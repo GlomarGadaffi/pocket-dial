@@ -59,6 +59,16 @@ namespace
 	// DtmfFeatureCodes::load()/saveAdminExt() too) is pbxpersist::kNvsNamespace
 	// (PbxPersist.hpp) so there is exactly one definition of "pbxcfg" in the
 	// codebase. The CDR ring's own namespace ("cdrlog") lives on CdrRing.cpp.
+
+	// Virtual extension for the anchored-media bridge (opt-in,
+	// docs/FEATURE_ROADMAP.md's "Anchored media" extension point). Dialing this
+	// fixed code bridges the caller to whatever AnchorClient the boot-time
+	// provider registry selected — Loopback by default, and the only
+	// implementation this project ships. See RequestsHandler.hpp's
+	// onAnchorInvite() comment for why a dedicated reserved virtual extension
+	// (matching 777/440/888/999) was chosen over a trunk-access prefix or an
+	// unregistered-number fallback.
+	constexpr const char* kAnchorCallExt = "555";
 }
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
@@ -106,6 +116,82 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// Seed the dashboard snapshot with the loaded devices so the TUI sees adopted
 	// devices immediately on boot (online flags start false until each re-REGISTERs).
 	refreshDeviceSnapshot();
+
+	// ── Anchored media (opt-in; docs/FEATURE_ROADMAP.md): wire the AnchorClient/
+	// MediaBridge extension point into call routing. pocket-dial ships only
+	// LoopbackAnchorClient (TelephonyProvider.hpp's class comment explains why no
+	// vendor-specific provider ships here) — register it as the registry's one
+	// entry and select it. A fork adding a real provider registers it the same
+	// way; this select() call and everything below pick it up with no other
+	// change here. telephonyProviderImplemented() guards against a fork adding a
+	// new TelephonyProviderType enumerator without ever registering/implementing
+	// it — select() would still return a non-null (stub) pointer for it, so the
+	// implemented-check is what actually keeps that half-added type from being
+	// selected.
+	_providerRegistry.registerProvider(TelephonyProviderType::Loopback, &_loopbackClient);
+	AnchorClient* selectedAnchor = _providerRegistry.select(TelephonyProviderType::Loopback);
+	_anchorClient = (selectedAnchor && telephonyProviderImplemented(TelephonyProviderType::Loopback))
+		? selectedAnchor : nullptr;
+
+	if (_anchorClient)
+	{
+		_anchorClient->init("", "", "", "");   // Loopback needs no real credentials
+
+		// Wire each anchor media bridge to its own RTP receiver/sender pair, then
+		// install ONE anchor rx callback fanning each call's inbound audio out to
+		// the bridge owning that participant — MediaBridge_test.cpp's
+		// AnchorAudioReachesPlayoutBufferThroughRxFanout proves this exact wiring
+		// in isolation. One callback covers every bridge; the AnchorClient
+		// interface exposes only a single rx slot.
+		for (size_t i = 0; i < POCKETDIAL_MAX_ANCHOR_CALLS; ++i)
+		{
+			_mediaBridges[i].init(&_anchorRtpReceivers[i], &_anchorRtpSenders[i], _anchorClient);
+		}
+		_anchorClient->registerAudioRxCallback(
+			[this](const std::string& participantId, const int16_t* samples, size_t count)
+			{
+				for (auto& b : _mediaBridges)
+				{
+					if (b.feedRx(participantId, samples, count)) break;
+				}
+			});
+
+		// setEventCallback() is deliberately NOT wired. LoopbackAnchorClient's
+		// makeCall()/dropCall() synchronously JOIN their own simulation thread(s)
+		// (reapSimThreads()), and onAnchorInvite()/endCall() call both while
+		// holding _mutex — an event callback that itself needed _mutex would
+		// deadlock its own caller. onAnchorInvite() treats a successful
+		// makeCall()+startBridge() as "answered" rather than waiting for the
+		// async Ringing/Answered events it documents (see that function's
+		// comment); wiring real event-driven completion later needs an
+		// async-safe outbox first — this engine's _outbox is only ever valid
+		// inside one handle()/tick() pass (both start it with _outbox.clear()).
+		//
+		// start() runs synchronously here (LoopbackAnchorClient::start() is a
+		// flag store, not I/O). A real anchor's connect must stay non-blocking
+		// in start() too — AnchorClient::tick() (pumped from tick() below) is
+		// the documented place for retry/blocking work, not this constructor.
+		//
+		// The same non-blocking requirement applies to makeCall()/dropCall():
+		// onAnchorInvite() and endCall() (src/SIP/RequestsHandler.cpp) call both
+		// while holding _mutex (ARCHITECTURE.md §3's "no blocking I/O under the
+		// registrar lock" invariant), exactly like every other handler in this
+		// class. Loopback's are cheap (a thread-join bounded by its ~40 ms sim
+		// sequence), but a fork wiring a real anchor whose makeCall() does
+		// network I/O would block the whole SIP task under that lock — the
+		// sibling commercial product this pattern is ported from sidesteps this
+		// with an asyncMakeCall() that hands off to a worker thread/task before
+		// returning; adding that here is future work, not done by this pass.
+		if (_anchorClient->start())
+		{
+			queueLog(std::string("[Anchor] ") +
+				telephonyProviderName(TelephonyProviderType::Loopback) + " client started");
+		}
+		else
+		{
+			queueLog("[Anchor] failed to start anchor client", true);
+		}
+	}
 }
 
 // Same bounded-fallback bookkeeping for the virtual-peer pool as the message
@@ -153,6 +239,7 @@ void RequestsHandler::initHandlers()
 	_handlers.emplace(SipMessageTypes::UNAVAILABLE,       std::bind(&RequestsHandler::onUnavailable,    this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::OK,                std::bind(&RequestsHandler::onOk,             this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::ACK,               std::bind(&RequestsHandler::onAck,            this, std::placeholders::_1));
+	_handlers.emplace(SipMessageTypes::FINAL_FAILURE,     std::bind(&RequestsHandler::onFinalFailure,   this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::BYE,               std::bind(&RequestsHandler::onBye,            this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::REQUEST_TERMINATED,std::bind(&RequestsHandler::onReqTerminated,  this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::REFER,             std::bind(&RequestsHandler::onRefer,          this, std::placeholders::_1));
@@ -270,7 +357,18 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				case 480: handlerKey = SipMessageTypes::UNAVAILABLE;        break;
 				case 486: handlerKey = SipMessageTypes::BUSY;               break;
 				case 487: handlerKey = SipMessageTypes::REQUEST_TERMINATED; break;
-				default:  handlerKey = std::string(request->getType());     break;
+				// Anything else with a final code: one shared key, so a 4xx/5xx/6xx
+				// this table has no name for still reaches a handler. It used to
+				// fall through to the full status line, match nothing, and be
+				// dropped -- leaving a server-originated INVITE unACKed (RFC 3261
+				// §17.1.1.3) and its dialog pinned until a timeout that then sent
+				// an illegal post-final CANCEL. Provisional (1xx) and other 2xx
+				// codes keep the old behaviour.
+				default:
+					handlerKey = (status->code >= 300)
+						? SipMessageTypes::FINAL_FAILURE
+						: std::string(request->getType());
+					break;
 			}
 		}
 		else
@@ -328,7 +426,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				if (!infoOk) return;   // pool exhausted: drop, peer retransmits (#101A)
 				infoOk->setHeader(SipMessageTypes::OK);
 				std::string activeIp = _localIp;
-				infoOk->setVia(std::string(request->getVia()) + ";received=" + activeIp);
+				infoOk->setVia(sipwire::viaWithReceived(request->getVia(), request->getSource()));
 				_outbox.emplace_back(request->getSource(), std::move(infoOk));
 			}
 			if (isDtmfRelay)
@@ -407,7 +505,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		response->setHeader("SIP/2.0 400 Bad Request");
 		response->clearBody();
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
@@ -488,7 +586,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			response->setHeader("SIP/2.0 503 Service Unavailable");
 			response->clearBody();
 			std::string activeIp = _localIp;
-			response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 			_outbox.emplace_back(data->getSource(), std::move(response));
 			return;
 		}
@@ -498,7 +596,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setHeader(SipMessageTypes::OK);
 	std::string activeIp = _localIp;
-	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	// Echo the granted lease back in the Contact so the client knows when to refresh.
 	response->setContact(buildContact(fromNumber) + ";expires=" + std::to_string(grantedExpires));
@@ -511,7 +609,7 @@ void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setHeader(SipMessageTypes::OK);
 	std::string activeIp = _localIp;
-	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	response->setContact(buildContact(data->getFromNumber()));
 	_outbox.emplace_back(data->getSource(), std::move(response));
@@ -552,6 +650,17 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		// CANCEL of a conference dial-in: endCall() drops the leg (see its
 		// ConferenceRoom::leave call), so the room needs nothing extra here.
 		endCall(data->getCallID(), data->getFromNumber(), ConferenceRoom::EXT);
+		return;
+	}
+
+	if (destNumber == kAnchorCallExt)
+	{
+		// CANCEL of an anchor-bridge dial-in: endCall() (below) drops the anchor-
+		// side leg and releases the MediaBridge — nothing extra needed here. In
+		// practice onAnchorInvite() answers synchronously (no ringing window), so
+		// this path is mostly defensive symmetry with 777/440/888 rather than a
+		// commonly-hit race.
+		endCall(data->getCallID(), data->getFromNumber(), kAnchorCallExt);
 		return;
 	}
 
@@ -607,6 +716,24 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 	endHandle(data->getFromNumber(), data);
 }
 
+void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
+{
+	// Server-originated UAC dialogs have no Session -- they are owned by the
+	// machine that minted them and found by Call-ID, the same intercept order
+	// onOk() uses. Whoever claims it is responsible for the ACK (RFC 3261
+	// §17.1.1.3) and for releasing its slot.
+	if (_beeper.handleInviteFailure(data))
+	{
+		return;
+	}
+
+	// Nothing owns it: a failure on a relayed leg, already handled by the
+	// endHandle()/session paths, or a stray. Recorded, not acted on -- the 4xx
+	// log line above (ClientError) has already surfaced it to the operator.
+	queueLog("[SIP] unclaimed final response " + std::string(data->getHeader())
+		+ " for callID=" + std::string(data->getCallID()), false);
+}
+
 void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 {
 	// Task 2A: Retransmission guard — silently drop if a session for this Call-ID
@@ -640,7 +767,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		response->setHeader("SIP/2.0 400 Bad Request");
 		response->clearBody();
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
@@ -654,7 +781,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
@@ -671,7 +798,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		response->setHeader("SIP/2.0 488 Not Acceptable Here");
 		response->clearBody();
 		response->addHeader("Warning", "304 " + _localIp + " \"No compatible audio codec (PCMU/PCMA/G722)\"");
-		response->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
@@ -698,6 +825,23 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	std::string destNumber(data->getToNumber());
 	if (destNumber == "777")
 	{
+		// The echo leg is SERVER-terminated and speaks G.711 only, so it is
+		// narrower than the relay-level gate at the top of this function (which
+		// admits G.722 because a peer-to-peer pair may negotiate wideband between
+		// themselves). A caller offering nothing but wideband gets 488 here rather
+		// than an answer advertising a codec this leg will never encode.
+		if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false))
+		{
+			auto responseObj = getMessageFromPool(*data);
+			if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
+			responseObj->setHeader("SIP/2.0 488 Not Acceptable Here");
+			responseObj->clearBody();
+			responseObj->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			responseObj->setContact(buildContact("777"));
+			_outbox.emplace_back(data->getSource(), std::move(responseObj));
+			return;
+		}
+
 		// SDP loopback echo test. Issue #115: allocateSession() must be called
 		// FIRST, before any 180/200 is built, mirroring the ordinary call-to-call
 		// INVITE path below (and the hunt-group path above) — otherwise a full
@@ -743,17 +887,26 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		ringing->setHeader("SIP/2.0 180 Ringing");
 		ringing->clearBody();
 		std::string activeIp = _localIp;
-		ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		ringing->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		std::string toTag = IDGen::GenerateID(9);
 		ringing->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		ringing->setContact(buildContact("777"));
 		_outbox.emplace_back(data->getSource(), std::move(ringing));
 
 		okResponse->setHeader(SipMessageTypes::OK);
-		okResponse->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		okResponse->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		okResponse->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		okResponse->setContact(buildContact("777"));
-		okResponse->enforceG711();
+		// The echo answer is the CALLER'S OWN offer handed back, so it must obey
+		// RFC 3264 §6.1: an answer reuses the offer's payload-type numbers and may
+		// only narrow the list. enforceG711() pinned the m= line to a literal
+		// "0 8 101" instead — inventing PT 101 with no a=rtpmap for it (invalid per
+		// RFC 4566 §6 for a dynamic PT) and asserting PTs the offer may never have
+		// used. pjsip rejects that answer outright ("Missing SDP rtpmap for dynamic
+		// payload type") and the echo call dies. filterAudioCodecs keeps the
+		// caller's own numbering, order and rtpmap/fmtp lines, dropping only what
+		// this leg cannot carry; the 488 gate above guarantees something survives.
+		okResponse->filterAudioCodecs(/*allowWideband=*/false);
 		_outbox.emplace_back(data->getSource(), std::move(okResponse));
 		return;
 	}
@@ -811,6 +964,14 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		// Meet-me conference (888): the server answers, joins this caller to the one
 		// shared MixBus, and mixes. N callers dialing 888 are N legs of one conference.
 		onConferenceInvite(data, caller.value());
+		return;
+	}
+
+	if (destNumber == kAnchorCallExt)
+	{
+		// Anchored media (555): the server answers and bridges this caller's RTP to
+		// whatever AnchorClient the boot-time provider registry selected.
+		onAnchorInvite(data, caller.value());
 		return;
 	}
 
@@ -904,7 +1065,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		response->setHeader("SIP/2.0 480 Temporarily Unavailable");
 		response->clearBody();
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		response->setContact(buildContact(caller.value()->getNumber()));
 		endHandle(data->getFromNumber(), response);
 		return;
@@ -1055,7 +1216,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		if (!busy) return;   // pool exhausted: drop, peer retransmits (#101A)
 		busy->setHeader("SIP/2.0 486 Busy Here");
 		busy->clearBody();
-		busy->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		busy->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		busy->setContact(buildContact("440"));
 		_outbox.emplace_back(data->getSource(), std::move(busy));
 		queueLog("440 media: busy (one stream max), rejected " + std::string(data->getFromNumber()));
@@ -1071,7 +1232,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		if (!bad) return;   // pool exhausted: drop, peer retransmits (#101A)
 		bad->setHeader(SipMessageTypes::BAD_REQUEST);
 		bad->clearBody();
-		bad->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		bad->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		bad->setContact(buildContact("440"));
 		_outbox.emplace_back(data->getSource(), std::move(bad));
 		queueLog("440 media: no usable RTP destination in INVITE from "
@@ -1088,7 +1249,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		if (!err) return;   // pool exhausted: drop, peer retransmits (#101A)
 		err->setHeader("SIP/2.0 500 Server Internal Error");
 		err->clearBody();
-		err->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		err->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		err->setContact(buildContact("440"));
 		_outbox.emplace_back(data->getSource(), std::move(err));
 		queueLog("440 media: RTP stream failed to start to " + destIp + ":"
@@ -1111,7 +1272,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		if (!busy) return;   // pool exhausted: drop, peer retransmits (#101A)
 		busy->setHeader("SIP/2.0 503 Service Unavailable");
 		busy->clearBody();
-		busy->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		busy->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		busy->setContact(buildContact("440"));
 		_outbox.emplace_back(data->getSource(), std::move(busy));
 		queueLog("440 media: session pool full, rejected " + std::string(data->getFromNumber()), true);
@@ -1148,7 +1309,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	// header/blank-line boundary intact; we then append Content-Type + the SDP and
 	// let syncContentLength() (invoked by enforceG711) fix the length.
 	ok->setHeader(SipMessageTypes::OK);
-	ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+	ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 	ok->setContact(buildContact("440"));
 	ok->clearBody();
@@ -1173,8 +1334,11 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		}
 		ok->reset(std::move(raw), data->getSource());
 	}
-	ok->enforceG711();                   // collapse codec list (no-op here) + sync length
-	ok->syncContentLength();             // belt-and-suspenders: length == body bytes
+	// No enforceG711() here: sdpBody is buildMediaSdp()'s own body, already exactly
+	// "m=audio N RTP/AVP 0" + a=rtpmap:0 PCMU/8000. enforceG711() did not "collapse"
+	// that list, it WIDENED it to "0 8 101" -- adding a dynamic PT 101 with no
+	// a=rtpmap line, which RFC 4566 forbids and pjsip rejects with 400 Bad SDP.
+	ok->syncContentLength();             // length == body bytes
 	_outbox.emplace_back(data->getSource(), std::move(ok));
 
 	queueLog("440 media: streaming tone to " + destIp + ":" + std::to_string(destPort)
@@ -1205,7 +1369,7 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
 		msg->setHeader(statusLine);
 		msg->clearBody();
-		msg->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		msg->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		msg->setContact(buildContact(confExt));
 		_outbox.emplace_back(data->getSource(), std::move(msg));
 		queueLog("888 conference: " + std::string(why) + " for "
@@ -1279,6 +1443,137 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		+ std::to_string(leg) + " (" + std::to_string(_conference->legCount()) + "/"
 		+ std::to_string(ConferenceRoom::MAX_LEGS) + "), media to "
 		+ destIp + ":" + std::to_string(destPort));
+}
+
+MediaBridge* RequestsHandler::acquireFreeAnchorBridge()
+{
+	for (auto& b : _mediaBridges)
+	{
+		if (!b.isActive()) return &b;
+	}
+	return nullptr;
+}
+
+void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
+	const std::shared_ptr<SipClient>& caller)
+{
+	const std::string activeIp = _localIp;
+	const std::string callID(data->getCallID());
+
+	auto refuse = [&](const char* statusLine, const char* why) {
+		auto msg = getMessageFromPool(*data);
+		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
+		msg->setHeader(statusLine);
+		msg->clearBody();
+		msg->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		msg->setContact(buildContact(kAnchorCallExt));
+		_outbox.emplace_back(data->getSource(), std::move(msg));
+		queueLog("555 anchor: " + std::string(why) + " for "
+			+ std::string(data->getFromNumber()), true);
+	};
+
+	if (!_anchorClient || !_anchorClient->isConnected())
+	{
+		// No provider selected, or it hasn't (yet) connected — same "feature not
+		// actually available" honesty StubTelephonyProvider models. 404 rather
+		// than 503: this is not a transient capacity problem, dialing 555 simply
+		// doesn't resolve to anything right now.
+		refuse(SipMessageTypes::NOT_FOUND, "no anchor client connected");
+		return;
+	}
+
+	// Anchor-bridge media is SERVER-terminated and speaks G.711 only (buildMediaSdp
+	// below hardcodes PCMU; MediaBridge::onHandsetRtp only µ-law-decodes) — narrower
+	// than the relay-level gate at the top of onInvite(), which admits G.722 because
+	// a peer-to-peer pair may negotiate wideband between themselves. Same reasoning
+	// as the 777 echo leg's gate above: a caller offering nothing but wideband gets
+	// 488 here rather than an answer advertising a codec this leg will never decode.
+	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false))
+	{
+		refuse("SIP/2.0 488 Not Acceptable Here", "no G.711 codec offered");
+		return;
+	}
+
+	// Where does this phone want its audio? Same c=/m= parse the 440/888 paths use.
+	std::string destIp;
+	uint16_t destPort = 0;
+	if (!parseCallerRtp(data, destIp, destPort))
+	{
+		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in INVITE");
+		return;
+	}
+
+	MediaBridge* bridge = acquireFreeAnchorBridge();
+	if (!bridge)
+	{
+		// 503 + Retry-After, not 486 Busy Here: 486 means the CALLED PARTY is busy
+		// (a final "don't retry this number" answer), but here nothing about the
+		// dialed 555 code itself is busy — every anchor bridge SLOT is. 503 tells
+		// the caller's UA this is a temporary capacity condition, matching what
+		// the equivalent WAN-anchor wiring in the sibling commercial product does
+		// for the same reason.
+		refuse("SIP/2.0 503 Service Unavailable", "every anchor bridge slot busy");
+		return;
+	}
+
+	// makeCall() before startBridge(): a bridge with no far side to carry audio to
+	// is pointless to stand up. `destination` here is the CALLER's own number, not
+	// a dialed digit string — 555 is a fixed feature code (like 777/440/888), so
+	// there is nothing after it to strip the way a trunk-access prefix would; a
+	// real AnchorClient's own configuration decides where the bridged audio
+	// actually goes (a recording line, an AI pipeline, a monitored DN, ...), and
+	// `destination` just tells it who is calling in. LoopbackAnchorClient resolves
+	// its own leg (ownLeg) SYNCHRONOUSLY, before any Ringing/Answered event, so it
+	// can be bound to the bridge right away (see its doc comment).
+	std::string ownLeg;
+	if (!_anchorClient->makeCall(std::string(caller->getNumber()), &ownLeg))
+	{
+		refuse("SIP/2.0 503 Service Unavailable", "anchor declined makeCall");
+		return;
+	}
+
+	if (!bridge->startBridge(destIp, destPort, callID, ownLeg))
+	{
+		_anchorClient->dropCall(ownLeg);
+		refuse("SIP/2.0 503 Service Unavailable", "media bridge failed to start");
+		return;
+	}
+
+	auto newSession = allocateSession(callID, caller);
+	if (!newSession)
+	{
+		bridge->stopBridge();
+		_anchorClient->dropCall(ownLeg);
+		refuse("SIP/2.0 503 Service Unavailable", "session pool full");
+		return;
+	}
+
+	// Draw the answer BEFORE publishing the session — same "a pool refusal must
+	// never strand a call that already mutated state" reasoning as onConferenceInvite
+	// above. The SDP advertises THIS BRIDGE's receive port (not any other slot's):
+	// that is where the handset must send its audio for the anchor to hear it.
+	const std::string toTag = IDGen::GenerateID(9);
+	const std::string sdpBody = buildMediaSdp(activeIp, bridge->receiverPort(), /*sendrecv=*/true);
+	auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
+	if (!ok)
+	{
+		bridge->stopBridge();
+		_anchorClient->dropCall(ownLeg);
+		queueLog("555 anchor: message pool exhausted, call unwound", true);
+		return;
+	}
+
+	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
+	// call can't overwrite this call's destination identity.
+	auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
+	newSession->setDest(dummyAnchor);
+	_sessions.emplace(callID, newSession);
+	newSession->setState(Session::State::Connected);
+
+	_outbox.emplace_back(data->getSource(), std::move(ok));
+
+	queueLog("555 anchor: " + std::string(caller->getNumber()) + " bridged (participant "
+		+ ownLeg + "), media to " + destIp + ":" + std::to_string(destPort));
 }
 
 void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
@@ -1408,7 +1703,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader(SipMessageTypes::OK);
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
 		return;
@@ -1423,7 +1718,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader(SipMessageTypes::OK);
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
 		return;
@@ -1437,7 +1732,21 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader(SipMessageTypes::OK);
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		endCall(data->getCallID(), data->getFromNumber(), destNumber);
+		return;
+	}
+
+	if (destNumber == kAnchorCallExt)
+	{
+		// Anchor-bridge hang-up: 200 OK the BYE and end the call. endCall() (below)
+		// best-effort drops the anchor-side leg and releases the MediaBridge.
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader(SipMessageTypes::OK);
+		std::string activeIp = _localIp;
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
 		return;
@@ -1449,7 +1758,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader(SipMessageTypes::OK);
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 
 		if (session.has_value())
@@ -1496,7 +1805,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		if (response)
 		{
 			response->setHeader(SipMessageTypes::OK);
-			response->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 			response->clearBody();
 			_outbox.emplace_back(data->getSource(), std::move(response));
 		}
@@ -1568,7 +1877,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		if (response)
 		{
 			response->setHeader(SipMessageTypes::OK);
-			response->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 			response->clearBody();
 			_outbox.emplace_back(data->getSource(), std::move(response));
 		}
@@ -1825,6 +2134,14 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	if (destNumber == kAnchorCallExt)
+	{
+		// Same as 777/888 above: the server is the UAS on an anchor-bridge leg, so
+		// the ACK completes our own 200 OK with no second SIP leg to relay it to.
+		// Media is already flowing — the bridge attached when the INVITE was answered.
+		return;
+	}
+
 	if (destNumber == "999")
 	{
 		auto answeringClient = session.value()->getDest();
@@ -1893,7 +2210,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
@@ -1975,7 +2292,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		response->setHeader(SipMessageTypes::BAD_REQUEST);
 		response->clearBody();
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
@@ -2112,7 +2429,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 			if (!declined) return;   // pool exhausted: drop, peer retransmits (#101A)
 			declined->setHeader("SIP/2.0 603 Decline");
 			declined->clearBody();
-			declined->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+			declined->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 			_outbox.emplace_back(data->getSource(), std::move(declined));
 			return;
 		}
@@ -2191,7 +2508,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 
 		accepted->setHeader(SipMessageTypes::ACCEPTED);
 		accepted->clearBody();
-		accepted->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+		accepted->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 		_outbox.emplace_back(data->getSource(), std::move(accepted));
 
@@ -2233,7 +2550,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		accepted->setHeader(SipMessageTypes::ACCEPTED);
 		accepted->clearBody();
 		std::string activeIp = _localIp;
-		accepted->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		accepted->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 		_outbox.emplace_back(data->getSource(), std::move(accepted));
 	}
@@ -2300,7 +2617,7 @@ void RequestsHandler::onMessage(std::shared_ptr<SipMessage> data)
 	response->setHeader(SipMessageTypes::OK);
 	response->clearBody();
 	std::string activeIp = _localIp;
-	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	_outbox.emplace_back(data->getSource(), std::move(response));
 }
@@ -2450,6 +2767,28 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	// it so the socket + 20 ms task never leak past the call. Idempotent no-op when
 	// the stream is idle or owned by a different Call-ID.
 	_rtpSender.stop(std::string(callID));
+
+	// Anchor-bridge safety net (same shape as the RTP tone-stream stop above): if
+	// the dialog being torn down owns a live anchor MediaBridge, best-effort drop
+	// the anchor-side leg and release the bridge so its RTP sockets/pacing task
+	// never outlive the call. Idempotent no-op when no bridge is bridging this
+	// Call-ID (the ordinary case for every non-555 call).
+	{
+		const std::string callIdStr(callID);
+		for (auto& bridge : _mediaBridges)
+		{
+			if (bridge.isForCallId(callIdStr))
+			{
+				const std::string participantId = bridge.participantId();
+				if (_anchorClient && !participantId.empty())
+				{
+					_anchorClient->dropCall(participantId);
+				}
+				bridge.stopBridge();
+				break;
+			}
+		}
+	}
 }
 
 uint64_t RequestsHandler::nowEpochMs() const
@@ -2752,7 +3091,7 @@ void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipM
 	// Warning 399 (miscellaneous, RFC 3261 §20.43) with the reason, so the
 	// refusal is diagnosable from the phone's SIP trace rather than a mystery 488.
 	response->addHeader("Warning", "399 " + _localIp + " \"SDP refused: " + why + "\"");
-	response->setVia(std::string(request->getVia()) + ";received=" + _localIp);
+	response->setVia(sipwire::viaWithReceived(request->getVia(), request->getSource()));
 	_outbox.emplace_back(request->getSource(), std::move(response));
 	queueLog("[SIP] SDP refused (" + std::string(why) + "), 488 to " +
 		std::string(request->getFromNumber()) + " for " + std::string(request->getHeader()), true);
@@ -3137,6 +3476,14 @@ void RequestsHandler::tick()
 		_outbox.clear();
 
 		sweepExpired();
+
+		// AnchorClient::tick(): "periodic, non-blocking maintenance pump ... (<=1 Hz)"
+		// per its doc comment. Loopback's is a no-op; a real anchor uses this for
+		// TLS re-warm / reconnect bookkeeping without blocking the SIP thread.
+		if (_anchorClient)
+		{
+			_anchorClient->tick();
+		}
 
 		// RFC 3261 §17: retransmit timed-out INVITE forks and free completed slots.
 		_txLayer.sweep(now);
@@ -3566,19 +3913,20 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	auto src = session->getSrc();
 	auto dest = session->getDest();
 
-	// Virtual-extension legs (777 echo, 888 conference) have no real peer to relay the
-	// offer to — their "dest" is a stand-in SipClient carrying the CALLER's own address,
-	// so relaying would send the phone its own re-INVITE back. Decline instead, so the
-	// holding phone keeps the call on the original SDP.
+	// Virtual-extension legs (777 echo, 888 conference, 555 anchor bridge) have no
+	// real peer to relay the offer to — their "dest" is a stand-in SipClient
+	// carrying the CALLER's own address, so relaying would send the phone its own
+	// re-INVITE back. Decline instead, so the holding phone keeps the call on the
+	// original SDP.
 	const std::string destNum = dest ? dest->getNumber() : "";
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || !src || !dest)
+	if (destNum == "777" || destNum == ConferenceRoom::EXT || destNum == kAnchorCallExt || !src || !dest)
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader("SIP/2.0 488 Not Acceptable Here");
 		response->clearBody();
 		std::string activeIp = _localIp;
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
@@ -3651,7 +3999,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		auto resp = getMessageFromPool(*data);
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader(SipMessageTypes::OK);
-		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		resp->clearBody();
 		resp->syncContentLength();
 		_outbox.emplace_back(data->getSource(), std::move(resp));
@@ -3670,8 +4018,8 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	auto dest = session->getDest();
 	const std::string destNum = dest ? dest->getNumber() : "";
 
-	// Same virtual-leg guard as onReinvite() above: 777/888 have no peer leg.
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || !src || !dest)
+	// Same virtual-leg guard as onReinvite() above: 777/888/555 have no peer leg.
+	if (destNum == "777" || destNum == ConferenceRoom::EXT || destNum == kAnchorCallExt || !src || !dest)
 	{
 		auto resp = getMessageFromPool(*data);
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -3932,14 +4280,14 @@ std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHand
 
 std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	const std::shared_ptr<SipMessage>& inviteMsg,
-	const std::string& activeIp,
+	const std::string& /*activeIp*/,   // Via now carries the request's real source
 	const std::string& toTag,
 	const std::string& sdpBody)
 {
 	auto ok = getMessageFromPool(*inviteMsg);
 	if (!ok) return nullptr;   // pool exhausted: propagate, caller drops (#101A)
 	ok->setHeader(SipMessageTypes::OK);
-	ok->setVia(std::string(inviteMsg->getVia()) + ";received=" + activeIp);
+	ok->setVia(sipwire::viaWithReceived(inviteMsg->getVia(), inviteMsg->getSource()));
 	ok->setTo(std::string(inviteMsg->getTo()) + ";tag=" + toTag);
 	ok->setContact(buildContact(inviteMsg->getToNumber()));
 	ok->clearBody();
@@ -3959,7 +4307,8 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 		}
 		ok->reset(std::move(raw), inviteMsg->getSource());
 	}
-	ok->enforceG711();
+	// See the note in the 440 media path: sdpBody is already the server's own
+	// PCMU-only offer; enforceG711() would widen it to an invalid "0 8 101".
 	ok->syncContentLength();
 	return ok;
 }

@@ -48,7 +48,13 @@
 #include "DtmfFeatureCodes.hpp"
 #include "CallForker.hpp"
 #include "CallPickup.hpp"
+#include "PoolConfig.hpp"   // POCKETDIAL_MAX_ANCHOR_CALLS (concurrent anchor media-bridge count)
 #include "RtpSender.hpp"
+#include "RtpReceiver.hpp"
+#include "AnchorClient.hpp"
+#include "LoopbackAnchorClient.hpp"
+#include "TelephonyProvider.hpp"
+#include "MediaBridge.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
 #include "Registrar.hpp"
@@ -269,6 +275,21 @@ public:
 	{
 		_adminHttpOpenUntilMs.store(ms, std::memory_order_release);
 	}
+
+	// Test-only: the anchor MediaBridge currently bridging this Call-ID, or nullptr
+	// if none is. Lets a test assert the 555 wiring actually attached a bridge
+	// (active state, participant id) without racing RtpSender's real background
+	// pacer thread the way reading a live PlayoutBuffer would (see
+	// ConferenceRoom_test.cpp's file comment on that race). Not compiled into
+	// device firmware.
+	MediaBridge* anchorBridgeForCallIdForTest(const std::string& callID)
+	{
+		for (auto& b : _mediaBridges)
+		{
+			if (b.isForCallId(callID)) return &b;
+		}
+		return nullptr;
+	}
 #endif
 
 	// ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
@@ -305,6 +326,11 @@ private:
 	void onOptions(std::shared_ptr<SipMessage> data);
 	void onCancel(std::shared_ptr<SipMessage> data);
 	void onReqTerminated(std::shared_ptr<SipMessage> data);
+	// Catch-all for a final failure response (>= 300) with no more specific
+	// handler. Its job is the one thing RFC 3261 requires of every one of them:
+	// make sure a server-originated INVITE transaction gets its ACK, and let the
+	// machine that owns the dialog release it.
+	void onFinalFailure(std::shared_ptr<SipMessage> data);
 	void onInvite(std::shared_ptr<SipMessage> data);
 	void onTrying(std::shared_ptr<SipMessage> data);
 	void onRinging(std::shared_ptr<SipMessage> data);
@@ -537,6 +563,27 @@ private:
 	// hold a conference. Null until then. Caller holds _mutex.
 	std::unique_ptr<ConferenceRoom> _conference;
 
+	// ── Anchored media: virtual extension 555 (bridge to an AnchorClient) ────────
+	// onInvite() routes a dial of 555 here — the docs/FEATURE_ROADMAP.md "Anchored
+	// media (opt-in, unwired)" extension point, now wired into call routing.
+	// AnchorClient/MediaBridge/TelephonyProvider are all vendor-neutral; pocket-dial
+	// ships only LoopbackAnchorClient as the concrete provider (see
+	// TelephonyProvider.hpp's class comment). Chosen as a dedicated reserved virtual
+	// extension — matching the established 777/440/888/999 style — rather than a
+	// trunk-access prefix or an unregistered-number fallback: there is no dialed
+	// destination digit string to carry (see onAnchorInvite()'s comment on the
+	// makeCall() `destination` argument), so a fixed feature code is the natural
+	// fit, and unlike a bare "unregistered falls through to the anchor" rule it can
+	// never collide with — or silently start bridging — a mistyped real extension.
+	// Caller holds _mutex.
+	void onAnchorInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
+
+	// First anchor media bridge with no active call, or nullptr if every slot is
+	// busy (onAnchorInvite() then answers 503 Service Unavailable, mirroring the
+	// 440/888 busy-refusal shape with a different status for the different meaning
+	// — see that call site's comment). Caller holds _mutex.
+	MediaBridge* acquireFreeAnchorBridge();
+
 	void unregisterClient(std::string_view number);
 
 	// Registration-lease handling (RFC 3261 §10.2.1)
@@ -604,6 +651,27 @@ private:
 	// Server-side RTP media source (the 440 tone stream). One concurrent stream; the
 	// ESP-only UDP socket + 20 ms pacing task live inside it, guarded for host builds.
 	RtpSender _rtpSender;
+
+	// ── Anchored media (555): the AnchorClient/MediaBridge wiring ────────────────
+	// POCKETDIAL_MAX_ANCHOR_CALLS concurrent bridges, each owning its own RTP
+	// receiver/sender pair (parallel arrays, index-matched) — mirrors _conference's
+	// per-leg RTP tasks. _loopbackClient is the only AnchorClient implementation
+	// this project ships; _anchorClient points at whatever the boot-time provider
+	// registry selected (see the constructor) so every call site below goes through
+	// one pointer instead of the concrete type, the same indirection
+	// TelephonyProviderRegistry exists to provide.
+	//
+	// Declaration order matters here: _mediaBridges MUST come after
+	// _anchorRtpReceivers/_anchorRtpSenders/_loopbackClient/_anchorClient so it is
+	// destroyed FIRST (C++ destroys members in REVERSE declaration order) —
+	// ~MediaBridge() calls stopBridge(), which dereferences _receiver/_sender/
+	// _anchor, and those must still be alive when that runs.
+	RtpReceiver _anchorRtpReceivers[POCKETDIAL_MAX_ANCHOR_CALLS];
+	RtpSender   _anchorRtpSenders[POCKETDIAL_MAX_ANCHOR_CALLS];
+	LoopbackAnchorClient _loopbackClient;
+	TelephonyProviderRegistry _providerRegistry;
+	AnchorClient* _anchorClient = nullptr;
+	MediaBridge _mediaBridges[POCKETDIAL_MAX_ANCHOR_CALLS];
 
 	// RequestsHandler.hpp: Issues #24 and #28 resolved.
 	std::unordered_map<std::string, std::function<void(std::shared_ptr<SipMessage> request)>> _handlers;

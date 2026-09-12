@@ -22,11 +22,14 @@ Cross-references:
 > signalling-side, bounded by the pre-allocated pools) and what is expensive (anything that would
 > put the MCU in the media path). Every priority below is assigned with that line drawn. An
 > **opt-in** exception exists: `AnchorClient`/`MediaBridge`/`TelephonyProvider` (`src/SIP/`) are a
-> vendor-neutral extension point for bridging a call to an external audio system, and `MixBus`
-> (`src/SIP/MixBus.*`) is a tested N-way mixer — both ship compiled and unit-tested but unwired
-> from call routing by default (see Non-Goals below). They don't change the
-> framing above for the default path; they're there for a fork that wants to cross the line
-> deliberately, on its own terms.
+> vendor-neutral extension point for bridging a call to an external audio system, wired into call
+> routing as virtual extension `555` against the `Loopback` reference client pocket-dial ships
+> (see `src/SIP/TelephonyProvider.hpp`'s class comment for why no real vendor client ships in
+> this tree). `MixBus`
+> (`src/SIP/MixBus.*`) is a tested N-way mixer, wired as the `888` meet-me conference. Neither
+> changes the framing above for the default path — a plain call never puts the MCU in the media
+> path; both are there for a fork (or an operator dialing `555`/`888`) that wants to cross that
+> line deliberately, on its own terms.
 
 ---
 
@@ -36,7 +39,7 @@ Cross-references:
 |------|-----------|-------|
 | SIP signalling | RFC 3261 registrar + back-to-back call broker: `REGISTER`, `INVITE`, `ACK`, `BYE`, `CANCEL`, `OPTIONS`, and provisional/final responses (`100/180/200/404/480/486/487`) | `src/SIP/RequestsHandler.cpp`, README "Supported SIP Methods" |
 | Media | Peer-to-peer G.711 RTP; server never sees audio. `enforceG711()` rewrites SDP to `0 8 101`; `clearBody()` strips ringing SDP for strict-UA interop (Yealink) | `src/SIP/SipMessage.cpp`, README "VoIP Interoperability" |
-| Virtual extensions | `777` zero-DSP echo loopback; `999` parallel all-page/intercom with auto-answer header injection, Request-URI/To rewrite, race-to-answer + CANCEL of losers; `440` server-sourced RTP tone; `888` local N-way conference (server-mixed) | `RequestsHandler::startPaging` / `handlePagingAnswer` / `onMediaInvite` / `onConferenceInvite` |
+| Virtual extensions | `777` zero-DSP echo loopback; `999` parallel all-page/intercom with auto-answer header injection, Request-URI/To rewrite, race-to-answer + CANCEL of losers; `440` server-sourced RTP tone; `888` local N-way conference (server-mixed); `555` anchor media bridge (opt-in, bridges to whichever `AnchorClient` the provider registry selected — `Loopback` by default) | `RequestsHandler::startPaging` / `handlePagingAnswer` / `onMediaInvite` / `onConferenceInvite` / `onAnchorInvite` |
 | Registration lease | Expiry parsing/capping (`DEFAULT/MAX_EXPIRES` 3600 s), OPTIONS keepalive ping, dead-binding sweep/prune | `parseRequestedExpires`, `sweepExpired`, `maybeSweep` |
 | Transports | Wi-Fi SoftAP (+ captive portal), W5500 / LAN8720 wired Ethernet & PoE, Guition JC3248W535 touch display (LVGL 8.3) | `main/esp_main*.cpp`, `main/drivers`, `main/ui` |
 | Onboarding | Captive-portal SoftAP, hand-rolled DNS redirect, on-screen join QR, NVS-persisted Wi-Fi mode/SSID/creds | `main/wifi/DnsServer.cpp`, `esp_main_display.cpp` |
@@ -49,7 +52,7 @@ Cross-references:
 | **Admin plane, dark by default** | HTTP is the only admin surface (SSH "sysop terminal" — wolfSSH + the ANSI/TUI hub — **removed**, not hardened). Unreachable on a provisioned device except for a bounded TTL after a source-IP-verified DTMF trigger or a fresh provisioning grace window. Ring groups, call-forward, and DND remain configurable — now over the web dashboard only. | `src/Helpers/HttpServer.*`, `src/SIP/RequestsHandler::onDtmfInfo`, [THREAT_MODEL.md](THREAT_MODEL.md) §5.5. `docs/design/` (TUI design docs) is now historical — describes the removed SSH surface, not current behavior. |
 | **PBX call features** | CDR ring, per-extension **DND**, **call-forward** (CFU/CFB/CFNA), **ring groups** (ring-all / hunt), **blind transfer** (REFER), **hold/resume** (re-INVITE + RFC 3311 UPDATE), **session timers** (RFC 4028), **call parking** (orbits `700`-`709`), **paging zones** (`980`-`989`), **BLF/presence** (`SUBSCRIBE`/`NOTIFY`, RFC 4235), DTMF star-codes (`*60/*80/*72/*73/*69/*11`) | `src/SIP/RequestsHandler.cpp`, `CallDetailRecord.hpp`, `PbxConfig.hpp` |
 | **Server-mixed conference** | `MixBus` (N−1 minus-self summing junction, int32 accumulator clipped once) wired into `MediaBridge`'s BUS mode and dialable as extension `888`. `ConferenceRoom` owns one bus, `POCKETDIAL_CONF_LEGS` legs, and the single 20 ms mix tick. No anchor/vendor required. | `src/SIP/ConferenceRoom.*`, `src/SIP/MixBus.*`, [CONFERENCE_MIXER.md](CONFERENCE_MIXER.md) |
-| **Anchored media (opt-in, unwired)** | `AnchorClient`/`MediaBridge`/`TelephonyProvider`/`TelephonyApiConfig` — vendor-neutral building blocks for bridging a call to an external audio system (ships with only a `Loopback` reference). The anchor side is not wired into call routing by default; see Non-Goals below. | `src/SIP/MediaBridge.*`, `src/SIP/TelephonyProvider.*` |
+| **Anchored media (opt-in)** | `AnchorClient`/`MediaBridge`/`TelephonyProvider`/`TelephonyApiConfig` — vendor-neutral building blocks for bridging a call to an external audio system, wired into call routing as virtual extension `555` (`RequestsHandler::onAnchorInvite`). pocket-dial ships only the `Loopback` reference `AnchorClient` — proving the wiring, not real PSTN/vendor connectivity; see `TelephonyProvider.hpp`'s class comment for why no vendor-specific client ships here. | `src/SIP/MediaBridge.*`, `src/SIP/TelephonyProvider.*`, `src/SIP/RequestsHandler.cpp` |
 
 ---
 

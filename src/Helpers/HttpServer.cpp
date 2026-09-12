@@ -1147,9 +1147,9 @@ void HttpServer::sendApiDnd(int sock, const std::string& body)
 		return;
 	}
 
-	// Reject the virtual extensions: DND must never affect echo (777) or
-	// broadcast (999) — they are not real endpoints.
-	if (ext == "777" || ext == "999")
+	// Reject the virtual extensions: DND must never affect echo (777), broadcast
+	// (999) or the anchor media bridge (555) — none are real endpoints.
+	if (ext == "777" || ext == "999" || ext == "555")
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot set DND on a virtual extension\"}");
@@ -1188,7 +1188,7 @@ void HttpServer::sendApiForward(int sock, const std::string& body)
 		             "{\"error\":\"trigger must be always|busy|noanswer\"}");
 		return;
 	}
-	if (ext == "777" || ext == "999")
+	if (ext == "777" || ext == "999" || ext == "555")
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot forward a virtual extension\"}");
@@ -1220,7 +1220,7 @@ void HttpServer::sendApiGroup(int sock, const std::string& body)
 		             "{\"error\":\"missing extension parameter\"}");
 		return;
 	}
-	if (ext == "777" || ext == "999")
+	if (ext == "777" || ext == "999" || ext == "555")
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot use a reserved extension as a group\"}");
@@ -1269,7 +1269,7 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 		             "{\"error\":\"pattern may contain only letters, digits, '#' and '*'\"}");
 		return;
 	}
-	if (pattern == "777" || pattern == "999" || pattern == "440")
+	if (pattern == "777" || pattern == "999" || pattern == "440" || pattern == "555")
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot use a reserved extension as a dial-plan pattern\"}");

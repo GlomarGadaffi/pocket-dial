@@ -176,6 +176,25 @@
 #define POCKETDIAL_CONF_LEGS 4
 #endif
 
+// Number of concurrent anchor media bridges (the 555 virtual extension --
+// docs/FEATURE_ROADMAP.md's "Anchored media" extension point, wired into call
+// routing in RequestsHandler). Each bridge owns its own RtpReceiver/RtpSender
+// pair, the same per-leg RTP-task cost as a conference leg (POCKETDIAL_CONF_LEGS
+// above).
+//
+// Fixed at 1: LoopbackAnchorClient -- the only AnchorClient implementation this
+// project ships -- hands back the SAME fixed mock participant id
+// ("mock-part-123") from every makeCall() (see LoopbackAnchorClient.cpp), so a
+// second concurrent anchor call would collide with the first on that id, and
+// RequestsHandler's single anchor rx-audio callback would feed only whichever
+// bridge it finds first, silently starving the other call's audio. Raise this
+// only alongside an AnchorClient implementation whose makeCall() hands back a
+// distinct participant id per call -- what AnchorClient.hpp's interface expects
+// of any real implementation.
+#ifndef POCKETDIAL_MAX_ANCHOR_CALLS
+#define POCKETDIAL_MAX_ANCHOR_CALLS 1
+#endif
+
 // Maximum concurrent RFC 3261 §17 transaction records tracked for retransmit
 // timers.  Each InviteClient slot tracks one outgoing INVITE fork (Timer A/B):
 // retransmit interval doubles from T1 until a provisional stops it, or Timer B

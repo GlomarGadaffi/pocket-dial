@@ -24,6 +24,11 @@ include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers)
 
 add_executable(sip_parser_tests
     SipMessage_test.cpp
+    # RFC regressions found by tests/interop/ (real pjsip stack): SDP answers
+    # that invented payload types, Via received/rport naming the server instead
+    # of the request source, and a non-2xx final response to a PBX-originated
+    # INVITE that was never ACKed.
+    InteropRfc_test.cpp
     SipMessage_header_test.cpp
     # Issue #101(B): SDP parse-once cache. Covers every body-mutation path that
     # must invalidate it — including reset() and `*msg = source`, the two ways
@@ -96,6 +101,13 @@ add_executable(sip_parser_tests
     PlayoutBuffer_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp
+    # Wires the AnchorClient/MediaBridge/TelephonyProvider extension point into
+    # RequestsHandler's own call routing (virtual extension 555, opt-in, docs/
+    # FEATURE_ROADMAP.md's "Anchored media") — the boot-time provider selection +
+    # MediaBridge pool + rx-audio fanout, and the onInvite()/onBye() intercept,
+    # driven end to end through RequestsHandler::handle() against the Loopback
+    # reference client (the only AnchorClient this project ships).
+    AnchorRouting_test.cpp
     MixBus_test.cpp
     # Issue #75: MixBus wired into MediaBridge (BUS mode) and made dialable as the
     # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real
@@ -175,6 +187,10 @@ add_executable(sip_parser_tests
     # are no-op stubs under !ESP_PLATFORM, so the lifecycle/identity bookkeeping
     # and the feedRx -> PlayoutBuffer path are exercisable on the desktop build.
     ../src/SIP/MediaBridge.cpp
+    # The fixed-size TelephonyProviderType registry/factory (name/implemented
+    # lookups + registerProvider/select) that RequestsHandler's boot-time anchor
+    # wiring now uses to select LoopbackAnchorClient. Pure C++17, no ESP dependency.
+    ../src/SIP/TelephonyProvider.cpp
     # Conference mix bus (see docs/CONFERENCE_MIXER.md). Pure C++17, no ESP
     # dependency. mix_kernels_scalar.cpp is the always-on scalar reference --
     # the ESP32-S3 PIE vector kernels (src/SIP/pie/) are opt-in and not built here.

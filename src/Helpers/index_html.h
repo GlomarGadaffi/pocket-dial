@@ -433,7 +433,7 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
         associated with this access point must be re-joined using the passphrase
         below. Nothing changes until the access point next comes up.
       </div>
-      <div class="kv"><span class="k">Current mode</span><span id="ap-mode">&mdash;</span></div>
+)html1" R"html1b(      <div class="kv"><span class="k">Current mode</span><span id="ap-mode">&mdash;</span></div>
       <div class="field">
         <label for="ap-psk">Access point passphrase (8&ndash;63 characters)</label>
         <input type="text" id="ap-psk" autocomplete="off" spellcheck="false">
@@ -586,7 +586,7 @@ var themeIdx=0;
 function applyTheme(i){
   themeIdx=((i%THEMES.length)+THEMES.length)%THEMES.length;
   var k=THEMES[themeIdx],v=THEME_VARS[k];
-)html1"
+)html1b"
 R"html2(  document.documentElement.style.setProperty("--amber",v.amber);
   document.documentElement.style.setProperty("--amber-glow",v.glow);
   var b=$("theme-btn");if(b)b.textContent=k.charAt(0).toUpperCase()+k.slice(1);

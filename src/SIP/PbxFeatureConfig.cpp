@@ -92,9 +92,10 @@ void PbxFeatureConfig::setForwardLocked(const std::string& extension, const std:
 	// DTMF *73/*72NNNN inline path skipped it entirely (Issue #77), so a
 	// crafted mid-dialog INFO with From: 777/999 could set up a "forward" on
 	// a virtual extension. Routing both callers through here closes that gap.
-	// "888" is ConferenceRoom::EXT (the meet-me conference) — not referenced
-	// by name here so this file stays decoupled from ConferenceRoom.hpp.
-	if (extension == "777" || extension == "999" || extension == "888")
+	// "888" is ConferenceRoom::EXT (the meet-me conference), "555" is the anchor
+	// media bridge (RequestsHandler.cpp's kAnchorCallExt) — neither referenced
+	// by name here so this file stays decoupled from ConferenceRoom.hpp/RequestsHandler.hpp.
+	if (extension == "777" || extension == "999" || extension == "888" || extension == "555")
 	{
 		_env.log("Forward set ignored for virtual extension " + extension, true);
 	}
@@ -155,9 +156,10 @@ const pbx::RingGroup* PbxFeatureConfig::findRingGroup(const std::string& extensi
 
 void PbxFeatureConfig::setRingGroup(const std::string& groupExt, const std::string& members, const std::string& mode)
 {
-	// "888" is ConferenceRoom::EXT — see setForwardLocked above for why this
-	// file spells it out instead of including ConferenceRoom.hpp.
-	if (groupExt == "777" || groupExt == "999" || groupExt == "888")
+	// "888" is ConferenceRoom::EXT, "555" is the anchor media bridge — see
+	// setForwardLocked above for why this file spells them out instead of
+	// including ConferenceRoom.hpp/RequestsHandler.hpp.
+	if (groupExt == "777" || groupExt == "999" || groupExt == "888" || groupExt == "555")
 	{
 		_env.log("Ring group ignored for reserved extension " + groupExt, true);
 	}
@@ -280,7 +282,7 @@ void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string
 	{
 		_env.log("Dial rule ignored: invalid pattern \"" + pattern + "\"", true);
 	}
-	else if (pattern == "777" || pattern == "999" || pattern == "440")
+	else if (pattern == "777" || pattern == "999" || pattern == "440" || pattern == "555")
 	{
 		// These are handled above the dial plan in onInvite(), so a rule here
 		// would never fire. Refuse it instead of accepting a dead rule.
