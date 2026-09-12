@@ -94,3 +94,8 @@ notes/
 LINEAGE.md
 *.old
 *.bak
+
+# Interop harness (tests/interop): server + per-UA SIP traces, regenerated each run
+tests/interop/.logs/
+__pycache__/
+*.pyc

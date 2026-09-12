@@ -1,8 +1,19 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 <!-- REGISTER, then call the 777 echo service with a PCMU offer. 777 is a
-     server-terminated leg, so the answer's m-line must be the pinned
-     "0 8 101" (enforceG711), then BYE cleanly. Run with -s <extension>. -->
+     server-terminated leg, so the answer may only NARROW what was offered
+     (RFC 3264 6.1) -- it keeps the offer's own payload numbering rather than
+     pinning a list of its own. This scenario offers "0 101" and so must get
+     "0 101" back. It used to assert the pinned "0 8 101" that enforceG711()
+     produced; that answer invented payload type 101 with no a=rtpmap when the
+     caller had not offered it, which pjsip rejects outright with 400 Bad SDP
+     (see tests/interop/ and ISSUES.md #140). Then BYE cleanly.
+     Run with -s <extension>.
+
+     NOTE: a failing check_it ereg logs "Failed regexp match" but does NOT fail
+     the call here -- the stale assertion below still reported PASS for months.
+     Read tests/sipp/.logs/<name>.out, or use tests/interop/, before trusting a
+     green run to mean the body was actually what you expected. -->
 <scenario name="777 echo, PCMU offer">
   <send retrans="500"><![CDATA[
     REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
@@ -47,7 +58,7 @@
   <recv response="180" optional="true"/>
   <recv response="200" rtd="true" rrs="true">
     <action>
-      <ereg regexp="m=audio [0-9]+ RTP/AVP 0 8 101" search_in="body" check_it="true" assign_to="1"/>
+      <ereg regexp="m=audio [0-9]+ RTP/AVP 0 101" search_in="body" check_it="true" assign_to="1"/>
     </action>
   </recv>
   <nop><action><log message="answer m-line ok: [$1]"/></action></nop>

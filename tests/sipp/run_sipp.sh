@@ -53,7 +53,7 @@ run_uac() {
 
 echo "== SIPp interop against $SERVER"
 run_uac register  register.xml      601 5061; result "REGISTER (open)" $?
-run_uac echo-pcmu echo-pcmu.xml     602 5062; result "777 echo, PCMU offer -> 0 8 101 answer" $?
+run_uac echo-pcmu echo-pcmu.xml     602 5062; result "777 echo, PCMU offer -> answer keeps the offer's 0 101" $?
 run_uac opus-488  opus-only-488.xml 603 5063; result "Opus-only offer -> 488" $?
 
 # Codec-order pair: callee UAS first (registers, then waits), then the caller.

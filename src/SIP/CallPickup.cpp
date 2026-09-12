@@ -1,6 +1,7 @@
 // CallPickup.cpp: directed/group call pickup completion, extracted out of
 // RequestsHandler.
 #include "CallPickup.hpp"
+#include "SipWireUtil.hpp"
 
 #include "IDGen.hpp"
 #include "Session.hpp"
@@ -21,7 +22,7 @@ void CallPickup::complete(const std::shared_ptr<SipMessage>& data,
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader(SipMessageTypes::BUSY);
 		resp->clearBody();
-		resp->setVia(std::string(data->getVia()) + ";received=" + _env.localIp());
+		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		resp->setContact(_env.contactFor(picker->getNumber()));
 		_env.enqueue(data->getSource(), std::move(resp));
 	};
@@ -90,7 +91,7 @@ void CallPickup::complete(const std::shared_ptr<SipMessage>& data,
 	callerTo += ";tag=" + callerToTag;
 
 	okToCaller->setHeader(SipMessageTypes::OK);
-	okToCaller->setVia(std::string(invite->getVia()) + ";received=" + _env.localIp());
+	okToCaller->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 	okToCaller->setTo(callerTo);
 	okToCaller->setContact(_env.contactFor(picker->getNumber()));
 	okToCaller->setBody(std::string(data->getBody()));
@@ -103,7 +104,7 @@ void CallPickup::complete(const std::shared_ptr<SipMessage>& data,
 	toForPicker += ";tag=" + pickerToTag;
 
 	okToPicker->setHeader(SipMessageTypes::OK);
-	okToPicker->setVia(std::string(data->getVia()) + ";received=" + _env.localIp());
+	okToPicker->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	okToPicker->setTo(toForPicker);
 	okToPicker->setContact(_env.contactFor(ringingExt));
 	okToPicker->setBody(std::string(invite->getBody()));

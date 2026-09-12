@@ -142,8 +142,6 @@ std::shared_ptr<SipMessage> BlfSubscriptions::buildDialogNotify(DialogSubscripti
 
 void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 {
-	const std::string& activeIp = _env.localIp();
-
 	// 1. Event-package gate: only the RFC 4235 "dialog" package is implemented.
 	std::string pkg = parseEventPackage(data->getEvent());
 	if (pkg != "dialog")
@@ -152,7 +150,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader(SipMessageTypes::BAD_EVENT);
 		resp->clearBody();
-		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		resp->addHeader("Allow-Events", "dialog");
 		_env.enqueue(data->getSource(), std::move(resp));
 		return;
@@ -166,7 +164,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader(SipMessageTypes::BAD_REQUEST);
 		resp->clearBody();
-		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_env.enqueue(data->getSource(), std::move(resp));
 		return;
 	}
@@ -195,7 +193,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 			if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 			resp->setHeader("SIP/2.0 503 Service Unavailable");
 			resp->clearBody();
-			resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+			resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 			_env.enqueue(data->getSource(), std::move(resp));
 			_env.log("BLF: subscription pool exhausted, 503 to watcher of " + target, true);
 			return;
@@ -216,7 +214,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader(SipMessageTypes::ACCEPTED);
 		resp->clearBody();
-		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		if (sub) resp->setTo(sub->subTo);
 		else     resp->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 		resp->setContact(_env.contactFor(target));

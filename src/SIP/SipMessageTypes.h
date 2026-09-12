@@ -16,6 +16,11 @@ public:
 	static constexpr auto UNAVAILABLE        = "SIP/2.0 480 Temporarily Unavailable";
 	static constexpr auto OK                 = "SIP/2.0 200 OK";
 	static constexpr auto ACK                = "ACK";
+	// Dispatch key (never a wire start line): every non-2xx final response that
+	// has no more specific key above is routed here, so it reaches a handler at
+	// all instead of falling off the table unacknowledged. See
+	// RequestsHandler::onFinalFailure.
+	static constexpr auto FINAL_FAILURE      = "final-failure";
 	static constexpr auto BYE                = "BYE";
 	static constexpr auto OPTIONS            = "OPTIONS";
 	// Blind transfer (RFC 3515). REFER carries a Refer-To target; the transferor

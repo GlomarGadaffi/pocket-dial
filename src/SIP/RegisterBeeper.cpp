@@ -93,9 +93,13 @@ void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone)
 
 	auto invite = _env.messageFromPool(ss.str(), addr);
 	if (!invite) return;   // pool exhausted: drop, peer retransmits (#101A)
-	// Normalise the codec list and (re)derive Content-Length from the actual body —
-	// a wrong Content-Length silently breaks the offer on UDP (the 777-path bug).
-	invite->enforceG711();
+	// (Re)derive Content-Length from the actual body — a wrong Content-Length
+	// silently breaks the offer on UDP (the 777-path bug). No enforceG711(): the
+	// body above is already this server's own minimal offer, and enforceG711()
+	// rewrote its m= line to "0 8 101", advertising a dynamic PT 101 with no
+	// a=rtpmap line. RFC 4566 §6 requires one, and pjsip answers the beep INVITE
+	// with 400 Bad SDP because of it. Nothing wants a telephone-event PT here
+	// anyway: the offer is a=inactive on port 9 — no media rides it.
 	invite->syncContentLength();
 	_env.enqueue(addr, std::move(invite));
 	_env.log("Register beep: INVITE -> " + clientNum);
@@ -223,6 +227,42 @@ void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
 		}
 		bd = BeepDialog{};   // AwaitingByeOk / AwaitingCancelDone fallback: free the slot
 	}
+}
+
+bool RegisterBeeper::handleInviteFailure(const std::shared_ptr<SipMessage>& data)
+{
+	BeepDialog* bd = findByCallID(data->getCallID());
+	if (!bd)
+	{
+		return false;
+	}
+
+	// Only the INVITE transaction takes an ACK. A failure to our BYE (or to the
+	// CANCEL) has nothing to acknowledge — the dialog is over either way, so the
+	// slot is simply released.
+	const std::string cseq(data->getCSeq());
+	if (cseq.find(SipMessageTypes::INVITE) != std::string::npos &&
+		(bd->state == BeepState::AwaitingInviteOk || bd->state == BeepState::AwaitingCancelDone))
+	{
+		// buildAck() already stamps the INVITE's Call-ID/branch/From-tag and takes
+		// the To tag off the response, which is exactly what §17.1.1.3 wants for a
+		// non-2xx ACK — it travels in the same transaction as the INVITE.
+		auto ack = buildAck(*bd, data);
+		if (!ack)
+		{
+			// Pool exhausted. Stay in this state so the phone's retransmitted
+			// failure response re-enters here and retries the ACK (#101A); the
+			// deadline still frees the slot if it never does.
+			_env.log("Register beep: " + bd->ext + " — pool exhausted, ACK of "
+				+ std::string(data->getHeader()) + " deferred", true);
+			return true;
+		}
+		_env.log("Register beep: " + bd->ext + " declined the beep ("
+			+ std::string(data->getHeader()) + ") — ACKed, slot freed");
+		_env.enqueue(bd->addr, std::move(ack));
+	}
+	*bd = BeepDialog{};
+	return true;
 }
 
 std::shared_ptr<SipMessage> RegisterBeeper::buildAck(const BeepDialog& bd,

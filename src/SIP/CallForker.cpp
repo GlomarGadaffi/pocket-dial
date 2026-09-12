@@ -89,7 +89,7 @@ void CallForker::startBroadcastFork(std::shared_ptr<SipMessage> invite,
 	ringing->setHeader("SIP/2.0 180 Ringing");
 	ringing->clearBody();
 	std::string activeIp = _env.localIp();
-	ringing->setVia(std::string(invite->getVia()) + ";received=" + activeIp);
+	ringing->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 	ringing->setTo(std::string(invite->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	ringing->setContact(_env.contactFor(contactExt));
 	_env.enqueue(invite->getSource(), std::move(ringing));
@@ -325,7 +325,7 @@ void CallForker::routeRingGroup(const std::shared_ptr<SipMessage>& data,
 	ringing->setHeader("SIP/2.0 180 Ringing");
 	ringing->clearBody();
 	std::string activeIp = _env.localIp();
-	ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+	ringing->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	ringing->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	ringing->setContact(_env.contactFor(groupExt));
 	_env.enqueue(data->getSource(), std::move(ringing));

@@ -38,7 +38,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 		auto ok = _env.messageFromPool(data->toString(), data->getSource());
 		if (!ok) return;   // pool exhausted: drop, peer retransmits (#101A)
 		ok->setHeader(SipMessageTypes::OK);
-		ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		ok->setContact(_env.contactFor(orbit));
 		ok->setBody(holdSdp);
@@ -110,7 +110,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 	auto ok = _env.messageFromPool(data->toString(), data->getSource());
 	if (!ok) return;   // pool exhausted: drop, peer retransmits (#101A)
 	ok->setHeader(SipMessageTypes::OK);
-	ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+	ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 	ok->setContact(_env.contactFor(orbit));
 	if (!parkedSdp.empty()) ok->setBody(parkedSdp);

@@ -87,10 +87,16 @@ public:
 	void setContact(std::string value);
 	void setContentLength(std::string value);
 	void addHeader(const std::string& name, const std::string& value);
-	// Pins the SDP payload list to "0 8 101". For SDP the SERVER itself
-	// terminates (777 echo, register beep, the 440/anchor media legs): those
-	// paths only ever speak G.711, so the list is the truth for them. Do NOT
-	// use it on a relayed offer/answer -- see filterAudioCodecs().
+	// Pins the SDP payload list to "0 8 101".
+	//
+	// DEPRECATED, and as of ISSUES.md #139 called from NO production path -- only
+	// from tests that use it as a convenient body mutation. Do not reintroduce it:
+	// "0 8 101" asserts payload type 101 with no matching a=rtpmap, which RFC 4566
+	// §6 forbids for a dynamic PT, and pjsip answers such a body with 400 Bad SDP.
+	// On an ANSWER it is doubly wrong -- RFC 3264 §6.1 requires the offer's own
+	// payload numbering. Use filterAudioCodecs() for a relayed or echoed body, and
+	// for a body the server BUILDS just emit the right m= line (buildMediaSdp() and
+	// sipwire::makeInactiveHoldSdp() already do).
 	void enforceG711();
 	// Codec policy for a RELAYED offer/answer (peer-to-peer legs): keep the
 	// endpoint's own payload list and ORDER, dropping only what this PBX

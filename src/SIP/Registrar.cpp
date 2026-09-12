@@ -1,4 +1,5 @@
 #include "Registrar.hpp"
+#include "SipWireUtil.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -68,7 +69,7 @@ void Registrar::sendChallenge(const std::shared_ptr<SipMessage>& data, bool stal
 	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setHeader("SIP/2.0 401 Unauthorized");
 	response->clearBody();
-	response->setVia(std::string(data->getVia()) + ";received=" + _env.localIp());
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	// Fresh stateless nonce per challenge; realm MUST match SipSecretStore::kRealm.
 	response->addHeader("WWW-Authenticate",
@@ -84,7 +85,7 @@ void Registrar::sendForbidden(const std::shared_ptr<SipMessage>& data, const std
 	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setHeader("SIP/2.0 403 " + reason);
 	response->clearBody();
-	response->setVia(std::string(data->getVia()) + ";received=" + _env.localIp());
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->syncContentLength();
 	_env.enqueue(data->getSource(), std::move(response));
 }

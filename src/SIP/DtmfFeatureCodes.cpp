@@ -1,6 +1,7 @@
 // DtmfFeatureCodes.cpp: the DTMF digit-collection state machine, CLASS
 // feature codes, and the admin menu, extracted out of RequestsHandler.
 #include "DtmfFeatureCodes.hpp"
+#include "SipWireUtil.hpp"
 
 #include <cctype>
 #include <chrono>
@@ -255,7 +256,7 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
 		std::string activeIp = _env.localIp();
-		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_env.enqueue(data->getSource(), std::move(response));
 		accum.digits.clear();
 		return;

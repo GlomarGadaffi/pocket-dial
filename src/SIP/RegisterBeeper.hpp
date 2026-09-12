@@ -55,6 +55,18 @@ public:
 	// true if the response was consumed (the caller must not process it further).
 	bool handleOk(const std::shared_ptr<SipMessage>& data);
 
+	// Route a NON-2xx final response to our beep INVITE (matched by Call-ID):
+	// ACK it and free the slot. Returns true if the response was consumed.
+	//
+	// RFC 3261 §17.1.1.3 makes the ACK mandatory — without it the phone's server
+	// transaction keeps retransmitting its failure response until Timer H (~32 s).
+	// Worse, this dialog previously sat in AwaitingInviteOk until sweep()'s
+	// deadline and then sent a CANCEL, which §9.1 forbids once a final response
+	// has arrived; the phone answers that with 481 and the slot stays pinned for
+	// the whole window. A phone can legitimately reject the beep (a 4xx it does
+	// not like, 488, 606), so this is an ordinary path, not an error path.
+	bool handleInviteFailure(const std::shared_ptr<SipMessage>& data);
+
 	// Time out overdue dialogs: CANCEL an unanswered INVITE (see sweep()'s own
 	// comment for why the slot isn't freed immediately), free a slot whose
 	// bounded fallback window has expired either way.
