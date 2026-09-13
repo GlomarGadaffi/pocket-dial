@@ -1,5 +1,27 @@
 # Threat Model: pocket-dial ESP32 SIP PBX
 
+> [!WARNING]
+> **STALE as of 2026-09-13 — the auth model this document describes has been replaced,
+> and this file has not yet been revised to match.** Two changes since v1.0 below:
+> 1. The HTTP listen socket is now **always open** regardless of provisioning state —
+>    the "dark by default once provisioned, DTMF `*4887` star-code to reopen" mechanism
+>    §5.4/§5.5 and threat E-4 describe no longer exists. It caused a real hardware
+>    lockout (dashboard "connection refused" the instant any client registered).
+> 2. The admin credential is now a **username + password with a shipped default**
+>    (`admin`/`admin`), not a bare PIN, and there is no more "unprovisioned = open,
+>    no session needed" window (§5.1's "First-run gap") — every admin-gated action
+>    is refused until the default credential is replaced (`setup_required`, enforced
+>    server-side). The phone-keypad DTMF admin menu now uses a **separate** numeric
+>    PIN with no default at all (disabled until explicitly set), independent of the
+>    web login.
+>
+> Every section below through §5.5, plus threat entries S-1/E-1/E-4/D-3/I-5 and the
+> "PIN strength"/"Mandatory admin PIN" recommendations, needs a full revision pass to
+> match. Treat this file as historical context for *why* the auth layer exists, not as
+> an accurate description of its current mechanics — see `docs/API.md` §0 and
+> `docs/SETUP_GUIDE.md` §3 for the current model, and `src/Helpers/AdminAuth.{hpp,cpp}`
+> for the source of truth.
+
 **Date**: 2026-06-04 | **Version**: 1.0 | **Author**: Security Engineering | **Phase**: 1 (production hardening)
 
 This document is a STRIDE-structured threat model for the **pocket-dial** ESP32 SIP PBX

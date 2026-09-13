@@ -8,6 +8,16 @@ This plan ensures that all management endpoints function correctly under standar
 > `src/Helpers/HttpServer.cpp` (`handleClient()` dispatch, `requireAdmin()`).
 > Where this plan and the code disagree, the code is right — fix the plan.
 
+> [!WARNING]
+> **STALE as of 2026-09-13.** This plan's §0 and its PIN-provisioning test cases
+> describe two mechanisms that no longer exist: the "dark by default, DTMF `*4887`
+> reopens it" HTTP transport gate, and the bare-PIN admin credential (`/api/admin/set-pin`,
+> `pin=` form param). The HTTP listener is now always open, and the admin credential is a
+> username + password with a shipped default (`admin`/`admin`) via `/api/admin/set-credential`
+> — see [`API.md`](API.md) §0 for the current model. `tests/http/test_api.sh` has been
+> updated to match (its own header comment documents the new suite ordering); this plan
+> document has not yet had the equivalent full revision pass.
+
 ---
 
 ## 🚦 0. Before You Test Anything: Provisioned vs Unprovisioned

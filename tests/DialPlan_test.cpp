@@ -722,7 +722,11 @@ namespace
 	// Minimal blocking HTTP POST over a raw socket, mirroring
 	// AdminHttpGate_test.cpp's helper. No Origin header → treated as a direct
 	// request by isSameOrigin(), which is what curl/the dashboard's own fetch do.
-	std::string httpPostRaw(int port, const std::string& path, const std::string& body)
+	// `cookie`/`csrf`, when non-empty, are sent as the session cookie and the
+	// X-CSRF header — every mutating route requires a logged-in session now
+	// (there is no more "unprovisioned, no session needed" bypass).
+	std::string httpPostRaw(int port, const std::string& path, const std::string& body,
+	                        const std::string& cookie = "", const std::string& csrf = "")
 	{
 #if defined(_WIN32) || defined(_WIN64)
 		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
@@ -744,10 +748,13 @@ namespace
 #endif
 			return "";
 		}
+		std::string cookieHeader = cookie.empty() ? "" : ("Cookie: " + cookie + "\r\n");
+		std::string csrfHeader   = csrf.empty()   ? "" : ("X-CSRF: " + csrf + "\r\n");
 		std::string req = "POST " + path + " HTTP/1.1\r\n"
 			"Host: 127.0.0.1\r\n"
 			"Content-Type: application/x-www-form-urlencoded\r\n"
-			"Content-Length: " + std::to_string(body.size()) + "\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n" +
+			cookieHeader + csrfHeader +
 			"Connection: close\r\n\r\n" + body;
 		send(s, req.c_str(), static_cast<int>(req.size()), 0);
 
@@ -822,7 +829,7 @@ namespace
 
 TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 {
-	AdminAuth::clearCredential();   // unprovisioned → same-origin gate only
+	AdminAuth::clearCredential();
 
 	RequestsHandler handler("192.168.9.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
@@ -831,18 +838,27 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
+	// Every mutating route needs a logged-in, fully-set-up session now — there
+	// is no more "unprovisioned, no session needed" bypass. Bypass the HTTP
+	// login round trip itself (not what this test is about) and go straight to
+	// AdminAuth for a session token + CSRF.
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
+	std::string token = AdminAuth::createSession();
+	std::string csrf = AdminAuth::sessionCsrf(token);
+	std::string cookie = "pd_session=" + token;
+
 	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
-		"pattern=2XX&action=group&target=610")), 200);
+		"pattern=2XX&action=group&target=610", cookie, csrf)), 200);
 	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
-		"pattern=3XX&action=page&target=981")), 200);
+		"pattern=3XX&action=page&target=981", cookie, csrf)), 200);
 
 	// '*' and '#' are the grammar's own characters AND form-encoding metacharacters,
 	// so a rule that uses them has to survive getFormParam's url-decoding intact —
 	// a plan whose wildcard cannot be configured over the API is no plan at all.
 	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
-		"pattern=6*&action=group&target=610")), 200);
+		"pattern=6*&action=group&target=610", cookie, csrf)), 200);
 	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
-		"pattern=%239&action=park&target=701")), 200);
+		"pattern=%239&action=park&target=701", cookie, csrf)), 200);
 
 	auto rules = handler.getDialRules();
 	ASSERT_EQ(rules.size(), 4u);
@@ -866,8 +882,8 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 	EXPECT_LT(first, second) << "/api/status must emit the plan in evaluation order";
 
 	// An empty target deletes — including a pattern carrying a wildcard.
-	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=2XX&target=")), 200);
-	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=6*&target=")), 200);
+	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=2XX&target=", cookie, csrf)), 200);
+	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=6*&target=", cookie, csrf)), 200);
 	rules = handler.getDialRules();
 	ASSERT_EQ(rules.size(), 2u);
 	EXPECT_EQ(std::get<0>(rules[0]), "3XX");
@@ -885,18 +901,23 @@ TEST(DialPlanHttp, PostApiDialPlanRejectsBadParametersWith400)
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan", "action=group&target=610")), 400)
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
+	std::string token = AdminAuth::createSession();
+	std::string csrf = AdminAuth::sessionCsrf(token);
+	std::string cookie = "pd_session=" + token;
+
+	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan", "action=group&target=610", cookie, csrf)), 400)
 		<< "missing pattern";
 	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
-		"pattern=2XX&action=pickup&target=610")), 400) << "unknown action";
+		"pattern=2XX&action=pickup&target=610", cookie, csrf)), 400) << "unknown action";
 	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
-		"pattern=2XX&action=page&target=601")), 400) << "page target is not a 98x zone";
+		"pattern=2XX&action=page&target=601", cookie, csrf)), 400) << "page target is not a 98x zone";
 	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
-		"pattern=2XX&action=park&target=799")), 400) << "park target is not an orbit";
+		"pattern=2XX&action=park&target=799", cookie, csrf)), 400) << "park target is not an orbit";
 	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
-		"pattern=777&action=group&target=610")), 400) << "reserved extension as a pattern";
+		"pattern=777&action=group&target=610", cookie, csrf)), 400) << "reserved extension as a pattern";
 	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
-		"pattern=2%20XX&action=group&target=610")), 400) << "unsafe character in pattern";
+		"pattern=2%20XX&action=group&target=610", cookie, csrf)), 400) << "unsafe character in pattern";
 
 	EXPECT_TRUE(handler.getDialRules().empty())
 		<< "no rejected request may have reached the rule table";

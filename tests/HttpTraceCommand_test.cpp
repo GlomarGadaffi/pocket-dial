@@ -66,8 +66,10 @@ namespace
 	}
 
 	// Minimal blocking HTTP GET over a raw socket. Returns the full raw
-	// response (status line + headers + body).
-	std::string httpGetRaw(int port, const std::string& path)
+	// response (status line + headers + body). `cookie`, when non-empty, is
+	// sent as the session cookie -- /api/trace requires a logged-in session
+	// now (there is no more "unprovisioned, no session needed" bypass).
+	std::string httpGetRaw(int port, const std::string& path, const std::string& cookie = "")
 	{
 #if defined(_WIN32) || defined(_WIN64)
 		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
@@ -89,8 +91,10 @@ namespace
 #endif
 			return "";
 		}
+		std::string cookieHeader = cookie.empty() ? "" : ("Cookie: " + cookie + "\r\n");
 		std::string req = "GET " + path + " HTTP/1.1\r\n"
-			"Host: 127.0.0.1\r\n"
+			"Host: 127.0.0.1\r\n" +
+			cookieHeader +
 			"Connection: close\r\n\r\n";
 		send(s, req.c_str(), static_cast<int>(req.size()), 0);
 		std::string resp;
@@ -148,9 +152,12 @@ namespace
 
 TEST(HttpTraceCommand, ApiTraceRoundTripsRawSipTextWithQuotesAndBackslashes)
 {
-	// Ungated path: no PIN provisioned, so /api/trace serves without a session
-	// (same setup as AdminHttpGate's Boot_Unprovisioned_ListensImmediately).
+	// /api/trace requires a logged-in session (requireAdmin) -- go straight to
+	// AdminAuth for one rather than a full HTTP login round trip, which isn't
+	// what this test is about.
 	AdminAuth::clearCredential();
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
+	std::string sessionCookie = "pd_session=" + AdminAuth::createSession();
 
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
@@ -186,7 +193,7 @@ TEST(HttpTraceCommand, ApiTraceRoundTripsRawSipTextWithQuotesAndBackslashes)
 
 	handler.handle(RequestsHandler::getMessageFromPool(raw, src));
 
-	std::string resp = httpGetRaw(18095, "/api/trace");
+	std::string resp = httpGetRaw(18095, "/api/trace", sessionCookie);
 	ASSERT_NE(resp.find("200"), std::string::npos) << resp;
 	ASSERT_NE(resp.find("application/json"), std::string::npos) << resp;
 

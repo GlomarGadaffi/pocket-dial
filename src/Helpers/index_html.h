@@ -430,25 +430,34 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
     <div class="mbody">
       <div class="subhead">Operator Authentication</div>
       <div id="admin-loading" class="note">Querying admin status&hellip;</div>
-      <div id="admin-setpin" style="display:none">
-        <div class="note">No admin PIN set. Create one to protect this device.</div>
-        <div class="field"><label>New PIN (min 4 chars)</label><input type="password" id="adm-newpin" inputmode="numeric" autocomplete="off"></div>
-        <button class="btn primary" onclick="adminSetPin()">&#9919; Set PIN</button>
-      </div>
       <div id="admin-login" style="display:none">
-        <div class="note">Admin login required to unlock controls.</div>
-        <div class="field"><label>PIN</label><input type="password" id="adm-pin" inputmode="numeric" autocomplete="off"></div>
+        <div class="note">Ships with a default login &mdash; admin / admin &mdash; until you set a real one below.</div>
+        <div class="field"><label>Username</label><input type="text" id="adm-user" autocomplete="username"></div>
+        <div class="field"><label>Password</label><input type="password" id="adm-pass" autocomplete="current-password"></div>
         <button class="btn primary" onclick="adminLogin()">Login</button>
+      </div>
+      <div id="admin-setup" style="display:none">
+        <div class="msg warn">&#9888; Still on the default login. Set a real username, password, and (optional) DTMF admin PIN before doing anything else.</div>
+        <div class="field"><label>New username</label><input type="text" id="adm-setup-user" autocomplete="username" value="admin"></div>
+        <div class="field"><label>New password (min 8 chars)</label><input type="password" id="adm-setup-pass" autocomplete="new-password"></div>
+        <div class="field"><label>DTMF admin PIN (4-16 digits, optional &mdash; phone-keypad admin menu stays disabled without one)</label><input type="password" id="adm-setup-dtmfpin" inputmode="numeric" autocomplete="off"></div>
+        <button class="btn primary" onclick="adminCompleteSetup()">Complete Setup</button>
       </div>
       <div id="admin-loggedin" style="display:none">
         <div class="msg ok">&#9679; Logged in &mdash; admin controls unlocked.</div>
         <div class="row">
-          <button class="btn" onclick="toggleChangePin()">Change PIN</button>
+          <button class="btn" onclick="toggleChangeCredential()">Change Password</button>
+          <button class="btn" onclick="toggleChangeDtmfPin()">Change DTMF PIN</button>
           <button class="btn danger" onclick="adminLogout()">Logout</button>
         </div>
-        <div id="admin-changepin" style="display:none;margin-top:8px">
-          <div class="field"><label>New PIN (min 4 chars)</label><input type="password" id="adm-changepin-val" inputmode="numeric" autocomplete="off"></div>
-          <button class="btn primary" onclick="adminSetPin('change')">Save</button>
+        <div id="admin-changecred" style="display:none;margin-top:8px">
+          <div class="field"><label>Username</label><input type="text" id="adm-changeuser" autocomplete="username"></div>
+          <div class="field"><label>New password (min 8 chars)</label><input type="password" id="adm-changepass" autocomplete="new-password"></div>
+          <button class="btn primary" onclick="adminChangeCredential()">Save</button>
+        </div>
+        <div id="admin-changedtmfpin" style="display:none;margin-top:8px">
+          <div class="field"><label>New DTMF PIN (4-16 digits)</label><input type="password" id="adm-changedtmfpin-val" inputmode="numeric" autocomplete="off"></div>
+          <button class="btn primary" onclick="adminChangeDtmfPin()">Save</button>
         </div>
       </div>
       <div class="msg" id="admin-msg"></div>
@@ -642,7 +651,7 @@ R"html1b(      <div class="kv"><span class="k">Current mode</span><span id="ap-m
 <script>
 "use strict";
 var statusData={ip:"0.0.0.0",port:5060,uptime:0,clients:[],sessions:[],dnd:[],forwards:[],groups:[],packetsProcessed:0};
-var adminState={provisioned:false,authenticated:false};
+var adminState={provisioned:false,needsSetup:true,authenticated:false};
 var otaUploading=false;
 var selectedSSID="";
 var selectedJack=null;
@@ -778,7 +787,7 @@ function openJack(ext){
   setMsg("jd-msg","");
   openModal("jack-modal");
 }
-function gateCheck(){if(adminState.provisioned&&!adminState.authenticated){toast("Admin login required","err");openModal("admin-modal");return false;}return true;}
+function gateCheck(){if(!adminState.authenticated||adminState.needsSetup){toast(adminState.authenticated?"Complete admin setup first":"Admin login required","err");openModal("admin-modal");return false;}return true;}
 
 function toggleDnd(){
   if(!selectedJack)return;
@@ -999,20 +1008,22 @@ window.addEventListener("resize",function(){clearTimeout(rsTimer);rsTimer=setTim
 /* ════ ADMIN / AUTH ════ */
 function fetchAdminStatus(){
   return fetch("/api/admin/status",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(d){
-    adminState.provisioned=!!d.provisioned;adminState.authenticated=!!d.authenticated;
+    adminState.provisioned=!!d.provisioned;adminState.needsSetup=!!d.needsSetup;adminState.authenticated=!!d.authenticated;
     renderAdminPanel();applyAuthGating();
-    if(adminState.authenticated){fetchApSecurity();fetchRegistrar();}
+    if(adminState.authenticated&&!adminState.needsSetup){fetchApSecurity();fetchRegistrar();}
   }).catch(function(){});
 }
 function renderAdminPanel(){
   $("admin-loading").style.display="none";
-  $("admin-setpin").style.display="none";$("admin-login").style.display="none";
+  $("admin-login").style.display="none";$("admin-setup").style.display="none";
   $("admin-loggedin").style.display="none";
-  if(!adminState.provisioned)$("admin-setpin").style.display="block";
-  else if(!adminState.authenticated)$("admin-login").style.display="block";
+  if(!adminState.authenticated)$("admin-login").style.display="block";
+  else if(adminState.needsSetup)$("admin-setup").style.display="block";
   else $("admin-loggedin").style.display="block";
 }
-function controlsUnlocked(){return !adminState.provisioned||adminState.authenticated;}
+/* Mirrors the server's requireAdmin() setup_required gate: logged in on the
+   default credential unlocks nothing except completing setup. */
+function controlsUnlocked(){return adminState.authenticated&&!adminState.needsSetup;}
 function applyAuthGating(){
   var unlocked=controlsUnlocked();
   ["wifi-connect-btn","wifi-ap-btn","wifi-reset-btn","ota-upload-btn","ota-reboot-btn"].forEach(function(id){var b=$(id);if(b)b.disabled=!unlocked;});
@@ -1021,21 +1032,34 @@ function applyAuthGating(){
   var of=$("ota-file");if(of)of.disabled=!unlocked;
 }
 function handleAuthExpired(){adminState.authenticated=false;renderAdminPanel();applyAuthGating();setMsg("admin-msg","Session expired — please log in.","err");}
-function adminSetPin(mode){
-  var inputId=mode==="change"?"adm-changepin-val":"adm-newpin";
-  var pin=$(inputId).value;
-  if(!pin||pin.length<4){setMsg("admin-msg","PIN must be at least 4 characters.","err");return;}
-  fetch("/api/admin/set-pin",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"pin="+encodeURIComponent(pin)})
-    .then(function(r){
-      if(r.status===401){handleAuthExpired();return;}
+function adminCompleteSetup(){
+  var user=$("adm-setup-user").value,pass=$("adm-setup-pass").value,dtmfPin=$("adm-setup-dtmfpin").value;
+  if(!user||!pass||pass.length<8){setMsg("admin-msg","Username and an 8+ character password are required.","err");return;}
+  var body="username="+encodeURIComponent(user)+"&password="+encodeURIComponent(pass);
+  if(dtmfPin)body+="&dtmfPin="+encodeURIComponent(dtmfPin);
+  post("/api/admin/set-credential",body).then(function(){
+    $("adm-setup-pass").value="";$("adm-setup-dtmfpin").value="";
+    setMsg("admin-msg","Setup complete.","ok");fetchAdminStatus();
 )html2a";
 
 static const char PD_HTML_3[] =
-R"html3(      if(r.status===400){setMsg("admin-msg","Invalid PIN (min 4 chars).","err");return;}
-      if(!r.ok){setMsg("admin-msg","Failed (HTTP "+r.status+").","err");return;}
-      $(inputId).value="";$("admin-changepin").style.display="none";
-      setMsg("admin-msg","Admin PIN updated.","ok");fetchAdminStatus();
-    }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
+R"html3(  }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
+}
+function adminChangeCredential(){
+  var user=$("adm-changeuser").value,pass=$("adm-changepass").value;
+  if(!user||!pass||pass.length<8){setMsg("admin-msg","Username and an 8+ character password are required.","err");return;}
+  post("/api/admin/set-credential","username="+encodeURIComponent(user)+"&password="+encodeURIComponent(pass)).then(function(){
+    $("adm-changepass").value="";$("admin-changecred").style.display="none";
+    setMsg("admin-msg","Password updated.","ok");
+  }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
+}
+function adminChangeDtmfPin(){
+  var pin=$("adm-changedtmfpin-val").value;
+  if(!pin||pin.length<4){setMsg("admin-msg","DTMF PIN must be at least 4 digits.","err");return;}
+  post("/api/admin/set-credential","dtmfPin="+encodeURIComponent(pin)).then(function(){
+    $("adm-changedtmfpin-val").value="";$("admin-changedtmfpin").style.display="none";
+    setMsg("admin-msg","DTMF PIN updated.","ok");
+  }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
 }
 /* post() resolves to the raw response text, so the AP handlers parse it here. */
 function parseJsonOr(t){try{return JSON.parse(t);}catch(e){return {};}}
@@ -1143,13 +1167,14 @@ function registrarDevice(action,target){
     }).catch(function(e){setMsg("reg-msg","Error: "+e.message,"err");});
 }
 function adminLogin(){
-  var pin=$("adm-pin").value;if(!pin){setMsg("admin-msg","Enter your PIN.","err");return;}
-  fetch("/api/admin/login",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"pin="+encodeURIComponent(pin)})
+  var user=$("adm-user").value,pass=$("adm-pass").value;
+  if(!user||!pass){setMsg("admin-msg","Enter your username and password.","err");return;}
+  fetch("/api/admin/login",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+        body:"username="+encodeURIComponent(user)+"&password="+encodeURIComponent(pass)})
     .then(function(r){
-      $("adm-pin").value="";
-      if(r.status===401){setMsg("admin-msg","Incorrect PIN.","err");return;}
+      $("adm-pass").value="";
+      if(r.status===401){setMsg("admin-msg","Incorrect username or password.","err");return;}
       if(r.status===429){setMsg("admin-msg","Locked — wait a minute.","err");return;}
-      if(r.status===409){setMsg("admin-msg","No PIN set yet.","err");fetchAdminStatus();return;}
       if(!r.ok){setMsg("admin-msg","Login failed (HTTP "+r.status+").","err");return;}
       /* The login response carries this session's CSRF token so a fetch()-based
          login can start making mutating calls immediately. */
@@ -1160,7 +1185,8 @@ function adminLogin(){
 function adminLogout(){
   fetch("/api/admin/logout",{method:"POST",credentials:"same-origin"}).then(function(){setMsg("admin-msg","Logged out.","warn");fetchAdminStatus();}).catch(function(){});
 }
-function toggleChangePin(){var cp=$("admin-changepin");cp.style.display=cp.style.display==="block"?"none":"block";if(cp.style.display==="block")$("adm-changepin-val").focus();}
+function toggleChangeCredential(){var cp=$("admin-changecred");cp.style.display=cp.style.display==="block"?"none":"block";if(cp.style.display==="block")$("adm-changeuser").focus();}
+function toggleChangeDtmfPin(){var cp=$("admin-changedtmfpin");cp.style.display=cp.style.display==="block"?"none":"block";if(cp.style.display==="block")$("adm-changedtmfpin-val").focus();}
 
 /* ════ OTA ════ */
 function fetchOtaStatus(){
@@ -1401,8 +1427,10 @@ document.addEventListener("keydown",function(e){
   else if(e.key==="F9"){e.preventDefault();openModal("wifi-modal");scanWifi();}
   else if(e.key==="Escape"){["jack-modal","admin-modal","wifi-modal","telephony-modal","help-modal"].forEach(function(id){closeModal(id);});}
 });
-["adm-newpin","adm-changepin-val"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminSetPin(id==="adm-changepin-val"?"change":undefined);});});
-(function(){var el=$("adm-pin");if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminLogin();});})();
+["adm-user","adm-pass"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminLogin();});});
+["adm-setup-user","adm-setup-pass","adm-setup-dtmfpin"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminCompleteSetup();});});
+["adm-changeuser","adm-changepass"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminChangeCredential();});});
+(function(){var el=$("adm-changedtmfpin-val");if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminChangeDtmfPin();});})();
 
 /* ── init ── */
 restoreTheme();

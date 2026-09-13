@@ -82,9 +82,11 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 		// Format: '*' + PIN(>=4 digits) + '#' + 3-digit code [+ confirm digit].
 		// The '#' terminates the PIN so its length is unambiguous: we verify the
 		// PIN EXACTLY ONCE per completed code. (The old version looped over every
-		// candidate PIN length calling verifyPin() for each, so a single normal
-		// admin entry charged several failed attempts against the brute-force
-		// lockout and could lock the admin out of both DTMF and the dashboard.)
+		// candidate PIN length calling verifyDtmfPin() for each, so a single
+		// normal admin entry charged several failed attempts against the
+		// brute-force lockout and could lock the admin out of both DTMF and the
+		// dashboard — verifyDtmfPin() shares its attempt-bucket table with the
+		// web login's verifyCredential(), so that risk is real in both directions.)
 		bool adminMatched = false;
 		size_t hashPos = seq.find('#');
 		if (hashPos != std::string::npos && hashPos >= 5 && (seq.size() - hashPos - 1) >= 3)
@@ -99,7 +101,10 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 				if (!std::isdigit(static_cast<unsigned char>(c))) { allDigits = false; break; }
 			}
 			// Single verify — a wrong PIN is exactly one counted failed attempt.
-			if (!allDigits || !AdminAuth::verifyPin(pinCandidate))
+			// verifyDtmfPin() always fails until a DTMF PIN has been explicitly
+			// set (AdminAuth::setDtmfPin) — there is no default, so this whole
+			// menu is unreachable on a freshly-flashed or freshly-reset device.
+			if (!allDigits || !AdminAuth::verifyDtmfPin(pinCandidate))
 			{
 				_env.log("[admin] DTMF admin auth failed", true);
 				accum.digits.clear();

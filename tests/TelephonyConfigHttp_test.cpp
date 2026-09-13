@@ -141,20 +141,27 @@ namespace
 		return resp.substr(start, end - start);
 	}
 
-	// Provisions a PIN, logs in, and returns {cookie, csrf} — same pattern as
-	// AdminHttpGate_test.cpp's loginOn(), duplicated here because anonymous-
-	// namespace helpers don't cross translation units.
+	// Logs in with the shipped default credential, then completes initial setup
+	// with a real one -- requireAdmin() refuses every other admin-gated route
+	// (including the ones under test in this file) while needsInitialSetup()
+	// is true, and setLoginCredential() does not invalidate the session it was
+	// called through, so the same cookie/csrf pair keeps working afterward.
+	// Same pattern as AdminHttpGate_test.cpp's loginAndCompleteSetup(),
+	// duplicated here because anonymous-namespace helpers don't cross
+	// translation units.
 	struct AdminSession { std::string cookie; std::string csrf; };
 
 	AdminSession loginOn(int port)
 	{
 		AdminSession a;
-		std::string setPin = httpRaw(port, "POST", "/api/admin/set-pin", "pin=123456");
-		EXPECT_EQ(statusOf(setPin), 200);
-		std::string resp = httpRaw(port, "POST", "/api/admin/login", "pin=123456");
-		EXPECT_EQ(statusOf(resp), 200);
-		a.cookie = cookieOf(resp, "pd_session");
-		a.csrf   = csrfOf(resp);
+		std::string loginResp = httpRaw(port, "POST", "/api/admin/login", "username=admin&password=admin");
+		EXPECT_EQ(statusOf(loginResp), 200);
+		a.cookie = cookieOf(loginResp, "pd_session");
+		a.csrf   = csrfOf(loginResp);
+
+		std::string setupResp = httpRaw(port, "POST", "/api/admin/set-credential",
+			"username=admin&password=realpassword123", "pd_session=" + a.cookie, a.csrf);
+		EXPECT_EQ(statusOf(setupResp), 200);
 		return a;
 	}
 

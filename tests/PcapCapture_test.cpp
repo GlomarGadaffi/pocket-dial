@@ -68,8 +68,11 @@ namespace
 
 	// Minimal blocking HTTP GET over a raw socket — mirrors the pattern
 	// AdminHttpGate_test.cpp uses for POST. Returns the full raw response
-	// (status line + headers + body).
-	std::string httpGetRaw(int port, const std::string& path)
+	// (status line + headers + body). `cookie`, when non-empty, is sent as the
+	// session cookie -- /api/trace and /api/diagnostics/pcap require a
+	// logged-in session now (there is no more "unprovisioned, no session
+	// needed" bypass).
+	std::string httpGetRaw(int port, const std::string& path, const std::string& cookie = "")
 	{
 #if defined(_WIN32) || defined(_WIN64)
 		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
@@ -91,8 +94,9 @@ namespace
 #endif
 			return "";
 		}
+		std::string cookieHeader = cookie.empty() ? "" : ("Cookie: " + cookie + "\r\n");
 		std::string req = "GET " + path + " HTTP/1.1\r\n"
-			"Host: 127.0.0.1\r\nConnection: close\r\n\r\n";
+			"Host: 127.0.0.1\r\n" + cookieHeader + "Connection: close\r\n\r\n";
 		send(s, req.c_str(), static_cast<int>(req.size()), 0);
 		std::string resp;
 		char buf[512];
@@ -485,6 +489,14 @@ TEST(PcapCapture, PcapFileStaysInCaptureOrderAfterWrap) {
 // the five with named escapes (\", \\, \n, \r, \t).
 TEST(PcapCapture, ApiTraceEscapesRawControlBytesFromWireCapture)
 {
+	// /api/trace requires a logged-in session (requireAdmin) -- go straight to
+	// AdminAuth for one rather than a full HTTP login round trip, which isn't
+	// what this test is about. Explicit rather than relying on whatever state
+	// an earlier test in this binary left AdminAuth in.
+	AdminAuth::clearCredential();
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
+	std::string sessionCookie = "pd_session=" + AdminAuth::createSession();
+
 	RequestsHandler handler("127.0.0.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
 	HttpServer server("127.0.0.1", 18095, nullptr);
@@ -509,7 +521,7 @@ TEST(PcapCapture, ApiTraceEscapesRawControlBytesFromWireCapture)
 	ASSERT_TRUE(request != nullptr);
 	handler.handle(request, raw);
 
-	const std::string resp = httpGetRaw(18095, "/api/trace");
+	const std::string resp = httpGetRaw(18095, "/api/trace", sessionCookie);
 	ASSERT_NE(resp.find("200"), std::string::npos) << "expected a 200 OK, got: " << resp;
 
 	size_t bodyStart = resp.find("\r\n\r\n");
@@ -532,11 +544,13 @@ TEST(PcapCapture, ApiTraceEscapesRawControlBytesFromWireCapture)
 // one full 16-byte record header + synthesized frame for a captured packet.
 TEST(PcapCapture, ApiDiagnosticsPcapServesValidGlobalHeaderAndOneRecordOverRealSocket)
 {
-	// Ungated path: no PIN provisioned, so /api/diagnostics/pcap serves without
-	// a session (same setup as HttpTraceCommand_test.cpp's equivalent test) —
-	// keeps this test's outcome independent of whatever AdminAuth state an
-	// earlier test in the same binary left behind.
+	// /api/diagnostics/pcap requires a logged-in session (requireAdmin) -- go
+	// straight to AdminAuth for one, same as HttpTraceCommand_test.cpp's
+	// equivalent test. Explicit rather than relying on whatever AdminAuth
+	// state an earlier test in the same binary left behind.
 	AdminAuth::clearCredential();
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
+	std::string sessionCookie = "pd_session=" + AdminAuth::createSession();
 
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
@@ -562,7 +576,7 @@ TEST(PcapCapture, ApiDiagnosticsPcapServesValidGlobalHeaderAndOneRecordOverRealS
 		"Content-Length: 0\r\n\r\n";
 	handler.handle(RequestsHandler::getMessageFromPool(raw, src));
 
-	const std::string resp = httpGetRaw(18096, "/api/diagnostics/pcap");
+	const std::string resp = httpGetRaw(18096, "/api/diagnostics/pcap", sessionCookie);
 	ASSERT_NE(resp.find("200"), std::string::npos) << resp;
 	ASSERT_NE(resp.find("application/vnd.tcpdump.pcap"), std::string::npos) << resp;
 	ASSERT_NE(resp.find("Content-Disposition: attachment"), std::string::npos) << resp;

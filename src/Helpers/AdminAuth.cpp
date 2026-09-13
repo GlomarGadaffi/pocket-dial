@@ -6,8 +6,10 @@
 // Crypto: a small, self-contained SHA-256 (public-domain reference
 // implementation of FIPS 180-4) is used on BOTH host and ESP so that the
 // stored credential is identical and portable, and so the host build needs no
-// external crypto library. PINs are stored as salt + iterated SHA-256 (a
-// PBKDF-style key-stretch) — never in cleartext.
+// external crypto library. Secrets (the login password and the DTMF PIN) are
+// stored as salt + iterated SHA-256 (a PBKDF-style key-stretch) — never in
+// cleartext. The username is stored in cleartext (it is an identity, not a
+// secret) alongside the password's salt/hash.
 //
 // Randomness: esp_random() (a hardware CSPRNG) on ESP; on host, a
 // std::random_device-seeded std::mt19937_64 (host is a developer/CI simulator,
@@ -16,6 +18,7 @@
 #include "AdminAuth.hpp"
 
 #include <array>
+#include <cctype>
 #include <mutex>
 #include <vector>
 #include <cstring>
@@ -213,16 +216,17 @@ namespace
 
 	// Salted, iterated SHA-256 (PBKDF-style key-stretch). The iteration count
 	// makes offline brute-forcing of a leaked hash markedly more expensive.
-	// Returns a 64-char lowercase hex digest.
-	std::string hashPin(const std::string& salt, const std::string& pin)
+	// Returns a 64-char lowercase hex digest. Used for both the login password
+	// and the DTMF PIN — same stretch cost either way.
+	std::string hashSecret(const std::string& salt, const std::string& secret)
 	{
 		uint8_t digest[32];
 
-		// Round 0: SHA-256(salt || pin).
+		// Round 0: SHA-256(salt || secret).
 		{
 			Sha256 sha;
 			sha.update(salt);
-			sha.update(pin);
+			sha.update(secret);
 			sha.finalize(digest);
 		}
 
@@ -278,8 +282,11 @@ namespace
 
 	// Constant-time string compare. Returns true iff equal. Designed not to
 	// short-circuit on the first differing byte, so timing does not leak how
-	// many leading characters matched. (Length is compared up front; the hex
-	// digests we compare are always the same fixed length.)
+	// many leading characters matched. (Length is compared up front — for the
+	// fixed-length hex digests this leaks nothing beyond "same length"; for the
+	// username compare in verifyCredential() the password hash is always
+	// computed regardless of this result, so a wrong username costs the same
+	// wall-clock time as a wrong password.)
 	bool constantTimeEquals(const std::string& a, const std::string& b)
 	{
 		if (a.size() != b.size())
@@ -293,6 +300,45 @@ namespace
 				diff | (static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i])));
 		}
 		return diff == 0;
+	}
+
+	bool usernameValid(const std::string& u)
+	{
+		if (u.size() < AdminAuth::kMinUsernameLength || u.size() > AdminAuth::kMaxUsernameLength)
+		{
+			return false;
+		}
+		for (char c : u)
+		{
+			// No whitespace or control characters — this is an identity string
+			// rendered into JSON/NVS, not free text.
+			if (std::iscntrl(static_cast<unsigned char>(c)) || std::isspace(static_cast<unsigned char>(c)))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool passwordValid(const std::string& p)
+	{
+		return p.size() >= AdminAuth::kMinPasswordLength && p.size() <= AdminAuth::kMaxPasswordLength;
+	}
+
+	bool dtmfPinValid(const std::string& p)
+	{
+		if (p.size() < AdminAuth::kMinDtmfPinLength || p.size() > AdminAuth::kMaxDtmfPinLength)
+		{
+			return false;
+		}
+		for (char c : p)
+		{
+			if (!std::isdigit(static_cast<unsigned char>(c)))
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 
 	uint64_t nowMs()
@@ -319,6 +365,7 @@ namespace
 	// One brute-force accounting bucket per client identity (see
 	// AdminAuth::kMaxAttemptBuckets). `key` is the HTTP peer address; the empty
 	// key is the unkeyed bucket used by callers with no peer (the DTMF menu).
+	// Shared between login-credential and DTMF-PIN attempts.
 	struct AttemptBucket
 	{
 		std::string key;
@@ -333,14 +380,26 @@ namespace
 	{
 		std::mutex mutex;
 
-		// In-memory mirror of the stored credential. On ESP this is loaded from
+		// In-memory mirror of the stored credentials. On ESP this is loaded from
 		// NVS on first access; on host it IS the credential (host has no NVS).
 		bool        loaded = false;     // have we tried to load from NVS yet?
+
+		// Login credential (web dashboard). `provisioned` is true only once
+		// setLoginCredential() has been called at least once — until then,
+		// verifyCredential() accepts only the compiled-in default.
 		bool        provisioned = false;
-		std::string salt;               // hex
-		std::string hash;               // hex (salted, iterated digest)
+		std::string username;
+		std::string pwSalt;             // hex
+		std::string pwHash;             // hex (salted, iterated digest)
+
+		// DTMF admin-menu PIN (phone keypad). No default — dtmfPinSet stays
+		// false, and verifyDtmfPin() always fails, until setDtmfPin() is called.
+		bool        dtmfPinSet = false;
+		std::string pinSalt;            // hex
+		std::string pinHash;            // hex (salted, iterated digest)
 
 		// Brute-force lockout, tracked per client (docs/THREAT_MODEL.md §5.2, D-3).
+		// Shared by login-credential and DTMF-PIN attempts.
 		std::array<AttemptBucket, AdminAuth::kMaxAttemptBuckets> attempts{};
 
 		// Aggregate backstop across every client, so that rotating source addresses
@@ -374,17 +433,35 @@ namespace
 		nvs_handle_t h;
 		if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK)
 		{
+			char userBuf[128] = {0};
 			char saltBuf[128] = {0};
 			char hashBuf[128] = {0};
+			size_t userLen = sizeof(userBuf);
 			size_t saltLen = sizeof(saltBuf);
 			size_t hashLen = sizeof(hashBuf);
-			esp_err_t e1 = nvs_get_str(h, "admin_salt", saltBuf, &saltLen);
-			esp_err_t e2 = nvs_get_str(h, "admin_hash", hashBuf, &hashLen);
-			if (e1 == ESP_OK && e2 == ESP_OK && saltBuf[0] != '\0' && hashBuf[0] != '\0')
+			esp_err_t e1 = nvs_get_str(h, "admin_user", userBuf, &userLen);
+			esp_err_t e2 = nvs_get_str(h, "admin_pw_salt", saltBuf, &saltLen);
+			esp_err_t e3 = nvs_get_str(h, "admin_pw_hash", hashBuf, &hashLen);
+			if (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK &&
+				userBuf[0] != '\0' && saltBuf[0] != '\0' && hashBuf[0] != '\0')
 			{
-				s.salt = saltBuf;
-				s.hash = hashBuf;
+				s.username = userBuf;
+				s.pwSalt = saltBuf;
+				s.pwHash = hashBuf;
 				s.provisioned = true;
+			}
+
+			char pinSaltBuf[128] = {0};
+			char pinHashBuf[128] = {0};
+			size_t pinSaltLen = sizeof(pinSaltBuf);
+			size_t pinHashLen = sizeof(pinHashBuf);
+			esp_err_t e4 = nvs_get_str(h, "admin_pin_salt", pinSaltBuf, &pinSaltLen);
+			esp_err_t e5 = nvs_get_str(h, "admin_pin_hash", pinHashBuf, &pinHashLen);
+			if (e4 == ESP_OK && e5 == ESP_OK && pinSaltBuf[0] != '\0' && pinHashBuf[0] != '\0')
+			{
+				s.pinSalt = pinSaltBuf;
+				s.pinHash = pinHashBuf;
+				s.dtmfPinSet = true;
 			}
 			nvs_close(h);
 		}
@@ -394,7 +471,7 @@ namespace
 	}
 
 	// Caller must hold state().mutex.
-	bool persistCredentialLocked(const AuthState& s)
+	bool persistLoginCredentialLocked(const AuthState& s)
 	{
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		nvs_handle_t h;
@@ -402,13 +479,34 @@ namespace
 		{
 			return false;
 		}
-		bool ok = (nvs_set_str(h, "admin_salt", s.salt.c_str()) == ESP_OK) &&
-		          (nvs_set_str(h, "admin_hash", s.hash.c_str()) == ESP_OK) &&
+		bool ok = (nvs_set_str(h, "admin_user", s.username.c_str()) == ESP_OK) &&
+		          (nvs_set_str(h, "admin_pw_salt", s.pwSalt.c_str()) == ESP_OK) &&
+		          (nvs_set_str(h, "admin_pw_hash", s.pwHash.c_str()) == ESP_OK) &&
 		          (nvs_commit(h) == ESP_OK);
 		nvs_close(h);
 		return ok;
 #else
 		// Host: the in-memory AuthState IS the store. Nothing else to do.
+		(void)s;
+		return true;
+#endif
+	}
+
+	// Caller must hold state().mutex.
+	bool persistDtmfPinLocked(const AuthState& s)
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		nvs_handle_t h;
+		if (nvs_open("storage", NVS_READWRITE, &h) != ESP_OK)
+		{
+			return false;
+		}
+		bool ok = (nvs_set_str(h, "admin_pin_salt", s.pinSalt.c_str()) == ESP_OK) &&
+		          (nvs_set_str(h, "admin_pin_hash", s.pinHash.c_str()) == ESP_OK) &&
+		          (nvs_commit(h) == ESP_OK);
+		nvs_close(h);
+		return ok;
+#else
 		(void)s;
 		return true;
 #endif
@@ -466,6 +564,51 @@ namespace
 		return *victim;
 	}
 
+	// Shared lockout-and-accounting update used by both verifyCredential() and
+	// verifyDtmfPin(). Caller must hold state().mutex and have already checked
+	// the lockout gates before doing the (expensive) hash comparison; this only
+	// updates the bookkeeping once the comparison result (`ok`) is known.
+	void recordAttemptLocked(AuthState& s, AttemptBucket& b, bool ok)
+	{
+		if (ok)
+		{
+			b.failures = 0;
+			b.trips = 0;
+			b.lockoutUntilMs = 0;
+			// A correct credential proves a legitimate operator is present, so it
+			// clears the aggregate backstop too — otherwise a burst of noise from
+			// the AP would keep punishing the admin after they had demonstrably
+			// arrived.
+			s.globalFailures = 0;
+			s.globalTrips = 0;
+			s.globalLockoutUntilMs = 0;
+			return;
+		}
+
+		++b.failures;
+		++s.globalFailures;
+		if (s.globalFailures >= AdminAuth::kMaxFailedAttemptsGlobal)
+		{
+			++s.globalTrips;
+			const int gshift = (s.globalTrips - 1 < AdminAuth::kMaxLockoutShift)
+				? (s.globalTrips - 1) : AdminAuth::kMaxLockoutShift;
+			s.globalLockoutUntilMs = nowMs() + (AdminAuth::kLockoutMs << gshift);
+			s.globalFailures = 0;
+		}
+		if (b.failures >= AdminAuth::kMaxFailedAttempts)
+		{
+			// Escalating backoff: keep the trip count and double the cooldown each
+			// time, rather than resetting it after every cooldown (which would
+			// hand the attacker a fresh kMaxFailedAttempts window forever). Only a
+			// correct credential clears it (above).
+			++b.trips;
+			const int shift = (b.trips - 1 < AdminAuth::kMaxLockoutShift)
+				? (b.trips - 1) : AdminAuth::kMaxLockoutShift;
+			b.lockoutUntilMs = nowMs() + (AdminAuth::kLockoutMs << shift);
+			b.failures = 0;
+		}
+	}
+
 	// Caller must hold state().mutex.
 	void eraseCredentialLocked()
 	{
@@ -473,8 +616,11 @@ namespace
 		nvs_handle_t h;
 		if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK)
 		{
-			nvs_erase_key(h, "admin_salt");
-			nvs_erase_key(h, "admin_hash");
+			nvs_erase_key(h, "admin_user");
+			nvs_erase_key(h, "admin_pw_salt");
+			nvs_erase_key(h, "admin_pw_hash");
+			nvs_erase_key(h, "admin_pin_salt");
+			nvs_erase_key(h, "admin_pin_hash");
 			nvs_commit(h);
 			nvs_close(h);
 		}
@@ -492,9 +638,14 @@ namespace AdminAuth
 		return s.provisioned;
 	}
 
-	bool setPin(const std::string& pin)
+	bool needsInitialSetup()
 	{
-		if (pin.size() < kMinPinLength)
+		return !isProvisioned();
+	}
+
+	bool setLoginCredential(const std::string& username, const std::string& password)
+	{
+		if (!usernameValid(username) || !passwordValid(password))
 		{
 			return false;
 		}
@@ -508,26 +659,32 @@ namespace AdminAuth
 		{
 			return false;
 		}
-		std::string hash = hashPin(salt, pin);
+		std::string hash = hashSecret(salt, password);
 
-		std::string prevSalt = s.salt;
-		std::string prevHash = s.hash;
+		std::string prevUsername = s.username;
+		std::string prevSalt = s.pwSalt;
+		std::string prevHash = s.pwHash;
 		bool        prevProvisioned = s.provisioned;
 
-		s.salt = salt;
-		s.hash = hash;
+		s.username = username;
+		s.pwSalt = salt;
+		s.pwHash = hash;
 		s.provisioned = true;
 
-		if (!persistCredentialLocked(s))
+		if (!persistLoginCredentialLocked(s))
 		{
 			// Roll back the in-memory state if persistence failed.
-			s.salt = prevSalt;
-			s.hash = prevHash;
+			s.username = prevUsername;
+			s.pwSalt = prevSalt;
+			s.pwHash = prevHash;
 			s.provisioned = prevProvisioned;
 			return false;
 		}
 
-		// A credential (re)set clears brute-force accounting for every client.
+		// A credential (re)set clears brute-force accounting for every client
+		// (shared table — also affects the DTMF PIN's accounting, which is
+		// fine: whoever just authenticated to change the login credential has
+		// already proven themselves).
 		s.attempts = {};
 		s.globalFailures = 0;
 		s.globalTrips = 0;
@@ -553,21 +710,12 @@ namespace AdminAuth
 		return b != nullptr && b->lockoutUntilMs != 0 && now < b->lockoutUntilMs;
 	}
 
-	bool verifyPin(const std::string& pin)
-	{
-		return verifyPin(pin, std::string());
-	}
-
-	bool verifyPin(const std::string& pin, const std::string& clientKey)
+	bool verifyCredential(const std::string& username, const std::string& password,
+		const std::string& clientKey)
 	{
 		AuthState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
 		loadCredentialLocked(s);
-
-		if (!s.provisioned)
-		{
-			return false;
-		}
 
 		AttemptBucket& b = acquireBucketLocked(s, clientKey);
 
@@ -582,48 +730,105 @@ namespace AdminAuth
 			return false;
 		}
 
-		std::string candidate = hashPin(s.salt, pin);
-		bool ok = constantTimeEquals(candidate, s.hash);
-
-		if (ok)
+		bool ok;
+		if (!s.provisioned)
 		{
-			b.failures = 0;
-			b.trips = 0;
-			b.lockoutUntilMs = 0;
-			// A correct PIN proves a legitimate operator is present, so it clears
-			// the aggregate backstop too — otherwise a burst of noise from the AP
-			// would keep punishing the admin after they had demonstrably arrived.
-			s.globalFailures = 0;
-			s.globalTrips = 0;
-			s.globalLockoutUntilMs = 0;
+			// No real credential has ever been set: only the well-known default
+			// verifies. Still subject to the same lockout accounting below — the
+			// default is not a bypass of brute-force protection, and once
+			// setLoginCredential() runs this branch never executes again.
+			ok = (username == kDefaultUsername) && (password == kDefaultPassword);
 		}
 		else
 		{
-			++b.failures;
-			++s.globalFailures;
-			if (s.globalFailures >= kMaxFailedAttemptsGlobal)
-			{
-				++s.globalTrips;
-				const int gshift = (s.globalTrips - 1 < kMaxLockoutShift)
-					? (s.globalTrips - 1) : kMaxLockoutShift;
-				s.globalLockoutUntilMs = nowMs() + (kLockoutMs << gshift);
-				s.globalFailures = 0;
-			}
-			if (b.failures >= kMaxFailedAttempts)
-			{
-				// Escalating backoff. The previous implementation zeroed the trip
-				// count here, which handed the attacker a fresh kMaxFailedAttempts
-				// window after every cooldown — a steady ~5 guesses/minute forever,
-				// which walks a 4-digit PIN in about a day and a half. Keeping the
-				// trip count and doubling the cooldown turns that into hours per
-				// handful of guesses. Only a correct PIN clears it.
-				++b.trips;
-				const int shift = (b.trips - 1 < kMaxLockoutShift)
-					? (b.trips - 1) : kMaxLockoutShift;
-				b.lockoutUntilMs = nowMs() + (kLockoutMs << shift);
-				b.failures = 0;
-			}
+			// Compute the password hash unconditionally (even if the username is
+			// already wrong) so a wrong username costs the same wall-clock time
+			// as a wrong password — no timing signal on which one was correct.
+			bool userOk = constantTimeEquals(username, s.username);
+			std::string candidate = hashSecret(s.pwSalt, password);
+			bool passOk = constantTimeEquals(candidate, s.pwHash);
+			ok = userOk && passOk;
 		}
+
+		recordAttemptLocked(s, b, ok);
+		return ok;
+	}
+
+	bool dtmfPinIsSet()
+	{
+		AuthState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+		loadCredentialLocked(s);
+		return s.dtmfPinSet;
+	}
+
+	bool setDtmfPin(const std::string& pin)
+	{
+		if (!dtmfPinValid(pin))
+		{
+			return false;
+		}
+
+		AuthState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+		loadCredentialLocked(s);
+
+		std::string salt = randomHex(32);
+		if (salt.empty())
+		{
+			return false;
+		}
+		std::string hash = hashSecret(salt, pin);
+
+		std::string prevSalt = s.pinSalt;
+		std::string prevHash = s.pinHash;
+		bool        prevSet = s.dtmfPinSet;
+
+		s.pinSalt = salt;
+		s.pinHash = hash;
+		s.dtmfPinSet = true;
+
+		if (!persistDtmfPinLocked(s))
+		{
+			s.pinSalt = prevSalt;
+			s.pinHash = prevHash;
+			s.dtmfPinSet = prevSet;
+			return false;
+		}
+
+		s.attempts = {};
+		s.globalFailures = 0;
+		s.globalTrips = 0;
+		s.globalLockoutUntilMs = 0;
+		return true;
+	}
+
+	bool verifyDtmfPin(const std::string& pin)
+	{
+		AuthState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+		loadCredentialLocked(s);
+
+		if (!s.dtmfPinSet)
+		{
+			return false;
+		}
+
+		AttemptBucket& b = acquireBucketLocked(s, std::string());
+
+		if (b.lockoutUntilMs != 0 && nowMs() < b.lockoutUntilMs)
+		{
+			return false;
+		}
+		if (s.globalLockoutUntilMs != 0 && nowMs() < s.globalLockoutUntilMs)
+		{
+			return false;
+		}
+
+		std::string candidate = hashSecret(s.pinSalt, pin);
+		bool ok = constantTimeEquals(candidate, s.pinHash);
+
+		recordAttemptLocked(s, b, ok);
 		return ok;
 	}
 
@@ -737,9 +942,13 @@ namespace AdminAuth
 
 		eraseCredentialLocked();
 
-		s.salt.clear();
-		s.hash.clear();
+		s.username.clear();
+		s.pwSalt.clear();
+		s.pwHash.clear();
 		s.provisioned = false;
+		s.pinSalt.clear();
+		s.pinHash.clear();
+		s.dtmfPinSet = false;
 		s.loaded = true;          // we know the (now empty) state; don't reload
 		s.attempts = {};
 		s.globalFailures = 0;
@@ -799,7 +1008,7 @@ namespace AdminAuth
 	}
 
 	// credentialIsSet: lightweight NVS probe used by the boot provisioning gate.
-	// Opens NVS namespace "storage", reads key "admin_hash" as a string, and
+	// Opens NVS namespace "storage", reads key "admin_pw_hash" as a string, and
 	// returns true iff the string is non-empty. Closes the handle on exit.
 	// On non-ESP builds it delegates to the in-memory isProvisioned() so the
 	// host unit tests exercise the same logic path.
@@ -813,7 +1022,7 @@ namespace AdminAuth
 		}
 		char hashBuf[128] = {0};
 		size_t hashLen = sizeof(hashBuf);
-		esp_err_t err = nvs_get_str(h, "admin_hash", hashBuf, &hashLen);
+		esp_err_t err = nvs_get_str(h, "admin_pw_hash", hashBuf, &hashLen);
 		nvs_close(h);
 		return (err == ESP_OK && hashBuf[0] != '\0');
 #else

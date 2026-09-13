@@ -2,6 +2,18 @@
 
 This document serves as the authoritative production-grade field operation and incident playbook for the pocket-dial ESP32 / ESP32-S3 firmware. It is intended for field engineers, system administrators, and core firmware maintainers to diagnose, isolate, secure, and recover devices suffering from field anomalies.
 
+> [!WARNING]
+> **STALE as of 2026-09-13 in every section discussing "dark by default"/the `*4887`
+> DTMF trigger, or a bare admin PIN.** Both mechanisms have been removed: the HTTP
+> listener is now always open (there is no transport-level dark/open gate to
+> troubleshoot at all — "Dashboard refuses connections" below has a different root
+> cause now, most likely a genuinely dead process or network issue, not an expired
+> admin-open window), and the admin credential is a username + password with a
+> shipped default (`admin`/`admin`) rather than a bare PIN — see `docs/API.md` §0 and
+> `docs/SETUP_GUIDE.md` §3 for the current model. This playbook has not yet had the
+> full revision pass to match; treat any procedure below that mentions `*4887`,
+> "dark by default," or `/api/admin/set-pin` as describing removed behavior.
+
 > [!IMPORTANT]
 > **Establish which posture the device is in before you triage.** v1.3.0 and newer add three
 > opt-in controls that change how the device answers you, and **all three default to off**.

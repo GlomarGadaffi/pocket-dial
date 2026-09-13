@@ -181,7 +181,7 @@ private:
 
 	// --- Admin auth endpoints (PIN-gated session layer; see AdminAuth.hpp) ---
 	void sendApiAdminStatus(int sock, const HttpRequest& req);
-	void sendApiAdminSetPin(int sock, const HttpRequest& req);
+	void sendApiAdminSetCredential(int sock, const HttpRequest& req);
 	void sendApiAdminLogin(int sock, const HttpRequest& req);
 	void sendApiAdminLogout(int sock, const HttpRequest& req);
 

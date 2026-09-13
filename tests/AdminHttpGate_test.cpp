@@ -3,9 +3,14 @@
 // provisioned, DTMF-star-code-to-reopen" gate used to close the socket
 // entirely, which meant the dashboard went unreachable ["connection
 // refused"] the moment any client registered and the device counted itself
-// as provisioned). Removed: the admin-facing session/PIN gate (requireAdmin,
-// tested in the WebHardening/Registrar suites below) is the intended
-// authentication layer, not the raw socket.
+// as provisioned). Removed: the admin-facing session/credential gate
+// (requireAdmin, tested in the WebHardening/Registrar suites below) is the
+// intended authentication layer, not the raw socket.
+//
+// Also covers the credential model itself: a shipped default login
+// (AdminAuth::kDefaultUsername/kDefaultPassword) that works until
+// setLoginCredential() is called, and a separate DTMF admin PIN with no
+// default at all (see the AdminAuth-suite tests below).
 
 #include <gtest/gtest.h>
 #include "HttpServer.hpp"
@@ -220,10 +225,10 @@ TEST(AdminHttpGate, Boot_Provisioned_StillListensImmediately)
 	// ("connection refused") the instant a device counted itself provisioned
 	// (e.g. any client registering), requiring a DTMF star-code from a specific
 	// extension to reopen it. The socket must now accept connections
-	// unconditionally; requireAdmin()'s per-route session/PIN check is what
-	// actually gates admin actions once a client can reach the page.
+	// unconditionally; requireAdmin()'s per-route session/credential check is
+	// what actually gates admin actions once a client can reach the page.
 	AdminAuth::clearCredential();
-	ASSERT_TRUE(AdminAuth::setPin("123456"));
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
 	ASSERT_TRUE(AdminAuth::isProvisioned());
 
 	HttpServer server("127.0.0.1", 18081, nullptr);
@@ -234,7 +239,7 @@ TEST(AdminHttpGate, Boot_Provisioned_StillListensImmediately)
 	AdminAuth::clearCredential();
 }
 
-TEST(AdminHttpGate, SetPin_DoesNotAffectReachability)
+TEST(AdminHttpGate, SetCredential_DoesNotAffectReachability)
 {
 	AdminAuth::clearCredential();
 	ASSERT_FALSE(AdminAuth::isProvisioned());
@@ -247,10 +252,79 @@ TEST(AdminHttpGate, SetPin_DoesNotAffectReachability)
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	ASSERT_TRUE(canConnect(18083));
 
-	ASSERT_EQ(httpPostStatus(18083, "/api/admin/set-pin", "pin=123456"), 200);
+	std::string loginResp = httpPostRaw(18083, "/api/admin/login", "username=admin&password=admin");
+	ASSERT_EQ(statusOf(loginResp), 200);
+	std::string cookie = cookieOf(loginResp, "pd_session");
+	std::string csrf = csrfOf(loginResp);
+	ASSERT_EQ(statusOf(httpPostRaw(18083, "/api/admin/set-credential",
+		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
 	ASSERT_TRUE(AdminAuth::isProvisioned());
 	EXPECT_TRUE(canConnect(18083));
 
+	AdminAuth::clearCredential();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The default login credential + forced initial setup. AdminAuth-level (no
+// HTTP round trip needed — see WebHardening below for the HTTP-layer
+// enforcement) and the independent DTMF PIN, which has no default at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(AdminAuth, DefaultCredentialWorksUntilARealOneIsSet)
+{
+	AdminAuth::clearCredential();
+	ASSERT_FALSE(AdminAuth::isProvisioned());
+	ASSERT_TRUE(AdminAuth::needsInitialSetup());
+
+	EXPECT_TRUE(AdminAuth::verifyCredential(AdminAuth::kDefaultUsername,
+		AdminAuth::kDefaultPassword, "20.0.0.1"));
+	EXPECT_FALSE(AdminAuth::verifyCredential(AdminAuth::kDefaultUsername, "wrong", "20.0.0.2"));
+
+	ASSERT_TRUE(AdminAuth::setLoginCredential("boss", "realpassword123"));
+	EXPECT_TRUE(AdminAuth::isProvisioned());
+	EXPECT_FALSE(AdminAuth::needsInitialSetup());
+	EXPECT_FALSE(AdminAuth::verifyCredential(AdminAuth::kDefaultUsername,
+		AdminAuth::kDefaultPassword, "20.0.0.3"))
+		<< "the default must stop working the instant a real credential is set";
+	EXPECT_TRUE(AdminAuth::verifyCredential("boss", "realpassword123", "20.0.0.4"));
+
+	AdminAuth::clearCredential();
+	EXPECT_TRUE(AdminAuth::needsInitialSetup())
+		<< "factory reset must return the device to the default-credential state";
+}
+
+TEST(AdminAuth, SetLoginCredentialRejectsOutOfBoundsFields)
+{
+	AdminAuth::clearCredential();
+	EXPECT_FALSE(AdminAuth::setLoginCredential("", "realpassword123")) << "empty username";
+	EXPECT_FALSE(AdminAuth::setLoginCredential("admin", "short")) << "password under the minimum length";
+	EXPECT_FALSE(AdminAuth::setLoginCredential("bad user", "realpassword123")) << "whitespace in username";
+	EXPECT_FALSE(AdminAuth::isProvisioned()) << "every rejected call above must be a no-op";
+	AdminAuth::clearCredential();
+}
+
+TEST(AdminAuth, DtmfPinHasNoDefaultAndStaysDisabledUntilSet)
+{
+	AdminAuth::clearCredential();
+	EXPECT_FALSE(AdminAuth::dtmfPinIsSet());
+	EXPECT_FALSE(AdminAuth::verifyDtmfPin("0000")) << "no default -- an all-zero guess must not work";
+	EXPECT_FALSE(AdminAuth::verifyDtmfPin(""));
+
+	ASSERT_TRUE(AdminAuth::setDtmfPin("4321"));
+	EXPECT_TRUE(AdminAuth::dtmfPinIsSet());
+	EXPECT_TRUE(AdminAuth::verifyDtmfPin("4321"));
+	EXPECT_FALSE(AdminAuth::verifyDtmfPin("0000"));
+
+	AdminAuth::clearCredential();
+	EXPECT_FALSE(AdminAuth::dtmfPinIsSet()) << "factory reset must wipe the DTMF PIN too";
+}
+
+TEST(AdminAuth, SetDtmfPinRejectsNonDigitsOrOutOfBoundsLength)
+{
+	AdminAuth::clearCredential();
+	EXPECT_FALSE(AdminAuth::setDtmfPin("12a4")) << "letters aren't reachable from a phone keypad";
+	EXPECT_FALSE(AdminAuth::setDtmfPin("123")) << "under the minimum length";
+	EXPECT_TRUE(AdminAuth::setDtmfPin("123456"));
 	AdminAuth::clearCredential();
 }
 
@@ -263,14 +337,35 @@ TEST(AdminHttpGate, SetPin_DoesNotAffectReachability)
 // cookie — that actually stops a same-site page from driving mutating calls.
 // ─────────────────────────────────────────────────────────────────────────────
 
+namespace
+{
+	// Log in with the shipped default credential, then immediately complete
+	// setup with a real one -- requireAdmin() refuses every other admin-gated
+	// route (including the ones under test here) while needsInitialSetup() is
+	// true, and setLoginCredential() does not invalidate the session it was
+	// called through, so the same cookie/csrf pair keeps working afterward.
+	struct AdminSession { std::string cookie; std::string csrf; };
+
+	AdminSession loginAndCompleteSetup(int port)
+	{
+		AdminSession a;
+		std::string loginResp = httpPostRaw(port, "/api/admin/login",
+			"username=admin&password=admin");
+		EXPECT_EQ(statusOf(loginResp), 200);
+		a.cookie = cookieOf(loginResp, "pd_session");
+		a.csrf   = csrfOf(loginResp);
+
+		std::string setupResp = httpPostRaw(port, "/api/admin/set-credential",
+			"username=admin&password=realpassword123",
+			"pd_session=" + a.cookie, a.csrf);
+		EXPECT_EQ(statusOf(setupResp), 200);
+		return a;
+	}
+}
+
 TEST(WebHardening, Csrf_MissingToken_Rejected403)
 {
 	AdminAuth::clearCredential();
-	// A real RequestsHandler is required: once a PIN exists the listen socket is
-	// dark by default and only opens inside an admin-open window, which set-pin
-	// grants as a grace period through the handler. With a null handler the
-	// deadline reads 0, the server fails closed, and the test would be measuring
-	// a refused connection rather than the gate.
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
 	HttpServer server("127.0.0.1", 18090, nullptr);
@@ -278,15 +373,11 @@ TEST(WebHardening, Csrf_MissingToken_Rejected403)
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	ASSERT_EQ(httpPostStatus(18090, "/api/admin/set-pin", "pin=123456"), 200);
-	std::string loginResp = httpPostRaw(18090, "/api/admin/login", "pin=123456");
-	ASSERT_EQ(statusOf(loginResp), 200);
-	std::string cookie = cookieOf(loginResp, "pd_session");
-	ASSERT_FALSE(cookie.empty());
+	AdminSession a = loginAndCompleteSetup(18090);
 
 	// A valid session but no token: the cookie alone must not be enough.
 	std::string resp = httpPostRaw(18090, "/api/ap-security", "regenerate=1",
-	                               "pd_session=" + cookie);
+	                               "pd_session=" + a.cookie);
 	EXPECT_EQ(statusOf(resp), 403);
 
 	AdminAuth::clearCredential();
@@ -295,11 +386,6 @@ TEST(WebHardening, Csrf_MissingToken_Rejected403)
 TEST(WebHardening, Csrf_WrongToken_Rejected403)
 {
 	AdminAuth::clearCredential();
-	// A real RequestsHandler is required: once a PIN exists the listen socket is
-	// dark by default and only opens inside an admin-open window, which set-pin
-	// grants as a grace period through the handler. With a null handler the
-	// deadline reads 0, the server fails closed, and the test would be measuring
-	// a refused connection rather than the gate.
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
 	HttpServer server("127.0.0.1", 18091, nullptr);
@@ -307,13 +393,10 @@ TEST(WebHardening, Csrf_WrongToken_Rejected403)
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	ASSERT_EQ(httpPostStatus(18091, "/api/admin/set-pin", "pin=123456"), 200);
-	std::string loginResp = httpPostRaw(18091, "/api/admin/login", "pin=123456");
-	std::string cookie = cookieOf(loginResp, "pd_session");
-	ASSERT_FALSE(cookie.empty());
+	AdminSession a = loginAndCompleteSetup(18091);
 
 	std::string resp = httpPostRaw(18091, "/api/ap-security", "regenerate=1",
-	                               "pd_session=" + cookie,
+	                               "pd_session=" + a.cookie,
 	                               "00000000000000000000000000000000");
 	EXPECT_EQ(statusOf(resp), 403);
 
@@ -323,11 +406,6 @@ TEST(WebHardening, Csrf_WrongToken_Rejected403)
 TEST(WebHardening, Csrf_ValidToken_Accepted)
 {
 	AdminAuth::clearCredential();
-	// A real RequestsHandler is required: once a PIN exists the listen socket is
-	// dark by default and only opens inside an admin-open window, which set-pin
-	// grants as a grace period through the handler. With a null handler the
-	// deadline reads 0, the server fails closed, and the test would be measuring
-	// a refused connection rather than the gate.
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
 	HttpServer server("127.0.0.1", 18092, nullptr);
@@ -335,32 +413,47 @@ TEST(WebHardening, Csrf_ValidToken_Accepted)
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	ASSERT_EQ(httpPostStatus(18092, "/api/admin/set-pin", "pin=123456"), 200);
-	std::string loginResp = httpPostRaw(18092, "/api/admin/login", "pin=123456");
-	std::string cookie = cookieOf(loginResp, "pd_session");
-	std::string csrf   = csrfOf(loginResp);
-	ASSERT_FALSE(cookie.empty());
-	ASSERT_EQ(csrf.size(), AdminAuth::kCsrfTokenHex);
+	AdminSession a = loginAndCompleteSetup(18092);
+	ASSERT_EQ(a.csrf.size(), AdminAuth::kCsrfTokenHex);
 
 	std::string resp = httpPostRaw(18092, "/api/ap-security", "regenerate=1",
-	                               "pd_session=" + cookie, csrf);
+	                               "pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(resp), 200);
 
 	AdminAuth::clearCredential();
 }
 
-TEST(WebHardening, Csrf_NotRequiredWhileUnprovisioned)
+TEST(WebHardening, ConfiguringRequiresLoginThenSetupCompletion)
 {
-	// The onboarding window must keep working exactly as before: a factory-fresh
-	// device has no session, so there is no token to bind and demanding one would
-	// make the device unclaimable (and break tests/http/test_api.sh).
+	// /api/configuring moves device state on a POST, so it takes the standard
+	// admin gate like everything else: no session at all -> 401; a session on
+	// the still-default credential -> 403 setup_required; only after
+	// completing setup does it succeed. (Supersedes the old
+	// Csrf_NotRequiredWhileUnprovisioned/Configuring_GatedOnceProvisioned pair
+	// now that there is no more unauthenticated onboarding window at all --
+	// the default credential IS the onboarding window.)
 	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
 	HttpServer server("127.0.0.1", 18093, nullptr);
+	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	ASSERT_FALSE(AdminAuth::isProvisioned());
-	EXPECT_EQ(httpPostStatus(18093, "/api/configuring", ""), 200);
+	EXPECT_EQ(httpPostStatus(18093, "/api/configuring", ""), 401);
+
+	std::string loginResp = httpPostRaw(18093, "/api/admin/login", "username=admin&password=admin");
+	ASSERT_EQ(statusOf(loginResp), 200);
+	std::string cookie = cookieOf(loginResp, "pd_session");
+	std::string csrf = csrfOf(loginResp);
+
+	EXPECT_EQ(statusOf(httpPostRaw(18093, "/api/configuring", "", "pd_session=" + cookie, csrf)), 403)
+		<< "logged in on the default credential, but setup is not complete yet";
+
+	ASSERT_EQ(statusOf(httpPostRaw(18093, "/api/admin/set-credential",
+		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
+
+	EXPECT_EQ(statusOf(httpPostRaw(18093, "/api/configuring", "", "pd_session=" + cookie, csrf)), 200);
 
 	AdminAuth::clearCredential();
 }
@@ -372,43 +465,26 @@ TEST(WebHardening, PcapAndTrace_RejectCrossOrigin)
 	// same-origin check, because each route open-coded its own gate and this one
 	// clause was missed. They now go through requireAdmin like everything else.
 	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
 	HttpServer server("127.0.0.1", 18094, nullptr);
+	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
+	// The same-origin check (requireAdmin step 1) runs before the session
+	// check, so a cross-origin request is rejected whether or not a session
+	// cookie is even presented.
 	const std::string evil = "http://evil.example";
 	EXPECT_EQ(statusOf(httpGetRaw(18094, "/api/pcap", "", evil)), 403);
 	EXPECT_EQ(statusOf(httpGetRaw(18094, "/api/trace", "", evil)), 403);
 	EXPECT_EQ(statusOf(httpGetRaw(18094, "/api/diagnostics/pcap", "", evil)), 403);
 
-	// Same-origin (no Origin header at all) still reaches the handler.
-	EXPECT_EQ(statusOf(httpGetRaw(18094, "/api/trace")), 200);
-
-	AdminAuth::clearCredential();
-}
-
-TEST(WebHardening, Configuring_GatedOnceProvisioned)
-{
-	// /api/configuring previously had no gate at all, waived in a comment as
-	// "harmless". It still moves device state on a POST, so once the device has
-	// an owner it needs the owner's session.
-	AdminAuth::clearCredential();
-	// A real RequestsHandler is required: once a PIN exists the listen socket is
-	// dark by default and only opens inside an admin-open window, which set-pin
-	// grants as a grace period through the handler. With a null handler the
-	// deadline reads 0, the server fails closed, and the test would be measuring
-	// a refused connection rather than the gate.
-	RequestsHandler handler("192.168.4.1", 5060,
-		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18095, nullptr);
-	server.attachHandler(&handler);
-	server.start();
-	std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-	ASSERT_EQ(httpPostStatus(18095, "/api/admin/set-pin", "pin=123456"), 200);
-	ASSERT_TRUE(AdminAuth::isProvisioned());
-
-	EXPECT_EQ(httpPostStatus(18095, "/api/configuring", ""), 401);
+	// Same-origin (no Origin header at all) reaches the session check next —
+	// needs a real, fully-set-up login to get all the way through to the
+	// handler and see 200.
+	AdminSession a = loginAndCompleteSetup(18094);
+	EXPECT_EQ(statusOf(httpGetRaw(18094, "/api/trace", "pd_session=" + a.cookie)), 200);
 
 	AdminAuth::clearCredential();
 }
@@ -442,27 +518,27 @@ TEST(WebHardening, SecurityHeadersOnEveryResponse)
 
 TEST(WebHardening, LockoutCounterDoesNotResetOnTrip)
 {
-	// Regression: verifyPin used to zero the failure counter when the lockout
-	// engaged, so every cooldown handed the attacker a fresh window of
+	// Regression: verifyCredential used to zero the failure counter when the
+	// lockout engaged, so every cooldown handed the attacker a fresh window of
 	// kMaxFailedAttempts — a steady ~5 guesses/minute for as long as they cared
 	// to keep going. The trip count now survives, so each lockout is longer than
-	// the last and only a correct PIN clears it.
+	// the last and only a correct credential clears it.
 	AdminAuth::clearCredential();
-	ASSERT_TRUE(AdminAuth::setPin("123456"));
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
 
 	for (int i = 0; i < AdminAuth::kMaxFailedAttempts; ++i)
 	{
-		EXPECT_FALSE(AdminAuth::verifyPin("000000", "10.0.0.1"));
+		EXPECT_FALSE(AdminAuth::verifyCredential("admin", "000000", "10.0.0.1"));
 	}
 	EXPECT_TRUE(AdminAuth::isLockedOut("10.0.0.1"));
 
-	// Even the correct PIN is refused while the cooldown is engaged.
-	EXPECT_FALSE(AdminAuth::verifyPin("123456", "10.0.0.1"));
+	// Even the correct credential is refused while the cooldown is engaged.
+	EXPECT_FALSE(AdminAuth::verifyCredential("admin", "realpassword123", "10.0.0.1"));
 
 	// ...and a different client is unaffected, which is the point of keying the
 	// buckets: one guesser must not lock the real admin out of new logins.
 	EXPECT_FALSE(AdminAuth::isLockedOut("10.0.0.2"));
-	EXPECT_TRUE(AdminAuth::verifyPin("123456", "10.0.0.2"));
+	EXPECT_TRUE(AdminAuth::verifyCredential("admin", "realpassword123", "10.0.0.2"));
 
 	AdminAuth::clearCredential();
 }
@@ -477,7 +553,7 @@ TEST(WebHardening, GlobalBackstopBoundsSpoofedSourceAddresses)
 	// safe to have: it bounds the total guess rate regardless of how many
 	// identities the attacker invents.
 	AdminAuth::clearCredential();
-	ASSERT_TRUE(AdminAuth::setPin("123456"));
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
 
 	// Burn the aggregate budget across several distinct "clients". Each one trips
 	// its own bucket after kMaxFailedAttempts, so this is exactly the pattern a
@@ -488,13 +564,13 @@ TEST(WebHardening, GlobalBackstopBoundsSpoofedSourceAddresses)
 		const std::string ip = "10.1.1." + std::to_string(c + 1);
 		for (int i = 0; i < AdminAuth::kMaxFailedAttempts; ++i)
 		{
-			EXPECT_FALSE(AdminAuth::verifyPin("000000", ip));
+			EXPECT_FALSE(AdminAuth::verifyCredential("admin", "000000", ip));
 		}
 	}
 
 	// A brand-new address, with an empty bucket of its own, is refused anyway.
 	EXPECT_TRUE(AdminAuth::isLockedOut("10.9.9.9"));
-	EXPECT_FALSE(AdminAuth::verifyPin("123456", "10.9.9.9"));
+	EXPECT_FALSE(AdminAuth::verifyCredential("admin", "realpassword123", "10.9.9.9"));
 
 	AdminAuth::clearCredential();
 }
@@ -502,21 +578,21 @@ TEST(WebHardening, GlobalBackstopBoundsSpoofedSourceAddresses)
 TEST(WebHardening, GlobalBackstopSitsWellAboveOrdinaryTypos)
 {
 	// The backstop must not resurrect the D-3 self-DoS: an operator fumbling
-	// their PIN a handful of times must never lock the whole device. Only that
-	// one client's short cooldown may engage.
+	// their password a handful of times must never lock the whole device. Only
+	// that one client's short cooldown may engage.
 	ASSERT_GT(AdminAuth::kMaxFailedAttemptsGlobal, AdminAuth::kMaxFailedAttempts);
 
 	AdminAuth::clearCredential();
-	ASSERT_TRUE(AdminAuth::setPin("123456"));
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
 
 	for (int i = 0; i < AdminAuth::kMaxFailedAttempts; ++i)
 	{
-		EXPECT_FALSE(AdminAuth::verifyPin("000000", "10.2.2.1"));
+		EXPECT_FALSE(AdminAuth::verifyCredential("admin", "000000", "10.2.2.1"));
 	}
 	EXPECT_TRUE(AdminAuth::isLockedOut("10.2.2.1"));
 	// Everyone else is still free to log in.
 	EXPECT_FALSE(AdminAuth::isLockedOut("10.2.2.2"));
-	EXPECT_TRUE(AdminAuth::verifyPin("123456", "10.2.2.2"));
+	EXPECT_TRUE(AdminAuth::verifyCredential("admin", "realpassword123", "10.2.2.2"));
 
 	AdminAuth::clearCredential();
 }
@@ -530,24 +606,9 @@ TEST(WebHardening, GlobalBackstopSitsWellAboveOrdinaryTypos)
 // production ever wrote the persisted mode. These endpoints are what close that.
 // ─────────────────────────────────────────────────────────────────────────────
 
-namespace
-{
-	// Provision, log in, and return {cookie, csrf} on a server that has a real
-	// handler attached — required because the HTTP plane goes dark the moment a
-	// PIN exists, and only set-pin's grace window keeps it open.
-	struct AdminSession { std::string cookie; std::string csrf; };
-
-	AdminSession loginOn(int port)
-	{
-		AdminSession a;
-		EXPECT_EQ(httpPostStatus(port, "/api/admin/set-pin", "pin=123456"), 200);
-		std::string resp = httpPostRaw(port, "/api/admin/login", "pin=123456");
-		EXPECT_EQ(statusOf(resp), 200);
-		a.cookie = cookieOf(resp, "pd_session");
-		a.csrf   = csrfOf(resp);
-		return a;
-	}
-}
+// loginAndCompleteSetup() (defined above, in the WebHardening section) is
+// reused here too: log in with the default credential, then complete initial
+// setup, returning a session usable for the rest of the test.
 
 TEST(Registrar, ModeRoundTripsThroughTheDashboard)
 {
@@ -559,7 +620,7 @@ TEST(Registrar, ModeRoundTripsThroughTheDashboard)
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	AdminSession a = loginOn(18100);
+	AdminSession a = loginAndCompleteSetup(18100);
 	ASSERT_FALSE(a.cookie.empty());
 
 	// Ships open: POCKETDIAL_OPEN_REGISTRAR seeds the default, and until now
@@ -596,7 +657,7 @@ TEST(Registrar, SwitchingToSecureWithNothingSecuredNeedsConfirmation)
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	AdminSession a = loginOn(18101);
+	AdminSession a = loginAndCompleteSetup(18101);
 
 	std::string blocked = httpPostRaw(18101, "/api/registrar", "mode=secure",
 	                                  "pd_session=" + a.cookie, a.csrf);
@@ -623,7 +684,7 @@ TEST(Registrar, RejectsUnknownModeAndUnknownDevice)
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	AdminSession a = loginOn(18102);
+	AdminSession a = loginAndCompleteSetup(18102);
 
 	EXPECT_EQ(statusOf(httpPostRaw(18102, "/api/registrar", "mode=wide-open",
 	                               "pd_session=" + a.cookie, a.csrf)), 400);
@@ -652,7 +713,7 @@ TEST(Registrar, MutatingEndpointsRequireTheCsrfToken)
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	AdminSession a = loginOn(18103);
+	AdminSession a = loginAndCompleteSetup(18103);
 
 	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar", "mode=open",
 	                               "pd_session=" + a.cookie)), 403);

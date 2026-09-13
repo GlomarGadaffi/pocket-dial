@@ -64,8 +64,8 @@ HttpServer::HttpServer(const std::string& ip, int port, RequestsHandler* handler
 #endif
 
 	// The dashboard listens immediately regardless of provisioning state.
-	// requireAdmin()'s per-route session/PIN check is the actual admin gate;
-	// the socket itself always accepts connections.
+	// requireAdmin()'s per-route session/credential check is the actual admin
+	// gate; the socket itself always accepts connections.
 	if (!openListenSocket())
 	{
 		throw std::runtime_error("HttpServer: failed to open listen socket on port " + std::to_string(_port));
@@ -594,10 +594,11 @@ void HttpServer::handleClient(int clientSock)
 	else if (req.method == "POST" && req.path == "/api/configuring")
 	{
 		// "I'm configuring" — hold the captive-portal decay so it doesn't switch
-		// to Standalone out from under the user. Previously ungated entirely on a
-		// "harmless" argument; it still moves device state on a POST, so it now
-		// takes the standard gate. Unprovisioned (i.e. mid-onboarding, which is the
-		// only time the captive portal calls it) requireAdmin admits it unchanged.
+		// to Standalone out from under the user. It moves device state on a
+		// POST, so it takes the standard gate like every other mutating route:
+		// log in with the default credential first (documented at first boot),
+		// same as WiFi setup itself (/api/wifi/connect, /api/wifi/mode_ap)
+		// just below.
 		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiConfiguring(clientSock);
@@ -649,16 +650,17 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "GET" && req.path == "/api/admin/status")
 	{
-		// Read-only: tells the dashboard whether to show a set-PIN or login form.
+		// Read-only: tells the dashboard whether to show the login form.
 		sendApiAdminStatus(clientSock, req);
 	}
-	else if (req.method == "POST" && req.path == "/api/admin/set-pin")
+	else if (req.method == "POST" && req.path == "/api/admin/set-credential")
 	{
-		// Unprovisioned this is onboarding (requireAdmin admits it); provisioned it
-		// is a credential change, so it needs the session and the CSRF token.
+		// Always needs a session + CSRF token — including during forced initial
+		// setup, since that's reached by first logging in with the default
+		// credential (requireAdmin's setup_required gate exempts this one path).
 		if (requireAdmin(clientSock, req, true))
 		{
-			sendApiAdminSetPin(clientSock, req);
+			sendApiAdminSetCredential(clientSock, req);
 		}
 	}
 	else if (req.method == "POST" && req.path == "/api/admin/login")
@@ -1733,15 +1735,12 @@ bool HttpServer::requireAdmin(int sock, const HttpRequest& req, bool needCsrf)
 		return false;
 	}
 
-	// 2. Session. An unprovisioned device keeps its pre-auth behaviour so
-	//    captive-portal onboarding still works and the device can be claimed at
-	//    all (docs/THREAT_MODEL.md §5.1 — this window is deliberate and is closed
-	//    by provisioning a PIN as the first onboarding step).
-	if (!AdminAuth::isProvisioned())
-	{
-		return true;
-	}
-
+	// 2. Session. There is no more "unprovisioned, admit everyone" bypass: the
+	//    device ships with a default login credential
+	//    (AdminAuth::kDefaultUsername/kDefaultPassword) precisely so this gate
+	//    can be unconditional from the very first boot — the old
+	//    "open AP until a PIN is set" window (docs/THREAT_MODEL.md §5.1) is
+	//    gone.
 	const std::string token = sessionToken(req);
 	if (!AdminAuth::validateSession(token))
 	{
@@ -1758,6 +1757,17 @@ bool HttpServer::requireAdmin(int sock, const HttpRequest& req, bool needCsrf)
 	{
 		sendResponse(sock, 403, "Forbidden", "application/json",
 		             "{\"error\":\"missing or invalid CSRF token\"}");
+		return false;
+	}
+
+	// 4. Forced initial setup. Until the operator replaces the default login
+	//    credential, every admin-gated action except the one that changes it
+	//    is refused server-side — "force setup on first use" enforced here,
+	//    not left to the frontend to merely suggest.
+	if (AdminAuth::needsInitialSetup() && req.path != "/api/admin/set-credential")
+	{
+		sendResponse(sock, 403, "Forbidden", "application/json",
+		             "{\"error\":\"setup_required\",\"message\":\"Change the default admin credential before continuing.\"}");
 		return false;
 	}
 
@@ -1986,8 +1996,9 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		             "{\"error\":\"factory reset requires confirm=ERASE\"}");
 		return;
 	}
-	// Clear the admin credential + all sessions so the device returns to the
-	// unprovisioned/open state on both ESP (NVS) and host (in-memory).
+	// Clear the login credential, the DTMF PIN, and all sessions so the device
+	// returns to the default-credential/needs-initial-setup state on both ESP
+	// (NVS) and host (in-memory).
 	AdminAuth::clearCredential();
 	// Also drop ap_secure / ap_psk / cfgseed_gen. Clearing the seed generation is
 	// deliberate: the next boot re-applies whatever the flasher wrote, so a
@@ -2245,52 +2256,69 @@ void HttpServer::sendApiAdminStatus(int sock, const HttpRequest& req)
 	bool authenticated = isAuthed(req);
 	std::ostringstream json;
 	json << "{\"provisioned\":" << (provisioned ? "true" : "false")
+	     << ",\"needsSetup\":" << (provisioned ? "false" : "true")
 	     << ",\"authenticated\":" << (authenticated ? "true" : "false") << "}";
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 
-void HttpServer::sendApiAdminSetPin(int sock, const HttpRequest& req)
+void HttpServer::sendApiAdminSetCredential(int sock, const HttpRequest& req)
 {
-	// First-run onboarding: setting a PIN is allowed only when the device is not
-	// yet provisioned, OR when the caller already holds a valid session (changing
-	// an existing PIN). This prevents an unauthenticated AP peer from overwriting
-	// a provisioned admin PIN.
-	if (AdminAuth::isProvisioned() && !isAuthed(req))
+	// Reached only with a valid session (requireAdmin) — either an operator
+	// still on the default credential doing forced initial setup, or one
+	// changing an already-real credential/DTMF PIN later. `username`+`password`
+	// must arrive together (a credential needs both); an empty `dtmfPin` means
+	// "leave the DTMF PIN as it is", same "empty means keep existing" contract
+	// TelephonyApiConfig's secret field already uses.
+	std::string username = getFormParam(req.body, "username");
+	std::string password = getFormParam(req.body, "password");
+	std::string dtmfPin  = getFormParam(req.body, "dtmfPin");
+
+	bool changedLogin = false;
+	bool changedPin = false;
+
+	if (!username.empty() || !password.empty())
 	{
-		sendResponse(sock, 401, "Unauthorized", "application/json",
-		             "{\"error\":\"authentication required to change PIN\"}");
-		return;
+		if (username.empty() || password.empty())
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"username and password must both be provided together\"}");
+			return;
+		}
+		if (!AdminAuth::setLoginCredential(username, password))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"invalid username or password\"}");
+			return;
+		}
+		changedLogin = true;
 	}
 
-	std::string pin = getFormParam(req.body, "pin");
-	if (pin.size() < AdminAuth::kMinPinLength)
+	if (!dtmfPin.empty())
+	{
+		if (!AdminAuth::setDtmfPin(dtmfPin))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"DTMF PIN must be 4-16 digits\"}");
+			return;
+		}
+		changedPin = true;
+	}
+
+	if (!changedLogin && !changedPin)
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
-		             "{\"error\":\"PIN must be at least 4 characters\"}");
+		             "{\"error\":\"nothing to change\"}");
 		return;
 	}
 
-	if (!AdminAuth::setPin(pin))
-	{
-		sendResponse(sock, 500, "Internal Server Error", "application/json",
-		             "{\"error\":\"failed to store PIN\"}");
-		return;
-	}
-
-	sendResponse(sock, 200, "OK", "application/json",
-	             "{\"status\":\"ok\",\"provisioned\":true}");
+	std::ostringstream json;
+	json << "{\"status\":\"ok\",\"provisioned\":" << (AdminAuth::isProvisioned() ? "true" : "false")
+	     << ",\"needsSetup\":" << (AdminAuth::needsInitialSetup() ? "true" : "false") << "}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 
 void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 {
-	if (!AdminAuth::isProvisioned())
-	{
-		// Nothing to log in to yet — direct the client to set a PIN first.
-		sendResponse(sock, 409, "Conflict", "application/json",
-		             "{\"error\":\"no admin PIN set; call /api/admin/set-pin first\"}");
-		return;
-	}
-
 	// Reject while locked out before doing any hashing work. Accounting is keyed
 	// on the peer address so one guessing client cannot lock the real admin out
 	// of new logins (docs/THREAT_MODEL.md D-3). A spoofed source only ever buys
@@ -2302,10 +2330,11 @@ void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 		return;
 	}
 
-	std::string pin = getFormParam(req.body, "pin");
-	if (!AdminAuth::verifyPin(pin, req.clientIp))
+	std::string username = getFormParam(req.body, "username");
+	std::string password = getFormParam(req.body, "password");
+	if (!AdminAuth::verifyCredential(username, password, req.clientIp))
 	{
-		// verifyPin may have just engaged the lockout on this attempt.
+		// verifyCredential may have just engaged the lockout on this attempt.
 		if (AdminAuth::isLockedOut(req.clientIp))
 		{
 			sendResponse(sock, 429, "Too Many Requests", "application/json",
@@ -2314,7 +2343,7 @@ void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 		else
 		{
 			sendResponse(sock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"invalid PIN\"}");
+			             "{\"error\":\"invalid username or password\"}");
 		}
 		return;
 	}
@@ -2336,10 +2365,15 @@ void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 
 	// Hand the page its CSRF token here as well as in the rendered document, so a
 	// login performed with fetch() can start making mutating calls immediately
-	// instead of needing a full reload to pick the token up.
+	// instead of needing a full reload to pick the token up. needsSetup tells
+	// the frontend whether this login just authenticated with the default
+	// credential — if so, requireAdmin() will refuse everything except
+	// /api/admin/set-credential until that's fixed, so the page must route
+	// straight to the setup form rather than the normal dashboard.
 	std::ostringstream json;
-	json << "{\"status\":\"ok\",\"authenticated\":true,\"csrf\":\""
-	     << jsonEscape(AdminAuth::sessionCsrf(token)) << "\"}";
+	json << "{\"status\":\"ok\",\"authenticated\":true,\"needsSetup\":"
+	     << (AdminAuth::needsInitialSetup() ? "true" : "false")
+	     << ",\"csrf\":\"" << jsonEscape(AdminAuth::sessionCsrf(token)) << "\"}";
 	sendResponseWithHeader(sock, 200, "OK", "application/json", json.str(), cookie);
 }
 

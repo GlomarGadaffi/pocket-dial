@@ -12,7 +12,7 @@ If you have not flashed firmware yet, do that first — see the build instructio
 
 1. [Power on and join the device's Wi-Fi](#1-power-on-and-join-the-device)
 2. [Open the dashboard](#2-open-the-dashboard)
-3. [Set the admin PIN (do this first)](#3-set-the-admin-pin-first)
+3. [Log in and complete setup (do this first)](#3-log-in-and-complete-setup-first)
 4. [Register a softphone or IP phone](#4-register-a-phone)
 5. [Make a test call (777 echo, then 999 all-page)](#5-make-a-test-call)
 6. [Quick-start checklist](#6-quick-start-checklist)
@@ -43,8 +43,8 @@ dashboard to `192.168.4.1:80`.
 
 > [!IMPORTANT]
 > The SoftAP is **open by default** — anyone in radio range can join, and the dashboard,
-> SIP signalling and call audio all cross that link in the clear. Set the admin PIN
-> immediately (step 3), then **turn access-point security on** — it is the single most
+> SIP signalling and call audio all cross that link in the clear. Log in and replace
+> the default admin credential immediately (step 3), then **turn access-point security on** — it is the single most
 > effective hardening available on this device, because it encrypts all three at once.
 > See [THREAT_MODEL.md](THREAT_MODEL.md) §6.
 
@@ -122,63 +122,72 @@ If the page does not load, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#dashboard
 
 ---
 
-## 3. Set the admin PIN (first)
+## 3. Log in and complete setup (first)
 
 > [!IMPORTANT]
-> **Set the admin PIN before doing anything else.** A factory-fresh device is
-> *unprovisioned*: its state-changing endpoints are protected only by a same-origin/CSRF
-> check, so any peer on the open AP could disconnect calls, rewrite Wi-Fi credentials,
-> switch modes, or factory-reset the device. The instant a PIN is set, those endpoints
-> require an authenticated session. This is the **first-run onboarding step**
-> (see [THREAT_MODEL.md](THREAT_MODEL.md) §5.1).
+> **Log in and replace the default credential before doing anything else.**
+> The device ships with a well-known default login — username `admin`,
+> password `admin` — precisely so this step doesn't require any out-of-band
+> secret. Every state-changing endpoint requires a valid, authenticated
+> session, and until you replace the default credential, the server refuses
+> everything else with `403 {"error":"setup_required"}` — "force setup on
+> first use," enforced by the firmware itself, not just suggested by the
+> dashboard (see [THREAT_MODEL.md](THREAT_MODEL.md) §5.1).
 
-Once a PIN is set, the following state-changing endpoints require a valid `pd_session`
-cookie (else they return `401`): `/api/kill`, `/api/wifi/connect`, `/api/wifi/mode_ap`,
-`/api/factory-reset`, and the OTA endpoints (`/api/ota/upload`, `/api/ota/reboot`).
+The following state-changing endpoints require a valid `pd_session` cookie
+(else they return `401`) and, once logged in, a valid CSRF token (else `403`):
+`/api/kill`, `/api/wifi/connect`, `/api/wifi/mode_ap`, `/api/factory-reset`,
+`/api/telephony-config`, `/api/did-mapping`, and the OTA endpoints
+(`/api/ota/upload`, `/api/ota/reboot`).
 
-### Set the PIN from the dashboard
+### Log in and complete setup from the dashboard
 
-Use the admin/security control on the dashboard to set your PIN. Under the hood this
-POSTs to `/api/admin/set-pin`.
+Use the admin/security control on the dashboard. It opens on a login form;
+logging in with the default `admin`/`admin` credential immediately routes to
+a forced setup form (new username, new password, and an optional DTMF admin
+PIN) that nothing else on the dashboard is usable until you submit.
 
-### Set the PIN from the command line
+### Log in and complete setup from the command line
 
 ```bash
 DEVICE=http://192.168.4.1     # or http://pocketdial.local
 
-curl -s -H "Origin: $DEVICE" \
-     -X POST --data "pin=YOUR_PIN" \
-     "$DEVICE/api/admin/set-pin"
-# -> {"status":"ok","provisioned":true}
+# 1. Log in with the shipped default credential.
+LOGIN=$(curl -s -i -H "Origin: $DEVICE" \
+     -X POST --data "username=admin&password=admin" \
+     "$DEVICE/api/admin/login")
+SESSION=$(echo "$LOGIN" | sed -n 's/.*pd_session=\([0-9a-fA-F]*\).*/\1/p' | head -1)
+CSRF=$(echo "$LOGIN" | sed -n 's/.*"csrf":"\([0-9a-fA-F]*\)".*/\1/p' | head -1)
+
+# 2. Complete setup: replace the login credential, optionally set a DTMF PIN.
+curl -s -H "Origin: $DEVICE" -H "Cookie: pd_session=$SESSION" -H "X-CSRF: $CSRF" \
+     -X POST --data "username=YOUR_USERNAME&password=YOUR_PASSWORD&dtmfPin=YOUR_DTMF_PIN" \
+     "$DEVICE/api/admin/set-credential"
+# -> {"status":"ok","provisioned":true,"needsSetup":false}
 ```
 
-PIN rules and behavior, from `src/Helpers/AdminAuth.{hpp,cpp}` and the threat model:
+Credential rules and behavior, from `src/Helpers/AdminAuth.{hpp,cpp}` and the threat model:
 
 | Property | Value |
 | :--- | :--- |
-| Minimum length | 4 characters (`kMinPinLength`); a too-short PIN returns `400` |
-| Storage | Salted, iterated SHA-256 — 50,000 rounds, 128-bit random salt (NVS keys `admin_salt` / `admin_hash`) |
-| Brute-force lockout | 5 consecutive failed logins → 60-second lockout (`429`); auto-clears |
-| Session token | ≥128-bit opaque, `HttpOnly` + `SameSite=Strict` cookie, 30-minute absolute expiry |
+| Password minimum length | 8 characters (`kMinPasswordLength`); shorter returns `400` |
+| Username | 1-32 chars, no whitespace/control characters (`kMinUsernameLength`/`kMaxUsernameLength`) |
+| DTMF admin PIN | Optional, 4-16 digits (`kMinDtmfPinLength`/`kMaxDtmfPinLength`); **no default** — the phone-keypad `*PIN#code` menu stays fully disabled until one is set |
+| Storage | Salted, iterated SHA-256 — 50,000 rounds, 128-bit random salt per secret (NVS keys `admin_user`/`admin_pw_salt`/`admin_pw_hash` for the login credential, `admin_pin_salt`/`admin_pin_hash` for the DTMF PIN — independent, so clearing/rotating one never touches the other) |
+| Brute-force lockout | 5 consecutive failed logins → 60-second lockout (`429`); auto-clears on a correct credential |
+| Session token | ≥128-bit opaque, `HttpOnly` + `SameSite=Strict` cookie, 30-minute sliding expiry |
 
 > [!TIP]
-> The hash is salted and iterated, but a short numeric PIN is still trivially crackable
-> if an attacker ever obtains the flash contents physically. **Use ≥6 alphanumeric
-> characters** (THREAT_MODEL.md §5.2, P0 guidance).
+> The hash is salted and iterated, but a short or common password is still
+> guessable if an attacker ever obtains the flash contents physically. **Use a
+> real, unique password** — this is exactly what the forced-setup step exists
+> to make you do instead of leaving `admin`/`admin` in place.
 
-### Log in
-
-After the PIN is set, obtain a session before calling any gated endpoint:
-
-```bash
-curl -s -c cookies.txt -H "Origin: $DEVICE" \
-     -X POST --data "pin=YOUR_PIN" \
-     "$DEVICE/api/admin/login"
-# -> {"status":"ok","authenticated":true}   (sets a pd_session cookie)
-```
-
-You can verify provisioning state any time with the read-only endpoint
-`GET /api/admin/status`, which returns only booleans (`provisioned`, `authenticated`).
+You can verify auth state any time with the read-only endpoint
+`GET /api/admin/status`, which returns `{provisioned, needsSetup, authenticated}`
+booleans — `provisioned`/`needsSetup` describe the login credential only (the
+DTMF PIN has no equivalent status field; query `dtmfPinIsSet()`'s effect
+indirectly by whether `*PIN#code` DTMF actions work).
 
 ---
 
@@ -264,8 +273,9 @@ registered extension** at once, injecting auto-answer headers; the first device 
 - [ ] Powered on; joined Wi-Fi SSID **`esp32-sipserver`** (open) — or completed the
       `My-Ap` captive portal on the display build.
 - [ ] Dashboard reachable at `http://192.168.4.1` (or `http://pocketdial.local`).
-- [ ] **Admin PIN set** via `/api/admin/set-pin` (≥6 alphanumeric chars recommended).
-- [ ] Logged in (`/api/admin/login`) before using any gated control.
+- [ ] Logged in with the default credential (`admin`/`admin`) and completed setup
+      via `/api/admin/set-credential` (real username + password ≥8 chars).
+- [ ] Logged in with the new credential (`/api/admin/login`) before using any gated control.
 - [ ] First softphone/IP phone registered: server `192.168.4.1:5060`, **UDP**, **G.711**,
       extension e.g. `1001`.
 - [ ] Second extension registered (e.g. `1002`).

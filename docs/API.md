@@ -11,35 +11,34 @@ This document provides the formal API specification for the HTTP control interfa
 
 ## 0. Reachability & Admin Session Layer (read this first)
 
-**The HTTP server is dark by default on a provisioned device.** Once an admin PIN
-exists, the TCP listener itself is closed except within a bounded open window
-(default 600 s) granted by one of:
+**The HTTP server's TCP listener always accepts connections**, regardless of
+provisioning state — there is no socket-level dark/open gate. The device ships
+with a well-known default login (username `admin`, password `admin`); every
+admin-gated endpoint requires a valid `pd_session` cookie, and until the
+operator replaces the default credential (`POST /api/admin/set-credential`),
+every admin-gated endpoint **except** `set-credential` itself is refused with
+`403 {"error":"setup_required"}` — "force setup on first use," enforced
+server-side, not just suggested by the dashboard UI.
 
-1. **DTMF trigger** — the admin extension (default `1001`), while registered, dials
-   `*4887`; the SIP INFO's source IP must match the registration's bound IP.
-2. **Provisioning grace** — a successful `POST /api/admin/set-pin` grants the same
-   window (first-run onboarding and PIN changes).
-3. **Keep-alive** — an authenticated `POST /api/admin/keepalive` extends the window
-   by 1 hour.
+A separate, independent numeric **DTMF admin PIN** (phone-keypad `*PIN#code`
+menu — NTP resync, topology switch, factory reset) has no default at all and
+stays fully disabled until explicitly set via the same `set-credential`
+endpoint's `dtmfPin=` field. Threat analysis: `docs/THREAT_MODEL.md` §5.5.
 
-Outside a window, connections are refused at the socket level — every endpoint in
-this document is unreachable. An **unprovisioned** device listens unconditionally
-(onboarding requires the web UI before any credential exists). Threat analysis:
-`docs/THREAT_MODEL.md` §5.5.
-
-**Admin session endpoints** (all JSON; mutating ones are Same-Origin checked):
+**Admin session endpoints** (all JSON; mutating ones are Same-Origin + CSRF checked):
 
 | Endpoint | Method | Auth | Purpose |
 | :--- | :--- | :--- | :--- |
-| `/api/admin/status` | `GET` | None | `{provisioned, authenticated}` booleans for dashboard render. |
-| `/api/admin/set-pin` | `POST` | None if unprovisioned; session if changing | Set/change the admin PIN (`pin=` form param, ≥4 chars, **must not begin `4887`** — reserved for the DTMF star-code). Grants the provisioning grace window. |
-| `/api/admin/login` | `POST` | PIN in body | Issues the `pd_session` cookie (HttpOnly, SameSite=Strict). Rate-limited with lockout. |
+| `/api/admin/status` | `GET` | None | `{provisioned, needsSetup, authenticated}` booleans for dashboard render. `provisioned`/`needsSetup` are inverses of each other and describe the login credential only. |
+| `/api/admin/set-credential` | `POST` | Session (+CSRF) | Change the login credential and/or the DTMF PIN. `username=`+`password=` (≥8 chars) must both be provided together to change the login credential; `dtmfPin=` (4-16 digits) alone changes just the DTMF PIN. Reachable even while `needsSetup` is true — it's the one exemption to the setup_required gate. |
+| `/api/admin/login` | `POST` | `username=`+`password=` in body | Verifies against the stored credential, or the default (`admin`/`admin`) if none has been set yet. Issues the `pd_session` cookie (HttpOnly, SameSite=Strict) and the session's CSRF token. Rate-limited with lockout. |
 | `/api/admin/logout` | `POST` | Session | Invalidates the session cookie. |
-| `/api/admin/keepalive` | `POST` | Session | Extends the HTTP-open window by 3600 s. |
 
-Once provisioned, all state-mutating endpoints (`/api/kill`, `/api/dnd`,
-`/api/forward`, `/api/group`, `/api/dialplan`, `/api/wifi/*`, `/api/factory-reset`, OTA upload)
-additionally require the `pd_session` cookie.
+Every state-mutating endpoint (`/api/kill`, `/api/dnd`, `/api/forward`,
+`/api/group`, `/api/dialplan`, `/api/wifi/*`, `/api/factory-reset`, OTA upload,
+`/api/telephony-config`, `/api/did-mapping`, `/api/admin/set-credential`, ...)
+requires both the `pd_session` cookie and the per-session CSRF token — from
+the very first login, including while still on the default credential.
 
 ---
 
@@ -176,8 +175,8 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/wifi/scan`](#get-apiwifiscan) | `GET` | Low | None | Triggers a scan of nearby Wi-Fi APs and returns their SSIDs and signal strengths. |
 | [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Gated (+ `X-CSRF`) | Saves Wi-Fi credentials to NVS and schedules an ESP32 system reboot into Station Mode. |
 | [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Gated (+ `X-CSRF`) | Sets the device to Standalone Access Point Mode and schedules a system reboot. |
-| [`/api/configuring`](#post-apiconfiguring) | `POST` | Low | Gated (+ `X-CSRF`) | Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. Previously ungated entirely; it still mutates device state, so it now takes the standard gate (which admits it unchanged during onboarding, the only time the portal calls it). |
-| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Wipes the admin credential and Wi-Fi/mode NVS state, then reboots to captive-portal setup. ESP-only (`501` on desktop). |
+| [`/api/configuring`](#post-apiconfiguring) | `POST` | Low | Gated (+ `X-CSRF`) | Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. It mutates device state, so it takes the standard gate like every other mutating route — a logged-in, fully-set-up session is required, same as WiFi setup itself. |
+| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Wipes the login credential, the DTMF PIN, the carrier-API credential table, the DID→extension table, the CDR call-history ring, and Wi-Fi/mode NVS state, then reboots to captive-portal setup. ESP-only (`501` on desktop — the underlying wipes still run and are host-testable). |
 | [`/api/ap-security`](#get-apiap-security) | `GET` | Medium | Gated | Reports whether the SoftAP requires WPA2 and returns its passphrase. |
 | [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
 | [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster. |
@@ -820,7 +819,7 @@ Tells the device a user is actively working through setup, pausing the captive-p
 ---
 
 ### `POST /api/factory-reset`
-Clears the admin PIN/session store and Wi-Fi/mode NVS state, returning the device to its unprovisioned captive-portal state, then reboots. **ESP-only** — returns `501` on the desktop build (no NVS to erase, and the process must keep running for the test harness).
+Clears the login credential, the DTMF PIN, all live sessions, the carrier-API credential table (`tapicfg`), the DID→extension table (`didmap`), the CDR call-history ring (`cdrlog`), and Wi-Fi/mode NVS state, returning the device to its default-credential/needs-initial-setup captive-portal state, then reboots. **ESP-only** for the reboot — returns `501` on the desktop build (no reboot to perform, and the process must keep running for the test harness), but every wipe above runs unconditionally before that platform check, so it is fully host-testable.
 
 * **Requires Same-Origin Check**: Yes
 * **Requires `pd_session` cookie**: Once the device is provisioned (see §0)

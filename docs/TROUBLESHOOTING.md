@@ -8,6 +8,16 @@ Quick references: [SETUP_GUIDE.md](SETUP_GUIDE.md) ·
 [API.md](API.md) · [OTA.md](OTA.md) · [LEARN_MODE.md](LEARN_MODE.md) ·
 [THREAT_MODEL.md](THREAT_MODEL.md)
 
+> [!WARNING]
+> **STALE as of 2026-09-13**: every section below mentioning "the dashboard went dark,"
+> `*4887`, or a bare admin **PIN** describes two mechanisms that have been removed. The
+> HTTP listener is now always open (no transport-level dark/open gate exists to
+> troubleshoot), and the admin credential is a username + password with a shipped
+> default (`admin`/`admin`, `/api/admin/set-credential`) rather than a bare PIN — see
+> [API.md](API.md) §0 and [SETUP_GUIDE.md](SETUP_GUIDE.md) §3 for the current model.
+> The lockout mechanics (brute-force cooldown, escalating backoff) are unchanged and
+> those sections remain accurate.
+
 > [!NOTE]
 > **v1.3.0 changed three operator-visible things.** If a
 > recipe here does not match your device, check which you are running.
