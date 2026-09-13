@@ -36,363 +36,386 @@ R"html0(<!DOCTYPE html>
 <title>Pocket-Dial Switchboard</title>
 <style>
 :root{
-  --field:#0d0b09; --field2:#141009; --panel:#1a140d; --panel2:#221a10;
-  --brass:#c69a4e; --brass-lo:#8a6a32; --brass-hi:#e8c987; --brass-dim:#6e5526;
-  --ink:#e8dcc3; --ink-dim:#9a8a6a; --line:#3a2c19; --line-hi:#5a4527;
-  --amber:#ffb000; --amber-glow:#ff9c1a; --lamp-off:#2a2117;
-  --green:#7bd66a; --red:#e8654a; --bake:#191512; --bake2:#221c16;
+  /* patch-bay palette (design brief) */
+  --void:#14100C; --face:#221B15; --face-raised:#2B231C;
+  --groove-light:rgba(255,255,255,.05); --groove-dark:rgba(0,0,0,.55);
+  --brass:#B08D52; --brass-bright:#D4AF6A; --brass-lo:rgba(176,141,82,.5); --brass-hi:#D4AF6A; --brass-dim:rgba(176,141,82,.28);
+  --paper:#EAE1C8; --paper-dim:#A99A7B;
+  --idle:#55A374; --active:#D9772E; --ringing:#E8C43D; --parked:#6C93B4; --alert:#C15C52;
+  --cord-a:#9078A8; --cord-b:#7C8A4C; --cord-c:#4E8A8C;
+  /* semantic aliases so the existing form/table/modal/chip rules below (unchanged
+     in structure from the brass/amber theme) retint to the patch-bay palette
+     without every individual rule needing to be rewritten */
+  --field:var(--void); --field2:var(--void); --panel:var(--face); --panel2:var(--face);
+  --ink:var(--paper); --ink-dim:var(--paper-dim);
+  --line:var(--brass-dim); --line-hi:var(--brass-lo);
+  --amber:var(--ringing); --amber-glow:#f0d466;
+  --lamp-off:#3a332a; --green:var(--idle); --red:var(--alert);
+  --bake:var(--face-raised); --bake2:var(--face-raised);
   --shadow:0 2px 4px rgba(0,0,0,.5);
-  --mono:ui-monospace,"Cascadia Code","Cascadia Mono","Consolas","SF Mono",Menlo,monospace;
-  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono","Cascadia Code","Consolas","Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Avenir Next",Roboto,sans-serif;
 }
 *{margin:0;padding:0;box-sizing:border-box}
-html,body{background:var(--field);color:var(--ink);font-family:var(--sans);font-size:15px;-webkit-text-size-adjust:100%}
-body{
-  min-height:100vh;
-  background:
-    radial-gradient(ellipse at 50% -10%, rgba(198,154,78,.10), transparent 55%),
-    radial-gradient(ellipse at 50% 120%, rgba(0,0,0,.6), transparent 60%),
-    var(--field);
-}
-a{color:var(--brass)}
-button{font-family:inherit}
+html,body{background:var(--void);color:var(--paper);font-family:var(--sans);font-size:15px;-webkit-text-size-adjust:100%}
+body{min-height:100vh}
+a{color:var(--brass-bright)}
+button{font-family:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--brass-bright);outline-offset:2px}
 
-/* ── OPERATOR RAIL ── */
+/* ── HEADER / RACK RAIL ── */
 #rail{
   position:sticky;top:0;z-index:40;
-  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
-  padding:8px 14px;
-  background:linear-gradient(180deg,#2a2013,#1a140c);
-  border-bottom:2px solid var(--brass-lo);
-  box-shadow:0 2px 8px rgba(0,0,0,.6);
+  display:flex;flex-wrap:wrap;align-items:center;gap:1.25rem 1.75rem;
+  padding:.9rem 1.5rem;
+  background:var(--face);
+  box-shadow:inset 0 -1px 0 var(--groove-light),0 6px 16px rgba(0,0,0,.45);
 }
-.wordmark{display:flex;align-items:baseline;gap:8px}
-.wordmark b{
-  font-family:var(--mono);font-size:18px;letter-spacing:1px;font-weight:700;
-  color:var(--brass-hi);text-shadow:0 1px 0 #000;
+.wordmark{display:flex;flex-direction:column;margin-right:.25rem}
+.wordmark b{font-family:var(--mono);font-size:1.05rem;letter-spacing:.02em;color:var(--paper)}
+.wordmark .sub{font-size:.6rem;letter-spacing:.14em;text-transform:uppercase;color:var(--brass);margin-top:2px}
+.rail-stats{display:flex;flex-wrap:wrap;gap:1.2rem;align-items:center;flex:1}
+.stat{display:flex;flex-direction:column;gap:1px;line-height:1.1}
+.stat .k{font-size:.6rem;letter-spacing:.1em;color:var(--paper-dim);text-transform:uppercase}
+.stat .v{font-family:var(--mono);font-size:.9rem;color:var(--paper);display:flex;align-items:center;gap:.4rem}
+#dot{width:8px;height:8px;border-radius:50%;background:var(--lamp-off);flex-shrink:0}
+#dot.on{background:var(--idle);box-shadow:0 0 6px var(--idle)}
+#dot.warn{background:var(--ringing);box-shadow:0 0 6px var(--ringing)}
+.recon{display:none;color:var(--ringing);font-size:.65rem;font-family:var(--mono)}
+.recon.show{display:inline}
+.spark{display:flex;align-items:center;gap:.5rem}
+.spark svg{display:block}
+.spark polyline{fill:none;stroke:var(--brass-bright);stroke-width:1.5}
+
+/* dual admin badge: left half = REAL web-session state, right half (separated
+   by a hairline) = a static note about the unrelated DTMF phone-menu channel.
+   Never blended into one sentence — see docs/patch-bay design notes. */
+.admin-badge{
+  display:flex;align-items:stretch;gap:0;
+  border-radius:8px;border:1px solid var(--brass-dim);
+  background:var(--face-raised);font-family:var(--mono);font-size:.72rem;overflow:hidden;
 }
-.wordmark .sub{font-size:11px;color:var(--brass);letter-spacing:3px;text-transform:uppercase}
-.rail-stats{display:flex;gap:14px;flex-wrap:wrap;margin-left:auto;align-items:center}
-.stat{display:flex;flex-direction:column;line-height:1.1}
-.stat .k{font-size:9px;letter-spacing:1px;color:var(--brass-lo);text-transform:uppercase}
-.stat .v{font-family:var(--mono);font-size:14px;color:var(--ink)}
-#dot{width:10px;height:10px;border-radius:50%;background:var(--lamp-off);box-shadow:0 0 0 2px #000 inset;flex-shrink:0}
-#dot.on{background:var(--green);box-shadow:0 0 8px var(--green)}
-#dot.warn{background:var(--amber);box-shadow:0 0 8px var(--amber-glow)}
-.online-wrap{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink-dim)}
-.rail-btns{display:flex;gap:6px;flex-wrap:wrap}
+.admin-badge .seg{display:flex;align-items:center;gap:.45rem;padding:.4rem .7rem}
+.admin-badge .seg.dtmf{color:var(--paper-dim);border-left:1px solid var(--brass-dim);cursor:help}
+.admin-badge .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.admin-badge.closed .seg.session .dot{background:var(--paper-dim)}
+.admin-badge.open .seg.session .dot{background:var(--idle);box-shadow:0 0 6px var(--idle)}
+
+.header-actions{display:flex;gap:.5rem;flex-wrap:wrap}
 .rbtn{
-  background:linear-gradient(180deg,#3a2c18,#241a0e);
-  color:var(--brass-hi);border:1px solid var(--brass-lo);border-radius:4px;
-  padding:5px 10px;font-size:12px;cursor:pointer;font-family:var(--mono);
-  box-shadow:var(--shadow);
+  background:var(--face-raised);border:1px solid var(--brass-lo);color:var(--paper);
+  padding:.45rem .8rem;border-radius:4px;font-size:.78rem;font-family:var(--mono);
+  box-shadow:inset 0 1px 0 var(--groove-light),inset 0 -2px 3px rgba(0,0,0,.4);
+  transition:filter .15s;
 }
-.rbtn:hover{border-color:var(--brass);color:#fff;background:linear-gradient(180deg,#4a3820,#2c2010)}
+.rbtn:hover{filter:brightness(1.2)}
 .rbtn:active{transform:translateY(1px)}
 
 /* ── LAYOUT ── */
-main{max-width:1180px;margin:0 auto;padding:14px;display:flex;flex-direction:column;gap:14px}
-.card{
-  background:linear-gradient(180deg,var(--panel2),var(--panel));
-  border:1px solid var(--line);border-radius:8px;
-  box-shadow:inset 0 1px 0 rgba(198,154,78,.06),0 4px 12px rgba(0,0,0,.4);
-}
-.card>h2{
-  font-family:var(--mono);font-size:12px;letter-spacing:2px;text-transform:uppercase;
-  color:var(--brass);padding:9px 14px;border-bottom:1px solid var(--line);
-  display:flex;align-items:center;gap:8px;
-}
-.card>h2 .badge{
-  margin-left:auto;font-size:11px;color:var(--ink-dim);
-  border:1px solid var(--line-hi);border-radius:10px;padding:1px 8px;letter-spacing:1px;
-}
-.card .body{padding:14px}
+main{max-width:1180px;margin:0 auto;padding:0 0 1.5rem}
 
-/* ── JACK BOARD ── */
-#board-wrap{position:relative}
-#cords{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:2;overflow:visible}
-#jacks{
-  position:relative;z-index:1;
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(82px,1fr));gap:10px;
+/* ── PATCH BAY (carries the visual weight) ── */
+.patch-bay{padding:1.75rem 1.5rem 0}
+.bay-face{
+  position:relative;background:var(--face);border-radius:16px;
+  padding:2.25rem 1.75rem 1.75rem;
+  box-shadow:inset 0 2px 0 var(--groove-light),inset 0 -4px 10px rgba(0,0,0,.5),0 12px 34px rgba(0,0,0,.4);
 }
-.jack{
-  position:relative;aspect-ratio:1/1.05;
-  background:radial-gradient(circle at 50% 38%,#2a221a 0%,var(--bake) 70%),var(--bake);
-  border:1px solid #000;border-radius:7px;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.05),inset 0 -3px 6px rgba(0,0,0,.6),var(--shadow);
-  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;
-  cursor:pointer;user-select:none;transition:border-color .15s,transform .08s;
+.bay-title{
+  font-size:.68rem;letter-spacing:.12em;text-transform:uppercase;color:var(--brass-bright);
+  margin:0 0 1.5rem;font-weight:700;display:flex;justify-content:space-between;align-items:baseline;
 }
-.jack:hover{border-color:var(--brass-lo)}
-.jack:active{transform:translateY(1px)}
-.jack .lamp{
-  width:16px;height:16px;border-radius:50%;
-  background:var(--lamp-off);
-  box-shadow:inset 0 1px 2px rgba(0,0,0,.8),inset 0 -1px 1px rgba(255,255,255,.06);
+.bay-title .count{color:var(--paper-dim);font-family:var(--mono);letter-spacing:normal;text-transform:none;font-weight:400}
+#cords{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.cord{fill:none;stroke-width:3;stroke-linecap:round;opacity:.85}
+.cord-a{stroke:var(--cord-a)} .cord-b{stroke:var(--cord-b)} .cord-c{stroke:var(--cord-c)}
+#jacks{display:flex;flex-wrap:wrap;gap:1.6rem 1.4rem;position:relative;z-index:1}
+.jack{display:flex;flex-direction:column;align-items:center;gap:.4rem;background:none;border:none;padding:.2rem;color:inherit;user-select:none}
+.jack .ring{
+  width:50px;height:50px;border-radius:50%;border:3px solid var(--brass);
+  background:radial-gradient(circle at 35% 28%,rgba(0,0,0,.55),rgba(0,0,0,0) 60%),var(--face-raised);
+  display:flex;align-items:center;justify-content:center;position:relative;transition:border-color .2s;
 }
-.jack .num{font-family:var(--mono);font-size:17px;color:var(--ink);letter-spacing:1px}
-/* socket hole decoration behind number */
-.jack .hole{
-  position:absolute;top:8px;width:10px;height:10px;border-radius:50%;
-  background:radial-gradient(circle at 50% 35%,#1a1410,#000 75%);
-  box-shadow:inset 0 1px 2px #000;
-}
-/* states */
-.jack.empty{opacity:.5}
-.jack.empty .num{color:var(--ink-dim)}
-.jack.reg .lamp{background:radial-gradient(circle at 50% 35%,#bfe8b0,var(--green));box-shadow:0 0 6px rgba(123,214,106,.6),inset 0 -1px 2px rgba(0,0,0,.4)}
-.jack.dnd{border-color:var(--amber)}
-.jack.dnd .lamp{background:radial-gradient(circle at 50% 35%,#ffd98a,var(--amber));box-shadow:0 0 6px var(--amber-glow),inset 0 -1px 2px rgba(0,0,0,.4)}
-.jack.call{border-color:var(--amber)}
-.jack.call .lamp{background:radial-gradient(circle at 50% 35%,#ffe1a0,var(--amber-glow));box-shadow:0 0 10px var(--amber-glow);animation:pulse 1.1s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.55;transform:scale(.86)}}
-.jack .badge-dnd{position:absolute;top:4px;right:5px;font-size:8px;color:var(--amber);font-family:var(--mono);letter-spacing:1px}
+.jack .led{width:11px;height:11px;border-radius:50%;background:var(--lamp-off)}
+.jack .badge-dnd{position:absolute;top:-4px;right:-4px;font-size:7px;font-family:var(--mono);letter-spacing:.5px;
+  background:var(--void);color:var(--ringing);border:1px solid var(--ringing);border-radius:3px;padding:0 3px}
+.jack .label{font-family:var(--mono);font-weight:600;font-size:.85rem;background:var(--face-raised);color:var(--paper);
+  padding:.1rem .45rem;border-radius:2px;border:1px solid rgba(0,0,0,.4)}
+.jack .sublabel{font-size:.6rem;color:var(--paper-dim);font-family:var(--mono)}
+.jack.state-idle .ring{border-color:var(--idle)} .jack.state-idle .led{background:var(--idle);box-shadow:0 0 8px var(--idle)}
+.jack.state-active .ring{border-color:var(--active)} .jack.state-active .led{background:var(--active);box-shadow:0 0 10px var(--active)}
+.jack.state-ringing .ring{border-color:var(--ringing)} .jack.state-ringing .led{background:var(--ringing);animation:pulse 1s ease-in-out infinite}
+.jack.state-parked .ring{border-color:var(--parked)} .jack.state-parked .led{background:var(--parked);box-shadow:0 0 8px var(--parked)}
+.jack.state-alert .ring{border-color:var(--alert)} .jack.state-alert .led{background:var(--alert);box-shadow:0 0 8px var(--alert);animation:pulse 1.4s ease-in-out infinite}
+.jack.state-unreg{opacity:.45} .jack.state-unreg .ring{border-color:#4a4136}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.82)}}
+.legend{display:flex;flex-wrap:wrap;gap:1.1rem;margin-top:1.75rem;padding-top:.9rem;border-top:1px solid var(--brass-dim)}
+.legend .item{display:flex;align-items:center;gap:.4rem;font-size:.65rem;color:var(--paper-dim);font-family:var(--mono)}
+.legend .swatch{width:9px;height:9px;border-radius:50%}
 
-/* ── PATCH CORD label ── */
-.cord-label{font-family:var(--mono);font-size:10px;fill:var(--amber);paint-order:stroke;stroke:#000;stroke-width:3px;stroke-linejoin:round}
+/* ── RACK MODULES (flat, not elevated cards — the bay carries the weight) ── */
+.rack-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1.1rem;padding:1.25rem 1.5rem}
+.module{background:var(--face);border-radius:6px;padding:1.1rem 1.3rem 1.3rem;
+  box-shadow:inset 0 1px 0 var(--groove-light),inset 0 -2px 5px rgba(0,0,0,.4)}
+.module.full{grid-column:1/-1}
+.module>h2{font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--brass-bright);
+  margin:0 0 .9rem;padding-bottom:.55rem;border-bottom:1px solid var(--brass-dim);font-weight:700;
+  display:flex;align-items:center;gap:8px}
+.module>h2 .badge{margin-left:auto;font-size:.68rem;color:var(--paper-dim);border:1px solid var(--line-hi);border-radius:10px;padding:1px 8px;letter-spacing:1px;text-transform:none}
+.module .body{padding-top:.2rem}
 
 /* ── TABLES ── */
 table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--brass-lo);padding:6px 8px;border-bottom:1px solid var(--line)}
-td{padding:6px 8px;border-bottom:1px solid rgba(58,44,25,.5);font-family:var(--mono)}
+th{text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--paper-dim);padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:6px 8px;border-bottom:1px solid rgba(176,141,82,.08);font-family:var(--mono)}
 tr:last-child td{border-bottom:none}
-tbody tr:hover{background:rgba(198,154,78,.05)}
+tbody tr:hover{background:rgba(176,141,82,.06)}
 .empty-row td{color:var(--ink-dim);font-family:var(--sans);text-align:center;padding:14px}
 .chip{display:inline-block;font-size:10px;font-family:var(--mono);padding:1px 7px;border-radius:9px;border:1px solid;letter-spacing:.5px}
-.chip.answered{color:var(--green);border-color:var(--green)}
-.chip.busy{color:var(--amber);border-color:var(--amber)}
-.chip.cancelled{color:var(--ink-dim);border-color:var(--line-hi)}
-.chip.unavailable,.chip.failed{color:var(--red);border-color:var(--red)}
-.chip.stub{color:var(--ink-dim);border-color:var(--line-hi)}
-.chip.pending{color:var(--amber);border-color:var(--amber)}
-.chip.live{color:var(--green);border-color:var(--green)}
+.chip.answered{color:var(--idle);border-color:var(--idle)}
+.chip.busy{color:var(--ringing);border-color:var(--ringing)}
+.chip.cancelled{color:var(--paper-dim);border-color:var(--line-hi)}
+.chip.unavailable,.chip.failed{color:var(--alert);border-color:var(--alert)}
+.chip.stub{color:var(--paper-dim);border-color:var(--line-hi)}
+.chip.pending{color:var(--ringing);border-color:var(--ringing)}
+.chip.live{color:var(--idle);border-color:var(--idle)}
 .arrow{color:var(--brass)}
 
 /* ── FORMS / CONTROLS ── */
 .field{display:flex;flex-direction:column;gap:3px;margin-bottom:8px}
 .field label{font-size:11px;color:var(--brass);letter-spacing:.5px}
 input[type=text],input[type=password],input[type=file],select{
-  background:#0c0a07;border:1px solid var(--line-hi);border-radius:4px;color:var(--ink);
+  background:var(--void);border:1px solid var(--line-hi);border-radius:4px;color:var(--ink);
   font-family:var(--mono);font-size:13px;padding:7px 9px;outline:none;width:100%;
 }
-input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(198,154,78,.18)}
+input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(176,141,82,.18)}
 .btn{
-  background:linear-gradient(180deg,#3a2c18,#241a0e);color:var(--brass-hi);
-  border:1px solid var(--brass-lo);border-radius:4px;padding:7px 14px;font-size:13px;
-  cursor:pointer;font-family:var(--mono);box-shadow:var(--shadow);
+  background:var(--face-raised);color:var(--paper);border:1px solid var(--brass-lo);border-radius:4px;
+  padding:7px 14px;font-size:13px;font-family:var(--mono);box-shadow:var(--shadow);transition:filter .15s;
 }
-.btn:hover{border-color:var(--brass);color:#fff}
+.btn:hover{filter:brightness(1.2)}
 .btn:active{transform:translateY(1px)}
 .btn.primary{background:linear-gradient(180deg,#7a5a1e,#5a4116);color:#fff;border-color:var(--brass)}
-.btn.danger{background:linear-gradient(180deg,#5a2418,#3a160e);color:#f3b9aa;border-color:#7a3424}
-.btn.danger:hover{background:linear-gradient(180deg,#7a3020,#4a1c12);color:#fff}
+.btn.danger{border-color:var(--alert);color:#F0D3CE}
+.btn.danger:hover{filter:brightness(1.3)}
 .btn:disabled{opacity:.4;cursor:not-allowed;filter:grayscale(.6)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .note{font-size:11px;color:var(--ink-dim);margin:4px 0}
 .msg{font-size:12px;font-family:var(--mono);min-height:16px;margin-top:4px}
-.ok{color:var(--green)}.err{color:var(--red)}.warn{color:var(--amber)}
+.ok{color:var(--idle)}.err{color:var(--alert)}.warn{color:var(--ringing)}
 
-/* toggle switch */
 .toggle{position:relative;display:inline-block;width:46px;height:24px;flex-shrink:0}
 .toggle input{opacity:0;width:0;height:0}
-.toggle .track{position:absolute;inset:0;background:#0c0a07;border:1px solid var(--line-hi);border-radius:24px;transition:.15s}
+.toggle .track{position:absolute;inset:0;background:var(--void);border:1px solid var(--line-hi);border-radius:24px;transition:.15s}
 .toggle .knob{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:var(--ink-dim);transition:.15s}
-.toggle input:checked+.track{background:rgba(255,176,0,.25);border-color:var(--amber)}
-.toggle input:checked+.track .knob{transform:translateX(22px);background:var(--amber);box-shadow:0 0 6px var(--amber-glow)}
+.toggle input:checked+.track{background:rgba(232,196,61,.22);border-color:var(--ringing)}
+.toggle input:checked+.track .knob{transform:translateX(22px);background:var(--ringing);box-shadow:0 0 6px var(--ringing)}
 
-/* split grid for groups/forwarding & status panels */
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.subhead{font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--brass-lo);margin-bottom:8px}
+.subhead{font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--brass);margin-bottom:8px}
 
 /* ── MODAL / PANEL OVERLAY ── */
-.overlay{
-  display:none;position:fixed;inset:0;z-index:60;
-  background:rgba(0,0,0,.66);backdrop-filter:blur(2px);
-  align-items:flex-start;justify-content:center;padding:24px 14px;overflow:auto;
-}
+.overlay{display:none;position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.66);backdrop-filter:blur(2px);
+  align-items:flex-start;justify-content:center;padding:24px 14px;overflow:auto}
 .overlay.show{display:flex}
-.modal{
-  width:100%;max-width:480px;background:linear-gradient(180deg,#221a10,#19130c);
-  border:1px solid var(--brass-lo);border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.7);
-}
-.modal h3{
-  font-family:var(--mono);font-size:13px;letter-spacing:1px;color:var(--brass-hi);
-  padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;
-}
+.modal{width:100%;max-width:480px;background:var(--face);border:1px solid var(--brass-lo);border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.7)}
+.modal h3{font-family:var(--mono);font-size:13px;letter-spacing:1px;color:var(--brass-hi);
+  padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
 .modal h3 .x{margin-left:auto;cursor:pointer;color:var(--ink-dim);font-size:18px;line-height:1}
-.modal h3 .x:hover{color:var(--red)}
+.modal h3 .x:hover{color:var(--alert)}
 .modal .mbody{padding:14px;max-height:74vh;overflow:auto}
 .hr{border:none;border-top:1px dashed var(--line-hi);margin:12px 0}
-.danger-zone{border-top:1px dashed #7a3424;margin-top:12px;padding-top:10px}
-.danger-zone .subhead{color:var(--red)}
+.danger-zone{border-top:1px dashed var(--alert);margin-top:12px;padding-top:10px}
+.danger-zone .subhead{color:var(--alert)}
 
-/* jack detail specific */
 #jd-lamp{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--lamp-off);vertical-align:middle;margin-right:6px}
 .kv{display:flex;justify-content:space-between;font-family:var(--mono);font-size:13px;padding:3px 0}
-.kv .k{color:var(--brass-lo)}
+.kv .k{color:var(--paper-dim)}
 .fwd-row{display:grid;grid-template-columns:78px 1fr auto;gap:8px;align-items:center;margin-bottom:7px}
 .fwd-row label{font-size:11px;color:var(--brass);font-family:var(--mono)}
 .did-row{display:grid;grid-template-columns:1fr 110px auto;gap:8px;align-items:center;margin-top:8px}
 
-/* wifi list */
 .wifi-net{display:flex;justify-content:space-between;align-items:center;padding:7px 9px;border:1px solid transparent;border-radius:4px;cursor:pointer}
-.wifi-net:hover{background:rgba(198,154,78,.06);border-color:var(--line-hi)}
+.wifi-net:hover{background:rgba(176,141,82,.08);border-color:var(--line-hi)}
 .wifi-ssid{color:var(--ink);font-family:var(--mono)}
 .wifi-meta{font-size:11px;color:var(--ink-dim);font-family:var(--mono)}
 
-/* OTA progress */
-#ota-prog{display:none;height:14px;border:1px solid var(--line-hi);border-radius:4px;background:#0c0a07;position:relative;margin:8px 0;overflow:hidden}
-#ota-bar{height:100%;width:0;background:linear-gradient(90deg,var(--brass-lo),var(--amber));transition:width .15s}
-#ota-pct{position:absolute;inset:0;text-align:center;font-size:10px;line-height:14px;font-family:var(--mono);color:#fff;text-shadow:0 0 3px #000}
+#ota-prog{display:none;height:14px;border:1px solid var(--line-hi);border-radius:4px;background:var(--void);position:relative;margin:8px 0;overflow:hidden}
+#ota-bar{height:100%;width:0;background:var(--brass);transition:width .15s}
+)html0";
 
-#toast{
-  position:fixed;left:50%;bottom:18px;transform:translateX(-50%) translateY(80px);
-  background:#241a0e;border:1px solid var(--brass-lo);border-radius:6px;color:var(--ink);
+static const char PD_HTML_1[] =
+R"html1(#ota-pct{position:absolute;inset:0;text-align:center;font-size:10px;line-height:14px;font-family:var(--mono);color:#fff;text-shadow:0 0 3px #000}
+
+#toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%) translateY(80px);
+  background:var(--face-raised);border:1px solid var(--brass-lo);border-radius:6px;color:var(--ink);
   padding:9px 16px;font-size:13px;font-family:var(--mono);z-index:90;opacity:0;
-  transition:transform .25s,opacity .25s;box-shadow:0 6px 20px rgba(0,0,0,.6);max-width:90vw;
-}
+  transition:transform .25s,opacity .25s;box-shadow:0 6px 20px rgba(0,0,0,.6);max-width:90vw}
 #toast.show{transform:translateX(-50%) translateY(0);opacity:1}
 
-.recon{display:none;color:var(--amber);font-size:11px;font-family:var(--mono)}
-.recon.show{display:inline}
-
-/* live SIP tracer (Issue #32) */
-.trace-screen{
-  height:260px;overflow-y:auto;background:#08070a;border:1px solid var(--line-hi);border-radius:4px;
-  padding:8px 10px;font-family:var(--mono);font-size:11px;line-height:1.5;color:var(--green);
-  white-space:pre-wrap;word-break:break-all;
-}
-.trace-screen .trc-hdr{color:var(--brass);}
-.trace-screen .trc-hdr.out{color:var(--amber);}
+.trace-screen{height:260px;overflow-y:auto;background:#08070a;border:1px solid var(--line-hi);border-radius:4px;
+  padding:8px 10px;font-family:var(--mono);font-size:11px;line-height:1.5;color:var(--idle);
+  white-space:pre-wrap;word-break:break-all}
+.trace-screen .trc-hdr{color:var(--brass)} .trace-screen .trc-hdr.out{color:var(--ringing)}
 .trace-screen .trc-empty{color:var(--ink-dim);font-family:var(--sans)}
 .trace-screen .trc-pkt{margin-bottom:8px;padding-bottom:8px;border-bottom:1px dashed var(--line)}
 .trace-screen .trc-pkt:last-child{border-bottom:none;margin-bottom:0}
-.trace-screen .trc-cmd{color:var(--green);opacity:.8;margin:2px 0 6px}
+.trace-screen .trc-cmd{color:var(--idle);opacity:.8;margin:2px 0 6px}
 
-/* trace command interpreter (Issue #32) */
 .term-line{display:flex;align-items:center;gap:6px;margin-top:8px;font-family:var(--mono);font-size:12px}
-.term-prompt{color:var(--green);flex-shrink:0}
+.term-prompt{color:var(--idle);flex-shrink:0}
 .term-input{flex:1;min-width:0;background:transparent;border:none;border-bottom:1px solid var(--line-hi);
-  color:var(--green);font-family:var(--mono);font-size:12px;padding:3px 0}
-.term-input:focus{outline:none;border-bottom-color:var(--amber)}
+  color:var(--idle);font-family:var(--mono);font-size:12px;padding:3px 0}
+.term-input:focus{outline:none;border-bottom-color:var(--ringing)}
+
+/* interconnect test-dial */
+.slot-row{display:flex;justify-content:space-between;align-items:center;gap:.75rem;padding:.5rem 0;border-bottom:1px dashed var(--brass-dim)}
+.slot-row:last-child{border-bottom:none}
+.test-result{font-size:.65rem;color:var(--paper-dim);font-family:var(--mono);min-width:9ch;text-align:right}
+
+footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-family:var(--mono)}
 
 @media (max-width:720px){
   .grid2{grid-template-columns:1fr}
-  #jacks{grid-template-columns:repeat(auto-fill,minmax(70px,1fr));gap:8px}
-  .rail-stats{width:100%;margin-left:0;justify-content:space-between}
+  .rail-stats{width:100%;justify-content:space-between}
   .fwd-row{grid-template-columns:64px 1fr}
   .fwd-row .btn{grid-column:2}
   .did-row{grid-template-columns:1fr}
+  .patch-bay{padding:1.25rem .9rem 0}
+  .rack-grid{padding:1rem .9rem}
 }
 @media (prefers-reduced-motion:reduce){
-  .jack.call .lamp{animation:none}
+  .jack .led{animation:none!important}
   *{transition:none!important}
 }
 </style>
 </head>
 <body>
 
-<!-- ══ OPERATOR RAIL ══ -->
+<!-- ══ HEADER / RACK RAIL ══ -->
 <div id="rail">
   <div class="wordmark">
     <b>POCKET&middot;DIAL</b><span class="sub">Switchboard</span>
   </div>
-  <div class="online-wrap"><span id="dot"></span><span id="online-txt">connecting&hellip;</span><span class="recon" id="recon">&nbsp;reconnecting&hellip;</span></div>
   <div class="rail-stats">
+    <div class="stat"><span class="k">Status</span><span class="v"><span id="dot"></span><span id="online-txt">connecting&hellip;</span><span class="recon" id="recon">&nbsp;reconnecting&hellip;</span></span></div>
     <div class="stat"><span class="k">Uptime</span><span class="v" id="s-uptime">--:--:--</span></div>
     <div class="stat"><span class="k">Address</span><span class="v" id="s-ip">0.0.0.0:5060</span></div>
-)html0";
-
-static const char PD_HTML_1[] =
-R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-jacks">0/32</span></div>
+    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-jacks">0/32</span></div>
     <div class="stat"><span class="k">Calls</span><span class="v" id="s-calls">0</span></div>
-    <div class="stat"><span class="k">Packets</span><span class="v" id="s-pkts">0</span></div>
+    <div class="stat">
+      <span class="k">Packets</span>
+      <span class="v spark">
+        <svg width="70" height="20" viewBox="0 0 70 20"><polyline id="sparkline" points=""></polyline></svg>
+        <span id="s-pkts">0</span>
+      </span>
+    </div>
   </div>
-  <div class="rail-btns">
+  <!-- Two independent facts, kept visually separate on purpose: the LEFT
+       segment is this browser's real web-admin session (from /api/admin/status);
+       the RIGHT segment is a static note about the DTMF *PIN#code phone menu,
+       which is a completely separate command channel gated from extension 1001
+       — it does not open, extend, or relate to the web session at all. -->
+  <div class="admin-badge closed" id="admin-badge">
+    <span class="seg session"><span class="dot"></span><span id="admin-text">SESSION: LOGGED OUT</span></span>
+    <span class="seg dtmf" title="Independent of this web session: dialing *PIN#code from extension 1001 runs a one-shot phone-keypad command (NTP resync, WiFi topology switch, factory reset). It never opens or extends a web login.">DTMF admin menu: 1001 · phone-only</span>
+  </div>
+  <div class="header-actions">
     <button class="rbtn" onclick="refreshNow()" title="Refresh (F5)">&#8635; Refresh</button>
     <button class="rbtn" onclick="openModal('wifi-modal');scanWifi()" title="WiFi (F9)">&#9783; WiFi</button>
     <button class="rbtn" onclick="openModal('admin-modal')" title="Admin">&#9919; Admin</button>
     <button class="rbtn" onclick="openTelephonyModal()" title="Telephone Interconnect">&#9742; Interconnect</button>
-    <button class="rbtn" onclick="cycleTheme()" id="theme-btn" title="Cycle accent">Amber</button>
     <button class="rbtn" onclick="openModal('help-modal')" title="Help (F1)">? Help</button>
   </div>
 </div>
 
 <main>
 
-  <!-- ══ JACK BOARD ══ -->
-  <section class="card" id="board-card">
-    <h2>&#9737; Jack Board <span class="badge" id="board-cap">0 / 32 lit</span></h2>
-    <div class="body" id="board-wrap">
+  <!-- ══ PATCH BAY ══ -->
+  <section class="patch-bay">
+    <div class="bay-face" id="board-wrap">
+      <div class="bay-title"><span>Jack Board</span><span class="count" id="board-cap">0 shown / 32 total</span></div>
       <svg id="cords"></svg>
       <div id="jacks"></div>
+      <div class="legend">
+        <span class="item"><span class="swatch" style="background:var(--idle)"></span>idle</span>
+        <span class="item"><span class="swatch" style="background:var(--ringing)"></span>ringing</span>
+        <span class="item"><span class="swatch" style="background:var(--active)"></span>active</span>
+        <span class="item"><span class="swatch" style="background:var(--parked)"></span>parked</span>
+        <span class="item"><span class="swatch" style="background:var(--alert)"></span>alert</span>
+        <span class="item"><span class="swatch" style="background:var(--cord-a)"></span>cord = ring-group membership</span>
+      </div>
     </div>
   </section>
 
-  <!-- ══ GROUPS & FORWARDING ══ -->
-  <section class="card">
-    <h2>&#9783; Ring Groups &amp; Forwarding</h2>
-    <div class="body">
-      <div class="grid2">
-        <div>
-          <div class="subhead">Ring / Hunt Groups</div>
-          <div id="groups-list"></div>
-          <hr class="hr">
-          <div class="subhead">New / Edit Group</div>
-          <div class="field"><label>Group extension</label><input type="text" id="grp-ext" inputmode="numeric" placeholder="e.g. 600"></div>
-          <div class="field"><label>Members (comma separated)</label><input type="text" id="grp-members" placeholder="101,102,103"></div>
-          <div class="field"><label>Mode</label>
-            <select id="grp-mode"><option value="ringall">Ring all</option><option value="hunt">Hunt</option></select>
+  <!-- ══ RACK MODULES ══ -->
+  <section class="rack-grid">
+
+    <article class="module">
+      <h2>Ring Groups &amp; Forwarding</h2>
+      <div class="body">
+        <div class="grid2">
+          <div>
+            <div class="subhead">Ring / Hunt Groups</div>
+            <p class="note" style="margin-top:0">Cords on the bay above show live membership.</p>
+            <div id="groups-list"></div>
+            <hr class="hr">
+            <div class="subhead">New / Edit Group</div>
+            <div class="field"><label>Group extension</label><input type="text" id="grp-ext" inputmode="numeric" placeholder="e.g. 600"></div>
+            <div class="field"><label>Members (comma separated)</label><input type="text" id="grp-members" placeholder="101,102,103"></div>
+            <div class="field"><label>Mode</label>
+              <select id="grp-mode"><option value="ringall">Ring all</option><option value="hunt">Hunt</option></select>
+            </div>
+            <div class="row">
+              <button class="btn primary" onclick="saveGroup()">Save Group</button>
+              <span class="note">Empty members deletes the group.</span>
+            </div>
+            <div class="msg" id="grp-msg"></div>
+            <p class="note">Dial-plan rules: <code>POST /api/dialplan</code> (see docs/API.md)</p>
           </div>
-          <div class="row">
-            <button class="btn primary" onclick="saveGroup()">Save Group</button>
-            <span class="note">Empty members deletes the group.</span>
+          <div>
+            <div class="subhead">Per-Extension Forwarding</div>
+            <div id="fwd-list"></div>
+            <hr class="hr">
+            <div class="subhead">Set Forward</div>
+            <div class="field"><label>Extension</label><input type="text" id="fwd-ext" inputmode="numeric" placeholder="e.g. 101"></div>
+            <div class="field"><label>Trigger</label>
+              <select id="fwd-trigger"><option value="always">Always</option><option value="busy">Busy</option><option value="noanswer">No answer</option></select>
+            </div>
+            <div class="field"><label>Target (blank clears)</label><input type="text" id="fwd-target" inputmode="numeric" placeholder="e.g. 102"></div>
+            <button class="btn primary" onclick="saveForward()">Save Forward</button>
+            <div class="msg" id="fwd-msg"></div>
           </div>
-          <div class="msg" id="grp-msg"></div>
         </div>
-        <div>
-          <div class="subhead">Per-Extension Forwarding</div>
-          <div id="fwd-list"></div>
-          <hr class="hr">
-          <div class="subhead">Set Forward</div>
-          <div class="field"><label>Extension</label><input type="text" id="fwd-ext" inputmode="numeric" placeholder="e.g. 101"></div>
-          <div class="field"><label>Trigger</label>
-            <select id="fwd-trigger"><option value="always">Always</option><option value="busy">Busy</option><option value="noanswer">No answer</option></select>
-          </div>
-          <div class="field"><label>Target (blank clears)</label><input type="text" id="fwd-target" inputmode="numeric" placeholder="e.g. 102"></div>
-          <button class="btn primary" onclick="saveForward()">Save Forward</button>
-          <div class="msg" id="fwd-msg"></div>
+      </div>
+    </article>
+
+    <article class="module full">
+      <h2>Call Log <span class="badge" id="cdr-count">0</span></h2>
+      <div class="body" style="padding:0">
+        <table>
+          <thead><tr><th>Caller</th><th></th><th>Callee</th><th>Result</th><th>Duration</th><th>Age</th></tr></thead>
+          <tbody id="cdr-tbody"><tr class="empty-row"><td colspan="6">No calls recorded yet</td></tr></tbody>
+        </table>
+      </div>
+    </article>
+
+    <article class="module full">
+      <h2>SIP Trace <span class="badge" id="trace-count">off</span></h2>
+      <div class="body">
+        <div class="row" style="justify-content:space-between;margin-bottom:8px">
+          <label class="toggle"><input type="checkbox" id="trace-toggle" onchange="toggleTrace()"><span class="track"><span class="knob"></span></span></label>
+          <span class="note" style="margin:0">Flip the switch, or type <b>trace on</b> / <b>trace off</b> below. Downloadable as a full .pcap via <a href="/api/pcap">/api/pcap</a>.</span>
+        </div>
+        <div class="trace-screen" id="trace-screen"><div class="trc-empty">Trace is off.</div></div>
+        <div class="term-line">
+          <span class="term-prompt">pd&gt;</span>
+          <input type="text" id="term-input" class="term-input" autocomplete="off" autocapitalize="off" spellcheck="false"
+                 placeholder="trace on | trace off | help" onkeydown="if(event.key==='Enter')termExec()">
         </div>
       </div>
-    </div>
-  </section>
+    </article>
 
-  <!-- ══ CALL LOG ══ -->
-  <section class="card">
-    <h2>&#9742; Call Log <span class="badge" id="cdr-count">0</span></h2>
-    <div class="body" style="padding:0">
-      <table>
-        <thead><tr><th>Caller</th><th></th><th>Callee</th><th>Result</th><th>Duration</th><th>Age</th></tr></thead>
-        <tbody id="cdr-tbody"><tr class="empty-row"><td colspan="6">No calls recorded yet</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- ══ LIVE SIP TRACE ══ -->
-  <section class="card">
-    <h2>&#9737; SIP Trace <span class="badge" id="trace-count">off</span></h2>
-    <div class="body">
-      <div class="row" style="justify-content:space-between;margin-bottom:8px">
-        <label class="toggle"><input type="checkbox" id="trace-toggle" onchange="toggleTrace()"><span class="track"><span class="knob"></span></span></label>
-        <span class="note" style="margin:0">Flip the switch, or type <b>trace on</b> / <b>trace off</b> below. Downloadable as a full .pcap via <a href="/api/pcap">/api/pcap</a>.</span>
-      </div>
-      <div class="trace-screen" id="trace-screen"><div class="trc-empty">Trace is off.</div></div>
-      <div class="term-line">
-        <span class="term-prompt">pd&gt;</span>
-        <input type="text" id="term-input" class="term-input" autocomplete="off" autocapitalize="off" spellcheck="false"
-               placeholder="trace on | trace off | help" onkeydown="if(event.key==='Enter')termExec()">
-      </div>
-    </div>
   </section>
 
 </main>
@@ -403,6 +426,8 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
     <h3><span id="jd-lamp"></span><span>Jack <span id="jd-num">--</span></span><span class="x" onclick="closeModal('jack-modal')">&times;</span></h3>
     <div class="mbody">
       <div class="kv"><span class="k">State</span><span id="jd-state">&mdash;</span></div>
+      <div class="kv"><span class="k">Peer</span><span id="jd-peer">&mdash;</span></div>
+      <div class="kv"><span class="k">Duration</span><span id="jd-dur">&mdash;</span></div>
       <div class="kv"><span class="k">Address</span><span id="jd-addr">&mdash;</span></div>
       <hr class="hr">
       <div class="row" style="justify-content:space-between">
@@ -452,7 +477,10 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
         </div>
         <div id="admin-changecred" style="display:none;margin-top:8px">
           <div class="field"><label>Username</label><input type="text" id="adm-changeuser" autocomplete="username"></div>
-          <div class="field"><label>New password (min 8 chars)</label><input type="password" id="adm-changepass" autocomplete="new-password"></div>
+)html1";
+
+static const char PD_HTML_2[] =
+R"html2(          <div class="field"><label>New password (min 8 chars)</label><input type="password" id="adm-changepass" autocomplete="new-password"></div>
           <button class="btn primary" onclick="adminChangeCredential()">Save</button>
         </div>
         <div id="admin-changedtmfpin" style="display:none;margin-top:8px">
@@ -475,10 +503,7 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
         associated with this access point must be re-joined using the passphrase
         below. Nothing changes until the access point next comes up.
       </div>
-)html1";
-
-static const char PD_HTML_1b[] =
-R"html1b(      <div class="kv"><span class="k">Current mode</span><span id="ap-mode">&mdash;</span></div>
+      <div class="kv"><span class="k">Current mode</span><span id="ap-mode">&mdash;</span></div>
       <div class="field">
         <label for="ap-psk">Access point passphrase (8&ndash;63 characters)</label>
         <input type="text" id="ap-psk" autocomplete="off" spellcheck="false">
@@ -582,7 +607,8 @@ R"html1b(      <div class="kv"><span class="k">Current mode</span><span id="ap-m
         API. Configure a slot with the carrier's credentials, then Activate it to choose
         which slot the device uses. A slot with no working backend yet is labelled
         &ldquo;not yet connected&rdquo; below &mdash; it stores what you enter, but nothing
-        actually dials out through it until that provider is implemented.
+        actually dials out through it until that provider is implemented. Test Dial places
+        a real probe call through the active slot's live provider connection.
       </div>
       <div class="kv"><span class="k">Active slot</span><span id="tapi-active-summary">&mdash;</span></div>
 
@@ -602,8 +628,10 @@ R"html1b(      <div class="kv"><span class="k">Current mode</span><span id="ap-m
       <div class="row">
         <button class="btn primary" onclick="saveTelephonySlot()">Save Slot</button>
         <button class="btn" onclick="activateTelephonySlot(tapiSelected)">Activate This Slot</button>
+        <button class="btn" id="tapi-test-btn" onclick="testTelephonySlot(tapiSelected)">&#9742; Test Dial</button>
       </div>
       <div class="msg" id="tapi-msg"></div>
+      <div class="row" style="justify-content:flex-end"><span class="test-result" id="tapi-test-result"></span></div>
 
       <hr class="hr">
       <div class="subhead">DID &rarr; Extension Routing</div>
@@ -634,11 +662,12 @@ R"html1b(      <div class="kv"><span class="k">Current mode</span><span id="ap-m
   <div class="modal">
     <h3>&#9737; Switchboard Help<span class="x" onclick="closeModal('help-modal')">&times;</span></h3>
     <div class="mbody" style="line-height:1.7;font-size:13px">
-      <p style="color:var(--brass);font-family:var(--mono)">POCKET&middot;DIAL &mdash; vintage operator switchboard</p>
+      <p style="color:var(--brass);font-family:var(--mono)">POCKET&middot;DIAL &mdash; patch-bay switchboard</p>
       <hr class="hr">
-      <p><b>The board.</b> Each tile is an extension jack. A lit green lamp = registered. A pulsing amber lamp = in a call (patched with a cord). An amber ring = Do Not Disturb. A dim recessed tile = empty slot.</p>
-      <p style="margin-top:8px"><b>Patch-cords.</b> Active calls are drawn as curved operator cords between the two jacks, labelled with state and running duration.</p>
-      <p style="margin-top:8px"><b>Tap a jack</b> to open its panel: address, DND toggle, the three call-forward triggers, and a force-disconnect.</p>
+      <p><b>The board.</b> Each ring is an extension jack. <span style="color:var(--idle)">Green</span> = idle/registered, <span style="color:var(--ringing)">yellow</span> = ringing, <span style="color:var(--active)">orange</span> = active call, <span style="color:var(--parked)">blue</span> = parked, <span style="color:var(--alert)">red</span> = alert. A dim ring = not yet seen. A small DND tag marks Do Not Disturb.</p>
+      <p style="margin-top:8px"><b>Cords.</b> A cord is a ring group, drawn between its member jacks — it never represents a single call. A lit jack is a call; tap it to see who with (peer and duration show in its panel).</p>
+      <p style="margin-top:8px"><b>Tap a jack</b> to open its panel: state, peer, duration, address, DND toggle, the three call-forward triggers, and a force-disconnect.</p>
+      <p style="margin-top:8px"><b>Admin badge.</b> The header badge's left half is this browser's real web login session. Its right half is an unrelated note: dialing <code>*PIN#code</code> from extension 1001 is a separate phone-keypad command channel (NTP resync, WiFi topology switch, factory reset) that never opens or extends the web session.</p>
       <hr class="hr">
       <p style="color:var(--brass);font-family:var(--mono)">Shortcuts</p>
       <p><span style="font-family:var(--mono);color:var(--brass-hi)">F1</span> Help &nbsp; <span style="font-family:var(--mono);color:var(--brass-hi)">F5</span> Refresh &nbsp; <span style="font-family:var(--mono);color:var(--brass-hi)">F9</span> WiFi &nbsp; <span style="font-family:var(--mono);color:var(--brass-hi)">Esc</span> Close</p>
@@ -648,10 +677,12 @@ R"html1b(      <div class="kv"><span class="k">Current mode</span><span id="ap-m
 
 <div id="toast"></div>
 
+<footer>pocket-dial &middot; patch-bay switchboard</footer>
+
 <script>
 "use strict";
-var statusData={ip:"0.0.0.0",port:5060,uptime:0,clients:[],sessions:[],dnd:[],forwards:[],groups:[],packetsProcessed:0};
-var adminState={provisioned:false,needsSetup:true,authenticated:false};
+var statusData={ip:"0.0.0.0",port:5060,uptime:0,clients:[],sessions:[],dnd:[],forwards:[],groups:[],dialplan:[],parkedCalls:[],packetsProcessed:0};
+var adminState={provisioned:false,needsSetup:true,authenticated:false,sessionRemainingSec:0};
 var otaUploading=false;
 var selectedSSID="";
 var selectedJack=null;
@@ -659,6 +690,7 @@ var failCount=0;
 var POOL=32;
 var tapiSlots=[];
 var tapiSelected=0;
+var tapiTestState={};
 /* Per-session CSRF token. The literal below is replaced by the server when it
    renders this page (HttpServer::sendHtml); an unauthenticated load leaves it
    empty and adminLogin() fills it in from the login response. It is deliberately
@@ -670,8 +702,12 @@ var PD_CSRF="__PD_CSRF__";
 /* ── helpers ── */
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");}
+function cssEsc(s){return String(s==null?"":s).replace(/["\\]/g,"\\$&");}
 function toast(msg,cls){var t=$("toast");t.textContent=msg;t.className=cls?("show "+cls):"show";clearTimeout(t._t);t._t=setTimeout(function(){t.className="";},2600);}
-function fmtUptime(sec){sec=Math.floor(sec||0);var h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;function p(n){return(n<10?"0":"")+n;}return p(h)+":"+p(m)+":"+p(s);}
+)html2";
+
+static const char PD_HTML_3[] =
+R"html3(function fmtUptime(sec){sec=Math.floor(sec||0);var h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;function p(n){return(n<10?"0":"")+n;}return p(h)+":"+p(m)+":"+p(s);}
 function setMsg(id,txt,cls){var e=$(id);if(e){e.textContent=txt||"";e.className="msg"+(cls?" "+cls:"");}}
 
 /* ── modals ── */
@@ -679,65 +715,75 @@ function openModal(id){$(id).classList.add("show");}
 function closeModal(id){$(id).classList.remove("show");}
 document.addEventListener("click",function(e){if(e.target.classList&&e.target.classList.contains("overlay"))e.target.classList.remove("show");});
 
-/* ── theme accent cycling (amber default / phosphor green) ── */
-var THEMES=["amber","phosphor","ice"];
-var THEME_VARS={
-  amber:{amber:"#ffb000",glow:"#ff9c1a"},
-  phosphor:{amber:"#5dff8a",glow:"#33ff66"},
-  ice:{amber:"#5ec8ff",glow:"#39a9ff"}
-};
-var themeIdx=0;
-function applyTheme(i){
-  themeIdx=((i%THEMES.length)+THEMES.length)%THEMES.length;
-  var k=THEMES[themeIdx],v=THEME_VARS[k];
-)html1b";
-
-static const char PD_HTML_2[] =
-R"html2(  document.documentElement.style.setProperty("--amber",v.amber);
-  document.documentElement.style.setProperty("--amber-glow",v.glow);
-  var b=$("theme-btn");if(b)b.textContent=k.charAt(0).toUpperCase()+k.slice(1);
-  try{localStorage.setItem("pd.theme",k);}catch(e){}
-}
-function cycleTheme(){applyTheme(themeIdx+1);}
-function restoreTheme(){var k="amber";try{k=localStorage.getItem("pd.theme")||"amber";}catch(e){}var i=THEMES.indexOf(k);applyTheme(i>=0?i:0);}
-
-/* ── extension classification from /api/status ── */
+/* ── extension classification from /api/status ──
+   One entry per extension ever seen this poll, merged from clients (registration),
+   dnd, sessions (call state + who with), and parkedCalls (self-park model: an
+   extension parks itself, so parkedExt === parker == the same caller). */
 function buildIndex(d){
   var idx={};
-  (d.clients||[]).forEach(function(c){var n=String(c.number);idx[n]={num:n,addr:c.address||"",reg:true,call:false,state:"",dnd:false};});
-  (d.dnd||[]).forEach(function(n){n=String(n);if(!idx[n])idx[n]={num:n,addr:"",reg:false,call:false,state:""};idx[n].dnd=true;});
+  function ensure(n){n=String(n);if(!idx[n])idx[n]={num:n,addr:"",reg:false,dnd:false,sessionState:"",peer:"",duration:"",parked:false,parkedBy:"",orbit:""};return idx[n];}
+  (d.clients||[]).forEach(function(c){var e=ensure(c.number);e.reg=true;e.addr=c.address||"";});
+  (d.dnd||[]).forEach(function(n){ensure(n).dnd=true;});
   (d.sessions||[]).forEach(function(s){
-    [s.caller,s.callee].forEach(function(n){n=String(n);if(!idx[n])idx[n]={num:n,addr:"",reg:false,dnd:false};idx[n].call=true;idx[n].state=s.state||"";});
+    var a=ensure(s.caller),b=ensure(s.callee);
+    a.sessionState=s.state||"";a.peer=String(s.callee);a.duration=s.duration||"";
+    b.sessionState=s.state||"";b.peer=String(s.caller);b.duration=s.duration||"";
+  });
+  (d.parkedCalls||[]).forEach(function(p){
+    var e=ensure(p.parkedExt);e.parked=true;e.parkedBy=p.parker;e.orbit=p.orbit;
   });
   return idx;
 }
+/* State priority: parked, then the live session state, then registration.
+   sessionStateToString() (RequestsHandler.cpp) emits exactly: Invited, Connected,
+   Busy, Unavailable, Cancel, Bye, Unknown (Unknown covers the Held enum value,
+   which has no case of its own there). Busy/Cancel/Bye are ordinary call-teardown
+   states that must NOT override the base idle/unreg classification for this
+   extension — otherwise a jack flashes "active" for one poll tick right after
+   every normal hangup. Unavailable is the one exception: it only ever appears
+   when a destination genuinely could not be reached, never on a normal hangup,
+   so it is surfaced as "alert" rather than silently folded back to idle. */
+function jackStateOf(e){
+  if(e.parked)return "parked";
+  var st=e.sessionState;
+  if(st==="Invited")return "ringing";
+  if(st==="Connected"||st==="Unknown")return "active";
+  if(st==="Unavailable")return "alert";
+  if(e.reg)return "idle";
+  return "unreg";
+}
+function jackSublabel(e,state){
+  if(state==="active")return e.duration||"active";
+  if(state==="ringing")return "ringing";
+  if(state==="parked")return "park\u00b7"+(e.orbit||"");
+  if(state==="alert")return "unavail";
+  if(state==="idle")return "reg";
+  return "\u2014";
+}
 
-/* ── render jack board ── */
+/* ── render patch bay ── */
 function renderBoard(d){
   var idx=buildIndex(d);
   var nums=Object.keys(idx).sort(function(a,b){return (parseInt(a,10)||0)-(parseInt(b,10)||0);});
   var board=$("jacks");
-  // Build/refresh tiles. We reuse DOM where possible to avoid churn.
   var html="";
   nums.forEach(function(n){
-    var e=idx[n];
-    var cls="jack";
-    if(e.call)cls+=" call";else if(e.reg)cls+=" reg";else cls+=" empty";
-    if(e.dnd)cls+=" dnd";
-    html+='<div class="'+cls+'" data-ext="'+esc(n)+'" onclick="openJack(\''+esc(n)+'\')">'
-      +'<span class="hole"></span>'
-      +(e.dnd?'<span class="badge-dnd">DND</span>':'')
-      +'<span class="lamp"></span><span class="num">'+esc(n)+'</span></div>';
+    var e=idx[n];var state=jackStateOf(e);
+    html+='<button class="jack state-'+state+'" data-ext="'+esc(n)+'" onclick="openJack(\''+esc(n)+'\')">'
+      +'<span class="ring"><span class="led"></span>'+(e.dnd?'<span class="badge-dnd">DND</span>':'')+'</span>'
+      +'<span class="label">'+esc(n)+'</span>'
+      +'<span class="sublabel">'+esc(jackSublabel(e,state))+'</span></button>';
   });
-  if(!nums.length)html='<div class="note" style="grid-column:1/-1;text-align:center;padding:24px">No extensions seen yet. Register a phone to light a jack.</div>';
+  if(!nums.length)html='<div class="note" style="text-align:center;padding:24px">No extensions seen yet. Register a phone to light a jack.</div>';
   board.innerHTML=html;
-  var lit=(d.clients||[]).length;
-  $("board-cap").textContent=lit+" / "+POOL+" lit";
-  // cords drawn after layout settles
+  $("board-cap").textContent=nums.length+" shown / "+POOL+" total";
   requestAnimationFrame(function(){drawCords(d);});
 }
 
-/* ── SVG patch-cords between caller and callee jacks ── */
+/* ── SVG patch-cords: ring-group MEMBERSHIP only, never a per-call state.
+   Members of one group are chained pairwise (member[i] -> member[i+1]); the
+   group's own "extension" is a virtual pilot number, not a physical jack, so
+   it is never a cord endpoint. Colors cycle mauve/olive/teal by group index. */
 function drawCords(d){
   var svg=$("cords");var wrap=$("board-wrap");
   if(!svg||!wrap){return;}
@@ -745,41 +791,44 @@ function drawCords(d){
   svg.setAttribute("width",wr.width);svg.setAttribute("height",wr.height);
   svg.setAttribute("viewBox","0 0 "+wr.width+" "+wr.height);
   var parts=[];
-  (d.sessions||[]).forEach(function(s){
-    var a=document.querySelector('.jack[data-ext="'+cssEsc(s.caller)+'"]');
-    var b=document.querySelector('.jack[data-ext="'+cssEsc(s.callee)+'"]');
-    if(!a||!b)return;
-    var ra=a.getBoundingClientRect(),rb=b.getBoundingClientRect();
-    var x1=ra.left-wr.left+ra.width/2,y1=ra.top-wr.top+8;
-    var x2=rb.left-wr.left+rb.width/2,y2=rb.top-wr.top+8;
-    var sag=Math.max(40,Math.abs(x2-x1)*0.32)+24;
-    var mx=(x1+x2)/2,my=Math.max(y1,y2)+sag;
-    var ringing=(s.state||"").toUpperCase()==="RINGING";
-    var col=ringing?"var(--amber-glow)":"var(--amber)";
-    parts.push('<path d="M'+x1+' '+y1+' Q'+mx+' '+my+' '+x2+' '+y2+'" fill="none" stroke="'+col+'" stroke-width="3" stroke-linecap="round" opacity="0.85"/>');
-    parts.push('<circle cx="'+x1+'" cy="'+y1+'" r="4" fill="'+col+'"/><circle cx="'+x2+'" cy="'+y2+'" r="4" fill="'+col+'"/>');
-    var lx=mx,ly=my-6;
-    parts.push('<text class="cord-label" x="'+lx+'" y="'+ly+'" text-anchor="middle">'+esc((s.state||"")+" "+(s.duration||""))+'</text>');
+  var colors=["cord-a","cord-b","cord-c"];
+  (d.groups||[]).forEach(function(g,gi){
+    var members=String(g.members||"").split(",").map(function(s){return s.trim();}).filter(Boolean);
+    var pts=[];
+    members.forEach(function(m){
+      var el=document.querySelector('.jack[data-ext="'+cssEsc(m)+'"] .ring');
+      if(!el)return;
+      var r=el.getBoundingClientRect();
+      pts.push({x:r.left+r.width/2-wr.left,y:r.top+r.height/2-wr.top});
+    });
+    var cls=colors[gi%3];
+    for(var i=0;i<pts.length-1;i++){
+      var a=pts[i],b=pts[i+1];
+      var midX=(a.x+b.x)/2,sag=30;
+      parts.push('<path class="cord '+cls+'" d="M '+a.x+' '+a.y+' Q '+midX+' '+(Math.max(a.y,b.y)+sag)+' '+b.x+' '+b.y+'"/>');
+    }
   });
   svg.innerHTML=parts.join("");
 }
-function cssEsc(s){return String(s==null?"":s).replace(/["\\]/g,"\\$&");}
 
 /* ── jack detail panel ── */
+var JACK_STATE_LABEL={idle:"IDLE / REGISTERED",active:"ACTIVE CALL",ringing:"RINGING",parked:"PARKED",alert:"ALERT \u2014 UNAVAILABLE",unreg:"IDLE / UNREGISTERED"};
+var JACK_STATE_COLOR={idle:"var(--idle)",active:"var(--active)",ringing:"var(--ringing)",parked:"var(--parked)",alert:"var(--alert)",unreg:"var(--lamp-off)"};
 function openJack(ext){
   selectedJack=ext;
-  var idx=buildIndex(statusData);var e=idx[ext]||{num:ext,addr:"",reg:false,call:false,state:"",dnd:false};
+  var idx=buildIndex(statusData);
+  var e=idx[ext]||{num:ext,addr:"",reg:false,dnd:false,sessionState:"",peer:"",duration:"",parked:false};
+  var state=jackStateOf(e);
   $("jd-num").textContent=ext;
   var lamp=$("jd-lamp");
-  lamp.style.boxShadow="none";
-  if(e.call){lamp.style.background="var(--amber-glow)";lamp.style.boxShadow="0 0 8px var(--amber-glow)";}
-  else if(e.dnd){lamp.style.background="var(--amber)";}
-  else if(e.reg){lamp.style.background="var(--green)";lamp.style.boxShadow="0 0 6px var(--green)";}
-  else lamp.style.background="var(--lamp-off)";
-  $("jd-state").textContent=e.call?("IN CALL — "+(e.state||"")):(e.dnd?"DND":(e.reg?"REGISTERED":"IDLE / UNREGISTERED"));
-  $("jd-addr").textContent=e.addr||"—";
+  var col=JACK_STATE_COLOR[state];
+  lamp.style.background=col;
+  lamp.style.boxShadow=(state==="unreg")?"none":("0 0 8px "+col);
+  $("jd-state").textContent=JACK_STATE_LABEL[state]+(e.dnd?" \u00b7 DND":"");
+  $("jd-peer").textContent=e.peer||"\u2014";
+  $("jd-dur").textContent=e.duration||"\u2014";
+  $("jd-addr").textContent=e.addr||"\u2014";
   $("jd-dnd").checked=!!e.dnd;
-  // prefill forwarding from status
   var fwd=(statusData.forwards||[]).filter(function(f){return String(f.extension)===String(ext);})[0]||{};
   $("jd-fwd-always").value=fwd.always||"";
   $("jd-fwd-busy").value=fwd.busy||"";
@@ -854,10 +903,6 @@ function saveForward(){
     .catch(function(err){setMsg("fwd-msg",err.message,"err");});
 }
 
-)html2";
-
-static const char PD_HTML_2a[] =
-R"html2a(
 /* ── CDR table ── */
 function renderCdr(records){
   var tb=$("cdr-tbody");
@@ -888,8 +933,6 @@ function toggleTrace(){
   if($("trace-toggle").checked&&!gateCheck()){$("trace-toggle").checked=false;return;}
   if($("trace-toggle").checked)startTrace();else stopTrace();
 }
-// `cmdEcho`, if given, is the "pd> trace on" line to show once the screen has
-// been cleared for the new session (so it doesn't get wiped by the clear).
 function startTrace(cmdEcho){
   traceOn=true;$("trace-toggle").checked=true;
   traceSeen={};$("trace-screen").innerHTML="";$("trace-count").textContent="0 shown";
@@ -921,21 +964,11 @@ function renderTraceAppend(records){
       +esc(r.peer)+' &middot; #'+r.seq+'</div>'+esc(r.text);
     screen.appendChild(div);
   });
-  // Cap rendered blocks client-side (independent of the server's ring cap) so a
-  // long-running trace session doesn't grow the DOM without bound.
   while(screen.children.length>200){screen.removeChild(screen.children[0]);}
   if(added>0)screen.scrollTop=screen.scrollHeight;
   var shown=screen.querySelectorAll(".trc-pkt").length;
   $("trace-count").textContent=shown+" shown";
 }
-
-/* ── trace-screen command interpreter (Issue #32): `trace on` / `trace off` ──
-   A minimal line interpreter for the terminal input under the trace screen.
-   It does not add a new transport — `trace on`/`trace off` just call the same
-   startTrace()/stopTrace() the checkbox uses, so packets still arrive via the
-   existing /api/trace poll. Command echoes share the trace-screen's own
-   200-block client-side cap (renderTraceAppend), so typing commands can't
-   grow the DOM unbounded either. */
 function termEcho(line){
   var screen=$("trace-screen");
   var empty=screen.querySelector(".trc-empty");if(empty)empty.remove();
@@ -950,7 +983,10 @@ function termExec(){
   var line="pd> "+raw;
   var cmd=raw.trim().toLowerCase().replace(/\s+/g," ");
   if(cmd==="trace on"){
-    if(traceOn){termEcho(line);termEcho("trace already on.");return;}
+)html3";
+
+static const char PD_HTML_4[] =
+R"html4(    if(traceOn){termEcho(line);termEcho("trace already on.");return;}
     if(!gateCheck()){termEcho(line);termEcho("session required — log in above first.");return;}
     startTrace(line);
   }else if(cmd==="trace off"){
@@ -964,9 +1000,6 @@ function termExec(){
 }
 
 /* ── networking ── */
-/* Shared by post()/put()/del() below — same mutating-request contract for
-   every verb: same-origin cookie, per-session CSRF header, and the same
-   401/403 handling every mutating call in this file relies on. */
 function httpMethod(method,url,body){
   return fetch(url,{method:method,credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF":PD_CSRF},body:body})
     .then(function(r){
@@ -981,7 +1014,7 @@ function put(url,body){return httpMethod("PUT",url,body);}
 function del(url,body){return httpMethod("DELETE",url,body);}
 function fetchStatus(){
   fetch("/api/status").then(function(r){return r.json();}).then(function(d){
-    statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);
+    statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);pushPacketSample(d.packetsProcessed||0);
   }).catch(function(){failCount++;if(failCount>=2)setOnline(false);});
 }
 function fetchCdr(){
@@ -1001,6 +1034,25 @@ function updateRail(d){
 }
 function refreshNow(){fetchStatus();fetchCdr();toast("Refreshed","ok");}
 
+/* ── packet sparkline: rolling per-poll THROUGHPUT (delta of the cumulative
+   packetsProcessed counter), not the raw cumulative value — a raw counter only
+   ever climbs, which would draw a flat rising line instead of a live pulse. */
+var pktHistory=new Array(24).fill(0);
+var lastPkts=null;
+function pushPacketSample(current){
+  var delta=0;
+  if(lastPkts!=null){delta=current-lastPkts;if(delta<0)delta=0;}
+  lastPkts=current;
+  pktHistory.shift();pktHistory.push(delta);
+  drawSparkline();
+}
+function drawSparkline(){
+  var max=Math.max.apply(null,pktHistory.concat([1]));
+  var w=70,h=20;
+  var pts=pktHistory.map(function(v,i){return (i/(pktHistory.length-1))*w+","+(h-(v/max)*h);}).join(" ");
+  var el=$("sparkline");if(el)el.setAttribute("points",pts);
+}
+
 /* redraw cords on resize (debounced) */
 var rsTimer=null;
 window.addEventListener("resize",function(){clearTimeout(rsTimer);rsTimer=setTimeout(function(){drawCords(statusData);},120);});
@@ -1009,7 +1061,8 @@ window.addEventListener("resize",function(){clearTimeout(rsTimer);rsTimer=setTim
 function fetchAdminStatus(){
   return fetch("/api/admin/status",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(d){
     adminState.provisioned=!!d.provisioned;adminState.needsSetup=!!d.needsSetup;adminState.authenticated=!!d.authenticated;
-    renderAdminPanel();applyAuthGating();
+    adminState.sessionRemainingSec=d.sessionRemainingSec||0;
+    renderAdminPanel();renderAdminBadge();applyAuthGating();
     if(adminState.authenticated&&!adminState.needsSetup){fetchApSecurity();fetchRegistrar();}
   }).catch(function(){});
 }
@@ -1021,8 +1074,22 @@ function renderAdminPanel(){
   else if(adminState.needsSetup)$("admin-setup").style.display="block";
   else $("admin-loggedin").style.display="block";
 }
-/* Mirrors the server's requireAdmin() setup_required gate: logged in on the
-   default credential unlocks nothing except completing setup. */
+/* Header badge: LEFT segment only ever reflects this real /api/admin/status
+   session (authenticated + sessionRemainingSec). The RIGHT segment (the DTMF
+   note) is static markup, never touched here — it must not appear to react to
+   this session's state, since the two are genuinely unrelated systems. */
+function renderAdminBadge(){
+  var badge=$("admin-badge"),txt=$("admin-text");
+  if(adminState.authenticated){
+    badge.className="admin-badge open";
+    var sec=Math.max(0,adminState.sessionRemainingSec|0);
+    var m=Math.floor(sec/60),s=sec%60;
+    txt.textContent="SESSION: LOGGED IN \u00b7 "+(m<10?"0":"")+m+":"+(s<10?"0":"")+s;
+  }else{
+    badge.className="admin-badge closed";
+    txt.textContent="SESSION: LOGGED OUT";
+  }
+}
 function controlsUnlocked(){return adminState.authenticated&&!adminState.needsSetup;}
 function applyAuthGating(){
   var unlocked=controlsUnlocked();
@@ -1031,7 +1098,7 @@ function applyAuthGating(){
   var on=$("ota-gate-note");if(on)on.style.display=unlocked?"none":"block";
   var of=$("ota-file");if(of)of.disabled=!unlocked;
 }
-function handleAuthExpired(){adminState.authenticated=false;renderAdminPanel();applyAuthGating();setMsg("admin-msg","Session expired — please log in.","err");}
+function handleAuthExpired(){adminState.authenticated=false;adminState.sessionRemainingSec=0;renderAdminPanel();renderAdminBadge();applyAuthGating();setMsg("admin-msg","Session expired — please log in.","err");}
 function adminCompleteSetup(){
   var user=$("adm-setup-user").value,pass=$("adm-setup-pass").value,dtmfPin=$("adm-setup-dtmfpin").value;
   if(!user||!pass||pass.length<8){setMsg("admin-msg","Username and an 8+ character password are required.","err");return;}
@@ -1040,10 +1107,7 @@ function adminCompleteSetup(){
   post("/api/admin/set-credential",body).then(function(){
     $("adm-setup-pass").value="";$("adm-setup-dtmfpin").value="";
     setMsg("admin-msg","Setup complete.","ok");fetchAdminStatus();
-)html2a";
-
-static const char PD_HTML_3[] =
-R"html3(  }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
+  }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
 }
 function adminChangeCredential(){
   var user=$("adm-changeuser").value,pass=$("adm-changepass").value;
@@ -1061,7 +1125,6 @@ function adminChangeDtmfPin(){
     setMsg("admin-msg","DTMF PIN updated.","ok");
   }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
 }
-/* post() resolves to the raw response text, so the AP handlers parse it here. */
 function parseJsonOr(t){try{return JSON.parse(t);}catch(e){return {};}}
 function renderApSecurity(d){
   $("ap-mode").textContent=d.secure?"WPA2 (encrypted)":"Open \u2014 unencrypted";
@@ -1107,8 +1170,6 @@ function renderRegistrar(d){
   }
   devs.forEach(function(x){
     var tr=document.createElement("tr");
-    /* textContent throughout: MAC and extension come off the wire from a phone,
-       so they are never interpolated as HTML. */
     var tdE=document.createElement("td");tdE.textContent=x.extension||"\u2014";
     var tdM=document.createElement("td");tdM.textContent=x.mac||"\u2014";
     var tdS=document.createElement("td");
@@ -1145,8 +1206,6 @@ function postRegistrarMode(mode,confirmLockout){
       setMsg("reg-msg","Registration mode is now "+mode+".","ok");
     })
     .catch(function(e){
-      /* 409 = switching to secure with nothing secured yet would reject every
-         phone. Make the operator say so explicitly rather than silently doing it. */
       if(/HTTP 409/.test(e.message)){
         if(confirm("No extensions are secured yet.\n\nSwitching to Secure now will reject EVERY phone until each one is adopted and secured.\n\nSwitch anyway?")){
           postRegistrarMode(mode,true);
@@ -1176,8 +1235,6 @@ function adminLogin(){
       if(r.status===401){setMsg("admin-msg","Incorrect username or password.","err");return;}
       if(r.status===429){setMsg("admin-msg","Locked — wait a minute.","err");return;}
       if(!r.ok){setMsg("admin-msg","Login failed (HTTP "+r.status+").","err");return;}
-      /* The login response carries this session's CSRF token so a fetch()-based
-         login can start making mutating calls immediately. */
       r.json().then(function(d){if(d&&d.csrf){PD_CSRF=d.csrf;}}).catch(function(){});
       setMsg("admin-msg","Logged in.","ok");toast("Admin unlocked","ok");fetchAdminStatus();
     }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
@@ -1202,7 +1259,10 @@ function fetchOtaStatus(){
 }
 function otaUpload(){
   if(otaUploading)return;
-  if(!controlsUnlocked()){setMsg("ota-msg","Admin login required.","err");return;}
+)html4";
+
+static const char PD_HTML_5[] =
+R"html5(  if(!controlsUnlocked()){setMsg("ota-msg","Admin login required.","err");return;}
   var fileEl=$("ota-file");var file=fileEl&&fileEl.files&&fileEl.files[0];
   if(!file){setMsg("ota-msg","Choose a firmware .bin first.","err");return;}
   var prog=$("ota-prog"),bar=$("ota-bar"),pct=$("ota-pct");
@@ -1237,16 +1297,13 @@ function otaReboot(skip){
 
 /* ════ WIFI ════ */
 function scanWifi(){
-  var st=$("wifi-status");st.textContent="Scanning…";st.style.color="var(--amber)";
+  var st=$("wifi-status");st.textContent="Scanning…";st.style.color="var(--ringing)";
   fetch("/api/wifi/scan").then(function(r){return r.json();}).then(function(d){
-    var nets=d.networks||[];st.textContent="Found "+nets.length+" networks";st.style.color="var(--green)";
+    var nets=d.networks||[];st.textContent="Found "+nets.length+" networks";st.style.color="var(--idle)";
     renderWifi(nets);
-  }).catch(function(e){st.textContent="Scan failed: "+e.message;st.style.color="var(--red)";});
+  }).catch(function(e){st.textContent="Scan failed: "+e.message;st.style.color="var(--alert)";});
 }
-)html3";
-
-static const char PD_HTML_3a[] =
-R"html3a(function renderWifi(nets){
+function renderWifi(nets){
   var list=$("wifi-list");list.innerHTML="";
   if(!nets.length){list.innerHTML='<div class="note">No networks found.</div>';return;}
   nets.forEach(function(n){
@@ -1262,17 +1319,17 @@ R"html3a(function renderWifi(nets){
 function selectWifi(ssid){selectedSSID=ssid;$("wifi-ssid").textContent=ssid;$("wifi-connect").style.display="block";$("wifi-pw").value="";$("wifi-pw").focus();}
 function cancelWifiConnect(){$("wifi-connect").style.display="none";selectedSSID="";}
 function connectWifi(){
-  var st=$("wifi-status");st.textContent="Connecting to "+selectedSSID+"…";st.style.color="var(--amber)";
+  var st=$("wifi-status");st.textContent="Connecting to "+selectedSSID+"…";st.style.color="var(--ringing)";
   post("/api/wifi/connect","ssid="+encodeURIComponent(selectedSSID)+"&password="+encodeURIComponent($("wifi-pw").value))
-    .then(function(){st.textContent="Connected to "+selectedSSID+"!";st.style.color="var(--green)";cancelWifiConnect();toast("WiFi connected","ok");})
-    .catch(function(e){st.textContent="Failed: "+e.message;st.style.color="var(--red)";});
+    .then(function(){st.textContent="Connected to "+selectedSSID+"!";st.style.color="var(--idle)";cancelWifiConnect();toast("WiFi connected","ok");})
+    .catch(function(e){st.textContent="Failed: "+e.message;st.style.color="var(--alert)";});
 }
 function startApMode(){
-  var st=$("wifi-status");st.textContent="Enabling AP Mode…";st.style.color="var(--amber)";
+  var st=$("wifi-status");st.textContent="Enabling AP Mode…";st.style.color="var(--ringing)";
   fetch("/api/wifi/mode_ap",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"}})
     .then(function(r){if(r.status===401){handleAuthExpired();throw new Error("session expired");}return r.json();})
-    .then(function(){st.textContent="AP mode set! Rebooting…";st.style.color="var(--green)";})
-    .catch(function(e){st.textContent="Failed: "+e.message;st.style.color="var(--red)";});
+    .then(function(){st.textContent="AP mode set! Rebooting…";st.style.color="var(--idle)";})
+    .catch(function(e){st.textContent="Failed: "+e.message;st.style.color="var(--alert)";});
 }
 function holdConfigMode(){
   fetch("/api/configuring",{method:"POST"}).then(function(r){return r.json();})
@@ -1280,7 +1337,7 @@ function holdConfigMode(){
 }
 function factoryReset(){
   if(!confirm("Factory reset erases saved Wi-Fi config and reboots into captive-portal setup. Continue?"))return;
-  var st=$("wifi-status");st.textContent="Factory resetting…";st.style.color="var(--red)";
+  var st=$("wifi-status");st.textContent="Factory resetting…";st.style.color="var(--alert)";
   fetch("/api/factory-reset",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"confirm=ERASE"})
     .then(function(r){if(r.status===401){handleAuthExpired();throw new Error("session expired");}return r.json();})
     .then(function(d){toast(d.message||"Rebooting…","warn");}).catch(function(e){toast("Error: "+e.message,"err");});
@@ -1288,13 +1345,8 @@ function factoryReset(){
 
 /* ════ TELEPHONE INTERCONNECT ════
    Carrier API credential slots (GET/PUT /api/telephony-config[/n], POST
-   /api/telephony-config/n/activate) and DID→extension routing (GET/PUT/DELETE
-   /api/did-mapping). Both reads are session-gated same as /api/registrar (see
-   HttpServer.cpp), so — unlike the WiFi scan above — opening this modal goes
-   through gateCheck() first instead of firing an unauthenticated fetch that
-   would just 401. Data is pulled on modal-open and after each mutation rather
-   than on the admin-status poll interval: this is edited-rarely config, not a
-   live status feed like the registrar roster. */
+   /api/telephony-config/n/activate, POST /api/telephony-config/n/test) and
+   DID→extension routing (GET/PUT/DELETE /api/did-mapping). */
 var PD_RESERVED_EXT={"777":1,"999":1,"555":1,"888":1,"440":1};
 function isDialTokenSafeJs(s){return !!s&&/^[A-Za-z0-9#*]+$/.test(s);}
 function openTelephonyModal(){
@@ -1302,9 +1354,6 @@ function openTelephonyModal(){
   openModal("telephony-modal");
   fetchTelephonyConfig();fetchDidMappings();
 }
-// Honest-by-construction: never renders "Active"/"connected" language for a
-// slot whose provider type has no real backend yet (SlotView.implemented),
-// even if it's enabled and selected active — see TelephonyProvider.hpp.
 function tapiStatusChip(s){
   var configured=!!(s.baseUrl||s.clientId||s.secretSet||s.routeDn||s.enabled);
   if(!configured)return '<span class="chip stub">Not configured</span>';
@@ -1325,7 +1374,7 @@ function renderTapiSlots(){
     if(s.active)activeLabel="Slot "+(i+1)+(s.implemented?"":" (not yet connected)");
     var tr=document.createElement("tr");
     var tdN=document.createElement("td");tdN.textContent="Slot "+(i+1);
-    var tdS=document.createElement("td");tdS.innerHTML=tapiStatusChip(s); // our own markup, not off-the-wire text
+    var tdS=document.createElement("td");tdS.innerHTML=tapiStatusChip(s);
     var tdU=document.createElement("td");tdU.textContent=s.baseUrl||"—";
     var tdR=document.createElement("td");tdR.textContent=s.routeDn||"—";
     var tdA=document.createElement("td");
@@ -1352,6 +1401,9 @@ function selectTapiSlot(i){
   $("tapi-secret").placeholder=s.secretSet?"leave blank to keep existing":"";
   $("tapi-routedn").value=s.routeDn||"";
   $("tapi-enabled").checked=!!s.enabled;
+  var testBtn=$("tapi-test-btn");
+  if(testBtn)testBtn.style.display=(s.active&&s.implemented)?"":"none";
+  renderTapiTestResult(i);
   setMsg("tapi-msg","");
 }
 function saveTelephonySlot(){
@@ -1371,6 +1423,32 @@ function activateTelephonySlot(i){
     .then(function(){setMsg("tapi-msg","Slot "+(i+1)+" is now active.","ok");fetchTelephonyConfig();})
     .catch(function(e){setMsg("tapi-msg",e.message,"err");});
 }
+/* Places a real probe call through the active slot's live provider connection
+   (RequestsHandler::testDialSlot) — only offered once a slot is both active and
+   implemented, since that's the only condition under which it can do anything. */
+function testTelephonySlot(i){
+  if(!gateCheck())return;
+  var s=tapiSlots[i]||{};
+  if(!(s.active&&s.implemented)){setMsg("tapi-msg","Slot "+(i+1)+" must be active and connected before testing.","err");return;}
+  var btn=$("tapi-test-btn");var orig=btn.textContent;
+  btn.disabled=true;btn.textContent="Dialing…";
+  post("/api/telephony-config/"+i+"/test","")
+    .then(function(t){
+      var d=parseJsonOr(t);
+      btn.disabled=false;btn.textContent=orig;
+      tapiTestState[i]={ok:!!d.ok,detail:(d.ok?d.participantId:d.error)||"",ts:Date.now()};
+      renderTapiTestResult(i);
+    })
+    .catch(function(e){btn.disabled=false;btn.textContent=orig;setMsg("tapi-msg",e.message,"err");});
+}
+function renderTapiTestResult(i){
+  var el=$("tapi-test-result");if(!el)return;
+  var r=tapiTestState[i];
+  if(!r){el.textContent="";return;}
+  var ageSec=Math.floor((Date.now()-r.ts)/1000);
+  var age=ageSec<5?"just now":ageSec<60?ageSec+"s ago":Math.floor(ageSec/60)+"m ago";
+  el.textContent="last: "+(r.ok?"OK":"FAIL")+(r.detail?(" \u00b7 "+r.detail):"")+" \u00b7 "+age;
+}
 function fetchDidMappings(){
   return fetch("/api/did-mapping",{credentials:"same-origin"}).then(function(r){
     if(r.status===401){handleAuthExpired();throw new Error("session expired");}
@@ -1387,8 +1465,6 @@ function renderDidMappings(list){
   }
   list.forEach(function(m){
     var tr=document.createElement("tr");
-    /* textContent throughout: did/extension are stored config strings, same
-       treatment as the registrar roster's MAC/extension above. */
     var tdD=document.createElement("td");tdD.textContent=m.did;
     var tdE=document.createElement("td");tdE.textContent=m.extension;
     var tdA=document.createElement("td");
@@ -1404,9 +1480,6 @@ function addDidMapping(){
   var did=$("did-new-did").value.trim();
   var ext=$("did-new-ext").value.trim();
   if(!did||!ext){setMsg("did-msg","DID and extension are both required.","err");return;}
-  // Same charset + reserved-extension checks HttpServer.cpp applies server-side
-  // (pbx::isDialTokenSafe + the 777/999/555/888/440 virtual-extension set) —
-  // client-side so a typo is caught before the round trip, not instead of it.
   if(!isDialTokenSafeJs(ext)){setMsg("did-msg","Extension may contain only letters, digits, '#' and '*'.","err");return;}
   if(PD_RESERVED_EXT[ext]){setMsg("did-msg","Cannot map a DID to a virtual/reserved extension ("+ext+").","err");return;}
   put("/api/did-mapping","did="+encodeURIComponent(did)+"&extension="+encodeURIComponent(ext))
@@ -1429,20 +1502,25 @@ document.addEventListener("keydown",function(e){
 });
 ["adm-user","adm-pass"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminLogin();});});
 ["adm-setup-user","adm-setup-pass","adm-setup-dtmfpin"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminCompleteSetup();});});
-["adm-changeuser","adm-changepass"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminChangeCredential();});});
+)html5";
+
+static const char PD_HTML_6[] =
+R"html6(["adm-changeuser","adm-changepass"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminChangeCredential();});});
 (function(){var el=$("adm-changedtmfpin-val");if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminChangeDtmfPin();});})();
 
 /* ── init ── */
-restoreTheme();
 fetchStatus();fetchCdr();fetchAdminStatus();fetchOtaStatus();
 setInterval(fetchStatus,2000);
 setInterval(fetchCdr,5000);
 setInterval(fetchAdminStatus,15000);
 setInterval(function(){if(!otaUploading)fetchOtaStatus();},15000);
+setInterval(function(){if(adminState.authenticated&&adminState.sessionRemainingSec>0){adminState.sessionRemainingSec--;renderAdminBadge();}},1000);
+setInterval(function(){if($("telephony-modal").classList.contains("show"))renderTapiTestResult(tapiSelected);},5000);
 </script>
+
 </body>
 </html>
-)html3a";
+)html6";
 
 // One HttpServer::sendHtml() assembles these into a single std::string per
 // request (as it already did with the old single literal) -- the parts
@@ -1452,11 +1530,11 @@ setInterval(function(){if(!otaUploading)fetchOtaStatus();},15000);
 static const HtmlPart CGA_INDEX_HTML_PARTS[] = {
 	{ PD_HTML_0,  sizeof(PD_HTML_0)  - 1 },
 	{ PD_HTML_1,  sizeof(PD_HTML_1)  - 1 },
-	{ PD_HTML_1b, sizeof(PD_HTML_1b) - 1 },
 	{ PD_HTML_2,  sizeof(PD_HTML_2)  - 1 },
-	{ PD_HTML_2a, sizeof(PD_HTML_2a) - 1 },
 	{ PD_HTML_3,  sizeof(PD_HTML_3)  - 1 },
-	{ PD_HTML_3a, sizeof(PD_HTML_3a) - 1 },
+	{ PD_HTML_4,  sizeof(PD_HTML_4)  - 1 },
+	{ PD_HTML_5,  sizeof(PD_HTML_5)  - 1 },
+	{ PD_HTML_6,  sizeof(PD_HTML_6)  - 1 },
 };
 static constexpr size_t CGA_INDEX_HTML_PART_COUNT =
 	sizeof(CGA_INDEX_HTML_PARTS) / sizeof(CGA_INDEX_HTML_PARTS[0]);
