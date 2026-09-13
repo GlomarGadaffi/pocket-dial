@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 #include "HttpServer.hpp"
+#include "LoopbackAnchorClient.hpp"
 #include "RequestsHandler.hpp"
 #include "AdminAuth.hpp"
 
@@ -323,6 +324,76 @@ TEST_F(TelephonyConfigHttpTest, ActivateFlipsExactlyOneSlotsActiveFlag)
 	ASSERT_NE(idx0, std::string::npos);
 	size_t idx0End = body.find('}', idx0);
 	EXPECT_NE(body.substr(idx0, idx0End - idx0).find("\"active\":false"), std::string::npos);
+}
+
+TEST_F(TelephonyConfigHttpTest, TestDialSucceedsOnTheActiveSlotThroughTheLoopbackAnchor)
+{
+	// Issue #165's patch-bay dashboard "Test Dial" action: a connectivity probe,
+	// not a real bridged call. Host tests always boot the Loopback anchor
+	// (RequestsHandler's constructor picks Loopback whenever no HTTP-configured
+	// slot sets a "type" other than the struct default — see TelephonyApiConfig::
+	// Slot's default member and HttpServer's PUT handler, which never accepts a
+	// "type" form param), so this exercises the real makeCall()/dropCall() pair
+	// against LoopbackAnchorClient::lastMakeCallDestination().
+	AdminSession a = loginOn(_port);
+	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/1",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=rcv2",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/telephony-config/1/activate", "",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+
+	std::string resp = httpRaw(_port, "POST", "/api/telephony-config/1/test", "",
+	                           "pd_session=" + a.cookie, a.csrf);
+	ASSERT_EQ(statusOf(resp), 200);
+	std::string body = bodyOf(resp);
+	EXPECT_NE(body.find("\"ok\":true"), std::string::npos) << body;
+	EXPECT_NE(body.find("\"participantId\":\"mock-part-123\""), std::string::npos) << body;
+
+	auto* loopback = dynamic_cast<LoopbackAnchorClient*>(_handler->anchorClientForTest());
+	ASSERT_NE(loopback, nullptr);
+	EXPECT_EQ(loopback->lastMakeCallDestination(), "rcv2")
+		<< "the test dial must self-dial the active slot's own routeDn";
+}
+
+TEST_F(TelephonyConfigHttpTest, TestDialRefusesANonActiveSlotWithoutCallingTheAnchor)
+{
+	AdminSession a = loginOn(_port);
+	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/0",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=100",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+	// Slot 0 is configured but never activated -- activeSlot() still names
+	// whatever it defaulted to (or nothing), so testing slot 0 must refuse.
+	std::string resp = httpRaw(_port, "POST", "/api/telephony-config/0/test", "",
+	                           "pd_session=" + a.cookie, a.csrf);
+	ASSERT_EQ(statusOf(resp), 200);
+	std::string body = bodyOf(resp);
+	EXPECT_NE(body.find("\"ok\":false"), std::string::npos) << body;
+	EXPECT_NE(body.find("not the active"), std::string::npos) << body;
+
+	auto* loopback = dynamic_cast<LoopbackAnchorClient*>(_handler->anchorClientForTest());
+	ASSERT_NE(loopback, nullptr);
+	EXPECT_TRUE(loopback->lastMakeCallDestination().empty())
+		<< "a refused test-dial must never reach the anchor client at all";
+}
+
+TEST_F(TelephonyConfigHttpTest, TestDialRejectsCrossOriginAndRequiresCsrf)
+{
+	AdminSession a = loginOn(_port);
+	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/1",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=rcv2",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/telephony-config/1/activate", "",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+
+	EXPECT_EQ(statusOf(httpRaw(_port, "POST", "/api/telephony-config/1/test", "",
+	                           "", "", "http://evil.example")), 403);
+	EXPECT_EQ(statusOf(httpRaw(_port, "POST", "/api/telephony-config/1/test", "",
+	                           "pd_session=" + a.cookie)), 403);
+
+	auto* loopback = dynamic_cast<LoopbackAnchorClient*>(_handler->anchorClientForTest());
+	ASSERT_NE(loopback, nullptr);
+	EXPECT_TRUE(loopback->lastMakeCallDestination().empty())
+		<< "neither cross-origin rejection above should have placed a call";
 }
 
 TEST_F(TelephonyConfigHttpTest, DeleteClearsSlotAndSubsequentGetShowsItCleared)

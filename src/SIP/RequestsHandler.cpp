@@ -4544,6 +4544,46 @@ TelephonyApiConfig::SlotView RequestsHandler::getTelephonyConfigSlot(size_t idx)
 	return _tapiConfig.view(idx);
 }
 
+RequestsHandler::TestDialResult RequestsHandler::testDialSlot(size_t idx)
+{
+	AnchorClient* anchor = nullptr;
+	std::string destination;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (idx != _tapiConfig.activeSlot())
+		{
+			// Only the boot-selected slot has a live _anchorClient (provider
+			// selection is boot-time-only — see anchorIsSynchronous()'s doc
+			// comment); testing any other slot would either test the wrong
+			// connection or silently no-op, so refuse instead.
+			return TestDialResult{false, "", "this slot is not the active one — activate it and reboot first"};
+		}
+		if (!_anchorClient || !_anchorClient->isConnected())
+		{
+			return TestDialResult{false, "", "no anchor client connected"};
+		}
+		anchor = _anchorClient;
+		destination = _tapiConfig.view(idx).routeDn;
+	}
+
+	// Deliberately outside _mutex: for a real (non-Loopback) provider, makeCall()/
+	// dropCall() are blocking TLS HTTP round trips (same reasoning asyncMakeCall()'s
+	// worker-thread wrapping documents) — holding the engine's one shared mutex
+	// across that would stall SIP packet handling for the whole device. This is a
+	// connectivity probe only: no session, no MediaBridge, no caller — dropCall()
+	// runs immediately after a successful makeCall() rather than leaving a leg up.
+	std::string ownLeg;
+	if (!anchor->makeCall(destination, &ownLeg))
+	{
+		return TestDialResult{false, "", "anchor declined makeCall"};
+	}
+	if (!ownLeg.empty())
+	{
+		anchor->dropCall(ownLeg);
+	}
+	return TestDialResult{true, ownLeg, ""};
+}
+
 std::string RequestsHandler::setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret)
 {
 	std::lock_guard<std::mutex> lock(_mutex);

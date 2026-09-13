@@ -30,6 +30,7 @@
 #endif
 
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 namespace
@@ -185,6 +186,14 @@ namespace
 		return std::atoi(resp.substr(sp1 + 1, sp2 - sp1 - 1).c_str());
 	}
 
+	// The response body, past the blank line ending the headers.
+	std::string bodyOf(const std::string& resp)
+	{
+		size_t sep = resp.find("\r\n\r\n");
+		if (sep == std::string::npos) return "";
+		return resp.substr(sep + 4);
+	}
+
 	// Extracts just the VALUE from a "Set-Cookie: name=value; ..." response
 	// header, empty if absent.
 	std::string cookieOf(const std::string& resp, const std::string& name)
@@ -260,6 +269,47 @@ TEST(AdminHttpGate, SetCredential_DoesNotAffectReachability)
 		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
 	ASSERT_TRUE(AdminAuth::isProvisioned());
 	EXPECT_TRUE(canConnect(18083));
+
+	AdminAuth::clearCredential();
+}
+
+TEST(AdminHttpGate, AdminStatusReportsSessionRemainingSecOnlyWhileAuthenticated)
+{
+	// Issue #165's patch-bay dashboard header badge shows a real countdown
+	// against this field rather than a client-invented one — pin its shape and
+	// the "0 while logged out" contract here at the API level.
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18084, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	std::string loggedOut = httpGetRaw(18084, "/api/admin/status");
+	ASSERT_EQ(statusOf(loggedOut), 200);
+	EXPECT_NE(bodyOf(loggedOut).find("\"sessionRemainingSec\":0"), std::string::npos)
+		<< bodyOf(loggedOut);
+
+	std::string loginResp = httpPostRaw(18084, "/api/admin/login", "username=admin&password=admin");
+	ASSERT_EQ(statusOf(loginResp), 200);
+	std::string cookie = cookieOf(loginResp, "pd_session");
+	std::string csrf = csrfOf(loginResp);
+	ASSERT_EQ(statusOf(httpPostRaw(18084, "/api/admin/set-credential",
+		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
+
+	std::string loggedIn = httpGetRaw(18084, "/api/admin/status", "pd_session=" + cookie);
+	ASSERT_EQ(statusOf(loggedIn), 200);
+	std::string body = bodyOf(loggedIn);
+	EXPECT_NE(body.find("\"authenticated\":true"), std::string::npos) << body;
+	size_t p = body.find("\"sessionRemainingSec\":");
+	ASSERT_NE(p, std::string::npos) << body;
+	int remaining = std::atoi(body.c_str() + p + std::string("\"sessionRemainingSec\":").size());
+	// kSessionTtlMs is 30 minutes; a fresh session must report close to the
+	// full TTL, never 0 and never longer than the configured ceiling.
+	EXPECT_GT(remaining, 0);
+	EXPECT_LE(remaining, 30 * 60);
 
 	AdminAuth::clearCredential();
 }

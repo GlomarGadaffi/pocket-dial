@@ -254,6 +254,27 @@ public:
 	std::string clearTelephonyConfigSlot(size_t idx);
 	std::string clearAllTelephonyConfig();
 
+	// Connectivity probe for the dashboard's "Test Dial" action (not a real
+	// bridged call — no SIP session, no MediaBridge, no caller): self-dials
+	// the currently-active slot's own routeDn through _anchorClient and
+	// immediately drops it, reporting only whether the carrier accepted the
+	// makeCall(). `idx` must name the currently-active slot (the only one with
+	// a live, boot-selected _anchorClient — see anchorIsSynchronous()'s doc
+	// comment on why provider selection is boot-time-only); any other slot
+	// returns ok=false with an explanatory error, never silently tests the
+	// wrong slot. Deliberately does NOT hold _mutex across the anchor calls
+	// themselves: for a real (non-Loopback) provider these are blocking TLS
+	// HTTP round trips, and holding the engine's one shared mutex across that
+	// would stall SIP packet handling for the whole device, not just this HTTP
+	// request. Safe to call from the HTTP handler thread.
+	struct TestDialResult
+	{
+		bool ok = false;
+		std::string participantId;
+		std::string error;
+	};
+	TestDialResult testDialSlot(size_t idx);
+
 	// ── DID -> extension inbound routing (new) ────────────────────────────────────
 	// DidMapping.hpp owns the bounded table + field validation; RequestsHandler
 	// owns the instance (_didMapping below) and serializes access under _mutex,

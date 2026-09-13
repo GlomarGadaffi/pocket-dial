@@ -47,6 +47,7 @@ static std::string getFormParam(const std::string& body, const std::string& key)
 // below (each defined further down, alongside the handlers that use them).
 static bool parseTelephonyConfigSlotPath(const std::string& path, size_t& slotIdx);
 static bool parseTelephonyConfigActivatePath(const std::string& path, size_t& slotIdx);
+static bool parseTelephonyConfigTestPath(const std::string& path, size_t& slotIdx);
 
 // Captive-portal decay hold. The display app's decay watchdog reads this; the web
 // "/api/configuring" confirm sets it to pause the auto-switch to Standalone while a user is
@@ -544,6 +545,15 @@ void HttpServer::handleClient(int clientSock)
 			sendApiTelephonyConfigActivate(clientSock, telSlotIdx);
 		}
 	}
+	else if (req.method == "POST" && parseTelephonyConfigTestPath(req.path, telSlotIdx))
+	{
+		// Places (and immediately drops) a real outbound call through the
+		// active anchor client -- same mutating-action gate as activate/PUT/DELETE.
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiTelephonyConfigTest(clientSock, telSlotIdx);
+		}
+	}
 	else if (req.method == "DELETE" && parseTelephonyConfigSlotPath(req.path, telSlotIdx))
 	{
 		// Same gate as the sibling PUT/activate routes above -- an operator
@@ -911,6 +921,7 @@ void HttpServer::sendApiStatus(int sock)
 	std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwards;
 	std::vector<std::tuple<std::string, std::string, std::string>> ringGroups;
 	std::vector<std::tuple<std::string, std::string, std::string, int>> dialRules;
+	std::vector<std::tuple<std::string, std::string, std::string, int>> parkedCalls;
 	uint64_t packets = 0;
 	uint64_t dropped = 0;
 
@@ -923,6 +934,7 @@ void HttpServer::sendApiStatus(int sock)
 		forwards = handler->getForwards();
 		ringGroups = handler->getRingGroups();
 		dialRules = handler->getDialRules();
+		parkedCalls = handler->getParkedCalls();
 		packets = handler->getPacketsProcessed();
 		dropped = handler->getPacketsDropped();   // Issue #38
 	}
@@ -1021,6 +1033,20 @@ void HttpServer::sendApiStatus(int sock)
 		     << "\",\"action\":\"" << jsonEscape(std::get<1>(dialRules[i]))
 		     << "\",\"target\":\"" << jsonEscape(std::get<2>(dialRules[i]))
 		     << "\",\"stripDigits\":" << std::get<3>(dialRules[i]) << "}";
+	}
+	json << "],";
+
+	// Parked calls: {orbit, parkedExt, parker, secondsParked} — Issue #65's
+	// ParkOrbit::snapshotRows(onlyParked=true), used by the dashboard to tell
+	// a parked jack apart from an idle or actively-connected one.
+	json << "\"parkedCalls\":[";
+	for (size_t i = 0; i < parkedCalls.size(); i++)
+	{
+		if (i > 0) json << ",";
+		json << "{\"orbit\":\"" << jsonEscape(std::get<0>(parkedCalls[i]))
+		     << "\",\"parkedExt\":\"" << jsonEscape(std::get<1>(parkedCalls[i]))
+		     << "\",\"parker\":\"" << jsonEscape(std::get<2>(parkedCalls[i]))
+		     << "\",\"secondsParked\":" << std::get<3>(parkedCalls[i]) << "}";
 	}
 	json << "]";
 
@@ -1435,6 +1461,20 @@ static bool parseTelephonyConfigActivatePath(const std::string& path, size_t& sl
 	return parseTelephonyConfigSlotPath(path.substr(0, path.size() - suffix.size()), slotIdx);
 }
 
+// Same prefix, but requires a trailing "/test" segment -- used for
+// POST .../<slot>/test (Issue #165's dashboard patch-bay: the interconnect
+// module's "Test Dial" action).
+static bool parseTelephonyConfigTestPath(const std::string& path, size_t& slotIdx)
+{
+	static const std::string suffix = "/test";
+	if (path.size() <= suffix.size() ||
+	    path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0)
+	{
+		return false;
+	}
+	return parseTelephonyConfigSlotPath(path.substr(0, path.size() - suffix.size()), slotIdx);
+}
+
 // Shared JSON shape for one slot, used by both the GET list and the PUT/activate
 // single-slot echo below. Mirrors TelephonyApiConfig::SlotView's own
 // secretSet-not-secret contract: the plaintext secret never appears here.
@@ -1544,6 +1584,25 @@ void HttpServer::sendApiTelephonyConfigActivate(int sock, size_t slotIdx)
 	}
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"activeIndex\":" + std::to_string(slotIdx) + "}");
+}
+
+void HttpServer::sendApiTelephonyConfigTest(int sock, size_t slotIdx)
+{
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		RequestsHandler::TestDialResult result = handler->testDialSlot(slotIdx);
+		if (!result.ok)
+		{
+			sendResponse(sock, 200, "OK", "application/json",
+			             "{\"ok\":false,\"error\":\"" + jsonEscape(result.error) + "\"}");
+			return;
+		}
+		sendResponse(sock, 200, "OK", "application/json",
+		             "{\"ok\":true,\"participantId\":\"" + jsonEscape(result.participantId) + "\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"ok\":false,\"error\":\"no handler attached\"}");
 }
 
 void HttpServer::sendApiTelephonyConfigDelete(int sock, size_t slotIdx)
@@ -2286,11 +2345,21 @@ void HttpServer::sendApiApSecuritySet(int sock, const std::string& body)
 void HttpServer::sendApiAdminStatus(int sock, const HttpRequest& req)
 {
 	bool provisioned = AdminAuth::isProvisioned();
-	bool authenticated = isAuthed(req);
+	bool authenticated = isAuthed(req);   // slides the session's expiry (existing behavior)
+	// Read the remaining TTL AFTER isAuthed()'s validateSession() has already
+	// applied its own slide above — this call adds no slide of its own, so a
+	// dashboard polling this endpoint just to show a countdown doesn't distort
+	// the number it displays beyond what isAuthed() itself already causes.
+	uint64_t sessionRemainingMs = 0;
+	if (authenticated)
+	{
+		sessionRemainingMs = AdminAuth::sessionRemainingMs(cookieValue(req, "pd_session"));
+	}
 	std::ostringstream json;
 	json << "{\"provisioned\":" << (provisioned ? "true" : "false")
 	     << ",\"needsSetup\":" << (provisioned ? "false" : "true")
-	     << ",\"authenticated\":" << (authenticated ? "true" : "false") << "}";
+	     << ",\"authenticated\":" << (authenticated ? "true" : "false")
+	     << ",\"sessionRemainingSec\":" << (sessionRemainingMs / 1000) << "}";
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 

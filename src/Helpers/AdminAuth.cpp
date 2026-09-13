@@ -1007,6 +1007,35 @@ namespace AdminAuth
 		return constantTimeEquals(want, csrf);
 	}
 
+	uint64_t sessionRemainingMs(const std::string& token)
+	{
+		if (token.empty())
+		{
+			return 0;
+		}
+
+		AuthState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+
+		const uint64_t now = nowMs();
+		for (auto& sess : s.sessions)
+		{
+			if (!sess.used)
+			{
+				continue;
+			}
+			if (sess.expiresAtMs != 0 && now >= sess.expiresAtMs)
+			{
+				continue;
+			}
+			if (constantTimeEquals(sess.token, token))
+			{
+				return (sess.expiresAtMs == 0) ? 0 : (sess.expiresAtMs - now);
+			}
+		}
+		return 0;
+	}
+
 	// credentialIsSet: lightweight NVS probe used by the boot provisioning gate.
 	// Opens NVS namespace "storage", reads key "admin_pw_hash" as a string, and
 	// returns true iff the string is non-empty. Closes the handle on exit.

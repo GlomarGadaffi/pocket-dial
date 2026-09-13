@@ -158,6 +158,12 @@ namespace AdminAuth
 	// not match. Does NOT slide the session expiry (validateSession does that).
 	bool validateCsrf(const std::string& token, const std::string& csrf);
 
+	// Milliseconds until `token`'s session expires, or 0 if the token is
+	// unknown/expired. Read-only — unlike validateSession(), this does NOT
+	// slide the expiry, so a dashboard polling this to show a countdown
+	// doesn't itself keep resetting the countdown it is displaying.
+	uint64_t sessionRemainingMs(const std::string& token);
+
 	// Destroy a session by token (logout). No-op if unknown.
 	void destroySession(const std::string& token);
 

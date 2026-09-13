@@ -163,6 +163,7 @@ private:
 	void sendApiTelephonyConfigList(int sock);
 	void sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::string& body);
 	void sendApiTelephonyConfigActivate(int sock, size_t slotIdx);
+	void sendApiTelephonyConfigTest(int sock, size_t slotIdx);
 	void sendApiTelephonyConfigDelete(int sock, size_t slotIdx);
 	// DID -> extension inbound routing (new). GET lists all configured
 	// mappings; PUT adds/updates one (extension validated against the same

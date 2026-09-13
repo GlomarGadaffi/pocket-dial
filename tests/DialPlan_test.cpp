@@ -1132,6 +1132,32 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 	EXPECT_EQ(std::get<0>(rules[1]), "#9");
 }
 
+TEST(DialPlanHttp, ApiStatusReportsParkedCalls)
+{
+	// Issue #165's patch-bay dashboard tells a parked jack apart from an idle
+	// or active one via this array — pin its presence and shape at the HTTP
+	// layer (ParkOrbit::snapshotRows() itself is already covered directly by
+	// ParkOrbit_test.cpp).
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18092, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	registerThreePhones(handler);
+	handler.handle(makeRegister("602", "192.168.9.62", "reg-602"));
+	handler.setDialRule("8XX", "park", "701");
+	handler.handle(makeInvite("600", "800", "192.168.9.60", "http-park"));
+
+	std::string status = httpGetRaw(18092, "/api/status");
+	EXPECT_NE(status.find("\"parkedCalls\":["), std::string::npos) << status;
+	EXPECT_NE(status.find("\"orbit\":\"701\""), std::string::npos) << status;
+	EXPECT_NE(status.find("\"parkedExt\":\"600\""), std::string::npos) << status;
+}
+
 TEST(DialPlanHttp, PostApiDialPlanRejectsBadParametersWith400)
 {
 	AdminAuth::clearCredential();
