@@ -2019,6 +2019,28 @@ void RequestsHandler::bindOutboundParticipant(const std::string& callId, const s
 	}
 }
 
+void RequestsHandler::refuseRingingAnchor(const std::string& callId,
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox)
+{
+	// Final response for an outbound anchor call that died before the far leg
+	// connected: 503 the caller off the stored INVITE, exactly as tick()'s
+	// no-answer reap does. endCall() itself never sends a SIP response, so every
+	// still-ringing failure path must call this first or the handset rings on
+	// with no final answer. Caller holds _mutex and picks the outbox for its
+	// thread (_outbox on the SIP thread, _asyncOutbox from a worker).
+	auto sit = _sessions.find(callId);
+	if (sit == _sessions.end() || !sit->second) return;
+	if (sit->second->getState() != Session::State::Invited) return;
+	auto invite = sit->second->getInviteMessage();
+	if (!invite) return;
+	auto resp = getMessageFromPool(*invite);
+	if (!resp) return;
+	resp->setHeader("SIP/2.0 503 Service Unavailable");
+	resp->clearBody();
+	resp->setContact(buildContact(std::string(invite->getToNumber())));
+	outbox.emplace_back(invite->getSource(), std::move(resp));
+}
+
 void RequestsHandler::asyncMakeCall(const std::string& destination, const std::string& callId,
 	const std::string& callerNumber)
 {
@@ -2046,6 +2068,8 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 		{
 			std::lock_guard<std::mutex> lock(mca->handler->_mutex);
 			mca->handler->queueLog("[Telephony] Failed to initiate outbound call to " + mca->dest, true);
+			// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
+			mca->handler->refuseRingingAnchor(mca->callId, mca->handler->_asyncOutbox);
 			mca->handler->endCall(mca->callId, mca->callerNumber, mca->dest, "anchor call fail");
 		}
 		else
@@ -2071,19 +2095,7 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 		// session down. Runs on the SIP thread under _mutex (handler dispatch),
 		// same as the synchronous anchor branch's direct endCall() call, so
 		// _outbox (not _asyncOutbox) is the right queue.
-		auto sit = _sessions.find(callId);
-		if (sit != _sessions.end() && sit->second &&
-		    sit->second->getState() == Session::State::Invited && sit->second->getInviteMessage())
-		{
-			auto invite = sit->second->getInviteMessage();
-			if (auto resp = getMessageFromPool(*invite))
-			{
-				resp->setHeader("SIP/2.0 503 Service Unavailable");
-				resp->clearBody();
-				resp->setContact(buildContact(std::string(invite->getToNumber())));
-				_outbox.emplace_back(invite->getSource(), std::move(resp));
-			}
-		}
+		refuseRingingAnchor(callId, _outbox);
 		endCall(callId, callerNumber, destination, "anchor worker spawn fail");
 	}
 #else
@@ -2093,6 +2105,8 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 		{
 			std::lock_guard<std::mutex> lock(_mutex);
 			queueLog("[Telephony] Failed to initiate outbound call to " + destination, true);
+			// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
+			refuseRingingAnchor(callId, _asyncOutbox);
 			endCall(callId, callerNumber, destination, "anchor call fail");
 		}
 		else

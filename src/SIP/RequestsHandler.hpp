@@ -702,6 +702,11 @@ private:
 	// method off the SIP thread, then re-takes _mutex only to log/react. Never
 	// called for a synchronous (Loopback) anchor — see anchorIsSynchronous().
 	void asyncMakeCall(const std::string& destination, const std::string& callId, const std::string& callerNumber);
+	// 503 a still-ringing outbound anchor call off its stored INVITE (endCall()
+	// sends no response itself). Caller holds _mutex; outbox is _outbox on the
+	// SIP thread or _asyncOutbox from a worker.
+	void refuseRingingAnchor(const std::string& callId,
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox);
 	void asyncDropCall(const std::string& participantId);
 	void asyncAnswerCall(const std::string& participantId);
 
