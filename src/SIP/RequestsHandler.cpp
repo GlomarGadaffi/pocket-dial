@@ -3302,10 +3302,8 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 		// ACK deadline (ANCHOR_ACK_TIMEOUT) so tick() can reap an abandoned call
 		// whose handset never ACKs — this genuine ACK disarms it. No-op for
 		// Loopback (never armed: it answers synchronously — see onAnchorInvite()).
-		if (auto session = getSession(data->getCallID()); session.has_value())
-		{
-			session.value()->clearRingTimer();
-		}
+		// `session` is the one fetched and null-checked at the top of onAck().
+		session.value()->clearRingTimer();
 		return;
 	}
 
