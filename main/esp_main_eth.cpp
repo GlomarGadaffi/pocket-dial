@@ -234,7 +234,15 @@ static esp_eth_handle_t eth_init_w5500(void)
     // ── Install driver ──────────────────────────────────────────────────
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth_handle = nullptr;
-    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));
+    esp_err_t err = esp_eth_driver_install(&eth_config, &eth_handle);
+    if (err == ESP_ERR_TIMEOUT)
+    {
+        ESP_LOGE(TAG, "W5500 did not respond on SCLK=%d MISO=%d MOSI=%d CS=%d. "
+                      "Check that PD_ETH_BOARD (%s) matches your hardware.",
+                 W5500_SCLK_GPIO, W5500_MISO_GPIO, W5500_MOSI_GPIO,
+                 W5500_CS_GPIO, W5500_BOARD_NAME);
+    }
+    ESP_ERROR_CHECK(err);
 
     // ── Set MAC address from ESP32 efuse (base + 1) ─────────────────────
     uint8_t mac_addr[6];

@@ -68,6 +68,10 @@ build_*/
 # does not match it). Without this, `git stash -u` sweeps its generated CMake/gtest
 # content into the stash as "untracked".
 build-wsl/
+# build-waveshare/: same hyphenated-name gap as build-wsl/ above, for the
+# Waveshare board build dir — without this, `git add -A` sweeps a large
+# untracked firmware build directory into the index.
+build-waveshare/
 managed_components/
 dependencies.lock
 scratch/

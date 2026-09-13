@@ -326,6 +326,43 @@ jobs:
                  build
           echo "Heap-poisoning profile builds (esp32s3 / eth)."
 
+  # Job 2c: Waveshare ESP32-S3-ETH board build.
+  # PD_ETH_BOARD=waveshare (main/CMakeLists.txt) is a second pin map for the
+  # 'eth' transport, documented and FATAL_ERROR-guarded like a maintained
+  # option, but it is in neither this matrix nor release.yml -- nothing has
+  # compiled it since it was added, which is how three of six pins shipped
+  # wrong to main (#155/#156). This is a dedicated job rather than a leg
+  # folded into build-esp-idf's matrix via `include`: an include entry that
+  # only adds a new key (pd-eth-board) to keys matching an EXISTING
+  # esp32s3/eth combination merges into that combination instead of creating
+  # a new one, which would silently turn the shipped Elite build into a
+  # Waveshare build (and lose Elite coverage) rather than adding anything.
+  # (`display` and `lan8720` avoid this because their sip-transport value
+  # isn't already in the base matrix.)
+  #
+  # This is bit-rot protection ONLY: it proves PD_ETH_BOARD=waveshare still
+  # compiles, nothing more. It would NOT have caught #155 -- wrong GPIO
+  # numbers compile fine, the bug was only visible on real hardware. The
+  # Waveshare board is not on the continuous CI/release bench (that board was
+  # verified by hand for #155 -- see esp_main_eth.cpp), so this leg carries no
+  # hardware coverage and there is no leg for it in release.yml either; the
+  # release ships PD_ETH_BOARD=elite.
+  build-waveshare:
+    name: Build Firmware (esp32s3 / eth / PD_ETH_BOARD=waveshare)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build Waveshare ESP32-S3-ETH pin map
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target esp32s3
+          idf.py -D SIP_TRANSPORT=eth -D PD_ETH_BOARD=waveshare build
+          echo "Compiles for esp32s3 / eth / PD_ETH_BOARD=waveshare (compile-only; not hardware-verified)."
+
   # Job 3: Security & Guardrails
   # Explicitly validates that no accidental GCP or outside deployment files are configured.
   deployment-audit:
