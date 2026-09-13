@@ -2063,6 +2063,28 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 	{
 		queueLog("[Telephony] asyncMakeCall: outbound worker xTaskCreate FAILED (heap exhausted) — call NOT placed", true);
 		delete arg;
+		// onAnchorInvite() already allocated the session and sent 180 Ringing; with
+		// no worker nobody will ever answer or fail it, so without this the handset
+		// rings until tick()'s no-answer reap fires ~20 s later. Do what that reap
+		// does for a still-ringing anchor call right now: 503 the caller off the
+		// stored INVITE (endCall() itself sends no SIP response), then tear the
+		// session down. Runs on the SIP thread under _mutex (handler dispatch),
+		// same as the synchronous anchor branch's direct endCall() call, so
+		// _outbox (not _asyncOutbox) is the right queue.
+		auto sit = _sessions.find(callId);
+		if (sit != _sessions.end() && sit->second &&
+		    sit->second->getState() == Session::State::Invited && sit->second->getInviteMessage())
+		{
+			auto invite = sit->second->getInviteMessage();
+			if (auto resp = getMessageFromPool(*invite))
+			{
+				resp->setHeader("SIP/2.0 503 Service Unavailable");
+				resp->clearBody();
+				resp->setContact(buildContact(std::string(invite->getToNumber())));
+				_outbox.emplace_back(invite->getSource(), std::move(resp));
+			}
+		}
+		endCall(callId, callerNumber, destination, "anchor worker spawn fail");
 	}
 #else
 	spawnAnchorWorker([this, destination, callId, callerNumber]() {
