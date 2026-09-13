@@ -36,9 +36,9 @@
 //                                  including nothing at all (prefix match)
 //
 // A '*' anywhere but the last character is a LITERAL '*', because star-codes
-// (`*8`, `*4887`) are real dialable strings on this box — treating a leading '*'
-// as a wildcard would make `*8*` ambiguous with the pickup-style codes. Only the
-// final character is special.
+// (`*8`, the *PIN#code admin menu) are real dialable strings on this box —
+// treating a leading '*' as a wildcard would make `*8*` ambiguous with the
+// pickup-style codes. Only the final character is special.
 //
 //   "601"    exact match: only 601
 //   "6XX"    601, 655, 699 … (three digits, first is 6)

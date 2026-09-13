@@ -277,60 +277,7 @@ public:
 	// cppcheck-suppress returnByReference
 	std::string getAdminExt() const;
 
-	// ── Admin HTTP-open deadline (PLAN_ADMIN_HTTP_ONLY.md Phase 2) ────────────────
-	// Epoch-ms deadline until which HttpServer's accept-loop should accept
-	// connections on a provisioned device; 0 means no open window. Written only by
-	// grantAdminHttpGraceWindow() below — reached from DtmfFeatureCodes's *4887
-	// branch (Phase 3), which already holds _mutex, via the _grantAdminWindow
-	// callback; read lock-free here so HttpServer's own accept-loop thread never
-	// takes _mutex (invariant I2 — it is the only thread that touches the
-	// listen socket).
-	uint64_t getAdminHttpOpenUntilMs() const
-	{
-		return _adminHttpOpenUntilMs.load(std::memory_order_acquire);
-	}
-
-	// Called by HttpServer's /api/admin/set-pin handler on a successful PIN
-	// set/change. Without this, the operator who just used the web UI to
-	// provision the device would lose HTTP access on the very next accept-loop
-	// tick (up to ~250ms later) — before they can finish onboarding (WiFi,
-	// extensions, ...) — since setting the PIN is exactly what flips
-	// AdminAuth::isProvisioned() to true and the dark-by-default gate on.
-	// Grants the same TTL window a DTMF trigger would; lock-free (atomic store
-	// only), safe to call from the HTTP worker thread. Returns the TTL (seconds)
-	// it applied so callers that need it for logging don't have to read
-	// _adminHttpTtlSec themselves — DtmfFeatureCodes's *4887 handler reaches
-	// this through the _grantAdminWindow callback passed to its constructor
-	// (see RequestsHandler's _dtmf member) rather than duplicating this
-	// arithmetic; HttpServer's existing caller (the set-PIN handler) ignores
-	// the return value.
-	uint16_t grantAdminHttpGraceWindow()
-	{
-		uint16_t ttlSec = _adminHttpTtlSec.load();
-		uint64_t untilMs = nowEpochMs() + static_cast<uint64_t>(ttlSec) * 1000ULL;
-		_adminHttpOpenUntilMs.store(untilMs, std::memory_order_release);
-		return ttlSec;
-	}
-
-	// Called by HttpServer's authenticated /api/admin/keepalive endpoint. A
-	// fixed 1-hour window, deliberately independent of _adminHttpTtlSec (the
-	// DTMF trigger's shorter default) — an operator already logged in via a
-	// valid session can push the window out further for extended
-	// configuration work without needing to re-trigger from a handset.
-	void extendAdminHttpWindowOneHour()
-	{
-		uint64_t untilMs = nowEpochMs() + 3600ULL * 1000ULL;
-		_adminHttpOpenUntilMs.store(untilMs, std::memory_order_release);
-	}
-
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
-	// Test-only: drive the deadline directly without a real DTMF trigger. Not
-	// compiled into device firmware.
-	void setAdminHttpOpenUntilMsForTest(uint64_t ms)
-	{
-		_adminHttpOpenUntilMs.store(ms, std::memory_order_release);
-	}
-
 	// Test-only: redirect the Telephony-API / DID-mapping host-file stores to
 	// test-specific paths and reload from them. Without this every test that
 	// constructs a RequestsHandler and exercises PUT /api/telephony-config or
@@ -1010,16 +957,6 @@ private:
 	// TUI can read without taking _mutex. Persisted to NVS ("pbxcfg"/"rewarm_min").
 	std::atomic<uint16_t> _rewarmMinutes{60};
 
-	// ── Admin HTTP-open TTL (PLAN_ADMIN_HTTP_ONLY.md Phase 2) ─────────────────────
-	// How long a DTMF trigger keeps the HTTP admin plane reachable, in seconds.
-	// Atomic (mirrors _registrarMode) so HttpServer's accept-loop can read it
-	// lock-free. Read-only from firmware: loadAdminHttpTtl() honors a value
-	// provisioned out-of-band in NVS (namespace "pbxcfg", key "admin_http_ttl"),
-	// but no code path changes it at runtime, so there is no write-through.
-	std::atomic<uint64_t> _adminHttpOpenUntilMs{0};
-	std::atomic<uint16_t> _adminHttpTtlSec{600};
-	void loadAdminHttpTtl();              // boot-time reload from NVS; caller holds _mutex
-
 	// Mirror the Registrar's adopted-device registry into the dashboard snapshot.
 	// Caller holds _mutex; takes _snapshotMutex internally.
 	void refreshDeviceSnapshot();
@@ -1074,13 +1011,10 @@ private:
 	// saveAdminExt) and the DTMF digit-collection state machine + CLASS/admin
 	// dispatch (Task 2C: DtmfAccum, _dtmfState, onDtmfInfo) now live on
 	// DtmfFeatureCodes. It takes _cfg (the *60/*80/*73/*72 CLASS codes) and
-	// _cdr (the *69 last-caller lookup) by reference, and reaches
-	// grantAdminHttpGraceWindow() through a callback rather than duplicating
-	// its epoch-ms-plus-TTL arithmetic (see that method's comment above).
-	// Guarded by this engine's _mutex, same "single-threaded SIP handler path"
-	// contract the original onDtmfInfo() documented.
-	DtmfFeatureCodes _dtmf{*this, _cfg, _cdr,
-		[this]() { return grantAdminHttpGraceWindow(); }};
+	// _cdr (the *69 last-caller lookup) by reference. Guarded by this engine's
+	// _mutex, same "single-threaded SIP handler path" contract the original
+	// onDtmfInfo() documented.
+	DtmfFeatureCodes _dtmf{*this, _cfg, _cdr};
 
 	// The fork/group/dial-plan routing engine (buildInviteFork, startBroadcastFork,
 	// huntRingNext, redirectInvite, buildCancel, routePageZone, routeRingGroup,

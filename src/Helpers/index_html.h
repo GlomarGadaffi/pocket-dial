@@ -444,7 +444,6 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
         <div class="msg ok">&#9679; Logged in &mdash; admin controls unlocked.</div>
         <div class="row">
           <button class="btn" onclick="toggleChangePin()">Change PIN</button>
-          <button class="btn" onclick="adminKeepAlive()">&#9201; Keep open (1h)</button>
           <button class="btn danger" onclick="adminLogout()">Logout</button>
         </div>
         <div id="admin-changepin" style="display:none;margin-top:8px">
@@ -1160,13 +1159,6 @@ function adminLogin(){
 }
 function adminLogout(){
   fetch("/api/admin/logout",{method:"POST",credentials:"same-origin"}).then(function(){setMsg("admin-msg","Logged out.","warn");fetchAdminStatus();}).catch(function(){});
-}
-function adminKeepAlive(){
-  fetch("/api/admin/keepalive",{method:"POST",credentials:"same-origin"}).then(function(r){
-    if(r.status===401){handleAuthExpired();return;}
-    if(!r.ok){setMsg("admin-msg","Failed (HTTP "+r.status+").","err");return;}
-    setMsg("admin-msg","Dashboard will stay open for 1 more hour.","ok");
-  }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
 }
 function toggleChangePin(){var cp=$("admin-changepin");cp.style.display=cp.style.display==="block"?"none":"block";if(cp.style.display==="block")$("adm-changepin-val").focus();}
 

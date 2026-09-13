@@ -20,8 +20,7 @@
 class SipMessage;
 
 // ── DTMF digit-collection state machine + CLASS feature codes + admin menu ───
-// extracted out of RequestsHandler (Task 2C / Task 2C-4 / Task 2C-5 /
-// PLAN_ADMIN_HTTP_ONLY.md Phase 3).
+// extracted out of RequestsHandler (Task 2C / Task 2C-4 / Task 2C-5).
 //
 // Every method here assumes the caller holds the engine's _mutex — the same
 // "single-threaded SIP handler path" convention the original onDtmfInfo()
@@ -31,19 +30,12 @@ class SipMessage;
 // Takes PbxEnv& (log/enqueue/findRegistered/findSession/validAor/localIp —
 // all pre-existing virtuals, none added for this move), PbxFeatureConfig&
 // for the *60/*80/*73/*72 CLASS codes, and CdrRing& for the *69 last-caller
-// lookup. The admin-HTTP grace window itself (the atomics and their TTL)
-// stays engine-owned: RequestsHandler::grantAdminHttpGraceWindow() is also
-// called directly by HttpServer's set-PIN handler, so rather than duplicate
-// its epoch-ms-plus-TTL arithmetic here (a third copy of the same
-// steady_clock read CdrRing.cpp already carries one of, see its comment),
-// the *4887 branch calls back into it through `_grantAdminWindow`, which
-// returns the TTL it applied so the log line here can still report it.
+// lookup.
 class DtmfFeatureCodes
 {
 public:
-	DtmfFeatureCodes(PbxEnv& env, PbxFeatureConfig& cfg, CdrRing& cdr,
-		std::function<uint16_t()> grantAdminWindow) :
-		_env(env), _cfg(cfg), _cdr(cdr), _grantAdminWindow(std::move(grantAdminWindow)) {}
+	DtmfFeatureCodes(PbxEnv& env, PbxFeatureConfig& cfg, CdrRing& cdr) :
+		_env(env), _cfg(cfg), _cdr(cdr) {}
 
 	// Parse one SIP INFO's Signal=X body, accumulate digits per Call-ID, and
 	// act on completed CLASS/admin sequences. Caller holds _mutex.
@@ -83,7 +75,6 @@ private:
 	PbxEnv& _env;
 	PbxFeatureConfig& _cfg;
 	CdrRing& _cdr;
-	std::function<uint16_t()> _grantAdminWindow;
 
 	std::string _adminExt{"1001"};
 
@@ -95,17 +86,9 @@ private:
 		std::string digits;          // accumulated digit string
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		TickType_t  lastTick{0};     // xTaskGetTickCount() of last digit
-		TickType_t  starCodeFiredAtTick{0};
 #else
 		uint32_t    lastTick{0};     // monotonic ms counter on host
-		uint32_t    starCodeFiredAtTick{0};
 #endif
-		// Set when the *4887 HTTP-open star-code just matched for this dialog
-		// (0 = not pending). The star-code clears `digits` the instant the
-		// sequence equals "*4887", which can land before the admin finishes
-		// dialing *PIN#code if their PIN happens to begin with those four
-		// digits — see the Issue #93 detection in onInfo(). Cleared on the
-		// next digit (one warning per incident) or on the normal DTMF timeout.
 		static constexpr uint32_t TIMEOUT_MS = 5000;
 	};
 	std::unordered_map<std::string, DtmfAccum> _dtmfState;

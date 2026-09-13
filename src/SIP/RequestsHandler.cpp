@@ -56,8 +56,8 @@ namespace
 	// CallForker::huntRingNext, so it now lives at pbx::kNoAnswerTimeout
 	// (PbxConfig.hpp) instead of file-local here.
 
-	// NVS namespace for the persisted PBX config, pbxcfg (loadAdminHttpTtl here;
-	// DtmfFeatureCodes::load()/saveAdminExt() too) is pbxpersist::kNvsNamespace
+	// NVS namespace for the persisted PBX config, pbxcfg
+	// (DtmfFeatureCodes::load()/saveAdminExt()) is pbxpersist::kNvsNamespace
 	// (PbxPersist.hpp) so there is exactly one definition of "pbxcfg" in the
 	// codebase. The CDR ring's own namespace ("cdrlog") lives on CdrRing.cpp.
 
@@ -122,7 +122,6 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// STAGE 2: load the registrar mode (defaults to the POCKETDIAL_OPEN_REGISTRAR
 	// seed) and the adopted-device registry from NVS.
 	_registrar.loadMode();
-	loadAdminHttpTtl();
 	_registrar.loadDevices();
 	// Prewarm the per-extension HA1 cache off the REGISTER hot path so the first
 	// Secure REGISTER does not pay a blocking NVS read while holding _mutex.
@@ -5230,25 +5229,6 @@ void RequestsHandler::queueLog(std::string msg, bool isError)
 // (see _cdr) — both still no-ops on host.
 
 // ── Registrar mode + device registry persistence (STAGE 2) ───────────────────
-
-void RequestsHandler::loadAdminHttpTtl()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	nvs_handle_t h;
-	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
-	{
-		return;
-	}
-	uint16_t v = 0;
-	esp_err_t err = nvs_get_u16(h, "admin_http_ttl", &v);
-	nvs_close(h);
-	if (err == ESP_OK && v > 0)
-	{
-		_adminHttpTtlSec.store(v, std::memory_order_relaxed);
-	}
-	// else: keep the compile-time default (600s).
-#endif
-}
 
 // ── Task 2B/2C: admin extension identity + DTMF digit-collection state machine
 // + CLASS service codes, now on DtmfFeatureCodes (see _dtmf) ──────────────────

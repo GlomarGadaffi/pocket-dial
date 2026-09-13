@@ -66,7 +66,6 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 	if (accum.lastTick != 0 && elapsedMs > DtmfAccum::TIMEOUT_MS)
 	{
 		accum.digits.clear();
-		accum.starCodeFiredAtTick = 0;
 	}
 	accum.lastTick = now;
 
@@ -80,45 +79,6 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 	// Admin gate fires only when the caller IS the admin extension.
 	if (callerExt == _adminExt && !seq.empty() && seq[0] == '*')
 	{
-		if (seq == "*4887")
-		{
-			// PLAN_ADMIN_HTTP_ONLY.md: dedicated star-code (spells HTTP on a phone
-			// keypad: H=4 T=8 T=8 P=7), no PIN. *<PIN>#010 does not work on real
-			// hardphones — '#' is bound to Send/Call on Yealink (and most SIP
-			// phones' keypads), both pre-dial and mid-call, so the sequence never
-			// reaches the phone's DTMF-relay path intact. Trust model: registered
-			// as the admin extension + signaling from that registration's bound
-			// IP is sufficient to open the transport. Opening the transport does
-			// NOT bypass PIN/session auth on the endpoints themselves once
-			// reachable — this only shortens the no-PIN-needed step to "have the
-			// admin handset."
-			auto adminClient = _env.findRegistered(_adminExt);
-			bool sourceOk = adminClient &&
-				data->getSource().sin_addr.s_addr ==
-				adminClient->getAddress().sin_addr.s_addr;
-
-			if (!adminClient || !sourceOk)
-			{
-				_env.log("[admin] HTTP-open DTMF trigger rejected: ext " + _adminExt +
-					(adminClient ? " source IP mismatch" : " not registered"), true);
-			}
-			else
-			{
-				uint16_t ttlSec = _grantAdminWindow();
-				_env.log("[admin] HTTP admin plane opened via DTMF *4887, ext " + _adminExt +
-					", ttl=" + std::to_string(ttlSec) + "s");
-			}
-			// Issue #93: this fires (accept or reject, above) the instant the
-			// accumulated sequence equals "*4887" — which can be mid-entry if the
-			// admin's actual PIN happens to begin with those four digits. Remember
-			// it so the next digits, landing in the fresh accumulator this clear()
-			// creates, can be checked for a pattern consistent with a continued
-			// *PIN#code the admin never got to finish.
-			accum.starCodeFiredAtTick = now;
-			accum.digits.clear();
-			return;
-		}
-
 		// Format: '*' + PIN(>=4 digits) + '#' + 3-digit code [+ confirm digit].
 		// The '#' terminates the PIN so its length is unambiguous: we verify the
 		// PIN EXACTLY ONCE per completed code. (The old version looped over every
@@ -225,25 +185,6 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 
 		// If the sequence starts with *NNNN (4+ digits) but no code matched yet,
 		// and the wrong caller is trying, send 403.
-	}
-	else if (callerExt == _adminExt && accum.starCodeFiredAtTick != 0 &&
-	         seq.find('#') != std::string::npos && (seq.size() - seq.find('#') - 1) >= 3)
-	{
-		// Issue #93: the *4887 star-code just fired for this dialog (above), and
-		// the admin kept dialing into something shaped like the tail of an
-		// interrupted *PIN#code (no leading '*' — the accumulator that produced
-		// this `seq` started fresh when the star-code cleared it). This is only
-		// ever a symptom of a PIN that begins "4887": that prefix is reserved
-		// (POST /api/admin/set-pin rejects it going forward), but a device
-		// provisioned before that guard existed can still be carrying one, and
-		// the hash can't be reversed to confirm it — so this is a best-effort,
-		// imperfect nudge rather than a definite diagnosis.
-		_env.log("[admin] DTMF entry right after *4887 fired looks like an "
-			"interrupted *PIN#code from ext " + _adminExt + " — if the admin PIN "
-			"begins with 4887 it is shadowed by the HTTP-open star-code and DTMF "
-			"admin commands can never complete; rotate it via the dashboard "
-			"(POST /api/admin/set-pin) — see docs/THREAT_MODEL.md", true);
-		accum.starCodeFiredAtTick = 0;   // one warning per incident
 	}
 	else if (callerExt != _adminExt && !seq.empty() && seq[0] == '*' &&
 	         seq.find('#') != std::string::npos)

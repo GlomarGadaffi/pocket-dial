@@ -636,10 +636,9 @@ namespace DeviceConfig
 			// Registrar, but DeviceConfig is what writes it from the flash seed,
 			// and leaving it behind made factory reset unable to rescue the one
 			// state that most needs rescuing: a device switched to `secure`
-			// before any extension was secured rejects every REGISTER, and the
-			// DTMF *4887 trigger that reopens the HTTP plane needs the admin
-			// extension REGISTERED — exactly what `secure` prevents. Without
-			// this, the only way back was USB.
+			// before any extension was secured rejects every REGISTER, locking
+			// every phone (and thus the operator) out. Without this, the only
+			// way back was USB.
 			nvs_erase_key(h, kKeyRegMode);
 			nvs_commit(h);
 			nvs_close(h);

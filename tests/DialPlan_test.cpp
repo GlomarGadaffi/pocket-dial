@@ -206,8 +206,9 @@ TEST(DialPlanPattern, LoneStarIsACatchAll)
 
 TEST(DialPlanPattern, NonTrailingStarIsLiteral)
 {
-	// Star-codes (*8, *4887) are real dialable strings on this box, so only a
-	// FINAL '*' is a wildcard — otherwise "*8" could never mean the literal *8.
+	// Star-codes (*8, the *PIN#code admin menu) are real dialable strings on
+	// this box, so only a FINAL '*' is a wildcard — otherwise "*8" could never
+	// mean the literal *8.
 	EXPECT_TRUE(pbx::dialPatternMatches("*8", "*8"));
 	EXPECT_FALSE(pbx::dialPatternMatches("*8", "8"));
 	EXPECT_FALSE(pbx::dialPatternMatches("*8", "998"));
