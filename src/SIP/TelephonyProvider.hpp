@@ -12,15 +12,29 @@
 // to the concrete implementation linked into the firmware.
 //
 // Concrete implementations today:
-//   LoopbackAnchorClient  — on-box mock (no external system), the safe default
-//                           and the only one this project ships.
+//   LoopbackAnchorClient  — on-box mock (no external system), the safe default.
+//   TelephonyAnchorClient — real WAN-anchor client (OAuth2 client-credentials,
+//                           a call-control WebSocket, and chunked-HTTPS PCM16
+//                           media streams), ported from drawbridge and
+//                           registered under TelephonyProviderType::Telephony
+//                           in RequestsHandler's constructor.
 //   StubTelephonyProvider — honest compile-time scaffolding for a provider type
 //                           that is declared in the enum but NOT implemented.
+//                           Nothing uses it today (both current enumerators have
+//                           a real client behind them) — it stays here as the
+//                           pattern for the next declared-but-unimplemented
+//                           provider type. Every call into a stub fails cleanly
+//                           (start() returns false, etc.) instead of faking
+//                           connectivity, and telephonyProviderImplemented()
+//                           reports false for whatever type is stubbed.
 //
-// pocket-dial intentionally ships no other AnchorClient implementation — bring
-// your own to bridge a real external system (SIP trunk, recording server, AI
-// pipeline, ...). Add a TelephonyProviderType enumerator for it in a fork and
-// register it the same way Loopback is registered.
+// pocket-dial ships two real implementations today: Loopback (on-box mock,
+// the safe default for local dev/testing) and Telephony (TelephonyAnchorClient,
+// the real WAN-anchor client described above). To bridge a THIRD external
+// system (a different SIP trunk, a recording server, an AI pipeline, another
+// Telephony-style API, ...), add a TelephonyProviderType enumerator for it and
+// register a real AnchorClient the same way Loopback and Telephony are
+// registered.
 //
 // Invariants:
 //   * Provider objects are constructed ONCE at boot (they are members of
@@ -38,12 +52,16 @@
 using ITelephonyProvider = AnchorClient;
 
 // Provider types selectable from config (NVS u8 on ESP, config file on host).
-// The numeric values are PERSISTED — never reorder or reuse them. pocket-dial
-// ships only Loopback; this enum is the extension point for your own provider.
+// The numeric values are PERSISTED — never reorder or reuse them. Both
+// enumerators below have a real implementation. This enum is also the
+// extension point for your own provider (register it the same way, or add a
+// StubTelephonyProvider slot if the real client isn't ready yet).
 enum class TelephonyProviderType : uint8_t
 {
-	Loopback = 0,  // on-box mock anchor (no external system) — implemented
-	Count          // sentinel — keep last
+	Loopback  = 0,  // on-box mock anchor (no external system) — implemented
+	Telephony = 1,  // Telephony API call-control provider (TelephonyAnchorClient,
+	                // ported from drawbridge) — implemented
+	Count           // sentinel — keep last
 };
 
 // Display/log name for a provider type ("?" for out-of-range).

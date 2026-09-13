@@ -161,6 +161,25 @@ private:
 	// rejects the parameter-level mistakes it can name precisely (missing pattern,
 	// bad action) so the operator gets a 400 instead of a silent server-side drop.
 	void sendApiDialPlan(int sock, const std::string& body);
+	// Telephony-API credential slots (ported from drawbridge). GET lists all
+	// kSlots display-safe views (secrets masked); PUT sets one slot's fields
+	// (an empty secret means "keep existing" -- TelephonyApiConfig::setSlot's
+	// keepSecret contract); activate marks a slot as the boot-time provider
+	// source. Same same-origin+auth gate as the other mutating PBX endpoints
+	// above (POST for activate since it has no body to speak of, mirroring
+	// sendApiKill's shape).
+	void sendApiTelephonyConfigList(int sock);
+	void sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::string& body);
+	void sendApiTelephonyConfigActivate(int sock, size_t slotIdx);
+	void sendApiTelephonyConfigDelete(int sock, size_t slotIdx);
+	// DID -> extension inbound routing (new). GET lists all configured
+	// mappings; PUT adds/updates one (extension validated against the same
+	// dial-token charset + reserved-virtual-extension set sendApiDialPlan/
+	// PbxFeatureConfig already enforce, not a new rule); DELETE removes one
+	// (idempotent, per DidMapping::removeMapping's contract).
+	void sendApiDidMappingList(int sock);
+	void sendApiDidMappingSet(int sock, const std::string& body);
+	void sendApiDidMappingDelete(int sock, const std::string& body);
 	void sendApiWifiScan(int sock);
 	void sendApiWifiConnect(int sock, const std::string& body);
 	void sendApiWifiModeAp(int sock);

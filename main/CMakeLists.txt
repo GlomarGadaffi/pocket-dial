@@ -113,14 +113,16 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/RtpReceiver.cpp"
                             "../src/SIP/PlayoutBuffer.cpp"
                             "../src/SIP/LoopbackAnchorClient.cpp"
+                            "../src/SIP/TelephonyAnchorClient.cpp"
                             "../src/SIP/MediaBridge.cpp"
                             "../src/SIP/TelephonyProvider.cpp"
                             "../src/SIP/TelephonyApiConfig.cpp"
+                            "../src/SIP/DidMapping.cpp"
                             "../src/SIP/MixBus.cpp"
                             "../src/SIP/mix_kernels_scalar.cpp"
                             "../src/SIP/ConferenceRoom.cpp"
                     INCLUDE_DIRS "../src/Helpers" "../src/SIP" "drivers" "ui" "wifi"
-                    REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns app_update esp_driver_ledc console esp_timer ${EXTRA_REQUIRES}
+                    REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns app_update esp_driver_ledc console esp_timer esp_websocket_client esp_http_client cjson mbedtls ${EXTRA_REQUIRES}
                     PRIV_REQUIRES esp_wifi)
 
 # Issue #49: the display transport reserves Core 1 for the LVGL graphics task and

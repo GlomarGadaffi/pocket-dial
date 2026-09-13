@@ -2,6 +2,8 @@
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
 #include "DialPlan.hpp"          // Issue #69: dial-rule validation shared with setDialRule
+#include "TelephonyApiConfig.hpp"
+#include "DidMapping.hpp"
 #include "CallDetailRecord.hpp"
 #include "AdminAuth.hpp"
 #include "DeviceConfig.hpp"
@@ -35,6 +37,14 @@
 // Forward declarations for the file-local form/URL helpers (defined lower down).
 // sendApiDnd() uses getFormParam() but is defined earlier in this TU.
 static std::string getFormParam(const std::string& body, const std::string& key);
+
+// Path-shape parsers for the two PUT/POST telephony-config routes, which (unlike
+// every other route in this file) carry a slot index as a URL segment rather
+// than a form param. Mirrors isProvisioningConfigPath's style: pure string-shape
+// checks, no registry access, used directly in the route table's if/else chain
+// below (each defined further down, alongside the handlers that use them).
+static bool parseTelephonyConfigSlotPath(const std::string& path, size_t& slotIdx);
+static bool parseTelephonyConfigActivatePath(const std::string& path, size_t& slotIdx);
 
 // Captive-portal decay hold. The display app's decay watchdog reads this; the web
 // "/api/configuring" confirm sets it to pause the auto-switch to Standalone while a user is
@@ -428,6 +438,9 @@ void HttpServer::handleClient(int clientSock)
 	}
 
 	HttpRequest req = parseRequest(raw);
+	// Out-param for the two telephony-config routes below, whose slot index is
+	// a URL path segment rather than a form param (see parseTelephonyConfigSlotPath).
+	size_t telSlotIdx = 0;
 
 #if defined(ESP_PLATFORM)
 	// Captive Portal Redirect: If the request is a GET, and the Host is not our IP or is a generic captive portal test domain,
@@ -537,6 +550,60 @@ void HttpServer::handleClient(int clientSock)
 		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiDialPlan(clientSock, req.body);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/api/telephony-config")
+	{
+		// Read-gated like /api/registrar (credential-adjacent config, not
+		// public dashboard data like /api/status's DND/forward/group arrays).
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiTelephonyConfigList(clientSock);
+		}
+	}
+	else if (req.method == "PUT" && parseTelephonyConfigSlotPath(req.path, telSlotIdx))
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiTelephonyConfigSet(clientSock, telSlotIdx, req.body);
+		}
+	}
+	else if (req.method == "POST" && parseTelephonyConfigActivatePath(req.path, telSlotIdx))
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiTelephonyConfigActivate(clientSock, telSlotIdx);
+		}
+	}
+	else if (req.method == "DELETE" && parseTelephonyConfigSlotPath(req.path, telSlotIdx))
+	{
+		// Same gate as the sibling PUT/activate routes above -- an operator
+		// needs a way to remove a stored secret without a full factory reset.
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiTelephonyConfigDelete(clientSock, telSlotIdx);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/api/did-mapping")
+	{
+		// Same read gate as /api/telephony-config above.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiDidMappingList(clientSock);
+		}
+	}
+	else if (req.method == "PUT" && req.path == "/api/did-mapping")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiDidMappingSet(clientSock, req.body);
+		}
+	}
+	else if (req.method == "DELETE" && req.path == "/api/did-mapping")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiDidMappingDelete(clientSock, req.body);
 		}
 	}
 	else if (req.method == "GET" && req.path == "/api/wifi/scan")
@@ -798,7 +865,18 @@ void HttpServer::sendResponse(int sock, int statusCode, const std::string& statu
 
 void HttpServer::sendHtml(int sock, const HttpRequest& req)
 {
-	std::string page(CGA_INDEX_HTML);
+	// index_html.h stores the page as independent const char[] parts (each
+	// its own flash-resident literal, never concatenated at compile time --
+	// see that header's comment for why) rather than one combined constant.
+	// This is the one place that ever pays for assembling them into a single
+	// std::string, exactly like it did before that split existed.
+	std::string page;
+	{
+		size_t total = 0;
+		for (size_t i = 0; i < CGA_INDEX_HTML_PART_COUNT; ++i) total += CGA_INDEX_HTML_PARTS[i].size;
+		page.reserve(total);
+		for (size_t i = 0; i < CGA_INDEX_HTML_PART_COUNT; ++i) page.append(CGA_INDEX_HTML_PARTS[i].data, CGA_INDEX_HTML_PARTS[i].size);
+	}
 
 	// Bind the page to this session's CSRF token. It is rendered INTO the
 	// document rather than set as a cookie: the browser attaches cookies to
@@ -1318,6 +1396,282 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 	             "\",\"target\":\"" + jsonEscape(target) + "\"}");
 }
 
+// ── Telephony-API credential slots (ported from drawbridge) ──────────────────
+
+// "/api/telephony-config/<digits>" with no further path segment -- used for
+// PUT (set one slot). `slotIdx` accepts any digit string that fits a size_t;
+// range-checking against TelephonyApiConfig::kSlots is deliberately left to
+// RequestsHandler::setTelephonyConfigSlot() (-> TelephonyApiConfig::setSlot()),
+// so there is exactly one place in the codebase that knows the valid range.
+static bool parseTelephonyConfigSlotPath(const std::string& path, size_t& slotIdx)
+{
+	static const std::string prefix = "/api/telephony-config/";
+	if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0)
+	{
+		return false;
+	}
+	const std::string rest = path.substr(prefix.size());
+	// No legitimate slot index needs more than a handful of digits; capping the
+	// length keeps the accumulation below overflow-free of any extra guard.
+	if (rest.empty() || rest.size() > 9 || rest.find('/') != std::string::npos)
+	{
+		return false;
+	}
+	size_t v = 0;
+	for (char c : rest)
+	{
+		if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+		v = v * 10 + static_cast<size_t>(c - '0');
+	}
+	slotIdx = v;
+	return true;
+}
+
+// Same prefix, but requires a trailing "/activate" segment -- used for
+// POST .../<slot>/activate.
+static bool parseTelephonyConfigActivatePath(const std::string& path, size_t& slotIdx)
+{
+	static const std::string suffix = "/activate";
+	if (path.size() <= suffix.size() ||
+	    path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0)
+	{
+		return false;
+	}
+	return parseTelephonyConfigSlotPath(path.substr(0, path.size() - suffix.size()), slotIdx);
+}
+
+// Shared JSON shape for one slot, used by both the GET list and the PUT/activate
+// single-slot echo below. Mirrors TelephonyApiConfig::SlotView's own
+// secretSet-not-secret contract: the plaintext secret never appears here.
+static std::string telephonySlotJson(size_t idx, const TelephonyApiConfig::SlotView& v)
+{
+	std::ostringstream json;
+	json << "{\"index\":" << idx
+	     << ",\"type\":\"" << telephonyProviderName(v.type) << "\""
+	     << ",\"enabled\":" << (v.enabled ? "true" : "false")
+	     << ",\"implemented\":" << (v.implemented ? "true" : "false")
+	     << ",\"active\":" << (v.active ? "true" : "false")
+	     << ",\"baseUrl\":\"" << jsonEscape(v.baseUrl) << "\""
+	     << ",\"clientId\":\"" << jsonEscape(v.clientId) << "\""
+	     << ",\"routeDn\":\"" << jsonEscape(v.routeDn) << "\""
+	     << ",\"secretSet\":" << (v.secretSet ? "true" : "false")
+	     << "}";
+	return json.str();
+}
+
+void HttpServer::sendApiTelephonyConfigList(int sock)
+{
+	std::vector<TelephonyApiConfig::SlotView> slots;
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		slots = handler->getTelephonyConfigSlots();
+	}
+
+	std::ostringstream json;
+	json << "{\"slots\":[";
+	for (size_t i = 0; i < slots.size(); ++i)
+	{
+		if (i > 0) json << ",";
+		json << telephonySlotJson(i, slots[i]);
+	}
+	json << "]}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::string& body)
+{
+	// Params: enabled ("1"/"true"/"on", same convention as sendApiDnd's "on"),
+	// baseUrl, clientId, secret, routeDn. An empty secret means "keep existing"
+	// (TelephonyApiConfig::setSlot's keepSecret param). `type` is deliberately
+	// NOT a parameter here: this endpoint only ever configures
+	// TelephonyProviderType::Telephony credentials -- the one real,
+	// vendor-neutral provider this class exists for (see TelephonyProvider.hpp).
+	// Loopback is the internal default and is never set through this API. Like
+	// sendApiForward/sendApiGroup above, this is a full-replace PUT (except for
+	// the secret carve-out): omitting `enabled` leaves the slot disabled.
+	std::string enabledParam = getFormParam(body, "enabled");
+	std::string baseUrl      = getFormParam(body, "baseUrl");
+	std::string clientId     = getFormParam(body, "clientId");
+	std::string secret       = getFormParam(body, "secret");
+	std::string routeDn      = getFormParam(body, "routeDn");
+
+	TelephonyApiConfig::Slot s;
+	s.type     = TelephonyProviderType::Telephony;
+	s.enabled  = (enabledParam == "1" || enabledParam == "true" || enabledParam == "on");
+	s.baseUrl  = baseUrl;
+	s.clientId = clientId;
+	s.secret   = secret;
+	s.routeDn  = routeDn;
+	const bool keepSecret = secret.empty();
+
+	TelephonyApiConfig::SlotView view;
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		std::string err = handler->setTelephonyConfigSlot(slotIdx, s, keepSecret);
+		if (!err.empty())
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"" + jsonEscape(err) + "\"}");
+			return;
+		}
+		view = handler->getTelephonyConfigSlot(slotIdx);
+	}
+	else
+	{
+		// No SIP engine attached yet (HttpServer can start before RequestsHandler
+		// exists -- see this class's constructor comment); nothing was
+		// persisted. Echo the request back, same convention as
+		// sendApiForward/sendApiGroup above.
+		view.type        = s.type;
+		view.enabled     = s.enabled;
+		view.implemented = telephonyProviderImplemented(s.type);
+		view.baseUrl     = s.baseUrl;
+		view.clientId    = s.clientId;
+		view.routeDn     = s.routeDn;
+		view.secretSet   = !s.secret.empty();
+	}
+
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"slot\":" + telephonySlotJson(slotIdx, view) + "}");
+}
+
+void HttpServer::sendApiTelephonyConfigActivate(int sock, size_t slotIdx)
+{
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		std::string err = handler->setTelephonyConfigActiveSlot(slotIdx);
+		if (!err.empty())
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"" + jsonEscape(err) + "\"}");
+			return;
+		}
+	}
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"activeIndex\":" + std::to_string(slotIdx) + "}");
+}
+
+void HttpServer::sendApiTelephonyConfigDelete(int sock, size_t slotIdx)
+{
+	// Lets an operator remove a stored secret short of a full factory reset.
+	// TelephonyApiConfig::clearSlot() owns the bound check (same "there is
+	// exactly one place that knows the valid range" contract as PUT above),
+	// so an out-of-range index surfaces as a 400 from setSlot's sibling
+	// rather than a duplicate check here.
+	TelephonyApiConfig::SlotView view;
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		std::string err = handler->clearTelephonyConfigSlot(slotIdx);
+		if (!err.empty())
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"" + jsonEscape(err) + "\"}");
+			return;
+		}
+		view = handler->getTelephonyConfigSlot(slotIdx);
+	}
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"slot\":" + telephonySlotJson(slotIdx, view) + "}");
+}
+
+// ── DID -> extension inbound routing (new) ────────────────────────────────────
+
+static std::string didMappingJson(const DidMapping::Entry& e)
+{
+	return "{\"did\":\"" + jsonEscape(e.did) + "\",\"extension\":\"" +
+	       jsonEscape(e.extension) + "\"}";
+}
+
+void HttpServer::sendApiDidMappingList(int sock)
+{
+	std::vector<DidMapping::Entry> mappings;
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		mappings = handler->getDidMappings();
+	}
+
+	std::ostringstream json;
+	json << "{\"mappings\":[";
+	for (size_t i = 0; i < mappings.size(); ++i)
+	{
+		if (i > 0) json << ",";
+		json << didMappingJson(mappings[i]);
+	}
+	json << "]}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiDidMappingSet(int sock, const std::string& body)
+{
+	// Params: did, extension. The extension is validated with this codebase's
+	// EXISTING extension-pattern checks rather than a new one: pbx::isDialTokenSafe
+	// (the same charset gate sendApiDialPlan applies to a pattern/target
+	// extension, DialPlan.hpp) and the same reserved-virtual-extension set
+	// PbxFeatureConfig.cpp's setForwardLocked/setRingGroup/setDialRule already
+	// refuse -- 777 (echo test), 999 (all-page), 555 (anchor media bridge), 888
+	// (ConferenceRoom meet-me), 440 (busy/reorder tone). None of those are real
+	// endpoints a DID could ever usefully ring. `did` itself gets no charset
+	// gate here (E.164 DIDs commonly carry a leading '+', which isDialTokenSafe
+	// would reject) -- DidMapping::setMapping's own field validation (length +
+	// no CR/LF/'=') is the one that applies to it.
+	std::string did       = getFormParam(body, "did");
+	std::string extension = getFormParam(body, "extension");
+
+	if (did.empty() || extension.empty())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"missing did or extension parameter\"}");
+		return;
+	}
+	if (!pbx::isDialTokenSafe(extension))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"extension may contain only letters, digits, '#' and '*'\"}");
+		return;
+	}
+	if (extension == "777" || extension == "999" || extension == "555" ||
+	    extension == "888" || extension == "440")
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot map a DID to a virtual/reserved extension\"}");
+		return;
+	}
+
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		std::string err = handler->setDidMapping(did, extension);
+		if (!err.empty())
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"" + jsonEscape(err) + "\"}");
+			return;
+		}
+	}
+
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"did\":\"" + jsonEscape(did) +
+	             "\",\"extension\":\"" + jsonEscape(extension) + "\"}");
+}
+
+void HttpServer::sendApiDidMappingDelete(int sock, const std::string& body)
+{
+	std::string did = getFormParam(body, "did");
+	if (did.empty())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"missing did parameter\"}");
+		return;
+	}
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		// removeMapping() is idempotent -- "" whether or not `did` existed --
+		// so there is nothing to branch on here.
+		handler->removeDidMapping(did);
+	}
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"did\":\"" + jsonEscape(did) + "\"}");
+}
+
 bool HttpServer::isSameOrigin(const HttpRequest& req) const
 {
 	// No Origin header means a direct request (browser nav, curl, etc.) — allow.
@@ -1680,6 +2034,23 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// factory reset returns the board to how it was FLASHED rather than to a
 	// hardcoded default the operator never chose.
 	DeviceConfig::clearAll();
+	// Also wipe the Telephony-API credential slots ("tapicfg") and the DID ->
+	// extension table ("didmap") -- both live in their OWN NVS namespace /
+	// host-file specifically so a factory reset of "storage"/"pbxcfg" above
+	// would NOT collaterally touch them (see TelephonyApiConfig.hpp's and
+	// DidMapping.hpp's class comments), which means a factory reset must
+	// clear them explicitly or a carrier OAuth client_id/client_secret and
+	// the full DID table survive the reset in flash. Both are owned by
+	// RequestsHandler (_tapiConfig/_didMapping), so go through it like every
+	// other mutation of those tables. Unconditional (not gated on
+	// POCKETDIAL_HAS_WIFI below) so this also runs -- and is host-testable --
+	// on eth/desktop builds, matching AdminAuth::clearCredential()/
+	// DeviceConfig::clearAll() just above.
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		handler->clearAllTelephonyConfig();
+		handler->clearAllDidMappings();
+	}
 #if defined(POCKETDIAL_HAS_WIFI)
 	nvs_handle_t nvs_handle;
 	if (nvs_open("storage", NVS_READWRITE, &nvs_handle) == ESP_OK) {

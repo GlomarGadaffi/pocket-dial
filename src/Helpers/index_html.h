@@ -1,7 +1,33 @@
 #ifndef INDEX_HTML_H
 #define INDEX_HTML_H
 
-static const char CGA_INDEX_HTML[] =
+#include <cstddef>
+
+// The dashboard page's HTML+CSS+JS, as a table of independent const char[]
+// parts rather than one big literal. Two separate reasons, both real:
+//
+//  1. MSVC (the host dev build's compiler) enforces the C++ standard's
+//     documented minimum string-literal limits, and this page's combined
+//     HTML+CSS+JS is past both of them: (a) each individual raw string
+//     literal TOKEN is capped -- measured exactly 16384 bytes on this
+//     toolset (cl 19.44); MSVC's own docs cite 16380 single-byte chars
+//     before concatenation -- and (b) the TOTAL of a run of ADJACENT
+//     string-literal tokens (nothing but whitespace/comments between them)
+//     is separately capped at 65535 bytes. C2026 "string too big" fires on
+//     whichever limit is hit first. Keep every PD_HTML_N part below ~16 KB
+//     (limit (a)) or that one part alone will trip it again.
+//  2. This header is also compiled into the ESP32 firmware (HttpServer.cpp
+//     is linked into main/), where RAM is scarce -- see the README's
+//     SIP_CONSTRAINED mode. Each PD_HTML_N[] below is a genuinely SEPARATE
+//     `static const char[]` -- never concatenated, not even via `+` -- so
+//     every one sits in .rodata (flash) at zero RAM cost, exactly like a
+//     single literal would; limit (b) above never applies because nothing
+//     here is adjacent. HttpServer::sendHtml() is the only place that ever
+//     materializes the full page as one std::string (via CGA_INDEX_HTML_
+//     PARTS below), same as it already did with the old single literal.
+struct HtmlPart { const char* data; size_t size; };
+
+static const char PD_HTML_0[] =
 R"html0(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -137,6 +163,9 @@ tbody tr:hover{background:rgba(198,154,78,.05)}
 .chip.busy{color:var(--amber);border-color:var(--amber)}
 .chip.cancelled{color:var(--ink-dim);border-color:var(--line-hi)}
 .chip.unavailable,.chip.failed{color:var(--red);border-color:var(--red)}
+.chip.stub{color:var(--ink-dim);border-color:var(--line-hi)}
+.chip.pending{color:var(--amber);border-color:var(--amber)}
+.chip.live{color:var(--green);border-color:var(--green)}
 .arrow{color:var(--brass)}
 
 /* ── FORMS / CONTROLS ── */
@@ -203,6 +232,7 @@ input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(198
 .kv .k{color:var(--brass-lo)}
 .fwd-row{display:grid;grid-template-columns:78px 1fr auto;gap:8px;align-items:center;margin-bottom:7px}
 .fwd-row label{font-size:11px;color:var(--brass);font-family:var(--mono)}
+.did-row{display:grid;grid-template-columns:1fr 110px auto;gap:8px;align-items:center;margin-top:8px}
 
 /* wifi list */
 .wifi-net{display:flex;justify-content:space-between;align-items:center;padding:7px 9px;border:1px solid transparent;border-radius:4px;cursor:pointer}
@@ -252,6 +282,7 @@ input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(198
   .rail-stats{width:100%;margin-left:0;justify-content:space-between}
   .fwd-row{grid-template-columns:64px 1fr}
   .fwd-row .btn{grid-column:2}
+  .did-row{grid-template-columns:1fr}
 }
 @media (prefers-reduced-motion:reduce){
   .jack.call .lamp{animation:none}
@@ -270,7 +301,9 @@ input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(198
   <div class="rail-stats">
     <div class="stat"><span class="k">Uptime</span><span class="v" id="s-uptime">--:--:--</span></div>
     <div class="stat"><span class="k">Address</span><span class="v" id="s-ip">0.0.0.0:5060</span></div>
-)html0"
+)html0";
+
+static const char PD_HTML_1[] =
 R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-jacks">0/32</span></div>
     <div class="stat"><span class="k">Calls</span><span class="v" id="s-calls">0</span></div>
     <div class="stat"><span class="k">Packets</span><span class="v" id="s-pkts">0</span></div>
@@ -279,6 +312,7 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
     <button class="rbtn" onclick="refreshNow()" title="Refresh (F5)">&#8635; Refresh</button>
     <button class="rbtn" onclick="openModal('wifi-modal');scanWifi()" title="WiFi (F9)">&#9783; WiFi</button>
     <button class="rbtn" onclick="openModal('admin-modal')" title="Admin">&#9919; Admin</button>
+    <button class="rbtn" onclick="openTelephonyModal()" title="Telephone Interconnect">&#9742; Interconnect</button>
     <button class="rbtn" onclick="cycleTheme()" id="theme-btn" title="Cycle accent">Amber</button>
     <button class="rbtn" onclick="openModal('help-modal')" title="Help (F1)">? Help</button>
   </div>
@@ -433,7 +467,10 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
         associated with this access point must be re-joined using the passphrase
         below. Nothing changes until the access point next comes up.
       </div>
-)html1" R"html1b(      <div class="kv"><span class="k">Current mode</span><span id="ap-mode">&mdash;</span></div>
+)html1";
+
+static const char PD_HTML_1b[] =
+R"html1b(      <div class="kv"><span class="k">Current mode</span><span id="ap-mode">&mdash;</span></div>
       <div class="field">
         <label for="ap-psk">Access point passphrase (8&ndash;63 characters)</label>
         <input type="text" id="ap-psk" autocomplete="off" spellcheck="false">
@@ -527,6 +564,63 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
   </div>
 </div>
 
+<!-- ══ TELEPHONE INTERCONNECT MODAL ══ -->
+<div class="overlay" id="telephony-modal">
+  <div class="modal">
+    <h3>&#9742; Telephone Interconnect<span class="x" onclick="closeModal('telephony-modal')">&times;</span></h3>
+    <div class="mbody">
+      <div class="note">
+        Bridges calls to an outside telephone network through a carrier's call-control
+        API. Configure a slot with the carrier's credentials, then Activate it to choose
+        which slot the device uses. A slot with no working backend yet is labelled
+        &ldquo;not yet connected&rdquo; below &mdash; it stores what you enter, but nothing
+        actually dials out through it until that provider is implemented.
+      </div>
+      <div class="kv"><span class="k">Active slot</span><span id="tapi-active-summary">&mdash;</span></div>
+
+      <div class="subhead">Carrier API Slots</div>
+      <table id="tapi-slots">
+        <thead><tr><th>Slot</th><th>Status</th><th>Base URL</th><th>Route DN</th><th></th></tr></thead>
+        <tbody id="tapi-slots-body"></tbody>
+      </table>
+
+      <hr class="hr">
+      <div class="subhead" id="tapi-edit-title">Configure Slot 1</div>
+      <div class="field"><label>Base URL / FQDN</label><input type="text" id="tapi-baseurl" autocomplete="off" spellcheck="false" placeholder="https://api.example.com"></div>
+      <div class="field"><label>Client ID</label><input type="text" id="tapi-clientid" autocomplete="off" spellcheck="false"></div>
+      <div class="field"><label>API Key / Secret</label><input type="password" id="tapi-secret" autocomplete="off" placeholder="leave blank to keep existing"></div>
+      <div class="field"><label>Route Point / Source DN</label><input type="text" id="tapi-routedn" autocomplete="off" spellcheck="false" placeholder="e.g. +15551234567"></div>
+      <div class="row"><label class="note" for="tapi-enabled" style="margin:0"><input type="checkbox" id="tapi-enabled"> Enabled &mdash; needs an https:// base URL to take effect</label></div>
+      <div class="row">
+        <button class="btn primary" onclick="saveTelephonySlot()">Save Slot</button>
+        <button class="btn" onclick="activateTelephonySlot(tapiSelected)">Activate This Slot</button>
+      </div>
+      <div class="msg" id="tapi-msg"></div>
+
+      <hr class="hr">
+      <div class="subhead">DID &rarr; Extension Routing</div>
+      <div class="note">
+        Currently only one route point is supported: the DID you enter here
+        must exactly match the Route Point / Source DN configured above in
+        the active Carrier API slot &mdash; that's the only inbound number
+        this device ever sees. Rows for other DIDs are stored but will never
+        match until multi-route support is added; an unmatched call falls
+        through to ring-all, same as if no mapping existed.
+      </div>
+      <table id="did-table">
+        <thead><tr><th>DID</th><th>Extension</th><th></th></tr></thead>
+        <tbody id="did-table-body"></tbody>
+      </table>
+      <div class="did-row">
+        <input type="text" id="did-new-did" autocomplete="off" spellcheck="false" placeholder="Must match Route Point DN above">
+        <input type="text" id="did-new-ext" inputmode="numeric" placeholder="Extension">
+        <button class="btn primary" onclick="addDidMapping()">Add</button>
+      </div>
+      <div class="msg" id="did-msg"></div>
+    </div>
+  </div>
+</div>
+
 <!-- ══ HELP MODAL ══ -->
 <div class="overlay" id="help-modal">
   <div class="modal">
@@ -555,6 +649,8 @@ var selectedSSID="";
 var selectedJack=null;
 var failCount=0;
 var POOL=32;
+var tapiSlots=[];
+var tapiSelected=0;
 /* Per-session CSRF token. The literal below is replaced by the server when it
    renders this page (HttpServer::sendHtml); an unauthenticated load leaves it
    empty and adminLogin() fills it in from the login response. It is deliberately
@@ -586,7 +682,9 @@ var themeIdx=0;
 function applyTheme(i){
   themeIdx=((i%THEMES.length)+THEMES.length)%THEMES.length;
   var k=THEMES[themeIdx],v=THEME_VARS[k];
-)html1b"
+)html1b";
+
+static const char PD_HTML_2[] =
 R"html2(  document.documentElement.style.setProperty("--amber",v.amber);
   document.documentElement.style.setProperty("--amber-glow",v.glow);
   var b=$("theme-btn");if(b)b.textContent=k.charAt(0).toUpperCase()+k.slice(1);
@@ -748,7 +846,10 @@ function saveForward(){
     .catch(function(err){setMsg("fwd-msg",err.message,"err");});
 }
 
-)html2" R"html2a(
+)html2";
+
+static const char PD_HTML_2a[] =
+R"html2a(
 /* ── CDR table ── */
 function renderCdr(records){
   var tb=$("cdr-tbody");
@@ -855,15 +956,21 @@ function termExec(){
 }
 
 /* ── networking ── */
-function post(url,body){
-  return fetch(url,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF":PD_CSRF},body:body})
+/* Shared by post()/put()/del() below — same mutating-request contract for
+   every verb: same-origin cookie, per-session CSRF header, and the same
+   401/403 handling every mutating call in this file relies on. */
+function httpMethod(method,url,body){
+  return fetch(url,{method:method,credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF":PD_CSRF},body:body})
     .then(function(r){
       if(r.status===401){handleAuthExpired();throw new Error("session expired — please log in");}
-      if(r.status===403){throw new Error("rejected (cross-origin or stale security token \u2014 reload the page)");}
+      if(r.status===403){throw new Error("rejected (cross-origin or stale security token — reload the page)");}
       if(!r.ok){throw new Error("HTTP "+r.status);}
       return r.text();
     });
 }
+function post(url,body){return httpMethod("POST",url,body);}
+function put(url,body){return httpMethod("PUT",url,body);}
+function del(url,body){return httpMethod("DELETE",url,body);}
 function fetchStatus(){
   fetch("/api/status").then(function(r){return r.json();}).then(function(d){
     statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);
@@ -922,7 +1029,9 @@ function adminSetPin(mode){
   fetch("/api/admin/set-pin",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"pin="+encodeURIComponent(pin)})
     .then(function(r){
       if(r.status===401){handleAuthExpired();return;}
-)html2a"
+)html2a";
+
+static const char PD_HTML_3[] =
 R"html3(      if(r.status===400){setMsg("admin-msg","Invalid PIN (min 4 chars).","err");return;}
       if(!r.ok){setMsg("admin-msg","Failed (HTTP "+r.status+").","err");return;}
       $(inputId).value="";$("admin-changepin").style.display="none";
@@ -1116,7 +1225,10 @@ function scanWifi(){
     renderWifi(nets);
   }).catch(function(e){st.textContent="Scan failed: "+e.message;st.style.color="var(--red)";});
 }
-function renderWifi(nets){
+)html3";
+
+static const char PD_HTML_3a[] =
+R"html3a(function renderWifi(nets){
   var list=$("wifi-list");list.innerHTML="";
   if(!nets.length){list.innerHTML='<div class="note">No networks found.</div>';return;}
   nets.forEach(function(n){
@@ -1156,12 +1268,146 @@ function factoryReset(){
     .then(function(d){toast(d.message||"Rebooting…","warn");}).catch(function(e){toast("Error: "+e.message,"err");});
 }
 
+/* ════ TELEPHONE INTERCONNECT ════
+   Carrier API credential slots (GET/PUT /api/telephony-config[/n], POST
+   /api/telephony-config/n/activate) and DID→extension routing (GET/PUT/DELETE
+   /api/did-mapping). Both reads are session-gated same as /api/registrar (see
+   HttpServer.cpp), so — unlike the WiFi scan above — opening this modal goes
+   through gateCheck() first instead of firing an unauthenticated fetch that
+   would just 401. Data is pulled on modal-open and after each mutation rather
+   than on the admin-status poll interval: this is edited-rarely config, not a
+   live status feed like the registrar roster. */
+var PD_RESERVED_EXT={"777":1,"999":1,"555":1,"888":1,"440":1};
+function isDialTokenSafeJs(s){return !!s&&/^[A-Za-z0-9#*]+$/.test(s);}
+function openTelephonyModal(){
+  if(!gateCheck())return;
+  openModal("telephony-modal");
+  fetchTelephonyConfig();fetchDidMappings();
+}
+// Honest-by-construction: never renders "Active"/"connected" language for a
+// slot whose provider type has no real backend yet (SlotView.implemented),
+// even if it's enabled and selected active — see TelephonyProvider.hpp.
+function tapiStatusChip(s){
+  var configured=!!(s.baseUrl||s.clientId||s.secretSet||s.routeDn||s.enabled);
+  if(!configured)return '<span class="chip stub">Not configured</span>';
+  if(!s.implemented)return '<span class="chip pending">Configured — not yet connected</span>';
+  return s.active?'<span class="chip live">Active</span>':'<span class="chip pending">Configured</span>';
+}
+function fetchTelephonyConfig(){
+  return fetch("/api/telephony-config",{credentials:"same-origin"}).then(function(r){
+    if(r.status===401){handleAuthExpired();throw new Error("session expired");}
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(d){tapiSlots=d.slots||[];renderTapiSlots();selectTapiSlot(tapiSelected);}).catch(function(){});
+}
+function renderTapiSlots(){
+  var body=$("tapi-slots-body");body.innerHTML="";
+  var activeLabel="None (loopback default)";
+  tapiSlots.forEach(function(s,i){
+    if(s.active)activeLabel="Slot "+(i+1)+(s.implemented?"":" (not yet connected)");
+    var tr=document.createElement("tr");
+    var tdN=document.createElement("td");tdN.textContent="Slot "+(i+1);
+    var tdS=document.createElement("td");tdS.innerHTML=tapiStatusChip(s); // our own markup, not off-the-wire text
+    var tdU=document.createElement("td");tdU.textContent=s.baseUrl||"—";
+    var tdR=document.createElement("td");tdR.textContent=s.routeDn||"—";
+    var tdA=document.createElement("td");
+    var eb=document.createElement("button");eb.className="btn";eb.textContent="Edit";
+    eb.onclick=function(){selectTapiSlot(i);};
+    tdA.appendChild(eb);
+    if(!s.active){
+      var ab=document.createElement("button");ab.className="btn";ab.textContent="Activate";ab.style.marginLeft="4px";
+      ab.onclick=function(){activateTelephonySlot(i);};
+      tdA.appendChild(ab);
+    }
+    tr.appendChild(tdN);tr.appendChild(tdS);tr.appendChild(tdU);tr.appendChild(tdR);tr.appendChild(tdA);
+    body.appendChild(tr);
+  });
+  $("tapi-active-summary").textContent=activeLabel;
+}
+function selectTapiSlot(i){
+  tapiSelected=i;
+  var s=tapiSlots[i]||{};
+  $("tapi-edit-title").textContent="Configure Slot "+(i+1)+(s.active?" (active)":"");
+  $("tapi-baseurl").value=s.baseUrl||"";
+  $("tapi-clientid").value=s.clientId||"";
+  $("tapi-secret").value="";
+  $("tapi-secret").placeholder=s.secretSet?"leave blank to keep existing":"";
+  $("tapi-routedn").value=s.routeDn||"";
+  $("tapi-enabled").checked=!!s.enabled;
+  setMsg("tapi-msg","");
+}
+function saveTelephonySlot(){
+  if(!gateCheck())return;
+  var body="enabled="+($("tapi-enabled").checked?"1":"0")
+    +"&baseUrl="+encodeURIComponent($("tapi-baseurl").value.trim())
+    +"&clientId="+encodeURIComponent($("tapi-clientid").value.trim())
+    +"&secret="+encodeURIComponent($("tapi-secret").value)
+    +"&routeDn="+encodeURIComponent($("tapi-routedn").value.trim());
+  put("/api/telephony-config/"+tapiSelected,body)
+    .then(function(){setMsg("tapi-msg","Slot "+(tapiSelected+1)+" saved.","ok");fetchTelephonyConfig();})
+    .catch(function(e){setMsg("tapi-msg",e.message,"err");});
+}
+function activateTelephonySlot(i){
+  if(!gateCheck())return;
+  post("/api/telephony-config/"+i+"/activate","")
+    .then(function(){setMsg("tapi-msg","Slot "+(i+1)+" is now active.","ok");fetchTelephonyConfig();})
+    .catch(function(e){setMsg("tapi-msg",e.message,"err");});
+}
+function fetchDidMappings(){
+  return fetch("/api/did-mapping",{credentials:"same-origin"}).then(function(r){
+    if(r.status===401){handleAuthExpired();throw new Error("session expired");}
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(d){renderDidMappings(d.mappings||[]);}).catch(function(){});
+}
+function renderDidMappings(list){
+  var body=$("did-table-body");body.innerHTML="";
+  if(!list.length){
+    var tr=document.createElement("tr");var td=document.createElement("td");
+    td.colSpan=3;td.className="note";td.textContent="No DID mappings configured.";
+    tr.appendChild(td);body.appendChild(tr);return;
+  }
+  list.forEach(function(m){
+    var tr=document.createElement("tr");
+    /* textContent throughout: did/extension are stored config strings, same
+       treatment as the registrar roster's MAC/extension above. */
+    var tdD=document.createElement("td");tdD.textContent=m.did;
+    var tdE=document.createElement("td");tdE.textContent=m.extension;
+    var tdA=document.createElement("td");
+    var b=document.createElement("button");b.className="btn danger";b.textContent="Remove";
+    b.onclick=function(){removeDidMapping(m.did);};
+    tdA.appendChild(b);
+    tr.appendChild(tdD);tr.appendChild(tdE);tr.appendChild(tdA);
+    body.appendChild(tr);
+  });
+}
+function addDidMapping(){
+  if(!gateCheck())return;
+  var did=$("did-new-did").value.trim();
+  var ext=$("did-new-ext").value.trim();
+  if(!did||!ext){setMsg("did-msg","DID and extension are both required.","err");return;}
+  // Same charset + reserved-extension checks HttpServer.cpp applies server-side
+  // (pbx::isDialTokenSafe + the 777/999/555/888/440 virtual-extension set) —
+  // client-side so a typo is caught before the round trip, not instead of it.
+  if(!isDialTokenSafeJs(ext)){setMsg("did-msg","Extension may contain only letters, digits, '#' and '*'.","err");return;}
+  if(PD_RESERVED_EXT[ext]){setMsg("did-msg","Cannot map a DID to a virtual/reserved extension ("+ext+").","err");return;}
+  put("/api/did-mapping","did="+encodeURIComponent(did)+"&extension="+encodeURIComponent(ext))
+    .then(function(){$("did-new-did").value="";$("did-new-ext").value="";setMsg("did-msg","Mapping saved.","ok");fetchDidMappings();})
+    .catch(function(e){setMsg("did-msg",e.message,"err");});
+}
+function removeDidMapping(did){
+  if(!gateCheck())return;
+  del("/api/did-mapping","did="+encodeURIComponent(did))
+    .then(function(){setMsg("did-msg","Mapping removed.","ok");fetchDidMappings();})
+    .catch(function(e){setMsg("did-msg",e.message,"err");});
+}
+
 /* ── keyboard shortcuts ── */
 document.addEventListener("keydown",function(e){
   if(e.key==="F1"){e.preventDefault();openModal("help-modal");}
   else if(e.key==="F5"){e.preventDefault();refreshNow();}
   else if(e.key==="F9"){e.preventDefault();openModal("wifi-modal");scanWifi();}
-  else if(e.key==="Escape"){["jack-modal","admin-modal","wifi-modal","help-modal"].forEach(function(id){closeModal(id);});}
+  else if(e.key==="Escape"){["jack-modal","admin-modal","wifi-modal","telephony-modal","help-modal"].forEach(function(id){closeModal(id);});}
 });
 ["adm-newpin","adm-changepin-val"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminSetPin(id==="adm-changepin-val"?"change":undefined);});});
 (function(){var el=$("adm-pin");if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminLogin();});})();
@@ -1176,7 +1422,23 @@ setInterval(function(){if(!otaUploading)fetchOtaStatus();},15000);
 </script>
 </body>
 </html>
-)html3"
-;
+)html3a";
+
+// One HttpServer::sendHtml() assembles these into a single std::string per
+// request (as it already did with the old single literal) -- the parts
+// themselves stay in flash the whole time. sizeof(PD_HTML_N)-1 drops the
+// implicit NUL each array's initializer added, same as strlen() would but
+// resolved at compile time.
+static const HtmlPart CGA_INDEX_HTML_PARTS[] = {
+	{ PD_HTML_0,  sizeof(PD_HTML_0)  - 1 },
+	{ PD_HTML_1,  sizeof(PD_HTML_1)  - 1 },
+	{ PD_HTML_1b, sizeof(PD_HTML_1b) - 1 },
+	{ PD_HTML_2,  sizeof(PD_HTML_2)  - 1 },
+	{ PD_HTML_2a, sizeof(PD_HTML_2a) - 1 },
+	{ PD_HTML_3,  sizeof(PD_HTML_3)  - 1 },
+	{ PD_HTML_3a, sizeof(PD_HTML_3a) - 1 },
+};
+static constexpr size_t CGA_INDEX_HTML_PART_COUNT =
+	sizeof(CGA_INDEX_HTML_PARTS) / sizeof(CGA_INDEX_HTML_PARTS[0]);
 
 #endif // INDEX_HTML_H

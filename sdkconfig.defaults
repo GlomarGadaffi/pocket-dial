@@ -109,6 +109,33 @@ CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 # than a jump. The code-size cost is a few percent on the parser TUs only.
 CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
 
+# ── Telephony WAN anchor: socket pool + TLS session resumption ──────────────
+# TelephonyAnchorClient (ported from drawbridge) opens 3 persistent TLS sockets
+# regardless of call count (control WS + ctrl POST + status GET) plus +2 per
+# active call slot (warm POST + GET stream), on top of 2 LAN RTP UDP sockets
+# per bridged anchor call. The W5500 runs in MACRAW mode, so LWIP's own socket
+# pool (not the chip's 8-socket HW TCP engine) is what's consumed, and this
+# board also carries socket consumers drawbridge doesn't (POCKETDIAL_CONF_LEGS
+# local conference legs, the littlessh/wolfSSH sysop terminal) — so this stays
+# at drawbridge's own hardware-confirmed number (socket() failed at the 3rd-4th
+# concurrent call with a 16-24 pool at N=8 anchor calls) rather than a smaller
+# one, even though POCKETDIAL_MAX_ANCHOR_CALLS ships at 1 today. IDF default is
+# 10, which starves the instant the anchor's 3 persistent sockets join SIP/
+# dashboard/SSH.
+CONFIG_LWIP_MAX_SOCKETS=48
+
+# TLS session resumption for the anchor's persistent connections
+# (makeAuthedClient() sets save_client_session per-client already). Without
+# these two, save_client_session is inert and every reconnect pays a full
+# software ECDHE (the S3 has no ECC accelerator); without the two below, a 4th
+# concurrent TLS context (e.g. a drop-call POST arriving while WS+GET+POST are
+# all live) can alloc-fail on internal RAM (mbedtls_ssl_setup -0x008D —
+# drawbridge issue #94).
+CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=y
+CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
 # ── Heap corruption detection ────────────────────────────────────────────────
 # The two settings above cover the STACK. Until now the heap had nothing
 # (HEAP_POISONING_DISABLED, the IDF default), which was defensible when the

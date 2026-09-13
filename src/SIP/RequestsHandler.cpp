@@ -21,6 +21,7 @@
 #include "SipDigest.hpp"
 #include "SipSecretStore.hpp"
 #include "ArpLookup.hpp"
+#include "PsramTask.hpp"   // PD_TASK_STACK_CAPS / xTaskCreateWithCaps / vTaskDeleteWithCaps (ESP-only)
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	// PBX config (call-forward / ring groups) and the persistent CDR ring live in
@@ -69,6 +70,14 @@ namespace
 	// (matching 777/440/888/999) was chosen over a trunk-access prefix or an
 	// unregistered-number fallback.
 	constexpr const char* kAnchorCallExt = "555";
+
+	// How long a CONNECTED outbound anchor call waits for the handset's ACK before
+	// tick() treats it as abandoned (handset gone, or its 200 OK arrived too late)
+	// and reaps the upstream leg + bridge. Re-arms the ring timer that was set for
+	// the no-answer window (pbx::kNoAnswerTimeout) at the moment the CallEvent
+	// callback sends the 200 OK. Loopback never arms this (see onAck's kAnchorCallExt
+	// branch): it answers synchronously and clears any timer immediately.
+	constexpr auto ANCHOR_ACK_TIMEOUT = std::chrono::seconds(15);
 }
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
@@ -102,6 +111,11 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// NVS so they survive reboot. No-ops on host. Construction is single-threaded
 	// (no handler is dispatching yet), so these run without holding _mutex.
 	_cfg.loadPbxConfig();
+	// Telephony-API credential slots + DID->extension mapping (new, Part 2):
+	// same "reload once at construction, single-threaded, no lock needed" story
+	// as _cfg.loadPbxConfig() just above.
+	_tapiConfig.load();
+	_didMapping.load();
 	_cdr.load();
 	// Task 2B: load the admin extension from NVS (defaults to "1001" if absent).
 	_dtmf.load();
@@ -118,24 +132,90 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	refreshDeviceSnapshot();
 
 	// ── Anchored media (opt-in; docs/FEATURE_ROADMAP.md): wire the AnchorClient/
-	// MediaBridge extension point into call routing. pocket-dial ships only
-	// LoopbackAnchorClient (TelephonyProvider.hpp's class comment explains why no
-	// vendor-specific provider ships here) — register it as the registry's one
-	// entry and select it. A fork adding a real provider registers it the same
-	// way; this select() call and everything below pick it up with no other
-	// change here. telephonyProviderImplemented() guards against a fork adding a
-	// new TelephonyProviderType enumerator without ever registering/implementing
-	// it — select() would still return a non-null (stub) pointer for it, so the
-	// implemented-check is what actually keeps that half-added type from being
-	// selected.
+	// MediaBridge extension point into call routing. Both provider slots now
+	// have a real implementation: LoopbackAnchorClient (on-box mock, the safe
+	// default) and TelephonyAnchorClient (WAN-anchor client ported from
+	// drawbridge — Stage A of that port; see TelephonyProvider.hpp's class
+	// comment). Boot selection below reads the Telephony-API credential slot
+	// table (also ported from drawbridge) so an operator-provisioned
+	// ACTIVE+ENABLED slot can pick Telephony over the Loopback default;
+	// telephonyProviderImplemented() remains the belt-and-braces guard against
+	// any FUTURE enumerator that is declared but not yet backed by a
+	// registered client.
 	_providerRegistry.registerProvider(TelephonyProviderType::Loopback, &_loopbackClient);
-	AnchorClient* selectedAnchor = _providerRegistry.select(TelephonyProviderType::Loopback);
-	_anchorClient = (selectedAnchor && telephonyProviderImplemented(TelephonyProviderType::Loopback))
+	_providerRegistry.registerProvider(TelephonyProviderType::Telephony, &_telephonyAnchorClient);
+
+	// Resolve the boot provider TYPE from the credential slot table. Default =
+	// Loopback; an ACTIVE+ENABLED slot overrides it, falling back to Loopback
+	// with an honest log if that slot names a provider that isn't (yet)
+	// implemented. Construction is single-threaded (no handler is dispatching
+	// yet), so this runs without holding _mutex — same as _tapiConfig.load()
+	// a few lines above.
+	TelephonyProviderType bootType = TelephonyProviderType::Loopback;
+	std::string tapiUrl, tapiId, tapiSecret, tapiDn;
+	bool credsFromSlot = false;
+	{
+		const size_t act = _tapiConfig.activeSlot();
+		const TelephonyApiConfig::Slot* slot = _tapiConfig.bootSlot(act);
+		if (slot != nullptr && slot->enabled)
+		{
+			if (telephonyProviderImplemented(slot->type))
+			{
+				bootType = slot->type;
+				tapiUrl = slot->baseUrl; tapiId = slot->clientId;
+				tapiSecret = slot->secret; tapiDn = slot->routeDn;
+				credsFromSlot = (slot->type != TelephonyProviderType::Loopback);
+			}
+			else
+			{
+				queueLog(std::string("[Telephony] Active provider ") +
+				         telephonyProviderName(slot->type) +
+				         " is not implemented yet — falling back to loopback", true);
+			}
+		}
+	}
+
+	AnchorClient* selectedAnchor = _providerRegistry.select(bootType);
+	_anchorClient = (selectedAnchor && telephonyProviderImplemented(bootType))
 		? selectedAnchor : nullptr;
+	if (_anchorClient == nullptr)
+	{
+		_anchorClient = &_loopbackClient;   // registry is total today; belt+braces
+		bootType = TelephonyProviderType::Loopback;
+	}
+
+	// Cache the FINAL decision (after the belt-braces fallback above) — every call
+	// site downstream (onAnchorInvite, endCall, the CallEvent callback,
+	// routeInboundAnchorCall) reads these two members rather than re-deriving them.
+	// _anchorRouteDn is pocket-dial's substitute for drawbridge's TrunkConfig::
+	// sourceDn: the monitored route DN an ACTIVE+ENABLED Telephony slot supplies
+	// (TelephonyApiConfig::Slot::routeDn) — "" whenever no such slot is active
+	// (Loopback boot).
+	_anchorBootType = bootType;
+	_anchorRouteDn = tapiDn;
 
 	if (_anchorClient)
 	{
-		_anchorClient->init("", "", "", "");   // Loopback needs no real credentials
+		if (credsFromSlot)
+		{
+			_anchorClient->init(tapiUrl, tapiId, tapiSecret, tapiDn);
+		}
+		else
+		{
+			_anchorClient->init("", "", "", "");   // Loopback needs no real credentials
+		}
+		// Drop the local plaintext copy now the client holds it (best-effort).
+		std::fill(tapiSecret.begin(), tapiSecret.end(), '\0');
+
+		// Push the re-warm cadence into the freshly-selected anchor (no-op on
+		// Loopback — AnchorClient::setRewarmIntervalSec() defaults to a no-op
+		// override); minutes -> seconds, mirroring drawbridge's own boot wiring.
+		// _rewarmMinutes has no NVS load/dashboard setter in pocket-dial today (it
+		// sits at its declared default, unlike drawbridge's TUI-exposed copy) —
+		// wiring that persistence is a separate, later piece of work; this line
+		// only makes the existing atomic actually reach the anchor once one exists.
+		_anchorClient->setRewarmIntervalSec(
+			static_cast<uint32_t>(_rewarmMinutes.load(std::memory_order_relaxed)) * 60u);
 
 		// Wire each anchor media bridge to its own RTP receiver/sender pair, then
 		// install ONE anchor rx callback fanning each call's inbound audio out to
@@ -156,41 +236,286 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 				}
 			});
 
-		// setEventCallback() is deliberately NOT wired. LoopbackAnchorClient's
-		// makeCall()/dropCall() synchronously JOIN their own simulation thread(s)
-		// (reapSimThreads()), and onAnchorInvite()/endCall() call both while
-		// holding _mutex — an event callback that itself needed _mutex would
-		// deadlock its own caller. onAnchorInvite() treats a successful
-		// makeCall()+startBridge() as "answered" rather than waiting for the
-		// async Ringing/Answered events it documents (see that function's
-		// comment); wiring real event-driven completion later needs an
-		// async-safe outbox first — this engine's _outbox is only ever valid
-		// inside one handle()/tick() pass (both start it with _outbox.clear()).
-		//
-		// start() runs synchronously here (LoopbackAnchorClient::start() is a
-		// flag store, not I/O). A real anchor's connect must stay non-blocking
-		// in start() too — AnchorClient::tick() (pumped from tick() below) is
-		// the documented place for retry/blocking work, not this constructor.
-		//
-		// The same non-blocking requirement applies to makeCall()/dropCall():
-		// onAnchorInvite() and endCall() (src/SIP/RequestsHandler.cpp) call both
-		// while holding _mutex (ARCHITECTURE.md §3's "no blocking I/O under the
-		// registrar lock" invariant), exactly like every other handler in this
-		// class. Loopback's are cheap (a thread-join bounded by its ~40 ms sim
-		// sequence), but a fork wiring a real anchor whose makeCall() does
-		// network I/O would block the whole SIP task under that lock — the
-		// sibling commercial product this pattern is ported from sidesteps this
-		// with an asyncMakeCall() that hands off to a worker thread/task before
-		// returning; adding that here is future work, not done by this pass.
-		if (_anchorClient->start())
+		// setEventCallback() is wired ONLY for a real (non-Loopback) anchor — Stage
+		// B of the TelephonyAnchorClient port. Loopback stays exactly as before
+		// (unwired): its makeCall()/dropCall()/answerCall() synchronously JOIN
+		// their own simulation thread(s) (reapSimThreads()), and onAnchorInvite()/
+		// endCall() call them while holding _mutex (anchorIsSynchronous() ==
+		// true keeps that path byte-for-byte unchanged from before this stage) —
+		// an event callback that itself took _mutex would deadlock its own
+		// caller: the SIP thread would be blocked inside reapSimThreads()'s
+		// join() waiting for a sim thread that is itself blocked trying to lock
+		// the _mutex the SIP thread is already holding. A real anchor's
+		// makeCall()/dropCall()/answerCall() are blocking TLS HTTP round trips
+		// instead, so every call site for one goes through asyncMakeCall()/
+		// asyncDropCall()/asyncAnswerCall() (spawned off the SIP thread) rather
+		// than being called directly under _mutex — see anchorIsSynchronous()'s
+		// doc comment, onAnchorInvite(), and endCall()'s anchor-bridge safety net.
+		if (!anchorIsSynchronous())
 		{
-			queueLog(std::string("[Anchor] ") +
-				telephonyProviderName(TelephonyProviderType::Loopback) + " client started");
+			_anchorClient->setEventCallback([this](const AnchorClient::CallEvent& ev) {
+				std::lock_guard<std::mutex> lock(_mutex);
+				if (ev.type == AnchorClient::CallEvent::Answered)
+				{
+					queueLog("[Telephony] Event: Answered, participantId=" + ev.participantId);
+					// Bind THIS answered participant to ITS session. asyncMakeCall's
+					// worker stamped the own leg onto the session at origination
+					// (bindOutboundParticipant), so match by participant id; fall back
+					// to a still-unbound Invited anchor session (covers a rare
+					// Answered-before-bind race, same as drawbridge's #100 fix).
+					std::shared_ptr<Session> session;
+					std::string callId;
+					for (auto& [cid, s] : _sessions)
+					{
+						if (s->isAnchor() && !s->isAnchorInbound() &&
+						    s->getState() == Session::State::Invited &&
+						    s->getAnchorParticipantId() == ev.participantId)
+						{
+							session = s; callId = cid; break;
+						}
+					}
+					if (!session)
+					{
+						for (auto& [cid, s] : _sessions)
+						{
+							if (s->isAnchor() && !s->isAnchorInbound() &&
+							    s->getState() == Session::State::Invited &&
+							    s->getAnchorParticipantId().empty())
+							{
+								session = s; callId = cid; break;
+							}
+						}
+					}
+					if (session)
+					{
+						auto caller = session->getSrc();
+						std::string handsetIp;
+						uint16_t handsetPort = 0;
+						auto inviteMsg = session->getInviteMessage();
+						if (caller && inviteMsg && parseCallerRtp(inviteMsg, handsetIp, handsetPort))
+						{
+							const std::string activeIp = _localIp;
+							// Reuse the To-tag from the 180 Ringing so the 200 OK lands in
+							// the SAME dialog the phone is already ringing (a fresh tag
+							// leaves Yealink-class phones stuck ringing).
+							std::string toTag = session->getLocalTag();
+							if (toTag.empty()) toTag = IDGen::GenerateID(9); // defensive fallback
+							// Claim a free media bridge for this call, starting it FIRST so
+							// the receiver's ephemeral RX port is known before the SDP
+							// answer is built — that port is what the handset must send
+							// its audio to.
+							MediaBridge* bridge = bridgeForParticipant(ev.participantId);
+							if (!bridge) bridge = acquireFreeAnchorBridge();
+							if (bridge && bridge->startBridge(handsetIp, handsetPort, callId, ev.participantId))
+							{
+								const int rxPort = bridge->receiverPort();
+								const std::string sdpBody = buildMediaSdp(activeIp, rxPort, /*sendrecv=*/true);
+								auto ok = buildOkWithSdp(inviteMsg, activeIp, toTag, sdpBody);
+								if (ok)
+								{
+									// Runs on the anchor's own WS event task, NOT the SIP
+									// receive thread — use _asyncOutbox so the start-of-pass
+									// _outbox.clear() in handle()/tick() can't wipe this 200 OK.
+									_asyncOutbox.emplace_back(inviteMsg->getSource(), std::move(ok));
+									session->setState(Session::State::Connected);
+									session->setAnchorParticipantId(ev.participantId);
+									// Re-arm as an ACK deadline: if the handset never ACKs this
+									// 200 (bridged late, past its own timeout, phone already
+									// gave up), tick() reaps the call and drops the anchor leg +
+									// bridge instead of zombie-ing it. onAck clears this on a
+									// healthy call (~1 s).
+									session->armRingTimer(std::chrono::steady_clock::now() + ANCHOR_ACK_TIMEOUT);
+									queueLog("[Telephony] MediaBridge started: handset=" + handsetIp + ":" +
+									         std::to_string(handsetPort) + " <-> anchor (rx port " +
+									         std::to_string(rxPort) + ")");
+								}
+								else
+								{
+									bridge->stopBridge();
+									queueLog("[Telephony] Answered: message pool exhausted, bridge unwound", true);
+								}
+							}
+							else
+							{
+								queueLog("[Telephony] MediaBridge failed to start (no free bridge)", true);
+							}
+						}
+					}
+				}
+				else if (ev.type == AnchorClient::CallEvent::Incoming)
+				{
+					queueLog("[Telephony] Event: Incoming, participantId=" + ev.participantId +
+					         (ev.callerId.empty() ? "" : (", caller=" + ev.callerId)));
+					routeInboundAnchorCall(ev.participantId, ev.callerId);
+				}
+				else if (ev.type == AnchorClient::CallEvent::Dropped)
+				{
+					queueLog("[Telephony] Event: Dropped, participantId=" + ev.participantId);
+					// Terminate ONLY the session for THIS participant and stop just its
+					// media bridge (drawbridge's #100 fix — never the first anchor
+					// session found, which would tear down an unrelated concurrent call).
+					for (auto& [callId, session] : _sessions)
+					{
+						if (!session->isAnchor()) continue;
+						if (session->getAnchorParticipantId() != ev.participantId) continue;
+
+						if (MediaBridge* b = bridgeForParticipant(ev.participantId)) b->stopBridge();
+						const std::string activeIp = _localIp;
+						std::string localTag = session->getLocalTag();
+						if (localTag.empty()) localTag = IDGen::GenerateID(9); // defensive fallback
+
+						if (session->isAnchorInbound())
+						{
+							// INBOUND: we are the UAC toward the handset (dest). If it
+							// already ANSWERED (Connected, we hold its tag) -> BYE it; if
+							// still RINGING -> CANCEL our outstanding fork INVITEs instead.
+							// All sends use _asyncOutbox (this runs off the SIP thread).
+							auto handset = session->getDest();
+							if (handset && session->getState() == Session::State::Connected &&
+							    !session->getRemoteTag().empty())
+							{
+								const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+								const std::string srcNum = session->getSrc() ? session->getSrc()->getNumber() : std::string("PSTN");
+								const std::string fromHeader = "\"" + srcNum + "\" <sip:" + handset->getNumber() +
+								                               "@" + srcIpPort + ">;tag=" + localTag;
+								const std::string toHeader = "<sip:" + handset->getNumber() + "@" + activeIp +
+								                             ">;tag=" + session->getRemoteTag();
+								auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), callId,
+								                          fromHeader, toHeader);
+								if (bye) _asyncOutbox.emplace_back(handset->getAddress(), std::move(bye));
+							}
+							else
+							{
+								for (const auto& target : session->getPendingTargets())
+								{
+									auto cancel = buildInboundCancelTo(session, target);
+									if (cancel) _asyncOutbox.emplace_back(target->getAddress(), std::move(cancel));
+								}
+							}
+							std::string localCallId = callId;
+							endCall(localCallId, ev.participantId, handset ? handset->getNumber() : "",
+							        "anchor hangup (inbound)");
+							break;
+						}
+
+						// OUTBOUND: server is UAS; BYE the original caller (src). From
+						// carries the To-tag minted on the 180/200 — tag-strict handsets
+						// (Yealink) reject a BYE without it and stay off-hook on a dead call.
+						auto caller = session->getSrc();
+						auto inviteMsg = session->getInviteMessage();
+						if (caller && inviteMsg)
+						{
+							const std::string fromHeader = "<sip:" + std::string(inviteMsg->getToNumber()) +
+							                               "@" + activeIp + ">;tag=" + localTag;
+							auto bye = buildServerBye(caller->getNumber(), caller->getAddress(), callId,
+							                          fromHeader, std::string(inviteMsg->getFrom()));
+							if (bye) _asyncOutbox.emplace_back(caller->getAddress(), std::move(bye));
+						}
+
+						std::string localCallId = callId;
+						endCall(localCallId, session->getSrc() ? session->getSrc()->getNumber() : "",
+						        inviteMsg ? inviteMsg->getToNumber() : "", "anchor hangup");
+						break;
+					}
+				}
+			});
+		}
+
+		// start() runs SYNCHRONOUSLY for Loopback (unchanged from before this
+		// port — LoopbackAnchorClient::start() is a flag store, not I/O), but
+		// MUST run off this constructor's call stack for any other provider:
+		// TelephonyAnchorClient::start() does a full mbedTLS handshake
+		// (fetchToken) + WS connect, and blocking construction on that would
+		// stall boot. This branch (on bootType, not on platform) is a
+		// deliberate departure from drawbridge's constructor, which always
+		// spawns asynchronously regardless of provider: pocket-dial's own host
+		// suite (AnchorRouting_test.cpp) constructs a RequestsHandler and
+		// dials the 555 anchor extension on the very next line with no wait,
+		// which needs LoopbackAnchorClient::isConnected() true the instant the
+		// constructor returns — spawning even Loopback's start() onto a
+		// background thread/task races that assertion. Every test today gets
+		// bootType==Loopback (no active slot on a fresh _tapiConfig.load()),
+		// so this preserves their exact timing while still fixing the real
+		// hazard (blocking TLS in the constructor) for a real anchor.
+		if (bootType == TelephonyProviderType::Loopback)
+		{
+			if (_anchorClient->start())
+			{
+				queueLog("[Anchor] LOOPBACK client started");
+			}
+			else
+			{
+				queueLog("[Anchor] failed to start anchor client", true);
+			}
 		}
 		else
 		{
-			queueLog("[Anchor] failed to start anchor client", true);
+			// Spawn off this constructor's call stack exactly like drawbridge's
+			// constructor does — an ESP task with real stack headroom (12288:
+			// 4096 bootlooped on real hardware, fetchToken's TLS handshake
+			// needs the room), or a joined host thread (_anchorStartThread,
+			// joined in ~RequestsHandler — a detached thread here would
+			// capture `this` and could outlive the handler in the unit-test
+			// process).
+#if defined(ESP_PLATFORM) || defined(ESP32)
+			struct StartClientArg { AnchorClient* anchor; RequestsHandler* handler; };
+			auto* startArg = new StartClientArg{ _anchorClient, this };
+			xTaskCreate([](void* p) {
+				auto* sca = static_cast<StartClientArg*>(p);
+				if (sca->anchor->start())
+				{
+					std::lock_guard<std::mutex> lock(sca->handler->_mutex);
+					sca->handler->queueLog("[Anchor] client started");
+				}
+				else
+				{
+					std::lock_guard<std::mutex> lock(sca->handler->_mutex);
+					sca->handler->queueLog("[Anchor] failed to start anchor client", true);
+				}
+				delete sca;
+				vTaskDelete(NULL);
+			}, "tel_start", 12288, startArg, 5, NULL);
+#else
+			_anchorStartThread = std::thread([this]() {
+				if (_anchorClient->start())
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					queueLog("[Anchor] client started");
+				}
+				else
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					queueLog("[Anchor] failed to start anchor client", true);
+				}
+			});
+#endif
 		}
+	}
+}
+
+RequestsHandler::~RequestsHandler()
+{
+#if !defined(ESP_PLATFORM) && !defined(ESP32)
+	if (_anchorStartThread.joinable())
+	{
+		_anchorStartThread.join();
+	}
+	// Stage B: drain every outstanding asyncMakeCall/asyncDropCall/asyncAnswerCall
+	// host worker BEFORE the anchor client is stopped and this object starts
+	// tearing down — a still-running worker captured `this` and calls back into
+	// _mutex/queueLog/endCall on completion, all of which need a live handler.
+	reapAnchorWorkers(/*drainAll=*/true);
+#endif
+	// Stop the anchor BEFORE member destruction begins: LoopbackAnchorClient's
+	// simulation threads call back into this handler (locking _mutex, touching
+	// _sessions), and TelephonyAnchorClient's WS/media worker tasks are the same
+	// kind of risk now that Stage B wires its event callback for a real anchor —
+	// those members are destroyed before _loopbackClient/_telephonyAnchorClient
+	// themselves, so relying on their own destructors to stop cleanly would be a
+	// use-after-free (mirrors drawbridge's ~RequestsHandler exactly).
+	if (_anchorClient)
+	{
+		_anchorClient->stop();
 	}
 }
 
@@ -655,12 +980,24 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 
 	if (destNumber == kAnchorCallExt)
 	{
-		// CANCEL of an anchor-bridge dial-in: endCall() (below) drops the anchor-
-		// side leg and releases the MediaBridge — nothing extra needed here. In
-		// practice onAnchorInvite() answers synchronously (no ringing window), so
-		// this path is mostly defensive symmetry with 777/440/888 rather than a
-		// commonly-hit race.
-		endCall(data->getCallID(), data->getFromNumber(), kAnchorCallExt);
+		// CANCEL of an anchor-bridge dial-in. For Loopback (answers synchronously,
+		// no ringing window) this is mostly defensive symmetry with 777/440/888 —
+		// but a real anchor (Stage B) rings first via asyncMakeCall(), so a caller
+		// hanging up before the far leg connects is a real, commonly-hit race now.
+		// RFC 3261 §9.2: the CANCEL request itself gets its own 200 OK (separate
+		// from whatever final response, if any, the original INVITE transaction
+		// gets) — a UA that never sees this retransmits the CANCEL. endCall()
+		// (below) drops the anchor-side leg (async or sync, per
+		// anchorIsSynchronous()) and releases the MediaBridge.
+		auto response = getMessageFromPool(*data);
+		if (response)
+		{
+			response->setHeader(SipMessageTypes::OK);
+			response->clearBody();
+			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			_outbox.emplace_back(data->getSource(), std::move(response));
+		}
+		endCall(data->getCallID(), data->getFromNumber(), kAnchorCallExt, "handset CANCEL");
 		return;
 	}
 
@@ -711,6 +1048,14 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
+		return;
+	}
+	// Inbound anchor ring-all: a 487 is a forked loser's reply to the CANCEL sent
+	// when another leg won (or on teardown). Complete the cancelled INVITE
+	// transaction with an ACK — there is no caller to relay it to.
+	if (session.has_value() && session.value()->isAnchorInbound())
+	{
+		ackInboundFinal(session.value(), data);
 		return;
 	}
 	endHandle(data->getFromNumber(), data);
@@ -1454,6 +1799,30 @@ MediaBridge* RequestsHandler::acquireFreeAnchorBridge()
 	return nullptr;
 }
 
+MediaBridge* RequestsHandler::bridgeForParticipant(const std::string& participantId)
+{
+	if (participantId.empty()) return nullptr;
+	for (auto& b : _mediaBridges)
+	{
+		if (b.isFor(participantId)) return &b;
+	}
+	return nullptr;
+}
+
+bool RequestsHandler::allBridgesBusy() const
+{
+	for (const auto& b : _mediaBridges)
+	{
+		if (!b.isActive()) return false;
+	}
+	return true;
+}
+
+bool RequestsHandler::anchorIsSynchronous() const
+{
+	return _anchorBootType == TelephonyProviderType::Loopback;
+}
+
 void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller)
 {
@@ -1503,83 +1872,776 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 
-	MediaBridge* bridge = acquireFreeAnchorBridge();
-	if (!bridge)
+	if (anchorIsSynchronous())
 	{
-		// 503 + Retry-After, not 486 Busy Here: 486 means the CALLED PARTY is busy
-		// (a final "don't retry this number" answer), but here nothing about the
-		// dialed 555 code itself is busy — every anchor bridge SLOT is. 503 tells
-		// the caller's UA this is a temporary capacity condition, matching what
-		// the equivalent WAN-anchor wiring in the sibling commercial product does
-		// for the same reason.
+		// Loopback: unchanged from before Stage B. makeCall()/dropCall() are cheap,
+		// bounded (~40 ms) thread-joins, so calling them directly under _mutex is
+		// safe (see anchorIsSynchronous()'s doc comment) — answer synchronously,
+		// exactly as AnchorRouting_test.cpp requires.
+		MediaBridge* bridge = acquireFreeAnchorBridge();
+		if (!bridge)
+		{
+			// 503 + Retry-After, not 486 Busy Here: 486 means the CALLED PARTY is busy
+			// (a final "don't retry this number" answer), but here nothing about the
+			// dialed 555 code itself is busy — every anchor bridge SLOT is. 503 tells
+			// the caller's UA this is a temporary capacity condition, matching what
+			// the equivalent WAN-anchor wiring in the sibling commercial product does
+			// for the same reason.
+			refuse("SIP/2.0 503 Service Unavailable", "every anchor bridge slot busy");
+			return;
+		}
+
+		// makeCall() before startBridge(): a bridge with no far side to carry audio to
+		// is pointless to stand up. `destination` here is the CALLER's own number, not
+		// a dialed digit string — 555 is a fixed feature code (like 777/440/888), so
+		// there is nothing after it to strip the way a trunk-access prefix would; a
+		// real AnchorClient's own configuration decides where the bridged audio
+		// actually goes (a recording line, an AI pipeline, a monitored DN, ...), and
+		// `destination` just tells it who is calling in. LoopbackAnchorClient resolves
+		// its own leg (ownLeg) SYNCHRONOUSLY, before any Ringing/Answered event, so it
+		// can be bound to the bridge right away (see its doc comment).
+		std::string ownLeg;
+		if (!_anchorClient->makeCall(std::string(caller->getNumber()), &ownLeg))
+		{
+			refuse("SIP/2.0 503 Service Unavailable", "anchor declined makeCall");
+			return;
+		}
+
+		if (!bridge->startBridge(destIp, destPort, callID, ownLeg))
+		{
+			_anchorClient->dropCall(ownLeg);
+			refuse("SIP/2.0 503 Service Unavailable", "media bridge failed to start");
+			return;
+		}
+
+		auto newSession = allocateSession(callID, caller);
+		if (!newSession)
+		{
+			bridge->stopBridge();
+			_anchorClient->dropCall(ownLeg);
+			refuse("SIP/2.0 503 Service Unavailable", "session pool full");
+			return;
+		}
+
+		// Draw the answer BEFORE publishing the session — same "a pool refusal must
+		// never strand a call that already mutated state" reasoning as onConferenceInvite
+		// above. The SDP advertises THIS BRIDGE's receive port (not any other slot's):
+		// that is where the handset must send its audio for the anchor to hear it.
+		const std::string toTag = IDGen::GenerateID(9);
+		const std::string sdpBody = buildMediaSdp(activeIp, bridge->receiverPort(), /*sendrecv=*/true);
+		auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
+		if (!ok)
+		{
+			bridge->stopBridge();
+			_anchorClient->dropCall(ownLeg);
+			queueLog("555 anchor: message pool exhausted, call unwound", true);
+			return;
+		}
+
+		// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
+		// call can't overwrite this call's destination identity.
+		auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
+		newSession->setDest(dummyAnchor);
+		newSession->setAnchor(true);
+		newSession->setAnchorParticipantId(ownLeg);
+		_sessions.emplace(callID, newSession);
+		newSession->setState(Session::State::Connected);
+
+		_outbox.emplace_back(data->getSource(), std::move(ok));
+
+		queueLog("555 anchor: " + std::string(caller->getNumber()) + " bridged (participant "
+			+ ownLeg + "), media to " + destIp + ":" + std::to_string(destPort));
+		return;
+	}
+
+	// A real WAN-anchor client (Stage B): admission is capacity-only here —
+	// makeCall() is a blocking TLS HTTP round trip (see anchorIsSynchronous()'s
+	// doc comment), so it must never run under _mutex the way the synchronous
+	// branch above does. startBridge() itself is deferred to the CallEvent::
+	// Answered callback, once asyncMakeCall()'s worker actually returns a
+	// participant id and the handset's RTP destination is still worth honoring.
+	if (allBridgesBusy())
+	{
 		refuse("SIP/2.0 503 Service Unavailable", "every anchor bridge slot busy");
-		return;
-	}
-
-	// makeCall() before startBridge(): a bridge with no far side to carry audio to
-	// is pointless to stand up. `destination` here is the CALLER's own number, not
-	// a dialed digit string — 555 is a fixed feature code (like 777/440/888), so
-	// there is nothing after it to strip the way a trunk-access prefix would; a
-	// real AnchorClient's own configuration decides where the bridged audio
-	// actually goes (a recording line, an AI pipeline, a monitored DN, ...), and
-	// `destination` just tells it who is calling in. LoopbackAnchorClient resolves
-	// its own leg (ownLeg) SYNCHRONOUSLY, before any Ringing/Answered event, so it
-	// can be bound to the bridge right away (see its doc comment).
-	std::string ownLeg;
-	if (!_anchorClient->makeCall(std::string(caller->getNumber()), &ownLeg))
-	{
-		refuse("SIP/2.0 503 Service Unavailable", "anchor declined makeCall");
-		return;
-	}
-
-	if (!bridge->startBridge(destIp, destPort, callID, ownLeg))
-	{
-		_anchorClient->dropCall(ownLeg);
-		refuse("SIP/2.0 503 Service Unavailable", "media bridge failed to start");
 		return;
 	}
 
 	auto newSession = allocateSession(callID, caller);
 	if (!newSession)
 	{
-		bridge->stopBridge();
-		_anchorClient->dropCall(ownLeg);
 		refuse("SIP/2.0 503 Service Unavailable", "session pool full");
 		return;
 	}
 
-	// Draw the answer BEFORE publishing the session — same "a pool refusal must
-	// never strand a call that already mutated state" reasoning as onConferenceInvite
-	// above. The SDP advertises THIS BRIDGE's receive port (not any other slot's):
-	// that is where the handset must send its audio for the anchor to hear it.
-	const std::string toTag = IDGen::GenerateID(9);
-	const std::string sdpBody = buildMediaSdp(activeIp, bridge->receiverPort(), /*sendrecv=*/true);
-	auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
-	if (!ok)
+	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
+	// call can't overwrite this call's destination identity; also what the ordinary
+	// isDialogSourceAuthorized() BYE/CANCEL leg-IP check compares against (its
+	// address is the caller's own, matching src — see that function's comment).
+	auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
+	newSession->setDest(dummyAnchor);
+	newSession->setInviteMessage(data);
+	newSession->setAnchor(true);
+	newSession->setState(Session::State::Invited);
+	const std::string localTag = IDGen::GenerateID(9);
+	newSession->setLocalTag(localTag);
+	newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
+	_sessions.emplace(callID, newSession);
+
+	auto ringing = getMessageFromPool(*data);
+	if (ringing)
 	{
-		bridge->stopBridge();
-		_anchorClient->dropCall(ownLeg);
-		queueLog("555 anchor: message pool exhausted, call unwound", true);
+		ringing->setHeader(SipMessageTypes::RINGING);
+		ringing->clearBody();
+		ringing->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		ringing->setTo(std::string(data->getTo()) + ";tag=" + localTag);
+		ringing->setContact(buildContact(kAnchorCallExt));
+		_outbox.emplace_back(data->getSource(), std::move(ringing));
+	}
+
+	// `destination` here is the CALLER's own number, not a dialed digit string —
+	// see the synchronous branch's comment above for why. Dispatched off the SIP
+	// thread; the 200 OK follows later from the CallEvent::Answered callback once
+	// the far leg actually connects.
+	asyncMakeCall(std::string(caller->getNumber()), callID, caller->getNumber());
+	queueLog("555 anchor: " + std::string(caller->getNumber()) + " ringing (async makeCall dispatched)");
+}
+
+// ── Anchor async wrappers (Stage B) ──────────────────────────────────────────
+
+void RequestsHandler::bindOutboundParticipant(const std::string& callId, const std::string& ownLeg)
+{
+	if (callId.empty() || ownLeg.empty()) return;
+	std::lock_guard<std::mutex> lock(_mutex);
+	auto it = _sessions.find(callId);
+	if (it != _sessions.end() && it->second && it->second->isAnchor())
+	{
+		it->second->setAnchorParticipantId(ownLeg);
+	}
+}
+
+void RequestsHandler::asyncMakeCall(const std::string& destination, const std::string& callId,
+	const std::string& callerNumber)
+{
+	if (!_anchorClient) return;
+#if defined(ESP_PLATFORM) || defined(ESP32)
+	struct MakeCallArg
+	{
+		AnchorClient* anchor;
+		std::string dest;
+		std::string callId;
+		std::string callerNumber;
+		RequestsHandler* handler;
+	};
+	auto* arg = new MakeCallArg{ _anchorClient, destination, callId, callerNumber, this };
+	// 12288: makeCall is a TLS HTTPS round trip — same overflow as tel_start's
+	// fetchToken (4096 bootlooped on real hardware).
+	// CHECK the spawn: under heap pressure during an active call the 12 KB PSRAM
+	// stack can fail to allocate; the outbound worker then never runs and the
+	// call is silently never placed. Surface that (and free the arg) instead of
+	// a silent, phantom non-call — mirrors asyncDropCall's check exactly.
+	if (xTaskCreateWithCaps([](void* p) {
+		auto* mca = static_cast<MakeCallArg*>(p);
+		std::string ownLeg;
+		if (!mca->anchor->makeCall(mca->dest, &ownLeg))
+		{
+			std::lock_guard<std::mutex> lock(mca->handler->_mutex);
+			mca->handler->queueLog("[Telephony] Failed to initiate outbound call to " + mca->dest, true);
+			mca->handler->endCall(mca->callId, mca->callerNumber, mca->dest, "anchor call fail");
+		}
+		else
+		{
+			// Bind this origination's own leg to its session NOW (locks _mutex
+			// internally) so a later Answered/Dropped maps to the right call when
+			// several are in flight.
+			mca->handler->bindOutboundParticipant(mca->callId, ownLeg);
+			std::lock_guard<std::mutex> lock(mca->handler->_mutex);
+			mca->handler->queueLog("[Telephony] Initiating outbound call to " + mca->dest);
+		}
+		delete mca;
+		vTaskDeleteWithCaps(NULL);   // created WithCaps(PSRAM)
+	}, "tel_makecall", 12288, arg, 5, NULL, PD_TASK_STACK_CAPS) != pdPASS)
+	{
+		queueLog("[Telephony] asyncMakeCall: outbound worker xTaskCreate FAILED (heap exhausted) — call NOT placed", true);
+		delete arg;
+	}
+#else
+	spawnAnchorWorker([this, destination, callId, callerNumber]() {
+		std::string ownLeg;
+		if (!_anchorClient->makeCall(destination, &ownLeg))
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			queueLog("[Telephony] Failed to initiate outbound call to " + destination, true);
+			endCall(callId, callerNumber, destination, "anchor call fail");
+		}
+		else
+		{
+			bindOutboundParticipant(callId, ownLeg);   // locks _mutex itself
+			std::lock_guard<std::mutex> lock(_mutex);
+			queueLog("[Telephony] Initiating outbound call to " + destination);
+		}
+	});
+#endif
+}
+
+void RequestsHandler::asyncDropCall(const std::string& participantId)
+{
+	if (!_anchorClient) return;
+#if defined(ESP_PLATFORM) || defined(ESP32)
+	struct DropCallArg
+	{
+		AnchorClient* anchor;
+		std::string partId;
+		RequestsHandler* handler;
+	};
+	auto* arg = new DropCallArg{ _anchorClient, participantId, this };
+	// CHECK the spawn: under heap pressure during an active call the 12 KB PSRAM
+	// stack can fail to allocate; the drop worker then never runs and the far leg
+	// never tears down. Surface that (and free the arg) instead of a silent,
+	// phantom non-drop.
+	if (xTaskCreateWithCaps([](void* p) {
+		auto* dca = static_cast<DropCallArg*>(p);
+		dca->anchor->dropCall(dca->partId);
+		delete dca;
+		vTaskDeleteWithCaps(NULL);
+	}, "tel_dropcall", 12288, arg, 5, NULL, PD_TASK_STACK_CAPS) != pdPASS)
+	{
+		queueLog("[Telephony] asyncDropCall: drop worker xTaskCreate FAILED (heap exhausted) — leg NOT dropped", true);
+		delete arg;
+	}
+#else
+	spawnAnchorWorker([this, participantId]() {
+		_anchorClient->dropCall(participantId);
+	});
+#endif
+}
+
+void RequestsHandler::asyncAnswerCall(const std::string& participantId)
+{
+	// Answer an inbound upstream participant off the SIP thread (the POST is a
+	// TLS round trip). Mirrors asyncDropCall's threading/lifetime rules exactly.
+	if (!_anchorClient) return;
+#if defined(ESP_PLATFORM) || defined(ESP32)
+	struct AnswerCallArg
+	{
+		AnchorClient* anchor;
+		std::string partId;
+		RequestsHandler* handler;
+	};
+	auto* arg = new AnswerCallArg{ _anchorClient, participantId, this };
+	// CHECK the spawn: same heap-pressure hazard asyncDropCall's own comment
+	// describes -- without this check a failed allocation leaks `arg` and
+	// silently never answers the call.
+	if (xTaskCreateWithCaps([](void* p) {
+		auto* aca = static_cast<AnswerCallArg*>(p);
+		if (!aca->anchor->answerCall(aca->partId))
+		{
+			std::lock_guard<std::mutex> lock(aca->handler->_mutex);
+			aca->handler->queueLog("[Telephony] Failed to answer inbound participant " + aca->partId, true);
+		}
+		delete aca;
+		vTaskDeleteWithCaps(NULL);
+	}, "tel_answer", 12288, arg, 5, NULL, PD_TASK_STACK_CAPS) != pdPASS)
+	{
+		queueLog("[Telephony] asyncAnswerCall: answer worker xTaskCreate FAILED (heap exhausted) — participant NOT answered", true);
+		delete arg;
+	}
+#else
+	spawnAnchorWorker([this, participantId]() {
+		if (!_anchorClient->answerCall(participantId))
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			queueLog("[Telephony] Failed to answer inbound participant " + participantId, true);
+		}
+	});
+#endif
+}
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32)
+// Spawn a host anchor worker that runs `job` then flips its done-flag. The flag
+// lets reapAnchorWorkers() join+erase finished threads in tick(), so the live
+// thread count tracks in-flight calls rather than growing without bound. Also
+// reaped opportunistically here, so a steady call rate never lets the vector grow.
+void RequestsHandler::spawnAnchorWorker(std::function<void()> job)
+{
+	auto done = std::make_shared<std::atomic<bool>>(false);
+	std::thread worker([job = std::move(job), done]() {
+		job();
+		done->store(true, std::memory_order_release);
+	});
+	std::lock_guard<std::mutex> lock(_anchorWorkMutex);
+	reapFinishedLocked();   // reap already-finished siblings before appending
+	_anchorWorkThreads.push_back(AnchorWorker{ std::move(worker), std::move(done) });
+}
+
+// Caller MUST hold _anchorWorkMutex. Join + erase every worker whose done-flag
+// is set.
+void RequestsHandler::reapFinishedLocked()
+{
+	for (auto it = _anchorWorkThreads.begin(); it != _anchorWorkThreads.end(); )
+	{
+		if (it->done && it->done->load(std::memory_order_acquire))
+		{
+			if (it->thread.joinable()) it->thread.join();
+			it = _anchorWorkThreads.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+}
+
+// Called from tick(): reap finished anchor workers. drainAll blocks until every
+// worker has finished (the destructor's belt-and-suspenders join).
+void RequestsHandler::reapAnchorWorkers(bool drainAll)
+{
+	std::vector<AnchorWorker> toJoin;
+	{
+		std::lock_guard<std::mutex> lock(_anchorWorkMutex);
+		if (drainAll)
+		{
+			toJoin = std::move(_anchorWorkThreads);
+			_anchorWorkThreads.clear();
+		}
+		else
+		{
+			reapFinishedLocked();
+			return;
+		}
+	}
+	// drainAll: join OUTSIDE the lock, so a still-running worker that ever needed
+	// _anchorWorkMutex (it doesn't today, but be safe) can't deadlock us.
+	for (auto& w : toJoin)
+	{
+		if (w.thread.joinable()) w.thread.join();
+	}
+}
+#endif
+
+// ── Inbound anchor call dispatch (Stage B) ───────────────────────────────────
+
+void RequestsHandler::routeInboundAnchorCall(const std::string& participantId, const std::string& callerId)
+{
+	// Runs under _mutex (the CallEvent callback holds it). The monitored DN
+	// (_anchorRouteDn) is a Telephony route point, not a phone, so the DEFAULT is
+	// RING-ALL: fork an offerless INVITE to every registered extension, first
+	// answer wins. _anchorRouteDn is only the gate that says this anchor is
+	// configured to take inbound calls at all — TelephonyAnchorClient's own
+	// handleWsEvent() already gates every WS event on the entity's dn matching
+	// this exact string before the event ever reaches here (an event for any
+	// other dn is silently dropped inside the client itself), so there is
+	// nothing left here to key on except "is one configured".
+	const std::string& dn = _anchorRouteDn;
+	if (dn.empty())
+	{
+		queueLog("[Telephony] Inbound: no route DN configured — dropping participant " + participantId, true);
+		asyncDropCall(participantId);
 		return;
 	}
 
-	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
-	// call can't overwrite this call's destination identity.
-	auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
-	newSession->setDest(dummyAnchor);
-	_sessions.emplace(callID, newSession);
-	newSession->setState(Session::State::Connected);
+	if (allBridgesBusy())
+	{
+		queueLog("[Telephony] Inbound: all media bridges busy — dropping inbound to " + dn);
+		asyncDropCall(participantId);
+		return;
+	}
 
-	_outbox.emplace_back(data->getSource(), std::move(ok));
+	// Refuse a second inbound while one is already ringing/up (keyed by the
+	// inbound flag) — POCKETDIAL_MAX_ANCHOR_CALLS is 1 today, so allBridgesBusy()
+	// above would already have caught this once the first leg is BRIDGED, but a
+	// still-ringing (not yet bridged) first inbound leg holds no bridge yet.
+	for (const auto& [cid, s] : _sessions)
+	{
+		if (s->isAnchorInbound() && s->getState() != Session::State::Bye)
+		{
+			queueLog("[Telephony] Inbound: a call is already in progress — dropping new inbound");
+			asyncDropCall(participantId);
+			return;
+		}
+	}
 
-	queueLog("555 anchor: " + std::string(caller->getNumber()) + " bridged (participant "
-		+ ownLeg + "), media to " + destIp + ":" + std::to_string(destPort));
+	// ── Track A's DID -> extension hook ──────────────────────────────────────
+	// DidMapping is a bounded, no-I/O, no-heap linear scan over at most
+	// POCKETDIAL_MAX_DID_MAPPINGS entries — safe to call directly under _mutex,
+	// the same as any other small in-memory config lookup on this codebase's
+	// dashboard/config tables (unlike makeCall/dropCall/answerCall, which must go
+	// through the async* wrappers because THEY do TLS I/O; this does neither).
+	// DidMapping's "did" field is entered by the operator as the LITERAL route DN
+	// string, not a free-form DID/DDI — matching the note above that
+	// TelephonyAnchorClient's own handleWsEvent() already filters to exactly this
+	// dn, so no normalization/E.164-suffix matching is meaningful here either.
+	std::string mappedExt = _didMapping.extensionForDid(dn);
+	std::vector<std::shared_ptr<SipClient>> targets;
+	if (!mappedExt.empty())
+	{
+		auto mapped = findClient(mappedExt);
+		if (mapped.has_value() && !(*mapped)->getNumber().empty())
+		{
+			targets.push_back(*mapped);
+		}
+		else
+		{
+			queueLog("[Telephony] Inbound: DID " + dn + " maps to extension " +
+			         mappedExt + " but it is not registered — falling back to ring-all", true);
+		}
+	}
+	if (targets.empty())
+	{
+		// RING-ALL fallback: gather the live registrar set. We hold _mutex, so
+		// reading _clientPool directly is safe (an empty number ⇒ free pool slot).
+		for (const auto& client : _clientPool)
+		{
+			if (!client->getNumber().empty())
+			{
+				targets.push_back(client);
+			}
+		}
+	}
+	if (targets.empty())
+	{
+		queueLog("[Telephony] Inbound: no extensions registered — dropping participant " + participantId, true);
+		asyncDropCall(participantId);
+		return;
+	}
+
+	// Sanitised caller label for the From display-name (quoted token: no '"'/CR/LF).
+	std::string callerDisplay = callerId.empty() ? std::string("PSTN") : callerId;
+	callerDisplay.erase(std::remove_if(callerDisplay.begin(), callerDisplay.end(),
+		[](char c){ return c == '"' || c == '\r' || c == '\n'; }), callerDisplay.end());
+	if (callerDisplay.empty()) callerDisplay = "PSTN";
+
+	const std::string activeIp = _localIp;
+	// Key the session by the FULL header-line form ("Call-ID: <id>") so the
+	// handsets' 200 OK/486/487 responses — which getSession() looks up via
+	// SipMessage::getCallID() (which returns the whole line, name included) —
+	// match. The forked INVITEs carry the bare <id> as the header value
+	// (stripHeaderName on the getter), which the phones echo back verbatim.
+	std::string callId  = std::string("Call-ID: ") + IDGen::GenerateID(16) + "@" + activeIp;
+	std::string branch  = "z9hG4bK" + IDGen::GenerateID(12);
+	std::string fromTag = IDGen::GenerateID(9);
+
+	// One session backs the whole fork: a synthetic PSTN src (zeroed address —
+	// only its label feeds getSrc() snapshots/CDR, never routed/looked-up), with
+	// every forked leg sharing the Call-ID/Via branch/From-tag so each is a
+	// single cancellable transaction toward its phone. dest stays unset until a
+	// winner answers; pendingTargets holds the ringing legs.
+	sockaddr_in pstnAddr{};
+	pstnAddr.sin_family = AF_INET;
+	auto pstn = allocateVirtualPeer(callerDisplay, pstnAddr);
+	auto session = allocateSession(callId, pstn);
+	if (!session)
+	{
+		queueLog("[Telephony] Inbound: session pool exhausted — dropping", true);
+		asyncDropCall(participantId);
+		return;
+	}
+	session->setAnchor(true);
+	session->setAnchorInbound(true);
+	session->setState(Session::State::Invited);
+	session->setLocalTag(fromTag);
+	session->setUacBranch(branch);
+	session->setAnchorParticipantId(participantId);
+	session->setPendingTargets(targets);
+	session->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
+	_sessions.emplace(callId, session);
+
+	// Delayed-offer INVITE per target (no SDP): the single-start MediaBridge
+	// can't advertise a port before it binds, and the winning handset's 200 OK
+	// carries its own offer — our ACK answers it (onInboundAnchorOk). No
+	// auto-answer headers: the extensions should genuinely RING.
+	for (const auto& target : targets)
+	{
+		buildInboundInviteFork(session, target, callerDisplay);
+	}
+	queueLog("[Telephony] Inbound: ringing " + std::to_string(targets.size()) +
+	         " extension(s) for participant " + participantId +
+	         (mappedExt.empty() ? " (ring-all)" : (" (DID-mapped to " + mappedExt + ")")));
+}
+
+void RequestsHandler::buildInboundInviteFork(const std::shared_ptr<Session>& session,
+	const std::shared_ptr<SipClient>& target, const std::string& callerDisplay)
+{
+	// One delayed-offer INVITE toward `target`, reusing the session's shared
+	// Call-ID/Via branch/From-tag. The dialog's From/To/Contact user is the
+	// target's own DN (matched verbatim when it answers/cancels); the display
+	// name presents the anchor's caller.
+	const std::string activeIp = _localIp;
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	const std::string dn = target->getNumber();
+	const std::string destIpPort = sipwire::addrToIpPort(target->getAddress());
+
+	std::ostringstream ss;
+	ss << "INVITE sip:" << dn << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << session->getUacBranch() << "\r\n"
+	   << "From: \"" << callerDisplay << "\" <sip:" << dn << "@" << srcIpPort << ">;tag=" << session->getLocalTag() << "\r\n"
+	   << "To: <sip:" << dn << "@" << activeIp << ">\r\n"
+	   << "Call-ID: " << stripHeaderName(session->getCallID()) << "\r\n"   // getCallID() returns the full line
+	   << "CSeq: 1 INVITE\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Contact: <sip:" << dn << "@" << srcIpPort << ";transport=UDP>\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+
+	auto invite = getMessageFromPool(ss.str(), target->getAddress());
+	if (!invite) return;   // pool exhausted: skip this target (#101A)
+	invite->syncContentLength();
+	// The CallEvent callback runs OFF the SIP receive thread — _asyncOutbox
+	// survives the per-pass _outbox.clear() in handle()/tick() (same rule as the
+	// WS 200 OK/BYE the Answered/Dropped branches use).
+	_asyncOutbox.emplace_back(target->getAddress(), std::move(invite));
+}
+
+std::shared_ptr<SipMessage> RequestsHandler::buildInboundCancelTo(const std::shared_ptr<Session>& session,
+	const std::shared_ptr<SipClient>& target)
+{
+	if (!target) return nullptr;
+
+	const std::string activeIp = _localIp;
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	const std::string dn = target->getNumber();
+	const std::string destIpPort = sipwire::addrToIpPort(target->getAddress());
+	// The fork INVITE's From display is the anchor's caller label, which is
+	// exactly the virtual src peer's number — so getSrc()->getNumber()
+	// reproduces it byte-for-byte for the match.
+	const std::string srcNum = session->getSrc() ? session->getSrc()->getNumber() : std::string("PSTN");
+
+	// CANCEL matches the forked INVITE transaction at `target`: identical
+	// Request-URI, top Via branch (shared by the whole fork), From (+tag), To (no
+	// tag — no final response was accepted), Call-ID, and CSeq number with method
+	// CANCEL.
+	std::ostringstream cs;
+	cs << "CANCEL sip:" << dn << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << session->getUacBranch() << "\r\n"
+	   << "From: \"" << srcNum << "\" <sip:" << dn << "@" << srcIpPort << ">;tag=" << session->getLocalTag() << "\r\n"
+	   << "To: <sip:" << dn << "@" << activeIp << ">\r\n"
+	   << "Call-ID: " << stripHeaderName(session->getCallID()) << "\r\n"   // getCallID() returns the full line
+	   << "CSeq: 1 CANCEL\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+	return getMessageFromPool(cs.str(), target->getAddress());
+}
+
+std::shared_ptr<SipMessage> RequestsHandler::buildInboundCancel(const std::shared_ptr<Session>& session)
+{
+	// Back-compat single-leg wrapper: CANCEL the session's current dest (the
+	// answered/answering handset). Ring-all loser teardown uses
+	// buildInboundCancelTo() directly per target instead.
+	return buildInboundCancelTo(session, session->getDest());
+}
+
+void RequestsHandler::ackInboundFinal(const std::shared_ptr<Session>& session, const std::shared_ptr<SipMessage>& data)
+{
+	// RFC 3261 §17.1.1.3: ACK a non-2xx final within the INVITE transaction. Same
+	// top Via branch as the forked INVITE (the shared fork branch), To from the
+	// response (carries the leg's tag), CSeq 1 ACK. The responding phone is the
+	// packet source.
+	const std::string activeIp = _localIp;
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	const std::string dn(data->getToNumber());
+	const std::string destIpPort = sipwire::addrToIpPort(data->getSource());
+	const std::string srcNum = session->getSrc() ? session->getSrc()->getNumber() : std::string("PSTN");
+
+	std::ostringstream ack;
+	ack << "ACK sip:" << dn << "@" << destIpPort << " SIP/2.0\r\n"
+	    << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << session->getUacBranch() << "\r\n"
+	    << "From: \"" << srcNum << "\" <sip:" << dn << "@" << srcIpPort << ">;tag=" << session->getLocalTag() << "\r\n"
+	    << "To: " << stripHeaderName(data->getTo()) << "\r\n"
+	    << "Call-ID: " << stripHeaderName(session->getCallID()) << "\r\n"   // getCallID() returns the full line
+	    << "CSeq: 1 ACK\r\n"
+	    << "Max-Forwards: 70\r\n"
+	    << "Content-Length: 0\r\n\r\n";
+	auto msg = getMessageFromPool(ack.str(), data->getSource());
+	if (msg) _outbox.emplace_back(data->getSource(), std::move(msg));
+}
+
+void RequestsHandler::onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, const std::shared_ptr<Session>& session)
+{
+	// The handset answered our INVITE (server-as-UAC). Learn its tag + RTP, bring
+	// up the media bridge, ACK with our SDP answer (delayed-offer model), then
+	// answer upstream. Runs on the SIP receive thread under _mutex.
+	session->clearRingTimer();
+
+	const std::string activeIp = _localIp;
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	const std::string callId(session->getCallID());          // full line — the _sessions key
+	const std::string callIdHdr = stripHeaderName(callId);   // bare value for the wire
+
+	// RING-ALL: dest is unset until a forked leg answers. The answering phone IS
+	// the OK's source address, so resolve it (mirrors the broadcast winner
+	// lookup); fall back to a previously-bound dest for the winner's own 200 OK
+	// retransmits.
+	auto answering = findClientByAddress(ok->getSource());
+	std::shared_ptr<SipClient> handset = answering.has_value() ? answering.value() : session->getDest();
+	if (!handset)
+	{
+		return;   // can't identify the answering extension — ignore
+	}
+
+	// Loser-race: a DIFFERENT extension answered after another leg already won
+	// and bridged (its 200 OK crossed our CANCEL). RFC 3261 §9 — we must ACK then
+	// BYE that orphan 2xx, but must NOT disturb the live bridge or the upstream
+	// leg.
+	if (session->getState() == Session::State::Connected &&
+	    session->getDest() && handset->getNumber() != session->getDest()->getNumber())
+	{
+		const std::string orphanIpPort = sipwire::addrToIpPort(handset->getAddress());
+		const std::string orphanFrom = "\"" + (session->getSrc() ? session->getSrc()->getNumber() : std::string("PSTN")) +
+		                               "\" <sip:" + handset->getNumber() + "@" + srcIpPort + ">;tag=" + session->getLocalTag();
+		const std::string orphanAckBranch = "z9hG4bK" + IDGen::GenerateID(12);
+		std::ostringstream oack;
+		oack << "ACK sip:" << handset->getNumber() << "@" << orphanIpPort << " SIP/2.0\r\n"
+		     << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << orphanAckBranch << "\r\n"
+		     << "From: " << orphanFrom << "\r\n"
+		     << "To: " << stripHeaderName(ok->getTo()) << "\r\n"
+		     << "Call-ID: " << callIdHdr << "\r\n"
+		     << "CSeq: 1 ACK\r\n"
+		     << "Max-Forwards: 70\r\n"
+		     << "Content-Length: 0\r\n\r\n";
+		auto oackMsg = getMessageFromPool(oack.str(), handset->getAddress());
+		if (oackMsg) _outbox.emplace_back(handset->getAddress(), std::move(oackMsg));
+		auto obye = buildServerBye(handset->getNumber(), handset->getAddress(), callId, orphanFrom,
+		                           std::string(ok->getTo()));
+		if (obye) _outbox.emplace_back(handset->getAddress(), std::move(obye));
+		queueLog("[Telephony] Inbound: extra answer from " + handset->getNumber() + " — rejected (call already up)");
+		return;
+	}
+
+	// First answer wins: bind this phone as the dialog's dest for the rest of the call.
+	if (!session->getDest())
+	{
+		session->setDest(handset);
+	}
+
+	// Handset's To-tag — needed on every in-dialog request we now send (ACK, BYE).
+	std::string toHdr(ok->getTo());
+	std::string remoteTag;
+	size_t tp = toHdr.find(";tag=");
+	if (tp != std::string::npos)
+	{
+		remoteTag = toHdr.substr(tp + 5);
+		size_t e = remoteTag.find_first_of(";> \r\n\t");
+		if (e != std::string::npos) remoteTag.erase(e);
+	}
+	session->setRemoteTag(remoteTag);
+
+	// Rebuild the dialog's local From verbatim (display = src label, user = DN,
+	// our tag) so ACK/BYE match the INVITE. To = the phone's full To header
+	// (carries its tag).
+	const std::string fromHeader = "\"" + (session->getSrc() ? session->getSrc()->getNumber() : std::string("PSTN")) +
+	                               "\" <sip:" + handset->getNumber() + "@" + srcIpPort + ">;tag=" + session->getLocalTag();
+	const std::string destIpPort = sipwire::addrToIpPort(handset->getAddress());
+
+	// Idempotency: the phone retransmits its 200 OK until it sees our ACK. The
+	// FIRST one (still Invited) brings up the bridge and answers upstream; a
+	// retransmit arriving after we are Connected must ONLY re-emit the ACK (with
+	// the same answer) — never start a second bridge (which would fail and tear
+	// the live call down).
+	const bool already = (session->getState() == Session::State::Connected);
+	std::string handsetIp; uint16_t handsetPort = 0;
+	std::string sdpAnswer;
+	bool bridged = false;
+	const std::string inPart = session->getAnchorParticipantId();
+	if (already)
+	{
+		// Re-ACK retransmit — reuse THIS call's already-up bridge.
+		if (MediaBridge* b = bridgeForParticipant(inPart))
+		{
+			sdpAnswer = buildMediaSdp(activeIp, b->receiverPort(), /*sendrecv=*/true);
+			bridged = true;   // re-ACK only; bridge already up
+		}
+	}
+	else if (parseCallerRtp(ok, handsetIp, handsetPort))
+	{
+		// Claim a free media bridge for this inbound call.
+		MediaBridge* b = bridgeForParticipant(inPart);
+		if (!b) b = acquireFreeAnchorBridge();
+		if (b && b->startBridge(handsetIp, handsetPort, callId, inPart))
+		{
+			const int rxPort = b->receiverPort();
+			sdpAnswer = buildMediaSdp(activeIp, rxPort, /*sendrecv=*/true);
+			bridged = true;
+			queueLog("[Telephony] Inbound: handset " + handsetIp + ":" + std::to_string(handsetPort) +
+			         " answered; bridge up (rx " + std::to_string(rxPort) + ")");
+		}
+	}
+	else
+	{
+		queueLog("[Telephony] Inbound: no usable SDP / bridge failed — tearing down", true);
+	}
+
+	// ACK the 2xx (RFC 3261 §13.2.2.4): a NEW transaction branch, CSeq 1 ACK.
+	// Carries our SDP answer on success; on failure it is sent bodyless purely to
+	// quench the phone's 200 retransmits before we BYE it.
+	const std::string ackBranch = "z9hG4bK" + IDGen::GenerateID(12);
+	std::ostringstream ack;
+	ack << "ACK sip:" << handset->getNumber() << "@" << destIpPort << " SIP/2.0\r\n"
+	    << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << ackBranch << "\r\n"
+	    << "From: " << fromHeader << "\r\n"
+	    << "To: " << stripHeaderName(ok->getTo()) << "\r\n"
+	    << "Call-ID: " << callIdHdr << "\r\n"
+	    << "CSeq: 1 ACK\r\n"
+	    << "Max-Forwards: 70\r\n";
+	if (bridged && !sdpAnswer.empty())
+	{
+		ack << "Content-Type: application/sdp\r\n"
+		    << "Content-Length: " << sdpAnswer.size() << "\r\n\r\n"
+		    << sdpAnswer;
+	}
+	else
+	{
+		ack << "Content-Length: 0\r\n\r\n";
+	}
+	auto ackMsg = getMessageFromPool(ack.str(), handset->getAddress());
+	if (ackMsg) _outbox.emplace_back(handset->getAddress(), std::move(ackMsg));
+
+	if (already)
+	{
+		return;   // retransmitted 200 OK: ACK re-sent, nothing else to do
+	}
+
+	if (!bridged)
+	{
+		// Couldn't bridge: hang up both legs. BYE the handset (new CSeq 2
+		// transaction), drop the upstream participant, end the session.
+		auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), callId, fromHeader,
+		                          std::string(ok->getTo()));
+		if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
+		asyncDropCall(session->getAnchorParticipantId());
+		endCall(callId, session->getSrc() ? session->getSrc()->getNumber() : "", handset->getNumber(),
+		        "inbound bridge failed");
+		return;
+	}
+
+	session->setState(Session::State::Connected);
+	// Tell the upstream to connect the PSTN leg; its Connected upsert opens the
+	// PCM streams (startMediaStreams) so audio flows handset RTP <-> bridge <-> PCM <-> upstream.
+	asyncAnswerCall(session->getAnchorParticipantId());
+
+	// RING-ALL: this leg won — CANCEL every other still-ringing fork so the other
+	// phones stop. The winner is now dest; the rest live in pendingTargets. Clear
+	// it afterward so the no-answer / upstream-abandon teardown paths don't
+	// re-CANCEL an already-answered call.
+	for (const auto& target : session->getPendingTargets())
+	{
+		if (target->getNumber() != handset->getNumber())
+		{
+			auto cancel = buildInboundCancelTo(session, target);
+			if (cancel) _outbox.emplace_back(target->getAddress(), std::move(cancel));
+		}
+	}
+	session->setPendingTargets({});
 }
 
 void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
+	{
+		return;
+	}
+	// Inbound anchor leg (server is UAC): the handset's 100 Trying is a
+	// provisional to US — swallow it rather than echoing it at the handset (see
+	// onRinging below).
+	if (session.has_value() && session.value()->isAnchorInbound())
 	{
 		return;
 	}
@@ -1590,6 +2652,14 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
+	{
+		return;
+	}
+	// Inbound anchor leg: the server is the UAC, so the handset's 180 is a
+	// provisional to US — there is no upstream caller to relay it to (the
+	// upstream leg already hears its own ringback). Swallow it; forwarding it
+	// would echo a 180 back at the handset that just started ringing.
+	if (session.has_value() && session.value()->isAnchorInbound())
 	{
 		return;
 	}
@@ -1619,6 +2689,27 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 		{
 			endHandle(session.value()->getSrc()->getNumber(), data);
 			endCall(data->getCallID(), session.value()->getSrc()->getNumber(), "999", "all targets busy");
+		}
+		return;
+	}
+
+	// Inbound anchor ring-all: one forked extension is busy. ACK its 486 and drop
+	// it from the ring set (NOT a per-extension call-forward — the anchor call
+	// rings the others). Fail the whole inbound call only if this was the last
+	// ringing leg and none answered.
+	if (session.has_value() && session.value()->isAnchorInbound())
+	{
+		auto s = session.value();
+		ackInboundFinal(s, data);
+		if (s->getState() != Session::State::Connected)
+		{
+			s->removePendingTarget(std::string(data->getToNumber()));
+			if (s->getPendingTargets().empty())
+			{
+				asyncDropCall(s->getAnchorParticipantId());
+				endCall(std::string(data->getCallID()), s->getAnchorParticipantId(), "",
+					"inbound all busy/declined");
+			}
 		}
 		return;
 	}
@@ -1674,6 +2765,25 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 		{
 			endHandle(session.value()->getSrc()->getNumber(), data);
 			endCall(data->getCallID(), session.value()->getSrc()->getNumber(), "999", "all targets unavailable");
+		}
+		return;
+	}
+	// Inbound anchor ring-all: one forked extension is unavailable (DND / out of
+	// range). ACK its 480 and drop it from the ring set; fail the whole inbound
+	// call only if it was the last ringing leg and none answered.
+	if (session.has_value() && session.value()->isAnchorInbound())
+	{
+		auto s = session.value();
+		ackInboundFinal(s, data);
+		if (s->getState() != Session::State::Connected)
+		{
+			s->removePendingTarget(std::string(data->getToNumber()));
+			if (s->getPendingTargets().empty())
+			{
+				asyncDropCall(s->getAnchorParticipantId());
+				endCall(std::string(data->getCallID()), s->getAnchorParticipantId(), "",
+					"inbound all unavailable");
+			}
 		}
 		return;
 	}
@@ -1921,6 +3031,19 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 	auto session = getSession(data->getCallID());
 	if (session.has_value())
 	{
+		// Inbound anchor leg: the server is the UAC (it originated the forked
+		// INVITEs), so a 200 OK to one of them is the handset ANSWERING — drive the
+		// media bridge + ACK + upstream answerCall() here, never the generic relay
+		// below (which assumes the opposite: the handset is the caller). Checked
+		// before the Cancel-state early return too, mirroring drawbridge exactly,
+		// though an inbound-anchor session's state never actually becomes Cancel.
+		if (session.value()->isAnchorInbound() &&
+		    data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos)
+		{
+			onInboundAnchorOk(data, session.value());
+			return;
+		}
+
 		if (session.value()->getState() == Session::State::Cancel)
 		{
 			endHandle(data->getFromNumber(), data);
@@ -2139,6 +3262,14 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 		// Same as 777/888 above: the server is the UAS on an anchor-bridge leg, so
 		// the ACK completes our own 200 OK with no second SIP leg to relay it to.
 		// Media is already flowing — the bridge attached when the INVITE was answered.
+		// A real anchor's CallEvent::Answered handler re-arms the ring timer as an
+		// ACK deadline (ANCHOR_ACK_TIMEOUT) so tick() can reap an abandoned call
+		// whose handset never ACKs — this genuine ACK disarms it. No-op for
+		// Loopback (never armed: it answers synchronously — see onAnchorInvite()).
+		if (auto session = getSession(data->getCallID()); session.has_value())
+		{
+			session.value()->clearRingTimer();
+		}
 		return;
 	}
 
@@ -2382,13 +3513,22 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 					queueLog("REFER: attended transfer invariant violated (A not common to both dialogs)", true);
 					canSplice = false;
 				}
+				// Stage B of the TelephonyAnchorClient port added isAnchor()/
+				// isAnchorInbound() to Session -- decline splicing either dialog if
+				// one is an anchor leg. Their "SDP" isn't a real peer offer/answer to
+				// swap (outbound: a virtual peer standing in for the upstream anchor;
+				// inbound: the MediaBridge, not a second SIP dialog, carries the
+				// audio), so bClient/cClient/bSdp/cSdp below would be meaningless for
+				// that side.
+				if (canSplice && (ab->isAnchor() || ab->isAnchorInbound() ||
+				                  ac->isAnchor() || ac->isAnchorInbound()))
+				{
+					queueLog("REFER: attended transfer declined — anchored session", true);
+					canSplice = false;
+				}
 			}
 			if (canSplice)
 			{
-				// pocket-dial has no SIP-trunk/anchor concept on Session (unlike
-				// drawbridge's isAnchor()/isAnchorInbound() guard) -- every session here
-				// is already a P2P leg, so that check has no equivalent to port.
-				//
 				// A can be EITHER side of either dialog (the receptionist case: B
 				// calls A, A consults C, A transfers -- A is AB's callee, not its
 				// caller), so "the other party" and their SDP must be derived from
@@ -2772,7 +3912,12 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	// the dialog being torn down owns a live anchor MediaBridge, best-effort drop
 	// the anchor-side leg and release the bridge so its RTP sockets/pacing task
 	// never outlive the call. Idempotent no-op when no bridge is bridging this
-	// Call-ID (the ordinary case for every non-555 call).
+	// Call-ID (the ordinary case for every non-555 call). Every OUTBOUND-anchor
+	// teardown path (onCancel/onBye's kAnchorCallExt branches, tick()'s no-answer/
+	// ACK-deadline reap) funnels through here rather than dropping the leg
+	// itself, so this is the ONE place that must pick sync vs async — see
+	// anchorIsSynchronous()'s doc comment for why calling dropCall() directly
+	// would stall the SIP thread for a real anchor's TLS round trip.
 	{
 		const std::string callIdStr(callID);
 		for (auto& bridge : _mediaBridges)
@@ -2782,7 +3927,14 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 				const std::string participantId = bridge.participantId();
 				if (_anchorClient && !participantId.empty())
 				{
-					_anchorClient->dropCall(participantId);
+					if (anchorIsSynchronous())
+					{
+						_anchorClient->dropCall(participantId);
+					}
+					else
+					{
+						asyncDropCall(participantId);
+					}
 				}
 				bridge.stopBridge();
 				break;
@@ -3277,6 +4429,81 @@ std::vector<std::tuple<std::string, std::string, std::string>> RequestsHandler::
 	return _snapshot.dialRules;
 }
 
+// ── Telephony-API credential slots (ported from drawbridge) ──────────────────
+// See RequestsHandler.hpp's comment on this block for why these lock _mutex
+// directly (like the setters above) rather than reading through the
+// dashboard snapshot (like getDialRules() just above): nothing on the SIP hot
+// path reads _tapiConfig yet, so there is no contention to shield against.
+
+std::vector<TelephonyApiConfig::SlotView> RequestsHandler::getTelephonyConfigSlots()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	std::vector<TelephonyApiConfig::SlotView> views;
+	views.reserve(TelephonyApiConfig::kSlots);
+	for (size_t i = 0; i < TelephonyApiConfig::kSlots; ++i)
+	{
+		views.push_back(_tapiConfig.view(i));
+	}
+	return views;
+}
+
+TelephonyApiConfig::SlotView RequestsHandler::getTelephonyConfigSlot(size_t idx)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _tapiConfig.view(idx);
+}
+
+std::string RequestsHandler::setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _tapiConfig.setSlot(idx, s, keepSecret);
+}
+
+std::string RequestsHandler::setTelephonyConfigActiveSlot(size_t idx)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _tapiConfig.setActiveSlot(idx);
+}
+
+std::string RequestsHandler::clearTelephonyConfigSlot(size_t idx)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _tapiConfig.clearSlot(idx);
+}
+
+std::string RequestsHandler::clearAllTelephonyConfig()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _tapiConfig.clearAll();
+}
+
+// ── DID -> extension inbound routing (new) ────────────────────────────────────
+// Same direct-_mutex rationale as the Telephony-API slots immediately above.
+
+std::vector<DidMapping::Entry> RequestsHandler::getDidMappings()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _didMapping.list();
+}
+
+std::string RequestsHandler::setDidMapping(const std::string& did, const std::string& extension)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _didMapping.setMapping(did, extension);
+}
+
+std::string RequestsHandler::removeDidMapping(const std::string& did)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _didMapping.removeMapping(did);
+}
+
+std::string RequestsHandler::clearAllDidMappings()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _didMapping.clearAll();
+}
+
 // ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
 
 void RequestsHandler::setRegistrarMode(RegistrarMode mode)
@@ -3498,13 +4725,22 @@ void RequestsHandler::tick()
 		// in case a teardown path bypassed endCall(). Bounded by the small session pool.
 		_dtmf.sweepStale();
 
-		// No-answer timers (CFNA + hunt-group progression). Poll the armed sessions
-		// and act on any that have run past their ring deadline without connecting.
-		// Collected first so we don't mutate _sessions while iterating it.
+		// No-answer timers (CFNA + hunt-group progression, plus the anchor
+		// no-answer/ACK-deadline reap below). Poll the armed sessions and act on
+		// any that have run past their ring deadline without connecting. Collected
+		// first so we don't mutate _sessions while iterating it.
 		std::vector<std::string> expiredCallIds;
 		for (const auto& [callID, session] : _sessions)
 		{
-			if (session->isRingExpired(now) && session->getState() == Session::State::Invited)
+			// A CONNECTED outbound anchor whose ACK deadline (ANCHOR_ACK_TIMEOUT)
+			// expired is an abandoned call — the handset never ACKed our 200 OK
+			// (bridged too late, or the phone already gave up) — reap it too so
+			// its upstream leg + bridge don't zombie forever.
+			const bool connectedAbandonedAnchor =
+				session->getState() == Session::State::Connected &&
+				session->isAnchor() && !session->isAnchorInbound();
+			if (session->isRingExpired(now) &&
+			    (session->getState() == Session::State::Invited || connectedAbandonedAnchor))
 			{
 				expiredCallIds.push_back(callID);
 			}
@@ -3515,6 +4751,63 @@ void RequestsHandler::tick()
 			if (sit == _sessions.end()) continue;
 			auto session = sit->second;
 			session->clearRingTimer();
+
+			if (session->isAnchorInbound())
+			{
+				// Inbound anchor call: no extension picked up. CANCEL every still-
+				// ringing forked INVITE (server is UAC), drop the upstream leg, and
+				// end the session. No leg answered (state is Invited), so
+				// pendingTargets still holds them all.
+				for (const auto& target : session->getPendingTargets())
+				{
+					auto cancel = buildInboundCancelTo(session, target);
+					if (cancel) _outbox.emplace_back(target->getAddress(), std::move(cancel));
+				}
+				asyncDropCall(session->getAnchorParticipantId());
+				queueLog("[Telephony] Inbound: no answer from " +
+				         std::to_string(session->getPendingTargets().size()) + " extension(s) — cancelled");
+				endCall(callID, session->getAnchorParticipantId(), "", "inbound no answer");
+				continue;
+			}
+
+			if (session->isAnchor())
+			{
+				// Plain OUTBOUND anchor call that expired — either the far end never
+				// connected it (still Invited) or the handset never ACKed our 200
+				// (Connected but abandoned). Either way DROP the upstream leg + free
+				// its media bridge so it doesn't linger as a zombie (which erodes the
+				// concurrent-call budget and otherwise needs a manual kill). 503 the
+				// caller only while it's still ringing — a Connected-abandoned
+				// handset is already gone, so there's no one to answer.
+				const std::string part = session->getAnchorParticipantId();
+				MediaBridge* b = bridgeForParticipant(part);
+				if (!b)
+				{
+					for (auto& mb : _mediaBridges)
+					{
+						if (mb.isForCallId(callID)) { b = &mb; break; }
+					}
+				}
+				if (b) b->stopBridge();
+				if (!part.empty()) asyncDropCall(part);
+				const bool stillRinging = (session->getState() == Session::State::Invited);
+				if (stillRinging && session->getInviteMessage())
+				{
+					auto invite = session->getInviteMessage();
+					auto resp = getMessageFromPool(*invite);
+					if (resp)
+					{
+						resp->setHeader("SIP/2.0 503 Service Unavailable");
+						resp->clearBody();
+						resp->setContact(buildContact(std::string(invite->getToNumber())));
+						_outbox.emplace_back(invite->getSource(), std::move(resp));
+					}
+				}
+				queueLog(std::string("[Telephony] anchor call reaped (no ") + (stillRinging ? "answer" : "ACK") +
+				         ") — dropped leg " + part);
+				endCall(callID, session->getSrc() ? session->getSrc()->getNumber() : "", part, "anchor reap");
+				continue;
+			}
 
 			if (session->isHunt())
 			{
@@ -3564,6 +4857,51 @@ void RequestsHandler::tick()
 				}
 			}
 		}
+
+		// Reap ORPHANED media bridges — active but with NO owning anchor session.
+		// Under a concurrent burst a bridge can outlive its session (a session
+		// reaped/ended while its bridge teardown didn't match, or an Answered
+		// landing just after its session was reaped). The session-based reaper
+		// above can't see these — they'd pump audio to a dead handset forever,
+		// hold the per-call RTP/TLS sockets, and (until dropped) keep the
+		// upstream leg up. Drop the leg + free the bridge. Safe at 1 Hz: a
+		// legitimate bridge is bound to its session under this same _mutex (the
+		// CallEvent::Answered handler / onInboundAnchorOk), so an unowned active
+		// bridge here is a real orphan, not a race.
+		for (auto& b : _mediaBridges)
+		{
+			if (!b.isActive()) continue;
+			const std::string bpart = b.participantId();
+			const std::string bcall = b.callId();
+			bool owned = false;
+			for (const auto& [cid, s] : _sessions)
+			{
+				if (!s->isAnchor()) continue;
+				if ((!bcall.empty() && cid == bcall) ||
+				    (!bpart.empty() && s->getAnchorParticipantId() == bpart))
+				{
+					owned = true;
+					break;
+				}
+			}
+			if (!owned)
+			{
+				if (!bpart.empty())
+				{
+					if (anchorIsSynchronous() && _anchorClient) _anchorClient->dropCall(bpart);
+					else asyncDropCall(bpart);
+				}
+				b.stopBridge();
+				queueLog("[Telephony] reaped orphaned media bridge (no session) leg " + bpart);
+			}
+		}
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32)
+		// Join+erase any asyncMakeCall/asyncDropCall/asyncAnswerCall host worker
+		// that has finished, so the vector tracks in-flight calls rather than
+		// growing without bound over the object's life.
+		reapAnchorWorkers();
+#endif
 
 		// Sweep rate-limit buckets older than 60 seconds (Issue #58). The bucket map
 		// now lives under _rateMutex (so per-packet admission never serializes on the
@@ -4237,6 +5575,18 @@ std::vector<std::pair<std::string, std::string>> RequestsHandler::getPageZones()
 
 std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler::drainOutbox()
 {
+	// Stage B of the TelephonyAnchorClient port: merge in anything the CallEvent
+	// callback (or an async worker's completion) queued to _asyncOutbox — it runs
+	// off the SIP receive thread, after handle()/tick() already cleared _outbox
+	// for this pass, so it cannot append there directly. Merged in BEFORE the
+	// retransmit-tracking scan below so a forked inbound INVITE
+	// (buildInboundInviteFork) gets the same Timer A/B coverage as any other.
+	for (auto& e : _asyncOutbox)
+	{
+		_outbox.push_back(std::move(e));
+	}
+	_asyncOutbox.clear();
+
 	// The single exit every deferred message passes through. RFC 3261 §17:
 	// register outgoing INVITEs for retransmit here, so Timer A/B coverage is
 	// structural rather than something each flush site re-implements — a new
@@ -4246,8 +5596,9 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 	//
 	// Ordering matters (#70): the scan must run after everything that appends to
 	// _outbox during this pass (BLF NOTIFYs, tick()-originated forks — park
-	// ring-back, hunt-group next-ring, CFNA redirect), which is exactly why it
-	// belongs at the drain rather than at any individual enqueue.
+	// ring-back, hunt-group next-ring, CFNA redirect — and now the async-anchor
+	// merge above), which is exactly why it belongs at the drain rather than at
+	// any individual enqueue.
 	for (const auto& [addr, msg] : _outbox)
 	{
 		_txLayer.maybeTrack(addr, msg);

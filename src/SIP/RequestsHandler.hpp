@@ -36,6 +36,7 @@
 #include <atomic>
 #include <chrono>
 #include <array>
+#include <thread>   // host-build async anchor-start worker (_anchorStartThread below)
 #include "SipMessage.hpp"
 #include "SipClient.hpp"
 #include "Session.hpp"
@@ -53,7 +54,10 @@
 #include "RtpReceiver.hpp"
 #include "AnchorClient.hpp"
 #include "LoopbackAnchorClient.hpp"
+#include "TelephonyAnchorClient.hpp"
 #include "TelephonyProvider.hpp"
+#include "TelephonyApiConfig.hpp"
+#include "DidMapping.hpp"
 #include "MediaBridge.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
@@ -71,6 +75,14 @@ public:
 
 	RequestsHandler(std::string serverIp, int serverPort,
 		OnHandledEvent onHandledEvent);
+	// Stage A of the TelephonyAnchorClient port (drawbridge): joins the host-build
+	// async anchor-start thread (see _anchorStartThread below) and stops the
+	// selected anchor client BEFORE member destruction begins — the loopback
+	// client's simulation threads call back into this handler, and a real
+	// anchor's WS/media worker tasks touch _mutex/_sessions too, so both must be
+	// torn down while those members are still alive (mirrors drawbridge's
+	// ~RequestsHandler exactly).
+	~RequestsHandler();
 
 	// Forwarders onto the static pool in SipMessagePool.hpp/.cpp (Issue #53 /
 	// #101(A) / #101(E)) — kept as public statics here because SipMessageFactory,
@@ -207,6 +219,49 @@ public:
 	void setDialRule(const std::string& pattern, const std::string& action, const std::string& target);
 	std::vector<std::tuple<std::string, std::string, std::string>> getDialRules();
 
+	// ── Telephony-API credential slots (ported from drawbridge) ──────────────────
+	// TelephonyApiConfig.hpp owns validation + NVS/file persistence for the
+	// bounded kSlots-entry credential table; RequestsHandler owns the instance
+	// (_tapiConfig below) and serializes access under _mutex, per that header's
+	// documented threading contract. Unlike the DND/forward/ring-group/dial-plan
+	// getters above, these read _tapiConfig directly under _mutex rather than
+	// through the lock-free dashboard snapshot: nothing on the SIP hot path
+	// reads this table yet (boot-time active-slot selection is a later, separate
+	// task — see TelephonyApiConfig.hpp's class comment), so there is no
+	// hot-path contention to shield HTTP-thread reads from.
+	//
+	// getTelephonyConfigSlots() returns all kSlots display-safe views (secrets
+	// masked to secretSet, per SlotView's contract) for GET /api/telephony-config;
+	// getTelephonyConfigSlot() returns just one (out-of-range -> a default view,
+	// same as TelephonyApiConfig::view()). setTelephonyConfigSlot() is the mutating
+	// path behind PUT /api/telephony-config/<slot> ("" on success, else a short
+	// operator-facing error); setTelephonyConfigActiveSlot() backs
+	// POST /api/telephony-config/<slot>/activate. clearTelephonyConfigSlot()
+	// backs DELETE /api/telephony-config/<slot> (wipes just that one slot);
+	// clearAllTelephonyConfig() backs /api/factory-reset (wipes every slot
+	// and the active-slot selection) -- see TelephonyApiConfig::clearAll().
+	std::vector<TelephonyApiConfig::SlotView> getTelephonyConfigSlots();
+	TelephonyApiConfig::SlotView getTelephonyConfigSlot(size_t idx);
+	std::string setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret);
+	std::string setTelephonyConfigActiveSlot(size_t idx);
+	std::string clearTelephonyConfigSlot(size_t idx);
+	std::string clearAllTelephonyConfig();
+
+	// ── DID -> extension inbound routing (new) ────────────────────────────────────
+	// DidMapping.hpp owns the bounded table + field validation; RequestsHandler
+	// owns the instance (_didMapping below) and serializes access under _mutex,
+	// same pattern and same rationale (no hot-path reader yet — see
+	// DidMapping.hpp's BOUNDARY comment) as the Telephony-API slots above.
+	// getDidMappings() backs GET /api/did-mapping; setDidMapping()/
+	// removeDidMapping() back PUT/DELETE respectively ("" on success, else a
+	// short operator-facing error — removeDidMapping is idempotent, so it is
+	// always ""). clearAllDidMappings() backs /api/factory-reset (wipes the
+	// whole table) -- see DidMapping::clearAll().
+	std::vector<DidMapping::Entry> getDidMappings();
+	std::string setDidMapping(const std::string& did, const std::string& extension);
+	std::string removeDidMapping(const std::string& did);
+	std::string clearAllDidMappings();
+
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint
 	// (default "1001", NVS namespace "pbxcfg", key "admin_ext") now lives on
@@ -274,6 +329,23 @@ public:
 	void setAdminHttpOpenUntilMsForTest(uint64_t ms)
 	{
 		_adminHttpOpenUntilMs.store(ms, std::memory_order_release);
+	}
+
+	// Test-only: redirect the Telephony-API / DID-mapping host-file stores to
+	// test-specific paths and reload from them. Without this every test that
+	// constructs a RequestsHandler and exercises PUT /api/telephony-config or
+	// PUT/DELETE /api/did-mapping would read and write the SAME default files
+	// ("pocketdial_tapi.cfg"/"pocketdial_didmap.cfg" in the process's cwd) as
+	// every other test in the binary — order-dependent failures and state that
+	// leaks into the next run. Mirrors TelephonyApiConfig_test.cpp's/
+	// DidMapping_test.cpp's own setStorePath() fixture pattern. Not compiled
+	// into device firmware (NVS has no such notion of a "path" to redirect).
+	void setTelephonyStorePathsForTest(const std::string& tapiPath, const std::string& didmapPath)
+	{
+		_tapiConfig.setStorePath(tapiPath);
+		_tapiConfig.load();
+		_didMapping.setStorePath(didmapPath);
+		_didMapping.load();
 	}
 
 	// Test-only: the anchor MediaBridge currently bridging this Call-ID, or nullptr
@@ -567,15 +639,19 @@ private:
 	// onInvite() routes a dial of 555 here — the docs/FEATURE_ROADMAP.md "Anchored
 	// media (opt-in, unwired)" extension point, now wired into call routing.
 	// AnchorClient/MediaBridge/TelephonyProvider are all vendor-neutral; pocket-dial
-	// ships only LoopbackAnchorClient as the concrete provider (see
-	// TelephonyProvider.hpp's class comment). Chosen as a dedicated reserved virtual
-	// extension — matching the established 777/440/888/999 style — rather than a
-	// trunk-access prefix or an unregistered-number fallback: there is no dialed
-	// destination digit string to carry (see onAnchorInvite()'s comment on the
-	// makeCall() `destination` argument), so a fixed feature code is the natural
-	// fit, and unlike a bare "unregistered falls through to the anchor" rule it can
-	// never collide with — or silently start bridging — a mistyped real extension.
-	// Caller holds _mutex.
+	// ships two concrete providers, LoopbackAnchorClient (the safe on-box default)
+	// and TelephonyAnchorClient (a real WAN-anchor client, ported from drawbridge —
+	// see TelephonyProvider.hpp's class comment). Chosen as a dedicated reserved
+	// virtual extension — matching the established 777/440/888/999 style — rather
+	// than a trunk-access prefix or an unregistered-number fallback: there is no
+	// dialed destination digit string to carry (see onAnchorInvite()'s comment on
+	// the makeCall() `destination` argument), so a fixed feature code is the
+	// natural fit, and unlike a bare "unregistered falls through to the anchor"
+	// rule it can never collide with — or silently start bridging — a mistyped
+	// real extension. onAnchorInvite() itself branches on anchorIsSynchronous():
+	// Loopback answers synchronously exactly as before; a real anchor rings, then
+	// completes asynchronously via asyncMakeCall()/the CallEvent callback. Caller
+	// holds _mutex.
 	void onAnchorInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
 
 	// First anchor media bridge with no active call, or nullptr if every slot is
@@ -583,6 +659,119 @@ private:
 	// 440/888 busy-refusal shape with a different status for the different meaning
 	// — see that call site's comment). Caller holds _mutex.
 	MediaBridge* acquireFreeAnchorBridge();
+
+	// The active bridge serving `participantId` ("" never matches), or nullptr if
+	// none is. Used by the CallEvent callback / tick()'s orphan sweep to find the
+	// bridge for an upstream event that carries a participant id rather than a
+	// Call-ID. Caller holds _mutex.
+	MediaBridge* bridgeForParticipant(const std::string& participantId);
+
+	// True iff every POCKETDIAL_MAX_ANCHOR_CALLS bridge slot is active — the
+	// capacity gate for both a fresh 555 dial (onAnchorInvite) and a fresh
+	// inbound anchor call (routeInboundAnchorCall). Caller holds _mutex.
+	bool allBridgesBusy() const;
+
+	// True iff the currently-selected anchor provider is Loopback — the boundary
+	// between the two calling conventions this port has to support:
+	//   * Loopback: makeCall()/dropCall()/answerCall() are cheap, bounded
+	//     (~40 ms) thread-joins, so onAnchorInvite()/endCall() call them
+	//     SYNCHRONOUSLY while holding _mutex (unchanged since Stage A) and
+	//     setEventCallback() is left unwired — see the constructor's comment
+	//     for why wiring it here specifically would deadlock (reapSimThreads()'s
+	//     join, inside a synchronous makeCall()/dropCall(), racing the very
+	//     callback this mutex-holding thread is blocked waiting to run).
+	//   * any real anchor (TelephonyAnchorClient today): those calls are
+	//     blocking TLS HTTP round trips, so every call site MUST go through
+	//     asyncMakeCall()/asyncDropCall()/asyncAnswerCall() instead, and the
+	//     CallEvent callback IS wired (that is how such a call ever completes).
+	// A consequence, documented rather than silently accepted: LoopbackAnchorClient's
+	// own simulateInboundCall()/CallEvent::Incoming test hook (see AnchorClient_test.cpp)
+	// is therefore never exercised THROUGH RequestsHandler — only a real anchor
+	// reaches routeInboundAnchorCall() in this port. Loopback's own contract is
+	// still fully tested in isolation there.
+	bool anchorIsSynchronous() const;
+
+	// ── Anchor async wrappers (Stage B of the TelephonyAnchorClient port) ────────
+	// makeCall()/dropCall()/answerCall() on a real anchor are blocking TLS HTTP
+	// round trips — calling them under _mutex would stall the whole SIP thread for
+	// the length of that HTTP call (this codebase's "no blocking I/O under the
+	// registrar lock" invariant). Each wrapper spawns a PSRAM-stack worker task
+	// (ESP: xTaskCreateWithCaps, 12288 bytes — 4096 bootlooped on real hardware,
+	// the TLS handshake needs the headroom) or a host worker thread (via
+	// spawnAnchorWorker(), reaped in tick()/the destructor) that calls the real
+	// method off the SIP thread, then re-takes _mutex only to log/react. Never
+	// called for a synchronous (Loopback) anchor — see anchorIsSynchronous().
+	void asyncMakeCall(const std::string& destination, const std::string& callId, const std::string& callerNumber);
+	void asyncDropCall(const std::string& participantId);
+	void asyncAnswerCall(const std::string& participantId);
+
+	// Bind an outbound call's own leg (from asyncMakeCall's successful makeCall())
+	// to its session, so the CallEvent::Answered/Dropped callback can match this
+	// call even with several outbound anchor calls in flight. Takes _mutex itself
+	// (called from the async worker, off the SIP thread, never while _mutex is
+	// already held).
+	void bindOutboundParticipant(const std::string& callId, const std::string& ownLeg);
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32)
+	// Host-only worker-thread pool backing the async wrappers above (mirrors
+	// drawbridge's own spawnAnchorWorker/reapAnchorWorkers exactly — ESP has no
+	// equivalent because xTaskCreateWithCaps tasks self-delete). A detached
+	// std::thread here would capture `this` and could outlive the handler in the
+	// unit-test process (the exact hazard _anchorStartThread above already guards
+	// against for the one-time start() call) — these run per CALL instead of once,
+	// so they need their own pool, joined opportunistically here and drained in
+	// ~RequestsHandler().
+	struct AnchorWorker
+	{
+		std::thread thread;
+		std::shared_ptr<std::atomic<bool>> done;
+	};
+	void spawnAnchorWorker(std::function<void()> job);
+	// Join + erase every worker whose done-flag is set. Caller MUST hold
+	// _anchorWorkMutex.
+	void reapFinishedLocked();
+	// Called from tick(): reap finished anchor workers. drainAll blocks until
+	// every worker has finished (the destructor's belt-and-suspenders join).
+	void reapAnchorWorkers(bool drainAll = false);
+	std::mutex _anchorWorkMutex;
+	std::vector<AnchorWorker> _anchorWorkThreads;
+#endif
+
+	// ── Inbound anchor call dispatch (Stage B) ────────────────────────────────────
+	// An Incoming CallEvent means an external system is delivering a call to the
+	// monitored route DN (_anchorRouteDn, cached at boot from the active
+	// TelephonyApiConfig slot — see the constructor). That DN is a trunk route
+	// point, not a phone, so the default is RING-ALL: fork an offerless INVITE to
+	// every registered extension, first answer wins. Track A's DID -> extension
+	// table (DidMapping) narrows this to a single target when the operator has
+	// mapped this exact DN — see the DID-hook comment inside the definition.
+	// Runs under _mutex (the CallEvent callback holds it).
+	void routeInboundAnchorCall(const std::string& participantId, const std::string& callerId);
+
+	// One delayed-offer INVITE fork toward `target` for the ring-all above, reusing
+	// the session's shared Call-ID / Via branch / From-tag. Enqueues to
+	// _asyncOutbox (this runs off the SIP receive thread).
+	void buildInboundInviteFork(const std::shared_ptr<Session>& session,
+		const std::shared_ptr<SipClient>& target, const std::string& callerDisplay);
+
+	// CANCEL matching the forked INVITE transaction at `target` (same top Via
+	// branch, From+tag, Call-ID, CSeq number). buildInboundCancel() is the
+	// back-compat single-leg wrapper (CANCELs the session's current dest).
+	std::shared_ptr<SipMessage> buildInboundCancelTo(const std::shared_ptr<Session>& session,
+		const std::shared_ptr<SipClient>& target);
+	std::shared_ptr<SipMessage> buildInboundCancel(const std::shared_ptr<Session>& session);
+
+	// RFC 3261 §17.1.1.3: ACK a non-2xx final (486/480/487) within a forked
+	// inbound-anchor INVITE transaction — there is no caller to relay it to, so
+	// the server (UAC for this leg) must complete its own transaction.
+	void ackInboundFinal(const std::shared_ptr<Session>& session, const std::shared_ptr<SipMessage>& data);
+
+	// The handset's 200 OK to one of routeInboundAnchorCall()'s forked INVITEs:
+	// learn its tag + RTP, bring up the media bridge, ACK with our SDP answer
+	// (delayed-offer model), answer the upstream leg, and CANCEL the losing forks.
+	// Called from onOk() before the generic session-answer path (isAnchorInbound()
+	// sessions are server-as-UAC, which that generic path assumes the opposite of).
+	void onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, const std::shared_ptr<Session>& session);
 
 	void unregisterClient(std::string_view number);
 
@@ -655,23 +844,65 @@ private:
 	// ── Anchored media (555): the AnchorClient/MediaBridge wiring ────────────────
 	// POCKETDIAL_MAX_ANCHOR_CALLS concurrent bridges, each owning its own RTP
 	// receiver/sender pair (parallel arrays, index-matched) — mirrors _conference's
-	// per-leg RTP tasks. _loopbackClient is the only AnchorClient implementation
-	// this project ships; _anchorClient points at whatever the boot-time provider
-	// registry selected (see the constructor) so every call site below goes through
+	// per-leg RTP tasks. Both _loopbackClient and _telephonyAnchorClient are
+	// REAL AnchorClient implementations (see TelephonyProvider.hpp);
+	// _anchorClient points at whatever the boot-time provider registry
+	// selected (see the constructor) so every call site below goes through
 	// one pointer instead of the concrete type, the same indirection
 	// TelephonyProviderRegistry exists to provide.
 	//
+	// TelephonyProviderType::Telephony is registered to _telephonyAnchorClient
+	// (TelephonyAnchorClient, ported from drawbridge) — StubTelephonyProvider
+	// is no longer instantiated here (the class itself stays in
+	// TelephonyProvider.hpp as scaffolding for any future
+	// genuinely-unimplemented provider type). telephonyProviderImplemented()
+	// reports true for Telephony; boot selection (see the constructor) still
+	// falls back to Loopback whenever no TelephonyApiConfig slot names
+	// Telephony as active+enabled.
+	//
 	// Declaration order matters here: _mediaBridges MUST come after
-	// _anchorRtpReceivers/_anchorRtpSenders/_loopbackClient/_anchorClient so it is
-	// destroyed FIRST (C++ destroys members in REVERSE declaration order) —
-	// ~MediaBridge() calls stopBridge(), which dereferences _receiver/_sender/
-	// _anchor, and those must still be alive when that runs.
+	// _anchorRtpReceivers/_anchorRtpSenders/_loopbackClient/_telephonyAnchorClient/
+	// _anchorClient so it is destroyed FIRST (C++ destroys members in REVERSE
+	// declaration order) — ~MediaBridge() calls stopBridge(), which dereferences
+	// _receiver/_sender/_anchor, and those must still be alive when that runs.
 	RtpReceiver _anchorRtpReceivers[POCKETDIAL_MAX_ANCHOR_CALLS];
 	RtpSender   _anchorRtpSenders[POCKETDIAL_MAX_ANCHOR_CALLS];
 	LoopbackAnchorClient _loopbackClient;
+	TelephonyAnchorClient _telephonyAnchorClient;
 	TelephonyProviderRegistry _providerRegistry;
 	AnchorClient* _anchorClient = nullptr;
 	MediaBridge _mediaBridges[POCKETDIAL_MAX_ANCHOR_CALLS];
+
+	// The boot-selected provider TYPE (cached alongside _anchorClient itself —
+	// see the constructor) and the monitored route DN an ACTIVE+ENABLED
+	// TelephonyApiConfig slot supplied (pocket-dial's substitute for drawbridge's
+	// TrunkConfig::sourceDn — see TelephonyApiConfig::Slot::routeDn). "" when no
+	// such slot is active (Loopback boot, or an unimplemented/disabled slot).
+	// anchorIsSynchronous() reads _anchorBootType; routeInboundAnchorCall() reads
+	// _anchorRouteDn as the RING-ALL gate and the DID-mapping lookup key.
+	TelephonyProviderType _anchorBootType = TelephonyProviderType::Loopback;
+	std::string _anchorRouteDn;
+
+	// Stage B of the TelephonyAnchorClient port: sends that originate OFF the SIP
+	// receive thread (the CallEvent callback, which runs on the anchor's own WS
+	// event task/thread) cannot append to _outbox — handle()/tick() clear it at
+	// the start of every pass, and appending from another thread with no lock
+	// would race that clear/scan. They land here instead; drainOutbox() (the
+	// single chokepoint every deferred send already passes through) merges this
+	// in before its own scan, so an async send gets the same retransmit tracking
+	// and /api/pcap capture as any other. Guarded by _mutex, same as _outbox —
+	// every writer (the CallEvent callback, buildInboundInviteFork/
+	// buildInboundCancelTo's async callers) already holds it.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _asyncOutbox;
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32)
+	// Async anchor-start worker (host builds only; ESP spawns a FreeRTOS task
+	// instead — see the constructor). Must be JOINED in ~RequestsHandler: a
+	// detached thread here would capture `this` and could outlive the handler
+	// in the unit-test process, segfaulting nondeterministically (mirrors
+	// drawbridge's _anchorStartThread exactly).
+	std::thread _anchorStartThread;
+#endif
 
 	// RequestsHandler.hpp: Issues #24 and #28 resolved.
 	std::unordered_map<std::string, std::function<void(std::shared_ptr<SipMessage> request)>> _handlers;
@@ -746,6 +977,21 @@ private:
 	// directly).
 	PbxFeatureConfig _cfg{*this,
 		[this](PbxFeatureConfig::Table t) { refreshPbxConfigSnapshot(t); }};
+
+	// The bounded Telephony-API credential slot table (ported from drawbridge)
+	// and the DID -> extension inbound routing table (new). Both are
+	// self-contained data models with their own NVS-namespace/host-file
+	// persistence (see TelephonyApiConfig.hpp / DidMapping.hpp) and, unlike
+	// _cfg above, need no OnChanged callback: neither has a dashboard-snapshot
+	// mirror to keep in sync, because neither is read from the SIP hot path
+	// yet (see each header's class/BOUNDARY comment). Loaded once at
+	// construction (see the constructor); mutated only through
+	// setTelephonyConfigSlot()/setTelephonyConfigActiveSlot()/
+	// clearTelephonyConfigSlot()/clearAllTelephonyConfig()/setDidMapping()/
+	// removeDidMapping()/clearAllDidMappings() above, all of which take
+	// _mutex first.
+	TelephonyApiConfig _tapiConfig;
+	DidMapping _didMapping;
 	// Mirrors one of _cfg's five tables into the dashboard snapshot immediately
 	// after a mutation (Issue #77) — the callback _cfg invokes on every DND/
 	// forward/ring-group/page-zone/dial-rule change, whether it came from the

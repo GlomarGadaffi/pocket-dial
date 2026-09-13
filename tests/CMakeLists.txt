@@ -106,8 +106,40 @@ add_executable(sip_parser_tests
     # FEATURE_ROADMAP.md's "Anchored media") — the boot-time provider selection +
     # MediaBridge pool + rx-audio fanout, and the onInvite()/onBye() intercept,
     # driven end to end through RequestsHandler::handle() against the Loopback
-    # reference client (the only AnchorClient this project ships).
+    # reference client (used here for deterministic, no-network testing; a
+    # second real implementation, TelephonyAnchorClient, exists but isn't
+    # exercised by this host suite — see its own test files below).
     AnchorRouting_test.cpp
+    # The bounded Telephony-API credential slot table ported from drawbridge,
+    # plus the TelephonyProviderType::Telephony enumerator (now backed by the
+    # real TelephonyAnchorClient, also ported from drawbridge). CRUD +
+    # validation + the https:// gate + active-slot selection, and the property
+    # that matters most for a credential store: view() never exposes the
+    # plaintext secret, only bootSlot() does.
+    TelephonyApiConfig_test.cpp
+    # The bounded DID -> extension inbound routing table (new: neither
+    # pocket-dial nor drawbridge had per-DID targeting before this). Pure
+    # data-model coverage -- CRUD, lookup, field validation, and the
+    # POCKETDIAL_MAX_DID_MAPPINGS bound. IS wired into call routing now --
+    # RequestsHandler::routeInboundAnchorCall() calls extensionForDid() (see
+    # DidMapping.hpp's BOUNDARY comment) -- but only the single configured
+    # route DN can ever match, so this suite still exercises the class
+    # directly rather than through call routing.
+    DidMapping_test.cpp
+    # The HTTP admin surface for the two tables above: GET/PUT/activate on
+    # TelephonyApiConfig's credential slots and GET/PUT/DELETE on DidMapping's
+    # DID->extension table, driven through a real HttpServer socket exactly
+    # like AdminHttpGate_test.cpp's other routes (same requireAdmin gate).
+    TelephonyConfigHttp_test.cpp
+    # TelephonyAnchorClient (ported from drawbridge, Stage A of the port): the
+    # pure, host-compilable helpers the real ESP-only client depends on. The
+    # client itself (cJSON/mbedTLS/esp_http_client/esp_websocket_client) only
+    # compiles on-device, so these three suites are what keeps the JWT-decode,
+    # WS entity-path parse, and URL-builder / percent-encode / JSON-escape
+    # logic exercised on the host build.
+    UrlEncode_test.cpp
+    JsonEscape_test.cpp
+    TelephonyAnchorLogic_test.cpp
     MixBus_test.cpp
     # Issue #75: MixBus wired into MediaBridge (BUS mode) and made dialable as the
     # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real
@@ -183,6 +215,11 @@ add_executable(sip_parser_tests
     # AnchorClient reference implementation. Pure loopback (no network); exercises
     # the AnchorClient contract: init/start/makeCall/audio/drop/stop lifecycle.
     ../src/SIP/LoopbackAnchorClient.cpp
+    # The real WAN-anchor AnchorClient implementation (ported from drawbridge,
+    # Stage A). Compiles to a host-stub arm under !ESP_PLATFORM (the real
+    # cJSON/mbedTLS/esp_http_client/esp_websocket_client logic is ESP-only) so
+    # it links into the host suite the same way RtpSender.cpp does.
+    ../src/SIP/TelephonyAnchorClient.cpp
     # RTP<->AnchorClient glue. Host-compilable: RtpReceiver/RtpSender::start()
     # are no-op stubs under !ESP_PLATFORM, so the lifecycle/identity bookkeeping
     # and the feedRx -> PlayoutBuffer path are exercisable on the desktop build.
@@ -191,6 +228,14 @@ add_executable(sip_parser_tests
     # lookups + registerProvider/select) that RequestsHandler's boot-time anchor
     # wiring now uses to select LoopbackAnchorClient. Pure C++17, no ESP dependency.
     ../src/SIP/TelephonyProvider.cpp
+    # The bounded Telephony-API credential slot table (ported from drawbridge).
+    # Host-compilable: falls back to a 0600-permission config file under
+    # !ESP_PLATFORM instead of NVS. See TelephonyApiConfig_test.cpp.
+    ../src/SIP/TelephonyApiConfig.cpp
+    # The bounded DID -> extension inbound routing table (new, data-model only
+    # -- see DidMapping.hpp's BOUNDARY comment). Same host-file/NVS split as
+    # TelephonyApiConfig.cpp. See DidMapping_test.cpp.
+    ../src/SIP/DidMapping.cpp
     # Conference mix bus (see docs/CONFERENCE_MIXER.md). Pure C++17, no ESP
     # dependency. mix_kernels_scalar.cpp is the always-on scalar reference --
     # the ESP32-S3 PIE vector kernels (src/SIP/pie/) are opt-in and not built here.

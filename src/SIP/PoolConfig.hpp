@@ -182,17 +182,34 @@
 // pair, the same per-leg RTP-task cost as a conference leg (POCKETDIAL_CONF_LEGS
 // above).
 //
-// Fixed at 1: LoopbackAnchorClient -- the only AnchorClient implementation this
-// project ships -- hands back the SAME fixed mock participant id
-// ("mock-part-123") from every makeCall() (see LoopbackAnchorClient.cpp), so a
-// second concurrent anchor call would collide with the first on that id, and
-// RequestsHandler's single anchor rx-audio callback would feed only whichever
-// bridge it finds first, silently starving the other call's audio. Raise this
-// only alongside an AnchorClient implementation whose makeCall() hands back a
-// distinct participant id per call -- what AnchorClient.hpp's interface expects
-// of any real implementation.
+// Fixed at 1: LoopbackAnchorClient hands back the SAME fixed mock participant
+// id ("mock-part-123") from every makeCall() (see LoopbackAnchorClient.cpp),
+// so a second concurrent anchor call on it would collide with the first on
+// that id, and RequestsHandler's single anchor rx-audio callback would feed
+// only whichever bridge it finds first, silently starving the other call's
+// audio. TelephonyAnchorClient (ported from drawbridge) IS an implementation
+// whose makeCall()/resolveOutboundLeg() hands back a distinct participant id
+// per call -- what AnchorClient.hpp's interface expects of any real
+// implementation -- so raising this is safe once that port lands. It is
+// deliberately NOT raised in that same pass: more slots multiply socket count
+// (see the sdkconfig.defaults CONFIG_LWIP_MAX_SOCKETS note), per-call task-stack
+// PSRAM footprint (12 KB x kWsWorkers, 6 KB x N media-rx tasks), and proving
+// the single-call path end-to-end on real hardware is its own verification
+// pass before concurrency is added on top.
 #ifndef POCKETDIAL_MAX_ANCHOR_CALLS
 #define POCKETDIAL_MAX_ANCHOR_CALLS 1
+#endif
+
+// Maximum number of DID -> extension inbound routing entries (DidMapping.hpp).
+// Bounded exactly like TelephonyApiConfig::kSlots: a fixed std::array, no heap,
+// a 9th add fails cleanly ("table full") rather than growing unbounded. Small
+// default: a desk PBX sitting behind a Telephony-API anchor typically owns a
+// handful of DIDs, not hundreds. Consulted by RequestsHandler::
+// routeInboundAnchorCall() (Stage B of the TelephonyAnchorClient port) — an
+// empty extensionForDid() lookup still falls back to ring-all, so raising
+// this costs table RAM only, no other budget.
+#ifndef POCKETDIAL_MAX_DID_MAPPINGS
+#define POCKETDIAL_MAX_DID_MAPPINGS 8
 #endif
 
 // Maximum concurrent RFC 3261 §17 transaction records tracked for retransmit

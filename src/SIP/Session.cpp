@@ -20,6 +20,11 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_state = State::Invited;
 	_startTime = std::chrono::steady_clock::now();
 	_isBroadcast = false;
+	_isAnchor = false;
+	_anchorInbound = false;
+	_remoteTag.clear();
+	_uacBranch.clear();
+	_anchorParticipantId.clear();
 	_pendingTargets.clear();
 	_inviteMessage.reset();
 	_ringTimerArmed = false;
@@ -114,6 +119,11 @@ void Session::release()
 	_dest.reset();
 	_state = State::Invited;
 	_isBroadcast = false;
+	_isAnchor = false;
+	_anchorInbound = false;
+	_remoteTag.clear();
+	_uacBranch.clear();
+	_anchorParticipantId.clear();
 	_pendingTargets.clear();
 	_inviteMessage.reset();
 	_ringTimerArmed = false;

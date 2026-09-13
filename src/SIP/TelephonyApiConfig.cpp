@@ -140,6 +140,25 @@ std::string TelephonyApiConfig::clearSlot(size_t idx)
 	return persist();
 }
 
+std::string TelephonyApiConfig::clearAll()
+{
+	// Reuse clearSlot() itself (zeroize + persist + clear-active-if-needed)
+	// across every slot rather than duplicating its logic -- see this
+	// method's header comment. Keep going even if one slot's persist fails,
+	// so a factory reset always zeroizes every slot's in-memory secret;
+	// report the last error, if any.
+	std::string lastErr;
+	for (size_t i = 0; i < kSlots; ++i)
+	{
+		const std::string err = clearSlot(i);
+		if (!err.empty())
+		{
+			lastErr = err;
+		}
+	}
+	return lastErr;
+}
+
 std::string TelephonyApiConfig::setActiveSlot(size_t idx)
 {
 	if (idx != kNoActiveSlot && idx >= kSlots)

@@ -7,9 +7,10 @@
 // What was missing, and what this file covers, is RequestsHandler actually doing
 // that wiring at boot and routing a real dial to it: virtual extension 555 bridges
 // a registered caller to whichever AnchorClient the provider registry selected
-// (Loopback, since that is the only implementation this project ships) — driven
-// end to end through RequestsHandler::handle(), the same style
-// ConferenceRoom_test.cpp uses for the 888 intercept.
+// (Loopback here, for deterministic, no-network testing — a second real
+// implementation, TelephonyAnchorClient, exists but isn't exercised by this
+// host suite) — driven end to end through RequestsHandler::handle(), the same
+// style ConferenceRoom_test.cpp uses for the 888 intercept.
 //
 // Deliberately NOT asserted here: PlayoutBuffer contents. ConferenceRoom_test.cpp's
 // file comment explains why -- RtpSender.cpp's "Linux desktop" branch spawns a REAL

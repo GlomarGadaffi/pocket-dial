@@ -73,6 +73,14 @@ public:
 	// Wipe a slot (zeroize + persist). Returns "" on success.
 	std::string clearSlot(size_t idx);
 
+	// Wipe EVERY slot (zeroize + persist), clearing the active-slot selection
+	// too. Used by /api/factory-reset so a reset never leaves a live carrier
+	// OAuth client_id/client_secret sitting in flash under this class's own
+	// "tapicfg" namespace/file. Returns "" only if every slot persisted
+	// cleanly, else the last non-empty per-slot error (each slot is still
+	// cleared and persisted regardless).
+	std::string clearAll();
+
 	// Mark a slot as the boot-time provider source (idx == kNoActiveSlot clears
 	// the selection → legacy/loopback behavior). Persisted. "" on success.
 	std::string setActiveSlot(size_t idx);

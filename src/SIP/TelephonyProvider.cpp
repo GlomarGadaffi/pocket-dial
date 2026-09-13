@@ -4,14 +4,18 @@ const char* telephonyProviderName(TelephonyProviderType t)
 {
 	switch (t)
 	{
-	case TelephonyProviderType::Loopback: return "LOOPBACK";
-	default:                              return "?";
+	case TelephonyProviderType::Loopback:  return "LOOPBACK";
+	case TelephonyProviderType::Telephony: return "TELEPHONY-API";
+	default:                               return "?";
 	}
 }
 
 bool telephonyProviderImplemented(TelephonyProviderType t)
 {
-	return t == TelephonyProviderType::Loopback;
+	// TelephonyAnchorClient (ported from drawbridge) is now registered for
+	// Telephony in RequestsHandler's constructor, so this is honest again:
+	// both enumerators have a real, working implementation behind them.
+	return t == TelephonyProviderType::Loopback || t == TelephonyProviderType::Telephony;
 }
 
 bool TelephonyProviderRegistry::registerProvider(TelephonyProviderType t, AnchorClient* provider)

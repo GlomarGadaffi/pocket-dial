@@ -52,6 +52,32 @@ public:
 	bool isBroadcast() const { return _isBroadcast; }
 	void setBroadcast(bool val) { _isBroadcast = val; }
 
+	// True only for sessions bridged to the WAN media anchor (TelephonyAnchorClient
+	// or LoopbackAnchorClient — ported from drawbridge, Stage B of the
+	// TelephonyAnchorClient port). The anchor CallEvent callback and CANCEL/BYE
+	// teardown branches MUST match on this — not on "dest is a non-pool client",
+	// which is also true of the 777 echo, 440 tone, and 999/ring-group virtual
+	// sessions and would make anchor teardown hit whichever virtual session
+	// happened to be first in the map.
+	bool isAnchor() const { return _isAnchor; }
+	void setAnchor(bool val) { _isAnchor = val; }
+
+	// Inbound anchor calls invert the SIP roles of an outbound one: the server is the
+	// UAC that originated the INVITE *toward the handset* (dest), so teardown/ACK must
+	// address the handset and carry our From-tag. These fields hold the extra dialog
+	// state an inbound leg needs that an outbound (server-as-UAS) leg does not:
+	//   _remoteTag           — the handset's To-tag, learned from its 200 OK
+	//   _uacBranch           — the Via branch of our INVITE (reused for the CANCEL)
+	//   _anchorParticipantId — the upstream participant id to answerCall()/dropCall()
+	bool isAnchorInbound() const { return _anchorInbound; }
+	void setAnchorInbound(bool val) { _anchorInbound = val; }
+	const std::string& getRemoteTag() const { return _remoteTag; }
+	void setRemoteTag(const std::string& tag) { _remoteTag = tag; }
+	const std::string& getUacBranch() const { return _uacBranch; }
+	void setUacBranch(const std::string& branch) { _uacBranch = branch; }
+	const std::string& getAnchorParticipantId() const { return _anchorParticipantId; }
+	void setAnchorParticipantId(const std::string& id) { _anchorParticipantId = id; }
+
 	const std::vector<std::shared_ptr<SipClient>>& getPendingTargets() const { return _pendingTargets; }
 	void setPendingTargets(std::vector<std::shared_ptr<SipClient>> targets) { _pendingTargets = std::move(targets); }
 	void removePendingTarget(const std::string& number);
@@ -150,6 +176,11 @@ private:
 	std::string _localTag; // UAS-generated To-tag, shared across 180 + 200 OK
 
 	bool _isBroadcast = false;
+	bool _isAnchor = false;
+	bool _anchorInbound = false;
+	std::string _remoteTag;            // handset To-tag (inbound anchor leg)
+	std::string _uacBranch;            // our INVITE Via branch (inbound anchor leg)
+	std::string _anchorParticipantId;  // upstream participant id (either anchor direction)
 	std::vector<std::shared_ptr<SipClient>> _pendingTargets;
 	std::shared_ptr<SipMessage> _inviteMessage;
 
