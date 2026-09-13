@@ -388,11 +388,16 @@ TEST_F(TelephonyConfigHttpTest, FactoryResetWipesTelephonyConfigAndDidMapping)
 	ASSERT_TRUE(_handler->getTelephonyConfigSlot(0).secretSet);
 	ASSERT_EQ(_handler->getDidMappings().size(), 1u);
 
+	// A third table with the same "own NVS namespace, not touched by
+	// storage/pbxcfg erases" shape: the CDR call-history ring (cdrlog).
+	_handler->recordCallForTest("1001", "1002");
+	ASSERT_FALSE(_handler->cdrSnapshotForTest().empty());
+
 	// Trigger factory reset (confirm=ERASE, same admin+CSRF gate as every
 	// other mutating route). The HTTP status itself is platform-dependent
 	// (501 "not available on desktop" off ESP+WiFi -- see
 	// HttpServer::sendApiFactoryReset), but AdminAuth::clearCredential()/
-	// DeviceConfig::clearAll() and the two Telephony tables all clear
+	// DeviceConfig::clearAll() and the Telephony/DID/CDR tables all clear
 	// unconditionally BEFORE that platform branch, so the actual wipe is
 	// host-testable regardless of the status code returned here.
 	httpRaw(_port, "POST", "/api/factory-reset", "confirm=ERASE",
@@ -402,6 +407,8 @@ TEST_F(TelephonyConfigHttpTest, FactoryResetWipesTelephonyConfigAndDidMapping)
 		<< "factory reset must wipe the Telephony-API credential table (tapicfg)";
 	EXPECT_TRUE(_handler->getDidMappings().empty())
 		<< "factory reset must wipe the DID -> extension table (didmap)";
+	EXPECT_TRUE(_handler->cdrSnapshotForTest().empty())
+		<< "factory reset must wipe the CDR call-history ring (cdrlog)";
 }
 
 TEST_F(TelephonyConfigHttpTest, MutatingRoutesRejectCrossOriginAndRequireCsrf)

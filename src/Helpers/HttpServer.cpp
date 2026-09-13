@@ -2000,9 +2000,12 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// would NOT collaterally touch them (see TelephonyApiConfig.hpp's and
 	// DidMapping.hpp's class comments), which means a factory reset must
 	// clear them explicitly or a carrier OAuth client_id/client_secret and
-	// the full DID table survive the reset in flash. Both are owned by
-	// RequestsHandler (_tapiConfig/_didMapping), so go through it like every
-	// other mutation of those tables. Unconditional (not gated on
+	// the full DID table survive the reset in flash. The CDR call-history ring
+	// ("cdrlog") is the same story -- its own NVS namespace, never touched by
+	// the "storage"/"pbxcfg" erases below, so callers/callees survive a reset
+	// unless cleared here too. All three are owned by RequestsHandler
+	// (_tapiConfig/_didMapping/_cdr), so go through it like every other
+	// mutation of those tables. Unconditional (not gated on
 	// POCKETDIAL_HAS_WIFI below) so this also runs -- and is host-testable --
 	// on eth/desktop builds, matching AdminAuth::clearCredential()/
 	// DeviceConfig::clearAll() just above.
@@ -2010,6 +2013,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	{
 		handler->clearAllTelephonyConfig();
 		handler->clearAllDidMappings();
+		handler->clearAllCallHistory();
 	}
 #if defined(POCKETDIAL_HAS_WIFI)
 	nvs_handle_t nvs_handle;

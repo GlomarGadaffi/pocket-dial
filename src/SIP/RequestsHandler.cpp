@@ -4537,6 +4537,12 @@ std::string RequestsHandler::clearAllDidMappings()
 	return _didMapping.clearAll();
 }
 
+void RequestsHandler::clearAllCallHistory()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	_cdr.clearAll();
+}
+
 // ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
 
 void RequestsHandler::setRegistrarMode(RegistrarMode mode)

@@ -159,6 +159,14 @@ void CdrRing::load()
 #endif
 }
 
+void CdrRing::clearAll()
+{
+	_ring = {};
+	_head = 0;
+	_count = 0;
+	persist();
+}
+
 void CdrRing::persist()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)

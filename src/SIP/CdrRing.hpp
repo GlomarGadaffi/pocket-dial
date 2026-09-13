@@ -45,6 +45,12 @@ public:
 	// before this split.
 	void load();
 
+	// Wipe every record and persist the empty ring. Caller holds _mutex.
+	// Used by the factory-reset path — CDR data (caller/callee numbers) is as
+	// sensitive as the credential tables in TelephonyApiConfig/DidMapping and
+	// lives in its own NVS namespace ("cdrlog"), so a reset must clear it too.
+	void clearAll();
+
 private:
 	void persist();
 

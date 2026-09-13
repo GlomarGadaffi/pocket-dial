@@ -262,6 +262,11 @@ public:
 	std::string removeDidMapping(const std::string& did);
 	std::string clearAllDidMappings();
 
+	// Backs /api/factory-reset: wipes the CDR ring (caller/callee history is
+	// as sensitive as the credential tables above and lives in its own NVS
+	// namespace, "cdrlog" — see CdrRing::clearAll()).
+	void clearAllCallHistory();
+
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint
 	// (default "1001", NVS namespace "pbxcfg", key "admin_ext") now lives on
@@ -293,6 +298,21 @@ public:
 		_tapiConfig.load();
 		_didMapping.setStorePath(didmapPath);
 		_didMapping.load();
+	}
+
+	// Test-only: seed one CDR record directly (bypassing a real call flow) and
+	// read the ring back, so a factory-reset test can assert clearAllCallHistory()
+	// actually empties it without driving a full INVITE/BYE sequence just to
+	// produce one record. Not compiled into device firmware.
+	void recordCallForTest(const std::string& src, const std::string& dest)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_cdr.record(nullptr, src, dest);
+	}
+	std::vector<CallDetailRecord> cdrSnapshotForTest()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		return _cdr.snapshot();
 	}
 
 	// Test-only: the anchor MediaBridge currently bridging this Call-ID, or nullptr
