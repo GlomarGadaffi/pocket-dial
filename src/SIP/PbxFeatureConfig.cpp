@@ -3,6 +3,7 @@
 #include "PbxFeatureConfig.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "PbxPersist.hpp"
 
@@ -273,7 +274,7 @@ std::vector<std::pair<std::string, std::string>> PbxFeatureConfig::pageZonesSnap
 // ── Dial plan (Issue #69) ─────────────────────────────────────────────────────
 
 void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string& action,
-	const std::string& target)
+	const std::string& target, int stripDigits)
 {
 	// Validate once, here, so a bad rule can never reach the SIP thread — and
 	// so the NVS blob (tab/newline delimited) can never be corrupted by a
@@ -308,7 +309,7 @@ void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string
 		if (!pbx::parseDialAction(action, parsed))
 		{
 			_env.log("Dial rule ignored: unknown action \"" + action +
-				"\" (want group|page|park)", true);
+				"\" (want group|page|park|trunk)", true);
 		}
 		else if (parsed == pbx::DialActionType::PageZone && !pbx::isPageZoneExt(target))
 		{
@@ -320,12 +321,28 @@ void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string
 			_env.log("Dial rule ignored: park target " + target +
 				" is not a park orbit for this build", true);
 		}
+		else if (parsed == pbx::DialActionType::Trunk && stripDigits < 0)
+		{
+			_env.log("Dial rule ignored: trunk stripDigits must not be negative for " + pattern, true);
+		}
+		else if (parsed == pbx::DialActionType::Trunk && pattern.back() != '*' &&
+			static_cast<size_t>(stripDigits) > pattern.size())
+		{
+			// Non-prefix pattern: every dialed string matching it is exactly
+			// pattern.size() long, so a strip count longer than that can never
+			// succeed — reject now rather than storing a rule that always 404s
+			// (applyTrunkTransform() re-checks against the ACTUAL dialed string at
+			// match time, which is the only possible check for a prefix pattern).
+			_env.log("Dial rule ignored: trunk stripDigits " + std::to_string(stripDigits) +
+				" exceeds pattern \"" + pattern + "\"'s fixed length", true);
+		}
 		else
 		{
 			pbx::DialRule rule;
 			rule.pattern = pattern;
 			rule.action = parsed;
 			rule.target = target;
+			rule.stripDigits = (parsed == pbx::DialActionType::Trunk) ? stripDigits : 0;
 			if (!_dialPlan.upsert(rule))
 			{
 				_env.log("Dial rule ignored (table full) for " + pattern, true);
@@ -333,7 +350,9 @@ void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string
 			else
 			{
 				_env.log("Dial rule " + pattern + " -> " +
-					pbx::dialActionName(parsed) + " " + target);
+					pbx::dialActionName(parsed) + " " + target +
+					(parsed == pbx::DialActionType::Trunk
+						? " (strip " + std::to_string(rule.stripDigits) + ")" : ""));
 				persistDialPlan();
 			}
 		}
@@ -343,13 +362,13 @@ void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string
 	_onChanged(Table::DialRules);
 }
 
-std::vector<std::tuple<std::string, std::string, std::string>> PbxFeatureConfig::dialRulesSnapshot() const
+std::vector<std::tuple<std::string, std::string, std::string, int>> PbxFeatureConfig::dialRulesSnapshot() const
 {
-	std::vector<std::tuple<std::string, std::string, std::string>> result;
+	std::vector<std::tuple<std::string, std::string, std::string, int>> result;
 	result.reserve(_dialPlan.size());
 	for (const auto& r : _dialPlan.rules())
 	{
-		result.emplace_back(r.pattern, pbx::dialActionName(r.action), r.target);
+		result.emplace_back(r.pattern, pbx::dialActionName(r.action), r.target, r.stripDigits);
 	}
 	return result;
 }
@@ -456,12 +475,16 @@ void PbxFeatureConfig::loadPbxConfig()
 		if (!z.members.empty()) _pageZones[rec[0]] = std::move(z);
 	}
 
-	// Dial plan (Issue #69): pattern \t action \t target, one record per rule, in
-	// evaluation order. DialPlan::upsert() enforces POCKETDIAL_MAX_DIAL_RULES on
-	// its own, so a blob written by a build with a larger cap simply stops being
-	// applied at this build's ceiling instead of overflowing it. Records that no
-	// longer validate (an unknown action, or a park target outside a shrunken
-	// POCKETDIAL_PARK_SLOTS) are dropped rather than loaded.
+	// Dial plan (Issue #69): pattern \t action \t target [\t stripDigits], one
+	// record per rule, in evaluation order. The 4th field (Issue #165's Trunk
+	// action) is optional so a blob written before it existed still loads: a
+	// record with exactly 3 fields gets stripDigits 0, same as any non-trunk
+	// rule. DialPlan::upsert() enforces POCKETDIAL_MAX_DIAL_RULES on its own, so
+	// a blob written by a build with a larger cap simply stops being applied at
+	// this build's ceiling instead of overflowing it. Records that no longer
+	// validate (an unknown action, a park target outside a shrunken
+	// POCKETDIAL_PARK_SLOTS, or a strip count now impossible for its pattern)
+	// are dropped rather than loaded.
 	for (const auto& rec : deserializeBlob(readBlob("dplan")))
 	{
 		if (rec.size() < 3 || rec[0].empty() || rec[2].empty()) continue;
@@ -470,8 +493,19 @@ void PbxFeatureConfig::loadPbxConfig()
 		if (!pbx::isDialTokenSafe(rec[0]) || !pbx::isDialTokenSafe(rec[2])) continue;
 		if (rule.action == pbx::DialActionType::PageZone && !pbx::isPageZoneExt(rec[2])) continue;
 		if (rule.action == pbx::DialActionType::ParkOrbit && !pbx::isParkOrbitExt(rec[2])) continue;
+		int stripDigits = 0;
+		if (rule.action == pbx::DialActionType::Trunk && rec.size() >= 4 && !rec[3].empty())
+		{
+			stripDigits = std::atoi(rec[3].c_str());
+		}
+		if (rule.action == pbx::DialActionType::Trunk &&
+			(stripDigits < 0 || (rec[0].back() != '*' && static_cast<size_t>(stripDigits) > rec[0].size())))
+		{
+			continue;
+		}
 		rule.pattern = rec[0];
 		rule.target = rec[2];
+		rule.stripDigits = (rule.action == pbx::DialActionType::Trunk) ? stripDigits : 0;
 		if (!_dialPlan.upsert(rule)) break;   // table full at this build's cap
 	}
 
@@ -549,7 +583,8 @@ void PbxFeatureConfig::persistDialPlan()
 	{
 		blob += r.pattern; blob += '\t';
 		blob += pbx::dialActionName(r.action); blob += '\t';
-		blob += r.target; blob += '\n';
+		blob += r.target; blob += '\t';
+		blob += std::to_string(r.stripDigits); blob += '\n';
 	}
 	nvs_handle_t h;
 	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)

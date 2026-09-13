@@ -183,6 +183,32 @@ public:
 		return std::atoi(raw.c_str() + p + 8);
 	}
 
+	// One recorded routeTrunkCall() call, for CallForker::routeDialPlan()'s
+	// Trunk-action tests (Issue #165) to assert the transformed destination
+	// actually reached the anchor-call path.
+	struct TrunkCall
+	{
+		std::string callId;
+		std::string callerNumber;
+		std::string destination;
+	};
+	std::vector<TrunkCall> trunkCalls;
+	// Set false to simulate "no anchor client connected" — routeTrunkCall()
+	// then returns false without sending anything, mirroring
+	// RequestsHandler::originateAnchorCall()'s respondIfDisconnected=false path.
+	bool trunkAnchorConnected = true;
+
+	bool routeTrunkCall(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller, const std::string& destination) override
+	{
+		if (!trunkAnchorConnected) return false;
+		trunkCalls.push_back(TrunkCall{
+			data ? std::string(data->getCallID()) : std::string{},
+			caller ? std::string(caller->getNumber()) : std::string{},
+			destination});
+		return true;
+	}
+
 private:
 	std::string _localIp = "192.168.1.10";
 };

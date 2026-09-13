@@ -199,13 +199,18 @@ public:
 	void setPageZone(const std::string& zoneExt, const std::string& members);
 	std::vector<std::pair<std::string, std::string>> getPageZones();
 
-	// ── Dial plan (Issue #69) ─────────────────────────────────────────────────
+	// ── Dial plan (Issue #69, Trunk action Issue #165) ───────────────────────────
 	// A bounded, ordered pattern → action rule table (see DialPlan.hpp for the
 	// pattern grammar and POCKETDIAL_MAX_DIAL_RULES for the cap). setDialRule
 	// upserts one rule: a rule whose pattern is already in the table is edited IN
 	// PLACE, keeping its evaluation position; a new pattern is appended, and is
 	// refused (logged, not applied) once the table is full. An empty `target`
-	// deletes the rule with that pattern. `action` is "group" | "page" | "park".
+	// deletes the rule with that pattern. `action` is "group" | "page" | "park" |
+	// "trunk". `stripDigits` only matters for "trunk" (leading digits stripped
+	// off the dialed string before prepending `target` — e.g. pattern
+	// "9XXXXXXXXXX", stripDigits 1, target "1" turns "93057673260" into
+	// "13057673260" and places it as an outbound call through the configured
+	// anchor/telephony provider); every other action ignores it.
 	//
 	// The rule is validated here, not at dial time: the pattern and target must be
 	// NVS/JSON-safe tokens (DialPlan.hpp's isDialTokenSafe), the target must have
@@ -214,10 +219,12 @@ public:
 	// input is logged and dropped — same contract as setRingGroup/setPageZone.
 	//
 	// Thread-safe (takes _mutex / _snapshotMutex) and NVS-persisted, exactly like
-	// setRingGroup. The getter returns {pattern, action, target} triples in TABLE
-	// ORDER — the order rules are evaluated in — for the dashboard and the API.
-	void setDialRule(const std::string& pattern, const std::string& action, const std::string& target);
-	std::vector<std::tuple<std::string, std::string, std::string>> getDialRules();
+	// setRingGroup. The getter returns {pattern, action, target, stripDigits}
+	// tuples in TABLE ORDER — the order rules are evaluated in — for the
+	// dashboard and the API.
+	void setDialRule(const std::string& pattern, const std::string& action, const std::string& target,
+		int stripDigits = 0);
+	std::vector<std::tuple<std::string, std::string, std::string, int>> getDialRules();
 
 	// ── Telephony-API credential slots (ported from drawbridge) ──────────────────
 	// TelephonyApiConfig.hpp owns validation + NVS/file persistence for the
@@ -329,6 +336,12 @@ public:
 		}
 		return nullptr;
 	}
+
+	// Test-only: the boot-selected anchor client (Loopback in every host test),
+	// so a test can read LoopbackAnchorClient::lastMakeCallDestination() and
+	// prove a dial-plan Trunk rule's transform actually reached makeCall() —
+	// see that accessor's comment. Not compiled into device firmware.
+	AnchorClient* anchorClientForTest() { return _anchorClient; }
 #endif
 
 	// ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
@@ -482,6 +495,11 @@ private:
 	{
 		return parseRequestedExpires(msg);
 	}
+	bool routeTrunkCall(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller, const std::string& destination) override
+	{
+		return originateAnchorCall(data, caller, destination, /*respondIfDisconnected=*/false);
+	}
 
 	// RFC 3261 §17 INVITE client transactions (Timer A/B/L). Guarded by _mutex.
 	TransactionLayer _txLayer{*this};
@@ -620,6 +638,22 @@ private:
 	// completes asynchronously via asyncMakeCall()/the CallEvent callback. Caller
 	// holds _mutex.
 	void onAnchorInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
+
+	// The shared core of onAnchorInvite(), parameterized by the outbound
+	// destination digit string. onAnchorInvite() calls this with the caller's
+	// own number (555 has nothing dialed after it); routeTrunkCall() (Issue
+	// #165's dial-plan Trunk action) calls this with the dial-plan-transformed
+	// PSTN number instead, so a Trunk rule reaches the exact same
+	// Loopback-sync / real-anchor-async branches 555 does. Returns true iff it
+	// took ownership of the INVITE (sent some final/provisional response, or
+	// dispatched an async makeCall) — false ONLY when the anchor isn't
+	// connected AND respondIfDisconnected is false, so the caller (routeTrunkCall)
+	// can fall through to its own 404 instead of getting two responses to one
+	// INVITE. onAnchorInvite() always passes respondIfDisconnected=true. Caller
+	// holds _mutex.
+	bool originateAnchorCall(std::shared_ptr<SipMessage> data,
+		const std::shared_ptr<SipClient>& caller, const std::string& destination,
+		bool respondIfDisconnected);
 
 	// First anchor media bridge with no active call, or nullptr if every slot is
 	// busy (onAnchorInvite() then answers 503 Service Unavailable, mirroring the
@@ -921,7 +955,7 @@ private:
 		// in table order — the order they are evaluated in. Unlike pageZones this
 		// is rebuilt from _cfg's dial plan every tick() alongside ringGroups, so
 		// it needs no out-of-band carry-over across the snapshot swap.
-		std::vector<std::tuple<std::string, std::string, std::string>> dialRules;
+		std::vector<std::tuple<std::string, std::string, std::string, int>> dialRules;
 		// Adopted devices (STAGE 2): {mac, ext, state, online}. Mirrored from the
 		// Registrar's registry under _mutex; copied out under _snapshotMutex.
 		std::vector<AdoptedDevice> devices;

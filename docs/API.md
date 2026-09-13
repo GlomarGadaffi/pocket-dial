@@ -255,8 +255,9 @@ Returns a detailed JSON object representing the active state of the SIP registra
 | `sessions[].duration` | String | Active call length formatted as `MM:SS` or `HH:MM:SS`. |
 | `dialplan` | Array | The dial-plan rule table (Issue #69), **in evaluation order** — first match wins, so this array's order is load-bearing. |
 | `dialplan[].pattern` | String | The dialed-number pattern (see [`POST /api/dialplan`](#post-apidialplan) for the grammar). |
-| `dialplan[].action` | String | `group`, `page`, or `park`. |
-| `dialplan[].target` | String | The group / paging-zone / park-orbit extension the rule routes to. |
+| `dialplan[].action` | String | `group`, `page`, `park`, or `trunk`. |
+| `dialplan[].target` | String | The group / paging-zone / park-orbit extension the rule routes to, or — for `trunk` — the string prepended to the dialed number after stripping. |
+| `dialplan[].stripDigits` | Number | `trunk` only (Issue #165): leading digits removed from the dialed number before prepending `target`. `0` for every other action. |
 
 ---
 
@@ -762,20 +763,34 @@ A `*` anywhere but the last character is a **literal** `*`, because star-codes
 * **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
 * **Request Content-Type**: `application/x-www-form-urlencoded`
 * **Request Parameters**:
-  * `pattern` (Required): The rule's dialed-number pattern, and its key in the table. May contain only letters, digits, `#` and `*`. Must not be `777`, `999` or `440` — those are routed before the dial plan, so such a rule could never fire.
-  * `action` (Optional, default `group`): `group` (ring/hunt group), `page` (paging zone), or `park` (park orbit).
-  * `target` (Optional): The extension the action routes to — a ring-group extension for `group`, a `980`–`989` zone for `page`, a `700`–`70N` orbit for `park`. **An empty `target` deletes the rule with that pattern.**
+  * `pattern` (Required): The rule's dialed-number pattern, and its key in the table. May contain only letters, digits, `#` and `*`. Must not be `777`, `999`, `440` or `555` — those are routed before the dial plan, so such a rule could never fire.
+  * `action` (Optional, default `group`): `group` (ring/hunt group), `page` (paging zone), `park` (park orbit), or `trunk` (outbound PSTN access via the anchor/telephony provider — Issue #165).
+  * `target` (Optional): The extension the action routes to — a ring-group extension for `group`, a `980`–`989` zone for `page`, a `700`–`70N` orbit for `park` — or, for `trunk`, the digit string **prepended** to the dialed number after stripping. **An empty `target` deletes the rule with that pattern.**
+  * `stripDigits` (Optional, `trunk` only, default `0`): how many leading digits to remove from the dialed number before prepending `target`. Must fit the pattern: for a fixed-length pattern (no trailing `*`) it cannot exceed the pattern's length; a prefix pattern (trailing `*`) is instead checked against the *actual* dialed number at call time, and a rule that no longer fits answers `404` rather than placing a truncated number.
 * **Response Content-Type**: `application/json`
 * **Response Status Codes**:
   * `200 OK`
-  * `400 Bad Request`: `pattern` missing, `pattern`/`target` contains a character outside `[0-9A-Za-z#*]`, `pattern` is a reserved extension, `action` is not `group`/`page`/`park`, or the `target` is the wrong shape for the action.
+  * `400 Bad Request`: `pattern` missing, `pattern`/`target` contains a character outside `[0-9A-Za-z#*]`, `pattern` is a reserved extension, `action` is not `group`/`page`/`park`/`trunk`, the `target` is the wrong shape for the action, or `stripDigits` is not a small non-negative integer that fits the pattern.
   * `401 Unauthorized` / `403 Forbidden`: as above.
 
 > [!NOTE]
 > A rule whose target no longer resolves — a group or zone deleted after the rule
-> was written — is answered `404 Not Found` at dial time rather than falling
-> through, so a stale rule fails visibly instead of silently ringing whichever real
-> extension happens to share the dialed digits.
+> was written, a `trunk` rule whose `stripDigits` no longer fits the dialed number,
+> or no anchor/telephony provider currently connected — is answered `404 Not Found`
+> at dial time rather than falling through, so a stale rule fails visibly instead of
+> silently ringing whichever real extension happens to share the dialed digits.
+
+**`trunk` example**: dialing `9` + 11 digits, stripping the `9` and prepending `1`
+so `93057673260` reaches the configured trunk as `13057673260`:
+```
+pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=1
+```
+The transformed number is placed as an outbound call through whichever
+telephony-API slot is currently active — the same call-origination path virtual
+extension `555` uses, so it requires that provider to actually be connected.
+`target` is charset-limited the same as every other dial-plan token
+(`[0-9A-Za-z#*]`) — a bare national number like `1` works with most US trunks;
+there is no `+` E.164 prefix support here yet.
 
 #### Request Example (Form URL-Encoded)
 ```http

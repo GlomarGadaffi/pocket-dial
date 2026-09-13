@@ -82,11 +82,16 @@ bool LoopbackAnchorClient::isConnected() const
 	return _connected;
 }
 
-bool LoopbackAnchorClient::makeCall(const std::string& /*destination*/, std::string* ownLegOut)
+bool LoopbackAnchorClient::makeCall(const std::string& destination, std::string* ownLegOut)
 {
 	if (!_connected)
 	{
 		return false;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_lastMakeCallDestination = destination;
 	}
 
 	// Resolve our own leg synchronously (fixed mock id) so the engine can bind the

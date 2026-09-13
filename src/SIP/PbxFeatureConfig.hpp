@@ -80,9 +80,13 @@ public:
 	void setPageZone(const std::string& zoneExt, const std::string& members);
 	std::vector<std::pair<std::string, std::string>> pageZonesSnapshot() const;
 
-	// ── Dial plan (Issue #69) ─────────────────────────────────────────────────
-	void setDialRule(const std::string& pattern, const std::string& action, const std::string& target);
-	std::vector<std::tuple<std::string, std::string, std::string>> dialRulesSnapshot() const;
+	// ── Dial plan (Issue #69, Trunk action Issue #165) ───────────────────────────
+	// stripDigits is only meaningful for action "trunk" (leading digits removed
+	// from the dialed string before prepending `target`); every other action
+	// ignores it and it is stored as 0.
+	void setDialRule(const std::string& pattern, const std::string& action, const std::string& target,
+		int stripDigits = 0);
+	std::vector<std::tuple<std::string, std::string, std::string, int>> dialRulesSnapshot() const;
 	// Read-only access for CallForker::routeDialPlan() (CallForker.hpp) to call
 	// .empty()/.match() on directly.
 	const pbx::DialPlan& dialPlan() const { return _dialPlan; }

@@ -85,6 +85,16 @@ struct PbxEnv
 	// Parse the requested registration/subscription lease from Expires/Contact
 	// (RFC 3261 §10.2.1), clamped to the engine's default when absent.
 	virtual int requestedExpires(const std::shared_ptr<SipMessage>& msg) const = 0;
+
+	// Originate an outbound call through the configured anchor/telephony
+	// provider to `destination` (a dial-plan-transformed PSTN number — Issue
+	// #165's Trunk dial-plan action), on behalf of `data`/`caller`. Returns
+	// true iff it took ownership of the INVITE (some response was sent, or an
+	// async makeCall dispatched); false only when no anchor is connected, in
+	// which case the caller must send its own failure response — this method
+	// sends none in that case, to avoid answering the same INVITE twice.
+	virtual bool routeTrunkCall(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller, const std::string& destination) = 0;
 };
 
 #endif

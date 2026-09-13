@@ -36,6 +36,17 @@ public:
 	// answerCall(), which drives the participant to Answered — mirroring makeCall().
 	void simulateInboundCall(const std::string& callerId);
 
+	// Test hook (Issue #165): the `destination` argument makeCall() was last called
+	// with. LoopbackAnchorClient otherwise ignores it entirely (it's a mock loop, not
+	// a real trunk), so this is the only way a host test can prove a dial-plan Trunk
+	// rule's strip/prepend transform actually reached the anchor call rather than the
+	// caller's own untransformed number.
+	std::string lastMakeCallDestination() const
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		return _lastMakeCallDestination;
+	}
+
 private:
 	std::string _baseUrl;
 	std::string _clientId;
@@ -43,6 +54,7 @@ private:
 
 	std::atomic<bool> _connected{false};
 	std::string _activeParticipantId;
+	std::string _lastMakeCallDestination;
 
 	EventCallback   _eventCb;
 	AudioRxCallback _audioCb;

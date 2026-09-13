@@ -385,6 +385,29 @@ bool CallForker::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 		}
 		break;
 	}
+
+	case pbx::DialActionType::Trunk:
+	{
+		// Outbound PSTN access (Issue #165): transform the dialed digits and hand
+		// them to the same call-origination core the 555 anchor extension uses
+		// (RequestsHandler::originateAnchorCall(), reached here only through the
+		// PbxEnv virtual routeTrunkCall() — CallForker has no direct dependency
+		// on RequestsHandler). A stale rule whose stripDigits exceeds the dialed
+		// length falls through to the "target no longer resolves" 404 below,
+		// same as a deleted ring group or page zone.
+		std::string transformed;
+		if (pbx::applyTrunkTransform(destNumber, rule->stripDigits, rule->target, transformed))
+		{
+			// routeTrunkCall() returns false ONLY when no anchor is connected, in
+			// which case it sent nothing — fall through to the shared 404 below
+			// exactly as if the target didn't resolve, rather than answering twice.
+			if (_env.routeTrunkCall(data, caller, transformed))
+			{
+				return true;
+			}
+		}
+		break;
+	}
 	}
 
 	// The rule matched but its target no longer resolves — a group or zone deleted

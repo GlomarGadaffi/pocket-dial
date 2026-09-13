@@ -942,11 +942,11 @@ void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 {
 	std::string destNumber(data->getToNumber());
+	auto cancelSess = getSession(data->getCallID());
 
 	// Issue #46: same off-path teardown guard as onBye(). A CANCEL whose Call-ID
 	// names an established two-leg dialog must come from a leg IP.
-	if (auto cancelSess = getSession(data->getCallID());
-		cancelSess.has_value() &&
+	if (cancelSess.has_value() &&
 		!isDialogSourceAuthorized(cancelSess.value(), data->getSource()))
 	{
 		queueLog("CANCEL for Call-ID " + std::string(data->getCallID()) +
@@ -977,7 +977,18 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	if (destNumber == kAnchorCallExt)
+	// A dial-plan Trunk rule (Issue #165) originates an anchor call under
+	// whatever digits the caller actually dialed (e.g. "93057673260"), not the
+	// literal 555 feature code — CANCEL must match the original INVITE's
+	// Request-URI verbatim (RFC 3261 §9.1), so destNumber above is that dialed
+	// string, not "555". Recognize the session by its own isAnchor() flag as well
+	// as the literal code, or a trunk-dialed CANCEL falls through to the generic
+	// findClient(destNumber) path below, which never finds a registered peer for
+	// a dialed PSTN number, answers 404, and never calls endCall() — leaking the
+	// MediaBridge and the live carrier leg. isAnchorInbound() sessions (ring-all
+	// from a real PSTN inbound call) are excluded: their teardown is unrelated.
+	if (destNumber == kAnchorCallExt ||
+		(cancelSess.has_value() && cancelSess.value()->isAnchor() && !cancelSess.value()->isAnchorInbound()))
 	{
 		// CANCEL of an anchor-bridge dial-in. For Loopback (answers synchronously,
 		// no ringing window) this is mostly defensive symmetry with 777/440/888 —
@@ -996,7 +1007,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 			_outbox.emplace_back(data->getSource(), std::move(response));
 		}
-		endCall(data->getCallID(), data->getFromNumber(), kAnchorCallExt, "handset CANCEL");
+		endCall(data->getCallID(), data->getFromNumber(), destNumber, "handset CANCEL");
 		return;
 	}
 
@@ -1825,8 +1836,30 @@ bool RequestsHandler::anchorIsSynchronous() const
 void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller)
 {
+	// 555 is a fixed feature code (like 777/440/888) with nothing dialed after
+	// it, so the only sensible makeCall() destination is whoever dialed in —
+	// see originateAnchorCall()'s doc comment for the trunk-access case, where a
+	// real digit string follows. respondIfDisconnected=true: a bare 555 dial IS
+	// the whole request, so "no anchor connected" must answer 404 itself.
+	originateAnchorCall(std::move(data), caller, std::string(caller->getNumber()),
+		/*respondIfDisconnected=*/true);
+}
+
+bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
+	const std::shared_ptr<SipClient>& caller, const std::string& destination,
+	bool respondIfDisconnected)
+{
 	const std::string activeIp = _localIp;
 	const std::string callID(data->getCallID());
+	// The remote target both this response's Contact and every later in-dialog
+	// request (BYE/CANCEL/ACK) key on. For a plain 555 dial this is "555"; for a
+	// dial-plan Trunk rule (Issue #165) it is whatever digits the caller actually
+	// dialed — buildOkWithSdp() below already derives its own Contact this same
+	// way (data->getToNumber()), so this just brings the refuse/ringing paths
+	// into agreement with it. onCancel()/onBye()/onAck() additionally recognize
+	// the session by isAnchor() so a non-"555" remote target still tears down
+	// correctly (see those functions' comments).
+	const std::string remoteExt(data->getToNumber());
 
 	auto refuse = [&](const char* statusLine, const char* why) {
 		auto msg = getMessageFromPool(*data);
@@ -1834,9 +1867,9 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 		msg->setHeader(statusLine);
 		msg->clearBody();
 		msg->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		msg->setContact(buildContact(kAnchorCallExt));
+		msg->setContact(buildContact(remoteExt));
 		_outbox.emplace_back(data->getSource(), std::move(msg));
-		queueLog("555 anchor: " + std::string(why) + " for "
+		queueLog("anchor(" + remoteExt + "): " + std::string(why) + " for "
 			+ std::string(data->getFromNumber()), true);
 	};
 
@@ -1844,10 +1877,22 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 	{
 		// No provider selected, or it hasn't (yet) connected — same "feature not
 		// actually available" honesty StubTelephonyProvider models. 404 rather
-		// than 503: this is not a transient capacity problem, dialing 555 simply
-		// doesn't resolve to anything right now.
-		refuse(SipMessageTypes::NOT_FOUND, "no anchor client connected");
-		return;
+		// than 503: this is not a transient capacity problem, dialing in simply
+		// doesn't resolve to anything right now. For a Trunk-routed call
+		// (respondIfDisconnected=false), the caller (CallForker::routeDialPlan)
+		// owns sending that 404 itself — its existing "rule matched but the
+		// target doesn't resolve" tail — so this must not also answer, or the
+		// handset gets two final responses to one INVITE.
+		if (respondIfDisconnected)
+		{
+			refuse(SipMessageTypes::NOT_FOUND, "no anchor client connected");
+		}
+		else
+		{
+			queueLog("anchor(" + remoteExt + "): trunk call to " + destination +
+				" refused, no anchor client connected", true);
+		}
+		return false;
 	}
 
 	// Anchor-bridge media is SERVER-terminated and speaks G.711 only (buildMediaSdp
@@ -1859,7 +1904,7 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false))
 	{
 		refuse("SIP/2.0 488 Not Acceptable Here", "no G.711 codec offered");
-		return;
+		return true;
 	}
 
 	// Where does this phone want its audio? Same c=/m= parse the 440/888 paths use.
@@ -1868,7 +1913,7 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 	if (!parseCallerRtp(data, destIp, destPort))
 	{
 		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in INVITE");
-		return;
+		return true;
 	}
 
 	if (anchorIsSynchronous())
@@ -1887,30 +1932,28 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 			// the equivalent WAN-anchor wiring in the sibling commercial product does
 			// for the same reason.
 			refuse("SIP/2.0 503 Service Unavailable", "every anchor bridge slot busy");
-			return;
+			return true;
 		}
 
 		// makeCall() before startBridge(): a bridge with no far side to carry audio to
-		// is pointless to stand up. `destination` here is the CALLER's own number, not
-		// a dialed digit string — 555 is a fixed feature code (like 777/440/888), so
-		// there is nothing after it to strip the way a trunk-access prefix would; a
-		// real AnchorClient's own configuration decides where the bridged audio
-		// actually goes (a recording line, an AI pipeline, a monitored DN, ...), and
-		// `destination` just tells it who is calling in. LoopbackAnchorClient resolves
-		// its own leg (ownLeg) SYNCHRONOUSLY, before any Ringing/Answered event, so it
-		// can be bound to the bridge right away (see its doc comment).
+		// is pointless to stand up. `destination` is the caller's own number for a
+		// plain 555 dial, or the dial-plan-transformed digit string for a Trunk rule
+		// (Issue #165) — either way, the AnchorClient decides where it actually goes.
+		// LoopbackAnchorClient resolves its own leg (ownLeg) SYNCHRONOUSLY, before any
+		// Ringing/Answered event, so it can be bound to the bridge right away (see its
+		// doc comment).
 		std::string ownLeg;
-		if (!_anchorClient->makeCall(std::string(caller->getNumber()), &ownLeg))
+		if (!_anchorClient->makeCall(destination, &ownLeg))
 		{
 			refuse("SIP/2.0 503 Service Unavailable", "anchor declined makeCall");
-			return;
+			return true;
 		}
 
 		if (!bridge->startBridge(destIp, destPort, callID, ownLeg))
 		{
 			_anchorClient->dropCall(ownLeg);
 			refuse("SIP/2.0 503 Service Unavailable", "media bridge failed to start");
-			return;
+			return true;
 		}
 
 		auto newSession = allocateSession(callID, caller);
@@ -1919,7 +1962,7 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 			bridge->stopBridge();
 			_anchorClient->dropCall(ownLeg);
 			refuse("SIP/2.0 503 Service Unavailable", "session pool full");
-			return;
+			return true;
 		}
 
 		// Draw the answer BEFORE publishing the session — same "a pool refusal must
@@ -1933,12 +1976,15 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 		{
 			bridge->stopBridge();
 			_anchorClient->dropCall(ownLeg);
-			queueLog("555 anchor: message pool exhausted, call unwound", true);
-			return;
+			queueLog("anchor(" + remoteExt + "): message pool exhausted, call unwound", true);
+			return true;
 		}
 
 		// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
-		// call can't overwrite this call's destination identity.
+		// call can't overwrite this call's destination identity. Always kAnchorCallExt
+		// (not remoteExt): this is dialog bookkeeping isAnchor()-adjacent code keys on
+		// (onReinvite/onUpdate), not the dialed digits, so it must stay stable across
+		// both a plain 555 dial and a Trunk-routed one.
 		auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
 		newSession->setDest(dummyAnchor);
 		newSession->setAnchor(true);
@@ -1948,9 +1994,9 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 
 		_outbox.emplace_back(data->getSource(), std::move(ok));
 
-		queueLog("555 anchor: " + std::string(caller->getNumber()) + " bridged (participant "
+		queueLog("anchor(" + remoteExt + "): " + std::string(caller->getNumber()) + " bridged (participant "
 			+ ownLeg + "), media to " + destIp + ":" + std::to_string(destPort));
-		return;
+		return true;
 	}
 
 	// A real WAN-anchor client (Stage B): admission is capacity-only here —
@@ -1962,14 +2008,14 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 	if (allBridgesBusy())
 	{
 		refuse("SIP/2.0 503 Service Unavailable", "every anchor bridge slot busy");
-		return;
+		return true;
 	}
 
 	auto newSession = allocateSession(callID, caller);
 	if (!newSession)
 	{
 		refuse("SIP/2.0 503 Service Unavailable", "session pool full");
-		return;
+		return true;
 	}
 
 	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
@@ -1993,16 +2039,18 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 		ringing->clearBody();
 		ringing->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		ringing->setTo(std::string(data->getTo()) + ";tag=" + localTag);
-		ringing->setContact(buildContact(kAnchorCallExt));
+		ringing->setContact(buildContact(remoteExt));
 		_outbox.emplace_back(data->getSource(), std::move(ringing));
 	}
 
-	// `destination` here is the CALLER's own number, not a dialed digit string —
-	// see the synchronous branch's comment above for why. Dispatched off the SIP
-	// thread; the 200 OK follows later from the CallEvent::Answered callback once
-	// the far leg actually connects.
-	asyncMakeCall(std::string(caller->getNumber()), callID, caller->getNumber());
-	queueLog("555 anchor: " + std::string(caller->getNumber()) + " ringing (async makeCall dispatched)");
+	// `destination` is the caller's own number for a plain 555 dial, or the
+	// dial-plan-transformed digit string for a Trunk rule (Issue #165) — see the
+	// synchronous branch's comment above. Dispatched off the SIP thread; the
+	// 200 OK follows later from the CallEvent::Answered callback once the far
+	// leg actually connects.
+	asyncMakeCall(destination, callID, caller->getNumber());
+	queueLog("anchor(" + remoteExt + "): " + std::string(caller->getNumber()) + " ringing (async makeCall dispatched)");
+	return true;
 }
 
 // ── Anchor async wrappers (Stage B) ──────────────────────────────────────────
@@ -2883,7 +2931,11 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	if (destNumber == kAnchorCallExt)
+	// See onCancel()'s matching comment: a Trunk-routed anchor call's BYE remote
+	// target is the dialed digits (buildOkWithSdp's Contact uses getToNumber()),
+	// not the literal 555 code, so recognize the session by isAnchor() too.
+	if (destNumber == kAnchorCallExt ||
+		(session.has_value() && session.value()->isAnchor() && !session.value()->isAnchorInbound()))
 	{
 		// Anchor-bridge hang-up: 200 OK the BYE and end the call. endCall() (below)
 		// best-effort drops the anchor-side leg and releases the MediaBridge.
@@ -3292,7 +3344,13 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	if (destNumber == kAnchorCallExt)
+	// See onCancel()'s matching comment: a Trunk-routed anchor call's ACK
+	// Request-URI carries the dialed digits, not the literal 555 code, so
+	// recognize the session by isAnchor() too — otherwise this ACK falls through
+	// and the ring timer is never disarmed, and tick() reaps the just-answered
+	// call at ANCHOR_ACK_TIMEOUT as if the handset never ACKed it.
+	if (destNumber == kAnchorCallExt ||
+		(session.value()->isAnchor() && !session.value()->isAnchorInbound()))
 	{
 		// Same as 777/888 above: the server is the UAS on an anchor-bridge leg, so
 		// the ACK completes our own 200 OK with no second SIP leg to relay it to.
@@ -4439,12 +4497,12 @@ void RequestsHandler::refreshPbxConfigSnapshot(PbxFeatureConfig::Table t)
 }
 
 void RequestsHandler::setDialRule(const std::string& pattern, const std::string& action,
-	const std::string& target)
+	const std::string& target, int stripDigits)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		_cfg.setDialRule(pattern, action, target);
+		_cfg.setDialRule(pattern, action, target, stripDigits);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -4456,7 +4514,7 @@ void RequestsHandler::setDialRule(const std::string& pattern, const std::string&
 	}
 }
 
-std::vector<std::tuple<std::string, std::string, std::string>> RequestsHandler::getDialRules()
+std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getDialRules()
 {
 	std::lock_guard<std::mutex> lock(_snapshotMutex);
 	return _snapshot.dialRules;

@@ -16,6 +16,13 @@
 //   park   → the park orbit named by the rule's target (Issue #65, 700–70N);
 //            dialing a rule with this action is exactly dialing the orbit, i.e.
 //            park into a free slot / retrieve from an occupied one
+//   trunk  → outbound PSTN access via the configured anchor/telephony provider
+//            (Issue #165): strip the rule's stripDigits leading digits off the
+//            dialed string, prepend `target`, and place the result as an
+//            outbound call through RequestsHandler::originateAnchorCall() (the
+//            same call-origination core the 555 anchor extension uses). E.g.
+//            pattern "9XXXXXXXXXX", stripDigits 1, target "1" turns a dial of
+//            "93057673260" into "13057673260".
 //
 // (Issue #68's directed pickup is deliberately absent: it is not on main. Adding
 // it later is one enum value, one parse/name string, and one dispatch arm.)
@@ -66,16 +73,21 @@ namespace pbx
 	{
 		RingGroup,   // route to the ring/hunt group named by `target`
 		PageZone,    // route to the paging zone named by `target`
-		ParkOrbit    // route to the park orbit named by `target` (park/retrieve)
+		ParkOrbit,   // route to the park orbit named by `target` (park/retrieve)
+		Trunk        // outbound PSTN access: strip stripDigits, prepend `target`
 	};
 
-	// One rule: a pattern, the action it selects, and the action's target
-	// (a group extension, a zone extension, or an orbit extension).
+	// One rule: a pattern, the action it selects, and the action's target (a
+	// group extension, a zone extension, an orbit extension, or — for Trunk —
+	// the digit string prepended to the dialed number after stripping).
+	// stripDigits is meaningless for every action but Trunk, where it counts
+	// leading digits removed from the dialed string before prepending target.
 	struct DialRule
 	{
 		std::string pattern;
 		DialActionType action = DialActionType::RingGroup;
 		std::string target;
+		int stripDigits = 0;
 	};
 
 	// ── Pure helpers (unit-tested directly) ───────────────────────────────────
@@ -89,6 +101,7 @@ namespace pbx
 		{
 		case DialActionType::PageZone:  return "page";
 		case DialActionType::ParkOrbit: return "park";
+		case DialActionType::Trunk:     return "trunk";
 		case DialActionType::RingGroup:
 		default:                        return "group";
 		}
@@ -99,6 +112,7 @@ namespace pbx
 		if (name == "group") { out = DialActionType::RingGroup; return true; }
 		if (name == "page")  { out = DialActionType::PageZone;  return true; }
 		if (name == "park")  { out = DialActionType::ParkOrbit; return true; }
+		if (name == "trunk") { out = DialActionType::Trunk;     return true; }
 		return false;
 	}
 
@@ -133,6 +147,24 @@ namespace pbx
 				return false;
 			}
 		}
+		return true;
+	}
+
+	// Trunk-access digit transform (Issue #165): strip `stripDigits` leading
+	// characters off `dialed` and prepend `prepend`. Returns false (leaving
+	// `out` untouched) if `stripDigits` exceeds `dialed`'s length — a stale
+	// rule (e.g. strip=1 saved against an 11-digit pattern, then the pattern
+	// loosened to match shorter numbers) must refuse rather than silently
+	// mis-dial a truncated or garbage number. Pure and allocation-free bar the
+	// one output string, so it is host-testable without a rule/pattern at all.
+	inline bool applyTrunkTransform(const std::string& dialed, int stripDigits,
+		const std::string& prepend, std::string& out)
+	{
+		if (stripDigits < 0 || static_cast<size_t>(stripDigits) > dialed.size())
+		{
+			return false;
+		}
+		out = prepend + dialed.substr(static_cast<size_t>(stripDigits));
 		return true;
 	}
 

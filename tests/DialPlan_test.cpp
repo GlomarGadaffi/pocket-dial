@@ -29,8 +29,10 @@
 #include <vector>
 
 #include "AdminAuth.hpp"
+#include "AnchorClient.hpp"
 #include "DialPlan.hpp"
 #include "HttpServer.hpp"
+#include "LoopbackAnchorClient.hpp"
 #include "PbxConfig.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
@@ -99,6 +101,58 @@ namespace
 			"Contact: <sip:" + fromExt + "@" + srcIp + ":5060>\r\n"
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
+	}
+
+	// A BYE whose Request-URI targets `toExt` — for a Trunk-routed anchor call
+	// this is the DIALED digits, not "555" (see RequestsHandler::onBye()'s
+	// comment on why), mirroring what buildOkWithSdp()'s Contact actually sends
+	// the phone as the remote target after the INVITE is answered.
+	std::shared_ptr<SipMessage> makeBye(const std::string& fromExt, const std::string& toExt,
+		const std::string& srcIp, const std::string& callId)
+	{
+		std::string raw =
+			"BYE sip:" + toExt + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKb" + callId + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + toExt + "@server>;tag=srv" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 2 BYE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
+	}
+
+	// A CANCEL whose Request-URI matches the ORIGINAL INVITE's exactly (RFC
+	// 3261 §9.1 — unlike BYE, CANCEL never uses the Contact-derived remote
+	// target), so `toExt` here must be the same digits the INVITE dialed.
+	std::shared_ptr<SipMessage> makeCancel(const std::string& fromExt, const std::string& toExt,
+		const std::string& srcIp, const std::string& callId)
+	{
+		std::string raw =
+			"CANCEL sip:" + toExt + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKi" + callId + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + toExt + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 CANCEL\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
+	}
+
+	// An ACK whose Request-URI targets `toExt` — same Contact-derived remote
+	// target as BYE (RFC 3261 dialog rules), so for a Trunk-routed anchor call
+	// this is the dialed digits, not "555".
+	std::shared_ptr<SipMessage> makeAck(const std::string& fromExt, const std::string& toExt,
+		const std::string& srcIp, const std::string& callId)
+	{
+		std::string raw =
+			"ACK sip:" + toExt + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKa" + callId + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + toExt + "@server>;tag=srv" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 ACK\r\n"
+			"Content-Length: 0\r\n\r\n";
 		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
 	}
 
@@ -248,11 +302,40 @@ TEST(DialPlanPattern, ActionNamesRoundTrip)
 	EXPECT_EQ(a, pbx::DialActionType::ParkOrbit);
 	EXPECT_STREQ(pbx::dialActionName(a), "park");
 
+	ASSERT_TRUE(pbx::parseDialAction("trunk", a));
+	EXPECT_EQ(a, pbx::DialActionType::Trunk);
+	EXPECT_STREQ(pbx::dialActionName(a), "trunk");
+
 	// Unknown names must be REJECTED, not silently defaulted — a corrupt NVS
 	// record must never turn into some action the operator never configured.
 	EXPECT_FALSE(pbx::parseDialAction("pickup", a));
 	EXPECT_FALSE(pbx::parseDialAction("", a));
 	EXPECT_FALSE(pbx::parseDialAction("GROUP", a));
+}
+
+TEST(DialPlanPattern, TrunkTransformStripsAndPrepends)
+{
+	// The user's own worked example: dial 9 + 11 digits, strip the leading 9,
+	// prepend "1" -> 93057673260 becomes 13057673260 (Issue #165).
+	std::string out;
+	ASSERT_TRUE(pbx::applyTrunkTransform("93057673260", 1, "1", out));
+	EXPECT_EQ(out, "13057673260");
+
+	// Strip 0 is just "prepend".
+	ASSERT_TRUE(pbx::applyTrunkTransform("5551234", 0, "9", out));
+	EXPECT_EQ(out, "95551234");
+
+	// Stripping everything is legal (result is bare `prepend`).
+	ASSERT_TRUE(pbx::applyTrunkTransform("911", 3, "", out));
+	EXPECT_EQ(out, "");
+
+	// Stripping MORE than the dialed string's length must refuse, not underflow
+	// or silently clamp — a stale rule must fail loudly (CallForker's caller
+	// treats a false return as "target no longer resolves", same as a deleted
+	// ring group or page zone).
+	EXPECT_FALSE(pbx::applyTrunkTransform("123", 4, "1", out));
+	EXPECT_FALSE(pbx::applyTrunkTransform("", 1, "1", out));
+	EXPECT_FALSE(pbx::applyTrunkTransform("123", -1, "1", out));
 }
 
 TEST(DialPlanPattern, TokenSafetyRejectsBlobSeparators)
@@ -482,6 +565,8 @@ TEST(DialPlanCap, SetDialRuleRejectsMalformedRules)
 	handler.setDialRule("777", "group", "610");          // reserved: routed before the plan
 	handler.setDialRule("999", "group", "610");
 	handler.setDialRule("440", "group", "610");
+	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", -1);   // negative strip
+	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 999);  // strip exceeds the fixed pattern length
 
 	EXPECT_TRUE(handler.getDialRules().empty())
 		<< "every malformed rule above must be dropped, not stored";
@@ -489,7 +574,8 @@ TEST(DialPlanCap, SetDialRuleRejectsMalformedRules)
 	// …and the valid shapes of each still land.
 	handler.setDialRule("6XX", "page", "981");
 	handler.setDialRule("7XX", "park", "701");
-	EXPECT_EQ(handler.getDialRules().size(), 2u);
+	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
+	EXPECT_EQ(handler.getDialRules().size(), 3u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -693,6 +779,153 @@ TEST(DialPlanRouting, MatchedRuleWithAStaleTargetAnswers404NotAMisroutedCall)
 		<< "a stale rule must not silently fall through and ring extension 600";
 }
 
+// ── Trunk action (Issue #165): outbound PSTN access via the anchor client ────
+
+TEST(DialPlanRouting, TrunkActionOriginatesAnAnchorCallWithTheTransformedNumber)
+{
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	registerThreePhones(handler);
+	// The user's own worked example: dial 9 + 11 digits, strip the leading 9,
+	// prepend "1" -> 93057673260 becomes 13057673260.
+	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
+
+	wire.clear();
+	handler.handle(makeInvite("500", "93057673260", "192.168.9.50", "plan-trunk"));
+
+	EXPECT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
+	EXPECT_TRUE(wire.sawContaining("a=sendrecv"))
+		<< "an anchor leg must be two-way or bridged audio never reaches the anchor";
+	// The remote target is the DIALED digits, not the literal 555 feature code —
+	// buildOkWithSdp() derives Contact from data->getToNumber(), which for a
+	// Trunk rule is whatever the caller actually dialed.
+	EXPECT_TRUE(wire.sawContaining("Contact: <sip:93057673260"))
+		<< "the answer's Contact must name the dialed digits for a trunk call";
+
+	ASSERT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: plan-trunk"), nullptr)
+		<< "no anchor MediaBridge is bridging this trunk call";
+
+	// The load-bearing assertion: the TRANSFORMED number, not the caller's own
+	// number and not the untransformed dialed digits, is what actually reached
+	// the anchor client's makeCall().
+	auto* loopback = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loopback, nullptr) << "host tests boot the Loopback anchor provider";
+	EXPECT_EQ(loopback->lastMakeCallDestination(), "13057673260");
+}
+
+TEST(DialPlanRouting, TrunkActionByeTearsDownTheBridgeAndTheSession)
+{
+	// Regression test for the onBye() fix this feature required: a Trunk call's
+	// BYE targets the DIALED digits (its Contact-derived remote target), not the
+	// literal "555" onBye()'s destNumber-literal check alone would have matched
+	// — before the fix this fell through to the generic findClient() path, 404d
+	// the BYE, and never called endCall(), leaking the MediaBridge and leaving
+	// the simulated carrier leg up forever.
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	registerThreePhones(handler);
+	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
+
+	wire.clear();
+	handler.handle(makeInvite("500", "93057673260", "192.168.9.50", "plan-trunk-bye"));
+	ASSERT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
+	ASSERT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: plan-trunk-bye"), nullptr);
+	ASSERT_TRUE(handler.getSession("Call-ID: plan-trunk-bye").has_value());
+
+	wire.clear();
+	handler.handle(makeBye("500", "93057673260", "192.168.9.50", "plan-trunk-bye"));
+
+	EXPECT_TRUE(wire.sawContaining("SIP/2.0 200 OK")) << "the BYE must be answered";
+	EXPECT_FALSE(handler.getSession("Call-ID: plan-trunk-bye").has_value());
+	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: plan-trunk-bye"), nullptr)
+		<< "endCall() must release the bridge for a trunk call, exactly as it does for 555";
+}
+
+TEST(DialPlanRouting, TrunkActionCancelTearsDownTheBridgeAndTheSession)
+{
+	// Same regression as the BYE test above, for onCancel(): CANCEL's
+	// Request-URI matches the ORIGINAL INVITE (RFC 3261 Section 9.1), which for a
+	// trunk call is the dialed digits, not "555".
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	registerThreePhones(handler);
+	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
+
+	wire.clear();
+	handler.handle(makeInvite("500", "93057673260", "192.168.9.50", "plan-trunk-cancel"));
+	ASSERT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
+	ASSERT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: plan-trunk-cancel"), nullptr);
+
+	wire.clear();
+	handler.handle(makeCancel("500", "93057673260", "192.168.9.50", "plan-trunk-cancel"));
+
+	EXPECT_TRUE(wire.sawContaining("SIP/2.0 200 OK")) << "the CANCEL must get its own 200 OK";
+	EXPECT_FALSE(handler.getSession("Call-ID: plan-trunk-cancel").has_value());
+	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: plan-trunk-cancel"), nullptr)
+		<< "endCall() must release the bridge for a trunk call, exactly as it does for 555";
+}
+
+TEST(DialPlanRouting, TrunkActionAckIsAbsorbedNotRelayedOr404d)
+{
+	// Regression for onAck()'s matching fix: the server is the UAS on a trunk
+	// leg exactly as it is on 555, so a genuine ACK must complete the 200 OK
+	// silently (nothing more on the wire) — never fall through to a 404 or a
+	// relay attempt, which would also leave the ANCHOR_ACK_TIMEOUT ring timer
+	// armed and let tick() wrongly reap an already-answered call.
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	registerThreePhones(handler);
+	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
+
+	wire.clear();
+	handler.handle(makeInvite("500", "93057673260", "192.168.9.50", "plan-trunk-ack"));
+	ASSERT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
+
+	wire.clear();
+	handler.handle(makeAck("500", "93057673260", "192.168.9.50", "plan-trunk-ack"));
+
+	EXPECT_TRUE(wire.sent.empty())
+		<< "the server is the UAS on a trunk leg — no relay, no 404, for the ACK";
+	EXPECT_TRUE(handler.getSession("Call-ID: plan-trunk-ack").has_value())
+		<< "the ACK must not tear the call down, only disarm its ring timer";
+}
+
+TEST(DialPlanRouting, TrunkActionWithStaleStripDigitsAnswers404NotAMisdial)
+{
+	// stripDigits is only bounds-checked against a FIXED pattern at config time
+	// (SetDialRuleRejectsMalformedRules above); a prefix pattern's minimum match
+	// length can still be shorter than stripDigits at actual dial time (e.g. the
+	// pattern was loosened after the rule was written). applyTrunkTransform()
+	// catches this at match time and CallForker must answer 404, never place a
+	// truncated or garbage number.
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	registerThreePhones(handler);
+	handler.setDialRule("9*", "trunk", "1", 5);   // prefix pattern; strip exceeds a short dial
+
+	wire.clear();
+	handler.handle(makeInvite("500", "91", "192.168.9.50", "plan-trunk-stale"));
+
+	EXPECT_TRUE(wire.sawContaining("404 Not Found"));
+	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: plan-trunk-stale"), nullptr)
+		<< "a stale strip count must not place any call, transformed or not";
+}
+
 TEST(DialPlanRouting, GroupActionAnswers480WhenNoMemberIsRegistered)
 {
 	// The rule and its group are both fine; the members just aren't online. This
@@ -859,9 +1092,11 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 		"pattern=6*&action=group&target=610", cookie, csrf)), 200);
 	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
 		"pattern=%239&action=park&target=701", cookie, csrf)), 200);
+	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
+		"pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=1", cookie, csrf)), 200);
 
 	auto rules = handler.getDialRules();
-	ASSERT_EQ(rules.size(), 4u);
+	ASSERT_EQ(rules.size(), 5u);
 	EXPECT_EQ(std::get<0>(rules[0]), "2XX");
 	EXPECT_EQ(std::get<1>(rules[0]), "group");
 	EXPECT_EQ(std::get<2>(rules[0]), "610");
@@ -871,6 +1106,10 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 		<< "a trailing-star prefix rule must round-trip the form body verbatim";
 	EXPECT_EQ(std::get<0>(rules[3]), "#9")
 		<< "a '#' pattern must survive url-decoding as the literal character";
+	EXPECT_EQ(std::get<0>(rules[4]), "9XXXXXXXXXX");
+	EXPECT_EQ(std::get<1>(rules[4]), "trunk");
+	EXPECT_EQ(std::get<2>(rules[4]), "1");
+	EXPECT_EQ(std::get<3>(rules[4]), 1) << "stripDigits must round-trip through the form body";
 
 	// The rule table is readable back out of /api/status, in table order.
 	std::string status = httpGetRaw(18090, "/api/status");
@@ -880,10 +1119,13 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 	EXPECT_NE(first, std::string::npos);
 	EXPECT_NE(second, std::string::npos);
 	EXPECT_LT(first, second) << "/api/status must emit the plan in evaluation order";
+	EXPECT_NE(status.find("\"pattern\":\"9XXXXXXXXXX\",\"action\":\"trunk\",\"target\":\"1\",\"stripDigits\":1"),
+		std::string::npos) << "/api/status must emit stripDigits for a trunk rule";
 
 	// An empty target deletes — including a pattern carrying a wildcard.
 	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=2XX&target=", cookie, csrf)), 200);
 	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=6*&target=", cookie, csrf)), 200);
+	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=9XXXXXXXXXX&target=", cookie, csrf)), 200);
 	rules = handler.getDialRules();
 	ASSERT_EQ(rules.size(), 2u);
 	EXPECT_EQ(std::get<0>(rules[0]), "3XX");
@@ -918,6 +1160,15 @@ TEST(DialPlanHttp, PostApiDialPlanRejectsBadParametersWith400)
 		"pattern=777&action=group&target=610", cookie, csrf)), 400) << "reserved extension as a pattern";
 	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
 		"pattern=2%20XX&action=group&target=610", cookie, csrf)), 400) << "unsafe character in pattern";
+	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+		"pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=-1", cookie, csrf)), 400)
+		<< "negative stripDigits";
+	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+		"pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=abc", cookie, csrf)), 400)
+		<< "non-numeric stripDigits";
+	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+		"pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=999", cookie, csrf)), 400)
+		<< "stripDigits exceeds this pattern's fixed length";
 
 	EXPECT_TRUE(handler.getDialRules().empty())
 		<< "no rejected request may have reached the rule table";

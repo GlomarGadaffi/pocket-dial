@@ -11,6 +11,8 @@
 #include "ProvisioningConfig.hpp"
 #include "index_html.h"
 #include "IPHelper.hpp"
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <iostream>
@@ -908,7 +910,7 @@ void HttpServer::sendApiStatus(int sock)
 	std::vector<std::string> dndExtensions;
 	std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwards;
 	std::vector<std::tuple<std::string, std::string, std::string>> ringGroups;
-	std::vector<std::tuple<std::string, std::string, std::string>> dialRules;
+	std::vector<std::tuple<std::string, std::string, std::string, int>> dialRules;
 	uint64_t packets = 0;
 	uint64_t dropped = 0;
 
@@ -1008,15 +1010,17 @@ void HttpServer::sendApiStatus(int sock)
 	}
 	json << "],";
 
-	// Dial-plan rules (Issue #69). Emitted in TABLE ORDER — this array's order is
-	// load-bearing (first match wins), unlike the sets above.
+	// Dial-plan rules (Issue #69, stripDigits for the Trunk action Issue #165).
+	// Emitted in TABLE ORDER — this array's order is load-bearing (first match
+	// wins), unlike the sets above.
 	json << "\"dialplan\":[";
 	for (size_t i = 0; i < dialRules.size(); i++)
 	{
 		if (i > 0) json << ",";
 		json << "{\"pattern\":\"" << jsonEscape(std::get<0>(dialRules[i]))
 		     << "\",\"action\":\"" << jsonEscape(std::get<1>(dialRules[i]))
-		     << "\",\"target\":\"" << jsonEscape(std::get<2>(dialRules[i])) << "\"}";
+		     << "\",\"target\":\"" << jsonEscape(std::get<2>(dialRules[i]))
+		     << "\",\"stripDigits\":" << std::get<3>(dialRules[i]) << "}";
 	}
 	json << "]";
 
@@ -1287,15 +1291,19 @@ void HttpServer::sendApiGroup(int sock, const std::string& body)
 
 void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 {
-	// Issue #69. Params: pattern (the rule's key), action ("group"|"page"|"park"),
-	// target (the group/zone/orbit extension). An empty target deletes the rule.
-	// The dial plan is ORDERED and first-match-wins, so an existing pattern is
-	// edited in place (keeping its position) and a new one is appended — see
-	// RequestsHandler::setDialRule, which owns the full validation and the
-	// POCKETDIAL_MAX_DIAL_RULES cap.
+	// Issue #69 (Trunk action Issue #165). Params: pattern (the rule's key),
+	// action ("group"|"page"|"park"|"trunk"), target (the group/zone/orbit
+	// extension, or — for "trunk" — the digit string prepended after
+	// stripping), stripDigits (trunk only: leading digits removed from the
+	// dialed string before prepending target). An empty target deletes the
+	// rule. The dial plan is ORDERED and first-match-wins, so an existing
+	// pattern is edited in place (keeping its position) and a new one is
+	// appended — see RequestsHandler::setDialRule, which owns the full
+	// validation and the POCKETDIAL_MAX_DIAL_RULES cap.
 	std::string pattern = getFormParam(body, "pattern");
 	std::string action  = getFormParam(body, "action");
 	std::string target  = getFormParam(body, "target");
+	std::string stripDigitsStr = getFormParam(body, "stripDigits");
 
 	if (pattern.empty())
 	{
@@ -1316,6 +1324,7 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 		return;
 	}
 
+	int stripDigits = 0;
 	// A delete only needs the pattern; everything else is validated for an upsert.
 	if (!target.empty())
 	{
@@ -1324,7 +1333,7 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 		if (!pbx::parseDialAction(action, parsed))
 		{
 			sendResponse(sock, 400, "Bad Request", "application/json",
-			             "{\"error\":\"action must be group|page|park\"}");
+			             "{\"error\":\"action must be group|page|park|trunk\"}");
 			return;
 		}
 		if (!pbx::isDialTokenSafe(target))
@@ -1345,17 +1354,41 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 			             "{\"error\":\"park target must be a park orbit\"}");
 			return;
 		}
+		if (parsed == pbx::DialActionType::Trunk)
+		{
+			// Digits only, and short — this is a strip COUNT, not a phone number;
+			// reject anything else outright rather than feeding atoi() garbage
+			// (a leading '-' would parse to a negative stripDigits, atoi's other
+			// failure mode returns 0, silently accepting a typo as "strip nothing").
+			bool digitsOnly = !stripDigitsStr.empty() && stripDigitsStr.size() <= 3 &&
+				std::all_of(stripDigitsStr.begin(), stripDigitsStr.end(),
+					[](unsigned char c) { return std::isdigit(c); });
+			if (!stripDigitsStr.empty() && !digitsOnly)
+			{
+				sendResponse(sock, 400, "Bad Request", "application/json",
+				             "{\"error\":\"stripDigits must be a small non-negative integer\"}");
+				return;
+			}
+			stripDigits = stripDigitsStr.empty() ? 0 : std::atoi(stripDigitsStr.c_str());
+			if (pattern.back() != '*' && static_cast<size_t>(stripDigits) > pattern.size())
+			{
+				sendResponse(sock, 400, "Bad Request", "application/json",
+				             "{\"error\":\"stripDigits exceeds this pattern's fixed length\"}");
+				return;
+			}
+		}
 	}
 
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
-		handler->setDialRule(pattern, action, target);
+		handler->setDialRule(pattern, action, target, stripDigits);
 	}
 
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"pattern\":\"" + jsonEscape(pattern) +
 	             "\",\"action\":\"" + jsonEscape(action) +
-	             "\",\"target\":\"" + jsonEscape(target) + "\"}");
+	             "\",\"target\":\"" + jsonEscape(target) +
+	             "\",\"stripDigits\":" + std::to_string(stripDigits) + "}");
 }
 
 // ── Telephony-API credential slots (ported from drawbridge) ──────────────────
