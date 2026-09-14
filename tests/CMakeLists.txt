@@ -77,6 +77,14 @@ add_executable(sip_parser_tests
     # and that a monotonic counter is exported as a counter rather than a gauge.
     MetricsEndpoint_test.cpp
     SipDigest_test.cpp
+    # Issue #164 groundwork: the CLIENT half of digest auth. SipDigest_test
+    # covers the registrar direction (build a challenge, verify an inbound
+    # Authorization); this covers the UAC direction (parse a challenge, compute
+    # the response, emit the header). Every hash asserted there is PUBLISHED —
+    # RFC 2617 §3.5, RFC 7616 §3.9.1, and RFC 2069 §2.4 as corrected by Verified
+    # Errata 749 — because a digest implementation that only agrees with itself
+    # will agree with itself while failing against every real SBC.
+    SipDigestClient_test.cpp
     ArpLookup_test.cpp
     Pbx_test.cpp
     PageZone_test.cpp

@@ -20,7 +20,9 @@
 #include <cstring>
 #include <cctype>
 #include <chrono>
+#include <initializer_list>
 #include <mutex>
+#include <string_view>
 #include <vector>
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
@@ -332,49 +334,62 @@ namespace
 		}
 		return true;
 	}
-}
 
-namespace SipDigest
-{
-	std::string md5Hex(const std::string& input)
+	// =====================================================================
+	// ONE parameter scanner, shared by both directions.
+	//
+	// parseAuthorization() (server: read a client's credential) and
+	// parseChallenge() (client: read a server's challenge) parse the SAME
+	// production — RFC 7235's comma-separated auth-param list, with values that
+	// are either a quoted-string or a bare token, in any order, with arbitrary
+	// whitespace. The ONLY thing that differs between the two is which keys each
+	// side stores. So the scanner is generic over a per-parameter callback and
+	// the header names that may legally prefix the value.
+	//
+	// This was extracted from parseAuthorization rather than duplicated: the
+	// quoting rules here are subtle (a quoted value may legally contain a comma,
+	// which is why splitting on commas first is wrong), and a second copy would
+	// have inherited today's bugs without inheriting tomorrow's fixes. The
+	// scanning behaviour is byte-for-byte the code parseAuthorization already
+	// shipped — the refactor is a move, not a rewrite.
+	//
+	// `names`        : header names that may prefix the value; "Digest ..." bare
+	//                  is always accepted too.
+	// `matchedName`  : if non-null, set to the name that was stripped, or left
+	//                  empty when the value carried no header name.
+	// `fn(key,value)`: invoked once per parameter. `key` is whitespace-trimmed
+	//                  but case-preserved; `value` is already unquoted.
+	//
+	// Returns false iff the "Digest" scheme token is absent.
+	template <typename Fn>
+	bool scanDigestParams(const std::string& headerValue,
+	                      std::initializer_list<std::string_view> names,
+	                      std::string_view* matchedName,
+	                      Fn&& fn)
 	{
-		uint8_t digest[16];
-		Md5 md;
-		md.update(input);
-		md.finalize(digest);
-		return toHex(digest, sizeof(digest));
-	}
+		if (matchedName) *matchedName = std::string_view{};
 
-	std::string buildWwwAuthenticate(const std::string& realm,
-	                                 const std::string& nonce,
-	                                 bool stale)
-	{
-		std::string out = "Digest realm=\"" + realm + "\", nonce=\"" + nonce +
-		                  "\", qop=\"auth\", algorithm=MD5";
-		if (stale)
-		{
-			out += ", stale=true";
-		}
-		return out;
-	}
+		std::string_view sv(headerValue);
 
-	bool parseAuthorization(const std::string& authHeaderValue, DigestAuth& out)
-	{
-		out = DigestAuth{};
-
-		std::string_view sv(authHeaderValue);
-
-		// Drop an optional "Authorization:" header name.
+		// Drop an optional header name.
 		size_t colon = sv.find(':');
 		if (colon != std::string_view::npos)
 		{
 			std::string_view name = sv.substr(0, colon);
 			// Only strip if it actually looks like the header name (no '=' before
 			// the colon, which would indicate this colon belongs to a param value).
-			if (name.find('=') == std::string_view::npos &&
-			    iequalsAscii(trimQuoted(name), "authorization"))
+			if (name.find('=') == std::string_view::npos)
 			{
-				sv = sv.substr(colon + 1);
+				const std::string trimmed = trimQuoted(name);
+				for (std::string_view candidate : names)
+				{
+					if (iequalsAscii(trimmed, candidate))
+					{
+						if (matchedName) *matchedName = candidate;
+						sv = sv.substr(colon + 1);
+						break;
+					}
+				}
 			}
 		}
 
@@ -437,17 +452,64 @@ namespace SipDigest
 			while (!k.empty() && std::isspace(static_cast<unsigned char>(k.front()))) k.remove_prefix(1);
 			while (!k.empty() && std::isspace(static_cast<unsigned char>(k.back())))  k.remove_suffix(1);
 
-			if      (iequalsAscii(k, "username"))  out.username  = value;
-			else if (iequalsAscii(k, "realm"))     out.realm     = value;
-			else if (iequalsAscii(k, "nonce"))     out.nonce     = value;
-			else if (iequalsAscii(k, "uri"))       out.uri       = value;
-			else if (iequalsAscii(k, "response"))  out.response  = value;
-			else if (iequalsAscii(k, "qop"))       out.qop       = value;
-			else if (iequalsAscii(k, "nc"))        out.nc        = value;
-			else if (iequalsAscii(k, "cnonce"))    out.cnonce    = value;
-			else if (iequalsAscii(k, "algorithm")) out.algorithm = value;
-			else if (iequalsAscii(k, "opaque"))    out.opaque    = value;
-			// Unknown parameters are ignored (forward-compatible).
+			fn(k, value);
+		}
+
+		return true;
+	}
+}
+
+namespace SipDigest
+{
+	std::string md5Hex(const std::string& input)
+	{
+		uint8_t digest[16];
+		Md5 md;
+		md.update(input);
+		md.finalize(digest);
+		return toHex(digest, sizeof(digest));
+	}
+
+	std::string buildWwwAuthenticate(const std::string& realm,
+	                                 const std::string& nonce,
+	                                 bool stale)
+	{
+		std::string out = "Digest realm=\"" + realm + "\", nonce=\"" + nonce +
+		                  "\", qop=\"auth\", algorithm=MD5";
+		if (stale)
+		{
+			out += ", stale=true";
+		}
+		return out;
+	}
+
+	bool parseAuthorization(const std::string& authHeaderValue, DigestAuth& out)
+	{
+		out = DigestAuth{};
+
+		// Only "authorization" is accepted as a strippable header name, exactly as
+		// before this was refactored onto the shared scanner. Widening it to
+		// Proxy-Authorization would be a behaviour change for every existing
+		// caller (a full "Proxy-Authorization: ..." line used to fail the scheme
+		// check and return false), and the registrar has no proxy role to need it.
+		const bool isDigest = scanDigestParams(
+			authHeaderValue, {"authorization"}, nullptr,
+			[&out](std::string_view k, const std::string& value) {
+				if      (iequalsAscii(k, "username"))  out.username  = value;
+				else if (iequalsAscii(k, "realm"))     out.realm     = value;
+				else if (iequalsAscii(k, "nonce"))     out.nonce     = value;
+				else if (iequalsAscii(k, "uri"))       out.uri       = value;
+				else if (iequalsAscii(k, "response"))  out.response  = value;
+				else if (iequalsAscii(k, "qop"))       out.qop       = value;
+				else if (iequalsAscii(k, "nc"))        out.nc        = value;
+				else if (iequalsAscii(k, "cnonce"))    out.cnonce    = value;
+				else if (iequalsAscii(k, "algorithm")) out.algorithm = value;
+				else if (iequalsAscii(k, "opaque"))    out.opaque    = value;
+				// Unknown parameters are ignored (forward-compatible).
+			});
+		if (!isDigest)
+		{
+			return false;
 		}
 
 		return !out.username.empty() && !out.response.empty();
@@ -579,5 +641,246 @@ namespace SipDigest
 		// Stale = the tag verified (it's ours) but it timed out.
 		// validateNonce returns false-with-expired=true in exactly that case.
 		return !fresh && expired;
+	}
+
+	// =====================================================================
+	// CLIENT SIDE (UAC)
+	// =====================================================================
+
+	bool parseChallenge(const std::string& challengeHeaderValue,
+	                    DigestChallenge& out,
+	                    bool proxyDefault)
+	{
+		out = DigestChallenge{};
+		out.proxy = proxyDefault;
+
+		std::string_view matched;
+		const bool isDigest = scanDigestParams(
+			challengeHeaderValue, {"www-authenticate", "proxy-authenticate"}, &matched,
+			[&out](std::string_view k, const std::string& value) {
+				if      (iequalsAscii(k, "realm"))     out.realm       = value;
+				else if (iequalsAscii(k, "nonce"))     out.nonce       = value;
+				else if (iequalsAscii(k, "opaque"))    out.opaque      = value;
+				else if (iequalsAscii(k, "algorithm")) out.algorithm   = value;
+				else if (iequalsAscii(k, "qop"))       out.qopList     = value;
+				else if (iequalsAscii(k, "domain"))    out.domainParam = value;
+				else if (iequalsAscii(k, "stale"))
+				{
+					// RFC 7616 §3.3: stale is an unquoted token, but plenty of
+					// stacks quote it. The scanner has already unquoted, so a
+					// plain case-insensitive "true" is the whole test.
+					out.stale = iequalsAscii(value, "true");
+				}
+				// Unknown parameters are ignored (forward-compatible).
+			});
+		if (!isDigest)
+		{
+			return false;
+		}
+
+		// A header name that was actually present overrides proxyDefault.
+		if (!matched.empty())
+		{
+			out.proxy = iequalsAscii(matched, "proxy-authenticate");
+		}
+
+		// A challenge with no nonce is unanswerable: there is nothing to hash
+		// against, and emitting a response over an empty nonce would produce a
+		// digest the server can never reproduce. A realm-less challenge, by
+		// contrast, is answerable — HA1 just hashes an empty realm, which is what
+		// the server that omitted it must itself do.
+		return !out.nonce.empty();
+	}
+
+	DigestAlgorithm algorithmOf(const DigestChallenge& ch)
+	{
+		if (ch.algorithm.empty())                    return DigestAlgorithm::Md5;
+		if (iequalsAscii(ch.algorithm, "md5"))       return DigestAlgorithm::Md5;
+		if (iequalsAscii(ch.algorithm, "md5-sess"))  return DigestAlgorithm::Md5Sess;
+		// SHA-256 / SHA-512-256 / SHA-*-sess (RFC 8760) and anything unrecognised.
+		return DigestAlgorithm::Unsupported;
+	}
+
+	bool selectQop(const DigestChallenge& ch, std::string& out)
+	{
+		out.clear();
+
+		// No qop parameter at all -> legacy RFC 2069. Answer with the short form.
+		if (ch.qopList.empty())
+		{
+			return true;
+		}
+
+		// qop is a comma-separated list of tokens ("auth", "auth-int", or a
+		// server extension). Walk it and take "auth" if it is offered.
+		//
+		// The substring trap this avoids: `qopList.find("auth") != npos` is true
+		// for an auth-int-ONLY challenge, because "auth-int" contains "auth". A
+		// client that fell for that would send qop=auth against a server that
+		// never offered it.
+		size_t i = 0;
+		const size_t n = ch.qopList.size();
+		while (i < n)
+		{
+			while (i < n && (ch.qopList[i] == ',' ||
+			                 std::isspace(static_cast<unsigned char>(ch.qopList[i])))) ++i;
+			size_t start = i;
+			while (i < n && ch.qopList[i] != ',') ++i;
+			size_t end = i;
+			while (end > start &&
+			       std::isspace(static_cast<unsigned char>(ch.qopList[end - 1]))) --end;
+			if (iequalsAscii(std::string_view(ch.qopList).substr(start, end - start), "auth"))
+			{
+				out = "auth";
+				return true;
+			}
+		}
+
+		// A list was offered and "auth" is not in it — auth-int only, or something
+		// we do not implement. Refuse rather than guess.
+		return false;
+	}
+
+	std::string computeHa1Sess(const std::string& ha1,
+	                           const std::string& nonce,
+	                           const std::string& cnonce)
+	{
+		return md5Hex(ha1 + ":" + nonce + ":" + cnonce);
+	}
+
+	const char* authorizationHeaderName(const DigestChallenge& ch)
+	{
+		return ch.proxy ? "Proxy-Authorization" : "Authorization";
+	}
+
+	std::string formatNc(uint32_t count)
+	{
+		static const char* d = "0123456789abcdef";
+		char buf[8];
+		uint32_t v = count;
+		for (int i = 7; i >= 0; --i)
+		{
+			buf[i] = d[v & 0xF];
+			v >>= 4;
+		}
+		return std::string(buf, 8);
+	}
+
+	std::string makeCnonce()
+	{
+		uint8_t raw[8];
+		fillRandom(raw, sizeof(raw));
+		return toHex(raw, sizeof(raw));
+	}
+
+	bool buildAuthorization(const DigestChallenge& ch,
+	                        const std::string& username,
+	                        const std::string& password,
+	                        const std::string& method,
+	                        const std::string& uri,
+	                        uint32_t ncValue,
+	                        const std::string& cnonce,
+	                        std::string& out)
+	{
+		// --- Refusal gates. Each one is a case where answering anyway produces a
+		// --- response the server will reject forever, with no diagnostic.
+
+		if (ch.nonce.empty())
+		{
+			return false;
+		}
+
+		const DigestAlgorithm alg = algorithmOf(ch);
+		if (alg == DigestAlgorithm::Unsupported)
+		{
+			// RFC 8760 SHA-256 / SHA-512-256. We vendor only MD5 (see the file
+			// header), and an MD5 response to a SHA-256 challenge is simply wrong.
+			return false;
+		}
+
+		std::string qop;
+		if (!selectQop(ch, qop))
+		{
+			// auth-int only: the response would have to hash the message body,
+			// which this implementation does not do.
+			return false;
+		}
+
+		if (!qop.empty() && cnonce.empty())
+		{
+			// qop=auth REQUIRES a cnonce (RFC 7616 §3.4). An empty one hashes,
+			// but it destroys the client-nonce's entire purpose and some SBCs
+			// reject it outright.
+			return false;
+		}
+
+		if (alg == DigestAlgorithm::Md5Sess && cnonce.empty())
+		{
+			// HA1-sess is defined over the cnonce; without one there is no HA1.
+			return false;
+		}
+
+		if (alg == DigestAlgorithm::Md5Sess && qop.empty())
+		{
+			// MD5-sess with NO qop is the one combination that cannot be made to
+			// work, and it is worth spelling out because it looks answerable.
+			// HA1-sess is MD5(HA1:nonce:cnonce), so the server needs our cnonce to
+			// recompute it — but the legacy no-qop emission omits cnonce entirely
+			// (and RFC 2617 says a cnonce MUST NOT be sent without qop). Either
+			// way the server cannot reproduce the digest.
+			//
+			// Answering anyway would be exactly the "silently compute the wrong
+			// thing" failure the SHA-2 refusal above exists to prevent: a
+			// well-formed header carrying a response nobody can verify. A server
+			// that really wants MD5-sess has to offer qop.
+			return false;
+		}
+
+		// --- Compute.
+
+		std::string ha1 = computeHa1(username, ch.realm, password);
+		if (alg == DigestAlgorithm::Md5Sess)
+		{
+			ha1 = computeHa1Sess(ha1, ch.nonce, cnonce);
+		}
+
+		const std::string nc = formatNc(ncValue);
+		const std::string response =
+			computeResponse(ha1, method, uri, ch.nonce, nc, cnonce, qop);
+
+		// --- Emit. Quoting follows RFC 7616 §3.4's ABNF: username/realm/nonce/
+		// --- uri/response/cnonce/opaque are quoted-string, algorithm/qop/nc are
+		// --- bare tokens. Quoting nc or qop is the single most common emit bug —
+		// --- Kamailio and several SBCs reject a quoted nc outright.
+		out  = "Digest username=\"" + username + "\"";
+		out += ", realm=\"" + ch.realm + "\"";
+		out += ", nonce=\"" + ch.nonce + "\"";
+		out += ", uri=\"" + uri + "\"";
+		out += ", response=\"" + response + "\"";
+
+		// Echo the algorithm ONLY when the challenge named one. An RFC 2069 server
+		// that sent no algorithm gets no algorithm back, which is exactly what the
+		// RFC 2617 §3.5 worked example shows the client sending.
+		if (!ch.algorithm.empty())
+		{
+			out += ", algorithm=" + ch.algorithm;
+		}
+
+		if (!qop.empty())
+		{
+			out += ", cnonce=\"" + cnonce + "\"";
+			out += ", qop=" + qop;
+			out += ", nc=" + nc;
+		}
+		// When qop is empty we deliberately emit NO cnonce/qop/nc. See the header:
+		// an RFC 2069 server ignores them and computes MD5(HA1:nonce:HA2), so
+		// sending them while computing the long form is a silent mismatch.
+
+		if (!ch.opaque.empty())
+		{
+			out += ", opaque=\"" + ch.opaque + "\"";
+		}
+
+		return true;
 	}
 }
