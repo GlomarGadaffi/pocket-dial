@@ -2,6 +2,7 @@
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
 #include "DialPlan.hpp"          // Issue #69: dial-rule validation shared with setDialRule
+#include "ServiceExtensions.hpp" // Issue #202: reserved engine-owned pseudo-AORs
 #include "TelephonyApiConfig.hpp"
 #include "DidMapping.hpp"
 #include "CallDetailRecord.hpp"
@@ -1476,6 +1477,13 @@ void HttpServer::sendApiDnd(int sock, const std::string& body)
 		             "{\"error\":\"cannot set DND on a virtual extension\"}");
 		return;
 	}
+	// Issue #202: same answer for an engine-owned service name (pbx/moh/server).
+	if (pbx::isServiceName(ext))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot set DND on a service extension\"}");
+		return;
+	}
 
 	// Accept 1/true/on as enable; anything else (incl. "0") disables.
 	bool enable = (on == "1" || on == "true" || on == "on");
@@ -1515,6 +1523,24 @@ void HttpServer::sendApiForward(int sock, const std::string& body)
 		             "{\"error\":\"cannot forward a virtual extension\"}");
 		return;
 	}
+	// Issue #202. Two different refusals, and they are not the same question:
+	// a service may not be the SUBSCRIBER (it has no calls of its own to divert),
+	// and a service that cannot receive calls may not be the TARGET (the forward
+	// would be accepted and then black-hole every call it caught, which is the
+	// failure the issue was filed about). setForwardLocked applies the identical
+	// pair so the *72/*73 DTMF path is guarded too — this is the HTTP-facing half.
+	if (pbx::isServiceName(ext))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot forward a service extension\"}");
+		return;
+	}
+	if (!target.empty() && pbx::isServiceName(target) && !pbx::isDialableService(target))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"service extension cannot receive calls\"}");
+		return;
+	}
 
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
@@ -1545,6 +1571,14 @@ void HttpServer::sendApiGroup(int sock, const std::string& body)
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot use a reserved extension as a group\"}");
+		return;
+	}
+	// Issue #202: a group under a service name would shadow it — ring groups are
+	// resolved before the extension lookup in onInvite.
+	if (pbx::isServiceName(ext))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot use a service extension as a group\"}");
 		return;
 	}
 	if (mode.empty()) mode = "ringall";
@@ -1598,6 +1632,15 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot use a reserved extension as a dial-plan pattern\"}");
+		return;
+	}
+	// Issue #202: and no rule may claim a service name either. isDialTokenSafe
+	// above admits letters, so "pbx" is a perfectly legal pattern as far as the
+	// validator is concerned — this is the check that makes it not a legal one.
+	if (pbx::isServiceName(pattern))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot use a service extension as a dial-plan pattern\"}");
 		return;
 	}
 
@@ -1948,6 +1991,16 @@ void HttpServer::sendApiDidMappingSet(int sock, const std::string& body)
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot map a DID to a virtual/reserved extension\"}");
+		return;
+	}
+	// Issue #202: a DID pointed at a non-dialable service is an inbound trunk call
+	// routed into a name the engine cannot deliver to — the same black hole as a
+	// forward, arriving from outside. Refuse the name outright; when a service
+	// becomes dialable, this gate opens for it by itself.
+	if (pbx::isServiceName(extension) && !pbx::isDialableService(extension))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot map a DID to a service extension that cannot receive calls\"}");
 		return;
 	}
 

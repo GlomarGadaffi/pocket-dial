@@ -23,6 +23,18 @@
 #include "ArpLookup.hpp"
 #include "PsramTask.hpp"   // PD_TASK_STACK_CAPS / xTaskCreateWithCaps / vTaskDeleteWithCaps (ESP-only)
 
+// inet_pton for the service-extension loopback address (Issue #202). RequestsHandler.hpp
+// already pulls in the platform socket header; on POSIX and Win32 the ADDRESS-CONVERSION
+// declarations live in a second header, which is what these add. lwip/sockets.h carries
+// them itself on the device.
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// nothing further: lwip/sockets.h already declares inet_pton
+#elif defined(__linux__) || defined(__APPLE__)
+	#include <arpa/inet.h>
+#elif defined _WIN32 || defined _WIN64
+	#include <ws2tcpip.h>
+#endif
+
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	// PBX config (call-forward / ring groups) and the persistent CDR ring live in
 	// NVS on the device. nvs_flash/nvs are core ESP-IDF components present on every
@@ -140,6 +152,36 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	for (int i = 0; i < POCKETDIAL_VIRTUAL_PEERS; ++i)
 	{
 		_virtualPeerPool.push_back(std::make_shared<SipClient>());
+	}
+
+	// Service extensions (Issue #202): one permanent peer per seeded entry, bound
+	// to THIS SERVER'S OWN address. That address is the whole idea — a call routed
+	// to a service is meant to come back to us and be intercepted by name the way
+	// 440/555/777/888 already are, rather than each routing path growing its own
+	// special case. Built here, once, so findServicePeer() never allocates in the
+	// packet path; _localIp is resolved in the member-init list above and is never
+	// reassigned afterwards, so the address cannot go stale under us.
+	//
+	// The lease is nominal: these are not registrations. sweepExpired() walks
+	// _clientPool only, so nothing ever ages one of these out — the long value is
+	// there so a stray isExpired() check can never make a service look dead.
+	{
+		sockaddr_in self{};
+		self.sin_family = AF_INET;
+		self.sin_port   = htons(static_cast<uint16_t>(_serverPort));
+		if (::inet_pton(AF_INET, _localIp.c_str(), &self.sin_addr) != 1)
+		{
+			// Unparseable local IP (should not happen: it is either the configured
+			// literal or getPrimaryLocalIP()'s output). Fall back to loopback rather
+			// than leaving the address zeroed, so a service peer never points at
+			// 0.0.0.0 — every consumer treats the address as a real destination.
+			self.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		}
+		for (std::size_t i = 0; i < pbx::kServiceEndpointCount; ++i)
+		{
+			_servicePeers[i] = std::make_shared<SipClient>(
+				std::string(pbx::kServiceEndpoints[i].name), self, /*expiresSeconds=*/0x7FFFFFFF);
+		}
 	}
 
 	// Reload persisted PBX config (call-forward / ring groups) and the CDR ring from
@@ -866,6 +908,30 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
+		return;
+	}
+
+	// ── Service extensions are not registerable (Issue #202) ─────────────────────
+	// `pbx`, `moh` and `server` are identities the ENGINE originates as, and
+	// isValidAor has always admitted them as spellings — std::isalnum plus
+	// . - _ + * # — so nothing before this stopped a phone from REGISTERing under
+	// one of them and taking the name. That is not a theoretical tidiness point:
+	// the register-beep response paths deliberately rely on findClient("pbx")
+	// MISSING (see onReqTerminated's comment on the stray 404 that results when it
+	// doesn't), so a client bound to "pbx" would send 404s back at phones that had
+	// just been beeped, and would put a fake handset in the dashboard roster.
+	//
+	// 403, not 400: the AOR is well-formed, it is the identity that is refused.
+	// Placed BEFORE the registrar-mode admission so the refusal is the same in
+	// Open, Secure and Learn — in particular a service name can never be ADOPTED
+	// in Learn mode, which is one of the issue's explicit constraints. Refusing an
+	// expires=0 de-REGISTER too is deliberate and harmless: there is nothing to
+	// unbind, because no binding under that name can ever have been created.
+	if (pbx::isServiceName(fromNumber))
+	{
+		queueLog("REGISTER refused: \"" + std::string(fromNumber) +
+			"\" is a reserved service extension", true);
+		_registrar.sendForbidden(data, "Reserved service extension");
 		return;
 	}
 
@@ -2066,12 +2132,12 @@ bool RequestsHandler::startMohPreview(const std::string& extension)
 	std::ostringstream ss;
 	ss << "INVITE sip:" << extension << "@" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << _mohPreview.branch << "\r\n"
-	   << "From: \"Hold Music\" <sip:moh@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
+	   << "From: \"Hold Music\" <sip:" << pbx::kServiceMoh << "@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
 	   << "To: <sip:" << extension << "@" << activeIp << ">\r\n"
 	   << _mohPreview.callId << "\r\n"
 	   << "CSeq: 1 INVITE\r\n"
 	   << "Max-Forwards: 70\r\n"
-	   << "Contact: <sip:moh@" << srcIpPort << ";transport=UDP>\r\n"
+	   << "Contact: <sip:" << pbx::kServiceMoh << "@" << srcIpPort << ";transport=UDP>\r\n"
 	   << "User-Agent: pocket-dial\r\n"
 	   << "Content-Type: application/sdp\r\n"
 	   << "Content-Length: " << sdp.size() << "\r\n\r\n"
@@ -2128,7 +2194,7 @@ bool RequestsHandler::handleMohPreviewOk(const std::shared_ptr<SipMessage>& data
 	std::ostringstream ss;
 	ss << "ACK sip:" << _mohPreview.extension << "@" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << _mohPreview.branch << "a\r\n"
-	   << "From: \"Hold Music\" <sip:moh@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
+	   << "From: \"Hold Music\" <sip:" << pbx::kServiceMoh << "@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
 	   << "To: <sip:" << _mohPreview.extension << "@" << activeIp << ">"
 	   << (_mohPreview.toTag.empty() ? "" : ";tag=" + _mohPreview.toTag) << "\r\n"
 	   << _mohPreview.callId << "\r\n"
@@ -2175,7 +2241,8 @@ bool RequestsHandler::handleMohPreviewFailure(const std::shared_ptr<SipMessage>&
 	std::ostringstream ss;
 	ss << "ACK sip:" << _mohPreview.extension << "@" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << _mohPreview.branch << "\r\n"
-	   << "From: \"Hold Music\" <sip:moh@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
+	   << "From: \"Hold Music\" <sip:" << pbx::kServiceMoh << "@" << srcIpPort
+	   << ">;tag=" << _mohPreview.fromTag << "\r\n"
 	   << "To: <sip:" << _mohPreview.extension << "@" << activeIp << ">"
 	   << (_mohPreview.toTag.empty() ? "" : ";tag=" + _mohPreview.toTag) << "\r\n"
 	   << _mohPreview.callId << "\r\n"
@@ -2232,7 +2299,7 @@ void RequestsHandler::stopMohPreviewLocked()
 		std::ostringstream ss;
 		ss << "BYE sip:" << _mohPreview.extension << "@" << destIpPort << " SIP/2.0\r\n"
 		   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << _mohPreview.branch << "b\r\n"
-		   << "From: \"Hold Music\" <sip:moh@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
+		   << "From: \"Hold Music\" <sip:" << pbx::kServiceMoh << "@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
 		   << "To: <sip:" << _mohPreview.extension << "@" << activeIp << ">;tag="
 		   << _mohPreview.toTag << "\r\n"
 		   << _mohPreview.callId << "\r\n"
@@ -2250,7 +2317,7 @@ void RequestsHandler::stopMohPreviewLocked()
 		   << sipwire::addrToIpPort(_mohPreview.addr) << " SIP/2.0\r\n"
 		   << "Via: SIP/2.0/UDP " << _localIp << ":" << _serverPort
 		   << ";branch=" << _mohPreview.branch << "\r\n"
-		   << "From: \"Hold Music\" <sip:moh@" << _localIp << ":" << _serverPort
+		   << "From: \"Hold Music\" <sip:" << pbx::kServiceMoh << "@" << _localIp << ":" << _serverPort
 		   << ">;tag=" << _mohPreview.fromTag << "\r\n"
 		   << "To: <sip:" << _mohPreview.extension << "@" << _localIp << ">\r\n"
 		   << _mohPreview.callId << "\r\n"
@@ -4533,7 +4600,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 	   << "Max-Forwards: 70\r\n"
 	   << "Event: refer\r\n"
 	   << "Subscription-State: " << subState << "\r\n"
-	   << "Contact: <sip:server@" << srcIpPort << ">\r\n"
+	   << "Contact: <sip:" << pbx::kServiceServer << "@" << srcIpPort << ">\r\n"
 	   << "User-Agent: pocket-dial\r\n"
 	   << "Content-Type: message/sipfrag;version=2.0\r\n"
 	   << "Content-Length: " << body.size() << "\r\n\r\n"
@@ -4845,6 +4912,29 @@ std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClient(std::strin
 			return client;
 	}
 	return {};
+}
+
+std::shared_ptr<SipClient> RequestsHandler::findServicePeer(std::string_view number)
+{
+	// Issue #202. The fallback half of findRegistered(): scanned only AFTER
+	// _clientPool misses, and kept out of findClient() itself so that "is a phone
+	// registered under this number" keeps its old, narrower answer everywhere it
+	// is asked (onInvite's callee lookup, onRegister's new-binding test, endHandle,
+	// forceDisconnect, and the register-beep paths that depend on findClient("pbx")
+	// MISSING).
+	//
+	// The dialable gate is the point, not a formality: a service marked false is
+	// still a RESERVED name the engine owns, but it is not a place a call may be
+	// sent. Every seeded service is false today — see ServiceExtensions.hpp for
+	// why (the loopback INVITE is dropped by onInvite's own retransmission guard
+	// until the engine can mint a fresh Call-ID for the inner leg), and note that
+	// answering a routing caller with a peer we cannot actually deliver to would
+	// be worse than the miss it replaces: redirectInvite() would report success
+	// and the CFU fall-through to the original callee would be skipped.
+	const int idx = pbx::serviceEndpointIndex(number);
+	if (idx < 0) return nullptr;
+	if (!pbx::kServiceEndpoints[static_cast<std::size_t>(idx)].dialable) return nullptr;
+	return _servicePeers[static_cast<std::size_t>(idx)];
 }
 
 void RequestsHandler::endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message)
@@ -5430,7 +5520,7 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 		std::ostringstream ss;
 		ss << "MESSAGE sip:" << ext << "@" << destIpPort << " SIP/2.0\r\n"
 		   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-		   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
+		   << "From: \"PocketDial\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
 		   << "To: <sip:" << ext << "@" << activeIp << ">\r\n"
 		   << "Call-ID: " << callId << "\r\n"
 		   << "CSeq: 1 MESSAGE\r\n"
@@ -5856,7 +5946,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	ss << "OPTIONS sip:" << clientNum << "@" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
 	   << "To: <sip:" << clientNum << "@" << destIpPort << ">\r\n"
-	   << "From: <sip:server@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
+	   << "From: <sip:" << pbx::kServiceServer << "@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
 	   << "Call-ID: " << callId << "\r\n"
 	   << "CSeq: 1 OPTIONS\r\n"
 	   << "Max-Forwards: 70\r\n"

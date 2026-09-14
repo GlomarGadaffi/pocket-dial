@@ -128,6 +128,26 @@
 #define POCKETDIAL_VIRTUAL_PEERS (POCKETDIAL_MAX_SESSIONS + POCKETDIAL_PARK_SLOTS)
 #endif
 
+// Number of SERVICE EXTENSION slots (Issue #202) — the alphanumeric pseudo-AORs
+// the ENGINE owns rather than a phone: `pbx` (register beep), `moh` (hold-music
+// preview), `server` (server-initiated BYE), and the `voicemail`/`attendant` that
+// #194/#168 will add. Sizes BOTH the compile-time table in ServiceExtensions.hpp
+// and RequestsHandler's parallel array of pre-allocated loopback peer objects, so
+// the whole feature's storage is fixed at boot like every pool above it.
+//
+// Deliberately SEPARATE from POCKETDIAL_MAX_CLIENTS: _clientPool is registration
+// capacity and belongs to real handsets. A service must never consume a slot a
+// phone could have had, must never show in the dashboard roster as though a
+// handset were there, and must never be adoptable in Learn mode — all three fall
+// out of the records simply living somewhere else.
+//
+// Eight is headroom, not a plan: three are seeded and the table is a static_assert
+// away from overflowing this. Each unused slot costs one empty ServiceEndpoint
+// (a string_view + a bool) and one null shared_ptr.
+#ifndef POCKETDIAL_MAX_SERVICES
+#define POCKETDIAL_MAX_SERVICES 8
+#endif
+
 // How long a call may sit parked before the orbit times out (seconds). On expiry
 // tick() rings back the parker (the Referred-By party of the parking INVITE) if
 // they are registered, or tears the parked leg down with a BYE otherwise.

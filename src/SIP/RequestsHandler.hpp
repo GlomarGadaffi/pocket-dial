@@ -50,6 +50,7 @@
 #include "CallForker.hpp"
 #include "CallPickup.hpp"
 #include "PoolConfig.hpp"   // POCKETDIAL_MAX_ANCHOR_CALLS (concurrent anchor media-bridge count)
+#include "ServiceExtensions.hpp"   // Issue #202: the engine-owned pseudo-AOR table
 #include "RtpSender.hpp"
 #include "RtpReceiver.hpp"
 #include "AnchorClient.hpp"
@@ -472,8 +473,19 @@ private:
 	int serverPort() const override { return _serverPort; }
 	std::shared_ptr<SipClient> findRegistered(std::string_view number) override
 	{
+		// THE routing choke point. Every path that asks "can a call go to this
+		// name" comes through here — CallForker (blind transfer, CFU/CFB/CFNA,
+		// ring-group members, dial-plan targets), CallPickup, ParkOrbit,
+		// DtmfFeatureCodes — which is precisely why Issue #202 extends this one
+		// function instead of teaching each caller about service extensions
+		// separately. That divergence is what produced #197/#198.
+		//
+		// Order matters: a REGISTERed phone always wins. A service name can never
+		// be registered (onRegister refuses it), so the two sets are disjoint and
+		// the fallback only ever runs on a miss.
 		auto c = findClient(number);
-		return c.has_value() ? c.value() : nullptr;
+		if (c.has_value()) return c.value();
+		return findServicePeer(number);
 	}
 	std::shared_ptr<SipClient> allocVirtualPeer(std::string number, const sockaddr_in& addr) override
 	{
@@ -925,6 +937,15 @@ private:
 
 	std::optional<std::shared_ptr<SipClient>> findClient(std::string_view number);
 	std::optional<std::shared_ptr<SipClient>> findClientByAddress(const sockaddr_in& addr);
+
+	// Issue #202: the service-extension half of findRegistered(). Resolves a name
+	// from the fixed ServiceExtensions.hpp table to its pre-allocated loopback peer
+	// (address = this server's own), or nullptr when the name is not a service or
+	// is a service marked NOT dialable. Deliberately NOT reachable from findClient:
+	// findClient answers "is a phone REGISTERed under this number", and a service
+	// must never be mistaken for one — the register-beep response path depends on
+	// findClient("pbx") missing. Caller must hold _mutex.
+	std::shared_ptr<SipClient> findServicePeer(std::string_view number);
 	std::shared_ptr<SipMessage> buildOptionsPing(const std::shared_ptr<SipClient>& client);
 
 	// ── Outbound SIP MESSAGE (STAGE 2) ────────────────────────────────────────────
@@ -1169,6 +1190,17 @@ private:
 	std::vector<std::shared_ptr<Session>> _sessionPool;
 	// Virtual-peer pool: transient SipClient slots for 777/440/park legs (Issue #70).
 	std::vector<std::shared_ptr<SipClient>> _virtualPeerPool;
+	// Service-extension peers (Issue #202), one slot per kServiceEndpoints entry and
+	// addressed by the SAME index. Built once in the constructor and never resized,
+	// so findServicePeer() hands back a long-lived object without touching the heap
+	// in the packet path — the pools above are recycled by use_count(), these are
+	// not, because a service identity is permanent rather than per-call.
+	//
+	// A separate array, NOT reserved slots inside _clientPool: registration capacity
+	// belongs to handsets, and keeping the storage apart is what makes "never in the
+	// roster / never adoptable in Learn mode" true by construction rather than by a
+	// filter somebody must remember to apply at each read site.
+	std::array<std::shared_ptr<SipClient>, POCKETDIAL_MAX_SERVICES> _servicePeers{};
 
 	// Issue #38: token bucket keyed by source IPv4 (network-order s_addr).
 	struct RateBucket

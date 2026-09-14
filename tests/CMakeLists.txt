@@ -123,6 +123,14 @@ add_executable(sip_parser_tests
     # RequestsHandler::handle(), and a real-socket round-trip of the
     # POST /api/dialplan admin surface through HttpServer.
     DialPlan_test.cpp
+    # Issue #202: service extensions -- the alphanumeric pseudo-AORs the engine
+    # owns (pbx/moh/server). Covers the fixed table, the REGISTER refusal that
+    # stops a phone taking one of those names (the register-beep paths depend by
+    # name on findClient("pbx") MISSING), the reserved-name guards on every
+    # config surface including the forward TARGET nothing ever validated, and the
+    # alarm that fires if a service is marked dialable before anything can answer
+    # a call routed to it.
+    ServiceExtensions_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is
