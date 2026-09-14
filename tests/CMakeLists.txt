@@ -231,6 +231,19 @@ add_executable(sip_parser_tests
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp
+    # Issue #186: AdminAuth::pbkdf2Sha256/aesGcmSeal/aesGcmOpen against
+    # published RFC 7914 / GCM-spec vectors, plus the tamper/wrong-AAD/
+    # wrong-key properties the config-export "secrets_enc" block depends on.
+    AdminAuthCrypto_test.cpp
+    # Issue #173: the owner/sysop two-role privilege model -- authenticate(),
+    # the no-owner-yet fallback, lockout keyed by (channel, principal), and
+    # owner-vs-sysop gating on the three owner-only HTTP actions.
+    TwoRoleAuth_test.cpp
+    # Issue #186: GET/POST /api/config/export and POST /api/config/import,
+    # driven end-to-end through a real HttpServer -- plaintext round-trip,
+    # password-gated round-trip, replace-not-merge, and the 400/422 rejection
+    # paths.
+    ConfigExportImport_test.cpp
     # Issue #32: the live SIP tracer's data path — the actual bytes GET
     # /api/trace puts on the wire for the terminal's `trace on` command to
     # render, not just the C++-side getTraceRecords() accessor other tests
