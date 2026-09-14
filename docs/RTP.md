@@ -12,8 +12,11 @@
 
 ## 0. What actually ships today
 
-The server is no longer media-free. Three virtual extensions terminate media on the board,
-and one ordinary call path does not:
+The server is no longer media-free. Three virtual extensions (`440`, `555`, `888`)
+terminate media on the board, an outbound trunk call crosses it on both sides, and — since
+music on hold shipped — **a call parked on an orbit is transmitted to by the board as well**
+whenever a clip is loaded. The ordinary extension-to-extension call is the one path that
+still never touches it:
 
 | Path | Does the board touch RTP? | Detail |
 | :--- | :--- | :--- |

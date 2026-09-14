@@ -230,7 +230,7 @@ W5500 pin map is not the same, so build it with `-D PD_ETH_BOARD=elite` (the def
 | `W5500_RST_GPIO` | **-1 (Unused)** | Reset | Not wired to a GPIO; reset via SPI soft command |
 
 microSD/TF slot — a **separate SPI bus** (`SPI3_HOST`; the W5500 owns `SPI2_HOST`), so the
-card and Ethernet never contend. Mounted at `/sdcard` (FATFS) during `eth` boot on this
+card and Ethernet never contend. **The music-on-hold clip is read from `/sdcard/moh.wav`** and must be **8 kHz mono G.711 µ-law WAV** — anything else is rejected `422` by `POST /api/moh/upload` (`HttpServer.cpp:2929-2980`); prepare one with `ffmpeg -i music.mp3 -ar 8000 -ac 1 -acodec pcm_mulaw moh.wav`. Mounted at `/sdcard` (FATFS) during `eth` boot on this
 board; `GET /api/status` reports `sd.{present,mounted,capacityMb}`.
 
 > [!IMPORTANT]

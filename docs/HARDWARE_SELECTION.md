@@ -144,7 +144,7 @@ From [HARDWARE.md §9](HARDWARE.md):
 ## 7. Build target reminder
 
 Each transport is selected at build time via `SIP_TRANSPORT` (and the optional tier
-macros). See [README.md §Building](../README.md#building) and [SCALING.md §3](SCALING.md)
+macros). See [README.md](../README.md#run-it-on-an-esp32-s3) and [SCALING.md §3](SCALING.md)
 for the exact commands. In short:
 
 - Wi-Fi SoftAP: `idf.py -D SIP_TRANSPORT=wifi build`. **Not the bare `idf.py build`** —

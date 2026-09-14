@@ -92,7 +92,8 @@ Full instructions: **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** ·
 ## What it does
 
 ### Call control
-Blind transfer (REFER) · attended transfer (REFER with Replaces) · hold and resume
+Blind transfer (REFER — **see the caveat below**) · attended transfer (REFER with
+Replaces) · hold and resume
 · RFC 3311 UPDATE (answered; advertised on `OPTIONS` only) · RFC 4028 session
 timers (passive) · call park to orbits `700`–`709` · group pickup `*8` and
 directed pickup `**<ext>` · ring groups (ring-all or sequential hunt) · call
@@ -100,7 +101,15 @@ forward on always / busy / no-answer · per-extension DND · paging zones
 `980`–`989` and `999` all-page · busy-lamp-field presence (`SUBSCRIBE`/`NOTIFY`,
 RFC 4235 dialog events) · DTMF star codes over SIP INFO.
 
-Two of those need an asterisk before you design around them:
+Three of those need an asterisk before you design around them:
+
+- **Blind transfer currently moves the wrong party.** On a `REFER` the PBX sends `BYE`
+  to the party being transferred and re-INVITEs the **transferor** to the target
+  (`RequestsHandler.cpp:4459`, `:4471`). For the commonest real shape — a receptionist
+  transferring an inbound caller — the customer is hung up on and the receptionist is
+  dialled through to the target, while the receptionist's phone reports success. This is
+  [#197](https://github.com/GlomarGadaffi/pocket-dial/issues/197); a fix is in flight.
+  Attended transfer and call forwarding are not affected — both move the correct leg.
 
 - **Session timers are passive.** The board honours a `Session-Expires` a phone
   asks for and drops the call when it lapses, but it never requests one itself and

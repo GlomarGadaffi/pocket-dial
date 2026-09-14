@@ -5,7 +5,7 @@ test call. It assumes a Wi-Fi SoftAP build (the default standalone Access Point 
 notes call out where the wired-Ethernet and touch-display variants differ.
 
 If you have not flashed firmware yet, do that first — see the build instructions in
-[../README.md](../README.md#building--testing) and, for updating an already-flashed device,
+[../README.md](../README.md#run-it-on-an-esp32-s3) and, for updating an already-flashed device,
 [OTA.md](OTA.md). This document picks up **after** the firmware is on the board.
 
 **What you will do:**
@@ -32,7 +32,7 @@ dashboard to `192.168.4.1:80`.
 | Channel | 1 | `EXAMPLE_ESP_WIFI_CHANNEL` |
 | Max associated stations | 10 | `EXAMPLE_MAX_STA_CONN` |
 | Gateway / server IP | `192.168.4.1` | DHCP server default |
-| Hostname (mDNS) | `pocketdial.local` | `mdns_hostname_set("pocketdial")` |
+| Hostname (mDNS) | `pocketdial.local` | `mdns_hostname_set("pocketdial")` in **`src/SIP/SipServer.cpp:33-35`** (not `main/esp_main.cpp`). **It is not advertised before setup on a wired board**: mDNS starts in the `SipServer` constructor, and `SipServer` is only constructed *after* the credential gate on `wifi`/`eth`/`lan8720` (`main/esp_main.cpp:365-397`). On an unprovisioned wired unit your only route to the dashboard is the IP from the router's DHCP table. The `display` build registers mDNS during onboarding and is the exception. |
 
 **Steps:**
 
@@ -76,7 +76,8 @@ by a firmware update. Enable it deliberately, in one of two ways:
 
 **Finding the passphrase.** The device generates its own, per unit — there is no
 factory default, and nothing is baked into the firmware image. It is 20 characters from
-an alphabet with no ambiguous glyphs (no `0`/`O`, no `1`/`I`/`L`), so it survives being
+an alphabet with no ambiguous glyphs (`23456789ABCDEFGHJKMNPQRSTVWXYZ` — no `0`/`O`, no
+`1`/`I`/`L`, and no `U`), so it survives being
 read off a screen and retyped into a desk phone. Read it from whichever applies:
 
 | Build | Where the passphrase appears |
@@ -118,7 +119,7 @@ Wi-Fi network (Station mode) or stay in Standalone AP mode.
 
 ### Variant: wired Ethernet / PoE
 
-W5500/LAN8720 builds (`SIP_TRANSPORT=eth`) are nodes on your wired LAN and obtain an
+Wired builds are nodes on your wired LAN and obtain an
 address via DHCP (with static fallback). There is no SoftAP; reach the dashboard at the
 device's LAN IP or at `pocketdial.local`. See [HARDWARE_SELECTION.md](HARDWARE_SELECTION.md)
 for board specifics.
@@ -194,15 +195,18 @@ header (else `403`):
   `/api/group`, `/api/dialplan`, `/api/wifi/connect`, `/api/wifi/mode_ap`,
   `/api/configuring`, `/api/factory-reset`, `POST /api/ap-security`,
   `POST /api/registrar`, `/api/registrar/device`, the `/api/telephony-config`
-  and `/api/did-mapping` writes, and the OTA endpoints (`/api/ota/upload`,
-  `/api/ota/reboot`).
+  and `/api/did-mapping` writes, the music-on-hold routes (`POST /api/moh/preview`,
+  `POST /api/moh/preview/stop`, `POST /api/moh/upload`), and the OTA endpoints
+  (`/api/ota/upload`, `/api/ota/reboot`).
 * **Read-gated (cookie only, no CSRF):** `GET /api/ap-security`,
   `GET /api/registrar`, `GET /api/telephony-config`, `GET /api/did-mapping`,
-  `GET /api/pcap`, `GET /api/trace`, `GET /api/diagnostics/pcap`.
+  `GET /api/pcap`, `GET /api/trace`, `GET /api/diagnostics/pcap`, `GET /api/moh`.
 * **Ungated, readable before you log in:** `GET /`, `GET /api/status`,
-  `GET /api/cdr`, `GET /api/wifi/scan`, `GET /api/ota/status`, and
-  `GET /api/admin/status` (which is how the dashboard decides whether to show you
-  the login form or the setup form).
+  `GET /api/cdr`, `GET /metrics`, `GET /api/wifi/scan`, `GET /api/ota/status`,
+  `GET /config/<mac>.cfg`, and `GET /api/admin/status` (which is how the dashboard
+  decides whether to show you the login form or the setup form). Note `/api/cdr`
+  hands over the recent call log and `/api/status` the extension roster with each
+  handset's IP:port — see [THREAT_MODEL.md](THREAT_MODEL.md) §4 E-2.
 
 The forced-setup refusal sits on top of all of that: while `admin`/`admin` is
 still in place, **every one of the gated routes above — the read-only `GET`s
@@ -346,7 +350,7 @@ registered extension** at once, injecting auto-answer headers; the first device 
 
 ## 6. Quick-start checklist
 
-- [ ] Firmware flashed (see [README.md](../README.md#building--testing) / [OTA.md](OTA.md)).
+- [ ] Firmware flashed (see [README.md](../README.md#run-it-on-an-esp32-s3) / [OTA.md](OTA.md)).
 - [ ] Powered on; joined Wi-Fi SSID **`esp32-sipserver`** (open) — or completed the
       `My-Ap` captive portal on the display build.
 - [ ] Dashboard reachable at `http://192.168.4.1` (or `http://pocketdial.local`).

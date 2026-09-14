@@ -149,9 +149,12 @@ curl.exe -s -o NUL -w "HTTP %{http_code}\n" http://<BOARD_IP>/
 # -> HTTP 200
 ```
 
-`GET /` is ungated and so are `/api/status`, `/api/cdr`, `/api/wifi/scan`,
-`/api/admin/status` and `/api/ota/status` (`HttpServer::handleClient()` dispatch,
-`src/Helpers/HttpServer.cpp:433-711`). A quick posture read costs one request:
+`GET /` is ungated and so are `/api/status`, `/api/cdr`, `/metrics`, `/api/wifi/scan`,
+`/api/admin/status`, `/api/ota/status` and `GET /config/<mac>.cfg`
+(`HttpServer::handleClient()` dispatch, `src/Helpers/HttpServer.cpp:457-755`).
+`/metrics` is a useful extra smoke read on a wired board — it answers `200` with six
+`pocketdial_*` families as soon as HTTP is up, all-zero until the SIP engine attaches.
+A quick posture read costs one request:
 
 ```powershell
 curl.exe -s http://<BOARD_IP>/api/admin/status
@@ -273,9 +276,9 @@ python .smoke\sip_probe.py <BOARD_IP> 5060
 
 | Symptom | Likely cause / fix |
 |---|---|
-| No `Ethernet link UP` at all | Cable/switch dead, or wrong SPI pin map — recheck the `W5500 board:` line matches your hardware. On a breadboard, keep SPI leads <5 cm (W5500 runs 36 MHz); see [HARDWARE.md §9B](HARDWARE.md). |
+| No `Ethernet link UP` at all | Cable/switch dead, or wrong SPI pin map — recheck the `W5500 board:` line matches your hardware. On a breadboard, keep SPI leads <5 cm (the W5500 bus runs at **40 MHz** — `esp_main_eth.cpp:113`, and the boot line above prints it); see [HARDWARE.md §9B](HARDWARE.md). |
 | Link UP but no `IP:` | No DHCP server on that LAN segment, or the lease is slow. Set `USE_STATIC_IP 1` (+ the `STATIC_IP/GATEWAY/NETMASK` defines) at the top of `main/esp_main_eth.cpp` and reflash to bypass DHCP. |
-| `sip_probe.py` → `NO RESPONSE`, but HTTP answers | Almost always the boot provisioning gate: the board has no admin credential yet and the SIP task has not been started (`esp_main_eth.cpp:468-496`). Do §5, watch for `[boot] credential set — unblocking SIP stack`, re-probe. |
+| `sip_probe.py` → `NO RESPONSE`, but HTTP answers | Almost always the boot provisioning gate: the board has no admin credential yet and the SIP task has not been started (`esp_main_eth.cpp:587-631`). Do §5, watch for `[boot] credential set — unblocking SIP stack`, re-probe. |
 | `sip_probe.py` → `NO RESPONSE` and HTTP is also dead | Wrong IP, a firewall on the dev machine, or you're not on the same subnet. Ping `<BOARD_IP>` first. |
 | The board reboots every ~30 minutes and nothing is configured | The provisioning wait is bounded: no credential within `kMaxCredentialWaitSec` (1800 s) and it restarts to retry (`esp_main_eth.cpp:473-482`). Complete §5. |
 | Board never enumerates for flashing | OTG-switch position / native-USB; BOOT-hold + RST tap to enter download mode. |
@@ -285,8 +288,8 @@ python .smoke\sip_probe.py <BOARD_IP> 5060
 | `403 {"error":"missing or invalid CSRF token"}` from a script | A mutating call needs the per-session `X-CSRF` header. Capture `"csrf"` from the `POST /api/admin/login` response ([API.md §0](API.md), worked example in §5 above and [OTA.md §3.2](OTA.md)). Read-only checks are unaffected. |
 | `401 {"error":"invalid username or password"}` on login | Wrong credential. If someone has run `test_api.sh` against this board, the password is `realpassword123`, not `admin`. |
 | `POST /api/factory-reset` answers `501` on this board | **Stale firmware.** Fixed in #189 — a current build answers `200` and reboots on every ESP transport. If you see a `501` here, the board is running pre-#189 firmware, and that `501` means the wipe *completed* without a reboot: power-cycle it yourself, then redo first-use setup. |
-| `429` on `/api/admin/login` | Brute-force lockout: 5 failures per client, 20 aggregate, cooldown doubling from 60 s to ~16 min and cleared only by a **correct login** (`AdminAuth.hpp:60-82`, [THREAT_MODEL.md §5.2](THREAT_MODEL.md)). Wait it out, or power-cycle — the counters are in-process only. |
-| A real handset gets `401` forever, though `sip_probe.py` passes | The registrar is in `secure` mode (possibly seeded at flash time via `cfgseed`'s `regMode`, which works from v1.4.1 — on v1.3.0/v1.4.0 rule that out, see [#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)) and this phone has no digest secret. In `secure` mode INVITE is challenged too, not just REGISTER. Check `GET /api/registrar`; recovery is in [TROUBLESHOOTING.md](TROUBLESHOOTING.md#all-phones-stopped-registering-at-once). |
+| `429` on `/api/admin/login` | Brute-force lockout: 5 failures (**counted globally, not per client** — `req.clientIp` is never populated on the login path, so every failure shares one bucket; see [THREAT_MODEL.md](THREAT_MODEL.md) D-3), 20 aggregate, cooldown doubling from 60 s to ~16 min and cleared only by a **correct login** (`AdminAuth.hpp:60-82`, [THREAT_MODEL.md §5.2](THREAT_MODEL.md)). Wait it out, or power-cycle — the counters are in-process only. |
+| A real handset gets `401` forever, though `sip_probe.py` passes | The registrar is in `secure` mode (possibly seeded at flash time via `cfgseed`'s `regMode`, which works from v1.4.1 — on v1.3.0/v1.4.0 rule that out, see [#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)) and this phone has no digest secret — and **cannot be given one**: nothing in the firmware calls `SipSecretStore::setSecret()`, so `secure` mode rejects every handset rather than authenticating it (see [LEARN_MODE.md](LEARN_MODE.md) Step 4). In `secure` mode INVITE is challenged too, not just REGISTER. Check `GET /api/registrar`; recovery is in [TROUBLESHOOTING.md](TROUBLESHOOTING.md#all-phones-stopped-registering-at-once). |
 | Settings you cleared come back after a reboot | The `cfgseed` partition re-applies at boot whenever `cfgseed_gen` is missing — which a factory reset or an NVS erase deliberately makes true. Erase the seed too: `esptool.py -p COMx erase_region 0xFFF000 0x1000` (16 MB layout only). |
 
 **Related:** [HARDWARE.md §5](HARDWARE.md) (Elite pinout) · [HARDWARE_SELECTION.md](HARDWARE_SELECTION.md) · [TROUBLESHOOTING.md](TROUBLESHOOTING.md) · [API.md](API.md) · [THREAT_MODEL.md](THREAT_MODEL.md)

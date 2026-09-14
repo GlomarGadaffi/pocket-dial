@@ -268,8 +268,8 @@ Fetches a read-only snapshot of the registrar, call sessions, and system metrics
     "sessions": [ { "caller": "101", "callee": "102", "state": "Connected", "duration": "02:15" } ],
     "dnd":      [ "103" ],
     "forwards": [ { "extension": "101", "always": "", "busy": "102", "noanswer": "" } ],
-    "groups":   [ { "extension": "600", "mode": "ring", "members": "101,102" } ],
-    "dialplan": [ { "pattern": "9X.", "action": "trunk", "target": "", "stripDigits": 1 } ],
+    "groups":   [ { "extension": "600", "mode": "ringall", "members": "101,102" } ],
+    "dialplan": [ { "pattern": "9XXXXXXXXXX", "action": "trunk", "target": "", "stripDigits": 1 } ],
     "parkedCalls": [ { "orbit": "701", "parkedExt": "102", "parker": "101", "secondsParked": 12 } ]
   }
   ```
@@ -581,9 +581,18 @@ login preamble — including setup completion — to have run first.
 * **TC-ED-07 (Registrar unknown device) (A):** POST `/api/registrar/device` with
   `action=secure&target=ffffffffffff` → `404`.
 * **TC-ED-08 (Dial-plan empty trunk target) (A):** POST `/api/dialplan` with
-  `pattern=9X.&action=trunk&target=&stripDigits=1` → `200` (a legal "strip 1, prepend
+  `pattern=9XXXXXXXXXX&action=trunk&target=&stripDigits=1` → `200` (a legal "strip 1, prepend
   nothing" rule). The same with `action=group&target=` → `400`. Then POST
-  `pattern=9X.` alone (no `action`, no `target`) → the rule is **deleted**.
+  `pattern=9XXXXXXXXXX` alone (no `action`, no `target`) → the rule is **deleted**.
+
+> [!NOTE]
+> **Corrected:** earlier revisions of these examples used the pattern `9X.` and the ring-group
+> mode `"ring"`. Neither is legal. `pbx::isDialTokenSafe` (`src/SIP/DialPlan.hpp:176-186`)
+> admits only alphanumerics, `#` and `*` — a `.` is rejected with
+> `400 "pattern may contain only letters, digits, '#' and '*'"` — and the only accepted
+> group modes are `ringall` and `hunt` (`HttpServer.cpp:1550-1556`). A test written from the
+> old examples fails against correct firmware. Use `X` per digit, or a trailing `*` for
+> "rest of the string".
 * **TC-ED-09 (Reserved dial-plan patterns) (A):** `pattern=777` → `400 {"error":"cannot use
   a reserved extension as a dial-plan pattern"}`. Same for `999`, `440`, `555`.
 * **TC-ED-10 (Provisioning config 404s in open mode):** GET `/config/805ec079c37f.cfg` on a

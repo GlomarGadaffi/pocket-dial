@@ -1,6 +1,6 @@
 # pocket-dial — Technical Feature Roadmap
 
-**Status:** Living document | **Last updated:** 2026-09-13 | **Scope:** Engineering / product-capability only
+**Status:** Living document | **Last updated:** 2026-09-14 | **Scope:** Engineering / product-capability only
 
 This is a prioritized **engineering** roadmap for pocket-dial: what exists, what is proved,
 and what is worth building next. It is grounded in the current source tree. It deliberately
@@ -63,7 +63,7 @@ Cross-references:
 |-----------|-------|-------|
 | Registrar + back-to-back call broker | `REGISTER`, `INVITE`, `ACK`, `BYE`, `CANCEL`, `OPTIONS`, provisional/final responses | `src/SIP/RequestsHandler.cpp` |
 | **SIP digest auth (RFC 2617)** | Implemented and operable. **The shipped default is `open`** — see §1.4. | `src/Helpers/SipDigest.*`, `src/SIP/Registrar.*` |
-| Blind transfer (REFER) | Source-authorized against the dialog's own legs (#133) | `onRefer` |
+| Blind transfer (REFER) | Source-authorized against the dialog's own legs (#133). **Known defect: it moves the wrong party** — the transferee is BYEd (`RequestsHandler.cpp:4459`) and the *transferor* is re-INVITEd to the target (`:4471`), so a receptionist transferring an inbound call keeps the call and drops the customer. [#197](https://github.com/GlomarGadaffi/pocket-dial/issues/197), fix in flight; the test suite currently pins the inverted topology. Unresolvable targets no longer destroy the call (#203, fixed). | `onRefer` |
 | Attended transfer (REFER + Replaces, RFC 3891) | Splices B and C, BYEs A out of both, relays a later BYE across the bridge | `onRefer`, `handleTransferOk` |
 | Hold / resume | Re-INVITE, relayed untouched so the SDP survives | `onReinvite`, `onOk` |
 | RFC 3311 `UPDATE` | | `onUpdate` |
