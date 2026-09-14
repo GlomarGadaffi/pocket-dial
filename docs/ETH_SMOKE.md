@@ -149,7 +149,7 @@ curl.exe -s -o NUL -w "HTTP %{http_code}\n" http://<BOARD_IP>/
 # -> HTTP 200
 ```
 
-`GET /` is ungated and so are `/api/status`, `/api/cdr`, `/metrics`, `/api/wifi/scan`,
+`GET /` is ungated and so are `/api/status`, `/metrics`, `/api/wifi/scan`,
 `/api/admin/status`, `/api/ota/status` and `GET /config/<mac>.cfg`
 (`HttpServer::handleClient()` dispatch, `src/Helpers/HttpServer.cpp:457-755`).
 `/metrics` is a useful extra smoke read on a wired board — it answers `200` with six

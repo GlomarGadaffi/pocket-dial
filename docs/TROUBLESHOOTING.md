@@ -284,7 +284,7 @@ What the media path actually is, because it decides where to look:
 | `403 missing or invalid CSRF token` | A **third** distinct 403 — see [403 on an API call that used to work](#403-on-an-api-call-that-used-to-work). |
 | `401 authentication required` on a control action | You have no valid `pd_session`. Log in via `POST /api/admin/login` first ([SETUP_GUIDE.md §3](SETUP_GUIDE.md)). |
 | `429` on login | Brute-force lockout — and it escalates. See [429 on login](#429-on-login) below. |
-| Page renders but panels are blank | `GET /` and `/api/status` are ungated, as are `/api/cdr`, `/metrics`, `/api/wifi/scan`, `/api/admin/status`, `/api/ota/status` and `GET /config/<mac>.cfg`. `/api/pcap`, `/api/trace`, `/api/registrar`, `/api/telephony-config`, `/api/did-mapping` and `/api/moh` all need a session. A logged-out browser gets a rendered shell with `401`s underneath — the **PBX Settings** panel (`F6`) is one of them, since `/api/moh` is gated. |
+| Page renders but panels are blank | `GET /` and `/api/status` are ungated, as are `/metrics`, `/api/wifi/scan`, `/api/admin/status`, `/api/ota/status` and `GET /config/<mac>.cfg`. `/api/pcap`, `/api/trace`, `/api/registrar`, `/api/telephony-config`, `/api/did-mapping` and `/api/moh` all need a session. A logged-out browser gets a rendered shell with `401`s underneath — the **PBX Settings** panel (`F6`) is one of them, since `/api/moh` is gated. |
 
 ---
 
