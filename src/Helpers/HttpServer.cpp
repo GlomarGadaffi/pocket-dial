@@ -37,6 +37,9 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+// Issue #185: heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) for
+// sendApiStatus's minFreeHeapSpiram field.
+#include "esp_heap_caps.h"
 #endif
 
 // Forward declarations for the file-local form/URL helpers (defined lower down).
@@ -1010,6 +1013,109 @@ static std::string jsonEscape(const std::string& s)
 	return out;
 }
 
+#if defined(ESP_PLATFORM)
+// ── Issue #185: task-watchdog + heap/stack telemetry for GET /api/status ────
+// Read-only and zero-coupling: every stack high-water mark below is looked up
+// by FreeRTOS task NAME via xTaskGetHandle() rather than threading a
+// TaskHandle_t out of SipServer/UdpServer/RtpSender/RtpReceiver/ConferenceRoom
+// into this file, so none of those classes needs a getter added for this.
+//
+// The Task Watchdog SUBSCRIPTION (esp_task_wdt_add() + a periodic
+// esp_task_wdt_reset()) is a separate mechanism and lives only in
+// sip_server_task (main/esp_main*.cpp): the TWDT can only be fed by the
+// subscribed task itself calling esp_task_wdt_reset() on its own behalf --
+// there is no "reset on behalf of task X" call in the IDF API. This file runs
+// on the HTTP task, not any of the five tasks #185 names, so it could not
+// feed a subscription for udp_receiver_task / rtp_media_tx / rtp_media_rx /
+// conf_mix_tick even if it added one here -- and an unfed subscription would
+// guarantee a spurious watchdog reset under normal operation, not add safety.
+// Those four tasks' loops live in UdpServer.cpp / RtpSender.cpp /
+// RtpReceiver.cpp / ConferenceRoom.cpp, outside this change's file scope; see
+// the PR description for exactly where their esp_task_wdt_add()/_reset() calls
+// would go. sip_server_task (in scope, main/esp_main*.cpp) IS fully subscribed.
+
+// xTaskGetHandle() asserts strlen(name) < configMAX_TASK_NAME_LEN (16 on this
+// project's sdkconfig — FreeRTOS's own default). A task's STORED name is
+// itself right-truncated to 15 chars + NUL at creation time (FreeRTOS
+// tasks.c: prvInitialiseNewTask), so querying a longer literal doesn't just
+// fail to match -- it trips that assert and aborts the board. "udp_receiver_
+// task" is 17 chars; every other name below is short enough to pass whole.
+#define PD_UDP_RECEIVER_TASK_NAME "udp_receiver_ta"   // truncated "udp_receiver_task"
+
+// Stack high-water mark in BYTES for the task currently named `name`, or -1 if
+// no such task exists right now. -1 (rendered as JSON null) is deliberately
+// distinct from 0: rtp_media_tx/rx and conf_mix_tick only exist while a
+// call/conference is active, so "not running" is the ordinary case and must
+// stay distinguishable from an actual 0-bytes-left reading, which is the
+// near-overflow alarm this field exists to surface (see MixBus::tick()'s ~2.9
+// KB of locals on conf_mix_tick's 3072-byte stack, issue #185's motivating
+// example).
+static long pdStackHwmBytes(const char* name)
+{
+	TaskHandle_t h = xTaskGetHandle(name);
+	if (h == nullptr)
+	{
+		return -1;
+	}
+	return static_cast<long>(uxTaskGetStackHighWaterMark(h)) * static_cast<long>(sizeof(StackType_t));
+}
+
+// sip_server_task is named "sip_server_task" on the wifi/softAP build
+// (main/esp_main.cpp) but "sip_server" on both eth builds
+// (main/esp_main_eth.cpp, main/esp_main_eth_lan8720.cpp). This one
+// HttpServer.cpp links into all three, so try both spellings.
+static long pdSipServerStackHwmBytes()
+{
+	TaskHandle_t h = xTaskGetHandle("sip_server_task");
+	if (h == nullptr)
+	{
+		h = xTaskGetHandle("sip_server");
+	}
+	if (h == nullptr)
+	{
+		return -1;
+	}
+	return static_cast<long>(uxTaskGetStackHighWaterMark(h)) * static_cast<long>(sizeof(StackType_t));
+}
+
+static const char* pdResetReasonString(esp_reset_reason_t reason)
+{
+	switch (reason)
+	{
+		case ESP_RST_POWERON:    return "POWERON";
+		case ESP_RST_EXT:        return "EXT_PIN";
+		case ESP_RST_SW:         return "SW_RESTART";
+		case ESP_RST_PANIC:      return "PANIC";
+		case ESP_RST_INT_WDT:    return "INT_WDT";
+		case ESP_RST_TASK_WDT:   return "TASK_WDT";
+		case ESP_RST_WDT:        return "OTHER_WDT";
+		case ESP_RST_DEEPSLEEP:  return "DEEPSLEEP_WAKE";
+		case ESP_RST_BROWNOUT:   return "BROWNOUT";
+		case ESP_RST_SDIO:       return "SDIO";
+		case ESP_RST_USB:        return "USB";
+		case ESP_RST_JTAG:       return "JTAG";
+		case ESP_RST_EFUSE:      return "EFUSE_ERROR";
+		case ESP_RST_PWR_GLITCH: return "PWR_GLITCH";
+		case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP";
+		default:                 return "UNKNOWN";
+	}
+}
+
+// Appends ,"<key>":<bytes|null> -- the shared shape for every stackHwm_* field.
+static void pdAppendHwmField(std::ostringstream& json, const char* key, long bytes)
+{
+	json << ",\"" << key << "\":";
+	if (bytes < 0)
+	{
+		json << "null";
+	}
+	else
+	{
+		json << bytes;
+	}
+}
+#endif // ESP_PLATFORM
+
 void HttpServer::sendApiStatus(int sock, bool authenticated)
 {
 	uint64_t uptimeMs = currentTimeMs() - _startTime;
@@ -1181,6 +1287,29 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		     << "\",\"secondsParked\":" << std::get<3>(parkedCalls[i]) << "}";
 	}
 	json << "]";
+
+	// Issue #185: task-watchdog / heap / per-task stack telemetry. Purely
+	// additive -- every key here is new; nothing above this line changed.
+#if defined(ESP_PLATFORM)
+	json << ",\"freeHeap\":" << esp_get_free_heap_size();
+	json << ",\"minFreeHeap\":" << esp_get_minimum_free_heap_size();
+	json << ",\"minFreeHeapSpiram\":" << heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+	json << ",\"resetReason\":\"" << pdResetReasonString(esp_reset_reason()) << "\"";
+	pdAppendHwmField(json, "stackHwm_sip_server_task", pdSipServerStackHwmBytes());
+	pdAppendHwmField(json, "stackHwm_udp_receiver_task", pdStackHwmBytes(PD_UDP_RECEIVER_TASK_NAME));
+	pdAppendHwmField(json, "stackHwm_rtp_media_tx", pdStackHwmBytes("rtp_media_tx"));
+	pdAppendHwmField(json, "stackHwm_rtp_media_rx", pdStackHwmBytes("rtp_media_rx"));
+	pdAppendHwmField(json, "stackHwm_conf_mix_tick", pdStackHwmBytes("conf_mix_tick"));
+#else
+	// Host build: no FreeRTOS, no heap_caps. Same key set as the ESP build,
+	// all-zero/null, so tests/interop/interop.py's JSON parsing never has to
+	// special-case platform -- matching this route's existing "counters read
+	// 0, arrays empty" convention for the unattached/host case (docs/API.md).
+	json << ",\"freeHeap\":0,\"minFreeHeap\":0,\"minFreeHeapSpiram\":0,\"resetReason\":\"n/a\"";
+	json << ",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
+	        "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
+	        "\"stackHwm_conf_mix_tick\":null";
+#endif
 
 	json << "}";
 

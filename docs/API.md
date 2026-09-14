@@ -275,7 +275,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/admin/login`](#post-apiadminlogin) | `POST` | High | Same-origin only | Exchanges `username`+`password` for a `pd_session` cookie and a CSRF token. |
 | [`/api/admin/logout`](#post-apiadminlogout) | `POST` | Low | Same-origin only | Destroys the session named by the cookie and expires it client-side. |
 | [`/api/admin/set-credential`](#post-apiadminset-credential) | `POST` | High | Gated (+ `X-CSRF`) | Replaces the admin login credential and/or sets the DTMF PIN. **The only route exempt from the `setup_required` gate.** |
-| [`/api/status`](#get-apistatus) | `GET` | Low | None | Retrieves registrar uptime, packet statistics, active extensions, ongoing sessions, and the whole PBX feature configuration. |
+| [`/api/status`](#get-apistatus) | `GET` | Low | None | Retrieves registrar uptime, packet statistics, active extensions, ongoing sessions, the whole PBX feature configuration, and (#185) heap/reset/per-task stack-headroom telemetry. |
 | [`/api/kill`](#post-apikill) | `POST` | High | Gated (+ `X-CSRF`) | Forcefully disconnects and de-registers an active SIP extension. |
 | [`/api/cdr`](#get-apicdr) | `GET` | Low | Session | Returns the in-memory Call Detail Record ring (most recent calls, newest first). **Gated since #215.** Call metadata -- who called whom, when, for how long -- was previously readable by any host that could reach the board. It was ungated by analogy to `/api/status`, which `THREAT_MODEL.md` section 4 E-2 justifies by what the LOGIN FORM needs; a login form does not need call history. See [THREAT_MODEL.md](THREAT_MODEL.md) §4 E-2. |
 | `/metrics` | `GET` | Low | None | Prometheus text format (`text/plain; version=0.0.4`). Six families, all `pocketdial_`-prefixed: `uptime_seconds`, `sip_registrations_active`, `sip_calls_active` (gauges), `packets_processed_total`, `packets_dropped_total`, `sdp_rejected_total` (counters). Always `200`; all-zero when the SIP engine is not yet attached. Ungated by design (`HttpServer.cpp:1120-1184`). **Not** on the captive-portal exempt list, so on a Wi-Fi build a scraper sending a foreign `Host` header gets the portal `302` instead. |
@@ -660,7 +660,16 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
   ],
   "parkedCalls": [
     { "orbit": "701", "parkedExt": "1002", "parker": "1001", "secondsParked": 18 }
-  ]
+  ],
+  "freeHeap": 187432,
+  "minFreeHeap": 152088,
+  "minFreeHeapSpiram": 7986211,
+  "resetReason": "POWERON",
+  "stackHwm_sip_server_task": 6104,
+  "stackHwm_udp_receiver_task": 9820,
+  "stackHwm_rtp_media_tx": null,
+  "stackHwm_rtp_media_rx": null,
+  "stackHwm_conf_mix_tick": null
 }
 ```
 
@@ -702,6 +711,30 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `dialplan[].target` | String | The group / paging-zone / park-orbit extension the rule routes to, or — for `trunk` — the string prepended to the dialed number after stripping (possibly empty, meaning "prepend nothing"). |
 | `dialplan[].stripDigits` | Number | `trunk` only (Issue #165): leading digits removed from the dialed number before prepending `target`. `0` for every other action. |
 | `parkedCalls` | Array | Calls currently sitting on a park orbit: `{orbit, parkedExt, parker, secondsParked}`. Lets a client tell a parked extension apart from an idle or connected one. |
+| `freeHeap` | Integer | `esp_get_free_heap_size()` (issue #185) — free internal+PSRAM heap right now, in bytes. `0` on the host build (no heap_caps there). |
+| `minFreeHeap` | Integer | `esp_get_minimum_free_heap_size()` (#185) — the LOWEST free-heap level seen since boot, not the current one. A transient allocation spike that `freeHeap` never catches (it's only sampled when something happens to poll this route) still shows up here. `0` on the host build. |
+| `minFreeHeapSpiram` | Integer | `heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)` (#185) — same "lowest ever" reading, PSRAM only. `PsramTask.hpp`'s own comment is the reason this exists separately from `minFreeHeap`: internal RAM is what actually starves under concurrent calls (task stacks, TLS), and a combined number hides that a PSRAM-heavy board can look fine in aggregate while internal RAM is exhausted. `0` on the host build **and** on any no-PSRAM build (`sdkconfig.defaults.esp32_constrained`) — the call itself is always safe, but a build with no SPIRAM capability has nothing in that pool to report. |
+| `resetReason` | String | `esp_reset_reason()` (#185), decoded to a short label: `POWERON`, `SW_RESTART`, `PANIC`, `INT_WDT`, `TASK_WDT`, `OTHER_WDT`, `DEEPSLEEP_WAKE`, `BROWNOUT`, `SDIO`, `USB`, `JTAG`, `EFUSE_ERROR`, `PWR_GLITCH`, `CPU_LOCKUP`, `EXT_PIN`, or `UNKNOWN`. Describes **how the currently-running boot started**, not a live fault — `TASK_WDT` here means a Task-Watchdog-subscribed task (`sip_server_task`) stalled on the *previous* boot and the board reset itself as designed. `"n/a"` on the host build. |
+| `stackHwm_sip_server_task` | Integer or `null` | `uxTaskGetStackHighWaterMark()` (#185) for `sip_server_task`, in bytes of stack headroom remaining — the *lowest* it has ever been, not the current value (that's what "high water mark" means: FreeRTOS fills each stack with a known pattern at creation and reports how much of it has never been touched). Task name is `sip_server_task` on the `wifi` build, `sip_server` on `eth`/`lan8720`; this field always uses the logical name. `null` on the host build (no FreeRTOS there), and also on an ESP board that has not yet cleared onboarding: `main/esp_main*.cpp` holds this task dark until an admin credential is committed (`app_main`'s provisioning gate), so a freshly-flashed or factory-reset board reads `null` here until setup completes — that is expected, not a lookup failure. |
+| `stackHwm_udp_receiver_task` | Integer or `null` | Same, for `udp_receiver_task` (`src/Helpers/UdpServer.cpp`) — the task `RequestsHandler::handle()` runs on inline, so this is the whole SIP signaling control plane's stack headroom. Created by the `SipServer` object `sip_server_task` constructs, so it shares that same "`null` until provisioning completes" window; long-lived and should always resolve after. |
+| `stackHwm_rtp_media_tx` | Integer or `null` | Same, for `rtp_media_tx` (`src/SIP/RtpSender.cpp`). **`null` most of the time by design** — every `RtpSender` instance's task shares this one literal name, and the task exists only while ONE of them is actively sending: the 440/555/888/park internal media, or a WAN-anchor-bridged call the board terminates through `MediaBridge`/`TelephonyAnchorClient`. Never for an ordinary ext-to-ext call (peer-to-peer; the board never touches that media) and not between calls. Distinguish `null` from a `0` reading, which would mean the task is running with **no stack headroom left** — the near-overflow condition this field exists to catch. |
+| `stackHwm_rtp_media_rx` | Integer or `null` | Same, for `rtp_media_rx` (`src/SIP/RtpReceiver.cpp`) — same shared-task-name and "any call the board terminates media for" caveat as `stackHwm_rtp_media_tx`. |
+| `stackHwm_conf_mix_tick` | Integer or `null` | Same, for `conf_mix_tick` (`src/SIP/ConferenceRoom.cpp`) — the task the #185 mixer survey flagged: `MixBus::tick()` puts roughly 2.9 KB of locals on this task's 3072 byte stack, so a low reading here (as opposed to `null`, meaning no conference is active) is the number that says whether that margin is real. `null` whenever no conference is running. |
+
+> **Task-Watchdog coverage (issue #185).** `sip_server_task` is subscribed to
+> the IDF Task Watchdog Timer (`esp_task_wdt_add()` + a per-tick
+> `esp_task_wdt_reset()`, `main/esp_main*.cpp`) and `sdkconfig.defaults` sets
+> `CONFIG_ESP_TASK_WDT_PANIC=y`, so a stall there is a controlled reset with a
+> logged cause (`resetReason":"TASK_WDT"` on the *next* boot), not silence.
+> `udp_receiver_task`, `rtp_media_tx`, `rtp_media_rx` and `conf_mix_tick` are
+> **not yet** watchdog-subscribed — their stack headroom is visible above, but
+> a stall in one of them today is not self-healing. Subscribing them requires
+> an `esp_task_wdt_add()`/`esp_task_wdt_reset()` pair inside each task's own
+> loop (`UdpServer.cpp`, `RtpSender.cpp`, `RtpReceiver.cpp`,
+> `ConferenceRoom.cpp` respectively — a FreeRTOS task can only feed the
+> watchdog on its own behalf, so this cannot be done from outside those
+> files), which is tracked as follow-up work rather than folded into this
+> change.
 
 > **Ordering.** `dialplan[]` is the one array whose order carries meaning: it is
 > emitted in table order, and the table is evaluated **first match wins**

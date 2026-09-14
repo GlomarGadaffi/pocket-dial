@@ -25,6 +25,7 @@
 #include "esp_system.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"   // Issue #185: sip_server_task TWDT subscription
 #include "esp_idf_version.h"
 #include "esp_eth.h"
 // W5500 driver headers. ESP-IDF v6.0 split the W5500 MAC/PHY driver out of the
@@ -66,6 +67,32 @@
 
 // ── Tag for ESP_LOG ────────────────────────────────────────────────────────
 static const char* TAG = "SipServerETH";
+
+// ── Reset reason (Issue #185) ─────────────────────────────────────────────────
+// Logged first thing in app_main(), below. This is a headless board's only way
+// to say, after the fact, that its previous boot ended in ESP_RST_TASK_WDT --
+// there is no screen and nobody was watching the UART in real time.
+static const char* pdResetReasonString(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON:    return "POWERON";
+        case ESP_RST_EXT:        return "EXT_PIN";
+        case ESP_RST_SW:         return "SW_RESTART";
+        case ESP_RST_PANIC:      return "PANIC";
+        case ESP_RST_INT_WDT:    return "INT_WDT";
+        case ESP_RST_TASK_WDT:   return "TASK_WDT";
+        case ESP_RST_WDT:        return "OTHER_WDT";
+        case ESP_RST_DEEPSLEEP:  return "DEEPSLEEP_WAKE";
+        case ESP_RST_BROWNOUT:   return "BROWNOUT";
+        case ESP_RST_SDIO:       return "SDIO";
+        case ESP_RST_USB:        return "USB";
+        case ESP_RST_JTAG:       return "JTAG";
+        case ESP_RST_EFUSE:      return "EFUSE_ERROR";
+        case ESP_RST_PWR_GLITCH: return "PWR_GLITCH";
+        case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP";
+        default:                 return "UNKNOWN";
+    }
+}
 
 // ── W5500 SPI pin map (board-selected) ────────────────────────────────────
 //   Chosen at build time by main/CMakeLists.txt from -D PD_ETH_BOARD=<board>:
@@ -371,6 +398,20 @@ static void sip_server_task(void* pvParameters)
 {
     ESP_LOGI(TAG, "Starting SipServer on %s:%d", s_ip_addr.c_str(), SIP_PORT);
 
+    // Issue #185: subscribe to the Task Watchdog Timer so a tick() that never
+    // returns (stuck on a lock, a runaway loop) produces a logged, controlled
+    // reset instead of a silently unresponsive board. esp_task_wdt_add(NULL)
+    // subscribes the CALLING (this) task; only this task's own loop below may
+    // feed it via esp_task_wdt_reset() -- the TWDT has no "reset on behalf of
+    // another task" call, by design (see sdkconfig.defaults for the PANIC=y
+    // that makes a timeout actually reset the board). A failed subscription is
+    // logged and non-fatal: better an unmonitored SIP task than no SIP task.
+    esp_err_t wdtErr = esp_task_wdt_add(NULL);
+    if (wdtErr != ESP_OK) {
+        ESP_LOGE(TAG, "esp_task_wdt_add failed (%s) -- this task's stalls will go undetected",
+                 esp_err_to_name(wdtErr));
+    }
+
     SipServer* srv = new SipServer(s_ip_addr, SIP_PORT);
     // Publish with release so the HTTP task's acquire-load sees a fully-constructed
     // object the moment it observes the non-null pointer.
@@ -382,6 +423,9 @@ static void sip_server_task(void* pvParameters)
     while (true)
     {
         srv->getHandler().tick();
+        // Fed once per 1 s loop, well inside the 5 s default TWDT timeout
+        // (CONFIG_ESP_TASK_WDT_TIMEOUT_S). Harmless no-op if the add above failed.
+        esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(1000));
         unsigned long nowSec = (unsigned long)(esp_timer_get_time() / 1000000);
         if (nowSec - lastHeartbeat >= 30)
@@ -492,6 +536,12 @@ static void log_drain_task(void* /*arg*/)
 
 extern "C" void app_main(void)
 {
+    // Issue #185: log the reset cause before anything else can fail and bury
+    // it. ESP_RST_TASK_WDT here means a TWDT-subscribed task (sip_server_task,
+    // below) actually stalled on the PREVIOUS boot -- the only place a headless
+    // unit can report that.
+    ESP_LOGI(TAG, "[boot] reset reason: %s", pdResetReasonString(esp_reset_reason()));
+
     // ── NVS init (keep ESP_ERROR_CHECK here — unrecoverable without flash) ──
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
