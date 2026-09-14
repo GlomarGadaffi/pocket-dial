@@ -518,6 +518,30 @@ namespace
 				         job->result.smtpReplyCode, job->result.lastError.c_str());
 			}
 
+			// Drop the secrets this slot was carrying before releasing it.
+			//
+			// g_jobs is a static array that lives for the whole process, so
+			// anything left in a slot stays resident until that slot happens to
+			// be reused -- possibly never. The App Password was already living
+			// there; this change adds the service account's RSA PRIVATE KEY,
+			// which is a materially stronger secret, so it should not be the
+			// thing that quietly extends that pattern.
+			//
+			// Overwrite-then-clear rather than just clear(): clear() only sets
+			// the length, leaving the bytes in the buffer. Honest caveat -- this
+			// is best-effort, not a guaranteed erase: for a short string the data
+			// sits in the small-string buffer, and any earlier reallocation may
+			// have left a copy elsewhere on the heap. It shrinks the window and
+			// removes the steady-state copy, which is worth having; it is not a
+			// claim that the key is unrecoverable from RAM.
+			auto scrub = [](std::string& v) {
+				if (!v.empty()) { v.assign(v.size(), '\0'); }
+				v.clear();
+			};
+			scrub(job->token.privateKeyPem);
+			scrub(job->cfg.password);
+			scrub(job->cfg.accessToken);
+
 			xSemaphoreGive(job->doneSem);
 			{
 				std::lock_guard<std::mutex> lk(g_slotMutex);
