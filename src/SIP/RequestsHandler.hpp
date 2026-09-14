@@ -354,6 +354,14 @@ public:
 		std::lock_guard<std::mutex> lock(_mutex);
 		return _cdr.snapshot();
 	}
+	// Test-only: live DTMF accumulators, so a teardown path can be checked for
+	// actually routing through endCall() (which forgets the dialog's digits)
+	// rather than only erasing the session (issue #228).
+	size_t dtmfAccumulatorCountForTest()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		return _dtmf.accumulatorCount();
+	}
 
 	// Test-only: the anchor MediaBridge currently bridging this Call-ID, or nullptr
 	// if none is. Lets a test assert the 555 wiring actually attached a bridge

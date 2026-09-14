@@ -5634,39 +5634,89 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		queueLog("Admin: force-disconnecting extension " + extension);
+		// Issue #228: tear down every dialog this extension is on the way every
+		// other server-initiated teardown does — BYE the phones, THEN endCall().
+		//
+		// Until this landed the loop below erased the Session and released its
+		// pool slot inline and sent nothing, so the far-end phone (and the killed
+		// extension's own handset) kept a call the PBX had already forgotten: P2P
+		// media carried on, and the phones only found out when one of them hung
+		// up locally into a 481. The inline erase also skipped everything
+		// endCall() owns besides the session map — the DTMF accumulator, the
+		// transaction-layer slots for the Call-ID, the park orbit, the conference
+		// leg and the CDR record — so a killed call never produced a CDR entry.
+		//
+		// Shape mirrors sweepSessionTimers(): one server BYE per leg, addressed
+		// with the dialog From/To captured at connect, then endCall() for the
+		// rest. Both legs get one — the admin killed the CALL, and the killed
+		// extension's handset has just as little way to learn that as its peer.
+		//
+		// Thread rule: /api/kill reaches here from the HTTP task, not the SIP
+		// receive thread, so the BYEs go to _asyncOutbox. handle()/tick() clear
+		// _outbox at the start of every pass; a push there from this thread
+		// would race that clear and be silently dropped. drainOutbox() merges
+		// _asyncOutbox on the SIP thread's next pass.
+		//
+		// Collect first, then act: endCall() erases from _sessions, so it cannot
+		// run inside an iteration over that map.
+		std::vector<std::string> involved;
+		for (const auto& [callID, session] : _sessions)
+		{
+			if ((session->getSrc()  && session->getSrc()->getNumber()  == extension) ||
+				(session->getDest() && session->getDest()->getNumber() == extension))
+			{
+				involved.push_back(callID);
+			}
+		}
+		for (const auto& callID : involved)
+		{
+			auto it = _sessions.find(callID);
+			if (it == _sessions.end()) continue;
+			auto session = it->second;
+			auto src  = session->getSrc();
+			auto dest = session->getDest();
+			const std::string& dFrom = session->getDialogFrom();
+			const std::string& dTo   = session->getDialogTo();
+
+			// Same #72 guard as the session-timer reaper: a BYE with an empty
+			// From or To is malformed and phones drop it. A dialog that never
+			// reached Connected (still ringing) has no To-tag yet and gets no
+			// BYE — endCall() below still clears it server-side, as before.
+			if (src && !dFrom.empty() && !dTo.empty())
+			{
+				auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom);
+				if (b) _asyncOutbox.emplace_back(src->getAddress(), std::move(b));
+			}
+			// A virtual-extension leg (777 echo, 888 conference, 555 anchor) has no
+			// second phone: its "dest" is a stand-in SipClient carrying the
+			// CALLER's own address (see onReinvite()'s note), so a BYE to it would
+			// reach the caller a second time with the tags reversed. The PBX is
+			// the UAS on that leg, and the src BYE above already ends it.
+			const std::string destNum = dest ? dest->getNumber() : "";
+			const bool destIsVirtual = destNum == "777" || destNum == ConferenceRoom::EXT ||
+			                           destNum == kAnchorCallExt;
+			if (dest && !destIsVirtual && !dFrom.empty() && !dTo.empty())
+			{
+				auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo);
+				if (b) _asyncOutbox.emplace_back(dest->getAddress(), std::move(b));
+			}
+			endCall(callID,
+			        src  ? src->getNumber()  : "",
+			        dest ? dest->getNumber() : "",
+			        "extension " + extension + " was force-disconnected by admin");
+		}
+		// Release the registration LAST. SipClient::release() clears the number,
+		// and the Session's src/dest point at this same pool object — releasing
+		// first (as this function used to) blanked the number before the
+		// involvement check above ever ran, so no session matched and nothing
+		// was torn down at all. The BYE Request-URIs and the CDR src/dest read
+		// the number too.
 		for (auto& client : _clientPool)
 		{
 			if (client->getNumber() == extension)
 			{
 				client->release();
 				break;
-			}
-		}
-		// Also remove any sessions involving this extension
-		for (auto it = _sessions.begin(); it != _sessions.end(); )
-		{
-			bool involved = false;
-			if (it->second->getSrc() && it->second->getSrc()->getNumber() == extension)
-				involved = true;
-			if (it->second->getDest() && it->second->getDest()->getNumber() == extension)
-				involved = true;
-			if (involved)
-			{
-				std::string callID = it->first;
-				_rtpSender.stop(callID);   // media beachhead: stop any owned RTP stream
-				it = _sessions.erase(it);
-				for (auto& session : _sessionPool)
-				{
-					if (session->getCallID() == callID)
-					{
-						session->release();
-						break;
-					}
-				}
-			}
-			else
-			{
-				++it;
 			}
 		}
 		localLogs = std::move(_logQueue);

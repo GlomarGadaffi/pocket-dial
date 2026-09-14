@@ -50,6 +50,10 @@ public:
 	// pool. Caller holds _mutex.
 	void sweepStale();
 
+	// Test/diagnostic accessor: live accumulators (one per Call-ID that has sent
+	// at least one digit and not yet been forgotten). Caller holds _mutex.
+	size_t accumulatorCount() const { return _dtmfState.size(); }
+
 	// NVS-persisted admin extension identity (default "1001"). Returned by
 	// value, not `const&`: callers are not required to hold _mutex (dashboard/
 	// HTTP reads reach this off the SIP thread), and saveAdminExt() below
