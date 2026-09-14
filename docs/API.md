@@ -425,6 +425,8 @@ you are about to hit. **Ungated** — it has to be reachable before login.
   "provisioned": false,
   "needsSetup": true,
   "authenticated": false,
+  "role": "",
+  "ownerProvisioned": false,
   "sessionRemainingSec": 0
 }
 ```
@@ -434,6 +436,8 @@ you are about to hit. **Ungated** — it has to be reachable before login.
 | `provisioned` | Boolean | `true` once a **real** (operator-set) login credential is stored. `false` on a factory-fresh device and again immediately after a factory reset, when `admin`/`admin` is what verifies. Describes the login credential only — it says nothing about the DTMF PIN, Wi-Fi, or the registrar. |
 | `needsSetup` | Boolean | Exactly `!provisioned`. Emitted separately so the frontend reads as intent rather than a double negative. While this is `true`, gate 4 refuses every admin-gated route except `set-credential`. |
 | `authenticated` | Boolean | Whether **this request's** `pd_session` cookie names a live session. |
+| `role` | String | (Issue #173) `"sysop"` or `"owner"` while `authenticated`, `""` otherwise. See [Two-Role Privilege Model](#two-role-privilege-model-issue-173) below. |
+| `ownerProvisioned` | Boolean | (Issue #173) `true` once a real owner credential has ever been set. While `false`, a sysop session satisfies an owner-gated action too (the no-owner-yet fallback) — the dashboard can use this to decide whether to show "create the owner account" or the three owner-only buttons. |
 | `sessionRemainingSec` | Integer | Seconds left on this request's session, `0` when unauthenticated. Derived from `AdminAuth::sessionRemainingMs()` divided by 1000 — so a session with 900 ms left reads `0`, not `1`. |
 
 > [!WARNING]
@@ -567,16 +571,17 @@ gates 1-3.
 
 * **Request Content-Type**: `application/x-www-form-urlencoded`
 * **Request Parameters** (all optional individually, but the request must change *something*):
-  * `username`: 1-32 characters, no whitespace and no control characters. Must be sent **together with** `password`.
+  * `username`: 1-32 characters, no whitespace and no control characters. Must be sent **together with** `password`. Rejected (`400`) if it collides with the current **owner** username (Issue #173) — the two principals must stay distinguishable.
   * `password`: 8-128 characters. Must be sent **together with** `username`.
   * `dtmfPin`: 4-16 **digits**. Independent of the login credential — sending it alone changes only the DTMF PIN. Empty means "leave the DTMF PIN as it is".
 * **Response Content-Type**: `application/json`
 * **Response Status Codes**:
   * `200 OK`: `{"status":"ok","provisioned":true,"needsSetup":false}`
   * `400 Bad Request`: `{"error":"username and password must both be provided together"}` — exactly one of the two was sent.
-  * `400 Bad Request`: `{"error":"invalid username or password"}` — a field is outside its length bounds, or the username contains whitespace/control characters.
+  * `400 Bad Request`: `{"error":"invalid username or password"}` — a field is outside its length bounds, the username contains whitespace/control characters, or it collides with the owner username.
   * `400 Bad Request`: `{"error":"DTMF PIN must be 4-16 digits"}`
   * `400 Bad Request`: `{"error":"nothing to change"}` — neither a credential pair nor a PIN was supplied.
+  * `403 Forbidden`: `{"error":"owner privilege required to set the DTMF admin PIN"}` — **only for a non-empty `dtmfPin`**, and **only once an owner account exists** (Issue #173, found in review: the DTMF admin menu's `999` factory-reset code — see `DtmfFeatureCodes.cpp` — wipes the entire NVS flash, including the owner credential itself, so planting a PIN is an owner-only action once there is an owner to protect). Before any owner exists, the no-owner-yet fallback still lets the sysop doing initial setup set a PIN. `username`/`password` changes are unaffected — still sysop-level.
   * `401`/`403`: gates 1-3 as in §0.1.
 
 The session you call this through **stays valid** — changing the credential does not
@@ -608,6 +613,173 @@ curl -s -X POST "http://$DEV/api/admin/set-credential" \
 
 Covered by `test_api.sh` TC-AUTH-06 (cross-origin → `403`) and TC-AUTH-07 (completes
 setup → `200`).
+
+---
+
+## Two-Role Privilege Model (Issue #173)
+
+Two independent principals, both derived through `AdminAuth` with the same PBKDF2
+salted-hash storage: **sysop** (the `admin_*` credential documented above — same
+identity, same wire behavior, nothing about it changed) and **owner** (`owner_*`, set
+via `POST /api/admin/set-owner-credential` below). A session resolves to exactly one
+`Role` at login time (`sysop` or `owner`), reported in
+[`POST /api/admin/login`](#post-apiadminlogin)'s and
+[`GET /api/admin/status`](#get-apiadminstatus)'s response bodies.
+
+**Gated at the action site, not the page.** Three actions require `Role::Owner`:
+
+* `POST /api/factory-reset`
+* `POST /api/config/export` **with a `password`** (the encrypted `secretsEnc` block —
+  the plaintext-only export/`GET` stays sysop-level)
+* `POST /api/ota/upload`
+
+…plus one found during review, not in the original issue text: `dtmfPin=` on
+`POST /api/admin/set-credential`, once an owner exists (see that endpoint's `403`
+entry above for why). Every other mutating route stays sysop-level, unchanged.
+
+**No-owner-yet fallback.** Until `POST /api/admin/set-owner-credential` has ever
+succeeded, a **sysop** session satisfies an owner-gated action too. Without this,
+every board that upgrades to this firmware from an earlier single-credential release
+would lose factory-reset/OTA/the encrypted export the instant it boots, with no owner
+account yet to grant them back. The fallback closes permanently the moment an owner
+account is created — from then on, only an owner session satisfies an owner gate, and
+`GET /api/admin/status`'s `ownerProvisioned` field tells a caller which side of that
+line the device is on.
+
+**Lockout is keyed by `(client, principal)`.** A brute-force lockout bucket is keyed
+on the *client address plus which principal the submitted username resolved to*, and
+each principal also tracks its own aggregate backstop independently
+(`AdminAuth::authenticate()`/`isLockedOutForAuth()`). Spraying the sysop password
+cannot lock the owner out, and vice versa — and neither shares any accounting with the
+DTMF admin PIN's own lockout bucket (a review finding: an earlier draft of this
+feature accidentally reused the DTMF PIN's shared counter for HTTP logins too).
+
+**The owner secret is not software-recoverable.** There is no "forgot owner password"
+flow and no way to read one back. If both the owner credential and the DTMF admin PIN
+are lost, the only way back in is a factory reflash with physical/USB access — by
+design, the same floor a lost sysop credential already sits on.
+
+### `POST /api/admin/set-owner-credential`
+
+Sets or replaces the owner credential. Reached only through
+`requireAdmin(…, minRole = Owner)` — which, via the no-owner-yet fallback above, means
+either a **sysop session on a board with no owner yet** (bootstrapping the first
+owner account) or an **existing owner session** (replacing their own credential). A
+sysop session can never replace an *existing* owner's credential.
+
+* **Requires Same-Origin Check + CSRF Token**: Yes
+* **Requires `pd_session` cookie**: Owner-gated (see above)
+* **Request Content-Type**: `application/x-www-form-urlencoded`
+* **Request Parameters**:
+  * `ownerUsername` (Required): Same length/charset rules as the sysop username. Rejected if it collides with the current sysop username.
+  * `ownerPassword` (Required): Same length rules as the sysop password (8-128 characters).
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`: `{"status":"ok","ownerProvisioned":true}`
+  * `400 Bad Request`: `{"error":"ownerUsername and ownerPassword are both required"}`
+  * `400 Bad Request`: `{"error":"invalid owner username/password, or it collides with the sysop username"}`
+  * `403 Forbidden`: `{"error":"owner privilege required"}` — a sysop session tried to replace an *already-existing* owner credential.
+  * `401`/`403`: gates 1-3 as in §0.1.
+
+```bash
+curl -s -X POST "http://$DEV/api/admin/set-owner-credential" \
+     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
+     -d "ownerUsername=boss&ownerPassword=a-different-real-password"
+```
+
+---
+
+## Config Export/Import (Issue #186)
+
+A single-file JSON backup/restore for the whole device, split into an
+**always-plaintext** section and an **optional password-gated** section
+(AES-256-GCM, PBKDF2-SHA256-derived key, 200000 iterations). See
+`src/Helpers/HttpServer.cpp`'s `sendApiConfigExport()`/`sendApiConfigImport()` for the
+authoritative field-by-field accounting of what is plaintext, what is gated, and the
+two data gaps neither direction can currently close (per-extension digest secrets and
+MAC bindings export but cannot import; a trunk slot's client secret is never exported
+at all) — filed as a followup, see the PR that introduced this section.
+
+### `GET /api/config/export`
+
+The plaintext-only export. Sysop-level (the plaintext section still carries the dial
+plan, ring groups, DID map and every extension's SIP digest secret — sensitive, but
+not owner-gated).
+
+* **Requires `pd_session` cookie**: Yes (sysop)
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`: `{"exportVer":1,"plaintext":{...}}` — never includes `secretsEnc`.
+
+```bash
+curl -s "http://$DEV/api/config/export" -b "pd_session=$SESSION" > backup.json
+```
+
+### `POST /api/config/export`
+
+Same plaintext body as the `GET`, plus (only when `password` is non-empty) an
+encrypted `secretsEnc` block carrying the Wi-Fi upstream password, the SoftAP WPA2
+passphrase, and each telephony-trunk slot's `baseUrl`/`clientId`/`routeDn` (never the
+slot's secret — see the followup note above). **Owner-gated, but only when a
+non-empty `password` is sent** — an empty/absent `password` behaves exactly like the
+`GET` (sysop-level, plaintext only), so a single dashboard form can drive both.
+
+* **Requires Same-Origin Check + CSRF Token**: Yes
+* **Requires `pd_session` cookie**: Owner-gated iff `password` is non-empty; otherwise sysop-level
+* **Request Content-Type**: `application/x-www-form-urlencoded`
+* **Request Parameters**:
+  * `password` (Optional): non-empty selects the encrypted block.
+* **Response Status Codes**:
+  * `200 OK`
+  * `403 Forbidden`: `{"error":"owner privilege required"}` — `password` was non-empty and the session was sysop, with an owner already provisioned.
+
+`secretsEnc` shape: `{"kdf":"pbkdf2-sha256","iter":200000,"salt":"<32 hex>","nonce":"<24 hex>","ct":"<ciphertext‖tag, hex>"}`.
+The GCM AAD is the **exact byte span** of the `"plaintext":{...}` object as it appears
+in this response — see `POST /api/config/import` below for why that matters on the way
+back in.
+
+```bash
+curl -s -X POST "http://$DEV/api/config/export" \
+     -b "pd_session=$OWNER_SESSION" -H "X-CSRF: $OWNER_CSRF" \
+     -d "password=a-strong-backup-password" > backup-with-secrets.json
+```
+
+### `POST /api/config/import`
+
+Restores config from a blob produced by either export route above.
+**Replace-not-merge**: for every table this can restore (ring groups, call-forward,
+DND, page zones, dial plan, DID mappings), an entry present on the device but absent
+from the blob is **removed**, not left behind. Sysop-level, with its own
+`confirm=REPLACE` interlock — restoring config is not one of the three owner-only
+actions.
+
+* **Requires Same-Origin Check + CSRF Token**: Yes
+* **Requires `pd_session` cookie**: Yes (sysop)
+* **Request Content-Type**: `application/x-www-form-urlencoded`
+* **Request Parameters**:
+  * `blob` (Required): the **entire** export JSON, percent-encoded exactly as produced (not pretty-printed, not re-serialized — the `plaintext` object's exact byte span is the encrypted block's AAD, so re-formatting it breaks decryption; see `JsonReader.hpp`'s span-tracking comment).
+  * `password` (Optional): required only to restore the `secretsEnc` half; if the blob carries one and this is omitted, the plaintext half still applies and the gated fields are reported `skipped`.
+  * `confirm` (Required): must be the literal string `REPLACE`.
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. **Deviates from a bare `204`** — see the followup note above: this feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
+  * `400 Bad Request`: `{"error":"import requires confirm=REPLACE"}` / `"missing blob parameter"` / `"malformed export blob"` / `"export blob is missing a plaintext object"` / `"unsupported exportVer"` / `"malformed secretsEnc block"`.
+  * `422 Unprocessable Entity`: `{"error":"bad password or corrupted secrets block"}` — a wrong password and a tampered/corrupted `secretsEnc` block are **deliberately indistinguishable** (the GCM tag check fails identically either way). A `400`/`422` leaves the device completely untouched — the whole blob is validated (and decrypted, if a password was given) before the first setter runs.
+  * `401`/`403`: gates 1-3 as in §0.1.
+
+Switching the registrar to `secure` mode via an imported blob is refused (reported
+`skipped`, not an error) when the device has no secured extensions after the
+import — the same guard [`POST /api/registrar`](#post-apiregistrar) already applies to
+a live switch, since restoring `secure` onto a board whose per-extension digest
+secrets could not be restored (see the followup note) would digest-challenge every
+`REGISTER` with no working handset left to notice.
+
+```bash
+curl -s -X POST "http://$DEV/api/config/import" \
+     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
+     --data-urlencode "blob@backup.json" \
+     -d "confirm=REPLACE"
+```
 
 ---
 
@@ -2091,7 +2263,9 @@ default-credential/needs-initial-setup state, then reboots.
 > comment.
 
 * **Requires Same-Origin Check**: Yes
-* **Requires `pd_session` cookie**: Always (see §0)
+* **Requires `pd_session` cookie**: Always (see §0) — and, as of Issue #173, an **owner**
+  session (or a sysop session while no owner has ever been provisioned yet — see
+  [Two-Role Privilege Model](#two-role-privilege-model-issue-173)).
 * **Build**: only the *Wi-Fi NVS erase* is `POCKETDIAL_HAS_WIFI`-guarded. The wipe, the `200` and the reboot are not: the reboot is guarded on `ESP_PLATFORM`, so every ESP transport restarts. See §4.2.
 * **Request Content-Type**: `application/x-www-form-urlencoded`
 * **Request Parameters**:
@@ -2102,6 +2276,7 @@ default-credential/needs-initial-setup state, then reboots.
     every ESP build a reboot is scheduled ~1 s out. The `message` field differs by build
     (captive portal / dashboard / restart the process) but the status does not.
   * `400 Bad Request`: `{"error":"factory reset requires confirm=ERASE"}` — checked **first**, before anything is touched, so a request without it is genuinely harmless.
+  * `403 Forbidden`: `{"error":"owner privilege required"}` — a sysop session, with an owner already provisioned.
   * `401`/`403`: gates 1-4 as in §0.1.
 
 > [!IMPORTANT]
@@ -2207,7 +2382,11 @@ Covered by `test_api.sh` TC-OTA-01 (reachable ungated, schema present).
 Streams a firmware image body directly into the inactive OTA slot. **Not routed through the normal 16 KB-buffered body path** — a firmware image is multi-megabyte, so `handleClient()` detects this path on the request line and hands off to a streaming reader before the usual `Content-Length` cap is applied. **ESP-only.**
 
 * **Requires Same-Origin Check**: Yes
-* **Requires `pd_session` cookie**: Always (see §0)
+* **Requires `pd_session` cookie**: Always (see §0) — and, as of Issue #173, an **owner**
+  session (or a sysop session while no owner has ever been provisioned yet — see
+  [Two-Role Privilege Model](#two-role-privilege-model-issue-173)). The MoH clip upload
+  (`POST /api/moh/upload`) takes the SAME streaming path but stays **sysop**-level — it
+  is audio, not firmware.
 * **Request Content-Type**: raw firmware binary (no particular `Content-Type` is enforced)
 * **Request Headers**:
   * `Content-Length` (Required): Non-zero. Parsed without the normal 16 KB cap, clamped to a 32 MB ceiling (larger than any 16 MB flash layout the firmware supports) to bound the work the server will do for a malformed value.
@@ -2215,6 +2394,7 @@ Streams a firmware image body directly into the inactive OTA slot. **Not routed 
 * **Response Status Codes**:
   * `200 OK` (ESP32): Image staged into the inactive slot; reboot required to run it.
   * `400 Bad Request`: Body was incomplete or a flash write failed mid-stream.
+  * `403 Forbidden`: `{"error":"owner privilege required"}` — a sysop session, with an owner already provisioned.
   * `401 Unauthorized` / `403 Forbidden`: as above.
   * `411 Length Required`: `Content-Length` missing or `0`.
   * `422 Unprocessable Entity`: The image was fully received but failed validation (e.g. bad magic byte / signature).

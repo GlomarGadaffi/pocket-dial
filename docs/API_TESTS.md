@@ -749,3 +749,50 @@ that never has to be rediscovered:
 
 Remember to `AdminAuth::clearCredential()` at the end of a case that sets one — the
 credential is a process-wide static on host, so a leftover one leaks into the next test.
+
+---
+
+## 🔐 7. Two-Role Privilege Model + Config Export/Import (Issues #173, #186)
+
+Covered by three new gtest files rather than `test_api.sh` shell cases — they exercise
+the same real-`HttpServer`-over-a-socket pattern `AdminHttpGate_test.cpp` established,
+plus (for the crypto) independently-published test vectors. All three run in the
+normal `ctest` pass; see §6.
+
+* **`tests/AdminAuthCrypto_test.cpp`** — `AdminAuth::pbkdf2Sha256`/`aesGcmSeal`/
+  `aesGcmOpen` against RFC 7914 §11's PBKDF2-HMAC-SHA256 vectors and the McGrew-Viega
+  GCM spec's Appendix B Test Cases 13/14 (the 256-bit, all-zero-key/IV cases), plus a
+  round-trip, a per-byte ciphertext-tamper sweep, wrong-AAD, wrong-key, and truncated-
+  ciphertext rejection. No `HttpServer` involved — pure function tests, no port block.
+* **`tests/TwoRoleAuth_test.cpp`** (ports `18130`-`18139`) — `AdminAuth::authenticate()`
+  resolving `Role::Sysop`/`Role::Owner`/`Role::None`; the username-collision guard in
+  both directions; the no-owner-yet fallback opening and then closing once an owner is
+  created; lockout keyed by `(client, principal)` including the per-principal
+  aggregate backstop, and the regression pin that an HTTP-login spray must not engage
+  the DTMF PIN's separate lockout bucket (or the reverse); and, driven through a real
+  `HttpServer`, owner-vs-sysop gating on all **four** owner-gated actions (factory
+  reset, config-export-with-secrets, OTA upload, and the DTMF-PIN field of
+  `set-credential` — the fourth found during review, not in the original issue text).
+* **`tests/ConfigExportImport_test.cpp`** (ports `18140`-`18159`) — plaintext
+  export/import round-trip through live `RequestsHandler`/`DeviceConfig` accessors;
+  replace-not-merge (an entry present on the device but absent from the imported blob
+  is removed); the AES-256-GCM-gated round-trip for the Wi-Fi password and the SoftAP
+  PSK; importing with `secretsEnc` present but no `password` (plaintext half still
+  applies, gated half reported `skipped`, existing secret left untouched); the
+  rejection paths — wrong password (`422`), a single tampered ciphertext byte (`422`,
+  indistinguishable from a wrong password), malformed JSON (`400`), a missing
+  `plaintext` object (`400`), an unsupported `exportVer` (`400`), an excessive PBKDF2
+  iteration count (`400` — a DoS guard found during review), an out-of-range
+  `wifiMode` that would otherwise silently wrap into a valid value via integer
+  narrowing (found during review), and a missing `confirm=REPLACE` (`400`); and that
+  the admin credential's hash (and the operators' real passwords) never appear
+  anywhere in an export, plaintext or decrypted-gated.
+
+**Known gap this suite does NOT cover** (see `HttpServer.cpp`'s
+`sendApiConfigExport()` comment and the PR that introduced this section): a
+Secure-mode fleet cannot be fully restored end-to-end, because per-extension digest
+secrets and MAC-to-extension bindings export but have no import accessor on
+`RequestsHandler`/`SipSecretStore` today, and a telephony-trunk slot's client secret
+is never exported at all (`TelephonyApiConfig::SlotView` masks it with no reversing
+accessor). All three are reported `skipped` by the import response rather than
+silently dropped, and are tracked as a followup, not fixed by this pass.
