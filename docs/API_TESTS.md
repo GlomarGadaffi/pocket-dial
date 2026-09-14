@@ -311,9 +311,13 @@ Sets operational mode back to Standalone AP and reboots. Cookie **and** `X-CSRF`
 > [!IMPORTANT]
 > "No-Wi-Fi build" is **not** just the desktop build. The `eth` and `lan8720` transports do
 > not define `POCKETDIAL_HAS_WIFI` (`main/CMakeLists.txt:133-136`), so on a wired board
-> `/api/wifi/connect`, `/api/wifi/mode_ap` and `/api/factory-reset` all take their `#else`
-> branch and answer `501` — despite the message saying "desktop". A hardware test matrix
-> must branch on transport, not on host-vs-device.
+> `/api/wifi/connect` and `/api/wifi/mode_ap` take their `#else` branch and answer `501` —
+> despite the message saying "desktop" (issue #167). A hardware test matrix must branch on
+> transport, not on host-vs-device.
+>
+> `/api/factory-reset` used to be in that list and no longer is: since #189 it answers
+> `200` on every build and reboots on every ESP build, with only the Wi-Fi NVS key erase
+> still transport-gated.
 
 ### 3.8 POST `/api/configuring`
 Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. Takes

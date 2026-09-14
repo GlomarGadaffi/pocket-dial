@@ -468,26 +468,30 @@ What a factory reset actually clears (`HttpServer::sendApiFactoryReset`,
   `400 {"error":"factory reset requires confirm=ERASE"}`.
 - `AdminAuth::clearCredential()` — the login credential, the DTMF PIN, and all live
   sessions.
-- `DeviceConfig::clearAll()` — `ap_secure`, `ap_psk` and `cfgseed_gen`. It *also* issues an
-  erase of `reg_mode`, but against the `storage` namespace rather than the `pbxcfg` one the
-  registrar actually uses, so **the registrar admission mode survives a factory reset** —
-  see the note under
-  [All phones stopped registering at once](#all-phones-stopped-registering-at-once).
+- `DeviceConfig::clearAll()` — `ap_secure`, `ap_psk`, `cfgseed_gen`, and `reg_mode`. The
+  `reg_mode` erase used to go to the `storage` namespace instead of the `pbxcfg` one the
+  registrar actually uses, so the admission mode survived a factory reset and a board left
+  in `secure` could not be rescued without USB. Fixed in #188 — the write and the erase now
+  go through `writeRegistrarMode()` / `eraseRegistrarMode()`, so the namespace is named in a
+  single place.
 - Via the handler: the Telephony-API credential slots (`tapicfg`), the DID→extension table
   (`didmap`) and the CDR call-history ring (`cdrlog`). These live in their own NVS
   namespaces and would otherwise survive.
-- The Wi-Fi keys `wifi_mode` / `wifi_ssid` / `wifi_pass` / `decayed`, then a reboot —
-  **but only on a build that has Wi-Fi.** That last block sits inside
-  `#if defined(POCKETDIAL_HAS_WIFI)` (`HttpServer.cpp:2130-2149`), and the `eth` /
-  `lan8720` transports deliberately do not define it (`main/CMakeLists.txt:133-136`). On a
-  wired board the route therefore clears the credential, the DeviceConfig keys and the
-  telephony/DID/CDR namespaces, then answers **`501 {"error":"factory reset not available
-  on desktop"}`** and does **not** reboot. The clearing has happened; power-cycle the board
-  yourself, and do not read the `501` as "nothing was erased". **Source-verified
-  2026-09-13; not exercised on hardware.**
-- **It does not clear the `provisioned` boot latch.** A factory-reset board comes back on
-  `admin`/`admin` but with SIP already running, rather than re-entering the
-  hold-SIP-until-credential wait a virgin board does.
+- The Wi-Fi keys `wifi_mode` / `wifi_ssid` / `wifi_pass` / `decayed` — **only on a build
+  that has Wi-Fi**, since `eth` / `lan8720` deliberately do not define
+  `POCKETDIAL_HAS_WIFI` (`main/CMakeLists.txt:133-136`) and have no radio settings to
+  erase. This is the only transport-specific part of the route.
+- **Then a reboot, on every ESP build.** The restart is guarded on `ESP_PLATFORM`, not on
+  the transport, so wired boards reboot too. Until #189 it was guarded on the transport:
+  a wired board performed the whole wipe, then answered `501 {"error":"factory reset not
+  available on desktop"}` and never rebooted. If you are reading an older capture, that
+  `501` recorded a *completed* reset.
+- **The boot provisioning gate does re-engage.** `provisioned` is an in-RAM flag
+  (`AdminAuth.cpp:390`), not a stored latch — the gate reads `storage`/`admin_pw_hash`
+  from NVS directly (`AdminAuth.cpp:1054`), and that is exactly the key
+  `eraseCredentialLocked()` removes (`:621`). So a factory-reset board comes back on the
+  default credential *and* re-enters the hold-SIP-until-credential wait, like a virgin
+  board.
 - **It re-applies the flash-time seed.** Dropping `cfgseed_gen` is deliberate — "factory"
   means *as flashed*, not *as hardcoded* (`DeviceConfig.hpp`). If the browser flasher wrote
   an AP passphrase, a Wi-Fi mode or a registrar mode into `cfgseed`, the next boot applies

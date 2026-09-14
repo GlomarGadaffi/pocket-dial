@@ -2128,6 +2128,10 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		handler->clearAllCallHistory();
 	}
 #if defined(POCKETDIAL_HAS_WIFI)
+	// The ONLY genuinely radio-specific work in this handler. It stays gated on the
+	// transport (not the platform) for a second reason beyond the keys themselves:
+	// nvs.h/nvs_flash.h are included under POCKETDIAL_HAS_WIFI alone (top of file),
+	// so nothing outside this block may touch NVS directly.
 	nvs_handle_t nvs_handle;
 	if (nvs_open("storage", NVS_READWRITE, &nvs_handle) == ESP_OK) {
 		nvs_erase_key(nvs_handle, "wifi_mode");
@@ -2137,15 +2141,39 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		nvs_commit(nvs_handle);
 		nvs_close(nvs_handle);
 	}
+#endif
+	// Every build that reaches this line has completed the wipe above, so every
+	// build has to say so. This used to answer 200 only under POCKETDIAL_HAS_WIFI
+	// and drop eth/lan8720 into a 501 "factory reset not available on desktop" --
+	// on real hardware, after the credential, the carrier OAuth secret, the DID
+	// table and the CDR ring were already gone. An operator reading that reasonably
+	// concludes nothing happened. Report the outcome truthfully everywhere; only
+	// the follow-up instruction differs, because only the radio builds come back to
+	// a captive portal.
+#if defined(POCKETDIAL_HAS_WIFI)
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"message\":\"Factory reset. Rebooting to captive-portal setup...\"}");
+#elif defined(ESP_PLATFORM)
+	// Wired boards have no captive portal: they reboot straight back to the
+	// dashboard, which reports needsSetup:true and demands a new admin login
+	// before the SIP registrar will start.
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"message\":\"Factory reset. Rebooting \\u2014 the dashboard will ask you to create a new admin login.\"}");
+#else
+	// Genuine desktop/host build: the wipe succeeded, there is simply no firmware
+	// to restart. This is the one case the old 501 described correctly, and even
+	// here it was the wrong status for an operation that did complete.
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"message\":\"Factory reset. Restart the process to complete.\"}");
+#endif
+#if defined(ESP_PLATFORM)
+	// Guarded on the platform, not the transport: esp_restart() and the deferred
+	// restart task exist on every ESP build (see the include block at the top of
+	// this file, which already makes exactly this distinction for the OTA path).
 	xTaskCreate([](void*) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
 		esp_restart();
 	}, "restart_task", 2048, NULL, 5, NULL);
-#else
-	sendResponse(sock, 501, "Not Implemented", "application/json",
-	             "{\"error\":\"factory reset not available on desktop\"}");
 #endif
 }
 
