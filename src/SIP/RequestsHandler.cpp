@@ -4106,28 +4106,45 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// original leg tears down; redirectInvite() then allocates a clean session.
 	auto targetClient = findClient(target);
 
-	// Issue #128: endCall() below is pure local bookkeeping (session/pool/CDR) — it
-	// never puts a packet on the wire, so the OTHER party on this dialog (the one
-	// NOT the transferor, dropped by the transfer) was never told the call ended and
-	// sat on a dead call forever. REFER is itself an in-dialog request on the SAME
-	// A-B dialog it's transferring out of, so data->getFrom()/getTo() already carry
-	// exactly this dialog's tags (transferor's own + the other party's) — no need to
-	// read session->getDialogFrom()/getDialogTo(), which armSessionTimer() only
-	// populates when RFC 4028 Session-Expires was negotiated.
-	if (auto original = getSession(callID); original.has_value())
+	// Issue #203: but do NOT tear anything down until we know the target resolves.
+	// This lookup is the SOLE thing that can make the transfer fail — redirectInvite()
+	// returns false only when its own findRegistered() misses (CallForker.cpp:150-154),
+	// and findRegistered() is findClient() with no extra filter (RequestsHandler.hpp:473).
+	// Every other way redirectInvite() can bail (session pool exhausted -> 503) returns
+	// true deliberately. So `targetClient.has_value()` here is exactly the outcome, known
+	// before a single byte of teardown — and when it's empty the right answer is to leave
+	// the call ALONE and decline the transfer, not to destroy a working call on behalf of
+	// a transfer that was never going to happen.
+	//
+	// Previously the BYE and endCall() below ran unconditionally, so REFERing to anything
+	// unresolvable — a park orbit (#203), a typo'd extension, an extension that dropped
+	// its registration — hung up on the other party and erased the session, THEN reported
+	// 404. The transferor was told the truth and still lost the call.
+	if (targetClient.has_value())
 	{
-		auto src = original.value()->getSrc();
-		auto dest = original.value()->getDest();
-		auto other = (dest && dest->getNumber() != transferor->getNumber()) ? dest : src;
-		if (other && other->getNumber() != transferor->getNumber())
+		// Issue #128: endCall() below is pure local bookkeeping (session/pool/CDR) — it
+		// never puts a packet on the wire, so the OTHER party on this dialog (the one
+		// NOT the transferor, dropped by the transfer) was never told the call ended and
+		// sat on a dead call forever. REFER is itself an in-dialog request on the SAME
+		// A-B dialog it's transferring out of, so data->getFrom()/getTo() already carry
+		// exactly this dialog's tags (transferor's own + the other party's) — no need to
+		// read session->getDialogFrom()/getDialogTo(), which armSessionTimer() only
+		// populates when RFC 4028 Session-Expires was negotiated.
+		if (auto original = getSession(callID); original.has_value())
 		{
-			auto bye = buildServerBye(other->getNumber(), other->getAddress(), callID,
-				std::string(data->getFrom()), std::string(data->getTo()));
-			if (bye) _outbox.emplace_back(other->getAddress(), std::move(bye));
+			auto src = original.value()->getSrc();
+			auto dest = original.value()->getDest();
+			auto other = (dest && dest->getNumber() != transferor->getNumber()) ? dest : src;
+			if (other && other->getNumber() != transferor->getNumber())
+			{
+				auto bye = buildServerBye(other->getNumber(), other->getAddress(), callID,
+					std::string(data->getFrom()), std::string(data->getTo()));
+				if (bye) _outbox.emplace_back(other->getAddress(), std::move(bye));
+			}
 		}
-	}
 
-	endCall(callID, transferor->getNumber(), std::string(data->getToNumber()), "blind transfer");
+		endCall(callID, transferor->getNumber(), std::string(data->getToNumber()), "blind transfer");
+	}
 
 	bool ok = targetClient.has_value() && _forker.redirectInvite(data, transferor, target);
 
@@ -4141,7 +4158,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 
 	if (!ok)
 	{
-		queueLog("REFER: blind transfer to " + target + " failed (target not registered)", true);
+		queueLog("REFER: blind transfer to " + target + " declined (no such target) — "
+			"call left up", true);
 	}
 	else
 	{
