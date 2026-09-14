@@ -131,16 +131,15 @@ for board specifics.
 > no Wi-Fi fallback into an `eth` board. If it drops off the wired LAN, recovery is
 > the serial console or a USB reflash, not a rescue AP.
 >
-> `POST /api/factory-reset` is the trap in that set: on these builds it **does** the
-> reset — clears the admin credential and DTMF PIN, `DeviceConfig`, the
-> Telephony-API slots, the DID table and the CDR ring — and *then* falls into the
-> same `501` arm and **does not reboot**. Do not read that `501` as "nothing
-> happened" and retry: `AdminAuth::clearCredential()` has already cleared the
-> stored *and* in-memory state and destroyed every session, so the board is on
-> `admin`/`admin` from that moment — it simply did not restart. Power-cycle it,
-> then redo first-use setup. Note the boot gate does **not** re-engage after a
-> factory reset: the `provisioned` flag in NVS `storage` is only ever set, never
-> erased, so SIP comes straight up on the default credential on that next boot.
+> `POST /api/factory-reset` is **not** in that set — it is fully real on a wired
+> board. It clears the admin credential and DTMF PIN, `DeviceConfig`, the
+> Telephony-API slots, the DID table and the CDR ring, answers `200`, and reboots.
+> The board comes back unprovisioned and holds SIP down until you commit a new
+> admin credential, exactly like a virgin board.
+>
+> Before #189 this route was the trap in that set: it did the whole reset and then
+> fell into the `501` arm without rebooting. If you are working from an older
+> capture or runbook, read that `501` as a *completed* reset, not a no-op.
 
 ---
 

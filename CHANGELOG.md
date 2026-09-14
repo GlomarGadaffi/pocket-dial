@@ -265,6 +265,35 @@ sensitive as the carrier credentials that fix already covered. `CdrRing::clearAl
 `RequestsHandler::clearAllCallHistory()` are now wired into `sendApiFactoryReset()`
 alongside the existing wipes.
 
+### Fixed — factory reset reported failure after wiping the device (#189)
+
+Third defect in the same handler, and the one an operator would actually be hurt by.
+
+Every destructive call in `sendApiFactoryReset()` is unconditional, but the `200` and the
+reboot were inside `#if defined(POCKETDIAL_HAS_WIFI)` — which `eth` and `lan8720` do not
+define, because those boards have no radio. So on the firmwares that ship on real
+hardware, `confirm=ERASE` cleared the admin credential, the DTMF PIN, `DeviceConfig`, the
+carrier OAuth client_id/client_secret, the DID table and the CDR ring, and then answered
+`501 {"error":"factory reset not available on desktop"}` without rebooting.
+
+An error naming a platform the operator is not on reads as "nothing happened" — and the
+response is the only signal they get, since `clearCredential()` destroys the very session
+that made the request. There is no authenticated follow-up call to check with.
+
+Only the Wi-Fi NVS key erase is genuinely radio-specific and stays gated on the transport
+(`nvs.h` is included under that flag alone). The reboot moves to `ESP_PLATFORM`, matching
+the rule the OTA path in the same file already followed: a restart exists on every ESP
+transport, not just the radio ones. Every build now answers `200`, because every build
+completed the work; only the follow-up instruction differs.
+
+`tests/http/test_api.sh` gains three cases — the host build's behaviour changes from
+`501` to `200`, which is the one part of this a host test can observe.
+
+Two documents also claimed the boot gate does not re-engage after a reset, because a
+`provisioned` latch in NVS is never erased. That was never true: `provisioned` is an
+in-RAM flag, and the gate reads `storage`/`admin_pw_hash`, which is exactly the key the
+reset erases. A reset board does come back unprovisioned.
+
 ### Hardware — the first real-handset evidence in this project
 
 Worth recording separately, because it changes what the rest of the test suite means.

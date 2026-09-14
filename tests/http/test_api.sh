@@ -15,9 +15,17 @@
 #       ("127.0.0.1:8080"). Defaults to 192.168.4.1 (device AP) if omitted.
 #
 # Optional environment:
-#   SERVER_PID   If set (host/CI), the OTA-reboot test asserts that this PID is
-#                STILL ALIVE afterwards (the desktop reboot endpoint must be a
-#                no-op and must NOT exit the process). Ignored on real hardware.
+#   SERVER_PID   If set, means "I launched this server myself and it is
+#                disposable" -- i.e. a host/CI run, never a board. Two things key
+#                off it:
+#                  * the OTA-reboot test asserts this PID is STILL ALIVE
+#                    afterwards (the desktop reboot endpoint must be a no-op and
+#                    must NOT exit the process), and
+#                  * the factory-reset cases (TC-FR-01..03) run AT ALL. They
+#                    perform a real reset -- on hardware that would erase the
+#                    credential, the carrier OAuth secret, the DID table and the
+#                    CDR ring, and reboot the board mid-suite -- so they are
+#                    skipped unless this is set.
 #
 # Test ORDERING is deliberate and load-bearing:
 #   0. Admin auth & setup    (RUN FIRST: the device ships with a default login
@@ -504,7 +512,87 @@ HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
 BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
 assert_status "TC-AUTH-10: POST /api/kill (session destroyed by logout -> 401)" "401" "$HTTP_CODE" "$BODY_CONTENT"
 
+# ── FACTORY RESET  (HOST/CI ONLY — SEE THE GUARD) ────────────────────────────
+# This block performs a REAL factory reset, so it runs only when SERVER_PID is
+# set. That variable means "I started this server process myself and it is
+# disposable" -- the same signal TC-OTA-07 already uses -- and nothing sets it
+# when the suite is pointed at a board. Against real hardware these cases would
+# erase the admin credential, the carrier OAuth secret, the DID table and the CDR
+# ring, and reboot the device out from under the remaining tests.
+#
+# Placement inside suite 6 is forced from both sides. /api/factory-reset is
+# admin-gated, so it needs a LIVE session -- but it also clears the credential and
+# destroys every session, so it cannot run before anything above. It must sit
+# AFTER TC-AUTH-10 (otherwise that test's 401 would come from the reset having
+# killed the session rather than from the logout it is meant to prove) and BEFORE
+# TC-AUTH-11 (whose five wrong passwords trip the 429 lockout that would block the
+# re-login below).
+if [ -z "${SERVER_PID:-}" ]; then
+    echo -e "         ${YELLOW}skipping TC-FR-01..03 (factory reset): SERVER_PID unset, so this"
+    echo -e "         may be real hardware. Export SERVER_PID to run them against a host build.${RESET}"
+else
+# Re-login with the credential TC-AUTH-07 established.
+FR_RAW=$(curl -s -i -X POST \
+  -H "Host: ${HOST_HDR}" \
+  -H "Origin: ${ORIGIN_HDR}" \
+  -d "username=admin&password=realpassword123" "${BASE_URL}/api/admin/login")
+FR_HEADERS=$(printf '%s' "$FR_RAW" | sed -n '1,/^\r*$/p')
+FR_BODY=$(printf '%s' "$FR_RAW" | sed '1,/^\r*$/d')
+FR_SESSION=$(printf '%s' "$FR_HEADERS" \
+    | grep -i "^set-cookie:" \
+    | sed -n 's/.*pd_session=\([0-9a-fA-F]*\).*/\1/p' \
+    | head -n1)
+FR_CSRF=$(printf '%s' "$FR_BODY" \
+    | sed -n 's/.*"csrf":"\([0-9a-fA-F]*\)".*/\1/p' \
+    | head -n1)
+
+# TC-FR-01: confirm token is checked FIRST, before anything is touched, so a
+# request without it must be a genuine no-op. Run before the real reset so the
+# session is still good afterwards.
+RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
+  -H "Host: ${HOST_HDR}" \
+  -H "Origin: ${ORIGIN_HDR}" \
+  -H "Cookie: pd_session=${FR_SESSION}" \
+  -H "X-CSRF: ${FR_CSRF}" \
+  -d "confirm=nope" "${BASE_URL}/api/factory-reset")
+HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
+BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
+assert_status "TC-FR-01: POST /api/factory-reset (wrong confirm token -> 400, nothing wiped)" "400" "$HTTP_CODE" "$BODY_CONTENT"
+
+# TC-FR-02: the real thing. Must answer 200 on EVERY build. This endpoint used to
+# answer 501 {"error":"factory reset not available on desktop"} on any build
+# without POCKETDIAL_HAS_WIFI -- including the eth/lan8720 firmwares, where the
+# wipe had already completed. The status is the operator's only signal that the
+# destructive work happened, so a build that reports failure after succeeding is
+# the bug this case exists to catch.
+RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
+  -H "Host: ${HOST_HDR}" \
+  -H "Origin: ${ORIGIN_HDR}" \
+  -H "Cookie: pd_session=${FR_SESSION}" \
+  -H "X-CSRF: ${FR_CSRF}" \
+  -d "confirm=ERASE" "${BASE_URL}/api/factory-reset")
+HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
+BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
+assert_status "TC-FR-02: POST /api/factory-reset (confirm=ERASE -> 200 on every build)" "200" "$HTTP_CODE" "$BODY_CONTENT"
+
+# TC-FR-03: and the 200 must be true. The credential is gone, so the ungated
+# status route reports needsSetup:true again -- the inverse of TC-AUTH-08.
+RESP_DATA=$(curl -s -w "\n%{http_code}" "${BASE_URL}/api/admin/status")
+HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
+BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
+if [ "$HTTP_CODE" = "200" ] && echo "$BODY_CONTENT" | grep -q '"needsSetup":true'; then
+    echo -e "  [${GREEN}PASS${RESET}] TC-FR-03: GET /api/admin/status reports needsSetup:true after the reset."
+    ((PASSED_TESTS++))
+else
+    echo -e "  [${RED}FAIL${RESET}] TC-FR-03: reset answered 200 but the credential survived (expected needsSetup:true)."
+    echo -e "         Response Body: ${YELLOW}${BODY_CONTENT}${RESET}"
+    ((FAILED_TESTS++))
+fi
+fi  # end SERVER_PID guard around TC-FR-01..03
+
 # TC-AUTH-11: brute-force lockout — 5 consecutive wrong passwords trip a 429.
+# Valid whether or not the factory-reset block above ran: "wrong" is wrong against
+# the credential TC-AUTH-07 set and against the default the reset restores.
 LOCKED_OUT=1
 for attempt in 1 2 3 4 5; do
     WRONG_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \

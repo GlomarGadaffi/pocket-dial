@@ -37,8 +37,19 @@ if(SIP_TRANSPORT STREQUAL "eth")
     if(NOT DEFINED PD_ETH_BOARD)
         set(PD_ETH_BOARD "elite")
     endif()
+    # microSD is board-specific and deliberately NOT a generic "eth" feature.
+    # The Elite carries its slot on a second SPI bus (SPI3; the W5500 owns SPI2)
+    # at GPIO 9/11/10/12. On the Waveshare those exact GPIOs are the W5500's own
+    # SCLK/MISO/MOSI/CS/INT/RST (9-14), so driving a card there would fight the
+    # Ethernet controller -- and per this file's own note, a wrong SPI pin on a
+    # W5500 board is not a soft failure: esp_eth_driver_install() times out and
+    # the ESP_ERROR_CHECK aborts the boot into a reset loop with no network to
+    # diagnose it over. So the SD stack is linked for the Elite alone.
+    set(ETH_SD_DEF "")
     if(PD_ETH_BOARD STREQUAL "elite")
         set(ETH_BOARD_DEF "PD_ETH_BOARD_ELITE")
+        list(APPEND EXTRA_REQUIRES sdmmc fatfs esp_driver_sdspi)
+        set(ETH_SD_DEF "PD_ETH_HAS_SD")
     elseif(PD_ETH_BOARD STREQUAL "waveshare")
         set(ETH_BOARD_DEF "PD_ETH_BOARD_WAVESHARE")
     else()
@@ -148,6 +159,11 @@ endif()
 # esp_main_eth.cpp; absent the define, that file falls back to the Elite pins.
 if(SIP_TRANSPORT STREQUAL "eth")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ${ETH_BOARD_DEF})
+    # Elite only — see the pin-collision note in the eth branch above.
+    if(ETH_SD_DEF)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE ${ETH_SD_DEF})
+        message(STATUS "SipServer: microSD enabled (SPI3, GPIO 9/11/10/12)")
+    endif()
 endif()
 
 if(SIP_TRANSPORT STREQUAL "display")

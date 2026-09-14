@@ -198,7 +198,16 @@ W5500 pin map is not the same, so build it with `-D PD_ETH_BOARD=elite` (the def
 | `W5500_INT_GPIO` | **GPIO 14** | Input | W5500 Hardware Interrupt Pin |
 | `W5500_RST_GPIO` | **-1 (Unused)** | Reset | Not wired to a GPIO; reset via SPI soft command |
 
-microSD/TF slot (separate SPI bus; not used by the SIP firmware, available for future config/log storage):
+microSD/TF slot — a **separate SPI bus** (`SPI3_HOST`; the W5500 owns `SPI2_HOST`), so the
+card and Ethernet never contend. Mounted at `/sdcard` (FATFS) during `eth` boot on this
+board; `GET /api/status` reports `sd.{present,mounted,capacityMb}`.
+
+> [!IMPORTANT]
+> These four GPIOs are **Elite-only**. On the Waveshare ESP32-S3-ETH the very same pins
+> (9–14) are that board's W5500 `SCLK`/`MISO`/`MOSI`/`CS`/`INT`/`RST`, so driving a card
+> there would fight the Ethernet controller. `main/CMakeLists.txt` links the SD stack and
+> defines `PD_ETH_HAS_SD` for `PD_ETH_BOARD=elite` alone. A card must be **FAT32** —
+> ESP-IDF's FatFs does not mount exFAT, which is how cards >32 GB ship from the factory.
 
 | Signal Name | ESP32-S3 GPIO |
 | :--- | :---: |

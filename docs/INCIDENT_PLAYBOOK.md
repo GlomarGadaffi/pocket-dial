@@ -287,7 +287,7 @@ before relying on it:
 | :--- | :--- | :--- | :--- |
 | `POST /api/wifi/mode_ap` | Writes `wifi_mode=2` and reboots after 1 s | **`501 Not Implemented`** — the whole body is inside `#if defined(POCKETDIAL_HAS_WIFI)`, which these transports do not define (`main/CMakeLists.txt:133-136`) | `501` |
 | `POST /api/ota/reboot` | Reboots — but only with a staged image; otherwise `409 {"error":"no pending OTA image to boot into"}` | Same (it is gated on `ESP_PLATFORM`, not Wi-Fi) | `200`, simulated no-op |
-| `POST /api/factory-reset` | Clears everything listed in §2, then `200` + reboot | Clears the credential, the DeviceConfig keys and `tapicfg`/`didmap`/`cdrlog`, then answers **`501`** and does **not** reboot (`HttpServer.cpp:2130-2149`) | `501` (after the same clearing) |
+| `POST /api/factory-reset` | Clears everything listed in §2, then `200` + reboot | Identical — same clearing, `200`, and reboot. Only the four Wi-Fi NVS keys are skipped, since a wired board has none | `200` (no reboot; nothing to restart) |
 
 So on a **wired** board in this state, recovery is a **power cycle** or a serial-triggered
 reset, not an HTTP call. On a Wi-Fi board the `mode_ap` recipe still works, and needs the
