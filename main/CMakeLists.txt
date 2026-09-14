@@ -90,6 +90,15 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/SipSecretStore.cpp"
                             "../src/Helpers/ArpLookup.cpp"
                             "../src/Helpers/OtaUpdater.cpp"
+                            # SNTP wall clock. Additive to steady_clock, never a
+                            # replacement: steady_clock stays the clock for every
+                            # duration and timer precisely because it cannot step.
+                            "../src/Helpers/TimeSync.cpp"
+                            # RFC 5424 syslog frame builder + UDP emitter. Present
+                            # but not yet hooked into LogQueue: the drain task runs
+                            # on a 2048-byte stack and send()'s frame buffer would
+                            # not fit, so wiring it needs a stack bump first.
+                            "../src/Helpers/Syslog.cpp"
                             "../src/SIP/SipMessagePool.cpp"
                             "../src/SIP/PbxFeatureConfig.cpp"
                             "../src/SIP/CdrRing.cpp"

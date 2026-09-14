@@ -257,10 +257,30 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 			{
 				// Per-session dummy dest (never a shared client) so concurrent
 				// star-code/777/440 calls can't clobber each other's destination.
-				auto dummy = std::make_shared<SipClient>();
-				dummy->reset("777", session->getSrc()
-					? session->getSrc()->getAddress() : sockaddr_in{}, 3600);
-				session->setDest(dummy);
+				// Drawn from the virtual-peer pool rather than make_shared'd:
+				// onInfo() runs on the SIP packet path like every other handler,
+				// so invariant 1 (zero heap allocation in the packet hot path)
+				// applies here too (drawbridge audit #70).
+				//
+				// allocVirtualPeer can return nullptr — pocket-dial's allocator
+				// refuses past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX rather than
+				// heap-falling-back forever the way drawbridge's does. There is no
+				// response to fail here (this is a mid-dialog DTMF feature, not a
+				// transaction), so the graceful degradation is to leave the call's
+				// existing destination alone: the caller simply doesn't get the
+				// echo, instead of ending up on a session whose dest is null and
+				// whose teardown/CDR paths dereference it.
+				auto dummy = _env.allocVirtualPeer("777", session->getSrc()
+					? session->getSrc()->getAddress() : sockaddr_in{});
+				if (dummy)
+				{
+					session->setDest(dummy);
+				}
+				else
+				{
+					_env.log("*69 virtual-peer pool exhausted, echo reroute skipped for "
+						+ callerExt, true);
+				}
 			}
 		}
 		else
@@ -280,9 +300,16 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 			auto src = session->getSrc();
 			if (src)
 			{
-				// Per-session dummy dest (never a shared client) — see *69 above.
-				auto dummy = std::make_shared<SipClient>();
-				dummy->reset("777", src->getAddress(), 3600);
+				// Per-session dummy dest from the virtual-peer pool, null-checked
+				// — see *69 above for both (drawbridge audit #70).
+				auto dummy = _env.allocVirtualPeer("777", src->getAddress());
+				if (!dummy)
+				{
+					_env.log("*11 virtual-peer pool exhausted, echo loopback skipped for call "
+						+ callId, true);
+					accum.digits.clear();
+					return;
+				}
 				session->setDest(dummy);
 				_env.log("*11 echo loopback for call " + callId);
 			}

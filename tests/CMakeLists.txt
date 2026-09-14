@@ -60,6 +60,22 @@ add_executable(sip_parser_tests
     # digest challenge (drawbridge #125), driven through handle().
     InviteAdmission_test.cpp
     SipStatus_test.cpp
+    # drawbridge #178/#90: the register-beep guard was wired into onFinalFailure
+    # alone, but 180/480/486/487 each have their OWN handlerKey in handle()'s
+    # dispatch switch — so all four fell through to endHandle(), which minted a
+    # 404 back at the phone off the beep's own "pbx" From while the three finals
+    # went unACKed. The pre-existing regression used 400 Bad SDP, the one code
+    # with no specific handlerKey and thus the one that already hit the guard,
+    # which is precisely why this survived. The 180 case is the subtle one: it
+    # must be RECOGNISED without being consumed (a 1xx takes no ACK and does not
+    # end the INVITE transaction, RFC 3261 §17.1.1).
+    RegisterBeepRouting_test.cpp
+    # RFC 5424 syslog frame construction: PRI arithmetic (facility*8 + severity),
+    # the NILVALUE "-" timestamp we must emit until SNTP has synced, field order.
+    Syslog_test.cpp
+    # Prometheus /metrics text-exposition format — content type, HELP/TYPE lines,
+    # and that a monotonic counter is exported as a counter rather than a gauge.
+    MetricsEndpoint_test.cpp
     SipDigest_test.cpp
     ArpLookup_test.cpp
     Pbx_test.cpp
@@ -107,6 +123,11 @@ add_executable(sip_parser_tests
     # RequestsHandler::handle(), and a real-socket round-trip of the
     # POST /api/dialplan admin surface through HttpServer.
     DialPlan_test.cpp
+    # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
+    # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
+    # reason) and the UNSYNCED path, which is permanent on the host build and is
+    # exactly the degraded state every caller has to branch on.
+    TimeSync_test.cpp
     Rtp_test.cpp
     RtpReceiver_test.cpp
     # RFC 4733 telephone-event decode. Only reachable on a SERVER-TERMINATED leg
@@ -208,6 +229,12 @@ add_executable(sip_parser_tests
     # under !ESP_PLATFORM, so it links cleanly into the host test binary and lets
     # RequestsHandler's Learn-mode path build on the desktop.
     ../src/Helpers/ArpLookup.cpp
+    # TimeSync: the SNTP wall clock. The formatter is pure; the SNTP client is
+    # ESP-only, so the host build is PERMANENTLY unsynced — which is exactly the
+    # degraded state every caller must branch on, and therefore worth exercising.
+    ../src/Helpers/TimeSync.cpp
+    # Syslog: RFC 5424 frame builder. Pure formatter host-side, UDP socket ESP-only.
+    ../src/Helpers/Syslog.cpp
     # AdminAuth is self-contained (vendored SHA-256, host-stubbed NVS/RNG under
     # !ESP_PLATFORM). RequestsHandler::onDtmfInfo references AdminAuth::verifyPin for
     # the DTMF *PIN# admin menu, so it must be linked into the host binary too.

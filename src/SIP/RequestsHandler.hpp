@@ -714,6 +714,16 @@ private:
 	// inbound anchor call (routeInboundAnchorCall). Caller holds _mutex.
 	bool allBridgesBusy() const;
 
+	// How many anchored calls may run at once: min(what the plugged-in provider
+	// can drive, what the arrays are sized for). See the implementation comment —
+	// the two are genuinely different limits, and a provider that hands back a
+	// constant participant id (the loopback mock) cannot be run concurrently at
+	// all without silently starving one leg's audio. Caller holds _mutex.
+	unsigned anchorCallLimit() const;
+
+	// Anchored calls currently up. Caller holds _mutex.
+	unsigned activeAnchorCalls() const;
+
 	// True iff the currently-selected anchor provider is Loopback — the boundary
 	// between the two calling conventions this port has to support:
 	//   * Loopback: makeCall()/dropCall()/answerCall() are cheap, bounded

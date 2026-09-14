@@ -450,6 +450,13 @@ void HttpServer::handleClient(int clientSock)
 	{
 		sendApiStatus(clientSock);
 	}
+	else if (req.method == "GET" && req.path == "/metrics")
+	{
+		// Issue #184: deliberately ungated, in the same read-only class as
+		// /api/status directly above — see sendApiMetrics for the full
+		// justification against docs/THREAT_MODEL.md §4 E-2.
+		sendApiMetrics(clientSock);
+	}
 	else if (req.method == "POST" && req.path == "/api/kill")
 	{
 		if (requireAdmin(clientSock, req, true))
@@ -1055,6 +1062,153 @@ void HttpServer::sendApiStatus(int sock)
 	json << "}";
 
 	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+// GET /metrics (issue #184) — Prometheus text-exposition format, ported from
+// drawbridge's issue #128 handler (its src/Helpers/HttpServer.cpp:1079
+// sendApiMetrics). Every place this diverges from that original is recorded
+// below, because the divergences are decisions, not drift.
+//
+// ── GATING: intentionally UNAUTHENTICATED ────────────────────────────────────
+// This is the decision that matters, so it is argued rather than asserted.
+//
+//  1. docs/THREAT_MODEL.md §4 E-2 defines the read-only-and-unauthenticated
+//     class (/api/status, /api/wifi/scan, /api/admin/status) and explicitly
+//     separates it from the *sensitive* reads that do take requireAdmin()
+//     (/api/pcap, /api/trace, /api/registrar, /api/telephony-config,
+//     /api/did-mapping, /api/ap-security — raw SIP bytes including
+//     Authorization digests, credentials-adjacent config, the AP passphrase in
+//     clear). What this handler emits is six unlabelled aggregate numbers: no
+//     extension numbers, no peer addresses, no caller/callee pairs, no config,
+//     no secrets. It belongs in the first class, not the second.
+//
+//  2. /api/status is dispatched ungated from handleClient()'s route table (the
+//     entry directly above /metrics, ~line 449) and returns strictly MORE than
+//     this page does — the whole registered-client roster with each phone's
+//     IP:port, every live session's caller/callee/state, the
+//     dial plan, and the parked-call table. Gating /metrics while that stays
+//     open would not withhold a single bit from an anonymous peer on the link;
+//     it would only look like a control. Operational detail does leak here, but
+//     it is a strict subset of what already leaks next door.
+//
+//  3. A stock Prometheus scraper cannot authenticate to this server even if we
+//     wanted it to. It issues a bare GET with no cookie jar; it cannot drive
+//     POST /api/admin/login, echo the per-session X-CSRF token, or renew the
+//     30-minute sliding session. Putting requireAdmin() here would not harden
+//     the endpoint — it would produce a permanently-401 route that no collector
+//     could ever scrape, i.e. a feature that does not work. Drawbridge reached
+//     the same conclusion for the same reason (its issue #128).
+//
+// So: ungated. A deployment that genuinely needs this hidden should control
+// *reachability* (don't route the scrape network to the device), which is a
+// lever that exists, rather than an auth gate the scrape protocol cannot
+// satisfy. Note §5.5's standing rule still holds — reachability is not a
+// security control for the admin plane; requireAdmin() is. This endpoint is
+// simply not part of the admin plane.
+//
+// ── NAMING ───────────────────────────────────────────────────────────────────
+// Every family is prefixed `pocketdial_`. That is a deliberate divergence:
+// drawbridge shipped its families bare (`uptime_seconds`, `sip_calls_active`,
+// `packets_processed_total`), which collides with any other exporter on the
+// same Prometheus server and is against the convention that a family is
+// namespaced by the application exporting it. The suffixes are drawbridge's
+// verbatim, so the families stay recognisable across the two repos, and the
+// prefix matches this codebase's own POCKETDIAL_ macro namespace.
+//
+// ── DATA SOURCES, and what was dropped ───────────────────────────────────────
+// Reads only the thread-safe getters sendApiStatus already uses: the relaxed
+// atomics (getPacketsProcessed / getPacketsDropped / getSdpRejected) and the
+// _snapshotMutex-guarded counts (getClientCount / getSessionCount). Nothing
+// here touches RequestsHandler::_mutex, the packet-path lock — which is why
+// getConferenceLegs() (RequestsHandler.cpp:4951, the one dashboard getter that
+// takes _mutex) is deliberately NOT exported: a scrape timer firing every
+// 15 s would become the first HTTP-thread contender for the SIP hot path's
+// lock, and a conference-legs gauge is not worth that.
+//
+// Drawbridge families with no source in pocket-dial are dropped, not faked:
+// anchor_calls_active, anchor_connected, sip_registrations_total,
+// sip_calls_total and rtp_playout_{underruns,overruns}_total all read a
+// RequestsHandler::Telemetry struct that this repo does not have, and
+// heap_free_bytes / psram_free_bytes have no counterpart in this server's
+// status route.
+void HttpServer::sendApiMetrics(int sock)
+{
+	uint64_t uptimeSec = (currentTimeMs() - _startTime) / 1000;
+
+	uint64_t packets      = 0;
+	uint64_t dropped      = 0;
+	uint64_t sdpRejected  = 0;
+	size_t   clientCount  = 0;
+	size_t   sessionCount = 0;
+
+	// Same null-check idiom as sendApiStatus: the dashboard starts before the
+	// SIP stack exists (see attachHandler's comment in the header), so an
+	// unattached server must still answer 200 with all-zero samples rather than
+	// 503. Zero is a valid sample; a missing family would make a collector
+	// report the series as stale.
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler != nullptr)
+	{
+		packets      = handler->getPacketsProcessed();
+		dropped      = handler->getPacketsDropped();
+		sdpRejected  = handler->getSdpRejected();
+		clientCount  = handler->getClientCount();
+		sessionCount = handler->getSessionCount();
+	}
+
+	// Exposition format 0.0.4 is a strict line protocol: "# HELP <name> <text>"
+	// then "# TYPE <name> <counter|gauge>" then one bare-number sample line per
+	// family, LF-separated (never CRLF — that is the response *header*
+	// convention, not the body's), and the body ends with a final LF.
+	//
+	// A monotonic series MUST be declared `counter`, never `gauge`: rate() and
+	// increase() only apply their counter-reset correction to a family typed
+	// counter, so mistyping one would make every reboot read as a large
+	// negative rate instead of a reset.
+	std::ostringstream out;
+	auto gauge = [&out](const char* name, const char* help, uint64_t value) {
+		out << "# HELP " << name << " " << help << "\n";
+		out << "# TYPE " << name << " gauge\n";
+		out << name << " " << value << "\n";
+	};
+	auto counter = [&out](const char* name, const char* help, uint64_t value) {
+		out << "# HELP " << name << " " << help << "\n";
+		out << "# TYPE " << name << " counter\n";
+		out << name << " " << value << "\n";
+	};
+
+	// Uptime is monotonic-since-boot but is a gauge by convention (and by
+	// drawbridge's choice): it is read as "how long has this board been up",
+	// a point-in-time value, and is never rate()'d. Only the _total families
+	// below are counters.
+	gauge("pocketdial_uptime_seconds",
+	      "Seconds since this boot.", uptimeSec);
+	// Both of these read the dashboard snapshot, which tick() republishes on its
+	// own ~1 s cadence (RequestsHandler.cpp's snapshot build) — so they lag live
+	// state by up to a tick. That is well inside any sane scrape interval, but it
+	// is why neither is described as "exact".
+	gauge("pocketdial_sip_registrations_active",
+	      "Extensions holding a registration binding, as of the last snapshot.",
+	      static_cast<uint64_t>(clientCount));
+	gauge("pocketdial_sip_calls_active",
+	      "Sessions allocated in the session map, as of the last snapshot. Counts "
+	      "internal legs (register beep, echo, park ring-back), not just "
+	      "handset-to-handset calls.",
+	      static_cast<uint64_t>(sessionCount));
+	counter("pocketdial_packets_processed_total",
+	        "SIP packets accepted and dispatched since boot.", packets);
+	counter("pocketdial_packets_dropped_total",
+	        "SIP packets dropped since boot as malformed or rate-limited (issue #38).",
+	        dropped);
+	counter("pocketdial_sdp_rejected_total",
+	        "SDP bodies refused by the admission gate since boot, whether answered 488 "
+	        "or dropped silently (docs/THREAT_MODEL.md T-7).",
+	        sdpRejected);
+
+	// "text/plain; version=0.0.4" is THE exposition-format content type — the
+	// version parameter is how a scraper picks its parser, so it is not
+	// decorative. sendResponse passes the string through verbatim.
+	sendResponse(sock, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", out.str());
 }
 
 void HttpServer::sendApiKill(int sock, const std::string& body)
