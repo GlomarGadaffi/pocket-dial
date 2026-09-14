@@ -302,6 +302,13 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 		for (size_t i = 0; i < POCKETDIAL_MAX_ANCHOR_CALLS; ++i)
 		{
 			_mediaBridges[i].init(&_anchorRtpReceivers[i], &_anchorRtpSenders[i], _anchorClient);
+			// Issue #199 item 3. On an anchored (555 / trunk) call the board IS
+			// the far end of the handset's media, so RFC 4733 is the only way a
+			// keypress reaches it short of SIP INFO — and this is the path #194's
+			// voicemail and IVR stages will navigate menus over.
+			_mediaBridges[i].setDigitSink([this](std::string_view legCallId, char digit) {
+				queueDtmfDigit(legCallId, digit);
+			});
 		}
 		_anchorClient->registerAudioRxCallback(
 			[this](const std::string& participantId, const int16_t* samples, size_t count)
@@ -734,6 +741,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		}
 
 		maybeSweep();
+
+		// RFC 4733 key presses captured on the media tasks since the last pass.
+		// Drained HERE as well as in tick() for two reasons: whenever any SIP
+		// traffic is flowing a digit is acted on immediately instead of waiting
+		// up to a tick, and it gives a host test a deterministic way to trigger
+		// the drain — tick() self-throttles to 1 Hz, so calling it in a loop
+		// proves nothing.
+		drainDtmfInbox();
 
 		// A refused SDP body skips the transaction layer and the handler table
 		// entirely: a poison 200 OK must not "accept" an INVITE transaction any
@@ -2124,6 +2139,13 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	if (!_conference)
 	{
 		_conference = std::make_unique<ConferenceRoom>();
+		// Issue #199 item 3: give every leg a way to hand an RFC 4733 key press
+		// back to the engine. Invoked on that leg's RTP receive task, so it goes
+		// to queueDtmfDigit(), which is the one entry point here built to be
+		// called without _mutex held.
+		_conference->setDigitSink([this](std::string_view legCallId, char digit) {
+			queueDtmfDigit(legCallId, digit);
+		});
 		_conference->startDriver();
 		queueLog("888 conference: room created (" + std::to_string(ConferenceRoom::MAX_LEGS)
 			+ " legs, " + std::to_string(ConferenceRoom::TICK_MS) + " ms mix tick)");
@@ -2131,7 +2153,8 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 
 	// Join first: a full room must not consume a session slot. The leg index is also
 	// the proof the media actually came up, so nothing is answered on a dead leg.
-	const int leg = _conference->join(callID, std::string(caller->getNumber()), destIp, destPort);
+	const int leg = _conference->join(callID, std::string(caller->getNumber()), destIp, destPort,
+		data->getTelephoneEventPayloadType());
 	if (leg < 0)
 	{
 		refuse("SIP/2.0 486 Busy Here", "room full or media failed to start");
@@ -2646,7 +2669,8 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 			return true;
 		}
 
-		if (!bridge->startBridge(destIp, destPort, callID, ownLeg))
+		if (!bridge->startBridge(destIp, destPort, callID, ownLeg,
+			data->getTelephoneEventPayloadType()))
 		{
 			_anchorClient->dropCall(ownLeg);
 			refuse("SIP/2.0 503 Service Unavailable", "media bridge failed to start");
@@ -6253,6 +6277,74 @@ int RequestsHandler::getConferenceLegs()
 	return _conference ? _conference->legCount() : 0;
 }
 
+void RequestsHandler::queueDtmfDigit(std::string_view callId, char digit)
+{
+	if (digit == '\0' || callId.empty()) return;
+
+	// Stamp at CAPTURE, not at drain. The press may wait up to a tick for the SIP
+	// thread, and DtmfAccum::TIMEOUT_MS is the user's inter-digit budget — if the
+	// timestamp came from drain time, the drain cadence would quietly consume
+	// part of it and a slowly-dialled feature code would reset mid-sequence.
+	DtmfPress press;
+	press.digit       = digit;
+	press.source      = static_cast<uint8_t>(DtmfFeatureCodes::DigitSource::Rfc4733);
+	press.arrivedTick = DtmfFeatureCodes::nowTickMs();
+	const size_t n = callId.size() < sizeof(press.callId)
+		? callId.size() : sizeof(press.callId) - 1;
+	std::memcpy(press.callId, callId.data(), n);
+	press.callId[n] = '\0';
+
+	{
+		std::lock_guard<std::mutex> lk(_dtmfInboxMutex);
+		if (_dtmfInboxCount >= _dtmfInbox.size())
+		{
+			// Full: drop the OLDEST press and keep the newest. If the SIP thread
+			// has fallen this far behind, the stale digits at the front are the
+			// ones least likely to still complete a sequence the user is typing.
+			// Dropping rather than blocking is the whole point — a stalled RTP
+			// task costs the call's audio, a dropped digit costs one keypress.
+			std::move(_dtmfInbox.begin() + 1, _dtmfInbox.end(), _dtmfInbox.begin());
+			--_dtmfInboxCount;
+			_dtmfDropped.fetch_add(1, std::memory_order_relaxed);
+		}
+		_dtmfInbox[_dtmfInboxCount++] = press;
+	}
+}
+
+uint64_t RequestsHandler::dtmfDigitsDropped() const
+{
+	return _dtmfDropped.load(std::memory_order_relaxed);
+}
+
+void RequestsHandler::drainDtmfInbox()
+{
+	// Lift the batch out under the small lock, then dispatch with it released: a
+	// feature-code action can enqueue SIP messages and touch the config store,
+	// and holding the producer's lock across that would stall a media task for
+	// the duration.
+	std::array<DtmfPress, POCKETDIAL_DTMF_INBOX> batch;
+	size_t count = 0;
+	{
+		std::lock_guard<std::mutex> lk(_dtmfInboxMutex);
+		count = _dtmfInboxCount;
+		for (size_t i = 0; i < count; ++i) batch[i] = _dtmfInbox[i];
+		_dtmfInboxCount = 0;
+	}
+
+	for (size_t i = 0; i < count; ++i)
+	{
+		const auto& p = batch[i];
+		// The dialog may have ended between capture and now — the call hung up
+		// while a digit was in flight. Drop it silently rather than creating an
+		// accumulator for a dead Call-ID, which sweepStale() would only have to
+		// reap later.
+		if (!findSession(p.callId)) continue;
+		_dtmf.onDigit(p.callId, p.digit,
+			static_cast<DtmfFeatureCodes::DigitSource>(p.source),
+			p.arrivedTick, nullptr);
+	}
+}
+
 size_t RequestsHandler::getClientTransactionCount()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
@@ -6285,6 +6377,11 @@ void RequestsHandler::tick()
 		// pointer left behind would silently suppress retransmit tracking for
 		// whatever pooled SipMessage next lands on that address.
 		_passThroughMsg = nullptr;
+
+		// The only drain a conference gets when nobody is signalling: an 888 leg
+		// carries RTP but no SIP, so feature codes pressed mid-conference arrive
+		// on this path alone.
+		drainDtmfInbox();
 
 		sweepExpired();
 

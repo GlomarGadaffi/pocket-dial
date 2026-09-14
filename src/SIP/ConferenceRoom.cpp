@@ -47,8 +47,18 @@ int ConferenceRoom::indexOfLocked(const std::string& callID) const
 	return -1;
 }
 
+void ConferenceRoom::setDigitSink(MediaBridge::DigitSink sink)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	_digitSink = std::move(sink);
+	for (auto& leg : _legs)
+	{
+		leg.bridge.setDigitSink(_digitSink);
+	}
+}
+
 int ConferenceRoom::join(const std::string& callID, const std::string& ext,
-	const std::string& handsetIp, uint16_t handsetPort)
+	const std::string& handsetIp, uint16_t handsetPort, int dtmfPt)
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 
@@ -72,7 +82,11 @@ int ConferenceRoom::join(const std::string& callID, const std::string& ext,
 		// startBridge() attaches the MixBus port and, on any failure past that point,
 		// unwinds it itself — so a false return leaves this slot exactly as free as it
 		// was, with no port leaked.
-		if (!leg.bridge.startBridge(handsetIp, handsetPort, callID, ext))
+		// Re-apply in case this leg was created after setDigitSink() ran; cheap,
+		// and it removes the ordering constraint between wiring and joining.
+		leg.bridge.setDigitSink(_digitSink);
+
+		if (!leg.bridge.startBridge(handsetIp, handsetPort, callID, ext, dtmfPt))
 		{
 			return -1;
 		}

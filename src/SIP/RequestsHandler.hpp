@@ -151,6 +151,24 @@ public:
 	size_t getClientTransactionCount();
 	size_t getServerTransactionCount();
 
+	// ── RFC 4733 DTMF hand-off (Issue #199 item 3) ──────────────────────────────
+	//
+	// Called from an RTP RECEIVE TASK, not the SIP thread. This is the only
+	// public entry point on this class that does NOT expect _mutex to be held —
+	// and must never take it. An RTP task blocked behind a SIP pass is audio
+	// jitter on a live call, so the press is copied into a small fixed ring under
+	// its own mutex and the media task returns immediately.
+	//
+	// The press is stamped with its arrival time here, at capture, because the
+	// SIP thread may not drain for up to a tick and the inter-digit timeout has
+	// to be measured against the key press rather than against the drain.
+	void queueDtmfDigit(std::string_view callId, char digit);
+
+	// Key presses discarded because the ring was full — i.e. the SIP thread fell
+	// far enough behind that a digit was lost. Should sit at zero; a non-zero
+	// value is a real "the user pressed a key and nothing happened" bug report.
+	uint64_t dtmfDigitsDropped() const;
+
 	// Call Detail Records (CDR): a thread-safe snapshot of the recent-call ring,
 	// newest first. Copied out under _snapshotMutex like the client/session views.
 	std::vector<CallDetailRecord> getCallDetailRecords();
@@ -1143,6 +1161,35 @@ private:
 	// Raw pointer, not a shared_ptr: it is only ever compared, never dereferenced,
 	// and the shared_ptr in `request` outlives the whole pass.
 	const SipMessage* _passThroughMsg = nullptr;
+
+	// ── RFC 4733 DTMF hand-off ring ─────────────────────────────────────────────
+	// Producer: any RTP receive task (one per conference leg / anchor bridge).
+	// Consumer: the SIP thread, via drainDtmfInbox() from handle() and tick().
+	//
+	// Guarded by its OWN mutex, deliberately NOT _mutex. This is the one place the
+	// codebase's "everything under the big lock" convention is wrong: the producer
+	// is a real-time media task, and making it wait on the engine lock would turn
+	// every slow SIP pass into an audio glitch. The ring holds plain bytes — no
+	// shared_ptr, no std::string, nothing that allocates or needs the engine's
+	// object pools — so the critical section is a memcpy and the producer never
+	// blocks for longer than another producer's memcpy.
+	struct DtmfPress
+	{
+		char     callId[128]{};   // dialog the press belongs to
+		char     digit = 0;
+		uint8_t  source = 0;      // DtmfFeatureCodes::DigitSource
+		uint32_t arrivedTick = 0; // DtmfFeatureCodes::nowTickMs() at capture
+	};
+	std::array<DtmfPress, POCKETDIAL_DTMF_INBOX> _dtmfInbox{};
+	size_t                _dtmfInboxCount = 0;
+	mutable std::mutex    _dtmfInboxMutex;
+	std::atomic<uint64_t> _dtmfDropped{0};
+
+	// Move everything the media tasks captured into the feature-code machine.
+	// Caller holds _mutex; this takes _dtmfInboxMutex briefly to lift the batch
+	// out, then releases it before dispatching, so a producer is never blocked
+	// for the length of a feature-code action.
+	void drainDtmfInbox();
 
 	std::string _serverIp;
 	std::string _localIp;   // resolved once at construction; avoids getPrimaryLocalIP() under _mutex

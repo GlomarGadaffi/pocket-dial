@@ -21,7 +21,12 @@ void MediaBridge::init(RtpReceiver* receiver, RtpSender* sender, AnchorClient* a
 	_bus      = bus;
 }
 
-bool MediaBridge::startBridge(const std::string& handsetIp, uint16_t handsetPort, const std::string& callID, const std::string& participantId)
+void MediaBridge::setDigitSink(DigitSink sink)
+{
+	_digitSink = std::move(sink);
+}
+
+bool MediaBridge::startBridge(const std::string& handsetIp, uint16_t handsetPort, const std::string& callID, const std::string& participantId, int dtmfPt)
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 
@@ -75,6 +80,40 @@ bool MediaBridge::startBridge(const std::string& handsetIp, uint16_t handsetPort
 		_participantId.clear();
 		_active.store(false, std::memory_order_release);
 		return false;
+	}
+
+	// Arm RFC 4733 reception for this call (Issue #199 item 3). Without this the
+	// receiver drops every telephone-event packet as "a codec we do not speak",
+	// which is why the whole feature-code surface (*8 pickup, *60/*72/*73/*80/*69)
+	// was unreachable from a stock-configured handset: RFC 4733 is the DEFAULT
+	// DTMF mode on most desk phones and softphones, and SIP INFO — the only mode
+	// that worked — generally has to be selected by hand.
+	//
+	// Only on a server-terminated leg, which is the only place it CAN work: an
+	// ordinary extension-to-extension call's RTP is peer-to-peer and never
+	// reaches this board at all.
+	//
+	// The Call-ID is captured by value here, at start, because RtpReceiver's sink
+	// signature carries only the digit — and capturing `this->_callID` by
+	// reference would race stopBridge() clearing it. One small string copy per
+	// call setup, not per packet.
+	if (dtmfPt >= 0 && dtmfPt <= 127 && _digitSink)
+	{
+		const std::string legCallId = callID;
+		auto sink = _digitSink;
+		// The return is deliberately ignored. The only refusal is
+		// PAYLOAD_TYPE_PCMU, which would shadow audio — and an offer claiming
+		// telephone-event on PT 0 is already refused further upstream, where the
+		// SDP is parsed. If one ever got here, the call still proceeds with DTMF
+		// over SIP INFO exactly as it did before this existed, which is the right
+		// outcome: a peculiar SDP should not fail a call that is otherwise fine.
+		// (This file deliberately does no logging — it is on the media path.)
+		(void)_receiver->setDtmfPayloadType(static_cast<uint8_t>(dtmfPt),
+			[legCallId, sink](char digit, uint16_t /*durationMs*/) {
+				// Runs on the RTP receive task. `sink` must not block or take the
+				// engine lock — see MediaBridge::DigitSink's contract.
+				sink(legCallId, digit);
+			});
 	}
 
 	// Start the LAN RTP sender to stream to the handset
