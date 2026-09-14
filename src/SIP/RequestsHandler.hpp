@@ -143,6 +143,14 @@ public:
 	// so it is exact the instant a leg joins or leaves.
 	int getConferenceLegs();
 
+	// Live RFC 3261 §17 transaction counts. Exposed for host tests, which need to
+	// assert the TRACKING DECISION rather than wait for a timer: tick() throttles
+	// itself to 1 Hz, so a test that drives it in a loop cannot observe a 500 ms
+	// Timer A at all and would pass whether or not the decision was right. Reading
+	// the count instead tests the thing under test directly.
+	size_t getClientTransactionCount();
+	size_t getServerTransactionCount();
+
 	// Call Detail Records (CDR): a thread-safe snapshot of the recent-call ring,
 	// newest first. Copied out under _snapshotMutex like the client/session views.
 	std::vector<CallDetailRecord> getCallDetailRecords();
@@ -1108,6 +1116,26 @@ private:
 	// #70 ordering note on the definition. Caller holds _mutex.
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> drainOutbox();
 
+	// The inbound message currently being handled, or nullptr outside a handle()
+	// pass (tick() drains with this unset). Used by drainOutbox() for exactly one
+	// question: is an outbound entry the very object we just received?
+	//
+	// Several relay paths forward a message by pushing the SAME shared_ptr rather
+	// than a clone — onReinvite's hold/resume relay (RequestsHandler.cpp:6787),
+	// onUpdate's SDP relay (:6876), and the provisional relays that endHandle()
+	// `data` straight through. Those are pure pass-through: the PBX is not the
+	// sender, it is the wire. The originating phone owns retransmitting its own
+	// re-INVITE under its own transaction (same branch, RFC 3261 §17.1.1), and it
+	// keeps doing so until the far end's answer comes back through here — so a
+	// PBX-side timer on top would put a second copy of the same branch on the
+	// wire for every loss. That is the same double-send the authored-vs-relayed
+	// rule prevents on the response side, and pointer identity is the exact test
+	// for it: a message the PBX built is never the object it received.
+	//
+	// Raw pointer, not a shared_ptr: it is only ever compared, never dereferenced,
+	// and the shared_ptr in `request` outlives the whole pass.
+	const SipMessage* _passThroughMsg = nullptr;
+
 	std::string _serverIp;
 	std::string _localIp;   // resolved once at construction; avoids getPrimaryLocalIP() under _mutex
 	int         _serverPort;
@@ -1115,6 +1143,11 @@ private:
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	// Requests answered from a §17.2 server transaction's stored response rather
+	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
+	// count is the packet-loss signal this layer exists to absorb, so it is worth
+	// having on the dashboard next to packetsDropped rather than only in the log.
+	std::atomic<uint64_t> _packetsAbsorbed{0};
 
 	struct RegistrarSnapshot
 	{
