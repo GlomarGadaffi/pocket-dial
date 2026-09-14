@@ -584,6 +584,14 @@ private:
 		int         listener = -1; // HoldMusic listener id once they answer
 	};
 	MohPreview _mohPreview;
+	// True when callID is the MoH preview's own dialog. Mirrors
+	// RegisterBeeper::ownsCallID: both are server-originated UACs with no
+	// Session, so response handlers must recognise them explicitly or fall
+	// through to endHandle() and answer the phone with a stray 404.
+	bool mohPreviewOwnsCallID(std::string_view callID) const
+	{
+		return _mohPreview.active && callID == _mohPreview.callId;
+	}
 
 	// Claim a response/request for the preview dialog. Both return true when the
 	// message belonged to the preview and was fully handled.
@@ -592,6 +600,7 @@ private:
 	// stopMohPreview() and by startMohPreview()'s replace-the-previous path.
 	// _mutex is not recursive, so mixing the two would self-deadlock.
 	bool handleMohPreviewOk(const std::shared_ptr<SipMessage>& data);
+	bool handleMohPreviewFailure(const std::shared_ptr<SipMessage>& data);
 	bool handleMohPreviewEnd(const std::shared_ptr<SipMessage>& data);
 	void stopMohPreviewLocked();
 	void releaseMohPreviewLocked();

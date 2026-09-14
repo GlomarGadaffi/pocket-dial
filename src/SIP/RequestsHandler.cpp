@@ -1169,6 +1169,12 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// The MoH preview is the same kind of dialog and needs the same claim.
+	if (handleMohPreviewFailure(data))
+	{
+		return;
+	}
+
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
@@ -1192,6 +1198,12 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 	// onOk() uses. Whoever claims it is responsible for the ACK (RFC 3261
 	// §17.1.1.3) and for releasing its slot.
 	if (_beeper.handleInviteFailure(data))
+	{
+		return;
+	}
+
+	// The MoH preview is the same kind of dialog and needs the same claim.
+	if (handleMohPreviewFailure(data))
 	{
 		return;
 	}
@@ -2072,7 +2084,15 @@ bool RequestsHandler::startMohPreview(const std::string& extension)
 		return false;
 	}
 	inv->syncContentLength();
-	_outbox.emplace_back(addr, std::move(inv));
+	// _asyncOutbox, NOT _outbox: this runs on the HTTP task, off the SIP receive
+	// thread. handle()/tick() clear _outbox at the START of every pass, so an
+	// INVITE queued there from here is wiped before anything drains it -- the
+	// phone never rings while the API cheerfully reports "ringing". Found on
+	// hardware: /api/moh/preview returned 200 and the SIP trace showed no INVITE
+	// at all, only REGISTER/OPTIONS traffic. drainOutbox() merges _asyncOutbox
+	// first, so the next tick() flushes this. Same rule as the CallEvent
+	// callback's fork at :2932.
+	_asyncOutbox.emplace_back(addr, std::move(inv));
 	queueLog("MoH preview: ringing " + extension);
 	return true;
 }
@@ -2122,6 +2142,60 @@ bool RequestsHandler::handleMohPreviewOk(const std::shared_ptr<SipMessage>& data
 	return true;
 }
 
+bool RequestsHandler::handleMohPreviewFailure(const std::shared_ptr<SipMessage>& data)
+{
+	// The phone said no to the preview INVITE (486 busy, 480 unavailable, 487
+	// cancelled, or any other final failure). Same contract onFinalFailure states
+	// for every server-originated UAC: whoever claims it owes the ACK (RFC 3261
+	// §17.1.1.3) and owes releasing the slot.
+	//
+	// Without this the preview was claimed by nobody: the failure fell through to
+	// endHandle(), whose lookup of the preview's own From ("moh") matches no
+	// registered client, so the else branch answered the declining phone with a
+	// stray 404 -- and _mohPreview stayed active forever, a phantom dialog that
+	// blocked every later preview and leaked its listener slot.
+	if (!_mohPreview.active) return false;
+	if (std::string(data->getCallID()) != _mohPreview.callId) return false;
+
+	if (_mohPreview.toTag.empty())
+	{
+		// A failure response carries its own To tag; the ACK for a non-2xx must
+		// echo it or the phone will not match the ACK to its transaction and keeps
+		// retransmitting until Timer H (~32 s).
+		_mohPreview.toTag = siphdr::tagOf(data->getTo());
+	}
+
+	const std::string activeIp   = _localIp;
+	const std::string srcIpPort  = activeIp + ":" + std::to_string(_serverPort);
+	const std::string destIpPort = sipwire::addrToIpPort(_mohPreview.addr);
+
+	// RFC 3261 §17.1.1.3: the ACK for a non-2xx goes in the ORIGINAL INVITE
+	// transaction, so it reuses the INVITE's branch exactly (no "a" suffix, unlike
+	// the 2xx ACK in handleMohPreviewOk, which is a new transaction).
+	std::ostringstream ss;
+	ss << "ACK sip:" << _mohPreview.extension << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << _mohPreview.branch << "\r\n"
+	   << "From: \"Hold Music\" <sip:moh@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
+	   << "To: <sip:" << _mohPreview.extension << "@" << activeIp << ">"
+	   << (_mohPreview.toTag.empty() ? "" : ";tag=" + _mohPreview.toTag) << "\r\n"
+	   << _mohPreview.callId << "\r\n"
+	   << "CSeq: 1 ACK\r\n"
+	   << "Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n";
+
+	if (auto ack = getMessageFromPool(ss.str(), _mohPreview.addr))
+	{
+		// This runs on the SIP receive thread (onBusy/onUnavailable/etc), so
+		// _outbox is the right queue here -- unlike startMohPreview, which is
+		// driven from the HTTP task and must use _asyncOutbox.
+		_outbox.emplace_back(_mohPreview.addr, std::move(ack));
+	}
+
+	queueLog("MoH preview: " + _mohPreview.extension + " declined the preview (" +
+	         std::string(data->getHeader()) + ")");
+	releaseMohPreviewLocked();
+	return true;
+}
+
 bool RequestsHandler::handleMohPreviewEnd(const std::shared_ptr<SipMessage>& data)
 {
 	if (!_mohPreview.active) return false;
@@ -2142,6 +2216,9 @@ void RequestsHandler::stopMohPreview()
 
 void RequestsHandler::stopMohPreviewLocked()
 {
+	// Every send below goes to _asyncOutbox for the same reason startMohPreview's
+	// INVITE does: both callers (stopMohPreview, and startMohPreview replacing an
+	// existing preview) run on the HTTP task, not the SIP receive thread.
 	if (!_mohPreview.active) return;
 
 	// Only BYE a dialog they actually answered — a To-tag is the proof. BYEing a
@@ -2163,7 +2240,7 @@ void RequestsHandler::stopMohPreviewLocked()
 		   << "Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n";
 		if (auto bye = getMessageFromPool(ss.str(), _mohPreview.addr))
 		{
-			_outbox.emplace_back(_mohPreview.addr, std::move(bye));
+			_asyncOutbox.emplace_back(_mohPreview.addr, std::move(bye));
 		}
 	}
 	else
@@ -2181,7 +2258,7 @@ void RequestsHandler::stopMohPreviewLocked()
 		   << "Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n";
 		if (auto c = getMessageFromPool(ss.str(), _mohPreview.addr))
 		{
-			_outbox.emplace_back(_mohPreview.addr, std::move(c));
+			_asyncOutbox.emplace_back(_mohPreview.addr, std::move(c));
 		}
 	}
 
@@ -3175,6 +3252,16 @@ void RequestsHandler::onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, c
 
 void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 {
+	// Our own MoH preview INVITE's 100 Trying. Same claim the beep makes in
+	// onRinging: this is a provisional to US, the preview is a server-originated
+	// UAC with no Session, and its From ("moh") resolves to no registered
+	// extension -- so falling through to endHandle() below answers the phone that
+	// is currently ringing with a stray 404 Not Found. Observed on hardware.
+	if (mohPreviewOwnsCallID(data->getCallID()))
+	{
+		return;
+	}
+
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
@@ -3203,6 +3290,16 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 	// extension) and answers the phone that just started ringing with a stray
 	// 404 Not Found.
 	if (_beeper.ownsCallID(data->getCallID()))
+	{
+		return;
+	}
+
+	// The MoH preview is the same shape as the beep -- server-originated UAC, no
+	// Session, From "moh" matching no registered extension -- so it needs the
+	// same claim for the same reason, and a 180 is likewise provisional: the
+	// preview dialog stays live until the 200 OK (handleMohPreviewOk) or a final
+	// failure. Without this the phone got a 404 while it was still ringing.
+	if (mohPreviewOwnsCallID(data->getCallID()))
 	{
 		return;
 	}
@@ -3238,6 +3335,12 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 	// server-originated UAC with NO Session, so those branches could not claim
 	// it anyway, and the ordering matches drawbridge's onBusy().
 	if (_beeper.handleInviteFailure(data))
+	{
+		return;
+	}
+
+	// The MoH preview is the same kind of dialog and needs the same claim.
+	if (handleMohPreviewFailure(data))
 	{
 		return;
 	}
@@ -3325,6 +3428,12 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 	// §17.1.1.3) and free the slot, rather than fall through to endHandle() and
 	// mint a stray 404 at the phone off the beep's own "pbx" From.
 	if (_beeper.handleInviteFailure(data))
+	{
+		return;
+	}
+
+	// The MoH preview is the same kind of dialog and needs the same claim.
+	if (handleMohPreviewFailure(data))
 	{
 		return;
 	}

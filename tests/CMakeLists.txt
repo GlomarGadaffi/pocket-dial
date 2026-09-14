@@ -135,6 +135,7 @@ add_executable(sip_parser_tests
     # loop), the gain table (sign fold = a crack instead of clipping), and the
     # port-0/port-9 cases that mean "no audio here".
     HoldMusic_test.cpp
+    MohPreview_test.cpp
     Rtp_test.cpp
     RtpReceiver_test.cpp
     # RFC 4733 telephone-event decode. Only reachable on a SERVER-TERMINATED leg
