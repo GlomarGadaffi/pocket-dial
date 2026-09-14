@@ -267,6 +267,14 @@ add_executable(sip_parser_tests
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
     # length/charset bounds that stop a typo from bringing the AP up open.
     DeviceConfig_test.cpp
+    # Issue #181: the NVS schema decision table and the migration walker. The
+    # rows that matter are "provisioned device with no version stamp" (every
+    # board in the field on the release that introduces versioning — adopt as
+    # v1, never wipe) and "stamp newer than this firmware" (an OTA rollback
+    # lands here by itself — write nothing, log loudly, still boot).
+    # planSchema()/runSchemaMigrations() are pure and platform-neutral for
+    # exactly this reason; the nvs_open glue around them is ESP-only.
+    SchemaVersion_test.cpp
     # DeviceConfig: SoftAP WPA2 settings + the flash-time cfgseed reader.
     # Host-stubbed under !ESP_PLATFORM (no NVS, no cfgseed partition), so the
     # dashboard AP-security endpoints stay exercisable on the desktop build.

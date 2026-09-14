@@ -634,6 +634,14 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    // NVS schema version (issue #181). Must land BEFORE applyFlashSeed(): the
+    // seed writer CREATES the very NVS namespaces the "is this a pre-versioning
+    // device?" probe looks for, so running it first would make every
+    // provisioned board look freshly installed and skip the migrations it
+    // actually needs. Logs its own outcome — loudly, if this firmware is older
+    // than the layout on flash.
+    DeviceConfig::ensureSchemaVersion();
+
     // Flash-time configuration seed. Must land AFTER nvs_flash_init() (it writes
     // NVS) and BEFORE the wifi_mode / wifi_ssid / wifi_pass read further down, so
     // a board configured by the browser flasher boots straight into its configured
