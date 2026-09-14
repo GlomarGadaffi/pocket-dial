@@ -202,6 +202,25 @@ namespace
 		return m;
 	}
 
+	// Makes "drain everything currently queued" (writer task) and "clear the
+	// queue, then wipe the sink" (wipeAll(), HTTP task) mutually exclusive as
+	// whole operations. WriterQueue's own internal mutex only protects each
+	// individual push/pop/clear/size call -- it does NOT span the writer
+	// loop's pop-then-append pair, so without this, wipeAll() can run its
+	// clear()+wipe() in the gap between a drainAll() pop() and the matching
+	// sink.append(), and the writer resumes and appends a pre-reset line into
+	// the brand-new post-wipe file. This lock closes exactly that window: the
+	// writer either finishes draining everything pending BEFORE a wipe can
+	// start, or the wipe finishes its clear+wipe BEFORE the writer can drain
+	// anything new. Not held by the free drainAll(WriterQueue&, Sink&)
+	// function itself (host tests call that directly with no concurrent
+	// wipeAll() to race) -- only by the production call sites below.
+	std::mutex& drainWipeMutex()
+	{
+		static std::mutex m;
+		return m;
+	}
+
 	Sink*& sinkSlot()
 	{
 		static Sink* s = nullptr;
@@ -246,17 +265,31 @@ void record(const CallDetailRecord& rec, std::string_view callId, std::string_vi
 
 void wipeAll()
 {
-	// Drop anything still queued FIRST -- a factory reset must not let a
-	// pre-reset call get written out by the writer task after the wipe below
-	// has already run (see WriterQueue::clear()'s doc comment).
-	queue().clear();
-
+	// Check the sink FIRST, same order as record() -- queue() is a
+	// function-local static that only ever gets constructed by init() on the
+	// PD_ETH_HAS_SD path (which force-constructs it up front specifically to
+	// avoid a lazy runtime allocation, see init()'s comment). On every other
+	// build no Sink is ever installed, so returning here means queue() is
+	// NEVER called and the ~19.5 KB WriterQueue backing vector never gets
+	// lazily constructed on the HTTP task at factory-reset time -- which is
+	// exactly what used to happen when this function touched queue() first.
 	Sink* sink;
 	{
 		std::lock_guard<std::mutex> lock(sinkMutex());
 		sink = sinkSlot();
 	}
-	if (sink != nullptr) sink->wipe();
+	if (sink == nullptr) return;  // no archive installed on this build/boot
+
+	// Mutually exclude against the writer task's drain loop for the whole
+	// clear+wipe operation -- see drainWipeMutex()'s doc comment for why a
+	// per-call lock on WriterQueue alone isn't enough.
+	std::lock_guard<std::mutex> lock(drainWipeMutex());
+
+	// Drop anything still queued FIRST -- a factory reset must not let a
+	// pre-reset call get written out by the writer task after the wipe below
+	// has already run (see WriterQueue::clear()'s doc comment).
+	queue().clear();
+	sink->wipe();
 }
 
 #if defined(PD_ETH_HAS_SD)
@@ -330,7 +363,15 @@ namespace
 	{
 		for (;;)
 		{
-			drainAll(queue(), fatFsSink());
+			{
+				// See drainWipeMutex()'s doc comment: this makes "drain
+				// everything currently queued" one atomic operation relative
+				// to wipeAll()'s clear+wipe, closing the factory-reset TOCTOU
+				// window where a popped-but-not-yet-appended line could
+				// survive a wipe into the fresh post-reset file.
+				std::lock_guard<std::mutex> lock(drainWipeMutex());
+				drainAll(queue(), fatFsSink());
+			}
 			vTaskDelay(pdMS_TO_TICKS(200));
 		}
 	}

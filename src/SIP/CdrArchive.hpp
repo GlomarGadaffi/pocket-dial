@@ -190,9 +190,15 @@ void record(const CallDetailRecord& rec, std::string_view callId, std::string_vi
 // Synchronous directory wipe. NOT SIP-thread-safe by the rules above --
 // deletes files, so call it only from a non-realtime context that does not
 // hold _mutex (HttpServer::sendApiFactoryReset, on the HTTP task, same as
-// its existing MoH-upload fopen()). No-op when no Sink is installed. Also
-// clears anything still queued so a pending pre-reset line can't be written
-// out after the wipe.
+// its existing MoH-upload fopen()). No-op when no Sink is installed -- and
+// checked BEFORE touching the queue, so a build with no archive installed
+// never forces the queue's backing allocation into existence here (see
+// record()'s identical ordering and CdrArchive.cpp's queue() comment).
+// Also clears anything still queued so a pending pre-reset line can't be
+// written out after the wipe -- and does so under the same lock the writer
+// task's drain loop holds, so "drain everything pending" and "clear + wipe"
+// are mutually exclusive as whole operations, not just individually
+// thread-safe (see CdrArchive.cpp's drainWipeMutex()).
 void wipeAll();
 
 // Test-only seam: installs `sink` as the active Sink (nullptr restores the
