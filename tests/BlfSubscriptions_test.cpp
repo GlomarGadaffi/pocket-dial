@@ -73,6 +73,34 @@ TEST(BlfSubscriptions, RejectsUnsupportedEventPackage)
 	EXPECT_NE(env.sentRaw(0).find("Allow-Events: dialog"), std::string::npos) << env.sentRaw(0);
 }
 
+// Issue #202: a SERVICE extension is not a watchable endpoint. This machine has
+// never required the watched target to be REGISTERed — an unknown extension is
+// legitimately subscribable, which is how a BLF key survives the watched phone
+// rebooting — so nothing but the charset gate stood between a busy-lamp key
+// labelled "pbx" and a live subscription reporting dialog state for an identity
+// the ENGINE originates calls as. The register beep and the hold-music preview
+// would have lit somebody's lamp.
+TEST(BlfSubscriptions, RejectsASubscribeAimedAtAServiceExtension)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	const sockaddr_in watcherAddr = FakePbxEnv::addr("192.168.1.60", 5060);
+
+	blf.onSubscribe(subscribe("200", "pbx", "watch-svc@192.168.1.60", "Event: dialog", 3600,
+		watcherAddr));
+
+	ASSERT_EQ(env.sent.size(), 1u) << "no 202 and no NOTIFY may be minted";
+	EXPECT_NE(env.sentRaw(0).find("404 Not Found"), std::string::npos) << env.sentRaw(0);
+
+	// Not vacuous: an ordinary, equally-unregistered extension is still watchable.
+	FakePbxEnv env2;
+	BlfSubscriptions blf2(env2);
+	blf2.onSubscribe(subscribe("200", "9999", "watch-ok@192.168.1.60", "Event: dialog", 3600,
+		watcherAddr));
+	ASSERT_EQ(env2.sent.size(), 2u);
+	EXPECT_NE(env2.sentRaw(0).find("202 Accepted"), std::string::npos) << env2.sentRaw(0);
+}
+
 // The compact form "o:" is the Event header (RFC 6665 §8.2.1), and an Event
 // header carrying an ;id= parameter still names the dialog package.
 TEST(BlfSubscriptions, AcceptsCompactEventHeaderAndIgnoresParameters)

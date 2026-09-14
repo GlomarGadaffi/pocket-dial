@@ -2,6 +2,7 @@
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
 #include "DialPlan.hpp"          // Issue #69: dial-rule validation shared with setDialRule
+#include "ServiceExtensions.hpp" // Issue #202: reserved engine-owned pseudo-AORs
 #include "TelephonyApiConfig.hpp"
 #include "DidMapping.hpp"
 #include "CallDetailRecord.hpp"
@@ -11,7 +12,8 @@
 #include "ProvisioningConfig.hpp"
 #include "index_html.h"
 #include "IPHelper.hpp"
-#include "UrlEncode.hpp"        // single source of truth for urlDecode (see below)
+#include "UrlEncode.hpp"
+#include "Syslog.hpp"        // single source of truth for urlDecode (see below)
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -470,7 +472,22 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "GET" && req.path == "/api/status")
 	{
-		sendApiStatus(clientSock);
+		// Issue #207: stays reachable unauthenticated -- E-2's justification is real,
+		// the dashboard genuinely needs this to render before login -- but the
+		// EXTENSION ROSTER is withheld from an unauthenticated caller.
+		//
+		// E-2 justifies this endpoint by what the login form needs. What it returned
+		// included every registered extension number with its handset's IP and port,
+		// which is not that: it is a target list for the SIP INFO spoofing described
+		// in E-4 of the same document, which notes there is no source-IP check on the
+		// DTMF admin parser and that a From header is free text. E-4's mitigation is
+		// "set a long PIN"; this endpoint was handing over the admin extension number
+		// to put in that From, for free.
+		//
+		// requireAdmin's third argument is the CSRF requirement, and passing false
+		// here would reject an unauthenticated caller outright -- so ask without
+		// enforcing, and let sendApiStatus decide what to include.
+		sendApiStatus(clientSock, hasValidAdminSession(req));
 	}
 	else if (req.method == "GET" && req.path == "/metrics")
 	{
@@ -486,29 +503,62 @@ void HttpServer::handleClient(int clientSock)
 			sendApiKill(clientSock, req.body);
 		}
 	}
+	else if (req.method == "GET" && req.path == "/api/syslog")
+	{
+		// Gated. The collector address is infrastructure detail, and #207 was filed
+		// about a read endpoint that had been ungated by analogy rather than by
+		// analysis -- so this takes the conservative side deliberately.
+		if (!requireAdmin(clientSock, req, false)) return;
+		sendApiSyslogStatus(clientSock);
+	}
+	else if (req.method == "POST" && req.path == "/api/syslog")
+	{
+		if (!requireAdmin(clientSock, req, true)) return;
+		sendApiSyslogSet(clientSock, req.body);
+	}
 	else if (req.method == "GET" && req.path == "/api/moh")
 	{
 		// Music-on-hold status. Gated: it reveals what is configured, and the
 		// dashboard already holds a session by the time it renders this panel.
-		if (!requireAdmin(clientSock, req, false)) return;
-		sendApiMohStatus(clientSock);
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiMohStatus(clientSock);
+		}
 	}
 	else if (req.method == "POST" && req.path == "/api/moh/preview")
 	{
 		// Ring an extension and play the clip to it. Mutating (it originates a
 		// call), so CSRF is required like every other POST.
-		if (!requireAdmin(clientSock, req, true)) return;
-		sendApiMohPreview(clientSock, req.body);
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiMohPreview(clientSock, req.body);
+		}
 	}
 	else if (req.method == "POST" && req.path == "/api/moh/preview/stop")
 	{
-		if (!requireAdmin(clientSock, req, true)) return;
-		sendApiMohPreviewStop(clientSock);
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiMohPreviewStop(clientSock);
+		}
 	}
 	else if (req.method == "GET" && req.path == "/api/cdr")
 	{
-		// Read-only Call Detail Records — ungated like /api/status.
-		sendApiCdr(clientSock);
+		// Issue #207: gated, same as /api/pcap and /api/trace.
+		//
+		// This was ungated by analogy -- "read-only, like /api/status" -- and the
+		// analogy does not hold. THREAT_MODEL.md section 4 E-2 enumerates the reads
+		// that are intentionally unauthenticated and gives the reason: the dashboard
+		// needs them to render the LOGIN FORM. A login form does not need call
+		// history. /api/cdr appears in neither E-2's ungated list nor its list of
+		// sensitive gated reads; it was never assessed at all.
+		//
+		// Call metadata -- who called whom, when, for how long -- is close to the
+		// most sensitive thing a PBX holds. Verified on the bench that any host on
+		// the LAN could read the full ring with no credentials.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiCdr(clientSock);
+		}
 	}
 	else if (req.method == "GET" && req.path == "/api/pcap")
 	{
@@ -960,7 +1010,7 @@ static std::string jsonEscape(const std::string& s)
 	return out;
 }
 
-void HttpServer::sendApiStatus(int sock)
+void HttpServer::sendApiStatus(int sock, bool authenticated)
 {
 	uint64_t uptimeMs = currentTimeMs() - _startTime;
 	uint64_t uptimeSec = uptimeMs / 1000;
@@ -1000,6 +1050,15 @@ void HttpServer::sendApiStatus(int sock)
 	json << "\"ip\":\"" << jsonEscape(displayIp) << "\",";
 	json << "\"port\":" << 5060 << ",";
 	json << "\"httpPort\":" << _port << ",";
+	// #167: state the board's WiFi capability rather than leaving the dashboard
+	// to infer it from an empty scan result. An eth/lan8720 build has no radio at
+	// all, so "found 0 networks" is not an empty scan -- it is a scan that can
+	// never succeed, and the two are indistinguishable to a client without this.
+#if defined(POCKETDIAL_HAS_WIFI)
+	json << "\"wifiCapable\":true,";
+#else
+	json << "\"wifiCapable\":false,";
+#endif
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
@@ -1015,14 +1074,27 @@ void HttpServer::sendApiStatus(int sock)
 #endif
 
 	// Clients array
+	// #207: the roster is withheld from an unauthenticated caller. The counts
+	// below stay visible -- "4 phones registered" is operational status, and the
+	// dashboard shows it before login -- but WHICH extensions, at WHICH
+	// addresses, is a target list and requires a session.
 	json << "\"clients\":[";
-	for (size_t i = 0; i < clients.size(); i++)
+	if (authenticated)
 	{
-		if (i > 0) json << ",";
-		json << "{\"number\":\"" << jsonEscape(clients[i].first)
-		     << "\",\"address\":\"" << jsonEscape(clients[i].second) << "\"}";
+		for (size_t i = 0; i < clients.size(); i++)
+		{
+			if (i > 0) json << ",";
+			json << "{\"number\":\"" << jsonEscape(clients[i].first)
+			     << "\",\"address\":\"" << jsonEscape(clients[i].second) << "\"}";
+		}
 	}
 	json << "],";
+	// The COUNT is not withheld -- "4 phones registered" is operational status the
+	// dashboard shows before login, and it discloses no identity. Emitted
+	// unconditionally so an unauthenticated client can tell "nobody is registered"
+	// from "you are not allowed to see who is", which an empty array alone cannot.
+	json << "\"clientCount\":" << clients.size() << ",";
+	json << "\"rosterVisible\":" << (authenticated ? "true" : "false") << ",";
 
 	// Sessions array
 	json << "\"sessions\":[";
@@ -1476,6 +1548,13 @@ void HttpServer::sendApiDnd(int sock, const std::string& body)
 		             "{\"error\":\"cannot set DND on a virtual extension\"}");
 		return;
 	}
+	// Issue #202: same answer for an engine-owned service name (pbx/moh/server).
+	if (pbx::isServiceName(ext))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot set DND on a service extension\"}");
+		return;
+	}
 
 	// Accept 1/true/on as enable; anything else (incl. "0") disables.
 	bool enable = (on == "1" || on == "true" || on == "on");
@@ -1515,6 +1594,24 @@ void HttpServer::sendApiForward(int sock, const std::string& body)
 		             "{\"error\":\"cannot forward a virtual extension\"}");
 		return;
 	}
+	// Issue #202. Two different refusals, and they are not the same question:
+	// a service may not be the SUBSCRIBER (it has no calls of its own to divert),
+	// and a service that cannot receive calls may not be the TARGET (the forward
+	// would be accepted and then black-hole every call it caught, which is the
+	// failure the issue was filed about). setForwardLocked applies the identical
+	// pair so the *72/*73 DTMF path is guarded too — this is the HTTP-facing half.
+	if (pbx::isServiceName(ext))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot forward a service extension\"}");
+		return;
+	}
+	if (!target.empty() && pbx::isServiceName(target) && !pbx::isDialableService(target))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"service extension cannot receive calls\"}");
+		return;
+	}
 
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
@@ -1545,6 +1642,14 @@ void HttpServer::sendApiGroup(int sock, const std::string& body)
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot use a reserved extension as a group\"}");
+		return;
+	}
+	// Issue #202: a group under a service name would shadow it — ring groups are
+	// resolved before the extension lookup in onInvite.
+	if (pbx::isServiceName(ext))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot use a service extension as a group\"}");
 		return;
 	}
 	if (mode.empty()) mode = "ringall";
@@ -1598,6 +1703,15 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot use a reserved extension as a dial-plan pattern\"}");
+		return;
+	}
+	// Issue #202: and no rule may claim a service name either. isDialTokenSafe
+	// above admits letters, so "pbx" is a perfectly legal pattern as far as the
+	// validator is concerned — this is the check that makes it not a legal one.
+	if (pbx::isServiceName(pattern))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot use a service extension as a dial-plan pattern\"}");
 		return;
 	}
 
@@ -1950,6 +2064,16 @@ void HttpServer::sendApiDidMappingSet(int sock, const std::string& body)
 		             "{\"error\":\"cannot map a DID to a virtual/reserved extension\"}");
 		return;
 	}
+	// Issue #202: a DID pointed at a non-dialable service is an inbound trunk call
+	// routed into a name the engine cannot deliver to — the same black hole as a
+	// forward, arriving from outside. Refuse the name outright; when a service
+	// becomes dialable, this gate opens for it by itself.
+	if (pbx::isServiceName(extension) && !pbx::isDialableService(extension))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot map a DID to a service extension that cannot receive calls\"}");
+		return;
+	}
 
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
@@ -2074,6 +2198,22 @@ bool HttpServer::requireSameOrigin(int sock, const HttpRequest& req)
 		return false;
 	}
 	return true;
+}
+
+// Does this request carry a valid admin session? Issue #207.
+//
+// Deliberately NOT a refactor of requireAdmin's step 2: this answers a question
+// without answering the REQUEST. requireAdmin's whole contract is that it writes
+// a 401/403 and returns false, which is exactly wrong for an endpoint that must
+// still serve an unauthenticated caller and merely wants to know how much to
+// include. Reusing it here would turn /api/status into a gated endpoint and break
+// the login form it exists to render.
+//
+// No same-origin check and no CSRF: this gates only what is DISCLOSED on a read,
+// and both of those controls are about who can cause an ACTION.
+bool HttpServer::hasValidAdminSession(const HttpRequest& req) const
+{
+	return AdminAuth::validateSession(sessionToken(req));
 }
 
 bool HttpServer::requireAdmin(int sock, const HttpRequest& req, bool needCsrf)
@@ -2257,7 +2397,7 @@ void HttpServer::sendApiWifiScan(int sock)
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 #else
 	sendResponse(sock, 200, "OK", "application/json", 
-	             "{\"networks\":[], \"note\":\"WiFi scan not available on desktop\"}");
+	             "{\"networks\":[], \"note\":\"WiFi is not available on this build -- this board has no WiFi radio in its current Ethernet-transport configuration\"}");
 #endif
 }
 
@@ -2295,7 +2435,7 @@ void HttpServer::sendApiWifiConnect(int sock, const std::string& body)
 #else
 	(void)password;
 	sendResponse(sock, 501, "Not Implemented", "application/json",
-	             "{\"error\":\"WiFi connect not available on desktop\"}");
+	             "{\"error\":\"WiFi is not available on this build -- this board has no WiFi radio in its current Ethernet-transport configuration\"}");
 #endif
 }
 
@@ -2320,7 +2460,7 @@ void HttpServer::sendApiWifiModeAp(int sock)
 	}, "restart_task", 2048, NULL, 5, NULL);
 #else
 	sendResponse(sock, 501, "Not Implemented", "application/json",
-	             "{\"error\":\"WiFi mode select not available on desktop\"}");
+	             "{\"error\":\"WiFi is not available on this build -- this board has no WiFi radio in its current Ethernet-transport configuration\"}");
 #endif
 }
 
@@ -2820,6 +2960,61 @@ bool HttpServer::streamBody(int sock, const char* prefix, size_t prefixLen,
 		consumed += static_cast<size_t>(n);
 	}
 	return consumed == contentLength;
+}
+
+void HttpServer::sendApiSyslogStatus(int sock)
+{
+	// The host is reported back; there is no secret here (a collector address is
+	// not a credential), and an operator needs to see what the board thinks it is
+	// pointed at to debug 'why am I getting no logs'.
+	std::ostringstream json;
+	json << "{\"supported\":"
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	     << "true"
+#else
+	     << "false"
+#endif
+	     << ",\"enabled\":" << (Syslog::isConfigured() ? "true" : "false")
+	     << ",\"host\":\"" << jsonEscape(Syslog::configuredHost())
+	     << "\",\"port\":" << Syslog::configuredPort()
+	     << "}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiSyslogSet(int sock, const std::string& body)
+{
+	const std::string host = getFormParam(body, "host");
+	const std::string portStr = getFormParam(body, "port");
+
+	// Default 514 when omitted; an explicit out-of-range value is an error rather
+	// than something to silently clamp, because a clamped port fails later as a
+	// mysterious absence of logs.
+	long port = 514;
+	if (!portStr.empty())
+	{
+		char* end = nullptr;
+		port = std::strtol(portStr.c_str(), &end, 10);
+		if (end == portStr.c_str() || *end != '\0' || port < 1 || port > 65535)
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"port must be 1-65535\"}");
+			return;
+		}
+	}
+
+	// An empty host is the documented way to turn remote logging off, so it is a
+	// success, not a validation failure.
+	if (!Syslog::saveToNvs(host, static_cast<uint16_t>(port)))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"host must be a dotted-quad IPv4 address (no DNS resolver on this device), or empty to disable\"}");
+		return;
+	}
+
+	sendResponse(sock, 200, "OK", "application/json",
+	             host.empty()
+	               ? "{\"status\":\"ok\",\"message\":\"remote logging disabled\"}"
+	               : "{\"status\":\"ok\",\"message\":\"remote logging enabled\"}");
 }
 
 void HttpServer::sendApiMohStatus(int sock)

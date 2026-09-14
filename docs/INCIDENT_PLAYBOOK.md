@@ -137,6 +137,7 @@ The device uses Non-Volatile Storage (NVS) to save Wi-Fi SSID, passphrases, mode
 > | `storage` | `admin_pin_salt`, `admin_pin_hash` | The **separate** phone-keypad DTMF PIN |
 > | `storage` | `ap_secure`, `ap_psk` | SoftAP WPA2 |
 > | `storage` | `cfgseed_gen` | Which flash-time seed generation has been applied |
+> | `storage` | `schema_ver` (u16) | Which **key layout** this device's config is written in (#181). Device-wide, not per-namespace. Not cleared by factory reset — see below |
 > | `storage` | `provisioned` (u8) | The **boot latch** that lets SIP start (§8). Not cleared by factory reset |
 > | `pbxcfg` | `reg_mode`, `admin_ext` | Registrar admission mode; the DTMF admin extension (`pbxpersist::kNvsNamespace`, `src/SIP/PbxPersist.hpp:16`) |
 > | `tapicfg` | Telephony-API credential slots | Carrier OAuth `client_id`/`client_secret` |

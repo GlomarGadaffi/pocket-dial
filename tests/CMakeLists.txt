@@ -77,6 +77,19 @@ add_executable(sip_parser_tests
     # and that a monotonic counter is exported as a counter rather than a gauge.
     MetricsEndpoint_test.cpp
     SipDigest_test.cpp
+    # Issue #164 groundwork: the CLIENT half of digest auth. SipDigest_test
+    # covers the registrar direction (build a challenge, verify an inbound
+    # Authorization); this covers the UAC direction (parse a challenge, compute
+    # the response, emit the header). Every hash asserted there is PUBLISHED —
+    # RFC 2617 §3.5, RFC 7616 §3.9.1, and RFC 2069 §2.4 as corrected by Verified
+    # Errata 749 — because a digest implementation that only agrees with itself
+    # will agree with itself while failing against every real SBC.
+    SipDigestClient_test.cpp
+    # The REGISTER user agent built on top of it: challenge/retry, nc
+    # incrementing across refreshes, stale-nonce re-challenge, 423 + Min-Expires,
+    # a server-shortened Expires, and the backoff that keeps a refusing carrier
+    # SBC from being hammered (several ITSPs auto-blacklist for that).
+    SipRegistrationClient_test.cpp
     ArpLookup_test.cpp
     Pbx_test.cpp
     PageZone_test.cpp
@@ -123,6 +136,14 @@ add_executable(sip_parser_tests
     # RequestsHandler::handle(), and a real-socket round-trip of the
     # POST /api/dialplan admin surface through HttpServer.
     DialPlan_test.cpp
+    # Issue #202: service extensions -- the alphanumeric pseudo-AORs the engine
+    # owns (pbx/moh/server). Covers the fixed table, the REGISTER refusal that
+    # stops a phone taking one of those names (the register-beep paths depend by
+    # name on findClient("pbx") MISSING), the reserved-name guards on every
+    # config surface including the forward TARGET nothing ever validated, and the
+    # alarm that fires if a service is marked dialable before anything can answer
+    # a call routed to it.
+    ServiceExtensions_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is
@@ -233,6 +254,10 @@ add_executable(sip_parser_tests
     # SipSecretStore uses an in-memory map under !ESP_PLATFORM (no NVS).
     ../src/Helpers/SipDigest.cpp
     ../src/Helpers/SipSecretStore.cpp
+    # The REGISTER user agent (issue #164 groundwork). Pure C++17 — it never
+    # touches a socket by design (see its header: the caller owns the _outbox vs
+    # _asyncOutbox choice), so it links into the host suite with no stub arm.
+    ../src/SIP/SipRegistrationClient.cpp
     # ArpLookup compiles to a host stub (returns nullopt — no ARP table off-device)
     # under !ESP_PLATFORM, so it links cleanly into the host test binary and lets
     # RequestsHandler's Learn-mode path build on the desktop.
@@ -250,6 +275,14 @@ add_executable(sip_parser_tests
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
     # length/charset bounds that stop a typo from bringing the AP up open.
     DeviceConfig_test.cpp
+    # Issue #181: the NVS schema decision table and the migration walker. The
+    # rows that matter are "provisioned device with no version stamp" (every
+    # board in the field on the release that introduces versioning — adopt as
+    # v1, never wipe) and "stamp newer than this firmware" (an OTA rollback
+    # lands here by itself — write nothing, log loudly, still boot).
+    # planSchema()/runSchemaMigrations() are pure and platform-neutral for
+    # exactly this reason; the nvs_open glue around them is ESP-only.
+    SchemaVersion_test.cpp
     # DeviceConfig: SoftAP WPA2 settings + the flash-time cfgseed reader.
     # Host-stubbed under !ESP_PLATFORM (no NVS, no cfgseed partition), so the
     # dashboard AP-security endpoints stay exercisable on the desktop build.

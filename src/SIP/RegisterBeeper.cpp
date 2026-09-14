@@ -5,6 +5,7 @@
 #include "IDGen.hpp"
 #include "SipHeaderUtil.hpp"
 #include "SipMessageTypes.h"
+#include "ServiceExtensions.hpp"
 #include "SipWireUtil.hpp"
 
 using sipwire::addrToIpPort;
@@ -73,12 +74,12 @@ void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone)
 	std::ostringstream ss;
 	ss << "INVITE sip:" << clientNum << "@" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
+	   << "From: \"PocketDial\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
 	   << "To: <sip:" << clientNum << "@" << activeIp << ">\r\n"
 	   << "Call-ID: " << callId << "\r\n"
 	   << "CSeq: 1 INVITE\r\n"
 	   << "Max-Forwards: 70\r\n"
-	   << "Contact: <sip:pbx@" << srcIpPort << ";transport=UDP>\r\n"
+	   << "Contact: <sip:" << pbx::kServicePbx << "@" << srcIpPort << ";transport=UDP>\r\n"
 	   // Auto-answer / intercom headers — identical intent to the 999 all-page fork:
 	   // make a Yealink auto-answer in intercom mode and so play its alert tone.
 	   << "Call-Info: <sip:any>;answer-after=0\r\n"
@@ -303,7 +304,7 @@ std::shared_ptr<SipMessage> RegisterBeeper::buildAck(const BeepDialog& bd,
 	std::ostringstream ss;
 	ss << "ACK sip:" << bd.ext << "@" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd.branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
+	   << "From: \"PocketDial\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
 	   << "To: " << siphdr::stripHeaderName(ok->getTo()) << "\r\n"
 	   << "Call-ID: " << bd.callID << "\r\n"
 	   << "CSeq: 1 ACK\r\n"
@@ -322,7 +323,7 @@ std::shared_ptr<SipMessage> RegisterBeeper::buildBye(const BeepDialog& bd,
 	// too, exactly as ParkOrbit::byeParkedParty does. To carries the phone's tag.
 	const std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
 	const std::string fromHeader =
-		"\"PocketDial\" <sip:pbx@" + srcIpPort + ">;tag=" + bd.fromTag;
+		"\"PocketDial\" <sip:" + std::string(pbx::kServicePbx) + "@" + srcIpPort + ">;tag=" + bd.fromTag;
 	return _env.serverBye(bd.ext, bd.addr, bd.callID,
 		fromHeader, std::string(ok->getTo()));
 }
@@ -345,7 +346,7 @@ std::shared_ptr<SipMessage> RegisterBeeper::buildCancel(std::size_t slot)
 	std::ostringstream ss;
 	ss << "CANCEL sip:" << bd.ext << "@" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd.branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
+	   << "From: \"PocketDial\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
 	   << "To: <sip:" << bd.ext << "@" << activeIp << ">\r\n"
 	   << "Call-ID: " << bd.callID << "\r\n"
 	   << "CSeq: 1 CANCEL\r\n"

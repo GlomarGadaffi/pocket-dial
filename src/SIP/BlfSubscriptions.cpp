@@ -7,6 +7,7 @@
 #include "IDGen.hpp"
 #include "Session.hpp"
 #include "SipClient.hpp"
+#include "ServiceExtensions.hpp"   // Issue #202: the engine-owned pseudo-AOR table
 #include "SipHeaderUtil.hpp"
 #include "SipMessageTypes.h"
 #include "SipWireUtil.hpp"
@@ -166,6 +167,29 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 		resp->clearBody();
 		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_env.enqueue(data->getSource(), std::move(resp));
+		return;
+	}
+
+	// Issue #202: a SERVICE extension is not a watchable endpoint. The charset
+	// gate above admits it — isValidAor accepts letters, and this machine never
+	// required the watched target to be REGISTERed (an unknown extension is
+	// legitimately subscribable; that is how a BLF key survives the watched phone
+	// rebooting). So without this, a phone could put `pbx` or `moh` on a busy-lamp
+	// key and get a subscription that reports dialog state for an identity the
+	// ENGINE originates calls as — the register beep and the hold-music preview
+	// would light somebody's BLF lamp.
+	//
+	// 404, not 403: "there is no such endpoint to watch" is the accurate answer,
+	// and it is what a phone's BLF implementation knows how to stop retrying.
+	if (pbx::isServiceName(target))
+	{
+		auto resp = _env.messageFromPool(data->toString(), data->getSource());
+		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
+		resp->setHeader(SipMessageTypes::NOT_FOUND);
+		resp->clearBody();
+		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_env.enqueue(data->getSource(), std::move(resp));
+		_env.log("SUBSCRIBE refused: \"" + target + "\" is a reserved service extension", true);
 		return;
 	}
 

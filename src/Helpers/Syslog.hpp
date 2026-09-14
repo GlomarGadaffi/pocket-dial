@@ -173,13 +173,19 @@ namespace Syslog
 	// Truncation: the header is bounded at 65 bytes ("<191>1" + six single-byte
 	// fields + a 48-byte APP-NAME + seven separators), so for any realistic `cap`
 	// only the tail of MSG is ever lost and the frame stays parseable.
+	// `timestamp` is an RFC 3339 string, or nullptr/"" for RFC 5424's NILVALUE.
+	// Passed in rather than read from a clock so this stays pure and testable;
+	// send() supplies timesync::rfc3339Now(), which itself returns "-" while
+	// the clock is unsynced.
 	size_t formatFrame(char* out, size_t cap, Severity severity, Facility facility,
-	                   const char* appName, const char* msg);
+	                   const char* appName, const char* msg,
+	                   const char* timestamp = "-");
 
 	// The same frame as a std::string — the form tests and any non-hot-path
 	// caller should use. Allocates, so send() uses the buffer form above.
 	std::string formatFrame(Severity severity, Facility facility,
-	                        const char* appName, const char* msg);
+	                        const char* appName, const char* msg,
+	                        const char* timestamp = "-");
 
 	// ── Sink lifecycle ──────────────────────────────────────────────────────────
 
@@ -195,12 +201,26 @@ namespace Syslog
 	// nothing actually being emitted (see the layering note at the top).
 	bool isConfigured();
 
+	// What the board believes it is pointed at. Not a secret -- a collector
+	// address is infrastructure, not a credential -- and an operator debugging
+	// "why am I getting no logs" needs to see it. Empty host when unconfigured.
+	std::string configuredHost();
+	uint16_t    configuredPort();
+
 	// Read the destination from NVS at boot: namespace "pbxcfg", key
 	// "syslog_host" (a dotted-quad string) and optional "syslog_port" (u32,
 	// default 514). Absent/empty host leaves the sink disabled, which is exactly
 	// how a unit that never had the feature turned on behaves. No-op off-device
 	// (no NVS there — tests call configure() directly).
 	void loadFromNvs();
+
+	// Persist host/port to NVS and apply them immediately. The counterpart to
+	// loadFromNvs(): without this, the keys loadFromNvs() reads had no writer
+	// anywhere in the firmware, so remote logging could not be turned on at all.
+	// An empty host clears the keys and disables the sink.
+	// Returns false if the host is non-empty and not a valid dotted-quad, or if
+	// NVS refuses the write -- callers surface that rather than silently no-op.
+	bool saveToNvs(const std::string& host, uint16_t port);
 
 	// Emit one frame. No-op when unconfigured. Never blocks, never throws, never
 	// logs (see the RE-ENTRANCY RULE above). `appName` is the event class the

@@ -117,7 +117,11 @@ TEST(Syslog, PriAndVersionAreOneTokenAndVersionIsOne)
 // own receive time. This test exists so that a later "helpful" change cannot
 // quietly substitute a 1970 timestamp from an unset clock, which would be a lie
 // the collector has no way to detect.
-TEST(Syslog, TimestampIsNilValueBecauseThereIsNoWallClock)
+// Renamed from TimestampIsNilValueBecauseThereIsNoWallClock: there IS a wall
+// clock now (timesync, SNTP). What survives is the DEFAULT — formatFrame takes
+// the timestamp as a parameter so it stays pure, and a caller that supplies
+// none still emits RFC 5424's NILVALUE rather than inventing a time.
+TEST(Syslog, TimestampDefaultsToNilValueWhenTheCallerSuppliesNone)
 {
 	const std::string frame = Syslog::formatFrame(
 		Syslog::Severity::Info, Syslog::Facility::Local0, "pbx-call", "caller=310");
@@ -127,6 +131,68 @@ TEST(Syslog, TimestampIsNilValueBecauseThereIsNoWallClock)
 	// And nothing that looks like an RFC 3339 stamp leaked in anywhere else.
 	EXPECT_EQ(frame.find("1970-"), std::string::npos) << frame;
 	EXPECT_EQ(frame.find('T'), std::string::npos) << frame;
+}
+
+// The point of the parameter. Every frame this board emitted before timesync was
+// wired in carried a NILVALUE, so the collector had to stamp on receipt — which
+// loses queueing delay and is simply wrong for anything logged during a network
+// stall. send() now supplies timesync::rfc3339Now().
+TEST(Syslog, TimestampLandsInTheTimestampFieldWithoutShiftingAnything)
+{
+	const std::string when  = "2026-09-14T07:05:37Z";
+	const std::string msg   = "caller=310 callee=210";
+	const std::string frame = Syslog::formatFrame(
+		Syslog::Severity::Info, Syslog::Facility::Local0, "pbx-call", msg.c_str(),
+		when.c_str());
+
+	const ParsedFrame parsed = parseFrame(frame);
+	ASSERT_TRUE(parsed.wellFormed) << frame;
+	ASSERT_EQ(parsed.header.size(), static_cast<size_t>(kHeaderFields)) << frame;
+
+	// The timestamp goes in TIMESTAMP — and every other field stays exactly where
+	// it was. A timestamp contains no spaces, so it cannot shift the field count,
+	// but asserting the neighbours is what proves the format string was edited in
+	// the right slot rather than a dash being replaced somewhere further along.
+	EXPECT_EQ(parsed.header[kPriVersion],     "<134>1")   << frame;
+	EXPECT_EQ(parsed.header[kTimestamp],      when)       << frame;
+	EXPECT_EQ(parsed.header[kHostname],       "-")        << frame;
+	EXPECT_EQ(parsed.header[kAppName],        "pbx-call") << frame;
+	EXPECT_EQ(parsed.header[kProcId],         "-")        << frame;
+	EXPECT_EQ(parsed.header[kMsgId],          "-")        << frame;
+	EXPECT_EQ(parsed.header[kStructuredData], "-")        << frame;
+	EXPECT_EQ(parsed.msg, msg) << frame;
+
+	EXPECT_EQ(frame, "<134>1 " + when + " - pbx-call - - - " + msg);
+}
+
+// timesync::rfc3339Now() returns "-" while the clock is unsynced, which is
+// already the NILVALUE — so an early-boot frame stays conformant rather than
+// carrying a fabricated 1970 stamp. Passing it straight through must not
+// double-handle it into something else.
+TEST(Syslog, AnUnsyncedClockPassesThroughAsTheNilValue)
+{
+	const std::string frame = Syslog::formatFrame(
+		Syslog::Severity::Info, Syslog::Facility::Local0, "pbx-log", "booting", "-");
+	const ParsedFrame parsed = parseFrame(frame);
+	ASSERT_TRUE(parsed.wellFormed) << frame;
+	EXPECT_EQ(parsed.header[kTimestamp], "-") << frame;
+	EXPECT_EQ(frame, "<134>1 - - pbx-log - - - booting");
+}
+
+// A caller handing over nullptr or an empty string must degrade to the NILVALUE,
+// not emit an empty token and shift every field left by one.
+TEST(Syslog, NullOrEmptyTimestampDegradesToNilValueRatherThanShiftingFields)
+{
+	for (const char* ts : {static_cast<const char*>(nullptr), ""})
+	{
+		const std::string frame = Syslog::formatFrame(
+			Syslog::Severity::Info, Syslog::Facility::Local0, "pbx-log", "x", ts);
+		const ParsedFrame parsed = parseFrame(frame);
+		ASSERT_TRUE(parsed.wellFormed) << frame;
+		ASSERT_EQ(parsed.header.size(), static_cast<size_t>(kHeaderFields)) << frame;
+		EXPECT_EQ(parsed.header[kTimestamp], "-")       << frame;
+		EXPECT_EQ(parsed.header[kAppName],   "pbx-log") << frame;
+	}
 }
 
 // ── Field ordering (RFC 5424 §6.2) ───────────────────────────────────────────

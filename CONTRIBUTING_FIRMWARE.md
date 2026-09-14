@@ -207,8 +207,22 @@ void setupNetworkMode() {
 ## 5. Host Test Suite
 
 The gtest suite under `tests/` is the gate every PR clears before hardware is
-touched. It is currently **506 cases** (by static count of `TEST`/`TEST_F`/`TEST_P` in
-`tests/*.cpp`; the 310 previously quoted here was long stale).
+touched. It is currently **578 cases** by static count of `TEST`/`TEST_F` in
+`tests/*.cpp`, of which **576 run on Linux/WSL** — which is the number CI
+enforces and the number to quote in a commit message.
+
+The gap is not drift. `DidMapping_test.cpp` and `TelephonyApiConfig_test.cpp`
+each carry a `#if !defined(_WIN32) ... #else ... #endif` pair around their
+persistence tests, because `persist()` is in-memory only under `_WIN32` (no
+POSIX permission model, so the host fallback refuses to write a world-readable
+file). The POSIX arms hold 3 and 2 real cases; each Windows arm holds one
+`GTEST_SKIP` placeholder. So a POSIX host compiles out 2 and runs **576**, and
+Windows compiles out 5 and runs **573**. A static grep always reads 578.
+
+Quote a number you MEASURED. Every count in this file has been wrong at least
+once because someone carried forward the previous one — 310, then 506, then
+521 — and a stale figure in the contributing guide teaches every future commit
+message to be wrong too.
 
 The same three commands CI runs, from a WSL shell:
 
