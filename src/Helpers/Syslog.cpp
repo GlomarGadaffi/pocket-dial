@@ -1,4 +1,5 @@
 #include "Syslog.hpp"
+#include "TimeSync.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -186,7 +187,7 @@ namespace
 namespace Syslog
 {
 	size_t formatFrame(char* out, size_t cap, Severity severity, Facility facility,
-	                   const char* appName, const char* msg)
+	                   const char* appName, const char* msg, const char* timestamp)
 	{
 		if (out == nullptr || cap == 0)
 		{
@@ -214,10 +215,17 @@ namespace Syslog
 		// class in PROCID and a fixed product string in APP-NAME — see the
 		// "COUNT THE DASHES" note in Syslog.hpp. tests/Syslog_test.cpp asserts
 		// each field BY INDEX so a future edit cannot drift a dash back out.
+		// TIMESTAMP is supplied by the caller, not read from a clock in here.
+		// Keeping this function pure is what lets tests drive it with fixed values
+		// and assert each field by index; send() is where the real clock enters.
+		// A null or empty timestamp degrades to the NILVALUE, which is what every
+		// frame carried before TimeSync was wired in.
+		const char* ts = (timestamp != nullptr && timestamp[0] != '\0') ? timestamp : "-";
+
 		const int n = (msgLen > 0)
-			? std::snprintf(out, cap, "<%d>1 - - %s - - - %.*s",
-			                pri, app, static_cast<int>(msgLen), msg)
-			: std::snprintf(out, cap, "<%d>1 - - %s - - -", pri, app);
+			? std::snprintf(out, cap, "<%d>1 %s - %s - - - %.*s",
+			                pri, ts, app, static_cast<int>(msgLen), msg)
+			: std::snprintf(out, cap, "<%d>1 %s - %s - - -", pri, ts, app);
 
 		if (n <= 0)
 		{
@@ -232,10 +240,11 @@ namespace Syslog
 	}
 
 	std::string formatFrame(Severity severity, Facility facility,
-	                        const char* appName, const char* msg)
+	                        const char* appName, const char* msg, const char* timestamp)
 	{
 		char frame[kMaxFrameBytes];
-		const size_t n = formatFrame(frame, sizeof(frame), severity, facility, appName, msg);
+		const size_t n = formatFrame(frame, sizeof(frame), severity, facility, appName, msg,
+		                             timestamp);
 		return std::string(frame, n);
 	}
 
@@ -424,7 +433,13 @@ namespace Syslog
 		// above), so there is exactly one writer at a time. The buffer costs 480
 		// bytes of BSS once, instead of 480 bytes on whichever task happens to log.
 		static char frame[kMaxFrameBytes];
-		const size_t len = formatFrame(frame, sizeof(frame), severity, facility, appName, msg);
+		// The board's own view of when this happened. Without it the collector has
+		// to stamp on receipt, which loses queueing delay and is wrong outright for
+		// anything logged during a network stall. Returns "-" until SNTP lands, so
+		// early-boot frames stay conformant rather than carrying a fabricated 1970.
+		const std::string nowStr = timesync::rfc3339Now();
+		const size_t len = formatFrame(frame, sizeof(frame), severity, facility, appName, msg,
+		                               nowStr.c_str());
 		if (len == 0)
 		{
 			return;

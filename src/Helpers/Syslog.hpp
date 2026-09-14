@@ -173,13 +173,19 @@ namespace Syslog
 	// Truncation: the header is bounded at 65 bytes ("<191>1" + six single-byte
 	// fields + a 48-byte APP-NAME + seven separators), so for any realistic `cap`
 	// only the tail of MSG is ever lost and the frame stays parseable.
+	// `timestamp` is an RFC 3339 string, or nullptr/"" for RFC 5424's NILVALUE.
+	// Passed in rather than read from a clock so this stays pure and testable;
+	// send() supplies timesync::rfc3339Now(), which itself returns "-" while
+	// the clock is unsynced.
 	size_t formatFrame(char* out, size_t cap, Severity severity, Facility facility,
-	                   const char* appName, const char* msg);
+	                   const char* appName, const char* msg,
+	                   const char* timestamp = "-");
 
 	// The same frame as a std::string — the form tests and any non-hot-path
 	// caller should use. Allocates, so send() uses the buffer form above.
 	std::string formatFrame(Severity severity, Facility facility,
-	                        const char* appName, const char* msg);
+	                        const char* appName, const char* msg,
+	                        const char* timestamp = "-");
 
 	// ── Sink lifecycle ──────────────────────────────────────────────────────────
 
