@@ -424,6 +424,22 @@ static void http_server_task(void* pvParameters)
             http.attachHandler(&srv->getHandler());
             handlerAttached = true;
             ESP_LOGI(TAG, "Dashboard: live SIP registrar attached");
+
+#if defined(PD_ETH_HAS_SD)
+            // Music on hold for parked callers (#162). Started here rather than in
+            // app_main because it needs the handler, and only on a board with a
+            // card because that is where the clip lives.
+            //
+            // Non-fatal at every step: no card, no file, or a file that is not
+            // 8 kHz mono mu-law all leave park on its original silent hold. A
+            // comfort feature must never cost anyone the ability to park a call.
+            //
+            // The clip is read once into PSRAM, so the SD card is out of the 20 ms
+            // media path entirely — see HoldMusic.hpp for why that matters (sdspi
+            // busy-spins, and routine card GC stalls of 100-250 ms would be audible
+            // dropout on every parked caller at once).
+            srv->getHandler().startHoldMusic("/sdcard/moh.wav");
+#endif
         }
         if (!otaConfirmed && ++otaSettleSec >= 5)
         {

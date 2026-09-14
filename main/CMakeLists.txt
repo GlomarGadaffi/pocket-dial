@@ -121,6 +121,10 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/Registrar.cpp"
                             "../src/SIP/RegisterBeeper.cpp"
                             "../src/SIP/ParkOrbit.cpp"
+                            # Music on hold for parked callers (#162): one global clip cursor, fanned
+                            # to every parked leg. Clip lives in PSRAM so the SD card stays out of the
+                            # 20 ms media path entirely.
+                            "../src/SIP/HoldMusic.cpp"
                             "../src/SIP/BlfSubscriptions.cpp"
                             "../src/SIP/Session.cpp"
                             "../src/SIP/SipClient.cpp"

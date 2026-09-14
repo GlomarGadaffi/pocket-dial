@@ -564,6 +564,29 @@ private:
 	// ParkOrbit.hpp). Guarded by _mutex.
 	ParkOrbit _park{*this};
 
+	// Music on hold for parked callers (issue #162). Owned here and attached to
+	// _park at construction; silent hold is the fallback when no clip is loaded,
+	// so this being idle is a normal state rather than a fault.
+	HoldMusic _holdMusic;
+
+public:
+	// Load a music-on-hold clip and begin the pacing stream. Called after the SD
+	// card is mounted, since that is where the clip lives. Returns false when the
+	// file is missing or is not 8 kHz mono µ-law — a false here is NOT fatal and
+	// must not fail the boot: park simply keeps its silent hold.
+	//
+	// Clip format is the wire format itself (WAVE_FORMAT_MULAW, 8 kHz, mono), so
+	// playback is a memcpy rather than a decode. Prepare one with:
+	//     ffmpeg -i music.mp3 -ar 8000 -ac 1 -acodec pcm_mulaw moh.wav
+	bool startHoldMusic(const std::string& clipPath);
+
+	// Dashboard/status accessors.
+	bool     holdMusicLoaded()  const { return _holdMusic.isLoaded(); }
+	unsigned holdMusicSeconds() const { return _holdMusic.clipSeconds(); }
+	unsigned holdMusicListeners() const { return _holdMusic.listenerCount(); }
+
+private:
+
 	// Mirror the park orbits into the dashboard snapshot. Caller holds _mutex;
 	// takes _snapshotMutex internally.
 	void refreshParkSnapshot();

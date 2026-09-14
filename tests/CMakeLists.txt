@@ -128,6 +128,13 @@ add_executable(sip_parser_tests
     # reason) and the UNSYNCED path, which is permanent on the host build and is
     # exactly the degraded state every caller has to branch on.
     TimeSync_test.cpp
+    # Music on hold (#162): parked callers used to hear literal silence (park
+    # answered a=inactive on port 9 and started no sender). Covers the parts where
+    # a bug is silent and maddening -- the WAV parser (a "skip 44 bytes" reader
+    # plays the header as audio), the cursor wrap (off-by-one = a click once per
+    # loop), the gain table (sign fold = a crack instead of clipping), and the
+    # port-0/port-9 cases that mean "no audio here".
+    HoldMusic_test.cpp
     Rtp_test.cpp
     RtpReceiver_test.cpp
     # RFC 4733 telephone-event decode. Only reachable on a SERVER-TERMINATED leg
@@ -317,6 +324,9 @@ add_executable(sip_parser_tests
     ../src/SIP/Registrar.cpp
     ../src/SIP/RegisterBeeper.cpp
     ../src/SIP/ParkOrbit.cpp
+    # Music on hold (#162). The WAV parser, cursor wrap and gain table are pure and
+    # host-tested; the socket and the 20 ms pacing task are ESP-only stubs here.
+    ../src/SIP/HoldMusic.cpp
     ../src/SIP/BlfSubscriptions.cpp
     ../src/SIP/SipSdpMessage.cpp
     ../src/SIP/SipClient.cpp

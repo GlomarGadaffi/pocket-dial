@@ -12,6 +12,7 @@
 #include "PbxEnv.hpp"
 #include "PoolConfig.hpp"
 #include "SipClient.hpp"
+#include "HoldMusic.hpp"
 #include "SipMessage.hpp"
 
 // ── Call parking / park-orbit state machine ───────────────────────────────────
@@ -28,6 +29,13 @@ class ParkOrbit
 {
 public:
 	explicit ParkOrbit(PbxEnv& env) : _env(env) {}
+
+	// Music on hold (issue #162). Optional by design: with no HoldMusic attached,
+	// or with one that has no clip loaded, park answers exactly as it always did —
+	// `a=inactive` on port 9, and the caller hears silence. A missing or unreadable
+	// clip must never cost anyone the ability to park a call, so every failure path
+	// below degrades to that instead of refusing the park.
+	void setHoldMusic(HoldMusic* moh) { _moh = moh; }
 
 	// Map "700".."709" to an orbit index, or -1 for anything else.
 	int orbitIndex(std::string_view ext) const;
@@ -81,6 +89,11 @@ private:
 		std::string rbBranch;
 		sockaddr_in rbAddr{};
 		std::chrono::steady_clock::time_point deadline{};
+		// Music-on-hold listener id for this parked leg, or -1 when the slot has no
+		// audio (no clip loaded, MoH failed to start, or the parked party's SDP
+		// carried no usable RTP endpoint). -1 is the old silent-hold behaviour and
+		// must stay a working state: a missing clip may not cost anyone a park.
+		int mohListener = -1;
 	};
 
 	void sendReinvite(ParkSlot& slot, const std::string& sdp);
@@ -97,6 +110,9 @@ private:
 	std::vector<std::string> _pendingAcks;   // park re-INVITE ACKs pending
 	bool _parkChanged = false;               // slot state moved since the last mirror
 	PbxEnv& _env;
+	// Not owned. RequestsHandler holds the HoldMusic and attaches it at boot; null
+	// means silent hold, which is the pre-#162 behaviour and a valid steady state.
+	HoldMusic* _moh = nullptr;
 };
 
 #endif

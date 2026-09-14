@@ -84,6 +84,86 @@ namespace sipwire
 			"m=audio 9 RTP/AVP 0\r\n"
 			"a=inactive\r\n";
 	}
+
+	// The same body, but SENDONLY from a real server port: the server transmits
+	// (music on hold, issue #162) and ignores anything the far end sends back.
+	//
+	// Sendonly rather than sendrecv is deliberate. Park is one-way by definition;
+	// advertising sendrecv would invite the parked phone to stream audio nothing
+	// reads, for the entire duration of the park.
+	//
+	// PCMU only, matching buildMediaSdp(): every server-terminated leg in this
+	// firmware speaks µ-law, and the hold clip is stored as µ-law precisely so the
+	// pacing task is a memcpy rather than a transcode.
+	inline std::string makeSendonlySdp(const std::string& localIp, int rtpPort)
+	{
+		return
+			"v=0\r\n"
+			"o=- 0 0 IN IP4 " + localIp + "\r\n"
+			"s=pocket-dial\r\n"
+			"c=IN IP4 " + localIp + "\r\n"
+			"t=0 0\r\n"
+			"m=audio " + std::to_string(rtpPort) + " RTP/AVP 0\r\n"
+			"a=rtpmap:0 PCMU/8000\r\n"
+			"a=sendonly\r\n";
+	}
+
+	// Pull the far end's RTP destination out of an SDP body: the `c=` connection
+	// address and the `m=audio` port.
+	//
+	// Mirrors RequestsHandler::parseCallerRtp's semantics, including its fallback:
+	// when `c=` is absent, unparseable, or the unspecified address 0.0.0.0, use the
+	// address the SIP message actually arrived from. That fallback is not
+	// defensive padding — a phone behind NAT routinely advertises a private `c=`
+	// it cannot receive on, and the signalling source is the only address known to
+	// work. 0.0.0.0 specifically is the legacy RFC 2543 hold form, which some
+	// handsets still send.
+	//
+	// Returns false when no usable port was found, which the caller must treat as
+	// "no audio for this leg" rather than an error.
+	inline bool parseRtpTarget(const std::string& sdp, const sockaddr_in& from,
+	                           std::string& outIp, uint16_t& outPort)
+	{
+		outPort = 0;
+		outIp.clear();
+
+		// m=audio <port> ...
+		size_t m = sdp.find("m=audio ");
+		if (m == std::string::npos) return false;
+		m += 8;
+		int port = 0;
+		while (m < sdp.size() && sdp[m] >= '0' && sdp[m] <= '9')
+		{
+			port = port * 10 + (sdp[m] - '0');
+			if (port > 65535) return false;     // malformed; do not wrap into a valid port
+			++m;
+		}
+		// Port 9 is the discard port and 0 means "stream disabled" (RFC 4566 / the
+		// a=inactive convention). Neither is somewhere to send audio.
+		if (port <= 9) return false;
+		outPort = static_cast<uint16_t>(port);
+
+		// c=IN IP4 <addr>
+		const size_t c = sdp.find("c=IN IP4 ");
+		if (c != std::string::npos)
+		{
+			const size_t s = c + 9;
+			size_t e = s;
+			while (e < sdp.size() && sdp[e] != '\r' && sdp[e] != '\n' && sdp[e] != ' ') ++e;
+			const std::string addr = sdp.substr(s, e - s);
+			if (!addr.empty() && addr != "0.0.0.0") outIp = addr;
+		}
+
+		if (outIp.empty())
+		{
+			char buf[INET_ADDRSTRLEN] = {0};
+			if (inet_ntop(AF_INET, &from.sin_addr, buf, sizeof(buf)) != nullptr)
+			{
+				outIp = buf;
+			}
+		}
+		return !outIp.empty();
+	}
 }
 
 #endif

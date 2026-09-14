@@ -116,6 +116,13 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	_serverPort(serverPort)
 {
 	initHandlers();
+
+	// Attach music on hold to the park orbits (issue #162). Attached unconditionally
+	// and unloaded: ParkOrbit checks isLoaded() per park, so a board with no clip
+	// answers exactly as it always did (a=inactive, silent hold). Loading a clip is
+	// a separate, later step — see startHoldMusic().
+	_park.setHoldMusic(&_holdMusic);
+
 	// Pre-allocate pools (Issue #53). Capacities are compile-time tunable via
 	// PoolConfig.hpp (-DPOCKETDIAL_MAX_* overrides); defaults preserve 32/8/32.
 	_clientPool.reserve(POCKETDIAL_MAX_CLIENTS);
@@ -1989,6 +1996,28 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		+ std::to_string(leg) + " (" + std::to_string(_conference->legCount()) + "/"
 		+ std::to_string(ConferenceRoom::MAX_LEGS) + "), media to "
 		+ destIp + ":" + std::to_string(destPort));
+}
+
+bool RequestsHandler::startHoldMusic(const std::string& clipPath)
+{
+	// Deliberately tolerant at every step. Music on hold is a comfort feature; a
+	// board whose card was pulled, or whose operator uploaded a 44.1 kHz stereo
+	// MP3-converted-wrong, must still park calls. Each failure logs and leaves
+	// park on its pre-#162 silent hold.
+	if (!_holdMusic.loadClip(clipPath))
+	{
+		queueLog("MoH: no clip at " + clipPath +
+		         " (or not 8 kHz mono mu-law) — parked callers will hear silence", true);
+		return false;
+	}
+	if (!_holdMusic.start())
+	{
+		queueLog("MoH: clip loaded but the stream would not start — silent hold", true);
+		return false;
+	}
+	queueLog("MoH: " + std::to_string(_holdMusic.clipSeconds()) + "s clip on UDP " +
+	         std::to_string(_holdMusic.localPort()));
+	return true;
 }
 
 unsigned RequestsHandler::anchorCallLimit() const
