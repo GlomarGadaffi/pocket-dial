@@ -6318,22 +6318,41 @@ uint64_t RequestsHandler::dtmfDigitsDropped() const
 
 void RequestsHandler::drainDtmfInbox()
 {
-	// Lift the batch out under the small lock, then dispatch with it released: a
-	// feature-code action can enqueue SIP messages and touch the config store,
-	// and holding the producer's lock across that would stall a media task for
-	// the duration.
-	std::array<DtmfPress, POCKETDIAL_DTMF_INBOX> batch;
-	size_t count = 0;
+	// One press at a time: take the front under the small lock, release it, then
+	// dispatch. Two properties this buys, both of which matter here.
+	//
+	// The producer's lock is never held across a feature-code action — those
+	// enqueue SIP messages and touch the config store, and stalling a real-time
+	// media task for that long is the thing this whole ring exists to avoid.
+	//
+	// And nothing large lands on the stack. Lifting the whole batch into a local
+	// array first would have been simpler to read, but that array is ~2.2 KB and
+	// this runs inside handle(), on a SIP task with an 8 KB stack
+	// (esp_main.cpp:438) that is already several frames deep by the time it gets
+	// here. Burning a quarter of it on a convenience copy is not a trade worth
+	// making for a loop that is almost always zero or one iterations.
+	//
+	// Bounded by the ring's depth rather than by "until empty" so a producer that
+	// is somehow outpacing us cannot hold the SIP thread in this loop; whatever
+	// arrives mid-drain simply waits for the next pass.
+	for (size_t guard = 0; guard < _dtmfInbox.size(); ++guard)
 	{
-		std::lock_guard<std::mutex> lk(_dtmfInboxMutex);
-		count = _dtmfInboxCount;
-		for (size_t i = 0; i < count; ++i) batch[i] = _dtmfInbox[i];
-		_dtmfInboxCount = 0;
-	}
+		DtmfPress p;
+		{
+			std::lock_guard<std::mutex> lk(_dtmfInboxMutex);
+			if (_dtmfInboxCount == 0) break;
+			p = _dtmfInbox[0];
+			--_dtmfInboxCount;
+			// Shift the remainder down. At most POCKETDIAL_DTMF_INBOX small
+			// trivially-copyable records, and in practice one or two — cheaper
+			// than the head/tail bookkeeping a true circular buffer would need,
+			// and far easier to read.
+			for (size_t i = 0; i < _dtmfInboxCount; ++i)
+			{
+				_dtmfInbox[i] = _dtmfInbox[i + 1];
+			}
+		}
 
-	for (size_t i = 0; i < count; ++i)
-	{
-		const auto& p = batch[i];
 		// The dialog may have ended between capture and now — the call hung up
 		// while a digit was in flight. Drop it silently rather than creating an
 		// accumulator for a dead Call-ID, which sweepStale() would only have to
