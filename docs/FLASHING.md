@@ -63,8 +63,20 @@ The build produces, under `build/`:
 
 Open **<https://glomargadaffi.github.io/pocket-dial/flasher/>** in Chrome, Edge, or
 Opera on a desktop, plug the board in over USB, pick the variant (Ethernet /
-display / Wi-Fi) and click **Flash board**. It pulls the images from the GitHub
-Release you choose and writes them from your machine; nothing is uploaded. It
+display / Wi-Fi) and click **Flash board**. It pulls the images from the **GitHub Pages
+mirror** under `docs/firmware/<tag>/`, not from the Release assets — release-asset URLs
+send no CORS header, so a browser page cannot `fetch()` them ([#138]; the page reads
+`../firmware/index.json` same-origin, `docs/flasher/index.html:540-551`, and
+`release.yml:278` publishes the mirror). It writes them from your machine; nothing is
+uploaded.
+
+> [!IMPORTANT]
+> **There is no Waveshare variant in any release.** The flasher's `esp32s3-eth` image is
+> the **LilyGO T-ETH-Elite**, and `PD_ETH_BOARD` defaults to `elite`
+> (`main/CMakeLists.txt:37-39`). Flashing it to a Waveshare ESP32-S3-ETH writes the wrong
+> W5500 pin map, which aborts boot and leaves the board in a reset loop (see
+> [HARDWARE.md §3](HARDWARE.md)). That board must be built from source with
+> `idf.py -D SIP_TRANSPORT=eth -D PD_ETH_BOARD=waveshare build`. It
 also takes locally built `.bin` files under *Flash your own build*. Details in
 [flasher/README.md](flasher/README.md).
 

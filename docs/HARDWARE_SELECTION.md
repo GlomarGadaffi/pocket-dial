@@ -18,7 +18,7 @@ detail.
 
 | Board | Connectivity | Display | SoC / PSRAM | Flash | SCALING tier | Realistic capacity |
 | :--- | :--- | :---: | :--- | :--- | :--- | :--- |
-| **Generic ESP32 / ESP32-S3 dev board** | Wi-Fi SoftAP (open) | No | ESP32 or ESP32-S3 (PSRAM optional) | varies | **Pocket** (defaults 32/8/32, ~37 KB) | 6–8 calls, ~16 phones (SoftAP-limited) |
+| **Generic ESP32 / ESP32-S3 dev board** | Wi-Fi SoftAP (open) | No | ESP32 or ESP32-S3 (PSRAM optional) | varies | **Pocket** (defaults 32/8/**52**, **~58 KB**) | 6–8 calls, ~16 phones (SoftAP-limited) |
 | **Guition JC3248W535** | Wi-Fi SoftAP + captive portal | **Yes** — 3.5" 320×480 IPS capacitive touch (AXS15231B, QSPI) | ESP32-S3R8, **8 MB Octal PSRAM** | 16 MB QSPI | **Office** (64/24/64, ~90 KB) | ~24 calls, 50+ phones |
 | **LilyGO T-ETH-ELITE S3 (W5500, PoE)** — *default `eth`* | **Wired Ethernet + PoE** (W5500 SPI, 802.3af) | No | ESP32-S3-WROOM-1, 8 MB PSRAM | 16 MB + microSD | **Rack** (128/48/128, ~180 KB) | ~48 calls, 100+ phones |
 | **Waveshare ESP32-S3-ETH (W5500, PoE)** | **Wired Ethernet + PoE** (W5500 SPI) | No | ESP32-S3R8 | — | **Rack** (128/48/128, ~180 KB) | ~48 calls, 100+ phones |
@@ -147,7 +147,9 @@ Each transport is selected at build time via `SIP_TRANSPORT` (and the optional t
 macros). See [README.md §Building](../README.md#building) and [SCALING.md §3](SCALING.md)
 for the exact commands. In short:
 
-- Wi-Fi SoftAP: default build (`idf.py build`).
+- Wi-Fi SoftAP: `idf.py -D SIP_TRANSPORT=wifi build`. **Not the bare `idf.py build`** —
+  `SIP_TRANSPORT` defaults to **`eth`** (`main/CMakeLists.txt:6-7`), so a plain build
+  produces Ethernet firmware with no SoftAP.
 - Touch display: `idf.py -D SIP_TRANSPORT=display build`.
 - Wired Ethernet / PoE: `idf.py -D SIP_TRANSPORT=eth build` — defaults to the **LilyGO
   T-ETH-ELITE S3** pin map. For the Waveshare board add `-D PD_ETH_BOARD=waveshare`. The

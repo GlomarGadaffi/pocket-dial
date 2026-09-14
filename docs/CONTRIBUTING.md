@@ -35,7 +35,8 @@ workflow ships, and what the browser flasher serves.
 
 ### Compiling & flashing via the ESP-IDF CLI
 1. Open your terminal in the root workspace directory.
-2. Select your hardware chip target (`esp32s3` for displays and S3-ETH, `esp32` for legacy POE-Pro):
+2. Select your hardware chip target (`esp32s3` for displays and S3-ETH, `esp32` for the
+   classic LAN8720 boards):
    ```bash
    idf.py set-target esp32s3
    ```
@@ -43,9 +44,15 @@ workflow ships, and what the browser flasher serves.
    ```bash
    idf.py menuconfig
    ```
-4. Build the application:
+4. Build the application — **pass the transport explicitly**. A bare `idf.py build` uses
+   the default `SIP_TRANSPORT=eth` (`main/CMakeLists.txt:6-7`), which is W5500 on
+   S3-only GPIOs; it is never the right build for a classic-ESP32 LAN8720 board, and it
+   starts no SoftAP, so the `192.168.4.1` walkthrough below will not apply to it.
    ```bash
-   idf.py build
+   idf.py -D SIP_TRANSPORT=wifi build      # SoftAP — matches the walkthrough below
+   idf.py -D SIP_TRANSPORT=eth build       # W5500; add -D PD_ETH_BOARD=waveshare if needed
+   idf.py -D SIP_TRANSPORT=lan8720 build   # classic ESP32 + LAN8720 RMII
+   idf.py -D SIP_TRANSPORT=display build   # Guition JC3248W535
    ```
 5. Flash the binary and launch the serial logger (replace `COM3` with your local port):
    ```bash
@@ -108,7 +115,20 @@ Verify the Web dashboard and security barriers using `curl` or a web browser:
 ## 4. Continuous Integration (CI) Checks
 
 The **pocket-dial** repository enforces strict verification checks on every pull request (configured via `.github/workflows/ci.yml`):
-* **Syntax Validation**: Ensures all source files are free of compilation warnings.
-* **API Schema Audits**: Spawns a virtual container running the build and validates JSON responses against the API schemas defined in [docs/API.md](API.md).
-* **Cross-Compilation Verification**: Verifies code builds for both `esp32` and `esp32s3` targets.
-* **Firmware Policy Checks**: Scans for prohibited code patterns (like heap allocation or raw `strcpy` operations).
+* **Static analysis**: `cppcheck` (`warning,performance`) is the **blocking** analyser
+  (`ci.yml:61-74`); `clang-tidy` runs `continue-on-error: true` (`:86-116`). Note there is
+  **no `-Werror`** anywhere in `ci.yml` or `CMakeLists.txt` (which passes `-Wall -Wextra
+  -Wpedantic` only), so compiler warnings alone do not fail a build — an earlier revision
+  of this list claimed they did.
+* **Host tests**: the gtest suite via `ctest`, plus the HTTP smoke script
+  `tests/http/test_api.sh` run against the **host binary on the runner**
+  (`ci.yml:191-216`). *(No container is spawned, and the script asserts field presence
+  itself — it does not validate responses against a schema defined in `docs/API.md`, as an
+  earlier revision of this list claimed.)*
+* **Cross-Compilation Verification**: builds for both `esp32` and `esp32s3`
+  (`ci.yml:242`), plus a partition-table guard, a heap-poisoning build and a Waveshare
+  build.
+* ~~**Firmware Policy Checks**: scans for prohibited code patterns (heap allocation, raw
+  `strcpy`).~~ **No such step exists in `ci.yml`.** The coding rules in
+  [CONTRIBUTING_FIRMWARE.md](../CONTRIBUTING_FIRMWARE.md) are enforced by review, not by
+  CI — do not rely on a bot to catch them.

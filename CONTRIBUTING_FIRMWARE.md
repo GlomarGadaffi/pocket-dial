@@ -21,8 +21,9 @@ Before any PR can be merged into `main`, it must receive at least **two approval
 - [ ] **Checked Returns**: All NVS flash, driver registrations, and socket syscall return codes are explicitly checked and handled.
 - [ ] **No Unchecked Pointers**: Any pointer dereferencing has been pre-verified against `nullptr` (particularly in fallback/onboarding modes).
 - [ ] **Core Affinity Alignment**: Pinned tasks match the dual-core topology and do not unbalance Core 0/1 workloads.
-- [ ] **Gated HTTP Routes**: Every new route in `HttpServer::handleClient()` passes through `requireAdmin()`, with `needCsrf = true` for anything that mutates state. No route implements its own origin, session, or token check.
-- [ ] **Central Response Path**: Buffered responses go out through `sendResponseWithHeader()` so the security headers (CSP, `X-Frame-Options`, `X-Content-Type-Options`, `Cache-Control`, `Referrer-Policy`) are emitted. New code does not write a response to the socket directly — the captive-portal `302` in `sendRedirect()` is the sole existing exception, and it should not gain company.
+- [ ] **Gated HTTP Routes**: Every new route in `HttpServer::handleClient()` passes through `requireAdmin()`, with `needCsrf = true` for anything that mutates state. No route implements its own origin, session, or token check. *(This is the policy, not a description of the current tree: `/`, `/config/<mac>.cfg`, `/api/status`, `/metrics`, `/api/cdr`, `/api/wifi/scan`, `/api/admin/status` and `/api/ota/status` are deliberately ungated, and login/logout call `requireSameOrigin()` directly. Each exception is argued in [THREAT_MODEL.md](docs/THREAT_MODEL.md) §4 E-2 — adding a new one means updating E-2 in the same PR.)*
+- [ ] **Gate by falling through, never by early `return`**: write the gate as `if (requireAdmin(...)) { ... }`, **not** `if (!requireAdmin(...)) return;`. The route chain in `handleClient()` ends in a single `closeSocket(clientSock)`, and an early `return` jumps straight over it — leaking a socket on every rejected request. Three MoH routes shipped with the early-return form and 14 unauthenticated requests took a board off the network ([THREAT_MODEL.md](docs/THREAT_MODEL.md) D-5).
+- [ ] **Central Response Path**: Buffered responses go out through `sendResponseWithHeader()` so the security headers (CSP, `X-Frame-Options`, `X-Content-Type-Options`, `Cache-Control`, `Referrer-Policy`) are emitted. New code does not write a response to the socket directly — there are **no exceptions left** — `sendRedirect()`'s captive-portal `302` used to hand-roll its own response, that was the bug, and it now routes through `sendResponseWithHeader()` too (`HttpServer.cpp:3115-3123`). Keep it that way.
 - [ ] **Partition Contract Intact**: `nvs`, `otadata`, `phy_init`, `ota_0` and `ota_1` keep their exact offsets and sizes in `partitions.csv`. Moving any of them breaks OTA compatibility with every deployed board.
 - [ ] **`cfgseed` Stays Read-Only**: No firmware code calls `esp_partition_write()` or `esp_partition_erase_range()` on `cfgseed`. The browser flasher is its only writer.
 - [ ] **Seed Format In Lockstep**: A change to the seed record in `src/Helpers/DeviceConfig.hpp` is mirrored in `docs/flasher/index.html` in the same PR.
@@ -206,8 +207,8 @@ void setupNetworkMode() {
 ## 5. Host Test Suite
 
 The gtest suite under `tests/` is the gate every PR clears before hardware is
-touched. It is currently **310 cases** (by static count of `TEST`/`TEST_F` in
-`tests/*.cpp`).
+touched. It is currently **506 cases** (by static count of `TEST`/`TEST_F`/`TEST_P` in
+`tests/*.cpp`; the 310 previously quoted here was long stale).
 
 The same three commands CI runs, from a WSL shell:
 
@@ -227,17 +228,17 @@ ctest --test-dir build/tests --output-on-failure
   them on Windows triggers firewall authorisation prompts.
 * Keep the count in this section current when you add or remove cases.
 
-### 🔴 The `AdminHttpGate_test` trap
+### ~~The `AdminHttpGate_test` trap~~ — removed, and this section described deleted behaviour
 
-Any new case in `tests/AdminHttpGate_test.cpp` that **provisions a PIN** must
-construct a real `RequestsHandler` and attach it. From the file's own comment:
+This section used to warn that provisioning a PIN made the listen socket "dark by
+default" until an admin-open window was granted, and quoted that as "the file's own
+comment". **None of that is true any more, and the quoted comment is not in the file.**
+The dark-by-default management plane and the `*4887` star-code that reopened it were
+deleted — `grep 4887 src/` returns nothing — and `tests/AdminHttpGate_test.cpp:1-5` now
+says the opposite: **the listen socket always accepts**, in every provisioning state, and
+`AdminHttpGate.Boot_Provisioned_StillListensImmediately` pins that as a regression test.
 
-> A real `RequestsHandler` is required: once a PIN exists the listen socket is
-> dark by default and only opens inside an admin-open window, which set-pin
-> grants. Without the handler the test measures a refused connection rather than
-> the gate.
+There is also no PIN-based admin login left to provision: the web credential is a username
+and password, and the separate DTMF PIN is unrelated to the HTTP plane.
 
-The failure this produces looks nothing like the thing under test — you get a
-connection error instead of the `401`/`403` you were asserting on, and the gate
-logic is never reached. Copy the setup from an existing provisioning case rather
-than writing a fresh one.
+A refused connection on port 80 is therefore a genuine fault, in a test or on a board.

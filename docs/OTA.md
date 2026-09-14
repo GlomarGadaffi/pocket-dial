@@ -108,7 +108,7 @@ next reset unless the running app confirms a healthy boot** (see §4).
 OTA is an on-device feature. The ESP-IDF build produces the image you upload.
 
 ```bash
-# (one-time) point at your ESP-IDF v5.x install
+# (one-time) point at your ESP-IDF v6.0+ install (v5.x fails at configure — see ONBOARDING.md)
 . $IDF_PATH/export.sh
 
 # Pick the transport you ship; the display build is the large one (~1.5 MB).
