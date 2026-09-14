@@ -209,6 +209,8 @@ namespace
 
 		static int _nextPort;
 	};
+	// Ports: this file owns 19100+ (issue #213 — every HTTP test file gets a
+	// disjoint block; see CONTRIBUTING_FIRMWARE.md for the full table).
 	int TelephonyConfigHttpTest::_nextPort = 19100;
 }
 

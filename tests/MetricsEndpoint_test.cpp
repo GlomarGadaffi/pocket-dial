@@ -44,11 +44,13 @@
 
 namespace
 {
-	// One HttpServer per test on its own port. The 1811x range is deliberately
-	// clear of the ports the other HTTP suites bind (18080-18103,
-	// AdminHttpGate/DialPlan/HttpTraceCommand/PcapCapture; 19100+,
-	// TelephonyConfigHttp; 193xx, ApiKillParse) so a whole-suite run never
-	// collides.
+	// One HttpServer per test on its own port. Issue #213: every HTTP test file
+	// owns a disjoint block so a lingering listener from one file can only ever
+	// fail its own tests, not another file's. The 1811x range is this file's
+	// block; see CONTRIBUTING_FIRMWARE.md for the full table (AdminHttpGate
+	// 18080-18099, DialPlan 18100-18109, this file 18110-18114, PcapCapture
+	// 18115-18119, HttpTraceCommand 18120-18124, ServiceExtensions 18125-18129,
+	// TelephonyConfigHttp 19100+, ApiKillParse 193xx).
 	constexpr int kPortNoHandler   = 18110;
 	constexpr int kPortTypes       = 18111;
 	constexpr int kPortLineEndings = 18112;

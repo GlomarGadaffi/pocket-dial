@@ -1122,13 +1122,15 @@ namespace
 	}
 }
 
+// Ports: this file owns 18100-18109 (issue #213 — every HTTP test file gets
+// a disjoint block; see CONTRIBUTING_FIRMWARE.md for the full table).
 TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 {
 	AdminAuth::clearCredential();
 
 	RequestsHandler handler("192.168.9.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18090, nullptr);
+	HttpServer server("127.0.0.1", 18100, nullptr);
 	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1142,19 +1144,19 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 	std::string csrf = AdminAuth::sessionCsrf(token);
 	std::string cookie = "pd_session=" + token;
 
-	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18100, "/api/dialplan",
 		"pattern=2XX&action=group&target=610", cookie, csrf)), 200);
-	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18100, "/api/dialplan",
 		"pattern=3XX&action=page&target=981", cookie, csrf)), 200);
 
 	// '*' and '#' are the grammar's own characters AND form-encoding metacharacters,
 	// so a rule that uses them has to survive getFormParam's url-decoding intact —
 	// a plan whose wildcard cannot be configured over the API is no plan at all.
-	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18100, "/api/dialplan",
 		"pattern=6*&action=group&target=610", cookie, csrf)), 200);
-	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18100, "/api/dialplan",
 		"pattern=%239&action=park&target=701", cookie, csrf)), 200);
-	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18100, "/api/dialplan",
 		"pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=1", cookie, csrf)), 200);
 
 	auto rules = handler.getDialRules();
@@ -1174,7 +1176,7 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 	EXPECT_EQ(std::get<3>(rules[4]), 1) << "stripDigits must round-trip through the form body";
 
 	// The rule table is readable back out of /api/status, in table order.
-	std::string status = httpGetRaw(18090, "/api/status");
+	std::string status = httpGetRaw(18100, "/api/status");
 	EXPECT_NE(status.find("\"dialplan\":["), std::string::npos);
 	size_t first = status.find("\"pattern\":\"2XX\"");
 	size_t second = status.find("\"pattern\":\"3XX\"");
@@ -1185,9 +1187,9 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 		std::string::npos) << "/api/status must emit stripDigits for a trunk rule";
 
 	// An empty target deletes — including a pattern carrying a wildcard.
-	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=2XX&target=", cookie, csrf)), 200);
-	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=6*&target=", cookie, csrf)), 200);
-	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=9XXXXXXXXXX&target=", cookie, csrf)), 200);
+	EXPECT_EQ(statusOf(httpPostRaw(18100, "/api/dialplan", "pattern=2XX&target=", cookie, csrf)), 200);
+	EXPECT_EQ(statusOf(httpPostRaw(18100, "/api/dialplan", "pattern=6*&target=", cookie, csrf)), 200);
+	EXPECT_EQ(statusOf(httpPostRaw(18100, "/api/dialplan", "pattern=9XXXXXXXXXX&target=", cookie, csrf)), 200);
 	rules = handler.getDialRules();
 	ASSERT_EQ(rules.size(), 2u);
 	EXPECT_EQ(std::get<0>(rules[0]), "3XX");
@@ -1204,7 +1206,7 @@ TEST(DialPlanHttp, ApiStatusReportsParkedCalls)
 
 	RequestsHandler handler("192.168.9.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18092, nullptr);
+	HttpServer server("127.0.0.1", 18102, nullptr);
 	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1214,7 +1216,7 @@ TEST(DialPlanHttp, ApiStatusReportsParkedCalls)
 	handler.setDialRule("8XX", "park", "701");
 	handler.handle(makeInvite("600", "800", "192.168.9.60", "http-park"));
 
-	std::string status = httpGetRaw(18092, "/api/status");
+	std::string status = httpGetRaw(18102, "/api/status");
 	EXPECT_NE(status.find("\"parkedCalls\":["), std::string::npos) << status;
 	EXPECT_NE(status.find("\"orbit\":\"701\""), std::string::npos) << status;
 	EXPECT_NE(status.find("\"parkedExt\":\"600\""), std::string::npos) << status;
@@ -1226,7 +1228,7 @@ TEST(DialPlanHttp, PostApiDialPlanRejectsBadParametersWith400)
 
 	RequestsHandler handler("192.168.9.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18091, nullptr);
+	HttpServer server("127.0.0.1", 18101, nullptr);
 	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1236,25 +1238,25 @@ TEST(DialPlanHttp, PostApiDialPlanRejectsBadParametersWith400)
 	std::string csrf = AdminAuth::sessionCsrf(token);
 	std::string cookie = "pd_session=" + token;
 
-	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan", "action=group&target=610", cookie, csrf)), 400)
+	EXPECT_EQ(statusOf(httpPostRaw(18101, "/api/dialplan", "action=group&target=610", cookie, csrf)), 400)
 		<< "missing pattern";
-	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18101, "/api/dialplan",
 		"pattern=2XX&action=pickup&target=610", cookie, csrf)), 400) << "unknown action";
-	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18101, "/api/dialplan",
 		"pattern=2XX&action=page&target=601", cookie, csrf)), 400) << "page target is not a 98x zone";
-	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18101, "/api/dialplan",
 		"pattern=2XX&action=park&target=799", cookie, csrf)), 400) << "park target is not an orbit";
-	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18101, "/api/dialplan",
 		"pattern=777&action=group&target=610", cookie, csrf)), 400) << "reserved extension as a pattern";
-	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18101, "/api/dialplan",
 		"pattern=2%20XX&action=group&target=610", cookie, csrf)), 400) << "unsafe character in pattern";
-	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18101, "/api/dialplan",
 		"pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=-1", cookie, csrf)), 400)
 		<< "negative stripDigits";
-	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18101, "/api/dialplan",
 		"pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=abc", cookie, csrf)), 400)
 		<< "non-numeric stripDigits";
-	EXPECT_EQ(statusOf(httpPostRaw(18091, "/api/dialplan",
+	EXPECT_EQ(statusOf(httpPostRaw(18101, "/api/dialplan",
 		"pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=999", cookie, csrf)), 400)
 		<< "stripDigits exceeds this pattern's fixed length";
 

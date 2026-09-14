@@ -153,10 +153,12 @@ namespace
 		return a;
 	}
 
-	// One HttpServer per test on its own port. The 193xx range is deliberately
-	// clear of the ports the other HTTP suites bind (18080-18103,
-	// AdminHttpGate/DialPlan/HttpTraceCommand/PcapCapture; 19100+,
-	// TelephonyConfigHttp) so a whole-suite run never collides.
+	// One HttpServer per test on its own port. Issue #213: every HTTP test file
+	// owns a disjoint block. The 193xx range is this file's; see
+	// CONTRIBUTING_FIRMWARE.md for the full table (AdminHttpGate 18080-18099,
+	// DialPlan 18100-18109, MetricsEndpoint 18110-18114, PcapCapture
+	// 18115-18119, HttpTraceCommand 18120-18124, ServiceExtensions 18125-18129,
+	// TelephonyConfigHttp 19100+).
 	class ApiKillParseTest : public ::testing::Test
 	{
 	protected:

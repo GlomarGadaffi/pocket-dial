@@ -150,6 +150,8 @@ namespace
 	}
 }
 
+// Ports: this file owns 18120-18124 (issue #213 — every HTTP test file gets
+// a disjoint block; see CONTRIBUTING_FIRMWARE.md for the full table).
 TEST(HttpTraceCommand, ApiTraceRoundTripsRawSipTextWithQuotesAndBackslashes)
 {
 	// /api/trace requires a logged-in session (requireAdmin) -- go straight to
@@ -161,17 +163,17 @@ TEST(HttpTraceCommand, ApiTraceRoundTripsRawSipTextWithQuotesAndBackslashes)
 
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18095, nullptr);
+	HttpServer server("127.0.0.1", 18120, nullptr);
 	server.attachHandler(&handler);
 	server.start();
 
 	// Give the accept loop a moment to come up rather than a fixed sleep before
 	// the first probe.
-	for (int i = 0; i < 50 && !canConnect(18095); ++i)
+	for (int i = 0; i < 50 && !canConnect(18120); ++i)
 	{
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
-	ASSERT_TRUE(canConnect(18095));
+	ASSERT_TRUE(canConnect(18120));
 
 	// A synthetic REGISTER whose Authorization header carries a backslash-
 	// escaped quote inside the nonce, the same shape a real digest challenge
@@ -193,7 +195,7 @@ TEST(HttpTraceCommand, ApiTraceRoundTripsRawSipTextWithQuotesAndBackslashes)
 
 	handler.handle(RequestsHandler::getMessageFromPool(raw, src));
 
-	std::string resp = httpGetRaw(18095, "/api/trace", sessionCookie);
+	std::string resp = httpGetRaw(18120, "/api/trace", sessionCookie);
 	ASSERT_NE(resp.find("200"), std::string::npos) << resp;
 	ASSERT_NE(resp.find("application/json"), std::string::npos) << resp;
 
