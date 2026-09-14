@@ -21,6 +21,7 @@
 #include "DeviceConfig.hpp"
 
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <cstring>
 #include <chrono>
@@ -35,6 +36,12 @@
 	#include "nvs.h"
 	#include "esp_random.h"
 	#include "esp_partition.h"
+	// esp_log is in the same class as the three above: a core component present
+	// on every transport, not a WiFi dependency. The schema-version banner is
+	// emitted HERE rather than in the four main/esp_main*.cpp entry points so
+	// that the one message an operator has to see on a downgrade cannot drift
+	// between transports or be forgotten by a fifth entry point later.
+	#include "esp_log.h"
 #else
 	#include <random>
 #endif
@@ -389,6 +396,86 @@ namespace
 		}
 		return std::string(reinterpret_cast<const char*>(base + off), n);
 	}
+
+	// ---------------------------------------------------------------------
+	// Schema versioning (issue #181). See DeviceConfig.hpp for the decision
+	// table and the downgrade argument.
+	// ---------------------------------------------------------------------
+
+	// Set once at boot by ensureSchemaVersion(), read afterwards from whatever
+	// task asks. Atomics rather than the ConfigState mutex: this pair is written
+	// before any task exists and read forever after, so a lock would only buy
+	// contention, and taking state().mutex here would tie schema detection to
+	// the AP-passphrase state it has nothing to do with.
+	std::atomic<DeviceConfig::SchemaOutcome> g_schemaOutcome{
+		DeviceConfig::SchemaOutcome::StoreUnavailable};
+	std::atomic<uint16_t> g_schemaObserved{0};
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	constexpr const char* kSchemaLogTag = "cfgschema";
+
+	// Every NVS namespace whose contents are operator configuration. If ANY of
+	// them exists on flash, the device has been provisioned and an absent stamp
+	// means "pre-versioning", not "brand new".
+	//
+	// Deliberately excluded: "cdrlog" (CdrRing). Call records are history, not
+	// configuration — a board that has only ever logged calls is still a blank
+	// device as far as the key LAYOUT is concerned, and including it would make
+	// the adoption path depend on whether anyone happened to dial.
+	constexpr const char* kConfigNamespaces[] = {
+		"storage",   // this file, AdminAuth, the transports
+		"pbxcfg",    // dial plan, ring groups, page zones, reg_mode, syslog
+		"sipauth",   // SipSecretStore
+		"didmap",    // DidMapping
+		"tapicfg",   // TelephonyApiConfig (trunk slots + secrets)
+	};
+
+	// Does `ns` exist on flash? nvs_open() in READONLY mode is the only probe
+	// that does not answer its own question: READWRITE would CREATE the
+	// namespace and make every device look provisioned.
+	//
+	//   1 = present, 0 = definitively absent, -1 = could not tell.
+	// The -1 case must not collapse into 0: a store we cannot read is not a
+	// blank store, and stamping a provisioned device as fresh is precisely the
+	// failure this whole mechanism exists to prevent.
+	int probeNamespace(const char* ns)
+	{
+		nvs_handle_t h;
+		esp_err_t err = nvs_open(ns, NVS_READONLY, &h);
+		if (err == ESP_OK)
+		{
+			nvs_close(h);
+			return 1;
+		}
+		if (err == ESP_ERR_NVS_NOT_FOUND)
+		{
+			return 0;
+		}
+		return -1;
+	}
+
+	// Write the stamp. Every return checked; a failed commit is reported so the
+	// caller can downgrade the outcome rather than claim a migration landed.
+	bool writeSchemaVersion(uint16_t version)
+	{
+		nvs_handle_t h;
+		if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+		{
+			return false;
+		}
+		bool ok = (nvs_set_u16(h, DeviceConfig::kKeySchemaVersion, version) == ESP_OK) &&
+		          (nvs_commit(h) == ESP_OK);
+		nvs_close(h);
+		return ok;
+	}
+
+	// Adapter matching DeviceConfig::SchemaStampFn, so the pure walker in
+	// runSchemaMigrations() can commit each step without knowing about NVS.
+	bool stampAfterStep(void* /*ctx*/, uint16_t version)
+	{
+		return writeSchemaVersion(version);
+	}
+#endif
 }
 
 namespace DeviceConfig
@@ -701,5 +788,336 @@ namespace DeviceConfig
 		s.apSecure = false;
 		s.apPsk.clear();
 		s.loaded = true;    // we know the (now empty) state; don't reload
+
+		// NOTE: `schema_ver` is NOT erased here, and that is deliberate.
+		// clearAll() drops three keys out of "storage"; it does not touch
+		// "pbxcfg", "sipauth", "didmap" or "tapicfg", so the device still holds
+		// config in the CURRENT layout after a factory reset. Erasing the stamp
+		// would make the next boot see "data, no stamp", conclude v1, and on a
+		// future v3 firmware re-run the 1->2->3 migrations over data that is
+		// already v3. The stamp describes the layout, not the contents, and a
+		// factory reset does not change the layout.
+	}
+
+	// =====================================================================
+	// Schema versioning (issue #181)
+	// =====================================================================
+
+	const char* schemaOutcomeName(SchemaOutcome outcome)
+	{
+		switch (outcome)
+		{
+			case SchemaOutcome::FreshInstall:     return "fresh-install";
+			case SchemaOutcome::AdoptedLegacy:    return "adopted-legacy";
+			case SchemaOutcome::UpToDate:         return "up-to-date";
+			case SchemaOutcome::Migrated:         return "migrated";
+			case SchemaOutcome::MigrationFailed:  return "migration-failed";
+			case SchemaOutcome::Downgrade:        return "downgrade";
+			case SchemaOutcome::StoreUnavailable: return "store-unavailable";
+		}
+		return "unknown";
+	}
+
+	SchemaPlan planSchema(const SchemaProbe& probe, uint16_t current)
+	{
+		SchemaPlan plan;
+
+		// Could not inspect the store at all. Every field stays at its "do
+		// nothing" default: no stamp, no migration, versions left at 0. This is
+		// the one branch that must never fall through to FreshInstall.
+		if (!probe.storeReadable)
+		{
+			plan.outcome = SchemaOutcome::StoreUnavailable;
+			return plan;
+		}
+
+		// A stored zero is treated as NO stamp rather than as version 0. No
+		// release has ever written 0, so reading one means a foreign or corrupt
+		// write; routing it through the legacy path re-stamps it correctly
+		// instead of leaving a meaningless value on flash forever.
+		const bool haveVersion = probe.versionPresent && probe.version != 0;
+
+		plan.toVersion = current;
+		if (haveVersion)
+		{
+			plan.fromVersion = probe.version;
+		}
+		else if (probe.hasExistingData)
+		{
+			// THE line this whole feature exists for. A provisioned device with
+			// no stamp is a pre-versioning device, and every release that could
+			// have written its data wrote the v1 layout. Assume v1 and migrate
+			// forward. Do not wipe, and do not assume `current` — assuming
+			// current would skip the migrations a legacy device actually needs.
+			plan.fromVersion = kSchemaBaselineVersion;
+		}
+		else
+		{
+			// Genuinely blank: nothing to migrate, born at today's layout.
+			plan.fromVersion = current;
+		}
+
+		// The label reports the primary FACT about the device, which is not
+		// always the same as the action. A legacy device on a v3 firmware is
+		// reported as adopted-legacy (with fromVersion 1) even though it also
+		// migrates — "we adopted an unstamped device" is the thing an operator
+		// reading a boot log needs to see.
+		if (!haveVersion)
+		{
+			plan.outcome = probe.hasExistingData ? SchemaOutcome::AdoptedLegacy
+			                                     : SchemaOutcome::FreshInstall;
+		}
+		else if (plan.fromVersion > current)
+		{
+			plan.outcome = SchemaOutcome::Downgrade;
+		}
+		else if (plan.fromVersion < current)
+		{
+			plan.outcome = SchemaOutcome::Migrated;
+		}
+		else
+		{
+			plan.outcome = SchemaOutcome::UpToDate;
+		}
+
+		// A downgrade writes nothing at all: stamping backwards would let the
+		// newer firmware come back and mistake its own v2 data for v1.
+		// UpToDate writes nothing either, so a plain reboot costs no flash wear.
+		plan.migrate = (plan.outcome != SchemaOutcome::Downgrade) &&
+		               (plan.fromVersion < current);
+		plan.stamp   = (plan.outcome != SchemaOutcome::Downgrade) &&
+		               (plan.outcome != SchemaOutcome::UpToDate);
+		return plan;
+	}
+
+	const SchemaMigration* schemaMigrations(size_t* count)
+	{
+		// Empty on purpose. kSchemaVersion is 1: there is no earlier layout to
+		// come from, so any row here would be a speculative, untested,
+		// flash-mutating code path shipped to production. The dispatch in
+		// runSchemaMigrations() is fully exercised by the host tests against
+		// synthetic tables instead, so adding the first real row is a two-line
+		// change to this function and nothing else.
+		if (count != nullptr)
+		{
+			*count = 0;
+		}
+		return nullptr;
+	}
+
+	bool runSchemaMigrations(uint16_t from, uint16_t to,
+	                         const SchemaMigration* table, size_t count,
+	                         void* ctx, SchemaStampFn stamp, uint16_t* reached)
+	{
+		if (reached == nullptr || stamp == nullptr)
+		{
+			return false;
+		}
+		*reached = from;
+		if (from >= to)
+		{
+			return true;   // nothing to do is success
+		}
+
+		uint16_t at = from;
+		// Bounded by `count`, not just by `at < to`: a table containing a cycle
+		// (2->1 alongside 1->2) would otherwise spin forever at boot. No row is
+		// usable more than once in a strictly increasing walk, so `count` steps
+		// is a hard upper bound on a well-formed chain.
+		for (size_t guard = 0; at < to && guard <= count; ++guard)
+		{
+			const SchemaMigration* step = nullptr;
+			for (size_t i = 0; i < count && table != nullptr; ++i)
+			{
+				if (table[i].from == at)
+				{
+					step = &table[i];
+					break;
+				}
+			}
+			// A gap is a hard failure, never a skip. Jumping from v1 straight to
+			// v3 because nobody wrote the 1->2 row would stamp a device as
+			// finished over data that was never converted.
+			if (step == nullptr || step->fn == nullptr || step->to <= at)
+			{
+				return false;
+			}
+
+			if (!step->fn(ctx))
+			{
+				return false;
+			}
+			// Commit the new version BEFORE attempting the next step, so an
+			// interrupted chain resumes at the last layout that actually landed
+			// rather than re-running conversions that already ran.
+			if (!stamp(ctx, step->to))
+			{
+				return false;
+			}
+			at = step->to;
+			*reached = at;
+		}
+		return at >= to;
+	}
+
+	SchemaOutcome lastSchemaOutcome()
+	{
+		return g_schemaOutcome.load(std::memory_order_acquire);
+	}
+
+	uint16_t observedSchemaVersion()
+	{
+		return g_schemaObserved.load(std::memory_order_acquire);
+	}
+
+	SchemaOutcome ensureSchemaVersion()
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		SchemaProbe probe;
+
+		// ---- Probe, READONLY throughout ----
+		// Order matters: the stamp namespace is read first and NEVER opened
+		// READWRITE before the decision is taken, because opening it READWRITE
+		// creates it and would make hasExistingData unconditionally true.
+		nvs_handle_t ro;
+		esp_err_t err = nvs_open(kNvsNamespace, NVS_READONLY, &ro);
+		if (err == ESP_OK)
+		{
+			probe.storeReadable = true;
+			// The namespace existing at all means something wrote it, which on a
+			// pre-versioning image means ap_psk / the admin PIN / wifi creds.
+			probe.hasExistingData = true;
+
+			uint16_t stored = 0;
+			esp_err_t gerr = nvs_get_u16(ro, kKeySchemaVersion, &stored);
+			nvs_close(ro);
+
+			if (gerr == ESP_OK)
+			{
+				probe.versionPresent = true;
+				probe.version = stored;
+			}
+			else if (gerr != ESP_ERR_NVS_NOT_FOUND)
+			{
+				// Anything else (INVALID_LENGTH from a key stored at the wrong
+				// type, an IO error) means we do not know what is on flash.
+				// Refuse to guess rather than adopt or stamp.
+				probe.storeReadable = false;
+			}
+		}
+		else if (err == ESP_ERR_NVS_NOT_FOUND)
+		{
+			// Definitively absent is an ANSWER, not a failure.
+			probe.storeReadable = true;
+		}
+
+		// Only reached when "storage" itself was absent; if it existed we already
+		// know the device is provisioned and the answer cannot change. The list
+		// still contains "storage" (it re-probes as absent, one wasted nvs_open)
+		// so that kConfigNamespaces stays the single complete statement of which
+		// namespaces count as config — a reader adding a sixth one should not
+		// have to notice that the first is handled somewhere else.
+		if (probe.storeReadable && !probe.hasExistingData)
+		{
+			for (const char* ns : kConfigNamespaces)
+			{
+				int present = probeNamespace(ns);
+				if (present < 0)
+				{
+					probe.storeReadable = false;
+					break;
+				}
+				if (present > 0)
+				{
+					probe.hasExistingData = true;
+					break;
+				}
+			}
+		}
+
+		// ---- Decide ----
+		const SchemaPlan plan = planSchema(probe, kSchemaVersion);
+		g_schemaObserved.store(plan.fromVersion, std::memory_order_release);
+
+		SchemaOutcome outcome = plan.outcome;
+
+		// ---- Act ----
+		uint16_t reached = plan.fromVersion;
+		if (plan.migrate)
+		{
+			size_t count = 0;
+			const SchemaMigration* table = schemaMigrations(&count);
+			if (!runSchemaMigrations(plan.fromVersion, plan.toVersion,
+			                         table, count, nullptr, &stampAfterStep,
+			                         &reached))
+			{
+				outcome = SchemaOutcome::MigrationFailed;
+			}
+		}
+
+		// runSchemaMigrations() has already stamped every step it completed, so
+		// the only stamp left to write is the one for a device that needed no
+		// migration at all (fresh install, or a legacy adoption on a firmware
+		// whose version equals the baseline).
+		if (plan.stamp && reached == plan.fromVersion &&
+		    !(probe.versionPresent && probe.version == reached))
+		{
+			if (!writeSchemaVersion(reached))
+			{
+				// The device is perfectly usable; it will simply be re-adopted
+				// (identically) on the next boot. Worth a warning, not a fault.
+				ESP_LOGW(kSchemaLogTag,
+				         "could not persist schema stamp v%u; will re-detect next boot",
+				         (unsigned)reached);
+			}
+		}
+
+		// ---- Report ----
+		if (outcome == SchemaOutcome::Downgrade)
+		{
+			// The loud one. See DeviceConfig.hpp: we boot anyway, because OTA
+			// rollback lands here automatically and a PBX that refuses to ring
+			// is worse than one running on possibly-misread config.
+			ESP_LOGE(kSchemaLogTag,
+			         "*** NVS SCHEMA DOWNGRADE: flash holds v%u, this firmware understands v%u ***",
+			         (unsigned)plan.fromVersion, (unsigned)kSchemaVersion);
+			ESP_LOGE(kSchemaLogTag,
+			         "*** configuration may be MISREAD. Re-flash the newer firmware, or "
+			         "factory-reset to re-provision. Nothing was written or migrated. ***");
+		}
+		else if (outcome == SchemaOutcome::MigrationFailed)
+		{
+			ESP_LOGE(kSchemaLogTag,
+			         "schema migration stopped at v%u (target v%u); retrying next boot",
+			         (unsigned)reached, (unsigned)kSchemaVersion);
+		}
+		else if (outcome == SchemaOutcome::StoreUnavailable)
+		{
+			ESP_LOGW(kSchemaLogTag,
+			         "could not inspect NVS; schema left untouched and unstamped");
+		}
+		else if (outcome == SchemaOutcome::AdoptedLegacy)
+		{
+			ESP_LOGW(kSchemaLogTag,
+			         "adopting pre-versioning config as schema v%u (now v%u); data preserved",
+			         (unsigned)plan.fromVersion, (unsigned)reached);
+		}
+		else
+		{
+			ESP_LOGI(kSchemaLogTag, "schema %s (v%u)",
+			         schemaOutcomeName(outcome), (unsigned)reached);
+		}
+
+		g_schemaOutcome.store(outcome, std::memory_order_release);
+		return outcome;
+#else
+		// Host: no NVS. The in-memory store is rebuilt from nothing every
+		// process, so it is blank by definition — the same reasoning that makes
+		// applyFlashSeed() a no-op here. Reporting FreshInstall keeps the host
+		// suite on the branch a normally-flashed device takes.
+		g_schemaObserved.store(kSchemaVersion, std::memory_order_release);
+		g_schemaOutcome.store(SchemaOutcome::FreshInstall, std::memory_order_release);
+		return SchemaOutcome::FreshInstall;
+#endif
 	}
 }

@@ -468,7 +468,12 @@ What a factory reset actually clears (`HttpServer::sendApiFactoryReset`,
   `400 {"error":"factory reset requires confirm=ERASE"}`.
 - `AdminAuth::clearCredential()` — the login credential, the DTMF PIN, and all live
   sessions.
-- `DeviceConfig::clearAll()` — `ap_secure`, `ap_psk`, `cfgseed_gen`, and `reg_mode`. The
+- `DeviceConfig::clearAll()` — `ap_secure`, `ap_psk`, `cfgseed_gen`, and `reg_mode`.
+  It deliberately does **not** clear `schema_ver` (#181). A factory reset leaves
+  `pbxcfg`/`sipauth`/`didmap`/`tapicfg` alone, so the device still holds config in the
+  current key layout; dropping the stamp would make the next boot re-adopt it as v1 and,
+  on a later release, re-run migrations over data that was already converted. The stamp
+  describes the layout, not the contents. The
   `reg_mode` erase used to go to the `storage` namespace instead of the `pbxcfg` one the
   registrar actually uses, so the admission mode survived a factory reset and a board left
   in `secure` could not be rescued without USB. Fixed in #188 — the write and the erase now

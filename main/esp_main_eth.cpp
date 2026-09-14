@@ -477,6 +477,14 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    // ── NVS schema version (issue #181) ─────────────────────────────
+    // BEFORE applyFlashSeed(): the seed writer CREATES the very NVS namespaces the
+    // "is this a pre-versioning device?" probe looks for, so running it first would
+    // make every provisioned board look freshly installed and skip the migrations it
+    // actually needs. Like applyFlashSeed() this touches only nvs/esp_log, never
+    // esp_wifi, so it links on the pure-Ethernet transports. Logs its own outcome.
+    DeviceConfig::ensureSchemaVersion();
+
     // ── Flash-time configuration seed ───────────────────────────────
     // Runs on the pure-Ethernet transports too, even though this build has no WiFi
     // radio and the seed's AP/STA fields are meaningless here. The seed also carries

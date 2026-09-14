@@ -203,7 +203,196 @@ namespace DeviceConfig
 	// Erase ap_secure / ap_psk / cfgseed_gen. Called by /api/factory-reset.
 	// Dropping cfgseed_gen is deliberate: the next boot re-applies the flash-time
 	// seed, so "factory" means "as flashed", not "as hardcoded".
+	//
+	// `schema_ver` is deliberately NOT dropped — see the schema section below.
 	void clearAll();
+
+	// =====================================================================
+	// NVS schema versioning (issue #181)
+	// =====================================================================
+	//
+	// This device keeps its entire identity in NVS: the admin credential, the
+	// SIP extensions and their secrets, the dial plan, ring groups, DID map,
+	// trunk API slots, WiFi config, syslog target. Firmware is updated over the
+	// air. Until now nothing recorded WHICH LAYOUT those keys were written in,
+	// so the first firmware that changes the meaning of a key would either
+	// misread the old value in silence or force the operator to factory-reset a
+	// live phone system and re-provision it by hand.
+	//
+	// The fix is one stamp and one decision, taken at boot before anything reads
+	// config. It is deliberately shaped as a sibling of applyFlashSeed(): both
+	// are "inspect persistent state once at boot, act exactly once, record that
+	// you acted so the next boot doesn't repeat it". `cfgseed_gen` is that
+	// counter for the seed; `schema_ver` is it for the key layout.
+	//
+	// ---- WHERE THE STAMP LIVES ----
+	// Key `schema_ver` (u16) in the "storage" namespace, and it describes the
+	// WHOLE device, not one namespace. A firmware image is upgraded atomically,
+	// so every namespace it owns ("storage", "pbxcfg", "sipauth", "didmap",
+	// "tapicfg") changes layout together; six independent stamps would be six
+	// chances to disagree. "storage" is chosen over "pbxcfg" because
+	// DeviceConfig already owns it, it exists on every transport including the
+	// pure-Ethernet ones, and reaching into "pbxcfg" from this file is the exact
+	// move that produced #151 and #188.
+	//
+	// ---- THE DECISION TABLE ----
+	//   stamp absent, every config namespace absent  -> FreshInstall.  Stamp
+	//        kSchemaVersion. A device born under this firmware is born current.
+	//   stamp absent, SOME config namespace present  -> AdoptedLegacy. This is
+	//        the case that matters: a device provisioned before versioning
+	//        existed. Its data IS v1 by definition — v1 is what every shipped
+	//        release wrote — so it is treated as v1, migrated forward if this
+	//        firmware is newer, and stamped. It is NEVER wiped. Erasing here
+	//        would factory-reset every deployed board on the update that
+	//        introduced versioning.
+	//   stamp == kSchemaVersion                      -> UpToDate. No write at
+	//        all, so a plain reboot costs zero flash wear.
+	//   stamp <  kSchemaVersion                      -> Migrated. Walk the
+	//        dispatch table one step at a time, re-stamping after EACH step, so
+	//        a failure halfway leaves the device at the last version that
+	//        actually completed and the next boot retries only the failed step.
+	//   stamp >  kSchemaVersion                      -> Downgrade. See below.
+	//   the store cannot be inspected               -> StoreUnavailable. No
+	//        stamp, no migration. Guessing on a flaky store is how you stamp a
+	//        provisioned device as fresh.
+	//
+	// ---- WHY A DOWNGRADE DOES NOT REFUSE TO BOOT ----
+	// Old firmware meeting a newer stamp is not a hypothetical: OTA rollback is
+	// armed (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE) and the new image is only
+	// marked valid after several seconds of healthy operation. So "new firmware
+	// migrated to v2, stamped it, then crashed and the bootloader rolled back"
+	// lands an old image on a v2 store automatically, with no operator involved.
+	// Refusing to start would turn the anti-crash safety net into the brick.
+	// A PBX that will not ring is worse than a PBX running on defaults.
+	//
+	// So a downgrade: is detected; is logged at ERROR with an unmissable banner;
+	// does NOT write the stamp backwards (which would let the newer firmware
+	// return and mistake its own data for old); does NOT migrate backwards; and
+	// boots. The newer data is left untouched on flash, so re-flashing the newer
+	// image restores the device exactly.
+	//
+	// KNOWN GAP, stated plainly: this release detects and reports the downgrade
+	// but does not quarantine the store against the old firmware's own writes,
+	// so v1-shaped values can be written into a v2-stamped store. Gating every
+	// loader and writer on the outcome is a much larger change and there is no
+	// v2 to test it against yet; lastSchemaOutcome() is exposed so that work can
+	// be built on this without redesigning it.
+
+	// The layout this firmware reads and writes. Bump this in the same PR that
+	// changes what any persisted key MEANS, and add the matching row to the
+	// migration table. Do not bump it for a key that is merely ADDED — an absent
+	// key already has a defined meaning everywhere in this codebase (use the
+	// default), which is why adding syslog_host or reg_mode needed no migration.
+	constexpr uint16_t kSchemaVersion = 1;
+
+	// What a pre-versioning device is assumed to be holding. Every release up to
+	// and including the one that introduced this framework wrote exactly this
+	// layout, so the assumption is a fact about shipped history, not a guess.
+	constexpr uint16_t kSchemaBaselineVersion = 1;
+
+	// NVS key for the stamp, in the "storage" namespace.
+	constexpr const char* kKeySchemaVersion = "schema_ver";
+
+	// What ensureSchemaVersion() concluded. Reported, logged, and available to
+	// callers afterwards via lastSchemaOutcome().
+	enum class SchemaOutcome : uint8_t
+	{
+		FreshInstall,       // blank store; stamped current
+		AdoptedLegacy,      // data but no stamp; treated as v1 and stamped
+		UpToDate,           // stamp already current; nothing written
+		Migrated,           // migrations ran to completion; stamped current
+		MigrationFailed,    // a step failed; stamped at the last good version
+		Downgrade,          // stamp newer than this firmware; nothing written
+		StoreUnavailable,   // could not inspect NVS; nothing written
+	};
+
+	// Stable short name, for logs and for a future dashboard field.
+	const char* schemaOutcomeName(SchemaOutcome outcome);
+
+	// What ensureSchemaVersion() found in NVS, pre-decision. `versionPresent`
+	// distinguishes "no stamp" from "stamped zero"; `hasExistingData` is true iff
+	// any namespace this firmware owns already exists on flash.
+	struct SchemaProbe
+	{
+		bool     storeReadable   = false;   // false => we could not tell, at all
+		bool     versionPresent  = false;
+		uint16_t version         = 0;
+		bool     hasExistingData = false;
+	};
+
+	// What to do about it.
+	struct SchemaPlan
+	{
+		SchemaOutcome outcome     = SchemaOutcome::StoreUnavailable;
+		uint16_t      fromVersion = 0;
+		uint16_t      toVersion   = 0;
+		bool          migrate     = false;
+		bool          stamp       = false;
+	};
+
+	// The decision table above, as a pure function of the probe. Split out from
+	// the NVS access deliberately: NVS is ESP-only, so a decision baked into the
+	// device branch could never be tested, and this one is the decision that
+	// destroys a live PBX if it is wrong.
+	//
+	// `current` is a PARAMETER rather than kSchemaVersion so the tests can drive
+	// it past 1. With current fixed at 1, "legacy data -> treat as v1" and
+	// "blank -> stamp current" produce the same number and a test cannot tell a
+	// correct implementation from one that conflates them.
+	SchemaPlan planSchema(const SchemaProbe& probe, uint16_t current);
+
+	// ---- Migration dispatch ----
+	//
+	// One row per single version step. `ctx` is reserved (always nullptr today):
+	// a migration may need to touch several NVS namespaces, so each one opens
+	// and COMMITS what it needs itself rather than inheriting one handle. Return
+	// false to stop the chain; the device is then left stamped at the last step
+	// that succeeded.
+	using SchemaMigrationFn = bool (*)(void* ctx);
+
+	struct SchemaMigration
+	{
+		uint16_t          from;
+		uint16_t          to;
+		SchemaMigrationFn fn;
+		const char*       what;   // short description, for the boot log
+	};
+
+	// The shipped table. EMPTY at kSchemaVersion == 1 — there is nothing to
+	// migrate from, and inventing rows for changes that have not happened would
+	// ship untested flash-mutating code. Returns nullptr with *count == 0.
+	const SchemaMigration* schemaMigrations(size_t* count);
+
+	// Called after each successful step with the version just reached, so the
+	// stamp is advanced step by step rather than once at the end.
+	using SchemaStampFn = bool (*)(void* ctx, uint16_t version);
+
+	// Walk `from` -> `to` one row at a time, stamping after each. Returns true
+	// iff the chain completed; `*reached` (required) receives the highest
+	// version actually attained, which is what the caller reports and keeps.
+	// A missing row for the current version is a failure, not a skip: silently
+	// jumping a gap is how a half-migrated device gets stamped as finished.
+	bool runSchemaMigrations(uint16_t from, uint16_t to,
+	                         const SchemaMigration* table, size_t count,
+	                         void* ctx, SchemaStampFn stamp, uint16_t* reached);
+
+	// Probe NVS, apply the table above, and log the outcome. Call ONCE at boot,
+	// immediately after nvs_flash_init() and BEFORE applyFlashSeed() — the seed
+	// writer creates the very namespaces the pre-versioning probe looks for, so
+	// running it first would make every device look freshly installed.
+	//
+	// Host build: there is no NVS and the in-memory store is rebuilt every
+	// process, so the store is blank by definition and the outcome is
+	// FreshInstall.
+	SchemaOutcome ensureSchemaVersion();
+
+	// The outcome of the last ensureSchemaVersion() call, and the version that
+	// was found on flash before any migration (== kSchemaVersion when the device
+	// was already current or freshly installed; 0 when the store could not be
+	// inspected, or before ensureSchemaVersion() has run at all). Safe to call
+	// from any task.
+	SchemaOutcome lastSchemaOutcome();
+	uint16_t      observedSchemaVersion();
 }
 
 #endif // DEVICE_CONFIG_HPP

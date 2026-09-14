@@ -294,6 +294,58 @@ Two documents also claimed the boot gate does not re-engage after a reset, becau
 in-RAM flag, and the gate reads `storage`/`admin_pw_hash`, which is exactly the key the
 reset erases. A reset board does come back unprovisioned.
 
+### Added — NVS carries a schema version, so a future firmware can migrate it (#181)
+
+Every configured thing on this device lives in NVS — the admin credential, the
+extensions and their SIP secrets, the dial plan, ring groups, the DID map, the trunk
+API slots, WiFi, the syslog target — and firmware is updated over the air. Nothing
+recorded which *layout* those keys were written in. The first release that changed what
+a key means would therefore have had two options, both bad: misread the old value in
+silence, or make the operator factory-reset a live phone system and re-provision it by
+hand.
+
+`DeviceConfig::ensureSchemaVersion()` now runs at boot, immediately after
+`nvs_flash_init()` and deliberately **before** `applyFlashSeed()` — the seed writer
+creates the very namespaces the detector inspects, so the other order would make every
+provisioned board look brand new. It is shaped as a sibling of the `cfgseed_gen`
+mechanism next to it: inspect persistent state once, act exactly once, record that you
+acted.
+
+The stamp is `schema_ver` (u16) in `storage`, and it describes the whole device rather
+than one namespace, because a firmware image upgrades every namespace it owns at the
+same instant. **This release stamps the current layout as version 1 and ships an empty
+migration table.** There is no earlier layout to convert from, and inventing rows for
+changes that have not happened would be untested flash-mutating code in production.
+
+The case that actually matters is a board already in the field: data present, no stamp.
+That is read as v1 — which is a fact about what every shipped release wrote, not a
+guess — then migrated forward if needed, then stamped. It is never wiped. A store that
+cannot be inspected is left alone rather than treated as blank, because stamping a
+provisioned device as a fresh install is the one mistake that silently skips every
+migration it will later need.
+
+A device whose stamp is **newer** than the running firmware is detected, logged at
+`ESP_LOGE` with an unmissable banner, and **boots anyway**. That is not a hypothetical
+state: OTA rollback is armed and the new image is only marked valid after several
+seconds of healthy operation, so "migrated, stamped, crashed, rolled back" lands old
+firmware on a newer store with no operator involved. Refusing to start would turn the
+anti-crash safety net into the brick, and a PBX that will not ring is worse than one
+running on defaults. Nothing is written and nothing is migrated in that state, so
+re-flashing the newer image restores the device exactly. What this release does *not*
+do is stop the old firmware writing v1-shaped values into that store; that gating is
+deliberately deferred until there is a v2 to test it against.
+
+`clearAll()` (factory reset) does **not** drop the stamp. It clears three keys out of
+`storage` and leaves `pbxcfg`/`sipauth`/`didmap`/`tapicfg` alone, so the device still
+holds config in the current layout afterwards. Erasing the stamp would make the next
+boot re-adopt it as v1 and, on a later release, re-run migrations over data that was
+already converted.
+
+17 host tests cover the decision table and the migration walker. They can exist at all
+because `planSchema()` and `runSchemaMigrations()` are pure and platform-neutral: the
+`nvs_open` glue around them is ESP-only, and logic buried in a device-only branch is
+exactly what let #151 ship inert through two releases.
+
 ### Hardware — the first real-handset evidence in this project
 
 Worth recording separately, because it changes what the rest of the test suite means.
