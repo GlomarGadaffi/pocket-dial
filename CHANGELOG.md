@@ -1,5 +1,308 @@
 # Changelog
 
+## Unreleased (on main, in no published release) — 2026-09-13
+
+The admin plane was rebuilt and the box learned to call outside. Those are the two
+headline changes, and they are related: a dashboard nobody could reach was fine while
+every feature lived on the LAN, and became untenable the moment the only route to an
+outside line was a dial-plan rule that could only be written from that dashboard.
+
+This is also the first time any of it has been proved on a real telephone. Every
+release before this one was verified on the host test suite, on `pjsua`/SIPp against
+the desktop binary, and on a bench board answering its own synthetic clients. A Yealink
+T29 is now registered to the bench board and an outbound call has completed to the
+public network with two-way audio.
+
+**Breaking for scripts and for anything written against a PIN.** The admin login is a
+username and password, `POST /api/admin/set-pin` is gone, and there is no longer any
+window in which an unprovisioned device admits unauthenticated requests.
+
+### Security — the admin credential is a username and password, with forced first-use setup
+
+`AdminAuth` was PIN-only. A 4-to-16-digit number is what you can type on a phone
+keypad, and the web dashboard inherited it for no better reason than that the DTMF
+admin menu needed one. The two uses have nothing in common — a keypad cannot type a
+username, and a browser has no reason to be limited to digits — so they are now two
+independent secrets.
+
+- `setLoginCredential()`/`verifyCredential()` (username + password, salted and iterated
+  SHA-256, the same brute-force lockout machinery as before) replace
+  `setPin()`/`verifyPin()`. `isProvisioned()` now means "a real, non-default credential
+  has been set", and `needsInitialSetup()` is its named complement.
+- **The device ships with `admin`/`admin`**, on purpose, so that the gate in front of
+  every admin action can be unconditional from the very first boot. The old model had
+  to admit unauthenticated requests until a PIN existed, which is a window; a known
+  default is not a secret, but it is a credential, and it lets the window close.
+- That default is then forced out of use server-side: `requireAdmin()` refuses every
+  admin-gated route except `POST /api/admin/set-credential` with
+  `403 {"error":"setup_required"}` until it is replaced. Enforced in the gate, not
+  suggested by the dashboard — a client that skips the UI gets the same answer.
+- The phone-keypad DTMF admin menu (`*PIN#code` — NTP resync, topology switch, factory
+  reset) keeps its own numeric secret via `setDtmfPin()`/`verifyDtmfPin()`, and
+  **deliberately has no default**: it stays disabled until explicitly set. A default
+  there would let `*0000#9991` factory-reset a freshly flashed box from any phone on
+  the link.
+- `requireAdmin()` drops the "unprovisioned devices skip the session check" bypass
+  entirely. Wi-Fi onboarding, `/api/configuring`, OTA, the telephony/DID/dial-plan
+  endpoints and factory-reset are now gated identically, with no special-cased
+  onboarding exemption. `POST /api/admin/login` takes `username=`+`password=` and no
+  longer answers `409` when nothing is provisioned, because the default always
+  verifies.
+
+Verified: 389 host tests (0 failures, 2 pre-existing Windows-only skips), including new
+coverage for the default credential, its removal the instant a real one is set, and the
+DTMF PIN's no-default behaviour; the full `tests/http/test_api.sh` suite (32/32) live
+against the host binary, reordered so admin auth runs first — there is no longer a "run
+everything while unprovisioned" window for test ordering to exploit. Confirmed on the
+T-ETH-Elite bench board end to end: default login works, `setup_required` blocks
+`/api/kill` until setup completes, and factory reset returns the board to the
+default-credential state.
+
+### Fixed — the dashboard must always be reachable, not dark by default
+
+This is the correction most likely to matter to someone holding an older document.
+
+The HTTP listener used to close once a device was provisioned, and the documented way
+back in was to dial `*4887` from the extension the firmware happened to consider the
+admin (default `1001`), from the same network segment, with a phone already registered.
+Found on real hardware: flashing a fresh build to an ESP32-S3 that already had a PIN in
+NVS left the dashboard answering "connection refused" on port 80 the moment any client
+registered. That is a worse failure mode than the credential exposure the gate was
+meant to prevent, and it bought nothing over the session and CSRF checks already
+sitting in front of every mutating endpoint.
+
+The listen socket now opens unconditionally at construction and stays open for the
+process lifetime. `requireAdmin()`'s per-route session + CSRF check is unchanged and
+remains the actual gate on admin actions.
+
+Removed as dead weight once the socket gate was gone: **the `*4887` star-code handler**
+and its Issue #93 shadowed-PIN warning, the admin-HTTP grace-window atomics and TTL in
+`RequestsHandler`, the authenticated "Keep open (1h)" dashboard button and its
+`/api/admin/keepalive` endpoint, and `set-pin`'s now-pointless "PIN must not begin with
+4887" reservation. The broader `*PIN#code` DTMF admin menu is untouched. **There is no
+longer any star-code that reopens the HTTP plane, because there is nothing to reopen** —
+any instruction to recover a board that way describes firmware that no longer exists.
+
+`tests/AdminHttpGate_test.cpp`'s 14-test dark-gate/DTMF-trigger suite is replaced by 3
+tests pinning the new invariant: the socket accepts connections immediately, stays
+reachable once provisioned, and setting a credential does not change that. Confirmed
+live on a T-ETH-Elite: "connection refused" on every probe before, HTTP 200 on every
+probe after, across boot and a real client registering and re-registering, with
+`GET /api/telephony-config` still correctly requiring authentication.
+
+### Added — outbound trunk access as a dial-plan action
+
+A dial-plan rule can now carry `action=trunk`: `9XXXXXXXXXX` with `stripDigits=1` and
+`target=1` turns a dial of `93057673260` into `13057673260` and places it as a real
+outbound call through the currently-configured anchor provider — the same origination
+core virtual extension `555` uses, extracted into
+`RequestsHandler::originateAnchorCall()` and reached from `CallForker::routeDialPlan()`
+through a new `PbxEnv::routeTrunkCall()`.
+
+Two things about this are worth stating plainly, because the word "trunk" invites the
+wrong mental model:
+
+- **It is not a SIP trunk.** The outbound path is an `AnchorClient` — HTTP/OAuth2, a
+  call-control WebSocket, and media as chunked-HTTPS PCM16 — and the shipping real
+  client speaks the 3CX Call Control API. Nothing in the tree ever *sends* a `REGISTER`,
+  so the box never registers to an ITSP and speaks no SIP to a carrier at all.
+- **A rule is the only way out.** There is no hardcoded `9` prefix and no
+  unregistered-destination fallback. With an empty dial plan, every outside number is
+  answered `404` without leaving the box. `POCKETDIAL_MAX_ANCHOR_CALLS` is 1, so one
+  outside call at a time. There is no E.164 normalization anywhere: what the rule
+  produces is exactly what the provider is asked to dial.
+
+Three teardown bugs surfaced with it, all fixed here: `onCancel()`, `onBye()` and
+`onAck()` recognized an anchor call by the literal string `"555"` parsed off the wire,
+but a trunk call's CANCEL/BYE/ACK carries the dialed digits instead. Left alone, hanging
+up a trunk call would have answered `404` instead of tearing down, leaking both the
+`MediaBridge` and the live carrier leg. All three now recognize the session by
+`isAnchor()`.
+
+### Fixed — three silent defects between the dial plan and the trunk
+
+Found while working out why an outbound 3CX call reached the provider's API and never
+placed a call. All three are silent: nothing logs, nothing errors, the dashboard shows
+a healthy box.
+
+1. **`DialPlan::upsert()` dropped `stripDigits` on an edit.** It copied only action and
+   target when the pattern already existed, so the strip count kept its first-insert
+   value forever — and `persistDialPlan()` wrote that stale value to NVS, where it
+   survived a reboot. Re-POSTing a pattern was the only way to edit a rule, so fixing a
+   typo in a trunk target silently reverted its strip: a rule saved as strip 1 / prepend
+   1 and later edited would dial `193057673260` instead of `13057673260`.
+2. **"Strip N, prepend nothing" could not be expressed.** The delete signal was an empty
+   `target`, which made the request that *creates* a strip-only trunk rule
+   byte-identical to the request that *deletes* it. That shape is not exotic — it is
+   exactly what this trunk wants (a bare `substr(1)`, no prepend), so the one digit
+   format known to work was the one format pocket-dial could not store. **The delete
+   signal is now an empty `action` *and* an empty `target`; naming an action always
+   means upsert.** Every existing delete call site already passes `("pattern","","")`,
+   so nothing changes for them, and a non-trunk action with an empty target is now
+   refused outright rather than quietly deleting the rule being edited.
+3. **An enabled trunk slot could be saved with a blank route DN.** `setSlot()` checked
+   field lengths and the `https://` prefix and nothing else. A blank route DN is the one
+   misconfiguration nothing downstream can report: `isConnected()` is WebSocket state
+   only and the control socket carries no DN, so the board boots "connected", every
+   `makeCall` posts to `.../callcontrol//makecall`, and the provider is genuinely
+   reached and answers non-2xx. In the field that reads as "the API was hit but no call
+   happened". An enabled non-Loopback slot now requires a route DN, a client ID and a
+   secret; the secret check honours `keepSecret` so editing a saved slot still works,
+   and disabled slots stay free to be incomplete drafts.
+
+Each fix has a regression test, and each test was verified to **fail** against the
+unfixed code before being kept — including the observable that mattered most, that a
+blank-`routeDn` slot came back with `view().enabled == true`. 408 host tests pass.
+
+### Added — the dashboard is a patch bay, and the dial plan finally has an editor
+
+The dashboard was a brass-and-amber "operator rail" skin over a text list. It is now the
+literal patch-bay switchboard it was always describing: five semantic jack states
+(idle / ringing / active / parked / alert) classified from real `/api/status` data,
+ring-group membership drawn as coloured cords between jacks instead of a text list, a
+live packet-counter sparkline, and a header badge showing the real web-session countdown
+next to a clearly separate note about the independent DTMF phone-menu channel.
+Per-call detail moved from the cords into the jack modal's Peer/Duration fields. The old
+accent theme-cycler is removed outright as incompatible with a fixed semantic palette.
+
+Three small backend pieces exist to feed it honestly rather than letting the page invent
+values:
+
+- `GET /api/status` now emits `parkedCalls` (`{orbit, parkedExt, parker, secondsParked}`),
+  already computed by `ParkOrbit::snapshotRows()` but never surfaced — needed to tell a
+  parked jack from an idle or a connected one.
+- `GET /api/admin/status` now emits `sessionRemainingSec`, via a new read-only
+  `AdminAuth::sessionRemainingMs()` that does **not** itself slide the session's expiry.
+  A countdown that refreshed the thing it was counting would never expire.
+- `POST /api/telephony-config/{slot}/test` — a connectivity probe, not a bridged call.
+  It self-dials the active slot's own route DN and drops it immediately, deliberately
+  outside `_mutex` because a real provider's `makeCall()`/`dropCall()` are blocking TLS
+  round trips that must never stall SIP packet handling for the whole device. It refuses
+  any slot that is not the currently-active one, since only that slot has a live,
+  boot-selected anchor client.
+
+Then **Dial Plan, Groups, Call Log and SIP Trace became top-bar buttons** — alongside
+Refresh, WiFi, Admin, Interconnect and Help, with F2/F3/F4/F8 joining the existing
+F1/F5/F9 and Escape closing all nine — leaving `<main>` as just the patch bay. The three
+existing modules moved into overlays with every control id preserved, so their render
+functions kept working untouched.
+
+**The dial-plan editor is new, and its absence was not cosmetic.** The dial plan is the
+only route to an outside trunk, so a box with no rule `404`s every outside number
+without ever reaching the anchor — and until now the only way to see or fix that was to
+POST to the API by hand. The editor lists the rules from `/api/status`, renders each as
+`9XXXXXXXXXX → trunk → strip 1, prepend 1` with a Delete button, hides the strip field
+for non-trunk actions, and refuses an empty target on a non-trunk rule with an explicit
+message rather than submitting it — an empty target used to be the delete signal, so
+saving one would have destroyed the rule being edited.
+
+The page is split across 8 `PD_HTML_N[]` raw-string parts (~12 KB each). This is not
+arbitrary: a single string literal past ~16 KB breaks the host build on MSVC, and adding
+the dial-plan modal pushed `PD_HTML_1` to 17,233 bytes. Reassembly was verified
+byte-identical.
+
+### Fixed — an outbound call was reaped after 20 s, and answered 503 when it was
+
+Confirmed on the bench board with a real Yealink and a real trunk, not reasoned about.
+Dialling `9`+NXXNXXXXXX placed a real call and the callee's mobile rang — and about 19 s
+in, the log said `anchor call reaped (no answer)` and the handset got a final response,
+a few seconds before carrier voicemail would have picked up.
+
+`originateAnchorCall` armed the ring timer with `pbx::kNoAnswerTimeout`, which is
+documented as how long an unanswered leg rings before the no-answer action fires (a CFNA
+forward, or advancing to the next hunt-group member) — an **internal-extension** number.
+The anchor path inherited it when the zombie reaper landed and nothing ever argued 20 s
+was a correct PSTN window. It is not: a US mobile rings 25-30 s before voicemail
+answers, and the clock starts when the *handset's* INVITE is accepted, before the ~1 s
+`makeCall` round trip and before the provider has begun dialling. A new
+`ANCHOR_NO_ANSWER_TIMEOUT` of **60 s** is used at the one outbound-anchor arm site; the
+other three arm sites — CFNA, the inbound-anchor fork and the hunt-group ring — keep
+`kNoAnswerTimeout` deliberately.
+
+It stays finite on purpose. The anchor's reconcile watchdog only tears down legs that
+have *vanished* from the DN, so the SIP ring timer is the sole backstop for a leg the
+provider still lists but that never progresses, and an unbounded window would pin the
+single `POCKETDIAL_MAX_ANCHOR_CALLS` slot. It is not re-armed on provider progress
+either: the status reported is our own control leg's, which sits at "Dialing" right
+through far-end alerting, so there is no alerting signal to key off.
+
+Separately, the reap answered **503 Service Unavailable**, which is what the Yealink
+displayed. A far end that rang and was not picked up is a no-answer, not a server fault.
+On this very path 503 already means something else — capacity refusal — while the
+sibling no-answer teardown (hunt-group exhaustion) already answers 480. A UAS 503 also
+invites upstream failover and blacklisting behaviour that a plain no-answer must never
+trigger. It is now **480 Temporarily Unavailable**; the true-failure 503s are untouched.
+
+### Fixed — the register-beep transaction storm (#148)
+
+Carried as a known issue by both v1.4.0 and v1.4.1, and now closed. On a fresh boot the
+T29 re-registered, never answered the beep INVITE, and one Call-ID produced 23
+`[tx] Timer B expired` lines plus `[tx] pool exhausted` within about 60 s. Both halves
+are fixed: duplicate INVITEs for a Call-ID/branch are deduped rather than each claiming
+a slot, and the slot is actually freed on teardown. `TransactionLayer::freeForCallId()`
+had exactly one caller, `endCall()` — and a beep dialog has no `Session`, living instead
+in `RegisterBeeper`'s own Call-ID-keyed table, so it never reached `endCall` and every
+beep teardown dropped the dialog while its transaction kept retransmitting for the rest
+of its 32 s Timer B window. A new `PbxEnv::freeTransactionsForCallId` routes all four
+`RegisterBeeper` terminal paths through a `releaseDialog()` that frees the transaction
+before clearing the slot — order matters, since clearing first loses the Call-ID.
+
+New `tests/TransactionLayer_test.cpp` covers the dedupe, that distinct branches still
+get their own slots, the RFC retransmit schedule and provisional stop, and that
+`freeForCallId` silences a slot at once. Two new `RegisterBeeper` tests assert the
+transaction is released on both the abandoned and completed paths, and that it is **not**
+released during the RFC 3261 §9.1 CANCEL race window (#98), where a raced 200 OK must
+still match. The dedupe test was verified to fail against the unfixed code. 414 host
+tests pass.
+
+### Fixed — factory reset wipes the call-history ring too
+
+Found live: a board's dashboard showed an old call from a prior deployment, surviving an
+app-only reflash because the CDR lives in its own NVS namespace (`cdrlog`) — untouched
+by the factory-reset path that had just been fixed to wipe `TelephonyApiConfig` and
+`DidMapping`. Same root cause, third namespace. Caller/callee history is at least as
+sensitive as the carrier credentials that fix already covered. `CdrRing::clearAll()` and
+`RequestsHandler::clearAllCallHistory()` are now wired into `sendApiFactoryReset()`
+alongside the existing wipes.
+
+### Hardware — the first real-handset evidence in this project
+
+Worth recording separately, because it changes what the rest of the test suite means.
+
+A Yealink T29 is registered to the bench board, and **outbound PSTN is verified end to
+end**: one call rang through to carrier voicemail, answered at 21.2 s — which is what
+made the 20 s reap above visible, and what the 60 s window exists to survive — and one
+call was answered by a person, **with two-way audio**.
+
+Everything else in the suite remains host-only: gtest, or `pjsua`/SIPp driven against
+the **desktop** binary over loopback. **On-device RTP has never been exercised by any
+test** — the host build's `RtpSender`/`RtpReceiver` are stubs (a Linux-desktop socket
+path aside), so every green media test exercises a stub rather than the ESP32 path.
+**OTA has never been executed anywhere**, on any board, in any release.
+
+### Documentation
+
+`docs/API.md` is corrected to the model above: the always-open listener, the
+username/password credential and its forced setup, the removal of the unprovisioned
+bypass, full sections for the previously-undocumented `/api/telephony-config` and
+`/api/did-mapping` routes, and the dial-plan rule table's real upsert/delete semantics.
+Any document that still describes an admin **PIN** login, a dark HTTP plane, or a
+`*4887` recovery code is stale and describes firmware that no longer exists.
+
+### Known issues
+
+- **#146** — the `Via` `received=` parameter is stamped with the server's own IP instead
+  of the sender's, contrary to RFC 3261 §18.2.1. Confirmed on hardware. Unchanged.
+- **The shipped registrar default is still `open`.** SIP digest auth (RFC 2617) is
+  implemented and Learn mode's TOFU + ARP MAC-lock works, but a fresh board accepts any
+  `REGISTER` and any `INVITE` until an operator changes `reg_mode`. Nothing in this
+  release changes that default.
+- **Zero-touch provisioning is inert on a default board.** `GET /config/<mac>.cfg` is
+  implemented, but it only serves a MAC in the Learn-mode adopted-device registry, and
+  `open` mode never records one — so on a fresh board it is a structural 404 for every
+  MAC. The Yealink key set has still never been confirmed against a physical handset.
+
+
 ## [v1.4.1] — 2026-09-07
 
 A single-bug patch release. It makes the flash-time registrar mode actually
@@ -83,7 +386,7 @@ anything at all. Full run on #151.
 
 Unchanged from v1.4.0: **#146** (`Via` `received=` carries the server's own IP,
 RFC 3261 §18.2.1) and **#148** (register-beep INVITE retransmission flood
-exhausting the message pool).
+exhausting the message pool — **fixed on main, in no published release**).
 
 
 ## [v1.4.0] — 2026-09-06
@@ -212,7 +515,8 @@ Two confirmed bugs are open against this release and are **not** fixed in it:
 - **#146** — the `Via` `received=` parameter is stamped with the server's own IP
   instead of the sender's, contrary to RFC 3261 §18.2.1. Confirmed on hardware.
   It misdirects responses to a sender behind NAT.
-- **#148** — the register-beep INVITE retransmits roughly 55 times in 8 seconds
+- **#148** (**fixed on main, in no published release**) — the register-beep INVITE
+  retransmits roughly 55 times in 8 seconds
   and continues after its own CANCEL. A SIP endpoint that does not answer it (a
   486 suffices) will drive the board's message pool to exhaustion, after which
   unrelated signalling is dropped silently. This mostly bites synthetic test

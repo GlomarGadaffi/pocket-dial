@@ -1,81 +1,129 @@
-# Server-Side RTP on Pocket-Dial: Design Exploration
+# Server-Side RTP on Pocket-Dial
 
-> **Status:** Proposed / exploration. No code written yet.
-> **Audience:** A future engineer who will implement the recommended phase.
-> **Scope:** What it would take to move RTP media *through* the device, what it
-> buys us, what it costs on an ESP32-S3, and a phased path that stays "fast and light".
-
----
-
-## 0. TL;DR (read this first)
-
-* **Today the server touches zero media.** SIP signalling (REGISTER / INVITE /
-  OK / BYE / the 777 echo and 999 all-page) flows through `RequestsHandler`, but
-  the actual G.711 audio streams **peer-to-peer (P2P)** between phones. The
-  server only rewrites/forwards SDP-bearing SIP messages; it never opens an RTP
-  socket. See `docs/ARCHITECTURE.md` and the `m=audio` / `enforceG711()` path in
-  `src/SIP/SipMessage.cpp` and `src/SIP/SipSdpMessage.cpp`.
-* **Recommended first phase: Music-on-Hold (MoH) player + RTP statistics.** It is
-  the lightest server-side RTP feature with the highest value-to-risk ratio. It
-  is a *transmit-mostly, single-direction* path that does not require a jitter
-  buffer or a mixer, and it proves out the RTP socket / packetiser / SDP-rewrite
-  plumbing that every later phase reuses.
-* **Realistic concurrent-stream ceiling on this hardware:** roughly
-  **4–6 relayed two-party calls (8–12 RTP streams)** on an S3 at 240 MHz with
-  Wi-Fi, *if* media handling is isolated on the otherwise-idle core (headless/
-  Ethernet builds) and packets bypass the SIP `_mutex`. **Conference mixing (999)
-  realistically caps at ~6–8 mixed participants** before the 20 ms deadline gets
-  tight. On a **display build the practical ceiling is ~half that**, because
-  Core 1 is reserved for LVGL.
-* **Single biggest risk:** **Wi-Fi half-duplex / airtime contention**, not CPU.
-  Relaying doubles every media packet (one in, one out) over a shared half-duplex
-  radio that is already carrying SIP, HTTP dashboard polling, and (on display
-  boards) nothing-to-spare. RTP is real-time and unforgiving: a few hundred ms of
-  added queueing delay or a burst of loss turns into audible glitches, and there
-  is no retransmit for UDP media.
+> **Status:** Originally a pre-implementation design exploration ("Proposed / exploration.
+> No code written yet"). **Server-side RTP has since been built — but not along the path this
+> document recommended.** §§0-1 and §3.5 have been rewritten to describe what shipped. The
+> cost analysis in §2 and the implementation sketch in §4 are preserved as the
+> **pre-implementation estimates they were**, and are labelled as such; they were never
+> re-measured against the shipped code.
+> **Audience:** An engineer extending the media path, or sizing a deployment.
 
 ---
 
-## 1. Why P2P today, and what RTP-through-server would unlock
+## 0. What actually ships today
 
-### 1.1 Why media is peer-to-peer today
+The server is no longer media-free. Three virtual extensions terminate media on the board,
+and one ordinary call path does not:
 
-The device is a **registrar + proxy/redirect-ish B2B-light signalling box**. When
-A calls B:
-
-1. A's INVITE (with SDP offering `m=audio <portA> RTP/AVP 0 8 101`) reaches the
-   server. The server enforces G.711 µ-law(0)/A-law(8)/telephone-event(101) via
-   `SipMessage::enforceG711()` and forwards the offer toward B.
-2. B answers 200 OK with its own SDP (`m=audio <portB> ...`). The server forwards
-   it back to A.
-3. **The `c=` connection address and `m=` port in each SDP point at the phones
-   themselves.** Once both sides have each other's `IP:port`, they stream RTP
-   directly. The server is out of the media path entirely.
-
-This is exactly why `PoolConfig.hpp` can say a `Session` "costs the server only
-signalling/bookkeeping RAM — not bandwidth or DSP." A session is ~200 B of state.
-It is the reason 8 concurrent calls fit on a plain ESP32. **The architecture is
-fast and light precisely because the server never sees a single audio packet.**
-
-### 1.2 What flowing RTP through the server would unlock
-
-| Capability | Why P2P can't do it | What server-side RTP enables |
+| Path | Does the board touch RTP? | Detail |
 | :--- | :--- | :--- |
-| **NAT traversal / media relay** | Two phones behind different NATs can't reach each other's `IP:port` directly. | Server becomes the rendezvous point (B2BUA media relay / TURN-like). Both phones send to the server; server forwards. |
-| **Call recording** | Audio never reaches the server. | Server can fork a copy of each RTP stream to flash/PSRAM/network. |
-| **Music-on-Hold (MoH)** | A phone on hold hears silence unless its own firmware plays a tone. | Server streams a stored G.711 clip to the held party. |
-| **Real conferencing / mixing for 999** | Today's 999 is a *fork-and-pick*: it forks INVITEs to everyone and the **first** to answer wins; the rest are CANCELed (see `onInvite`/`onOk` in `RequestsHandler.cpp`). It is a 1:1 call, not a conference. | Server mixes N decoded PCM streams (sum + clip) and sends each participant the mix-minus-self. True all-page / talk-back. |
-| **DTMF / announcements** | Phone-to-phone only. | Server can inject `telephone-event` (101) or play canned announcements ("all circuits busy", page chimes). |
-| **RTP statistics (jitter / loss / MOS)** | Server sees no media, so no quality telemetry. | Server can compute per-stream jitter, loss %, and an estimated MOS for the dashboard. |
+| **Ordinary extension → extension** | **No.** Pure peer-to-peer. | SDP is relayed; the `c=` connection line is **never** rewritten. Only the codec list is narrowed, by `SipMessage::filterAudioCodecs(/*allowWideband=*/true)`. |
+| **Hold / resume, park, blind & attended transfer, ring/hunt groups, pickup** | **No.** | Same property preserved deliberately — see `RequestsHandler.cpp:5449` ("Relay UNTOUCHED"), `ParkOrbit.cpp:117`, `CallForker.cpp:49`, `CallPickup.cpp:98`. |
+| **`777` echo test** | **No.** | It is an **SDP loopback**: the answer is the caller's own offer handed back (narrowed to PCMU), so the phone streams to its own address. `RequestsHandler.cpp:1228-1293`. A code comment elsewhere in the tree implying the server echoes the audio is wrong. |
+| **`440` tone** | **Yes — transmit only.** | `RtpSender` synthesizes a G.711 µ-law tone 20 ms at a time and sends it to the caller. Fixed server port `5062`. **One concurrent stream**; a second dial gets `486 Busy Here`. |
+| **`555` anchor bridge** | **Yes — both directions.** | `MediaBridge` pairs an `RtpReceiver`/`RtpSender` with an `AnchorClient`, decoding handset RTP into the anchor and draining the anchor's audio out of a `PlayoutBuffer`. `POCKETDIAL_MAX_ANCHOR_CALLS` = **1** (`PoolConfig.hpp:199-200`). Active on default firmware via the `LoopbackAnchorClient` reference implementation. |
+| **`888` meet-me conference** | **Yes — decode, mix, re-encode.** | `ConferenceRoom` owns one `MixBus`; each leg is its own `RtpReceiver`/`RtpSender`/`MediaBridge` trio on a bus port. `POCKETDIAL_CONF_LEGS` = **4** (`PoolConfig.hpp:175-176`), bounded by `MixBus::MAX_PORTS` = 8. No PIN, one global room. |
+| **Outbound trunk call** | **Yes — on the handset leg.** | Two legs. Handset ↔ board is ordinary **RTP** through `MediaBridge` in ANCHOR mode, which owns the handset-facing `RtpReceiver`/`RtpSender` pair (`MediaBridge.hpp:15-17`; `startBridge(handsetIp, handsetPort, …)` at `RequestsHandler.cpp:336`, `:2676`). Board ↔ carrier is the AnchorClient's chunked-HTTPS PCM16 stream — **not** RTP and **not** SIP. Same `POCKETDIAL_MAX_ANCHOR_CALLS` = 1 budget as `555`. |
 
-The high-value, low-cost subset is **MoH + RTP stats + announcements**. The
-high-cost subset is **relay** (NAT) and **mixing** (999 conference).
+**Codecs on server-terminated legs are PCMU only** — `buildMediaSdp()` emits a literal
+`m=audio <port> RTP/AVP 0` (`RequestsHandler.cpp:1536`), and each such leg admits a caller
+only if it offers narrowband (`offersSupportedAudio(/*allowWideband=*/false)`, e.g.
+`RequestsHandler.cpp:1931`), answering `488 Not Acceptable Here` otherwise. The `777` echo
+answer is narrowed by `filterAudioCodecs(/*allowWideband=*/false)`
+(`RequestsHandler.cpp:1292`). Relayed peer-to-peer legs admit PCMU, PCMA **and G.722**.
+
+### 0.1 Shipped modules
+
+The proposed `src/Media/` directory was never created; everything landed under `src/SIP/`:
+
+| File | Role |
+| :--- | :--- |
+| `src/SIP/RtpSender.{hpp,cpp}` | One-way RTP transmit: µ-law encode, tone synthesis, RTP header build, 20 ms pacing task. Optional `FrameProvider` lets a bridge supply frames instead of the tone. |
+| `src/SIP/RtpReceiver.{hpp,cpp}` | RTP receive + depacketize into a sink. |
+| `src/SIP/PlayoutBuffer.{hpp,cpp}` | The jitter-absorbing ring. Hard ceiling 1600 samples = **200 ms @ 8 kHz**; overrun drops oldest; underrun fills comfort noise. Tracks underruns/overruns. |
+| `src/SIP/MixBus.{hpp,cpp}` | The summing junction. Per-port rings, minus-self mix held in int32 and clipped exactly once on the way out. `FRAME` = 160 samples, `MAX_PORTS` = 8. |
+| `src/SIP/MediaBridge.{hpp,cpp}` | Anchors one call's LAN RTP to either an `AnchorClient` (ANCHOR mode) or a `MixBus` port (BUS mode). |
+| `src/SIP/ConferenceRoom.{hpp,cpp}` | Owns one `MixBus`, the per-leg transport, and the **single** 20 ms mix-tick driver. |
+
+> [!WARNING]
+> **No automated test has ever exercised any of this on-target.** The DSP/packetization
+> helpers are platform-independent and host-unit-tested, but the UDP socket and the FreeRTOS
+> pacing task are `#if defined(ESP_PLATFORM)`-only; off-target they compile to **host stubs**
+> (`RtpSender.cpp:589`, `RtpReceiver.cpp:416`). Every green media test in the suite —
+> `Rtp_test`, `RtpReceiver_test`, `MediaBridge_test`, `MixBus_test`, `PlayoutBuffer_test`,
+> `ConferenceRoom_test` — exercises a stub, not the radio.
+>
+> There is exactly **one** piece of real-hardware media evidence in the project: an outbound
+> trunk call from a Yealink T29 answered by a person **with two-way audio** (2026-09-13). That
+> call ran the handset leg through `RtpReceiver` / `RtpSender` / `MediaBridge` / `PlayoutBuffer`
+> on a real board, so it is genuine on-target proof of the **anchor-bridge shape** of this
+> media stack. It proves nothing about `440` or `888`: the tone sender's standalone path and
+> the whole `MixBus` / `ConferenceRoom` mixer have **never been run on hardware at all**.
+
+### 0.2 What is still absent
+
+The document below recommended **Music-on-Hold as Phase 1**. MoH was never built, and neither
+was recording, relay or announcement injection. Still absent today:
+
+* **Music-on-hold.** A held party hears whatever its own firmware plays.
+* **Call recording**, **RTP relay / NAT traversal**, **announcement injection**.
+* **RTP statistics.** Nothing computes or exposes jitter, loss or MOS. `PlayoutBuffer`'s
+  underrun/overrun counters exist but are not surfaced on the dashboard or in any API
+  response; `/api/status` carries no media quality fields.
+* **999 as a mixer.** `999` is still fork-and-pick — the INVITE goes to every registered
+  phone and the **first** to answer wins; the rest are CANCELed (`CallForker.cpp:59-62`).
+  The real N-way bridge is the separate `888` meet-me room.
 
 ---
 
-## 2. Hard ESP32-S3 reality check ("fast and light")
+## 1. Why P2P remains the default, and what server RTP unlocked
 
-### 2.1 The unit economics of one G.711 stream
+### 1.1 Why ordinary media is peer-to-peer
+
+The device is a registrar + proxy/redirect-ish B2B-light signalling box. When A calls B:
+
+1. A's INVITE (with SDP offering `m=audio <portA> RTP/AVP ...`) reaches the server. The
+   server narrows the codec list with `filterAudioCodecs()` and forwards the offer toward B.
+2. B answers `200 OK` with its own SDP (`m=audio <portB> ...`). The server narrows and
+   forwards it back to A.
+3. **The `c=` connection address and `m=` port in each SDP still point at the phones
+   themselves.** Once both sides have each other's `IP:port`, they stream RTP directly. The
+   server is out of the media path entirely.
+
+This is why `PoolConfig.hpp` can say a `Session` "costs the server only signalling/bookkeeping
+RAM — not bandwidth or DSP". A signalling session is ~200 B of state. **The ordinary call path
+is fast and light precisely because the server never sees an audio packet, and that has been
+preserved through every feature added since** — hold, park and transfer all relay SDP
+untouched apart from the codec list.
+
+### 1.2 What server-side RTP bought, and what it did not
+
+| Capability | Status |
+| :--- | :--- |
+| **Real conferencing / mixing** | **Shipped as `888`** (`ConferenceRoom` + `MixBus`), capped at 4 legs, one global room, no PIN. Note this is a *separate* extension — `999` was **not** converted; it is still fork-and-pick. |
+| **Server-sourced audio** | **Shipped as `440`** — a synthesized tone, transmit-only. This is the "media beachhead" the phased plan called Phase 1, but it is a test tone, not music-on-hold. |
+| **Bridging to an off-LAN party** | **Shipped as `555`** — `MediaBridge` in ANCHOR mode, one concurrent call. The far side is an `AnchorClient` over HTTPS/WebSocket, **not** an RTP relay and **not** a SIP trunk. |
+| **NAT traversal / media relay** | Not built. There is no B2BUA RTP relay and no rewriting of a peer-to-peer call's `c=` line. |
+| **Call recording** | Not built. |
+| **Music-on-Hold** | Not built. |
+| **DTMF / announcement injection** | Not built as a media feature. DTMF itself is carried as SIP INFO and as relayed `telephone-event`. |
+| **RTP statistics (jitter / loss / MOS)** | Not built (§0.2). |
+
+---
+
+## 2. ESP32-S3 cost analysis — PRE-IMPLEMENTATION ESTIMATES
+
+> [!IMPORTANT]
+> **Everything in §2 is an estimate made *before* any media code was written, and it has never
+> been re-measured against the shipped `RtpSender` / `MixBus` / `ConferenceRoom`.** The
+> unit-economics arithmetic (§2.1) is arithmetic and still correct. The concurrency ceilings
+> (§2.4) are educated guesses that were **never validated**; the shipped caps —
+> `POCKETDIAL_CONF_LEGS` = 4 and `POCKETDIAL_MAX_ANCHOR_CALLS` = 1 — are the numbers that
+> actually bound the firmware, and both were chosen conservatively for reasons documented in
+> `PoolConfig.hpp` rather than derived from the table below. Treat §2 as *why the caps are
+> low*, not as *what the hardware can do*.
+
+### 2.1 The unit economics of one G.711 stream (arithmetic — still valid)
 
 G.711 at 8 kHz, 20 ms ptime:
 
@@ -87,324 +135,317 @@ payload bitrate                             = 160 B × 50 × 8   = 64 kbit/s
 on-the-wire bitrate (one direction)         ≈ 200 B × 50 × 8   = 80 kbit/s
 ```
 
-So **one RTP stream = 50 pps, ~64 kbit/s payload (~80 kbit/s on the wire),
-each direction.** A two-party call is two streams each way.
+So **one RTP stream = 50 pps, ~64 kbit/s payload (~80 kbit/s on the wire), each direction.**
+A two-party call is two streams each way. The shipped 20 ms cadence and 160-sample frame
+match this exactly (`RtpSender::SAMPLES_PER_PKT` = 160, `MixBus::FRAME` = 160).
 
-### 2.2 Cost of a 2-party relay
+### 2.2 Estimated cost of a 2-party relay (never built)
 
-A relay receives a packet on socket A and re-sends it to B (and vice versa). Per
-two-party call:
+A relay receives a packet on socket A and re-sends it to B (and vice versa). Per two-party
+call:
 
 * **Packets:** 50 pps in + 50 pps out, per direction = **~200 pps of relay work**
   (100 in, 100 out) for a single bidirectional call.
-* **CPU:** Pure relay (no decode) is `recvfrom` → look up session → rewrite dest →
-  `sendto`. That's a few µs of work plus two syscalls crossing the LwIP stack.
-  The LwIP/socket path is the real cost, not arithmetic. Budget conservatively
-  **~30–60 µs of CPU per relayed packet** including the LwIP traversal; at 200 pps
-  that's ~6–12 µs/ms ≈ **0.6–1.2% of one core per call**. CPU is *not* the binding
-  constraint for pure relay.
-* **RAM:** A relay needs a small per-stream context (SSRC, last seq, remote
-  `IP:port`, stats counters) plus a jitter buffer if used (see §2.5). Without a
-  jitter buffer, ~200–400 B/stream. With a 60 ms jitter buffer of 160 B frames,
-  add ~480 B–1 KB/stream. This is static-pool territory (§4).
-* **Wi-Fi:** **This is the constraint.** Relaying *doubles* airtime: every audio
-  packet is received and re-transmitted over the same half-duplex radio. A
-  two-party relay = ~320 kbit/s of media airtime (4 × 80 kbit/s) plus 802.11
-  per-frame overhead (ACKs, inter-frame spacing, retries) that dwarfs the payload
-  at these tiny frame sizes. Small frames are *airtime-expensive*.
+* **CPU (estimate):** pure relay (no decode) is `recvfrom` → look up session → rewrite dest →
+  `sendto`. The LwIP/socket path is the real cost, not arithmetic. Budgeted conservatively at
+  **~30–60 µs of CPU per relayed packet**; at 200 pps that is ~6–12 µs/ms ≈ **0.6–1.2% of one
+  core per call**. CPU was not expected to be the binding constraint for pure relay.
+* **RAM (estimate):** ~200–400 B/stream without a jitter buffer; add ~480 B–1 KB/stream with a
+  60 ms buffer of 160 B frames.
+* **Wi-Fi:** **this was identified as the constraint.** Relaying *doubles* airtime: every
+  audio packet is received and re-transmitted over the same half-duplex radio. A two-party
+  relay ≈ 320 kbit/s of media airtime (4 × 80 kbit/s) plus 802.11 per-frame overhead that
+  dwarfs the payload at these tiny frame sizes. Small frames are airtime-expensive.
 
-### 2.3 Cost of an N-party mixer (the 999 conference)
+### 2.3 Estimated cost of an N-party mixer (shipped as `888`, capped at 4)
 
-A mixer must **decode** each incoming stream to 16-bit PCM, **sum** them, **clip**
-to int16, **re-encode** G.711, and send each participant the mix-minus-themselves.
+A mixer must **decode** each incoming stream to 16-bit PCM, **sum** them, **clip** to int16,
+**re-encode** G.711, and send each participant the mix-minus-self.
 
 ```
 per 20 ms frame, N participants:
   N × decode (G.711→PCM)        : 160 table lookups each  → cheap
-  build mix bus                 : sum N×80 int16 samples
+  build mix bus                 : sum N×160 int16 samples
   per participant: subtract self, clip, encode (PCM→G.711)
   N × sendto                    : N syscalls / 20 ms
 ```
 
-* **CPU:** Arithmetic is trivial (µ-law decode is a 256-entry LUT; encode is a
-  small branch). The cost is again **syscalls and the per-frame deadline**: all N
-  decodes + the mix + N encodes + N `sendto` calls must complete **every 20 ms**.
-  At N=8 that's 8 recv contexts + 8 sends every 20 ms = 800 pps of socket work on
-  one task, plus the mix math. Feasible but tightening.
-* **RAM:** mix bus (80 × int16 = 160 B) + per-participant jitter buffer. With
-  jitter buffers this is the dominant per-conference cost; budget ~1 KB ×
-  N.
-* **Hard limit:** the **20 ms wall clock**. If decode+mix+encode+send for all
-  participants ever exceeds 20 ms, you drop a frame and everyone hears a click.
-  Realistic mixed-participant ceiling: **~6–8** on a dedicated core; fewer if the
-  core also runs SIP.
+* **CPU:** arithmetic is trivial (µ-law decode is a LUT). The cost is **syscalls and the
+  per-frame deadline**: all N decodes + the mix + N encodes + N `sendto` calls must complete
+  **every 20 ms**.
+* **Hard limit:** the **20 ms wall clock**. Overrun it and you drop a frame and everyone hears
+  a click.
+* **Estimated ceiling at the time: ~6–8 mixed participants on a dedicated core.** **The
+  shipped cap is 4** (`POCKETDIAL_CONF_LEGS`), and `PoolConfig.hpp:169-177` gives the real
+  reason: a conference leg costs one `Session` slot, one RTP receive task, one RTP send task
+  and two `MixBus` rings (**~6 KB**) per participant, on top of the room's own mix-tick task.
+  Four legs is what comfortably fits the constrained node. Raise it only alongside
+  `POCKETDIAL_MAX_SESSIONS` and a look at free heap.
 
-### 2.4 Concurrent calls vs. the static pools and memory headroom
+One structural point from the original design **did** survive into the implementation and is
+worth keeping visible: **the mix tick is the master clock and there is exactly one of it.**
+Each leg's `RtpSender` runs its own 20 ms cadence, so hanging the mix tick off a sender would
+give N competing clocks draining the bus N times per frame. `ConferenceRoom::startDriver()`
+stands up one dedicated 20 ms driver for the whole room; a leg's sender only ever calls
+`MixBus::outputFrame()`.
 
-Per `docs/SCALING.md`, internal DRAM headroom after IDF + Wi-Fi is ~290–320 KB on
-a plain ESP32, and the existing pools cost ~37 KB. **The S3 has more SRAM and
-PSRAM**, but two hard facts dominate:
+### 2.4 Estimated concurrency ceilings — NEVER VALIDATED
 
-1. **IRAM is ~100% used today.** Any new code that wants to be in IRAM (for
-   speed / to run during cache misses) has essentially **no room**. RTP code must
-   live in flash-cached IRAM-less code paths, which means it is subject to
-   instruction-cache misses — acceptable for a 20 ms cadence, but it means the
-   hot loop must not be latency-sensitive at the microsecond level.
-2. **The session pool defaults to 8**, and each relayed/mixed stream needs its own
-   RTP context + (optionally) jitter buffer in a **new static pool** (§4). These
-   are not free like signalling sessions — a media session is ~1–2 KB, not 200 B.
+Per `docs/SCALING.md`, internal DRAM headroom after IDF + Wi-Fi was ~290–320 KB on a plain
+ESP32, and the existing pools cost ~37 KB. Two facts were expected to dominate:
 
-**Realistic ceilings (rule of thumb, conservative):**
+1. **IRAM was ~100% used**, so RTP code would have to live in flash-cached paths subject to
+   i-cache misses — acceptable at a 20 ms cadence, but the hot loop must not be
+   latency-sensitive at the microsecond level. *(This claim was true when written and has not
+   been re-checked against the current build.)*
+2. **A media session is ~1–2 KB, not the ~200 B of a signalling session.** This held up: the
+   shipped figure is ~6 KB of `MixBus` rings per conference leg plus two task stacks.
 
-| Build | Media core available | Relayed 2-party calls | 999 mixed participants |
+| Build | Media core available | Relayed 2-party calls | Mixed participants |
 | :--- | :--- | :---: | :---: |
-| Headless / Ethernet (S3) | Core 0 mostly free | **4–6** | **6–8** |
-| Display (JC3248W535) | Core 1 = LVGL only; share Core 0 | **2–3** | **3–4** |
+| Headless / Ethernet (S3) | Core 0 mostly free | *est.* 4–6 | *est.* 6–8 |
+| Display (JC3248W535) | Core 1 = LVGL only; share Core 0 | *est.* 2–3 | *est.* 3–4 |
 
-These are bounded first by **Wi-Fi airtime**, then by the **20 ms deadline**, then
-by RAM. Wired Ethernet builds (W5500/LAN8720) relax the airtime constraint
-substantially and are the only sensible target for serious relay/mixing.
+**These numbers were never measured.** Relay was never built at all, so its column is purely
+hypothetical. The mixer shipped with a flat cap of 4 legs on every build. They were bounded
+first by Wi-Fi airtime, then by the 20 ms deadline, then by RAM; wired Ethernet builds relax
+the airtime constraint substantially.
 
-### 2.5 Latency budget (jitter buffer adds delay)
+### 2.5 Latency budget
 
-Relaying/mixing adds delay on top of P2P:
+Server-terminated media adds delay on top of peer-to-peer:
 
 ```
 P2P one-way:        capture(20) + network + playout         ≈ 40–80 ms typical
-Relayed one-way:    capture(20) + net→server + server queue
-                    + jitter buffer(40–80) + net→peer + playout
-                    ≈ 100–180 ms
+Server-terminated:  capture(20) + net→server + server queue
+                    + playout buffer + net→peer + playout
+                    ≈ 100–180 ms  (estimate)
 ```
 
-A **jitter buffer is mandatory** for mixing (you can't sum frames that arrive at
-different times) and strongly recommended for relay over Wi-Fi (which reorders and
-bursts). A 40–80 ms buffer (2–4 frames) is the practical floor. **Every ms of
-buffer is a ms of added mouth-to-ear latency**, and the ITU-T G.114 comfort
-ceiling is ~150 ms one-way. Server relay eats a big chunk of that budget, which is
-another reason to **prefer P2P whenever possible** (§3b).
+The ITU-T G.114 comfort ceiling is ~150 ms one-way, so every ms of buffer matters. The
+shipped `PlayoutBuffer` enforces a **hard 200 ms ceiling** (1600 samples @ 8 kHz) with a
+target-depth drain holding steady state far lower — the header records that an earlier 1 s
+buffer "let mouth-to-ear delay balloon". This is another reason to **prefer peer-to-peer
+whenever possible**, which the ordinary call path still does.
 
 ---
 
-## 3. Architecture options
+## 3. Architecture options as they were evaluated — and what happened
 
-### (a) Pure relay / B2BUA — forward all RTP through the server
+### (a) Pure relay / B2BUA — **not built**
 
-The server terminates both media legs. It rewrites the SDP it sends to each phone
-so the `c=`/`m=` point at **the server's** relay IP and an allocated RTP port,
-instead of the far phone. Each phone thinks it is talking to the server; the
-server shuttles packets between the two legs.
+The server would terminate both media legs, rewriting the SDP it sends each phone so `c=`/`m=`
+point at the server. Rejected as the default then, and never built since: it doubles airtime
+for *every* call including ones that did not need it, adds latency to every call, and has the
+biggest blast radius if the media task stalls. **The shipped code never rewrites a
+peer-to-peer call's `c=` line.**
 
-* **Pros:** Solves NAT universally; enables recording, stats, and is the
-  foundation for mixing; centralises media policy.
-* **Cons:** Doubles airtime for *every* call (even ones that didn't need relay);
-  adds latency to *every* call; consumes a media-session pool slot + ports +
-  jitter buffer per call; biggest blast radius if the media task stalls.
-* **Feasibility on this MCU:** Feasible for a *small* number of calls on a
-  **wired** build. On Wi-Fi it is the riskiest option for the airtime reasons in
-  §2.2. **Do not make this the default** — it taxes the "fast and light" promise
-  on every call.
+### (b) Selective relay — **not built**
 
-### (b) Selective relay — relay only when P2P fails / NAT detected
+Default to P2P and insert the server only when needed (different subnets, unreachable private
+`c=`, or a policy flag). Judged the right way to ship relay *if* relay were ever needed. It
+was not: the device is primarily a same-LAN intercom and the NAT case has not come up.
 
-Default to P2P (today's behaviour). Only insert the server into the media path
-when it is actually needed: e.g. the two endpoints are on different subnets, an
-SDP `c=` is a private address unreachable from the peer, or a configured policy
-flag forces it. This is the ICE/TURN philosophy applied minimally.
+### (c) MoH player — **recommended first, never built**
 
-* **Pros:** Keeps the common case (same-LAN intercom — the device's primary use)
-  fully P2P and zero-cost. Pays the relay tax only when unavoidable.
-* **Cons:** Requires a heuristic for "do we need to relay?" (subnet compare on the
-  offered `c=` vs. the registrar's known client address is a cheap, good-enough
-  start). More signalling complexity in `onInvite`/`onOk`.
-* **Feasibility:** Good. This is the right way to ship relay *if* relay is needed
-  at all. But note: the device is primarily a same-LAN intercom, so the NAT case
-  may be rare — validate the need before building it.
+Transmit-only G.711 clip looped from flash/PSRAM to a held phone. This was the document's
+headline recommendation. What actually shipped first was the `440` **tone** — the same
+transmit-only shape (`RtpSender`), the same "prove the RTP pipe" purpose, but synthesized
+rather than played from a stored clip, and not wired to hold signalling. Music-on-hold remains
+absent; a held party hears whatever its own firmware plays.
 
-### (c) MoH player — stream a stored G.711 clip from flash/PSRAM (lightest, high value)
+### (d) Conference mixer — **built, but as `888`, not as `999`**
 
-When a call is put on hold (re-INVITE with `a=sendonly`/`a=inactive`, or a feature
-code), the server opens a *single transmit* RTP stream to the held phone and
-plays a pre-encoded G.711 clip looped from flash or PSRAM.
+The proposal was to replace fork-and-pick `999` with a true mixer. Instead a **new** virtual
+extension `888` was added with its own `MixBus`/`ConferenceRoom`, leaving `999` unchanged as
+the all-page broadcast. That is the better outcome: paging and conferencing are different
+features and `999`'s fork-and-pick semantics are what an all-page wants.
 
-* **Pros:** **Lightest possible server-side RTP.** Transmit-only: no jitter buffer,
-  no decode, no mixing, no inbound media to schedule. The clip is already G.711
-  (matches `enforceG711()`), so it is literally `read 160 bytes → packetise →
-  sendto` every 20 ms. Proves the entire RTP socket/packetiser/SDP-rewrite
-  pipeline that relay and mixing reuse. High perceived-quality win.
-* **Cons:** Need a stored clip (flash space; a 30 s µ-law loop ≈ 240 KB — store
-  in flash, optionally cache in PSRAM). Need to handle hold re-INVITE signalling.
-* **Feasibility:** **Excellent.** This is the recommended first phase.
-
-### (d) Conference mixer for 999
-
-Replace the fork-and-pick 999 with a true mixer: every answering phone joins a
-conference; the server mixes mix-minus-self and sends to each.
-
-* **Pros:** Makes 999 a real all-page/talk-back. High wow-factor for an intercom.
-* **Cons:** Most expensive option (§2.3): decode+mix+encode+send for all
-  participants every 20 ms, N jitter buffers, hard real-time deadline. Highest
-  risk of audio glitches under load.
-* **Feasibility:** Feasible at small N (~6–8) on a dedicated core, but it is the
-  last thing to build and should be gated behind measured headroom.
-
-### Recommended phased path
+### 3.5 What the phased plan said, and what actually happened
 
 ```
-Phase 1  ── MoH player (transmit-only) + RTP stats scaffolding   ← SHIP THIS FIRST
-            • lightest, proves the RtpEndpoint/socket/packetiser/SDP-rewrite plumbing
-            • single direction, no jitter buffer, no mixer
-Phase 2  ── RTP statistics on a (optional) receive path
-            • add an inbound RTP socket + jitter buffer + jitter/loss/MOS counters
-            • surface on the dashboard via the existing snapshot model
-Phase 3  ── Selective relay (option b), WIRED builds only by default
-            • reuse Phase-1 packetiser + Phase-2 jitter buffer
-            • gate behind subnet-mismatch heuristic; keep P2P as the default
-Phase 4  ── 999 conference mixer (option d), gated by measured headroom
-            • only after Phases 1–3 prove the scheduling model holds 20 ms
+PROPOSED                                    ACTUAL
+Phase 1  MoH player + RTP stats scaffolding  →  440 tone (RtpSender). No MoH. No stats.
+Phase 2  RTP stats on a receive path         →  RtpReceiver + PlayoutBuffer shipped;
+                                                stats never surfaced anywhere.
+Phase 3  Selective relay, wired-only         →  Never built. Instead: 555 anchor bridge
+                                                (MediaBridge + AnchorClient over HTTPS).
+Phase 4  999 conference mixer, gated         →  888 meet-me room (MixBus + ConferenceRoom),
+         behind measured headroom               capped at 4 legs. 999 unchanged. The
+                                                "measured headroom" gate did not happen —
+                                                the cap was chosen from a RAM budget, and
+                                                nothing has been measured on-target.
 ```
 
-**"Light enough to ship": Phase 1 (MoH).** Everything past Phase 2 should be
-opt-in at compile time and default to wired builds.
+The plan's *sequencing instinct* was right — transmit-only first, then receive, then
+bridging, then mixing — and that is the order things were built in. Its *feature* predictions
+were not: none of MoH, RTP statistics or relay exist, and the conference landed on a different
+extension.
 
 ---
 
-## 4. Implementation sketch
+## 4. Implementation sketch — AS ORIGINALLY PROPOSED
+
+> [!NOTE]
+> This section is the original pre-implementation sketch. The file layout it proposes does
+> **not** match the shipped code — see §0.1 for the real module list. It is kept for the
+> design reasoning (lock discipline, static allocation, task pinning), most of which the
+> implementation did follow.
 
 ### 4.1 Where it hooks in
 
+**Proposed:**
+
 ```
-src/SIP/RequestsHandler.cpp   ← session wiring: on hold re-INVITE / 999, start/stop media
-src/SIP/SipSdpMessage.*       ← SDP rewrite: point c=/m= at the server's relay IP:port
-src/SIP/SipMessage.cpp        ← already has enforceG711(); media layer trusts 0/8/101
-src/Media/RtpEndpoint.{hpp,cpp}   ← NEW: one UDP RTP socket + packetiser/depacketiser + stats
-src/Media/RtpRelay.{hpp,cpp}      ← NEW: pairs two RtpEndpoints (relay) or fans out (mixer)
-src/Media/MohPlayer.{hpp,cpp}     ← NEW (Phase 1): transmit-only G.711 clip looper
-src/Media/JitterBuffer.{hpp,cpp}  ← NEW (Phase 2): fixed-depth reordering buffer
+src/SIP/RequestsHandler.cpp   ← session wiring: start/stop media
+src/SIP/SipSdpMessage.*       ← SDP rewrite for server-terminated legs
+src/Media/RtpEndpoint.*       ← NEW: UDP RTP socket + packetiser/depacketiser + stats
+src/Media/RtpRelay.*          ← NEW: pairs two RtpEndpoints, or fans out
+src/Media/MohPlayer.*         ← NEW: transmit-only G.711 clip looper
+src/Media/JitterBuffer.*      ← NEW: fixed-depth reordering buffer
 ```
 
-New module lives under a new `src/Media/` directory so it is cleanly separable and
-compile-time excludable (`-DPOCKETDIAL_MEDIA=1`).
+**Actual:** no `src/Media/` directory; `RtpSender` / `RtpReceiver` / `PlayoutBuffer` /
+`MixBus` / `MediaBridge` / `ConferenceRoom` all live in `src/SIP/`. `RtpEndpoint` was split
+into separate send and receive classes; `RtpRelay` and `MohPlayer` were never written;
+`JitterBuffer` became `PlayoutBuffer`.
 
-### 4.2 SDP rewrite (the signalling half)
+### 4.2 SDP for server-terminated legs
 
-`SipSdpMessage` already parses `c=` (`getConnectionInformation()`), `m=`
-(`getMedia()`, `getRtpPort()`), and can replace the media line (`setMedia()`).
-For relay/MoH we add a `rewriteMediaTarget(serverIp, allocatedPort)` that:
-
-* replaces the `m=audio <port> ...` port with the server-allocated RTP port,
-* replaces (or inserts) the `c=IN IP4 <addr>` with the server's media IP,
-* leaves the `RTP/AVP 0 8 101` codec list intact (still G.711-enforced).
-
-The rest of the SDP is untouched. This is a string-splice in the existing
-`_messageStr`, consistent with how `enforceG711()` and `setMedia()` already work.
+The proposal was a `rewriteMediaTarget(serverIp, allocatedPort)` splice into the existing
+`_messageStr`. **What shipped instead** is `RequestsHandler::buildMediaSdp(serverIp, rtpPort,
+sendrecv)` (`RequestsHandler.cpp:1521-1540`), which constructs the server's **own** SDP body
+from scratch — `m=audio <port> RTP/AVP 0` plus `a=rtpmap:0 PCMU/8000` — rather than rewriting
+the caller's. Server RTP ports: `440` uses a fixed `5062` (`RtpSender.cpp`, `SERVER_RTP_PORT`);
+conference legs get theirs from `ConferenceRoom::rtpPortFor(callID)`.
 
 ### 4.3 Packet path
 
 ```
-PHASE 1 — MoH (transmit only):
-  [MohPlayer task] every 20 ms:
-     read 160 B from clip cursor (flash/PSRAM) → wrap in RTP (seq++, ts+=160, SSRC)
-     → sendto(held_phone_ip:port)            (no recv, no jitter buffer)
+440 tone (transmit only):
+  [RtpSender task] every 20 ms:
+     synthesize 160 µ-law samples (or pull from a FrameProvider)
+     → wrap in RTP (seq++, ts+=160, SSRC) → sendto(caller_ip:port)
 
-PHASE 3 — Relay:
-     recvfrom(legA_sock) → RtpEndpoint A depacketise → JitterBuffer A
-     20 ms tick: pop JB A → repacketise (rewrite SSRC/seq/ts) → sendto(legB)
-     (and symmetric B→A)
+555 anchor bridge (both directions):
+     RtpReceiver → MediaBridge::onHandsetRtp → decode → AnchorClient::writeAudio()
+     AnchorClient rx → MediaBridge::feedRx → PlayoutBuffer → RtpSender's FrameProvider
 
-PHASE 4 — Mixer (999):
-     for each leg: recvfrom → depacketise → decode µ-law→PCM16 → JitterBuffer
-     20 ms tick:
-        mixBus = Σ all legs' current PCM frame (saturating add, clip int16)
-        for each leg i: out_i = mixBus − frame_i  → encode PCM16→µ-law → sendto(leg_i)
+888 conference (decode / mix / re-encode):
+     per leg: RtpReceiver → MediaBridge (BUS mode) → MixBus::inputFrame(port)
+     one 20 ms driver tick: MixBus::tick() sums every active port in int32
+     per leg: RtpSender pulls MixBus::outputFrame(port) = the sum of every OTHER port,
+              clipped exactly once on the way out
 ```
 
-### 4.4 Jitter buffer (Phase 2+)
+### 4.4 Buffering
 
-Fixed-depth ring of N frames (default 3–4 = 60–80 ms). Ordered insert by RTP
-sequence number; pop one frame per 20 ms tick; conceal a missing frame by
-repeating the last (or emitting comfort-silence). Keep depth a compile-time
-constant so it lives in the static pool. **No dynamic resize on the hot path.**
+Proposed: a fixed-depth ring of 3–4 frames (60–80 ms), compile-time constant, no dynamic
+resize on the hot path. **Shipped as `PlayoutBuffer`**: a 1600-sample (200 ms) hard ceiling
+with a target-depth drain, overrun dropping oldest and underrun filling low-amplitude comfort
+noise, plus underrun/overrun counters (which nothing reads — §0.2).
 
-### 4.5 Static-allocation & threading model
+### 4.5 Static allocation & threading
 
-Consistent with the project's pool philosophy (`PoolConfig.hpp`, Issue #53):
+Proposed, and largely followed:
 
-* **New static pool** `_mediaPool` of `MediaSession` objects, sized by a new
-  `POCKETDIAL_MAX_MEDIA` knob (default small, e.g. **2** on Wi-Fi / **4** on
-  wired). Each holds its RtpEndpoint(s) + jitter buffer(s) + stats. Allocated at
-  boot; `reset()`-recycled like clients/sessions. An INVITE that needs media but
-  finds the media pool exhausted **falls back to P2P** (graceful) rather than 503.
-* **RTP ports** allocated from a fixed range (e.g. 10000–10000+2×MAX_MEDIA),
-  even ports for RTP per RFC 3550.
-* **Dedicated FreeRTOS task** `media_task`, **priority equal-or-just-below the SIP
-  receiver (5)**, driven by a 20 ms tick (or `recvfrom` with a 20 ms timeout):
-  * **Display build:** pin to **Core 0** (Core 1 is LVGL-only — do not touch it).
-    This shares Core 0 with HTTP/SIP, which is why the display ceiling is lower.
-  * **Headless/Ethernet build:** the existing scheme moves SIP to Core 1 and
-    leaves Core 0 freer; pin `media_task` to the core *not* running the SIP
-    receiver so media and SIP don't fight for the same core.
-* **Lock discipline:** media packets must **never** take the SIP `_mutex`. The
-  media task reads the far-end `IP:port` from an immutable per-session snapshot
-  captured at call-setup time (same spirit as the dashboard snapshot model).
-  Socket `sendto` happens on the media task, never inside the registrar lock —
-  identical to the existing Outbox pattern (Issue #24/#51).
+* **Bounded pools, not dynamic growth.** Shipped as `POCKETDIAL_CONF_LEGS` (4) and
+  `POCKETDIAL_MAX_ANCHOR_CALLS` (1); `RtpSender` and `RtpReceiver` each enforce a one-stream
+  cap internally, so a conference leg gets its own pair rather than sharing the `440` sender.
+* **No hot-path heap.** Shipped: the tone is synthesized 160 samples at a time into a fixed
+  member buffer; nothing is allocated per packet.
+* **Dedicated FreeRTOS tasks, pinned.** Shipped: `RtpSender`, `RtpReceiver` and
+  `ConferenceRoom`'s driver all use `xTaskCreatePinnedToCore`. On a display build Core 1 is
+  LVGL-only and must not be touched.
+* **Lock discipline: media packets must never take the SIP `_mutex`.** The media task reads
+  the far-end `IP:port` from an immutable per-session snapshot captured at call setup, and
+  `sendto` happens on the media task, never inside the registrar lock — the same spirit as the
+  existing Outbox pattern.
 
-### 4.6 Interaction with existing codec enforcement
+**Where the proposal was wrong:** a media-pool exhaustion was supposed to "fall back to P2P
+gracefully". It does not — the call is refused:
 
-The media layer **assumes G.711 0/8/101** because `enforceG711()` already
-guarantees it in every SDP answer. The packetiser is therefore fixed-format: 160 B
-payload, 20 ms, payload type 0 (µ-law) or 8 (A-law). DTMF (101) is passed through
-as `telephone-event` RTP events. No format negotiation logic is needed in the
-media path — a deliberate simplification that the existing signalling makes safe.
+* a second `440` while a tone stream is live → **486 Busy Here** (`RequestsHandler.cpp:1667`);
+* a fifth conference leg → **486 Busy Here**, "room full or media failed to start"
+  (`RequestsHandler.cpp:1788`);
+* a `555` while the single anchor bridge is in use → **503 Service Unavailable** with
+  `Retry-After`, deliberately *not* 486, because 486 would mean the called party is busy when
+  in fact every bridge slot is (`RequestsHandler.cpp:1956-1962`).
 
-### 4.7 Media-path diagrams: P2P vs relayed
+There is no P2P fallback for a server-terminated feature, because these features *are* the
+server media — there is no far phone to fall back to.
+
+### 4.6 Interaction with codec enforcement
+
+The proposal assumed `enforceG711()` guaranteed `0 8 101` in every answer, so the packetiser
+could be fixed-format with no negotiation logic. **`enforceG711()` is deprecated with no
+production callers.** The live guarantee comes from a different place and is narrower: the
+server builds its own PCMU-only SDP (`buildMediaSdp()`), and admits a caller onto a
+server-terminated leg only if it offers narrowband, answering `488 Not Acceptable Here`
+otherwise (`RequestsHandler.cpp:1216`, `:1931`). The practical effect the media layer depends on is the
+same — **server-terminated legs are PCMU, 160 B payload, 20 ms** — but relayed peer-to-peer
+legs are *not* so constrained: they may negotiate PCMA or G.722 between the phones, and the
+media layer never sees them.
+
+### 4.7 Media-path diagrams
 
 ```
-TODAY — Peer-to-peer (server out of media path):
+ORDINARY CALL — peer-to-peer (server out of the media path; still the default):
 
    Phone A ───── SIP (INVITE/OK) ─────► [ pocket-dial ] ◄───── SIP ───── Phone B
-        │                                  registrar/proxy                   │
-        │                                  (rewrites SDP only)                │
-        │                                                                     │
-        └──────────────── RTP G.711 (direct, 64 kbit/s ea way) ──────────────┘
+        │                                registrar/proxy                      │
+        │                         (narrows codec list; c= untouched)          │
+        └──────────────── RTP G.711 (direct, 64 kbit/s ea way) ───────────────┘
                           server NEVER sees these packets
 
 
-RELAYED (Phase 3) — server terminates both media legs:
+888 CONFERENCE — server terminates every leg:
 
-   Phone A ───── SIP ─────►┌──────────────────────────┐◄───── SIP ───── Phone B
-        │                   │       pocket-dial        │                      │
-        │                   │  RtpEndpoint A   B        │                      │
-        └─ RTP ────────────►│  recv→JB→repacketise→send│◄──────────── RTP ────┘
-            (to server)     │  (and symmetric B→A)     │   (to server)
-                            └──────────────────────────┘
-                          every packet crosses the radio TWICE (in + out)
+   Phone A ──RTP──►┌─────────────────────────────────┐◄──RTP── Phone B
+                   │           pocket-dial           │
+   Phone C ──RTP──►│  RtpReceiver ─► MediaBridge ─►  │◄──RTP── Phone D
+                   │         MixBus (int32 sum)      │
+                   │  RtpSender  ◄─ minus-self mix ◄─│
+                   └─────────────────────────────────┘
+                   one 20 ms tick drives the whole room; 4 legs max
+                   every packet crosses the radio TWICE (in + out)
 ```
 
 ---
 
-## 5. Risks and recommendation
+## 5. Risks — as assessed pre-implementation
 
-| Risk | Detail | Mitigation |
+> These were written before the media code existed. They still read as the right risk list,
+> but **none has been validated on-target**, because on-device RTP has never been exercised by
+> a test (§0.1).
+
+| Risk | Detail | Mitigation as shipped |
 | :--- | :--- | :--- |
-| **Wi-Fi half-duplex / airtime (BIGGEST)** | Relay doubles media airtime on a shared half-duplex radio; tiny 200 B frames are airtime-inefficient (802.11 overhead dominates). This — not CPU — caps concurrency. | Default to P2P; relay only selectively (option b); prefer wired (W5500/LAN8720) builds for relay/mixing; cap `POCKETDIAL_MAX_MEDIA` low on Wi-Fi. |
-| **Added latency** | Relay + jitter buffer adds 60–140 ms one-way, eating the G.114 150 ms budget. | Keep jitter buffer shallow (60–80 ms); never relay calls that work fine P2P. |
-| **CPU saturation → glitches** | The 20 ms deadline is hard. Missing it (cache miss storm, contention with LVGL/HTTP) = audible clicks; mixing is most exposed. | Dedicated `media_task` on a non-LVGL core; bound N; measure watermark before enabling Phase 4. |
-| **IRAM exhaustion** | IRAM is ~100% used; RTP code can't go in IRAM, so the hot loop runs from flash-cached code subject to i-cache misses. | Keep the per-frame loop small and branch-light; 20 ms cadence tolerates cache misses; do not add IRAM-hungry code. |
-| **RAM** | Media sessions are ~1–2 KB each (vs ~200 B signalling sessions); jitter buffers dominate. | Small static media pool; fall back to P2P on exhaustion, not 503. |
-| **Security — RTP injection** | An attacker who learns a session's `IP:port`/SSRC can inject forged RTP (audio injection, DoS). The existing SIP rate-limiter does not cover RTP ports. | Validate inbound RTP source against the negotiated peer `IP:port`; check SSRC continuity; apply a per-port packet-rate cap analogous to the SIP token bucket; only open relay ports for the duration of a call. |
-| **Conflicts with "fast and light"** | The whole value proposition is that the server is media-free. Relay/mixing inverts that. | Make all media features compile-time opt-in; ship MoH (which is cheap and obviously valuable) first; treat relay/mixing as wired-build, measured-headroom features. |
+| **Wi-Fi half-duplex / airtime (assessed BIGGEST)** | Server-terminated media doubles airtime on a shared half-duplex radio; tiny 200 B frames are airtime-inefficient. Expected to cap concurrency ahead of CPU. | Ordinary calls stay peer-to-peer; server media is confined to opt-in virtual extensions with hard caps (4 conference legs, 1 anchor call, 1 tone stream). Prefer wired builds for conferencing. **Not measured.** |
+| **Added latency** | Server-terminated media plus buffering eats the G.114 150 ms budget. | `PlayoutBuffer` hard ceiling 200 ms with a target-depth drain holding steady state lower. **Not measured.** |
+| **CPU saturation → glitches** | The 20 ms deadline is hard; mixing is most exposed. | One dedicated pinned mix-tick task per room; legs capped at 4. **Watermark never measured on-target.** |
+| **IRAM exhaustion** | IRAM was ~100% used, so the media hot loop runs from flash-cached code subject to i-cache misses. | The per-frame loop is small and branch-light; the 20 ms cadence tolerates cache misses. **Current IRAM headroom not re-checked.** |
+| **RAM** | Media sessions are ~1–2 KB each (estimate); shipped conference legs are ~6 KB of rings plus two task stacks. | Small fixed caps. Note there is **no graceful P2P fallback** — the call is simply refused (§4.5). |
+| **Security — RTP injection** | An attacker who learns a session's `IP:port`/SSRC can inject forged RTP. The SIP rate limiter does not cover RTP ports. | `440`'s port is **fixed at 5062**, which makes it the easiest target on the box. Validate inbound source against the negotiated peer, check SSRC continuity, and rate-cap per port — **verify against the current `RtpReceiver` before relying on any of this.** |
+| **Conflicts with "fast and light"** | The original value proposition was a media-free server. | Preserved where it matters: ordinary calls, hold, park and transfer are still 100% peer-to-peer. Server media is confined to features the user must explicitly dial. |
 
-### Recommendation
+---
 
-**Build Phase 1 (MoH player) first.** It is the only server-side RTP feature that
-is unambiguously worth it: it is light (transmit-only, no jitter buffer, no mixer),
-it delivers obvious user value (held callers hear music instead of silence), and
-it builds the exact `RtpEndpoint` / socket / packetiser / SDP-rewrite plumbing
-that every later phase reuses — so it de-risks the rest at the lowest cost.
+## 6. If you are extending this
 
-**Defer relay and mixing** until there is a demonstrated need (a real NAT
-deployment for relay; a real all-page-talk-back requirement for mixing), and when
-built, make them **opt-in and wired-build-first**. For a same-LAN intercom — the
-device's primary mission — P2P media remains the right default, and keeping it
-that way is what keeps the device fast and light.
+1. **Measure something on-target first.** The single largest gap in this document is that
+   every performance number in it is an estimate and every media test is a host stub. A real
+   4-leg `888` conference on a real board, with a scope on the frame deadline, would be worth
+   more than any further design work.
+2. **Do not break the peer-to-peer property of the ordinary call path.** It is what makes 8
+   concurrent calls fit. Hold, park and transfer preserved it deliberately; anything new
+   should too.
+3. **Music-on-hold is still the cheapest unbuilt win** and the `RtpSender::FrameProvider` hook
+   it needs already exists — a held party currently hears silence.
+4. **RTP statistics are nearly free.** `PlayoutBuffer` already counts underruns and overruns;
+   nothing surfaces them. Adding them to `/api/status` would give the dashboard its first
+   media-quality signal.
+
+**Related:** [CONFERENCE_MIXER.md](CONFERENCE_MIXER.md) ·
+[PHONE_COMPATIBILITY.md](PHONE_COMPATIBILITY.md) · [SCALING.md](SCALING.md) ·
+[ARCHITECTURE.md](ARCHITECTURE.md)

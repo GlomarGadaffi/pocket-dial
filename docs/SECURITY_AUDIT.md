@@ -7,6 +7,45 @@
 
 ---
 
+> [!CAUTION]
+> **This is a point-in-time record. It is not a description of the firmware as it ships today.**
+>
+> | | |
+> |---|---|
+> | Originally written | 2026-06-01, against commits `8be61da` / `f919178` |
+> | Partially amended | 2026-09-03 (`e631fc2`) — SEC-04 re-marked Resolved, registrar modes + CSRF |
+> | Banner added | 2026-09-13, HEAD `fbad51b` |
+> | Re-audited since? | **No.** No fresh security audit has been run against the current tree. |
+>
+> **Read these four corrections before acting on anything below.**
+>
+> 1. **The "dark by default" HTTP transport in SEC-04's remediation table is GONE
+>    (`de1a36e`, 2026-09-13).** The dashboard listen socket is always bound and the
+>    dashboard is **always reachable**. There is no `*4887` star code, no DTMF-opened
+>    admission window, and no grace period — those mechanisms were deleted, not
+>    merely defaulted off. That table row is struck through in place below. Any
+>    operator procedure that says "reopen the web UI with a star code" is wrong and
+>    will waste your time on a device that is already listening.
+> 2. **The admin credential is a username + password, not a PIN.** `AdminAuth` ships
+>    a default `admin`/`admin` with a *forced* first-use change (`AdminAuth::needsInitialSetup()`,
+>    gated in [HttpServer.cpp:1868](../src/Helpers/HttpServer.cpp#L1868)); the routes are
+>    `POST /api/admin/set-credential` ([HttpServer.cpp:668](../src/Helpers/HttpServer.cpp#L668))
+>    and `POST /api/admin/login` ([HttpServer.cpp:678](../src/Helpers/HttpServer.cpp#L678)).
+>    A **separate** numeric DTMF PIN still exists for the phone-keypad admin menu
+>    (`*PIN#code`); it is unrelated to the web session and unlocks no HTTP.
+> 3. **INVITE *is* now independently challenged in Secure mode** — the residual-risk
+>    paragraph under SEC-04 that says otherwise is stale. See
+>    [RequestsHandler.cpp:1195-1206](../src/SIP/RequestsHandler.cpp#L1195-L1206).
+> 4. **The shipped default registrar mode is still `open`.** A fresh board accepts any
+>    REGISTER and any INVITE until an operator changes `reg_mode`. Digest auth and the
+>    Learn-mode TOFU/ARP MAC-lock are implemented; they are simply not on by default.
+>
+> Line numbers quoted throughout this document predate the decomposition of
+> `RequestsHandler` into `CallForker` / `CallPickup` / `ParkOrbit` / `BlfSubscriptions` /
+> `DtmfFeatureCodes` / `CdrRing` and are stale unless a correction note says otherwise.
+
+---
+
 ## Executive Summary
 
 This security audit and threat model report evaluates the network-facing and local attack surfaces of the **pocket-dial** ESP32 PBX firmware codebase (`GlomarGadaffi/pocket-dial`). The primary objectives are to analyze entry points, assess the robustness of parsers, review access control mechanisms, and classify findings using CVE-class severity ratings and CVSS v3.1 scoring vectors.
@@ -188,16 +227,43 @@ Because Flash Encryption is disabled by default, an attacker with physical acces
 
 | Plane | Shipped control |
 |---|---|
-| HTTP admin | Admin PIN + server-side session (128-bit token, `HttpOnly`/`SameSite=Strict` cookie) on every mutating endpoint; per-client brute-force lockout with exponential backoff and an aggregate backstop; per-session CSRF token required in `X-CSRF`; same-origin checking; security response headers. All admission decisions go through one `HttpServer::requireAdmin()`. |
-| HTTP transport | **Dark by default**: on a provisioned device the listen socket is not bound at all except inside a bounded window opened by a source-IP-verified DTMF code, a fresh-provisioning grace period, or an authenticated keepalive. An attacker usually cannot even reach the login endpoint. |
+| HTTP admin | Admin credential + server-side session (128-bit token, `HttpOnly`/`SameSite=Strict` `pd_session` cookie) on every mutating endpoint; per-client brute-force lockout with exponential backoff and an aggregate backstop; per-session CSRF token required in `X-CSRF`; same-origin checking; security response headers. All admission decisions go through one [`HttpServer::requireAdmin()`](../src/Helpers/HttpServer.cpp#L1828). |
+| HTTP transport | ~~**Dark by default**: on a provisioned device the listen socket is not bound at all except inside a bounded window opened by a source-IP-verified DTMF code, a fresh-provisioning grace period, or an authenticated keepalive. An attacker usually cannot even reach the login endpoint.~~ |
 | SIP registrar | Digest authentication (RFC 2617, MD5, `qop=auth`) challenging `REGISTER`, with runtime-selectable `open` / `learn` / `secure` modes and a per-extension HA1 secret store. |
 
-Residual risk, stated plainly: the **first-run window is still open by design** (a
-factory-fresh device has no credential, so onboarding stays possible — THREAT_MODEL §5.1);
-the registrar's **default mode is still `open`**, so the digest control protects only
-deployments that switch to `secure`; **INVITE is not independently challenged** in the
-current phase; and the stored HA1 is a bearer credential at rest, which is what makes
-SEC-03's flash-encryption fix matter. See [THREAT_MODEL.md](THREAT_MODEL.md) §5 and §9.
+> [!IMPORTANT]
+> **Correction, 2026-09-13 — the "HTTP transport" row above is obsolete and is struck
+> through for that reason.** The dark-by-default listener was removed in `de1a36e`
+> ("the dashboard must always be reachable, not dark-by-default once provisioned").
+> There is no unbound-listener state, no `grantAdminHttpGraceWindow`, and no `*4887`
+> star code anywhere in `src/` — grep confirms zero hits. **The listener is always
+> bound and the dashboard is always reachable on a provisioned device.**
+>
+> What this means for the threat model: the login endpoint is now always exposed to
+> anyone with link-layer reach, so the *entire* HTTP-plane defence is the credential,
+> the session cookie, the CSRF token and the lockout — the "attacker usually cannot
+> even reach the login endpoint" mitigation no longer applies and must not be counted
+> in any residual-risk calculation made from this document.
+>
+> Also corrected in that row: the credential is a **username + password** (`AdminAuth`),
+> not a PIN. The numeric PIN that still exists is the *DTMF* PIN for the phone-keypad
+> admin menu (`*PIN#code`) and grants no HTTP access.
+
+Residual risk, stated plainly *(as amended 2026-09-13)*: the **first-run window is still
+open by design** — a factory-fresh device ships `admin`/`admin` with a forced change on
+first use, so onboarding stays possible (THREAT_MODEL §5.1); the registrar's **default
+mode is still `open`**, so the digest control protects only deployments that switch it;
+and the stored HA1 is a bearer credential at rest, which is what makes SEC-03's
+flash-encryption fix matter. See [THREAT_MODEL.md](THREAT_MODEL.md) §5 and §9.
+
+> [!NOTE]
+> **No longer residual:** this paragraph previously read "INVITE is not independently
+> challenged in the current phase". That gap has since been closed — in Secure mode the
+> INVITE is challenged with the same digest machinery as REGISTER, verified against the
+> `INVITE` method taken from the request line
+> ([RequestsHandler.cpp:1195-1206](../src/SIP/RequestsHandler.cpp#L1195-L1206)). Learn
+> mode keeps TOFU semantics and Open mode still never challenges — which, given that
+> Open is the shipped default, is the part that actually matters on a fresh board.
 
 #### Original remediation guidance (historical)
 1. **HTTP Authentication:** Implement standard HTTP Basic Authentication or token-based session cookies for all web endpoints.
