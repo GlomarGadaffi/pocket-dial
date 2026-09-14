@@ -955,6 +955,65 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	endHandle(fromNumber, response);
 }
 
+// ── Capability advertisement (issue #199, root cause 2) ──────────────────────
+// Until this landed, no code in src/ ever emitted Allow:, Supported: or Accept:.
+// Two concrete consequences, both of which make a correctly-implemented phone
+// refuse to use machinery this PBX already has:
+//   * RFC 3311 §5.1 — a UA MUST NOT send an UPDATE unless the peer advertised
+//     UPDATE in an Allow header. onUpdate() has handled hold/resume and bodiless
+//     session-timer keep-alives all along; no phone would ever reach it.
+//   * RFC 3891 §4 — a UA only offers a Replaces-based attended transfer when the
+//     peer advertised "replaces" in Supported. onRefer()'s ?Replaces= splice
+//     (issue #131) was likewise unreachable from a spec-abiding phone.
+//
+// EVERY entry below is something this PBX genuinely dispatches. Over-claiming is
+// the exact failure #199 is about, so the lists are derived from initHandlers()
+// (:582-601) plus the one method handled ahead of the table, and nothing else.
+namespace
+{
+	// The request methods initHandlers() registers — REGISTER, OPTIONS, CANCEL,
+	// INVITE, ACK, BYE, REFER, UPDATE, MESSAGE, SUBSCRIBE — plus INFO, which
+	// handle() answers before the handler table (RFC 6086 §4.2.1) and routes to
+	// the DTMF collector. The other table entries (TRYING/RINGING/BUSY/
+	// UNAVAILABLE/OK/FINAL_FAILURE/REQUEST_TERMINATED) are RESPONSE keys, not
+	// methods, and have no business in Allow.
+	//
+	// Deliberately absent: PRACK (no handler — so 100rel must not be claimed
+	// either), NOTIFY (BlfSubscriptions SENDS them; nothing accepts one) and
+	// PUBLISH. A phone that saw those here would wait on replies we never send.
+	constexpr const char* kAllowedMethods =
+		"INVITE, ACK, CANCEL, BYE, OPTIONS, REGISTER, INFO, MESSAGE, REFER, "
+		"SUBSCRIBE, UPDATE";
+
+	// Option tags, RFC 3261 §20.37. "replaces" only.
+	//
+	// NOT "timer": docs/FEATURE_ROADMAP.md calls the RFC 4028 support "passive —
+	// honours a timer a phone requests, but never requests one itself and never
+	// sends 422/Min-SE". §5 and §6 make Min-SE processing and the 422 response
+	// mandatory for an entity that advertises the extension, and neither exists
+	// here (getMinSESecs() has no caller), so advertising it would be a lie.
+	// NOT "100rel" (RFC 3262 needs PRACK), "norefersub", "path", "gruu" or
+	// "outbound" — none of them have any implementation in this codebase.
+	constexpr const char* kSupportedOptionTags = "replaces";
+
+	// Body types this PBX actually parses: SDP on INVITE/re-INVITE/UPDATE/ACK,
+	// and the DTMF relay body handle() looks for on INFO. onMessage() does not
+	// interpret its body at all (RequestsHandler.cpp:3940-3944), so no MESSAGE
+	// content type is claimed — under-claiming is the safe direction here.
+	constexpr const char* kAcceptedBodyTypes = "application/sdp, application/dtmf-relay";
+}
+
+void RequestsHandler::addCapabilityHeaders(SipMessage& response) const
+{
+	response.addHeader("Allow", kAllowedMethods);
+	response.addHeader("Supported", kSupportedOptionTags);
+	response.addHeader("Accept", kAcceptedBodyTypes);
+	// RFC 6665 §4.4.1: a UA that accepts SUBSCRIBE advertises its packages.
+	// BlfSubscriptions::onSubscribe() implements exactly one, the RFC 4235
+	// "dialog" package, and 489s anything else (BlfSubscriptions.cpp:145-154).
+	response.addHeader("Allow-Events", "dialog");
+}
+
 void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 {
 	auto response = getMessageFromPool(*data);
@@ -964,6 +1023,10 @@ void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	response->setContact(buildContact(data->getFromNumber()));
+	// OPTIONS is THE capability-discovery method (RFC 3261 §11.2: a 200 OK to it
+	// SHOULD carry Allow/Accept/Supported), and it is the one a phone polls as a
+	// keep-alive — so this is where the advertisement costs nothing and is read.
+	addCapabilityHeaders(*response);
 	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
@@ -5603,10 +5666,70 @@ void RequestsHandler::armSessionTimer(Session* session,
 {
 	uint32_t secs = ok200->getSessionExpiresSecs();
 	if (secs == 0) return;
-	auto ref = ok200->getSessionExpiresRefresher();
-	bool weRefresh = (ref == "uas");
-	session->armSessionTimer(secs, weRefresh, std::chrono::steady_clock::now());
+
+	// Capture the dialog From/To FIRST, before any decision about the reaper.
+	// sweepSessionTimers() and the #72 guard at the bottom of this file both read
+	// getDialogFrom()/getDialogTo(), and attended transfer reads them to address
+	// its cross re-INVITEs — none of that is conditional on a timer being armed,
+	// so hoisting this above the early return below keeps it unconditional.
 	session->setDialogHeaders(std::string(ok200->getFrom()), std::string(ok200->getTo()));
+
+	// ── Who is the refresher? (RFC 4028 §7.4) ────────────────────────────────
+	// The refresher parameter on a 2xx names ONE OF THE TWO UAs of the session:
+	// "uas" is the party that ANSWERED the INVITE (the callee, whose 200 OK this
+	// is), "uac" is the party that SENT it. It never names an intermediary.
+	//
+	// The orientation at this call site is not the obvious one, so spell it out.
+	// This PBX does not re-originate calls on the ordinary call path: onInvite()
+	// clones the CALLER's INVITE, rewrites only Contact, and forwards it
+	// (RequestsHandler.cpp:1578-1581); CallForker::forkInvite does the same for a
+	// ring group (CallForker.cpp:22-50). From/To/Call-ID/CSeq stay the caller's
+	// end to end, and this handler is only ever reached from onOk()'s generic
+	// relay branch (:3408) — every path where the server really is the UAC
+	// (register beep, park, attended-transfer splice, inbound anchor) is
+	// intercepted earlier in onOk() at :3197/:3205/:3213/:3226 and never gets
+	// here. So on this leg the UAC is the CALLER'S PHONE and the UAS is the
+	// CALLEE'S PHONE. The PBX is neither, and therefore is never the refresher.
+	//
+	// The old `weRefresh = (ref == "uas")` asserted the PBX was the refresher in
+	// exactly the case where the header designates the CALLEE — the opposite of
+	// what it reads — and it is the wrong question besides. It was inert only
+	// because _isRefresher has no consumer that generates anything: nothing in
+	// this firmware has ever sent a refreshing re-INVITE or UPDATE
+	// (Session::getNextRefresh() has zero call sites).
+	const auto ref = ok200->getSessionExpiresRefresher();
+	const bool calleeRefreshes = (ref == "uas");
+	const bool callerRefreshes = (ref == "uac");
+	constexpr bool kPbxIsRefresher = false;   // derivation above
+
+	// ── Only arm a reaper we can actually expect to be fed ───────────────────
+	// RFC 4028's UAS rules require a 2xx that carries Session-Expires to carry a
+	// refresher parameter too (section number deliberately omitted — §7.4 is
+	// cited above only for what the parameter MEANS, which is the part this
+	// change turns on). When the parameter is absent, nobody has been made
+	// responsible for refreshing, so no refresh is owed and the only thing this
+	// timer can ever do is BYE a healthy call.
+	//
+	// That is not hypothetical: this PBX builds most responses by cloning the
+	// REQUEST (getMessageFromPool(*data) + setHeader), so its own 200 OK echoes
+	// the caller's Session-Expires back with no refresher added — see the real
+	// pjsip capture in tests/interop/.logs/pjsua-A.log (the PBX's 200 OK on the
+	// 777 leg comes back carrying pjsua's own Session-Expires/Min-SE, and pjsua
+	// then has to pick a refresher itself). A callee that answers the same way
+	// lands the same header here.
+	//
+	// Declining to arm is the safe direction: the worst case is that a dead
+	// dialog lingers until the ordinary BYE/CANCEL or the no-answer and orphan
+	// sweeps in tick() clear it, whereas arming wrongly hangs up a live call.
+	if (!calleeRefreshes && !callerRefreshes)
+	{
+		queueLog("[session timer] Session-Expires with no refresher parameter "
+		         "(RFC 4028 §7.4) — reaper not armed for " +
+		         std::string(ok200->getCallID()));
+		return;
+	}
+
+	session->armSessionTimer(secs, kPbxIsRefresher, std::chrono::steady_clock::now());
 }
 
 void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point now)
@@ -5617,6 +5740,42 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 		if (session->getSessionExpiresSeconds() == 0) continue;
 		const auto st = session->getState();
 		if (st != Session::State::Connected && st != Session::State::Held) continue;
+
+		// Never reap a session whose refresh we would REFUSE. This guard mirrors
+		// the virtual/missing-peer early return in onReinvite() (:5485) and
+		// onUpdate() (:5585) deliberately: those answer 488 Not Acceptable Here
+		// and return ABOVE their re-arm (:5520 / :5607), so for any dialog in that
+		// set a refresh arrives, is refused, and never touches the expiry clock —
+		// after which the sweep below BYEs a call that is perfectly healthy. The
+		// set we refuse to refresh and the set we refuse to reap must stay
+		// identical or that asymmetry comes straight back.
+		//
+		// arming alone cannot prevent this. armSessionTimer() only runs from
+		// onOk()'s relay branch (:3408), where dest was just resolved to a
+		// REGISTERED client — so every armed session starts serviceable and can
+		// only become unserviceable later. The verified way that happens today is
+		// the DTMF feature codes: *69 (DtmfFeatureCodes.cpp:263) and *11 (:286)
+		// take the caller's LIVE session and setDest() a per-session dummy peer
+		// numbered "777" to reroute its RTP to the echo loopback. From that digit
+		// on, the dialog is in onReinvite's 488 set while still being a real,
+		// connected two-party call with an armed reaper — issue #198's spurious
+		// hang-up, reachable with no anchor, no trunk and no transfer.
+		//
+		// The `!src || !dest` half is defensive: no current path unsets a leg on a
+		// Connected session (the attended-transfer splice deliberately leaves both
+		// in place — see Session::wasTransferorSrc()'s comment — and park builds a
+		// FRESH session rather than mutating the connected one, ParkOrbit.cpp:66-69).
+		// Nothing here is leaked: ordinary BYE handling, the anchor ACK/no-answer
+		// reaper and the park sweep in tick() already own these teardowns.
+		auto sweepSrc  = session->getSrc();
+		auto sweepDest = session->getDest();
+		const std::string sweepDestNum = sweepDest ? sweepDest->getNumber() : "";
+		if (!sweepSrc || !sweepDest ||
+			sweepDestNum == "777" || sweepDestNum == ConferenceRoom::EXT ||
+			sweepDestNum == kAnchorCallExt)
+		{
+			continue;
+		}
 
 		if (now >= session->getSessionExpiry())
 		{

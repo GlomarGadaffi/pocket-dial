@@ -76,6 +76,17 @@ add_executable(sip_parser_tests
     # gets a BYE for the dialog it was on (not just that the target gets an
     # INVITE).
     BlindTransfer_test.cpp
+    # Issue #198: RFC 4028 session timers. Pins the arming DECISION (a 2xx with
+    # Session-Expires but no refresher parameter obliges nobody, so arming a
+    # reaper could only ever produce a spurious BYE) and the OPTIONS capability
+    # advertisement. The negative assertions are the load-bearing ones: Supported
+    # must NOT claim "timer" while Min-SE/422 handling is absent, which is the
+    # over-claiming failure class issue #199 exists to document.
+    SessionTimer_test.cpp
+    # Issue #191: /api/kill used to hand-roll its form parse, swallowing every
+    # parameter after "extension=" and never URL-decoding. Pins the shared
+    # getFormParam() boundary semantics it now uses.
+    ApiKillParse_test.cpp
     # Issue #131: attended transfer (REFER + Replaces, RFC 3891), ported from
     # drawbridge. Splices two live P2P sessions via cross re-INVITEs carrying
     # swapped SDP, then drops the transferor. Drives two direct calls through

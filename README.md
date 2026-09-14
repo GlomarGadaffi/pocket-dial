@@ -93,11 +93,28 @@ Full instructions: **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** ·
 
 ### Call control
 Blind transfer (REFER) · attended transfer (REFER with Replaces) · hold and resume
-· RFC 3311 UPDATE · RFC 4028 session timers · call park to orbits `700`–`709` ·
-group pickup `*8` and directed pickup `**<ext>` · ring groups (ring-all or
-sequential hunt) · call forward on always / busy / no-answer · per-extension DND ·
-paging zones `980`–`989` and `999` all-page · busy-lamp-field presence
-(`SUBSCRIBE`/`NOTIFY`, RFC 4235 dialog events) · DTMF star codes over SIP INFO.
+· RFC 3311 UPDATE (answered; advertised on `OPTIONS` only) · RFC 4028 session
+timers (passive) · call park to orbits `700`–`709` · group pickup `*8` and
+directed pickup `**<ext>` · ring groups (ring-all or sequential hunt) · call
+forward on always / busy / no-answer · per-extension DND · paging zones
+`980`–`989` and `999` all-page · busy-lamp-field presence (`SUBSCRIBE`/`NOTIFY`,
+RFC 4235 dialog events) · DTMF star codes over SIP INFO.
+
+Two of those need an asterisk before you design around them:
+
+- **Session timers are passive.** The board honours a `Session-Expires` a phone
+  asks for and drops the call when it lapses, but it never requests one itself and
+  never answers `422`/`Min-SE`. It deliberately leaves `timer` out of its
+  `Supported` header, because RFC 4028 §5–6 make `Min-SE` handling and the `422`
+  mandatory for anything that claims the extension. A phone that asks for no timer
+  gets no dead-peer detection from the board.
+- **UPDATE is answered, but only advertised on `OPTIONS`.** `onUpdate` handles
+  both the bodiless session-timer refresh and an SDP re-offer. The board lists
+  `UPDATE` in the `Allow` header of its `OPTIONS` response — the one place it
+  advertises its own capabilities — while the `180`/`200` that set up an ordinary
+  call are relayed from the far phone and carry *that* phone's `Allow` instead.
+  RFC 3311 §5.1 lets a phone send `UPDATE` only once it has seen it advertised, so
+  this path belongs to phones that poll `OPTIONS` or that send it unprompted.
 
 ### Routing
 A bounded, ordered dial plan maps a dialled pattern to an action:

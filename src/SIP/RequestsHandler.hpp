@@ -543,6 +543,20 @@ private:
 	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);
 	void sweepSessionTimers(std::chrono::steady_clock::time_point now);
 
+	// Stamps Allow / Supported / Accept / Allow-Events onto an outgoing response
+	// (issue #199 root cause 2). The lists are compiled from initHandlers() and
+	// are deliberately conservative — see the comment block above the definition
+	// in RequestsHandler.cpp for why "timer" and "100rel" are NOT claimed.
+	//
+	// Currently called only from onOptions(), the capability-discovery method.
+	// The server-terminated INVITE responses (777 echo, 440 tone, 888 conference,
+	// 555 anchor, park ring-back, and CallForker's group 180s) each build their
+	// own 180/200 and would each need their own call; the ordinary call path
+	// RELAYS the far phone's 180/200 and must keep advertising that phone's
+	// capabilities, not ours. Adding those is a per-site follow-up, not a
+	// one-line sweep.
+	void addCapabilityHeaders(SipMessage& response) const;
+
 	// Call parking / park-orbit: the orbit FSM lives in ParkOrbit (see
 	// ParkOrbit.hpp). Guarded by _mutex.
 	ParkOrbit _park{*this};

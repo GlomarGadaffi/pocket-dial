@@ -37,7 +37,8 @@
 #endif
 
 // Forward declarations for the file-local form/URL helpers (defined lower down).
-// sendApiDnd() uses getFormParam() but is defined earlier in this TU.
+// sendApiDnd() and sendApiKill() use getFormParam() but are defined earlier in
+// this TU — this declaration is what lets them, so no reordering is needed.
 static std::string getFormParam(const std::string& body, const std::string& key);
 
 // Path-shape parsers for the two PUT/POST telephony-config routes, which (unlike
@@ -1057,17 +1058,34 @@ void HttpServer::sendApiStatus(int sock)
 
 void HttpServer::sendApiKill(int sock, const std::string& body)
 {
-	// Parse "extension=XXXX" from the body
-	std::string ext;
-	std::string prefix = "extension=";
-	size_t pos = body.find(prefix);
-	if (pos != std::string::npos)
-	{
-		ext = body.substr(pos + prefix.size());
-		// Trim whitespace / newlines
-		while (!ext.empty() && (ext.back() == '\r' || ext.back() == '\n' || ext.back() == ' '))
-			ext.pop_back();
-	}
+	// Issue #191: this used to hand-roll the parse — a bare body.find("extension=")
+	// followed by a substr() to the end of the body — and so reproduced, one for
+	// one, every defect getFormParam() exists to prevent:
+	//
+	//   1. find() matched a key that merely ENDS in "extension", so a body of
+	//      "myextension=999&extension=101" disconnected 999 and left the jack the
+	//      operator actually clicked still up. This is exactly the bug class the
+	//      helper's own boundary check carries the scar of (see getFormParam's
+	//      comment below): searching for "on=" inside "extension=101&on=1" hit the
+	//      "n=" of "extensio[n=]101", and DND silently inverted.
+	//   2. the substr() ran to the END of the body rather than to the next '&',
+	//      so "extension=101&reason=test" yielded ext = "101&reason=test" — a
+	//      string no registered client can ever equal, i.e. a kill that matched
+	//      nothing while still answering 200.
+	//   3. no URL-decoding at all, so a percent-encoded extension was compared
+	//      literally. isValidAor admits '*' and '#' (park orbits, page zones, the
+	//      *8 group-pickup code — see PbxConfig.hpp), and those reach a form body
+	//      as escapes from any conservative encoder: curl --data-urlencode and
+	//      Python's quote() both send "*8" as "%2A8". Even the dashboard's
+	//      encodeURIComponent(), which leaves '*' alone, sends a '#'-bearing code
+	//      as "%23". None of those ever equalled a registered client's number.
+	//
+	// One deliberate behaviour change falls out of (1): a body carrying ONLY
+	// "myextension=999" now answers 400 instead of killing 999. That is the fix,
+	// not a regression — and the real caller (index_html.h's
+	// post("/api/kill","extension="+encodeURIComponent(selectedJack))) puts
+	// "extension=" at offset 0, which the boundary check admits unchanged.
+	const std::string ext = getFormParam(body, "extension");
 
 	if (ext.empty())
 	{
@@ -1076,6 +1094,14 @@ void HttpServer::sendApiKill(int sock, const std::string& body)
 		return;
 	}
 
+	// KNOWN GAP (issue #191, second half): this answers 200 whether or not the
+	// extension matched anything, so an operator clearing a stuck phone is told
+	// it worked even when no client and no session bore that number — precisely
+	// the outcome defect (2) above produced on every call. Reporting 404
+	// needs RequestsHandler::forceDisconnect() to return whether it matched
+	// (the signal already exists inside it: the _clientPool number compare and
+	// the per-session `involved` flag), which is a change to another translation
+	// unit, so it is left for a follow-up rather than faked from this side.
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
 		handler->forceDisconnect(ext);
@@ -1122,13 +1148,32 @@ void HttpServer::sendApiPcap(int sock)
 	{
 		pcap = handler->getPcapCapture();
 	}
-	// No same-origin check: this is a plain-download GET (an admin clicking a
-	// dashboard link, or curl/wget with the session cookie), not a
-	// state-mutating action — the same-origin gate on every other admin
-	// endpoint exists to stop a malicious page from silently POSTing through an
-	// admin's authenticated browser, which doesn't apply to fetching a file.
-	// SameSite=Strict on pd_session (see /api/admin/login) already keeps a
-	// cross-site page from riding the admin's session to reach this at all.
+	// This handler ASSUMES it was reached through requireAdmin() and re-checks
+	// nothing: the two routes that reach it (/api/pcap and /api/diagnostics/pcap —
+	// sendApiTrace next door serves the same ring behind the same gate) both go
+	// through requireAdmin(..., needCsrf=false), whose FIRST gate is
+	// requireSameOrigin() — so same-origin and a valid session are already
+	// established by the time these bytes are built. The guard lives at the
+	// dispatch site, not here.
+	//
+	// What needCsrf=false means, which is all this comment was ever trying to say:
+	// a plain-download GET (an admin clicking a dashboard link, or curl/wget with
+	// the session cookie) mutates nothing, and the CSRF token defends against a
+	// hostile page driving a state change THROUGH an admin's browser — it can
+	// forge the request but never read the response. SameSite=Strict on pd_session
+	// (see /api/admin/login) is the defence in depth that stops such a page
+	// reaching this at all.
+	//
+	// The comment this replaces claimed "No same-origin check" — true of this
+	// function read in isolation, false of the endpoint as dispatched. It predates
+	// the sweep that put these read routes behind requireAdmin (see
+	// HttpServer.hpp's requireAdmin comment: "/api/pcap, /api/trace and
+	// /api/diagnostics/pcap had no same-origin check despite serving raw SIP bytes
+	// including Authorization digests"). docs/API.md now lists /api/pcap among the
+	// same-origin-checked "gated reads", so this comment was the last place the old
+	// claim still stood — and a security note that disagrees with the dispatch
+	// table is exactly how a wrong claim gets repeated downstream. Hence: say where
+	// the guard lives, not whether this function performs it.
 	sendResponseWithHeader(sock, 200, "OK", "application/vnd.tcpdump.pcap", pcap,
 		"Content-Disposition: attachment; filename=\"pocket-dial.pcap\"");
 }
@@ -2108,14 +2153,25 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	DeviceConfig::clearAll();
 	// Also wipe the Telephony-API credential slots ("tapicfg") and the DID ->
 	// extension table ("didmap") -- both live in their OWN NVS namespace /
-	// host-file specifically so a factory reset of "storage"/"pbxcfg" above
-	// would NOT collaterally touch them (see TelephonyApiConfig.hpp's and
-	// DidMapping.hpp's class comments), which means a factory reset must
-	// clear them explicitly or a carrier OAuth client_id/client_secret and
-	// the full DID table survive the reset in flash. The CDR call-history ring
-	// ("cdrlog") is the same story -- its own NVS namespace, never touched by
-	// the "storage"/"pbxcfg" erases below, so callers/callees survive a reset
-	// unless cleared here too. All three are owned by RequestsHandler
+	// host-file specifically so that clearing the device's own settings would NOT
+	// collaterally touch them (see TelephonyApiConfig.hpp's and DidMapping.hpp's
+	// class comments), which means a factory reset must clear them explicitly or a
+	// carrier OAuth client_id/client_secret and the full DID table survive the
+	// reset in flash. The CDR call-history ring ("cdrlog") is the same story --
+	// its own NVS namespace again, so callers/callees survive a reset unless
+	// cleared here too.
+	//
+	// Nothing else in this function reaches them: DeviceConfig::clearAll() just
+	// above erases only its three named "storage" keys plus reg_mode in "pbxcfg"
+	// (via that file's eraseRegistrarMode(), src/Helpers/DeviceConfig.cpp), and the
+	// WiFi block further down erases four more "storage" keys by name. Both of
+	// those are key-by-key, never a namespace wipe, so a namespace no line here
+	// names is not reached at all. (An earlier version of this comment said
+	// "storage"/"pbxcfg" were erased "above"/"below", which pointed at nothing in
+	// this file: those erases live in DeviceConfig.cpp, a different translation
+	// unit.)
+	//
+	// All three are owned by RequestsHandler
 	// (_tapiConfig/_didMapping/_cdr), so go through it like every other
 	// mutation of those tables. Unconditional (not gated on
 	// POCKETDIAL_HAS_WIFI below) so this also runs -- and is host-testable --
