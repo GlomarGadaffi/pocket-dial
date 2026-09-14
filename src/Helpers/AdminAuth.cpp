@@ -32,6 +32,9 @@
 	#include "nvs_flash.h"
 	#include "nvs.h"
 	#include "esp_random.h"
+	// vTaskDelay() for the Task-Watchdog yield inside pbkdf2Sha256() (see there).
+	#include "freertos/FreeRTOS.h"
+	#include "freertos/task.h"
 #else
 	#include <random>
 #endif
@@ -1725,7 +1728,52 @@ namespace AdminAuth
 		}
 
 		constexpr size_t kHLen = 32;
+		constexpr size_t kBlock = 64;
 		const uint32_t numBlocks = static_cast<uint32_t>((dkLen + kHLen - 1) / kHLen);
+
+		// ── Precomputed HMAC pad states (PR #227 review) ─────────────────────
+		// The password is the HMAC key for every one of the `iterations` calls,
+		// so K ^ ipad and K ^ opad — and the SHA-256 compression of each as the
+		// first 64-byte block — are identical every time. Hash them ONCE here and
+		// copy the two mid-states per iteration instead of calling hmacSha256(),
+		// which rebuilt both pads and ran four compressions per call. This halves
+		// the per-iteration work (two compressions instead of four) and is the
+		// standard PBKDF2 optimisation every real implementation makes.
+		std::array<uint8_t, kBlock> keyBlock{};
+		if (password.size() > kBlock)
+		{
+			auto hashed = sha256Bytes(reinterpret_cast<const uint8_t*>(password.data()), password.size());
+			std::copy(hashed.begin(), hashed.end(), keyBlock.begin());
+		}
+		else if (!password.empty())
+		{
+			std::copy(password.begin(), password.end(), keyBlock.begin());
+		}
+		std::array<uint8_t, kBlock> ipad{};
+		std::array<uint8_t, kBlock> opad{};
+		for (size_t i = 0; i < kBlock; ++i)
+		{
+			ipad[i] = static_cast<uint8_t>(keyBlock[i] ^ 0x36);
+			opad[i] = static_cast<uint8_t>(keyBlock[i] ^ 0x5c);
+		}
+		Sha256 innerBase;
+		innerBase.update(ipad.data(), ipad.size());
+		Sha256 outerBase;
+		outerBase.update(opad.data(), opad.size());
+
+		// HMAC(password, msg) from the precomputed states. Sha256 is a plain
+		// value type, so copying the mid-state is a 100-odd-byte memcpy.
+		auto hmacFromBase = [&](const uint8_t* msg, size_t msgLen) {
+			Sha256 inner = innerBase;
+			inner.update(msg, msgLen);
+			std::array<uint8_t, kHLen> innerDigest;
+			inner.finalize(innerDigest.data());
+			Sha256 outer = outerBase;
+			outer.update(innerDigest.data(), innerDigest.size());
+			std::array<uint8_t, kHLen> result;
+			outer.finalize(result.data());
+			return result;
+		};
 
 		std::vector<uint8_t> saltAndIndex(salt, salt + saltLen);
 		saltAndIndex.resize(saltLen + 4);
@@ -1738,14 +1786,31 @@ namespace AdminAuth
 			saltAndIndex[saltLen + 2] = static_cast<uint8_t>((i >> 8) & 0xFF);
 			saltAndIndex[saltLen + 3] = static_cast<uint8_t>(i & 0xFF);
 
-			auto u = hmacSha256(reinterpret_cast<const uint8_t*>(password.data()), password.size(),
-				saltAndIndex.data(), saltAndIndex.size());
+			auto u = hmacFromBase(saltAndIndex.data(), saltAndIndex.size());
 			auto t = u;
 			for (uint32_t c = 1; c < iterations; ++c)
 			{
-				u = hmacSha256(reinterpret_cast<const uint8_t*>(password.data()), password.size(),
-					u.data(), u.size());
+				u = hmacFromBase(u.data(), u.size());
 				for (size_t j = 0; j < kHLen; ++j) t[j] = static_cast<uint8_t>(t[j] ^ u[j]);
+
+#if defined(ESP_PLATFORM)
+				// ── Task Watchdog (PR #227 review) ───────────────────────────
+				// This runs on the HTTP handler task for kExportKdfIterations
+				// (200000) per export and up to twice that per import, with no
+				// other blocking call inside the loop. Nothing in sdkconfig
+				// overrides ESP-IDF's default 5 s Task Watchdog, which is fed by
+				// the IDLE task — so a loop this long that never lets IDLE run
+				// trips the TWDT and panics the board mid-call. Sleep one tick
+				// every 1024 iterations: vTaskDelay(1) is what actually lets the
+				// priority-0 idle task run (taskYIELD() only hands off to tasks
+				// of equal or higher priority, which idle is not). At ~200 ticks
+				// this adds well under a second per export and keeps SIP/RTP
+				// tasks scheduled throughout.
+				if ((c & 1023u) == 0)
+				{
+					vTaskDelay(1);
+				}
+#endif
 			}
 
 			size_t take = (dkLen - written < kHLen) ? (dkLen - written) : kHLen;
