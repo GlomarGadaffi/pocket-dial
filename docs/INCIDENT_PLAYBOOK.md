@@ -470,7 +470,7 @@ re-login mints a **new** token — re-capture it, do not reuse the old one. `GET
 * **The trip count survives the cooldown.** The second lockout is 2 min, the third 4 min, and only a **correct login** clears either counter.
 * **The DTMF PIN shares the same bucket table.** `AdminAuth::verifyDtmfPin()` accounts against the unkeyed `""` bucket, so hammering the `*PIN#` menu can lock out the web login and vice versa.
 * **Instant Recovery:** wait — it always auto-clears and never permanently locks the device. Pre-existing sessions stay valid throughout; only `login` is throttled, so a browser still logged in elsewhere is your fastest route back in. Failing that, **power-cycle**: both counters live in a process-local static (`AuthState`), never in NVS, so a reboot clears every lockout without touching the credential. Hitting the aggregate counter without guessing means something on the link is hammering `/api/admin/login` — treat that as an incident in its own right.
-* **Note:** the per-client key is for *fairness, not trust* — a source address is trivially spoofable on a shared link. That is precisely why the aggregate backstop exists.
+* **Note:** the per-client key *would be* for fairness, not trust — a source address is trivially spoofable on a shared link, which is why the aggregate backstop exists. In the shipped firmware the key is never supplied at all (see the table row above), so the aggregate backstop is the only counter actually doing anything.
 
 ### 4.8 🔐 Forced first-use setup — `403 setup_required` on everything
 

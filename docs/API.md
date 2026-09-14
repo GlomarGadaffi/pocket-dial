@@ -502,13 +502,21 @@ attach it to cross-site requests). There is **no `Secure` flag** — the dashboa
 plain HTTP on a LAN appliance, and `Secure` would make the cookie unusable. The
 cookie value is the session token; the CSRF token is never a cookie, by design.
 
-**Brute-force accounting** is per-client, keyed on the peer IP taken from
-`getpeername()`: `kMaxFailedAttempts` = 5 consecutive failures engage a
+**Brute-force accounting** is **global, not per-client.** `AdminAuth` implements
+per-client buckets and `handleClient()` even derives `peerIp` from `getpeername()` for
+them (`HttpServer.cpp:247-263`) — but it stores that only on the OTA request (`:330`).
+`parseRequest()` never sets `req.clientIp`, so `sendApiAdminLogin` passes an empty string
+(`:2720`, `:2729`, `:2732`) and every failure shares one unkeyed bucket with the DTMF PIN
+path. **One guesser can therefore lock the real admin out** — see
+[THREAT_MODEL.md](THREAT_MODEL.md) D-3. The thresholds below are real:
+`kMaxFailedAttempts` = 5 consecutive failures engage a
 `kLockoutMs` = 60 s cooldown, and consecutive lockouts back off exponentially to a
 cap of 60 s << 4 ≈ 16 minutes. A separate aggregate backstop
 (`kMaxFailedAttemptsGlobal` = 20) bounds the total guess rate across all source
-addresses, since addresses are spoofable. Keying per-client is what stops one guesser
-locking the real admin out. The default credential is **not** exempt from any of this.
+addresses, since addresses are spoofable. *(Keying per-client was meant to stop one
+guesser locking the real admin out; as above, the key never arrives, so the aggregate
+backstop is carrying this alone.)* The default credential is **not** exempt from any of
+this.
 
 ```bash
 curl -s -i -X POST "http://$DEV/api/admin/login" -d "username=admin&password=admin"

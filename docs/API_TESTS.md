@@ -664,7 +664,8 @@ login preamble — including setup completion — to have run first.
   surfaces must expect them to lock each other out.
 
 > [!CAUTION]
-> **Do not hammer `/api/admin/login` in a load test.** The lockout is per-client with
+> **Do not hammer `/api/admin/login` in a load test.** The lockout is **global** (the
+> per-client key is never supplied — [THREAT_MODEL.md](THREAT_MODEL.md) D-3) with
 > exponential backoff *and* an aggregate backstop across all clients, so a brute-force
 > loop locks the whole bench out — including you, at the correct password — for up to 16
 > minutes, and each further round doubles it. Budget wall-clock time for TC-RL-02/03, or

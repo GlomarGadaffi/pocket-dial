@@ -273,7 +273,7 @@ What the media path actually is, because it decides where to look:
 
 | Cause | Fix |
 | :--- | :--- |
-| **Connection refused** | **A real fault now.** The listener accepts unconditionally in every provisioning state — there is no dark/open gate and nothing to "reopen". Check you are at the right IP, that `http_dashboard` started in the serial log, and that nothing on your machine is filtering port 80. |
+| **Connection refused** | **A real fault now.** The listener accepts unconditionally in every provisioning state — there is no dark/open gate and nothing to "reopen". Check you are at the right IP and that nothing on your machine is filtering port 80. (`http_dashboard` is a FreeRTOS **task name** — on `eth`/`lan8720` only; the `wifi` build calls it `http_server_task` — and neither is printed at boot, so do not wait for a log line.) |
 | Wrong scheme | Use **`http://`**, not `https://` — the dashboard is plain HTTP ([API.md §1](API.md)). There is deliberately **no** HSTS header, so a browser that once cached HTTPS for this host will not have been pinned by us ([API.md §2.2](API.md)). |
 | mDNS not resolving | Browse to the raw IP `192.168.4.1` (SoftAP) or the device's LAN IP (wired). |
 | Not joined to the device network | Re-check Wi-Fi association / DHCP lease. If the AP is now WPA2, see [Can't join the Wi-Fi network](#cant-join-the-wi-fi-network-any-more). |

@@ -339,4 +339,4 @@ Many JC3248W535 display clones omit these, resulting in I2C timeouts and immedia
 If breadboarding the Waveshare or LilyGO W5500 SPI interfaces:
 * Keep SPI line paths **shorter than 5 cm** to prevent clock skew.
 * Ground lines should be bundled alongside high-speed clock signals (`SCK` and `MOSI`) to shield against EMI.
-* High-speed SPI clock lines running at 36 MHz will experience significant crosstalk if unshielded or loosely jumpered.
+* High-speed SPI clock lines running at **40 MHz** (the configured W5500 bus speed — `esp_main_eth.cpp:113`) will experience significant crosstalk if unshielded or loosely jumpered.

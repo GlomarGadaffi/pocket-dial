@@ -252,8 +252,9 @@ deployment:
   giving comfortable room for stale-binding churn without ever being the limit.
 * 8 sessions means up to 8 simultaneous 1:1 calls — well beyond what ~16 phones
   realistically place at once, and an `8 × ~200 B` rounding error in the budget.
-* The whole thing fits in ~37 KB, leaving the bulk of internal SRAM for Wi-Fi
-  buffers, the HTTP dashboard, the captive-portal DNS, and LVGL.
+* The whole thing fits in **~58 KB** (see §2 — the message pool defaults to the derived
+  52, not 32), leaving most of internal SRAM for Wi-Fi buffers, the HTTP dashboard, the
+  captive-portal DNS, and LVGL.
 
 In short: 32/8 is sized to be *one notch above* the network layer's own ceiling on
 the cheapest supported board, so RAM is never wasted and the pool is never the

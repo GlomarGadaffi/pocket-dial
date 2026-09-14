@@ -201,7 +201,8 @@ stands up one dedicated 20 ms driver for the whole room; a leg's sender only eve
 ### 2.4 Estimated concurrency ceilings — NEVER VALIDATED
 
 Per `docs/SCALING.md`, internal DRAM headroom after IDF + Wi-Fi was ~290–320 KB on a plain
-ESP32, and the existing pools cost ~37 KB. Two facts were expected to dominate:
+ESP32, and the existing pools were then believed to cost ~37 KB (the real default is
+~58 KB — see [SCALING.md](SCALING.md) §2). Two facts were expected to dominate:
 
 1. **IRAM was ~100% used**, so RTP code would have to live in flash-cached paths subject to
    i-cache misses — acceptable at a 20 ms cadence, but the hot loop must not be

@@ -203,7 +203,7 @@ LOGIN=$(curl -s -c "$JAR" \
 # -> {"status":"ok","authenticated":true,"needsSetup":false,"csrf":"3f2a...e91c"}
 #
 # Wrong credentials -> 401 {"error":"invalid username or password"}, and repeated
-# failures trip a per-client lockout -> 429 {"error":"too many failed attempts;
+# failures trip the (global) lockout -> 429 {"error":"too many failed attempts;
 # try again later"}. A stale script still POSTing "pin=..." sends no username at
 # all, so it fails this way and will lock its own source address out.
 # "needsSetup":true means the login succeeded against the DEFAULT credential —
@@ -413,7 +413,8 @@ upload path are:
 
 - the **admin session** gate — a username + password login that mints a
   `pd_session` cookie, enforced **unconditionally** on every device in every
-  state, with a per-client brute-force lockout (`429`) on the login route;
+  state, with a brute-force lockout (`429`) on the login route — **global, not
+  per-client**, see [THREAT_MODEL.md](THREAT_MODEL.md) D-3;
 - the **per-session CSRF token** (`X-CSRF`) on the mutating routes; and
 - the **same-origin** check, which constrains browsers only (a request with no
   `Origin` header is admitted, so this is defence in depth, not the gate).

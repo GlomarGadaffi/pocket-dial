@@ -93,8 +93,10 @@ shows the captive-portal join QR code on first boot.
 
 ## 4. PSRAM and memory
 
-- **Generic ESP32/ESP32-S3**: PSRAM is optional. The Pocket tier's ~37 KB of pools fits
-  comfortably in the ~290–320 KB of usable internal DRAM on a plain ESP32.
+- **Generic ESP32/ESP32-S3**: PSRAM is optional. The Pocket tier's **~58 KB** of pools
+  (not the ~37 KB quoted before this audit — the message pool is the derived 52, see
+  [SCALING.md](SCALING.md) §2) still fits in the ~290–320 KB of usable internal DRAM on a
+  plain ESP32, with less margin than the old figure implied.
 - **Guition / S3 boards**: PSRAM is present (8 MB) but, except on the display build where
   it holds the LVGL frame buffers, it is **not** required for the SIP pools — keeping SIP
   state in internal SRAM avoids PSRAM access latency on the signaling path
@@ -114,7 +116,7 @@ From [HARDWARE.md §9](HARDWARE.md):
   (GPIO 4) and `TOUCH_SCL` (GPIO 8) to 3.3 V. Many JC3248W535 clones omit these, causing
   I2C timeouts and panel-init crashes.
 - **High-frequency SPI Ethernet routing (W5500 boards):** keep SPI traces **shorter than
-  5 cm**, bundle ground alongside `SCK`/`MOSI`, and expect crosstalk on a 36 MHz clock if
+  5 cm**, bundle ground alongside `SCK`/`MOSI`, and expect crosstalk on the 40 MHz clock if
   lines are loosely jumpered on a breadboard.
 - **PoE:** the LilyGO T-ETH-ELITE, Waveshare ESP32-S3-ETH, and LilyGO T-POE-Pro accept
   power over the RJ45; the LilyGO T-ETH-Lite and Wi-Fi boards are USB-C powered.
