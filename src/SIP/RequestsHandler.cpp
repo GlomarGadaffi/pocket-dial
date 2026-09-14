@@ -1235,10 +1235,17 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-<<<<<<< HEAD
 	// The MoH preview is the same kind of dialog and needs the same claim.
 	if (handleMohPreviewFailure(data))
-=======
+	{
+		return;
+	}
+
+	// Both claims must run: they match different Call-IDs, so neither can
+	// mask the other, and dropping either sends its dialog back through
+	// endHandle() -- whose lookup of a server-owned From matches no
+	// registered client, so the else branch answers the phone with a stray
+	// 404. MoH is first only because it reached main first.
 	// A blind-transfer target refusing the INVITE the server sent on the
 	// transferee's behalf (issue #197). Claimed here, ahead of every session
 	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
@@ -1247,7 +1254,6 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
 	// a forward-on-busy call nobody asked for.
 	if (handleBlindXferFailure(data))
->>>>>>> c3e26bb (fix(refer): blind transfer moves the transferee, not the transferor)
 	{
 		return;
 	}
@@ -1279,10 +1285,17 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-<<<<<<< HEAD
 	// The MoH preview is the same kind of dialog and needs the same claim.
 	if (handleMohPreviewFailure(data))
-=======
+	{
+		return;
+	}
+
+	// Both claims must run: they match different Call-IDs, so neither can
+	// mask the other, and dropping either sends its dialog back through
+	// endHandle() -- whose lookup of a server-owned From matches no
+	// registered client, so the else branch answers the phone with a stray
+	// 404. MoH is first only because it reached main first.
 	// A blind-transfer target refusing the INVITE the server sent on the
 	// transferee's behalf (issue #197). Claimed here, ahead of every session
 	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
@@ -1291,7 +1304,6 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
 	// a forward-on-busy call nobody asked for.
 	if (handleBlindXferFailure(data))
->>>>>>> c3e26bb (fix(refer): blind transfer moves the transferee, not the transferor)
 	{
 		return;
 	}
@@ -3437,10 +3449,17 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-<<<<<<< HEAD
 	// The MoH preview is the same kind of dialog and needs the same claim.
 	if (handleMohPreviewFailure(data))
-=======
+	{
+		return;
+	}
+
+	// Both claims must run: they match different Call-IDs, so neither can
+	// mask the other, and dropping either sends its dialog back through
+	// endHandle() -- whose lookup of a server-owned From matches no
+	// registered client, so the else branch answers the phone with a stray
+	// 404. MoH is first only because it reached main first.
 	// A blind-transfer target refusing the INVITE the server sent on the
 	// transferee's behalf (issue #197). Claimed here, ahead of every session
 	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
@@ -3449,7 +3468,6 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
 	// a forward-on-busy call nobody asked for.
 	if (handleBlindXferFailure(data))
->>>>>>> c3e26bb (fix(refer): blind transfer moves the transferee, not the transferor)
 	{
 		return;
 	}
@@ -3541,10 +3559,17 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-<<<<<<< HEAD
 	// The MoH preview is the same kind of dialog and needs the same claim.
 	if (handleMohPreviewFailure(data))
-=======
+	{
+		return;
+	}
+
+	// Both claims must run: they match different Call-IDs, so neither can
+	// mask the other, and dropping either sends its dialog back through
+	// endHandle() -- whose lookup of a server-owned From matches no
+	// registered client, so the else branch answers the phone with a stray
+	// 404. MoH is first only because it reached main first.
 	// A blind-transfer target refusing the INVITE the server sent on the
 	// transferee's behalf (issue #197). Claimed here, ahead of every session
 	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
@@ -3553,7 +3578,6 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
 	// a forward-on-busy call nobody asked for.
 	if (handleBlindXferFailure(data))
->>>>>>> c3e26bb (fix(refer): blind transfer moves the transferee, not the transferor)
 	{
 		return;
 	}
