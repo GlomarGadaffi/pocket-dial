@@ -94,12 +94,15 @@ Full instructions: **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** ·
 ### Call control
 Blind transfer (REFER — **see the caveat below**) · attended transfer (REFER with
 Replaces) · hold and resume
-· RFC 3311 UPDATE (answered; advertised on `OPTIONS` only) · RFC 4028 session
+· RFC 3311 UPDATE (answered, and advertised in `Allow` on the registrar's 200 OK
+and on the 2xx the board authors, so a conformant phone will actually send one)
+· RFC 4028 session
 timers (passive) · call park to orbits `700`–`709` · group pickup `*8` and
 directed pickup `**<ext>` · ring groups (ring-all or sequential hunt) · call
 forward on always / busy / no-answer · per-extension DND · paging zones
 `980`–`989` and `999` all-page · busy-lamp-field presence (`SUBSCRIBE`/`NOTIFY`,
-RFC 4235 dialog events) · DTMF star codes over SIP INFO.
+RFC 4235 dialog events) · DTMF star codes over SIP INFO, and over RFC 4733
+telephone-event on server-terminated legs.
 
 Three of those need an asterisk before you design around them:
 
@@ -288,7 +291,10 @@ than failing unpredictably.
 | Office | 32 | 8 | 4 | ESP32-S3, 16 MB flash — the default |
 | Rack | 128+ | 32+ | 8 | Desktop build |
 
-Details and the reasoning behind the numbers: [docs/SCALING.md](docs/SCALING.md).
+Details and the reasoning behind the numbers: [docs/SCALING.md](docs/SCALING.md). Need more
+Wi-Fi phones than one SoftAP's ~10–16-station ceiling holds? See
+[docs/SOFTAP_SCALE.md](docs/SOFTAP_SCALE.md) for the deployment options and why mesh isn't
+one of them yet.
 
 ---
 
@@ -301,6 +307,8 @@ Details and the reasoning behind the numbers: [docs/SCALING.md](docs/SCALING.md)
 - **[RTP.md](docs/RTP.md)** — the media bridge, G.711 codecs, and what the board
   does and doesn't carry
 - **[SCALING.md](docs/SCALING.md)** — where the ceilings are and why
+- **[SOFTAP_SCALE.md](docs/SOFTAP_SCALE.md)** — scaling a Wi-Fi deployment past one
+  SoftAP's station cap: the mesh-vs-wired-backbone decision
 - **[THREAT_MODEL.md](docs/THREAT_MODEL.md)** — STRIDE analysis and the residual risks
 - **[API.md](docs/API.md)** — every HTTP endpoint
 - **[CONTRIBUTING.md](docs/CONTRIBUTING.md)** — build, test and PR workflow

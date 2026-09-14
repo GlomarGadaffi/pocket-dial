@@ -73,8 +73,18 @@ public:
 	// RTP sender toward handsetIp:handsetPort. Returns the leg index (>= 0), or -1 if
 	// the room is full, the Call-ID is already in the room, or the media failed to
 	// start (nothing is left half-joined on failure).
+	// `dtmfPt` is the RFC 4733 telephone-event payload type this handset offered
+	// (-1 when it offered none). A conference is exactly where in-call keypresses
+	// matter -- PIN entry and in-call controls are pressed on a leg the server
+	// terminates -- so the leg's receiver is armed for it at join time.
 	int join(const std::string& callID, const std::string& ext,
-		const std::string& handsetIp, uint16_t handsetPort);
+		const std::string& handsetIp, uint16_t handsetPort, int dtmfPt = -1);
+
+	// Where an RFC 4733 key press decoded off ANY leg goes. Invoked on that leg's
+	// RTP receive task, so it must be thread-safe and non-blocking; see
+	// MediaBridge::DigitSink. Applied to every leg's bridge, so it must be set
+	// before the first join -- RequestsHandler does so at room construction.
+	void setDigitSink(MediaBridge::DigitSink sink);
 
 	// Drop the leg holding `callID`. Idempotent — safe for an unknown Call-ID, which
 	// is what lets RequestsHandler::endCall() call it unconditionally on every teardown.
@@ -131,6 +141,10 @@ private:
 		std::string ext;
 		bool        inUse = false;
 	};
+
+	// Kept so setDigitSink() can reach legs that already exist, and so a leg
+	// created later still gets it — join() re-applies it below.
+	MediaBridge::DigitSink _digitSink;
 
 	int indexOfLocked(const std::string& callID) const;
 	void runDriver();

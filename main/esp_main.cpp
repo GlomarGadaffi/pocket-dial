@@ -8,6 +8,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"   // Issue #185: sip_server_task TWDT subscription
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "lwip/err.h"
@@ -133,6 +134,20 @@ static std::string wifi_init_softap(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     // Explicitly start the embedded DHCP server so connected IP phones get leases.
+    //
+    // Issue #178 asked for DHCP Option 66 (provisioning-URL auto-discovery) to be
+    // injected here. Investigated, not implemented: esp_netif_dhcps_option()'s
+    // esp_netif_dhcp_option_id_t enum, and the dhcpserver.c switch underneath it,
+    // both recognize a fixed, closed set of options that does not include 66 (or
+    // the RFC 2132 TFTP_SERVER_NAME code at all) -- there is no field in the
+    // dhcpserver's own struct to hold it, and the one extension hook,
+    // LWIP_HOOK_DHCPS_POST_STATE, fires on the parsed INBOUND request, not the
+    // OUTBOUND OFFER/ACK, so it cannot inject bytes into what actually gets sent.
+    // Serving Option 66 from this SoftAP therefore requires forking the `lwip`
+    // component's dhcpserver.c (e.g. via EXTRA_COMPONENT_DIRS) or replacing the
+    // DHCP server outright -- both bigger than a change confined to this file.
+    // See docs/PROVISIONING.md §1.1 for the full investigation and §1.1a for the
+    // wired-LAN case (a site's own DHCP server), which needs no firmware change.
     esp_err_t dhcps_err = esp_netif_dhcps_start(ap_netif);
     if (dhcps_err != ESP_OK && dhcps_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
         ESP_LOGW(TAG, "dhcps_start returned %d — phones may not get leases", dhcps_err);
@@ -202,6 +217,32 @@ static std::string wifi_init_sta(void)
     return s_sta_ip;
 }
 
+// ── Reset reason (Issue #185) ─────────────────────────────────────────────────
+// Logged first thing in app_main(), below. This is a headless board's only way
+// to say, after the fact, that its previous boot ended in ESP_RST_TASK_WDT --
+// there is no screen and nobody was watching the UART in real time.
+static const char* pdResetReasonString(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON:    return "POWERON";
+        case ESP_RST_EXT:        return "EXT_PIN";
+        case ESP_RST_SW:         return "SW_RESTART";
+        case ESP_RST_PANIC:      return "PANIC";
+        case ESP_RST_INT_WDT:    return "INT_WDT";
+        case ESP_RST_TASK_WDT:   return "TASK_WDT";
+        case ESP_RST_WDT:        return "OTHER_WDT";
+        case ESP_RST_DEEPSLEEP:  return "DEEPSLEEP_WAKE";
+        case ESP_RST_BROWNOUT:   return "BROWNOUT";
+        case ESP_RST_SDIO:       return "SDIO";
+        case ESP_RST_USB:        return "USB";
+        case ESP_RST_JTAG:       return "JTAG";
+        case ESP_RST_EFUSE:      return "EFUSE_ERROR";
+        case ESP_RST_PWR_GLITCH: return "PWR_GLITCH";
+        case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP";
+        default:                 return "UNKNOWN";
+    }
+}
+
 // ── SIP server task ────────────────────────────────────────────────────────────
 static std::string s_sip_ip;  // set before task is spawned
 
@@ -210,12 +251,32 @@ void sip_server_task(void *pvParameters)
     int port = 5060;
     ESP_LOGI("SipServerTask", "Starting SipServer on %s:%d", s_sip_ip.c_str(), port);
 
+    // Issue #185: subscribe to the Task Watchdog Timer so a tick() that never
+
     SipServer* srv = new SipServer(s_sip_ip, port);
     // Publish with release so the HTTP task's acquire-load sees a fully-constructed
     // object (not a half-initialised one) the moment it observes the non-null pointer.
     g_sipServer.store(srv, std::memory_order_release);
+
+    // Issue #185: subscribe to the Task Watchdog Timer so a tick() that never
+    // returns (stuck on a lock, a runaway loop) produces a logged, controlled
+    // reset instead of a silently unresponsive board. esp_task_wdt_add(NULL)
+    // subscribes the CALLING (this) task; only this task's own loop below may
+    // feed it via esp_task_wdt_reset() -- the TWDT has no "reset on behalf of
+    // another task" call, by design (see sdkconfig.defaults for the PANIC=y
+    // that makes a timeout actually reset the board). A failed subscription is
+    // logged and non-fatal: better an unmonitored SIP task than no SIP task.
+    esp_err_t wdtErr = esp_task_wdt_add(NULL);
+    if (wdtErr != ESP_OK) {
+        ESP_LOGE("SipServerTask", "esp_task_wdt_add failed (%s) -- this task's stalls will go undetected",
+                 esp_err_to_name(wdtErr));
+    }
+
     while (1) {
         srv->getHandler().tick();
+        // Fed once per 1 s loop, well inside the 5 s default TWDT timeout
+        // (CONFIG_ESP_TASK_WDT_TIMEOUT_S). Harmless no-op if the add above failed.
+        (void)esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
@@ -296,6 +357,12 @@ static void log_drain_task(void* /*arg*/)
 
 extern "C" void app_main(void)
 {
+    // Issue #185: log the reset cause before anything else can fail and bury
+    // it. ESP_RST_TASK_WDT here means a TWDT-subscribed task (sip_server_task,
+    // below) actually stalled on the PREVIOUS boot -- the only place a headless
+    // unit can report that.
+    ESP_LOGI(TAG, "[boot] reset reason: %s", pdResetReasonString(esp_reset_reason()));
+
     // ── NVS init (keep ESP_ERROR_CHECK here — unrecoverable without flash) ──
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

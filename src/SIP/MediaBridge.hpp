@@ -44,11 +44,29 @@ public:
 	// anchor-only wiring for every existing call site.
 	void init(RtpReceiver* receiver, RtpSender* sender, AnchorClient* anchor, MixBus* bus = nullptr);
 
+	// Where an RFC 4733 key press decoded off this bridge's handset stream goes.
+	//
+	// Invoked ON THE RTP RECEIVE TASK, so the implementation must be thread-safe
+	// and must not block — RequestsHandler::queueDtmfDigit() is the intended
+	// target and is built for exactly this (a memcpy into a fixed ring under its
+	// own small mutex, never the engine lock).
+	//
+	// Set once at wiring time rather than per call, because the destination is a
+	// property of the engine, not of the dialog; the Call-ID that varies per call
+	// is supplied by startBridge() and captured for you.
+	using DigitSink = std::function<void(std::string_view callId, char digit)>;
+	void setDigitSink(DigitSink sink);
+
 	// Start bridging a handset's RTP stream. participantId is the anchor-side
 	// participant this bridge serves — it tags writeAudio() so the anchor can route this
 	// bridge's handset audio correctly when multiple bridges are active concurrently.
 	// In BUS mode it is just an opaque identity used by isFor()/the dashboard.
-	bool startBridge(const std::string& handsetIp, uint16_t handsetPort, const std::string& callID, const std::string& participantId);
+	// `dtmfPt` is the RFC 4733 telephone-event payload type the handset offered in
+	// its SDP (SipMessage::getTelephoneEventPayloadType()); -1 means it offered
+	// none, and the receiver stays DTMF-deaf as before. Per-CALL, unlike the sink
+	// above, because the payload type is negotiated per dialog — most phones say
+	// 101 but the number is theirs to choose.
+	bool startBridge(const std::string& handsetIp, uint16_t handsetPort, const std::string& callID, const std::string& participantId, int dtmfPt = -1);
 
 	// Stop all active streams and tear down the bridge
 	void stopBridge();
@@ -128,6 +146,11 @@ private:
 	std::atomic<int>  _busPort{-1};
 	std::string       _callID;
 	std::string       _participantId;   // the anchor-side participant id this bridge serves
+
+	// Set once at wiring time, before any bridge starts, and never mutated after —
+	// so the RTP task reads it without synchronisation, the same way it reads the
+	// other init()-time dependencies.
+	DigitSink _digitSink;
 
 	mutable std::mutex _mutex;
 };

@@ -133,13 +133,19 @@ TEST(Pbx, ForwardConfigNonEmptyWhenAnyTriggerSet) {
 // ── Star/pound codes stay dialable AORs (future feature codes) ────────────────
 //
 // isValidAor() is a private RequestsHandler method (not linked into this test
-// binary), but its accept rule is exact and stable: non-empty, every char is
-// alphanumeric or one of '.', '-', '_', '+', '*', '#'. This free function mirrors it
-// so we can assert star/pound codes are still accepted (the roster *55 behaviour was
-// removed, but the AOR charset change that makes star codes dialable is KEPT).
+// binary), but its accept rule is exact and stable: non-empty, no longer than
+// kMaxAorLen (64), every char alphanumeric or one of '.', '-', '_', '+', '*', '#'.
+// This free function mirrors it so we can assert star/pound codes are still
+// accepted (the roster *55 behaviour was removed, but the AOR charset change
+// that makes star codes dialable is KEPT) and, as of issue #194, that the length
+// bound added alongside the charset check (RequestsHandler.cpp's kMaxAorLen --
+// see CallDetailRecord.hpp's corrected comment for why one was needed at all:
+// isValidAor() used to be claimed as a length bound elsewhere in the codebase
+// when it never was one) is mirrored here too.
 namespace {
+constexpr size_t kMirrorMaxAorLen = 64;
 bool mirrorsIsValidAor(const std::string& s) {
-    if (s.empty()) return false;
+    if (s.empty() || s.size() > kMirrorMaxAorLen) return false;
     for (char c : s) {
         if (!std::isalnum(static_cast<unsigned char>(c)) &&
             c != '.' && c != '-' && c != '_' && c != '+' &&
@@ -157,6 +163,17 @@ TEST(Aor, StarAndPoundCodesAreDialable) {
     EXPECT_FALSE(mirrorsIsValidAor(""));      // empty still rejected
     EXPECT_FALSE(mirrorsIsValidAor("55 5"));  // whitespace still rejected
     EXPECT_FALSE(mirrorsIsValidAor("a@b"));   // delimiters/host chars still rejected
+}
+
+TEST(Aor, LengthIsBoundedAt64Chars) {
+    // Issue #194 audit: isValidAor() was charset-only with no length check, so
+    // an unbounded AOR (nothing stops a REGISTER/INVITE from carrying one) could
+    // heap-allocate without limit inside every CdrRing slot. 64 chars is exactly
+    // at the bound; 65 must be refused.
+    const std::string ok(64, 'a');
+    const std::string tooLong(65, 'a');
+    EXPECT_TRUE(mirrorsIsValidAor(ok));
+    EXPECT_FALSE(mirrorsIsValidAor(tooLong));
 }
 
 // ── Register-beep INVITE: auto-answer headers + correct Content-Length ─────────
@@ -242,4 +259,71 @@ TEST(RegisterBeep, EnforceG711AndSyncKeepsContentLengthCorrect) {
     ASSERT_NE(sep, std::string::npos);
     size_t actualBody = out.size() - (sep + 4);
     EXPECT_EQ(parsedContentLength(msg), actualBody);
+}
+
+// ── Reserved/emergency/PSTN-shaped REGISTER identity guard (Issue #163) ────────
+//
+// Pure coverage for the three PbxConfig.hpp helpers behind onRegister()'s
+// identity guard and findProvisioningInfo()'s recheck. The REGISTER-level
+// behaviour (403 in every registrar mode) is covered separately in
+// RegisterIdentityGuard_test.cpp, which links the full RequestsHandler; these
+// stay here, alongside the rest of PbxConfig.hpp's pure logic, because they
+// need nothing else.
+
+TEST(ReservedExtension, MatchesExactlyTheSevenReservedOrEmergencyLiterals) {
+    for (const char* ext : {"777", "999", "888", "555", "440", "911", "933"}) {
+        EXPECT_TRUE(pbx::isReservedExtension(ext)) << ext;
+    }
+}
+
+TEST(ReservedExtension, DoesNotMatchOrdinaryExtensionsOrLookalikes) {
+    // Real extensions this codebase's own docs/tests use, an empty AOR, and
+    // near-miss spellings that must NOT be swept in by a sloppier comparison
+    // (substring, prefix, or digit-only match).
+    for (const char* ext : {"101", "1001", "610", "620", "reception", "",
+                             "9110", "0911", "91", "4400", "*440", "555a"}) {
+        EXPECT_FALSE(pbx::isReservedExtension(ext)) << ext;
+    }
+}
+
+TEST(LooksLikePstnAor, AcceptsAllDigitAtOrAboveTheConfiguredThreshold) {
+    // Default threshold is POCKETDIAL_MIN_PSTN_AOR_DIGITS (PoolConfig.hpp) = 7.
+    EXPECT_TRUE(pbx::looksLikePstnAor("5551234"));       // exactly 7
+    EXPECT_TRUE(pbx::looksLikePstnAor("15551234567"));   // NANP w/ country code, no '+'
+}
+
+TEST(LooksLikePstnAor, RejectsShortOrNonDigitOrEmpty) {
+    EXPECT_FALSE(pbx::looksLikePstnAor(""));
+    EXPECT_FALSE(pbx::looksLikePstnAor("101"));          // ordinary 3-digit extension
+    EXPECT_FALSE(pbx::looksLikePstnAor("620"));
+    EXPECT_FALSE(pbx::looksLikePstnAor("555123"));       // one short of the threshold
+    EXPECT_FALSE(pbx::looksLikePstnAor("555123a"));      // right length, not all-digit
+    EXPECT_FALSE(pbx::looksLikePstnAor("+5551234"));     // '+' is handled separately
+}
+
+TEST(IsReservedOrPstnAor, BlocksEveryReservedLiteral) {
+    for (const char* ext : {"777", "999", "888", "555", "440", "911", "933"}) {
+        EXPECT_TRUE(pbx::isReservedOrPstnAor(ext)) << ext;
+    }
+}
+
+TEST(IsReservedOrPstnAor, BlocksAnyLeadingPlusRegardlessOfLength) {
+    EXPECT_TRUE(pbx::isReservedOrPstnAor("+15551234567"));
+    EXPECT_TRUE(pbx::isReservedOrPstnAor("+1"));
+    EXPECT_TRUE(pbx::isReservedOrPstnAor("+"))
+        << "unconditional per the issue: reject ANY leading '+', not just a "
+           "plausibly-long one";
+}
+
+TEST(IsReservedOrPstnAor, BlocksLongAllDigitAors) {
+    EXPECT_TRUE(pbx::isReservedOrPstnAor("5551234567"));
+}
+
+TEST(IsReservedOrPstnAor, AllowsOrdinaryExtensionsAndAlphanumericNames) {
+    // The other half of every guard in this file: it must refuse ONLY the
+    // three specific cases above, not every '+'-free, non-3-digit AOR.
+    for (const char* ext : {"101", "1001", "610", "620", "reception",
+                             "voicemail", "*55", "*8", "**204", "1_0.1-a"}) {
+        EXPECT_FALSE(pbx::isReservedOrPstnAor(ext)) << ext;
+    }
 }

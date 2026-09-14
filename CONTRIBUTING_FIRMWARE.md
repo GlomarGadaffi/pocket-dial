@@ -206,24 +206,25 @@ void setupNetworkMode() {
 
 ## 5. Host Test Suite
 
-The gtest suite under `tests/` is the gate every PR clears before hardware is
-touched. It is currently **641 cases** by static count of `TEST`/`TEST_F` in
-`tests/*.cpp`, of which **639 run on Linux/WSL** — which is the number CI
-enforces and the number to quote in a commit message. (Issue #159 measured
-this from a stale 578/576 — the mechanism below is unchanged, the count grew
-from tests added across multiple PRs, 56 of them issue #159's own SMTP-client/
-JWT/HTTP suites.)
+touched. It is currently **799 cases** by static count of `TEST`/`TEST_F` in
+`tests/*.cpp`, of which **796 run on Linux/WSL** — which is the number CI
+enforces and the number to quote in a commit message. (This count merges
+issue #159's SMTP-client/JWT/HTTP suites with #186/#173's config-export and
+two-role suites, both landing around the same time — re-measured after the
+merge rather than carried forward from either PR alone.)
 
-The gap is not drift. `DidMapping_test.cpp` and `TelephonyApiConfig_test.cpp`
-each carry a `#if !defined(_WIN32) ... #else ... #endif` pair around their
-persistence tests, because `persist()` is in-memory only under `_WIN32` (no
-POSIX permission model, so the host fallback refuses to write a world-readable
-file). The POSIX arms hold 3 and 2 real cases; each Windows arm holds one
-`GTEST_SKIP` placeholder. So a POSIX host compiles out 2 and runs **639**, and
-Windows compiles out 5 and runs some smaller number this measurement did not
-re-check on that platform — the exact delta was **5** as of the previous
-measurement; re-verify it on Windows before quoting it. A static grep always
-reads 641.
+The gap is not drift, though the exact size of it is worth re-deriving rather
+than trusting the last committed sentence: `DidMapping_test.cpp` and
+`TelephonyApiConfig_test.cpp` each carry a `#if !defined(_WIN32) ... #else
+... #endif` pair around their persistence tests (`persist()` is in-memory
+only under `_WIN32`), and `GoogleServiceAuthCrypto_test.cpp` (issue #159)
+carries a `find_package(OpenSSL)`-conditional split — five real RS256 tests
+when OpenSSL is present (the case measured here), one `GTEST_SKIP` when it
+is not. A POSIX/WSL host with OpenSSL present runs **796** of the **799**
+statically-counted cases; a Windows-native build's exact count was not
+re-measured in this pass (its `_WIN32` persistence-test gap alone was 5 as
+of the previous measurement, before either the OpenSSL split or this PR's
+own test files existed) — re-verify it there before quoting a number.
 
 Quote a number you MEASURED. Every count in this file has been wrong at least
 once because someone carried forward the previous one — 310, then 506, then
@@ -289,8 +290,10 @@ Current allocation:
 | `18115`-`18119` | `PcapCapture_test.cpp` |
 | `18120`-`18124` | `HttpTraceCommand_test.cpp` |
 | `18125`-`18129` | `ServiceExtensions_test.cpp` |
-| `18130`-`18159` | `SmtpDialogue_test.cpp` (fake SMTP server, raw sockets — not HttpServer, but still claims its own block; ~17 scripted-server tests via auto-incrementing `_nextPort`, sized with headroom) |
+| `18130`-`18139` | `TwoRoleAuth_test.cpp` |
+| `18140`-`18159` | `ConfigExportImport_test.cpp` |
 | `18160`-`18169` | `EmailHttp_test.cpp` (auto-incrementing `_nextPort`) |
+| `18200`-`18229` | `SmtpDialogue_test.cpp` (fake SMTP server, raw sockets — not HttpServer, but still claims its own block; ~17 scripted-server tests via auto-incrementing `g_nextPort`, sized with headroom. Originally claimed 18130-18159 — renumbered here, at merge time, when that turned out to collide with the two rows above it, which claimed the same "next free block" independently and landed first. See #159's PR for the story; the lesson is in `SmtpDialogue_test.cpp`'s own header comment.) |
 | `19100`+ | `TelephonyConfigHttp_test.cpp` (auto-incrementing `_nextPort`) |
 | `193xx` | `ApiKillParse_test.cpp` (auto-incrementing `_nextPort`) |
 

@@ -162,6 +162,14 @@ add_executable(sip_parser_tests
     # alarm that fires if a service is marked dialable before anything can answer
     # a call routed to it.
     ServiceExtensions_test.cpp
+    # Issue #163: the REGISTER-time identity guard -- refuses a From-number that
+    # is one of the reserved virtual/emergency extensions (777/999/888/555/440/
+    # 911/933), E.164 ('+'-prefixed), or merely PSTN-shaped (long, all-digit),
+    # in every registrar mode, before a binding is ever created. Wire-level
+    # coverage driven through RequestsHandler::handle(); the pure
+    # pbx::isReservedExtension()/looksLikePstnAor()/isReservedOrPstnAor() logic
+    # (PbxConfig.hpp) is covered in Pbx_test.cpp instead.
+    RegisterIdentityGuard_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is
@@ -183,6 +191,14 @@ add_executable(sip_parser_tests
     # every non-PCMU packet as "wrong codec", so a phone in its default DTMF mode
     # could not drive a server-side menu at all.
     TelephoneEvent_test.cpp
+    # Issue #199 item 3: the WIRING around that parser. Nothing ever called
+    # setDtmfPayloadType() or set a sink, so the whole RFC 4733 receive path was
+    # orphaned and the feature-code surface was unreachable from a stock handset.
+    # Covers one-report-per-keypress off a packet burst (only testable on host
+    # because dispatchDtmf() was split out of the socket loop), the media-task to
+    # SIP-thread hand-off, and de-duplication against a phone that sends the same
+    # press over BOTH RFC 4733 and SIP INFO.
+    Rfc4733Dtmf_test.cpp
     PlayoutBuffer_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp
@@ -233,6 +249,19 @@ add_executable(sip_parser_tests
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp
+    # Issue #186: AdminAuth::pbkdf2Sha256/aesGcmSeal/aesGcmOpen against
+    # published RFC 7914 / GCM-spec vectors, plus the tamper/wrong-AAD/
+    # wrong-key properties the config-export "secrets_enc" block depends on.
+    AdminAuthCrypto_test.cpp
+    # Issue #173: the owner/sysop two-role privilege model -- authenticate(),
+    # the no-owner-yet fallback, lockout keyed by (channel, principal), and
+    # owner-vs-sysop gating on the three owner-only HTTP actions.
+    TwoRoleAuth_test.cpp
+    # Issue #186: GET/POST /api/config/export and POST /api/config/import,
+    # driven end-to-end through a real HttpServer -- plaintext round-trip,
+    # password-gated round-trip, replace-not-merge, and the 400/422 rejection
+    # paths.
+    ConfigExportImport_test.cpp
     # Issue #32: the live SIP tracer's data path — the actual bytes GET
     # /api/trace puts on the wire for the terminal's `trace on` command to
     # render, not just the C++-side getTraceRecords() accessor other tests
@@ -259,6 +288,29 @@ add_executable(sip_parser_tests
     # retransmit and drainOutbox()'s maybeTrack() scan, driven directly so the
     # same INVITE can be re-fed deterministically.
     TransactionLayer_test.cpp
+    # Issue #199 root cause 1: the rest of RFC 3261 §17 — the non-INVITE CLIENT
+    # transaction (Timer E/F/K) and both SERVER transactions (Timer G/H/I/J/L,
+    # plus the §13.3.1.4 2xx-retransmit-until-ACK). Also pins the two rules that
+    # keep the layer from doing harm: only responses this PBX AUTHORED are
+    # retransmitted (a relayed 200 OK belongs to the callee phone, which is
+    # already retransmitting it), and freeForCallId() must not cancel the very
+    # BYE that is tearing the dialog down.
+    TransactionLayerRfc17_test.cpp
+    # Issue #228: /api/kill's forceDisconnect() tore a call down server-side
+    # only — no BYE to either phone, and an inline erase that bypassed
+    # endCall() (no CDR, DTMF accumulator and #226 transaction slots leaked).
+    # Pins: one BYE per leg on the right dialog tags via _asyncOutbox, and
+    # endCall()'s side effects actually happening.
+    ForceDisconnect_test.cpp
+    # Issue #199 root cause 2: capability advertisement beyond OPTIONS. #200
+    # built addCapabilityHeaders() but wired it only into the OPTIONS 200 OK,
+    # which is not what gates UPDATE or Replaces on a conformant phone — it reads
+    # Allow off the dialog's own messages. Pins the advertisement on the
+    # registrar 200 and on 2xx the PBX authors as the real UAS, the absence of
+    # `timer` (RFC 4028 support here is passive — see #198), that a RELAYED
+    # answer keeps the callee's own capabilities, and that a phone's own Allow
+    # never survives into ours as a second header line.
+    CapabilityHeaders_test.cpp
     BlfSubscriptions_test.cpp
     DashboardSnapshot_test.cpp
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
@@ -362,6 +414,15 @@ add_executable(sip_parser_tests
     # The CDR ring buffer, extracted out of RequestsHandler into its own
     # translation unit.
     ../src/SIP/CdrRing.cpp
+    # Issue #194 Stage 1: SD CDR archive. The CSV formatter and the queue/
+    # drain decoupling (WriterQueue/drainAll) are pure C++17 and fully
+    # exercised here via a FakeSink; the real FatFs Sink and writer task are
+    # PD_ETH_HAS_SD-gated and compile to no-ops on this host build (that
+    # macro is never defined outside main/CMakeLists.txt's eth+elite branch),
+    # so record()/wipeAll()/init() are covered only for their reachable-on-
+    # host no-op contract -- see CdrArchive_test.cpp's header comment.
+    ../src/SIP/CdrArchive.cpp
+    CdrArchive_test.cpp
     # The DTMF digit-collection state machine + CLASS/admin codes, extracted
     # out of RequestsHandler into its own translation unit.
     ../src/SIP/DtmfFeatureCodes.cpp

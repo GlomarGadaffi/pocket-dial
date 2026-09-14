@@ -15,12 +15,16 @@
 //      upgrade are ESP-only, and this file's StartTls test pins what the
 //      HOST build does when asked to use them: fail cleanly, not crash.
 //
-// Ports: this file owns 18130-18159 (raw sockets, not HttpServer -- see
-// CONTRIBUTING_FIRMWARE.md's port table; picked from the next free block
-// rather than reusing any HttpServer-owning file's range). ~17 ScriptedServer
-// instances via the auto-incrementing g_nextPort below, sized with headroom
-// per CONTRIBUTING_FIRMWARE.md's own advice for a file with "more than a
-// couple" real-socket instances.
+// Ports: this file owns 18200-18229 (raw sockets, not HttpServer -- see
+// CONTRIBUTING_FIRMWARE.md's port table; renumbered from 18130 during a merge
+// with #227, which independently claimed 18130-18159 for TwoRoleAuth_test.cpp/
+// ConfigExportImport_test.cpp before this file's PR landed -- two PRs picking
+// the "next free block" in parallel is exactly the class of collision
+// CONTRIBUTING_FIRMWARE.md's table exists to prevent, and it still happened,
+// because neither PR could see the other's in-flight choice). ~17
+// ScriptedServer instances via the auto-incrementing g_nextPort below, sized
+// with headroom per CONTRIBUTING_FIRMWARE.md's own advice for a file with
+// "more than a couple" real-socket instances.
 
 #include <gtest/gtest.h>
 #include "SmtpDialogue.hpp"
@@ -51,7 +55,7 @@
 
 namespace
 {
-	std::atomic<int> g_nextPort{18130};
+	std::atomic<int> g_nextPort{18200};
 
 #if defined(_WIN32) || defined(_WIN64)
 	struct WsaInit

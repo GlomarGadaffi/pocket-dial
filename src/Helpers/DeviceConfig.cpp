@@ -553,6 +553,152 @@ namespace DeviceConfig
 		return true;
 	}
 
+}
+
+namespace
+{
+	// ---------------------------------------------------------------------
+	// WiFi station config readback (issue #186). Host-only mirror: on ESP
+	// these functions never cache anything (see the .hpp comment on why), so
+	// there is nothing here for the ESP branch to use. Kept separate from
+	// ConfigState deliberately — its `loaded`-once cache is the wrong shape
+	// for a value other writers can change out from under it.
+	// ---------------------------------------------------------------------
+	std::mutex& wifiMirrorMutex()
+	{
+		static std::mutex m;
+		return m;
+	}
+	struct WifiStationMirror
+	{
+		std::string ssid;
+		std::string password;
+		uint8_t     mode = 0;
+	};
+	WifiStationMirror& wifiMirror()
+	{
+		static WifiStationMirror w;
+		return w;
+	}
+}
+
+namespace DeviceConfig
+{
+	std::string getWifiSsid()
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		std::string result;
+		nvs_handle_t h;
+		if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK)
+		{
+			char buf[64] = {0};
+			size_t len = sizeof(buf);
+			if (nvs_get_str(h, "wifi_ssid", buf, &len) == ESP_OK)
+			{
+				result = buf;
+			}
+			nvs_close(h);
+		}
+		return result;
+#else
+		std::lock_guard<std::mutex> lock(wifiMirrorMutex());
+		return wifiMirror().ssid;
+#endif
+	}
+
+	uint8_t getWifiMode()
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		uint8_t mode = 0;
+		nvs_handle_t h;
+		if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK)
+		{
+			// Explicit check (CONTRIBUTING_FIRMWARE.md Pattern 4): an absent
+			// key or any other read failure must leave `mode` at its safe
+			// pre-initialized default (0, captive-portal) rather than an
+			// unchecked call merely happening to leave it there today.
+			if (nvs_get_u8(h, "wifi_mode", &mode) != ESP_OK)
+			{
+				mode = 0;
+			}
+			nvs_close(h);
+		}
+		return mode;
+#else
+		std::lock_guard<std::mutex> lock(wifiMirrorMutex());
+		return wifiMirror().mode;
+#endif
+	}
+
+	std::string getWifiPassword()
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		std::string result;
+		nvs_handle_t h;
+		if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK)
+		{
+			char buf[128] = {0};
+			size_t len = sizeof(buf);
+			if (nvs_get_str(h, "wifi_pass", buf, &len) == ESP_OK)
+			{
+				result = buf;
+			}
+			nvs_close(h);
+		}
+		return result;
+#else
+		std::lock_guard<std::mutex> lock(wifiMirrorMutex());
+		return wifiMirror().password;
+#endif
+	}
+
+	bool setWifiConfig(const std::string& ssid, uint8_t mode)
+	{
+		if (ssid.empty() || ssid.size() > 32 || mode > 2)
+		{
+			return false;
+		}
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		nvs_handle_t h;
+		if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+		{
+			return false;
+		}
+		bool ok = (nvs_set_str(h, "wifi_ssid", ssid.c_str()) == ESP_OK) &&
+		          (nvs_set_u8(h, "wifi_mode", mode) == ESP_OK) &&
+		          (nvs_commit(h) == ESP_OK);
+		nvs_close(h);
+		return ok;
+#else
+		std::lock_guard<std::mutex> lock(wifiMirrorMutex());
+		wifiMirror().ssid = ssid;
+		wifiMirror().mode = mode;
+		return true;
+#endif
+	}
+
+	bool setWifiPassword(const std::string& password)
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		nvs_handle_t h;
+		if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+		{
+			return false;
+		}
+		bool ok = (nvs_set_str(h, "wifi_pass", password.c_str()) == ESP_OK) &&
+		          (nvs_commit(h) == ESP_OK);
+		nvs_close(h);
+		return ok;
+#else
+		std::lock_guard<std::mutex> lock(wifiMirrorMutex());
+		wifiMirror().password = password;
+		return true;
+#endif
+	}
+}
+
+namespace DeviceConfig
+{
 	bool applyFlashSeed()
 	{
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)

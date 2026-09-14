@@ -19,6 +19,8 @@
 #include <thread>
 #include <cstdint>
 
+#include "AdminAuth.hpp"   // AdminAuth::Role, used by requireAdmin()'s minRole param
+
 // Forward declaration — the HttpServer queries the SIP engine via this
 class RequestsHandler;
 
@@ -87,7 +89,13 @@ private:
 	//
 	// `needCsrf` should be true for every mutating request and false for reads;
 	// the token is only checked when a session actually exists to bind it to.
-	bool requireAdmin(int sock, const HttpRequest& req, bool needCsrf);
+	// `minRole` (issue #173) gates the THREE owner-only actions (factory reset,
+	// config export WITH the encrypted secrets block, OTA upload) — pass
+	// AdminAuth::Role::Owner for those three call sites only; every other call
+	// site keeps the default (Sysop), unchanged. See AdminAuth::
+	// sessionSatisfiesRole() for the no-owner-yet fallback this relies on.
+	bool requireAdmin(int sock, const HttpRequest& req, bool needCsrf,
+		AdminAuth::Role minRole = AdminAuth::Role::Sysop);
 	// Answers "is this caller logged in?" WITHOUT answering the request, for
 	// endpoints that serve everyone but disclose more to a session (#207).
 	bool hasValidAdminSession(const HttpRequest& req) const;
@@ -194,8 +202,27 @@ private:
 	// --- Admin auth endpoints (PIN-gated session layer; see AdminAuth.hpp) ---
 	void sendApiAdminStatus(int sock, const HttpRequest& req);
 	void sendApiAdminSetCredential(int sock, const HttpRequest& req);
+	// Issue #173: bootstrap/replace the OWNER principal. Dispatched with
+	// requireAdmin(..., minRole=Owner) — which, via sessionSatisfiesRole()'s
+	// no-owner-yet fallback, lets a sysop session bootstrap the FIRST owner
+	// account but requires an existing owner to replace one.
+	void sendApiAdminSetOwnerCredential(int sock, const HttpRequest& req);
 	void sendApiAdminLogin(int sock, const HttpRequest& req);
 	void sendApiAdminLogout(int sock, const HttpRequest& req);
+
+	// --- Config export/import (issue #186) ---
+	// GET/POST /api/config/export. `withSecrets`/`password` select the
+	// password-gated "secretsEnc" block; the dispatch site in handleClient()
+	// decides withSecrets from whether a `password` form field was sent (POST
+	// only — the plain GET never carries one) and requires Owner only on the
+	// withSecrets path (see requireAdmin's minRole).
+	void sendApiConfigExport(int sock, bool withSecrets, const std::string& password);
+	// POST /api/config/import. Body is form-encoded: blob=<url-encoded JSON
+	// export>&password=<optional>&confirm=REPLACE. Sysop-level (default
+	// minRole) with its own confirm-before-overwrite interlock, per #173's
+	// "sysop gets add/change with a confirm-before-overwrite interlock" —
+	// restoring secrets is not one of the three owner-only ACTIONS #173 names.
+	void sendApiConfigImport(int sock, const std::string& body);
 
 	// Music-on-hold panel (PBX settings). Status reports the BUILD capability and
 	// the runtime state separately, so a client can tell "no card on this board"

@@ -28,8 +28,14 @@ public:
 	// `session` (may be null) supplies the start time / final state used to
 	// derive duration and result; src/dest provide the parties when the
 	// session lookup can't (e.g. the virtual 777/999 extensions reuse a shared
-	// dummy client). Write-through persists to NVS (no-op on host).
-	void record(const std::shared_ptr<Session>& session,
+	// dummy client). Write-through persists to NVS (no-op on host). Returns a
+	// reference to the slot just written (valid until the ring wraps back onto
+	// it POCKETDIAL_CDR_RECORDS records from now) so a caller — endCall(),
+	// specifically — can reuse the already-computed startMs/durationSec/result
+	// (including the Connected/Held/Bye -> Answered disposition logic above)
+	// instead of re-deriving them from the session a second time. Issue #194
+	// Stage 1 (SD CDR archive) is the first consumer of this.
+	const CallDetailRecord& record(const std::shared_ptr<Session>& session,
 		std::string_view srcNumber, std::string_view destNumber);
 
 	// Newest-first copy of the ring, for the dashboard snapshot. Caller holds

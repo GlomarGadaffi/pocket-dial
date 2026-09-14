@@ -1,11 +1,23 @@
 # Phone Auto-Provisioning
 
-**Issue:** #35
-**Status:** **Shipped.** `GET /config/<mac>.cfg` is implemented and served by every build
-(`HttpServer.cpp:437-445`, `:1166-1206`; renderer in `src/SIP/ProvisioningConfig.hpp`).
-**Format:** Yealink plain-text auto-provisioning keys (`key = value`). Yealink only.
+**Issue:** #35, #177 (multi-vendor renderers), #178 (DHCP Option 66)
+**Status:** **Shipped, Yealink only, live.** `GET /config/<mac>.cfg` is implemented and served
+by every build (`HttpServer.cpp:437-445`, `:1166-1206`; renderer in
+`src/SIP/ProvisioningConfig.hpp`).
+**Format:** Yealink plain-text auto-provisioning keys (`key = value`) on the live route.
 **Never confirmed against a physical handset** — the key names follow Yealink's long-stable,
 widely-documented auto-provisioning key set, but no real phone has ever consumed this file.
+
+**Issue #177 status: renderers shipped, wiring not.** `ProvisioningConfig.hpp` now also builds
+Grandstream, Polycom (two-file) and Cisco SPA/Linksys/Sipura configs, plus
+`detectVendorFromUserAgent()` / `renderProvisioningConfigForUserAgent()` to pick one — all pure,
+all host-tested (`tests/ProvisioningConfig_test.cpp`). **None of it is reachable over HTTP yet.**
+The live route still calls `yealinkConfigFor()` unconditionally, regardless of what phone asks.
+See [§2.5](#25-multi-vendor-renderers-issue-177--not-yet-wired) for what exists, what's missing
+to wire it up, and how confident to be in each vendor's field names.
+
+**Issue #178 status: SoftAP injection not achievable in this repo without a much larger change;
+wired-LAN path is a config recipe, not code.** See [§1.1](#11-dhcp-option-66--option-43-the-real-zero-touch-path--not-implemented).
 
 > [!IMPORTANT]
 > **Read §0.1 before planning a deployment around this.** The endpoint only serves a MAC that
@@ -41,8 +53,9 @@ fly from the extension that MAC last registered as.
   **There is no `adopt` action** — see §0.1.
 * **No password in the file.** See §4. This is the single biggest divergence from the
   original design's threat model.
-* **No DHCP option, no token, no provisioning window, no auto-assign, no Grandstream/Polycom
-  /Cisco renderer, no TLS.**
+* **No DHCP option, no token, no provisioning window, no auto-assign, no TLS.**
+* **Grandstream/Polycom/Cisco renderers exist (Issue #177) but nothing routes to them.** See
+  [§2.5](#25-multi-vendor-renderers-issue-177--not-yet-wired).
 
 ### 0.1 The real limitation: a phone must register before it can be provisioned
 
@@ -100,26 +113,102 @@ Enterprise phones request a provisioning URL via DHCP:
   Cisco/Polycom use it; encoding differs per vendor. More fragile.
 * **Option 160** — Polycom/Poly's dedicated provisioning-URL option.
 
-**The ESP-IDF feasibility constraint.** pocket-dial's SoftAP runs the bundled ESP-IDF
-`dhcpserver` component (`esp_netif_dhcps_start()`, `main/esp_main.cpp:134`). The server-side
-option API, `esp_netif_dhcps_option()`, exposes only a fixed, small enum of option IDs
-(subnet mask, DNS, router solicitation, requested IP, lease time, retry time, vendor class
-identifier, vendor-specific info).
+**The ESP-IDF feasibility constraint (Issue #178) — now confirmed by reading the SDK source,
+not just the header surface.** pocket-dial's SoftAP and (when it runs its own DHCP server on
+the wired side) Ethernet builds both use the bundled ESP-IDF `dhcpserver` component
+(`esp_netif_dhcps_start()`, `main/esp_main.cpp:135`, `main/esp_main_eth.cpp:619` — line numbers
+as of commit `78b399b`; they drift). Verified against an ESP-IDF **v6.0.2** checkout (CI pins v6.0.1 — the "no case for 66" finding
+below is structural and very unlikely to be version-specific, but "114 is supported"
+specifically might not hold on 6.0.1; re-check if that distinction ever matters):
 
-So:
+* **`esp_netif_dhcps_option()`** (`components/esp_netif/lwip/esp_netif_lwip.c`) takes an
+  `esp_netif_dhcp_option_id_t`, a **closed enum**: subnet mask, DNS, router-solicitation flag,
+  requested-IP pool, lease time, retry time, vendor class identifier, vendor-specific info, and
+  (new since the original version of this doc was written) **Captive-Portal URI, RFC 8910,
+  option 114** — `ESP_NETIF_CAPTIVEPORTAL_URI`. There is no `TFTP_SERVER_NAME` / option-66
+  entry in this enum.
+* Underneath that, **`dhcps_option_info()` / `dhcps_set_option_info()`**
+  (`components/lwip/apps/dhcpserver/dhcpserver.c`) — the actual per-option storage — has a
+  `switch` over exactly the same closed set (`IP_ADDRESS_LEASE_TIME`, `REQUESTED_IP_ADDRESS`,
+  `ROUTER_SOLICITATION_ADDRESS`, `DOMAIN_NAME_SERVER`, `SUBNET_MASK`, `CAPTIVEPORTAL_URI`). An
+  unrecognized `op_id` — option 66 included — hits `default: break;` and the function returns
+  `NULL`/does nothing. **There is no field in `struct dhcps_t` to hold an option-66 value at
+  all** (compare `dhcps_captiveportal_uri`, which exists specifically for option 114 and
+  nothing else).
+* **The one documented extension hook doesn't help either.** `LWIP_HOOK_DHCPS_POST_STATE`
+  (`dhcpserver.h`'s own doc comment) fires on `pmsg_dhcps`, the just-parsed **inbound** request,
+  immediately after `parse_msg()` and before `send_offer()`/`send_ack()` build a brand-new
+  **outbound** message from scratch. A hook here can inspect what the phone asked for; it
+  cannot append bytes to what the server sends back.
 
-* **Option 66 is NOT settable through the public API.** There is no `ESP_NETIF_*` enum for
-  code 66. Serving it requires either patching/forking the `dhcpserver` component, or
-  disabling the built-in DHCP server and shipping a minimal responder of our own (we already
-  ship a hand-rolled DNS server in `main/wifi/DnsServer.cpp`, so the pattern exists).
+So: **there is no public, or even internal-but-reachable, way to put option 66 into a SoftAP
+DHCP OFFER/ACK without changing `dhcpserver.c` itself.** That file lives inside the `lwip`
+component of the ESP-IDF SDK, not in this repository. The only ways to actually ship this are:
+
+1. **Fork the `lwip` component** via `EXTRA_COMPONENT_DIRS` (a project-local directory named
+   `lwip` shadows the SDK's own) and add a `dhcps_captiveportal_uri`-shaped field/case for
+   option 66 in `send_offer()`/`send_ack()`. This is a fork of an entire IDF component to
+   change one function in one file inside it — large, and it has to be kept in sync with SDK
+   upgrades by hand.
+2. **Stop using the built-in DHCP server and ship a minimal one of our own**, the same pattern
+   `main/wifi/DnsServer.cpp` already uses for DNS. Full control over every option, but a new
+   UDP server to write, test and keep correct (lease tracking, retransmits, the states
+   `dhcpserver.c` already handles) — a materially bigger undertaking than "add one option."
+
+Both are out of scope for a change confined to `main/esp_main.cpp` / `main/esp_main_eth.cpp` —
+scoping this work to those two files (per Issue #178's own text) was, in hindsight, scoping it
+to something that cannot be done in those two files. **Neither has been built.** Issue #178
+stays open for the SoftAP/Ethernet-DHCP-server case specifically; see
+[§1.1a](#11a-wired-lan-with-your-own-dhcp-server--works-today-configure-it-there) for the case
+that *is* actionable today.
+
 * **Option 43 IS settable** via `ESP_NETIF_VENDOR_SPECIFIC_INFO`, but the payload must be a
   raw vendor TLV blob and each vendor decodes it differently. One blob that satisfies Yealink
   *and* Grandstream *and* Cisco simultaneously is brittle and firmware-version sensitive.
 * **Option 160** is likewise not in the enum.
 
-> **Standing decision:** if DHCP discovery is ever built, do it by **forking the bundled
-> `dhcpserver` to inject Option 66** (single clean string, widest vendor support), not by
-> abusing Option 43. None of this has been built.
+> **Standing decision (unchanged by the #178 investigation):** if SoftAP-side DHCP discovery is
+> ever built, do it by **forking `lwip`'s `dhcpserver.c` to inject Option 66** (single clean
+> string, widest vendor support) or by replacing the DHCP server outright, not by abusing
+> Option 43. Pick the fork if IDF-upgrade churn on one file is acceptable; pick the from-scratch
+> responder if it isn't. Neither is a small change — budget it as its own issue, not a follow-up
+> bullet.
+
+### 1.1a Wired LAN with your own DHCP server — works today, configure it there
+
+When phones sit on a wired LAN behind a *site's own* DHCP server (a router, `dnsmasq`, ISC
+`dhcpd`, a Windows Server DHCP role, a pfSense/OPNsense box, …) rather than pocket-dial's own
+SoftAP, none of §1.1's ESP-IDF constraint applies — that server is not pocket-dial's code, and
+setting Option 66 on it is ordinary DHCP-server administration, not a firmware change:
+
+| DHCP server | How to set Option 66 |
+| :--- | :--- |
+| `dnsmasq` | `dhcp-option=66,"http://<board-ip>/config/"` in `dnsmasq.conf` |
+| ISC `dhcpd` | `option tftp-server-name "http://<board-ip>/config/";` in the relevant `subnet`/`host` block |
+| Windows Server DHCP | Scope Options → **066 Boot Server Host Name** → the same URL string |
+| pfSense/OPNsense | Services → DHCP Server → the interface's **TFTP Server** field |
+| MikroTik RouterOS | `/ip dhcp-server option add name=opt66 code=66 value="'http://<board-ip>/config/'"`, then attach it to the DHCP server's option set |
+
+Point it at `http://<board-ip>/config/` — a directory, not a specific `.cfg` file — and let each
+phone append its own filename the way its firmware already does.
+
+**Be honest with the installer about what actually 200s once the phone fetches that URL.**
+Today, only one shape reaches a working response:
+
+* A **Yealink** phone requesting `<mac>.cfg` (its own MAC, 12 lowercase hex, no separators) —
+  **and only if that MAC is already in the Learn-mode adopted-device registry** (§0.1). Every
+  other phone, on every vendor, gets a `404`:
+  * Grandstream's `cfg<mac>.xml`, Polycom's `<mac>-phone.cfg` / `000000000000.cfg`, and Cisco
+    SPA's `spa<model>.cfg` all fail `isProvisioningConfigPath()`'s shape check before
+    `findProvisioningInfo()` is ever called — see [§2.5](#25-multi-vendor-renderers-issue-177--not-yet-wired).
+  * Even a Yealink phone 404s if its MAC has never registered while the board was in Learn mode
+    (§0.1) — Option 66 only gets the phone to *ask*; it does not make the board *know* the
+    phone yet.
+
+So Option 66 alone does not deliver zero-touch bootstrap for a fleet with mixed vendors, or for
+any vendor before the multi-vendor wiring in §2.5 is finished. It does remove the one manual
+step §1.3 describes (typing the URL into the phone's web UI) for Yealink phones that have
+already registered once. Set expectations with whoever is deploying this accordingly.
 
 ### 1.2 mDNS — advertised, but not a provisioning-discovery path
 
@@ -168,8 +257,10 @@ Vendor is implicit: there is one renderer. `User-Agent` is not read and not used
    Miss → `404`.
 2. Re-validates the adopted extension against `isValidAor()` as defence in depth: the `.cfg`
    interpolates the extension into `key = value\r\n` lines, so a CR/LF in it would inject
-   config lines nobody wrote (Issue #107). Fails closed → `404`
-   (`RequestsHandler.cpp:4414-4426`).
+   config lines nobody wrote (Issue #107). The same recheck also refuses an adopted extension
+   that is reserved, emergency, or PSTN-shaped (`pbx::isReservedOrPstnAor()`, Issue #163) — the
+   REGISTER-time identity guard onRegister() applies is not the only gate provisioning depends
+   on. Either failure closes → `404` (`RequestsHandler.cpp::findProvisioningInfo`).
 3. Resolves the server IP the same way `/api/status` does; SIP port is hardcoded `5060`
    (this codebase does not support a non-default SIP listen port).
 4. `provisioning::yealinkConfigFor(ext, ip, 5060, authRequired)`. If the builder refuses
@@ -261,6 +352,53 @@ Notes:
 
 ---
 
+### 2.5 Multi-vendor renderers (Issue #177) — not yet wired
+
+`src/SIP/ProvisioningConfig.hpp` builds three more vendor configs alongside
+`yealinkConfigFor()`, plus a `Vendor` enum and two dispatch functions
+(`detectVendorFromUserAgent()`, `renderProvisioningConfigForUserAgent()`). All of it is pure
+(no sockets, no NVS, no globals) and host-tested (`tests/ProvisioningConfig_test.cpp`). **None
+of it is reachable through `GET /config/<mac>.cfg` today** — `HttpServer::sendConfigCfg()`
+(`HttpServer.cpp`) still calls `yealinkConfigFor()` unconditionally, and this change
+deliberately did not touch `HttpServer.cpp`/`RequestsHandler.cpp` to make that true (out of
+scope — see the PR that introduced this section).
+
+**What's missing to wire it up, precisely — three separate gaps, not one:**
+
+1. **User-Agent isn't captured.** `HttpServer::HttpRequest` (`HttpServer.hpp`) and
+   `parseRequest()` (`HttpServer.cpp`) currently keep `origin`, `host`, `cookie` and `x-csrf`
+   only. `detectVendorFromUserAgent()` needs the raw `User-Agent` header value, which isn't
+   parsed out of the request at all yet.
+2. **The path-shape check is Yealink-only.** `isProvisioningConfigPath()` accepts exactly
+   `/config/` + 12 lowercase hex + `.cfg` (§0.2). None of the other vendors' real request
+   filenames fit that: Grandstream requests `cfg<mac>.xml`, Polycom requests
+   `<mac>-phone.cfg` (and, once, the fixed `000000000000.cfg`), Cisco SPA/Linksys/Sipura
+   request `spa<model>.cfg`. Each needs its own shape check, or a looser one that extracts
+   both the MAC and which shape matched.
+3. **Polycom's base file has no route, and can't use the MAC-keyed one.**
+   `polycomBaseConfigFor()` takes no arguments — it's the same for every phone — but
+   `000000000000.cfg` *does* pass today's `isProvisioningConfigPath()` shape check (12 hex
+   chars, coincidentally all zero) and would then 404 in `findProvisioningInfo()`, which has no
+   device named `000000000000`. Serving it correctly means special-casing that exact filename
+   *before* the registry lookup, not after.
+
+**Renderer-by-renderer confidence** (all four share the CR/LF injection guard from Issue #107,
+and the three XML ones additionally XML-escape the extension. That escaping is defence in depth,
+not a fix for a reachable bug: the live route re-validates with `isValidAor()`, which admits only
+alnum + `.-_+*#`, so `&` cannot reach a renderer today — but the renderers are pure functions with
+no validation of their own, and a future less-filtered caller would otherwise emit malformed XML):
+
+| Vendor | Structure | Field names |
+| :--- | :--- | :--- |
+| Yealink | N/A (plain text) | Long-stable, widely documented; **never tested against real hardware** (§2.4). |
+| Grandstream | **Confirmed** against Grandstream's own [SIP Device Provisioning Guide](https://blog.grandstream.com/hubfs/Grandstream_Feb_2021/Pdf/gs_provisioning_guide_public.pdf) example (`<gs_provision version="1">` → `<mac>` → `<config version="1">` wrapping one `<PNNN>value</PNNN>` element per field — not a `"PNNN = value"` text-line shape). | P271/P270 confirmed against that same guide's example (numeric Active flag / string account name). P36 = SIP Authenticate ID and P34 = SIP Authenticate Password (an earlier draft had these two reversed — caught in review of PR #224 — which would have handed the phone the extension as its password and an empty auth ID). The rest (P34/P35/P36/P47/P57/P58) come from a secondary [Grandstream P-Codes reference](https://support.ispsupplies.com/portal/en/kb/articles/grandstream-p-codes-31-10-2019) that **actively disagrees** with other secondary sources found during this change on which P-number means what — P-value assignments are documented per device generation, not universally. Confirm against the target model's own P-Value guide before deploying. P47 folds in a non-default port as `ip:port` rather than using a separate port field — Grandstream's own SIP-Server field is documented as taking address *and* port together, and there is no reliably-sourced separate port P-number. |
+| Polycom | Two-file scheme (`polycomBaseConfigFor()` / `polycomPhoneConfigFor()`) cross-confirmed against multiple independent third-party UC Software config examples. | `reg.1.address`/`label`/`displayName`/`auth.userId`/`auth.password`/`server.1.address` cross-confirmed the same way. `reg.1.server.1.port`, `reg.1.server.1.transport` and `voice.codecPref.G711_Mu`/`G711_A` are standard, widely-cited UC Software parameter names, not independently re-confirmed for this change. The base file's `<APPLICATION>` element/attributes are likewise standard-but-unconfirmed, and deliberately omits `APP_FILE_PATH` (pocket-dial hosts no Polycom firmware image; whether a phone tolerates that omission is a hardware question). |
+| Cisco SPA / Linksys / Sipura | **Confirmed** against Cisco's own [SPA100/200-series Provisioning Guide](https://www.cisco.com/c/dam/en/us/td/docs/voice_ip_comm/csbpvga/spa100-200/provisioning/guide/SPA100-200_Provisioning.pdf): `<flat-profile>` root, trailing-underscore line-numbered tags (`Line_Enable_1_`, `Proxy_1_`, `User_ID_1_`, `Auth_ID_1_`, `Password_1_`), `G711u`/`G711a` codec value strings, and the `Proxy_1_` field folding address and port together (the guide's own worked example: `192.168.2.100:6060`). | `Use_Auth_ID_1_` is the standard field name from the same product family's admin-UI-derived naming convention, not independently re-confirmed in that specific guide. |
+
+None of the four has been tested against a real handset of any vendor.
+
+---
+
 ## 3. Extension assignment
 
 There is one mode, and it is not configurable: **the extension is whatever that MAC last
@@ -278,10 +416,24 @@ Consequences:
   grow the heap without limit (`Registrar.cpp:171-178`). Because the registry is bounded by
   the *same* constant as the client pool, the original design's "you can pre-map 50 phones
   against a 32-slot pool" scenario does not arise here.
-* **Reserved virtual extensions** (`777`, `999`, `440`, `555`, `888`, `700`-`709`,
-  `980`-`989`) are handled before ordinary routing, so a phone that registers as one of them
-  is shadowed by the feature. The registry does not refuse them; the router simply never
-  reaches the registration. Do not assign them.
+* **Reserved and emergency extensions** (`777`, `999`, `440`, `555`, `888`, `911`, `933`) are
+  refused outright by `onRegister()`'s identity guard (`pbx::isReservedOrPstnAor()`, Issue
+  #163) — `403`, before the registrar-mode branch runs at all, so the registry never adopts
+  one of these names in ANY mode, Learn included. Before #163 this section described a
+  weaker property ("shadowed by routing, not actually refused") that let a phone squat on
+  `911` with zero indication anything was wrong; that gap is what #163 closed. An AOR that is
+  `+`-prefixed (E.164) or otherwise looks like a direct-dial PSTN number (long, all-digit —
+  `POCKETDIAL_MIN_PSTN_AOR_DIGITS`, `PoolConfig.hpp`) is refused the same way. The park-orbit
+  (`700`-`709`) and page-zone (`980`-`989`) *ranges* are a separate mechanism — dial-plan
+  routing intercepts those, per the original note — and are unaffected by this guard.
+  Do not assign any of the above.
+* **Not yet guarded: `admitLearn()`'s own re-sync branch.** If a MAC already adopted under one
+  extension re-REGISTERs under a different AOR, `admitLearn()` updates the stored extension to
+  match (`Registrar.cpp:188-194`) — but `onRegister()`'s identity guard runs *before*
+  `admitLearn()` is ever reached, so in practice a resync can never carry a reserved/emergency/
+  PSTN-shaped AOR either. There is no independent check inside `admitLearn()` itself; it relies
+  entirely on the caller's gate. Tracked as a possible defense-in-depth follow-up, not a known
+  bypass.
 * **`forget` re-arms adoption.** `POST /api/registrar/device` with `action=forget` removes the
   record; a later REGISTER in Learn mode re-learns it (`Registrar.hpp:83-85`).
 
@@ -373,7 +525,8 @@ board nothing authenticates one. Do not describe it as a security control.
       |                                  |  | hex + .cfg, else 404
       |                                  |  | findProvisioningInfo(mac) in the
       |                                  |  | adopted-device registry, else 404
-      |                                  |  | isValidAor(ext) re-check, else 404
+      |                                  |  | isValidAor(ext) + reserved/emergency/
+      |                                  |  | PSTN-shaped re-check, else 404
       |   200 OK  text/plain             |<-+ yealinkConfigFor(ext, ip, 5060, auth)
       |   account.1.* = ...              |     password field BLANK
       |<---------------------------------|
@@ -408,15 +561,20 @@ it otherwise. Nothing in this section describes current behaviour.
 
 ```
 GET /provision/{mac}.cfg      # superseded by GET /config/{mac}.cfg
-GET /provision/{mac}.xml      # Grandstream / Polycom — never built
-GET /provision/{mac}.boot     # Polycom master bootstrap — never built
-GET /provision/{mac}.cisco    # Cisco SPA/MPP — never built
+GET /provision/{mac}.xml      # Grandstream / Polycom — content renderer exists (§2.5), route doesn't
+GET /provision/{mac}.boot     # Polycom master bootstrap — content renderer exists (§2.5), route doesn't
+GET /provision/{mac}.cisco    # Cisco SPA/MPP — content renderer exists (§2.5), route doesn't
 POST   /api/provision/map     # admin MAC->extension mapping — never built
 DELETE /api/provision/map
 POST   /api/provision/window  # timed provisioning window — never built
 POST   /api/provision/reset
 GET    /api/provision/list
 ```
+
+The exact filenames above are illustrative, not what a real phone requests — see §2.5 for the
+actual per-vendor filenames (`cfg<mac>.xml`, `<mac>-phone.cfg` / `000000000000.cfg`,
+`spa<model>.cfg`) and the three concrete gaps between "the renderer exists" and "the route
+exists."
 
 ### 6.2 Storage that does not exist
 
