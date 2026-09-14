@@ -420,12 +420,27 @@ static void sip_server_task(void* pvParameters)
              s_ip_addr.c_str(), SIP_PORT);
 
     unsigned long lastHeartbeat = 0;
+
+    // Issue #185: subscribe to the Task Watchdog Timer so a tick() that never
+    // returns (stuck on a lock, a runaway loop) produces a logged, controlled
+    // reset instead of a silently unresponsive board. esp_task_wdt_add(NULL)
+    // subscribes the CALLING (this) task; only this task's own loop below may
+    // feed it via esp_task_wdt_reset() -- the TWDT has no "reset on behalf of
+    // another task" call, by design (see sdkconfig.defaults for the PANIC=y
+    // that makes a timeout actually reset the board). A failed subscription is
+    // logged and non-fatal: better an unmonitored SIP task than no SIP task.
+    esp_err_t wdtErr = esp_task_wdt_add(NULL);
+    if (wdtErr != ESP_OK) {
+        ESP_LOGE(TAG, "esp_task_wdt_add failed (%s) -- this task's stalls will go undetected",
+                 esp_err_to_name(wdtErr));
+    }
+
     while (true)
     {
         srv->getHandler().tick();
         // Fed once per 1 s loop, well inside the 5 s default TWDT timeout
         // (CONFIG_ESP_TASK_WDT_TIMEOUT_S). Harmless no-op if the add above failed.
-        esp_task_wdt_reset();
+        (void)esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(1000));
         unsigned long nowSec = (unsigned long)(esp_timer_get_time() / 1000000);
         if (nowSec - lastHeartbeat >= 30)

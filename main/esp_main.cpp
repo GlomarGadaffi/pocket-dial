@@ -237,6 +237,13 @@ void sip_server_task(void *pvParameters)
     ESP_LOGI("SipServerTask", "Starting SipServer on %s:%d", s_sip_ip.c_str(), port);
 
     // Issue #185: subscribe to the Task Watchdog Timer so a tick() that never
+
+    SipServer* srv = new SipServer(s_sip_ip, port);
+    // Publish with release so the HTTP task's acquire-load sees a fully-constructed
+    // object (not a half-initialised one) the moment it observes the non-null pointer.
+    g_sipServer.store(srv, std::memory_order_release);
+
+    // Issue #185: subscribe to the Task Watchdog Timer so a tick() that never
     // returns (stuck on a lock, a runaway loop) produces a logged, controlled
     // reset instead of a silently unresponsive board. esp_task_wdt_add(NULL)
     // subscribes the CALLING (this) task; only this task's own loop below may
@@ -250,15 +257,11 @@ void sip_server_task(void *pvParameters)
                  esp_err_to_name(wdtErr));
     }
 
-    SipServer* srv = new SipServer(s_sip_ip, port);
-    // Publish with release so the HTTP task's acquire-load sees a fully-constructed
-    // object (not a half-initialised one) the moment it observes the non-null pointer.
-    g_sipServer.store(srv, std::memory_order_release);
     while (1) {
         srv->getHandler().tick();
         // Fed once per 1 s loop, well inside the 5 s default TWDT timeout
         // (CONFIG_ESP_TASK_WDT_TIMEOUT_S). Harmless no-op if the add above failed.
-        esp_task_wdt_reset();
+        (void)esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
