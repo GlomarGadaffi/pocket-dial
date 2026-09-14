@@ -224,9 +224,15 @@ hears audio.
 What the media path actually is, because it decides where to look:
 
 * An **ordinary extension-to-extension call is peer-to-peer**. The board relays the SDP but
-  never touches the RTP — the phones stream directly to each other. Hold, park and transfer
-  keep that property: only the codec list is narrowed, the `c=` connection line is never
+  never touches the RTP — the phones stream directly to each other. Hold and transfer keep
+  that property: only the codec list is narrowed, the `c=` connection line is never
   rewritten.
+* **A call parked on an orbit is the exception.** With a music-on-hold clip loaded the board
+  answers the parked leg `sendonly` from its own port and streams the clip to it, so board-side
+  capture *will* show RTP for a parked call. With no clip loaded (the default) park answers
+  `a=inactive` and the board sends nothing — which is also what you will see if the clip
+  failed to load, so "parked caller hears silence" is a MoH-configuration symptom, not a
+  media-path fault.
 * **`777` (echo) also touches no RTP** — it is an SDP loopback, so the phone streams to
   itself. That makes it a test of *that one phone's* media path, not of the board's.
 * **`440` (tone), `555` (anchor bridge) and `888` (conference) are server-terminated** — the

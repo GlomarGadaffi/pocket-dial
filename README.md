@@ -147,9 +147,16 @@ button, or `POST /api/dialplan`.
 
 ### Admin
 A web dashboard (always reachable, username + password, forced setup on first
-boot), call-detail records, live SIP tracing with `.pcap` export, dual-slot OTA
-updates with rollback, and zero-touch phone provisioning over
-`GET /config/<mac>.cfg`.
+boot), call-detail records, live SIP tracing with `.pcap` export, a **PBX Settings**
+panel (`F6`) for uploading and previewing the hold-music clip, dual-slot OTA
+updates with rollback, a Prometheus-style **`GET /metrics`** endpoint, and
+zero-touch phone provisioning over `GET /config/<mac>.cfg`.
+
+> Not every read endpoint is behind the login. `/api/status`, `/api/cdr`,
+> `/metrics`, `/api/ota/status`, `/api/wifi/scan`, `/api/admin/status` and
+> `GET /config/<mac>.cfg` all answer without a session — see
+> [THREAT_MODEL.md §4 E-2](docs/THREAT_MODEL.md). `/api/cdr` in particular hands
+> the recent call log to any host that can reach the board.
 
 ---
 
@@ -159,11 +166,21 @@ This distinction matters more than any feature list, so it gets its own section.
 
 | Call type | Does the board carry audio? |
 |---|---|
-| Extension → extension | **No.** Direct phone-to-phone RTP, including on hold, park and transfer |
+| Extension → extension | **No.** Direct phone-to-phone RTP, including on hold and transfer |
+| Call sitting on a park orbit | **Only if music on hold is configured** — see below |
 | `777` echo test | **No.** The SDP is looped back; the phone streams to itself |
 | `440` tone | Yes — the board generates and sends it |
 | `888` conference | Yes — decodes, mixes and re-encodes every leg |
 | `555` / outside lines | Yes — the board bridges audio to the external system |
+
+**Park is the one exception that moved.** Historically a parked caller heard literal
+silence: the board answered `a=inactive` on the discard port and sourced nothing. With
+a music-on-hold clip loaded it instead answers `sendonly` from its own port and streams
+the clip to the parked phone, so for the duration of the park the board *is* in the
+media path — one-way, board→phone only, and only for the parked leg. With no clip
+loaded, which is the default, park falls back to the old silent `a=inactive` hold and
+the board still sources nothing. Phone-initiated hold is unaffected either way: that
+SDP is relayed untouched.
 
 Codecs on peer-to-peer legs: **PCMU, PCMA and G.722** — the board narrows the offer
 to what it can broker and otherwise leaves the phones to negotiate. Legs the board
@@ -226,8 +243,13 @@ only the dashboard — not SIP or RTP. The reasoning is in
 
 ## What it deliberately does not do
 
-No voicemail, no IVR or auto-attendant, no music on hold, no call recording, no
-queues or ACD, no time-based routing, no MWI, no fax, no video, no multi-tenancy.
+No voicemail, no IVR or auto-attendant, no call recording, no queues or ACD, no
+time-based routing, no MWI, no fax, no video, no multi-tenancy.
+
+Music on hold *was* on that list and no longer is: a G.711 clip on the SD card now
+plays to calls sitting on a park orbit (one global cursor, every parked caller hearing
+the same point in the track). It covers **park only** — a call a phone puts on hold
+itself is still relayed peer-to-peer and hears whatever that handset generates.
 
 Most of these need the board to sit in the audio path for *ordinary* calls, which
 is the one thing the architecture is built to avoid. Some are simply unbuilt. The

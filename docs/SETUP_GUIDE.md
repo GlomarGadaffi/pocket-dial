@@ -272,7 +272,7 @@ registers against it with these settings:
 | Transport | **UDP** | The engine only speaks UDP |
 | Username / Auth ID / extension | your choice, e.g. `1001` | The registrar keys clients by this extension (AOR) |
 | Password | (any / blank) | The registrar **ships in `open` mode**, which accepts every REGISTER without a challenge, so whatever you type here is ignored. SIP digest auth *does* exist — `learn` (trust-on-first-use, MAC-locked) and `secure` (digest required for every provisioned extension) are selectable via `POST /api/registrar` once you are logged in. The mode is stored as `reg_mode` in NVS namespace **`pbxcfg`**. See [THREAT_MODEL.md](THREAT_MODEL.md) S-3 |
-| Codec | **G.711 only** — µ-law (PCMU, payload 0) and a-law (PCMA, payload 8), plus telephone-event (101) | The server rewrites SDP to `0 8 101` via `enforceG711()` |
+| Codec | **PCMU, PCMA and G.722** between two phones; **PCMU only** on legs the board terminates (`440`, `555`, `888`, hold music) | The server does **not** rewrite your codec list — `filterAudioCodecs(allowWideband=true)` only *drops* payloads it won't carry, keeping each phone's own preference order and payload numbering, so two G.722-capable handsets negotiate wideband between themselves. `telephone-event` passes through. (Earlier revisions of this table said the server rewrites SDP to a literal `0 8 101` via `enforceG711()`. That function has **no callers left** — `src/SIP/SipMessage.cpp:260` is dead code — and the literal rewrite it did was itself a bug: it advertised payload 101 with no `a=rtpmap`, which pjsip rejects outright.) |
 | Registration expiry | up to `3600` s | `DEFAULT_EXPIRES`/`MAX_EXPIRES`; higher requests are capped to 3600 |
 
 > [!IMPORTANT]

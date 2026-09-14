@@ -50,8 +50,9 @@ flash time via the `cfgseed` record. Full detail in [LEARN_MODE.md](LEARN_MODE.m
 pocket-dial does **not** transcode. What it does depends on whether the call is relayed
 peer-to-peer or terminated on the board:
 
-* **Relayed peer-to-peer legs** (ordinary extension-to-extension calls, hold, park,
-  transfer, ring/hunt groups, pickup) admit **PCMU, PCMA and G.722**. Each phone's own
+* **Relayed peer-to-peer legs** (ordinary extension-to-extension calls, hold, transfer,
+  ring/hunt groups, pickup — and park when no hold-music clip is loaded) admit
+  **PCMU, PCMA and G.722**. Each phone's own
   offer/answer is relayed with its preference order and payload numbering intact;
   `SipMessage::filterAudioCodecs(/*allowWideband=*/true)` only *drops* payloads the PBX
   won't carry (`RequestsHandler.cpp:3269`, `CallForker.cpp:49`, `ParkOrbit.cpp:117`).
@@ -193,7 +194,8 @@ phone that has never registered. It re-provisions phones you already brought up 
 | Call type | RTP path |
 | :--- | :--- |
 | Ordinary extension → extension | **Peer-to-peer.** The board never touches the media; only SDP is relayed, and the `c=` line is never rewritten. |
-| Hold / resume, park, blind & attended transfer, ring/hunt groups, pickup | **Peer-to-peer** — same property preserved; only the codec list is narrowed. |
+| Hold / resume, blind & attended transfer, ring/hunt groups, pickup | **Peer-to-peer** — same property preserved; only the codec list is narrowed. |
+| Call parked on an orbit | **Peer-to-peer only while no hold-music clip is loaded.** With a clip loaded the board answers the parked leg `sendonly` from its own port and transmits G.711 µ-law to it for the duration of the park (`ParkOrbit.cpp:56-75`); with no clip it answers `a=inactive` and sources nothing. Retrieve returns the call to peer-to-peer either way. A handset that cannot accept a `sendonly` answer on a re-INVITE will show this as a park-specific fault. |
 | `777` echo test | **Peer-to-peer — to itself.** The answer is an SDP loopback of the caller's own offer, so the phone streams to its own address. The board sources and receives *no* RTP. (A stale code comment elsewhere implies otherwise; the loopback at `RequestsHandler.cpp:1228-1293` is authoritative.) |
 | `440` tone | **Server-terminated.** The board opens an RTP socket and sends a synthesized µ-law tone (`RtpSender.cpp`). One concurrent stream. |
 | `555` anchor bridge | **Server-terminated.** The board sends *and* receives RTP and bridges it to an `AnchorClient`. `POCKETDIAL_MAX_ANCHOR_CALLS` = 1. |

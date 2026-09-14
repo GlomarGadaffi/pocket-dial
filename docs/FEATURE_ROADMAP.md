@@ -25,8 +25,14 @@ Cross-references:
 >
 > **The peer-to-peer half.** An extension-to-extension call is brokered and then gets out
 > of the way: the two phones stream RTP directly to each other and the MCU never sees a
-> media packet. Hold, park and blind/attended transfer all preserve that property — the
-> SDP is relayed, and only the codec list is narrowed, never the `c=` line. `777` echo is
+> media packet. Hold and blind/attended transfer all preserve that property — the
+> SDP is relayed, and only the codec list is narrowed, never the `c=` line. **Park no
+> longer does, unconditionally:** with a music-on-hold clip loaded the board answers the
+> parked leg `sendonly` from its own port and streams the clip to it
+> (`src/SIP/ParkOrbit.cpp:56-75`), which puts the MCU in the media path one-way for the
+> duration of the park. With no clip loaded — the default — park still answers
+> `a=inactive` and sources nothing, which is the behaviour this paragraph used to
+> describe as unconditional. `777` echo is
 > in this half too, despite an in-code comment calling it "server-terminated": it is an
 > SDP loopback, answering with the caller's own body so the phone streams to itself
 > (`src/SIP/RequestsHandler.cpp:1228`). Nothing on the board carries that audio.
@@ -79,6 +85,7 @@ Cross-references:
 | Capability | Notes | Where |
 |-----------|-------|-------|
 | `440` server-sourced tone | board **sends** RTP; `sendonly` SDP | `onMediaInvite` |
+| **Music on hold (park only)** | board **sends** RTP. One global clip cursor fanned to every parked leg — the 20 ms tick reads 160 bytes once and `sendto`s the identical payload per listener, so there is no per-leg decode and no `MixBus`. G.711 µ-law 8 kHz mono only (the wire format itself; playback is a memcpy). The clip is read off the SD card into PSRAM **once at load** and the card is then out of the media path entirely. Cap `POCKETDIAL_PARK_SLOTS` listeners. **Falls back to the old silent `a=inactive` hold** when there is no clip, no usable RTP endpoint in the parked party's SDP, or MoH is not running — park never fails because nobody uploaded a WAV. Does **not** apply to phone-initiated hold. | `HoldMusic.*`, `ParkOrbit.cpp:56-75` |
 | `888` meet-me conference | board decodes, mixes (`MixBus`, N−1 minus-self summing) and re-encodes. **`POCKETDIAL_CONF_LEGS` = 4**, one global room, **no PIN**, created on first dial-in and then kept alive. | `ConferenceRoom.*`, `MixBus.*` |
 | `555` anchor media bridge | board bridges a leg to an `AnchorClient`. **Active on default firmware** via the `Loopback` reference client. | `onAnchorInvite`, `MediaBridge.*` |
 | Codec policy | **Relayed peer-to-peer legs admit PCMU, PCMA _and G.722_** (`filterAudioCodecs(allowWideband=true)`). Legs the board terminates itself refuse G.722, and the board's own SDP offers PCMU only. | `SipMessage.cpp:405`, `buildMediaSdp` |
@@ -127,8 +134,10 @@ Transports: Wi-Fi SoftAP with captive portal, W5500 / LAN8720 wired Ethernet and
 Guition JC3248W535 touch display (LVGL 8.3). Zero-touch provisioning
 (`GET /config/<mac>.cfg`, Yealink key format). Flash-time configuration via the `cfgseed`
 partition and the browser flasher. Live SIP tracer (`/api/trace`) and Wireshark-readable
-capture (`/api/pcap`). Dashboard with patch-bay UI and toolbar modals for dial plan,
-groups, call log and trace (F2/F3/F4/F8).
+capture (`/api/pcap`). Prometheus-style `GET /metrics`. Dashboard with patch-bay UI and
+toolbar modals for dial plan (`F2`), ring groups & forwarding (`F3`), call log (`F4`),
+refresh (`F5`), **PBX Settings (`F6`** — hold-music upload, preview and stop**)**, SIP
+trace (`F8`) and Wi-Fi (`F9`) (`src/Helpers/index_html.h:330-336`, `:1706-1712`).
 
 ---
 
@@ -178,8 +187,8 @@ zones, pickup — **has shipped** and now lives in §1. What remains is below.
 |-----|---------|-----------|------------|-------|
 | **P0** | **Config import / export (backup / restore)** | Still the strongest platform item, and now overdue: the config surface has grown to dial plan, DID map, groups, forwards, DND, registrar roster, telephony slots and Wi-Fi. Rebuilding that by hand on a replacement unit is the realistic failure the project has no answer for. | **M** | Admin-gated `GET /api/config/export` + `POST /api/config/import`. **Never export the telephony secrets in clear** — the whole API is built around `secretSet`, not `secret`. |
 | **P1** | **Watchdog / health & self-heal** | No project task subscribes to a watchdog and nothing in `sdkconfig.defaults` configures one, so a wedged SIP or HTTP task is not detected or recovered. Task-level WDT plus heap/stack high-water reporting protects the RT guarantees in [ARCHITECTURE.md](ARCHITECTURE.md) §2 and feeds the OTA `mark-valid` health gate. | **S–M** | IDF Task WDT; surface on `/api/status`. |
-| **P1** | **Metrics endpoint** | `packetsProcessed`/`Dropped`, client/session counts and pool headroom are already counted and already exposed as JSON. A scrape-friendly text format is nearly free. | **S** | Read-only `/metrics` off the existing lock-free snapshot — no new locking. |
-| **P1** | **Syslog (RFC 5424 over UDP)** | `_logQueue` already buffers under lock and flushes outside it; tee it for fleets with no serial console. | **S** | One UDP socket, bounded queue, drop-on-full — never block the RT path. |
+| ~~P1~~ **DONE** | **Metrics endpoint** | **Shipped.** `GET /metrics` serves six Prometheus text-format families, all `pocketdial_`-prefixed: `uptime_seconds`, `sip_registrations_active`, `sip_calls_active`, `packets_processed_total`, `packets_dropped_total`, `sdp_rejected_total`. Reads only the relaxed atomics and the snapshot-mutex counts — it never touches `RequestsHandler::_mutex`, which is why `getConferenceLegs()` is deliberately *not* exported. **Ungated**, argued in-place: a stock scraper cannot drive the login/CSRF handshake. | — | `HttpServer.cpp:475`, `sendApiMetrics` at `:1185`; rationale at `:1124-1183`. Listed in [THREAT_MODEL.md](THREAT_MODEL.md) §4 E-2's unauthenticated-read class. |
+| **P1** | **Syslog (RFC 5424 over UDP)** — *module written, not wired* | `_logQueue` already buffers under lock and flushes outside it; tee it for fleets with no serial console. **Careful: `src/Helpers/Syslog.{hpp,cpp}` already exists** — a complete, host-unit-tested RFC 5424 frame formatter, compiled into both the firmware (`main/CMakeLists.txt:112`) and the host build. What does *not* exist is any way to reach it: `Syslog.hpp` is included by nothing but its own `.cpp` and `tests/Syslog_test.cpp`, there is no call site on the log drain, no HTTP route and no NVS key for a destination. **It is compiled dead code today — do not report syslog as a shipped feature.** The remaining work is wiring and a config surface, not the protocol. | **S** | One UDP socket, bounded queue, drop-on-full — never block the RT path. |
 | **P2** | **NVS schema versioning / migration** | Config keys have accreted across several releases with no `schema_ver`. Pairs with config export. | **M** | Retrofitting this after an export format exists is the expensive order. |
 | **P2** | **Multi-AP / mesh / roaming** | Extends coverage past one SoftAP's ~16-station ceiling. Large, and it changes the trust boundary. | **L** | Keep one logical registrar; clients re-REGISTER on roam. |
 
