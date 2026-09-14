@@ -168,8 +168,10 @@ Vendor is implicit: there is one renderer. `User-Agent` is not read and not used
    Miss → `404`.
 2. Re-validates the adopted extension against `isValidAor()` as defence in depth: the `.cfg`
    interpolates the extension into `key = value\r\n` lines, so a CR/LF in it would inject
-   config lines nobody wrote (Issue #107). Fails closed → `404`
-   (`RequestsHandler.cpp:4414-4426`).
+   config lines nobody wrote (Issue #107). The same recheck also refuses an adopted extension
+   that is reserved, emergency, or PSTN-shaped (`pbx::isReservedOrPstnAor()`, Issue #163) — the
+   REGISTER-time identity guard onRegister() applies is not the only gate provisioning depends
+   on. Either failure closes → `404` (`RequestsHandler.cpp::findProvisioningInfo`).
 3. Resolves the server IP the same way `/api/status` does; SIP port is hardcoded `5060`
    (this codebase does not support a non-default SIP listen port).
 4. `provisioning::yealinkConfigFor(ext, ip, 5060, authRequired)`. If the builder refuses
@@ -278,10 +280,24 @@ Consequences:
   grow the heap without limit (`Registrar.cpp:171-178`). Because the registry is bounded by
   the *same* constant as the client pool, the original design's "you can pre-map 50 phones
   against a 32-slot pool" scenario does not arise here.
-* **Reserved virtual extensions** (`777`, `999`, `440`, `555`, `888`, `700`-`709`,
-  `980`-`989`) are handled before ordinary routing, so a phone that registers as one of them
-  is shadowed by the feature. The registry does not refuse them; the router simply never
-  reaches the registration. Do not assign them.
+* **Reserved and emergency extensions** (`777`, `999`, `440`, `555`, `888`, `911`, `933`) are
+  refused outright by `onRegister()`'s identity guard (`pbx::isReservedOrPstnAor()`, Issue
+  #163) — `403`, before the registrar-mode branch runs at all, so the registry never adopts
+  one of these names in ANY mode, Learn included. Before #163 this section described a
+  weaker property ("shadowed by routing, not actually refused") that let a phone squat on
+  `911` with zero indication anything was wrong; that gap is what #163 closed. An AOR that is
+  `+`-prefixed (E.164) or otherwise looks like a direct-dial PSTN number (long, all-digit —
+  `POCKETDIAL_MIN_PSTN_AOR_DIGITS`, `PoolConfig.hpp`) is refused the same way. The park-orbit
+  (`700`-`709`) and page-zone (`980`-`989`) *ranges* are a separate mechanism — dial-plan
+  routing intercepts those, per the original note — and are unaffected by this guard.
+  Do not assign any of the above.
+* **Not yet guarded: `admitLearn()`'s own re-sync branch.** If a MAC already adopted under one
+  extension re-REGISTERs under a different AOR, `admitLearn()` updates the stored extension to
+  match (`Registrar.cpp:188-194`) — but `onRegister()`'s identity guard runs *before*
+  `admitLearn()` is ever reached, so in practice a resync can never carry a reserved/emergency/
+  PSTN-shaped AOR either. There is no independent check inside `admitLearn()` itself; it relies
+  entirely on the caller's gate. Tracked as a possible defense-in-depth follow-up, not a known
+  bypass.
 * **`forget` re-arms adoption.** `POST /api/registrar/device` with `action=forget` removes the
   record; a later REGISTER in Learn mode re-learns it (`Registrar.hpp:83-85`).
 
@@ -373,7 +389,8 @@ board nothing authenticates one. Do not describe it as a security control.
       |                                  |  | hex + .cfg, else 404
       |                                  |  | findProvisioningInfo(mac) in the
       |                                  |  | adopted-device registry, else 404
-      |                                  |  | isValidAor(ext) re-check, else 404
+      |                                  |  | isValidAor(ext) + reserved/emergency/
+      |                                  |  | PSTN-shaped re-check, else 404
       |   200 OK  text/plain             |<-+ yealinkConfigFor(ext, ip, 5060, auth)
       |   account.1.* = ...              |     password field BLANK
       |<---------------------------------|

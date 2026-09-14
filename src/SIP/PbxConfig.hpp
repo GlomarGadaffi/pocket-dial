@@ -17,6 +17,7 @@
 
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <utility>
 #include <unordered_map>
@@ -174,6 +175,77 @@ namespace pbx
 				out.push_back(m);
 		}
 		return out;
+	}
+
+	// ── Reserved / emergency / PSTN-shaped REGISTER identity guard (Issue #163) ──
+	//
+	// isValidAor() (RequestsHandler.cpp) is charset-only, so nothing stopped a
+	// phone REGISTERing as one of the fixed virtual extensions this engine
+	// already treats specially elsewhere, as the emergency number or its test
+	// number, or as a PSTN-shaped number. The three helpers below are that
+	// missing identity-semantics check, kept pure and free-standing so both
+	// REGISTER call sites (onRegister()'s From-number gate and
+	// findProvisioningInfo()'s adopted-extension recheck) can ask the same
+	// question without a third independent copy of the literal set.
+
+	// The reserved virtual/emergency extensions: 777 (echo test), 999 (all-page/
+	// ring-all fan-out), 888 (ConferenceRoom::EXT, the meet-me conference), 555
+	// (kAnchorCallExt, the anchor media bridge), 440 (busy/error tone), and 911 /
+	// 933 (the US emergency number and its standard E911 TEST number — neither
+	// has ANY special handling anywhere in this codebase today, which is exactly
+	// why a REGISTER claiming one must be refused outright rather than silently
+	// intercepting calls meant for it).
+	//
+	// This is the REGISTER-identity set, not a general "reserved extension"
+	// predicate — it deliberately does NOT replace the narrower, independently
+	// evolving literal sets in PbxFeatureConfig.cpp's setForwardLocked() (777/
+	// 999/888/555) and setDialRule() (777/999/440/555). Those guard CONFIG
+	// surfaces (a call-forward target, a dial-plan pattern) that must keep
+	// working for a future dial-plan rule routing 911 to a trunk — the whole
+	// point of the companion 911-handling issue — so they omit 911/933 on
+	// purpose and must go on doing so. Retrofitting them onto this helper is
+	// out of scope for #163 (tracked as optional, not required, by the issue).
+	inline bool isReservedExtension(std::string_view ext)
+	{
+		return ext == "777" || ext == "999" || ext == "888" || ext == "555" ||
+			ext == "440" || ext == "911" || ext == "933";
+	}
+
+	// True iff `aor` "looks like a direct PSTN number" rather than an internal
+	// extension: all-digit and at least POCKETDIAL_MIN_PSTN_AOR_DIGITS long (see
+	// PoolConfig.hpp for the threshold and the reasoning behind its default).
+	// Deliberately does NOT match a leading '+' — that case is unambiguous E.164
+	// and isReservedOrPstnAor() below refuses it unconditionally, without regard
+	// to length, so it never reaches this length-based guess at all.
+	inline bool looksLikePstnAor(std::string_view aor)
+	{
+		if (aor.size() < static_cast<std::size_t>(POCKETDIAL_MIN_PSTN_AOR_DIGITS))
+		{
+			return false;
+		}
+		for (char c : aor)
+		{
+			if (!std::isdigit(static_cast<unsigned char>(c)))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// The combined REGISTER-time guard (Issue #163): true iff `aor` must never
+	// be admitted as a phone's From-number, in ANY registrar mode. ORs the three
+	// independent reasons an otherwise charset-valid AOR is inadmissible:
+	//   - it names one of the reserved/emergency extensions above, or
+	//   - it is unambiguously E.164 (a leading '+' — legitimate on an outbound
+	//     INVITE To-number, which is why this lives beside isValidAor() rather
+	//     than inside it), or
+	//   - it merely looks like a direct-dial PSTN number (long, all-digit).
+	inline bool isReservedOrPstnAor(std::string_view aor)
+	{
+		if (isReservedExtension(aor)) return true;
+		if (!aor.empty() && aor.front() == '+') return true;
+		return looksLikePstnAor(aor);
 	}
 
 	// ── Directed / group call pickup (Issue #68) ──────────────────────────────
