@@ -133,13 +133,19 @@ TEST(Pbx, ForwardConfigNonEmptyWhenAnyTriggerSet) {
 // ── Star/pound codes stay dialable AORs (future feature codes) ────────────────
 //
 // isValidAor() is a private RequestsHandler method (not linked into this test
-// binary), but its accept rule is exact and stable: non-empty, every char is
-// alphanumeric or one of '.', '-', '_', '+', '*', '#'. This free function mirrors it
-// so we can assert star/pound codes are still accepted (the roster *55 behaviour was
-// removed, but the AOR charset change that makes star codes dialable is KEPT).
+// binary), but its accept rule is exact and stable: non-empty, no longer than
+// kMaxAorLen (64), every char alphanumeric or one of '.', '-', '_', '+', '*', '#'.
+// This free function mirrors it so we can assert star/pound codes are still
+// accepted (the roster *55 behaviour was removed, but the AOR charset change
+// that makes star codes dialable is KEPT) and, as of issue #194, that the length
+// bound added alongside the charset check (RequestsHandler.cpp's kMaxAorLen --
+// see CallDetailRecord.hpp's corrected comment for why one was needed at all:
+// isValidAor() used to be claimed as a length bound elsewhere in the codebase
+// when it never was one) is mirrored here too.
 namespace {
+constexpr size_t kMirrorMaxAorLen = 64;
 bool mirrorsIsValidAor(const std::string& s) {
-    if (s.empty()) return false;
+    if (s.empty() || s.size() > kMirrorMaxAorLen) return false;
     for (char c : s) {
         if (!std::isalnum(static_cast<unsigned char>(c)) &&
             c != '.' && c != '-' && c != '_' && c != '+' &&
@@ -157,6 +163,17 @@ TEST(Aor, StarAndPoundCodesAreDialable) {
     EXPECT_FALSE(mirrorsIsValidAor(""));      // empty still rejected
     EXPECT_FALSE(mirrorsIsValidAor("55 5"));  // whitespace still rejected
     EXPECT_FALSE(mirrorsIsValidAor("a@b"));   // delimiters/host chars still rejected
+}
+
+TEST(Aor, LengthIsBoundedAt64Chars) {
+    // Issue #194 audit: isValidAor() was charset-only with no length check, so
+    // an unbounded AOR (nothing stops a REGISTER/INVITE from carrying one) could
+    // heap-allocate without limit inside every CdrRing slot. 64 chars is exactly
+    // at the bound; 65 must be refused.
+    const std::string ok(64, 'a');
+    const std::string tooLong(65, 'a');
+    EXPECT_TRUE(mirrorsIsValidAor(ok));
+    EXPECT_FALSE(mirrorsIsValidAor(tooLong));
 }
 
 // ── Register-beep INVITE: auto-answer headers + correct Content-Length ─────────

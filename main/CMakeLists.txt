@@ -113,6 +113,10 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/SipMessagePool.cpp"
                             "../src/SIP/PbxFeatureConfig.cpp"
                             "../src/SIP/CdrRing.cpp"
+                            # SD-card CDR archive (issue #194 Stage 1). Compiles to a
+                            # permanent no-op on every SIP_TRANSPORT/board that doesn't
+                            # define PD_ETH_HAS_SD above -- see CdrArchive.hpp/.cpp.
+                            "../src/SIP/CdrArchive.cpp"
                             "../src/SIP/DtmfFeatureCodes.cpp"
                             "../src/SIP/CallForker.cpp"
                             "../src/SIP/CallPickup.cpp"
