@@ -210,6 +210,16 @@ static void sd_mount(void)
 {
 	sdmmc_host_t host = SDSPI_HOST_DEFAULT();
 	host.slot = SD_SPI_HOST;
+	// Cap command timeout BELOW the task watchdog. ESP-IDF's default write timeout
+	// is SDMMC_WRITE_CMD_TIMEOUT_MS = 5000 (sdmmc_common.h:47) and this build runs
+	// CONFIG_ESP_TASK_WDT_TIMEOUT_S = 5 with idle-task checks on both cores -- the
+	// two are exactly equal. That matters because sdspi's poll_busy() is a hard
+	// busy-spin (spi_device_polling_transmit, no vTaskDelay), so a card that hits
+	// its worst-case programming time starves that core's idle task for the whole
+	// interval and trips the watchdog at the same moment it reports the error.
+	// 2 s leaves the card room for a normal garbage-collection stall (100-250 ms is
+	// routine) while still failing well clear of the WDT.
+	host.command_timeout_ms = 2000;
 
 	spi_bus_config_t bus = {};
 	bus.mosi_io_num   = SD_MOSI_GPIO;
@@ -233,7 +243,12 @@ static void sd_mount(void)
 	// NEVER format on failure. This is the operator's card and may hold data
 	// that has nothing to do with this firmware.
 	mcfg.format_if_mount_failed = false;
-	mcfg.max_files              = 4;
+	// 8, not 4. ESP-IDF's VFS-FAT layer takes one lock per mounted volume, so every
+	// open handle competes; 4 happens to equal POCKETDIAL_CONF_LEGS, which would
+	// leave ZERO handles spare the moment anything else touches the card (an HTTP
+	// handler streaming a recording, a status probe stat'ing it) while the writers
+	// hold theirs. Handles are cheap; running out is a confusing runtime failure.
+	mcfg.max_files              = 8;
 	mcfg.allocation_unit_size   = 16 * 1024;
 
 	// SD-over-SPI probing is occasionally flaky on the first attempt
