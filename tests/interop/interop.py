@@ -485,7 +485,14 @@ def sc_cancel_ringing(env):
 
 
 def sc_blind_transfer(env):
-    """A<->B established, then A REFERs B to C with no Replaces."""
+    """A<->B established, then A REFERs B to C with no Replaces.
+
+    RFC 3515 s2 / RFC 5359 s2.4: B ends up talking to C and A drops out. This
+    scenario used to assert the reverse ("transferee torn down"), matching a PBX
+    that BYEd B and dialled A through to C -- issue #197. The assertions below
+    are the corrected topology and have NOT been run against the bench: the
+    firmware change is host-tested only, and this harness needs the real PBX.
+    """
     a, b, c = env["A"], env["B"], env["C"]
     ma = a.mark()
     a.call(b.ext)
@@ -496,14 +503,19 @@ def sc_blind_transfer(env):
     ma2, mb2, mc2 = a.mark(), b.mark(), c.mark()
     a.cmd("call transfer sip:%s@%s:%d" % (c.ext, PBX_IP, PBX_SIP_PORT), 3.0)
     accepted = a.wait_log(r"202 Accepted|202/REFER", 6, ma2) is not None
-    b_torn = b.wait_log(r"BYE|(is|to) DISCONNECTED", 8, mb2) is not None
+    # The TRANSFEROR is the one that leaves.
+    a_torn = a.wait_log(r"BYE|(is|to) DISCONNECTED", 8, ma2) is not None
     c_invited = c.wait_log(r"INVITE", 8, mc2) is not None
+    # ...and B stays up. Checked last, and only as "no teardown seen": a pass
+    # costs the full timeout, which is why it is not first.
+    b_torn = b.wait_log(r"BYE|(is|to) DISCONNECTED", 6, mb2) is not None
     for ua in (a, b, c):
         ua.hangup_all()
-    ok = accepted and b_torn and c_invited
+    ok = accepted and a_torn and c_invited and not b_torn
     return report("blind_transfer", "OK" if ok else "FAIL",
-                  "202 to REFER=%s, transferee torn down=%s, target INVITEd=%s"
-                  % (accepted, b_torn, c_invited))
+                  "202 to REFER=%s, transferor dropped=%s, target INVITEd=%s, "
+                  "transferee survived=%s"
+                  % (accepted, a_torn, c_invited, not b_torn))
 
 
 def sc_attended_transfer(env):
