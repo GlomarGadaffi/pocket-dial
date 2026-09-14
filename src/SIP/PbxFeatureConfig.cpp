@@ -6,6 +6,7 @@
 #include <cstdlib>
 
 #include "PbxPersist.hpp"
+#include "ServiceExtensions.hpp"   // Issue #202: the engine-owned pseudo-AOR table
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "nvs_flash.h"
@@ -100,6 +101,29 @@ void PbxFeatureConfig::setForwardLocked(const std::string& extension, const std:
 	{
 		_env.log("Forward set ignored for virtual extension " + extension, true);
 	}
+	// Issue #202: the same refusal for a SERVICE extension (`pbx`/`moh`/`server`)
+	// as the SUBSCRIBER. A service is an engine identity, never an endpoint with a
+	// mailbox of its own to forward away from, and letting one be configured here
+	// would put an engine-owned name into the persisted forward table.
+	else if (pbx::isServiceName(extension))
+	{
+		_env.log("Forward set ignored for service extension " + extension, true);
+	}
+	// ...and, new, a guard on the TARGET — which nothing has ever validated. This
+	// is narrow on purpose: it refuses ONLY a service name that is not dialable,
+	// i.e. a target the engine knows by name and knows it cannot deliver to. A
+	// forward pointed at one would be accepted, fire, and then black-hole the call
+	// inside redirectInvite()'s findRegistered() miss. Refusing it at config time
+	// is the difference between "the dashboard told me no" and "calls to that
+	// extension silently stopped arriving". Unknown NON-service targets are
+	// deliberately still accepted: an extension that is merely offline right now
+	// must remain a legal forward target, and telling those two cases apart is
+	// exactly what Issue #202's routing work is for.
+	else if (!target.empty() && pbx::isServiceName(target) && !pbx::isDialableService(target))
+	{
+		_env.log("Forward set ignored: service extension " + target +
+			" cannot receive calls", true);
+	}
 	else
 	{
 		auto it = _forwards.find(extension);
@@ -163,6 +187,14 @@ void PbxFeatureConfig::setRingGroup(const std::string& groupExt, const std::stri
 	if (groupExt == "777" || groupExt == "999" || groupExt == "888" || groupExt == "555")
 	{
 		_env.log("Ring group ignored for reserved extension " + groupExt, true);
+	}
+	// Issue #202: a group named for a service extension would SHADOW that name —
+	// onInvite resolves ring groups before the extension lookup, so whatever the
+	// engine later wanted `pbx`/`moh` to mean would never be reached. Refuse it
+	// here rather than let the shadow be persisted to NVS.
+	else if (pbx::isServiceName(groupExt))
+	{
+		_env.log("Ring group ignored for service extension " + groupExt, true);
 	}
 	else
 	{
@@ -289,6 +321,15 @@ void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string
 		// would never fire. Refuse it instead of accepting a dead rule.
 		_env.log("Dial rule ignored: " + pattern +
 			" is a reserved extension and is routed before the dial plan", true);
+	}
+	// Issue #202: the dial plan is where a catch-all pattern lives (#201's SBC
+	// mode), so it is also where a service name is most easily swallowed. Refuse
+	// an exact service-name pattern for the same reason as the numeric reserved
+	// extensions above — the name belongs to the engine.
+	else if (pbx::isServiceName(pattern))
+	{
+		_env.log("Dial rule ignored: " + pattern +
+			" is a reserved service extension", true);
 	}
 	else if (action.empty() && target.empty())
 	{
