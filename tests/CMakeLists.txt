@@ -109,6 +109,12 @@ add_executable(sip_parser_tests
     DialPlan_test.cpp
     Rtp_test.cpp
     RtpReceiver_test.cpp
+    # RFC 4733 telephone-event decode. Only reachable on a SERVER-TERMINATED leg
+    # (440/555/888, and the voicemail/IVR roadmap) -- an ordinary call's RTP is
+    # peer-to-peer and never reaches the board. The receive loop used to drop
+    # every non-PCMU packet as "wrong codec", so a phone in its default DTMF mode
+    # could not drive a server-side menu at all.
+    TelephoneEvent_test.cpp
     PlayoutBuffer_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp

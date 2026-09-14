@@ -88,6 +88,58 @@ public:
 		size_t         payloadLen  = 0;
 	};
 
+	// ── RFC 4733 telephone-event (DTMF over RTP) ────────────────────────────────
+	// Named events ride the SAME RTP stream as audio, on a DYNAMIC payload type the
+	// two ends negotiate in SDP (`a=rtpmap:<pt> telephone-event/8000`). There is no
+	// fixed number for it — 101 is merely a common choice — so the PT must be taken
+	// from the offer at call setup and handed to setDtmfPayloadType(). Until then
+	// the receiver has no way to tell an event packet from a codec it does not
+	// speak, which is why kDtmfPayloadTypeUnset is the default.
+	static constexpr uint8_t kDtmfPayloadTypeUnset = 0xFF;
+
+	// One decoded RFC 4733 §2.3 event payload (4 bytes on the wire):
+	//
+	//    0                   1                   2                   3
+	//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	//   |     event     |E|R| volume    |          duration             |
+	//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	struct DtmfEvent
+	{
+		uint8_t  event    = 0;      // 0-9 digits, 10 '*', 11 '#', 12-15 A-D, 16 flash
+		bool     end      = false;  // E bit: this is a (retransmitted) end packet
+		uint8_t  volume   = 0;      // 6 bits, -dBm0 (0 loudest, 63 quietest)
+		uint16_t duration = 0;      // 8 kHz timestamp units, network byte order
+	};
+
+	// Parse a telephone-event payload. Pure and bounds-checked: returns false on a
+	// short buffer, leaving `out` untouched. Does NOT validate the event code — a
+	// caller wanting only DTMF filters with dtmfEventToChar().
+	static bool parseTelephoneEvent(const uint8_t* payload, size_t len, DtmfEvent& out);
+
+	// Map an RFC 4733 event code to its keypad character, or '\0' for anything that
+	// is not one of the 16 DTMF symbols (event 16 "flash" and the tone events are
+	// deliberately NOT digits).
+	static char dtmfEventToChar(uint8_t event);
+
+	// The DTMF sink: invoked ONCE per key press, ON THE RECEIVE TASK.
+	//
+	// Deduplication is the whole difficulty of RFC 4733 and it is done here so no
+	// consumer has to. One key press is sent as a BURST of packets that all share
+	// the RTP timestamp of the event's START, with a growing `duration`, and the
+	// final packet is retransmitted (§2.5.1.2 recommends three times) with E=1. A
+	// naive consumer sees one keypress as ~10 callbacks.
+	//
+	// The rule used: report when the event's RTP timestamp DIFFERS from the last
+	// reported one. That fires on the first packet of the burst actually received —
+	// which is loss-tolerant, since any packet of the burst will do if the first is
+	// dropped — and never fires again for that press. Two presses of the same key
+	// carry different timestamps, so a genuine repeat is still reported.
+	//   digit    : the keypad character ('0'-'9', '*', '#', 'A'-'D')
+	//   durationMs: duration carried by the packet that triggered the report,
+	//               converted to ms. Small when reported from the first packet —
+	//               it is NOT the total press length, which is not yet known.
+	using DtmfSink = std::function<void(char digit, uint16_t durationMs)>;
+
 	// The Sink: callers choose what to do with each received audio frame without
 	// RtpReceiver knowing. Invoked once per accepted (PT==0) packet, ON THE
 	// RECEIVE TASK, with:
@@ -143,6 +195,13 @@ public:
 	// cap + bind-advertise logic is exercisable in tests.
 	bool start(uint16_t localPort, Sink sink);
 
+	// Enable RFC 4733 reception on `pt`, the telephone-event payload type taken
+	// from the peer's SDP. Pass kDtmfPayloadTypeUnset to disable. May be called
+	// before or after start(); the receive task reads it atomically each packet, so
+	// a mid-call re-negotiation is safe. Passing PAYLOAD_TYPE_PCMU is refused — that
+	// would shadow audio — and returns false.
+	bool setDtmfPayloadType(uint8_t pt, DtmfSink sink);
+
 	// Stop the stream: close the socket (unblocks recvfrom), signal the receive
 	// task to exit, clear _active and the sink. Idempotent — safe on an already-
 	// idle receiver. Returns true if a stream was actually stopped.
@@ -176,6 +235,17 @@ private:
 	// receive task never race the slot. Non-recursive (matches RtpSender).
 	mutable std::mutex _slotMutex;
 	Sink               _sink;             // owner of the live stream's consumer
+
+	// RFC 4733 state. The PT is atomic because the receive task reads it on every
+	// packet while the SIP thread may set it at call setup; the sink is guarded by
+	// _slotMutex like _sink. _lastDtmfTs/_haveLastDtmf are touched ONLY by the
+	// receive task, so they need no synchronisation — but they must be reset by
+	// start()/clearSlotLocked(), or the first press of a NEW call whose timestamp
+	// happens to match the last press of the previous one would be swallowed.
+	std::atomic<uint8_t> _dtmfPt{kDtmfPayloadTypeUnset};
+	DtmfSink             _dtmfSink;
+	uint32_t             _lastDtmfTs   = 0;
+	bool                 _haveLastDtmf = false;
 };
 
 #endif

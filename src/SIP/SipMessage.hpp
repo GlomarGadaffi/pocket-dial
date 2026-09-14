@@ -112,6 +112,22 @@ public:
 	// we would keep? True when there is no m=audio line at all.
 	bool offersSupportedAudio(bool allowWideband) const;
 
+	// The payload type this SDP advertises for RFC 4733 telephone-event (DTMF),
+	// or -1 when the body offers none. There is NO fixed number for it: it is a
+	// dynamic PT the offerer chooses (101 is merely common), so a server building
+	// an ANSWER must echo the value found here rather than picking its own --
+	// RFC 3264 forbids answering with a payload type the offer did not contain.
+	//
+	// Only meaningful on a server-TERMINATED leg. An ordinary call's media is
+	// peer-to-peer, so the two phones agree their own event PT and the board never
+	// sees those packets at all.
+	//
+	// Flat single-pass scan, same discipline as applyAudioPolicy(): no recursion,
+	// no per-attribute dispatch, bounded by body length. When a body carries more
+	// than one telephone-event rtpmap the LAST one wins, matching the existing
+	// codec-policy scan so the two cannot disagree about the same body.
+	int getTelephoneEventPayloadType() const;
+
 	// ── SDP admission ───────────────────────────────────────────────────────
 	// One flat pass over the body applying SdpLimits and the attribute policy.
 	// Never allocates, never recurses, never dispatches on attribute content:

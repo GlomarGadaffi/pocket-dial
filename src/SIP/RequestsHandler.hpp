@@ -100,8 +100,11 @@ public:
 	// the resulting Content-Length correctness (the 777-bug class).
 	// `sendrecv` flips the direction attribute: 440 is a one-way tone (sendonly), a
 	// conference leg (888) is two-way (sendrecv) — the phone must know to send audio.
+	// `dtmfPt` echoes the caller's RFC 4733 telephone-event payload type (from
+	// SipMessage::getTelephoneEventPayloadType()) so DTMF can reach a
+	// server-terminated leg at all; -1 keeps the answer PCMU-only as before.
 	static std::string buildMediaSdp(const std::string& serverIp, int rtpPort,
-		bool sendrecv = false);
+		bool sendrecv = false, int dtmfPt = -1);
 
 	// Parse the caller's RTP destination from an INVITE: the SDP c= line IP (falling
 	// back to the INVITE source IP) + the m=audio port via getRtpPort(). Returns false

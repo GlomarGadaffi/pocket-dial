@@ -1581,7 +1581,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	endHandle(data->getToNumber(), response);
 }
 
-std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpPort, bool sendrecv)
+std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpPort, bool sendrecv, int dtmfPt)
 {
 	// The server's OWN SDP offer/answer for a server-media call. PCMU (PT 0) only —
 	// matches enforceG711()/the codec the rest of the PBX speaks. Sendonly (the 440
@@ -1590,14 +1590,38 @@ std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpP
 	// mix if the phone actually sends its own audio up.
 	// CRLF line endings throughout so Content-Length (computed by the caller via
 	// syncContentLength()) matches the wire bytes exactly.
+	// dtmfPt: the caller's RFC 4733 telephone-event payload type, echoed back so
+	// DTMF reaches us on this leg. It MUST be the number the offer used -- RFC 3264
+	// forbids answering with a payload type the offer did not contain, and the PT
+	// is dynamic, so there is nothing to hardcode. -1 means the offer carried none
+	// (or we are building an offer of our own), in which case the answer stays
+	// PCMU-only exactly as before.
+	//
+	// Without this the board advertised "RTP/AVP 0" and nothing else, so a
+	// conformant phone had no negotiated way to send DTMF into a server-terminated
+	// call at all -- and since an ordinary call's media is peer-to-peer, the RTP
+	// path was the ONLY way it could have arrived. That is why a menu on 440/555/888
+	// could never be driven from a handset in its default DTMF mode.
+	const bool withDtmf = (dtmfPt >= 0 && dtmfPt <= 127 && dtmfPt != 0);
+
 	std::string s;
 	s += "v=0\r\n";
 	s += "o=- 0 0 IN IP4 " + serverIp + "\r\n";
 	s += "s=pocketdial-media\r\n";
 	s += "c=IN IP4 " + serverIp + "\r\n";
 	s += "t=0 0\r\n";
-	s += "m=audio " + std::to_string(rtpPort) + " RTP/AVP 0\r\n";
+	s += "m=audio " + std::to_string(rtpPort) + " RTP/AVP 0";
+	if (withDtmf) s += " " + std::to_string(dtmfPt);
+	s += "\r\n";
 	s += "a=rtpmap:0 PCMU/8000\r\n";
+	if (withDtmf)
+	{
+		s += "a=rtpmap:" + std::to_string(dtmfPt) + " telephone-event/8000\r\n";
+		// 0-15 is the DTMF subset: the sixteen keypad symbols and nothing else.
+		// We deliberately do not claim 16 (hook flash) or the tone events -- the
+		// receiver maps only 0-15 to a key and would drop the rest anyway.
+		s += "a=fmtp:" + std::to_string(dtmfPt) + " 0-15\r\n";
+	}
 	s += sendrecv ? "a=sendrecv\r\n" : "a=sendonly\r\n";
 	return s;
 }
@@ -1866,8 +1890,12 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	// The SDP advertises THIS LEG's receive port (not the 440 sender's port): that is
 	// where the handset must send its audio for the mix to hear it.
 	const std::string toTag = IDGen::GenerateID(9);
+	// Echo the caller's telephone-event PT (RFC 4733) so keypresses reach the mix
+	// leg. A conference is exactly the place this matters -- PIN entry and in-call
+	// controls are keypresses on a leg the server terminates, and before this the
+	// answer advertised PCMU alone so a phone had no negotiated way to send them.
 	const std::string sdpBody = buildMediaSdp(activeIp, _conference->rtpPortFor(callID),
-		/*sendrecv=*/true);
+		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
 	auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
 	if (!ok)
 	{
@@ -2061,7 +2089,10 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		// above. The SDP advertises THIS BRIDGE's receive port (not any other slot's):
 		// that is where the handset must send its audio for the anchor to hear it.
 		const std::string toTag = IDGen::GenerateID(9);
-		const std::string sdpBody = buildMediaSdp(activeIp, bridge->receiverPort(), /*sendrecv=*/true);
+		// Echo the caller's telephone-event PT so DTMF reaches the anchored leg --
+		// this is the path a voicemail or IVR menu will be driven over.
+		const std::string sdpBody = buildMediaSdp(activeIp, bridge->receiverPort(),
+			/*sendrecv=*/true, data->getTelephoneEventPayloadType());
 		auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
 		if (!ok)
 		{
