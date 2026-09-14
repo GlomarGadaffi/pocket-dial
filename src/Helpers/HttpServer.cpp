@@ -40,6 +40,13 @@
 // sendApiDnd() uses getFormParam() but is defined earlier in this TU.
 static std::string getFormParam(const std::string& body, const std::string& key);
 
+#if defined(PD_ETH_HAS_SD)
+// Defined in main/esp_main_eth.cpp, which owns the card. Declared rather than
+// pulled in through a header because that file is a transport main, not a module.
+extern "C" bool     pd_sd_mounted(void);
+extern "C" uint64_t pd_sd_capacity_mb(void);
+#endif
+
 // Path-shape parsers for the two PUT/POST telephony-config routes, which (unlike
 // every other route in this file) carry a slot index as a URL segment rather
 // than a form param. Mirrors isProvisioningConfigPath's style: pure string-shape
@@ -953,6 +960,16 @@ void HttpServer::sendApiStatus(int sock)
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
+
+	// microSD, on builds that have a slot wired (currently the T-ETH-ELITE `eth`
+	// board only). Always present so a client can tell "no card" from "this build
+	// has no slot": `present` is the build capability, `mounted` the runtime fact.
+#if defined(PD_ETH_HAS_SD)
+	json << "\"sd\":{\"present\":true,\"mounted\":" << (pd_sd_mounted() ? "true" : "false")
+	     << ",\"capacityMb\":" << pd_sd_capacity_mb() << "},";
+#else
+	json << "\"sd\":{\"present\":false,\"mounted\":false,\"capacityMb\":0},";
+#endif
 
 	// Clients array
 	json << "\"clients\":[";

@@ -46,6 +46,12 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 
+#if defined(PD_ETH_HAS_SD)
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdspi_host.h"
+#endif
+
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
@@ -91,6 +97,15 @@ static const char* TAG = "SipServerETH";
 #  define W5500_CS_GPIO    45
 #  define W5500_INT_GPIO   14   // Elite ETH_INT
 #  define W5500_RST_GPIO   -1   // Elite ETH_RST not wired to a GPIO
+// microSD/TF slot, SPI mode, on the Elite's SECOND SPI bus (SPI3 — the W5500 has
+// SPI2 above). Same map the ESP32_AdBlocker_Reborn firmware runs on this exact
+// board, and it matches docs/HARDWARE.md §5. Note these four GPIOs are precisely
+// what the Waveshare W5500 occupies (9-14), which is why the slot is Elite-only
+// and why main/CMakeLists.txt links the SD stack for this board alone.
+#  define SD_MISO_GPIO     9
+#  define SD_MOSI_GPIO     11
+#  define SD_SCLK_GPIO     10
+#  define SD_CS_GPIO       12
 #endif
 
 #define W5500_SPI_HOST    SPI2_HOST
@@ -174,6 +189,80 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base,
 }
 
 // ── Ethernet initialisation ───────────────────────────────────────────────
+
+#if defined(PD_ETH_HAS_SD)
+// ── microSD (SPI3 — a different bus from the W5500 on SPI2) ──────────────────
+// Optional storage. Every failure here is non-fatal by design: the SIP engine
+// does not depend on a card being present, so a missing/unreadable card must
+// degrade to "no SD" rather than abort the boot the way a W5500 mis-pin does.
+#define SD_SPI_HOST   SPI3_HOST
+#define SD_MOUNT      "/sdcard"
+
+static sdmmc_card_t* s_sd_card = nullptr;
+static uint64_t      s_sd_mb   = 0;
+
+// Reported through GET /api/status so the card can be confirmed from the
+// dashboard without a serial capture.
+extern "C" bool     pd_sd_mounted(void)  { return s_sd_card != nullptr; }
+extern "C" uint64_t pd_sd_capacity_mb(void) { return s_sd_mb; }
+
+static void sd_mount(void)
+{
+	sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+	host.slot = SD_SPI_HOST;
+
+	spi_bus_config_t bus = {};
+	bus.mosi_io_num   = SD_MOSI_GPIO;
+	bus.miso_io_num   = SD_MISO_GPIO;
+	bus.sclk_io_num   = SD_SCLK_GPIO;
+	bus.quadwp_io_num = -1;
+	bus.quadhd_io_num = -1;
+
+	esp_err_t rc = spi_bus_initialize(SD_SPI_HOST, &bus, SDSPI_DEFAULT_DMA);
+	if (rc != ESP_OK) {
+		ESP_LOGW(TAG, "SD: SPI3 bus init failed: %s — continuing without SD",
+		         esp_err_to_name(rc));
+		return;
+	}
+
+	sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+	slot.gpio_cs = static_cast<gpio_num_t>(SD_CS_GPIO);
+	slot.host_id = SD_SPI_HOST;
+
+	esp_vfs_fat_sdmmc_mount_config_t mcfg = {};
+	// NEVER format on failure. This is the operator's card and may hold data
+	// that has nothing to do with this firmware.
+	mcfg.format_if_mount_failed = false;
+	mcfg.max_files              = 4;
+	mcfg.allocation_unit_size   = 16 * 1024;
+
+	// SD-over-SPI probing is occasionally flaky on the first attempt
+	// (ESP_ERR_INVALID_RESPONSE). Retrying is what makes it reliable on this
+	// board — carried over from the AdBlocker firmware, not defensive padding.
+	for (int attempt = 1; attempt <= 4; attempt++) {
+		rc = esp_vfs_fat_sdspi_mount(SD_MOUNT, &host, &slot, &mcfg, &s_sd_card);
+		if (rc == ESP_OK) {
+			s_sd_mb = (uint64_t)s_sd_card->csd.capacity
+			          * s_sd_card->csd.sector_size / (1024 * 1024);
+			ESP_LOGI(TAG, "SD mounted at %s (attempt %d): %llu MB",
+			         SD_MOUNT, attempt, s_sd_mb);
+			sdmmc_card_print_info(stdout, s_sd_card);
+			return;
+		}
+		ESP_LOGW(TAG, "SD mount attempt %d/4 failed: %s", attempt, esp_err_to_name(rc));
+		vTaskDelay(pdMS_TO_TICKS(250));
+	}
+
+	// ESP_FAIL here usually means the filesystem, not the wiring: ESP-IDF's
+	// FatFs mounts FAT16/FAT32 only, so a card over 32 GB in its factory exFAT
+	// format fails exactly like a bad pin. Reformat FAT32 before suspecting GPIO.
+	ESP_LOGW(TAG, "SD: no card mounted after 4 attempts (last: %s). If a card IS "
+	              "inserted, check it is formatted FAT32 — exFAT is not supported.",
+	         esp_err_to_name(rc));
+	s_sd_card = nullptr;
+	spi_bus_free(SD_SPI_HOST);
+}
+#endif  // PD_ETH_HAS_SD
 
 static esp_eth_handle_t eth_init_w5500(void)
 {
@@ -401,6 +490,13 @@ extern "C" void app_main(void)
         return;
     }
     ESP_ERROR_CHECK(esp_netif_attach(s_eth_netif, eth_glue));
+
+#if defined(PD_ETH_HAS_SD)
+    // ── microSD ─────────────────────────────────────────────────────────
+    // After the netif is wired, so the retry loop (up to ~1 s on a missing
+    // card) cannot delay Ethernet bring-up. Never fatal — see sd_mount().
+    sd_mount();
+#endif
 
     // ── Static IP (optional) ────────────────────────────────────────────
 #if USE_STATIC_IP
