@@ -338,8 +338,17 @@ namespace
 			while ((ent = ::readdir(d)) != nullptr)
 			{
 				if (ent->d_name[0] == '.') continue;  // skip "." / ".."
-				char path[80];
-				std::snprintf(path, sizeof(path), "%s/%s", kArchiveDir, ent->d_name);
+				// d_name is a fixed-size array in struct dirent (POSIX NAME_MAX+1,
+				// 256 on glibc) but an arbitrary filename at runtime -- unlike
+				// append()'s path[64] above, whose second component is this file's
+				// own fixed-format date string, the compiler cannot prove this one
+				// fits, and GCC 15's -Werror=format-truncation is right to say so.
+				// Sized with real headroom over kArchiveDir ("/sdcard/cdr", 11
+				// bytes) + '/' + the worst-case d_name; still checked defensively
+				// in case a future kArchiveDir grows past what fits.
+				char path[320];
+				const int n = std::snprintf(path, sizeof(path), "%s/%s", kArchiveDir, ent->d_name);
+				if (n < 0 || static_cast<size_t>(n) >= sizeof(path)) continue;  // truncated -- skip rather than remove() a mangled path
 				std::remove(path);
 			}
 			::closedir(d);

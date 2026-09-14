@@ -449,7 +449,7 @@ namespace
 
 	struct GhashState
 	{
-		uint8_t h[16];
+		uint8_t h[16] = {0};
 		uint8_t y[16] = {0};
 	};
 

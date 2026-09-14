@@ -119,9 +119,9 @@ namespace JsonReader
 	{
 		struct Parser
 		{
-			const char* base;   // start of the ORIGINAL text, for span offsets
-			const char* p;
-			const char* end;
+			const char* base = nullptr;   // start of the ORIGINAL text, for span offsets
+			const char* p = nullptr;
+			const char* end = nullptr;
 			int depth = 0;
 			bool error = false;
 
