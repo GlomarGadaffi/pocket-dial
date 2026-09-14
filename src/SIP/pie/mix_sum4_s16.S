@@ -29,6 +29,32 @@
  * Windowed ABI argument registers:  a2=out a3=a a4=b a5=c a6=d a7=frameLen
  */
 
+/*
+ * BUILD GUARD — the other half of the opt-in (issue #145).
+ *
+ * mix_kernels_scalar.cpp:7/:42 wraps its portable stand-in in the inverse
+ * #ifndef POCKETDIAL_MIXBUS_PIE, so defining the macro switches the scalar
+ * mix_sum4_s16 OFF. Nothing switched THIS one on or off, so only one direction
+ * of the toggle existed: with the macro undefined and both files compiled, the
+ * linker saw two definitions of the symbol.
+ * Only the fact that no target lists this .S kept them apart — CMake
+ * enumerates sources explicitly (main/CMakeLists.txt:122,
+ * tests/CMakeLists.txt:247). A build that globs src/** recursively picks up
+ * both and the link fails:
+ *   ld: mix_sum4_s16.S.o: multiple definition of mix_sum4_s16;
+ *       mix_kernels_scalar.cpp.o: first defined here      [arduino-cli, #145]
+ *
+ * A capital-S .S is run through the C preprocessor by GCC (-x
+ * assembler-with-cpp), so #ifdef is the right gate here rather than a CMake
+ * condition: it keeps the toggle in one place for anyone who glob-builds.
+ * The guard brackets the ENTIRE .text/.align/.global/.type/.size block, so no
+ * directive is split across it and the text GAS sees when the macro is defined
+ * is identical, once cpp has run, to what was proven to assemble. When the
+ * macro is undefined cpp hands GAS an empty translation unit, which assembles
+ * to an object that simply exports no symbols.
+ */
+#ifdef POCKETDIAL_MIXBUS_PIE
+
     .text
     .align  4
     .global mix_sum4_s16
@@ -52,3 +78,5 @@ mix_sum4_s16:
     retw.n                      /* windowed epilogue / return                   */
 
     .size   mix_sum4_s16, .-mix_sum4_s16
+
+#endif /* POCKETDIAL_MIXBUS_PIE */

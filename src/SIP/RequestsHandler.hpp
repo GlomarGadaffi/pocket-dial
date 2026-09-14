@@ -100,8 +100,11 @@ public:
 	// the resulting Content-Length correctness (the 777-bug class).
 	// `sendrecv` flips the direction attribute: 440 is a one-way tone (sendonly), a
 	// conference leg (888) is two-way (sendrecv) — the phone must know to send audio.
+	// `dtmfPt` echoes the caller's RFC 4733 telephone-event payload type (from
+	// SipMessage::getTelephoneEventPayloadType()) so DTMF can reach a
+	// server-terminated leg at all; -1 keeps the answer PCMU-only as before.
 	static std::string buildMediaSdp(const std::string& serverIp, int rtpPort,
-		bool sendrecv = false);
+		bool sendrecv = false, int dtmfPt = -1);
 
 	// Parse the caller's RTP destination from an INVITE: the SDP c= line IP (falling
 	// back to the INVITE source IP) + the m=audio port via getRtpPort(). Returns false
@@ -543,6 +546,20 @@ private:
 	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);
 	void sweepSessionTimers(std::chrono::steady_clock::time_point now);
 
+	// Stamps Allow / Supported / Accept / Allow-Events onto an outgoing response
+	// (issue #199 root cause 2). The lists are compiled from initHandlers() and
+	// are deliberately conservative — see the comment block above the definition
+	// in RequestsHandler.cpp for why "timer" and "100rel" are NOT claimed.
+	//
+	// Currently called only from onOptions(), the capability-discovery method.
+	// The server-terminated INVITE responses (777 echo, 440 tone, 888 conference,
+	// 555 anchor, park ring-back, and CallForker's group 180s) each build their
+	// own 180/200 and would each need their own call; the ordinary call path
+	// RELAYS the far phone's 180/200 and must keep advertising that phone's
+	// capabilities, not ours. Adding those is a per-site follow-up, not a
+	// one-line sweep.
+	void addCapabilityHeaders(SipMessage& response) const;
+
 	// Call parking / park-orbit: the orbit FSM lives in ParkOrbit (see
 	// ParkOrbit.hpp). Guarded by _mutex.
 	ParkOrbit _park{*this};
@@ -696,6 +713,16 @@ private:
 	// capacity gate for both a fresh 555 dial (onAnchorInvite) and a fresh
 	// inbound anchor call (routeInboundAnchorCall). Caller holds _mutex.
 	bool allBridgesBusy() const;
+
+	// How many anchored calls may run at once: min(what the plugged-in provider
+	// can drive, what the arrays are sized for). See the implementation comment —
+	// the two are genuinely different limits, and a provider that hands back a
+	// constant participant id (the loopback mock) cannot be run concurrently at
+	// all without silently starving one leg's audio. Caller holds _mutex.
+	unsigned anchorCallLimit() const;
+
+	// Anchored calls currently up. Caller holds _mutex.
+	unsigned activeAnchorCalls() const;
 
 	// True iff the currently-selected anchor provider is Loopback — the boundary
 	// between the two calling conventions this port has to support:

@@ -34,11 +34,13 @@
 //                            fresh bounded deadline. If AwaitingByeOk or
 //                            AwaitingCancelDone, just free (best-effort BYE already
 //                            sent, or the fallback window on a raced CANCEL expired
-//                            with no further response — the dialog's own 487, if
-//                            the CANCEL landed in time, is routed to
-//                            RequestsHandler::onReqTerminated, which has no
-//                            Session to key a beep dialog off; this fallback is
-//                            what actually frees the slot in that case).
+//                            with no further response). The dialog's own 487, when
+//                            the CANCEL did land in time, no longer relies on that
+//                            fallback: RequestsHandler::onReqTerminated now offers
+//                            every 487 to handleInviteFailure() first, so it is
+//                            ACKed and the slot released on arrival. The deadline
+//                            is the belt-and-suspenders path for a 487 that never
+//                            comes at all.
 //
 // Locking: every method assumes the caller holds the engine's _mutex
 // (non-recursive), matching the RequestsHandler code this was extracted from.
@@ -66,6 +68,21 @@ public:
 	// the whole window. A phone can legitimately reject the beep (a 4xx it does
 	// not like, 488, 606), so this is an ordinary path, not an error path.
 	bool handleInviteFailure(const std::shared_ptr<SipMessage>& data);
+
+	// Does this Call-ID belong to a live beep dialog? Recognition only: nothing is
+	// ACKed, no slot is released, no state moves.
+	//
+	// This exists SEPARATELY from handleInviteFailure() because a 1xx is
+	// provisional (RFC 3261 §17.1.1) — it neither takes an ACK nor ends the
+	// INVITE transaction, so a beep dialog that has merely been answered with
+	// 180 Ringing is still very much alive and must keep its slot. The only
+	// thing its handler needs is to know the response is OURS and stop, instead
+	// of relaying it by the beep's own From ("pbx"), which is not a registered
+	// extension and so came back at the phone as a 404 (drawbridge #178).
+	// Do NOT "simplify" a provisional caller into handleInviteFailure(): that
+	// would ACK a response the RFC says takes none and free a dialog whose
+	// INVITE is still outstanding.
+	bool ownsCallID(std::string_view callID);
 
 	// Time out overdue dialogs: CANCEL an unanswered INVITE (see sweep()'s own
 	// comment for why the slot isn't freed immediately), free a slot whose

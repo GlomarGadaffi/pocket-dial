@@ -10,6 +10,46 @@ CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
 CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
 
 # SPIRAM (OPI PSRAM) Configurations
+#
+# ⚠ HARD PSRAM REQUIREMENT (ported from drawbridge audit #71 — pocket-dial's own
+# issue numbering differs). Every image built from this file targets an ESP32-S3
+# WITH octal PSRAM (S3R8: 8 MB OPI). CONFIG_SPIRAM_BOOT_INIT=y below initialises
+# PSRAM in the bootloader, and IDF's own Kconfig help for SPIRAM_IGNORE_NOTFOUND
+# spells out what happens without the chip: "if psram initialization is enabled
+# during compile time but not found at runtime, it is seen as an error making
+# the CPU panic". That panic happens before the app runs, so there is no log
+# line, no dashboard, no console — just a board that reboots.
+#
+# WHY THIS MATTERS MORE HERE THAN IT DID IN DRAWBRIDGE: this repo publishes a
+# BROWSER FLASHER (docs/flasher/index.html, serving the images under
+# docs/firmware/<version>/ that .github/workflows/release.yml builds). Its
+# variants — esp32s3-wifi, esp32s3-eth, esp32s3-display — are one click away for
+# anyone with a WebSerial browser and an S3 on their desk. The generic SoftAP
+# `wifi` variant is the exposed one: it names no particular board, so the
+# obvious thing for a stranger to do is flash it onto whatever ESP32-S3 they
+# own — and the WROOM-1 parts without an R suffix (N8, N16, the common bare
+# dev-board configuration) have NO PSRAM at all; only the Rn variants (N8R8,
+# N16R8) do. The failure therefore lands on someone else's bench, where nobody
+# can read a serial log or ask us what happened. (The `display` variant would fail
+# regardless: its LVGL double frame buffers, 307.2 KB each, are allocated
+# MALLOC_CAP_SPIRAM — see docs/HARDWARE.md:63.)
+#
+# CONFIG_SPIRAM_IGNORE_NOTFOUND IS DELIBERATELY NOT SET. It would downgrade the
+# missing chip to a boot warning — but the same Kconfig help notes that it also
+# silently re-sizes the WiFi/LWIP buffers to their no-SPIRAM defaults, so the
+# unit would come up in a configuration nothing in this repo has ever tested,
+# carrying calls, with the heap and socket budgets this file's other settings
+# (LWIP_MAX_SOCKETS=48, MBEDTLS_EXTERNAL_MEM_ALLOC=y below) all assume PSRAM
+# for. A half-functional PBX is worse than an obviously dead one — and a silent
+# PSRAM-off drift (a regenerated sdkconfig, a wrong overlay) would then ship
+# instead of failing at build/boot.
+#
+# There is NO no-PSRAM S3 profile in this tree. sdkconfig.defaults.esp32_constrained
+# does set CONFIG_SPIRAM=n, but it is the classic-ESP32 WROOM profile (4 MB DIO
+# flash, 520 KB SRAM, lan8720) and needs `set-target esp32` — it is not an S3
+# image. If a cross-board S3 image is ever genuinely wanted, it belongs in its
+# own overlay file with its own flasher variant id and its own hardware test,
+# not in IGNORE_NOTFOUND bolted onto the image the flasher hands to strangers.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_TYPE_AUTO=y
 CONFIG_SPIRAM_MODE_OCT=y

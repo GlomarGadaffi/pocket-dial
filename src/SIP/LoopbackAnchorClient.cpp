@@ -94,9 +94,18 @@ bool LoopbackAnchorClient::makeCall(const std::string& destination, std::string*
 		_lastMakeCallDestination = destination;
 	}
 
-	// Resolve our own leg synchronously (fixed mock id) so the engine can bind the
-	// session immediately, before any Answered event arrives — keeping call correlation
-	// correct even when multiple calls are in flight.
+	// Resolve our own leg synchronously so the engine can bind the session before any
+	// Answered event arrives.
+	//
+	// The id is FIXED, and that is why maxConcurrentCalls() reports 1 (see the
+	// override in the header). The previous comment here claimed this kept "call
+	// correlation correct even when multiple calls are in flight", which cannot be
+	// true of a constant: the engine keys its rx-audio fan-out on the participant
+	// id, so two live loopback calls would collide on "mock-part-123". The sim-thread
+	// machinery below says the same thing in code — `_stopSimThread = true` plus
+	// reapSimThreads() deliberately SUPERSEDES any previous call, and the stale-call
+	// guard (`myCallId != g_activeCallId`) exists to let it. This is a single-call
+	// mock by construction, not by accident.
 	if (ownLegOut) *ownLegOut = "mock-part-123";
 
 	_stopSimThread = true;

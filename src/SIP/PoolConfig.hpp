@@ -196,8 +196,29 @@
 // PSRAM footprint (12 KB x kWsWorkers, 6 KB x N media-rx tasks), and proving
 // the single-call path end-to-end on real hardware is its own verification
 // pass before concurrency is added on top.
+// RAISED 1 -> 4. Both conditions the paragraph above set for this are now met:
+// TelephonyAnchorClient landed (it hands back a distinct participant id per call,
+// TelephonyAnchorClient.cpp:418), and the single-call path is hardware-proven --
+// an outbound PSTN call completed end to end with two-way audio on the bench.
+//
+// The loopback objection above is NOT waved away, it is enforced properly:
+// AnchorClient::maxConcurrentCalls() lets each provider declare what it can
+// actually drive, LoopbackAnchorClient reports 1 because its participant id is a
+// constant, and RequestsHandler::anchorCallLimit() takes the min of that and this
+// array size. So sizing the arrays for the real trunk can no longer quietly hand
+// the mock a concurrency that would silently starve one leg's audio.
+//
+// 4 rather than more, from drawbridge's hardware validation on this same silicon:
+// the ceiling is not sockets or RAM (both lifted -- PSRAM task stacks, 48-entry
+// LWIP pool) but the ESP32-S3's SOFTWARE ECDHE. With no ECC accelerator each TLS
+// handshake costs roughly a second of CPU and a cold start opens two per call
+// (the GET and POST audio streams). Past ~4 simultaneous handshakes both cores
+// saturate, the idle tasks starve into the task watchdog, and the surplus calls
+// finish handshaking too late to bridge anything. At 4 the calls bridge with no
+// playout glitches and the 5th is cleanly refused with 503 rather than accepted
+// and dropped. Raising further needs ECC-accel silicon or GET-stream resumption.
 #ifndef POCKETDIAL_MAX_ANCHOR_CALLS
-#define POCKETDIAL_MAX_ANCHOR_CALLS 1
+#define POCKETDIAL_MAX_ANCHOR_CALLS 4
 #endif
 
 // Maximum number of DID -> extension inbound routing entries (DidMapping.hpp).

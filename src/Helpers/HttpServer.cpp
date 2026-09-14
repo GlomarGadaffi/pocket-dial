@@ -11,6 +11,7 @@
 #include "ProvisioningConfig.hpp"
 #include "index_html.h"
 #include "IPHelper.hpp"
+#include "UrlEncode.hpp"        // single source of truth for urlDecode (see below)
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -37,7 +38,8 @@
 #endif
 
 // Forward declarations for the file-local form/URL helpers (defined lower down).
-// sendApiDnd() uses getFormParam() but is defined earlier in this TU.
+// sendApiDnd() and sendApiKill() use getFormParam() but are defined earlier in
+// this TU — this declaration is what lets them, so no reordering is needed.
 static std::string getFormParam(const std::string& body, const std::string& key);
 
 #if defined(PD_ETH_HAS_SD)
@@ -454,6 +456,13 @@ void HttpServer::handleClient(int clientSock)
 	else if (req.method == "GET" && req.path == "/api/status")
 	{
 		sendApiStatus(clientSock);
+	}
+	else if (req.method == "GET" && req.path == "/metrics")
+	{
+		// Issue #184: deliberately ungated, in the same read-only class as
+		// /api/status directly above — see sendApiMetrics for the full
+		// justification against docs/THREAT_MODEL.md §4 E-2.
+		sendApiMetrics(clientSock);
 	}
 	else if (req.method == "POST" && req.path == "/api/kill")
 	{
@@ -1072,19 +1081,183 @@ void HttpServer::sendApiStatus(int sock)
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 
+// GET /metrics (issue #184) — Prometheus text-exposition format, ported from
+// drawbridge's issue #128 handler (its src/Helpers/HttpServer.cpp:1079
+// sendApiMetrics). Every place this diverges from that original is recorded
+// below, because the divergences are decisions, not drift.
+//
+// ── GATING: intentionally UNAUTHENTICATED ────────────────────────────────────
+// This is the decision that matters, so it is argued rather than asserted.
+//
+//  1. docs/THREAT_MODEL.md §4 E-2 defines the read-only-and-unauthenticated
+//     class (/api/status, /api/wifi/scan, /api/admin/status) and explicitly
+//     separates it from the *sensitive* reads that do take requireAdmin()
+//     (/api/pcap, /api/trace, /api/registrar, /api/telephony-config,
+//     /api/did-mapping, /api/ap-security — raw SIP bytes including
+//     Authorization digests, credentials-adjacent config, the AP passphrase in
+//     clear). What this handler emits is six unlabelled aggregate numbers: no
+//     extension numbers, no peer addresses, no caller/callee pairs, no config,
+//     no secrets. It belongs in the first class, not the second.
+//
+//  2. /api/status is dispatched ungated from handleClient()'s route table (the
+//     entry directly above /metrics, ~line 449) and returns strictly MORE than
+//     this page does — the whole registered-client roster with each phone's
+//     IP:port, every live session's caller/callee/state, the
+//     dial plan, and the parked-call table. Gating /metrics while that stays
+//     open would not withhold a single bit from an anonymous peer on the link;
+//     it would only look like a control. Operational detail does leak here, but
+//     it is a strict subset of what already leaks next door.
+//
+//  3. A stock Prometheus scraper cannot authenticate to this server even if we
+//     wanted it to. It issues a bare GET with no cookie jar; it cannot drive
+//     POST /api/admin/login, echo the per-session X-CSRF token, or renew the
+//     30-minute sliding session. Putting requireAdmin() here would not harden
+//     the endpoint — it would produce a permanently-401 route that no collector
+//     could ever scrape, i.e. a feature that does not work. Drawbridge reached
+//     the same conclusion for the same reason (its issue #128).
+//
+// So: ungated. A deployment that genuinely needs this hidden should control
+// *reachability* (don't route the scrape network to the device), which is a
+// lever that exists, rather than an auth gate the scrape protocol cannot
+// satisfy. Note §5.5's standing rule still holds — reachability is not a
+// security control for the admin plane; requireAdmin() is. This endpoint is
+// simply not part of the admin plane.
+//
+// ── NAMING ───────────────────────────────────────────────────────────────────
+// Every family is prefixed `pocketdial_`. That is a deliberate divergence:
+// drawbridge shipped its families bare (`uptime_seconds`, `sip_calls_active`,
+// `packets_processed_total`), which collides with any other exporter on the
+// same Prometheus server and is against the convention that a family is
+// namespaced by the application exporting it. The suffixes are drawbridge's
+// verbatim, so the families stay recognisable across the two repos, and the
+// prefix matches this codebase's own POCKETDIAL_ macro namespace.
+//
+// ── DATA SOURCES, and what was dropped ───────────────────────────────────────
+// Reads only the thread-safe getters sendApiStatus already uses: the relaxed
+// atomics (getPacketsProcessed / getPacketsDropped / getSdpRejected) and the
+// _snapshotMutex-guarded counts (getClientCount / getSessionCount). Nothing
+// here touches RequestsHandler::_mutex, the packet-path lock — which is why
+// getConferenceLegs() (RequestsHandler.cpp:4951, the one dashboard getter that
+// takes _mutex) is deliberately NOT exported: a scrape timer firing every
+// 15 s would become the first HTTP-thread contender for the SIP hot path's
+// lock, and a conference-legs gauge is not worth that.
+//
+// Drawbridge families with no source in pocket-dial are dropped, not faked:
+// anchor_calls_active, anchor_connected, sip_registrations_total,
+// sip_calls_total and rtp_playout_{underruns,overruns}_total all read a
+// RequestsHandler::Telemetry struct that this repo does not have, and
+// heap_free_bytes / psram_free_bytes have no counterpart in this server's
+// status route.
+void HttpServer::sendApiMetrics(int sock)
+{
+	uint64_t uptimeSec = (currentTimeMs() - _startTime) / 1000;
+
+	uint64_t packets      = 0;
+	uint64_t dropped      = 0;
+	uint64_t sdpRejected  = 0;
+	size_t   clientCount  = 0;
+	size_t   sessionCount = 0;
+
+	// Same null-check idiom as sendApiStatus: the dashboard starts before the
+	// SIP stack exists (see attachHandler's comment in the header), so an
+	// unattached server must still answer 200 with all-zero samples rather than
+	// 503. Zero is a valid sample; a missing family would make a collector
+	// report the series as stale.
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler != nullptr)
+	{
+		packets      = handler->getPacketsProcessed();
+		dropped      = handler->getPacketsDropped();
+		sdpRejected  = handler->getSdpRejected();
+		clientCount  = handler->getClientCount();
+		sessionCount = handler->getSessionCount();
+	}
+
+	// Exposition format 0.0.4 is a strict line protocol: "# HELP <name> <text>"
+	// then "# TYPE <name> <counter|gauge>" then one bare-number sample line per
+	// family, LF-separated (never CRLF — that is the response *header*
+	// convention, not the body's), and the body ends with a final LF.
+	//
+	// A monotonic series MUST be declared `counter`, never `gauge`: rate() and
+	// increase() only apply their counter-reset correction to a family typed
+	// counter, so mistyping one would make every reboot read as a large
+	// negative rate instead of a reset.
+	std::ostringstream out;
+	auto gauge = [&out](const char* name, const char* help, uint64_t value) {
+		out << "# HELP " << name << " " << help << "\n";
+		out << "# TYPE " << name << " gauge\n";
+		out << name << " " << value << "\n";
+	};
+	auto counter = [&out](const char* name, const char* help, uint64_t value) {
+		out << "# HELP " << name << " " << help << "\n";
+		out << "# TYPE " << name << " counter\n";
+		out << name << " " << value << "\n";
+	};
+
+	// Uptime is monotonic-since-boot but is a gauge by convention (and by
+	// drawbridge's choice): it is read as "how long has this board been up",
+	// a point-in-time value, and is never rate()'d. Only the _total families
+	// below are counters.
+	gauge("pocketdial_uptime_seconds",
+	      "Seconds since this boot.", uptimeSec);
+	// Both of these read the dashboard snapshot, which tick() republishes on its
+	// own ~1 s cadence (RequestsHandler.cpp's snapshot build) — so they lag live
+	// state by up to a tick. That is well inside any sane scrape interval, but it
+	// is why neither is described as "exact".
+	gauge("pocketdial_sip_registrations_active",
+	      "Extensions holding a registration binding, as of the last snapshot.",
+	      static_cast<uint64_t>(clientCount));
+	gauge("pocketdial_sip_calls_active",
+	      "Sessions allocated in the session map, as of the last snapshot. Counts "
+	      "internal legs (register beep, echo, park ring-back), not just "
+	      "handset-to-handset calls.",
+	      static_cast<uint64_t>(sessionCount));
+	counter("pocketdial_packets_processed_total",
+	        "SIP packets accepted and dispatched since boot.", packets);
+	counter("pocketdial_packets_dropped_total",
+	        "SIP packets dropped since boot as malformed or rate-limited (issue #38).",
+	        dropped);
+	counter("pocketdial_sdp_rejected_total",
+	        "SDP bodies refused by the admission gate since boot, whether answered 488 "
+	        "or dropped silently (docs/THREAT_MODEL.md T-7).",
+	        sdpRejected);
+
+	// "text/plain; version=0.0.4" is THE exposition-format content type — the
+	// version parameter is how a scraper picks its parser, so it is not
+	// decorative. sendResponse passes the string through verbatim.
+	sendResponse(sock, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", out.str());
+}
+
 void HttpServer::sendApiKill(int sock, const std::string& body)
 {
-	// Parse "extension=XXXX" from the body
-	std::string ext;
-	std::string prefix = "extension=";
-	size_t pos = body.find(prefix);
-	if (pos != std::string::npos)
-	{
-		ext = body.substr(pos + prefix.size());
-		// Trim whitespace / newlines
-		while (!ext.empty() && (ext.back() == '\r' || ext.back() == '\n' || ext.back() == ' '))
-			ext.pop_back();
-	}
+	// Issue #191: this used to hand-roll the parse — a bare body.find("extension=")
+	// followed by a substr() to the end of the body — and so reproduced, one for
+	// one, every defect getFormParam() exists to prevent:
+	//
+	//   1. find() matched a key that merely ENDS in "extension", so a body of
+	//      "myextension=999&extension=101" disconnected 999 and left the jack the
+	//      operator actually clicked still up. This is exactly the bug class the
+	//      helper's own boundary check carries the scar of (see getFormParam's
+	//      comment below): searching for "on=" inside "extension=101&on=1" hit the
+	//      "n=" of "extensio[n=]101", and DND silently inverted.
+	//   2. the substr() ran to the END of the body rather than to the next '&',
+	//      so "extension=101&reason=test" yielded ext = "101&reason=test" — a
+	//      string no registered client can ever equal, i.e. a kill that matched
+	//      nothing while still answering 200.
+	//   3. no URL-decoding at all, so a percent-encoded extension was compared
+	//      literally. isValidAor admits '*' and '#' (park orbits, page zones, the
+	//      *8 group-pickup code — see PbxConfig.hpp), and those reach a form body
+	//      as escapes from any conservative encoder: curl --data-urlencode and
+	//      Python's quote() both send "*8" as "%2A8". Even the dashboard's
+	//      encodeURIComponent(), which leaves '*' alone, sends a '#'-bearing code
+	//      as "%23". None of those ever equalled a registered client's number.
+	//
+	// One deliberate behaviour change falls out of (1): a body carrying ONLY
+	// "myextension=999" now answers 400 instead of killing 999. That is the fix,
+	// not a regression — and the real caller (index_html.h's
+	// post("/api/kill","extension="+encodeURIComponent(selectedJack))) puts
+	// "extension=" at offset 0, which the boundary check admits unchanged.
+	const std::string ext = getFormParam(body, "extension");
 
 	if (ext.empty())
 	{
@@ -1093,6 +1266,14 @@ void HttpServer::sendApiKill(int sock, const std::string& body)
 		return;
 	}
 
+	// KNOWN GAP (issue #191, second half): this answers 200 whether or not the
+	// extension matched anything, so an operator clearing a stuck phone is told
+	// it worked even when no client and no session bore that number — precisely
+	// the outcome defect (2) above produced on every call. Reporting 404
+	// needs RequestsHandler::forceDisconnect() to return whether it matched
+	// (the signal already exists inside it: the _clientPool number compare and
+	// the per-session `involved` flag), which is a change to another translation
+	// unit, so it is left for a follow-up rather than faked from this side.
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
 		handler->forceDisconnect(ext);
@@ -1139,13 +1320,32 @@ void HttpServer::sendApiPcap(int sock)
 	{
 		pcap = handler->getPcapCapture();
 	}
-	// No same-origin check: this is a plain-download GET (an admin clicking a
-	// dashboard link, or curl/wget with the session cookie), not a
-	// state-mutating action — the same-origin gate on every other admin
-	// endpoint exists to stop a malicious page from silently POSTing through an
-	// admin's authenticated browser, which doesn't apply to fetching a file.
-	// SameSite=Strict on pd_session (see /api/admin/login) already keeps a
-	// cross-site page from riding the admin's session to reach this at all.
+	// This handler ASSUMES it was reached through requireAdmin() and re-checks
+	// nothing: the two routes that reach it (/api/pcap and /api/diagnostics/pcap —
+	// sendApiTrace next door serves the same ring behind the same gate) both go
+	// through requireAdmin(..., needCsrf=false), whose FIRST gate is
+	// requireSameOrigin() — so same-origin and a valid session are already
+	// established by the time these bytes are built. The guard lives at the
+	// dispatch site, not here.
+	//
+	// What needCsrf=false means, which is all this comment was ever trying to say:
+	// a plain-download GET (an admin clicking a dashboard link, or curl/wget with
+	// the session cookie) mutates nothing, and the CSRF token defends against a
+	// hostile page driving a state change THROUGH an admin's browser — it can
+	// forge the request but never read the response. SameSite=Strict on pd_session
+	// (see /api/admin/login) is the defence in depth that stops such a page
+	// reaching this at all.
+	//
+	// The comment this replaces claimed "No same-origin check" — true of this
+	// function read in isolation, false of the endpoint as dispatched. It predates
+	// the sweep that put these read routes behind requireAdmin (see
+	// HttpServer.hpp's requireAdmin comment: "/api/pcap, /api/trace and
+	// /api/diagnostics/pcap had no same-origin check despite serving raw SIP bytes
+	// including Authorization digests"). docs/API.md now lists /api/pcap among the
+	// same-origin-checked "gated reads", so this comment was the last place the old
+	// claim still stood — and a security note that disagrees with the dispatch
+	// table is exactly how a wrong claim gets repeated downstream. Hence: say where
+	// the guard lives, not whether this function performs it.
 	sendResponseWithHeader(sock, 200, "OK", "application/vnd.tcpdump.pcap", pcap,
 		"Content-Disposition: attachment; filename=\"pocket-dial.pcap\"");
 }
@@ -1923,29 +2123,22 @@ uint64_t HttpServer::currentTimeMs() const
 }
 
 // Helpers for URL decoding and parsing post/form params
-static std::string urlDecode(const std::string& src)
-{
-	std::string ret;
-	char ch = '\0';
-	unsigned int ii = 0;
-	for (size_t pos = 0; pos < src.length(); ++pos) {
-		if (src[pos] == '+') {
-			ret += ' ';
-		} else if (src[pos] == '%') {
-			if (pos + 2 < src.length() && 
-				sscanf(src.substr(pos + 1, 2).c_str(), "%x", &ii) == 1) {
-				ch = static_cast<char>(ii);
-				ret += ch;
-				pos += 2;
-			} else {
-				ret += src[pos];
-			}
-		} else {
-			ret += src[pos];
-		}
-	}
-	return ret;
-}
+// urlDecode intentionally does NOT live here. This TU used to carry its own
+// file-static copy built on sscanf(substr(pos+1, 2), "%x", &ii), which silently
+// diverged from the tested one in UrlEncode.hpp:
+//
+//   * scanf's %x stops at the first non-hex character and still reports one
+//     successful conversion, so "%5g" decoded to byte 0x05 AND swallowed the
+//     'g' via the pos += 2 that followed. UrlEncode.hpp's hexVal() rejects the
+//     pair and emits a literal '%', leaving "5g" intact.
+//   * %x also accepts a leading sign, so "%-1" parsed rather than being passed
+//     through.
+//
+// Two decoders is one too many: the tested one (tests/UrlEncode_test.cpp,
+// UrlDecodeTrailingEscape) was reachable only from TelephonyAnchorClient, while
+// every HTML form route -- getFormParam() below, and therefore every admin POST
+// -- went through the weaker copy. drawbridge hit the same split and resolved it
+// the same way (its audit #73), making the header the single source of truth.
 
 static std::string getFormParam(const std::string& body, const std::string& key)
 {
@@ -2125,14 +2318,25 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	DeviceConfig::clearAll();
 	// Also wipe the Telephony-API credential slots ("tapicfg") and the DID ->
 	// extension table ("didmap") -- both live in their OWN NVS namespace /
-	// host-file specifically so a factory reset of "storage"/"pbxcfg" above
-	// would NOT collaterally touch them (see TelephonyApiConfig.hpp's and
-	// DidMapping.hpp's class comments), which means a factory reset must
-	// clear them explicitly or a carrier OAuth client_id/client_secret and
-	// the full DID table survive the reset in flash. The CDR call-history ring
-	// ("cdrlog") is the same story -- its own NVS namespace, never touched by
-	// the "storage"/"pbxcfg" erases below, so callers/callees survive a reset
-	// unless cleared here too. All three are owned by RequestsHandler
+	// host-file specifically so that clearing the device's own settings would NOT
+	// collaterally touch them (see TelephonyApiConfig.hpp's and DidMapping.hpp's
+	// class comments), which means a factory reset must clear them explicitly or a
+	// carrier OAuth client_id/client_secret and the full DID table survive the
+	// reset in flash. The CDR call-history ring ("cdrlog") is the same story --
+	// its own NVS namespace again, so callers/callees survive a reset unless
+	// cleared here too.
+	//
+	// Nothing else in this function reaches them: DeviceConfig::clearAll() just
+	// above erases only its three named "storage" keys plus reg_mode in "pbxcfg"
+	// (via that file's eraseRegistrarMode(), src/Helpers/DeviceConfig.cpp), and the
+	// WiFi block further down erases four more "storage" keys by name. Both of
+	// those are key-by-key, never a namespace wipe, so a namespace no line here
+	// names is not reached at all. (An earlier version of this comment said
+	// "storage"/"pbxcfg" were erased "above"/"below", which pointed at nothing in
+	// this file: those erases live in DeviceConfig.cpp, a different translation
+	// unit.)
+	//
+	// All three are owned by RequestsHandler
 	// (_tapiConfig/_didMapping/_cdr), so go through it like every other
 	// mutation of those tables. Unconditional (not gated on
 	// POCKETDIAL_HAS_WIFI below) so this also runs -- and is host-testable --

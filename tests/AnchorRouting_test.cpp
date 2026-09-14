@@ -20,6 +20,7 @@
 // proven, thread-free, by MediaBridge_test.cpp's
 // AnchorAudioReachesPlayoutBufferThroughRxFanout.
 
+#include <algorithm>
 #include <gtest/gtest.h>
 
 #include <string>
@@ -142,21 +143,37 @@ TEST(AnchorRouting, DialingReservedExtensionReachesAnchorAndBridgeAttaches)
 
 TEST(AnchorRouting, DialPastCapacityIsRefusedWithoutConsumingASession)
 {
-	// Generalized over POCKETDIAL_MAX_ANCHOR_CALLS (documented default: 1, see
-	// PoolConfig.hpp) rather than hardcoding the cap, so a deliberate -D override
-	// doesn't fail this test — one caller per slot connects, then one more finds
-	// every slot busy. Mirrors ConferenceRoom_test.cpp's
-	// ConferenceDialIsRefusedWhenTheRoomIsFull.
-	ASSERT_LE(POCKETDIAL_MAX_ANCHOR_CALLS + 1, POCKETDIAL_MAX_SESSIONS)
-		<< "test assumes the anchor-bridge pool fills before the session pool does";
-
+	// Generalized over the EFFECTIVE limit, not the array size. Those are two
+	// different numbers and conflating them is the bug this guards:
+	//
+	//   * POCKETDIAL_MAX_ANCHOR_CALLS sizes _mediaBridges — the machinery.
+	//   * AnchorClient::maxConcurrentCalls() is what the plugged-in provider can
+	//     actually drive.
+	//
+	// This test runs against LoopbackAnchorClient, which hands back the CONSTANT
+	// participant id "mock-part-123" (asserted a few tests above). The engine keys
+	// its rx-audio fan-out on that id via bridgeForParticipant(), which returns the
+	// FIRST match — so a second concurrent loopback call would be signalled fine
+	// and then have its audio fed to the first call's bridge. Signalling-only
+	// assertions cannot see that, which is exactly why the limit has to be the
+	// provider's, and why the loopback reports 1 however large the array grows.
+	//
+	// Mirrors ConferenceRoom_test.cpp's ConferenceDialIsRefusedWhenTheRoomIsFull.
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
 	RequestsHandler handler("192.168.9.1", 5060,
 		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
 			sent.emplace_back(addr, std::move(msg));
 		});
 
-	for (int i = 0; i <= POCKETDIAL_MAX_ANCHOR_CALLS; ++i)
+	ASSERT_NE(handler.anchorClientForTest(), nullptr);
+	const int kLimit = static_cast<int>(
+		std::min<unsigned>(handler.anchorClientForTest()->maxConcurrentCalls(),
+		                   static_cast<unsigned>(POCKETDIAL_MAX_ANCHOR_CALLS)));
+	ASSERT_GE(kLimit, 1);
+	ASSERT_LE(kLimit + 1, POCKETDIAL_MAX_SESSIONS)
+		<< "test assumes the anchor-bridge capacity fills before the session pool does";
+
+	for (int i = 0; i <= kLimit; ++i)
 	{
 		const std::string ext = "6" + std::to_string(10 + i);
 		const std::string ip = "192.168.9." + std::to_string(100 + i);
@@ -168,7 +185,7 @@ TEST(AnchorRouting, DialPastCapacityIsRefusedWithoutConsumingASession)
 		ASSERT_FALSE(sent.empty());
 		const std::string raw = sent.front().second ? sent.front().second->toString() : std::string{};
 
-		if (i < POCKETDIAL_MAX_ANCHOR_CALLS)
+		if (i < kLimit)
 		{
 			EXPECT_NE(raw.find("SIP/2.0 200 OK"), std::string::npos)
 				<< "call " << i << " should have gotten a free bridge slot, got:\n" << raw;

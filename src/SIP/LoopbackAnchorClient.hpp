@@ -30,6 +30,15 @@ public:
 	void registerAudioRxCallback(AudioRxCallback cb) override;
 	void tick() override {}   // no periodic maintenance for the in-process loopback
 
+	// Single-call by construction: makeCall() hands back the constant participant id
+	// "mock-part-123" (LoopbackAnchorClient.cpp), and the engine keys rx-audio
+	// fan-out on that id, so a second concurrent call would collide with the first
+	// and silently starve one leg's audio. The sim threads reinforce it — a new
+	// makeCall() supersedes the previous one rather than running alongside it.
+	// Reported explicitly rather than left to the base default so that raising
+	// POCKETDIAL_MAX_ANCHOR_CALLS can never quietly enable concurrency here.
+	unsigned maxConcurrentCalls() const override { return 1; }
+
 	// Test hook: pretend the upstream is delivering a PSTN call to the monitored DN.
 	// Fires a single CallEvent::Incoming (participant id "mock-in-<n>", the given
 	// callerId). The engine is expected to ring a local extension and then call

@@ -955,6 +955,65 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	endHandle(fromNumber, response);
 }
 
+// ── Capability advertisement (issue #199, root cause 2) ──────────────────────
+// Until this landed, no code in src/ ever emitted Allow:, Supported: or Accept:.
+// Two concrete consequences, both of which make a correctly-implemented phone
+// refuse to use machinery this PBX already has:
+//   * RFC 3311 §5.1 — a UA MUST NOT send an UPDATE unless the peer advertised
+//     UPDATE in an Allow header. onUpdate() has handled hold/resume and bodiless
+//     session-timer keep-alives all along; no phone would ever reach it.
+//   * RFC 3891 §4 — a UA only offers a Replaces-based attended transfer when the
+//     peer advertised "replaces" in Supported. onRefer()'s ?Replaces= splice
+//     (issue #131) was likewise unreachable from a spec-abiding phone.
+//
+// EVERY entry below is something this PBX genuinely dispatches. Over-claiming is
+// the exact failure #199 is about, so the lists are derived from initHandlers()
+// (:582-601) plus the one method handled ahead of the table, and nothing else.
+namespace
+{
+	// The request methods initHandlers() registers — REGISTER, OPTIONS, CANCEL,
+	// INVITE, ACK, BYE, REFER, UPDATE, MESSAGE, SUBSCRIBE — plus INFO, which
+	// handle() answers before the handler table (RFC 6086 §4.2.1) and routes to
+	// the DTMF collector. The other table entries (TRYING/RINGING/BUSY/
+	// UNAVAILABLE/OK/FINAL_FAILURE/REQUEST_TERMINATED) are RESPONSE keys, not
+	// methods, and have no business in Allow.
+	//
+	// Deliberately absent: PRACK (no handler — so 100rel must not be claimed
+	// either), NOTIFY (BlfSubscriptions SENDS them; nothing accepts one) and
+	// PUBLISH. A phone that saw those here would wait on replies we never send.
+	constexpr const char* kAllowedMethods =
+		"INVITE, ACK, CANCEL, BYE, OPTIONS, REGISTER, INFO, MESSAGE, REFER, "
+		"SUBSCRIBE, UPDATE";
+
+	// Option tags, RFC 3261 §20.37. "replaces" only.
+	//
+	// NOT "timer": docs/FEATURE_ROADMAP.md calls the RFC 4028 support "passive —
+	// honours a timer a phone requests, but never requests one itself and never
+	// sends 422/Min-SE". §5 and §6 make Min-SE processing and the 422 response
+	// mandatory for an entity that advertises the extension, and neither exists
+	// here (getMinSESecs() has no caller), so advertising it would be a lie.
+	// NOT "100rel" (RFC 3262 needs PRACK), "norefersub", "path", "gruu" or
+	// "outbound" — none of them have any implementation in this codebase.
+	constexpr const char* kSupportedOptionTags = "replaces";
+
+	// Body types this PBX actually parses: SDP on INVITE/re-INVITE/UPDATE/ACK,
+	// and the DTMF relay body handle() looks for on INFO. onMessage() does not
+	// interpret its body at all (RequestsHandler.cpp:3940-3944), so no MESSAGE
+	// content type is claimed — under-claiming is the safe direction here.
+	constexpr const char* kAcceptedBodyTypes = "application/sdp, application/dtmf-relay";
+}
+
+void RequestsHandler::addCapabilityHeaders(SipMessage& response) const
+{
+	response.addHeader("Allow", kAllowedMethods);
+	response.addHeader("Supported", kSupportedOptionTags);
+	response.addHeader("Accept", kAcceptedBodyTypes);
+	// RFC 6665 §4.4.1: a UA that accepts SUBSCRIBE advertises its packages.
+	// BlfSubscriptions::onSubscribe() implements exactly one, the RFC 4235
+	// "dialog" package, and 489s anything else (BlfSubscriptions.cpp:145-154).
+	response.addHeader("Allow-Events", "dialog");
+}
+
 void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 {
 	auto response = getMessageFromPool(*data);
@@ -964,6 +1023,10 @@ void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	response->setContact(buildContact(data->getFromNumber()));
+	// OPTIONS is THE capability-discovery method (RFC 3261 §11.2: a 200 OK to it
+	// SHOULD carry Allow/Accept/Supported), and it is the one a phone polls as a
+	// keep-alive — so this is where the advertisement costs nothing and is read.
+	addCapabilityHeaders(*response);
 	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
@@ -1083,6 +1146,22 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 {
+	// A 487 to our own register-beep INVITE — the phone's answer to the CANCEL
+	// sweep() sent when it never auto-answered (drawbridge #90/#178). Claim it
+	// here exactly as onFinalFailure() does: 487 has its own handlerKey in
+	// handle()'s dispatch switch, so it never reaches that catch-all, and the
+	// beep guard was wired into the catch-all alone. Unclaimed, this fell
+	// through to endHandle(data->getFromNumber(), ...) below — and a beep's From
+	// is the server's own <sip:pbx@...> (RegisterBeeper::sendBeep), which is not
+	// a registered extension, so findClient("pbx") missed and endHandle's else
+	// branch minted a 404 Not Found straight back at the phone that had just
+	// been beeped. The 487 also went unACKed, which RFC 3261 §17.1.1.3 requires,
+	// leaving the phone retransmitting it until Timer H (~32 s).
+	if (_beeper.handleInviteFailure(data))
+	{
+		return;
+	}
+
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
@@ -1261,8 +1340,34 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		// 777/440 call must not overwrite this session's destination identity. The
 		// shared_ptr lives as long as the session references it (released on
 		// teardown / pool reuse) — bounded by the session pool, not the packet path.
-		auto dummy777 = std::make_shared<SipClient>();
-		dummy777->reset("777", data->getSource(), 3600);
+		//
+		// Drawn from _virtualPeerPool rather than make_shared'd here (drawbridge
+		// audit #70). This is the UDP packet handler, and invariant 1 — zero heap
+		// allocation in the packet hot path — says every transient SipClient comes
+		// from a boot-time pool; park/conference/anchor/PSTN already do, and
+		// PoolConfig.hpp:121-126 has described 777 as pool-drawn all along. The
+		// pool is sized POCKETDIAL_MAX_SESSIONS + POCKETDIAL_PARK_SLOTS, so the
+		// allocateSession() above is the real gate and this should never fail —
+		// but unlike drawbridge's allocator, which always heap-falls-back, ours
+		// returns nullptr past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX, so the null
+		// MUST be checked: setDest(nullptr) would publish a Connected session
+		// whose teardown/CDR paths dereference getDest(). Refuse with the same
+		// 503 the session-pool-full branch above sends, and refuse HERE, before
+		// setDest()/_sessions.emplace() — newSession is still unpublished, so the
+		// next allocateSession() reclaims its slot (see that comment above).
+		auto dummy777 = allocateVirtualPeer("777", data->getSource());
+		if (!dummy777)
+		{
+			auto responseObj = getMessageFromPool(*data);
+			if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
+			responseObj->setHeader("SIP/2.0 503 Service Unavailable");
+			responseObj->clearBody();
+			responseObj->setContact(buildContact("777"));
+			_outbox.emplace_back(data->getSource(), std::move(responseObj));
+			queueLog("777 echo: virtual-peer pool exhausted, rejected "
+				+ std::string(data->getFromNumber()), true);
+			return;
+		}
 		newSession->setDest(dummy777);
 		_sessions.emplace(data->getCallID(), newSession);
 		newSession->setState(Session::State::Connected);
@@ -1518,7 +1623,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	endHandle(data->getToNumber(), response);
 }
 
-std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpPort, bool sendrecv)
+std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpPort, bool sendrecv, int dtmfPt)
 {
 	// The server's OWN SDP offer/answer for a server-media call. PCMU (PT 0) only —
 	// matches enforceG711()/the codec the rest of the PBX speaks. Sendonly (the 440
@@ -1527,14 +1632,38 @@ std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpP
 	// mix if the phone actually sends its own audio up.
 	// CRLF line endings throughout so Content-Length (computed by the caller via
 	// syncContentLength()) matches the wire bytes exactly.
+	// dtmfPt: the caller's RFC 4733 telephone-event payload type, echoed back so
+	// DTMF reaches us on this leg. It MUST be the number the offer used -- RFC 3264
+	// forbids answering with a payload type the offer did not contain, and the PT
+	// is dynamic, so there is nothing to hardcode. -1 means the offer carried none
+	// (or we are building an offer of our own), in which case the answer stays
+	// PCMU-only exactly as before.
+	//
+	// Without this the board advertised "RTP/AVP 0" and nothing else, so a
+	// conformant phone had no negotiated way to send DTMF into a server-terminated
+	// call at all -- and since an ordinary call's media is peer-to-peer, the RTP
+	// path was the ONLY way it could have arrived. That is why a menu on 440/555/888
+	// could never be driven from a handset in its default DTMF mode.
+	const bool withDtmf = (dtmfPt >= 0 && dtmfPt <= 127 && dtmfPt != 0);
+
 	std::string s;
 	s += "v=0\r\n";
 	s += "o=- 0 0 IN IP4 " + serverIp + "\r\n";
 	s += "s=pocketdial-media\r\n";
 	s += "c=IN IP4 " + serverIp + "\r\n";
 	s += "t=0 0\r\n";
-	s += "m=audio " + std::to_string(rtpPort) + " RTP/AVP 0\r\n";
+	s += "m=audio " + std::to_string(rtpPort) + " RTP/AVP 0";
+	if (withDtmf) s += " " + std::to_string(dtmfPt);
+	s += "\r\n";
 	s += "a=rtpmap:0 PCMU/8000\r\n";
+	if (withDtmf)
+	{
+		s += "a=rtpmap:" + std::to_string(dtmfPt) + " telephone-event/8000\r\n";
+		// 0-15 is the DTMF subset: the sixteen keypad symbols and nothing else.
+		// We deliberately do not claim 16 (hook flash) or the tone events -- the
+		// receiver maps only 0-15 to a key and would drop the rest anyway.
+		s += "a=fmtp:" + std::to_string(dtmfPt) + " 0-15\r\n";
+	}
 	s += sendrecv ? "a=sendrecv\r\n" : "a=sendonly\r\n";
 	return s;
 }
@@ -1641,12 +1770,11 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	}
 
 	// Track a Session so the dashboard shows the call and CDR is recorded on teardown.
-	// Per-session dummy dest (never a shared client) so a concurrent 777/440 can't
-	// overwrite this call's destination identity. If the session pool is full, stop
-	// the stream we just started and answer 503 rather than streaming an untracked
-	// call that nothing can later tear down.
-	auto dummy440 = std::make_shared<SipClient>();
-	dummy440->reset("440", data->getSource(), 3600);
+	// If the session pool is full, stop the stream we just started and answer 503
+	// rather than streaming an untracked call that nothing can later tear down.
+	// (Its per-session dummy dest — never a shared client, so a concurrent 777/440
+	// can't overwrite this call's destination identity — is drawn below, once this
+	// session is in hand.)
 	auto newSession = allocateSession(std::string(data->getCallID()), caller);
 	if (!newSession)
 	{
@@ -1661,6 +1789,37 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		queueLog("440 media: session pool full, rejected " + std::string(data->getFromNumber()), true);
 		return;
 	}
+
+	// The per-session dummy dest, drawn from _virtualPeerPool instead of
+	// make_shared'd in the packet handler (drawbridge audit #70 — invariant 1,
+	// zero heap allocation in the packet hot path; PoolConfig.hpp:121-126 has
+	// listed the 440 media beachhead as pool-drawn all along).
+	//
+	// Deliberately AFTER allocateSession(): it used to be built first, so a call
+	// that then hit the session-pool-full 503 above had already churned a peer
+	// slot for a session that never existed. The pool is sized
+	// POCKETDIAL_MAX_SESSIONS + POCKETDIAL_PARK_SLOTS, so with the session in
+	// hand this should never fail — but pocket-dial's allocator returns nullptr
+	// past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX (drawbridge's always heap-falls
+	// back), and setDest(nullptr) would publish a Connected session whose
+	// teardown/CDR paths dereference getDest(). Unwind the RTP stream and answer
+	// 503, exactly as the session-pool-full branch directly above does.
+	auto dummy440 = allocateVirtualPeer("440", data->getSource());
+	if (!dummy440)
+	{
+		_rtpSender.stop(std::string(data->getCallID()));
+		auto busy = getMessageFromPool(*data);
+		if (!busy) return;   // pool exhausted: drop, peer retransmits (#101A)
+		busy->setHeader("SIP/2.0 503 Service Unavailable");
+		busy->clearBody();
+		busy->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		busy->setContact(buildContact("440"));
+		_outbox.emplace_back(data->getSource(), std::move(busy));
+		queueLog("440 media: virtual-peer pool exhausted, stream unwound, rejected "
+			+ std::string(data->getFromNumber()), true);
+		return;
+	}
+
 	// The 200 OK is drawn BEFORE the session is published, because past
 	// _sessions.emplace() + Connected there is no clean way back: the caller's
 	// INVITE retransmit would hit the _rtpSender.isActive() guard at the top of
@@ -1803,8 +1962,12 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	// The SDP advertises THIS LEG's receive port (not the 440 sender's port): that is
 	// where the handset must send its audio for the mix to hear it.
 	const std::string toTag = IDGen::GenerateID(9);
+	// Echo the caller's telephone-event PT (RFC 4733) so keypresses reach the mix
+	// leg. A conference is exactly the place this matters -- PIN entry and in-call
+	// controls are keypresses on a leg the server terminates, and before this the
+	// answer advertised PCMU alone so a phone had no negotiated way to send them.
 	const std::string sdpBody = buildMediaSdp(activeIp, _conference->rtpPortFor(callID),
-		/*sendrecv=*/true);
+		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
 	auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
 	if (!ok)
 	{
@@ -1828,8 +1991,48 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		+ destIp + ":" + std::to_string(destPort));
 }
 
+unsigned RequestsHandler::anchorCallLimit() const
+{
+	// TWO different ceilings, and conflating them is a real bug rather than a
+	// tidiness point.
+	//
+	//   * POCKETDIAL_MAX_ANCHOR_CALLS sizes _mediaBridges and the per-call RTP
+	//     arrays. It is a limit on the MACHINERY.
+	//   * AnchorClient::maxConcurrentCalls() is what the plugged-in PROVIDER can
+	//     actually drive. LoopbackAnchorClient returns a constant participant id
+	//     ("mock-part-123"), and the engine keys its rx-audio fan-out on that id —
+	//     so a second concurrent loopback call collides with the first and the
+	//     fan-out feeds whichever bridge it finds first, silently starving the
+	//     other leg. Not a crash: one-way audio with no diagnostic. 555 is
+	//     reachable on default firmware, so this is not hypothetical.
+	//
+	// Taking the smaller means the array can be sized for the real trunk without
+	// the mock inheriting a concurrency it cannot honour.
+	unsigned providerLimit = 1;
+	if (_anchorClient) providerLimit = _anchorClient->maxConcurrentCalls();
+	if (providerLimit == 0) providerLimit = 1;   // a provider claiming 0 is a bug; refuse to divide by it
+
+	const unsigned poolLimit = static_cast<unsigned>(POCKETDIAL_MAX_ANCHOR_CALLS);
+	return (providerLimit < poolLimit) ? providerLimit : poolLimit;
+}
+
+unsigned RequestsHandler::activeAnchorCalls() const
+{
+	unsigned n = 0;
+	for (const auto& b : _mediaBridges)
+	{
+		if (b.isActive()) ++n;
+	}
+	return n;
+}
+
 MediaBridge* RequestsHandler::acquireFreeAnchorBridge()
 {
+	// Refuse before handing out a slot the provider cannot service. The caller
+	// treats nullptr as "at capacity" and answers 503, which is the honest result
+	// — better than accepting a call that would come up with one-way audio.
+	if (activeAnchorCalls() >= anchorCallLimit()) return nullptr;
+
 	for (auto& b : _mediaBridges)
 	{
 		if (!b.isActive()) return &b;
@@ -1849,11 +2052,9 @@ MediaBridge* RequestsHandler::bridgeForParticipant(const std::string& participan
 
 bool RequestsHandler::allBridgesBusy() const
 {
-	for (const auto& b : _mediaBridges)
-	{
-		if (!b.isActive()) return false;
-	}
-	return true;
+	// Must agree with acquireFreeAnchorBridge()'s refusal exactly, or the engine
+	// reports capacity it will then decline to hand out.
+	return activeAnchorCalls() >= anchorCallLimit();
 }
 
 bool RequestsHandler::anchorIsSynchronous() const
@@ -1998,7 +2199,10 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		// above. The SDP advertises THIS BRIDGE's receive port (not any other slot's):
 		// that is where the handset must send its audio for the anchor to hear it.
 		const std::string toTag = IDGen::GenerateID(9);
-		const std::string sdpBody = buildMediaSdp(activeIp, bridge->receiverPort(), /*sendrecv=*/true);
+		// Echo the caller's telephone-event PT so DTMF reaches the anchored leg --
+		// this is the path a voicemail or IVR menu will be driven over.
+		const std::string sdpBody = buildMediaSdp(activeIp, bridge->receiverPort(),
+			/*sendrecv=*/true, data->getTelephoneEventPayloadType());
 		auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
 		if (!ok)
 		{
@@ -2769,6 +2973,21 @@ void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 {
+	// A 180 to our own register-beep INVITE (drawbridge #178). Recognise it and
+	// stop — nothing more. Unlike the 480/486/487 claims in onBusy() /
+	// onUnavailable() / onReqTerminated(), this deliberately does NOT call
+	// _beeper.handleInviteFailure(): a 180 is provisional (RFC 3261 §17.1.1), it
+	// takes no ACK and does not end the INVITE transaction, so the beep dialog is
+	// still live and must keep its slot until a real final response or sweep().
+	// What it must not do is fall through to endHandle(data->getFromNumber(),
+	// ...) below, which resolves the beep's own From ("pbx" — not a registered
+	// extension) and answers the phone that just started ringing with a stray
+	// 404 Not Found.
+	if (_beeper.ownsCallID(data->getCallID()))
+	{
+		return;
+	}
+
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
@@ -2787,6 +3006,23 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 {
+	// The phone declined our register-beep INVITE with 486 (drawbridge #178).
+	// Same claim onFinalFailure() makes, for the same reason: 486 has its own
+	// handlerKey in handle()'s dispatch switch and so never reaches that
+	// catch-all. handleInviteFailure() ACKs it in the INVITE transaction (RFC
+	// 3261 §17.1.1.3) and frees the beep slot; without this the 486 fell through
+	// to endHandle(data->getFromNumber(), ...) at the bottom of this function,
+	// where the beep's own From ("pbx") matches no registered client and the
+	// else branch answered the declining phone with a 404 Not Found.
+	//
+	// Ahead of every session branch below on purpose: a beep dialog is a
+	// server-originated UAC with NO Session, so those branches could not claim
+	// it anyway, and the ordering matches drawbridge's onBusy().
+	if (_beeper.handleInviteFailure(data))
+	{
+		return;
+	}
+
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
@@ -2864,6 +3100,16 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 {
+	// The phone answered our register-beep INVITE with 480 — DND, or simply not
+	// willing to auto-answer right now (drawbridge #178). Identical treatment to
+	// the 486 path in onBusy(): ACK it inside the INVITE transaction (RFC 3261
+	// §17.1.1.3) and free the slot, rather than fall through to endHandle() and
+	// mint a stray 404 at the phone off the beep's own "pbx" From.
+	if (_beeper.handleInviteFailure(data))
+	{
+		return;
+	}
+
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
@@ -5603,10 +5849,70 @@ void RequestsHandler::armSessionTimer(Session* session,
 {
 	uint32_t secs = ok200->getSessionExpiresSecs();
 	if (secs == 0) return;
-	auto ref = ok200->getSessionExpiresRefresher();
-	bool weRefresh = (ref == "uas");
-	session->armSessionTimer(secs, weRefresh, std::chrono::steady_clock::now());
+
+	// Capture the dialog From/To FIRST, before any decision about the reaper.
+	// sweepSessionTimers() and the #72 guard at the bottom of this file both read
+	// getDialogFrom()/getDialogTo(), and attended transfer reads them to address
+	// its cross re-INVITEs — none of that is conditional on a timer being armed,
+	// so hoisting this above the early return below keeps it unconditional.
 	session->setDialogHeaders(std::string(ok200->getFrom()), std::string(ok200->getTo()));
+
+	// ── Who is the refresher? (RFC 4028 §7.4) ────────────────────────────────
+	// The refresher parameter on a 2xx names ONE OF THE TWO UAs of the session:
+	// "uas" is the party that ANSWERED the INVITE (the callee, whose 200 OK this
+	// is), "uac" is the party that SENT it. It never names an intermediary.
+	//
+	// The orientation at this call site is not the obvious one, so spell it out.
+	// This PBX does not re-originate calls on the ordinary call path: onInvite()
+	// clones the CALLER's INVITE, rewrites only Contact, and forwards it
+	// (RequestsHandler.cpp:1578-1581); CallForker::forkInvite does the same for a
+	// ring group (CallForker.cpp:22-50). From/To/Call-ID/CSeq stay the caller's
+	// end to end, and this handler is only ever reached from onOk()'s generic
+	// relay branch (:3408) — every path where the server really is the UAC
+	// (register beep, park, attended-transfer splice, inbound anchor) is
+	// intercepted earlier in onOk() at :3197/:3205/:3213/:3226 and never gets
+	// here. So on this leg the UAC is the CALLER'S PHONE and the UAS is the
+	// CALLEE'S PHONE. The PBX is neither, and therefore is never the refresher.
+	//
+	// The old `weRefresh = (ref == "uas")` asserted the PBX was the refresher in
+	// exactly the case where the header designates the CALLEE — the opposite of
+	// what it reads — and it is the wrong question besides. It was inert only
+	// because _isRefresher has no consumer that generates anything: nothing in
+	// this firmware has ever sent a refreshing re-INVITE or UPDATE
+	// (Session::getNextRefresh() has zero call sites).
+	const auto ref = ok200->getSessionExpiresRefresher();
+	const bool calleeRefreshes = (ref == "uas");
+	const bool callerRefreshes = (ref == "uac");
+	constexpr bool kPbxIsRefresher = false;   // derivation above
+
+	// ── Only arm a reaper we can actually expect to be fed ───────────────────
+	// RFC 4028's UAS rules require a 2xx that carries Session-Expires to carry a
+	// refresher parameter too (section number deliberately omitted — §7.4 is
+	// cited above only for what the parameter MEANS, which is the part this
+	// change turns on). When the parameter is absent, nobody has been made
+	// responsible for refreshing, so no refresh is owed and the only thing this
+	// timer can ever do is BYE a healthy call.
+	//
+	// That is not hypothetical: this PBX builds most responses by cloning the
+	// REQUEST (getMessageFromPool(*data) + setHeader), so its own 200 OK echoes
+	// the caller's Session-Expires back with no refresher added — see the real
+	// pjsip capture in tests/interop/.logs/pjsua-A.log (the PBX's 200 OK on the
+	// 777 leg comes back carrying pjsua's own Session-Expires/Min-SE, and pjsua
+	// then has to pick a refresher itself). A callee that answers the same way
+	// lands the same header here.
+	//
+	// Declining to arm is the safe direction: the worst case is that a dead
+	// dialog lingers until the ordinary BYE/CANCEL or the no-answer and orphan
+	// sweeps in tick() clear it, whereas arming wrongly hangs up a live call.
+	if (!calleeRefreshes && !callerRefreshes)
+	{
+		queueLog("[session timer] Session-Expires with no refresher parameter "
+		         "(RFC 4028 §7.4) — reaper not armed for " +
+		         std::string(ok200->getCallID()));
+		return;
+	}
+
+	session->armSessionTimer(secs, kPbxIsRefresher, std::chrono::steady_clock::now());
 }
 
 void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point now)
@@ -5617,6 +5923,42 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 		if (session->getSessionExpiresSeconds() == 0) continue;
 		const auto st = session->getState();
 		if (st != Session::State::Connected && st != Session::State::Held) continue;
+
+		// Never reap a session whose refresh we would REFUSE. This guard mirrors
+		// the virtual/missing-peer early return in onReinvite() (:5485) and
+		// onUpdate() (:5585) deliberately: those answer 488 Not Acceptable Here
+		// and return ABOVE their re-arm (:5520 / :5607), so for any dialog in that
+		// set a refresh arrives, is refused, and never touches the expiry clock —
+		// after which the sweep below BYEs a call that is perfectly healthy. The
+		// set we refuse to refresh and the set we refuse to reap must stay
+		// identical or that asymmetry comes straight back.
+		//
+		// arming alone cannot prevent this. armSessionTimer() only runs from
+		// onOk()'s relay branch (:3408), where dest was just resolved to a
+		// REGISTERED client — so every armed session starts serviceable and can
+		// only become unserviceable later. The verified way that happens today is
+		// the DTMF feature codes: *69 (DtmfFeatureCodes.cpp:263) and *11 (:286)
+		// take the caller's LIVE session and setDest() a per-session dummy peer
+		// numbered "777" to reroute its RTP to the echo loopback. From that digit
+		// on, the dialog is in onReinvite's 488 set while still being a real,
+		// connected two-party call with an armed reaper — issue #198's spurious
+		// hang-up, reachable with no anchor, no trunk and no transfer.
+		//
+		// The `!src || !dest` half is defensive: no current path unsets a leg on a
+		// Connected session (the attended-transfer splice deliberately leaves both
+		// in place — see Session::wasTransferorSrc()'s comment — and park builds a
+		// FRESH session rather than mutating the connected one, ParkOrbit.cpp:66-69).
+		// Nothing here is leaked: ordinary BYE handling, the anchor ACK/no-answer
+		// reaper and the park sweep in tick() already own these teardowns.
+		auto sweepSrc  = session->getSrc();
+		auto sweepDest = session->getDest();
+		const std::string sweepDestNum = sweepDest ? sweepDest->getNumber() : "";
+		if (!sweepSrc || !sweepDest ||
+			sweepDestNum == "777" || sweepDestNum == ConferenceRoom::EXT ||
+			sweepDestNum == kAnchorCallExt)
+		{
+			continue;
+		}
 
 		if (now >= session->getSessionExpiry())
 		{

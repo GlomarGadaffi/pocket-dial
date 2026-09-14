@@ -455,6 +455,41 @@ bool SipMessage::offersSupportedAudio(bool allowWideband) const
 	return !r.hasMLine || r.hasAudio;
 }
 
+int SipMessage::getTelephoneEventPayloadType() const
+{
+	// Deliberately a separate scan rather than another field on AudioPolicyResult:
+	// that struct is built on the hot relay path for every INVITE, while this is
+	// needed only when the server is ANSWERING with its own SDP (440/555/888 and
+	// the voicemail/IVR roadmap). Keeping it out keeps the common path unchanged.
+	//
+	// Flat and bounded, matching applyAudioPolicy()'s discipline -- see the
+	// CWE-674 note in SipSdpMessage.hpp for why attribute handling in this
+	// codebase must never recurse or dispatch on attacker-chosen structure.
+	int found = -1;
+	size_t pos = 0;
+	while (pos < _body.size())
+	{
+		const std::string_view line = nextSdpLine(_body, pos);
+		if (line.rfind("a=rtpmap:", 0) != 0) continue;
+
+		std::string_view rest = line.substr(9);
+		const int pt = parseIntPrefix(rest);
+		if (pt < 0 || pt > 127) continue;
+
+		const size_t sp = rest.find(' ');
+		if (sp == std::string_view::npos) continue;
+
+		std::string_view name = rest.substr(sp + 1);
+		const size_t slash = name.find('/');
+		if (slash != std::string_view::npos) name = name.substr(0, slash);
+
+		// Case-insensitive: the encoding name is not case sensitive per RFC 4566
+		// §6, and phones do ship "TELEPHONE-EVENT".
+		if (iequalLower(name, "telephone-event")) found = pt;   // last one wins
+	}
+	return found;
+}
+
 bool SipMessage::filterAudioCodecs(bool allowWideband)
 {
 	const AudioPolicyResult r = applyAudioPolicy(_body, allowWideband);

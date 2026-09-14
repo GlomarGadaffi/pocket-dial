@@ -61,6 +61,7 @@
 #include "AdminAuth.hpp"
 #include "DeviceConfig.hpp"
 #include "LogQueue.hpp"
+#include "TimeSync.hpp"
 
 // ── Tag for ESP_LOG ────────────────────────────────────────────────────────
 static const char* TAG = "SipServerETH";
@@ -183,6 +184,13 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Gateway: %s", buf);
         esp_ip4addr_ntoa(&event->ip_info.netmask, buf, sizeof(buf));
         ESP_LOGI(TAG, "Netmask: %s", buf);
+
+        // Start the wall clock now that there is a route. Non-blocking and
+        // idempotent, so a DHCP renew or a cable bounce re-entering this handler
+        // costs nothing. Deliberately NOT awaited: the SIP registrar must come up
+        // whether or not a time server is reachable, and every consumer already
+        // has to handle timesync::isSynced() == false.
+        timesync::start();
 
         xEventGroupSetBits(s_eth_event_group, ETH_GOT_IP_BIT);
     }

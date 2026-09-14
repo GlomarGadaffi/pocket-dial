@@ -31,8 +31,9 @@ public:
 
 	// Advance the state machine for any tracked transaction matching this
 	// response's Via branch + CSeq method. A 1xx moves Calling → Proceeding
-	// (stops retransmitting); a 2xx → Accepted, 3xx-6xx → Completed (both arm
-	// the RFC 6026 Timer L absorb window). Returns true if a slot matched.
+	// (stops retransmitting); a 2xx → Accepted (Timer M), 3xx-6xx → Completed
+	// (Timer D) — both absorb retransmissions for 32 s over UDP, which is why one
+	// deadline field serves both. Returns true if a slot matched.
 	bool matchAndAdvance(const std::shared_ptr<SipMessage>& msg);
 
 	// Retransmit timed-out INVITE forks and free completed/absorbed slots.
@@ -61,7 +62,15 @@ private:
 
 		std::chrono::steady_clock::time_point nextRetransmit{};     // next Timer A fire
 		std::chrono::steady_clock::time_point transactionTimeout{}; // Timer B (32 s)
-		std::chrono::steady_clock::time_point absorbDeadline{};     // Timer L (RFC 6026, 2xx)
+		// Absorb window for a response that has ended the transaction. On 2xx this
+		// is Timer M — the CLIENT-side Accepted-state timer, RFC 6026 §8.4 (the
+		// replacement text for RFC 3261 §17.1.1.2), 64*T1. It is NOT Timer L:
+		// RFC 6026 §8.5 (replacing RFC 3261 §17.2.1) gives Timer L to the SERVER
+		// transaction, and there is no server transaction layer here — whoever
+		// adds one gets Timer L then, as a separate field. On 3xx-6xx this same
+		// field holds RFC 3261 §17.1.1.2 Timer D instead; both are 32 s over UDP,
+		// so they share the field and the constant (TransactionLayer.cpp:103).
+		std::chrono::steady_clock::time_point absorbDeadline{};
 
 		uint32_t retransmitCount   = 0;
 		uint32_t currentIntervalMs = 500; // Timer A: starts at T1, doubles each retransmit

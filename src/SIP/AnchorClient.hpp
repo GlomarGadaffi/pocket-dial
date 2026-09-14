@@ -89,6 +89,26 @@ public:
 	// can refresh it while idle so the first call after a quiet period doesn't pay a cold
 	// handshake. 0 = disabled. Default no-op.
 	virtual void setRewarmIntervalSec(uint32_t sec) { (void)sec; }
+
+	// How many calls THIS implementation can anchor at once.
+	//
+	// POCKETDIAL_MAX_ANCHOR_CALLS sizes the engine's per-call arrays (bridges, RTP
+	// port pairs, WS workers) — it is a ceiling on the machinery. It is NOT a
+	// statement that whatever provider is plugged in can actually drive that many,
+	// and the two are genuinely different limits:
+	//
+	//   * A real provider's makeCall() must hand back a DISTINCT participant id per
+	//     call, because the engine keys its rx-audio fan-out on that id. One that
+	//     returns a constant cannot be used concurrently at all: two calls would
+	//     collide on the id and the fan-out would feed whichever bridge it found
+	//     first, silently starving the other call's audio. That is not a crash, it
+	//     is one-way audio nobody can explain.
+	//   * So the safe default here is 1 — a new implementation is single-call until
+	//     it proves otherwise, rather than inheriting a ceiling it cannot honour.
+	//
+	// The engine takes min(this, POCKETDIAL_MAX_ANCHOR_CALLS) when deciding whether
+	// to accept another anchored call.
+	virtual unsigned maxConcurrentCalls() const { return 1; }
 };
 
 #endif // ANCHOR_CLIENT_HPP

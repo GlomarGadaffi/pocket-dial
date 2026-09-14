@@ -124,8 +124,22 @@ public:
 	void setParkUac(bool v) { _parkUac = v; }
 
 	// ── RFC 4028 session timers ────────────────────────────────────────
+	// _sessionExpiresSeconds != 0 means "an expiry reaper is armed for this
+	// dialog" — RequestsHandler::sweepSessionTimers() keys off exactly that.
+	// It is NOT the same as "the endpoints negotiated a session timer":
+	// RequestsHandler::armSessionTimer() deliberately declines to arm when the
+	// 2xx names no refresher, because nothing would then be obliged to feed it.
 	uint32_t getSessionExpiresSeconds() const { return _sessionExpiresSeconds; }
+	// Whether THIS PBX is the RFC 4028 refresher. On the ordinary call path it
+	// never is — the PBX relays the caller's INVITE rather than originating one,
+	// so the "uac"/"uas" of §7.4 are the two phones and neither is us. See
+	// RequestsHandler::armSessionTimer()'s derivation. Kept as state because a
+	// future server-as-UAC leg (anchor/park) could legitimately set it.
 	bool isRefresher() const { return _isRefresher; }
+	// Half the negotiated interval, per RFC 4028 §10's refresh-at-half rule.
+	// DORMANT: nothing consumes this, because no code path generates a
+	// refreshing re-INVITE or UPDATE. Anything that starts reading it must ship
+	// the sender alongside, or it recreates #198 from the other direction.
 	std::chrono::steady_clock::time_point getNextRefresh() const { return _nextRefresh; }
 	std::chrono::steady_clock::time_point getSessionExpiry() const { return _sessionExpiry; }
 	void armSessionTimer(uint32_t secs, bool weAreRefresher,

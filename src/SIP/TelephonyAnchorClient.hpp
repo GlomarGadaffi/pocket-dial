@@ -42,6 +42,24 @@ public:
 	void tick() override;   // non-blocking; runs the _outboundActive reconcile watchdog (ESP only)
 	void setRewarmIntervalSec(uint32_t sec) override;  // #107: idle TLS re-warm cadence (s); 0 = off
 
+	// A real provider: makeCall()/resolveOutboundLeg() hand back a DISTINCT
+	// participant id per call (TelephonyAnchorClient.cpp:418, "#100: let the engine
+	// bind this call's session now"), which is what the engine's rx-audio fan-out
+	// keys on — so unlike the loopback mock this can genuinely be driven
+	// concurrently, and the binding limit is the engine's array size rather than
+	// anything in here.
+	//
+	// The practical ceiling is NOT sockets or RAM (both were lifted: PSRAM task
+	// stacks, a 48-entry LWIP pool). It is that the ESP32-S3 has no ECC
+	// acceleration, so every TLS handshake is roughly a second of CPU and a cold
+	// start opens two per call (the GET and POST audio streams). Past about four
+	// simultaneous handshakes both cores saturate, the idle tasks starve and the
+	// task watchdog trips, while the extra calls finish handshaking too late to
+	// bridge anything. drawbridge validated 4 on this same silicon as the point
+	// where calls still bridge with no playout glitches and the next one is cleanly
+	// refused with 503 rather than attempted and dropped.
+	unsigned maxConcurrentCalls() const override { return POCKETDIAL_MAX_ANCHOR_CALLS; }
+
 	// Counts of POST media-stream opens by handshake type (set in startMediaStreams from the
 	// open's wall time — a full S3 ECDHE is always >~400ms, a resumed session well under).
 	void getTlsHandshakeStats(uint32_t& fullOut, uint32_t& resumedOut) const override

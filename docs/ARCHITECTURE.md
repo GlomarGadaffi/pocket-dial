@@ -6,11 +6,11 @@ This document provides a highly technical, deep architectural analysis of the **
 
 ## 1. System Topology & Component Overview
 
-**pocket-dial** is an ultra-low-latency, dual-core SIP registrar and proxy server designed to run on resource-constrained ESP32 and ESP32-S3 microcontrollers. It supports multiple networking interfaces (Wi-Fi SoftAP/Station and SPI/RMII wired Ethernet) and drives smart displays (e.g., JC3248W535) using the LVGL graphics library.
+**pocket-dial** is an ultra-low-latency, dual-core SIP registrar and back-to-back call broker designed to run on resource-constrained ESP32 and ESP32-S3 microcontrollers. It supports multiple networking interfaces (Wi-Fi SoftAP/Station and SPI/RMII wired Ethernet) and drives smart displays (e.g., JC3248W535) using the LVGL graphics library.
 
 The firmware architecture is divided into three core logical layers:
 1. **Network Hardware & Driver Layer**: Controls physical media (Wi-Fi radio, W5500 SPI Ethernet MAC/PHY, LAN8720 RMII PHY) and registers low-level event handlers.
-2. **Signaling & State Engine Layer (`RequestsHandler`)**: A lightweight RFC 3261-compliant SIP registrar and session controller managing client registration leases, active SIP sessions, and intercom broadcasting/paging features.
+2. **Signaling & State Engine Layer (`RequestsHandler`)**: A lightweight SIP registrar and session controller managing client registration leases, active SIP sessions, and intercom broadcasting/paging features. It implements a deliberately partial subset of RFC 3261; §1.2 states exactly which transactions exist and which do not.
 3. **User Interface & Query Layer**: Consists of a custom select-based, thread-dispatching `HttpServer` serving a retro CGA CRT web dashboard, an mDNS service responder, and a high-frequency LVGL-based GUI display task.
 
 ```mermaid
@@ -41,6 +41,51 @@ graph TD
     E -->|Write-Buffer| P[Local Outbox Vector]
     P -->|Send Outside Lock| N
 ```
+
+### 1.1 Protocol Role: Back-to-Back Call Broker, Not a Proxy
+
+> [!IMPORTANT]
+> **`RequestsHandler` is not an RFC 3261 §16 proxy, and the distinction decides
+> where the audio goes.** A proxy forwards a request onward along a route set; this
+> engine terminates each call leg and originates the next one itself.
+
+The clearest evidence is in what the outbound path never writes:
+
+- **No `Record-Route`, ever.** The header does not occur anywhere in `src/`. The box stays reachable for in-dialog traffic by rewriting `Contact` to point at itself on each leg (`CallForker::buildInviteFork`, `CallForker.cpp:28`) — a user agent's mechanism, not a proxy's route set.
+- **No `Via` stacking.** Requests the PBX *originates* carry exactly one `Via`, its own, bearing its own branch (`buildInboundInviteFork`, `buildInboundCancelTo`, `ackInboundFinal`; `BlfSubscriptions.cpp:126`; `ParkOrbit.cpp:155`; `RegisterBeeper.cpp:75`). The ordinary extension-to-extension INVITE (`CallForker::buildInviteFork`, `CallForker.cpp:22-50`) is not rewritten in that respect at all: it is a verbatim copy of the caller's message with only the Request-URI, `To` and `Contact` replaced, so it reaches the callee carrying the caller's own `Via` with none of ours pushed on top. Responses are generated as a UAS — the request's `Via` echoed back with `received=` / `rport` filled in per §18.2.1 (`sipwire::viaWithReceived`) — and are never forwarded upstream by popping a `Via` off a stack.
+- **`Max-Forwards` is write-only.** It appears solely as the literal `Max-Forwards: 70` on outbound requests, and is never read, tested or decremented on any inbound path. The §16.6 loop protection a proxy owes the network is therefore absent by construction.
+- **`Route` is neither honoured nor stripped.** `SipMessage` has no concept of the header, so a `Route` a phone puts on a request simply rides along inside the relayed copy.
+
+What the engine *is* instead is a forked UAC coupled to a UAS — what `docs/FEATURE_ROADMAP.md:57` calls a **back-to-back call broker**. Two distinct leg shapes share that label, and the difference surfaces in every header a debugger looks at:
+
+- **Legs the PBX originates** — the inbound-trunk fork, park ring-back, register beep, BLF `NOTIFY` — are a fresh UAC: its own `Via` and branch, its own `From`-tag, and a `CSeq` space restarting at 1, while reusing the caller's `Call-ID` (`buildInboundInviteFork`).
+- **Ordinary extension-to-extension legs** are the wholesale copy described above, so `From` (tag included), `CSeq` and `Via` all reach the callee exactly as the caller wrote them. Keeping the caller's `Via` is what lets the return path work without a second rewrite: the callee's `180`/`200` already bears the `Via` the caller expects, so the relay hands it straight back with only `To` and the codec list touched (`onOk` → `endHandle`, which merely enqueues to the destination).
+
+Either way the caller's `Call-ID` spans both legs. That is deliberate rather than sloppy: it is the `_sessions` key, which is how a mid-dialog request arriving from *either* leg resolves to the one session via `getSession(data->getCallID())`.
+
+Unlike a textbook B2BUA, it does not insert itself into the media path. SDP is relayed with only unsupported codecs filtered out, so an ordinary extension-to-extension call streams RTP directly phone-to-phone and the board never handles a media packet. The exceptions — `440`, `888`, `555` and outside lines — are tabulated under "Audio: what touches the board, and what doesn't" in the README.
+
+### 1.2 Transaction-Layer Scope
+
+`TransactionLayer` is scoped by its own header comment to the "RFC 3261 §17 INVITE **client** transaction" (`TransactionLayer.hpp:14`). That scope is enforced rather than aspirational: `classify()` returns `None` for every response and for every non-INVITE request (`TransactionLayer.cpp:10-12`), so nothing else can ever claim a slot.
+
+Implemented today:
+
+| Mechanism | Where |
+| :--- | :--- |
+| §17.1.1 INVITE client transaction — Timer A retransmit from `T1` = 500 ms, doubling per attempt; Timer B at 32 s | `TransactionLayer.hpp:14-18`, `sweep()` |
+| RFC 6026 Timer L absorb window once a final response arrives | `TransactionLayer.hpp:35`, `:64` |
+| §17.1.1.3 ACK for a non-2xx final to a PBX-originated INVITE | `ackInboundFinal`, `RegisterBeeper::handleInviteFailure` |
+| §18.2.1 `received=` and RFC 3581 `rport` on every response | `sipwire::viaWithReceived` |
+| §12.2 To-tag detection routing a re-INVITE onto the hold/resume path | `RequestsHandler::onInvite` |
+| §11.2 capability discovery on `OPTIONS` (`Allow` / `Supported` / `Accept` / `Allow-Events`) | `addCapabilityHeaders`, called from `onOptions` only |
+
+Not implemented, and worth knowing before debugging a retransmission:
+
+- **There is no server transaction.** No §13.3.1.4 retransmission of a 2xx until the ACK arrives, and no Timers G/H/I. A retransmitted INVITE for a session already `Invited` / `Connected` / `Held` is silently dropped rather than answered from a stored response (`onInvite`, citing §17.2.3). With no non-INVITE server transaction there is likewise no §17.2.2 Timer J absorb window.
+- **There is no non-INVITE client transaction** (§17.1.2), hence no Timers E/F. Every non-INVITE request the PBX sends — `BYE`, `CANCEL`, `NOTIFY` and the rest — is written to the outbox exactly once.
+
+The consequence is bounded and worth stating plainly: for those messages, retransmission recovery is the peer's job or nobody's, so a single dropped UDP datagram carrying a PBX-originated `BYE` will not be retried by this engine. INVITE — the one transaction a call depends on to come up at all — is covered.
 
 ---
 

@@ -109,6 +109,11 @@ private:
 	// Takes the request so the rendered page can carry this session's CSRF token.
 	void sendHtml(int sock, const HttpRequest& req);
 	void sendApiStatus(int sock);
+	// Issue #184: GET /metrics — Prometheus text-exposition format over the same
+	// thread-safe getters /api/status already reads. Intentionally ungated (the
+	// full reasoning, including why a gated scrape endpoint would be a dead one,
+	// is at sendApiMetrics's definition in the .cpp).
+	void sendApiMetrics(int sock);
 	// SoftAP security (docs/THREAT_MODEL.md §6 / FEATURE_ROADMAP P0): report and
 	// toggle WPA2 on the standalone AP, and show/rotate its passphrase. Turning
 	// it on is a breaking change for already-associated phones, so it is an

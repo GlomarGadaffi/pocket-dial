@@ -200,9 +200,11 @@ void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
 			// freeing immediately is what let a raced 200 OK go unACKed/unBYEd,
 			// with sweep() then CANCELling an INVITE that already had a final
 			// response five seconds later. The dialog's own 487 (if the CANCEL
-			// really did land in time) is routed to onReqTerminated, not here — it
-			// has no Session to key off, so we just fall through to the same
-			// bounded fallback below rather than acting on it there too.
+			// really did land in time) is routed to onReqTerminated, not here —
+			// and that handler now offers it to handleInviteFailure() before
+			// anything else, so the 487 is ACKed (RFC 3261 §17.1.1.3) and this
+			// slot released the moment it lands. The bounded fallback below is
+			// what covers a 487 that never arrives at all.
 			auto cancel = buildCancel(i);
 			if (cancel)
 			{
@@ -244,6 +246,13 @@ void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
 		}
 		releaseDialog(bd);   // AwaitingByeOk / AwaitingCancelDone fallback: free the slot
 	}
+}
+
+bool RegisterBeeper::ownsCallID(std::string_view callID)
+{
+	// Recognition without consumption — see the header for why a provisional
+	// response must not take the handleInviteFailure() path.
+	return findByCallID(callID) != nullptr;
 }
 
 bool RegisterBeeper::handleInviteFailure(const std::shared_ptr<SipMessage>& data)

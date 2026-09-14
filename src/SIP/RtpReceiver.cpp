@@ -147,6 +147,48 @@ bool RtpReceiver::parseRtp(const uint8_t* data, size_t len, RtpPacket& out)
 	return true;
 }
 
+bool RtpReceiver::parseTelephoneEvent(const uint8_t* payload, size_t len, DtmfEvent& out)
+{
+	// RFC 4733 §2.3. Exactly four bytes; anything shorter is malformed and anything
+	// longer is a multi-event payload whose first event is still at offset 0, so a
+	// >= test is correct rather than ==.
+	if (payload == nullptr || len < 4) return false;
+
+	out.event    = payload[0];
+	out.end      = (payload[1] & 0x80) != 0;
+	out.volume   = static_cast<uint8_t>(payload[1] & 0x3F);   // bit 6 is reserved
+	out.duration = static_cast<uint16_t>((static_cast<uint16_t>(payload[2]) << 8)
+	                                     | static_cast<uint16_t>(payload[3]));
+	return true;
+}
+
+char RtpReceiver::dtmfEventToChar(uint8_t event)
+{
+	// RFC 4733 §3.2 table 7. Only the 16 DTMF symbols map to a key; event 16 is
+	// hook flash and 17+ are the tone events (dial tone, busy, ringback...), none
+	// of which are digits a feature-code parser should ever see.
+	if (event <= 9)  return static_cast<char>('0' + event);
+	if (event == 10) return '*';
+	if (event == 11) return '#';
+	if (event >= 12 && event <= 15) return static_cast<char>('A' + (event - 12));
+	return '\0';
+}
+
+bool RtpReceiver::setDtmfPayloadType(uint8_t pt, DtmfSink sink)
+{
+	// Refuse to shadow audio. PT 0 is PCMU and is matched first in the receive
+	// loop anyway, so accepting it here would silently do nothing — better to say
+	// no than to leave a caller believing DTMF is armed.
+	if (pt == PAYLOAD_TYPE_PCMU) return false;
+
+	{
+		std::lock_guard<std::mutex> lk(_slotMutex);
+		_dtmfSink = std::move(sink);
+	}
+	_dtmfPt.store(pt, std::memory_order_release);
+	return true;
+}
+
 RtpReceiver::RtpReceiver()
 {
 	_localPort.store(SERVER_RTP_RX_PORT, std::memory_order_release);
@@ -172,6 +214,15 @@ RtpReceiver::~RtpReceiver()
 void RtpReceiver::clearSlotLocked()
 {
 	_sink = nullptr;
+	_dtmfSink = nullptr;
+	_dtmfPt.store(kDtmfPayloadTypeUnset, std::memory_order_release);
+	// Reset the dedupe memory with the slot. RFC 4733 keys a press on its RTP
+	// timestamp, and timestamps are per-stream: a fresh call starts its own clock
+	// at a random offset, so a stale value here could coincide with the new call's
+	// first press and swallow it. Cheap insurance against a once-in-2^32 bug that
+	// would be unreproducible in the field.
+	_lastDtmfTs   = 0;
+	_haveLastDtmf = false;
 	_active.store(false, std::memory_order_release);
 }
 
@@ -358,8 +409,52 @@ void RtpReceiver::runLoop()
 		}
 		if (pkt.payloadType != RtpReceiver::PAYLOAD_TYPE_PCMU)
 		{
-			// Wrong codec (e.g. DTMF telephone-event PT 101, comfort noise, etc.).
-			// Drop gracefully — the consumers only handle µ-law for now.
+			// Not audio. It may still be an RFC 4733 named event on the dynamic PT
+			// the peer advertised at call setup — that is the ONLY way DTMF reaches
+			// the board on a server-terminated leg, since an ordinary call's RTP is
+			// peer-to-peer and never passes through here at all.
+			const uint8_t dtmfPt = _dtmfPt.load(std::memory_order_acquire);
+			if (dtmfPt != RtpReceiver::kDtmfPayloadTypeUnset && pkt.payloadType == dtmfPt)
+			{
+				RtpReceiver::DtmfEvent ev;
+				if (parseTelephoneEvent(pkt.payload, pkt.payloadLen, ev))
+				{
+					const char digit = dtmfEventToChar(ev.event);
+					// Dedupe on the event's RTP timestamp: every packet of one key
+					// press carries the timestamp of the press's START, so a change
+					// means a NEW press. Reporting on the first packet SEEN (rather
+					// than specifically the first sent, or waiting for E=1) keeps
+					// this loss-tolerant — any packet of the burst will do — and
+					// still fires exactly once per press.
+					const bool isNewPress = !_haveLastDtmf || pkt.timestamp != _lastDtmfTs;
+					if (digit != '\0' && isNewPress)
+					{
+						_lastDtmfTs   = pkt.timestamp;
+						_haveLastDtmf = true;
+
+						DtmfSink dtmfSink;
+						{
+							std::lock_guard<std::mutex> lk(_slotMutex);
+							dtmfSink = _dtmfSink;
+						}
+						if (dtmfSink)
+						{
+							// duration is in 8 kHz units -> ms.
+							dtmfSink(digit, static_cast<uint16_t>(ev.duration / 8));
+						}
+					}
+					else if (digit == '\0')
+					{
+						// Hook flash (16) or a tone event (17+): valid RFC 4733, not
+						// a keypad symbol. Swallow it rather than passing junk up.
+						ESP_LOGD("RtpReceiver", "non-digit telephone-event %u ignored",
+							static_cast<unsigned>(ev.event));
+					}
+				}
+				continue;
+			}
+			// Anything else (comfort noise, a codec we do not speak) is dropped
+			// gracefully — the audio consumers only handle µ-law.
 			continue;
 		}
 		if (pkt.payload == nullptr || pkt.payloadLen == 0)
