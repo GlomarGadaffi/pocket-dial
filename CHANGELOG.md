@@ -111,6 +111,11 @@ wrong mental model:
   answered `404` without leaving the box. `POCKETDIAL_MAX_ANCHOR_CALLS` is 1, so one
   outside call at a time. There is no E.164 normalization anywhere: what the rule
   produces is exactly what the provider is asked to dial.
+  *(Superseded later in this same unreleased window: the macro was raised to **4**
+  once `TelephonyAnchorClient` landed and the single-call path was proven on the
+  bench. The effective limit is `min(provider, 4)`, and the default
+  `LoopbackAnchorClient` still declares 1 — so a stock board is unchanged, but a
+  board on a real trunk now carries four. See `PoolConfig.hpp:221`.)*
 
 Three teardown bugs surfaced with it, all fixed here: `onCancel()`, `onBye()` and
 `onAck()` recognized an anchor call by the literal string `"555"` parsed off the wire,

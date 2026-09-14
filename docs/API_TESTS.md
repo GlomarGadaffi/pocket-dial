@@ -268,8 +268,8 @@ Fetches a read-only snapshot of the registrar, call sessions, and system metrics
     "sessions": [ { "caller": "101", "callee": "102", "state": "Connected", "duration": "02:15" } ],
     "dnd":      [ "103" ],
     "forwards": [ { "extension": "101", "always": "", "busy": "102", "noanswer": "" } ],
-    "groups":   [ { "extension": "600", "mode": "ring", "members": "101,102" } ],
-    "dialplan": [ { "pattern": "9X.", "action": "trunk", "target": "", "stripDigits": 1 } ],
+    "groups":   [ { "extension": "600", "mode": "ringall", "members": "101,102" } ],
+    "dialplan": [ { "pattern": "9XXXXXXXXXX", "action": "trunk", "target": "", "stripDigits": 1 } ],
     "parkedCalls": [ { "orbit": "701", "parkedExt": "102", "parker": "101", "secondsParked": 12 } ]
   }
   ```
@@ -415,13 +415,16 @@ Switching to `secure` while **no** extension is yet `secured` is refused with `4
 Resend with `confirm=LOCKOUT` to override — the same shape as `/api/factory-reset`'s
 `confirm=ERASE`. Responds with the same body as the `GET`.
 
-> [!CAUTION]
-> **Restoring `mode=open` is the only reliable way back, so do it in the same run.**
-> `POST /api/factory-reset` will *not* undo it: `DeviceConfig::clearAll()` erases `reg_mode`
-> from the `storage` namespace (`DeviceConfig.cpp:628`) while the registrar reads and writes
-> it in `pbxcfg` (`src/SIP/Registrar.cpp:35-40`, `src/SIP/PbxPersist.hpp:16`). A hardware
-> test that leaves a board in `secure` and expects a factory reset to clean up will strand
-> the board. Source-verified 2026-09-13; not yet exercised on hardware.
+> [!NOTE]
+> **Corrected — a factory reset *does* clear `reg_mode` now.** Earlier revisions of this
+> box warned that `POST /api/factory-reset` would not undo `mode=secure`, because
+> `DeviceConfig::clearAll()` erased `reg_mode` from the `storage` namespace while the
+> registrar keeps it in `pbxcfg`. **That was a real bug and it was fixed in issue #188**:
+> `clearAll()` now calls `eraseRegistrarMode()` (`DeviceConfig.cpp:698`), which opens
+> `pbxcfg`, and the comment at `:693-697` records exactly this. [API.md](API.md)'s
+> factory-reset section already stated it correctly. Restoring `mode=open` in the same run
+> is still good hygiene, but a reset is no longer a way to strand the board. Still not
+> exercised on hardware.
 
 ### 3.14 POST `/api/registrar/device`
 Secures or forgets one adopted device. Cookie **and** `X-CSRF`.
@@ -466,7 +469,9 @@ Cases worth pinning:
 > every outside number is answered `404` without leaving the box. Outbound goes over the
 > AnchorClient (HTTP/OAuth2 + call-control WebSocket + chunked-HTTPS PCM16), **not** a SIP
 > trunk: nothing in the tree ever sends a `REGISTER`, so the device never registers to an
-> ITSP. `POCKETDIAL_MAX_ANCHOR_CALLS` is `1` — one concurrent outside call. No E.164
+> ITSP. `POCKETDIAL_MAX_ANCHOR_CALLS` is `4`; the effective limit is `min(provider, 4)` and
+> the default loopback provider declares 1, so a stock board allows one concurrent outside
+> call and a real trunk four. No E.164
 > normalization exists anywhere.
 
 ### 3.16 GET `/config/<mac>.cfg`
@@ -486,9 +491,12 @@ session cookie, and the MAC is the credential.
 ## 🧾 4. Security Response Headers (assert on every response)
 
 `HttpServer::sendResponseWithHeader` emits these centrally (`HttpServer.cpp:796-802`), so a
-single missing header is a global regression and is cheap to assert once per suite. The one
-response that does not go through it is the captive-portal `302` from `sendRedirect()`,
-which writes a bare redirect to the socket — do not assert the headers on that path:
+single missing header is a global regression and is cheap to assert once per suite.
+**Correction: there is no exempt path.** Earlier revisions said the captive-portal `302`
+from `sendRedirect()` hand-rolled a bare redirect and told you not to assert headers on it.
+`sendRedirect()` now routes through `sendResponseWithHeader` (`HttpServer.cpp:3122`) — the
+hand-rolled version was the bug, and its own comment records the fix. **Assert the headers
+on the `302` too**; it is a regression if they are missing:
 
 | Header | Value |
 |---|---|
@@ -573,9 +581,18 @@ login preamble — including setup completion — to have run first.
 * **TC-ED-07 (Registrar unknown device) (A):** POST `/api/registrar/device` with
   `action=secure&target=ffffffffffff` → `404`.
 * **TC-ED-08 (Dial-plan empty trunk target) (A):** POST `/api/dialplan` with
-  `pattern=9X.&action=trunk&target=&stripDigits=1` → `200` (a legal "strip 1, prepend
+  `pattern=9XXXXXXXXXX&action=trunk&target=&stripDigits=1` → `200` (a legal "strip 1, prepend
   nothing" rule). The same with `action=group&target=` → `400`. Then POST
-  `pattern=9X.` alone (no `action`, no `target`) → the rule is **deleted**.
+  `pattern=9XXXXXXXXXX` alone (no `action`, no `target`) → the rule is **deleted**.
+
+> [!NOTE]
+> **Corrected:** earlier revisions of these examples used the pattern `9X.` and the ring-group
+> mode `"ring"`. Neither is legal. `pbx::isDialTokenSafe` (`src/SIP/DialPlan.hpp:176-186`)
+> admits only alphanumerics, `#` and `*` — a `.` is rejected with
+> `400 "pattern may contain only letters, digits, '#' and '*'"` — and the only accepted
+> group modes are `ringall` and `hunt` (`HttpServer.cpp:1550-1556`). A test written from the
+> old examples fails against correct firmware. Use `X` per digit, or a trailing `*` for
+> "rest of the string".
 * **TC-ED-09 (Reserved dial-plan patterns) (A):** `pattern=777` → `400 {"error":"cannot use
   a reserved extension as a dial-plan pattern"}`. Same for `999`, `440`, `555`.
 * **TC-ED-10 (Provisioning config 404s in open mode):** GET `/config/805ec079c37f.cfg` on a
@@ -615,10 +632,13 @@ login preamble — including setup completion — to have run first.
 * **TC-SEC-09 (Headers present):** Assert the five headers of §4 on at least one `GET`,
   one `POST` success, and one error response, and assert `Strict-Transport-Security` is
   **absent**.
-* **TC-SEC-10 (Session slide):** GET `/api/admin/status` while logged in returns
-  `sessionRemainingSec` near 1800 and, unlike `validateSession()`, does **not** itself slide
-  the expiry further — polling it to display a countdown must not keep resetting the
-  countdown.
+* **TC-SEC-10 (Session slide):** ~~GET `/api/admin/status` does **not** itself slide the
+  expiry.~~ **This expectation is wrong and must not be asserted.** `sendApiAdminStatus`
+  calls `isAuthed()` (`HttpServer.cpp:2639`) → `AdminAuth::validateSession()`, which pushes
+  `expiresAtMs` forward (`AdminAuth.cpp:909`). So polling `/api/admin/status` **does** keep
+  the session alive, and a dashboard that polls it for a countdown will never see the
+  session expire. [API.md](API.md) already carries this correction; this line did not.
+  Assert the opposite: two reads 2 s apart both return `sessionRemainingSec` near 1800.
 
 ### Login Rate-Limiting Tests
 * **TC-RL-01 (Per-client lockout):** From one client, POST `/api/admin/login` with a wrong
@@ -644,7 +664,8 @@ login preamble — including setup completion — to have run first.
   surfaces must expect them to lock each other out.
 
 > [!CAUTION]
-> **Do not hammer `/api/admin/login` in a load test.** The lockout is per-client with
+> **Do not hammer `/api/admin/login` in a load test.** The lockout is **global** (the
+> per-client key is never supplied — [THREAT_MODEL.md](THREAT_MODEL.md) D-3) with
 > exponential backoff *and* an aggregate backstop across all clients, so a brute-force
 > loop locks the whole bench out — including you, at the correct password — for up to 16
 > minutes, and each further round doubles it. Budget wall-clock time for TC-RL-02/03, or
@@ -671,9 +692,9 @@ login preamble — including setup completion — to have run first.
 
 ## 🖥️ 6. Host Test Suite
 
-The gtest suite that backs all of the above is **416 test cases** (static count of
-`TEST`/`TEST_F` in `tests/*.cpp` as of 2026-09-13). The same three commands CI runs, from a
-WSL shell:
+The gtest suite that backs all of the above is **506 test cases** (static count of
+`TEST`/`TEST_F`/`TEST_P` in `tests/*.cpp`; the 416 previously quoted here was stale by 90).
+The same three commands CI runs, from a WSL shell:
 
 ```bash
 unset IDF_PATH                                        # see below

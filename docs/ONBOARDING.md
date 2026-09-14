@@ -14,9 +14,14 @@ Ensure you have installed the correct USB-to-UART bridge drivers for your target
 * **Silicon Labs CP210x:** [Download CP210x VCP Drivers](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers) (Common on standard ESP32 DevKits)
 * **WCH CH340 / CH341:** [Download CH340 Drivers](http://www.wch-ic.com/downloads/CH341SER_EXE.html) (Common on low-cost S3 boards, displays, and clone devkits)
 
-### 2. ESP-IDF Toolchain (v5.1.2 or v5.2.1)
-The firmware is fully certified and compiled against **ESP-IDF v5.1.2** and **v5.2.1**.
-* **Windows installation:** Download and run the [ESP-IDF Offline Installer](https://dl.espressif.com/dl/esp-idf/) (Select version `5.1.2` or `5.2.1`).
+### 2. ESP-IDF Toolchain (**v6.0 or later** — v5.x will not configure)
+The firmware requires **ESP-IDF v6.0+**. This is a hard floor, not a recommendation:
+`main/CMakeLists.txt:19-24` raises a CMake `FATAL_ERROR` on anything below v6.0, so a v5.x
+toolchain fails at configure time before a single file is compiled. Both
+`.github/workflows/ci.yml` and `release.yml` build on **v6.0.1**.
+*(Earlier revisions of this page said v5.1.2 / v5.2.1 were "fully certified". They are not
+usable at all — a v5.2.1 pin is what silently broke the v1.3.0-pre-alpha release run.)*
+* **Windows installation:** Download and run the [ESP-IDF Offline Installer](https://dl.espressif.com/dl/esp-idf/) (select version `6.0.1`).
 * **Linux/macOS installation:** Follow the [Espressif Standard Shell Setup Guide](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/linux-macos-setup.html).
 
 ---
@@ -38,7 +43,8 @@ To load the correct compilers (`xtensa-esp32-elf-gcc`, `xtensa-esp32s3-elf-g++`)
 ```
 
 > [!TIP]
-> If activation is successful, running `idf.py --version` should output `ESP-IDF v5.1.x` or `ESP-IDF v5.2.x`.
+> If activation is successful, running `idf.py --version` should output `ESP-IDF v6.0.x`.
+> Anything below v6.0 will stop with the `FATAL_ERROR` from `main/CMakeLists.txt`.
 
 ---
 
@@ -53,7 +59,8 @@ To load the correct compilers (`xtensa-esp32-elf-gcc`, `xtensa-esp32s3-elf-g++`)
 2. **Select your target chip architecture:**
    The firmware supports multiple physical boards. Tell the build system which chip you are compiling for:
    ```bash
-   # For Standard ESP32 devboards (e.g. NodeMCU, Waveshare PoE)
+   # For classic ESP32 devboards (e.g. NodeMCU, LilyGO T-Internet-COM)
+   # NOTE: the Waveshare ESP32-S3-ETH is an S3 board — use esp32s3 for it.
    idf.py set-target esp32
 
    # For ESP32-S3 boards (e.g. Guition AXS15231B Display, LilyGO T-ETH-Lite)
@@ -85,8 +92,9 @@ The firmware is designed with a highly modular physical layer. Define your trans
 | Transport Parameter | Target Board Description | Primary Entrypoint File |
 | :--- | :--- | :--- |
 | `wifi` | Broad support. Starts a Standalone Access Point named `esp32-sipserver` | `main/esp_main.cpp` |
-| `eth` *(Default)* | W5500 / LAN8720 Ethernet chips (e.g. Waveshare PoE, T-POE-Pro) | `main/esp_main_eth.cpp` |
-| `display` | Guition AXS15231B 2.4" LCD, pins graphics to Core 1 and SIP on Core 0 | `main/esp_main_display.cpp` |
+| `eth` *(Default)* | **W5500 only** — LilyGO T-ETH-Elite S3 (default) or Waveshare ESP32-S3-ETH (needs `-D PD_ETH_BOARD=waveshare`; the two pin maps are entirely different and the wrong one reset-loops the board) | `main/esp_main_eth.cpp` |
+| `lan8720` | **A separate transport, not part of `eth`.** Classic ESP32 + LAN8720 RMII PHY; hard-errors unless `IDF_TARGET == esp32` | `main/esp_main_eth_lan8720.cpp` |
+| `display` | Guition AXS15231B **3.5" 320x480** LCD, pins graphics to Core 1 and SIP on Core 0 | `main/esp_main_display.cpp` |
 
 Choose **ONE** of the following compilation commands matching your physical hardware setup:
 
@@ -109,16 +117,31 @@ Before compiling, configure security settings according to your environment's po
 
 ### 1. Closed Mode vs. Open Mode Authentication (Issue #56)
 By default, the SIP engine starts in **Open Mode** to facilitate rapid bench-testing and hobbyist setups. If you are deploying the firmware in a production or shared corporate network environment, you must switch the system to **Closed Mode** to block unauthorized traffic.
-* **To Enable Closed Mode:** Open `src/SIP/RequestsHandler.hpp` and comment out or remove the following line:
-  ```cpp
-  // Comment this line to switch from default-open to a secure closed registrar:
-  // #define POCKETDIAL_OPEN_REGISTRAR
-  ```
-* **Effect:** When undefined, any incoming `REGISTER` or `INVITE` transaction from an unrecognized endpoint or with non-matching credentials will be blocked immediately with a secure `403 Forbidden` response code.
+> [!CAUTION]
+> **This is not a build knob and editing that `#define` does nothing.** Earlier revisions
+> told you to comment out `POCKETDIAL_OPEN_REGISTRAR` in `src/SIP/RequestsHandler.hpp`. That
+> macro is **unconditional** and only seeds the boot *default*; the header's own comment at
+> `RequestsHandler.hpp:4-15` says in as many words: *"Do not document this as a build knob;
+> it is not one."*
+
+* **To enable Closed Mode:** the registrar admission mode is a **runtime** setting,
+  persisted in NVS as `reg_mode` in the `pbxcfg` namespace. Change it with
+  `POST /api/registrar` (`mode=learn` or `mode=secure`) from a logged-in dashboard session,
+  or seed it at flash time through the `cfgseed` record. See
+  [LEARN_MODE.md](LEARN_MODE.md) for the cutover procedure.
+* **Effect:** in `learn`, an unknown MAC is adopted trust-on-first-use and then locked to
+  that MAC; in `secure`, every `REGISTER` **and** `INVITE` is digest-challenged.
+* **Before you plan on `secure`:** read [LEARN_MODE.md](LEARN_MODE.md) Step 4 first. There
+  is currently no way to set a per-extension SIP secret, so `secure` rejects every phone
+  rather than protecting them, and `POST /api/registrar mode=secure` refuses with `409`
+  unless you override it. `learn` is the strongest mode that can actually be deployed today.
 
 ### 2. Address of Record (AOR) Sanitization Safeguard (Issue #55)
 The engine whitelists and sanitizes SIP Address of Record (AOR) segments during inbound packet parsing. 
-* Only alphanumeric characters and the characters `.`, `-`, `_`, `+` are allowed.
+* Only alphanumeric characters and the characters `.`, `-`, `_`, `+`, **`*` and `#`** are
+  allowed (`RequestsHandler.cpp:5968-5977`). The last two matter: without them the star and
+  pound feature codes (`*8` group pickup, `**<ext>` directed pickup, the `*PIN#` admin menu)
+  would not be dialable.
 * Malformed injection strings or script probes are instantly intercepted and rejected with a `400 Bad Request` packet, preventing potential parsing or configuration hijacking attempts.
 
 ### 3. Distributed Scanner Denial-of-Service Defense (Issue #58)
@@ -220,13 +243,26 @@ curl -s http://192.168.4.1/api/wifi/scan
 ### 3. Connect Device to a Client Wi-Fi Network
 Saves credentials into the `"storage"` NVS namespace, changes operating mode to station, and initiates an automatic system restart.
 
+> [!IMPORTANT]
+> **This route is admin-gated — an unauthenticated call returns `401`.**
+> `POST /api/wifi/connect` goes through `requireAdmin(..., needCsrf=true)`
+> (`HttpServer.cpp:642-648`), so it needs a `pd_session` cookie **and** a matching
+> `X-CSRF` header. Earlier revisions of this page showed the bare call below without
+> either. Log in first, keep the cookie, and echo the CSRF token the login returns.
+> See [API.md §0.1](API.md).
+
 #### Command
 ```bash
-# For Windows PowerShell:
-Invoke-RestMethod -Method Post -Uri "http://192.168.4.1/api/wifi/connect" -Body "ssid=HQ-Office-WiFi&password=MySecurePassword"
+# 1. Log in; keep the cookie jar. The response body carries the CSRF token.
+curl -c jar.txt -X POST \
+     -H "Origin: http://192.168.4.1" \
+     -d "username=admin&password=YOUR_PASSWORD" \
+     http://192.168.4.1/api/admin/login
 
-# For Linux/macOS Shell:
-curl -X POST \
+# 2. Now the real call, with the session cookie and the token.
+curl -b jar.txt -X POST \
+     -H "Origin: http://192.168.4.1" \
+     -H "X-CSRF: <token from the login response>" \
      -H "Content-Type: application/x-www-form-urlencoded" \
      -d "ssid=HQ-Office-WiFi&password=MySecurePassword" \
      http://192.168.4.1/api/wifi/connect
@@ -242,14 +278,23 @@ curl -X POST \
 
 ---
 
-### 4. Force Disconnect an Active Call Extension (CSRF-Protected)
-Sends a disconnect command to terminate the session of a rogue or deadlocked extension. Because this is a state-changing POST endpoint, it requires **Same-Origin protection**. You must supply matching `Origin` and `Host` headers.
+### 4. Force Disconnect an Active Call Extension (admin session + CSRF)
+Sends a disconnect command to terminate the session of a rogue or deadlocked extension.
+
+> [!IMPORTANT]
+> **Matching `Origin`/`Host` headers are not sufficient.** Earlier revisions described
+> this route as protected by "Same-Origin protection" alone, and showed a `curl` with
+> only those two headers. It runs the full `requireAdmin(..., needCsrf=true)` chain
+> (`HttpServer.cpp:482-488`, gate body at `:2079-2127`): same-origin, **then** a valid
+> `pd_session` cookie, **then** a matching `X-CSRF` token, **then** the forced-setup
+> check. Without a session it returns `401 {"error":"authentication required"}`.
 
 #### Command
 ```bash
-curl -X POST \
+# Reuses the cookie jar and CSRF token from the login in §3.
+curl -b jar.txt -X POST \
      -H "Origin: http://192.168.4.1" \
-     -H "Host: 192.168.4.1" \
+     -H "X-CSRF: <token from the login response>" \
      -H "Content-Type: application/x-www-form-urlencoded" \
      -d "extension=100" \
      http://192.168.4.1/api/kill

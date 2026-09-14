@@ -108,7 +108,7 @@ next reset unless the running app confirms a healthy boot** (see §4).
 OTA is an on-device feature. The ESP-IDF build produces the image you upload.
 
 ```bash
-# (one-time) point at your ESP-IDF v5.x install
+# (one-time) point at your ESP-IDF v6.0+ install (v5.x fails at configure — see ONBOARDING.md)
 . $IDF_PATH/export.sh
 
 # Pick the transport you ship; the display build is the large one (~1.5 MB).
@@ -203,7 +203,7 @@ LOGIN=$(curl -s -c "$JAR" \
 # -> {"status":"ok","authenticated":true,"needsSetup":false,"csrf":"3f2a...e91c"}
 #
 # Wrong credentials -> 401 {"error":"invalid username or password"}, and repeated
-# failures trip a per-client lockout -> 429 {"error":"too many failed attempts;
+# failures trip the (global) lockout -> 429 {"error":"too many failed attempts;
 # try again later"}. A stale script still POSTing "pin=..." sends no username at
 # all, so it fails this way and will lock its own source address out.
 # "needsSetup":true means the login succeeded against the DEFAULT credential —
@@ -413,7 +413,8 @@ upload path are:
 
 - the **admin session** gate — a username + password login that mints a
   `pd_session` cookie, enforced **unconditionally** on every device in every
-  state, with a per-client brute-force lockout (`429`) on the login route;
+  state, with a brute-force lockout (`429`) on the login route — **global, not
+  per-client**, see [THREAT_MODEL.md](THREAT_MODEL.md) D-3;
 - the **per-session CSRF token** (`X-CSRF`) on the mutating routes; and
 - the **same-origin** check, which constrains browsers only (a request with no
   `Origin` header is admitted, so this is defence in depth, not the gate).

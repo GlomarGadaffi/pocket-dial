@@ -12,7 +12,18 @@ notes on which instructions are confirmed versus toolchain-verify).
 
 ## 0. Context and goals
 
-### What exists today
+### What existed when this was written
+
+> [!IMPORTANT]
+> **§0 is a pre-implementation snapshot and its present tense is now wrong.** The mix bus
+> it proposes **shipped** as `MixBus` + `ConferenceRoom` on extension `888` (issue #75) —
+> see §7, which is the current-state section. Read §0 as history. Two of its statements
+> would actively mislead if taken as current: the board *is* in the media path for `440`,
+> `555`, `888`, an outbound trunk call, and a park orbit with music on hold loaded; and
+> the "retire the special-case 1:1 logic" goal below **was not met** — ordinary calls are
+> still peer-to-peer and never touch `MixBus`, and `MediaBridge` in BUS mode still holds
+> exactly one port with `feedRx()` returning `false` (`MediaBridge.cpp:179-184`).
+
 pocket-dial routes phone↔phone calls as **peer-to-peer RTP** — the board is not in the
 media path. `MediaBridge` only anchors media for a call routed through an `AnchorClient`
 implementation (see `src/SIP/MediaBridge.cpp`). Reading that path (`src/SIP/MediaBridge.cpp`,
@@ -32,6 +43,9 @@ Add a single `MixBus` that owns the mix tick. Each call attaches a **port** (two
 rings: leg→bus and bus→leg). Every active port hears the saturated sum of all *other* ports.
 `MediaBridge` becomes a thin transport endcap; an ordinary 1:1 call falls out as the **N=2 case**,
 so the mixer subsumes the point-to-point path and the special-case 1:1 logic can be retired.
+*(This last clause did not happen — see the note at the top of §0. Ordinary calls stayed
+peer-to-peer, which is the property the rest of the project is built around, and the anchor
+leg is still outside the bus; §7's own caveat says so.)*
 
 ### Non-goals
 Transcoding (still G.711 at the rim, linear within), and per-codec edges beyond what
@@ -375,7 +389,10 @@ src/SIP/MixBus.hpp                the bus + per-port state machine
 src/SIP/MixBus.cpp                attach/detach/tick (compiled, -Wall -Wextra clean)
 src/SIP/mix_kernels.h             kernel signatures + POCKETDIAL_MIXBUS_PIE toggle
 src/SIP/mix_kernels_scalar.cpp    correct scalar bodies (the default + fallback)
-src/SIP/pie/mix_sum4_s16.S        confirmed-ISA saturating int16 sum (small-conf path)
+src/SIP/pie/mix_sum4_s16.S        confirmed-ISA saturating int16 sum — NOT on the live
+                                  path: MixBus::tick() calls mix_accumulate/mix_minus_self
+                                  unconditionally (MixBus.cpp:77,84). The only callers of
+                                  mix_sum4_s16 in the tree are tests/MixBus_test.cpp:120,127
 src/SIP/MediaBridge.hpp/.cpp      the transport endcap; BUS mode is §7's diff
 src/SIP/ConferenceRoom.hpp/.cpp   one bus + N legs + THE single tick driver; extension 888
 tests/MixBus_test.cpp             verifies minus-self, no-over-saturation, reclaim (GoogleTest)

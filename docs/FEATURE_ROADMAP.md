@@ -1,6 +1,6 @@
 # pocket-dial — Technical Feature Roadmap
 
-**Status:** Living document | **Last updated:** 2026-09-13 | **Scope:** Engineering / product-capability only
+**Status:** Living document | **Last updated:** 2026-09-14 | **Scope:** Engineering / product-capability only
 
 This is a prioritized **engineering** roadmap for pocket-dial: what exists, what is proved,
 and what is worth building next. It is grounded in the current source tree. It deliberately
@@ -25,8 +25,14 @@ Cross-references:
 >
 > **The peer-to-peer half.** An extension-to-extension call is brokered and then gets out
 > of the way: the two phones stream RTP directly to each other and the MCU never sees a
-> media packet. Hold, park and blind/attended transfer all preserve that property — the
-> SDP is relayed, and only the codec list is narrowed, never the `c=` line. `777` echo is
+> media packet. Hold and blind/attended transfer all preserve that property — the
+> SDP is relayed, and only the codec list is narrowed, never the `c=` line. **Park no
+> longer does, unconditionally:** with a music-on-hold clip loaded the board answers the
+> parked leg `sendonly` from its own port and streams the clip to it
+> (`src/SIP/ParkOrbit.cpp:56-75`), which puts the MCU in the media path one-way for the
+> duration of the park. With no clip loaded — the default — park still answers
+> `a=inactive` and sources nothing, which is the behaviour this paragraph used to
+> describe as unconditional. `777` echo is
 > in this half too, despite an in-code comment calling it "server-terminated": it is an
 > SDP loopback, answering with the caller's own body so the phone streams to itself
 > (`src/SIP/RequestsHandler.cpp:1228`). Nothing on the board carries that audio.
@@ -44,7 +50,8 @@ Cross-references:
 > The cheap/expensive axis therefore still holds, and is now measurable rather than
 > hypothetical: signalling features are bounded by the pre-allocated pools and cost a few
 > hundred bytes; media features cost a leg's worth of RTP tasks and rings apiece, which is
-> why the conference is capped at 4 legs and the trunk at **one** concurrent call.
+> why the conference is capped at 4 legs and the trunk at **four** concurrent calls
+> (one on the default loopback provider — see §1.3).
 
 ---
 
@@ -56,7 +63,7 @@ Cross-references:
 |-----------|-------|-------|
 | Registrar + back-to-back call broker | `REGISTER`, `INVITE`, `ACK`, `BYE`, `CANCEL`, `OPTIONS`, provisional/final responses | `src/SIP/RequestsHandler.cpp` |
 | **SIP digest auth (RFC 2617)** | Implemented and operable. **The shipped default is `open`** — see §1.4. | `src/Helpers/SipDigest.*`, `src/SIP/Registrar.*` |
-| Blind transfer (REFER) | Source-authorized against the dialog's own legs (#133) | `onRefer` |
+| Blind transfer (REFER) | Source-authorized against the dialog's own legs (#133). **Known defect: it moves the wrong party** — the transferee is BYEd (`RequestsHandler.cpp:4459`) and the *transferor* is re-INVITEd to the target (`:4471`), so a receptionist transferring an inbound call keeps the call and drops the customer. [#197](https://github.com/GlomarGadaffi/pocket-dial/issues/197), fix in flight; the test suite currently pins the inverted topology. Unresolvable targets no longer destroy the call (#203, fixed). | `onRefer` |
 | Attended transfer (REFER + Replaces, RFC 3891) | Splices B and C, BYEs A out of both, relays a later BYE across the bridge | `onRefer`, `handleTransferOk` |
 | Hold / resume | Re-INVITE, relayed untouched so the SDP survives | `onReinvite`, `onOk` |
 | RFC 3311 `UPDATE` | | `onUpdate` |
@@ -79,6 +86,7 @@ Cross-references:
 | Capability | Notes | Where |
 |-----------|-------|-------|
 | `440` server-sourced tone | board **sends** RTP; `sendonly` SDP | `onMediaInvite` |
+| **Music on hold (park only)** | board **sends** RTP. One global clip cursor fanned to every parked leg — the 20 ms tick reads 160 bytes once and `sendto`s the identical payload per listener, so there is no per-leg decode and no `MixBus`. G.711 µ-law 8 kHz mono only (the wire format itself; playback is a memcpy). The clip is read off the SD card into PSRAM **once at load** and the card is then out of the media path entirely. Cap `POCKETDIAL_PARK_SLOTS` listeners. **Falls back to the old silent `a=inactive` hold** when there is no clip, no usable RTP endpoint in the parked party's SDP, or MoH is not running — park never fails because nobody uploaded a WAV. Does **not** apply to phone-initiated hold. | `HoldMusic.*`, `ParkOrbit.cpp:56-75` |
 | `888` meet-me conference | board decodes, mixes (`MixBus`, N−1 minus-self summing) and re-encodes. **`POCKETDIAL_CONF_LEGS` = 4**, one global room, **no PIN**, created on first dial-in and then kept alive. | `ConferenceRoom.*`, `MixBus.*` |
 | `555` anchor media bridge | board bridges a leg to an `AnchorClient`. **Active on default firmware** via the `Loopback` reference client. | `onAnchorInvite`, `MediaBridge.*` |
 | Codec policy | **Relayed peer-to-peer legs admit PCMU, PCMA _and G.722_** (`filterAudioCodecs(allowWideband=true)`). Legs the board terminates itself refuse G.722, and the board's own SDP offers PCMU only. | `SipMessage.cpp:405`, `buildMediaSdp` |
@@ -97,7 +105,11 @@ Four things follow from that, and each one surprises someone:
 - **A dial-plan rule with `action=trunk` is the only way out.** No hardcoded `9` prefix, no
   unregistered-destination fallback: with an empty dial plan every outside number is
   answered `404` without leaving the box.
-- **`POCKETDIAL_MAX_ANCHOR_CALLS` is 1.** One concurrent outside call.
+- **`POCKETDIAL_MAX_ANCHOR_CALLS` is 4**, raised from 1 (`PoolConfig.hpp:221`). The
+  effective ceiling is `min(provider, 4)` via `RequestsHandler::anchorCallLimit()`:
+  `LoopbackAnchorClient` declares **1** (constant participant id), `TelephonyAnchorClient`
+  declares 4. So **default firmware still gets one concurrent outside call**; a board
+  driving a real 3CX trunk gets four, bounded by software ECDHE cost, not RAM.
 - **No E.164 normalization exists anywhere.** A rule's strip/prepend is the whole of the
   number transformation.
 
@@ -108,12 +120,12 @@ through `/api/telephony-config` — see [API.md](API.md).
 
 | Control | State |
 |---------|-------|
-| **Admin login** | **Username + password** (`AdminAuth`), salted/iterated SHA-256, server-side sessions, per-session CSRF token on every mutating route, per-client + aggregate brute-force lockout. Ships as `admin`/`admin` with **forced first-use setup** — every admin route except `set-credential` answers `403 setup_required` until it is replaced. |
+| **Admin login** | **Username + password** (`AdminAuth`), salted/iterated SHA-256, server-side sessions, per-session CSRF token on every mutating route, and brute-force lockout with exponential backoff plus an aggregate backstop. **The lockout is global, not per-client**, despite the per-client machinery in `AdminAuth`: `req.clientIp` is never populated on the login path (`HttpServer.cpp:2720-2732`), so every failure lands in the unkeyed bucket — see [THREAT_MODEL.md](THREAT_MODEL.md) D-3. Ships as `admin`/`admin` with **forced first-use setup** — every admin route except `set-credential` answers `403 setup_required` until it is replaced. |
 | **DTMF admin PIN** | A *separate*, independent numeric secret for the phone-keypad `*PIN#code` menu. **No default**, so that menu is disabled until explicitly configured. Unrelated to the web session. |
 | **HTTP reachability** | **The dashboard is always reachable.** The listener opens at construction and stays open. The dark-by-default plane and the `*4887` reopen star-code were **removed** (`de1a36e`); `grantAdminHttpGraceWindow` no longer exists. |
 | **Registrar admission** | Three modes — `open` / `learn` / `secure`. Digest auth is real; Learn is TOFU + an ARP-learned MAC lock. **The shipped default is `open`: a fresh board accepts any REGISTER and any INVITE until an operator changes `reg_mode`.** Both halves of that sentence matter. |
 | **SoftAP WPA2** | Implemented, **opt-in, default off** (NVS `ap_secure`) so a firmware update never re-pairs a live fleet. Encrypts dashboard, SIP and RTP together. |
-| Signalling hardening | per-source-IP token bucket, optional CIDR allowlist, AOR whitelist, bounded parser, SDP admission gate |
+| Signalling hardening | per-source-IP token bucket, AOR whitelist, bounded parser, SDP admission gate. **The "optional CIDR allowlist" this row used to list is not a shipped control** — `_allowNet`/`_allowMask` are never assigned, so `ipAllowed()` returns true for every source (`RequestsHandler.cpp:5922-5927`). See [ARCHITECTURE.md](ARCHITECTURE.md) §Rate Limiting. |
 | HTTP hardening | same-origin + CSRF, 16 KB body cap, `SO_RCVTIMEO`, no wildcard CORS, central security response headers (CSP, `X-Frame-Options: DENY`, `nosniff`, `no-store`), deliberately no HSTS |
 | OTA | dual-slot `ota_0`/`ota_1`, streaming upload, mark-valid-on-healthy-boot rollback. **Unsigned**, admin-gated. |
 
@@ -122,13 +134,16 @@ through `/api/telephony-config` — see [API.md](API.md).
 Core-pinned tasks (SIP vs HTTP/LVGL); outbox pattern keeping socket syscalls outside the
 lock; double-buffered lock-free status snapshot; zero-heap-alloc hot path. Compile-time
 pools: `MAX_CLIENTS` 32, `MAX_SESSIONS` 8, `MAX_DIAL_RULES` 16, `MAX_DID_MAPPINGS` 8,
-`CONF_LEGS` 4, `MAX_ANCHOR_CALLS` 1, with graceful `503` on exhaustion.
+`CONF_LEGS` 4, `MAX_ANCHOR_CALLS` **4** (effective 1 on the default loopback provider),
+with graceful `503` on exhaustion.
 Transports: Wi-Fi SoftAP with captive portal, W5500 / LAN8720 wired Ethernet and PoE,
 Guition JC3248W535 touch display (LVGL 8.3). Zero-touch provisioning
 (`GET /config/<mac>.cfg`, Yealink key format). Flash-time configuration via the `cfgseed`
 partition and the browser flasher. Live SIP tracer (`/api/trace`) and Wireshark-readable
-capture (`/api/pcap`). Dashboard with patch-bay UI and toolbar modals for dial plan,
-groups, call log and trace (F2/F3/F4/F8).
+capture (`/api/pcap`). Prometheus-style `GET /metrics`. Dashboard with patch-bay UI and
+toolbar modals for dial plan (`F2`), ring groups & forwarding (`F3`), call log (`F4`),
+refresh (`F5`), **PBX Settings (`F6`** — hold-music upload, preview and stop**)**, SIP
+trace (`F8`) and Wi-Fi (`F9`) (`src/Helpers/index_html.h:330-336`, `:1706-1712`).
 
 ---
 
@@ -167,7 +182,7 @@ zones, pickup — **has shipped** and now lives in §1. What remains is below.
 |-----|---------|-----------|------------|-------------|
 | **P1** | **E.164 normalization** | There is none anywhere. A trunk rule's strip/prepend is the entire number transformation, which works for one national dial habit and breaks on the next. | **S–M** | A bounded normalization table, not a regex engine. Pairs with DID matching, which is also literal-string today. |
 | **P1** | **Session timers, active side** | The PBX honours a phone's `Session-Expires` but never requests one and never answers `422`/`Min-SE`. A phone that dies mid-call therefore leaves the session to the orphan sweep rather than a refresh failure. | **M** | Pure signalling; the passive half already parses `refresher=`. |
-| **P2** | **Trunk failover / a second concurrent outside call** | `MAX_ANCHOR_CALLS` is 1 and there is no failover between configured slots. Raising it is a media-cost decision, not a signalling one. | **M (media)** | Each extra anchor leg costs an RTP task pair + rings, the same as a conference leg. Measure before raising. |
+| **P2** | **Trunk failover** | `MAX_ANCHOR_CALLS` has since been raised to 4, so "a second concurrent outside call" is **done** on a real provider. What remains is **failover between the four configured telephony slots** — there is none: one slot is active at a time and a dead provider is not detected or switched away from. | **M** | Signalling/orchestration, not media — the concurrency half was the media decision and it has been taken. |
 | **P2** | **Conference rooms with PINs** | One global room, no PIN, cap 4. Multiple rooms means a room table and per-room `MixBus` instances. | **M–L (media)** | Memory-bound: the rings are ~50 KB per room. |
 | **P2** | **MWI / `message-summary`** | The BLF machinery only implements the `dialog` event package. MWI is cheap *given* a voicemail store — and there isn't one (§5). | **S** | Meaningless without an external voicemail endpoint to subscribe to. |
 | **P2** | **100rel / PRACK** | Not implemented. Matters only for interop with a UAS that requires it. | **M** | No known handset in the bench set needs it. |
@@ -178,8 +193,8 @@ zones, pickup — **has shipped** and now lives in §1. What remains is below.
 |-----|---------|-----------|------------|-------|
 | **P0** | **Config import / export (backup / restore)** | Still the strongest platform item, and now overdue: the config surface has grown to dial plan, DID map, groups, forwards, DND, registrar roster, telephony slots and Wi-Fi. Rebuilding that by hand on a replacement unit is the realistic failure the project has no answer for. | **M** | Admin-gated `GET /api/config/export` + `POST /api/config/import`. **Never export the telephony secrets in clear** — the whole API is built around `secretSet`, not `secret`. |
 | **P1** | **Watchdog / health & self-heal** | No project task subscribes to a watchdog and nothing in `sdkconfig.defaults` configures one, so a wedged SIP or HTTP task is not detected or recovered. Task-level WDT plus heap/stack high-water reporting protects the RT guarantees in [ARCHITECTURE.md](ARCHITECTURE.md) §2 and feeds the OTA `mark-valid` health gate. | **S–M** | IDF Task WDT; surface on `/api/status`. |
-| **P1** | **Metrics endpoint** | `packetsProcessed`/`Dropped`, client/session counts and pool headroom are already counted and already exposed as JSON. A scrape-friendly text format is nearly free. | **S** | Read-only `/metrics` off the existing lock-free snapshot — no new locking. |
-| **P1** | **Syslog (RFC 5424 over UDP)** | `_logQueue` already buffers under lock and flushes outside it; tee it for fleets with no serial console. | **S** | One UDP socket, bounded queue, drop-on-full — never block the RT path. |
+| ~~P1~~ **DONE** | **Metrics endpoint** | **Shipped.** `GET /metrics` serves six Prometheus text-format families, all `pocketdial_`-prefixed: `uptime_seconds`, `sip_registrations_active`, `sip_calls_active`, `packets_processed_total`, `packets_dropped_total`, `sdp_rejected_total`. Reads only the relaxed atomics and the snapshot-mutex counts — it never touches `RequestsHandler::_mutex`, which is why `getConferenceLegs()` is deliberately *not* exported. **Ungated**, argued in-place: a stock scraper cannot drive the login/CSRF handshake. | — | `HttpServer.cpp:475`, `sendApiMetrics` at `:1185`; rationale at `:1124-1183`. Listed in [THREAT_MODEL.md](THREAT_MODEL.md) §4 E-2's unauthenticated-read class. |
+| ~~**P1**~~ **Shipped** | **Syslog (RFC 5424 over UDP)** | `_logQueue` already buffers under lock and flushes outside it; tee it for fleets with no serial console. **Careful: `src/Helpers/Syslog.{hpp,cpp}` already exists** — a complete, host-unit-tested RFC 5424 frame formatter, compiled into both the firmware (`main/CMakeLists.txt:112`) and the host build. What does *not* exist is any way to reach it: `Syslog.hpp` is included by nothing but its own `.cpp` and `tests/Syslog_test.cpp`, there is no call site on the log drain, no HTTP route and no NVS key for a destination. **Shipped in #209.** The tee lives on `LogQueue::setTee()` (which deliberately knows nothing about syslog, so a failing sink cannot take the log path down), all three ESP entry points register it at boot, and `GET`/`POST /api/syslog` configure the destination. Frames carry a real RFC 3339 timestamp from `timesync::rfc3339Now()`, which returns the RFC 5424 NILVALUE while the clock is unsynced. The 480-byte frame buffer is `static` under the module mutex rather than a stack local -- that spike on the 2048-byte drain task was the original reason this shipped unwired. | **S** | One UDP socket, bounded queue, drop-on-full — never block the RT path. |
 | **P2** | **NVS schema versioning / migration** | Config keys have accreted across several releases with no `schema_ver`. Pairs with config export. | **M** | Retrofitting this after an export format exists is the expensive order. |
 | **P2** | **Multi-AP / mesh / roaming** | Extends coverage past one SoftAP's ~16-station ceiling. Large, and it changes the trust boundary. | **L** | Keep one logical registrar; clients re-REGISTER on roam. |
 

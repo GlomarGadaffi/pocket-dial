@@ -5,7 +5,12 @@ RAM, and what breaks if you push it too far.
 
 > TL;DR: capacity is set at **compile time** via three macros in
 > [`src/SIP/PoolConfig.hpp`](../src/SIP/PoolConfig.hpp). The defaults
-> (`32` clients / `8` sessions / `32` messages) target a generic Wi-Fi ESP32.
+> (`32` clients / `8` sessions / **`52`** messages) target a generic Wi-Fi ESP32.
+> The message pool is **derived, not a literal**: `POCKETDIAL_MSG_POOL` defaults to
+> `MAX_CLIENTS + MAX_SUBSCRIPTIONS + 4` = 32 + 16 + 4 = **52**
+> (`PoolConfig.hpp:69-71`), sized so a `999` all-page fan-out and a BLF `NOTIFY`
+> burst in the same locked section cannot spill to the heap. Override it and you
+> break that sizing — see §3.
 > Bump them with `-D` flags for an S3-with-PSRAM build. See the tier table below
 > for ready-to-paste build commands.
 
@@ -66,19 +71,25 @@ Call-ID and a couple of `shared_ptr`s. The message objects dominate the budget:
 each one owns a full reusable packet buffer (the SDP body alone is several hundred
 bytes), which is precisely why we recycle them instead of reallocating per packet.
 
-### Default static budget (32 / 8 / 32)
+### Default static budget (32 / 8 / 52)
 
 ```
 clients :  32 × ~100 B  ≈   3.2 KB
 sessions:   8 × ~200 B  ≈   1.6 KB
-messages:  32 × ~1   KB ≈  32.8 KB   <-- dominant term
+messages:  52 × ~1   KB ≈  53.2 KB   <-- dominant term
                           ----------
-TOTAL                   ≈  ~37 KB static SRAM
+TOTAL                   ≈  ~58 KB static SRAM
 ```
 
+> **Corrected.** This block previously used 32 messages and reported ~37 KB. The
+> default pool is the derived 52 (`PoolConfig.hpp:69-71`), so the real static cost
+> is ~58 KB — about 20 KB more than every earlier revision of this document
+> claimed. If you sized a board against the old number, re-check it.
+
 The message pool is ~90% of the cost. On a generic ESP32 (~290–320 KB usable
-internal DRAM after the IDF/Wi-Fi stack) ~37 KB is comfortable headroom alongside
-the HTTP dashboard, DNS captive portal, and FreeRTOS tasks.
+internal DRAM after the IDF/Wi-Fi stack) ~58 KB is still workable alongside the
+HTTP dashboard, DNS captive portal, and FreeRTOS tasks, but it is no longer the
+comfortable margin the old figure implied.
 
 ---
 
@@ -89,7 +100,7 @@ build the same firmware; only the pool caps differ.
 
 | Tier | Board | `MAX_CLIENTS` | `MAX_SESSIONS` | Msg pool | Static pool RAM | Realistic concurrent calls |
 | :--- | :--- | ---: | ---: | ---: | ---: | :--- |
-| **Pocket** | Generic ESP32 (Wi-Fi SoftAP) | **32** (default) | **8** (default) | 32 | **~37 KB** | 6–8 simultaneous calls, ~16 phones (SoftAP-limited) |
+| **Pocket** | Generic ESP32 (Wi-Fi SoftAP) | **32** (default) | **8** (default) | 52 (derived) | **~58 KB** | 6–8 simultaneous calls, ~16 phones (SoftAP-limited) |
 | **Office** | ESP32-S3 + 8 MB PSRAM (Guition JC3248W535) | **64** | **24** | 64 | **~90 KB** | ~24 calls, 50+ phones |
 | **Rack** | ESP32-S3 + W5500 PoE (wired Ethernet) | **128** | **48** | 128 | **~180 KB** | ~48 calls, 100+ phones |
 
@@ -117,22 +128,32 @@ idf.py build
 ```sh
 # Host build
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_FLAGS="-DPOCKETDIAL_MAX_CLIENTS=64 -DPOCKETDIAL_MAX_SESSIONS=24 -DPOCKETDIAL_MSG_POOL=64"
+  -DCMAKE_CXX_FLAGS="-DPOCKETDIAL_MAX_CLIENTS=64 -DPOCKETDIAL_MAX_SESSIONS=24"
 
 # ESP-IDF firmware
-idf.py build -DCMAKE_CXX_FLAGS="-DPOCKETDIAL_MAX_CLIENTS=64 -DPOCKETDIAL_MAX_SESSIONS=24 -DPOCKETDIAL_MSG_POOL=64"
+idf.py build -DCMAKE_CXX_FLAGS="-DPOCKETDIAL_MAX_CLIENTS=64 -DPOCKETDIAL_MAX_SESSIONS=24"
 ```
+
+> **Do not pass `-DPOCKETDIAL_MSG_POOL` here.** Earlier revisions of this block
+> added `-DPOCKETDIAL_MSG_POOL=64`, which is *smaller* than the value the default
+> derivation produces for `MAX_CLIENTS=64` (64 + 16 + 4 = **84**). Setting it to 64
+> silently shrank the pool below the all-page + `NOTIFY` fan-out it is sized for
+> (`PoolConfig.hpp:58-71`) — the opposite of what the flag looked like it was doing.
+> Leave it unset and it tracks `MAX_CLIENTS` automatically.
 
 **Rack — ESP32-S3 + W5500/PoE wired Ethernet:**
 
 ```sh
 # Host build
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_FLAGS="-DPOCKETDIAL_MAX_CLIENTS=128 -DPOCKETDIAL_MAX_SESSIONS=48 -DPOCKETDIAL_MSG_POOL=128"
+  -DCMAKE_CXX_FLAGS="-DPOCKETDIAL_MAX_CLIENTS=128 -DPOCKETDIAL_MAX_SESSIONS=48"
 
 # ESP-IDF firmware
-idf.py build -DCMAKE_CXX_FLAGS="-DPOCKETDIAL_MAX_CLIENTS=128 -DPOCKETDIAL_MAX_SESSIONS=48 -DPOCKETDIAL_MSG_POOL=128"
+idf.py build -DCMAKE_CXX_FLAGS="-DPOCKETDIAL_MAX_CLIENTS=128 -DPOCKETDIAL_MAX_SESSIONS=48"
 ```
+
+> Same note as Office: leave `POCKETDIAL_MSG_POOL` unset. The derivation gives
+> 128 + 16 + 4 = **148**, and the `=128` this block used to pass was a reduction.
 
 > **PSRAM note (Office/Rack):** the ~90–180 KB pool budget fits in *internal*
 > SRAM on the S3, so no PSRAM is strictly required for these tiers. PSRAM on the
@@ -160,12 +181,19 @@ an out-of-memory abort. Each pool degrades in its own well-behaved way:
   **`503 Service Unavailable`** (see `onInvite()` and the broadcast handler in
   `RequestsHandler.cpp`). The caller hears fast-busy / "service unavailable"
   rather than the call hanging. Existing calls are untouched.
-* **Message pool drained (transient).** `getMessageFromPool()` logs
-  `"[WARNING] SIP Message pool exhausted! Fallback to heap allocation."` and
-  serves a one-off `std::make_shared` instead. This is a *soft* limit: it never
-  refuses work, it just temporarily forgoes the no-allocation guarantee. It
-  matters most during a 999 all-page, which transiently needs one message per
-  paged target — see §6.
+* **Message pool drained (transient), then hard-stopped.** `getMessageFromPool()`
+  logs `"[WARNING] SIP Message pool exhausted (N total)! Falling back to bounded
+  heap allocation."` (rate-limited to 1-in-100) and serves a one-off
+  `std::make_shared` instead. **This is not an unlimited soft limit.** The heap
+  fallback is capped at `POCKETDIAL_MSG_HEAP_FALLBACK_MAX` = 8 concurrent
+  allocations (`PoolConfig.hpp:87-89`); past that `getMessageFromPool()` returns
+  `nullptr`, logs `"Fallback budget spent — DROPPING packets."`
+  (`SipMessagePool.cpp:95-99`, `:134-141`), and the ~20 call sites in
+  `RequestsHandler.cpp` that check it drop the packet and rely on the peer's
+  RFC 3261 §17 retransmit. Shedding load is the intended behaviour at that depth,
+  but it *does* refuse work — an earlier revision of this bullet said it never
+  does. It matters most during a 999 all-page, which transiently needs one message
+  per paged target — see §6.
 
 All three counters surface on the dashboard (`getClientCount()`,
 `getSessionCount()`, processed/dropped packet counters), so operators can watch
@@ -224,8 +252,9 @@ deployment:
   giving comfortable room for stale-binding churn without ever being the limit.
 * 8 sessions means up to 8 simultaneous 1:1 calls — well beyond what ~16 phones
   realistically place at once, and an `8 × ~200 B` rounding error in the budget.
-* The whole thing fits in ~37 KB, leaving the bulk of internal SRAM for Wi-Fi
-  buffers, the HTTP dashboard, the captive-portal DNS, and LVGL.
+* The whole thing fits in **~58 KB** (see §2 — the message pool defaults to the derived
+  52, not 32), leaving most of internal SRAM for Wi-Fi buffers, the HTTP dashboard, the
+  captive-portal DNS, and LVGL.
 
 In short: 32/8 is sized to be *one notch above* the network layer's own ceiling on
 the cheapest supported board, so RAM is never wasted and the pool is never the

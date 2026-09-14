@@ -78,7 +78,7 @@ The post-refactor tasks are allocated generous stacks, resulting in highly secur
 | Task Name | Core | Allocated Stack (Bytes) | Projected Peak Stack Usage (Bytes) | Projected High-Water Mark (Free Bytes) | Technical Risk Analysis & Design Details |
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **`sip_server_task`** | Core 1 | 8,192 | 3,840 | 4,352 | Handles the 1Hz ticking engine, keeps alive, and sweeps expired clients. Low risk of recursion or heavy frames. |
-| **`udp_receiver_task`**| Core 1 | 8,192 | 4,200 | 3,992 | **High-activity path.** Processes and parses incoming SIP string structures inline. Generous 8 KB allocation protects against complex headers. |
+| **`udp_receiver_task`**| Core 1 | **16,384** | 4,200 | *(projection stale)* | **High-activity path.** Processes and parses incoming SIP string structures inline. **The 8 KB figure this row used to carry is wrong and was wrong in practice too**: 8 KB caused a stack-overflow panic on this task, and it was raised to 16,384 at `UdpServer.cpp:145-152`. The peak/high-water projections beside it were computed against the old allocation and were never re-derived. |
 | **`http_server_task`** | Core 0 | 8,192 | 2,800 | 5,392 | Executes the non-blocking accept loop using `select()`. Light and secure as handling is delegated. |
 | **HTTP client thread** | Core 0 | ~3,072 *Default* | 1,450 | 1,622 | Each active HTTP socket runs in a detached `pthread`. **PASS due to heap shift of 4 KB read buffer.** |
 

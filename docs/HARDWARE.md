@@ -28,8 +28,8 @@ The Guition JC3248W535 is an all-in-one Smart Display powered by an ESP32-S3. It
        └────────────────────────────────────────────────────────┘
           │ TFT SCK=47                │ I2C SDA=4
           │ TFT CS=45                 │ I2C SCL=8
-          │ QSPI TFT Lines            │ I2C INT=11
-          │ [21, 48, 40, 39]          │ I2C RST=12
+          │ QSPI TFT Lines            │ (no INT/RST routed —
+          │ [21, 48, 40, 39, 38=TE]   │  touch is polled)
           ▼                           ▼
       ┌────────────────────────────────────────────────────────┐
       │                      ESP32-S3R8                        │
@@ -55,8 +55,15 @@ The Guition JC3248W535 is an all-in-one Smart Display powered by an ESP32-S3. It
 | `TFT_BL` | **GPIO 1** | Output | LED Backlight Control (High = Backlight ON) |
 | `TOUCH_SDA` | **GPIO 4** | Bidirectional | Touch Controller I2C SDA (Pull-up Required) |
 | `TOUCH_SCL` | **GPIO 8** | Output | Touch Controller I2C SCL (Pull-up Required) |
-| `TOUCH_RST` | **GPIO 12** | Output | Touch Controller Reset Pin |
-| `TOUCH_INT` | **GPIO 11** | Input | Touch Controller Interrupt Pin |
+| `TOUCH_RST` | **not routed** | — | **Corrected.** The AXS15231B on this board has no reset line brought out; the driver is initialised with `rst = GPIO_NUM_NC` (`main/esp_main_display.cpp:59-64`). |
+| `TOUCH_INT` | **not routed** | — | **Corrected.** No touch interrupt either — `int = GPIO_NUM_NC`, and **touch is polled**. |
+
+> [!CAUTION]
+> **GPIO 11 and 12 are the microSD CMD/CLK lines on this board, not touch pins.** Earlier
+> revisions of this table assigned them to `TOUCH_INT`/`TOUCH_RST`; the code comment at
+> `main/esp_main_display.cpp:59-64` records that as a mis-assignment it had to undo. Wiring
+> a touch panel to 11/12 on the strength of the old table would collide with the SD slot —
+> see §2's microSD note.
 | `BATTERY_ADC` | **GPIO 5** | Analog Input | Voltage Divider ADC channel (Simulated or ADC1_CH4) |
 
 > [!TIP]
@@ -84,7 +91,9 @@ on COM4), which independently arrived at GPIO 11/12 being the microSD CMD/CLK li
 while fixing an unrelated touch-pin mis-assignment.
 
 **Conflict check against this table**: clean. GPIO 11/12/13 don't collide with
-`TFT_*` (45/47/21/48/40/39/1/38), `TOUCH_*` (4/8), or `BATTERY_ADC` (5).
+`TFT_*` (45/47/21/48/40/39/1/38 — note **GPIO 38 is `TFT_TE`**, the tearing-effect line,
+which §2's pin table omits), `TOUCH_*` (4/8 — the touch IC has no INT/RST routed), or
+`BATTERY_ADC` (5).
 
 **Still open** (needs the physical board — this is the issue's blocker, narrowed but
 not closed):
@@ -113,26 +122,48 @@ An industrial, ultra-compact ESP32-S3 board with a built-in PoE module and a hig
        ┌──────────────────┐             ┌──────────────────┐
        │   W5500 MAC/PHY  │<─── SPI ───>│    ESP32-S3R8    │
        └──────────────────┘             └──────────────────┘
-         SCLK: GPIO 12                    SCLK: SPI2_SCLK
-         MISO: GPIO 13                    MISO: SPI2_MISO
+         SCLK: GPIO 13                    SCLK: SPI2_SCLK
+         MISO: GPIO 12                    MISO: SPI2_MISO
          MOSI: GPIO 11                    MOSI: SPI2_MOSI
-         CS:   GPIO 10                    CS:   SPI2_CS
-         INT:  GPIO 14                    INT:  GPIO Pin Interrupt
+         CS:   GPIO 14                    CS:   SPI2_CS
+         INT:  GPIO 10                    INT:  GPIO Pin Interrupt
+         RST:  GPIO 9                     RST:  GPIO output
 ```
 
 ### Pin Assignments
 * **Ethernet Controller**: Wiznet W5500 MAC/PHY
 * **SPI Host Device**: `SPI2_HOST` (FSPI)
-* **Bus Speed**: 36 MHz (Supports up to 80 MHz)
+* **Bus Speed**: **40 MHz**. Not 36, and **80 MHz hard-fails** with `ESP_ERR_TIMEOUT` at
+  driver install. The GPSPI divides an 80 MHz source by integers, so any request in
+  40-79 lands on 40 actual — and the old "36" quietly ran at 26.7
+  (`main/esp_main_eth.cpp:113-117`).
+
+> [!CAUTION]
+> **This table was wrong until this audit, and the wrong values do not fail softly.**
+> Earlier revisions listed SCLK 12 / MISO 13 / CS 10 / INT 14 and no reset line — SCLK
+> and MISO transposed, CS and INT transposed. That map does not merely fail to link:
+> `esp_eth_driver_install()` returns `ESP_ERR_TIMEOUT`, the `ESP_ERROR_CHECK` in
+> `eth_init_w5500()` aborts the boot, and **the board sits in a reset loop with no
+> network to diagnose it over** (108 consecutive `rst:0xc` in one capture). Corrected on
+> hardware in [#155](https://github.com/GlomarGadaffi/pocket-dial/issues/155); the values
+> below are `main/esp_main_eth.cpp:84-91` and are the ones actually running on this board.
 
 | Signal Name | ESP32-S3 GPIO | Bus Signal | Description |
 | :--- | :---: | :---: | :--- |
-| `W5500_SCLK_GPIO` | **GPIO 12** | SPI2 SCLK | SPI Serial Clock |
-| `W5500_MISO_GPIO` | **GPIO 13** | SPI2 MISO | SPI Master Input Slave Output |
+| `W5500_SCLK_GPIO` | **GPIO 13** | SPI2 SCLK | SPI Serial Clock |
+| `W5500_MISO_GPIO` | **GPIO 12** | SPI2 MISO | SPI Master Input Slave Output |
 | `W5500_MOSI_GPIO` | **GPIO 11** | SPI2 MOSI | SPI Master Output Slave Input |
-| `W5500_CS_GPIO` | **GPIO 10** | SPI2 CS | SPI Chip Select (Active Low) |
-| `W5500_INT_GPIO` | **GPIO 14** | Input | W5500 Hardware Interrupt Pin |
-| `W5500_RST_GPIO` | **-1 (Unused)** | Reset | Not wired; reset handled via SPI soft commands |
+| `W5500_CS_GPIO` | **GPIO 14** | SPI2 CS | SPI Chip Select (Active Low) |
+| `W5500_INT_GPIO` | **GPIO 10** | Input | W5500 Hardware Interrupt Pin |
+| `W5500_RST_GPIO` | **GPIO 9** | Reset | Waveshare **does** wire a real reset line (the Elite does not) |
+
+> [!IMPORTANT]
+> **This board is not the default build.** `PD_ETH_BOARD` defaults to `elite`
+> (`main/CMakeLists.txt:37-39`), whose pin map is completely different. Building for a
+> Waveshare board without `-D PD_ETH_BOARD=waveshare` flashes the Elite map and produces
+> exactly the reset loop described above. There is also **no Waveshare variant in any
+> release artifact** — the browser flasher's `esp32s3-eth` image is the T-ETH-Elite — so
+> this board must be built from source.
 
 ---
 
@@ -199,7 +230,7 @@ W5500 pin map is not the same, so build it with `-D PD_ETH_BOARD=elite` (the def
 | `W5500_RST_GPIO` | **-1 (Unused)** | Reset | Not wired to a GPIO; reset via SPI soft command |
 
 microSD/TF slot — a **separate SPI bus** (`SPI3_HOST`; the W5500 owns `SPI2_HOST`), so the
-card and Ethernet never contend. Mounted at `/sdcard` (FATFS) during `eth` boot on this
+card and Ethernet never contend. **The music-on-hold clip is read from `/sdcard/moh.wav`** and must be **8 kHz mono G.711 µ-law WAV** — anything else is rejected `422` by `POST /api/moh/upload` (`HttpServer.cpp:2929-2980`); prepare one with `ffmpeg -i music.mp3 -ar 8000 -ac 1 -acodec pcm_mulaw moh.wav`. Mounted at `/sdcard` (FATFS) during `eth` boot on this
 board; `GET /api/status` reports `sd.{present,mounted,capacityMb}`.
 
 > [!IMPORTANT]
@@ -247,21 +278,25 @@ A legacy ESP32-WROVER-E board with Power-over-Ethernet (PoE) and RMII-based LAN8
        └──────────────────┘             │  Ethernet MAC    │
          MDC:  GPIO 23                  └──────────────────┘
          MDIO: GPIO 18
-         CLK:  GPIO 17 (OUT)
-         RST:  GPIO 5 (Active Low)
+         CLK:  GPIO 0 (OUT)
+         PWR:  GPIO 4 (driven HIGH)
 ```
 
 ### Pin Assignments
 * **Ethernet PHY**: LAN8720 (RMII Mode)
 * **PHY Address**: `0`
-* **Reference Clock Mode**: `ETH_CLOCK_GPIO17_OUT` (50MHz clock generated by ESP32)
+* **Reference Clock Mode**: `EMAC_CLK_OUT` on **GPIO 0** (50 MHz clock generated by the
+  ESP32). Not GPIO 17 — **GPIO 0 is the only RMII CLK-OUT capable pad on the classic
+  ESP32** (`main/esp_main_eth_lan8720.cpp:178-182`; under IDF v6 this is a plain int GPIO
+  number, the `EMAC_APPL_CLK_OUT_GPIO` enum is gone).
 
 | Signal Name | ESP32 GPIO | RMII Signal | Description |
 | :--- | :---: | :---: | :--- |
 | `ETH_MDC_PIN` | **GPIO 23** | MDC | Management Data Clock |
 | `ETH_MDIO_PIN` | **GPIO 18** | MDIO | Management Data Input/Output |
-| `ETH_POWER_PIN` | **GPIO 5** | PHY_RST | PHY Active-low Reset and Power enable |
-| `ETH_CLK_MODE` | **GPIO 17** | CLK_OUT | 50MHz Reference Clock output |
+| `LAN8720_POWER_GPIO` | **GPIO 4** | PHY enable | PHY power-enable, driven **HIGH** before init — not GPIO 5 and not active-low |
+| `LAN8720_PHY_RST_GPIO` | **-1 (unmanaged)** | PHY_RST | No dedicated PHY reset is driven. `config.h`'s `NRST=5` is believed to be the **4G modem** reset on this board, not the LAN8720's — which is where the old "GPIO 5, active-low" entry came from |
+| RMII CLK | **GPIO 0** | CLK_OUT | 50 MHz reference clock output |
 
 ---
 
@@ -304,4 +339,4 @@ Many JC3248W535 display clones omit these, resulting in I2C timeouts and immedia
 If breadboarding the Waveshare or LilyGO W5500 SPI interfaces:
 * Keep SPI line paths **shorter than 5 cm** to prevent clock skew.
 * Ground lines should be bundled alongside high-speed clock signals (`SCK` and `MOSI`) to shield against EMI.
-* High-speed SPI clock lines running at 36 MHz will experience significant crosstalk if unshielded or loosely jumpered.
+* High-speed SPI clock lines running at **40 MHz** (the configured W5500 bus speed — `esp_main_eth.cpp:113`) will experience significant crosstalk if unshielded or loosely jumpered.

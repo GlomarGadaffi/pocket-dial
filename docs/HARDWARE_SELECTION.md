@@ -18,7 +18,7 @@ detail.
 
 | Board | Connectivity | Display | SoC / PSRAM | Flash | SCALING tier | Realistic capacity |
 | :--- | :--- | :---: | :--- | :--- | :--- | :--- |
-| **Generic ESP32 / ESP32-S3 dev board** | Wi-Fi SoftAP (open) | No | ESP32 or ESP32-S3 (PSRAM optional) | varies | **Pocket** (defaults 32/8/32, ~37 KB) | 6–8 calls, ~16 phones (SoftAP-limited) |
+| **Generic ESP32 / ESP32-S3 dev board** | Wi-Fi SoftAP (open) | No | ESP32 or ESP32-S3 (PSRAM optional) | varies | **Pocket** (defaults 32/8/**52**, **~58 KB**) | 6–8 calls, ~16 phones (SoftAP-limited) |
 | **Guition JC3248W535** | Wi-Fi SoftAP + captive portal | **Yes** — 3.5" 320×480 IPS capacitive touch (AXS15231B, QSPI) | ESP32-S3R8, **8 MB Octal PSRAM** | 16 MB QSPI | **Office** (64/24/64, ~90 KB) | ~24 calls, 50+ phones |
 | **LilyGO T-ETH-ELITE S3 (W5500, PoE)** — *default `eth`* | **Wired Ethernet + PoE** (W5500 SPI, 802.3af) | No | ESP32-S3-WROOM-1, 8 MB PSRAM | 16 MB + microSD | **Rack** (128/48/128, ~180 KB) | ~48 calls, 100+ phones |
 | **Waveshare ESP32-S3-ETH (W5500, PoE)** | **Wired Ethernet + PoE** (W5500 SPI) | No | ESP32-S3R8 | — | **Rack** (128/48/128, ~180 KB) | ~48 calls, 100+ phones |
@@ -93,8 +93,10 @@ shows the captive-portal join QR code on first boot.
 
 ## 4. PSRAM and memory
 
-- **Generic ESP32/ESP32-S3**: PSRAM is optional. The Pocket tier's ~37 KB of pools fits
-  comfortably in the ~290–320 KB of usable internal DRAM on a plain ESP32.
+- **Generic ESP32/ESP32-S3**: PSRAM is optional. The Pocket tier's **~58 KB** of pools
+  (not the ~37 KB quoted before this audit — the message pool is the derived 52, see
+  [SCALING.md](SCALING.md) §2) still fits in the ~290–320 KB of usable internal DRAM on a
+  plain ESP32, with less margin than the old figure implied.
 - **Guition / S3 boards**: PSRAM is present (8 MB) but, except on the display build where
   it holds the LVGL frame buffers, it is **not** required for the SIP pools — keeping SIP
   state in internal SRAM avoids PSRAM access latency on the signaling path
@@ -114,7 +116,7 @@ From [HARDWARE.md §9](HARDWARE.md):
   (GPIO 4) and `TOUCH_SCL` (GPIO 8) to 3.3 V. Many JC3248W535 clones omit these, causing
   I2C timeouts and panel-init crashes.
 - **High-frequency SPI Ethernet routing (W5500 boards):** keep SPI traces **shorter than
-  5 cm**, bundle ground alongside `SCK`/`MOSI`, and expect crosstalk on a 36 MHz clock if
+  5 cm**, bundle ground alongside `SCK`/`MOSI`, and expect crosstalk on the 40 MHz clock if
   lines are loosely jumpered on a breadboard.
 - **PoE:** the LilyGO T-ETH-ELITE, Waveshare ESP32-S3-ETH, and LilyGO T-POE-Pro accept
   power over the RJ45; the LilyGO T-ETH-Lite and Wi-Fi boards are USB-C powered.
@@ -144,10 +146,12 @@ From [HARDWARE.md §9](HARDWARE.md):
 ## 7. Build target reminder
 
 Each transport is selected at build time via `SIP_TRANSPORT` (and the optional tier
-macros). See [README.md §Building](../README.md#building) and [SCALING.md §3](SCALING.md)
+macros). See [README.md](../README.md#run-it-on-an-esp32-s3) and [SCALING.md §3](SCALING.md)
 for the exact commands. In short:
 
-- Wi-Fi SoftAP: default build (`idf.py build`).
+- Wi-Fi SoftAP: `idf.py -D SIP_TRANSPORT=wifi build`. **Not the bare `idf.py build`** —
+  `SIP_TRANSPORT` defaults to **`eth`** (`main/CMakeLists.txt:6-7`), so a plain build
+  produces Ethernet firmware with no SoftAP.
 - Touch display: `idf.py -D SIP_TRANSPORT=display build`.
 - Wired Ethernet / PoE: `idf.py -D SIP_TRANSPORT=eth build` — defaults to the **LilyGO
   T-ETH-ELITE S3** pin map. For the Waveshare board add `-D PD_ETH_BOARD=waveshare`. The
