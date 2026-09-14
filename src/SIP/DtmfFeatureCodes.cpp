@@ -49,18 +49,54 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 		return; // malformed / no signal — nothing to do
 	}
 
+	onDigit(data->getCallID(), digit, DigitSource::Info, nowTickMs(), data);
+}
+
+uint32_t DtmfFeatureCodes::nowTickMs()
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	return static_cast<uint32_t>(xTaskGetTickCount());
+#else
+	return static_cast<uint32_t>(
+		std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+}
+
+void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
+	DigitSource source, uint32_t arrivedTick, const std::shared_ptr<SipMessage>& data)
+{
 	// --- 2. Look up or create the per-Call-ID accumulator -------------------
-	std::string callId(data->getCallID());
+	std::string callId(callIdView);
 	auto& accum = _dtmfState[callId];
+
+	// --- 2a. Dual-source de-duplication -------------------------------------
+	// Same digit, other source, inside the window: this is the twin of a press
+	// already counted, not a second press. See DtmfAccum's note for why the rule
+	// is this narrow.
+	const uint32_t nowTick = arrivedTick;
+	if (accum.lastDigit == digit &&
+	    accum.lastSource != 0 &&
+	    accum.lastSource != static_cast<uint8_t>(source))
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		const uint32_t sinceMs =
+			(nowTick - accum.lastAcceptedTick) * portTICK_PERIOD_MS;
+#else
+		const uint32_t sinceMs = nowTick - accum.lastAcceptedTick;
+#endif
+		if (sinceMs <= DtmfAccum::DUP_WINDOW_MS)
+		{
+			return;   // duplicate of a press we already have
+		}
+	}
 
 	// --- 3. Timeout: reset accumulator if > TIMEOUT_MS since last digit -----
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	TickType_t now = xTaskGetTickCount();
+	TickType_t now = static_cast<TickType_t>(nowTick);
 	uint32_t elapsedMs = (now - accum.lastTick) * portTICK_PERIOD_MS;
 #else
-	uint32_t now = static_cast<uint32_t>(
-		std::chrono::duration_cast<std::chrono::milliseconds>(
-			std::chrono::steady_clock::now().time_since_epoch()).count());
+	uint32_t now = nowTick;
 	uint32_t elapsedMs = (accum.lastTick == 0) ? 0 : (now - accum.lastTick);
 #endif
 	if (accum.lastTick != 0 && elapsedMs > DtmfAccum::TIMEOUT_MS)
@@ -71,8 +107,22 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 
 	// --- 4. Append digit ----------------------------------------------------
 	accum.digits += digit;
+	accum.lastDigit        = digit;
+	accum.lastSource       = static_cast<uint8_t>(source);
+	accum.lastAcceptedTick = now;
 	const std::string& seq = accum.digits;
-	std::string callerExt(data->getFromNumber());
+	// The caller's extension. An INFO carries it in From; an RFC 4733 digit
+	// arrives with only a Call-ID, so resolve it off the live session — the same
+	// dialog the accumulator is keyed by.
+	std::string callerExt;
+	if (data)
+	{
+		callerExt = std::string(data->getFromNumber());
+	}
+	else if (auto session = _env.findSession(callId); session && session->getSrc())
+	{
+		callerExt = session->getSrc()->getNumber();
+	}
 
 	// --- 5. Admin menu gate (Task 2C-5): *PIN + 3-digit code ----------------
 	// Pattern: * + PIN(4+) + 3-digit-code  (minimum 8 chars total after '*')
@@ -197,13 +247,24 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 		// A non-admin caller attempting the admin-menu pattern (*PIN#…): reject.
 		// CLASS service codes (*60/*72/…) have no '#', so they fall through to the
 		// per-subscriber feature handling below for any registered caller.
-		auto response = sipmsgpool::getMessageFromPool(*data);
-		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
-		response->setHeader("SIP/2.0 403 Forbidden");
-		response->clearBody();
-		std::string activeIp = _env.localIp();
-		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		_env.enqueue(data->getSource(), std::move(response));
+		//
+		// The 403 is only sendable when the digit arrived as a SIP INFO, because
+		// it is the response to THAT request. An RFC 4733 digit came over RTP and
+		// has no request to answer — there is no such thing as a SIP response to
+		// a media packet. The refusal still takes effect either way: clearing the
+		// accumulator is what actually stops the sequence from completing, and
+		// the caller simply gets silence instead of a 403 they were never going
+		// to surface to the user anyway.
+		if (data)
+		{
+			auto response = sipmsgpool::getMessageFromPool(*data);
+			if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+			response->setHeader("SIP/2.0 403 Forbidden");
+			response->clearBody();
+			std::string activeIp = _env.localIp();
+			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			_env.enqueue(data->getSource(), std::move(response));
+		}
 		accum.digits.clear();
 		return;
 	}

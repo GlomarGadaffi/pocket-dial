@@ -202,6 +202,23 @@ public:
 	// would shadow audio — and returns false.
 	bool setDtmfPayloadType(uint8_t pt, DtmfSink sink);
 
+	// Offer one parsed RTP packet to the RFC 4733 path. Returns true when the
+	// packet was a telephone-event on the negotiated payload type and has been
+	// consumed (whether or not it produced a digit — a malformed body, a hook
+	// flash or a repeat packet of a press already reported all count as
+	// consumed); false when it is not telephone-event at all and the caller
+	// should go on treating it as audio, or drop it.
+	//
+	// Public and separate from runLoop() only so host tests can reach it. On a
+	// host build start() is a no-op stub that never binds a socket, so every line
+	// after recvfrom() is otherwise unreachable off-device — and the press-dedupe
+	// (one report per key press, across a burst of packets that may arrive
+	// lossily) is exactly the logic worth pinning.
+	//
+	// Called on the receive task. Touches _lastDtmfTs/_haveLastDtmf, which are
+	// owned by that task alone; the sink copy is taken under _slotMutex.
+	bool dispatchDtmf(const RtpPacket& pkt);
+
 	// Stop the stream: close the socket (unblocks recvfrom), signal the receive
 	// task to exit, clear _active and the sink. Idempotent — safe on an already-
 	// idle receiver. Returns true if a stream was actually stopped.

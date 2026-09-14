@@ -299,6 +299,28 @@
 #define POCKETDIAL_MAX_SERVER_TRANSACTIONS (POCKETDIAL_MAX_SESSIONS + 8)
 #endif
 
+// Depth of the RFC 4733 DTMF hand-off ring — key presses captured on an RTP
+// receive task and waiting to be acted on by the SIP thread.
+//
+// This is a THREAD BOUNDARY, not a work queue. A telephone-event packet is
+// decoded on the media task, but every consumer of a digit (the feature-code
+// table, the admin menu, the per-dialog accumulator) assumes the engine's big
+// _mutex is held and runs single-threaded on the SIP path. The ring is how a
+// press crosses from one to the other: the RTP task memcpy's a fixed record in
+// under its own small mutex and returns immediately, never touching _mutex and
+// never allocating, so a busy SIP pass can never introduce audio jitter.
+//
+// Sized for human dialling, not throughput. Digits arrive at a few per second
+// at most, and the ring is drained on every SIP packet AND every tick, so more
+// than a couple of slots are only ever needed if the SIP thread stalls. Sixteen
+// covers the longest feature code several times over. Overflow drops the oldest
+// press and counts it (see RequestsHandler::dtmfDigitsDropped) rather than
+// blocking the media task — a dropped digit costs one keypress, a blocked RTP
+// task costs the call's audio.
+#ifndef POCKETDIAL_DTMF_INBOX
+#define POCKETDIAL_DTMF_INBOX 16
+#endif
+
 // Bytes of each transaction record's retransmit buffer — the serialized message
 // held ready to put back on the wire.
 //
