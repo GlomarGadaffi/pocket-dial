@@ -53,14 +53,16 @@ namespace provisioning
 
 	// XML-escapes the five characters XML gives special meaning to element and
 	// attribute content. The three new renderers below are all XML (Yealink's
-	// key=value format is not); '&' is the one every renderer emits by feeding
-	// the extension straight through, so left unescaped it would silently break
-	// well-formedness for an extension like "1&2" -- isValidAor()'s charset is
-	// wider than Yealink's format-level needs bargained for. '<' '>' are near
-	// impossible via that charset but escaped anyway since a fully-quoted
-	// implementation is easier to audit than a partially-quoted one; '"' '\''
-	// exist for Polycom, whose fields are XML attribute values, not element
-	// text.
+	// key=value format is not). Today no XML-special character can actually
+	// reach these renderers: the live route re-validates the extension with
+	// isValidAor() (RequestsHandler.cpp), which admits only alnum plus
+	// `.-_+*#` -- never '&', '<', '>', '"' or '\''. The escaping is defence in
+	// depth, not a fix for a reachable bug: these are pure functions decoupled
+	// from any caller's validation, and a future caller wired to less-filtered
+	// input (an admin-typed label, an imported CSV) would otherwise emit
+	// malformed XML for an extension like "1&2". A fully-quoted implementation
+	// is also easier to audit than a partially-quoted one. '"' and '\'' matter
+	// for Polycom, whose fields are XML attribute values, not element text.
 	inline std::string xmlEscape(const std::string& in)
 	{
 		std::string out;
@@ -203,8 +205,14 @@ namespace provisioning
 		out += "<P271>1</P271>\r\n";                                  // Account Active
 		out += "<P270>" + ext + "</P270>\r\n";                        // Account Name / label
 		out += "<P35>" + ext + "</P35>\r\n";                          // SIP User ID
-		out += "<P34>" + ext + "</P34>\r\n";                          // SIP Authenticate ID
-		out += "<P36></P36>\r\n";                                     // SIP Authenticate Password -- always blank, see yealinkConfigFor's rationale above (HA1-only storage)
+		// P36 is the Authenticate ID and P34 the Authenticate Password on the
+		// account-1 P-value set (GXP/GXV/HT generations alike). An earlier draft
+		// had these two reversed, which would have handed the phone the extension
+		// as its digest PASSWORD and an empty auth ID -- unregisterable against a
+		// Secure-mode registrar, and only "working" in Learn/Open mode because no
+		// digest is checked there. Caught in review of PR #224.
+		out += "<P36>" + ext + "</P36>\r\n";                          // SIP Authenticate ID
+		out += "<P34></P34>\r\n";                                     // SIP Authenticate Password -- always blank, see yealinkConfigFor's rationale above (HA1-only storage)
 		out += "<P47>" + serverAddressFor(serverIp, serverPort) + "</P47>\r\n";  // SIP Server[:port]
 		// Preferred vocoder 1/2 -- 0=PCMU, 8=PCMA, matching enforceG711()'s pair.
 		out += "<P57>0</P57>\r\n";

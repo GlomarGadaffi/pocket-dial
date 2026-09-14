@@ -127,8 +127,11 @@ TEST(ProvisioningConfig, GrandstreamConfigForProducesConfigVersion1RootAndAccoun
 	EXPECT_NE(cfg.find("<P35>101</P35>"), std::string::npos) << "SIP User ID: " << cfg;
 	EXPECT_NE(cfg.find("<P47>192.168.4.1</P47>"), std::string::npos)
 		<< "SIP Server, default port 5060 omitted: " << cfg;
-	EXPECT_NE(cfg.find("<P36></P36>"), std::string::npos)
-		<< "password field must be present but blank: " << cfg;
+	EXPECT_NE(cfg.find("<P36>101</P36>"), std::string::npos) << "SIP Authenticate ID: " << cfg;
+	EXPECT_NE(cfg.find("<P34></P34>"), std::string::npos)
+		<< "password field (P34) must be present but blank: " << cfg;
+	EXPECT_EQ(cfg.find("<P34>101</P34>"), std::string::npos)
+		<< "the extension must never land in the PASSWORD element (PR #224 review): " << cfg;
 	EXPECT_EQ(cfg.find("requires a SIP password"), std::string::npos)
 		<< "Open/Learn-mode config should not carry the auth warning";
 }
@@ -151,15 +154,16 @@ TEST(ProvisioningConfig, GrandstreamConfigForWarnsPasswordMustBeSetByHandWhenAut
 		/*authRequired=*/true);
 
 	EXPECT_NE(cfg.find("requires a SIP password"), std::string::npos) << cfg;
-	EXPECT_NE(cfg.find("<P36></P36>"), std::string::npos)
+	EXPECT_NE(cfg.find("<P34></P34>"), std::string::npos)
 		<< "still blank -- the server never has the plaintext to give out" << cfg;
 }
 
 TEST(ProvisioningConfig, GrandstreamConfigForEscapesXmlSpecialCharsInExtension)
 {
-	// '&' is reachable through isValidAor()'s charset and would otherwise break
-	// well-formedness (Advisor-flagged gap): unescaped, "1&2" inside <P35> stops
-	// being valid XML content at the '&'.
+	// '&' is NOT reachable through the live route today (isValidAor() admits
+	// only alnum + `.-_+*#`); this pins the defence-in-depth escaping of a pure
+	// function that a less-filtered caller could be wired to later. Unescaped,
+	// "1&2" inside <P35> would stop being valid XML content at the '&'.
 	std::string cfg = provisioning::grandstreamConfigFor("1&2", "192.168.4.1", 5060,
 		/*authRequired=*/false);
 
