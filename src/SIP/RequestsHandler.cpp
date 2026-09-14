@@ -4650,6 +4650,42 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		if (original->isAnchor() || original->isAnchorInbound()) transferee = nullptr;
 	}
 
+	// A REFER landing on a dialog that has ALREADY been transferred once. Two ways
+	// to get here, needing opposite answers, and neither is "do it again":
+	//
+	//   * a retransmit, because the transferor's 202 was lost. Running the branch
+	//     below a second time would invite the target twice, BYE a party that is
+	//     already gone, and overwrite setPeerCallID() — orphaning the first leg,
+	//     which then rings on with nothing tracking it. Re-send the 202 that went
+	//     missing and stop; the transfer itself is already done.
+	//   * the SURVIVOR chaining a further transfer. The derivation above cannot
+	//     serve that: src/dest still name the ORIGINAL pair, so "the party that is
+	//     not the transferor" resolves to the transferor already dropped, and the
+	//     real far end is on the other Call-ID entirely. Declining is the honest
+	//     answer — transferring the wrong party while reporting success is #197.
+	if (original && original->isTransferBridge())
+	{
+		auto dropped = original->wasTransferorSrc() ? original->getSrc() : original->getDest();
+		const bool isRetransmit = dropped && dropped->getNumber() == transferor->getNumber();
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader(isRetransmit ? std::string(SipMessageTypes::ACCEPTED)
+			: std::string("SIP/2.0 603 Decline"));
+		response->clearBody();
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		if (isRetransmit)
+		{
+			response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
+		}
+		else
+		{
+			queueLog("REFER: transfer of an already-transferred leg declined — "
+				"the far end is on another dialog", true);
+		}
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		return;
+	}
+
 	if (!transferee || transfereeSdp.empty())
 	{
 		// There is no leg to move. Either the REFER names no dialog this PBX knows
@@ -4782,8 +4818,11 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	legSession->setInviteMessage(inviteToTarget);
 	legSession->setPeerCallID(callID);
 	// Our own side of the leg's dialog now; the target's To-tag is stamped in when
-	// it answers (handleBlindXferOk) — it does not exist yet.
-	legSession->setDialogHeaders(legFrom, std::string());
+	// it answers (handleBlindXferOk) — it does not exist yet. Stored WITH the header
+	// name, the convention every other setDialogHeaders() caller follows (they pass
+	// data->getFrom(), which is the whole line) and what the stripHeaderName() in
+	// buildServerBye and the ACK builders expects to be handed.
+	legSession->setDialogHeaders("From: " + legFrom, std::string());
 	_sessions.emplace(legCallID, legSession);
 
 	// ── The A-B dialog SURVIVES, as the transferee's half of the bridge. This is

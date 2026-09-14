@@ -8,8 +8,11 @@
 // the sender, so any registered phone could put someone else's Call-ID on a
 // REFER and:
 //
-//   * blind path — endCall() the victim's session and (since #128) send the
-//     victim's peer a BYE built from the attacker's own tags; or
+//   * blind path — hang the victim's own leg up and splice the victim's peer
+//     away to an attacker-chosen target, with the BYE built from the
+//     attacker's own tags (before #197 it was the peer that was hung up on
+//     and the victim that was dialled through — either way, someone else's
+//     call rearranged by a stranger); or
 //   * attended path — name the victim's call as ?Replaces= and splice it.
 //
 // The attended path's own "A must be common to both dialogs" check is not a

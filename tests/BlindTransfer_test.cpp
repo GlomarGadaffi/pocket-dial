@@ -232,7 +232,6 @@ TEST(BlindTransfer, TransferorIsDroppedAndTheTransfereeIsMovedToTheTarget)
 		"100", transferorAddr, "atag", sdpBodyFor("10.1.1.1", 10001),
 		"106", transfereeAddr, "btag", sdpBodyFor("10.2.2.2", 20002));
 
-	const size_t before = sent.size();
 	handler.handle(makeRefer(callId, "100", transferorAddr, "atag", "106", "btag", "107"));
 
 	EXPECT_FALSE(findSentTo(sent, transferorAddr, "SIP/2.0 202 Accepted").empty())
@@ -274,8 +273,6 @@ TEST(BlindTransfer, TransferorIsDroppedAndTheTransfereeIsMovedToTheTarget)
 		<< "the transferee's dialog must not be torn down by the transfer";
 	EXPECT_TRUE(surviving.value()->isTransferBridge())
 		<< "it must be linked to the new leg so a later BYE reaches the right party";
-
-	(void)before;
 }
 
 // ── #197: the receptionist orientation ───────────────────────────────────────
@@ -775,6 +772,13 @@ TEST(BlindTransfer, TargetRefusalIsAckedAndTheTransfereeIsReleased)
 
 	std::string ackToC = findSentTo(sent, targetAddr, "ACK sip:");
 	ASSERT_FALSE(ackToC.empty()) << "a non-2xx final to OUR INVITE must be ACKed";
+	// §17.1.1.3 also fixes the identities: the ACK repeats the INVITE's own From
+	// (the transferee the server stood in for) and carries the To as the target
+	// returned it, tag included.
+	EXPECT_NE(extractHeaderLine(ackToC, "From:").find("sip:106@"), std::string::npos)
+		<< ackToC;
+	EXPECT_NE(extractHeaderLine(ackToC, "To:").find("tag=ctag"), std::string::npos)
+		<< ackToC;
 	EXPECT_EQ(branchOf(extractHeaderLine(ackToC, "Via:")), inviteBranch)
 		<< "the ACK must travel in the INVITE's own transaction (same branch), or the "
 		   "target keeps retransmitting:\n" << ackToC;
@@ -895,6 +899,71 @@ TEST(BlindTransfer, PostTransferByeFromTheTransfereeReachesTheTarget)
 	ASSERT_FALSE(byeToC.empty()) << "the target must be told the call ended";
 	EXPECT_NE(byeToC.find(legCallId), std::string::npos)
 		<< "and told inside ITS OWN dialog, not the transferee's:\n" << byeToC;
+	// ...with that dialog's real identities in the right slots: From is the side
+	// the server impersonates (the transferee it stood in for), To is C's own
+	// tagged address. A phone drops a BYE whose From/To it does not recognise, so
+	// a Call-ID check alone would pass over a BYE C simply ignores.
+	EXPECT_NE(extractHeaderLine(byeToC, "From:").find("sip:106@"), std::string::npos)
+		<< byeToC;
+	EXPECT_NE(extractHeaderLine(byeToC, "To:").find("tag=ctag"), std::string::npos)
+		<< byeToC;
 	EXPECT_FALSE(handler.getSession(legCallId).has_value());
 	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value());
+}
+
+// A REFER retransmit (the transferor's 202 was lost — UDP, and a phone retries
+// until it sees one) must not run the transfer a second time. The A-B dialog is
+// by then the transferee's half of a bridge, so a second pass would invite the
+// target again, BYE a transferor already gone, and overwrite the bridge link,
+// leaving the FIRST leg orphaned: ringing, with nothing left pointing at it.
+TEST(BlindTransfer, ReferRetransmitIsAcceptedWithoutStartingASecondTransfer)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.39.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in transferorAddr = addrFor("192.168.39.10"); // A: 100
+	const sockaddr_in transfereeAddr = addrFor("192.168.39.20"); // B: 106
+	const sockaddr_in targetAddr     = addrFor("192.168.39.30"); // C: 107
+
+	handler.handle(makeRegister("100", "192.168.39.10", "reg-100j"));
+	handler.handle(makeRegister("106", "192.168.39.20", "reg-106j"));
+	handler.handle(makeRegister("107", "192.168.39.30", "reg-107j"));
+
+	const std::string callId = "blindxfer-197-retx";
+	connectCall(handler, sent, callId,
+		"100", transferorAddr, "atag", sdpBodyFor("10.1.1.1", 10001),
+		"106", transfereeAddr, "btag", sdpBodyFor("10.2.2.2", 20002));
+
+	const size_t beforeRefer = sent.size();
+	handler.handle(makeRefer(callId, "100", transferorAddr, "atag", "106", "btag", "107"));
+	handler.handle(makeRefer(callId, "100", transferorAddr, "atag", "106", "btag", "107"));
+
+	int invitesToTarget = 0, byesToTransferor = 0, acceptedToTransferor = 0;
+	for (size_t i = beforeRefer; i < sent.size(); ++i)
+	{
+		if (!sent[i].second) continue;
+		const std::string raw = sent[i].second->toString();
+		if (sent[i].first.sin_addr.s_addr == targetAddr.sin_addr.s_addr &&
+			raw.rfind("INVITE sip:107@", 0) == 0) ++invitesToTarget;
+		if (sent[i].first.sin_addr.s_addr == transferorAddr.sin_addr.s_addr)
+		{
+			if (raw.rfind("BYE ", 0) == 0) ++byesToTransferor;
+			if (raw.rfind("SIP/2.0 202", 0) == 0) ++acceptedToTransferor;
+		}
+	}
+	EXPECT_EQ(invitesToTarget, 1) << "the target must be invited exactly once";
+	EXPECT_EQ(byesToTransferor, 1) << "the transferor must be dropped exactly once";
+	// The retransmit is still answered — that is what stops the phone retrying.
+	EXPECT_EQ(acceptedToTransferor, 2) << "every REFER must get its own 202";
+
+	// Exactly one transfer leg exists, and it is still the one the bridge names.
+	std::string inviteToC = findSentTo(sent, targetAddr, "INVITE sip:107@");
+	ASSERT_FALSE(inviteToC.empty());
+	auto bLeg = handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(bLeg.has_value());
+	EXPECT_EQ(bLeg.value()->getPeerCallID(), extractHeaderLine(inviteToC, "Call-ID:"))
+		<< "the bridge must still point at the leg that was actually created";
 }
