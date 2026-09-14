@@ -48,6 +48,19 @@ dashboard to `192.168.4.1:80`.
 > effective hardening available on this device, because it encrypts all three at once.
 > See [THREAT_MODEL.md](THREAT_MODEL.md) §6.
 
+> [!IMPORTANT]
+> **On the `wifi`, `eth` and `lan8720` builds the SIP registrar does not start until
+> you complete step 3.** The boot task reads the provisioning flag, logs
+> `[boot] device unprovisioned — SIP stack held dark until credential committed`,
+> and polls every 2 seconds; the dashboard is up the whole time (that is how you
+> provision), but **no phone can register until the admin credential is replaced**.
+> If nothing is committed within 30 minutes the board reboots and starts the wait
+> over — a restart mid-setup is designed behaviour, not a crash. Do step 3 before
+> step 4, not after.
+>
+> The `display` build is **not** gated this way: it boots into its normal network
+> role and brings SIP up regardless of provisioning state.
+
 ### Turning on access-point security (WPA2)
 
 It is **off by default on purpose**: switching it on forces every phone already
@@ -86,6 +99,18 @@ device redirects all web traffic to its setup page so you can either join an exi
 Wi-Fi network (Station mode) or stay in Standalone AP mode.
 
 > [!NOTE]
+> The portal's choices are state-changing, so they take the same admin gate as
+> everything else: `POST /api/wifi/connect`, `POST /api/wifi/mode_ap` and
+> `POST /api/configuring` all run through `requireAdmin`, and all return
+> `403 {"error":"setup_required"}` while the board is still on `admin`/`admin`.
+> Log in and replace the credential (step 3) first. The two calls that still work
+> before setup completes are `POST /api/admin/login` (which does not go through
+> `requireAdmin` at all — it only checks same-origin) and
+> `POST /api/admin/set-credential` (the one path the `setup_required` refusal
+> exempts; it still needs the session cookie and CSRF token the login just handed
+> you).
+
+> [!NOTE]
 > The onboarding portal has a **5-minute decay watchdog** (`CAPTIVE_DECAY_SECONDS = 300`
 > in `main/esp_main_display.cpp`): if no configuration is confirmed within five minutes,
 > the device reboots into Standalone AP mode (`esp32-sipserver`) on its own. If your
@@ -97,6 +122,25 @@ W5500/LAN8720 builds (`SIP_TRANSPORT=eth`) are nodes on your wired LAN and obtai
 address via DHCP (with static fallback). There is no SoftAP; reach the dashboard at the
 device's LAN IP or at `pocketdial.local`. See [HARDWARE_SELECTION.md](HARDWARE_SELECTION.md)
 for board specifics.
+
+> [!NOTE]
+> These builds compile **without** `POCKETDIAL_HAS_WIFI` (`main/CMakeLists.txt`), so
+> the Wi-Fi routes are compiled out to a stub that answers
+> `501 {"error":"... not available on desktop"}` (issue #167).
+> `POST /api/wifi/connect` and `POST /api/wifi/mode_ap` do nothing here — there is
+> no Wi-Fi fallback into an `eth` board. If it drops off the wired LAN, recovery is
+> the serial console or a USB reflash, not a rescue AP.
+>
+> `POST /api/factory-reset` is the trap in that set: on these builds it **does** the
+> reset — clears the admin credential and DTMF PIN, `DeviceConfig`, the
+> Telephony-API slots, the DID table and the CDR ring — and *then* falls into the
+> same `501` arm and **does not reboot**. Do not read that `501` as "nothing
+> happened" and retry: `AdminAuth::clearCredential()` has already cleared the
+> stored *and* in-memory state and destroyed every session, so the board is on
+> `admin`/`admin` from that moment — it simply did not restart. Power-cycle it,
+> then redo first-use setup. Note the boot gate does **not** re-engage after a
+> factory reset: the `provisioned` flag in NVS `storage` is only ever set, never
+> erased, so SIP comes straight up on the default credential on that next boot.
 
 ---
 
@@ -118,7 +162,16 @@ You should see the retro CGA dashboard. It renders live data from
 [`GET /api/status`](API.md#get-apistatus): the server IP/port, uptime, processed/dropped
 packet counters, the list of registered extensions, and any active call sessions.
 
-If the page does not load, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#dashboard-unreachable).
+**The dashboard is always reachable.** The HTTP listener opens when the server is
+constructed and stays open for the life of the process, in every provisioning
+state — there is nothing to unlock, open, or dial first. (Firmware built before
+commit `de1a36e` did go dark once a PIN was set, reopened by a `*4887` DTMF
+star-code; that mechanism was **removed** and no longer exists in `src/`. If a
+colleague or an older runbook tells you to dial in to open the port, they are
+describing deleted firmware.) So a refused connection or a timeout here is
+**always a real fault** — wrong address, wrong network, or a board that has not
+finished booting. See
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#dashboard-unreachable).
 
 ---
 
@@ -132,13 +185,30 @@ If the page does not load, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#dashboard
 > session, and until you replace the default credential, the server refuses
 > everything else with `403 {"error":"setup_required"}` — "force setup on
 > first use," enforced by the firmware itself, not just suggested by the
-> dashboard (see [THREAT_MODEL.md](THREAT_MODEL.md) §5.1).
+> dashboard (see [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first)).
 
-The following state-changing endpoints require a valid `pd_session` cookie
-(else they return `401`) and, once logged in, a valid CSRF token (else `403`):
-`/api/kill`, `/api/wifi/connect`, `/api/wifi/mode_ap`, `/api/factory-reset`,
-`/api/telephony-config`, `/api/did-mapping`, and the OTA endpoints
-(`/api/ota/upload`, `/api/ota/reboot`).
+Every admin-gated route requires a valid `pd_session` cookie (else `401`), and
+**mutating** routes additionally require the session's CSRF token in an `X-CSRF`
+header (else `403`):
+
+* **Mutating (cookie + `X-CSRF`):** `/api/kill`, `/api/dnd`, `/api/forward`,
+  `/api/group`, `/api/dialplan`, `/api/wifi/connect`, `/api/wifi/mode_ap`,
+  `/api/configuring`, `/api/factory-reset`, `POST /api/ap-security`,
+  `POST /api/registrar`, `/api/registrar/device`, the `/api/telephony-config`
+  and `/api/did-mapping` writes, and the OTA endpoints (`/api/ota/upload`,
+  `/api/ota/reboot`).
+* **Read-gated (cookie only, no CSRF):** `GET /api/ap-security`,
+  `GET /api/registrar`, `GET /api/telephony-config`, `GET /api/did-mapping`,
+  `GET /api/pcap`, `GET /api/trace`, `GET /api/diagnostics/pcap`.
+* **Ungated, readable before you log in:** `GET /`, `GET /api/status`,
+  `GET /api/cdr`, `GET /api/wifi/scan`, `GET /api/ota/status`, and
+  `GET /api/admin/status` (which is how the dashboard decides whether to show you
+  the login form or the setup form).
+
+The forced-setup refusal sits on top of all of that: while `admin`/`admin` is
+still in place, **every one of the gated routes above — the read-only `GET`s
+included — returns `403 {"error":"setup_required"}`**, no matter that you have a
+valid session. `POST /api/admin/set-credential` is the only exemption.
 
 ### Log in and complete setup from the dashboard
 
@@ -174,7 +244,7 @@ Credential rules and behavior, from `src/Helpers/AdminAuth.{hpp,cpp}` and the th
 | Username | 1-32 chars, no whitespace/control characters (`kMinUsernameLength`/`kMaxUsernameLength`) |
 | DTMF admin PIN | Optional, 4-16 digits (`kMinDtmfPinLength`/`kMaxDtmfPinLength`); **no default** — the phone-keypad `*PIN#code` menu stays fully disabled until one is set |
 | Storage | Salted, iterated SHA-256 — 50,000 rounds, 128-bit random salt per secret (NVS keys `admin_user`/`admin_pw_salt`/`admin_pw_hash` for the login credential, `admin_pin_salt`/`admin_pin_hash` for the DTMF PIN — independent, so clearing/rotating one never touches the other) |
-| Brute-force lockout | 5 consecutive failed logins → 60-second lockout (`429`); auto-clears on a correct credential |
+| Brute-force lockout | 5 consecutive failed logins → 60-second lockout (`429`), doubling on each repeat lockout to a 16-minute cap (`kLockoutMs << kMaxLockoutShift`). Keyed **per client address** (8 least-recently-seen buckets), so ordinary fat-fingering by one client does not lock out another; a correct credential clears that client's counter. There is also an aggregate backstop — 20 failures across *all* clients trips the same escalating lockout globally (`kMaxFailedAttemptsGlobal`), so a determined attacker rotating source addresses can still stall logins. Counters are RAM-only — a power cycle clears them without touching the stored credential. |
 | Session token | ≥128-bit opaque, `HttpOnly` + `SameSite=Strict` cookie, 30-minute sliding expiry |
 
 > [!TIP]
@@ -202,7 +272,7 @@ registers against it with these settings:
 | Port | `5060` | UDP signaling port |
 | Transport | **UDP** | The engine only speaks UDP |
 | Username / Auth ID / extension | your choice, e.g. `1001` | The registrar keys clients by this extension (AOR) |
-| Password | (any / blank) | There is **no SIP digest authentication** today — the registrar accepts the REGISTER on the open link. See [THREAT_MODEL.md](THREAT_MODEL.md) S-3 |
+| Password | (any / blank) | The registrar **ships in `open` mode**, which accepts every REGISTER without a challenge, so whatever you type here is ignored. SIP digest auth *does* exist — `learn` (trust-on-first-use, MAC-locked) and `secure` (digest required for every provisioned extension) are selectable via `POST /api/registrar` once you are logged in. The mode is stored as `reg_mode` in NVS namespace **`pbxcfg`**. See [THREAT_MODEL.md](THREAT_MODEL.md) S-3 |
 | Codec | **G.711 only** — µ-law (PCMU, payload 0) and a-law (PCMA, payload 8), plus telephone-event (101) | The server rewrites SDP to `0 8 101` via `enforceG711()` |
 | Registration expiry | up to `3600` s | `DEFAULT_EXPIRES`/`MAX_EXPIRES`; higher requests are capped to 3600 |
 
@@ -228,6 +298,14 @@ call later. Per-client walkthroughs and known quirks are in
 > The registrar pings each registered client with a SIP `OPTIONS` keepalive every 5
 > seconds and prunes a client after ~15 seconds of silence (`RequestsHandler.cpp`). A
 > phone that does not answer OPTIONS may be dropped from the registrar.
+
+> [!TIP]
+> **If nothing registers at all** on a `wifi`, `eth` or `lan8720` build, check that
+> you finished step 3 first. Those builds hold the SIP stack down until an admin
+> credential is committed — port 5060 is simply not listening yet, while the
+> dashboard on port 80 answers normally. `idf.py monitor` shows
+> `[boot] waiting for admin credential...` every couple of seconds when this is
+> what is happening.
 
 ---
 
@@ -276,6 +354,9 @@ registered extension** at once, injecting auto-answer headers; the first device 
 - [ ] Logged in with the default credential (`admin`/`admin`) and completed setup
       via `/api/admin/set-credential` (real username + password ≥8 chars).
 - [ ] Logged in with the new credential (`/api/admin/login`) before using any gated control.
+- [ ] (`wifi`/`eth`/`lan8720` only) Confirmed the SIP stack came up **after** setup —
+      it is held down until the credential is committed, so this must precede the
+      registration steps below.
 - [ ] First softphone/IP phone registered: server `192.168.4.1:5060`, **UDP**, **G.711**,
       extension e.g. `1001`.
 - [ ] Second extension registered (e.g. `1002`).

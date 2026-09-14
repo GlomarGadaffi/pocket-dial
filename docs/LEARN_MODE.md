@@ -20,9 +20,21 @@ The registrar mode is a runtime setting (NVS-backed, chosen at onboarding and ch
 from the dashboard's *Extension Registration & Onboarding* panel, or `POST /api/registrar`).
 It controls how a REGISTER is treated.
 
-On a headless board, the browser flasher's flash-time configuration panel is the practical
-route: it is the only place to pick a mode before first boot, since a provisioned board's
-HTTP plane goes dark and the `*4887` star-code that reopens it is not reliable.
+There are two routes to it, and which one you want depends on whether the board is already
+on a network you can reach:
+
+- **The dashboard** (*Extension Registration & Onboarding* panel, or `POST /api/registrar`
+  directly) — for any board you can reach over HTTP. **The dashboard is always reachable
+  on its port.** The HTTP listener opens at boot and never closes; there is no
+  dark-by-default admin plane and no `*4887` star-code to reopen one — both were removed,
+  along with the bounded admin-open window and `POST /api/admin/keepalive`. If the
+  dashboard refuses your connection, that is a genuine fault (wrong address, wrong
+  network, or a board that never finished booting), not a gate you need to open. You do
+  need to **log in**, and on an unclaimed board you must replace the default credential
+  first — see §3, Step 0.
+- **The browser flasher's flash-time configuration panel** — the only way to pick a mode
+  *before first boot*, which matters on a headless board you are about to deploy somewhere
+  you would rather not visit twice.
 
 > [!IMPORTANT]
 > **That panel only works from firmware v1.4.1 onward.** On v1.3.0 and v1.4.0 the seed's
@@ -72,11 +84,22 @@ plainly in [THREAT_MODEL.md](THREAT_MODEL.md) §9.
 ## 3. The cutover sequence
 
 > Do this on a **trusted link** (ideally WPA2 on the SoftAP, or a trusted wired segment),
-> with the box's admin PIN already set. Keep the adoption window short.
+> with the box's admin credential already claimed. Keep the adoption window short.
 
 ### Step 0 — Prepare
 - [ ] pocket-dial powered, on the **same L2 segment** as the existing phones.
-- [ ] Admin PIN set (first onboarding step — see [ONBOARDING.md](ONBOARDING.md)).
+- [ ] **Admin credential claimed.** The board ships with a known default login
+      (`admin`/`admin`) and refuses every other admin action — including
+      `GET /api/registrar` — with `403 {"error":"setup_required"}` until you replace it
+      via `POST /api/admin/set-credential`. Log in with the default, set a real
+      username + password (8-character minimum), and only then touch the registrar. See
+      [ONBOARDING.md](ONBOARDING.md). *(This is a login credential, not a PIN — the
+      numeric DTMF PIN is a separate, optional secret for the phone-keypad admin menu and
+      is not involved in any of this.)*
+      On the `wifi`, `eth` and `lan8720` builds this is not optional in a second sense:
+      the SIP stack is held down at boot until a credential is committed, so **no phone
+      can register and adoption cannot begin** until you have done it. The `display`
+      build is deliberately not gated this way.
 - [ ] You know the current extension list and which phone is which (you will verify MACs).
 - [ ] Link is trusted: WPA2 SoftAP or a segmented/trusted wired LAN. Avoid an open AP for
       the window if you can ([THREAT_MODEL.md](THREAT_MODEL.md) §9, TOFU-window risk).
@@ -97,10 +120,10 @@ the box trusts the first device to claim an extension on the LAN.
 > "re-register") to adopt it immediately rather than waiting for its lease to lapse.
 
 ### Step 3 — Verify the adopted roster
-Open the **devices / registrar view on the web dashboard** (on a provisioned device the
-dashboard is dark by default — open it first via the `*4887` DTMF trigger or your
-provisioning grace window; see THREAT_MODEL.md §5.5). Confirm every expected phone
-appears with the right **MAC · extension ·
+Open the **devices / registrar view on the web dashboard** — it is reachable at any time
+(the listener is never gated; see [THREAT_MODEL.md](THREAT_MODEL.md) §5.5), you just need
+a logged-in session, and `GET /api/registrar` is one of the reads that requires one.
+Confirm every expected phone appears with the right **MAC · extension ·
 state** (`LEARNED` / `ONLINE`). **This is the trust-on-first-use checkpoint — verify it
 before you secure anything.** If a MAC is blank, see §2 (first-packet caveat); wait one
 cycle. If an *unexpected* MAC adopted an extension, you have a rogue/duplicate device on
@@ -275,4 +298,4 @@ to deliver the new secret.
 - [THREAT_MODEL.md](THREAT_MODEL.md) §9 — the auth-surface analysis (digest, TOFU window, MAC-lock, secret-at-rest, mode transitions).
 - [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) §3.3 — SIP digest auth and WPA2 priorities.
 - [PROVISIONING.md](PROVISIONING.md) — the per-MAC secret store and the M2 auto-reprovision path.
-- [ONBOARDING.md](ONBOARDING.md) — first-boot setup and admin-PIN provisioning.
+- [ONBOARDING.md](ONBOARDING.md) — first-boot setup and replacing the default admin credential.

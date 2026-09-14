@@ -110,13 +110,48 @@ and sizes (that is a stated contract in `partitions.csv`'s own header). Neither
 `idf.py flash` nor the `esptool` command above writes `cfgseed`; it is left
 erased (`0xFF`), which the firmware treats as "no seed" and ignores. See §5.
 
+### First boot — what you will actually see
+
+Nothing about the dashboard is hidden, gated at the transport, or delayed. As soon
+as the board is up:
+
+* **The HTTP dashboard answers on its port immediately**, in every state,
+  provisioned or not. The listener opens when `HttpServer` is constructed and stays
+  open for the life of the process. Firmware built before commit `de1a36e` went
+  **dark** once a PIN was set and was reopened by dialling `*4887` from the admin
+  extension; **that entire mechanism was removed** — `grep -rn 4887 src/` returns
+  nothing. A **connection refused is therefore always a genuine fault** (wrong
+  address, wrong network, board still booting), never an expected gate to open.
+* **The login is `admin` / `admin`** — a username and a password, not a PIN. It
+  ships well-known on purpose, so first contact needs no out-of-band secret.
+* **You must replace it before anything else works.** While the default credential
+  stands, every admin-gated route — read-only `GET`s included — returns
+  `403 {"error":"setup_required"}`. The single exception is
+  `POST /api/admin/set-credential`. That covers OTA, factory reset, Wi-Fi changes,
+  registrar mode and AP security.
+* **On the `wifi`, `eth` and `lan8720` builds the SIP registrar does not start at
+  all until a credential is committed.** The boot task logs
+  `[boot] device unprovisioned — SIP stack held dark until credential committed`
+  and polls every 2 s; no phone can register until you finish setup. If nothing is
+  committed within 30 minutes the board reboots and begins the wait again — a board
+  that restarts on you mid-setup is behaving as designed, not crashing. The
+  `display` build is **not** gated this way: it boots into its normal network role
+  and brings SIP up regardless.
+
+The exact `curl` calls are in
+[SETUP_GUIDE.md §3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first).
+
 ### Migration note (single-`factory` → dual-OTA)
 
 If the board previously ran a single-`factory` image, the partition layout
 changes. The `nvs` partition stays at `0x9000`/`0x6000`, so saved Wi-Fi
-credentials and the admin PIN *can* survive — but a full chip erase
-(`esptool.py -p COM3 erase_flash`) wipes them. After a migration flash, expect
-to re-onboard Wi-Fi and re-set the admin PIN.
+credentials and the stored admin credential *can* survive — but a full chip erase
+(`esptool.py -p COM3 erase_flash`) wipes them. After a migration flash that lost
+NVS, expect to re-onboard Wi-Fi and to go through first-use setup again: the device
+falls back to the built-in `admin`/`admin` login and refuses every other admin
+action until you replace it. The *separate* DTMF admin PIN (the phone-keypad
+`*PIN#code` menu secret — unrelated to the web login) is erased with it, and has no
+default, so that menu is disabled until you set one again.
 
 ### Migration note (adding `cfgseed`)
 
@@ -140,27 +175,40 @@ the browser flasher's *Full flash* mode does in one operation.
 ## 4. Updating over-the-air (after the first USB flash)
 
 Once a device is running an OTA-capable build, push new firmware without a
-cable. On a device with a PIN set, OTA upload needs **two** things from the
-admin session: the `pd_session` cookie *and* the session's `X-CSRF` token, which
-`POST /api/admin/login` returns in its JSON response.
+cable. OTA upload always needs **two** things from the admin session — there is no
+unauthenticated path in any provisioning state: the `pd_session` cookie *and* the
+session's `X-CSRF` token, which `POST /api/admin/login` returns in its JSON
+response.
 
 > [!IMPORTANT]
-> Once a PIN is set, the HTTP port is **dark** except inside a bounded admin-open
-> window. Open one by dialling `*4887` from the registered admin extension before
-> you expect any of this to connect — `POST /api/admin/keepalive` only *extends*
-> an already-open window, so it cannot get you back in. See
+> **Finish first-use setup before attempting an OTA.** While the board is still on
+> the shipped `admin`/`admin` credential, `POST /api/ota/upload` and
+> `POST /api/ota/reboot` return `403 {"error":"setup_required"}` like every other
+> admin-gated route — only `POST /api/admin/set-credential` is exempt. See
+> [SETUP_GUIDE.md §3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first).
+>
+> **The port itself is not a gate.** The HTTP listener is open from boot in every
+> state. Earlier firmware went dark once a PIN was set, was reopened by dialling
+> `*4887` from the registered admin extension, and had a
+> `POST /api/admin/keepalive` route to extend that window. **All of it was
+> removed**: there is no star-code, no bounded admin-open window, and no
+> `keepalive` route in `src/` any more. If a connection is refused, the fault is
+> real — do not go looking for a window to open. See
 > [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first).
 
 ```bash
 DEVICE=http://192.168.4.1
 JAR=cookies.txt
 
-# 1. (If a PIN is set) log in, capturing the cookie AND the CSRF token
+# 1. Log in (always required), capturing the cookie AND the CSRF token.
+#    The credential is a username + password, not a PIN.
 LOGIN=$(curl -s -c "$JAR" \
      -H "Origin: $DEVICE" \
-     -X POST --data "pin=YOUR_PIN" \
+     -X POST --data "username=YOUR_USERNAME&password=YOUR_PASSWORD" \
      "$DEVICE/api/admin/login")
-# -> {"status":"ok","authenticated":true,"csrf":"3f2a...e91c"}
+# -> {"status":"ok","authenticated":true,"needsSetup":false,"csrf":"3f2a...e91c"}
+#    "needsSetup":true means the board is still on admin/admin, and the upload
+#    below will 403 setup_required until POST /api/admin/set-credential runs.
 
 CSRF=$(printf '%s' "$LOGIN" | sed -n 's/.*"csrf":"\([0-9a-f]*\)".*/\1/p')
 [ -n "$CSRF" ] || { echo "login failed: $LOGIN" >&2; exit 1; }
@@ -182,15 +230,23 @@ curl -s -b "$JAR" \
 
 > A script written against earlier firmware sends the cookie but no token, and
 > now gets `403 {"error":"missing or invalid CSRF token"}` on the upload and
-> reboot steps. Unprovisioned devices are unaffected — with no session there is
-> no token to check, so step 1 can be skipped entirely. **Set a PIN in
-> production**: an open AP with an ungated OTA endpoint is a remote-compromise
-> risk. Full walk-through and response codes: [OTA.md §3](OTA.md).
+> reboot steps. A script that skips step 1 altogether — which older firmware
+> tolerated on an unprovisioned device — now gets
+> `401 {"error":"authentication required"}`. **There is no ungated OTA endpoint any
+> more, in any state**, so the old advice to "set a PIN in production before
+> exposing OTA" no longer describes a choice you have. Full walk-through and
+> response codes: [OTA.md §3](OTA.md).
 
 The bootloader brings the new image up in a *pending-verify* state. The firmware
 confirms it automatically a few seconds after the SIP and HTTP servers come up
 (see [OTA.md](OTA.md) §4); if the new image crashes on boot, the bootloader rolls
 back to the previous slot — no bricking.
+
+> [!NOTE]
+> The dual-slot layout, the pending-verify confirmation and the rollback path are
+> all implemented, but the **full OTA cycle has never been run end to end on
+> hardware**. Treat your first wireless update as the test of it, and
+> keep a USB cable within reach.
 
 Check status any time:
 
@@ -278,9 +334,10 @@ bringup, so power-cycle the board to see it take effect.
 | Flash fails / garbage output | Lower baud (`-b 115200`), or hold **BOOT** while connecting to force download mode. |
 | Boots to old firmware after OTA | The new image failed verification and rolled back — check the serial log; rebuild and retry. |
 | Colors look wrong on the display | Confirm the `display` transport build (`CONFIG_LV_COLOR_16_SWAP=y` is set in `sdkconfig.defaults`). |
-| Wi-Fi creds / PIN lost after flashing | Expected after a full `erase_flash` or layout migration — re-onboard. |
-| Nothing happens on port 80 after setting a PIN | Working as designed: the listener is dark outside an admin-open window. Dial `*4887` from the registered admin extension. See [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first). |
-| `429 {"error":"too many failed attempts..."}` on login | The brute-force lockout is engaged (5 wrong PINs, doubling to 16 minutes). The counters are RAM-only — power-cycle the board to clear them without losing the PIN. |
+| Wi-Fi creds / admin credential lost after flashing | Expected after a full `erase_flash` or layout migration. The board is back on `admin`/`admin` and demands first-use setup again; the separate DTMF admin PIN is gone too. On `wifi`/`eth`/`lan8720` the SIP registrar stays down until you complete setup — see *First boot* in §3. |
+| Connection refused on port 80 | **Always a genuine fault** — wrong address, wrong network, or the board has not finished booting. The listener opens at construction and stays open in every provisioning state. The dark-by-default plane and the `*4887` reopen star-code were **removed**; there is nothing to "open" first. See [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first). |
+| `403 {"error":"setup_required"}` from any admin route | The board is still on the default `admin`/`admin` login. Until you replace it via `POST /api/admin/set-credential`, every other admin-gated route (`GET`s included) refuses. See [SETUP_GUIDE.md §3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first). |
+| `429 {"error":"too many failed attempts..."}` on login | The brute-force lockout is engaged: 5 consecutive wrong username/password attempts → 60 s, doubling on each repeat lockout to a 16-minute cap. It is keyed per client address, and a correct login clears that client's counter. The counters are RAM-only — power-cycling clears them without touching the stored credential. |
 | `403 {"error":"missing or invalid CSRF token"}` from a script | The script sends the session cookie but no `X-CSRF` header. Capture the token from the login response — §4. |
 | Flash-time settings had no effect | Either the panel's *Apply these settings to the board* box was left unchecked (the default), or the seed was written in *App only* mode onto a partition table that predates `cfgseed`. Redo it as a **Full flash** — §5. |
 | Phones can't associate after enabling WPA2 | Expected: WPA2 breaks every existing association. Re-pair each device with the generated passphrase (`GET /api/ap-security`, the serial log, or the display). |
