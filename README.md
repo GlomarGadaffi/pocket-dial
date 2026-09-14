@@ -230,7 +230,10 @@ required) — but you must turn one on. See [docs/LEARN_MODE.md](docs/LEARN_MODE
 What is on by default:
 
 - **Username + password on the dashboard**, with forced credential setup on first
-  boot, per-client brute-force lockout, server-side sessions and CSRF tokens
+  boot, brute-force lockout with exponential backoff, server-side sessions and CSRF
+  tokens. (The lockout is currently **global, not per-client** — the per-IP key is
+  computed but never reaches the login path, so one guesser can lock out the real
+  admin. See [THREAT_MODEL.md](docs/THREAT_MODEL.md) D-3.)
 - **SDP admission gate** — every SDP body is structurally checked before any
   decoder runs or it is relayed onward
 - **Per-source-IP rate limiting** on the SIP socket (token bucket, burst 40 / 20 pps

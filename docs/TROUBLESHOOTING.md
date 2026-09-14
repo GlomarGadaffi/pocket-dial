@@ -180,17 +180,19 @@ reachable, so you have as long as you need.
    [Forgot the admin password](#forgot-the-admin-password) — that path is a re-flash.
 
 > [!IMPORTANT]
-> **Do not reach for `POST /api/factory-reset` to reopen the registrar — on a device it
-> does not work.** `DeviceConfig::clearAll()` *intends* to clear `reg_mode` (the comment at
-> `src/Helpers/DeviceConfig.cpp:634-641` says so explicitly, and that is the one state most
-> worth rescuing), but the erase is issued on the **`storage`** namespace
-> (`DeviceConfig.cpp:628`) while `Registrar::loadMode()`/`persistMode()` read and write
-> `reg_mode` in **`pbxcfg`** (`src/SIP/Registrar.cpp:35-40, 51-58`;
-> `pbxpersist::kNvsNamespace`, `src/SIP/PbxPersist.hpp:16`). The key the reset deletes is
-> not the key the registrar reads — the same namespace mismatch as
-> [#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151), in the reset path this
-> time. **Verified by reading the source on 2026-09-13; not tested on hardware.** Use
-> `POST /api/registrar mode=open` instead, which does go through the registrar.
+> **Corrected: `POST /api/factory-reset` *does* clear `reg_mode`.** Earlier revisions of
+> this box said it did not — that the erase was issued on the `storage` namespace while
+> the registrar reads `pbxcfg`. That was a real bug and it was **fixed in
+> [#188](https://github.com/GlomarGadaffi/pocket-dial/issues/188)**:
+> `DeviceConfig::clearAll()` now calls `eraseRegistrarMode()` (`DeviceConfig.cpp:698`),
+> which opens `pbxcfg` — the same namespace `Registrar::loadMode()` reads — and the
+> comment at `DeviceConfig.cpp:685-697` records exactly this. Note the erase sits
+> *outside* the `storage` block on purpose, so it runs whether or not `storage` opened.
+> This file already stated the corrected behaviour further down, in the factory-reset
+> section; the two disagreed. **Source-verified; still not exercised on hardware.**
+>
+> `POST /api/registrar mode=open` remains the lighter-touch fix and is still the first
+> thing to try — it changes one setting instead of wiping the box.
 >
 > Factory reset also **re-arms the flash-time seed.** Dropping `cfgseed_gen` means the next
 > boot re-applies whatever the browser flasher wrote — which can include `regMode`
@@ -414,11 +416,21 @@ Two counters can produce it (`AdminAuth.hpp:60-82`, [THREAT_MODEL.md §5.2](THRE
 
 | Counter | Threshold | Cooldown |
 | :--- | :--- | :--- |
-| **Per-client** — keyed on the HTTP peer address, 8 least-recently-seen-evicted buckets | **5** consecutive failures (`kMaxFailedAttempts`) | 60 s (`kLockoutMs`), **doubling on each successive lockout**, capped at ~16 min (`kMaxLockoutShift = 4`) |
+| ~~**Per-client** — keyed on the HTTP peer address, 8 LRU buckets~~ **Effectively GLOBAL — see the note below the table.** | **5** consecutive failures (`kMaxFailedAttempts`) | 60 s (`kLockoutMs`), **doubling on each successive lockout**, capped at ~16 min (`kMaxLockoutShift = 4`) |
 | **Aggregate backstop** — across *all* clients | **20** consecutive failures (`kMaxFailedAttemptsGlobal`) | Same doubling ladder, also up to ~16 min; locks out **everyone** |
 
 What will surprise you:
 
+- **The "per-client" bucket is not actually per-client.** `AdminAuth` implements per-client
+  buckets and `HttpServer::handleClient()` even computes `peerIp` for them
+  (`HttpServer.cpp:247-263`), but that value is only ever stored on the OTA request
+  (`:330`). `parseRequest()` never populates `req.clientIp`, so `sendApiAdminLogin` hands
+  `isLockedOut()` and `verifyCredential()` an **empty string** (`:2720`, `:2729`, `:2732`)
+  and every failure — web login and DTMF PIN alike — lands in the one unkeyed bucket. **In
+  practice there is a single global lockout**, so one guesser on the link can lock the real
+  admin out after five wrong passwords, which is exactly what the per-client design was
+  meant to prevent. Plan recovery around that (power-cycle clears it; see below), and see
+  [THREAT_MODEL.md](THREAT_MODEL.md) D-3.
 - **The cooldown does not reset the failure budget.** The trip count survives it, so a
   second lockout is 2 min, a third 4 min, and so on. Repeatedly retrying while locked out
   does not extend it, but each fresh set of 5 wrong passwords does.
@@ -492,12 +504,19 @@ What a factory reset actually clears (`HttpServer::sendApiFactoryReset`,
   a wired board performed the whole wipe, then answered `501 {"error":"factory reset not
   available on desktop"}` and never rebooted. If you are reading an older capture, that
   `501` recorded a *completed* reset.
-- **The boot provisioning gate does re-engage.** `provisioned` is an in-RAM flag
-  (`AdminAuth.cpp:390`), not a stored latch — the gate reads `storage`/`admin_pw_hash`
-  from NVS directly (`AdminAuth.cpp:1054`), and that is exactly the key
-  `eraseCredentialLocked()` removes (`:621`). So a factory-reset board comes back on the
-  default credential *and* re-enters the hold-SIP-until-credential wait, like a virgin
-  board.
+- **The boot provisioning gate does NOT re-engage.** *(Corrected — this bullet previously
+  said the opposite, and it matters: it is the difference between a reset board that is
+  dark and one that is answering SIP.)* The gate is a **persisted latch**, not an in-RAM
+  flag: it reads the `storage`/`provisioned` **u8** key (`main/esp_main.cpp:346-358`, and
+  the same block in `esp_main_eth.cpp:587-598` / `esp_main_eth_lan8720.cpp:401-412`) and
+  writes it once a credential is committed (`esp_main.cpp:384-392`). **Nothing in the
+  reset path erases it** — `"provisioned"` appears only in `main/`, never in
+  `DeviceConfig::clearAll()` or `AdminAuth::eraseCredentialLocked()`. The earlier bullet
+  confused `AuthState::provisioned` (an in-RAM field in `AdminAuth.cpp`) with the NVS key
+  of the same name. So a factory-reset board comes back **on the default `admin`/`admin`
+  credential with the SIP stack already running** — it does not re-enter the hold. Treat a
+  reset board as live and claim its credential immediately. A bare NVS erase
+  (`erase_region 0x9000 0x6000`) *does* drop the latch and restore virgin behaviour.
 - **It re-applies the flash-time seed.** Dropping `cfgseed_gen` is deliberate — "factory"
   means *as flashed*, not *as hardcoded* (`DeviceConfig.hpp`). If the browser flasher wrote
   an AP passphrase, a Wi-Fi mode or a registrar mode into `cfgseed`, the next boot applies

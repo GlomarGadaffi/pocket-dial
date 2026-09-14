@@ -71,8 +71,12 @@ Two consequences you must plan around:
 - **First-packet timing caveat.** The ARP entry for a phone may not exist yet on its
   *very first* packet. pocket-dial resolves the MAC a beat later (after the initial
   exchange / keepalive `OPTIONS`) and retries; a phone can therefore show up momentarily as
-  adopted-without-MAC and resolve on the next registration cycle. If a device's MAC reads
-  blank on the roster, wait one registration interval and re-check before acting.
+  adopted-without-MAC and resolve on the next registration cycle. **Corrected: that state
+  cannot occur.** On an ARP miss `admitLearn()` accepts the REGISTER but adopts *nothing*
+  (`Registrar.cpp:145-153`), and the MAC is the device map's key (`Registrar.hpp:126`), so a
+  row with a blank MAC cannot exist — the phone is simply **absent** from the roster until a
+  cycle where ARP resolves. Wait one registration interval and re-check; look for a missing
+  row, not a blank one.
 
 **Implication for the lock:** because the lock is keyed on a MAC learned from ARP, it is a
 *trust-the-LAN* control, not a cryptographic one. ARP/MAC can be spoofed on a hostile L2.
@@ -130,6 +134,37 @@ cycle. If an *unexpected* MAC adopted an extension, you have a rogue/duplicate d
 the segment — stop, investigate, and forget it (§6) before proceeding.
 
 ### Step 4 — Assign / rotate per-extension secrets
+
+> [!CAUTION]
+> **STOP. This step cannot be carried out on any current build, and the two steps after
+> it depend on it.** There is **no way to set a per-extension SIP secret** —
+> `SipSecretStore::setSecret()`, `generateSecret()` and `clearSecret()`
+> (`src/Helpers/SipSecretStore.cpp:171,230,307`) have **zero callers** outside the test
+> suite. There is no HTTP route (the full route table is `HttpServer.cpp:457-760`), no
+> field on the dashboard (the only "secret" input in `index_html.h` is the 3CX
+> telephony API key), no serial console, and `cfgseed` cannot carry one (its flag set
+> is apSecure / apPsk / wifiMode / staCreds / regMode only,
+> `DeviceConfig.hpp:167-180`).
+>
+> The consequences follow all the way down:
+> * `Registrar::secure()` refuses and only logs when the extension has no secret
+>   (`Registrar.cpp:251-256`), so **Step 5 cannot mark any device Secured** — the API
+>   answers `404 {"error":"no adopted device matches that MAC or extension"}`, which
+>   names the wrong cause.
+> * `admitSecure()` rejects every REGISTER with *Extension Not Provisioned*
+>   (`Registrar.cpp:99-105`), so **flipping `reg_mode = 2` locks out the entire fleet**
+>   rather than securing it. The `409` guard on `POST /api/registrar mode=secure`
+>   (`HttpServer.cpp:2522-2541`) exists precisely to stop you doing this, and it will
+>   refuse unless you override it with `confirm=LOCKOUT`. **Do not override it.**
+>
+> The digest machinery itself is real and host-tested — `SipDigest`, the HA1 store, the
+> challenge path on both REGISTER and INVITE. What is missing is the one operator-facing
+> write path. Until it exists, `learn` mode (TOFU + MAC lock) is the strongest admission
+> mode that can actually be deployed, and this runbook stops at Step 3.
+
+*The rest of this section describes the intended design, for whoever wires up that write
+path — not a procedure you can follow today.*
+
 For each extension, **set or rotate a secret** from the config panel (M1: manual, on the
 web dashboard; M2 auto-reprovision is later — see §7). The box stores
 **HA1 = MD5(extension : realm : secret)** per extension — the recoverable-equivalent digest
@@ -142,6 +177,12 @@ for M1).
 > in [THREAT_MODEL.md](THREAT_MODEL.md) (§7 P2). Do not export or log secrets.
 
 ### Step 5 — Flip to Secure (per device, then the box)
+
+> [!CAUTION]
+> **Blocked by Step 4** — no device can be marked Secured while there is no way to set a
+> secret, and flipping the box to `reg_mode = 2` in that state is a full fleet lockout,
+> not a hardening step. Read Step 4's box before doing anything here.
+
 Mark each adopted device **Secured** once its new secret is on the handset and it
 digest-authenticates cleanly. A secured device is now **locked to its MAC**: a REGISTER for
 that extension from a *different* MAC is rejected (`403`/`401`). When every device is
@@ -253,11 +294,14 @@ A MAC change is indistinguishable, at the registrar, from a different device cla
 extension — so re-adoption is a deliberate admin action, by design.
 
 ### Rollback / forget
-- **Forget one device** — remove its `{MAC, ext, HA1}` record from the registry. The
-  extension is then unclaimed and can be re-adopted (in Learn) or simply left unregistered.
-- **Rotate instead of forget** — if you only need to change the secret (suspected leak),
-  rotate the secret without forgetting the MAC binding; the device re-authenticates with
-  the new secret, the lock stays.
+- **Forget one device** — removes its `{MAC, ext}` entry from the device registry
+  (`Registrar::forget()`, `Registrar.cpp:275-288`). The extension is then unclaimed and can
+  be re-adopted (in Learn) or left unregistered. **It does not remove the HA1.** The digest
+  credential lives in a separate NVS namespace (`sipauth`, `SipSecretStore.cpp:25`) and
+  survives a forget — so "forget" is not a credential revocation.
+- ~~**Rotate instead of forget**~~ — **not available.** There is no rotate path, for the
+  same reason Step 4 is blocked: nothing in the firmware calls
+  `SipSecretStore::setSecret()`. See the caution box in Step 4.
 - **Roll the whole box back to Learn/Open** — explicit admin mode change (logged, no silent
   downgrade). Reverts to the cutover posture; use only deliberately and re-secure promptly.
 
@@ -271,8 +315,8 @@ extension — so re-adoption is a deliberate admin action, by design.
 | Digest auth on REGISTER (challenge/verify) | **M1 (now)** | RFC 2617 (MD5); closes the open registrar. INVITE auth (407) is a follow-up. |
 | Learn-mode TOFU adoption keyed by MAC | **M1 (now)** | Unknown MAC adopted; recorded `{MAC, ext}`. |
 | Extension ↔ MAC lock (anti-spoof) | **M1 (now)** | Different MAC for a secured ext → reject. |
-| Set / rotate per-extension secret in config panel | **M1 (now)** | Manual entry on the handset; box stores HA1. |
-| **Auto-reprovision** (push new creds to the phone) | **M2 (later)** | Zero-touch cutover via the provisioning HTTP path (`/provision/{mac}.cfg`) + `check-sync`. Out of scope for M1 — see [PROVISIONING.md](PROVISIONING.md). |
+| Set / rotate per-extension secret in config panel | **NOT BUILT** | Listed as "M1 (now)" in earlier revisions; there is no route, no UI field and no console for it — `SipSecretStore::setSecret()` has no production caller. This is the gap that blocks Steps 4-5. |
+| **Auto-reprovision** (push new creds to the phone) | **M2 (later)** | Zero-touch cutover via the provisioning HTTP path + `check-sync`. The route shipped as **`GET /config/<mac>.cfg`** (`HttpServer.cpp:461-469`) — the `/provision/{mac}.cfg` form named in earlier revisions never existed; see [PROVISIONING.md](PROVISIONING.md). Note it still serves a blank password field, so it cannot complete a credential cutover on its own. |
 
 For M1, **the operator types the rotated secret into each handset.** M2 removes that step by
 auto-reprovisioning the phone over HTTP; until then, plan for a touch on each phone's web UI

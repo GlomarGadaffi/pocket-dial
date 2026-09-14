@@ -39,9 +39,9 @@ Use this matrix for rapid triage based on visible device indicators and active d
 | **Every API call rejected `403 setup_required`** | • `{"error":"setup_required"}`<br>• Even read-only routes refused<br>• `/api/admin/status` → `needsSetup:true` | • Board still on the shipped `admin`/`admin` default; forced first-use setup | • Log in `admin`/`admin`, then `POST /api/admin/set-credential` with a real username+password (§4.8) |
 | **API call rejected `403` CSRF** | • `{"error":"missing or invalid CSRF token"}`<br>• Script/`curl` that worked before | • Every mutating route requires the per-session `X-CSRF` header | • Capture `"csrf"` from the login response, resend with `-H "X-CSRF: …"` (§4.6) |
 | **Dashboard refuses connections** | • *Connection refused*, not `401`/timeout | • **A real fault** — the listener is unconditional; there is no window to reopen | • Verify the IP, that `http_dashboard` started in the serial log, and that nothing local filters port 80 (§6) |
-| **Login returns `429`** | • `{"error":"too many failed attempts…"}`<br>• Correct password also refused | • Per-client lockout (5 fails) or aggregate backstop (20 fails), **escalating** | • Wait it out (cooldown doubles per trip, caps ~16 min; only a correct login clears it), or power-cycle — the counters are in-RAM (§4.7) |
+| **Login returns `429`** | • `{"error":"too many failed attempts…"}`<br>• Correct password also refused | • Login lockout (5 fails) or aggregate backstop (20 fails), **escalating**. The lockout is **global, not per-client** (§4.7), so another host's guessing can lock you out | • Wait it out (cooldown doubles per trip, caps ~16 min; only a correct login clears it), or power-cycle — the counters are in-RAM (§4.7) |
 | **Port 5060 dead, port 80 alive, `wifi`/`eth`/`lan8720` board never configured** | • `[boot] device unprovisioned — SIP stack held dark…` in the serial log<br>• Board reboots every ~30 min | • Boot provisioning gate: SIP is not started until a credential exists (**not** on the `display` build) | • Complete setup over HTTP; watch for `[boot] credential set — unblocking SIP stack` (§8) |
-| **Whole fleet de-registers at once** | • Every handset "not registered"<br>• `GET /api/registrar` → `"mode":"secure"`, empty roster | • Registrar switched to `secure` before any extension was adopted/secured | • `POST /api/registrar mode=learn`; re-adopt, secure, then re-switch. **Do not use factory reset** — it cannot clear `reg_mode` (§4.3) |
+| **Whole fleet de-registers at once** | • Every handset "not registered"<br>• `GET /api/registrar` → `"mode":"secure"`, empty roster | • Registrar switched to `secure` before any extension was adopted/secured | • `POST /api/registrar mode=learn` — the light-touch fix, and the one to reach for. Factory reset also clears `reg_mode` since #188 (§4.3), but wipes far more. **Note: "re-adopt, secure, then re-switch" cannot currently be completed** — there is no way to set a per-extension secret, so no device can be marked Secured; see [LEARN_MODE.md](LEARN_MODE.md) Step 4 |
 | **Cannot join the SoftAP** | • Client prompts for a password<br>• Boot log `auth:WPA2-PSK` | • AP security enabled (dashboard or flash-time seed) | • Read the per-device passphrase from serial / LVGL / `GET /api/ap-security` (§7) |
 | **Watchdog Reset** | • Boot loops with `TG0WDT_SYS_RST`<br>• Logs showing `Task watchdog got triggered` | • Thread starvation on Core 1<br>• Infinite loop in SIP message parser | • Increase TWDT timeout in sdkconfig<br>• Add `vTaskDelay` yields in parsing loops |
 | **NVS / Credential Corruption** | • Core boot loops on `nvs_flash_init()` failure<br>• Constant boot loop back to factory SoftAP | • Flash sector wear-out<br>• Brownout mid-write (incomplete `nvs_commit`) | • Programmatic partition format on error<br>• Force sector erase with `esptool.py` |
@@ -373,18 +373,21 @@ up, so take the time to do it properly:
    (§2).
 
 > [!IMPORTANT]
-> **`POST /api/factory-reset` cannot rescue this — it does not clear `reg_mode`.** The
-> reasoning has changed since earlier revisions of this playbook, but the conclusion has
-> not. `DeviceConfig::clearAll()` *does* issue an erase of `reg_mode`, and its comment says
-> that is deliberately to rescue exactly this lockout
-> (`src/Helpers/DeviceConfig.cpp:634-641`) — but it issues it against the **`storage`**
-> namespace (`DeviceConfig.cpp:628`), while `Registrar::loadMode()`/`persistMode()` read and
-> write `reg_mode` in **`pbxcfg`** (`src/SIP/Registrar.cpp:35-40, 51-58`;
-> `pbxpersist::kNvsNamespace`, `src/SIP/PbxPersist.hpp:16`). The key deleted is not the key
-> read — the same namespace mismatch as [#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151),
-> in the reset path this time. **Verified by source reading on 2026-09-13; not tested on
-> hardware.** Factory reset also re-arms the flash-time seed, which can itself carry
-> `regMode`. Use `POST /api/registrar` or an NVS erase.
+> **Corrected: `POST /api/factory-reset` *does* clear `reg_mode`, so it can rescue this.**
+> Earlier revisions of this playbook said the erase was issued against the `storage`
+> namespace while the registrar reads `pbxcfg`. That was true, it was a real bug, and it
+> was **fixed in [#188](https://github.com/GlomarGadaffi/pocket-dial/issues/188)**:
+> `DeviceConfig::clearAll()` now calls `eraseRegistrarMode()` (`DeviceConfig.cpp:698`),
+> which opens `pbxcfg` — the namespace `Registrar::loadMode()` actually reads — and is
+> placed outside the `storage` block precisely so it runs regardless. The comment at
+> `DeviceConfig.cpp:685-697` records the fix. §3's own build-difference table already
+> stated the corrected behaviour; this box contradicted it.
+>
+> **Prefer `POST /api/registrar mode=learn` anyway** — it fixes the lockout without wiping
+> the credential, the DTMF PIN, `tapicfg`, `didmap` and `cdrlog`. Note that factory reset
+> also re-arms the flash-time seed, which can itself carry `regMode`, so a board *seeded*
+> `secure` comes back `secure`; clearing that needs a re-flash or an erase of the `cfgseed`
+> sector.
 
 > [!TIP]
 > **The `409` is a guard, not a fault.** `POST /api/registrar mode=secure` while no extension
@@ -461,7 +464,7 @@ re-login mints a **new** token — re-capture it, do not reuse the old one. `GET
 
 | Counter | Trips at | Cooldown |
 | :--- | :--- | :--- |
-| **Per-client** — keyed on the HTTP peer address, 8 LRU buckets | 5 consecutive failures (`kMaxFailedAttempts`) | 60 s (`kLockoutMs`), **doubling per successive trip**, capped ~16 min (`kMaxLockoutShift = 4`) |
+| ~~**Per-client** — keyed on the HTTP peer address, 8 LRU buckets~~ **Effectively GLOBAL.** The bucket machinery is per-client, but the key is never supplied: `req.clientIp` is only ever assigned on the OTA path (`HttpServer.cpp:330`), never by `parseRequest()`, so `sendApiAdminLogin` passes `""` (`:2720`, `:2729`) — the same unkeyed bucket the DTMF PIN uses | 5 consecutive failures (`kMaxFailedAttempts`) | 60 s (`kLockoutMs`), **doubling per successive trip**, capped ~16 min (`kMaxLockoutShift = 4`) |
 | **Aggregate backstop** — across all clients | 20 consecutive failures (`kMaxFailedAttemptsGlobal`) | Same doubling ladder, also up to ~16 min; locks out **everyone** |
 
 * **The trip count survives the cooldown.** The second lockout is 2 min, the third 4 min, and only a **correct login** clears either counter.
@@ -651,9 +654,11 @@ Being locked out now means one of four things. Work down the list.
    page. That clears the credential (and the DTMF PIN, and `tapicfg`/`didmap`/`cdrlog`) and
    returns the board to `admin`/`admin`. Note the caveats in
    [TROUBLESHOOTING.md](TROUBLESHOOTING.md#forgot-the-admin-password): it does **not** clear
-   `reg_mode` (§4.3), does **not** clear the `provisioned` boot latch, **re-arms** the
-   flash-time seed, and on an `eth`/`lan8720` board it answers `501` and does not reboot
-   after doing all of the clearing anyway (§3).
+   clear the `provisioned` boot latch and **re-arms** the flash-time seed. *(Two claims
+   that used to sit here are stale: it **does** clear `reg_mode` since #188, and it
+   **does** answer `200` and reboot on `eth`/`lan8720` since #189 — the reboot is guarded
+   on `ESP_PLATFORM`, not on the transport, `HttpServer.cpp:2424-2432`. §3's table is the
+   correct one.)*
 2. **If a DTMF admin PIN was set**, dialling `*<PIN>#9991` from the admin extension
    (`pbxcfg`/`admin_ext`, default `1001`) performs `nvs_flash_erase()` + restart
    (`src/SIP/DtmfFeatureCodes.cpp:155-180`). This needs the admin extension **registered**

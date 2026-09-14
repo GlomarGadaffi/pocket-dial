@@ -227,7 +227,7 @@ Because Flash Encryption is disabled by default, an attacker with physical acces
 
 | Plane | Shipped control |
 |---|---|
-| HTTP admin | Admin credential + server-side session (128-bit token, `HttpOnly`/`SameSite=Strict` `pd_session` cookie) on every mutating endpoint; per-client brute-force lockout with exponential backoff and an aggregate backstop; per-session CSRF token required in `X-CSRF`; same-origin checking; security response headers. All admission decisions go through one [`HttpServer::requireAdmin()`](../src/Helpers/HttpServer.cpp#L1828). |
+| HTTP admin | Admin credential + server-side session (128-bit token, `HttpOnly`/`SameSite=Strict` `pd_session` cookie) on every mutating endpoint; brute-force lockout with exponential backoff and an aggregate backstop (**global, not per-client** — the per-IP key is never supplied on the login path, `HttpServer.cpp:2720-2732`; see [THREAT_MODEL.md](THREAT_MODEL.md) D-3); per-session CSRF token required in `X-CSRF`; same-origin checking; security response headers. All admission decisions go through one [`HttpServer::requireAdmin()`](../src/Helpers/HttpServer.cpp#L1828). |
 | HTTP transport | ~~**Dark by default**: on a provisioned device the listen socket is not bound at all except inside a bounded window opened by a source-IP-verified DTMF code, a fresh-provisioning grace period, or an authenticated keepalive. An attacker usually cannot even reach the login endpoint.~~ |
 | SIP registrar | Digest authentication (RFC 2617, MD5, `qop=auth`) challenging `REGISTER`, with runtime-selectable `open` / `learn` / `secure` modes and a per-extension HA1 secret store. |
 
