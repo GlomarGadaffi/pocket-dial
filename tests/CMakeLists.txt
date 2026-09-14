@@ -76,6 +76,24 @@ add_executable(sip_parser_tests
     # Prometheus /metrics text-exposition format — content type, HELP/TYPE lines,
     # and that a monotonic counter is exported as a counter rather than a gauge.
     MetricsEndpoint_test.cpp
+    # Issue #159 (SMTP client), Phase 1: the pure protocol engine (base64,
+    # EHLO capability parsing, dot-stuffing, the chunked base64 attachment
+    # writer, the RFC 5322 date formatter) plus end-to-end coverage driven
+    # through the REAL plain-TCP transport (SmtpClient::SmtpTransport)
+    # against a scripted fake SMTP server on loopback -- greeting, every AUTH
+    # variant, 4xx/5xx handling at each step, DATA dot-stuffing on the wire,
+    # and timeouts. Ports 18130-18159 (see CONTRIBUTING_FIRMWARE.md's table).
+    SmtpDialogue_test.cpp
+    # RS256 JWT construction (Google service-account domain-wide delegation,
+    # issue #159's Gmail Workspace path) + signature verification against a
+    # fixed embedded test key -- OpenSSL host-side, mbedTLS on-device (see
+    # GoogleServiceAuth.cpp's platform split).
+    GoogleServiceAuth_test.cpp
+    # HTTP admin surface for the two files above: GET/POST /api/email
+    # (never echoes stored secrets, even authenticated) and POST
+    # /api/email/test, driven through a real HttpServer socket exactly like
+    # AdminHttpGate_test.cpp's other routes. Ports 18160-18169.
+    EmailHttp_test.cpp
     SipDigest_test.cpp
     # Issue #164 groundwork: the CLIENT half of digest auth. SipDigest_test
     # covers the registrar direction (build a challenge, verify an inbound
@@ -431,9 +449,53 @@ add_executable(sip_parser_tests
     # target. Needed by AdminHttpGate_test.cpp above.
     ../src/Helpers/HttpServer.cpp
     ../src/Helpers/OtaUpdater.cpp
+    # Issue #159 (SMTP client): the pure protocol engine (no sockets/TLS --
+    # see SmtpDialogue.hpp's header comment) and the real transport
+    # (plain-TCP identical on host/device; esp_tls only under ESP_PLATFORM --
+    # see SmtpClient.hpp). Both link into the host suite the same way
+    # RtpSender.cpp/TelephonyAnchorClient.cpp do.
+    ../src/Helpers/SmtpDialogue.cpp
+    ../src/Helpers/SmtpClient.cpp
+    # RS256 JWT construction + signing for the Workspace service-account
+    # XOAUTH2 path. Host-only crypto backend is OpenSSL (see this file's
+    # platform split and find_package(OpenSSL) below); ESP-only backend is
+    # mbedTLS, already a project dependency (main/CMakeLists.txt REQUIRES).
+    ../src/Helpers/GoogleServiceAuth.cpp
+    # NVS-backed (namespace "pbxcfg") SMTP/service-account configuration.
+    # Host-stubbed in-memory under !ESP_PLATFORM, same pattern as
+    # AdminAuth.cpp/DeviceConfig.cpp.
+    ../src/Helpers/EmailConfigStore.cpp
 )
 
 target_link_libraries(sip_parser_tests PRIVATE gtest gtest_main)
+
+# Issue #159: RS256 JWT signing on the host build uses OpenSSL (EVP_DigestSign)
+# rather than mbedTLS -- IDF v6.0.1 only ships mbedtls/private headers (see
+# SipDigest.hpp's identical reasoning for vendoring MD5 instead of depending on
+# them), and a full mbedTLS build is not otherwise part of the host toolchain.
+#
+# OPTIONAL, not REQUIRED -- see the matching block in the top-level
+# CMakeLists.txt for the full reasoning. Short version: `REQUIRED` here meant a
+# Windows/MSVC host build could not configure at all, on a platform
+# CONTRIBUTING_FIRMWARE.md lists as supported, because only ci.yml's Linux
+# runner installs libssl-dev.
+#
+# Without it, the five GoogleServiceAuthCrypto tests compile out and one
+# always-present test GTEST_SKIPs with an explanation, so the gap shows up in
+# the test log instead of looking like full coverage. The three
+# GoogleServiceAuthPure tests -- the JWT header/claims construction, which is
+# where the escaping and exact-shape bugs would live -- need no crypto and run
+# everywhere.
+find_package(OpenSSL)
+if (OpenSSL_FOUND)
+    target_link_libraries(sip_parser_tests PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(sip_parser_tests PRIVATE PD_HAVE_OPENSSL=1)
+else()
+    message(STATUS
+        "OpenSSL not found -- the GoogleServiceAuthCrypto tests (RS256 signature "
+        "verification, issue #159) will be skipped. Every other test still runs. "
+        "See CONTRIBUTING_FIRMWARE.md to install it.")
+endif()
 
 if (WIN32)
     target_link_libraries(sip_parser_tests PRIVATE wsock32 ws2_32)

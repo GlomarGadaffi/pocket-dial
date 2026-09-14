@@ -64,6 +64,7 @@
 #include "DeviceConfig.hpp"
 #include "LogQueue.hpp"
 #include "Syslog.hpp"
+#include "SmtpClient.hpp"
 
 // ── Tag for ESP_LOG ────────────────────────────────────────────────────────
 static const char* TAG = "SipServerLAN8720";
@@ -501,6 +502,10 @@ extern "C" void app_main(void)
             nvs_close(nvs_h);
         }
     }
+
+    // ── Email (issue #159): start the SMTP worker task before the dashboard ────
+    // that can queue sends into it. See the matching comment in esp_main_eth.cpp.
+    SmtpClient::init();
 
     // ── Launch HTTP dashboard on Core 0 (always — needed to provision) ─────────
     xTaskCreatePinnedToCore(&http_server_task, "http_dashboard", 8192, nullptr, 4, nullptr, 0);

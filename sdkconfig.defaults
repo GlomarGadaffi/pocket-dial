@@ -176,6 +176,52 @@ CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
+# Issue #159 (SMTP client): required to build the SMTP config's "insecure"
+# toggle at all. Leaving esp_tls_cfg_t's cacert_buf/crt_bundle_attach both
+# unset does NOT silently skip verification -- esp_tls_mbedtls.c hard-fails
+# the handshake (ESP_ERR_MBEDTLS_SSL_SETUP_FAILED, "No server verification
+# option set") unless this Kconfig symbol is on; it exists specifically to
+# gate that escape hatch at build time. Enabling it here does not itself make
+# any connection insecure: SmtpClient only reaches the VERIFY_NONE path when
+# the operator has explicitly turned on the per-account insecureSkipVerify
+# toggle (default OFF, documented LAN-relay-only -- see docs/API.md's
+# POST /api/email and docs/THREAT_MODEL.md). Every other esp_tls/
+# esp_http_client caller in this tree (TelephonyAnchorClient.cpp's WSS/HTTPS)
+# keeps supplying crt_bundle_attach and is unaffected.
+#
+# ESP_TLS_SKIP_SERVER_CERT_VERIFY itself `depends on ESP_TLS_INSECURE` (see
+# components/esp-tls/Kconfig) -- without also selecting that parent symbol,
+# kconfgen silently drops the child as "not visible (disabled dependency)"
+# and CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY never lands in sdkconfig at all,
+# so esp_crt_bundle-less connections would hard-fail instead of going
+# insecure. Caught by reading the `idf.py set-target` NOTE log, not by any
+# host test (this Kconfig gate has no host-testable equivalent).
+#
+# FLEET-WIDE FAILURE-MODE CHANGE, not a per-caller opt-in: the option's own
+# Kconfig help says esp-tls goes unverified "by default ... when no other
+# option regarding the server cert verification is opted in" -- i.e. this
+# symbol flips esp_tls from FAIL-CLOSED (a caller that forgets cacert_buf/
+# crt_bundle_attach hard-fails the handshake) to FAIL-OPEN (it silently
+# connects with no verification at all) for every esp_tls/esp_http_client/
+# esp_websocket_client consumer in this tree, not just SmtpClient. Audited
+# 2026-09-14 (issue #159): every current caller sets crt_bundle_attach or a
+# pinned cacert_buf --
+#   src/Helpers/GoogleServiceAuth.cpp   (esp_http_client, oauth2.googleapis.com POST)
+#   src/Helpers/SmtpClient.cpp          (esp_tls_cfg_t x2 -- both branch on
+#                                         insecureSkipVerify/caCertPem/crt_bundle_attach)
+#   src/SIP/TelephonyAnchorClient.cpp   (esp_websocket_client + esp_http_client x1 each)
+# -- and OtaUpdater.cpp does not use esp_https_ota / any network client at all
+# (it only writes bytes the dashboard already received over its own HTTP
+# server into the OTA partition, so it has no esp_tls_cfg_t to audit). A
+# FUTURE caller that omits verification config now connects silently
+# unverified instead of failing loudly at handshake time -- re-run this grep
+# and re-audit before merging any PR that adds a new esp_tls/esp_http_client/
+# esp_websocket_client consumer:
+#   grep -rn "esp_http_client_config_t\|esp_websocket_client_config_t\|esp_https_ota_config_t\|esp_tls_cfg_t" src/ main/
+#   grep -rn "crt_bundle_attach\|cacert_buf\|use_global_ca_store" src/ main/
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+
 # ── Heap corruption detection ────────────────────────────────────────────────
 # The two settings above cover the STACK. Until now the heap had nothing
 # (HEAP_POISONING_DISABLED, the IDF default), which was defensible when the

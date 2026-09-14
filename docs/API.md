@@ -261,8 +261,10 @@ When booting into onboarding mode, the device intercepts client browser check do
 > a default credential precisely so the gate can be unconditional from first boot.
 > Endpoints marked "None" are read-only and intentionally reachable without a session:
 > `/`, `/index.html`, `/api/status`, `/api/cdr`, `/metrics`, `/api/wifi/scan`,
-> `/api/ota/status`, `/api/admin/status` and `/config/<mac>.cfg`. That is the complete
-> list — **`/metrics` was missing from it** until this audit; it is ungated by a
+> `/api/ota/status`, `/api/admin/status`, `/config/<mac>.cfg` and, since issue #159,
+> `/setup/email` (the page SHELL only — every field on it is fetched from the gated
+> `GET /api/email`, same split as `/` itself vs. its own gated data endpoints). That is
+> the complete list — **`/metrics` was missing from it** until this audit; it is ungated by a
 > deliberate decision argued at `HttpServer.cpp:1120-1184` (a Prometheus scraper cannot
 > drive the login/CSRF handshake). Everything
 > else goes through `requireAdmin()` — except `POST /api/admin/login` and
@@ -312,6 +314,10 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
 | [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
 | [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image. Simulated (`200`, no-op) on desktop. |
+| [`/setup/email`](#get-setupemail) | `GET` | Low | None | Standalone SMTP-configuration page (own document, not part of the `/` SPA). Shell only — no data. |
+| [`/api/email`](#get-apiemail) | `GET` | Medium | Gated | Current SMTP configuration. Secrets redacted to `hasPassword`/`hasGsaKey` booleans. |
+| [`/api/email`](#post-apiemail) | `POST` | High | Gated (+ `X-CSRF`) | Saves SMTP host/port/mode/auth/credentials. Empty `pass`/`gsaKey`/`caPem` keeps the stored value. |
+| [`/api/email/test`](#post-apiemailtest) | `POST` | High | Gated (+ `X-CSRF`) | Sends a real test message and reports the structured `SmtpDialogue::ResultCode` inline. Always `200`; `ok` in the body is the real result. |
 
 ---
 
@@ -2510,6 +2516,155 @@ curl -s -X POST "http://$DEV/api/ota/reboot" \
 
 Covered by `test_api.sh` TC-OTA-05 (cross-origin → `403`), TC-OTA-06 (`200` or `409`
 same-origin) and TC-OTA-07 (the desktop stub must not exit the process).
+
+---
+
+### `GET /setup/email`
+
+Issue #159 (Phase 1). Serves the standalone SMTP-configuration page (own top-level
+document, **not** part of the `/` dashboard SPA — see `index_html.h`'s `PD_HTML_8`).
+The shell alone discloses nothing; every field it renders is fetched client-side from
+`GET /api/email` below, which IS gated. Same ungated-shell class as `GET /` itself
+(§4 E-2 in `docs/THREAT_MODEL.md`).
+
+* **Auth**: None — ungated, deliberately (see above).
+* **Response Status Codes**: `200 OK` always.
+
+### `GET /api/email`
+
+Current SMTP configuration, **with both secrets redacted to a boolean**: `hasPassword`
+and `hasGsaKey` report whether a value is stored, never the value itself. This is the
+same discipline `TelephonyApiConfig`'s `view()`/`secretSet` uses, for the same reason —
+issue #207's class of bug (an unauthenticated OR merely-authenticated read handing back a
+credential nothing legitimately needs to display) has bitten this project twice already
+(`/api/cdr`, the extension roster in `/api/status`).
+
+```json
+{
+  "host": "smtp.gmail.com",
+  "port": 465,
+  "mode": "tls",
+  "auth": "plain",
+  "user": "bot@example.com",
+  "from": "bot@example.com",
+  "to": "ops@example.com",
+  "gsaEmail": "",
+  "hasPassword": true,
+  "hasGsaKey": false,
+  "insecure": false,
+  "hasCaPem": false
+}
+```
+
+* `mode` — `tls` (implicit, port 465 by default) \| `starttls` (port 587 by default) \|
+  `plain` (port 25, **LAN-relay only** — see `insecure` below and
+  `docs/THREAT_MODEL.md`).
+* `auth` — `none` \| `plain` \| `login` \| `xoauth2-sa` (Google Workspace service-account
+  domain-wide delegation — `gsaEmail`/the stored `gsaKey` are used, `user`/`pass` are not).
+* `insecure` — skips TLS certificate verification entirely (`MBEDTLS_SSL_VERIFY_NONE` —
+  see `sdkconfig.defaults`'s `CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY` comment). Defaults
+  `false`. **Never enable this against a real mail provider** — it exists for a LAN relay
+  with a self-signed or absent certificate only.
+* **Auth**: Gated read — same-origin, session and completed setup, **no** `X-CSRF` (same
+  class as `/api/syslog`, `/api/registrar`: infrastructure detail, not public dashboard
+  data).
+* **Response Status Codes**: `200 OK` always (an unconfigured device reports every field
+  at its zero value); `401`/`403` as in §0.1.
+
+```bash
+curl -s "http://$DEV/api/email" -b "pd_session=$SESSION"
+```
+
+### `POST /api/email`
+
+| Param | Values | Effect |
+| :--- | :--- | :--- |
+| `host` | hostname | SMTP server. |
+| `port` | `1`-`65535` | Optional — defaults by `mode` (465/587/25) when omitted or empty. |
+| `mode` | `tls` \| `starttls` \| `plain` | Optional, keeps the stored value if omitted; `400` if present and not one of the three. |
+| `auth` | `none` \| `plain` \| `login` \| `xoauth2-sa` | Optional, keeps the stored value if omitted; `400` if present and not one of the four. |
+| `user` | string | `AUTH PLAIN`/`AUTH LOGIN` username. |
+| `pass` | string | `AUTH PLAIN`/`AUTH LOGIN` secret. **Submitted empty means "keep the stored password"** — this endpoint never re-displays a real secret for the client to diff against, so there is no other way to express "unchanged" (mirrors `PUT /api/telephony-config/<slot>`'s `secret` field). Explicitly *clearing* a stored secret (as opposed to replacing it with a new one) is not supported in Phase 1 — use a factory reset. |
+| `from` | address | Envelope/header `From:`. |
+| `to` | address(es) | Default recipient(s) for a test send with no explicit `to`; comma-separated for multiple. |
+| `gsaEmail` | address | Service-account email (domain-wide delegation `iss`). |
+| `gsaKey` | PEM | Service-account private key. **Same "empty = keep stored" rule as `pass`.** Stored as an NVS *blob* (not `nvs_set_str`) — a real RSA key PEM can exceed the ~4000 byte `nvs_set_str` cap. |
+| `caPem` | PEM | Optional custom server CA. Empty = use the built-in `esp_crt_bundle`. Same "empty = keep stored" rule, and also stored as a blob. |
+
+`gsaKey`/`caPem` are large-ish PEM text and go through `POST`'s ordinary **16 KB whole-body
+cap** (§1's payload limit) like every other field on this route — there is no streaming
+exception here the way OTA/MOH upload get one. A 2048-bit RSA key PEM percent-encoded is
+comfortably under that; a very large custom CA chain submitted alongside a large key in the
+same request could approach it. Submit them in separate saves if that ever matters.
+| `insecure` | `1`/`on` \| absent | Skip TLS certificate verification. See the `GET`'s field description. Absent/anything else = `false`. |
+
+Responds with the same redacted shape as the `GET` (`config` key).
+
+* **Request Content-Type**: `application/x-www-form-urlencoded`
+* **Response Status Codes**:
+  * `200 OK`: `{"status":"ok","config":{...}}`.
+  * `400 Bad Request`: invalid `mode`/`auth`/`port`.
+  * `401`/`403`: gates 1-4 as in §0.1.
+  * `500 Internal Server Error`: NVS persistence failed (ESP only).
+
+```bash
+# Gmail App Password preset, filled by the /setup/email page's dropdown
+curl -s -X POST "http://$DEV/api/email" \
+     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
+     --data-urlencode "host=smtp.gmail.com" --data-urlencode "port=465" \
+     --data-urlencode "mode=tls" --data-urlencode "auth=plain" \
+     --data-urlencode "user=you@gmail.com" --data-urlencode "pass=xxxxxxxxxxxxxxxx" \
+     --data-urlencode "from=you@gmail.com" --data-urlencode "to=ops@example.com"
+```
+
+### `POST /api/email/test`
+
+Sends a real test message through the SMTP client and reports the structured result
+inline — this **is** the "Send test message" button and the dashboard terminal's
+`email test <addr>` command; there is no separate code path for either. Runs through
+`SmtpClient::sendAndWait()`, i.e. the same bounded single-worker send queue a future
+voicemail-to-email consumer would use — never more than one send in flight, and never on
+a SIP thread (the HTTP per-connection thread blocks here, up to ~20 s, which costs that
+thread alone).
+
+| Param | Values | Effect |
+| :--- | :--- | :--- |
+| `to` | address(es) | Optional — falls back to the stored default `to` if omitted. |
+
+```json
+{ "ok": true, "resultCode": 0, "smtpReplyCode": 250, "error": "" }
+```
+
+* `resultCode` — `SmtpDialogue::ResultCode` as an integer (`0` = `Ok`); see
+  `src/Helpers/SmtpDialogue.hpp` for the full enum. Present on both success and failure so
+  the dashboard/terminal can show *which step* failed (`GreetingRejected`,
+  `AuthRejected`, `RcptToRejected`, `Timeout`, ...), not just "failed".
+  `1` = `InvalidConfig`, `2` = `ConnectFailed`, `3` = `TlsFailed`, `4` = `GreetingRejected`,
+  `5` = `EhloRejected`, `6` = `AuthNotSupported`, `7` = `AuthRejected`,
+  `8` = `MailFromRejected`, `9` = `RcptToRejected`, `10` = `DataRejected`,
+  `11` = `MessageRejected`, `12` = `Timeout`, `13` = `TransportError`.
+* `smtpReplyCode` — the server's last numeric SMTP reply, `0` if none was ever received.
+* `error` — human-readable detail: the server's own text where there was a reply, or a
+  local reason (e.g. "server did not advertise STARTTLS") where there wasn't.
+* **Always responds `200`** with `ok:false` on failure (no host configured, no recipient,
+  connect/auth/relay failure, timeout, ...) — a failed test send is an expected, common
+  outcome to report inline, not a server error. `500`/`503` are not used here.
+* **Request Content-Type**: `application/x-www-form-urlencoded`
+* **Response Status Codes**:
+  * `200 OK`: Always (see above); `ok` in the body is the real result.
+  * `401`/`403`: gates 1-4 as in §0.1.
+
+```bash
+curl -s -X POST "http://$DEV/api/email/test" \
+     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
+     --data-urlencode "to=you@example.com"
+```
+
+**Bench-unverified** (host-testable subset only — see `tests/SmtpDialogue_test.cpp`,
+`tests/GoogleServiceAuth_test.cpp`, `tests/EmailHttp_test.cpp`): real delivery via Gmail
+App Password, Workspace service-account XOAUTH2, and the `insecure`/custom-CA paths have
+not been exercised against a real mail provider or a real device. See the issue #159 PR
+for the full list.
 
 ---
 

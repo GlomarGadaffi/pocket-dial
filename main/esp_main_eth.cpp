@@ -64,6 +64,7 @@
 #include "LogQueue.hpp"
 #include "Syslog.hpp"
 #include "TimeSync.hpp"
+#include "SmtpClient.hpp"
 #if defined(PD_ETH_HAS_SD)
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive writer
 #endif
@@ -709,6 +710,15 @@ extern "C" void app_main(void)
             nvs_close(nvs_h);
         }
     }
+
+    // ── Email (issue #159): start the SMTP worker task before the dashboard ────
+    // that can queue sends into it. init() only stands up the bounded queue +
+    // PSRAM-backed worker task -- it does not touch the network itself, so it
+    // does not need to wait for the IP-acquired gate above. Every /api/email*
+    // route and the dashboard's "Send test message" button call
+    // SmtpClient::sendAndWait(), which is a silent "not initialised" failure
+    // without this.
+    SmtpClient::init();
 
     // ── Launch HTTP dashboard on Core 0 (always — needed to provision) ─────────
     xTaskCreatePinnedToCore(&http_server_task, "http_dashboard", 8192, nullptr, 4, nullptr, 0);

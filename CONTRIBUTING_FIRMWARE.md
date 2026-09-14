@@ -21,7 +21,7 @@ Before any PR can be merged into `main`, it must receive at least **two approval
 - [ ] **Checked Returns**: All NVS flash, driver registrations, and socket syscall return codes are explicitly checked and handled.
 - [ ] **No Unchecked Pointers**: Any pointer dereferencing has been pre-verified against `nullptr` (particularly in fallback/onboarding modes).
 - [ ] **Core Affinity Alignment**: Pinned tasks match the dual-core topology and do not unbalance Core 0/1 workloads.
-- [ ] **Gated HTTP Routes**: Every new route in `HttpServer::handleClient()` passes through `requireAdmin()`, with `needCsrf = true` for anything that mutates state. No route implements its own origin, session, or token check. *(This is the policy, not a description of the current tree: `/`, `/config/<mac>.cfg`, `/api/status`, `/metrics`, `/api/wifi/scan`, `/api/admin/status` and `/api/ota/status` are deliberately ungated, and login/logout call `requireSameOrigin()` directly. Each exception is argued in [THREAT_MODEL.md](docs/THREAT_MODEL.md) §4 E-2 — adding a new one means updating E-2 in the same PR.)*
+- [ ] **Gated HTTP Routes**: Every new route in `HttpServer::handleClient()` passes through `requireAdmin()`, with `needCsrf = true` for anything that mutates state. No route implements its own origin, session, or token check. *(This is the policy, not a description of the current tree: `/`, `/config/<mac>.cfg`, `/api/status`, `/metrics`, `/api/wifi/scan`, `/api/admin/status`, `/api/ota/status` and `/setup/email` are deliberately ungated, and login/logout call `requireSameOrigin()` directly. Each exception is argued in [THREAT_MODEL.md](docs/THREAT_MODEL.md) §4 E-2 — adding a new one means updating E-2 in the same PR.)*
 - [ ] **Gate by falling through, never by early `return`**: write the gate as `if (requireAdmin(...)) { ... }`, **not** `if (!requireAdmin(...)) return;`. The route chain in `handleClient()` ends in a single `closeSocket(clientSock)`, and an early `return` jumps straight over it — leaking a socket on every rejected request. Three MoH routes shipped with the early-return form and 14 unauthenticated requests took a board off the network ([THREAT_MODEL.md](docs/THREAT_MODEL.md) D-5).
 - [ ] **Central Response Path**: Buffered responses go out through `sendResponseWithHeader()` so the security headers (CSP, `X-Frame-Options`, `X-Content-Type-Options`, `Cache-Control`, `Referrer-Policy`) are emitted. New code does not write a response to the socket directly — there are **no exceptions left** — `sendRedirect()`'s captive-portal `302` used to hand-roll its own response, that was the bug, and it now routes through `sendResponseWithHeader()` too (`HttpServer.cpp:3115-3123`). Keep it that way.
 - [ ] **Partition Contract Intact**: `nvs`, `otadata`, `phy_init`, `ota_0` and `ota_1` keep their exact offsets and sizes in `partitions.csv`. Moving any of them breaks OTA compatibility with every deployed board.
@@ -206,18 +206,25 @@ void setupNetworkMode() {
 
 ## 5. Host Test Suite
 
-The gtest suite under `tests/` is the gate every PR clears before hardware is
-touched. It is currently **630 cases** by static count of `TEST`/`TEST_F` in
-`tests/*.cpp`, of which **628 run on Linux/WSL** — which is the number CI
-enforces and the number to quote in a commit message.
+touched. It is currently **799 cases** by static count of `TEST`/`TEST_F` in
+`tests/*.cpp`, of which **796 run on Linux/WSL** — which is the number CI
+enforces and the number to quote in a commit message. (This count merges
+issue #159's SMTP-client/JWT/HTTP suites with #186/#173's config-export and
+two-role suites, both landing around the same time — re-measured after the
+merge rather than carried forward from either PR alone.)
 
-The gap is not drift. `DidMapping_test.cpp` and `TelephonyApiConfig_test.cpp`
-each carry a `#if !defined(_WIN32) ... #else ... #endif` pair around their
-persistence tests, because `persist()` is in-memory only under `_WIN32` (no
-POSIX permission model, so the host fallback refuses to write a world-readable
-file). The POSIX arms hold 3 and 2 real cases; each Windows arm holds one
-`GTEST_SKIP` placeholder. So a POSIX host compiles out 2 and runs **628**, and
-Windows compiles out 5 and runs **625**. A static grep always reads 630.
+The gap is not drift, though the exact size of it is worth re-deriving rather
+than trusting the last committed sentence: `DidMapping_test.cpp` and
+`TelephonyApiConfig_test.cpp` each carry a `#if !defined(_WIN32) ... #else
+... #endif` pair around their persistence tests (`persist()` is in-memory
+only under `_WIN32`), and `GoogleServiceAuthCrypto_test.cpp` (issue #159)
+carries a `find_package(OpenSSL)`-conditional split — five real RS256 tests
+when OpenSSL is present (the case measured here), one `GTEST_SKIP` when it
+is not. A POSIX/WSL host with OpenSSL present runs **796** of the **799**
+statically-counted cases; a Windows-native build's exact count was not
+re-measured in this pass (its `_WIN32` persistence-test gap alone was 5 as
+of the previous measurement, before either the OpenSSL split or this PR's
+own test files existed) — re-verify it there before quoting a number.
 
 Quote a number you MEASURED. Every count in this file has been wrong at least
 once because someone carried forward the previous one — 310, then 506, then
@@ -240,6 +247,27 @@ ctest --test-dir build/tests --output-on-failure
   `tests/` subdirectory, so the CTest set lives there, not at the build root.
 * **Run it from WSL, not natively.** Several suites open real sockets; running
   them on Windows triggers firewall authorisation prompts.
+* **OpenSSL is optional, and only affects one thing.** Issue #159 added RS256
+  JWT signing for the Workspace service-account path; on the host build that
+  uses OpenSSL's `EVP_DigestSign` (the device uses mbedTLS, and IDF ships only
+  `mbedtls/private/*` headers, so there is no shared backend). CI's Linux
+  runner gets it from `libssl-dev`, and most Linux/WSL dev images already have
+  it.
+
+  If CMake cannot find it you get a `-- OpenSSL not found` status line at
+  configure, **not** an error: the build still configures, still compiles, and
+  still runs every test but the five `GoogleServiceAuthCrypto` ones, which
+  compile out in favour of a single `GTEST_SKIP` so the missing coverage shows
+  up in the ctest log rather than passing for green. The JWT header/claims
+  construction — where the escaping and exact-shape bugs would actually live —
+  is pure string work and is covered either way.
+
+  To get the full set: `apt install libssl-dev` (Debian/Ubuntu/WSL),
+  `brew install openssl` (macOS), or `vcpkg install openssl:x64-windows` plus
+  `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake` (Windows/
+  MSVC). This was briefly `find_package(OpenSSL REQUIRED)`, which meant a
+  Windows host build could not configure **at all** — worth knowing if you hit
+  a `Could NOT find OpenSSL` error on an older checkout.
 * Keep the count in this section current when you add or remove cases.
 
 ### HTTP test ports: pick from a disjoint block, never a bare literal
@@ -264,6 +292,8 @@ Current allocation:
 | `18125`-`18129` | `ServiceExtensions_test.cpp` |
 | `18130`-`18139` | `TwoRoleAuth_test.cpp` |
 | `18140`-`18159` | `ConfigExportImport_test.cpp` |
+| `18160`-`18169` | `EmailHttp_test.cpp` (auto-incrementing `_nextPort`) |
+| `18200`-`18229` | `SmtpDialogue_test.cpp` (fake SMTP server, raw sockets — not HttpServer, but still claims its own block; ~17 scripted-server tests via auto-incrementing `g_nextPort`, sized with headroom. Originally claimed 18130-18159 — renumbered here, at merge time, when that turned out to collide with the two rows above it, which claimed the same "next free block" independently and landed first. See #159's PR for the story; the lesson is in `SmtpDialogue_test.cpp`'s own header comment.) |
 | `19100`+ | `TelephonyConfigHttp_test.cpp` (auto-incrementing `_nextPort`) |
 | `193xx` | `ApiKillParse_test.cpp` (auto-incrementing `_nextPort`) |
 

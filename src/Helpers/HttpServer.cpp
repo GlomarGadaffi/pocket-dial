@@ -15,6 +15,14 @@
 #include "IPHelper.hpp"
 #include "UrlEncode.hpp"
 #include "Syslog.hpp"        // single source of truth for urlDecode (see below)
+// Issue #159 (SMTP client): SmtpDialogue is the pure protocol engine,
+// SmtpClient the real transport + bounded send queue, EmailConfigStore the
+// persisted "pbxcfg" config, GoogleServiceAuth the Workspace service-account
+// XOAUTH2 token path.
+#include "SmtpDialogue.hpp"
+#include "SmtpClient.hpp"
+#include "EmailConfigStore.hpp"
+#include "GoogleServiceAuth.hpp"
 // Issue #186 (config export/import): the digest-secret and mDNS/park-timeout
 // readers below need these two subsystems' EXISTING public accessors, exactly
 // like the includes above pull in DialPlan/TelephonyApiConfig/DidMapping/etc
@@ -527,11 +535,14 @@ void HttpServer::handleClient(int clientSock)
 		// about a read endpoint that had been ungated by analogy rather than by
 		// analysis -- so this takes the conservative side deliberately.
 		//
-		// Fall-through form (CONTRIBUTING_FIRMWARE.md): the early-return form
-		// used here skips handleClient()'s single terminal closeSocket() on
-		// rejection, leaking the socket on every unauthenticated/cross-origin
-		// request to this route -- the exact #207/D-5 pattern. Fixed in the
-		// same pass that added requireAdmin's minRole parameter.
+		// Written as the fall-through form deliberately: `if (!requireAdmin(...))
+		// return;` (both this route and the POST one just below, until this fix)
+		// jumps straight over handleClient()'s single closeSocket() at the bottom
+		// of the route chain and leaks a socket on every rejected request -- the
+		// exact #207/#215 pattern, reintroduced here by 9356d2d after #215 had
+		// already fixed it on /api/moh's three routes. See
+		// docs/THREAT_MODEL.md D-5. (Independently caught and fixed the same way
+		// by both #227 and #230 -- this comment is whichever landed second.)
 		if (requireAdmin(clientSock, req, false))
 		{
 			sendApiSyslogStatus(clientSock);
@@ -542,6 +553,37 @@ void HttpServer::handleClient(int clientSock)
 		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiSyslogSet(clientSock, req.body);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/setup/email")
+	{
+		// Ungated shell, same class as "/" -- see sendEmailSetupHtml's
+		// declaration comment and docs/THREAT_MODEL.md §4 E-2.
+		sendEmailSetupHtml(clientSock, req);
+	}
+	else if (req.method == "GET" && req.path == "/api/email")
+	{
+		// Gated: even redacted, this discloses host/user/from -- infrastructure
+		// detail, same conservative call as /api/syslog just above.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiEmailConfig(clientSock);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/email")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiEmailConfigSet(clientSock, req.body);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/email/test")
+	{
+		// Places a real outbound send -- same mutating-action gate as
+		// /api/telephony-config/<slot>/test above.
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiEmailTest(clientSock, req.body);
 		}
 	}
 	else if (req.method == "GET" && req.path == "/api/moh")
@@ -4036,6 +4078,227 @@ void HttpServer::sendApiSyslogSet(int sock, const std::string& body)
 	             host.empty()
 	               ? "{\"status\":\"ok\",\"message\":\"remote logging disabled\"}"
 	               : "{\"status\":\"ok\",\"message\":\"remote logging enabled\"}");
+}
+
+// ---------------------------------------------------------------------
+// Issue #159: SMTP client config + test-send. See EmailConfigStore.hpp for
+// the persisted shape, SmtpDialogue.hpp/SmtpClient.hpp for the send itself.
+// ---------------------------------------------------------------------
+namespace
+{
+	SmtpDialogue::Mode emailModeFromString(const std::string& s)
+	{
+		if (s == "tls") return SmtpDialogue::Mode::ImplicitTls;
+		if (s == "plain") return SmtpDialogue::Mode::Plain;
+		return SmtpDialogue::Mode::StartTls; // "starttls", default, and any unrecognised value
+	}
+	// Validates the raw string form BEFORE it is folded into the fallback
+	// case above -- so "auth=bogus" is a 400, not silently stored as "none".
+	bool isValidEmailMode(const std::string& s) { return s == "tls" || s == "starttls" || s == "plain"; }
+	bool isValidEmailAuth(const std::string& s)
+	{
+		return s == "none" || s == "plain" || s == "login" || s == "xoauth2-sa";
+	}
+	SmtpDialogue::AuthMethod emailAuthFromString(const std::string& s)
+	{
+		if (s == "plain") return SmtpDialogue::AuthMethod::Plain;
+		if (s == "login") return SmtpDialogue::AuthMethod::Login;
+		if (s == "xoauth2-sa") return SmtpDialogue::AuthMethod::XOAuth2;
+		return SmtpDialogue::AuthMethod::None;
+	}
+	uint16_t defaultPortForMode(const std::string& mode)
+	{
+		if (mode == "tls") return 465;
+		if (mode == "plain") return 25;
+		return 587;
+	}
+	std::string emailConfigJson(const EmailConfigStore::Config& cfg)
+	{
+		std::ostringstream json;
+		json << "{\"host\":\"" << jsonEscape(cfg.host) << "\""
+		     << ",\"port\":" << cfg.port
+		     << ",\"mode\":\"" << jsonEscape(cfg.mode) << "\""
+		     << ",\"auth\":\"" << jsonEscape(cfg.auth) << "\""
+		     << ",\"user\":\"" << jsonEscape(cfg.user) << "\""
+		     << ",\"from\":\"" << jsonEscape(cfg.from) << "\""
+		     << ",\"to\":\"" << jsonEscape(cfg.to) << "\""
+		     << ",\"gsaEmail\":\"" << jsonEscape(cfg.gsaEmail) << "\""
+		     // Secrets: presence only, NEVER the value -- issue #207's class.
+		     << ",\"hasPassword\":" << (cfg.pass.empty() ? "false" : "true")
+		     << ",\"hasGsaKey\":" << (cfg.gsaKey.empty() ? "false" : "true")
+		     << ",\"insecure\":" << (cfg.insecureSkipVerify ? "true" : "false")
+		     << ",\"hasCaPem\":" << (cfg.caPem.empty() ? "false" : "true")
+		     << "}";
+		return json.str();
+	}
+} // namespace
+
+void HttpServer::sendApiEmailConfig(int sock)
+{
+	sendResponse(sock, 200, "OK", "application/json", emailConfigJson(EmailConfigStore::load()));
+}
+
+void HttpServer::sendApiEmailConfigSet(int sock, const std::string& body)
+{
+	const std::string mode = getFormParam(body, "mode");
+	const std::string auth = getFormParam(body, "auth");
+	if (!mode.empty() && !isValidEmailMode(mode))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"mode must be tls, starttls or plain\"}");
+		return;
+	}
+	if (!auth.empty() && !isValidEmailAuth(auth))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"auth must be none, plain, login or xoauth2-sa\"}");
+		return;
+	}
+
+	EmailConfigStore::Config cfg = EmailConfigStore::load(); // start from what's stored -- see "keep unchanged" below
+	cfg.host = getFormParam(body, "host");
+	cfg.mode = mode.empty() ? cfg.mode : mode;
+	cfg.auth = auth.empty() ? cfg.auth : auth;
+
+	const std::string portStr = getFormParam(body, "port");
+	if (portStr.empty())
+	{
+		cfg.port = defaultPortForMode(cfg.mode);
+	}
+	else
+	{
+		char* end = nullptr;
+		long port = std::strtol(portStr.c_str(), &end, 10);
+		if (end == portStr.c_str() || *end != '\0' || port < 1 || port > 65535)
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"port must be 1-65535\"}");
+			return;
+		}
+		cfg.port = static_cast<uint16_t>(port);
+	}
+
+	cfg.user = getFormParam(body, "user");
+	cfg.from = getFormParam(body, "from");
+	cfg.to = getFormParam(body, "to");
+	cfg.gsaEmail = getFormParam(body, "gsaEmail");
+	const std::string insecureParam = getFormParam(body, "insecure");
+	cfg.insecureSkipVerify = (insecureParam == "1" || insecureParam == "on");
+
+	// Secrets: an empty submitted value means "leave the stored one alone" --
+	// the dashboard never re-displays a real password/private key to redact
+	// FROM, so there is nothing to compare against on the client side, and a
+	// blank field must not be read as "clear this". See EmailConfigStore.hpp.
+	const std::string pass = getFormParam(body, "pass");
+	if (!pass.empty()) cfg.pass = pass;
+	const std::string gsaKey = getFormParam(body, "gsaKey");
+	if (!gsaKey.empty()) cfg.gsaKey = gsaKey;
+	const std::string caPem = getFormParam(body, "caPem");
+	if (!caPem.empty()) cfg.caPem = caPem;
+
+	if (!EmailConfigStore::save(cfg))
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"error\":\"failed to persist email configuration\"}");
+		return;
+	}
+
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"config\":" + emailConfigJson(cfg) + "}");
+}
+
+void HttpServer::sendApiEmailTest(int sock, const std::string& body)
+{
+	EmailConfigStore::Config stored = EmailConfigStore::load();
+	if (stored.host.empty())
+	{
+		sendResponse(sock, 200, "OK", "application/json",
+		             "{\"ok\":false,\"error\":\"no SMTP host configured -- save the settings above first\"}");
+		return;
+	}
+
+	std::string to = getFormParam(body, "to");
+	if (to.empty()) to = stored.to;
+	if (to.empty())
+	{
+		sendResponse(sock, 200, "OK", "application/json",
+		             "{\"ok\":false,\"error\":\"no recipient -- set a default 'to' or pass one to this test\"}");
+		return;
+	}
+
+	SmtpDialogue::Config cfg;
+	cfg.host = stored.host;
+	cfg.port = stored.port;
+	cfg.mode = emailModeFromString(stored.mode);
+	cfg.auth = emailAuthFromString(stored.auth);
+	cfg.username = stored.user;
+	cfg.password = stored.pass;
+	cfg.commandTimeoutMs = 15000;
+
+	// The Workspace service-account path needs a bearer token, but this handler
+	// does NOT fetch one. Minting is an RSA-2048 signature plus a full TLS
+	// handshake to oauth2.googleapis.com, and this function runs on a
+	// per-connection HTTP handler thread -- an IDF pthread on the 8192-byte
+	// CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT. Every other TLS-handshake path in
+	// this codebase runs on a task with a dedicated 12 KB PSRAM stack for
+	// exactly that reason (PsramTask.hpp), and SmtpClient's worker is one of
+	// them.
+	//
+	// So the material is handed to the worker and it mints there. That also
+	// restores what SmtpClient::sendAndWait()'s contract already promised --
+	// "the caller's own thread never does socket/TLS I/O itself" -- which the
+	// inline fetch had quietly broken.
+	SmtpClient::TokenRequest token;
+	if (cfg.auth == SmtpDialogue::AuthMethod::XOAuth2)
+	{
+		token.serviceAccountEmail = stored.gsaEmail;
+		token.subjectUser         = stored.user;
+		token.scope               = "https://mail.google.com/";
+		token.privateKeyPem       = stored.gsaKey;
+	}
+
+	SmtpDialogue::Message msg;
+	msg.from = stored.from.empty() ? stored.user : stored.from;
+	msg.to = to;
+	msg.subject = "pocket-dial test message";
+	msg.textBody = "This is a test message from pocket-dial's SMTP client (issue #159).\r\n"
+	               "If you can read this, outbound email is configured correctly.\r\n";
+
+	const bool allowPlain = (cfg.mode == SmtpDialogue::Mode::Plain);
+
+	SmtpDialogue::SendResult result;
+	// 20 s was sized for the SMTP session alone. A cold XOAUTH2 send now also
+	// pays the token mint on the worker (RSA-2048 sign + a TLS handshake to
+	// Google, ~1-2 s on this silicon with no ECC accelerator) before the SMTP
+	// session even starts, so the budget has to cover both or a first-of-the-hour
+	// test would report a spurious Timeout while the send was in fact fine.
+	// Cached-token sends are unaffected -- getAccessToken() reuses one until 60 s
+	// before expiry.
+	const uint32_t waitMs = token.serviceAccountEmail.empty() ? 20000u : 35000u;
+
+	bool dispatched = SmtpClient::sendAndWait(cfg, msg, allowPlain, stored.caPem, stored.insecureSkipVerify,
+	                                           waitMs, result, token);
+
+	std::ostringstream json;
+	json << "{\"ok\":" << ((dispatched && result.ok()) ? "true" : "false")
+	     << ",\"resultCode\":" << static_cast<int>(result.code)
+	     << ",\"smtpReplyCode\":" << result.smtpReplyCode
+	     << ",\"error\":\"" << jsonEscape(result.lastError) << "\""
+	     << "}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendEmailSetupHtml(int sock, const HttpRequest& req)
+{
+	std::string page(PD_HTML_8, sizeof(PD_HTML_8) - 1);
+	const std::string token = AdminAuth::sessionCsrf(sessionToken(req));
+	const std::string marker = "__PD_CSRF__";
+	const size_t at = page.find(marker);
+	if (at != std::string::npos)
+	{
+		page.replace(at, marker.size(), token);
+	}
+	sendResponse(sock, 200, "OK", "text/html; charset=utf-8", page);
 }
 
 void HttpServer::sendApiMohStatus(int sock)
