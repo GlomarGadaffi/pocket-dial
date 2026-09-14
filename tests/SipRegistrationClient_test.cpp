@@ -559,6 +559,24 @@ TEST(SipRegistrationClient, ASha256ChallengeFailsTheCycleRatherThanAnsweringWith
     EXPECT_FALSE(c.tick(now, req));
     EXPECT_EQ(c.state(), State::Failed);
     EXPECT_NE(std::string(c.status().lastError).find("algorithm"), std::string::npos);
+
+    // ...and the unanswerable challenge is DROPPED. Keeping it would make the
+    // refusal permanent in a much worse way: every backed-off retry rebuilds the
+    // same impossible header, fails at compose time, and never puts a byte on the
+    // wire again. The next retry must go out UNAUTHENTICATED so the server gets
+    // the chance to offer a different challenge -- RFC 7616 §3.7 lets it send one
+    // per algorithm, and the §3.9.1 example sends SHA-256 AND MD5.
+    EXPECT_FALSE(c.hasCachedChallenge());
+    now += 2000;
+    ASSERT_TRUE(c.tick(now, req)) << "a refused challenge must not wedge the client";
+    EXPECT_TRUE(headerOf(wire(req), "Authorization").empty());
+
+    // And the MD5 challenge it now draws IS answered.
+    c.onResponse(now, challenge401());
+    ASSERT_TRUE(c.tick(now, req));
+    EXPECT_FALSE(headerOf(wire(req), "Authorization").empty());
+    c.onResponse(now, ok200("3600"));
+    EXPECT_EQ(c.state(), State::Registered);
 }
 
 TEST(SipRegistrationClient, AnOversizedChallengeFieldIsRefusedNotTruncated)

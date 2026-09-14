@@ -130,7 +130,10 @@ public:
 		uint32_t consecutiveFailures  = 0;
 		uint32_t registerAttempts     = 0;  // REGISTERs emitted since configure()
 		uint16_t lastStatusCode       = 0;
-		bool     authenticated        = false; // a challenge was answered
+		bool     authenticated        = false; // THIS registration was carried by a
+		                                       // credential (an IP-authenticated
+		                                       // trunk never sets it) -- not merely
+		                                       // that a challenge was seen
 		char     lastError[kMaxError] = {0};
 	};
 
@@ -155,6 +158,21 @@ public:
 
 	// One SIP response, reduced to the header values this machine reads. Views,
 	// not copies: the caller owns the backing buffer for the duration of the call.
+	//
+	// BOUNDARY / KNOWN GAP -- multiple challenges. RFC 7616 §3.7 lets a server
+	// send ONE WWW-Authenticate per algorithm, strongest first, and the §3.9.1
+	// example this module's vectors come from sends exactly two: SHA-256 then
+	// MD5. This struct carries ONE view per header name, so the caller chooses
+	// which challenge is offered here. A caller that blindly hands over the FIRST
+	// WWW-Authenticate line of such a response gets a permanent refusal with a
+	// perfectly good MD5 challenge sitting on the next line.
+	//
+	// Until the trunk wiring grows a "pick the first answerable challenge"
+	// helper (which belongs there, with the SipMessage header iteration, not
+	// here), the mitigation is inside this class rather than in its API: an
+	// unanswerable challenge is DROPPED rather than cached, so the next backed-off
+	// retry goes out unauthenticated and draws a fresh challenge instead of
+	// re-failing forever at compose time. See composeRegister().
 	struct ResponseView
 	{
 		int              code = 0;

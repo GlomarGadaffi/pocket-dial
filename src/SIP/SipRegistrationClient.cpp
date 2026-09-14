@@ -335,8 +335,22 @@ bool SipRegistrationClient::composeRegister(Request& out)
 		                                   "REGISTER", requestUri,
 		                                   nextNc, cnonce, authValue))
 		{
-			// Unanswerable challenge (SHA-256, auth-int only, ...). Refusing is
-			// the point: an MD5 answer to a SHA-256 challenge loops forever.
+			// Unanswerable challenge (SHA-256, auth-int only, MD5-sess with no
+			// qop). Refusing to ANSWER is the point: an MD5 response to a SHA-256
+			// challenge loops forever against a server that will never accept it.
+			//
+			// But the cached challenge must also be DROPPED, or the refusal is
+			// permanent in a much worse way: every backed-off retry would rebuild
+			// the same impossible Authorization, fail here, and never put a single
+			// byte on the wire again. Dropping it means the next retry sends an
+			// unauthenticated REGISTER and draws a FRESH challenge -- which is the
+			// only way the client ever sees a different one. That matters
+			// concretely: RFC 7616 3.7 lets a server offer one challenge per
+			// algorithm (the 3.9.1 example sends SHA-256 AND MD5), so "the
+			// challenge we happened to cache is unanswerable" is not the same
+			// statement as "this server is unanswerable".
+			_haveChallenge = false;
+			_nc            = 0;
 			setError("challenge cannot be answered (algorithm or qop)");
 			return false;
 		}
