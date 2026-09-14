@@ -372,18 +372,18 @@ namespace Syslog
 			// Disable: erase rather than store an empty string, so loadFromNvs()'s
 			// 'absent key' path and the disabled state are the same thing.
 			// ESP_ERR_NVS_NOT_FOUND is success here -- already absent is the goal.
-			err = nvs_erase_key(h, \"syslog_host\");
+			err = nvs_erase_key(h, "syslog_host");
 			if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
-			esp_err_t e2 = nvs_erase_key(h, \"syslog_port\");
+			esp_err_t e2 = nvs_erase_key(h, "syslog_port");
 			if (e2 == ESP_ERR_NVS_NOT_FOUND) e2 = ESP_OK;
 			if (err == ESP_OK) err = e2;
 		}
 		else
 		{
-			err = nvs_set_str(h, \"syslog_host\", host.c_str());
+			err = nvs_set_str(h, "syslog_host", host.c_str());
 			if (err == ESP_OK)
 			{
-				err = nvs_set_u32(h, \"syslog_port\", static_cast<uint32_t>(port));
+				err = nvs_set_u32(h, "syslog_port", static_cast<uint32_t>(port));
 			}
 		}
 
