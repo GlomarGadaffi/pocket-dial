@@ -100,7 +100,7 @@ bool TransactionLayer::matchAndAdvance(const std::shared_ptr<SipMessage>& msg)
 
 	bool matched = false;
 	auto now = std::chrono::steady_clock::now();
-	constexpr uint32_t kTimerLms = 64 * 500; // RFC 6026: 32 s absorb after 2xx
+	constexpr uint32_t kAbsorbWindowMs = 64 * 500; // Timer M (2xx, RFC 6026 §8.4) / Timer D (3xx-6xx, RFC 3261 §17.1.1.2) -- NOT Timer L (server-side); see hpp:65-72
 
 	for (auto& tx : _pool)
 	{
@@ -121,11 +121,11 @@ bool TransactionLayer::matchAndAdvance(const std::shared_ptr<SipMessage>& msg)
 				break;
 			case Cls::Success:
 				tx.state = SipTransaction::State::Accepted;
-				tx.absorbDeadline = now + std::chrono::milliseconds(kTimerLms);
+				tx.absorbDeadline = now + std::chrono::milliseconds(kAbsorbWindowMs);
 				break;
 			default:
 				tx.state = SipTransaction::State::Completed;
-				tx.absorbDeadline = now + std::chrono::milliseconds(kTimerLms);
+				tx.absorbDeadline = now + std::chrono::milliseconds(kAbsorbWindowMs);
 				break;
 		}
 	}

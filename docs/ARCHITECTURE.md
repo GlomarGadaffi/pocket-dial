@@ -80,7 +80,7 @@ Implemented today:
 | Mechanism | Where |
 | :--- | :--- |
 | §17.1.1 INVITE client transaction — Timer A retransmit from `T1` = 500 ms, doubling per attempt; Timer B at 32 s | `TransactionLayer.hpp:14-18`, `sweep()` |
-| RFC 6026 Timer L absorb window once a final response arrives | `TransactionLayer.hpp:35`, `:64` |
+| RFC 6026 §8.4 Timer M (2xx) / RFC 3261 Timer D (3xx-6xx) absorb window once a final response arrives — client-side only; there is no server transaction layer, so this is not Timer L | `TransactionLayer.hpp:35`, `:65-72` |
 | §17.1.1.3 ACK for a non-2xx final to a PBX-originated INVITE | `ackInboundFinal`, `RegisterBeeper::handleInviteFailure` |
 | §18.2.1 `received=` and RFC 3581 `rport` on every response | `sipwire::viaWithReceived` |
 | §12.2 To-tag detection routing a re-INVITE onto the hold/resume path | `RequestsHandler::onInvite` |
