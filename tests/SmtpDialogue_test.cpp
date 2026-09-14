@@ -899,3 +899,70 @@ TEST(SmtpDialogueE2E, PlainMode_RefusedByTransportWhenNotAllowed)
 	EXPECT_FALSE(transport.connect(cfg, /*allowPlain=*/false, "", false, err));
 	EXPECT_NE(err.find("LAN-relay"), std::string::npos);
 }
+
+// ---------------------------------------------------------------------
+// XOAUTH2 token minting is the WORKER's job, not the caller's (#230 review).
+//
+// HttpServer::sendApiEmailTest() used to fetch the bearer token inline, on the
+// per-connection HTTP handler thread -- an RSA-2048 signature plus a full TLS
+// handshake on an IDF pthread with the 8192-byte default stack, while every
+// other TLS-handshake path here runs on a task with a dedicated 12 KB PSRAM
+// stack. The material now travels to the worker as SmtpClient::TokenRequest.
+//
+// That refactor moved the host build's "device-only" refusal out of the HTTP
+// handler and into SmtpClient, where every caller sees the same answer. The
+// behaviour was untested in EITHER location, so it is pinned here now -- it is
+// the only host-observable part of the change.
+// ---------------------------------------------------------------------
+
+TEST(SmtpClientTokenRequest, AMintRequestIsRefusedOnHostRatherThanSilentlySendingUnauthenticated)
+{
+	SmtpDialogue::Config cfg;
+	cfg.host = "smtp.example.test";
+	cfg.port = 587;
+	cfg.auth = SmtpDialogue::AuthMethod::XOAuth2;
+	cfg.username = "user@example.test";
+	// No accessToken: this send NEEDS a token minted.
+
+	SmtpDialogue::Message msg;
+	msg.from = "user@example.test";
+	msg.to = "someone@example.test";
+
+	SmtpClient::TokenRequest token;
+	token.serviceAccountEmail = "sa@project.iam.gserviceaccount.com";
+	token.subjectUser = "user@example.test";
+	token.scope = "https://mail.google.com/";
+	token.privateKeyPem = "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n";
+
+	SmtpDialogue::SendResult result;
+	const bool dispatched = SmtpClient::sendAndWait(
+		cfg, msg, /*allowPlain=*/false, /*caCertPem=*/"", /*insecureSkipVerify=*/false,
+		/*waitMs=*/1000, result, token);
+
+	EXPECT_FALSE(dispatched);
+	// AuthRejected, not TransportError: nothing was ever dialled, the credential
+	// is what could not be produced.
+	EXPECT_EQ(result.code, SmtpDialogue::ResultCode::AuthRejected);
+	EXPECT_NE(result.lastError.find("device-only"), std::string::npos)
+		<< "the refusal must say WHY, since this is a build-capability limit and "
+		   "not a server rejection: " << result.lastError;
+}
+
+TEST(SmtpClientTokenRequest, AnEmptyTokenRequestIsNotTreatedAsAMintRequest)
+{
+	// The App Password path, and any caller that already holds a token, must be
+	// completely unaffected by the new parameter -- an empty TokenRequest means
+	// "nothing to mint", NOT "mint with empty credentials". Getting this wrong
+	// would have refused every non-OAuth send on host.
+	SmtpDialogue::Config cfg;
+	cfg.host = "";   // invalid on purpose: we want the DIALOGUE to be what objects
+	cfg.auth = SmtpDialogue::AuthMethod::Plain;
+
+	SmtpDialogue::Message msg;
+	SmtpDialogue::SendResult result;
+	SmtpClient::sendAndWait(cfg, msg, false, "", false, 1000, result, SmtpClient::TokenRequest{});
+
+	EXPECT_NE(result.code, SmtpDialogue::ResultCode::AuthRejected)
+		<< "an empty TokenRequest must not be mistaken for a mint request; this "
+		   "send should fail on its own (missing) config instead";
+}
