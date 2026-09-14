@@ -8,8 +8,11 @@
 // the sender, so any registered phone could put someone else's Call-ID on a
 // REFER and:
 //
-//   * blind path — endCall() the victim's session and (since #128) send the
-//     victim's peer a BYE built from the attacker's own tags; or
+//   * blind path — hang the victim's own leg up and splice the victim's peer
+//     away to an attacker-chosen target, with the BYE built from the
+//     attacker's own tags (before #197 it was the peer that was hung up on
+//     and the victim that was dialled through — either way, someone else's
+//     call rearranged by a stranger); or
 //   * attended path — name the victim's call as ?Replaces= and splice it.
 //
 // The attended path's own "A must be common to both dialogs" check is not a
@@ -275,8 +278,15 @@ TEST(ReferSourceAuth, InDialogTransferFromARealLegStillSucceeds)
 		<< "a real leg's REFER must still be accepted";
 	EXPECT_TRUE(findSentTo(sent, aAddr, "SIP/2.0 403", sentBefore).empty())
 		<< "a real leg's REFER must not be forbidden";
-	EXPECT_FALSE(findSentTo(sent, bAddr, "BYE sip:", sentBefore).empty())
-		<< "the dropped party must still get its #128 BYE";
+	// #128's BYE still goes out, and since #197 it goes to the party the transfer
+	// DROPS — the transferor, A, who is the one asking to leave. B is the
+	// transferee: it stays on its own dialog and is re-pointed at the target.
+	// (Before #197 this assertion named bAddr, because the handler hung up on the
+	// transferee and dialled the transferor through instead.)
+	EXPECT_FALSE(findSentTo(sent, aAddr, "BYE sip:", sentBefore).empty())
+		<< "the transferor must still get its #128 BYE";
+	EXPECT_TRUE(findSentTo(sent, bAddr, "BYE sip:", sentBefore).empty())
+		<< "the transferee must not be hung up on (#197)";
 	EXPECT_FALSE(findSentTo(sent, targetAddr, "INVITE sip:107@", sentBefore).empty())
 		<< "the transfer target must still be dialled";
 }

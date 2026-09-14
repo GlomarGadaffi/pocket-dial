@@ -17,6 +17,7 @@
 #endif
 
 #include <string>
+#include <string_view>
 
 namespace sipwire
 {
@@ -106,6 +107,53 @@ namespace sipwire
 			"m=audio " + std::to_string(rtpPort) + " RTP/AVP 0\r\n"
 			"a=rtpmap:0 PCMU/8000\r\n"
 			"a=sendonly\r\n";
+	}
+
+	// Rewrite every line-anchored direction attribute in an SDP body to
+	// a=sendrecv, leaving the rest of the body byte-identical.
+	//
+	// This exists for one situation: relaying a party's LAST KNOWN SDP into a new
+	// leg when that SDP may have been captured while they were on hold. Every
+	// phone's Transfer softkey holds the call first and REFERs second, so the
+	// media the transferee last negotiated is routinely a=recvonly (or a=inactive
+	// / a=sendonly, depending on which side held). Handing that to the transfer
+	// target verbatim offers it a one-way stream and the transfer completes with
+	// audio missing in one direction — a failure that only shows up on real
+	// handsets, never in a signalling trace that "looks right".
+	//
+	// RFC 3264 §6.1: a fresh offer re-negotiates direction, so overriding the
+	// stale attribute is correct, not a lie — the hold is being ended by the very
+	// re-INVITE this body rides in. Address/port are NOT touched: a phone that
+	// held with the RFC 2543 c=0.0.0.0 form still needs its own re-INVITE to
+	// publish a live address, and inventing one here would be a guess.
+	inline std::string sdpAsSendrecv(const std::string& sdp)
+	{
+		static constexpr std::string_view kDirs[] = { "a=sendonly", "a=recvonly", "a=inactive" };
+		std::string out = sdp;
+		for (const auto dir : kDirs)
+		{
+			size_t pos = 0;
+			while ((pos = out.find(dir, pos)) != std::string::npos)
+			{
+				// Line-anchored only: "a=sendonly" inside e.g. an a=label value is
+				// not a direction attribute, and the trailing check keeps us off a
+				// longer token that merely starts the same way.
+				const bool atLineStart = (pos == 0) || out[pos - 1] == '\n';
+				const size_t after = pos + dir.size();
+				const bool atLineEnd = (after >= out.size()) ||
+					out[after] == '\r' || out[after] == '\n';
+				if (atLineStart && atLineEnd)
+				{
+					out.replace(pos, dir.size(), "a=sendrecv");
+					pos += 10;   // strlen("a=sendrecv")
+				}
+				else
+				{
+					pos = after;
+				}
+			}
+		}
+		return out;
 	}
 
 	// Pull the far end's RTP destination out of an SDP body: the `c=` connection
