@@ -17,7 +17,7 @@
 	#include "cJSON.h"
 	#include "TimeSync.hpp"
 	static const char* kTag = "GoogleServiceAuth";
-#else
+#elif defined(PD_HAVE_OPENSSL)
 	#include <openssl/evp.h>
 	#include <openssl/pem.h>
 	#include <openssl/bio.h>
@@ -91,7 +91,7 @@ bool signRs256(const std::string& privateKeyPem, const std::string& signingInput
 	return true;
 }
 
-#else // host build -- OpenSSL
+#elif defined(PD_HAVE_OPENSSL) // host build -- OpenSSL
 
 bool signRs256(const std::string& privateKeyPem, const std::string& signingInput,
                 std::string& signatureOut, std::string& errOut)
@@ -138,6 +138,29 @@ bool signRs256(const std::string& privateKeyPem, const std::string& signingInput
 	}
 	signatureOut.assign(reinterpret_cast<const char*>(sig.data()), sig.size());
 	return true;
+}
+
+#else // host build with no crypto backend configured
+
+// A host build that could not find OpenSSL. The rest of this file -- the JWT
+// header and claims construction, which is where the escaping and exact-shape
+// bugs actually live -- is pure string work and still compiles, still runs and
+// is still tested. Only the signature is unavailable.
+//
+// This arm exists so that a Windows host build without OpenSSL CONFIGURES AND
+// BUILDS rather than dying at cmake time, which is what `find_package(OpenSSL
+// REQUIRED)` used to do on a platform CONTRIBUTING_FIRMWARE.md lists as
+// supported. Failing loudly at the one call that cannot work beats failing at
+// configure for the whole project.
+//
+// Nothing on the DEVICE reaches here: ESP builds take the mbedTLS arm above,
+// and the XOAUTH2 token fetch is ESP-only regardless.
+bool signRs256(const std::string& /*privateKeyPem*/, const std::string& /*signingInput*/,
+                std::string& /*signatureOut*/, std::string& errOut)
+{
+	errOut = "RS256 signing unavailable: this host build was configured without "
+	         "OpenSSL (see CONTRIBUTING_FIRMWARE.md)";
+	return false;
 }
 
 #endif

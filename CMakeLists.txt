@@ -42,11 +42,34 @@ else()
     # platform-split comment for why (IDF only ships mbedtls/private/*
     # headers; a full mbedTLS build is not otherwise part of the host
     # toolchain). SipServer globs every src/Helpers/*.cpp, so it picks this
-    # up too. tests/CMakeLists.txt (via add_subdirectory below) also calls
-    # find_package(OpenSSL REQUIRED); whichever of the two configures first,
-    # CMake caches the result, so this is not a second real search.
-    find_package(OpenSSL REQUIRED)
-    target_link_libraries(SipServer OpenSSL::Crypto)
+    # up too. tests/CMakeLists.txt (via add_subdirectory below) does the same
+    # search; whichever of the two configures first, CMake caches the result,
+    # so this is not a second real search.
+    #
+    # NOT `REQUIRED`. It was, and that silently broke the Windows/MSVC host
+    # build: OpenSSL is not present by default there, so `cmake -B build -S .`
+    # died at configure with "Could NOT find OpenSSL" -- on a platform
+    # CONTRIBUTING_FIRMWARE.md documents as a supported host-test path, and
+    # with nothing anywhere naming the new prerequisite. Only ci.yml's Linux
+    # runner installs libssl-dev.
+    #
+    # Optional instead, because what is actually lost without it is narrow and
+    # host-only: RS256 SIGNING on the host. The device build uses mbedTLS and
+    # is untouched; the XOAUTH2 token fetch is ESP-only regardless. So a
+    # Windows host build without OpenSSL still configures, still builds, and
+    # still runs every test except the five that exercise the signature
+    # itself. See CONTRIBUTING_FIRMWARE.md for how to install it if you want
+    # those.
+    find_package(OpenSSL)
+    if (OpenSSL_FOUND)
+        target_link_libraries(SipServer OpenSSL::Crypto)
+        target_compile_definitions(SipServer PRIVATE PD_HAVE_OPENSSL=1)
+    else()
+        message(STATUS
+            "OpenSSL not found -- host RS256 JWT signing (issue #159) is disabled. "
+            "Everything else builds normally. To enable it: apt install libssl-dev, "
+            "brew install openssl, or vcpkg install openssl (see CONTRIBUTING_FIRMWARE.md).")
+    endif()
 
     if (WIN32)
         target_link_libraries(SipServer wsock32 ws2_32)

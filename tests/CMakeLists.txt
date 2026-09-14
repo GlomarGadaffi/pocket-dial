@@ -412,11 +412,29 @@ target_link_libraries(sip_parser_tests PRIVATE gtest gtest_main)
 # rather than mbedTLS -- IDF v6.0.1 only ships mbedtls/private headers (see
 # SipDigest.hpp's identical reasoning for vendoring MD5 instead of depending on
 # them), and a full mbedTLS build is not otherwise part of the host toolchain.
-# OpenSSL is present on every CI/dev image this project already assumes
-# (ci.yml's apt-get line installs libssl-dev; see docs there for glolab, the
-# one non-apt runner).
-find_package(OpenSSL REQUIRED)
-target_link_libraries(sip_parser_tests PRIVATE OpenSSL::Crypto)
+#
+# OPTIONAL, not REQUIRED -- see the matching block in the top-level
+# CMakeLists.txt for the full reasoning. Short version: `REQUIRED` here meant a
+# Windows/MSVC host build could not configure at all, on a platform
+# CONTRIBUTING_FIRMWARE.md lists as supported, because only ci.yml's Linux
+# runner installs libssl-dev.
+#
+# Without it, the five GoogleServiceAuthCrypto tests compile out and one
+# always-present test GTEST_SKIPs with an explanation, so the gap shows up in
+# the test log instead of looking like full coverage. The three
+# GoogleServiceAuthPure tests -- the JWT header/claims construction, which is
+# where the escaping and exact-shape bugs would live -- need no crypto and run
+# everywhere.
+find_package(OpenSSL)
+if (OpenSSL_FOUND)
+    target_link_libraries(sip_parser_tests PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(sip_parser_tests PRIVATE PD_HAVE_OPENSSL=1)
+else()
+    message(STATUS
+        "OpenSSL not found -- the GoogleServiceAuthCrypto tests (RS256 signature "
+        "verification, issue #159) will be skipped. Every other test still runs. "
+        "See CONTRIBUTING_FIRMWARE.md to install it.")
+endif()
 
 if (WIN32)
     target_link_libraries(sip_parser_tests PRIVATE wsock32 ws2_32)

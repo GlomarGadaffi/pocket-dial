@@ -246,6 +246,27 @@ ctest --test-dir build/tests --output-on-failure
   `tests/` subdirectory, so the CTest set lives there, not at the build root.
 * **Run it from WSL, not natively.** Several suites open real sockets; running
   them on Windows triggers firewall authorisation prompts.
+* **OpenSSL is optional, and only affects one thing.** Issue #159 added RS256
+  JWT signing for the Workspace service-account path; on the host build that
+  uses OpenSSL's `EVP_DigestSign` (the device uses mbedTLS, and IDF ships only
+  `mbedtls/private/*` headers, so there is no shared backend). CI's Linux
+  runner gets it from `libssl-dev`, and most Linux/WSL dev images already have
+  it.
+
+  If CMake cannot find it you get a `-- OpenSSL not found` status line at
+  configure, **not** an error: the build still configures, still compiles, and
+  still runs every test but the five `GoogleServiceAuthCrypto` ones, which
+  compile out in favour of a single `GTEST_SKIP` so the missing coverage shows
+  up in the ctest log rather than passing for green. The JWT header/claims
+  construction — where the escaping and exact-shape bugs would actually live —
+  is pure string work and is covered either way.
+
+  To get the full set: `apt install libssl-dev` (Debian/Ubuntu/WSL),
+  `brew install openssl` (macOS), or `vcpkg install openssl:x64-windows` plus
+  `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake` (Windows/
+  MSVC). This was briefly `find_package(OpenSSL REQUIRED)`, which meant a
+  Windows host build could not configure **at all** — worth knowing if you hit
+  a `Could NOT find OpenSSL` error on an older checkout.
 * Keep the count in this section current when you add or remove cases.
 
 ### HTTP test ports: pick from a disjoint block, never a bare literal

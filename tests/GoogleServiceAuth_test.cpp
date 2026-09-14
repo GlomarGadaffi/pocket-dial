@@ -21,9 +21,17 @@
 #include "GoogleServiceAuth.hpp"
 #include "SmtpDialogue.hpp"
 
+// OpenSSL is OPTIONAL for the host build (issue #159 follow-up): requiring it
+// silently broke the Windows/MSVC host build, which CONTRIBUTING_FIRMWARE.md
+// lists as a supported host-test path but where OpenSSL is not present by
+// default. Without it the crypto cases below compile out and the guard test at
+// the bottom of this file GTEST_SKIPs, so the gap is visible in the test log
+// rather than looking like full coverage.
+#if defined(PD_HAVE_OPENSSL)
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
+#endif
 
 #include <cstdint>
 #include <string>
@@ -101,6 +109,7 @@ namespace
 	// using the public half of kTestPrivateKeyPem. Independent of
 	// GoogleServiceAuth.cpp's own signRs256 -- this is the "known test key"
 	// half of the acceptance criterion.
+#if defined(PD_HAVE_OPENSSL)
 	bool verifyRs256WithTestKey(const std::string& signingInput, const std::vector<uint8_t>& signature)
 	{
 		BIO* bio = BIO_new_mem_buf(kTestPrivateKeyPem, -1);
@@ -122,6 +131,7 @@ namespace
 		EVP_PKEY_free(pkey);
 		return ok;
 	}
+#endif // PD_HAVE_OPENSSL
 } // namespace
 
 // ---------------------------------------------------------------------
@@ -160,6 +170,8 @@ TEST(GoogleServiceAuthPure, ClaimsJsonEscapesUnsafeCharacters)
 // ---------------------------------------------------------------------
 // RS256 signing against the fixed test key.
 // ---------------------------------------------------------------------
+
+#if defined(PD_HAVE_OPENSSL)
 
 TEST(GoogleServiceAuthCrypto, SignRs256_VerifiesAgainstKnownTestKey)
 {
@@ -240,3 +252,18 @@ TEST(GoogleServiceAuthCrypto, BuildSignedJwt_DifferentInputsProduceDifferentSign
 	ASSERT_TRUE(GoogleServiceAuth::buildSignedJwt("sa@x", "userB@x", "scope", kTestPrivateKeyPem, 1700000000ULL, jwt2, err));
 	EXPECT_NE(jwt1, jwt2);
 }
+
+#else  // no crypto backend on this host build
+
+// One visible, always-compiled marker so an OpenSSL-less run REPORTS the
+// missing coverage instead of quietly showing a green suite that never
+// exercised a signature. A skipped test reads as a skip in ctest output; a
+// compiled-out one reads as nothing at all.
+TEST(GoogleServiceAuthCrypto, SkippedWithoutOpenSsl)
+{
+	GTEST_SKIP() << "built without OpenSSL: RS256 sign/verify coverage is "
+	                "absent on this host build. See CONTRIBUTING_FIRMWARE.md "
+	                "to install it (issue #159).";
+}
+
+#endif // PD_HAVE_OPENSSL
