@@ -52,6 +52,58 @@ namespace
 	// an include so DeviceConfig stays free of any src/SIP dependency.
 	constexpr const char* kKeyRegMode   = "reg_mode";
 
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// reg_mode is the ONE key this file touches that lives in a different NVS
+	// namespace from everything else here: Registrar owns it in `pbxcfg`, while
+	// every other DeviceConfig field is in `storage`. That single exception has
+	// now caused the same bug twice — each call site did its own nvs_open and
+	// each had to remember the exception independently:
+	//
+	//   #151 (fixed v1.4.1) — applyFlashSeed() WROTE it to `storage`, so the
+	//        flash-time registrar mode was committed somewhere the registrar
+	//        never looks. Shipped inert in two releases.
+	//   #188 (fixed here)   — clearAll() ERASED it from `storage`, so a factory
+	//        reset could not clear the mode. That broke the documented rescue for
+	//        a board flipped to `secure` before any extension was adopted, which
+	//        rejects every REGISTER and locks the operator out; the comment in
+	//        clearAll() says that rescue is the entire reason the erase exists.
+	//
+	// #151's fix added kRegistrarNvsNamespace and a static_assert tying it to
+	// pbxpersist::kNvsNamespace — but a static_assert can only prove the CONSTANT
+	// is right, never that a call site uses it, which is exactly how clearAll()
+	// slipped through. So both accesses now go through these two helpers and the
+	// namespace is named in one place. Do not open pbxcfg inline again.
+	bool writeRegistrarMode(uint8_t mode)
+	{
+		nvs_handle_t rh;
+		if (nvs_open(DeviceConfig::kRegistrarNvsNamespace, NVS_READWRITE, &rh) != ESP_OK)
+		{
+			return false;
+		}
+		bool ok = (nvs_set_u8(rh, kKeyRegMode, mode) == ESP_OK);
+		if (ok)
+		{
+			ok = (nvs_commit(rh) == ESP_OK);
+		}
+		nvs_close(rh);
+		return ok;
+	}
+
+	// Drop the persisted mode so the next boot falls back to the compiled-in
+	// default. Absent key is success: nothing to clear is the desired end state.
+	void eraseRegistrarMode()
+	{
+		nvs_handle_t rh;
+		if (nvs_open(DeviceConfig::kRegistrarNvsNamespace, NVS_READWRITE, &rh) != ESP_OK)
+		{
+			return;
+		}
+		nvs_erase_key(rh, kKeyRegMode);   // ESP_ERR_NVS_NOT_FOUND is fine
+		nvs_commit(rh);
+		nvs_close(rh);
+	}
+#endif
+
 	// Alphabet size, computed rather than written as a literal: the modulo-bias
 	// rejection threshold below depends on it, and a hand-copied constant that
 	// drifts from kPskAlphabet would silently reintroduce the bias.
@@ -560,18 +612,13 @@ namespace DeviceConfig
 			// registrar. A dashboard endpoint covers the boards that do have one.
 			if (regMode <= 2)
 			{
-				// Separate handle: a different namespace from every other field
-				// this function writes. Committed and closed here rather than
-				// deferred to the shared commit below, which only covers `h`.
-				nvs_handle_t rh;
-				if (nvs_open(kRegistrarNvsNamespace, NVS_READWRITE, &rh) == ESP_OK)
+				// Separate handle on a different namespace from every other field
+				// this function writes, committed and closed inside the helper
+				// rather than deferred to the shared commit below, which only
+				// covers `h`. See writeRegistrarMode (issues #151 / #188).
+				if (writeRegistrarMode(regMode))
 				{
-					if (nvs_set_u8(rh, "reg_mode", regMode) == ESP_OK)
-					{
-						nvs_commit(rh);
-						applied = true;
-					}
-					nvs_close(rh);
+					applied = true;
 				}
 			}
 		}
@@ -632,17 +679,23 @@ namespace DeviceConfig
 			// Dropping cfgseed_gen is deliberate — see DeviceConfig.hpp: the next
 			// boot re-applies the flash-time seed, so "factory" means "as flashed".
 			nvs_erase_key(h, kKeySeedGen);
-			// The registrar admission mode goes too. This key belongs to
-			// Registrar, but DeviceConfig is what writes it from the flash seed,
-			// and leaving it behind made factory reset unable to rescue the one
-			// state that most needs rescuing: a device switched to `secure`
-			// before any extension was secured rejects every REGISTER, locking
-			// every phone (and thus the operator) out. Without this, the only
-			// way back was USB.
-			nvs_erase_key(h, kKeyRegMode);
 			nvs_commit(h);
 			nvs_close(h);
 		}
+
+		// The registrar admission mode goes too. This key belongs to Registrar,
+		// but DeviceConfig is what writes it from the flash seed, and leaving it
+		// behind makes factory reset unable to rescue the one state that most
+		// needs rescuing: a device switched to `secure` before any extension was
+		// secured rejects every REGISTER, locking every phone (and thus the
+		// operator) out. Without this the only way back is USB.
+		//
+		// #188: this erase used to run against the `storage` handle above, which
+		// is the wrong namespace — Registrar keeps reg_mode in `pbxcfg` — so the
+		// rescue never actually worked. It is OUTSIDE the block above because it
+		// is a different namespace and must happen whether or not `storage`
+		// opened; eraseRegistrarMode() owns that choice now.
+		eraseRegistrarMode();
 #endif
 
 		s.apSecure = false;

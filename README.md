@@ -1,70 +1,52 @@
 # pocket-dial
 
-**A complete SIP phone exchange that fits on a microcontroller.**
+**A working telephone exchange on a microcontroller.**
 
-Point any SIP phone (desk phone, ATA, or softphone) at pocket-dial and dial each other. No router, no SIP trunk, no cloud—everything runs on a single ESP32-S3 board with Ethernet or WiFi. Audio flows peer-to-peer directly between phones; the microcontroller only choreographs the signaling.
+Point SIP desk phones, ATAs or softphones at an ESP32-S3 and they can call each
+other — extensions, transfer, hold, park, page, hunt groups, busy-lamp keys. Add a
+dial-plan rule and they can call the outside world. No router, no server, no cloud.
 
-The same C++17 engine compiles to a desktop binary for development and testing. GoogleTest-covered, CI-gated, and field-deployable.
+The same C++17 engine compiles to a desktop binary, so you can run the whole PBX on
+your laptop before you own the hardware.
 
-## What it does
+```
+┌──────────┐        SIP signalling        ┌───────────────┐
+│ Yealink  │◄───────────────────────────►│  pocket-dial  │
+│   1001   │                              │   ESP32-S3    │
+└────┬─────┘                              └───────┬───────┘
+     │                                            │ (outside calls only)
+     │         RTP audio, peer-to-peer            ▼
+     └──────────────────────────────────►  ┌─────────────┐
+               ┌──────────┐                │   carrier   │
+               │ Grandstr │                └─────────────┘
+               │   1002   │
+               └──────────┘
+```
 
-### Core exchange
-- **Registrar + PBX**: SIP phones register and authenticate. Dial by extension number.
-- **Call signaling**: INVITE, BYE, CANCEL, transfer (REFER), hold/resume, session timers, presence subscriptions (BLF).
-- **Peer-to-peer audio**: G.711 (μ-law) RTP streams flow directly between phones—the microcontroller never touches call audio.
+For an ordinary extension-to-extension call the board brokers the setup and then
+gets out of the way — the phones stream audio directly to each other and the
+microcontroller never sees an RTP packet. That single design choice is why a
+240 MHz chip with 512 KB of RAM can run a phone system at all.
 
-### Call features
-- **Ring groups** (ring all, hunt-to-first-available)
-- **Call parking** (orbits `700`–`709`) and retrieval
-- **Paging zones** (`980`–`989`)
-- **Call-forward** (unconditional, on busy, on no-answer)
-- **Do-not-disturb** + DND dials
-- **Star codes** (echo test, DND toggle, etc.)
+---
 
-### Admin & provisioning
-- **Web dashboard** (HTTP API) — manage extensions, DND, monitor live calls
-- **LVGL touchscreen UI** (Guition JC3248W535, optional) — glossy retro operator-board aesthetic
-- **NVS provisioning** — inject credentials and config without rebuilding firmware
-- **Dual-OTA firmware updates** — safe binary rollout with fallback
-- **Flash-time configuration** — set Wi-Fi mode, AP security and the passphrase from the
-  browser flasher; the firmware applies them on first boot
+## Status
 
-### Security
-The device is an appliance on a local link, so the defences are layered rather than
-perimeter-based. [THREAT_MODEL.md](docs/THREAT_MODEL.md) is candid about what each one
-does and does not buy:
+Outbound calling to the public phone network is **verified on real hardware**: a
+Yealink T29 registered to a bench board placed a call that rang through to carrier
+voicemail, and a second that was answered with two-way audio.
 
-- **WPA2 on the SoftAP** (opt-in) — encrypts the dashboard, SIP signalling **and** RTP
-  audio in one move. Per-device passphrase, generated on the device, never baked into
-  the image. Off by default so a firmware update can't strand phones already associated
-  with a live access point.
-- **Dark-by-default HTTP admin plane** — on a provisioned device the listen socket isn't
-  even bound except inside a bounded window opened by a source-IP-verified DTMF code or
-  an authenticated operator
-- **Admin PIN + server-side session** on every mutating endpoint, with per-client
-  brute-force lockout and an aggregate backstop
-- **SIP digest auth** (RFC 2617) with a Learn mode for adopting an existing phone
-  fleet — runtime-selectable `open`/`learn`/`secure`; the registrar still **defaults
-  to open**, so this protects deployments that switch it on
-- **CSRF tokens + strict security headers** — the same-origin check deliberately admits
-  header-less clients like `curl`, so a per-session token is what actually closes the gap
-- **SDP admission gate** — every SDP body is structurally checked before any decoder
-  runs or it is relayed to a peer phone
-- **No SSH surface** — the second admin plane was deleted rather than hardened
+That is also the honest limit of the hardware evidence. One handset model, one
+board, one carrier. Everything else in the test suite is host-side: 414 GoogleTest
+cases plus real-SIP-stack interop (pjsua, SIPp) against the **desktop** binary.
+On-device RTP has no automated coverage — `RtpSender`/`RtpReceiver` compile to host
+stubs, so the green media tests exercise stubs, not silicon. OTA has never been
+exercised end to end. See [docs/PHONE_COMPATIBILITY.md](docs/PHONE_COMPATIBILITY.md)
+for what has actually been tried.
 
-> **Not** TLS. Self-signed HTTPS on a LAN appliance trains users to click through
-> certificate warnings, costs MCU RAM and CPU on a device carrying real-time audio, and
-> protects only the dashboard — not SIP or RTP. WPA2 at the link layer covers all three
-> for less. The reasoning is written up in [THREAT_MODEL.md §6](docs/THREAT_MODEL.md).
+---
 
-### Hardware flexibility
-| Transport | Board | Use case |
-|-----------|-------|----------|
-| **eth** (default) | W5500 wired Ethernet or LAN8720 on classic ESP32 | Office / PoE powered |
-| **wifi** | Generic ESP32-S3 + SoftAP | Portable / no cable |
-| **display** | Guition JC3248W535 (AXS15231B + LVGL) | Wallboard + touch UI |
-
-## Get it running in 2 minutes (desktop)
+## Try it in two minutes, no hardware
 
 ```bash
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
@@ -72,117 +54,204 @@ cmake --build build --config Release
 ./build/SipServer --ip 127.0.0.1 --port 5060 --web 8080
 ```
 
-Open the web UI: **http://127.0.0.1:8080**
+Open **http://127.0.0.1:8080**, point two softphones (Linphone, Zoiper, MicroSIP)
+at `sip:127.0.0.1:5060` as extensions `1001` and `1002`, and call each other.
+Dial `777` for an echo test, `999` to page every phone at once.
 
-Register two SIP softphones (Linphone, Zoiper, etc.) to `sip:127.0.0.1:5060`, dial each other, then dial `777` for the echo test.
+The dashboard is a patch-bay: every registered extension is a jack, lit by state,
+with cords showing ring-group membership.
 
-## Run it on hardware (ESP32-S3)
+## Run it on an ESP32-S3
 
-**No toolchain?** Flash a release straight from Chrome or Edge at
-**<https://glomargadaffi.github.io/pocket-dial/flasher/>** — plug the board in over USB,
-pick Ethernet / display / Wi-Fi, click Flash. The flasher can also write the Wi-Fi mode,
-access-point security and passphrase at the same time, which is the easiest way to
-configure the headless Ethernet and Wi-Fi variants. Or build it yourself:
+No toolchain required — flash a release from Chrome or Edge at
+**<https://glomargadaffi.github.io/pocket-dial/flasher/>**. Plug the board in over
+USB, pick your variant, click Flash.
 
-```bash
-# WiFi SoftAP (default for standard ESP32-S3 boards)
-idf.py set-target esp32s3
-idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
-
-# Or, Ethernet + touchscreen display
-idf.py set-target esp32s3
-idf.py -D SIP_TRANSPORT=display build
-idf.py -p /dev/ttyUSB0 -D SIP_TRANSPORT=display flash monitor
-```
-
-Low on RAM? Add `-D SIP_CONSTRAINED=1` to drop features and fit the classic ESP32 (512 KB RAM).
-
-For detailed setup, see **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** and **[docs/HARDWARE.md](docs/HARDWARE.md)**.
-
-## How it works inside
-
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — concurrency model, zero-heap-alloc hot path, outbox pattern for safe sockets
-- **[RTP.md](docs/RTP.md)** — media bridge, G.711 codec, how peer-to-peer streaming stays under 2 KB/s overhead
-- **[THREAT_MODEL.md](docs/THREAT_MODEL.md)** — STRIDE analysis, trust boundaries, and the honest residual risks
-
-## Capacity & constraints
-
-Compile-time pools; graceful degradation on exhaustion (503 responses). Three tiers:
-
-| Tier | Extensions | Concurrent calls | Board |
-|------|-----------|------------------|-------|
-| Pocket | 8 | 2 | Classic ESP32 (4 MB flash, constrained) |
-| Office | 32 | 8 | ESP32-S3 (16 MB flash, standard) |
-| Rack | 128+ | 32+ | Desktop (unlimited) |
-
-See **[docs/SCALING.md](docs/SCALING.md)** for details.
-
-## Building & testing
-
-Host build (fast dev loop, what CI gates on):
+Or build it:
 
 ```bash
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-ctest --test-dir build/tests --output-on-failure
+idf.py set-target esp32s3
+idf.py -D SIP_TRANSPORT=eth build          # W5500 / LAN8720 wired Ethernet
+idf.py -p /dev/ttyUSB0 -D SIP_TRANSPORT=eth flash monitor
 ```
 
-CI cross-compiles firmware on ESP-IDF v6.0.1 (the supported floor — v5.x no longer builds, and `main/CMakeLists.txt` says so at configure time), across esp32/esp32s3 and WiFi/Ethernet/display, and runs the full GoogleTest suite.
+| `SIP_TRANSPORT` | Hardware | Use case |
+|---|---|---|
+| `eth` | W5500 or LAN8720 wired Ethernet | Office, PoE — the best-tested path |
+| `wifi` | Generic ESP32-S3 + SoftAP | Portable, no cabling |
+| `display` | Guition JC3248W535 (LVGL touch) | Wallboard with an on-screen UI |
+| `lan8720` | Classic ESP32 + LAN8720 | Older hardware |
 
-See **[CONTRIBUTING_FIRMWARE.md](CONTRIBUTING_FIRMWARE.md)** before sending firmware PRs.
+Low on RAM? `-D SIP_CONSTRAINED=1` trims features to fit a classic ESP32.
 
-## Optional: Conference mixing & external audio
-
-The **`MixBus`** and **`MediaBridge`** are fully tested but **not wired into call routing by default** — they're extension points for a fork:
-
-- **`MediaBridge`** glues RTP streams to a vendor-neutral `AnchorClient` interface (e.g., a radio transmitter, recording system, external audio processor)
-- **`MixBus`**: N-way conference mixer with assembly-optimized kernels
-
-If you need conference calls or external bridging, see **[docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md)** for the design rationale.
-
-## Docs
-
-**Getting started:**
-- [SETUP_GUIDE.md](docs/SETUP_GUIDE.md) — first steps
-- [HARDWARE.md](docs/HARDWARE.md) — boards, wiring, PoE
-- [PHONE_COMPATIBILITY.md](docs/PHONE_COMPATIBILITY.md) — phones people have actually registered
-
-**Hacking:**
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — concurrency, memory model, hot path
-- [RTP.md](docs/RTP.md) — media bridge, codec handling
-- [CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md) — optional audio mixing
-
-**Deployment:**
-- [PROVISIONING.md](docs/PROVISIONING.md) — inject credentials without rebuilding
-- [OTA.md](docs/OTA.md) — dual-OTA safe firmware updates
-- [THREAT_MODEL.md](docs/THREAT_MODEL.md) — security architecture, and why not TLS
-- [SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md) — known constraints
-
-**Ops:**
-- [docs/API.md](docs/API.md) — HTTP API reference (extensions, DND, CDR, live calls)
-- [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — "it's not working"
-- [Browser flasher](https://glomargadaffi.github.io/pocket-dial/flasher/) — flash a release over USB from Chrome/Edge, no toolchain
-- [FLASHING.md](docs/FLASHING.md) — ESP-IDF & build recipes
-
-## License
-
-**Apache License 2.0** — see [LICENSE](LICENSE).
-
-The original SIP engine (BarGabriel/SipServer, MIT-licensed) is preserved verbatim in [LICENSE-MIT](LICENSE-MIT). All extensions (hardware layers, media bridge, call features, UI, security, tests) are Apache 2.0. See [NOTICE](NOTICE) for full attribution.
-
-## Next steps
-
-- **[Quick start](#get-it-running-in-2-minutes-desktop)** on your laptop first.
-- **[SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** for hardware flashing.
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** to understand the design.
-- **[PHONE_COMPATIBILITY.md](docs/PHONE_COMPATIBILITY.md)** to check your phone model.
-
-## Companion projects
-
-- [pocket-dial-handset](https://github.com/GlomarGadaffi/pocket-dial-handset) — ESP32-S3 push-to-talk SIP handset that registers to pocket-dial
-- [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer/) — the original MIT-licensed SIP server (see [LICENSE-MIT](LICENSE-MIT))
+Full instructions: **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** ·
+**[docs/HARDWARE.md](docs/HARDWARE.md)** · **[docs/FLASHING.md](docs/FLASHING.md)**
 
 ---
 
-**Questions?** Open an issue or check [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+## What it does
+
+### Call control
+Blind transfer (REFER) · attended transfer (REFER with Replaces) · hold and resume
+· RFC 3311 UPDATE · RFC 4028 session timers · call park to orbits `700`–`709` ·
+group pickup `*8` and directed pickup `**<ext>` · ring groups (ring-all or
+sequential hunt) · call forward on always / busy / no-answer · per-extension DND ·
+paging zones `980`–`989` and `999` all-page · busy-lamp-field presence
+(`SUBSCRIBE`/`NOTIFY`, RFC 4235 dialog events) · DTMF star codes over SIP INFO.
+
+### Routing
+A bounded, ordered dial plan maps a dialled pattern to an action:
+
+```
+9XXXXXXXXXX  →  trunk       strip 1, prepend 1     outside line
+6XX          →  group       600                    ring group
+5*           →  page        981                    paging zone
+```
+
+`X` matches one digit; a trailing `*` matches the rest. First match wins. Rules are
+evaluated **after** the reserved feature extensions, so a catch-all can never
+shadow the echo test or a park orbit. Edit them from the dashboard's **Dial Plan**
+button, or `POST /api/dialplan`.
+
+> **The dial plan is the only route to an outside line.** There is no hardcoded `9`
+> prefix and no "unknown number goes to the trunk" fallback. A board with an empty
+> dial plan answers `404` to every outside number without ever reaching the carrier.
+
+### Reserved extensions
+| | |
+|---|---|
+| `777` | Echo test — your phone streams to itself; the board touches no audio |
+| `999` | Page every registered phone, race to answer |
+| `440` | Server-generated test tone |
+| `888` | Meet-me conference, up to 4 legs, mixed on the board |
+| `555` | Bridge to an external audio system (see Outside lines) |
+| `700`–`709` | Park orbits |
+| `980`–`989` | Paging zones |
+
+### Admin
+A web dashboard (always reachable, username + password, forced setup on first
+boot), call-detail records, live SIP tracing with `.pcap` export, dual-slot OTA
+updates with rollback, and zero-touch phone provisioning over
+`GET /config/<mac>.cfg`.
+
+---
+
+## Audio: what touches the board, and what doesn't
+
+This distinction matters more than any feature list, so it gets its own section.
+
+| Call type | Does the board carry audio? |
+|---|---|
+| Extension → extension | **No.** Direct phone-to-phone RTP, including on hold, park and transfer |
+| `777` echo test | **No.** The SDP is looped back; the phone streams to itself |
+| `440` tone | Yes — the board generates and sends it |
+| `888` conference | Yes — decodes, mixes and re-encodes every leg |
+| `555` / outside lines | Yes — the board bridges audio to the external system |
+
+Codecs on peer-to-peer legs: **PCMU, PCMA and G.722** — the board narrows the offer
+to what it can broker and otherwise leaves the phones to negotiate. Legs the board
+terminates itself are PCMU-only.
+
+There is no transcoding, and none is planned. See [docs/RTP.md](docs/RTP.md).
+
+---
+
+## Outside lines
+
+pocket-dial reaches the public network through a **call-control API**, not a SIP
+trunk. The shipping client speaks the 3CX Call Control API: OAuth2, a WebSocket for
+call control, and PCM16 audio over chunked HTTPS. Configure it under
+**Interconnect** on the dashboard, then point a dial-plan `trunk` rule at it.
+
+Two consequences worth knowing before you plan around it:
+
+- **The box never registers to an ITSP.** Nothing in the tree sends a SIP `REGISTER`
+  as a client, so it cannot connect to a generic SIP carrier today. That is
+  [#164](https://github.com/GlomarGadaffi/pocket-dial/issues/164).
+- **One outside call at a time.** `POCKETDIAL_MAX_ANCHOR_CALLS` is 1.
+
+There is also no E.164 normalisation anywhere — `+15551234567`, `15551234567` and
+`5551234567` are three different destinations to the dial plan and the call log.
+
+---
+
+## Security
+
+The device is an appliance on a local link, so the defences are layered rather than
+perimeter-based. [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) is candid about what
+each one does and does not buy.
+
+**Read this first:** the registrar ships in **open** mode. A freshly flashed board
+accepts any `REGISTER` and any `INVITE` from anything that can reach it. SIP digest
+authentication is fully implemented and there are two stricter modes — `learn`
+(trust-on-first-use, then lock each extension to its MAC) and `secure` (digest
+required) — but you must turn one on. See [docs/LEARN_MODE.md](docs/LEARN_MODE.md).
+
+What is on by default:
+
+- **Username + password on the dashboard**, with forced credential setup on first
+  boot, per-client brute-force lockout, server-side sessions and CSRF tokens
+- **SDP admission gate** — every SDP body is structurally checked before any
+  decoder runs or it is relayed onward
+- **Per-source-IP rate limiting** on the SIP socket, with an optional CIDR allowlist
+- **No SSH surface** — the second admin plane was deleted rather than hardened
+
+Optional: **WPA2 on the SoftAP**, which encrypts the dashboard, SIP signalling and
+RTP in one move. It is off by default so a firmware update cannot strand phones
+already associated with an open AP.
+
+Not TLS. On a LAN appliance, self-signed certificates train users to click through
+warnings, cost MCU RAM and CPU on a device carrying real-time audio, and protect
+only the dashboard — not SIP or RTP. The reasoning is in
+[THREAT_MODEL.md §6](docs/THREAT_MODEL.md).
+
+---
+
+## What it deliberately does not do
+
+No voicemail, no IVR or auto-attendant, no music on hold, no call recording, no
+queues or ACD, no time-based routing, no MWI, no fax, no video, no multi-tenancy.
+
+Most of these need the board to sit in the audio path for *ordinary* calls, which
+is the one thing the architecture is built to avoid. Some are simply unbuilt. The
+distinction — and which side of it each feature falls on — is in
+[docs/FEATURE_ROADMAP.md](docs/FEATURE_ROADMAP.md).
+
+---
+
+## Capacity
+
+Compile-time pools, sized per tier. Exhaustion degrades gracefully to `503` rather
+than failing unpredictably.
+
+| Tier | Extensions | Concurrent calls | Conference legs | Board |
+|---|---|---|---|---|
+| Pocket | 8 | 2 | — | Classic ESP32, 4 MB flash, `SIP_CONSTRAINED` |
+| Office | 32 | 8 | 4 | ESP32-S3, 16 MB flash — the default |
+| Rack | 128+ | 32+ | 8 | Desktop build |
+
+Details and the reasoning behind the numbers: [docs/SCALING.md](docs/SCALING.md).
+
+---
+
+## How it works inside
+
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the concurrency model: core-pinned
+  tasks, an outbox pattern that keeps socket syscalls outside the lock, a
+  double-buffered snapshot so the dashboard never blocks signalling, and a
+  zero-heap-allocation hot path
+- **[RTP.md](docs/RTP.md)** — the media bridge, G.711 codecs, and what the board
+  does and doesn't carry
+- **[SCALING.md](docs/SCALING.md)** — where the ceilings are and why
+- **[THREAT_MODEL.md](docs/THREAT_MODEL.md)** — STRIDE analysis and the residual risks
+- **[API.md](docs/API.md)** — every HTTP endpoint
+- **[CONTRIBUTING.md](docs/CONTRIBUTING.md)** — build, test and PR workflow
+
+---
+
+## Licence
+
+Apache License 2.0 for all work since the fork. pocket-dial began as a fork of
+[BarGabriel/SipServer](https://github.com/BarGabriel/SipServer) (MIT); that
+licence is preserved in [LICENSE-MIT](LICENSE-MIT) and the attribution in
+[NOTICE](NOTICE).

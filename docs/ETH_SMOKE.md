@@ -15,14 +15,18 @@ board's captive-AP dance.
 > ship in the ESP-IDF Python env.
 
 > [!IMPORTANT]
-> **This runbook assumes a freshly flashed, unprovisioned board** — no admin PIN, registrar
-> in the default `open` mode. That is the state §3 leaves you in, and it is the state the
-> HTTP checks below are written against. On a **provisioned** board (an admin PIN exists)
-> two things change and steps 5–6 read differently:
-> * The HTTP listener is **dark by default** — `curl` gets *connection refused*, not a
->   status code (see step 6 and [THREAT_MODEL.md §5.5](THREAT_MODEL.md)).
-> * Mutating API calls need a session **and** an `X-CSRF` header
->   ([API.md §2.1](API.md)) — the read-only checks here do not.
+> **On a freshly flashed board the HTTP step comes BEFORE the SIP step, and it is not
+> optional.** `app_main()` holds the SIP task down until an admin credential has been
+> committed (`main/esp_main_eth.cpp:468-496` — `[boot] device unprovisioned — SIP stack
+> held dark until credential committed`, then a poll on `AdminAuth::credentialIsSet()`).
+> The HTTP dashboard is launched first and unconditionally, precisely so you can do that
+> (`esp_main_eth.cpp:466`). So on a virgin board:
+> * port 80 answers immediately — the listener **always** accepts, there is no
+>   socket-level dark/open gate any more ([API.md §0](API.md), and
+>   `tests/AdminHttpGate_test.cpp` pins it as a regression);
+> * port 5060 does **not** answer, and that is the gate working, not a fault;
+> * after 30 minutes with no credential the board reboots and re-arms the same wait
+>   (`kMaxCredentialWaitSec`, `esp_main_eth.cpp:473`).
 >
 > The `eth` build has **no SoftAP**, so SoftAP WPA2 (`ap_secure`) is not a factor on these
 > boards. The registrar admission mode is.
@@ -106,58 +110,101 @@ In the captured log, confirm three things in order:
 
 Record the IP as `<BOARD_IP>`.
 
+Then read one more line, because it decides whether §5 or §6 is your next step:
+
+```
+[boot] device unprovisioned — SIP stack held dark until credential committed
+```
+
+* **Present** → the board has never had an admin credential committed. Do §5 now; SIP will
+  not answer until you do.
+* **Absent** → the board is past the boot gate (NVS key `provisioned`) and SIP is already
+  running. §5 and §6 can be done in either order. Note that this flag is a **latch**:
+  `POST /api/factory-reset` does not clear it (`HttpServer::sendApiFactoryReset` erases the
+  credential, the Wi-Fi keys, `ap_secure`/`ap_psk`/`cfgseed_gen` and the telephony/DID/CDR
+  namespaces — not `provisioned`, and **not** the registrar mode either, see
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md#all-phones-stopped-registering-at-once)), so a
+  factory-reset board comes back on the default credential but with SIP **up**. Only a full
+  NVS erase re-arms the boot gate.
+
 Two optional lines are worth noting if you see them:
 
 * `[boot] applied flash-time cfgseed` — the board carries a `cfgseed` record written by the
   browser flasher and has just applied it to NVS. On an `eth` board the seed's AP/STA fields
   are meaningless, but `regMode` is not: a board seeded `regMode=2` comes up with the SIP
-  registrar in **`secure`** mode. Read step 5 accordingly. The line's **absence is normal**
+  registrar in **`secure`** mode. Read step 6 accordingly. The line's **absence is normal**
   — a board flashed before `cfgseed` existed, or one whose seed generation was already
   applied, prints nothing.
 * An NVS init error early in the log — the firmware erases and re-inits NVS on
   `ESP_ERR_NVS_NO_FREE_PAGES` / `NEW_VERSION_FOUND`, which also clears `cfgseed_gen` and so
-  re-arms the flash-time seed on the next boot (`DeviceConfig::applyFlashSeed()`).
+  re-arms the flash-time seed on the next boot (`DeviceConfig::applyFlashSeed()`). It also
+  clears `provisioned`, so the boot gate above comes back.
 
-## 5. SIP smoke — the signaling stack is alive
+## 5. HTTP dashboard smoke — the management surface, and forced setup
 
-From the dev machine (same LAN), poke the registrar. **Any** SIP status line back
-(`200 OK`, `401 Unauthorized`, `403 Forbidden`) means the UDP receiver + parser + handler
-are all working — that's a pass.
-
-```powershell
-python .smoke\sip_probe.py <BOARD_IP> 5060
-# -> [probe] RESPONSE to REGISTER ...: SIP/2.0 401 Unauthorized
-# -> [probe] RESULT: ALIVE   (exit 0)
-```
-
-> [!NOTE]
-> **`401` is a pass here, and on a `secure` board it is the only answer you will get.** In
-> the default `open` registrar mode a `401` back is just the probe's unauthenticated
-> REGISTER being answered. If the board was seeded (or configured) into `secure` mode, every
-> `REGISTER` is digest-challenged — the probe can never reach `200 OK`, and that is still a
-> pass for *this* test: it proves the stack parses and answers. It does **not** prove a real
-> handset can register. Check the mode with `curl.exe -s http://<BOARD_IP>/api/registrar` —
-> a read-only `GET` needing no `X-CSRF`, but session-gated once an admin PIN exists, so it
-> answers without a cookie only on the unprovisioned board this runbook assumes.
-
-## 6. HTTP dashboard smoke — the management surface is up
-
-The eth build serves the HTTP dashboard on **port 80**.
+The eth build serves the HTTP dashboard on **port 80**, on every boot, provisioned or not.
 
 ```powershell
 curl.exe -s -o NUL -w "HTTP %{http_code}\n" http://<BOARD_IP>/
-# -> HTTP 200   (or 401 if the dashboard requires admin auth — still 'alive')
+# -> HTTP 200
 ```
 
-> [!IMPORTANT]
-> **A refused connection here is not necessarily a dead board.** Once an admin PIN is
-> provisioned, the HTTP listener is closed except inside a bounded open window (default
-> 600 s) — `curl` fails to connect at all rather than returning a status
-> ([API.md §0](API.md)). On a freshly flashed board this cannot happen: unprovisioned
-> devices listen unconditionally. If you hit it on a board that has been used before, either
-> re-open the window (dial `*4887` from the registered admin extension) or erase NVS and
-> re-run the smoke loop from step 3 — see
-> [TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-dashboard-went-dark-after-i-set-a-pin).
+`GET /` is ungated and so are `/api/status`, `/api/cdr`, `/api/wifi/scan`,
+`/api/admin/status` and `/api/ota/status` (`HttpServer::handleClient()` dispatch,
+`src/Helpers/HttpServer.cpp:433-711`). A quick posture read costs one request:
+
+```powershell
+curl.exe -s http://<BOARD_IP>/api/admin/status
+# -> {"provisioned":false,"needsSetup":true,"authenticated":false,"sessionRemainingSec":0}
+```
+
+`"needsSetup":true` means the board is still on the shipped default login
+(`admin`/`admin`, `AdminAuth::kDefaultUsername`/`kDefaultPassword`) and
+`HttpServer::requireAdmin()` will refuse **every** other admin-gated route — GETs
+included — with `403 {"error":"setup_required"}` until you replace it
+(`HttpServer.cpp:1864-1873`). Do that now; the SIP stack is waiting on it.
+
+<a name="login-recipe"></a>
+```bash
+DEVICE=http://<BOARD_IP>
+JAR=cookies.txt
+
+# 1) Log in. On a board that has never been set up this is the shipped default.
+LOGIN=$(curl -s -c "$JAR" -H "Origin: $DEVICE" \
+     -X POST --data "username=admin&password=admin" \
+     "$DEVICE/api/admin/login")
+# -> {"status":"ok","authenticated":true,"needsSetup":true,"csrf":"3f2a...e91c"}
+
+CSRF=$(printf '%s' "$LOGIN" | sed -n 's/.*"csrf":"\([0-9a-f]*\)".*/\1/p')
+[ -n "$CSRF" ] || { echo "login failed: $LOGIN" >&2; exit 1; }
+
+# 2) If the login said needsSetup:true, replace the default credential before
+#    anything else. Password >= 8 chars (AdminAuth::kMinPasswordLength).
+curl -s -b "$JAR" -H "Origin: $DEVICE" -H "X-CSRF: $CSRF" \
+     -X POST --data "username=admin&password=CHANGE-THIS-PASSWORD" \
+     "$DEVICE/api/admin/set-credential"
+# -> {"status":"ok","provisioned":true,"needsSetup":false}
+
+# The session and its CSRF token survive the credential change, so "$JAR"/"$CSRF"
+# keep working — no second login needed.
+```
+
+Every **mutating** call from here on carries three things: the cookie, a matching `Origin`
+(or none at all — `curl` sending no `Origin` is deliberately allowed), and `X-CSRF`.
+This is the same recipe [TROUBLESHOOTING.md](TROUBLESHOOTING.md#403-on-an-api-call-that-used-to-work)
+and [API_TESTS.md §2](API_TESTS.md) use; keep them in step.
+
+> [!NOTE]
+> The optional `dtmfPin=` field on the same `set-credential` call sets the **separate**
+> numeric PIN for the phone-keypad admin menu (`*PIN#code`). It has no default and the
+> menu stays entirely unreachable until you set one — it is not the web login and setting
+> one is not required to finish setup.
+
+Seconds after the credential lands you should see, in a still-running serial capture:
+
+```
+[boot] credential set — unblocking SIP stack
+```
 
 Optionally run the shared HTTP smoke suite against it (takes a bare `IP` or `host:port`,
 defaults to the device AP if omitted — so pass the board's LAN IP explicitly):
@@ -167,12 +214,47 @@ tests/http/test_api.sh <BOARD_IP>
 ```
 
 > [!WARNING]
-> **`test_api.sh` provisions a PIN** (`1234`, in its last suite) and leaves it set. After it
-> runs, the board is provisioned: the HTTP plane goes dark on the next window expiry and
-> every mutating call needs an `X-CSRF` header. Run it only on a scratch board you are
-> willing to erase, and factory-reset or `erase_region 0x9000 0x6000` afterwards. The suite
-> covers the CSRF gate itself (`TC-AUTH-07a` expects `403` for cookie-without-token,
-> `TC-AUTH-07b` expects `200` with it), so a `403` in that row is a pass, not a fault.
+> **`test_api.sh` sets a real admin credential and leaves it set.** Its first suite logs in
+> with `admin`/`admin` and completes setup as `admin` / `realpassword123`
+> (`tests/http/test_api.sh:222`) — every later run, and every manual `curl` afterwards, must
+> use that password, not the default. Its **last** suite (`TC-AUTH-11`) deliberately fails
+> five logins to trip the brute-force lockout, so the board answers `429` on
+> `/api/admin/login` for at least 60 s after the run finishes; that is the suite passing,
+> not a fault. Run it on a scratch board you are willing to erase, and factory-reset or
+> `erase_region 0x9000 0x6000` afterwards. 27 test cases, and the ordering in its header
+> comment is load-bearing — the auth suite runs **first** now, because nothing else works
+> without the session it establishes.
+
+## 6. SIP smoke — the signaling stack is alive
+
+From the dev machine (same LAN), poke the registrar. **Any** SIP status line back
+(`200 OK`, `401 Unauthorized`, `403 Forbidden`) means the UDP receiver + parser + handler
+are all working — that's a pass.
+
+```powershell
+python .smoke\sip_probe.py <BOARD_IP> 5060
+# -> [probe] RESPONSE to REGISTER ...: SIP/2.0 200 OK
+# -> [probe] RESULT: ALIVE   (exit 0)
+```
+
+> [!NOTE]
+> **Which status you get depends on the registrar mode, and all of them are a pass.**
+> * **`open`** — the shipped default. There is no SIP authentication at all, so the probe's
+>   REGISTER for extension `9001` is simply accepted: `200 OK`. It really does take a client
+>   slot; the registrar prunes it after ~15 s of not answering `OPTIONS`.
+> * **`learn`** — an unknown MAC claiming an unclaimed extension is adopted on first
+>   contact, so the probe is also likely to be answered `200 OK`.
+> * **`secure`** — every `REGISTER` is digest-challenged (RFC 2617), so the probe can never
+>   reach `200 OK`. `401` is the answer and it is still a pass for *this* test: it proves
+>   the stack parses and answers. It does **not** prove a real handset can register.
+>
+> Check the mode with `curl -s -b "$JAR" http://<BOARD_IP>/api/registrar` — a read-only
+> `GET` that needs no `X-CSRF`, but it **is** session-gated and refuses with
+> `403 {"error":"setup_required"}` until §5 is done, so run §5 first.
+
+> [!NOTE]
+> **`NO RESPONSE` on a board you have not set up yet is expected, not a fault** — see the
+> boot gate in §4. Finish §5 and re-run the probe.
 
 ---
 
@@ -183,8 +265,9 @@ tests/http/test_api.sh <BOARD_IP>
 | 1 | Correct pin map | `W5500 board: LilyGO T-ETH-ELITE S3 …` in boot log |
 | 2 | PHY link | `Ethernet link UP` |
 | 3 | DHCP | `IP: 192.168.x.y` |
-| 4 | SIP stack | `sip_probe.py` prints `RESULT: ALIVE` (any SIP status line — `401` included) |
-| 5 | HTTP dashboard | `curl` returns `200` (or `401`) on port 80. *Connection refused* is a fail **only** on an unprovisioned board — otherwise it is the dark-by-default gate |
+| 4 | HTTP dashboard | `curl` returns `200` on `GET /` on port 80. *Connection refused* is **always** a fail — the listener is unconditional |
+| 5 | Forced setup completes | `POST /api/admin/set-credential` → `200 {"needsSetup":false}`, and the serial log prints `[boot] credential set — unblocking SIP stack` |
+| 6 | SIP stack | `sip_probe.py` prints `RESULT: ALIVE` (any SIP status line — `200`, `401` or `403`) |
 
 ## Troubleshooting
 
@@ -192,13 +275,18 @@ tests/http/test_api.sh <BOARD_IP>
 |---|---|
 | No `Ethernet link UP` at all | Cable/switch dead, or wrong SPI pin map — recheck the `W5500 board:` line matches your hardware. On a breadboard, keep SPI leads <5 cm (W5500 runs 36 MHz); see [HARDWARE.md §9B](HARDWARE.md). |
 | Link UP but no `IP:` | No DHCP server on that LAN segment, or the lease is slow. Set `USE_STATIC_IP 1` (+ the `STATIC_IP/GATEWAY/NETMASK` defines) at the top of `main/esp_main_eth.cpp` and reflash to bypass DHCP. |
-| `sip_probe.py` → `NO RESPONSE` but board has an IP | Wrong IP, a firewall on the dev machine, or you're not on the same subnet. Ping `<BOARD_IP>` first. |
+| `sip_probe.py` → `NO RESPONSE`, but HTTP answers | Almost always the boot provisioning gate: the board has no admin credential yet and the SIP task has not been started (`esp_main_eth.cpp:468-496`). Do §5, watch for `[boot] credential set — unblocking SIP stack`, re-probe. |
+| `sip_probe.py` → `NO RESPONSE` and HTTP is also dead | Wrong IP, a firewall on the dev machine, or you're not on the same subnet. Ping `<BOARD_IP>` first. |
+| The board reboots every ~30 minutes and nothing is configured | The provisioning wait is bounded: no credential within `kMaxCredentialWaitSec` (1800 s) and it restarts to retry (`esp_main_eth.cpp:473-482`). Complete §5. |
 | Board never enumerates for flashing | OTG-switch position / native-USB; BOOT-hold + RST tap to enter download mode. |
 | Wrong board's pins compiled | You passed (or defaulted) the wrong `PD_ETH_BOARD`. Rebuild; the `W5500 board:` boot line is the ground truth. |
-| `curl` says **connection refused** on port 80, but SIP answers | Not a fault: the board is provisioned and the dark-by-default HTTP window has expired ([API.md §0](API.md)). Reopen with `*4887` from the registered admin extension, or wipe NVS (`esptool.py -p COMx erase_region 0x9000 0x6000`) to return it to the unprovisioned state this runbook assumes. |
-| `403 {"error":"missing or invalid CSRF token"}` from a script | A provisioned board requires the per-session `X-CSRF` header on mutating calls. Capture `"csrf"` from the `POST /api/admin/login` response ([API.md §2.1](API.md), worked example in [OTA.md §3.2](OTA.md)). Read-only checks in this runbook are unaffected. |
-| `429` on `/api/admin/login` | Brute-force lockout: 5 failures per client, 20 aggregate, cooldown doubling from 60 s to ~16 min and cleared only by a correct PIN ([THREAT_MODEL.md §5.2](THREAT_MODEL.md)). Wait it out. |
-| A real handset gets `401` forever, though `sip_probe.py` passes | The registrar is in `secure` mode (possibly seeded at flash time via `cfgseed`'s `regMode`, which works from v1.4.1 — on v1.3.0/v1.4.0 rule that out, see [#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)) and this phone has no digest secret. Check `GET /api/registrar`; recovery is in [TROUBLESHOOTING.md](TROUBLESHOOTING.md#all-phones-stopped-registering-at-once). |
+| `curl` says **connection refused** on port 80 | A real fault. The HTTP listener accepts unconditionally on every build and every provisioning state — there is no dark/open gate to reopen (`tests/AdminHttpGate_test.cpp`, `AdminHttpGate.Boot_Provisioned_StillListensImmediately`). Check the board is at the IP you think it is, that `http_dashboard` started in the serial log, and that nothing on the dev machine is filtering port 80. |
+| `403 {"error":"setup_required"}` from any admin route | The board is still on the `admin`/`admin` default. Complete §5's `set-credential` step; nothing else — not even gated `GET`s — is permitted first (`HttpServer.cpp:1864-1873`). |
+| `403 {"error":"missing or invalid CSRF token"}` from a script | A mutating call needs the per-session `X-CSRF` header. Capture `"csrf"` from the `POST /api/admin/login` response ([API.md §0](API.md), worked example in §5 above and [OTA.md §3.2](OTA.md)). Read-only checks are unaffected. |
+| `401 {"error":"invalid username or password"}` on login | Wrong credential. If someone has run `test_api.sh` against this board, the password is `realpassword123`, not `admin`. |
+| `POST /api/factory-reset` answers `501` on this board | Expected on `eth`/`lan8720`. The Wi-Fi-key erase, the `200` response and the reboot all sit inside `#if defined(POCKETDIAL_HAS_WIFI)` (`HttpServer.cpp:2130-2149`), which these transports deliberately do not define (`main/CMakeLists.txt:133-136`). The credential, the DeviceConfig keys and the telephony/DID/CDR namespaces **were** cleared before that point — power-cycle the board yourself. Do not read the `501` as "nothing happened". Source-verified, not hardware-tested. |
+| `429` on `/api/admin/login` | Brute-force lockout: 5 failures per client, 20 aggregate, cooldown doubling from 60 s to ~16 min and cleared only by a **correct login** (`AdminAuth.hpp:60-82`, [THREAT_MODEL.md §5.2](THREAT_MODEL.md)). Wait it out, or power-cycle — the counters are in-process only. |
+| A real handset gets `401` forever, though `sip_probe.py` passes | The registrar is in `secure` mode (possibly seeded at flash time via `cfgseed`'s `regMode`, which works from v1.4.1 — on v1.3.0/v1.4.0 rule that out, see [#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)) and this phone has no digest secret. In `secure` mode INVITE is challenged too, not just REGISTER. Check `GET /api/registrar`; recovery is in [TROUBLESHOOTING.md](TROUBLESHOOTING.md#all-phones-stopped-registering-at-once). |
 | Settings you cleared come back after a reboot | The `cfgseed` partition re-applies at boot whenever `cfgseed_gen` is missing — which a factory reset or an NVS erase deliberately makes true. Erase the seed too: `esptool.py -p COMx erase_region 0xFFF000 0x1000` (16 MB layout only). |
 
 **Related:** [HARDWARE.md §5](HARDWARE.md) (Elite pinout) · [HARDWARE_SELECTION.md](HARDWARE_SELECTION.md) · [TROUBLESHOOTING.md](TROUBLESHOOTING.md) · [API.md](API.md) · [THREAT_MODEL.md](THREAT_MODEL.md)

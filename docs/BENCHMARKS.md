@@ -1,8 +1,38 @@
 # Pocket-Dial Firmware: Performance Benchmarks & Methodology
 
+> [!CAUTION]
+> ## Every number in sections 1–4 of this document is MODELLED. None of it was measured.
+>
+> These are desk estimates written on 2026-06-01 (commit `8be61da`) before any board
+> was in the loop. They are **projections**, not benchmarks, despite the column headers
+> and the confident tone. Section 5 is a test plan that **was never executed as written**.
+>
+> **Where real measurements exist, they live in
+> [`tests/load/STRESS_FINDINGS.md`](../tests/load/STRESS_FINDINGS.md)** (display build on a
+> live JC3248W535, post-fix commit `b04ecac`, 2026-06-04; plus a host-build multi-source-IP
+> run for Issue #79). **Those measurements contradict this document in two places and
+> falsify one of its PASS verdicts outright.** Each affected table below carries an inline
+> correction box. Where the two disagree, the measurement wins.
+>
+> | | |
+> |---|---|
+> | Written | 2026-06-01, commit `8be61da` — entirely modelled |
+> | Banner + correction boxes added | 2026-09-13, HEAD `fbad51b` |
+> | Re-modelled or re-measured since? | **No.** The projections have not been revised; the real numbers were simply never folded back in. |
+>
+> Treat the tables as *budgets someone once proposed*, useful for sizing arguments and
+> for seeing what the design intended — not as evidence about how the firmware behaves.
+
 This document outlines the performance benchmark plan, theoretical resource models, and live-board physical testing methodologies for the post-refactor **pocket-dial ESP32 firmware**. 
 
 Since pocket-dial is deployed across multiple hardware form factors (headless SoftAP modules, W5500 Ethernet boards, and smart-display units running high-frequency graphics), this document establishes rigorous resource budgets and measurement guidelines rather than assuming a single physical board setup.
+
+> [!NOTE]
+> **Reading the measurements against these models.** Every on-device number that exists
+> was taken on **Target B (the ESP32-S3 smart display)** in STATION mode. That build's
+> core map is the *opposite* of the §2 model below: on the display build SIP and HTTP run
+> on Core 0 while `lvgl_task` is pinned to Core 1. So the display measurements bound what
+> the *display* build does; Targets A and C have never been profiled at all.
 
 ---
 
@@ -23,6 +53,28 @@ The post-refactor tasks are allocated generous stacks, resulting in highly secur
 
 ### Stack Allocations vs. Projected Watermark Estimates
 
+> [!WARNING]
+> **The "HTTP client thread" row below was falsified on hardware.** Every figure in
+> that row is a projection, and the projection was wrong in the direction that matters.
+>
+> On a live S3 display board in STA mode the HTTP server accepted TCP connections and
+> then **RST them without responding**. Root cause, from
+> [`tests/load/STRESS_FINDINGS.md`](../tests/load/STRESS_FINDINGS.md): `sendApiStatus`
+> **overflowed the ~3 KB default pthread stack on-device**. Moving the 4 KB read buffer
+> to the heap — the entire argument of the subsection immediately below — did *not*
+> keep the thread under the default limit, because the read buffer was never the only
+> thing on that stack. The projected "1,450 bytes peak / 1,622 free / **PASS**" never
+> happened.
+>
+> The real fix was to stop relying on the default at all:
+> `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192`
+> ([`sdkconfig.defaults:68`](../sdkconfig.defaults#L68)), plus binding `INADDR_ANY`
+> (commit `b04ecac`, 2026-06-04). Any current build inherits the 8 KB pthread stack;
+> the "~3,072 *Default*" figure in the table is no longer the shipped configuration.
+>
+> The other three rows have **never been measured** — the §5 Phase 1 `vTaskList`
+> procedure was not run, so no real high-water mark exists for any task on any board.
+
 | Task Name | Core | Allocated Stack (Bytes) | Projected Peak Stack Usage (Bytes) | Projected High-Water Mark (Free Bytes) | Technical Risk Analysis & Design Details |
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **`sip_server_task`** | Core 1 | 8,192 | 3,840 | 4,352 | Handles the 1Hz ticking engine, keeps alive, and sweeps expired clients. Low risk of recursion or heavy frames. |
@@ -31,6 +83,16 @@ The post-refactor tasks are allocated generous stacks, resulting in highly secur
 | **HTTP client thread** | Core 0 | ~3,072 *Default* | 1,450 | 1,622 | Each active HTTP socket runs in a detached `pthread`. **PASS due to heap shift of 4 KB read buffer.** |
 
 ### 💡 Why HTTP Client Threads Do Not Overflow pthread Defaults
+
+> [!CAUTION]
+> **This subsection's conclusion is false as stated, and is kept only as the record of
+> what was believed in June 2026.** They *did* overflow the pthread default — see the
+> correction box above. The heap-shift described here is real and still in the code
+> ([`HttpServer.cpp:271`](../src/Helpers/HttpServer.cpp#L271)), and it was a necessary
+> change; it just was not a *sufficient* one. The claim that it "keeps the stack
+> footprint below the default pthread limits" is the specific sentence hardware
+> disproved. Builds now raise the default to 8192 instead of fitting under ~3 KB.
+
 In the original design, allocating a stack-local buffer like `char buf[4096]` inside the HTTP connection handler would immediately exceed the ~3 KB default pthread stack limit allocated by the ESP-IDF RTOS layer, causing a silent stack overflow or memory corruption.
 
 In the post-refactor design (`HttpServer.cpp:141-144`), we shift the buffer to the heap:
@@ -48,6 +110,21 @@ The ESP32 possesses a unified SRAM map, but internal memory is divided into Inst
 We estimate heap consumption across three key operating states:
 
 ### Heap Consumption Models per Target State
+
+> [!NOTE]
+> **Modelled. One data point exists and the model was pessimistic.** The only real heap
+> figure recorded on hardware is "~200 KB free" on the S3 display build
+> ([`tests/load/STRESS_FINDINGS.md`](../tests/load/STRESS_FINDINGS.md), in the discussion
+> of raising the lwIP mailbox sizes) — against the 120 KB projected for that target in
+> the table below. That is a single observation under unstated conditions, so it does not
+> replace the row; it only shows the estimate was conservative rather than optimistic.
+> The State 1 / 2 / 3 deltas, the fragmentation grades, and Targets A and C have never
+> been measured. The §5 Phase 2 `heap_caps_*` procedure was not run.
+>
+> Note also that the pool sizes quoted below as literal 32 / 8 are now compile-time
+> knobs — `POCKETDIAL_MAX_CLIENTS` / `POCKETDIAL_MAX_SESSIONS`
+> ([`src/SIP/PoolConfig.hpp`](../src/SIP/PoolConfig.hpp)) — which default to those same
+> values. A build that raises them moves every number in this section.
 
 ```
   [State 1: Idle Baseline] ──> Pre-allocates static pools (~10 KB DRAM overhead)
@@ -87,6 +164,37 @@ We estimate heap consumption across three key operating states:
 
 We model request processing latencies based on the network and storage activities required for each HTTP endpoint.
 
+> [!WARNING]
+> **Measured latencies exist for two of these endpoints and both are roughly an order of
+> magnitude worse than projected.** From
+> [`tests/load/STRESS_FINDINGS.md`](../tests/load/STRESS_FINDINGS.md) — S3 display build,
+> live board, single source, paced ~10 req/s, post-fix (`b04ecac`, 2026-06-04):
+>
+> | Endpoint | Projected here | **Actually measured** | Ratio |
+> |---|---|---|---|
+> | `GET /api/status` | 3–8 ms | **150 ms** | ~20–50× slower |
+> | `GET /` (dashboard) | 10–25 ms | **~6 s** (84 KB, one-time) | ~250–600× slower |
+> | `GET /api/cdr` | *not modelled* | 17 ms | — |
+>
+> The `/api/status` figure is the important one, because the `[!NOTE]` under this table
+> argues from first principles that it "is exceptionally low (<8 ms) because it reads
+> from the pre-compiled `_snapshot`". The snapshot architecture is real and does bypass
+> the signalling mutex — but it is not what dominates the response time on-device, so
+> the architectural argument does not license the number. **Do not quote "<8 ms" as a
+> characteristic of this firmware.**
+>
+> The `GET /` figure is additionally *stale in the optimistic direction*: it was measured
+> at 84 KB, and the dashboard has since grown the Dial Plan / Groups / Call Log / SIP
+> Trace modals (`fbad51b`, 2026-09-13). It has not been re-measured since that growth.
+>
+> For comparison, the SIP path *was* fast and roughly in line with expectations in the
+> same run: REGISTER p50 8.6 ms / p95 25.8 ms / max 121 ms (20/20 OK), and a `777` echo
+> call p50 13.3 ms / p95 19.9 ms (5/5 OK). Nothing in the SIP rows of this document was
+> modelled, so there is nothing there to contradict — but it is the reason the stress
+> findings conclude "the SIP engine itself is healthy" while the HTTP plane was not.
+>
+> No endpoint has ever been measured under the "10 Clients Poll" column's conditions.
+
 | HTTP Endpoint | HTTP Method | Expected Latency (Normal Load) | Expected Latency (10 Clients Poll) | Processing Bottleneck & Hardware Activity |
 | :--- | :---: | :---: | :---: | :--- |
 | **`GET /`** | GET | 10–25 ms | 15–40 ms | Reading static index HTML from flash or embedded header (`CGA_INDEX_HTML`). |
@@ -98,10 +206,29 @@ We model request processing latencies based on the network and storage activitie
 
 > [!NOTE]
 > The `/api/status` response latency is exceptionally low ($<8\text{ ms}$) because it reads from the pre-compiled `_snapshot` structure. It does not block on active UDP processing or lock the core SIP engine.
+>
+> ~~*(Superseded — measured at 150 ms on hardware. See the correction box above. The
+> snapshot decoupling is real; the latency claim it was used to justify is not.)*~~
 
 ---
 
 ## 📈 5. Live-Board Measurement Methodology (Test Plan)
+
+> [!IMPORTANT]
+> **This test plan was never executed as written.** No `vTaskList` watermark run
+> (Phase 1), no `heap_caps_*` baseline/stress/call sweep (Phase 2), and no `curl -w`
+> latency capture (Phase 3) was ever performed against these procedures. It remains a
+> perfectly good plan and is kept for that reason — but nothing in sections 1–4 was
+> validated by it.
+>
+> What was actually run instead, and what it produced, is
+> [`tests/load/sip_stress.py`](../tests/load/sip_stress.py) →
+> [`tests/load/STRESS_FINDINGS.md`](../tests/load/STRESS_FINDINGS.md). That harness
+> measures SIP register/call latency and samples `GET /api/status` for server-side
+> counters; it does not measure stacks or heap. If you are picking this up, the
+> highest-value unexecuted work here is **Phase 1** — there is still no real high-water
+> mark for any task on any board, and the one time a stack limit was tested in anger
+> (the pthread default) the model was wrong.
 
 To validate these theoretical estimates on physical hardware, the QA/testing team must execute the following step-by-step physical measurement protocols on live boards.
 
