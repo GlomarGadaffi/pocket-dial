@@ -737,6 +737,27 @@ private:
 	// Caller holds _mutex.
 	bool handleTransferOk(const std::shared_ptr<SipMessage>& data);
 
+	// Blind transfer (RFC 3515 §2 / RFC 5359 §2.4), issue #197: onRefer() moves the
+	// TRANSFEREE — the party that is not the transferor — to the target, and drops
+	// the transferor. Because media is peer-to-peer, that is a two-dialog B2BUA
+	// operation: a new server-originated leg carries the transferee's SDP to the
+	// target, and the transferee's own dialog survives untouched until the target
+	// answers. These two claim every response on that new leg, ahead of the normal
+	// session paths (same pattern as _beeper.handleOk()/handleInviteFailure()),
+	// because the server is its UAC and the transferee is not in that dialog at all:
+	//
+	//   handleBlindXferOk      — target answered: ACK it, re-INVITE the transferee
+	//                            with the target's SDP (the swap that completes the
+	//                            transfer), and link the two Call-IDs as a bridge.
+	//   handleBlindXferFailure — target refused: ACK the non-2xx in its own
+	//                            transaction, then release the transferee, who has
+	//                            nobody left on either side.
+	//
+	// Both return false for any message that is not on such a leg. Caller holds
+	// _mutex.
+	bool handleBlindXferOk(const std::shared_ptr<SipMessage>& data);
+	bool handleBlindXferFailure(const std::shared_ptr<SipMessage>& data);
+
 	// ── Media beachhead: virtual extension 440 (server-sourced RTP tone) ─────────
 	// onInvite() routes a dial of 440 here. The server answers 200 OK advertising its
 	// OWN media (server IP:port, m=audio <svrport> RTP/AVP 0, PCMU) and starts the

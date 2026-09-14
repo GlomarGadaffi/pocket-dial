@@ -178,6 +178,19 @@ public:
 	bool wasTransferorSrc() const { return _wasTransferorSrc; }
 	void setWasTransferorSrc(bool v) { _wasTransferorSrc = v; }
 
+	// Marks the leg a BLIND transfer creates toward the transfer target (issue
+	// #197). The server is the UAC on it — it minted the INVITE, impersonating
+	// the transferee whose media it carries — so every response on this dialog
+	// belongs to US, never to the transferee: a 200 OK must be ACKed here and
+	// turned into a re-INVITE of the transferee (not relayed as if it answered
+	// something), and a 180/4xx/5xx/6xx must not be forwarded into the
+	// transferee's own dialog, whose Call-ID and tags it does not match.
+	// Distinct from isParkUac() (a park ring-back, a different role inversion)
+	// and from isTransferBridge(), which this leg ALSO becomes once the target
+	// answers and the two dialogs are linked.
+	bool isBlindXferLeg() const { return _blindXferLeg; }
+	void setBlindXferLeg(bool v) { _blindXferLeg = v; }
+
 	void release();
 
 private:
@@ -225,6 +238,7 @@ private:
 
 	std::string _remoteSdp;        // callee's most recent SDP (for transfer SDP swap)
 	bool _isTransferBridge = false; // true for attended-transfer bridge halves
+	bool _blindXferLeg = false;    // true for the server-UAC leg toward a blind-transfer target
 	bool _wasTransferorSrc = true; // meaningful only when _isTransferBridge
 };
 

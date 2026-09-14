@@ -44,6 +44,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_dialogTo.clear();
 	_remoteSdp.clear();
 	_isTransferBridge = false;
+	_blindXferLeg = false;
 }
 
 void Session::setState(State state)
@@ -143,4 +144,5 @@ void Session::release()
 	_dialogTo.clear();
 	_remoteSdp.clear();
 	_isTransferBridge = false;
+	_blindXferLeg = false;
 }

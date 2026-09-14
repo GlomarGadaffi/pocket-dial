@@ -1235,8 +1235,19 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+<<<<<<< HEAD
 	// The MoH preview is the same kind of dialog and needs the same claim.
 	if (handleMohPreviewFailure(data))
+=======
+	// A blind-transfer target refusing the INVITE the server sent on the
+	// transferee's behalf (issue #197). Claimed here, ahead of every session
+	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
+	// so the ACK is ours (RFC 3261 §17.1.1.3), and nothing further down reads the
+	// response as what it actually is — onBusy()'s CFB lookup in particular would
+	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
+	// a forward-on-busy call nobody asked for.
+	if (handleBlindXferFailure(data))
+>>>>>>> c3e26bb (fix(refer): blind transfer moves the transferee, not the transferor)
 	{
 		return;
 	}
@@ -1268,8 +1279,19 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+<<<<<<< HEAD
 	// The MoH preview is the same kind of dialog and needs the same claim.
 	if (handleMohPreviewFailure(data))
+=======
+	// A blind-transfer target refusing the INVITE the server sent on the
+	// transferee's behalf (issue #197). Claimed here, ahead of every session
+	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
+	// so the ACK is ours (RFC 3261 §17.1.1.3), and nothing further down reads the
+	// response as what it actually is — onBusy()'s CFB lookup in particular would
+	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
+	// a forward-on-busy call nobody asked for.
+	if (handleBlindXferFailure(data))
+>>>>>>> c3e26bb (fix(refer): blind transfer moves the transferee, not the transferor)
 	{
 		return;
 	}
@@ -3384,6 +3406,15 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 	{
 		return;
 	}
+	// Blind-transfer leg (issue #197): the server is the UAC, so the target's 180
+	// is a provisional to US. There is nobody to relay it to — the transferee is
+	// still on its own dialog, mid-call, and a 180 stamped with this leg's Call-ID
+	// and tags matches nothing it holds. Swallow it. (A 180 takes no ACK, RFC 3261
+	// §17.1.1, so unlike the final responses there is nothing else owed here.)
+	if (session.has_value() && session.value()->isBlindXferLeg())
+	{
+		return;
+	}
 	endHandle(data->getFromNumber(), data);
 }
 
@@ -3406,8 +3437,19 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+<<<<<<< HEAD
 	// The MoH preview is the same kind of dialog and needs the same claim.
 	if (handleMohPreviewFailure(data))
+=======
+	// A blind-transfer target refusing the INVITE the server sent on the
+	// transferee's behalf (issue #197). Claimed here, ahead of every session
+	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
+	// so the ACK is ours (RFC 3261 §17.1.1.3), and nothing further down reads the
+	// response as what it actually is — onBusy()'s CFB lookup in particular would
+	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
+	// a forward-on-busy call nobody asked for.
+	if (handleBlindXferFailure(data))
+>>>>>>> c3e26bb (fix(refer): blind transfer moves the transferee, not the transferor)
 	{
 		return;
 	}
@@ -3499,8 +3541,19 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+<<<<<<< HEAD
 	// The MoH preview is the same kind of dialog and needs the same claim.
 	if (handleMohPreviewFailure(data))
+=======
+	// A blind-transfer target refusing the INVITE the server sent on the
+	// transferee's behalf (issue #197). Claimed here, ahead of every session
+	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
+	// so the ACK is ours (RFC 3261 §17.1.1.3), and nothing further down reads the
+	// response as what it actually is — onBusy()'s CFB lookup in particular would
+	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
+	// a forward-on-busy call nobody asked for.
+	if (handleBlindXferFailure(data))
+>>>>>>> c3e26bb (fix(refer): blind transfer moves the transferee, not the transferor)
 	{
 		return;
 	}
@@ -3699,6 +3752,26 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			_outbox.emplace_back(data->getSource(), std::move(response));
 		}
 
+		// Issue #197: only the party still ON this dialog can tear the bridge down.
+		// Both transfer paths drop a transferor whose phone may well hang up its own
+		// leg rather than wait for the server's BYE (RFC 5589 §6.1 — Yealink and
+		// friends do exactly this, right after the sipfrag NOTIFY), so that BYE
+		// crosses ours on the wire and arrives on a dialog the server has already
+		// re-purposed. Relaying it would tear down the very bridge the transfer just
+		// built, a beat after the two survivors were connected. The survivor is
+		// whichever side the transferor was not — the same wasTransferorSrc() the
+		// relay below uses to pick it.
+		{
+			auto mine = session.value()->wasTransferorSrc() ? session.value()->getDest()
+				: session.value()->getSrc();
+			if (!mine || !sameAddress(data->getSource(), mine->getAddress()))
+			{
+				queueLog("BYE on a transfer bridge from the dropped transferor — "
+					"answered, bridge left up", false);
+				return;   // already 200 OK'd above
+			}
+		}
+
 		const std::string peerId = session.value()->getPeerCallID();
 		if (auto peer = getSession(peerId); peer.has_value())
 		{
@@ -3709,6 +3782,26 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			// side A wasn't.
 			bool peerAIsSrc = peerSess->wasTransferorSrc();
 			auto survivor = peerAIsSrc ? peerSess->getDest() : peerSess->getSrc();
+			// Issue #197: a blind-transfer target can still be RINGING when the
+			// transferee gives up and hangs up. There is no dialog to BYE yet — the
+			// target has sent no To-tag — so the right teardown is a CANCEL of the
+			// INVITE the server still has outstanding (RFC 3261 §9.1), reusing that
+			// INVITE's own branch, which is why the leg keeps it. Without this the
+			// target rings on after everyone else has gone.
+			if (peerSess->isBlindXferLeg() && peerSess->getState() != Session::State::Connected)
+			{
+				if (auto inv = peerSess->getInviteMessage(); inv && survivor)
+				{
+					if (auto cancel = _forker.buildCancel(inv, survivor))
+					{
+						_outbox.emplace_back(survivor->getAddress(), std::move(cancel));
+					}
+				}
+				endCall(peerId, survivor ? survivor->getNumber() : std::string(),
+					std::string(data->getFromNumber()), "transfer target cancelled (transferee hung up)");
+				endCall(data->getCallID(), data->getFromNumber(), destNumber, "transfer bridge BYE");
+				return;
+			}
 			// Same #72 malformed-BYE guard as the generic branch below.
 			if (survivor && !peerSess->getDialogFrom().empty() && !peerSess->getDialogTo().empty())
 			{
@@ -3812,6 +3905,16 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 	// session-lookup pattern -- must never reach the generic relay below, which
 	// would forward this 200 OK toward A, the transferor the splice already drops.
 	if (handleTransferOk(data))
+	{
+		return;
+	}
+
+	// Blind-transfer target answered (issue #197). Same intercept-before-the-
+	// session-lookup placement, and the same reason as the line above: the server
+	// is the UAC on that leg, so this 200 OK is ours to ACK and to turn into the
+	// transferee's re-INVITE. The generic relay below would instead forward it to
+	// the leg's src — the transferee — inside a dialog it has never seen.
+	if (handleBlindXferOk(data))
 	{
 		return;
 	}
@@ -4473,87 +4576,240 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// ── Blind transfer ─────────────────────────────────────────────────────────────
+	// ── Blind transfer (RFC 3515 §2, RFC 5359 §2.4) ────────────────────────────────
+	// A and B are talking; A REFERs to C. The party that ends up talking to C is
+	// B — the TRANSFEREE, the leg a transfer MOVES — while A, the transferor, drops
+	// out. Issue #197: this handler used to do the exact opposite. It BYEd B (the
+	// one party a transfer exists to keep) and re-INVITEd A to C, so a receptionist
+	// transferring an inbound caller hung up on the customer and was dialled through
+	// to the target themselves — with the sipfrag NOTIFY reporting 200 OK, so the
+	// lost call was invisible until the customer rang back. The REFER machinery
+	// around it was right; one decision about which leg survives was inverted.
+	//
+	// Moving B instead of A is not a swap of two arguments, because media here is
+	// peer-to-peer: the board relays offers and answers and never sits in the audio
+	// path, so "B ends up talking to C" means B's and C's SDP have to reach each
+	// other. That makes a blind transfer a two-dialog B2BUA operation:
+	//
+	//   1. mint a NEW dialog toward C carrying B's media, impersonating B;
+	//   2. BYE A out of the A-B dialog, which SURVIVES as B's half of the bridge;
+	//   3. when C answers: ACK it, and re-INVITE B with C's SDP (handleBlindXferOk);
+	//   4. link the two Call-IDs so a BYE from either party reaches the other.
+	//
+	// Step 3 is the same offer/answer swap ParkOrbit's retrieve performs (answer the
+	// retriever with the parked party's SDP, re-INVITE the parked party with the
+	// retriever's) — split across time, because C has to be rung before its answer
+	// exists to swap in.
+	//
+	// The old "tear the leg down FIRST, then redirect" ordering (#128) is not being
+	// ignored here, it no longer has anything to order: the collision it guarded
+	// against was redirectInvite() reusing the A-B Session for the transfer leg
+	// under the same Call-ID. The leg toward C now has its own Call-ID and its own
+	// Session, and the A-B Session is deliberately KEPT (it is B's dialog, and B is
+	// staying). redirectInvite() and that ordering are untouched for CFB/CFNA, which
+	// still redirect the same party and therefore still need both.
+
+	// Resolve the whole transfer before a byte moves. Issue #203's gate — the target
+	// lookup decides the outcome BEFORE any teardown — is preserved and widened:
+	// every ingredient (target, transferee, transferee media, message pool, session
+	// pool) is checked first, and any miss declines the transfer with the call left
+	// exactly as it was.
+	auto targetClient = findClient(target);
+	auto originalOpt = getSession(callID);
+
+	// The transferee, and the media it is currently on. The transferor can be
+	// EITHER side of the A-B dialog — the receptionist case has them as the callee
+	// — so both are derived from which side the transferor actually is, never
+	// assumed. getRemoteSdp() is always "the callee's SDP", so when the transferor
+	// is the callee that SDP is the transferor's own answer and the transferee's
+	// offer must be read back off the stored INVITE instead. Same derivation the
+	// attended splice above uses, for the same reason.
+	std::shared_ptr<Session> original;
+	std::shared_ptr<SipClient> transferee;
+	bool transferorIsSrc = false;
+	std::string transfereeSdp;
+	if (originalOpt.has_value())
+	{
+		original = originalOpt.value();
+		transferorIsSrc = original->getSrc() &&
+			original->getSrc()->getNumber() == transferor->getNumber();
+		if (auto other = transferorIsSrc ? original->getDest() : original->getSrc();
+			other && other->getNumber() != transferor->getNumber())
+		{
+			transferee = other;
+		}
+		transfereeSdp = transferorIsSrc
+			? original->getRemoteSdp()
+			: (original->getInviteMessage()
+				? std::string(original->getInviteMessage()->getBody())
+				: std::string());
+		// Anchored legs are declined for the same reason the attended splice
+		// declines them: their "SDP" is not a peer offer/answer that a third phone
+		// could be handed (outbound: a virtual peer standing in for the upstream
+		// anchor; inbound: a MediaBridge, not a second SIP dialog).
+		if (original->isAnchor() || original->isAnchorInbound()) transferee = nullptr;
+	}
+
+	if (!transferee || transfereeSdp.empty())
+	{
+		// There is no leg to move. Either the REFER names no dialog this PBX knows
+		// (an out-of-dialog REFER — which under the pre-#197 topology quietly became
+		// click-to-dial FOR THE TRANSFEROR, not a transfer of anyone), or the dialog
+		// has no second party, or no media was ever captured for it (a transfer
+		// attempted before the call was answered). Decline honestly rather than do
+		// something else and report it as a transfer.
+		auto declined = getMessageFromPool(*data);
+		if (!declined) return;   // pool exhausted: drop, peer retransmits (#101A)
+		declined->setHeader(original ? "SIP/2.0 603 Decline"
+			: "SIP/2.0 481 Call/Transaction Does Not Exist");
+		declined->clearBody();
+		declined->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(declined));
+		queueLog("REFER: blind transfer declined — no transferable leg on " + callID, true);
+		return;
+	}
+
 	// 202 Accepted to the transferor (RFC 3515 §2.4.4).
 	{
 		auto accepted = getMessageFromPool(*data);
 		if (!accepted) return;   // pool exhausted: drop, peer retransmits (#101A)
 		accepted->setHeader(SipMessageTypes::ACCEPTED);
 		accepted->clearBody();
-		std::string activeIp = _localIp;
 		accepted->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 		_outbox.emplace_back(data->getSource(), std::move(accepted));
 	}
 
-	// Blind transfer drops the transferor's ORIGINAL call. Tear that leg down FIRST,
-	// then drive the new INVITE — ordering is load-bearing: redirectInvite() reuses the
-	// Session stored under this Call-ID, so ending the call AFTER it (the previous
-	// order) erased the freshly-created transfer leg, and the target's 200 OK then
-	// matched no session and the transfer silently never completed. onBusy()/tick()
-	// (CFB/CFNA) end-then-redirect for exactly this reason. CDR is recorded as the
-	// original leg tears down; redirectInvite() then allocates a clean session.
-	auto targetClient = findClient(target);
-
-	// Issue #203: but do NOT tear anything down until we know the target resolves.
-	// This lookup is the SOLE thing that can make the transfer fail — redirectInvite()
-	// returns false only when its own findRegistered() misses (CallForker.cpp:150-154),
-	// and findRegistered() is findClient() with no extra filter (RequestsHandler.hpp:473).
-	// Every other way redirectInvite() can bail (session pool exhausted -> 503) returns
-	// true deliberately. So `targetClient.has_value()` here is exactly the outcome, known
-	// before a single byte of teardown — and when it's empty the right answer is to leave
-	// the call ALONE and decline the transfer, not to destroy a working call on behalf of
-	// a transfer that was never going to happen.
-	//
-	// Previously the BYE and endCall() below ran unconditionally, so REFERing to anything
-	// unresolvable — a park orbit (#203), a typo'd extension, an extension that dropped
-	// its registration — hung up on the other party and erased the session, THEN reported
-	// 404. The transferor was told the truth and still lost the call.
-	if (targetClient.has_value())
+	// Issue #203, unchanged in substance: an unresolvable target (a park orbit, a
+	// typo, an extension that just dropped its registration) declines the transfer
+	// and leaves the call up. It matters more now, not less — the party that used to
+	// be hung up on here is the one now being kept.
+	if (!targetClient.has_value())
 	{
-		// Issue #128: endCall() below is pure local bookkeeping (session/pool/CDR) — it
-		// never puts a packet on the wire, so the OTHER party on this dialog (the one
-		// NOT the transferor, dropped by the transfer) was never told the call ended and
-		// sat on a dead call forever. REFER is itself an in-dialog request on the SAME
-		// A-B dialog it's transferring out of, so data->getFrom()/getTo() already carry
-		// exactly this dialog's tags (transferor's own + the other party's) — no need to
-		// read session->getDialogFrom()/getDialogTo(), which armSessionTimer() only
-		// populates when RFC 4028 Session-Expires was negotiated.
-		if (auto original = getSession(callID); original.has_value())
-		{
-			auto src = original.value()->getSrc();
-			auto dest = original.value()->getDest();
-			auto other = (dest && dest->getNumber() != transferor->getNumber()) ? dest : src;
-			if (other && other->getNumber() != transferor->getNumber())
-			{
-				auto bye = buildServerBye(other->getNumber(), other->getAddress(), callID,
-					std::string(data->getFrom()), std::string(data->getTo()));
-				if (bye) _outbox.emplace_back(other->getAddress(), std::move(bye));
-			}
-		}
-
-		endCall(callID, transferor->getNumber(), std::string(data->getToNumber()), "blind transfer");
-	}
-
-	bool ok = targetClient.has_value() && _forker.redirectInvite(data, transferor, target);
-
-	// NOTIFY the transferor with the transfer result (message/sipfrag body).
-	std::string frag = ok ? "SIP/2.0 200 OK" : "SIP/2.0 404 Not Found";
-	auto notify = buildReferNotify(data, transferor, frag, /*terminated=*/true);
-	if (notify)
-	{
-		_outbox.emplace_back(transferor->getAddress(), std::move(notify));
-	}
-
-	if (!ok)
-	{
+		auto notify = buildReferNotify(data, transferor, "SIP/2.0 404 Not Found", /*terminated=*/true);
+		if (notify) _outbox.emplace_back(transferor->getAddress(), std::move(notify));
 		queueLog("REFER: blind transfer to " + target + " declined (no such target) — "
 			"call left up", true);
+		return;
 	}
-	else
+
+	const std::string srcIpPort = _localIp + ":" + std::to_string(_serverPort);
+	const std::string legCallID = "Call-ID: " + IDGen::GenerateID(16) + "@" + _localIp;
+	const std::string legBranch = "z9hG4bK" + IDGen::GenerateID(12);
+	const std::string legFromTag = IDGen::GenerateID(9);
+	// The server stands in for the TRANSFEREE on the new leg, so From and Contact
+	// carry the transferee's identity: the target's phone must announce the caller
+	// it is about to be connected to, not the extension that pressed Transfer.
+	const std::string legFrom = "<sip:" + transferee->getNumber() + "@" + srcIpPort +
+		">;tag=" + legFromTag;
+
+	// ── Draw everything BEFORE mutating or sending (#101A). A transfer touches two
+	// dialogs' worth of wire state; refusing halfway would leave the transferor
+	// dropped with nobody invited, which is the #197 bug in a different costume.
+	std::shared_ptr<SipMessage> inviteToTarget;
 	{
-		queueLog("REFER: blind transfer " + transferor->getNumber() + " -> " + target);
+		// The transferee's own media, relayed peer-to-peer. Normalised to sendrecv:
+		// every phone's Transfer softkey holds the call before it REFERs, so the
+		// last SDP captured for the transferee is routinely a hold offer/answer.
+		// Relaying that direction verbatim would complete the transfer with one-way
+		// audio (see sipwire::sdpAsSendrecv).
+		const std::string offer = sipwire::sdpAsSendrecv(transfereeSdp);
+		std::ostringstream ss;
+		ss << "INVITE sip:" << target << "@"
+		   << sipwire::addrToIpPort(targetClient.value()->getAddress()) << " SIP/2.0\r\n"
+		   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << legBranch << "\r\n"
+		   << "From: " << legFrom << "\r\n"
+		   << "To: <sip:" << target << "@" << srcIpPort << ">\r\n"
+		   << legCallID << "\r\n"
+		   << "CSeq: 1 INVITE\r\n"
+		   << "Max-Forwards: 70\r\n"
+		   << "Contact: <sip:" << transferee->getNumber() << "@" << srcIpPort << ";transport=UDP>\r\n"
+		   // RFC 3892: who caused this INVITE to be sent. Cheap, and it is the only
+		   // trace of the transferor left on the leg once they are dropped.
+		   << "Referred-By: <sip:" << transferor->getNumber() << "@" << srcIpPort << ">\r\n"
+		   << "User-Agent: pocket-dial\r\n"
+		   << "Content-Type: application/sdp\r\n"
+		   << "Content-Length: " << offer.size() << "\r\n\r\n"
+		   << offer;
+		inviteToTarget = getMessageFromPool(ss.str(), targetClient.value()->getAddress());
 	}
+
+	// The BYE that drops the transferor — the mirror image of the pre-#197 one in
+	// every slot. It is addressed to the TRANSFEROR, and the server sends it
+	// impersonating the transferee, so From carries the transferee's tag and To the
+	// transferor's: the REFER's own To/From, swapped (the REFER travelled A->B, this
+	// BYE travels B->A). Getting these backwards produces a message the phone
+	// rejects as a stranger's dialog, which is why #128 regression-tests the slots.
+	auto byeToTransferor = buildServerBye(transferor->getNumber(), transferor->getAddress(),
+		callID, std::string(data->getTo()), std::string(data->getFrom()));
+
+	// NOTE (issue #197, secondary item 1): this sipfrag still claims 200 OK the
+	// moment the INVITE is queued, before the target has been rung. RFC 3515 §2.4.5
+	// wants the referred request's ACTUAL final response, preceded by a 100 Trying
+	// notification (§2.4.4). Deliberately NOT changed here: it is a separate defect
+	// with its own failure mode (a phone told the truth late vs. told a lie early),
+	// and folding it in would make this change about two things.
+	auto notify = buildReferNotify(data, transferor, "SIP/2.0 200 OK", /*terminated=*/true);
+
+	auto legSession = allocateSession(legCallID, transferee);
+
+	if (!inviteToTarget || !byeToTransferor || !notify || !legSession)
+	{
+		// Nothing has been sent but the 202 and nothing has been mutated, so the
+		// transferor's REFER retransmit retries the whole transfer from scratch.
+		// An unpublished legSession is reclaimed by the next allocateSession()
+		// scan. Same answer as #203: refuse without destroying a working call.
+		queueLog("REFER: blind transfer to " + target + " not started — pool exhausted", true);
+		return;
+	}
+
+	// The transferee's offer relayed peer-to-peer: keep its preference order, drop
+	// only payloads this PBX will not carry (the same treatment buildInviteFork
+	// gives an ordinary fork).
+	(void)inviteToTarget->filterAudioCodecs(/*allowWideband=*/true);
+	inviteToTarget->syncContentLength();
+
+	// ── The leg toward the target. The server is the UAC on it: it minted the
+	// INVITE, so every response belongs to us, not to the transferee whose identity
+	// it borrows. isBlindXferLeg() is what routes those responses to
+	// handleBlindXferOk()/handleBlindXferFailure() instead of the generic relays,
+	// which would forward them into the transferee's dialog, whose Call-ID and tags
+	// they do not match.
+	legSession->setDest(targetClient.value());
+	legSession->setBlindXferLeg(true);
+	legSession->setLocalTag(legFromTag);
+	legSession->setUacBranch(legBranch);   // a non-2xx ACK must reuse the INVITE's branch
+	legSession->setInviteMessage(inviteToTarget);
+	legSession->setPeerCallID(callID);
+	// Our own side of the leg's dialog now; the target's To-tag is stamped in when
+	// it answers (handleBlindXferOk) — it does not exist yet.
+	legSession->setDialogHeaders(legFrom, std::string());
+	_sessions.emplace(legCallID, legSession);
+
+	// ── The A-B dialog SURVIVES, as the transferee's half of the bridge. This is
+	// the whole point of #197: endCall() is NOT called here. The transferee stays on
+	// its own dialog throughout — same Call-ID, same tags, no reconnect — and only
+	// its media is re-pointed once the target answers.
+	original->setPeerCallID(legCallID);
+	original->setTransferBridge(true);
+	original->setWasTransferorSrc(transferorIsSrc);
+	// REFER is an in-dialog request on this very dialog, so its From/To are this
+	// dialog's authoritative tags. Re-stamp them in src/dest orientation:
+	// getDialogFrom/To() is otherwise only populated by onOk() at connect time, and
+	// both the BYE relay and the re-INVITE below depend on them being real.
+	original->setDialogHeaders(
+		transferorIsSrc ? std::string(data->getFrom()) : std::string(data->getTo()),
+		transferorIsSrc ? std::string(data->getTo()) : std::string(data->getFrom()));
+
+	_outbox.emplace_back(targetClient.value()->getAddress(), std::move(inviteToTarget));
+	// NOTIFY BEFORE the BYE. Both go to the transferor, and the NOTIFY is an
+	// in-dialog request on the REFER's own dialog: send the BYE first and the phone
+	// has every right to 481 the notification it is waiting for.
+	_outbox.emplace_back(transferor->getAddress(), std::move(notify));
+	_outbox.emplace_back(transferor->getAddress(), std::move(byeToTransferor));
+
+	queueLog("REFER: blind transfer " + transferee->getNumber() + " -> " + target +
+		" (transferor " + transferor->getNumber() + " dropped)");
 }
 
 void RequestsHandler::onMessage(std::shared_ptr<SipMessage> data)
@@ -4638,6 +4894,232 @@ bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
 	                          // generic relay below (which would forward it toward A).
 	_outbox.emplace_back(data->getSource(), std::move(ack));
 	_transferPendingAcks.erase(it);
+
+	// This 200 OK answers a re-INVITE that re-pointed a phone's media at its new
+	// peer, so whatever hold that dialog was in has just ended. A transferor's
+	// Transfer softkey holds the call before it REFERs (and a consult does the
+	// same), so the session is routinely still Held here — leaving it that way
+	// would have the dashboard, the session-timer sweep and any later resume all
+	// reasoning about a call that is in fact talking.
+	if (auto spliced = getSession(callID);
+		spliced.has_value() && spliced.value()->getState() == Session::State::Held)
+	{
+		spliced.value()->setState(Session::State::Connected);
+	}
+	return true;
+}
+
+bool RequestsHandler::handleBlindXferOk(const std::shared_ptr<SipMessage>& data)
+{
+	// The blind-transfer TARGET answered (issue #197). The server is the UAC on
+	// this leg — it minted the INVITE, borrowing the transferee's identity — so
+	// this 200 OK is addressed to US and must never reach the generic relay in
+	// onOk(), which would forward it to the session's src (the transferee) inside
+	// a dialog the transferee has never seen.
+	//
+	// Two things happen here, and only here: the leg gets its ACK, and the media
+	// swap that makes the transfer real gets completed — the transferee is
+	// re-INVITEd, inside its OWN untouched dialog, with the target's SDP. That is
+	// ParkOrbit's retrieve swap, arriving one round-trip late because the target
+	// had to be rung before it had an answer to swap in.
+	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string::npos) return false;
+	const std::string callID(data->getCallID());
+	auto legOpt = getSession(callID);
+	if (!legOpt.has_value() || !legOpt.value()->isBlindXferLeg()) return false;
+	auto leg = legOpt.value();
+
+	const std::string srcIpPort = _localIp + ":" + std::to_string(_serverPort);
+
+	// ACK on EVERY arrival, not just the first. A 2xx is retransmitted until its
+	// UAC ACKs it, and this intercept is keyed off a session flag rather than a
+	// one-shot tracking entry precisely so a retransmit still lands here and still
+	// gets acknowledged, instead of falling through to the relay once an entry had
+	// been consumed.
+	{
+		std::ostringstream ss;
+		ss << "ACK sip:" << data->getToNumber() << "@"
+		   << sipwire::addrToIpPort(data->getSource()) << " SIP/2.0\r\n"
+		   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=z9hG4bK" << IDGen::GenerateID(12) << "\r\n"
+		   << "From: " << stripHeaderName(data->getFrom()) << "\r\n"
+		   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
+		   << "Call-ID: " << stripHeaderName(callID) << "\r\n"
+		   << "CSeq: 1 ACK\r\n"
+		   << "Max-Forwards: 70\r\n"
+		   << "Content-Length: 0\r\n\r\n";
+		auto ack = getMessageFromPool(ss.str(), data->getSource());
+		if (!ack) return true;   // pool exhausted: the target retransmits its 200 OK (#101A)
+		_outbox.emplace_back(data->getSource(), std::move(ack));
+	}
+
+	// Already swapped: this is a retransmit. It got its ACK above; re-INVITEing the
+	// transferee a second time would restart an offer/answer it has already
+	// completed.
+	if (leg->getState() == Session::State::Connected) return true;
+
+	auto origOpt = getSession(leg->getPeerCallID());
+	std::shared_ptr<Session> orig = origOpt.has_value() ? origOpt.value() : nullptr;
+	auto transferee = orig ? (orig->wasTransferorSrc() ? orig->getDest() : orig->getSrc()) : nullptr;
+	if (!orig || !transferee || orig->getDialogFrom().empty() || orig->getDialogTo().empty())
+	{
+		// The transferee hung up between our INVITE and this answer. There is
+		// nothing left to bridge the target to, and it is now talking to a call
+		// that no longer exists — end it rather than leave it there (the #128 rule:
+		// never leave a party on a call the server considers over).
+		if (auto tgt = leg->getDest())
+		{
+			auto bye = buildServerBye(tgt->getNumber(), tgt->getAddress(), callID,
+				leg->getDialogFrom(), std::string(data->getTo()));
+			if (bye) _outbox.emplace_back(tgt->getAddress(), std::move(bye));
+		}
+		endCall(callID, leg->getSrc() ? leg->getSrc()->getNumber() : std::string(),
+			leg->getDest() ? leg->getDest()->getNumber() : std::string(),
+			"blind transfer: transferee gone before the target answered");
+		queueLog("REFER: blind transfer target answered but the transferee had gone — "
+			"target released", true);
+		return true;
+	}
+
+	// The re-INVITE impersonates the departed transferor inside the transferee's
+	// dialog: those are the tags that phone's dialog expects, and they are the only
+	// ones it will accept. Which of the pair is the transferor flips with
+	// orientation (the receptionist case has them as the callee), which is what
+	// wasTransferorSrc() recorded at transfer time.
+	const std::string& transferorHdr = orig->wasTransferorSrc() ? orig->getDialogFrom()
+		: orig->getDialogTo();
+	const std::string& transfereeHdr = orig->wasTransferorSrc() ? orig->getDialogTo()
+		: orig->getDialogFrom();
+
+	std::shared_ptr<SipMessage> reinvite;
+	{
+		// The target's answer becomes the transferee's new offer. Normalised to
+		// sendrecv for the same reason the outbound offer was: the transferee may
+		// still be on hold from the moment the transferor pressed Transfer, and a
+		// re-INVITE that re-points its media is exactly where that hold ends.
+		const std::string offer = sipwire::sdpAsSendrecv(std::string(data->getBody()));
+		std::ostringstream ss;
+		ss << "INVITE sip:" << transferee->getNumber() << "@"
+		   << sipwire::addrToIpPort(transferee->getAddress()) << " SIP/2.0\r\n"
+		   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=z9hG4bK" << IDGen::GenerateID(12) << "\r\n"
+		   << "From: " << stripHeaderName(transferorHdr) << "\r\n"
+		   << "To: " << stripHeaderName(transfereeHdr) << "\r\n"
+		   << "Call-ID: " << stripHeaderName(leg->getPeerCallID()) << "\r\n"
+		   // CSeq 100, the same high value the attended splice uses and for the same
+		   // reason: far enough above the dialog's own in-flight CSeq to never
+		   // collide, and it is what handleTransferOk() recognises when the
+		   // transferee's 200 OK comes back, so that answer is ACKed rather than
+		   // relayed at a transferor who is no longer on the call.
+		   << "CSeq: 100 INVITE\r\n"
+		   << "Max-Forwards: 70\r\n"
+		   << "Contact: <sip:" << transferee->getNumber() << "@" << srcIpPort << ">\r\n"
+		   << "User-Agent: pocket-dial\r\n"
+		   << "Content-Type: application/sdp\r\n"
+		   << "Content-Length: " << offer.size() << "\r\n\r\n"
+		   << offer;
+		reinvite = getMessageFromPool(ss.str(), transferee->getAddress());
+	}
+	if (!reinvite)
+	{
+		// Drawn before any state change on purpose: the leg is still not Connected,
+		// so the target's 200 OK retransmit comes straight back here and the swap is
+		// retried. Claiming the bridge now would strand the transferee on the old
+		// media path with no second chance (#101A).
+		return true;
+	}
+	(void)reinvite->filterAudioCodecs(/*allowWideband=*/true);   // phone SDP relayed P2P
+	reinvite->syncContentLength();
+
+	leg->setState(Session::State::Connected);
+	leg->setDialogHeaders(leg->getDialogFrom(), std::string(data->getTo()));   // target's To-tag
+	leg->setRemoteSdp(std::string(data->getBody()));
+	leg->setTransferBridge(true);
+	// On this leg the absent party the server impersonates — onBye's bridge relay
+	// calls it "A" — is the transferee, which is this session's src. So the
+	// surviving party that relay must address is getDest(), the target. Same field,
+	// same meaning as the attended splice gives it: "the impersonated side is src".
+	leg->setWasTransferorSrc(true);
+	_transferPendingAcks.push_back(leg->getPeerCallID());
+	_outbox.emplace_back(transferee->getAddress(), std::move(reinvite));
+
+	queueLog("REFER: blind transfer completed — " + transferee->getNumber() + " <-> " +
+		(leg->getDest() ? leg->getDest()->getNumber() : std::string("?")));
+	return true;
+}
+
+bool RequestsHandler::handleBlindXferFailure(const std::shared_ptr<SipMessage>& data)
+{
+	// A non-2xx final to the INVITE we sent the blind-transfer target: busy,
+	// declined, gone, whatever. Same intercept-before-everything shape as
+	// _beeper.handleInviteFailure(), and for the same two reasons — the response is
+	// ours to ACK (nobody else will), and left alone it would be interpreted as a
+	// failure of a call the transferee placed. onBusy()'s CFB lookup in particular
+	// reads data->getFromNumber(), which on this leg is the TRANSFEREE's number:
+	// the target being busy would go looking up the transferee's own forward-on-busy
+	// target and fork a call nobody asked for.
+	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string::npos) return false;
+	const std::string callID(data->getCallID());
+	auto legOpt = getSession(callID);
+	if (!legOpt.has_value() || !legOpt.value()->isBlindXferLeg()) return false;
+	auto leg = legOpt.value();
+
+	const std::string srcIpPort = _localIp + ":" + std::to_string(_serverPort);
+
+	// RFC 3261 §17.1.1.3: a non-2xx final is ACKed inside the INVITE's own
+	// transaction — same Call-ID, same From-tag, and the SAME Via branch as the
+	// INVITE, which is what setUacBranch() captured at transfer time. Without this
+	// the target retransmits its 486 until Timer H fires.
+	{
+		std::ostringstream ss;
+		ss << "ACK sip:" << data->getToNumber() << "@"
+		   << sipwire::addrToIpPort(data->getSource()) << " SIP/2.0\r\n"
+		   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << leg->getUacBranch() << "\r\n"
+		   << "From: " << stripHeaderName(leg->getDialogFrom()) << "\r\n"
+		   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
+		   << "Call-ID: " << stripHeaderName(callID) << "\r\n"
+		   << "CSeq: 1 ACK\r\n"
+		   << "Max-Forwards: 70\r\n"
+		   << "Content-Length: 0\r\n\r\n";
+		if (auto ack = getMessageFromPool(ss.str(), data->getSource()))
+		{
+			_outbox.emplace_back(data->getSource(), std::move(ack));
+		}
+		// A pool refusal only costs retransmits of a response we are about to stop
+		// caring about; the teardown below must happen either way, or the transferee
+		// is the one left waiting.
+	}
+
+	// The transferor has already been dropped and the target has refused, so the
+	// transferee is holding a dialog with nobody on the far end and no way back.
+	// End it explicitly — the #128 rule again: local bookkeeping alone leaves that
+	// phone on a call the server considers over. A nicer PBX would ring the
+	// transferor back instead (RFC 5359 §2.4 leaves that to policy); that needs the
+	// transferor's leg kept alive through the target's answer, which is a different
+	// change.
+	if (auto origOpt = getSession(leg->getPeerCallID()); origOpt.has_value())
+	{
+		auto orig = origOpt.value();
+		auto transferee = orig->wasTransferorSrc() ? orig->getDest() : orig->getSrc();
+		if (transferee && !orig->getDialogFrom().empty() && !orig->getDialogTo().empty())
+		{
+			const std::string& transferorHdr = orig->wasTransferorSrc() ? orig->getDialogFrom()
+				: orig->getDialogTo();
+			const std::string& transfereeHdr = orig->wasTransferorSrc() ? orig->getDialogTo()
+				: orig->getDialogFrom();
+			auto bye = buildServerBye(transferee->getNumber(), transferee->getAddress(),
+				leg->getPeerCallID(), transferorHdr, transfereeHdr);
+			if (bye) _outbox.emplace_back(transferee->getAddress(), std::move(bye));
+		}
+		endCall(leg->getPeerCallID(),
+			orig->getSrc() ? orig->getSrc()->getNumber() : std::string(),
+			orig->getDest() ? orig->getDest()->getNumber() : std::string(),
+			"blind transfer target refused");
+	}
+	endCall(callID, leg->getSrc() ? leg->getSrc()->getNumber() : std::string(),
+		leg->getDest() ? leg->getDest()->getNumber() : std::string(),
+		"blind transfer target refused");
+
+	queueLog("REFER: blind transfer target " +
+		(leg->getDest() ? leg->getDest()->getNumber() : std::string("?")) +
+		" refused the call (" + std::string(data->getHeader()) + ") — transferee released", true);
 	return true;
 }
 

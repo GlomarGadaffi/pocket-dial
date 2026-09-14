@@ -275,8 +275,15 @@ TEST(ReferSourceAuth, InDialogTransferFromARealLegStillSucceeds)
 		<< "a real leg's REFER must still be accepted";
 	EXPECT_TRUE(findSentTo(sent, aAddr, "SIP/2.0 403", sentBefore).empty())
 		<< "a real leg's REFER must not be forbidden";
-	EXPECT_FALSE(findSentTo(sent, bAddr, "BYE sip:", sentBefore).empty())
-		<< "the dropped party must still get its #128 BYE";
+	// #128's BYE still goes out, and since #197 it goes to the party the transfer
+	// DROPS — the transferor, A, who is the one asking to leave. B is the
+	// transferee: it stays on its own dialog and is re-pointed at the target.
+	// (Before #197 this assertion named bAddr, because the handler hung up on the
+	// transferee and dialled the transferor through instead.)
+	EXPECT_FALSE(findSentTo(sent, aAddr, "BYE sip:", sentBefore).empty())
+		<< "the transferor must still get its #128 BYE";
+	EXPECT_TRUE(findSentTo(sent, bAddr, "BYE sip:", sentBefore).empty())
+		<< "the transferee must not be hung up on (#197)";
 	EXPECT_FALSE(findSentTo(sent, targetAddr, "INVITE sip:107@", sentBefore).empty())
 		<< "the transfer target must still be dialled";
 }
