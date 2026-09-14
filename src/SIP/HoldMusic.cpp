@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "esp_log.h"
@@ -221,6 +222,23 @@ bool HoldMusic::loadClip(const std::string& path)
 	}
 	if (dataOff + dataLen > static_cast<size_t>(total)) dataLen = static_cast<size_t>(total) - dataOff;
 
+	// ── HEAP ALLOCATION, AND WHY IT IS ALLOWED HERE ──────────────────────────
+	// The engine invariant is "no dynamic allocation in RTOS tasks after init":
+	// pools and static buffers only, because heap churn on a long-running node
+	// fragments and then fails at the worst moment. This allocation is a
+	// deliberate, narrow exception and it is worth being explicit about:
+	//
+	//   * It is NOT on any media or packet path. The pacing task allocates
+	//     nothing, ever — it writes into a fixed stack buffer and memcpys from
+	//     an already-resident clip.
+	//   * It is one-shot and bounded: a single block, capped at 8 MB by the
+	//     upload route, replacing any previous one rather than accumulating.
+	//   * It runs on the boot task or the HTTP task, never on the SIP or RTP
+	//     tasks, so a failure or a slow allocation cannot stall call handling.
+	//   * The alternative — a fixed static buffer — would have to be sized for
+	//     the largest clip anyone might ever upload, permanently, on a device
+	//     where most users load none at all.
+	//
 	// PSRAM by preference: the clip is large, long-lived and only ever read
 	// sequentially, which is exactly what PSRAM is good at. Internal RAM is scarce
 	// and needed for task stacks and the SIP pools.
@@ -335,8 +353,8 @@ bool HoldMusic::start()
 	// Core 0 alongside the other media tasks, priority just under them: hold music
 	// glitching is cosmetic where a live call's RTP is not, so it must never win a
 	// scheduling contest against an active bridge.
-	if (xTaskCreatePinnedToCore(&HoldMusic::taskTrampoline, "moh_tx", 3072, this, 5,
-	                            nullptr, 0) != pdPASS)
+	if (xTaskCreatePinnedToCore(&HoldMusic::taskTrampoline, "moh_tx", kTaskStackBytes,
+	                            this, 5, nullptr, 0) != pdPASS)
 	{
 		_running.store(false, std::memory_order_release);
 		close(_sock);
@@ -409,13 +427,37 @@ void HoldMusic::runLoop()
 			// buffer rather than treating the first frames as late.
 			RtpSender::buildRtpHeader(packet, /*marker=*/(l.seq == 0), PAYLOAD_TYPE_PCMU,
 				l.seq, l.timestamp, l.ssrc);
-			sendto(_sock, packet, sizeof(packet), 0,
+			// Check the send. A silently-dropped sendto is exactly the failure that
+			// does not reproduce on a bench: the listener hears a gap, the log says
+			// nothing, and there is no counter to point at. Rate-limited so a
+			// genuinely unreachable peer cannot flood the log at 50 lines/second.
+			const int sent = sendto(_sock, packet, sizeof(packet), 0,
 				reinterpret_cast<const sockaddr*>(&l.dest), sizeof(l.dest));
+			if (sent < 0)
+			{
+				++_txErrors;
+				if ((_txErrors % 250u) == 1u)
+				{
+					ESP_LOGW(TAG, "sendto failed (errno %d), %u dropped so far",
+						errno, static_cast<unsigned>(_txErrors));
+				}
+			}
 			++l.seq;
 			l.timestamp += static_cast<uint32_t>(BYTES_PER_TICK);
 		}
 
 		_cursor = advanceCursor(_cursor, clipLen);
+
+		// Stack headroom, measured rather than assumed. The task was created with a
+		// guessed size; this reports what it actually uses so the number can be set
+		// from evidence. Logged once, ~10 s in, when the deepest path (a full
+		// listener table) has been exercised.
+		if (++_ticks == 500u)
+		{
+			const UBaseType_t freeWords = uxTaskGetStackHighWaterMark(nullptr);
+			ESP_LOGI(TAG, "stack high-water: %u bytes free of %d",
+				static_cast<unsigned>(freeWords * sizeof(StackType_t)), kTaskStackBytes);
+		}
 	}
 
 	_taskRunning.store(false, std::memory_order_release);

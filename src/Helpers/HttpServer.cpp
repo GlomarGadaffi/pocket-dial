@@ -486,6 +486,25 @@ void HttpServer::handleClient(int clientSock)
 			sendApiKill(clientSock, req.body);
 		}
 	}
+	else if (req.method == "GET" && req.path == "/api/moh")
+	{
+		// Music-on-hold status. Gated: it reveals what is configured, and the
+		// dashboard already holds a session by the time it renders this panel.
+		if (!requireAdmin(clientSock, req, false)) return;
+		sendApiMohStatus(clientSock);
+	}
+	else if (req.method == "POST" && req.path == "/api/moh/preview")
+	{
+		// Ring an extension and play the clip to it. Mutating (it originates a
+		// call), so CSRF is required like every other POST.
+		if (!requireAdmin(clientSock, req, true)) return;
+		sendApiMohPreview(clientSock, req.body);
+	}
+	else if (req.method == "POST" && req.path == "/api/moh/preview/stop")
+	{
+		if (!requireAdmin(clientSock, req, true)) return;
+		sendApiMohPreviewStop(clientSock);
+	}
 	else if (req.method == "GET" && req.path == "/api/cdr")
 	{
 		// Read-only Call Detail Records — ungated like /api/status.
@@ -2801,6 +2820,83 @@ bool HttpServer::streamBody(int sock, const char* prefix, size_t prefixLen,
 		consumed += static_cast<size_t>(n);
 	}
 	return consumed == contentLength;
+}
+
+void HttpServer::sendApiMohStatus(int sock)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+		             "{\"error\":\"SIP engine not attached yet\"}");
+		return;
+	}
+
+	// `supported` is the BUILD capability (is there a card at all), separate from
+	// `loaded` (is a clip actually there) — the same distinction /api/status draws
+	// for sd.present vs sd.mounted, and for the same reason: a client must be able
+	// to tell "this board can't do MoH" from "nobody has uploaded a clip yet".
+#if defined(PD_ETH_HAS_SD)
+	const bool supported = true;
+#else
+	const bool supported = false;
+#endif
+
+	std::ostringstream json;
+	json << "{\"supported\":" << (supported ? "true" : "false")
+	     << ",\"loaded\":"    << (handler->holdMusicLoaded() ? "true" : "false")
+	     << ",\"seconds\":"   << handler->holdMusicSeconds()
+	     << ",\"listeners\":" << handler->holdMusicListeners()
+	     << ",\"preview\":\"" << jsonEscape(handler->mohPreviewExtension()) << "\"}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiMohPreview(int sock, const std::string& body)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+		             "{\"error\":\"SIP engine not attached yet\"}");
+		return;
+	}
+
+	const std::string ext = getFormParam(body, "extension");
+	if (ext.empty())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"extension is required\"}");
+		return;
+	}
+
+	if (!handler->startMohPreview(ext))
+	{
+		// One 409 covering both causes, with a body that says which applies, rather
+		// than making the operator guess: "nothing happened" is the least useful
+		// possible answer when a phone did not ring.
+		const bool loaded = handler->holdMusicLoaded();
+		sendResponse(sock, 409, "Conflict", "application/json",
+		             loaded
+		               ? "{\"error\":\"extension is not registered\"}"
+		               : "{\"error\":\"no hold clip loaded — upload one first\"}");
+		return;
+	}
+
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"message\":\"ringing " + jsonEscape(ext) + "\"}");
+}
+
+void HttpServer::sendApiMohPreviewStop(int sock)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+		             "{\"error\":\"SIP engine not attached yet\"}");
+		return;
+	}
+	handler->stopMohPreview();   // idempotent: harmless when nothing is running
+	sendResponse(sock, 200, "OK", "application/json", "{\"status\":\"ok\"}");
 }
 
 void HttpServer::handleMohUpload(int sock, const std::string& alreadyRead,

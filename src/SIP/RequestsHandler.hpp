@@ -569,6 +569,33 @@ private:
 	// so this being idle is a normal state rather than a fault.
 	HoldMusic _holdMusic;
 
+	// The single in-flight MoH preview dialog. Server-originated, so there is no
+	// Session backing it — it is matched by Call-ID exactly like the register beep
+	// and the park ring-back. Guarded by _mutex like every other engine member.
+	struct MohPreview
+	{
+		bool        active = false;
+		std::string callId;        // full "Call-ID: ..." line, as the wire carries it
+		std::string extension;
+		std::string fromTag;
+		std::string branch;
+		std::string toTag;         // learned from their 200 OK, needed for the BYE
+		sockaddr_in addr{};
+		int         listener = -1; // HoldMusic listener id once they answer
+	};
+	MohPreview _mohPreview;
+
+	// Claim a response/request for the preview dialog. Both return true when the
+	// message belonged to the preview and was fully handled.
+	// All three assume _mutex is ALREADY held: the handle* pair runs inside
+	// handle()'s lock, and stopMohPreviewLocked() is shared by the public
+	// stopMohPreview() and by startMohPreview()'s replace-the-previous path.
+	// _mutex is not recursive, so mixing the two would self-deadlock.
+	bool handleMohPreviewOk(const std::shared_ptr<SipMessage>& data);
+	bool handleMohPreviewEnd(const std::shared_ptr<SipMessage>& data);
+	void stopMohPreviewLocked();
+	void releaseMohPreviewLocked();
+
 public:
 	// Load a music-on-hold clip and begin the pacing stream. Called after the SD
 	// card is mounted, since that is where the clip lives. Returns false when the
@@ -584,6 +611,32 @@ public:
 	bool     holdMusicLoaded()  const { return _holdMusic.isLoaded(); }
 	unsigned holdMusicSeconds() const { return _holdMusic.clipSeconds(); }
 	unsigned holdMusicListeners() const { return _holdMusic.listenerCount(); }
+
+	// ── MoH preview: ring an extension and play the hold clip to it ────────────
+	// "Does my hold music sound right?" is otherwise answered by parking a real
+	// call, which needs two phones and a caller willing to be put on hold. This
+	// rings one extension directly from the dashboard and streams the clip when
+	// they answer.
+	//
+	// Server-originated UAC dialog, the same shape as the park ring-back
+	// (ParkOrbit::ringBackParker) and the register beep: a minted Call-ID/From-tag
+	// recognised before the normal session lookup, with no Session allocated.
+	//
+	// ONE preview at a time. A second request replaces the first, because the
+	// realistic misuse is an operator clicking the button twice, not two operators
+	// previewing at once — and leaving an orphaned ringing dialog is worse than
+	// cancelling it.
+	//
+	// Returns false if no clip is loaded, the extension is not registered, or the
+	// message pool refused. Never throws, never blocks.
+	bool startMohPreview(const std::string& extension);
+
+	// Hang up an in-progress preview. Safe when none is running.
+	void stopMohPreview();
+
+	// Extension the preview is ringing/playing to, or empty when idle.
+	// Not const: it takes _mutex, which is not declared mutable.
+	std::string mohPreviewExtension();
 
 private:
 
