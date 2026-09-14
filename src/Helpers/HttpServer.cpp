@@ -11,6 +11,7 @@
 #include "ProvisioningConfig.hpp"
 #include "index_html.h"
 #include "IPHelper.hpp"
+#include "UrlEncode.hpp"        // single source of truth for urlDecode (see below)
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -1951,29 +1952,22 @@ uint64_t HttpServer::currentTimeMs() const
 }
 
 // Helpers for URL decoding and parsing post/form params
-static std::string urlDecode(const std::string& src)
-{
-	std::string ret;
-	char ch = '\0';
-	unsigned int ii = 0;
-	for (size_t pos = 0; pos < src.length(); ++pos) {
-		if (src[pos] == '+') {
-			ret += ' ';
-		} else if (src[pos] == '%') {
-			if (pos + 2 < src.length() && 
-				sscanf(src.substr(pos + 1, 2).c_str(), "%x", &ii) == 1) {
-				ch = static_cast<char>(ii);
-				ret += ch;
-				pos += 2;
-			} else {
-				ret += src[pos];
-			}
-		} else {
-			ret += src[pos];
-		}
-	}
-	return ret;
-}
+// urlDecode intentionally does NOT live here. This TU used to carry its own
+// file-static copy built on sscanf(substr(pos+1, 2), "%x", &ii), which silently
+// diverged from the tested one in UrlEncode.hpp:
+//
+//   * scanf's %x stops at the first non-hex character and still reports one
+//     successful conversion, so "%5g" decoded to byte 0x05 AND swallowed the
+//     'g' via the pos += 2 that followed. UrlEncode.hpp's hexVal() rejects the
+//     pair and emits a literal '%', leaving "5g" intact.
+//   * %x also accepts a leading sign, so "%-1" parsed rather than being passed
+//     through.
+//
+// Two decoders is one too many: the tested one (tests/UrlEncode_test.cpp,
+// UrlDecodeTrailingEscape) was reachable only from TelephonyAnchorClient, while
+// every HTML form route -- getFormParam() below, and therefore every admin POST
+// -- went through the weaker copy. drawbridge hit the same split and resolved it
+// the same way (its audit #73), making the header the single source of truth.
 
 static std::string getFormParam(const std::string& body, const std::string& key)
 {
