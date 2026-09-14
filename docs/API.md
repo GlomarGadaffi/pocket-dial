@@ -295,7 +295,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Gated (+ `X-CSRF`) | Saves Wi-Fi credentials to NVS and schedules a reboot into Station Mode. `501` on `eth`/`lan8720`/desktop (§4.2). |
 | [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Gated (+ `X-CSRF`) | Sets the device to Standalone Access Point Mode and schedules a reboot. No confirmation parameter. `501` on `eth`/`lan8720`/desktop (§4.2). |
 | [`/api/configuring`](#post-apiconfiguring) | `POST` | Low | Gated (+ `X-CSRF`) | Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. It mutates device state, so it takes the standard gate like every other mutating route — a logged-in, fully-set-up session is required, same as WiFi setup itself. |
-| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Requires `confirm=ERASE`. Wipes the login credential, the DTMF PIN, every session, AP security, the carrier-API credential table, the DID→extension table, the CDR ring, and (Wi-Fi builds only) Wi-Fi/mode NVS, then reboots. **On `eth`/`lan8720`/desktop it answers `501` *after* performing every wipe** — see §4.2 and that section's warning. |
+| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Requires `confirm=ERASE`. Wipes the login credential, the DTMF PIN, every session, AP security, the carrier-API credential table, the DID→extension table, the CDR ring, and (Wi-Fi builds only) Wi-Fi/mode NVS, then reboots on any ESP build. Answers `200` on every build. |
 | [`/api/ap-security`](#get-apiap-security) | `GET` | Medium | Gated | Reports whether the SoftAP requires WPA2 and returns its passphrase. |
 | [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
 | [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster. |
@@ -769,14 +769,20 @@ Covered by `test_api.sh` TC-SEC-01/02/03 (the same-origin matrix), TC-AUTH-02/05
 
 ---
 
-### 4.2 Build-dependent routes — read before using `/api/wifi/*` or `/api/factory-reset`
+### 4.2 Build-dependent routes — read before using `/api/wifi/*`
 
-Four routes are compiled against `POCKETDIAL_HAS_WIFI`, which
+Three routes are compiled against `POCKETDIAL_HAS_WIFI`, which
 `main/CMakeLists.txt:134` defines for **every transport except `eth` (W5500) and
 `lan8720`** — the two pure-Ethernet builds, which have no Wi-Fi radio at all. On those
 builds, and on the host/desktop build, the `#else` stub answers instead of the real
 implementation. This is Issue #167, and the stub messages all say *"on desktop"*
 regardless of whether you are on a desktop or on Ethernet hardware.
+
+`/api/factory-reset` is listed below too, but it is **not** one of those three: it is
+fully functional on every build. Only its Wi-Fi NVS key erase is transport-gated, and a
+wired board has no such keys to erase. It answers `200` everywhere and reboots on every
+ESP transport. (Before #189 it did belong in that set, and was the worst member of it —
+it performed the whole wipe and *then* answered `501`.)
 
 A second, **different** guard — `ESP_PLATFORM` — covers the OTA routes. It is defined
 on *every* ESP transport including `eth`/`lan8720`, so OTA works on Ethernet boards
@@ -787,7 +793,7 @@ even though Wi-Fi does not. Do not conflate the two.
 | [`GET /api/wifi/scan`](#get-apiwifiscan) | `POCKETDIAL_HAS_WIFI` | `200` with `{"networks":[], "note":"WiFi scan not available on desktop"}` |
 | [`POST /api/wifi/connect`](#post-apiwificonnect) | `POCKETDIAL_HAS_WIFI` | `501` `{"error":"WiFi connect not available on desktop"}` (after the `ssid` check) |
 | [`POST /api/wifi/mode_ap`](#post-apiwifimode_ap) | `POCKETDIAL_HAS_WIFI` | `501` `{"error":"WiFi mode select not available on desktop"}` |
-| [`POST /api/factory-reset`](#post-apifactory-reset) | `POCKETDIAL_HAS_WIFI` | `501` — **but the destructive work has already happened.** See that section. |
+| [`POST /api/factory-reset`](#post-apifactory-reset) | `POCKETDIAL_HAS_WIFI` *(Wi-Fi NVS keys only)* | Fully real everywhere: `200` on every build, and every ESP build reboots. Only the four Wi-Fi NVS keys and the captive-portal wording are transport-specific. |
 | [`POST /api/ota/upload`](#post-apiotaupload) | `ESP_PLATFORM` | Real on `eth`/`lan8720`; `501` only on desktop |
 | [`POST /api/ota/reboot`](#post-apiotareboot) | `ESP_PLATFORM` | Real on `eth`/`lan8720`; simulated `200` only on desktop |
 
@@ -2060,47 +2066,68 @@ default-credential/needs-initial-setup state, then reboots.
 
 * **Requires Same-Origin Check**: Yes
 * **Requires `pd_session` cookie**: Always (see §0)
-* **Build**: the *reboot and the Wi-Fi NVS erase* are `POCKETDIAL_HAS_WIFI`-guarded — see §4.2 and the warning below.
+* **Build**: only the *Wi-Fi NVS erase* is `POCKETDIAL_HAS_WIFI`-guarded. The wipe, the `200` and the reboot are not: the reboot is guarded on `ESP_PLATFORM`, so every ESP transport restarts. See §4.2.
 * **Request Content-Type**: `application/x-www-form-urlencoded`
 * **Request Parameters**:
   * `confirm` (Required): Must be the literal string `ERASE`, case-sensitive. Guards against an accidental/stray POST wiping the device.
 * **Response Content-Type**: `application/json`
 * **Response Status Codes**:
-  * `200 OK` (Wi-Fi builds): Everything cleared, Wi-Fi NVS keys erased, reboot scheduled ~1 s out.
+  * `200 OK`: Everything cleared. On Wi-Fi builds the Wi-Fi NVS keys are erased too; on
+    every ESP build a reboot is scheduled ~1 s out. The `message` field differs by build
+    (captive portal / dashboard / restart the process) but the status does not.
   * `400 Bad Request`: `{"error":"factory reset requires confirm=ERASE"}` — checked **first**, before anything is touched, so a request without it is genuinely harmless.
   * `401`/`403`: gates 1-4 as in §0.1.
-  * `501 Not Implemented`: `{"error":"factory reset not available on desktop"}` on a build without `POCKETDIAL_HAS_WIFI`. **Read the warning below before believing that message.**
 
-> [!CAUTION]
-> **On an `eth` or `lan8720` board, the `501` is a lie about what happened.** The wipes
-> above are all *unconditional* — they run before the `POCKETDIAL_HAS_WIFI` branch
-> (`HttpServer.cpp:2103-2129`) — and only the Wi-Fi NVS erase, the `200` response and
-> the reboot are inside the guard. So on the pure-Ethernet firmwares, a
-> `confirm=ERASE` request:
+> [!IMPORTANT]
+> **The response arrives on a connection that is already logged out.**
+> `AdminAuth::clearCredential()` wipes the session table (`AdminAuth.cpp:958`),
+> including the session that made this request, so the `200` is the last thing that
+> session will ever be told. There is no follow-up call to confirm with — treat the
+> `200` itself as the record that the wipe completed.
 >
-> * **does** clear the admin credential back to `admin`/`admin` and destroy every live
->   session, including the one that made the request (`AdminAuth::clearCredential()`
->   wipes the session table, `AdminAuth.cpp:958`);
-> * **does** clear the DTMF PIN, the AP security settings, the telephony credential
->   slots, the DID table and the CDR ring;
-> * does **not** reboot, and
-> * answers `501 {"error":"factory reset not available on desktop"}` — a message that
->   names the wrong platform and reads as "nothing happened".
->
-> The device is left reset but still running the old configuration in RAM, with the
-> caller logged out and unable to log back in except with the default credential — at
-> which point gate 4 (`setup_required`) applies again. **Treat a `501` from this
-> endpoint as a completed destructive reset, not as a no-op.** Issue #167 tracks the
-> `POCKETDIAL_HAS_WIFI` stubs generally; this is its sharpest edge.
->
-> On the **host/desktop** build the same thing happens, which is exactly why the wipes
-> are unconditional: it makes them host-testable. The `501` is honest there.
+> After the reboot the board comes back unprovisioned: the credential is the default
+> again, gate 4 (`setup_required`) applies, and on `wifi`/`eth`/`lan8720` the SIP
+> registrar stays down until a new admin credential is committed.
 
-#### Response Example (200 OK, Wi-Fi builds)
+<details>
+<summary>Historical: this endpoint used to report failure after succeeding (fixed, #189)</summary>
+
+Before #189, only the `POCKETDIAL_HAS_WIFI` arm answered `200`. Every other build —
+including the `eth` and `lan8720` firmwares that ship on real hardware — fell through to
+`501 {"error":"factory reset not available on desktop"}`, **after** the unconditional
+wipes had already cleared the credential, the carrier OAuth secret, the DID table and
+the CDR ring. Those builds also never rebooted, leaving the device reset in flash but
+still running the old configuration in RAM.
+
+If you are reading logs or a runbook from before that fix: a `501` from this endpoint
+recorded a *completed* destructive reset, not a no-op.
+
+</details>
+
+#### Response Examples (200 OK — the `message` is what varies by build)
+
+Wi-Fi builds:
 ```json
 {
   "status": "ok",
   "message": "Factory reset. Rebooting to captive-portal setup..."
+}
+```
+
+`eth` / `lan8720` builds — reboot straight back to the dashboard, which will report
+`needsSetup:true`:
+```json
+{
+  "status": "ok",
+  "message": "Factory reset. Rebooting — the dashboard will ask you to create a new admin login."
+}
+```
+
+Host/desktop build — the wipe completes, but there is no firmware to restart:
+```json
+{
+  "status": "ok",
+  "message": "Factory reset. Restart the process to complete."
 }
 ```
 

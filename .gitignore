@@ -103,3 +103,11 @@ LINEAGE.md
 tests/interop/.logs/
 __pycache__/
 *.pyc
+
+# Host-build runtime state. These are the desktop stand-ins for the NVS
+# namespaces the firmware uses, written into the CWD the moment SipServer runs.
+# pocketdial_tapi.cfg holds the carrier OAuth client_id/client_secret (the s*id /
+# s*sec keys), so this is a credential-leak guard, not just tidiness.
+# Wildcard rather than the two current names (pocketdial_tapi.cfg,
+# pocketdial_didmap.cfg) so a future host-backed namespace is covered on day one.
+pocketdial_*.cfg
