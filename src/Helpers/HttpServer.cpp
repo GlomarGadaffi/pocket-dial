@@ -6,6 +6,7 @@
 #include "TelephonyApiConfig.hpp"
 #include "DidMapping.hpp"
 #include "CallDetailRecord.hpp"
+#include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive wipe on factory reset
 #include "AdminAuth.hpp"
 #include "DeviceConfig.hpp"
 #include "OtaUpdater.hpp"
@@ -14,6 +15,14 @@
 #include "IPHelper.hpp"
 #include "UrlEncode.hpp"
 #include "Syslog.hpp"        // single source of truth for urlDecode (see below)
+// Issue #186 (config export/import): the digest-secret and mDNS/park-timeout
+// readers below need these two subsystems' EXISTING public accessors, exactly
+// like the includes above pull in DialPlan/TelephonyApiConfig/DidMapping/etc
+// for the other sendApi* handlers. Neither is modified -- see sendApiConfigExport's
+// comment on the HA1-export/no-import asymmetry this implies.
+#include "SipSecretStore.hpp"
+#include "PoolConfig.hpp"    // POCKETDIAL_PARK_TIMEOUT_SEC (informational export field)
+#include "JsonReader.hpp"    // strict, dependency-free JSON reader for /api/config/import
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +31,7 @@
 #include <chrono>
 #include <algorithm>
 #include <vector>
+#include <set>
 
 #if defined(POCKETDIAL_HAS_WIFI)
 #include "esp_wifi.h"
@@ -37,6 +47,9 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+// Issue #185: heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) for
+// sendApiStatus's minFreeHeapSpiram field.
+#include "esp_heap_caps.h"
 #endif
 
 // Forward declarations for the file-local form/URL helpers (defined lower down).
@@ -331,10 +344,15 @@ void HttpServer::handleClient(int clientSock)
 				HttpRequest otaReq = parseRequest(raw.substr(0, hdrEnd + 4));
 				otaReq.clientIp = peerIp;
 
-				// Same gate as every other mutating endpoint. Flashing firmware is
-				// the most consequential thing this server does, so it gets the CSRF
-				// check too — the dashboard's upload path sends the token.
-				if (!requireAdmin(clientSock, otaReq, true))
+				// Same gate as every other mutating endpoint, PLUS issue #173's
+				// owner-only floor for OTA upload specifically (MoH clip upload
+				// stays sysop-level — it is audio, not firmware). Flashing
+				// firmware is the most consequential thing this server does, so
+				// it gets the CSRF check too — the dashboard's upload path sends
+				// the token.
+				const AdminAuth::Role otaMinRole =
+					isMoh ? AdminAuth::Role::Sysop : AdminAuth::Role::Owner;
+				if (!requireAdmin(clientSock, otaReq, true, otaMinRole))
 				{
 					closeSocket(clientSock);
 					return;
@@ -508,13 +526,23 @@ void HttpServer::handleClient(int clientSock)
 		// Gated. The collector address is infrastructure detail, and #207 was filed
 		// about a read endpoint that had been ungated by analogy rather than by
 		// analysis -- so this takes the conservative side deliberately.
-		if (!requireAdmin(clientSock, req, false)) return;
-		sendApiSyslogStatus(clientSock);
+		//
+		// Fall-through form (CONTRIBUTING_FIRMWARE.md): the early-return form
+		// used here skips handleClient()'s single terminal closeSocket() on
+		// rejection, leaking the socket on every unauthenticated/cross-origin
+		// request to this route -- the exact #207/D-5 pattern. Fixed in the
+		// same pass that added requireAdmin's minRole parameter.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiSyslogStatus(clientSock);
+		}
 	}
 	else if (req.method == "POST" && req.path == "/api/syslog")
 	{
-		if (!requireAdmin(clientSock, req, true)) return;
-		sendApiSyslogSet(clientSock, req.body);
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiSyslogSet(clientSock, req.body);
+		}
 	}
 	else if (req.method == "GET" && req.path == "/api/moh")
 	{
@@ -718,9 +746,46 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "POST" && req.path == "/api/factory-reset")
 	{
-		if (requireAdmin(clientSock, req, true))
+		// Issue #173: owner-only (one of the three named owner-gated actions).
+		if (requireAdmin(clientSock, req, true, AdminAuth::Role::Owner))
 		{
 			sendApiFactoryReset(clientSock, req.body);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/api/config/export")
+	{
+		// Plaintext-only export. Read, but genuinely sensitive (digest secrets,
+		// dial plan, MAC bindings) -- sysop-gated, not public like /api/status.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiConfigExport(clientSock, /*withSecrets=*/false, "");
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/config/export")
+	{
+		// A non-empty `password` selects the encrypted secretsEnc block, and
+		// THAT is the one owner-only half of this endpoint (#173: "config
+		// export with secrets"). An empty/absent password on the POST is
+		// treated exactly like the GET (sysop-level, plaintext only) rather
+		// than rejected outright, so the dashboard can use one form for both.
+		const std::string password = getFormParam(req.body, "password");
+		const bool withSecrets = !password.empty();
+		if (requireAdmin(clientSock, req, true,
+			withSecrets ? AdminAuth::Role::Owner : AdminAuth::Role::Sysop))
+		{
+			sendApiConfigExport(clientSock, withSecrets, password);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/config/import")
+	{
+		// Sysop-level: #173 lists factory reset / export-with-secrets / OTA
+		// upload as the three owner-only actions, and restoring config is not
+		// one of them -- it gets its own confirm-before-overwrite interlock
+		// instead (checked inside the handler), matching "sysop gets add/
+		// change with a confirm-before-overwrite interlock".
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiConfigImport(clientSock, req.body);
 		}
 	}
 	else if (req.method == "GET" && req.path == "/api/ap-security")
@@ -773,6 +838,16 @@ void HttpServer::handleClient(int clientSock)
 		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiAdminSetCredential(clientSock, req);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/admin/set-owner-credential")
+	{
+		// Issue #173: owner-gated (sessionSatisfiesRole's no-owner-yet fallback
+		// is what lets a sysop session BOOTSTRAP the first owner account here;
+		// once one exists, only an owner session may replace it).
+		if (requireAdmin(clientSock, req, true, AdminAuth::Role::Owner))
+		{
+			sendApiAdminSetOwnerCredential(clientSock, req);
 		}
 	}
 	else if (req.method == "POST" && req.path == "/api/admin/login")
@@ -1010,6 +1085,109 @@ static std::string jsonEscape(const std::string& s)
 	return out;
 }
 
+#if defined(ESP_PLATFORM)
+// ── Issue #185: task-watchdog + heap/stack telemetry for GET /api/status ────
+// Read-only and zero-coupling: every stack high-water mark below is looked up
+// by FreeRTOS task NAME via xTaskGetHandle() rather than threading a
+// TaskHandle_t out of SipServer/UdpServer/RtpSender/RtpReceiver/ConferenceRoom
+// into this file, so none of those classes needs a getter added for this.
+//
+// The Task Watchdog SUBSCRIPTION (esp_task_wdt_add() + a periodic
+// esp_task_wdt_reset()) is a separate mechanism and lives only in
+// sip_server_task (main/esp_main*.cpp): the TWDT can only be fed by the
+// subscribed task itself calling esp_task_wdt_reset() on its own behalf --
+// there is no "reset on behalf of task X" call in the IDF API. This file runs
+// on the HTTP task, not any of the five tasks #185 names, so it could not
+// feed a subscription for udp_receiver_task / rtp_media_tx / rtp_media_rx /
+// conf_mix_tick even if it added one here -- and an unfed subscription would
+// guarantee a spurious watchdog reset under normal operation, not add safety.
+// Those four tasks' loops live in UdpServer.cpp / RtpSender.cpp /
+// RtpReceiver.cpp / ConferenceRoom.cpp, outside this change's file scope; see
+// the PR description for exactly where their esp_task_wdt_add()/_reset() calls
+// would go. sip_server_task (in scope, main/esp_main*.cpp) IS fully subscribed.
+
+// xTaskGetHandle() asserts strlen(name) < configMAX_TASK_NAME_LEN (16 on this
+// project's sdkconfig — FreeRTOS's own default). A task's STORED name is
+// itself right-truncated to 15 chars + NUL at creation time (FreeRTOS
+// tasks.c: prvInitialiseNewTask), so querying a longer literal doesn't just
+// fail to match -- it trips that assert and aborts the board. "udp_receiver_
+// task" is 17 chars; every other name below is short enough to pass whole.
+#define PD_UDP_RECEIVER_TASK_NAME "udp_receiver_ta"   // truncated "udp_receiver_task"
+
+// Stack high-water mark in BYTES for the task currently named `name`, or -1 if
+// no such task exists right now. -1 (rendered as JSON null) is deliberately
+// distinct from 0: rtp_media_tx/rx and conf_mix_tick only exist while a
+// call/conference is active, so "not running" is the ordinary case and must
+// stay distinguishable from an actual 0-bytes-left reading, which is the
+// near-overflow alarm this field exists to surface (see MixBus::tick()'s ~2.9
+// KB of locals on conf_mix_tick's 3072-byte stack, issue #185's motivating
+// example).
+static long pdStackHwmBytes(const char* name)
+{
+	TaskHandle_t h = xTaskGetHandle(name);
+	if (h == nullptr)
+	{
+		return -1;
+	}
+	return static_cast<long>(uxTaskGetStackHighWaterMark(h)) * static_cast<long>(sizeof(StackType_t));
+}
+
+// sip_server_task is named "sip_server_task" on the wifi/softAP build
+// (main/esp_main.cpp) but "sip_server" on both eth builds
+// (main/esp_main_eth.cpp, main/esp_main_eth_lan8720.cpp). This one
+// HttpServer.cpp links into all three, so try both spellings.
+static long pdSipServerStackHwmBytes()
+{
+	TaskHandle_t h = xTaskGetHandle("sip_server_task");
+	if (h == nullptr)
+	{
+		h = xTaskGetHandle("sip_server");
+	}
+	if (h == nullptr)
+	{
+		return -1;
+	}
+	return static_cast<long>(uxTaskGetStackHighWaterMark(h)) * static_cast<long>(sizeof(StackType_t));
+}
+
+static const char* pdResetReasonString(esp_reset_reason_t reason)
+{
+	switch (reason)
+	{
+		case ESP_RST_POWERON:    return "POWERON";
+		case ESP_RST_EXT:        return "EXT_PIN";
+		case ESP_RST_SW:         return "SW_RESTART";
+		case ESP_RST_PANIC:      return "PANIC";
+		case ESP_RST_INT_WDT:    return "INT_WDT";
+		case ESP_RST_TASK_WDT:   return "TASK_WDT";
+		case ESP_RST_WDT:        return "OTHER_WDT";
+		case ESP_RST_DEEPSLEEP:  return "DEEPSLEEP_WAKE";
+		case ESP_RST_BROWNOUT:   return "BROWNOUT";
+		case ESP_RST_SDIO:       return "SDIO";
+		case ESP_RST_USB:        return "USB";
+		case ESP_RST_JTAG:       return "JTAG";
+		case ESP_RST_EFUSE:      return "EFUSE_ERROR";
+		case ESP_RST_PWR_GLITCH: return "PWR_GLITCH";
+		case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP";
+		default:                 return "UNKNOWN";
+	}
+}
+
+// Appends ,"<key>":<bytes|null> -- the shared shape for every stackHwm_* field.
+static void pdAppendHwmField(std::ostringstream& json, const char* key, long bytes)
+{
+	json << ",\"" << key << "\":";
+	if (bytes < 0)
+	{
+		json << "null";
+	}
+	else
+	{
+		json << bytes;
+	}
+}
+#endif // ESP_PLATFORM
+
 void HttpServer::sendApiStatus(int sock, bool authenticated)
 {
 	uint64_t uptimeMs = currentTimeMs() - _startTime;
@@ -1181,6 +1359,29 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		     << "\",\"secondsParked\":" << std::get<3>(parkedCalls[i]) << "}";
 	}
 	json << "]";
+
+	// Issue #185: task-watchdog / heap / per-task stack telemetry. Purely
+	// additive -- every key here is new; nothing above this line changed.
+#if defined(ESP_PLATFORM)
+	json << ",\"freeHeap\":" << esp_get_free_heap_size();
+	json << ",\"minFreeHeap\":" << esp_get_minimum_free_heap_size();
+	json << ",\"minFreeHeapSpiram\":" << heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+	json << ",\"resetReason\":\"" << pdResetReasonString(esp_reset_reason()) << "\"";
+	pdAppendHwmField(json, "stackHwm_sip_server_task", pdSipServerStackHwmBytes());
+	pdAppendHwmField(json, "stackHwm_udp_receiver_task", pdStackHwmBytes(PD_UDP_RECEIVER_TASK_NAME));
+	pdAppendHwmField(json, "stackHwm_rtp_media_tx", pdStackHwmBytes("rtp_media_tx"));
+	pdAppendHwmField(json, "stackHwm_rtp_media_rx", pdStackHwmBytes("rtp_media_rx"));
+	pdAppendHwmField(json, "stackHwm_conf_mix_tick", pdStackHwmBytes("conf_mix_tick"));
+#else
+	// Host build: no FreeRTOS, no heap_caps. Same key set as the ESP build,
+	// all-zero/null, so tests/interop/interop.py's JSON parsing never has to
+	// special-case platform -- matching this route's existing "counters read
+	// 0, arrays empty" convention for the unattached/host case (docs/API.md).
+	json << ",\"freeHeap\":0,\"minFreeHeap\":0,\"minFreeHeapSpiram\":0,\"resetReason\":\"n/a\"";
+	json << ",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
+	        "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
+	        "\"stackHwm_conf_mix_tick\":null";
+#endif
 
 	json << "}";
 
@@ -2216,7 +2417,8 @@ bool HttpServer::hasValidAdminSession(const HttpRequest& req) const
 	return AdminAuth::validateSession(sessionToken(req));
 }
 
-bool HttpServer::requireAdmin(int sock, const HttpRequest& req, bool needCsrf)
+bool HttpServer::requireAdmin(int sock, const HttpRequest& req, bool needCsrf,
+	AdminAuth::Role minRole)
 {
 	// 1. Same-origin. A request with NO Origin header is admitted by design (see
 	//    isSameOrigin): curl, native clients and tests/http/test_api.sh do not
@@ -2260,6 +2462,19 @@ bool HttpServer::requireAdmin(int sock, const HttpRequest& req, bool needCsrf)
 	{
 		sendResponse(sock, 403, "Forbidden", "application/json",
 		             "{\"error\":\"setup_required\",\"message\":\"Change the default admin credential before continuing.\"}");
+		return false;
+	}
+
+	// 5. Issue #173: owner-only actions. sessionSatisfiesRole() admits a Sysop
+	//    session here TOO, but only while no owner credential has ever been
+	//    set (the no-owner fallback — see its declaration comment for why:
+	//    otherwise every already-deployed single-credential board loses
+	//    factory-reset/OTA/the encrypted export block the instant it upgrades
+	//    to this firmware, with no owner account yet to grant them back).
+	if (minRole == AdminAuth::Role::Owner && !AdminAuth::sessionSatisfiesRole(token, minRole))
+	{
+		sendResponse(sock, 403, "Forbidden", "application/json",
+		             "{\"error\":\"owner privilege required\"}");
 		return false;
 	}
 
@@ -2522,6 +2737,44 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		handler->clearAllDidMappings();
 		handler->clearAllCallHistory();
 	}
+	// ── Issue #194 Stage 1 DECISION: factory reset ALSO wipes the SD CDR
+	// archive, same policy as the NVS ring immediately above. This device
+	// already treats call history (caller/callee, when, how long) as
+	// sensitive as carrier credentials -- that is the entire reason
+	// clearAllCallHistory() exists as its own explicit step rather than
+	// falling out of DeviceConfig::clearAll(). An SD file does not
+	// automatically inherit that policy just because it holds the same data:
+	// without this call, a factory reset would erase the live NVS ring while
+	// leaving a full, dated, plaintext history sitting on the card, which is
+	// almost certainly the more surprising and worse outcome of the two for
+	// an operator who just asked the device to forget everything. If a
+	// deployment wants the SD archive to OUTLIVE a factory reset instead
+	// (e.g. the archive is the compliance record and the reset is routine
+	// re-provisioning), that is a one-line reversal at this call site -- flag
+	// it in review if this default is wrong for how pocket-dial is actually
+	// deployed.
+	//
+	// Called directly here, NOT threaded through clearAllCallHistory(): that
+	// method takes RequestsHandler::_mutex, and directory I/O (opendir/
+	// unlink) must never run while holding it -- see CdrArchive.hpp's SD
+	// write-discipline note. sendApiFactoryReset() runs on the HTTP task with
+	// no lock held, the same context the MoH-upload fopen() above already
+	// uses, so calling it here is safe. No-op on every build without an SD
+	// archive installed (see cdrarchive::wipeAll()'s doc comment).
+	cdrarchive::wipeAll();
+	//
+	// KNOWN GAP, not fixed here (out of this stage's scope -- DtmfFeatureCodes.cpp
+	// is not part of issue #194 Stage 1's touch list): the DTMF admin menu's OWN
+	// factory-reset path (*<PIN>#999#1, DtmfFeatureCodes.cpp) does not call this
+	// function at all -- it runs nvs_flash_erase() + esp_restart() directly on
+	// the SIP thread. That wipes NVS (including the "cdrlog" ring, more
+	// thoroughly than the targeted erase above) but never touches the SD card,
+	// so a DTMF-triggered factory reset currently leaves the SD archive intact
+	// while the HTTP-triggered one (this function) wipes both. Closing that gap
+	// means either giving DtmfFeatureCodes.cpp its own SD-wipe call (same SIP-
+	// thread/no-blocking-I/O constraint as endCall(), and outside this stage's
+	// "minimal hook" scope) or unifying the two factory-reset entry points --
+	// filed as issue #222 rather than an unreviewed addition here.
 #if defined(POCKETDIAL_HAS_WIFI)
 	// The ONLY genuinely radio-specific work in this handler. It stays gated on the
 	// transport (not the platform) for a second reason beyond the keys themselves:
@@ -2783,16 +3036,53 @@ void HttpServer::sendApiAdminStatus(int sock, const HttpRequest& req)
 	// dashboard polling this endpoint just to show a countdown doesn't distort
 	// the number it displays beyond what isAuthed() itself already causes.
 	uint64_t sessionRemainingMs = 0;
+	AdminAuth::Role role = AdminAuth::Role::None;
 	if (authenticated)
 	{
 		sessionRemainingMs = AdminAuth::sessionRemainingMs(cookieValue(req, "pd_session"));
+		role = AdminAuth::sessionRole(cookieValue(req, "pd_session"));
 	}
+	// Issue #173: `role`/`ownerProvisioned` let the dashboard show or hide the
+	// owner-only actions (factory reset, export-with-secrets, OTA upload) and
+	// the "create the owner account" prompt without probing each one.
+	// `role` is "" (not "none") while unauthenticated -- unauthenticated
+	// already has its own boolean field, so a caller doesn't need to parse a
+	// string to learn it.
 	std::ostringstream json;
 	json << "{\"provisioned\":" << (provisioned ? "true" : "false")
 	     << ",\"needsSetup\":" << (provisioned ? "false" : "true")
 	     << ",\"authenticated\":" << (authenticated ? "true" : "false")
+	     << ",\"role\":\"" << (role == AdminAuth::Role::Owner ? "owner" :
+	                            role == AdminAuth::Role::Sysop ? "sysop" : "")
+	     << "\",\"ownerProvisioned\":" << (AdminAuth::isOwnerProvisioned() ? "true" : "false")
 	     << ",\"sessionRemainingSec\":" << (sessionRemainingMs / 1000) << "}";
 	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiAdminSetOwnerCredential(int sock, const HttpRequest& req)
+{
+	// Reached only through requireAdmin(..., minRole=Owner) -- which, via
+	// sessionSatisfiesRole()'s no-owner-yet fallback, means either a real
+	// owner session (replacing an existing owner credential) or a sysop
+	// session on a device with NO owner yet (bootstrapping the first one).
+	std::string username = getFormParam(req.body, "ownerUsername");
+	std::string password = getFormParam(req.body, "ownerPassword");
+
+	if (username.empty() || password.empty())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"ownerUsername and ownerPassword are both required\"}");
+		return;
+	}
+	if (!AdminAuth::setOwnerCredential(username, password))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"invalid owner username/password, or it collides with the sysop username\"}");
+		return;
+	}
+
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"ownerProvisioned\":true}");
 }
 
 void HttpServer::sendApiAdminSetCredential(int sock, const HttpRequest& req)
@@ -2829,6 +3119,25 @@ void HttpServer::sendApiAdminSetCredential(int sock, const HttpRequest& req)
 
 	if (!dtmfPin.empty())
 	{
+		// Issue #173 (found in review, not in the original issue text): the
+		// DTMF admin menu's *999#1 code wipes the ENTIRE NVS flash
+		// (nvs_flash_erase(), DtmfFeatureCodes.cpp) — including the owner
+		// credential itself. Without this gate, a sysop session could set a
+		// DTMF PIN here, dial *<PIN>999#1 from any registered phone to
+		// factory-reset the device, and land back on a no-owner-yet board
+		// where sessionSatisfiesRole()'s fallback hands sysop owner powers
+		// again — a sysop-reachable path to permanently escalating past the
+		// owner they were never supposed to be able to remove. Gating this
+		// at Owner (with the SAME no-owner-yet fallback every other
+		// owner-gated action uses) closes it while leaving first-boot
+		// onboarding untouched: before any owner exists, the fallback still
+		// lets the sysop doing initial setup set a DTMF PIN.
+		if (!AdminAuth::sessionSatisfiesRole(sessionToken(req), AdminAuth::Role::Owner))
+		{
+			sendResponse(sock, 403, "Forbidden", "application/json",
+			             "{\"error\":\"owner privilege required to set the DTMF admin PIN\"}");
+			return;
+		}
 		if (!AdminAuth::setDtmfPin(dtmfPin))
 		{
 			sendResponse(sock, 400, "Bad Request", "application/json",
@@ -2853,23 +3162,26 @@ void HttpServer::sendApiAdminSetCredential(int sock, const HttpRequest& req)
 
 void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 {
+	std::string username = getFormParam(req.body, "username");
+	std::string password = getFormParam(req.body, "password");
+
 	// Reject while locked out before doing any hashing work. Accounting is keyed
-	// on the peer address so one guessing client cannot lock the real admin out
-	// of new logins (docs/THREAT_MODEL.md D-3). A spoofed source only ever buys
-	// the spoofer their own fresh bucket — the key is for fairness, not trust.
-	if (AdminAuth::isLockedOut(req.clientIp))
+	// on (peer address, principal resolved from `username`) — issue #173 — so
+	// spraying one principal's password cannot lock the OTHER principal out,
+	// and a spoofed source only ever buys the spoofer their own fresh bucket
+	// either way (docs/THREAT_MODEL.md D-3).
+	if (AdminAuth::isLockedOutForAuth(username, req.clientIp))
 	{
 		sendResponse(sock, 429, "Too Many Requests", "application/json",
 		             "{\"error\":\"too many failed attempts; try again later\"}");
 		return;
 	}
 
-	std::string username = getFormParam(req.body, "username");
-	std::string password = getFormParam(req.body, "password");
-	if (!AdminAuth::verifyCredential(username, password, req.clientIp))
+	AdminAuth::Role role = AdminAuth::authenticate(username, password, req.clientIp);
+	if (role == AdminAuth::Role::None)
 	{
-		// verifyCredential may have just engaged the lockout on this attempt.
-		if (AdminAuth::isLockedOut(req.clientIp))
+		// authenticate() may have just engaged the lockout on this attempt.
+		if (AdminAuth::isLockedOutForAuth(username, req.clientIp))
 		{
 			sendResponse(sock, 429, "Too Many Requests", "application/json",
 			             "{\"error\":\"too many failed attempts; try again later\"}");
@@ -2882,7 +3194,7 @@ void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 		return;
 	}
 
-	std::string token = AdminAuth::createSession();
+	std::string token = AdminAuth::createSession(role);
 	if (token.empty())
 	{
 		sendResponse(sock, 500, "Internal Server Error", "application/json",
@@ -2903,10 +3215,13 @@ void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 	// the frontend whether this login just authenticated with the default
 	// credential — if so, requireAdmin() will refuse everything except
 	// /api/admin/set-credential until that's fixed, so the page must route
-	// straight to the setup form rather than the normal dashboard.
+	// straight to the setup form rather than the normal dashboard. `role`
+	// (issue #173) lets the dashboard show/hide the owner-only actions
+	// without probing each one to find out.
 	std::ostringstream json;
 	json << "{\"status\":\"ok\",\"authenticated\":true,\"needsSetup\":"
 	     << (AdminAuth::needsInitialSetup() ? "true" : "false")
+	     << ",\"role\":\"" << (role == AdminAuth::Role::Owner ? "owner" : "sysop") << "\""
 	     << ",\"csrf\":\"" << jsonEscape(AdminAuth::sessionCsrf(token)) << "\"}";
 	sendResponseWithHeader(sock, 200, "OK", "application/json", json.str(), cookie);
 }
@@ -2922,6 +3237,712 @@ void HttpServer::sendApiAdminLogout(int sock, const HttpRequest& req)
 	std::string cookie = "Set-Cookie: pd_session=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0";
 	sendResponseWithHeader(sock, 200, "OK", "application/json",
 	                       "{\"status\":\"ok\"}", cookie);
+}
+
+// ── Config export/import (issue #186) ─────────────────────────────────────
+namespace
+{
+	std::string toHexLocal(const uint8_t* data, size_t len)
+	{
+		static const char* d = "0123456789abcdef";
+		std::string out;
+		out.reserve(len * 2);
+		for (size_t i = 0; i < len; ++i)
+		{
+			out.push_back(d[(data[i] >> 4) & 0xF]);
+			out.push_back(d[data[i] & 0xF]);
+		}
+		return out;
+	}
+
+	// Decodes a hex string into bytes. Returns false (leaving `out`
+	// untouched) on an odd length or any non-hex character -- never silently
+	// truncates or skips malformed input, the same discipline UrlEncode.hpp's
+	// hexVal() already established for this codebase's other hex/percent
+	// decoder.
+	bool fromHexLocal(const std::string& hex, std::vector<uint8_t>& out)
+	{
+		if (hex.size() % 2 != 0) return false;
+		std::vector<uint8_t> bytes(hex.size() / 2);
+		for (size_t i = 0; i < bytes.size(); ++i)
+		{
+			auto nibble = [](char c) -> int {
+				if (c >= '0' && c <= '9') return c - '0';
+				if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+				if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+				return -1;
+			};
+			int hi = nibble(hex[2 * i]);
+			int lo = nibble(hex[2 * i + 1]);
+			if (hi < 0 || lo < 0) return false;
+			bytes[i] = static_cast<uint8_t>((hi << 4) | lo);
+		}
+		out = std::move(bytes);
+		return true;
+	}
+}
+
+// Builds the full export blob. `withSecrets` selects whether the encrypted
+// "secretsEnc" block is included; `password` is ignored when it is not.
+//
+// DATA-SOURCE DISCIPLINE (matches every other sendApi* handler in this file):
+// every field below comes from an EXISTING public accessor on DialPlan/
+// TelephonyApiConfig/DidMapping/AdminAuth/DeviceConfig/RequestsHandler/
+// SipSecretStore -- no new method was added to RequestsHandler.hpp/.cpp for
+// this feature (that file is being touched by other concurrent work). Three
+// real gaps fell out of that constraint, and are surfaced here rather than
+// hidden:
+//
+//   1. Per-extension digest secrets (SipSecretStore::getHa1) and MAC bindings
+//      (RequestsHandler::getAdoptedDevices) export cleanly but have NO way
+//      back in: SipSecretStore exposes setSecret(ext, PLAINTEXT) but no
+//      "install this HA1 directly" setter, and there is no adoptDevice(mac,
+//      ext, state)-shaped mutator at all. sendApiConfigImport() reports both
+//      as "skipped" rather than silently dropping them.
+//   2. A TelephonyApiConfig slot's actual secret is masked by SlotView
+//      (secretSet only) with no accessor that would reverse that -- the
+//      gated block below carries baseUrl/clientId/routeDn per slot, never
+//      the secret. An operator restoring a trunk config re-enters that one
+//      field once, same as fresh setup.
+//   3. mDNS hostname (POCKETDIAL_HOSTNAME) and the park-call timeout
+//      (POCKETDIAL_PARK_TIMEOUT_SEC) are compile-time constants in this
+//      codebase today, not NVS-backed settings -- included as informational
+//      plaintext fields so a restored device's operator can see what the
+//      backed-up device was running under; import is a no-op for both.
+//
+// Followup filed in the PR description: an adoptDevice()/setHa1() pair on
+// RequestsHandler/SipSecretStore, and a masked-secret round trip for
+// TelephonyApiConfig slots, would close gaps 1 and 2 without ever exposing a
+// plaintext secret over this API.
+void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::string& password)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+
+	std::ostringstream pt;
+	pt << "{";
+
+	// Extensions + MAC bindings (always-plaintext per #186's field list).
+	// EXPORT ONLY -- see gap 1 above.
+	pt << "\"extensions\":[";
+	{
+		bool first = true;
+		if (handler)
+		{
+			for (const auto& d : handler->getAdoptedDevices())
+			{
+				if (!first) pt << ",";
+				first = false;
+				pt << "{\"mac\":\"" << jsonEscape(d.mac)
+				   << "\",\"extension\":\"" << jsonEscape(d.extension)
+				   << "\",\"state\":\""
+				   << ((d.state == RequestsHandler::DeviceState::Secured) ? "secured" : "learned")
+				   << "\"}";
+			}
+		}
+	}
+	pt << "],";
+
+	// Per-extension digest secrets (HA1 -- see SipSecretStore.hpp: this IS
+	// the persisted, plaintext-equivalent secret; there is no separate
+	// original password stored anywhere to export instead). Matches #186's
+	// field list verbatim ("per-extension digest secrets" is named as an
+	// always-plaintext field). EXPORT ONLY -- see gap 1 above.
+	pt << "\"extensionSecrets\":[";
+	{
+		bool first = true;
+		for (const auto& ext : SipSecretStore::securedExtensions())
+		{
+			auto ha1 = SipSecretStore::getHa1(ext);
+			if (!ha1.has_value()) continue;
+			if (!first) pt << ",";
+			first = false;
+			pt << "{\"extension\":\"" << jsonEscape(ext)
+			   << "\",\"ha1\":\"" << jsonEscape(*ha1) << "\"}";
+		}
+	}
+	pt << "],";
+
+	pt << "\"ringGroups\":[";
+	{
+		bool first = true;
+		if (handler)
+		{
+			for (const auto& g : handler->getRingGroups())
+			{
+				if (!first) pt << ",";
+				first = false;
+				pt << "{\"extension\":\"" << jsonEscape(std::get<0>(g))
+				   << "\",\"mode\":\"" << jsonEscape(std::get<1>(g))
+				   << "\",\"members\":\"" << jsonEscape(std::get<2>(g)) << "\"}";
+			}
+		}
+	}
+	pt << "],";
+
+	pt << "\"forwards\":[";
+	{
+		bool first = true;
+		if (handler)
+		{
+			for (const auto& f : handler->getForwards())
+			{
+				if (!first) pt << ",";
+				first = false;
+				pt << "{\"extension\":\"" << jsonEscape(std::get<0>(f))
+				   << "\",\"always\":\"" << jsonEscape(std::get<1>(f))
+				   << "\",\"busy\":\"" << jsonEscape(std::get<2>(f))
+				   << "\",\"noAnswer\":\"" << jsonEscape(std::get<3>(f)) << "\"}";
+			}
+		}
+	}
+	pt << "],";
+
+	pt << "\"dnd\":[";
+	{
+		bool first = true;
+		if (handler)
+		{
+			for (const auto& ext : handler->getDndExtensions())
+			{
+				if (!first) pt << ",";
+				first = false;
+				pt << "\"" << jsonEscape(ext) << "\"";
+			}
+		}
+	}
+	pt << "],";
+
+	pt << "\"pageZones\":[";
+	{
+		bool first = true;
+		if (handler)
+		{
+			for (const auto& z : handler->getPageZones())
+			{
+				if (!first) pt << ",";
+				first = false;
+				pt << "{\"zone\":\"" << jsonEscape(z.first)
+				   << "\",\"members\":\"" << jsonEscape(z.second) << "\"}";
+			}
+		}
+	}
+	pt << "],";
+
+	pt << "\"dialPlan\":[";
+	{
+		bool first = true;
+		if (handler)
+		{
+			for (const auto& r : handler->getDialRules())
+			{
+				if (!first) pt << ",";
+				first = false;
+				pt << "{\"pattern\":\"" << jsonEscape(std::get<0>(r))
+				   << "\",\"action\":\"" << jsonEscape(std::get<1>(r))
+				   << "\",\"target\":\"" << jsonEscape(std::get<2>(r))
+				   << "\",\"stripDigits\":" << std::get<3>(r) << "}";
+			}
+		}
+	}
+	pt << "],";
+
+	pt << "\"didMappings\":[";
+	{
+		bool first = true;
+		if (handler)
+		{
+			for (const auto& e : handler->getDidMappings())
+			{
+				if (!first) pt << ",";
+				first = false;
+				pt << "{\"did\":\"" << jsonEscape(e.did)
+				   << "\",\"extension\":\"" << jsonEscape(e.extension) << "\"}";
+			}
+		}
+	}
+	pt << "],";
+
+	pt << "\"registrarMode\":\""
+	   << (handler ? registrarModeName(handler->getRegistrarMode()) : "open") << "\",";
+
+	// Telephony-API slot METADATA only. baseUrl/clientId/routeDn are
+	// password-gated (#186: "anchor/trunk base URL, client ID/secret, source
+	// DN") -- see the gated block below. The secret itself is never
+	// exportable at all, gated or not -- see gap 2 above.
+	pt << "\"telephonyConfig\":[";
+	{
+		bool first = true;
+		if (handler)
+		{
+			auto slots = handler->getTelephonyConfigSlots();
+			for (size_t i = 0; i < slots.size(); ++i)
+			{
+				if (!first) pt << ",";
+				first = false;
+				pt << "{\"index\":" << i
+				   << ",\"type\":\"" << telephonyProviderName(slots[i].type) << "\""
+				   << ",\"enabled\":" << (slots[i].enabled ? "true" : "false")
+				   << ",\"secretSet\":" << (slots[i].secretSet ? "true" : "false") << "}";
+			}
+		}
+	}
+	pt << "],";
+
+	pt << "\"wifiSsid\":\"" << jsonEscape(DeviceConfig::getWifiSsid()) << "\""
+	   << ",\"wifiMode\":" << static_cast<int>(DeviceConfig::getWifiMode())
+	   << ",\"apSecure\":" << (DeviceConfig::isApSecure() ? "true" : "false") << ",";
+
+	// Informational only -- see gap 3 above; import is a no-op for both.
+#ifndef POCKETDIAL_HOSTNAME
+#define POCKETDIAL_HOSTNAME "pocketdial"
+#endif
+	pt << "\"parkTimeoutSec\":" << POCKETDIAL_PARK_TIMEOUT_SEC << ","
+	   << "\"mdnsHostname\":\"" << jsonEscape(POCKETDIAL_HOSTNAME) << "\","
+	   << "\"schemaVer\":" << DeviceConfig::kSchemaVersion;
+	pt << "}";
+
+	const std::string plaintextJson = pt.str();
+
+	std::ostringstream out;
+	out << "{\"exportVer\":1,\"plaintext\":" << plaintextJson;
+
+	if (withSecrets)
+	{
+		std::ostringstream gated;
+		gated << "{\"wifiPassword\":\"" << jsonEscape(DeviceConfig::getWifiPassword()) << "\""
+		      << ",\"apPsk\":\"" << jsonEscape(DeviceConfig::getApPsk()) << "\""
+		      << ",\"telephonyConfig\":[";
+		{
+			bool first = true;
+			if (handler)
+			{
+				auto slots = handler->getTelephonyConfigSlots();
+				for (size_t i = 0; i < slots.size(); ++i)
+				{
+					if (!first) gated << ",";
+					first = false;
+					gated << "{\"index\":" << i
+					      << ",\"baseUrl\":\"" << jsonEscape(slots[i].baseUrl) << "\""
+					      << ",\"clientId\":\"" << jsonEscape(slots[i].clientId) << "\""
+					      << ",\"routeDn\":\"" << jsonEscape(slots[i].routeDn) << "\"}";
+				}
+			}
+		}
+		gated << "]}";
+		const std::string gatedPlaintext = gated.str();
+
+		uint8_t salt[AdminAuth::kKdfSaltBytes];
+		uint8_t nonce[AdminAuth::kGcmNonceBytes];
+		AdminAuth::secureRandomBytes(salt, sizeof(salt));
+		AdminAuth::secureRandomBytes(nonce, sizeof(nonce));
+
+		uint8_t key[AdminAuth::kAesKeyBytes];
+		AdminAuth::pbkdf2Sha256(password, salt, sizeof(salt), AdminAuth::kExportKdfIterations,
+			key, sizeof(key));
+
+		std::string ct;
+		// AAD binds this block to the EXACT plaintext bytes shipped alongside
+		// it (byte-for-byte, since `plaintextJson` is written verbatim into
+		// `out` above) so the two halves can never be silently recombined
+		// from two different exports, or against a tampered plaintext
+		// section, without failing authentication on import.
+		AdminAuth::aesGcmSeal(key, nonce, plaintextJson, gatedPlaintext, ct);
+
+		out << ",\"secretsEnc\":{\"kdf\":\"pbkdf2-sha256\""
+		    << ",\"iter\":" << AdminAuth::kExportKdfIterations
+		    << ",\"salt\":\"" << toHexLocal(salt, sizeof(salt)) << "\""
+		    << ",\"nonce\":\"" << toHexLocal(nonce, sizeof(nonce)) << "\""
+		    << ",\"ct\":\""
+		    << toHexLocal(reinterpret_cast<const uint8_t*>(ct.data()), ct.size()) << "\"}";
+	}
+
+	out << "}";
+	sendResponse(sock, 200, "OK", "application/json", out.str());
+}
+
+// Restores config from an export blob. Body: form-encoded
+// blob=<url-encoded export JSON>&password=<optional>&confirm=REPLACE.
+//
+// Ordering (deliberate): the WHOLE blob is parsed, schema-checked, and (if a
+// password was given) decrypted BEFORE any setter runs, so a 400 or 422 here
+// leaves every table on the device exactly as it was. Only once everything
+// needed has been validated does the apply pass begin, and that pass cannot
+// itself fail outward -- each underlying setter already validates and
+// silently drops a malformed row (the same "log and drop" contract
+// PbxFeatureConfig's setters use for the live HTTP routes), so a partially
+// bad blob degrades to a smaller "applied" list rather than a crash.
+//
+// DEVIATION FROM THE ISSUE TEXT: #186 describes a 204 on success. This
+// returns 200 with {"applied":[...],"skipped":[...]} instead -- see gaps 1/2
+// on sendApiConfigExport() above: this feature genuinely cannot restore
+// everything a plaintext-capable export can carry (MAC bindings, digest
+// secrets, a trunk slot's secret), and a bare 204 would tell the operator
+// "fully restored" when it was not. Silently dropping those fields would be
+// worse than saying so.
+void HttpServer::sendApiConfigImport(int sock, const std::string& body)
+{
+	if (getFormParam(body, "confirm") != "REPLACE")
+	{
+		// Same "explicit confirm token" convention as /api/factory-reset
+		// (confirm=ERASE) -- both are replace-not-merge, both use 400 for a
+		// missing/wrong token.
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"import requires confirm=REPLACE\"}");
+		return;
+	}
+
+	const std::string blob = getFormParam(body, "blob");
+	const std::string password = getFormParam(body, "password");
+	if (blob.empty())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"missing blob parameter\"}");
+		return;
+	}
+
+	JsonReader::Value root;
+	std::string parseErr;
+	if (!JsonReader::parse(blob, root, parseErr) || !root.isObject())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"malformed export blob\"}");
+		return;
+	}
+	const JsonReader::Value* pt = root.find("plaintext");
+	if (!pt || !pt->isObject())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"export blob is missing a plaintext object\"}");
+		return;
+	}
+	if (root.intOr("exportVer", 1) != 1)
+	{
+		// Found in review: emitted on export, never checked on import. A
+		// future export format bump must not be silently misread as v1 --
+		// refuse rather than guess.
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"unsupported exportVer\"}");
+		return;
+	}
+
+	// Decrypt the gated block FIRST (before any setter runs) -- see the
+	// function comment on why. A tag mismatch is reported as 422 and is
+	// deliberately indistinguishable from a wrong password (AdminAuth::
+	// aesGcmOpen's contract): the two must look the same to the caller.
+	bool haveSecrets = false;
+	JsonReader::Value secretsValue;
+	const JsonReader::Value* secretsEncNode = root.find("secretsEnc");
+	if (secretsEncNode && secretsEncNode->isObject() && !password.empty())
+	{
+		std::vector<uint8_t> salt, nonce, ct;
+		int iter = secretsEncNode->intOr("iter", 0);
+		// Found in review: `iter` is attacker-controlled (a sysop-crafted
+		// blob, or any operator on the LAN once past the sysop-level import
+		// gate). PBKDF2 cost is linear in it, on the HTTP handler thread --
+		// an unbounded value pins that thread for as long as the caller
+		// likes. Cap generously above this feature's own iteration count
+		// (kExportKdfIterations) rather than pinning it exactly, so a blob
+		// exported by an older/newer build with a different constant still
+		// imports.
+		bool shapeOk = iter > 0 && iter <= static_cast<int>(2 * AdminAuth::kExportKdfIterations) &&
+			fromHexLocal(secretsEncNode->stringOr("salt"), salt) &&
+			salt.size() == AdminAuth::kKdfSaltBytes &&
+			fromHexLocal(secretsEncNode->stringOr("nonce"), nonce) &&
+			nonce.size() == AdminAuth::kGcmNonceBytes &&
+			fromHexLocal(secretsEncNode->stringOr("ct"), ct) &&
+			ct.size() >= AdminAuth::kGcmTagBytes;
+		if (!shapeOk)
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"malformed secretsEnc block\"}");
+			return;
+		}
+
+		uint8_t key[AdminAuth::kAesKeyBytes];
+		AdminAuth::pbkdf2Sha256(password, salt.data(), salt.size(),
+			static_cast<uint32_t>(iter), key, sizeof(key));
+
+		const std::string ctStr(reinterpret_cast<const char*>(ct.data()), ct.size());
+		const std::string aad = blob.substr(pt->spanStart, pt->spanEnd - pt->spanStart);
+		std::string plaintextOut;
+		if (!AdminAuth::aesGcmOpen(key, nonce.data(), aad, ctStr, plaintextOut))
+		{
+			sendResponse(sock, 422, "Unprocessable Entity", "application/json",
+			             "{\"error\":\"bad password or corrupted secrets block\"}");
+			return;
+		}
+
+		std::string innerErr;
+		if (!JsonReader::parse(plaintextOut, secretsValue, innerErr) || !secretsValue.isObject())
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"decrypted secrets block is not valid JSON\"}");
+			return;
+		}
+		haveSecrets = true;
+	}
+
+	// ── Validated. Apply. ────────────────────────────────────────────────
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	std::vector<std::string> applied;
+	std::vector<std::string> skipped;
+
+	if (!pt->arrayOr("extensions").empty())
+	{
+		skipped.push_back("extensions (MAC bindings: no import accessor -- see PR description)");
+	}
+	if (!pt->arrayOr("extensionSecrets").empty())
+	{
+		skipped.push_back("extensionSecrets (digest secrets: no import accessor -- see PR description)");
+	}
+
+	if (handler)
+	{
+		// Ring groups: delete-then-set sweep (replace, not merge).
+		{
+			std::set<std::string> keep;
+			for (const auto& g : pt->arrayOr("ringGroups")) keep.insert(g.stringOr("extension"));
+			for (const auto& g : handler->getRingGroups())
+			{
+				if (!keep.count(std::get<0>(g)))
+				{
+					handler->setRingGroup(std::get<0>(g), "", std::get<1>(g));
+				}
+			}
+			for (const auto& g : pt->arrayOr("ringGroups"))
+			{
+				handler->setRingGroup(g.stringOr("extension"), g.stringOr("members"),
+					g.stringOr("mode", "ringall"));
+			}
+		}
+		applied.push_back("ringGroups");
+
+		// Forwards: replace per (extension, trigger).
+		{
+			std::set<std::string> keep;
+			for (const auto& f : pt->arrayOr("forwards")) keep.insert(f.stringOr("extension"));
+			for (const auto& f : handler->getForwards())
+			{
+				if (!keep.count(std::get<0>(f)))
+				{
+					handler->setForward(std::get<0>(f), "always", "");
+					handler->setForward(std::get<0>(f), "busy", "");
+					handler->setForward(std::get<0>(f), "noanswer", "");
+				}
+			}
+			for (const auto& f : pt->arrayOr("forwards"))
+			{
+				const std::string ext = f.stringOr("extension");
+				handler->setForward(ext, "always", f.stringOr("always"));
+				handler->setForward(ext, "busy", f.stringOr("busy"));
+				handler->setForward(ext, "noanswer", f.stringOr("noAnswer"));
+			}
+		}
+		applied.push_back("forwards");
+
+		// DND: replace membership.
+		{
+			std::set<std::string> keep;
+			for (const auto& d : pt->arrayOr("dnd")) if (d.isString()) keep.insert(d.strVal);
+			for (const auto& ext : handler->getDndExtensions())
+			{
+				if (!keep.count(ext)) handler->setDnd(ext, false);
+			}
+			for (const auto& ext : keep) handler->setDnd(ext, true);
+		}
+		applied.push_back("dnd");
+
+		// Page zones: delete-then-set sweep.
+		{
+			std::set<std::string> keep;
+			for (const auto& z : pt->arrayOr("pageZones")) keep.insert(z.stringOr("zone"));
+			for (const auto& z : handler->getPageZones())
+			{
+				if (!keep.count(z.first)) handler->setPageZone(z.first, "");
+			}
+			for (const auto& z : pt->arrayOr("pageZones"))
+			{
+				handler->setPageZone(z.stringOr("zone"), z.stringOr("members"));
+			}
+		}
+		applied.push_back("pageZones");
+
+		// Dial plan: delete-then-set sweep. setDialRule() deletes ONLY when
+		// BOTH action and target are empty (PbxFeatureConfig::setDialRule) --
+		// an empty target alone means "trunk: prepend nothing" and must not
+		// be read as a delete.
+		{
+			std::set<std::string> keep;
+			for (const auto& r : pt->arrayOr("dialPlan")) keep.insert(r.stringOr("pattern"));
+			for (const auto& r : handler->getDialRules())
+			{
+				if (!keep.count(std::get<0>(r)))
+				{
+					handler->setDialRule(std::get<0>(r), "", "", 0);
+				}
+			}
+			for (const auto& r : pt->arrayOr("dialPlan"))
+			{
+				handler->setDialRule(r.stringOr("pattern"), r.stringOr("action"),
+					r.stringOr("target"), r.intOr("stripDigits", 0));
+			}
+		}
+		applied.push_back("dialPlan");
+
+		// DID mappings: RequestsHandler exposes a genuine bulk clear (the same
+		// one /api/factory-reset uses), unlike the four tables above -- use it
+		// for a real replace instead of hand-rolling a diff.
+		handler->clearAllDidMappings();
+		for (const auto& m : pt->arrayOr("didMappings"))
+		{
+			handler->setDidMapping(m.stringOr("did"), m.stringOr("extension"));
+		}
+		applied.push_back("didMappings");
+
+		// Registrar mode: the SAME lockout guard sendApiRegistrarSet() already
+		// enforces for a live switch to `secure` -- restoring `secure` onto a
+		// device whose extensions could NOT be restored (see the
+		// extensions/extensionSecrets skip above) would digest-challenge every
+		// REGISTER with no working handset left to notice. Every other mode
+		// applies outright.
+		RequestsHandler::RegistrarMode parsedMode;
+		if (parseRegistrarMode(pt->stringOr("registrarMode", "open"), parsedMode))
+		{
+			if (parsedMode == RequestsHandler::RegistrarMode::Secure)
+			{
+				size_t secured = 0;
+				for (const auto& d : handler->getAdoptedDevices())
+				{
+					if (d.state == RequestsHandler::DeviceState::Secured) ++secured;
+				}
+				if (secured == 0)
+				{
+					skipped.push_back("registrarMode=secure (no extensions are secured on "
+						"this device yet -- would lock out every phone; switch manually "
+						"once extensions are re-provisioned)");
+				}
+				else
+				{
+					handler->setRegistrarMode(parsedMode);
+					applied.push_back("registrarMode");
+				}
+			}
+			else
+			{
+				handler->setRegistrarMode(parsedMode);
+				applied.push_back("registrarMode");
+			}
+		}
+
+		// Telephony-config metadata (type/enabled only -- baseUrl/clientId/
+		// routeDn are gated, applied further below if a password was given).
+		// keepSecret=true always: the plaintext half never carries the
+		// secret, so this pass must never clear an existing one.
+		for (const auto& slot : pt->arrayOr("telephonyConfig"))
+		{
+			int idxI = slot.intOr("index", -1);
+			if (idxI < 0) continue;
+			size_t idx = static_cast<size_t>(idxI);
+			TelephonyApiConfig::SlotView existing = handler->getTelephonyConfigSlot(idx);
+			TelephonyApiConfig::Slot s;
+			s.type = existing.type;
+			s.enabled = slot.boolOr("enabled", existing.enabled);
+			s.baseUrl = existing.baseUrl;
+			s.clientId = existing.clientId;
+			s.routeDn = existing.routeDn;
+			handler->setTelephonyConfigSlot(idx, s, /*keepSecret=*/true);
+		}
+		applied.push_back("telephonyConfig (metadata)");
+	}
+	else
+	{
+		skipped.push_back("SIP engine not attached yet -- ring groups/forwards/dnd/pageZones/"
+			"dialPlan/didMappings/registrarMode/telephonyConfig not applied");
+	}
+
+	// WiFi SSID/mode + the AP-secure toggle: plaintext, always applied.
+	const std::string ssid = pt->stringOr("wifiSsid");
+	if (!ssid.empty())
+	{
+		// Found in review: the range check belongs BEFORE the narrowing cast.
+		// A raw value like 258 wraps to a perfectly in-range uint8_t (2) and
+		// would silently pass DeviceConfig::setWifiConfig()'s own `mode > 2`
+		// check despite being nonsense on the wire.
+		const int rawMode = pt->intOr("wifiMode", 0);
+		if (rawMode < 0 || rawMode > 2)
+		{
+			skipped.push_back("wifiSsid/wifiMode (mode out of range)");
+		}
+		else if (DeviceConfig::setWifiConfig(ssid, static_cast<uint8_t>(rawMode)))
+		{
+			applied.push_back("wifiSsid/wifiMode");
+		}
+		else
+		{
+			skipped.push_back("wifiSsid/wifiMode (invalid)");
+		}
+	}
+	DeviceConfig::setApSecure(pt->boolOr("apSecure", DeviceConfig::isApSecure()));
+	applied.push_back("apSecure");
+
+	// Password-gated fields, only once the block above actually decrypted.
+	if (haveSecrets)
+	{
+		DeviceConfig::setWifiPassword(secretsValue.stringOr("wifiPassword"));
+		applied.push_back("wifiPassword");
+
+		const std::string apPsk = secretsValue.stringOr("apPsk");
+		if (!apPsk.empty())
+		{
+			if (DeviceConfig::setApPsk(apPsk)) applied.push_back("apPsk");
+			else skipped.push_back("apPsk (invalid passphrase)");
+		}
+
+		if (handler)
+		{
+			for (const auto& slot : secretsValue.arrayOr("telephonyConfig"))
+			{
+				int idxI = slot.intOr("index", -1);
+				if (idxI < 0) continue;
+				size_t idx = static_cast<size_t>(idxI);
+				TelephonyApiConfig::SlotView existing = handler->getTelephonyConfigSlot(idx);
+				TelephonyApiConfig::Slot s;
+				s.type = existing.type;
+				s.enabled = existing.enabled;
+				s.baseUrl = slot.stringOr("baseUrl");
+				s.clientId = slot.stringOr("clientId");
+				s.routeDn = slot.stringOr("routeDn");
+				// keepSecret=true: the export never carries the actual secret
+				// (SlotView masks it -- see gap 2 in sendApiConfigExport's
+				// comment). An operator restoring a trunk config re-enters
+				// that one field once, same as fresh setup.
+				handler->setTelephonyConfigSlot(idx, s, /*keepSecret=*/true);
+			}
+			applied.push_back("telephonyConfig (baseUrl/clientId/routeDn)");
+		}
+	}
+	else if (secretsEncNode)
+	{
+		skipped.push_back(password.empty()
+			? "secretsEnc present but no password supplied"
+			: "secretsEnc present but not applied");
+	}
+
+	std::ostringstream json;
+	json << "{\"status\":\"ok\",\"applied\":[";
+	for (size_t i = 0; i < applied.size(); ++i)
+	{
+		if (i) json << ",";
+		json << "\"" << jsonEscape(applied[i]) << "\"";
+	}
+	json << "],\"skipped\":[";
+	for (size_t i = 0; i < skipped.size(); ++i)
+	{
+		if (i) json << ",";
+		json << "\"" << jsonEscape(skipped[i]) << "\"";
+	}
+	json << "]}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 
 bool HttpServer::streamBody(int sock, const char* prefix, size_t prefixLen,

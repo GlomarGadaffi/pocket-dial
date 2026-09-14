@@ -98,6 +98,48 @@ namespace DeviceConfig
 	bool setApPsk(const std::string& psk);
 
 	// ---------------------------------------------------------------------
+	// WiFi station config readback (issue #186)
+	// ---------------------------------------------------------------------
+	//
+	// sendApiWifiConnect()/sendApiWifiModeAp() (HttpServer.cpp) and the DTMF
+	// topology-switch code (DtmfFeatureCodes.cpp) write "wifi_ssid"/"wifi_pass"/
+	// "wifi_mode" directly to NVS namespace "storage" — the SAME namespace this
+	// file already owns for ap_secure/ap_psk — without going through any shared
+	// accessor. These getters/setters read/write those SAME keys so the config
+	// export/import feature can round-trip them, WITHOUT changing any existing
+	// writer's behavior (none of the getters below is ever cached: every ESP
+	// call opens NVS fresh, because ANY of those other writers can change the
+	// value between calls and a stale in-memory mirror would silently diverge
+	// from what a plain reboot actually applies).
+	//
+	// `mode`: 0 = captive-portal default, 1 = STATION, 2 = AP — matches the
+	// existing "wifi_mode" convention (see the cfgseed wire format above).
+
+	// The stored upstream SSID, or "" if never set. Plaintext — see #186.
+	std::string getWifiSsid();
+	// The stored operating mode (0/1/2 as above), or 0 if never set.
+	uint8_t getWifiMode();
+	// The stored upstream WiFi password, or "" if none. PASSWORD-GATED in the
+	// export feature — never included in a plaintext export.
+	std::string getWifiPassword();
+
+	// Writes ssid + mode ONLY (the plaintext-importable half). Does not touch
+	// the stored password and does NOT reboot — unlike sendApiWifiConnect(),
+	// which is a live user action that reasonably reboots immediately, an
+	// import may be restoring several fields in one request and a mid-import
+	// reboot would abandon the rest. The mode change (like ap-security's)
+	// takes effect at the next boot. Returns false if `ssid` is empty or
+	// longer than 32 octets (IEEE 802.11) or `mode` is not 0/1/2; on ESP, also
+	// false on an NVS write failure.
+	bool setWifiConfig(const std::string& ssid, uint8_t mode);
+
+	// Writes the upstream WiFi password alone (the password-gated half, applied
+	// only once an encrypted config-import block has been decrypted). An empty
+	// password is valid (an open upstream network). Returns false only on an
+	// ESP NVS write failure.
+	bool setWifiPassword(const std::string& password);
+
+	// ---------------------------------------------------------------------
 	// Flash-time configuration seed
 	// ---------------------------------------------------------------------
 

@@ -257,6 +257,11 @@ void SipMessage::addHeader(const std::string& name, const std::string& value)
 	insertHeaderLine(name + ": " + value);
 }
 
+void SipMessage::setHeaderOnce(const std::string& name, const std::string& value)
+{
+	setNamedHeader(name, {}, name + ": " + value);
+}
+
 void SipMessage::enforceG711()
 {
 	size_t mPos = _body.find("m=audio ");

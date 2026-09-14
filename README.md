@@ -94,12 +94,15 @@ Full instructions: **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** ·
 ### Call control
 Blind transfer (REFER — **see the caveat below**) · attended transfer (REFER with
 Replaces) · hold and resume
-· RFC 3311 UPDATE (answered; advertised on `OPTIONS` only) · RFC 4028 session
+· RFC 3311 UPDATE (answered, and advertised in `Allow` on the registrar's 200 OK
+and on the 2xx the board authors, so a conformant phone will actually send one)
+· RFC 4028 session
 timers (passive) · call park to orbits `700`–`709` · group pickup `*8` and
 directed pickup `**<ext>` · ring groups (ring-all or sequential hunt) · call
 forward on always / busy / no-answer · per-extension DND · paging zones
 `980`–`989` and `999` all-page · busy-lamp-field presence (`SUBSCRIBE`/`NOTIFY`,
-RFC 4235 dialog events) · DTMF star codes over SIP INFO.
+RFC 4235 dialog events) · DTMF star codes over SIP INFO, and over RFC 4733
+telephone-event on server-terminated legs.
 
 Three of those need an asterisk before you design around them:
 

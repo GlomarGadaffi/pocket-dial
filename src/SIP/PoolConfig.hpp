@@ -253,14 +253,116 @@
 #define POCKETDIAL_MAX_DID_MAPPINGS 8
 #endif
 
-// Maximum concurrent RFC 3261 §17 transaction records tracked for retransmit
-// timers.  Each InviteClient slot tracks one outgoing INVITE fork (Timer A/B):
-// retransmit interval doubles from T1 until a provisional stops it, or Timer B
-// (32 s) fires.  Sized to cover MAX_SESSIONS concurrent INVITE dialogs plus
-// headroom for forks to hunt-group members.  Pool exhaustion → message still
-// sent once (graceful degradation) — it never crashes or blocks.
+// Maximum concurrent RFC 3261 §17 CLIENT transaction records — requests this
+// PBX sent and will retransmit until they are answered.
+//
+// Each slot tracks either one outgoing INVITE fork (§17.1.1, Timer A/B) or one
+// outgoing non-INVITE request (§17.1.2, Timer E/F/K): BYE, CANCEL, NOTIFY,
+// REFER, INFO, MESSAGE, SUBSCRIBE, UPDATE. Sized to cover MAX_SESSIONS
+// concurrent INVITE dialogs, plus the worst-case BLF NOTIFY fan-out (one NOTIFY
+// per subscription when a watched extension changes state, all in flight at
+// once), plus headroom for hunt-group forks.
+//
+// The NOTIFY burst is what drove the +MAX_SUBSCRIPTIONS term: those slots are
+// each held for Timer K (T4 = 5 s) after the watcher's 200 OK, or Timer F (32 s)
+// if a watcher has gone away silently, so a single busy-lamp change can claim
+// MAX_SUBSCRIPTIONS slots at once. Without the term, a BLF burst would evict
+// INVITE retransmit coverage — the exact regression #148 was about.
+//
+// Pool exhaustion → message still sent once (graceful degradation), which is
+// precisely the pre-transaction-layer behaviour — it never crashes or blocks.
 #ifndef POCKETDIAL_MAX_TRANSACTIONS
-#define POCKETDIAL_MAX_TRANSACTIONS (POCKETDIAL_MAX_SESSIONS * 2 + 8)
+#define POCKETDIAL_MAX_TRANSACTIONS \
+	(POCKETDIAL_MAX_SESSIONS * 2 + POCKETDIAL_MAX_SUBSCRIPTIONS + 8)
+#endif
+
+// Maximum concurrent RFC 3261 §17 SERVER transaction records — responses this
+// PBX AUTHORED, kept so that a retransmitted request gets the same answer
+// instead of being re-processed, and (for INVITE) retransmitted until ACKed.
+//
+// Much smaller than the client pool, for two reasons. First, only responses the
+// PBX itself authors are tracked at all: an ordinary extension-to-extension call
+// has its 200 OK RELAYED from the callee phone, which owns that retransmission
+// under its own transaction layer, so those take no slot here. What is left is
+// the virtual extensions (777 echo, 888 conference, 555 anchor, park orbits, MoH
+// preview), the register beep, and the failure responses the engine mints itself
+// (403/404/486/488/503/603). Second, only the methods where re-processing a
+// duplicate actually does harm get a non-INVITE server transaction — BYE, CANCEL,
+// REFER and UPDATE — while REGISTER, OPTIONS, MESSAGE, INFO and SUBSCRIBE are
+// left to be re-processed as before, because they are idempotent enough that a
+// 32 s Timer J slot each would cost far more than it buys. (INFO is the close
+// call: a duplicated DTMF digit is a real bug, but at one slot per keypress for
+// 32 s it would dominate this pool on its own. Tracked separately.)
+//
+// Same graceful degradation: no free slot → the response is still sent once.
+#ifndef POCKETDIAL_MAX_SERVER_TRANSACTIONS
+#define POCKETDIAL_MAX_SERVER_TRANSACTIONS (POCKETDIAL_MAX_SESSIONS + 8)
+#endif
+
+// Depth of the RFC 4733 DTMF hand-off ring — key presses captured on an RTP
+// receive task and waiting to be acted on by the SIP thread.
+//
+// This is a THREAD BOUNDARY, not a work queue. A telephone-event packet is
+// decoded on the media task, but every consumer of a digit (the feature-code
+// table, the admin menu, the per-dialog accumulator) assumes the engine's big
+// _mutex is held and runs single-threaded on the SIP path. The ring is how a
+// press crosses from one to the other: the RTP task memcpy's a fixed record in
+// under its own small mutex and returns immediately, never touching _mutex and
+// never allocating, so a busy SIP pass can never introduce audio jitter.
+//
+// Sized for human dialling, not throughput. Digits arrive at a few per second
+// at most, and the ring is drained on every SIP packet AND every tick, so more
+// than a couple of slots are only ever needed if the SIP thread stalls. Sixteen
+// covers the longest feature code several times over. Overflow drops the oldest
+// press and counts it (see RequestsHandler::dtmfDigitsDropped) rather than
+// blocking the media task — a dropped digit costs one keypress, a blocked RTP
+// task costs the call's audio.
+#ifndef POCKETDIAL_DTMF_INBOX
+#define POCKETDIAL_DTMF_INBOX 16
+#endif
+
+// Bytes of each transaction record's retransmit buffer — the serialized message
+// held ready to put back on the wire.
+//
+// 1500 is the Ethernet MTU, which is the practical ceiling for a SIP/UDP
+// datagram this engine will emit without fragmenting. A message that does not
+// fit is stored truncated, flagged, and NEVER retransmitted (sending a truncated
+// SIP message is worse than sending nothing) — sweep() logs once when that
+// happens, so lost coverage is visible rather than silent.
+//
+// This is the dominant term in the layer's RAM cost:
+// (MAX_TRANSACTIONS + MAX_SERVER_TRANSACTIONS) × ~1.7 KB. On the default S3R8
+// profile that lands in PSRAM along with the rest of RequestsHandler. On a
+// no-PSRAM board (sdkconfig.defaults.esp32_constrained) it is internal RAM —
+// lower this, or the two pool counts above, for that tier. See docs/SCALING.md.
+#ifndef POCKETDIAL_TX_MSG_BYTES
+#define POCKETDIAL_TX_MSG_BYTES 1500
+#endif
+
+// Issue #163: minimum all-digit length an unprefixed AOR must reach before the
+// REGISTER identity guard (pbx::looksLikePstnAor(), PbxConfig.hpp) treats it as
+// "looks like a direct PSTN number" rather than an internal extension, and
+// refuses the REGISTER. This is a POLICY choice, not a protocol fact — unlike
+// the '+' case (unambiguous E.164, refused unconditionally regardless of this
+// knob), an unprefixed all-digit string is only ever a *guess* about intent.
+//
+// Every extension this codebase's own docs/tests actually use is 3-4 digits
+// (docs/API.md's "1001"/"1002"/"1003"/"610"/"620" examples, 700-709 park
+// orbits, 980-989 page zones) and PoolConfig's own
+// POCKETDIAL_MAX_DIAL_RULES comment above describes the whole dial space as
+// "three-digit LAN extensions". NANP draws its own line at 7 (a bare local
+// number, no area code) and 10 (area code included); a true international
+// E.164 number runs 8-15 digits but arrives with a leading '+' and is already
+// caught unconditionally, so this knob only ever has to catch a NANP-shaped
+// number someone dialed in without the '+'. 7 gives every real extension in
+// this deployment a clean 3-4 digit margin while still catching the shortest
+// PSTN-shaped string that could plausibly show up unprefixed.
+//
+// Raise this if a deployment's numbering plan legitimately needs 5-6 digit
+// internal extensions; only lower it with a numbering plan that guarantees no
+// collision with a shorter PSTN-shaped number.
+#ifndef POCKETDIAL_MIN_PSTN_AOR_DIGITS
+#define POCKETDIAL_MIN_PSTN_AOR_DIGITS 7
 #endif
 
 #endif

@@ -143,6 +143,32 @@ public:
 	// so it is exact the instant a leg joins or leaves.
 	int getConferenceLegs();
 
+	// Live RFC 3261 §17 transaction counts. Exposed for host tests, which need to
+	// assert the TRACKING DECISION rather than wait for a timer: tick() throttles
+	// itself to 1 Hz, so a test that drives it in a loop cannot observe a 500 ms
+	// Timer A at all and would pass whether or not the decision was right. Reading
+	// the count instead tests the thing under test directly.
+	size_t getClientTransactionCount();
+	size_t getServerTransactionCount();
+
+	// ── RFC 4733 DTMF hand-off (Issue #199 item 3) ──────────────────────────────
+	//
+	// Called from an RTP RECEIVE TASK, not the SIP thread. This is the only
+	// public entry point on this class that does NOT expect _mutex to be held —
+	// and must never take it. An RTP task blocked behind a SIP pass is audio
+	// jitter on a live call, so the press is copied into a small fixed ring under
+	// its own mutex and the media task returns immediately.
+	//
+	// The press is stamped with its arrival time here, at capture, because the
+	// SIP thread may not drain for up to a tick and the inter-digit timeout has
+	// to be measured against the key press rather than against the drain.
+	void queueDtmfDigit(std::string_view callId, char digit);
+
+	// Key presses discarded because the ring was full — i.e. the SIP thread fell
+	// far enough behind that a digit was lost. Should sit at zero; a non-zero
+	// value is a real "the user pressed a key and nothing happened" bug report.
+	uint64_t dtmfDigitsDropped() const;
+
 	// Call Detail Records (CDR): a thread-safe snapshot of the recent-call ring,
 	// newest first. Copied out under _snapshotMutex like the client/session views.
 	std::vector<CallDetailRecord> getCallDetailRecords();
@@ -345,6 +371,14 @@ public:
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		return _cdr.snapshot();
+	}
+	// Test-only: live DTMF accumulators, so a teardown path can be checked for
+	// actually routing through endCall() (which forgets the dialog's digits)
+	// rather than only erasing the session (issue #228).
+	size_t dtmfAccumulatorCountForTest()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		return _dtmf.accumulatorCount();
 	}
 
 	// Test-only: the anchor MediaBridge currently bridging this Call-ID, or nullptr
@@ -1108,6 +1142,55 @@ private:
 	// #70 ordering note on the definition. Caller holds _mutex.
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> drainOutbox();
 
+	// The inbound message currently being handled, or nullptr outside a handle()
+	// pass (tick() drains with this unset). Used by drainOutbox() for exactly one
+	// question: is an outbound entry the very object we just received?
+	//
+	// Several relay paths forward a message by pushing the SAME shared_ptr rather
+	// than a clone — onReinvite's hold/resume relay (RequestsHandler.cpp:6787),
+	// onUpdate's SDP relay (:6876), and the provisional relays that endHandle()
+	// `data` straight through. Those are pure pass-through: the PBX is not the
+	// sender, it is the wire. The originating phone owns retransmitting its own
+	// re-INVITE under its own transaction (same branch, RFC 3261 §17.1.1), and it
+	// keeps doing so until the far end's answer comes back through here — so a
+	// PBX-side timer on top would put a second copy of the same branch on the
+	// wire for every loss. That is the same double-send the authored-vs-relayed
+	// rule prevents on the response side, and pointer identity is the exact test
+	// for it: a message the PBX built is never the object it received.
+	//
+	// Raw pointer, not a shared_ptr: it is only ever compared, never dereferenced,
+	// and the shared_ptr in `request` outlives the whole pass.
+	const SipMessage* _passThroughMsg = nullptr;
+
+	// ── RFC 4733 DTMF hand-off ring ─────────────────────────────────────────────
+	// Producer: any RTP receive task (one per conference leg / anchor bridge).
+	// Consumer: the SIP thread, via drainDtmfInbox() from handle() and tick().
+	//
+	// Guarded by its OWN mutex, deliberately NOT _mutex. This is the one place the
+	// codebase's "everything under the big lock" convention is wrong: the producer
+	// is a real-time media task, and making it wait on the engine lock would turn
+	// every slow SIP pass into an audio glitch. The ring holds plain bytes — no
+	// shared_ptr, no std::string, nothing that allocates or needs the engine's
+	// object pools — so the critical section is a memcpy and the producer never
+	// blocks for longer than another producer's memcpy.
+	struct DtmfPress
+	{
+		char     callId[128]{};   // dialog the press belongs to
+		char     digit = 0;
+		uint8_t  source = 0;      // DtmfFeatureCodes::DigitSource
+		uint32_t arrivedTick = 0; // DtmfFeatureCodes::nowTickMs() at capture
+	};
+	std::array<DtmfPress, POCKETDIAL_DTMF_INBOX> _dtmfInbox{};
+	size_t                _dtmfInboxCount = 0;
+	mutable std::mutex    _dtmfInboxMutex;
+	std::atomic<uint64_t> _dtmfDropped{0};
+
+	// Move everything the media tasks captured into the feature-code machine.
+	// Caller holds _mutex; this takes _dtmfInboxMutex briefly to lift the batch
+	// out, then releases it before dispatching, so a producer is never blocked
+	// for the length of a feature-code action.
+	void drainDtmfInbox();
+
 	std::string _serverIp;
 	std::string _localIp;   // resolved once at construction; avoids getPrimaryLocalIP() under _mutex
 	int         _serverPort;
@@ -1115,6 +1198,11 @@ private:
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	// Requests answered from a §17.2 server transaction's stored response rather
+	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
+	// count is the packet-loss signal this layer exists to absorb, so it is worth
+	// having on the dashboard next to packetsDropped rather than only in the log.
+	std::atomic<uint64_t> _packetsAbsorbed{0};
 
 	struct RegistrarSnapshot
 	{
