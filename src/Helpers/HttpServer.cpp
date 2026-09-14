@@ -314,8 +314,16 @@ void HttpServer::handleClient(int clientSock)
 			// Cheap method+path probe on the request line only.
 			const std::string reqLine = raw.substr(0, reqLineEnd);
 			if (reqLine.compare(0, 5, "POST ") == 0 &&
-			    reqLine.find(" /api/ota/upload ") != std::string::npos)
+			    (reqLine.find(" /api/ota/upload ") != std::string::npos ||
+			     reqLine.find(" /api/moh/upload ") != std::string::npos))
 			{
+				// The music-on-hold clip takes the SAME streaming treatment, for the
+				// same reason: it is ~800 KB of audio and must not flow through the
+				// 16 KB-capped buffered path below. Without this route there is no
+				// way to get a clip onto the card at all short of physically pulling
+				// it, because the firmware has no other filesystem writer.
+				const bool isMoh =
+					reqLine.find(" /api/moh/upload ") != std::string::npos;
 				// Parse just the header block (parseRequest tolerates a truncated
 				// body) to get method/path/origin/host/cookie for the auth gate.
 				HttpRequest otaReq = parseRequest(raw.substr(0, hdrEnd + 4));
@@ -349,11 +357,18 @@ void HttpServer::handleClient(int clientSock)
 				if (otaLen == 0)
 				{
 					sendResponse(clientSock, 411, "Length Required", "application/json",
-					             "{\"error\":\"OTA upload requires a non-zero Content-Length\"}");
+					             isMoh ? "{\"error\":\"clip upload requires a non-zero Content-Length\"}"
+					                   : "{\"error\":\"OTA upload requires a non-zero Content-Length\"}");
 					closeSocket(clientSock);
 					return;
 				}
 
+				if (isMoh)
+				{
+					handleMohUpload(clientSock, raw, hdrEnd + 4, otaLen);
+					closeSocket(clientSock);
+					return;
+				}
 				handleOtaUpload(clientSock, raw, hdrEnd + 4, otaLen);
 				closeSocket(clientSock);
 				return;
@@ -2786,6 +2801,103 @@ bool HttpServer::streamBody(int sock, const char* prefix, size_t prefixLen,
 		consumed += static_cast<size_t>(n);
 	}
 	return consumed == contentLength;
+}
+
+void HttpServer::handleMohUpload(int sock, const std::string& alreadyRead,
+                                 size_t bodyStart, size_t contentLength)
+{
+	const char*  prefix    = (bodyStart <= alreadyRead.size())
+	                             ? alreadyRead.data() + bodyStart : nullptr;
+	const size_t prefixLen = (bodyStart <= alreadyRead.size())
+	                             ? alreadyRead.size() - bodyStart : 0;
+
+	// Bound the upload. The clip is read into PSRAM in full, so an unbounded one
+	// would exhaust the heap and take the SIP engine down with it. 8 MB is ~17
+	// minutes of mu-law, far past any sane hold loop, and still leaves PSRAM for
+	// the anchor task stacks.
+	static constexpr size_t kMaxClipBytes = 8u * 1024u * 1024u;
+	if (contentLength > kMaxClipBytes)
+	{
+		streamBody(sock, prefix, prefixLen, contentLength,
+		           [](const uint8_t*, size_t) { return true; });
+		sendResponse(sock, 413, "Payload Too Large", "application/json",
+		             "{\"error\":\"clip exceeds 8 MB\"}");
+		return;
+	}
+
+#if defined(PD_ETH_HAS_SD)
+	// Write to a TEMPORARY name and rename on success. A half-written moh.wav
+	// would fail HoldMusic's format check on the next boot and silently drop every
+	// parked caller back to silence; worse, a truncated-but-valid-looking file
+	// would loop a fragment. The rename is the commit point.
+	const char* kTmp   = "/sdcard/moh.part";
+	const char* kFinal = "/sdcard/moh.wav";
+
+	std::FILE* f = std::fopen(kTmp, "wb");
+	if (f == nullptr)
+	{
+		streamBody(sock, prefix, prefixLen, contentLength,
+		           [](const uint8_t*, size_t) { return true; });
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"error\":\"cannot open /sdcard for writing — card mounted?\"}");
+		return;
+	}
+
+	bool writeOk = streamBody(sock, prefix, prefixLen, contentLength,
+		[f](const uint8_t* p, size_t n) {
+			return std::fwrite(p, 1, n, f) == n;
+		});
+
+	std::fclose(f);
+
+	if (!writeOk)
+	{
+		std::remove(kTmp);
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"incomplete upload or SD write failed\"}");
+		return;
+	}
+
+	std::remove(kFinal);            // rename() will not overwrite on FatFs
+	if (std::rename(kTmp, kFinal) != 0)
+	{
+		std::remove(kTmp);
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"error\":\"could not commit clip to /sdcard/moh.wav\"}");
+		return;
+	}
+
+	// Load it now so the operator finds out immediately whether the file is
+	// actually 8 kHz mono mu-law, rather than discovering silence the next time
+	// somebody parks a call. A rejected clip leaves the previous one playing.
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 200, "OK", "application/json",
+		             "{\"status\":\"ok\",\"message\":\"clip stored; will load on next boot\"}");
+		return;
+	}
+	if (!handler->startHoldMusic(kFinal))
+	{
+		sendResponse(sock, 422, "Unprocessable Entity", "application/json",
+		             "{\"error\":\"stored, but not 8 kHz mono mu-law WAV — "
+		             "convert with: ffmpeg -i in.mp3 -ar 8000 -ac 1 -acodec pcm_mulaw moh.wav\"}");
+		return;
+	}
+
+	std::ostringstream ok;
+	ok << "{\"status\":\"ok\",\"seconds\":" << handler->holdMusicSeconds()
+	   << ",\"bytes\":" << contentLength << "}";
+	sendResponse(sock, 200, "OK", "application/json", ok.str());
+#else
+	// No card on this build. Drain the body so the client's send completes and it
+	// gets a clean answer rather than a reset mid-upload.
+	streamBody(sock, prefix, prefixLen, contentLength,
+	           [](const uint8_t*, size_t) { return true; });
+	sendResponse(sock, 501, "Not Implemented", "application/json",
+	             "{\"error\":\"no SD card on this build — music on hold needs the "
+	             "eth/elite board\"}");
+#endif
 }
 
 void HttpServer::handleOtaUpload(int sock, const std::string& alreadyRead,

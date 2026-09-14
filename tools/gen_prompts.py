@@ -5,7 +5,7 @@ Usage:
   python tools/gen_prompts.py --key-file PATH [--voice VOICE_ID] [--out DIR] [--only NAME ...]
 
 Writes <out>/<name>.ulaw (raw u-law, 8 kHz mono, what the board plays) and
-<out>/<name>.wav (same bytes wrapped as WAV format 7, for listening on a PC),
+<out>/<name>.wav (decoded to 16-bit PCM, for listening on a PC),
 plus <out>/manifest.json. Existing files are skipped unless --force.
 The API key is read from the key file line that starts with "elevenlabs".
 """
@@ -83,9 +83,16 @@ PROMPTS = {
     "vm_no_messages": "You have no new messages.",
     "vm_controls": "Press 1 to replay, 7 to delete, or 9 to save.",
     # 9. fragments
-    "n_0": "zero.", "n_1": "one.", "n_2": "two.", "n_3": "three.", "n_4": "four.",
-    "n_5": "five.", "n_6": "six.", "n_7": "seven.", "n_8": "eight.", "n_9": "nine.",
-    "n_oh": "oh.",
+    # digits without punctuation so they read flat mid-sentence when concatenated
+    "n_0": "zero", "n_1": "one", "n_2": "two", "n_3": "three", "n_4": "four",
+    "n_5": "five", "n_6": "six", "n_7": "seven", "n_8": "eight", "n_9": "nine",
+    "n_oh": "oh",
+    # counting words for natural numbers (voicemail counts etc)
+    "n_10": "ten", "n_11": "eleven", "n_12": "twelve", "n_13": "thirteen", "n_14": "fourteen",
+    "n_15": "fifteen", "n_16": "sixteen", "n_17": "seventeen", "n_18": "eighteen", "n_19": "nineteen",
+    "n_20": "twenty", "n_30": "thirty", "n_40": "forty", "n_50": "fifty",
+    "n_60": "sixty", "n_70": "seventy", "n_80": "eighty", "n_90": "ninety",
+    "n_hundred": "hundred", "n_thousand": "thousand", "w_and": "and",
     "w_star": "star.", "w_pound": "pound.", "w_extension": "extension",
     "w_orbit": "orbit", "w_zone": "zone", "w_conference_room": "conference room",
     "w_missed_call": "missed call.", "w_missed_calls": "missed calls.",
@@ -130,12 +137,26 @@ def trim(data, thresh=8, keep=800):
     return data[max(0, s - keep):min(n, e + keep)]
 
 
+def ulaw_to_pcm16(ulaw):
+    out = bytearray()
+    for b in ulaw:
+        b = ~b & 0xFF
+        sign, exp, mant = b & 0x80, (b >> 4) & 7, b & 0x0F
+        v = ((mant << 3) + 0x84) << exp
+        v -= 0x84
+        v = -v if sign else v
+        out += struct.pack("<h", max(-32768, min(32767, v)))
+    return bytes(out)
+
+
 def write_wav(path, ulaw):
+    """Standard 16-bit PCM WAV at 8 kHz for listening on a PC. Windows players
+    truncate WAV format 7 (u-law) files, so the u-law bytes are decoded first."""
+    pcm = ulaw_to_pcm16(ulaw)
     with open(path, "wb") as f:
-        f.write(b"RIFF" + struct.pack("<I", 50 + len(ulaw)) + b"WAVE")
-        f.write(b"fmt " + struct.pack("<IHHIIHHH", 18, 7, 1, 8000, 8000, 1, 8, 0))
-        f.write(b"fact" + struct.pack("<II", 4, len(ulaw)))
-        f.write(b"data" + struct.pack("<I", len(ulaw)) + ulaw)
+        f.write(b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVE")
+        f.write(b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, 8000, 16000, 2, 16))
+        f.write(b"data" + struct.pack("<I", len(pcm)) + pcm)
 
 
 def main():

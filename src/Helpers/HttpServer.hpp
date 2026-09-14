@@ -191,6 +191,15 @@ private:
 	void sendApiAdminLogin(int sock, const HttpRequest& req);
 	void sendApiAdminLogout(int sock, const HttpRequest& req);
 
+	// Streams an uploaded music-on-hold clip to /sdcard/moh.wav and reloads it.
+	// Takes the same streaming treatment as the OTA image and for the same reason:
+	// ~800 KB of audio must not go through the 16 KB buffered path. Writes to a
+	// temporary name and renames on success, so a failed upload cannot leave a
+	// half-written file that looks valid enough to loop a fragment. Replies 501 on
+	// a build with no card. Admin + CSRF gated at the dispatch site.
+	void handleMohUpload(int sock, const std::string& alreadyRead,
+	                     size_t bodyStart, size_t contentLength);
+
 	// --- OTA firmware-update endpoints (see OtaUpdater.hpp + docs/OTA.md) ---
 	// Streams the request body straight into the inactive OTA slot. This MUST
 	// bypass the 16 KB buffered path in handleClient(); see handleOtaUpload().
