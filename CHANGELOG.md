@@ -1,5 +1,121 @@
 # Changelog
 
+## v1.5.0-beta.2 — 2026-09-14
+
+Still a beta. Twelve pull requests landed in one evening on top of beta.1, every
+one of them proved on the host suite (585 → 799 test cases by static count) and
+**none of them on the bench board**. Two flip behaviour a phone can see, three
+close reliability holes that were live on `main`, one changes what `/api/kill`
+actually does, and one adds outbound email. Read the "not bench-tested" note at the end before
+putting this on a board that carries real calls.
+
+---
+
+### SIP — retransmission for everything the PBX sends itself (#226)
+
+`TransactionLayer` covered only the INVITE *client* transaction. Every
+PBX-originated `BYE`, `CANCEL`, `NOTIFY` and REFER-`NOTIFY` went out exactly
+once; one lost datagram left a handset stuck in a dead call. The three missing
+RFC 3261 §17 transaction types are in (non-INVITE client with timers E/F/K,
+INVITE server with G/H/I and 2xx-until-ACK, non-INVITE server with J), and a
+relayed 200 OK is deliberately *not* tracked — the callee phone is already
+retransmitting it.
+
+Capability headers (`Allow` / `Supported` / `Accept` / `Allow-Events`) now go on
+the registrar's 200 OK and on every 2xx the PBX authors as a UAS, not only on
+the reply to OPTIONS. A conformant phone reads `Allow: UPDATE` off the dialog it
+is in, which is what gated UPDATE and Replaces on a real handset (#199).
+`Supported: timer` stays **unadvertised** — the Min-SE / 422 half of RFC 4028 is
+still missing; #198 has the exact list.
+
+### DTMF over RTP works on a stock phone (#233)
+
+The RFC 4733 parser existed with eighteen tests behind it and was wired to
+nothing. Telephone-event packets now reach the feature-code collector, so
+`*69`, `*72` and the rest work from a phone that sends DTMF in-band-RTP rather
+than as SIP INFO.
+
+### `/api/kill` actually ends the call (#231, closes #228)
+
+`forceDisconnect()` erased the session server-side and told neither phone; the
+far end kept a dead call up until it hung up into a 481. It also released the
+registration *before* comparing the extension against the session legs, so in
+practice it had never removed a session at all. It now sends one BYE per handset
+leg on the correct dialog tags, through the async outbox because it runs on the
+HTTP task, then routes through `endCall()` so the CDR, DTMF state and
+transaction slots are cleaned up too. Echo / conference legs still get no BYE to
+the killed handset (#232).
+
+### REGISTER as `911`, `777`, `+1555…` is refused (#220, closes #163)
+
+Nothing stopped a phone from registering as a reserved virtual extension, the
+E911 test numbers, or an E.164-shaped identity and silently receiving the calls
+meant for them. All three shapes now get a 403 in every registrar mode.
+
+### Task Watchdog on the SIP task, heap/stack on `/api/status` (#225, part of #185)
+
+`sip_server_task` is subscribed to the IDF Task Watchdog with
+`CONFIG_ESP_TASK_WDT_PANIC=y`, so a stalled `tick()` produces a logged reset
+instead of a silently wedged board, and the reset reason is logged at boot.
+**Consequence for everything else:** any monitored loop that fails to yield for
+five seconds is now a reboot, not a warning. The other RTP/UDP tasks are not yet
+subscribed (#235).
+
+### Config export/import and an owner/sysop split (#227, closes #173, #186)
+
+Full config backup and restore over the admin API. Plaintext export is
+sysop-level; Wi-Fi, SoftAP and trunk secrets travel only in a password-sealed
+`secretsEnc` block (PBKDF2-HMAC-SHA256, 200 000 iterations, AES-256-GCM). The
+admin login gains a second, lower role. Review fix before merge: the PBKDF2
+loop now precomputes its HMAC pad states and yields to the idle task every
+1 024 iterations — as first written it would have tripped the new watchdog on
+every export. Per-extension digest secrets are in the sysop-level plaintext
+export, which is #186's spec but sits oddly against #173's "secrets are
+owner-only"; flagged, not changed.
+
+### Multi-vendor provisioning renderers (#224, refs #177)
+
+Grandstream, Polycom and Cisco SPA config renderers with User-Agent detection
+and a Yealink fallback, host-tested against fixtures. **Not reachable from a
+phone yet**: the HTTP route captures no User-Agent and accepts only the Yealink
+filename shape (#234). A Grandstream P34/P36 swap that would have provisioned
+the extension as the password was caught in review.
+
+### Outbound email, phase 1 (#230)
+
+A generic SMTP client with two auth paths: Gmail App Password (AUTH PLAIN over
+implicit TLS) and Google Workspace domain-wide delegation (AUTH XOAUTH2 with an
+on-device RS256 JWT). The protocol state machine is pure and host-tested; the
+transport uses `esp_tls` with the IDF certificate bundle by default and a
+bounded single-worker send queue so a send never blocks a SIP thread. Nothing
+in the PBX sends mail yet — this is the client, not the notifications.
+
+### SD-card CDR archive (#223, Stage 1 of #194)
+
+Append-only `/sdcard/cdr/YYYY-MM-DD.csv`, additive to the 32-slot NVS ring the
+dashboard reads. Writes are queued off the SIP thread.
+
+### Housekeeping
+
+- Every HTTP test file owns a disjoint port block; two agents lost time to
+  cross-file port collisions before this (#217, closes #213).
+- SoftAP scale-out decision recorded, last RFC-199 doc correction (#219,
+  closes #176).
+- A #226 test registered extension `440`, which #220 now refuses; renumbered
+  after both landed. Two CI-only breakages from the same evening — a
+  format-truncation error in the SD CDR archive's wipe path and four
+  uninitialised members cppcheck rejected — fixed on main before this tag.
+
+---
+
+### Not bench-tested
+
+Everything above ran the host suite under WSL. Nothing in this beta has been
+flashed to the bench board or exercised against a real handset. Items with a
+hardware-only failure mode — the watchdog panic threshold, PBKDF2 wall-clock on
+the S3, the SD CDR writer, every provisioning renderer — are unverified on
+device. beta.1's changelog was written from the bench; this one is not.
+
 ## v1.5.0-beta.1 — 2026-09-14
 
 A beta, deliberately. Nine changes landed in one session, two of them fix defects
