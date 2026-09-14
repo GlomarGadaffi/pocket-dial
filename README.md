@@ -291,7 +291,10 @@ than failing unpredictably.
 | Office | 32 | 8 | 4 | ESP32-S3, 16 MB flash — the default |
 | Rack | 128+ | 32+ | 8 | Desktop build |
 
-Details and the reasoning behind the numbers: [docs/SCALING.md](docs/SCALING.md).
+Details and the reasoning behind the numbers: [docs/SCALING.md](docs/SCALING.md). Need more
+Wi-Fi phones than one SoftAP's ~10–16-station ceiling holds? See
+[docs/SOFTAP_SCALE.md](docs/SOFTAP_SCALE.md) for the deployment options and why mesh isn't
+one of them yet.
 
 ---
 
@@ -304,6 +307,8 @@ Details and the reasoning behind the numbers: [docs/SCALING.md](docs/SCALING.md)
 - **[RTP.md](docs/RTP.md)** — the media bridge, G.711 codecs, and what the board
   does and doesn't carry
 - **[SCALING.md](docs/SCALING.md)** — where the ceilings are and why
+- **[SOFTAP_SCALE.md](docs/SOFTAP_SCALE.md)** — scaling a Wi-Fi deployment past one
+  SoftAP's station cap: the mesh-vs-wired-backbone decision
 - **[THREAT_MODEL.md](docs/THREAT_MODEL.md)** — STRIDE analysis and the residual risks
 - **[API.md](docs/API.md)** — every HTTP endpoint
 - **[CONTRIBUTING.md](docs/CONTRIBUTING.md)** — build, test and PR workflow
