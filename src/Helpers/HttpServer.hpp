@@ -88,6 +88,9 @@ private:
 	// `needCsrf` should be true for every mutating request and false for reads;
 	// the token is only checked when a session actually exists to bind it to.
 	bool requireAdmin(int sock, const HttpRequest& req, bool needCsrf);
+	// Answers "is this caller logged in?" WITHOUT answering the request, for
+	// endpoints that serve everyone but disclose more to a session (#207).
+	bool hasValidAdminSession(const HttpRequest& req) const;
 
 	// Same-origin check only, for the pre-session endpoints (login, logout).
 	// Same contract: on false the response has already been written.
@@ -108,7 +111,10 @@ private:
 	void sendRedirect(int sock, const std::string& location);
 	// Takes the request so the rendered page can carry this session's CSRF token.
 	void sendHtml(int sock, const HttpRequest& req);
-	void sendApiStatus(int sock);
+	// `authenticated` controls DISCLOSURE, not access: the endpoint always answers
+	// (the dashboard needs it to render the login form) but withholds the
+	// extension roster from an unauthenticated caller (#207).
+	void sendApiStatus(int sock, bool authenticated);
 	// Issue #184: GET /metrics — Prometheus text-exposition format over the same
 	// thread-safe getters /api/status already reads. Intentionally ungated (the
 	// full reasoning, including why a gated scrape endpoint would be a dead one,

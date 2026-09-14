@@ -470,7 +470,22 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "GET" && req.path == "/api/status")
 	{
-		sendApiStatus(clientSock);
+		// Issue #207: stays reachable unauthenticated -- E-2's justification is real,
+		// the dashboard genuinely needs this to render before login -- but the
+		// EXTENSION ROSTER is withheld from an unauthenticated caller.
+		//
+		// E-2 justifies this endpoint by what the login form needs. What it returned
+		// included every registered extension number with its handset's IP and port,
+		// which is not that: it is a target list for the SIP INFO spoofing described
+		// in E-4 of the same document, which notes there is no source-IP check on the
+		// DTMF admin parser and that a From header is free text. E-4's mitigation is
+		// "set a long PIN"; this endpoint was handing over the admin extension number
+		// to put in that From, for free.
+		//
+		// requireAdmin's third argument is the CSRF requirement, and passing false
+		// here would reject an unauthenticated caller outright -- so ask without
+		// enforcing, and let sendApiStatus decide what to include.
+		sendApiStatus(clientSock, hasValidAdminSession(req));
 	}
 	else if (req.method == "GET" && req.path == "/metrics")
 	{
@@ -490,25 +505,45 @@ void HttpServer::handleClient(int clientSock)
 	{
 		// Music-on-hold status. Gated: it reveals what is configured, and the
 		// dashboard already holds a session by the time it renders this panel.
-		if (!requireAdmin(clientSock, req, false)) return;
-		sendApiMohStatus(clientSock);
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiMohStatus(clientSock);
+		}
 	}
 	else if (req.method == "POST" && req.path == "/api/moh/preview")
 	{
 		// Ring an extension and play the clip to it. Mutating (it originates a
 		// call), so CSRF is required like every other POST.
-		if (!requireAdmin(clientSock, req, true)) return;
-		sendApiMohPreview(clientSock, req.body);
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiMohPreview(clientSock, req.body);
+		}
 	}
 	else if (req.method == "POST" && req.path == "/api/moh/preview/stop")
 	{
-		if (!requireAdmin(clientSock, req, true)) return;
-		sendApiMohPreviewStop(clientSock);
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiMohPreviewStop(clientSock);
+		}
 	}
 	else if (req.method == "GET" && req.path == "/api/cdr")
 	{
-		// Read-only Call Detail Records — ungated like /api/status.
-		sendApiCdr(clientSock);
+		// Issue #207: gated, same as /api/pcap and /api/trace.
+		//
+		// This was ungated by analogy -- "read-only, like /api/status" -- and the
+		// analogy does not hold. THREAT_MODEL.md section 4 E-2 enumerates the reads
+		// that are intentionally unauthenticated and gives the reason: the dashboard
+		// needs them to render the LOGIN FORM. A login form does not need call
+		// history. /api/cdr appears in neither E-2's ungated list nor its list of
+		// sensitive gated reads; it was never assessed at all.
+		//
+		// Call metadata -- who called whom, when, for how long -- is close to the
+		// most sensitive thing a PBX holds. Verified on the bench that any host on
+		// the LAN could read the full ring with no credentials.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiCdr(clientSock);
+		}
 	}
 	else if (req.method == "GET" && req.path == "/api/pcap")
 	{
@@ -960,7 +995,7 @@ static std::string jsonEscape(const std::string& s)
 	return out;
 }
 
-void HttpServer::sendApiStatus(int sock)
+void HttpServer::sendApiStatus(int sock, bool authenticated)
 {
 	uint64_t uptimeMs = currentTimeMs() - _startTime;
 	uint64_t uptimeSec = uptimeMs / 1000;
@@ -1015,14 +1050,27 @@ void HttpServer::sendApiStatus(int sock)
 #endif
 
 	// Clients array
+	// #207: the roster is withheld from an unauthenticated caller. The counts
+	// below stay visible -- "4 phones registered" is operational status, and the
+	// dashboard shows it before login -- but WHICH extensions, at WHICH
+	// addresses, is a target list and requires a session.
 	json << "\"clients\":[";
-	for (size_t i = 0; i < clients.size(); i++)
+	if (authenticated)
 	{
-		if (i > 0) json << ",";
-		json << "{\"number\":\"" << jsonEscape(clients[i].first)
-		     << "\",\"address\":\"" << jsonEscape(clients[i].second) << "\"}";
+		for (size_t i = 0; i < clients.size(); i++)
+		{
+			if (i > 0) json << ",";
+			json << "{\"number\":\"" << jsonEscape(clients[i].first)
+			     << "\",\"address\":\"" << jsonEscape(clients[i].second) << "\"}";
+		}
 	}
 	json << "],";
+	// The COUNT is not withheld -- "4 phones registered" is operational status the
+	// dashboard shows before login, and it discloses no identity. Emitted
+	// unconditionally so an unauthenticated client can tell "nobody is registered"
+	// from "you are not allowed to see who is", which an empty array alone cannot.
+	json << "\"clientCount\":" << clients.size() << ",";
+	json << "\"rosterVisible\":" << (authenticated ? "true" : "false") << ",";
 
 	// Sessions array
 	json << "\"sessions\":[";
@@ -2074,6 +2122,22 @@ bool HttpServer::requireSameOrigin(int sock, const HttpRequest& req)
 		return false;
 	}
 	return true;
+}
+
+// Does this request carry a valid admin session? Issue #207.
+//
+// Deliberately NOT a refactor of requireAdmin's step 2: this answers a question
+// without answering the REQUEST. requireAdmin's whole contract is that it writes
+// a 401/403 and returns false, which is exactly wrong for an endpoint that must
+// still serve an unauthenticated caller and merely wants to know how much to
+// include. Reusing it here would turn /api/status into a gated endpoint and break
+// the login form it exists to render.
+//
+// No same-origin check and no CSRF: this gates only what is DISCLOSED on a read,
+// and both of those controls are about who can cause an ACTION.
+bool HttpServer::hasValidAdminSession(const HttpRequest& req) const
+{
+	return AdminAuth::validateSession(sessionToken(req));
 }
 
 bool HttpServer::requireAdmin(int sock, const HttpRequest& req, bool needCsrf)

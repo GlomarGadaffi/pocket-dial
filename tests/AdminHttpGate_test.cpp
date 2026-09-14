@@ -773,3 +773,100 @@ TEST(Registrar, MutatingEndpointsRequireTheCsrfToken)
 
 	AdminAuth::clearCredential();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #207 — two read endpoints disclosed more than the threat model
+// sanctioned. Both were found on the WIRE, not by reading the code: the code
+// comments read as authoritative and only the live board disagreed.
+//
+//   /api/cdr     200  [{"caller":"1098","callee":"1099","startMs":78930,...
+//   /api/status  200  ..."clients":[{"number":"1001","address":"192.168.12.181:5060"}]
+//
+// with no credentials, from any host on the LAN.
+//
+// THREAT_MODEL.md section 4 E-2 ENUMERATES the intentionally-unauthenticated
+// reads — /api/status, /api/wifi/scan, /api/admin/status — and gives the reason:
+// the dashboard needs them to render the LOGIN FORM. /api/cdr is in neither that
+// list nor E-2's list of sensitive gated reads. It was ungated by analogy
+// ("read-only, like /api/status"), and the analogy does not hold: a login form
+// does not need call history.
+//
+// /api/status stays reachable, because E-2's justification is real. What it must
+// not hand over is the extension roster — not what a login form needs, and a
+// target list for the SIP INFO spoofing in E-4 of the same document, which notes
+// there is no source-IP check on the DTMF admin parser and that From is free
+// text.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(CdrDisclosure, CallHistoryNeedsASessionAndTheRosterIsWithheldWithoutOne)
+{
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18097, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	// ── Unauthenticated ──────────────────────────────────────────────────────
+	const std::string cdrOut = httpGetRaw(18097, "/api/cdr");
+	EXPECT_EQ(statusOf(cdrOut), 401)
+		<< "unauthenticated /api/cdr must not return call history:\n" << cdrOut;
+
+	// Still answers — the login form depends on it, and turning this into a 401
+	// would be the opposite regression.
+	const std::string statusOut = httpGetRaw(18097, "/api/status");
+	ASSERT_EQ(statusOf(statusOut), 200)
+		<< "/api/status must stay reachable for the login form:\n" << statusOut;
+	const std::string body = bodyOf(statusOut);
+
+	EXPECT_NE(body.find("\"clients\":[]"), std::string::npos)
+		<< "roster must be withheld without a session:\n" << body;
+	EXPECT_NE(body.find("\"rosterVisible\":false"), std::string::npos)
+		<< "must distinguish 'withheld' from 'nobody registered':\n" << body;
+	// The COUNT stays — operational status, no identity in it.
+	EXPECT_NE(body.find("\"clientCount\":"), std::string::npos) << body;
+
+	// ── Authenticated ────────────────────────────────────────────────────────
+	// set-credential first: requireAdmin refuses every gated action until the
+	// default is replaced, so a 403 setup_required would otherwise be mistaken
+	// for the gate under test.
+	const std::string loginResp = httpPostRaw(18097, "/api/admin/login", "username=admin&password=admin");
+	ASSERT_EQ(statusOf(loginResp), 200) << loginResp;
+	const std::string cookie = cookieOf(loginResp, "pd_session");
+	const std::string csrf   = csrfOf(loginResp);
+	ASSERT_EQ(statusOf(httpPostRaw(18097, "/api/admin/set-credential",
+		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
+
+	EXPECT_EQ(statusOf(httpGetRaw(18097, "/api/cdr", "pd_session=" + cookie)), 200)
+		<< "a logged-in operator must still get the call log";
+
+	const std::string authed = bodyOf(httpGetRaw(18097, "/api/status", "pd_session=" + cookie));
+	EXPECT_NE(authed.find("\"rosterVisible\":true"), std::string::npos)
+		<< "a session must see the roster:\n" << authed;
+
+	AdminAuth::clearCredential();
+}
+
+// The count is deliberately NOT withheld, and that is worth pinning: an empty
+// array alone cannot distinguish "nobody is registered" from "you may not see
+// who is", and a dashboard that cannot tell those apart renders "0 phones" at a
+// logged-out operator staring at a working PBX.
+TEST(CdrDisclosure, ClientCountStaysVisibleSoEmptyIsNotAmbiguous)
+{
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.9.2", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18098, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string body = bodyOf(httpGetRaw(18098, "/api/status"));
+	EXPECT_NE(body.find("\"clientCount\":0"), std::string::npos) << body;
+	EXPECT_NE(body.find("\"rosterVisible\":false"), std::string::npos) << body;
+
+	AdminAuth::clearCredential();
+}
