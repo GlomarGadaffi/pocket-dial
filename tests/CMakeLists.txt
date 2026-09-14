@@ -144,6 +144,14 @@ add_executable(sip_parser_tests
     # alarm that fires if a service is marked dialable before anything can answer
     # a call routed to it.
     ServiceExtensions_test.cpp
+    # Issue #163: the REGISTER-time identity guard -- refuses a From-number that
+    # is one of the reserved virtual/emergency extensions (777/999/888/555/440/
+    # 911/933), E.164 ('+'-prefixed), or merely PSTN-shaped (long, all-digit),
+    # in every registrar mode, before a binding is ever created. Wire-level
+    # coverage driven through RequestsHandler::handle(); the pure
+    # pbx::isReservedExtension()/looksLikePstnAor()/isReservedOrPstnAor() logic
+    # (PbxConfig.hpp) is covered in Pbx_test.cpp instead.
+    RegisterIdentityGuard_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is

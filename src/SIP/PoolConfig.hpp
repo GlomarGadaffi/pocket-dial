@@ -317,4 +317,30 @@
 #define POCKETDIAL_TX_MSG_BYTES 1500
 #endif
 
+// Issue #163: minimum all-digit length an unprefixed AOR must reach before the
+// REGISTER identity guard (pbx::looksLikePstnAor(), PbxConfig.hpp) treats it as
+// "looks like a direct PSTN number" rather than an internal extension, and
+// refuses the REGISTER. This is a POLICY choice, not a protocol fact — unlike
+// the '+' case (unambiguous E.164, refused unconditionally regardless of this
+// knob), an unprefixed all-digit string is only ever a *guess* about intent.
+//
+// Every extension this codebase's own docs/tests actually use is 3-4 digits
+// (docs/API.md's "1001"/"1002"/"1003"/"610"/"620" examples, 700-709 park
+// orbits, 980-989 page zones) and PoolConfig's own
+// POCKETDIAL_MAX_DIAL_RULES comment above describes the whole dial space as
+// "three-digit LAN extensions". NANP draws its own line at 7 (a bare local
+// number, no area code) and 10 (area code included); a true international
+// E.164 number runs 8-15 digits but arrives with a leading '+' and is already
+// caught unconditionally, so this knob only ever has to catch a NANP-shaped
+// number someone dialed in without the '+'. 7 gives every real extension in
+// this deployment a clean 3-4 digit margin while still catching the shortest
+// PSTN-shaped string that could plausibly show up unprefixed.
+//
+// Raise this if a deployment's numbering plan legitimately needs 5-6 digit
+// internal extensions; only lower it with a numbering plan that guarantees no
+// collision with a shorter PSTN-shaped number.
+#ifndef POCKETDIAL_MIN_PSTN_AOR_DIGITS
+#define POCKETDIAL_MIN_PSTN_AOR_DIGITS 7
+#endif
+
 #endif

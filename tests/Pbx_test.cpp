@@ -243,3 +243,70 @@ TEST(RegisterBeep, EnforceG711AndSyncKeepsContentLengthCorrect) {
     size_t actualBody = out.size() - (sep + 4);
     EXPECT_EQ(parsedContentLength(msg), actualBody);
 }
+
+// ── Reserved/emergency/PSTN-shaped REGISTER identity guard (Issue #163) ────────
+//
+// Pure coverage for the three PbxConfig.hpp helpers behind onRegister()'s
+// identity guard and findProvisioningInfo()'s recheck. The REGISTER-level
+// behaviour (403 in every registrar mode) is covered separately in
+// RegisterIdentityGuard_test.cpp, which links the full RequestsHandler; these
+// stay here, alongside the rest of PbxConfig.hpp's pure logic, because they
+// need nothing else.
+
+TEST(ReservedExtension, MatchesExactlyTheSevenReservedOrEmergencyLiterals) {
+    for (const char* ext : {"777", "999", "888", "555", "440", "911", "933"}) {
+        EXPECT_TRUE(pbx::isReservedExtension(ext)) << ext;
+    }
+}
+
+TEST(ReservedExtension, DoesNotMatchOrdinaryExtensionsOrLookalikes) {
+    // Real extensions this codebase's own docs/tests use, an empty AOR, and
+    // near-miss spellings that must NOT be swept in by a sloppier comparison
+    // (substring, prefix, or digit-only match).
+    for (const char* ext : {"101", "1001", "610", "620", "reception", "",
+                             "9110", "0911", "91", "4400", "*440", "555a"}) {
+        EXPECT_FALSE(pbx::isReservedExtension(ext)) << ext;
+    }
+}
+
+TEST(LooksLikePstnAor, AcceptsAllDigitAtOrAboveTheConfiguredThreshold) {
+    // Default threshold is POCKETDIAL_MIN_PSTN_AOR_DIGITS (PoolConfig.hpp) = 7.
+    EXPECT_TRUE(pbx::looksLikePstnAor("5551234"));       // exactly 7
+    EXPECT_TRUE(pbx::looksLikePstnAor("15551234567"));   // NANP w/ country code, no '+'
+}
+
+TEST(LooksLikePstnAor, RejectsShortOrNonDigitOrEmpty) {
+    EXPECT_FALSE(pbx::looksLikePstnAor(""));
+    EXPECT_FALSE(pbx::looksLikePstnAor("101"));          // ordinary 3-digit extension
+    EXPECT_FALSE(pbx::looksLikePstnAor("620"));
+    EXPECT_FALSE(pbx::looksLikePstnAor("555123"));       // one short of the threshold
+    EXPECT_FALSE(pbx::looksLikePstnAor("555123a"));      // right length, not all-digit
+    EXPECT_FALSE(pbx::looksLikePstnAor("+5551234"));     // '+' is handled separately
+}
+
+TEST(IsReservedOrPstnAor, BlocksEveryReservedLiteral) {
+    for (const char* ext : {"777", "999", "888", "555", "440", "911", "933"}) {
+        EXPECT_TRUE(pbx::isReservedOrPstnAor(ext)) << ext;
+    }
+}
+
+TEST(IsReservedOrPstnAor, BlocksAnyLeadingPlusRegardlessOfLength) {
+    EXPECT_TRUE(pbx::isReservedOrPstnAor("+15551234567"));
+    EXPECT_TRUE(pbx::isReservedOrPstnAor("+1"));
+    EXPECT_TRUE(pbx::isReservedOrPstnAor("+"))
+        << "unconditional per the issue: reject ANY leading '+', not just a "
+           "plausibly-long one";
+}
+
+TEST(IsReservedOrPstnAor, BlocksLongAllDigitAors) {
+    EXPECT_TRUE(pbx::isReservedOrPstnAor("5551234567"));
+}
+
+TEST(IsReservedOrPstnAor, AllowsOrdinaryExtensionsAndAlphanumericNames) {
+    // The other half of every guard in this file: it must refuse ONLY the
+    // three specific cases above, not every '+'-free, non-3-digit AOR.
+    for (const char* ext : {"101", "1001", "610", "620", "reception",
+                             "voicemail", "*55", "*8", "**204", "1_0.1-a"}) {
+        EXPECT_FALSE(pbx::isReservedOrPstnAor(ext)) << ext;
+    }
+}

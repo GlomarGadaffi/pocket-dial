@@ -975,6 +975,27 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// ── Reserved/emergency/PSTN-shaped identity guard (Issue #163) ───────────────
+	// isValidAor() above is charset-only, so nothing stopped a phone REGISTERing
+	// as a reserved virtual extension (777/999/888/555/440 — colliding directly
+	// with the echo test, all-page, meet-me conference, anchor media bridge or
+	// busy tone), as 911 or 933 (no special handling exists for either anywhere
+	// in this codebase, so a squatter would silently receive calls meant for
+	// them), or as an E.164/PSTN-shaped number. See pbx::isReservedOrPstnAor()
+	// (PbxConfig.hpp) for the full reasoning behind each case.
+	//
+	// Same placement rationale as the service-name guard just above: BEFORE the
+	// registrar-mode admission so Open/Secure/Learn all refuse identically, and
+	// 403 (not 400) because the AOR is well-formed — it is the identity that is
+	// refused.
+	if (pbx::isReservedOrPstnAor(fromNumber))
+	{
+		queueLog("REGISTER refused: \"" + std::string(fromNumber) +
+			"\" is a reserved, emergency or PSTN-shaped identity", true);
+		_registrar.sendForbidden(data, "Reserved or PSTN-shaped extension");
+		return;
+	}
+
 	// ── Registrar-mode admission (STAGE 2) ───────────────────────────────────────
 	// Runtime policy replaces the old compile-time POCKETDIAL_OPEN_REGISTRAR gate.
 	//   Open   : accept every REGISTER (legacy standalone behaviour).
@@ -5811,10 +5832,17 @@ std::optional<RequestsHandler::ProvisioningInfo> RequestsHandler::findProvisioni
 			// charset excludes CR/LF -- this re-checks that invariant at the point of
 			// use so provisioning does not silently depend on a gate three call layers
 			// away. Fails closed: no info -> the endpoint 404s.
-			if (!isValidAor(d.extension))
+			//
+			// Issue #163 addendum: same reasoning, for the reserved/emergency/PSTN-
+			// shaped identity guard. onRegister() already refuses a REGISTER that
+			// would adopt a device under 911, a service-adjacent virtual extension,
+			// etc, but this recheck means provisioning does not silently depend on
+			// that gate either -- a device record reaching this point under a name
+			// that guard would refuse must not walk away with a working .cfg for it.
+			if (!isValidAor(d.extension) || pbx::isReservedOrPstnAor(d.extension))
 			{
 				queueLog("Provisioning refused for " + mac +
-					": adopted extension fails the AOR charset", true);
+					": adopted extension fails the AOR charset or identity guard", true);
 				return std::nullopt;
 			}
 			const bool authRequired = (d.state == Registrar::DeviceState::Secured) ||
