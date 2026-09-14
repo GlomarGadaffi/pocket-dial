@@ -143,6 +143,14 @@ public:
 	// so it is exact the instant a leg joins or leaves.
 	int getConferenceLegs();
 
+	// Live RFC 3261 §17 transaction counts. Exposed for host tests, which need to
+	// assert the TRACKING DECISION rather than wait for a timer: tick() throttles
+	// itself to 1 Hz, so a test that drives it in a loop cannot observe a 500 ms
+	// Timer A at all and would pass whether or not the decision was right. Reading
+	// the count instead tests the thing under test directly.
+	size_t getClientTransactionCount();
+	size_t getServerTransactionCount();
+
 	// Call Detail Records (CDR): a thread-safe snapshot of the recent-call ring,
 	// newest first. Copied out under _snapshotMutex like the client/session views.
 	std::vector<CallDetailRecord> getCallDetailRecords();

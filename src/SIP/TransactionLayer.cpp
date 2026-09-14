@@ -25,9 +25,10 @@ namespace
 	}
 
 	// CSeq sequence number out of a full "CSeq: 101 INVITE" header line. 0 when
-	// the header is absent or has no leading number — which never matches a real
-	// CSeq, so a parse failure degrades to "this slot matches nothing" rather
-	// than to a false match.
+	// the header is absent, has no leading number, or would overflow. Callers
+	// must treat 0 as "unknown" and refuse to match on it — two unparseable CSeqs
+	// both yield 0 and would otherwise compare equal, turning a parse failure into
+	// a false match rather than no match.
 	uint32_t parseCSeqNum(std::string_view cseq)
 	{
 		size_t i = 0;
@@ -166,6 +167,47 @@ void TransactionLayer::maybeTrack(const sockaddr_in& peer,
                                   const std::shared_ptr<SipMessage>& msg)
 {
 	const auto type = classify(peer, msg);
+
+	// A FINAL response going out that we did NOT author still ends any server
+	// transaction we opened on that dialog.
+	//
+	// The shape this exists for: a ring-group or hunt fan-out authors its own
+	// "180 Ringing" back to the caller (CallForker.cpp:89 and :325), which opens
+	// an InviteServer slot in Proceeding — deliberately with no timer, because
+	// §17.2.1 expects the TU to follow with a final. But the final on that dialog
+	// is the winning member's 200 OK, which is RELAYED, so classify() correctly
+	// returns None for it and the slot would never hear that the transaction is
+	// over.
+	//
+	// Two consequences, and the second is worse than the first. The slot sits
+	// until endCall(), so sixteen concurrent ringing calls exhaust the server
+	// pool. And while it sits, a retransmitted INVITE would be answered out of it
+	// with the stale 180 — telling a phone the call is still ringing after it has
+	// already been answered.
+	//
+	// Freeing on the relayed final closes both structurally, rather than relying
+	// on every authored-provisional path also authoring its own final.
+	if (type == SipTransaction::Type::None && msg)
+	{
+		const auto si = msg->getStatusInfo();
+		if (si.has_value() && si->klass != PocketDial::SipStatusClass::Provisional)
+		{
+			const auto branch = msg->getViaBranch();
+			if (!branch.empty())
+			{
+				for (auto& tx : _serverPool)
+				{
+					if (tx.type != SipTransaction::Type::InviteServer) continue;
+					if (tx.state != SipTransaction::State::Proceeding) continue;
+					if (branch != std::string_view(tx.viaBranch)) continue;
+					if (!sameEndpoint(peer, tx.peer)) continue;
+					tx.type = SipTransaction::Type::None;
+					break;
+				}
+			}
+		}
+	}
+
 	if (type == SipTransaction::Type::None) return;
 
 	const auto branchSv = msg->getViaBranch();
@@ -412,7 +454,9 @@ bool TransactionLayer::absorbRetransmittedRequest(const std::shared_ptr<SipMessa
 		for (auto& tx : _serverPool)
 		{
 			if (tx.type != SipTransaction::Type::InviteServer) continue;
-			if (tx.cseqNum != cseqNum) continue;
+			// A CSeq that failed to parse is 0, and two zeroes match each other —
+			// so an unparseable CSeq on both sides must not be read as agreement.
+			if (cseqNum == 0 || tx.cseqNum != cseqNum) continue;
 			if (!sameEndpoint(src, tx.peer)) continue;
 			const bool byBranch = !branch.empty() &&
 				branch == std::string_view(tx.viaBranch);
@@ -448,7 +492,7 @@ bool TransactionLayer::absorbRetransmittedRequest(const std::shared_ptr<SipMessa
 		    tx.type != SipTransaction::Type::NonInviteServer) continue;
 		if (branch != std::string_view(tx.viaBranch)) continue;
 		if (!method.empty() && method != std::string_view(tx.cseqMethod)) continue;
-		if (tx.cseqNum != cseqNum) continue;
+		if (cseqNum == 0 || tx.cseqNum != cseqNum) continue;
 		// Call-ID is NOT part of RFC 3261 §17.2.3's match (branch + sent-by +
 		// method), because a conformant branch is already globally unique. It is
 		// compared anyway, because the cost of a false match here is silently

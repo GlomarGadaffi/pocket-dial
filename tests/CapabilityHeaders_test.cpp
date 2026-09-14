@@ -495,6 +495,7 @@ TEST(CapabilityHeaders, APassedThroughReinviteGetsNoPbxSideRetransmitTimer)
 
 	// A holds: an in-dialog re-INVITE, relayed on to B untouched.
 	sent.clear();
+	const size_t beforeRelay = handler.getClientTransactionCount();
 	{
 		std::string body = sdpBody(callerIp, 40002) + "a=sendonly\r\n";
 		const std::string raw =
@@ -519,17 +520,98 @@ TEST(CapabilityHeaders, APassedThroughReinviteGetsNoPbxSideRetransmitTimer)
 	}
 	ASSERT_EQ(relayedToCallee, 1) << "the hold re-INVITE must reach the callee exactly once";
 
-	// Drive well past Timer A's first fire. Nothing more may go out: the PBX does
-	// not own this request.
-	sent.clear();
-	for (int i = 0; i < 4; ++i) handler.tick();
+	// Assert the DECISION, not a timer. Driving tick() in a loop would prove
+	// nothing here: it self-throttles to 1 Hz, so at most one tick runs and it
+	// runs microseconds after the relay — long before a 500 ms Timer A could
+	// fire. Such a test passes whether or not the tracking is right. The client
+	// transaction count answers the actual question.
+	//
+	// A DELTA, not an absolute: registering a phone fires a register-beep INVITE
+	// (RegisterBeeper), which is a genuine PBX-originated request and correctly
+	// holds a client slot of its own for its Timer B window. Only the change
+	// across the relay is this test's business.
+	EXPECT_EQ(handler.getClientTransactionCount(), beforeRelay)
+		<< "the PBX armed a retransmit timer on a re-INVITE it was only relaying";
+}
 
-	for (const auto& [addr, msg] : sent)
+TEST(CapabilityHeaders, AServerOriginatedByeIsTrackedForRetransmitByTheRealEngine)
+{
+	// The layer-level counterpart of this lives in TransactionLayerRfc17_test.cpp
+	// (FreeForCallIdStopsTheInviteButNotTheByeTearingItDown). What a layer test
+	// CANNOT prove is the wiring: that a BYE the engine actually originates reaches
+	// maybeTrack() through drainOutbox() and is accepted there. classify() could
+	// reject it, the pass-through guard could swallow it, or the BYE could leave by
+	// a path that never passes the choke point -- all invisible to FakePbxEnv.
+	//
+	// The register beep is the shortest real path to a server-originated BYE: a new
+	// registration triggers an auto-answer INVITE, and when the phone answers,
+	// RegisterBeeper ACKs and BYEs to end the call it just made.
+	//
+	// Scope note, deliberately stated rather than papered over: this proves the BYE
+	// is TRACKED. It does not prove the retransmission fires, because tick()
+	// self-throttles to 1 Hz and there is no clock injection to step it -- any test
+	// claiming otherwise here would be measuring nothing. The timer schedules
+	// themselves are covered at the layer, where the clock IS a parameter.
+	Outbox sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) {
+			sent.emplace_back(a, std::move(m));
+		});
+
+	const std::string phoneIp = "192.168.41.50";
+	handler.handle(makeRegister("450", phoneIp, "reg-450"));
+
+	// The beep INVITE the registration just fired. Echo its dialog back so the
+	// 200 OK is matched to it.
+	const std::string beep = firstWithStartLine(sent, "INVITE sip:");
+	ASSERT_FALSE(beep.empty()) << "the registration fired no beep INVITE";
+	const std::string beepCallId = headerValue(beep, "Call-ID");
+	const std::string beepVia    = headerValue(beep, "Via");
+	const std::string beepFrom   = headerValue(beep, "From");
+	const std::string beepTo     = headerValue(beep, "To");
+	const std::string beepCSeq   = headerValue(beep, "CSeq");
+	ASSERT_FALSE(beepCallId.empty());
+
+	const size_t beforeAnswer = handler.getClientTransactionCount();
+	ASSERT_GE(beforeAnswer, 1u)
+		<< "the beep INVITE itself must already hold a client transaction";
+
+	// The phone answers the beep. RegisterBeeper ACKs, then BYEs to hang it up.
+	sent.clear();
 	{
-		(void)addr;
-		ASSERT_TRUE(msg != nullptr);
-		EXPECT_NE(msg->toString().rfind("INVITE sip:", 0), 0u)
-			<< "the PBX retransmitted a re-INVITE it was only relaying:\n"
-			<< msg->toString();
+		const std::string raw =
+			"SIP/2.0 200 OK\r\n"
+			"Via: " + beepVia + "\r\n"
+			"From: " + beepFrom + "\r\n"
+			"To: " + beepTo + ";tag=phonetag\r\n"
+			"Call-ID: " + beepCallId + "\r\n"
+			"CSeq: " + beepCSeq + "\r\n"
+			"Contact: <sip:450@" + phoneIp + ":5060>\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(phoneIp)));
 	}
+
+	const std::string bye = firstWithStartLine(sent, "BYE sip:");
+	ASSERT_FALSE(bye.empty())
+		<< "answering the beep did not produce a server-originated BYE";
+
+	// THE ASSERTION. Before this change every one of these went out exactly once
+	// and was never retransmitted -- "fire and forget", in #199's words -- so a
+	// single lost datagram left the handset showing a call the PBX had already
+	// torn down, with nothing anywhere that would ever correct it.
+	// EXACTLY one more than before, which is the only form of this assertion that
+	// is not vacuous. A bare "> 0" would pass on the beep INVITE's own slot alone:
+	// that slot is still occupied after the 200 OK, sitting in its RFC 6026 §8.4
+	// Timer M absorb window, so it would satisfy "> 0" whether or not the BYE was
+	// tracked at all.
+	//
+	// The exact delta also pins the other half: the ACK that went out in the same
+	// pass must NOT have claimed a slot. §17.1.1.3 — an ACK is never its own
+	// transaction, and putting one on a retransmit timer would emit unmatched
+	// ACKs.
+	const std::string ack = firstWithStartLine(sent, "ACK sip:");
+	EXPECT_FALSE(ack.empty()) << "the answered beep was never ACKed";
+	EXPECT_EQ(handler.getClientTransactionCount(), beforeAnswer + 1)
+		<< "expected exactly one new client transaction (the BYE) and none for "
+		   "the ACK sent alongside it";
 }

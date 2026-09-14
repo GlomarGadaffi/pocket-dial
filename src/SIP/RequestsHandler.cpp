@@ -6203,6 +6203,18 @@ int RequestsHandler::getConferenceLegs()
 	return _conference ? _conference->legCount() : 0;
 }
 
+size_t RequestsHandler::getClientTransactionCount()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _txLayer.activeClientTransactions();
+}
+
+size_t RequestsHandler::getServerTransactionCount()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _txLayer.activeServerTransactions();
+}
+
 void RequestsHandler::tick()
 {
 	auto now = std::chrono::steady_clock::now();
@@ -6217,6 +6229,12 @@ void RequestsHandler::tick()
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_outbox.clear();
+		// No inbound message owns a tick() pass. Cleared here rather than only at
+		// the end of handle() because handle() has early returns between setting
+		// it and draining (the INFO pool-exhaustion path, for one), and a stale
+		// pointer left behind would silently suppress retransmit tracking for
+		// whatever pooled SipMessage next lands on that address.
+		_passThroughMsg = nullptr;
 
 		sweepExpired();
 
