@@ -64,6 +64,9 @@
 #include "LogQueue.hpp"
 #include "Syslog.hpp"
 #include "TimeSync.hpp"
+#if defined(PD_ETH_HAS_SD)
+#include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive writer
+#endif
 
 // ── Tag for ESP_LOG ────────────────────────────────────────────────────────
 static const char* TAG = "SipServerETH";
@@ -626,6 +629,15 @@ extern "C" void app_main(void)
     // After the netif is wired, so the retry loop (up to ~1 s on a missing
     // card) cannot delay Ethernet bring-up. Never fatal — see sd_mount().
     sd_mount();
+
+    // Issue #194 Stage 1: bring up the SD CDR archive writer task now that
+    // sd_mount() has decided whether there's a card. init() checks
+    // pd_sd_mounted() itself and is a permanent no-op if it isn't -- see
+    // CdrArchive.hpp. Deliberately NOT waiting for timesync::start() (called
+    // later, from the IP event handler below): the archive's own record()
+    // already drops every entry until the wall clock has synced at least
+    // once, so there's nothing here to sequence against.
+    cdrarchive::init();
 #endif
 
     // ── Static IP (optional) ────────────────────────────────────────────

@@ -396,6 +396,15 @@ add_executable(sip_parser_tests
     # The CDR ring buffer, extracted out of RequestsHandler into its own
     # translation unit.
     ../src/SIP/CdrRing.cpp
+    # Issue #194 Stage 1: SD CDR archive. The CSV formatter and the queue/
+    # drain decoupling (WriterQueue/drainAll) are pure C++17 and fully
+    # exercised here via a FakeSink; the real FatFs Sink and writer task are
+    # PD_ETH_HAS_SD-gated and compile to no-ops on this host build (that
+    # macro is never defined outside main/CMakeLists.txt's eth+elite branch),
+    # so record()/wipeAll()/init() are covered only for their reachable-on-
+    # host no-op contract -- see CdrArchive_test.cpp's header comment.
+    ../src/SIP/CdrArchive.cpp
+    CdrArchive_test.cpp
     # The DTMF digit-collection state machine + CLASS/admin codes, extracted
     # out of RequestsHandler into its own translation unit.
     ../src/SIP/DtmfFeatureCodes.cpp

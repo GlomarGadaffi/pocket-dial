@@ -6,6 +6,7 @@
 #include "TelephonyApiConfig.hpp"
 #include "DidMapping.hpp"
 #include "CallDetailRecord.hpp"
+#include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive wipe on factory reset
 #include "AdminAuth.hpp"
 #include "DeviceConfig.hpp"
 #include "OtaUpdater.hpp"
@@ -2736,6 +2737,44 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		handler->clearAllDidMappings();
 		handler->clearAllCallHistory();
 	}
+	// ── Issue #194 Stage 1 DECISION: factory reset ALSO wipes the SD CDR
+	// archive, same policy as the NVS ring immediately above. This device
+	// already treats call history (caller/callee, when, how long) as
+	// sensitive as carrier credentials -- that is the entire reason
+	// clearAllCallHistory() exists as its own explicit step rather than
+	// falling out of DeviceConfig::clearAll(). An SD file does not
+	// automatically inherit that policy just because it holds the same data:
+	// without this call, a factory reset would erase the live NVS ring while
+	// leaving a full, dated, plaintext history sitting on the card, which is
+	// almost certainly the more surprising and worse outcome of the two for
+	// an operator who just asked the device to forget everything. If a
+	// deployment wants the SD archive to OUTLIVE a factory reset instead
+	// (e.g. the archive is the compliance record and the reset is routine
+	// re-provisioning), that is a one-line reversal at this call site -- flag
+	// it in review if this default is wrong for how pocket-dial is actually
+	// deployed.
+	//
+	// Called directly here, NOT threaded through clearAllCallHistory(): that
+	// method takes RequestsHandler::_mutex, and directory I/O (opendir/
+	// unlink) must never run while holding it -- see CdrArchive.hpp's SD
+	// write-discipline note. sendApiFactoryReset() runs on the HTTP task with
+	// no lock held, the same context the MoH-upload fopen() above already
+	// uses, so calling it here is safe. No-op on every build without an SD
+	// archive installed (see cdrarchive::wipeAll()'s doc comment).
+	cdrarchive::wipeAll();
+	//
+	// KNOWN GAP, not fixed here (out of this stage's scope -- DtmfFeatureCodes.cpp
+	// is not part of issue #194 Stage 1's touch list): the DTMF admin menu's OWN
+	// factory-reset path (*<PIN>#999#1, DtmfFeatureCodes.cpp) does not call this
+	// function at all -- it runs nvs_flash_erase() + esp_restart() directly on
+	// the SIP thread. That wipes NVS (including the "cdrlog" ring, more
+	// thoroughly than the targeted erase above) but never touches the SD card,
+	// so a DTMF-triggered factory reset currently leaves the SD archive intact
+	// while the HTTP-triggered one (this function) wipes both. Closing that gap
+	// means either giving DtmfFeatureCodes.cpp its own SD-wipe call (same SIP-
+	// thread/no-blocking-I/O constraint as endCall(), and outside this stage's
+	// "minimal hook" scope) or unifying the two factory-reset entry points --
+	// filed as issue #222 rather than an unreviewed addition here.
 #if defined(POCKETDIAL_HAS_WIFI)
 	// The ONLY genuinely radio-specific work in this handler. It stays gated on the
 	// transport (not the platform) for a second reason beyond the keys themselves:

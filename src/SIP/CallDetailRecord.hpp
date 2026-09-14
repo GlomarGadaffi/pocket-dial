@@ -42,9 +42,27 @@ inline const char* cdrResultToString(CdrResult r)
 	}
 }
 
-// One completed call. Strings are short SIP AORs (extensions); they are bounded
+// One completed call. Strings are short SIP AORs (extensions) on MOST paths.
+//
+// CORRECTED (issue #194 audit): this used to claim caller/callee "are bounded
 // by the registrar's isValidAor() validation on ingress, so they cannot grow
-// without limit. A CDR is a value type copied into the dashboard snapshot.
+// without limit." That is false on two counts. First, isValidAor() (see
+// RequestsHandler::isValidAor) is a pure CHARSET filter — alnum plus
+// `. - _ + * #` — with no length check at all, so even an AOR that does pass
+// through it could be arbitrarily long; RequestsHandler.cpp now caps it at
+// kMaxAorLen (64) for exactly this reason (a caller/callee string heap-
+// allocates inside every ring slot below, and CdrRing has no bound of its
+// own). Second, not every CDR field actually comes through that gate: the
+// anchor/trunk paths (RequestsHandler.cpp's endCall() calls around the
+// participant-id branches, e.g. `ev.participantId` /
+// Session::getAnchorParticipantId()) pass values sourced from the anchor's
+// own JSON, which never touches isValidAor(). Those are bounded only by
+// whatever the anchor/telephony provider itself enforces upstream — treat
+// them as untrusted-length input at any new consumer (like the SD archive
+// formatter in CdrArchive.cpp, which truncates defensively rather than
+// trusting this comment a second time).
+//
+// A CDR is a value type copied into the dashboard snapshot.
 struct CallDetailRecord
 {
 	std::string caller;       // calling extension (From)

@@ -13,6 +13,7 @@
 #include "IPHelper.hpp"
 #include "PoolConfig.hpp"
 #include "CallDetailRecord.hpp"
+#include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive (endCall() hook)
 #include "PbxConfig.hpp"
 #include "PbxPersist.hpp"
 #include "SipHeaderUtil.hpp"
@@ -82,6 +83,17 @@ namespace
 	// (matching 777/440/888/999) was chosen over a trunk-access prefix or an
 	// unregistered-number fallback.
 	constexpr const char* kAnchorCallExt = "555";
+
+	// Issue #194 audit: isValidAor() had a header comment (CallDetailRecord.hpp)
+	// claiming it bounded caller/callee length. It never did -- charset only,
+	// no size check -- which let an unbounded AOR heap-allocate inside every
+	// CdrRing slot (and, now, every queued SD-archive line). A real SIP AOR
+	// user-part is nowhere near this long; 64 is generous headroom over every
+	// extension/feature-code/DID this codebase dials (longest today: 4-digit
+	// park orbits/page zones, PIN-bearing DTMF admin codes under 16 chars) while
+	// still refusing a pathological value outright rather than silently
+	// truncating it somewhere downstream.
+	constexpr size_t kMaxAorLen = 64;
 
 	// How long a CONNECTED outbound anchor call waits for the handset's ACK before
 	// tick() treats it as abandoned (handset gone, or its 200 OK arrived too late)
@@ -5373,7 +5385,14 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	if (_sessions.erase(std::string(callID)) > 0)
 	{
 		// Record exactly once per torn-down dialog (Phase 2 CDR).
-		_cdr.record(ending, srcNumber, destNumber);
+		const CallDetailRecord& rec = _cdr.record(ending, srcNumber, destNumber);
+
+		// Issue #194 Stage 1: queue the same teardown for the SD archive, reusing
+		// the CallDetailRecord CdrRing just derived (startMs/durationSec/result)
+		// plus the two pieces of context only this call site has and previously
+		// discarded -- callID and `reason`. Non-blocking; see CdrArchive.hpp for
+		// why this is safe to call here, under _mutex, on the SIP thread.
+		cdrarchive::record(rec, callID, reason);
 
 		std::ostringstream message;
 		message << "Session has been disconnected between " << srcNumber << " and " << destNumber;
@@ -6902,7 +6921,10 @@ bool RequestsHandler::allowPacket(const sockaddr_in& src)
 
 bool RequestsHandler::isValidAor(std::string_view s) const
 {
-	if (s.empty()) return false;
+	// Issue #194: length bound added alongside the charset check below -- see
+	// kMaxAorLen's comment for why 64 and why this matters (unbounded heap
+	// growth inside CdrRing's fixed-footprint slots). Charset-only until now.
+	if (s.empty() || s.size() > kMaxAorLen) return false;
 	for (char c : s)
 	{
 		// Alnum + RFC 3261 user-part punctuation we accept, plus '*' and '#' so star/pound

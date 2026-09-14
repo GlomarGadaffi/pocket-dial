@@ -31,7 +31,7 @@ namespace
 	}
 }
 
-void CdrRing::record(const std::shared_ptr<Session>& session,
+const CallDetailRecord& CdrRing::record(const std::shared_ptr<Session>& session,
 	std::string_view srcNumber, std::string_view destNumber)
 {
 	CallDetailRecord rec;
@@ -81,7 +81,8 @@ void CdrRing::record(const std::shared_ptr<Session>& session,
 	rec.result = result;
 
 	// Fixed ring write: overwrite the oldest slot once full (no heap growth).
-	_ring[_head] = std::move(rec);
+	const size_t writtenIdx = _head;
+	_ring[writtenIdx] = std::move(rec);
 	_head = (_head + 1) % POCKETDIAL_CDR_RECORDS;
 	if (_count < POCKETDIAL_CDR_RECORDS)
 	{
@@ -92,6 +93,8 @@ void CdrRing::record(const std::shared_ptr<Session>& session,
 	// on host). Caller (RequestsHandler::endCall) holds _mutex. See persist()
 	// for the wear note.
 	persist();
+
+	return _ring[writtenIdx];
 }
 
 std::vector<CallDetailRecord> CdrRing::snapshot() const
