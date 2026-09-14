@@ -75,6 +75,68 @@ TEST_F(TelephonyApiConfigTest, SetSlotRoundTripsNonSecretFields)
 	EXPECT_TRUE(v.secretSet);
 }
 
+TEST_F(TelephonyApiConfigTest, EnabledRealSlotRefusesIncompleteIdentity)
+{
+	// Regression: an ENABLED real-provider slot used to be accepted with a blank
+	// route DN. Nothing downstream can catch that -- isConnected() is WebSocket
+	// state and the control socket carries no DN -- so the board boots
+	// "connected", every makeCall POSTs to ".../callcontrol//makecall", the
+	// provider really is reached and answers non-2xx. In the field that reads as
+	// "the API was hit but no call happened". This is the only place it is
+	// detectable, so it has to be refused here.
+	TelephonyApiConfig::Slot base;
+	base.type = TelephonyProviderType::Telephony;
+	base.baseUrl = "https://pbx.example.invalid";
+	base.clientId = "id";
+	base.secret = "sssh";
+	base.routeDn = "100";
+	base.enabled = true;
+
+	{   // blank route DN
+		TelephonyApiConfig::Slot s = base;
+		s.routeDn.clear();
+		EXPECT_EQ(_cfg.setSlot(0, s, false), "Enabled slot needs a route DN");
+	}
+	{   // blank client id
+		TelephonyApiConfig::Slot s = base;
+		s.clientId.clear();
+		EXPECT_EQ(_cfg.setSlot(0, s, false), "Enabled slot needs a client ID");
+	}
+	{   // blank secret
+		TelephonyApiConfig::Slot s = base;
+		s.secret.clear();
+		EXPECT_EQ(_cfg.setSlot(0, s, false), "Enabled slot needs a client secret");
+	}
+
+	// None of those wrote anything.
+	EXPECT_FALSE(_cfg.view(0).enabled);
+
+	// The complete slot saves.
+	ASSERT_EQ(_cfg.setSlot(0, base, false), "");
+	EXPECT_TRUE(_cfg.view(0).enabled);
+
+	// keepSecret validates the STORED secret, not the deliberately-empty
+	// incoming one -- editing the route DN of a saved slot must still work.
+	TelephonyApiConfig::Slot edit = base;
+	edit.secret.clear();
+	edit.routeDn = "200";
+	EXPECT_EQ(_cfg.setSlot(0, edit, /*keepSecret=*/true), "");
+	EXPECT_EQ(_cfg.view(0).routeDn, "200");
+	EXPECT_TRUE(_cfg.view(0).secretSet);
+
+	// A DISABLED slot is still free to be incomplete -- it is a draft.
+	TelephonyApiConfig::Slot draft = base;
+	draft.enabled = false;
+	draft.routeDn.clear();
+	EXPECT_EQ(_cfg.setSlot(1, draft, false), "");
+
+	// ...and so is a Loopback slot, which needs no credentials at all.
+	TelephonyApiConfig::Slot loop;
+	loop.type = TelephonyProviderType::Loopback;
+	loop.enabled = true;
+	EXPECT_EQ(_cfg.setSlot(2, loop, false), "");
+}
+
 TEST_F(TelephonyApiConfigTest, SecretNeverAppearsInView)
 {
 	TelephonyApiConfig::Slot s;

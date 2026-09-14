@@ -523,6 +523,68 @@ TEST(DialPlanCap, SetDialRuleEnforcesTheCapThroughTheHandler)
 	EXPECT_EQ(static_cast<int>(handler.getDialRules().size()), POCKETDIAL_MAX_DIAL_RULES);
 }
 
+TEST(DialPlanEdit, EditingARuleInPlaceKeepsTheNewStripCount)
+{
+	// Regression: DialPlan::upsert() used to copy only action and target when a
+	// rule with the same pattern already existed, so stripDigits kept the FIRST
+	// insert's value forever. Re-POSTing a pattern is the only way to edit a
+	// rule, so correcting a typo reverted the strip to whatever it was first
+	// stored as -- and persistDialPlan() then wrote that stale value to NVS.
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+
+	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
+	ASSERT_EQ(handler.getDialRules().size(), 1u);
+	EXPECT_EQ(std::get<3>(handler.getDialRules()[0]), 1);
+
+	// Same pattern, different strip: the edit must take.
+	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 4);
+	ASSERT_EQ(handler.getDialRules().size(), 1u) << "an edit must not append a second rule";
+	EXPECT_EQ(std::get<3>(handler.getDialRules()[0]), 4)
+		<< "editing a trunk rule must take the NEW strip count, not the original";
+
+	// And switching a non-trunk rule to trunk must not inherit a stale 0.
+	handler.setDialRule("7XX", "group", "610");
+	handler.setDialRule("7XX", "trunk", "1", 2);
+	auto rules = handler.getDialRules();
+	ASSERT_EQ(rules.size(), 2u);
+	EXPECT_EQ(std::get<0>(rules[1]), "7XX");
+	EXPECT_EQ(std::get<1>(rules[1]), "trunk");
+	EXPECT_EQ(std::get<3>(rules[1]), 2);
+}
+
+TEST(DialPlanEdit, ATrunkRuleMayPrependNothingAndIsNotADelete)
+{
+	// Regression: the delete signal used to be "empty target", which made
+	// "strip N, prepend nothing" -- the shape that sends the dialed digits on
+	// verbatim -- impossible to express, because the create request was
+	// byte-identical to the delete request. Naming an action now means upsert.
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+
+	handler.setDialRule("9XXXXXXXXXX", "trunk", "", 1);
+	ASSERT_EQ(handler.getDialRules().size(), 1u)
+		<< "a trunk rule with an empty target must be stored, not treated as a delete";
+	EXPECT_EQ(std::get<2>(handler.getDialRules()[0]), "");
+	EXPECT_EQ(std::get<3>(handler.getDialRules()[0]), 1);
+
+	// It must actually route: 9 + 10 digits, strip 1, prepend nothing.
+	std::string out;
+	ASSERT_TRUE(pbx::applyTrunkTransform("93057673260", 1, "", out));
+	EXPECT_EQ(out, "3057673260");
+
+	// An empty action AND an empty target still deletes.
+	handler.setDialRule("9XXXXXXXXXX", "", "");
+	EXPECT_TRUE(handler.getDialRules().empty()) << "the no-action/no-target delete must still work";
+
+	// But a non-trunk action with no target names no destination -- refuse it.
+	handler.setDialRule("6XX", "group", "");
+	handler.setDialRule("6XX", "page", "");
+	handler.setDialRule("6XX", "park", "");
+	EXPECT_TRUE(handler.getDialRules().empty())
+		<< "only a trunk rule may carry an empty target";
+}
+
 TEST(DialPlanCap, HandlerGetterReportsRulesInTableOrder)
 {
 	RequestsHandler handler("192.168.9.1", 5060,

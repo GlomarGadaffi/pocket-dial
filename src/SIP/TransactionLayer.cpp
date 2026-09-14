@@ -17,6 +17,34 @@ void TransactionLayer::maybeTrack(const sockaddr_in& peer,
 {
 	if (classify(msg) == SipTransaction::Type::None) return;
 
+	// An INVITE we are ALREADY tracking must never claim a SECOND slot.
+	//
+	// sweep()'s Timer-A retransmit re-enqueues the INVITE through _env.enqueue(),
+	// which appends to RequestsHandler's _outbox — and drainOutbox() runs
+	// maybeTrack() over EVERY _outbox entry (issue #70 moved the scan there
+	// deliberately, so that anything appended during a pass still gets tracked).
+	// Without this guard the two compose into a feedback loop: each retransmit is
+	// registered as a brand-new transaction, which retransmits and registers
+	// again — 1 -> 2 -> 4 -> ... until the pool is exhausted, every stranded slot
+	// then logging its own Timer B against the SAME Call-ID.
+	//
+	// Observed on hardware (issue #148): one unanswered register-beep INVITE to a
+	// Yealink T29 produced 23 "[tx] Timer B expired" lines for a single Call-ID
+	// plus "[tx] pool exhausted", within ~60 s of boot. With this guard the beep
+	// gets exactly one transaction and the RFC 3261 §17.1.1.2 retransmit schedule.
+	const auto branchSv = msg->getViaBranch();
+	const auto methodSv = msg->getCSeqMethod();
+	if (!branchSv.empty())
+	{
+		for (const auto& tx : _pool)
+		{
+			if (tx.type == SipTransaction::Type::None) continue;
+			if (branchSv != std::string_view(tx.viaBranch)) continue;
+			if (!methodSv.empty() && methodSv != std::string_view(tx.cseqMethod)) continue;
+			return;   // already tracked — that slot owns this INVITE's retransmission
+		}
+	}
+
 	SipTransaction* slot = nullptr;
 	for (auto& tx : _pool)
 	{

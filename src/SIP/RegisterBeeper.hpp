@@ -95,6 +95,10 @@ private:
 	};
 
 	BeepDialog* findByCallID(std::string_view callID);
+	// Free this dialog's INVITE transaction, then clear the slot. EVERY terminal
+	// path must go through here rather than assigning BeepDialog{} directly —
+	// see the definition for why (issue #148).
+	void releaseDialog(BeepDialog& bd);
 	// buildAck/buildBye take the dialog handleOk() already located — they used to
 	// re-scan the table by Call-ID themselves, three linear passes over the same
 	// Call-ID per answered beep, all inside the _mutex-held 200-OK dispatch.

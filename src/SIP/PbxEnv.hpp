@@ -38,6 +38,17 @@ struct PbxEnv
 	// dereferencing. The contract on refusal is to drop: the peer retransmits.
 	virtual std::shared_ptr<SipMessage> messageFromPool(std::string raw, sockaddr_in src) = 0;
 
+	// Release any client transaction still retransmitting for this Call-ID.
+	//
+	// A register-beep dialog has NO Session — it lives in RegisterBeeper's own
+	// fixed table, keyed by Call-ID — so it never reaches endCall(), which was
+	// the only caller of TransactionLayer::freeForCallId(). Without this, a beep
+	// the phone never answers keeps retransmitting its INVITE for the whole
+	// Timer B window (32 s) after the beep dialog itself has been torn down, and
+	// its slot stays claimed the entire time (issue #148). Safe to call with a
+	// Call-ID that owns no transaction: it is a no-op.
+	virtual void freeTransactionsForCallId(std::string_view callId) = 0;
+
 	// Append to the deferred log queue (flushed off-lock).
 	virtual void log(std::string msg, bool isError = false) = 0;
 

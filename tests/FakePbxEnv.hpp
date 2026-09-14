@@ -62,6 +62,9 @@ public:
 	// bounded heap fallback are both spent.
 	bool messagePoolAvailable = true;
 
+	// Call-IDs passed to freeTransactionsForCallId(), in order.
+	std::vector<std::string> freedTransactionCallIds;
+
 	static sockaddr_in addr(const char* ip, uint16_t port)
 	{
 		sockaddr_in a{};
@@ -99,6 +102,12 @@ public:
 	{
 		if (!messagePoolAvailable) return nullptr;
 		return std::make_shared<SipMessage>(raw, src);
+	}
+	// Records every Call-ID whose client transactions were released, so a test can
+	// assert that a teardown path actually stopped the retransmits (issue #148).
+	void freeTransactionsForCallId(std::string_view callId) override
+	{
+		freedTransactionCallIds.emplace_back(callId);
 	}
 	void log(std::string msg, bool /*isError*/ = false) override
 	{

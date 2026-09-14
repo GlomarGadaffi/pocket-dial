@@ -1351,8 +1351,11 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 	}
 
 	int stripDigits = 0;
-	// A delete only needs the pattern; everything else is validated for an upsert.
-	if (!target.empty())
+	// A delete only needs the pattern (and names no action); everything else is
+	// validated for an upsert. Naming an action ALWAYS means upsert, because a
+	// trunk rule may legitimately carry an empty target — that is how you say
+	// "strip N digits and prepend nothing", which is otherwise inexpressible.
+	if (!action.empty() || !target.empty())
 	{
 		if (action.empty()) action = "group";
 		pbx::DialActionType parsed;
@@ -1362,10 +1365,16 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 			             "{\"error\":\"action must be group|page|park|trunk\"}");
 			return;
 		}
-		if (!pbx::isDialTokenSafe(target))
+		if (!target.empty() && !pbx::isDialTokenSafe(target))
 		{
 			sendResponse(sock, 400, "Bad Request", "application/json",
 			             "{\"error\":\"target may contain only letters, digits, '#' and '*'\"}");
+			return;
+		}
+		if (target.empty() && parsed != pbx::DialActionType::Trunk)
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"only a trunk rule may have an empty target (it means prepend nothing)\"}");
 			return;
 		}
 		if (parsed == pbx::DialActionType::PageZone && !pbx::isPageZoneExt(target))

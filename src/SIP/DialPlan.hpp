@@ -217,6 +217,14 @@ namespace pbx
 				{
 					existing.action = rule.action;
 					existing.target = rule.target;
+					// stripDigits MUST be copied too. Leaving it out meant an edit
+					// silently kept the FIRST insert's strip count while taking the
+					// new action/target — so re-POSTing a trunk rule to fix a typo
+					// reverted it to "strip nothing" and persistDialPlan() then wrote
+					// that stale value to NVS, where it survived a reboot. Since
+					// re-POSTing a pattern is the only way to edit a rule, this hit
+					// the normal editing path, not a corner case.
+					existing.stripDigits = rule.stripDigits;
 					return true;
 				}
 			}
