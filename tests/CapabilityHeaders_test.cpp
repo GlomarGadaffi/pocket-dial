@@ -475,15 +475,15 @@ TEST(CapabilityHeaders, APassedThroughReinviteGetsNoPbxSideRetransmitTimer)
 
 	const std::string callerIp = "192.168.41.40";
 	const std::string calleeIp = "192.168.41.41";
-	handler.handle(makeRegister("440", callerIp, "reg-440"));
+	handler.handle(makeRegister("450", callerIp, "reg-450"));
 	handler.handle(makeRegister("441", calleeIp, "reg-441"));
-	handler.handle(makeInvite("440", "441", callerIp, "hold-cap"));
+	handler.handle(makeInvite("450", "441", callerIp, "hold-cap"));
 	{
 		const std::string body = sdpBody(calleeIp, 40000);
 		const std::string raw =
 			"SIP/2.0 200 OK\r\n"
 			"Via: SIP/2.0/UDP " + callerIp + ":5060;branch=z9hG4bKihold-cap1\r\n"
-			"From: <sip:440@server>;tag=cthold-cap\r\n"
+			"From: <sip:450@server>;tag=cthold-cap\r\n"
 			"To: <sip:441@server>;tag=calleetag\r\n"
 			"Call-ID: hold-cap\r\n"
 			"CSeq: 1 INVITE\r\n"
@@ -501,11 +501,11 @@ TEST(CapabilityHeaders, APassedThroughReinviteGetsNoPbxSideRetransmitTimer)
 		const std::string raw =
 			"INVITE sip:441@server SIP/2.0\r\n"
 			"Via: SIP/2.0/UDP " + callerIp + ":5060;branch=z9hG4bKhold2\r\n"
-			"From: <sip:440@server>;tag=cthold-cap\r\n"
+			"From: <sip:450@server>;tag=cthold-cap\r\n"
 			"To: <sip:441@server>;tag=calleetag\r\n"
 			"Call-ID: hold-cap\r\n"
 			"CSeq: 2 INVITE\r\n"
-			"Contact: <sip:440@" + callerIp + ":5060>\r\n"
+			"Contact: <sip:450@" + callerIp + ":5060>\r\n"
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(callerIp)));
