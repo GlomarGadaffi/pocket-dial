@@ -75,7 +75,7 @@ Cross-references:
 | Call forward | CFU / CFB / CFNA, per extension | `PbxFeatureConfig` |
 | Per-extension DND | | `PbxFeatureConfig` |
 | BLF / presence | `SUBSCRIBE`/`NOTIFY`, **`dialog` event package only** (RFC 4235). No `presence`, no `message-summary`/MWI. | `BlfSubscriptions.cpp:132` |
-| DTMF via SIP INFO + star codes | `*60`, `*72`, `*73`, `*80`, `*69`, `*11`, plus the `*PIN#code` admin menu | `DtmfFeatureCodes.cpp` |
+| DTMF star codes | `*60`, `*72`, `*73`, `*80`, `*69`, `*11`, plus the `*PIN#code` admin menu. Digits arrive over **SIP INFO** (RFC 6086) on any call, and over **RFC 4733** telephone-event on a leg the board itself terminates (888 conference, 555/anchor). RFC 4733 cannot work on an ordinary extension-to-extension call: that RTP is peer-to-peer and never reaches this board. | `DtmfFeatureCodes.cpp`, `RtpReceiver::dispatchDtmf` |
 | Bounded dial plan | ordered `pattern → group\|page\|park\|trunk`, first match wins, cap `POCKETDIAL_MAX_DIAL_RULES` = 16 | `DialPlan.hpp` |
 | Inbound DID → extension | literal route-DN match, cap 8; unmapped falls back to ring-all | `DidMapping.*` |
 | CDR ring + `GET /api/cdr` | in-memory, bounded, wiped by factory reset | `CdrRing.*` |
