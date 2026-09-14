@@ -1,0 +1,110 @@
+{
+  "version": "v1.5.0-beta.2",
+  "variants": {
+    "esp32s3-display": {
+      "name": "esp32s3-display",
+      "flash": {
+        "size": "16MB",
+        "mode": "dio",
+        "freq": "80m"
+      },
+      "parts": [
+        {
+          "offset": 0,
+          "file": "bootloader-esp32s3-display.bin",
+          "role": "bootloader",
+          "size": 22576
+        },
+        {
+          "offset": 32768,
+          "file": "partition-table-esp32s3-display.bin",
+          "role": "partition-table",
+          "size": 3072
+        },
+        {
+          "offset": 61440,
+          "file": "ota_data_initial-esp32s3-display.bin",
+          "role": "ota-data",
+          "size": 8192
+        },
+        {
+          "offset": 131072,
+          "file": "SipServer-esp32s3-display.bin",
+          "role": "app",
+          "size": 2382288
+        }
+      ],
+      "cfgseed_offset": 16773120
+    },
+    "esp32s3-eth": {
+      "name": "esp32s3-eth",
+      "flash": {
+        "size": "16MB",
+        "mode": "dio",
+        "freq": "80m"
+      },
+      "parts": [
+        {
+          "offset": 0,
+          "file": "bootloader-esp32s3-eth.bin",
+          "role": "bootloader",
+          "size": 22576
+        },
+        {
+          "offset": 32768,
+          "file": "partition-table-esp32s3-eth.bin",
+          "role": "partition-table",
+          "size": 3072
+        },
+        {
+          "offset": 61440,
+          "file": "ota_data_initial-esp32s3-eth.bin",
+          "role": "ota-data",
+          "size": 8192
+        },
+        {
+          "offset": 131072,
+          "file": "SipServer-esp32s3-eth.bin",
+          "role": "app",
+          "size": 1863008
+        }
+      ],
+      "cfgseed_offset": 16773120
+    },
+    "esp32s3-wifi": {
+      "name": "esp32s3-wifi",
+      "flash": {
+        "size": "16MB",
+        "mode": "dio",
+        "freq": "80m"
+      },
+      "parts": [
+        {
+          "offset": 0,
+          "file": "bootloader-esp32s3-wifi.bin",
+          "role": "bootloader",
+          "size": 22576
+        },
+        {
+          "offset": 32768,
+          "file": "partition-table-esp32s3-wifi.bin",
+          "role": "partition-table",
+          "size": 3072
+        },
+        {
+          "offset": 61440,
+          "file": "ota_data_initial-esp32s3-wifi.bin",
+          "role": "ota-data",
+          "size": 8192
+        },
+        {
+          "offset": 131072,
+          "file": "SipServer-esp32s3-wifi.bin",
+          "role": "app",
+          "size": 2080048
+        }
+      ],
+      "cfgseed_offset": 16773120
+    }
+  }
+}
