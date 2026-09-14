@@ -134,6 +134,43 @@ TEST(HoldMusic, RejectsWrongFormatLoudlyRatherThanPlayingNoise)
     EXPECT_FALSE(HoldMusic::parseUlawWav(stereo.data(), stereo.size(), off, len));
 }
 
+TEST(HoldMusic, ParsesFromAHeaderPrefixWithTheAudioStillOnDisk)
+{
+    // THE REGRESSION. loadClip() reads only ~1 KB to validate the format BEFORE
+    // allocating megabytes for a file that might turn out to be 44.1 kHz stereo.
+    // The data chunk's payload is then legitimately outside the buffer, and an
+    // earlier bounds check that required it to be resident rejected every real
+    // clip -- an 800 KB upload came back 422 "not 8 kHz mono mu-law" for a file
+    // that was exactly that. Only whole-file fixtures were tested, so nothing
+    // caught it until hardware did.
+    const auto whole = makeUlawWav(8000, 1, 819625);   // a real ~102 s clip
+    ASSERT_GT(whole.size(), 1024u);
+
+    size_t off = 0, len = 0;
+    ASSERT_TRUE(HoldMusic::parseUlawWav(whole.data(), 1024, off, len))
+        << "must parse from a header prefix -- the payload is read separately";
+    EXPECT_EQ(len, 819625u) << "declared data length, not what fits in the prefix";
+    EXPECT_LT(off, 1024u)   << "the data chunk header itself must be inside the prefix";
+}
+
+TEST(HoldMusic, StillRejectsAMalformedChunkThatOverrunsTheBuffer)
+{
+    // The prefix allowance above applies to `data` ONLY. Any other chunk has to be
+    // stepped OVER, so it must be fully present -- otherwise a bogus size field
+    // would walk the parser off the end of the buffer.
+    auto wav = makeUlawWav(8000, 1, 320);
+    // Corrupt the fmt chunk's size to something enormous.
+    const std::string needle = "fmt ";
+    auto it = std::search(wav.begin(), wav.end(), needle.begin(), needle.end());
+    ASSERT_NE(it, wav.end());
+    const size_t szPos = size_t(it - wav.begin()) + 4;
+    wav[szPos + 0] = 0xFF; wav[szPos + 1] = 0xFF;
+    wav[szPos + 2] = 0xFF; wav[szPos + 3] = 0x7F;
+
+    size_t off = 0, len = 0;
+    EXPECT_FALSE(HoldMusic::parseUlawWav(wav.data(), wav.size(), off, len));
+}
+
 TEST(HoldMusic, RejectsTruncatedAndNonRiffInput)
 {
     size_t off = 0, len = 0;

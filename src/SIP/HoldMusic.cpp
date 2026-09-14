@@ -64,9 +64,24 @@ bool HoldMusic::parseUlawWav(const uint8_t* data, size_t len,
 		const uint32_t sz = rd32(data + pos + 4);
 		const size_t body = pos + 8;
 
-		// A chunk claiming to run past the buffer is a malformed/truncated file.
-		// Stop rather than trusting the size — this is parsing a file that arrived
-		// from outside, so it gets the same bounded treatment as anything on the wire.
+		// `data` is handled BEFORE the bounds check below, and deliberately so.
+		// Callers parse a HEADER PREFIX — loadClip() reads ~1 KB to validate the
+		// format before allocating megabytes for a file that might be 44.1 kHz
+		// stereo. The data chunk's payload is then legitimately outside the buffer,
+		// so requiring it to be resident rejected every real clip. All we need from
+		// this chunk is its offset and declared length; the caller clamps that
+		// against the true file size.
+		if (std::memcmp(id, "data", 4) == 0)
+		{
+			dataOff = body;
+			dataLen = sz;
+			break;          // nothing after data matters to us
+		}
+
+		// Every OTHER chunk we must be able to step OVER, so it does have to be
+		// fully present. A chunk claiming to run past the buffer is malformed or
+		// truncated: stop rather than trusting the size, since this is a file that
+		// arrived from outside.
 		if (sz > len || body + sz > len) break;
 
 		if (std::memcmp(id, "fmt ", 4) == 0)
@@ -86,12 +101,6 @@ bool HoldMusic::parseUlawWav(const uint8_t* data, size_t len,
 			if (bits != 8)                  return false;
 			haveFmt = true;
 		}
-		else if (std::memcmp(id, "data", 4) == 0)
-		{
-			dataOff = body;
-			dataLen = sz;
-		}
-
 		// Chunks are word-aligned: an odd size carries a pad byte that is not
 		// counted in the size field.
 		pos = body + sz + (sz & 1u);
@@ -99,7 +108,9 @@ bool HoldMusic::parseUlawWav(const uint8_t* data, size_t len,
 
 	if (!haveFmt || dataLen == 0) return false;
 
-	// One whole tick minimum, or the pacing task has nothing to send.
+	// One whole tick minimum, or the pacing task has nothing to send. Checked
+	// against the DECLARED length; loadClip() re-checks what it actually read,
+	// since a truncated file can declare more than it carries.
 	if (dataLen < BYTES_PER_TICK) return false;
 
 	outOffset = dataOff;
