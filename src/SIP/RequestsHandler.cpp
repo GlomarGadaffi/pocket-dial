@@ -2072,7 +2072,15 @@ bool RequestsHandler::startMohPreview(const std::string& extension)
 		return false;
 	}
 	inv->syncContentLength();
-	_outbox.emplace_back(addr, std::move(inv));
+	// _asyncOutbox, NOT _outbox: this runs on the HTTP task, off the SIP receive
+	// thread. handle()/tick() clear _outbox at the START of every pass, so an
+	// INVITE queued there from here is wiped before anything drains it -- the
+	// phone never rings while the API cheerfully reports "ringing". Found on
+	// hardware: /api/moh/preview returned 200 and the SIP trace showed no INVITE
+	// at all, only REGISTER/OPTIONS traffic. drainOutbox() merges _asyncOutbox
+	// first, so the next tick() flushes this. Same rule as the CallEvent
+	// callback's fork at :2932.
+	_asyncOutbox.emplace_back(addr, std::move(inv));
 	queueLog("MoH preview: ringing " + extension);
 	return true;
 }
@@ -2142,6 +2150,9 @@ void RequestsHandler::stopMohPreview()
 
 void RequestsHandler::stopMohPreviewLocked()
 {
+	// Every send below goes to _asyncOutbox for the same reason startMohPreview's
+	// INVITE does: both callers (stopMohPreview, and startMohPreview replacing an
+	// existing preview) run on the HTTP task, not the SIP receive thread.
 	if (!_mohPreview.active) return;
 
 	// Only BYE a dialog they actually answered — a To-tag is the proof. BYEing a
@@ -2163,7 +2174,7 @@ void RequestsHandler::stopMohPreviewLocked()
 		   << "Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n";
 		if (auto bye = getMessageFromPool(ss.str(), _mohPreview.addr))
 		{
-			_outbox.emplace_back(_mohPreview.addr, std::move(bye));
+			_asyncOutbox.emplace_back(_mohPreview.addr, std::move(bye));
 		}
 	}
 	else
@@ -2181,7 +2192,7 @@ void RequestsHandler::stopMohPreviewLocked()
 		   << "Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n";
 		if (auto c = getMessageFromPool(ss.str(), _mohPreview.addr))
 		{
-			_outbox.emplace_back(_mohPreview.addr, std::move(c));
+			_asyncOutbox.emplace_back(_mohPreview.addr, std::move(c));
 		}
 	}
 
