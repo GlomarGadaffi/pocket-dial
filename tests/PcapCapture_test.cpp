@@ -487,6 +487,9 @@ TEST(PcapCapture, PcapFileStaysInCaptureOrderAfterWrap) {
 // containing a raw control byte must not break the JSON response — jsonEscape()
 // in HttpServer.cpp must escape every C0 control byte (RFC 8259 §7), not just
 // the five with named escapes (\", \\, \n, \r, \t).
+//
+// Ports: this file owns 18115-18119 (issue #213 — every HTTP test file gets
+// a disjoint block; see CONTRIBUTING_FIRMWARE.md for the full table).
 TEST(PcapCapture, ApiTraceEscapesRawControlBytesFromWireCapture)
 {
 	// /api/trace requires a logged-in session (requireAdmin) -- go straight to
@@ -499,7 +502,7 @@ TEST(PcapCapture, ApiTraceEscapesRawControlBytesFromWireCapture)
 
 	RequestsHandler handler("127.0.0.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18095, nullptr);
+	HttpServer server("127.0.0.1", 18115, nullptr);
 	server.attachHandler(&handler);
 	server.start();
 
@@ -521,7 +524,7 @@ TEST(PcapCapture, ApiTraceEscapesRawControlBytesFromWireCapture)
 	ASSERT_TRUE(request != nullptr);
 	handler.handle(request, raw);
 
-	const std::string resp = httpGetRaw(18095, "/api/trace", sessionCookie);
+	const std::string resp = httpGetRaw(18115, "/api/trace", sessionCookie);
 	ASSERT_NE(resp.find("200"), std::string::npos) << "expected a 200 OK, got: " << resp;
 
 	size_t bodyStart = resp.find("\r\n\r\n");
@@ -554,15 +557,15 @@ TEST(PcapCapture, ApiDiagnosticsPcapServesValidGlobalHeaderAndOneRecordOverRealS
 
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18096, nullptr);
+	HttpServer server("127.0.0.1", 18116, nullptr);
 	server.attachHandler(&handler);
 	server.start();
 
-	for (int i = 0; i < 50 && !canConnect(18096); ++i)
+	for (int i = 0; i < 50 && !canConnect(18116); ++i)
 	{
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
-	ASSERT_TRUE(canConnect(18096));
+	ASSERT_TRUE(canConnect(18116));
 
 	const sockaddr_in src = addr("192.168.4.80", 5060);
 	const std::string raw =
@@ -576,7 +579,7 @@ TEST(PcapCapture, ApiDiagnosticsPcapServesValidGlobalHeaderAndOneRecordOverRealS
 		"Content-Length: 0\r\n\r\n";
 	handler.handle(RequestsHandler::getMessageFromPool(raw, src));
 
-	const std::string resp = httpGetRaw(18096, "/api/diagnostics/pcap", sessionCookie);
+	const std::string resp = httpGetRaw(18116, "/api/diagnostics/pcap", sessionCookie);
 	ASSERT_NE(resp.find("200"), std::string::npos) << resp;
 	ASSERT_NE(resp.find("application/vnd.tcpdump.pcap"), std::string::npos) << resp;
 	ASSERT_NE(resp.find("Content-Disposition: attachment"), std::string::npos) << resp;

@@ -242,6 +242,37 @@ ctest --test-dir build/tests --output-on-failure
   them on Windows triggers firewall authorisation prompts.
 * Keep the count in this section current when you add or remove cases.
 
+### HTTP test ports: pick from a disjoint block, never a bare literal
+
+Every test file that opens a real `HttpServer` binds a **fixed TCP port block
+that no other test file uses.** This was not always true (issue #213): six
+ports were each bound by two or three different files, and a listener that
+outlived its test — an orphaned process from a killed run, two worktrees
+running the suite at once, `TIME_WAIT` — failed an unrelated file's tests with
+a message that named the port, not the actual cause. Two separate agents lost
+time to this before finding the orphan rather than a real regression.
+
+Current allocation:
+
+| Block | File |
+| :-- | :-- |
+| `18080`-`18099` | `AdminHttpGate_test.cpp` |
+| `18100`-`18109` | `DialPlan_test.cpp` |
+| `18110`-`18114` | `MetricsEndpoint_test.cpp` |
+| `18115`-`18119` | `PcapCapture_test.cpp` |
+| `18120`-`18124` | `HttpTraceCommand_test.cpp` |
+| `18125`-`18129` | `ServiceExtensions_test.cpp` |
+| `19100`+ | `TelephonyConfigHttp_test.cpp` (auto-incrementing `_nextPort`) |
+| `193xx` | `ApiKillParse_test.cpp` (auto-incrementing `_nextPort`) |
+
+**Adding a new HTTP test file:** claim the next unused `181xx`/`182xx`
+ten-port block (or extend an existing file's block if you're adding tests to
+it), add a row to this table, and drop a one-line comment at the top of the
+file naming the block. Prefer the auto-incrementing `_nextPort` pattern
+(`ApiKillParse_test.cpp`, `TelephonyConfigHttp_test.cpp`) over a fresh set of
+bare literals when the file has more than a couple of `HttpServer` instances —
+it removes the "did I reuse a number" question entirely.
+
 ### ~~The `AdminHttpGate_test` trap~~ — removed, and this section described deleted behaviour
 
 This section used to warn that provisioning a PIN made the listen socket "dark by

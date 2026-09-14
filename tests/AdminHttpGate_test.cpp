@@ -11,6 +11,10 @@
 // (AdminAuth::kDefaultUsername/kDefaultPassword) that works until
 // setLoginCredential() is called, and a separate DTMF admin PIN with no
 // default at all (see the AdminAuth-suite tests below).
+//
+// Ports: this file owns 18080-18099. Issue #213: every HTTP test file owns a
+// disjoint block so a lingering listener from one file can only ever fail its
+// own tests. See CONTRIBUTING_FIRMWARE.md for the full table.
 
 #include <gtest/gtest.h>
 #include "HttpServer.hpp"

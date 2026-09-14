@@ -422,6 +422,8 @@ namespace
 	}
 }
 
+// Ports: this file owns 18125-18129 (issue #213 — every HTTP test file gets
+// a disjoint block; see CONTRIBUTING_FIRMWARE.md for the full table).
 TEST(ServiceExtensionsHttp, EveryAdminConfigRouteRefusesAServiceName)
 {
 	// The dashboard's PD_RESERVED_EXT map is a courtesy; these five routes are the
@@ -431,7 +433,7 @@ TEST(ServiceExtensionsHttp, EveryAdminConfigRouteRefusesAServiceName)
 
 	RequestsHandler handler("192.168.23.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18097, nullptr);
+	HttpServer server("127.0.0.1", 18125, nullptr);
 	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -441,24 +443,24 @@ TEST(ServiceExtensionsHttp, EveryAdminConfigRouteRefusesAServiceName)
 	const std::string csrf   = AdminAuth::sessionCsrf(token);
 	const std::string cookie = "pd_session=" + token;
 
-	EXPECT_EQ(svcStatusOf(svcHttpSend(18097, "POST", "/api/dialplan",
+	EXPECT_EQ(svcStatusOf(svcHttpSend(18125, "POST", "/api/dialplan",
 		"pattern=pbx&action=group&target=610", cookie, csrf)), 400);
-	EXPECT_EQ(svcStatusOf(svcHttpSend(18097, "POST", "/api/group",
+	EXPECT_EQ(svcStatusOf(svcHttpSend(18125, "POST", "/api/group",
 		"extension=moh&members=101,102&mode=ringall", cookie, csrf)), 400);
-	EXPECT_EQ(svcStatusOf(svcHttpSend(18097, "POST", "/api/dnd",
+	EXPECT_EQ(svcStatusOf(svcHttpSend(18125, "POST", "/api/dnd",
 		"extension=server&on=1", cookie, csrf)), 400);
-	EXPECT_EQ(svcStatusOf(svcHttpSend(18097, "POST", "/api/forward",
+	EXPECT_EQ(svcStatusOf(svcHttpSend(18125, "POST", "/api/forward",
 		"extension=pbx&trigger=always&target=101", cookie, csrf)), 400);
-	EXPECT_EQ(svcStatusOf(svcHttpSend(18097, "POST", "/api/forward",
+	EXPECT_EQ(svcStatusOf(svcHttpSend(18125, "POST", "/api/forward",
 		"extension=101&trigger=noanswer&target=moh", cookie, csrf)), 400)
 		<< "a forward TARGET the engine cannot deliver to must be refused too";
-	EXPECT_EQ(svcStatusOf(svcHttpSend(18097, "PUT", "/api/did-mapping",
+	EXPECT_EQ(svcStatusOf(svcHttpSend(18125, "PUT", "/api/did-mapping",
 		"did=13055551234&extension=moh", cookie, csrf)), 400);
 
 	// Not vacuous: the same routes still accept an ordinary extension.
-	EXPECT_EQ(svcStatusOf(svcHttpSend(18097, "POST", "/api/dialplan",
+	EXPECT_EQ(svcStatusOf(svcHttpSend(18125, "POST", "/api/dialplan",
 		"pattern=4XX&action=group&target=610", cookie, csrf)), 200);
-	EXPECT_EQ(svcStatusOf(svcHttpSend(18097, "POST", "/api/forward",
+	EXPECT_EQ(svcStatusOf(svcHttpSend(18125, "POST", "/api/forward",
 		"extension=101&trigger=always&target=102", cookie, csrf)), 200);
 
 	AdminAuth::clearCredential();
