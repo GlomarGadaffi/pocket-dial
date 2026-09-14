@@ -81,6 +81,91 @@ namespace AdminAuth
 	// what keeps the D-3 self-DoS from coming back with it.
 	constexpr int      kMaxFailedAttemptsGlobal = 20;
 
+	// --- Issue #173: two-role privilege model ---
+	//
+	// "admin_*"/kDefaultUsername stays the SYSOP principal (unchanged identity
+	// and wire behavior — every existing call site and test that authenticates
+	// as "admin" keeps meaning "sysop"). A second, independent principal
+	// ("owner_*") is layered on top: same PBKDF2 derivation, its own salt/hash/
+	// username, persisted the same way. A session now carries a resolved Role
+	// rather than being a bare yes/no.
+	//
+	// NO-OWNER FALLBACK: until an owner credential is ever set, a sysop session
+	// satisfies an owner-gated action too (see sessionSatisfiesRole()) — see
+	// that function's comment for why this is load-bearing, not a shortcut.
+	//
+	// THE OWNER SECRET IS NOT SOFTWARE-RECOVERABLE. There is no "forgot owner
+	// password" flow, and no way to read one back once set (same as the
+	// sysop credential and the DTMF PIN — see hashSecret()'s one-way
+	// salted-iterated-SHA-256 storage). If the owner credential AND the DTMF
+	// admin PIN are both lost, the only way back in is a factory reflash
+	// with physical/USB access. This is a deliberate floor, not a gap: an
+	// owner privilege that could be recovered over the network would not be
+	// a meaningfully stronger boundary than the single sysop credential
+	// this feature replaces.
+	enum class Role : uint8_t
+	{
+		None  = 0,   // no session / expired / never authenticated
+		Sysop = 1,
+		Owner = 2,
+	};
+
+	// True iff an owner credential has ever been set (setOwnerCredential()).
+	bool isOwnerProvisioned();
+
+	// Set/replace the OWNER login credential. Same length/charset validation as
+	// setLoginCredential(); additionally rejects a username identical to the
+	// current sysop (admin_*) username — the two principals must be
+	// distinguishable, both so a login attempt can be attributed to the right
+	// lockout bucket (see authenticate()) and so "which one did I just log in
+	// as" is never ambiguous to the operator. Returns false on any rejection
+	// (nothing is changed) or persistence failure.
+	bool setOwnerCredential(const std::string& username, const std::string& password);
+
+	// Constant-time credential check that resolves to a ROLE rather than a
+	// bool. `username` selects the principal to check against: if an owner
+	// credential is set and `username` matches the owner's, this verifies
+	// against the owner secret; otherwise it verifies against the sysop
+	// secret (including the compiled-in default before setLoginCredential()
+	// has ever run — identical to verifyCredential()'s pre-provisioning
+	// branch). Returns Role::None on any failure. Brute-force accounting is
+	// keyed on (clientKey, resolved-principal) — see the .cpp — so spraying
+	// one principal's password cannot lock the other principal out, and the
+	// aggregate backstop is tracked per principal for the same reason.
+	//
+	// This is the primary HTTP login path (sendApiAdminLogin) going forward.
+	// verifyCredential() below is kept, UNCHANGED, purely so existing sysop-
+	// only callers/tests keep working without churn — it does not know about
+	// the owner principal at all.
+	Role authenticate(const std::string& username, const std::string& password,
+		const std::string& clientKey);
+
+	// True while the (clientKey, principal-resolved-from-username) bucket
+	// authenticate() would use is in cooldown — resolves the principal the
+	// same way authenticate() does, WITHOUT hashing or accounting an attempt.
+	// Mirrors isLockedOut(clientKey)'s role for verifyCredential(): a caller
+	// checks this before paying the hash cost, and again afterward (once
+	// authenticate() may have just engaged the lockout) to tell "wrong
+	// credential" apart from "the cooldown just started" for the HTTP status
+	// it sends back.
+	bool isLockedOutForAuth(const std::string& username, const std::string& clientKey);
+
+	// The role bound to a live session, or Role::None if the token is
+	// unknown/expired. Read-only (does not slide expiry), same contract as
+	// sessionCsrf().
+	Role sessionRole(const std::string& token);
+
+	// True iff a session with role `sessionRole(token)` may perform an action
+	// gated at `need`. Owner-gated actions (`need == Role::Owner`) ALSO admit a
+	// Sysop session, but ONLY while isOwnerProvisioned() is false: without this,
+	// every already-deployed single-credential board would lose factory-reset,
+	// OTA upload and the encrypted config-export block from its OWN dashboard
+	// the instant it upgrades to this firmware, with no owner account yet to
+	// grant them back. Once an owner exists, this floor closes — only an Owner
+	// session satisfies an Owner gate from then on. Sysop-gated actions
+	// (`need == Role::Sysop`) admit either role, since Owner is a superset.
+	bool sessionSatisfiesRole(const std::string& token, Role need);
+
 	// True iff a REAL (operator-set, non-default) login credential is stored.
 	// False on a freshly-flashed device, and again immediately after
 	// clearCredential() — in both cases kDefaultUsername/kDefaultPassword is
@@ -141,7 +226,10 @@ namespace AdminAuth
 	// Create a new server-side session and return its opaque random token
 	// (kSessionTokenHex hex chars). Evicts the oldest/expired entry if the table
 	// is full. Returns an empty string only on catastrophic RNG failure.
-	std::string createSession();
+	// `role` defaults to Sysop so every pre-existing call site (this codebase's
+	// tests call createSession() with no argument in several files) keeps its
+	// old meaning exactly.
+	std::string createSession(Role role = Role::Sysop);
 
 	// True iff the token names a live (non-expired) session.
 	bool validateSession(const std::string& token);
@@ -182,6 +270,56 @@ namespace AdminAuth
 	// On non-ESP (host) builds this delegates to isProvisioned() so the host
 	// unit tests exercise the same code path.
 	bool credentialIsSet();
+
+	// --- Issue #186: password-based sealing for the config-export "secrets_enc"
+	// block. Self-contained (no external crypto dependency), for the same
+	// portability reason as the SHA-256 above: host and ESP must derive
+	// byte-identical output from the same inputs. NOT a general crypto toolkit —
+	// sized and shaped for exactly this one use (a few KB of JSON, encrypted
+	// once, decrypted once), not for streaming or reuse elsewhere. ---
+
+	constexpr size_t kAesKeyBytes   = 32;  // AES-256
+	constexpr size_t kGcmNonceBytes = 12;  // 96-bit — the GCM-recommended size,
+	                                       // the only size this implementation
+	                                       // supports (no generic-length IV path)
+	constexpr size_t kGcmTagBytes   = 16;  // 128-bit authentication tag
+	constexpr size_t kKdfSaltBytes  = 16;
+	// Iteration count for the export/import KDF. Higher than AdminAuth's own
+	// kHashIterations (50000): this key protects a whole config backup — every
+	// extension secret and trunk credential on the device — offline, with no
+	// online lockout to slow a guesser down, so it earns a larger stretch cost.
+	constexpr uint32_t kExportKdfIterations = 200000;
+
+	// Fills `len` bytes with cryptographically-strong randomness (the hardware
+	// CSPRNG on ESP, std::random_device-seeded on host — the exact same source
+	// randomHex() already uses internally for session tokens/salts). Exposed
+	// so a caller sealing a config-export block can generate its own KDF salt
+	// and GCM nonce without duplicating the ESP-vs-host RNG selection this
+	// file already has to make for its own salts.
+	void secureRandomBytes(uint8_t* buf, size_t len);
+
+	// PBKDF2-HMAC-SHA256 (RFC 8018). Writes exactly `dkLen` bytes to `out`.
+	// Returns false only on a degenerate call (iterations == 0 or dkLen == 0);
+	// any valid input succeeds. Pure function — no shared state, safe to call
+	// off any thread.
+	bool pbkdf2Sha256(const std::string& password, const uint8_t* salt, size_t saltLen,
+		uint32_t iterations, uint8_t* out, size_t dkLen);
+
+	// AES-256-GCM seal: encrypts `plaintext` under `key`/`nonce`, authenticating
+	// `aad` alongside it without encrypting it. Appends the kGcmTagBytes
+	// authentication tag to `outCiphertext`, so on return
+	// outCiphertext.size() == plaintext.size() + kGcmTagBytes.
+	void aesGcmSeal(const uint8_t key[kAesKeyBytes], const uint8_t nonce[kGcmNonceBytes],
+		const std::string& aad, const std::string& plaintext, std::string& outCiphertext);
+
+	// AES-256-GCM open: verifies the tag and, only if it matches, decrypts.
+	// `ciphertextAndTag` must be at least kGcmTagBytes long. Returns false
+	// (leaving `outPlaintext` untouched) on ANY authentication failure — a
+	// wrong password and a tampered/truncated blob are deliberately
+	// indistinguishable to the caller; nothing is ever returned from an
+	// unauthenticated buffer.
+	bool aesGcmOpen(const uint8_t key[kAesKeyBytes], const uint8_t nonce[kGcmNonceBytes],
+		const std::string& aad, const std::string& ciphertextAndTag, std::string& outPlaintext);
 }
 
 #endif // ADMIN_AUTH_HPP
