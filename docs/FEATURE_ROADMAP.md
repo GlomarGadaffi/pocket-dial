@@ -75,6 +75,7 @@ Cross-references:
 | Call forward | CFU / CFB / CFNA, per extension | `PbxFeatureConfig` |
 | Per-extension DND | | `PbxFeatureConfig` |
 | BLF / presence | `SUBSCRIBE`/`NOTIFY`, **`dialog` event package only** (RFC 4235). No `presence`, no `message-summary`/MWI. | `BlfSubscriptions.cpp:132` |
+| Outbound email (SMTP client) | Issue #159 Phase 1: generic SMTP client over `esp_tls` (implicit TLS/STARTTLS/plain-LAN-relay, `AUTH PLAIN`/`LOGIN`/`XOAUTH2`, streaming DATA writer), configured at `/setup/email`. Gmail App Password and Google Workspace service-account (domain-wide delegation, RS256 JWT) paths. Standalone -- its own "Send test message" is the only consumer; **no voicemail store to send FROM yet** (see §5's Voicemail non-goal and the MWI row above). | `src/Helpers/SmtpDialogue.*`, `SmtpClient.*`, `GoogleServiceAuth.*`, `EmailConfigStore.*` |
 | DTMF via SIP INFO + star codes | `*60`, `*72`, `*73`, `*80`, `*69`, `*11`, plus the `*PIN#code` admin menu | `DtmfFeatureCodes.cpp` |
 | Bounded dial plan | ordered `pattern → group\|page\|park\|trunk`, first match wins, cap `POCKETDIAL_MAX_DIAL_RULES` = 16 | `DialPlan.hpp` |
 | Inbound DID → extension | literal route-DN match, cap 8; unmapped falls back to ring-all | `DidMapping.*` |

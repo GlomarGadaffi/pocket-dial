@@ -40,6 +40,7 @@
 #include "DnsServer.hpp"
 #include "DeviceConfig.hpp"
 #include "IPHelper.hpp"
+#include "SmtpClient.hpp"
 #include "host_compat.h"
 
 static const char *TAG = "main_display";
@@ -804,6 +805,13 @@ extern "C" void app_main(void) {
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
         esp_wifi_set_ps(WIFI_PS_NONE);
     }
+
+    // ── Email (issue #159): start the SMTP worker task ──────────────────────
+    // Before the STATION/Standalone-AP/captive-portal branch below, since all
+    // three paths stand up a dashboard that can reach /api/email*, and
+    // init() only creates the queue/task -- it does not touch the network,
+    // so it does not need to wait for any of those branches to resolve.
+    SmtpClient::init();
 
     // Onboarding model: "up usable, secure later" — the device is NEVER held dark
     // waiting for an admin credential. It boots straight into its normal network role

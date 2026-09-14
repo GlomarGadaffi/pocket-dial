@@ -110,6 +110,16 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # on a 2048-byte stack and send()'s frame buffer would
                             # not fit, so wiring it needs a stack bump first.
                             "../src/Helpers/Syslog.cpp"
+                            # Issue #159: SMTP client. SmtpDialogue is the pure protocol
+                            # engine; SmtpClient is the real transport (esp_tls) + bounded
+                            # single-worker send queue; EmailConfigStore persists the
+                            # "pbxcfg" config; GoogleServiceAuth signs the RS256 JWT and
+                            # fetches the XOAUTH2 token for the Workspace service-account
+                            # (domain-wide delegation) path.
+                            "../src/Helpers/SmtpDialogue.cpp"
+                            "../src/Helpers/SmtpClient.cpp"
+                            "../src/Helpers/EmailConfigStore.cpp"
+                            "../src/Helpers/GoogleServiceAuth.cpp"
                             "../src/SIP/SipMessagePool.cpp"
                             "../src/SIP/PbxFeatureConfig.cpp"
                             "../src/SIP/CdrRing.cpp"
@@ -152,7 +162,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/mix_kernels_scalar.cpp"
                             "../src/SIP/ConferenceRoom.cpp"
                     INCLUDE_DIRS "../src/Helpers" "../src/SIP" "drivers" "ui" "wifi"
-                    REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns app_update esp_driver_ledc console esp_timer esp_websocket_client esp_http_client cjson mbedtls ${EXTRA_REQUIRES}
+                    REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns app_update esp_driver_ledc console esp_timer esp_websocket_client esp_http_client cjson mbedtls esp-tls ${EXTRA_REQUIRES}
                     PRIV_REQUIRES esp_wifi)
 
 # Issue #49: the display transport reserves Core 1 for the LVGL graphics task and

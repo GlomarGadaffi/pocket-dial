@@ -486,6 +486,43 @@ session cookie, and the MAC is the credential.
 * **The Yealink key set has never been confirmed against a physical handset.** Treat a
   `200` as "the route served bytes", not as "a phone would accept them".
 
+### 3.17 GET `/setup/email`
+Issue #159 (Phase 1). Standalone SMTP-configuration page — own document, not part of the
+`/` dashboard SPA (see `index_html.h`'s `PD_HTML_8`). Ungated shell, same class as `/`
+itself: renders no configuration on its own, fetches everything from the gated
+`GET /api/email` client-side. `200` always.
+
+### 3.18 GET/POST `/api/email`, POST `/api/email/test`
+The SMTP client's config surface. `GET` redacts both secrets (`hasPassword`/`hasGsaKey`
+booleans, never the values — the #207 class, see `API.md`). `POST`'s `pass`/`gsaKey`/
+`caPem` keep the stored value when submitted empty. `POST /api/email/test` sends a real
+message through `SmtpClient::sendAndWait()` and always answers `200` with the real
+outcome in `ok`/`resultCode`/`smtpReplyCode`/`error` — a failed send is an expected,
+common result to report inline, not a `5xx`. Full schemas, param tables and `curl`
+examples: [`API.md`](API.md)'s `/setup/email`/`/api/email`/`/api/email/test` sections.
+
+**TC-EMAIL-01** GET unauthenticated → `401`. **TC-EMAIL-02** POST unauthenticated → `401`.
+**TC-EMAIL-03** POST cross-origin (with a session cookie, no `X-CSRF`) → `403`.
+**TC-EMAIL-04** POST with `mode`/`auth` set to a value outside the fixed enum → `400`.
+**TC-EMAIL-05** POST with an out-of-range `port` → `400`. **TC-EMAIL-06** Save a
+password, then GET → response body must not contain the literal password anywhere,
+`hasPassword:true`. **TC-EMAIL-07** Save a password, then POST again with `pass=`
+(empty) and a changed `host` → the password is unchanged (verified in-process via
+`EmailConfigStore::load()`, since the HTTP layer never echoes it — there is no other
+way to assert this from outside). **TC-EMAIL-08** POST with `mode` omitting `port` →
+stored port matches the mode's default (465/587/25). **TC-EMAIL-09** Test-send with no
+host configured → `200 {"ok":false,...}`, never a `5xx`. **TC-EMAIL-10** Full round trip
+against a scripted fake SMTP server (loopback, plain mode) → `200 {"ok":true,
+"smtpReplyCode":250}` and the fake server actually received the configured `RCPT TO`.
+
+All ten are implemented as host gtest (`tests/EmailHttp_test.cpp`), not yet as
+`test_api.sh` shell cases — this is a Phase 1 addition and the shell suite was not
+extended in the same PR (the host suite already gives byte-level assertions `curl`-based
+cases can't, e.g. TC-EMAIL-06's "never appears anywhere in the response body" check).
+Extending `test_api.sh` to match, and a live-bench pass (real Gmail App Password /
+Workspace service-account delivery — see `API.md`'s bench-unverified note), are open
+follow-ups.
+
 ---
 
 ## 🧾 4. Security Response Headers (assert on every response)
@@ -692,8 +729,11 @@ login preamble — including setup completion — to have run first.
 
 ## 🖥️ 6. Host Test Suite
 
-The gtest suite that backs all of the above is **506 test cases** (static count of
-`TEST`/`TEST_F`/`TEST_P` in `tests/*.cpp`; the 416 previously quoted here was stale by 90).
+The gtest suite that backs all of the above is **641 test cases** (static count of
+`TEST`/`TEST_F`/`TEST_P` in `tests/*.cpp`; the 506 previously quoted here was stale by
+135 — measured alongside issue #159's own addition; see
+[`CONTRIBUTING_FIRMWARE.md`](../CONTRIBUTING_FIRMWARE.md) §5 for the platform-specific
+run-count gap, currently 639 on Linux/WSL).
 The same three commands CI runs, from a WSL shell:
 
 ```bash

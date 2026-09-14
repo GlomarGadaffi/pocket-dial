@@ -1129,8 +1129,19 @@ function termExec(){
   }else if(cmd==="trace off"){
     if(!traceOn){termEcho(line);termEcho("trace already off.");return;}
     stopTrace(line);
+  }else if(cmd.indexOf("email test")===0){
+    termEcho(line);
+    if(!gateCheck()){termEcho("session required — log in above first.");return;}
+    var addr=raw.trim().slice(10).trim(); // preserve case from raw, past "email test"
+    if(!addr){termEcho("usage: email test <addr>");return;}
+    termEcho("sending test message to "+addr+" (up to 20s)…");
+    post("/api/email/test","to="+encodeURIComponent(addr)).then(function(t){
+      var d;try{d=JSON.parse(t);}catch(e){d={};}
+      if(d.ok)termEcho("sent"+(d.smtpReplyCode?(" (server said "+d.smtpReplyCode+")"):""));
+      else termEcho("failed: "+(d.error||t)+(d.smtpReplyCode?(" (SMTP "+d.smtpReplyCode+")"):""));
+    }).catch(function(e){termEcho("failed: "+e.message);});
   }else if(cmd==="help"||cmd==="?"){
-    termEcho(line);termEcho("commands: trace on, trace off, help");
+    termEcho(line);termEcho("commands: trace on, trace off, email test <addr>, help");
   }else{
     termEcho(line);termEcho("unknown command: "+raw);
   }
@@ -1833,6 +1844,246 @@ setInterval(function(){if($("pbx-modal").classList.contains("show"))fetchMohStat
 </body>
 </html>
 )html7";
+
+// Issue #159 (SMTP client): the standalone /setup/email admin page.
+// Deliberately its OWN top-level document (own <html>/<head>/<body>), served
+// by HttpServer::sendEmailSetupHtml() -- NOT concatenated into the "/" SPA
+// via CGA_INDEX_HTML_PARTS below (this constant is intentionally absent from
+// that array; see this file's own top comment for why growing an existing
+// part isn't an option and PD_HTML_7 is already close to its cap). Reuses
+// the same __PD_CSRF__ substitution convention sendHtml() uses for "/".
+static const char PD_HTML_8[] =
+R"html8(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pocket-Dial Email Setup</title>
+<style>
+:root{--bg:#14100C;--panel:#221B15;--panel2:#2B231C;--ink:#EAE1C8;--ink-dim:#A99A7B;
+--brass:#B08D52;--brass-hi:#D4AF6A;--line:#3a2f24;--ok:#55A374;--bad:#C15C52;--warn:#E8C43D;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;padding:16px}
+.wrap{max-width:640px;margin:0 auto}
+h1{font-size:18px;color:var(--brass-hi);margin:0 0 4px}
+.sub{color:var(--ink-dim);margin:0 0 20px;font-size:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:16px}
+label{display:block;font-size:12px;color:var(--ink-dim);margin:10px 0 4px}
+label:first-child{margin-top:0}
+input[type=text],input[type=password],input[type=number],select,textarea{
+  width:100%;background:var(--bg);border:1px solid var(--line);color:var(--ink);
+  border-radius:4px;padding:8px;font:inherit}
+textarea{min-height:80px;font-family:ui-monospace,Consolas,monospace;font-size:12px;resize:vertical}
+.row{display:flex;gap:10px}
+.row>div{flex:1}
+.hint{font-size:11px;color:var(--ink-dim);margin-top:4px}
+.chk{display:flex;align-items:center;gap:8px;margin:10px 0}
+.chk input{width:auto}
+button{background:var(--brass);color:#14100C;border:none;border-radius:4px;padding:9px 16px;
+  font-weight:600;cursor:pointer;font-size:13px}
+button.sec{background:var(--panel2);color:var(--ink);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:default}
+.actions{display:flex;gap:10px;margin-top:16px}
+.msg{margin-top:12px;padding:10px;border-radius:4px;font-size:12px;display:none;white-space:pre-wrap}
+.msg.ok{display:block;background:rgba(85,163,116,.15);color:var(--ok);border:1px solid var(--ok)}
+.msg.bad{display:block;background:rgba(193,92,82,.15);color:var(--bad);border:1px solid var(--bad)}
+.badge{font-size:10px;padding:2px 6px;border-radius:3px;background:var(--panel2);color:var(--ink-dim)}
+.badge.set{color:var(--ok)}
+details{margin-top:10px}
+summary{cursor:pointer;color:var(--ink-dim);font-size:12px}
+a{color:var(--brass-hi)}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>&#9993; Email (SMTP)</h1>
+  <p class="sub">Outbound mail for test messages and (later) voicemail delivery. <a href="/">&larr; back to dashboard</a></p>
+
+  <div class="card">
+    <label>Provider preset</label>
+    <select id="preset" onchange="applyPreset()">
+      <option value="custom">Custom SMTP server</option>
+      <option value="gmail-app">Gmail — App Password (consumer, 2SV required)</option>
+      <option value="workspace-sa">Google Workspace — Service Account (domain-wide delegation)</option>
+    </select>
+    <div class="hint" id="preset-hint"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div><label>SMTP host</label><input type="text" id="f-host" placeholder="smtp.example.com"></div>
+      <div style="flex:.4"><label>Port</label><input type="number" id="f-port" placeholder="587"></div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Connection</label>
+        <select id="f-mode">
+          <option value="starttls">STARTTLS (587)</option>
+          <option value="tls">Implicit TLS (465)</option>
+          <option value="plain">Plain (25) — LAN relay only</option>
+        </select>
+      </div>
+      <div>
+        <label>Authentication</label>
+        <select id="f-auth" onchange="renderAuthFields()">
+          <option value="none">None</option>
+          <option value="plain">AUTH PLAIN</option>
+          <option value="login">AUTH LOGIN</option>
+          <option value="xoauth2-sa">XOAUTH2 (Workspace service account)</option>
+        </select>
+      </div>
+    </div>
+
+    <div id="userpass-fields">
+      <label>Username</label>
+      <input type="text" id="f-user" placeholder="you@example.com">
+      <label>Password <span class="badge" id="pass-badge">not set</span></label>
+      <input type="password" id="f-pass" placeholder="leave blank to keep the stored password">
+    </div>
+
+    <div id="sa-fields" hidden>
+      <label>Service account email</label>
+      <input type="text" id="f-gsaEmail" placeholder="name@project.iam.gserviceaccount.com">
+      <label>Service account private key (PEM) <span class="badge" id="gsakey-badge">not set</span></label>
+      <textarea id="f-gsaKey" placeholder="leave blank to keep the stored key&#10;-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"></textarea>
+      <div class="hint">Domain-wide delegation must already be authorized in the Workspace admin console for scope <code>https://mail.google.com/</code>. The key is stored as an NVS blob; enabling flash encryption is recommended (see docs).</div>
+    </div>
+
+    <label>From address</label>
+    <input type="text" id="f-from" placeholder="pocketdial@example.com">
+    <label>Default recipient (To)</label>
+    <input type="text" id="f-to" placeholder="ops@example.com">
+
+    <div class="chk">
+      <input type="checkbox" id="f-insecure">
+      <label style="margin:0" for="f-insecure">Skip TLS certificate verification — LAN relay only, never for a real mail provider</label>
+    </div>
+
+    <details>
+      <summary>Advanced: custom server CA certificate <span class="badge" id="ca-badge">not set</span></summary>
+      <label>CA certificate (PEM, optional)</label>
+      <textarea id="f-caPem" placeholder="leave blank to use the built-in certificate bundle"></textarea>
+    </details>
+
+    <div class="actions">
+      <button onclick="saveConfig()">Save settings</button>
+      <button class="sec" onclick="loadConfig()">Reload</button>
+    </div>
+    <div class="msg" id="save-msg"></div>
+  </div>
+
+  <div class="card">
+    <label>Send test message to</label>
+    <input type="text" id="test-to" placeholder="defaults to the recipient above">
+    <div class="actions">
+      <button onclick="sendTest()" id="test-btn">Send test message</button>
+    </div>
+    <div class="msg" id="test-msg"></div>
+  </div>
+</div>
+
+<script>
+var PD_CSRF="__PD_CSRF__";
+function $(id){return document.getElementById(id);}
+function post(url,body){
+  return fetch(url,{method:"POST",credentials:"same-origin",
+    headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF":PD_CSRF},body:body})
+    .then(function(r){
+      if(r.status===401){throw new Error("session expired — log in at the dashboard, then reload this page");}
+      if(r.status===403){throw new Error("rejected (stale security token — reload this page)");}
+      return r.json().catch(function(){return {};}).then(function(d){return {status:r.status,body:d};});
+    });
+}
+function showMsg(id,ok,text){
+  var el=$(id);el.className="msg "+(ok?"ok":"bad");el.textContent=text;
+}
+function qs(k,v){return encodeURIComponent(k)+"="+encodeURIComponent(v==null?"":v);}
+
+function loadConfig(){
+  fetch("/api/email",{credentials:"same-origin"}).then(function(r){
+    if(r.status===401){showMsg("save-msg",false,"log in at the dashboard first, then reload this page");return null;}
+    return r.json();
+  }).then(function(d){
+    if(!d)return;
+    $("f-host").value=d.host||"";
+    $("f-port").value=d.port||"";
+    $("f-mode").value=d.mode||"starttls";
+    $("f-auth").value=d.auth||"none";
+    $("f-user").value=d.user||"";
+    $("f-from").value=d.from||"";
+    $("f-to").value=d.to||"";
+    $("f-gsaEmail").value=d.gsaEmail||"";
+    $("pass-badge").textContent=d.hasPassword?"set":"not set";
+    $("pass-badge").className="badge"+(d.hasPassword?" set":"");
+    $("gsakey-badge").textContent=d.hasGsaKey?"set":"not set";
+    $("gsakey-badge").className="badge"+(d.hasGsaKey?" set":"");
+    $("ca-badge").textContent=d.hasCaPem?"set":"not set";
+    $("ca-badge").className="badge"+(d.hasCaPem?" set":"");
+    $("f-insecure").checked=!!d.insecure;
+    renderAuthFields();
+  }).catch(function(e){showMsg("save-msg",false,String(e.message||e));});
+}
+
+function renderAuthFields(){
+  var isSa=$("f-auth").value==="xoauth2-sa";
+  $("sa-fields").hidden=!isSa;
+  $("userpass-fields").hidden=isSa;
+}
+
+function applyPreset(){
+  var p=$("preset").value;
+  if(p==="gmail-app"){
+    $("f-host").value="smtp.gmail.com";$("f-port").value="465";$("f-mode").value="tls";$("f-auth").value="plain";
+    $("preset-hint").textContent="Create a 16-character App Password (requires 2-Step Verification) at myaccount.google.com/apppasswords, then paste it as the password below.";
+  }else if(p==="workspace-sa"){
+    $("f-host").value="smtp.gmail.com";$("f-port").value="465";$("f-mode").value="tls";$("f-auth").value="xoauth2-sa";
+    $("preset-hint").textContent="Requires domain-wide delegation already granted to the service account for scope https://mail.google.com/ in the Workspace admin console. See docs/API.md.";
+  }else{
+    $("preset-hint").textContent="";
+  }
+  renderAuthFields();
+}
+
+function saveConfig(){
+  var body=[
+    qs("host",$("f-host").value), qs("port",$("f-port").value), qs("mode",$("f-mode").value),
+    qs("auth",$("f-auth").value), qs("user",$("f-user").value), qs("pass",$("f-pass").value),
+    qs("from",$("f-from").value), qs("to",$("f-to").value), qs("gsaEmail",$("f-gsaEmail").value),
+    qs("gsaKey",$("f-gsaKey").value), qs("caPem",$("f-caPem").value),
+    qs("insecure",$("f-insecure").checked?"1":"0")
+  ].join("&");
+  post("/api/email",body).then(function(res){
+    if(res.status!==200){showMsg("save-msg",false,(res.body&&res.body.error)||("HTTP "+res.status));return;}
+    showMsg("save-msg",true,"Saved.");
+    $("f-pass").value="";$("f-gsaKey").value="";
+    loadConfig();
+  }).catch(function(e){showMsg("save-msg",false,String(e.message||e));});
+}
+
+function sendTest(){
+  var btn=$("test-btn");btn.disabled=true;btn.textContent="Sending…";
+  showMsg("test-msg",true,"Sending — this can take up to 20 seconds…");
+  post("/api/email/test", qs("to",$("test-to").value)).then(function(res){
+    btn.disabled=false;btn.textContent="Send test message";
+    var d=res.body||{};
+    if(d.ok){
+      showMsg("test-msg",true,"Sent OK"+(d.smtpReplyCode?(" (server said "+d.smtpReplyCode+")"):""));
+    }else{
+      showMsg("test-msg",false,"Failed: "+(d.error||("HTTP "+res.status))+(d.smtpReplyCode?(" (SMTP "+d.smtpReplyCode+")"):""));
+    }
+  }).catch(function(e){
+    btn.disabled=false;btn.textContent="Send test message";
+    showMsg("test-msg",false,String(e.message||e));
+  });
+}
+
+renderAuthFields();
+loadConfig();
+</script>
+</body>
+</html>
+)html8";
 
 // One HttpServer::sendHtml() assembles these into a single std::string per
 // request (as it already did with the old single literal) -- the parts

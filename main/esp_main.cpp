@@ -21,6 +21,7 @@
 #include "DeviceConfig.hpp"
 #include "LogQueue.hpp"
 #include "Syslog.hpp"
+#include "SmtpClient.hpp"
 #include "host_compat.h"
 
 // ── Default INFRA (AP) profile settings ───────────────────────────────────────
@@ -397,6 +398,10 @@ extern "C" void app_main(void)
             nvs_close(nvs_h);
         }
     }
+
+    // ── Email (issue #159): start the SMTP worker task before the dashboard ────
+    // that can queue sends into it. See the matching comment in esp_main_eth.cpp.
+    SmtpClient::init();
 
     // ── Launch HTTP dashboard on Core 0 (always — needed to provision) ─────────
     // The HTTP dashboard must start even on an unprovisioned device so the admin

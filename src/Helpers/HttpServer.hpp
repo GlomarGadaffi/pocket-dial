@@ -203,6 +203,26 @@ private:
 	// to it, which is how an operator checks a clip without parking a real call.
 	void sendApiSyslogStatus(int sock);
 	void sendApiSyslogSet(int sock, const std::string& body);
+
+	// Issue #159 (SMTP client): GET never echoes the stored secret/private
+	// key -- only hasPassword/hasGsaKey booleans (see EmailConfigStore.hpp's
+	// top comment and EmailHttp_test.cpp's "never echoes secrets, even
+	// authenticated" case). POST's `pass`/`gsaKey` form fields keep the
+	// existing stored value when submitted empty. Test sends synchronously
+	// through SmtpClient::sendAndWait() (the same bounded single-worker
+	// queue a real voicemail-to-email send would use) and reports the
+	// structured result inline -- this IS the "Send test message" button and
+	// the `email test <addr>` terminal command's only backend.
+	void sendApiEmailConfig(int sock);
+	void sendApiEmailConfigSet(int sock, const std::string& body);
+	void sendApiEmailTest(int sock, const std::string& body);
+	// GET /setup/email's standalone page (PD_HTML_8 -- NOT part of the "/"
+	// SPA's CGA_INDEX_HTML_PARTS assembly). Ungated like sendHtml(), for the
+	// same reason: the shell alone discloses nothing, and the dashboard's own
+	// convention is that only the DATA endpoints are session-gated (see
+	// docs/THREAT_MODEL.md §4 E-2).
+	void sendEmailSetupHtml(int sock, const HttpRequest& req);
+
 	void sendApiMohStatus(int sock);
 	void sendApiMohPreview(int sock, const std::string& body);
 	void sendApiMohPreviewStop(int sock);

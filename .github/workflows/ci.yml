@@ -30,7 +30,12 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential clang-tidy jq curl
+          # libssl-dev: issue #159's GoogleServiceAuth_test.cpp/tests/CMakeLists.txt
+          # find_package(OpenSSL REQUIRED) for the host-side RS256 JWT signing test
+          # (mbedTLS is the on-device backend; IDF's own mbedtls ships only
+          # mbedtls/private/* headers, so the host build uses OpenSSL instead --
+          # same reasoning SipDigest.hpp documents for vendoring its own MD5).
+          sudo apt-get install -y cmake build-essential clang-tidy jq curl libssl-dev
 
       - name: Cache pinned cppcheck build
         id: cppcheck-cache

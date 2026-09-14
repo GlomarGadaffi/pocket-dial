@@ -36,6 +36,18 @@ else()
 
     include_directories(${HELPERS_SRC_FILES} ${SIP_SRC_FILES})
     add_executable (SipServer "main.cpp" ${SIP_SRC} ${HELPERS_SRC} )
+
+    # Issue #159: GoogleServiceAuth.cpp's host build signs RS256 JWTs with
+    # OpenSSL (EVP_DigestSign) rather than mbedTLS -- see that file's own
+    # platform-split comment for why (IDF only ships mbedtls/private/*
+    # headers; a full mbedTLS build is not otherwise part of the host
+    # toolchain). SipServer globs every src/Helpers/*.cpp, so it picks this
+    # up too. tests/CMakeLists.txt (via add_subdirectory below) also calls
+    # find_package(OpenSSL REQUIRED); whichever of the two configures first,
+    # CMake caches the result, so this is not a second real search.
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(SipServer OpenSSL::Crypto)
+
     if (WIN32)
         target_link_libraries(SipServer wsock32 ws2_32)
     elseif (UNIX)

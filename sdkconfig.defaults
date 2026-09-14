@@ -176,6 +176,29 @@ CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
+# Issue #159 (SMTP client): required to build the SMTP config's "insecure"
+# toggle at all. Leaving esp_tls_cfg_t's cacert_buf/crt_bundle_attach both
+# unset does NOT silently skip verification -- esp_tls_mbedtls.c hard-fails
+# the handshake (ESP_ERR_MBEDTLS_SSL_SETUP_FAILED, "No server verification
+# option set") unless this Kconfig symbol is on; it exists specifically to
+# gate that escape hatch at build time. Enabling it here does not itself make
+# any connection insecure: SmtpClient only reaches the VERIFY_NONE path when
+# the operator has explicitly turned on the per-account insecureSkipVerify
+# toggle (default OFF, documented LAN-relay-only -- see docs/API.md's
+# POST /api/email and docs/THREAT_MODEL.md). Every other esp_tls/
+# esp_http_client caller in this tree (TelephonyAnchorClient.cpp's WSS/HTTPS)
+# keeps supplying crt_bundle_attach and is unaffected.
+#
+# ESP_TLS_SKIP_SERVER_CERT_VERIFY itself `depends on ESP_TLS_INSECURE` (see
+# components/esp-tls/Kconfig) -- without also selecting that parent symbol,
+# kconfgen silently drops the child as "not visible (disabled dependency)"
+# and CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY never lands in sdkconfig at all,
+# so esp_crt_bundle-less connections would hard-fail instead of going
+# insecure. Caught by reading the `idf.py set-target` NOTE log, not by any
+# host test (this Kconfig gate has no host-testable equivalent).
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+
 # ── Heap corruption detection ────────────────────────────────────────────────
 # The two settings above cover the STACK. Until now the heap had nothing
 # (HEAP_POISONING_DISABLED, the IDF default), which was defensible when the
