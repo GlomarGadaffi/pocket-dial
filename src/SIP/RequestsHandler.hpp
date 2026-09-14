@@ -457,6 +457,10 @@ private:
 	{
 		return getMessageFromPool(std::move(raw), src);
 	}
+	void freeTransactionsForCallId(std::string_view callId) override
+	{
+		_txLayer.freeForCallId(callId);
+	}
 	void log(std::string msg, bool isError = false) override
 	{
 		queueLog(std::move(msg), isError);

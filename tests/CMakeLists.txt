@@ -170,6 +170,10 @@ add_executable(sip_parser_tests
     # asserted at the wire level.
     CallPickup_test.cpp
     RegisterBeeper_test.cpp
+    # Issue #148: the duplicate-tracking feedback loop between sweep()'s Timer-A
+    # retransmit and drainOutbox()'s maybeTrack() scan, driven directly so the
+    # same INVITE can be re-fed deterministically.
+    TransactionLayer_test.cpp
     BlfSubscriptions_test.cpp
     DashboardSnapshot_test.cpp
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —

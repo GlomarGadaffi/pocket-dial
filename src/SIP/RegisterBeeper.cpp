@@ -152,13 +152,30 @@ bool RegisterBeeper::handleOk(const std::shared_ptr<SipMessage>& data)
 	}
 	else if (cseq.find(SipMessageTypes::BYE) != std::string::npos)
 	{
-		*bd = BeepDialog{};   // BYE acknowledged: dialog fully torn down, free slot
+		releaseDialog(*bd);   // BYE acknowledged: dialog fully torn down, free slot
 	}
 	// Anything else with a matching Call-ID (e.g. the 200 OK to our own CANCEL)
 	// is absorbed here without action — still "ours", just nothing to do — so it
 	// falls through neither ACKed/BYEd nor to a session lookup that would never
 	// find one.
 	return true;
+}
+
+void RegisterBeeper::releaseDialog(BeepDialog& bd)
+{
+	// Free the INVITE's client transaction BEFORE clearing the slot.
+	//
+	// A beep dialog has no Session — it lives here, keyed by Call-ID — so it never
+	// reaches endCall(), which used to be the only caller of freeForCallId(). Every
+	// terminal path below therefore had to drop the dialog while its transaction
+	// kept retransmitting the INVITE for the remainder of its 32 s Timer B window,
+	// holding a pool slot the whole time (issue #148). Clearing the slot first
+	// would lose the Call-ID, so order matters.
+	if (!bd.callID.empty())
+	{
+		_env.freeTransactionsForCallId(bd.callID);
+	}
+	bd = BeepDialog{};
 }
 
 void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
@@ -221,11 +238,11 @@ void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
 				// sustained load.
 				_env.log("Register beep: no answer from " + bd.ext +
 					", cancel build failed repeatedly — giving up, slot freed", true);
-				bd = BeepDialog{};
+				releaseDialog(bd);
 			}
 			continue;
 		}
-		bd = BeepDialog{};   // AwaitingByeOk / AwaitingCancelDone fallback: free the slot
+		releaseDialog(bd);   // AwaitingByeOk / AwaitingCancelDone fallback: free the slot
 	}
 }
 
@@ -261,7 +278,7 @@ bool RegisterBeeper::handleInviteFailure(const std::shared_ptr<SipMessage>& data
 			+ std::string(data->getHeader()) + ") — ACKed, slot freed");
 		_env.enqueue(bd->addr, std::move(ack));
 	}
-	*bd = BeepDialog{};
+	releaseDialog(*bd);
 	return true;
 }
 

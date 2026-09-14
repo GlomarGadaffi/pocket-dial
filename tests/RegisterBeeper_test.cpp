@@ -75,6 +75,67 @@ TEST(RegisterBeeper, AnsweredBeepAcksAndByesWithWellFormedHeaders)
 	EXPECT_NE(bye.fromHeader.find(";tag="), std::string::npos) << bye.fromHeader;
 }
 
+// Issue #148: a beep dialog has NO Session, so it never reaches endCall() — which
+// used to be the only caller of TransactionLayer::freeForCallId(). Every terminal
+// path must therefore release the INVITE transaction itself, or the beep keeps
+// retransmitting to a phone we have already given up on, holding a pool slot for
+// the rest of its 32 s Timer B window. Observed on hardware as a pool-exhaustion
+// burst after a single unanswered beep.
+TEST(RegisterBeeper, UnansweredBeepReleasesItsInviteTransaction)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr));
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string callId = callIdOf(env.sentRaw(0));
+	ASSERT_FALSE(callId.empty());
+	EXPECT_TRUE(env.freedTransactionCallIds.empty())
+		<< "nothing is released while the beep is still in flight";
+
+	// Deadline passes with no answer: sweep CANCELs but deliberately keeps the
+	// slot for the RFC 3261 §9.1 race window (issue #98) — still not released.
+	const auto t0 = std::chrono::steady_clock::now();
+	beeper.sweep(t0 + std::chrono::seconds(30));
+	EXPECT_TRUE(env.freedTransactionCallIds.empty())
+		<< "the CANCEL window must not release the transaction yet — a raced 200 "
+		   "OK still has to be matchable";
+
+	// The race window itself expires: now the dialog is genuinely abandoned and
+	// the transaction must go with it.
+	beeper.sweep(t0 + std::chrono::seconds(120));
+	ASSERT_EQ(env.freedTransactionCallIds.size(), 1u)
+		<< "an abandoned beep must free its INVITE transaction";
+	EXPECT_EQ(env.freedTransactionCallIds[0], callId);
+}
+
+// The happy path frees it too: once the phone 200s our BYE the dialog is over.
+TEST(RegisterBeeper, CompletedBeepReleasesItsInviteTransaction)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr));
+	const std::string callId = callIdOf(env.sentRaw(0));
+	ASSERT_TRUE(beeper.handleOk(okFor(callId, phoneAddr)));   // ACK + BYE
+
+	// The phone's 200 to our BYE tears the dialog down for good.
+	const std::string byeOk =
+		"SIP/2.0 200 OK\r\n"
+		"Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bKbye\r\n"
+		"From: \"PocketDial\" <sip:pbx@192.168.1.10:5060>;tag=servertag\r\n"
+		"To: <sip:101@192.168.1.10>;tag=phonetag\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 2 BYE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	EXPECT_TRUE(beeper.handleOk(std::make_shared<SipMessage>(byeOk, phoneAddr)));
+
+	ASSERT_EQ(env.freedTransactionCallIds.size(), 1u);
+	EXPECT_EQ(env.freedTransactionCallIds[0], callId);
+}
+
 // A 200 OK for an unknown Call-ID is not ours — handleOk must decline it so the
 // engine goes on to its normal session lookup.
 TEST(RegisterBeeper, ForeignOkIsNotConsumed)

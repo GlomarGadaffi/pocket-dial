@@ -78,6 +78,34 @@ namespace
 	// callback sends the 200 OK. Loopback never arms this (see onAck's kAnchorCallExt
 	// branch): it answers synchronously and clears any timer immediately.
 	constexpr auto ANCHOR_ACK_TIMEOUT = std::chrono::seconds(15);
+
+	// How long an outbound anchor/trunk call may RING before tick() reaps it.
+	//
+	// Deliberately NOT pbx::kNoAnswerTimeout. That constant is documented as "how
+	// long an unanswered leg rings before the no-answer action fires (CFNA forward,
+	// or advancing to the next hunt-group member)" — an INTERNAL-extension number,
+	// and one the operator can work around by simply not configuring CFNA (an
+	// extension with no forward never arms a ring timer at all). The outbound
+	// anchor path inherited it when the zombie-reaper landed, and nothing ever
+	// argued 20 s was a correct PSTN window.
+	//
+	// It is not. A US mobile typically rings 25-30 s before its carrier voicemail
+	// answers, and the clock here starts when the HANDSET's INVITE is accepted —
+	// before the ~1 s makeCall TLS round trip and before the provider has even
+	// begun dialling. Measured on hardware: a real call to a mobile was reaped at
+	// ~19 s of a 20 s budget, a few seconds short of voicemail pickup, and the
+	// caller got a 503 (issue #148's sibling; see the PR for the capture).
+	//
+	// This must still be FINITE and reasonably tight. It is the only backstop for
+	// a leg the provider still lists but that never progresses: the anchor's own
+	// reconcile watchdog tears down only legs that have VANISHED from the DN, so
+	// a stuck-but-present leg would otherwise pin the single
+	// POCKETDIAL_MAX_ANCHOR_CALLS slot forever. 60 s clears carrier voicemail with
+	// margin while bounding that worst case; do not make it unbounded, and do not
+	// re-arm it on provider progress events (the provider reports our own control
+	// leg's state, which sits at "Dialing" right through far-end alerting — there
+	// is no alerting signal to key off).
+	constexpr auto ANCHOR_NO_ANSWER_TIMEOUT = std::chrono::seconds(60);
 }
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
@@ -2029,7 +2057,9 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	newSession->setState(Session::State::Invited);
 	const std::string localTag = IDGen::GenerateID(9);
 	newSession->setLocalTag(localTag);
-	newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
+	// ANCHOR_NO_ANSWER_TIMEOUT, not pbx::kNoAnswerTimeout — this leg rings a PSTN
+	// destination, not an extension down the hall. See the constant's definition.
+	newSession->armRingTimer(std::chrono::steady_clock::now() + ANCHOR_NO_ANSWER_TIMEOUT);
 	_sessions.emplace(callID, newSession);
 
 	auto ringing = getMessageFromPool(*data);
@@ -4940,7 +4970,15 @@ void RequestsHandler::tick()
 					auto resp = getMessageFromPool(*invite);
 					if (resp)
 					{
-						resp->setHeader("SIP/2.0 503 Service Unavailable");
+						// 480, not 503. The far end rang and nobody picked up — that is
+						// a no-answer, not a server fault. On this path 503 already
+						// carries a specific and DIFFERENT meaning (capacity refusal
+						// above, and refuseRingingAnchor's makeCall/worker failures),
+						// while the sibling no-answer teardown — hunt-group exhaustion,
+						// below — already answers 480. A UAS 503 additionally invites
+						// upstream failover/blacklist behaviour that a plain no-answer
+						// must never trigger.
+						resp->setHeader("SIP/2.0 480 Temporarily Unavailable");
 						resp->clearBody();
 						resp->setContact(buildContact(std::string(invite->getToNumber())));
 						_outbox.emplace_back(invite->getSource(), std::move(resp));
