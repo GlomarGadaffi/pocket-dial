@@ -448,7 +448,7 @@ function initTerminalEmulator() {
                 break;
 
             case "ver":
-                appendLine("POCKET-DIAL Version: <span class='highlight-cyan'>v1.3.0</span>");
+                appendLine("POCKET-DIAL Version: <span class='highlight-cyan'>v1.4.1</span>");
                 appendLine("Hardened C++17 Core Engine (CMake Build: MSVC 19.x/GCC 11.x)");
                 appendLine("lwIP Sockets binding: UDP/5060, HTTP/8080 (Web CGA Console)");
                 break;
