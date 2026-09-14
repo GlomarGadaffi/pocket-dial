@@ -92,7 +92,7 @@ The HTTP server operates under strict resource constraints and security policies
 * **Protocol**: HTTP/1.1
 * **Default Port**: 80 (Overridden to custom port if configured)
 * **Socket Timeout (`SO_RCVTIMEO`)**: **5 Seconds**. Connections that do not send data within 5 seconds of connection are forcefully closed.
-* **Payload Limit**: **16 KB (16,384 bytes)**. Any request body larger than 16 KB (including large Wi-Fi passwords) is rejected with status `413 Payload Too Large` and the body `{"error":"request body exceeds 16 KB limit"}` (`HttpServer.cpp:383`). The **one** exception is [`POST /api/ota/upload`](#post-apiotaupload), which is intercepted before this cap is applied and streamed instead — see that section.
+* **Payload Limit**: **16 KB (16,384 bytes)**. Any request body larger than 16 KB (including large Wi-Fi passwords) is rejected with status `413 Payload Too Large` and the body `{"error":"request body exceeds 16 KB limit"}` (`HttpServer.cpp:405-410`). There are **two** exceptions, both intercepted before this cap is applied and streamed instead: [`POST /api/ota/upload`](#post-apiotaupload) and **`POST /api/moh/upload`**, which carries its own **8 MB** cap (`HttpServer.cpp:2911-2923`) rather than 16 KB. The interception matches either path on the request line (`HttpServer.cpp:314-316`).
 * **Request body framing**: `Content-Length` only. There is no `Transfer-Encoding: chunked` support anywhere in the parser — a chunked upload would be read as an opaque body with chunk framing bytes in it. Always send an explicit `Content-Length` (curl does this for you for `-d` and `--data-binary @file`).
 * **Concurrency**: one detached thread per accepted connection. If thread creation fails under memory pressure the connection is dropped silently rather than answered (`HttpServer.cpp:218`).
 
@@ -260,8 +260,11 @@ When booting into onboarding mode, the device intercepts client browser check do
 > token checks until an admin PIN existed; that window is gone — the device ships with
 > a default credential precisely so the gate can be unconditional from first boot.
 > Endpoints marked "None" are read-only and intentionally reachable without a session:
-> `/`, `/index.html`, `/api/status`, `/api/cdr`, `/api/wifi/scan`, `/api/ota/status`,
-> `/api/admin/status` and `/config/<mac>.cfg`. That is the complete list. Everything
+> `/`, `/index.html`, `/api/status`, `/api/cdr`, `/metrics`, `/api/wifi/scan`,
+> `/api/ota/status`, `/api/admin/status` and `/config/<mac>.cfg`. That is the complete
+> list — **`/metrics` was missing from it** until this audit; it is ungated by a
+> deliberate decision argued at `HttpServer.cpp:1120-1184` (a Prometheus scraper cannot
+> drive the login/CSRF handshake). Everything
 > else goes through `requireAdmin()` — except `POST /api/admin/login` and
 > `POST /api/admin/logout`, which take `requireSameOrigin()` alone (gate 1 only).
 
@@ -274,7 +277,12 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/admin/set-credential`](#post-apiadminset-credential) | `POST` | High | Gated (+ `X-CSRF`) | Replaces the admin login credential and/or sets the DTMF PIN. **The only route exempt from the `setup_required` gate.** |
 | [`/api/status`](#get-apistatus) | `GET` | Low | None | Retrieves registrar uptime, packet statistics, active extensions, ongoing sessions, and the whole PBX feature configuration. |
 | [`/api/kill`](#post-apikill) | `POST` | High | Gated (+ `X-CSRF`) | Forcefully disconnects and de-registers an active SIP extension. |
-| [`/api/cdr`](#get-apicdr) | `GET` | Low | None | Returns the in-memory Call Detail Record ring (most recent calls, newest first). |
+| [`/api/cdr`](#get-apicdr) | `GET` | Low | None | Returns the in-memory Call Detail Record ring (most recent calls, newest first). **Ungated — this discloses who called whom, when, and for how long to any host that can reach the board.** See [THREAT_MODEL.md](THREAT_MODEL.md) §4 E-2. |
+| `/metrics` | `GET` | Low | None | Prometheus text format (`text/plain; version=0.0.4`). Six families, all `pocketdial_`-prefixed: `uptime_seconds`, `sip_registrations_active`, `sip_calls_active` (gauges), `packets_processed_total`, `packets_dropped_total`, `sdp_rejected_total` (counters). Always `200`; all-zero when the SIP engine is not yet attached. Ungated by design (`HttpServer.cpp:1120-1184`). **Not** on the captive-portal exempt list, so on a Wi-Fi build a scraper sending a foreign `Host` header gets the portal `302` instead. |
+| `/api/moh` | `GET` | Medium | Gated (no `X-CSRF`) | Music-on-hold status: `200 {supported, loaded, seconds, listeners, preview}`, or `503 {"error":"SIP engine not attached yet"}`. |
+| `/api/moh/preview` | `POST` | High | Gated (+ `X-CSRF`) | **Places a real call to a handset** to audition the hold clip. Param `extension`. `400` missing extension; `409` "extension is not registered" or "no hold clip loaded — upload one first"; `503`; `200 {"status":"ok","message":"ringing <ext>"}`. |
+| `/api/moh/preview/stop` | `POST` | High | Gated (+ `X-CSRF`) | Ends the preview call. `503`, or `200 {"status":"ok"}`. |
+| `/api/moh/upload` | `POST` | High | Gated (+ `X-CSRF`) | Streaming upload of the hold clip, **8 MB cap** (not 16 KB). Requires 8 kHz mono µ-law WAV. `411` zero `Content-Length`; `413 "clip exceeds 8 MB"`; `400`; `422` wrong format; `500`; `501` on builds without SD (`PD_ETH_HAS_SD`); `200 {"status":"ok","seconds":N,"bytes":N}`. |
 | [`/api/pcap`](#get-apipcap) | `GET` | Medium | Gated (no `X-CSRF`) | Downloads the last `POCKETDIAL_PCAP_RING_SIZE` SIP signaling packets as a `.pcap` (Wireshark-readable). |
 | [`/api/diagnostics/pcap`](#get-apidiagnosticspcap) | `GET` | Medium | Gated (no `X-CSRF`) | Alias for `/api/pcap` (Issue #33's originally-requested path) — identical response, same ring, same gate. |
 | [`/api/trace`](#get-apitrace) | `GET` | Medium | Gated (no `X-CSRF`) | The same capture ring as JSON, for the dashboard's polling live SIP tracer. |
@@ -707,27 +715,24 @@ Disconnects a specified VoIP station, removing its registration and terminating 
 * **Requires `pd_session` cookie**: Always (see §0)
 * **Request Content-Type**: `application/x-www-form-urlencoded`
 * **Request Parameters**:
-  * `extension` (Required): The registration extension number to disconnect. **Must be the only parameter in the body** — see the warning below.
+  * `extension` (Required): The registration extension number to disconnect.
 * **Response Content-Type**: `application/json`
 * **Response Status Codes**:
   * `200 OK`: Request accepted. See the note below on what this does *not* tell you.
   * `400 Bad Request`: `{"error":"missing extension parameter"}` — the body contains no `extension=`, or the value after it is empty.
   * `401`/`403`: gates 1-4 as in §0.1.
 
-> [!WARNING]
-> **This is the one endpoint that does not use `getFormParam()`.** `sendApiKill()`
-> (`HttpServer.cpp:1058`) does a bare `body.find("extension=")` and then takes
-> **everything to the end of the body** as the value, trimming only trailing CR, LF
-> and spaces. Two consequences, both easy to trip over:
->
-> * **Extra parameters are swallowed into the value.** `extension=1001&foo=bar`
->   disconnects the extension literally named `1001&foo=bar` — which matches nothing,
->   so the call silently does nothing and still answers `200`. Send `extension` alone.
-> * **The value is not URL-decoded.** `%2A` stays the three characters `%2A`; `+`
->   stays a `+` rather than becoming a space. Every other endpoint decodes.
->
-> The bare `find()` also matches a key that merely *ends* with `extension=`, so a body
-> like `myextension=1001` is accepted as `extension=1001`.
+> [!NOTE]
+> **Corrected — this endpoint now parses like every other one.** Earlier revisions of
+> this document warned that `sendApiKill()` was the one handler that did *not* use
+> `getFormParam()`: that it did a bare `body.find("extension=")`, swallowed extra
+> parameters into the value, never URL-decoded, and accepted `myextension=1001` as
+> `extension=1001`. **All four of those behaviours were removed in issue #191.**
+> `sendApiKill()` now calls `getFormParam(body, "extension")`
+> (`HttpServer.cpp:1294`), which enforces an `&` token boundary, stops at the next
+> `&`, and URL-decodes. So extra parameters are fine, `%2A` decodes to `*`, and a body
+> carrying only `myextension=1001` answers `400` rather than killing extension 1001.
+> Do not write a client against the old contract.
 
 > [!NOTE]
 > **`200` means "the request was well-formed", not "an extension was disconnected".**
@@ -974,8 +979,14 @@ Reports how a `REGISTER` is admitted, and which phones have been adopted.
 
 * `attached` — `false` when the SIP engine has not been bound to the dashboard yet. The
   HTTP server starts before the registrar exists and the main loop attaches the handler
-  once it does (`main/esp_main_eth.cpp:310`), so this is a boot-time transient of a
-  second or two, not an error; `mode` reads `"unknown"` and `devices` is empty. Every
+  once it does (`main/esp_main_eth.cpp:424`). **It is not always a "boot-time transient
+  of a second or two".** On the `eth` build the SIP task is not started at all until an
+  admin credential exists (`main/esp_main_eth.cpp:587-631` waits on
+  `AdminAuth::credentialIsSet()` before `xTaskCreatePinnedToCore(&sip_server_task, …)`),
+  so on a freshly flashed or freshly factory-reset board `attached` stays `false`
+  indefinitely — until someone completes first-run setup. Treat a persistent
+  `attached:false` as "setup not finished", not as a hung registrar. `mode` reads
+  `"unknown"` and `devices` is empty meanwhile. Every
   other endpoint that reads registrar state behaves the same way — empty datasets, not
   failures.
 * `mode` — `open`, `learn` or `secure` (see `POST` below).

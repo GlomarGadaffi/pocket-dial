@@ -415,13 +415,16 @@ Switching to `secure` while **no** extension is yet `secured` is refused with `4
 Resend with `confirm=LOCKOUT` to override — the same shape as `/api/factory-reset`'s
 `confirm=ERASE`. Responds with the same body as the `GET`.
 
-> [!CAUTION]
-> **Restoring `mode=open` is the only reliable way back, so do it in the same run.**
-> `POST /api/factory-reset` will *not* undo it: `DeviceConfig::clearAll()` erases `reg_mode`
-> from the `storage` namespace (`DeviceConfig.cpp:628`) while the registrar reads and writes
-> it in `pbxcfg` (`src/SIP/Registrar.cpp:35-40`, `src/SIP/PbxPersist.hpp:16`). A hardware
-> test that leaves a board in `secure` and expects a factory reset to clean up will strand
-> the board. Source-verified 2026-09-13; not yet exercised on hardware.
+> [!NOTE]
+> **Corrected — a factory reset *does* clear `reg_mode` now.** Earlier revisions of this
+> box warned that `POST /api/factory-reset` would not undo `mode=secure`, because
+> `DeviceConfig::clearAll()` erased `reg_mode` from the `storage` namespace while the
+> registrar keeps it in `pbxcfg`. **That was a real bug and it was fixed in issue #188**:
+> `clearAll()` now calls `eraseRegistrarMode()` (`DeviceConfig.cpp:698`), which opens
+> `pbxcfg`, and the comment at `:693-697` records exactly this. [API.md](API.md)'s
+> factory-reset section already stated it correctly. Restoring `mode=open` in the same run
+> is still good hygiene, but a reset is no longer a way to strand the board. Still not
+> exercised on hardware.
 
 ### 3.14 POST `/api/registrar/device`
 Secures or forgets one adopted device. Cookie **and** `X-CSRF`.
@@ -488,9 +491,12 @@ session cookie, and the MAC is the credential.
 ## 🧾 4. Security Response Headers (assert on every response)
 
 `HttpServer::sendResponseWithHeader` emits these centrally (`HttpServer.cpp:796-802`), so a
-single missing header is a global regression and is cheap to assert once per suite. The one
-response that does not go through it is the captive-portal `302` from `sendRedirect()`,
-which writes a bare redirect to the socket — do not assert the headers on that path:
+single missing header is a global regression and is cheap to assert once per suite.
+**Correction: there is no exempt path.** Earlier revisions said the captive-portal `302`
+from `sendRedirect()` hand-rolled a bare redirect and told you not to assert headers on it.
+`sendRedirect()` now routes through `sendResponseWithHeader` (`HttpServer.cpp:3122`) — the
+hand-rolled version was the bug, and its own comment records the fix. **Assert the headers
+on the `302` too**; it is a regression if they are missing:
 
 | Header | Value |
 |---|---|
@@ -617,10 +623,13 @@ login preamble — including setup completion — to have run first.
 * **TC-SEC-09 (Headers present):** Assert the five headers of §4 on at least one `GET`,
   one `POST` success, and one error response, and assert `Strict-Transport-Security` is
   **absent**.
-* **TC-SEC-10 (Session slide):** GET `/api/admin/status` while logged in returns
-  `sessionRemainingSec` near 1800 and, unlike `validateSession()`, does **not** itself slide
-  the expiry further — polling it to display a countdown must not keep resetting the
-  countdown.
+* **TC-SEC-10 (Session slide):** ~~GET `/api/admin/status` does **not** itself slide the
+  expiry.~~ **This expectation is wrong and must not be asserted.** `sendApiAdminStatus`
+  calls `isAuthed()` (`HttpServer.cpp:2639`) → `AdminAuth::validateSession()`, which pushes
+  `expiresAtMs` forward (`AdminAuth.cpp:909`). So polling `/api/admin/status` **does** keep
+  the session alive, and a dashboard that polls it for a countdown will never see the
+  session expire. [API.md](API.md) already carries this correction; this line did not.
+  Assert the opposite: two reads 2 s apart both return `sessionRemainingSec` near 1800.
 
 ### Login Rate-Limiting Tests
 * **TC-RL-01 (Per-client lockout):** From one client, POST `/api/admin/login` with a wrong
@@ -673,9 +682,9 @@ login preamble — including setup completion — to have run first.
 
 ## 🖥️ 6. Host Test Suite
 
-The gtest suite that backs all of the above is **416 test cases** (static count of
-`TEST`/`TEST_F` in `tests/*.cpp` as of 2026-09-13). The same three commands CI runs, from a
-WSL shell:
+The gtest suite that backs all of the above is **506 test cases** (static count of
+`TEST`/`TEST_F`/`TEST_P` in `tests/*.cpp`; the 416 previously quoted here was stale by 90).
+The same three commands CI runs, from a WSL shell:
 
 ```bash
 unset IDF_PATH                                        # see below
