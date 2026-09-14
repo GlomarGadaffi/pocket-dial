@@ -1998,6 +1998,196 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		+ destIp + ":" + std::to_string(destPort));
 }
 
+void RequestsHandler::releaseMohPreviewLocked()
+{
+	if (_mohPreview.listener >= 0)
+	{
+		_holdMusic.removeListener(_mohPreview.listener);
+	}
+	_mohPreview = MohPreview{};
+}
+
+std::string RequestsHandler::mohPreviewExtension()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _mohPreview.active ? _mohPreview.extension : std::string{};
+}
+
+bool RequestsHandler::startMohPreview(const std::string& extension)
+{
+	// _mutex is NOT recursive, so this takes it once and every helper below is the
+	// *Locked variant. Calling the public stopMohPreview() from in here would
+	// self-deadlock the HTTP task.
+	std::lock_guard<std::mutex> lock(_mutex);
+
+	if (!_holdMusic.isLoaded() || _holdMusic.localPort() <= 0) return false;
+
+	auto target = findClient(extension);
+	if (!target.has_value() || !target.value()) return false;
+
+	// Replace any previous preview rather than refusing. The realistic case is an
+	// operator clicking twice; leaving the first dialog ringing forever is worse
+	// than cancelling it.
+	if (_mohPreview.active)
+	{
+		stopMohPreviewLocked();
+	}
+
+	const std::string activeIp  = _localIp;
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	const sockaddr_in& addr     = target.value()->getAddress();
+	const std::string destIpPort = sipwire::addrToIpPort(addr);
+
+	_mohPreview.callId    = "Call-ID: " + IDGen::GenerateID(16) + "@" + activeIp;
+	_mohPreview.extension = extension;
+	_mohPreview.fromTag   = IDGen::GenerateID(9);
+	_mohPreview.branch    = "z9hG4bK" + IDGen::GenerateID(12);
+	_mohPreview.addr      = addr;
+	_mohPreview.listener  = -1;
+	_mohPreview.active    = true;
+
+	// Offer the board's OWN media: sendonly from the MoH port, exactly what a
+	// parked caller is answered with. The phone is the answerer here, so this is
+	// an OFFER rather than an answer, but the body is the same shape.
+	const std::string sdp = sipwire::makeSendonlySdp(activeIp, _holdMusic.localPort());
+
+	std::ostringstream ss;
+	ss << "INVITE sip:" << extension << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << _mohPreview.branch << "\r\n"
+	   << "From: \"Hold Music\" <sip:moh@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
+	   << "To: <sip:" << extension << "@" << activeIp << ">\r\n"
+	   << _mohPreview.callId << "\r\n"
+	   << "CSeq: 1 INVITE\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Contact: <sip:moh@" << srcIpPort << ";transport=UDP>\r\n"
+	   << "User-Agent: pocket-dial\r\n"
+	   << "Content-Type: application/sdp\r\n"
+	   << "Content-Length: " << sdp.size() << "\r\n\r\n"
+	   << sdp;
+
+	auto inv = getMessageFromPool(ss.str(), addr);
+	if (!inv)
+	{
+		_mohPreview = MohPreview{};   // pool exhausted: do not leave a phantom dialog
+		return false;
+	}
+	inv->syncContentLength();
+	_outbox.emplace_back(addr, std::move(inv));
+	queueLog("MoH preview: ringing " + extension);
+	return true;
+}
+
+bool RequestsHandler::handleMohPreviewOk(const std::shared_ptr<SipMessage>& data)
+{
+	if (!_mohPreview.active) return false;
+	if (std::string(data->getCallID()) != _mohPreview.callId) return false;
+
+	// They answered. Their 200 OK's SDP says where to send the music.
+	if (_mohPreview.listener < 0)
+	{
+		std::string rtpIp;
+		uint16_t    rtpPort = 0;
+		if (sipwire::parseRtpTarget(std::string(data->getBody()), data->getSource(),
+		                            rtpIp, rtpPort))
+		{
+			_mohPreview.listener = _holdMusic.addListener(rtpIp, rtpPort);
+		}
+		_mohPreview.toTag = siphdr::tagOf(data->getTo());
+
+		queueLog(_mohPreview.listener >= 0
+			? "MoH preview: " + _mohPreview.extension + " answered — streaming"
+			: "MoH preview: " + _mohPreview.extension +
+			  " answered but offered no usable RTP endpoint");
+	}
+
+	// ACK it, or the phone retransmits the 200 and eventually tears the call down.
+	const std::string activeIp  = _localIp;
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	const std::string destIpPort = sipwire::addrToIpPort(_mohPreview.addr);
+
+	std::ostringstream ss;
+	ss << "ACK sip:" << _mohPreview.extension << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << _mohPreview.branch << "a\r\n"
+	   << "From: \"Hold Music\" <sip:moh@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
+	   << "To: <sip:" << _mohPreview.extension << "@" << activeIp << ">"
+	   << (_mohPreview.toTag.empty() ? "" : ";tag=" + _mohPreview.toTag) << "\r\n"
+	   << _mohPreview.callId << "\r\n"
+	   << "CSeq: 1 ACK\r\n"
+	   << "Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n";
+
+	if (auto ack = getMessageFromPool(ss.str(), _mohPreview.addr))
+	{
+		_outbox.emplace_back(_mohPreview.addr, std::move(ack));
+	}
+	return true;
+}
+
+bool RequestsHandler::handleMohPreviewEnd(const std::shared_ptr<SipMessage>& data)
+{
+	if (!_mohPreview.active) return false;
+	if (std::string(data->getCallID()) != _mohPreview.callId) return false;
+
+	// They hung up (BYE), or declined/cancelled (4xx/6xx). Either way the preview
+	// is over: stop the music to this leg and free the slot.
+	queueLog("MoH preview: ended (" + _mohPreview.extension + ")");
+	releaseMohPreviewLocked();
+	return true;
+}
+
+void RequestsHandler::stopMohPreview()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	stopMohPreviewLocked();
+}
+
+void RequestsHandler::stopMohPreviewLocked()
+{
+	if (!_mohPreview.active) return;
+
+	// Only BYE a dialog they actually answered — a To-tag is the proof. BYEing a
+	// still-ringing INVITE is wrong (RFC 3261 wants a CANCEL) and phones reject it.
+	if (!_mohPreview.toTag.empty())
+	{
+		const std::string activeIp  = _localIp;
+		const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+		const std::string destIpPort = sipwire::addrToIpPort(_mohPreview.addr);
+
+		std::ostringstream ss;
+		ss << "BYE sip:" << _mohPreview.extension << "@" << destIpPort << " SIP/2.0\r\n"
+		   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << _mohPreview.branch << "b\r\n"
+		   << "From: \"Hold Music\" <sip:moh@" << srcIpPort << ">;tag=" << _mohPreview.fromTag << "\r\n"
+		   << "To: <sip:" << _mohPreview.extension << "@" << activeIp << ">;tag="
+		   << _mohPreview.toTag << "\r\n"
+		   << _mohPreview.callId << "\r\n"
+		   << "CSeq: 2 BYE\r\n"
+		   << "Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n";
+		if (auto bye = getMessageFromPool(ss.str(), _mohPreview.addr))
+		{
+			_outbox.emplace_back(_mohPreview.addr, std::move(bye));
+		}
+	}
+	else
+	{
+		std::ostringstream ss;
+		ss << "CANCEL sip:" << _mohPreview.extension << "@"
+		   << sipwire::addrToIpPort(_mohPreview.addr) << " SIP/2.0\r\n"
+		   << "Via: SIP/2.0/UDP " << _localIp << ":" << _serverPort
+		   << ";branch=" << _mohPreview.branch << "\r\n"
+		   << "From: \"Hold Music\" <sip:moh@" << _localIp << ":" << _serverPort
+		   << ">;tag=" << _mohPreview.fromTag << "\r\n"
+		   << "To: <sip:" << _mohPreview.extension << "@" << _localIp << ">\r\n"
+		   << _mohPreview.callId << "\r\n"
+		   << "CSeq: 1 CANCEL\r\n"
+		   << "Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n";
+		if (auto c = getMessageFromPool(ss.str(), _mohPreview.addr))
+		{
+			_outbox.emplace_back(_mohPreview.addr, std::move(c));
+		}
+	}
+
+	releaseMohPreviewLocked();
+}
+
 bool RequestsHandler::startHoldMusic(const std::string& clipPath)
 {
 	// Deliberately tolerant at every step. Music on hold is a comfort feature; a
@@ -3187,6 +3377,21 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 {
+	// MoH preview hangup. Server-originated dialog with no Session, so it must be
+	// claimed by Call-ID before the lookup below — otherwise the BYE falls through
+	// to the unknown-dialog path and the listener is never released, leaving the
+	// clip streaming at a phone that has hung up.
+	if (handleMohPreviewEnd(data))
+	{
+		if (auto response = getMessageFromPool(*data))
+		{
+			response->setHeader(SipMessageTypes::OK);
+			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			_outbox.emplace_back(data->getSource(), std::move(response));
+		}
+		return;
+	}
+
 	auto session = getSession(data->getCallID());
 	std::string destNumber(data->getToNumber());
 
@@ -3415,6 +3620,14 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 	// snapshot mirror is driven by _park.consumeParkChanged() in handle(), so a
 	// state-neutral ACK confirmation no longer pays a rebuild.
 	if (_park.handleOk(data))
+	{
+		return;
+	}
+
+	// MoH preview (server-originated UAC, no Session), same intercept-by-Call-ID
+	// shape as the two above. The phone answering our INVITE is what starts the
+	// music, so this must run before the session lookup that would 404 it.
+	if (handleMohPreviewOk(data))
 	{
 		return;
 	}

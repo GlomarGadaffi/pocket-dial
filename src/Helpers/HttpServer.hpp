@@ -191,6 +191,14 @@ private:
 	void sendApiAdminLogin(int sock, const HttpRequest& req);
 	void sendApiAdminLogout(int sock, const HttpRequest& req);
 
+	// Music-on-hold panel (PBX settings). Status reports the BUILD capability and
+	// the runtime state separately, so a client can tell "no card on this board"
+	// from "no clip uploaded yet". Preview rings an extension and streams the clip
+	// to it, which is how an operator checks a clip without parking a real call.
+	void sendApiMohStatus(int sock);
+	void sendApiMohPreview(int sock, const std::string& body);
+	void sendApiMohPreviewStop(int sock);
+
 	// Streams an uploaded music-on-hold clip to /sdcard/moh.wav and reloads it.
 	// Takes the same streaming treatment as the OTA image and for the same reason:
 	// ~800 KB of audio must not go through the 16 KB buffered path. Writes to a

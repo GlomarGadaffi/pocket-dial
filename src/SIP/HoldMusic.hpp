@@ -75,6 +75,14 @@ public:
 	// test vectors, which pin 0xFF -> 0).
 	static constexpr uint8_t kUlawSilence = 0xFF;
 
+	// Pacing-task stack. The task's own frame is small and bounded — one
+	// 172-byte packet buffer plus a handful of locals; there is no recursion and
+	// nothing variable-length. This is deliberately NOT a round number picked by
+	// feel: runLoop() logs uxTaskGetStackHighWaterMark() once the listener table
+	// has been exercised, so the value can be trimmed from measurement instead of
+	// guessed. Check the boot log's "stack high-water" line before changing it.
+	static constexpr int kTaskStackBytes = 3072;
+
 	// ── Pure, platform-independent primitives (host-unit-tested) ────────────────
 
 	// Where the µ-law audio starts and how much of it there is, for a WAV in
@@ -164,6 +172,9 @@ private:
 	int  _sock = -1;
 	std::atomic<bool> _stopRequested{false};
 	std::atomic<bool> _taskRunning{false};
+	// Touched only by the pacing task, so no synchronisation is needed or wanted.
+	uint32_t _txErrors = 0;   // failed sendto()s — a silent gap otherwise
+	uint32_t _ticks    = 0;   // drives the one-shot stack high-water report
 #endif
 
 	// The clip. Owned here, freed on destruction / replacement.
