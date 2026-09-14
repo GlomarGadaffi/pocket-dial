@@ -99,6 +99,18 @@ namespace LogQueue
         return s_queue;
     }
 
+    // Optional second sink for every drained line. Registered by the platform
+    // entry point, NOT by this header -- LogQueue deliberately knows nothing about
+    // syslog, the network, or anything that can fail, so a tee that misbehaves
+    // cannot take the log path down with it.
+    //
+    // The tee runs on the drain task, AFTER the line has already reached the UART.
+    // That ordering is the point: serial is the sink that always works, and it must
+    // never be delayed or lost because a remote collector is slow or unreachable.
+    using Tee = void (*)(const char* line);
+    static Tee s_tee = nullptr;
+    static inline void setTee(Tee t) { s_tee = t; }
+
     // Dequeue one log line and write it to stderr.
     // Call repeatedly from a low-priority drain task.
     // blockTicks — how long to wait for a line before returning (default 10 ms)
@@ -112,6 +124,9 @@ namespace LogQueue
             // Ensure null-termination even if something went wrong during enqueue.
             buf[LINE_BYTES - 1] = '\0';
             fputs(buf, stderr);
+            if (s_tee != nullptr) {
+                s_tee(buf);
+            }
         }
     }
 
@@ -123,6 +138,8 @@ namespace LogQueue
 {
     static inline void* create(int = 16, int = 256) { return nullptr; }
     static inline void drainToUart(unsigned = 10) {}
+    using Tee = void (*)(const char* line);
+    static inline void setTee(Tee) {}
 }
 
 #endif // ESP_PLATFORM

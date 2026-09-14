@@ -333,7 +333,7 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
     <button class="rbtn" onclick="openModal('cdr-modal')" title="Call Log (F4)">&#9779; Call Log</button>
     <button class="rbtn" onclick="openPbxModal()" title="PBX Settings (F6)">&#9881; PBX</button>
     <button class="rbtn" onclick="openModal('trace-modal')" title="SIP Trace (F8)">&#9780; Trace</button>
-    <button class="rbtn" onclick="openModal('wifi-modal');scanWifi()" title="WiFi (F9)">&#9783; WiFi</button>
+    <button class="rbtn" id="wifi-btn" onclick="openWifiModal()" title="WiFi (F9)">&#9783; WiFi</button>
     <button class="rbtn" onclick="openModal('admin-modal')" title="Admin">&#9919; Admin</button>
     <button class="rbtn" onclick="openTelephonyModal()" title="Telephone Interconnect">&#9742; Interconnect</button>
     <button class="rbtn" onclick="openModal('help-modal')" title="Help (F1)">? Help</button>
@@ -640,6 +640,17 @@ R"html3(      <div class="msg" id="ota-state-msg"></div>
   <div class="modal">
     <h3>&#9783; WiFi &amp; Network<span class="x" onclick="closeModal('wifi-modal')">&times;</span></h3>
     <div class="mbody">
+      <!-- #167: shown only when /api/status reports wifiCapable:false. An
+           eth/lan8720 build has no radio at all, so a Scan button there is not
+           an empty result waiting to fill in -- it is a control that can never
+           do anything, and the operator deserves to be told rather than left
+           reading "Found 0 networks" as a signal problem. -->
+      <div class="note" id="wifi-no-radio" style="display:none">
+        &#9432; This board has no WiFi radio in its current Ethernet-transport
+        build, so there is nothing to scan for or connect to. Network settings
+        are handled by the wired interface. Factory Reset below still applies.
+      </div>
+      <div id="wifi-radio-ui">
       <div class="row"><button class="btn" onclick="scanWifi()">&#8635; Scan</button><span class="note" id="wifi-status">Ready</span></div>
       <div id="wifi-list" style="margin-top:8px"><div class="note">Press Scan to discover networks&hellip;</div></div>
       <div class="note" id="wifi-admin-note" style="display:none">&#9919; Admin login required for the controls below.</div>
@@ -656,6 +667,7 @@ R"html3(      <div class="msg" id="ota-state-msg"></div>
       <button class="btn" id="wifi-ap-btn" onclick="startApMode()">&#9889; Host Standalone AP</button>
       <div class="note">Persists across reboots. Unconfigured devices auto-switch to Standalone ~5 min after power-on.</div>
       <button class="btn" onclick="holdConfigMode()" style="margin-top:6px">&#9208; I'm Configuring (hold setup)</button>
+      </div><!-- /wifi-radio-ui -->
       <div class="danger-zone">
         <div class="subhead">Danger Zone</div>
         <button class="btn danger" id="wifi-reset-btn" onclick="factoryReset()">&#9888; Factory Reset</button>
@@ -1139,8 +1151,26 @@ function put(url,body){return httpMethod("PUT",url,body);}
 function del(url,body){return httpMethod("DELETE",url,body);}
 function fetchStatus(){
   fetch("/api/status").then(function(r){return r.json();}).then(function(d){
-    statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);renderDialplan(d);pushPacketSample(d.packetsProcessed||0);
+    statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);renderDialplan(d);pushPacketSample(d.packetsProcessed||0);applyWifiCapability(d);
   }).catch(function(){failCount++;if(failCount>=2)setOnline(false);});
+}
+/* #167: the board states whether it has a radio; the UI must not infer it from
+   an empty scan. Older firmware predates the field, so an ABSENT wifiCapable is
+   treated as capable -- the dashboard is served by the same board it manages, so
+   this only matters while a stale page is open across an upgrade. */
+function applyWifiCapability(d){
+  if(!d||typeof d.wifiCapable==="undefined")return;
+  var capable=!!d.wifiCapable;
+  var ui=$("wifi-radio-ui"),note=$("wifi-no-radio"),btn=$("wifi-btn");
+  if(ui)ui.style.display=capable?"":"none";
+  if(note)note.style.display=capable?"none":"";
+  /* Relabel the toolbar button too: on a board with no radio, "WiFi" names
+     something that isn't there, and the modal's remaining content is network
+     info plus Factory Reset. */
+  if(btn){
+    btn.innerHTML=capable?"&#9783; WiFi":"&#9783; Network";
+    btn.title=capable?"WiFi (F9)":"Network & Factory Reset (F9)";
+  }
 }
 function fetchCdr(){
   fetch("/api/cdr").then(function(r){return r.json();}).then(renderCdr).catch(function(){});
@@ -1422,6 +1452,11 @@ function otaReboot(skip){
 }
 
 /* ════ WIFI ════ */
+/* Only auto-scan where a scan can succeed (#167). */
+function openWifiModal(){
+  openModal("wifi-modal");
+  if(!statusData||statusData.wifiCapable!==false)scanWifi();
+}
 function scanWifi(){
   var st=$("wifi-status");st.textContent="Scanning…";st.style.color="var(--ringing)";
   fetch("/api/wifi/scan").then(function(r){return r.json();}).then(function(d){
@@ -1709,7 +1744,7 @@ document.addEventListener("keydown",function(e){
   else if(e.key==="F5"){e.preventDefault();refreshNow();}
   else if(e.key==="F6"){e.preventDefault();openPbxModal();}
   else if(e.key==="F8"){e.preventDefault();openModal("trace-modal");}
-  else if(e.key==="F9"){e.preventDefault();openModal("wifi-modal");scanWifi();}
+  else if(e.key==="F9"){e.preventDefault();openWifiModal();}
   else if(e.key==="Escape"){["jack-modal","admin-modal","wifi-modal","telephony-modal","help-modal",
     "dialplan-modal","groups-modal","cdr-modal","trace-modal","pbx-modal"].forEach(function(id){closeModal(id);});}
 });

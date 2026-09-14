@@ -20,6 +20,7 @@
 #include "AdminAuth.hpp"
 #include "DeviceConfig.hpp"
 #include "LogQueue.hpp"
+#include "Syslog.hpp"
 #include "host_compat.h"
 
 // ── Default INFRA (AP) profile settings ───────────────────────────────────────
@@ -261,10 +262,33 @@ void http_server_task(void *pvParameters)
 }
 
 // ── Log drain task (Task 1B) ───────────────────────────────────────────────────
+// Every drained line also goes to the remote collector, when one is configured.
+// Runs on the drain task, after the line has already reached the UART -- serial
+// is the sink that always works and must never wait on a network peer. Syslog's
+// own send() is a fire-and-forget datagram on a connected socket, silent on
+// failure by design (the RE-ENTRANCY RULE in Syslog.hpp: logging a syslog
+// failure would come straight back here as another line to send).
+static void log_tee_to_syslog(const char* line)
+{
+    if (line == nullptr || line[0] == '\0') {
+        return;
+    }
+    Syslog::send(Syslog::Severity::Info, "pbx-log", line);
+}
+
 static void log_drain_task(void* /*arg*/)
 {
+    // Stack headroom is MEASURED, not assumed. This task carries drainToUart()'s
+    // 256-byte line buffer plus, now, an lwip send() on the tee path; #183 sat
+    // unwired precisely because nobody had numbers for that. Reported once, after
+    // enough drains to have exercised the tee.
+    unsigned drains = 0;
     while (1) {
         LogQueue::drainToUart();
+        if (++drains == 500) {
+            ESP_LOGI(TAG, "[log] drain task stack high-water: %u bytes free",
+                     (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -291,7 +315,16 @@ extern "C" void app_main(void)
 
     // ── Task 1B: install non-blocking log queue + drain task ────────────────
     LogQueue::create();
-    xTaskCreatePinnedToCore(log_drain_task, "log_drain", 2048, nullptr, 1, nullptr, 0);
+    // Remote logging (#183). loadFromNvs() is a no-op when syslog_host is unset,
+    // and send() returns immediately while unconfigured, so an unprovisioned board
+    // pays nothing but the branch. Registered before the task starts so no line
+    // drained during boot is missed once a host IS configured.
+    Syslog::loadFromNvs();
+    LogQueue::setTee(log_tee_to_syslog);
+    // 3072, up from 2048: the tee adds an lwip send() to this task's deepest path.
+    // The high-water mark logged by the task itself is what justifies this number
+    // staying here or moving.
+    xTaskCreatePinnedToCore(log_drain_task, "log_drain", 3072, nullptr, 1, nullptr, 0);
 
     // ── Networking stack init ────────────────────────────────────────────────
     // netif + default event loop are non-retryable boot prerequisites: if they fail the
