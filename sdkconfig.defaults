@@ -200,3 +200,21 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # that may be carrying calls -- which is still better than serving from a
 # corrupt heap, but it is a trade, not a free win.
 CONFIG_HEAP_POISONING_LIGHT=y
+
+# ── Task Watchdog Timer: make a stall a controlled reset, not silence (#185) ──
+# CONFIG_ESP_TASK_WDT_INIT=y (IDF default) already auto-starts the TWDT and
+# subscribes the idle tasks; main/esp_main*.cpp additionally subscribes
+# sip_server_task and feeds it once per tick. But the OTHER IDF default,
+# CONFIG_ESP_TASK_WDT_PANIC=n, means a timeout only prints "Task watchdog got
+# triggered..." and the wedged task is left exactly as wedged as before --
+# which is silence with extra logging, not the "controlled reset with a logged
+# cause" #185 asks for. This is the one line that makes the subscription in
+# main/esp_main*.cpp actually reset the board instead of only ever warning.
+#
+# Consequence worth knowing: this also arms the auto-subscribed idle tasks
+# (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0/1, both default y) to reset instead
+# of warn if either core's idle task is ever starved for the full timeout
+# window (CONFIG_ESP_TASK_WDT_TIMEOUT_S, default 5s) -- nothing in this repo's
+# issue history suggests that happens today, but it is a real behavior change
+# on top of the #185 subscriptions, not a no-op.
+CONFIG_ESP_TASK_WDT_PANIC=y
