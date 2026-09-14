@@ -297,3 +297,121 @@ TEST(BlindTransfer, CalleeAsTransferorByesTheOriginalCaller)
 	EXPECT_FALSE(findSentTo(sent, targetAddr, "INVITE sip:107@").empty())
 		<< "transfer target must receive a fresh INVITE";
 }
+
+// Issue #203 — the failure case the two tests above never reach, because both
+// transfer to a REGISTERED target.
+//
+// A transfer that cannot be completed must DECLINE, not destroy. Previously
+// onRefer() sent the dropped party's BYE and ran endCall() unconditionally, and
+// only afterwards asked whether the target resolved — so REFERing to anything
+// unresolvable hung up on the other party and erased the session before
+// reporting 404. The transferor was told the truth and still lost the call.
+//
+// The target here is a park orbit (701), which is #203's actual repro:
+// "transfer to 701" is how a call gets parked on any real PBX, and orbits live
+// in _virtualPeerPool, not _clientPool, so findClient() misses them. But the
+// contract under test is general — an unregistered extension, a typo, or a
+// phone that just dropped its registration must all land here.
+//
+// Making 701 a *workable* transfer target is a different job: it needs #202
+// (virtual endpoints findable) AND #197 (blind transfer currently moves the
+// transferor, so a resolvable orbit would park the wrong party). Until then the
+// correct answer is the one asserted below — decline, and leave the call up.
+TEST(BlindTransfer, TransferToUnresolvableTargetDeclinesWithoutDestroyingTheCall)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.32.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in transferorAddr = addrFor("192.168.32.10"); // A: 100
+	const sockaddr_in peerAddr       = addrFor("192.168.32.20"); // B: 106
+
+	handler.handle(makeRegister("100", "192.168.32.10", "reg-100c"));
+	handler.handle(makeRegister("106", "192.168.32.20", "reg-106c"));
+
+	const std::string callId = "blindxfer-203";
+	{
+		std::string body = sdpBody();
+		std::string raw =
+			"INVITE sip:106@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 192.168.32.10:5060;branch=z9hG4bKinvc\r\n"
+			"From: <sip:100@server>;tag=atagc\r\n"
+			"To: <sip:106@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:100@192.168.32.10:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		handler.handle(RequestsHandler::getMessageFromPool(raw, transferorAddr));
+	}
+	std::string forkToB = findSentTo(sent, peerAddr, "INVITE sip:106@");
+	ASSERT_FALSE(forkToB.empty()) << "direct call must reach B";
+
+	{
+		std::string fromLine = extractHeaderLine(forkToB, "From:");
+		std::string via = extractHeaderLine(forkToB, "Via:");
+		ASSERT_FALSE(fromLine.empty());
+		std::string body = sdpBody();
+		std::string raw =
+			"SIP/2.0 200 OK\r\n" +
+			via + "\r\n" +
+			fromLine + "\r\n"
+			"To: <sip:106@server>;tag=btagc\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Contact: <sip:106@192.168.32.20:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		handler.handle(RequestsHandler::getMessageFromPool(raw, peerAddr));
+	}
+
+	auto before = handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(before.has_value());
+	ASSERT_EQ(before.value()->getState(), Session::State::Connected);
+
+	const size_t sentBeforeRefer = sent.size();
+
+	// ── A blind-transfers to a park orbit, which findClient() cannot resolve ──
+	{
+		std::string raw =
+			"REFER sip:106@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 192.168.32.10:5060;branch=z9hG4bKrefc\r\n"
+			"From: <sip:100@server>;tag=atagc\r\n"
+			"To: <sip:106@server>;tag=btagc\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 2 REFER\r\n"
+			"Max-Forwards: 70\r\n"
+			"Refer-To: <sip:701@server>\r\n"
+			"Contact: <sip:100@192.168.32.10:5060>\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, transferorAddr));
+	}
+
+	// The REFER is still accepted and still answered honestly — that part was
+	// never wrong, and the transferor's phone already handles it.
+	EXPECT_FALSE(findSentTo(sent, transferorAddr, "SIP/2.0 202 Accepted").empty())
+		<< "REFER must still be accepted";
+	std::string notify = findSentTo(sent, transferorAddr, "NOTIFY sip:");
+	ASSERT_FALSE(notify.empty()) << "transferor must be NOTIFYed of the outcome";
+	EXPECT_NE(notify.find("SIP/2.0 404 Not Found"), std::string::npos)
+		<< "sipfrag must report the transfer failed:\n" << notify;
+
+	// THE FIX: nothing was torn down. B keeps its call.
+	EXPECT_TRUE(findSentTo(sent, peerAddr, "BYE sip:").empty())
+		<< "B must NOT be hung up on for a transfer that never happened";
+
+	auto after = handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(after.has_value()) << "the A-B session must survive a declined transfer";
+	EXPECT_EQ(after.value()->getState(), Session::State::Connected)
+		<< "and must still be connected, not left in a torn-down state";
+
+	// Belt and braces: the ONLY things that went out because of the REFER are
+	// the 202 and the NOTIFY. Anything else means some other teardown leaked.
+	size_t emittedByRefer = sent.size() - sentBeforeRefer;
+	EXPECT_EQ(emittedByRefer, 2u)
+		<< "a declined transfer should emit exactly 202 + NOTIFY, got "
+		<< emittedByRefer;
+}
