@@ -1,5 +1,197 @@
 # Changelog
 
+## v1.5.0-beta.1 — 2026-09-14
+
+A beta, deliberately. Nine changes landed in one session, two of them fix defects
+that were live on `main`, and one rewrites what a blind transfer *means*. Every
+item below was proved on the bench board at `192.168.12.244` with a real Yealink
+T29G and synthetic SIP endpoints — not only on the host suite.
+
+**Music on hold works end to end.** A parked caller hears audio from the SD card.
+
+**Two security fixes, both reachable without credentials.** If you run a board on
+a network you do not fully control, this beta is not optional.
+
+---
+
+### Security — an unauthenticated host could take the board off the network
+
+`handleClient()`'s route chain ends in a single `closeSocket(clientSock)`. Four
+gated routes were written as `if (!requireAdmin(...)) return;`, which jumps over
+it — so **every rejected request leaked a socket**. Three of the four shipped in
+the music-on-hold work earlier in the same session and were already on `main`.
+
+The device runs `CONFIG_LWIP_MAX_SOCKETS=16` and the WAN anchor holds three
+persistent TLS sockets. Measured against the unfixed build:
+
+```
+hammering /api/moh unauthenticated x60
+  request 14 could not even connect: timed out
+  connections cleanly closed : 0/60
+is the board still serving? /api/status -> UNREACHABLE
+```
+
+**Fourteen requests, no credentials, and the management plane is gone.** After the
+fix: 60/60 closed, board healthy.
+
+`curl` never showed it — curl reads to `Content-Length` and does not care whether
+the peer closes. It surfaced only because a host test *hung* instead of failing.
+Every gated route now uses the fall-through form, and that rule is written into
+`CONTRIBUTING_FIRMWARE.md` as a checklist item.
+
+### Security — call history was readable by anyone on the LAN
+
+`GET /api/cdr` returned who called whom, when, and for how long, with no session.
+It had been ungated by an in-code analogy to `/api/status`, and the analogy does
+not hold: `THREAT_MODEL.md` §4 E-2 justifies `/api/status` by what the **login
+form** needs, and a login form does not need call history. `/api/cdr` appears in
+neither E-2's ungated list nor its list of sensitive gated reads — it was never
+assessed at all. It is now gated exactly as `/api/trace` is.
+
+`/api/status` stays reachable, because E-2's reasoning about the login form is
+sound, but it **no longer discloses the extension roster** — every registered
+number with its handset's IP and port, which is precisely the target list for the
+SIP INFO spoofing described in E-4 of the same document. `clientCount` and
+`rosterVisible` are still emitted unauthenticated, so a client can tell "nobody is
+registered" from "you may not see who is".
+
+### Blind transfer moves the transferee, not the transferor
+
+RFC 3515 §2 / RFC 5359 §2.4: A and B are talking, A sends `REFER` with
+`Refer-To: C`. **B** ends up talking to C; A drops out.
+
+This PBX did the reverse. It BYEd B and re-INVITEd A to C — so a receptionist
+transferring an inbound caller **hung up on the customer** and was dialled through
+to the target themselves, reported as `200 OK` by the sipfrag `NOTIFY`, so the lost
+call was invisible until the customer rang back. The old behaviour was asserted as
+intended by the test suite; those tests are rewritten, not merely flipped.
+
+Because media is peer-to-peer, this is a real SDP swap. Measured on hardware:
+
+```
+  target was offered media at 192.168.12.110:59954 (transferee's RTP port: 59954)
+  re-INVITE to transferee points at 192.168.12.110:33389 (target's RTP port: 33389)
+  RTP transferee -> target: 20/20 packets received
+```
+
+A `REFER` naming a dialog with no transferable leg — an unanswered call, or a
+virtual extension like `777` with no second party's media to hand on — is now
+**declined outright** rather than accepted and then reported failed.
+
+### Transferring to an unresolvable target no longer destroys the call
+
+`onRefer` sent the other party's BYE and ran `endCall()` **before** checking
+whether the target resolved, then reported `404`. Transferring to a park orbit, a
+typo, or an extension that had just dropped its registration hung up on the other
+party and erased the session. The lookup is now the gate: when it misses, nothing
+is torn down and the transfer is declined.
+
+### Music on hold
+
+Parked callers hear a clip from the SD card instead of silence. One global cursor,
+radio-station style — every listener gets the same frame, so a caller parked
+mid-song joins mid-song. The clip is read into PSRAM once; the card is never
+touched during a call.
+
+A **PBX Settings** panel (gear, F6) uploads a clip, shows its duration and live
+listener count, and plays it to an extension so you can hear what a parked caller
+hears. Hardware-verified on a Yealink T29G: `listeners 0 → 1` on answer.
+
+Three defects surfaced only once real hardware was in the loop, and all three are
+fixed: the preview INVITE was queued on the wrong outbox and silently discarded
+while the API reported success; the board answered the phone's `100 Trying` and
+`180 Ringing` with a stray `404`; and a declined preview was claimed by nobody,
+leaving a phantom dialog that blocked every later preview.
+
+### Remote logging (RFC 5424 syslog over UDP)
+
+The syslog module had been compiled into every firmware image for weeks with
+**zero callers** — and `loadFromNvs()` read keys that nothing could write, so it
+was not merely unwired but unreachable. It is now teed off the log drain, with
+`GET`/`POST /api/syslog` to configure a collector.
+
+Frames carry a real RFC 3339 timestamp from the SNTP clock. They previously
+carried the NILVALUE `-`, because `timesync::rfc3339Now()` — which returns exactly
+that NILVALUE while unsynced, and was clearly written for this — had never been
+connected to it.
+
+### NVS schema versioning
+
+The device stores its whole identity in NVS and updates over OTA, with no version
+stamp anywhere. A boot-time detector now stamps the current schema and dispatches
+migrations. The case that matters was verified on a provisioned board:
+
+```
+W (624) cfgschema: adopting pre-versioning config as schema v1 (now v1); data preserved
+```
+
+Admin credential, dial plan and MoH clip all survived; the second boot reports
+`schema up-to-date (v1)` and writes nothing.
+
+### SIP digest auth, client side
+
+The board has only ever been a SIP *registrar*. It can now be a *client*: parse a
+`WWW-Authenticate`/`Proxy-Authenticate` challenge, compute the response, and drive
+a `REGISTER` user agent that honours the server's returned `Expires`, handles
+`423`/`Min-Expires`, and backs off rather than hammering a carrier SBC.
+
+Validated against the published worked examples in RFC 2617 §3.5 and RFC 7616
+§3.9.1. **The vector printed in RFC 2069 is wrong** — Verified Errata 749 corrects
+it, and trusting the printed constant would have made a correct implementation
+look broken.
+
+Groundwork for a real SIP trunk (#164); nothing is wired into the call path yet.
+
+### Service extensions
+
+A fixed table of names the engine owns (`pbx`, `moh`, `server`), consulted as a
+fallback after the client pool misses. Closes three shadowing holes: a phone could
+`REGISTER` as `pbx`, a ring group or dial rule could be named for a service, and a
+BLF key could subscribe to one.
+
+The routing half is **inert** — every seeded service is non-dialable, because the
+loopback design the issue preferred cannot work here: `buildInviteFork` clones the
+INVITE verbatim, and `onInvite`'s own retransmission guard drops the looped packet.
+That is a property of this engine being a forwarding proxy rather than a B2BUA, and
+it constrains voicemail routing and the IVR too.
+
+### Documentation
+
+Every capability claim audited against the code: **~255 checked, 78 wrong**.
+Five would have cost someone real time, including a documented security cutover
+that cannot be performed (`reg_mode=2` locks out the fleet, because
+`SipSecretStore::setSecret` has no caller), a W5500 pin map that reset-loops a
+board, and install instructions naming an ESP-IDF version the project refuses to
+build under.
+
+Two documented security controls turned out not to exist: the "per-client"
+brute-force lockout is global, and the "optional CIDR allowlist" cannot be enabled.
+Both are recorded as open defects rather than quietly corrected in prose.
+
+### Also
+
+- `/api/status` reports `wifiCapable`; the dashboard stops offering a WiFi scan on
+  Ethernet builds that have no radio, and says so plainly instead of showing
+  "Found 0 networks" forever.
+- Register-beep retransmit storm (`#148`) confirmed fixed and closed.
+- `/metrics` (Prometheus) and park-orbit MoH confirmed shipped and closed.
+- RFC 4028 retitled: the PBX no longer arms a timer that would BYE a healthy call,
+  but still never *generates* a refresh.
+
+### Known limitations in this beta
+
+- **Park-by-transfer does not park.** Transferring to an orbit is declined, not
+  completed. Dial `700`–`709` directly.
+- **`CFNA → voicemail` is still black-holed**; voicemail does not exist.
+- **No generic SIP trunk yet.** The only outside line is the vendor call-control
+  API. Digest-client groundwork landed this release.
+- Session timers are passive — the PBX never originates a refresh.
+- Six test-suite HTTP ports are shared between files, so an orphaned listener can
+  fail unrelated tests.
+
+
+---
+
 ## Unreleased (on main, in no published release) — 2026-09-13
 
 The admin plane was rebuilt and the box learned to call outside. Those are the two
