@@ -2095,11 +2095,15 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 #if defined(ESP_PLATFORM) || defined(ESP32)
 	struct MakeCallArg
 	{
-		AnchorClient* anchor;
+		// Default-initialized so cppcheck's uninitMemberVarNoCtor cannot fire on
+		// the raw pointers. Every member is still aggregate-initialized at the
+		// single call site below (C++17 keeps this an aggregate despite the
+		// default member initializers), so behaviour is unchanged.
+		AnchorClient* anchor = nullptr;
 		std::string dest;
 		std::string callId;
 		std::string callerNumber;
-		RequestsHandler* handler;
+		RequestsHandler* handler = nullptr;
 	};
 	auto* arg = new MakeCallArg{ _anchorClient, destination, callId, callerNumber, this };
 	// 12288: makeCall is a TLS HTTPS round trip — same overflow as tel_start's
@@ -2172,9 +2176,10 @@ void RequestsHandler::asyncDropCall(const std::string& participantId)
 #if defined(ESP_PLATFORM) || defined(ESP32)
 	struct DropCallArg
 	{
-		AnchorClient* anchor;
+		// See MakeCallArg: default-initialized for cppcheck, still an aggregate.
+		AnchorClient* anchor = nullptr;
 		std::string partId;
-		RequestsHandler* handler;
+		RequestsHandler* handler = nullptr;
 	};
 	auto* arg = new DropCallArg{ _anchorClient, participantId, this };
 	// CHECK the spawn: under heap pressure during an active call the 12 KB PSRAM
@@ -2206,9 +2211,10 @@ void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 #if defined(ESP_PLATFORM) || defined(ESP32)
 	struct AnswerCallArg
 	{
-		AnchorClient* anchor;
+		// See MakeCallArg: default-initialized for cppcheck, still an aggregate.
+		AnchorClient* anchor = nullptr;
 		std::string partId;
-		RequestsHandler* handler;
+		RequestsHandler* handler = nullptr;
 	};
 	auto* arg = new AnswerCallArg{ _anchorClient, participantId, this };
 	// CHECK the spawn: same heap-pressure hazard asyncDropCall's own comment
