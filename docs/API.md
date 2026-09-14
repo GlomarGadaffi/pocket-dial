@@ -623,6 +623,7 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
   "uptime": 14205,
   "packetsProcessed": 10543,
   "packetsDropped": 12,
+  "sd": { "present": true, "mounted": true, "capacityMb": 29820 },
   "clients": [
     { "number": "1001", "address": "192.168.4.12:5060" },
     { "number": "1002", "address": "192.168.4.15:5068" }
@@ -663,6 +664,10 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `uptime` | Integer | Time in seconds since the HTTP server initialized. |
 | `packetsProcessed` | Integer | Total UDP signaling packets processed by the state machine. |
 | `packetsDropped` | Integer | Total UDP signaling packets dropped by rate-limiting or firewall rules. |
+| `sd` | Object | microSD state. **Always present**, on every build and transport, so a client never has to distinguish "key missing" from "no card". |
+| `sd.present` | Boolean | Whether this *build* has a card slot wired — i.e. was compiled with `PD_ETH_HAS_SD`. True only for `eth` on `PD_ETH_BOARD=elite`; false on `wifi`, `lan8720`, `display`, the Waveshare `eth` board, and the host build. This is a build capability, not a runtime observation. |
+| `sd.mounted` | Boolean | Whether a card is actually mounted at `/sdcard` right now. Distinguishing this from `present` matters: `present:true, mounted:false` means the slot exists but the card is missing, unreadable, or **exFAT** (ESP-IDF's FatFs mounts FAT16/FAT32 only, and cards over 32 GB ship exFAT from the factory). |
+| `sd.capacityMb` | Integer | Card capacity in MB when mounted; `0` otherwise. |
 | `clients` | Array | Array of objects listing active VoIP extensions. |
 | `clients[].number` | String | SIP extension number (e.g., `"1001"`). |
 | `clients[].address` | String | Client's IP and port (e.g., `"192.168.4.12:5060"`). |
