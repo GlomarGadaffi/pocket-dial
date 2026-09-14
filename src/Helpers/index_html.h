@@ -401,8 +401,9 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
       </div>
       <div class="msg" id="dp-msg"></div>
       <p class="note">
-        <b>Deleting:</b> use the Delete button on a rule above. An empty target is what the API uses to
-        signal a delete, so a rule that strips digits and prepends nothing cannot be expressed today.
+        <b>Prepend nothing:</b> leave Prepend blank on a trunk rule to send the dialed digits with only
+        the strip applied &mdash; dialing <b>9</b> then <b>3057673260</b> with strip 1 and no prepend
+        sends <b>3057673260</b>. <b>Deleting:</b> use the Delete button on a rule above.
       </p>
     </div>
   </div>
@@ -971,7 +972,7 @@ function dpActionChanged(){
 function dpDescribe(r){
   if(r.action!=="trunk")return r.action+" → "+esc(r.target||"");
   var strip=Number(r.stripDigits||0);
-  return "trunk → strip "+strip+", prepend "+esc(r.target||"");
+  return "trunk → strip "+strip+", "+(r.target?("prepend "+esc(r.target)):"prepend nothing");
 }
 function renderDialplan(d){
   var rules=d.dialplan||[];
@@ -993,7 +994,10 @@ function saveDialRule(){
   if(!pattern){setMsg("dp-msg","Pattern required.","err");return;}
   var action=$("dp-action").value;
   var target=$("dp-target").value.trim();
-  if(!target){setMsg("dp-msg","Target required — an empty target is the delete signal, so it cannot create a rule.","err");return;}
+  /* A trunk rule MAY have an empty target: that is "strip N, prepend nothing".
+     Every other action needs a destination. The request still names an action,
+     which is what distinguishes an upsert from a delete. */
+  if(!target&&action!=="trunk"){setMsg("dp-msg","Target required for a "+action+" rule.","err");return;}
   var body="pattern="+encodeURIComponent(pattern)+"&action="+action+"&target="+encodeURIComponent(target);
   if(action==="trunk"){
     var strip=$("dp-strip").value.trim()||"0";

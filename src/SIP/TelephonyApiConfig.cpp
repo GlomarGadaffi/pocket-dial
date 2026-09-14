@@ -96,13 +96,33 @@ std::string TelephonyApiConfig::setSlot(size_t idx, const Slot& s, bool keepSecr
 	{
 		return "Field too long";
 	}
-	if (s.enabled)
+	if (s.enabled && s.type != TelephonyProviderType::Loopback)
 	{
-		// An ENABLED slot must be dialable: real provider, https endpoint.
-		if (s.type != TelephonyProviderType::Loopback &&
-		    s.baseUrl.rfind("https://", 0) != 0)
+		// An ENABLED slot must be dialable: real provider, https endpoint, and
+		// enough identity to actually originate.
+		if (s.baseUrl.rfind("https://", 0) != 0)
 		{
 			return "Enabled slot needs an https:// base URL";
+		}
+		// A blank route DN is the one misconfiguration nothing downstream can
+		// report. isConnected() is WebSocket state only and the control socket
+		// carries no DN, so the board comes up "connected", every makeCall
+		// builds ".../callcontrol//makecall", the provider is genuinely reached
+		// and answers non-2xx — which reads in the field as "the API was hit but
+		// no call happened". Refuse it here, at the only place that can tell.
+		if (s.routeDn.empty())
+		{
+			return "Enabled slot needs a route DN";
+		}
+		if (s.clientId.empty())
+		{
+			return "Enabled slot needs a client ID";
+		}
+		// keepSecret means "leave the stored secret alone", so validate the
+		// EFFECTIVE secret rather than the (deliberately empty) incoming one.
+		if ((keepSecret ? _slots[idx].secret : s.secret).empty())
+		{
+			return "Enabled slot needs a client secret";
 		}
 	}
 

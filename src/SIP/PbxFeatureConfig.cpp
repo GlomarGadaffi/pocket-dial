@@ -290,16 +290,21 @@ void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string
 		_env.log("Dial rule ignored: " + pattern +
 			" is a reserved extension and is routed before the dial plan", true);
 	}
-	else if (target.empty())
+	else if (action.empty() && target.empty())
 	{
-		// Empty target deletes the rule (mirrors setRingGroup's empty member list).
+		// Deleting takes an empty ACTION as well as an empty target (mirrors
+		// setRingGroup's empty member list). Keying the delete on the target
+		// alone made "strip N and prepend nothing" — drawbridge's only trunk
+		// shape — impossible to express, because the request that would create
+		// it is byte-identical to the request that deletes it. Naming an action
+		// now always means "upsert".
 		if (_dialPlan.erase(pattern))
 		{
 			_env.log("Dial rule " + pattern + " deleted");
 			persistDialPlan();
 		}
 	}
-	else if (!pbx::isDialTokenSafe(target))
+	else if (!target.empty() && !pbx::isDialTokenSafe(target))
 	{
 		_env.log("Dial rule ignored: invalid target \"" + target + "\"", true);
 	}
@@ -310,6 +315,13 @@ void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string
 		{
 			_env.log("Dial rule ignored: unknown action \"" + action +
 				"\" (want group|page|park|trunk)", true);
+		}
+		else if (target.empty() && parsed != pbx::DialActionType::Trunk)
+		{
+			// Only a trunk rule has a meaningful empty target ("prepend nothing").
+			// A group/page/park rule with no target names no destination at all.
+			_env.log("Dial rule ignored: " + action + " needs a target (only a trunk "
+				"rule may leave it empty, meaning prepend nothing)", true);
 		}
 		else if (parsed == pbx::DialActionType::PageZone && !pbx::isPageZoneExt(target))
 		{
