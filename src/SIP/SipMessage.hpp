@@ -87,6 +87,23 @@ public:
 	void setContact(std::string value);
 	void setContentLength(std::string value);
 	void addHeader(const std::string& name, const std::string& value);
+	// Replace-or-insert ONE header line by name — what setVia/setTo/setContact do
+	// for their fixed names, generalised to an arbitrary header.
+	//
+	// addHeader() above always appends, which is correct for a header that may
+	// legitimately repeat (Alert-Info, Route) and wrong for one that must not.
+	// Responses here are built by CLONING the request (getMessageFromPool(const
+	// SipMessage&) copies every header line), so a phone that put `Allow:` in its
+	// own request has already put an Allow line in our response before we add
+	// ours — addHeader() would then emit two, advertising the phone's
+	// capabilities and this PBX's as though they were one set. This overwrites
+	// instead, leaving exactly one line.
+	//
+	// Matching is case-insensitive (findHeaderIndex folds case), so `name` may be
+	// written in its canonical form. Compact forms are NOT matched: pass the
+	// compact spelling explicitly via setNamedHeader if a header has one that
+	// matters. None of the capability headers do.
+	void setHeaderOnce(const std::string& name, const std::string& value);
 	// Pins the SDP payload list to "0 8 101".
 	//
 	// DEPRECATED, and as of ISSUES.md #139 called from NO production path -- only

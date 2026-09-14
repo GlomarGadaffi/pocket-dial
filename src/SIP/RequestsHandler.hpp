@@ -1115,6 +1115,11 @@ private:
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	// Requests answered from a §17.2 server transaction's stored response rather
+	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
+	// count is the packet-loss signal this layer exists to absorb, so it is worth
+	// having on the dashboard next to packetsDropped rather than only in the log.
+	std::atomic<uint64_t> _packetsAbsorbed{0};
 
 	struct RegistrarSnapshot
 	{

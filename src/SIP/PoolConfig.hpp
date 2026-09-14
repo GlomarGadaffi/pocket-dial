@@ -253,14 +253,68 @@
 #define POCKETDIAL_MAX_DID_MAPPINGS 8
 #endif
 
-// Maximum concurrent RFC 3261 §17 transaction records tracked for retransmit
-// timers.  Each InviteClient slot tracks one outgoing INVITE fork (Timer A/B):
-// retransmit interval doubles from T1 until a provisional stops it, or Timer B
-// (32 s) fires.  Sized to cover MAX_SESSIONS concurrent INVITE dialogs plus
-// headroom for forks to hunt-group members.  Pool exhaustion → message still
-// sent once (graceful degradation) — it never crashes or blocks.
+// Maximum concurrent RFC 3261 §17 CLIENT transaction records — requests this
+// PBX sent and will retransmit until they are answered.
+//
+// Each slot tracks either one outgoing INVITE fork (§17.1.1, Timer A/B) or one
+// outgoing non-INVITE request (§17.1.2, Timer E/F/K): BYE, CANCEL, NOTIFY,
+// REFER, INFO, MESSAGE, SUBSCRIBE, UPDATE. Sized to cover MAX_SESSIONS
+// concurrent INVITE dialogs, plus the worst-case BLF NOTIFY fan-out (one NOTIFY
+// per subscription when a watched extension changes state, all in flight at
+// once), plus headroom for hunt-group forks.
+//
+// The NOTIFY burst is what drove the +MAX_SUBSCRIPTIONS term: those slots are
+// each held for Timer K (T4 = 5 s) after the watcher's 200 OK, or Timer F (32 s)
+// if a watcher has gone away silently, so a single busy-lamp change can claim
+// MAX_SUBSCRIPTIONS slots at once. Without the term, a BLF burst would evict
+// INVITE retransmit coverage — the exact regression #148 was about.
+//
+// Pool exhaustion → message still sent once (graceful degradation), which is
+// precisely the pre-transaction-layer behaviour — it never crashes or blocks.
 #ifndef POCKETDIAL_MAX_TRANSACTIONS
-#define POCKETDIAL_MAX_TRANSACTIONS (POCKETDIAL_MAX_SESSIONS * 2 + 8)
+#define POCKETDIAL_MAX_TRANSACTIONS \
+	(POCKETDIAL_MAX_SESSIONS * 2 + POCKETDIAL_MAX_SUBSCRIPTIONS + 8)
+#endif
+
+// Maximum concurrent RFC 3261 §17 SERVER transaction records — responses this
+// PBX AUTHORED, kept so that a retransmitted request gets the same answer
+// instead of being re-processed, and (for INVITE) retransmitted until ACKed.
+//
+// Much smaller than the client pool, for two reasons. First, only responses the
+// PBX itself authors are tracked at all: an ordinary extension-to-extension call
+// has its 200 OK RELAYED from the callee phone, which owns that retransmission
+// under its own transaction layer, so those take no slot here. What is left is
+// the virtual extensions (777 echo, 888 conference, 555 anchor, park orbits, MoH
+// preview), the register beep, and the failure responses the engine mints itself
+// (403/404/486/488/503/603). Second, only the methods where re-processing a
+// duplicate actually does harm get a non-INVITE server transaction — BYE, CANCEL,
+// REFER and UPDATE — while REGISTER, OPTIONS, MESSAGE, INFO and SUBSCRIBE are
+// left to be re-processed as before, because they are idempotent enough that a
+// 32 s Timer J slot each would cost far more than it buys. (INFO is the close
+// call: a duplicated DTMF digit is a real bug, but at one slot per keypress for
+// 32 s it would dominate this pool on its own. Tracked separately.)
+//
+// Same graceful degradation: no free slot → the response is still sent once.
+#ifndef POCKETDIAL_MAX_SERVER_TRANSACTIONS
+#define POCKETDIAL_MAX_SERVER_TRANSACTIONS (POCKETDIAL_MAX_SESSIONS + 8)
+#endif
+
+// Bytes of each transaction record's retransmit buffer — the serialized message
+// held ready to put back on the wire.
+//
+// 1500 is the Ethernet MTU, which is the practical ceiling for a SIP/UDP
+// datagram this engine will emit without fragmenting. A message that does not
+// fit is stored truncated, flagged, and NEVER retransmitted (sending a truncated
+// SIP message is worse than sending nothing) — sweep() logs once when that
+// happens, so lost coverage is visible rather than silent.
+//
+// This is the dominant term in the layer's RAM cost:
+// (MAX_TRANSACTIONS + MAX_SERVER_TRANSACTIONS) × ~1.7 KB. On the default S3R8
+// profile that lands in PSRAM along with the rest of RequestsHandler. On a
+// no-PSRAM board (sdkconfig.defaults.esp32_constrained) it is internal RAM —
+// lower this, or the two pool counts above, for that tier. See docs/SCALING.md.
+#ifndef POCKETDIAL_TX_MSG_BYTES
+#define POCKETDIAL_TX_MSG_BYTES 1500
 #endif
 
 #endif

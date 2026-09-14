@@ -241,6 +241,14 @@ add_executable(sip_parser_tests
     # retransmit and drainOutbox()'s maybeTrack() scan, driven directly so the
     # same INVITE can be re-fed deterministically.
     TransactionLayer_test.cpp
+    # Issue #199 root cause 1: the rest of RFC 3261 §17 — the non-INVITE CLIENT
+    # transaction (Timer E/F/K) and both SERVER transactions (Timer G/H/I/J/L,
+    # plus the §13.3.1.4 2xx-retransmit-until-ACK). Also pins the two rules that
+    # keep the layer from doing harm: only responses this PBX AUTHORED are
+    # retransmitted (a relayed 200 OK belongs to the callee phone, which is
+    # already retransmitting it), and freeForCallId() must not cancel the very
+    # BYE that is tearing the dialog down.
+    TransactionLayerRfc17_test.cpp
     BlfSubscriptions_test.cpp
     DashboardSnapshot_test.cpp
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —

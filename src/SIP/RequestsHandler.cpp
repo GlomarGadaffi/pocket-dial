@@ -714,6 +714,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// after the pcap capture on purpose, so the refused bytes are there to
 		// look at.
 		bool sdpRefused = false;
+		// Set when the §17.2 server transaction answered this packet from its
+		// stored response, which means the TU must not see it at all.
+		bool absorbed   = false;
 		if (request->hasSdp() && !request->getBody().empty())
 		{
 			const auto verdict = request->checkSdp();
@@ -738,10 +741,40 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// like any other unhandled packet.
 		if (!sdpRefused)
 		{
-		// RFC 3261 §17 transaction layer: advance the state machine for any tracked
-		// InviteClient transaction before the TU handler runs. A 1xx moves Calling →
-		// Proceeding (stops retransmitting); a 2xx/3xx-6xx → Accepted/Completed.
+		// RFC 3261 §17 transaction layer, CLIENT half: advance the state machine
+		// for any tracked client transaction before the TU handler runs. A 1xx
+		// moves Calling → Proceeding (stops retransmitting an INVITE, caps the
+		// interval at T2 for a non-INVITE); a 2xx/3xx-6xx → Accepted/Completed.
 		_txLayer.matchAndAdvance(request);
+
+		// RFC 3261 §17.2 transaction layer, SERVER half: a retransmitted request
+		// this PBX has ALREADY answered is answered again from the stored
+		// response, and the TU is not re-run.
+		//
+		// Re-running it is what turns one lost packet into a second action: a
+		// retransmitted REFER transfers the call twice, a retransmitted INFO
+		// doubles a DTMF digit, and a retransmitted BYE draws a 481 for a dialog
+		// we tore down perfectly well the first time. The absorb also replaces
+		// onInvite's older "Task 2A" silent-drop guard for the cases it covers —
+		// silence made the phone keep retransmitting until ITS Timer B, where
+		// re-sending our 180/200 ends the retransmission immediately.
+		//
+		// Returns false for ACK (which it consumes internally to stop a 2xx
+		// retransmit, but must not swallow — onAck bridges media and completes
+		// transfer splices) and for anything with no matching server transaction,
+		// which is every first-arrival request.
+		if (_txLayer.absorbRetransmittedRequest(request))
+		{
+			_packetsAbsorbed.fetch_add(1, std::memory_order_relaxed);
+			queueLog("[tx] absorbed retransmitted " + std::string(request->getType())
+				+ " for callID=" + std::string(request->getCallID())
+				+ " — re-sent stored response", false);
+			absorbed = true;
+		}
+		}
+
+		if (!sdpRefused && !absorbed)
+		{
 
 		// Route responses by parsed numeric status code so dispatch is immune to
 		// reason-phrase variation (e.g. "486 Busy" vs "486 Busy Here"). Requests and
@@ -1025,6 +1058,15 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	// Echo the granted lease back in the Contact so the client knows when to refresh.
 	response->setContact(buildContact(fromNumber) + ";expires=" + std::to_string(grantedExpires));
+	// The registrar's 200 OK is the one message EVERY phone sees, on every lease
+	// period, before it ever places a call — which makes it the discovery point
+	// that matters most in practice. OPTIONS only tells a phone that bothers to
+	// ask; plenty never do, and a phone that has not learned `Supported:
+	// replaces` here will not offer BLF-key pickup at all.
+	//
+	// The PBX is unambiguously the UAS of a REGISTER, so there is no relay
+	// question on this path.
+	addCapabilityHeaders(*response);
 	endHandle(fromNumber, response);
 }
 
@@ -1076,15 +1118,37 @@ namespace
 	constexpr const char* kAcceptedBodyTypes = "application/sdp, application/dtmf-relay";
 }
 
+// Stamp this PBX's own capabilities onto a message it AUTHORED.
+//
+// ── Only ever on messages this PBX authors ───────────────────────────────────
+//
+// Never on a relayed one. For an ordinary extension-to-extension call this
+// engine is a forwarding proxy / forked-UAC hybrid, not a B2BUA: callee B's 200
+// OK reaches caller A almost verbatim, carrying B's OWN Allow/Supported. Writing
+// this PBX's list over B's would tell A that B accepts UPDATE and understands
+// `replaces` on the strength of the PBX supporting them — a claim about the far
+// end that the PBX is in no position to make. That is the same dishonesty the
+// `timer` exclusion below refuses to commit, so the rule is applied
+// symmetrically: authored messages only. The same boundary governs which
+// responses earn a server transaction (TransactionLayer::authoredHere).
+//
+// ── setHeaderOnce, not addHeader ─────────────────────────────────────────────
+//
+// Responses here are built by CLONING the request, and getMessageFromPool(const
+// SipMessage&) copies every header line — so a phone that put `Allow:` in its
+// own REGISTER has already put an Allow line in our 200 OK before we get here.
+// addHeader() appends unconditionally and would emit both, which reads on the
+// wire as one merged capability set belonging to nobody. setHeaderOnce()
+// replaces, leaving exactly one line.
 void RequestsHandler::addCapabilityHeaders(SipMessage& response) const
 {
-	response.addHeader("Allow", kAllowedMethods);
-	response.addHeader("Supported", kSupportedOptionTags);
-	response.addHeader("Accept", kAcceptedBodyTypes);
+	response.setHeaderOnce("Allow", kAllowedMethods);
+	response.setHeaderOnce("Supported", kSupportedOptionTags);
+	response.setHeaderOnce("Accept", kAcceptedBodyTypes);
 	// RFC 6665 §4.4.1: a UA that accepts SUBSCRIBE advertises its packages.
 	// BlfSubscriptions::onSubscribe() implements exactly one, the RFC 4235
 	// "dialog" package, and 489s anything else (BlfSubscriptions.cpp:145-154).
-	response.addHeader("Allow-Events", "dialog");
+	response.setHeaderOnce("Allow-Events", "dialog");
 }
 
 void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
@@ -3964,43 +4028,65 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 			return;
 		}
 
-		if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos)
+		// Re-INVITE answer (hold/resume): relay 200 OK to the opposite leg and
+		// preserve the session state set by onReinvite() — do NOT re-run connect.
+		// Applies equally to a broadcast/ring-group session once it is
+		// Connected or Held (#74): after the first-answer connect path runs,
+		// getSrc()/getDest() name exactly the two live legs (original caller,
+		// answering client) the same way a unicast session's do, so the same
+		// source-address peer lookup relays a hold/resume 200 OK for either.
+		//
+		// UPDATE rides this same relay (#199 root cause 2). onUpdate() forwards an
+		// SDP-bearing UPDATE to the opposite leg and relies on the peer's 200 OK
+		// coming back through here — but this block used to sit INSIDE an
+		// `if (CSeq contains INVITE)` gate, so a `CSeq: n UPDATE` response matched
+		// nothing, fell past the Bye check at the bottom of onOk(), and was
+		// silently dropped. The sender's UPDATE transaction then timed out.
+		//
+		// That was survivable only because nothing told phones this PBX accepts
+		// UPDATE. Advertising `Allow: UPDATE` (which is what makes RFC 3311
+		// reachable at all — §5.1 forbids a compliant UAC from sending UPDATE
+		// otherwise) would have turned a dormant gap into an active regression on
+		// exactly the well-behaved phones the header is meant to serve. Hoisting
+		// the block out of the INVITE gate is behaviour-identical for INVITE — it
+		// still runs after the anchor-inbound and Cancel checks and still returns
+		// before the broadcast/connect path — and adds the UPDATE case.
+		const bool isInviteCSeq =
+			data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos;
+		const bool isUpdateCSeq =
+			data->getCSeq().find(SipMessageTypes::UPDATE) != std::string::npos;
+
+		if (isInviteCSeq || isUpdateCSeq)
 		{
-			// Re-INVITE answer (hold/resume): relay 200 OK to the opposite leg and
-			// preserve the session state set by onReinvite() — do NOT re-run connect.
-			// Applies equally to a broadcast/ring-group session once it is
-			// Connected or Held (#74): after the first-answer connect path runs,
-			// getSrc()/getDest() name exactly the two live legs (original caller,
-			// answering client) the same way a unicast session's do, so the same
-			// source-address peer lookup relays a hold/resume 200 OK for either.
+			const auto st = session.value()->getState();
+			if (st == Session::State::Connected || st == Session::State::Held)
 			{
-				const auto st = session.value()->getState();
-				if (st == Session::State::Connected || st == Session::State::Held)
+				auto legSrc  = session.value()->getSrc();
+				auto legDest = session.value()->getDest();
+				if (legSrc && legDest)
 				{
-					auto legSrc  = session.value()->getSrc();
-					auto legDest = session.value()->getDest();
-					if (legSrc && legDest)
+					std::shared_ptr<SipClient> peer;
+					if (sameAddress(data->getSource(), legSrc->getAddress()))
 					{
-						std::shared_ptr<SipClient> peer;
-						if (sameAddress(data->getSource(), legSrc->getAddress()))
-						{
-							peer = legDest;
-						}
-						else if (sameAddress(data->getSource(), legDest->getAddress()))
-						{
-							if (!data->getBody().empty())
-								session.value()->setRemoteSdp(std::string(data->getBody()));
-							peer = legSrc;
-						}
-						if (peer)
-						{
-							_outbox.emplace_back(peer->getAddress(), data);
-							return;
-						}
+						peer = legDest;
+					}
+					else if (sameAddress(data->getSource(), legDest->getAddress()))
+					{
+						if (!data->getBody().empty())
+							session.value()->setRemoteSdp(std::string(data->getBody()));
+						peer = legSrc;
+					}
+					if (peer)
+					{
+						_outbox.emplace_back(peer->getAddress(), data);
+						return;
 					}
 				}
 			}
+		}
 
+		if (isInviteCSeq)
+		{
 			if (session.value()->isBroadcast())
 			{
 				// Only the first answer from a pending fork (Invited state) should run
@@ -7149,6 +7235,15 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	ok->setVia(sipwire::viaWithReceived(inviteMsg->getVia(), inviteMsg->getSource()));
 	ok->setTo(std::string(inviteMsg->getTo()) + ";tag=" + toTag);
 	ok->setContact(buildContact(inviteMsg->getToNumber()));
+	// Every caller of this builder answers an INVITE the PBX itself terminates —
+	// the 888 conference leg, the 555/anchor bridge and the inbound-anchor
+	// handset leg — so the PBX is the real UAS on the dialog this 2xx opens and
+	// these headers describe it, not a phone being spoken for. RFC 3261 §13.3.1
+	// / §20.5: a 2xx to an INVITE SHOULD carry Allow, which is also the only
+	// place a phone looks to decide whether it may send UPDATE in this dialog
+	// (RFC 3311 §5.1). Added BEFORE the body work below so the header block is
+	// final when Content-Type/Content-Length are recomputed off the raw string.
+	addCapabilityHeaders(*ok);
 	ok->clearBody();
 	{
 		std::string raw = ok->toString();
