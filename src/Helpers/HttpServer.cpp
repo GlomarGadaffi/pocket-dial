@@ -3223,23 +3223,26 @@ void HttpServer::sendApiEmailTest(int sock, const std::string& body)
 	cfg.password = stored.pass;
 	cfg.commandTimeoutMs = 15000;
 
+	// The Workspace service-account path needs a bearer token, but this handler
+	// does NOT fetch one. Minting is an RSA-2048 signature plus a full TLS
+	// handshake to oauth2.googleapis.com, and this function runs on a
+	// per-connection HTTP handler thread -- an IDF pthread on the 8192-byte
+	// CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT. Every other TLS-handshake path in
+	// this codebase runs on a task with a dedicated 12 KB PSRAM stack for
+	// exactly that reason (PsramTask.hpp), and SmtpClient's worker is one of
+	// them.
+	//
+	// So the material is handed to the worker and it mints there. That also
+	// restores what SmtpClient::sendAndWait()'s contract already promised --
+	// "the caller's own thread never does socket/TLS I/O itself" -- which the
+	// inline fetch had quietly broken.
+	SmtpClient::TokenRequest token;
 	if (cfg.auth == SmtpDialogue::AuthMethod::XOAuth2)
 	{
-#if defined(ESP_PLATFORM) || defined(ESP32)
-		std::string tokErr;
-		if (!GoogleServiceAuth::getAccessToken(stored.gsaEmail, stored.user,
-		                                        "https://mail.google.com/", stored.gsaKey,
-		                                        cfg.accessToken, tokErr))
-		{
-			sendResponse(sock, 200, "OK", "application/json",
-			             "{\"ok\":false,\"error\":\"" + jsonEscape("OAuth token fetch failed: " + tokErr) + "\"}");
-			return;
-		}
-#else
-		sendResponse(sock, 200, "OK", "application/json",
-		             "{\"ok\":false,\"error\":\"XOAUTH2 token fetch is device-only -- not available on this build\"}");
-		return;
-#endif
+		token.serviceAccountEmail = stored.gsaEmail;
+		token.subjectUser         = stored.user;
+		token.scope               = "https://mail.google.com/";
+		token.privateKeyPem       = stored.gsaKey;
 	}
 
 	SmtpDialogue::Message msg;
@@ -3252,8 +3255,17 @@ void HttpServer::sendApiEmailTest(int sock, const std::string& body)
 	const bool allowPlain = (cfg.mode == SmtpDialogue::Mode::Plain);
 
 	SmtpDialogue::SendResult result;
+	// 20 s was sized for the SMTP session alone. A cold XOAUTH2 send now also
+	// pays the token mint on the worker (RSA-2048 sign + a TLS handshake to
+	// Google, ~1-2 s on this silicon with no ECC accelerator) before the SMTP
+	// session even starts, so the budget has to cover both or a first-of-the-hour
+	// test would report a spurious Timeout while the send was in fact fine.
+	// Cached-token sends are unaffected -- getAccessToken() reuses one until 60 s
+	// before expiry.
+	const uint32_t waitMs = token.serviceAccountEmail.empty() ? 20000u : 35000u;
+
 	bool dispatched = SmtpClient::sendAndWait(cfg, msg, allowPlain, stored.caPem, stored.insecureSkipVerify,
-	                                           20000, result);
+	                                           waitMs, result, token);
 
 	std::ostringstream json;
 	json << "{\"ok\":" << ((dispatched && result.ok()) ? "true" : "false")

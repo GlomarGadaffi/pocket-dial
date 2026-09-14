@@ -32,6 +32,7 @@
 	#include "esp_heap_caps.h"
 	#include "esp_timer.h"
 	#include "TimeSync.hpp"
+	#include "GoogleServiceAuth.hpp"
 	static const char* kTag = "SmtpClient";
 	#define PD_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #endif
@@ -447,6 +448,9 @@ namespace
 		bool allowPlain = false;
 		std::string caCertPem;
 		bool insecureSkipVerify = false;
+		// Snapshotted like everything else in the slot, so the worker owns its
+		// own copy of the key material and the caller can return immediately.
+		TokenRequest token;
 		SmtpDialogue::SendResult result;
 		StaticSemaphore_t semBuf;
 		SemaphoreHandle_t doneSem = nullptr; // created once, reused for the slot's lifetime
@@ -470,7 +474,38 @@ namespace
 			// has no clock (see its header comment).
 			job->msg.dateHeader = SmtpDialogue::formatRfc5322Date(timesync::epochSeconds());
 
-			job->result = sendNow(job->cfg, job->msg, job->allowPlain, job->caCertPem, job->insecureSkipVerify);
+			// Mint the XOAUTH2 bearer token HERE, on this task, not on whatever
+			// thread called sendAndWait(). This is an RSA-2048 signature plus a
+			// full TLS handshake to Google, and this task is the one with the
+			// 12 KB PSRAM stack sized for exactly that (see init()). The HTTP
+			// handler thread that used to do it inline runs on the 8192-byte
+			// IDF pthread default.
+			//
+			// Cheap on the common path: getAccessToken() serves a cached token
+			// until 60 s before expiry, so only the first send of an hour pays
+			// the RSA + handshake.
+			bool tokenOk = true;
+			if (!job->token.serviceAccountEmail.empty() && job->cfg.accessToken.empty())
+			{
+				std::string tokErr;
+				tokenOk = GoogleServiceAuth::getAccessToken(
+					job->token.serviceAccountEmail, job->token.subjectUser,
+					job->token.scope, job->token.privateKeyPem,
+					job->cfg.accessToken, tokErr);
+				if (!tokenOk)
+				{
+					// AuthRejected rather than TransportError: the transport was
+					// never reached, the credential is what failed.
+					job->result = SmtpDialogue::SendResult{
+						SmtpDialogue::ResultCode::AuthRejected, 0,
+						"OAuth token fetch failed: " + tokErr};
+				}
+			}
+
+			if (tokenOk)
+			{
+				job->result = sendNow(job->cfg, job->msg, job->allowPlain, job->caCertPem, job->insecureSkipVerify);
+			}
 
 			if (job->result.ok())
 			{
@@ -527,7 +562,8 @@ void init()
 
 bool sendAndWait(const SmtpDialogue::Config& cfg, const SmtpDialogue::Message& msg,
                   bool allowPlain, const std::string& caCertPem, bool insecureSkipVerify,
-                  uint32_t waitMs, SmtpDialogue::SendResult& result)
+                  uint32_t waitMs, SmtpDialogue::SendResult& result,
+                  const TokenRequest& token)
 {
 	if (g_queue == nullptr)
 	{
@@ -563,6 +599,7 @@ bool sendAndWait(const SmtpDialogue::Config& cfg, const SmtpDialogue::Message& m
 	slot->allowPlain = allowPlain;
 	slot->caCertPem = caCertPem;
 	slot->insecureSkipVerify = insecureSkipVerify;
+	slot->token = token;
 
 	if (xQueueSend(g_queue, &slot, 0) != pdTRUE)
 	{
@@ -596,8 +633,21 @@ void init() {}
 
 bool sendAndWait(const SmtpDialogue::Config& cfg, const SmtpDialogue::Message& msg,
                   bool allowPlain, const std::string& caCertPem, bool insecureSkipVerify,
-                  uint32_t /*waitMs*/, SmtpDialogue::SendResult& result)
+                  uint32_t /*waitMs*/, SmtpDialogue::SendResult& result,
+                  const TokenRequest& token)
 {
+	// Minting a bearer token needs GoogleServiceAuth::getAccessToken(), which is
+	// device-only (real network + cJSON). Refusing HERE rather than in the HTTP
+	// handler keeps the "device-only" knowledge in one place and means every
+	// caller gets the same answer -- the handler used to carry its own #else arm
+	// saying this, which would have drifted the moment a second caller appeared.
+	if (!token.serviceAccountEmail.empty() && cfg.accessToken.empty())
+	{
+		result = SmtpDialogue::SendResult{
+			SmtpDialogue::ResultCode::AuthRejected, 0,
+			"XOAUTH2 token fetch is device-only -- not available on this build"};
+		return false;
+	}
 	result = sendNow(cfg, msg, allowPlain, caCertPem, insecureSkipVerify);
 	return true;
 }

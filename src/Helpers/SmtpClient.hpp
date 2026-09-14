@@ -108,9 +108,34 @@ void init();
 // returns false (result.code = Timeout) if the worker has not finished
 // within `waitMs` -- in that case the send may still complete in the
 // background; the slot frees itself once it does.
+// The service-account material needed to MINT an XOAUTH2 bearer token, for the
+// Workspace path where the caller has no token yet.
+//
+// This exists so the minting happens on the WORKER, not on the caller's thread.
+// Fetching a token is not a lightweight lookup: it is an RSA-2048
+// mbedtls_pk_sign plus a full TLS handshake to oauth2.googleapis.com. Doing it
+// inline in an HTTP handler put roughly a second of RSA and a TLS session on an
+// IDF pthread running the 8192-byte CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT,
+// while every other TLS-handshake path in this codebase deliberately gets a
+// dedicated 12 KB PSRAM-backed stack (PsramTask.hpp). That is the same
+// unmeasured-stack-budget mistake the RFC 4733 drain had, and the same reason
+// sendAndWait()'s own contract below promises the caller's thread never does
+// socket/TLS I/O itself -- a promise the inline fetch quietly broke.
+//
+// Leave serviceAccountEmail empty for "nothing to mint": the App Password path
+// and any caller that already has a token in cfg.accessToken.
+struct TokenRequest
+{
+	std::string serviceAccountEmail;
+	std::string subjectUser;    // the mailbox being impersonated
+	std::string scope;          // e.g. "https://mail.google.com/"
+	std::string privateKeyPem;
+};
+
 bool sendAndWait(const SmtpDialogue::Config& cfg, const SmtpDialogue::Message& msg,
                   bool allowPlain, const std::string& caCertPem, bool insecureSkipVerify,
-                  uint32_t waitMs, SmtpDialogue::SendResult& result);
+                  uint32_t waitMs, SmtpDialogue::SendResult& result,
+                  const TokenRequest& token = {});
 
 } // namespace SmtpClient
 
