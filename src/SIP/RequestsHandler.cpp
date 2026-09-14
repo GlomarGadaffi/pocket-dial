@@ -773,6 +773,12 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		}
 		}
 
+		// Anything a handler forwards by pushing THIS object (rather than a clone)
+		// is a pass-through relay, not something the PBX sends on its own behalf.
+		// drainOutbox() reads this to keep a retransmit timer off it; see the
+		// member's declaration for why that matters.
+		_passThroughMsg = request.get();
+
 		if (!sdpRefused && !absorbed)
 		{
 
@@ -897,6 +903,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		_blf.refresh();
 
 		localOutbox = drainOutbox();
+		_passThroughMsg = nullptr;
 
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -7195,7 +7202,12 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 	// any individual enqueue.
 	for (const auto& [addr, msg] : _outbox)
 	{
-		_txLayer.maybeTrack(addr, msg);
+		// Skip the one thing that is not ours to retransmit: the inbound message
+		// itself, forwarded verbatim by a relay handler. See _passThroughMsg.
+		if (msg.get() != _passThroughMsg)
+		{
+			_txLayer.maybeTrack(addr, msg);
+		}
 		// Issue #33: /api/pcap capture, outbound side. Same single choke point as
 		// the retransmit registration above — every deferred message leaves
 		// through here regardless of which call site (handle(), tick(),

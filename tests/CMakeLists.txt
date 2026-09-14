@@ -249,6 +249,15 @@ add_executable(sip_parser_tests
     # already retransmitting it), and freeForCallId() must not cancel the very
     # BYE that is tearing the dialog down.
     TransactionLayerRfc17_test.cpp
+    # Issue #199 root cause 2: capability advertisement beyond OPTIONS. #200
+    # built addCapabilityHeaders() but wired it only into the OPTIONS 200 OK,
+    # which is not what gates UPDATE or Replaces on a conformant phone — it reads
+    # Allow off the dialog's own messages. Pins the advertisement on the
+    # registrar 200 and on 2xx the PBX authors as the real UAS, the absence of
+    # `timer` (RFC 4028 support here is passive — see #198), that a RELAYED
+    # answer keeps the callee's own capabilities, and that a phone's own Allow
+    # never survives into ours as a second header line.
+    CapabilityHeaders_test.cpp
     BlfSubscriptions_test.cpp
     DashboardSnapshot_test.cpp
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —

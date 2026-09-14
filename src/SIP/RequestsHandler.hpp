@@ -1108,6 +1108,26 @@ private:
 	// #70 ordering note on the definition. Caller holds _mutex.
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> drainOutbox();
 
+	// The inbound message currently being handled, or nullptr outside a handle()
+	// pass (tick() drains with this unset). Used by drainOutbox() for exactly one
+	// question: is an outbound entry the very object we just received?
+	//
+	// Several relay paths forward a message by pushing the SAME shared_ptr rather
+	// than a clone — onReinvite's hold/resume relay (RequestsHandler.cpp:6787),
+	// onUpdate's SDP relay (:6876), and the provisional relays that endHandle()
+	// `data` straight through. Those are pure pass-through: the PBX is not the
+	// sender, it is the wire. The originating phone owns retransmitting its own
+	// re-INVITE under its own transaction (same branch, RFC 3261 §17.1.1), and it
+	// keeps doing so until the far end's answer comes back through here — so a
+	// PBX-side timer on top would put a second copy of the same branch on the
+	// wire for every loss. That is the same double-send the authored-vs-relayed
+	// rule prevents on the response side, and pointer identity is the exact test
+	// for it: a message the PBX built is never the object it received.
+	//
+	// Raw pointer, not a shared_ptr: it is only ever compared, never dereferenced,
+	// and the shared_ptr in `request` outlives the whole pass.
+	const SipMessage* _passThroughMsg = nullptr;
+
 	std::string _serverIp;
 	std::string _localIp;   // resolved once at construction; avoids getPrimaryLocalIP() under _mutex
 	int         _serverPort;

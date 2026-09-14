@@ -64,6 +64,7 @@ sit a little under these figures.
 | **`SipClient`** | `std::string` extension (SSO, no heap for short numbers), `sockaddr_in` (16 B), `int`, 3× `steady_clock::time_point` (8 B each) | none (extension fits in SSO) | **~100 B** |
 | **`Session`** | `std::string` Call-ID (~32–40 B on heap), 2× `shared_ptr<SipClient>`, `State` enum, `time_point`, broadcast `vector` (empty for normal 1:1 calls) | ~40 B Call-ID | **~200 B** |
 | **`SipSdpMessage`** | base `SipMessage`: 12× `string_view` (16 B each ≈ 192 B), SDP adds 6 more + int; plus the owned **`std::string _messageStr`** holding the entire raw SIP+SDP packet | ~0.6–0.9 KB packet buffer | **~1 KB** |
+| **`SipTransaction`** | `char msg[POCKETDIAL_TX_MSG_BYTES]` retransmit buffer (1500 B), Call-ID/branch/CSeq-method char arrays (~212 B), `sockaddr_in`, 3× `time_point` | none — the buffer is inline, by design | **~1.75 KB** |
 
 **Reasoning:** clients are cheap because an extension like `"1001"` lives in the
 string's small-string-optimization buffer (no allocation). Sessions add a heap
@@ -71,25 +72,63 @@ Call-ID and a couple of `shared_ptr`s. The message objects dominate the budget:
 each one owns a full reusable packet buffer (the SDP body alone is several hundred
 bytes), which is precisely why we recycle them instead of reallocating per packet.
 
-### Default static budget (32 / 8 / 52)
+### Default static budget (32 / 8 / 52 / 40+16)
 
 ```
-clients :  32 × ~100 B  ≈   3.2 KB
-sessions:   8 × ~200 B  ≈   1.6 KB
-messages:  52 × ~1   KB ≈  53.2 KB   <-- dominant term
-                          ----------
-TOTAL                   ≈  ~58 KB static SRAM
+clients     :  32 × ~100 B  ≈   3.2 KB
+sessions    :   8 × ~200 B  ≈   1.6 KB
+messages    :  52 × ~1   KB ≈  53.2 KB
+transactions:  56 × ~1.75KB ≈  97.6 KB   <-- dominant term
+                              ----------
+TOTAL                       ≈ ~156 KB static SRAM
 ```
 
-> **Corrected.** This block previously used 32 messages and reported ~37 KB. The
-> default pool is the derived 52 (`PoolConfig.hpp:69-71`), so the real static cost
-> is ~58 KB — about 20 KB more than every earlier revision of this document
-> claimed. If you sized a board against the old number, re-check it.
+> **Corrected twice.** An early revision used 32 messages and reported ~37 KB;
+> that was fixed to ~58 KB when the derived 52-message default was accounted for
+> (`PoolConfig.hpp`). The figure above adds the transaction pools, which did not
+> exist at either earlier revision in anything like their current size. If you
+> sized a board against **either** older number, re-check it.
 
-The message pool is ~90% of the cost. On a generic ESP32 (~290–320 KB usable
-internal DRAM after the IDF/Wi-Fi stack) ~58 KB is still workable alongside the
-HTTP dashboard, DNS captive portal, and FreeRTOS tasks, but it is no longer the
-comfortable margin the old figure implied.
+**The transaction pools are now the dominant term, ahead of the message pool.**
+`sizeof(TransactionLayer)` is **99,912 B** at the defaults — measured, not
+estimated; `TxLifecycle.TheLayerStaticFootprintIsVisibleHere` in
+`tests/TransactionLayerRfc17_test.cpp` asserts a ceiling on it so the number
+cannot drift silently. It breaks down as 40 client slots
+(`POCKETDIAL_MAX_TRANSACTIONS`, sized `MAX_SESSIONS*2 + MAX_SUBSCRIPTIONS + 8` so
+a full BLF NOTIFY fan-out cannot evict INVITE retransmit coverage) plus 16 server
+slots (`POCKETDIAL_MAX_SERVER_TRANSACTIONS`), each carrying an inline 1500-byte
+copy of the message it may have to put back on the wire.
+
+That inline buffer is the whole cost and it is deliberate: a transaction must be
+able to retransmit after the pooled `SipMessage` it came from has been recycled
+into a different call, so it cannot hold a reference — it has to own the bytes.
+
+**On a no-PSRAM board this is internal DRAM and it matters.** The default S3R8
+profile has `CONFIG_SPIRAM_USE_MALLOC=y`, and `RequestsHandler` is far larger
+than the 16 KB always-internal threshold, so the whole engine — these pools
+included — lands in PSRAM. `sdkconfig.defaults.esp32_constrained` sets
+`CONFIG_SPIRAM=n`, and on that tier ~156 KB against ~290–320 KB of usable
+internal DRAM is no longer a comfortable margin. Note that the `POCKETDIAL_*`
+knobs are `-D` compiler flags, **not** Kconfig options, so switching to the
+constrained sdkconfig does **not** scale them down on its own — the build has to
+pass them. For that tier, start with:
+
+```
+-DPOCKETDIAL_MAX_TRANSACTIONS=16 \
+-DPOCKETDIAL_MAX_SERVER_TRANSACTIONS=6 \
+-DPOCKETDIAL_TX_MSG_BYTES=900
+```
+
+which brings the layer to roughly 25 KB. The trade is real and worth stating
+plainly: fewer slots means pool exhaustion sheds retransmit tracking sooner (the
+message still goes out once — the pre-transaction-layer behaviour), and a smaller
+buffer means any message over the limit is stored truncated and never
+retransmitted at all. Both degrade loudly rather than silently — exhaustion logs
+`[tx] client pool exhausted` / `[tx] server pool exhausted`, and an oversized
+message logs `[tx] message too large to retransmit` naming the method and
+Call-ID. 900 bytes comfortably holds a BYE, CANCEL, NOTIFY or a bodiless
+response; it will truncate an INVITE carrying a large SDP offer, so check those
+logs on a constrained build before trusting the number.
 
 ---
 
