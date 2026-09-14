@@ -249,6 +249,12 @@ add_executable(sip_parser_tests
     # already retransmitting it), and freeForCallId() must not cancel the very
     # BYE that is tearing the dialog down.
     TransactionLayerRfc17_test.cpp
+    # Issue #228: /api/kill's forceDisconnect() tore a call down server-side
+    # only — no BYE to either phone, and an inline erase that bypassed
+    # endCall() (no CDR, DTMF accumulator and #226 transaction slots leaked).
+    # Pins: one BYE per leg on the right dialog tags via _asyncOutbox, and
+    # endCall()'s side effects actually happening.
+    ForceDisconnect_test.cpp
     # Issue #199 root cause 2: capability advertisement beyond OPTIONS. #200
     # built addCapabilityHeaders() but wired it only into the OPTIONS 200 OK,
     # which is not what gates UPDATE or Replaces on a conformant phone — it reads
