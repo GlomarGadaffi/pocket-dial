@@ -249,9 +249,9 @@ R"html1(  align-items:flex-start;justify-content:center;padding:24px 14px;overfl
 .wifi-ssid{color:var(--ink);font-family:var(--mono)}
 .wifi-meta{font-size:11px;color:var(--ink-dim);font-family:var(--mono)}
 
-#ota-prog{display:none;height:14px;border:1px solid var(--line-hi);border-radius:4px;background:var(--void);position:relative;margin:8px 0;overflow:hidden}
-#ota-bar{height:100%;width:0;background:var(--brass);transition:width .15s}
-#ota-pct{position:absolute;inset:0;text-align:center;font-size:10px;line-height:14px;font-family:var(--mono);color:#fff;text-shadow:0 0 3px #000}
+#ota-prog,#moh-prog{display:none;height:14px;border:1px solid var(--line-hi);border-radius:4px;background:var(--void);position:relative;margin:8px 0;overflow:hidden}
+#ota-bar,#moh-bar{height:100%;width:0;background:var(--brass);transition:width .15s}
+#ota-pct,#moh-pct{position:absolute;inset:0;text-align:center;font-size:10px;line-height:14px;font-family:var(--mono);color:#fff;text-shadow:0 0 3px #000}
 
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%) translateY(80px);
   background:var(--face-raised);border:1px solid var(--brass-lo);border-radius:6px;color:var(--ink);
@@ -331,6 +331,7 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
     <button class="rbtn" onclick="openModal('dialplan-modal')" title="Dial Plan (F2)">&#9776; Dial Plan</button>
     <button class="rbtn" onclick="openModal('groups-modal')" title="Ring Groups &amp; Forwarding (F3)">&#9778; Groups</button>
     <button class="rbtn" onclick="openModal('cdr-modal')" title="Call Log (F4)">&#9779; Call Log</button>
+    <button class="rbtn" onclick="openPbxModal()" title="PBX Settings (F6)">&#9881; PBX</button>
     <button class="rbtn" onclick="openModal('trace-modal')" title="SIP Trace (F8)">&#9780; Trace</button>
     <button class="rbtn" onclick="openModal('wifi-modal');scanWifi()" title="WiFi (F9)">&#9783; WiFi</button>
     <button class="rbtn" onclick="openModal('admin-modal')" title="Admin">&#9919; Admin</button>
@@ -1217,7 +1218,8 @@ function renderAdminBadge(){
 function controlsUnlocked(){return adminState.authenticated&&!adminState.needsSetup;}
 function applyAuthGating(){
   var unlocked=controlsUnlocked();
-  ["wifi-connect-btn","wifi-ap-btn","wifi-reset-btn","ota-upload-btn","ota-reboot-btn"].forEach(function(id){var b=$(id);if(b)b.disabled=!unlocked;});
+  ["wifi-connect-btn","wifi-ap-btn","wifi-reset-btn","ota-upload-btn","ota-reboot-btn",
+   "moh-upload-btn","moh-play-btn","moh-stop-btn"].forEach(function(id){var b=$(id);if(b)b.disabled=!unlocked;});
   var wn=$("wifi-admin-note");if(wn)wn.style.display=unlocked?"none":"block";
   var on=$("ota-gate-note");if(on)on.style.display=unlocked?"none":"block";
   var of=$("ota-file");if(of)of.disabled=!unlocked;
@@ -1620,6 +1622,84 @@ function removeDidMapping(did){
     .catch(function(e){setMsg("did-msg",e.message,"err");});
 }
 
+/* ════ PBX SETTINGS / MUSIC ON HOLD ════ */
+var mohUploading=false;
+function openPbxModal(){openModal("pbx-modal");fetchMohStatus();}
+function fmtClock(s){s=Math.max(0,Math.round(s||0));var m=Math.floor(s/60);var r=s%60;return m+":"+(r<10?"0":"")+r;}
+function fetchMohStatus(){
+  fetch("/api/moh",{credentials:"same-origin"}).then(function(r){
+    if(r.status===401){handleAuthExpired();return null;}
+    return r.json();
+  }).then(function(d){
+    if(!d)return;
+    var clip=$("moh-clip"),lis=$("moh-listeners");
+    if(!d.supported){
+      /* No card in this build at all — say so plainly rather than showing an
+         empty clip line the operator would read as "nothing uploaded yet". */
+      if(clip){clip.textContent="Not available — this build has no SD card support";}
+      if(lis)lis.textContent="—";
+      return;
+    }
+    if(clip)clip.textContent=d.loaded?("loaded — "+fmtClock(d.seconds)):"No clip on the card";
+    if(lis){
+      var n=d.listeners||0;
+      /* A preview is itself a listener, so name it instead of leaving the
+         operator wondering who the extra listener is. */
+      lis.textContent=(n===1?"1 caller":n+" callers")+(d.preview?" (previewing to "+d.preview+")":"");
+    }
+    if(d.preview)setMsg("moh-preview-msg","Playing to "+d.preview+".","ok");
+  }).catch(function(){});
+}
+function mohUpload(){
+  if(mohUploading)return;
+  if(!controlsUnlocked()){setMsg("moh-msg","Admin login required.","err");return;}
+  var fileEl=$("moh-file");var file=fileEl&&fileEl.files&&fileEl.files[0];
+  if(!file){setMsg("moh-msg","Choose a .wav file first.","err");return;}
+  var prog=$("moh-prog"),bar=$("moh-bar"),pct=$("moh-pct");
+  prog.style.display="block";bar.style.width="0%";pct.textContent="0%";
+  mohUploading=true;$("moh-upload-btn").disabled=true;
+  setMsg("moh-msg","Uploading "+file.name+" ("+file.size.toLocaleString()+" bytes)…","warn");
+  var xhr=new XMLHttpRequest();
+  xhr.open("POST","/api/moh/upload",true);xhr.withCredentials=true;
+  xhr.setRequestHeader("Content-Type","application/octet-stream");
+  xhr.setRequestHeader("X-CSRF",PD_CSRF);
+  xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);bar.style.width=p+"%";pct.textContent=p+"%";}};
+  xhr.onload=function(){
+    mohUploading=false;applyAuthGating();
+    if(xhr.status===200){
+      bar.style.width="100%";pct.textContent="100%";
+      setMsg("moh-msg","Upload complete. Reboot to load the new clip.","ok");
+      fetchMohStatus();
+    }
+    else if(xhr.status===401){handleAuthExpired();setMsg("moh-msg","Session expired — please log in.","err");}
+    else if(xhr.status===422){setMsg("moh-msg","Not a valid 8 kHz mono µ-law WAV — convert it with tools/gen_moh.py.","err");}
+    else if(xhr.status===413){setMsg("moh-msg","File is too large (8 MB max).","err");}
+    else if(xhr.status===501){setMsg("moh-msg","No SD card on this build.","err");}
+    else {
+      var info={};try{info=JSON.parse(xhr.responseText);}catch(e){}
+      setMsg("moh-msg",info.error||("Upload failed (HTTP "+xhr.status+")."),"err");
+    }
+  };
+  xhr.onerror=function(){mohUploading=false;applyAuthGating();setMsg("moh-msg","Upload failed — network error.","err");};
+  xhr.send(file);
+}
+function mohPreview(){
+  if(!gateCheck())return;
+  var ext=$("moh-preview-ext").value.trim();
+  if(!ext){setMsg("moh-preview-msg","Enter an extension to ring.","err");return;}
+  if(!isDialTokenSafeJs(ext)){setMsg("moh-preview-msg","Extension may contain only letters, digits, '#' and '*'.","err");return;}
+  setMsg("moh-preview-msg","Ringing "+ext+"…","warn");
+  post("/api/moh/preview","extension="+encodeURIComponent(ext))
+    .then(function(){setMsg("moh-preview-msg","Ringing "+ext+" — answer to listen.","ok");fetchMohStatus();})
+    .catch(function(e){setMsg("moh-preview-msg",e.message,"err");});
+}
+function mohPreviewStop(){
+  if(!gateCheck())return;
+  post("/api/moh/preview/stop","")
+    .then(function(){setMsg("moh-preview-msg","Preview stopped.","ok");fetchMohStatus();})
+    .catch(function(e){setMsg("moh-preview-msg",e.message,"err");});
+}
+
 /* ── keyboard shortcuts ── */
 document.addEventListener("keydown",function(e){
   if(e.key==="F1"){e.preventDefault();openModal("help-modal");}
@@ -1627,10 +1707,11 @@ document.addEventListener("keydown",function(e){
   else if(e.key==="F3"){e.preventDefault();openModal("groups-modal");}
   else if(e.key==="F4"){e.preventDefault();openModal("cdr-modal");}
   else if(e.key==="F5"){e.preventDefault();refreshNow();}
+  else if(e.key==="F6"){e.preventDefault();openPbxModal();}
   else if(e.key==="F8"){e.preventDefault();openModal("trace-modal");}
   else if(e.key==="F9"){e.preventDefault();openModal("wifi-modal");scanWifi();}
   else if(e.key==="Escape"){["jack-modal","admin-modal","wifi-modal","telephony-modal","help-modal",
-    "dialplan-modal","groups-modal","cdr-modal","trace-modal"].forEach(function(id){closeModal(id);});}
+    "dialplan-modal","groups-modal","cdr-modal","trace-modal","pbx-modal"].forEach(function(id){closeModal(id);});}
 });
 ["adm-user","adm-pass"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminLogin();});});
 ["adm-setup-user","adm-setup-pass","adm-setup-dtmfpin"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminCompleteSetup();});});
@@ -1645,7 +1726,68 @@ setInterval(fetchAdminStatus,15000);
 setInterval(function(){if(!otaUploading)fetchOtaStatus();},15000);
 setInterval(function(){if(adminState.authenticated&&adminState.sessionRemainingSec>0){adminState.sessionRemainingSec--;renderAdminBadge();}},1000);
 setInterval(function(){if($("telephony-modal").classList.contains("show"))renderTapiTestResult(tapiSelected);},5000);
+/* Only poll while the panel is actually open — listener count and preview
+   state both change from outside the browser (a caller parks, the previewed
+   extension hangs up), so a static panel would quietly go stale. */
+setInterval(function(){if($("pbx-modal").classList.contains("show"))fetchMohStatus();},3000);
 </script>
+
+<!-- ══ PBX SETTINGS MODAL ══
+     Device-wide switch behaviour — how the PBX acts, as opposed to the dial
+     plan and ring groups, which are about who it connects. Music on hold is
+     the first tenant; anything later of the same kind belongs here rather
+     than growing another toolbar button.
+
+     Placed last in the document purely for the 16 KB literal budget: .overlay
+     is position:fixed/inset:0, so a modal renders identically wherever it
+     sits in the DOM. -->
+<div class="overlay" id="pbx-modal">
+  <div class="modal">
+    <h3>&#9881; PBX Settings<span class="x" onclick="closeModal('pbx-modal')">&times;</span></h3>
+    <div class="mbody">
+
+      <div class="subhead">Music on Hold</div>
+      <div class="note">
+        Played to callers parked on an orbit (700&ndash;709). The clip is read off
+        the SD card into PSRAM once and streamed from memory, so the card is
+        never touched during a call. Every listener hears the same position in
+        the track &mdash; like a radio station rather than a per-caller player &mdash;
+        so a caller parked mid-song joins mid-song.
+      </div>
+      <div class="kv"><span class="k">Clip</span><span id="moh-clip">&mdash;</span></div>
+      <div class="kv"><span class="k">Listening now</span><span id="moh-listeners">&mdash;</span></div>
+
+      <div class="field"><label>Replace clip</label>
+        <input type="file" id="moh-file" accept=".wav,audio/wav,audio/wave"></div>
+      <div class="note" style="margin-top:0">
+        Must already be <strong>8 kHz mono &micro;-law WAV</strong>. That is the G.711
+        wire format itself, so playback is a straight copy with nothing decoded on
+        the device. <code>tools/gen_moh.py</code> converts anything else. 8 MB max;
+        a failed upload leaves the existing clip untouched.
+      </div>
+      <div class="row">
+        <button class="btn primary" id="moh-upload-btn" onclick="mohUpload()">&#8593; Upload Clip</button>
+      </div>
+      <div id="moh-prog"><div id="moh-bar"></div><div id="moh-pct">0%</div></div>
+      <div class="msg" id="moh-msg"></div>
+
+      <hr class="hr">
+      <div class="subhead">Preview</div>
+      <div class="note">
+        Rings an extension and plays the clip to it, so you can hear what a parked
+        caller hears without parking anyone. The PBX places this call as
+        <code>moh</code>. Answer the phone to listen; hang up, or press Stop, to end it.
+      </div>
+      <div class="did-row">
+        <input type="text" id="moh-preview-ext" inputmode="numeric" placeholder="Extension (e.g. 1001)">
+        <button class="btn primary" id="moh-play-btn" onclick="mohPreview()">&#9654; Play</button>
+        <button class="btn" id="moh-stop-btn" onclick="mohPreviewStop()">&#9632; Stop</button>
+      </div>
+      <div class="msg" id="moh-preview-msg"></div>
+
+    </div>
+  </div>
+</div>
 
 </body>
 </html>
