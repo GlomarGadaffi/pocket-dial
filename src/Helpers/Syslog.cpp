@@ -298,6 +298,27 @@ namespace Syslog
 		return s.configured;
 	}
 
+	std::string configuredHost()
+	{
+		SyslogState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+		if (!s.configured) return std::string();
+		// Rebuilt from the stored octets rather than kept as a second copy of the
+		// string: one source of truth, and configure() has already validated it.
+		char buf[16];
+		std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+		              (unsigned)s.addr[0], (unsigned)s.addr[1],
+		              (unsigned)s.addr[2], (unsigned)s.addr[3]);
+		return std::string(buf);
+	}
+
+	uint16_t configuredPort()
+	{
+		SyslogState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+		return s.port;
+	}
+
 	void loadFromNvs()
 	{
 #if SYSLOG_HAS_UDP
@@ -328,6 +349,59 @@ namespace Syslog
 		// Host builds have no NVS; tests call configure() directly.
 	}
 
+	bool saveToNvs(const std::string& host, uint16_t port)
+	{
+#if SYSLOG_HAS_UDP
+		// Apply first. configure() is the one place that validates the host, so a
+		// rejected address never reaches flash -- otherwise a typo would persist and
+		// silently disable logging on every subsequent boot.
+		if (!configure(host, port))
+		{
+			return false;
+		}
+
+		nvs_handle_t h;
+		if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+		{
+			return false;
+		}
+
+		esp_err_t err;
+		if (host.empty())
+		{
+			// Disable: erase rather than store an empty string, so loadFromNvs()'s
+			// 'absent key' path and the disabled state are the same thing.
+			// ESP_ERR_NVS_NOT_FOUND is success here -- already absent is the goal.
+			err = nvs_erase_key(h, \"syslog_host\");
+			if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+			esp_err_t e2 = nvs_erase_key(h, \"syslog_port\");
+			if (e2 == ESP_ERR_NVS_NOT_FOUND) e2 = ESP_OK;
+			if (err == ESP_OK) err = e2;
+		}
+		else
+		{
+			err = nvs_set_str(h, \"syslog_host\", host.c_str());
+			if (err == ESP_OK)
+			{
+				err = nvs_set_u32(h, \"syslog_port\", static_cast<uint32_t>(port));
+			}
+		}
+
+		if (err == ESP_OK)
+		{
+			err = nvs_commit(h);
+		}
+		nvs_close(h);
+		return err == ESP_OK;
+#else
+		// Host builds have no NVS. Apply to the live state so tests and the host
+		// binary behave, but report honestly that nothing was persisted.
+		(void)port;
+		configure(host, port);
+		return false;
+#endif
+	}
+
 	void send(Severity severity, Facility facility, const char* appName, const char* msg)
 	{
 		SyslogState& s = state();
@@ -337,9 +411,19 @@ namespace Syslog
 			return;
 		}
 
-		// Fixed stack buffer, no heap — this can run on the log-drain task or a
-		// SIP path (CLAUDE.md invariant 1).
-		char frame[kMaxFrameBytes];
+		// STATIC, not a stack local, and not heap. Two reasons, both load-bearing.
+		//
+		// The engine invariant forbids heap in this path (CLAUDE.md invariant 1).
+		// But a 480-byte stack frame is what kept this module unwired: its intended
+		// producer is the LogQueue drain task, which runs on a 2048-byte stack and
+		// already spends 256 of it on drainToUart()'s own line buffer -- adding 480
+		// more on top of the lwip send() path was the reason the original syslog
+		// commit shipped the formatter but hooked up nothing.
+		//
+		// Safe because every entry to this function already holds s.mutex (acquired
+		// above), so there is exactly one writer at a time. The buffer costs 480
+		// bytes of BSS once, instead of 480 bytes on whichever task happens to log.
+		static char frame[kMaxFrameBytes];
 		const size_t len = formatFrame(frame, sizeof(frame), severity, facility, appName, msg);
 		if (len == 0)
 		{

@@ -195,12 +195,26 @@ namespace Syslog
 	// nothing actually being emitted (see the layering note at the top).
 	bool isConfigured();
 
+	// What the board believes it is pointed at. Not a secret -- a collector
+	// address is infrastructure, not a credential -- and an operator debugging
+	// "why am I getting no logs" needs to see it. Empty host when unconfigured.
+	std::string configuredHost();
+	uint16_t    configuredPort();
+
 	// Read the destination from NVS at boot: namespace "pbxcfg", key
 	// "syslog_host" (a dotted-quad string) and optional "syslog_port" (u32,
 	// default 514). Absent/empty host leaves the sink disabled, which is exactly
 	// how a unit that never had the feature turned on behaves. No-op off-device
 	// (no NVS there — tests call configure() directly).
 	void loadFromNvs();
+
+	// Persist host/port to NVS and apply them immediately. The counterpart to
+	// loadFromNvs(): without this, the keys loadFromNvs() reads had no writer
+	// anywhere in the firmware, so remote logging could not be turned on at all.
+	// An empty host clears the keys and disables the sink.
+	// Returns false if the host is non-empty and not a valid dotted-quad, or if
+	// NVS refuses the write -- callers surface that rather than silently no-op.
+	bool saveToNvs(const std::string& host, uint16_t port);
 
 	// Emit one frame. No-op when unconfigured. Never blocks, never throws, never
 	// logs (see the RE-ENTRANCY RULE above). `appName` is the event class the

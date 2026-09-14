@@ -195,6 +195,8 @@ private:
 	// the runtime state separately, so a client can tell "no card on this board"
 	// from "no clip uploaded yet". Preview rings an extension and streams the clip
 	// to it, which is how an operator checks a clip without parking a real call.
+	void sendApiSyslogStatus(int sock);
+	void sendApiSyslogSet(int sock, const std::string& body);
 	void sendApiMohStatus(int sock);
 	void sendApiMohPreview(int sock, const std::string& body);
 	void sendApiMohPreviewStop(int sock);

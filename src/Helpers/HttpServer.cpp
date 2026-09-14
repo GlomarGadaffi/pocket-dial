@@ -11,7 +11,8 @@
 #include "ProvisioningConfig.hpp"
 #include "index_html.h"
 #include "IPHelper.hpp"
-#include "UrlEncode.hpp"        // single source of truth for urlDecode (see below)
+#include "UrlEncode.hpp"
+#include "Syslog.hpp"        // single source of truth for urlDecode (see below)
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -485,6 +486,19 @@ void HttpServer::handleClient(int clientSock)
 		{
 			sendApiKill(clientSock, req.body);
 		}
+	}
+	else if (req.method == "GET" && req.path == "/api/syslog")
+	{
+		// Gated. The collector address is infrastructure detail, and #207 was filed
+		// about a read endpoint that had been ungated by analogy rather than by
+		// analysis -- so this takes the conservative side deliberately.
+		if (!requireAdmin(clientSock, req, false)) return;
+		sendApiSyslogStatus(clientSock);
+	}
+	else if (req.method == "POST" && req.path == "/api/syslog")
+	{
+		if (!requireAdmin(clientSock, req, true)) return;
+		sendApiSyslogSet(clientSock, req.body);
 	}
 	else if (req.method == "GET" && req.path == "/api/moh")
 	{
@@ -1000,6 +1014,15 @@ void HttpServer::sendApiStatus(int sock)
 	json << "\"ip\":\"" << jsonEscape(displayIp) << "\",";
 	json << "\"port\":" << 5060 << ",";
 	json << "\"httpPort\":" << _port << ",";
+	// #167: state the board's WiFi capability rather than leaving the dashboard
+	// to infer it from an empty scan result. An eth/lan8720 build has no radio at
+	// all, so "found 0 networks" is not an empty scan -- it is a scan that can
+	// never succeed, and the two are indistinguishable to a client without this.
+#if defined(POCKETDIAL_HAS_WIFI)
+	json << "\"wifiCapable\":true,";
+#else
+	json << "\"wifiCapable\":false,";
+#endif
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
@@ -2257,7 +2280,7 @@ void HttpServer::sendApiWifiScan(int sock)
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 #else
 	sendResponse(sock, 200, "OK", "application/json", 
-	             "{\"networks\":[], \"note\":\"WiFi scan not available on desktop\"}");
+	             "{\"networks\":[], \"note\":\"WiFi is not available on this build -- this board has no WiFi radio in its current Ethernet-transport configuration\"}");
 #endif
 }
 
@@ -2295,7 +2318,7 @@ void HttpServer::sendApiWifiConnect(int sock, const std::string& body)
 #else
 	(void)password;
 	sendResponse(sock, 501, "Not Implemented", "application/json",
-	             "{\"error\":\"WiFi connect not available on desktop\"}");
+	             "{\"error\":\"WiFi is not available on this build -- this board has no WiFi radio in its current Ethernet-transport configuration\"}");
 #endif
 }
 
@@ -2320,7 +2343,7 @@ void HttpServer::sendApiWifiModeAp(int sock)
 	}, "restart_task", 2048, NULL, 5, NULL);
 #else
 	sendResponse(sock, 501, "Not Implemented", "application/json",
-	             "{\"error\":\"WiFi mode select not available on desktop\"}");
+	             "{\"error\":\"WiFi is not available on this build -- this board has no WiFi radio in its current Ethernet-transport configuration\"}");
 #endif
 }
 
@@ -2820,6 +2843,61 @@ bool HttpServer::streamBody(int sock, const char* prefix, size_t prefixLen,
 		consumed += static_cast<size_t>(n);
 	}
 	return consumed == contentLength;
+}
+
+void HttpServer::sendApiSyslogStatus(int sock)
+{
+	// The host is reported back; there is no secret here (a collector address is
+	// not a credential), and an operator needs to see what the board thinks it is
+	// pointed at to debug 'why am I getting no logs'.
+	std::ostringstream json;
+	json << "{\"supported\":"
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	     << "true"
+#else
+	     << "false"
+#endif
+	     << ",\"enabled\":" << (Syslog::isConfigured() ? "true" : "false")
+	     << ",\"host\":\"" << jsonEscape(Syslog::configuredHost())
+	     << "\",\"port\":" << Syslog::configuredPort()
+	     << "}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiSyslogSet(int sock, const std::string& body)
+{
+	const std::string host = getFormParam(body, "host");
+	const std::string portStr = getFormParam(body, "port");
+
+	// Default 514 when omitted; an explicit out-of-range value is an error rather
+	// than something to silently clamp, because a clamped port fails later as a
+	// mysterious absence of logs.
+	long port = 514;
+	if (!portStr.empty())
+	{
+		char* end = nullptr;
+		port = std::strtol(portStr.c_str(), &end, 10);
+		if (end == portStr.c_str() || *end != '\0' || port < 1 || port > 65535)
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"port must be 1-65535\"}");
+			return;
+		}
+	}
+
+	// An empty host is the documented way to turn remote logging off, so it is a
+	// success, not a validation failure.
+	if (!Syslog::saveToNvs(host, static_cast<uint16_t>(port)))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"host must be a dotted-quad IPv4 address (no DNS resolver on this device), or empty to disable\"}");
+		return;
+	}
+
+	sendResponse(sock, 200, "OK", "application/json",
+	             host.empty()
+	               ? "{\"status\":\"ok\",\"message\":\"remote logging disabled\"}"
+	               : "{\"status\":\"ok\",\"message\":\"remote logging enabled\"}");
 }
 
 void HttpServer::sendApiMohStatus(int sock)
