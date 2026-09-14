@@ -165,6 +165,14 @@ add_executable(sip_parser_tests
     # every non-PCMU packet as "wrong codec", so a phone in its default DTMF mode
     # could not drive a server-side menu at all.
     TelephoneEvent_test.cpp
+    # Issue #199 item 3: the WIRING around that parser. Nothing ever called
+    # setDtmfPayloadType() or set a sink, so the whole RFC 4733 receive path was
+    # orphaned and the feature-code surface was unreachable from a stock handset.
+    # Covers one-report-per-keypress off a packet burst (only testable on host
+    # because dispatchDtmf() was split out of the socket loop), the media-task to
+    # SIP-thread hand-off, and de-duplication against a phone that sends the same
+    # press over BOTH RFC 4733 and SIP INFO.
+    Rfc4733Dtmf_test.cpp
     PlayoutBuffer_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp

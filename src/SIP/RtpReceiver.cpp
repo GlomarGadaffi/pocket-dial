@@ -189,6 +189,61 @@ bool RtpReceiver::setDtmfPayloadType(uint8_t pt, DtmfSink sink)
 	return true;
 }
 
+bool RtpReceiver::dispatchDtmf(const RtpPacket& pkt)
+{
+	// Split out of runLoop() so it is reachable from a host test. On host,
+	// start() is a no-op stub that never binds a socket (see MediaBridge.cpp's
+	// note), so everything downstream of recvfrom() is otherwise untestable off
+	// the device — and the press-dedupe below is the part most worth pinning.
+	const uint8_t dtmfPt = _dtmfPt.load(std::memory_order_acquire);
+	if (dtmfPt == kDtmfPayloadTypeUnset || pkt.payloadType != dtmfPt)
+	{
+		return false;   // not the negotiated telephone-event PT
+	}
+
+	DtmfEvent ev;
+	if (!parseTelephoneEvent(pkt.payload, pkt.payloadLen, ev))
+	{
+		return true;    // the right PT but a malformed body: consumed, not audio
+	}
+
+	const char digit = dtmfEventToChar(ev.event);
+	if (digit == '\0')
+	{
+		// Hook flash (16) or a tone event (17+): valid RFC 4733, not a keypad
+		// symbol. Swallow it rather than passing junk up.
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		ESP_LOGD("RtpReceiver", "non-digit telephone-event %u ignored",
+			static_cast<unsigned>(ev.event));
+#endif
+		return true;
+	}
+
+	// Dedupe on the event's RTP timestamp: every packet of one key press carries
+	// the timestamp of the press's START, so a change means a NEW press.
+	// Reporting on the first packet SEEN (rather than specifically the first
+	// sent, or waiting for E=1) keeps this loss-tolerant — any packet of the
+	// burst will do — and still fires exactly once per press.
+	if (_haveLastDtmf && pkt.timestamp == _lastDtmfTs)
+	{
+		return true;    // another packet of a press already reported
+	}
+	_lastDtmfTs   = pkt.timestamp;
+	_haveLastDtmf = true;
+
+	DtmfSink dtmfSink;
+	{
+		std::lock_guard<std::mutex> lk(_slotMutex);
+		dtmfSink = _dtmfSink;
+	}
+	if (dtmfSink)
+	{
+		// duration is in 8 kHz units -> ms.
+		dtmfSink(digit, static_cast<uint16_t>(ev.duration / 8));
+	}
+	return true;
+}
+
 RtpReceiver::RtpReceiver()
 {
 	_localPort.store(SERVER_RTP_RX_PORT, std::memory_order_release);
@@ -347,59 +402,6 @@ bool RtpReceiver::stop()
 		shutdown(_sock, SHUT_RDWR);
 	}
 	ESP_LOGI("RtpReceiver", "Media RX stop requested");
-	return true;
-}
-
-bool RtpReceiver::dispatchDtmf(const RtpPacket& pkt)
-{
-	// Split out of runLoop() so it is reachable from a host test. On host,
-	// start() is a no-op stub that never binds a socket (see MediaBridge.cpp's
-	// note), so everything downstream of recvfrom() is otherwise untestable off
-	// the device — and the press-dedupe below is the part most worth pinning.
-	const uint8_t dtmfPt = _dtmfPt.load(std::memory_order_acquire);
-	if (dtmfPt == kDtmfPayloadTypeUnset || pkt.payloadType != dtmfPt)
-	{
-		return false;   // not the negotiated telephone-event PT
-	}
-
-	DtmfEvent ev;
-	if (!parseTelephoneEvent(pkt.payload, pkt.payloadLen, ev))
-	{
-		return true;    // the right PT but a malformed body: consumed, not audio
-	}
-
-	const char digit = dtmfEventToChar(ev.event);
-	if (digit == '\0')
-	{
-		// Hook flash (16) or a tone event (17+): valid RFC 4733, not a keypad
-		// symbol. Swallow it rather than passing junk up.
-		ESP_LOGD("RtpReceiver", "non-digit telephone-event %u ignored",
-			static_cast<unsigned>(ev.event));
-		return true;
-	}
-
-	// Dedupe on the event's RTP timestamp: every packet of one key press carries
-	// the timestamp of the press's START, so a change means a NEW press.
-	// Reporting on the first packet SEEN (rather than specifically the first
-	// sent, or waiting for E=1) keeps this loss-tolerant — any packet of the
-	// burst will do — and still fires exactly once per press.
-	if (_haveLastDtmf && pkt.timestamp == _lastDtmfTs)
-	{
-		return true;    // another packet of a press already reported
-	}
-	_lastDtmfTs   = pkt.timestamp;
-	_haveLastDtmf = true;
-
-	DtmfSink dtmfSink;
-	{
-		std::lock_guard<std::mutex> lk(_slotMutex);
-		dtmfSink = _dtmfSink;
-	}
-	if (dtmfSink)
-	{
-		// duration is in 8 kHz units -> ms.
-		dtmfSink(digit, static_cast<uint16_t>(ev.duration / 8));
-	}
 	return true;
 }
 
