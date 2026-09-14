@@ -119,6 +119,12 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/RequestsHandler.cpp"
                             "../src/SIP/TransactionLayer.cpp"
                             "../src/SIP/Registrar.cpp"
+                            # The other direction: the board as a REGISTER client
+                            # (issue #164 groundwork). Not wired into any call
+                            # path yet -- the generic SIP trunk that will drive it
+                            # needs carrier credentials. Built here so the
+                            # firmware and the host suite compile the same code.
+                            "../src/SIP/SipRegistrationClient.cpp"
                             "../src/SIP/RegisterBeeper.cpp"
                             "../src/SIP/ParkOrbit.cpp"
                             # Music on hold for parked callers (#162): one global clip cursor, fanned
