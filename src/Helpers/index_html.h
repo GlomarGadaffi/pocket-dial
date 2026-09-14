@@ -216,14 +216,23 @@ input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(176
 
 /* ── MODAL / PANEL OVERLAY ── */
 .overlay{display:none;position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.66);backdrop-filter:blur(2px);
-  align-items:flex-start;justify-content:center;padding:24px 14px;overflow:auto}
+)html0";
+
+static const char PD_HTML_1[] =
+R"html1(  align-items:flex-start;justify-content:center;padding:24px 14px;overflow:auto}
 .overlay.show{display:flex}
 .modal{width:100%;max-width:480px;background:var(--face);border:1px solid var(--brass-lo);border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.7)}
+.modal.wide{max-width:780px}
 .modal h3{font-family:var(--mono);font-size:13px;letter-spacing:1px;color:var(--brass-hi);
   padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
 .modal h3 .x{margin-left:auto;cursor:pointer;color:var(--ink-dim);font-size:18px;line-height:1}
 .modal h3 .x:hover{color:var(--alert)}
 .modal .mbody{padding:14px;max-height:74vh;overflow:auto}
+.modal h3 .badge{margin-left:8px;font-size:11px;color:var(--paper-dim);border:1px solid var(--line-hi);
+  border-radius:10px;padding:1px 8px;letter-spacing:1px;text-transform:none}
+.dp-rule{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)}
+.dp-rule .pat{font-family:var(--mono);color:var(--brass-hi);min-width:104px}
+.dp-rule .act{font-size:11px;color:var(--ink-dim);flex:1}
 .hr{border:none;border-top:1px dashed var(--line-hi);margin:12px 0}
 .danger-zone{border-top:1px dashed var(--alert);margin-top:12px;padding-top:10px}
 .danger-zone .subhead{color:var(--alert)}
@@ -242,10 +251,7 @@ input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(176
 
 #ota-prog{display:none;height:14px;border:1px solid var(--line-hi);border-radius:4px;background:var(--void);position:relative;margin:8px 0;overflow:hidden}
 #ota-bar{height:100%;width:0;background:var(--brass);transition:width .15s}
-)html0";
-
-static const char PD_HTML_1[] =
-R"html1(#ota-pct{position:absolute;inset:0;text-align:center;font-size:10px;line-height:14px;font-family:var(--mono);color:#fff;text-shadow:0 0 3px #000}
+#ota-pct{position:absolute;inset:0;text-align:center;font-size:10px;line-height:14px;font-family:var(--mono);color:#fff;text-shadow:0 0 3px #000}
 
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%) translateY(80px);
   background:var(--face-raised);border:1px solid var(--brass-lo);border-radius:6px;color:var(--ink);
@@ -322,6 +328,10 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
   </div>
   <div class="header-actions">
     <button class="rbtn" onclick="refreshNow()" title="Refresh (F5)">&#8635; Refresh</button>
+    <button class="rbtn" onclick="openModal('dialplan-modal')" title="Dial Plan (F2)">&#9776; Dial Plan</button>
+    <button class="rbtn" onclick="openModal('groups-modal')" title="Ring Groups &amp; Forwarding (F3)">&#9778; Groups</button>
+    <button class="rbtn" onclick="openModal('cdr-modal')" title="Call Log (F4)">&#9779; Call Log</button>
+    <button class="rbtn" onclick="openModal('trace-modal')" title="SIP Trace (F8)">&#9780; Trace</button>
     <button class="rbtn" onclick="openModal('wifi-modal');scanWifi()" title="WiFi (F9)">&#9783; WiFi</button>
     <button class="rbtn" onclick="openModal('admin-modal')" title="Admin">&#9919; Admin</button>
     <button class="rbtn" onclick="openTelephonyModal()" title="Telephone Interconnect">&#9742; Interconnect</button>
@@ -348,20 +358,72 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
     </div>
   </section>
 
-  <!-- ══ RACK MODULES ══ -->
-  <section class="rack-grid">
+</main>
 
-    <article class="module">
-      <h2>Ring Groups &amp; Forwarding</h2>
-      <div class="body">
+<!-- ══ DIAL PLAN MODAL ══
+     The dial plan is the ONLY way to reach an outside trunk: there is no
+     hardcoded "9" prefix and no unregistered-destination fallback, so with an
+     empty table every outside number answers 404 without ever leaving the box.
+     First match wins, and the table is evaluated AFTER every reserved virtual
+     extension, so no rule can shadow 777/999/440/888/555/70x/*8. -->
+<div class="overlay" id="dialplan-modal">
+  <div class="modal wide">
+    <h3>&#9776; Dial Plan <span class="badge" id="dp-count">0</span><span class="x" onclick="closeModal('dialplan-modal')">&times;</span></h3>
+    <div class="mbody">
+      <div class="note">
+        Ordered rules, first match wins. <b>X</b> matches one digit; a trailing <b>*</b> matches any
+        remaining digits. Rules are evaluated after the reserved feature extensions, so a catch-all
+        can never shadow the echo test or a park orbit.
+      </div>
+      <div id="dp-list"><div class="note">Loading rules&hellip;</div></div>
+      <hr class="hr">
+      <div class="subhead">New / Edit Rule</div>
+      <div class="grid2">
+        <div>
+          <div class="field"><label>Pattern</label><input type="text" id="dp-pattern" placeholder="e.g. 9XXXXXXXXXX"></div>
+          <div class="field"><label>Action</label>
+            <select id="dp-action" onchange="dpActionChanged()">
+              <option value="trunk">Trunk (outside line)</option>
+              <option value="group">Ring group</option>
+              <option value="page">Page zone</option>
+              <option value="park">Park orbit</option>
+            </select>
+          </div>
+        </div>
+        <div>
+          <div class="field"><label id="dp-target-label">Prepend after stripping</label><input type="text" id="dp-target" placeholder="e.g. 1"></div>
+          <div class="field" id="dp-strip-field"><label>Strip leading digits</label><input type="text" id="dp-strip" inputmode="numeric" placeholder="e.g. 1" value="0"></div>
+        </div>
+      </div>
+      <div class="row">
+        <button class="btn primary" onclick="saveDialRule()">Save Rule</button>
+        <span class="note">Dialing <b>9</b> then <b>3057673260</b> with strip 1 / prepend 1 sends <b>13057673260</b>.</span>
+      </div>
+      <div class="msg" id="dp-msg"></div>
+      <p class="note">
+        <b>Deleting:</b> use the Delete button on a rule above. An empty target is what the API uses to
+        signal a delete, so a rule that strips digits and prepends nothing cannot be expressed today.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ══ RING GROUPS & FORWARDING MODAL ══ -->
+<div class="overlay" id="groups-modal">
+  <div class="modal wide">
+    <h3>&#9778; Ring Groups &amp; Forwarding<span class="x" onclick="closeModal('groups-modal')">&times;</span></h3>
+    <div class="mbody">
         <div class="grid2">
           <div>
             <div class="subhead">Ring / Hunt Groups</div>
-            <p class="note" style="margin-top:0">Cords on the bay above show live membership.</p>
+            <p class="note" style="margin-top:0">Cords on the jack board show live membership.</p>
             <div id="groups-list"></div>
             <hr class="hr">
             <div class="subhead">New / Edit Group</div>
-            <div class="field"><label>Group extension</label><input type="text" id="grp-ext" inputmode="numeric" placeholder="e.g. 600"></div>
+)html1";
+
+static const char PD_HTML_2[] =
+R"html2(            <div class="field"><label>Group extension</label><input type="text" id="grp-ext" inputmode="numeric" placeholder="e.g. 600"></div>
             <div class="field"><label>Members (comma separated)</label><input type="text" id="grp-members" placeholder="101,102,103"></div>
             <div class="field"><label>Mode</label>
               <select id="grp-mode"><option value="ringall">Ring all</option><option value="hunt">Hunt</option></select>
@@ -371,7 +433,7 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
               <span class="note">Empty members deletes the group.</span>
             </div>
             <div class="msg" id="grp-msg"></div>
-            <p class="note">Dial-plan rules: <code>POST /api/dialplan</code> (see docs/API.md)</p>
+            <p class="note">Routing an outside line? That lives under <b>Dial Plan</b>.</p>
           </div>
           <div>
             <div class="subhead">Per-Extension Forwarding</div>
@@ -387,22 +449,28 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
             <div class="msg" id="fwd-msg"></div>
           </div>
         </div>
-      </div>
-    </article>
+    </div>
+  </div>
+</div>
 
-    <article class="module full">
-      <h2>Call Log <span class="badge" id="cdr-count">0</span></h2>
-      <div class="body" style="padding:0">
+<!-- ══ CALL LOG MODAL ══ -->
+<div class="overlay" id="cdr-modal">
+  <div class="modal wide">
+    <h3>&#9779; Call Log <span class="badge" id="cdr-count">0</span><span class="x" onclick="closeModal('cdr-modal')">&times;</span></h3>
+    <div class="mbody" style="padding:0">
         <table>
           <thead><tr><th>Caller</th><th></th><th>Callee</th><th>Result</th><th>Duration</th><th>Age</th></tr></thead>
           <tbody id="cdr-tbody"><tr class="empty-row"><td colspan="6">No calls recorded yet</td></tr></tbody>
         </table>
-      </div>
-    </article>
+    </div>
+  </div>
+</div>
 
-    <article class="module full">
-      <h2>SIP Trace <span class="badge" id="trace-count">off</span></h2>
-      <div class="body">
+<!-- ══ SIP TRACE MODAL ══ -->
+<div class="overlay" id="trace-modal">
+  <div class="modal wide">
+    <h3>&#9780; SIP Trace <span class="badge" id="trace-count">off</span><span class="x" onclick="closeModal('trace-modal')">&times;</span></h3>
+    <div class="mbody">
         <div class="row" style="justify-content:space-between;margin-bottom:8px">
           <label class="toggle"><input type="checkbox" id="trace-toggle" onchange="toggleTrace()"><span class="track"><span class="knob"></span></span></label>
           <span class="note" style="margin:0">Flip the switch, or type <b>trace on</b> / <b>trace off</b> below. Downloadable as a full .pcap via <a href="/api/pcap">/api/pcap</a>.</span>
@@ -413,12 +481,9 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
           <input type="text" id="term-input" class="term-input" autocomplete="off" autocapitalize="off" spellcheck="false"
                  placeholder="trace on | trace off | help" onkeydown="if(event.key==='Enter')termExec()">
         </div>
-      </div>
-    </article>
-
-  </section>
-
-</main>
+    </div>
+  </div>
+</div>
 
 <!-- ══ JACK DETAIL MODAL ══ -->
 <div class="overlay" id="jack-modal">
@@ -477,10 +542,7 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
         </div>
         <div id="admin-changecred" style="display:none;margin-top:8px">
           <div class="field"><label>Username</label><input type="text" id="adm-changeuser" autocomplete="username"></div>
-)html1";
-
-static const char PD_HTML_2[] =
-R"html2(          <div class="field"><label>New password (min 8 chars)</label><input type="password" id="adm-changepass" autocomplete="new-password"></div>
+          <div class="field"><label>New password (min 8 chars)</label><input type="password" id="adm-changepass" autocomplete="new-password"></div>
           <button class="btn primary" onclick="adminChangeCredential()">Save</button>
         </div>
         <div id="admin-changedtmfpin" style="display:none;margin-top:8px">
@@ -555,7 +617,10 @@ R"html2(          <div class="field"><label>New password (min 8 chars)</label><i
       <div class="kv"><span class="k">OTA support</span><span id="ota-supported">&mdash;</span></div>
       <div class="kv"><span class="k">Running</span><span id="ota-running">&mdash;</span></div>
       <div class="kv"><span class="k">Boot / Next</span><span id="ota-parts">&mdash;</span></div>
-      <div class="msg" id="ota-state-msg"></div>
+)html2";
+
+static const char PD_HTML_3[] =
+R"html3(      <div class="msg" id="ota-state-msg"></div>
       <div class="note" id="ota-gate-note" style="display:none">Admin login required to update firmware.</div>
       <div class="field"><label>Firmware image (.bin)</label><input type="file" id="ota-file" accept=".bin"></div>
       <div id="ota-prog"><div id="ota-bar"></div><div id="ota-pct">0%</div></div>
@@ -704,10 +769,7 @@ function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");}
 function cssEsc(s){return String(s==null?"":s).replace(/["\\]/g,"\\$&");}
 function toast(msg,cls){var t=$("toast");t.textContent=msg;t.className=cls?("show "+cls):"show";clearTimeout(t._t);t._t=setTimeout(function(){t.className="";},2600);}
-)html2";
-
-static const char PD_HTML_3[] =
-R"html3(function fmtUptime(sec){sec=Math.floor(sec||0);var h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;function p(n){return(n<10?"0":"")+n;}return p(h)+":"+p(m)+":"+p(s);}
+function fmtUptime(sec){sec=Math.floor(sec||0);var h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;function p(n){return(n<10?"0":"")+n;}return p(h)+":"+p(m)+":"+p(s);}
 function setMsg(id,txt,cls){var e=$(id);if(e){e.textContent=txt||"";e.className="msg"+(cls?" "+cls:"");}}
 
 /* ── modals ── */
@@ -742,7 +804,10 @@ function buildIndex(d){
    extension — otherwise a jack flashes "active" for one poll tick right after
    every normal hangup. Unavailable is the one exception: it only ever appears
    when a destination genuinely could not be reached, never on a normal hangup,
-   so it is surfaced as "alert" rather than silently folded back to idle. */
+)html3";
+
+static const char PD_HTML_4[] =
+R"html4(   so it is surfaced as "alert" rather than silently folded back to idle. */
 function jackStateOf(e){
   if(e.parked)return "parked";
   var st=e.sessionState;
@@ -892,6 +957,61 @@ function saveGroup(){
     .then(function(){setMsg("grp-msg",members?("Group "+ext+" saved."):("Group "+ext+" deleted."),"ok");fetchStatus();})
     .catch(function(err){setMsg("grp-msg",err.message,"err");});
 }
+/* ── Dial plan ──
+   The only route to an outside trunk. Rendered from /api/status's dialplan[],
+   written through POST /api/dialplan. An empty target is the API's delete
+   signal, so "strip N, prepend nothing" is NOT expressible — the trunk form
+   below therefore requires a prepend value. */
+function dpActionChanged(){
+  var trunk=$("dp-action").value==="trunk";
+  $("dp-strip-field").style.display=trunk?"":"none";
+  $("dp-target-label").textContent=trunk?"Prepend after stripping":"Target extension";
+  $("dp-target").placeholder=trunk?"e.g. 1":"e.g. 600";
+}
+function dpDescribe(r){
+  if(r.action!=="trunk")return r.action+" → "+esc(r.target||"");
+  var strip=Number(r.stripDigits||0);
+  return "trunk → strip "+strip+", prepend "+esc(r.target||"");
+}
+function renderDialplan(d){
+  var rules=d.dialplan||[];
+  $("dp-count").textContent=rules.length;
+  var list=$("dp-list");
+  if(!rules.length){
+    list.innerHTML='<div class="note">No rules. Every outside number answers 404 until a trunk rule exists.</div>';
+    return;
+  }
+  list.innerHTML=rules.map(function(r,i){
+    return '<div class="dp-rule"><span class="pat">'+esc(r.pattern)+'</span>'
+      +'<span class="act">'+dpDescribe(r)+'</span>'
+      +'<button class="btn" onclick="deleteDialRule('+i+')">Delete</button></div>';
+  }).join("");
+}
+function saveDialRule(){
+  if(!gateCheck())return;
+  var pattern=$("dp-pattern").value.trim();
+  if(!pattern){setMsg("dp-msg","Pattern required.","err");return;}
+  var action=$("dp-action").value;
+  var target=$("dp-target").value.trim();
+  if(!target){setMsg("dp-msg","Target required — an empty target is the delete signal, so it cannot create a rule.","err");return;}
+  var body="pattern="+encodeURIComponent(pattern)+"&action="+action+"&target="+encodeURIComponent(target);
+  if(action==="trunk"){
+    var strip=$("dp-strip").value.trim()||"0";
+    if(!/^\d{1,3}$/.test(strip)){setMsg("dp-msg","Strip must be a small non-negative integer.","err");return;}
+    body+="&stripDigits="+strip;
+  }
+  post("/api/dialplan",body)
+    .then(function(){setMsg("dp-msg","Rule "+pattern+" saved.","ok");fetchStatus();})
+    .catch(function(err){setMsg("dp-msg",err.message,"err");});
+}
+function deleteDialRule(i){
+  if(!gateCheck())return;
+  var r=(statusData.dialplan||[])[i];
+  if(!r)return;
+  post("/api/dialplan","pattern="+encodeURIComponent(r.pattern)+"&target=")
+    .then(function(){setMsg("dp-msg","Rule "+r.pattern+" deleted.","ok");fetchStatus();})
+    .catch(function(err){setMsg("dp-msg",err.message,"err");});
+}
 function saveForward(){
   if(!gateCheck())return;
   var ext=$("fwd-ext").value.trim();
@@ -931,7 +1051,10 @@ function fmtAge(s){s=Math.floor(s||0);if(s<60)return s+"s ago";if(s<3600)return 
 var traceOn=false,traceTimer=null,traceSeen={};
 function toggleTrace(){
   if($("trace-toggle").checked&&!gateCheck()){$("trace-toggle").checked=false;return;}
-  if($("trace-toggle").checked)startTrace();else stopTrace();
+)html4";
+
+static const char PD_HTML_5[] =
+R"html5(  if($("trace-toggle").checked)startTrace();else stopTrace();
 }
 function startTrace(cmdEcho){
   traceOn=true;$("trace-toggle").checked=true;
@@ -983,10 +1106,7 @@ function termExec(){
   var line="pd> "+raw;
   var cmd=raw.trim().toLowerCase().replace(/\s+/g," ");
   if(cmd==="trace on"){
-)html3";
-
-static const char PD_HTML_4[] =
-R"html4(    if(traceOn){termEcho(line);termEcho("trace already on.");return;}
+    if(traceOn){termEcho(line);termEcho("trace already on.");return;}
     if(!gateCheck()){termEcho(line);termEcho("session required — log in above first.");return;}
     startTrace(line);
   }else if(cmd==="trace off"){
@@ -1014,7 +1134,7 @@ function put(url,body){return httpMethod("PUT",url,body);}
 function del(url,body){return httpMethod("DELETE",url,body);}
 function fetchStatus(){
   fetch("/api/status").then(function(r){return r.json();}).then(function(d){
-    statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);pushPacketSample(d.packetsProcessed||0);
+    statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);renderDialplan(d);pushPacketSample(d.packetsProcessed||0);
   }).catch(function(){failCount++;if(failCount>=2)setOnline(false);});
 }
 function fetchCdr(){
@@ -1174,7 +1294,10 @@ function renderRegistrar(d){
     var tdM=document.createElement("td");tdM.textContent=x.mac||"\u2014";
     var tdS=document.createElement("td");
     tdS.textContent=(x.state==="secured"?"secured":"learned")+(x.online?" \u00b7 online":"");
-    var tdA=document.createElement("td");
+)html5";
+
+static const char PD_HTML_6[] =
+R"html6(    var tdA=document.createElement("td");
     if(x.state!=="secured"){
       var b=document.createElement("button");
       b.className="btn";b.textContent="Secure";
@@ -1259,10 +1382,7 @@ function fetchOtaStatus(){
 }
 function otaUpload(){
   if(otaUploading)return;
-)html4";
-
-static const char PD_HTML_5[] =
-R"html5(  if(!controlsUnlocked()){setMsg("ota-msg","Admin login required.","err");return;}
+  if(!controlsUnlocked()){setMsg("ota-msg","Admin login required.","err");return;}
   var fileEl=$("ota-file");var file=fileEl&&fileEl.files&&fileEl.files[0];
   if(!file){setMsg("ota-msg","Choose a firmware .bin first.","err");return;}
   var prog=$("ota-prog"),bar=$("ota-bar"),pct=$("ota-pct");
@@ -1379,7 +1499,10 @@ function renderTapiSlots(){
     var tdR=document.createElement("td");tdR.textContent=s.routeDn||"—";
     var tdA=document.createElement("td");
     var eb=document.createElement("button");eb.className="btn";eb.textContent="Edit";
-    eb.onclick=function(){selectTapiSlot(i);};
+)html6";
+
+static const char PD_HTML_7[] =
+R"html7(    eb.onclick=function(){selectTapiSlot(i);};
     tdA.appendChild(eb);
     if(!s.active){
       var ab=document.createElement("button");ab.className="btn";ab.textContent="Activate";ab.style.marginLeft="4px";
@@ -1496,16 +1619,18 @@ function removeDidMapping(did){
 /* ── keyboard shortcuts ── */
 document.addEventListener("keydown",function(e){
   if(e.key==="F1"){e.preventDefault();openModal("help-modal");}
+  else if(e.key==="F2"){e.preventDefault();openModal("dialplan-modal");}
+  else if(e.key==="F3"){e.preventDefault();openModal("groups-modal");}
+  else if(e.key==="F4"){e.preventDefault();openModal("cdr-modal");}
   else if(e.key==="F5"){e.preventDefault();refreshNow();}
+  else if(e.key==="F8"){e.preventDefault();openModal("trace-modal");}
   else if(e.key==="F9"){e.preventDefault();openModal("wifi-modal");scanWifi();}
-  else if(e.key==="Escape"){["jack-modal","admin-modal","wifi-modal","telephony-modal","help-modal"].forEach(function(id){closeModal(id);});}
+  else if(e.key==="Escape"){["jack-modal","admin-modal","wifi-modal","telephony-modal","help-modal",
+    "dialplan-modal","groups-modal","cdr-modal","trace-modal"].forEach(function(id){closeModal(id);});}
 });
 ["adm-user","adm-pass"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminLogin();});});
 ["adm-setup-user","adm-setup-pass","adm-setup-dtmfpin"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminCompleteSetup();});});
-)html5";
-
-static const char PD_HTML_6[] =
-R"html6(["adm-changeuser","adm-changepass"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminChangeCredential();});});
+["adm-changeuser","adm-changepass"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminChangeCredential();});});
 (function(){var el=$("adm-changedtmfpin-val");if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminChangeDtmfPin();});})();
 
 /* ── init ── */
@@ -1520,7 +1645,7 @@ setInterval(function(){if($("telephony-modal").classList.contains("show"))render
 
 </body>
 </html>
-)html6";
+)html7";
 
 // One HttpServer::sendHtml() assembles these into a single std::string per
 // request (as it already did with the old single literal) -- the parts
@@ -1528,13 +1653,14 @@ setInterval(function(){if($("telephony-modal").classList.contains("show"))render
 // implicit NUL each array's initializer added, same as strlen() would but
 // resolved at compile time.
 static const HtmlPart CGA_INDEX_HTML_PARTS[] = {
-	{ PD_HTML_0,  sizeof(PD_HTML_0)  - 1 },
-	{ PD_HTML_1,  sizeof(PD_HTML_1)  - 1 },
-	{ PD_HTML_2,  sizeof(PD_HTML_2)  - 1 },
-	{ PD_HTML_3,  sizeof(PD_HTML_3)  - 1 },
-	{ PD_HTML_4,  sizeof(PD_HTML_4)  - 1 },
-	{ PD_HTML_5,  sizeof(PD_HTML_5)  - 1 },
-	{ PD_HTML_6,  sizeof(PD_HTML_6)  - 1 },
+	{ PD_HTML_0, sizeof(PD_HTML_0) - 1 },
+	{ PD_HTML_1, sizeof(PD_HTML_1) - 1 },
+	{ PD_HTML_2, sizeof(PD_HTML_2) - 1 },
+	{ PD_HTML_3, sizeof(PD_HTML_3) - 1 },
+	{ PD_HTML_4, sizeof(PD_HTML_4) - 1 },
+	{ PD_HTML_5, sizeof(PD_HTML_5) - 1 },
+	{ PD_HTML_6, sizeof(PD_HTML_6) - 1 },
+	{ PD_HTML_7, sizeof(PD_HTML_7) - 1 },
 };
 static constexpr size_t CGA_INDEX_HTML_PART_COUNT =
 	sizeof(CGA_INDEX_HTML_PARTS) / sizeof(CGA_INDEX_HTML_PARTS[0]);
