@@ -3,6 +3,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cinttypes> // PRIx32 -- uint32_t is `long unsigned int` on the xtensa-esp32s3
+                     // toolchain (not `unsigned int`), so a bare "%08x" against a
+                     // uint32_t argument is a real -Werror=format= build failure
+                     // there, even though it is silent on host platforms where
+                     // uint32_t happens to alias unsigned int. Caught by the ESP
+                     // compile-only build attempt, not by any host test.
 #include <cstdio>
 #include <cstring>
 
@@ -351,7 +357,7 @@ namespace
 		h += "MIME-Version: 1.0\r\n";
 		uint32_t n = g_messageIdCounter.fetch_add(1, std::memory_order_relaxed);
 		char midBuf[96];
-		std::snprintf(midBuf, sizeof(midBuf), "<pdmail-%08x@%s>", n, cfg.ehloName.c_str());
+		std::snprintf(midBuf, sizeof(midBuf), "<pdmail-%08" PRIx32 "@%s>", n, cfg.ehloName.c_str());
 		h += "Message-ID: ";
 		h += midBuf;
 		h += "\r\n";
