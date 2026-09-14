@@ -466,7 +466,9 @@ Cases worth pinning:
 > every outside number is answered `404` without leaving the box. Outbound goes over the
 > AnchorClient (HTTP/OAuth2 + call-control WebSocket + chunked-HTTPS PCM16), **not** a SIP
 > trunk: nothing in the tree ever sends a `REGISTER`, so the device never registers to an
-> ITSP. `POCKETDIAL_MAX_ANCHOR_CALLS` is `1` — one concurrent outside call. No E.164
+> ITSP. `POCKETDIAL_MAX_ANCHOR_CALLS` is `4`; the effective limit is `min(provider, 4)` and
+> the default loopback provider declares 1, so a stock board allows one concurrent outside
+> call and a real trunk four. No E.164
 > normalization exists anywhere.
 
 ### 3.16 GET `/config/<mac>.cfg`

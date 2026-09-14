@@ -13,15 +13,21 @@ The firmware architecture is divided into three core logical layers:
 2. **Signaling & State Engine Layer (`RequestsHandler`)**: A lightweight SIP registrar and session controller managing client registration leases, active SIP sessions, and intercom broadcasting/paging features. It implements a deliberately partial subset of RFC 3261; §1.2 states exactly which transactions exist and which do not.
 3. **User Interface & Query Layer**: Consists of a custom select-based, thread-dispatching `HttpServer` serving a retro CGA CRT web dashboard, an mDNS service responder, and a high-frequency LVGL-based GUI display task.
 
+The diagram below shows the **display (JC3248W535) build**, where Core 1 is reserved for
+LVGL and everything else is on Core 0. On the headless `eth` build there is no `lvgl_task`
+and both `sip_server_task` and `udp_receiver_task` move to Core 1 instead. The two are
+**always co-located** on the same core — `handle()` runs inline on the receiver task — so
+no build splits them the way an earlier revision of this diagram did.
+
 ```mermaid
 graph TD
-    subgraph Core 1 [Core 1: Graphics & Real-Time Loop]
+    subgraph Core 1 [Core 1: Graphics Only - display build]
         A[lvgl_task 10ms] -->|Drives| B["AXS15231B LCD (QSPI)"]
         A -->|Reads| C["AXS15231B Touch (I2C)"]
-        D[sip_server_task] -->|Runs| E[RequestsHandler::tick]
     end
 
-    subgraph Core 0 [Core 0: Network & Web Control]
+    subgraph Core 0 [Core 0: Network, SIP & Web Control]
+        D[sip_server_task] -->|Runs| E[RequestsHandler::tick]
         F[http_server_task] -->|Listens| G[TCP Port 80]
         G -->|Select Activity| H["Detached Thread Dispatch"]
         H -->|Lock-Free Read| I["Registrar Snapshot (Clients/Sessions)"]
@@ -63,7 +69,7 @@ What the engine *is* instead is a forked UAC coupled to a UAS — what `docs/FEA
 
 Either way the caller's `Call-ID` spans both legs. That is deliberate rather than sloppy: it is the `_sessions` key, which is how a mid-dialog request arriving from *either* leg resolves to the one session via `getSession(data->getCallID())`.
 
-Unlike a textbook B2BUA, it does not insert itself into the media path. SDP is relayed with only unsupported codecs filtered out, so an ordinary extension-to-extension call streams RTP directly phone-to-phone and the board never handles a media packet. The exceptions — `440`, `888`, `555` and outside lines — are tabulated under "Audio: what touches the board, and what doesn't" in the README.
+Unlike a textbook B2BUA, it does not insert itself into the media path. SDP is relayed with only unsupported codecs filtered out, so an ordinary extension-to-extension call streams RTP directly phone-to-phone and the board never handles a media packet. The exceptions — `440`, `888`, `555` and outside lines — are tabulated under "Audio: what touches the board, and what doesn't" in the README. **Add two the README table did not used to list: a call sitting on a park orbit when a music-on-hold clip is loaded (`ParkOrbit.cpp:56-75` answers the parked leg `sendonly` from the `HoldMusic` port, and `HoldMusic` then transmits to it every 20 ms), and the dashboard's MoH preview call (`RequestsHandler.cpp:2035-2064`), which rings an extension purely to play the clip at it.** Park with no clip loaded — the default — still answers `a=inactive` and sources nothing.
 
 ### 1.2 Transaction-Layer Scope
 
@@ -101,7 +107,7 @@ The system assigns FreeRTOS tasks to specific cores using `xTaskCreatePinnedToCo
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | `lvgl_task` | 5 | **Core 1** | *N/A* | 8192 Bytes | Runs the LVGL render loop (`lv_timer_handler()`) every 10ms. Must have exclusive Core 1 access to avoid micro-stuttering. |
 | `sip_server_task` | 5 | **Core 0** | **Core 1** | 8192 Bytes | Ticks the SIP state engine (`RequestsHandler::tick()`) and sweeps expired leases. |
-| `udp_receiver_task` | 5 | **Core 0** | **Core 1** | 8192 Bytes | Listens on UDP port 5060, parses incoming packet headers, and dispatches them to the handler. |
+| `udp_receiver_task` | 5 | **Core 0** | **Core 1** | **16384 Bytes** | Listens on UDP port 5060, parses incoming packet headers, and dispatches them to the handler. **Not 8 KB** — `RequestsHandler::handle()` runs inline on this task, and the string-heavy message building plus the register-beep UAC and the `440` SDP path together overflowed the old 8 KB allocation (stack-overflow panic). Raised to 16 KB at `UdpServer.cpp:145-152`. |
 | `http_server_task` | 4 | **Core 0** | **Core 0** | 8192 Bytes | Runs the select-based HTTP server accept loop. Spawns detached client worker threads. |
 | `status_task` | 3 | **Core 0** | *N/A* | 4096 Bytes | Polls ADC battery voltage divider (GPIO 5) and updates on-screen status fields every 500ms. |
 
@@ -242,4 +248,4 @@ To protect the registrar from UDP flood denial-of-service (DoS) attacks, the `Re
 * **Sustained/Burst Thresholds**: UDP packets are evaluated using a per-source IP token bucket with a default burst depth of **40 packets** and a sustained replenishment rate of **20 packets per second**.
 * **Zero CPU Parse Overheads**: Rate check verification is executed before any SIP header parsing, dynamic routing, or database work. If an IP exceeds its burst threshold, the packet is instantly discarded, and the atomic `_packetsDropped` counter is incremented.
 * **Eviction Cycle**: To prevent memory leak accumulation from transient spoofed IPs, inactive buckets are periodically evicted during the central registrar sweep.
-* **Subnet CIDR Filtering**: If compiled with `-DPOCKETDIAL_ALLOW_CIDR="192.168.1.0/24"`, the registrar translates incoming IP addresses and blocks any traffic originating from outside the designated local network segment.
+* **Subnet CIDR Filtering — NOT AVAILABLE. Do not plan a deployment around this.** Earlier revisions of this document said the registrar could be compiled with `-DPOCKETDIAL_ALLOW_CIDR="192.168.1.0/24"` to reject traffic from outside a segment. **No such macro exists anywhere in the tree** — the only occurrence of that name in the repository was this sentence. The matching runtime state does exist but is inert: `_allowNet` / `_allowMask` (`src/SIP/RequestsHandler.hpp:1185-1187`) are initialised to `0` and **never assigned by any code path** — there is no setter, no constructor argument, no HTTP route and no NVS key. `RequestsHandler::ipAllowed()` (`RequestsHandler.cpp:5922-5927`) therefore takes its `if (_allowMask == 0) return true;` early exit on every packet, so **every source IP is allowed, always**. The token bucket above is real and does run; the subnet filter is scaffolding that was never wired up. Segment isolation has to come from the network (VLAN, firewall, or simply not routing the board's link), not from this firmware.

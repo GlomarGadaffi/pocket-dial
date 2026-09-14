@@ -37,7 +37,7 @@ Yealink T29 registered to a bench board placed a call that rang through to carri
 voicemail, and a second that was answered with two-way audio.
 
 That is also the honest limit of the hardware evidence. One handset model, one
-board, one carrier. Everything else in the test suite is host-side: 414 GoogleTest
+board, one carrier. Everything else in the test suite is host-side: 506 GoogleTest
 cases plus real-SIP-stack interop (pjsua, SIPp) against the **desktop** binary.
 On-device RTP has no automated coverage — `RtpSender`/`RtpReceiver` compile to host
 stubs, so the green media tests exercise stubs, not silicon. OTA has never been
@@ -202,7 +202,13 @@ Two consequences worth knowing before you plan around it:
 - **The box never registers to an ITSP.** Nothing in the tree sends a SIP `REGISTER`
   as a client, so it cannot connect to a generic SIP carrier today. That is
   [#164](https://github.com/GlomarGadaffi/pocket-dial/issues/164).
-- **One outside call at a time.** `POCKETDIAL_MAX_ANCHOR_CALLS` is 1.
+- **One outside call at a time on default firmware — up to four with a real trunk.**
+  `POCKETDIAL_MAX_ANCHOR_CALLS` is **4** (it was raised from 1 once the 3CX client landed
+  and the single-call path was proven on the bench). The effective ceiling is
+  `min(provider, 4)`: the `LoopbackAnchorClient` that ships by default declares **1**,
+  because its participant id is a constant, so a stock board still gets one. The 3CX
+  `TelephonyAnchorClient` declares 4 — the limit there is the ESP32-S3's software ECDHE,
+  not RAM or sockets. The fifth call is refused `503`.
 
 There is also no E.164 normalisation anywhere — `+15551234567`, `15551234567` and
 `5551234567` are three different destinations to the dial plan and the call log.
@@ -227,7 +233,8 @@ What is on by default:
   boot, per-client brute-force lockout, server-side sessions and CSRF tokens
 - **SDP admission gate** — every SDP body is structurally checked before any
   decoder runs or it is relayed onward
-- **Per-source-IP rate limiting** on the SIP socket, with an optional CIDR allowlist
+- **Per-source-IP rate limiting** on the SIP socket (token bucket, burst 40 / 20 pps
+  sustained, checked before any header is parsed)
 - **No SSH surface** — the second admin plane was deleted rather than hardened
 
 Optional: **WPA2 on the SoftAP**, which encrypts the dashboard, SIP signalling and

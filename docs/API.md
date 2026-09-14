@@ -1613,7 +1613,9 @@ connected.
 > a call-control WebSocket, with media as chunked-HTTPS PCM16 — and the shipping real
 > client speaks the 3CX Call Control API. Nothing in the tree ever *sends* a `REGISTER`,
 > so the board never registers to an ITSP and speaks no SIP to a carrier at all.
-> `POCKETDIAL_MAX_ANCHOR_CALLS` is **1** (`src/SIP/PoolConfig.hpp:199`): one outside call
+> `POCKETDIAL_MAX_ANCHOR_CALLS` is **4** (`src/SIP/PoolConfig.hpp:221`), and the effective
+> limit is `min(provider, 4)` — the default `LoopbackAnchorClient` declares 1, so a stock
+> board still gets one outside call
 > at a time, and a second attempt is refused rather than queued.
 
 `target` is charset-limited the same as every other dial-plan token

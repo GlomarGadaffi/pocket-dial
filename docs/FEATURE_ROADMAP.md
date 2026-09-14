@@ -50,7 +50,8 @@ Cross-references:
 > The cheap/expensive axis therefore still holds, and is now measurable rather than
 > hypothetical: signalling features are bounded by the pre-allocated pools and cost a few
 > hundred bytes; media features cost a leg's worth of RTP tasks and rings apiece, which is
-> why the conference is capped at 4 legs and the trunk at **one** concurrent call.
+> why the conference is capped at 4 legs and the trunk at **four** concurrent calls
+> (one on the default loopback provider — see §1.3).
 
 ---
 
@@ -104,7 +105,11 @@ Four things follow from that, and each one surprises someone:
 - **A dial-plan rule with `action=trunk` is the only way out.** No hardcoded `9` prefix, no
   unregistered-destination fallback: with an empty dial plan every outside number is
   answered `404` without leaving the box.
-- **`POCKETDIAL_MAX_ANCHOR_CALLS` is 1.** One concurrent outside call.
+- **`POCKETDIAL_MAX_ANCHOR_CALLS` is 4**, raised from 1 (`PoolConfig.hpp:221`). The
+  effective ceiling is `min(provider, 4)` via `RequestsHandler::anchorCallLimit()`:
+  `LoopbackAnchorClient` declares **1** (constant participant id), `TelephonyAnchorClient`
+  declares 4. So **default firmware still gets one concurrent outside call**; a board
+  driving a real 3CX trunk gets four, bounded by software ECDHE cost, not RAM.
 - **No E.164 normalization exists anywhere.** A rule's strip/prepend is the whole of the
   number transformation.
 
@@ -120,7 +125,7 @@ through `/api/telephony-config` — see [API.md](API.md).
 | **HTTP reachability** | **The dashboard is always reachable.** The listener opens at construction and stays open. The dark-by-default plane and the `*4887` reopen star-code were **removed** (`de1a36e`); `grantAdminHttpGraceWindow` no longer exists. |
 | **Registrar admission** | Three modes — `open` / `learn` / `secure`. Digest auth is real; Learn is TOFU + an ARP-learned MAC lock. **The shipped default is `open`: a fresh board accepts any REGISTER and any INVITE until an operator changes `reg_mode`.** Both halves of that sentence matter. |
 | **SoftAP WPA2** | Implemented, **opt-in, default off** (NVS `ap_secure`) so a firmware update never re-pairs a live fleet. Encrypts dashboard, SIP and RTP together. |
-| Signalling hardening | per-source-IP token bucket, optional CIDR allowlist, AOR whitelist, bounded parser, SDP admission gate |
+| Signalling hardening | per-source-IP token bucket, AOR whitelist, bounded parser, SDP admission gate. **The "optional CIDR allowlist" this row used to list is not a shipped control** — `_allowNet`/`_allowMask` are never assigned, so `ipAllowed()` returns true for every source (`RequestsHandler.cpp:5922-5927`). See [ARCHITECTURE.md](ARCHITECTURE.md) §Rate Limiting. |
 | HTTP hardening | same-origin + CSRF, 16 KB body cap, `SO_RCVTIMEO`, no wildcard CORS, central security response headers (CSP, `X-Frame-Options: DENY`, `nosniff`, `no-store`), deliberately no HSTS |
 | OTA | dual-slot `ota_0`/`ota_1`, streaming upload, mark-valid-on-healthy-boot rollback. **Unsigned**, admin-gated. |
 
@@ -129,7 +134,8 @@ through `/api/telephony-config` — see [API.md](API.md).
 Core-pinned tasks (SIP vs HTTP/LVGL); outbox pattern keeping socket syscalls outside the
 lock; double-buffered lock-free status snapshot; zero-heap-alloc hot path. Compile-time
 pools: `MAX_CLIENTS` 32, `MAX_SESSIONS` 8, `MAX_DIAL_RULES` 16, `MAX_DID_MAPPINGS` 8,
-`CONF_LEGS` 4, `MAX_ANCHOR_CALLS` 1, with graceful `503` on exhaustion.
+`CONF_LEGS` 4, `MAX_ANCHOR_CALLS` **4** (effective 1 on the default loopback provider),
+with graceful `503` on exhaustion.
 Transports: Wi-Fi SoftAP with captive portal, W5500 / LAN8720 wired Ethernet and PoE,
 Guition JC3248W535 touch display (LVGL 8.3). Zero-touch provisioning
 (`GET /config/<mac>.cfg`, Yealink key format). Flash-time configuration via the `cfgseed`
@@ -176,7 +182,7 @@ zones, pickup — **has shipped** and now lives in §1. What remains is below.
 |-----|---------|-----------|------------|-------------|
 | **P1** | **E.164 normalization** | There is none anywhere. A trunk rule's strip/prepend is the entire number transformation, which works for one national dial habit and breaks on the next. | **S–M** | A bounded normalization table, not a regex engine. Pairs with DID matching, which is also literal-string today. |
 | **P1** | **Session timers, active side** | The PBX honours a phone's `Session-Expires` but never requests one and never answers `422`/`Min-SE`. A phone that dies mid-call therefore leaves the session to the orphan sweep rather than a refresh failure. | **M** | Pure signalling; the passive half already parses `refresher=`. |
-| **P2** | **Trunk failover / a second concurrent outside call** | `MAX_ANCHOR_CALLS` is 1 and there is no failover between configured slots. Raising it is a media-cost decision, not a signalling one. | **M (media)** | Each extra anchor leg costs an RTP task pair + rings, the same as a conference leg. Measure before raising. |
+| **P2** | **Trunk failover** | `MAX_ANCHOR_CALLS` has since been raised to 4, so "a second concurrent outside call" is **done** on a real provider. What remains is **failover between the four configured telephony slots** — there is none: one slot is active at a time and a dead provider is not detected or switched away from. | **M** | Signalling/orchestration, not media — the concurrency half was the media decision and it has been taken. |
 | **P2** | **Conference rooms with PINs** | One global room, no PIN, cap 4. Multiple rooms means a room table and per-room `MixBus` instances. | **M–L (media)** | Memory-bound: the rings are ~50 KB per room. |
 | **P2** | **MWI / `message-summary`** | The BLF machinery only implements the `dialog` event package. MWI is cheap *given* a voicemail store — and there isn't one (§5). | **S** | Meaningless without an external voicemail endpoint to subscribe to. |
 | **P2** | **100rel / PRACK** | Not implemented. Matters only for interop with a UAS that requires it. | **M** | No known handset in the bench set needs it. |
