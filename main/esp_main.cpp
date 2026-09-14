@@ -132,6 +132,20 @@ static std::string wifi_init_softap(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     // Explicitly start the embedded DHCP server so connected IP phones get leases.
+    //
+    // Issue #178 asked for DHCP Option 66 (provisioning-URL auto-discovery) to be
+    // injected here. Investigated, not implemented: esp_netif_dhcps_option()'s
+    // esp_netif_dhcp_option_id_t enum, and the dhcpserver.c switch underneath it,
+    // both recognize a fixed, closed set of options that does not include 66 (or
+    // the RFC 2132 TFTP_SERVER_NAME code at all) -- there is no field in the
+    // dhcpserver's own struct to hold it, and the one extension hook,
+    // LWIP_HOOK_DHCPS_POST_STATE, fires on the parsed INBOUND request, not the
+    // OUTBOUND OFFER/ACK, so it cannot inject bytes into what actually gets sent.
+    // Serving Option 66 from this SoftAP therefore requires forking the `lwip`
+    // component's dhcpserver.c (e.g. via EXTRA_COMPONENT_DIRS) or replacing the
+    // DHCP server outright -- both bigger than a change confined to this file.
+    // See docs/PROVISIONING.md §1.1 for the full investigation and §1.1a for the
+    // wired-LAN case (a site's own DHCP server), which needs no firmware change.
     esp_err_t dhcps_err = esp_netif_dhcps_start(ap_netif);
     if (dhcps_err != ESP_OK && dhcps_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
         ESP_LOGW(TAG, "dhcps_start returned %d — phones may not get leases", dhcps_err);

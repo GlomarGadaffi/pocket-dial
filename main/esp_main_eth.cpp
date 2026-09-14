@@ -616,6 +616,16 @@ extern "C" void app_main(void)
         if (topology_mode == TOPOLOGY_INFRA) {
             // Ethernet INFRA: enable DHCP server on the Ethernet netif so
             // directly-connected phones on the LAN segment get leases.
+            //
+            // Issue #178 (DHCP Option 66 provisioning-URL auto-discovery): same
+            // finding as the SoftAP path in esp_main.cpp -- this is the bundled
+            // ESP-IDF dhcpserver component, whose public API and internal option
+            // table both lack any case for option 66, and whose one extension
+            // hook only sees inbound requests, not the outbound OFFER/ACK this
+            // would need to carry the option. See docs/PROVISIONING.md §1.1 for
+            // the full investigation (and why fixing it means forking `lwip` or
+            // replacing this DHCP server, not a change confined to this file)
+            // and §1.1a for the wired-LAN case, which needs no firmware change.
             esp_err_t dhcps_err = esp_netif_dhcps_start(s_eth_netif);
             if (dhcps_err != ESP_OK && dhcps_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
                 ESP_LOGW(TAG, "dhcps_start on eth netif returned %d", dhcps_err);
