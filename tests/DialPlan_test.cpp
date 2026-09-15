@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <utility>
@@ -36,6 +37,7 @@
 #include "PbxConfig.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
+#include "TelephonyApiConfig.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -213,6 +215,22 @@ namespace
 		handler.handle(makeRegister("500", "192.168.9.50", "reg-500"));
 		handler.handle(makeRegister("600", "192.168.9.60", "reg-600"));
 		handler.handle(makeRegister("601", "192.168.9.61", "reg-601"));
+	}
+
+	// A test that calls setSbcMode()/setActiveSlot() persists through
+	// TelephonyApiConfig's host-file store -- redirect it to a per-test path
+	// FIRST (TelephonyConfigHttpTest's own fixture does the same, see that
+	// file's class comment), or every test in this binary that touches SBC
+	// mode reads/writes the SAME default "pocketdial_tapi.cfg" in the
+	// process's cwd, leaking `active` across tests that never asked for it.
+	void isolateTapiStoreForTest(RequestsHandler& handler)
+	{
+		const std::string name = ::testing::UnitTest::GetInstance()->current_test_info()->name();
+		const std::string tapiPath = "test_dialplan_tapicfg_" + name + ".cfg";
+		const std::string didPath  = "test_dialplan_didmap_" + name + ".cfg";
+		std::remove(tapiPath.c_str());
+		std::remove(didPath.c_str());
+		handler.setTelephonyStorePathsForTest(tapiPath, didPath);
 	}
 }
 
@@ -986,6 +1004,182 @@ TEST(DialPlanRouting, TrunkActionWithStaleStripDigitsAnswers404NotAMisdial)
 	EXPECT_TRUE(wire.sawContaining("404 Not Found"));
 	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: plan-trunk-stale"), nullptr)
 		<< "a stale strip count must not place any call, transformed or not";
+}
+
+// ── SBC mode (Issue #201) ─────────────────────────────────────────────────────
+
+TEST(DialPlanRouting, SbcModeOffUnmatchedNumberStill404s)
+{
+	// Baseline: with SBC mode untouched (default off), nothing here changes —
+	// same assertion as UnmatchedUnknownNumberStill404s above, just re-pinned
+	// so a default-constructed handler can never silently start SBC'ing.
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	registerThreePhones(handler);
+
+	wire.clear();
+	handler.handle(makeInvite("500", "8005550123", "192.168.9.50", "sbc-off"));
+
+	EXPECT_TRUE(wire.sawContaining("404 Not Found"));
+	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-off"), nullptr);
+}
+
+TEST(DialPlanRouting, SbcModeRoutesAnUnmatchedNumberToTheTrunkUnmodified)
+{
+	// The core of #201: turn SBC mode on with an empty dial-plan table, dial
+	// something no rule could ever have matched, and it must reach the anchor
+	// client with the EXACT dialed digits — no strip, no prepend. This is what
+	// makes it a border-element relay rather than an outside-line rewrite.
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	isolateTapiStoreForTest(handler);
+	registerThreePhones(handler);
+	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+
+	wire.clear();
+	handler.handle(makeInvite("500", "8005550123", "192.168.9.50", "sbc-on"));
+
+	EXPECT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
+	ASSERT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-on"), nullptr)
+		<< "SBC mode must place the call through the anchor client, like any other trunk rule";
+	auto* loopback = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loopback, nullptr);
+	EXPECT_EQ(loopback->lastMakeCallDestination(), "8005550123")
+		<< "SBC mode relays the dialed digits as-is, unlike a strip/prepend trunk rule";
+}
+
+TEST(DialPlanRouting, SbcModeNeverShadowsAnExplicitDialPlanRule)
+{
+	// An operator's own rule always wins — SBC mode is the LOWEST-priority
+	// fallback, exactly like a hand-written trailing "*" rule would be.
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	isolateTapiStoreForTest(handler);
+	registerThreePhones(handler);
+	handler.setRingGroup("610", "600,601", "ringall");
+	handler.setDialRule("2XX", "group", "610");
+	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+
+	wire.clear();
+	handler.handle(makeInvite("500", "250", "192.168.9.50", "sbc-explicit-wins"));
+
+	EXPECT_TRUE(wire.sawInviteTo("600"));
+	EXPECT_TRUE(wire.sawInviteTo("601"))
+		<< "the explicit 2XX -> group rule must win over the SBC fallback";
+	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-explicit-wins"), nullptr);
+}
+
+TEST(DialPlanRouting, SbcModeSendsExtensionToExtensionCallsOutTheTrunkToo)
+{
+	// The issue's own flagged decision point: SBC mode means EVERY call,
+	// including one registered extension dialing another — the local registrar
+	// becomes decorative once this is on. That is a real SBC's behavior and is
+	// what "one toggle that routes every call" has to mean if it means anything.
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	isolateTapiStoreForTest(handler);
+	registerThreePhones(handler);   // 500, 600, 601 all genuinely registered
+	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+
+	wire.clear();
+	handler.handle(makeInvite("500", "600", "192.168.9.50", "sbc-ext-to-ext"));
+
+	EXPECT_FALSE(wire.sawInviteTo("600"))
+		<< "600 must NOT ring locally once SBC mode claims every unmatched call";
+	auto* loopback = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loopback, nullptr);
+	EXPECT_EQ(loopback->lastMakeCallDestination(), "600");
+}
+
+TEST(DialPlanRouting, SbcModeNeverReachesReservedExtensions)
+{
+	// 777 (the echo test) is resolved in onInvite() BEFORE the dial plan is
+	// ever consulted (mirrors ReservedCodesAreRoutedBeforeThePlanCanSeeThem
+	// above, with SBC mode on instead of a catch-all dial-plan rule) — so SBC
+	// mode cannot see it, let alone reroute it, asserted end-to-end rather
+	// than trusted from reading the ordering.
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	isolateTapiStoreForTest(handler);
+	registerThreePhones(handler);
+	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+
+	wire.clear();
+	handler.handle(makeInvite("500", "777", "192.168.9.50", "sbc-echo"));
+	EXPECT_TRUE(wire.sawContaining("SIP/2.0 200 OK"))
+		<< "777 must still be the SDP echo test, not a trunk call";
+	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-echo"), nullptr);
+}
+
+TEST(DialPlanRouting, SbcModeDoesNotChangeEmergencyDialingBehavior)
+{
+	// 911 is classified and routed in onInvite() BEFORE the dial plan is ever
+	// consulted (see the comment at onInvite's emergency-dial check), so SBC
+	// mode must produce IDENTICAL 911 behavior whether it is on or off --
+	// whatever that behavior actually is. It is NOT "never reaches the anchor
+	// client": #166 places 911 through the connected anchor/trunk itself when
+	// one is available (logged "ROUTED TO TRUNK") -- that is how the call
+	// reaches a real PSAP, and this test does not re-litigate it. What must
+	// hold is that turning SBC mode on changes nothing about that decision.
+	auto dial911 = [](bool sbcOn) {
+		WireLog wire;
+		RequestsHandler handler("192.168.9.1", 5060,
+			[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+				wire.sent.emplace_back(addr, std::move(msg));
+			});
+		isolateTapiStoreForTest(handler);
+		registerThreePhones(handler);
+		if (sbcOn)
+		{
+			EXPECT_TRUE(handler.setSbcMode(true, 0).empty());
+		}
+		const std::string callId = sbcOn ? "sbc-911-on" : "sbc-911-off";
+		wire.clear();
+		handler.handle(makeInvite("500", "911", "192.168.9.50", callId));
+		auto* loopback = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+		return std::make_pair(
+			handler.anchorBridgeForCallIdForTest("Call-ID: " + callId) != nullptr,
+			loopback != nullptr ? loopback->lastMakeCallDestination() : std::string());
+	};
+
+	auto withoutSbc = dial911(false);
+	auto withSbc = dial911(true);
+
+	EXPECT_EQ(withoutSbc.first, withSbc.first)
+		<< "SBC mode must not change whether 911 gets bridged through the anchor client";
+	EXPECT_EQ(withoutSbc.second, withSbc.second)
+		<< "SBC mode must not change what 911 dials through the anchor client";
+}
+
+TEST(DialPlanRouting, SetSbcModeRejectsABadRouteAndLeavesModeUnchanged)
+{
+	// RequestsHandler::setSbcMode() validates+activates the route through
+	// TelephonyApiConfig BEFORE persisting the PBX-side toggle, so a bad index
+	// must leave SBC mode exactly as it was, not "on" with an unvalidated route.
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+
+	const std::string err = handler.setSbcMode(true, TelephonyApiConfig::kSlots + 1);
+	EXPECT_FALSE(err.empty()) << "an out-of-range slot index must be refused";
+
+	auto [enabled, route] = handler.getSbcMode();
+	EXPECT_FALSE(enabled) << "the rejected write must not have taken effect";
+	(void)route;
 }
 
 TEST(DialPlanRouting, GroupActionAnswers480WhenNoMemberIsRegistered)

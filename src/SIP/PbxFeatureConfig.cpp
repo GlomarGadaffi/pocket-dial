@@ -573,6 +573,8 @@ void PbxFeatureConfig::loadPbxConfig()
 	// Issue #166: its own key, read after the handle above is closed because
 	// loadE911() opens its own (it is also callable on its own from a test).
 	loadE911();
+	// Issue #201: same story as loadE911() just above.
+	loadSbcMode();
 #endif
 }
 
@@ -725,6 +727,76 @@ void PbxFeatureConfig::persistPageZones()
 		nvs_commit(h);
 		nvs_close(h);
 	}
+#endif
+}
+
+// ── SBC mode (Issue #201) ────────────────────────────────────────────────────
+
+void PbxFeatureConfig::setSbcMode(bool enabled, size_t route)
+{
+	_sbcEnabled = enabled;
+	_sbcRoute = route;
+	_env.log(std::string("SBC mode ") + (enabled ? "enabled" : "disabled") +
+		", route slot " + std::to_string(route));
+	persistSbcMode();
+	// No _onChanged() call: unlike DND/forwards/ring-groups/page-zones/dial-
+	// rules, SBC mode isn't mirrored into the dashboard snapshot (it changes
+	// rarely and isn't on the polling-frequency /api/status payload) -- the
+	// HTTP layer reads it straight through RequestsHandler under _mutex,
+	// exactly like the Telephony-API credential slots.
+}
+
+void PbxFeatureConfig::persistSbcMode()
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	std::string blob;
+	blob += (_sbcEnabled ? "1" : "0"); blob += '\n';
+	blob += std::to_string(_sbcRoute); blob += '\n';
+	nvs_handle_t h;
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
+	{
+		nvs_set_str(h, "sbcmode", blob.c_str());
+		nvs_commit(h);
+		nvs_close(h);
+	}
+#endif
+}
+
+void PbxFeatureConfig::loadSbcMode()
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	nvs_handle_t h;
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READONLY, &h) != ESP_OK)
+	{
+		return;
+	}
+	size_t len = 0;
+	if (nvs_get_str(h, "sbcmode", nullptr, &len) == ESP_OK && len > 0 && len < 64)
+	{
+		std::string blob(len, '\0');
+		if (nvs_get_str(h, "sbcmode", &blob[0], &len) == ESP_OK)
+		{
+			// Two lines: enabled, route. A short/absent blob leaves the
+			// remaining field at its default rather than failing (loadE911's
+			// pattern).
+			std::string fields[2];
+			size_t start = 0;
+			for (int i = 0; i < 2 && start < blob.size(); ++i)
+			{
+				const size_t nl = blob.find('\n', start);
+				fields[i] = blob.substr(start, (nl == std::string::npos) ? std::string::npos : nl - start);
+				if (nl == std::string::npos) break;
+				start = nl + 1;
+			}
+			_sbcEnabled = (fields[0] == "1");
+			if (!fields[1].empty())
+			{
+				const long parsed = std::atol(fields[1].c_str());
+				if (parsed >= 0) _sbcRoute = static_cast<size_t>(parsed);
+			}
+		}
+	}
+	nvs_close(h);
 #endif
 }
 

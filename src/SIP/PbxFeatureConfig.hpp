@@ -102,6 +102,31 @@ public:
 	// .empty()/.match() on directly.
 	const pbx::DialPlan& dialPlan() const { return _dialPlan; }
 
+	// ── SBC mode (Issue #201) ─────────────────────────────────────────────────
+	// One toggle that routes every call the explicit dial-plan table doesn't
+	// already claim out a single configured trunk slot. See
+	// CallForker::routeDialPlan() for why this is an EVALUATION-TIME synthetic
+	// rule (lowest priority, "*" -> trunk, strip nothing/prepend nothing)
+	// rather than a row ever written into _dialPlan: it costs no
+	// POCKETDIAL_MAX_DIAL_RULES slot, can't be edited/reordered from the
+	// dial-plan API, and "off" is always just the bool, never "did somebody
+	// remember to delete the rule".
+	//
+	// `route` names a TelephonyApiConfig slot index. Validating that index and
+	// keeping it in sync with the live boot-time provider selection is the
+	// CALLER's job (RequestsHandler::setSbcMode(), which also owns
+	// _tapiConfig) -- this class stays decoupled from TelephonyApiConfig the
+	// same way it stays decoupled from every other sibling config class.
+	// Enabling with a route this build never validated is harmless: the actual
+	// outbound path (routeDialPlan -> PbxEnv::routeTrunkCall) never reads
+	// `route` at all, only whichever provider booted active. Changing which
+	// slot is ACTIVE still takes a reboot, exactly like every other
+	// Telephony-API credential change today; this only closes the larger gap,
+	// where the routing behavior could not be expressed AT ALL, reboot or not.
+	void setSbcMode(bool enabled, size_t route);
+	bool sbcEnabled() const { return _sbcEnabled; }
+	size_t sbcRoute() const { return _sbcRoute; }
+
 	// ── Directed / group call pickup (Issue #68) ──────────────────────────────
 	// Every OTHER extension co-membered with `ext` in any configured ring
 	// group, deduped and order-preserving. Empty if `ext` is in no group. Pure
@@ -126,6 +151,11 @@ private:
 	void persistE911();
 	void loadE911();
 	void persistDialPlan();
+	// Issue #201: its own NVS key, same rationale as e911's -- a factory-reset
+	// or a rewrite of any other table must not silently flip what "every call"
+	// means for an operator who turned this on.
+	void persistSbcMode();
+	void loadSbcMode();
 
 	PbxEnv& _env;
 	OnChanged _onChanged;
@@ -157,6 +187,11 @@ private:
 	// POCKETDIAL_MAX_DIAL_RULES by DialPlan::upsert(). Empty by default, and an
 	// empty table is a no-op on routing.
 	pbx::DialPlan _dialPlan;
+
+	// SBC mode (Issue #201): off by default, route defaults to slot 0 (only
+	// meaningful once enabled -- see setSbcMode()'s doc comment above).
+	bool _sbcEnabled = false;
+	size_t _sbcRoute = 0;
 
 	bool _pbxConfigLoaded = false;
 };

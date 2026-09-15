@@ -293,6 +293,19 @@ public:
 	std::string clearTelephonyConfigSlot(size_t idx);
 	std::string clearAllTelephonyConfig();
 
+	// ── SBC mode (Issue #201) ─────────────────────────────────────────────────
+	// {enabled, route}. See PbxFeatureConfig::setSbcMode()'s doc comment for
+	// what `route` does and does not do.
+	std::pair<bool, size_t> getSbcMode();
+	// Orchestrates across both config classes: enabling (or changing route
+	// while already enabled) first validates+activates the slot through
+	// TelephonyApiConfig (same path as POST /api/telephony-config/<n>/activate
+	// — "" on success, else that call's "Bad slot index" style error, in which
+	// case SBC mode is left exactly as it was). Disabling never touches the
+	// active slot: some other feature (the 555 anchor extension, a manual
+	// Trunk dial-plan rule) may still depend on it.
+	std::string setSbcMode(bool enabled, size_t route);
+
 	// Connectivity probe for the dashboard's "Test Dial" action (not a real
 	// bridged call — no SIP session, no MediaBridge, no caller): self-dials
 	// the currently-active slot's own routeDn through _anchorClient and
