@@ -189,6 +189,45 @@ bool RtpReceiver::setDtmfPayloadType(uint8_t pt, DtmfSink sink)
 	return true;
 }
 
+bool RtpReceiver::setRawSink(RawSink sink)
+{
+	std::lock_guard<std::mutex> lock(_slotMutex);
+	if (!sink && !_rawSink)
+	{
+		return false;   // asked to disarm a receiver that was never armed
+	}
+	// Publish the flag from inside the lock so the receive task can never see
+	// armed==true against a sink that has not been stored yet.
+	_rawArmed.store(static_cast<bool>(sink), std::memory_order_release);
+	_rawSink = std::move(sink);
+	return true;
+}
+
+bool RtpReceiver::dispatchRaw(const RtpPacket& pkt)
+{
+	if (!_rawArmed.load(std::memory_order_acquire))
+	{
+		return false;   // fast path: an ordinary receiver, no lock taken
+	}
+
+	// Copy the handle under the lock and invoke outside it -- same discipline as
+	// the audio path, so a slow relay egress never stalls a stop()/start() on
+	// the SIP thread (CONTRIBUTING_FIRMWARE rule 3).
+	RawSink sink;
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		sink = _rawSink;
+	}
+	if (!sink)
+	{
+		// Disarmed between the flag check and the lock. Report the packet as
+		// unclaimed rather than swallowing it, so the normal path still gets it.
+		return false;
+	}
+	sink(pkt);
+	return true;
+}
+
 bool RtpReceiver::dispatchDtmf(const RtpPacket& pkt)
 {
 	// Split out of runLoop() so it is reachable from a host test. On host,
@@ -270,6 +309,8 @@ void RtpReceiver::clearSlotLocked()
 {
 	_sink = nullptr;
 	_dtmfSink = nullptr;
+	_rawSink = nullptr;
+	_rawArmed.store(false, std::memory_order_release);
 	_dtmfPt.store(kDtmfPayloadTypeUnset, std::memory_order_release);
 	// Reset the dedupe memory with the slot. RFC 4733 keys a press on its RTP
 	// timestamp, and timestamps are per-stream: a fresh call starts its own clock
@@ -297,9 +338,17 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	{
 		return false;
 	}
-	if (!sink)
+	// A stream needs SOMEWHERE to deliver, but the audio Sink is no longer the
+	// only answer. A raw-relay leg (a SIP trunk) arms setRawSink() instead and
+	// has no use for an audio sink at all -- the raw path claims every packet
+	// before the payload-type split, so an audio sink passed here would never
+	// be invoked. Demanding a no-op one would be a lie in the call signature.
+	//
+	// _slotMutex is held, so reading _rawSink directly here is safe and sees
+	// any setRawSink() that has already returned.
+	if (!sink && !_rawSink)
 	{
-		ESP_LOGE("RtpReceiver", "start() called with null sink");
+		ESP_LOGE("RtpReceiver", "start() called with no sink of any kind");
 		return false;
 	}
 
@@ -462,6 +511,15 @@ void RtpReceiver::runLoop()
 		{
 			continue;   // not a valid RTPv2 packet — drop silently
 		}
+
+		// RAW RELAY, when armed, owns the whole packet path: a trunk leg forwards
+		// bytes rather than interpreting them, so this deliberately runs BEFORE
+		// the payload-type split below and skips the audio sink, the RFC 4733
+		// decode and the gap diagnostics. See setRawSink() for why that matters.
+		if (dispatchRaw(pkt))
+		{
+			continue;
+		}
 		if (pkt.payloadType != RtpReceiver::PAYLOAD_TYPE_PCMU)
 		{
 			// Not audio. It may still be an RFC 4733 named event on the dynamic PT
@@ -535,7 +593,12 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	{
 		return false;   // single-stream cap still enforced on host (for tests)
 	}
-	if (!sink)
+	// Mirrors the ESP guard: a raw-relay leg (a SIP trunk) has no audio sink by
+	// design, so only the total absence of a consumer is refused. Keeping the
+	// two arms in step matters -- this stub is the ONLY start() the host tests
+	// ever call, so a divergence here means the tests pin behaviour the device
+	// does not have.
+	if (!sink && !_rawSink)
 	{
 		return false;
 	}

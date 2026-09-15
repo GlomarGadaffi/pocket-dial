@@ -206,6 +206,21 @@ add_executable(sip_parser_tests
     # SIP-thread hand-off, and de-duplication against a phone that sends the same
     # press over BOTH RFC 4733 and SIP INFO.
     Rfc4733Dtmf_test.cpp
+    # Issue #164: the raw egress a SIP trunk's B2BUA leg relays through. The
+    # receive path could previously neither forward a packet nor leave one
+    # alone -- anything that was not PCMU and was not claimed by the RFC 4733
+    # path was dropped, and Sink exposed decoded audio only. Covers header
+    # fidelity (a relay that loses the marker bit or renumbers seq produces a
+    # stream the far end cannot reassemble) and the exclusivity guarantee: an
+    # armed relay leg CLAIMS the packet, so a carrier IVR keypress can never
+    # reach the local star-code feature parser.
+    RtpRawRelay_test.cpp
+    # Issue #164: the outbound half of a generic ITSP SIP trunk. Pins the wire
+    # format, because a carrier that dislikes a request answers 4xx and nothing
+    # else -- in particular that the two ACK forms stay distinct (RFC 3261
+    # s17.1.1.3 reuses the INVITE branch, s13.2.2.4 is a new transaction to the
+    # remote target), which is the easiest thing in a trunk to get wrong.
+    SipTrunk_test.cpp
     PlayoutBuffer_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp
@@ -463,6 +478,7 @@ add_executable(sip_parser_tests
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp
     ../src/SIP/RegisterBeeper.cpp
+    ../src/SIP/SipTrunk.cpp
     # Kari's Law on-site notification (#166 part 2). PbxEnv-only sibling
     # machine; pure text formatter is host-tested directly.
     ../src/SIP/EmergencyNotifier.cpp

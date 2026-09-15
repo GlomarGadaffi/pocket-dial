@@ -241,6 +241,24 @@
 #define POCKETDIAL_MAX_ANCHOR_CALLS 4
 #endif
 
+// Concurrent OUTBOUND SIP trunk dialogs (issue #164). Two, not four: each trunk
+// call also consumes an RtpReceiver/RtpSender relay pair and a message-pool
+// slot, and a residential PBX placing three simultaneous PSTN calls is not the
+// case worth sizing for. Exceeding it refuses the call rather than queueing --
+// see SipTrunk::placeCall().
+//
+// Its OWN #ifndef, deliberately. This define originally sat inside the anchor
+// cap's guard above, which meant any build overriding POCKETDIAL_MAX_ANCHOR_CALLS
+// skipped the whole block and never defined this at all -- and SipTrunk.hpp
+// declares std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS>, so that configuration
+// failed to COMPILE. No current build overrides the anchor cap, so CI was green
+// and correct and the break was invisible to every configuration it exercises.
+// Every cap in this file carries its own guard for exactly this reason; do not
+// nest one inside another.
+#ifndef POCKETDIAL_MAX_TRUNK_CALLS
+#define POCKETDIAL_MAX_TRUNK_CALLS 2
+#endif
+
 // Maximum number of DID -> extension inbound routing entries (DidMapping.hpp).
 // Bounded exactly like TelephonyApiConfig::kSlots: a fixed std::array, no heap,
 // a 9th add fails cleanly ("table full") rather than growing unbounded. Small
