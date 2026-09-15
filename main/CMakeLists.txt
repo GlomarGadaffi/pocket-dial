@@ -163,6 +163,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/MediaBridge.cpp"
                             # Issue #246 (voicemail, Stage 3 of #194): the 1:1 record/playback leg.
                             "../src/SIP/VoicemailLeg.cpp"
+                            # Issue #246: the SD-flush queue/writer-task pipeline.
+                            "../src/SIP/VoicemailArchive.cpp"
                             "../src/SIP/TelephonyProvider.cpp"
                             "../src/SIP/TelephonyApiConfig.cpp"
                             "../src/SIP/DidMapping.cpp"

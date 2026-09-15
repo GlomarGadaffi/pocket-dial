@@ -433,6 +433,10 @@ add_executable(sip_parser_tests
     # Pure C++17, no ESP dependency -- holds no socket/FreeRTOS state itself.
     ../src/SIP/VoicemailLeg.cpp
     VoicemailLeg_test.cpp
+    # Issue #246: the SD-flush queue/writer-task pipeline (WAV header,
+    # WriterQueue, drainAll) -- pure C++17, mirrors CdrArchive's shape.
+    ../src/SIP/VoicemailArchive.cpp
+    VoicemailArchive_test.cpp
     # The fixed-size TelephonyProviderType registry/factory (name/implemented
     # lookups + registerProvider/select) that RequestsHandler's boot-time anchor
     # wiring now uses to select LoopbackAnchorClient. Pure C++17, no ESP dependency.
