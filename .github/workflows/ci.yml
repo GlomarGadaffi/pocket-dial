@@ -1,10 +1,24 @@
 name: ESP32 Pocket-Dial Firmware CI
 
 on:
+  # Both filters are '**' (every branch) rather than an explicit allowlist.
+  # This block hadn't been touched since the file was first added (2026-06-01,
+  # git blame), predating this repo's actual branch conventions -- push's old
+  # 'feature/**' glob never matched a real branch (this repo uses feat/, fix/,
+  # docs/, and assorted ad-hoc names) and pull_request's [main, master] meant a
+  # PR based on an unmerged feat/** branch (a stacked PR) got NO CI at all: no
+  # host tests, no cppcheck, nothing, and `gh pr checks` just reports "no
+  # checks reported" instead of erroring. Bit us for real on #242. A whitelist
+  # of prefixes drifts again the next time someone invents a new one (see
+  # ci-perf-lints/, claude/, embedded-fixes/, phase2-polish/ in history) --
+  # '**' can't go stale. push and pull_request firing on the same branch
+  # double-runs CI for a normal PR; that costs runner minutes, not signal.
+  # Neither filter matches tag pushes (no `tags:` key here), so this stays
+  # disjoint from release.yml's tags-only trigger.
   push:
-    branches: [ main, master, 'feature/**' ]
+    branches: [ '**' ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ '**' ]
 
 jobs:
   # Job 1: Build and simulate the host desktop application, run static analysis and unit/smoke tests.
