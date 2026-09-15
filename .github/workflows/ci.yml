@@ -37,6 +37,17 @@ jobs:
       # not to fail silently -- do not bump without re-running locally first.
       CPPCHECK_VERSION: 2.21.0
 
+      # Pinned code generator (issue #196) -- same reasoning as the analyzer
+      # pin above, and pinned from day one rather than after it broke.
+      # src/SIP/Sdp.cpp is GENERATED from Sdp.re and committed, and the drift
+      # check below regenerates it and diffs. That check is only meaningful
+      # if CI's re2c matches the version the committed file was generated
+      # with: re2c stamps its version on line 1 of its own output, so a
+      # mismatch is a guaranteed one-line diff on every run, forever.
+      # ubuntu-latest's apt ships 3.1; the committed file is 4.1. Bump this
+      # deliberately, regenerate, and commit the result in the same PR.
+      RE2C_VERSION: "4.1"
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -91,6 +102,54 @@ jobs:
                    --suppress=unknownMacro:main/ui/ui.cpp \
                    -I src/Helpers -I src/SIP -I main \
                    src/ main/
+
+      - name: Cache pinned re2c build
+        id: re2c-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/re2c-install
+          key: ${{ runner.os }}-re2c-${{ env.RE2C_VERSION }}
+
+      - name: Build & Install re2c (pinned version)
+        # Built from the tagged release rather than installed from apt, for
+        # the same reason cppcheck is (issue #112): the apt package tracks
+        # the runner image, so a runner bump would change the generated
+        # output and redden a PR nobody touched. Cached on the version, so
+        # this runs once per bump rather than once per build.
+        if: steps.re2c-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL -o re2c.tar.xz \
+            "https://github.com/skvadrik/re2c/releases/download/${RE2C_VERSION}/re2c-${RE2C_VERSION}.tar.xz"
+          tar xf re2c.tar.xz
+          cd "re2c-${RE2C_VERSION}"
+          ./configure --prefix="$HOME/re2c-install"
+          make -j"$(nproc)"
+          make install
+
+      - name: Verify committed Sdp.cpp matches Sdp.re (re2c drift check)
+        # src/SIP/Sdp.cpp is generated and committed so the firmware build
+        # never needs re2c. This step is what keeps the committed copy
+        # honest: regenerate and diff.
+        #
+        # --no-debug-info is NOT optional and must not be dropped to get
+        # nicer diagnostics. Without it re2c emits #line directives carrying
+        # the ABSOLUTE path of the .re source, so output generated on a
+        # developer's machine can never match output generated here and this
+        # check is red on every run regardless of drift.
+        run: |
+          export PATH="$HOME/re2c-install/bin:$PATH"
+          re2c --version
+          re2c --no-generation-date --no-debug-info -W \
+               src/SIP/Sdp.re -o /tmp/Sdp.regenerated.cpp
+          if ! diff -u src/SIP/Sdp.cpp /tmp/Sdp.regenerated.cpp; then
+            echo "::error::src/SIP/Sdp.cpp is out of sync with Sdp.re."
+            echo "Regenerate with:"
+            echo "  re2c --no-generation-date --no-debug-info -W src/SIP/Sdp.re -o src/SIP/Sdp.cpp"
+            echo "If the only difference is the version stamp on line 1, CI's re2c"
+            echo "and yours disagree -- match RE2C_VERSION in this workflow."
+            exit 1
+          fi
+          echo "Sdp.cpp is in sync with Sdp.re."
 
       - name: Configure CMake (Host Build)
         run: |

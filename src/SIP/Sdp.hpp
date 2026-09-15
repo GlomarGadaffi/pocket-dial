@@ -141,6 +141,20 @@ namespace sdp
 		// Payload type parsed out of the value for rtpmap/fmtp only. 0xFF means
 		// "not applicable or not numeric" -- kept here so filtering payload types
 		// (issue #194 stage 4) never has to re-lex the value.
+		//
+		// THE 0xFF DEFAULT COSTS 6,640 BYTES OF FLASH, DELIBERATELY. It is a
+		// non-zero initialiser, so the two static Session scratch slots in
+		// SipSdpMessage.cpp cannot live in .bss and land in .data instead --
+		// stored in the flash image and copied to DRAM at boot rather than
+		// zero-filled. Measured: g_scratch is 0x19f0 in .data.
+		//
+		// Do NOT "fix" this by making the sentinel zero-valued. It buys flash
+		// ONLY -- the DRAM cost is identical either way, because .bss occupies
+		// the same memory -- and it costs either a pt-plus-one encoding every
+		// reader has to decode, or a silent trap where an unset pt reads as 0,
+		// which is PCMU: a VALID payload type rather than an obviously wrong
+		// one. Removing that class of ambiguity is why this model exists.
+		// Reviewed and accepted 2026-09-15.
 		uint8_t  pt = 0xFF;
 	};
 
