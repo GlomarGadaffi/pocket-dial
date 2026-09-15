@@ -401,7 +401,7 @@ probe after, across boot and a real client registering and re-registering, with
 ### Added — outbound trunk access as a dial-plan action
 
 A dial-plan rule can now carry `action=trunk`: `9XXXXXXXXXX` with `stripDigits=1` and
-`target=1` turns a dial of `93057673260` into `13057673260` and places it as a real
+`target=1` turns a dial of `92025550123` into `12025550123` and places it as a real
 outbound call through the currently-configured anchor provider — the same origination
 core virtual extension `555` uses, extracted into
 `RequestsHandler::originateAnchorCall()` and reached from `CallForker::routeDialPlan()`
@@ -443,7 +443,7 @@ a healthy box.
    value forever — and `persistDialPlan()` wrote that stale value to NVS, where it
    survived a reboot. Re-POSTing a pattern was the only way to edit a rule, so fixing a
    typo in a trunk target silently reverted its strip: a rule saved as strip 1 / prepend
-   1 and later edited would dial `193057673260` instead of `13057673260`.
+   1 and later edited would dial `192025550123` instead of `12025550123`.
 2. **"Strip N, prepend nothing" could not be expressed.** The delete signal was an empty
    `target`, which made the request that *creates* a strip-only trunk rule
    byte-identical to the request that *deletes* it. That shape is not exotic — it is

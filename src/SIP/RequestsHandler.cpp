@@ -1261,7 +1261,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 	}
 
 	// A dial-plan Trunk rule (Issue #165) originates an anchor call under
-	// whatever digits the caller actually dialed (e.g. "93057673260"), not the
+	// whatever digits the caller actually dialed (e.g. "92025550123"), not the
 	// literal 555 feature code — CANCEL must match the original INVITE's
 	// Request-URI verbatim (RFC 3261 §9.1), so destNumber above is that dialed
 	// string, not "555". Recognize the session by its own isAnchor() flag as well

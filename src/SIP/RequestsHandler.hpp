@@ -238,8 +238,8 @@ public:
 	// deletes the rule with that pattern. `action` is "group" | "page" | "park" |
 	// "trunk". `stripDigits` only matters for "trunk" (leading digits stripped
 	// off the dialed string before prepending `target` — e.g. pattern
-	// "9XXXXXXXXXX", stripDigits 1, target "1" turns "93057673260" into
-	// "13057673260" and places it as an outbound call through the configured
+	// "9XXXXXXXXXX", stripDigits 1, target "1" turns "92025550123" into
+	// "12025550123" and places it as an outbound call through the configured
 	// anchor/telephony provider); every other action ignores it.
 	//
 	// The rule is validated here, not at dial time: the pattern and target must be
