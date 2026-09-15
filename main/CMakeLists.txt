@@ -162,6 +162,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/TelephonyProvider.cpp"
                             "../src/SIP/TelephonyApiConfig.cpp"
                             "../src/SIP/DidMapping.cpp"
+                            "../src/SIP/E164.cpp"
                             "../src/SIP/MixBus.cpp"
                             "../src/SIP/mix_kernels_scalar.cpp"
                             "../src/SIP/ConferenceRoom.cpp"
