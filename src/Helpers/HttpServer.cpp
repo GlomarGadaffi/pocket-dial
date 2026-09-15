@@ -749,6 +749,23 @@ void HttpServer::handleClient(int clientSock)
 			sendApiE911Set(clientSock, req.body);
 		}
 	}
+	else if (req.method == "GET" && req.path == "/api/sbc-mode")
+	{
+		// Read gate matches the other config surfaces: nothing here is secret.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiSbcModeGet(clientSock);
+		}
+	}
+	else if (req.method == "PUT" && req.path == "/api/sbc-mode")
+	{
+		// Mutating: same gate as /api/dialplan and /api/telephony-config's
+		// activate route -- this decides where EVERY call goes.
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiSbcModeSet(clientSock, req.body);
+		}
+	}
 	else if (req.method == "GET" && req.path == "/api/did-mapping")
 	{
 		// Same read gate as /api/telephony-config above.
@@ -2324,6 +2341,56 @@ void HttpServer::sendApiE911Set(int sock, const std::string& body)
 	// Echo the stored result, so a caller sees what was actually kept after
 	// truncation to kMaxE911NotifyExts and any dropped field.
 	sendApiE911Get(sock);
+}
+
+void HttpServer::sendApiSbcModeGet(int sock)
+{
+	bool enabled = false;
+	size_t route = 0;
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		std::tie(enabled, route) = handler->getSbcMode();
+	}
+
+	std::ostringstream json;
+	json << "{\"enabled\":" << (enabled ? "true" : "false")
+	     << ",\"route\":" << route
+	     << ",\"maxRoute\":" << TelephonyApiConfig::kSlots << "}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiSbcModeSet(int sock, const std::string& body)
+{
+	// Issue #201. Params: enabled ("1"/"true"/"on"), route (a
+	// TelephonyApiConfig slot index as a decimal string). Enabling with a bad
+	// route is a 400 -- see RequestsHandler::setSbcMode()'s doc comment for
+	// why that leaves the previous SBC state untouched rather than turning it
+	// on against a slot this build refused.
+	const std::string enabledParam = getFormParam(body, "enabled");
+	const bool enabled = (enabledParam == "1" || enabledParam == "true" || enabledParam == "on");
+	const std::string routeParam = getFormParam(body, "route");
+
+	char* endp = nullptr;
+	const unsigned long parsedRoute = routeParam.empty() ? 0 : std::strtoul(routeParam.c_str(), &endp, 10);
+	if (!routeParam.empty() && (endp == nullptr || *endp != '\0'))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"route must be a slot index\"}");
+		return;
+	}
+
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		std::string err = handler->setSbcMode(enabled, static_cast<size_t>(parsedRoute));
+		if (!err.empty())
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"" + jsonEscape(err) + "\"}");
+			return;
+		}
+	}
+	// Echo the stored result, mirroring sendApiE911Set's pattern above.
+	sendApiSbcModeGet(sock);
 }
 
 void HttpServer::sendApiDidMappingList(int sock)

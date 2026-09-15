@@ -193,6 +193,8 @@ private:
 	// Issue #166 (Kari's Law): who gets alerted when 911 is dialed.
 	void sendApiE911Get(int sock);
 	void sendApiE911Set(int sock, const std::string& body);
+	void sendApiSbcModeGet(int sock);
+	void sendApiSbcModeSet(int sock, const std::string& body);
 	void sendApiDidMappingSet(int sock, const std::string& body);
 	void sendApiDidMappingDelete(int sock, const std::string& body);
 	void sendApiWifiScan(int sock);

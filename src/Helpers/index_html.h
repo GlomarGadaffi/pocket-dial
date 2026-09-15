@@ -328,7 +328,7 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
   </div>
   <div class="header-actions">
     <button class="rbtn" onclick="refreshNow()" title="Refresh (F5)">&#8635; Refresh</button>
-    <button class="rbtn" onclick="openModal('dialplan-modal')" title="Dial Plan (F2)">&#9776; Dial Plan</button>
+    <button class="rbtn" onclick="openDialPlanModal()" title="Dial Plan (F2)">&#9776; Dial Plan</button>
     <button class="rbtn" onclick="openModal('groups-modal')" title="Ring Groups &amp; Forwarding (F3)">&#9778; Groups</button>
     <button class="rbtn" onclick="openModal('cdr-modal')" title="Call Log (F4)">&#9779; Call Log</button>
     <button class="rbtn" onclick="openPbxModal()" title="PBX Settings (F6)">&#9881; PBX</button>
@@ -376,6 +376,21 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
         remaining digits. Rules are evaluated after the reserved feature extensions, so a catch-all
         can never shadow the echo test or a park orbit.
       </div>
+      <hr class="hr">
+      <div class="subhead">SBC Mode</div>
+      <div class="note">
+        Border-element mode: every call these rules don't already claim &mdash; including
+        extension-to-extension &mdash; goes out the selected trunk exactly as dialed, unmodified.
+        The echo test, paging, park and the feature codes above always stay local; so does 911,
+        which is resolved before any of this. Changing the route takes effect on next reboot,
+        same as any other Telephony-API credential change.
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="sbc-enabled"> Enable SBC mode</label>
+        <select id="sbc-route"></select>
+        <button class="btn primary" onclick="saveSbcMode()">Save</button>
+      </div>
+      <div class="msg" id="sbc-msg"></div>
       <div id="dp-list"><div class="note">Loading rules&hellip;</div></div>
       <hr class="hr">
       <div class="subhead">New / Edit Rule</div>
@@ -1028,6 +1043,40 @@ function deleteDialRule(i){
   post("/api/dialplan","pattern="+encodeURIComponent(r.pattern)+"&target=")
     .then(function(){setMsg("dp-msg","Rule "+r.pattern+" deleted.","ok");fetchStatus();})
     .catch(function(err){setMsg("dp-msg",err.message,"err");});
+}
+/* ── SBC mode (Issue #201) ──
+   Lives in the Dial Plan modal: a toggle plus a route dropdown built from the
+   same tapiSlots the Telephony modal uses. Neither is on the /api/status poll
+   (route selection is credential-adjacent, same reasoning as the Telephony
+   modal's own on-open fetch), so both are fetched fresh whenever this modal
+   opens, dropdown populated BEFORE the current route is applied to it. */
+function openDialPlanModal(){
+  openModal("dialplan-modal");
+  fetchTelephonyConfig().then(renderSbcRouteOptions).then(fetchSbcMode);
+}
+function renderSbcRouteOptions(){
+  var sel=$("sbc-route");
+  sel.innerHTML=tapiSlots.map(function(s,i){
+    return '<option value="'+i+'">Slot '+(i+1)+(s.routeDn?" — "+esc(s.routeDn):(s.baseUrl?" — "+esc(s.baseUrl):""))+'</option>';
+  }).join("");
+}
+function fetchSbcMode(){
+  return fetch("/api/sbc-mode",{credentials:"same-origin"}).then(function(r){
+    if(r.status===401){handleAuthExpired();throw new Error("session expired");}
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(d){
+    $("sbc-enabled").checked=!!d.enabled;
+    if($("sbc-route").options.length)$("sbc-route").value=String(d.route||0);
+  }).catch(function(){});
+}
+function saveSbcMode(){
+  if(!gateCheck())return;
+  var enabled=$("sbc-enabled").checked;
+  var route=$("sbc-route").value||"0";
+  put("/api/sbc-mode","enabled="+(enabled?"1":"0")+"&route="+encodeURIComponent(route))
+    .then(function(){setMsg("sbc-msg",enabled?("SBC mode enabled, route slot "+(Number(route)+1)+"."):"SBC mode disabled.","ok");fetchStatus();})
+    .catch(function(e){setMsg("sbc-msg",e.message,"err");});
 }
 function saveForward(){
   if(!gateCheck())return;
@@ -1755,7 +1804,7 @@ function mohPreviewStop(){
 /* ── keyboard shortcuts ── */
 document.addEventListener("keydown",function(e){
   if(e.key==="F1"){e.preventDefault();openModal("help-modal");}
-  else if(e.key==="F2"){e.preventDefault();openModal("dialplan-modal");}
+  else if(e.key==="F2"){e.preventDefault();openDialPlanModal();}
   else if(e.key==="F3"){e.preventDefault();openModal("groups-modal");}
   else if(e.key==="F4"){e.preventDefault();openModal("cdr-modal");}
   else if(e.key==="F5"){e.preventDefault();refreshNow();}

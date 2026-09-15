@@ -337,17 +337,40 @@ bool CallForker::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 	const std::shared_ptr<SipClient>& caller,
 	const std::string& destNumber)
 {
-	// Fast path: the table is empty on a default install, so the overwhelmingly
-	// common case costs one size check and nothing else.
-	if (_cfg.dialPlan().empty())
+	// Fast path: the table is empty and SBC mode is off on a default install,
+	// so the overwhelmingly common case costs two cheap checks and nothing else.
+	const pbx::DialRule* rule = nullptr;
+	pbx::DialRule sbcFallback;   // only populated/used in the SBC-mode branch below
+
+	if (!_cfg.dialPlan().empty())
 	{
-		return false;
+		rule = _cfg.dialPlan().match(destNumber);
 	}
 
-	const pbx::DialRule* rule = _cfg.dialPlan().match(destNumber);
 	if (!rule)
 	{
-		return false;   // fallthrough — routing continues exactly as it did pre-#69
+		// SBC mode (Issue #201): everything the explicit table doesn't already
+		// claim goes out the configured trunk exactly as dialed. This is an
+		// evaluation-time synthetic rule, never one DialPlan::upsert()/erase()
+		// or the dial-plan API can see or reorder — see PbxFeatureConfig::
+		// setSbcMode()'s doc comment for why. stripDigits=0 and an empty
+		// target make applyTrunkTransform() below a pure pass-through: SBC
+		// mode relays the dialed digits unmodified, it does not do outside-
+		// line digit games.
+		//
+		// Reached only after every reserved virtual extension, the direct
+		// ring-group lookup, AND the explicit dial-plan table above (same
+		// ordering comment as RequestsHandler::onInvite's call site) — so a
+		// real rule always wins over the fallback, and 911 (classified and
+		// routed in onInvite BEFORE the dial plan is ever consulted at all)
+		// is unaffected by this branch by construction, not by a check here.
+		if (!_cfg.sbcEnabled())
+		{
+			return false;   // fallthrough — routing continues exactly as it did pre-#69
+		}
+		sbcFallback.pattern = "*";
+		sbcFallback.action = pbx::DialActionType::Trunk;
+		rule = &sbcFallback;
 	}
 
 	_env.log("Dial plan: " + destNumber + " matched \"" + rule->pattern + "\" -> " +

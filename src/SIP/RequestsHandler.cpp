@@ -6304,6 +6304,50 @@ std::string RequestsHandler::clearAllTelephonyConfig()
 	return _tapiConfig.clearAll();
 }
 
+// ── SBC mode (Issue #201) ─────────────────────────────────────────────────────
+
+std::pair<bool, size_t> RequestsHandler::getSbcMode()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return {_cfg.sbcEnabled(), _cfg.sbcRoute()};
+}
+
+std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
+{
+	std::vector<std::pair<bool, std::string>> localLogs;
+	std::string err;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (enabled)
+		{
+			// Validate + activate BEFORE persisting the toggle, so a bad slot
+			// index leaves SBC mode exactly as it was rather than "on" with a
+			// route this build refused.
+			err = _tapiConfig.setActiveSlot(route);
+			if (err.empty())
+			{
+				_cfg.setSbcMode(true, route);
+			}
+		}
+		else
+		{
+			// Disabling never touches the active slot -- the 555 anchor
+			// extension or a manual Trunk dial-plan rule may still depend on
+			// whichever slot is active independent of SBC mode.
+			_cfg.setSbcMode(false, route);
+		}
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+
+	for (const auto& log : localLogs)
+	{
+		if (log.first) std::cerr << log.second << std::endl;
+		else std::cout << log.second << std::endl;
+	}
+	return err;
+}
+
 // ── DID -> extension inbound routing (new) ────────────────────────────────────
 // Same direct-_mutex rationale as the Telephony-API slots immediately above.
 
