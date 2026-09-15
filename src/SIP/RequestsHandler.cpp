@@ -1148,10 +1148,16 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 // BLF-key "grab this ringing call" pickup and phone-native call steal. No code
 // in src/ handles that -- onInvite() has no Replaces branch, so such an INVITE
 // just rings its own target as an ordinary new call (ReplacesInvite_test.cpp
-// pins this). Advertising the tag anyway is a deliberate, revisitable scope
-// call (issue #229): the REFER path it is honest about is real and exercised,
-// and withdrawing the tag would break that working attended transfer for no
-// gain. See kSupportedOptionTags below.
+// pins this).
+//
+// This is a KNOWN, DELIBERATE SPEC DEVIATION, not merely an unimplemented
+// corner: RFC 3891 §3 says a UA that advertises "replaces" MUST accept an
+// INVITE carrying that header, and this one advertises it while only actually
+// honouring §4's REFER-based use of the same tag. Withdrawing the tag would
+// break the working, exercised attended transfer (REFER ?Replaces=, issue
+// #131) for no gain, so issue #229 chose to keep advertising and document the
+// gap rather than under-claim a real feature to fix an unrelated one. See
+// kSupportedOptionTags below.
 //
 // EVERY entry below is something this PBX genuinely dispatches. Over-claiming is
 // the exact failure #199 is about, so the lists are derived from initHandlers()
