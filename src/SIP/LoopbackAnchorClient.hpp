@@ -26,7 +26,7 @@ public:
 	bool answerCall(const std::string& participantId) override;
 	bool dropCall(const std::string& participantId) override;
 	void setEventCallback(EventCallback cb) override;
-	bool writeAudio(const std::string& participantId, const int16_t* pcmSamples, size_t count) override;
+	bool writeAudio(std::string_view participantId, const int16_t* pcmSamples, size_t count) override;
 	void registerAudioRxCallback(AudioRxCallback cb) override;
 	void tick() override {}   // no periodic maintenance for the in-process loopback
 

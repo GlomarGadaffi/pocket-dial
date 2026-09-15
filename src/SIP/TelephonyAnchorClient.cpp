@@ -49,7 +49,7 @@ void TelephonyAnchorClient::setEventCallback(EventCallback)
 {
 }
 
-bool TelephonyAnchorClient::writeAudio(const std::string&, const int16_t*, size_t)
+bool TelephonyAnchorClient::writeAudio(std::string_view, const int16_t*, size_t)
 {
 	return false;
 }
@@ -580,7 +580,7 @@ void TelephonyAnchorClient::setEventCallback(EventCallback cb)
 	_eventCb = cb;
 }
 
-bool TelephonyAnchorClient::writeAudio(const std::string& participantId, const int16_t* pcmSamples, size_t count)
+bool TelephonyAnchorClient::writeAudio(std::string_view participantId, const int16_t* pcmSamples, size_t count)
 {
 	if (pcmSamples == nullptr || count == 0)
 	{
@@ -640,7 +640,10 @@ bool TelephonyAnchorClient::writeAudio(const std::string& participantId, const i
 	// dropping serial lines and burning CPU on the 20 ms media pump. A short write still warns.
 	if (written != total)
 	{
-		ESP_LOGW(TAG, "POST writeAudio short/failed write rc=%d (want %d) for %s", written, total, participantId.c_str());
+		// %.*s, not %s: participantId is a string_view now (issue #218 follow-up)
+		// and is not guaranteed null-terminated.
+		ESP_LOGW(TAG, "POST writeAudio short/failed write rc=%d (want %d) for %.*s", written, total,
+			static_cast<int>(participantId.size()), participantId.data());
 	}
 	return (written == total);
 }
@@ -652,7 +655,7 @@ void TelephonyAnchorClient::registerAudioRxCallback(AudioRxCallback cb)
 }
 
 // ── #100: per-call slot helpers (caller holds _mutex) ───────────────────────────
-TelephonyAnchorClient::CallSlot* TelephonyAnchorClient::slotForLocked(const std::string& participantId)
+TelephonyAnchorClient::CallSlot* TelephonyAnchorClient::slotForLocked(std::string_view participantId)
 {
 	if (participantId.empty()) return nullptr;
 	for (auto& s : _calls)

@@ -1,4 +1,5 @@
 #include "MediaBridge.hpp"
+#include <cstring>
 
 MediaBridge::MediaBridge() = default;
 
@@ -147,6 +148,17 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 		return;
 	}
 
+	// Issue #218: held ANCHOR-mode legs get their anchor-bound audio from
+	// feedMohTick() instead of the handset -- discard what the handset sends
+	// while on hold rather than forwarding it alongside (or racing) the MoH
+	// tap. BUS mode is unaffected: conference hold is a separate, still-
+	// refused case (see onReinvite()'s 777/888 branch), and _held is never
+	// set true for a bus-mode bridge in the first place.
+	if (_held.load(std::memory_order_acquire) && _bus == nullptr)
+	{
+		return;
+	}
+
 	// Decode incoming LAN handset µ-law audio to PCM16
 	int16_t decoded[MAX_FRAME_SAMPLES];
 	size_t toDecode = (n > MAX_FRAME_SAMPLES) ? MAX_FRAME_SAMPLES : n;
@@ -171,6 +183,100 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 	{
 		_anchor->writeAudio(_participantId, decoded, decodedCount);
 	}
+}
+
+void MediaBridge::setHeld(bool held)
+{
+	if (held == _held.load(std::memory_order_acquire)) return;   // idempotent
+
+	if (held)
+	{
+		// BUS mode: nothing to tap in for. Conference hold stays refused
+		// upstream (onReinvite()'s 777/888 branch) -- this call should never
+		// actually happen for a bus-mode bridge, but a bridge that somehow
+		// got here anyway just plays nothing rather than tapping HoldMusic
+		// into a conference mix.
+		if (_moh && _bus == nullptr)
+		{
+			_mohTapId = _moh->addTap(&MediaBridge::mohTapTrampoline, this);
+			// addTap() returning -1 (no clip loaded, HoldMusic not running,
+			// or the tap table is full) is not an error here -- same
+			// fail-safe-to-silence philosophy as ParkOrbit's missing-clip
+			// path. The anchor just hears nothing while held instead of
+			// music, which is still strictly better than the 488 refusal
+			// this replaces.
+		}
+		_held.store(true, std::memory_order_release);
+	}
+	else
+	{
+		_held.store(false, std::memory_order_release);
+		if (_moh && _mohTapId >= 0)
+		{
+			_moh->removeTap(_mohTapId);
+		}
+		_mohTapId = -1;
+	}
+}
+
+void MediaBridge::feedMohTick(const uint8_t* ulawTick, size_t n)
+{
+	if (!_active.load(std::memory_order_acquire)) return;
+	if (!_held.load(std::memory_order_acquire)) return;
+	if (_bus != nullptr) return;   // ANCHOR mode only
+	if (_anchor == nullptr) return;   // set once in init(), never touched after -- safe unlocked
+
+	// Issue #218 follow-up (PD-Opus's vet of PR #239 caught this): snapshot
+	// _participantId into a fixed on-stack buffer under a SHORT, standalone
+	// hold of THIS class's _mutex, then release it before the network write
+	// below. Two things this depends on:
+	//
+	// 1. This lock is never nested under HoldMusic::_mutex -- the caller
+	//    (HoldMusic::runLoop()/deliverTickForTest()) only invokes taps AFTER
+	//    releasing its own _mutex. So stopBridge() (which takes this _mutex
+	//    then HoldMusic::_mutex, via removeTap()) and this function (which
+	//    takes only this _mutex, standalone) can never form a cycle.
+	// 2. _held is rechecked HERE, not just in the unlocked fast-path check
+	//    above -- setHeld(false)/stopBridge() could run in the gap between
+	//    that check and taking this lock. stopBridge() stores _held=false
+	//    BEFORE clearing _participantId, both under this same _mutex, so a
+	//    tap that observes _held==true under the lock is guaranteed to see
+	//    an intact, not-concurrently-cleared string.
+	//
+	// A fixed buffer rather than copying into a std::string: the copy must
+	// not allocate (this runs on HoldMusic's real-time pacing task), and
+	// AnchorClient::writeAudio() takes a string_view for exactly this reason.
+	char participantIdBuf[kMohParticipantIdBufSize];
+	size_t participantIdLen = 0;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (!_held.load(std::memory_order_acquire)) return;
+		participantIdLen = _participantId.size();
+		if (participantIdLen >= sizeof(participantIdBuf))
+		{
+			// Not seen in practice (see kMohParticipantIdBufSize's doc
+			// comment) -- refuse rather than truncate, since a truncated id
+			// could collide with a different call's slot in writeAudio()'s
+			// lookup and misdeliver this tick's audio into it.
+			return;
+		}
+		std::memcpy(participantIdBuf, _participantId.data(), participantIdLen);
+	}
+	// _mutex released here. Everything below, including the network write
+	// inside writeAudio(), runs unlocked -- see this function's own doc
+	// comment in the header for why that matters.
+
+	int16_t decoded[MAX_FRAME_SAMPLES];
+	size_t toDecode = (n > MAX_FRAME_SAMPLES) ? MAX_FRAME_SAMPLES : n;
+	size_t decodedCount = RtpReceiver::mulawDecodeBuffer(ulawTick, toDecode, decoded);
+	if (decodedCount == 0) return;
+
+	_anchor->writeAudio(std::string_view(participantIdBuf, participantIdLen), decoded, decodedCount);
+}
+
+void MediaBridge::mohTapTrampoline(void* ctx, const uint8_t* ulawTick, size_t n)
+{
+	static_cast<MediaBridge*>(ctx)->feedMohTick(ulawTick, n);
 }
 
 bool MediaBridge::fillHandsetTx(uint8_t* outUlaw, size_t count)
@@ -290,6 +396,19 @@ void MediaBridge::stopBridge()
 	}
 	// The anchor rx callback is owned by RequestsHandler (one for all bridges) — a bridge
 	// must NOT clear it on teardown, or it would silence every other live call's inbound audio.
+
+	// Issue #218: this bridge slot is about to be reused by a DIFFERENT call
+	// (POCKETDIAL_MAX_ANCHOR_CALLS-sized array, not one instance per call) —
+	// a tap left registered would keep firing feedMohTick() into whatever
+	// call claims this slot next, into an anchor that no longer belongs to
+	// it. Release it here rather than relying on the teardown path having
+	// already called setHeld(false).
+	if (_moh && _mohTapId >= 0)
+	{
+		_moh->removeTap(_mohTapId);
+	}
+	_mohTapId = -1;
+	_held.store(false, std::memory_order_release);
 
 	_playoutBuffer.clear();
 	_callID.clear();

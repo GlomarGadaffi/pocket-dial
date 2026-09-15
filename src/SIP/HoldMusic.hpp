@@ -75,13 +75,20 @@ public:
 	// test vectors, which pin 0xFF -> 0).
 	static constexpr uint8_t kUlawSilence = 0xFF;
 
-	// Pacing-task stack. The task's own frame is small and bounded — one
-	// 172-byte packet buffer plus a handful of locals; there is no recursion and
-	// nothing variable-length. This is deliberately NOT a round number picked by
-	// feel: runLoop() logs uxTaskGetStackHighWaterMark() once the listener table
-	// has been exercised, so the value can be trimmed from measurement instead of
-	// guessed. Check the boot log's "stack high-water" line before changing it.
-	static constexpr int kTaskStackBytes = 3072;
+	// Pacing-task stack. Was 3072 against a bounded 172-byte packet buffer plus
+	// a handful of locals -- issue #218 changed that: a tap fired under this
+	// same tick can now reach MediaBridge::feedMohTick() -> TelephonyAnchor
+	// Client::writeAudio(), which puts its own ~320-sample PCM16 decode buffer
+	// (640 bytes) and a ~1 KB chunked-HTTP framing buffer on THIS task's stack,
+	// plus whatever esp_http_client/mbedTLS use under a real (possibly slow,
+	// possibly TLS-handshaking) network write. Bumped defensively rather than
+	// left at the old, now-wrong figure. This is deliberately NOT a round
+	// number picked by feel: runLoop() logs uxTaskGetStackHighWaterMark() once
+	// the listener table has been exercised, so the value can be trimmed from
+	// measurement instead of guessed. Check the boot log's "stack high-water"
+	// line on the next hardware pass -- this number has not been measured
+	// against the new call chain yet.
+	static constexpr int kTaskStackBytes = 6144;
 
 	// ── Pure, platform-independent primitives (host-unit-tested) ────────────────
 
@@ -154,7 +161,67 @@ public:
 	void removeListener(int id);
 	unsigned listenerCount() const;
 
+	// Issue #218: a second, smaller kind of listener for a leg that has no RTP
+	// destination of its own to register above -- a media-anchored (555) call
+	// on hold. MediaBridge already owns that leg's real transport (it decodes
+	// the handset's RTP and hands PCM16 to the AnchorClient itself), so it
+	// doesn't want a UDP packet sent anywhere; it wants the shared clip's raw
+	// bytes each tick so it can inject them into its OWN outbound-to-anchor
+	// path in place of the handset's real audio. Same "one cursor, everyone
+	// hears the same instant" model as the RTP listeners above -- this is
+	// still a pull off that one cursor, not a second stream.
+	//
+	// Raw function pointer + context, not std::function: this fires from the
+	// pacing task's own real-time loop and must not touch the heap. Fixed at
+	// POCKETDIAL_MAX_ANCHOR_CALLS slots -- one tap per anchor call that could
+	// be held, at most, which is the same bound _mediaBridges is sized to.
+	using TapFn = void (*)(void* ctx, const uint8_t* ulawTick, size_t n);
+	// Registers a tap; returns an id (>=0), or -1 if the tap table is full.
+	int  addTap(TapFn fn, void* ctx);
+	void removeTap(int id);
+
+	// Test-only: drives exactly the per-tick body runLoop() runs (read the
+	// cursor, apply gain, snapshot+invoke taps, advance the cursor) without
+	// the real 20 ms task or socket, neither of which exist on host. A no-op
+	// if no clip is loaded. Compiled on every platform, like RequestsHandler's
+	// other test-only seams, so a host test can exercise addTap()'s actual
+	// delivery rather than only its bookkeeping. Invokes taps in the same
+	// lock-released order runLoop() does (see tickLocked()'s doc comment) —
+	// this deliberately does NOT take a shortcut of calling taps under the
+	// lock just because there is no real fan-out here to interleave with;
+	// host tests should exercise the actual production ordering.
+	void deliverTickForTest();
+
 private:
+	// A tap registration, copied OUT of the tap table by value under _mutex
+	// so it can be invoked after the lock is released. See tickLocked()'s
+	// doc comment for why the invocation itself must not happen while this
+	// class's _mutex is still held.
+	struct TapSnapshot
+	{
+		TapFn fn  = nullptr;
+		void* ctx = nullptr;
+	};
+
+	// Shared by runLoop() (ESP) and deliverTickForTest() (host): fills `out`
+	// with BYTES_PER_TICK gain-adjusted bytes at the current cursor position,
+	// copies (does NOT invoke) every registered tap into `tapsOut` (caller-
+	// sized to at least POCKETDIAL_MAX_ANCHOR_CALLS), sets `tapCount`, and
+	// advances the cursor. Caller must hold _mutex. Returns false (leaving
+	// everything else untouched) if no clip is loaded.
+	//
+	// Taps are snapshotted rather than invoked here on purpose (issue #218
+	// follow-up, caught in review): a tap can reach MediaBridge::feedMohTick()
+	// -> TelephonyAnchorClient::writeAudio(), a real network write that can
+	// block for the WHOLE 2 s HTTP client timeout on a congested trunk. If
+	// that happened while THIS _mutex were held, the SIP thread's own
+	// addTap()/removeTap() calls (setHeld()/stopBridge(), taken under
+	// RequestsHandler's engine lock) would stall behind it too — meaning one
+	// slow trunk write could freeze registration/INVITE/BYE processing for
+	// every call on the box, not just delay one parked caller's audio. The
+	// caller must invoke the snapshotted taps only AFTER releasing _mutex.
+	bool tickLocked(uint8_t out[BYTES_PER_TICK], TapSnapshot* tapsOut, size_t& tapCount);
+
 	struct Listener
 	{
 		bool     used     = false;
@@ -195,6 +262,17 @@ private:
 	Listener           _listeners[kMaxListeners];
 	uint8_t            _gainTable[256];
 	bool               _gainIsUnity = true;
+
+	// Issue #218's taps (see addTap()'s doc comment). Guarded by the same
+	// _mutex as _listeners -- the pacing task reads this table under lock
+	// alongside the listener fan-out, in the same tick.
+	struct Tap
+	{
+		bool  used = false;
+		TapFn fn   = nullptr;
+		void* ctx  = nullptr;
+	};
+	Tap _taps[POCKETDIAL_MAX_ANCHOR_CALLS];
 };
 
 #endif

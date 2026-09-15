@@ -9,6 +9,7 @@
 // reference implementation that echoes audio back to the caller.
 
 #include <string>
+#include <string_view>
 #include <functional>
 #include <cstdint>
 #include <cstddef>
@@ -67,7 +68,14 @@ public:
 	virtual void setEventCallback(EventCallback cb) = 0;
 
 	// Push a PCM-16 audio chunk into an active call, keyed by participant id.
-	virtual bool writeAudio(const std::string& participantId, const int16_t* pcmSamples, size_t count) = 0;
+	// string_view, not const std::string& (issue #218 follow-up): MediaBridge's
+	// HoldMusic-tap call site (feedMohTick()) must not allocate to build this
+	// argument -- it runs on HoldMusic's real-time pacing task, where the
+	// embedded firmware rules forbid heap allocation after init, and the
+	// participant id there comes from a fixed on-stack buffer, not a
+	// std::string. Every implementation still receives a valid, non-owning
+	// view; a std::string argument at any other call site converts for free.
+	virtual bool writeAudio(std::string_view participantId, const int16_t* pcmSamples, size_t count) = 0;
 
 	// Register the callback that receives inbound PCM-16 audio chunks from the external system.
 	virtual void registerAudioRxCallback(AudioRxCallback cb) = 0;

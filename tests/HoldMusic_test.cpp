@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -72,6 +73,20 @@ std::vector<uint8_t> makeUlawWav(uint32_t rate, uint16_t channels, size_t dataBy
     put32(out, uint32_t(body.size()));
     out.insert(out.end(), body.begin(), body.end());
     return out;
+}
+
+// Writes a real µ-law WAV to disk (same shape as makeUlawWav() above) and
+// returns its path, so a test can get HoldMusic all the way to `_running`,
+// which loadClip()+start() need a real file for — same pattern
+// MohPreview_test.cpp uses for its own clip fixture.
+std::string writeUlawWavToTemp(const char* filename, size_t dataBytes, uint8_t fill)
+{
+	const auto bytes = makeUlawWav(8000, 1, dataBytes, /*fmtTag=*/7, /*withFact=*/true, fill);
+	std::string path = std::string(::testing::TempDir()) + filename;
+	std::ofstream out(path, std::ios::binary | std::ios::trunc);
+	out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+	out.close();
+	return path;
 }
 
 }  // namespace
@@ -417,4 +432,89 @@ TEST(HoldMusic, ListenerCapacityMatchesTheParkOrbitCount)
     // Every parked call can be listening at once, and none of them should be the
     // one that silently gets nothing.
     EXPECT_EQ(HoldMusic::kMaxListeners, size_t(POCKETDIAL_PARK_SLOTS));
+}
+
+// ── Taps (issue #218: a held anchor/trunk call, not an RTP listener) ────────
+
+namespace
+{
+	void noopTap(void*, const uint8_t*, size_t) {}
+}
+
+TEST(HoldMusic, RefusesTapsUntilStarted)
+{
+    HoldMusic moh;
+    EXPECT_FALSE(moh.isLoaded());
+    // Same reasoning as RefusesListenersUntilStarted: a tap id that will
+    // never actually be invoked (the pacing task never runs) is worse than
+    // an honest -1 -- MediaBridge::setHeld() treats -1 as "play nothing",
+    // not as a fault.
+    EXPECT_EQ(moh.addTap(&noopTap, nullptr), -1);
+}
+
+TEST(HoldMusic, RemoveTapIsSafeOnOutOfRangeIds)
+{
+    // MediaBridge::stopBridge() calls this with whatever setHeld(true) last
+    // returned, including -1 for a bridge that was never actually held.
+    HoldMusic moh;
+    moh.removeTap(-1);
+    moh.removeTap(9999);
+}
+
+TEST(HoldMusic, AddTapSucceedsOnceRunningAndDeliversTheCurrentTick)
+{
+    HoldMusic moh;
+    // 0xAA is neither silence (0xFF) nor the fill byte other tests use, so a
+    // tap receiving it is unambiguously receiving the loaded clip and not a
+    // zeroed buffer.
+    const std::string path = writeUlawWavToTemp("pd_holdmusic_tap_test.wav",
+        HoldMusic::BYTES_PER_TICK * 4, 0xAA);
+    ASSERT_TRUE(moh.loadClip(path));
+    ASSERT_TRUE(moh.start());
+
+    struct Capture { uint8_t bytes[HoldMusic::BYTES_PER_TICK]; size_t n = 0; int calls = 0; } cap;
+    const int id = moh.addTap(
+        [](void* ctx, const uint8_t* tick, size_t n) {
+            auto* c = static_cast<Capture*>(ctx);
+            std::memcpy(c->bytes, tick, n);
+            c->n = n;
+            ++c->calls;
+        },
+        &cap);
+    ASSERT_GE(id, 0);
+
+    // The host build's start()/stop() have no real pacing task (HoldMusic.hpp's
+    // own class comment: the 20 ms task is ESP-only) -- deliverTickForTest()
+    // is the seam that drives exactly the tick body runLoop() would run,
+    // without needing a real thread. This is the same "drive the production
+    // code path directly" idiom MediaBridge_test.cpp already uses for
+    // onHandsetRtp/fillHandsetTx.
+    moh.deliverTickForTest();
+
+    EXPECT_EQ(cap.calls, 1);
+    ASSERT_EQ(cap.n, HoldMusic::BYTES_PER_TICK);
+    EXPECT_EQ(cap.bytes[0], 0xAA);
+
+    moh.removeTap(id);
+    cap.calls = 0;
+    moh.deliverTickForTest();
+    EXPECT_EQ(cap.calls, 0) << "a removed tap must not still fire";
+}
+
+TEST(HoldMusic, TapCapacityMatchesTheAnchorCallCount)
+{
+    // One tap per anchor call that could be held, at most -- the same bound
+    // _mediaBridges is sized to (POCKETDIAL_MAX_ANCHOR_CALLS), not the park
+    // orbit count the RTP listener table above uses.
+    HoldMusic moh;
+    const std::string path = writeUlawWavToTemp("pd_holdmusic_tap_capacity_test.wav",
+        HoldMusic::BYTES_PER_TICK, 0xFF);
+    ASSERT_TRUE(moh.loadClip(path));
+    ASSERT_TRUE(moh.start());
+
+    for (int i = 0; i < POCKETDIAL_MAX_ANCHOR_CALLS; ++i)
+    {
+        EXPECT_GE(moh.addTap(&noopTap, nullptr), 0) << "slot " << i;
+    }
+    EXPECT_EQ(moh.addTap(&noopTap, nullptr), -1) << "one past capacity must fail, not evict";
 }

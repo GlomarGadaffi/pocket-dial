@@ -464,6 +464,24 @@ private:
 	void onReinvite(std::shared_ptr<SipMessage> data);  // mid-dialog re-INVITE (hold/resume, RFC 3261 §14)
 	void onUpdate(std::shared_ptr<SipMessage> data);    // RFC 3311 mid-dialog UPDATE
 
+	// Issue #218: onReinvite()/onUpdate() share this for the anchored-media
+	// (555) leg. The board built the ORIGINAL 200 OK for that leg itself
+	// (originateAnchorCall()/onAnchorInvite()) rather than relaying one, so a
+	// re-INVITE/UPDATE here is something to ANSWER, not something with no
+	// peer to relay to -- unlike the 777/888 legs, which genuinely have none.
+	// Before this, all three fell into the same 488 refusal, which meant a
+	// phone could never hold an anchored/trunk call at all (confirmed on
+	// hardware: the far end heard silence, not hold music, because the hold
+	// itself was never accepted). Answers with the SAME media (codec/port
+	// unchanged -- the RTP session between phone and board never stops) and
+	// toggles the owning MediaBridge's held state, which decides whether the
+	// anchor hears the handset or hold music; the SDP negotiation itself
+	// doesn't need to change shape to do that. Returns false only when no
+	// bridge exists for this Call-ID (a race with teardown), in which case
+	// the caller has already sent a 481 and should just return.
+	bool answerAnchorReinvite(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<Session>& session, const std::shared_ptr<SipClient>& src);
+
 	// SDP admission failure (T-7). Requests that take a final response get a
 	// 488 Not Acceptable Here whose Warning header names the reason; ACK and
 	// responses, which take none, are dropped. Either way the body never reaches
@@ -623,9 +641,15 @@ private:
 	// ParkOrbit.hpp). Guarded by _mutex.
 	ParkOrbit _park{*this};
 
-	// Music on hold for parked callers (issue #162). Owned here and attached to
-	// _park at construction; silent hold is the fallback when no clip is loaded,
-	// so this being idle is a normal state rather than a fault.
+	// Music on hold for parked callers (issue #162), and — via setHoldMusic()
+	// at _mediaBridges' wiring below — for a held anchor/trunk call (issue
+	// #218). Owned here and attached to both at construction; silent hold is
+	// the fallback when no clip is loaded, so this being idle is a normal
+	// state rather than a fault. Declared BEFORE _mediaBridges below on
+	// purpose: ~MediaBridge() (via stopBridge()) may call _moh->removeTap(),
+	// so this must still be alive when _mediaBridges is destroyed — same
+	// reverse-declaration-order reasoning as the comment on _mediaBridges
+	// itself.
 	HoldMusic _holdMusic;
 
 	// The single in-flight MoH preview dialog. Server-originated, so there is no
