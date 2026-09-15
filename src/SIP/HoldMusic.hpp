@@ -75,13 +75,20 @@ public:
 	// test vectors, which pin 0xFF -> 0).
 	static constexpr uint8_t kUlawSilence = 0xFF;
 
-	// Pacing-task stack. The task's own frame is small and bounded — one
-	// 172-byte packet buffer plus a handful of locals; there is no recursion and
-	// nothing variable-length. This is deliberately NOT a round number picked by
-	// feel: runLoop() logs uxTaskGetStackHighWaterMark() once the listener table
-	// has been exercised, so the value can be trimmed from measurement instead of
-	// guessed. Check the boot log's "stack high-water" line before changing it.
-	static constexpr int kTaskStackBytes = 3072;
+	// Pacing-task stack. Was 3072 against a bounded 172-byte packet buffer plus
+	// a handful of locals -- issue #218 changed that: a tap fired under this
+	// same tick can now reach MediaBridge::feedMohTick() -> TelephonyAnchor
+	// Client::writeAudio(), which puts its own ~320-sample PCM16 decode buffer
+	// (640 bytes) and a ~1 KB chunked-HTTP framing buffer on THIS task's stack,
+	// plus whatever esp_http_client/mbedTLS use under a real (possibly slow,
+	// possibly TLS-handshaking) network write. Bumped defensively rather than
+	// left at the old, now-wrong figure. This is deliberately NOT a round
+	// number picked by feel: runLoop() logs uxTaskGetStackHighWaterMark() once
+	// the listener table has been exercised, so the value can be trimmed from
+	// measurement instead of guessed. Check the boot log's "stack high-water"
+	// line on the next hardware pass -- this number has not been measured
+	// against the new call chain yet.
+	static constexpr int kTaskStackBytes = 6144;
 
 	// ── Pure, platform-independent primitives (host-unit-tested) ────────────────
 
