@@ -1,9 +1,8 @@
 #include "SipSdpMessage.hpp"
-#include <string>
-#include <cstring>
-#include <stdexcept>
-#include <iostream>
+
 #include <cctype>
+#include <cstring>
+#include <string>
 
 SipSdpMessage::SipSdpMessage(const std::string& message, sockaddr_in src) : SipMessage(message, src)
 {
@@ -14,160 +13,225 @@ SipSdpMessage& SipSdpMessage::operator=(const SipSdpMessage& other)
 	if (this == &other) return *this;
 
 	SipMessage::operator=(other);   // copies the body, advances _bodyGen
-	// Deliberately NOT copying _spans/_spansGen — see the header. Generation 0
-	// is never a live body generation, so this forces a re-parse on next access.
+	// Deliberately NOT copying the cache state — see the header. Generation 0 is
+	// never a live body generation, so this forces a re-parse on next access.
+	// The slot hint is cleared too: keeping it would point this message at a
+	// slot owned by `other`, and while ensureParsed() would catch that via the
+	// owner check, leaving a knowingly-wrong hint behind is worse than clearing
+	// it.
 	_spansGen = 0;
+	_slot     = 0xFF;
 	return *this;
 }
 
-void SipSdpMessage::setMedia(std::string value)
+// ── Shared scratch ───────────────────────────────────────────────────────────
+//
+// Two slots, file-static, tagged with (owner, generation). See the header for
+// why the model does not live in the message and what makes sharing safe.
+namespace
 {
-	// Operate on a local copy of the body so the search offset and the mutation
-	// stay consistent within the same buffer (no cross-object pointer math
-	// against the base class's storage).
-	std::string body(getBody());
-	size_t pos_start = 0;
-	while (pos_start < body.size())
-	{
-		size_t pos_end = body.find("\r\n", pos_start);
-		size_t next_start = pos_end + 2;
-		if (pos_end == std::string::npos)
-		{
-			pos_end = body.find('\n', pos_start);
-			next_start = pos_end + 1;
-		}
-		size_t lineLen = (pos_end == std::string::npos) ? (body.size() - pos_start) : (pos_end - pos_start);
+	constexpr uint8_t kScratchSlots = 2;
 
-		if (lineLen >= 2 && body.compare(pos_start, 2, "m=") == 0)
-		{
-			body.replace(pos_start, lineLen, value);
-			setBody(body);
-			return;
-		}
-		pos_start = (pos_end == std::string::npos) ? body.size() : next_start;
-	}
-	// No "m=" line found: no-op, matching the original's behavior when there
-	// was no media line to replace.
+	struct ScratchSlot
+	{
+		const SipSdpMessage* owner = nullptr;
+		uint64_t             gen   = 0;
+		sdp::Session         model{};
+	};
+
+	ScratchSlot g_scratch[kScratchSlots];
+
+	// Round-robin eviction. Deliberately not true LRU: with two slots the two
+	// differ only when the same message is read twice in a row, which the
+	// generation check already short-circuits before eviction is reached. A
+	// counter is cheaper and has no tie-breaking behaviour to get wrong.
+	uint8_t g_nextSlot = 0;
 }
 
-// Issue #101(B): one single-pass parse of the body, cached until the body
-// changes. Line splitting mirrors the old per-accessor parseSdpFields() exactly
-// (primary "\r\n" delimiter, bare "\n" fallback) so behavior on mixed/malformed
-// line endings is unchanged, as is last-one-wins when a body repeats a field.
-const SipSdpMessage::SdpSpans& SipSdpMessage::ensureParsed() const
+const sdp::Session& SipSdpMessage::ensureParsed() const
 {
 	const uint64_t gen = bodyGeneration();
-	if (_spansGen == gen)
+
+	// Fast path: my own cache generation agrees with my body AND the slot I
+	// remember is still genuinely mine.
+	//
+	// All three conditions are load-bearing. _spansGen catches a body mutation.
+	// The owner check catches a slot that has been evicted and re-used by
+	// another message, and also catches a COPY that inherited my hint — a copy
+	// is a different object at a different address, so it can never pass this.
+	// The slot's own gen check is belt-and-braces against a pooled object being
+	// destroyed and a new one landing at the same address.
+	//
+	// ON ADDRESS REUSE (ABA), because it is the case a reader will worry about:
+	// the heap-fallback path deletes and re-allocates SipSdpMessage, so a NEW
+	// object really can land on an address a scratch slot is still tagged with.
+	// It is safe, but only because of the ORDER below. `_spansGen == gen` is
+	// checked FIRST and is per-object state: it can only be true if THIS object
+	// performed that parse, and that parse is what wrote its own tag into the
+	// slot. A fresh object starts at _spansGen = 0, and operator= resets it, so
+	// neither can ever take the fast path on an inherited tag.
+	//
+	// So: do NOT reorder these, and do NOT let the tag check alone be sufficient.
+	// Either change opens the ABA case that the current ordering closes.
+	if (_spansGen == gen && _slot < kScratchSlots
+		&& g_scratch[_slot].owner == this
+		&& g_scratch[_slot].gen == gen)
 	{
-		return _spans;   // body has not been touched since the last parse
+		return g_scratch[_slot].model;
 	}
 
-	const std::string_view body = getBody();
-
-	// Rebuilt from scratch rather than updated in place: a field present in the
-	// PREVIOUS body and absent from this one must not survive in the cache. This
-	// is the recycled-pool-slot case (reset() hands the same object back out with
-	// a different call's SDP), which is precisely what makes a stale cache here
-	// dangerous rather than merely wrong.
-	SdpSpans spans;
-
-	size_t pos_start = 0;
-	unsigned lineCount = 0;
-	while (pos_start < body.size())
+	// Prefer a slot that is already nominally mine, so re-parsing after a body
+	// mutation does not evict the OTHER message being read alongside this one.
+	uint8_t slot = kScratchSlots;
+	for (uint8_t i = 0; i < kScratchSlots; ++i)
 	{
-		// CWE-674 defense-in-depth (see SipSdpMessage.hpp): bound the scan so the
-		// work is a function of a fixed cap, never of attacker-chosen structure.
-		// A well-formed offer carries its session lines (v/o/s/c/t) and the m=
-		// line up front, so a legitimate body is never truncated; a hostile body
-		// padded past the cap simply stops being parsed. (On the wire path such a
-		// body was already refused by SipMessage::checkSdp() before reaching here.)
-		if (lineCount++ >= kMaxSdpLines) break;
-		const size_t lineStart = pos_start;
-		size_t pos_end = body.find("\r\n", pos_start);
-		size_t next_start = pos_end + 2;
-		if (pos_end == std::string_view::npos)
-		{
-			pos_end = body.find('\n', pos_start);
-			next_start = pos_end + 1;
-		}
-
-		std::string_view line;
-		if (pos_end == std::string_view::npos)
-		{
-			line = body.substr(pos_start);
-			pos_start = body.size();
-		}
-		else
-		{
-			line = body.substr(pos_start, pos_end - pos_start);
-			pos_start = next_start;
-		}
-
-		if (line.empty()) continue;
-
-		const FieldSpan span{static_cast<uint32_t>(lineStart), static_cast<uint32_t>(line.size())};
-		if (line.compare(0, 2, "v=") == 0)      spans.version = span;
-		else if (line.compare(0, 2, "o=") == 0) spans.originator = span;
-		else if (line.compare(0, 2, "s=") == 0) spans.sessionName = span;
-		else if (line.compare(0, 2, "c=") == 0) spans.connectionInformation = span;
-		else if (line.compare(0, 2, "t=") == 0) spans.time = span;
-		else if (line.compare(0, 2, "m=") == 0) spans.media = span;
+		if (g_scratch[i].owner == this) { slot = i; break; }
+	}
+	if (slot == kScratchSlots)
+	{
+		slot = g_nextSlot;
+		g_nextSlot = static_cast<uint8_t>((g_nextSlot + 1) % kScratchSlots);
 	}
 
-	_spans    = spans;
+	ScratchSlot& s = g_scratch[slot];
+
+	// parse() resets the model before filling it, so a field from the PREVIOUS
+	// occupant of this slot cannot survive into ours.
+	//
+	// A non-Ok verdict leaves `model` as the reset-but-empty state, which is the
+	// right answer for an accessor: every field reads absent. The wire path
+	// refuses such a body with a 488 long before it reaches here (checkSdp()),
+	// so this only arises for a locally built or test-constructed message, where
+	// "the body is not usable, report nothing" beats both throwing and
+	// returning half a parse.
+	(void)sdp::parse(getBody(), s.model);
+
+	s.owner   = this;
+	s.gen     = gen;
+	_slot     = slot;
 	_spansGen = gen;
-	return _spans;
+	return s.model;
 }
 
-std::string_view SipSdpMessage::viewOf(const FieldSpan& span) const
-{
-	if (span.len == 0) return {};   // field absent — same empty view as before
-
-	// Belt-and-braces: ensureParsed() guarantees the span indexes the body it was
-	// parsed from, so an out-of-range span means the generation counter missed a
-	// mutation. Report the field absent rather than let substr() throw
-	// std::out_of_range out of the middle of a SIP handler — exceptions are
-	// enabled in the ESP-IDF build (CONFIG_COMPILER_CXX_EXCEPTIONS=y) but nothing
-	// up the call stack catches, so the throw would take the SIP task with it.
-	// The invariant is still enforced by the tests, not by this clamp.
-	const std::string_view body = getBody();
-	if (span.pos > body.size() || span.len > body.size() - span.pos) return {};
-	return body.substr(span.pos, span.len);
-}
+// ── The six legacy accessors, reimplemented on the model ─────────────────────
+//
+// Each returns the WHOLE line including its two-character prefix, exactly as
+// before — see the span convention in Sdp.hpp, which exists largely so these
+// stay byte-identical for their existing callers. The string_views point into
+// the body, not into the scratch slot, so they remain valid after the slot is
+// evicted.
 
 std::string_view SipSdpMessage::getVersion() const
 {
-	return viewOf(ensureParsed().version);
+	return sdp::view(getBody(), ensureParsed().version);
 }
 
 std::string_view SipSdpMessage::getOriginator() const
 {
-	return viewOf(ensureParsed().originator);
+	return sdp::view(getBody(), ensureParsed().origin);
 }
 
 std::string_view SipSdpMessage::getSessionName() const
 {
-	return viewOf(ensureParsed().sessionName);
+	return sdp::view(getBody(), ensureParsed().name);
 }
 
 std::string_view SipSdpMessage::getConnectionInformation() const
 {
-	return viewOf(ensureParsed().connectionInformation);
+	// CORRECTION TO THE RECORD, because issue #196 item 2 overstates this and the
+	// overstatement nearly got baked in here. Item 2 says a phone emitting c=
+	// only per-media "defeats getConnectionInformation() outright". It does not.
+	// The parser this replaces scanned for ANY line starting with "c=", session
+	// or media level, last one wins — so it found a media-level c= perfectly
+	// well. (Same shape as the #199 finding: an issue calling something absent
+	// when it is present but unreachable by a different route.)
+	//
+	// The real defect is narrower and still real: the old scan had no notion of
+	// WHICH section a c= belonged to, so on a multi-section body there was no way
+	// to ask for a particular stream's address — you got whichever c= came last.
+	// That is what the model fixes, via effectiveConnection(s, i).
+	//
+	// This accessor deliberately reproduces the OLD semantics exactly, because
+	// the brief for this branch is that no caller outside this class changes:
+	// walk sections backwards for the last media-level c=, else fall back to the
+	// session's. For any body that respects RFC 8866's line ordering (session c=
+	// precedes the first m=), that is identical to "last c= line in the body".
+	// Callers that want a specific section's address use the model directly.
+	const sdp::Session& s = ensureParsed();
+	for (int i = static_cast<int>(s.nMedia) - 1; i >= 0; --i)
+	{
+		if (!s.media[i].connection.absent())
+		{
+			return sdp::view(getBody(), s.media[i].connection);
+		}
+	}
+	return sdp::view(getBody(), s.connection);
 }
 
 std::string_view SipSdpMessage::getTime() const
 {
-	return viewOf(ensureParsed().time);
+	return sdp::view(getBody(), ensureParsed().time);
 }
 
 std::string_view SipSdpMessage::getMedia() const
 {
-	return viewOf(ensureParsed().media);
+	// The LAST media section's m= line, not the first.
+	//
+	// This looks wrong and is not. The parser this replaces had a single media
+	// span overwritten by every m= line it met, so a body with two m= lines
+	// reported the SECOND one, and SipSdpMessage_cache_test pins exactly that
+	// ("last-one-wins on a repeated field"). Returning media[0] here is the
+	// intuitive reading of a sectioned model and it broke that test immediately.
+	//
+	// Preserving the old answer is the right call for this branch: the brief is
+	// that no caller outside this class changes behaviour, and getMedia() feeds
+	// getRtpPort(), which feeds RequestsHandler::parseCallerRtp. Quietly moving
+	// which stream the PBX aims RTP at, inside a parser refactor, is precisely
+	// the kind of change that should not ride along unannounced.
+	//
+	// It IS wrong for a genuine audio+video offer — it returns the video line —
+	// but it was equally wrong before, and fixing it means teaching the callers
+	// about sections. Tracked as #253, which argues the fix is explicit section
+	// selection at the call sites ("the first AUDIO section"), not media[0].
+	const sdp::Session& s = ensureParsed();
+	if (s.nMedia == 0) return std::string_view();
+	return sdp::view(getBody(), s.media[s.nMedia - 1].line);
 }
 
 int SipSdpMessage::getRtpPort() const
 {
+	// Deliberately still parsed out of the m= line text rather than read from
+	// Media::port, so this returns bit-for-bit what it always has — including
+	// its saturation behaviour on absurd input. Switching to the model's parsed
+	// port would be a behaviour change smuggled into a refactor; it belongs in
+	// the follow-up that migrates callers, not here.
 	return extractRtpPort(getMedia());
+}
+
+void SipSdpMessage::setMedia(std::string value)
+{
+	// Replace the first m= line, using the model to find it instead of
+	// re-scanning the body by hand.
+	//
+	// setBody() bumps _bodyGen, so the next accessor re-parses against the NEW
+	// bytes: the model can never be left describing a body that no longer
+	// exists. That ordering is the whole safety argument for mutation here.
+	// NOTE THE ASYMMETRY WITH getMedia(), which is pre-existing and preserved:
+	// the old getMedia() reported the LAST m= line (a single span overwritten
+	// by each one), while the old setMedia() replaced the FIRST (it returned
+	// on first match). So on a two-section body they disagree about which
+	// line they mean. That is a real inconsistency, it predates this change,
+	// and reproducing it exactly is deliberate -- silently aligning them here
+	// would change behaviour for any caller relying on either. Tracked as #253.
+	const sdp::Session& s = ensureParsed();
+	if (s.nMedia == 0) return;   // no m= line to replace — same no-op as before
+
+	const sdp::Span line = s.media[0].line;
+	std::string body(getBody());
+	if (line.pos > body.size() || line.len > body.size() - line.pos) return;
+
+	body.replace(line.pos, line.len, value);
+	setBody(body);
 }
 
 int SipSdpMessage::extractRtpPort(std::string_view data) const

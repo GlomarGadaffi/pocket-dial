@@ -38,6 +38,13 @@ add_executable(sip_parser_tests
     # against the UNISOC T612 a=acap-flood RCE class (SSD advisory, 2026), even as
     # SDP negotiation adds a= attribute handling on this branch.
     SipSdpMessage_hardening_test.cpp
+    # Issue #196. SdpModel_test holds the structural invariants (offsets only,
+    # memcpy-safe, size ceiling) at COMPILE time; SdpParse_test covers what the
+    # generated parser does, weighted at the three cases the issue was filed
+    # for: multi-section survival, media-level c= with no session-level c=, and
+    # fail-closed overflow rather than silent truncation.
+    SdpModel_test.cpp
+    SdpParse_test.cpp
     # T-7 (docs/THREAT_MODEL.md): SipMessage::checkSdp() structural caps + the
     # RFC 5939 capability-negotiation refusal, and the handle()-level gate that
     # applies them to every SDP-bearing message before any decode or relay.
@@ -459,6 +466,14 @@ add_executable(sip_parser_tests
     ../src/SIP/HoldMusic.cpp
     ../src/SIP/BlfSubscriptions.cpp
     ../src/SIP/SipSdpMessage.cpp
+    # Issue #196: the RFC 8866 model SipSdpMessage is now built on. Sdp.cpp is
+    # GENERATED from Sdp.re by re2c and committed -- never edit it; regenerate
+    # with `re2c --no-generation-date --no-debug-info -W Sdp.re -o Sdp.cpp`.
+    # --no-debug-info is required: without it re2c embeds the absolute source
+    # path in #line directives and the committed file can never match a
+    # regeneration on another machine.
+    ../src/SIP/Sdp.cpp
+    ../src/SIP/SdpModel.cpp
     ../src/SIP/SipClient.cpp
     ../src/SIP/Session.cpp
     # HttpServer + its OTA dependency, both already host-compilable (platform

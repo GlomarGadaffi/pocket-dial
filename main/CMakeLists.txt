@@ -152,6 +152,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/SipMessage.cpp"
                             "../src/SIP/SipMessageFactory.cpp"
                             "../src/SIP/SipSdpMessage.cpp"
+                            "../src/SIP/Sdp.cpp"
+                            "../src/SIP/SdpModel.cpp"
                             "../src/SIP/SipServer.cpp"
                             "../src/SIP/SipStatus.cpp"
                             "../src/SIP/RtpSender.cpp"
