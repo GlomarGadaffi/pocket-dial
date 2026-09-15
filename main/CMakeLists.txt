@@ -140,6 +140,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # firmware and the host suite compile the same code.
                             "../src/SIP/SipRegistrationClient.cpp"
                             "../src/SIP/RegisterBeeper.cpp"
+                            "../src/SIP/SipTrunk.cpp"
                             "../src/SIP/EmergencyNotifier.cpp"
                             "../src/SIP/ParkOrbit.cpp"
                             # Music on hold for parked callers (#162): one global clip cursor, fanned

@@ -154,6 +154,23 @@ public:
 	using Sink = std::function<void(const uint8_t* mulaw, size_t n,
 		uint32_t timestamp, uint16_t seq)>;
 
+	// The RawSink: a B2BUA relay leg's egress. Invoked once per well-formed
+	// RTPv2 datagram, ON THE RECEIVE TASK, with the packet exactly as it
+	// arrived -- payload type, sequence, timestamp and marker intact, payload
+	// undecoded.
+	//
+	// WHY THIS IS SEPARATE FROM Sink. A trunk leg must forward what it
+	// receives, not interpret it. Sink hands out audio only (PT 0), and
+	// runLoop() drops every other payload type after offering it to the RFC
+	// 4733 path -- so on a relay leg the carrier's telephone-event packets,
+	// comfort noise and any codec we do not speak would all be destroyed, and
+	// DTMF would never cross the trunk at all. RawSink is the escape hatch:
+	// it sees everything.
+	//
+	// CONTRACT: as Sink -- consume synchronously, do NOT retain pkt.payload
+	// past return (the datagram buffer is reused for the next packet).
+	using RawSink = std::function<void(const RtpPacket& pkt)>;
+
 	// ── Pure, platform-independent primitives (host-unit-tested) ────────────────
 
 	// ITU-T G.711 µ-law DECODE of one companded byte → 16-bit linear PCM. Exact
@@ -193,6 +210,11 @@ public:
 	// active (cap reached) or the socket/task could not be created. On host this
 	// is a guarded no-op that still flips _active and records the sink/port so the
 	// cap + bind-advertise logic is exercisable in tests.
+	//
+	// `sink` may be null IF a raw sink is already armed (setRawSink) -- a relay
+	// leg has no audio consumer by design. With neither, start() refuses: a
+	// bound socket and a running task delivering nowhere is a leak, not a
+	// stream.
 	bool start(uint16_t localPort, Sink sink);
 
 	// Enable RFC 4733 reception on `pt`, the telephone-event payload type taken
@@ -201,6 +223,30 @@ public:
 	// a mid-call re-negotiation is safe. Passing PAYLOAD_TYPE_PCMU is refused — that
 	// would shadow audio — and returns false.
 	bool setDtmfPayloadType(uint8_t pt, DtmfSink sink);
+
+	// Arm RAW RELAY for this stream. While a raw sink is set, EVERY
+	// well-formed RTPv2 packet goes to it intact and nothing else runs: no
+	// audio Sink, no RFC 4733 decode, no sequence-gap diagnostics.
+	//
+	// The exclusivity is the point, not an optimisation. A relay leg that
+	// also decoded DTMF would hand the carrier's IVR keypresses to whatever
+	// the local digit consumer is -- on this PBX, the star-code feature
+	// parser -- so a caller navigating "press 1 for billing" would trip a
+	// local feature code instead. Making raw mode take over the packet path
+	// means that cannot be wired up by accident: there is no state in which
+	// one receiver both relays and interprets.
+	//
+	// Pass nullptr to disarm and return the stream to normal audio handling.
+	// May be called before or after start(). Returns false only when asked to
+	// disarm a receiver that had no raw sink armed.
+	bool setRawSink(RawSink sink);
+
+	// Offer one parsed packet to the raw-relay path. Returns true when a raw
+	// sink was armed and consumed it, in which case the caller must not
+	// process the packet further. Public for the same reason dispatchDtmf()
+	// is: start() is a no-op stub on host builds, so everything downstream of
+	// recvfrom() would otherwise be unreachable off-device.
+	bool dispatchRaw(const RtpPacket& pkt);
 
 	// Offer one parsed RTP packet to the RFC 4733 path. Returns true when the
 	// packet was a telephone-event on the negotiated payload type and has been
@@ -261,6 +307,12 @@ private:
 	// happens to match the last press of the previous one would be swallowed.
 	std::atomic<uint8_t> _dtmfPt{kDtmfPayloadTypeUnset};
 	DtmfSink             _dtmfSink;
+
+	// Raw relay (B2BUA trunk leg). The sink is guarded by _slotMutex like
+	// _sink; the atomic flag lets the receive task skip the lock entirely on
+	// the common non-relay path -- one acquire-load per packet, not a mutex.
+	std::atomic<bool> _rawArmed{false};
+	RawSink           _rawSink;
 	uint32_t             _lastDtmfTs   = 0;
 	bool                 _haveLastDtmf = false;
 };

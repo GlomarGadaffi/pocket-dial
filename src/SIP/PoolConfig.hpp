@@ -239,6 +239,13 @@
 // and dropped. Raising further needs ECC-accel silicon or GET-stream resumption.
 #ifndef POCKETDIAL_MAX_ANCHOR_CALLS
 #define POCKETDIAL_MAX_ANCHOR_CALLS 4
+
+// Concurrent OUTBOUND SIP trunk dialogs (issue #164). Two, not four: each trunk
+// call also consumes an RtpReceiver/RtpSender relay pair and a message-pool
+// slot, and a residential PBX placing three simultaneous PSTN calls is not the
+// case worth sizing for. Exceeding it refuses the call rather than queueing --
+// see SipTrunk::placeCall().
+#define POCKETDIAL_MAX_TRUNK_CALLS 2
 #endif
 
 // Maximum number of DID -> extension inbound routing entries (DidMapping.hpp).
