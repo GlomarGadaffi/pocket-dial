@@ -147,6 +147,17 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 		return;
 	}
 
+	// Issue #218: held ANCHOR-mode legs get their anchor-bound audio from
+	// feedMohTick() instead of the handset -- discard what the handset sends
+	// while on hold rather than forwarding it alongside (or racing) the MoH
+	// tap. BUS mode is unaffected: conference hold is a separate, still-
+	// refused case (see onReinvite()'s 777/888 branch), and _held is never
+	// set true for a bus-mode bridge in the first place.
+	if (_held.load(std::memory_order_acquire) && _bus == nullptr)
+	{
+		return;
+	}
+
 	// Decode incoming LAN handset µ-law audio to PCM16
 	int16_t decoded[MAX_FRAME_SAMPLES];
 	size_t toDecode = (n > MAX_FRAME_SAMPLES) ? MAX_FRAME_SAMPLES : n;
@@ -171,6 +182,60 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 	{
 		_anchor->writeAudio(_participantId, decoded, decodedCount);
 	}
+}
+
+void MediaBridge::setHeld(bool held)
+{
+	if (held == _held.load(std::memory_order_acquire)) return;   // idempotent
+
+	if (held)
+	{
+		// BUS mode: nothing to tap in for. Conference hold stays refused
+		// upstream (onReinvite()'s 777/888 branch) -- this call should never
+		// actually happen for a bus-mode bridge, but a bridge that somehow
+		// got here anyway just plays nothing rather than tapping HoldMusic
+		// into a conference mix.
+		if (_moh && _bus == nullptr)
+		{
+			_mohTapId = _moh->addTap(&MediaBridge::mohTapTrampoline, this);
+			// addTap() returning -1 (no clip loaded, HoldMusic not running,
+			// or the tap table is full) is not an error here -- same
+			// fail-safe-to-silence philosophy as ParkOrbit's missing-clip
+			// path. The anchor just hears nothing while held instead of
+			// music, which is still strictly better than the 488 refusal
+			// this replaces.
+		}
+		_held.store(true, std::memory_order_release);
+	}
+	else
+	{
+		_held.store(false, std::memory_order_release);
+		if (_moh && _mohTapId >= 0)
+		{
+			_moh->removeTap(_mohTapId);
+		}
+		_mohTapId = -1;
+	}
+}
+
+void MediaBridge::feedMohTick(const uint8_t* ulawTick, size_t n)
+{
+	if (!_active.load(std::memory_order_acquire)) return;
+	if (!_held.load(std::memory_order_acquire)) return;
+	if (_bus != nullptr) return;   // ANCHOR mode only
+	if (_anchor == nullptr) return;
+
+	int16_t decoded[MAX_FRAME_SAMPLES];
+	size_t toDecode = (n > MAX_FRAME_SAMPLES) ? MAX_FRAME_SAMPLES : n;
+	size_t decodedCount = RtpReceiver::mulawDecodeBuffer(ulawTick, toDecode, decoded);
+	if (decodedCount == 0) return;
+
+	_anchor->writeAudio(_participantId, decoded, decodedCount);
+}
+
+void MediaBridge::mohTapTrampoline(void* ctx, const uint8_t* ulawTick, size_t n)
+{
+	static_cast<MediaBridge*>(ctx)->feedMohTick(ulawTick, n);
 }
 
 bool MediaBridge::fillHandsetTx(uint8_t* outUlaw, size_t count)
@@ -290,6 +355,19 @@ void MediaBridge::stopBridge()
 	}
 	// The anchor rx callback is owned by RequestsHandler (one for all bridges) — a bridge
 	// must NOT clear it on teardown, or it would silence every other live call's inbound audio.
+
+	// Issue #218: this bridge slot is about to be reused by a DIFFERENT call
+	// (POCKETDIAL_MAX_ANCHOR_CALLS-sized array, not one instance per call) —
+	// a tap left registered would keep firing feedMohTick() into whatever
+	// call claims this slot next, into an anchor that no longer belongs to
+	// it. Release it here rather than relying on the teardown path having
+	// already called setHeld(false).
+	if (_moh && _mohTapId >= 0)
+	{
+		_moh->removeTap(_mohTapId);
+	}
+	_mohTapId = -1;
+	_held.store(false, std::memory_order_release);
 
 	_playoutBuffer.clear();
 	_callID.clear();

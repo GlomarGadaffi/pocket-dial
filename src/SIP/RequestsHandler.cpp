@@ -314,6 +314,9 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 		for (size_t i = 0; i < POCKETDIAL_MAX_ANCHOR_CALLS; ++i)
 		{
 			_mediaBridges[i].init(&_anchorRtpReceivers[i], &_anchorRtpSenders[i], _anchorClient);
+			// Issue #218: same wiring as ParkOrbit::setHoldMusic() below, so a
+			// held anchor/trunk call can tap the shared clip too.
+			_mediaBridges[i].setHoldMusic(&_holdMusic);
 			// Issue #199 item 3. On an anchored (555 / trunk) call the board IS
 			// the far end of the handset's media, so RFC 4733 is the only way a
 			// keypress reaches it short of SIP INFO — and this is the path #194's
@@ -6977,6 +6980,83 @@ static std::string stripHeaderName(std::string_view h)
 	return siphdr::stripHeaderName(h);
 }
 
+// ── Anchored-leg (555) re-INVITE/UPDATE — issue #218 ─────────────────────────
+// See the declaration's doc comment (RequestsHandler.hpp) for the full "why":
+// the board is the UAS on this leg, so a re-INVITE/UPDATE here is answered,
+// not relayed. Shared by onReinvite() and onUpdate(), whose SDP-bearing path
+// hits the identical case.
+bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<Session>& session, const std::shared_ptr<SipClient>& src)
+{
+	const std::string callIdStr(data->getCallID());
+	MediaBridge* bridge = nullptr;
+	for (auto& b : _mediaBridges)
+	{
+		if (b.isForCallId(callIdStr)) { bridge = &b; break; }
+	}
+	if (!bridge)
+	{
+		// Bridge already torn down (a race with teardown) -- nothing to answer
+		// with. 481 is the honest response: the dialog this request names does
+		// not have a media leg behind it any more.
+		auto response = getMessageFromPool(*data);
+		if (!response) return false;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 481 Call/Transaction Does Not Exist");
+		response->clearBody();
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		return false;
+	}
+
+	auto ok = getMessageFromPool(*data);
+	if (!ok) return true;   // pool exhausted: drop, peer retransmits (#101A) -- bridge was found, so this counts as handled
+	ok->setHeader(SipMessageTypes::OK);
+	ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	// To: is left exactly as `data` carried it -- this is an in-dialog request,
+	// so the phone already echoed the tag it learned from the ORIGINAL 200 OK.
+	// buildOkWithSdp() mints a fresh tag for a first answer; calling it here
+	// would append a second tag onto the one already present.
+	addCapabilityHeaders(*ok);
+	const std::string sdpBody = buildMediaSdp(_localIp, bridge->receiverPort(),
+		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
+	ok->clearBody();
+	{
+		std::string raw = ok->toString();
+		size_t sep = raw.find("\r\n\r\n");
+		if (sep != std::string::npos)
+		{
+			std::string_view headerView(raw.data(), sep);
+			if (headerView.find("application/sdp") == std::string_view::npos)
+			{
+				raw.insert(sep, "\r\nContent-Type: application/sdp");
+				sep = raw.find("\r\n\r\n");
+			}
+			raw.erase(sep + 4);
+			raw += sdpBody;
+		}
+		ok->reset(std::move(raw), data->getSource());
+	}
+	ok->syncContentLength();
+	_outbox.emplace_back(data->getSource(), std::move(ok));
+
+	const auto dir = data->getSdpDirection();
+	const bool holding = (dir == SipMessage::SdpDirection::SendOnly ||
+		dir == SipMessage::SdpDirection::RecvOnly ||
+		dir == SipMessage::SdpDirection::Inactive);
+	bridge->setHeld(holding);
+
+	if (session->getSessionExpiresSeconds() > 0)
+	{
+		session->armSessionTimer(session->getSessionExpiresSeconds(),
+		                         session->isRefresher(),
+		                         std::chrono::steady_clock::now());
+	}
+	session->setState(holding ? Session::State::Held : Session::State::Connected);
+	queueLog(std::string(holding ? "Hold (anchor): " : "Resume (anchor): ") +
+		std::string(src->getNumber()) + " call " + callIdStr, false);
+	return true;
+}
+
 // ── Mid-dialog re-INVITE (RFC 3261 §12.2 hold/resume) ────────────────────────
 
 void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
@@ -6990,13 +7070,23 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	auto src = session->getSrc();
 	auto dest = session->getDest();
 
-	// Virtual-extension legs (777 echo, 888 conference, 555 anchor bridge) have no
-	// real peer to relay the offer to — their "dest" is a stand-in SipClient
-	// carrying the CALLER's own address, so relaying would send the phone its own
-	// re-INVITE back. Decline instead, so the holding phone keeps the call on the
-	// original SDP.
 	const std::string destNum = dest ? dest->getNumber() : "";
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || destNum == kAnchorCallExt || !src || !dest)
+
+	// Issue #218: the anchored leg is answered, not refused -- see
+	// answerAnchorReinvite()'s doc comment. Checked before the virtual-leg
+	// refusal below, which still applies to 777/888 (no real peer at all).
+	if (destNum == kAnchorCallExt && src && dest)
+	{
+		answerAnchorReinvite(data, session, src);
+		return;
+	}
+
+	// Virtual-extension legs (777 echo, 888 conference) have no real peer to
+	// relay the offer to — their "dest" is a stand-in SipClient carrying the
+	// CALLER's own address, so relaying would send the phone its own
+	// re-INVITE back. Decline instead, so the holding phone keeps the call on
+	// the original SDP.
+	if (destNum == "777" || destNum == ConferenceRoom::EXT || !src || !dest)
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -7095,8 +7185,16 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	auto dest = session->getDest();
 	const std::string destNum = dest ? dest->getNumber() : "";
 
-	// Same virtual-leg guard as onReinvite() above: 777/888/555 have no peer leg.
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || destNum == kAnchorCallExt || !src || !dest)
+	// Issue #218: same anchored-leg answer as onReinvite() — see
+	// answerAnchorReinvite()'s doc comment.
+	if (destNum == kAnchorCallExt && src && dest)
+	{
+		answerAnchorReinvite(data, session, src);
+		return;
+	}
+
+	// Same virtual-leg guard as onReinvite() above: 777/888 have no peer leg.
+	if (destNum == "777" || destNum == ConferenceRoom::EXT || !src || !dest)
 	{
 		auto resp = getMessageFromPool(*data);
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)

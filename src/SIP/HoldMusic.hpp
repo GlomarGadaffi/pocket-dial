@@ -154,7 +154,43 @@ public:
 	void removeListener(int id);
 	unsigned listenerCount() const;
 
+	// Issue #218: a second, smaller kind of listener for a leg that has no RTP
+	// destination of its own to register above -- a media-anchored (555) call
+	// on hold. MediaBridge already owns that leg's real transport (it decodes
+	// the handset's RTP and hands PCM16 to the AnchorClient itself), so it
+	// doesn't want a UDP packet sent anywhere; it wants the shared clip's raw
+	// bytes each tick so it can inject them into its OWN outbound-to-anchor
+	// path in place of the handset's real audio. Same "one cursor, everyone
+	// hears the same instant" model as the RTP listeners above -- this is
+	// still a pull off that one cursor, not a second stream.
+	//
+	// Raw function pointer + context, not std::function: this fires from the
+	// pacing task's own real-time loop and must not touch the heap. Fixed at
+	// POCKETDIAL_MAX_ANCHOR_CALLS slots -- one tap per anchor call that could
+	// be held, at most, which is the same bound _mediaBridges is sized to.
+	using TapFn = void (*)(void* ctx, const uint8_t* ulawTick, size_t n);
+	// Registers a tap; returns an id (>=0), or -1 if the tap table is full.
+	int  addTap(TapFn fn, void* ctx);
+	void removeTap(int id);
+
+	// Test-only: drives exactly the per-tick body runLoop() runs (read the
+	// cursor, apply gain, invoke taps, advance the cursor) without the real
+	// 20 ms task or socket, neither of which exist on host. A no-op if no
+	// clip is loaded. Compiled on every platform, like RequestsHandler's
+	// other test-only seams, so a host test can exercise addTap()'s actual
+	// delivery rather than only its bookkeeping.
+	void deliverTickForTest();
+
 private:
+	// Shared by runLoop() (ESP) and deliverTickForTest() (host): fills `out`
+	// with BYTES_PER_TICK gain-adjusted bytes at the current cursor position,
+	// invokes any registered taps with those same bytes, and advances the
+	// cursor. Caller must hold _mutex. Returns false (leaving `out`
+	// untouched) if no clip is loaded — the only difference between the two
+	// callers is what they do with `out` afterwards: runLoop() fans it to
+	// the RTP listener table too; deliverTickForTest() doesn't have one.
+	bool tickLocked(uint8_t out[BYTES_PER_TICK]);
+
 	struct Listener
 	{
 		bool     used     = false;
@@ -195,6 +231,17 @@ private:
 	Listener           _listeners[kMaxListeners];
 	uint8_t            _gainTable[256];
 	bool               _gainIsUnity = true;
+
+	// Issue #218's taps (see addTap()'s doc comment). Guarded by the same
+	// _mutex as _listeners -- the pacing task reads this table under lock
+	// alongside the listener fan-out, in the same tick.
+	struct Tap
+	{
+		bool  used = false;
+		TapFn fn   = nullptr;
+		void* ctx  = nullptr;
+	};
+	Tap _taps[POCKETDIAL_MAX_ANCHOR_CALLS];
 };
 
 #endif

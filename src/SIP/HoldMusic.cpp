@@ -318,6 +318,75 @@ void HoldMusic::removeListener(int id)
 	_listeners[id].used = false;
 }
 
+int HoldMusic::addTap(TapFn fn, void* ctx)
+{
+	if (!_running.load(std::memory_order_acquire)) return -1;
+	if (fn == nullptr) return -1;
+
+	std::lock_guard<std::mutex> lk(_mutex);
+	for (size_t i = 0; i < POCKETDIAL_MAX_ANCHOR_CALLS; ++i)
+	{
+		if (_taps[i].used) continue;
+		_taps[i].used = true;
+		_taps[i].fn   = fn;
+		_taps[i].ctx  = ctx;
+		return static_cast<int>(i);
+	}
+	return -1;   // every anchor call already tapped in
+}
+
+void HoldMusic::removeTap(int id)
+{
+	if (id < 0 || static_cast<size_t>(id) >= POCKETDIAL_MAX_ANCHOR_CALLS) return;
+	std::lock_guard<std::mutex> lk(_mutex);
+	_taps[id].used = false;
+	_taps[id].fn   = nullptr;
+	_taps[id].ctx  = nullptr;
+}
+
+// Platform-independent (no socket, no task) so both runLoop() (ESP) and
+// deliverTickForTest() (host) can call it. Caller holds _mutex.
+bool HoldMusic::tickLocked(uint8_t out[BYTES_PER_TICK])
+{
+	const size_t clipLen = _clipBytes.load(std::memory_order_acquire);
+	if (_clip == nullptr || clipLen == 0) return false;
+
+	// The clip wraps mid-frame, so a tick can straddle the loop point. Copy in
+	// two pieces rather than clamping, or every loop would emit a short frame.
+	const size_t first = (_cursor + BYTES_PER_TICK <= clipLen)
+		? BYTES_PER_TICK : (clipLen - _cursor);
+	std::memcpy(out, _clip + _cursor, first);
+	if (first < BYTES_PER_TICK)
+	{
+		std::memcpy(out + first, _clip, BYTES_PER_TICK - first);
+	}
+
+	if (!_gainIsUnity)
+	{
+		for (size_t i = 0; i < BYTES_PER_TICK; ++i) out[i] = _gainTable[out[i]];
+	}
+
+	// Issue #218: the same gain-adjusted tick bytes, handed to anything
+	// tapped in (a held MediaBridge) instead of sent over a socket. Same
+	// instant as every RTP listener the caller may fan this out to next --
+	// one cursor, one hand-out.
+	for (auto& t : _taps)
+	{
+		if (!t.used) continue;
+		t.fn(t.ctx, out, BYTES_PER_TICK);
+	}
+
+	_cursor = advanceCursor(_cursor, clipLen);
+	return true;
+}
+
+void HoldMusic::deliverTickForTest()
+{
+	std::lock_guard<std::mutex> lk(_mutex);
+	uint8_t scratch[BYTES_PER_TICK];
+	tickLocked(scratch);   // return value not needed -- taps already fired
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ESP-only: UDP socket + 20 ms pacing task
 // ─────────────────────────────────────────────────────────────────────────────
@@ -399,25 +468,11 @@ void HoldMusic::runLoop()
 		vTaskDelayUntil(&next, pdMS_TO_TICKS(PTIME_MS));
 
 		std::lock_guard<std::mutex> lk(_mutex);
-		const size_t clipLen = _clipBytes.load(std::memory_order_acquire);
-		if (_clip == nullptr || clipLen == 0) continue;
-
 		// ── the radio station: ONE read, fanned to everyone ──────────────────
-		// The clip wraps mid-frame, so a tick can straddle the loop point. Copy in
-		// two pieces rather than clamping, or every loop would emit a short frame.
+		// tickLocked() reads the cursor, applies gain, invokes any taps
+		// (issue #218) and advances the cursor; false means no clip loaded.
 		uint8_t* payload = packet + RTP_HEADER_BYTES;
-		const size_t first = (_cursor + BYTES_PER_TICK <= clipLen)
-			? BYTES_PER_TICK : (clipLen - _cursor);
-		std::memcpy(payload, _clip + _cursor, first);
-		if (first < BYTES_PER_TICK)
-		{
-			std::memcpy(payload + first, _clip, BYTES_PER_TICK - first);
-		}
-
-		if (!_gainIsUnity)
-		{
-			for (size_t i = 0; i < BYTES_PER_TICK; ++i) payload[i] = _gainTable[payload[i]];
-		}
+		if (!tickLocked(payload)) continue;
 
 		for (auto& l : _listeners)
 		{
@@ -446,7 +501,7 @@ void HoldMusic::runLoop()
 			l.timestamp += static_cast<uint32_t>(BYTES_PER_TICK);
 		}
 
-		_cursor = advanceCursor(_cursor, clipLen);
+		// Cursor already advanced inside tickLocked() above.
 
 		// Stack headroom, measured rather than assumed. The task was created with a
 		// guessed size; this reports what it actually uses so the number can be set

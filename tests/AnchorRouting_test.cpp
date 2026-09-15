@@ -100,6 +100,46 @@ namespace
 			"Content-Length: 0\r\n\r\n";
 		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
 	}
+
+	// A phone's in-dialog re-INVITE — issue #218. `toHeaderLine` is the exact
+	// FULL "To: ...;tag=..." line the ORIGINAL 200 OK carried, straight from
+	// toHeaderOf() below — not a fresh one, since this is a request on an
+	// already-established dialog. `direction` is the SDP attribute line to
+	// offer ("a=sendonly\r\n" for hold, "a=sendrecv\r\n" for resume).
+	std::shared_ptr<SipMessage> makeHoldReinvite(const std::string& fromExt,
+		const std::string& toHeaderLine, const std::string& srcIp, const std::string& callId,
+		int cseq, const std::string& direction, int rtpPort = 10000)
+	{
+		std::string body =
+			"v=0\r\n"
+			"o=- 0 0 IN IP4 " + srcIp + "\r\n"
+			"s=-\r\n"
+			"c=IN IP4 " + srcIp + "\r\n"
+			"t=0 0\r\n"
+			"m=audio " + std::to_string(rtpPort) + " RTP/AVP 0\r\n"
+			"a=rtpmap:0 PCMU/8000\r\n" + direction;
+		std::string raw =
+			"INVITE sip:555@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKih" + callId + std::to_string(cseq) + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			+ toHeaderLine + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(cseq) + " INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + fromExt + "@" + srcIp + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
+	}
+
+	// Pulls the FULL "To: ...;tag=..." line out of a sent SipMessage
+	// (SipMessage::getTo() already returns the complete raw header line, not
+	// just its value — see setTo()'s symmetric contract), for building the
+	// next in-dialog request in a test.
+	std::string toHeaderOf(const std::shared_ptr<SipMessage>& msg)
+	{
+		return std::string(msg->getTo());
+	}
 }
 
 // ── RequestsHandler's 555 intercept: dial -> anchor -> bridge ────────────────────
@@ -269,4 +309,123 @@ TEST(AnchorRouting, AnchorExtensionIsReservedFromForwardsRingGroupsAndDialPlan)
 		<< "config for 555, got:\n" << raw;
 	EXPECT_NE(raw.find("Contact: <sip:555"), std::string::npos)
 		<< "must still be answered as the anchor extension, not redirected to 502";
+}
+
+// ── Hold/resume on an anchored leg (issue #218) ──────────────────────────────
+//
+// Before this fix, onReinvite()/onUpdate() refused a re-INVITE on the anchor
+// extension with the same 488 the two genuinely peer-less virtual legs
+// (777/888) get — confirmed on hardware: a phone could never hold an
+// anchored/trunk call at all, so the far end heard silence (from the phone's
+// own local mute), never hold music. These tests drive the fix end to end
+// through RequestsHandler::handle() -- the same style the rest of this file
+// already uses for the anchor intercept itself.
+
+TEST(AnchorRouting, HoldOnTheAnchorLegIsAnsweredNotRefused)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-hold"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+	ASSERT_NE(toLine.find(";tag="), std::string::npos)
+		<< "the original 200 OK must have minted a to-tag, got: " << toLine;
+
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-hold");
+	ASSERT_NE(bridge, nullptr);
+	ASSERT_FALSE(bridge->isHeld());
+
+	sent.clear();
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-hold",
+		/*cseq=*/2, "a=sendonly\r\n"));
+
+	ASSERT_FALSE(sent.empty()) << "the hold re-INVITE got no answer at all";
+	const std::string holdRaw = sent.front().second ? sent.front().second->toString() : std::string{};
+	EXPECT_NE(holdRaw.find("SIP/2.0 200 OK"), std::string::npos)
+		<< "a hold on the anchor leg must be ANSWERED, not refused with 488 -- "
+		<< "this is the exact bug (#218): the caller never actually put the "
+		<< "call on hold, so the far end heard silence instead of hold music. Got:\n"
+		<< holdRaw;
+	EXPECT_EQ(holdRaw.find("SIP/2.0 488"), std::string::npos) << holdRaw;
+
+	EXPECT_TRUE(bridge->isHeld())
+		<< "the bridge must switch to held mode so the anchor hears hold music "
+		<< "instead of the handset";
+
+	auto session = handler.getSession("Call-ID: anchor-hold");
+	ASSERT_TRUE(session.has_value());
+	EXPECT_EQ(session.value()->getState(), Session::State::Held);
+}
+
+TEST(AnchorRouting, ResumingTheAnchorLegClearsHeldStateAndRestoresTheHandsetPath)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-resume"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-resume",
+		/*cseq=*/2, "a=sendonly\r\n"));
+
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-resume");
+	ASSERT_NE(bridge, nullptr);
+	ASSERT_TRUE(bridge->isHeld()) << "setup: the hold must have taken for this test to mean anything";
+
+	sent.clear();
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-resume",
+		/*cseq=*/3, "a=sendrecv\r\n"));
+
+	ASSERT_FALSE(sent.empty());
+	const std::string resumeRaw = sent.front().second ? sent.front().second->toString() : std::string{};
+	EXPECT_NE(resumeRaw.find("SIP/2.0 200 OK"), std::string::npos) << resumeRaw;
+	EXPECT_FALSE(bridge->isHeld())
+		<< "resuming must switch the bridge back to forwarding the handset's own audio";
+
+	auto session = handler.getSession("Call-ID: anchor-resume");
+	ASSERT_TRUE(session.has_value());
+	EXPECT_EQ(session.value()->getState(), Session::State::Connected);
+}
+
+TEST(AnchorRouting, HoldOnAVirtualLegIsStillRefused)
+{
+	// Issue #218's fix is scoped to 555 specifically -- 777 (echo) and 888
+	// (conference) genuinely have no second party's media to hand back on
+	// resume, so they must keep the pre-existing 488 refusal. This is the
+	// regression guard for that boundary.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+
+	sent.clear();
+	handler.handle(makeInvite("501", "777", "192.168.9.51", "echo-hold"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+
+	sent.clear();
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "echo-hold",
+		/*cseq=*/2, "a=sendonly\r\n"));
+
+	ASSERT_FALSE(sent.empty());
+	const std::string raw = sent.front().second ? sent.front().second->toString() : std::string{};
+	EXPECT_NE(raw.find("SIP/2.0 488"), std::string::npos)
+		<< "777 has no real peer and must still be refused, got:\n" << raw;
 }

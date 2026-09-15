@@ -6,6 +6,7 @@
 #include "AnchorClient.hpp"
 #include "PlayoutBuffer.hpp"
 #include "MixBus.hpp"
+#include "HoldMusic.hpp"
 #include <string>
 #include <atomic>
 #include <cstddef>
@@ -43,6 +44,22 @@ public:
 	// selects BUS mode (see the class comment); the default null keeps the historical
 	// anchor-only wiring for every existing call site.
 	void init(RtpReceiver* receiver, RtpSender* sender, AnchorClient* anchor, MixBus* bus = nullptr);
+
+	// Issue #218: the shared hold-music source, for ANCHOR-mode calls only.
+	// Wired once at boot alongside init(), same as ParkOrbit::setHoldMusic() —
+	// not owned, may be null (in which case setHeld(true) just plays nothing,
+	// same fail-safe-to-silence philosophy as every other HoldMusic consumer).
+	void setHoldMusic(HoldMusic* moh) { _moh = moh; }
+
+	// Issue #218: put the handset leg on/off hold. While held, onHandsetRtp()
+	// discards the handset's real audio instead of forwarding it to the
+	// anchor, and this bridge taps into `_moh` so the anchor hears hold music
+	// in its place; leaving hold releases the tap and resumes the normal
+	// handset -> anchor path. No-op in BUS mode (conference hold is a
+	// separate, still-refused case — see onReinvite()'s 777/888 branch) and
+	// idempotent (calling with the current state is a no-op).
+	void setHeld(bool held);
+	bool isHeld() const { return _held.load(std::memory_order_acquire); }
 
 	// Where an RFC 4733 key press decoded off this bridge's handset stream goes.
 	//
@@ -93,7 +110,16 @@ public:
 	// stubs on host, and never invoke the callbacks they were given).
 
 	// Handset -> (bus | anchor): decode one µ-law RTP payload and route the PCM16.
+	// While held (issue #218), discards the payload instead of forwarding it —
+	// see setHeld()'s doc comment.
 	void onHandsetRtp(const uint8_t* mulaw, size_t n);
+
+	// Issue #218: HoldMusic's tap target while held (ANCHOR mode only) —
+	// decodes one tick's worth of the shared clip and hands it to the anchor
+	// in place of the handset's own audio. Public so it matches HoldMusic::
+	// TapFn's raw-function-pointer shape via the static trampoline below;
+	// callers should go through setHeld(), not call this directly.
+	void feedMohTick(const uint8_t* ulawTick, size_t n);
 
 	// (bus | playout) -> handset: fill one 20 ms µ-law frame for the sender. Returns
 	// false only when the bridge is inactive; on underrun it still returns true so
@@ -130,6 +156,11 @@ private:
 	// MUST hold _mutex. Idempotent: a no-op when no port is held or in ANCHOR mode.
 	void releaseBusPortLocked();
 
+	// Issue #218: the free-function shape HoldMusic::TapFn needs. Casts `ctx`
+	// back to `this` and calls feedMohTick() — kept as a one-line static
+	// rather than a capturing lambda so nothing here allocates.
+	static void mohTapTrampoline(void* ctx, const uint8_t* ulawTick, size_t n);
+
 	// Pointers to the shared dependencies
 	RtpReceiver* _receiver = nullptr;
 	RtpSender*   _sender = nullptr;
@@ -151,6 +182,21 @@ private:
 	// so the RTP task reads it without synchronisation, the same way it reads the
 	// other init()-time dependencies.
 	DigitSink _digitSink;
+
+	// Issue #218. Not owned; may be null (see setHoldMusic()). Set once at
+	// wiring time like _anchor/_bus above, so read without _mutex.
+	HoldMusic* _moh = nullptr;
+	// Touched from the SIP thread (setHeld()), the handset RTP task
+	// (onHandsetRtp()'s discard check) and HoldMusic's own pacing task
+	// (feedMohTick()'s active check) -- three different threads, one flag,
+	// atomic is sufficient since nothing here depends on it changing
+	// atomically WITH anything else.
+	std::atomic<bool> _held{false};
+	// The tap id addTap() returned, or -1 when not tapped in. Only ever
+	// touched from setHeld(), which the SIP thread calls under _mutex
+	// (RequestsHandler's engine lock, not this class's own _mutex) — same
+	// single-writer assumption _callID/_participantId already make.
+	int _mohTapId = -1;
 
 	mutable std::mutex _mutex;
 };
