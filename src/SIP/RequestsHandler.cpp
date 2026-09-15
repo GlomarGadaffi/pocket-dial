@@ -1121,7 +1121,9 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	// period, before it ever places a call — which makes it the discovery point
 	// that matters most in practice. OPTIONS only tells a phone that bothers to
 	// ask; plenty never do, and a phone that has not learned `Supported:
-	// replaces` here will not offer BLF-key pickup at all.
+	// replaces` here will not offer a Replaces-based attended transfer via
+	// REFER (issue #131) -- NOT BLF-key pickup, which needs an INVITE that
+	// itself carries Replaces and has no handler here (issue #229).
 	//
 	// The PBX is unambiguously the UAS of a REGISTER, so there is no relay
 	// question on this path.
@@ -1136,9 +1138,26 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 //   * RFC 3311 §5.1 — a UA MUST NOT send an UPDATE unless the peer advertised
 //     UPDATE in an Allow header. onUpdate() has handled hold/resume and bodiless
 //     session-timer keep-alives all along; no phone would ever reach it.
-//   * RFC 3891 §4 — a UA only offers a Replaces-based attended transfer when the
-//     peer advertised "replaces" in Supported. onRefer()'s ?Replaces= splice
-//     (issue #131) was likewise unreachable from a spec-abiding phone.
+//   * RFC 3891 §4 — a UA only offers a Replaces-based ATTENDED TRANSFER (REFER
+//     with a ?Replaces= Refer-To, issue #131) when the peer advertised
+//     "replaces" in Supported. onRefer()'s splice was likewise unreachable
+//     from a spec-abiding phone.
+//
+// "replaces" does NOT cover RFC 3891's other use of the same tag: a UA sending
+// an INVITE that itself carries a Replaces header (§3), the mechanism behind
+// BLF-key "grab this ringing call" pickup and phone-native call steal. No code
+// in src/ handles that -- onInvite() has no Replaces branch, so such an INVITE
+// just rings its own target as an ordinary new call (ReplacesInvite_test.cpp
+// pins this).
+//
+// This is a KNOWN, DELIBERATE SPEC DEVIATION, not merely an unimplemented
+// corner: RFC 3891 §3 says a UA that advertises "replaces" MUST accept an
+// INVITE carrying that header, and this one advertises it while only actually
+// honouring §4's REFER-based use of the same tag. Withdrawing the tag would
+// break the working, exercised attended transfer (REFER ?Replaces=, issue
+// #131) for no gain, so issue #229 chose to keep advertising and document the
+// gap rather than under-claim a real feature to fix an unrelated one. See
+// kSupportedOptionTags below.
 //
 // EVERY entry below is something this PBX genuinely dispatches. Over-claiming is
 // the exact failure #199 is about, so the lists are derived from initHandlers()
@@ -1160,6 +1179,13 @@ namespace
 		"SUBSCRIBE, UPDATE";
 
 	// Option tags, RFC 3261 §20.37. "replaces" only.
+	//
+	// "replaces" is PARTIAL -- see the capability-advertisement block above
+	// this namespace for the full reasoning. Short form: it backs onRefer()'s
+	// REFER ?Replaces= attended-transfer splice (#131); it does NOT mean an
+	// INVITE carrying a Replaces header itself (§3, BLF-key pickup) is
+	// handled, because nothing in src/ reads that header. Kept per #229's
+	// scope call rather than withdrawn, since the REFER usage is real.
 	//
 	// NOT "timer": docs/FEATURE_ROADMAP.md calls the RFC 4028 support "passive —
 	// honours a timer a phone requests, but never requests one itself and never
