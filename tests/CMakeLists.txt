@@ -170,6 +170,10 @@ add_executable(sip_parser_tests
     # pbx::isReservedExtension()/looksLikePstnAor()/isReservedOrPstnAor() logic
     # (PbxConfig.hpp) is covered in Pbx_test.cpp instead.
     RegisterIdentityGuard_test.cpp
+    # Emergency dialing (#166): 911/933 intercepted ahead of every
+    # operator-configurable lookup, the bare number handed to the trunk, and a
+    # 503 (never a 404) when no trunk is connected.
+    EmergencyDialing_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is

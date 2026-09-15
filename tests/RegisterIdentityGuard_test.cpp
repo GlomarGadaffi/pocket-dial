@@ -329,13 +329,15 @@ TEST(RegisterIdentityGuard, LongAllDigitPstnShapedAorRefused)
 // 4. A refused REGISTER leaves no binding: the security property, observed
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST(RegisterIdentityGuard, RefusedRegistrationAs911BindsNothingSoDialing911StillMisses)
+TEST(RegisterIdentityGuard, RefusedRegistrationAs911BindsNothingSoDialing911NeverReachesTheSquatter)
 {
 	// The exact scenario the issue is about: before this guard, a squatter
 	// REGISTERing as "911" would have received every call dialed to it. Prove
 	// the refusal is not merely cosmetic (a 403 on the wire) by dialing "911"
-	// from a real registered client afterwards and requiring the SAME 404 an
-	// unclaimed number gets -- not a call forwarded to the squatter's address.
+	// from a real registered client afterwards and requiring that the call is
+	// NOT forwarded to the squatter's address. (It originally required a 404
+	// here; since #166 a 911 dial is intercepted and routed to the trunk
+	// instead, which does not weaken what this test is actually about.)
 	RidWire wire;
 	RequestsHandler handler("192.168.50.9", 5060,
 		[&wire](const sockaddr_in& a, std::shared_ptr<SipMessage> m) {
@@ -373,8 +375,14 @@ TEST(RegisterIdentityGuard, RefusedRegistrationAs911BindsNothingSoDialing911Stil
 
 	EXPECT_FALSE(wire.sawContaining("INVITE sip:911@192.168.50.66"))
 		<< "the refused REGISTER must not have bound 911 to the squatter's address";
-	EXPECT_TRUE(wire.sawContaining("SIP/2.0 404 Not Found"))
-		<< "911 must miss exactly like any other unclaimed number today "
-		   "(this codebase has no emergency-routing rule yet -- that is the "
-		   "companion issue's scope, not #163's)";
+	// Issue #166 landed the emergency-routing path this test used to note was
+	// absent, so 911 no longer "misses" -- it is intercepted ahead of every
+	// destination lookup and handed to the trunk. The 404 this once asserted
+	// would now be a regression in the opposite direction: a 911 dial that
+	// reached the ordinary unclaimed-number tail would mean the intercept did
+	// not run. What #163 actually guarantees, and all it ever guaranteed, is
+	// the assertion above: the squatter got nothing.
+	EXPECT_FALSE(wire.sawContaining("SIP/2.0 404 Not Found"))
+		<< "911 is now routed by the emergency intercept (#166), so reaching the "
+		   "unclaimed-number 404 tail means the intercept was bypassed";
 }

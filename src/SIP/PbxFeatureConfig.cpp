@@ -97,7 +97,10 @@ void PbxFeatureConfig::setForwardLocked(const std::string& extension, const std:
 	// "888" is ConferenceRoom::EXT (the meet-me conference), "555" is the anchor
 	// media bridge (RequestsHandler.cpp's kAnchorCallExt) — neither referenced
 	// by name here so this file stays decoupled from ConferenceRoom.hpp/RequestsHandler.hpp.
-	if (extension == "777" || extension == "999" || extension == "888" || extension == "555")
+	// Issue #166: pbx::isReservedExtension() is the single list, so 440 and
+	// the emergency numbers 911/933 are covered here too rather than only in
+	// the REGISTER identity guard, which was the only caller it had.
+	if (pbx::isReservedExtension(extension))
 	{
 		_env.log("Forward set ignored for virtual extension " + extension, true);
 	}
@@ -181,10 +184,13 @@ const pbx::RingGroup* PbxFeatureConfig::findRingGroup(const std::string& extensi
 
 void PbxFeatureConfig::setRingGroup(const std::string& groupExt, const std::string& members, const std::string& mode)
 {
-	// "888" is ConferenceRoom::EXT, "555" is the anchor media bridge — see
-	// setForwardLocked above for why this file spells them out instead of
-	// including ConferenceRoom.hpp/RequestsHandler.hpp.
-	if (groupExt == "777" || groupExt == "999" || groupExt == "888" || groupExt == "555")
+	// One shared list (pbx::isReservedExtension) rather than a hand-copied one:
+	// the three validators in this file had drifted into three DIFFERENT
+	// lists, and none of them covered 911/933. A ring group named "911"
+	// was accepted and persisted, and findRingGroup() runs before the dial
+	// plan in onInvite() -- so it would have shadowed emergency dialing
+	// outright had #166 not moved that check ahead of every lookup.
+	if (pbx::isReservedExtension(groupExt))
 	{
 		_env.log("Ring group ignored for reserved extension " + groupExt, true);
 	}
@@ -315,7 +321,7 @@ void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string
 	{
 		_env.log("Dial rule ignored: invalid pattern \"" + pattern + "\"", true);
 	}
-	else if (pattern == "777" || pattern == "999" || pattern == "440" || pattern == "555")
+	else if (pbx::isReservedExtension(pattern))
 	{
 		// These are handled above the dial plan in onInvite(), so a rule here
 		// would never fire. Refuse it instead of accepting a dead rule.

@@ -15,6 +15,7 @@
 #include "CallDetailRecord.hpp"
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive (endCall() hook)
 #include "PbxConfig.hpp"
+#include "EmergencyCall.hpp"  // Issue #166: 911/933 classification, ahead of the dial plan
 #include "PbxPersist.hpp"
 #include "SipHeaderUtil.hpp"
 #include "SipWireUtil.hpp"
@@ -1503,6 +1504,28 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	std::string destNumber(data->getToNumber());
+
+	// ── Emergency dialing, before anything an operator can configure (#166) ──
+	//
+	// This is the FIRST destination check in onInvite, ahead of the reserved
+	// virtual extensions, ring groups and the dial plan. That ordering is the
+	// whole feature, not a style choice — see EmergencyCall.hpp for why a
+	// dial-plan rule cannot be trusted to carry 911 (an operator's "9*" +
+	// stripDigits=1 outside-line rule silently rewrites a dialed 911 into 11).
+	//
+	// It also sits deliberately ABOVE the secure-mode challenge below, so
+	// call-setup policy cannot block 911 — while staying BELOW the registration
+	// and codec gates above, which are not policy: a caller this PBX cannot
+	// identify or cannot relay audio for has no working call to place. See
+	// EmergencyCall.hpp's "capability gates stay, policy gates do not".
+	if (const pbx::EmergencyDial emergency = pbx::classifyEmergencyDial(destNumber);
+		emergency.isEmergency)
+	{
+		routeEmergencyCall(data, caller.value(), emergency, destNumber);
+		return;
+	}
+
 	// Secure mode: registration auth alone leaves call setup open to anyone who
 	// can reach UDP/5060 (drawbridge #125). Challenge the INVITE with the same
 	// digest machinery -- admitSecure() takes the method from the request line,
@@ -1522,7 +1545,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		}
 	}
 
-	std::string destNumber(data->getToNumber());
 	if (destNumber == "777")
 	{
 		// The echo leg is SERVER-terminated and speaks G.711 only, so it is
@@ -2596,6 +2618,86 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 	// the whole request, so "no anchor connected" must answer 404 itself.
 	originateAnchorCall(std::move(data), caller, std::string(caller->getNumber()),
 		/*respondIfDisconnected=*/true);
+}
+
+// ── Emergency call routing (Issue #166) ──────────────────────────────────────
+//
+// Reached only from onInvite's emergency intercept, which runs before every
+// operator-configurable destination lookup. See EmergencyCall.hpp for why the
+// dial plan cannot be trusted to carry this and why the intercept sits where it
+// does. Caller holds _mutex.
+void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
+	const std::shared_ptr<SipClient>& caller,
+	const pbx::EmergencyDial& emergency, const std::string& dialed)
+{
+	const std::string kind(emergency.isTest ? "TEST 933" : "911");
+	const std::string from(data->getFromNumber());
+	// Always the bare number. If the user dialed 9911 out of habit, the trunk
+	// still gets "911" -- never the prefixed form, and never a stripped "11".
+	const std::string bare(emergency.number);
+	const std::string asDialed = emergency.hadTrunkPrefix ? " (dialed " + dialed + ")" : "";
+
+	// Log BEFORE routing, so the attempt is on the record even if everything
+	// after this line fails. This is the honest floor of Kari's Law's
+	// notification requirement; the on-site notification hook itself is the
+	// companion half of #166 and lands separately.
+	queueLog("EMERGENCY: " + kind + " dialed by " + from + asDialed, true);
+
+	// respondIfDisconnected=false: when no trunk is connected, originateAnchorCall
+	// returns false having sent NOTHING, so this function owns the failure
+	// response and the handset never receives two final responses to one INVITE.
+	// NOT std::move: originateAnchorCall takes its shared_ptr by value, and this
+	// function still needs `data` afterwards to build the failure response from.
+	if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false))
+	{
+		return;
+	}
+
+	// ── No route. 503, and specifically not 404 ──────────────────────────────
+	//
+	// RFC 4497 §8.3.1 (BCP 117) covers exactly this condition -- a SIP INVITE
+	// inbound with no outbound channel available: "If no suitable channel is
+	// available, the gateway should use response code 503 (Service
+	// Unavailable)." RFC 3398 §7.2.4.1's Q.850 mapping agrees, sending every
+	// trunk-outage cause (34 no circuit, 38 network out of order, 41 temporary
+	// failure, 42 congestion, 47 resource unavailable) to 503 while reserving
+	// 404 for numbering-plan causes (1/2/3).
+	//
+	// 404 is not merely a worse choice here, it is a false statement. RFC 3261
+	// §21.4.5 defines it as "the server has definitive information that the user
+	// does not exist" -- but this PBX just recognised 911. It knows exactly what
+	// the number is; only the trunk is missing. Telling someone dialing for help
+	// that the number does not exist is the wrong answer to the wrong question.
+	//
+	// RFC 6881 itself specifies no code for this, because §8 SP-28 makes a
+	// default mapping a MUST and so never contemplates a compliant proxy having
+	// no route at all. 503 is the least-wrong answer to a state the BCP forbids.
+	//
+	// NO Retry-After. RFC 3261 §21.5.4: a client "SHOULD NOT forward any other
+	// requests to that server for the duration specified in the Retry-After
+	// header field, if present" -- making a handset back off the PBX after a
+	// failed 911 attempt is the last thing anyone wants. Without it the UA
+	// treats this as a plain failure and may immediately try again.
+	auto response = getMessageFromPool(*data);
+	if (!response)
+	{
+		// Pool exhausted: drop and let the peer retransmit (#101A). The log line
+		// above already recorded the attempt, which is the part that matters.
+		queueLog("EMERGENCY: " + kind + " from " + from +
+			" NOT ROUTED and no message available to answer with", true);
+		return;
+	}
+	// A free-text reason phrase (RFC 3261 §7.2) that many handsets display.
+	// "Service Unavailable" is true but says nothing; this says what happened.
+	response->setHeader("SIP/2.0 503 Emergency Call Not Routable");
+	response->clearBody();
+	response->addHeader("Warning", "399 " + _localIp +
+		" \"Emergency call could not be routed: no outbound trunk connected\"");
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	_outbox.emplace_back(data->getSource(), std::move(response));
+
+	queueLog("EMERGENCY: " + kind + " from " + from +
+		" COULD NOT BE ROUTED (no trunk connected) - answered 503", true);
 }
 
 bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
