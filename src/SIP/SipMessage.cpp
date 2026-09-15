@@ -1,4 +1,5 @@
 #include "SipMessage.hpp"
+#include "Sdp.hpp"
 #include <vector>
 #include <cctype>
 #include "SipMessageTypes.h"
@@ -643,16 +644,36 @@ void SipMessage::clearBody()
 
 SipMessage::SdpDirection SipMessage::getSdpDirection() const
 {
-	const std::string_view whole(_body);
-	size_t pos = 0;
-	while (pos < whole.size())
-	{
-		const std::string_view line = nextSdpLine(whole, pos);
-		if (line == "a=sendrecv") return SdpDirection::SendRecv;
-		if (line == "a=sendonly") return SdpDirection::SendOnly;
-		if (line == "a=recvonly") return SdpDirection::RecvOnly;
-		if (line == "a=inactive") return SdpDirection::Inactive;
-	}
+	// Issue #196: judged on the FIRST AUDIO stream through the sdp:: model, with
+	// RFC 8866 scoping (a media-level direction overrides a session-level one)
+	// and the RFC 2543 legacy hold form (c=0.0.0.0, no direction attribute at
+	// all) reported as Inactive. `None` still means "no direction attribute
+	// anywhere and no zero address", which is what the callers' Held/Connected
+	// decision has always keyed on. Flat and bounded like every decoder here;
+	// zero heap (SdpAdmission.DecodePathsAllocateNothing pins that).
+	const std::string_view body(_body);
+	sdp::Session& s = sdp::scratch(0);
+	sdp::parse(body, s);
+
+	auto map = [](sdp::Direction d) {
+		switch (d)
+		{
+			case sdp::Direction::SendRecv: return SdpDirection::SendRecv;
+			case sdp::Direction::SendOnly: return SdpDirection::SendOnly;
+			case sdp::Direction::RecvOnly: return SdpDirection::RecvOnly;
+			case sdp::Direction::Inactive: return SdpDirection::Inactive;
+			default:                       return SdpDirection::None;
+		}
+	};
+
+	int idx = s.firstAudio();
+	if (idx < 0 && s.mediaCount > 0) idx = 0;
+	if (idx < 0) return map(s.dir);   // no m= at all: session-level attribute or None
+
+	const unsigned i = static_cast<unsigned>(idx);
+	if (s.media[i].dir != sdp::Direction::None) return map(s.media[i].dir);
+	if (s.dir != sdp::Direction::None) return map(s.dir);
+	if (sdp::connectionAddress(body, sdp::effectiveConnection(s, i)).isZero) return SdpDirection::Inactive;
 	return SdpDirection::None;
 }
 

@@ -34,6 +34,12 @@ add_executable(sip_parser_tests
     # must invalidate it — including reset() and `*msg = source`, the two ways
     # the message pool recycles a slot into a different call.
     SipSdpMessage_cache_test.cpp
+    # Issue #196: the RFC 8866 model and RFC 3264 offer/answer engine that
+    # replace the six-field line scanner. Multi-m=, media-level c= override,
+    # attribute scoping, c=0.0.0.0 hold, counted overflow, answer construction
+    # and relayed-answer validation.
+    Sdp_test.cpp
+    SdpOfferAnswer_test.cpp
     # CWE-674 hardening: the SDP parser must stay flat, non-recursive and bounded
     # against the UNISOC T612 a=acap-flood RCE class (SSD advisory, 2026), even as
     # SDP negotiation adds a= attribute handling on this branch.
@@ -442,6 +448,8 @@ add_executable(sip_parser_tests
     ../src/SIP/HoldMusic.cpp
     ../src/SIP/BlfSubscriptions.cpp
     ../src/SIP/SipSdpMessage.cpp
+    ../src/SIP/Sdp.cpp
+    ../src/SIP/SdpOfferAnswer.cpp
     ../src/SIP/SipClient.cpp
     ../src/SIP/Session.cpp
     # HttpServer + its OTA dependency, both already host-compilable (platform

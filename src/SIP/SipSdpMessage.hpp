@@ -60,23 +60,33 @@ private:
 	// was uncontrolled recursion in an SDP a=acap decoder: a body of repeated
 	// `acap:1 acap:1 ...` drove the parser to recurse per token until the modem
 	// stack overflowed into a neighbouring task and became code execution. This
-	// parser is structurally immune — it is a flat, non-recursive line scan that
-	// ignores a= attributes entirely — and on the wire path SipMessage::checkSdp()
-	// has already refused any body over SdpLimits before an accessor here can
-	// run. The line cap is still applied locally so the "SDP parse work is
-	// bounded, never a function of attacker-chosen structure" invariant holds
-	// for a body that reached this class by any other route (a locally built or
-	// test-constructed message). See SipSdpMessage_hardening_test.cpp.
-	static constexpr unsigned kMaxSdpLines = SdpLimits::kMaxLines;
+	// parser is structurally immune. Since issue #196 it is sdp::parse() (Sdp.hpp):
+	// still a flat, non-recursive line scan, now reading a= lines into fixed-
+	// capacity tables with counted overflow and no re-dispatch on tokens -- and
+	// on the wire path SipMessage::checkSdp() has already refused any body over
+	// SdpLimits before an accessor here can run. The same SdpLimits::kMaxLines
+	// cap is applied by sdp::parse() itself, so the "SDP parse work is bounded,
+	// never a function of attacker-chosen structure" invariant holds for a body
+	// that reached this class by any other route (a locally built or
+	// test-constructed message). See SipSdpMessage_hardening_test.cpp and
+	// Sdp_test.cpp.
 
 	struct FieldSpan
 	{
 		uint32_t pos = 0;
 		uint32_t len = 0;
 	};
+	// Issue #196: the spans are now DERIVED from the sdp:: model (Sdp.hpp) rather
+	// than from a private six-field scan, so the accessors inherit its RFC 8866
+	// semantics: `media` is the FIRST AUDIO m= section (not the first m= of any
+	// type, and not the last one -- a second audio m= is a second stream, not a
+	// replacement), `connectionInformation` is the c= that EFFECTIVELY applies to
+	// that section (its own media-level c= when present, else the session's), and
+	// `rtpPort` is that section's port. The offsets-not-views rule is unchanged.
 	struct SdpSpans
 	{
 		FieldSpan version, originator, sessionName, connectionInformation, time, media;
+		int rtpPort = 0;
 	};
 
 	// mutable: the accessors are const and observably still pure — a re-parse is
@@ -97,7 +107,6 @@ private:
 	const SdpSpans& ensureParsed() const;
 	std::string_view viewOf(const FieldSpan& span) const;
 
-	int extractRtpPort(std::string_view data) const;
 };
 
 #endif

@@ -53,6 +53,8 @@ SRC = os.path.join(REPO, "src")
 SIP_TUS = [
     "SIP/SipMessage.cpp",
     "SIP/SipSdpMessage.cpp",
+    "SIP/Sdp.cpp",
+    "SIP/SdpOfferAnswer.cpp",
     "SIP/SipStatus.cpp",
     "SIP/RequestsHandler.cpp",
     "SIP/Session.cpp",
@@ -219,7 +221,8 @@ def main():
         for t, (b, kind) in sorted(proj, key=lambda x: -x[1][0])[:12]:
             print(f"  {b:6d} {kind:8s} {pretty(nodes[t])[:100]}")
         roots = ["RequestsHandler::handle(", "SipMessage::checkSdp", "SipMessage::filterAudioCodecs",
-                 "SipSdpMessage::ensureParsed", "SipMessage::getSdpDirection"]
+                 "SipSdpMessage::ensureParsed", "SipMessage::getSdpDirection",
+                 "sdp::parse(", "sdp::buildAnswer(", "sdp::validateAnswer("]
         print("\ndeepest static call chains from the parser entry points:")
         for want, (total, path) in deepest_chains(nodes, edges, frames, roots):
             print(f"  {want}: {total} bytes over {len(path)} frames")

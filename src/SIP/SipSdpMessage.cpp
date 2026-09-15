@@ -1,4 +1,5 @@
 #include "SipSdpMessage.hpp"
+#include "Sdp.hpp"
 #include <string>
 #include <cstring>
 #include <stdexcept>
@@ -51,9 +52,13 @@ void SipSdpMessage::setMedia(std::string value)
 }
 
 // Issue #101(B): one single-pass parse of the body, cached until the body
-// changes. Line splitting mirrors the old per-accessor parseSdpFields() exactly
-// (primary "\r\n" delimiter, bare "\n" fallback) so behavior on mixed/malformed
-// line endings is unchanged, as is last-one-wins when a body repeats a field.
+// changes. Line splitting tolerates CRLF and bare LF alike, as every decoder
+// here does.
+// Issue #196: the cache is derived from the sdp:: model. One flat, bounded pass
+// (sdp::parse honours SdpLimits::kMaxLines and its own fixed capacities -- the
+// CWE-674 discipline this class has always carried, see the header), into the
+// engine-owned scratch Session, then the six spans are copied out as offsets.
+// The model is NOT kept: at ~1.7 KB it would multiply by the pool size.
 const SipSdpMessage::SdpSpans& SipSdpMessage::ensureParsed() const
 {
 	const uint64_t gen = bodyGeneration();
@@ -68,50 +73,35 @@ const SipSdpMessage::SdpSpans& SipSdpMessage::ensureParsed() const
 	// PREVIOUS body and absent from this one must not survive in the cache. This
 	// is the recycled-pool-slot case (reset() hands the same object back out with
 	// a different call's SDP), which is precisely what makes a stale cache here
-	// dangerous rather than merely wrong.
+	// dangerous rather than merely wrong. sdp::parse() resets its output for the
+	// same reason.
+	sdp::Session& s = sdp::scratch(0);
+	sdp::parse(body, s);
+
+	auto toField = [](sdp::Span sp) { return FieldSpan{sp.pos, sp.len}; };
+
 	SdpSpans spans;
+	spans.version     = toField(s.version);
+	spans.originator  = toField(s.origin);
+	spans.sessionName = toField(s.name);
+	spans.time        = toField(s.time);
 
-	size_t pos_start = 0;
-	unsigned lineCount = 0;
-	while (pos_start < body.size())
+	// The stream this PBX cares about is the first AUDIO one (RFC 8866 lets an
+	// offer lead with video, which the six-field scanner misread as "the" media
+	// line). With no audio section fall back to the first section of any type so
+	// a non-audio-only body still reports something; with no m= at all, absent.
+	int idx = s.firstAudio();
+	if (idx < 0 && s.mediaCount > 0) idx = 0;
+	if (idx >= 0)
 	{
-		// CWE-674 defense-in-depth (see SipSdpMessage.hpp): bound the scan so the
-		// work is a function of a fixed cap, never of attacker-chosen structure.
-		// A well-formed offer carries its session lines (v/o/s/c/t) and the m=
-		// line up front, so a legitimate body is never truncated; a hostile body
-		// padded past the cap simply stops being parsed. (On the wire path such a
-		// body was already refused by SipMessage::checkSdp() before reaching here.)
-		if (lineCount++ >= kMaxSdpLines) break;
-		const size_t lineStart = pos_start;
-		size_t pos_end = body.find("\r\n", pos_start);
-		size_t next_start = pos_end + 2;
-		if (pos_end == std::string_view::npos)
-		{
-			pos_end = body.find('\n', pos_start);
-			next_start = pos_end + 1;
-		}
-
-		std::string_view line;
-		if (pos_end == std::string_view::npos)
-		{
-			line = body.substr(pos_start);
-			pos_start = body.size();
-		}
-		else
-		{
-			line = body.substr(pos_start, pos_end - pos_start);
-			pos_start = next_start;
-		}
-
-		if (line.empty()) continue;
-
-		const FieldSpan span{static_cast<uint32_t>(lineStart), static_cast<uint32_t>(line.size())};
-		if (line.compare(0, 2, "v=") == 0)      spans.version = span;
-		else if (line.compare(0, 2, "o=") == 0) spans.originator = span;
-		else if (line.compare(0, 2, "s=") == 0) spans.sessionName = span;
-		else if (line.compare(0, 2, "c=") == 0) spans.connectionInformation = span;
-		else if (line.compare(0, 2, "t=") == 0) spans.time = span;
-		else if (line.compare(0, 2, "m=") == 0) spans.media = span;
+		const unsigned i = static_cast<unsigned>(idx);
+		spans.media                 = toField(s.media[i].line);
+		spans.rtpPort               = static_cast<int>(s.media[i].port);
+		spans.connectionInformation = toField(sdp::effectiveConnection(s, i));   // media-level c= wins
+	}
+	else
+	{
+		spans.connectionInformation = toField(s.connection);
 	}
 
 	_spans    = spans;
@@ -167,25 +157,7 @@ std::string_view SipSdpMessage::getMedia() const
 
 int SipSdpMessage::getRtpPort() const
 {
-	return extractRtpPort(getMedia());
-}
-
-int SipSdpMessage::extractRtpPort(std::string_view data) const
-{
-	auto spacePos = data.find(' ');
-	if (spacePos == std::string_view::npos)
-		return 0;
-	size_t portStart = spacePos + 1;
-	while (portStart < data.size() && std::isspace(static_cast<unsigned char>(data[portStart]))) ++portStart;
-	size_t portEnd = portStart;
-	while (portEnd < data.size() && std::isdigit(static_cast<unsigned char>(data[portEnd]))) ++portEnd;
-	if (portEnd == portStart)
-		return 0;
-	int val = 0;
-	for (size_t i = portStart; i < portEnd; ++i)
-	{
-		if (val > 200000000) return 200000000;
-		val = val * 10 + (data[i] - '0');
-	}
-	return val;
+	// Already decoded by the model (bounded to 65535 there); the old
+	// extractRtpPort() re-scan of the m= line is gone with the scanner.
+	return ensureParsed().rtpPort;
 }

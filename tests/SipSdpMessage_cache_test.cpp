@@ -337,10 +337,25 @@ TEST(SipSdpMessageCache, LineEndingAndDuplicateFieldBehaviorUnchanged) {
 	EXPECT_EQ(std::string(lf.getConnectionInformation()), "c=IN IP4 10.0.0.7");
 	EXPECT_EQ(lf.getRtpPort(), 1234);
 
+	// Issue #196: two m=audio lines are two STREAMS (RFC 8866 §5.14), not a
+	// field repeated with last-one-wins. The accessors report the first audio
+	// section, which is the one this PBX terminates or relays.
 	SipSdpMessage dup(inviteWith(
 		"v=0\r\n"
 		"m=audio 1111 RTP/AVP 0\r\n"
 		"m=audio 2222 RTP/AVP 0\r\n"), localAddr());
-	EXPECT_EQ(std::string(dup.getMedia()), "m=audio 2222 RTP/AVP 0");
-	EXPECT_EQ(dup.getRtpPort(), 2222);
+	EXPECT_EQ(std::string(dup.getMedia()), "m=audio 1111 RTP/AVP 0");
+	EXPECT_EQ(dup.getRtpPort(), 1111);
+
+	// And a video-first offer no longer reads the video line as "the" media:
+	SipSdpMessage vfirst(inviteWith(
+		"v=0\r\n"
+		"c=IN IP4 10.0.0.7\r\n"
+		"m=video 5000 RTP/AVP 96\r\n"
+		"m=audio 3333 RTP/AVP 0\r\n"
+		"c=IN IP4 10.0.0.8\r\n"), localAddr());
+	EXPECT_EQ(std::string(vfirst.getMedia()), "m=audio 3333 RTP/AVP 0");
+	EXPECT_EQ(vfirst.getRtpPort(), 3333);
+	EXPECT_EQ(std::string(vfirst.getConnectionInformation()), "c=IN IP4 10.0.0.8")
+		<< "the media-level c= applies to the audio stream (RFC 8866 §5.7)";
 }

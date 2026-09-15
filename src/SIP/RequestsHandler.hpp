@@ -107,6 +107,21 @@ public:
 	static std::string buildMediaSdp(const std::string& serverIp, int rtpPort,
 		bool sendrecv = false, int dtmfPt = -1);
 
+	// Issue #196: the server's answer to a phone's OFFER, built by the RFC 3264
+	// engine (sdp::buildAnswer) when `offer` carries SDP: one m= per offered m=
+	// in the offer's order, non-audio streams rejected with port 0 instead of
+	// silently ignored, formats = the offer's list intersected with what the
+	// board terminates (PCMU today) in the offer's order, the offered
+	// telephone-event PT echoed with its own fmtp, and the direction the RFC
+	// complement of the offer's. Falls back to buildMediaSdp() when the offer has
+	// no SDP, or when no offered codec is one the board can terminate -- the
+	// latter keeps the pre-#196 behaviour (a PCMU answer the phone may not be
+	// able to play) rather than newly 488ing PCMA-only handsets on 440/888/555;
+	// RtpSender/RtpReceiver are PCMU-only, so that is a media-object change, not
+	// an SDP one (see the PR for the follow-up).
+	static std::string answerSdpFor(const std::shared_ptr<SipMessage>& offer,
+		const std::string& serverIp, int rtpPort, bool sendrecv, int dtmfPt = -1);
+
 	// Parse the caller's RTP destination from an INVITE: the SDP c= line IP (falling
 	// back to the INVITE source IP) + the m=audio port via getRtpPort(). Returns false
 	// if no usable port is found. Pure/host-testable.

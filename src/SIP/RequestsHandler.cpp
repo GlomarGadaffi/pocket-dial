@@ -9,6 +9,8 @@
 #include <algorithm>
 #include "SipMessageTypes.h"
 #include "SipSdpMessage.hpp"
+#include "Sdp.hpp"
+#include "SdpOfferAnswer.hpp"
 #include "IDGen.hpp"
 #include "IPHelper.hpp"
 #include "PoolConfig.hpp"
@@ -1906,6 +1908,34 @@ std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpP
 	return s;
 }
 
+std::string RequestsHandler::answerSdpFor(const std::shared_ptr<SipMessage>& offer,
+	const std::string& serverIp, int rtpPort, bool sendrecv, int dtmfPt)
+{
+	if (!offer || !offer->hasSdp())
+	{
+		return buildMediaSdp(serverIp, rtpPort, sendrecv, dtmfPt);   // server-originated: our own offer
+	}
+	const std::string_view body = offer->getBody();
+	sdp::Session& s = sdp::scratch(0);
+	sdp::parse(body, s);
+
+	sdp::AnswerParams p;
+	p.localIp   = serverIp.c_str();
+	p.audioPort = static_cast<uint32_t>(rtpPort);
+	p.want      = sendrecv ? sdp::Direction::SendRecv : sdp::Direction::SendOnly;
+
+	std::string out;
+	const sdp::AnswerResult r = sdp::buildAnswer(body, s, sdp::LocalCaps::pcmuOnly(), p, out);
+	if (!r.acceptedAudio)
+	{
+		// See the declaration: status quo for a no-PCMU offer until the media
+		// objects speak more than PCMU. The answer still names only what the
+		// caller offered for DTMF, exactly as before.
+		return buildMediaSdp(serverIp, rtpPort, sendrecv, dtmfPt);
+	}
+	return out;
+}
+
 bool RequestsHandler::parseCallerRtp(const std::shared_ptr<SipMessage>& invite,
 	std::string& outIp, uint16_t& outPort)
 {
@@ -2083,7 +2113,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	// via enforceG711()/syncContentLength() so the answer isn't dropped on UDP (the
 	// 777-bug class — see tests/SipMessage_test.cpp).
 	std::string toTag = IDGen::GenerateID(9);
-	std::string sdpBody = buildMediaSdp(activeIp, _rtpSender.serverRtpPort());
+	std::string sdpBody = answerSdpFor(data, activeIp, _rtpSender.serverRtpPort(), /*sendrecv=*/false);
 
 	// Assemble the OK from the INVITE's headers + our body. clearBody() leaves the
 	// header/blank-line boundary intact; we then append Content-Type + the SDP and
@@ -2212,7 +2242,7 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	// leg. A conference is exactly the place this matters -- PIN entry and in-call
 	// controls are keypresses on a leg the server terminates, and before this the
 	// answer advertised PCMU alone so a phone had no negotiated way to send them.
-	const std::string sdpBody = buildMediaSdp(activeIp, _conference->rtpPortFor(callID),
+	const std::string sdpBody = answerSdpFor(data, activeIp, _conference->rtpPortFor(callID),
 		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
 	auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
 	if (!ok)
@@ -2726,7 +2756,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		const std::string toTag = IDGen::GenerateID(9);
 		// Echo the caller's telephone-event PT so DTMF reaches the anchored leg --
 		// this is the path a voicemail or IVR menu will be driven over.
-		const std::string sdpBody = buildMediaSdp(activeIp, bridge->receiverPort(),
+		const std::string sdpBody = answerSdpFor(data, activeIp, bridge->receiverPort(),
 			/*sendrecv=*/true, data->getTelephoneEventPayloadType());
 		auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
 		if (!ok)
@@ -4178,6 +4208,30 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 						return;
 					}
 
+					// Issue #196 (item 5): the caller's INVITE was gated with a 488
+					// but the callee's 200 OK was relayed unread. RFC 3264 §6 says
+					// an answer has one m= per offered m=, same order and types,
+					// and may only list payload types the offer contained. An
+					// answer that breaks that is dropped here -- BEFORE the session
+					// is advanced, so the callee's retransmit can be judged again --
+					// matching the poison-answer precedent (SdpAdmissionGate tests).
+					if (auto offerMsg = session.value()->getInviteMessage();
+						offerMsg && offerMsg->hasSdp())
+					{
+						sdp::Session& offerS  = sdp::scratch(0);
+						sdp::Session& answerS = sdp::scratch(1);
+						sdp::parse(offerMsg->getBody(), offerS);
+						sdp::parse(data->getBody(), answerS);
+						const auto verdict = sdp::validateAnswer(offerS, answerS);
+						if (verdict != sdp::AnswerVerdict::Ok && verdict != sdp::AnswerVerdict::NoMedia)
+						{
+							queueLog("200 OK from " + answeringClient->getNumber() +
+								" is not a valid answer to the offer (" +
+								sdp::answerVerdictText(verdict) + ") -- dropped, not relayed", true);
+							return;
+						}
+					}
+
 					// Drawn BEFORE the session is advanced: the branch above only
 					// re-enters while the state is still Invited, so refusing after
 					// setState(Connected) would strand the call permanently — the
@@ -4274,6 +4328,26 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 				endHandle(data->getToNumber(), responseObj);
 				endCall(data->getCallID(), data->getFromNumber(), data->getToNumber(), "SDP parse error.");
 				return;
+			}
+
+			// Issue #196 (item 5), ordinary call path: same RFC 3264 §6/§6.1 check
+			// as the ring-group branch above. Judged BEFORE any state moves, so the
+			// callee's retransmit (or a corrected answer) is evaluated afresh.
+			if (auto offerMsg = session.value()->getInviteMessage();
+				offerMsg && offerMsg->hasSdp())
+			{
+				sdp::Session& offerS  = sdp::scratch(0);
+				sdp::Session& answerS = sdp::scratch(1);
+				sdp::parse(offerMsg->getBody(), offerS);
+				sdp::parse(data->getBody(), answerS);
+				const auto verdict = sdp::validateAnswer(offerS, answerS);
+				if (verdict != sdp::AnswerVerdict::Ok && verdict != sdp::AnswerVerdict::NoMedia)
+				{
+					queueLog("200 OK from " + client.value()->getNumber() +
+						" is not a valid answer to the offer (" +
+						sdp::answerVerdictText(verdict) + ") -- dropped, not relayed", true);
+					return;
+				}
 			}
 			session->get()->setDest(client.value());
 			session->get()->setState(Session::State::Connected);

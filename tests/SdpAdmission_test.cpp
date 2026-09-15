@@ -530,3 +530,107 @@ TEST(SdpAdmissionGate, UpperCaseContentTypeCannotSidestepTheGate)
 	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@"));
 	EXPECT_EQ(h.handler.getSdpRejected(), 1u);
 }
+
+// ── Issue #196: RFC 3264 offer/answer through the real handler path ─────────
+
+namespace
+{
+	// An INVITE from 500 to a service extension the board answers itself.
+	std::string serviceInviteRaw(const std::string& dest, const std::string& body, const std::string& callId)
+	{
+		return
+			"INVITE sip:" + dest + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + kCallerIp + ":5060;branch=z9hG4bK" + callId + "\r\n"
+			"From: <sip:500@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + dest + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:500@" + kCallerIp + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	}
+}
+
+TEST(SdpOfferAnswerGate, BoardAnswersEveryOfferedStreamInOrderRejectingVideoWithPortZero)
+{
+	// The old builder answered a PCMU-only single m= to whatever was offered, so
+	// a phone offering audio+video had its VIDEO port matched against our audio
+	// line (issue #196, RFC audit row 8866). RFC 3264 §6: one m= per offered m=,
+	// same order; the stream we cannot take is answered with port 0.
+	Harness h;
+	h.handler.handle(RequestsHandler::getMessageFromPool(
+		serviceInviteRaw("440", mmtelVideoOffer(""), "oa-440"), h.caller));
+
+	const std::string ok = findSentTo(h.sent, h.caller, "SIP/2.0 200 OK");
+	ASSERT_FALSE(ok.empty()) << "440 must answer";
+	const std::string body = ok.substr(ok.find("\r\n\r\n") + 4);
+
+	const size_t audio = body.find("m=audio ");
+	const size_t video = body.find("m=video 0 RTP/AVP 96\r\n");
+	ASSERT_NE(audio, std::string::npos) << body;
+	ASSERT_NE(video, std::string::npos) << "video must be present and rejected, not omitted: " << body;
+	EXPECT_LT(audio, video) << "offer order: audio first, video second";
+	EXPECT_EQ(body.find("m=audio ", audio + 1), std::string::npos) << "exactly one audio m=";
+
+	// Formats: the offer's list (0 8 101) intersected with what the board
+	// terminates (PCMU), in the offer's order, plus the offered DTMF PT with
+	// the OFFERED fmtp range, not our own.
+	EXPECT_NE(body.find(" RTP/AVP 0 101\r\n"), std::string::npos) << body;
+	EXPECT_NE(body.find("a=rtpmap:101 telephone-event/8000\r\n"), std::string::npos) << body;
+	EXPECT_NE(body.find("a=fmtp:101 0-16\r\n"), std::string::npos) << body;
+	EXPECT_EQ(body.find("PCMA"), std::string::npos) << "PCMA is not something the board terminates: " << body;
+	EXPECT_NE(body.find("a=sendonly\r\n"), std::string::npos) << "440 is a one-way tone: " << body;
+
+	// Content-Length still equals the body bytes (the 777-bug class).
+	const std::string cl = extractHeaderLine(ok, "Content-Length:");
+	EXPECT_EQ(std::stoul(cl.substr(cl.find(':') + 1)), body.size());
+}
+
+TEST(SdpOfferAnswerGate, RelayedAnswerListingAnUnofferedCodecIsDroppedNotRelayed)
+{
+	// Issue #196 item 5: the caller's INVITE was gated, the callee's 200 OK was
+	// not. A 200 OK whose m= names a payload type the offer never contained is
+	// not an answer to that offer (RFC 3264 §6.1) and must not reach the caller.
+	Harness h;
+	const std::string callId = "oa-bad-answer";
+	h.handler.handle(RequestsHandler::getMessageFromPool(
+		inviteRaw(kSessionLines + kPcmuAudio, callId), h.caller));
+	const std::string fork = findSentTo(h.sent, h.callee, "INVITE sip:600@");
+	ASSERT_FALSE(fork.empty());
+	auto session = h.handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(session.has_value());
+	const auto before = session.value()->getState();
+	h.sent.clear();
+
+	// G.729 was never offered.
+	h.answer(callId, fork, kSessionLines + "m=audio 20000 RTP/AVP 18\r\na=rtpmap:18 G729/8000\r\n");
+
+	EXPECT_TRUE(findSentTo(h.sent, h.caller, "SIP/2.0 200 OK").empty()) << "invalid answer must not be relayed";
+	EXPECT_EQ(session.value()->getState(), before) << "a dropped answer must not connect the call";
+
+	// The callee's corrected retransmit is judged afresh and goes through.
+	h.answer(callId, fork, kSessionLines + "m=audio 20000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n");
+	EXPECT_FALSE(findSentTo(h.sent, h.caller, "SIP/2.0 200 OK").empty()) << "a valid answer still relays";
+	EXPECT_EQ(session.value()->getState(), Session::State::Connected);
+}
+
+TEST(SdpOfferAnswerGate, RelayedAnswerThatDropsAnOfferedStreamIsDropped)
+{
+	// RFC 3264 §6: the answer MUST contain exactly one m= per offered m=. An
+	// answer to an audio+video offer that omits the video line (instead of
+	// rejecting it with port 0) is malformed and is not relayed.
+	Harness h;
+	const std::string callId = "oa-fewer-m";
+	h.handler.handle(RequestsHandler::getMessageFromPool(
+		inviteRaw(mmtelVideoOffer(""), callId), h.caller));
+	const std::string fork = findSentTo(h.sent, h.callee, "INVITE sip:600@");
+	ASSERT_FALSE(fork.empty());
+	h.sent.clear();
+
+	h.answer(callId, fork, kSessionLines + kPcmuAudio);   // audio only: one m= short
+	EXPECT_TRUE(findSentTo(h.sent, h.caller, "SIP/2.0 200 OK").empty()) << "one m= short of the offer";
+
+	h.answer(callId, fork, kSessionLines + kPcmuAudio + "m=video 0 RTP/AVP 96\r\n");   // rejected properly
+	EXPECT_FALSE(findSentTo(h.sent, h.caller, "SIP/2.0 200 OK").empty()) << "port-0 rejection is a valid answer";
+}
