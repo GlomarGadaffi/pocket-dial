@@ -304,6 +304,10 @@ add_executable(sip_parser_tests
     # -- setVoicemail()/getVoicemailExtensions() must obey the same
     # immediate-snapshot-refresh contract as setDnd()/getDndExtensions().
     VoicemailConfig_test.cpp
+    # Issue #246: the SIP divert-hook slice -- CFNA/CFB falling back to a
+    # locally-terminated voicemail leg, the mandatory CANCEL of the
+    # still-ringing callee, and the #232-class BYE-teardown regression.
+    VoicemailDivert_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header

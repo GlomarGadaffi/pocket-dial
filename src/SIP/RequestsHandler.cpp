@@ -1923,6 +1923,15 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		newSession->setNoAnswerTarget(cfna);
 		newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
 	}
+	// Issue #246: no explicit CFNA target, but this extension has voicemail
+	// enabled -- arm the timer anyway with the voicemail sentinel, decided
+	// once here rather than re-checked at sweep time (see the sentinel's
+	// own doc comment for why that would be a TOCTOU).
+	else if (cfna.empty() && _cfg.isVoicemailEnabled(destNumber))
+	{
+		newSession->setNoAnswerTarget(pbx::kVoicemailForwardSentinel);
+		newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
+	}
 
 	auto response = getMessageFromPool(*data);
 	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -2311,6 +2320,134 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		+ std::to_string(leg) + " (" + std::to_string(_conference->legCount()) + "/"
 		+ std::to_string(ConferenceRoom::MAX_LEGS) + "), media to "
 		+ destIp + ":" + std::to_string(destPort));
+}
+
+void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& invite,
+	const std::shared_ptr<SipClient>& src, const std::string& extension)
+{
+	const std::string activeIp = _localIp;
+	const std::string callID(invite->getCallID());
+
+	auto refuse = [&](const char* statusLine, const char* why) {
+		auto msg = getMessageFromPool(*invite);
+		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
+		msg->setHeader(statusLine);
+		msg->clearBody();
+		msg->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
+		msg->setContact(buildContact(extension));
+		_outbox.emplace_back(invite->getSource(), std::move(msg));
+		queueLog("Voicemail: " + std::string(why) + " for " + std::string(src->getNumber())
+			+ " -> " + extension, true);
+	};
+
+	// Where does the caller want its audio sent? Same c=/m= parse 440/888 use
+	// against their own inbound INVITE -- here it's the RETAINED invite,
+	// since this fires well after the original INVITE was received.
+	std::string destIp;
+	uint16_t destPort = 0;
+	if (!parseCallerRtp(invite, destIp, destPort))
+	{
+		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in retained invite");
+		return;
+	}
+
+	// Find a free leg. This slice (b1) wires the real RtpReceiver/RtpSender
+	// pair and answers correctly, but does not yet call
+	// _vmLegs[i].startRecording() with a real PSRAM buffer -- that lands in
+	// a follow-up commit alongside the boot-time buffer pool allocation.
+	// Until then the leg stays Idle after being claimed here, so
+	// onCallerRtp()/fillTx() are harmless no-ops: the call answers and holds
+	// open, but nothing is recorded or played yet.
+	int slot = -1;
+	for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
+	{
+		if (_vmLegs[i].isIdle()) { slot = static_cast<int>(i); break; }
+	}
+	if (slot < 0)
+	{
+		refuse("SIP/2.0 486 Busy Here", "every voicemail leg busy, rejected deposit");
+		return;
+	}
+
+	// Pass localPort 0 so the OS picks an ephemeral port on real hardware
+	// (read back via localPort() below), exactly like MediaBridge::startBridge()
+	// does for the anchor pool -- 0 stays 0 on host, same as every other
+	// caller of this pattern.
+	const bool rxStarted = _vmRtpReceivers[slot].start(0,
+		[this, slot](const uint8_t* mulaw, size_t n, uint32_t /*timestamp*/, uint16_t /*seq*/) {
+			_vmLegs[slot].onCallerRtp(mulaw, n);
+		});
+	if (!rxStarted)
+	{
+		refuse("SIP/2.0 500 Server Internal Error", "voicemail RTP receiver failed to start");
+		return;
+	}
+	if (!_vmRtpSenders[slot].start(destIp, destPort, callID,
+		[this, slot](uint8_t* outUlaw, size_t count) {
+			return _vmLegs[slot].fillTx(outUlaw, count);
+		}))
+	{
+		_vmRtpReceivers[slot].stop();
+		refuse("SIP/2.0 500 Server Internal Error", "voicemail RTP sender failed to start");
+		return;
+	}
+
+	auto newSession = allocateSession(callID, src);
+	if (!newSession)
+	{
+		_vmRtpReceivers[slot].stop();
+		_vmRtpSenders[slot].stop(callID);
+		refuse("SIP/2.0 503 Service Unavailable", "session pool full, rejected deposit");
+		return;
+	}
+
+	const std::string toTag = IDGen::GenerateID(9);
+	// buildMediaSdp() still answers sendrecv unconditionally (not offer-aware)
+	// -- matches every OTHER locally-terminated leg today (777/888/anchor)
+	// until #196 Phase 2's SDP model replacement lands; tracked as a
+	// follow-up for this leg too, not a regression introduced here.
+	const std::string sdpBody = buildMediaSdp(activeIp, _vmRtpReceivers[slot].localPort(),
+		/*sendrecv=*/true, invite->getTelephoneEventPayloadType());
+	auto ok = buildOkWithSdp(invite, activeIp, toTag, sdpBody);
+	if (!ok)
+	{
+		_vmRtpReceivers[slot].stop();
+		_vmRtpSenders[slot].stop(callID);
+		queueLog("Voicemail: message pool exhausted answering " + extension, true);
+		return;
+	}
+
+	// Per-session dummy dest, drawn from the virtual peer pool like every
+	// other locally-terminated leg (777/888/anchor) -- never a shared
+	// client, so a concurrent voicemail call can't overwrite this one's
+	// destination identity.
+	auto dummyVm = allocateVirtualPeer("700", invite->getSource());
+	newSession->setDest(dummyVm);
+	newSession->setVoicemail(true);
+	newSession->setVoicemailLegSlot(slot);
+	_sessions.emplace(callID, newSession);
+	newSession->setState(Session::State::Connected);
+
+	// Issue #232 (777/888 legs never get a BYE matched correctly): capture
+	// BOTH sides' dialog identity HERE, directly, the way ParkOrbit/CallPickup
+	// do -- not via armSessionTimer(), which only sets this when
+	// Session-Expires was negotiated (and whose early-return guard runs
+	// BEFORE its own setDialogHeaders() call despite a comment claiming
+	// otherwise -- a separate, pre-existing bug, not fixed here).
+	newSession->setDialogHeaders(std::string(ok->getFrom()), std::string(ok->getTo()));
+
+	_outbox.emplace_back(invite->getSource(), std::move(ok));
+
+	queueLog("Voicemail: " + std::string(src->getNumber()) + " -> " + extension
+		+ " deposit answered locally (leg " + std::to_string(slot) + ")");
+}
+
+void RequestsHandler::releaseVoicemailLeg(int slot, const std::string& callId)
+{
+	if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return;
+	_vmRtpReceivers[slot].stop();
+	_vmRtpSenders[slot].stop(callId);
+	_vmLegs[slot].reset();
 }
 
 void RequestsHandler::releaseMohPreviewLocked()
@@ -3891,6 +4028,39 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 				}
 			}
 		}
+		// Issue #246: no explicit CFB target, but this extension has
+		// voicemail enabled -- answer locally instead of just failing with
+		// the 486 below. Unlike CFNA there is no "still ringing" leg to
+		// CANCEL here (the callee already answered with 486 Busy, a final
+		// response the caller's UA has already processed), so no
+		// forked-dialog hazard applies -- straight to answerVoicemailDeposit().
+		//
+		// Deliberately NOT reusing `busyExt`/`cfb` above: for an ordinary
+		// proxied call, this 486 mirrors the ORIGINAL INVITE's From/To
+		// (RFC 3261), so data->getFromNumber() names the CALLER, not the
+		// busy callee -- data->getToNumber() is the actual busy party. This
+		// looks like a real pre-existing bug in the CFB lookup above (busyExt
+		// appears to key off the wrong identity for a normal call; the
+		// blind-transfer comment a few hundred lines up independently
+		// documents the same getFromNumber() trap for a different leg
+		// shape) -- flagged to the team, not fixed here, since it's outside
+		// this issue's scope and touches shared, untested logic.
+		else
+		{
+			std::string actualBusyExt(data->getToNumber());
+			if (cfb.empty() && _cfg.isVoicemailEnabled(actualBusyExt))
+			{
+				auto inviteMsg = session.value()->getInviteMessage();
+				auto src = session.value()->getSrc();
+				if (inviteMsg && src)
+				{
+					std::string callID(data->getCallID());
+					endCall(callID, src->getNumber(), actualBusyExt, "busy (voicemail)");
+					answerVoicemailDeposit(inviteMsg, src, actualBusyExt);
+					return;
+				}
+			}
+		}
 	}
 
 	setCallState(data->getCallID(), Session::State::Busy);
@@ -4065,6 +4235,28 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
+		return;
+	}
+
+	// Issue #246: a voicemail leg is locally terminated, same as 777/440/888/
+	// anchor above -- but keyed on the session flag, not destNumber, since
+	// destNumber here is the mailbox owner's REAL extension (whatever the
+	// caller originally dialed), not a fixed virtual code (Session.hpp's own
+	// isAnchor() comment warns against matching on "dest is a non-pool
+	// client" or the dest's name for exactly this reason). Without this
+	// branch the BYE falls through to the generic two-real-phone path at the
+	// bottom of this function, which RELAYS it toward the mailbox owner's own
+	// extension instead of the server answering it -- the depositor never
+	// gets their 200 OK (the #232 class of bug).
+	if (session.has_value() && session.value()->isVoicemail())
+	{
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader(SipMessageTypes::OK);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		releaseVoicemailLeg(session.value()->getVoicemailLegSlot(), std::string(data->getCallID()));
+		endCall(data->getCallID(), data->getFromNumber(), destNumber, "voicemail depositor hung up");
 		return;
 	}
 
@@ -6911,21 +7103,48 @@ void RequestsHandler::tick()
 			}
 			else
 			{
-				// CFNA: CANCEL the original callee leg and INVITE the no-answer target.
+				// CFNA: CANCEL the original callee leg and INVITE the no-answer target,
+				// or (Issue #246) answer locally as voicemail.
 				auto invite = session->getInviteMessage();
 				auto dest = session->getDest();
 				auto src = session->getSrc();
 				std::string cfna = session->getNoAnswerTarget();
 				if (invite && src && !cfna.empty())
 				{
-					if (dest)
+					if (cfna == pbx::kVoicemailForwardSentinel)
 					{
-						auto cancel = _forker.buildCancel(invite, dest);
-						if (cancel) _outbox.emplace_back(dest->getAddress(), std::move(cancel));
+						// Issue #246: this is a forked-dialog hazard, not a UX nicety
+						// (RFC 3261 S13.2.2.4) -- the callee's phone is still
+						// ringing on this exact Call-ID; if it answers after we've
+						// already sent our own 200 OK, the caller's UA gets two
+						// 2xx responses with different To-tags for one INVITE.
+						// CANCEL it BEFORE answering, using a freshly looked-up
+						// client rather than `dest` (which is null here by
+						// construction -- dest is only populated once someone
+						// answers, and CFNA only fires because nobody did; relying
+						// on `dest` is the pre-existing gap that leaves the
+						// original callee ringing on ordinary CFNA today).
+						auto callee = findClient(invite->getToNumber());
+						if (callee.has_value())
+						{
+							auto cancel = _forker.buildCancel(invite, callee.value());
+							if (cancel) _outbox.emplace_back(callee.value()->getAddress(), std::move(cancel));
+						}
+						std::string depositExt(invite->getToNumber());
+						endCall(callID, src->getNumber(), depositExt, "no answer (voicemail)");
+						answerVoicemailDeposit(invite, src, depositExt);
 					}
-					queueLog("CFNA: no answer, forwarding -> " + cfna);
-					endCall(callID, src->getNumber(), std::string(invite->getToNumber()), "no answer (CFNA)");
-					_forker.redirectInvite(invite, src, cfna);
+					else
+					{
+						if (dest)
+						{
+							auto cancel = _forker.buildCancel(invite, dest);
+							if (cancel) _outbox.emplace_back(dest->getAddress(), std::move(cancel));
+						}
+						queueLog("CFNA: no answer, forwarding -> " + cfna);
+						endCall(callID, src->getNumber(), std::string(invite->getToNumber()), "no answer (CFNA)");
+						_forker.redirectInvite(invite, src, cfna);
+					}
 				}
 			}
 		}

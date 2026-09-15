@@ -62,6 +62,26 @@ public:
 	bool isAnchor() const { return _isAnchor; }
 	void setAnchor(bool val) { _isAnchor = val; }
 
+	// True only for a session answered locally as voicemail (Issue #246,
+	// answerVoicemailDeposit()) -- same reasoning as isAnchor() above: onBye()/
+	// onCancel() must match on this, not on "dest is a non-pool client" or on
+	// the dest's name, which is exactly the trap this class comment already
+	// warns about for the OTHER locally-terminated legs (777/440/888/anchor).
+	// Without this flag a voicemail leg's BYE falls through onBye()'s generic
+	// two-real-phone path, which RELAYS the BYE toward the mailbox owner's own
+	// extension instead of the server answering it directly -- the caller who
+	// left the message never gets their 200 OK.
+	bool isVoicemail() const { return _isVoicemail; }
+	void setVoicemail(bool val) { _isVoicemail = val; }
+
+	// Which _vmLegs[]/_vmRtpReceivers[]/_vmRtpSenders[] slot this session
+	// claimed (-1 if none) -- onBye()/onCancel() need this to release the
+	// slot back to the pool; VoicemailLeg itself carries no callId until
+	// startRecording()/startPlaying() is called on it, so the session is the
+	// only place this identity lives in the meantime.
+	int getVoicemailLegSlot() const { return _voicemailLegSlot; }
+	void setVoicemailLegSlot(int slot) { _voicemailLegSlot = slot; }
+
 	// Inbound anchor calls invert the SIP roles of an outbound one: the server is the
 	// UAC that originated the INVITE *toward the handset* (dest), so teardown/ACK must
 	// address the handset and carry our From-tag. These fields hold the extra dialog
@@ -204,6 +224,8 @@ private:
 
 	bool _isBroadcast = false;
 	bool _isAnchor = false;
+	bool _isVoicemail = false;
+	int  _voicemailLegSlot = -1;
 	bool _anchorInbound = false;
 	std::string _remoteTag;            // handset To-tag (inbound anchor leg)
 	std::string _uacBranch;            // our INVITE Via branch (inbound anchor leg)

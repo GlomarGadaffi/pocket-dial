@@ -61,6 +61,7 @@
 #include "TelephonyApiConfig.hpp"
 #include "DidMapping.hpp"
 #include "MediaBridge.hpp"
+#include "VoicemailLeg.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
 #include "Registrar.hpp"
@@ -867,6 +868,24 @@ private:
 	// holds _mutex.
 	void onConferenceInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
 
+	// ── Voicemail deposit: answer locally as voicemail (Issue #246) ──────────────
+	// Called from the CFNA sweep (tick()) and onBusy()'s CFB path when the
+	// diverting extension has no explicit forward target but has voicemail
+	// enabled -- NOT from onInvite()'s virtual-extension dispatch, since this
+	// is a fallback for an ALREADY-RETAINED invite mid-call, not a fresh dial.
+	// `invite` is the retained original INVITE, `src` its caller, `extension`
+	// the mailbox owner (the extension that didn't answer / was busy). Finds
+	// a free slot in the voicemail leg pool and answers with a real sendrecv
+	// SDP (888-style: buildMediaSdp(), not the 777 echo pattern, which never
+	// actually terminates media on the board -- see #194); 503s if every leg
+	// is busy. Caller holds _mutex.
+	void answerVoicemailDeposit(const std::shared_ptr<SipMessage>& invite,
+		const std::shared_ptr<SipClient>& src, const std::string& extension);
+	// Stop the leg's RTP receiver/sender and return it to Idle. Called from
+	// onBye()'s voicemail branch (and will be called from BYE-equivalent
+	// teardown paths added alongside recording in a follow-up commit).
+	void releaseVoicemailLeg(int slot, const std::string& callId);
+
 	// The shared meet-me room, created lazily on the first 888 dial-in — a MixBus and
 	// its per-leg rings are ~50 KB, too much to pay at boot on a node that may never
 	// hold a conference. Null until then. Caller holds _mutex.
@@ -1170,6 +1189,17 @@ private:
 	TelephonyProviderRegistry _providerRegistry;
 	AnchorClient* _anchorClient = nullptr;
 	MediaBridge _mediaBridges[POCKETDIAL_MAX_ANCHOR_CALLS];
+
+	// ── Voicemail (Issue #246, Stage 3 of #194) ──────────────────────────────────
+	// POCKETDIAL_MAX_VOICEMAIL_LEGS concurrent deposit/retrieval legs, each
+	// owning its own RTP receiver/sender pair -- same parallel-array,
+	// index-matched shape as the anchor bridge pool above, but VoicemailLeg
+	// holds no pointer back to its pair (callbacks are index-capturing
+	// lambdas, wired at answer time in answerVoicemailDeposit()), so unlike
+	// _mediaBridges there is no cross-member destruction-order constraint.
+	RtpReceiver  _vmRtpReceivers[POCKETDIAL_MAX_VOICEMAIL_LEGS];
+	RtpSender    _vmRtpSenders[POCKETDIAL_MAX_VOICEMAIL_LEGS];
+	VoicemailLeg _vmLegs[POCKETDIAL_MAX_VOICEMAIL_LEGS];
 
 	// The boot-selected provider TYPE (cached alongside _anchorClient itself —
 	// see the constructor) and the monitored route DN an ACTIVE+ENABLED

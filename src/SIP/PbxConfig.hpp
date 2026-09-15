@@ -34,6 +34,19 @@ namespace pbx
 	// it lives here rather than file-local to either translation unit.
 	inline constexpr std::chrono::seconds kNoAnswerTimeout{20};
 
+	// Issue #246 (voicemail, Stage 3 of #194): the CFNA/CFB no-answer-target
+	// sentinel meaning "no explicit forward target is configured, but this
+	// extension has voicemail enabled -- answer locally instead of failing."
+	// Set once, at INVITE/486 time (alongside armRingTimer()/setNoAnswerTarget()),
+	// not re-derived from PbxFeatureConfig::isVoicemailEnabled() at sweep time --
+	// re-deriving would be a TOCTOU: an admin toggling voicemail off mid-ring
+	// would leave a session with an armed timer and neither an explicit target
+	// nor the voicemail fallback, so it would never fire at all.
+	//
+	// Contains ':', which isValidAor()'s charset (alnum plus `. - _ + * #`)
+	// excludes -- guaranteed to never collide with a real, dialable AOR.
+	inline constexpr const char* kVoicemailForwardSentinel = "vm:";
+
 	// How a ring group fans an inbound INVITE out to its members.
 	enum class GroupMode
 	{
