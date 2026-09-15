@@ -227,6 +227,9 @@ add_executable(sip_parser_tests
     # route DN can ever match, so this suite still exercises the class
     # directly rather than through call routing.
     DidMapping_test.cpp
+    # E.164 normalization/equivalence (#165), including the bounded
+    # country-code relaxation and the short-extension collision it refuses.
+    E164_test.cpp
     # The HTTP admin surface for the two tables above: GET/PUT/activate on
     # TelephonyApiConfig's credential slots and GET/PUT/DELETE on DidMapping's
     # DID->extension table, driven through a real HttpServer socket exactly
@@ -395,6 +398,10 @@ add_executable(sip_parser_tests
     # -- see DidMapping.hpp's BOUNDARY comment). Same host-file/NVS split as
     # TelephonyApiConfig.cpp. See DidMapping_test.cpp.
     ../src/SIP/DidMapping.cpp
+    # E.164 number normalization and equivalence (#165). Pure string work, no
+    # platform dependency at all -- DidMapping.cpp matches DIDs through it so a
+    # carrier-reported "+1..." and an operator-typed "(555) ..." name one line.
+    ../src/SIP/E164.cpp
     # Conference mix bus (see docs/CONFERENCE_MIXER.md). Pure C++17, no ESP
     # dependency. mix_kernels_scalar.cpp is the always-on scalar reference --
     # the ESP32-S3 PIE vector kernels (src/SIP/pie/) are opt-in and not built here.

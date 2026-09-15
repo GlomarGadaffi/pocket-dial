@@ -1,5 +1,7 @@
 #include "DidMapping.hpp"
 
+#include "E164.hpp"
+
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -52,11 +54,32 @@ bool DidMapping::fieldValid(const std::string& s)
 	return true;
 }
 
+bool DidMapping::sameDid(const std::string& a, const std::string& b)
+{
+	// Exact string identity first, and unconditionally. It is the only thing
+	// that can match a DID which is not a telephone number at all — a
+	// hand-edited store, or an entry written by some future build with a wider
+	// field charset, must stay findable by list()/removeMapping() rather than
+	// becoming an unremovable row. pbx::e164SameNumber() returns false for
+	// anything it cannot normalize, so without this line such an entry would
+	// be stranded in the table forever.
+	if (a == b)
+	{
+		return true;
+	}
+
+	// Then E.164 equivalence (Issue #165): the DID the carrier reports and the
+	// DID the operator typed name the same line even when they are written
+	// differently ("+15551234567" vs "(555) 123-4567"). See E164.hpp for the
+	// exact rule and its one accepted false positive.
+	return pbx::e164SameNumber(a, b);
+}
+
 size_t DidMapping::findIndex(const std::string& did) const
 {
 	for (size_t i = 0; i < _count; ++i)
 	{
-		if (_entries[i].did == did)
+		if (sameDid(_entries[i].did, did))
 		{
 			return i;
 		}

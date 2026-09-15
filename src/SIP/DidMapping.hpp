@@ -26,6 +26,27 @@
 // DIDs and extensions are not secrets, so there is no write-only/redaction
 // model here, only the same bounded-table and validated-field discipline.
 //
+// ── DID identity: E.164 equivalence, not string equality (Issue #165) ──────
+// Every lookup in this table (extensionForDid, and the update-in-place and
+// remove paths through findIndex) matches on pbx::e164SameNumber() as well as
+// on exact string equality. The same line is written many ways — a carrier
+// reports "+15551234567", an operator types "(555) 123-4567" — and before
+// #165 these did not match, so per-DID routing silently degraded to the
+// ring-all fallback described in the BOUNDARY note above. Nothing errors in
+// that case; a phone still rings; the operator's configuration is simply
+// ignored. See E164.hpp for the normalization rule and the one false positive
+// it knowingly accepts.
+//
+// Two consequences worth knowing at the call sites:
+//   * setMapping() with a DIFFERENT RENDERING of an existing DID updates that
+//     entry in place rather than adding a second one. That is deliberate: two
+//     rows that both match one inbound call would make routing depend on
+//     table order, which is not something an operator can see or control.
+//   * A DID that is not a telephone number at all (a hand-edited store) is
+//     still matched by exact string equality, so it can always be listed and
+//     removed. E.164 equivalence is added on top of the old behaviour, never
+//     in place of it.
+//
 // Thread-safety: this class is NOT internally locked, same caller-holds-lock
 // convention as TelephonyApiConfig — RequestsHandler owns the instance
 // (alongside TelephonyApiConfig) and serializes access under its own _mutex.
@@ -108,6 +129,12 @@ private:
 	// Index of the live entry for `did`, or kMaxMappings if none. Linear scan
 	// over _count entries — no heap, no I/O.
 	size_t findIndex(const std::string& did) const;
+
+	// DID identity for every lookup in this table: exact string match, OR
+	// E.164 equivalence (Issue #165). See the ── DID identity ── note at the
+	// top of this file.
+	static bool sameDid(const std::string& a, const std::string& b);
+
 	static bool fieldValid(const std::string& s);
 
 	Entry _entries[kMaxMappings];
