@@ -42,6 +42,9 @@
 //     entry in place rather than adding a second one. That is deliberate: two
 //     rows that both match one inbound call would make routing depend on
 //     table order, which is not something an operator can see or control.
+//     The update also adopts the caller's rendering as the stored `did`
+//     (not just the extension), so list()/the dashboard show the spelling
+//     most recently typed rather than whichever one landed first.
 //   * A DID that is not a telephone number at all (a hand-edited store) is
 //     still matched by exact string equality, so it can always be listed and
 //     removed. E.164 equivalence is added on top of the old behaviour, never
@@ -84,14 +87,17 @@ public:
 	// loading never reads past kMaxMappings.
 	void load();
 
-	// Add a new mapping, or update the extension of an existing one (matched
-	// by `did`) in place — an update never consumes an additional slot, so it
-	// can succeed even when the table is otherwise full. Returns "" on
-	// success, else a short operator-facing error: "DID required",
-	// "Extension required", "Field too long", "Field contains a control
-	// character", or "DID mapping table full" (only for a genuinely NEW did
-	// once all kMaxMappings slots are taken by other DIDs). Persists on
-	// success.
+	// Add a new mapping, or update an existing one (matched by `did`, which
+	// may be a different rendering of the same line — see the ── DID
+	// identity ── note above) in place — an update never consumes an
+	// additional slot, so it can succeed even when the table is otherwise
+	// full. An update replaces BOTH the stored `did` and the extension with
+	// the values just passed in, so a re-set never leaves a stale rendering
+	// behind. Returns "" on success, else a short operator-facing error:
+	// "DID required", "Extension required", "Field too long", "Field
+	// contains a control character", or "DID mapping table full" (only for a
+	// genuinely NEW did once all kMaxMappings slots are taken by other
+	// DIDs). Persists on success.
 	std::string setMapping(const std::string& did, const std::string& extension);
 
 	// Remove the mapping for `did`, compacting the table so list() never has

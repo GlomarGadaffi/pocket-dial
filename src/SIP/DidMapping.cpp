@@ -109,8 +109,15 @@ std::string DidMapping::setMapping(const std::string& did, const std::string& ex
 	const size_t idx = findIndex(did);
 	if (idx < _count)
 	{
-		// Existing DID: update its extension in place. Never consumes a slot,
-		// so this can succeed even when every OTHER slot is taken.
+		// Existing DID: update in place. Never consumes a slot, so this can
+		// succeed even when every OTHER slot is taken. Adopt the caller's
+		// rendering of `did` too, not just the extension -- findIndex()
+		// matched on E.164 equivalence (Issue #165), so a re-set can arrive
+		// as a different spelling of the same line ("+12025550123" over a
+		// stored "(202) 555-0123"), and list()/the dashboard should reflect
+		// what the operator most recently typed rather than whatever was
+		// stored first (Issue #243).
+		_entries[idx].did = did;
 		_entries[idx].extension = extension;
 		return persist();
 	}
