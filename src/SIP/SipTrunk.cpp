@@ -351,7 +351,30 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 		return true;
 	}
 
-	// 3xx-6xx final. ACK it in the INVITE's own transaction, then release.
+	// A non-2xx to our BYE takes NO ACK and must not fall into the INVITE
+	// failure path below. RFC 3261 s17.1.1.3's ACK belongs to an INVITE
+	// client transaction; a BYE is a NON-INVITE transaction, which absorbs
+	// its own final response (s17.1.2) and is never acknowledged at the
+	// application level whatever the status code.
+	//
+	// Without this the 481 a carrier sends for a dialog it has already torn
+	// down produced an ACK stamped with the INVITE's CSeq -- referencing a
+	// transaction that completed when the call was answered. Unmatched at
+	// the far end, and a message-pool slot spent to send it.
+	//
+	// The outcome is the same as the 2xx-to-BYE case above: the dialog is
+	// over either way. A carrier that refuses our BYE is not going to be
+	// talked round, and holding the slot open would leak it.
+	if (d->state == State::Terminating)
+	{
+		_env.log("Trunk: BYE answered " + std::to_string(status)
+			+ " (" + d->destE164 + ") -- dialog released regardless", true);
+		*d = Dialog{};
+		return true;
+	}
+
+	// 3xx-6xx final to the INVITE. ACK it in the INVITE's own transaction,
+	// then release.
 	auto ack = _env.messageFromPool(buildAckForFailure(*d), d->peer);
 	if (ack)
 	{

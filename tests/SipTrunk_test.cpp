@@ -329,3 +329,86 @@ TEST(SipTrunkDialog, HangupOnAnUnknownCallIdDoesNothing)
 	EXPECT_FALSE(trunk.hangup("no-such-call"));
 	EXPECT_TRUE(env.sent.empty());
 }
+
+// ── Responses to our BYE ─────────────────────────────────────────────────────
+//
+// These exist because a second reader found the gap by reading the diff, not
+// because a test failed: the 3xx-6xx branch had no Terminating check, so a
+// carrier refusing our BYE fell through to the INVITE failure path and got an
+// ACK it should never have been sent. Both BYE outcomes are pinned now.
+
+namespace
+{
+	// Build a response the way the engine would. Uses a plain SipMessage rather
+	// than RequestsHandler's pool so this file keeps its light include set --
+	// SipTrunk itself only ever sees messages through PbxEnv.
+	std::shared_ptr<SipMessage> responseFor(const std::string& raw)
+	{
+		return std::make_shared<SipMessage>(raw, sbcAddr());
+	}
+
+	std::string okFor(const SipTrunk::Dialog& d)
+	{
+		return
+			"SIP/2.0 200 OK\r\n"
+			"Via: SIP/2.0/UDP 192.168.1.10:5060;branch=" + d.branch + "\r\n"
+			"From: <sip:15551230000@" + d.sbcIpPort + ">;tag=" + d.fromTag + "\r\n"
+			"To: <sip:" + d.destE164 + "@" + d.sbcIpPort + ">;tag=carrier-tag\r\n"
+			"Call-ID: " + d.callID + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Contact: <sip:" + d.destE164 + "@203.0.113.99:5060>\r\n"
+			"Content-Length: 0\r\n\r\n";
+	}
+}
+
+TEST(SipTrunkBye, ANonTwoXxAnsweringOurByeIsNotAcked)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));   // answered
+	ASSERT_TRUE(trunk.hangup("handset-1"));                      // BYE sent
+	const size_t sentAfterBye = env.sent.size();
+
+	// The carrier refuses the BYE for a dialog it has already dropped.
+	std::string notFound = okFor(*trunk.findByCallID("handset-1"));
+	notFound.replace(0, notFound.find("\r\n"), "SIP/2.0 481 Call/Transaction Does Not Exist");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(notFound)));
+
+	// RFC 3261 s17.1.2: a BYE is a non-INVITE transaction and absorbs its own
+	// final response. Nothing may go on the wire.
+	EXPECT_EQ(env.sent.size(), sentAfterBye)
+		<< "a non-2xx to a BYE must not be ACKed -- that ACK would carry the "
+		   "INVITE's CSeq for a transaction that completed at answer time";
+	EXPECT_EQ(trunk.activeDialogs(), 0u) << "the dialog is over either way";
+}
+
+// The inverse, so the test above cannot pass for the wrong reason: a non-2xx to
+// the INVITE *is* still ACKed, in the INVITE's own transaction.
+TEST(SipTrunkBye, ANonTwoXxAnsweringTheInviteIsStillAcked)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string branch = d->branch;
+
+	std::string busy = okFor(*d);
+	busy.replace(0, busy.find("\r\n"), "SIP/2.0 486 Busy Here");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(busy)));
+
+	ASSERT_EQ(env.sent.size(), 2u) << "INVITE then its ACK";
+	const std::string ack = env.sentRaw(1);
+	EXPECT_EQ(ack.substr(0, 3), "ACK");
+	EXPECT_NE(ack.find(";branch=" + branch), std::string::npos)
+		<< "RFC 3261 s17.1.1.3: same branch as the INVITE";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+}
