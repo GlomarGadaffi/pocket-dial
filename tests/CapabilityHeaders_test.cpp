@@ -10,8 +10,12 @@
 //
 //   RFC 3311 §5.1 — a UAC MUST NOT send UPDATE unless UPDATE is in the target's
 //                   Allow. Without it, onUpdate() is dead code.
-//   RFC 3891 §4   — a phone will not offer a Replaces-based pickup without
-//                   `Supported: replaces`.
+//   RFC 3891 §4   — a phone will not offer a Replaces-based ATTENDED TRANSFER
+//                   (REFER's ?Replaces=, issue #131) without
+//                   `Supported: replaces`. The tag's OTHER RFC 3891 use --
+//                   an INVITE that itself carries Replaces, i.e. BLF-key
+//                   pickup -- has no handler anywhere in src/; that gap is
+//                   pinned separately in ReplacesInvite_test.cpp (issue #229).
 //
 // So this file pins the advertisement on the two paths that reach every phone:
 // the registrar's 200 OK (seen by every handset, every lease period, before it
@@ -177,7 +181,9 @@ TEST(CapabilityHeaders, RegisterOkAdvertisesWhatThisPbxActuallyHandles)
 	// OPTIONS only tells a phone that bothers to ask, and plenty never do. The
 	// REGISTER 200 OK reaches every handset on every lease period, before it
 	// ever places a call — so a phone that has not learned `Supported: replaces`
-	// here will not offer BLF-key pickup at all.
+	// here will not offer a Replaces-based attended transfer (REFER, #131) at
+	// all. NOT BLF-key pickup -- that needs an INVITE that itself carries
+	// Replaces (RFC 3891 §3), which nothing in src/ handles (issue #229).
 	Outbox sent;
 	RequestsHandler handler(kServerIp, 5060,
 		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) {
@@ -198,7 +204,8 @@ TEST(CapabilityHeaders, RegisterOkAdvertisesWhatThisPbxActuallyHandles)
 	EXPECT_NE(allow.find("REFER"), std::string::npos);
 
 	EXPECT_NE(headerValue(ok, "Supported").find("replaces"), std::string::npos)
-		<< "RFC 3891 §4: without this a phone will not offer a Replaces pickup";
+		<< "RFC 3891 §4: without this a phone will not offer a Replaces-based "
+		   "attended transfer via REFER (not INVITE-Replaces / BLF pickup -- #229)";
 	EXPECT_NE(headerValue(ok, "Accept").find("application/sdp"), std::string::npos);
 	EXPECT_EQ(headerValue(ok, "Allow-Events"), "dialog");
 }

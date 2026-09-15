@@ -321,6 +321,15 @@ add_executable(sip_parser_tests
     # answer keeps the callee's own capabilities, and that a phone's own Allow
     # never survives into ours as a second header line.
     CapabilityHeaders_test.cpp
+    # Issue #229: `Supported: replaces` backs onRefer()'s REFER ?Replaces=
+    # attended-transfer splice (#131) only -- RFC 3891 §3's OTHER use of the
+    # same tag, an INVITE that itself carries a Replaces header (the BLF-key
+    # "grab this ringing call" / phone-native call-steal mechanism), has no
+    # handler anywhere in src/. Pins that such an INVITE is a complete no-op
+    # today: the named dialog is untouched and the INVITE is dispatched as an
+    # ordinary new call. See the comment above kSupportedOptionTags in
+    # RequestsHandler.cpp for the scope call this documents.
+    ReplacesInvite_test.cpp
     BlfSubscriptions_test.cpp
     DashboardSnapshot_test.cpp
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
