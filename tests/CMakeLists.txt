@@ -300,6 +300,10 @@ add_executable(sip_parser_tests
     # CDR archive like the HTTP factory reset does. Drives the real INFO digit
     # path with a spy Sink installed via cdrarchive::setSinkForTest().
     DtmfFactoryReset_test.cpp
+    # Issue #246 (voicemail Stage 3 of #194): the extension-config-model slice
+    # -- setVoicemail()/getVoicemailExtensions() must obey the same
+    # immediate-snapshot-refresh contract as setDnd()/getDndExtensions().
+    VoicemailConfig_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header

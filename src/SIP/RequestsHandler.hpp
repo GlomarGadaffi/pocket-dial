@@ -207,6 +207,14 @@ public:
 	void setDnd(const std::string& extension, bool on);
 	std::vector<std::string> getDndExtensions();
 
+	// Voicemail (Issue #246): set/query a per-extension flag, mirroring
+	// setDnd/getDndExtensions exactly except this one IS NVS-persisted (see
+	// PbxFeatureConfig::setVoicemailEnabledLocked) since the toggle must
+	// survive a reboot. setVoicemail is the mutating path behind
+	// POST /api/voicemail.
+	void setVoicemail(const std::string& extension, bool on);
+	std::vector<std::string> getVoicemailExtensions();
+
 	// Call forwarding (CFU/CFB/CFNA). setForward mutates one trigger ("always",
 	// "busy" or "noanswer") for an extension; an empty target clears it (and the
 	// whole entry once all three are empty). Both are thread-safe (take _mutex /
@@ -1281,6 +1289,7 @@ private:
 		std::vector<std::tuple<std::string, std::string, std::string, int>> sessions;
 		std::vector<CallDetailRecord> cdr;   // newest first
 		std::vector<std::string> dnd;        // extensions currently in DND
+		std::vector<std::string> voicemail;  // extensions with voicemail enabled (Issue #246)
 		// Call-forward config: {extension, always, busy, noAnswer}.
 		std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwards;
 		// Ring/hunt groups: {groupExt, "ringall"|"hunt", "m1,m2,..."}.

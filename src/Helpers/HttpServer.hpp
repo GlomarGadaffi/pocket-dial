@@ -163,6 +163,9 @@ private:
 	void sendConfigCfg(int sock, const std::string& mac);
 	// Phase 2: set per-extension Do Not Disturb. Mutating (same-origin + auth gated).
 	void sendApiDnd(int sock, const std::string& body);
+	// Issue #246: set per-extension voicemail-enabled, same shape and gate as
+	// sendApiDnd (unlike DND, this one is NVS-persisted — see RequestsHandler::setVoicemail).
+	void sendApiVoicemail(int sock, const std::string& body);
 	// Class A sweep: set per-extension call forwarding (always/busy/noanswer) and
 	// configure ring/hunt groups. Mutating (same-origin + auth gated), mirroring DND.
 	void sendApiForward(int sock, const std::string& body);

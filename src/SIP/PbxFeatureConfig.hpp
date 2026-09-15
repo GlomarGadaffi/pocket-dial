@@ -37,7 +37,7 @@ class PbxFeatureConfig
 public:
 	// Which table changed, for the OnChanged callback -> RequestsHandler's
 	// refreshPbxConfigSnapshot(Table) switch.
-	enum class Table { Dnd, Forwards, RingGroups, PageZones, DialRules };
+	enum class Table { Dnd, Forwards, RingGroups, PageZones, DialRules, Voicemail };
 	using OnChanged = std::function<void(Table)>;
 
 	PbxFeatureConfig(PbxEnv& env, OnChanged onChanged)
@@ -57,6 +57,19 @@ public:
 	// RequestsHandler::refreshPbxConfigSnapshot() and tick()'s periodic full
 	// rebuild. Caller holds _mutex — this performs no locking of its own.
 	std::vector<std::string> dndSnapshot() const;
+
+	// ── Voicemail (Issue #246) ───────────────────────────────────────────────
+	// Per-extension "voicemail enabled" flag. Structurally identical to DND
+	// (a bounded on/off set keyed by extension) but, unlike DND, persisted to
+	// NVS like forwards/ring groups: the toggle must survive a reboot, whereas
+	// DND is deliberately session-only in this codebase.
+	void setVoicemailEnabledLocked(const std::string& extension, bool on);
+	// Internal lookup for the CFNA no-answer sweep (tick()) and onBusy()'s CFB
+	// redirect: whether an unanswered/busy call with no explicit forward
+	// target should fall back to voicemail instead of just failing. Caller
+	// MUST already hold _mutex.
+	bool isVoicemailEnabled(const std::string& extension) const;
+	std::vector<std::string> voicemailSnapshot() const;
 
 	// ── Call forwarding (CFU/CFB/CFNA) ───────────────────────────────────────
 	// Internal lookup used by onInvite()/onBusy()/tick(). Caller MUST already
@@ -143,6 +156,7 @@ public:
 
 private:
 	void persistForwards();
+	void persistVoicemail();
 	void persistRingGroups();
 	void persistPageZones();
 	// Issue #166: the E911 notification settings, in their own NVS key so a
@@ -166,6 +180,11 @@ private:
 	// extensions. (A std::shared_ptr<SipClient> flag would be lost across
 	// re-REGISTER / pool eviction; keying by extension keeps DND sticky.)
 	std::unordered_map<std::string, bool> _dnd;
+
+	// Voicemail-enabled state (Issue #246), keyed by extension. Same bounding
+	// rationale as _dnd, but persisted (see persistVoicemail()) since this
+	// toggle must survive a reboot.
+	std::unordered_map<std::string, bool> _voicemailEnabled;
 
 	// Call-forwarding config, keyed by extension (Class A sweep). Same
 	// bounding/stickiness rationale as _dnd: an entry exists only while at

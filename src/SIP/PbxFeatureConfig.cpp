@@ -70,6 +70,53 @@ std::vector<std::string> PbxFeatureConfig::dndSnapshot() const
 	return result;
 }
 
+// ── Voicemail (Issue #246) ───────────────────────────────────────────────────
+
+void PbxFeatureConfig::setVoicemailEnabledLocked(const std::string& extension, bool on)
+{
+	if (on)
+	{
+		// Same bound as DND — reject new keys past the client-pool cap rather
+		// than let a flood of distinct extensions grow the map unbounded.
+		if (_voicemailEnabled.find(extension) == _voicemailEnabled.end() &&
+			_voicemailEnabled.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
+		{
+			_env.log("Voicemail enable ignored (table full) for extension " + extension, true);
+			return;
+		}
+		_voicemailEnabled[extension] = true;
+	}
+	else
+	{
+		_voicemailEnabled.erase(extension);
+	}
+	_env.log("Voicemail " + std::string(on ? "enabled" : "disabled") + " for extension " + extension);
+
+	// Unlike DND, this must survive a reboot: the whole point is that a call
+	// diverted while the box was mid-restart still lands in the mailbox.
+	persistVoicemail();
+	_onChanged(Table::Voicemail);
+}
+
+bool PbxFeatureConfig::isVoicemailEnabled(const std::string& extension) const
+{
+	// Internal lookup: invoked from the CFNA sweep / onBusy(), which already
+	// hold _mutex — must NOT take it again (std::mutex is non-recursive).
+	auto it = _voicemailEnabled.find(extension);
+	return it != _voicemailEnabled.end() && it->second;
+}
+
+std::vector<std::string> PbxFeatureConfig::voicemailSnapshot() const
+{
+	std::vector<std::string> result;
+	result.reserve(_voicemailEnabled.size());
+	for (const auto& [ext, enabled] : _voicemailEnabled)
+	{
+		if (enabled) result.push_back(ext);
+	}
+	return result;
+}
+
 // ── Call forwarding (CFU/CFB/CFNA) ───────────────────────────────────────────
 
 std::string PbxFeatureConfig::getForwardTarget(const std::string& extension, const std::string& trigger) const
@@ -513,6 +560,16 @@ void PbxFeatureConfig::loadPbxConfig()
 		if (!cfg.empty()) _forwards[rec[0]] = std::move(cfg);
 	}
 
+	// Voicemail-enabled (Issue #246): one extension per record, membership
+	// list like the DND blob would be if DND were persisted — presence means
+	// enabled, there is no third state.
+	for (const auto& rec : deserializeBlob(readBlob("vmenabled")))
+	{
+		if (rec.empty() || rec[0].empty()) continue;
+		if (_voicemailEnabled.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS)) break;
+		_voicemailEnabled[rec[0]] = true;
+	}
+
 	// Ring groups: ext \t mode \t m1,m2,...
 	for (const auto& rec : deserializeBlob(readBlob("groups")))
 	{
@@ -596,6 +653,30 @@ void PbxFeatureConfig::persistForwards()
 		nvs_commit(h);
 		nvs_close(h);
 	}
+#endif
+}
+
+void PbxFeatureConfig::persistVoicemail()
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	std::string blob;
+	for (const auto& [ext, enabled] : _voicemailEnabled)
+	{
+		if (!enabled) continue;
+		blob += ext; blob += '\n';
+	}
+	nvs_handle_t h;
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+	{
+		_env.log("Voicemail persist: nvs_open failed", true);
+		return;
+	}
+	if (nvs_set_str(h, "vmenabled", blob.c_str()) != ESP_OK ||
+		nvs_commit(h) != ESP_OK)
+	{
+		_env.log("Voicemail persist: nvs write/commit failed", true);
+	}
+	nvs_close(h);
 #endif
 }
 

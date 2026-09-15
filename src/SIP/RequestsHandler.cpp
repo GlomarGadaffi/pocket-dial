@@ -6141,6 +6141,29 @@ std::vector<std::string> RequestsHandler::getDndExtensions()
 	return _snapshot.dnd;
 }
 
+void RequestsHandler::setVoicemail(const std::string& extension, bool on)
+{
+	std::vector<std::pair<bool, std::string>> localLogs;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_cfg.setVoicemailEnabledLocked(extension, on);
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+
+	for (const auto& log : localLogs)
+	{
+		if (log.first) std::cerr << log.second << std::endl;
+		else std::cout << log.second << std::endl;
+	}
+}
+
+std::vector<std::string> RequestsHandler::getVoicemailExtensions()
+{
+	std::lock_guard<std::mutex> lock(_snapshotMutex);
+	return _snapshot.voicemail;
+}
+
 // ── Call forwarding (CFU/CFB/CFNA) ───────────────────────────────────────────
 
 void RequestsHandler::setForward(const std::string& extension, const std::string& trigger, const std::string& target)
@@ -6239,6 +6262,9 @@ void RequestsHandler::refreshPbxConfigSnapshot(PbxFeatureConfig::Table t)
 		break;
 	case PbxFeatureConfig::Table::DialRules:
 		_snapshot.dialRules = _cfg.dialRulesSnapshot();
+		break;
+	case PbxFeatureConfig::Table::Voicemail:
+		_snapshot.voicemail = _cfg.voicemailSnapshot();
 		break;
 	}
 }
