@@ -14,6 +14,7 @@
 #include "PoolConfig.hpp"
 #include "CallDetailRecord.hpp"
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive (endCall() hook)
+#include "TimeSync.hpp"    // Issue #246: voicemail flush timestamp (endCall() hook)
 #include "PbxConfig.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: 911/933 classification, ahead of the dial plan
 #include "PbxPersist.hpp"
@@ -597,6 +598,75 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 #endif
 		}
 	}
+
+	// Issue #246: the voicemail recording/staging buffer pool. Same
+	// "deliberate, narrow exception to no-heap-after-init" reasoning
+	// HoldMusic::loadClip() documents in full -- one-shot, bounded, off the
+	// media path, runs on whatever thread constructs this object (never the
+	// SIP/RTP tasks, since those don't exist until after construction). PSRAM
+	// by preference, same fallback-to-internal-RAM order as HoldMusic. Two
+	// buffers per leg, not one: the record buffer is what onCallerRtp() fills
+	// live; the staging buffer is a separate copy the flush queue owns after
+	// BYE, so releaseVoicemailLeg() can reset() the leg (and let it take a
+	// new call) without waiting for the writer task to finish reading -- see
+	// VoicemailArchive.hpp's class comment.
+	for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		_vmRecordBufs[i] = static_cast<uint8_t*>(
+			heap_caps_malloc(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+		if (_vmRecordBufs[i] == nullptr)
+		{
+			_vmRecordBufs[i] = static_cast<uint8_t*>(
+				heap_caps_malloc(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES, MALLOC_CAP_8BIT));
+		}
+		_vmStagingBufs[i] = static_cast<uint8_t*>(
+			heap_caps_malloc(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+		if (_vmStagingBufs[i] == nullptr)
+		{
+			_vmStagingBufs[i] = static_cast<uint8_t*>(
+				heap_caps_malloc(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES, MALLOC_CAP_8BIT));
+		}
+#else
+		_vmRecordBufs[i] = static_cast<uint8_t*>(std::malloc(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES));
+		_vmStagingBufs[i] = static_cast<uint8_t*>(std::malloc(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES));
+#endif
+		if (_vmRecordBufs[i] == nullptr || _vmStagingBufs[i] == nullptr)
+		{
+			// Allocation failure at boot is a hardware/build-config problem,
+			// not a runtime condition to recover from -- leave this leg's
+			// buffers null and let the free-slot scan's null checks in
+			// answerVoicemailDeposit() refuse deposits onto it rather than
+			// crash. Every other leg still works.
+			queueLog("[Voicemail] leg " + std::to_string(i) +
+				" buffer allocation failed (" +
+				std::to_string(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES) + " bytes x2)", true);
+		}
+	}
+
+#if defined(PD_ETH_HAS_SD)
+	// The SD-flush writer task -- mirrors CdrArchive.cpp's writerTaskBody
+	// shape (poll the queue every 200ms, drain whatever's there) but spawned
+	// HERE rather than from a free-function init(), since this queue and its
+	// staging buffers are per-instance members, not a process-global
+	// singleton like CdrArchive's. Captures `this` in a raw pointer, safe
+	// because RequestsHandler is never destructed during normal operation on
+	// a real device (same assumption CdrArchive's own never-terminating
+	// writer task makes).
+	xTaskCreatePinnedToCore([](void* arg) {
+		auto* handler = static_cast<RequestsHandler*>(arg);
+		for (;;)
+		{
+			handler->drainVoicemailFlush(vmarchive::productionSink());
+			vTaskDelay(pdMS_TO_TICKS(200));
+		}
+	}, "vm_archive", 6144, this, 1, nullptr, 0);
+	// Stack size is a reasoned estimate (FatFs snprintf/fopen/rename need
+	// headroom, same order as CdrArchive's own 6144B figure), NOT measured
+	// with uxTaskGetStackHighWaterMark() -- this task has never run on real
+	// hardware. Flag for hardware bring-up, same as CdrArchive.cpp's
+	// identical caveat on its own writer task.
+#endif
 }
 
 RequestsHandler::~RequestsHandler()
@@ -622,6 +692,21 @@ RequestsHandler::~RequestsHandler()
 	if (_anchorClient)
 	{
 		_anchorClient->stop();
+	}
+
+	// Issue #246: free the voicemail buffer pool allocated in the
+	// constructor. Symmetric ESP/host free matching the allocator above --
+	// heap_caps_free() is safe to call on a null pointer (allocation
+	// failure leaves it null), same as std::free().
+	for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		heap_caps_free(_vmRecordBufs[i]);
+		heap_caps_free(_vmStagingBufs[i]);
+#else
+		std::free(_vmRecordBufs[i]);
+		std::free(_vmStagingBufs[i]);
+#endif
 	}
 }
 
@@ -2372,6 +2457,28 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		refuse("SIP/2.0 486 Busy Here", "every voicemail leg busy, rejected deposit");
 		return;
 	}
+	if (_vmRecordBufs[slot] == nullptr)
+	{
+		// Boot-time allocation failed for this leg (see the constructor's
+		// queueLog on failure) -- refuse rather than record into a null
+		// pointer. Every other leg is unaffected.
+		refuse("SIP/2.0 500 Server Internal Error", "voicemail leg has no recording buffer");
+		return;
+	}
+
+	// Claim the leg BEFORE starting the RTP receiver, not after: onCallerRtp()
+	// could otherwise fire (real hardware, receive task starts near-instantly)
+	// while the leg is still Idle and silently drop the call's opening frames.
+	if (!_vmLegs[slot].startRecording(_vmRecordBufs[slot], POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES,
+		POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES, extension, callID))
+	{
+		// Only reachable if the leg was somehow left Recording/Finalizing
+		// despite _vmRtpReceivers[slot] reporting inactive -- a slot-tracking
+		// bug elsewhere, not a normal refusal path. Refuse rather than record
+		// over a not-yet-flushed message.
+		refuse("SIP/2.0 500 Server Internal Error", "voicemail leg claim failed");
+		return;
+	}
 
 	// Pass localPort 0 so the OS picks an ephemeral port on real hardware
 	// (read back via localPort() below), exactly like MediaBridge::startBridge()
@@ -2383,6 +2490,7 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		});
 	if (!rxStarted)
 	{
+		_vmLegs[slot].reset();
 		refuse("SIP/2.0 500 Server Internal Error", "voicemail RTP receiver failed to start");
 		return;
 	}
@@ -2392,6 +2500,7 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		}))
 	{
 		_vmRtpReceivers[slot].stop();
+		_vmLegs[slot].reset();
 		refuse("SIP/2.0 500 Server Internal Error", "voicemail RTP sender failed to start");
 		return;
 	}
@@ -2401,6 +2510,7 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 	{
 		_vmRtpReceivers[slot].stop();
 		_vmRtpSenders[slot].stop(callID);
+		_vmLegs[slot].reset();
 		refuse("SIP/2.0 503 Service Unavailable", "session pool full, rejected deposit");
 		return;
 	}
@@ -2417,6 +2527,7 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 	{
 		_vmRtpReceivers[slot].stop();
 		_vmRtpSenders[slot].stop(callID);
+		_vmLegs[slot].reset();
 		queueLog("Voicemail: message pool exhausted answering " + extension, true);
 		return;
 	}
@@ -2450,6 +2561,38 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 
 	queueLog("Voicemail: " + std::string(src->getNumber()) + " -> " + extension
 		+ " deposit answered locally (leg " + std::to_string(slot) + ")");
+}
+
+void RequestsHandler::enqueueVoicemailFlush(int slot)
+{
+	if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return;
+	if (_vmStagingBufs[slot] == nullptr) return;   // boot-time allocation failed for this leg
+
+	_vmLegs[slot].stopRecording();   // no-op if not Recording (e.g. answer never completed)
+	const uint8_t* data = _vmLegs[slot].recordedData();
+	const size_t length = _vmLegs[slot].recordedLength();
+	if (data == nullptr || length == 0) return;   // nothing said -- nothing to flush
+
+	// Copy into THIS slot's staging buffer, not the leg's own recording
+	// buffer -- see VoicemailArchive.hpp's class comment for why: this is
+	// what lets releaseVoicemailLeg() reset() the leg immediately afterwards
+	// without waiting for the writer task to finish reading.
+	std::memcpy(_vmStagingBufs[slot], data, length);
+
+	vmarchive::QueuedRecording rec;
+	rec.stagingSlot = slot;
+	std::string ext = _vmLegs[slot].extension();
+	std::string callId = _vmLegs[slot].callId();
+	std::strncpy(rec.extension, ext.c_str(), sizeof(rec.extension) - 1);
+	std::strncpy(rec.callId, callId.c_str(), sizeof(rec.callId) - 1);
+	rec.epochSeconds = timesync::epochSeconds();   // 0 if never synced -- NOT dropped, see header
+	rec.sequence = ++_vmFlushSequence;
+	rec.length = length;
+
+	if (!_vmFlushQueue.push(rec))
+	{
+		queueLog("Voicemail: flush queue full, message from " + ext + " dropped", true);
+	}
 }
 
 void RequestsHandler::releaseVoicemailLeg(int slot, const std::string& callId)
@@ -5893,7 +6036,9 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	// dest's name -- same reasoning as isAnchor()'s own doc comment.
 	if (ending && ending->isVoicemail())
 	{
-		releaseVoicemailLeg(ending->getVoicemailLegSlot(), std::string(callID));
+		const int vmSlot = ending->getVoicemailLegSlot();
+		enqueueVoicemailFlush(vmSlot);
+		releaseVoicemailLeg(vmSlot, std::string(callID));
 	}
 }
 

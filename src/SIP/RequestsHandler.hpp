@@ -62,6 +62,7 @@
 #include "DidMapping.hpp"
 #include "MediaBridge.hpp"
 #include "VoicemailLeg.hpp"
+#include "VoicemailArchive.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
 #include "Registrar.hpp"
@@ -883,9 +884,39 @@ private:
 	void answerVoicemailDeposit(const std::shared_ptr<SipMessage>& invite,
 		const std::shared_ptr<SipClient>& src, const std::string& extension);
 	// Stop the leg's RTP receiver/sender and return it to Idle. Called from
-	// onBye()'s voicemail branch (and will be called from BYE-equivalent
-	// teardown paths added alongside recording in a follow-up commit).
+	// endCall()'s voicemail safety net, covering every teardown path.
 	void releaseVoicemailLeg(int slot, const std::string& callId);
+	// Finalize whatever `_vmLegs[slot]` recorded (stopRecording() is a no-op
+	// if it wasn't Recording), copy it into that slot's staging buffer, and
+	// push a QueuedRecording -- called from endCall()'s voicemail safety net,
+	// BEFORE releaseVoicemailLeg() resets the leg. Drops (does not enqueue)
+	// a zero-length recording -- nobody said anything, nothing to flush.
+	void enqueueVoicemailFlush(int slot);
+
+public:
+	// Drains whatever is currently queued to `sink`, reading each recording
+	// from this instance's own staging buffers. The ESP+PD_ETH_HAS_SD writer
+	// task (spawned in the constructor) calls this against
+	// vmarchive::productionSink() in a loop; a host test calls it directly
+	// against a FakeSink, exercising the identical vmarchive::drainAll() path
+	// with no writer task needed.
+	void drainVoicemailFlush(vmarchive::Sink& sink)
+	{
+		vmarchive::drainAll(_vmFlushQueue, sink, _vmStagingBufs);
+	}
+	size_t voicemailFlushQueueDepthForTest() const { return _vmFlushQueue.size(); }
+	// Test-only seam, same reasoning as RtpReceiver::dispatchDtmf() being
+	// public "so host tests can reach it": RtpReceiver::start() is a no-op
+	// stub on host (no real socket), so nothing can otherwise get caller
+	// audio into an active leg. `slot` comes from
+	// Session::getVoicemailLegSlot() on the session a test just answered.
+	bool feedVoicemailAudioForTest(int slot, const uint8_t* mulaw, size_t n)
+	{
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return false;
+		return _vmLegs[slot].onCallerRtp(mulaw, n);
+	}
+
+private:
 
 	// The shared meet-me room, created lazily on the first 888 dial-in — a MixBus and
 	// its per-leg rings are ~50 KB, too much to pay at boot on a node that may never
@@ -1201,6 +1232,23 @@ private:
 	RtpReceiver  _vmRtpReceivers[POCKETDIAL_MAX_VOICEMAIL_LEGS];
 	RtpSender    _vmRtpSenders[POCKETDIAL_MAX_VOICEMAIL_LEGS];
 	VoicemailLeg _vmLegs[POCKETDIAL_MAX_VOICEMAIL_LEGS];
+
+	// Recording/staging buffer pool (see PoolConfig.hpp's
+	// POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES budget comment and
+	// VoicemailArchive.hpp's class comment for why there are two arrays, not
+	// one). Allocated once in the constructor, freed once in the destructor
+	// -- never touched by any other code path. A null entry means boot-time
+	// allocation failed for that leg; answerVoicemailDeposit() must check.
+	uint8_t* _vmRecordBufs[POCKETDIAL_MAX_VOICEMAIL_LEGS] = {};
+	uint8_t* _vmStagingBufs[POCKETDIAL_MAX_VOICEMAIL_LEGS] = {};
+
+	// The SD-flush queue (VoicemailArchive.hpp) -- capacity matches the leg
+	// count, since at most one finished recording per leg can be pending
+	// flush at a time. Monotonic counter for the filename fallback when the
+	// wall clock hasn't synced yet (see VoicemailArchive.hpp's
+	// QueuedRecording::sequence doc comment).
+	vmarchive::WriterQueue _vmFlushQueue{POCKETDIAL_MAX_VOICEMAIL_LEGS};
+	uint64_t _vmFlushSequence = 0;
 
 	// The boot-selected provider TYPE (cached alongside _anchorClient itself —
 	// see the constructor) and the monitored route DN an ACTIVE+ENABLED

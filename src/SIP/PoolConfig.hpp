@@ -283,6 +283,24 @@
 #define POCKETDIAL_MAX_VOICEMAIL_LEGS 2
 #endif
 
+// Max single voicemail message duration. 90s of 8kHz mu-law (1 byte/sample)
+// is 720,000 bytes (~703 KiB) -- long enough for a real message, short
+// enough that the full budget below still fits comfortably. Every leg needs
+// TWO buffers this size, not one (see VoicemailArchive.hpp's class comment
+// for why): the record buffer onCallerRtp() fills live, and a separate
+// staging buffer the flush queue copies into at BYE so releaseVoicemailLeg()
+// never has to wait for the writer task. Total budget at the defaults above:
+// POCKETDIAL_MAX_VOICEMAIL_LEGS (2) x 2 buffers x ~703 KiB =~ 2.75 MiB,
+// alongside HoldMusic's ~816 KiB clip, on the 8MB Octal PSRAM every board in
+// docs/HARDWARE.md carries. Not yet checked against actual free-PSRAM
+// telemetry on hardware -- same caution POCKETDIAL_MAX_ANCHOR_CALLS's own
+// history above sets a precedent for; raise/lower alongside a real
+// measurement, not by feel.
+#ifndef POCKETDIAL_VOICEMAIL_MAX_MESSAGE_SECONDS
+#define POCKETDIAL_VOICEMAIL_MAX_MESSAGE_SECONDS 90
+#endif
+#define POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES (POCKETDIAL_VOICEMAIL_MAX_MESSAGE_SECONDS * 8000)
+
 // Maximum number of DID -> extension inbound routing entries (DidMapping.hpp).
 // Bounded exactly like TelephonyApiConfig::kSlots: a fixed std::array, no heap,
 // a 9th add fails cleanly ("table full") rather than growing unbounded. Small

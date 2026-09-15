@@ -113,6 +113,20 @@ private:
 // VoicemailArchive_test.cpp calls directly against a FakeSink.
 void drainAll(WriterQueue& queue, Sink& sink, uint8_t* const* stagingBufs);
 
+#if defined(PD_ETH_HAS_SD)
+// The production Sink: writes /sdcard/vm/<extension>/<name>.wav.tmp, closes
+// it, renames to .wav, THEN appends the metadata index row -- in that order
+// (#194 prereq 1b's write-order rule: a crash mid-write leaves an orphaned
+// .tmp, swept at boot, never an index entry pointing at a truncated file).
+// `<name>` is epochSeconds when the wall clock has synced, else
+// "boot-<sequence>" (see QueuedRecording's doc comment) -- never dropped for
+// lack of a timestamp the way cdrarchive::record() drops a CDR row, since a
+// voicemail is worth more than its timestamp. Declared only under
+// PD_ETH_HAS_SD, same reason CdrArchive.hpp's Sink split is gated that way:
+// wifi/lan8720 builds don't declare pd_sd_mounted() at all.
+Sink& productionSink();
+#endif
+
 }  // namespace vmarchive
 
 #endif

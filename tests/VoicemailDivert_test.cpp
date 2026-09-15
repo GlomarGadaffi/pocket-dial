@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "RequestsHandler.hpp"
+#include "VoicemailArchive.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -136,6 +137,25 @@ namespace
 		}
 		return {};
 	}
+
+	class FakeSink : public vmarchive::Sink
+	{
+	public:
+		struct Call
+		{
+			vmarchive::QueuedRecording rec;
+			std::vector<uint8_t> mulaw;
+		};
+		std::vector<Call> calls;
+
+		void write(const vmarchive::QueuedRecording& rec, const uint8_t* mulaw) override
+		{
+			Call c;
+			c.rec = rec;
+			c.mulaw.assign(mulaw, mulaw + rec.length);
+			calls.push_back(std::move(c));
+		}
+	};
 }
 
 // CFNA fallback: no explicit no-answer forward, voicemail enabled. The
@@ -414,4 +434,84 @@ TEST(VoicemailDivert, EndCallViaNonByePathReleasesTheVoicemailLegSlot)
 
 	EXPECT_NE(findSentTo(sent, caller3Addr, "SIP/2.0 200 OK").find("v=0"), std::string::npos)
 		<< "the slot forceDisconnect freed must be reusable by a new deposit";
+}
+
+// End-to-end: deposit, caller audio actually recorded (injected via the
+// dispatchDtmf()-style test seam, since RtpReceiver::start() is a no-op stub
+// on host), BYE, and the finished message reaches the flush queue with the
+// right identity and the exact bytes recorded -- not just "some 200 OK went
+// out", but the whole record -> finalize -> stage -> queue pipeline.
+TEST(VoicemailDivert, RecordedAudioReachesTheFlushQueueAfterBye)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.43.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("601", "192.168.43.11", "reg-601"));
+	handler.handle(makeRegister("611", "192.168.43.21", "reg-611"));
+	handler.setVoicemail("601", true);
+
+	const std::string callId = "vm-audio-1";
+	const std::string branch = "z9hG4bKvmaudio1";
+	handler.handle(makeInvite("611", "601", "192.168.43.21", callId, branch));
+	handler.handle(makeBusy("611", "601", "192.168.43.11", callId, branch));
+
+	auto session = handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(session.has_value());
+	const int slot = session.value()->getVoicemailLegSlot();
+	ASSERT_GE(slot, 0);
+
+	const uint8_t frame1[] = {10, 20, 30, 40};
+	const uint8_t frame2[] = {50, 60};
+	ASSERT_TRUE(handler.feedVoicemailAudioForTest(slot, frame1, sizeof(frame1)));
+	ASSERT_TRUE(handler.feedVoicemailAudioForTest(slot, frame2, sizeof(frame2)));
+
+	// forceDisconnect rather than a real BYE: ByeAfterVoicemail... already
+	// pins the exact-dialog-tag-matching requirement for a real BYE, and
+	// endCall()'s voicemail safety net fires on ANY teardown reaching it --
+	// this test's interest is the flush pipeline, not dialog matching.
+	handler.forceDisconnect("611");
+
+	FakeSink sink;
+	handler.drainVoicemailFlush(sink);
+
+	ASSERT_EQ(sink.calls.size(), 1u);
+	EXPECT_STREQ(sink.calls[0].rec.extension, "601");
+	// VoicemailLeg::callId() stores whatever SipMessage::getCallID() returns
+	// verbatim -- the FULL "Call-ID: <value>" header line, same convention
+	// _sessions' map key and every getSession() caller in this file already
+	// account for, not just the bare value.
+	EXPECT_STREQ(sink.calls[0].rec.callId, ("Call-ID: " + callId).c_str());
+	EXPECT_EQ(sink.calls[0].rec.length, 6u);
+	EXPECT_EQ(sink.calls[0].mulaw, std::vector<uint8_t>({10, 20, 30, 40, 50, 60}));
+}
+
+// A caller who hangs up without saying anything must not produce a flushed
+// message at all -- enqueueVoicemailFlush() drops a zero-length recording.
+TEST(VoicemailDivert, HangingUpWithNoAudioProducesNoFlushedMessage)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.44.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("602", "192.168.44.11", "reg-602"));
+	handler.handle(makeRegister("612", "192.168.44.21", "reg-612"));
+	handler.setVoicemail("602", true);
+
+	const std::string callId = "vm-empty-1";
+	const std::string branch = "z9hG4bKvmempty1";
+	handler.handle(makeInvite("612", "602", "192.168.44.21", callId, branch));
+	handler.handle(makeBusy("612", "602", "192.168.44.11", callId, branch));
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+
+	handler.forceDisconnect("612");
+
+	FakeSink sink;
+	handler.drainVoicemailFlush(sink);
+	EXPECT_TRUE(sink.calls.empty())
+		<< "nobody said anything -- nothing should reach the flush queue";
 }
