@@ -2648,8 +2648,19 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// response and the handset never receives two final responses to one INVITE.
 	// NOT std::move: originateAnchorCall takes its shared_ptr by value, and this
 	// function still needs `data` afterwards to build the failure response from.
-	if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false))
+	bool placed = false;
+	if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed))
 	{
+		// The call leg is enqueued. NOW notify: 47 CFR 9.16(b)(2) wants the
+		// notification contemporaneous with the call and not delaying it, and
+		// both leave on the same drainOutbox() pass, so that holds literally
+		// rather than approximately. Nothing in notifyEmergency() can fail in a
+		// way this function has to handle -- see EmergencyNotifier.hpp.
+		// `placed`, not `true`: the anchor may have ANSWERED with a 503 (every
+		// bridge slot busy, session pool full, makeCall declined) and still
+		// returned true. Telling the front desk a 911 call went through when it
+		// was refused for capacity is the worst error this feature could make.
+		notifyEmergency(emergency, from, dialed, /*routed=*/placed);
 		return;
 	}
 
@@ -2685,6 +2696,10 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		// above already recorded the attempt, which is the part that matters.
 		queueLog("EMERGENCY: " + kind + " from " + from +
 			" NOT ROUTED and no message available to answer with", true);
+		// Still notify. A 911 attempt that produced neither a call nor even a
+		// failure response is the single most important thing to put in front of
+		// a human, and the notification path has its own pooled messages.
+		notifyEmergency(emergency, from, dialed, /*routed=*/false);
 		return;
 	}
 	// A free-text reason phrase (RFC 3261 §7.2) that many handsets display.
@@ -2698,12 +2713,61 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 
 	queueLog("EMERGENCY: " + kind + " from " + from +
 		" COULD NOT BE ROUTED (no trunk connected) - answered 503", true);
+
+	// 503 is enqueued; notify after it, same ordering rule as the routed path.
+	notifyEmergency(emergency, from, dialed, /*routed=*/false);
+}
+
+// Issue #166 part 2. Kept to this one small function so the compliance-relevant
+// ordering is visible in one place: every caller has already enqueued its
+// response before reaching here, and nothing below can fail back into the call.
+void RequestsHandler::notifyEmergency(const pbx::EmergencyDial& emergency,
+	const std::string& fromExt, const std::string& dialed, bool routed)
+{
+	const pbx::E911Config& cfg = _cfg.e911Config();
+
+	_e911Notifier.notify(cfg, emergency.isTest, fromExt, dialed,
+		emergency.hadTrunkPrefix, routed);
+
+	// Make the notified phones audibly alert, on top of the MESSAGE text. The
+	// beep is the existing register-beep INVITE (auto-answer headers, no RTP),
+	// reused because it is the one server-originated "make this phone make a
+	// noise" path in the tree that is actually proven in production.
+	//
+	// Honest limitation, documented rather than hidden: sendBeep() SKIPS when
+	// its bounded table is full (RegisterBeeper.cpp), which is right for a
+	// cosmetic registration beep and is not a guarantee anyone should rely on
+	// for 911. It is strictly additive here -- the syslog record and the SIP
+	// MESSAGE are the notification; this is the "or hear it" half of 9.16(b)(2)
+	// on a best-effort basis. A dedicated alert-INVITE table that cannot be
+	// starved by registration churn is the follow-up.
+	for (const std::string& ext : cfg.notifyExts)
+	{
+		if (ext.empty() || ext == fromExt)
+		{
+			// Never beep the phone that is dialing 911: it is mid-call setup and
+			// an intercom INVITE at that moment is the last thing it needs.
+			continue;
+		}
+		auto phone = findClient(ext);
+		if (phone.has_value())
+		{
+			_beeper.sendBeep(phone.value());
+		}
+	}
 }
 
 bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller, const std::string& destination,
-	bool respondIfDisconnected)
+	bool respondIfDisconnected, bool* placedOut)
 {
+	// Issue #166: this function's bool return means "took ownership of the
+	// INVITE", NOT "the call was placed" -- eight refuse() paths answer 4xx/5xx
+	// and still return true. The emergency notification must tell a human which
+	// actually happened, so it asks for that second fact separately. Optimistic
+	// default, cleared by refuse() and by the one unwind path that fails without
+	// answering.
+	if (placedOut) *placedOut = true;
 	const std::string activeIp = _localIp;
 	const std::string callID(data->getCallID());
 	// The remote target both this response's Contact and every later in-dialog
@@ -2717,6 +2781,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	const std::string remoteExt(data->getToNumber());
 
 	auto refuse = [&](const char* statusLine, const char* why) {
+		if (placedOut) *placedOut = false;   // answered, but not placed (#166)
 		auto msg = getMessageFromPool(*data);
 		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
 		msg->setHeader(statusLine);
@@ -2836,6 +2901,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 			bridge->stopBridge();
 			_anchorClient->dropCall(ownLeg);
 			queueLog("anchor(" + remoteExt + "): message pool exhausted, call unwound", true);
+			if (placedOut) *placedOut = false;   // unwound, nothing sent (#166)
 			return true;
 		}
 
@@ -6047,6 +6113,31 @@ std::vector<std::tuple<std::string, std::string, std::string, std::string>> Requ
 }
 
 // ── Ring / hunt groups ───────────────────────────────────────────────────────
+
+void RequestsHandler::setE911Config(const std::string& exts, const std::string& callback,
+	const std::string& location)
+{
+	std::vector<std::pair<bool, std::string>> localLogs;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_cfg.setE911Config(exts, callback, location);
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+
+	for (const auto& log : localLogs)
+	{
+		if (log.first) std::cerr << log.second << std::endl;
+		else std::cout << log.second << std::endl;
+	}
+}
+
+std::tuple<std::string, std::string, std::string> RequestsHandler::getE911Config()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	const pbx::E911Config& c = _cfg.e911Config();
+	return {pbx::joinMembers(c.notifyExts), c.callback, c.location};
+}
 
 void RequestsHandler::setRingGroup(const std::string& groupExt, const std::string& members, const std::string& mode)
 {

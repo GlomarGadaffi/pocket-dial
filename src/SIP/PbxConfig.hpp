@@ -196,15 +196,20 @@ namespace pbx
 	// why a REGISTER claiming one must be refused outright rather than silently
 	// intercepting calls meant for it).
 	//
-	// This is the REGISTER-identity set, not a general "reserved extension"
-	// predicate — it deliberately does NOT replace the narrower, independently
-	// evolving literal sets in PbxFeatureConfig.cpp's setForwardLocked() (777/
-	// 999/888/555) and setDialRule() (777/999/440/555). Those guard CONFIG
-	// surfaces (a call-forward target, a dial-plan pattern) that must keep
-	// working for a future dial-plan rule routing 911 to a trunk — the whole
-	// point of the companion 911-handling issue — so they omit 911/933 on
-	// purpose and must go on doing so. Retrofitting them onto this helper is
-	// out of scope for #163 (tracked as optional, not required, by the issue).
+	// HISTORY, because this comment used to say the opposite and a reader needs
+	// to know it changed deliberately. Under #163 this was the REGISTER-identity
+	// set only, and PbxFeatureConfig.cpp's three config-surface validators kept
+	// their own narrower literal lists, omitting 911/933 on purpose so that a
+	// future dial-plan rule could route 911 to a trunk.
+	//
+	// #166 removed that reason. 911 and 933 are now intercepted in onInvite()
+	// ahead of ring groups and the dial plan (see EmergencyCall.hpp), so a
+	// dial-plan rule for them cannot fire and is not merely redundant but
+	// actively dangerous: a "9*" outside-line rule with stripDigits=1 matched a
+	// dialed 911 and rewrote it to 11 (issue #240). All three validators
+	// therefore call THIS helper now, and the three lists that had drifted
+	// apart (forwards and ring groups omitted 440; setDialRule omitted 888;
+	// none covered 911/933) are one list again.
 	inline bool isReservedExtension(std::string_view ext)
 	{
 		return ext == "777" || ext == "999" || ext == "888" || ext == "555" ||

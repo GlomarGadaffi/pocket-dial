@@ -219,6 +219,14 @@ public:
 	// member list deletes the group. Thread-safe and NVS-persisted. The getter
 	// returns {groupExt, "ringall"|"hunt", "m1,m2,..."} for the dashboard.
 	void setRingGroup(const std::string& groupExt, const std::string& members, const std::string& mode);
+
+	// Issue #166 (Kari's Law): the extensions alerted when 911 is dialed, plus
+	// the callback number and site string the alert carries. `exts` uses the
+	// same delimited member syntax as ring groups and page zones.
+	void setE911Config(const std::string& exts, const std::string& callback,
+		const std::string& location);
+	// {notifyExts, callback, location} as configured.
+	std::tuple<std::string, std::string, std::string> getE911Config();
 	std::vector<std::tuple<std::string, std::string, std::string>> getRingGroups();
 
 	// Parked calls snapshot for the TUI: {orbit, parkedExt, parker, secondsParked}.
@@ -477,6 +485,10 @@ private:
 	// Register beep (signaling-only intercom tone): the outbound UAC dialog FSM
 	// lives in RegisterBeeper (see RegisterBeeper.hpp). Guarded by _mutex.
 	RegisterBeeper _beeper{*this};
+	// Issue #166 part 2: Kari's Law on-site notification. A sibling machine
+	// reaching the engine only through PbxEnv, so it adds one member and one
+	// call rather than more surface to this file.
+	EmergencyNotifier _e911Notifier{*this};
 
 	// ── PbxEnv: shared-infrastructure surface for the extracted machines ───────
 	// RequestsHandler is the PbxEnv implementation each decomposed state machine
@@ -853,13 +865,23 @@ private:
 	// when the user dialed a trunk-access digit first, and owns the failure
 	// response itself -- a 503, never a 404, per RFC 4497 8.3.1. Caller holds
 	// _mutex.
+	// Issue #166 part 2: fire the Kari's Law notification. Called ONLY after
+	// the emergency call leg (or its 503) has already been enqueued, so a
+	// notification can never delay or displace the call. Caller holds _mutex.
+	void notifyEmergency(const pbx::EmergencyDial& emergency,
+		const std::string& fromExt, const std::string& dialed, bool routed);
+
 	void routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller,
 		const pbx::EmergencyDial& emergency, const std::string& dialed);
 
+	// `placedOut` (optional, Issue #166): true only when a call was actually
+	// dispatched. The bool RETURN means "took ownership of the INVITE" and is
+	// true for every refuse() path too, so a caller that must report what really
+	// happened -- the emergency notification does -- has to ask for this.
 	bool originateAnchorCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
-		bool respondIfDisconnected);
+		bool respondIfDisconnected, bool* placedOut = nullptr);
 
 	// First anchor media bridge with no active call, or nullptr if every slot is
 	// busy (onAnchorInvite() then answers 503 Service Unavailable, mirroring the

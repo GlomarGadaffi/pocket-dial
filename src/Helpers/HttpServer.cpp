@@ -733,6 +733,22 @@ void HttpServer::handleClient(int clientSock)
 			sendApiTelephonyConfigDelete(clientSock, telSlotIdx);
 		}
 	}
+	else if (req.method == "GET" && req.path == "/api/e911-config")
+	{
+		// Read gate matches the other config surfaces: nothing here is secret.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiE911Get(clientSock);
+		}
+	}
+	else if (req.method == "PUT" && req.path == "/api/e911-config")
+	{
+		// Sysop to WRITE: this decides who finds out when somebody dials 911.
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiE911Set(clientSock, req.body);
+		}
+	}
 	else if (req.method == "GET" && req.path == "/api/did-mapping")
 	{
 		// Same read gate as /api/telephony-config above.
@@ -2251,6 +2267,63 @@ static std::string didMappingJson(const DidMapping::Entry& e)
 {
 	return "{\"did\":\"" + jsonEscape(e.did) + "\",\"extension\":\"" +
 	       jsonEscape(e.extension) + "\"}";
+}
+
+void HttpServer::sendApiE911Get(int sock)
+{
+	std::string exts, callback, location;
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		std::tie(exts, callback, location) = handler->getE911Config();
+	}
+
+	std::ostringstream json;
+	json << "{\"notifyExts\":\"" << jsonEscape(exts) << "\","
+	     << "\"callback\":\"" << jsonEscape(callback) << "\","
+	     << "\"location\":\"" << jsonEscape(location) << "\","
+	     << "\"maxNotifyExts\":" << pbx::kMaxE911NotifyExts << "}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiE911Set(int sock, const std::string& body)
+{
+	// Issue #166 (Kari's Law). Params: notifyExts (space/comma delimited),
+	// callback, location. All three are optional -- an empty notifyExts is the
+	// legitimate way to turn SIP notification off, and the syslog record at
+	// Alert severity is emitted regardless of what is configured here.
+	//
+	// Only the charset gate lives here. PbxFeatureConfig::setE911Config() is
+	// deliberately TOTAL -- it drops an unusable field and keeps the rest rather
+	// than refusing the whole write -- because a rejected config would leave the
+	// previous notify list silently in place while the operator believed they
+	// had changed who gets told when somebody dials 911.
+	const std::string exts     = getFormParam(body, "notifyExts");
+	const std::string callback = getFormParam(body, "callback");
+	const std::string location = getFormParam(body, "location");
+
+	for (const std::string& e : pbx::splitMembers(exts))
+	{
+		if (!pbx::isDialTokenSafe(e))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"notifyExts may contain only extensions, separated by spaces or commas\"}");
+			return;
+		}
+	}
+	if (!callback.empty() && !pbx::isDialTokenSafe(callback))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"callback may contain only digits, letters, '#' and '*'\"}");
+		return;
+	}
+
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		handler->setE911Config(exts, callback, location);
+	}
+	// Echo the stored result, so a caller sees what was actually kept after
+	// truncation to kMaxE911NotifyExts and any dropped field.
+	sendApiE911Get(sock);
 }
 
 void HttpServer::sendApiDidMappingList(int sock)
