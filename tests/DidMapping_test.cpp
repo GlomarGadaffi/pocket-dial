@@ -70,6 +70,26 @@ TEST_F(DidMappingTest, UpdateInPlaceDoesNotConsumeAnotherSlot)
 	EXPECT_EQ(_map.extensionForDid("+15551234567"), "1002");
 }
 
+// Issue #243: a re-set with a DIFFERENT RENDERING of an already-stored DID
+// must adopt that new rendering, not just the extension -- otherwise list()/
+// the dashboard keep showing whatever spelling was typed first, with no way
+// to correct it short of delete-and-re-add.
+TEST_F(DidMappingTest, UpdateInPlaceAdoptsTheNewRendering)
+{
+	ASSERT_EQ(_map.setMapping("(202) 555-0123", "1001"), "");
+	ASSERT_EQ(_map.setMapping("+12025550123", "1001"), "");  // same line, re-typed
+	EXPECT_EQ(_map.size(), 1u);
+
+	const auto list = _map.list();
+	ASSERT_EQ(list.size(), 1u);
+	EXPECT_EQ(list[0].did, "+12025550123");  // latest write wins, not the first
+	EXPECT_EQ(list[0].extension, "1001");
+
+	// Still findable/updatable under either rendering afterward.
+	EXPECT_EQ(_map.extensionForDid("(202) 555-0123"), "1001");
+	EXPECT_EQ(_map.extensionForDid("+12025550123"), "1001");
+}
+
 TEST_F(DidMappingTest, RemoveIsIdempotentAndCompacts)
 {
 	ASSERT_EQ(_map.setMapping("did-a", "100"), "");

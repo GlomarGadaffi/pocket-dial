@@ -114,15 +114,27 @@ std::string e164Normalize(std::string_view raw);
 //
 // FALSE POSITIVE, accepted knowingly: "+445551234567" and "5551234567" satisfy
 // both bounds and compare equal, though one is a UK number and the other is a
-// bare national string that, in this deployment, means a US line. Reaching that
-// case requires an operator to configure a bare national DID that is a digit-
-// exact tail of a foreign number their carrier also delivers, inside a table of
-// at most POCKETDIAL_MAX_DID_MAPPINGS entries. The alternative — refusing the
-// relaxation entirely — fails the common case (an operator typing the 10-digit
-// DID they know) every single time, in exchange for a collision that requires a
-// deliberate coincidence. If a deployment ever needs the strict behaviour, the
-// fix is a configured default country code that makes the comparison exact,
-// not a tighter heuristic here.
+// bare national string that, in this deployment, means a US line.
+//
+// This function itself is pairwise — it only ever judges the two numbers
+// handed to it — but the risk it accepts is NOT pairwise: DidMapping::
+// findIndex() calls it once per STORED ROW to find which entry an inbound
+// DID matches, so one inbound call gets as many chances to collide as there
+// are rows in the table, not one. What actually bounds that exposure is
+// POCKETDIAL_MAX_DID_MAPPINGS (see PoolConfig.hpp) — nothing in the
+// comparison above shrinks as the table grows. A deployment that raised the
+// cap substantially would be raising this risk with it, in direct
+// proportion.
+//
+// Reaching the false positive at all still requires an operator to configure
+// a bare national DID that is a digit-exact tail of a foreign number their
+// carrier also delivers — and each row is a number one operator deliberately
+// typed for one carrier, not an arbitrary string. The alternative — refusing
+// the relaxation entirely — fails the common case (an operator typing the
+// 10-digit DID they know) every single time, in exchange for a collision
+// that requires a deliberate coincidence. If a deployment ever needs the
+// strict behaviour, the fix is a configured default country code that makes
+// the comparison exact, not a tighter heuristic here.
 bool e164SameNumber(std::string_view a, std::string_view b);
 
 } // namespace pbx
