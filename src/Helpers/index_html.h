@@ -398,13 +398,13 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
       </div>
       <div class="row">
         <button class="btn primary" onclick="saveDialRule()">Save Rule</button>
-        <span class="note">Dialing <b>9</b> then <b>3057673260</b> with strip 1 / prepend 1 sends <b>13057673260</b>.</span>
+        <span class="note">Dialing <b>9</b> then <b>2025550123</b> with strip 1 / prepend 1 sends <b>12025550123</b>.</span>
       </div>
       <div class="msg" id="dp-msg"></div>
       <p class="note">
         <b>Prepend nothing:</b> leave Prepend blank on a trunk rule to send the dialed digits with only
-        the strip applied &mdash; dialing <b>9</b> then <b>3057673260</b> with strip 1 and no prepend
-        sends <b>3057673260</b>. <b>Deleting:</b> use the Delete button on a rule above.
+        the strip applied &mdash; dialing <b>9</b> then <b>2025550123</b> with strip 1 and no prepend
+        sends <b>2025550123</b>. <b>Deleting:</b> use the Delete button on a rule above.
       </p>
     </div>
   </div>

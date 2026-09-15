@@ -22,7 +22,7 @@
 //            outbound call through RequestsHandler::originateAnchorCall() (the
 //            same call-origination core the 555 anchor extension uses). E.g.
 //            pattern "9XXXXXXXXXX", stripDigits 1, target "1" turns a dial of
-//            "93057673260" into "13057673260".
+//            "92025550123" into "12025550123".
 //
 // (Issue #68's directed pickup is deliberately absent: it is not on main. Adding
 // it later is one enum value, one parse/name string, and one dispatch arm.)

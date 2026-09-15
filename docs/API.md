@@ -1769,8 +1769,8 @@ this device. Examples: `601` (exact),
 > at dial time rather than falling through, so a stale rule fails visibly instead of
 > silently ringing whichever real extension happens to share the dialed digits.
 
-`trunk` example: dialing `9` + 11 digits, stripping the `9` and prepending `1`
-so `93057673260` reaches the configured trunk as `13057673260`:
+**`trunk` example**: dialing `9` + 11 digits, stripping the `9` and prepending `1`
+so `92025550123` reaches the configured trunk as `12025550123`:
 ```
 pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=1
 ```

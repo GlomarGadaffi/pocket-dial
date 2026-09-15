@@ -315,11 +315,11 @@ TEST(DialPlanPattern, ActionNamesRoundTrip)
 
 TEST(DialPlanPattern, TrunkTransformStripsAndPrepends)
 {
-	// The user's own worked example: dial 9 + 11 digits, strip the leading 9,
-	// prepend "1" -> 93057673260 becomes 13057673260 (Issue #165).
+	// A worked trunk-transform example: dial 9 + 11 digits, strip the leading 9,
+	// prepend "1" -> 92025550123 becomes 12025550123 (Issue #165).
 	std::string out;
-	ASSERT_TRUE(pbx::applyTrunkTransform("93057673260", 1, "1", out));
-	EXPECT_EQ(out, "13057673260");
+	ASSERT_TRUE(pbx::applyTrunkTransform("92025550123", 1, "1", out));
+	EXPECT_EQ(out, "12025550123");
 
 	// Strip 0 is just "prepend".
 	ASSERT_TRUE(pbx::applyTrunkTransform("5551234", 0, "9", out));
@@ -570,8 +570,8 @@ TEST(DialPlanEdit, ATrunkRuleMayPrependNothingAndIsNotADelete)
 
 	// It must actually route: 9 + 10 digits, strip 1, prepend nothing.
 	std::string out;
-	ASSERT_TRUE(pbx::applyTrunkTransform("93057673260", 1, "", out));
-	EXPECT_EQ(out, "3057673260");
+	ASSERT_TRUE(pbx::applyTrunkTransform("92025550123", 1, "", out));
+	EXPECT_EQ(out, "2025550123");
 
 	// An empty action AND an empty target still deletes.
 	handler.setDialRule("9XXXXXXXXXX", "", "");
@@ -851,12 +851,12 @@ TEST(DialPlanRouting, TrunkActionOriginatesAnAnchorCallWithTheTransformedNumber)
 			wire.sent.emplace_back(addr, std::move(msg));
 		});
 	registerThreePhones(handler);
-	// The user's own worked example: dial 9 + 11 digits, strip the leading 9,
-	// prepend "1" -> 93057673260 becomes 13057673260.
+	// A worked trunk-transform example: dial 9 + 11 digits, strip the leading 9,
+	// prepend "1" -> 92025550123 becomes 12025550123.
 	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
 
 	wire.clear();
-	handler.handle(makeInvite("500", "93057673260", "192.168.9.50", "plan-trunk"));
+	handler.handle(makeInvite("500", "92025550123", "192.168.9.50", "plan-trunk"));
 
 	EXPECT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
 	EXPECT_TRUE(wire.sawContaining("a=sendrecv"))
@@ -864,7 +864,7 @@ TEST(DialPlanRouting, TrunkActionOriginatesAnAnchorCallWithTheTransformedNumber)
 	// The remote target is the DIALED digits, not the literal 555 feature code —
 	// buildOkWithSdp() derives Contact from data->getToNumber(), which for a
 	// Trunk rule is whatever the caller actually dialed.
-	EXPECT_TRUE(wire.sawContaining("Contact: <sip:93057673260"))
+	EXPECT_TRUE(wire.sawContaining("Contact: <sip:92025550123"))
 		<< "the answer's Contact must name the dialed digits for a trunk call";
 
 	ASSERT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: plan-trunk"), nullptr)
@@ -875,7 +875,7 @@ TEST(DialPlanRouting, TrunkActionOriginatesAnAnchorCallWithTheTransformedNumber)
 	// the anchor client's makeCall().
 	auto* loopback = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
 	ASSERT_NE(loopback, nullptr) << "host tests boot the Loopback anchor provider";
-	EXPECT_EQ(loopback->lastMakeCallDestination(), "13057673260");
+	EXPECT_EQ(loopback->lastMakeCallDestination(), "12025550123");
 }
 
 TEST(DialPlanRouting, TrunkActionByeTearsDownTheBridgeAndTheSession)
@@ -895,13 +895,13 @@ TEST(DialPlanRouting, TrunkActionByeTearsDownTheBridgeAndTheSession)
 	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
 
 	wire.clear();
-	handler.handle(makeInvite("500", "93057673260", "192.168.9.50", "plan-trunk-bye"));
+	handler.handle(makeInvite("500", "92025550123", "192.168.9.50", "plan-trunk-bye"));
 	ASSERT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
 	ASSERT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: plan-trunk-bye"), nullptr);
 	ASSERT_TRUE(handler.getSession("Call-ID: plan-trunk-bye").has_value());
 
 	wire.clear();
-	handler.handle(makeBye("500", "93057673260", "192.168.9.50", "plan-trunk-bye"));
+	handler.handle(makeBye("500", "92025550123", "192.168.9.50", "plan-trunk-bye"));
 
 	EXPECT_TRUE(wire.sawContaining("SIP/2.0 200 OK")) << "the BYE must be answered";
 	EXPECT_FALSE(handler.getSession("Call-ID: plan-trunk-bye").has_value());
@@ -923,12 +923,12 @@ TEST(DialPlanRouting, TrunkActionCancelTearsDownTheBridgeAndTheSession)
 	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
 
 	wire.clear();
-	handler.handle(makeInvite("500", "93057673260", "192.168.9.50", "plan-trunk-cancel"));
+	handler.handle(makeInvite("500", "92025550123", "192.168.9.50", "plan-trunk-cancel"));
 	ASSERT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
 	ASSERT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: plan-trunk-cancel"), nullptr);
 
 	wire.clear();
-	handler.handle(makeCancel("500", "93057673260", "192.168.9.50", "plan-trunk-cancel"));
+	handler.handle(makeCancel("500", "92025550123", "192.168.9.50", "plan-trunk-cancel"));
 
 	EXPECT_TRUE(wire.sawContaining("SIP/2.0 200 OK")) << "the CANCEL must get its own 200 OK";
 	EXPECT_FALSE(handler.getSession("Call-ID: plan-trunk-cancel").has_value());
@@ -952,11 +952,11 @@ TEST(DialPlanRouting, TrunkActionAckIsAbsorbedNotRelayedOr404d)
 	handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
 
 	wire.clear();
-	handler.handle(makeInvite("500", "93057673260", "192.168.9.50", "plan-trunk-ack"));
+	handler.handle(makeInvite("500", "92025550123", "192.168.9.50", "plan-trunk-ack"));
 	ASSERT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
 
 	wire.clear();
-	handler.handle(makeAck("500", "93057673260", "192.168.9.50", "plan-trunk-ack"));
+	handler.handle(makeAck("500", "92025550123", "192.168.9.50", "plan-trunk-ack"));
 
 	EXPECT_TRUE(wire.sent.empty())
 		<< "the server is the UAS on a trunk leg — no relay, no 404, for the ACK";
