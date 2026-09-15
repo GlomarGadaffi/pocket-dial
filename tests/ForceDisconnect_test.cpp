@@ -292,11 +292,10 @@ TEST(ForceDisconnect, EchoLegFreesTheServerTransactionAndNeverByesTheStandInPeer
 	// itself, so #226 tracks an INVITE server transaction for it until the ACK
 	// (never sent here). The session's "dest" is a stand-in SipClient carrying
 	// 100's OWN address, so a "peer" BYE would reach 100 with the tags reversed
-	// — none may go out. (The 777/888/555 answer paths do not record their
-	// generated To-tag on the Session, so no valid BYE toward 100 can be built
-	// from here either; there is no far-end phone left holding the call on
-	// these legs, which is the failure #228 is about. Recording the tag so the
-	// killed handset also hears a BYE is a separate change.)
+	// and must never go out. 100 itself ("src") is the killed handset, though,
+	// and since #232 the echo answer path records its own dialog headers on
+	// the Session, so exactly one correctly-addressed BYE (from the src leg,
+	// not the dest stand-in) reaches this same address now.
 	Rig rig;
 	const std::string callId = "kill-228-echo";
 	{
@@ -318,12 +317,45 @@ TEST(ForceDisconnect, EchoLegFreesTheServerTransactionAndNeverByesTheStandInPeer
 	ASSERT_GT(rig.handler.getServerTransactionCount(), 0u)
 		<< "precondition: the un-ACKed PBX-authored 200 OK must hold a server slot";
 
+	// The echo leg's own 200 OK carries the To-tag #232 now stores on the
+	// Session — capture it here (it is random, minted by IDGen) so the BYE
+	// below can be checked against the tag this call actually used rather
+	// than a value the test would otherwise have to guess.
+	std::string echoToTag;
+	for (const auto& [addr, msg] : rig.sent)
+	{
+		if (!msg) continue;
+		std::string raw = msg->toString();
+		if (raw.rfind("SIP/2.0 200 OK", 0) == 0 && headerValue(raw, "Call-ID") == callId)
+		{
+			echoToTag = headerValue(raw, "To");
+			break;
+		}
+	}
+	ASSERT_NE(echoToTag.find("tag="), std::string::npos)
+		<< "precondition: the echo leg's own 200 OK must carry a To-tag";
+
 	rig.sent.clear();
 	rig.handler.forceDisconnect("100");
 	flushAsyncOutbox(rig.handler);
 
-	EXPECT_TRUE(byesTo(rig.sent, addrFor(kCallerIp)).empty())
-		<< "no BYE may be addressed to the stand-in peer (it is the caller's own address)";
+	// Both the stand-in dest and the real src leg live at kCallerIp (the
+	// stand-in carries the caller's OWN address), so this is the one place
+	// both halves of forceDisconnect()'s per-leg BYE logic are visible at
+	// once: exactly one BYE must cross the wire, and it must be the src leg's
+	// (never the dest stand-in's, which the #72/#228 comment above forbids).
+	const auto toCaller = byesTo(rig.sent, addrFor(kCallerIp));
+	ASSERT_EQ(toCaller.size(), 1u)
+		<< "exactly one BYE to the killed handset — the stand-in dest must stay silent (#228) "
+		   "while the src leg, which #232 gave a real To-tag, now gets told";
+	EXPECT_EQ(toCaller[0].rfind("BYE sip:100@" + std::string(kCallerIp) + ":5060 SIP/2.0", 0), 0u)
+		<< toCaller[0];
+	// Server-authored BYE impersonates the echo leg itself (the PBX was the
+	// UAS on this dialog): From carries the tag #232 recorded from the leg's
+	// own 200 OK, To carries the caller's original tag from the INVITE.
+	EXPECT_NE(headerValue(toCaller[0], "From").find(echoToTag.substr(echoToTag.find("tag="))),
+		std::string::npos) << toCaller[0];
+	EXPECT_NE(headerValue(toCaller[0], "To").find("tag=ctag" + callId), std::string::npos) << toCaller[0];
 	EXPECT_EQ(rig.handler.getServerTransactionCount(), 0u)
 		<< "endCall() frees the INVITE server transaction for the Call-ID (#226)";
 	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());

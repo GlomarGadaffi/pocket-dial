@@ -418,6 +418,13 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 									_asyncOutbox.emplace_back(inviteMsg->getSource(), std::move(ok));
 									session->setState(Session::State::Connected);
 									session->setAnchorParticipantId(ev.participantId);
+									// Issue #232: toTag above is already this leg's own tag (reused
+									// from the 180 Ringing), but nothing had stored the dialog
+									// headers themselves — getDialogFrom()/getDialogTo() stayed
+									// empty, so forceDisconnect()'s #72 guard could never BYE this
+									// handset. Same fix as the 777/888 answer sites.
+									session->setDialogHeaders(std::string(inviteMsg->getFrom()),
+										std::string(inviteMsg->getTo()) + ";tag=" + toTag);
 									// Re-arm as an ACK deadline: if the handset never ACKs this
 									// 200 (bridged late, past its own timeout, phone already
 									// gave up), tick() reaps the call and drops the anchor leg +
@@ -1666,6 +1673,17 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		std::string activeIp = _localIp;
 		ringing->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		std::string toTag = IDGen::GenerateID(9);
+		// Issue #232: this leg is server-terminated (the PBX is the UAS, answering
+		// itself — there is no far-end phone whose 200 OK the ordinary onOk() path
+		// at :4454 could capture headers from), so this is the only place this
+		// leg's own dialog identity is ever known. Record it on the Session or
+		// getDialogFrom()/getDialogTo() stay empty forever and the #72 guard in
+		// forceDisconnect()/sweepSessionTimers() can never build a BYE toward this
+		// handset if the call is torn down from the server side. Same convention
+		// ParkOrbit/CallPickup follow at their own answer time.
+		newSession->setLocalTag(toTag);
+		newSession->setDialogHeaders(std::string(data->getFrom()),
+			std::string(data->getTo()) + ";tag=" + toTag);
 		ringing->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		ringing->setContact(buildContact("777"));
 		_outbox.emplace_back(data->getSource(), std::move(ringing));
@@ -2277,6 +2295,13 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	// can't overwrite this call's destination identity.
 	auto dummyConf = allocateVirtualPeer(confExt, data->getSource());
 	newSession->setDest(dummyConf);
+	// Issue #232: same reasoning as the 777 echo leg (RequestsHandler.cpp,
+	// onInvite's "777" branch) — record this leg's own To-tag now, since
+	// nothing else ever will, or forceDisconnect()'s #72 guard can never BYE
+	// this handset later.
+	newSession->setLocalTag(toTag);
+	newSession->setDialogHeaders(std::string(data->getFrom()),
+		std::string(data->getTo()) + ";tag=" + toTag);
 	_sessions.emplace(callID, newSession);
 	newSession->setState(Session::State::Connected);
 
