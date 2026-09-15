@@ -1,4 +1,4 @@
-# `docs/firmware/` — same-origin firmware for the browser flasher
+# `docs/firmware/` (same-origin firmware for the browser flasher)
 
 Generated. **Do not hand-edit**; `.github/workflows/release.yml` writes this
 directory on every `v*` tag via [`tools/publish_pages_firmware.py`](../../tools/publish_pages_firmware.py).
@@ -15,8 +15,8 @@ healthy right up until someone pressed **Flash** (#138).
 Serving the images from `docs/` puts them on the same origin as the flasher, so
 CORS never applies.
 
-The GitHub Release stays the source of truth and keeps every asset — host
-binary, `partitions.csv`, `SHA256SUMS`. Pages carries only what the page
+The GitHub Release stays the source of truth and keeps every asset (host
+binary, `partitions.csv`, `SHA256SUMS`). Pages carries only what the page
 actually downloads: the `.bin` images, `manifest.json`, and the
 `flasher_args-*.json` files.
 
@@ -36,7 +36,7 @@ docs/firmware/
 ```
 
 `index.json` carries an explicit `files` array because GitHub Pages serves no
-directory listing — it is what lets the page rebuild the asset map it used to
+directory listing; it is what lets the page rebuild the asset map it used to
 get from the API, without a second round trip.
 
 An empty `releases` array is the honest state before the first tag lands on this

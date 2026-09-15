@@ -1,4 +1,4 @@
-# pocket-dial — Conference Mix Bus
+# pocket-dial: Conference Mix Bus
 
 **The summing junction: design and implementation for N-way audio on the ESP32-S3.**
 
@@ -8,23 +8,21 @@ into an N-way conference bridge: the **mix**. It carries the design, a compiled-
 scalar reference, the concurrency model, and the ESP32-S3 PIE vector kernels (with honest
 notes on which instructions are confirmed versus toolchain-verify).
 
----
-
 ## 0. Context and goals
 
 ### What existed when this was written
 
 > [!IMPORTANT]
 > **§0 is a pre-implementation snapshot and its present tense is now wrong.** The mix bus
-> it proposes **shipped** as `MixBus` + `ConferenceRoom` on extension `888` (issue #75) —
+> it proposes **shipped** as `MixBus` + `ConferenceRoom` on extension `888` (issue #75),
 > see §7, which is the current-state section. Read §0 as history. Two of its statements
 > would actively mislead if taken as current: the board *is* in the media path for `440`,
 > `555`, `888`, an outbound trunk call, and a park orbit with music on hold loaded; and
-> the "retire the special-case 1:1 logic" goal below **was not met** — ordinary calls are
+> the "retire the special-case 1:1 logic" goal below **was not met**: ordinary calls are
 > still peer-to-peer and never touch `MixBus`, and `MediaBridge` in BUS mode still holds
 > exactly one port with `feedRx()` returning `false` (`MediaBridge.cpp:179-184`).
 
-pocket-dial routes phone↔phone calls as **peer-to-peer RTP** — the board is not in the
+pocket-dial routes phone↔phone calls as **peer-to-peer RTP**; the board is not in the
 media path. `MediaBridge` only anchors media for a call routed through an `AnchorClient`
 implementation (see `src/SIP/MediaBridge.cpp`). Reading that path (`src/SIP/MediaBridge.cpp`,
 `RtpReceiver::mulawDecodeBuffer`, `RtpSender::ulawEncodeBuffer`, `AnchorClient::writeAudio(const int16_t*)`)
@@ -32,7 +30,7 @@ reveals the important fact:
 
 > **Linear int16 PCM is already the internal currency at the anchor boundary.** µ-law lives
 > only at the LAN/handset rim; the anchor (`writeAudio` / `feedRx`) speaks linear. The PCM
-> fabric is built — what's missing is the summing junction.
+> fabric is built; what's missing is the summing junction.
 
 Today each participant's audio reaches exactly one handset (`MediaBridge::feedRx` → its own
 `_playoutBuffer`). It is a **star of 1:1 anchored legs with no summing**. The `999` all-page
@@ -43,48 +41,44 @@ Add a single `MixBus` that owns the mix tick. Each call attaches a **port** (two
 rings: leg→bus and bus→leg). Every active port hears the saturated sum of all *other* ports.
 `MediaBridge` becomes a thin transport endcap; an ordinary 1:1 call falls out as the **N=2 case**,
 so the mixer subsumes the point-to-point path and the special-case 1:1 logic can be retired.
-*(This last clause did not happen — see the note at the top of §0. Ordinary calls stayed
+*(This last clause did not happen, see the note at the top of §0. Ordinary calls stayed
 peer-to-peer, which is the property the rest of the project is built around, and the anchor
 leg is still outside the bus; §7's own caveat says so.)*
 
 ### Non-goals
 Transcoding (still G.711 at the rim, linear within), and per-codec edges beyond what
 `MediaBridge` already does. Wideband (16 kHz) and Opus legs drop onto the same bus as linear
-ports — the bus does not care which codec produced a frame.
-
----
+ports; the bus does not care which codec produced a frame.
 
 ## 1. The summing junction (the math)
 
-An **N−1 mix**: each leg hears everyone *but itself*. The minus-self is not optional — loop a
+An N−1 mix: each leg hears everyone *but itself*. The minus-self is not optional; loop a
 talker's own audio back and you have built a digital echo chamber with one-frame delay.
 
 Two ways to compute it:
 
 | Formulation | Cost | Where it fits |
 |---|---|---|
-| **Sum-once-subtract**: `M = Σ inᵢ` once, then `outₚ = M − inₚ` | `2N` ops | Large/variable N. Needs a **wide (int32) accumulator**. |
-| **Direct per-port**: `outₚ = Σ_{q≠p} in_q` | `N(N−1)` ops | Small N (≤~6). Pure int16 saturating; **no accumulator, no minus-self**. |
+| Sum-once-subtract: `M = Σ inᵢ` once, then `outₚ = M − inₚ` | `2N` ops | Large/variable N. Needs a **wide (int32) accumulator**. |
+| Direct per-port: `outₚ = Σ_{q≠p} in_q` | `N(N−1)` ops | Small N (≤~6). Pure int16 saturating; **no accumulator, no minus-self**. |
 
 ### The one invariant you cannot violate
 **Never saturate the running mix.** Sum-once-subtract is only correct if `M` is held in int32
 and saturated *exactly once*, at the final per-port output.
 
 Worked counterexample (four legs at +30000, int16):
-- **Wrong** — clip `M` to int16 first: `M = sat16(120000) = 32767`; a leg hears
+- Wrong: clip `M` to int16 first: `M = sat16(120000) = 32767`; a leg hears
   `32767 − 30000 = 2767` → nearly silent. Broken.
-- **Right** — `M` in int32 = `120000`; leg hears `120000 − 30000 = 90000` → `sat16 = 32767`.
+- Right: `M` in int32 = `120000`; leg hears `120000 − 30000 = 90000` → `sat16 = 32767`.
   Correct.
 
 Headroom: max magnitude is `N × 32767`, which fits int32 for any sane N (overflow needs
 >65536 legs). The direct per-port formulation sidesteps this entirely because it never forms
-the all-inclusive sum — that is exactly why it is the natural fit for the confirmed S3 int16
+the all-inclusive sum, that is exactly why it is the natural fit for the confirmed S3 int16
 saturating ops (§6).
 
 > The self-test (`tests/MixBus_test.cpp`) asserts both the minus-self result and that the
 > loud port hears **32767, not 2767**. Both pass.
-
----
 
 ## 2. Topology
 
@@ -114,14 +108,12 @@ sockets and the rim companding; it just rewires its two callbacks at the bus.
   straight onto the bus with **no compand at all**.
 - The bus sees only int16 frames; the codec edge is somebody else's problem.
 
----
-
 ## 3. The mix tick is the master clock
 
-This is the actual engineering — the arithmetic is trivial; the timing is not.
+This is the actual engineering; the arithmetic is trivial, the timing is not.
 
 Every leg arrives on its own RTP/jitter clock. The **per-port input ring absorbs that jitter**,
-and a single periodic driver (one timer, or your existing sender cadence — whichever is more
+and a single periodic driver (one timer, or your existing sender cadence, whichever is more
 stable on your build) drains **exactly one frame per port in lockstep** each tick. A leg that
 is late contributes **zeros for that tick** and the tick moves on; it never blocks waiting on
 a straggler.
@@ -135,12 +127,10 @@ RTP in (jittery) ─▶ [per-port input ring] ─▶ ┘
 **Stabilising this loop and making it underrun-tolerant is ~80% of the work.** Treat the tick
 cadence as inviolable; everything else slots around it.
 
----
-
-## 4. Implementation — scalar reference (ships today)
+## 4. Implementation: scalar reference (ships today)
 
 Correct, portable, `-Wall -Wextra`-clean, and the always-on fallback. At ≤8 narrowband ports
-the mix is ~64k adds/s — a rounding error on a 240 MHz core. **Write it scalar first;
+the mix is ~64k adds/s, a rounding error on a 240 MHz core. **Write it scalar first;
 vectorise only when ports × sample-rate climbs.**
 
 Files (all in `src/SIP/`): `MixBus.hpp`, `MixBus.cpp`, `mix_kernels.h`, `mix_kernels_scalar.cpp`.
@@ -199,9 +189,7 @@ void mix_minus_self(int16_t* out, const int32_t* mix, const int16_t* self, int f
 }
 ```
 
----
-
-## 5. Concurrency — attach/detach vs the tick
+## 5. Concurrency: attach/detach vs the tick
 
 `attach`/`detach` run on SIP signaling threads; the tick runs on its own driver. The hot path
 must be lock-free and a leg leaving must never corrupt or silence the others. This is the
@@ -217,7 +205,7 @@ must be lock-free and a leg leaving must never corrupt or silence the others. Th
                        (clears rings, stores Free)
 ```
 
-**The rule:** the tick is the *sole owner of ring teardown*. Reclamation (clear rings → return
+The rule: the tick is the *sole owner of ring teardown*. Reclamation (clear rings → return
 to `Free`) happens only inside `tick()`, so no signaling thread ever frees ring state under a
 concurrent tick read. This maintains the invariant **"a `Free` slot has empty rings,"** which
 is why `attach()` need only flip the flag.
@@ -244,31 +232,29 @@ void MixBus::detach(int port) {                 // non-blocking; tick reclaims l
 
 - `attach` uses a **CAS** (`Free → Active`) so two signaling threads racing for the same slot
   resolve lock-free; the loser tries the next slot. (A coarse mutex around `attach`/`detach` is
-  an acceptable simplification — those paths are cold.)
+  an acceptable simplification; those paths are cold.)
 - `detach` only flips to `Draining` and returns. The next tick clears the rings and publishes
   `Free`. Until then `attach` won't reuse the slot.
 - `inputFrame`/`outputFrame` gate on `State::Active`; `PlayoutBuffer` is itself internally
   synchronised for the ring read/write, so the only thing the state flag arbitrates is
   *participation*, not buffer safety.
-- **Ordering:** publish-Active and publish-Free are `release`; all readers (`tick`, `inputFrame`,
+- Ordering: publish-Active and publish-Free are `release`; all readers (`tick`, `inputFrame`,
   `outputFrame`) are `acquire`. The tick snapshots `present[]` at the top, so a port flipping
   mid-tick never tears a frame.
 
 > Verified in `tests/MixBus_test.cpp`: detach a port, tick once, slot returns `Free` and
 > re-attaches at the same index.
 
----
-
 ## 6. The PIE vector kernels (drop-in when N × Fs climbs)
 
-**Discipline first:** the scalar path above is the default and is correct. These kernels are a
+Discipline first: the scalar path above is the default and is correct. These kernels are a
 *transparent swap behind the same signatures*. Do not reach for them until profiling says the
-mix loop matters — i.e. many legs, or you move the bus to 16 kHz to fold G.722 in natively.
+mix loop matters, i.e. many legs, or you move the bus to 16 kHz to fold G.722 in natively.
 
-**ISA honesty:** the ESP32-S3 PIE instruction set is thinly documented. The kernel below uses
-**only instructions confirmed real** (`ee.vld.128.ip`, `ee.vadds.s16`, `ee.vst.128.ip` — the
+ISA honesty: the ESP32-S3 PIE instruction set is thinly documented. The kernel below uses
+**only instructions confirmed real** (`ee.vld.128.ip`, `ee.vadds.s16`, `ee.vst.128.ip`; the
 `vadds.s16` pattern is in esp-dsp's `dsps_add_s16_aes3.S` and the S3 TRM extended-instruction
-chapter). The int32 path needs ops I will not assert blind — see the caveat box.
+chapter). The int32 path needs ops I will not assert blind, see the caveat box.
 
 ### 6a. Small conference (≤5-way): confirmed-ISA, no int32, no minus-self
 Pick the **direct per-port** formulation. To give port P "everyone but itself," sum P's
@@ -292,15 +278,15 @@ mix_sum4_s16:                       # out[i] = sat16(a+b+c+d); args a2=out a3..a
     retw.n
 ```
 
-- A **5-way** conference is `mix_sum4_s16(out_P, peer1, peer2, peer3, peer4, FRAME)` — done.
+- A **5-way** conference is `mix_sum4_s16(out_P, peer1, peer2, peer3, peer4, FRAME)`, done.
   Zero-frame any unused slot (one static 16-byte-aligned zero buffer).
 - For **>5-way**, chain: mix one group of four into a temp, then `vadds` the next group.
   Saturating sum is a valid mix; saturation is order-dependent at the clip boundary but
   perceptually identical (this is what most production mixers do).
-- **Alignment is a hard requirement:** `ee.vld/vst.128` ignore the low 4 address bits. Buffers
+- Alignment is a hard requirement: `ee.vld/vst.128` ignore the low 4 address bits. Buffers
   must be 16-byte aligned (`MixBus.cpp` declares the tick frames `alignas(16)`) and `frameLen`
-  a multiple of 8. FRAME=160 → 20 iterations, 320 B — both satisfied.
-- **One function per `.S` file** (the S3 gotcha — multiple PIE functions in one file misbehave).
+  a multiple of 8. FRAME=160 → 20 iterations, 320 B, both satisfied.
+- **One function per `.S` file** (the S3 gotcha: multiple PIE functions in one file misbehave).
 
 ### 6b. Large/variable N: int32 sum-once-subtract (parity with scalar)
 This matches the scalar reference bit-for-bit, but the vector body needs **int32-lane and
@@ -321,17 +307,15 @@ narrowing ops I have not personally confirmed assemble**:
 > today; crib the vector envelope from esp-dsp (`dsps_add_s16_aes3.S`, `dsps_mulc_s16_ansi.c` /
 > `_aes3.S`) when you commit to it. Gate the swap behind `POCKETDIAL_MIXBUS_PIE`.
 
-### 6c. Next honest PIE target — VAD gating
+### 6c. Next honest PIE target: VAD gating
 When you want it to *sound* like a conference (not just be correct), gate the mix to ports
 that are actually speaking. That drops the noise floor and the clip risk simultaneously, and
-the per-frame energy test is **sum-of-squares** — a clean vector MAC (`ee.vmulas.s16.accx`),
+the per-frame energy test is **sum-of-squares**, a clean vector MAC (`ee.vmulas.s16.accx`),
 which is the same kernel shape as a Goertzel/correlation detector.
-
----
 
 ## 7. Integration with `MediaBridge` (the diff)
 
-**Shipped** (Issue #75). `MediaBridge` gained a BUS mode — `init()` takes an optional `MixBus*`,
+**Shipped** (Issue #75). `MediaBridge` gained a BUS mode: `init()` takes an optional `MixBus*`,
 and a non-null bus swaps both media callbacks at their far end. `ConferenceRoom`
 (`src/SIP/ConferenceRoom.*`) owns one bus, up to `POCKETDIAL_CONF_LEGS` legs of
 `{RtpReceiver, RtpSender, MediaBridge}`, and the single 20 ms tick driver; `RequestsHandler`
@@ -344,22 +328,20 @@ joins the caller. The diff as it landed:
 | TX cb: `_playoutBuffer.read` → `ulawEncodeBuffer` | TX cb: `bus.outputFrame(port, pcm, n)` → `ulawEncodeBuffer` |
 | `startBridge`: wire callbacks | `startBridge`: `port = bus.attach();` then wire |
 | `stopBridge`: stop sockets | `stopBridge`: `bus.detach(port);` then stop sockets |
-| `feedRx` writes the single playout buffer | BUS mode refuses it — see the caveat below |
+| `feedRx` writes the single playout buffer | BUS mode refuses it, see the caveat below |
 | one mutex-guarded single bridge | N ports, one shared bus, one tick driver |
 
 The single tick driver replaces nothing in `MediaBridge`: it is one new periodic task inside
 `ConferenceRoom` (Core 0, `RtpSender`'s media priority, on device; a `std::thread` off it).
-Deliberately **not** hung off the existing sender cadence — there are N senders and one bus, so
+Deliberately **not** hung off the existing sender cadence: there are N senders and one bus, so
 that would be N clocks racing to drain the same rings. `ConferenceRoom::tickOnce()` lets the host
 suite step the clock instead of running the driver.
 
-> **Caveat — the anchor leg is still outside the bus.** The row above is the one line of this
+> **Caveat: the anchor leg is still outside the bus.** The row above is the one line of this
 > sketch that did not ship as drawn. A bussed `MediaBridge` holds exactly one port, its handset
 > leg; `feedRx()` returns `false` in BUS mode rather than writing into a `_playoutBuffer` the
 > sender no longer reads. Giving the anchor its own port (and a pump for its return direction) is
-> follow-up work. Nothing in the local conference needs it — handset legs alone are enough ports.
-
----
+> follow-up work. Nothing in the local conference needs it; handset legs alone are enough ports.
 
 ## 8. Traps (pre-flight checklist)
 
@@ -372,16 +354,14 @@ suite step the clock instead of running the driver.
 4. **Alignment.** 16-byte-align every frame buffer; `frameLen % 8 == 0`. Misaligned `ee.vld.128`
    reads the wrong window silently. (§6.)
 5. **Frame cadence.** Bus `FRAME` must equal the RTP ptime. Mixed ptimes (G.723.1 = 30 ms,
-   G.729 = 10 ms, Opus 2.5–60 ms) need per-port repacketization before the bus — a
+   G.729 = 10 ms, Opus 2.5–60 ms) need per-port repacketization before the bus, a
    correctness/jitter problem, not a compute one.
 6. **Headroom vs. feel.** Naive clip is fine in practice (one or two talkers at once). Add VAD
    gating when you want conference-grade quiet. (§6c.)
 7. **Vectorise last.** Scalar ships and is a rounding error at ≤8 narrowband legs. The PIE
    kernels are the easy 5%; the bus topology and master clock are the 95%.
 
----
-
-## Appendix — files
+## Appendix: files
 
 ```
 docs/CONFERENCE_MIXER.md          this document

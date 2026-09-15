@@ -8,7 +8,7 @@ layout, and the security posture.
 > TL;DR: dual-OTA (`ota_0` / `ota_1`) on the 16 MB flash, an admin-gated
 > streaming upload endpoint (`POST /api/ota/upload`), explicit reboot
 > (`POST /api/ota/reboot`), and mark-valid-on-healthy-boot rollback. Images are
-> **not signed yet** — OTA is gated behind an admin **username + password**
+> **not signed yet**: OTA is gated behind an admin **username + password**
 > session plus a per-session CSRF token, and should be restricted to the local
 > link until Secure Boot v2 lands (see [THREAT_MODEL.md](THREAT_MODEL.md)).
 
@@ -20,7 +20,7 @@ layout, and the security posture.
 >   where there is no flash. (CI does *compile* the firmware in an ESP-IDF matrix
 >   job, but it never runs those images.)
 >   `tests/http/test_api.sh` TC-OTA-03 asserts the upload returns
->   **`501`** — it never writes a byte to a partition — and TC-OTA-06/07 assert
+>   **`501`** (it never writes a byte to a partition), and TC-OTA-06/07 assert
 >   that the reboot endpoint is a **deliberate no-op** whose only check is that
 >   the host process is *still alive* afterwards. So CI proves the routing, the
 >   auth gate and the streaming bypass of the 16 KB body cap. It proves nothing
@@ -39,8 +39,6 @@ layout, and the security posture.
 > reboot → healthy boot → `markValid()` in the log, see §4.1) before touching a
 > second. The rollback described in §4 is the designed behaviour of
 > `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, not an observed one on this project.
-
----
 
 ## 1. Partition layout
 
@@ -72,10 +70,10 @@ Arithmetic / alignment checks:
 - App partitions **must be 64 KB-aligned** on the ESP32-S3 (MMU flash-mapping
   granularity). `0x20000` and `0x620000` are both multiples of `0x10000`. ✅
 - `ota_1` ends at `0x620000 + 0x600000 = 0xC20000`, well within the 16 MB
-  (`0x1000000`) device — about **3.875 MB of flash left free** at the top for
+  (`0x1000000`) device, about **3.875 MB of flash left free** at the top for
   future partitions (e.g. a SPIFFS/LittleFS data partition or a coredump
   partition). ✅
-- Each 6 MB slot is ~4× the current ~1.5 MB display image — generous headroom
+- Each 6 MB slot is ~4× the current ~1.5 MB display image, generous headroom
   for UI growth without re-partitioning (which would force another full
   reflash).
 
@@ -96,12 +94,10 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 This is the **single canonical symbol** for the anti-rollback / app-validation
 workflow in ESP-IDF v5.x. (There is no separate `CONFIG_APP_ROLLBACK_ENABLE` in
-mainline IDF — that name does not exist as a Kconfig option, so it is
+mainline IDF; that name does not exist as a Kconfig option, so it is
 intentionally not added.) With this enabled, a freshly activated OTA image boots
 in the `PENDING_VERIFY` state and is **rolled back to the previous slot on the
 next reset unless the running app confirms a healthy boot** (see §4).
-
----
 
 ## 2. Building
 
@@ -120,10 +116,8 @@ idf.py -D SIP_TRANSPORT=display build
 ```
 
 The desktop/host build (`cmake -B build -S . && cmake --build build`) compiles
-the same `OtaUpdater` and HTTP endpoints, but with **stubs** — there is no flash
+the same `OtaUpdater` and HTTP endpoints, but with stubs: there is no flash
 to write, so the host cannot perform a real update (see §3.4).
-
----
 
 ## 3. Pushing an update
 
@@ -136,13 +130,13 @@ to write, so the host cannot perform a real update (see §3.4).
 | `POST /api/ota/reboot`  | full admin gate (session + CSRF)       | Reboots into the staged image (device) / no-op simulation (host). |
 
 The two mutating endpoints use the **exact same gate** as the existing mutating
-endpoints (`/api/kill`, `/api/wifi/*`, `/api/factory-reset`) — one shared
+endpoints (`/api/kill`, `/api/wifi/*`, `/api/factory-reset`), one shared
 `HttpServer::requireAdmin(sock, req, /*needCsrf=*/true)`, which applies **four**
 checks in this order:
 
 1. **Same-origin.** A request carrying an `Origin` header must match an allowed
    local host; a request with **no** `Origin` at all (curl, native tooling, the
-   smoke suite) is admitted by design — the `Origin` check is a browser-only
+   smoke suite) is admitted by design: the `Origin` check is a browser-only
    control and is not what protects the endpoint. Failure ⇒
    `403 {"error":"cross-origin request rejected"}`.
 2. **Session.** A valid `pd_session` cookie is required **unconditionally**.
@@ -162,16 +156,16 @@ checks in this order:
 > default login credential precisely so the session check can be unconditional
 > from the very first boot, and check 4 then refuses OTA outright until that
 > default is replaced. A fresh board cannot be flashed over the air until
-> *someone* has logged in as `admin`/`admin` and committed a real credential —
+> *someone* has logged in as `admin`/`admin` and committed a real credential,
 > and whoever does that first owns the device. The fresh-device window did not
 > vanish; it changed from "ungated" to "first-come-first-owns" (see §6).
 >
 > Note the ordering: **CSRF (check 3) runs before the setup check (check 4)**. On
 > a factory-fresh device a script that logs in but sends no `X-CSRF` header gets
-> the CSRF `403`, *not* `setup_required` — the message names the first failure,
+> the CSRF `403`, *not* `setup_required`: the message names the first failure,
 > not the only problem.
 
-`/api/ota/upload` is **not** subject to the 16 KB request body cap — it is
+`/api/ota/upload` is **not** subject to the 16 KB request body cap; it is
 intercepted before the buffered path and streamed (a firmware image is >1.5 MB).
 
 `GET /api/ota/status` is genuinely ungated (no origin check, no session): it
@@ -179,9 +173,9 @@ reports only partition labels and the pending-verify flag.
 
 ### 3.2 Curl walk-through
 
-**Prerequisite:** the device must already have a real admin credential. If it is
+Prerequisite: the device must already have a real admin credential. If it is
 still on the factory default `admin`/`admin`, every step after login returns
-`403 {"error":"setup_required"}` — replace the default first (dashboard, or
+`403 {"error":"setup_required"}`; replace the default first (dashboard, or
 `POST /api/admin/set-credential` with `username=`/`password=` form fields, which
 itself needs a session and a CSRF token from a default-credential login).
 
@@ -238,7 +232,7 @@ curl -s -b "$JAR" \
 > [!NOTE]
 > **Two separate migrations will break an old script here.**
 > 1. **The login body changed.** A script that posts `pin=YOUR_PIN` authenticates
->    nothing — the handler reads `username` and `password` form fields, so the
+>    nothing: the handler reads `username` and `password` form fields, so the
 >    attempt fails with `401` and counts toward the lockout.
 > 2. **The `X-CSRF` header is required.** A script written against an earlier
 >    firmware sends the cookie but no token and gets
@@ -246,7 +240,7 @@ curl -s -b "$JAR" \
 >    steps. Capture the token from the login response as shown above.
 >
 > A script that skipped login entirely because the device was "unprovisioned"
-> now gets `401 {"error":"authentication required"}` — see below.
+> now gets `401 {"error":"authentication required"}`, see below.
 
 Note the gate on these endpoints is **four** checks, not two: same-origin, then
 the session cookie, then the per-session CSRF token on the mutating ones (§2.1 of
@@ -258,7 +252,7 @@ firmware let the upload through on same-origin alone until an admin PIN was
 provisioned; **that unprovisioned bypass was deleted.** The session check is now
 unconditional, so an unauthenticated upload gets `401` on any device in any
 state, and a device still on the default `admin`/`admin` additionally gets
-`403 setup_required` — meaning a factory-fresh board is *not* OTA-flashable at
+`403 setup_required`, meaning a factory-fresh board is *not* OTA-flashable at
 all until an operator commits a real credential. The old "an open AP with an
 ungated OTA endpoint" exposure is closed by construction (see §6).
 
@@ -267,39 +261,37 @@ ungated OTA endpoint" exposure is closed by construction (see §6).
 | Code | Meaning |
 |------|---------|
 | `200` | Image written, validated, and staged. `rebootRequired:true`. |
-| `401` | No/invalid `pd_session` cookie — `{"error":"authentication required"}`. Unconditional; there is no unprovisioned exemption. |
-| `403` | `{"error":"cross-origin request rejected"}` — an `Origin` header was sent and did not match an allowed local host. |
-| `403` | `{"error":"missing or invalid CSRF token"}` — session is valid but `X-CSRF` was absent or stale. |
-| `403` | `{"error":"setup_required"}` — the device is still on the default `admin`/`admin`; change it via `POST /api/admin/set-credential` first. |
+| `401` | No/invalid `pd_session` cookie: `{"error":"authentication required"}`. Unconditional; there is no unprovisioned exemption. |
+| `403` | `{"error":"cross-origin request rejected"}`: an `Origin` header was sent and did not match an allowed local host. |
+| `403` | `{"error":"missing or invalid CSRF token"}`: session is valid but `X-CSRF` was absent or stale. |
+| `403` | `{"error":"setup_required"}`: the device is still on the default `admin`/`admin`; change it via `POST /api/admin/set-credential` first. |
 | `411` | Missing or zero `Content-Length` (the stream size is required). |
 | `400` | Upload truncated / socket closed early, or a flash write failed mid-stream. |
 | `422` | `esp_ota_end()` rejected the image (bad magic / corrupt / not a valid app). |
 | `500` | `esp_ota_begin` / `esp_ota_set_boot_partition` failed. |
-| `501` | **Host build only** — OTA is not available off-device. |
+| `501` | Host build only: OTA is not available off-device. |
 
 ### 3.4 Host (desktop) build behaviour
 
 The host binary is for development and CI smoke tests; it has no flash.
 
-- `POST /api/ota/upload` — drains the request body (bounded by `Content-Length`
+- `POST /api/ota/upload` drains the request body (bounded by `Content-Length`
   and the existing 5 s per-socket receive timeout, so it never hangs) and
   returns **`501 {"error":"OTA only available on device"}`**. We deliberately
   return 501 rather than a simulated `200` so a real update can never be
   confused with the host stub in tooling/CI.
-- `GET /api/ota/status` — returns valid JSON with placeholder partition labels
+- `GET /api/ota/status` returns valid JSON with placeholder partition labels
   (`"running":"host"`, …) and `"otaSupported":false`.
-- `POST /api/ota/reboot` — returns `200 {"status":"ok","simulated":true,…}` and
-  **does not exit the process** (the smoke-test harness keeps running).
-
----
+- `POST /api/ota/reboot` returns `200 {"status":"ok","simulated":true,…}` and
+  **does not exit the process** (the smoke-test suite keeps running).
 
 ## 4. Rollback strategy & failure handling
 
-**Strategy: mark-valid-on-healthy-boot.** It is the simplest robust scheme and
+**Strategy: mark-valid-on-healthy-boot.** It is the simplest sound scheme and
 is what `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` is built for.
 
 1. `POST /api/ota/upload` writes the image to the inactive slot and, on success,
-   calls `esp_ota_set_boot_partition()` — the slot is now the boot choice but is
+   calls `esp_ota_set_boot_partition()`: the slot is now the boot choice but is
    marked `PENDING_VERIFY`.
 2. `POST /api/ota/reboot` restarts the device into that slot.
 3. On the **next** boot the bootloader sees `PENDING_VERIFY`. The application
@@ -313,7 +305,7 @@ is what `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` is built for.
 ### 4.1 Integration in firmware `app_main` (wired in)
 
 The application confirms a healthy boot from each firmware entry point's
-`http_server_task` — all four: `main/esp_main.cpp`, `esp_main_eth.cpp`,
+`http_server_task`, all four: `main/esp_main.cpp`, `esp_main_eth.cpp`,
 `esp_main_eth_lan8720.cpp`, and `esp_main_display.cpp`. After the SIP engine and
 HTTP dashboard are up, the task waits **5 seconds** of stable operation
 (`otaSettleSec >= 5` in each file), then confirms the image:
@@ -334,7 +326,7 @@ a no-op except immediately after an OTA.
 
 > **Health-gate scope:** the confirmation runs in the normal operating path
 > (the path a configured device follows after an OTA reboot). The display
-> build's first-run *captive-onboarding* path does not confirm — that path is
+> build's first-run *captive-onboarding* path does not confirm; that path is
 > not reachable as a post-OTA boot of a configured device. A stricter health
 > signal (e.g. confirm only after the first successful SIP REGISTER) is a
 > possible future refinement.
@@ -346,9 +338,7 @@ a no-op except immediately after an OTA.
 | Upload truncated (Wi-Fi drop mid-stream) | `esp_ota_write` stream ends short → handler `abort()`s the session, returns `400`. The boot partition is unchanged; the device keeps running the current image. |
 | Corrupt image | `esp_ota_end()` returns `ESP_ERR_OTA_VALIDATE_FAILED` → `422`. Slot not activated. |
 | Power loss during write | The slot is partially written but never activated; `otadata` still points at the running slot. Next boot is the old image. Re-upload to retry. |
-| New image boot-loops | Anti-rollback restores the previous slot — the image is only confirmed after a healthy boot reaches `markValid()` (§4.1). |
-
----
+| New image boot-loops | Anti-rollback restores the previous slot; the image is only confirmed after a healthy boot reaches `markValid()` (§4.1). |
 
 ## 5. Migration from the single-`factory` layout
 
@@ -373,15 +363,15 @@ idf.py -p /dev/ttyUSB0 flash      # writes bootloader + new partition table + ap
 contents are *layout-preserved*. **However**, a full migration flash often erases
 the whole chip depending on the method used:
 
-- `idf.py flash` writes only the bootloader, partition table, and app — it does
+- `idf.py flash` writes only the bootloader, partition table, and app; it does
   **not** explicitly erase `nvs`, so creds *may* survive.
 - `idf.py erase-flash` (or a factory programming jig) **wipes everything**,
   including `nvs`.
 
 Because the safe assumption differs per tool and the partition table offsets for
-everything *after* `nvs` have shifted, **treat the migration as a clean slate**:
+everything *after* `nvs` have shifted, treat the migration as a clean slate:
 
-> After migrating a device to the dual-OTA layout, **re-onboard it** — reconnect
+> After migrating a device to the dual-OTA layout, **re-onboard it**: reconnect
 > WiFi and **set the admin username and password again** (and the DTMF PIN, if
 > you use the phone-keypad admin menu). Do not assume the old WiFi password or
 > credential carried over.
@@ -396,7 +386,7 @@ migration:
 > service at all**, logging `device unprovisioned — SIP stack held dark until
 > credential committed`, and `/api/registrar` will answer `{"attached":false,
 > "mode":"unknown","devices":[]}`. That is the designed state, not a fault.
-> The wait is bounded — the board **reboots itself to retry after 30 minutes**
+> The wait is bounded: the board **reboots itself to retry after 30 minutes**
 > (`kMaxCredentialWaitSec = 1800`, identical in all three builds), so a board
 > that keeps restarting every half hour after migration usually means nobody has
 > finished onboarding it, not that the image is bad.
@@ -404,17 +394,15 @@ migration:
 > into its normal network role ("up usable, secure later") and onboards from the
 > screen.
 
----
-
 ## 6. Security
 
 **Today, OTA images are unsigned and unencrypted.** The only controls on the
 upload path are:
 
-- the **admin session** gate — a username + password login that mints a
+- the **admin session** gate: a username + password login that mints a
   `pd_session` cookie, enforced **unconditionally** on every device in every
-  state, with a brute-force lockout (`429`) on the login route — **global, not
-  per-client**, see [THREAT_MODEL.md](THREAT_MODEL.md) D-3;
+  state, with a brute-force lockout (`429`) on the login route (**global, not
+  per-client**, see [THREAT_MODEL.md](THREAT_MODEL.md) D-3);
 - the **per-session CSRF token** (`X-CSRF`) on the mutating routes; and
 - the **same-origin** check, which constrains browsers only (a request with no
   `Origin` header is admitted, so this is defence in depth, not the gate).
@@ -426,7 +414,7 @@ and password can flash arbitrary firmware. This matches threats **T-5
 
 **What changed since this document was first written:** the gate used to be an
 admin *PIN* that was only enforced "once provisioned", which left a fresh device
-with an open AP and an ungated OTA endpoint — a genuine remote
+with an open AP and an ungated OTA endpoint, a genuine remote
 persistent-compromise vector. **That model is gone.** The credential is now a
 username + password, the session check is unconditional, and forced first-use
 setup refuses OTA outright until the default `admin`/`admin` is replaced, so
@@ -436,22 +424,22 @@ there is no longer an **unauthenticated** path to OTA on any device in any state
 one.** Because the factory default is a *published* credential, anyone with
 link-layer reach to an unclaimed device can log in as `admin`/`admin`, commit
 their own credential, and then flash it. The race is first-come-first-owns
-(THREAT_MODEL §5.1), not an open door — but it is a race, so **provision on the
+(THREAT_MODEL §5.1), not an open door, but it is a race, so **provision on the
 bench, not on the deployed link.**
 
 The numeric PIN that still exists is
-the **DTMF PIN** for the phone-keypad admin menu (`*PIN#code` — NTP resync, WiFi
+the **DTMF PIN** for the phone-keypad admin menu (`*PIN#code`: NTP resync, WiFi
 topology switch, factory reset); it has no default, is unrelated to the web
 session, and **unlocks no HTTP and no OTA**.
 
-**Operational guidance until signing lands:**
+Operational guidance until signing lands:
 
 - **Replace the default `admin`/`admin` credential on every device before it
   leaves the bench.** The firmware forces this before it will accept an OTA, but
   the default is a published credential: a device left on it is one the first
   person to reach it will claim and own.
 - Choose a real password: the login route is always reachable (the dashboard
-  listener is always bound — see §6.1), so the credential and the lockout are the
+  listener is always bound, see §6.1), so the credential and the lockout are the
   whole HTTP-plane defence.
 - **Restrict OTA to the local link** (the device is a LAN appliance; do not
   expose `/api/ota/*` to the internet).
@@ -463,7 +451,7 @@ session, and **unlocks no HTTP and no OTA**.
 ### 6.1 The dashboard is always reachable
 
 Some older notes describe a "dark by default" HTTP listener that stayed unbound
-on a provisioned device and was opened only inside a bounded admission window —
+on a provisioned device and was opened only inside a bounded admission window,
 via a `*4887` DTMF star code, a fresh-provisioning grace period, or an
 authenticated keepalive. **All of that was removed.** There is no star code, no
 grace window, and no keepalive endpoint; `HttpServer`'s constructor opens the
@@ -471,26 +459,24 @@ listen socket immediately and it stays open. `requireAdmin()` is the only admin
 gate.
 
 For an operator this matters in one practical way: **"connection refused" on the
-dashboard port is now always a genuine fault** — a crashed or unbooted device, a
-wrong address, or a network problem — and never an expected security state to be
+dashboard port is now always a genuine fault** (a crashed or unbooted device, a
+wrong address, or a network problem) and never an expected security state to be
 cleared with a star code. Do not go hunting for a way to "reopen" the web UI on a
 device that is simply not answering.
 
-**Roadmap (durable fix — see [THREAT_MODEL.md](THREAT_MODEL.md) §roadmap, P2):**
+Roadmap (durable fix, see [THREAT_MODEL.md](THREAT_MODEL.md) §roadmap, P2):
 
-- **Secure Boot v2** — the bootloader verifies an RSA/ECDSA signature on the app,
+- Secure Boot v2: the bootloader verifies an RSA/ECDSA signature on the app,
   so only images signed with your private key will boot.
-- **Flash encryption** — protects NVS (WiFi password, admin hash) and the app
+- Flash encryption: protects NVS (WiFi password, admin hash) and the app
   against a physical flash read (threats T-4 / I-3).
-- **Signed OTA images** — `esp_ota_*` verifies the image signature against the
+- Signed OTA images: `esp_ota_*` verifies the image signature against the
   Secure Boot key on write, closing the unsigned-OTA gap above.
 
 These are intentionally **out of scope** for Phase-1 (they require key
-management, a secured factory-provisioning flow, and burning eFuses — a one-way
+management, a secured factory-provisioning flow, and burning eFuses, a one-way
 operation), but the partition layout and rollback workflow shipped here are
 forward-compatible with all three.
-
----
 
 ## 7. File map (what this change touched)
 

@@ -1,23 +1,22 @@
-# pocket-dial — Design System Index (SSH Sysop Terminal)
+# pocket-dial. Design System Index (SSH Sysop Terminal)
 
-> **⚠️ HISTORICAL — describes a removed surface.** The SSH sysop terminal and its ANSI TUI
+> **⚠️ HISTORICAL, describes a removed surface.** The SSH sysop terminal and its ANSI TUI
 > were deleted from pocket-dial (see `docs/THREAT_MODEL.md` §5.5: the admin plane is now
-> HTTP-only and dark by default). This folder is preserved as design history — the width
-> discipline, glyph lexicon, and accessibility rules remain good reference material — but
+> HTTP-only and dark by default). This folder is preserved as design history, the width
+> discipline, glyph lexicon, and accessibility rules remain good reference material, but
 > nothing in it describes current firmware behavior.
 
 > **Phase-A design sprint · Design-system index & locked decisions.** pocket-dial is a self-contained
 > SIP PBX on a single ESP32-S3 (Guition JC3248W535, 3.5" 320×480 touch display). The redesign reframes
-> it as an **SSH-first "sysop terminal"**: all configuration happens over a retro telco/BBS ANSI TUI
+> it as an SSH-first "sysop terminal": all configuration happens over a retro telco/BBS ANSI TUI
 > reached by SSH, the 3.5" touchscreen becomes a **passive live-status wallboard**, and the entire
-> surface renders at a **80×24 minimum in 16-color ANSI that degrades cleanly to monochrome** — state
+> surface renders at a **80×24 minimum in 16-color ANSI that degrades cleanly to monochrome**, state
 > is **never signalled by color alone** (every status is glyph + label + color, in that order of
 > authority). This file is the entry point for the ten Phase-A deliverables, the single linked table of
 > contents, and the **locked-decisions** block every downstream doc, mockup, and firmware string must
 > obey. When in doubt, the canonical brief ([`00-brief.md`](00-brief.md)) wins; this README only indexes
 > and reconciles it.
 
----
 
 ## Table of contents
 
@@ -32,17 +31,16 @@
 | 6 | [`whimsy.md`](whimsy.md) | Whimsy Injector | Opt-in retro-BBS delight: Tier-0 micro-moments, Tier-1 ambient, easter eggs, the whimsy toggle |
 | 7 | [`walkthrough.md`](walkthrough.md) | Persona Walkthrough | Cognitive walkthrough of onboarding (Rivera) + a ring-group task (Dana); **prioritized friction log (F1–F15)** |
 | 8 | [`accessibility.md`](accessibility.md) | Accessibility Auditor | Color-blind audit, **STATIC screen-reader mode**, spoken selection, 80×24 legibility, keyboard-trap audit |
-| 9 | [`imagery.md`](imagery.md) | Image Prompt Engineer | The three real bitmaps: 320×480 splash, onboarding QR card, README hero — prompts + inclusive review |
+| 9 | [`imagery.md`](imagery.md) | Image Prompt Engineer | The three real bitmaps: 320×480 splash, onboarding QR card, README hero, prompts + inclusive review |
 
-**Reading order for a newcomer:** brief → personas (the *why*) → brand (the *voice*) → tui-ia (the *map*) → tui-style (the *pixels*) → narrative/whimsy (the *feel*) → walkthrough/accessibility (the *audit*) → imagery (the *bitmaps*).
+Reading order for a newcomer: brief → personas (the *why*) → brand (the *voice*) → tui-ia (the *map*) → tui-style (the *pixels*) → narrative/whimsy (the *feel*) → walkthrough/accessibility (the *audit*) → imagery (the *bitmaps*).
 
----
 
 ## LOCKED DECISIONS
 
 These four blocks are the protected core. A change to any of them is a design change requiring a review against `brand.md` §6.1; downstream docs cross-reference these, they do not redefine them.
 
-### 1. Product name — one name, three casings (`brand.md` §1.1)
+### 1. Product name, one name, three casings (`brand.md` §1.1)
 
 | Context | Form | Where |
 |---|---|---|
@@ -52,11 +50,11 @@ These four blocks are the protected core. A change to any of them is a design ch
 | Hostname / mDNS / URLs / configs | `pocketdial` | `pocketdial.local`, NVS keys |
 | Code identifiers / macros | `POCKETDIAL_*` / `pocketdial` | `POCKETDIAL_MAX_CLIENTS` |
 
-Descriptor line: **`SYSOP TERMINAL` · *single-board SIP PBX***. Contextual mode (title bar): `[ SYSTEM MANAGEMENT ]` (and `[ MONITOR ]`, `[ NETWORK ]`, `[ PBX CONFIG ]`, `[ SECURITY ]`, `[ REPORTS ]`, `[ ABOUT ]`, `[ FIRST-RUN ]`). Version string `vMAJOR.MINOR` in human surfaces; the redesign ships under the **3.x** line. **Banned:** `PocketDial`, `Pocket Dial`, `MyPBX`, `PD-PBX`, sub-brands. Tagline budget is **exactly two flavor lines**: `operator on duty` and `Patching you through…`.
+Descriptor line: **`SYSOP TERMINAL` · *single-board SIP PBX***. Contextual mode (title bar): `[ SYSTEM MANAGEMENT ]` (and `[ MONITOR ]`, `[ NETWORK ]`, `[ PBX CONFIG ]`, `[ SECURITY ]`, `[ REPORTS ]`, `[ ABOUT ]`, `[ FIRST-RUN ]`). Version string `vMAJOR.MINOR` in human surfaces; the redesign ships under the **3.x** line. Banned: `PocketDial`, `Pocket Dial`, `MyPBX`, `PD-PBX`, sub-brands. Tagline budget is exactly two flavor lines: `operator on duty` and `Patching you through…`.
 
-### 2. Palette — BRASS (default) + PHOSPHOR (alt), mirroring `main/ui/ui.cpp` `PALETTES[]`
+### 2. Palette. BRASS (default) + PHOSPHOR (alt), mirroring `main/ui/ui.cpp` `PALETTES[]`
 
-Two themes, same product — "a change of bench lighting, not a different product." Brass is the chrome; the lamp is the accent; red is rationed to destructive/alert; **DND stays amber in both themes** (`ui.cpp` L61). 16-color xterm mapping owned by `tui-style.md` §1.
+Two themes, same product, "a change of bench lighting, not a different product." Brass is the chrome; the lamp is the accent; red is rationed to destructive/alert; **DND stays amber in both themes** (`ui.cpp` L61). 16-color xterm mapping owned by `tui-style.md` §1.
 
 | Role | BRASS RGB | PHOSPHOR RGB | xterm-16 → SGR |
 |---|---|---|---|
@@ -65,12 +63,12 @@ Two themes, same product — "a change of bench lighting, not a different produc
 | brass rail / border | `#B08438` | `#96823C` | `3` yellow → `33` |
 | text | `#D6B26E` | `#AAD296` | BRASS `3`→`33` / PHOS `2`→`32` |
 | highlight / header | `#F5D696` | `#D2F0BE` | BRASS `11`→`93` / PHOS `10`→`92` |
-| **accent — live lamp** | `#FFB020` amber | `#40FF60` green | BRASS `11`→`93` / PHOS `10`→`92` |
+| **accent, live lamp** | `#FFB020` amber | `#40FF60` green | BRASS `11`→`93` / PHOS `10`→`92` |
 | dim / UNREACH | `#1E1B17` | `#16201C` | `8` grey → `90` |
 | **DND ring** (both themes) | `#FFB020` amber | `#FFB020` amber | `11` → `93` |
 | **alert / destructive** | `#C84028` | `#DC4632` | `1` red → `31` |
 
-**Status lexicon (`brand.md` §4.5 — never color alone; label authoritative, glyph reinforces, color removable):**
+**Status lexicon (`brand.md` §4.5, never color alone; label authoritative, glyph reinforces, color removable):**
 
 ```
 ● ONLINE   ○ UNREACH   ◐ RINGING   ◆ ACTIVE   ⊘ DND   ↳ FWD   ▲ ALERT   ◆ READY
@@ -78,18 +76,18 @@ CDR results:  ✓ answered   ⊘ busy   … cancelled   ○ unavailable   ▲ fa
 ASCII fallback:  ●→(*)  ○→( )  ◐→(~)  ◆→<*>  ⊘→[/]  ↳→->  ▲→/!\   ╔╗╚╝═║→+ + + + = |   ─→-
 ```
 
-### 3. Keybinding scheme — one scheme, learned once (`tui-ia.md` §3)
+### 3. Keybinding scheme, one scheme, learned once (`tui-ia.md` §3)
 
 | Scope | Keys |
 |---|---|
 | **Global (every screen)** | `?` context help (Esc-dismiss) · `Esc` back one level, non-destructive (no-op on hub) · `Ctrl-L` redraw |
-| **Hub typeahead** (single key, **no Enter** — `3→1→A` is one fluid run) | `1` Monitor · `2` Network · `3` PBX Config · `4` Security · `5` Reports/Logs · `6` About · `R` Reboot `[A!]` · `L` Logout · `T` Theme toggle |
+| **Hub typeahead** (single key, **no Enter**, `3→1→A` is one fluid run) | `1` Monitor · `2` Network · `3` PBX Config · `4` Security · `5` Reports/Logs · `6` About · `R` Reboot `[A!]` · `L` Logout · `T` Theme toggle |
 | **List/table panels** | `↑/↓` select · `PgUp/PgDn` page · `Enter` edit · `Tab` `←/→` switch tab/view · `A` add · `D` delete `[A!]` · `Space` toggle binary · `/` filter/jump · `Esc` back |
 | **Forms / wizard steps** | `Tab`/`↓` next field · `Shift-Tab`/`↑` prev · `Space` toggle radio/checkbox · `←/→` move in radio / between buttons · `Enter` apply/advance · `Esc` cancel/prev step · `Backspace` edit text |
 | **Confirm dialogs `[A!]`** | `←/→` choose (safe default pre-focused) · `Enter` confirm · `y/n` inline shortcut (`N` safe) · `Esc` cancel = safe default |
-| **Live monitor `[1]`** | `F` freeze/unfreeze 1 Hz refresh · `C` clear stale rows · `Esc` back. **`P` is NOT bound** (no on-device PCAP — honesty). |
+| **Live monitor `[1]`** | `F` freeze/unfreeze 1 Hz refresh · `C` clear stale rows · `Esc` back. **`P` is NOT bound** (no on-device PCAP, honesty). |
 
-Every screen carries the **3-zone spine**: title bar (`POCKET-DIAL vX.Y  [MODE]  HH:MM:SS`) / body / always-visible key-hint footer ending in the **named theme label** (`Theme: BRASS ▸` / `Theme: PHOSPHOR ▸`). Selection = `▸` marker + reverse video (never color alone). Live cells repaint ~1 Hz by cursor positioning, never full clears.
+Every screen carries the 3-zone spine: title bar (`POCKET-DIAL vX.Y  [MODE]  HH:MM:SS`) / body / always-visible key-hint footer ending in the **named theme label** (`Theme: BRASS ▸` / `Theme: PHOSPHOR ▸`). Selection = `▸` marker + reverse video (never color alone). Live cells repaint ~1 Hz by cursor positioning, never full clears.
 
 ### 4. Full screen inventory (v1)
 
@@ -122,11 +120,10 @@ SSH CONNECT
    Cross-cutting overlays: ◇ confirm dialog (one shell for all [A!]) · ◇ modal editors · ? help overlay
 ```
 
-**Hard caps surfaced as design objects (not error states):** 32 extensions / 8 concurrent calls — shown ambiently (hub `ext 12/32 · 1/8 calls`) and predictively (pre-apply cap check). The 3.88 MB on-flash `prompts` partition backs IVR; **no SD card** anywhere.
+Hard caps surfaced as design objects (not error states): 32 extensions / 8 concurrent calls, shown ambiently (hub `ext 12/32 · 1/8 calls`) and predictively (pre-apply cap check). The 3.88 MB on-flash `prompts` partition backs IVR; **no SD card** anywhere.
 
----
 
-## Reconciled decisions (where docs differed — these are the rulings)
+## Reconciled decisions (where docs differed, these are the rulings)
 
 These were inconsistencies across the upstream docs; they are resolved here so engineering reads one answer. See the **Inconsistencies** field of the Phase-A checkpoint for the full list and rationale.
 
@@ -136,7 +133,6 @@ These were inconsistencies across the upstream docs; they are resolved here so e
 4. **First-boot banner needs an un-provisioned branch.** The banner asks for a PIN that only exists after wizard `[2/5]` (`walkthrough.md` F1). The two-state banner (`◆ READY — UNPROVISIONED · first SSH session starts setup`) is the ruling. **Open for engineering.**
 5. **Accessibility adds renderer constraints, not geometry changes.** STATIC screen-reader mode and spoken selection (`accessibility.md` A11Y-1/-2) are **mandatory** and gate "accessible." They change the renderer, not a single mockup.
 
----
 
 *Design Lead · pocket-dial 3.x redesign · index + locked decisions for the Phase-A sprint. Canonical*
 *source: [`00-brief.md`](00-brief.md). Palette source of truth: `main/ui/ui.cpp` `PALETTES[]`.*

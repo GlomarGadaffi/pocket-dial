@@ -13,7 +13,7 @@ machine.
 
 ## Requirements
 
-* **Chrome, Edge, or Opera on desktop.** Web Serial exists nowhere else — not
+* **Chrome, Edge, or Opera on desktop.** Web Serial exists nowhere else, not
   Firefox, not Safari, not any mobile browser. The page detects this and shows
   an explanation instead of a broken UI.
 * **HTTPS or `localhost`.** Web Serial requires a secure context. GitHub Pages
@@ -25,7 +25,7 @@ machine.
 
 ## How it works
 
-1. **Connect.** `navigator.serial.requestPort()` → `Transport` → `ESPLoader`.
+1. **Connect.** `navigator.serial.requestPort()`, then a `Transport`, then an `ESPLoader`.
    `loader.main()` syncs with the ROM bootloader, identifies the chip, uploads
    the flasher stub, and raises the baud rate to 921600. Everything afterwards
    runs on that one connection.
@@ -34,12 +34,12 @@ machine.
    both OTA slots (app partition + `0x20`, i.e. `0x20020` for `ota_0` and
    `0x620020` for `ota_1`) and `otadata` at `0xf000` to say which slot is
    live. That yields the project name (`SipServer`) and version of whatever is
-   on the board. It does **not** identify the variant — the firmware doesn't
-   stamp its transport into the descriptor — so the user always picks the
+   on the board. It does **not** identify the variant (the firmware doesn't
+   stamp its transport into the descriptor), so the user always picks the
    board. Every published build is ESP32-S3, so a non-S3 chip gets a warning
    pointing at the from-source `lan8720` build.
 
-3. **Fetch releases — from this site, not from the GitHub API.** One call to
+3. **Fetch releases from this site, not from the GitHub API.** One call to
    `../firmware/index.json` populates the picker; the newest non-pre-release is
    selected by default. An empty list and network errors are explained states
    that steer the user to the local-file panel.
@@ -49,8 +49,8 @@ machine.
    > that.** Those URLs 302 to `release-assets.githubusercontent.com`, and
    > neither the redirect nor the final response sets
    > `Access-Control-Allow-Origin`, so every download fails CORS. The API itself
-   > *is* CORS-enabled, so listing releases worked and only the downloads failed
-   > — the page looked healthy right up until someone pressed **Flash** (#138).
+   > *is* CORS-enabled, so listing releases worked and only the downloads failed;
+   > the page looked healthy right up until someone pressed **Flash** (#138).
    >
    > `release.yml` now copies each release's images into `docs/firmware/<tag>/`
    > and regenerates `docs/firmware/index.json`, so everything the page fetches
@@ -94,7 +94,7 @@ machine.
      the browser, not published in the release. Only its address comes from the
      manifest, read by `release.yml` out of the published
      `partition-table-<variant>.bin` so a partition move follows automatically.
-     A manifest without the key — or a convention-layout release — means the
+     A manifest without the key, or a convention-layout release, means the
      build predates the feature; the page falls back to the `CFGSEED_OFFSET`
      constant and logs a warning that the firmware will ignore the seed.
 
@@ -110,8 +110,8 @@ machine.
    `index.html` and the matrix in `release.yml` must stay in sync.
 
 5. **Flash.** Every image is downloaded *before* the first byte is written.
-   `writeFlash` runs with `eraseAll: false` by default — that is what preserves
-   NVS (saved Wi-Fi, admin PIN, extensions) — and `compress: true`. An
+   `writeFlash` runs with `eraseAll: false` by default, which is what preserves
+   NVS (saved Wi-Fi, admin PIN, extensions), and with `compress: true`. An
    *Erase the whole chip first* checkbox flips `eraseAll` on for the
    single-`factory` → dual-OTA migration described in `FLASHING.md`.
 
@@ -124,7 +124,7 @@ machine.
 | Mode | Writes | When |
 | ---- | ------ | ---- |
 | **Full flash** | bootloader `0x0`, partition table `0x8000`, otadata `0xf000`, app `0x20000` | First install, and after any partition-table or bootloader change |
-| **App only** | otadata `0xf000`, app `0x20000` | Upgrading firmware already on the board — the same regions the OTA path touches |
+| **App only** | otadata `0xf000`, app `0x20000` | Upgrading firmware already on the board, the same regions the OTA path touches |
 
 Both modes additionally write `cfgseed` at `0xFFF000` **only** when the
 flash-time configuration panel is opted into; see below.
@@ -139,7 +139,7 @@ toolchain's flasher.
 writes a 256-byte settings record to the `cfgseed` partition at `0xFFF000`. The
 firmware reads it once at boot, copies the flagged fields into NVS, records the
 record's `gen` counter, and ignores the partition until a newer `gen` appears
-(`src/Helpers/DeviceConfig.hpp`, which holds the authoritative wire format —
+(`src/Helpers/DeviceConfig.hpp`, which holds the authoritative wire format;
 keep the two in lockstep).
 
 It exists mainly for the headless `esp32s3-eth` and `esp32s3-wifi` builds: they
@@ -148,7 +148,7 @@ passphrase.
 
 **Opt-in, and off by default.** The panel is governed by *Apply these settings
 to the board*, unchecked on load. While it is unchecked the flasher writes
-**nothing** to `cfgseed` — the partition is not in the flash plan at all — so
+**nothing** to `cfgseed` (the partition is not in the flash plan at all), so
 reflashing a board you already configured never clobbers its passphrase, Wi-Fi
 mode, or upstream credentials. The panel says so; so does this paragraph,
 because it is the property most worth not breaking.
@@ -157,7 +157,7 @@ because it is the property most worth not breaking.
 set their `has-*` flag in the record. This is not politeness: a plain on/off
 checkbox for AP security would mean someone opting in purely to set STATION
 mode also writes `has-ap-secure` with the value `0`, silently reopening a board
-that had WPA2 on — and with a fresh `gen`, so the firmware would really apply
+that had WPA2 on, and with a fresh `gen`, so the firmware would really apply
 it.
 
 **Turning WPA2 on is a breaking change**, called out in a warning next to the
@@ -174,21 +174,21 @@ in the result notice with a **Copy** button and echoed into the log.
 **SIP registrar mode** is the one setting here that is not about Wi-Fi, and it
 is in this panel because there is nowhere else to put it: digest auth is fully
 implemented in the firmware, but nothing outside the unit tests has ever
-written the `reg_mode` NVS key — no HTTP endpoint, no dashboard control — so a
+written the `reg_mode` NVS key (no HTTP endpoint, no dashboard control), so a
 device comes up in the compiled-in default and stays there. A dashboard control
 is being added in parallel; until it ships, this page is the only way to set
 the mode on a headless board before first boot. The compiled-in default is
 `open`, so on a never-configured board *Leave as is* means open.
 
-- **open** (byte `0`) — any endpoint on the network registers as any extension,
+- open (byte `0`): any endpoint on the network registers as any extension,
   no credential. Fine for a bench, lab, or classroom; not for a shared link.
-- **learn** (`1`) — trust-on-first-use. Unknown devices are adopted and locked
+- learn (`1`): trust-on-first-use. Unknown devices are adopted and locked
   to their extension by MAC, while already-secured ones are digest-enforced. A
   deliberate, *temporary* weakening for adopting an existing phone fleet: it
   must not be left on as a steady state and should be run on a trusted or WPA2
   link. Selecting it reveals a warning that says so, and the flash log records
   it.
-- **secure** (`2`) — every REGISTER is digest-challenged; an extension is
+- secure (`2`): every REGISTER is digest-challenged; an extension is
   registrable only by a party that knows its secret. An extension with no
   stored secret is rejected outright with *Extension Not Provisioned*
   (`Registrar::admitSecure`), so provision before switching a live system over.

@@ -8,8 +8,6 @@ board, and updating it afterward over-the-air (OTA).
 > install of an OTA-capable build has to go on over the USB/serial port. After
 > that, you can update wirelessly from the dashboard.
 
----
-
 ## 1. Which firmware for which board
 
 All targets build for **ESP32-S3**. Pick the transport with
@@ -27,7 +25,7 @@ Every image fits comfortably in the 6 MB `ota_0` / `ota_1` slots.
 > **ESP-IDF v6.0 or later is required.** `main/CMakeLists.txt` enforces it at
 > configure time, so an older toolchain stops immediately with a clear message
 > instead of failing ~1400 objects in with `component esp_driver_ledc could not
-> be found` — LEDC, GPIO, SPI and I2C were split out of the monolithic `driver`
+> be found`. LEDC, GPIO, SPI and I2C were split out of the monolithic `driver`
 > component after v5.2, and this project requires them by their split names.
 > Both `.github/workflows/ci.yml` and `.github/workflows/release.yml` build on
 > **v6.0.1**.
@@ -35,10 +33,8 @@ Every image fits comfortably in the 6 MB `ota_0` / `ota_1` slots.
 > This used to be inconsistent: the release workflow stayed pinned to v5.2.1
 > long after v5 stopped building, which is why the `v1.3.0-pre-alpha` release
 > run failed on every leg. If you are reproducing a release artifact older than
-> that, you need the toolchain that shipped it — but nothing on `main` builds
+> that, you need the toolchain that shipped it, but nothing on `main` builds
 > under v5 any more.
-
----
 
 ## 2. Build
 
@@ -55,16 +51,14 @@ The build produces, under `build/`:
 - `SipServer.bin` (the application)
 - `flash_args` (the exact offsets, used by `idf.py flash`)
 
----
-
 ## 3. First-time flash (USB)
 
-### Option 0 — from the browser, no toolchain
+### Option 0: from the browser, no toolchain
 
 Open **<https://glomargadaffi.github.io/pocket-dial/flasher/>** in Chrome, Edge, or
 Opera on a desktop, plug the board in over USB, pick the variant (Ethernet /
 display / Wi-Fi) and click **Flash board**. It pulls the images from the **GitHub Pages
-mirror** under `docs/firmware/<tag>/`, not from the Release assets — release-asset URLs
+mirror** under `docs/firmware/<tag>/`, not from the Release assets; release-asset URLs
 send no CORS header, so a browser page cannot `fetch()` them ([#138]; the page reads
 `../firmware/index.json` same-origin, `docs/flasher/index.html:540-551`, and
 `release.yml:278` publishes the mirror). It writes them from your machine; nothing is
@@ -80,20 +74,20 @@ uploaded.
 also takes locally built `.bin` files under *Flash your own build*. Details in
 [flasher/README.md](flasher/README.md).
 
-It can additionally write the device's configuration at flash time — Wi-Fi mode,
+It can additionally write the device's configuration at flash time (Wi-Fi mode,
 SoftAP security and passphrase, upstream STA credentials, and the SIP registrar
-mode — through the collapsed *Set Wi-Fi, AP security and SIP registrar mode
-while flashing* panel. That panel is **opt-in and off by default**: leave it
+mode) through the collapsed *Set Wi-Fi, AP security and SIP registrar mode
+while flashing* panel. That panel is opt-in and off by default: leave it
 alone and the flasher touches no configuration at all. It is the only way to
 configure a headless `eth` or `wifi` board before its first boot. See §5.
 
 Connect the board over USB and identify the serial port:
 
-- **Linux:** `/dev/ttyUSB0` or `/dev/ttyACM0`
-- **macOS:** `/dev/cu.usbserial-*` or `/dev/cu.usbmodem-*`
-- **Windows:** `COM3` (check Device Manager → Ports)
+- Linux: `/dev/ttyUSB0` or `/dev/ttyACM0`
+- macOS: `/dev/cu.usbserial-*` or `/dev/cu.usbmodem-*`
+- Windows: `COM3` (check Device Manager → Ports)
 
-### Option A — `idf.py` (recommended)
+### Option A: `idf.py` (recommended)
 
 ```bash
 idf.py -p COM3 flash         # Windows
@@ -103,7 +97,7 @@ idf.py -p /dev/ttyUSB0 flash # Linux
 This writes the bootloader, partition table, and app at the correct offsets and
 can `monitor` the serial log with `idf.py -p COM3 monitor` (or `flash monitor`).
 
-### Option B — `esptool` directly
+### Option B: `esptool` directly
 
 ```bash
 esptool.py -p COM3 -b 460800 --chip esp32s3 write_flash \
@@ -116,13 +110,13 @@ esptool.py -p COM3 -b 460800 --chip esp32s3 write_flash \
 > The `ota_data_initial.bin` at `0xf000` points the bootloader at `ota_0`
 > (offset `0x20000`) for the first boot. `idf.py flash` handles this for you.
 
-Those four offsets are still correct after the `cfgseed` partition was added —
+Those four offsets are still correct after the `cfgseed` partition was added:
 `nvs`, `otadata`, `phy_init`, `ota_0` and `ota_1` all keep their exact offsets
 and sizes (that is a stated contract in `partitions.csv`'s own header). Neither
 `idf.py flash` nor the `esptool` command above writes `cfgseed`; it is left
 erased (`0xFF`), which the firmware treats as "no seed" and ignores. See §5.
 
-### First boot — what you will actually see
+### First boot: what you will actually see
 
 Nothing about the dashboard is hidden, gated at the transport, or delayed. As soon
 as the board is up:
@@ -131,13 +125,13 @@ as the board is up:
   provisioned or not. The listener opens when `HttpServer` is constructed and stays
   open for the life of the process. Firmware built before commit `de1a36e` went
   **dark** once a PIN was set and was reopened by dialling `*4887` from the admin
-  extension; **that entire mechanism was removed** — `grep -rn 4887 src/` returns
+  extension; that entire mechanism was removed: `grep -rn 4887 src/` returns
   nothing. A **connection refused is therefore always a genuine fault** (wrong
   address, wrong network, board still booting), never an expected gate to open.
-* **The login is `admin` / `admin`** — a username and a password, not a PIN. It
+* The login is `admin` / `admin`: a username and a password, not a PIN. It
   ships well-known on purpose, so first contact needs no out-of-band secret.
 * **You must replace it before anything else works.** While the default credential
-  stands, every admin-gated route — read-only `GET`s included — returns
+  stands, every admin-gated route (read-only `GET`s included) returns
   `403 {"error":"setup_required"}`. The single exception is
   `POST /api/admin/set-credential`. That covers OTA, factory reset, Wi-Fi changes,
   registrar mode and AP security.
@@ -145,7 +139,7 @@ as the board is up:
   all until a credential is committed.** The boot task logs
   `[boot] device unprovisioned — SIP stack held dark until credential committed`
   and polls every 2 s; no phone can register until you finish setup. If nothing is
-  committed within 30 minutes the board reboots and begins the wait again — a board
+  committed within 30 minutes the board reboots and begins the wait again; a board
   that restarts on you mid-setup is behaving as designed, not crashing. The
   `display` build is **not** gated this way: it boots into its normal network role
   and brings SIP up regardless.
@@ -157,12 +151,12 @@ The exact `curl` calls are in
 
 If the board previously ran a single-`factory` image, the partition layout
 changes. The `nvs` partition stays at `0x9000`/`0x6000`, so saved Wi-Fi
-credentials and the stored admin credential *can* survive — but a full chip erase
+credentials and the stored admin credential *can* survive, but a full chip erase
 (`esptool.py -p COM3 erase_flash`) wipes them. After a migration flash that lost
 NVS, expect to re-onboard Wi-Fi and to go through first-use setup again: the device
 falls back to the built-in `admin`/`admin` login and refuses every other admin
 action until you replace it. The *separate* DTMF admin PIN (the phone-keypad
-`*PIN#code` menu secret — unrelated to the web login) is erased with it, and has no
+`*PIN#code` menu secret, unrelated to the web login) is erased with it, and has no
 default, so that menu is disabled until you set one again.
 
 ### Migration note (adding `cfgseed`)
@@ -173,7 +167,7 @@ came out of `prompts`, which shrank from `0x3E0000` to `0x3DF000`; everything
 below it is byte-identical, so the change is OTA-compatible in both directions.
 
 Because an OTA update ships an app image and **never rewrites the partition
-table**, a board flashed before `cfgseed` existed will not have it — and current
+table**, a board flashed before `cfgseed` existed will not have it, and current
 firmware runs on it perfectly well. So does the 4 MB
 `sdkconfig.defaults.esp32_constrained` layout (`partitions_4mb.csv`), which has
 no room for `cfgseed` at all. **A missing `cfgseed` partition is the normal case,
@@ -182,12 +176,10 @@ configuration. The only way to add the partition to an existing board is a full
 USB flash of the new partition table (bootloader + partition table + app), which
 the browser flasher's *Full flash* mode does in one operation.
 
----
-
 ## 4. Updating over-the-air (after the first USB flash)
 
 Once a device is running an OTA-capable build, push new firmware without a
-cable. OTA upload always needs **two** things from the admin session — there is no
+cable. OTA upload always needs **two** things from the admin session: there is no
 unauthenticated path in any provisioning state: the `pd_session` cookie *and* the
 session's `X-CSRF` token, which `POST /api/admin/login` returns in its JSON
 response.
@@ -196,7 +188,7 @@ response.
 > **Finish first-use setup before attempting an OTA.** While the board is still on
 > the shipped `admin`/`admin` credential, `POST /api/ota/upload` and
 > `POST /api/ota/reboot` return `403 {"error":"setup_required"}` like every other
-> admin-gated route — only `POST /api/admin/set-credential` is exempt. See
+> admin-gated route, only `POST /api/admin/set-credential` is exempt. See
 > [SETUP_GUIDE.md §3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first).
 >
 > **The port itself is not a gate.** The HTTP listener is open from boot in every
@@ -205,7 +197,7 @@ response.
 > `POST /api/admin/keepalive` route to extend that window. **All of it was
 > removed**: there is no star-code, no bounded admin-open window, and no
 > `keepalive` route in `src/` any more. If a connection is refused, the fault is
-> real — do not go looking for a window to open. See
+> real; do not go looking for a window to open. See
 > [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first).
 
 ```bash
@@ -242,8 +234,8 @@ curl -s -b "$JAR" \
 
 > A script written against earlier firmware sends the cookie but no token, and
 > now gets `403 {"error":"missing or invalid CSRF token"}` on the upload and
-> reboot steps. A script that skips step 1 altogether — which older firmware
-> tolerated on an unprovisioned device — now gets
+> reboot steps. A script that skips step 1 altogether (which older firmware
+> tolerated on an unprovisioned device) now gets
 > `401 {"error":"authentication required"}`. **There is no ungated OTA endpoint any
 > more, in any state**, so the old advice to "set a PIN in production before
 > exposing OTA" no longer describes a choice you have. Full walk-through and
@@ -252,7 +244,7 @@ curl -s -b "$JAR" \
 The bootloader brings the new image up in a *pending-verify* state. The firmware
 confirms it automatically a few seconds after the SIP and HTTP servers come up
 (see [OTA.md](OTA.md) §4); if the new image crashes on boot, the bootloader rolls
-back to the previous slot — no bricking.
+back to the previous slot, no bricking.
 
 > [!NOTE]
 > The dual-slot layout, the pending-verify confirmation and the rollback path are
@@ -266,11 +258,9 @@ Check status any time:
 curl http://192.168.4.1/api/ota/status
 ```
 
----
-
 ## 5. Flash-time configuration (`cfgseed`)
 
-A board with no screen — the `eth` and `wifi` variants — has nowhere to display a
+A board with no screen (the `eth` and `wifi` variants) has nowhere to display a
 generated SoftAP passphrase and no dashboard to reach before it is on a network.
 `cfgseed` solves that: the browser flasher writes a **256-byte fixed-layout
 record** into the `cfgseed` partition at `0xFFF000`, and the firmware reads it
@@ -279,7 +269,7 @@ record** into the `cfgseed` partition at `0xFFF000`, and the firmware reads it
 | | |
 |---|---|
 | What can be seeded | Wi-Fi mode (captive-portal default / STATION / AP), SoftAP WPA2 on-off, SoftAP passphrase, upstream STA SSID + password, SIP registrar mode |
-| Who writes it | The browser flasher, over USB, before first boot — **only**. There is no CLI tool for this. |
+| Who writes it | The browser flasher, over USB, before first boot, **only**. There is no CLI tool for this. |
 | Who reads it | `DeviceConfig::applyFlashSeed()`, called at boot right after `nvs_flash_init()` |
 | Applied how often | Once per record. Each write carries a `gen` counter; the firmware stores it as `cfgseed_gen` and ignores the partition until a *newer* `gen` appears, so a plain reboot never re-clobbers settings you changed since. |
 | Wire format | `src/Helpers/DeviceConfig.hpp` is authoritative (magic `PDCS`, version, per-field `has-*` flag bits, CRC-32 over bytes `[0,252)`). |
@@ -310,25 +300,25 @@ so "factory" on a seeded board means **as flashed**, not as hardcoded.
 ### 5.1 SoftAP WPA2
 
 The standalone SoftAP can require WPA2 rather than coming up open. It is
-**opt-in and defaults to off**: turning it on forces every already-associated
+opt-in and defaults to off: turning it on forces every already-associated
 phone, ATA, and laptop to be re-paired with the new passphrase, so a firmware
 update must not do it to a live fleet on its own.
 
 The device generates its own passphrase from the hardware CSPRNG on first
-access and stores it in NVS — 20 characters from `23456789ABCDEFGHJKMNPQRSTVWXYZ`
+access and stores it in NVS: 20 characters from `23456789ABCDEFGHJKMNPQRSTVWXYZ`
 (no `0`/`O`, `1`/`I`/`L`, `U`), because it gets read off a small LCD or a serial
 log and retyped into a desk phone. You can see it in four places:
 
 * on the LVGL onboarding screen, on the `display` build;
 * on the serial console at AP bringup, as
-  `INFRA: SoftAP passphrase (WPA2): <psk>` — the headless build's only local
+  `INFRA: SoftAP passphrase (WPA2): <psk>`, the headless build's only local
   channel, and yes, that is in the clear: anyone with a serial cable is already
   inside the physical trust boundary;
 * in the dashboard, and over `GET /api/ap-security` (see [API.md](API.md));
 * in the browser flasher's result notice, with a **Copy** button, when the
   passphrase was set at flash time.
 
-Enabling WPA2 from the dashboard does **not** restart the radio — that would drop
+Enabling WPA2 from the dashboard does **not** restart the radio; that would drop
 the client that just asked for the passphrase. The change lands at the next AP
 bringup, so power-cycle the board to see it take effect.
 
@@ -336,20 +326,18 @@ bringup, so power-cycle the board to see it take effect.
 > plain HTTP, and unsigned OTA. Everything in this section is something an
 > operator turns on deliberately.
 
----
-
 ## 6. Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
 | Port not found / permission denied | Install the CP210x/CH34x USB-UART driver; on Linux add yourself to the `dialout` group. |
 | Flash fails / garbage output | Lower baud (`-b 115200`), or hold **BOOT** while connecting to force download mode. |
-| Boots to old firmware after OTA | The new image failed verification and rolled back — check the serial log; rebuild and retry. |
+| Boots to old firmware after OTA | The new image failed verification and rolled back; check the serial log, rebuild and retry. |
 | Colors look wrong on the display | Confirm the `display` transport build (`CONFIG_LV_COLOR_16_SWAP=y` is set in `sdkconfig.defaults`). |
-| Wi-Fi creds / admin credential lost after flashing | Expected after a full `erase_flash` or layout migration. The board is back on `admin`/`admin` and demands first-use setup again; the separate DTMF admin PIN is gone too. On `wifi`/`eth`/`lan8720` the SIP registrar stays down until you complete setup — see *First boot* in §3. |
-| Connection refused on port 80 | **Always a genuine fault** — wrong address, wrong network, or the board has not finished booting. The listener opens at construction and stays open in every provisioning state. The dark-by-default plane and the `*4887` reopen star-code were **removed**; there is nothing to "open" first. See [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first). |
+| Wi-Fi creds / admin credential lost after flashing | Expected after a full `erase_flash` or layout migration. The board is back on `admin`/`admin` and demands first-use setup again; the separate DTMF admin PIN is gone too. On `wifi`/`eth`/`lan8720` the SIP registrar stays down until you complete setup, see *First boot* in §3. |
+| Connection refused on port 80 | Always a genuine fault: wrong address, wrong network, or the board has not finished booting. The listener opens at construction and stays open in every provisioning state. The dark-by-default plane and the `*4887` reopen star-code were **removed**; there is nothing to "open" first. See [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first). |
 | `403 {"error":"setup_required"}` from any admin route | The board is still on the default `admin`/`admin` login. Until you replace it via `POST /api/admin/set-credential`, every other admin-gated route (`GET`s included) refuses. See [SETUP_GUIDE.md §3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first). |
-| `429 {"error":"too many failed attempts..."}` on login | The brute-force lockout is engaged: 5 consecutive wrong username/password attempts → 60 s, doubling on each repeat lockout to a 16-minute cap. It is keyed per client address, and a correct login clears that client's counter. The counters are RAM-only — power-cycling clears them without touching the stored credential. |
-| `403 {"error":"missing or invalid CSRF token"}` from a script | The script sends the session cookie but no `X-CSRF` header. Capture the token from the login response — §4. |
-| Flash-time settings had no effect | Either the panel's *Apply these settings to the board* box was left unchecked (the default), or the seed was written in *App only* mode onto a partition table that predates `cfgseed`. Redo it as a **Full flash** — §5. |
+| `429 {"error":"too many failed attempts..."}` on login | The brute-force lockout is engaged: 5 consecutive wrong username/password attempts → 60 s, doubling on each repeat lockout to a 16-minute cap. It is keyed per client address, and a correct login clears that client's counter. The counters are RAM-only; power-cycling clears them without touching the stored credential. |
+| `403 {"error":"missing or invalid CSRF token"}` from a script | The script sends the session cookie but no `X-CSRF` header. Capture the token from the login response, §4. |
+| Flash-time settings had no effect | Either the panel's *Apply these settings to the board* box was left unchecked (the default), or the seed was written in *App only* mode onto a partition table that predates `cfgseed`. Redo it as a **Full flash**, §5. |
 | Phones can't associate after enabling WPA2 | Expected: WPA2 breaks every existing association. Re-pair each device with the generated passphrase (`GET /api/ap-security`, the serial log, or the display). |

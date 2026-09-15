@@ -1,4 +1,4 @@
-# pocket-dial — TUI Information Architecture (SSH Sysop Terminal)
+# pocket-dial. TUI Information Architecture (SSH Sysop Terminal)
 
 > **Phase-A deliverable (UX Architect).** Reads from and stays consistent with
 > [`00-brief.md`](00-brief.md) (canonical), [`brand.md`](brand.md) (name treatment, banner,
@@ -7,12 +7,11 @@
 > `src/SIP/PbxConfig.hpp`, `PoolConfig.hpp`, `CallDetailRecord.hpp`, and the CLASS feature-code +
 > DTMF-admin handlers in `src/SIP/RequestsHandler.cpp`.
 >
-> **This file owns:** the master hub, the full v1 screen tree, the global keybinding scheme,
+> This file owns: the master hub, the full v1 screen tree, the global keybinding scheme,
 > the panel/tab interaction model, and the SSH-first onboarding wizard. Downstream:
 > [`tui-style.md`](tui-style.md) (UI Designer) renders these screens in full ANSI;
 > [`walkthrough.md`](walkthrough.md) walks the flows.
 
----
 
 ## 0. IA principles (the load-bearing rules every screen obeys)
 
@@ -41,13 +40,12 @@ architecture. Every decision below traces to one of them.
 9. **Embedded redraw discipline.** Live screens (`[1]` monitor, hub footer counters) repaint cell
    ranges via cursor positioning at ~1 Hz, never full-screen clears (brief §6).
 
----
 
 ## 1. The master HUB (landing screen)
 
 After auth (banner → PIN), the hub is home. It is the brief's numbered command matrix, reconciled to
 pocket-dial's real feature set. `[6] ADDONS` from the brief's example matrix is **renamed `[6] ABOUT`**
-— pocket-dial ships no add-on/plugin surface, and an empty "ADDONS" menu would violate the honesty
+, pocket-dial ships no add-on/plugin surface, and an empty "ADDONS" menu would violate the honesty
 clause (`brand.md` §6.10). ABOUT carries the firmware/build/license/scaling facts an installer reads.
 
 ```
@@ -70,15 +68,15 @@ clause (`brand.md` §6.10). ABOUT carries the firmware/build/license/scaling fac
 ```
 
 **Hub anatomy**
-- **Title bar (row 1):** brand spine. `[ SYSTEM MANAGEMENT ]` is the contextual mode; the clock is
+- Title bar (row 1): brand spine. `[ SYSTEM MANAGEMENT ]` is the contextual mode; the clock is
   `HH:MM:SS`, repainted in place each second (no full clear).
-- **Matrix (body):** six numbered destinations + two single-key system actions (`[R]`, `[L]`). Keys
+- Matrix (body): six numbered destinations + two single-key system actions (`[R]`, `[L]`). Keys
   are unique first-characters so typeahead never collides.
-- **Ambient headroom line (D12):** the live one-liner surfaces the two hard ceilings *before* anyone
-  hits a 503 — registration tally (`● ONLINE`/`○ UNREACH` glyph+label), `n/8 calls`, `ext n/32`, and
+- Ambient headroom line (D12): the live one-liner surfaces the two hard ceilings *before* anyone
+  hits a 503, registration tally (`● ONLINE`/`○ UNREACH` glyph+label), `n/8 calls`, `ext n/32`, and
   network mode. This row repaints ~1 Hz like the monitor.
-- **Prompt:** `Select an option: _` — a single keystroke dispatches; no Enter required (D1).
-- **Footer:** the always-visible key-hint line, ending in the **theme label** (`Theme: BRASS ▸` /
+- Prompt: `Select an option: _`, a single keystroke dispatches; no Enter required (D1).
+- Footer: the always-visible key-hint line, ending in the **theme label** (`Theme: BRASS ▸` /
   `Theme: PHOSPHOR ▸`) so the active theme is named, never read by hue (`brand.md` §5).
 
 **Hub destinations → personas → Task-Inventory coverage** (personas §3):
@@ -95,7 +93,6 @@ clause (`brand.md` §6.10). ABOUT carries the firmware/build/license/scaling fac
 | `L` | LOGOUT | Both | S3 |
 | `?` | HELP (overlay) | Both | S4 (global) |
 
----
 
 ## 2. Full screen tree (v1)
 
@@ -210,13 +207,12 @@ SSH CONNECT
   is a reference card so Dana can answer "what do I dial to turn off forwarding?" (`*73`). Listing the
   real, firmware-verified codes (not invented ones) honors the honesty clause.
 - **`[5]` has two views (CDR + Event Log)** under one hub key because both answer "what happened?"
-  — the CDR for calls (R1–R3), the log tail for system events (R4). `[Tab]` flips between them.
+, the CDR for calls (R1–R3), the log tail for system events (R4). `[Tab]` flips between them.
 - **Factory reset lives in `[4]` SECURITY**, not NETWORK, because it is a credential/identity-wiping
   act; it is `[A!]` double-confirmed and dumps you back into the first-run wizard, closing the loop.
-- **Reboot and Logout stay on the hub** (`[R]`/`[L]`) exactly as the brief specifies — system-level
+- **Reboot and Logout stay on the hub** (`[R]`/`[L]`) exactly as the brief specifies, system-level
   acts that should be reachable from home in one key.
 
----
 
 ## 3. Global keybinding scheme
 
@@ -233,7 +229,7 @@ arrows/Enter/Tab; Esc always backs out one level (D7).
 | `Ctrl-L` | Redraw screen | Recovers from line noise on a serial console; full repaint. |
 | `L` | Logout | From the hub only (panels use `Esc` to return home first). |
 
-### 3.2 Hub (typeahead — single keystroke, no Enter)
+### 3.2 Hub (typeahead, single keystroke, no Enter)
 
 | Key | Action |
 |-----|--------|
@@ -248,7 +244,7 @@ arrows/Enter/Tab; Esc always backs out one level (D7).
 | `T` | Toggle theme BRASS ↔ PHOSPHOR (footer label updates) |
 
 > `T` (theme) is a hub-level toggle so it is always one Esc + one key away from any screen, and the
-> footer's theme label updates immediately — the only "preference" in the product.
+> footer's theme label updates immediately, the only "preference" in the product.
 
 ### 3.3 List / table panels (Extensions, Ring Groups, Forwards/DND, CDR, roster)
 
@@ -293,11 +289,11 @@ arrows/Enter/Tab; Esc always backs out one level (D7).
 | `C` | Clear stale / torn-down rows from the matrix |
 | `Esc` | Back to hub |
 
-> **Reserved-but-unused (honesty):** the brief's monitor example shows `[P] PCAP`. pocket-dial ships
-> no on-device packet capture (no SD card, RTP is peer-to-peer), so **`P` is not bound** — listing a
+> Reserved-but-unused (honesty): the brief's monitor example shows `[P] PCAP`. pocket-dial ships
+> no on-device packet capture (no SD card, RTP is peer-to-peer), so **`P` is not bound**, listing a
 > key that does nothing would violate the honesty clause. The monitor footer shows only real keys.
 
-### 3.7 Footer contract (how keys are always discoverable — D10)
+### 3.7 Footer contract (how keys are always discoverable. D10)
 
 Every screen's footer lists **only the keys live on that screen**, left-to-right by frequency, and
 always ends with the theme label. Examples:
@@ -309,12 +305,11 @@ Monitor:    [F] Freeze  [C] Clear  [Esc] Main  [?] Help                       ·
 Confirm:    [←/→] Choose  [Enter] Confirm  [Esc] Cancel
 ```
 
----
 
 ## 4. Panel & tab interaction model
 
-The brief's two interaction archetypes — the **hub** (single-key launcher) and the **ncurses config
-panel** (tab strip + data table + action buttons) — are the only two body layouts. Everything is one
+The brief's two interaction archetypes, the **hub** (single-key launcher) and the **ncurses config
+panel** (tab strip + data table + action buttons), are the only two body layouts. Everything is one
 or the other, which is what keeps the geometry stable (D13) and the keys consistent (D10).
 
 ### 4.1 The tabbed config panel (used by `[3]` PBX CONFIG)
@@ -338,7 +333,7 @@ or the other, which is what keeps the geometry stable (D13) and the keys consist
 
 **Model rules**
 - **Tab strip = horizontal mode switch.** `[←]/[→]` or `[Tab]/[Shift-Tab]` move the active tab; the
-  active tab is marked by an underline **and its name** (never highlight color alone — D11). Tabs do
+  active tab is marked by an underline **and its name** (never highlight color alone. D11). Tabs do
   not scroll horizontally; all five fit in 80 cols.
 - **One data table per tab.** `[↑]/[↓]` move row selection (a `▸`/inverse marker pairs with position,
   so selection is legible in mono). `[Enter]` opens the row's editor as a centered modal.
@@ -346,8 +341,8 @@ or the other, which is what keeps the geometry stable (D13) and the keys consist
   table verbs; the footer names them. Inside editor *dialogs*, on-screen `< Apply > < Cancel >`
   buttons exist and are reached with `←/→`, because forms benefit from a visible commit affordance.
 - **Headroom is ambient (D12).** The cap (`ext 12/32`) sits bottom-right of the table body, not in an
-  error — you see the ceiling approaching before you hit the 503.
-- **Esc semantics:** in a table, `Esc` → hub. In an editor modal opened from a table, `Esc` → back to
+  error, you see the ceiling approaching before you hit the 503.
+- Esc semantics: in a table, `Esc` → hub. In an editor modal opened from a table, `Esc` → back to
   the table (discarding edits). One level at a time, always.
 
 ### 4.2 Modal editors (Add/Edit dialogs)
@@ -357,7 +352,7 @@ A modal is a centered box over the dimmed panel. It is a **form** (§3.4 keys): 
 add-range, edit-extension, group editor, forward editor, IVR digit editor, PIN change. Destructive
 modals (`[A!]`) add a consequence line and a safe-default button (§4.3).
 
-### 4.3 Confirm dialog (the single guarded-action pattern — D7/D9)
+### 4.3 Confirm dialog (the single guarded-action pattern. D7/D9)
 
 Every `[A!]` action funnels through one confirm pattern: a `▲` glyph, the action in plain words, a
 consequence sentence, and two buttons with the **safe choice pre-selected**.
@@ -385,13 +380,12 @@ blame the input not the user; no exclamation marks.
 title area (`Recent Calls ◂▸ Event Log`). Same row/scroll keys as §3.3. This keeps "two related
 read-only views under one hub key" from needing a second hub slot.
 
----
 
 ## 5. SSH-first onboarding wizard
 
 The wizard is the heart of the redesign: it **replaces the entire `gen_provision_nvs.py` →
 `nvs_partition_gen.py` → `esptool write_flash 0x9000` toolchain ritual** over SSH in one sitting (D5).
-It is **forced** on an un-provisioned box (no usable default state exists — O1), **linear, numbered,
+It is **forced** on an un-provisioned box (no usable default state exists. O1), **linear, numbered,
 and resumable** (D3): an interrupted install resumes at the last completed step, because each step
 persists to NVS as it is applied. It uses the form keys (§3.4); `Enter` advances, `Esc` steps back,
 and there is a visible step counter so the installer always knows how far they are.
@@ -439,9 +433,9 @@ FIRST-RUN WIZARD  (forced; resumable)            → personas §3.1 O1–O6
 ### 5.2 Wizard interaction rules
 
 - **Resumable (D3).** Each step commits to NVS on `Enter`. If the SSH session drops mid-install, the
-  next connect re-enters the wizard at the first incomplete step — never from zero.
+  next connect re-enters the wizard at the first incomplete step, never from zero.
 - **Esc steps back, never forward, never destroys.** From `[0/5]` Esc is a no-op (you cannot escape
-  setup on an un-provisioned box — there is nothing usable behind it). This is the one place Esc does
+  setup on an un-provisioned box, there is nothing usable behind it). This is the one place Esc does
   not reach the hub, because there is no hub yet.
 - **Numbered + footer-guided (D10).** Every step shows `[n/5]` and a footer:
   `[Tab] Field  [Enter] Next  [Esc] Back  [?] Help`. Help is per-step.
@@ -449,11 +443,11 @@ FIRST-RUN WIZARD  (forced; resumable)            → personas §3.1 O1–O6
   flags `⚠ EXCEEDS CAP` *before* apply, so the installer corrects the range instead of meeting a 503.
 - **Ends in evidence (D4).** Finishing the wizard lands on the hub adjacent to the live monitor, so
   the installer's acceptance test (ring a phone, watch the matrix and the `● ONLINE` dots) is the
-  natural next keystroke — the handoff closes on proof, not hope.
+  natural next keystroke, the handoff closes on proof, not hope.
 
 ### 5.3 Wizard ⇄ steady-state mapping (no orphan screens)
 
-Every wizard step has a permanent home in the hub so day-2 edits use the *same* screens (D10 — one
+Every wizard step has a permanent home in the hub so day-2 edits use the *same* screens (D10, one
 mental model, two speeds). Nothing learned in the wizard is thrown away:
 
 | Wizard step | Permanent home | Re-entry |
@@ -464,9 +458,8 @@ mental model, two speeds). Nothing learned in the wizard is thrown away:
 | [4] First extensions | `[3]` PBX CONFIG · Extensions `(A)` | add more, single or range |
 | [5] Handoff card | `[6]` ABOUT | re-read host/build/caps anytime |
 
----
 
-## 6. Coverage matrix — every Task-Inventory item has a home
+## 6. Coverage matrix, every Task-Inventory item has a home
 
 Cross-checked against `personas.md` §3 (the authoritative checklist). Every task lands on exactly one
 primary screen; cross-links noted. No task is unmapped; no screen lacks a task.
@@ -499,7 +492,7 @@ primary screen; cross-links noted. No task is unmapped; no screen lacks a task.
 | F6 star-code reference | `[3]` Features tab (read-only) | real codes only (§6.1) |
 | V1 DTMF digit map | `[3]` IVR tab | digit → action |
 | V2 pick prompt | `[3]` IVR | on-flash prompts partition |
-| V3 set/test answer point | `[3]` IVR `(T)` | — |
+| V3 set/test answer point | `[3]` IVR `(T)` |, |
 | M1 live call matrix | `[1]` MONITOR ⟳ | ≤8 sessions |
 | M2 registration roster | `[1]` MONITOR | ● ONLINE / ○ UNREACH |
 | M3 hardware vitals | `[1]` MONITOR | CPU/mem/uptime/pool n/8 |
@@ -517,7 +510,7 @@ primary screen; cross-links noted. No task is unmapped; no screen lacks a task.
 | S4 `?` help everywhere | global overlay | every screen |
 | (cross-cutting) Esc-back, footer, confirm-on-destructive, glyph+label | global (§0, §3) | every screen |
 
-### 6.1 Star-code reference (Features tab) — verified against firmware
+### 6.1 Star-code reference (Features tab), verified against firmware
 
 These are the **only** codes the firmware's CLASS handler actually implements
 (`src/SIP/RequestsHandler.cpp`); the Features tab lists exactly these, no invented ones:
@@ -534,7 +527,7 @@ These are the **only** codes the firmware's CLASS handler actually implements
 > Admin-only DTMF menu (caller must be the admin extension): `*<PIN>#001` NTP resync,
 > `*<PIN>#101` network-mode toggle. Documented in `[4]` SECURITY help, not the public Features card.
 
-### 6.2 CDR result vocabulary — corrected to the real enum
+### 6.2 CDR result vocabulary, corrected to the real enum
 
 `personas.md` §3.7 lists outcomes as "answered / busy / no-answer / cancelled / failed", but the
 shipping `CdrResult` enum (`src/SIP/CallDetailRecord.hpp`) is **`Answered · Busy · Cancelled ·
@@ -550,7 +543,6 @@ state the firmware doesn't write:
 | Unavailable | `unavailable` | `○ unavailable` |
 | Failed | `failed` | `▲ failed` |
 
----
 
 ## 7. Consistency check (brand §6.1 + brief §6)
 
@@ -569,22 +561,20 @@ state the firmware doesn't write:
 [x] Wizard replaces gen_provision_nvs.py end-to-end over SSH (D5); resumable (D3); ends in proof (D4)
 ```
 
----
 
 ## 8. Open IA questions (hand-offs to downstream agents)
 
 - **`[5]` two-view vs. two hub keys.** I model Recent-Calls + Event-Log as `[Tab]`-toggled views under
   one hub key to conserve the 6-slot matrix. If usability testing (personas §6.2) shows admins miss
-  the log, promote it — the hub has room before `[6]`.
+  the log, promote it, the hub has room before `[6]`.
 - **IVR scope rendering.** The IVR is deliberately "DTMF menu → ring/prompt", no queues. UI Designer
   should ensure the digit-map screen visually reads as *one shallow menu*, not a tree, to avoid
-  implying IVR-tree capability we don't ship (brand bans "IVR-tree" — say "menu").
+  implying IVR-tree capability we don't ship (brand bans "IVR-tree", say "menu").
 - **Theme toggle key (`T`).** Placed at the hub for global reach; UI Designer confirms it doesn't
-  collide with any panel hotkey (it doesn't — panels reach theme via Esc-to-hub-then-`T`).
-- **SSH-key vs PIN handoff (S2).** Open per personas §6 — IA reserves `[4]`→`(K)` for both; final
+  collide with any panel hotkey (it doesn't, panels reach theme via Esc-to-hub-then-`T`).
+- **SSH-key vs PIN handoff (S2).** Open per personas §6. IA reserves `[4]`→`(K)` for both; final
   policy (key required vs PIN sufficient for Dana) is a research/security decision, not an IA one.
 
----
 
 *UX Architect · pocket-dial 3.x redesign · grounded in `src/SIP/{PbxConfig,PoolConfig,*
 *CallDetailRecord}.hpp` + the CLASS/DTMF handlers in `RequestsHandler.cpp`; consistent with*

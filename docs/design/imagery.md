@@ -1,10 +1,10 @@
-# pocket-dial — Raster Imagery Specs & Generation Prompts
+# pocket-dial: Raster Imagery Specs & Generation Prompts
 
-> **Agent:** Image Prompt Engineer + Inclusive Visuals (reduced role).
-> **Why reduced:** pocket-dial is a *pure-ANSI/TUI* product. The SSH terminal, login banner, hub,
-> panels, and live monitor are **text, not pictures** — they are owned by
+> Agent: Image Prompt Engineer + Inclusive Visuals (reduced role).
+> Why reduced: pocket-dial is a *pure-ANSI/TUI* product. The SSH terminal, login banner, hub,
+> panels, and live monitor are **text, not pictures**. They are owned by
 > [`brand.md`](brand.md) / [`tui-style.md`](tui-style.md) and are **not** raster assets. This file
-> covers **only the three places a real bitmap exists**:
+> covers only the three places a real bitmap exists:
 >
 > | # | Asset | Surface | Canvas | Render path |
 > |---|---|---|---|---|
@@ -15,16 +15,14 @@
 > Everything here inherits the locked brand from [`00-brief.md`](00-brief.md) §5 and
 > [`brand.md`](brand.md): name **pocket-dial**, tagline *operator on duty*, the **BRASS** (default) /
 > **PHOSPHOR** (alt) palettes, the jack mark `(◉)`, and the flavor budget (only *operator on duty*
-> and *Patching you through…* spend charm). **No new copy, no new colors, no sub-brands.**
-
----
+> and *Patching you through…* spend charm). No new copy, no new colors, no sub-brands.
 
 ## 0. Shared palette tokens (single source of truth)
 
 Pulled verbatim from `main/ui/ui.cpp` `PALETTES[]` and `00-brief.md` §5. Every prompt and spec below
 references these by name so the splash, the card, and the hero read as **one product**.
 
-### BRASS (default) — deep charcoal board, warm brass rails, amber lamps
+### BRASS (default): deep charcoal board, warm brass rails, amber lamps
 | Token | Hex | RGB | Role |
 |---|---|---|---|
 | `BRASS.bg` | `#161412` | 22,20,18 | board background (near-black warm charcoal) |
@@ -32,10 +30,10 @@ references these by name so the splash, the card, and the hero read as **one pro
 | `BRASS.border` | `#B08438` | 176,132,56 | brass rails / frame / nameplate |
 | `BRASS.text` | `#D6B26E` | 214,178,110 | brass label text |
 | `BRASS.highlight` | `#F5D696` | 245,214,150 | bright brass / headers |
-| `BRASS.accent` | `#FFB020` | 255,176,32 | **the lamp** — live/lit only |
+| `BRASS.accent` | `#FFB020` | 255,176,32 | **the lamp** (live/lit only) |
 | `BRASS.alert` | `#C84028` | 200,64,40 | destructive / alert only |
 
-### PHOSPHOR (alt) — charcoal board, dim-brass rails, green phosphor lamps
+### PHOSPHOR (alt): charcoal board, dim-brass rails, green phosphor lamps
 | Token | Hex | RGB | Role |
 |---|---|---|---|
 | `PHOS.bg` | `#10140F` | 16,20,15 | board background |
@@ -43,17 +41,15 @@ references these by name so the splash, the card, and the hero read as **one pro
 | `PHOS.border` | `#96823C` | 150,130,60 | dim-brass rails / frame |
 | `PHOS.text` | `#AAD296` | 170,210,150 | phosphor label text |
 | `PHOS.highlight` | `#D2F0BE` | 210,240,190 | bright phosphor |
-| `PHOS.accent` | `#40FF60` | 64,255,96 | **the lamp** — live/lit only |
+| `PHOS.accent` | `#40FF60` | 64,255,96 | **the lamp** (live/lit only) |
 | `PHOS.alert` | `#DC4632` | 220,70,50 | destructive / alert only |
 
-**Locked discipline (from brand.md):** *brass is the chrome, the lamp is the accent.* Frames, rails,
+Locked discipline (from brand.md): *brass is the chrome, the lamp is the accent.* Frames, rails,
 and nameplate are `border`; the single hot accent (`accent`) is reserved for **live things**; `alert`
-red is rationed to destructive/alert only. **State is never color alone** — every status is glyph +
+red is rationed to destructive/alert only. State is never color alone: every status is glyph +
 LABEL, the label authoritative, the glyph reinforcing, color the removable third layer.
 
----
-
-## 1. ON-DEVICE SPLASH / BOOT ART — 320 × 480, portrait
+## 1. ON-DEVICE SPLASH / BOOT ART: 320 × 480, portrait
 
 ### 1.1 Purpose & viewing reality
 Shown for the ~3–6 s while firmware boots, *before* the wallboard goes live; the brand's first
@@ -64,15 +60,15 @@ physical impression. **Viewing distance is arms-length-to-across-the-room at 3.5
 ### 1.2 Hard technical constraints (this is an ESP32-S3)
 - **Exact canvas: 320 px wide × 480 px tall, portrait.** Matches `lv_obj_set_size(main_container,320,480)`.
 - **Must ship in flash** (16 MB, but the wallboard shares it). Two viable encodings:
-  - **Preferred: drawn in LVGL primitives** (rects, lines, label with the embedded font) — ~0 image
+  - **Preferred: drawn in LVGL primitives** (rects, lines, label with the embedded font), ~0 image
     bytes, recolors for free per theme, crisp at native res. This is the **default deliverable**.
   - Fallback: a single **flat-color PNG/`LV_IMG_CF_TRUE_COLOR`** ≤ ~24 KB. If raster, it must be a
     *flat vector-style* render (no photographic grain) so it compresses and stays sharp.
-- **No per-tick repaint** (`ui.cpp:192` — "Discrete state changes only"): the splash is drawn once,
+- **No per-tick repaint** (`ui.cpp:192`, "Discrete state changes only"): the splash is drawn once,
   then replaced by the wallboard. No animation budget assumed beyond an optional single lamp fade.
 - **Two theme variants required** (BRASS + PHOSPHOR), identical geometry, only token swaps. The panel's
   `disp_on_off` inversion footgun (per device memory) means **never rely on subtle near-black
-  separation** — keep the board bg and panel a clear ≥2-step value apart.
+  separation**: keep the board bg and panel a clear ≥2-step value apart.
 
 ### 1.3 Layout spec (ASCII wireframe of the 320×480 frame)
 ```
@@ -96,15 +92,16 @@ physical impression. **Viewing distance is arms-length-to-across-the-room at 3.5
 │                                    │           BRASS.accent diamond + BRASS.text
 └────────────────────────────────────┘  ← 480px  border rail
 ```
-- **Focal hierarchy:** jack mark `(◉)` → POCKET-DIAL wordmark → SYSOP TERMINAL → *single-board SIP PBX*
-  → boot line. Exactly **one** charm line (`Patching you through…`, sanctioned by the flavor budget).
+Focal hierarchy: jack mark `(◉)` leads to the POCKET-DIAL wordmark, then SYSOP TERMINAL, then
+*single-board SIP PBX*, then the boot line. Exactly **one** charm line (`Patching you through…`,
+sanctioned by the flavor budget).
 - **The only lit element is the `(◉)` ring and the `◆` lamp**, both in `accent`. Everything else is
   `border` / `text` / `highlight`. This obeys "the lamp is the accent."
-- **Color-independent:** the wordmark + descriptor carry 100% of meaning in pure value; on a washed-out
-  or color-shifted panel the splash still reads. No status is encoded here, so no glyph/label pairing is
-  *required*, but the `◆` before the boot line keeps the house style.
+- The wordmark + descriptor are color-independent: they carry 100% of meaning in pure value; on a
+  washed-out or color-shifted panel the splash still reads. No status is encoded here, so no
+  glyph/label pairing is *required*, but the `◆` before the boot line keeps the house style.
 
-### 1.4 Generation prompt — BRASS variant
+### 1.4 Generation prompt: BRASS variant
 > Use only if rendering a raster fallback. Platform-agnostic; tuned for Flux / SDXL / Midjourney.
 
 ```
@@ -123,8 +120,8 @@ NEGATIVE: photorealism, skin, faces, people, busy texture, noise, drop shadows,
 3D bevels, lens flare, watermark, gradient background, rainbow colors, red except none.
 ```
 
-### 1.5 Generation prompt — PHOSPHOR variant
-Identical geometry; swap tokens — board `#10140F`, jack/lamp **green `#40FF60`**, rails `#96823C`,
+### 1.5 Generation prompt: PHOSPHOR variant
+Identical geometry; swap tokens: board `#10140F`, jack/lamp **green `#40FF60`**, rails `#96823C`,
 wordmark `#D2F0BE`, descriptor `#AAD296`. Same NEGATIVE list.
 ```
 …same composition as BRASS… background deep charcoal-green (#10140F); the jack icon and
@@ -137,28 +134,26 @@ bottom diamond glow phosphor green (#40FF60); wordmark in pale phosphor (#D2F0BE
 - [ ] Wordmark reads "POCKET-DIAL" (one hyphen, all-caps) at 320×480, legible at 3.5".
 - [ ] Exactly one lit accent color in frame; rails/text are brass/`border`, not accent.
 - [ ] BRASS and PHOSPHOR variants are geometry-identical, token-swapped only.
-- [ ] Survives value-only (grayscale) rendering — no meaning lost.
+- [ ] Survives value-only (grayscale) rendering, no meaning lost.
 - [ ] No photographic grain; flat enough to draw in LVGL primitives or compress < 24 KB.
 - [ ] Only flavor line present is `Patching you through…`; no extra copy.
 
----
-
-## 2. ONBOARDING QR "CARD" — 320 × 480, portrait
+## 2. ONBOARDING QR "CARD": 320 × 480, portrait
 
 ### 2.1 Purpose
-First-run / "how do I configure this?" screen on the device. The redesign is **SSH-first**: the box has
+First-run / "how do I configure this?" screen on the device. The redesign is SSH-first: the box has
 no touch config, so the screen's job is to **hand the installer to the terminal**. The card shows brand
 + host + one instruction + the QR. (Today `ui.cpp:586,813` renders a `WIFI:` QR into a 99×99 canvas via
-the `qrcode` lib at `ECC_LOW`, version 4 — this card keeps that exact render path, only the payload and
+the `qrcode` lib at `ECC_LOW`, version 4; this card keeps that exact render path, only the payload and
 chrome change.)
 
 ### 2.2 QR payload (locked)
-- **Encode an `ssh://` URI to the host**, not Wi-Fi creds:
+- Encode an `ssh://` URI to the host, not Wi-Fi creds:
   `ssh://sysop@pocketdial.local` (firmware substitutes the live host/IP if mDNS is unresolved).
 - Keep **`ECC_LOW`, version 4** to fit the existing 99×99 canvas buffer; the URI above is short enough.
-  If a longer payload is ever needed, bump version and the canvas size together — do **not** silently
+  If a longer payload is ever needed, bump version and the canvas size together. Do **not** silently
   overflow the 99×99 buffer (`ui.cpp:584`).
-- **Quiet zone:** the QR module render must keep ≥4-module white margin (`draw_qr` already paints a
+- Quiet zone: the QR module render must keep ≥4-module white margin (`draw_qr` already paints a
   white field). Scanners need it.
 
 ### 2.3 Layout spec (ASCII wireframe)
@@ -188,17 +183,17 @@ chrome change.)
 ```
 - **`◆ READY` keeps the brand's glyph+label+color triad** (brand.md §3.1): the word READY is
   authoritative, `◆` reinforces, amber is removable. A monochrome panel still reads "READY".
-- **QR is on the one white field in the whole product** — intentional, scanners require high contrast;
+- **QR is on the one white field in the whole product**, intentionally: scanners require high contrast,
   it is functional, not decorative, so it is exempt from the brass-only chrome rule.
-- **Two strings carry the job:** `SSH here to configure` (instruction) and the `ssh sysop@…` fallback,
+- Two strings carry the job: `SSH here to configure` (instruction) and the `ssh sysop@…` fallback,
   so an installer **without** a QR-scanning camera is never stuck. Honesty/keyboard-first voice: "SSH",
   not "scan to connect"; no "tap".
 - One sanctioned flavor line: `operator on duty`. Nothing else spends charm.
-- **PHOSPHOR variant:** same geometry; rails/border → `PHOS.border`, instruction → `PHOS.highlight`,
-  the `◆ READY` / `◆ operator on duty` lamps → `PHOS.accent` green. **QR stays black-on-white in both
-  themes** — never tint a QR; tinting breaks scanners and the contrast guarantee.
+- PHOSPHOR variant: same geometry; rails/border become `PHOS.border`, instruction becomes
+  `PHOS.highlight`, the `◆ READY` / `◆ operator on duty` lamps become `PHOS.accent` green. **QR stays
+  black-on-white in both themes**: never tint a QR, tinting breaks scanners and the contrast guarantee.
 
-### 2.4 Generation prompt (reference layout — the card is built in LVGL, not generated)
+### 2.4 Generation prompt (reference layout; the card is built in LVGL, not generated)
 > This card is **drawn on-device** (it needs the live host/IP and a real QR). The prompt below is only
 > for producing a *design comp / README figure*, not the shipped asset.
 ```
@@ -224,21 +219,19 @@ NEGATIVE: photorealism, people, faces, busy texture, gradients (except faint amb
 - [ ] Host/Addr/User block is monospace, colon-aligned, fed from live device state.
 - [ ] Says "SSH", never "tap/click/scan-to-connect"; one flavor line only.
 
----
-
-## 3. README / MARKETING HERO — 2400 × 1350 (16:9)
+## 3. README / MARKETING HERO: 2400 × 1350 (16:9)
 
 ### 3.1 Purpose
 The repo's front-door image and any web/marketing use. Goal: **sell the "sysop terminal" aesthetic and
-the embedded reality in one frame** — a single small board lighting up a glowing amber/green terminal.
+the embedded reality in one frame** (a single small board lighting up a glowing amber/green terminal).
 Honest: it is a *single ESP32-S3 + a 3.5" screen*, not a rack. The hero should feel like a **night-shift
 operator's bench**, not a data center.
 
 ### 3.2 Constraints
 - **2400 × 1350 px, 16:9** (downscales cleanly to GitHub's ~1280-wide social card; keep the focal
   subject within the centered 1280×640 safe area).
-- **One hero composition, both palettes optional** — BRASS is the canonical hero.
-- **The on-screen content must be real product** — the actual ANSI hub or live monitor from
+- One hero composition, both palettes optional. BRASS is the canonical hero.
+- The on-screen content must be real product: the actual ANSI hub or live monitor from
   `tui-style.md`, not invented UI. Inclusive-visuals note in §4 governs any hands/people in frame.
 
 ### 3.3 Composition spec
@@ -258,16 +251,16 @@ operator's bench**, not a data center.
 │   POCKET-DIAL · SYSOP TERMINAL — single-board SIP PBX (lower-third, brass)  │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
-- **Subject:** the tiny board + its 3.5" wallboard (showing the §1 splash or the live monitor) in the
-  foreground; a warm amber terminal/CRT behind it showing the **real ANSI hub**. Story = *small box,
-  big operator energy.*
-- **Lighting:** single warm key from the screens (the lamp is the light source), deep falloff into
-  charcoal — chiaroscuro / neon-noir on a workbench. Shallow depth of field, the board tack-sharp,
-  background bokeh.
+Subject: the tiny board + its 3.5" wallboard (showing the §1 splash or the live monitor) in the
+foreground; a warm amber terminal/CRT behind it showing the **real ANSI hub**. Story = *small box,
+big operator energy.*
+Lighting: single warm key from the screens (the lamp is the light source), deep falloff into
+charcoal, chiaroscuro / neon-noir on a workbench. Shallow depth of field, the board tack-sharp,
+background bokeh.
 - **Lower-third title** in brass: `POCKET-DIAL · SYSOP TERMINAL — single-board SIP PBX`. No marketing
   superlatives, no exclamation marks (voice rule).
 
-### 3.4 Generation prompt — hero (BRASS, canonical)
+### 3.4 Generation prompt: hero (BRASS, canonical)
 ```
 A moody product hero photograph, 16:9, of a tiny single-board computer (ESP32-S3) with a
 small 3.5-inch portrait IPS screen, sitting on a dark workbench. The little screen glows
@@ -285,8 +278,8 @@ NEGATIVE: rack of servers, data center, blue/cyan tech glow, cluttered desk, bus
 phones, people unless intentional, cartoon, lens dirt, heavy bloom, rainbow RGB lighting,
 text errors, gibberish on screen, exclamation marks, watermark, logos other than POCKET-DIAL.
 ```
-- **PHOSPHOR alt:** swap amber → phosphor green `#40FF60`, board bg `#10140F`, rails `#96823C`, "green
-  CRT" mood; otherwise identical.
+PHOSPHOR alt: swap amber for phosphor green `#40FF60`, board bg `#10140F`, rails `#96823C`, "green
+CRT" mood; otherwise identical.
 
 ### 3.5 Acceptance checklist
 - [ ] Subject reads as **one small board + 3.5" screen**, not a rack/data-center (honesty clause).
@@ -296,8 +289,6 @@ text errors, gibberish on screen, exclamation marks, watermark, logos other than
 - [ ] Lower-third title exact: `POCKET-DIAL · SYSOP TERMINAL — single-board SIP PBX`. No hype, no "!".
 - [ ] Focal subject inside the centered 1280×640 social-card safe area.
 
----
-
 ## 4. Inclusive-visuals review (the few human-facing surfaces)
 
 pocket-dial's product surfaces are **text + one icon + one QR**, so the inclusive-visuals footprint is
@@ -305,23 +296,21 @@ small but real. Guardrails:
 
 - **No people are required anywhere.** The product story is the board + the terminal. If the **hero**
   (§3) ever shows a human (hands on a keyboard, an operator at the bench), follow:
-  - **Skin/representation:** if hands appear, vary skin tone across marketing sets; never default to a
-    single tone. Prefer **hands at a keyboard** over faces — it centers the *keyboard-first* promise and
+  - Skin/representation: if hands appear, vary skin tone across marketing sets; never default to a
+    single tone. Prefer **hands at a keyboard** over faces: it centers the *keyboard-first* promise and
     sidesteps tokenism. No gendered/"hacker in a hoodie" cliché.
-  - **No surveillance/menace framing** (no dark-hacker tropes) — the voice is a *calm night-shift
+  - No surveillance/menace framing (no dark-hacker tropes). The voice is a *calm night-shift
     operator*, not an intruder. Warm, competent, mundane-expert.
 - **Accessibility carries into raster** (mirrors [`accessibility.md`](accessibility.md)):
-  - Every status glyph in any rendered image keeps its **label** (`◆ READY`, `◆ ACTIVE`) — never a bare
+  - Every status glyph in any rendered image keeps its **label** (`◆ READY`, `◆ ACTIVE`), never a bare
     colored dot. Validated against the brief's "never color alone" rule.
-  - The splash/card must pass a **grayscale check**: convert to luminance; all text must still separate
+  - The splash/card must pass a grayscale check: convert to luminance; all text must still separate
     from background ≥ value-step the panel uses. (Guards the `disp_on_off` inversion footgun.)
-  - QR contrast is **non-negotiable black-on-white** — the single most accessibility-sensitive bitmap;
+  - QR contrast is **non-negotiable black-on-white**, the single most accessibility-sensitive bitmap;
     never themed, never tinted, always with quiet zone.
-- **Honest representation:** marketing must not imply trunks, queues, conferencing, a rack, an SD card,
+- Honest representation: marketing must not imply trunks, queues, conferencing, a rack, an SD card,
   or voicemail-in-v1 (brief §3, honesty clause). Show only what ships: extensions, ring groups, IVR,
   forward/DND/transfer/star-codes, CDR, live monitor.
-
----
 
 ## 5. Asset register (hand-off summary)
 
@@ -331,22 +320,20 @@ small but real. Guardrails:
 | Onboarding QR card | 320×480 | BRASS + PHOSPHOR (QR mono in both) | LVGL layout + 99×99 QR canvas, live payload | firmware (`ui.cpp` draw_qr path) |
 | README / hero | 2400×1350 | BRASS canonical (+PHOSPHOR alt) | PNG/WebP in `/docs` or repo root | repo (external render) |
 
-**Out of scope (text, not raster):** login banner, hub, all config panels, live monitor, help screens —
+Out of scope (text, not raster): login banner, hub, all config panels, live monitor, help screens,
 owned by `brand.md` / `tui-style.md`. Do not generate these as images.
-
----
 
 ## Inclusive review
 
-> **Reviewer:** Inclusive Visuals Specialist. This section **does not replace** the prompts in §1–§4;
-> it **tightens** them. The existing §4 guardrails are correct in spirit but under-specified for the way
+> Reviewer: Inclusive Visuals Specialist. This section does not replace the prompts in §1 through §4;
+> it tightens them. The existing §4 guardrails are correct in spirit but under-specified for the way
 > foundational image models actually fail. Below: (a) where bias would creep in, (b) drop-in tightened
-> prompt language, (c) a reusable negative library, (d) a review gate. Apply these fragments **on top of**
-> the prompts already written — do not rewrite the originals.
+> prompt language, (c) a reusable negative library, (d) a review gate. Apply these fragments on top of
+> the prompts already written; do not rewrite the originals.
 
 ### IR.1 Bias surface assessment (what these prompts will actually trigger)
 
-pocket-dial's human footprint is genuinely tiny — **the splash (§1) and the QR card (§2) contain no
+pocket-dial's human footprint is genuinely tiny. **The splash (§1) and the QR card (§2) contain no
 people and must stay that way.** The only place a person can appear is the **README hero (§3)**, and only
 behind the `people unless intentional` clause. That single conditional is the entire risk surface, plus
 the cross-cutting "AI weirdness" risk on every screen (gibberish script, warped hardware, false UI).
@@ -357,13 +344,13 @@ the cross-cutting "AI weirdness" risk on every screen (gibberish script, warped 
 | §2 QR card | none | **tinted/warped QR** (accessibility-critical), invented extra glyph rows |
 | §3 Hero | **optional human** | clone faces, single default skin tone, "hacker in a hoodie", menace lighting, extra fingers on the keyboard, gibberish on the CRT, wrong board form-factor |
 
-**Verdict:** the safest hero ships **with no person at all** (board + terminal only), which §3 already
+The verdict: the safest hero ships **with no person at all** (board + terminal only), which §3 already
 supports. *If* a human is added, it must be **hands at a keyboard, never a face/figure**, and must carry
 the tightened language in IR.2. A face/figure in this product is over-reach and reintroduces exactly the
-tokenism §4 warns against — so we constrain the *only* sanctioned human depiction to anonymous,
+tokenism §4 warns against, so we constrain the *only* sanctioned human depiction to anonymous,
 competent hands.
 
-### IR.2 Tightened hero language — the "hands at the keyboard" variant (append to §3.4)
+### IR.2 Tightened hero language: the "hands at the keyboard" variant (append to §3.4)
 
 > Use **only** if the hero includes a human. Append this block to the §3.4 BRASS prompt (and the PHOSPHOR
 > swap). It replaces the vague `people unless intentional` with an explicit, dignified, non-stereotyped
@@ -383,20 +370,20 @@ the bench, or the armrest of a supportive chair) is welcome but never the subjec
 glitched. The keyboard is a real, ordinary keyboard with consistent, correctly-spaced keycaps.
 ```
 
-**Why each clause is load-bearing (memory of how the models fail):**
-- *"hands… no face… no torso"* — removes the entire face-tokenism / "clone diverse crowd" failure mode at
+Why each clause is load-bearing (memory of how the models fail):
+- *"hands… no face… no torso"* removes the entire face-tokenism / "clone diverse crowd" failure mode at
   the source; you cannot stereotype a face you do not render. Also reinforces the *keyboard-first* promise.
-- *"exactly five fingers each, correct proportions"* — Flux/SDXL/Midjourney still mangle hands; naming the
+- *"exactly five fingers each, correct proportions"*: Flux/SDXL/Midjourney still mangle hands; naming the
   count and proportions measurably reduces six-finger / fused-knuckle artifacts.
-- *"unremarked and natural… vary across a set"* — defeats both the **default-tone bias** (models trend to
+- *"unremarked and natural… vary across a set"* defeats both the **default-tone bias** (models trend to
   one tone) **and** the **over-correction failure** (a model told to be "diverse" in one image produces a
   tokenized, posed result). The fix is set-level variance, not in-frame quota.
-- *"include visibly older hands"* — age is the most-omitted axis in tech imagery; calling it out prevents
+- *"include visibly older hands"*: age is the most-omitted axis in tech imagery; calling it out prevents
   the perpetual-25-year-old default.
-- *"mobility aid… never the subject and never glitched"* — disability representation must be incidental and
+- *"mobility aid… never the subject and never glitched"*: disability representation must be incidental and
   dignified, and **video/photo models warp canes/wheels** when they are foregrounded; keeping it in the
   deep background renders it cleanly and avoids inspiration-porn framing.
-- *"calm night-shift operator, not secretive or menacing"* — directly cancels the "dark hacker in a hoodie"
+- *"calm night-shift operator, not secretive or menacing"* directly cancels the "dark hacker in a hoodie"
   archetype the prompt's noir lighting could otherwise pull toward.
 
 ### IR.3 Reusable inclusive + anti-artifact negative library (apply to ALL §1–§3 prompts)
@@ -431,17 +418,17 @@ blue/cyan tech glow, cluttered cables.
 ### IR.4 Cultural-neutrality + honesty notes (refines §4, does not replace it)
 
 - **Culturally neutral by construction.** pocket-dial carries **no culturally-specific imagery, script,
-  symbol, flag, or motif** — and must not acquire one by hallucination. The wordmark is the only text;
+  symbol, flag, or motif**, and must not acquire one by hallucination. The wordmark is the only text;
   everything else that *looks* like text in a render is a defect (see Universal negative). This sidesteps
   the "gibberish foreign script" and "invented cultural symbol" failure modes entirely: the correct number
   of cultural symbols in this product is **zero**.
-- **No geography to get wrong.** The hero is a *workbench at night*, deliberately placeless — no skyline,
+- **No geography to get wrong.** The hero is a *workbench at night*, deliberately placeless: no skyline,
   no national context, no "office in [city]" anchoring. This is intentional: it removes the architectural-
   accuracy / "exoticized locale" risk class instead of trying to render it correctly.
 - **The lamp is the only warmth, not a person.** The emotional center is the glowing screen, not a human
-  subject — which is *why* the hero reads as inclusive: it does not ask any one demographic to "be" the
+  subject, which is *why* the hero reads as inclusive: it does not ask any one demographic to "be" the
   product. Keep it that way; a human is an optional accent, never the hero's meaning.
-- **Honesty (carries from §4):** no rack, trunk, queue, SD card, conferencing, or voicemail-in-v1 implied
+- Honesty (carries from §4): no rack, trunk, queue, SD card, conferencing, or voicemail-in-v1 implied
   in any frame; the on-CRT content is the **real** ANSI hub/monitor from `tui-style.md`, spelled correctly.
 
 ### IR.5 Inclusive review gate (run before any hero with a human ships)
@@ -449,18 +436,18 @@ blue/cyan tech glow, cluttered cables.
 A render passes only if **all** are true; any failure is a re-prompt, not a touch-up.
 
 - [ ] **No face / no figure.** If a human is present, it is hands-only, mid-forearm-down, no torso, no eyes.
-- [ ] **Hands are anatomically correct** — five fingers per hand, plausible proportions, no extra/fused/
+- [ ] Hands are anatomically correct: five fingers per hand, plausible proportions, no extra/fused/
       missing digits, no plastic/doll skin.
 - [ ] **No archetype.** No hoodie/hacker/menace/surveillance framing; mood is calm competent night-shift.
 - [ ] **Set-level variance.** Across the marketing set, skin tone, hand size, and **age** visibly vary; no
       single default tone and no all-young cast.
-- [ ] **Mobility aid (if any) is incidental and clean** — background, unglitched, not inspiration-porn.
+- [ ] **Mobility aid (if any) is incidental and clean**: background, unglitched, not inspiration-porn.
 - [ ] **No gibberish / no invented script / no cultural prop.** Only correct copy is the POCKET-DIAL
       wordmark and the real ANSI UI; zero cultural symbols (correct count is zero).
 - [ ] **QR is pure black-on-white** with quiet zone, untinted, undistorted (guards the §2 card).
-- [ ] **Grayscale pass** — convert to luminance; every label still separates from background; every status
+- [ ] Grayscale pass: convert to luminance; every label still separates from background; every status
       stays glyph + label, never a bare colored dot (mirrors §4 + `accessibility.md`).
-- [ ] **Honesty pass** — no rack/trunk/queue/SD/voicemail implied; on-screen UI is real and correctly spelled.
+- [ ] Honesty pass: no rack/trunk/queue/SD/voicemail implied; on-screen UI is real and correctly spelled.
 
 ### IR.6 What did NOT need changing (so the next agent doesn't "fix" it)
 

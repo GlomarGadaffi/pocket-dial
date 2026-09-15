@@ -1,4 +1,4 @@
-# pocket-dial — ANSI Visual System & Screen Mockups (SSH Sysop Terminal)
+# pocket-dial: ANSI Visual System & Screen Mockups (SSH Sysop Terminal)
 
 > **Phase-A deliverable (UI Designer).** Renders the screens defined in
 > [`tui-ia.md`](tui-ia.md) in full 16-color ANSI, using the identity, status lexicon, and ASCII
@@ -10,11 +10,9 @@
 > (2) a reusable **ANSI component library** drawn in box-drawing glyphs; (3) a faithful **80×24
 > ANSI mockup of every screen** in the IA.
 >
-> **Reading the mockups:** the box-drawing art *is* the spec. Where a cell would be tinted, the
-> color role is named in a `‹role›` annotation in the prose beside the mockup — the glyph carries
+> Reading the mockups: the box-drawing art *is* the spec. Where a cell would be tinted, the
+> color role is named in a `‹role›` annotation in the prose beside the mockup. The glyph carries
 > the meaning, the color only decorates (brand §4.5). Every screen is ≤ 80 columns and ≤ 24 rows.
-
----
 
 ## 0. Design constraints this file is built to satisfy
 
@@ -27,11 +25,9 @@ Pulled forward from the brief and brand so the visual system is checkable agains
 - **State is never color alone.** Every status renders as **glyph + LABEL**; color is the third,
   removable layer (brand §4.5). The mockups are legible with all SGR stripped.
 - **Embedded redraw discipline.** Live cells (clock, headroom line, monitor matrix/vitals) are
-  repainted by cursor positioning at ~1 Hz — the mockups mark these **`⟳ live cells`** regions so
+  repainted by cursor positioning at ~1 Hz. The mockups mark these **`⟳ live cells`** regions so
   the renderer knows what to move-cursor-and-overwrite vs. what is static chrome.
 - **One name, three casings.** `POCKET-DIAL` in title bars/banner, `pocketdial.local` in hosts.
-
----
 
 ## 1. The 16-color ANSI mapping (BRASS + PHOSPHOR)
 
@@ -43,11 +39,11 @@ intent (charcoal board, brass rails, one hot lamp, rationed red). Where the lite
 would muddy the brass/charcoal read, we pick the index that keeps the *role contrast* (e.g. brass
 text must out-contrast the panel) and note it.
 
-The terminal's own palette decides the final pixel — we target the **standard xterm/VGA** 16-color
+The terminal's own palette decides the final pixel; we target the **standard xterm/VGA** 16-color
 values. The mapping is by **semantic role**, not by raw hue, so a sysop's theme toggle reads as a
 change of bench lighting, not a different product.
 
-### 1.2 BRASS theme (default) — amber lamps on a charcoal board
+### 1.2 BRASS theme (default): amber lamps on a charcoal board
 
 `ui.cpp` BRASS RGB → xterm-16 role:
 
@@ -58,29 +54,29 @@ change of bench lighting, not a different product.
 | **brass rail / border** | `#B08438` brass | `3` yellow (dim) | fg `33` | the frame glyphs `╔═╗║╚╝├┤` themselves |
 | **brass text** | `#D6B26E` warm brass | `3` yellow | fg `33` | all body labels / column headers |
 | **bright brass / header** | `#F5D696` bright brass | `11` bright-yellow | fg `93` | section titles, `[ MODE ]`, selected-tab name |
-| **accent — live lamp** | `#FFB020` amber | `11` bright-yellow | fg `93` / bg `103` | `●`+`ONLINE`, `◆`+`ACTIVE`, `◆`+`READY` |
+| **accent (live lamp)** | `#FFB020` amber | `11` bright-yellow | fg `93` / bg `103` | `●`+`ONLINE`, `◆`+`ACTIVE`, `◆`+`READY` |
 | **jack empty / dim** | `#1E1B17` dark recessed | `8` bright-black (grey) | fg `90` | `○`+`UNREACH` (dim, never red) |
 | **DND ring** | `#FFB020` amber | `11` bright-yellow | fg `93` | `⊘`+`DND` |
 | **alert / destructive** | `#C84028` ember-red | `1` red | fg `31` / bg `41` | `▲`+`ALERT`, `[A!]` actions only |
 
-### 1.3 PHOSPHOR theme (alt) — green phosphor lamps on a charcoal board
+### 1.3 PHOSPHOR theme (alt): green phosphor lamps on a charcoal board
 
-`ui.cpp` PHOSPHOR RGB → xterm-16 role. **Same chrome, same red, same amber DND** — only the live
+`ui.cpp` PHOSPHOR RGB → xterm-16 role. **Same chrome, same red, same amber DND**; only the live
 lamp accent and the text tint shift green (the bench-lighting change):
 
 | Role (semantic) | On-device RGB (`ui.cpp`) | xterm-16 index · name | SGR (fg / bg) | Paired glyph + label |
 |---|---|---|---|---|
 | **board bg** | `#10140F` charcoal | `0` black | bg `40` | — |
 | **panel face** | `#1C241C` recessed | `0` black (dim) | bg `40` | — |
-| **brass rail / border** | `#96823C` dim brass | `3` yellow (dim) | fg `33` | frame glyphs (rails stay brass — brand §5) |
+| **brass rail / border** | `#96823C` dim brass | `3` yellow (dim) | fg `33` | frame glyphs (rails stay brass, brand §5) |
 | **phosphor text** | `#AAD296` green-grey | `2` green | fg `32` | all body labels / column headers |
 | **bright phosphor / header** | `#D2F0BE` bright green | `10` bright-green | fg `92` | section titles, `[ MODE ]`, selected tab |
-| **accent — live lamp** | `#40FF60` green phosphor | `10` bright-green | fg `92` / bg `102` | `●`+`ONLINE`, `◆`+`ACTIVE`, `◆`+`READY` |
+| **accent (live lamp)** | `#40FF60` green phosphor | `10` bright-green | fg `92` / bg `102` | `●`+`ONLINE`, `◆`+`ACTIVE`, `◆`+`READY` |
 | **jack empty / dim** | `#16201C` dark recessed | `8` bright-black (grey) | fg `90` | `○`+`UNREACH` (dim) |
 | **DND ring** | `#FFB020` amber (kept!) | `11` bright-yellow | fg `93` | `⊘`+`DND` (amber in BOTH themes, `ui.cpp` L61) |
 | **alert / destructive** | `#DC4632` ember-red | `1` red | fg `31` / bg `41` | `▲`+`ALERT`, `[A!]` only |
 
-**Why DND stays amber in PHOSPHOR:** `ui.cpp` line 61 keeps the DND ring amber in the phosphor
+Why DND stays amber in PHOSPHOR: `ui.cpp` line 61 keeps the DND ring amber in the phosphor
 palette. Cross-theme consistency of a status color is itself a brand signal (brand §5), and it
 prevents DND from colliding with the green "live" accent.
 
@@ -103,15 +99,15 @@ alert / destructive ... ESC[31m  (red)             ESC[31m  (red)
 board background ...... ESC[40m  (black)           ESC[40m  (black)
 ```
 
-> **Renderer rule:** wrap *only* the glyph+label of a status in its accent SGR, then `ESC[0m`.
+> Renderer rule: wrap *only* the glyph+label of a status in its accent SGR, then `ESC[0m`.
 > Never tint a whole row by state. A `--no-color` client or `TERM=dumb` gets the same glyphs and
-> labels with every SGR stripped — and loses nothing (proven in §1.5).
+> labels with every SGR stripped, and loses nothing (proven in §1.5).
 
 ### 1.5 Monochrome degradation (the proof the color is removable)
 
 The same hub, every SGR stripped, every box glyph dropped to its ASCII fallback (brand §3.3 map:
 `╔╗╚╝═║`→`+ + + + = |`, `├┤`→`+ +`, `─`→`-`, `●`→`(*)`, `○`→`( )`, `◆`→`<*>`, `⊘`→`[/]`,
-`↳`→`->`, `▲`→`/!\`, `·`→`.`, `▸`→`>`). **No information is lost** — the labels carry it:
+`↳`→`->`, `▲`→`/!\`, `·`→`.`, `▸`→`>`). No information is lost: the labels carry it:
 
 ```
 +------------------------------------------------------------------------------+
@@ -135,17 +131,15 @@ The same hub, every SGR stripped, every box glyph dropped to its ASCII fallback 
 Firmware selects glyph table + SGR on/off from `TERM` (and an explicit `--no-color`/serial flag).
 Every mockup in §3 below is shown in its **box-drawing** form; each has this guaranteed fallback.
 
----
-
 ## 2. ANSI component library
 
 Reusable parts. Every screen in §3 is assembled from these. Dimensions are quoted for the 80-wide
 frame. Each component states its **glyph+label contract** and its **`⟳ live` vs static** nature.
 
-### 2.1 Title bar (row 1) — the brand spine
+### 2.1 Title bar (row 1): the brand spine
 
 `POCKET-DIAL vX.Y   [ MODE ]   HH:MM:SS` inside the top frame rule. The clock (`HH:MM:SS`) is the
-only **`⟳ live`** cell on this row — repainted in place each second, never a full clear.
+only **`⟳ live`** cell on this row, repainted in place each second, never a full clear.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -155,9 +149,9 @@ only **`⟳ live`** cell on this row — repainted in place each second, never a
 
 - `POCKET-DIAL v3.0` ‹brass text›, `[ MODE ]` ‹bright header›, clock ‹brass text, ⟳ live›.
 - `[ MODE ]` ∈ `{ SYSTEM MANAGEMENT, MONITOR, NETWORK, PBX CONFIG, SECURITY, REPORTS, ABOUT,
-  FIRST-RUN }` — the contextual mode from the IA.
+  FIRST-RUN }`, the contextual mode from the IA.
 
-### 2.2 Key-hint footer (row 24) — always visible, ends in the theme label
+### 2.2 Key-hint footer (row 24): always visible, ends in the theme label
 
 Lists **only the keys live on this screen**, left-to-right by frequency, and **always ends in the
 named theme label** (`Theme: BRASS ▸` / `Theme: PHOSPHOR ▸`) so the active theme is read by label,
@@ -174,7 +168,7 @@ never by hue (brand §5). The `▸` is brand chrome, not state.
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.3 Status chip — `[ ONLINE ]` / `[ UNREACH ]` (glyph + label, color last)
+### 2.3 Status chip: `[ ONLINE ]` / `[ UNREACH ]` (glyph + label, color last)
 
 The atomic state primitive. Drawn as **glyph + LABEL**, optionally bracketed as a chip in tables.
 The label is authoritative; the glyph reinforces; color decorates. From brand §4.5 + IA §6.2:
@@ -189,7 +183,7 @@ The label is authoritative; the glyph reinforces; color decorates. From brand §
   ▲ ALERT      ‹red, rationed›    destructive / fault                mono: /!\ ALERT
 ```
 
-CDR result chips (IA §6.2, real `CdrResult` enum — no invented states):
+CDR result chips (IA §6.2, real `CdrResult` enum, no invented states):
 
 ```
   ✓ answered   ‹accent›    ⊘ busy   ‹amber›    … cancelled ‹brass›
@@ -202,7 +196,7 @@ Chip form in a column (fixed 11-wide cell so the colon column never jitters):
   [ ● ONLINE ]   [ ○ UNREACH ]   [ ◐ RINGING ]   [ ◆ ACTIVE ]
 ```
 
-### 2.4 Numbered hub matrix — the typeahead launcher
+### 2.4 Numbered hub matrix: the typeahead launcher
 
 Six numbered destinations + two single-key system keys (`R`/`L`) that **fire without Enter** (IA
 §1, D1). Numbers and system letters are unique first-characters so typeahead never collides.
@@ -215,12 +209,12 @@ Six numbered destinations + two single-key system keys (`R`/`L`) that **fire wit
 ```
 
 - `[n]` bracket digits ‹bright header›, destination names ‹brass text›.
-- `[R] REBOOT` is an `[A!]` key — its glyph in help/confirm is `▲`; on the hub it reads plainly and
+- `[R] REBOOT` is an `[A!]` key: its glyph in help/confirm is `▲`; on the hub it reads plainly and
   the *consequence* lives in the confirm dialog (§2.8), not here.
 
-### 2.5 Tab strip — horizontal mode switch (PBX Config)
+### 2.5 Tab strip: horizontal mode switch (PBX Config)
 
-Active tab marked by an **underline rule AND its name** (never highlight color alone — D11). All
+Active tab marked by an **underline rule AND its name** (never highlight color alone, D11). All
 five tabs fit in 80 cols. `[←/→]` or `[Tab]` moves the active tab.
 
 ```
@@ -230,10 +224,10 @@ five tabs fit in 80 cols. `[←/→]` or `[Tab]` moves the active tab.
 
 - Inactive tab names ‹brass text›; the active tab name ‹bright header› **and** carries the `═══`
   underline directly beneath it. Separators `│` ‹border›.
-- Reports `[5]` uses the **two-view** variant (no strip) — a `[Tab]`-named selector instead:
+- Reports `[5]` uses the **two-view** variant (no strip): a `[Tab]`-named selector instead:
   `Recent Calls ◂▸ Event Log` (the live view name ‹bright header›, the other ‹dim›).
 
-### 2.6 Data table — column header + selectable rows + status chips
+### 2.6 Data table: column header + selectable rows + status chips
 
 `[↑/↓]` move the selection. The selected row pairs an **inverse field with a `▸` marker** so it is
 legible in monochrome (selection is position + glyph, not color). Headroom cap sits bottom-right of
@@ -263,7 +257,7 @@ buttons to mouse. Inside *form dialogs*, on-screen buttons exist and are reached
 - Focused button: `< Apply >` rendered `ESC[7m` reverse with the angle brackets.
 - Unfocused button: `[ Cancel ]` plain ‹brass text›. Safe/cancel default pre-focused in `[A!]` flows.
 
-### 2.8 Modal / confirm dialog — the single guarded-action pattern
+### 2.8 Modal / confirm dialog: the single guarded-action pattern
 
 A centered box over the dimmed panel. The confirm shell carries a `▲ ALERT` glyph+label, the action
 in plain words, a consequence sentence, and two buttons with the **safe choice pre-focused** (IA
@@ -285,7 +279,7 @@ in plain words, a consequence sentence, and two buttons with the **safe choice p
 Plain (non-destructive) editor modals use the same box without the `▲ ALERT` line; their buttons
 are `< Apply >  [ Cancel ]`.
 
-### 2.9 Live-call matrix — the monitor's hero (`⟳ live cells`)
+### 2.9 Live-call matrix: the monitor's hero (`⟳ live cells`)
 
 The BBS-glow call table. Repainted ~1 Hz by overwriting the **cell ranges** (CH/EXT/DEST/DUR/CODEC/
 STATUS), never a full clear (brief §6). Each row's STATUS uses §2.3 chips.
@@ -302,10 +296,10 @@ STATUS), never a full clear (brief §6). Each row's STATUS uses §2.3 chips.
 - Header rule ‹border›; `→` direction arrow ‹brass›; `DUR` ticks every second ‹brass, ⟳›.
 - A torn-down row shows `· stale` until `[C]` clears it (IA §3.6). Idle channels read `○ idle`.
 
-### 2.10 Vitals bars — CPU / mem (`⟳ live cells`)
+### 2.10 Vitals bars: CPU / mem (`⟳ live cells`)
 
 10-cell block-glyph bars; the filled run is ‹accent lamp›, the empty run ‹dim›. The **numeric label
-to the right is authoritative** (the bar is the reinforcing glyph — color last, even here).
+to the right is authoritative** (the bar is the reinforcing glyph, color last, even here).
 
 ```
   CPU   [██████░░░░]  61%        ‹fill=accent, empty=dim, % = brass, ⟳ live›
@@ -317,7 +311,7 @@ to the right is authoritative** (the bar is the reinforcing glyph — color last
 Block ramp for partial cells (when sub-10% resolution helps): `░▒▓█`. ASCII fallback bar:
 `[######....] 61%` (mono map `█`→`#`, `░`→`.`).
 
-### 2.11 Progress / step indicator (wizard) — `[n/5]` + dot rail
+### 2.11 Progress / step indicator (wizard): `[n/5]` + dot rail
 
 The wizard step counter pairs a numeric `[n/5]` (authoritative) with a dot rail (reinforcing):
 
@@ -338,8 +332,6 @@ proportional thumb (`█`) over a track (`│`). Pairs with `PgUp/PgDn` in the f
   …row…                                                                         │
   …row…                                                                         │
 ```
-
----
 
 ## 3. Full 80×24 ANSI mockups (every screen in the IA)
 
@@ -376,12 +368,12 @@ appends. Frame + nameplate ‹border/brass›; `◆ READY` lamp ‹accent + the 
 ```
 
 - The `«guillemets»` are runtime fields the firmware fills (host/ip/mac/fw/uptime).
-- `PIN:` is **never echoed** — the firmware reads it silently; the `••••••` is illustrative only.
+- `PIN:` is never echoed: the firmware reads it silently; the `••••••` is illustrative only.
 - On a wrong PIN, the operator-terse error (brand §4.6) reprints in place: `PIN rejected. Try
-  again.` — blames the input, states the fix, no exclamation mark. After N tries: a back-off notice.
+  again.` It blames the input, states the fix, no exclamation mark. After N tries: a back-off notice.
 - Mono fallback is brand §3.3 verbatim (`+===+`, `[*] READY`, `[#] SYSOP TERMINAL`).
 
-### 3.2 MASTER HUB `[ SYSTEM MANAGEMENT ]` — the typeahead launcher
+### 3.2 MASTER HUB `[ SYSTEM MANAGEMENT ]`: the typeahead launcher
 
 Faithful to IA §1. The headroom line and clock are the only **`⟳ live`** cells.
 
@@ -414,15 +406,15 @@ Faithful to IA §1. The headroom line and clock are the only **`⟳ live`** cell
 
 - `[ SYSTEM MANAGEMENT ]` ‹bright header›; `[1]…[6]` digits ‹bright header›, names ‹brass›.
 - Headroom line (`⟳ live`): `● 4 ONLINE` ‹accent›, `○ 1 UNREACH` ‹dim›, counts ‹brass›. Repaints
-  ~1 Hz alongside the clock — both are cursor-positioned cell overwrites, never a full clear.
+  ~1 Hz alongside the clock. Both are cursor-positioned cell overwrites, never a full clear.
 - `(◉)─▶` is the brand prompt sigil (brand §3.4); it is chrome, never changes color to signal state.
 - Esc is a **no-op** here (home). `T` toggles theme; the footer label flips `BRASS ▸ ↔ PHOSPHOR ▸`.
 
-### 3.3 `[1]` SYSTEM MONITOR `[ MONITOR ]` — the live wallboard (`⟳`)
+### 3.3 `[1]` SYSTEM MONITOR `[ MONITOR ]`: the live wallboard (`⟳`)
 
 The BBS-glow screen: live-call matrix (§2.9) + registration roster + vitals bars (§2.10). Redraws
 ~1 Hz by cell-range overwrite. `[F]` freezes the refresh; `[C]` clears stale rows. **`[P]` is NOT
-bound** (no on-device PCAP — IA §3.6 honesty note); the footer shows only real keys.
+bound** (no on-device PCAP, IA §3.6 honesty note); the footer shows only real keys.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -455,9 +447,9 @@ bound** (no on-device PCAP — IA §3.6 honesty note); the footer shows only rea
 - Matrix STATUS/DUR cells are the `⟳ live` overwrite zone; the ROSTER state chips repaint on
   registration change; the VITALS bars + `UP` clock repaint each second.
 - `Patching you through…` is the sanctioned boot/flavor line (brand §4.4) doubling as the M4
-  ring-test hint — the installer's acceptance test is "place a call, watch the matrix light up."
+  ring-test hint: the installer's acceptance test is "place a call, watch the matrix light up."
 
-### 3.4 `[2]` NETWORK `[ NETWORK ]` — status + guarded mode switch
+### 3.4 `[2]` NETWORK `[ NETWORK ]`: status + guarded mode switch
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -522,7 +514,7 @@ The default tab. Tab strip (§2.5) + roster table (§2.6). `3 → 1 → A` lands
 
 - Active tab `Extensions` ‹bright header› + `═══` underline. Selected row `▸ 102` reverse video.
 - `● ONLINE` ‹accent›, `○ UNREACH` ‹dim›, `⊘ DND` ‹amber›, `↳ FWD` ‹brass›. `·`=none ‹dim›.
-- `ext 12/32` headroom ‹brass›, bottom-right of the body (D12) — the cap is visible before a 503.
+- `ext 12/32` headroom ‹brass›, bottom-right of the body (D12); the cap is visible before a 503.
 
 #### 3.5.1 Add submenu (`A` → single | range)
 
@@ -535,7 +527,7 @@ The default tab. Tab strip (§2.5) + roster table (§2.6). `3 → 1 → A` lands
         └────────────────────────────────────────┘
 ```
 
-#### 3.5.2 Add single — modal form (§2.2/2.8 plain editor)
+#### 3.5.2 Add single: modal form (§2.2/2.8 plain editor)
 
 ```
         ┌─ Add extension · single ───────────────────────────┐
@@ -551,7 +543,7 @@ The default tab. Tab strip (§2.5) + roster table (§2.6). `3 → 1 → A` lands
         └────────────────────────────────────────────────────┘
 ```
 
-#### 3.5.3 Add range — the marquee batch (D2 / E3)
+#### 3.5.3 Add range: the marquee batch (D2 / E3)
 
 ```
         ┌─ Add extensions · range (batch) ───────────────────┐
@@ -569,8 +561,8 @@ The default tab. Tab strip (§2.5) + roster table (§2.6). `3 → 1 → A` lands
         └────────────────────────────────────────────────────┘
 ```
 
-- One keypress on `< Provision >` provisions the whole block — never N dialogs (D2). The cap check
-  is **predictive**: `⚠ EXCEEDS CAP` ‹red glyph+label› shows *before* apply if the range overflows
+- One keypress on `< Provision >` provisions the whole block, never N dialogs (D2). The cap check
+  is predictive: `⚠ EXCEEDS CAP` ‹red glyph+label› shows *before* apply if the range overflows
   the 32-slot pool, so the installer trims the range instead of meeting a 503 (D12 / E6).
 
 ### 3.6 `[3]` PBX CONFIG · **Ring Groups** tab
@@ -602,10 +594,10 @@ The default tab. Tab strip (§2.5) + roster table (§2.6). `3 → 1 → A` lands
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- `● OK` ‹accent›; `⚠ 1 NOT AN EXTENSION` ‹red glyph + label› is the G6 integrity flag — a member
+- `● OK` ‹accent›; `⚠ 1 NOT AN EXTENSION` ‹red glyph + label› is the G6 integrity flag: a member
   number that no longer maps to a real extension. Mode is plain-language (G3), never "RingAll/Hunt".
 
-#### 3.6.1 Ring Group editor — modal (mode radios + member checklist + hunt order)
+#### 3.6.1 Ring Group editor: modal (mode radios + member checklist + hunt order)
 
 ```
         ┌─ Edit ring group · sales ──────────────────────────────┐
@@ -627,15 +619,15 @@ The default tab. Tab strip (§2.5) + roster table (§2.6). `3 → 1 → A` lands
 
 - In **Ring everyone** mode the `Hunt order` column greys to `—` ‹dim› (order is irrelevant); in
   **One at a time** it shows the live sequence (G4). The integrity flag repeats inline so the sysop
-  can't save a phantom member silently.
+  cannot save a phantom member silently.
 
-#### 3.6.2 Add Ring Group — CREATE modal (the new-group flow, mirrors §3.6.1)
+#### 3.6.2 Add Ring Group: CREATE modal (the new-group flow, mirrors §3.6.1)
 
-> Closes **walkthrough F3** (the "Add ring group" create-task had no rendered modal — only the
+> Closes **walkthrough F3** (the "Add ring group" create-task had no rendered modal; only the
 > §3.6.1 *Edit* modal existed; anxious Dana froze at `[3]→Ring Groups→A`). This is the IA's
 > promised `(A) Add group ◇ name → mode → member-pick → hunt order` create flow (`tui-ia.md` §2,
 > G2). It reuses §3.6.1 geometry **verbatim** (same 58-wide box, same keys, same footer) so there
-> is no new interaction to learn — the only differences are the title, an **empty name field**,
+> is no new interaction to learn. The only differences are the title, an **empty name field**,
 > **zero members checked**, and the live `(0 selected)` counter that ticks up as the sysop picks.
 
 The fresh box: name empty, mode pre-set to the safe default (`(•) Ring everyone`), **no members
@@ -662,7 +654,7 @@ checked**, Hunt-order column greyed `—`, and the live selection counter reads 
         └────────────────────────────────────────────────────────┘
 ```
 
-**After the sysop names it `frontline`, picks 3, and switches to One-at-a-time** — the counter reads
+After the sysop names it `frontline`, picks 3, and switches to One-at-a-time, the counter reads
 `(3 selected)`, the checked rows show `[x]`, and the **Hunt order column comes alive** (G4):
 
 ```
@@ -685,34 +677,34 @@ checked**, Hunt-order column greyed `—`, and the live selection counter reads 
         └────────────────────────────────────────────────────────┘
 ```
 
-- **Distinct from §3.6.1 Edit:** title `Add ring group` (no `· sales` suffix), an empty `[ _ ]`
+- Distinct from §3.6.1 Edit: title `Add ring group` (no `· sales` suffix), an empty `[ _ ]`
   name field with the cursor, **zero** members checked on entry, and the action button reads
   **`< Create >`** (not `< Apply >`) so the sysop knows this *makes* a row rather than mutating one.
-- **Empty / fresh-box case (no groups exist yet, no members picked):** the box still renders fully —
-  the member checklist is the **live extension roster** (always ≥1: the admin ext from wizard `[3/5]`),
+- Empty / fresh-box case (no groups exist yet, no members picked): the box still renders fully.
+  The member checklist is the **live extension roster** (always ≥1: the admin ext from wizard `[3/5]`),
   every box `[ ]`, the counter `(0 selected)` ‹dim when 0›, Hunt column all `—`. There is never an
   empty-list dead-end. If the operator presses `< Create >` with **0 members**, an inline guard
-  prints in the helper zone: `Pick at least one extension to ring. ▲ no members` ‹red glyph+label› —
-  blames the input, states the fix, no exclamation mark (brand §4.1); the group is not created.
-- **Mode → Hunt-order coupling (G4):** in `(•) Ring everyone` the Hunt-order column greys to `—`
-  ‹dim› (order is irrelevant — every member rings at once). Toggling to `(•) One at a time` lights
+  prints in the helper zone: `Pick at least one extension to ring. ▲ no members` ‹red glyph+label›.
+  It blames the input, states the fix, no exclamation mark (brand §4.1); the group is not created.
+- Mode → Hunt-order coupling (G4): in `(•) Ring everyone` the Hunt-order column greys to `—`
+  ‹dim› (order is irrelevant, every member rings at once). Toggling to `(•) One at a time` lights
   the column with the **pick sequence** (1,2,3…) ‹brass›; re-ordering follows the check order, so the
-  first box ticked is hunt position 1. This mirrors §3.6.1 exactly (G3/G4) — one model, two entry
-  points (D10): create here, edit there.
-- **Integrity (G6):** the checklist is built from real roster entries, so a phantom member cannot be
+  first box ticked is hunt position 1. This mirrors §3.6.1 exactly (G3/G4): one model, two entry
+  points (D10), create here, edit there.
+- Integrity (G6): the checklist is built from real roster entries, so a phantom member cannot be
   *added* here (unlike Edit, which may inherit a stale `⚠ NOT AN EXTENSION` row). `○ UNREACH` members
-  are legal — offline is dim, not red; only a number with **no extension** would flag red, and the
+  are legal (offline is dim, not red); only a number with **no extension** would flag red, and the
   create list never offers one.
-- **On `< Create >`:** the modal closes back to the Ring Groups table (§3.6) with the new row
+- On `< Create >`: the modal closes back to the Ring Groups table (§3.6) with the new row
   `frontline · One at a time · 3 · ● OK`, and the helper zone shows a transient
-  `✓ Ring group "frontline" created (3 members)` ‹brass› line for ~2 s (a *line*, not a modal —
+  `✓ Ring group "frontline" created (3 members)` ‹brass› line for ~2 s (a *line*, not a modal,
   nothing to dismiss; closes walkthrough F10's reassurance ask).
-- **Keys (identical to §3.6.1):** `[Tab]` cycles Name → Mode → checklist → buttons; `[Space]`
+- Keys (identical to §3.6.1): `[Tab]` cycles Name → Mode → checklist → buttons; `[Space]`
   toggles the focused member (or the mode radio); `[↑/↓]` move within the checklist; `[←/→]` move
   between the radio options and between the two buttons; `[Enter]` = Create; `[Esc]` cancels with no
-  write (D7). `[Backspace]` edits the Name field. The footer names exactly these keys — keyboard-only.
+  write (D7). `[Backspace]` edits the Name field. The footer names exactly these keys, keyboard-only.
 
-### 3.7 `[3]` PBX CONFIG · **Forwards/DND** tab — Dana's day-2 surface
+### 3.7 `[3]` PBX CONFIG · **Forwards/DND** tab: Dana's day-2 surface
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -744,7 +736,7 @@ checked**, Hunt-order column greyed `—`, and the live selection counter reads 
 - `⊘ DND` ‹amber›; `↳ 205` forward targets ‹brass›. `Space` flips the selected row's DND badge
   live (F1). `·`=unset ‹dim›.
 
-#### 3.7.1 Forward editor — modal (the three CLASS forwards, F2–F5)
+#### 3.7.1 Forward editor: modal (the three CLASS forwards, F2–F5)
 
 ```
         ┌─ Forwards · ext 102 (Sam) ─────────────────────────────┐
@@ -762,11 +754,11 @@ checked**, Hunt-order column greyed `—`, and the live selection counter reads 
         └────────────────────────────────────────────────────────┘
 ```
 
-#### 3.7.2 Forward-to-GROUP — target picker (a forward target may be a RING GROUP)
+#### 3.7.2 Forward-to-GROUP: target picker (a forward target may be a RING GROUP)
 
-> Closes **walkthrough F4** (the IA implies ring groups are legal forward targets — the Extensions
+> Closes **walkthrough F4** (the IA implies ring groups are legal forward targets: the Extensions
 > table renders `↳ grp:sales` (§3.5) and the IVR digit map routes to `ring group` (`tui-ia.md` §2,
-> V1) — yet §3.7.1 only ever showed **single-extension** targets, so "point the front desk at the
+> V1), yet §3.7.1 only ever showed **single-extension** targets, so "point the front desk at the
 > group" had no rendered, reachable affordance). This extends §3.7.1: each of CFU/CFB/CFNA becomes a
 > **picker** that lists extensions **and** ring groups, locking **CFU-to-group** as the canonical
 > meaning of "point an extension at a group."
@@ -791,7 +783,7 @@ Here ext 104 (Front Desk) forwards ALL calls to the `frontline` group created in
         └────────────────────────────────────────────────────────┘
 ```
 
-**`[Space]` on the focused field opens the combined target list** — extensions first, then a ruled
+**`[Space]` on the focused field opens the combined target list**: extensions first, then a ruled
 `RING GROUPS` section, so the two target *types* are read by label, never conflated. `▸` marks the
 selection (reverse video, §2.6); `[↑/↓]` move, `[Enter]` picks, `[Esc]` closes the list unchanged:
 
@@ -812,37 +804,37 @@ selection (reverse video, §2.6); `[↑/↓]` move, `[Enter]` picks, `[Esc]` clo
         └────────────────────────────────────────────────────────┘
 ```
 
-- **How the `↳ grp:sales` table indicator is produced (the §3.5 / tui-ia link):** picking a `grp:`
+- How the `↳ grp:sales` table indicator is produced (the §3.5 / tui-ia link): picking a `grp:`
   row writes that group as the field's target. The Extensions and Forwards/DND tables then render the
-  stored CFU/CFB/CFNA target with the **`↳ FWD` glyph + the `grp:<name>` token** — exactly the
+  stored CFU/CFB/CFNA target with the **`↳ FWD` glyph + the `grp:<name>` token**, exactly the
   `↳ grp:sales` cell already shown on ext 104 in §3.5 and the `↳ grp:sales` CFNA cell on ext 103 in
   §3.7. The token is `grp:` + the group name so a group target is **visually distinct from a bare
-  extension** (`↳ 205` is an extension; `↳ grp:sales` is a group) — one glyph, two readable target
+  extension** (`↳ 205` is an extension; `↳ grp:sales` is a group): one glyph, two readable target
   types, no color needed. Picking an extension row writes the bare number and the cell reads `↳ 205`.
-- **Canonical meaning locked (F4):** "point the front desk at the group" = **CFU (Forward ALL) →
+- Canonical meaning locked (F4): "point the front desk at the group" = **CFU (Forward ALL) →
   grp:<name>**. The picker makes that path *reachable*, not merely *displayable*; the helper line
   "A target can be an extension or a ring group" pre-answers the exact uncertainty that stalled the
   anxious admin.
-- **Cross-link (one model, two doors — D10):** the Ring Groups screen (§3.6) carries a one-key
+- Cross-link (one model, two doors, D10): the Ring Groups screen (§3.6) carries a one-key
   **`[F] Make an ext ring this group`** verb that jumps straight here with `Forward ALL → grp:<this>`
   pre-filled, so the task finishes from *either* the group screen or the Forwards/DND screen. The
   footer on §3.6 already lists list-panel verbs; `[F]` slots beside them.
-- **Integrity & honesty:** the list offers only **real** extensions and **real** groups (no invented
-  targets — brand §6.8); a group flagged `⚠ NOT AN EXTENSION` internally (a stale member, G6) still
-  forwards fine — the forward points at the *group*, not its members. `○ UNREACH` extension targets
+- Integrity and honesty: the list offers only **real** extensions and **real** groups (no invented
+  targets, brand §6.8); a group flagged `⚠ NOT AN EXTENSION` internally (a stale member, G6) still
+  forwards fine. The forward points at the *group*, not its members. `○ UNREACH` extension targets
   are legal (dim, never red): you may forward to a phone that is currently offline.
-- **Non-destructive (D9):** setting a forward is **not** an `[A!]` action — no confirm dialog; the
+- Non-destructive (D9): setting a forward is **not** an `[A!]` action, no confirm dialog; the
   reassurance is the visible `↳ grp:frontline` value that appears on the row after `< Apply >`
   (walkthrough F14: reserve `▲ ALERT` strictly for delete/reboot/mode/reset). `[Esc]` backs out one
   level, non-destructive (D7).
-- **Keys:** `[Tab]` moves DND → CFU → CFB → CFNA → buttons; `[Space]` opens the focused picker (or
+- Keys: `[Tab]` moves DND → CFU → CFB → CFNA → buttons; `[Space]` opens the focused picker (or
   toggles DND on the DND row); inside the list `[↑/↓]` move and `[Enter]` chooses; `[Enter]` on the
-  form = Apply; `[Esc]` cancels. The footer names exactly these keys — keyboard-only, 80×24, no
+  form = Apply; `[Esc]` cancels. The footer names exactly these keys, keyboard-only, 80×24, no
   horizontal scroll, with the standard ASCII fallback for `▾ ▸ ↳ ── ●○ │` (brand §3.3 map).
 
-### 3.8 `[3]` PBX CONFIG · **IVR** tab — minimal DTMF menu (NO queues)
+### 3.8 `[3]` PBX CONFIG · **IVR** tab: minimal DTMF menu (NO queues)
 
-Renders as **one shallow menu**, not a tree (IA §8 — never imply IVR-tree capability we don't ship).
+Renders as **one shallow menu**, not a tree (IA §8: never imply IVR-tree capability we don't ship).
 A flat digit map: each digit → one action (ring ext | ring group | play prompt).
 
 ```
@@ -875,7 +867,7 @@ A flat digit map: each digit → one action (ring ext | ring group | play prompt
 - The explicit "One menu, one level deep … No call queues." line honors the brand ban on
   queue/IVR-tree language and the brief's no-queues scope.
 
-#### 3.8.1 IVR digit editor — modal
+#### 3.8.1 IVR digit editor: modal
 
 ```
         ┌─ Digit  1 ─────────────────────────────────────────┐
@@ -891,7 +883,7 @@ A flat digit map: each digit → one action (ring ext | ring group | play prompt
         └────────────────────────────────────────────────────┘
 ```
 
-### 3.9 `[3]` PBX CONFIG · **Features** tab — read-only star-code card (F6)
+### 3.9 `[3]` PBX CONFIG · **Features** tab: read-only star-code card (F6)
 
 Lists the **only** codes the firmware's CLASS handler implements (IA §6.1). No invented codes.
 
@@ -954,7 +946,7 @@ Lists the **only** codes the firmware's CLASS handler implements (IA §6.1). No 
 - `● SET` ‹accent›; `○ none` ‹dim›. `[X] Factory reset [A!]` is double-confirmed (IA §2) and dumps
   the box back into the first-run wizard.
 
-#### 3.10.1 Change PIN — modal (S1; never echoed)
+#### 3.10.1 Change PIN: modal (S1; never echoed)
 
 ```
         ┌─ Change admin PIN ─────────────────────────────────┐
@@ -970,9 +962,9 @@ Lists the **only** codes the firmware's CLASS handler implements (IA §6.1). No 
         └────────────────────────────────────────────────────┘
 ```
 
-### 3.11 `[5]` REPORTS/LOGS — two views (`[Tab]` flips), `[ REPORTS ]`
+### 3.11 `[5]` REPORTS/LOGS: two views (`[Tab]` flips), `[ REPORTS ]`
 
-#### 3.11.1 VIEW · Recent Calls (CDR) — newest-first ring of 32
+#### 3.11.1 VIEW · Recent Calls (CDR): newest-first ring of 32
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -1005,7 +997,7 @@ Lists the **only** codes the firmware's CLASS handler implements (IA §6.1). No 
   real `CdrResult` vocabulary (IA §6.2): `✓ answered` ‹accent›, `⊘ busy` ‹amber›, `… cancelled`
   ‹brass›, `○ unavailable` ‹dim›, `▲ failed` ‹red›. Right gutter = scrollbar (§2.12).
 
-#### 3.11.2 CDR detail — modal (R3)
+#### 3.11.2 CDR detail: modal (R3)
 
 ```
         ┌─ Call detail ──────────────────────────────────────┐
@@ -1053,7 +1045,7 @@ Lists the **only** codes the firmware's CLASS handler implements (IA §6.1). No 
 - Each event pairs a glyph+label state chip with the fact; the tail repaints ~1 Hz at the top
   (`⟳ live`), older lines scroll down.
 
-### 3.12 `[6]` ABOUT `[ ABOUT ]` — the honesty card
+### 3.12 `[6]` ABOUT `[ ABOUT ]`: the honesty card
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -1084,7 +1076,7 @@ Lists the **only** codes the firmware's CLASS handler implements (IA §6.1). No 
 
 - States real limits plainly (honesty clause, brand §6.10): caps, "voicemail in v2", "no SD card".
 
-### 3.13 CONFIRM DIALOG — guarded actions (reboot / mode switch / factory reset)
+### 3.13 CONFIRM DIALOG: guarded actions (reboot / mode switch / factory reset)
 
 The one shell wraps every `[A!]` action. Three instances, same skeleton, copy per brand §4.1:
 
@@ -1121,7 +1113,7 @@ The one shell wraps every `[A!]` action. Three instances, same skeleton, copy pe
   `y/N` shortcut with `N` safe. Mode-switch and factory-reset reuse this exact box; factory reset
   **double-confirms** (a second identical dialog: "Type the PIN to confirm wipe").
 
-### 3.14 HELP OVERLAY — global, context-scoped (`?` on every screen)
+### 3.14 HELP OVERLAY: global, context-scoped (`?` on every screen)
 
 Drawn over the dimmed current screen; `Esc` dismisses back to it. Lists **only this screen's** keys.
 
@@ -1153,17 +1145,15 @@ Drawn over the dimmed current screen; `Esc` dismisses back to it. Lists **only t
 ```
 
 - The footer **state key** restates the glyph+label lexicon so the operator can decode any screen
-  without leaving it — reinforcing "label is authoritative, color is removable."
+  without leaving it, reinforcing "label is authoritative, color is removable."
 
----
-
-## 4. First-run onboarding wizard — every step (forced, resumable)
+## 4. First-run onboarding wizard: every step (forced, resumable)
 
 The wizard uses the form keys (IA §3.4): `Enter` advances, `Esc` steps back, `[n/5]` + dot rail
 (§2.11) shows progress. From `[0/5]`, `Esc` is a no-op (nothing usable behind it). `[ FIRST-RUN ]`
 is the mode in the title bar throughout.
 
-### 4.0 `[0/5]` Welcome — "Patching you through…"
+### 4.0 `[0/5]` Welcome: "Patching you through…"
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -1282,7 +1272,7 @@ is the mode in the title bar throughout.
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.4 `[4/5]` First extensions — the marquee batch (O5/E3/E6)
+### 4.4 `[4/5]` First extensions: the marquee batch (O5/E3/E6)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -1313,7 +1303,7 @@ is the mode in the title bar throughout.
 
 - `Pool after this: 25/32 — OK` ‹brass› is the **predictive** cap (D12/E6); over-cap it reads
   `37/32 ⚠ EXCEEDS CAP` ‹red glyph+label› *before* apply. One keypress on `< Provision block >`
-  provisions all 24 — never 24 dialogs (D2).
+  provisions all 24, never 24 dialogs (D2).
 
 ### 4.5 `[5/5]` Done · handoff card (O6)
 
@@ -1345,16 +1335,14 @@ is the mode in the title bar throughout.
 ```
 
 - `◆ READY` ‹accent + label›. `< Finish >` drops into the hub (§3.2) with `[1] MONITOR` one key
-  away so the ring-test (M4) is the natural next act — "the handoff closes on proof, not hope."
+  away so the ring-test (M4) is the natural next act: "the handoff closes on proof, not hope."
 
----
-
-## 5. PHOSPHOR theme — the same board under green bench-light
+## 5. PHOSPHOR theme: the same board under green bench-light
 
 Themes are not redrawn screens; they re-tint the **same geometry**. Below is the hub (§3.2) under
 PHOSPHOR to show the change is bench-lighting only: identical glyphs/labels/layout, the **live lamp
 accent shifts green** (`●`/`◆`), text tints green, **brass rails stay brass**, **DND stays amber**,
-**red stays red**, and the footer **names** the theme (`PHOSPHOR ▸`) — never read by hue.
+**red stays red**, and the footer **names** the theme (`PHOSPHOR ▸`), never read by hue.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -1383,13 +1371,11 @@ accent shifts green** (`●`/`◆`), text tints green, **brass rails stay brass*
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-> A sysop pressing `T` sees the footer label flip `BRASS ▸ → PHOSPHOR ▸` and the lamps go amber→green
-> — the bench lighting changed, not the product. Because every status is still glyph+label, the
+> A sysop pressing `T` sees the footer label flip `BRASS ▸ → PHOSPHOR ▸` and the lamps go amber→green.
+> The bench lighting changed, not the product. Because every status is still glyph+label, the
 > screen is identical in meaning the instant the color changes (and in monochrome, identical period).
 
----
-
-## 6. Renderer contract (what firmware emits — for the implementer)
+## 6. Renderer contract (what firmware emits, for the implementer)
 
 A compact spec so the C++ renderer (over the SSH PTY) produces these screens deterministically:
 
@@ -1399,12 +1385,12 @@ A compact spec so the C++ renderer (over the SSH PTY) produces these screens det
    - `TERM=dumb`/`--no-color`/serial → **ASCII fallback glyphs, no SGR** (the §1.5 form).
 2. **Glyph table is one indirection.** Keep a `GLYPHS[tier]` table (`●○◆⊘↳▲◐✓…─│┌┐└┘├┤═║◉▌▐◖◗▸◍`)
    → ASCII (`(*) ( ) <*> [/] -> /!\ (~) v . - | + + + + + + = | (o) | | [ ] > (O)`). Draw from the
-   table, never inline a glyph — that is what makes the mono degradation free.
+   table, never inline a glyph; that is what makes the mono degradation free.
 3. **SGR is wrapped, never spanned.** Emit `ESC[<role>m` immediately before a status glyph+label and
    `ESC[0m` immediately after. Frame chrome gets the border role once per line. Never tint a row.
 4. **Live cells are cursor-positioned.** The clock (row 1), hub headroom line, monitor matrix
    STATUS/DUR cells, vitals bars + `UP`, and the event-log head are repainted by
-   `ESC[<row>;<col>H` + overwrite at ~1 Hz — **no `ESC[2J` full clear** in steady state (brief §6).
+   `ESC[<row>;<col>H` + overwrite at ~1 Hz. **No `ESC[2J` full clear** in steady state (brief §6).
    `[F]` freeze halts these writes; `Ctrl-L` is the only full repaint (line-noise recovery).
 5. **Selection = reverse + marker.** Selected table row: `ESC[7m` over the row body **and** a `▸`
    in the gutter; active tab: `═══` underline rule **and** the bright-header tab name. Both pairings
@@ -1415,9 +1401,7 @@ A compact spec so the C++ renderer (over the SSH PTY) produces these screens det
 7. **80×24 budget is enforced.** The renderer clips to 80 cols; any line that would exceed wraps to
    a `…` ellipsis on that field, never a horizontal scroll. Modals are centered within the body box.
 
----
-
-## 7. Consistency check (brand §6.1 + brief §6 — applied to this file)
+## 7. Consistency check (brand §6.1 + brief §6, applied to this file)
 
 ```
 [x] Name cased correctly: POCKET-DIAL in title bars/banner, pocketdial.local in hosts
@@ -1435,8 +1419,6 @@ A compact spec so the C++ renderer (over the SSH PTY) produces these screens det
 [x] BRASS default + PHOSPHOR alt mirror ui.cpp RGB; brass rails + amber DND + red are theme-invariant
 [x] Flavor budget respected: only "operator on duty" (§4.5 banner/handoff) + "Patching you through…"
 ```
-
----
 
 *UI Designer · pocket-dial 3.x redesign · ANSI visual system mapped from `main/ui/ui.cpp`*
 *PALETTES[] to xterm-16; renders every screen in [`tui-ia.md`](tui-ia.md); consistent with*

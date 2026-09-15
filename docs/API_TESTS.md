@@ -7,13 +7,12 @@ This plan ensures that all management endpoints function correctly under standar
 > Source of truth for every route and every gate: [`API.md`](API.md) and
 > `src/Helpers/HttpServer.cpp` (`handleClient()` dispatch at lines 433-711,
 > `requireAdmin()` at 1828-1876). Where this plan and the code disagree, the code is
-> right — fix the plan.
+> right, fix the plan.
 
----
 
-## 🚦 0. Before You Test Anything: the shipped-default credential
+## 0. Before You Test Anything: the shipped-default credential
 
-Almost every surprise in this suite comes from one distinction — and it is **not** the old
+Almost every surprise in this suite comes from one distinction, and it is **not** the old
 "provisioned vs unprovisioned" split, which no longer exists.
 
 The device ships with a well-known default login, `admin`/`admin`
@@ -53,7 +52,7 @@ exist. A separate numeric **DTMF PIN** does exist, for the phone-keypad `*PIN#co
 menu only; it has no default and is set through `dtmfPin=` on
 `POST /api/admin/set-credential`.
 
-### 0.2 Ungated routes — the only things a test can hit with no headers at all
+### 0.2 Ungated routes, the only things a test can hit with no headers at all
 
 From the dispatch (`HttpServer.cpp:433-711`):
 
@@ -66,14 +65,14 @@ From the dispatch (`HttpServer.cpp:433-711`):
 | `GET /api/admin/status` | Tells the page whether to show the login form |
 | `GET /api/ota/status` | Partition labels + pending flag; no secrets |
 | `GET /config/<mac>.cfg` | A booting phone has no cookie. The 12-lowercase-hex MAC is the only credential, and only an **adopted** MAC is served |
-| `POST /api/admin/login`, `POST /api/admin/logout` | Same-origin checked, but no session/CSRF — there is nothing to bind a token to |
+| `POST /api/admin/login`, `POST /api/admin/logout` | Same-origin checked, but no session/CSRF, there is nothing to bind a token to |
 
 Everything else goes through `requireAdmin()`.
 
 ### 0.3 What this means for `tests/http/test_api.sh`
 
 The smoke suite (**27 test cases**) runs its Admin Auth block **first**, and that ordering is
-load-bearing — the opposite of the ordering an older revision of this plan described. The
+load-bearing, the opposite of the ordering an older revision of this plan described. The
 comment block at the top of `test_api.sh` says why: every other suite needs the
 `$SESSION`/`$CSRF` that block establishes, and needs setup to already be complete, because
 `requireAdmin()` refuses everything otherwise.
@@ -82,7 +81,7 @@ Its sequence: `TC-AUTH-01` asserts `needsSetup:true` pre-login → `02` a mutati
 no session is `401` → `03` cross-origin login is `403` → `04` login with `admin`/`admin`
 returns a cookie **and** a CSRF token → `05` a mutating call while `needsSetup` is still
 true is `403 setup_required` → `06` cross-origin `set-credential` is `403` → `07` completes
-setup as `admin`/`realpassword123` **reusing the same session** → `08` status now reports
+setup as `admin`/`realpassword123` **reusing the same session**. `08` status now reports
 `provisioned:true, needsSetup:false` → `09` the cookie **alone**, without `X-CSRF`, is still
 `403`. The Auth Mechanics suite (`TC-AUTH-10`/`11`) runs **last** because it logs out and
 deliberately trips the brute-force lockout.
@@ -92,9 +91,8 @@ deliberately trips the brute-force lockout.
 > out for ≥60 s.** Any manual testing after a run must use that password, and must wait out
 > the `429`. Run it against a scratch board or the host build.
 
----
 
-## 🔒 1. The Four-Layer Gate
+## 1. The Four-Layer Gate
 
 Every gated route funnels through one function, `HttpServer::requireAdmin(sock, req, needCsrf)`.
 It applies four checks **in this order**, and the first one to fail is the response you get:
@@ -146,21 +144,21 @@ device returns `setup_required`, because there is no CSRF check on a `GET` to fa
 
 The same-origin check deliberately **allows** a request with no `Origin` header, because
 that is what `curl`, native clients, and this repository's own smoke suite send. That
-gap — a same-site page riding the victim's cookie — is closed by a per-session CSRF token:
+gap (a same-site page riding the victim's cookie) is closed by a per-session CSRF token:
 
 * A 128-bit token is minted with the session at login (`AdminAuth::kCsrfTokenHex`).
 * It is returned in the login response body as `"csrf"` and rendered into the dashboard
-  document. It is **never** a cookie — a browser would attach a cookie to a cross-site
+  document. It is **never** a cookie, a browser would attach a cookie to a cross-site
   request on its own, so only a value our own page had to read and echo back proves
   where the request came from.
 * Checked centrally in `requireAdmin()`, so no route can forget it.
 
 ### 1.2 Safe-origin matrix (layer 1 only)
 
-1. **Direct request (`curl`, address-bar navigation):** no `Origin` header. **Allow.**
-2. **Same-origin request (the dashboard):** `Origin: http://192.168.4.1` matches
+1. Direct request (`curl`, address-bar navigation): no `Origin` header. **Allow.**
+2. Same-origin request (the dashboard): `Origin: http://192.168.4.1` matches
    `Host: 192.168.4.1`. **Allow.**
-3. **Cross-origin request:** `Origin: http://malicious.com` vs `Host: 192.168.4.1`.
+3. Cross-origin request: `Origin: http://malicious.com` vs `Host: 192.168.4.1`.
    **Reject `403`**, `{"error":"cross-origin request rejected"}`.
 
 > [!WARNING]
@@ -179,9 +177,8 @@ There is **no** "unprovisioned device is exempt" row any more. `POST /api/admin/
 is exempt from layer **4**, not from layers 1-3: it still requires a session and a CSRF
 token, obtained by first logging in with the default credential.
 
----
 
-## 🔑 2. The Login Preamble Every Test Needs
+## 2. The Login Preamble Every Test Needs
 
 Capture the cookie **and** the token in one step, then complete setup if the device has not
 had it done. This is the same pattern [OTA.md §3.2](OTA.md) and
@@ -216,7 +213,7 @@ case "$LOGIN" in *'"needsSetup":true'*)
 esac
 ```
 
-Every mutating request below then carries three things — the cookie, the `Origin`, and
+Every mutating request below then carries three things, the cookie, the `Origin`, and
 the token:
 
 ```bash
@@ -227,7 +224,7 @@ curl -s -b "$JAR" \
      "$DEVICE/api/kill"
 ```
 
-Drop the `-H "X-CSRF: $CSRF"` and you get `403 {"error":"missing or invalid CSRF token"}` —
+Drop the `-H "X-CSRF: $CSRF"` and you get `403 {"error":"missing or invalid CSRF token"}`, 
 the single most common failure when running a pre-existing script against current firmware.
 
 > [!NOTE]
@@ -236,26 +233,25 @@ the single most common failure when running a pre-existing script against curren
 > `"needsSetup":true`. A wrong credential returns
 > `401 {"error":"invalid username or password"}` (`HttpServer.cpp:2456-2458`).
 
----
 
-## 📡 3. Endpoint Specifications & JSON Schemas
+## 3. Endpoint Specifications & JSON Schemas
 
 ### 3.1 GET `/` or `/index.html`
 Serves the CGA CRT web dashboard. Ungated. Once logged in, the page also carries the
 session's CSRF token, which is how the dashboard's own `fetch()` calls satisfy layer 3.
-* **Request:** `GET /`
-* **Response:** `200 OK`
-* **Content-Type:** `text/html; charset=utf-8`
+* Request: `GET /`
+* Response: `200 OK`
+* Content-Type: `text/html; charset=utf-8`
 
 The top bar now exposes Dial Plan (F2), Groups (F3), Call Log (F4) and SIP Trace (F8) as
 modals alongside Refresh / WiFi / Admin / Interconnect / Help. Anything those modals write
-goes through the ordinary gated routes below — there is no privileged path from the page.
+goes through the ordinary gated routes below, there is no privileged path from the page.
 
 ### 3.2 GET `/api/status`
 Fetches a read-only snapshot of the registrar, call sessions, and system metrics. Ungated.
-* **Request:** `GET /api/status`
-* **Response:** `200 OK`, `application/json`
-* **Schema** (abridged — see `HttpServer::sendApiStatus`):
+* Request: `GET /api/status`
+* Response: `200 OK`, `application/json`
+* **Schema** (abridged, see `HttpServer::sendApiStatus`):
   ```json
   {
     "ip": "192.168.4.1",
@@ -275,43 +271,43 @@ Fetches a read-only snapshot of the registrar, call sessions, and system metrics
   ```
 
 ### 3.3 GET `/api/cdr`
-Read-only Call Detail Records ring. **Ungated**, like `/api/status` — a test must not expect
+Read-only Call Detail Records ring. **Ungated**, like `/api/status`, a test must not expect
 a `401` here.
 
 ### 3.4 POST `/api/kill`
 Administratively disconnects a registered extension and terminates its calls.
-* **Content-Type:** `application/x-www-form-urlencoded`
-* **Parameters:** `extension=XXXX`
-* **Headers:** `Cookie: pd_session=…` **and** `X-CSRF: <token>`
-* **Response (Success):** `200 OK` `{"status":"ok","disconnected":"101"}`
-* **Missing parameter:** `400` `{"error":"missing extension parameter"}`
-* **No session:** `401` `{"error":"authentication required"}`
-* **Session but no/wrong token:** `403` `{"error":"missing or invalid CSRF token"}`
-* **Cross-origin:** `403` `{"error":"cross-origin request rejected"}`
-* **Default credential still in place:** `403` `{"error":"setup_required"}`
+* Content-Type: `application/x-www-form-urlencoded`
+* Parameters: `extension=XXXX`
+* Headers: `Cookie: pd_session=…` **and** `X-CSRF: <token>`
+* Response (Success): `200 OK` `{"status":"ok","disconnected":"101"}`
+* Missing parameter: `400` `{"error":"missing extension parameter"}`
+* No session: `401` `{"error":"authentication required"}`
+* Session but no/wrong token: `403` `{"error":"missing or invalid CSRF token"}`
+* Cross-origin: `403` `{"error":"cross-origin request rejected"}`
+* Default credential still in place: `403` `{"error":"setup_required"}`
 
 ### 3.5 GET `/api/wifi/scan`
 Triggers an active Wi-Fi channel scan and returns visible networks. Ungated.
-* **Response (Wi-Fi build):** `200 OK` `{"networks":[{"ssid":"Office_WiFi","rssi":-65,"encryption":"WPA2"}]}`
-* **Response (desktop / no-Wi-Fi build):** `200 OK` `{"networks":[], "note":"WiFi scan not available on desktop"}`
+* Response (Wi-Fi build): `200 OK` `{"networks":[{"ssid":"Office_WiFi","rssi":-65,"encryption":"WPA2"}]}`
+* Response (desktop / no-Wi-Fi build): `200 OK` `{"networks":[], "note":"WiFi scan not available on desktop"}`
 
 ### 3.6 POST `/api/wifi/connect`
 Configures network credentials, saves them to NVS, and restarts in Station mode.
-* **Parameters:** `ssid=SSID_NAME&password=WIFI_PASSWORD`
-* **Headers:** cookie **and** `X-CSRF`
-* **Response (Wi-Fi build):** `200 OK` `{"status":"ok","message":"WiFi credentials saved. Rebooting to Station Mode..."}`
-* **Missing SSID:** `400` `{"error":"missing ssid parameter"}`
-* **Response (no-Wi-Fi build):** `501` `{"error":"WiFi connect not available on desktop"}`
+* Parameters: `ssid=SSID_NAME&password=WIFI_PASSWORD`
+* Headers: cookie **and** `X-CSRF`
+* Response (Wi-Fi build): `200 OK` `{"status":"ok","message":"WiFi credentials saved. Rebooting to Station Mode..."}`
+* Missing SSID: `400` `{"error":"missing ssid parameter"}`
+* Response (no-Wi-Fi build): `501` `{"error":"WiFi connect not available on desktop"}`
 
 ### 3.7 POST `/api/wifi/mode_ap`
 Sets operational mode back to Standalone AP and reboots. Cookie **and** `X-CSRF`.
-* **Response (Wi-Fi build):** `200 OK` `{"status":"ok","message":"Operational mode set to Standalone AP. Rebooting..."}`
-* **Response (no-Wi-Fi build):** `501` `{"error":"WiFi mode select not available on desktop"}`
+* Response (Wi-Fi build): `200 OK` `{"status":"ok","message":"Operational mode set to Standalone AP. Rebooting..."}`
+* Response (no-Wi-Fi build): `501` `{"error":"WiFi mode select not available on desktop"}`
 
 > [!IMPORTANT]
 > "No-Wi-Fi build" is **not** just the desktop build. The `eth` and `lan8720` transports do
 > not define `POCKETDIAL_HAS_WIFI` (`main/CMakeLists.txt:133-136`), so on a wired board
-> `/api/wifi/connect` and `/api/wifi/mode_ap` take their `#else` branch and answer `501` —
+> `/api/wifi/connect` and `/api/wifi/mode_ap` take their `#else` branch and answer `501`, 
 > despite the message saying "desktop" (issue #167). A hardware test matrix must branch on
 > transport, not on host-vs-device.
 >
@@ -322,19 +318,19 @@ Sets operational mode back to Standalone AP and reboots. Cookie **and** `X-CSRF`
 ### 3.8 POST `/api/configuring`
 Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. Takes
 the full `requireAdmin()` gate with `needCsrf = true` (`HttpServer.cpp:606-618`), like every
-other mutating route. **It is no longer exempt on a fresh device** — an older revision of
+other mutating route. **It is no longer exempt on a fresh device**, an older revision of
 this plan said onboarding was unaffected because unprovisioned requests skipped the gate;
 that bypass is gone, so the portal must log in with the default credential first.
 
 ### 3.9 GET `/api/pcap`, `/api/diagnostics/pcap`, `/api/trace`
 Diagnostic capture ring: the first two as a Wireshark-readable `.pcap`, the third as JSON
 for the dashboard's live tracer. All three are `GET`, so they take same-origin plus a
-session, and no CSRF token — but they are still subject to layer 4.
+session, and no CSRF token, but they are still subject to layer 4.
 
-**These three previously had no same-origin check** — before `e631fc2` `/api/pcap` called
+**These three previously had no same-origin check**, before `e631fc2` `/api/pcap` called
 `isAuthed()` directly and never consulted the `Origin` header. They now go through
 `requireAdmin()` like everything else, which is worth an explicit regression case
-(TC-SEC-06): a capture ring is signalling metadata — who called whom, from which address —
+(TC-SEC-06): a capture ring is signalling metadata, who called whom, from which address, 
 and was readable by any page that could reach the device.
 
 ### 3.10 GET `/api/ap-security`
@@ -344,10 +340,10 @@ Reports the SoftAP security setting and its passphrase. Gated.
 { "secure": false, "psk": "DD9T4GZKQ4AHY5KGRZP8" }
 ```
 
-* `secure` — `true` when the standalone SoftAP comes up `WIFI_AUTH_WPA2_PSK`. **Defaults
+* `secure`, `true` when the standalone SoftAP comes up `WIFI_AUTH_WPA2_PSK`. **Defaults
   to `false`**; the shipped posture is an open AP. Enabling WPA2 forces every associated
   phone to be re-paired, so it is an explicit operator action.
-* `psk` — generated from the hardware CSPRNG on first access and stored in NVS. 20
+* `psk`, generated from the hardware CSPRNG on first access and stored in NVS. 20
   characters from an alphabet with no ambiguous glyphs (no `0`/`O`, `1`/`I`/`L`, `U`).
 
 Returning the passphrase in clear to an authenticated admin is deliberate: on the
@@ -362,7 +358,7 @@ Form-encoded; all parameters optional, omitted ones unchanged. Cookie **and** `X
 | `psk` | 8–63 printable ASCII | Set the passphrase explicitly. `400` if out of range, leaving the stored value untouched. |
 | `regenerate` | `1`/`true` | Replace the passphrase with a freshly generated one. |
 
-Responds with the same body as the `GET`. **The radio is not restarted** — doing so would
+Responds with the same body as the `GET`. **The radio is not restarted**, doing so would
 drop the client that just made the request, losing the response and the passphrase it
 still has to display, and would tear down live calls. The change lands at the next AP
 bringup, so a test must reboot (or re-bring-up the AP) before asserting on the radio.
@@ -381,16 +377,16 @@ Reports the SIP registrar admission mode and the adopted-extension roster. Gated
 }
 ```
 
-* `attached` — `false` when the SIP engine has not been bound to the dashboard yet. On a
+* `attached`, `false` when the SIP engine has not been bound to the dashboard yet. On a
   `wifi`/`eth`/`lan8720` device this is not merely a transient: such a board runs **no SIP
   task at all** until a credential has been committed (`main/esp_main_eth.cpp:465-496`), so
   `attached` stays `false` for as long as setup is outstanding. (The `display` build has no
-  such gate — `main/esp_main_display.cpp:799-806`.) A test that asserts `mode == "open"` on
-  a fresh boot will flake against this — assert on `attached` first.
-* `mode` — `open`, `learn` or `secure`. **`open` is the shipped default.**
-* `state` — `learned` (adopted on first contact, not yet enforced) or `secured`
+  such gate, `main/esp_main_display.cpp:799-806`.) A test that asserts `mode == "open"` on
+  a fresh boot will flake against this, assert on `attached` first.
+* `mode`, `open`, `learn` or `secure`. **`open` is the shipped default.**
+* `state`, `learned` (adopted on first contact, not yet enforced) or `secured`
   (MAC-locked and digest-enforced for its extension).
-* `online` — volatile registration state; never persisted.
+* `online`, volatile registration state; never persisted.
 
 ### 3.13 POST `/api/registrar`
 Sets the admission mode. Cookie **and** `X-CSRF`.
@@ -412,14 +408,14 @@ Switching to `secure` while **no** extension is yet `secured` is refused with `4
 { "error": "no extensions are secured yet; switching to secure now would reject every phone. Adopt them in learn mode first, or resend with confirm=LOCKOUT to override." }
 ```
 
-Resend with `confirm=LOCKOUT` to override — the same shape as `/api/factory-reset`'s
+Resend with `confirm=LOCKOUT` to override, the same shape as `/api/factory-reset`'s
 `confirm=ERASE`. Responds with the same body as the `GET`.
 
 > [!NOTE]
-> **Corrected — a factory reset *does* clear `reg_mode` now.** Earlier revisions of this
+> **Corrected, a factory reset *does* clear `reg_mode` now.** Earlier revisions of this
 > box warned that `POST /api/factory-reset` would not undo `mode=secure`, because
 > `DeviceConfig::clearAll()` erased `reg_mode` from the `storage` namespace while the
-> registrar keeps it in `pbxcfg`. **That was a real bug and it was fixed in issue #188**:
+> registrar keeps it in `pbxcfg`. That was a real bug and it was fixed in issue #188:
 > `clearAll()` now calls `eraseRegistrarMode()` (`DeviceConfig.cpp:698`), which opens
 > `pbxcfg`, and the comment at `:693-697` records exactly this. [API.md](API.md)'s
 > factory-reset section already stated it correctly. Restoring `mode=open` in the same run
@@ -434,12 +430,12 @@ Secures or forgets one adopted device. Cookie **and** `X-CSRF`.
 | `action` | `secure` \| `forget` | Required. |
 | `target` | 12-hex MAC, or an extension | Required. An extension resolves to the device currently bound to it. |
 
-`secure` promotes a `learned` device to `secured`. `forget` drops the adoption record —
+`secure` promotes a `learned` device to `secured`. `forget` drops the adoption record, 
 in `learn` mode the phone is re-adopted on its next registration, which is how you re-home
 an extension to different hardware. `404` if no adopted device matches. Responds with the
 same body as the `GET`.
 
-> The MAC lock is **not** a cryptographic boundary — it is learned from the ARP table, and
+> The MAC lock is **not** a cryptographic boundary, it is learned from the ARP table, and
 > ARP/MAC are spoofable on a hostile L2. Test it as defence in depth, not as authentication.
 
 ### 3.15 POST `/api/dialplan`
@@ -448,14 +444,14 @@ Cookie **and** `X-CSRF`.
 
 | Param | Values | Effect |
 |---|---|---|
-| `pattern` | letters, digits, `#`, `*` | Required — the rule key. Editing an existing pattern keeps its position; a new one is appended. |
+| `pattern` | letters, digits, `#`, `*` | Required, the rule key. Editing an existing pattern keeps its position; a new one is appended. |
 | `action` | `group` \| `page` \| `park` \| `trunk` | Omitted **and** `target` omitted ⇒ delete. Naming an action always means upsert. |
-| `target` | letters, digits, `#`, `*` | The group/zone/orbit extension, or — for `trunk` — the digits prepended after stripping. |
+| `target` | letters, digits, `#`, `*` | The group/zone/orbit extension, or, for `trunk`, the digits prepended after stripping. |
 | `stripDigits` | integer | `trunk` only: leading digits removed before prepending `target`. |
 
 Cases worth pinning:
 
-* **A `trunk` rule may carry an EMPTY `target`** — that is how you express "strip N digits
+* **A `trunk` rule may carry an EMPTY `target`**, that is how you express "strip N digits
   and prepend nothing", and it is otherwise inexpressible. Any other action with an empty
   target is `400 {"error":"only a trunk rule may have an empty target (it means prepend nothing)"}`.
 * **Deleting therefore requires an empty `action` *and* an empty `target`.** Sending
@@ -465,7 +461,7 @@ Cases worth pinning:
 
 > [!NOTE]
 > **Reaching an outbound trunk requires such a rule.** There is no hardcoded `9` prefix and
-> no "unknown destination falls through to the trunk" behaviour — with an empty dial plan,
+> no "unknown destination falls through to the trunk" behaviour, with an empty dial plan,
 > every outside number is answered `404` without leaving the box. Outbound goes over the
 > AnchorClient (HTTP/OAuth2 + call-control WebSocket + chunked-HTTPS PCM16), **not** a SIP
 > trunk: nothing in the tree ever sends a `REGISTER`, so the device never registers to an
@@ -475,7 +471,7 @@ Cases worth pinning:
 > normalization exists anywhere.
 
 ### 3.16 GET `/config/<mac>.cfg`
-Zero-touch provisioning, Yealink key format. Ungated by design — a booting phone has no
+Zero-touch provisioning, Yealink key format. Ungated by design, a booting phone has no
 session cookie, and the MAC is the credential.
 
 * The MAC in the path must be **12 lowercase hex characters**.
@@ -487,17 +483,17 @@ session cookie, and the MAC is the credential.
   `200` as "the route served bytes", not as "a phone would accept them".
 
 ### 3.17 GET `/setup/email`
-Issue #159 (Phase 1). Standalone SMTP-configuration page — own document, not part of the
+Issue #159 (Phase 1). Standalone SMTP-configuration page, own document, not part of the
 `/` dashboard SPA (see `index_html.h`'s `PD_HTML_8`). Ungated shell, same class as `/`
 itself: renders no configuration on its own, fetches everything from the gated
 `GET /api/email` client-side. `200` always.
 
 ### 3.18 GET/POST `/api/email`, POST `/api/email/test`
 The SMTP client's config surface. `GET` redacts both secrets (`hasPassword`/`hasGsaKey`
-booleans, never the values — the #207 class, see `API.md`). `POST`'s `pass`/`gsaKey`/
+booleans, never the values, the #207 class, see `API.md`). `POST`'s `pass`/`gsaKey`/
 `caPem` keep the stored value when submitted empty. `POST /api/email/test` sends a real
 message through `SmtpClient::sendAndWait()` and always answers `200` with the real
-outcome in `ok`/`resultCode`/`smtpReplyCode`/`error` — a failed send is an expected,
+outcome in `ok`/`resultCode`/`smtpReplyCode`/`error`, a failed send is an expected,
 common result to report inline, not a `5xx`. Full schemas, param tables and `curl`
 examples: [`API.md`](API.md)'s `/setup/email`/`/api/email`/`/api/email/test` sections.
 
@@ -508,7 +504,7 @@ examples: [`API.md`](API.md)'s `/setup/email`/`/api/email`/`/api/email/test` sec
 password, then GET → response body must not contain the literal password anywhere,
 `hasPassword:true`. **TC-EMAIL-07** Save a password, then POST again with `pass=`
 (empty) and a changed `host` → the password is unchanged (verified in-process via
-`EmailConfigStore::load()`, since the HTTP layer never echoes it — there is no other
+`EmailConfigStore::load()`, since the HTTP layer never echoes it, there is no other
 way to assert this from outside). **TC-EMAIL-08** POST with `mode` omitting `port` →
 stored port matches the mode's default (465/587/25). **TC-EMAIL-09** Test-send with no
 host configured → `200 {"ok":false,...}`, never a `5xx`. **TC-EMAIL-10** Full round trip
@@ -516,22 +512,21 @@ against a scripted fake SMTP server (loopback, plain mode) → `200 {"ok":true,
 "smtpReplyCode":250}` and the fake server actually received the configured `RCPT TO`.
 
 All ten are implemented as host gtest (`tests/EmailHttp_test.cpp`), not yet as
-`test_api.sh` shell cases — this is a Phase 1 addition and the shell suite was not
+`test_api.sh` shell cases, this is a Phase 1 addition and the shell suite was not
 extended in the same PR (the host suite already gives byte-level assertions `curl`-based
 cases can't, e.g. TC-EMAIL-06's "never appears anywhere in the response body" check).
 Extending `test_api.sh` to match, and a live-bench pass (real Gmail App Password /
-Workspace service-account delivery — see `API.md`'s bench-unverified note), are open
+Workspace service-account delivery, see `API.md`'s bench-unverified note), are open
 follow-ups.
 
----
 
-## 🧾 4. Security Response Headers (assert on every response)
+## 4. Security Response Headers (assert on every response)
 
 `HttpServer::sendResponseWithHeader` emits these centrally (`HttpServer.cpp:796-802`), so a
 single missing header is a global regression and is cheap to assert once per suite.
 **Correction: there is no exempt path.** Earlier revisions said the captive-portal `302`
 from `sendRedirect()` hand-rolled a bare redirect and told you not to assert headers on it.
-`sendRedirect()` now routes through `sendResponseWithHeader` (`HttpServer.cpp:3122`) — the
+`sendRedirect()` now routes through `sendResponseWithHeader` (`HttpServer.cpp:3122`), the
 hand-rolled version was the bug, and its own comment records the fix. **Assert the headers
 on the `302` too**; it is a regression if they are missing:
 
@@ -552,124 +547,123 @@ There is deliberately **no** `Strict-Transport-Security`, and asserting its abse
 worth a case: the dashboard is plain HTTP on a LAN appliance, and pinning HSTS would make
 the device permanently unreachable over `http://` with no way for a user to override it.
 
----
 
-## 🧪 5. Systematic Test Matrix
+## 5. Systematic Test Matrix
 
 Execute the following against a running device. Every case marked **(A)** requires the §2
-login preamble — including setup completion — to have run first.
+login preamble (including setup completion) to have run first.
 
 ### Happy Path Tests
-* **TC-HP-01 (Get Dashboard):** GET `/` → `200 OK`, HTML matching `CGA_INDEX_HTML`.
-* **TC-HP-02 (Get System Status):** GET `/api/status` → `200 OK` and a valid JSON map of
+* TC-HP-01 (Get Dashboard): GET `/` → `200 OK`, HTML matching `CGA_INDEX_HTML`.
+* TC-HP-02 (Get System Status): GET `/api/status` → `200 OK` and a valid JSON map of
   system metrics, client snapshots, and active sessions. No headers needed.
-* **TC-HP-03 (Kill Active Extension) (A):** POST `/api/kill` with `extension=101`, cookie
+* TC-HP-03 (Kill Active Extension) (A): POST `/api/kill` with `extension=101`, cookie
   and `X-CSRF` → `200 OK`, `{"status":"ok","disconnected":"101"}`. Sessions involving
   `101` are immediately swept.
-* **TC-HP-04 (Scan WiFi):** GET `/api/wifi/scan` → on a Wi-Fi build, switches to `APSTA`
+* TC-HP-04 (Scan WiFi): GET `/api/wifi/scan` → on a Wi-Fi build, switches to `APSTA`
   then `200 OK` with SSIDs; on `eth`/`lan8720`/host, `200 OK` with an empty list.
-* **TC-HP-05 (Call log):** GET `/api/cdr` with **no** headers → `200 OK`. Regression case
+* TC-HP-05 (Call log): GET `/api/cdr` with **no** headers → `200 OK`. Regression case
   for the route being ungated like `/api/status`.
 
 ### Forced-Setup Tests (gate layer 4)
-* **TC-SET-01 (Fresh device reports itself):** GET `/api/admin/status` on a never-set-up
+* TC-SET-01 (Fresh device reports itself): GET `/api/admin/status` on a never-set-up
   target → `200`, `{"provisioned":false,"needsSetup":true,…}`. No headers.
-* **TC-SET-02 (Default credential authenticates):** POST `/api/admin/login` with
+* TC-SET-02 (Default credential authenticates): POST `/api/admin/login` with
   `username=admin&password=admin` → `200`, a `pd_session` cookie, and a body containing both
   `"csrf"` and `"needsSetup":true`. **Not** `409`.
-* **TC-SET-03 (Everything else is refused):** With that session and its token, POST
+* TC-SET-03 (Everything else is refused): With that session and its token, POST
   `/api/kill` → `403 {"error":"setup_required"}`. Repeat with a gated **GET**
   (`/api/registrar`) → also `403 setup_required`, proving layer 4 applies to reads too.
-* **TC-SET-04 (The one exemption works):** POST `/api/admin/set-credential` with
+* TC-SET-04 (The one exemption works): POST `/api/admin/set-credential` with
   `username=admin&password=realpassword123`, same cookie and token → `200`,
   `{"status":"ok","provisioned":true,"needsSetup":false}`. The **same** session must still
-  work afterwards — `setLoginCredential()` does not invalidate the session it was called
+  work afterwards, `setLoginCredential()` does not invalidate the session it was called
   through.
-* **TC-SET-05 (Validation):** `password=short` → `400 {"error":"invalid username or password"}`;
+* TC-SET-05 (Validation): `password=short` → `400 {"error":"invalid username or password"}`;
   `username=` alone → `400 {"error":"username and password must both be provided together"}`;
   an empty body → `400 {"error":"nothing to change"}`. A rejected call must leave the
   stored credential unchanged.
-* **TC-SET-06 (DTMF PIN is separate):** POST `/api/admin/set-credential` with
+* TC-SET-06 (DTMF PIN is separate): POST `/api/admin/set-credential` with
   `dtmfPin=1234` alone → `200`. A 3-digit or non-numeric PIN → `400 {"error":"DTMF PIN must
   be 4-16 digits"}`. Setting it must not alter the login credential, and not setting it must
   leave the `*PIN#code` menu unreachable.
 
 ### Edge Case & Boundary Validation Tests
-* **TC-ED-01 (Payload Too Large):** POST a body larger than 16 KB (16,384 bytes) to
+* TC-ED-01 (Payload Too Large): POST a body larger than 16 KB (16,384 bytes) to
   `/api/wifi/connect` → `413 Payload Too Large`,
   `{"error":"request body exceeds 16 KB limit"}`, connection closes. Note
-  `/api/ota/upload` is **exempt** — it is streamed, not buffered, so a multi-MB image
+  `/api/ota/upload` is **exempt**, it is streamed, not buffered, so a multi-MB image
   must not return `413`.
-* **TC-ED-02 (Missing Kill Parameter) (A):** POST `/api/kill` with an empty body, cookie
+* TC-ED-02 (Missing Kill Parameter) (A): POST `/api/kill` with an empty body, cookie
   and valid token → `400 Bad Request`, `{"error":"missing extension parameter"}`.
-  The `400` proves the gate was passed *before* validation — order matters.
-* **TC-ED-03 (Missing Connect Parameters) (A):** POST `/api/wifi/connect` with
+  The `400` proves the gate was passed *before* validation, order matters.
+* TC-ED-03 (Missing Connect Parameters) (A): POST `/api/wifi/connect` with
   `password=12345678` → `400 Bad Request`, `{"error":"missing ssid parameter"}`.
-* **TC-ED-04 (URL-Encoded Values Parsing) (A):** POST `/api/wifi/connect` with
+* TC-ED-04 (URL-Encoded Values Parsing) (A): POST `/api/wifi/connect` with
   `ssid=Office+AP%21&password=pass`. Verify the stored credential decodes to `Office AP!`.
-* **TC-ED-05 (AP passphrase bounds) (A):** POST `/api/ap-security` with a 7-character
+* TC-ED-05 (AP passphrase bounds) (A): POST `/api/ap-security` with a 7-character
   `psk` → `400`, and a follow-up `GET /api/ap-security` still returns the **previous**
   passphrase. A rejected write must not clear the stored value.
-* **TC-ED-06 (Registrar lockout guard) (A):** With no extension in state `secured`, POST
+* TC-ED-06 (Registrar lockout guard) (A): With no extension in state `secured`, POST
   `/api/registrar` with `mode=secure` → `409` and the quoted body above. Repeat with
   `mode=secure&confirm=LOCKOUT` → `200` and `"mode":"secure"`. **Restore `mode=open`
-  explicitly afterwards** — every later SIP case is otherwise digest-challenged, and on real
+  explicitly afterwards**, every later SIP case is otherwise digest-challenged, and on real
   hardware a factory reset will not undo it (§3.13).
-* **TC-ED-07 (Registrar unknown device) (A):** POST `/api/registrar/device` with
+* TC-ED-07 (Registrar unknown device) (A): POST `/api/registrar/device` with
   `action=secure&target=ffffffffffff` → `404`.
-* **TC-ED-08 (Dial-plan empty trunk target) (A):** POST `/api/dialplan` with
+* TC-ED-08 (Dial-plan empty trunk target) (A): POST `/api/dialplan` with
   `pattern=9XXXXXXXXXX&action=trunk&target=&stripDigits=1` → `200` (a legal "strip 1, prepend
   nothing" rule). The same with `action=group&target=` → `400`. Then POST
   `pattern=9XXXXXXXXXX` alone (no `action`, no `target`) → the rule is **deleted**.
 
 > [!NOTE]
-> **Corrected:** earlier revisions of these examples used the pattern `9X.` and the ring-group
+> Corrected: earlier revisions of these examples used the pattern `9X.` and the ring-group
 > mode `"ring"`. Neither is legal. `pbx::isDialTokenSafe` (`src/SIP/DialPlan.hpp:176-186`)
-> admits only alphanumerics, `#` and `*` — a `.` is rejected with
-> `400 "pattern may contain only letters, digits, '#' and '*'"` — and the only accepted
+> admits only alphanumerics, `#` and `*`, a `.` is rejected with
+> `400 "pattern may contain only letters, digits, '#' and '*'"`, and the only accepted
 > group modes are `ringall` and `hunt` (`HttpServer.cpp:1550-1556`). A test written from the
 > old examples fails against correct firmware. Use `X` per digit, or a trailing `*` for
 > "rest of the string".
-* **TC-ED-09 (Reserved dial-plan patterns) (A):** `pattern=777` → `400 {"error":"cannot use
+* TC-ED-09 (Reserved dial-plan patterns) (A): `pattern=777` → `400 {"error":"cannot use
   a reserved extension as a dial-plan pattern"}`. Same for `999`, `440`, `555`.
-* **TC-ED-10 (Provisioning config 404s in open mode):** GET `/config/805ec079c37f.cfg` on a
+* TC-ED-10 (Provisioning config 404s in open mode): GET `/config/805ec079c37f.cfg` on a
   default (`open`) board → `404`, because open mode records no adopted devices. Uppercase or
   short MACs must also `404`, not `500`.
 
 ### Same-Origin Tests (gate layer 1)
-* **TC-SEC-01 (Direct Request — No Origin Header) (A):** POST `/api/kill` via `curl` with no
-  `Origin`, cookie and token → `200 OK`. Without the cookie → `401` — the missing `Origin`
+* TC-SEC-01 (Direct Request. No Origin Header) (A): POST `/api/kill` via `curl` with no
+  `Origin`, cookie and token → `200 OK`. Without the cookie → `401`, the missing `Origin`
   is still allowed, it is the session that stops you.
-* **TC-SEC-02 (Same-Origin Request) (A):** POST `/api/kill` with `Host: 192.168.4.1`,
+* TC-SEC-02 (Same-Origin Request) (A): POST `/api/kill` with `Host: 192.168.4.1`,
   `Origin: http://192.168.4.1`, cookie and token → `200 OK`.
-* **TC-SEC-03 (Cross-Origin Block):** POST `/api/kill` with `Host: 192.168.4.1` and
+* TC-SEC-03 (Cross-Origin Block): POST `/api/kill` with `Host: 192.168.4.1` and
   `Origin: http://malicious-website.com` → `403 Forbidden`,
-  `{"error":"cross-origin request rejected"}`. Assert the **body** — see TC-SEC-05.
+  `{"error":"cross-origin request rejected"}`. Assert the **body**, see TC-SEC-05.
 
 ### Session & CSRF Tests (gate layers 2 and 3)
-* **TC-SEC-04 (No session):** POST `/api/kill` with no cookie → `401 Unauthorized`,
-  `{"error":"authentication required"}`. This holds on a factory-fresh device too — there
+* TC-SEC-04 (No session): POST `/api/kill` with no cookie → `401 Unauthorized`,
+  `{"error":"authentication required"}`. This holds on a factory-fresh device too, there
   is no unprovisioned bypass to regression-test for any more.
-* **TC-SEC-05 (Cookie without token) (A):** POST `/api/kill` with a valid `pd_session`
+* TC-SEC-05 (Cookie without token) (A): POST `/api/kill` with a valid `pd_session`
   cookie but **no** `X-CSRF` header → `403 Forbidden`,
   `{"error":"missing or invalid CSRF token"}`. Repeat with a token that is valid-looking
-  but belongs to no session — same result. This case, TC-SEC-03 and TC-SET-03 all return
+  but belongs to no session, same result. This case, TC-SEC-03 and TC-SET-03 all return
   `403`; the assertion **must** be on the JSON body.
-* **TC-SEC-06 (Diagnostics are gated) (A):** GET `/api/pcap`, `/api/diagnostics/pcap` and
+* TC-SEC-06 (Diagnostics are gated) (A): GET `/api/pcap`, `/api/diagnostics/pcap` and
   `/api/trace` with no cookie → `401` on all three. Then with a cookie and **no** token →
   `200` on all three, because they are `GET`s and take no CSRF token. Regression case for
   the previously-missing gate.
-* **TC-SEC-07 (`/api/configuring` is gated) (A):** POST `/api/configuring` with no cookie →
+* TC-SEC-07 (`/api/configuring` is gated) (A): POST `/api/configuring` with no cookie →
   `401`; with a cookie but no `X-CSRF` → `403` (it is a mutating route, `needCsrf = true`).
-  On a device still on the default credential it is `403 setup_required` — the old
+  On a device still on the default credential it is `403 setup_required`, the old
   "unprovisioned onboarding is exempt" behaviour is **gone**, so a captive-portal test must
   log in first.
-* **TC-SEC-08 (Logout needs no token) (A):** POST `/api/admin/logout` with only the cookie →
+* TC-SEC-08 (Logout needs no token) (A): POST `/api/admin/logout` with only the cookie →
   succeeds. A subsequent `/api/kill` with the same cookie → `401`.
-* **TC-SEC-09 (Headers present):** Assert the five headers of §4 on at least one `GET`,
+* TC-SEC-09 (Headers present): Assert the five headers of §4 on at least one `GET`,
   one `POST` success, and one error response, and assert `Strict-Transport-Security` is
   **absent**.
-* **TC-SEC-10 (Session slide):** ~~GET `/api/admin/status` does **not** itself slide the
+* TC-SEC-10 (Session slide): ~~GET `/api/admin/status` does **not** itself slide the
   expiry.~~ **This expectation is wrong and must not be asserted.** `sendApiAdminStatus`
   calls `isAuthed()` (`HttpServer.cpp:2639`) → `AdminAuth::validateSession()`, which pushes
   `expiresAtMs` forward (`AdminAuth.cpp:909`). So polling `/api/admin/status` **does** keep
@@ -678,60 +672,59 @@ login preamble — including setup completion — to have run first.
   Assert the opposite: two reads 2 s apart both return `sessionRemainingSec` near 1800.
 
 ### Login Rate-Limiting Tests
-* **TC-RL-01 (Per-client lockout):** From one client, POST `/api/admin/login` with a wrong
+* TC-RL-01 (Per-client lockout): From one client, POST `/api/admin/login` with a wrong
   password. Attempts 1–4 return `401 Unauthorized`,
   `{"error":"invalid username or password"}`. The **5th** attempt
   (`AdminAuth::kMaxFailedAttempts`) engages the lockout inside `verifyCredential()` and the
   handler's post-verify re-check turns that same response into `429 Too Many Requests`,
-  `{"error":"too many failed attempts; try again later"}` — the 5th wrong password is a
+  `{"error":"too many failed attempts; try again later"}`, the 5th wrong password is a
   `429`, not a `401` (`HttpServer.cpp:2446-2459`). Every attempt after it, **including one
   with the correct password**, is `429` until the cooldown expires. Cooldown starts at 60 s
   (`kLockoutMs`).
-* **TC-RL-02 (Exponential backoff):** Repeat TC-RL-01 after the cooldown expires. Each
-  consecutive lockout doubles the wait — `kLockoutMs << min(trips-1, kMaxLockoutShift)`,
+* TC-RL-02 (Exponential backoff): Repeat TC-RL-01 after the cooldown expires. Each
+  consecutive lockout doubles the wait, `kLockoutMs << min(trips-1, kMaxLockoutShift)`,
   capped by `kMaxLockoutShift = 4` at 16 minutes per client. Only a **correct** login
   resets the trip count.
-* **TC-RL-03 (Aggregate backstop):** Across *different* clients, accumulate
+* TC-RL-03 (Aggregate backstop): Across *different* clients, accumulate
   `kMaxFailedAttemptsGlobal = 20` failures. A fresh client with an empty bucket of its
-  own is then locked out too — this is what stops an attacker who rotates source
+  own is then locked out too, this is what stops an attacker who rotates source
   addresses from buying an unbounded guess rate. A correct login clears the aggregate state
   as well.
-* **TC-RL-04 (Shared bucket with the DTMF PIN):** `AdminAuth::verifyDtmfPin()` accounts
+* TC-RL-04 (Shared bucket with the DTMF PIN): `AdminAuth::verifyDtmfPin()` accounts
   against the unkeyed `""` bucket (`AdminAuth.hpp:135-139`). A suite that exercises both
   surfaces must expect them to lock each other out.
 
 > [!CAUTION]
 > **Do not hammer `/api/admin/login` in a load test.** The lockout is **global** (the
-> per-client key is never supplied — [THREAT_MODEL.md](THREAT_MODEL.md) D-3) with
+> per-client key is never supplied, [THREAT_MODEL.md](THREAT_MODEL.md) D-3) with
 > exponential backoff *and* an aggregate backstop across all clients, so a brute-force
-> loop locks the whole bench out — including you, at the correct password — for up to 16
+> loop locks the whole bench out (including you, at the correct password) for up to 16
 > minutes, and each further round doubles it. Budget wall-clock time for TC-RL-02/03, or
 > run them last.
 >
 > **To get unstuck: reboot.** The attempt buckets and the aggregate counters live in
-> `AuthState`, a function-local static — only the credential hashes are persisted to NVS.
+> `AuthState`, a function-local static, only the credential hashes are persisted to NVS.
 > Power-cycling the device (or restarting the host `SipServer` process) clears every lockout
 > without touching the credential. A factory reset is not needed.
 
 ### Concurrent Stress Tests
-* **TC-ST-01 (Rapid Dashboard Status Polling):**
-  * **Action:** Fire 50 requests per second against `/api/status` for 60 seconds while an
+* TC-ST-01 (Rapid Dashboard Status Polling):
+  * Action: Fire 50 requests per second against `/api/status` for 60 seconds while an
     active SIP call is running on Core 1.
-  * **Expected:**
+  * Expected:
     * All HTTP status requests return successfully.
     * No connection stalls occur.
-    * **Crucially:** SIP call audio remains smooth, and no signalling UDP packets are
+    * Crucially: SIP call audio remains smooth, and no signalling UDP packets are
       dropped on Core 1 (verifying that snapshotting prevents thread blocking).
-  * **Note:** `/api/status` is a `GET` and ungated, so this runs without a session. Do
-    **not** substitute a mutating endpoint here — see TC-RL-01.
+  * Note: `/api/status` is a `GET` and ungated, so this runs without a session. Do
+    **not** substitute a mutating endpoint here, see TC-RL-01.
 
----
 
-## 🖥️ 6. Host Test Suite
+## 6. Host Test Suite
 
 The gtest suite that backs all of the above is **641 test cases** (static count of
 `TEST`/`TEST_F`/`TEST_P` in `tests/*.cpp`; the 506 previously quoted here was stale by
-135 — measured alongside issue #159's own addition; see
+135, measured alongside issue #159's own addition; see
 [`CONTRIBUTING_FIRMWARE.md`](../CONTRIBUTING_FIRMWARE.md) §5 for the platform-specific
 run-count gap, currently 639 on Linux/WSL).
 The same three commands CI runs, from a WSL shell:
@@ -746,7 +739,7 @@ ctest --test-dir build/tests --output-on-failure
 `IDF_PATH` must be unset because the root `CMakeLists.txt` branches on it: with the
 variable defined it includes `$ENV{IDF_PATH}/tools/cmake/project.cmake` and configures an
 ESP-IDF cross-build, and the host tests are never generated. The `--test-dir build/tests`
-is not optional either — testing is enabled only inside the `tests/` subdirectory, so the
+is not optional either, testing is enabled only inside the `tests/` subdirectory, so the
 CTest set lives there and not at the build root.
 
 Run it from WSL rather than natively on Windows: several suites open real sockets, which
@@ -758,11 +751,11 @@ State this plainly before quoting the pass count at anyone:
 
 * **`RtpSender.cpp` and `RtpReceiver.cpp` compile to host stubs.** Every green media test
   exercises a stub, not real RTP. On-device RTP has never been exercised by a test.
-* **OTA has never been executed anywhere** — not on hardware, not in CI.
+* **OTA has never been executed anywhere**, not on hardware, not in CI.
 * The interop suites (`tests/interop/`, pjsua/SIPp) run against the **desktop** binary on
   loopback, not against a board.
 * The only real-handset evidence in the project is recent and narrow: a Yealink T29
-  registered to the bench board, and outbound PSTN verified end to end — one call rang
+  registered to the bench board, and outbound PSTN verified end to end, one call rang
   through to carrier voicemail (answered at 21.2 s) and one was answered by a person with
   two-way audio. That is the first real-handset evidence there has been; everything else in
   this plan is host-only.
@@ -771,7 +764,7 @@ State this plainly before quoting the pass count at anyone:
 
 The trap here has **inverted** since the previous revision of this plan. It used to be
 "provision a PIN without attaching a `RequestsHandler` and the listener goes dark, so you
-measure a refused connection instead of the gate." That mechanism is gone — the socket is
+measure a refused connection instead of the gate." That mechanism is gone, the socket is
 unconditional, and `AdminHttpGate_test.cpp`'s header comment now exists to document its
 removal.
 
@@ -782,29 +775,28 @@ under test, which looks nothing like the thing being tested. The helper exists p
 that never has to be rediscovered:
 
 > Log in with the shipped default credential, then immediately complete setup with a real
-> one — `requireAdmin()` refuses every other admin-gated route (including the ones under
+> one, `requireAdmin()` refuses every other admin-gated route (including the ones under
 > test here) while `needsInitialSetup()` is true, and `setLoginCredential()` does not
 > invalidate the session it was called through, so the same cookie/csrf pair keeps working
 > afterward.
 
-Remember to `AdminAuth::clearCredential()` at the end of a case that sets one — the
+Remember to `AdminAuth::clearCredential()` at the end of a case that sets one, the
 credential is a process-wide static on host, so a leftover one leaks into the next test.
 
----
 
-## 🔐 7. Two-Role Privilege Model + Config Export/Import (Issues #173, #186)
+## 7. Two-Role Privilege Model + Config Export/Import (Issues #173, #186)
 
-Covered by three new gtest files rather than `test_api.sh` shell cases — they exercise
+Covered by three new gtest files rather than `test_api.sh` shell cases, they exercise
 the same real-`HttpServer`-over-a-socket pattern `AdminHttpGate_test.cpp` established,
 plus (for the crypto) independently-published test vectors. All three run in the
 normal `ctest` pass; see §6.
 
-* **`tests/AdminAuthCrypto_test.cpp`** — `AdminAuth::pbkdf2Sha256`/`aesGcmSeal`/
+* **`tests/AdminAuthCrypto_test.cpp`**, `AdminAuth::pbkdf2Sha256`/`aesGcmSeal`/
   `aesGcmOpen` against RFC 7914 §11's PBKDF2-HMAC-SHA256 vectors and the McGrew-Viega
   GCM spec's Appendix B Test Cases 13/14 (the 256-bit, all-zero-key/IV cases), plus a
   round-trip, a per-byte ciphertext-tamper sweep, wrong-AAD, wrong-key, and truncated-
-  ciphertext rejection. No `HttpServer` involved — pure function tests, no port block.
-* **`tests/TwoRoleAuth_test.cpp`** (ports `18130`-`18139`) — `AdminAuth::authenticate()`
+  ciphertext rejection. No `HttpServer` involved, pure function tests, no port block.
+* **`tests/TwoRoleAuth_test.cpp`** (ports `18130`-`18139`), `AdminAuth::authenticate()`
   resolving `Role::Sysop`/`Role::Owner`/`Role::None`; the username-collision guard in
   both directions; the no-owner-yet fallback opening and then closing once an owner is
   created; lockout keyed by `(client, principal)` including the per-principal
@@ -812,17 +804,17 @@ normal `ctest` pass; see §6.
   the DTMF PIN's separate lockout bucket (or the reverse); and, driven through a real
   `HttpServer`, owner-vs-sysop gating on all **four** owner-gated actions (factory
   reset, config-export-with-secrets, OTA upload, and the DTMF-PIN field of
-  `set-credential` — the fourth found during review, not in the original issue text).
-* **`tests/ConfigExportImport_test.cpp`** (ports `18140`-`18159`) — plaintext
+  `set-credential`, the fourth found during review, not in the original issue text).
+* **`tests/ConfigExportImport_test.cpp`** (ports `18140`-`18159`), plaintext
   export/import round-trip through live `RequestsHandler`/`DeviceConfig` accessors;
   replace-not-merge (an entry present on the device but absent from the imported blob
   is removed); the AES-256-GCM-gated round-trip for the Wi-Fi password and the SoftAP
   PSK; importing with `secretsEnc` present but no `password` (plaintext half still
   applies, gated half reported `skipped`, existing secret left untouched); the
-  rejection paths — wrong password (`422`), a single tampered ciphertext byte (`422`,
+  rejection paths, wrong password (`422`), a single tampered ciphertext byte (`422`,
   indistinguishable from a wrong password), malformed JSON (`400`), a missing
   `plaintext` object (`400`), an unsupported `exportVer` (`400`), an excessive PBKDF2
-  iteration count (`400` — a DoS guard found during review), an out-of-range
+  iteration count (`400`, a DoS guard found during review), an out-of-range
   `wifiMode` that would otherwise silently wrap into a valid value via integer
   narrowing (found during review), and a missing `confirm=REPLACE` (`400`); and that
   the admin credential's hash (and the operators' real passwords) never appear

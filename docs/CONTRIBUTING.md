@@ -2,8 +2,6 @@
 
 Welcome! This guide assists contributors in setting up the development environment, compiling the source files, flashing targets, and executing local functional validation testing.
 
----
-
 ## 1. Development Toolchain Prerequisites
 
 The **pocket-dial** firmware builds with **ESP-IDF**. That is the only supported
@@ -29,8 +27,6 @@ workflow ships, and what the browser flasher serves.
    xtensa-esp32s3-elf-gcc --version
    ```
 
----
-
 ## 2. Compilation & Flashing Instructions
 
 ### Compiling & flashing via the ESP-IDF CLI
@@ -44,7 +40,7 @@ workflow ships, and what the browser flasher serves.
    ```bash
    idf.py menuconfig
    ```
-4. Build the application — **pass the transport explicitly**. A bare `idf.py build` uses
+4. Build the application. **Pass the transport explicitly**. A bare `idf.py build` uses
    the default `SIP_TRANSPORT=eth` (`main/CMakeLists.txt:6-7`), which is W5500 on
    S3-only GPIOs; it is never the right build for a classic-ESP32 LAN8720 board, and it
    starts no SoftAP, so the `192.168.4.1` walkthrough below will not apply to it.
@@ -59,8 +55,6 @@ workflow ships, and what the browser flasher serves.
    idf.py -p COM3 flash monitor
    ```
 
----
-
 ## 3. Local Testing & Validation Methodology
 
 Once the target is flashed and running, follow these steps to test the local installation.
@@ -68,67 +62,65 @@ Once the target is flashed and running, follow these steps to test the local ins
 ### A. Connecting Softphones
 To test VoIP signaling, connect two software SIP clients (such as **MicroSIP**, **Linphone**, or **Zoiper**) to the target's IP address:
 
-1. **Verify Server IP**: Read the serial output or on-screen display.
+1. Verify server IP: read the serial output or on-screen display.
    * SoftAP Mode: Default gateway is `192.168.4.1`.
    * Station/DHCP Mode: Locate the leased IP (e.g. `192.168.1.145`).
-2. **Configure Softphone Accounts**:
-   * **Domain / Registrar**: `<device_ip>:5060` (e.g. `192.168.4.1:5060`)
-   * **Username / Extension**: Set user 1 to `1001` and user 2 to `1002`.
-   * **Password**: Leave blank — the registrar's **default** mode is open, so any
+2. Configure softphone accounts:
+   * Domain / Registrar: `<device_ip>:5060` (e.g. `192.168.4.1:5060`)
+   * Username / Extension: Set user 1 to `1001` and user 2 to `1002`.
+   * Password: leave blank; the registrar's **default** mode is open, so any
      extension registers without a credential. (SIP digest authentication exists and is
      runtime-selectable via the `open` / `learn` / `secure` registrar modes; in `secure`
      mode you must supply the extension's provisioned password here. See
      [LEARN_MODE.md](LEARN_MODE.md) and [THREAT_MODEL.md](THREAT_MODEL.md) §9.)
-   * **Protocol**: Set transport to **UDP**.
-3. **Initiate Call**: Dial `1002` from `1001`. The status display should update instantly to show:
+   * Protocol: set transport to **UDP**.
+3. Initiate call: dial `1002` from `1001`. The status display should update instantly to show:
    * State: `Invited` (Ringing)
    * State: `Connected` (Active)
-4. **Test Special Features**:
-   * **Echo Test (`777`)**: Dial `777` from any extension. Speak into your mic; the server will mirror your RTP audio stream back to you.
-   * **Intercom / Broadcast Paging (`999`)**: Dial `999` from an extension. The server forks the call to all other registered extensions, auto-answers their speakerphones, and streams audio to them simultaneously.
+4. Test special features:
+   * Echo test (`777`): dial `777` from any extension. Speak into your mic; the server will mirror your RTP audio stream back to you.
+   * Intercom / broadcast paging (`999`): dial `999` from an extension. The server forks the call to all other registered extensions, auto-answers their speakerphones, and streams audio to them simultaneously.
 
 ### B. Dashboard REST API Verification
 Verify the Web dashboard and security barriers using `curl` or a web browser:
 
-1. **Fetch Registrar Status**:
+1. Fetch registrar status:
    ```bash
    curl -i http://192.168.4.1/api/status
    ```
    Verify that `packetsProcessed` increments with each registration or call.
 
-2. **Trigger Same-Origin Rejection**:
+2. Trigger same-origin rejection:
    Attempt a simulated cross-origin POST attack to disconnect an extension:
    ```bash
    curl -i -X POST -H "Origin: http://malicious-site.com" -H "Host: 192.168.4.1" --data "extension=1001" http://192.168.4.1/api/kill
    ```
    Confirm that the server returns `403 Forbidden` with the cross-origin error payload.
 
-3. **Verify Payload Capacity Protections**:
+3. Verify payload capacity protections:
    Send an oversized request body (over 16KB) to simulate a buffer-flooding attack:
    ```bash
    curl -i -X POST -H "Content-Length: 20000" --data-binary @/path/to/large_file.txt http://192.168.4.1/api/wifi/connect
    ```
    Confirm that the connection is immediately severed or returns a `413 Payload Too Large` error.
 
----
-
 ## 4. Continuous Integration (CI) Checks
 
 The **pocket-dial** repository enforces strict verification checks on every pull request (configured via `.github/workflows/ci.yml`):
-* **Static analysis**: `cppcheck` (`warning,performance`) is the **blocking** analyser
+* Static analysis: `cppcheck` (`warning,performance`) is the **blocking** analyser
   (`ci.yml:61-74`); `clang-tidy` runs `continue-on-error: true` (`:86-116`). Note there is
   **no `-Werror`** anywhere in `ci.yml` or `CMakeLists.txt` (which passes `-Wall -Wextra
-  -Wpedantic` only), so compiler warnings alone do not fail a build — an earlier revision
+  -Wpedantic` only), so compiler warnings alone do not fail a build; an earlier revision
   of this list claimed they did.
-* **Host tests**: the gtest suite via `ctest`, plus the HTTP smoke script
+* Host tests: the gtest suite via `ctest`, plus the HTTP smoke script
   `tests/http/test_api.sh` run against the **host binary on the runner**
   (`ci.yml:191-216`). *(No container is spawned, and the script asserts field presence
-  itself — it does not validate responses against a schema defined in `docs/API.md`, as an
+  itself; it does not validate responses against a schema defined in `docs/API.md`, as an
   earlier revision of this list claimed.)*
-* **Cross-Compilation Verification**: builds for both `esp32` and `esp32s3`
+* Cross-compilation verification: builds for both `esp32` and `esp32s3`
   (`ci.yml:242`), plus a partition-table guard, a heap-poisoning build and a Waveshare
   build.
-* ~~**Firmware Policy Checks**: scans for prohibited code patterns (heap allocation, raw
+* ~~Firmware Policy Checks: scans for prohibited code patterns (heap allocation, raw
   `strcpy`).~~ **No such step exists in `ci.yml`.** The coding rules in
   [CONTRIBUTING_FIRMWARE.md](../CONTRIBUTING_FIRMWARE.md) are enforced by review, not by
-  CI — do not rely on a bot to catch them.
+  CI. Do not rely on a bot to catch them.
