@@ -14,6 +14,10 @@ public:
 	static constexpr auto RINGING            = "SIP/2.0 180 Ringing";
 	static constexpr auto BUSY               = "SIP/2.0 486 Busy Here";
 	static constexpr auto UNAVAILABLE        = "SIP/2.0 480 Temporarily Unavailable";
+	// 503. Every other status here had a constant and this one did not, so it
+	// was spelled out as a bare literal at six-plus call sites -- which is part
+	// of why the no-trunk path reached for 404 instead (Issue #166).
+	static constexpr auto SERVICE_UNAVAILABLE = "SIP/2.0 503 Service Unavailable";
 	static constexpr auto OK                 = "SIP/2.0 200 OK";
 	static constexpr auto ACK                = "ACK";
 	// Dispatch key (never a wire start line): every non-2xx final response that

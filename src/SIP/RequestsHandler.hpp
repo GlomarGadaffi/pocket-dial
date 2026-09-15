@@ -44,6 +44,7 @@
 #include "PcapCapture.hpp"
 #include "PbxConfig.hpp"
 #include "DialPlan.hpp"
+#include "EmergencyCall.hpp"  // Issue #166: pbx::EmergencyDial
 #include "PbxFeatureConfig.hpp"
 #include "CdrRing.hpp"
 #include "DtmfFeatureCodes.hpp"
@@ -845,6 +846,17 @@ private:
 	// can fall through to its own 404 instead of getting two responses to one
 	// INVITE. onAnchorInvite() always passes respondIfDisconnected=true. Caller
 	// holds _mutex.
+	// Issue #166: route a recognised 911/933 dial. Called from onInvite's
+	// emergency intercept, which runs ahead of every operator-configurable
+	// destination lookup so no ring group or dial-plan rule can shadow or rewrite
+	// it (see EmergencyCall.hpp). Hands the trunk the BARE emergency number even
+	// when the user dialed a trunk-access digit first, and owns the failure
+	// response itself -- a 503, never a 404, per RFC 4497 8.3.1. Caller holds
+	// _mutex.
+	void routeEmergencyCall(std::shared_ptr<SipMessage> data,
+		const std::shared_ptr<SipClient>& caller,
+		const pbx::EmergencyDial& emergency, const std::string& dialed);
+
 	bool originateAnchorCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
 		bool respondIfDisconnected);
