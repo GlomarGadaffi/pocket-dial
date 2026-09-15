@@ -875,9 +875,13 @@ private:
 		const std::shared_ptr<SipClient>& caller,
 		const pbx::EmergencyDial& emergency, const std::string& dialed);
 
+	// `placedOut` (optional, Issue #166): true only when a call was actually
+	// dispatched. The bool RETURN means "took ownership of the INVITE" and is
+	// true for every refuse() path too, so a caller that must report what really
+	// happened -- the emergency notification does -- has to ask for this.
 	bool originateAnchorCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
-		bool respondIfDisconnected);
+		bool respondIfDisconnected, bool* placedOut = nullptr);
 
 	// First anchor media bridge with no active call, or nullptr if every slot is
 	// busy (onAnchorInvite() then answers 503 Service Unavailable, mirroring the

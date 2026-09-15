@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -596,4 +597,75 @@ TEST(E911Notify, TheSyslogRecordIsEmittedEvenWithNoNotifyTargetsAtAll)
 	EXPECT_EQ(n, 0u) << "no targets means no MESSAGEs";
 	EXPECT_EQ(env.findCalls, 0) << "and no lookups";
 	EXPECT_EQ(env.enqueued, 0) << "and nothing on the wire";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// "Answered" is not "placed"
+//
+// originateAnchorCall() returns true meaning "took ownership of the INVITE",
+// and EIGHT refuse() paths inside it answer 4xx/5xx and still return true. The
+// first cut of this feature read that bool as "the call went through", so a 911
+// call refused for capacity would have been reported to the front desk as
+// ROUTED. Caught in review of PR #242.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(E911Notify, ACallRefusedForCapacityIsNeverReportedAsRouted)
+{
+	NBench b;
+	ASSERT_NE(b.loopback(), nullptr);
+	b.handler->setE911Config("200", "", "");
+
+	// Fill the anchor to its effective capacity via the anchor extension.
+	const unsigned cap = std::min<unsigned>(
+		b.handler->anchorClientForTest()->maxConcurrentCalls(),
+		static_cast<unsigned>(POCKETDIAL_MAX_ANCHOR_CALLS));
+	ASSERT_GE(cap, 1u);
+	for (unsigned i = 0; i < cap; ++i)
+	{
+		b.handler->handle(enInvite("101", "555", "192.168.78.11",
+			"en-fill-" + std::to_string(i)));
+	}
+	b.wire.clear();
+
+	// 911 from a DIFFERENT extension, so the dialer is not one of the fillers.
+	b.handler->handle(enInvite("200", "911", "192.168.78.20", "en-911-busy"));
+
+	EXPECT_EQ(b.indexOf("ROUTED TO TRUNK"), -1)
+		<< "the anchor answered this INVITE with a 503 and still returned true; "
+		   "reporting it as routed tells the front desk a 911 call went through "
+		   "when it did not:\n" << b.dump();
+}
+
+TEST(E911Format, TruncationLandsOnAUtf8BoundaryNotMidCodepoint)
+{
+	// `location` is operator free text and may be non-ASCII. Cutting at byte 512
+	// can split a multi-byte sequence, and a half-written codepoint renders as
+	// garbage in whatever reads the notification.
+	pbx::E911Config cfg;
+	cfg.location = std::string(300, 'x');
+	for (int i = 0; i < 80; ++i) cfg.location += "\xC3\xA9";   // 'e' acute, 2 bytes
+
+	const std::string s = pbx::formatE911Notification(false, "101", "911", false, true, cfg);
+	ASSERT_LE(s.size(), 512u);
+
+	// Validate the whole string decodes: every lead byte is followed by exactly
+	// the continuation bytes it declares.
+	size_t i = 0;
+	while (i < s.size())
+	{
+		const unsigned char c = static_cast<unsigned char>(s[i]);
+		size_t need = 0;
+		if ((c & 0x80) == 0x00) need = 0;
+		else if ((c & 0xE0) == 0xC0) need = 1;
+		else if ((c & 0xF0) == 0xE0) need = 2;
+		else if ((c & 0xF8) == 0xF0) need = 3;
+		else FAIL() << "stray continuation byte at " << i;
+		ASSERT_LE(i + need, s.size() - 1) << "truncated mid-codepoint at byte " << i;
+		for (size_t k = 1; k <= need; ++k)
+		{
+			ASSERT_EQ(static_cast<unsigned char>(s[i + k]) & 0xC0, 0x80)
+				<< "bad continuation byte at " << (i + k);
+		}
+		i += need + 1;
+	}
 }

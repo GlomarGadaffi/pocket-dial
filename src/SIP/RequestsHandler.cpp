@@ -2648,14 +2648,19 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// response and the handset never receives two final responses to one INVITE.
 	// NOT std::move: originateAnchorCall takes its shared_ptr by value, and this
 	// function still needs `data` afterwards to build the failure response from.
-	if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false))
+	bool placed = false;
+	if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed))
 	{
 		// The call leg is enqueued. NOW notify: 47 CFR 9.16(b)(2) wants the
 		// notification contemporaneous with the call and not delaying it, and
 		// both leave on the same drainOutbox() pass, so that holds literally
 		// rather than approximately. Nothing in notifyEmergency() can fail in a
 		// way this function has to handle -- see EmergencyNotifier.hpp.
-		notifyEmergency(emergency, from, dialed, /*routed=*/true);
+		// `placed`, not `true`: the anchor may have ANSWERED with a 503 (every
+		// bridge slot busy, session pool full, makeCall declined) and still
+		// returned true. Telling the front desk a 911 call went through when it
+		// was refused for capacity is the worst error this feature could make.
+		notifyEmergency(emergency, from, dialed, /*routed=*/placed);
 		return;
 	}
 
@@ -2754,8 +2759,15 @@ void RequestsHandler::notifyEmergency(const pbx::EmergencyDial& emergency,
 
 bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller, const std::string& destination,
-	bool respondIfDisconnected)
+	bool respondIfDisconnected, bool* placedOut)
 {
+	// Issue #166: this function's bool return means "took ownership of the
+	// INVITE", NOT "the call was placed" -- eight refuse() paths answer 4xx/5xx
+	// and still return true. The emergency notification must tell a human which
+	// actually happened, so it asks for that second fact separately. Optimistic
+	// default, cleared by refuse() and by the one unwind path that fails without
+	// answering.
+	if (placedOut) *placedOut = true;
 	const std::string activeIp = _localIp;
 	const std::string callID(data->getCallID());
 	// The remote target both this response's Contact and every later in-dialog
@@ -2769,6 +2781,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	const std::string remoteExt(data->getToNumber());
 
 	auto refuse = [&](const char* statusLine, const char* why) {
+		if (placedOut) *placedOut = false;   // answered, but not placed (#166)
 		auto msg = getMessageFromPool(*data);
 		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
 		msg->setHeader(statusLine);
@@ -2888,6 +2901,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 			bridge->stopBridge();
 			_anchorClient->dropCall(ownLeg);
 			queueLog("anchor(" + remoteExt + "): message pool exhausted, call unwound", true);
+			if (placedOut) *placedOut = false;   // unwound, nothing sent (#166)
 			return true;
 		}
 

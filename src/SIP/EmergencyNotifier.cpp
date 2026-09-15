@@ -36,7 +36,11 @@ std::string formatE911Notification(bool isTest, std::string_view fromExt,
 		out += ")";
 	}
 
-	out += routed ? " - ROUTED TO TRUNK" : " - NOT ROUTED (no trunk connected)";
+	// "no trunk available" rather than "no trunk connected": this fires both
+	// when no anchor is connected AND when one is connected but refused the
+	// call (every bridge slot busy, session pool full, makeCall declined).
+	// Naming only the first cause would be a confident, wrong diagnosis.
+	out += routed ? " - ROUTED TO TRUNK" : " - NOT ROUTED (no trunk available)";
 
 	// An absent callback is stated rather than omitted: a blank field reads as
 	// "nothing to report", and here it means the opposite.
@@ -53,7 +57,16 @@ std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	// and the SIP body are the same text rather than diverging silently.
 	if (out.size() > 512)
 	{
-		out.resize(512);
+		// Trim to a UTF-8 CODEPOINT boundary, not a byte one. `location` is
+		// operator free text and may be non-ASCII; a half-written multi-byte
+		// sequence renders as a replacement character or garbage in whatever
+		// reads the notification, which is the one thing this text must not do.
+		std::size_t cut = 512;
+		while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
+		{
+			--cut;   // inside a sequence: back up to its lead byte
+		}
+		out.resize(cut);
 	}
 	return out;
 }
