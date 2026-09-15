@@ -19,19 +19,6 @@ bool isSeparator(char c)
 		c == '(' || c == ')' || c == '/';
 }
 
-// The digits of a normalized number, without the '+' marker. The marker says
-// "a country code is present"; it is not itself part of the number's identity,
-// so every comparison below is done on this view.
-std::string_view digitsOf(const std::string& normalized)
-{
-	std::string_view v = normalized;
-	if (!v.empty() && v.front() == '+')
-	{
-		v.remove_prefix(1);
-	}
-	return v;
-}
-
 } // namespace
 
 std::string e164Normalize(std::string_view raw)
@@ -102,10 +89,24 @@ bool e164SameNumber(std::string_view a, std::string_view b)
 		return false;
 	}
 
-	const std::string_view da = digitsOf(na);
-	const std::string_view db = digitsOf(nb);
+	// The '+' marker says "a country code is present"; it is not itself part of
+	// the number's identity, so every comparison below is made on the digits
+	// alone.
+	//
+	// Offsets into `na`/`nb` rather than a std::string_view over each: two views
+	// over two DIFFERENT strings, compared against one another, is the shape
+	// cppcheck reports as [mismatchingContainers]. It is a false positive here
+	// (comparing two string_views is well-defined regardless of what they view),
+	// but index arithmetic over one buffer each is just as clear, allocates
+	// nothing, and leaves no warning to suppress and explain later.
+	const bool plusA = na.front() == '+';
+	const bool plusB = nb.front() == '+';
+	const std::size_t offA = plusA ? 1u : 0u;
+	const std::size_t offB = plusB ? 1u : 0u;
+	const std::size_t lenA = na.size() - offA;
+	const std::size_t lenB = nb.size() - offB;
 
-	if (da == db)
+	if (lenA == lenB && na.compare(offA, lenA, nb, offB, lenB) == 0)
 	{
 		// Identical digits: the only difference was formatting and/or the '+'
 		// marker. "+15551234567" == "1 (555) 123-4567".
@@ -121,17 +122,22 @@ bool e164SameNumber(std::string_view a, std::string_view b)
 	// which is two distinct international numbers, for no benefit: the case
 	// this relaxation exists to serve is an operator typing a number WITHOUT
 	// the country code, and such a number has no '+'.
-	const bool bothInternational = na.front() == '+' && nb.front() == '+';
-	if (bothInternational)
+	if (plusA && plusB)
 	{
 		return false;
 	}
 
-	const std::string_view shorter = (da.size() <= db.size()) ? da : db;
-	const std::string_view longer  = (da.size() <= db.size()) ? db : da;
+	// Orient the two so the rest reads as "does the longer end with the shorter".
+	const bool aIsShorter        = (lenA <= lenB);
+	const std::string& shortStr  = aIsShorter ? na   : nb;
+	const std::string& longStr   = aIsShorter ? nb   : na;
+	const std::size_t  shortOff  = aIsShorter ? offA : offB;
+	const std::size_t  longOff   = aIsShorter ? offB : offA;
+	const std::size_t  shortLen  = aIsShorter ? lenA : lenB;
+	const std::size_t  longLen   = aIsShorter ? lenB : lenA;
 
 	// At most a country code may separate them (ITU-T E.164: 1-3 digits).
-	const std::size_t extra = longer.size() - shorter.size();
+	const std::size_t extra = longLen - shortLen;
 	if (extra == 0 || extra > kE164MaxCountryCodeDigits)
 	{
 		return false;
@@ -140,12 +146,13 @@ bool e164SameNumber(std::string_view a, std::string_view b)
 	// ...and the shorter side must be long enough to be a PSTN number in its
 	// own right, so a short internal extension can never tail-match its way
 	// into a DID. See POCKETDIAL_MIN_PSTN_AOR_DIGITS in PoolConfig.hpp.
-	if (shorter.size() < static_cast<std::size_t>(POCKETDIAL_MIN_PSTN_AOR_DIGITS))
+	if (shortLen < static_cast<std::size_t>(POCKETDIAL_MIN_PSTN_AOR_DIGITS))
 	{
 		return false;
 	}
 
-	return longer.compare(longer.size() - shorter.size(), shorter.size(), shorter) == 0;
+	// The tail: longStr's last shortLen digits against shortStr's digits.
+	return longStr.compare(longOff + extra, shortLen, shortStr, shortOff, shortLen) == 0;
 }
 
 } // namespace pbx
