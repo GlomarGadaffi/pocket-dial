@@ -103,7 +103,10 @@ namespace sdp
 					FormatSpec f;
 					f.pt = pt;
 					f.encoding = staticEncoding(pt);
-					f.clock = (pt == 9) ? 8000 : 8000;   // G.722's RTP clock is 8000 by RFC 3551 quirk
+					// 8000 for every static PT the board could terminate, G.722
+					// included: RFC 3551 §4.5.2 fixes its RTP clock at 8000 despite
+					// the 16 kHz sample rate.
+					f.clock = 8000;
 					am->add(f);
 				}
 				const int evPt = om.telephoneEventPt();
@@ -179,9 +182,13 @@ namespace sdp
 	{
 		if (offer.mediaCount == 0 && answer.mediaCount == 0) return AnswerVerdict::NoMedia;
 		// Sections past Limits::kMaxMedia were counted, not modelled, on both
-		// sides; compare the totals so an answer that drops a fourth stream is
-		// still caught.
-		if (offer.mediaCount + offer.droppedMedia != answer.mediaCount + answer.droppedMedia)
+		// sides. Compare the modelled and the dropped counts SEPARATELY rather
+		// than their sum: both sides model the first kMaxMedia sections in
+		// order, so equal counts on each side mean the modelled sections line up
+		// index for index below, and an answer that drops a fourth stream is
+		// still caught. (Comparing only the sum would let, say, 2 modelled + 2
+		// dropped pass against 3 + 1 with one section escaping the loop.)
+		if (offer.mediaCount != answer.mediaCount || offer.droppedMedia != answer.droppedMedia)
 			return AnswerVerdict::MediaCountMismatch;
 		for (unsigned i = 0; i < offer.mediaCount && i < answer.mediaCount; ++i)
 		{
