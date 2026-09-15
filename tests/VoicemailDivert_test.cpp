@@ -515,3 +515,123 @@ TEST(VoicemailDivert, HangingUpWithNoAudioProducesNoFlushedMessage)
 	EXPECT_TRUE(sink.calls.empty())
 		<< "nobody said anything -- nothing should reach the flush queue";
 }
+
+// With a greeting loaded, a deposit must play it BEFORE recording -- not
+// record immediately (dead silence to the caller, the pre-greeting
+// behavior). tick() is what advances Playing -> PlaybackDone -> Recording;
+// nothing else polls playbackDone().
+TEST(VoicemailDivert, DepositPlaysGreetingBeforeRecordingWhenOneIsLoaded)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.45.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const uint8_t greeting[] = {77, 78, 79};
+	handler.setVoicemailGreetingForTest(greeting, sizeof(greeting));
+
+	handler.handle(makeRegister("801", "192.168.45.11", "reg-701"));
+	handler.handle(makeRegister("811", "192.168.45.21", "reg-711"));
+	handler.setVoicemail("801", true);
+
+	const std::string callId = "vm-greet-1";
+	const std::string branch = "z9hG4bKvmgreet1";
+	handler.handle(makeInvite("811", "801", "192.168.45.21", callId, branch));
+	handler.handle(makeBusy("811", "801", "192.168.45.11", callId, branch));
+
+	auto session = handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(session.has_value());
+	const int slot = session.value()->getVoicemailLegSlot();
+	ASSERT_GE(slot, 0);
+
+	// Immediately after answer: playing the greeting, NOT recording yet. Feed
+	// audio now and it must be silently dropped (leg is Playing, not
+	// Recording) -- proves the greeting-first ordering, not just that a
+	// greeting CAN play.
+	const uint8_t earlyAudio[] = {1, 2, 3};
+	EXPECT_FALSE(handler.feedVoicemailAudioForTest(slot, earlyAudio, sizeof(earlyAudio)))
+		<< "must still be playing the greeting, not recording, right after answer";
+
+	uint8_t out[3] = {};
+	ASSERT_TRUE(handler.readVoicemailPlaybackForTest(slot, out, sizeof(out)));
+	EXPECT_EQ(out[0], 77); EXPECT_EQ(out[1], 78); EXPECT_EQ(out[2], 79);
+
+	// The greeting (3 bytes) is now fully delivered -> PlaybackDone. tick()
+	// is the only thing that advances this to Recording.
+	handler.tick();
+
+	const uint8_t frame[] = {10, 20};
+	EXPECT_TRUE(handler.feedVoicemailAudioForTest(slot, frame, sizeof(frame)))
+		<< "tick() must have advanced the leg to Recording once the greeting finished";
+
+	handler.forceDisconnect("811");
+	FakeSink sink;
+	handler.drainVoicemailFlush(sink);
+	ASSERT_EQ(sink.calls.size(), 1u);
+	EXPECT_EQ(sink.calls[0].mulaw, std::vector<uint8_t>({10, 20}))
+		<< "only the post-greeting audio should have been recorded";
+}
+
+// Regression: with no greeting loaded (the default, and every other test in
+// this file), a deposit must still record immediately -- the behavior every
+// earlier test already relies on, pinned explicitly here.
+TEST(VoicemailDivert, DepositRecordsImmediatelyWithNoGreetingLoaded)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.45.2", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("802", "192.168.45.12", "reg-702"));
+	handler.handle(makeRegister("812", "192.168.45.22", "reg-712"));
+	handler.setVoicemail("802", true);
+
+	const std::string callId = "vm-nogreet-1";
+	const std::string branch = "z9hG4bKvmnogreet1";
+	handler.handle(makeInvite("812", "802", "192.168.45.22", callId, branch));
+	handler.handle(makeBusy("812", "802", "192.168.45.12", callId, branch));
+
+	auto session = handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(session.has_value());
+	const int slot = session.value()->getVoicemailLegSlot();
+	ASSERT_GE(slot, 0);
+
+	const uint8_t frame[] = {5, 6, 7};
+	EXPECT_TRUE(handler.feedVoicemailAudioForTest(slot, frame, sizeof(frame)))
+		<< "no greeting loaded -- must record from the start, no tick() needed";
+}
+
+// Wall-clock safety net: a session whose voicemail deadline has passed must
+// be BYEd and torn down even if onCallerRtp()'s byte-cap was never hit (a
+// caller whose audio silently stopped arriving).
+TEST(VoicemailDivert, ExpiredVoicemailDeadlineByesAndTearsDownTheSession)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.45.3", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in callerAddr = addrFor("192.168.45.23");
+
+	handler.handle(makeRegister("803", "192.168.45.13", "reg-703"));
+	handler.handle(makeRegister("813", "192.168.45.23", "reg-713"));
+	handler.setVoicemail("803", true);
+
+	const std::string callId = "vm-deadline-1";
+	const std::string branch = "z9hG4bKvmdeadline1";
+	handler.handle(makeInvite("813", "803", "192.168.45.23", callId, branch));
+	handler.handle(makeBusy("813", "803", "192.168.45.13", callId, branch));
+
+	auto session = handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(session.has_value());
+	session.value()->armVoicemailDeadline(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+
+	handler.tick();
+
+	EXPECT_FALSE(findSentTo(sent, callerAddr, "BYE sip:").empty())
+		<< "an expired voicemail deadline must BYE the caller, not just silently drop the session";
+	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value());
+}

@@ -643,6 +643,11 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 				std::to_string(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES) + " bytes x2)", true);
 		}
 	}
+	// Safe to call unconditionally (host included): std::fopen() against a
+	// path that doesn't exist on this platform just returns null and the
+	// function degrades gracefully, same as it does for "no card, no file
+	// yet" on real hardware.
+	loadVoicemailGreeting();
 
 #if defined(PD_ETH_HAS_SD)
 	// The SD-flush writer task -- mirrors CdrArchive.cpp's writerTaskBody
@@ -706,6 +711,14 @@ RequestsHandler::~RequestsHandler()
 #else
 		std::free(_vmRecordBufs[i]);
 		std::free(_vmStagingBufs[i]);
+#endif
+	}
+	if (_vmGreetingClipOwned)
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		heap_caps_free(_vmGreetingClip);
+#else
+		std::free(_vmGreetingClip);
 #endif
 	}
 }
@@ -2407,6 +2420,69 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		+ destIp + ":" + std::to_string(destPort));
 }
 
+void RequestsHandler::loadVoicemailGreeting()
+{
+	constexpr const char* kGreetingPath = "/sdcard/vm/greeting.wav";
+
+	std::FILE* f = std::fopen(kGreetingPath, "rb");
+	if (f == nullptr) return;   // no greeting on the card -- stays null, graceful degradation
+
+	std::fseek(f, 0, SEEK_END);
+	const long total = std::ftell(f);
+	std::fseek(f, 0, SEEK_SET);
+	if (total <= 0)
+	{
+		std::fclose(f);
+		return;
+	}
+
+	// Same header-first-then-allocate ordering as HoldMusic::loadClip() and
+	// for the same reason: reject a wrong-format file without allocating
+	// megabytes for it first.
+	uint8_t head[1024];
+	const size_t headLen = std::fread(head, 1, sizeof(head) < static_cast<size_t>(total)
+	                                            ? sizeof(head) : static_cast<size_t>(total), f);
+	size_t dataOff = 0, dataLen = 0;
+	if (!HoldMusic::parseUlawWav(head, headLen, dataOff, dataLen))
+	{
+		std::fclose(f);
+		queueLog("Voicemail: greeting at " + std::string(kGreetingPath) +
+			" is not a valid 8kHz mono mu-law WAV -- deposits will record immediately", true);
+		return;
+	}
+	if (dataOff + dataLen > static_cast<size_t>(total)) dataLen = static_cast<size_t>(total) - dataOff;
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(dataLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+	if (buf == nullptr) buf = static_cast<uint8_t*>(heap_caps_malloc(dataLen, MALLOC_CAP_8BIT));
+#else
+	uint8_t* buf = static_cast<uint8_t*>(std::malloc(dataLen));
+#endif
+	if (buf == nullptr)
+	{
+		std::fclose(f);
+		return;
+	}
+
+	std::fseek(f, static_cast<long>(dataOff), SEEK_SET);
+	const size_t got = std::fread(buf, 1, dataLen, f);
+	std::fclose(f);
+
+	if (got == 0)
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		heap_caps_free(buf);
+#else
+		std::free(buf);
+#endif
+		return;
+	}
+
+	_vmGreetingClip = buf;
+	_vmGreetingClipLen = got;
+	queueLog("Voicemail: greeting loaded (" + std::to_string(got) + " bytes)");
+}
+
 void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& invite,
 	const std::shared_ptr<SipClient>& src, const std::string& extension)
 {
@@ -2469,8 +2545,15 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 	// Claim the leg BEFORE starting the RTP receiver, not after: onCallerRtp()
 	// could otherwise fire (real hardware, receive task starts near-instantly)
 	// while the leg is still Idle and silently drop the call's opening frames.
-	if (!_vmLegs[slot].startRecording(_vmRecordBufs[slot], POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES,
-		POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES, extension, callID))
+	// Play the greeting first when one is loaded (Playing -> PlaybackDone ->
+	// tick()'s sweep starts recording); with no greeting, record immediately
+	// -- the pre-greeting behavior, still exercised by every host test that
+	// never loads one. Either call claims the leg out of Idle the same way.
+	const bool claimed = (_vmGreetingClip != nullptr && _vmGreetingClipLen > 0)
+		? _vmLegs[slot].startPlaying(_vmGreetingClip, _vmGreetingClipLen, extension, callID)
+		: _vmLegs[slot].startRecording(_vmRecordBufs[slot], POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES,
+			POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES, extension, callID);
+	if (!claimed)
 	{
 		// Only reachable if the leg was somehow left Recording/Finalizing
 		// despite _vmRtpReceivers[slot] reporting inactive -- a slot-tracking
@@ -2546,6 +2629,14 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 	newSession->setDest(dummyVm);
 	newSession->setVoicemail(true);
 	newSession->setVoicemailLegSlot(slot);
+	newSession->setVoicemailPurpose(Session::VoicemailPurpose::Deposit);
+	// Wall-clock safety net (see the class comment on armVoicemailDeadline()):
+	// covers the whole call, greeting included, not just the Recording phase
+	// -- a greeting that somehow never reaches PlaybackDone (a corrupt clip
+	// with a length that never lets the cursor catch up, say) must not pin
+	// this leg forever either.
+	newSession->armVoicemailDeadline(std::chrono::steady_clock::now() +
+		std::chrono::seconds(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_SECONDS));
 	_sessions.emplace(callID, newSession);
 	newSession->setState(Session::State::Connected);
 
@@ -2592,6 +2683,61 @@ void RequestsHandler::enqueueVoicemailFlush(int slot)
 	if (!_vmFlushQueue.push(rec))
 	{
 		queueLog("Voicemail: flush queue full, message from " + ext + " dropped", true);
+	}
+}
+
+void RequestsHandler::sweepVoicemailLegs(std::chrono::steady_clock::time_point now)
+{
+	std::vector<std::string> toExpire;
+	for (const auto& [callID, session] : _sessions)
+	{
+		if (!session->isVoicemail()) continue;
+		const int slot = session->getVoicemailLegSlot();
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) continue;
+
+		// Deposit: greeting finished -> start recording. A Retrieval leg (a
+		// later slice) manages its own PlaybackDone transitions via its menu
+		// state machine and must never be touched here -- see
+		// Session::getVoicemailPurpose()'s doc comment.
+		if (session->getVoicemailPurpose() == Session::VoicemailPurpose::Deposit &&
+			_vmLegs[slot].state() == VoicemailLeg::State::PlaybackDone)
+		{
+			// Reuse the identity the leg was already claimed under (set at
+			// startPlaying() time) rather than re-deriving from the session
+			// -- session->getSrc() is the CALLER, not the mailbox owner.
+			const std::string extension = _vmLegs[slot].extension();
+			const std::string callId = _vmLegs[slot].callId();
+			_vmLegs[slot].startRecording(_vmRecordBufs[slot], POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES,
+				POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES, extension, callId);
+		}
+
+		// Wall-clock safety net: a caller whose audio silently stops
+		// arriving (network drop, a phone that stops sending RTP) never
+		// hits onCallerRtp()'s byte-cap and never sends a BYE either.
+		if (session->isVoicemailDeadlineExpired(now))
+		{
+			toExpire.push_back(callID);
+		}
+	}
+
+	for (const auto& callID : toExpire)
+	{
+		auto it = _sessions.find(callID);
+		if (it == _sessions.end()) continue;
+		auto session = it->second;
+		auto src = session->getSrc();
+		const std::string& dFrom = session->getDialogFrom();
+		const std::string& dTo = session->getDialogTo();
+		// Same From/To swap sweepSessionTimers() uses: we (the dialog's
+		// original To/UAS) are now originating the BYE, so our own captured
+		// To becomes the BYE's From and the caller's captured From becomes
+		// its To.
+		if (src && !dFrom.empty() && !dTo.empty())
+		{
+			auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom);
+			if (b) _outbox.emplace_back(src->getAddress(), std::move(b));
+		}
+		endCall(callID, src ? src->getNumber() : "", "700", "voicemail max duration reached");
 	}
 }
 
@@ -7154,6 +7300,10 @@ void RequestsHandler::tick()
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
 		// in case a teardown path bypassed endCall(). Bounded by the small session pool.
 		_dtmf.sweepStale();
+
+		// Issue #246: advance Deposit voicemail legs (greeting -> recording)
+		// and enforce the wall-clock recording deadline.
+		sweepVoicemailLegs(now);
 
 		// No-answer timers (CFNA + hunt-group progression, plus the anchor
 		// no-answer/ACK-deadline reap below). Poll the armed sessions and act on

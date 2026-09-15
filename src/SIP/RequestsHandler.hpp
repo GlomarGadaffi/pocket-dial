@@ -886,6 +886,12 @@ private:
 	// Stop the leg's RTP receiver/sender and return it to Idle. Called from
 	// endCall()'s voicemail safety net, covering every teardown path.
 	void releaseVoicemailLeg(int slot, const std::string& callId);
+	// tick()'s 1Hz voicemail sweep: advances a Deposit leg from PlaybackDone
+	// (greeting finished) to Recording, and BYEs + tears down any voicemail
+	// session whose wall-clock deadline has expired (see Session::
+	// armVoicemailDeadline()'s doc comment for why this exists alongside
+	// onCallerRtp()'s byte-cap). Caller holds _mutex.
+	void sweepVoicemailLegs(std::chrono::steady_clock::time_point now);
 	// Finalize whatever `_vmLegs[slot]` recorded (stopRecording() is a no-op
 	// if it wasn't Recording), copy it into that slot's staging buffer, and
 	// push a QueuedRecording -- called from endCall()'s voicemail safety net,
@@ -914,6 +920,32 @@ public:
 	{
 		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return false;
 		return _vmLegs[slot].onCallerRtp(mulaw, n);
+	}
+	// Test-only counterpart to feedVoicemailAudioForTest(): reads what the
+	// leg would send the caller right now (a greeting/prompt frame, or false
+	// if not Playing) -- same no-real-socket reasoning.
+	bool readVoicemailPlaybackForTest(int slot, uint8_t* out, size_t count)
+	{
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return false;
+		return _vmLegs[slot].fillTx(out, count);
+	}
+	// Test-only: inject a greeting clip without a real filesystem at
+	// /sdcard/vm/greeting.wav (which doesn't exist on host, or exist as a
+	// portable path at all). `clip` must outlive the handler -- tests pass a
+	// static/local buffer that does. Pass nullptr/0 to restore "no greeting".
+	void setVoicemailGreetingForTest(const uint8_t* clip, size_t len)
+	{
+		if (_vmGreetingClipOwned)
+		{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+			heap_caps_free(_vmGreetingClip);
+#else
+			std::free(_vmGreetingClip);
+#endif
+		}
+		_vmGreetingClip = const_cast<uint8_t*>(clip);
+		_vmGreetingClipLen = len;
+		_vmGreetingClipOwned = false;
 	}
 
 private:
@@ -1249,6 +1281,26 @@ private:
 	// QueuedRecording::sequence doc comment).
 	vmarchive::WriterQueue _vmFlushQueue{POCKETDIAL_MAX_VOICEMAIL_LEGS};
 	uint64_t _vmFlushSequence = 0;
+
+	// System deposit greeting: loaded once at boot from a fixed SD path,
+	// PSRAM-resident, same "why the SD card stays off the media path" and
+	// "why this one-shot allocation is allowed" reasoning as
+	// HoldMusic::loadClip() -- this reuses HoldMusic::parseUlawWav() (the
+	// pure parser) rather than HoldMusic itself, since HoldMusic is a
+	// looping one-global-cursor fan-out engine and this needs neither. Null
+	// (and _vmGreetingClipLen 0) when no greeting file is present -- graceful
+	// degradation to "record immediately, no greeting", matching HoldMusic's
+	// own "falls back to silence" philosophy rather than failing the call.
+	// Per-extension custom greetings are a later slice.
+	uint8_t* _vmGreetingClip = nullptr;
+	size_t _vmGreetingClipLen = 0;
+	// False when _vmGreetingClip points at memory this instance doesn't own
+	// (setVoicemailGreetingForTest()'s caller-supplied buffer) -- the
+	// destructor must never free() a test's stack/static array. True is the
+	// correct default: the constructor's own loadVoicemailGreeting() call is
+	// the only OTHER writer, and that path always heap-allocates.
+	bool _vmGreetingClipOwned = true;
+	void loadVoicemailGreeting();
 
 	// The boot-selected provider TYPE (cached alongside _anchorClient itself —
 	// see the constructor) and the monitored route DN an ACTIVE+ENABLED
