@@ -174,6 +174,9 @@ add_executable(sip_parser_tests
     # operator-configurable lookup, the bare number handed to the trunk, and a
     # 503 (never a 404) when no trunk is connected.
     EmergencyDialing_test.cpp
+    # Kari's Law notification (#166 part 2): ordering (call leg before
+    # notification), firing on a FAILED 911, and the config bound.
+    EmergencyNotify_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is
@@ -447,6 +450,9 @@ add_executable(sip_parser_tests
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp
     ../src/SIP/RegisterBeeper.cpp
+    # Kari's Law on-site notification (#166 part 2). PbxEnv-only sibling
+    # machine; pure text formatter is host-tested directly.
+    ../src/SIP/EmergencyNotifier.cpp
     ../src/SIP/ParkOrbit.cpp
     # Music on hold (#162). The WAV parser, cursor wrap and gain table are pure and
     # host-tested; the socket and the 20 ms pacing task are ESP-only stubs here.

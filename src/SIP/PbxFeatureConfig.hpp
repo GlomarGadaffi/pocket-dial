@@ -11,6 +11,7 @@
 #include "PbxConfig.hpp"
 #include "DialPlan.hpp"
 #include "PbxEnv.hpp"
+#include "EmergencyNotifier.hpp"   // Issue #166: pbx::E911Config
 
 // Owns the five bounded, NVS-persisted PBX feature tables that used to live
 // directly on RequestsHandler: DND flags, call-forward config, ring/hunt
@@ -72,6 +73,16 @@ public:
 	// Full validate + mutate + persist + snapshot-refresh, called from
 	// RequestsHandler::setRingGroup() after it takes _mutex.
 	void setRingGroup(const std::string& groupExt, const std::string& members, const std::string& mode);
+
+	// Issue #166 (Kari's Law): who to alert when 911 is dialed, plus the
+	// callback number and site string the notification carries. `exts` is the
+	// same comma/space-delimited member syntax ring groups and page zones use.
+	// Over-long lists are truncated to pbx::kMaxE911NotifyExts rather than
+	// refused -- a mis-typed notify list must never be a reason 911 behaves
+	// differently. Persists on success.
+	void setE911Config(const std::string& exts, const std::string& callback,
+		const std::string& location);
+	const pbx::E911Config& e911Config() const { return _e911; }
 	std::vector<std::tuple<std::string, std::string, std::string>> ringGroupsSnapshot() const;
 
 	// ── Paging zones (980–989) ────────────────────────────────────────────────
@@ -109,6 +120,11 @@ private:
 	void persistForwards();
 	void persistRingGroups();
 	void persistPageZones();
+	// Issue #166: the E911 notification settings, in their own NVS key so a
+	// factory-reset or a rewrite of any other table cannot quietly drop who
+	// gets told when somebody dials 911.
+	void persistE911();
+	void loadE911();
 	void persistDialPlan();
 
 	PbxEnv& _env;
@@ -134,6 +150,7 @@ private:
 	// Paging zones, keyed by the zone extension (980–989). Bounded by
 	// POCKETDIAL_MAX_PAGE_ZONES; member lists bounded by splitZoneMembers().
 	std::unordered_map<std::string, pbx::PageZone> _pageZones;
+	pbx::E911Config _e911;   // Issue #166 (Kari's Law)
 
 	// Dial-plan rule table (Issue #69). An ORDERED vector, not a map: first
 	// match wins, so evaluation order is the semantics. Hard-capped at

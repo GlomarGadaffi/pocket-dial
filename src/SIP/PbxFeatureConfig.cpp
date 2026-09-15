@@ -569,6 +569,10 @@ void PbxFeatureConfig::loadPbxConfig()
 	}
 
 	nvs_close(h);
+
+	// Issue #166: its own key, read after the handle above is closed because
+	// loadE911() opens its own (it is also callable on its own from a test).
+	loadE911();
 #endif
 }
 
@@ -610,6 +614,98 @@ void PbxFeatureConfig::persistRingGroups()
 		nvs_commit(h);
 		nvs_close(h);
 	}
+#endif
+}
+
+void PbxFeatureConfig::setE911Config(const std::string& exts, const std::string& callback,
+	const std::string& location)
+{
+	// Issue #166. Note what this does NOT do: it never refuses. Every other
+	// setter in this file logs-and-drops bad input, but this one governs what
+	// happens when somebody dials 911, and a rejected config would leave the
+	// previous one silently in place. Anything unusable is dropped field by
+	// field and whatever remains is kept.
+	std::vector<std::string> list = pbx::splitMembers(exts);
+	if (list.size() > pbx::kMaxE911NotifyExts)
+	{
+		_env.log("E911 notify list truncated to " +
+			std::to_string(pbx::kMaxE911NotifyExts) + " extensions", true);
+		list.resize(pbx::kMaxE911NotifyExts);
+	}
+	_e911.notifyExts = std::move(list);
+
+	// Field-level validation only: a control character would corrupt the
+	// tab/newline delimited NVS blob on the next load, so such a field is
+	// dropped rather than persisted.
+	_e911.callback = pbx::isDialTokenSafe(callback) ? callback : std::string();
+	_e911.location = location;
+	for (char c : _e911.location)
+	{
+		if (c == '\t' || c == '\n' || c == '\r')
+		{
+			_e911.location.clear();
+			_env.log("E911 location dropped: contains a control character", true);
+			break;
+		}
+	}
+
+	_env.log("E911 notify = [" + pbx::joinMembers(_e911.notifyExts) + "] callback=" +
+		(_e911.callback.empty() ? "(none)" : _e911.callback));
+	persistE911();
+}
+
+void PbxFeatureConfig::persistE911()
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	std::string blob;
+	blob += pbx::joinMembers(_e911.notifyExts); blob += '\n';
+	blob += _e911.callback;                     blob += '\n';
+	blob += _e911.location;                     blob += '\n';
+	nvs_handle_t h;
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
+	{
+		nvs_set_str(h, "e911", blob.c_str());
+		nvs_commit(h);
+		nvs_close(h);
+	}
+#endif
+}
+
+void PbxFeatureConfig::loadE911()
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	nvs_handle_t h;
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READONLY, &h) != ESP_OK)
+	{
+		return;
+	}
+	size_t len = 0;
+	if (nvs_get_str(h, "e911", nullptr, &len) == ESP_OK && len > 0 && len < 1024)
+	{
+		std::string blob(len, '\0');
+		if (nvs_get_str(h, "e911", &blob[0], &len) == ESP_OK)
+		{
+			// Three lines: exts, callback, location. A short/absent blob leaves
+			// the remaining fields at their defaults rather than failing.
+			std::string fields[3];
+			size_t start = 0;
+			for (int i = 0; i < 3 && start < blob.size(); ++i)
+			{
+				const size_t nl = blob.find('\n', start);
+				fields[i] = blob.substr(start, (nl == std::string::npos) ? std::string::npos : nl - start);
+				if (nl == std::string::npos) break;
+				start = nl + 1;
+			}
+			_e911.notifyExts = pbx::splitMembers(fields[0]);
+			if (_e911.notifyExts.size() > pbx::kMaxE911NotifyExts)
+			{
+				_e911.notifyExts.resize(pbx::kMaxE911NotifyExts);
+			}
+			_e911.callback = fields[1];
+			_e911.location = fields[2];
+		}
+	}
+	nvs_close(h);
 #endif
 }
 
