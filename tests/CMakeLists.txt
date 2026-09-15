@@ -281,6 +281,10 @@ add_executable(sip_parser_tests
     # dashboard snapshot the HTTP setters do, not bypass it by writing
     # _dnd/_forwards directly from inside onDtmfInfo's _mutex lock.
     DtmfClassCodes_test.cpp
+    # Issue #222: the DTMF admin factory reset (*<PIN>#999#1) must wipe the SD
+    # CDR archive like the HTTP factory reset does. Drives the real INFO digit
+    # path with a spy Sink installed via cdrarchive::setSinkForTest().
+    DtmfFactoryReset_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header

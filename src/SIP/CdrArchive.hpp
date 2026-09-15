@@ -190,7 +190,11 @@ void record(const CallDetailRecord& rec, std::string_view callId, std::string_vi
 // Synchronous directory wipe. NOT SIP-thread-safe by the rules above --
 // deletes files, so call it only from a non-realtime context that does not
 // hold _mutex (HttpServer::sendApiFactoryReset, on the HTTP task, same as
-// its existing MoH-upload fopen()). No-op when no Sink is installed -- and
+// its existing MoH-upload fopen()). ONE documented exception: the DTMF
+// factory reset (DtmfFeatureCodes.cpp, *<PIN>#999#1, issue #222) calls this
+// on the SIP thread immediately before esp_restart(), where the only thing a
+// stall can delay is the reboot itself -- see the reasoning at that call
+// site before copying the pattern anywhere else. No-op when no Sink is installed -- and
 // checked BEFORE touching the queue, so a build with no archive installed
 // never forces the queue's backing allocation into existence here (see
 // record()'s identical ordering and CdrArchive.cpp's queue() comment).
