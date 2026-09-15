@@ -213,7 +213,10 @@
 // implementation -- so raising this is safe once that port lands. It is
 // deliberately NOT raised in that same pass: more slots multiply socket count
 // (see the sdkconfig.defaults CONFIG_LWIP_MAX_SOCKETS note), per-call task-stack
-// PSRAM footprint (12 KB x kWsWorkers, 6 KB x N media-rx tasks), and proving
+// footprint (12 KB PSRAM x kWsWorkers; 6 KB INTERNAL RAM x N media-rx tasks --
+// RtpReceiver.cpp/RtpSender.cpp both use plain xTaskCreatePinnedToCore, not
+// PSRAM, despite PsramTask.hpp's name -- corrected here, found while sizing
+// POCKETDIAL_MAX_VOICEMAIL_LEGS below, which hits the same tasks), and proving
 // the single-call path end-to-end on real hardware is its own verification
 // pass before concurrency is added on top.
 // RAISED 1 -> 4. Both conditions the paragraph above set for this are now met:
@@ -257,6 +260,27 @@
 // nest one inside another.
 #ifndef POCKETDIAL_MAX_TRUNK_CALLS
 #define POCKETDIAL_MAX_TRUNK_CALLS 2
+#endif
+
+// Number of concurrent voicemail legs (Issue #246, Stage 3 of #194) -- deposit
+// (recording a caller's message) or retrieval (playing one back), never more
+// than one call at a time per leg. Each leg owns its own RtpReceiver/RtpSender
+// pair, the same per-leg RTP-task cost as a conference leg or anchor bridge
+// (POCKETDIAL_CONF_LEGS / POCKETDIAL_MAX_ANCHOR_CALLS above) -- 2 x 6144B of
+// task stack in INTERNAL RAM per leg (RtpReceiver.cpp/RtpSender.cpp both use
+// plain xTaskCreatePinnedToCore, not PSRAM, despite PsramTask.hpp's name).
+//
+// Fixed at 2, deliberately small: each leg ALSO holds a PSRAM recording
+// buffer sized to the per-message duration cap (see VoicemailLeg.hpp), so
+// raising this multiplies BOTH the internal-RAM task-stack cost above and the
+// PSRAM buffer cost, on the same 8MB PSRAM pool HoldMusic's clip and the new
+// IVR prompt clips already share (docs/HARDWARE.md: 8MB Octal PSRAM on every
+// board). 2 covers "someone leaves a message while someone else is
+// retrieving theirs" without a real sizing pass against hardware; raise it
+// only alongside a fresh look at free PSRAM/internal RAM, the same caution
+// POCKETDIAL_MAX_ANCHOR_CALLS's history above already sets a precedent for.
+#ifndef POCKETDIAL_MAX_VOICEMAIL_LEGS
+#define POCKETDIAL_MAX_VOICEMAIL_LEGS 2
 #endif
 
 // Maximum number of DID -> extension inbound routing entries (DidMapping.hpp).

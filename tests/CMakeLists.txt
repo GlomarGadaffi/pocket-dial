@@ -425,6 +425,10 @@ add_executable(sip_parser_tests
     # are no-op stubs under !ESP_PLATFORM, so the lifecycle/identity bookkeeping
     # and the feedRx -> PlayoutBuffer path are exercisable on the desktop build.
     ../src/SIP/MediaBridge.cpp
+    # Issue #246 (voicemail, Stage 3 of #194): the 1:1 record/playback leg.
+    # Pure C++17, no ESP dependency -- holds no socket/FreeRTOS state itself.
+    ../src/SIP/VoicemailLeg.cpp
+    VoicemailLeg_test.cpp
     # The fixed-size TelephonyProviderType registry/factory (name/implemented
     # lookups + registerProvider/select) that RequestsHandler's boot-time anchor
     # wiring now uses to select LoopbackAnchorClient. Pure C++17, no ESP dependency.
