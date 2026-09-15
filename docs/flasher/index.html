@@ -275,7 +275,7 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
 <!-- Unsupported browser gate -->
 <div id="unsupported" class="notice err hidden">
   <p><strong>This browser can't talk to serial devices.</strong></p>
-  <p>Flashing needs the <a href="https://developer.mozilla.org/docs/Web/API/Web_Serial_API" rel="noreferrer">Web Serial API</a>, which today only <strong>Chrome, Edge, and Opera on desktop</strong> support — Firefox, Safari, and all mobile browsers do not.</p>
+  <p>Flashing needs the <a href="https://developer.mozilla.org/docs/Web/API/Web_Serial_API" rel="noreferrer">Web Serial API</a>, which today only <strong>Chrome, Edge, and Opera on desktop</strong> support. Firefox, Safari, and all mobile browsers do not.</p>
   <p id="unsupported-why" class="muted"></p>
   <p style="margin-bottom:0">Open this page in Chrome or Edge on a desktop, or flash from the command line with the <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/FLASHING.md">esptool instructions in FLASHING.md</a>.</p>
 </div>
@@ -540,7 +540,7 @@ const REPO = "GlomarGadaffi/pocket-dial";
 // A browser cannot fetch a Release asset: browser_download_url 302s to
 // release-assets.githubusercontent.com, and neither the redirect nor the final
 // response sets Access-Control-Allow-Origin. api.github.com *is* CORS-enabled,
-// so listing releases succeeded and only the downloads failed — the page looked
+// so listing releases succeeded and only the downloads failed - the page looked
 // fine right up until someone pressed Flash (pocket-dial#138).
 //
 // release.yml copies each release's images into docs/firmware/<tag>/ and
@@ -556,7 +556,7 @@ const FIRMWARE_INDEX = "../firmware/index.json";
 const VARIANTS = {
   "esp32s3-eth": {
     name: "Ethernet",
-    desc: "LilyGO T-ETH-Elite (W5500, PoE). Wired only — no Wi-Fi in this build.",
+    desc: "LilyGO T-ETH-Elite (W5500, PoE). Wired only, no Wi-Fi in this build.",
     art: { body: "#2b7a4b", chip: "#1d2733", label: "T-ETH-ELITE", jack: true },
     after: `<p style="margin-bottom:8px">Plug an Ethernet cable in. The board asks your router for an address over DHCP;
             find it in the router's client list, then open <strong>http://&lt;that address&gt;/</strong> for the dashboard.
@@ -598,7 +598,7 @@ const PROJECT_NAME = "SipServer";
 //
 // Why a fallback and not the only source: the seed is generated here in the
 // browser, so it is not a release asset and has no place in manifest.json's
-// `parts` — but its *address* is a property of the release's partition table,
+// `parts` - but its *address* is a property of the release's partition table,
 // exactly like the app and otadata offsets the manifest already carries. So
 // release.yml now reads the real offset out of the published
 // partition-table-<variant>.bin and emits it as `cfgseed_offset`, and the page
@@ -607,7 +607,7 @@ const PROJECT_NAME = "SipServer";
 // writing 256 bytes into whatever now lives at 0xFFF000.
 //
 // Its absence is also a capability signal: a release built before the partition
-// existed emits no `cfgseed_offset`, and its firmware ignores seeds anyway — the
+// existed emits no `cfgseed_offset`, and its firmware ignores seeds anyway - the
 // page warns rather than pretending the settings took effect.
 const CFGSEED_OFFSET = 0xfff000;
 const DEFAULT_FLASH = { size: "16MB", mode: "dio", freq: "80m" };
@@ -670,7 +670,7 @@ const fmtBytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(2) + " MB"
 function checkSupport() {
   const reasons = [];
   if (!("serial" in navigator)) reasons.push("navigator.serial is not available in this browser.");
-  if (!window.isSecureContext) reasons.push("This page is not in a secure context — Web Serial needs HTTPS (or localhost).");
+  if (!window.isSecureContext) reasons.push("This page is not in a secure context, and Web Serial needs HTTPS (or localhost).");
 
   if (reasons.length) {
     $("unsupported").classList.remove("hidden");
@@ -735,7 +735,7 @@ function activeSlot(entry0, entry1) {
 // ---------------------------------------------------------------------------
 // Flash-time configuration seed
 //
-// ==== WIRE FORMAT — keep in lockstep with src/Helpers/DeviceConfig.hpp ====
+// ==== WIRE FORMAT - keep in lockstep with src/Helpers/DeviceConfig.hpp ====
 //
 // One 256-byte little-endian record at offset 0 of the `cfgseed` partition.
 // Strings are NUL-padded ASCII; every unlisted byte is zero.
@@ -759,7 +759,7 @@ function activeSlot(entry0, entry1) {
 //   252     4  crc32     CRC-32 (IEEE 802.3 / zlib) over bytes [0, 252)
 //
 // The firmware ignores a record whose magic, version or CRC does not check
-// out — an unwritten partition reads back as 0xFF and must not be an error.
+// out - an unwritten partition reads back as 0xFF and must not be an error.
 //
 // `regMode` was added after the first release of this format and deliberately
 // did NOT bump SEED_VERSION: every field is gated by its own "has" flag and
@@ -767,8 +767,8 @@ function activeSlot(entry0, entry1) {
 // Older firmware skips bit 5 and applies the rest; newer firmware reading a
 // record written by an older copy of this page sees bit 5 clear and leaves
 // `reg_mode` alone. A version bump would instead have made older firmware
-// reject the whole record. Add future fields the same way — in the reserved
-// space, behind a new flag bit — never by repurposing an existing one.
+// reject the whole record. Add future fields the same way - in the reserved
+// space, behind a new flag bit - never by repurposing an existing one.
 // ---------------------------------------------------------------------------
 
 const SEED_SIZE = 256;
@@ -776,7 +776,7 @@ const SEED_MAGIC = 0x53434450;
 const SEED_VERSION = 1;
 
 // Each "has" bit says "this field is meaningful". A seed may carry any subset,
-// so we set only the bits for settings the user actually chose — see
+// so we set only the bits for settings the user actually chose - see
 // readSeedForm() for why that matters more than it looks.
 const SEED_HAS_AP_SECURE = 1 << 0;
 const SEED_AP_SECURE_ON  = 1 << 1;
@@ -786,7 +786,7 @@ const SEED_HAS_STA_CREDS = 1 << 4;
 // The only operator-facing route to `learn`/`secure` on a headless board: SIP
 // digest auth has always been implemented, but nothing outside the firmware's
 // own tests ever wrote `reg_mode`, so a device came up in the compiled-in
-// default — open — and stayed there.
+// default - open - and stayed there.
 const SEED_HAS_REG_MODE  = 1 << 5;
 
 // DeviceConfig::kPskAlphabet / kGeneratedPskChars / kMin|MaxPskChars.
@@ -800,7 +800,7 @@ const PSK_MAX = 63;
 const SSID_MAX_BYTES = 32;
 
 // CRC-32, IEEE 802.3 / zlib: reflected polynomial 0xEDB88320, init 0xFFFFFFFF,
-// final xor 0xFFFFFFFF. Table built once, lazily — 256 entries is nothing, but
+// final xor 0xFFFFFFFF. Table built once, lazily - 256 entries is nothing, but
 // there is no reason to pay for it on a page that never opts into a seed.
 let crcTable = null;
 function crc32(bytes) {
@@ -915,7 +915,7 @@ function syncSeedPanel() {
 //
 // The three-way "leave as is" defaults are load-bearing, not politeness: a
 // plain on/off checkbox would mean that somebody opting in only to set STATION
-// mode also writes has-ap-secure with the value 0 — quietly reopening a board
+// mode also writes has-ap-secure with the value 0 - quietly reopening a board
 // that had WPA2 on, with a fresh `gen` so the firmware really applies it. Every
 // control here has an explicit "don't touch this" position, and only the ones
 // moved off it contribute a flag.
@@ -929,7 +929,7 @@ function readSeedForm() {
 
   // Turning WPA2 on with no passphrase would leave the firmware to generate
   // one, and on the headless builds that generated value only ever reaches the
-  // serial log — the exact problem this panel exists to solve. Generate it here
+  // serial log - the exact problem this panel exists to solve. Generate it here
   // instead, and put it in the box so the user sees it before flashing too.
   if (apSecure === "on" && !apPsk) {
     apPsk = generatePsk();
@@ -950,14 +950,14 @@ function readSeedForm() {
     return { error: "Enter the upstream SSID, or clear the password to keep the board's saved network." };
   }
   if (apSecure === "keep" && !apPsk && wifiMode === "keep" && regMode === "keep") {
-    return { error: "Nothing to write — every setting is on “Leave as is”. Untick the box, or change a setting." };
+    return { error: "Nothing to write: every setting is on “Leave as is”. Untick the box, or change a setting." };
   }
   return { cfg: { apSecure, apPsk, wifiMode, regMode, staSsid, staPass } };
 }
 
 // Build the extra flash part for the seed, or null when the user opted out.
 // Returns { part, psk } / { error } / null. Shaped exactly like the synthesised
-// otadata entry above — an inline `data` buffer — so doFlash and the progress
+// otadata entry above - an inline `data` buffer - so doFlash and the progress
 // bars need no special case for it.
 function seedPart(plan) {
   if (!seedPanelEnabled()) return null;
@@ -984,7 +984,7 @@ function seedPart(plan) {
     const name = { "0": "open", "1": "learn", "2": "secure" }[read.cfg.regMode];
     log(`SIP registrar mode will be set to ${name}.`);
     if (read.cfg.regMode === "1") {
-      logWarn("Learn mode is temporary by design — adopt the phones, then reflash with Secure.");
+      logWarn("Learn mode is temporary by design. Adopt the phones, then reflash with Secure.");
     }
   }
 
@@ -1044,7 +1044,7 @@ async function loadReleases() {
       tag: r.tag,
       name: r.name || r.tag,
       prerelease: !!r.prerelease,
-      // Metadata only — nothing on the flash path depends on reaching github.com.
+      // Metadata only - nothing on the flash path depends on reaching github.com.
       url: `https://github.com/${REPO}/releases/tag/${encodeURIComponent(r.tag)}`,
       assets: new Map((r.files || []).map((f) => [
         f.name,
@@ -1158,7 +1158,7 @@ function planFromManifest(rel, variantId) {
     parts.push({ name: p.file, offset: Number(p.offset), role: p.role, url: a.url, size: p.size ?? a.size });
   }
   // Not a member of `parts`: the seed is generated in this page, not shipped in
-  // the release. Only its address comes from the manifest — see CFGSEED_OFFSET.
+  // the release. Only its address comes from the manifest - see CFGSEED_OFFSET.
   const seedOff = v.cfgseed_offset ?? rel.manifest.cfgseed_offset;
   return {
     flash: { ...DEFAULT_FLASH, ...(v.flash || rel.manifest.flash || {}) },
@@ -1435,7 +1435,7 @@ async function readInstalled() {
     const cur = slots[active] || slots[1 - active];
     if (cur) {
       state.installedVersion = cur.version;
-      $("fact-version").textContent = `${cur.projectName || "?"} ${cur.version}` + (cur.date ? ` — built ${cur.date}` : "");
+      $("fact-version").textContent = `${cur.projectName || "?"} ${cur.version}` + (cur.date ? `, built ${cur.date}` : "");
       log(`Slot ota_${slots[active] ? active : 1 - active}: ${cur.projectName} ${cur.version}, IDF ${cur.idfVer}, built ${cur.date} ${cur.time}.`);
       if (cur.projectName === PROJECT_NAME) {
         notice("detect-notice", "ok",
@@ -1447,14 +1447,14 @@ async function readInstalled() {
            A <em>Full flash</em> replaces it.</p>`);
       }
     } else {
-      $("fact-version").textContent = "none — blank or unrecognised";
+      $("fact-version").textContent = "none (blank or unrecognised)";
       notice("detect-notice", "info", `<p style="margin-bottom:0">No firmware descriptor found on this board &mdash; it looks blank. Use a <em>Full flash</em>.</p>`);
     }
     $("detect-summary").textContent = "Every build targets the ESP32-S3, so the chip alone can't say which one you have. Pick by how the board reaches the network.";
   } catch (err) {
     logWarn(`Could not read the flash: ${err.message}`);
     $("fact-version").textContent = "unknown (read failed)";
-    $("detect-summary").textContent = "Couldn't read the board's flash — pick your board below.";
+    $("detect-summary").textContent = "Couldn't read the board's flash. Pick your board below.";
   }
 }
 
@@ -1590,7 +1590,7 @@ function showDone() {
   setStep("step-progress", "done");
 
   // On the headless eth/wifi variants this page is the only place the
-  // passphrase is ever shown to a human — the firmware also puts it on the
+  // passphrase is ever shown to a human - the firmware also puts it on the
   // serial log, but nobody has a serial monitor open at this point. So repeat
   // it here, in the log (so "Copy log" carries it), and behind a copy button.
   let pskBlock = "";
@@ -1605,7 +1605,7 @@ function showDone() {
   }
 
   notice("done-notice", "ok", `
-    <p style="margin-bottom:8px"><strong>Done — the board is rebooting.</strong></p>
+    <p style="margin-bottom:8px"><strong>Done. The board is rebooting.</strong></p>
     ${pskBlock}
     ${v.after}
     <p class="muted" style="margin-bottom:0">Later updates can go over the air from the dashboard (see
@@ -1613,14 +1613,14 @@ function showDone() {
       disconnecting the port here is safe.</p>`);
 
   // The notice is rebuilt as innerHTML each time, so the button is wired after
-  // insertion rather than once at startup — same shape as btn-copy-log.
+  // insertion rather than once at startup - same shape as btn-copy-log.
   const copy = $("btn-copy-psk");
   if (copy) copy.addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText($("done-psk").textContent);
       copy.textContent = "Copied";
     } catch {
-      copy.textContent = "Copy failed — select it by hand";
+      copy.textContent = "Copy failed, select it by hand";
     }
     setTimeout(() => { copy.textContent = "Copy"; }, 1500);
   });
@@ -1660,7 +1660,7 @@ async function flashFromRelease() {
   if (seed) parts = parts.concat(seed.part);
 
   const name = VARIANTS[state.selectedVariant].name;
-  const label = `${mode === "full" ? "Full" : "App-only"} flash — ${name} ${rel.tag}`;
+  const label = `${mode === "full" ? "Full" : "App-only"} flash: ${name} ${rel.tag}`;
   await doFlash(parts, plan.flash, label, $("erase-all").checked);
 }
 
@@ -1691,7 +1691,7 @@ async function flashLocal() {
   }
 
   // A local build has no manifest, so the seed lands at the page's fallback
-  // offset — which is what partitions.csv in this repository says.
+  // offset - which is what partitions.csv in this repository says.
   const seed = seedPart(null);
   if (seed && seed.error) {
     $("local-status").textContent = seed.error;
@@ -1702,7 +1702,7 @@ async function flashLocal() {
   if (seed) parts.push(seed.part);
 
   $("local-status").textContent = "";
-  await doFlash(parts, DEFAULT_FLASH, `Local flash — ${parts.length} file(s)`, $("erase-all").checked);
+  await doFlash(parts, DEFAULT_FLASH, `Local flash: ${parts.length} file(s)`, $("erase-all").checked);
 }
 
 // ---------------------------------------------------------------------------

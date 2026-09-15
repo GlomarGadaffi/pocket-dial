@@ -83,7 +83,7 @@ body {
     font-size: 11px;
     font-weight: 600;
     padding: 2px 8px;
-    border-radius: 9999px;
+    border-radius: 6px;
     background-color: rgba(16, 185, 129, 0.1);
     color: var(--primary);
     border: 1px solid rgba(16, 185, 129, 0.2);
@@ -176,7 +176,7 @@ section {
     background-color: rgba(16, 185, 129, 0.08);
     border: 1px solid rgba(16, 185, 129, 0.15);
     padding: 4px 12px;
-    border-radius: 9999px;
+    border-radius: 6px;
     width: max-content;
 }
 
@@ -489,8 +489,14 @@ section {
     transform: translateY(-2px);
 }
 
+.card-icon svg {
+    width: 22px;
+    height: 22px;
+}
+
 .card-icon {
     font-size: 24px;
+    color: #06b6d4;
     background-color: rgba(6, 182, 212, 0.08);
     border: 1px solid rgba(6, 182, 212, 0.15);
     width: 44px;

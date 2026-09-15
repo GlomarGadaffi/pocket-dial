@@ -46,7 +46,7 @@
                 <!-- docs/index.html: Issue #27 resolved. -->
                 <h1 class="hero-title">Minimalist SIP Server for Embedded & Desktop</h1>
                 <p class="hero-subtitle">
-                    A lightweight, robust SIP registrar and stateless proxy designed for flat trusted local networks. Point any SIP phone at the server to connect instantly on secure, flat local subnets.
+                    A small SIP registrar and stateless proxy for flat, trusted local networks. Point any SIP phone at the server to connect instantly on secure, flat local subnets.
                 </p>
                 <div class="hero-actions">
                     <a href="#quickstart" class="btn btn-primary">Launch Quickstart</a>
@@ -55,14 +55,13 @@
                 </div>
             </div>
 
-            <!-- Sleek Screenshot Showcase Card -->
             <div class="screenshot-showcase-container">
                 <div class="showcase-card">
                     <div class="card-title-bar">
                         <span class="dot red"></span>
                         <span class="dot yellow"></span>
                         <span class="dot green"></span>
-                        <span class="card-title-text">pocket-dial Switchboard — web dashboard</span>
+                        <span class="card-title-text">pocket-dial Switchboard web dashboard</span>
                     </div>
                     <img src="screenshot.png" alt="The pocket-dial Switchboard web dashboard: jack board, ring groups and forwarding, and the call log" class="showcase-img" width="1512" height="1341" decoding="async">
                 </div>
@@ -115,31 +114,31 @@
 
             <div class="features-grid">
                 <div class="feature-card">
-                    <div class="card-icon">🔑</div>
+                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 11h14v10H5z"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
                     <h3 class="feature-card-title">Open By Default, Locked If You Want</h3>
                     <p class="feature-card-text">
-                        Out of the box any SIP endpoint registers immediately — no username, no password, nothing to configure. Turn on SIP digest auth (RFC&nbsp;2617) when you are ready, with a <em>Learn</em> mode that adopts an existing phone fleet without re-provisioning it. Either way: <strong>do not expose SIP or the dashboard to the public Internet.</strong>
+                        Out of the box any SIP endpoint registers immediately. No username, no password, nothing to configure. Turn on SIP digest auth (RFC&nbsp;2617) when you are ready, with a <em>Learn</em> mode that adopts an existing phone fleet without re-provisioning it. Either way: <strong>do not expose SIP or the dashboard to the public Internet.</strong>
                     </p>
                 </div>
                 <div class="feature-card">
-                    <div class="card-icon">🔊</div>
+                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/></svg></div>
                     <h3 class="feature-card-title">Direct RTP Media Flow</h3>
                     <p class="feature-card-text">
                         Voice data flows peer-to-peer directly between devices. By default the server handles only SIP signalling and never touches call audio, which is what keeps RAM use and latency down. The optional conference mixer is the one exception, and it is off unless you build it in.
                     </p>
                 </div>
                 <div class="feature-card">
-                    <div class="card-icon">⚡</div>
+                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
                     <h3 class="feature-card-title">Hardened C++17 Core</h3>
                     <p class="feature-card-text">
                         Features memory-safe header parsing, bounded string modifications, and dynamic_cast failure handling to prevent Xtensa reboots or desktop crashes.
                     </p>
                 </div>
                 <div class="feature-card">
-                    <div class="card-icon">🌐</div>
+                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15 15 0 0 1 0 20a15 15 0 0 1 0-20z"/></svg></div>
                     <h3 class="feature-card-title">Multi-Platform Sockets</h3>
                     <p class="feature-card-text">
-                        Utilizes standard POSIX socket abstractions on Linux, Winsock on Windows, and native lwIP wrappers on ESP32 (running in a dedicated FreeRTOS 8KB stack task).
+                        Uses standard POSIX socket abstractions on Linux, Winsock on Windows, and native lwIP wrappers on ESP32 (running in a dedicated FreeRTOS 8KB stack task).
                     </p>
                 </div>
             </div>
@@ -157,42 +156,42 @@
 
             <div class="features-grid">
                 <div class="feature-card">
-                    <div class="card-icon">⇄</div>
+                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg></div>
                     <h3 class="feature-card-title">Transfer, Blind &amp; Attended</h3>
                     <p class="feature-card-text">
                         Blind transfer hands the call straight over. Attended transfer lets you consult first, then splice the two parties together with REFER + <code>Replaces</code> (RFC&nbsp;3891) &mdash; the transferor drops out and a later hang-up from either side still tears the call down cleanly.
                     </p>
                 </div>
                 <div class="feature-card">
-                    <div class="card-icon">◎</div>
+                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9 17V7h4a3 3 0 0 1 0 6H9"/></svg></div>
                     <h3 class="feature-card-title">Park &amp; Retrieve</h3>
                     <p class="feature-card-text">
                         Dial a free orbit in <strong>700&ndash;709</strong> to park a call; anyone can dial the same orbit from any handset to pick it up. Useful for &ldquo;grab this on the phone in the back&rdquo; without an intercom.
                     </p>
                 </div>
                 <div class="feature-card">
-                    <div class="card-icon">☎</div>
+                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.6a2 2 0 0 1-.5 2.1L8.1 9.7a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.8.3 1.7.6 2.6.7a2 2 0 0 1 1.9 2z"/></svg></div>
                     <h3 class="feature-card-title">Call Pickup</h3>
                     <p class="feature-card-text">
                         <strong>*8</strong> answers whatever is ringing in your pickup group; <strong>**&lt;ext&gt;</strong> answers one specific extension. Stops the walk across the room to a ringing desk.
                     </p>
                 </div>
                 <div class="feature-card">
-                    <div class="card-icon">⚇</div>
+                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.9"/><path d="M16 3.1a4 4 0 0 1 0 7.8"/></svg></div>
                     <h3 class="feature-card-title">Ring Groups &amp; Hunting</h3>
                     <p class="feature-card-text">
                         Ring every member at once, or hunt down the list to the first phone that answers. Unanswered legs are cancelled properly rather than left ringing.
                     </p>
                 </div>
                 <div class="feature-card">
-                    <div class="card-icon">↳</div>
+                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 10l5 5-5 5"/><path d="M4 4v7a4 4 0 0 0 4 4h12"/></svg></div>
                     <h3 class="feature-card-title">Forwarding &amp; DND</h3>
                     <p class="feature-card-text">
                         Forward unconditionally, on busy, or on no-answer (CFU / CFB / CFNA), plus do-not-disturb with dial codes to toggle it from the handset.
                     </p>
                 </div>
                 <div class="feature-card">
-                    <div class="card-icon">📢</div>
+                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 11 18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></svg></div>
                     <h3 class="feature-card-title">Paging Zones</h3>
                     <p class="feature-card-text">
                         Dial <strong>980&ndash;989</strong> to talk out of a zone of phones at once, or <strong>999</strong> to page everything. Star codes cover the rest &mdash; echo test, DND toggle and friends.
@@ -275,7 +274,7 @@
         <!-- MINIMAL FOOTER -->
         <footer class="system-footer">
             <div class="footer-columns">
-                <div>pocket-dial project — v1.4.1. Licensed under <span class="highlight-white">MIT</span>.</div>
+                <div>pocket-dial project, v1.4.1. Licensed under <span class="highlight-white">MIT</span>.</div>
                 <div>Source code available on <a href="https://github.com/GlomarGadaffi/pocket-dial" target="_blank" class="footer-link">GitHub</a></div>
             </div>
         </footer>

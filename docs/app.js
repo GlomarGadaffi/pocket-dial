@@ -149,7 +149,7 @@ ETH.begin(ETH_PHY_W5500, 1, ETH_CS_PIN, ETH_INT_PIN, ETH_RST_PIN, SPI);`
         },
         ascii:
 ` ┌──────────────────────────────────┐
- │ [ESP32 RF] 📡 ═ ═ ═ [esp32-sipserver AP]
+ │ [ESP32 RF] ═ ═ ═ ═ [esp32-sipserver AP]
  ├──────────────────────────────────┤
  │ Gateway: 192.168.4.1             
  │ Client Leases: 192.168.4.2 -> .5 
