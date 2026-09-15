@@ -181,22 +181,46 @@ public:
 	void removeTap(int id);
 
 	// Test-only: drives exactly the per-tick body runLoop() runs (read the
-	// cursor, apply gain, invoke taps, advance the cursor) without the real
-	// 20 ms task or socket, neither of which exist on host. A no-op if no
-	// clip is loaded. Compiled on every platform, like RequestsHandler's
+	// cursor, apply gain, snapshot+invoke taps, advance the cursor) without
+	// the real 20 ms task or socket, neither of which exist on host. A no-op
+	// if no clip is loaded. Compiled on every platform, like RequestsHandler's
 	// other test-only seams, so a host test can exercise addTap()'s actual
-	// delivery rather than only its bookkeeping.
+	// delivery rather than only its bookkeeping. Invokes taps in the same
+	// lock-released order runLoop() does (see tickLocked()'s doc comment) —
+	// this deliberately does NOT take a shortcut of calling taps under the
+	// lock just because there is no real fan-out here to interleave with;
+	// host tests should exercise the actual production ordering.
 	void deliverTickForTest();
 
 private:
+	// A tap registration, copied OUT of the tap table by value under _mutex
+	// so it can be invoked after the lock is released. See tickLocked()'s
+	// doc comment for why the invocation itself must not happen while this
+	// class's _mutex is still held.
+	struct TapSnapshot
+	{
+		TapFn fn  = nullptr;
+		void* ctx = nullptr;
+	};
+
 	// Shared by runLoop() (ESP) and deliverTickForTest() (host): fills `out`
 	// with BYTES_PER_TICK gain-adjusted bytes at the current cursor position,
-	// invokes any registered taps with those same bytes, and advances the
-	// cursor. Caller must hold _mutex. Returns false (leaving `out`
-	// untouched) if no clip is loaded — the only difference between the two
-	// callers is what they do with `out` afterwards: runLoop() fans it to
-	// the RTP listener table too; deliverTickForTest() doesn't have one.
-	bool tickLocked(uint8_t out[BYTES_PER_TICK]);
+	// copies (does NOT invoke) every registered tap into `tapsOut` (caller-
+	// sized to at least POCKETDIAL_MAX_ANCHOR_CALLS), sets `tapCount`, and
+	// advances the cursor. Caller must hold _mutex. Returns false (leaving
+	// everything else untouched) if no clip is loaded.
+	//
+	// Taps are snapshotted rather than invoked here on purpose (issue #218
+	// follow-up, caught in review): a tap can reach MediaBridge::feedMohTick()
+	// -> TelephonyAnchorClient::writeAudio(), a real network write that can
+	// block for the WHOLE 2 s HTTP client timeout on a congested trunk. If
+	// that happened while THIS _mutex were held, the SIP thread's own
+	// addTap()/removeTap() calls (setHeld()/stopBridge(), taken under
+	// RequestsHandler's engine lock) would stall behind it too — meaning one
+	// slow trunk write could freeze registration/INVITE/BYE processing for
+	// every call on the box, not just delay one parked caller's audio. The
+	// caller must invoke the snapshotted taps only AFTER releasing _mutex.
+	bool tickLocked(uint8_t out[BYTES_PER_TICK], TapSnapshot* tapsOut, size_t& tapCount);
 
 	struct Listener
 	{

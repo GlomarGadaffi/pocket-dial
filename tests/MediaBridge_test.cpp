@@ -300,6 +300,32 @@ TEST(MediaBridge, StopBridgeResetsHeldState) {
 	EXPECT_FALSE(f.bridge.isHeld());
 }
 
+TEST(MediaBridge, FeedMohTickAfterStopBridgeIsANoOp) {
+	// Issue #218 follow-up (PD-Opus's vet of PR #239): HoldMusic snapshots a
+	// tap's {fn, ctx} under its OWN _mutex, then invokes it only AFTER
+	// releasing that lock (see HoldMusic::tickLocked()'s doc comment -- the
+	// whole point of the fix this test guards is that a tap invocation must
+	// never happen while HoldMusic::_mutex is held, since a tap can block on
+	// a real network write). That means a snapshotted invocation can still be
+	// in flight after stopBridge() has already torn this bridge down. This is
+	// the direct regression test for the guard that makes that safe: even
+	// with no timing games, calling feedMohTick() straight after
+	// stopBridge() must be a clean no-op, not a write into a torn-down (or,
+	// in the fixed-size bridge pool, potentially already-reused) slot.
+	Fixture f;
+	ASSERT_TRUE(f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1"));
+	ASSERT_TRUE(f.sender.stop("call-1"));   // issue #135
+	wireLoopbackEcho(f);
+	f.bridge.setHeld(true);
+
+	f.bridge.stopBridge();
+
+	const auto tick = ulawTick(0xAA);
+	f.bridge.feedMohTick(tick.data(), tick.size());   // must not crash or deliver
+
+	EXPECT_EQ(f.bridge.getPlayoutBuffer().getLength(), 0u);
+}
+
 TEST(MediaBridge, StopBridgeReleasesTheHeldTapSoItDoesNotLeakIntoTheNextCall) {
 	// Needs a real, running HoldMusic (not just Fixture's LoopbackAnchorClient)
 	// to exercise setHeld()'s actual addTap()/removeTap() calls, not just the

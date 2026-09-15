@@ -345,9 +345,12 @@ void HoldMusic::removeTap(int id)
 }
 
 // Platform-independent (no socket, no task) so both runLoop() (ESP) and
-// deliverTickForTest() (host) can call it. Caller holds _mutex.
-bool HoldMusic::tickLocked(uint8_t out[BYTES_PER_TICK])
+// deliverTickForTest() (host) can call it. Caller holds _mutex. Does NOT
+// invoke taps -- see the header's doc comment on why that has to happen
+// after the caller releases _mutex.
+bool HoldMusic::tickLocked(uint8_t out[BYTES_PER_TICK], TapSnapshot* tapsOut, size_t& tapCount)
 {
+	tapCount = 0;
 	const size_t clipLen = _clipBytes.load(std::memory_order_acquire);
 	if (_clip == nullptr || clipLen == 0) return false;
 
@@ -366,14 +369,14 @@ bool HoldMusic::tickLocked(uint8_t out[BYTES_PER_TICK])
 		for (size_t i = 0; i < BYTES_PER_TICK; ++i) out[i] = _gainTable[out[i]];
 	}
 
-	// Issue #218: the same gain-adjusted tick bytes, handed to anything
-	// tapped in (a held MediaBridge) instead of sent over a socket. Same
-	// instant as every RTP listener the caller may fan this out to next --
-	// one cursor, one hand-out.
+	// Issue #218: copy each registered tap out BY VALUE -- the caller invokes
+	// them after releasing _mutex. `tapsOut` is sized by the caller to at
+	// least POCKETDIAL_MAX_ANCHOR_CALLS, i.e. exactly _taps' own capacity, so
+	// this can never overflow it.
 	for (auto& t : _taps)
 	{
 		if (!t.used) continue;
-		t.fn(t.ctx, out, BYTES_PER_TICK);
+		tapsOut[tapCount++] = TapSnapshot{t.fn, t.ctx};
 	}
 
 	_cursor = advanceCursor(_cursor, clipLen);
@@ -382,9 +385,20 @@ bool HoldMusic::tickLocked(uint8_t out[BYTES_PER_TICK])
 
 void HoldMusic::deliverTickForTest()
 {
-	std::lock_guard<std::mutex> lk(_mutex);
 	uint8_t scratch[BYTES_PER_TICK];
-	tickLocked(scratch);   // return value not needed -- taps already fired
+	TapSnapshot taps[POCKETDIAL_MAX_ANCHOR_CALLS];
+	size_t tapCount = 0;
+	{
+		std::lock_guard<std::mutex> lk(_mutex);
+		tickLocked(scratch, taps, tapCount);
+	}
+	// Invoked after _mutex is released -- same ordering runLoop() uses, so a
+	// host test exercises the real production sequencing (see tickLocked()'s
+	// doc comment for why taps must never fire while _mutex is held).
+	for (size_t i = 0; i < tapCount; ++i)
+	{
+		taps[i].fn(taps[i].ctx, scratch, BYTES_PER_TICK);
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -465,40 +479,74 @@ void HoldMusic::runLoop()
 		// vTaskDelayUntil, not vTaskDelay: the latter drifts by however long the
 		// send took, and a drifting 20 ms tick is a slowly-accumulating gap the far
 		// end hears as stuttering.
-		vTaskDelayUntil(&next, pdMS_TO_TICKS(PTIME_MS));
-
-		std::lock_guard<std::mutex> lk(_mutex);
-		// ── the radio station: ONE read, fanned to everyone ──────────────────
-		// tickLocked() reads the cursor, applies gain, invokes any taps
-		// (issue #218) and advances the cursor; false means no clip loaded.
-		uint8_t* payload = packet + RTP_HEADER_BYTES;
-		if (!tickLocked(payload)) continue;
-
-		for (auto& l : _listeners)
+		//
+		// xTaskDelayUntil's return tells us whether it actually delayed. If a
+		// previous tick ran long enough that `next` is already in the past
+		// (e.g. a tap's writeAudio() stalled on a congested trunk -- see
+		// tickLocked()'s doc comment for why that can no longer happen while
+		// _mutex is held, but the write itself can still take up to the HTTP
+		// client's own timeout), it returns pdFALSE without waiting at all.
+		// Left alone, `next` stays stuck in the past and every subsequent
+		// call keeps returning immediately -- the loop would burst through
+		// every catch-up tick back-to-back, blasting a run of packets that
+		// overflows every listener's jitter buffer instead of one clean gap.
+		// Resetting `next` to now on that signal trades the burst for a
+		// single dropped/late tick, which is what parked callers actually
+		// experience as a hold-music player: a brief gap, not a stutter.
+		if (xTaskDelayUntil(&next, pdMS_TO_TICKS(PTIME_MS)) == pdFALSE)
 		{
-			if (!l.used) continue;
-			// Marker on the very first packet of a stream (RFC 3550 §5.1): it tells
-			// the far end this is the start of a talkspurt so it primes its jitter
-			// buffer rather than treating the first frames as late.
-			RtpSender::buildRtpHeader(packet, /*marker=*/(l.seq == 0), PAYLOAD_TYPE_PCMU,
-				l.seq, l.timestamp, l.ssrc);
-			// Check the send. A silently-dropped sendto is exactly the failure that
-			// does not reproduce on a bench: the listener hears a gap, the log says
-			// nothing, and there is no counter to point at. Rate-limited so a
-			// genuinely unreachable peer cannot flood the log at 50 lines/second.
-			const int sent = sendto(_sock, packet, sizeof(packet), 0,
-				reinterpret_cast<const sockaddr*>(&l.dest), sizeof(l.dest));
-			if (sent < 0)
+			next = xTaskGetTickCount();
+		}
+
+		uint8_t* payload = packet + RTP_HEADER_BYTES;
+		TapSnapshot taps[POCKETDIAL_MAX_ANCHOR_CALLS];
+		size_t tapCount = 0;
+		{
+			std::lock_guard<std::mutex> lk(_mutex);
+			// ── the radio station: ONE read, fanned to everyone ──────────────
+			// tickLocked() reads the cursor, applies gain, snapshots any taps
+			// (issue #218) and advances the cursor; false means no clip loaded.
+			if (!tickLocked(payload, taps, tapCount)) continue;
+
+			for (auto& l : _listeners)
 			{
-				++_txErrors;
-				if ((_txErrors % 250u) == 1u)
+				if (!l.used) continue;
+				// Marker on the very first packet of a stream (RFC 3550 §5.1): it tells
+				// the far end this is the start of a talkspurt so it primes its jitter
+				// buffer rather than treating the first frames as late.
+				RtpSender::buildRtpHeader(packet, /*marker=*/(l.seq == 0), PAYLOAD_TYPE_PCMU,
+					l.seq, l.timestamp, l.ssrc);
+				// Check the send. A silently-dropped sendto is exactly the failure that
+				// does not reproduce on a bench: the listener hears a gap, the log says
+				// nothing, and there is no counter to point at. Rate-limited so a
+				// genuinely unreachable peer cannot flood the log at 50 lines/second.
+				const int sent = sendto(_sock, packet, sizeof(packet), 0,
+					reinterpret_cast<const sockaddr*>(&l.dest), sizeof(l.dest));
+				if (sent < 0)
 				{
-					ESP_LOGW(TAG, "sendto failed (errno %d), %u dropped so far",
-						errno, static_cast<unsigned>(_txErrors));
+					++_txErrors;
+					if ((_txErrors % 250u) == 1u)
+					{
+						ESP_LOGW(TAG, "sendto failed (errno %d), %u dropped so far",
+							errno, static_cast<unsigned>(_txErrors));
+					}
 				}
+				++l.seq;
+				l.timestamp += static_cast<uint32_t>(BYTES_PER_TICK);
 			}
-			++l.seq;
-			l.timestamp += static_cast<uint32_t>(BYTES_PER_TICK);
+			// _mutex releases here (end of scope) BEFORE any tap fires below.
+		}
+
+		// Issue #218: taps invoked only after _mutex is released -- a tap can
+		// block for a real network write (TelephonyAnchorClient::writeAudio's
+		// HTTP timeout); doing that under this task's own lock would stall
+		// every SIP-thread addTap()/removeTap() (setHeld()/stopBridge()) call
+		// behind it, freezing INVITE/REGISTER/BYE processing for every call
+		// on the box, not just this one parked caller's audio. See
+		// tickLocked()'s doc comment.
+		for (size_t i = 0; i < tapCount; ++i)
+		{
+			taps[i].fn(taps[i].ctx, payload, BYTES_PER_TICK);
 		}
 
 		// Cursor already advanced inside tickLocked() above.

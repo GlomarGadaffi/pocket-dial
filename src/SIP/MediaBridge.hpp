@@ -119,6 +119,14 @@ public:
 	// in place of the handset's own audio. Public so it matches HoldMusic::
 	// TapFn's raw-function-pointer shape via the static trampoline below;
 	// callers should go through setHeld(), not call this directly.
+	//
+	// Invoked from HoldMusic's pacing task, and ONLY after it has released
+	// its own _mutex (see HoldMusic::tickLocked()'s doc comment) — never
+	// nested under it. This function takes MediaBridge's OWN _mutex briefly,
+	// standalone, to snapshot _participantId before the network write below;
+	// that lock is never held across the write itself (see the .cpp), so
+	// stopBridge() — which also takes this _mutex — can never be made to
+	// wait on a slow trunk.
 	void feedMohTick(const uint8_t* ulawTick, size_t n);
 
 	// (bus | playout) -> handset: fill one 20 ms µ-law frame for the sender. Returns
@@ -152,6 +160,15 @@ private:
 	// touches the heap on the media path.
 	static constexpr size_t MAX_FRAME_SAMPLES = 320;
 
+	// Issue #218: fixed capacity for feedMohTick()'s on-stack participant-id
+	// snapshot (see the .cpp). 3CX Call Control API participant ids are short
+	// numerics (single/double/triple-digit call-leg ids); 32 is generous
+	// headroom over that, not a measured maximum. feedMohTick() refuses to
+	// deliver a tick rather than silently truncate if this is ever exceeded —
+	// see its doc comment for why a truncated id is a correctness hazard
+	// (could collide with a different call's slot), not just a lost frame.
+	static constexpr size_t kMohParticipantIdBufSize = 32;
+
 	// Hand this bridge's MixBus port back (Active -> Draining) and forget it. Caller
 	// MUST hold _mutex. Idempotent: a no-op when no port is held or in ANCHOR mode.
 	void releaseBusPortLocked();
@@ -176,7 +193,14 @@ private:
 	// because the media callbacks read it outside _mutex.
 	std::atomic<int>  _busPort{-1};
 	std::string       _callID;
-	std::string       _participantId;   // the anchor-side participant id this bridge serves
+	// The anchor-side participant id this bridge serves. Read/written under
+	// _mutex almost everywhere already; feedMohTick() (issue #218) is the one
+	// caller that reads it from a different thread than the SIP thread that
+	// writes it (HoldMusic's pacing task, not RtpReceiver's rx task like
+	// onHandsetRtp()'s read below), so it copies this into a fixed buffer
+	// under a short, standalone _mutex hold rather than reading it directly —
+	// see feedMohTick()'s doc comment in the header and its .cpp body.
+	std::string       _participantId;
 
 	// Set once at wiring time, before any bridge starts, and never mutated after —
 	// so the RTP task reads it without synchronisation, the same way it reads the

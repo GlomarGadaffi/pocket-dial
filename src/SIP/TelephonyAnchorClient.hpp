@@ -4,6 +4,7 @@
 #include "AnchorClient.hpp"
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <atomic>
 #include <functional>
 
@@ -37,7 +38,7 @@ public:
 	bool answerCall(const std::string& participantId) override;
 	bool dropCall(const std::string& participantId) override;
 	void setEventCallback(EventCallback cb) override;
-	bool writeAudio(const std::string& participantId, const int16_t* pcmSamples, size_t count) override;
+	bool writeAudio(std::string_view participantId, const int16_t* pcmSamples, size_t count) override;
 	void registerAudioRxCallback(AudioRxCallback cb) override;
 	void tick() override;   // non-blocking; runs the _outboundActive reconcile watchdog (ESP only)
 	void setRewarmIntervalSec(uint32_t sec) override;  // #107: idle TLS re-warm cadence (s); 0 = off
@@ -176,7 +177,12 @@ private:
 	// Slot lookup/alloc (caller holds _mutex). slotForLocked returns the slot whose
 	// participantId matches (nullptr if none); allocSlotLocked claims a free slot for a new
 	// participant (nullptr if all busy). freeSlotLocked clears a slot back to free.
-	CallSlot* slotForLocked(const std::string& participantId);
+	// string_view (issue #218 follow-up): writeAudio() can now be called from
+	// HoldMusic's real-time pacing task with a participant id that lives in a
+	// fixed on-stack buffer, not a std::string -- this must stay allocation-
+	// free on that path. Every other call site already holds a std::string,
+	// which converts for free.
+	CallSlot* slotForLocked(std::string_view participantId);
 	CallSlot* allocSlotLocked(const std::string& participantId);
 	void      freeSlotLocked(CallSlot& slot);
 	// Heap arg handed to a slot's rx task so the static trampoline knows its slot.
