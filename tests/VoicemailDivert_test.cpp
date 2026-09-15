@@ -309,3 +309,109 @@ TEST(VoicemailDivert, NoForwardNoVoicemailStillFailsPlainly)
 	EXPECT_FALSE(findSentTo(sent, callerAddr, "SIP/2.0 486").empty())
 		<< "with no forward configured and voicemail off, the caller must still see 486";
 }
+
+// Found in review: the free-slot scan used to key off VoicemailLeg's own
+// state, which this slice never advances past Idle (startRecording() isn't
+// wired yet), so every deposit picked slot 0 regardless of how many were
+// already active. Two genuinely concurrent deposits must land on two
+// distinct legs, and a third (with POCKETDIAL_MAX_VOICEMAIL_LEGS == 2) must
+// be refused rather than clobber an active one.
+TEST(VoicemailDivert, TwoConcurrentDepositsUseDistinctSlotsAndAThirdIsRefused)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.41.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in caller1Addr = addrFor("192.168.41.21");
+	const sockaddr_in caller2Addr = addrFor("192.168.41.22");
+	const sockaddr_in caller3Addr = addrFor("192.168.41.23");
+
+	handler.handle(makeRegister("401", "192.168.41.11", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.41.12", "reg-402"));
+	handler.handle(makeRegister("403", "192.168.41.13", "reg-403"));
+	handler.handle(makeRegister("411", "192.168.41.21", "reg-411"));
+	handler.handle(makeRegister("412", "192.168.41.22", "reg-412"));
+	handler.handle(makeRegister("413", "192.168.41.23", "reg-413"));
+	handler.setVoicemail("401", true);
+	handler.setVoicemail("402", true);
+	handler.setVoicemail("403", true);
+
+	handler.handle(makeInvite("411", "401", "192.168.41.21", "vm-slot-1", "z9hG4bKvmslot1"));
+	handler.handle(makeBusy("411", "401", "192.168.41.11", "vm-slot-1", "z9hG4bKvmslot1"));
+	handler.handle(makeInvite("412", "402", "192.168.41.22", "vm-slot-2", "z9hG4bKvmslot2"));
+	handler.handle(makeBusy("412", "402", "192.168.41.12", "vm-slot-2", "z9hG4bKvmslot2"));
+
+	EXPECT_NE(findSentTo(sent, caller1Addr, "SIP/2.0 200 OK").find("v=0"), std::string::npos)
+		<< "first deposit must be answered locally";
+	EXPECT_NE(findSentTo(sent, caller2Addr, "SIP/2.0 200 OK").find("v=0"), std::string::npos)
+		<< "second, CONCURRENT deposit must land on the OTHER slot, not be refused or "
+		   "silently drop the first leg's still-active RTP receiver";
+
+	// A third deposit, with both legs still active, must be refused rather
+	// than corrupt whichever slot the scan mistakenly thinks is free.
+	handler.handle(makeInvite("413", "403", "192.168.41.23", "vm-slot-3", "z9hG4bKvmslot3"));
+	handler.handle(makeBusy("413", "403", "192.168.41.13", "vm-slot-3", "z9hG4bKvmslot3"));
+
+	EXPECT_FALSE(findSentTo(sent, caller3Addr, "Call-ID: vm-slot-3").empty())
+		<< "the third deposit's own transaction must at least be answered somehow";
+	std::string thirdResponse = findSentTo(sent, caller3Addr, "Call-ID: vm-slot-3");
+	EXPECT_NE(thirdResponse.find("486"), std::string::npos)
+		<< "every leg busy must refuse the third deposit with 486, not fail some other way -- "
+		   "got: " << thirdResponse;
+	EXPECT_EQ(thirdResponse.find("v=0"), std::string::npos)
+		<< "the third deposit must not be silently answered with SDP on top of an active leg -- "
+		   "got: " << thirdResponse;
+}
+
+// Found in review: releaseVoicemailLeg() used to be called only from onBye(),
+// so any OTHER teardown path reaching endCall() (session-timer expiry,
+// forceDisconnect/admin hangup, the orphan sweep) left the RTP receiver/
+// sender running and the slot claimed forever. Proven black-box: fill both
+// legs, forceDisconnect one of them, then confirm a THIRD deposit can still
+// be answered -- which is only possible if the slot actually came back.
+TEST(VoicemailDivert, EndCallViaNonByePathReleasesTheVoicemailLegSlot)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.42.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in caller3Addr = addrFor("192.168.42.23");
+
+	handler.handle(makeRegister("501", "192.168.42.11", "reg-501"));
+	handler.handle(makeRegister("502", "192.168.42.12", "reg-502"));
+	handler.handle(makeRegister("503", "192.168.42.13", "reg-503"));
+	handler.handle(makeRegister("511", "192.168.42.21", "reg-511"));
+	handler.handle(makeRegister("512", "192.168.42.22", "reg-512"));
+	handler.handle(makeRegister("513", "192.168.42.23", "reg-513"));
+	handler.setVoicemail("501", true);
+	handler.setVoicemail("502", true);
+	handler.setVoicemail("503", true);
+
+	handler.handle(makeInvite("511", "501", "192.168.42.21", "vm-fd-1", "z9hG4bKvmfd1"));
+	handler.handle(makeBusy("511", "501", "192.168.42.11", "vm-fd-1", "z9hG4bKvmfd1"));
+	handler.handle(makeInvite("512", "502", "192.168.42.22", "vm-fd-2", "z9hG4bKvmfd2"));
+	handler.handle(makeBusy("512", "502", "192.168.42.12", "vm-fd-2", "z9hG4bKvmfd2"));
+
+	ASSERT_TRUE(handler.getSession("Call-ID: vm-fd-1").has_value());
+	ASSERT_TRUE(handler.getSession("Call-ID: vm-fd-2").has_value());
+
+	// Tear down the first depositor by a path OTHER than its own BYE --
+	// forceDisconnect() is what /api/kill uses, and it reaches endCall() the
+	// same way session-timer expiry and the orphan sweep do.
+	handler.forceDisconnect("511");
+	EXPECT_FALSE(handler.getSession("Call-ID: vm-fd-1").has_value())
+		<< "forceDisconnect must actually tear the voicemail session down";
+
+	// A third deposit only succeeds if slot 1's RTP receiver/sender were
+	// actually stopped -- otherwise this hits the same single-stream-cap
+	// failure the leaked slot would cause.
+	handler.handle(makeInvite("513", "503", "192.168.42.23", "vm-fd-3", "z9hG4bKvmfd3"));
+	handler.handle(makeBusy("513", "503", "192.168.42.13", "vm-fd-3", "z9hG4bKvmfd3"));
+
+	EXPECT_NE(findSentTo(sent, caller3Addr, "SIP/2.0 200 OK").find("v=0"), std::string::npos)
+		<< "the slot forceDisconnect freed must be reusable by a new deposit";
+}

@@ -877,8 +877,9 @@ private:
 	// the mailbox owner (the extension that didn't answer / was busy). Finds
 	// a free slot in the voicemail leg pool and answers with a real sendrecv
 	// SDP (888-style: buildMediaSdp(), not the 777 echo pattern, which never
-	// actually terminates media on the board -- see #194); 503s if every leg
-	// is busy. Caller holds _mutex.
+	// actually terminates media on the board -- see #194); 486 Busy Here if
+	// every leg is busy (matches 888's full-room refusal), 503 only for
+	// message-pool/session-pool exhaustion. Caller holds _mutex.
 	void answerVoicemailDeposit(const std::shared_ptr<SipMessage>& invite,
 		const std::shared_ptr<SipClient>& src, const std::string& extension);
 	// Stop the leg's RTP receiver/sender and return it to Idle. Called from

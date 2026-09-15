@@ -2351,17 +2351,21 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		return;
 	}
 
-	// Find a free leg. This slice (b1) wires the real RtpReceiver/RtpSender
-	// pair and answers correctly, but does not yet call
-	// _vmLegs[i].startRecording() with a real PSRAM buffer -- that lands in
-	// a follow-up commit alongside the boot-time buffer pool allocation.
-	// Until then the leg stays Idle after being claimed here, so
-	// onCallerRtp()/fillTx() are harmless no-ops: the call answers and holds
-	// open, but nothing is recorded or played yet.
+	// Find a free leg. Scan the RTP RECEIVER's own active state, not
+	// _vmLegs[i].isIdle() -- found in review: this slice wires the real
+	// RtpReceiver/RtpSender pair and answers correctly, but does not yet call
+	// _vmLegs[i].startRecording() with a real PSRAM buffer (that lands in a
+	// follow-up commit), so the leg stays Idle after being claimed here.
+	// Scanning on leg state meant every deposit picked slot 0: a second
+	// concurrent deposit would then call _vmRtpReceivers[0].start() on an
+	// already-active receiver, fail the single-stream cap, and 500 instead of
+	// claiming slot 1. The RTP pair's isActive() is the actual ground truth
+	// for "is this slot in use" regardless of which VoicemailLeg state the
+	// call happens to be in.
 	int slot = -1;
 	for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
 	{
-		if (_vmLegs[i].isIdle()) { slot = static_cast<int>(i); break; }
+		if (!_vmRtpReceivers[i].isActive()) { slot = static_cast<int>(i); break; }
 	}
 	if (slot < 0)
 	{
@@ -2421,6 +2425,12 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 	// other locally-terminated leg (777/888/anchor) -- never a shared
 	// client, so a concurrent voicemail call can't overwrite this one's
 	// destination identity.
+	//
+	// Noted, not fixed here (found in review): forceDisconnect() BYEs both
+	// legs of a session, so an admin-killed voicemail call will emit a BYE
+	// toward this dummy "700" address -- the same #232 shape 777/888 already
+	// have (a locally-terminated leg's dummy dest isn't a real phone to BYE).
+	// Whoever picks up #232 broadly should include this leg.
 	auto dummyVm = allocateVirtualPeer("700", invite->getSource());
 	newSession->setDest(dummyVm);
 	newSession->setVoicemail(true);
@@ -4054,6 +4064,9 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 				auto src = session.value()->getSrc();
 				if (inviteMsg && src)
 				{
+					// Same double-CDR shape as the CFNA divert's endCall() call --
+					// see its comment. Matches the existing CFNA redirect
+					// precedent, not a new problem introduced here.
 					std::string callID(data->getCallID());
 					endCall(callID, src->getNumber(), actualBusyExt, "busy (voicemail)");
 					answerVoicemailDeposit(inviteMsg, src, actualBusyExt);
@@ -4247,7 +4260,10 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	// branch the BYE falls through to the generic two-real-phone path at the
 	// bottom of this function, which RELAYS it toward the mailbox owner's own
 	// extension instead of the server answering it -- the depositor never
-	// gets their 200 OK (the #232 class of bug).
+	// gets their 200 OK (the #232 class of bug). The leg itself is released
+	// by endCall() below (its own voicemail safety net), not here directly --
+	// same reasoning as the conference/anchor-bridge cleanup already living
+	// there: every teardown path funnels through endCall(), not just BYE.
 	if (session.has_value() && session.value()->isVoicemail())
 	{
 		auto response = getMessageFromPool(*data);
@@ -4255,7 +4271,6 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		response->setHeader(SipMessageTypes::OK);
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
-		releaseVoicemailLeg(session.value()->getVoicemailLegSlot(), std::string(data->getCallID()));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber, "voicemail depositor hung up");
 		return;
 	}
@@ -5866,6 +5881,20 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 			}
 		}
 	}
+
+	// Voicemail-leg safety net (Issue #246, same shape as the anchor-bridge one
+	// above): a leg claimed by answerVoicemailDeposit() must be released on
+	// EVERY teardown path, not just onBye() -- session-timer expiry,
+	// forceDisconnect()/admin hangup and the orphan sweep all funnel through
+	// endCall() too, and none of them should have to remember this pool
+	// exists. Found in review: releasing only from onBye() left the RTP
+	// receiver/sender running and the slot claimed forever on any other path.
+	// Keyed on the session flag (ending->isVoicemail()), not destNumber or the
+	// dest's name -- same reasoning as isAnchor()'s own doc comment.
+	if (ending && ending->isVoicemail())
+	{
+		releaseVoicemailLeg(ending->getVoicemailLegSlot(), std::string(callID));
+	}
 }
 
 uint64_t RequestsHandler::nowEpochMs() const
@@ -7130,6 +7159,14 @@ void RequestsHandler::tick()
 							auto cancel = _forker.buildCancel(invite, callee.value());
 							if (cancel) _outbox.emplace_back(callee.value()->getAddress(), std::move(cancel));
 						}
+						// Noted, not fixed here (found in review): endCall() here
+						// writes a CDR ("no answer (voicemail)"), then
+						// answerVoicemailDeposit() re-inserts the same Call-ID under
+						// a new session -- the eventual BYE writes a SECOND CDR for
+						// what a caller experiences as one call. The existing CFNA
+						// redirect path has the identical double-record shape, so
+						// this matches established behavior rather than introducing
+						// a new one; worth knowing when the mailbox CDR work lands.
 						std::string depositExt(invite->getToNumber());
 						endCall(callID, src->getNumber(), depositExt, "no answer (voicemail)");
 						answerVoicemailDeposit(invite, src, depositExt);
