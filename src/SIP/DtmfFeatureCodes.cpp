@@ -7,6 +7,7 @@
 #include <chrono>
 
 #include "AdminAuth.hpp"
+#include "CdrArchive.hpp"
 #include "PbxPersist.hpp"
 #include "SipClient.hpp"
 #include "SipMessage.hpp"
@@ -210,11 +211,41 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 					if (rest[3] == '1')
 					{
 						_env.log("[admin] factory reset confirmed via DTMF");
+						// Issue #222: wipe the SD CDR archive too, so this door and the
+						// HTTP one (HttpServer::sendApiFactoryReset) forget the same
+						// things. nvs_flash_erase() below takes out the NVS "cdrlog"
+						// ring along with every other namespace, but it never touches
+						// the card's filesystem, so without this line a DTMF reset left
+						// a full dated plaintext call history on the SD while the HTTP
+						// reset wiped it -- same "forget everything" action, different
+						// outcome depending on which door was used.
+						//
+						// This is a deliberate, scoped EXCEPTION to CdrArchive.hpp's SD
+						// write-discipline rule ("no blocking file I/O on the SIP
+						// thread / under RequestsHandler::_mutex"). The rule exists so
+						// directory I/O can never stall live call handling. Here the
+						// very next statement is esp_restart(): the SIP thread, the
+						// mutex and every call it was protecting are about to cease to
+						// exist, so the only thing the opendir/unlink sweep can delay is
+						// the reboot itself. No packet that arrives during the sweep
+						// would have been serviced anyway. wipeAll() also takes the
+						// archive's drain/wipe mutex, so it cannot race the writer task
+						// mid-drain (a std::mutex on ESP-IDF is a FreeRTOS mutex with
+						// priority inheritance, so the low-priority writer task cannot
+						// hold the SIP thread hostage either). Ordering: SD first, then
+						// NVS, then restart -- the NVS erase is fast and unconditional,
+						// so putting the (possibly slower, card-dependent) SD sweep
+						// first means both wipes are attempted before power is cut.
+						// Kept OUTSIDE the platform guard: on host wipeAll() reaches the
+						// test-installed Sink (or is a no-op with none), which is what
+						// makes this path's wipe contract host-testable -- see
+						// DtmfFactoryReset_test.cpp.
+						cdrarchive::wipeAll();
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 						nvs_flash_erase();
 						esp_restart();
 #else
-						_env.log("[admin] factory reset (stub on host)");
+						_env.log("[admin] factory reset (NVS erase + restart stubbed on host)");
 #endif
 					}
 					else

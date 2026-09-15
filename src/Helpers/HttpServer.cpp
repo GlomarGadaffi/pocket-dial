@@ -2878,18 +2878,16 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// archive installed (see cdrarchive::wipeAll()'s doc comment).
 	cdrarchive::wipeAll();
 	//
-	// KNOWN GAP, not fixed here (out of this stage's scope -- DtmfFeatureCodes.cpp
-	// is not part of issue #194 Stage 1's touch list): the DTMF admin menu's OWN
-	// factory-reset path (*<PIN>#999#1, DtmfFeatureCodes.cpp) does not call this
-	// function at all -- it runs nvs_flash_erase() + esp_restart() directly on
-	// the SIP thread. That wipes NVS (including the "cdrlog" ring, more
-	// thoroughly than the targeted erase above) but never touches the SD card,
-	// so a DTMF-triggered factory reset currently leaves the SD archive intact
-	// while the HTTP-triggered one (this function) wipes both. Closing that gap
-	// means either giving DtmfFeatureCodes.cpp its own SD-wipe call (same SIP-
-	// thread/no-blocking-I/O constraint as endCall(), and outside this stage's
-	// "minimal hook" scope) or unifying the two factory-reset entry points --
-	// filed as issue #222 rather than an unreviewed addition here.
+	// The DTMF admin menu's OWN factory-reset path (*<PIN>#999#1,
+	// DtmfFeatureCodes.cpp) does not call this function -- it runs
+	// nvs_flash_erase() + esp_restart() directly on the SIP thread, which wipes
+	// NVS more thoroughly than the targeted erases here. Since issue #222 it
+	// ALSO calls cdrarchive::wipeAll() right before the restart, so both doors
+	// forget the same things; the justification for doing file I/O on the SIP
+	// thread in that one spot (the thread is about to be rebooted out of
+	// existence) lives at that call site. If the "what does a factory reset
+	// wipe" policy changes here, change it there too -- DtmfFactoryReset_test.cpp
+	// pins the DTMF side.
 #if defined(POCKETDIAL_HAS_WIFI)
 	// The ONLY genuinely radio-specific work in this handler. It stays gated on the
 	// transport (not the platform) for a second reason beyond the keys themselves:
