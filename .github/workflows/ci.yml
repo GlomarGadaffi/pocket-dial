@@ -71,7 +71,7 @@ jobs:
       # Sdp.cpp excluded. Re-measure and update this in the SAME PR as any
       # CLANG_TIDY_VERSION bump -- a version change moves the count, which
       # is the whole reason the previous "~59" had drifted to 260.
-      CLANG_TIDY_BASELINE: "258"
+      CLANG_TIDY_BASELINE: "106"
 
     steps:
       - name: Checkout Repository
@@ -300,8 +300,35 @@ jobs:
           echo "================================================================"
           echo "clang-tidy total diagnostics: ${COUNT} (baseline ${CLANG_TIDY_BASELINE}, pinned clang-tidy-${CLANG_TIDY_VERSION})"
           echo "of which ${UNIQUE} are distinct findings -- the rest are the same header-level finding reprinted per including .cpp file"
+          # TWO-DIRECTIONAL on purpose (issue #292). The check used to fire
+          # only on COUNT > BASELINE, and that one-way comparison is how the
+          # constant rotted twice without anyone noticing:
+          #
+          #   - #262 pinned BASELINE=258 measured on its own branch, which did
+          #     not contain #261. #261 had already added 55 findings, so the
+          #     constant was stale the day it was committed and the warning
+          #     fired on every PR and every main push for twelve merges,
+          #     carrying no information.
+          #   - Then #290 FIXED 206 of them, taking the tree to ~106. Now the
+          #     comparison sat 152 below the constant and the step went
+          #     completely silent -- someone could have added 150 new findings
+          #     without a peep.
+          #
+          # A one-way check cannot tell you it has gone slack. Both halves of
+          # this are warnings, not failures: continue-on-error stays, per #254
+          # and #262, because enforcing is a policy decision to make on its own.
           if [ "${COUNT}" -gt "${CLANG_TIDY_BASELINE}" ]; then
             echo "::warning::clang-tidy diagnostics ${COUNT} exceed the baseline ${CLANG_TIDY_BASELINE} by $(( COUNT - CLANG_TIDY_BASELINE )). A new finding has been introduced, or the pinned version changed."
+          elif [ "${COUNT}" -lt "${CLANG_TIDY_BASELINE}" ]; then
+            # Good news that still needs action. Someone removed findings and
+            # the constant no longer describes this tree, so the gate above is
+            # now slack by exactly this margin. Re-pin it in the PR that did
+            # the fixing, and say in the commit that N were FIXED -- absorbing
+            # an improvement into a silent baseline change is the same loss of
+            # information #254 was filed about, just in the pleasant direction.
+            echo "::warning::clang-tidy diagnostics ${COUNT} are $(( CLANG_TIDY_BASELINE - COUNT )) BELOW the baseline ${CLANG_TIDY_BASELINE}. Findings were fixed (good) and the baseline is now stale (bad -- it is slack by that margin). Re-pin CLANG_TIDY_BASELINE to ${COUNT} in this PR."
+          else
+            echo "clang-tidy diagnostics match the baseline exactly (${COUNT}); the gate is measuring this tree."
           fi
           echo "Diagnostics by check:"
           grep -oE "\[[a-z0-9-]+(,[a-z0-9-]+)*\]$" clang-tidy.log | sort | uniq -c | sort -rn || true
