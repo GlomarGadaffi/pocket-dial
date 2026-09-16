@@ -120,13 +120,17 @@ Three of those need an asterisk before you design around them:
   `Supported` header, because RFC 4028 §5–6 make `Min-SE` handling and the `422`
   mandatory for anything that claims the extension. A phone that asks for no timer
   gets no dead-peer detection from the board.
-- **UPDATE is answered, but only advertised on `OPTIONS`.** `onUpdate` handles
-  both the bodiless session-timer refresh and an SDP re-offer. The board lists
-  `UPDATE` in the `Allow` header of its `OPTIONS` response — the one place it
-  advertises its own capabilities — while the `180`/`200` that set up an ordinary
-  call are relayed from the far phone and carry *that* phone's `Allow` instead.
-  RFC 3311 §5.1 lets a phone send `UPDATE` only once it has seen it advertised, so
-  this path belongs to phones that poll `OPTIONS` or that send it unprompted.
+- **UPDATE is answered, but not advertised on every response.** `onUpdate`
+  handles both the bodiless session-timer refresh and an SDP re-offer. The
+  board lists `UPDATE` in the `Allow` header of the registrar's 200 OK, its
+  `OPTIONS` response, and any 2xx it authors itself — including its own
+  answer to an SDP-bearing UPDATE on a leg it anchors — while the bodiless
+  session-timer-refresh OK carries no such header, and the `180`/`200` that
+  set up an ordinary call are relayed from the far phone and carry *that*
+  phone's `Allow` instead. RFC 3311 §5.1 lets a phone send `UPDATE` only once
+  it has seen it advertised, so this path belongs to phones that have
+  registered, that poll `OPTIONS` or send it unprompted, or that are on a
+  call whose INVITE the board itself answered.
 
 ### Routing
 A bounded, ordered dial plan maps a dialled pattern to an action:
