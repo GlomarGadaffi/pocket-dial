@@ -491,10 +491,31 @@ void dumpInternalRecords(uint32_t atSec)
 	//
 	// Those two have opposite fixes and guessing between them costs a board
 	// cycle each time. So count how many DISTINCT sites remain when only the
-	// first 1, 2 and 4 frames are considered. If the depth-4 count is far
-	// below the full-depth count, the key is too specific and shallower
-	// keying is the answer. If all four numbers are close, the diversity is
-	// real and the leak is genuinely spread out.
+	// first 1, 2 and 4 frames are considered.
+	//
+	// HOW TO READ THE RESULT -- and how NOT to. First hardware census was
+	// 4 / 18 / 214 / 449 (depths 1, 2, 4, full). The tempting reading is
+	// "4 to 18 is the honest number of leak sources, the deep key is
+	// fragmenting them." That reading is wrong, and the reason is in
+	// heap_trace.inc:29: STACK_OFFSET is 2, commented "Caller is 2 stack
+	// frames deeper than we care about", so IDF already skips its own
+	// wrapper frames and frames[0] is the DIRECT CALLER of the heap API.
+	// In C++ that is almost always an allocator FUNNEL -- operator new,
+	// std::string::_M_create, lwIP mem_malloc, pvPortMalloc -- not the code
+	// holding the memory. Four distinct frames[0] across 887 allocations
+	// means four funnels, not four leaks; ranking at that depth reports that
+	// operator new is leaking, which is both true and useless.
+	//
+	// So this census describes the SHAPE of the fan-out and nothing more.
+	// Which depth to rank at is a question for symbols, not for a ratio.
+	// An earlier version of this comment offered "depth-4 far below
+	// full-depth means the key is too specific" as a decision rule; that was
+	// a threshold invented before anyone had symbolized a single frame, and
+	// it is not a sound basis for changing the key.
+	//
+	// Usually the question does not need answering at all: the leak is found
+	// by diffing two dumps, and a large TOTAL site count only matters if the
+	// GROWTH is spread just as wide. Check the diff before re-keying.
 	//
 	// Costs O(sites^2) short memcmp per depth, once per dump, outside any
 	// critical section.
