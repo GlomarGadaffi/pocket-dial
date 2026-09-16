@@ -33,6 +33,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -966,4 +967,92 @@ TEST(BlindTransfer, ReferRetransmitIsAcceptedWithoutStartingASecondTransfer)
 	ASSERT_TRUE(bLeg.has_value());
 	EXPECT_EQ(bLeg.value()->getPeerCallID(), extractHeaderLine(inviteToC, "Call-ID:"))
 		<< "the bridge must still point at the leg that was actually created";
+}
+
+// Issue #257. Reproduces the exact interop-harness failure: a real UA's own
+// dialog CSeq has nothing to do with how many requests the PBX has relayed on
+// it, and nothing requires it to start anywhere near 1. pjsua's did not --
+// the REFER that started this class of failure carried CSeq 15353. A swap
+// re-INVITE minted with a hardcoded low CSeq (previously 100) is, from that
+// real dialog's point of view, an out-of-order request: RFC 3261 s12.2.2
+// requires the transferee's own UA to reject it with 500 Invalid CSeq, which
+// is exactly what the interop harness's pjsua target did, and the transferee
+// never got the swap and eventually gave up -- "transferee survived=False".
+TEST(BlindTransfer, SwapReinviteUsesACseqHigherThanTheDialogsRealOne)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.34.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in transferorAddr = addrFor("192.168.34.10"); // A: 100
+	const sockaddr_in transfereeAddr = addrFor("192.168.34.20"); // B: 106
+	const sockaddr_in targetAddr     = addrFor("192.168.34.30"); // C: 107
+
+	handler.handle(makeRegister("100", "192.168.34.10", "reg-100e"));
+	handler.handle(makeRegister("106", "192.168.34.20", "reg-106e"));
+	handler.handle(makeRegister("107", "192.168.34.30", "reg-107e"));
+
+	const std::string callId = "blindxfer-257-highcseq";
+	connectCall(handler, sent, callId,
+		"100", transferorAddr, "atag257", sdpBodyFor("10.1.1.1", 10001),
+		"106", transfereeAddr, "btag257", sdpBodyFor("10.2.2.2", 20002));
+
+	// A REFER with a CSeq well past the old hardcoded 100 -- the exact shape a
+	// real, already-established call from a real UA produces. Built directly
+	// (not via makeRefer(), which hardcodes CSeq 2) since this test's whole
+	// point is a high one.
+	{
+		std::string raw =
+			"REFER sip:106@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 192.168.34.10:5060;branch=z9hG4bKref" + callId + "\r\n"
+			"From: <sip:100@server>;tag=atag257\r\n"
+			"To: <sip:106@server>;tag=btag257\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 15353 REFER\r\n"
+			"Max-Forwards: 70\r\n"
+			"Refer-To: <sip:107@server>\r\n"
+			"Contact: <sip:100@192.168.34.10:5060>\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, transferorAddr));
+	}
+
+	// C answers, which is what triggers the swap re-INVITE toward B.
+	std::string inviteToC = findSentTo(sent, targetAddr, "INVITE sip:107@");
+	ASSERT_FALSE(inviteToC.empty());
+	const std::string legCallId = extractHeaderLine(inviteToC, "Call-ID:");
+	const std::string legVia    = extractHeaderLine(inviteToC, "Via:");
+	const std::string legFrom   = extractHeaderLine(inviteToC, "From:");
+	{
+		std::string body = sdpBodyFor("10.3.3.3", 30003);
+		std::string raw =
+			"SIP/2.0 200 OK\r\n" +
+			legVia + "\r\n" +
+			legFrom + "\r\n"
+			"To: <sip:107@192.168.34.1:5060>;tag=ctag257\r\n" +
+			legCallId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Contact: <sip:107@192.168.34.30:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		handler.handle(RequestsHandler::getMessageFromPool(raw, targetAddr));
+	}
+
+	std::string reinviteToB = findSentTo(sent, transfereeAddr, "INVITE sip:106@");
+	ASSERT_FALSE(reinviteToB.empty()) << "the transferee must still be re-INVITEd";
+
+	std::string cseqLine = extractHeaderLine(reinviteToB, "CSeq:");
+	ASSERT_FALSE(cseqLine.empty()) << reinviteToB;
+	long cseqNum = std::strtol(cseqLine.c_str() + cseqLine.find(':') + 1, nullptr, 10);
+	EXPECT_GT(cseqNum, 15353)
+		<< "the swap re-INVITE's CSeq must be higher than the REFER's own "
+		   "(15353) -- a real UA's dialog layer rejects anything lower or equal "
+		   "as out of order (RFC 3261 s12.2.2), which is the exact bug this "
+		   "test reproduces:\n" << reinviteToB;
+
+	// The rest of the swap still behaves exactly as the CSeq-100 test above
+	// proves in detail -- this test is narrowly about the CSeq, not a repeat
+	// of that coverage.
+	EXPECT_NE(reinviteToB.find("c=IN IP4 10.3.3.3"), std::string::npos) << reinviteToB;
 }

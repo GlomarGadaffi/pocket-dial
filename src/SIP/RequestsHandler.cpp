@@ -5815,6 +5815,20 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		auto byeAfromAC = buildServerBye(transferor->getNumber(), transferor->getAddress(),
 			replacesCallIdKey, otherHdrAC, aHdrAC);
 
+		// NOT FIXED, same bug as #257 (which fixed only the blind-transfer swap
+		// re-INVITE below in handleBlindXferOk): both invToB and invToC
+		// impersonate A inside A-B/A-C's PRE-EXISTING dialogs with a hardcoded
+		// CSeq 100, which any real UA whose own dialog CSeq has already climbed
+		// past 100 will correctly reject as 500 Invalid CSeq (RFC 3261 s12.2.2)
+		// — the exact failure #257 root-caused for blind transfer. Left
+		// deliberately unfixed here: attended_transfer's own interop scenario
+		// currently passes, which is this test's specific CSeq values, not
+		// evidence the code path is safe. A real fix needs the same
+		// directly-observed-floor treatment #257 used (the REFER that starts
+		// an attended transfer only arrives on ONE of these two dialogs, so
+		// unlike blind transfer this needs real per-dialog CSeq tracking on
+		// Session for the other one, not just the REFER's own value) — tracked
+		// as a #257 follow-up, not attempted here.
 		std::shared_ptr<SipMessage> invToB;
 		{
 			std::ostringstream ss;
@@ -5955,6 +5969,16 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	if (originalOpt.has_value())
 	{
 		original = originalOpt.value();
+		// Issue #257. The REFER itself is a real, fresh in-dialog request from
+		// the transferor (A) on this exact dialog, so its own CSeq is a directly-
+		// observed floor: any later request minted here IMPERSONATING A must use
+		// a higher CSeq than this, or B's dialog layer correctly rejects it with
+		// 500 Invalid CSeq (RFC 3261 s12.2.2) — see handleBlindXferOk(), the only
+		// reader. Recorded unconditionally, including on a REFER that ends up
+		// declined below: a slightly stale-but-safe value from an earlier REFER
+		// is harmless, and a later successful REFER always overwrites it with a
+		// fresher one before it is ever read.
+		original->setTransferorCseqAtRefer(siphdr::cseqNumber(data->getCSeq()));
 		transferorIsSrc = original->getSrc() &&
 			original->getSrc()->getNumber() == transferor->getNumber();
 		if (auto other = transferorIsSrc ? original->getDest() : original->getSrc();
@@ -6230,13 +6254,21 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 
 bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
 {
-	// Only the splice re-INVITEs use CSeq 100 (chosen high enough to never collide
-	// with the dialog's own in-flight CSeq at splice time) — same recognise-by-
-	// Call-ID-in-a-tracking-vector pattern as ParkOrbit::handleOk's pendingAcks scan.
+	// Recognised by Call-ID membership in _transferPendingAcks, not by CSeq value
+	// — same recognise-by-Call-ID-in-a-tracking-vector pattern as ParkOrbit::
+	// handleOk's pendingAcks scan. The three splice/swap re-INVITEs that populate
+	// that vector no longer share one hardcoded CSeq (issue #257 gave the blind-
+	// transfer one a real, dialog-specific value), so this ACK's own CSeq is
+	// pulled from the response itself: RFC 3261 s8.2.6.2 requires a 200 OK to
+	// echo the SAME CSeq number as the request it answers, and s17.1.1.3 requires
+	// the ACK to carry that identical number. Deriving it here means this
+	// function is correct for whatever CSeq any of the three re-INVITEs used,
+	// present or future, rather than assuming they all agree on one constant.
 	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string::npos) return false;
 	const std::string callID(data->getCallID());
 	auto it = std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(), callID);
 	if (it == _transferPendingAcks.end()) return false;
+	const uint32_t ackCseq = siphdr::cseqNumber(data->getCSeq());
 
 	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
@@ -6248,7 +6280,7 @@ bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
 	   << "From: " << stripHeaderName(data->getFrom()) << "\r\n"
 	   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
 	   << "Call-ID: " << stripHeaderName(callID) << "\r\n"
-	   << "CSeq: 100 ACK\r\n"
+	   << "CSeq: " << ackCseq << " ACK\r\n"
 	   << "Max-Forwards: 70\r\n"
 	   << "Content-Length: 0\r\n\r\n";
 	auto ack = getMessageFromPool(ss.str(), data->getSource());
@@ -6366,12 +6398,22 @@ bool RequestsHandler::handleBlindXferOk(const std::shared_ptr<SipMessage>& data)
 		   << "From: " << stripHeaderName(transferorHdr) << "\r\n"
 		   << "To: " << stripHeaderName(transfereeHdr) << "\r\n"
 		   << "Call-ID: " << stripHeaderName(leg->getPeerCallID()) << "\r\n"
-		   // CSeq 100, the same high value the attended splice uses and for the same
-		   // reason: far enough above the dialog's own in-flight CSeq to never
-		   // collide, and it is what handleTransferOk() recognises when the
-		   // transferee's 200 OK comes back, so that answer is ACKed rather than
-		   // relayed at a transferor who is no longer on the call.
-		   << "CSeq: 100 INVITE\r\n"
+		   // Issue #257. This impersonates the transferor (A) inside A and B's
+		   // PRE-EXISTING dialog, so the CSeq must be higher than anything B's
+		   // own dialog layer has already seen from A -- a hardcoded constant
+		   // (previously 100) broke on any real UA whose own CSeq counter had
+		   // already climbed past it, which real UAs routinely do; RFC 3261
+		   // places no floor on where that counter starts. orig's
+		   // transferorCseqAtRefer() is the REFER's own CSeq, captured in
+		   // onRefer() as a real, directly-observed floor for "A's" numbering
+		   // on this exact dialog -- +1 is the next value A's own UA would
+		   // legitimately have used, which is guaranteed unused and in order.
+		   // handleTransferOk() recognises this dialog's 200 OK by Call-ID
+		   // membership in _transferPendingAcks (not by CSeq value), and ACKs
+		   // it with whatever CSeq that response itself echoes back -- so
+		   // nothing downstream needs to know this number, only that it is
+		   // real and monotonic.
+		   << "CSeq: " << (orig->transferorCseqAtRefer() + 1) << " INVITE\r\n"
 		   << "Max-Forwards: 70\r\n"
 		   << "Contact: <sip:" << transferee->getNumber() << "@" << srcIpPort << ">\r\n"
 		   << "User-Agent: pocket-dial\r\n"

@@ -2,6 +2,7 @@
 #define SIP_HEADER_UTIL_HPP
 
 #include <cctype>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -54,6 +55,28 @@ namespace siphdr
 		size_t e = h.size();
 		while (e > v && (h[e - 1] == '\r' || h[e - 1] == '\n')) --e;
 		return std::string(h.substr(v, e - v));
+	}
+
+	// Parse the leading digits out of a CSeq header line ("CSeq: 100 INVITE")
+	// or an already-stripped value ("100 INVITE") -- either form works, since
+	// this strips the header name itself first. Returns 0 on anything
+	// unparseable; callers must treat 0 as "absent/unknown", never as a real
+	// CSeq value (RFC 3261 places no floor on where a UA's own counter starts,
+	// but a well-formed request always has SOME digits here).
+	inline uint32_t cseqNumber(std::string_view header)
+	{
+		std::string value = stripHeaderName(header);
+		size_t i = 0;
+		while (i < value.size() && (value[i] == ' ' || value[i] == '\t')) ++i;
+		uint32_t n = 0;
+		bool any = false;
+		while (i < value.size() && value[i] >= '0' && value[i] <= '9')
+		{
+			any = true;
+			n = n * 10u + static_cast<uint32_t>(value[i] - '0');
+			++i;
+		}
+		return any ? n : 0;
 	}
 
 	// Percent-decode a URI parameter value (RFC 3986 %XX escapes only — unlike
