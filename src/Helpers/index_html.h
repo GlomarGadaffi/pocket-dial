@@ -39,9 +39,16 @@ R"html0(<!DOCTYPE html>
   /* patch-bay palette (design brief) */
   --void:#14100C; --face:#221B15; --face-raised:#2B231C;
   --groove-light:rgba(255,255,255,.05); --groove-dark:rgba(0,0,0,.55);
-  --brass:#B08D52; --brass-bright:#D4AF6A; --brass-lo:rgba(176,141,82,.5); --brass-hi:#D4AF6A; --brass-dim:rgba(176,141,82,.28);
+  --brass:#B08D52; --brass-bright:#D4AF6A; --brass-lo:#87714A; --brass-hi:var(--brass-bright); --brass-dim:rgba(176,141,82,.28);
   --paper:#EAE1C8; --paper-dim:#A99A7B;
-  --idle:#55A374; --active:#D9772E; --ringing:#E8C43D; --parked:#6C93B4; --alert:#C15C52;
+  /* item 16: spacing scale, measured from the rhythm already in use */
+  --space-1:.25rem; --space-2:.5rem; --space-3:.75rem; --space-4:1rem;
+  --space-5:1.5rem; --space-6:2rem; --space-7:2.25rem;
+  /* item 23: repeats twice (.btn.primary, #ota-pct/#moh-pct) */
+  --ink-on-brass:#fff;
+  --idle:#55A374; --active:#D9772E; --ringing:#E8C43D; --parked:#6C93B4; --alert:#D26F65;
+  /* item 8: ring/lamp dim for never-registered jacks; 4.22:1 on --face */
+  --unreg-ring:#8A7D68;
   --cord-a:#9078A8; --cord-b:#7C8A4C; --cord-c:#4E8A8C;
   /* semantic aliases so the existing form/table/modal/chip rules below (unchanged
      in structure from the brass/amber theme) retint to the patch-bay palette
@@ -100,6 +107,7 @@ button{font-family:inherit;cursor:pointer}
 .admin-badge .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
 .admin-badge.closed .seg.session .dot{background:var(--paper-dim)}
 .admin-badge.open .seg.session .dot{background:var(--idle);box-shadow:0 0 6px var(--idle)}
+.admin-badge.expired .seg.session .dot{background:var(--alert);box-shadow:0 0 6px var(--alert)}
 
 .header-actions{display:flex;gap:.5rem;flex-wrap:wrap}
 .rbtn{
@@ -147,11 +155,21 @@ main{max-width:1180px;margin:0 auto;padding:0 0 1.5rem}
 .jack.state-ringing .ring{border-color:var(--ringing)} .jack.state-ringing .led{background:var(--ringing);animation:pulse 1s ease-in-out infinite}
 .jack.state-parked .ring{border-color:var(--parked)} .jack.state-parked .led{background:var(--parked);box-shadow:0 0 8px var(--parked)}
 .jack.state-alert .ring{border-color:var(--alert)} .jack.state-alert .led{background:var(--alert);box-shadow:0 0 8px var(--alert);animation:pulse 1.4s ease-in-out infinite}
-.jack.state-unreg{opacity:.45} .jack.state-unreg .ring{border-color:#4a4136}
+.jack.state-unreg .ring{border-color:var(--unreg-ring)} .jack.state-unreg .led{background:var(--unreg-ring)}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.82)}}
 .legend{display:flex;flex-wrap:wrap;gap:1.1rem;margin-top:1.75rem;padding-top:.9rem;border-top:1px solid var(--brass-dim)}
 .legend .item{display:flex;align-items:center;gap:.4rem;font-size:.65rem;color:var(--paper-dim);font-family:var(--mono)}
-.legend .swatch{width:9px;height:9px;border-radius:50%}
+.legend .swatch{width:14px;height:14px;border-radius:50%;flex-shrink:0}
+/* item 15: each state gets a distinct SHAPE as well as its colour+word */
+.legend .sw-idle{background:var(--idle)}
+.legend .sw-ringing{background:transparent;border:3px solid var(--ringing)}
+.legend .sw-active{background:var(--active);border-radius:2px}
+.legend .sw-parked{width:0;height:0;border-radius:0;border-left:7px solid transparent;border-right:7px solid transparent;border-bottom:12px solid var(--parked)}
+.legend .sw-alert{background:var(--alert);border-radius:2px;transform:rotate(45deg)}
+.legend .sw-unreg{background:transparent;border:2px dashed var(--unreg-ring)}
+.legend .sw-cord{background:var(--cord-a)}
+/* item 18: was a style attribute repeated on every key in the Help modal */
+.help-keys b{font-family:var(--mono);color:var(--brass-hi);font-weight:400}
 
 /* ── RACK MODULES (flat, not elevated cards — the bay carries the weight) ── */
 .rack-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1.1rem;padding:1.25rem 1.5rem}
@@ -195,7 +213,10 @@ input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(176
 }
 .btn:hover{filter:brightness(1.2)}
 .btn:active{transform:translateY(1px)}
-.btn.primary{background:linear-gradient(180deg,#7a5a1e,#5a4116);color:#fff;border-color:var(--brass)}
+/* item 23: the gradient stops and #F0D3CE below are true one-offs, used
+   nowhere else, so they stay literal rather than inventing a token with
+   one consumer. #fff repeats, so it became --ink-on-brass. */
+.btn.primary{background:linear-gradient(180deg,#7a5a1e,#5a4116);color:var(--ink-on-brass);border-color:var(--brass)}
 .btn.danger{border-color:var(--alert);color:#F0D3CE}
 .btn.danger:hover{filter:brightness(1.3)}
 .btn:disabled{opacity:.4;cursor:not-allowed;filter:grayscale(.6)}
@@ -210,6 +231,7 @@ input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(176
 .toggle .knob{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:var(--ink-dim);transition:.15s}
 .toggle input:checked+.track{background:rgba(232,196,61,.22);border-color:var(--ringing)}
 .toggle input:checked+.track .knob{transform:translateX(22px);background:var(--ringing);box-shadow:0 0 6px var(--ringing)}
+.toggle input:focus-visible + .track{outline:2px solid var(--brass-bright);outline-offset:2px}
 
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .subhead{font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--brass);margin-bottom:8px}
@@ -225,8 +247,9 @@ R"html1(  align-items:flex-start;justify-content:center;padding:24px 14px;overfl
 .modal.wide{max-width:780px}
 .modal h3{font-family:var(--mono);font-size:13px;letter-spacing:1px;color:var(--brass-hi);
   padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
-.modal h3 .x{margin-left:auto;cursor:pointer;color:var(--ink-dim);font-size:18px;line-height:1}
-.modal h3 .x:hover{color:var(--alert)}
+.modal h3 .x{min-width:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:center;margin-left:auto;background:none;border:none;padding:0;font:inherit;cursor:pointer;color:var(--ink-dim);font-size:18px;line-height:1}
+.modal h3 .x:hover,.modal h3 .x:focus-visible{color:var(--alert)}
+.modal h3 .x:focus-visible{outline:2px solid var(--brass-bright);outline-offset:2px}
 .modal .mbody{padding:14px;max-height:74vh;overflow:auto}
 .modal h3 .badge{margin-left:8px;font-size:11px;color:var(--paper-dim);border:1px solid var(--line-hi);
   border-radius:10px;padding:1px 8px;letter-spacing:1px;text-transform:none}
@@ -251,7 +274,7 @@ R"html1(  align-items:flex-start;justify-content:center;padding:24px 14px;overfl
 
 #ota-prog,#moh-prog{display:none;height:14px;border:1px solid var(--line-hi);border-radius:4px;background:var(--void);position:relative;margin:8px 0;overflow:hidden}
 #ota-bar,#moh-bar{height:100%;width:0;background:var(--brass);transition:width .15s}
-#ota-pct,#moh-pct{position:absolute;inset:0;text-align:center;font-size:10px;line-height:14px;font-family:var(--mono);color:#fff;text-shadow:0 0 3px #000}
+#ota-pct,#moh-pct{position:absolute;inset:0;text-align:center;font-size:10px;line-height:14px;font-family:var(--mono);color:var(--ink-on-brass);text-shadow:0 0 3px #000}
 
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%) translateY(80px);
   background:var(--face-raised);border:1px solid var(--brass-lo);border-radius:6px;color:var(--ink);
@@ -259,6 +282,8 @@ R"html1(  align-items:flex-start;justify-content:center;padding:24px 14px;overfl
   transition:transform .25s,opacity .25s;box-shadow:0 6px 20px rgba(0,0,0,.6);max-width:90vw}
 #toast.show{transform:translateX(-50%) translateY(0);opacity:1}
 
+/* item 23: #08070a is a deliberate one-off, darker than --void, so the
+   trace screen reads as a CRT rather than another rack face. */
 .trace-screen{height:260px;overflow-y:auto;background:#08070a;border:1px solid var(--line-hi);border-radius:4px;
   padding:8px 10px;font-family:var(--mono);font-size:11px;line-height:1.5;color:var(--idle);
   white-space:pre-wrap;word-break:break-all}
@@ -272,7 +297,7 @@ R"html1(  align-items:flex-start;justify-content:center;padding:24px 14px;overfl
 .term-prompt{color:var(--idle);flex-shrink:0}
 .term-input{flex:1;min-width:0;background:transparent;border:none;border-bottom:1px solid var(--line-hi);
   color:var(--idle);font-family:var(--mono);font-size:12px;padding:3px 0}
-.term-input:focus{outline:none;border-bottom-color:var(--ringing)}
+.term-input:focus{outline:none;border-color:var(--brass);box-shadow:0 0 0 2px rgba(176,141,82,.18)}
 
 /* interconnect test-dial */
 .slot-row{display:flex;justify-content:space-between;align-items:center;gap:.75rem;padding:.5rem 0;border-bottom:1px dashed var(--brass-dim)}
@@ -289,6 +314,15 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
   .did-row{grid-template-columns:1fr}
   .patch-bay{padding:1.25rem .9rem 0}
   .rack-grid{padding:1rem .9rem}
+  /* item 9: 44px touch minimum, scoped to touch width so the desktop
+     header rail keeps its deliberate compact chrome */
+  .btn,.rbtn{min-height:44px}
+  /* item 5: Carrier API Slots reflow to labelled cards */
+  #tapi-slots,#tapi-slots thead,#tapi-slots tbody,#tapi-slots tr{display:block}
+  #tapi-slots thead{display:none}
+  #tapi-slots tr{border-bottom:1px solid var(--line);padding:.5rem 0}
+  #tapi-slots td{display:flex;justify-content:space-between;border:none;padding:2px 0}
+  #tapi-slots td::before{content:attr(data-label);color:var(--paper-dim);font-size:10px;text-transform:uppercase}
 }
 @media (prefers-reduced-motion:reduce){
   .jack .led{animation:none!important}
@@ -346,15 +380,17 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
   <section class="patch-bay">
     <div class="bay-face" id="board-wrap">
       <div class="bay-title"><span>Jack Board</span><span class="count" id="board-cap">0 shown / 32 total</span></div>
+      <div class="note" id="bay-idle" style="display:none">All jacks quiet.</div>
       <svg id="cords"></svg>
       <div id="jacks"></div>
       <div class="legend">
-        <span class="item"><span class="swatch" style="background:var(--idle)"></span>idle</span>
-        <span class="item"><span class="swatch" style="background:var(--ringing)"></span>ringing</span>
-        <span class="item"><span class="swatch" style="background:var(--active)"></span>active</span>
-        <span class="item"><span class="swatch" style="background:var(--parked)"></span>parked</span>
-        <span class="item"><span class="swatch" style="background:var(--alert)"></span>alert</span>
-        <span class="item"><span class="swatch" style="background:var(--cord-a)"></span>cord = ring-group membership</span>
+        <span class="item"><span class="swatch sw-idle"></span>idle</span>
+        <span class="item"><span class="swatch sw-ringing"></span>ringing</span>
+        <span class="item"><span class="swatch sw-active"></span>active</span>
+        <span class="item"><span class="swatch sw-parked"></span>parked</span>
+        <span class="item"><span class="swatch sw-alert"></span>alert</span>
+        <span class="item"><span class="swatch sw-unreg"></span>unreg</span>
+        <span class="item"><span class="swatch sw-cord"></span>cord = ring-group membership</span>
       </div>
     </div>
   </section>
@@ -367,9 +403,9 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
      empty table every outside number answers 404 without ever leaving the box.
      First match wins, and the table is evaluated AFTER every reserved virtual
      extension, so no rule can shadow 777/999/440/888/555/70x/*8. -->
-<div class="overlay" id="dialplan-modal">
+<div class="overlay" id="dialplan-modal" role="dialog" aria-modal="true" aria-labelledby="dialplan-title">
   <div class="modal wide">
-    <h3>&#9776; Dial Plan <span class="badge" id="dp-count">0</span><span class="x" onclick="closeModal('dialplan-modal')">&times;</span></h3>
+    <h3><span aria-hidden="true">&#9776;</span> <span id="dialplan-title">Dial Plan</span> <span class="badge" id="dp-count">0</span><button type="button" class="x" aria-label="Close" onclick="closeModal('dialplan-modal')">&times;</button></h3>
     <div class="mbody">
       <div class="note">
         Ordered rules, first match wins. <b>X</b> matches one digit; a trailing <b>*</b> matches any
@@ -379,14 +415,15 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
       <hr class="hr">
       <div class="subhead">SBC Mode</div>
       <div class="note">
-        Border-element mode: every call these rules don't already claim &mdash; including
-        extension-to-extension &mdash; goes out the selected trunk exactly as dialed, unmodified.
+        Border-element mode: every call these rules don't already claim (including
+        extension-to-extension) goes out the selected trunk exactly as dialed, unmodified.
         The echo test, paging, park and the feature codes above always stay local; so does 911,
         which is resolved before any of this. Changing the route takes effect on next reboot,
         same as any other Telephony-API credential change.
       </div>
       <div class="row">
         <label><input type="checkbox" id="sbc-enabled"> Enable SBC mode</label>
+        <label for="sbc-route">Route</label>
         <select id="sbc-route"></select>
         <button class="btn primary" onclick="saveSbcMode()">Save</button>
       </div>
@@ -396,8 +433,8 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
       <div class="subhead">New / Edit Rule</div>
       <div class="grid2">
         <div>
-          <div class="field"><label>Pattern</label><input type="text" id="dp-pattern" placeholder="e.g. 9XXXXXXXXXX"></div>
-          <div class="field"><label>Action</label>
+          <div class="field"><label for="dp-pattern">Pattern</label><input type="text" id="dp-pattern" placeholder="e.g. 9XXXXXXXXXX"></div>
+          <div class="field"><label for="dp-action">Action</label>
             <select id="dp-action" onchange="dpActionChanged()">
               <option value="trunk">Trunk (outside line)</option>
               <option value="group">Ring group</option>
@@ -407,8 +444,8 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
           </div>
         </div>
         <div>
-          <div class="field"><label id="dp-target-label">Prepend after stripping</label><input type="text" id="dp-target" placeholder="e.g. 1"></div>
-          <div class="field" id="dp-strip-field"><label>Strip leading digits</label><input type="text" id="dp-strip" inputmode="numeric" placeholder="e.g. 1" value="0"></div>
+          <div class="field"><label id="dp-target-label" for="dp-target">Prepend after stripping</label><input type="text" id="dp-target" placeholder="e.g. 1"></div>
+          <div class="field" id="dp-strip-field"><label for="dp-strip">Strip leading digits</label><input type="text" id="dp-strip" inputmode="numeric" placeholder="e.g. 1" value="0"></div>
         </div>
       </div>
       <div class="row">
@@ -418,7 +455,7 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
       <div class="msg" id="dp-msg"></div>
       <p class="note">
         <b>Prepend nothing:</b> leave Prepend blank on a trunk rule to send the dialed digits with only
-        the strip applied &mdash; dialing <b>9</b> then <b>2025550123</b> with strip 1 and no prepend
+        the strip applied. Dialing <b>9</b> then <b>2025550123</b> with strip 1 and no prepend
         sends <b>2025550123</b>. <b>Deleting:</b> use the Delete button on a rule above.
       </p>
     </div>
@@ -426,9 +463,9 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
 </div>
 
 <!-- ══ RING GROUPS & FORWARDING MODAL ══ -->
-<div class="overlay" id="groups-modal">
+<div class="overlay" id="groups-modal" role="dialog" aria-modal="true" aria-labelledby="groups-title">
   <div class="modal wide">
-    <h3>&#9778; Ring Groups &amp; Forwarding<span class="x" onclick="closeModal('groups-modal')">&times;</span></h3>
+    <h3><span aria-hidden="true">&#9778;</span> <span id="groups-title">Ring Groups &amp; Forwarding</span><button type="button" class="x" aria-label="Close" onclick="closeModal('groups-modal')">&times;</button></h3>
     <div class="mbody">
         <div class="grid2">
           <div>
@@ -440,9 +477,9 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
 )html1";
 
 static const char PD_HTML_2[] =
-R"html2(            <div class="field"><label>Group extension</label><input type="text" id="grp-ext" inputmode="numeric" placeholder="e.g. 600"></div>
-            <div class="field"><label>Members (comma separated)</label><input type="text" id="grp-members" placeholder="101,102,103"></div>
-            <div class="field"><label>Mode</label>
+R"html2(            <div class="field"><label for="grp-ext">Group extension</label><input type="text" id="grp-ext" inputmode="numeric" placeholder="e.g. 600"></div>
+            <div class="field"><label for="grp-members">Members (comma separated)</label><input type="text" id="grp-members" placeholder="101,102,103"></div>
+            <div class="field"><label for="grp-mode">Mode</label>
               <select id="grp-mode"><option value="ringall">Ring all</option><option value="hunt">Hunt</option></select>
             </div>
             <div class="row">
@@ -457,11 +494,11 @@ R"html2(            <div class="field"><label>Group extension</label><input type
             <div id="fwd-list"></div>
             <hr class="hr">
             <div class="subhead">Set Forward</div>
-            <div class="field"><label>Extension</label><input type="text" id="fwd-ext" inputmode="numeric" placeholder="e.g. 101"></div>
-            <div class="field"><label>Trigger</label>
+            <div class="field"><label for="fwd-ext">Extension</label><input type="text" id="fwd-ext" inputmode="numeric" placeholder="e.g. 101"></div>
+            <div class="field"><label for="fwd-trigger">Trigger</label>
               <select id="fwd-trigger"><option value="always">Always</option><option value="busy">Busy</option><option value="noanswer">No answer</option></select>
             </div>
-            <div class="field"><label>Target (blank clears)</label><input type="text" id="fwd-target" inputmode="numeric" placeholder="e.g. 102"></div>
+            <div class="field"><label for="fwd-target">Target (blank clears)</label><input type="text" id="fwd-target" inputmode="numeric" placeholder="e.g. 102"></div>
             <button class="btn primary" onclick="saveForward()">Save Forward</button>
             <div class="msg" id="fwd-msg"></div>
           </div>
@@ -471,9 +508,9 @@ R"html2(            <div class="field"><label>Group extension</label><input type
 </div>
 
 <!-- ══ CALL LOG MODAL ══ -->
-<div class="overlay" id="cdr-modal">
+<div class="overlay" id="cdr-modal" role="dialog" aria-modal="true" aria-labelledby="cdr-title">
   <div class="modal wide">
-    <h3>&#9779; Call Log <span class="badge" id="cdr-count">0</span><span class="x" onclick="closeModal('cdr-modal')">&times;</span></h3>
+    <h3><span aria-hidden="true">&#9779;</span> <span id="cdr-title">Call Log</span> <span class="badge" id="cdr-count">0</span><button type="button" class="x" aria-label="Close" onclick="closeModal('cdr-modal')">&times;</button></h3>
     <div class="mbody" style="padding:0">
         <table>
           <thead><tr><th>Caller</th><th></th><th>Callee</th><th>Result</th><th>Duration</th><th>Age</th></tr></thead>
@@ -484,48 +521,49 @@ R"html2(            <div class="field"><label>Group extension</label><input type
 </div>
 
 <!-- ══ SIP TRACE MODAL ══ -->
-<div class="overlay" id="trace-modal">
+<div class="overlay" id="trace-modal" role="dialog" aria-modal="true" aria-labelledby="trace-title">
   <div class="modal wide">
-    <h3>&#9780; SIP Trace <span class="badge" id="trace-count">off</span><span class="x" onclick="closeModal('trace-modal')">&times;</span></h3>
+    <h3><span aria-hidden="true">&#9780;</span> <span id="trace-title">SIP Trace</span> <span class="badge" id="trace-count">off</span><button type="button" class="x" aria-label="Close" onclick="closeModal('trace-modal')">&times;</button></h3>
     <div class="mbody">
         <div class="row" style="justify-content:space-between;margin-bottom:8px">
-          <label class="toggle"><input type="checkbox" id="trace-toggle" onchange="toggleTrace()"><span class="track"><span class="knob"></span></span></label>
+          <label class="toggle"><input type="checkbox" id="trace-toggle" aria-label="Enable SIP trace" onchange="toggleTrace()"><span class="track"><span class="knob"></span></span></label>
           <span class="note" style="margin:0">Flip the switch, or type <b>trace on</b> / <b>trace off</b> below. Downloadable as a full .pcap via <a href="/api/pcap">/api/pcap</a>.</span>
         </div>
         <div class="trace-screen" id="trace-screen"><div class="trc-empty">Trace is off.</div></div>
         <div class="term-line">
           <span class="term-prompt">pd&gt;</span>
           <input type="text" id="term-input" class="term-input" autocomplete="off" autocapitalize="off" spellcheck="false"
-                 placeholder="trace on | trace off | help" onkeydown="if(event.key==='Enter')termExec()">
+                 placeholder="trace on | trace off | help" aria-label="trace on | trace off | help" onkeydown="if(event.key==='Enter')termExec()">
         </div>
     </div>
   </div>
 </div>
 
 <!-- ══ JACK DETAIL MODAL ══ -->
-<div class="overlay" id="jack-modal">
+<div class="overlay" id="jack-modal" role="dialog" aria-modal="true" aria-labelledby="jack-title">
   <div class="modal">
-    <h3><span id="jd-lamp"></span><span>Jack <span id="jd-num">--</span></span><span class="x" onclick="closeModal('jack-modal')">&times;</span></h3>
+    <h3><span id="jd-lamp" aria-hidden="true"></span><span id="jack-title">Jack <span id="jd-num">--</span></span><button type="button" class="x" aria-label="Close" onclick="closeModal('jack-modal')">&times;</button></h3>
     <div class="mbody">
       <div class="kv"><span class="k">State</span><span id="jd-state">&mdash;</span></div>
       <div class="kv"><span class="k">Peer</span><span id="jd-peer">&mdash;</span></div>
       <div class="kv"><span class="k">Duration</span><span id="jd-dur">&mdash;</span></div>
       <div class="kv"><span class="k">Address</span><span id="jd-addr">&mdash;</span></div>
+      <div class="kv"><span class="k">Groups</span><span id="jd-groups">&mdash;</span></div>
       <hr class="hr">
       <div class="row" style="justify-content:space-between">
         <span class="subhead" style="margin:0">Do Not Disturb</span>
-        <label class="toggle"><input type="checkbox" id="jd-dnd" onchange="toggleDnd()"><span class="track"><span class="knob"></span></span></label>
+        <label class="toggle"><input type="checkbox" id="jd-dnd" aria-label="Do Not Disturb" onchange="toggleDnd()"><span class="track"><span class="knob"></span></span></label>
       </div>
       <hr class="hr">
       <div class="row" style="justify-content:space-between">
         <span class="subhead" style="margin:0">Voicemail</span>
-        <label class="toggle"><input type="checkbox" id="jd-vm" onchange="toggleVoicemail()"><span class="track"><span class="knob"></span></span></label>
+        <label class="toggle"><input type="checkbox" id="jd-vm" aria-label="Voicemail" onchange="toggleVoicemail()"><span class="track"><span class="knob"></span></span></label>
       </div>
       <hr class="hr">
       <div class="subhead">Call Forwarding</div>
-      <div class="fwd-row"><label>Always</label><input type="text" id="jd-fwd-always" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('always')">Set</button></div>
-      <div class="fwd-row"><label>Busy</label><input type="text" id="jd-fwd-busy" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('busy')">Set</button></div>
-      <div class="fwd-row"><label>No answer</label><input type="text" id="jd-fwd-noanswer" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('noanswer')">Set</button></div>
+      <div class="fwd-row"><label for="jd-fwd-always">Always</label><input type="text" id="jd-fwd-always" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('always')">Set</button></div>
+      <div class="fwd-row"><label for="jd-fwd-busy">Busy</label><input type="text" id="jd-fwd-busy" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('busy')">Set</button></div>
+      <div class="fwd-row"><label for="jd-fwd-noanswer">No answer</label><input type="text" id="jd-fwd-noanswer" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('noanswer')">Set</button></div>
       <div class="msg" id="jd-msg"></div>
       <div class="danger-zone">
         <div class="subhead">Danger Zone</div>
@@ -536,50 +574,51 @@ R"html2(            <div class="field"><label>Group extension</label><input type
 </div>
 
 <!-- ══ ADMIN MODAL ══ -->
-<div class="overlay" id="admin-modal">
+<div class="overlay" id="admin-modal" role="dialog" aria-modal="true" aria-labelledby="admin-title">
   <div class="modal">
-    <h3>&#9919; Admin / Security &amp; Firmware<span class="x" onclick="closeModal('admin-modal')">&times;</span></h3>
+    <h3><span aria-hidden="true">&#9919;</span> <span id="admin-title">Admin / Security &amp; Firmware</span><button type="button" class="x" aria-label="Close" onclick="closeModal('admin-modal')">&times;</button></h3>
     <div class="mbody">
       <div class="subhead">Operator Authentication</div>
       <div id="admin-loading" class="note">Querying admin status&hellip;</div>
       <div id="admin-login" style="display:none">
-        <div class="note">Ships with a default login &mdash; admin / admin &mdash; until you set a real one below.</div>
-        <div class="field"><label>Username</label><input type="text" id="adm-user" autocomplete="username"></div>
-        <div class="field"><label>Password</label><input type="password" id="adm-pass" autocomplete="current-password"></div>
+        <div class="note">Ships with a default login (admin / admin) until you set a real one below.</div>
+        <div class="field"><label for="adm-user">Username</label><input type="text" id="adm-user" autocomplete="username"></div>
+        <div class="field"><label for="adm-pass">Password</label><input type="password" id="adm-pass" autocomplete="current-password"></div>
         <button class="btn primary" onclick="adminLogin()">Login</button>
       </div>
       <div id="admin-setup" style="display:none">
         <div class="msg warn">&#9888; Still on the default login. Set a real username, password, and (optional) DTMF admin PIN before doing anything else.</div>
-        <div class="field"><label>New username</label><input type="text" id="adm-setup-user" autocomplete="username" value="admin"></div>
-        <div class="field"><label>New password (min 8 chars)</label><input type="password" id="adm-setup-pass" autocomplete="new-password"></div>
-        <div class="field"><label>DTMF admin PIN (4-16 digits, optional &mdash; phone-keypad admin menu stays disabled without one)</label><input type="password" id="adm-setup-dtmfpin" inputmode="numeric" autocomplete="off"></div>
+        <div class="field"><label for="adm-setup-user">New username</label><input type="text" id="adm-setup-user" autocomplete="username" value="admin"></div>
+        <div class="field"><label for="adm-setup-pass">New password (min 8 chars)</label><input type="password" id="adm-setup-pass" autocomplete="new-password"></div>
+        <div class="field"><label for="adm-setup-dtmfpin">DTMF admin PIN (4-16 digits, optional: the phone-keypad admin menu stays disabled without one)</label><input type="password" id="adm-setup-dtmfpin" inputmode="numeric" autocomplete="off"></div>
         <button class="btn primary" onclick="adminCompleteSetup()">Complete Setup</button>
       </div>
       <div id="admin-loggedin" style="display:none">
-        <div class="msg ok">&#9679; Logged in &mdash; admin controls unlocked.</div>
+        <div class="msg ok">&#9679; Logged in. Admin controls unlocked.</div>
         <div class="row">
           <button class="btn" onclick="toggleChangeCredential()">Change Password</button>
           <button class="btn" onclick="toggleChangeDtmfPin()">Change DTMF PIN</button>
           <button class="btn danger" onclick="adminLogout()">Logout</button>
         </div>
         <div id="admin-changecred" style="display:none;margin-top:8px">
-          <div class="field"><label>Username</label><input type="text" id="adm-changeuser" autocomplete="username"></div>
-          <div class="field"><label>New password (min 8 chars)</label><input type="password" id="adm-changepass" autocomplete="new-password"></div>
+          <div class="field"><label for="adm-changeuser">Username</label><input type="text" id="adm-changeuser" autocomplete="username"></div>
+          <div class="field"><label for="adm-changepass">New password (min 8 chars)</label><input type="password" id="adm-changepass" autocomplete="new-password"></div>
           <button class="btn primary" onclick="adminChangeCredential()">Save</button>
         </div>
         <div id="admin-changedtmfpin" style="display:none;margin-top:8px">
-          <div class="field"><label>New DTMF PIN (4-16 digits)</label><input type="password" id="adm-changedtmfpin-val" inputmode="numeric" autocomplete="off"></div>
+          <div class="field"><label for="adm-changedtmfpin-val">New DTMF PIN (4-16 digits)</label><input type="password" id="adm-changedtmfpin-val" inputmode="numeric" autocomplete="off"></div>
           <button class="btn primary" onclick="adminChangeDtmfPin()">Save</button>
         </div>
       </div>
       <div class="msg" id="admin-msg"></div>
 
+      <div id="ap-security-section">
       <hr class="hr">
       <div class="subhead">&#128246; Wi-Fi Access Point Security</div>
       <div class="note">
         This device&rsquo;s own access point carries the dashboard, SIP signalling and
         call audio. Left open, anyone in radio range can join and record calls.
-        Turning WPA2 on encrypts all three at once &mdash; the single most effective
+        Turning WPA2 on encrypts all three at once: the single most effective
         hardening available here.
       </div>
       <div class="msg warn" id="ap-break-note">
@@ -600,12 +639,13 @@ R"html2(            <div class="field"><label>Group extension</label><input type
         <button class="btn" onclick="regenApPsk()">Generate new passphrase</button>
       </div>
       <div class="msg" id="ap-msg"></div>
+      </div><!-- /ap-security-section -->
 
       <hr class="hr">
       <div class="subhead">&#9990; Extension Registration &amp; Onboarding</div>
       <div class="note">
         Controls what a phone must prove before it can register as an extension.
-        <strong>Open</strong> accepts any endpoint with no credential &mdash; convenient
+        <strong>Open</strong> accepts any endpoint with no credential, convenient
         for a lab, but on a shared link anyone can register as any extension and tear
         down calls. <strong>Learn</strong> adopts unknown phones on first contact and
         locks each to its extension; run it briefly to onboard a fleet, then move on.
@@ -615,9 +655,9 @@ R"html2(            <div class="field"><label>Group extension</label><input type
       <div class="field">
         <label for="reg-mode">Registration mode</label>
         <select id="reg-mode">
-          <option value="open">Open &mdash; no credential required</option>
-          <option value="learn">Learn &mdash; adopt new phones (temporary)</option>
-          <option value="secure">Secure &mdash; digest auth required</option>
+          <option value="open">Open: no credential required</option>
+          <option value="learn">Learn: adopt new phones (temporary)</option>
+          <option value="secure">Secure: digest auth required</option>
         </select>
       </div>
       <button class="btn primary" onclick="saveRegistrarMode()">Apply mode</button>
@@ -639,12 +679,9 @@ R"html2(            <div class="field"><label>Group extension</label><input type
       <div class="kv"><span class="k">OTA support</span><span id="ota-supported">&mdash;</span></div>
       <div class="kv"><span class="k">Running</span><span id="ota-running">&mdash;</span></div>
       <div class="kv"><span class="k">Boot / Next</span><span id="ota-parts">&mdash;</span></div>
-)html2";
-
-static const char PD_HTML_3[] =
-R"html3(      <div class="msg" id="ota-state-msg"></div>
+      <div class="msg" id="ota-state-msg"></div>
       <div class="note" id="ota-gate-note" style="display:none">Admin login required to update firmware.</div>
-      <div class="field"><label>Firmware image (.bin)</label><input type="file" id="ota-file" accept=".bin"></div>
+      <div class="field"><label for="ota-file">Firmware image (.bin)</label><input type="file" id="ota-file" accept=".bin"></div>
       <div id="ota-prog"><div id="ota-bar"></div><div id="ota-pct">0%</div></div>
       <div class="row">
         <button class="btn primary" id="ota-upload-btn" onclick="otaUpload()">&#8593; Upload</button>
@@ -656,9 +693,9 @@ R"html3(      <div class="msg" id="ota-state-msg"></div>
 </div>
 
 <!-- ══ WIFI MODAL ══ -->
-<div class="overlay" id="wifi-modal">
+<div class="overlay" id="wifi-modal" role="dialog" aria-modal="true" aria-labelledby="wifi-title">
   <div class="modal">
-    <h3>&#9783; WiFi &amp; Network<span class="x" onclick="closeModal('wifi-modal')">&times;</span></h3>
+    <h3><span aria-hidden="true">&#9783;</span> <span id="wifi-title">WiFi &amp; Network</span><button type="button" class="x" aria-label="Close" onclick="closeModal('wifi-modal')">&times;</button></h3>
     <div class="mbody">
       <!-- #167: shown only when /api/status reports wifiCapable:false. An
            eth/lan8720 build has no radio at all, so a Scan button there is not
@@ -670,13 +707,22 @@ R"html3(      <div class="msg" id="ota-state-msg"></div>
         build, so there is nothing to scan for or connect to. Network settings
         are handled by the wired interface. Factory Reset below still applies.
       </div>
-      <div id="wifi-radio-ui">
+)html2";
+
+/* Split point deliberately moved here from just above the OTA status block.
+   The accessibility pass grew this region enough that PD_HTML_3 sat 112 bytes
+   under the 16384-byte literal cap; the parts concatenate in order (see
+   CGA_INDEX_HTML_PARTS), so a split may fall at any byte, and moving it here
+   restores usable headroom either side. If you add markup near here, re-check
+   every part's size before assuming there is room. */
+static const char PD_HTML_3[] =
+R"html3(      <div id="wifi-radio-ui">
       <div class="row"><button class="btn" onclick="scanWifi()">&#8635; Scan</button><span class="note" id="wifi-status">Ready</span></div>
       <div id="wifi-list" style="margin-top:8px"><div class="note">Press Scan to discover networks&hellip;</div></div>
       <div class="note" id="wifi-admin-note" style="display:none">&#9919; Admin login required for the controls below.</div>
       <div id="wifi-connect" style="display:none">
         <hr class="hr">
-        <div class="field"><label>SSID: <span id="wifi-ssid" style="color:var(--ink)"></span></label><input type="password" id="wifi-pw" placeholder="Network key"></div>
+        <div class="field"><label>SSID: <span id="wifi-ssid" style="color:var(--ink)"></span></label><input type="password" id="wifi-pw" placeholder="Network key" aria-label="Network key"></div>
         <div class="row">
           <button class="btn primary" id="wifi-connect-btn" onclick="connectWifi()">&#9889; Connect</button>
           <button class="btn" onclick="cancelWifiConnect()">Cancel</button>
@@ -697,15 +743,15 @@ R"html3(      <div class="msg" id="ota-state-msg"></div>
 </div>
 
 <!-- ══ TELEPHONE INTERCONNECT MODAL ══ -->
-<div class="overlay" id="telephony-modal">
-  <div class="modal">
-    <h3>&#9742; Telephone Interconnect<span class="x" onclick="closeModal('telephony-modal')">&times;</span></h3>
+<div class="overlay" id="telephony-modal" role="dialog" aria-modal="true" aria-labelledby="telephony-title">
+  <div class="modal wide">
+    <h3><span aria-hidden="true">&#9742;</span> <span id="telephony-title">Telephone Interconnect</span><button type="button" class="x" aria-label="Close" onclick="closeModal('telephony-modal')">&times;</button></h3>
     <div class="mbody">
       <div class="note">
         Bridges calls to an outside telephone network through a carrier's call-control
         API. Configure a slot with the carrier's credentials, then Activate it to choose
         which slot the device uses. A slot with no working backend yet is labelled
-        &ldquo;not yet connected&rdquo; below &mdash; it stores what you enter, but nothing
+        &ldquo;not yet connected&rdquo; below: it stores what you enter, but nothing
         actually dials out through it until that provider is implemented. Test Dial places
         a real probe call through the active slot's live provider connection.
       </div>
@@ -719,11 +765,11 @@ R"html3(      <div class="msg" id="ota-state-msg"></div>
 
       <hr class="hr">
       <div class="subhead" id="tapi-edit-title">Configure Slot 1</div>
-      <div class="field"><label>Base URL / FQDN</label><input type="text" id="tapi-baseurl" autocomplete="off" spellcheck="false" placeholder="https://api.example.com"></div>
-      <div class="field"><label>Client ID</label><input type="text" id="tapi-clientid" autocomplete="off" spellcheck="false"></div>
-      <div class="field"><label>API Key / Secret</label><input type="password" id="tapi-secret" autocomplete="off" placeholder="leave blank to keep existing"></div>
-      <div class="field"><label>Route Point / Source DN</label><input type="text" id="tapi-routedn" autocomplete="off" spellcheck="false" placeholder="e.g. +15551234567"></div>
-      <div class="row"><label class="note" for="tapi-enabled" style="margin:0"><input type="checkbox" id="tapi-enabled"> Enabled &mdash; needs an https:// base URL to take effect</label></div>
+      <div class="field"><label for="tapi-baseurl">Base URL / FQDN</label><input type="text" id="tapi-baseurl" autocomplete="off" spellcheck="false" placeholder="https://api.example.com"></div>
+      <div class="field"><label for="tapi-clientid">Client ID</label><input type="text" id="tapi-clientid" autocomplete="off" spellcheck="false"></div>
+      <div class="field"><label for="tapi-secret">API Key / Secret</label><input type="password" id="tapi-secret" autocomplete="off" placeholder="leave blank to keep existing"></div>
+      <div class="field"><label for="tapi-routedn">Route Point / Source DN</label><input type="text" id="tapi-routedn" autocomplete="off" spellcheck="false" placeholder="e.g. +15551234567"></div>
+      <div class="row"><label class="note" for="tapi-enabled" style="margin:0"><input type="checkbox" id="tapi-enabled"> Enabled (needs an https:// base URL to take effect)</label></div>
       <div class="row">
         <button class="btn primary" onclick="saveTelephonySlot()">Save Slot</button>
         <button class="btn" onclick="activateTelephonySlot(tapiSelected)">Activate This Slot</button>
@@ -737,7 +783,7 @@ R"html3(      <div class="msg" id="ota-state-msg"></div>
       <div class="note">
         Currently only one route point is supported: the DID you enter here
         must exactly match the Route Point / Source DN configured above in
-        the active Carrier API slot &mdash; that's the only inbound number
+        the active Carrier API slot: that's the only inbound number
         this device ever sees. Rows for other DIDs are stored but will never
         match until multi-route support is added; an unmatched call falls
         through to ring-all, same as if no mapping existed.
@@ -747,8 +793,8 @@ R"html3(      <div class="msg" id="ota-state-msg"></div>
         <tbody id="did-table-body"></tbody>
       </table>
       <div class="did-row">
-        <input type="text" id="did-new-did" autocomplete="off" spellcheck="false" placeholder="Must match Route Point DN above">
-        <input type="text" id="did-new-ext" inputmode="numeric" placeholder="Extension">
+        <input type="text" id="did-new-did" autocomplete="off" spellcheck="false" placeholder="Must match Route Point DN above" aria-label="DID">
+        <input type="text" id="did-new-ext" inputmode="numeric" placeholder="Extension" aria-label="Extension">
         <button class="btn primary" onclick="addDidMapping()">Add</button>
       </div>
       <div class="msg" id="did-msg"></div>
@@ -757,31 +803,31 @@ R"html3(      <div class="msg" id="ota-state-msg"></div>
 </div>
 
 <!-- ══ HELP MODAL ══ -->
-<div class="overlay" id="help-modal">
+<div class="overlay" id="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title">
   <div class="modal">
-    <h3>&#9737; Switchboard Help<span class="x" onclick="closeModal('help-modal')">&times;</span></h3>
+    <h3><span aria-hidden="true">&#9737;</span> <span id="help-title">Switchboard Help</span><button type="button" class="x" aria-label="Close" onclick="closeModal('help-modal')">&times;</button></h3>
     <div class="mbody" style="line-height:1.7;font-size:13px">
-      <p style="color:var(--brass);font-family:var(--mono)">POCKET&middot;DIAL &mdash; patch-bay switchboard</p>
+      <p style="color:var(--brass);font-family:var(--mono)">POCKET&middot;DIAL: patch-bay switchboard</p>
       <hr class="hr">
       <p><b>The board.</b> Each ring is an extension jack. <span style="color:var(--idle)">Green</span> = idle/registered, <span style="color:var(--ringing)">yellow</span> = ringing, <span style="color:var(--active)">orange</span> = active call, <span style="color:var(--parked)">blue</span> = parked, <span style="color:var(--alert)">red</span> = alert. A dim ring = not yet seen. A small DND tag marks Do Not Disturb.</p>
-      <p style="margin-top:8px"><b>Cords.</b> A cord is a ring group, drawn between its member jacks — it never represents a single call. A lit jack is a call; tap it to see who with (peer and duration show in its panel).</p>
+      <p style="margin-top:8px"><b>Cords.</b> A cord is a ring group, drawn between its member jacks. It never represents a single call. A lit jack is a call; tap it to see who with (peer and duration show in its panel).</p>
       <p style="margin-top:8px"><b>Tap a jack</b> to open its panel: state, peer, duration, address, DND toggle, the three call-forward triggers, and a force-disconnect.</p>
       <p style="margin-top:8px"><b>Admin badge.</b> The header badge's left half is this browser's real web login session. Its right half is an unrelated note: dialing <code>*PIN#code</code> from extension 1001 is a separate phone-keypad command channel (NTP resync, WiFi topology switch, factory reset) that never opens or extends the web session.</p>
       <hr class="hr">
       <p style="color:var(--brass);font-family:var(--mono)">Shortcuts</p>
-      <p><span style="font-family:var(--mono);color:var(--brass-hi)">F1</span> Help &nbsp; <span style="font-family:var(--mono);color:var(--brass-hi)">F5</span> Refresh &nbsp; <span style="font-family:var(--mono);color:var(--brass-hi)">F9</span> WiFi &nbsp; <span style="font-family:var(--mono);color:var(--brass-hi)">Esc</span> Close</p>
+      <p class="help-keys"><b>F1</b> Help &nbsp; <b>F2</b> Dial Plan &nbsp; <b>F3</b> Ring Groups &nbsp; <b>F4</b> Call Log &nbsp; <b>F5</b> Refresh &nbsp; <b>F6</b> PBX Settings &nbsp; <b>F8</b> SIP Trace &nbsp; <b>F9</b> WiFi &nbsp; <b>Esc</b> Close</p>
     </div>
   </div>
 </div>
 
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <footer>pocket-dial &middot; patch-bay switchboard</footer>
 
 <script>
 "use strict";
 var statusData={ip:"0.0.0.0",port:5060,uptime:0,clients:[],sessions:[],dnd:[],forwards:[],groups:[],dialplan:[],parkedCalls:[],packetsProcessed:0};
-var adminState={provisioned:false,needsSetup:true,authenticated:false,sessionRemainingSec:0};
+var adminState={provisioned:false,needsSetup:true,authenticated:false,sessionRemainingSec:0,sessionExpired:false};
 var otaUploading=false;
 var selectedSSID="";
 var selectedJack=null;
@@ -807,9 +853,70 @@ function fmtUptime(sec){sec=Math.floor(sec||0);var h=Math.floor(sec/3600),m=Math
 function setMsg(id,txt,cls){var e=$(id);if(e){e.textContent=txt||"";e.className="msg"+(cls?" "+cls:"");}}
 
 /* ── modals ── */
-function openModal(id){$(id).classList.add("show");}
-function closeModal(id){$(id).classList.remove("show");}
-document.addEventListener("click",function(e){if(e.target.classList&&e.target.classList.contains("overlay"))e.target.classList.remove("show");});
+/* One controller, replacing four separate gaps: two modals could be open at
+   once, Escape closed all ten, Tab escaped the open modal, and focus never
+   returned to whatever opened it. */
+var activeModal=null,modalOpener=null,modalOpenerKey=null;
+/* The opener is remembered twice: the node itself, and a key that survives
+   the node. renderBoard() replaces every jack button on each poll, so the
+   node alone can be detached by the time the modal closes. */
+function rememberOpener(){
+  var el=document.activeElement;
+  modalOpener=(el&&el.nodeType===1)?el:null;
+  modalOpenerKey=modalOpener?{id:modalOpener.id||"",
+    ext:(modalOpener.dataset&&modalOpener.dataset.ext)||""}:null;
+}
+function resolveOpener(){
+  if(modalOpener&&document.contains(modalOpener))return modalOpener;
+  if(!modalOpenerKey)return null;
+  if(modalOpenerKey.id&&$(modalOpenerKey.id))return $(modalOpenerKey.id);
+  if(modalOpenerKey.ext)return document.querySelector('.jack[data-ext="'+cssEsc(modalOpenerKey.ext)+'"]');
+  return null;
+}
+function modalFocusable(m){
+  return [].slice.call(m.querySelectorAll('button,[href],input:not([type=hidden]),select,textarea,[tabindex]:not([tabindex="-1"])'))
+    .filter(function(el){return !el.disabled&&el.offsetParent!==null;});
+}
+function openModal(id){
+  var m=$(id);if(!m)return;
+  /* A wholly gated overlay refuses to open at all. Only #pbx-modal carries
+     data-gate; #dialplan-modal deliberately does NOT, because its rule list
+     is public and only its SBC sub-section gates, inside openDialPlanModal().
+     gateCheck() is NOT a pure predicate: it toasts AND opens #admin-modal,
+     so it re-enters this function. Two things make that safe, and both are
+     load-bearing. First, the id!=="admin-modal" test terminates the
+     recursion structurally -- relying on "#admin-modal has no data-gate"
+     would leave an infinite loop one attribute away. Second, this runs
+     BEFORE the close-previous step, so the nested open's bookkeeping is not
+     clobbered by the outer call. */
+  if(id!=="admin-modal"&&m.getAttribute("data-gate")==="admin"&&!gateCheck())return;
+  if(activeModal&&activeModal!==id)closeModal(activeModal);
+  /* Re-opening the ALREADY-active modal must not overwrite the opener with
+     something inside that modal, or closing it would focus a hidden node. */
+  if(activeModal!==id)rememberOpener();
+  m.classList.add("show");activeModal=id;
+  var f=modalFocusable(m);if(f.length)f[0].focus();
+}
+function closeModal(id){
+  var m=$(id);if(!m)return;
+  m.classList.remove("show");
+  if(activeModal===id){
+    activeModal=null;
+    var back=resolveOpener();
+    if(back&&back.focus)back.focus();
+    modalOpener=null;modalOpenerKey=null;
+  }
+}
+document.addEventListener("click",function(e){if(e.target.classList&&e.target.classList.contains("overlay"))closeModal(e.target.id);});
+document.addEventListener("keydown",function(e){
+  if(e.key!=="Tab"||!activeModal)return;
+  var m=$(activeModal);if(!m)return;
+  var f=modalFocusable(m);
+  if(!f.length){e.preventDefault();return;}
+  var first=f[0],last=f[f.length-1];
+  if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}
+  else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
+});
 
 /* ── extension classification from /api/status ──
    One entry per extension ever seen this poll, merged from clients (registration),
@@ -858,7 +965,7 @@ function jackSublabel(e,state){
   if(state==="parked")return "park\u00b7"+(e.orbit||"");
   if(state==="alert")return "unavail";
   if(state==="idle")return "reg";
-  return "\u2014";
+  return "unreg";
 }
 
 /* ── render patch bay ── */
@@ -866,6 +973,12 @@ function renderBoard(d){
   var idx=buildIndex(d);
   var nums=Object.keys(idx).sort(function(a,b){return (parseInt(a,10)||0)-(parseInt(b,10)||0);});
   var board=$("jacks");
+  /* board.innerHTML below destroys every jack button. Without preserving
+     focus across the rebuild, a keyboard user Tabbing the board is dumped
+     back to <body> on every poll tick -- WCAG 2.4.3 on the primary control
+     surface, and it happens with no modal involved at all. */
+  var keepExt=(document.activeElement&&board.contains(document.activeElement)
+    &&document.activeElement.dataset)?document.activeElement.dataset.ext:null;
   var html="";
   nums.forEach(function(n){
     var e=idx[n];var state=jackStateOf(e);
@@ -876,6 +989,10 @@ function renderBoard(d){
   });
   if(!nums.length)html='<div class="note" style="text-align:center;padding:24px">No extensions seen yet. Register a phone to light a jack.</div>';
   board.innerHTML=html;
+  if(keepExt){
+    var refocus=board.querySelector('.jack[data-ext="'+cssEsc(keepExt)+'"]');
+    if(refocus)refocus.focus();
+  }
   $("board-cap").textContent=nums.length+" shown / "+POOL+" total";
   requestAnimationFrame(function(){drawCords(d);});
 }
@@ -912,7 +1029,7 @@ function drawCords(d){
 }
 
 /* ── jack detail panel ── */
-var JACK_STATE_LABEL={idle:"IDLE / REGISTERED",active:"ACTIVE CALL",ringing:"RINGING",parked:"PARKED",alert:"ALERT \u2014 UNAVAILABLE",unreg:"IDLE / UNREGISTERED"};
+var JACK_STATE_LABEL={idle:"IDLE / REGISTERED",active:"ACTIVE CALL",ringing:"RINGING",parked:"PARKED",alert:"ALERT: UNAVAILABLE",unreg:"IDLE / UNREGISTERED"};
 var JACK_STATE_COLOR={idle:"var(--idle)",active:"var(--active)",ringing:"var(--ringing)",parked:"var(--parked)",alert:"var(--alert)",unreg:"var(--lamp-off)"};
 function openJack(ext){
   selectedJack=ext;
@@ -928,6 +1045,12 @@ function openJack(ext){
   $("jd-peer").textContent=e.peer||"\u2014";
   $("jd-dur").textContent=e.duration||"\u2014";
   $("jd-addr").textContent=e.addr||"\u2014";
+  /* item 14: cord COLOUR collides past 3 groups (colors[gi%3] in
+     drawCords), so membership is also stated as text here. */
+  var jg=(statusData.groups||[]).filter(function(g){
+    return String(g.members||"").split(",").map(function(t){return t.trim();}).indexOf(String(ext))>=0;
+  }).map(function(g){return String(g.extension);});
+  $("jd-groups").textContent=jg.length?jg.join(", "):"\u2014";
   $("jd-dnd").checked=!!e.dnd;
   $("jd-vm").checked=!!e.voicemail;
   var fwd=(statusData.forwards||[]).filter(function(f){return String(f.extension)===String(ext);})[0]||{};
@@ -973,7 +1096,7 @@ function killJack(){
 /* ── groups & forwarding panels ── */
 function renderGroups(d){
   var list=$("groups-list");var g=d.groups||[];
-  if(!g.length){list.innerHTML='<div class="note">No groups defined.</div>';}
+  if(!g.length){list.innerHTML='<div class="note">No groups defined. Add one below to ring several jacks together.</div>';}
   else{
     list.innerHTML=g.map(function(x){
       return '<div class="kv"><span><b style="color:var(--brass-hi)">'+esc(x.extension)+'</b> '
@@ -1067,12 +1190,19 @@ function deleteDialRule(i){
    opens, dropdown populated BEFORE the current route is applied to it. */
 function openDialPlanModal(){
   openModal("dialplan-modal");
-  fetchTelephonyConfig().then(renderSbcRouteOptions).then(fetchSbcMode);
+  if(adminState.authenticated&&!adminState.needsSetup){
+    $("sbc-enabled").disabled=false;
+    fetchTelephonyConfig().then(renderSbcRouteOptions).then(fetchSbcMode);
+  }else{
+    $("sbc-route").innerHTML="";
+    $("sbc-enabled").checked=false;$("sbc-enabled").disabled=true;
+    setMsg("sbc-msg","Log in to view or change SBC mode.","");
+  }
 }
 function renderSbcRouteOptions(){
   var sel=$("sbc-route");
   sel.innerHTML=tapiSlots.map(function(s,i){
-    return '<option value="'+i+'">Slot '+(i+1)+(s.routeDn?" — "+esc(s.routeDn):(s.baseUrl?" — "+esc(s.baseUrl):""))+'</option>';
+    return '<option value="'+i+'">Slot '+(i+1)+(s.routeDn?" \u00b7 "+esc(s.routeDn):(s.baseUrl?" \u00b7 "+esc(s.baseUrl):""))+'</option>';
   }).join("");
 }
 function fetchSbcMode(){
@@ -1140,7 +1270,7 @@ R"html5(  if($("trace-toggle").checked)startTrace();else stopTrace();
 function startTrace(cmdEcho){
   traceOn=true;$("trace-toggle").checked=true;
   traceSeen={};$("trace-screen").innerHTML="";$("trace-count").textContent="0 shown";
-  if(cmdEcho){termEcho(cmdEcho);termEcho("trace on — streaming.");}
+  if(cmdEcho){termEcho(cmdEcho);termEcho("trace on: streaming.");}
   pollTrace();traceTimer=setInterval(pollTrace,1500);
 }
 function stopTrace(cmdEcho){
@@ -1188,14 +1318,14 @@ function termExec(){
   var cmd=raw.trim().toLowerCase().replace(/\s+/g," ");
   if(cmd==="trace on"){
     if(traceOn){termEcho(line);termEcho("trace already on.");return;}
-    if(!gateCheck()){termEcho(line);termEcho("session required — log in above first.");return;}
+    if(!gateCheck()){termEcho(line);termEcho("session required: log in above first.");return;}
     startTrace(line);
   }else if(cmd==="trace off"){
     if(!traceOn){termEcho(line);termEcho("trace already off.");return;}
     stopTrace(line);
   }else if(cmd.indexOf("email test")===0){
     termEcho(line);
-    if(!gateCheck()){termEcho("session required — log in above first.");return;}
+    if(!gateCheck()){termEcho("session required: log in above first.");return;}
     var addr=raw.trim().slice(10).trim(); // preserve case from raw, past "email test"
     if(!addr){termEcho("usage: email test <addr>");return;}
     termEcho("sending test message to "+addr+" (up to 20s)…");
@@ -1215,8 +1345,8 @@ function termExec(){
 function httpMethod(method,url,body){
   return fetch(url,{method:method,credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF":PD_CSRF},body:body})
     .then(function(r){
-      if(r.status===401){handleAuthExpired();throw new Error("session expired — please log in");}
-      if(r.status===403){throw new Error("rejected (cross-origin or stale security token — reload the page)");}
+      if(r.status===401){handleAuthExpired();throw new Error("session expired: log in again to continue");}
+      if(r.status===403){throw new Error("rejected (cross-origin or stale security token, reload the page)");}
       if(!r.ok){throw new Error("HTTP "+r.status);}
       return r.text();
     });
@@ -1238,6 +1368,9 @@ function applyWifiCapability(d){
   var capable=!!d.wifiCapable;
   var ui=$("wifi-radio-ui"),note=$("wifi-no-radio"),btn=$("wifi-btn");
   if(ui)ui.style.display=capable?"":"none";
+  /* item 10: the AP-security section configures a radio that may not be
+     fitted; on such a board it reported success for absent hardware. */
+  var aps=$("ap-security-section");if(aps)aps.style.display=capable?"":"none";
   if(note)note.style.display=capable?"none":"";
   /* Relabel the toolbar button too: on a board with no radio, "WiFi" names
      something that isn't there, and the modal's remaining content is network
@@ -1260,6 +1393,10 @@ function updateRail(d){
   $("s-ip").textContent=(d.ip||"0.0.0.0")+":"+(d.port||5060);
   $("s-jacks").textContent=((d.clients||[]).length)+"/"+POOL;
   $("s-calls").textContent=(d.sessions||[]).length;
+  /* item 21: derived from the same payload fields the Calls stat reads,
+     so it appears and disappears with real state. No invented number. */
+  var bi=$("bay-idle");
+  if(bi)bi.style.display=((d.sessions||[]).length||(d.parkedCalls||[]).length)?"none":"";
   $("s-pkts").textContent=(d.packetsProcessed||0).toLocaleString();
 }
 function refreshNow(){fetchStatus();fetchCdr();toast("Refreshed","ok");}
@@ -1291,7 +1428,7 @@ window.addEventListener("resize",function(){clearTimeout(rsTimer);rsTimer=setTim
 function fetchAdminStatus(){
   return fetch("/api/admin/status",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(d){
     adminState.provisioned=!!d.provisioned;adminState.needsSetup=!!d.needsSetup;adminState.authenticated=!!d.authenticated;
-    adminState.sessionRemainingSec=d.sessionRemainingSec||0;
+    adminState.sessionRemainingSec=d.sessionRemainingSec||0;adminState.sessionExpired=false;
     renderAdminPanel();renderAdminBadge();applyAuthGating();
     if(adminState.authenticated&&!adminState.needsSetup){fetchApSecurity();fetchRegistrar();}
   }).catch(function(){});
@@ -1315,6 +1452,9 @@ function renderAdminBadge(){
     var sec=Math.max(0,adminState.sessionRemainingSec|0);
     var m=Math.floor(sec/60),s=sec%60;
     txt.textContent="SESSION: LOGGED IN \u00b7 "+(m<10?"0":"")+m+":"+(s<10?"0":"")+s;
+  }else if(adminState.sessionExpired){
+    badge.className="admin-badge expired";
+    txt.textContent="SESSION: EXPIRED";
   }else{
     badge.className="admin-badge closed";
     txt.textContent="SESSION: LOGGED OUT";
@@ -1329,7 +1469,7 @@ function applyAuthGating(){
   var on=$("ota-gate-note");if(on)on.style.display=unlocked?"none":"block";
   var of=$("ota-file");if(of)of.disabled=!unlocked;
 }
-function handleAuthExpired(){adminState.authenticated=false;adminState.sessionRemainingSec=0;renderAdminPanel();renderAdminBadge();applyAuthGating();setMsg("admin-msg","Session expired — please log in.","err");}
+function handleAuthExpired(){adminState.authenticated=false;adminState.sessionRemainingSec=0;adminState.sessionExpired=true;renderAdminPanel();renderAdminBadge();applyAuthGating();setMsg("admin-msg","Session expired. Log in again to continue.","err");toast("Session expired. Log in again to continue.","err");}
 function adminCompleteSetup(){
   var user=$("adm-setup-user").value,pass=$("adm-setup-pass").value,dtmfPin=$("adm-setup-dtmfpin").value;
   if(!user||!pass||pass.length<8){setMsg("admin-msg","Username and an 8+ character password are required.","err");return;}
@@ -1337,7 +1477,7 @@ function adminCompleteSetup(){
   if(dtmfPin)body+="&dtmfPin="+encodeURIComponent(dtmfPin);
   post("/api/admin/set-credential",body).then(function(){
     $("adm-setup-pass").value="";$("adm-setup-dtmfpin").value="";
-    setMsg("admin-msg","Setup complete.","ok");fetchAdminStatus();
+    setMsg("admin-msg","Setup complete. The admin/admin default is retired; this login now guards the panel.","ok");fetchAdminStatus();
   }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
 }
 function adminChangeCredential(){
@@ -1358,7 +1498,7 @@ function adminChangeDtmfPin(){
 }
 function parseJsonOr(t){try{return JSON.parse(t);}catch(e){return {};}}
 function renderApSecurity(d){
-  $("ap-mode").textContent=d.secure?"WPA2 (encrypted)":"Open \u2014 unencrypted";
+  $("ap-mode").textContent=d.secure?"WPA2 (encrypted)":"Open (unencrypted)";
   $("ap-secure").checked=!!d.secure;
   $("ap-psk").value=d.psk||"";
 }
@@ -1380,12 +1520,12 @@ function regenApPsk(){
   post("/api/ap-security","regenerate=1")
     .then(function(t){
       renderApSecurity(parseJsonOr(t));
-      setMsg("ap-msg","New passphrase generated \u2014 write it down before restarting the access point.","warn");
+      setMsg("ap-msg","New passphrase generated. Write it down before restarting the access point.","warn");
     }).catch(function(e){setMsg("ap-msg","Error: "+e.message,"err");});
 }
 function renderRegistrar(d){
   var mode=(d&&d.mode)||"unknown";
-  $("reg-mode-cur").textContent=(d&&d.attached===false)?"\u2014 (SIP engine not attached yet)":mode;
+  $("reg-mode-cur").textContent=(d&&d.attached===false)?"(SIP engine not attached yet)":mode;
   if(d&&d.attached!==false&&mode!=="unknown"){$("reg-mode").value=mode;}
   var body=$("reg-roster-body");
   body.innerHTML="";
@@ -1395,7 +1535,7 @@ function renderRegistrar(d){
     var td=document.createElement("td");
     td.colSpan=4;
     td.textContent=(mode==="learn")
-      ? "No phones adopted yet \u2014 register one now and it will appear here."
+      ? "No phones adopted yet. Register one now and it will appear here."
       : "No phones adopted. Switch to Learn mode to onboard them.";
     tr.appendChild(td);body.appendChild(tr);return;
   }
@@ -1467,7 +1607,7 @@ function adminLogin(){
     .then(function(r){
       $("adm-pass").value="";
       if(r.status===401){setMsg("admin-msg","Incorrect username or password.","err");return;}
-      if(r.status===429){setMsg("admin-msg","Locked — wait a minute.","err");return;}
+      if(r.status===429){setMsg("admin-msg","Locked. Wait a minute.","err");return;}
       if(!r.ok){setMsg("admin-msg","Login failed (HTTP "+r.status+").","err");return;}
       r.json().then(function(d){if(d&&d.csrf){PD_CSRF=d.csrf;}}).catch(function(){});
       setMsg("admin-msg","Logged in.","ok");toast("Admin unlocked","ok");fetchAdminStatus();
@@ -1510,11 +1650,11 @@ function otaUpload(){
     if(xhr.status===200){bar.style.width="100%";pct.textContent="100%";var info={};try{info=JSON.parse(xhr.responseText);}catch(e){}
       setMsg("ota-msg","Upload complete ("+(info.bytes||file.size)+" bytes). Reboot to apply.","ok");fetchOtaStatus();
       if(info.rebootRequired&&confirm("Firmware uploaded. Reboot now to apply?"))otaReboot(true);
-    }else if(xhr.status===401){handleAuthExpired();setMsg("ota-msg","Session expired — please log in.","err");}
+    }else if(xhr.status===401){handleAuthExpired();setMsg("ota-msg","Session expired. Log in again to continue.","err");}
     else if(xhr.status===501){setMsg("ota-msg","OTA only available on device (not host build).","err");}
     else setMsg("ota-msg","Upload failed (HTTP "+xhr.status+").","err");
   };
-  xhr.onerror=function(){otaUploading=false;applyAuthGating();setMsg("ota-msg","Upload failed — network error.","err");};
+  xhr.onerror=function(){otaUploading=false;applyAuthGating();setMsg("ota-msg","Upload failed: network error.","err");};
   xhr.send(file);
 }
 function otaReboot(skip){
@@ -1599,7 +1739,7 @@ function openTelephonyModal(){
 function tapiStatusChip(s){
   var configured=!!(s.baseUrl||s.clientId||s.secretSet||s.routeDn||s.enabled);
   if(!configured)return '<span class="chip stub">Not configured</span>';
-  if(!s.implemented)return '<span class="chip pending">Configured — not yet connected</span>';
+  if(!s.implemented)return '<span class="chip pending">Configured, not yet connected</span>';
   return s.active?'<span class="chip live">Active</span>':'<span class="chip pending">Configured</span>';
 }
 function fetchTelephonyConfig(){
@@ -1609,17 +1749,18 @@ function fetchTelephonyConfig(){
     return r.json();
   }).then(function(d){tapiSlots=d.slots||[];renderTapiSlots();selectTapiSlot(tapiSelected);}).catch(function(){});
 }
+function tapiCell(label){var td=document.createElement("td");td.setAttribute("data-label",label);return td;}
 function renderTapiSlots(){
   var body=$("tapi-slots-body");body.innerHTML="";
   var activeLabel="None (loopback default)";
   tapiSlots.forEach(function(s,i){
     if(s.active)activeLabel="Slot "+(i+1)+(s.implemented?"":" (not yet connected)");
     var tr=document.createElement("tr");
-    var tdN=document.createElement("td");tdN.textContent="Slot "+(i+1);
-    var tdS=document.createElement("td");tdS.innerHTML=tapiStatusChip(s);
-    var tdU=document.createElement("td");tdU.textContent=s.baseUrl||"—";
-    var tdR=document.createElement("td");tdR.textContent=s.routeDn||"—";
-    var tdA=document.createElement("td");
+    var tdN=tapiCell("Slot");tdN.textContent="Slot "+(i+1);
+    var tdS=tapiCell("Status");tdS.innerHTML=tapiStatusChip(s);
+    var tdU=tapiCell("Base URL");tdU.textContent=s.baseUrl||"—";
+    var tdR=tapiCell("Route DN");tdR.textContent=s.routeDn||"—";
+    var tdA=tapiCell("");
     var eb=document.createElement("button");eb.className="btn";eb.textContent="Edit";
 )html6";
 
@@ -1705,7 +1846,7 @@ function renderDidMappings(list){
   var body=$("did-table-body");body.innerHTML="";
   if(!list.length){
     var tr=document.createElement("tr");var td=document.createElement("td");
-    td.colSpan=3;td.className="note";td.textContent="No DID mappings configured.";
+    td.colSpan=3;td.className="note";td.textContent="No DID mappings configured. Add one below to route an incoming number to a jack.";
     tr.appendChild(td);body.appendChild(tr);return;
   }
   list.forEach(function(m){
@@ -1740,7 +1881,7 @@ function removeDidMapping(did){
 
 /* ════ PBX SETTINGS / MUSIC ON HOLD ════ */
 var mohUploading=false;
-function openPbxModal(){openModal("pbx-modal");fetchMohStatus();}
+function openPbxModal(){if(!gateCheck())return;openModal("pbx-modal");fetchMohStatus();}
 function fmtClock(s){s=Math.max(0,Math.round(s||0));var m=Math.floor(s/60);var r=s%60;return m+":"+(r<10?"0":"")+r;}
 function fetchMohStatus(){
   fetch("/api/moh",{credentials:"same-origin"}).then(function(r){
@@ -1752,11 +1893,11 @@ function fetchMohStatus(){
     if(!d.supported){
       /* No card in this build at all — say so plainly rather than showing an
          empty clip line the operator would read as "nothing uploaded yet". */
-      if(clip){clip.textContent="Not available — this build has no SD card support";}
+      if(clip){clip.textContent="Not available: this build has no SD card support";}
       if(lis)lis.textContent="—";
       return;
     }
-    if(clip)clip.textContent=d.loaded?("loaded — "+fmtClock(d.seconds)):"No clip on the card";
+    if(clip)clip.textContent=d.loaded?("loaded: "+fmtClock(d.seconds)):"No clip on the card";
     if(lis){
       var n=d.listeners||0;
       /* A preview is itself a listener, so name it instead of leaving the
@@ -1787,8 +1928,8 @@ function mohUpload(){
       setMsg("moh-msg","Upload complete. Reboot to load the new clip.","ok");
       fetchMohStatus();
     }
-    else if(xhr.status===401){handleAuthExpired();setMsg("moh-msg","Session expired — please log in.","err");}
-    else if(xhr.status===422){setMsg("moh-msg","Not a valid 8 kHz mono µ-law WAV — convert it with tools/gen_moh.py.","err");}
+    else if(xhr.status===401){handleAuthExpired();setMsg("moh-msg","Session expired. Log in again to continue.","err");}
+    else if(xhr.status===422){setMsg("moh-msg","Not a valid 8 kHz mono µ-law WAV. Convert it with tools/gen_moh.py.","err");}
     else if(xhr.status===413){setMsg("moh-msg","File is too large (8 MB max).","err");}
     else if(xhr.status===501){setMsg("moh-msg","No SD card on this build.","err");}
     else {
@@ -1796,7 +1937,7 @@ function mohUpload(){
       setMsg("moh-msg",info.error||("Upload failed (HTTP "+xhr.status+")."),"err");
     }
   };
-  xhr.onerror=function(){mohUploading=false;applyAuthGating();setMsg("moh-msg","Upload failed — network error.","err");};
+  xhr.onerror=function(){mohUploading=false;applyAuthGating();setMsg("moh-msg","Upload failed: network error.","err");};
   xhr.send(file);
 }
 function mohPreview(){
@@ -1806,7 +1947,7 @@ function mohPreview(){
   if(!isDialTokenSafeJs(ext)){setMsg("moh-preview-msg","Extension may contain only letters, digits, '#' and '*'.","err");return;}
   setMsg("moh-preview-msg","Ringing "+ext+"…","warn");
   post("/api/moh/preview","extension="+encodeURIComponent(ext))
-    .then(function(){setMsg("moh-preview-msg","Ringing "+ext+" — answer to listen.","ok");fetchMohStatus();})
+    .then(function(){setMsg("moh-preview-msg","Ringing "+ext+". Answer to listen.","ok");fetchMohStatus();})
     .catch(function(e){setMsg("moh-preview-msg",e.message,"err");});
 }
 function mohPreviewStop(){
@@ -1826,8 +1967,7 @@ document.addEventListener("keydown",function(e){
   else if(e.key==="F6"){e.preventDefault();openPbxModal();}
   else if(e.key==="F8"){e.preventDefault();openModal("trace-modal");}
   else if(e.key==="F9"){e.preventDefault();openWifiModal();}
-  else if(e.key==="Escape"){["jack-modal","admin-modal","wifi-modal","telephony-modal","help-modal",
-    "dialplan-modal","groups-modal","cdr-modal","trace-modal","pbx-modal"].forEach(function(id){closeModal(id);});}
+  else if(e.key==="Escape"){if(activeModal)closeModal(activeModal);}
 });
 ["adm-user","adm-pass"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminLogin();});});
 ["adm-setup-user","adm-setup-pass","adm-setup-dtmfpin"].forEach(function(id){var el=$(id);if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminCompleteSetup();});});
@@ -1857,9 +1997,9 @@ setInterval(function(){if($("pbx-modal").classList.contains("show"))fetchMohStat
      Placed last in the document purely for the 16 KB literal budget: .overlay
      is position:fixed/inset:0, so a modal renders identically wherever it
      sits in the DOM. -->
-<div class="overlay" id="pbx-modal">
+<div class="overlay" id="pbx-modal" role="dialog" aria-modal="true" aria-labelledby="pbx-title" data-gate="admin">
   <div class="modal">
-    <h3>&#9881; PBX Settings<span class="x" onclick="closeModal('pbx-modal')">&times;</span></h3>
+    <h3><span aria-hidden="true">&#9881;</span> <span id="pbx-title">PBX Settings</span><button type="button" class="x" aria-label="Close" onclick="closeModal('pbx-modal')">&times;</button></h3>
     <div class="mbody">
 
       <div class="subhead">Music on Hold</div>
@@ -1867,13 +2007,13 @@ setInterval(function(){if($("pbx-modal").classList.contains("show"))fetchMohStat
         Played to callers parked on an orbit (700&ndash;709). The clip is read off
         the SD card into PSRAM once and streamed from memory, so the card is
         never touched during a call. Every listener hears the same position in
-        the track &mdash; like a radio station rather than a per-caller player &mdash;
+        the track (like a radio station rather than a per-caller player),
         so a caller parked mid-song joins mid-song.
       </div>
       <div class="kv"><span class="k">Clip</span><span id="moh-clip">&mdash;</span></div>
       <div class="kv"><span class="k">Listening now</span><span id="moh-listeners">&mdash;</span></div>
 
-      <div class="field"><label>Replace clip</label>
+      <div class="field"><label for="moh-file">Replace clip</label>
         <input type="file" id="moh-file" accept=".wav,audio/wav,audio/wave"></div>
       <div class="note" style="margin-top:0">
         Must already be <strong>8 kHz mono &micro;-law WAV</strong>. That is the G.711
@@ -1895,7 +2035,7 @@ setInterval(function(){if($("pbx-modal").classList.contains("show"))fetchMohStat
         <code>moh</code>. Answer the phone to listen; hang up, or press Stop, to end it.
       </div>
       <div class="did-row">
-        <input type="text" id="moh-preview-ext" inputmode="numeric" placeholder="Extension (e.g. 1001)">
+        <input type="text" id="moh-preview-ext" inputmode="numeric" placeholder="Extension (e.g. 1001)" aria-label="Extension (e.g. 1001)">
         <button class="btn primary" id="moh-play-btn" onclick="mohPreview()">&#9654; Play</button>
         <button class="btn" id="moh-stop-btn" onclick="mohPreviewStop()">&#9632; Stop</button>
       </div>
@@ -1925,7 +2065,7 @@ R"html8(<!DOCTYPE html>
 <title>Pocket-Dial Email Setup</title>
 <style>
 :root{--bg:#14100C;--panel:#221B15;--panel2:#2B231C;--ink:#EAE1C8;--ink-dim:#A99A7B;
---brass:#B08D52;--brass-hi:#D4AF6A;--line:#3a2f24;--ok:#55A374;--bad:#C15C52;--warn:#E8C43D;}
+--brass:#B08D52;--brass-hi:#D4AF6A;--line:#87714A;--ok:#55A374;--bad:#D26F65;--warn:#E8C43D;}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;padding:16px}
 .wrap{max-width:640px;margin:0 auto}
@@ -1950,7 +2090,7 @@ button:disabled{opacity:.5;cursor:default}
 .actions{display:flex;gap:10px;margin-top:16px}
 .msg{margin-top:12px;padding:10px;border-radius:4px;font-size:12px;display:none;white-space:pre-wrap}
 .msg.ok{display:block;background:rgba(85,163,116,.15);color:var(--ok);border:1px solid var(--ok)}
-.msg.bad{display:block;background:rgba(193,92,82,.15);color:var(--bad);border:1px solid var(--bad)}
+.msg.bad{display:block;background:rgba(210,111,101,.07);color:var(--bad);border:1px solid var(--bad)}
 .badge{font-size:10px;padding:2px 6px;border-radius:3px;background:var(--panel2);color:var(--ink-dim)}
 .badge.set{color:var(--ok)}
 details{margin-top:10px}
