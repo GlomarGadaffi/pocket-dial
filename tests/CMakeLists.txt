@@ -121,6 +121,9 @@ add_executable(sip_parser_tests
     # SBC from being hammered (several ITSPs auto-blacklist for that).
     SipRegistrationClient_test.cpp
     ArpLookup_test.cpp
+    # Issue #282: pure Ethernet+IPv4+UDP+RTP frame-template builder for the L2
+    # TX fast path (no ESP-IDF/socket headers, host-testable byte-exact).
+    L2RtpFrame_test.cpp
     Pbx_test.cpp
     PageZone_test.cpp
     # Issue #74: broadcast/ring-group hold-resume relay. onOk()'s Connected/Held
@@ -407,6 +410,9 @@ add_executable(sip_parser_tests
     # under !ESP_PLATFORM, so it links cleanly into the host test binary and lets
     # RequestsHandler's Learn-mode path build on the desktop.
     ../src/Helpers/ArpLookup.cpp
+    # Issue #282: the L2 TX frame-template builder has no ESP-IDF/socket
+    # dependency at all (see its header), so it needs no host stub arm.
+    ../src/Helpers/L2RtpFrame.cpp
     # TimeSync: the SNTP wall clock. The formatter is pure; the SNTP client is
     # ESP-only, so the host build is PERMANENTLY unsynced — which is exactly the
     # degraded state every caller must branch on, and therefore worth exercising.
