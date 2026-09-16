@@ -15,7 +15,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: glolab-host-verify
+  # Scoped per-commit, not per-branch: a static group name meant "only the
+  # latest push's verification matters", which is fine when merges are rare
+  # but starves this job outright during a merge burst -- every push cancels
+  # the still-running previous one, so on a busy night NONE of them ever
+  # reach a conclusion (confirmed: 29/29 cancelled in a row on 2026-09-16).
+  # Per-SHA groups let each push's run queue and actually finish; cancel-in-
+  # progress only fires now for a genuine duplicate dispatch of the same SHA.
+  group: glolab-host-verify-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
