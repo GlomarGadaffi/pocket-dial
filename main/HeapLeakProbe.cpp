@@ -150,6 +150,12 @@ constexpr char TAG[] = "HeapProbe";
 // it a ~2 s dump starves the idle task into a task-WDT panic.
 constexpr size_t kLineBytes = 256;
 
+// Lines probePrintf() could not fully hand to write(). Reported in each dump
+// footer. Non-zero means output was genuinely lost on the way out of the
+// board, which is a different fault from a line never being generated -- and
+// distinguishing those two is the whole point of counting it.
+unsigned g_shortWrites = 0;
+
 __attribute__((format(printf, 1, 2)))
 void probePrintf(const char* fmt, ...)
 {
@@ -163,7 +169,23 @@ void probePrintf(const char* fmt, ...)
 	// line is truncated rather than reading past the buffer.
 	const size_t len = (static_cast<size_t>(n) < sizeof(line))
 		? static_cast<size_t>(n) : sizeof(line) - 1;
-	write(STDERR_FILENO, line, len);
+
+	// CHECK THE RETURN. write() is permitted to write fewer bytes than asked
+	// and the caller is responsible for the rest; ignoring that is a silent
+	// way to lose output, and losing output is the open anomaly this probe is
+	// currently suffering from (two of three dumps short exactly one site
+	// line, by 6 bytes once and 364 bytes once). Retry the remainder, and
+	// count anything that could not be placed so a dump can report it instead
+	// of a reader inferring it from a missing line.
+	size_t done = 0;
+	int guard = 0;
+	while (done < len && guard++ < 8)
+	{
+		const ssize_t w = write(STDERR_FILENO, line + done, len - done);
+		if (w <= 0) break;
+		done += static_cast<size_t>(w);
+	}
+	if (done < len) ++g_shortWrites;
 }
 
 // 4000 records x 40-odd bytes each, in PSRAM. Sized to comfortably outlast the
@@ -227,6 +249,38 @@ void logPerTask(uint32_t atSec)
 	params.blocks        = nullptr;      // totals only; per-block is huge
 	params.max_blocks    = 0;
 
+	// MEMSET THE WHOLE ARRAY. Setting totalsCount = 0 does NOT mean
+	// "start clean", and assuming it did produced a fake leak
+	// convincing enough that it was nearly reported as the answer to
+	// #278.
+	//
+	// heap_task_info.c:921-928 clears prepopulated entries with
+	// `for (i = 0; i < count; ++i)` where count = *params->num_totals.
+	// Passing 0 means it clears NOTHING. Then at :970-974 a task seen
+	// for the first time in a pass gets
+	// `params->totals[count].size[type] = bsize` -- assignment, but
+	// only for the ONE matching type slot.
+	//
+	// params is value-initialized, so caps[1] and mask[1] are 0 and
+	// `(region_caps & 0) == 0` matches EVERY heap -- PSRAM included.
+	// So if a task's first block in a pass comes from PSRAM, the new
+	// entry assigns size[1] and leaves size[0] holding the PREVIOUS
+	// dump's internal total. Every internal block after that does
+	// size[0] += bsize on top of the stale value.
+	//
+	// On hardware that printed one owner at 96484 / 192968 / 289452
+	// bytes and 152 / 304 / 456 blocks across three dumps: exactly
+	// 1x, 2x, 3x of the first reading in both columns. It reads as a
+	// perfectly linear leak of a fixed unit every interval. The true
+	// figure was flat 96484 B the whole time.
+	//
+	// The tell was the RATIO, not the delta: a constant addend exactly
+	// equal to the initial total is a counter being re-added, not a
+	// process allocating. The other check that would have caught it is
+	// arithmetic against the gauges -- 96 KB per 120 s against a board
+	// whose internal free falls ~7.5 KB per 120 s, and which is still
+	// alive, cannot both be true.
+	memset(totals, 0, sizeof(totals));
 	totalsCount = 0;
 	heap_caps_get_per_task_info(&params);
 
@@ -489,7 +543,8 @@ void dumpInternalRecords(uint32_t atSec)
 			if (off >= static_cast<int>(sizeof(frames)) - 1) break;
 		}
 		frames[sizeof(frames) - 1] = '\0';
-		probePrintf("HeapProbe:   site %8u B  %5u allocs by%s\n",
+		probePrintf("HeapProbe:   site %4u/%4u %8u B  %5u allocs by%s\n",
+			static_cast<unsigned>(k + 1), static_cast<unsigned>(siteCount),
 			static_cast<unsigned>(g_sites[k].bytes),
 			static_cast<unsigned>(g_sites[k].count),
 			// Explicit marker, not an empty field. A site with no call
@@ -577,10 +632,11 @@ void dumpInternalRecords(uint32_t atSec)
 	// cannot be smaller than the record count. If it is ever non-zero, the
 	// sizing invariant above has been broken and every total below
 	// under-counts, so it is stated explicitly rather than inferred.
-	probePrintf("HeapProbe: [dump t=%us] call sites: %u (records unplaced: %u%s)\n",
+	probePrintf("HeapProbe: [dump t=%us] call sites: %u (records unplaced: %u%s, short writes: %u)\n",
 		static_cast<unsigned>(atSec), static_cast<unsigned>(siteCount),
 		static_cast<unsigned>(overflow),
-		overflow ? ", TRUNCATED -- kMaxSites invariant broken" : "");
+		overflow ? ", TRUNCATED -- kMaxSites invariant broken" : "",
+		g_shortWrites);
 }
 
 void heapProbeTask(void*)
