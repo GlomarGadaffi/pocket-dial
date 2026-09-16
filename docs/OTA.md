@@ -126,7 +126,7 @@ to write, so the host cannot perform a real update (see §3.4).
 | Method & path           | Auth                                   | Behaviour |
 |-------------------------|----------------------------------------|-----------|
 | `POST /api/ota/upload`  | full admin gate (session + CSRF)       | **Streaming.** Writes the request body into the inactive slot, validates, and stages it for boot. |
-| `GET  /api/ota/status`  | none (read-only, no secrets)           | JSON: running / boot / next partition, pending-verify flag, `otaSupported`. |
+| `GET  /api/ota/status`  | none (read-only, no secrets)           | JSON: running / boot / next partition, inProgress flag, pending-verify flag, `otaSupported`. |
 | `POST /api/ota/reboot`  | full admin gate (session + CSRF)       | Reboots into the staged image (device) / no-op simulation (host). |
 
 The two mutating endpoints use the **exact same gate** as the existing mutating

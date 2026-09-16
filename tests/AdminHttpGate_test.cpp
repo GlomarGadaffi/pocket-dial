@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 #include "HttpServer.hpp"
+#include "OtaUpdater.hpp"
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
 #include "AdminAuth.hpp"
@@ -873,4 +874,51 @@ TEST(CdrDisclosure, ClientCountStaysVisibleSoEmptyIsNotAmbiguous)
 	EXPECT_NE(body.find("\"rosterVisible\":false"), std::string::npos) << body;
 
 	AdminAuth::clearCredential();
+}
+
+// ── OTA Status & Updater Lifecycle (Issue #271) ──────────────────────────────
+// Issue #271: /api/ota/status "running" is a partition label ("ota_0" or "host"),
+// which JS treated as a truthy boolean causing the panel to permanently read
+// "IN PROGRESS". The endpoint must emit a genuine boolean "inProgress": false
+// while idle, and OtaUpdater must track session lifecycle.
+TEST(OtaStatus, ReportsIdleWhenNoUploadInProgress)
+{
+	HttpServer server("127.0.0.1", 18099, nullptr);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string resp = httpGetRaw(18099, "/api/ota/status");
+	ASSERT_EQ(statusOf(resp), 200) << "/api/ota/status must return 200:\n" << resp;
+	const std::string body = bodyOf(resp);
+
+	EXPECT_NE(body.find("\"inProgress\":false"), std::string::npos)
+		<< "inProgress must be boolean false while idle:\n" << body;
+	EXPECT_NE(body.find("\"running\":\"host\""), std::string::npos)
+		<< "running partition label must be preserved:\n" << body;
+	EXPECT_NE(body.find("\"runningPartition\":\"host\""), std::string::npos)
+		<< "runningPartition alias must match running:\n" << body;
+}
+
+TEST(OtaUpdater, ProgressFlagTracksSessionLifecycle)
+{
+	EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
+	{
+		OtaUpdater updater;
+		EXPECT_TRUE(updater.begin(1024));
+		EXPECT_TRUE(OtaUpdater::isUpdateInProgress());
+		EXPECT_TRUE(updater.isInProgress());
+		updater.abort();
+		EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
+		EXPECT_FALSE(updater.isInProgress());
+	}
+	EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
+
+	{
+		OtaUpdater updater;
+		EXPECT_TRUE(updater.begin(2048));
+		EXPECT_TRUE(OtaUpdater::isUpdateInProgress());
+		EXPECT_TRUE(updater.end());
+		EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
+	}
+	EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
 }

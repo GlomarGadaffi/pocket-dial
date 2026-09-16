@@ -389,7 +389,7 @@ BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
 assert_status "TC-OTA-01: GET /api/ota/status (ungated introspection)" "200" "$HTTP_CODE" "$BODY_CONTENT"
 # On the host build the stub reports otaSupported:false; on device it is true.
 # We only assert the field is present and well-formed here.
-if [[ "$BODY_CONTENT" == *'"otaSupported"'* && "$BODY_CONTENT" == *'"running"'* ]]; then
+if [[ "$BODY_CONTENT" == *'"otaSupported"'* && "$BODY_CONTENT" == *'"running"'* && "$BODY_CONTENT" == *'"inProgress":false'* ]]; then
     echo -e "  [${GREEN}PASS${RESET}] TC-OTA-01: ota/status has otaSupported + partition fields."
     ((PASSED_TESTS++))
 else

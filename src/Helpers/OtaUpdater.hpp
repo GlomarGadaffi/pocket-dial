@@ -90,6 +90,10 @@ public:
 
 	// --- Static status helpers (no session required) ---
 
+	// True while an OTA upload/flash session is actively in progress.
+	// Thread-safe and non-blocking.
+	static bool isUpdateInProgress();
+
 	// Label of the partition the device is currently running from
 	// (e.g. "ota_0"). Host: a fixed placeholder string.
 	static std::string runningPartitionLabel();

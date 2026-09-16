@@ -691,7 +691,7 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <hr class="hr">
       <div class="subhead">&#8593; Firmware Update (OTA)</div>
       <div class="kv"><span class="k">OTA support</span><span id="ota-supported">&mdash;</span></div>
-      <div class="kv"><span class="k">Running</span><span id="ota-running">&mdash;</span></div>
+      <div class="kv"><span class="k">Update status</span><span id="ota-running">&mdash;</span></div>
       <div class="kv"><span class="k">Boot / Next</span><span id="ota-parts">&mdash;</span></div>
       <div class="msg" id="ota-state-msg"></div>
       <div class="note" id="ota-gate-note" style="display:none">Admin login required to update firmware.</div>
@@ -1637,7 +1637,7 @@ function toggleChangeDtmfPin(){var cp=$("admin-changedtmfpin");cp.style.display=
 function fetchOtaStatus(){
   return fetch("/api/ota/status",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(d){
     $("ota-supported").textContent=d.otaSupported?"YES":"NO (host build)";
-    $("ota-running").textContent=d.running?"IN PROGRESS":"idle";
+    $("ota-running").textContent=d.inProgress?"IN PROGRESS":"idle";
     $("ota-parts").textContent=(d.boot||"—")+" / "+(d.next||"—");
     var sm=$("ota-state-msg");
     if(d.pendingVerify){sm.textContent="New firmware pending verification.";sm.className="msg warn";}
