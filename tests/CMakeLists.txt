@@ -123,6 +123,12 @@ add_executable(sip_parser_tests
     # 200 OK was silently dropped instead of reaching the held leg. Drives a full
     # 999 broadcast call through connect -> hold -> resume via handle().
     BroadcastHoldResume_test.cpp
+    # Issue #263: sdp::isHold() (#255) had zero production callers -- the two
+    # non-anchor hold/resume sites (onReinvite, onUpdate) called the older
+    # direction-only getSdpDirection() instead, missing the legacy RFC 2543
+    # c=0.0.0.0 hold signal entirely. The anchor site's #263 coverage lives in
+    # AnchorRouting_test.cpp, beside its existing #218 hold/resume tests.
+    HoldDetection_test.cpp
     # Issue #128: blind transfer's onRefer() tore down the transferor's ORIGINAL
     # session (endCall(), pure local bookkeeping) without ever sending the
     # dropped party a BYE on the wire. Drives a direct call through connect,

@@ -208,6 +208,27 @@ int SipSdpMessage::getRtpPort() const
 	return extractRtpPort(getMedia());
 }
 
+bool SipSdpMessage::isHoldOffer() const
+{
+	// #253: the section a call site means must be picked explicitly, never
+	// implied by index 0. The first AUDIO section is the one hold applies to
+	// here; fall back to index 0 (session-level direction/connection only,
+	// since effectiveDirection()/effectiveConnection() both guard mediaIndex
+	// against nMedia) when the offer has no audio section at all -- a body
+	// that fails to parse at all lands here too, with nMedia == 0.
+	const sdp::Session& s = ensureParsed();
+	unsigned audioSection = 0;
+	for (uint8_t i = 0; i < s.nMedia; ++i)
+	{
+		if (sdp::view(getBody(), s.media[i].typeName) == "audio")
+		{
+			audioSection = i;
+			break;
+		}
+	}
+	return sdp::isHold(s, getBody(), audioSection);
+}
+
 void SipSdpMessage::setMedia(std::string value)
 {
 	// Replace the first m= line, using the model to find it instead of
