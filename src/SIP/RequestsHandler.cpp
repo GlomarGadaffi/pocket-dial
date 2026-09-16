@@ -335,7 +335,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 			});
 		}
 		_anchorClient->registerAudioRxCallback(
-			[this](const std::string& participantId, const int16_t* samples, size_t count)
+			[this](std::string_view participantId, const int16_t* samples, size_t count)
 			{
 				for (auto& b : _mediaBridges)
 				{
@@ -2736,6 +2736,22 @@ void RequestsHandler::enqueueVoicemailFlush(int slot)
 	}
 }
 
+// Issue #284: RtpReceiver::DtmfSink trampoline for a voicemail retrieval leg
+// -- see VmDtmfCtx's doc comment in the header. "Deaf during I/O", not
+// "newest wins" (Fable-Low review): only stores a digit while no SD job is
+// in flight for this slot, so a caller who presses a key mid-fetch must
+// press again once the next message actually starts -- simpler and more
+// honest than remembering exactly one digit whose identity would depend on
+// arrival timing.
+void RequestsHandler::vmDtmfSinkTrampoline(void* ctx, char digit, uint16_t /*durationMs*/)
+{
+	auto* c = static_cast<VmDtmfCtx*>(ctx);
+	if (c->jobState->load(std::memory_order_acquire) == VmSdJobState::Idle)
+	{
+		c->pendingDigit->store(digit, std::memory_order_release);
+	}
+}
+
 void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>& invite,
 	const std::shared_ptr<SipClient>& src)
 {
@@ -2804,18 +2820,12 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 	// (added alongside this slice) for why SIP INFO must never reach this
 	// leg's digits into the star-code parser instead.
 	//
-	// "Deaf during I/O", not "newest wins" (Fable-Low review): only stores
-	// a digit while no SD job is in flight for this slot, so a caller who
-	// presses a key mid-fetch must press again once the next message
-	// actually starts -- simpler and more honest than remembering exactly
-	// one digit whose identity would depend on arrival timing.
+	// Issue #284: DtmfSink is a raw function pointer + void* ctx now, so the
+	// per-slot state vmDtmfSinkTrampoline() needs is reached via _vmDtmfCtx
+	// rather than a [this, slot] capture -- see VmDtmfCtx's doc comment.
+	_vmDtmfCtx[slot] = VmDtmfCtx{ &_vmSdJobState[slot], &_vmPendingDigit[slot] };
 	_vmRtpReceivers[slot].setDtmfPayloadType(invite->getTelephoneEventPayloadType(),
-		[this, slot](char digit, uint16_t /*durationMs*/) {
-			if (_vmSdJobState[slot].load(std::memory_order_acquire) == VmSdJobState::Idle)
-			{
-				_vmPendingDigit[slot].store(digit, std::memory_order_release);
-			}
-		});
+		&RequestsHandler::vmDtmfSinkTrampoline, &_vmDtmfCtx[slot]);
 
 	if (!_vmRtpSenders[slot].start(destIp, destPort, callID,
 		[this, slot](uint8_t* outUlaw, size_t count) {

@@ -140,12 +140,13 @@ TEST(MediaBridge, AnchorAudioReachesPlayoutBufferThroughRxFanout) {
 	// Same pacer-thread hazard as above (issue #135).
 	ASSERT_TRUE(f.sender.stop("call-1"));
 
-	f.anchor.registerAudioRxCallback([&f](const std::string& participantId,
+	// #284: AudioRxCallback's participant id is now a string_view, so this
+	// mirrors RequestsHandler's actual fan-out (RequestsHandler.cpp:337-344)
+	// exactly -- feedRx() itself is the participant-match gate, not a
+	// separate isFor() check the production wiring never makes either.
+	f.anchor.registerAudioRxCallback([&f](std::string_view participantId,
 	                                       const int16_t* samples, size_t count) {
-		if (f.bridge.isFor(participantId))
-		{
-			f.bridge.feedRx(participantId, samples, count);
-		}
+		f.bridge.feedRx(participantId, samples, count);
 	});
 
 	const int16_t input[] = {10, 20, 30, 40};
@@ -174,12 +175,9 @@ namespace
 	// bridge (see the constructor's registerAudioRxCallback wiring).
 	void wireLoopbackEcho(Fixture& f)
 	{
-		f.anchor.registerAudioRxCallback([&f](const std::string& participantId,
+		f.anchor.registerAudioRxCallback([&f](std::string_view participantId,
 		                                       const int16_t* samples, size_t count) {
-			if (f.bridge.isFor(participantId))
-			{
-				f.bridge.feedRx(participantId, samples, count);
-			}
+			f.bridge.feedRx(participantId, samples, count);
 		});
 	}
 

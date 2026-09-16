@@ -86,7 +86,7 @@ TEST(LoopbackAnchorClient, WriteAudioLoopsBackThroughCallback) {
 
     std::vector<int16_t> received;
     std::atomic<bool> gotAudio{false};
-    client.registerAudioRxCallback([&](const std::string& /*id*/, const int16_t* s, size_t n) {
+    client.registerAudioRxCallback([&](std::string_view /*id*/, const int16_t* s, size_t n) {
         received.assign(s, s + n);
         gotAudio = true;
     });

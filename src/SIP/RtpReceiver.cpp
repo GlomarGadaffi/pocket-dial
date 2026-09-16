@@ -180,7 +180,7 @@ char RtpReceiver::dtmfEventToChar(uint8_t event)
 	return '\0';
 }
 
-bool RtpReceiver::setDtmfPayloadType(uint8_t pt, DtmfSink sink)
+bool RtpReceiver::setDtmfPayloadType(uint8_t pt, DtmfSink sink, void* ctx)
 {
 	// Refuse to shadow audio. PT 0 is PCMU and is matched first in the receive
 	// loop anyway, so accepting it here would silently do nothing — better to say
@@ -189,13 +189,14 @@ bool RtpReceiver::setDtmfPayloadType(uint8_t pt, DtmfSink sink)
 
 	{
 		std::lock_guard<std::mutex> lk(_slotMutex);
-		_dtmfSink = std::move(sink);
+		_dtmfSink = sink;
+		_dtmfSinkCtx = ctx;
 	}
 	_dtmfPt.store(pt, std::memory_order_release);
 	return true;
 }
 
-bool RtpReceiver::setRawSink(RawSink sink)
+bool RtpReceiver::setRawSink(RawSink sink, void* ctx)
 {
 	std::lock_guard<std::mutex> lock(_slotMutex);
 	// NOT hasAnyConsumerOrPeerLocked(), despite the identical shape. That
@@ -210,8 +211,9 @@ bool RtpReceiver::setRawSink(RawSink sink)
 	}
 	// Publish the flag from inside the lock so the receive task can never see
 	// armed==true against a sink that has not been stored yet.
-	_rawArmed.store(static_cast<bool>(sink), std::memory_order_release);
-	_rawSink = std::move(sink);
+	_rawArmed.store(sink != nullptr, std::memory_order_release);
+	_rawSink = sink;
+	_rawSinkCtx = ctx;
 	return true;
 }
 
@@ -224,11 +226,14 @@ bool RtpReceiver::dispatchRaw(const RtpPacket& pkt)
 
 	// Copy the handle under the lock and invoke outside it -- same discipline as
 	// the audio path, so a slow relay egress never stalls a stop()/start() on
-	// the SIP thread (CONTRIBUTING_FIRMWARE rule 3).
+	// the SIP thread (CONTRIBUTING_FIRMWARE rule 3). A trivial pointer-pair
+	// copy now (#284), not a std::function copy.
 	RawSink sink;
+	void*   ctx;
 	{
 		std::lock_guard<std::mutex> lock(_slotMutex);
 		sink = _rawSink;
+		ctx  = _rawSinkCtx;
 	}
 	if (!sink)
 	{
@@ -236,7 +241,7 @@ bool RtpReceiver::dispatchRaw(const RtpPacket& pkt)
 		// unclaimed rather than swallowing it, so the normal path still gets it.
 		return false;
 	}
-	sink(pkt);
+	sink(ctx, pkt);
 	return true;
 }
 
@@ -387,14 +392,16 @@ bool RtpReceiver::dispatchDtmf(const RtpPacket& pkt)
 	_haveLastDtmf = true;
 
 	DtmfSink dtmfSink;
+	void*    dtmfCtx;
 	{
 		std::lock_guard<std::mutex> lk(_slotMutex);
 		dtmfSink = _dtmfSink;
+		dtmfCtx  = _dtmfSinkCtx;
 	}
 	if (dtmfSink)
 	{
 		// duration is in 8 kHz units -> ms.
-		dtmfSink(digit, static_cast<uint16_t>(ev.duration / 8));
+		dtmfSink(dtmfCtx, digit, static_cast<uint16_t>(ev.duration / 8));
 	}
 	return true;
 }
@@ -440,7 +447,9 @@ void RtpReceiver::clearSlotLocked()
 {
 	_sink = nullptr;
 	_dtmfSink = nullptr;
+	_dtmfSinkCtx = nullptr;
 	_rawSink = nullptr;
+	_rawSinkCtx = nullptr;
 	_rawArmed.store(false, std::memory_order_release);
 	// The peer goes with the slot. A pooled receiver handed to a new call must
 	// not keep forwarding into the PREVIOUS call's far end.

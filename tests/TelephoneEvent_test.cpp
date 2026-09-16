@@ -151,7 +151,7 @@ TEST(TelephoneEvent, RefusesToArmOnThePcmuPayloadType)
     // than to leave the caller believing DTMF is armed.
     RtpReceiver rx;
     EXPECT_FALSE(rx.setDtmfPayloadType(RtpReceiver::PAYLOAD_TYPE_PCMU,
-                                       [](char, uint16_t) {}));
+                                       [](void*, char, uint16_t) {}));
 }
 
 TEST(TelephoneEvent, ArmsOnADynamicPayloadType)
@@ -159,9 +159,9 @@ TEST(TelephoneEvent, ArmsOnADynamicPayloadType)
     RtpReceiver rx;
     // 101 is the common choice but the value is negotiated, not fixed -- the API
     // must accept whatever the peer advertised.
-    EXPECT_TRUE(rx.setDtmfPayloadType(101, [](char, uint16_t) {}));
-    EXPECT_TRUE(rx.setDtmfPayloadType(96,  [](char, uint16_t) {}));
-    EXPECT_TRUE(rx.setDtmfPayloadType(127, [](char, uint16_t) {}));
+    EXPECT_TRUE(rx.setDtmfPayloadType(101, [](void*, char, uint16_t) {}));
+    EXPECT_TRUE(rx.setDtmfPayloadType(96,  [](void*, char, uint16_t) {}));
+    EXPECT_TRUE(rx.setDtmfPayloadType(127, [](void*, char, uint16_t) {}));
     // Disarming is legal and is how a call teardown releases the sink.
     EXPECT_TRUE(rx.setDtmfPayloadType(RtpReceiver::kDtmfPayloadTypeUnset,
                                       nullptr));

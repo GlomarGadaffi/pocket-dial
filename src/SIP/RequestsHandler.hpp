@@ -1572,6 +1572,24 @@ private:
 	// timing relative to the job.
 	std::atomic<char> _vmPendingDigit[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
 
+	// Issue #284: RtpReceiver::DtmfSink is a raw function pointer + void* ctx,
+	// not a std::function, so the retrieval leg's digit sink cannot capture
+	// `this` and `slot` in a closure -- ctx points at one of these instead,
+	// populated once per answer in answerVoicemailRetrieval() (the two member
+	// arrays above never move, so the pointers stay valid for the leg's whole
+	// life).
+	struct VmDtmfCtx
+	{
+		std::atomic<VmSdJobState>* jobState = nullptr;
+		std::atomic<char>*         pendingDigit = nullptr;
+	};
+	VmDtmfCtx _vmDtmfCtx[POCKETDIAL_MAX_VOICEMAIL_LEGS];
+
+	// The RtpReceiver::DtmfSink trampoline itself -- see VmDtmfCtx above.
+	// "Deaf during I/O", not "newest wins" (Fable-Low review): only stores a
+	// digit while no SD job is in flight for this slot.
+	static void vmDtmfSinkTrampoline(void* ctx, char digit, uint16_t durationMs);
+
 	// The pure per-slot menu state machine (VoicemailMenu.hpp) driving a
 	// Retrieval leg. A Deposit leg never touches this.
 	VoicemailMenu _vmMenus[POCKETDIAL_MAX_VOICEMAIL_LEGS];
