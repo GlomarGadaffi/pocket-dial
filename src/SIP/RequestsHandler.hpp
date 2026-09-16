@@ -883,6 +883,16 @@ private:
 	// message-pool/session-pool exhaustion. Caller holds _mutex.
 	void answerVoicemailDeposit(const std::shared_ptr<SipMessage>& invite,
 		const std::shared_ptr<SipClient>& src, const std::string& extension);
+	// Shared by answerVoicemailDeposit() and answerVoicemailRetrieval(): the
+	// RTP pair's isActive() is the ground truth for "in use" regardless of
+	// VoicemailLeg's own state (see answerVoicemailDeposit()'s call site for
+	// why leg state alone was wrong), and _vmFlushBusy must ALSO be clear --
+	// found in review (Fable-Low): a slot whose deposit just hung up looks
+	// RTP-free immediately, but its staging buffer may still be mid-fwrite
+	// on the writer task; claiming it before that finishes corrupts the
+	// PREVIOUS message's file, not anything belonging to the new call.
+	// Returns -1 if every leg is busy either way.
+	int findFreeVoicemailSlot() const;
 	// Stop the leg's RTP receiver/sender and return it to Idle. Called from
 	// endCall()'s voicemail safety net, covering every teardown path.
 	void releaseVoicemailLeg(int slot, const std::string& callId);
@@ -908,7 +918,15 @@ public:
 	// with no writer task needed.
 	void drainVoicemailFlush(vmarchive::Sink& sink)
 	{
-		vmarchive::drainAll(_vmFlushQueue, sink, _vmStagingBufs);
+		vmarchive::drainAll(_vmFlushQueue, sink, _vmStagingBufs,
+			[this](const vmarchive::QueuedRecording& rec) {
+				if (rec.stagingSlot >= 0 && rec.stagingSlot < static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS))
+				{
+					// See _vmFlushBusy's doc comment: this is the one moment
+					// the staging buffer is provably safe to reuse again.
+					_vmFlushBusy[rec.stagingSlot].store(false, std::memory_order_release);
+				}
+			});
 	}
 	size_t voicemailFlushQueueDepthForTest() const { return _vmFlushQueue.size(); }
 	// Test-only seam, same reasoning as RtpReceiver::dispatchDtmf() being
@@ -1302,6 +1320,24 @@ private:
 	// QueuedRecording::sequence doc comment).
 	vmarchive::WriterQueue _vmFlushQueue{POCKETDIAL_MAX_VOICEMAIL_LEGS};
 	uint64_t _vmFlushSequence = 0;
+
+	// Found in review (Fable-Low, during the retrieval slice's design pass):
+	// the comment above describes "at most one pending flush per leg" as an
+	// invariant, but nothing enforced it. enqueueVoicemailFlush() copies a
+	// finished recording into _vmStagingBufs[slot] and pushes a job for the
+	// writer task, but releaseVoicemailLeg() (called right after, in
+	// endCall()) frees the slot immediately -- _vmRtpReceivers[slot] goes
+	// inactive before the writer task has necessarily even started reading
+	// _vmStagingBufs[slot], let alone finished. A new deposit landing on
+	// that same slot before the drain completes would memcpy its OWN
+	// recording into the SAME staging buffer the writer is still mid-fwrite
+	// from, corrupting or torn-mixing the FIRST message's file on SD --
+	// silently, no error anywhere. This flag closes that: true from the
+	// moment a flush job is actually queued for a slot until
+	// vmarchive::drainAll()'s afterWrite callback confirms sink.write() has
+	// returned for it (see drainVoicemailFlush() below) -- i.e. exactly the
+	// window findFreeVoicemailSlot() must refuse to reuse the slot in.
+	std::atomic<bool> _vmFlushBusy[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
 
 	// System deposit greeting: loaded once at boot from a fixed SD path,
 	// PSRAM-resident, same "why the SD card stays off the media path" and

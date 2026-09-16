@@ -2483,6 +2483,19 @@ void RequestsHandler::loadVoicemailGreeting()
 	queueLog("Voicemail: greeting loaded (" + std::to_string(got) + " bytes)");
 }
 
+int RequestsHandler::findFreeVoicemailSlot() const
+{
+	for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
+	{
+		if (!_vmRtpReceivers[i].isActive() &&
+			!_vmFlushBusy[i].load(std::memory_order_acquire))
+		{
+			return static_cast<int>(i);
+		}
+	}
+	return -1;
+}
+
 void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& invite,
 	const std::shared_ptr<SipClient>& src, const std::string& extension)
 {
@@ -2512,22 +2525,8 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		return;
 	}
 
-	// Find a free leg. Scan the RTP RECEIVER's own active state, not
-	// _vmLegs[i].isIdle() -- found in review: this slice wires the real
-	// RtpReceiver/RtpSender pair and answers correctly, but does not yet call
-	// _vmLegs[i].startRecording() with a real PSRAM buffer (that lands in a
-	// follow-up commit), so the leg stays Idle after being claimed here.
-	// Scanning on leg state meant every deposit picked slot 0: a second
-	// concurrent deposit would then call _vmRtpReceivers[0].start() on an
-	// already-active receiver, fail the single-stream cap, and 500 instead of
-	// claiming slot 1. The RTP pair's isActive() is the actual ground truth
-	// for "is this slot in use" regardless of which VoicemailLeg state the
-	// call happens to be in.
-	int slot = -1;
-	for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
-	{
-		if (!_vmRtpReceivers[i].isActive()) { slot = static_cast<int>(i); break; }
-	}
+	// Find a free leg -- see findFreeVoicemailSlot()'s doc comment.
+	const int slot = findFreeVoicemailSlot();
 	if (slot < 0)
 	{
 		refuse("SIP/2.0 486 Busy Here", "every voicemail leg busy, rejected deposit");
@@ -2680,7 +2679,14 @@ void RequestsHandler::enqueueVoicemailFlush(int slot)
 	rec.sequence = ++_vmFlushSequence;
 	rec.length = length;
 
-	if (!_vmFlushQueue.push(rec))
+	if (_vmFlushQueue.push(rec))
+	{
+		// Set ONLY on a successful push -- see _vmFlushBusy's doc comment.
+		// A dropped (queue-full) message has nothing left for the writer to
+		// drain, so nothing will ever clear this again if it were set here.
+		_vmFlushBusy[slot].store(true, std::memory_order_release);
+	}
+	else
 	{
 		queueLog("Voicemail: flush queue full, message from " + ext + " dropped", true);
 	}

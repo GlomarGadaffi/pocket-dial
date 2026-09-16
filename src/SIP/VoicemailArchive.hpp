@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string_view>
 #include <vector>
@@ -111,7 +112,18 @@ private:
 // each recording's audio from `stagingBufs[rec.stagingSlot]`. This is the
 // entire body of the ESP writer task's loop and what
 // VoicemailArchive_test.cpp calls directly against a FakeSink.
-void drainAll(WriterQueue& queue, Sink& sink, uint8_t* const* stagingBufs);
+//
+// `afterWrite`, if set, is called once per record immediately after
+// `sink.write()` RETURNS for it -- i.e. once that staging buffer is
+// provably safe to overwrite again. This exists so a caller (RequestsHandler)
+// can clear its own "this staging slot is still in flight" bookkeeping at
+// the one moment that's actually true, rather than at enqueue time or at
+// pop time, either of which would let a new deposit reuse (and silently
+// corrupt) a staging buffer the write to SD hadn't actually finished
+// reading from yet. This module stays ignorant of what that bookkeeping
+// is -- it only promises the callback fires after the read, never before.
+void drainAll(WriterQueue& queue, Sink& sink, uint8_t* const* stagingBufs,
+	const std::function<void(const QueuedRecording&)>& afterWrite = nullptr);
 
 #if defined(PD_ETH_HAS_SD)
 // The production Sink: writes /sdcard/vm/<extension>/<name>.wav.tmp, closes

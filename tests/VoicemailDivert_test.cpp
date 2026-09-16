@@ -669,3 +669,79 @@ TEST(VoicemailDivert, ExpiredVoicemailDeadlineByesAndTearsDownTheSession)
 		<< "an expired voicemail deadline must BYE the caller, not just silently drop the session";
 	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value());
 }
+
+// Found in review (Fable-Low, during the retrieval slice's design pass): a
+// slot whose deposit just hung up looks RTP-free immediately, but its
+// staging buffer may still be mid-fwrite on the (not-yet-run, in a host
+// test) writer task. Before the fix this test pins, a THIRD deposit could
+// have reused either slot and corrupted the FIRST message still awaiting
+// its flush. Assumes POCKETDIAL_MAX_VOICEMAIL_LEGS == 2 (current default).
+TEST(VoicemailDivert, ASecondSlotWithAPendingFlushCannotBeReusedByAThirdDeposit)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.46.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("801", "192.168.46.11", "reg-fa1"));
+	handler.handle(makeRegister("811", "192.168.46.21", "reg-fa2"));
+	handler.handle(makeRegister("802", "192.168.46.12", "reg-fb1"));
+	handler.handle(makeRegister("812", "192.168.46.22", "reg-fb2"));
+	handler.handle(makeRegister("803", "192.168.46.13", "reg-fc1"));
+	handler.handle(makeRegister("813", "192.168.46.23", "reg-fc2"));
+	handler.setVoicemail("801", true);
+	handler.setVoicemail("802", true);
+	handler.setVoicemail("803", true);
+
+	// Deposit A: 811 -> 801.
+	handler.handle(makeInvite("811", "801", "192.168.46.21", "vm-flush-a", "z9hG4bKvmfa"));
+	handler.handle(makeBusy("811", "801", "192.168.46.11", "vm-flush-a", "z9hG4bKvmfa"));
+	auto sessA = handler.getSession("Call-ID: vm-flush-a");
+	ASSERT_TRUE(sessA.has_value());
+	const int slotA = sessA.value()->getVoicemailLegSlot();
+	ASSERT_GE(slotA, 0);
+	const uint8_t audioA[] = {1, 2, 3};
+	ASSERT_TRUE(handler.feedVoicemailAudioForTest(slotA, audioA, sizeof(audioA)));
+	handler.forceDisconnect("811");   // queues A's flush, marks slot A busy
+
+	// Deposit B: 812 -> 802 -- must land on the OTHER slot, since A's is
+	// still awaiting its flush.
+	handler.handle(makeInvite("812", "802", "192.168.46.22", "vm-flush-b", "z9hG4bKvmfb"));
+	handler.handle(makeBusy("812", "802", "192.168.46.12", "vm-flush-b", "z9hG4bKvmfb"));
+	auto sessB = handler.getSession("Call-ID: vm-flush-b");
+	ASSERT_TRUE(sessB.has_value());
+	const int slotB = sessB.value()->getVoicemailLegSlot();
+	ASSERT_GE(slotB, 0);
+	ASSERT_NE(slotB, slotA) << "slot A's flush is still pending, must not be reused yet";
+	const uint8_t audioB[] = {4, 5, 6, 7};
+	ASSERT_TRUE(handler.feedVoicemailAudioForTest(slotB, audioB, sizeof(audioB)));
+	handler.forceDisconnect("812");   // queues B's flush, marks slot B busy
+
+	// Both slots now look RTP-free but each has a flush still pending -- a
+	// THIRD deposit must be refused outright, not silently corrupt either
+	// staging buffer.
+	sent.clear();
+	handler.handle(makeInvite("813", "803", "192.168.46.23", "vm-flush-c", "z9hG4bKvmfc"));
+	handler.handle(makeBusy("813", "803", "192.168.46.13", "vm-flush-c", "z9hG4bKvmfc"));
+	EXPECT_FALSE(handler.getSession("Call-ID: vm-flush-c").has_value())
+		<< "must refuse -- every slot's staging buffer is still awaiting its flush";
+	const sockaddr_in callerCAddr = addrFor("192.168.46.23");
+	EXPECT_FALSE(findSentTo(sent, callerCAddr, "486 Busy Here").empty())
+		<< "the caller must see a real refusal, not silence";
+
+	// Drain both pending flushes -- NOW a slot is safe to reuse.
+	FakeSink sink;
+	handler.drainVoicemailFlush(sink);
+	ASSERT_EQ(sink.calls.size(), 2u);
+	// FIFO -- A was queued first.
+	EXPECT_EQ(sink.calls[0].mulaw, std::vector<uint8_t>({1, 2, 3}))
+		<< "A's bytes must be intact -- exactly what the pre-fix bug could have corrupted";
+	EXPECT_EQ(sink.calls[1].mulaw, std::vector<uint8_t>({4, 5, 6, 7}));
+
+	sent.clear();
+	handler.handle(makeInvite("813", "803", "192.168.46.23", "vm-flush-c2", "z9hG4bKvmfc2"));
+	handler.handle(makeBusy("813", "803", "192.168.46.13", "vm-flush-c2", "z9hG4bKvmfc2"));
+	EXPECT_TRUE(handler.getSession("Call-ID: vm-flush-c2").has_value())
+		<< "both staging buffers are drained now -- a deposit must succeed";
+}

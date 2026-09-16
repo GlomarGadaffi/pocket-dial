@@ -102,13 +102,15 @@ void WriterQueue::clear()
 	_count = 0;
 }
 
-void drainAll(WriterQueue& queue, Sink& sink, uint8_t* const* stagingBufs)
+void drainAll(WriterQueue& queue, Sink& sink, uint8_t* const* stagingBufs,
+	const std::function<void(const QueuedRecording&)>& afterWrite)
 {
 	QueuedRecording rec;
 	while (queue.pop(rec))
 	{
 		if (rec.stagingSlot < 0) continue;   // defensive: never a valid job
 		sink.write(rec, stagingBufs[rec.stagingSlot]);
+		if (afterWrite) afterWrite(rec);
 	}
 }
 
