@@ -1589,7 +1589,7 @@ function factoryReset(){
    pseudo-AORs the engine originates as. This map is a COURTESY: every gate it
    fronts is enforced again in HttpServer.cpp, which is the authority. Keep the
    two in step, but never rely on this one. */
-var PD_RESERVED_EXT={"777":1,"999":1,"555":1,"888":1,"440":1,"pbx":1,"moh":1,"server":1};
+var PD_RESERVED_EXT={"777":1,"999":1,"555":1,"888":1,"440":1,"796":1,"pbx":1,"moh":1,"server":1};
 function isDialTokenSafeJs(s){return !!s&&/^[A-Za-z0-9#*]+$/.test(s);}
 function openTelephonyModal(){
   if(!gateCheck())return;

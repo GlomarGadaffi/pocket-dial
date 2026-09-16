@@ -2037,7 +2037,7 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 		             "{\"error\":\"pattern may contain only letters, digits, '#' and '*'\"}");
 		return;
 	}
-	if (pattern == "777" || pattern == "999" || pattern == "440" || pattern == "555")
+	if (pbx::isReservedExtension(pattern))
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot use a reserved extension as a dial-plan pattern\"}");
@@ -2502,8 +2502,7 @@ void HttpServer::sendApiDidMappingSet(int sock, const std::string& body)
 		             "{\"error\":\"extension may contain only letters, digits, '#' and '*'\"}");
 		return;
 	}
-	if (extension == "777" || extension == "999" || extension == "555" ||
-	    extension == "888" || extension == "440")
+	if (pbx::isReservedExtension(extension))
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot map a DID to a virtual/reserved extension\"}");

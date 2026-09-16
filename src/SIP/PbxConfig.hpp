@@ -223,10 +223,18 @@ namespace pbx
 	// therefore call THIS helper now, and the three lists that had drifted
 	// apart (forwards and ring groups omitted 440; setDialRule omitted 888;
 	// none covered 911/933) are one list again.
+	// Issue #246: "796" joins the set as the voicemail retrieval dial-in
+	// pilot. Picked only after checking it against ALL THREE reserved
+	// ranges this codebase has (this literal set, the 700-709 park orbits,
+	// and the 980-989 page zones) -- "700" was the first candidate and
+	// collided with park orbits, caught empirically by a test that dialed
+	// it and got "parked" instead of "ringing" (voicemail's own internal
+	// dummy-dest label "700" is a different thing: it's never dialed, just
+	// a session's bookkeeping identity, so that one is fine as-is).
 	inline bool isReservedExtension(std::string_view ext)
 	{
 		return ext == "777" || ext == "999" || ext == "888" || ext == "555" ||
-			ext == "440" || ext == "911" || ext == "933";
+			ext == "440" || ext == "911" || ext == "933" || ext == "796";
 	}
 
 	// True iff `aor` "looks like a direct PSTN number" rather than an internal
