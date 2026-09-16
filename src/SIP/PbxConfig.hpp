@@ -16,6 +16,7 @@
 // the unit tests can exercise the routing logic without the full RequestsHandler.
 
 #include <chrono>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -48,7 +49,7 @@ namespace pbx
 	inline constexpr const char* kVoicemailForwardSentinel = "vm:";
 
 	// How a ring group fans an inbound INVITE out to its members.
-	enum class GroupMode
+	enum class GroupMode : uint8_t
 	{
 		RingAll,   // fork to every member at once; first to answer wins (like 999)
 		Hunt       // ring members one at a time with a per-member timeout

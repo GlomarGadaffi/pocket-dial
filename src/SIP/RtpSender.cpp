@@ -422,14 +422,14 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	dest.sin_port   = htons(destPort);
 	if (inet_pton(AF_INET, destIp.c_str(), &dest.sin_addr) != 1)
 	{
-		std::cerr << "[RtpSender] Bad destination IP '" << destIp << "'" << std::endl;
+		std::cerr << "[RtpSender] Bad destination IP '" << destIp << "'" << '\n';
 		return false;
 	}
 
 	int sock = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sock < 0)
 	{
-		std::cerr << "[RtpSender] socket() failed" << std::endl;
+		std::cerr << "[RtpSender] socket() failed" << '\n';
 		return false;
 	}
 
@@ -443,7 +443,7 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	{
 		// Non-fatal: an ephemeral source port still delivers media to the caller.
 		std::cerr << "[RtpSender] bind(" << _serverRtpPort
-			<< ") failed; using ephemeral source port" << std::endl;
+			<< ") failed; using ephemeral source port" << '\n';
 	}
 
 	_sock     = sock;

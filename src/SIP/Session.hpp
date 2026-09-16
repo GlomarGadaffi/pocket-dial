@@ -2,6 +2,7 @@
 #define SESSION_HPP
 
 // Session.hpp: Issue #28 resolved.
+#include <cstdint>
 #include <memory>
 #include <chrono>
 #include <vector>
@@ -13,7 +14,7 @@ class Session
 {
 public:
 
-	enum class State
+	enum class State : uint8_t
 	{
 		Invited,
 		Busy,
@@ -89,7 +90,7 @@ public:
 	// menu state machine decides what PlaybackDone means for it instead
 	// (advance to the next prompt, wait for a keypress, etc.) -- the sweep
 	// must never race that decision.
-	enum class VoicemailPurpose { Deposit, Retrieval };
+	enum class VoicemailPurpose : uint8_t { Deposit, Retrieval };
 	VoicemailPurpose getVoicemailPurpose() const { return _voicemailPurpose; }
 	void setVoicemailPurpose(VoicemailPurpose p) { _voicemailPurpose = p; }
 

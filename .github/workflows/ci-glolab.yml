@@ -99,7 +99,15 @@ jobs:
                        "$f" 2>&1 | tee -a clang-tidy.log || true
           done < <(find src -name '*.cpp' | sort)
           COUNT=$(grep -cE "warning:|error:" clang-tidy.log || true)
-          echo "clang-tidy total diagnostics: ${COUNT} (pre-existing baseline ~59)"
+          # --header-filter reprints every shared-header finding once per
+          # including .cpp file, so COUNT is inflated by that duplication --
+          # see ci.yml's matching step for the full explanation. UNIQUE
+          # collapses exact-duplicate lines to show the real number of
+          # distinct findings. This step is purely informational (no gate),
+          # so the stale "~59" hint is dropped -- ci.yml's pinned clang-tidy
+          # step carries the real measured baseline (see #254).
+          UNIQUE=$(grep -E "warning:|error:" clang-tidy.log | sort -u | wc -l | tr -d ' ')
+          echo "clang-tidy total diagnostics: ${COUNT} (${UNIQUE} distinct, see ci.yml for the pinned/baselined version)"
 
       - name: Run Unit Test Suite (GoogleTest via CTest)
         run: |

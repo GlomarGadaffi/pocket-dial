@@ -9,6 +9,7 @@
 #include <WinSock2.h>
 #endif
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -81,7 +82,7 @@ struct PbxEnv
 		const sockaddr_in& destAddr, const std::string& callId,
 		const std::string& fromHeader, const std::string& toHeader) = 0;
 	// Which end of a dialog an extension sits on.
-	enum class DialogRole { Caller, Callee };
+	enum class DialogRole : uint8_t { Caller, Callee };
 	// Visit every live session `aor` is a party to, as {Call-ID, session, role}.
 	// Used by the BLF machine to compute an RFC 4235 dialog state. A query rather
 	// than a reference to the session table: every other method here is a

@@ -27,7 +27,7 @@ public:
 		// CallEvent is constructed at its call sites (LoopbackAnchorClient.cpp)
 		// with all four fields brace-initialised.
 		// cppcheck-suppress uninitMemberVarNoCtor
-		enum Type { Ringing, Answered, Dropped, Dtmf, Incoming } type;
+		enum Type : uint8_t { Ringing, Answered, Dropped, Dtmf, Incoming } type;
 		std::string participantId;
 		std::string dtmfDigit;
 		std::string callerId;

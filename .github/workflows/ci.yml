@@ -254,13 +254,28 @@ jobs:
           # cppcheck already excludes it for exactly this reason.
           done < <(find src -name '*.cpp' ! -path 'src/SIP/Sdp.cpp' | sort)
           COUNT=$(grep -cE "warning:|error:" clang-tidy.log || true)
+          # --header-filter makes every shared-header finding (an enum sizing
+          # suggestion in Session.hpp, say) reprint once per .cpp translation
+          # unit that includes it -- with this many TUs sharing a handful of
+          # SIP headers, that inflates COUNT far past the number of distinct
+          # things anyone could actually go fix. UNIQUE collapses exact
+          # duplicate "file:line:col: warning: ..." lines (identical text,
+          # since it's the same physical header location every time) so the
+          # log states plainly how much of COUNT is one real finding echoed
+          # N times. COUNT vs CLANG_TIDY_BASELINE stays the gating comparison
+          # -- that's #254's measured baseline and changing what it means is
+          # a separate decision, not something to fold in here.
+          UNIQUE=$(grep -E "warning:|error:" clang-tidy.log | sort -u | wc -l | tr -d ' ')
           echo "================================================================"
           echo "clang-tidy total diagnostics: ${COUNT} (baseline ${CLANG_TIDY_BASELINE}, pinned clang-tidy-${CLANG_TIDY_VERSION})"
+          echo "of which ${UNIQUE} are distinct findings -- the rest are the same header-level finding reprinted per including .cpp file"
           if [ "${COUNT}" -gt "${CLANG_TIDY_BASELINE}" ]; then
             echo "::warning::clang-tidy diagnostics ${COUNT} exceed the baseline ${CLANG_TIDY_BASELINE} by $(( COUNT - CLANG_TIDY_BASELINE )). A new finding has been introduced, or the pinned version changed."
           fi
           echo "Diagnostics by check:"
           grep -oE "\[[a-z0-9-]+(,[a-z0-9-]+)*\]$" clang-tidy.log | sort | uniq -c | sort -rn || true
+          echo "Distinct findings (deduplicated across including .cpp files):"
+          grep -E "warning:|error:" clang-tidy.log | sort -u || true
           echo "================================================================"
 
       - name: Run Unit Test Suite (GoogleTest via CTest)

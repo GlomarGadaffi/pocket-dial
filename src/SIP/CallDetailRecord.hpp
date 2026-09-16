@@ -20,7 +20,7 @@
 #endif
 
 // How a call ended. Derived from the Session's final state at teardown.
-enum class CdrResult
+enum class CdrResult : uint8_t
 {
 	Answered,    // the call connected (Session reached Connected)
 	Busy,        // callee was busy (486)

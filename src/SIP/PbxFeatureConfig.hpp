@@ -1,6 +1,7 @@
 #ifndef PBX_FEATURE_CONFIG_HPP
 #define PBX_FEATURE_CONFIG_HPP
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <tuple>
@@ -37,7 +38,7 @@ class PbxFeatureConfig
 public:
 	// Which table changed, for the OnChanged callback -> RequestsHandler's
 	// refreshPbxConfigSnapshot(Table) switch.
-	enum class Table { Dnd, Forwards, RingGroups, PageZones, DialRules, Voicemail };
+	enum class Table : uint8_t { Dnd, Forwards, RingGroups, PageZones, DialRules, Voicemail };
 	using OnChanged = std::function<void(Table)>;
 
 	PbxFeatureConfig(PbxEnv& env, OnChanged onChanged)

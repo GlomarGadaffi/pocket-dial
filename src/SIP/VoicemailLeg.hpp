@@ -57,7 +57,7 @@
 class VoicemailLeg
 {
 public:
-	enum class State
+	enum class State : uint8_t
 	{
 		Idle,          // not serving a call; ready to be claimed from the pool
 		Recording,     // deposit: appending caller audio into the record buffer
