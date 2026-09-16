@@ -66,7 +66,12 @@ jobs:
       # version above. NOT an aspiration -- a high-water mark, so a new
       # finding is visible instead of lost in the noise. See the step below
       # for why it is not yet enforced.
-      CLANG_TIDY_BASELINE: "0"   # set from this PR's own run, see below
+      # MEASURED, not estimated: 258 is what clang-tidy-18 (Ubuntu LLVM
+      # 18.1.3) reported on this branch's own CI run, with the generated
+      # Sdp.cpp excluded. Re-measure and update this in the SAME PR as any
+      # CLANG_TIDY_VERSION bump -- a version change moves the count, which
+      # is the whole reason the previous "~59" had drifted to 260.
+      CLANG_TIDY_BASELINE: "258"
 
     steps:
       - name: Checkout Repository
