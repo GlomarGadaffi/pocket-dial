@@ -132,6 +132,40 @@ namespace
 		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
 	}
 
+	// Issue #263: the legacy RFC 2543 hold shape -- session level says
+	// "a=sendrecv" (an explicit, unambiguous "not holding" by direction alone)
+	// while the AUDIO section's own connection address is blackholed. Same
+	// request shape as makeHoldReinvite() above; the only difference is the
+	// body, which needs a session-level line makeHoldReinvite()'s single
+	// trailing `direction` parameter cannot express.
+	std::shared_ptr<SipMessage> makeLegacyHoldReinvite(const std::string& fromExt,
+		const std::string& toHeaderLine, const std::string& srcIp, const std::string& callId,
+		int cseq, int rtpPort = 10000)
+	{
+		std::string body =
+			"v=0\r\n"
+			"o=- 0 0 IN IP4 " + srcIp + "\r\n"
+			"s=-\r\n"
+			"c=IN IP4 " + srcIp + "\r\n"
+			"t=0 0\r\n"
+			"a=sendrecv\r\n"
+			"m=audio " + std::to_string(rtpPort) + " RTP/AVP 0\r\n"
+			"c=IN IP4 0.0.0.0\r\n"
+			"a=rtpmap:0 PCMU/8000\r\n";
+		std::string raw =
+			"INVITE sip:555@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKih" + callId + std::to_string(cseq) + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			+ toHeaderLine + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(cseq) + " INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + fromExt + "@" + srcIp + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
+	}
+
 	// Pulls the FULL "To: ...;tag=..." line out of a sent SipMessage
 	// (SipMessage::getTo() already returns the complete raw header line, not
 	// just its value — see setTo()'s symmetric contract), for building the
@@ -399,6 +433,50 @@ TEST(AnchorRouting, ResumingTheAnchorLegClearsHeldStateAndRestoresTheHandsetPath
 	auto session = handler.getSession("Call-ID: anchor-resume");
 	ASSERT_TRUE(session.has_value());
 	EXPECT_EQ(session.value()->getState(), Session::State::Connected);
+}
+
+// Issue #263: sdp::isHold() had zero production callers, so the legacy RFC
+// 2543 hold shape (session-level a=sendrecv, the AUDIO section's OWN
+// connection blackholed) was never detected on the anchor leg either --
+// answerAnchorReinvite() called getSdpDirection(), which never looks at the
+// connection address at all. Same end-to-end style as
+// HoldOnTheAnchorLegIsAnsweredNotRefused above, legacy body instead.
+TEST(AnchorRouting, HoldOnTheAnchorLegDetectsTheLegacyZeroAddressSignal)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-legacy-hold"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-legacy-hold");
+	ASSERT_NE(bridge, nullptr);
+	ASSERT_FALSE(bridge->isHeld());
+
+	sent.clear();
+	handler.handle(makeLegacyHoldReinvite("501", toLine, "192.168.9.51", "anchor-legacy-hold",
+		/*cseq=*/2));
+
+	ASSERT_FALSE(sent.empty()) << "the legacy-hold re-INVITE got no answer at all";
+	const std::string holdRaw = sent.front().second ? sent.front().second->toString() : std::string{};
+	EXPECT_NE(holdRaw.find("SIP/2.0 200 OK"), std::string::npos) << holdRaw;
+
+	EXPECT_TRUE(bridge->isHeld())
+		<< "a=sendrecv at session level with the audio section's connection "
+		   "blackholed (c=IN IP4 0.0.0.0) is the legacy hold signal -- "
+		   "getSdpDirection() alone (pre-#263) reads this as an active call "
+		   "and the anchor would never hear hold music";
+
+	auto session = handler.getSession("Call-ID: anchor-legacy-hold");
+	ASSERT_TRUE(session.has_value());
+	EXPECT_EQ(session.value()->getState(), Session::State::Held);
 }
 
 TEST(AnchorRouting, HoldOnAVirtualLegIsStillRefused)

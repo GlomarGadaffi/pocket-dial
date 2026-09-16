@@ -8340,10 +8340,17 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 	ok->syncContentLength();
 	_outbox.emplace_back(data->getSource(), std::move(ok));
 
+	// Issue #263: sdp::isHold() is model-aware and section-explicit, and
+	// catches the legacy RFC 2543 c=0.0.0.0 hold signal getSdpDirection()
+	// never looked for at all. recvonly is kept as an explicit hold signal
+	// here too -- RFC 3264 s8.4 does not call recvonly hold and isHold()
+	// correctly does not treat it as one, but this PBX always has at all
+	// three hold/resume sites, and the swap must not silently drop that
+	// rather than deciding it.
+	SipSdpMessage* sdpMsg = data->hasSdp() ? static_cast<SipSdpMessage*>(data.get()) : nullptr;
 	const auto dir = data->getSdpDirection();
-	const bool holding = (dir == SipMessage::SdpDirection::SendOnly ||
-		dir == SipMessage::SdpDirection::RecvOnly ||
-		dir == SipMessage::SdpDirection::Inactive);
+	const bool holding = (sdpMsg && sdpMsg->isHoldOffer()) ||
+		dir == SipMessage::SdpDirection::RecvOnly;
 	bridge->setHeld(holding);
 
 	if (session->getSessionExpiresSeconds() > 0)
@@ -8427,12 +8434,16 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 		                         std::chrono::steady_clock::now());
 	}
 
-	// Track hold state from the offered SDP direction. RFC 3264: an absent
-	// direction attribute implies sendrecv (an active call).
+	// Track hold state from the offered SDP. Issue #263: sdp::isHold() (model-
+	// aware, section-explicit -- see answerAnchorReinvite()'s identical swap
+	// for the full reasoning) replaces the direction-only getSdpDirection()
+	// scan, adding the legacy RFC 2543 c=0.0.0.0 signal; recvonly is kept as
+	// an explicit hold signal alongside it, same as before this change. RFC
+	// 3264: an absent direction attribute AND a real connection address
+	// implies sendrecv (an active call).
+	SipSdpMessage* sdpMsg = data->hasSdp() ? static_cast<SipSdpMessage*>(data.get()) : nullptr;
 	const auto dir = data->getSdpDirection();
-	if (dir == SipMessage::SdpDirection::SendOnly ||
-		dir == SipMessage::SdpDirection::RecvOnly ||
-		dir == SipMessage::SdpDirection::Inactive)
+	if ((sdpMsg && sdpMsg->isHoldOffer()) || dir == SipMessage::SdpDirection::RecvOnly)
 	{
 		session->setState(Session::State::Held);
 		queueLog("Hold: " + std::string(data->getFromNumber()) + " held call " + std::string(data->getCallID()));
@@ -8522,10 +8533,13 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		                         std::chrono::steady_clock::now());
 	}
 
+	// Issue #263: same isHoldOffer()+recvonly swap as onReinvite() above. The
+	// cast is unguarded here (unlike the other two sites) because the
+	// `!data->hasSdp()` branch above already returned for a bodiless UPDATE --
+	// every message reaching this point has SDP.
+	SipSdpMessage* sdpMsg = static_cast<SipSdpMessage*>(data.get());
 	const auto dir = data->getSdpDirection();
-	if (dir == SipMessage::SdpDirection::SendOnly ||
-	    dir == SipMessage::SdpDirection::RecvOnly ||
-	    dir == SipMessage::SdpDirection::Inactive)
+	if (sdpMsg->isHoldOffer() || dir == SipMessage::SdpDirection::RecvOnly)
 	{
 		session->setState(Session::State::Held);
 		queueLog("Update/Hold: " + std::string(data->getFromNumber()) +
