@@ -1466,6 +1466,37 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// so a near-exhausted 320 KB of DRAM barely moves it. Task stacks and
 	// lwIP pbufs live here and nowhere else.
 	json << ",\"minFreeHeapInternal\":" << heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+	// Issue #273, second pass: the field above is a LOW-WATER MARK since boot
+	// (heap_caps_get_minimum_free_size), which is monotonically non-increasing
+	// and therefore cannot distinguish a slow leak from one large transient
+	// dip. It already caused a wrong conclusion on #273: a 7072 -> 3272 move
+	// across a window containing both a quiet period and five /api/status
+	// requests was read as background drain, when a single DMA bounce-buffer
+	// allocation during one of those requests explains it just as well. A
+	// watermark can only tell you the worst instant ever seen; it can never
+	// recover, so "it went down" is not evidence about WHEN or WHY.
+	//
+	// These are instantaneous, and together they answer what the watermark
+	// cannot. Total free and largest CONTIGUOUS block are reported separately
+	// because the allocation that actually fails on this board is a
+	// contiguous, ALIGNED one: spicommon_dma_setup_priv_buffer() ends in
+	// heap_caps_aligned_alloc(alignment, align_len, mem_cap) (IDF
+	// esp_driver_spi/src/gpspi/spi_common.c), so total free can look
+	// comfortable while no single block is big enough. A widening gap between
+	// freeHeapInternal and largestFreeBlock* is fragmentation; both falling
+	// together is exhaustion. Nothing here decides which is happening -- that
+	// is the point of reporting both.
+	//
+	// The DMA figure is reported alongside the INTERNAL one rather than
+	// instead of it because that IDF call takes its caps from the CALLER
+	// (mem_cap is a parameter), so MALLOC_CAP_INTERNAL is a proxy, not the
+	// exact pool. On ESP32-S3 the two sets are nearly identical -- and
+	// "nearly" is precisely the kind of word that has already produced wrong
+	// conclusions on #273, so measure both and let the numbers say.
+	json << ",\"freeHeapInternal\":" << heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+	json << ",\"largestFreeBlockInternal\":" << heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+	json << ",\"freeHeapDma\":" << heap_caps_get_free_size(MALLOC_CAP_DMA);
+	json << ",\"largestFreeBlockDma\":" << heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
 	json << ",\"resetReason\":\"" << pdResetReasonString(esp_reset_reason()) << "\"";
 	pdAppendHwmField(json, "stackHwm_sip_server_task", pdSipServerStackHwmBytes());
 	pdAppendHwmField(json, "stackHwm_udp_receiver_task", pdStackHwmBytes(PD_UDP_RECEIVER_TASK_NAME));
@@ -1477,7 +1508,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// all-zero/null, so tests/interop/interop.py's JSON parsing never has to
 	// special-case platform -- matching this route's existing "counters read
 	// 0, arrays empty" convention for the unattached/host case (docs/API.md).
-	json << ",\"freeHeap\":0,\"minFreeHeap\":0,\"minFreeHeapSpiram\":0,\"minFreeHeapInternal\":0,\"resetReason\":\"n/a\"";
+	json << ",\"freeHeap\":0,\"minFreeHeap\":0,\"minFreeHeapSpiram\":0,\"minFreeHeapInternal\":0"
+	        ",\"freeHeapInternal\":0,\"largestFreeBlockInternal\":0"
+	        ",\"freeHeapDma\":0,\"largestFreeBlockDma\":0,\"resetReason\":\"n/a\"";
 	json << ",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
 	        "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
 	        "\"stackHwm_conf_mix_tick\":null";
