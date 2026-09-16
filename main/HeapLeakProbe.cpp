@@ -59,6 +59,8 @@
 
 #include "esp_heap_caps.h"
 #include "esp_heap_trace.h"
+#include "esp_memory_utils.h"   // esp_ptr_internal
+#include <cstdio>                 // snprintf
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -149,6 +151,89 @@ void logPerTask(uint32_t atSec)
 }
 #endif  // CONFIG_HEAP_TASK_TRACKING
 
+// Print the outstanding internal-RAM trace records WITHOUT using
+// heap_trace_dump_caps().
+//
+// WHY WE CANNOT USE IDF'S DUMP. heap_trace_dump_base()
+// (components/heap/heap_trace_standalone.c:341) does portENTER_CRITICAL()
+// and then runs its whole `for (i < records.count)` print loop inside it --
+// esp_rom_printf per record, plus one %p per backtrace frame, with
+// CONFIG_HEAP_TRACING_STACK_DEPTH=8 frames each. Interrupts stay off for the
+// entire dump.
+//
+// On the first real run that was 904 outstanding records at t=120 s. It
+// printed ~50 of them, then:
+//
+//   Guru Meditation Error: Core 0 panic'ed (Interrupt wdt timeout on CPU0)
+//
+// reproducibly, on consecutive boots. CONFIG_ESP_INT_WDT_TIMEOUT_MS defaults
+// to 300 ms; ~6 ms per record means 904 of them need ~5.4 s with interrupts
+// disabled. The dump can never finish on a board with a real number of
+// outstanding allocations, which is exactly the board we want to dump.
+//
+// Feeding a watchdog inside that loop is not an option -- it is IDF's code,
+// and you cannot delay or yield inside a critical section anyway.
+//
+// heap_trace_get() takes its OWN short critical section per call, covering a
+// single record copy rather than 904 prints. So we iterate at our own pace,
+// print outside any critical section, and yield between batches. Interrupts
+// are then off for microseconds at a time instead of seconds.
+void dumpInternalRecords(uint32_t atSec)
+{
+	// Bounded so a badly-leaking board cannot emit megabytes over a 115200
+	// line faster than anyone can capture it. If we hit the cap the count is
+	// reported, so a truncated dump is visible rather than silently partial.
+	constexpr size_t kMaxPrinted  = 400;
+	constexpr size_t kBatchSize   = 16;   // records per yield
+
+	const size_t total = heap_trace_get_count();
+	size_t printed = 0, internalSeen = 0;
+
+	ESP_LOGW(TAG, "[dump t=%" PRIu32 "s] %u outstanding records total; listing "
+		"internal-RAM ones (max %u)", atSec, static_cast<unsigned>(total),
+		static_cast<unsigned>(kMaxPrinted));
+
+	for (size_t i = 0; i < total; ++i)
+	{
+		heap_trace_record_t rec;
+		if (heap_trace_get(i, &rec) != ESP_OK) continue;
+		if (rec.address == nullptr) continue;
+		if (!esp_ptr_internal(rec.address)) continue;   // PSRAM: not #273's pool
+
+		++internalSeen;
+		if (printed < kMaxPrinted)
+		{
+			// One line per record: size, address, then the call stack. Raw
+			// addresses -- symbolize in bulk with xtensa-esp32s3-elf-addr2line
+			// against the ELF whose SHA256 matches this boot's banner.
+			char frames[9 * 11 + 1];
+			int  off = 0;
+			for (int f = 0; f < CONFIG_HEAP_TRACING_STACK_DEPTH; ++f)
+			{
+				if (rec.alloced_by[f] == nullptr) break;
+				off += snprintf(frames + off, sizeof(frames) - off, " %p",
+					rec.alloced_by[f]);
+				if (off >= static_cast<int>(sizeof(frames)) - 1) break;
+			}
+			frames[sizeof(frames) - 1] = '\0';
+			ESP_LOGW(TAG, "  %6u B @ %p by%s", static_cast<unsigned>(rec.size),
+				rec.address, frames);
+			++printed;
+		}
+
+		// Yield outside any critical section so the idle task runs and both
+		// watchdogs stay fed. This is the whole point of not using IDF's dump.
+		if ((i % kBatchSize) == (kBatchSize - 1))
+		{
+			vTaskDelay(1);
+		}
+	}
+
+	ESP_LOGW(TAG, "[dump t=%" PRIu32 "s] internal-RAM records: %u (printed %u%s)",
+		atSec, static_cast<unsigned>(internalSeen), static_cast<unsigned>(printed),
+		internalSeen > printed ? ", TRUNCATED" : "");
+}
+
 void heapProbeTask(void*)
 {
 	auto* buf = static_cast<heap_trace_record_t*>(
@@ -206,9 +291,11 @@ void heapProbeTask(void*)
 		ESP_LOGW(TAG, "[dump t=%" PRIu32 "s] heap_probe stack high-water: %u bytes free of %d",
 			target, static_cast<unsigned>(freeWords * sizeof(StackType_t)), 8192);
 
-		// Only the internal-RAM allocations. A full dump is dominated by PSRAM
-		// traffic that has nothing to do with #273.
-		heap_trace_dump_caps(MALLOC_CAP_INTERNAL);
+		// NOT heap_trace_dump_caps(). See dumpInternalRecords() -- IDF's own
+		// dump holds a critical section across its entire per-record print
+		// loop, which at 904 records tripped the interrupt watchdog and
+		// crashed the board mid-dump, losing the very data it was printing.
+		dumpInternalRecords(target);
 
 #if CONFIG_HEAP_TASK_TRACKING
 		logPerTask(target);
