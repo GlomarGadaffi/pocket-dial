@@ -215,6 +215,50 @@ TEST(AnchorRouting, DialingReservedExtensionReachesAnchorAndBridgeAttaches)
 	EXPECT_EQ(bridge->callId(), "Call-ID: anchor-1");
 }
 
+TEST(AnchorRouting, PcmaOnlyOfferGets488NotABridgeItCannotDecode)
+{
+	// Issue #304: MediaBridge::onHandsetRtp only mu-law-decodes, and
+	// buildMediaSdp's answer is PCMU-only regardless of what was offered,
+	// so a PCMA-only offer must be refused rather than bridged into silence.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("505", "192.168.9.55", "reg-505"));
+
+	sent.clear();
+	sockaddr_in s = addrFor("192.168.9.55");
+	std::string body =
+		"v=0\r\n"
+		"o=- 0 0 IN IP4 192.168.9.55\r\n"
+		"s=-\r\n"
+		"c=IN IP4 192.168.9.55\r\n"
+		"t=0 0\r\n"
+		"m=audio 10000 RTP/AVP 8\r\n"
+		"a=rtpmap:8 PCMA/8000\r\n";
+	std::string raw =
+		"INVITE sip:555@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.9.55:5060;branch=z9hG4bKanchorpcma\r\n"
+		"From: <sip:505@server>;tag=ftanchorpcma\r\n"
+		"To: <sip:555@server>\r\n"
+		"Call-ID: anchor-pcma\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:505@192.168.9.55:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	handler.handle(RequestsHandler::getMessageFromPool(raw, s));
+
+	ASSERT_FALSE(sent.empty()) << "PCMA-only offer to 555 got no response at all";
+	const std::string respRaw = sent.front().second ? sent.front().second->toString() : std::string{};
+	EXPECT_NE(respRaw.find("SIP/2.0 488"), std::string::npos)
+		<< "PCMA-only offer should be refused with 488, got:\n" << respRaw;
+	EXPECT_FALSE(handler.getSession("Call-ID: anchor-pcma").has_value())
+		<< "must refuse before claiming a session";
+}
+
 TEST(AnchorRouting, DialPastCapacityIsRefusedWithoutConsumingASession)
 {
 	// Generalized over the EFFECTIVE limit, not the array size. Those are two

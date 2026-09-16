@@ -157,7 +157,8 @@ TEST(InteropRfc, EchoAnswerKeepsTheOffersPayloadNumberingAndInventsNothing)
 
 	// Every payload type in the answer must have been in the offer. 101 in
 	// particular was invented by the old enforceG711() rewrite; the offer above
-	// numbers telephone-event 120.
+	// numbers telephone-event 120. 8 (PCMA) is allowed in the OFFER but must
+	// NOT survive into the answer -- see the exact-match check below.
 	for (const auto& pt : pts)
 	{
 		EXPECT_TRUE(pt == "0" || pt == "8" || pt == "120")
@@ -175,8 +176,11 @@ TEST(InteropRfc, EchoAnswerKeepsTheOffersPayloadNumberingAndInventsNothing)
 			<< "dynamic payload type " << pt << " kept in the answer with no a=rtpmap line";
 	}
 
-	// The caller's own preference order is preserved among what survives.
-	std::vector<std::string> expected{"0", "8", "120"};
+	// The caller's own preference order is preserved among what survives --
+	// except 8 (PCMA), which filterAudioCodecs(allowPcma=false) now strips:
+	// nothing in this codebase decodes A-law (issue #304), so echoing it
+	// back would invite audio this leg could never actually play.
+	std::vector<std::string> expected{"0", "120"};
 	EXPECT_EQ(pts, expected);
 }
 
@@ -202,6 +206,29 @@ TEST(InteropRfc, EchoRefuses488WhenNothingTheEchoLegSpeaksWasOffered)
 		<< "G.722-only offer to the echo test was not refused with 488";
 	EXPECT_TRUE(firstMatching(sent, "SIP/2.0 200 OK").empty())
 		<< "G.722-only offer to the echo test was answered 200 OK";
+}
+
+TEST(InteropRfc, EchoRefuses488WhenOnlyPcmaWasOffered)
+{
+	// Issue #304: nothing in this codebase decodes A-law (RtpReceiver.cpp
+	// only recognizes PAYLOAD_TYPE_PCMU), so a PCMA-only offer to the echo
+	// leg must be refused outright, same as a wideband-only offer above.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("502", "192.168.7.52", "reg-502", /*withRport=*/false));
+	sent.clear();
+
+	handler.handle(makeRichInvite("502", "777", "192.168.7.52", "echo-pcma",
+		"m=audio 10000 RTP/AVP 8\r\n"));
+
+	EXPECT_FALSE(firstMatching(sent, "488 Not Acceptable Here").empty())
+		<< "PCMA-only offer to the echo test was not refused with 488";
+	EXPECT_TRUE(firstMatching(sent, "SIP/2.0 200 OK").empty())
+		<< "PCMA-only offer to the echo test was answered 200 OK";
 }
 
 // ── 2. Via received / rport ──────────────────────────────────────────────────

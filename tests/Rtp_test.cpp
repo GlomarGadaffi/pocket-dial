@@ -274,6 +274,53 @@ TEST(MediaAnswer, EndToEnd440InviteEmitsServerSdpAnswer) {
     EXPECT_TRUE(saw200Again) << "after BYE the media slot should be free again";
 }
 
+// Issue #304: 440's tone is synthesized and G.711 mu-law encoded only
+// (RtpSender hardcodes PCMU) and buildMediaSdp's answer is PCMU-only
+// regardless of what was offered, so a PCMA-only caller must be refused
+// rather than answered with a payload type it never offered.
+TEST(MediaAnswer, PcmaOnlyOfferGets488NotAnAnswerItCannotProduce) {
+    Captured cap;
+    RequestsHandler handler("192.168.4.1", 5060,
+        [&cap](const sockaddr_in& dest, std::shared_ptr<SipMessage> msg) {
+            cap.out.emplace_back(dest, msg);
+        });
+
+    handler.handle(makeRegister("101", "192.168.4.51", "reg-2"));
+    cap.out.clear();
+
+    sockaddr_in s{}; s.sin_family = AF_INET;
+    s.sin_addr.s_addr = inet_addr("192.168.4.51"); s.sin_port = htons(5060);
+    std::string body =
+        "v=0\r\n"
+        "o=- 0 0 IN IP4 192.168.4.51\r\n"
+        "s=-\r\n"
+        "c=IN IP4 192.168.4.51\r\n"
+        "t=0 0\r\n"
+        "m=audio 40000 RTP/AVP 8\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n";
+    std::string head =
+        "INVITE sip:440@server SIP/2.0\r\n"
+        "Via: SIP/2.0/UDP 192.168.4.51:5060;branch=z9hG4bKp\r\n"
+        "From: <sip:101@server>;tag=pt\r\n"
+        "To: <sip:440@server>\r\n"
+        "Call-ID: media-pcma\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Contact: <sip:101@192.168.4.51:5060>\r\n"
+        "Content-Type: application/sdp\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+    handler.handle(RequestsHandler::getMessageFromPool(head + body, s));
+
+    bool saw488 = false, saw200 = false;
+    for (auto& e : cap.out) {
+        auto st = e.second->getStatusInfo();
+        if (!st.has_value()) continue;
+        if (st->code == 488) saw488 = true;
+        if (st->code == 200) saw200 = true;
+    }
+    EXPECT_TRUE(saw488) << "PCMA-only offer to 440 was not refused with 488";
+    EXPECT_FALSE(saw200) << "PCMA-only offer to 440 was answered 200 OK";
+}
+
 // ── Single-stream cap: the host stub still enforces one concurrent stream ────
 TEST(MediaAnswer, SingleStreamCap) {
     RtpSender tx;

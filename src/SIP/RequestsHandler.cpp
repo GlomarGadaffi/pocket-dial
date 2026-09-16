@@ -1707,7 +1707,13 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		// admits G.722 because a peer-to-peer pair may negotiate wideband between
 		// themselves). A caller offering nothing but wideband gets 488 here rather
 		// than an answer advertising a codec this leg will never encode.
-		if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false))
+		//
+		// Issue #304: PCMA is rejected too. Nothing in this codebase decodes
+		// A-law (RtpReceiver.cpp only recognizes PAYLOAD_TYPE_PCMU; anything
+		// else falls through to the DTMF-event check and is dropped), so a
+		// PCMA-only offer admitted here would echo back as a 200 OK the peer
+		// could never actually be heard over.
+		if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
 		{
 			auto responseObj = getMessageFromPool(*data);
 			if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -1819,7 +1825,11 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		// payload type") and the echo call dies. filterAudioCodecs keeps the
 		// caller's own numbering, order and rtpmap/fmtp lines, dropping only what
 		// this leg cannot carry; the 488 gate above guarantees something survives.
-		okResponse->filterAudioCodecs(/*allowWideband=*/false);
+		// Issue #304: allowPcma=false here too -- the gate above only refuses a
+		// PCMA-ONLY offer; a dual-codec PCMU+PCMA offer passes it fine, and
+		// without this the echoed answer would still list PT8, leaving the peer
+		// free to pick it and send audio nothing on this leg can decode.
+		okResponse->filterAudioCodecs(/*allowWideband=*/false, /*allowPcma=*/false);
 		_outbox.emplace_back(data->getSource(), std::move(okResponse));
 		return;
 	}
@@ -2167,6 +2177,25 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 {
 	std::string activeIp = _localIp;
 
+	// Issue #304: 440's tone is synthesized and G.711 µ-law encoded only
+	// (RtpSender hardcodes PCMU; see RtpSender.hpp) and the answer below
+	// (buildMediaSdp) is PCMU-only regardless of what was offered. A
+	// PCMA-only caller could never hear the tone and could never have been
+	// legally answered anyway (the answer would name a payload type it
+	// never offered) -- refuse before the single-stream slot is claimed.
+	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+	{
+		auto notAcceptable = getMessageFromPool(*data);
+		if (!notAcceptable) return;   // pool exhausted: drop, peer retransmits (#101A)
+		notAcceptable->setHeader("SIP/2.0 488 Not Acceptable Here");
+		notAcceptable->clearBody();
+		notAcceptable->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		notAcceptable->setContact(buildContact("440"));
+		_outbox.emplace_back(data->getSource(), std::move(notAcceptable));
+		queueLog("440 media: no G.711 codec offered, rejected " + std::string(data->getFromNumber()), true);
+		return;
+	}
+
 	// Single-stream cap: a 2nd dial of 440 while a stream is live is rejected so the
 	// one media slot/socket/task is never double-booked (degrade gracefully).
 	if (_rtpSender.isActive())
@@ -2365,6 +2394,17 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 			+ std::string(data->getFromNumber()), true);
 	};
 
+	// Issue #304: conference mixing only understands PCMU -- RtpReceiver.cpp
+	// only recognizes PAYLOAD_TYPE_PCMU as audio; anything else (PCMA
+	// included) falls through to the DTMF-event check and is dropped. Same
+	// reasoning as the 777/anchor gates: refuse a PCMA-only offer rather
+	// than mix silence in from this leg.
+	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+	{
+		refuse("SIP/2.0 488 Not Acceptable Here", "no G.711 codec offered");
+		return;
+	}
+
 	// Where does this phone want its audio? Same c=/m= parse the 440 path uses.
 	std::string destIp;
 	uint16_t destPort = 0;
@@ -2547,6 +2587,18 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		queueLog("Voicemail: " + std::string(why) + " for " + std::string(src->getNumber())
 			+ " -> " + extension, true);
 	};
+
+	// Issue #304: recording only understands PCMU -- onCallerRtp() below is
+	// fed raw µ-law bytes by the RTP receiver, which (RtpReceiver.cpp) only
+	// recognizes PAYLOAD_TYPE_PCMU as audio and silently drops anything
+	// else after the DTMF-event check. A PCMA-only caller's message would
+	// otherwise record as silence rather than fail loudly -- refuse here
+	// instead.
+	if (invite->hasSdp() && !invite->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+	{
+		refuse("SIP/2.0 488 Not Acceptable Here", "no G.711 codec offered");
+		return;
+	}
 
 	// Where does the caller want its audio sent? Same c=/m= parse 440/888 use
 	// against their own inbound INVITE -- here it's the RETAINED invite,
@@ -2759,6 +2811,17 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 		_outbox.emplace_back(invite->getSource(), std::move(msg));
 		queueLog("Voicemail retrieval: " + std::string(why) + " for " + extension, true);
 	};
+
+	// Issue #304: retrieval only ever SENDS PCMU (buildMediaSdp is PCMU-only
+	// regardless of what was offered) -- a PCMA-only caller could never
+	// hear their own mailbox, even though this leg discards the caller's
+	// own audio entirely (see the DTMF-only sink below) and so has no
+	// decode concern of its own. Same reasoning as 440's gate.
+	if (invite->hasSdp() && !invite->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+	{
+		refuse("SIP/2.0 488 Not Acceptable Here", "no G.711 codec offered");
+		return;
+	}
 
 	// MVP auth: no PIN -- the mailbox IS whoever's dialing in, authenticated
 	// purely by Caller-ID. Accepted tradeoff, documented in
@@ -3749,7 +3812,12 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// a peer-to-peer pair may negotiate wideband between themselves. Same reasoning
 	// as the 777 echo leg's gate above: a caller offering nothing but wideband gets
 	// 488 here rather than an answer advertising a codec this leg will never decode.
-	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false))
+	//
+	// Issue #304: allowPcma=false too, same as 777 -- MediaBridge::onHandsetRtp
+	// only µ-law-decodes, not A-law, and buildMediaSdp's answer is PCMU-only
+	// regardless of what was offered, so a PCMA-only offer could never be
+	// legally answered here.
+	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
 	{
 		refuse("SIP/2.0 488 Not Acceptable Here", "no G.711 codec offered");
 		return true;

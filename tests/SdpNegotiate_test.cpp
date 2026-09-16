@@ -154,3 +154,56 @@ TEST(SdpNegotiate, EnforceG711StillPinsServerLegs)
 	m.enforceG711();
 	EXPECT_NE(std::string(m.getBody()).find("m=audio 10000 RTP/AVP 0 8 101"), std::string::npos);
 }
+
+// ── Issue #304: allowPcma -- nothing in this codebase decodes A-law, so a
+// handful of server-terminated legs (777, anchor, and #304's fix) must be
+// able to reject/strip PCMA specifically, distinct from allowWideband. ──────
+
+TEST(SdpNegotiate, AllowPcmaDefaultsTrueSoEveryExistingCallSiteIsUnaffected)
+{
+	SipMessage m = make(sdp("m=audio 10000 RTP/AVP 0 8 101",
+	                        "a=rtpmap:0 PCMU/8000\r\n"
+	                        "a=rtpmap:8 PCMA/8000\r\n"
+	                        "a=rtpmap:101 telephone-event/8000\r\n"));
+	const std::string before(m.getBody());
+	EXPECT_TRUE(m.offersSupportedAudio(false));   // no allowPcma arg -> true
+	EXPECT_TRUE(m.filterAudioCodecs(false));
+	EXPECT_EQ(std::string(m.getBody()), before) << "PCMA kept by default, nothing rewritten";
+}
+
+TEST(SdpNegotiate, PcmaOnlyOfferReportsUnsupportedWhenPcmaDisallowed)
+{
+	SipMessage m = make(sdp("m=audio 10000 RTP/AVP 8", "a=rtpmap:8 PCMA/8000\r\n"));
+	EXPECT_FALSE(m.offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false));
+	EXPECT_FALSE(m.filterAudioCodecs(/*allowWideband=*/false, /*allowPcma=*/false))
+		<< "no codec would survive -- body must be left untouched, same as any other 488 case";
+}
+
+TEST(SdpNegotiate, DualCodecOfferKeepsOnlyPcmuWhenPcmaDisallowed)
+{
+	SipMessage m = make(sdp("m=audio 10000 RTP/AVP 0 8 101",
+	                        "a=rtpmap:0 PCMU/8000\r\n"
+	                        "a=rtpmap:8 PCMA/8000\r\n"
+	                        "a=rtpmap:101 telephone-event/8000\r\n"));
+	EXPECT_TRUE(m.offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+		<< "PCMU alone is still enough to admit the call";
+	EXPECT_TRUE(m.filterAudioCodecs(/*allowWideband=*/false, /*allowPcma=*/false));
+	const std::string body(m.getBody());
+	EXPECT_NE(body.find("m=audio 10000 RTP/AVP 0 101\r\n"), std::string::npos) << body;
+	EXPECT_EQ(body.find("a=rtpmap:8 "), std::string::npos)
+		<< "rtpmap for the dropped PCMA payload must go";
+}
+
+TEST(SdpNegotiate, AllowPcmaAndAllowWidebandAreIndependent)
+{
+	// A caller offering all three: PCMU survives regardless; G.722 and PCMA
+	// are each gated by their OWN, independent parameter.
+	SipMessage m = make(sdp("m=audio 10000 RTP/AVP 9 0 8",
+	                        "a=rtpmap:9 G722/8000\r\n"
+	                        "a=rtpmap:0 PCMU/8000\r\n"
+	                        "a=rtpmap:8 PCMA/8000\r\n"));
+	EXPECT_TRUE(m.filterAudioCodecs(/*allowWideband=*/true, /*allowPcma=*/false));
+	const std::string body(m.getBody());
+	EXPECT_NE(body.find("m=audio 10000 RTP/AVP 9 0\r\n"), std::string::npos)
+		<< "wideband kept, PCMA dropped: " << body;
+}
