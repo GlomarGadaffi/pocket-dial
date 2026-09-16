@@ -54,9 +54,11 @@ namespace l2rtp
 	// RtpReceiver::MAX_DATAGRAM_BYTES so one template can carry either a
 	// plain 160-byte PCMU frame (RtpSender/HoldMusic) or a relayed raw
 	// packet up to the same size the receive side already accepts (#260).
-	// Keep these two constants equal by inspection; a static_assert can't
-	// reach across the two headers without an include cycle (RtpReceiver.hpp
-	// does not need to know about this file).
+	// This header does not include RtpReceiver.hpp to check that at compile
+	// time (RtpReceiver.hpp has no reason to know about this file, and
+	// shouldn't gain one just for this) -- L2RtpFrame_test.cpp includes both
+	// and static_asserts the two stay equal, so drift fails the test suite,
+	// not silently.
 	static constexpr size_t kMaxRtpDatagramBytes = 512;
 
 	static constexpr size_t kIpOffset  = kEthHeaderBytes;
@@ -66,6 +68,34 @@ namespace l2rtp
 
 	// Largest possible complete frame: headers + the largest RTP datagram.
 	static constexpr size_t kMaxFrameBytes = kHeaderBytes + (kMaxRtpDatagramBytes - kRtpHeaderBytes);
+
+	// ── Buffer placement: THE WHOLE POINT of this file, so it is not a footnote ──
+	//
+	// buildTemplate()/patchTick() write into a caller-provided buffer. Whether
+	// that buffer actually avoids #282's allocation depends ENTIRELY on where
+	// the caller puts it:
+	//
+	//   * a `static` (or global, or heap_caps_malloc'd-once-at-init) buffer in
+	//     internal RAM, DMA-capable, aligned -- esp_eth_transmit() takes it
+	//     with no bounce, no allocation. This is the only correct choice.
+	//   * a task-stack local (`uint8_t buf[kMaxFrameBytes];` inside a function
+	//     running on an RTOS task) is WRONG on this codebase specifically:
+	//     RTP/media task stacks here are allocated with
+	//     PD_TASK_STACK_CAPS = MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT (see
+	//     PsramTask.hpp -- the same PSRAM-stack fact that is #273's root
+	//     cause), so a stack-local buffer lives in PSRAM. The SPI driver
+	//     bounces it exactly as it would an lwIP pbuf, and this whole PR
+	//     delivers ZERO benefit while looking correct. RtpSender::runLoop's
+	//     existing `uint8_t packet[PACKET_BYTES];` is that exact pattern --
+	//     do NOT copy it for this buffer.
+	//
+	// FrameBuffer below is `alignas(4)` (spicommon_dma_setup_priv_buffer checks
+	// dma_align_tx_int; 4 is sufficient on this target) so the easy declaration
+	// is also the correct one: `static l2rtp::FrameBuffer buf;` per stream slot.
+	struct alignas(4) FrameBuffer
+	{
+		uint8_t bytes[kMaxFrameBytes];
+	};
 
 	// One stream's fixed addressing, unchanged for the stream's life.
 	struct Endpoint
@@ -79,7 +109,9 @@ namespace l2rtp
 	};
 
 	// Write the fixed Ethernet+IPv4+UDP+RTP portion into `out`, which must be
-	// at least kHeaderBytes long. `ssrc` is written once here (RFC 3550
+	// at least kHeaderBytes long and MUST be placed per the "Buffer placement"
+	// note above (a FrameBuffer, not a task-stack local). `ssrc` is written
+	// once here (RFC 3550
 	// §5.1: fixed for the stream's life) and is never touched by
 	// patchTick(). The IPv4 total-length/checksum and UDP length fields are
 	// placeholders (patchTick() finishes them each tick) -- the buffer this
@@ -100,9 +132,10 @@ namespace l2rtp
 	// makes (ESP32_AdBlocker_Reborn's l2_finish_reply).
 	//
 	// Returns the total frame length ready for esp_eth_transmit(), or 0 if
-	// payloadLen overflows the datagram cap -- refuse rather than truncate,
-	// same discipline as RtpReceiver::sendRaw's MAX_DATAGRAM_BYTES guard,
-	// because a truncated RTP payload is a corrupt frame, not a smaller one.
+	// payloadLen overflows the datagram cap, or if payload is null while
+	// payloadLen is nonzero -- refuse rather than truncate or dereference a
+	// null pointer, same discipline as RtpReceiver::sendRaw's
+	// MAX_DATAGRAM_BYTES guard. A refused call writes nothing to `buf`.
 	size_t patchTick(uint8_t* buf, bool marker, uint8_t payloadType,
 		uint16_t seq, uint32_t timestamp,
 		const uint8_t* payload, size_t payloadLen,

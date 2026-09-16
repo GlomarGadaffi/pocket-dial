@@ -82,6 +82,10 @@ size_t patchTick(uint8_t* buf, bool marker, uint8_t payloadType,
 	{
 		return 0;   // refuse rather than truncate -- see the header's doc comment
 	}
+	if (payload == nullptr && payloadLen > 0)
+	{
+		return 0;   // nothing to copy from -- refuse rather than dereference null
+	}
 
 	// ── RTP: marker/PT/seq/timestamp change every tick; SSRC and the
 	// version byte were fixed once by buildTemplate() and are left alone. ──

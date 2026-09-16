@@ -3,8 +3,16 @@
 #include <vector>
 
 #include "L2RtpFrame.hpp"
+#include "RtpReceiver.hpp"
 
 using namespace l2rtp;
+
+// The drift guard the header says a static_assert can't reach across headers
+// for (true from L2RtpFrame.hpp's side, to avoid an include cycle) -- but a
+// test file can include both, so enforce it here instead of leaving the two
+// caps to drift silently apart.
+static_assert(l2rtp::kMaxRtpDatagramBytes == static_cast<size_t>(RtpReceiver::MAX_DATAGRAM_BYTES),
+	"l2rtp::kMaxRtpDatagramBytes must track RtpReceiver::MAX_DATAGRAM_BYTES");
 
 namespace
 {
@@ -223,8 +231,11 @@ TEST(L2RtpFramePatch, RefusesRatherThanTruncatesAnOversizePayload)
 	uint8_t buf[kMaxFrameBytes];
 	buildTemplate(buf, testEndpoint(), 0);
 
-	// Snapshot the header so we can prove a refused call touches nothing.
-	uint8_t before[kHeaderBytes];
+	// Snapshot the WHOLE buffer, including the payload region past the
+	// header, so this actually catches a bug that copies the payload before
+	// checking its length (the header-only snapshot this test used to take
+	// would miss exactly that bug).
+	uint8_t before[kMaxFrameBytes];
 	std::memcpy(before, buf, sizeof(before));
 
 	std::vector<uint8_t> tooBig(kMaxRtpDatagramBytes - kRtpHeaderBytes + 1, 0x42);
@@ -232,7 +243,43 @@ TEST(L2RtpFramePatch, RefusesRatherThanTruncatesAnOversizePayload)
 
 	EXPECT_EQ(total, 0u);
 	EXPECT_EQ(std::memcmp(buf, before, sizeof(before)), 0)
-		<< "a refused patchTick() must not have written anything";
+		<< "a refused patchTick() must not have written anything, anywhere in the buffer";
+}
+
+TEST(L2RtpFramePatch, RefusesRatherThanDereferenceNullPayloadWithNonzeroLength)
+{
+	uint8_t buf[kMaxFrameBytes];
+	buildTemplate(buf, testEndpoint(), 0);
+	uint8_t before[kMaxFrameBytes];
+	std::memcpy(before, buf, sizeof(before));
+
+	const size_t total = patchTick(buf, true, 0, 1, 1, /*payload=*/nullptr, /*payloadLen=*/10, 0);
+
+	EXPECT_EQ(total, 0u);
+	EXPECT_EQ(std::memcmp(buf, before, sizeof(before)), 0);
+}
+
+TEST(L2RtpFrameBuffer, IsCorrectlySizedAndAligned)
+{
+	// The type the header recommends every real caller use, so its own
+	// contract (big enough, DMA-alignment-friendly) is asserted, not just
+	// described in a comment.
+	//
+	// `sizeof(FrameBuffer)` itself is NOT asserted equal to kMaxFrameBytes:
+	// alignas(4) pads the whole struct up to a multiple of 4 (554 -> 556 on
+	// every toolchain tried), which is correct, required C++ behaviour, not
+	// a defect -- that padding sits after the array and nothing ever reads
+	// or writes it. What must hold, and is what buildTemplate()/patchTick()
+	// actually rely on, is that the `bytes` MEMBER is exactly big enough.
+	FrameBuffer fb{};
+	EXPECT_EQ(sizeof(fb.bytes), kMaxFrameBytes);
+	EXPECT_GE(sizeof(FrameBuffer), kMaxFrameBytes) << "struct must be at least as large as the array it wraps";
+	EXPECT_GE(alignof(FrameBuffer), 4u);
+
+	// And it actually works as a buildTemplate()/patchTick() target.
+	buildTemplate(fb.bytes, testEndpoint(), 0x42);
+	const size_t total = patchTick(fb.bytes, false, 0, 1, 160, nullptr, 0, 0);
+	EXPECT_EQ(total, kHeaderBytes);
 }
 
 TEST(L2RtpFramePatch, AcceptsExactlyTheMaximumPayload)
