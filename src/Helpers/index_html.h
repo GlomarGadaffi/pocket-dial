@@ -6,25 +6,39 @@
 // The dashboard page's HTML+CSS+JS, as a table of independent const char[]
 // parts rather than one big literal. Two separate reasons, both real:
 //
-//  1. MSVC (the host dev build's compiler) enforces the C++ standard's
-//     documented minimum string-literal limits, and this page's combined
-//     HTML+CSS+JS is past both of them: (a) each individual raw string
-//     literal TOKEN is capped -- measured exactly 16384 bytes on this
-//     toolset (cl 19.44); MSVC's own docs cite 16380 single-byte chars
-//     before concatenation -- and (b) the TOTAL of a run of ADJACENT
-//     string-literal tokens (nothing but whitespace/comments between them)
-//     is separately capped at 65535 bytes. C2026 "string too big" fires on
-//     whichever limit is hit first. Keep every PD_HTML_N part below ~16 KB
-//     (limit (a)) or that one part alone will trip it again.
+//  1. MSVC (the host dev build's compiler) caps a single string-literal
+//     TOKEN, and this page's combined HTML+CSS+JS is far past it: measured
+//     exactly 16384 bytes of content for a RAW literal on this toolset
+//     (cl 19.44.35228), and 16383 for an ordinary one -- the two really do
+//     differ by one. MSVC's own docs cite 16380, which this toolset does
+//     not match. C2026 "string too big" fires past it. Keep every
+//     PD_HTML_N part below 16384 bytes or that one part alone will trip it.
+//
+//     This is now CHECKED, not merely documented (issue #270):
+//     tools/check_string_literal_caps.py runs in CI and fails the build on
+//     an over-cap part, and warns when one drops under 512 bytes of
+//     headroom. tools/msvc_literal_cap_probe.py is where those constants
+//     were measured; re-run it on a toolchain bump.
+//
+//     An earlier version of this comment also claimed a second, separate
+//     cap of 65535 bytes on the TOTAL of a run of ADJACENT literal tokens.
+//     MSVC documents that limit, but cl 19.44 does NOT enforce it -- the
+//     probe above compiles 40 adjacent raw literals totalling 655360 bytes,
+//     and 64 ordinary ones totalling 1048512, without complaint. The split
+//     below is required by the per-token cap alone. The checker still
+//     reports an oversized adjacent run, as a warning only, in case some
+//     other toolset does enforce what the docs describe.
+//
 //  2. This header is also compiled into the ESP32 firmware (HttpServer.cpp
 //     is linked into main/), where RAM is scarce -- see the README's
 //     SIP_CONSTRAINED mode. Each PD_HTML_N[] below is a genuinely SEPARATE
 //     `static const char[]` -- never concatenated, not even via `+` -- so
 //     every one sits in .rodata (flash) at zero RAM cost, exactly like a
-//     single literal would; limit (b) above never applies because nothing
-//     here is adjacent. HttpServer::sendHtml() is the only place that ever
-//     materializes the full page as one std::string (via CGA_INDEX_HTML_
-//     PARTS below), same as it already did with the old single literal.
+//     single literal would; the concatenation limit discussed above could
+//     not apply here anyway, because nothing here is adjacent.
+//     HttpServer::sendHtml() is the only place that ever materializes the
+//     full page as one std::string (via CGA_INDEX_HTML_PARTS below), same
+//     as it already did with the old single literal.
 struct HtmlPart { const char* data; size_t size; };
 
 static const char PD_HTML_0[] =
