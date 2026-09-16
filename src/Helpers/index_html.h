@@ -557,7 +557,7 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <hr class="hr">
       <div class="row" style="justify-content:space-between">
         <span class="subhead" style="margin:0">Voicemail</span>
-        <label class="toggle"><input type="checkbox" id="jd-vm" onchange="toggleVoicemail()"><span class="track"><span class="knob"></span></span></label>
+        <label class="toggle"><input type="checkbox" id="jd-vm" aria-label="Voicemail" onchange="toggleVoicemail()"><span class="track"><span class="knob"></span></span></label>
       </div>
       <hr class="hr">
       <div class="subhead">Call Forwarding</div>
