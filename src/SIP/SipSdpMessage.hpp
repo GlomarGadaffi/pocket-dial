@@ -76,14 +76,17 @@ private:
 	//
 	// The accessors are const but observably pure, and they WRITE (to the shared
 	// scratch). They are therefore NOT safe to call concurrently on any two
-	// messages, let alone one. That is survivable only because every call site
-	// runs on the SIP task under RequestsHandler::_mutex: the two outside this
-	// class are in RequestsHandler::parseCallerRtp (getRtpPort /
-	// getConnectionInformation), reached solely from onMediaInvite, which runs
-	// under that mutex like every other handler.
+	// messages, let alone one. The property that makes that survivable is MUTEX
+	// EXCLUSION, not which handler you are in: every caller of an SDP accessor
+	// must hold RequestsHandler::_mutex before reaching it. This is not a
+	// property of the call path — RequestsHandler::parseCallerRtp
+	// (getRtpPort / getConnectionInformation) alone is reached from five
+	// sites, one of them the AnchorClient::setEventCallback lambda, which
+	// runs off the SIP thread entirely and takes the mutex explicitly before
+	// calling in. Check the lock, not the call path.
 	//
-	// RE-CHECK THIS if an SDP accessor is ever called from the HTTP/dashboard
-	// task or a media task. With the old per-object cache that would have been a
+	// RE-CHECK THIS if an SDP accessor is ever reachable without the caller
+	// holding that mutex. With the old per-object cache that would have been a
 	// data race on one message; with shared scratch it is a race between
 	// UNRELATED messages, which is both more likely to happen and harder to spot.
 	//
