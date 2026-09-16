@@ -61,6 +61,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -69,7 +70,7 @@
 namespace pbx
 {
 	// The already-shipped call-handling actions a dial rule can select.
-	enum class DialActionType
+	enum class DialActionType : uint8_t
 	{
 		RingGroup,   // route to the ring/hunt group named by `target`
 		PageZone,    // route to the paging zone named by `target`

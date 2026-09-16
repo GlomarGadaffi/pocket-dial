@@ -158,7 +158,7 @@ namespace SipDigest
 	// SHA-512-256) is deliberately NOT implemented — see the file header — and
 	// maps to Unsupported so a caller REFUSES rather than silently computing an
 	// MD5 response the server will reject with a second 401 forever.
-	enum class DigestAlgorithm
+	enum class DigestAlgorithm : uint8_t
 	{
 		Md5,          // "MD5", or absent (RFC 7616 §3.3: MD5 is the default)
 		Md5Sess,      // "MD5-sess" (RFC 7616 §3.4.2)

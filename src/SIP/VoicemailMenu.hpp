@@ -42,11 +42,12 @@
 // is already known when start() is called.
 
 #include <cstddef>
+#include <cstdint>
 
 class VoicemailMenu
 {
 public:
-	enum class Command
+	enum class Command : uint8_t
 	{
 		None,          // nothing to do: digit ignored, or called before start()/after Done
 		PlayMessage,   // play playIndex from the caller's own listing
@@ -85,7 +86,7 @@ public:
 	bool isDone() const { return _state == State::Done; }
 
 private:
-	enum class State { Idle, PlayingMessage, PlayingPrompt, Done };
+	enum class State : uint8_t { Idle, PlayingMessage, PlayingPrompt, Done };
 
 	// Shared "this message/prompt is over, what's next" transition -- used
 	// by start() (from index -1), onPlaybackDone() (natural end), and

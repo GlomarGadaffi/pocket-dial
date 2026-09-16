@@ -44,7 +44,7 @@ public:
 		bool online = false;     // currently has a live registration binding
 	};
 
-	enum class AuthDecision { Accept, Challenge, Reject };
+	enum class AuthDecision : uint8_t { Accept, Challenge, Reject };
 
 	Registrar(PbxEnv& env, Mode defaultMode) : _env(env), _mode(defaultMode) {}
 

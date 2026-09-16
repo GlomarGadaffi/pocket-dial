@@ -1123,8 +1123,8 @@ public:
 		_logQueue.clear();
 		for (const auto& log : localLogs)
 		{
-			if (log.first) std::cerr << log.second << std::endl;
-			else std::cout << log.second << std::endl;
+			if (log.first) std::cerr << log.second << '\n';
+			else std::cout << log.second << '\n';
 		}
 		for (auto& event : localOutbox)
 		{
@@ -1523,7 +1523,7 @@ private:
 	// makes everything the SD task wrote beforehand visible -- the same
 	// producer/consumer handoff CdrArchive's queue already relies on, just
 	// with a result to read back instead of fire-and-forget.
-	enum class VmSdJobState { Idle, Pending, Done };
+	enum class VmSdJobState : uint8_t { Idle, Pending, Done };
 	struct VmSdJob
 	{
 		bool listRequested = false;

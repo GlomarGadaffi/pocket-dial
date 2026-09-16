@@ -221,7 +221,7 @@ public:
 	// body. Returns None when there is no body or no direction attribute (RFC
 	// 3264: an absent attribute implies sendrecv — the caller decides; we only
 	// report what is on the wire). Pure string scan, host-compilable.
-	enum class SdpDirection { None, SendRecv, SendOnly, RecvOnly, Inactive };
+	enum class SdpDirection : uint8_t { None, SendRecv, SendOnly, RecvOnly, Inactive };
 	SdpDirection getSdpDirection() const;
 
 	// Issue #42: virtual SDP probe replaces dynamic_cast so call setup works

@@ -3,6 +3,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -93,7 +94,7 @@ private:
 	// AwaitingCancelDone: CANCEL sent for an unanswered INVITE, lingering for a
 	// bounded window in case the phone's 200 OK raced the CANCEL (RFC 3261 §9.1) —
 	// handleOk() still matches this state so a raced answer gets ACKed+BYEd.
-	enum class BeepState { Free, AwaitingInviteOk, AwaitingByeOk, AwaitingCancelDone };
+	enum class BeepState : uint8_t { Free, AwaitingInviteOk, AwaitingByeOk, AwaitingCancelDone };
 	struct BeepDialog
 	{
 		BeepState state = BeepState::Free;

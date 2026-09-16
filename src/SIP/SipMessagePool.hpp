@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -35,7 +36,7 @@ namespace sipmsgpool
 	// logs its own (separate) virtual-peer pool exhaustion through the same
 	// helper and label scheme — that is why this enum and logPoolExhausted() are
 	// exposed here rather than kept file-local.
-	enum class PoolPressure { Fallback, Refused };
+	enum class PoolPressure : uint8_t { Fallback, Refused };
 
 	// Rate-limited (1-in-100) exhaustion logger, shared by every bounded pool in
 	// the engine (the message pool here, and RequestsHandler's virtual-peer pool).

@@ -1014,7 +1014,6 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				auto infoOk = getMessageFromPool(*request);
 				if (!infoOk) return;   // pool exhausted: drop, peer retransmits (#101A)
 				infoOk->setHeader(SipMessageTypes::OK);
-				std::string activeIp = _localIp;
 				infoOk->setVia(sipwire::viaWithReceived(request->getVia(), request->getSource()));
 				_outbox.emplace_back(request->getSource(), std::move(infoOk));
 			}
@@ -1074,8 +1073,8 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	// Print deferred logs safely outside of the lock
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 
 	// Issue #24 resolved: UDP socket syscall sendto is now executed outside the locked section to prevent lock contention.
@@ -1107,7 +1106,6 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader("SIP/2.0 400 Bad Request");
 		response->clearBody();
-		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -1233,7 +1231,6 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 			response->setHeader("SIP/2.0 503 Service Unavailable");
 			response->clearBody();
-			std::string activeIp = _localIp;
 			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 			_outbox.emplace_back(data->getSource(), std::move(response));
 			return;
@@ -1243,7 +1240,6 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	auto response = getMessageFromPool(*data);
 	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setHeader(SipMessageTypes::OK);
-	std::string activeIp = _localIp;
 	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	// Echo the granted lease back in the Contact so the client knows when to refresh.
@@ -1372,7 +1368,6 @@ void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 	auto response = getMessageFromPool(*data);
 	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setHeader(SipMessageTypes::OK);
-	std::string activeIp = _localIp;
 	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	response->setContact(buildContact(data->getFromNumber()));
@@ -1629,7 +1624,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader("SIP/2.0 400 Bad Request");
 		response->clearBody();
-		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -1643,7 +1637,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
-		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -1796,7 +1789,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 
 		ringing->setHeader("SIP/2.0 180 Ringing");
 		ringing->clearBody();
-		std::string activeIp = _localIp;
 		ringing->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		std::string toTag = IDGen::GenerateID(9);
 		// Issue #232: this leg is server-terminated (the PBX is the UAS, answering
@@ -1996,7 +1988,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader("SIP/2.0 480 Temporarily Unavailable");
 		response->clearBody();
-		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		response->setContact(buildContact(caller.value()->getNumber()));
 		endHandle(data->getFromNumber(), response);
@@ -2053,7 +2044,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// isSessionRingingExt() finds "who's ringing" for call pickup (Issue #68)
 	// without needing to pre-populate Session::dest before an answer exists.
 	newSession->setInviteMessage(data);
-	std::string cfb  = _cfg.getForwardTarget(destNumber, "busy");
 	std::string cfna = _cfg.getForwardTarget(destNumber, "noanswer");
 	if (!cfna.empty() && cfna != destNumber)
 	{
@@ -4917,7 +4907,6 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader(SipMessageTypes::OK);
-		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
@@ -4932,7 +4921,6 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader(SipMessageTypes::OK);
-		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
@@ -4946,7 +4934,6 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader(SipMessageTypes::OK);
-		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
@@ -4964,7 +4951,6 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader(SipMessageTypes::OK);
-		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
@@ -5557,7 +5543,6 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
-		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -5639,7 +5624,6 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader(SipMessageTypes::BAD_REQUEST);
 		response->clearBody();
-		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -6183,7 +6167,6 @@ void RequestsHandler::onMessage(std::shared_ptr<SipMessage> data)
 	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setHeader(SipMessageTypes::OK);
 	response->clearBody();
-	std::string activeIp = _localIp;
 	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	_outbox.emplace_back(data->getSource(), std::move(response));
@@ -6960,8 +6943,8 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 }
 
@@ -7079,8 +7062,8 @@ void RequestsHandler::setDnd(const std::string& extension, bool on)
 
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 }
 
@@ -7102,8 +7085,8 @@ void RequestsHandler::setVoicemail(const std::string& extension, bool on)
 
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 }
 
@@ -7127,8 +7110,8 @@ void RequestsHandler::setForward(const std::string& extension, const std::string
 
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 }
 
@@ -7153,8 +7136,8 @@ void RequestsHandler::setE911Config(const std::string& exts, const std::string& 
 
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 }
 
@@ -7177,8 +7160,8 @@ void RequestsHandler::setRingGroup(const std::string& groupExt, const std::strin
 
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 }
 
@@ -7231,8 +7214,8 @@ void RequestsHandler::setDialRule(const std::string& pattern, const std::string&
 
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 }
 
@@ -7368,8 +7351,8 @@ std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
 
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 	return err;
 }
@@ -7420,8 +7403,8 @@ void RequestsHandler::setRegistrarMode(RegistrarMode mode)
 	}
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 }
 
@@ -7487,8 +7470,8 @@ bool RequestsHandler::secureDevice(const std::string& macOrExt)
 	}
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 	return changed;
 }
@@ -7506,8 +7489,8 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 	}
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 	return removed;
 }
@@ -8079,8 +8062,8 @@ void RequestsHandler::tick()
 
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 
 	for (auto& event : localOutbox)
@@ -8809,8 +8792,8 @@ void RequestsHandler::setPageZone(const std::string& zoneExt, const std::string&
 
 	for (const auto& log : localLogs)
 	{
-		if (log.first) std::cerr << log.second << std::endl;
-		else std::cout << log.second << std::endl;
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
 	}
 }
 
