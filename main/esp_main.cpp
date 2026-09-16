@@ -24,6 +24,7 @@
 #include "Syslog.hpp"
 #include "SmtpClient.hpp"
 #include "host_compat.h"
+#include "HeapLeakProbe.hpp"   // issue #273 leak probe (no-op unless CONFIG_HEAP_TRACING)
 
 // ── Default INFRA (AP) profile settings ───────────────────────────────────────
 #define EXAMPLE_ESP_WIFI_SSID      "esp32-sipserver"
@@ -357,6 +358,12 @@ static void log_drain_task(void* /*arg*/)
 
 extern "C" void app_main(void)
 {
+    // Issue #273: arms the internal-DRAM leak probe. No-op unless
+    // CONFIG_HEAP_TRACING is set (sdkconfig.defaults.heap_trace only).
+    // MUST be here rather than a global constructor -- constructors run
+    // before the scheduler exists; see HeapLeakProbe.hpp.
+    pdHeapLeakProbeStart();
+
     // Issue #185: log the reset cause before anything else can fail and bury
     // it. ESP_RST_TASK_WDT here means a TWDT-subscribed task (sip_server_task,
     // below) actually stalled on the PREVIOUS boot -- the only place a headless

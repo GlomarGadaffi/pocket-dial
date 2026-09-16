@@ -67,6 +67,7 @@
 #include "SmtpClient.hpp"
 #if defined(PD_ETH_HAS_SD)
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive writer
+#include "HeapLeakProbe.hpp"   // issue #273 leak probe (no-op unless CONFIG_HEAP_TRACING)
 #endif
 
 // ── Tag for ESP_LOG ────────────────────────────────────────────────────────
@@ -540,6 +541,12 @@ static void log_drain_task(void* /*arg*/)
 
 extern "C" void app_main(void)
 {
+    // Issue #273: arms the internal-DRAM leak probe. No-op unless
+    // CONFIG_HEAP_TRACING is set (sdkconfig.defaults.heap_trace only).
+    // MUST be here rather than a global constructor -- constructors run
+    // before the scheduler exists; see HeapLeakProbe.hpp.
+    pdHeapLeakProbeStart();
+
     // Issue #185: log the reset cause before anything else can fail and bury
     // it. ESP_RST_TASK_WDT here means a TWDT-subscribed task (sip_server_task,
     // below) actually stalled on the PREVIOUS boot -- the only place a headless

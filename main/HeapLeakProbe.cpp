@@ -17,22 +17,41 @@
 // leaked — with the call stack that allocated it. Paired with
 // CONFIG_HEAP_TASK_TRACKING it also names the owning task.
 //
-// HOW IT STARTS WITHOUT TOUCHING THE THREE app_main()s
-// ----------------------------------------------------
-// There are three transport-specific mains (esp_main.cpp, esp_main_eth.cpp,
-// esp_main_display.cpp, plus the lan8720 variant) and editing all of them for
-// a diagnostic build would put conflict surface into files other sessions are
-// actively working in. Instead this self-registers from a file-scope
-// constructor. That is safe here specifically because ESP-IDF runs global C++
-// constructors from main_task, AFTER the scheduler is running — so
-// xTaskCreate() from a constructor is legal. It would not be on bare metal.
+// HOW IT STARTS -- AND WHY NOT FROM A CONSTRUCTOR
+// ------------------------------------------------
+// pdHeapLeakProbeStart() is called from each transport's app_main(). The first
+// revision instead self-registered from a file-scope constructor, to avoid
+// touching four files, justified in this comment as: "safe because ESP-IDF
+// runs global C++ constructors from main_task, AFTER the scheduler is
+// running." That was asserted, never checked, and it is FALSE.
+//
+// esp_system/startup.c, start_cpu0_default(): __libc_init_array() and
+// __do_global_ctors_1() run there, and the comment immediately following that
+// call says "the scheduler (and ipc service) is not available."
+// esp_startup_start_app() -- which creates main_task and starts the scheduler
+// -- runs AFTER. So constructors execute with no scheduler, and the
+// xTaskCreate() in one produced a deterministic crash ~3.8 s into every boot,
+// nine identical cycles in under a minute:
+//
+//   assert failed: prvSelectHighestPriorityTaskSMP tasks.c:3642
+//                  (xTaskScheduled == ( ( BaseType_t ) 1 ))
+//
+// with 0xa5a5a5a5 (FreeRTOS stack poison) in the backtrace. The probe never
+// logged a line; the board never lived long enough to reach it. Caught on
+// hardware by madmax, not by CI -- a build that compiles and a build that
+// boots are different claims, and this file's own header previously conflated
+// them.
+//
+// app_main() has the property the constructor was assumed to have: scheduler
+// up, both cores live. The header gives the call site an inline no-op when
+// CONFIG_HEAP_TRACING is off, so no #if is needed at any of the four sites.
 //
 // THE TRACE BUFFER LIVES IN PSRAM, deliberately. The thing being measured is
 // internal DRAM; an instrument that consumes the resource under study changes
 // the result it reports. heap_trace_init_standalone() takes any buffer, so
 // MALLOC_CAP_SPIRAM costs the measurement nothing.
 
-#include "sdkconfig.h"
+#include "HeapLeakProbe.hpp"
 
 #if CONFIG_HEAP_TRACING
 
@@ -204,33 +223,28 @@ void heapProbeTask(void*)
 	vTaskDelete(nullptr);
 }
 
-// Runs from main_task after the scheduler is up -- see the header comment.
-// Internal-RAM stack (plain xTaskCreate, not PD_TASK_STACK_CAPS): this task
-// calls into the heap subsystem and logs, and a PSRAM stack is the hazard
-// #277/#309 exist to prevent.
-//
-// 8192, not a measured figure yet (G-dubs, pre-hardware-pass review):
-// heap_trace_dump_caps() walks up to HEAP_TRACING_STACK_DEPTH (8) %p-formatted
-// frames per outstanding record via esp_rom_printf, and at t=360s there could
-// be hundreds of records -- the original 4096 guess wasn't sized against that.
-// A diagnostic overflowing its OWN stack would present as a fresh crash in
-// the exact thing being diagnosed, which is the #309 bug class reappearing
-// inside the tool built to find it. The dump loop above now logs the real
-// high-water mark every dump, so the next revision of this number is
-// measured, not guessed twice.
-struct HeapProbeInstaller
-{
-	HeapProbeInstaller()
-	{
-		if (xTaskCreate(heapProbeTask, "heap_probe", 8192, nullptr, 1, nullptr) != pdPASS)
-		{
-			ESP_LOGE(TAG, "xTaskCreate heap_probe failed -- probe disabled");
-		}
-	}
-};
-
-const HeapProbeInstaller g_heapProbeInstaller;
-
 }  // namespace
+
+// Entry point, called from app_main() -- see the header for why this is not a
+// constructor. Internal-RAM stack (plain xTaskCreate, not PD_TASK_STACK_CAPS):
+// this task calls into the heap subsystem and logs, and a PSRAM stack is the
+// hazard #277/#309 exist to prevent.
+void pdHeapLeakProbeStart()
+{
+	static bool started = false;
+	if (started)
+	{
+		// Defensive: four app_main()s exist but only one runs per build. A
+		// second call would arm a second tracer over the first's buffer.
+		return;
+	}
+	started = true;
+
+	if (xTaskCreate(heapProbeTask, "heap_probe", 8192, nullptr, 1, nullptr) != pdPASS)
+	{
+		ESP_LOGE(TAG, "xTaskCreate heap_probe failed -- probe disabled");
+	}
+}
+
 
 #endif  // CONFIG_HEAP_TRACING
