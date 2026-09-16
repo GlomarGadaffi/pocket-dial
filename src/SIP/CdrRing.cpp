@@ -3,12 +3,18 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 
 #include "PbxPersist.hpp"
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "PsramTask.hpp"   // PD_ASSERT_NOT_PSRAM_STACK -- issue #277
 #endif
 
 namespace
@@ -29,6 +35,137 @@ namespace
 			std::chrono::duration_cast<std::chrono::milliseconds>(
 				std::chrono::steady_clock::now().time_since_epoch()).count());
 	}
+
+	// Per-field raw-length cap for caller/callee before truncation. Mirrors
+	// CdrArchive.cpp's kMaxAorRaw for the identical reason: anchor-sourced
+	// values bypass isValidAor()'s length bound (see CallDetailRecord.hpp).
+	constexpr size_t kMaxAorRaw = 48;
+
+	// caller(48) + '\t' + callee(48) + '\t' + startMs(20 digits, uint64_t max)
+	// + '\t' + durationSec(10 digits, uint32_t max) + '\t' + result(1 digit,
+	// 0-4) + '\n' = 48+1+48+1+20+1+10+1+1+1 = 132, rounded up to 140 for
+	// margin. CdrRingBlob::kCapacity (CdrRing.hpp) must track this constant;
+	// the static_assert below fails the build, not just a test, if they drift.
+	constexpr size_t kMaxLineBytes = 140;
+	static_assert(CdrRingBlob::kCapacity == POCKETDIAL_CDR_RECORDS * kMaxLineBytes + 1,
+		"CdrRingBlob::kCapacity must match kMaxLineBytes's arithmetic here");
+
+	// Appends `raw` (truncated to `maxRaw` bytes) to buf[0..cap), starting at
+	// *used, followed by `sep` if non-'\0'. Never writes past cap; if the
+	// buffer would overflow, the append truncates silently rather than
+	// corrupting adjacent memory (same discipline as CdrArchive.cpp's
+	// appendCsvField) -- this can only trigger if kMaxLineBytes above is
+	// wrong. No CSV-style quoting: this format is unchanged from before issue
+	// #273's fix (plain tab/newline separated, no escaping), so
+	// deserializeBlob() needs no matching change.
+	void appendField(char* buf, size_t cap, size_t& used, std::string_view raw,
+		size_t maxRaw, char sep)
+	{
+		if (raw.size() > maxRaw) raw = raw.substr(0, maxRaw);
+		size_t n = raw.size();
+		if (used + n > cap) n = (used < cap) ? (cap - used) : 0;
+		if (n > 0)
+		{
+			std::memcpy(buf + used, raw.data(), n);
+			used += n;
+		}
+		if (sep != '\0' && used < cap)
+		{
+			buf[used++] = sep;
+		}
+	}
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Queue depth 2: one blob potentially in flight (being written) plus one
+	// more pending. Each blob is CdrRingBlob::kCapacity bytes (~4.5 KB with
+	// POCKETDIAL_CDR_RECORDS=32), so this is a fixed ~9 KB of internal RAM,
+	// allocated once at boot and never freed. Safe to drop beyond this depth
+	// (see persist()'s comment): every blob is a COMPLETE ring snapshot, not
+	// one incremental record, so a dropped blob's contents are entirely
+	// superseded by whichever later blob the writer task does drain.
+	constexpr size_t kQueueDepth = 2;
+
+	QueueHandle_t& cdrPersistQueue()
+	{
+		static QueueHandle_t q = nullptr;
+		return q;
+	}
+
+	void cdrPersistWriterTask(void*)
+	{
+		CdrRingBlob blob;
+		while (true)
+		{
+			if (xQueueReceive(cdrPersistQueue(), &blob, portMAX_DELAY) == pdTRUE)
+			{
+				// Defense in depth (#277 suggestion 3): this task is created
+				// WITHOUT PD_TASK_STACK_CAPS (plain xTaskCreatePinnedToCore
+				// below), so this should never fire -- if it ever does,
+				// someone changed the task creation call without reading
+				// PsramTask.hpp first.
+				PD_ASSERT_NOT_PSRAM_STACK();
+				nvs_handle_t h;
+				if (nvs_open(NVS_CDR_NS, NVS_READWRITE, &h) == ESP_OK)
+				{
+					nvs_set_str(h, "ring", blob.text);
+					nvs_commit(h);
+					nvs_close(h);
+				}
+			}
+		}
+	}
+
+	// Idempotent. Called once from load() (already the class's single-
+	// threaded, before-any-handler-dispatches boot hook -- see its doc
+	// comment) rather than lazily from the first persist(): that would
+	// otherwise make the very first call teardown pay for xQueueCreate AND
+	// xTaskCreatePinnedToCore, on the SIP thread or a PSRAM-stacked task, in
+	// the middle of real-time work -- the same reasoning CdrArchive.cpp's
+	// init() documents for forcing its own queue to construct at boot.
+	void ensureWriterTaskStarted()
+	{
+		static bool started = false;
+		if (started) return;
+		started = true;
+		cdrPersistQueue() = xQueueCreate(kQueueDepth, sizeof(CdrRingBlob));
+		if (cdrPersistQueue() == nullptr)
+		{
+			ESP_LOGE("CdrRing", "xQueueCreate failed -- CDR ring will not persist across reboot");
+			started = false;   // allow a retry on a later load() (there is none today, but cheap to allow)
+			return;
+		}
+		// PLAIN stack (no PD_TASK_STACK_CAPS): this task is the only place
+		// allowed to touch flash for the CDR ring -- see PsramTask.hpp.
+		if (xTaskCreatePinnedToCore(cdrPersistWriterTask, "cdr_persist", 4096,
+			nullptr, 1, nullptr, 0) != pdPASS)
+		{
+			ESP_LOGE("CdrRing", "xTaskCreate cdr_persist failed -- CDR ring will not persist across reboot");
+			vQueueDelete(cdrPersistQueue());
+			cdrPersistQueue() = nullptr;
+			started = false;
+		}
+	}
+#endif
+}
+
+CdrRingBlob CdrRing::serializeForPersist(
+	const std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS>& ring,
+	size_t head, size_t count)
+{
+	CdrRingBlob out;   // zero-initialized: already NUL-terminated at text[0]
+	size_t used = 0;
+	const size_t cap = sizeof(out.text) - 1;   // reserve the last byte as a hard NUL
+	for (size_t i = 0; i < count; ++i)
+	{
+		size_t idx = (head + POCKETDIAL_CDR_RECORDS - count + i) % POCKETDIAL_CDR_RECORDS;
+		const CallDetailRecord& r = ring[idx];
+		appendField(out.text, cap, used, r.caller, kMaxAorRaw, '\t');
+		appendField(out.text, cap, used, r.callee, kMaxAorRaw, '\t');
+		appendField(out.text, cap, used, std::to_string(r.startMs), 20, '\t');
+		appendField(out.text, cap, used, std::to_string(r.durationSec), 10, '\t');
+		appendField(out.text, cap, used, std::to_string(static_cast<int>(r.result)), 1, '\n');
+	}
+	return out;
 }
 
 const CallDetailRecord& CdrRing::record(const std::shared_ptr<Session>& session,
@@ -126,6 +263,11 @@ std::string CdrRing::lastCallerFor(std::string_view calleeExt) const
 void CdrRing::load()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Issue #273/#288: start the dedicated persist writer task now, at boot,
+	// before any handler is dispatching -- not lazily inside persist() (see
+	// ensureWriterTaskStarted()'s doc comment for why).
+	ensureWriterTaskStarted();
+
 	nvs_handle_t h;
 	if (nvs_open(NVS_CDR_NS, NVS_READWRITE, &h) != ESP_OK)
 	{
@@ -173,27 +315,39 @@ void CdrRing::clearAll()
 void CdrRing::persist()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	// Serialize the ring oldest-first (same order load() replays). Bounded by
-	// POCKETDIAL_CDR_RECORDS, so the blob is fixed-footprint. Write-through on each
-	// teardown: the CDR ring is small (default 32) and calls end infrequently
-	// relative to flash endurance, so a per-call rewrite is acceptable — see summary.
-	std::string blob;
-	for (size_t i = 0; i < _count; ++i)
+	// Issue #273/#288: this used to call nvs_set_str/nvs_commit directly
+	// here, on whatever task called endCall() -- including tel_wsw and the
+	// makecall worker, both PD_TASK_STACK_CAPS (PSRAM-stacked) tasks. A flash
+	// write disables the flash cache, which makes PSRAM unreadable, which
+	// crashes a task whose own stack lives there
+	// (esp_task_stack_is_sane_cache_disabled()). See PsramTask.hpp's
+	// corrected comment for the full story.
+	//
+	// serializeForPersist() is pure CPU work (string formatting into a fixed
+	// buffer, no allocation) -- safe on any stack, including a PSRAM one.
+	// The actual flash write now happens ONLY on cdr_persist_writer's plain
+	// stack; this function just builds the blob and hands it off.
+	CdrRingBlob blob = serializeForPersist(_ring, _head, _count);
+
+	// Non-blocking: never stall the caller (which may be holding
+	// RequestsHandler::_mutex, or be a real-time task) waiting for queue
+	// space. Dropping is safe here in a way it would not be for
+	// CdrArchive.cpp's per-row queue: every blob is a COMPLETE snapshot of
+	// the whole ring, not one incremental record, so a dropped blob's
+	// contents are entirely superseded by whichever later blob the writer
+	// task does end up draining -- nothing is permanently lost, persistence
+	// for THIS particular call is merely delayed until the next one ends.
+	//
+	// Guard the handle (same convention TelephonyAnchorClient.cpp's
+	// _wsWorkQueue uses): xQueueSend on a null handle is a FreeRTOS
+	// configASSERT, not a safe no-op, and ensureWriterTaskStarted() can leave
+	// the queue null if xQueueCreate/xTaskCreatePinnedToCore failed under
+	// memory pressure -- exactly the condition #273 was investigating, so
+	// this path degrading to "CDR not persisted this call" instead of a
+	// second crash matters more here than almost anywhere else in the tree.
+	if (cdrPersistQueue() != nullptr)
 	{
-		size_t idx = (_head + POCKETDIAL_CDR_RECORDS - _count + i) % POCKETDIAL_CDR_RECORDS;
-		const CallDetailRecord& r = _ring[idx];
-		blob += r.caller; blob += '\t';
-		blob += r.callee; blob += '\t';
-		blob += std::to_string(r.startMs); blob += '\t';
-		blob += std::to_string(r.durationSec); blob += '\t';
-		blob += std::to_string(static_cast<int>(r.result)); blob += '\n';
-	}
-	nvs_handle_t h;
-	if (nvs_open(NVS_CDR_NS, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_str(h, "ring", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
+		xQueueSend(cdrPersistQueue(), &blob, 0);
 	}
 #endif
 }
