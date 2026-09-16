@@ -5793,6 +5793,39 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		// so on ANY refusal below nothing is sent and nothing mutates.
 		const std::string srcIpPort = _localIp + ":" + std::to_string(_serverPort);
 
+		// Issue #257 follow-up. invToB and invToC each impersonate A inside
+		// A-B/A-C's PRE-EXISTING dialog, exactly like handleBlindXferOk()'s swap
+		// re-INVITE -- so each needs a CSeq higher than anything that dialog has
+		// already seen from A, or the real UA on the other end correctly rejects
+		// it with 500 Invalid CSeq (RFC 3261 s12.2.2). Unlike blind transfer,
+		// there are two dialogs and the REFER only arrives on one of them.
+		//
+		// AB: this REFER (data) is itself a real, fresh in-dialog request from A
+		// on the AB dialog -- the same directly-observed-floor technique
+		// transferorCseqAtRefer() uses, just consumed immediately instead of
+		// stashed for later, since invToB is built in this same function.
+		//
+		// AC: no request from A arrives on this dialog at REFER time, so there is
+		// no equivalent live signal. The next best real (not invented) value is
+		// the CSeq A's own UA used on the consult INVITE that established this
+		// dialog (ac->getInviteMessage()) -- same reasoning the SDP capture above
+		// already relies on for this dialog: nothing else has changed its state
+		// since setup in the ordinary case, and the existing comment two
+		// paragraphs up already accepts a later re-INVITE here as a known,
+		// undetected gap, not a new one this introduces. If that message or its
+		// CSeq is ever unavailable, fall back to the REFER's own CSeq (abCseq)
+		// rather than a constant -- a real, recently-observed value from the
+		// same UA's single running counter (RFC 3261 places no per-dialog floor
+		// on it) is far more likely to be a safe lower bound than any fixed
+		// number.
+		const uint32_t abCseq = siphdr::cseqNumber(data->getCSeq());
+		uint32_t acCseq = 0;
+		if (auto acInvite = ac->getInviteMessage())
+		{
+			acCseq = siphdr::cseqNumber(acInvite->getCSeq());
+		}
+		if (acCseq == 0) acCseq = abCseq;
+
 		// A's own tag/header in each dialog, and the other party's -- these flip
 		// with orientation. A message the server sends impersonating A carries
 		// A's own tag as From and the peer's as To; a message impersonating the
@@ -5808,20 +5841,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		auto byeAfromAC = buildServerBye(transferor->getNumber(), transferor->getAddress(),
 			replacesCallIdKey, otherHdrAC, aHdrAC);
 
-		// NOT FIXED, same bug as #257 (which fixed only the blind-transfer swap
-		// re-INVITE below in handleBlindXferOk): both invToB and invToC
-		// impersonate A inside A-B/A-C's PRE-EXISTING dialogs with a hardcoded
-		// CSeq 100, which any real UA whose own dialog CSeq has already climbed
-		// past 100 will correctly reject as 500 Invalid CSeq (RFC 3261 s12.2.2)
-		// — the exact failure #257 root-caused for blind transfer. Left
-		// deliberately unfixed here: attended_transfer's own interop scenario
-		// currently passes, which is this test's specific CSeq values, not
-		// evidence the code path is safe. A real fix needs the same
-		// directly-observed-floor treatment #257 used (the REFER that starts
-		// an attended transfer only arrives on ONE of these two dialogs, so
-		// unlike blind transfer this needs real per-dialog CSeq tracking on
-		// Session for the other one, not just the REFER's own value) — tracked
-		// as a #257 follow-up, not attempted here.
+		// #257: invToB's CSeq uses abCseq+1 (see the comment above at its
+		// computation), a real directly-observed floor rather than a constant.
 		std::shared_ptr<SipMessage> invToB;
 		{
 			std::ostringstream ss;
@@ -5830,7 +5851,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 			   << "From: " << stripHeaderName(aHdrAB) << "\r\n"
 			   << "To: " << stripHeaderName(otherHdrAB) << "\r\n"
 			   << "Call-ID: " << stripHeaderName(callID) << "\r\n"
-			   << "CSeq: 100 INVITE\r\n"
+			   << "CSeq: " << (abCseq + 1) << " INVITE\r\n"
 			   << "Max-Forwards: 70\r\n"
 			   << "Contact: <sip:" << bClient->getNumber() << "@" << srcIpPort << ">\r\n"
 			   << "User-Agent: pocket-dial\r\n"
@@ -5839,6 +5860,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 			   << cSdp;
 			invToB = getMessageFromPool(ss.str(), bClient->getAddress());
 		}
+		// #257: invToC's CSeq uses acCseq+1 (see the comment above at its
+		// computation), a real directly-observed floor rather than a constant.
 		std::shared_ptr<SipMessage> invToC;
 		{
 			std::ostringstream ss;
@@ -5847,7 +5870,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 			   << "From: " << stripHeaderName(aHdrAC) << "\r\n"
 			   << "To: " << stripHeaderName(otherHdrAC) << "\r\n"
 			   << "Call-ID: " << replacesCallIdBare << "\r\n"
-			   << "CSeq: 100 INVITE\r\n"
+			   << "CSeq: " << (acCseq + 1) << " INVITE\r\n"
 			   << "Max-Forwards: 70\r\n"
 			   << "Contact: <sip:" << cClient->getNumber() << "@" << srcIpPort << ">\r\n"
 			   << "User-Agent: pocket-dial\r\n"

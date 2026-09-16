@@ -489,14 +489,20 @@ TEST(AttendedTransfer, SpliceSendsAcceptedAndCrossedReinvites)
 	EXPECT_FALSE(findSentTo(rig.sent, rig.aAddr, "SIP/2.0 202 Accepted").empty())
 		<< "REFER must be accepted";
 
-	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 100 INVITE");
-	ASSERT_FALSE(invToB.empty()) << "B must get the splice re-INVITE";
+	// Issue #257. abCseq is the REFER's own CSeq (2, see sendAttendedRefer) + 1;
+	// acCseq is the consult INVITE's own CSeq (1, see setUpSplicedCalls) + 1.
+	// Computed independently from the fix's own stated logic, not copied from
+	// a prior run's output, then confirmed to match what the code actually
+	// emits -- see the code comment at the computation site for why each is a
+	// real, directly-observed floor rather than an arbitrary constant.
+	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 3 INVITE");
+	ASSERT_FALSE(invToB.empty()) << "B must get the splice re-INVITE with a real CSeq (REFER's own CSeq + 1), not a hardcoded constant";
 	EXPECT_NE(invToB.find("Call-ID: " + rig.abCallId), std::string::npos) << invToB;
 	EXPECT_NE(invToB.find("c=IN IP4 192.168.40.30"), std::string::npos)
 		<< "B's re-INVITE must carry C's SDP:\n" << invToB;
 
-	std::string invToC = findSentTo(rig.sent, rig.cAddr, "CSeq: 100 INVITE");
-	ASSERT_FALSE(invToC.empty()) << "C must get the splice re-INVITE";
+	std::string invToC = findSentTo(rig.sent, rig.cAddr, "CSeq: 2 INVITE");
+	ASSERT_FALSE(invToC.empty()) << "C must get the splice re-INVITE with a real CSeq (consult INVITE's own CSeq + 1), not a hardcoded constant";
 	EXPECT_NE(invToC.find("Call-ID: " + rig.acCallId), std::string::npos) << invToC;
 	EXPECT_NE(invToC.find("c=IN IP4 192.168.40.20"), std::string::npos)
 		<< "C's re-INVITE must carry B's SDP:\n" << invToC;
@@ -510,7 +516,9 @@ TEST(AttendedTransfer, SpliceReinviteOkIsAckedNotRelayedToA)
 	setUpSplicedCalls(rig);
 	sendAttendedRefer(rig);
 
-	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 100 INVITE");
+	// Issue #257: invToB's CSeq is now a real value (REFER's CSeq + 1 = 3, see
+	// the sibling test's comment), not the old hardcoded 100.
+	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 3 INVITE");
 	ASSERT_FALSE(invToB.empty());
 	std::string fromLine = extractHeaderLine(invToB, "From:");
 	std::string toLine = extractHeaderLine(invToB, "To:");
@@ -522,7 +530,10 @@ TEST(AttendedTransfer, SpliceReinviteOkIsAckedNotRelayedToA)
 		std::string raw =
 			"SIP/2.0 200 OK\r\n" + via + "\r\n" + fromLine + "\r\n" + toLine + "\r\n"
 			"Call-ID: " + rig.abCallId + "\r\n"
-			"CSeq: 100 INVITE\r\n"
+			// Echoes invToB's own CSeq, matching what a real UA's 200 OK to
+			// that specific request would carry (RFC 3261: a response's CSeq
+			// always echoes the request's).
+			"CSeq: 3 INVITE\r\n"
 			"Contact: <sip:106@192.168.40.20:5060>\r\n"
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
@@ -619,8 +630,10 @@ TEST(AttendedTransfer, SpliceHandlesReceptionistOrientationBCalledAThenAConsulte
 	EXPECT_FALSE(findSentTo(rig.sent, rig.aAddr, "SIP/2.0 202 Accepted").empty())
 		<< "REFER must be accepted";
 
-	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 100 INVITE");
-	ASSERT_FALSE(invToB.empty()) << "B must get the splice re-INVITE, addressed to B not A";
+	// Issue #257: same REFER/consult-INVITE CSeq values as setUpSplicedCalls
+	// (2 and 1 respectively), so the same expected floors apply: 3 for B, 2 for C.
+	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 3 INVITE");
+	ASSERT_FALSE(invToB.empty()) << "B must get the splice re-INVITE, addressed to B not A, with a real CSeq";
 	EXPECT_NE(invToB.find("INVITE sip:106@"), std::string::npos)
 		<< "must be addressed to B's own extension, not A's:\n" << invToB;
 	EXPECT_NE(invToB.find("c=IN IP4 192.168.40.30"), std::string::npos)
@@ -628,8 +641,8 @@ TEST(AttendedTransfer, SpliceHandlesReceptionistOrientationBCalledAThenAConsulte
 	EXPECT_NE(extractHeaderLine(invToB, "To:").find("tag=rbatag"), std::string::npos)
 		<< "must carry B's own dialog tag as To, not A's:\n" << invToB;
 
-	std::string invToC = findSentTo(rig.sent, rig.cAddr, "CSeq: 100 INVITE");
-	ASSERT_FALSE(invToC.empty()) << "C must get the splice re-INVITE";
+	std::string invToC = findSentTo(rig.sent, rig.cAddr, "CSeq: 2 INVITE");
+	ASSERT_FALSE(invToC.empty()) << "C must get the splice re-INVITE with a real CSeq";
 	EXPECT_NE(invToC.find("c=IN IP4 192.168.40.20"), std::string::npos)
 		<< "C's re-INVITE must carry B's real SDP, not A's own answer:\n" << invToC;
 
@@ -674,13 +687,15 @@ TEST(AttendedTransfer, SpliceHandlesBothLegsAAsCallee)
 	EXPECT_FALSE(findSentTo(rig.sent, rig.aAddr, "SIP/2.0 202 Accepted").empty())
 		<< "REFER must be accepted";
 
-	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 100 INVITE");
-	ASSERT_FALSE(invToB.empty()) << "B must get the splice re-INVITE";
+	// Issue #257: same REFER/consult-INVITE CSeq values as setUpSplicedCalls
+	// (2 and 1 respectively), so the same expected floors apply: 3 for B, 2 for C.
+	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 3 INVITE");
+	ASSERT_FALSE(invToB.empty()) << "B must get the splice re-INVITE with a real CSeq";
 	EXPECT_NE(invToB.find("c=IN IP4 192.168.40.30"), std::string::npos)
 		<< "B's re-INVITE must carry C's real (offered) SDP, not A's own answer:\n" << invToB;
 
-	std::string invToC = findSentTo(rig.sent, rig.cAddr, "CSeq: 100 INVITE");
-	ASSERT_FALSE(invToC.empty()) << "C must get the splice re-INVITE";
+	std::string invToC = findSentTo(rig.sent, rig.cAddr, "CSeq: 2 INVITE");
+	ASSERT_FALSE(invToC.empty()) << "C must get the splice re-INVITE with a real CSeq";
 	EXPECT_NE(invToC.find("c=IN IP4 192.168.40.20"), std::string::npos)
 		<< "C's re-INVITE must carry B's real (offered) SDP, not A's own answer:\n" << invToC;
 }
