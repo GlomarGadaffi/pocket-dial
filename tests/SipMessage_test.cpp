@@ -154,6 +154,30 @@ TEST(SipMessage, AllFiveHeadersPresentIsStillValid)
 	EXPECT_TRUE(m.isValidMessage());
 }
 
+// Self-audit follow-up (#265 was clean here, but this was untested): the four
+// of the five headers that HAVE an RFC 3261 s7.3.3 compact form -- v/f/t/i for
+// Via/From/To/Call-ID -- must still count as present when a phone sends the
+// compact form instead of the long one. getVia()/getFrom()/getTo()/
+// getCallID() already pass both names to findHeaderIndex() (pre-existing,
+// unchanged by #265); this pins that #265's new checks inherit that, rather
+// than assuming it from reading the accessor once. CSeq has no compact form
+// in RFC 3261, so it is deliberately not part of this test.
+TEST(SipMessage, CompactFormHeadersStillCountAsPresent)
+{
+	std::string raw =
+		"INVITE sip:100@server SIP/2.0\r\n"
+		"v: SIP/2.0/UDP 127.0.0.1:5060;branch=1\r\n"
+		"f: <sip:100@server>\r\n"
+		"t: <sip:200@server>\r\n"
+		"i: compact-id\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	SipMessage m(raw, localhost());
+	EXPECT_TRUE(m.isValidMessage())
+		<< "compact-form Via/From/To/Call-ID must satisfy #265's presence check, "
+		   "same as the long form";
+}
+
 // Regression: enforceG711() rewrites the SDP m= codec list, which changes the
 // body size. It must resync Content-Length, otherwise the 777 echo / 999 page
 // answer is dropped by the peer as truncated and the caller sits on ringback.
