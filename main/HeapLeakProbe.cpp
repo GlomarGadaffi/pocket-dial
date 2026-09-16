@@ -301,11 +301,31 @@ void logPerTask(uint32_t atSec)
 // single record copy rather than 904 prints. So we iterate at our own pace,
 // print outside any critical section, and yield between batches. Interrupts
 // are then off for microseconds at a time instead of seconds.
-// Aggregation table for the dump, in PSRAM. Sized by DISTINCT CALL SITES, not
-// by allocation count -- 886 outstanding records on the first real capture
-// collapsed to far fewer unique stacks, and that ratio is what makes the dump
-// bounded.
-constexpr size_t kMaxSites = 192;
+// Aggregation table for the dump, in PSRAM.
+//
+// SIZED SO OVERFLOW IS STRUCTURALLY IMPOSSIBLE, not so it is usually enough.
+// The first aggregated run on hardware read:
+//
+//   905 outstanding records total, 887 in internal RAM ... across 192 call sites
+//   call sites: 192 (records unplaced: 596, TRUNCATED -- raise kMaxSites)
+//
+// 192 was a guess that "records collapse to far fewer unique stacks," and the
+// board disagreed: 291 records filled all 192 slots, a collapse ratio of only
+// 1.5 records per site, which projects to roughly 585 distinct stacks for 887
+// records. Guessing again with a bigger number would just be a slower version
+// of the same mistake.
+//
+// A dump can never contain more distinct call sites than it contains records,
+// and the trace buffer caps records at kTraceRecords. So sizing the table at
+// kTraceRecords makes `records unplaced` provably always zero, at 40 bytes an
+// entry -- about 156 KB of PSRAM, which costs the measurement nothing (same
+// reasoning as the trace buffer: PSRAM is not the resource under study).
+//
+// Cost is O(records x sites) memcmp of a 32-byte key. Realistically ~600 sites
+// x 887 records is under a million short comparisons; the 4000 x 4000 ceiling
+// only arises if the trace buffer fills. All of it runs outside any critical
+// section, yielding every batch.
+constexpr size_t kMaxSites = kTraceRecords;
 
 struct SiteTotal
 {
@@ -460,12 +480,56 @@ void dumpInternalRecords(uint32_t atSec)
 		if ((k % kBatchSize) == (kBatchSize - 1)) vTaskDelay(1);
 	}
 
-	// Closing line. NOTHING IS TRUNCATED unless overflow is non-zero, and the
-	// count is printed either way so a reader never has to infer it.
+	// PREFIX CENSUS -- measurement, not a change in behaviour.
+	//
+	// Sites are keyed on the full CONFIG_HEAP_TRACING_STACK_DEPTH frames, and
+	// the first hardware run collapsed only 1.5 records per site. For a LEAK
+	// that is suspicious: a leaking site should repeat, so either this board
+	// genuinely leaks from hundreds of distinct places, or an 8-frame key is
+	// splitting what is really one allocation site reached by different outer
+	// call paths.
+	//
+	// Those two have opposite fixes and guessing between them costs a board
+	// cycle each time. So count how many DISTINCT sites remain when only the
+	// first 1, 2 and 4 frames are considered. If the depth-4 count is far
+	// below the full-depth count, the key is too specific and shallower
+	// keying is the answer. If all four numbers are close, the diversity is
+	// real and the leak is genuinely spread out.
+	//
+	// Costs O(sites^2) short memcmp per depth, once per dump, outside any
+	// critical section.
+	for (size_t depth = 1; depth <= 4; depth *= 2)
+	{
+		if (depth >= static_cast<size_t>(CONFIG_HEAP_TRACING_STACK_DEPTH)) break;
+		size_t distinct = 0;
+		const size_t keyBytes = depth * sizeof(void*);
+		for (size_t a = 0; a < siteCount; ++a)
+		{
+			bool seen = false;
+			for (size_t b = 0; b < a; ++b)
+			{
+				if (memcmp(g_sites[a].frames, g_sites[b].frames, keyBytes) == 0)
+				{
+					seen = true;
+					break;
+				}
+			}
+			if (!seen) ++distinct;
+			if ((a % 64) == 63) vTaskDelay(1);
+		}
+		probePrintf("HeapProbe: [dump t=%us] distinct sites at depth %u: %u\n",
+			static_cast<unsigned>(atSec), static_cast<unsigned>(depth),
+			static_cast<unsigned>(distinct));
+	}
+
+	// Closing line. `records unplaced` should now always be 0 -- the table
+	// cannot be smaller than the record count. If it is ever non-zero, the
+	// sizing invariant above has been broken and every total below
+	// under-counts, so it is stated explicitly rather than inferred.
 	probePrintf("HeapProbe: [dump t=%us] call sites: %u (records unplaced: %u%s)\n",
 		static_cast<unsigned>(atSec), static_cast<unsigned>(siteCount),
 		static_cast<unsigned>(overflow),
-		overflow ? ", TRUNCATED -- raise kMaxSites" : "");
+		overflow ? ", TRUNCATED -- kMaxSites invariant broken" : "");
 }
 
 void heapProbeTask(void*)
@@ -506,7 +570,7 @@ void heapProbeTask(void*)
 	}
 
 	probePrintf("HeapProbe: leak probe armed: %u records in PSRAM, HEAP_TRACE_LEAKS. "
-		"Aggregating by call site (max %u distinct). "
+		"Aggregating by call site (table %u, cannot overflow). "
 		"Dumps at 120/240/360/900 s (#273 onset measured 218-276 s).\n",
 		static_cast<unsigned>(kTraceRecords), static_cast<unsigned>(kMaxSites));
 	logInternalState("armed", 0);
