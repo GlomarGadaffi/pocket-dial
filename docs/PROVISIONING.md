@@ -235,13 +235,16 @@ modest: it is the codec/NAT/expiry/line block that gets standardized, not the bo
 ### 2.1 URL scheme
 
 ```
-GET /config/{mac}.cfg     # Yealink key=value. The only route that exists.
+GET /config/{mac}.cfg            # Yealink key=value (or auto-dispatched by User-Agent)
+GET /config/cfg{mac}.xml         # Grandstream XML
+GET /config/{mac}-phone.cfg      # Polycom per-phone XML
+GET /config/000000000000.cfg     # Polycom master/generic XML
+GET /config/spa{mac}.cfg         # Cisco SPA macro-expanded flat-profile XML ($MA)
+GET /config/spa{model}.cfg       # Cisco SPA model-keyed (Profile_Rule bootstrap)
 ```
 
-`{mac}` is 12 **lowercase** hex digits, no separators (§0.2). Yealink substitutes its own MAC
-into a `$MAC.cfg` URL template.
-
-Vendor is implicit: there is one renderer. `User-Agent` is not read and not used for routing.
+`{mac}` is 12 **lowercase** hex digits, no separators (§0.2).
+When requesting `{mac}.cfg`, `User-Agent` is used to detect vendor (Grandstream, Polycom, Cisco SPA, or Yealink fallback). When requesting vendor-specific filename shapes, the vendor format is served directly.
 
 ### 2.2 Request handling
 
@@ -344,35 +347,25 @@ Notes:
 * Unverified: these key names have never been tested against a real Yealink. Treat a
   successful fetch as evidence the *server* works, not that the *phone* accepted it.
 
-### 2.5 Multi-vendor renderers (Issue #177): not yet wired
+### 2.5 Multi-vendor renderers (Issues #177, #234): wired
 
-`src/SIP/ProvisioningConfig.hpp` builds three more vendor configs alongside
-`yealinkConfigFor()`, plus a `Vendor` enum and two dispatch functions
-(`detectVendorFromUserAgent()`, `renderProvisioningConfigForUserAgent()`). All of it is pure
-(no sockets, no NVS, no globals) and host-tested (`tests/ProvisioningConfig_test.cpp`). **None
-of it is reachable through `GET /config/<mac>.cfg` today**; `HttpServer::sendConfigCfg()`
-(`HttpServer.cpp`) still calls `yealinkConfigFor()` unconditionally, and this change
-deliberately did not touch `HttpServer.cpp`/`RequestsHandler.cpp` to make that true (out of
-scope; see the PR that introduced this section).
+`src/SIP/ProvisioningConfig.hpp` builds four vendor configs (`yealinkConfigFor()`,
+`grandstreamConfigFor()`, `polycomPhoneConfigFor()` / `polycomBaseConfigFor()`, and
+`ciscoSpaConfigFor()`), plus vendor detection and dispatch (`detectVendorFromUserAgent()`,
+`renderProvisioningConfigForUserAgent()`). All four are wired into the live HTTP server
+(`src/Helpers/HttpServer.cpp`) via Issue #234:
 
-What is missing to wire it up, precisely, is three separate gaps, not one:
-
-1. **User-Agent isn't captured.** `HttpServer::HttpRequest` (`HttpServer.hpp`) and
-   `parseRequest()` (`HttpServer.cpp`) currently keep `origin`, `host`, `cookie` and `x-csrf`
-   only. `detectVendorFromUserAgent()` needs the raw `User-Agent` header value, which isn't
-   parsed out of the request at all yet.
-2. **The path-shape check is Yealink-only.** `isProvisioningConfigPath()` accepts exactly
-   `/config/` + 12 lowercase hex + `.cfg` (§0.2). None of the other vendors' real request
-   filenames fit that: Grandstream requests `cfg<mac>.xml`, Polycom requests
-   `<mac>-phone.cfg` (and, once, the fixed `000000000000.cfg`), Cisco SPA/Linksys/Sipura
-   request `spa<model>.cfg`. Each needs its own shape check, or a looser one that extracts
-   both the MAC and which shape matched.
-3. **Polycom's base file has no route, and can't use the MAC-keyed one.**
-   `polycomBaseConfigFor()` takes no arguments (it's the same for every phone), but
-   `000000000000.cfg` *does* pass today's `isProvisioningConfigPath()` shape check (12 hex
-   chars, coincidentally all zero) and would then 404 in `findProvisioningInfo()`, which has no
-   device named `000000000000`. Serving it correctly means special-casing that exact filename
-   *before* the registry lookup, not after.
+1. **User-Agent is captured** in `HttpServer::HttpRequest::userAgent` during `parseRequest()`
+   and passed to `renderProvisioningConfigForUserAgent()` when `{mac}.cfg` is fetched.
+2. **Path-shape check (`isProvisioningConfigPath`)** accepts:
+   - Yealink/fallback: `/config/<mac>.cfg`
+   - Grandstream: `/config/cfg<mac>.xml`
+   - Polycom per-phone: `/config/<mac>-phone.cfg`
+   - Polycom master: `/config/000000000000.cfg`
+   - Cisco SPA macro: `/config/spa<mac>.cfg` (expanded `$MA`)
+   - Cisco SPA model: `/config/spa<model>.cfg` (resolves via ARP if known, or serves `<Profile_Rule>` bootstrap redirect)
+3. **Polycom master file** (`000000000000.cfg`) routes directly to `polycomBaseConfigFor()`
+   before any device registry lookup.
 
 **Renderer-by-renderer confidence** (all four share the CR/LF injection guard from Issue #107,
 and the three XML ones additionally XML-escape the extension. That escaping is defence in depth,

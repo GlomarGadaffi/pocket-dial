@@ -8,6 +8,17 @@
 #include "ProvisioningConfig.hpp"
 #include "RequestsHandler.hpp"
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <WinSock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
+
 TEST(ProvisioningConfig, OpenModeConfigHasNoAuthWarningAndBlankPassword)
 {
 	std::string cfg = provisioning::yealinkConfigFor("101", "192.168.4.1", 5060,
@@ -54,6 +65,67 @@ TEST(ProvisioningConfig, PathShapeRejectsWrongLengthOrCharsOrMissingPieces)
 	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/configs/805ec079c37f.cfg"));  // wrong prefix
 	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/805ec079c37f"));       // no suffix
 	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/../../etc/passwd"));   // traversal attempt
+}
+
+TEST(ProvisioningConfig, MultiVendorPathShapesAccepted)
+{
+	// Grandstream cfg<mac>.xml
+	EXPECT_TRUE(HttpServer::isProvisioningConfigPath("/config/cfg805ec079c37f.xml"));
+	// Polycom per-phone <mac>-phone.cfg
+	EXPECT_TRUE(HttpServer::isProvisioningConfigPath("/config/805ec079c37f-phone.cfg"));
+	// Polycom master 000000000000.cfg
+	EXPECT_TRUE(HttpServer::isProvisioningConfigPath("/config/000000000000.cfg"));
+	// Cisco SPA macro spa<mac>.cfg
+	EXPECT_TRUE(HttpServer::isProvisioningConfigPath("/config/spa805ec079c37f.cfg"));
+	// Cisco SPA model spa<model>.cfg
+	EXPECT_TRUE(HttpServer::isProvisioningConfigPath("/config/spa504g.cfg"));
+	EXPECT_TRUE(HttpServer::isProvisioningConfigPath("/config/spa112.cfg"));
+	EXPECT_TRUE(HttpServer::isProvisioningConfigPath("/config/spa303.cfg"));
+}
+
+TEST(ProvisioningConfig, MultiVendorPathShapesRejectedWhenMalformed)
+{
+	// Grandstream malformed
+	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/cfg805ec079c37.xml"));   // 11 hex
+	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/cfg805EC079C37F.xml"));  // uppercase
+	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/cfg805ec079c37f.cfg"));  // wrong suffix
+	// Polycom malformed
+	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/805ec079c37-phone.cfg"));  // 11 hex
+	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/805EC079C37F-phone.cfg")); // uppercase
+	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/805ec079c37f-phone.xml")); // wrong suffix
+	// Cisco SPA malformed
+	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/spa805ec079c37.cfg"));   // 11 hex
+	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/spa.cfg"));              // empty model
+	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/spa504g.xml"));          // wrong suffix
+	EXPECT_FALSE(HttpServer::isProvisioningConfigPath("/config/spa504g/cfg"));          // traversal/slash
+}
+
+TEST(ProvisioningConfig, ParseProvisioningPathExtractsCorrectKeyAndType)
+{
+	std::string key;
+	EXPECT_EQ(HttpServer::parseProvisioningPath("/config/805ec079c37f.cfg", key),
+		HttpServer::ProvisioningPathType::Yealink);
+	EXPECT_EQ(key, "805ec079c37f");
+
+	EXPECT_EQ(HttpServer::parseProvisioningPath("/config/cfg805ec079c37f.xml", key),
+		HttpServer::ProvisioningPathType::Grandstream);
+	EXPECT_EQ(key, "805ec079c37f");
+
+	EXPECT_EQ(HttpServer::parseProvisioningPath("/config/805ec079c37f-phone.cfg", key),
+		HttpServer::ProvisioningPathType::PolycomPhone);
+	EXPECT_EQ(key, "805ec079c37f");
+
+	EXPECT_EQ(HttpServer::parseProvisioningPath("/config/000000000000.cfg", key),
+		HttpServer::ProvisioningPathType::PolycomMaster);
+	EXPECT_TRUE(key.empty());
+
+	EXPECT_EQ(HttpServer::parseProvisioningPath("/config/spa805ec079c37f.cfg", key),
+		HttpServer::ProvisioningPathType::CiscoSpaMac);
+	EXPECT_EQ(key, "805ec079c37f");
+
+	EXPECT_EQ(HttpServer::parseProvisioningPath("/config/spa504g.cfg", key),
+		HttpServer::ProvisioningPathType::CiscoSpaModel);
+	EXPECT_EQ(key, "504g");
 }
 
 // ── RequestsHandler::findProvisioningInfo ───────────────────────────────────────
@@ -368,4 +440,177 @@ TEST(ProvisioningConfig, RenderProvisioningConfigForUserAgentDispatchesToRightRe
 			<< "UA '" << c.userAgent << "' should render a config containing '"
 			<< c.mustContain << "': " << cfg;
 	}
+}
+
+// ── HTTP route integration tests (Issue #234) ───────────────────────────────
+//
+// Ports: this section owns 18170-18179. See CONTRIBUTING_FIRMWARE.md.
+
+namespace
+{
+	int nextProvisioningPort()
+	{
+		static int port = 18170;
+		return port++;
+	}
+
+	std::string httpGetWithUa(int port, const std::string& path, const std::string& userAgent = "")
+	{
+#if defined(_WIN32) || defined(_WIN64)
+		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s == INVALID_SOCKET) return "";
+#else
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0) return "";
+#endif
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(static_cast<uint16_t>(port));
+		inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+		if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+		{
+#if defined(_WIN32) || defined(_WIN64)
+			closesocket(s);
+#else
+			close(s);
+#endif
+			return "";
+		}
+
+		std::string req = "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n";
+		if (!userAgent.empty())
+		{
+			req += "User-Agent: " + userAgent + "\r\n";
+		}
+		req += "Connection: close\r\n\r\n";
+		send(s, req.c_str(), static_cast<int>(req.size()), 0);
+
+		std::string resp;
+		char buf[512];
+		int n;
+		while ((n = recv(s, buf, sizeof(buf), 0)) > 0)
+		{
+			resp.append(buf, static_cast<size_t>(n));
+		}
+#if defined(_WIN32) || defined(_WIN64)
+		closesocket(s);
+#else
+		close(s);
+#endif
+		return resp;
+	}
+}
+
+TEST(ProvisioningConfig, HttpRouteServesPolycomMasterWithoutAdoptedDevice)
+{
+	int port = nextProvisioningPort();
+	RequestsHandler handler("127.0.0.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", port, &handler);
+	server.start();
+
+	std::string resp = httpGetWithUa(port, "/config/000000000000.cfg");
+	EXPECT_NE(resp.find("HTTP/1.1 200 OK"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("Content-Type: application/xml"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("<APPLICATION CONFIG_FILES="), std::string::npos) << resp;
+}
+
+TEST(ProvisioningConfig, HttpRouteDispatchesByPathShape)
+{
+	int port = nextProvisioningPort();
+	RequestsHandler handler("127.0.0.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.adoptDeviceForTest("805ec079c37f", "101");
+	HttpServer server("127.0.0.1", port, &handler);
+	server.start();
+
+	// 1. Grandstream cfg<mac>.xml
+	std::string gsResp = httpGetWithUa(port, "/config/cfg805ec079c37f.xml");
+	EXPECT_NE(gsResp.find("HTTP/1.1 200 OK"), std::string::npos) << gsResp;
+	EXPECT_NE(gsResp.find("Content-Type: application/xml"), std::string::npos) << gsResp;
+	EXPECT_NE(gsResp.find("<gs_provision version=\"1\">"), std::string::npos) << gsResp;
+	EXPECT_NE(gsResp.find("<P35>101</P35>"), std::string::npos) << gsResp;
+
+	// 2. Polycom per-phone <mac>-phone.cfg
+	std::string polyResp = httpGetWithUa(port, "/config/805ec079c37f-phone.cfg");
+	EXPECT_NE(polyResp.find("HTTP/1.1 200 OK"), std::string::npos) << polyResp;
+	EXPECT_NE(polyResp.find("Content-Type: application/xml"), std::string::npos) << polyResp;
+	EXPECT_NE(polyResp.find("<phone1>"), std::string::npos) << polyResp;
+	EXPECT_NE(polyResp.find("reg.1.address=\"101\""), std::string::npos) << polyResp;
+
+	// 3. Cisco SPA macro-expanded spa<mac>.cfg
+	std::string spaResp = httpGetWithUa(port, "/config/spa805ec079c37f.cfg");
+	EXPECT_NE(spaResp.find("HTTP/1.1 200 OK"), std::string::npos) << spaResp;
+	EXPECT_NE(spaResp.find("Content-Type: application/xml"), std::string::npos) << spaResp;
+	EXPECT_NE(spaResp.find("<flat-profile>"), std::string::npos) << spaResp;
+	EXPECT_NE(spaResp.find("<User_ID_1_>101</User_ID_1_>"), std::string::npos) << spaResp;
+
+	// 4. Cisco SPA model bootstrap spa<model>.cfg
+	std::string modelResp = httpGetWithUa(port, "/config/spa504g.cfg");
+	EXPECT_NE(modelResp.find("HTTP/1.1 200 OK"), std::string::npos) << modelResp;
+	EXPECT_NE(modelResp.find("Content-Type: application/xml"), std::string::npos) << modelResp;
+	EXPECT_NE(modelResp.find("<Profile_Rule>http://"), std::string::npos) << modelResp;
+	EXPECT_NE(modelResp.find("/config/spa$MA.cfg</Profile_Rule>"), std::string::npos) << modelResp;
+
+	// 5. Yealink / default <mac>.cfg with no User-Agent
+	std::string ylResp = httpGetWithUa(port, "/config/805ec079c37f.cfg");
+	EXPECT_NE(ylResp.find("HTTP/1.1 200 OK"), std::string::npos) << ylResp;
+	EXPECT_NE(ylResp.find("Content-Type: text/plain"), std::string::npos) << ylResp;
+	EXPECT_NE(ylResp.find("#!version:1.0.0.1"), std::string::npos) << ylResp;
+	EXPECT_NE(ylResp.find("account.1.user_name = 101"), std::string::npos) << ylResp;
+}
+
+TEST(ProvisioningConfig, HttpRouteDispatchesMacCfgByUserAgent)
+{
+	int port = nextProvisioningPort();
+	RequestsHandler handler("127.0.0.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.adoptDeviceForTest("805ec079c37f", "101");
+	HttpServer server("127.0.0.1", port, &handler);
+	server.start();
+
+	// Grandstream UA
+	std::string gsResp = httpGetWithUa(port, "/config/805ec079c37f.cfg", "Grandstream GXP2170 1.0.9.60");
+	EXPECT_NE(gsResp.find("HTTP/1.1 200 OK"), std::string::npos) << gsResp;
+	EXPECT_NE(gsResp.find("Content-Type: application/xml"), std::string::npos) << gsResp;
+	EXPECT_NE(gsResp.find("<gs_provision version=\"1\">"), std::string::npos) << gsResp;
+
+	// Polycom UA
+	std::string polyResp = httpGetWithUa(port, "/config/805ec079c37f.cfg", "PolycomVVX-VVX411-UA/5.9.3.0416");
+	EXPECT_NE(polyResp.find("HTTP/1.1 200 OK"), std::string::npos) << polyResp;
+	EXPECT_NE(polyResp.find("Content-Type: application/xml"), std::string::npos) << polyResp;
+	EXPECT_NE(polyResp.find("<phone1>"), std::string::npos) << polyResp;
+
+	// Cisco SPA UA
+	std::string spaResp = httpGetWithUa(port, "/config/805ec079c37f.cfg", "Cisco/SPA504G-7.6.2b");
+	EXPECT_NE(spaResp.find("HTTP/1.1 200 OK"), std::string::npos) << spaResp;
+	EXPECT_NE(spaResp.find("Content-Type: application/xml"), std::string::npos) << spaResp;
+	EXPECT_NE(spaResp.find("<flat-profile>"), std::string::npos) << spaResp;
+
+	// Yealink UA
+	std::string ylResp = httpGetWithUa(port, "/config/805ec079c37f.cfg", "Yealink SIP-T46S 66.86.0.15");
+	EXPECT_NE(ylResp.find("HTTP/1.1 200 OK"), std::string::npos) << ylResp;
+	EXPECT_NE(ylResp.find("Content-Type: text/plain"), std::string::npos) << ylResp;
+	EXPECT_NE(ylResp.find("#!version:1.0.0.1"), std::string::npos) << ylResp;
+}
+
+TEST(ProvisioningConfig, HttpRouteReturns404ForUnknownMac)
+{
+	int port = nextProvisioningPort();
+	RequestsHandler handler("127.0.0.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", port, &handler);
+	server.start();
+
+	std::string r1 = httpGetWithUa(port, "/config/112233445566.cfg");
+	EXPECT_NE(r1.find("HTTP/1.1 404 Not Found"), std::string::npos) << r1;
+
+	std::string r2 = httpGetWithUa(port, "/config/cfg112233445566.xml");
+	EXPECT_NE(r2.find("HTTP/1.1 404 Not Found"), std::string::npos) << r2;
+
+	std::string r3 = httpGetWithUa(port, "/config/112233445566-phone.cfg");
+	EXPECT_NE(r3.find("HTTP/1.1 404 Not Found"), std::string::npos) << r3;
+
+	std::string r4 = httpGetWithUa(port, "/config/spa112233445566.cfg");
+	EXPECT_NE(r4.find("HTTP/1.1 404 Not Found"), std::string::npos) << r4;
 }

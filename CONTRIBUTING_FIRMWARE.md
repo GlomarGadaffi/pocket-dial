@@ -293,6 +293,7 @@ Current allocation:
 | `18130`-`18139` | `TwoRoleAuth_test.cpp` |
 | `18140`-`18159` | `ConfigExportImport_test.cpp` |
 | `18160`-`18169` | `EmailHttp_test.cpp` (auto-incrementing `_nextPort`) |
+| `18170`-`18179` | `ProvisioningConfig_test.cpp` (auto-incrementing `_nextPort`) |
 | `18200`-`18229` | `SmtpDialogue_test.cpp` (fake SMTP server, raw sockets — not HttpServer, but still claims its own block; ~17 scripted-server tests via auto-incrementing `g_nextPort`, sized with headroom. Originally claimed 18130-18159 — renumbered here, at merge time, when that turned out to collide with the two rows above it, which claimed the same "next free block" independently and landed first. See #159's PR for the story; the lesson is in `SmtpDialogue_test.cpp`'s own header comment.) |
 | `19100`+ | `TelephonyConfigHttp_test.cpp` (auto-incrementing `_nextPort`) |
 | `193xx` | `ApiKillParse_test.cpp` (auto-incrementing `_nextPort`) |

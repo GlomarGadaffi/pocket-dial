@@ -11,6 +11,7 @@
 #include "DeviceConfig.hpp"
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
+#include "ArpLookup.hpp"
 #include "index_html.h"
 #include "IPHelper.hpp"
 #include "UrlEncode.hpp"
@@ -488,13 +489,13 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "GET" && isProvisioningConfigPath(req.path))
 	{
-		// Issue #35: GET /config/<mac>.cfg, e.g. GET /config/805ec079c37f.cfg —
+		// Issue #35, #234: GET /config/<mac>.cfg, /config/cfg<mac>.xml, etc. —
 		// a phone's own auto-provisioning fetch, so intentionally NOT
 		// session-gated (a booting phone has no session cookie to present).
-		// The MAC itself is the only credential: it's not guessable (2^48
+		// The MAC/path itself is the credential: it's not guessable (2^48
 		// space) and only served for a MAC already in the adopted-device
-		// registry, so an unrelated prober learns nothing by guessing.
-		sendConfigCfg(clientSock, req.path.substr(8, 12));
+		// registry, or a recognized master/bootstrap file.
+		sendProvisioningResponse(clientSock, req);
 	}
 	else if (req.method == "GET" && req.path == "/api/status")
 	{
@@ -1011,7 +1012,7 @@ HttpServer::HttpRequest HttpServer::parseRequest(const std::string& raw)
 				while (!hName.empty() && std::isspace(static_cast<unsigned char>(hName.back()))) hName.pop_back();
 
 				if (hName == "origin" || hName == "host" || hName == "cookie" ||
-				    hName == "x-csrf") {
+				    hName == "x-csrf" || hName == "user-agent") {
 					size_t valStart = colon + 1;
 					while (valStart < line.size() && std::isspace(static_cast<unsigned char>(line[valStart]))) valStart++;
 					std::string hVal = line.substr(valStart);
@@ -1020,6 +1021,7 @@ HttpServer::HttpRequest HttpServer::parseRequest(const std::string& raw)
 					else if (hName == "host") req.host = hVal;
 					else if (hName == "cookie") req.cookie = hVal;
 					else if (hName == "x-csrf") req.csrf = hVal;
+					else if (hName == "user-agent") req.userAgent = hVal;
 				}
 			}
 			pos = lineEnd + 2;
@@ -1820,46 +1822,196 @@ void HttpServer::sendApiTrace(int sock)
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 
-bool HttpServer::isProvisioningConfigPath(const std::string& path)
+HttpServer::ProvisioningPathType HttpServer::parseProvisioningPath(
+	const std::string& path, std::string& outKey)
 {
+	outKey.clear();
 	static const std::string prefix = "/config/";
-	static const std::string suffix = ".cfg";
-	if (path.size() != prefix.size() + 12 + suffix.size()) return false;
-	if (path.compare(0, prefix.size(), prefix) != 0) return false;
-	if (path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
-	for (std::size_t i = prefix.size(); i < prefix.size() + 12; ++i)
+	if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0)
 	{
-		char c = path[i];
-		bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-		if (!hex) return false;
+		return ProvisioningPathType::Invalid;
 	}
-	return true;
+
+	const std::string filename = path.substr(prefix.size());
+
+	auto is12LowerHex = [](const std::string& s) {
+		if (s.size() != 12) return false;
+		for (char c : s)
+		{
+			bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+			if (!hex) return false;
+		}
+		return true;
+	};
+
+	// 1. Polycom master/generic config: 000000000000.cfg (Issue #234 Gap 3)
+	if (filename == "000000000000.cfg") return ProvisioningPathType::PolycomMaster;
+
+	// 2. Grandstream: cfg<12 hex>.xml (19 chars: "cfg" + 12 hex + ".xml")
+	if (filename.size() == 19 && filename.compare(0, 3, "cfg") == 0 &&
+	    filename.compare(15, 4, ".xml") == 0)
+	{
+		std::string mac = filename.substr(3, 12);
+		if (is12LowerHex(mac)) { outKey = mac; return ProvisioningPathType::Grandstream; }
+	}
+
+	// 3. Polycom per-phone: <12 hex>-phone.cfg (22 chars: 12 hex + "-phone.cfg")
+	if (filename.size() == 22 && filename.compare(12, 10, "-phone.cfg") == 0)
+	{
+		std::string mac = filename.substr(0, 12);
+		if (is12LowerHex(mac)) { outKey = mac; return ProvisioningPathType::PolycomPhone; }
+	}
+
+	// 4. Cisco SPA macro-expanded: spa<12 hex>.cfg (19 chars: "spa" + 12 hex + ".cfg")
+	if (filename.size() == 19 && filename.compare(0, 3, "spa") == 0 &&
+	    filename.compare(15, 4, ".cfg") == 0)
+	{
+		std::string mac = filename.substr(3, 12);
+		if (is12LowerHex(mac)) { outKey = mac; return ProvisioningPathType::CiscoSpaMac; }
+	}
+
+	// 5. Cisco SPA model-keyed: spa<model>.cfg (e.g. spa504g.cfg)
+	if (filename.size() > 7 && filename.compare(0, 3, "spa") == 0 &&
+	    filename.compare(filename.size() - 4, 4, ".cfg") == 0)
+	{
+		std::string model = filename.substr(3, filename.size() - 7);
+		if (model.size() >= 2 && model.size() <= 8)
+		{
+			bool validModel = true;
+			for (char c : model) if (!std::isalnum(static_cast<unsigned char>(c))) { validModel = false; break; }
+			if (validModel) { outKey = model; return ProvisioningPathType::CiscoSpaModel; }
+		}
+	}
+
+	// 6. Yealink / default: <12 hex>.cfg (16 chars: 12 hex + ".cfg")
+	if (filename.size() == 16 && filename.compare(12, 4, ".cfg") == 0)
+	{
+		std::string mac = filename.substr(0, 12);
+		if (is12LowerHex(mac)) { outKey = mac; return ProvisioningPathType::Yealink; }
+	}
+
+	return ProvisioningPathType::Invalid;
 }
 
-void HttpServer::sendConfigCfg(int sock, const std::string& mac)
+bool HttpServer::isProvisioningConfigPath(const std::string& path)
 {
+	std::string unused;
+	return parseProvisioningPath(path, unused) != ProvisioningPathType::Invalid;
+}
+
+void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
+{
+	std::string key;
+	ProvisioningPathType type = parseProvisioningPath(req.path, key);
+	if (type == ProvisioningPathType::Invalid)
+	{
+		send404(sock);
+		return;
+	}
+
+	// 1. Polycom master/generic config: served directly without registry lookup (Issue #234 Gap 3)
+	if (type == ProvisioningPathType::PolycomMaster)
+	{
+		std::string cfg = provisioning::polycomBaseConfigFor();
+		sendResponse(sock, 200, "OK", "application/xml", cfg);
+		return;
+	}
+
+	std::string activeIp = (_ip == "0.0.0.0") ? getPrimaryLocalIP() : _ip;
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
-	auto info = handler ? handler->findProvisioningInfo(mac) : std::nullopt;
+
+	// 2. Cisco SPA model-keyed request (e.g. spa504g.cfg): resolve via ARP or serve Profile_Rule redirect
+	if (type == ProvisioningPathType::CiscoSpaModel)
+	{
+		std::string mac;
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		if (!req.clientIp.empty())
+		{
+			struct sockaddr_in sa;
+			std::memset(&sa, 0, sizeof(sa));
+			sa.sin_family = AF_INET;
+			if (inet_pton(AF_INET, req.clientIp.c_str(), &sa.sin_addr) == 1)
+			{
+				auto macOpt = ArpLookup::pdLookupMac(sa);
+				if (macOpt.has_value())
+				{
+					mac = ArpLookup::toHex12(*macOpt);
+				}
+			}
+		}
+#endif
+		if (!mac.empty())
+		{
+			auto info = handler ? handler->findProvisioningInfo(mac) : std::nullopt;
+			if (info)
+			{
+				std::string cfg = provisioning::ciscoSpaConfigFor(
+					info->extension, activeIp, 5060, info->authRequired);
+				if (!cfg.empty())
+				{
+					sendResponse(sock, 200, "OK", "application/xml", cfg);
+					return;
+				}
+			}
+		}
+
+		std::string bootstrap =
+			"<flat-profile>\r\n"
+			"<!-- Auto-generated by pocket-dial. Issues #35, #234: Cisco SPA bootstrap -->\r\n"
+			"<Profile_Rule>http://" + activeIp + "/config/spa$MA.cfg</Profile_Rule>\r\n"
+			"</flat-profile>\r\n";
+		sendResponse(sock, 200, "OK", "application/xml", bootstrap);
+		return;
+	}
+
+	// 3. MAC-keyed provisioning paths (Yealink, Grandstream, PolycomPhone, CiscoSpaMac)
+	auto info = handler ? handler->findProvisioningInfo(key) : std::nullopt;
 	if (!info)
 	{
 		send404(sock);
 		return;
 	}
 
-	// Same IP resolution as sendApiStatus; SIP port is hardcoded 5060 there
-	// too (this codebase doesn't support running the SIP listener on a
-	// non-default port).
-	std::string activeIp = (_ip == "0.0.0.0") ? getPrimaryLocalIP() : _ip;
-	std::string cfg = provisioning::yealinkConfigFor(info->extension, activeIp, 5060,
-		info->authRequired);
+	std::string cfg;
+	std::string contentType = "application/xml";
+
+	if (type == ProvisioningPathType::Grandstream)
+	{
+		cfg = provisioning::grandstreamConfigFor(info->extension, activeIp, 5060, info->authRequired);
+	}
+	else if (type == ProvisioningPathType::PolycomPhone)
+	{
+		cfg = provisioning::polycomPhoneConfigFor(info->extension, activeIp, 5060, info->authRequired);
+	}
+	else if (type == ProvisioningPathType::CiscoSpaMac)
+	{
+		cfg = provisioning::ciscoSpaConfigFor(info->extension, activeIp, 5060, info->authRequired);
+	}
+	else // ProvisioningPathType::Yealink (/config/<mac>.cfg)
+	{
+		provisioning::Vendor vendor = provisioning::detectVendorFromUserAgent(req.userAgent);
+		cfg = provisioning::renderProvisioningConfigForUserAgent(
+			req.userAgent, info->extension, activeIp, 5060, info->authRequired);
+		if (vendor == provisioning::Vendor::Yealink)
+		{
+			contentType = "text/plain";
+		}
+	}
+
 	if (cfg.empty())
 	{
-		// The builder refused the extension (CR/LF -- Issue #107). There is no safe
-		// partial config to serve, so this is a miss, not a 200 with an empty body.
 		send404(sock);
 		return;
 	}
-	sendResponse(sock, 200, "OK", "text/plain", cfg);
+	sendResponse(sock, 200, "OK", contentType, cfg);
+}
+
+void HttpServer::sendConfigCfg(int sock, const std::string& mac)
+{
+	HttpRequest req;
+	req.method = "GET";
+	req.path = "/config/" + mac + ".cfg";
+	sendProvisioningResponse(sock, req);
 }
 
 void HttpServer::sendApiVoicemail(int sock, const std::string& body)

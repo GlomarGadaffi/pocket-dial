@@ -446,6 +446,13 @@ public:
 	// prove a dial-plan Trunk rule's transform actually reached makeCall() —
 	// see that accessor's comment. Not compiled into device firmware.
 	AnchorClient* anchorClientForTest() { return _anchorClient; }
+
+	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
+	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_registrar.adoptDeviceForTest(mac, ext, state);
+	}
 #endif
 
 	// ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
