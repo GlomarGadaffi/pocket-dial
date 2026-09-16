@@ -8872,11 +8872,14 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 	_asyncOutbox.clear();
 
 	// The single exit every deferred message passes through. RFC 3261 §17:
-	// register outgoing INVITEs for retransmit here, so Timer A/B coverage is
-	// structural rather than something each flush site re-implements — a new
-	// flush path would otherwise send one-shot UDP INVITEs that are simply lost
-	// on a dropped packet. maybeTrack filters to INVITE requests, so responses
-	// and NOTIFYs are ignored.
+	// register outgoing messages for retransmit here, so Timer A/B, E/F
+	// (requests) and G/H/J (our own responses) coverage is structural rather
+	// than something each flush site re-implements — a new flush path would
+	// otherwise send one-shot UDP messages that are simply lost on a dropped
+	// packet. classify() (TransactionLayer.cpp) tracks INVITE requests, every
+	// other request except ACK/OPTIONS/REGISTER (NOTIFY included), and our
+	// own responses to INVITE/BYE/CANCEL/REFER/UPDATE; everything else is
+	// left untracked.
 	//
 	// Ordering matters (#70): the scan must run after everything that appends to
 	// _outbox during this pass (BLF NOTIFYs, tick()-originated forks — park
