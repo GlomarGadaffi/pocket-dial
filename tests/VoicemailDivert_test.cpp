@@ -6,7 +6,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "RequestsHandler.hpp"
@@ -553,12 +555,32 @@ TEST(VoicemailDivert, DepositPlaysGreetingBeforeRecordingWhenOneIsLoaded)
 	EXPECT_FALSE(handler.feedVoicemailAudioForTest(slot, earlyAudio, sizeof(earlyAudio)))
 		<< "must still be playing the greeting, not recording, right after answer";
 
-	uint8_t out[3] = {};
-	ASSERT_TRUE(handler.readVoicemailPlaybackForTest(slot, out, sizeof(out)));
-	EXPECT_EQ(out[0], 77); EXPECT_EQ(out[1], 78); EXPECT_EQ(out[2], 79);
+	// RtpSender is REAL on a WSL/Linux host build (#82's Linux media path:
+	// an actual std::thread pacer, not a stub) and starts pulling frames
+	// from this leg via fillTx() on its own schedule the instant
+	// answerVoicemailDeposit() calls _vmRtpSenders[slot].start() -- often
+	// before this test's own thread reaches its next line. Asserting that
+	// THIS thread's own readVoicemailPlaybackForTest() call is the one that
+	// drains the clip is a race this test lost ~20% of the time. The exact
+	// bytes a clip delivers are already unit-tested with no threading
+	// involved (VoicemailLeg.StartPlayingFillsFromClipSequentially,
+	// PlaybackIsOneShotNotALoop); this test's job is proving the
+	// greeting-before-recording ORDERING, so poll for PlaybackDone instead
+	// of racing the sender thread for the first fillTx() call.
+	bool reachedPlaybackDone = false;
+	for (int i = 0; i < 100; ++i)
+	{
+		if (handler.voicemailLegStateForTest(slot) == VoicemailLeg::State::PlaybackDone)
+		{
+			reachedPlaybackDone = true;
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	ASSERT_TRUE(reachedPlaybackDone) << "greeting never finished playing within 100ms";
 
-	// The greeting (3 bytes) is now fully delivered -> PlaybackDone. tick()
-	// is the only thing that advances this to Recording.
+	// The greeting is now fully delivered -> PlaybackDone. tick() is the
+	// only thing that advances this to Recording.
 	handler.tick();
 
 	const uint8_t frame[] = {10, 20};

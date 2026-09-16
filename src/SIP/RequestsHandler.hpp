@@ -913,9 +913,10 @@ public:
 	size_t voicemailFlushQueueDepthForTest() const { return _vmFlushQueue.size(); }
 	// Test-only seam, same reasoning as RtpReceiver::dispatchDtmf() being
 	// public "so host tests can reach it": RtpReceiver::start() is a no-op
-	// stub on host (no real socket), so nothing can otherwise get caller
-	// audio into an active leg. `slot` comes from
-	// Session::getVoicemailLegSlot() on the session a test just answered.
+	// stub on EVERY host build (WSL/Linux included -- see RtpReceiver.cpp's
+	// `#else` host-stub branch), so nothing can otherwise get caller audio
+	// into an active leg. `slot` comes from Session::getVoicemailLegSlot()
+	// on the session a test just answered.
 	bool feedVoicemailAudioForTest(int slot, const uint8_t* mulaw, size_t n)
 	{
 		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return false;
@@ -923,11 +924,31 @@ public:
 	}
 	// Test-only counterpart to feedVoicemailAudioForTest(): reads what the
 	// leg would send the caller right now (a greeting/prompt frame, or false
-	// if not Playing) -- same no-real-socket reasoning.
+	// if not Playing).
+	//
+	// UNLIKE RtpReceiver, RtpSender is REAL on a WSL/Linux host build (#82's
+	// Linux media path spins an actual std::thread pacer -- see
+	// RtpSender.cpp's `__linux__` branch), and it calls this same leg's
+	// fillTx() on its own 20 ms schedule the instant answerVoicemailDeposit()
+	// starts it -- before this seam's caller gets a chance to. A test that
+	// calls this synchronously right after answering a Playing leg is
+	// racing that thread for the clip and MUST NOT assert on winning that
+	// race (see VoicemailDivert.DepositPlaysGreetingBeforeRecordingWhenOneIsLoaded's
+	// fix history) -- poll voicemailLegStateForTest() for PlaybackDone
+	// instead of asserting this call succeeds on the first try.
 	bool readVoicemailPlaybackForTest(int slot, uint8_t* out, size_t count)
 	{
 		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return false;
 		return _vmLegs[slot].fillTx(out, count);
+	}
+	// Test-only: the leg's own state, for polling past the RtpSender race
+	// described above (e.g. "wait for PlaybackDone") without touching
+	// fillTx()/onCallerRtp() and perturbing the very state being observed.
+	VoicemailLeg::State voicemailLegStateForTest(int slot) const
+	{
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS))
+			return VoicemailLeg::State::Idle;
+		return _vmLegs[slot].state();
 	}
 	// Test-only: inject a greeting clip without a real filesystem at
 	// /sdcard/vm/greeting.wav (which doesn't exist on host, or exist as a
