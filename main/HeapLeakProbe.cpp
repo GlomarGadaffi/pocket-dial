@@ -59,9 +59,11 @@
 #include "esp_heap_caps.h"
 #include "esp_heap_trace.h"
 #include "esp_memory_utils.h"   // esp_ptr_internal
-#include <cstdio>                 // snprintf
+#include <cstdarg>                // va_list, for probePrintf
+#include <cstdio>                 // vsnprintf
+#include <cstdint>                // uintptr_t
+#include <unistd.h>               // write(), STDERR_FILENO
 #include "esp_log.h"
-#include "esp_rom_sys.h"    // esp_rom_printf -- see probePrintf above
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -74,8 +76,13 @@ namespace
 
 constexpr char TAG[] = "HeapProbe";
 
-// EVERY LINE THIS PROBE PRINTS GOES THROUGH esp_rom_printf, NOT ESP_LOGx.
-// This is not a style choice; ESP_LOGx cannot carry this output at all.
+// HOW THIS PROBE PRINTS, AND WHY IT IS NEITHER ESP_LOGx NOR esp_rom_printf.
+//
+// Every line goes through probePrintf() below: vsnprintf into a stack buffer,
+// then one write() to fd 2. Both of the obvious alternatives are wrong here,
+// and each was wrong in a way that cost a board cycle or nearly did.
+//
+// NOT ESP_LOGx -- it silently discards this output.
 //
 // The non-display builds install LogQueue's non-blocking hook via
 // esp_log_set_vprintf (src/Helpers/LogQueue.hpp). That hook formats into a
@@ -96,43 +103,67 @@ constexpr char TAG[] = "HeapProbe";
 // timing; it was how many of ~400 lines happened to win a 16-slot queue before
 // the panic, and a panic discards whatever is still queued.
 //
-// esp_rom_printf writes the UART FIFO directly: synchronous, no heap, no
-// queue, nothing to drop, and no syslog tee (the drain task's tee does an lwip
-// send per line, on a board whose Ethernet is the thing dying). It is what
-// IDF's own heap_trace_dump_base() uses, with these same %p / %u conversions
-// -- IDF's mistake was the critical section wrapped around the loop, not the
-// print. Our loop holds no critical section.
+// Consequence of leaving ESP_LOGx: these lines carry no "W (12345)" prefix.
+// The literal "HeapProbe:" below is what tooling greps for, and every line is
+// emitted in true program order -- which ESP_LOGx could not guarantee anyway,
+// since the queue lags by up to a drain interval and records could overtake
+// their own dump header.
 //
-// Blocking on the UART FIFO paces the loop to 115200 baud (~2 s for a full
-// 400-line dump), which is why the vTaskDelay(1) every batch in
-// dumpInternalRecords() is load-bearing: esp_rom_printf spins rather than
-// yielding, and starving the idle task for 2 s would trade this bug for a
-// task-watchdog panic.
+// NOT esp_rom_printf EITHER -- it writes the UART FIFO with no lock.
 //
-// Consequence: these lines carry no "W (12345)" ESP_LOG prefix. The literal
-// "HeapProbe:" prefix below is what tooling greps for, and every line is
-// emitted in true program order -- unlike ESP_LOGx, which lags by up to the
-// drain interval and would let records overtake their own dump header.
-// ONE THING ESP_LOGx GAVE US THAT esp_rom_printf DOES NOT: format checking.
-// esp_rom_sys.h:46 declares `int esp_rom_printf(const char *fmt, ...);` with NO
-// __attribute__((format(printf, 1, 2))), so gcc will not diagnose a %u fed a
-// size_t, or a conversion with no argument behind it -- on a diagnostic whose
-// entire job is printing, and where a bad %s is precisely the bug that just
-// crashed this board twice.
+// IDF's heap_trace_dump_base() gets away with esp_rom_printf only because the
+// critical section that tripped the interrupt watchdog ALSO serialized the
+// port. This loop deliberately holds no critical section, so during a ~2 s
+// dump there would be two unsynchronized writers on UART0: heap_probe
+// (unaffinitized) and log_drain (pinned core 0, fputs(stderr)). The probe
+// occupies the wire for essentially all of that window, and the window is
+// never quiet -- the Yealink re-registers every ~30 s by design, plus OPTIONS
+// and mDNS. Drained lines would land mid-record and garble them.
 //
-// probePrintfFormatCheck() restores it. The call sits under `if (false)`, so
-// gcc type-checks the arguments against the format string at compile time and
-// then discards the branch: the arguments are evaluated zero times and no code
-// is emitted. -Werror is on in this build, so a format mistake is a build
-// failure rather than a runtime surprise.
-__attribute__((format(printf, 1, 2)))
-inline void probePrintfFormatCheck(const char*, ...) {}
+// That failure is especially nasty here: a garbled record makes the capture
+// fail the very line-count check built to detect dropped records, on a dump
+// that completed correctly on the device. A false integrity failure teaches
+// people to ignore the integrity check.
+//
+// So: format into a stack buffer, emit with ONE write() to fd 2.
+//
+//   - Still bypasses LogQueue. The queue hook is installed only on
+//     esp_log_set_vprintf; the drain task's own fputs(stderr) is the proof
+//     that fd 2 is the raw console path underneath it.
+//   - ATOMIC per line. uart_vfs.c:236 takes
+//     _lock_acquire_recursive(&s_ctx[fd]->write_lock) around the whole write,
+//     so a HeapProbe: line cannot be split by another writer.
+//   - Goes wherever the console goes. Verified CONFIG_ESP_CONSOLE_UART_DEFAULT
+//     (UART0, 115200), with USB-Serial-JTAG only secondary -- worth checking
+//     rather than assuming, because on a USB-SJ-primary board esp_rom_printf
+//     would have gone to pins nobody was listening on and the probe would have
+//     looked silent rather than broken.
+//   - snprintf carries a real __attribute__((format(printf,...))), unlike
+//     esp_rom_printf (esp_rom_sys.h:46 declares it bare). So -Wformat applies
+//     directly and no checking workaround is needed: with -Werror on, a %u fed
+//     a size_t is a build failure. Mutation-tested by adding an unmatched %d.
+//   - No heap; one 256-byte stack buffer, reused.
+//
+// write() blocks on the UART at 115200, which paces the loop, which is why the
+// vTaskDelay(1) per batch in dumpInternalRecords() is load-bearing -- without
+// it a ~2 s dump starves the idle task into a task-WDT panic.
+constexpr size_t kLineBytes = 256;
 
-#define probePrintf(...)                                 \
-	do {                                                 \
-		if (false) probePrintfFormatCheck(__VA_ARGS__);  \
-		esp_rom_printf(__VA_ARGS__);                     \
-	} while (false)
+__attribute__((format(printf, 1, 2)))
+void probePrintf(const char* fmt, ...)
+{
+	char line[kLineBytes];
+	va_list ap;
+	va_start(ap, fmt);
+	const int n = vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (n <= 0) return;
+	// vsnprintf returns what it WOULD have written; clamp so an over-long
+	// line is truncated rather than reading past the buffer.
+	const size_t len = (static_cast<size_t>(n) < sizeof(line))
+		? static_cast<size_t>(n) : sizeof(line) - 1;
+	write(STDERR_FILENO, line, len);
+}
 
 // 4000 records x 40-odd bytes each, in PSRAM. Sized to comfortably outlast the
 // ~220 s onset window rather than to be frugal: HEAP_TRACE_LEAKS drops a
@@ -234,8 +265,8 @@ void logPerTask(uint32_t atSec)
 		// copying the name by value under CONFIG_HEAP_TRACK_DELETED_TASKS.
 		// That is the right follow-up; it is not worth a second untested change
 		// on a bench that has already taken three crashes from this file.
-		probePrintf("HeapProbe:   owner %p  %8u bytes  %5u blocks\n",
-			totals[i].task,
+		probePrintf("HeapProbe:   owner 0x%08x  %8u bytes  %5u blocks\n",
+			static_cast<unsigned>(reinterpret_cast<uintptr_t>(totals[i].task)),
 			static_cast<unsigned>(totals[i].size[0]),
 			static_cast<unsigned>(totals[i].count[0]));
 	}
@@ -302,13 +333,16 @@ void dumpInternalRecords(uint32_t atSec)
 			for (int f = 0; f < CONFIG_HEAP_TRACING_STACK_DEPTH; ++f)
 			{
 				if (rec.alloced_by[f] == nullptr) break;
-				off += snprintf(frames + off, sizeof(frames) - off, " %p",
-					rec.alloced_by[f]);
+				off += snprintf(frames + off, sizeof(frames) - off, " 0x%08x",
+						static_cast<unsigned>(
+						reinterpret_cast<uintptr_t>(rec.alloced_by[f])));
 				if (off >= static_cast<int>(sizeof(frames)) - 1) break;
 			}
 			frames[sizeof(frames) - 1] = '\0';
-			probePrintf("HeapProbe:   %6u B @ %p by%s\n",
-				static_cast<unsigned>(rec.size), rec.address, frames);
+			probePrintf("HeapProbe:   %6u B @ 0x%08x by%s\n",
+				static_cast<unsigned>(rec.size),
+				static_cast<unsigned>(reinterpret_cast<uintptr_t>(rec.address)),
+				frames);
 			++printed;
 		}
 
