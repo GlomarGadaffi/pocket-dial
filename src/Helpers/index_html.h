@@ -555,6 +555,11 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
         <label class="toggle"><input type="checkbox" id="jd-dnd" aria-label="Do Not Disturb" onchange="toggleDnd()"><span class="track"><span class="knob"></span></span></label>
       </div>
       <hr class="hr">
+      <div class="row" style="justify-content:space-between">
+        <span class="subhead" style="margin:0">Voicemail</span>
+        <label class="toggle"><input type="checkbox" id="jd-vm" onchange="toggleVoicemail()"><span class="track"><span class="knob"></span></span></label>
+      </div>
+      <hr class="hr">
       <div class="subhead">Call Forwarding</div>
       <div class="fwd-row"><label for="jd-fwd-always">Always</label><input type="text" id="jd-fwd-always" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('always')">Set</button></div>
       <div class="fwd-row"><label for="jd-fwd-busy">Busy</label><input type="text" id="jd-fwd-busy" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('busy')">Set</button></div>
@@ -919,9 +924,10 @@ document.addEventListener("keydown",function(e){
    extension parks itself, so parkedExt === parker == the same caller). */
 function buildIndex(d){
   var idx={};
-  function ensure(n){n=String(n);if(!idx[n])idx[n]={num:n,addr:"",reg:false,dnd:false,sessionState:"",peer:"",duration:"",parked:false,parkedBy:"",orbit:""};return idx[n];}
+  function ensure(n){n=String(n);if(!idx[n])idx[n]={num:n,addr:"",reg:false,dnd:false,voicemail:false,sessionState:"",peer:"",duration:"",parked:false,parkedBy:"",orbit:""};return idx[n];}
   (d.clients||[]).forEach(function(c){var e=ensure(c.number);e.reg=true;e.addr=c.address||"";});
   (d.dnd||[]).forEach(function(n){ensure(n).dnd=true;});
+  (d.voicemail||[]).forEach(function(n){ensure(n).voicemail=true;});
   (d.sessions||[]).forEach(function(s){
     var a=ensure(s.caller),b=ensure(s.callee);
     a.sessionState=s.state||"";a.peer=String(s.callee);a.duration=s.duration||"";
@@ -1028,7 +1034,7 @@ var JACK_STATE_COLOR={idle:"var(--idle)",active:"var(--active)",ringing:"var(--r
 function openJack(ext){
   selectedJack=ext;
   var idx=buildIndex(statusData);
-  var e=idx[ext]||{num:ext,addr:"",reg:false,dnd:false,sessionState:"",peer:"",duration:"",parked:false};
+  var e=idx[ext]||{num:ext,addr:"",reg:false,dnd:false,voicemail:false,sessionState:"",peer:"",duration:"",parked:false};
   var state=jackStateOf(e);
   $("jd-num").textContent=ext;
   var lamp=$("jd-lamp");
@@ -1046,6 +1052,7 @@ function openJack(ext){
   }).map(function(g){return String(g.extension);});
   $("jd-groups").textContent=jg.length?jg.join(", "):"\u2014";
   $("jd-dnd").checked=!!e.dnd;
+  $("jd-vm").checked=!!e.voicemail;
   var fwd=(statusData.forwards||[]).filter(function(f){return String(f.extension)===String(ext);})[0]||{};
   $("jd-fwd-always").value=fwd.always||"";
   $("jd-fwd-busy").value=fwd.busy||"";
@@ -1062,6 +1069,14 @@ function toggleDnd(){
   post("/api/dnd","extension="+encodeURIComponent(selectedJack)+"&on="+(on?"1":"0"))
     .then(function(){setMsg("jd-msg","DND "+(on?"enabled":"disabled")+" for "+selectedJack,"ok");fetchStatus();})
     .catch(function(err){setMsg("jd-msg",err.message,"err");$("jd-dnd").checked=!on;});
+}
+function toggleVoicemail(){
+  if(!selectedJack)return;
+  if(!gateCheck()){$("jd-vm").checked=!$("jd-vm").checked;return;}
+  var on=$("jd-vm").checked;
+  post("/api/voicemail","extension="+encodeURIComponent(selectedJack)+"&on="+(on?"1":"0"))
+    .then(function(){setMsg("jd-msg","Voicemail "+(on?"enabled":"disabled")+" for "+selectedJack,"ok");fetchStatus();})
+    .catch(function(err){setMsg("jd-msg",err.message,"err");$("jd-vm").checked=!on;});
 }
 function jdSaveFwd(trigger){
   if(!selectedJack||!gateCheck())return;
@@ -1714,7 +1729,7 @@ function factoryReset(){
    pseudo-AORs the engine originates as. This map is a COURTESY: every gate it
    fronts is enforced again in HttpServer.cpp, which is the authority. Keep the
    two in step, but never rely on this one. */
-var PD_RESERVED_EXT={"777":1,"999":1,"555":1,"888":1,"440":1,"pbx":1,"moh":1,"server":1};
+var PD_RESERVED_EXT={"777":1,"999":1,"555":1,"888":1,"440":1,"796":1,"pbx":1,"moh":1,"server":1};
 function isDialTokenSafeJs(s){return !!s&&/^[A-Za-z0-9#*]+$/.test(s);}
 function openTelephonyModal(){
   if(!gateCheck())return;

@@ -25,6 +25,7 @@
 #endif
 
 #include <functional>
+#include <iostream>
 #include <unordered_map>
 #include <string>
 #include <string_view>
@@ -61,6 +62,9 @@
 #include "TelephonyApiConfig.hpp"
 #include "DidMapping.hpp"
 #include "MediaBridge.hpp"
+#include "VoicemailLeg.hpp"
+#include "VoicemailArchive.hpp"
+#include "VoicemailMenu.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
 #include "Registrar.hpp"
@@ -85,6 +89,17 @@ public:
 	// torn down while those members are still alive (mirrors drawbridge's
 	// ~RequestsHandler exactly).
 	~RequestsHandler();
+
+	// Non-copyable: already implicitly true (a std::mutex member alone
+	// deletes the implicit copy ctor/operator=), but this engine class also
+	// owns live sockets/RTP tasks/PSRAM buffers directly -- copying it
+	// would silently duplicate the mutex-protected state, not the
+	// resources it guards. Declared explicitly (found via CI cppcheck
+	// 2.21.0's noCopyConstructor/noOperatorEq, tripped once the voicemail
+	// slice added more directly-owned dynamic-resource members) so the
+	// invariant is documented rather than only accidentally true.
+	RequestsHandler(const RequestsHandler&) = delete;
+	RequestsHandler& operator=(const RequestsHandler&) = delete;
 
 	// Forwarders onto the static pool in SipMessagePool.hpp/.cpp (Issue #53 /
 	// #101(A) / #101(E)) — kept as public statics here because SipMessageFactory,
@@ -206,6 +221,14 @@ public:
 	// (thread-safe; takes _snapshotMutex). Both are safe to call off the SIP thread.
 	void setDnd(const std::string& extension, bool on);
 	std::vector<std::string> getDndExtensions();
+
+	// Voicemail (Issue #246): set/query a per-extension flag, mirroring
+	// setDnd/getDndExtensions exactly except this one IS NVS-persisted (see
+	// PbxFeatureConfig::setVoicemailEnabledLocked) since the toggle must
+	// survive a reboot. setVoicemail is the mutating path behind
+	// POST /api/voicemail.
+	void setVoicemail(const std::string& extension, bool on);
+	std::vector<std::string> getVoicemailExtensions();
 
 	// Call forwarding (CFU/CFB/CFNA). setForward mutates one trigger ("always",
 	// "busy" or "noanswer") for an extension; an empty target clears it (and the
@@ -859,6 +882,276 @@ private:
 	// holds _mutex.
 	void onConferenceInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
 
+	// ── Voicemail deposit: answer locally as voicemail (Issue #246) ──────────────
+	// Called from the CFNA sweep (tick()) and onBusy()'s CFB path when the
+	// diverting extension has no explicit forward target but has voicemail
+	// enabled -- NOT from onInvite()'s virtual-extension dispatch, since this
+	// is a fallback for an ALREADY-RETAINED invite mid-call, not a fresh dial.
+	// `invite` is the retained original INVITE, `src` its caller, `extension`
+	// the mailbox owner (the extension that didn't answer / was busy). Finds
+	// a free slot in the voicemail leg pool and answers with a real sendrecv
+	// SDP (888-style: buildMediaSdp(), not the 777 echo pattern, which never
+	// actually terminates media on the board -- see #194); 486 Busy Here if
+	// every leg is busy (matches 888's full-room refusal), 503 only for
+	// message-pool/session-pool exhaustion. Caller holds _mutex.
+	void answerVoicemailDeposit(const std::shared_ptr<SipMessage>& invite,
+		const std::shared_ptr<SipClient>& src, const std::string& extension);
+	// Shared by answerVoicemailDeposit() and answerVoicemailRetrieval(): the
+	// RTP pair's isActive() is the ground truth for "in use" regardless of
+	// VoicemailLeg's own state (see answerVoicemailDeposit()'s call site for
+	// why leg state alone was wrong). Two more busy signals must ALSO be
+	// clear, both found in review (Fable-Low): _vmFlushBusy (a slot whose
+	// deposit just hung up looks RTP-free immediately, but its staging
+	// buffer may still be mid-fwrite on the writer task) and
+	// _vmSdJobState != Idle (a retrieval leg's list/read/delete job may
+	// still be in flight even after the caller hangs up -- see
+	// VmSdJob::callId's doc comment on why releaseVoicemailLeg() never
+	// resets job state itself). Returns -1 if every leg is busy any way.
+	int findFreeVoicemailSlot() const;
+	// Stop the leg's RTP receiver/sender and return it to Idle. Called from
+	// endCall()'s voicemail safety net, covering every teardown path.
+	void releaseVoicemailLeg(int slot, const std::string& callId);
+	// tick()'s 1Hz voicemail sweep: advances a Deposit leg from PlaybackDone
+	// (greeting finished) to Recording, and BYEs + tears down any voicemail
+	// session whose wall-clock deadline has expired (see Session::
+	// armVoicemailDeadline()'s doc comment for why this exists alongside
+	// onCallerRtp()'s byte-cap). Caller holds _mutex.
+	void sweepVoicemailLegs(std::chrono::steady_clock::time_point now);
+	// Finalize whatever `_vmLegs[slot]` recorded (stopRecording() is a no-op
+	// if it wasn't Recording), copy it into that slot's staging buffer, and
+	// push a QueuedRecording -- called from endCall()'s voicemail safety net,
+	// BEFORE releaseVoicemailLeg() resets the leg. Drops (does not enqueue)
+	// a zero-length recording -- nobody said anything, nothing to flush.
+	void enqueueVoicemailFlush(int slot);
+
+	// ── Voicemail retrieval: ext 796 dial-in (Issue #246, slice 3/3) ────────
+	// Called from onInvite()'s virtual-extension dispatch (unlike
+	// answerVoicemailDeposit(), this IS a fresh dial, not a mid-call
+	// fallback). No PIN for MVP: the mailbox is src's OWN extension,
+	// authenticated purely by Caller-ID -- an accepted tradeoff documented
+	// in pocket_dial_246_voicemail.md, fine for a LAN-only extension,
+	// revisit if 796 ever becomes trunk-reachable. Claims a free slot the
+	// same way answerVoicemailDeposit() does, answers with a real sendrecv
+	// SDP, arms RFC 4733 DTMF into this leg's own digit slot (never the
+	// global accumulator -- see _vmPendingDigit's doc comment), and kicks
+	// off the initial mailbox-listing SD job. VoicemailLeg itself stays
+	// Idle throughout the "answered, list not back yet" window --
+	// _vmSdJobState going Pending IS the busy signal for this slot; no new
+	// VoicemailLeg state was needed. Caller holds _mutex.
+	void answerVoicemailRetrieval(const std::shared_ptr<SipMessage>& invite,
+		const std::shared_ptr<SipClient>& src);
+	// One slot's worth of runVoicemailSdJobs() below -- a no-op unless
+	// _vmSdJobState[slot] is Pending. Runs delete-then-list-then-read as
+	// the job struct flags, against `source`, then stores Done. Never
+	// touches _vmMenus[slot] or dispatches anything -- purely the I/O half;
+	// sweepVoicemailLegs()/handleVoicemailSdJobDone() do the consuming, on
+	// the SIP thread, once Done is observed under acquire ordering.
+	void runVoicemailSdJob(int slot, vmarchive::Source& source);
+	// sweepVoicemailLegs()'s Retrieval-purpose branch, factored out for
+	// readability: a List job going Done starts the menu (start()); a Read
+	// job going Done starts real playback via VoicemailLeg::startPlaying()
+	// directly (bypassing dispatchVoicemailMenuCommand() -- there is
+	// nothing left to dispatch once the bytes are in hand) and re-arms the
+	// deadline for this message (advisor review: per-message, not once at
+	// answer, or a long inbox would hit the deadline mid-playback of an
+	// early message). A failed Read (message vanished under us) is treated
+	// as end-of-mailbox rather than getting stuck silent.
+	//
+	// Returns true if the call should be torn down. NEVER calls
+	// endCall()/sendVoicemailBye() itself -- every caller of this function
+	// runs from inside sweepVoicemailLegs()'s live iteration over
+	// _sessions (an unordered_map), and erasing the CURRENT element mid-
+	// range-for is undefined behavior. The caller queues the callID into
+	// the SAME deferred toExpire list the wall-clock deadline check uses,
+	// processed only after that iteration completes.
+	bool handleVoicemailSdJobDone(int slot, const std::string& callID,
+		const std::shared_ptr<Session>& session);
+	// Turns one VoicemailMenu::Result into action: builds and queues an SD
+	// job when playIndex and/or deleteIndex call for one (both checked
+	// independently -- Fable-Low review: a single digit event can require
+	// both), resets the leg FIRST when a new Read is about to be requested
+	// (advisor review, point 3: the leg may still be Playing the OLD
+	// message when a digit interrupts it -- fillTx() checking state under
+	// its own mutex is what makes reusing _vmRecordBufs[slot] safe here,
+	// NOT any assumption that RtpSender::stop() blocks, which it does not
+	// on ESP). PlayPrompt has no asset in this MVP -- synthesizes an
+	// immediate onPlaybackDone() the same way the deposit-side greeting
+	// degrades when unloaded.
+	//
+	// Returns true on Command::Hangup -- see handleVoicemailSdJobDone()'s
+	// doc comment for why this never tears the call down itself either. A
+	// Hangup MAY also have queued a delete-only SD job in the same call
+	// (deleting the last message before hanging up); that's safe to leave
+	// running after teardown, since a delete-only job never touches
+	// _vmRecordBufs[slot] -- the orphan sweep at the top of
+	// sweepVoicemailLegs() reclaims the slot once it finishes.
+	bool dispatchVoicemailMenuCommand(int slot, const std::string& callID,
+		const std::shared_ptr<Session>& session, const VoicemailMenu::Result& r);
+	// The BYE-then-teardown steps sweepVoicemailLegs()'s deadline-expiry
+	// path already used, factored out so its own toExpire loop is the only
+	// caller -- see dispatchVoicemailMenuCommand()'s doc comment for why a
+	// menu-driven hangup must go through that SAME deferred list instead of
+	// calling this directly.
+	void sendVoicemailBye(const std::string& callID, const std::shared_ptr<Session>& session);
+
+public:
+	// Drains whatever is currently queued to `sink`, reading each recording
+	// from this instance's own staging buffers. The ESP+PD_ETH_HAS_SD writer
+	// task (spawned in the constructor) calls this against
+	// vmarchive::productionSink() in a loop; a host test calls it directly
+	// against a FakeSink, exercising the identical vmarchive::drainAll() path
+	// with no writer task needed.
+	void drainVoicemailFlush(vmarchive::Sink& sink)
+	{
+		vmarchive::drainAll(_vmFlushQueue, sink, _vmStagingBufs,
+			[this](const vmarchive::QueuedRecording& rec) {
+				if (rec.stagingSlot >= 0 && rec.stagingSlot < static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS))
+				{
+					// See _vmFlushBusy's doc comment: this is the one moment
+					// the staging buffer is provably safe to reuse again.
+					_vmFlushBusy[rec.stagingSlot].store(false, std::memory_order_release);
+				}
+			});
+	}
+	size_t voicemailFlushQueueDepthForTest() const { return _vmFlushQueue.size(); }
+	// Runs every slot's pending retrieval SD job (list/read/delete), a
+	// no-op for any slot not Pending. The ESP+PD_ETH_HAS_SD writer task
+	// (spawned in the constructor, same task drainVoicemailFlush() above
+	// already runs on) calls this against vmarchive::productionSource() in
+	// its loop; a host test calls it directly against a FakeSource,
+	// exercising the identical per-slot runVoicemailSdJob() path with no
+	// writer task needed -- same public-for-the-lambda reasoning as
+	// drainVoicemailFlush() above (a plain xTaskCreatePinnedToCore callback
+	// is not a member function and cannot reach a private method).
+	void runVoicemailSdJobs(vmarchive::Source& source)
+	{
+		for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
+		{
+			runVoicemailSdJob(static_cast<int>(i), source);
+		}
+	}
+	// Test-only seam, same reasoning as RtpReceiver::dispatchDtmf() being
+	// public "so host tests can reach it": RtpReceiver::start() is a no-op
+	// stub on EVERY host build (WSL/Linux included -- see RtpReceiver.cpp's
+	// `#else` host-stub branch), so nothing can otherwise get caller audio
+	// into an active leg. `slot` comes from Session::getVoicemailLegSlot()
+	// on the session a test just answered.
+	bool feedVoicemailAudioForTest(int slot, const uint8_t* mulaw, size_t n)
+	{
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return false;
+		return _vmLegs[slot].onCallerRtp(mulaw, n);
+	}
+	// Test-only counterpart to feedVoicemailAudioForTest(): reads what the
+	// leg would send the caller right now (a greeting/prompt frame, or false
+	// if not Playing).
+	//
+	// UNLIKE RtpReceiver, RtpSender is REAL on a WSL/Linux host build (#82's
+	// Linux media path spins an actual std::thread pacer -- see
+	// RtpSender.cpp's `__linux__` branch), and it calls this same leg's
+	// fillTx() on its own 20 ms schedule the instant answerVoicemailDeposit()
+	// starts it -- before this seam's caller gets a chance to. A test that
+	// calls this synchronously right after answering a Playing leg is
+	// racing that thread for the clip and MUST NOT assert on winning that
+	// race (see VoicemailDivert.DepositPlaysGreetingBeforeRecordingWhenOneIsLoaded's
+	// fix history) -- poll voicemailLegStateForTest() for PlaybackDone
+	// instead of asserting this call succeeds on the first try.
+	bool readVoicemailPlaybackForTest(int slot, uint8_t* out, size_t count)
+	{
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return false;
+		return _vmLegs[slot].fillTx(out, count);
+	}
+	// Test-only: the leg's own state, for polling past the RtpSender race
+	// described above (e.g. "wait for PlaybackDone") without touching
+	// fillTx()/onCallerRtp() and perturbing the very state being observed.
+	VoicemailLeg::State voicemailLegStateForTest(int slot) const
+	{
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS))
+			return VoicemailLeg::State::Idle;
+		return _vmLegs[slot].state();
+	}
+	// Test-only: deliver one DTMF digit to a retrieval leg exactly the way
+	// the real RtpSink lambda in answerVoicemailRetrieval() does (same
+	// "deaf during I/O" check) -- RFC 4733 reception is unreachable on
+	// host for the same no-real-socket reason feedVoicemailAudioForTest()
+	// exists.
+	void feedVoicemailDigitForTest(int slot, char digit)
+	{
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return;
+		if (_vmSdJobState[slot].load(std::memory_order_acquire) == VmSdJobState::Idle)
+		{
+			_vmPendingDigit[slot].store(digit, std::memory_order_release);
+		}
+	}
+	// Test-only: is a retrieval SD job currently in flight for this slot?
+	// (list/read/delete just requested, result not consumed yet.)
+	bool voicemailSdJobPendingForTest(int slot) const
+	{
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return false;
+		return _vmSdJobState[slot].load(std::memory_order_acquire) == VmSdJobState::Pending;
+	}
+	// Test-only: how many messages the last completed List job found for
+	// this slot (0 before any List job has completed).
+	size_t voicemailMessageCountForTest(int slot) const
+	{
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) return 0;
+		return _vmMessageCounts[slot];
+	}
+	// Test-only: runs sweepVoicemailLegs() directly, bypassing tick()'s 1Hz
+	// self-throttle (see pocket_dial_build_environment.md's "host tests
+	// can never see a SIP timer" note). A retrieval test needs several
+	// separate sweep passes -- list done, read done, playback done, digit
+	// -- each a genuine advisor-recommended round trip through
+	// runVoicemailSdJobs() in between, all faster than real wall-clock
+	// time allows through tick() alone. sweepVoicemailLegs() already takes
+	// `now` as a parameter rather than reading the clock itself, so this
+	// seam changes nothing about what it does -- only how often a test can
+	// ask it to run.
+	//
+	// Found while writing the first retrieval integration test: calling
+	// sweepVoicemailLegs() alone is NOT enough -- tick() also drains
+	// _outbox (via drainOutbox(), which does retransmit tracking + PCAP
+	// capture too) and _logQueue and hands each to _onHandled()/std::cout
+	// afterward. Without mirroring that here, a BYE sendVoicemailBye()
+	// queues into _outbox sits there invisibly forever (or until some
+	// LATER tick()/handle() call happens to flush it) -- this seam must
+	// reproduce that whole flush, not just the sweep itself.
+	void sweepVoicemailLegsForTest()
+	{
+		sweepVoicemailLegs(std::chrono::steady_clock::now());
+		auto localOutbox = drainOutbox();
+		auto localLogs = std::move(_logQueue);
+		_logQueue.clear();
+		for (const auto& log : localLogs)
+		{
+			if (log.first) std::cerr << log.second << std::endl;
+			else std::cout << log.second << std::endl;
+		}
+		for (auto& event : localOutbox)
+		{
+			_onHandled(event.first, std::move(event.second));
+		}
+	}
+	// Test-only: inject a greeting clip without a real filesystem at
+	// /sdcard/vm/greeting.wav (which doesn't exist on host, or exist as a
+	// portable path at all). `clip` must outlive the handler -- tests pass a
+	// static/local buffer that does. Pass nullptr/0 to restore "no greeting".
+	void setVoicemailGreetingForTest(const uint8_t* clip, size_t len)
+	{
+		if (_vmGreetingClipOwned)
+		{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+			heap_caps_free(_vmGreetingClip);
+#else
+			std::free(_vmGreetingClip);
+#endif
+		}
+		_vmGreetingClip = const_cast<uint8_t*>(clip);
+		_vmGreetingClipLen = len;
+		_vmGreetingClipOwned = false;
+	}
+
+private:
+
 	// The shared meet-me room, created lazily on the first 888 dial-in — a MixBus and
 	// its per-leg rings are ~50 KB, too much to pay at boot on a node that may never
 	// hold a conference. Null until then. Caller holds _mutex.
@@ -1163,6 +1456,146 @@ private:
 	AnchorClient* _anchorClient = nullptr;
 	MediaBridge _mediaBridges[POCKETDIAL_MAX_ANCHOR_CALLS];
 
+	// ── Voicemail (Issue #246, Stage 3 of #194) ──────────────────────────────────
+	// POCKETDIAL_MAX_VOICEMAIL_LEGS concurrent deposit/retrieval legs, each
+	// owning its own RTP receiver/sender pair -- same parallel-array,
+	// index-matched shape as the anchor bridge pool above, but VoicemailLeg
+	// holds no pointer back to its pair (callbacks are index-capturing
+	// lambdas, wired at answer time in answerVoicemailDeposit()), so unlike
+	// _mediaBridges there is no cross-member destruction-order constraint.
+	RtpReceiver  _vmRtpReceivers[POCKETDIAL_MAX_VOICEMAIL_LEGS];
+	RtpSender    _vmRtpSenders[POCKETDIAL_MAX_VOICEMAIL_LEGS];
+	VoicemailLeg _vmLegs[POCKETDIAL_MAX_VOICEMAIL_LEGS];
+
+	// Recording/staging buffer pool (see PoolConfig.hpp's
+	// POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES budget comment and
+	// VoicemailArchive.hpp's class comment for why there are two arrays, not
+	// one). Allocated once in the constructor, freed once in the destructor
+	// -- never touched by any other code path. A null entry means boot-time
+	// allocation failed for that leg; answerVoicemailDeposit() must check.
+	uint8_t* _vmRecordBufs[POCKETDIAL_MAX_VOICEMAIL_LEGS] = {};
+	uint8_t* _vmStagingBufs[POCKETDIAL_MAX_VOICEMAIL_LEGS] = {};
+
+	// The SD-flush queue (VoicemailArchive.hpp) -- capacity matches the leg
+	// count, since at most one finished recording per leg can be pending
+	// flush at a time. Monotonic counter for the filename fallback when the
+	// wall clock hasn't synced yet (see VoicemailArchive.hpp's
+	// QueuedRecording::sequence doc comment).
+	vmarchive::WriterQueue _vmFlushQueue{POCKETDIAL_MAX_VOICEMAIL_LEGS};
+	uint64_t _vmFlushSequence = 0;
+
+	// Found in review (Fable-Low, during the retrieval slice's design pass):
+	// the comment above describes "at most one pending flush per leg" as an
+	// invariant, but nothing enforced it. enqueueVoicemailFlush() copies a
+	// finished recording into _vmStagingBufs[slot] and pushes a job for the
+	// writer task, but releaseVoicemailLeg() (called right after, in
+	// endCall()) frees the slot immediately -- _vmRtpReceivers[slot] goes
+	// inactive before the writer task has necessarily even started reading
+	// _vmStagingBufs[slot], let alone finished. A new deposit landing on
+	// that same slot before the drain completes would memcpy its OWN
+	// recording into the SAME staging buffer the writer is still mid-fwrite
+	// from, corrupting or torn-mixing the FIRST message's file on SD --
+	// silently, no error anywhere. This flag closes that: true from the
+	// moment a flush job is actually queued for a slot until
+	// vmarchive::drainAll()'s afterWrite callback confirms sink.write() has
+	// returned for it (see drainVoicemailFlush() below) -- i.e. exactly the
+	// window findFreeVoicemailSlot() must refuse to reuse the slot in.
+	std::atomic<bool> _vmFlushBusy[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
+
+	// ── Retrieval SD-I/O job machine (Issue #246, retrieval slice 3/3) ──────
+	// listMessages()/readMessage()/markDeleted() are all SD I/O and must
+	// never run on the SIP thread (same discipline as the flush pipeline
+	// above). ONE job struct per slot, not a queue (advisor + Fable-Low
+	// design review): a queue would let a second digit-driven request land
+	// while the first is still in flight, and two jobs writing the same
+	// slot's buffers concurrently is exactly the class of bug
+	// _vmFlushBusy above exists to prevent on the deposit side. A single
+	// digit-driven event (e.g. '7': delete the current message AND fetch
+	// the next one's bytes) fills BOTH fields of the SAME job.
+	//
+	// State machine: SIP thread fills _vmSdJob[slot] then
+	// _vmSdJobState[slot].store(Pending, release). The SD-I/O task (the
+	// same writer task the flush pipeline already spawns) polls for
+	// Pending, runs delete-then-list-then-read as flagged, writes results
+	// into _vmMessageLists/_vmMessageCounts/_vmRecordBufs+_vmReadLength,
+	// then store(Done, release). sweepVoicemailLegs() consumes a Done
+	// result under acquire ordering, which the C++ memory model guarantees
+	// makes everything the SD task wrote beforehand visible -- the same
+	// producer/consumer handoff CdrArchive's queue already relies on, just
+	// with a result to read back instead of fire-and-forget.
+	enum class VmSdJobState { Idle, Pending, Done };
+	struct VmSdJob
+	{
+		bool listRequested = false;
+		char readName[48] = {};
+		char deleteName[48] = {};
+		char extension[32] = {};
+		// Tag this job with the call it belongs to (Fable-Low review, Break
+		// 2): a caller hanging up mid-job does NOT reset job state --
+		// releaseVoicemailLeg() must not touch it, since the SD task owns
+		// that transition -- so sweepVoicemailLegs() must verify a Done
+		// result still belongs to the session consuming it before acting
+		// on it, never assume the slot's current occupant issued it. Belt-
+		// and-suspenders: findFreeVoicemailSlot() already refuses a slot
+		// while a job is outstanding, so this should be unreachable in
+		// practice -- the tag makes it impossible rather than merely
+		// unreached.
+		char callId[128] = {};
+	};
+	VmSdJob _vmSdJob[POCKETDIAL_MAX_VOICEMAIL_LEGS];
+	std::atomic<VmSdJobState> _vmSdJobState[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
+
+	// This slot's fetched mailbox listing, valid once a List job for it has
+	// gone Done. Fixed-size (POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX per
+	// slot, see PoolConfig.hpp) -- no heap, matching every other array in
+	// this pool. ~3.8 KiB per slot (mostly MessageInfo::callId, which the
+	// menu never reads) -- internal RAM, not PSRAM: small, fixed at boot,
+	// no different in kind from _vmLegs/_vmRtpReceivers above.
+	vmarchive::MessageInfo _vmMessageLists[POCKETDIAL_MAX_VOICEMAIL_LEGS]
+		[POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX];
+	size_t _vmMessageCounts[POCKETDIAL_MAX_VOICEMAIL_LEGS] = {};
+	// How many bytes a completed Read job actually wrote into
+	// _vmRecordBufs[slot] (REUSED here -- unused on a Retrieval leg, since
+	// startRecording() is never called on one, and already sized to
+	// POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES; zero new PSRAM).
+	size_t _vmReadLength[POCKETDIAL_MAX_VOICEMAIL_LEGS] = {};
+
+	// One pending digit per slot, written from the RTP task's DtmfSink
+	// callback (must not block or take _mutex -- same contract
+	// MediaBridge::DigitSink documents) and consumed by sweepVoicemailLegs()
+	// on the SIP thread. Deliberately "deaf during I/O", not "newest wins"
+	// (Fable-Low review): the DtmfSink only stores a digit when
+	// _vmSdJobState[slot] == Idle, so a digit pressed while a job is
+	// Pending is dropped outright -- the caller must press again once the
+	// next message actually starts playing. Simpler and more honest than
+	// remembering exactly one digit whose identity depends on arrival
+	// timing relative to the job.
+	std::atomic<char> _vmPendingDigit[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
+
+	// The pure per-slot menu state machine (VoicemailMenu.hpp) driving a
+	// Retrieval leg. A Deposit leg never touches this.
+	VoicemailMenu _vmMenus[POCKETDIAL_MAX_VOICEMAIL_LEGS];
+
+	// System deposit greeting: loaded once at boot from a fixed SD path,
+	// PSRAM-resident, same "why the SD card stays off the media path" and
+	// "why this one-shot allocation is allowed" reasoning as
+	// HoldMusic::loadClip() -- this reuses HoldMusic::parseUlawWav() (the
+	// pure parser) rather than HoldMusic itself, since HoldMusic is a
+	// looping one-global-cursor fan-out engine and this needs neither. Null
+	// (and _vmGreetingClipLen 0) when no greeting file is present -- graceful
+	// degradation to "record immediately, no greeting", matching HoldMusic's
+	// own "falls back to silence" philosophy rather than failing the call.
+	// Per-extension custom greetings are a later slice.
+	uint8_t* _vmGreetingClip = nullptr;
+	size_t _vmGreetingClipLen = 0;
+	// False when _vmGreetingClip points at memory this instance doesn't own
+	// (setVoicemailGreetingForTest()'s caller-supplied buffer) -- the
+	// destructor must never free() a test's stack/static array. True is the
+	// correct default: the constructor's own loadVoicemailGreeting() call is
+	// the only OTHER writer, and that path always heap-allocates.
+	bool _vmGreetingClipOwned = true;
+	void loadVoicemailGreeting();
+
 	// The boot-selected provider TYPE (cached alongside _anchorClient itself —
 	// see the constructor) and the monitored route DN an ACTIVE+ENABLED
 	// TelephonyApiConfig slot supplied (pocket-dial's substitute for drawbridge's
@@ -1281,6 +1714,7 @@ private:
 		std::vector<std::tuple<std::string, std::string, std::string, int>> sessions;
 		std::vector<CallDetailRecord> cdr;   // newest first
 		std::vector<std::string> dnd;        // extensions currently in DND
+		std::vector<std::string> voicemail;  // extensions with voicemail enabled (Issue #246)
 		// Call-forward config: {extension, always, busy, noAnswer}.
 		std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwards;
 		// Ring/hunt groups: {groupExt, "ringall"|"hunt", "m1,m2,..."}.
