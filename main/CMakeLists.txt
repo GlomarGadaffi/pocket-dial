@@ -93,6 +93,11 @@ endif()
 
 idf_component_register(SRCS ${MAIN_SRC}
                             ${ADDITIONAL_SRCS}
+                            # Issue #273 leak probe. The file compiles to NOTHING unless
+                            # CONFIG_HEAP_TRACING is set, which only
+                            # sdkconfig.defaults.heap_trace does -- so this costs the
+                            # shipping build a preprocessor pass and no bytes.
+                            "HeapLeakProbe.cpp"
                             "../src/Helpers/UdpServer.cpp"
                             "../src/Helpers/HttpServer.cpp"
                             "../src/Helpers/AdminAuth.cpp"

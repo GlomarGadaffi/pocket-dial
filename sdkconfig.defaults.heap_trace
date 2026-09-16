@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Heap-TRACE profile (issue #273). Layered ON TOP of sdkconfig.defaults —
+# later files win:
+#
+#   idf.py -B C:\pdtrace -D SIP_TRANSPORT=eth \
+#          -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_trace" \
+#          build
+#
+# This is a BUG-FINDING build, not a shipping one. Do not cut a release from it.
+#
+# Distinct from sdkconfig.defaults.heap_debug, and they answer different
+# questions — do not combine them without thinking:
+#
+#   heap_debug  = HEAP_POISONING_COMPREHENSIVE. "Is memory being CORRUPTED?"
+#                 Catches uninitialised reads and use-after-free.
+#   heap_trace  = this file. "WHO is holding memory that never comes back?"
+#                 Catches leaks and names the allocator.
+#
+# Enabling both is legal but the poisoning cost lands on every allocation
+# while the trace is recording every allocation, which on a board already
+# carrying real-time audio will distort timing enough to change behaviour
+# you are trying to observe. Pick one per boot.
+#
+# WHY THIS EXISTS
+# ---------------
+# #273's internal-DRAM leak has been measured twice on two firmware revisions
+# — symptomatic exhaustion at 218–276 s of uptime, HTTP thread spawns failing,
+# W5500 DMA bounce-buffer allocations failing, board still alive 76–91 minutes
+# later — with no candidate allocator. #295's /api/status gauges
+# (freeHeapInternal, largestFreeBlockInternal, and the MALLOC_CAP_DMA pair)
+# answer how much and how fast. They cannot answer WHO, and that is the only
+# question left.
+#
+# HEAP_TRACE_LEAKS records every allocation and deletes the record on free, so
+# whatever remains in the buffer at dump time is by construction what leaked,
+# with the call stack that allocated it. main/HeapLeakProbe.cpp arms it at boot
+# and dumps at 120/240/360/900 s, bracketing the measured onset.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The trace itself. STANDALONE keeps records in a buffer on the device
+# (HeapLeakProbe.cpp puts that buffer in PSRAM, so the instrument does not
+# consume the internal DRAM it is measuring). TOHOST would need a host-side
+# JTAG collector we do not have set up.
+CONFIG_HEAP_TRACING_STANDALONE=y
+
+# Depth of the recorded call stack per allocation. The default is 2, which for
+# this bug would routinely stop inside a wrapper and name the same handful of
+# allocator shims for every finding. 8 is enough to get out of IDF's internals
+# and into project code — #273's own panic needed four frames to get from the
+# task entry point to the flash write, and a leak's interesting frame is
+# usually further out than a crash's.
+CONFIG_HEAP_TRACING_STACK_DEPTH=8
+
+# Attributes outstanding heap to the OWNING TASK. Independent of the trace and
+# worth having alongside it: when a call stack is uninformative (a shared
+# allocator, a lambda, an IDF internal), "which task is holding 40 KB of
+# internal RAM" often identifies the subsystem on its own. Reported by
+# HeapLeakProbe.cpp at each dump.
+CONFIG_HEAP_TASK_TRACKING=y
+
+# NOT set, on purpose:
+#
+#   CONFIG_HEAP_POISONING_COMPREHENSIVE — that is heap_debug's job, see above.
+#
+#   CONFIG_HEAP_ABORT_WHEN_ALLOCATION_FAILS — this bug's whole signature is
+#   allocations FAILING (pthread task creation, spicommon_dma_setup_priv_buffer).
+#   Aborting on the first failure would kill the board at the exact moment the
+#   trace becomes interesting, and would skip the graceful out-of-memory paths
+#   that produced the observed degraded-but-alive behaviour. Same reasoning
+#   heap_debug gives for leaving it off, only more so here.
