@@ -20,6 +20,140 @@ TEST(SipMessage, BasicParse) {
     ASSERT_EQ(std::string(m.getType()), "REGISTER");
 }
 
+// ── Issue #265: isValidMessage()'s adversarial coverage ─────────────────────
+//
+// SECURITY_AUDIT.md's SEC-02 entry always claimed this checks that Via/To/
+// From/Call-ID/CSeq are present. Until this change the code checked only a
+// non-empty start line and type token -- true of the doc's claim in name
+// only. Zero test in this suite fed the parser anything that should be
+// REJECTED; every call anywhere asserted isValidMessage() returns true.
+// These pin the actual, now-true claim: the message this handler drops must
+// be recognizably invalid, not just "a message some other test didn't build".
+
+namespace
+{
+	sockaddr_in localhost()
+	{
+		sockaddr_in s{}; s.sin_addr.s_addr = inet_addr("127.0.0.1");
+		return s;
+	}
+
+	// A message with all five RFC 3261 s8.1.1/s8.2.6.2-mandatory headers
+	// present, so each "missing X" test below removes exactly one line from a
+	// baseline that is otherwise known-valid.
+	std::string validBaseline()
+	{
+		return
+			"INVITE sip:100@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 127.0.0.1:5060;branch=1\r\n"
+			"From: <sip:100@server>\r\n"
+			"To: <sip:200@server>\r\n"
+			"Call-ID: baseline-id\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Content-Length: 0\r\n\r\n";
+	}
+
+	// Every line of `raw` whose header NAME matches `headerName` (case-
+	// sensitive, matching this wire format's own convention) is dropped.
+	std::string withoutHeader(std::string raw, const std::string& headerName)
+	{
+		const std::string needle = headerName + ":";
+		std::string out;
+		size_t pos = 0;
+		while (pos < raw.size())
+		{
+			size_t eol = raw.find("\r\n", pos);
+			const bool lastLine = (eol == std::string::npos);
+			const std::string line = raw.substr(pos, lastLine ? std::string::npos : eol - pos);
+			if (line.compare(0, needle.size(), needle) != 0)
+			{
+				out += line;
+				if (!lastLine) out += "\r\n";
+			}
+			if (lastLine) break;
+			pos = eol + 2;
+		}
+		return out;
+	}
+}
+
+TEST(SipMessage, EmptyMessageIsInvalid)
+{
+	SipMessage m(std::string(), localhost());
+	EXPECT_FALSE(m.isValidMessage());
+}
+
+TEST(SipMessage, TruncatedBinaryGarbageIsInvalid)
+{
+	// No CRLF anywhere, not ASCII, nothing resembling a start line -- the
+	// shape a truncated or corrupted UDP datagram takes on the wire.
+	std::string raw(64, '\0');
+	for (size_t i = 0; i < raw.size(); ++i) raw[i] = static_cast<char>(i & 0xFF);
+	SipMessage m(raw, localhost());
+	EXPECT_FALSE(m.isValidMessage());
+}
+
+TEST(SipMessage, NoHeaderBodySeparatorIsInvalid)
+{
+	// A start line with no "\r\n\r\n" (or even a bare "\r\n") after it at
+	// all -- splitMessage() has nothing to split, so every header lookup,
+	// including getType(), comes back empty.
+	SipMessage m("INVITE sip:100@server SIP/2.0", localhost());
+	EXPECT_FALSE(m.isValidMessage());
+}
+
+TEST(SipMessage, AColonlessHeaderLineLeavesThatHeaderAbsent)
+{
+	// The pre-#265 check would have accepted this: the start line and type
+	// token both parse fine, and neither depended on any individual header.
+	// "ViaSIP/2.0/UDP ..." matches no header name (getVia() requires the
+	// literal "Via:" prefix to identify the line), so it is exactly as absent
+	// as if the line were never sent at all.
+	std::string raw = withoutHeader(validBaseline(), "Via");
+	raw.insert(raw.find("From:"), "ViaSIP/2.0/UDP 127.0.0.1:5060;branch=1\r\n");
+	SipMessage m(raw, localhost());
+	EXPECT_FALSE(m.isValidMessage())
+		<< "a malformed Via line must count as Via being absent, not present-but-odd";
+}
+
+TEST(SipMessage, MissingViaIsInvalid)
+{
+	SipMessage m(withoutHeader(validBaseline(), "Via"), localhost());
+	EXPECT_FALSE(m.isValidMessage());
+}
+
+TEST(SipMessage, MissingToIsInvalid)
+{
+	SipMessage m(withoutHeader(validBaseline(), "To"), localhost());
+	EXPECT_FALSE(m.isValidMessage());
+}
+
+TEST(SipMessage, MissingFromIsInvalid)
+{
+	SipMessage m(withoutHeader(validBaseline(), "From"), localhost());
+	EXPECT_FALSE(m.isValidMessage());
+}
+
+TEST(SipMessage, MissingCallIdIsInvalid)
+{
+	SipMessage m(withoutHeader(validBaseline(), "Call-ID"), localhost());
+	EXPECT_FALSE(m.isValidMessage());
+}
+
+TEST(SipMessage, MissingCSeqIsInvalid)
+{
+	SipMessage m(withoutHeader(validBaseline(), "CSeq"), localhost());
+	EXPECT_FALSE(m.isValidMessage());
+}
+
+TEST(SipMessage, AllFiveHeadersPresentIsStillValid)
+{
+	// The other half of "present" -- a message missing NONE of the five must
+	// not have become collateral damage from #265's stricter check.
+	SipMessage m(validBaseline(), localhost());
+	EXPECT_TRUE(m.isValidMessage());
+}
+
 // Regression: enforceG711() rewrites the SDP m= codec list, which changes the
 // body size. It must resync Content-Length, otherwise the 777 echo / 999 page
 // answer is dropped by the peer as truncated and the caller sits on ringback.
