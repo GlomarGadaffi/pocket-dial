@@ -139,7 +139,17 @@ public:
 	//   durationMs: duration carried by the packet that triggered the report,
 	//               converted to ms. Small when reported from the first packet —
 	//               it is NOT the total press length, which is not yet known.
-	using DtmfSink = std::function<void(char digit, uint16_t durationMs)>;
+	//
+	// Issue #284: raw function pointer + context, not std::function. This is
+	// copied under _slotMutex and invoked on every reported digit, on the RTP
+	// receive task -- a std::function whose installed closure exceeds the
+	// libstdc++ SBO (8 bytes on this target) heap-allocates on every copy,
+	// which is exactly what MediaBridge's old `[legCallId, sink]` installer
+	// did (a std::string + a std::function, 40 bytes). A raw pointer pair is
+	// always a trivial, allocation-free copy, by construction, regardless of
+	// what any future installer wants to capture. Same shape as HoldMusic's
+	// tap (HoldMusic.hpp:178).
+	using DtmfSink = void (*)(void* ctx, char digit, uint16_t durationMs);
 
 	// The Sink: callers choose what to do with each received audio frame without
 	// RtpReceiver knowing. Invoked once per accepted (PT==0) packet, ON THE
@@ -170,7 +180,14 @@ public:
 	//
 	// CONTRACT: as Sink -- consume synchronously, do NOT retain pkt.payload
 	// past return (the datagram buffer is reused for the next packet).
-	using RawSink = std::function<void(const RtpPacket& pkt)>;
+	//
+	// Issue #284: raw function pointer + context, not std::function -- same
+	// reasoning as DtmfSink above. No installer exists on main yet (the #164
+	// trunk wiring is what will call setRawSink()), so this is the cheapest
+	// point to fix the type: every future installer inherits an
+	// allocation-free copy instead of depending on a capture-size convention
+	// nobody enforces.
+	using RawSink = void (*)(void* ctx, const RtpPacket& pkt);
 
 	// ── Pure, platform-independent primitives (host-unit-tested) ────────────────
 
@@ -223,7 +240,7 @@ public:
 	// before or after start(); the receive task reads it atomically each packet, so
 	// a mid-call re-negotiation is safe. Passing PAYLOAD_TYPE_PCMU is refused — that
 	// would shadow audio — and returns false.
-	bool setDtmfPayloadType(uint8_t pt, DtmfSink sink);
+	bool setDtmfPayloadType(uint8_t pt, DtmfSink sink, void* ctx = nullptr);
 
 	// Arm RAW RELAY for this stream. While a raw sink is set, EVERY
 	// well-formed RTPv2 packet goes to it intact and nothing else runs: no
@@ -240,7 +257,7 @@ public:
 	// Pass nullptr to disarm and return the stream to normal audio handling.
 	// May be called before or after start(). Returns false only when asked to
 	// disarm a receiver that had no raw sink armed.
-	bool setRawSink(RawSink sink);
+	bool setRawSink(RawSink sink, void* ctx = nullptr);
 
 	// Offer one parsed packet to the raw-relay path. Returns true when a raw
 	// sink was armed and consumed it, in which case the caller must not
@@ -376,13 +393,15 @@ private:
 	// start()/clearSlotLocked(), or the first press of a NEW call whose timestamp
 	// happens to match the last press of the previous one would be swallowed.
 	std::atomic<uint8_t> _dtmfPt{kDtmfPayloadTypeUnset};
-	DtmfSink             _dtmfSink;
+	DtmfSink             _dtmfSink = nullptr;
+	void*                _dtmfSinkCtx = nullptr;
 
 	// Raw relay (B2BUA trunk leg). The sink is guarded by _slotMutex like
 	// _sink; the atomic flag lets the receive task skip the lock entirely on
 	// the common non-relay path -- one acquire-load per packet, not a mutex.
 	std::atomic<bool> _rawArmed{false};
-	RawSink           _rawSink;
+	RawSink           _rawSink = nullptr;
+	void*             _rawSinkCtx = nullptr;
 
 	// Raw egress. The peer is guarded by _slotMutex like the sinks; the atomic
 	// flag lets sendRaw() reject early without taking the lock.

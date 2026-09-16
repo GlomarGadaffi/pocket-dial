@@ -77,17 +77,40 @@ namespace
 		std::vector<uint8_t> payload;
 	};
 
-	RtpReceiver::RawSink capture(Captured& out)
+	// Issue #284: RawSink is now a raw function pointer + void* ctx, not a
+	// std::function, so the test can no longer hand out a closure -- `ctx` is
+	// the `Captured` instance's address instead.
+	void captureRaw(void* ctx, const RtpReceiver::RtpPacket& pkt)
 	{
-		return [&out](const RtpReceiver::RtpPacket& pkt) {
-			++out.calls;
-			out.pt     = pkt.payloadType;
-			out.seq    = pkt.seq;
-			out.ts     = pkt.timestamp;
-			out.ssrc   = pkt.ssrc;
-			out.marker = pkt.marker;
-			out.payload.assign(pkt.payload, pkt.payload + pkt.payloadLen);
-		};
+		auto* out = static_cast<Captured*>(ctx);
+		++out->calls;
+		out->pt     = pkt.payloadType;
+		out->seq    = pkt.seq;
+		out->ts     = pkt.timestamp;
+		out->ssrc   = pkt.ssrc;
+		out->marker = pkt.marker;
+		out->payload.assign(pkt.payload, pkt.payload + pkt.payloadLen);
+	}
+
+	// Same #284 reasoning for DtmfSink: a fixed capture struct + a trampoline
+	// reading it via ctx, instead of a per-test capturing lambda.
+	struct DigitCapture
+	{
+		int  count = 0;
+		char lastDigit = '\0';
+	};
+
+	void recordDigit(void* ctx, char digit, uint16_t /*durationMs*/)
+	{
+		auto* c = static_cast<DigitCapture*>(ctx);
+		++c->count;
+		c->lastDigit = digit;
+	}
+
+	// The cross-wired relay test's egress: ctx is the far-side RtpReceiver.
+	void relayToPeer(void* ctx, const RtpReceiver::RtpPacket& pkt)
+	{
+		static_cast<RtpReceiver*>(ctx)->sendRaw(pkt);
 	}
 
 	// One RFC 4733 event body (event code, E bit, volume, duration) — the thing
@@ -136,7 +159,7 @@ TEST(RtpRawRelay, ArmedSinkSeesThePacketExactlyAsItArrived)
 {
 	RtpReceiver rx;
 	Captured got;
-	ASSERT_TRUE(rx.setRawSink(capture(got)));
+	ASSERT_TRUE(rx.setRawSink(&captureRaw, &got));
 
 	const uint8_t payload[] = {0xFF, 0x7F, 0x00, 0x80, 0x2A};
 	ASSERT_TRUE(rx.dispatchRaw(
@@ -160,7 +183,7 @@ TEST(RtpRawRelay, RelaysPayloadTypesTheBoardCannotDecode)
 {
 	RtpReceiver rx;
 	Captured got;
-	ASSERT_TRUE(rx.setRawSink(capture(got)));
+	ASSERT_TRUE(rx.setRawSink(&captureRaw, &got));
 
 	const uint8_t opus[3] = {0x11, 0x22, 0x33};
 	EXPECT_TRUE(rx.dispatchRaw(packet(kOpusPt, 1, 160, opus, sizeof(opus))));
@@ -178,7 +201,7 @@ TEST(RtpRawRelay, EveryPacketOfAStreamIsRelayed)
 {
 	RtpReceiver rx;
 	Captured got;
-	ASSERT_TRUE(rx.setRawSink(capture(got)));
+	ASSERT_TRUE(rx.setRawSink(&captureRaw, &got));
 
 	const uint8_t frame[160] = {};
 	for (uint16_t i = 0; i < 50; ++i)
@@ -205,12 +228,11 @@ TEST(RtpRawRelay, ClaimsTelephoneEventEvenWhenDtmfIsAlsoArmed)
 {
 	RtpReceiver rx;
 
-	int localDigits = 0;
-	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt,
-		[&localDigits](char, uint16_t) { ++localDigits; }));
+	DigitCapture dc;
+	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt, &recordDigit, &dc));
 
 	Captured got;
-	ASSERT_TRUE(rx.setRawSink(capture(got)));
+	ASSERT_TRUE(rx.setRawSink(&captureRaw, &got));
 
 	const EventBody ev = eventBody(1, false, 160);   // the digit '1'
 	EXPECT_TRUE(rx.dispatchRaw(packet(kDtmfPt, 7, 900, ev.b, sizeof(ev.b))));
@@ -221,7 +243,7 @@ TEST(RtpRawRelay, ClaimsTelephoneEventEvenWhenDtmfIsAlsoArmed)
 
 	// And had it been offered anyway, this is the local consumer it would have
 	// reached — the star-code feature parser's entry point on a real leg.
-	EXPECT_EQ(localDigits, 0);
+	EXPECT_EQ(dc.count, 0);
 }
 
 // The inverse, so the previous test cannot pass for the wrong reason: with NO
@@ -231,18 +253,16 @@ TEST(RtpRawRelay, WithoutARawSinkTheSamePacketStillReachesTheDtmfPath)
 {
 	RtpReceiver rx;
 
-	int localDigits = 0;
-	char seen = '\0';
-	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt,
-		[&](char d, uint16_t) { ++localDigits; seen = d; }));
+	DigitCapture dc;
+	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt, &recordDigit, &dc));
 
 	const EventBody ev = eventBody(1, false, 160);
 	const auto pkt = packet(kDtmfPt, 7, 900, ev.b, sizeof(ev.b));
 
 	EXPECT_FALSE(rx.dispatchRaw(pkt));   // nothing armed — unclaimed
 	EXPECT_TRUE(rx.dispatchDtmf(pkt));   // so the ordinary path takes it
-	EXPECT_EQ(localDigits, 1);
-	EXPECT_EQ(seen, '1');
+	EXPECT_EQ(dc.count, 1);
+	EXPECT_EQ(dc.lastDigit, '1');
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -253,7 +273,7 @@ TEST(RtpRawRelay, DisarmingRestoresOrdinaryHandling)
 {
 	RtpReceiver rx;
 	Captured got;
-	ASSERT_TRUE(rx.setRawSink(capture(got)));
+	ASSERT_TRUE(rx.setRawSink(&captureRaw, &got));
 
 	const uint8_t frame[4] = {9, 9, 9, 9};
 	ASSERT_TRUE(rx.dispatchRaw(packet(RtpReceiver::PAYLOAD_TYPE_PCMU, 1, 160, frame, sizeof(frame))));
@@ -271,7 +291,7 @@ TEST(RtpRawRelay, ARelayLegStartsWithNoAudioSink)
 {
 	RtpReceiver rx;
 	Captured got;
-	ASSERT_TRUE(rx.setRawSink(capture(got)));
+	ASSERT_TRUE(rx.setRawSink(&captureRaw, &got));
 	EXPECT_TRUE(rx.start(0, nullptr)) << "a raw sink is a consumer; start must accept it";
 	EXPECT_TRUE(rx.stop());
 }
@@ -291,7 +311,7 @@ TEST(RtpRawRelay, StopClearsTheRawSinkWithTheSlot)
 {
 	RtpReceiver rx;
 	Captured got;
-	ASSERT_TRUE(rx.setRawSink(capture(got)));
+	ASSERT_TRUE(rx.setRawSink(&captureRaw, &got));
 	ASSERT_TRUE(rx.start(0, nullptr));   // host stub: flips _active, binds nothing
 
 	ASSERT_TRUE(rx.stop());
@@ -396,9 +416,7 @@ TEST(RtpRawEgress, CrossWiredReceiversRelayAPacketEndToEnd)
 {
 	RtpReceiver handsetLeg, trunkLeg;
 	ASSERT_TRUE(trunkLeg.setRawPeer(peerAt("203.0.113.9", 4000)));
-	ASSERT_TRUE(handsetLeg.setRawSink([&trunkLeg](const RtpReceiver::RtpPacket& p) {
-		trunkLeg.sendRaw(p);
-	}));
+	ASSERT_TRUE(handsetLeg.setRawSink(&relayToPeer, &trunkLeg));
 
 	const uint8_t ev[] = {0x05, 0x0A, 0x01, 0x40};
 	ASSERT_TRUE(handsetLeg.dispatchRaw(packet(101, 77, 999, ev, sizeof(ev), /*marker=*/true)));

@@ -8,6 +8,7 @@
 #include "MixBus.hpp"
 #include "HoldMusic.hpp"
 #include <string>
+#include <string_view>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -101,7 +102,7 @@ public:
 	// leg its own MixBus port (docs/CONFERENCE_MIXER.md §7's "anchor leg is just another
 	// port") is follow-up work — the local N-way conference this bridge serves today
 	// needs handset legs only.
-	bool feedRx(const std::string& participantId, const int16_t* samples, size_t count);
+	bool feedRx(std::string_view participantId, const int16_t* samples, size_t count);
 
 	// ── The RX/TX callback bodies ────────────────────────────────────────────────
 	// These ARE what startBridge() hands to RtpReceiver/RtpSender; they live here as
@@ -169,6 +170,13 @@ private:
 	// (could collide with a different call's slot), not just a lost frame.
 	static constexpr size_t kMohParticipantIdBufSize = 32;
 
+	// Issue #284: fixed capacity for dtmfSinkTrampoline()'s on-stack Call-ID
+	// snapshot. 128 matches the buffer size this codebase already uses for a
+	// Call-ID everywhere else (RequestsHandler.hpp, VoicemailArchive.hpp,
+	// TransactionLayer.hpp) -- a SIP Call-ID has no RFC 3261 length cap, unlike
+	// the short numeric participant ids kMohParticipantIdBufSize sizes for.
+	static constexpr size_t kCallIdBufSize = 128;
+
 	// Hand this bridge's MixBus port back (Active -> Draining) and forget it. Caller
 	// MUST hold _mutex. Idempotent: a no-op when no port is held or in ANCHOR mode.
 	void releaseBusPortLocked();
@@ -177,6 +185,15 @@ private:
 	// back to `this` and calls feedMohTick() — kept as a one-line static
 	// rather than a capturing lambda so nothing here allocates.
 	static void mohTapTrampoline(void* ctx, const uint8_t* ulawTick, size_t n);
+
+	// Issue #284: the free-function shape RtpReceiver::DtmfSink now needs, same
+	// reasoning as mohTapTrampoline above. Casts `ctx` back to `this`, snapshots
+	// _callID into a fixed on-stack buffer under a short _mutex hold (exactly
+	// feedMohTick()'s pattern, for the same reason -- this runs on the RTP
+	// receive task, so nothing here may allocate), and forwards to _digitSink,
+	// which is boot-time-fixed and safe to read unlocked (see its own doc
+	// comment).
+	static void dtmfSinkTrampoline(void* ctx, char digit, uint16_t durationMs);
 
 	// Pointers to the shared dependencies
 	RtpReceiver* _receiver = nullptr;

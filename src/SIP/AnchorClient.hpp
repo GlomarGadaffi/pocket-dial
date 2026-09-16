@@ -33,7 +33,14 @@ public:
 		std::string callerId;
 	};
 	using EventCallback = std::function<void(const CallEvent&)>;
-	using AudioRxCallback = std::function<void(const std::string& participantId, const int16_t* pcmSamples, size_t count)>;
+	// Issue #284: string_view, not `const std::string&` -- installed once at
+	// boot wiring time ([this]-only capture, SBO-safe as a std::function), but
+	// every implementation's per-chunk invocation used to copy the participant
+	// id into a real std::string first. That copy is SBO-safe today only
+	// because 3CX participant ids are short numerics; string_view lets every
+	// caller pass a fixed on-stack buffer instead of depending on that staying
+	// true.
+	using AudioRxCallback = std::function<void(std::string_view participantId, const int16_t* pcmSamples, size_t count)>;
 
 	virtual ~AnchorClient() = default;
 

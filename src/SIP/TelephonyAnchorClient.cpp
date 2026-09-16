@@ -3081,22 +3081,41 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 		}
 		rxReads++;
 
+		// Issue #284: fixed on-stack buffer + string_view, not a std::string
+		// copy -- this runs once per inbound audio chunk. SBO-safe in practice
+		// today (3CX participant ids are short numerics, same premise
+		// MediaBridge::kMohParticipantIdBufSize rests on), but unconditionally
+		// so rather than relying on that staying true. Refuse rather than
+		// truncate on overflow, same guard MediaBridge::feedMohTick() uses for
+		// the identical reason: a truncated id could be mistaken for a
+		// different call downstream.
 		AudioRxCallback audioCb;
-		std::string partId;
+		constexpr size_t kPartIdBufSize = 32;
+		char partIdBuf[kPartIdBufSize];
+		size_t partIdLen = 0;
+		bool partIdOk = true;
 		{
 			std::lock_guard<std::mutex> lock(_mutex);
 			audioCb = _audioCb;
-			partId = _activeParticipantId;   // #100: alias of slot->participantId — routes rx to this call
+			partIdLen = _activeParticipantId.size();   // #100: alias of slot->participantId — routes rx to this call
+			if (partIdLen >= sizeof(partIdBuf))
+			{
+				partIdOk = false;
+			}
+			else
+			{
+				std::memcpy(partIdBuf, _activeParticipantId.data(), partIdLen);
+			}
 		}
 
-		if (audioCb)
+		if (audioCb && partIdOk)
 		{
 			// Process raw bytes into linear PCM16 samples (each sample is 2 bytes, little-endian)
 			size_t sampleCount = bytesRead / sizeof(int16_t);
 			const int16_t* pcmSamples = reinterpret_cast<const int16_t*>(readBuf);
 			if (sampleCount > 0)
 			{
-				audioCb(partId, pcmSamples, sampleCount);
+				audioCb(std::string_view(partIdBuf, partIdLen), pcmSamples, sampleCount);
 			}
 		}
 	}

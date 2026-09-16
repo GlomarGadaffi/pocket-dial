@@ -162,6 +162,19 @@ namespace
 		for (const auto& x : v) if (x == s) return true;
 		return false;
 	}
+
+	// Issue #284: DtmfSink is now a raw function pointer + void* ctx, not a
+	// std::function, so these tests hand out trampolines reading ctx instead
+	// of per-test capturing lambdas.
+	void pushDigit(void* ctx, char digit, uint16_t /*durationMs*/)
+	{
+		static_cast<std::vector<char>*>(ctx)->push_back(digit);
+	}
+
+	void incrementCounter(void* ctx, char /*digit*/, uint16_t /*durationMs*/)
+	{
+		++*static_cast<int*>(ctx);
+	}
 }
 
 // ── dispatchDtmf: one report per key press ──────────────────────────────────
@@ -176,8 +189,7 @@ TEST(Rfc4733Dispatch, ABurstOfPacketsForOneKeyPressReportsExactlyOnce)
 	// Getting this wrong does not fail quietly: *60 would become *6666660.
 	RtpReceiver rx;
 	std::vector<char> seen;
-	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt,
-		[&seen](char d, uint16_t) { seen.push_back(d); }));
+	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt, &pushDigit, &seen));
 
 	for (uint16_t dur = 160; dur <= 960; dur += 160)
 	{
@@ -199,8 +211,7 @@ TEST(Rfc4733Dispatch, ASecondPressOfTheSameKeyIsANewDigit)
 	// keyed on the digit instead, "77" would be impossible to dial.
 	RtpReceiver rx;
 	std::vector<char> seen;
-	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt,
-		[&seen](char d, uint16_t) { seen.push_back(d); }));
+	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt, &pushDigit, &seen));
 
 	rx.dispatchDtmf(packetFor(eventBody(7, false, 160), kDtmfPt, 1000));
 	rx.dispatchDtmf(packetFor(eventBody(7, true,  480), kDtmfPt, 1000));
@@ -219,8 +230,7 @@ TEST(Rfc4733Dispatch, ReportsOnTheFirstPacketSeenEvenWhenTheStartIsLost)
 	// opening packet of a burst routinely; the digit must still arrive.
 	RtpReceiver rx;
 	std::vector<char> seen;
-	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt,
-		[&seen](char d, uint16_t) { seen.push_back(d); }));
+	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt, &pushDigit, &seen));
 
 	// Only the final end-of-event packet survives the network.
 	rx.dispatchDtmf(packetFor(eventBody(11, true, 800), kDtmfPt, 4242));   // '#'
@@ -235,7 +245,7 @@ TEST(Rfc4733Dispatch, AudioAndUnknownPayloadTypesAreNotClaimed)
 	// so a false positive here would eat audio.
 	RtpReceiver rx;
 	int fired = 0;
-	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt, [&fired](char, uint16_t) { ++fired; }));
+	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt, &incrementCounter, &fired));
 
 	EXPECT_FALSE(rx.dispatchDtmf(packetFor(eventBody(1, true, 160), 0, 100)))
 		<< "PCMU audio must never be claimed by the DTMF path";
@@ -260,7 +270,7 @@ TEST(Rfc4733Dispatch, NonDigitEventsAndMalformedBodiesAreConsumedButYieldNoDigit
 	// not keypad symbols. Passing them up would inject junk into a feature code.
 	RtpReceiver rx;
 	int fired = 0;
-	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt, [&fired](char, uint16_t) { ++fired; }));
+	ASSERT_TRUE(rx.setDtmfPayloadType(kDtmfPt, &incrementCounter, &fired));
 
 	EXPECT_TRUE(rx.dispatchDtmf(packetFor(eventBody(16, true, 160), kDtmfPt, 100)))
 		<< "hook flash (event 16) is valid RFC 4733 and ours to swallow";

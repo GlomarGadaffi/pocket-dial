@@ -94,27 +94,20 @@ bool MediaBridge::startBridge(const std::string& handsetIp, uint16_t handsetPort
 	// ordinary extension-to-extension call's RTP is peer-to-peer and never
 	// reaches this board at all.
 	//
-	// The Call-ID is captured by value here, at start, because RtpReceiver's sink
-	// signature carries only the digit — and capturing `this->_callID` by
-	// reference would race stopBridge() clearing it. One small string copy per
-	// call setup, not per packet.
+	// Issue #284: dtmfSinkTrampoline() reads _callID fresh (under _mutex) on
+	// every reported digit instead of capturing a snapshot here -- see its doc
+	// comment in the header. The return is deliberately ignored. The only
+	// refusal is PAYLOAD_TYPE_PCMU, which would shadow audio — and an offer
+	// claiming telephone-event on PT 0 is already refused further upstream,
+	// where the SDP is parsed. If one ever got here, the call still proceeds
+	// with DTMF over SIP INFO exactly as it did before this existed, which is
+	// the right outcome: a peculiar SDP should not fail a call that is
+	// otherwise fine. (This file deliberately does no logging — it is on the
+	// media path.)
 	if (dtmfPt >= 0 && dtmfPt <= 127 && _digitSink)
 	{
-		const std::string legCallId = callID;
-		auto sink = _digitSink;
-		// The return is deliberately ignored. The only refusal is
-		// PAYLOAD_TYPE_PCMU, which would shadow audio — and an offer claiming
-		// telephone-event on PT 0 is already refused further upstream, where the
-		// SDP is parsed. If one ever got here, the call still proceeds with DTMF
-		// over SIP INFO exactly as it did before this existed, which is the right
-		// outcome: a peculiar SDP should not fail a call that is otherwise fine.
-		// (This file deliberately does no logging — it is on the media path.)
 		(void)_receiver->setDtmfPayloadType(static_cast<uint8_t>(dtmfPt),
-			[legCallId, sink](char digit, uint16_t /*durationMs*/) {
-				// Runs on the RTP receive task. `sink` must not block or take the
-				// engine lock — see MediaBridge::DigitSink's contract.
-				sink(legCallId, digit);
-			});
+			&MediaBridge::dtmfSinkTrampoline, this);
 	}
 
 	// Start the LAN RTP sender to stream to the handset
@@ -279,6 +272,33 @@ void MediaBridge::mohTapTrampoline(void* ctx, const uint8_t* ulawTick, size_t n)
 	static_cast<MediaBridge*>(ctx)->feedMohTick(ulawTick, n);
 }
 
+void MediaBridge::dtmfSinkTrampoline(void* ctx, char digit, uint16_t /*durationMs*/)
+{
+	// Runs on the RTP receive task. Same discipline as feedMohTick(): _callID
+	// changes per call (startBridge()/stopBridge()), so it is snapshotted into
+	// a fixed on-stack buffer under a short, standalone _mutex hold rather than
+	// read directly, which would race stopBridge() clearing it. _digitSink is
+	// boot-time-fixed (see its own doc comment) and safe to read unlocked.
+	auto* self = static_cast<MediaBridge*>(ctx);
+	if (!self->_digitSink) return;
+
+	char callIdBuf[kCallIdBufSize];
+	size_t callIdLen;
+	{
+		std::lock_guard<std::mutex> lock(self->_mutex);
+		callIdLen = self->_callID.size();
+		if (callIdLen >= sizeof(callIdBuf))
+		{
+			// Not seen in practice -- refuse rather than truncate, same
+			// reasoning as feedMohTick()'s identical guard: a truncated
+			// Call-ID could be mistaken for a different call downstream.
+			return;
+		}
+		std::memcpy(callIdBuf, self->_callID.data(), callIdLen);
+	}
+	self->_digitSink(std::string_view(callIdBuf, callIdLen), digit);
+}
+
 bool MediaBridge::fillHandsetTx(uint8_t* outUlaw, size_t count)
 {
 	if (!_active.load(std::memory_order_acquire))
@@ -312,7 +332,7 @@ bool MediaBridge::fillHandsetTx(uint8_t* outUlaw, size_t count)
 	return true;
 }
 
-bool MediaBridge::feedRx(const std::string& participantId, const int16_t* samples, size_t count)
+bool MediaBridge::feedRx(std::string_view participantId, const int16_t* samples, size_t count)
 {
 	// Hot path (anchor rx task). The lock is uncontended except against start/stopBridge;
 	// PlayoutBuffer is itself internally synchronized for the sender's reads.
