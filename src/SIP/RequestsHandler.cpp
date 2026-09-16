@@ -1530,9 +1530,10 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 	// transferee's behalf (issue #197). Claimed here, ahead of every session
 	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
 	// so the ACK is ours (RFC 3261 §17.1.1.3), and nothing further down reads the
-	// response as what it actually is — onBusy()'s CFB lookup in particular would
-	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
-	// a forward-on-busy call nobody asked for.
+	// response as what it actually is — onBusy()'s CFB lookup used to read
+	// data->getFromNumber() here, which on this leg is the TRANSFEREE, not the
+	// busy party; fixed to data->getToNumber() by #256. This intercept still
+	// stands regardless, for the ACK-ownership reason above.
 	if (handleBlindXferFailure(data))
 	{
 		return;
@@ -1580,9 +1581,10 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 	// transferee's behalf (issue #197). Claimed here, ahead of every session
 	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
 	// so the ACK is ours (RFC 3261 §17.1.1.3), and nothing further down reads the
-	// response as what it actually is — onBusy()'s CFB lookup in particular would
-	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
-	// a forward-on-busy call nobody asked for.
+	// response as what it actually is — onBusy()'s CFB lookup used to read
+	// data->getFromNumber() here, which on this leg is the TRANSFEREE, not the
+	// busy party; fixed to data->getToNumber() by #256. This intercept still
+	// stands regardless, for the ACK-ownership reason above.
 	if (handleBlindXferFailure(data))
 	{
 		return;
@@ -4686,9 +4688,10 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 	// transferee's behalf (issue #197). Claimed here, ahead of every session
 	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
 	// so the ACK is ours (RFC 3261 §17.1.1.3), and nothing further down reads the
-	// response as what it actually is — onBusy()'s CFB lookup in particular would
-	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
-	// a forward-on-busy call nobody asked for.
+	// response as what it actually is — onBusy()'s CFB lookup used to read
+	// data->getFromNumber() here, which on this leg is the TRANSFEREE, not the
+	// busy party; fixed to data->getToNumber() by #256. This intercept still
+	// stands regardless, for the ACK-ownership reason above.
 	if (handleBlindXferFailure(data))
 	{
 		return;
@@ -4744,7 +4747,13 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 	// swallow the 486 and redirect the call there instead of failing the caller.
 	if (session.has_value())
 	{
-		std::string busyExt(data->getFromNumber());
+		// Issue #256: a 486 mirrors the ORIGINAL INVITE's From/To (RFC 3261),
+		// so for an ordinary proxied call data->getFromNumber() names the
+		// CALLER, not the busy callee -- data->getToNumber() is the actual
+		// busy party. (The blind-transfer leg above returns before reaching
+		// here, so this does not need to special-case that shape: getToNumber()
+		// also names the actual busy party on that leg, it just never gets here.)
+		std::string busyExt(data->getToNumber());
 		std::string cfb = _cfg.getForwardTarget(busyExt, "busy");
 		if (!cfb.empty() && cfb != busyExt)
 		{
@@ -4769,34 +4778,19 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 		// CANCEL here (the callee already answered with 486 Busy, a final
 		// response the caller's UA has already processed), so no
 		// forked-dialog hazard applies -- straight to answerVoicemailDeposit().
-		//
-		// Deliberately NOT reusing `busyExt`/`cfb` above: for an ordinary
-		// proxied call, this 486 mirrors the ORIGINAL INVITE's From/To
-		// (RFC 3261), so data->getFromNumber() names the CALLER, not the
-		// busy callee -- data->getToNumber() is the actual busy party. This
-		// looks like a real pre-existing bug in the CFB lookup above (busyExt
-		// appears to key off the wrong identity for a normal call; the
-		// blind-transfer comment a few hundred lines up independently
-		// documents the same getFromNumber() trap for a different leg
-		// shape) -- flagged to the team, not fixed here, since it's outside
-		// this issue's scope and touches shared, untested logic.
-		else
+		else if (cfb.empty() && _cfg.isVoicemailEnabled(busyExt))
 		{
-			std::string actualBusyExt(data->getToNumber());
-			if (cfb.empty() && _cfg.isVoicemailEnabled(actualBusyExt))
+			auto inviteMsg = session.value()->getInviteMessage();
+			auto src = session.value()->getSrc();
+			if (inviteMsg && src)
 			{
-				auto inviteMsg = session.value()->getInviteMessage();
-				auto src = session.value()->getSrc();
-				if (inviteMsg && src)
-				{
-					// Same double-CDR shape as the CFNA divert's endCall() call --
-					// see its comment. Matches the existing CFNA redirect
-					// precedent, not a new problem introduced here.
-					std::string callID(data->getCallID());
-					endCall(callID, src->getNumber(), actualBusyExt, "busy (voicemail)");
-					answerVoicemailDeposit(inviteMsg, src, actualBusyExt);
-					return;
-				}
+				// Same double-CDR shape as the CFNA divert's endCall() call --
+				// see its comment. Matches the existing CFNA redirect
+				// precedent, not a new problem introduced here.
+				std::string callID(data->getCallID());
+				endCall(callID, src->getNumber(), busyExt, "busy (voicemail)");
+				answerVoicemailDeposit(inviteMsg, src, busyExt);
+				return;
 			}
 		}
 	}
@@ -4832,9 +4826,10 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 	// transferee's behalf (issue #197). Claimed here, ahead of every session
 	// branch, for the same reason a beep dialog is: the server is that leg's UAC,
 	// so the ACK is ours (RFC 3261 §17.1.1.3), and nothing further down reads the
-	// response as what it actually is — onBusy()'s CFB lookup in particular would
-	// resolve data->getFromNumber(), which on this leg is the TRANSFEREE, and fork
-	// a forward-on-busy call nobody asked for.
+	// response as what it actually is — onBusy()'s CFB lookup used to read
+	// data->getFromNumber() here, which on this leg is the TRANSFEREE, not the
+	// busy party; fixed to data->getToNumber() by #256. This intercept still
+	// stands regardless, for the ACK-ownership reason above.
 	if (handleBlindXferFailure(data))
 	{
 		return;
@@ -6418,10 +6413,10 @@ bool RequestsHandler::handleBlindXferFailure(const std::shared_ptr<SipMessage>& 
 	// declined, gone, whatever. Same intercept-before-everything shape as
 	// _beeper.handleInviteFailure(), and for the same two reasons — the response is
 	// ours to ACK (nobody else will), and left alone it would be interpreted as a
-	// failure of a call the transferee placed. onBusy()'s CFB lookup in particular
-	// reads data->getFromNumber(), which on this leg is the TRANSFEREE's number:
-	// the target being busy would go looking up the transferee's own forward-on-busy
-	// target and fork a call nobody asked for.
+	// failure of a call the transferee placed. onBusy()'s CFB lookup used to read
+	// data->getFromNumber() here, the TRANSFEREE's number on this leg, not the
+	// busy party; fixed to data->getToNumber() by #256. This intercept still
+	// stands regardless, for the ACK-ownership reason above.
 	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string::npos) return false;
 	const std::string callID(data->getCallID());
 	auto legOpt = getSession(callID);

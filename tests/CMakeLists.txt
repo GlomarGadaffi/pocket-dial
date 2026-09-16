@@ -333,6 +333,10 @@ add_executable(sip_parser_tests
     # locally-terminated voicemail leg, the mandatory CANCEL of the
     # still-ringing callee, and the #232-class BYE-teardown regression.
     VoicemailDivert_test.cpp
+    # Issue #256: onBusy()'s CFB lookup used to key off data->getFromNumber(),
+    # which for an ordinary proxied call's 486 (RFC 3261 mirrors the original
+    # INVITE's From/To) names the caller, not the busy callee.
+    CallForwardBusy_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header
