@@ -548,6 +548,50 @@ TEST(ConferenceRoom, ThreeExtensionsDialingTheConferenceExtensionLandOnOneRoom)
 	EXPECT_TRUE(handler.getSession("Call-ID: conf-503").has_value());
 }
 
+TEST(ConferenceRoom, PcmaOnlyOfferGets488NotMixedInAsSilence)
+{
+	// Issue #304: conference mixing only understands PCMU -- RtpReceiver.cpp
+	// only recognizes PAYLOAD_TYPE_PCMU as audio, so a PCMA-only leg would
+	// mix in as permanent silence rather than fail loudly.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.7.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("504", "192.168.7.54", "reg-504"));
+	sent.clear();
+
+	const std::string ext(ConferenceRoom::EXT);
+	sockaddr_in s{}; s.sin_family = AF_INET;
+	s.sin_addr.s_addr = inet_addr("192.168.7.54"); s.sin_port = htons(5060);
+	std::string body =
+		"v=0\r\n"
+		"o=- 0 0 IN IP4 192.168.7.54\r\n"
+		"s=-\r\n"
+		"c=IN IP4 192.168.7.54\r\n"
+		"t=0 0\r\n"
+		"m=audio 10000 RTP/AVP 8\r\n"
+		"a=rtpmap:8 PCMA/8000\r\n";
+	std::string raw =
+		"INVITE sip:" + ext + "@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.7.54:5060;branch=z9hG4bKconfpcma\r\n"
+		"From: <sip:504@server>;tag=ftconfpcma\r\n"
+		"To: <sip:" + ext + "@server>\r\n"
+		"Call-ID: conf-pcma\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Contact: <sip:504@192.168.7.54:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	handler.handle(RequestsHandler::getMessageFromPool(raw, s));
+
+	ASSERT_FALSE(sent.empty()) << "PCMA-only offer to " << ext << " got no response at all";
+	const std::string respRaw = sent.front().second ? sent.front().second->toString() : std::string{};
+	EXPECT_NE(respRaw.find("SIP/2.0 488"), std::string::npos)
+		<< "PCMA-only offer should be refused with 488, got:\n" << respRaw;
+	EXPECT_EQ(handler.getConferenceLegs(), 0) << "no leg should be mixed in";
+}
+
 TEST(ConferenceRoom, ConferenceDialIsRefusedWhenTheRoomIsFull)
 {
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;

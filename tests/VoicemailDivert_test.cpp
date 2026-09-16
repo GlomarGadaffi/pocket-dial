@@ -307,6 +307,57 @@ TEST(VoicemailDivert, CfbFallsBackToVoicemailWithNoCancelNeeded)
 		<< "the caller must never see the bare 486 once voicemail is enabled";
 }
 
+TEST(VoicemailDivert, PcmaOnlyCallerFallingBackToVoicemailGets488NotASilentRecording)
+{
+	// Issue #304: onCallerRtp() below the RTP receiver is fed raw mu-law bytes
+	// -- RtpReceiver.cpp only recognizes PAYLOAD_TYPE_PCMU as audio, so a
+	// PCMA-only caller's deposit would record as silence rather than fail
+	// loudly. answerVoicemailDeposit() uses the RETAINED original INVITE, so
+	// the PCMA-only offer has to be on THAT invite, not on the busy response.
+	SentList sent;
+	RequestsHandler handler("192.168.40.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in callerAddr = addrFor("192.168.40.24");
+
+	handler.handle(makeRegister("318", "192.168.40.15", "reg-318-d"));
+	handler.handle(makeRegister("319", "192.168.40.24", "reg-319-d"));
+	handler.setVoicemail("318", true);
+	sent.clear();   // else findSentTo's reverse scan matches 319's own REGISTER 200 OK
+
+	const std::string callId = "vm-cfb-pcma";
+	const std::string branch = "z9hG4bKvmcfbpcma";
+	std::string body =
+		"v=0\r\n"
+		"o=- 0 0 IN IP4 192.168.40.24\r\n"
+		"s=-\r\n"
+		"c=IN IP4 192.168.40.24\r\n"
+		"t=0 0\r\n"
+		"m=audio 10000 RTP/AVP 8\r\n"
+		"a=rtpmap:8 PCMA/8000\r\n";
+	std::string raw =
+		"INVITE sip:318@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.40.24:5060;branch=" + branch + "\r\n"
+		"From: <sip:319@server>;tag=ft" + callId + "\r\n"
+		"To: <sip:318@server>\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:319@192.168.40.24:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	handler.handle(RequestsHandler::getMessageFromPool(raw, callerAddr));
+	handler.handle(makeBusy("319", "318", "192.168.40.15", callId, branch));
+
+	std::string okToCaller = findSentTo(sent, callerAddr, "SIP/2.0 200 OK");
+	EXPECT_TRUE(okToCaller.empty())
+		<< "a PCMA-only caller must not be answered into a deposit it can't be recorded from";
+	EXPECT_FALSE(findSentTo(sent, callerAddr, "SIP/2.0 488").empty())
+		<< "PCMA-only fallback to voicemail should be refused with 488";
+}
+
 // Neither an explicit CFB target nor voicemail configured: the existing,
 // unmodified behaviour (the bare 486 reaches the caller) must be unchanged.
 TEST(VoicemailDivert, NoForwardNoVoicemailStillFailsPlainly)

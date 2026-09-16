@@ -339,6 +339,52 @@ TEST(VoicemailRetrieval, RefusesADialInFromAnExtensionWithVoicemailDisabled)
 	EXPECT_FALSE(findSentTo(sent, callerAddr, "403 Forbidden").empty());
 }
 
+TEST(VoicemailRetrieval, PcmaOnlyDialInGets488NotAMailboxItCanNeverHear)
+{
+	// Issue #304: retrieval only ever SENDS PCMU (buildMediaSdp is PCMU-only
+	// regardless of what was offered), so a PCMA-only caller could never
+	// hear their own mailbox even though this leg discards the caller's own
+	// audio (nothing to decode on THIS leg's own account).
+	SentList sent;
+	RequestsHandler handler("192.168.47.3", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("804", "192.168.47.14", "reg-r4"));
+	handler.setVoicemail("804", true);
+	sent.clear();   // else findSentTo's reverse scan matches 804's own REGISTER 200 OK
+
+	const std::string callId = "vm-retrieve-pcma";
+	const sockaddr_in callerAddr = addrFor("192.168.47.14");
+	std::string body =
+		"v=0\r\n"
+		"o=- 0 0 IN IP4 192.168.47.14\r\n"
+		"s=-\r\n"
+		"c=IN IP4 192.168.47.14\r\n"
+		"t=0 0\r\n"
+		"m=audio 10000 RTP/AVP 8\r\n"
+		"a=rtpmap:8 PCMA/8000\r\n";
+	std::string raw =
+		"INVITE sip:796@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.47.14:5060;branch=z9hG4bKvmretpcma\r\n"
+		"From: <sip:804@server>;tag=ft" + callId + "\r\n"
+		"To: <sip:796@server>\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:804@192.168.47.14:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	handler.handle(RequestsHandler::getMessageFromPool(raw, callerAddr));
+
+	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value())
+		<< "must refuse before claiming a slot";
+	EXPECT_FALSE(findSentTo(sent, callerAddr, "SIP/2.0 488").empty())
+		<< "PCMA-only retrieval dial-in should be refused with 488";
+	EXPECT_TRUE(findSentTo(sent, callerAddr, "SIP/2.0 200 OK").empty());
+}
+
 // SIP INFO digits on a voicemail leg must never leak into the star-code
 // parser (Fable-Low review finding: this guard was previously absent
 // entirely). Pin it with a real, directly observable feature code -- *60

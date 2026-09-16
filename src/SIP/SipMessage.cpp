@@ -351,7 +351,7 @@ namespace
 		size_t  mPrefixLen = 0;        // length of "m=audio <port> <proto>" within it
 	};
 
-	AudioPolicyResult applyAudioPolicy(std::string_view body, bool allowWideband)
+	AudioPolicyResult applyAudioPolicy(std::string_view body, bool allowWideband, bool allowPcma)
 	{
 		AudioPolicyResult r;
 		bool     isEvent[128] = {};   // a=rtpmap:<pt> telephone-event/...
@@ -407,7 +407,7 @@ namespace
 		{
 			const uint8_t pt = offered[k];
 			const bool ev = isEvent[pt];
-			const bool keep = (pt == 0) || (pt == 8) || (allowWideband && pt == 9) || ev;
+			const bool keep = (pt == 0) || (allowPcma && pt == 8) || (allowWideband && pt == 9) || ev;
 			if (keep)
 			{
 				r.kept[r.keptCount++] = pt;
@@ -454,9 +454,9 @@ namespace
 	}
 }
 
-bool SipMessage::offersSupportedAudio(bool allowWideband) const
+bool SipMessage::offersSupportedAudio(bool allowWideband, bool allowPcma) const
 {
-	const AudioPolicyResult r = applyAudioPolicy(_body, allowWideband);
+	const AudioPolicyResult r = applyAudioPolicy(_body, allowWideband, allowPcma);
 	return !r.hasMLine || r.hasAudio;
 }
 
@@ -495,9 +495,9 @@ int SipMessage::getTelephoneEventPayloadType() const
 	return found;
 }
 
-bool SipMessage::filterAudioCodecs(bool allowWideband)
+bool SipMessage::filterAudioCodecs(bool allowWideband, bool allowPcma)
 {
-	const AudioPolicyResult r = applyAudioPolicy(_body, allowWideband);
+	const AudioPolicyResult r = applyAudioPolicy(_body, allowWideband, allowPcma);
 	if (!r.hasMLine) return true;        // nothing to negotiate
 	if (!r.hasAudio) return false;       // caller answers 488; body left as offered
 	if (r.droppedCount == 0) return true; // already within policy: no rewrite, no churn
