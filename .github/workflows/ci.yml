@@ -77,6 +77,37 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: "Verify MSVC string-literal caps (issue #270)"
+        # src/Helpers/index_html.h is split into PD_HTML_0..N for exactly
+        # one reason: MSVC caps a single string-literal TOKEN and the
+        # dashboard page is far past it. GCC and Clang have no comparable
+        # limit and every runner in this repo is Linux, so a part that grows
+        # past the cap builds green on all of them, merges, and then fails
+        # for whoever next compiles on Windows -- `C2026: string too big,
+        # trailing characters truncated`, pointing at a line they did not
+        # write. Nothing enforced that until this step.
+        #
+        # No Windows runner is needed: the constraint is a BYTE COUNT, and
+        # the caps were measured against the real cl.exe once
+        # (tools/msvc_literal_cap_probe.py, re-runnable on any dev box) so
+        # this check can be a sub-second Python step on the runner we
+        # already pay for.
+        #
+        # FIRST step in the job, before dependency installation, because it
+        # needs nothing but python3 and answers in under a second -- a
+        # literal-cap failure should not cost a full build to discover.
+        #
+        # --selftest runs first, deliberately. The scanner is the part that
+        # can be wrong without looking wrong: index_html.h uses a DIFFERENT
+        # raw-string delimiter per part, and an extractor that assumes one
+        # uniform tag reports confident, specific, entirely fake byte counts
+        # rather than failing visibly. The self-test pins the cases that get
+        # that wrong, so a broken checker fails loudly instead of quietly
+        # reporting PASS on numbers it invented.
+        run: |
+          python3 tools/check_string_literal_caps.py --selftest
+          python3 tools/check_string_literal_caps.py
+
       - name: Install System Dependencies
         run: |
           sudo apt-get update
