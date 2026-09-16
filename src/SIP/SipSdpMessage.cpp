@@ -241,12 +241,21 @@ bool SipSdpMessage::isHoldOffer() const
 {
 	// #253: the section a call site means must be picked explicitly, never
 	// implied by index 0. The first AUDIO section is the one hold applies to
-	// here; fall back to index 0 (session-level direction/connection only,
-	// since effectiveDirection()/effectiveConnection() both guard mediaIndex
-	// against nMedia) when the offer has no audio section at all -- a body
-	// that fails to parse at all lands here too, with nMedia == 0.
+	// here; fall back to session-level-only direction/connection when the
+	// offer has no audio section at all -- either because it truly has no
+	// media sections (nMedia == 0, which a body that fails to parse also
+	// lands on), or because it has media sections and none of them are
+	// audio (e.g. video-only). Both cases use the SAME sentinel: an index
+	// equal to nMedia is guaranteed out of range, so effectiveDirection()/
+	// effectiveConnection()'s own `mediaIndex < s.nMedia` guards fall
+	// through to session level for either reason, uniformly.
+	//
+	// Issue #281: this used to initialize audioSection to 0 and only
+	// overwrite it on a match, so "media sections exist but none are audio"
+	// silently read section 0 -- whatever type it actually was -- instead of
+	// falling back to session level as this comment already claimed.
 	const sdp::Session& s = ensureParsed();
-	unsigned audioSection = 0;
+	unsigned audioSection = s.nMedia;
 	for (uint8_t i = 0; i < s.nMedia; ++i)
 	{
 		if (sdp::view(getBody(), s.media[i].typeName) == "audio")

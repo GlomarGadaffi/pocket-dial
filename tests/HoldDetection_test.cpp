@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "RequestsHandler.hpp"
+#include "SipSdpMessage.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -255,4 +256,46 @@ TEST(HoldDetection, ResumeAfterLegacyHoldReturnsToConnected)
 		plainSdpBody("192.168.50.10")));
 
 	EXPECT_EQ(session->getState(), Session::State::Connected);
+}
+
+// Issue #281, found re-reading #263 for a self-audit: isHoldOffer()'s "first
+// audio section, else session-level only" fallback used to initialize its
+// section index to 0 rather than nMedia, so an offer with media sections but
+// NO audio section silently read section 0 -- whatever type it actually was
+// -- instead of falling back to session level. A direct SipSdpMessage unit
+// test rather than a full handle() drive: the bug is entirely inside section
+// selection, nothing about the surrounding call machinery matters to it.
+TEST(HoldDetection, IsHoldOfferFallsBackToSessionLevelWhenNoAudioSectionExists)
+{
+	// Video-only offer: session level is plainly active (sendrecv, a real
+	// connection address), but the ONE media section is video, marked
+	// sendonly. Pre-#281, reading "section 0" unconditionally would read
+	// THIS section and wrongly report hold; the fix must fall back to the
+	// (non-holding) session level instead, since there is no audio section
+	// to apply hold to at all.
+	std::string body =
+		"v=0\r\n"
+		"o=- 0 0 IN IP4 192.168.50.10\r\n"
+		"s=-\r\n"
+		"c=IN IP4 192.168.50.10\r\n"
+		"t=0 0\r\n"
+		"a=sendrecv\r\n"
+		"m=video 20000 RTP/AVP 96\r\n"
+		"a=sendonly\r\n"
+		"a=rtpmap:96 H264/90000\r\n";
+	std::string raw =
+		"INVITE sip:200@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.50.10:5060;branch=z9hG4bK1\r\n"
+		"From: <sip:100@server>;tag=a\r\n"
+		"To: <sip:200@server>\r\n"
+		"Call-ID: video-only\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+
+	SipSdpMessage m(raw, addrFor("192.168.50.10"));
+	EXPECT_FALSE(m.isHoldOffer())
+		<< "no audio section exists, so this must fall back to the session "
+		   "level's own sendrecv -- reading the video section's sendonly "
+		   "instead is exactly issue #281";
 }
