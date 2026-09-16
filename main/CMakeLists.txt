@@ -165,6 +165,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/VoicemailLeg.cpp"
                             # Issue #246: the SD-flush queue/writer-task pipeline.
                             "../src/SIP/VoicemailArchive.cpp"
+                            # Issue #246, retrieval slice 2/3: the pure DTMF retrieval-menu.
+                            "../src/SIP/VoicemailMenu.cpp"
                             "../src/SIP/TelephonyProvider.cpp"
                             "../src/SIP/TelephonyApiConfig.cpp"
                             "../src/SIP/DidMapping.cpp"

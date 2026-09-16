@@ -437,6 +437,10 @@ add_executable(sip_parser_tests
     # WriterQueue, drainAll) -- pure C++17, mirrors CdrArchive's shape.
     ../src/SIP/VoicemailArchive.cpp
     VoicemailArchive_test.cpp
+    # Issue #246, retrieval slice 2/3: the pure DTMF retrieval-menu state
+    # machine (digits/playbackDone in, one Command out). No ESP dependency.
+    ../src/SIP/VoicemailMenu.cpp
+    VoicemailMenu_test.cpp
     # The fixed-size TelephonyProviderType registry/factory (name/implemented
     # lookups + registerProvider/select) that RequestsHandler's boot-time anchor
     # wiring now uses to select LoopbackAnchorClient. Pure C++17, no ESP dependency.
