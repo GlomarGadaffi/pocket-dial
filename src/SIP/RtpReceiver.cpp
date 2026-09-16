@@ -1,5 +1,11 @@
 #include "RtpReceiver.hpp"
 
+// buildRtpHeader() is reused rather than reimplemented. Two copies of the
+// RFC 3550 header layout would be two places to get the big-endian packing
+// wrong, and a relay that mis-serialises a header is invisible until a far
+// end rejects the stream.
+#include "RtpSender.hpp"
+
 #include <cstring>
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
@@ -192,6 +198,12 @@ bool RtpReceiver::setDtmfPayloadType(uint8_t pt, DtmfSink sink)
 bool RtpReceiver::setRawSink(RawSink sink)
 {
 	std::lock_guard<std::mutex> lock(_slotMutex);
+	// NOT hasAnyConsumerOrPeerLocked(), despite the identical shape. That
+	// predicate answers "has this receiver any reason to be running?"; this
+	// asks "was there anything here to disarm?". Substituting it would make
+	// setRawSink(nullptr) report success on a send-only leg that has a peer
+	// but never had a sink -- claiming to have disarmed something that was
+	// never armed.
 	if (!sink && !_rawSink)
 	{
 		return false;   // asked to disarm a receiver that was never armed
@@ -226,6 +238,89 @@ bool RtpReceiver::dispatchRaw(const RtpPacket& pkt)
 	}
 	sink(pkt);
 	return true;
+}
+
+bool RtpReceiver::setRawPeer(const sockaddr_in& peer)
+{
+	if (peer.sin_port == 0 || peer.sin_addr.s_addr == 0)
+	{
+		// Refuse rather than accept a destination nothing can reach. A relay
+		// silently sending into 0.0.0.0:0 looks exactly like a working leg with
+		// no audio, which is the most expensive kind of failure to diagnose.
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(_slotMutex);
+	_rawPeer = peer;
+	_rawPeerSet.store(true, std::memory_order_release);
+	return true;
+}
+
+// A refusal that DROPPED a packet, as distinct from one that never had a
+// destination. Counted on host only; on device it compiles to a plain false
+// so the media path carries no bookkeeping it cannot report anywhere.
+bool RtpReceiver::countDropAndFail()
+{
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	std::lock_guard<std::mutex> lock(_slotMutex);
+	++_droppedRawCount;
+#endif
+	return false;
+}
+
+bool RtpReceiver::sendRaw(const RtpPacket& pkt)
+{
+	if (!_rawPeerSet.load(std::memory_order_acquire)) return false;
+	if (pkt.payload == nullptr && pkt.payloadLen != 0)  return countDropAndFail();
+
+	// The datagram must fit the same fixed buffer the receive path uses. A relay
+	// never has to grow one: anything larger than MAX_DATAGRAM_BYTES could not
+	// have been received through this class in the first place.
+	const size_t total = static_cast<size_t>(RTP_HEADER_BYTES) + pkt.payloadLen;
+	if (total > static_cast<size_t>(MAX_DATAGRAM_BYTES)) return countDropAndFail();
+
+	uint8_t datagram[MAX_DATAGRAM_BYTES];
+	// VERBATIM: the far end's marker, payload type, sequence, timestamp and SSRC
+	// all survive. Renumbering here would break the very thing the raw path
+	// exists for -- a telephone-event burst is identified by its shared start
+	// timestamp, so re-stamping turns one keypress into many or none.
+	RtpSender::buildRtpHeader(datagram, pkt.marker, pkt.payloadType,
+		pkt.seq, pkt.timestamp, pkt.ssrc);
+	if (pkt.payloadLen > 0)
+	{
+		std::memcpy(datagram + RTP_HEADER_BYTES, pkt.payload, pkt.payloadLen);
+	}
+
+	// Copy fd + peer under the lock, send outside it -- same discipline as the
+	// audio path, so a slow send cannot stall a stop()/start() on the SIP thread.
+	sockaddr_in peer{};
+	int         fd = -1;
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		peer = _rawPeer;
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		fd = _sock;
+#endif
+	}
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	if (fd < 0) return false;   // not started: nothing bound to send from
+	// A stop() landing between the snapshot and here closes fd and sendto returns
+	// EBADF. Harmless, and the same race runLoop()'s own socket snapshot already
+	// accepts: the alternative is holding the lock across a syscall.
+	const int n = static_cast<int>(sendto(fd, datagram, total, 0,
+		reinterpret_cast<const sockaddr*>(&peer), sizeof(peer)));
+	return n == static_cast<int>(total);
+#else
+	// Host: no socket. Record what would have gone on the wire so a test can
+	// assert byte fidelity, which is the whole contract of this function.
+	(void)fd;
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		_lastRawDatagram.assign(datagram, datagram + total);
+		++_sentRawCount;
+	}
+	return true;
+#endif
 }
 
 bool RtpReceiver::dispatchDtmf(const RtpPacket& pkt)
@@ -305,12 +400,31 @@ RtpReceiver::~RtpReceiver()
 #endif
 }
 
+bool RtpReceiver::hasAnyConsumerOrPeerLocked(const Sink& pending) const
+{
+	// Three reasons to be running, and they are genuinely different roles:
+	//   an audio Sink   -- an ordinary decoded-media consumer;
+	//   a raw Sink      -- a relay leg that forwards what it receives;
+	//   a raw peer      -- a SEND-ONLY relay leg, which receives nothing and
+	//                      needs the socket bound only so sendRaw() can
+	//                      source from the port we advertised.
+	// `pending` is the Sink about to be installed by start(), which is not in
+	// _sink yet.
+	return static_cast<bool>(pending)
+		|| static_cast<bool>(_rawSink)
+		|| _rawPeerSet.load(std::memory_order_acquire);
+}
+
 void RtpReceiver::clearSlotLocked()
 {
 	_sink = nullptr;
 	_dtmfSink = nullptr;
 	_rawSink = nullptr;
 	_rawArmed.store(false, std::memory_order_release);
+	// The peer goes with the slot. A pooled receiver handed to a new call must
+	// not keep forwarding into the PREVIOUS call's far end.
+	_rawPeer = sockaddr_in{};
+	_rawPeerSet.store(false, std::memory_order_release);
 	_dtmfPt.store(kDtmfPayloadTypeUnset, std::memory_order_release);
 	// Reset the dedupe memory with the slot. RFC 4733 keys a press on its RTP
 	// timestamp, and timestamps are per-stream: a fresh call starts its own clock
@@ -346,9 +460,12 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	//
 	// _slotMutex is held, so reading _rawSink directly here is safe and sees
 	// any setRawSink() that has already returned.
-	if (!sink && !_rawSink)
+	// A SEND-ONLY relay leg has neither sink: it exists to transmit, and needs
+	// start() purely to bind the socket sendRaw() sources from. So an armed raw
+	// PEER counts as a reason to be running, exactly as a sink does.
+	if (!hasAnyConsumerOrPeerLocked(sink))
 	{
-		ESP_LOGE("RtpReceiver", "start() called with no sink of any kind");
+		ESP_LOGE("RtpReceiver", "start() called with no sink and no raw peer");
 		return false;
 	}
 
@@ -598,7 +715,10 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	// two arms in step matters -- this stub is the ONLY start() the host tests
 	// ever call, so a divergence here means the tests pin behaviour the device
 	// does not have.
-	if (!sink && !_rawSink)
+	// Mirrors the ESP guard, including the send-only relay leg. This stub is
+	// the only start() the host tests can reach, so a divergence here pins
+	// behaviour the device does not have.
+	if (!hasAnyConsumerOrPeerLocked(sink))
 	{
 		return false;
 	}
@@ -624,4 +744,28 @@ bool RtpReceiver::stop()
 	return true;
 }
 
+#endif
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+size_t RtpReceiver::sentRawCount() const
+{
+	std::lock_guard<std::mutex> lock(_slotMutex);
+	return _sentRawCount;
+}
+
+size_t RtpReceiver::droppedRawCount() const
+{
+	std::lock_guard<std::mutex> lock(_slotMutex);
+	return _droppedRawCount;
+}
+
+const std::vector<uint8_t>& RtpReceiver::lastRawDatagram() const
+{
+	// Returned by reference deliberately: a test compares it against an expected
+	// byte sequence immediately and copying a datagram per assertion would only
+	// obscure that. Not thread-safe to hold across another sendRaw(), which no
+	// single-threaded host test does.
+	std::lock_guard<std::mutex> lock(_slotMutex);
+	return _lastRawDatagram;
+}
 #endif

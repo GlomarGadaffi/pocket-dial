@@ -53,6 +53,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 class RtpReceiver
 {
@@ -248,6 +249,38 @@ public:
 	// recvfrom() would otherwise be unreachable off-device.
 	bool dispatchRaw(const RtpPacket& pkt);
 
+	// Point this receiver's socket at a peer, so sendRaw() can transmit from
+	// it. May be called before or after start().
+	//
+	// WHY THE EGRESS LIVES ON THE RECEIVER and not on RtpSender, which is the
+	// obvious place to look for it:
+	//
+	//   1. SYMMETRIC RTP, which NAT-latching carriers require. This socket is
+	//      bound to the port we advertised in SDP, so media leaves from exactly
+	//      the address the far end was told to expect. RtpSender binds its own
+	//      FIXED port (SERVER_RTP_PORT 5062), so sending from it would advertise
+	//      one port and source from another.
+	//   2. ONE SOCKET PER LEG. A relay needs two independent legs; two RtpSenders
+	//      would contend for that single 5062 bind and the loser falls back to an
+	//      ephemeral port with only a warning -- one-way audio, diagnosable only
+	//      with a capture.
+	//   3. NO FrameProvider ANYWHERE ON A RELAY LEG, so a provider's own SSRC can
+	//      never interleave with forwarded packets on one stream. That hazard is
+	//      removed by construction rather than by a documented convention.
+	bool setRawPeer(const sockaddr_in& peer);
+
+	// Forward one packet VERBATIM: original marker, payload type, sequence,
+	// timestamp and SSRC, payload bytes untouched. This is the egress half of
+	// setRawSink() and the reason a trunk can carry DTMF at all -- re-stamping a
+	// telephone-event packet as PCMU, which is all RtpSender's FrameProvider can
+	// do, destroys it.
+	//
+	// Returns false if no peer is set, the stream is not started, or the packet
+	// does not fit MAX_DATAGRAM_BYTES. Safe to call from the receive task: the
+	// socket and peer are copied under _slotMutex and the sendto happens outside
+	// it, so a slow send cannot stall a stop()/start() on the SIP thread.
+	bool sendRaw(const RtpPacket& pkt);
+
 	// Offer one parsed RTP packet to the RFC 4733 path. Returns true when the
 	// packet was a telephone-event on the negotiated payload type and has been
 	// consumed (whether or not it produced a digit — a malformed body, a hook
@@ -270,10 +303,47 @@ public:
 	// idle receiver. Returns true if a stream was actually stopped.
 	bool stop();
 
+	// ── Host-only test seam ─────────────────────────────────────────────────
+	//
+	// On host there is no socket, so sendRaw() records the datagram it WOULD
+	// have transmitted instead. That is the only way to assert byte fidelity of
+	// a forwarded packet off-device, and byte fidelity is the entire point of
+	// this path -- a relay that quietly renumbers or re-stamps produces a stream
+	// the far end cannot reassemble.
+	//
+	// Absent on device: it would be dead weight on the media path, and there is
+	// nothing off-target to read it.
+	#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	size_t                      sentRawCount() const;
+	// Packets sendRaw() REFUSED. Counted so a test can prove a drop happened
+	// rather than only observing a false return -- "returned false" and
+	// "dropped a packet" are different claims.
+	size_t                      droppedRawCount() const;
+	const std::vector<uint8_t>& lastRawDatagram() const;
+	#endif
+
 private:
 	// Common, platform-independent slot reset used by stop()/teardown. Caller must
 	// hold _slotMutex. Clears the sink and active/port state.
 	void clearSlotLocked();
+
+	// The ONE place that answers "does this receiver have a reason to be
+	// running?". Used by both arms of start()'s #if.
+	//
+	// It exists because that question has been answered wrong twice in this
+	// class: once when a raw-relay receiver with no audio Sink was refused,
+	// and again when a SEND-ONLY leg with no sink at all -- only a peer, and
+	// needing start() purely to bind the socket sendRaw() transmits from --
+	// was refused. Both times the fix had to be applied to the ESP arm AND the
+	// host stub, and the host stub is the only start() the tests can reach, so
+	// a divergence pins behaviour the device does not have. A fourth reason
+	// goes here, once.
+	//
+	// Caller holds _slotMutex.
+	bool hasAnyConsumerOrPeerLocked(const Sink& pending) const;
+
+	// Refuse, and on host record that a packet was dropped. See the impl.
+	bool countDropAndFail();
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	static void taskTrampoline(void* arg);
@@ -313,6 +383,19 @@ private:
 	// the common non-relay path -- one acquire-load per packet, not a mutex.
 	std::atomic<bool> _rawArmed{false};
 	RawSink           _rawSink;
+
+	// Raw egress. The peer is guarded by _slotMutex like the sinks; the atomic
+	// flag lets sendRaw() reject early without taking the lock.
+	std::atomic<bool> _rawPeerSet{false};
+	sockaddr_in       _rawPeer{};
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Host-only record of what sendRaw() would have transmitted. Guarded by
+	// _slotMutex like everything else in the slot. See the accessors above.
+	std::vector<uint8_t> _lastRawDatagram;
+	size_t               _sentRawCount = 0;
+	size_t               _droppedRawCount = 0;
+#endif
 	uint32_t             _lastDtmfTs   = 0;
 	bool                 _haveLastDtmf = false;
 };
