@@ -491,3 +491,25 @@ TEST(RtpRawEgress, NoPeerIsNotCountedAsADrop)
 	EXPECT_EQ(rx.droppedRawCount(), 0u);
 	EXPECT_EQ(rx.sentRawCount(), 0u);
 }
+
+// Requested in review alongside the in-lock re-check fix.
+//
+// HONEST LIMIT: this is single-threaded, so it does NOT exercise the
+// interleaving the fix is for -- a stop() landing between sendRaw()'s lock-free
+// _rawPeerSet fast path and its snapshot of _rawPeer, which would have sent one
+// datagram to 0.0.0.0:0. No host test can schedule that. What this pins is the
+// observable contract either way: after stop(), sendRaw() refuses and records
+// nothing at all -- not a send, and not a drop either, because an unconfigured
+// leg has lost nothing.
+TEST(RtpRawEgress, AfterStopSendRawRefusesAndRecordsNothing)
+{
+	RtpReceiver rx;
+	ASSERT_TRUE(rx.setRawPeer(peerAt("203.0.113.9", 4000)));
+	ASSERT_TRUE(rx.start(0, nullptr));
+	ASSERT_TRUE(rx.stop());
+
+	const uint8_t body[4] = {1, 2, 3, 4};
+	EXPECT_FALSE(rx.sendRaw(packet(0, 1, 160, body, sizeof(body))));
+	EXPECT_EQ(rx.sentRawCount(), 0u)    << "nothing was transmitted";
+	EXPECT_EQ(rx.droppedRawCount(), 0u) << "and nothing was lost -- there was no destination";
+}

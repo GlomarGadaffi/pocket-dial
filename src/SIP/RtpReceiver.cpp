@@ -296,6 +296,19 @@ bool RtpReceiver::sendRaw(const RtpPacket& pkt)
 	int         fd = -1;
 	{
 		std::lock_guard<std::mutex> lock(_slotMutex);
+
+		// RE-CHECK INSIDE THE LOCK. The early _rawPeerSet test above is a
+		// lock-free fast path, so a stop() landing between it and here has
+		// already run clearSlotLocked() and ZEROED _rawPeer -- and we would
+		// snapshot that and fire one datagram at 0.0.0.0:0.
+		//
+		// Distinct from the closed-fd race noted below, which really is
+		// harmless: that one fails at sendto with EBADF, whereas this one
+		// SUCCEEDS at sending somewhere meaningless. Found in review; I had
+		// reasoned about the neighbouring race and walked straight past this
+		// one.
+		if (!_rawPeerSet.load(std::memory_order_acquire)) return false;
+
 		peer = _rawPeer;
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		fd = _sock;
@@ -307,6 +320,14 @@ bool RtpReceiver::sendRaw(const RtpPacket& pkt)
 	// A stop() landing between the snapshot and here closes fd and sendto returns
 	// EBADF. Harmless, and the same race runLoop()'s own socket snapshot already
 	// accepts: the alternative is holding the lock across a syscall.
+	//
+	// TWO TASKS TOUCH THIS SOCKET: this leg's own receive task is parked in
+	// recvfrom() on it while the OPPOSITE leg's receive task calls sendRaw()
+	// here. lwIP permits concurrent recvfrom/sendto on one UDP socket -- they
+	// take different paths through the stack and neither mutates shared
+	// per-socket send state. Stated explicitly because "one socket, two tasks"
+	// looks wrong at a glance and is the kind of thing someone later
+	// "fixes" by adding a second socket, which would cost symmetric RTP.
 	const int n = static_cast<int>(sendto(fd, datagram, total, 0,
 		reinterpret_cast<const sockaddr*>(&peer), sizeof(peer)));
 	return n == static_cast<int>(total);
