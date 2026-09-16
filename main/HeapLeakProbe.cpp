@@ -60,6 +60,7 @@
 #include "esp_heap_trace.h"
 #include "esp_memory_utils.h"   // esp_ptr_internal
 #include <cstdarg>                // va_list, for probePrintf
+#include <cstring>                // memcmp, memcpy
 #include <cstdio>                 // vsnprintf
 #include <cstdint>                // uintptr_t
 #include <unistd.h>               // write(), STDERR_FILENO
@@ -300,63 +301,171 @@ void logPerTask(uint32_t atSec)
 // single record copy rather than 904 prints. So we iterate at our own pace,
 // print outside any critical section, and yield between batches. Interrupts
 // are then off for microseconds at a time instead of seconds.
+// Aggregation table for the dump, in PSRAM. Sized by DISTINCT CALL SITES, not
+// by allocation count -- 886 outstanding records on the first real capture
+// collapsed to far fewer unique stacks, and that ratio is what makes the dump
+// bounded.
+constexpr size_t kMaxSites = 192;
+
+struct SiteTotal
+{
+	void*    frames[CONFIG_HEAP_TRACING_STACK_DEPTH];
+	uint32_t bytes;
+	uint32_t count;
+};
+
+SiteTotal* g_sites = nullptr;   // kMaxSites entries, allocated once in PSRAM
+
+// Print outstanding internal-RAM allocations AGGREGATED BY CALL STACK.
+//
+// WHY NOT ONE LINE PER RECORD (the previous design, and why it was wrong).
+//
+// The first working capture said: `internal-RAM records: 886 (printed 400,
+// TRUNCATED)`. The cap existed so a badly-leaking board could not emit
+// megabytes over a 115200 line -- a real concern -- but it discarded exactly
+// the records the analysis needs.
+//
+// heap_trace_standalone.c:604 inserts new allocations with TAILQ_INSERT_TAIL,
+// and heap_trace_get(0) returns TAILQ_FIRST (line 287). Index order is
+// therefore OLDEST FIRST. Printing indices 0..399 prints the 400 oldest
+// outstanding allocations and throws away the tail -- and in HEAP_TRACE_LEAKS
+// mode the tail is, by construction, where a growing leak lives.
+//
+// A leak is found by diffing two dumps: the signal IS the set of allocations
+// added between them, which is precisely the set the cap deleted. The
+// comparison would have reported "nothing grew" -- not an error, not a crash,
+// just a plausible wrong answer. The line-count integrity check passes it too,
+// because every line the probe emitted did arrive; they were simply the wrong
+// 400.
+//
+// Raising the cap only moves the cliff. Aggregating removes it: output is
+// bounded by the number of DISTINCT call sites, which does not grow with the
+// leak, so nothing is ever discarded. It also computes on-device exactly what
+// the host-side analysis was going to compute anyway -- bytes and allocation
+// count per call stack -- so the delta between dumps becomes exact rather than
+// a diff of two truncated samples.
+//
+// Cost: O(records x sites) memcmp of a 32-byte key. At 4000 x 192 that is
+// bounded work outside any critical section, yielding every batch.
 void dumpInternalRecords(uint32_t atSec)
 {
-	// Bounded so a badly-leaking board cannot emit megabytes over a 115200
-	// line faster than anyone can capture it. If we hit the cap the count is
-	// reported, so a truncated dump is visible rather than silently partial.
-	constexpr size_t kMaxPrinted  = 400;
-	constexpr size_t kBatchSize   = 16;   // records per yield
+	constexpr size_t kBatchSize = 16;   // records per yield
+
+	if (g_sites == nullptr)
+	{
+		probePrintf("HeapProbe: [dump t=%us] no aggregation table -- skipped\n",
+			static_cast<unsigned>(atSec));
+		return;
+	}
 
 	const size_t total = heap_trace_get_count();
-	size_t printed = 0, internalSeen = 0;
-
-	probePrintf("HeapProbe: [dump t=%us] %u outstanding records total; listing "
-		"internal-RAM ones (max %u)\n", static_cast<unsigned>(atSec), static_cast<unsigned>(total),
-		static_cast<unsigned>(kMaxPrinted));
+	size_t siteCount = 0, internalSeen = 0, overflow = 0;
+	uint64_t internalBytes = 0;
 
 	for (size_t i = 0; i < total; ++i)
 	{
 		heap_trace_record_t rec;
-		if (heap_trace_get(i, &rec) != ESP_OK) continue;
-		if (rec.address == nullptr) continue;
-		if (!esp_ptr_internal(rec.address)) continue;   // PSRAM: not #273's pool
-
-		++internalSeen;
-		if (printed < kMaxPrinted)
+		if (heap_trace_get(i, &rec) == ESP_OK &&
+		    rec.address != nullptr &&
+		    esp_ptr_internal(rec.address))     // PSRAM: not #273's pool
 		{
-			// One line per record: size, address, then the call stack. Raw
-			// addresses -- symbolize in bulk with xtensa-esp32s3-elf-addr2line
-			// against the ELF whose SHA256 matches this boot's banner.
-			char frames[9 * 11 + 1];
-			int  off = 0;
-			for (int f = 0; f < CONFIG_HEAP_TRACING_STACK_DEPTH; ++f)
+			++internalSeen;
+			internalBytes += rec.size;
+
+			size_t k = 0;
+			for (; k < siteCount; ++k)
 			{
-				if (rec.alloced_by[f] == nullptr) break;
-				off += snprintf(frames + off, sizeof(frames) - off, " 0x%08x",
-						static_cast<unsigned>(
-						reinterpret_cast<uintptr_t>(rec.alloced_by[f])));
-				if (off >= static_cast<int>(sizeof(frames)) - 1) break;
+				if (memcmp(g_sites[k].frames, rec.alloced_by,
+				           sizeof(g_sites[k].frames)) == 0)
+				{
+					break;
+				}
 			}
-			frames[sizeof(frames) - 1] = '\0';
-			probePrintf("HeapProbe:   %6u B @ 0x%08x by%s\n",
-				static_cast<unsigned>(rec.size),
-				static_cast<unsigned>(reinterpret_cast<uintptr_t>(rec.address)),
-				frames);
-			++printed;
+			if (k == siteCount)
+			{
+				if (siteCount < kMaxSites)
+				{
+					memcpy(g_sites[siteCount].frames, rec.alloced_by,
+					       sizeof(g_sites[siteCount].frames));
+					g_sites[siteCount].bytes = 0;
+					g_sites[siteCount].count = 0;
+					++siteCount;
+				}
+				else
+				{
+					// Reported, never silent. A table this small overflowing
+					// would mean the stacks are far more varied than measured,
+					// and the number below says so rather than the totals
+					// quietly under-counting.
+					++overflow;
+					goto yield_point;
+				}
+			}
+			g_sites[k].bytes += rec.size;
+			g_sites[k].count += 1;
 		}
 
-		// Yield outside any critical section so the idle task runs and both
-		// watchdogs stay fed. This is the whole point of not using IDF's dump.
+	yield_point:
+		// Outside any critical section, so the idle task runs and both
+		// watchdogs stay fed. The whole point of not using IDF's dump.
 		if ((i % kBatchSize) == (kBatchSize - 1))
 		{
 			vTaskDelay(1);
 		}
 	}
 
-	probePrintf("HeapProbe: [dump t=%us] internal-RAM records: %u (printed %u%s)\n",
-		static_cast<unsigned>(atSec), static_cast<unsigned>(internalSeen), static_cast<unsigned>(printed),
-		internalSeen > printed ? ", TRUNCATED" : "");
+	probePrintf("HeapProbe: [dump t=%us] %u outstanding records total, %u in "
+		"internal RAM holding %u B across %u call sites\n",
+		static_cast<unsigned>(atSec), static_cast<unsigned>(total),
+		static_cast<unsigned>(internalSeen),
+		static_cast<unsigned>(internalBytes),
+		static_cast<unsigned>(siteCount));
+
+	// Selection sort by bytes held, descending. siteCount is small and this
+	// runs once per dump; an in-place sort avoids a second allocation.
+	for (size_t a = 0; a + 1 < siteCount; ++a)
+	{
+		size_t best = a;
+		for (size_t b = a + 1; b < siteCount; ++b)
+		{
+			if (g_sites[b].bytes > g_sites[best].bytes) best = b;
+		}
+		if (best != a)
+		{
+			SiteTotal tmp = g_sites[a];
+			g_sites[a] = g_sites[best];
+			g_sites[best] = tmp;
+		}
+	}
+
+	for (size_t k = 0; k < siteCount; ++k)
+	{
+		// Raw addresses -- symbolize in bulk with xtensa-esp32s3-elf-addr2line
+		// against the ELF whose SHA256 matches this boot's banner.
+		char frames[CONFIG_HEAP_TRACING_STACK_DEPTH * 11 + 1];
+		int  off = 0;
+		for (int f = 0; f < CONFIG_HEAP_TRACING_STACK_DEPTH; ++f)
+		{
+			if (g_sites[k].frames[f] == nullptr) break;
+			off += snprintf(frames + off, sizeof(frames) - off, " 0x%08x",
+				static_cast<unsigned>(
+					reinterpret_cast<uintptr_t>(g_sites[k].frames[f])));
+			if (off >= static_cast<int>(sizeof(frames)) - 1) break;
+		}
+		frames[sizeof(frames) - 1] = '\0';
+		probePrintf("HeapProbe:   site %8u B  %5u allocs by%s\n",
+			static_cast<unsigned>(g_sites[k].bytes),
+			static_cast<unsigned>(g_sites[k].count), frames);
+
+		if ((k % kBatchSize) == (kBatchSize - 1)) vTaskDelay(1);
+	}
+
+	// Closing line. NOTHING IS TRUNCATED unless overflow is non-zero, and the
+	// count is printed either way so a reader never has to infer it.
+	probePrintf("HeapProbe: [dump t=%us] call sites: %u (records unplaced: %u%s)\n",
+		static_cast<unsigned>(atSec), static_cast<unsigned>(siteCount),
+		static_cast<unsigned>(overflow),
+		overflow ? ", TRUNCATED -- raise kMaxSites" : "");
 }
 
 void heapProbeTask(void*)
@@ -383,9 +492,23 @@ void heapProbeTask(void*)
 		return;
 	}
 
+	// Aggregation table, also in PSRAM and for the same reason as the trace
+	// buffer: an instrument that consumes internal DRAM changes the internal
+	// DRAM figure it exists to report. Allocated once at arm time rather than
+	// per dump, so a dump never depends on an allocation succeeding on a board
+	// whose whole symptom is allocations failing.
+	g_sites = static_cast<SiteTotal*>(
+		heap_caps_malloc(kMaxSites * sizeof(SiteTotal), MALLOC_CAP_SPIRAM));
+	if (g_sites == nullptr)
+	{
+		probePrintf("HeapProbe: no PSRAM for the %u-entry call-site table -- "
+			"dumps will report gauges only\n", static_cast<unsigned>(kMaxSites));
+	}
+
 	probePrintf("HeapProbe: leak probe armed: %u records in PSRAM, HEAP_TRACE_LEAKS. "
+		"Aggregating by call site (max %u distinct). "
 		"Dumps at 120/240/360/900 s (#273 onset measured 218-276 s).\n",
-		static_cast<unsigned>(kTraceRecords));
+		static_cast<unsigned>(kTraceRecords), static_cast<unsigned>(kMaxSites));
 	logInternalState("armed", 0);
 
 	for (uint32_t target : kDumpsSec)
