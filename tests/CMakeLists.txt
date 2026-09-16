@@ -228,6 +228,13 @@ add_executable(sip_parser_tests
     # s17.1.1.3 reuses the INVITE branch, s13.2.2.4 is a new transaction to the
     # remote target), which is the easiest thing in a trunk to get wrong.
     SipTrunk_test.cpp
+    # Issue #164: carrier SBC resolution off the SIP thread. The blocking
+    # getaddrinfo is ESP-only and untestable here; what IS tested is the part
+    # that decides whether a configured host is an ADDRESS or a NAME (getting
+    # that wrong sends calls somewhere else entirely), the negative cache that
+    # stops a bad name re-queueing a ~21 s lookup per call attempt, and the
+    # bounded-cache/in-flight state machine.
+    TrunkResolver_test.cpp
     PlayoutBuffer_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp
@@ -486,6 +493,7 @@ add_executable(sip_parser_tests
     ../src/SIP/Registrar.cpp
     ../src/SIP/RegisterBeeper.cpp
     ../src/SIP/SipTrunk.cpp
+    ../src/SIP/TrunkResolver.cpp
     # Kari's Law on-site notification (#166 part 2). PbxEnv-only sibling
     # machine; pure text formatter is host-tested directly.
     ../src/SIP/EmergencyNotifier.cpp

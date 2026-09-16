@@ -111,3 +111,11 @@ __pycache__/
 # Wildcard rather than the two current names (pocketdial_tapi.cfg,
 # pocketdial_didmap.cfg) so a future host-backed namespace is covered on day one.
 pocketdial_*.cfg
+
+# Written by tests/DialPlan_test.cpp into the CWD, one per test case. Build
+# artifacts, not fixtures. Ignored for the same reason as the line above and
+# then some: they use the TAPI config FORMAT, whose s*id / s*sec fields hold
+# carrier OAuth credentials. The ones the suite currently writes are empty,
+# but a committed file of that shape is one populated test run away from
+# being a real leak.
+test_dialplan_tapicfg_*.cfg
