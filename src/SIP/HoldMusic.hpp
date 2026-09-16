@@ -242,6 +242,9 @@ private:
 	// Touched only by the pacing task, so no synchronisation is needed or wanted.
 	uint32_t _txErrors = 0;   // failed sendto()s — a silent gap otherwise
 	uint32_t _ticks    = 0;   // drives the one-shot stack high-water report
+	// Issue #273: the deep (held-call) path's stack margin. Pacing task only.
+	bool     _deepPathSampled = false;
+	uint32_t _stackLowWater   = 0xFFFFFFFFu;
 #endif
 
 	// The clip. Owned here, freed on destruction / replacement.

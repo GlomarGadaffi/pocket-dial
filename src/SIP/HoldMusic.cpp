@@ -553,13 +553,54 @@ void HoldMusic::runLoop()
 
 		// Stack headroom, measured rather than assumed. The task was created with a
 		// guessed size; this reports what it actually uses so the number can be set
-		// from evidence. Logged once, ~10 s in, when the deepest path (a full
-		// listener table) has been exercised.
+		// from evidence. Logged once, ~10 s in.
+		//
+		// Issue #273: this one-shot sample measures the SHALLOW path. A full
+		// listener table is not this task's deepest frame -- sendto() into a
+		// fixed on-stack packet is. The deepest is
+		//     tap -> MediaBridge::feedMohTick -> TelephonyAnchorClient::writeAudio
+		//     (char chunkBuf[1034]) -> esp_http_client_write -> mbedTLS record write
+		// which only exists while a call is HELD over the anchor. At ~10 s on a
+		// box that is not on hold, no tap has ever run, so the number this
+		// printed was the one path we did not need to know about, and it read
+		// healthy no matter how close the deep path came to the canary.
+		//
+		// The high-water mark is a persistent watermark, not an instantaneous
+		// depth, so sampling it LATER still reports the deepest excursion ever
+		// taken. That lets both samples below stay off the 20 ms hot path: the
+		// scan is O(stack) and this task paces real-time audio.
 		if (++_ticks == 500u)
 		{
 			const UBaseType_t freeWords = uxTaskGetStackHighWaterMark(nullptr);
-			ESP_LOGI(TAG, "stack high-water: %u bytes free of %d",
+			ESP_LOGI(TAG, "stack high-water: %u bytes free of %d (shallow path -- no tap has run)",
 				static_cast<unsigned>(freeWords * sizeof(StackType_t)), kTaskStackBytes);
+		}
+
+		// One tagged reading the first time a tap actually ran, i.e. the first
+		// tick that reached writeAudio(). This is the number that says whether
+		// 6144 bytes is enough for the held-call path; mbedTLS's record write
+		// alone generally wants 2-4 KB of frame on this IDF.
+		if (tapCount > 0 && !_deepPathSampled)
+		{
+			_deepPathSampled = true;
+			const UBaseType_t freeWords = uxTaskGetStackHighWaterMark(nullptr);
+			_stackLowWater = static_cast<uint32_t>(freeWords * sizeof(StackType_t));
+			ESP_LOGW(TAG, "stack high-water: %u bytes free of %d (DEEP PATH -- first tap tick)",
+				static_cast<unsigned>(_stackLowWater), kTaskStackBytes);
+		}
+		// Then track new minima, every 250 ticks (~5 s) so the scan cost stays
+		// off the hot path. Warn level: if this is trending toward zero it is
+		// the story, not background noise.
+		else if (_deepPathSampled && (_ticks % 250u) == 0u)
+		{
+			const UBaseType_t freeWords = uxTaskGetStackHighWaterMark(nullptr);
+			const uint32_t freeBytes = static_cast<uint32_t>(freeWords * sizeof(StackType_t));
+			if (freeBytes < _stackLowWater)
+			{
+				_stackLowWater = freeBytes;
+				ESP_LOGW(TAG, "stack high-water: NEW MINIMUM %u bytes free of %d",
+					static_cast<unsigned>(freeBytes), kTaskStackBytes);
+			}
 		}
 	}
 
