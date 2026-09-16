@@ -8,6 +8,17 @@
 //     so the host binary links and behaves predictably for the smoke tests.
 
 #include "OtaUpdater.hpp"
+#include <atomic>
+
+namespace
+{
+	std::atomic<bool> s_inProgress{false};
+}
+
+bool OtaUpdater::isUpdateInProgress()
+{
+	return s_inProgress.load(std::memory_order_relaxed);
+}
 
 #if defined(ESP_PLATFORM)
 #include "esp_ota_ops.h"   // esp_ota_*; esp_ota_img_states_t / ESP_OTA_IMG_* enums
@@ -68,6 +79,7 @@ bool OtaUpdater::begin(size_t totalSize)
 	_updatePart = part;
 	_otaHandle  = static_cast<uint64_t>(handle);
 	_inProgress = true;
+	s_inProgress.store(true, std::memory_order_relaxed);
 	return true;
 }
 
@@ -106,6 +118,7 @@ bool OtaUpdater::end()
 	esp_err_t err = esp_ota_end(toHandle(_otaHandle));
 	// Whether end() succeeds or fails, the handle is consumed by esp_ota_end.
 	_inProgress = false;
+	s_inProgress.store(false, std::memory_order_relaxed);
 	_otaHandle  = 0;
 
 	if (err != ESP_OK)
@@ -153,6 +166,7 @@ void OtaUpdater::abort()
 		esp_ota_abort(toHandle(_otaHandle));
 	}
 	_inProgress = false;
+	s_inProgress.store(false, std::memory_order_relaxed);
 	_otaHandle  = 0;
 }
 
@@ -208,6 +222,7 @@ bool OtaUpdater::begin(size_t totalSize)
 	_expectedSize  = totalSize;
 	_updatePending = false;
 	_inProgress    = true;
+	s_inProgress.store(true, std::memory_order_relaxed);
 	_lastError.clear();
 	return true;
 }
@@ -232,6 +247,7 @@ bool OtaUpdater::end()
 		return false;
 	}
 	_inProgress = false;
+	s_inProgress.store(false, std::memory_order_relaxed);
 	return true;
 }
 
@@ -249,6 +265,7 @@ bool OtaUpdater::activate()
 void OtaUpdater::abort()
 {
 	_inProgress = false;
+	s_inProgress.store(false, std::memory_order_relaxed);
 }
 
 std::string OtaUpdater::runningPartitionLabel()  { return "host"; }

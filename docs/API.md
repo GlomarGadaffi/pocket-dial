@@ -2321,6 +2321,8 @@ Read-only OTA introspection: which partition is running/booting/staged next, and
 ```json
 {
   "running": "ota_0",
+  "runningPartition": "ota_0",
+  "inProgress": false,
   "boot": "ota_0",
   "next": "ota_1",
   "pendingVerify": false,
@@ -2334,6 +2336,8 @@ Read-only OTA introspection: which partition is running/booting/staged next, and
 | Field Name | Type | Description |
 | :--- | :---: | :--- |
 | `running` | String | Partition label of the image currently executing. |
+| `runningPartition` | String | Alias for `running` (partition label of the image currently executing). |
+| `inProgress` | Boolean | `true` while an OTA firmware upload/flash session is actively in progress; `false` when idle. |
 | `boot` | String | Partition label the bootloader will boot next. |
 | `next` | String | Partition label a new OTA upload would target. |
 | `pendingVerify` | Boolean | `true` if the running image has not yet called `markValid()` (anti-rollback window; see `docs/OTA.md`). |

@@ -4814,8 +4814,10 @@ void HttpServer::sendApiOtaStatus(int sock)
 {
 	std::ostringstream json;
 	json << "{";
-	json << "\"running\":\""  << jsonEscape(OtaUpdater::runningPartitionLabel())    << "\",";
-	json << "\"boot\":\""     << jsonEscape(OtaUpdater::bootPartitionLabel())       << "\",";
+	json << "\"running\":\""          << jsonEscape(OtaUpdater::runningPartitionLabel())    << "\",";
+	json << "\"runningPartition\":\"" << jsonEscape(OtaUpdater::runningPartitionLabel())    << "\",";
+	json << "\"inProgress\":"         << (OtaUpdater::isUpdateInProgress() ? "true" : "false") << ",";
+	json << "\"boot\":\""             << jsonEscape(OtaUpdater::bootPartitionLabel())       << "\",";
 	json << "\"next\":\""     << jsonEscape(OtaUpdater::nextUpdatePartitionLabel()) << "\",";
 	json << "\"pendingVerify\":" << (OtaUpdater::isPendingVerify() ? "true" : "false") << ",";
 #if defined(ESP_PLATFORM)
