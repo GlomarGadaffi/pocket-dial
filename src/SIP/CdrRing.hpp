@@ -10,6 +10,20 @@
 #include "CallDetailRecord.hpp"
 #include "Session.hpp"
 
+// Fixed-capacity NVS blob for the CDR ring's write-through persistence.
+// Sized so the worst case (every one of POCKETDIAL_CDR_RECORDS records at its
+// per-field cap) fits with room to spare -- see CdrRing.cpp's kMaxLineBytes
+// comment for the exact arithmetic. Never allocates: this is what crosses
+// from persist() -- called from RequestsHandler::endCall(), on WHATEVER task
+// ended the call, including a PSRAM-stacked one (issues #273/#288) -- to the
+// dedicated, plain-stack writer task via a fixed-size FreeRTOS queue item.
+// The actual flash write happens only on that task; nothing here does I/O.
+struct CdrRingBlob
+{
+	static constexpr size_t kCapacity = POCKETDIAL_CDR_RECORDS * 140 + 1;
+	char text[kCapacity] = {};
+};
+
 // ── Call Detail Record ring buffer, extracted out of RequestsHandler ─────────
 // Fixed capacity (POCKETDIAL_CDR_RECORDS), no heap growth: writes wrap and
 // overwrite the oldest slot. Unlike PbxFeatureConfig (see PbxFeatureConfig.hpp),
@@ -56,6 +70,32 @@ public:
 	// sensitive as the credential tables in TelephonyApiConfig/DidMapping and
 	// lives in its own NVS namespace ("cdrlog"), so a reset must clear it too.
 	void clearAll();
+
+	// Pure, host-testable, never allocates: builds the exact NVS blob format
+	// persist() writes -- oldest-first, tab-separated, one line per record --
+	// directly into `out`. Unchanged by issue #273's fix, which only moved
+	// WHERE the flash write happens, not what it writes, so
+	// load()/deserializeBlob() need no matching change. caller/callee are
+	// truncated to a fixed cap (see CdrRing.cpp) rather than the unbounded
+	// length the live std::string fields allow -- anchor-sourced values
+	// bypass isValidAor()'s length bound, same precedent as
+	// CdrArchive.cpp's kMaxAorRaw -- which is the one behavior change from
+	// the pre-fix code, a necessary consequence of a fixed-size buffer
+	// rather than a scope addition.
+	//
+	// Takes `out` BY REFERENCE rather than returning a CdrRingBlob, matching
+	// CdrArchive.cpp's formatLine(..., QueuedLine& out) convention for the
+	// same reason: at ~4.5 KB, a return-by-value risks a temporary of that
+	// size materializing on the caller's stack around the assignment, even
+	// with a static destination -- an out-parameter writes straight into
+	// whatever storage the caller already owns (persist()'s static `blob`),
+	// with nothing but this function's own small locals ever touching the
+	// stack. Exposed as a static method (rather than private) specifically
+	// so CdrRing_test.cpp can exercise the format/truncation logic directly,
+	// without FreeRTOS, NVS, or a live CdrRing instance.
+	static void serializeForPersist(
+		const std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS>& ring,
+		size_t head, size_t count, CdrRingBlob& out);
 
 private:
 	void persist();
