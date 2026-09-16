@@ -36,6 +36,12 @@
 #include <cstring>
 #include <vector>
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <WinSock2.h>
+#else
+#include <arpa/inet.h>
+#endif
+
 #include "RtpReceiver.hpp"
 
 namespace
@@ -293,4 +299,217 @@ TEST(RtpRawRelay, StopClearsTheRawSinkWithTheSlot)
 	const uint8_t frame[4] = {1, 2, 3, 4};
 	EXPECT_FALSE(rx.dispatchRaw(packet(RtpReceiver::PAYLOAD_TYPE_PCMU, 1, 160, frame, sizeof(frame))));
 	EXPECT_EQ(got.calls, 0);
+}
+
+// ── The EGRESS half ──────────────────────────────────────────────────────────
+//
+// setRawSink() (above) was shipped in #250 with nothing that could put a
+// received packet back on the wire intact. RtpSender only has FrameProvider, a
+// pull model that stamps PT 0 with its own seq/ts, so a forwarded
+// telephone-event packet would have been re-stamped as PCMU -- destroying the
+// exact thing the raw path exists to carry. Found in review by a second reader,
+// not by any test, which is why the fidelity assertion below is byte-exact
+// rather than field-by-field.
+//
+// The egress lives on RtpReceiver, not RtpSender, for three reasons worth
+// restating where the tests are: this socket is bound to the port advertised in
+// SDP, so media leaves from where the far end expects it (symmetric RTP, which
+// NAT-latching carriers require); RtpSender binds a single fixed 5062 so two
+// relay legs would contend for it; and with no FrameProvider anywhere on a
+// relay leg, a provider's own SSRC can never interleave with forwarded packets.
+
+namespace
+{
+	sockaddr_in peerAt(const char* ip, uint16_t port)
+	{
+		sockaddr_in a{};
+		a.sin_family = AF_INET;
+		a.sin_addr.s_addr = inet_addr(ip);
+		a.sin_port = htons(port);
+		return a;
+	}
+}
+
+TEST(RtpRawEgress, RefusedWithoutAPeer)
+{
+	RtpReceiver rx;
+	const uint8_t body[4] = {1, 2, 3, 4};
+	EXPECT_FALSE(rx.sendRaw(packet(RtpReceiver::PAYLOAD_TYPE_PCMU, 1, 160, body, sizeof(body))))
+		<< "no destination configured -- must refuse rather than send nowhere";
+	EXPECT_EQ(rx.sentRawCount(), 0u);
+}
+
+// An unreachable destination is refused at configuration time. A relay quietly
+// sending into 0.0.0.0:0 looks identical to a working leg with no audio.
+TEST(RtpRawEgress, AnUnusablePeerIsRefused)
+{
+	RtpReceiver rx;
+	EXPECT_FALSE(rx.setRawPeer(peerAt("0.0.0.0", 4000))) << "unspecified address";
+	EXPECT_FALSE(rx.setRawPeer(peerAt("203.0.113.9", 0))) << "port 0";
+	EXPECT_TRUE(rx.setRawPeer(peerAt("203.0.113.9", 4000)));
+}
+
+// The whole contract, asserted byte-for-byte against a hand-built header. A
+// relay that renumbers or re-stamps produces a stream the far end cannot
+// reassemble, and an RFC 4733 burst is identified by its shared start
+// timestamp -- re-stamping turns one keypress into many or none.
+TEST(RtpRawEgress, TheSerialisedDatagramIsByteExact)
+{
+	RtpReceiver rx;
+	ASSERT_TRUE(rx.setRawPeer(peerAt("203.0.113.9", 4000)));
+
+	const uint8_t body[] = {0x01, 0x8A, 0x00, 0xA0};   // an RFC 4733 event body
+	const uint8_t kPt = 101, kMarker = 1;
+	const uint16_t kSeq = 0x1234;
+	const uint32_t kTs = 0xCAFEBABE, kSsrc = 0xDEADBEEF;
+
+	ASSERT_TRUE(rx.sendRaw(packet(kPt, kSeq, kTs, body, sizeof(body), /*marker=*/true)));
+	ASSERT_EQ(rx.sentRawCount(), 1u);
+
+	const std::vector<uint8_t>& d = rx.lastRawDatagram();
+	ASSERT_EQ(d.size(), 12u + sizeof(body));
+
+	EXPECT_EQ(d[0], 0x80) << "V=2, P=0, X=0, CC=0";
+	EXPECT_EQ(d[1], static_cast<uint8_t>((kMarker ? 0x80 : 0) | kPt)) << "marker + PT preserved";
+	EXPECT_EQ((d[2] << 8) | d[3], kSeq) << "sequence preserved, not renumbered";
+	EXPECT_EQ((static_cast<uint32_t>(d[4]) << 24) | (d[5] << 16) | (d[6] << 8) | d[7], kTs)
+		<< "timestamp preserved -- an RFC 4733 burst is keyed on it";
+	EXPECT_EQ((static_cast<uint32_t>(d[8]) << 24) | (d[9] << 16) | (d[10] << 8) | d[11], kSsrc)
+		<< "SSRC forwarded: pure B2BUA transparency";
+	EXPECT_EQ(std::memcmp(d.data() + 12, body, sizeof(body)), 0) << "payload untouched";
+}
+
+TEST(RtpRawEgress, AnOversizePayloadIsRefusedNotTruncated)
+{
+	RtpReceiver rx;
+	ASSERT_TRUE(rx.setRawPeer(peerAt("203.0.113.9", 4000)));
+
+	// Truncating would put a malformed packet on the wire; refusing drops one.
+	std::vector<uint8_t> huge(RtpReceiver::MAX_DATAGRAM_BYTES, 0xAB);
+	EXPECT_FALSE(rx.sendRaw(packet(0, 1, 160, huge.data(), huge.size())));
+	EXPECT_EQ(rx.sentRawCount(), 0u);
+}
+
+// The relay as it will actually be wired: two receivers cross-connected, so a
+// packet arriving on A leaves on B unchanged.
+TEST(RtpRawEgress, CrossWiredReceiversRelayAPacketEndToEnd)
+{
+	RtpReceiver handsetLeg, trunkLeg;
+	ASSERT_TRUE(trunkLeg.setRawPeer(peerAt("203.0.113.9", 4000)));
+	ASSERT_TRUE(handsetLeg.setRawSink([&trunkLeg](const RtpReceiver::RtpPacket& p) {
+		trunkLeg.sendRaw(p);
+	}));
+
+	const uint8_t ev[] = {0x05, 0x0A, 0x01, 0x40};
+	ASSERT_TRUE(handsetLeg.dispatchRaw(packet(101, 77, 999, ev, sizeof(ev), /*marker=*/true)));
+
+	ASSERT_EQ(trunkLeg.sentRawCount(), 1u) << "the packet crossed the relay";
+	const std::vector<uint8_t>& d = trunkLeg.lastRawDatagram();
+	ASSERT_EQ(d.size(), 12u + sizeof(ev));
+	EXPECT_EQ(d[1] & 0x7F, 101) << "still telephone-event on the far side, not PCMU";
+	EXPECT_EQ((d[2] << 8) | d[3], 77);
+	EXPECT_EQ(std::memcmp(d.data() + 12, ev, sizeof(ev)), 0);
+}
+
+// A send-only relay leg has no Sink at all -- it exists to transmit. start()
+// used to refuse that, the same guard that refused a raw-only receiver before
+// #250 widened it.
+TEST(RtpRawEgress, ASendOnlyLegCanStartWithNoSink)
+{
+	RtpReceiver rx;
+	ASSERT_TRUE(rx.setRawPeer(peerAt("203.0.113.9", 4000)));
+	EXPECT_TRUE(rx.start(0, nullptr)) << "a raw peer is a reason to be running";
+	EXPECT_TRUE(rx.stop());
+}
+
+TEST(RtpRawEgress, StartStillRefusesWithNoSinkAndNoPeer)
+{
+	RtpReceiver rx;
+	EXPECT_FALSE(rx.start(0, nullptr));
+}
+
+// The peer goes with the slot. A pooled receiver handed to a new call must not
+// keep forwarding into the previous call's far end.
+TEST(RtpRawEgress, StopClearsThePeer)
+{
+	RtpReceiver rx;
+	ASSERT_TRUE(rx.setRawPeer(peerAt("203.0.113.9", 4000)));
+	ASSERT_TRUE(rx.start(0, nullptr));
+	ASSERT_TRUE(rx.stop());
+
+	const uint8_t body[4] = {1, 2, 3, 4};
+	EXPECT_FALSE(rx.sendRaw(packet(0, 1, 160, body, sizeof(body))))
+		<< "a recycled receiver must not inherit the previous call's destination";
+}
+
+// A carrier re-INVITE can move media mid-call, so the peer must be replaceable
+// on a receiver that is already running. Requested in review; without it the
+// relay would keep forwarding to the OLD address after a re-INVITE and the call
+// would go one-way with nothing in the signalling to explain it.
+TEST(RtpRawEgress, ThePeerCanBeReplacedWhileTheStreamIsActive)
+{
+	RtpReceiver rx;
+	ASSERT_TRUE(rx.setRawPeer(peerAt("203.0.113.9", 4000)));
+	ASSERT_TRUE(rx.start(0, nullptr));
+
+	const uint8_t body[4] = {1, 2, 3, 4};
+	ASSERT_TRUE(rx.sendRaw(packet(0, 1, 160, body, sizeof(body))));
+	ASSERT_EQ(rx.sentRawCount(), 1u);
+
+	// Mid-call move, exactly as a re-INVITE would do it.
+	ASSERT_TRUE(rx.setRawPeer(peerAt("198.51.100.7", 5000)))
+		<< "must be callable while active";
+	EXPECT_TRUE(rx.sendRaw(packet(0, 2, 320, body, sizeof(body))));
+	EXPECT_EQ(rx.sentRawCount(), 2u);
+
+	EXPECT_TRUE(rx.stop());
+}
+
+// "Returned false" and "dropped a packet" are different claims. The counter
+// makes the second one assertable.
+TEST(RtpRawEgress, AnOversizePacketIsCountedAsADropNotJustRefused)
+{
+	RtpReceiver rx;
+	ASSERT_TRUE(rx.setRawPeer(peerAt("203.0.113.9", 4000)));
+	ASSERT_EQ(rx.droppedRawCount(), 0u);
+
+	std::vector<uint8_t> huge(RtpReceiver::MAX_DATAGRAM_BYTES, 0xAB);
+	EXPECT_FALSE(rx.sendRaw(packet(0, 1, 160, huge.data(), huge.size())));
+
+	EXPECT_EQ(rx.droppedRawCount(), 1u) << "the drop is recorded, not merely refused";
+	EXPECT_EQ(rx.sentRawCount(), 0u);
+}
+
+// An unconfigured leg is NOT a drop. Nothing was lost -- there was never a
+// destination -- and conflating the two would make the drop counter useless as
+// a diagnostic for a relay that is losing media.
+TEST(RtpRawEgress, NoPeerIsNotCountedAsADrop)
+{
+	RtpReceiver rx;
+	const uint8_t body[4] = {1, 2, 3, 4};
+	EXPECT_FALSE(rx.sendRaw(packet(0, 1, 160, body, sizeof(body))));
+	EXPECT_EQ(rx.droppedRawCount(), 0u);
+	EXPECT_EQ(rx.sentRawCount(), 0u);
+}
+
+// Requested in review alongside the in-lock re-check fix.
+//
+// HONEST LIMIT: this is single-threaded, so it does NOT exercise the
+// interleaving the fix is for -- a stop() landing between sendRaw()'s lock-free
+// _rawPeerSet fast path and its snapshot of _rawPeer, which would have sent one
+// datagram to 0.0.0.0:0. No host test can schedule that. What this pins is the
+// observable contract either way: after stop(), sendRaw() refuses and records
+// nothing at all -- not a send, and not a drop either, because an unconfigured
+// leg has lost nothing.
+TEST(RtpRawEgress, AfterStopSendRawRefusesAndRecordsNothing)
+{
+	RtpReceiver rx;
+	ASSERT_TRUE(rx.setRawPeer(peerAt("203.0.113.9", 4000)));
+	ASSERT_TRUE(rx.start(0, nullptr));
+	ASSERT_TRUE(rx.stop());
+
+	const uint8_t body[4] = {1, 2, 3, 4};
+	EXPECT_FALSE(rx.sendRaw(packet(0, 1, 160, body, sizeof(body))));
+	EXPECT_EQ(rx.sentRawCount(), 0u)    << "nothing was transmitted";
+	EXPECT_EQ(rx.droppedRawCount(), 0u) << "and nothing was lost -- there was no destination";
 }
