@@ -462,7 +462,23 @@ void dumpInternalRecords(uint32_t atSec)
 	{
 		// Raw addresses -- symbolize in bulk with xtensa-esp32s3-elf-addr2line
 		// against the ELF whose SHA256 matches this boot's banner.
-		char frames[CONFIG_HEAP_TRACING_STACK_DEPTH * 11 + 1];
+		// INITIALIZED, and that is load-bearing. get_call_stack() zeroes the
+		// whole array and bails the moment a return address is not
+		// esp_ptr_executable() (heap_trace.inc:33-41), so an allocation made
+		// from a context with no usable call chain -- very early startup, or
+		// a frame whose return address is not in executable memory -- has
+		// frames[0] == NULL. The loop below then breaks on its first
+		// iteration and writes nothing, and an UNINITIALIZED buffer would be
+		// handed straight to %s: stack garbage in the log, and if that
+		// garbage held a newline byte it would split the line in two.
+		//
+		// That is exactly what happened on the first clean pair. The t=120
+		// dump reported 449 sites and the capture held 448, with the byte
+		// total 6 short -- one 6-byte site, the smallest, therefore the LAST
+		// line in a descending sort, carrying no call stack at all. Both
+		// integrity checks agreed on it independently, which is the only
+		// reason it surfaced as a refusal instead of a quietly wrong ranking.
+		char frames[CONFIG_HEAP_TRACING_STACK_DEPTH * 11 + 1] = "";
 		int  off = 0;
 		for (int f = 0; f < CONFIG_HEAP_TRACING_STACK_DEPTH; ++f)
 		{
@@ -475,7 +491,12 @@ void dumpInternalRecords(uint32_t atSec)
 		frames[sizeof(frames) - 1] = '\0';
 		probePrintf("HeapProbe:   site %8u B  %5u allocs by%s\n",
 			static_cast<unsigned>(g_sites[k].bytes),
-			static_cast<unsigned>(g_sites[k].count), frames);
+			static_cast<unsigned>(g_sites[k].count),
+			// Explicit marker, not an empty field. A site with no call
+			// stack is a real site holding real bytes; it has to stay
+			// countable and diffable rather than disappearing from any
+			// tool that scans for addresses.
+			frames[0] ? frames : " <no-call-stack>");
 
 		if ((k % kBatchSize) == (kBatchSize - 1)) vTaskDelay(1);
 	}
