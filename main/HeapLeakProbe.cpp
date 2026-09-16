@@ -496,15 +496,24 @@ void dumpInternalRecords(uint32_t atSec)
 	// HOW TO READ THE RESULT -- and how NOT to. First hardware census was
 	// 4 / 18 / 214 / 449 (depths 1, 2, 4, full). The tempting reading is
 	// "4 to 18 is the honest number of leak sources, the deep key is
-	// fragmenting them." That reading is wrong, and the reason is in
-	// heap_trace.inc:29: STACK_OFFSET is 2, commented "Caller is 2 stack
-	// frames deeper than we care about", so IDF already skips its own
-	// wrapper frames and frames[0] is the DIRECT CALLER of the heap API.
-	// In C++ that is almost always an allocator FUNNEL -- operator new,
-	// std::string::_M_create, lwIP mem_malloc, pvPortMalloc -- not the code
-	// holding the memory. Four distinct frames[0] across 887 allocations
-	// means four funnels, not four leaks; ranking at that depth reports that
-	// operator new is leaking, which is both true and useless.
+	// fragmenting them." That reading is wrong.
+	//
+	// heap_trace.inc:29 sets STACK_OFFSET to 2, commented "Caller is 2 stack
+	// frames deeper than we care about", so the capture skips get_call_stack
+	// and trace_malloc. But it lands on whoever called
+	// __wrap_heap_caps_malloc, and in IDF that is STILL the allocator: the
+	// four depth-1 addresses from the first census symbolized to exactly
+	// heap_caps_malloc_default, heap_caps_malloc, calloc and malloc
+	// (madmax, addr2line, on this tree). The skip stops INSIDE the allocator
+	// stack, not above it.
+	//
+	// So frames[0] AND frames[1] are allocator plumbing on every record, and
+	// real program context does not begin until roughly frames[2]. Two
+	// consequences: ranking at depth 1-2 would report that malloc is
+	// leaking, and the 8-frame key carries only ~6 frames of actual signal,
+	// which argues AGAINST re-keying shallower rather than for it. When
+	// symbolizing for a ranking, skip the first two frames -- they are the
+	// same handful of names on every row.
 	//
 	// So this census describes the SHAPE of the fan-out and nothing more.
 	// Which depth to rank at is a question for symbols, not for a ratio.
