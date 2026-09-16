@@ -567,17 +567,29 @@ TEST(VoicemailDivert, DepositPlaysGreetingBeforeRecordingWhenOneIsLoaded)
 	// PlaybackIsOneShotNotALoop); this test's job is proving the
 	// greeting-before-recording ORDERING, so poll for PlaybackDone instead
 	// of racing the sender thread for the first fillTx() call.
+	//
+	// Found in review (Fable-Low): on the MSVC host stub (RtpSender's plain
+	// `#else` branch), no sender thread exists at all -- the provider is
+	// stored and never called, so nothing would ever drain the clip and
+	// this loop would spin to its budget and fail deterministically on that
+	// build. Draining a frame ourselves each iteration (ignoring the
+	// return) makes this correct on BOTH builds: on Linux whichever thread
+	// wins drains it, on the stub this call is the only drain there is
+	// either way -- the assertion is "reached PlaybackDone", never "my
+	// read won the race".
 	bool reachedPlaybackDone = false;
-	for (int i = 0; i < 100; ++i)
+	for (int i = 0; i < 1000; ++i)
 	{
 		if (handler.voicemailLegStateForTest(slot) == VoicemailLeg::State::PlaybackDone)
 		{
 			reachedPlaybackDone = true;
 			break;
 		}
+		uint8_t discard[3];
+		handler.readVoicemailPlaybackForTest(slot, discard, sizeof(discard));
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
-	ASSERT_TRUE(reachedPlaybackDone) << "greeting never finished playing within 100ms";
+	ASSERT_TRUE(reachedPlaybackDone) << "greeting never finished playing within 1s";
 
 	// The greeting is now fully delivered -> PlaybackDone. tick() is the
 	// only thing that advances this to Recording.
