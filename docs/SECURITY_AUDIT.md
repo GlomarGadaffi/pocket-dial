@@ -129,19 +129,22 @@ Under this enforcement, a rebinding request carrying a foreign host header (such
 
 ### SEC-02: Missing Request Parsing Validation on SIP Signaling
 * Classification: CWE-20: Improper Input Validation
-* Vulnerable Component: `RequestsHandler::handle` in [RequestsHandler.cpp](../src/SIP/RequestsHandler.cpp#L59-L88).
+* Vulnerable Component: `RequestsHandler::handle` in [RequestsHandler.cpp](../src/SIP/RequestsHandler.cpp#L793-L800).
 
 #### Previous Behavior
 The `SipMessage` class defines `isValidMessage()` to verify that mandatory headers (`Via`, `To`, `From`, `Call-ID`, `CSeq`) are present. However, this validator was never called inside `RequestsHandler::handle`. Malformed or truncated UDP packets returned empty headers upon parsing. 
 
 Subsequent header mutation calls (such as `setVia()` or `setFrom()`) ran `.find("")` on empty member variables, which returned index `0`, prepending modified values at the very beginning of the packet and corrupting the SIP Request-Line.
 
+**Issue #265 addendum (2026-09-15):** the two paragraphs above describe two separate gaps, and the "Resolution Verification" below originally closed only the first. `isValidMessage()` was call*ed*, correctly, from the moment SEC-02 shipped — but until #265 it did **not** actually check for the five mandatory headers this paragraph describes; it checked only that the start line and method/status token were non-empty. That gap had zero adversarial test coverage (every `isValidMessage()` call anywhere in the suite asserted `true`) and was found by a from-scratch comparison against the #196/#255 SDP model's standard, not by exploitation. #265 closed it: `isValidMessage()` now genuinely checks all five headers this paragraph always claimed it did, backed by one adversarial test per header (`SipMessage_test.cpp`) plus empty/truncated/no-separator/colonless-header cases.
+
 #### Resolution Verification
 The security patches successfully enforce validation at the signaling entry point. `RequestsHandler::handle` now immediately drops null or structurally malformed packets:
 
 ```cpp
-// Verified in RequestsHandler.cpp lines 59-66:
-void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
+// Verified in RequestsHandler.cpp lines 793-800 (signature updated since this
+// doc was written; the validation gate itself is unchanged in shape):
+void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_view rawBytes)
 {
     // Input validation: Drop null or structurally malformed packets instantly (SEC-02)
     if (!request || !request->isValidMessage())

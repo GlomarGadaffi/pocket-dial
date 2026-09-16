@@ -702,6 +702,22 @@ bool SipMessage::isValidMessage() const
 	// SIP message always yields a non-empty start line and type token.
 	if (_startLine.empty()) return false;
 	if (getType().empty()) return false;
+
+	// Issue #265: SECURITY_AUDIT.md's SEC-02 entry has always described this
+	// check as also verifying the five headers RFC 3261 s8.1.1/s8.2.6.2
+	// requires on every request AND every response alike -- Via, To, From,
+	// Call-ID, CSeq (Max-Forwards is request-only, so it is deliberately not
+	// checked here). The code did not actually do that; this closes the gap
+	// the doc always claimed was closed, rather than weakening the doc to
+	// match a narrower check. A message missing any one of these cannot be
+	// correlated to a dialog or transaction downstream regardless -- rejecting
+	// it here, loudly and once, beats letting a handler further down discover
+	// the same absence with no equivalent guard of its own.
+	if (getVia().empty()) return false;
+	if (getTo().empty()) return false;
+	if (getFrom().empty()) return false;
+	if (getCallID().empty()) return false;
+	if (getCSeq().empty()) return false;
 	return true;
 }
 
