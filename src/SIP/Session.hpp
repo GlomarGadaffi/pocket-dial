@@ -240,6 +240,22 @@ public:
 	bool isBlindXferLeg() const { return _blindXferLeg; }
 	void setBlindXferLeg(bool v) { _blindXferLeg = v; }
 
+	// Issue #257. When the server impersonates the transferor (A) inside this
+	// dialog -- the blind-transfer swap re-INVITE toward the transferee -- the
+	// CSeq it mints MUST be higher than any CSeq this dialog has already seen
+	// from A's own UA, or the transferee's stack correctly rejects it with 500
+	// Invalid CSeq (RFC 3261 s12.2.2). A hardcoded low constant broke on any
+	// real UA whose dialog CSeq had already climbed past it -- which is most
+	// of them; there is no reason a phone's own CSeq counter starts near 1.
+	//
+	// The REFER that starts a blind transfer is itself an in-dialog request
+	// from A on THIS dialog, so it is a real, fresh, directly-observed data
+	// point for "the last CSeq A used here" -- captured once at REFER time
+	// (there is no ongoing per-message tracking; nothing else needs this
+	// value or updates it). 0 means unset/never captured.
+	uint32_t transferorCseqAtRefer() const { return _transferorCseqAtRefer; }
+	void setTransferorCseqAtRefer(uint32_t v) { _transferorCseqAtRefer = v; }
+
 	void release();
 
 private:
@@ -294,6 +310,7 @@ private:
 	bool _isTransferBridge = false; // true for attended-transfer bridge halves
 	bool _blindXferLeg = false;    // true for the server-UAC leg toward a blind-transfer target
 	bool _wasTransferorSrc = true; // meaningful only when _isTransferBridge
+	uint32_t _transferorCseqAtRefer = 0; // issue #257, see the accessor's comment
 };
 
 #endif
