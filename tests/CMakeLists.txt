@@ -441,6 +441,9 @@ add_executable(sip_parser_tests
     # machine (digits/playbackDone in, one Command out). No ESP dependency.
     ../src/SIP/VoicemailMenu.cpp
     VoicemailMenu_test.cpp
+    # Issue #246, retrieval slice 3/3: ext-796 SIP dial-in wired to the
+    # SD-I/O job machine and VoicemailMenu, driven through handle()/tick().
+    VoicemailRetrieval_test.cpp
     # The fixed-size TelephonyProviderType registry/factory (name/implemented
     # lookups + registerProvider/select) that RequestsHandler's boot-time anchor
     # wiring now uses to select LoopbackAnchorClient. Pure C++17, no ESP dependency.

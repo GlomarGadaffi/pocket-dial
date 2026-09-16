@@ -2,6 +2,7 @@
 #include "RequestsHandler.hpp"
 #include "SipMessagePool.hpp"
 #include <atomic>
+#include <iostream>
 #include <sstream>
 #include <cctype>
 #include <cstring>
@@ -85,6 +86,12 @@ namespace
 	// (matching 777/440/888/999) was chosen over a trunk-access prefix or an
 	// unregistered-number fallback.
 	constexpr const char* kAnchorCallExt = "555";
+
+	// Issue #246, retrieval slice 3/3: voicemail retrieval dial-in. Matches
+	// pbx::isReservedExtension()'s own "796" literal -- see that function's
+	// comment for why 700 (the originally-planned number) collided with the
+	// park-orbit range instead.
+	constexpr const char* kVoicemailRetrievalExt = "796";
 
 	// Issue #194 audit: isValidAor() had a header comment (CallDetailRecord.hpp)
 	// claiming it bounded caller/callee length. It never did -- charset only,
@@ -663,6 +670,12 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 		for (;;)
 		{
 			handler->drainVoicemailFlush(vmarchive::productionSink());
+			// Issue #246, retrieval slice 3/3: the same SD-I/O task also
+			// serves list/read/delete jobs for a retrieval leg -- both are
+			// SD-card work, and this task already exists for exactly that
+			// discipline (never on the SIP/RTP threads). Runs every slot
+			// each pass; a no-op for any slot not Pending.
+			handler->runVoicemailSdJobs(vmarchive::productionSource());
 			vTaskDelay(pdMS_TO_TICKS(200));
 		}
 	}, "vm_archive", 6144, this, 1, nullptr, 0);
@@ -1007,7 +1020,20 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			}
 			if (isDtmfRelay)
 			{
-				_dtmf.onInfo(request);
+				// Found in review (Fable-Low, during the retrieval slice's
+				// design pass): this guard was previously ABSENT entirely,
+				// so any voicemail leg's caller sending digits via SIP
+				// INFO already leaked into the star-code parser instead --
+				// a pre-existing gap affecting DEPOSIT legs too, not
+				// something the retrieval menu introduces. RFC 4733 is the
+				// only digit path this MVP's menu wires up (see
+				// answerVoicemailRetrieval()'s DtmfSink); SIP INFO support
+				// for it is an explicit follow-up, not an oversight.
+				auto infoSession = findSession(request->getCallID());
+				if (!infoSession || !infoSession->isVoicemail())
+				{
+					_dtmf.onInfo(request);
+				}
 			}
 		}
 		else
@@ -1868,6 +1894,17 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	if (destNumber == kVoicemailRetrievalExt)
+	{
+		// Voicemail retrieval dial-in (796, Issue #246): the server answers
+		// and streams the CALLER'S OWN mailbox back -- see
+		// answerVoicemailRetrieval()'s doc comment for the no-PIN MVP
+		// tradeoff and why this is a fresh-dial dispatch, unlike
+		// answerVoicemailDeposit()'s mid-call-fallback shape.
+		answerVoicemailRetrieval(data, caller.value());
+		return;
+	}
+
 	// Call parking (park-orbit, 700..70N): an INVITE to a FREE orbit parks the
 	// caller's leg there; an INVITE to an OCCUPIED orbit retrieves the parked call.
 	{
@@ -2488,7 +2525,8 @@ int RequestsHandler::findFreeVoicemailSlot() const
 	for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
 	{
 		if (!_vmRtpReceivers[i].isActive() &&
-			!_vmFlushBusy[i].load(std::memory_order_acquire))
+			!_vmFlushBusy[i].load(std::memory_order_acquire) &&
+			_vmSdJobState[i].load(std::memory_order_acquire) == VmSdJobState::Idle)
 		{
 			return static_cast<int>(i);
 		}
@@ -2692,8 +2730,330 @@ void RequestsHandler::enqueueVoicemailFlush(int slot)
 	}
 }
 
+void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>& invite,
+	const std::shared_ptr<SipClient>& src)
+{
+	const std::string activeIp = _localIp;
+	const std::string callID(invite->getCallID());
+	const std::string extension = src->getNumber();
+
+	auto refuse = [&](const char* statusLine, const char* why) {
+		auto msg = getMessageFromPool(*invite);
+		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
+		msg->setHeader(statusLine);
+		msg->clearBody();
+		msg->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
+		msg->setContact(buildContact(kVoicemailRetrievalExt));
+		_outbox.emplace_back(invite->getSource(), std::move(msg));
+		queueLog("Voicemail retrieval: " + std::string(why) + " for " + extension, true);
+	};
+
+	// MVP auth: no PIN -- the mailbox IS whoever's dialing in, authenticated
+	// purely by Caller-ID. Accepted tradeoff, documented in
+	// pocket_dial_246_voicemail.md: fine for a LAN-only extension, revisit
+	// if 796 ever becomes trunk-reachable.
+	if (!_cfg.isVoicemailEnabled(extension))
+	{
+		refuse("SIP/2.0 403 Forbidden", "voicemail not enabled");
+		return;
+	}
+
+	std::string destIp;
+	uint16_t destPort = 0;
+	if (!parseCallerRtp(invite, destIp, destPort))
+	{
+		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in invite");
+		return;
+	}
+
+	// Same free-slot rules a deposit uses -- a slot mid-flush or mid-job is
+	// exactly as unavailable to a retrieval as to a new deposit.
+	const int slot = findFreeVoicemailSlot();
+	if (slot < 0)
+	{
+		refuse("SIP/2.0 486 Busy Here", "every voicemail leg busy, rejected retrieval");
+		return;
+	}
+	if (_vmRecordBufs[slot] == nullptr)
+	{
+		refuse("SIP/2.0 500 Server Internal Error", "voicemail leg has no message buffer");
+		return;
+	}
+
+	const bool rxStarted = _vmRtpReceivers[slot].start(0,
+		[](const uint8_t* /*mulaw*/, size_t /*n*/, uint32_t /*timestamp*/, uint16_t /*seq*/) {
+			// Retrieval discards the caller's own audio entirely -- there is
+			// nothing to record while a caller is listening to their own
+			// mailbox. The receiver must still be started (its isActive()
+			// is one of findFreeVoicemailSlot()'s busy signals) and armed
+			// for DTMF below; this sink intentionally does nothing.
+		});
+	if (!rxStarted)
+	{
+		refuse("SIP/2.0 500 Server Internal Error", "voicemail RTP receiver failed to start");
+		return;
+	}
+
+	// RFC 4733 only for this MVP menu -- see onInfo()'s isVoicemail() guard
+	// (added alongside this slice) for why SIP INFO must never reach this
+	// leg's digits into the star-code parser instead.
+	//
+	// "Deaf during I/O", not "newest wins" (Fable-Low review): only stores
+	// a digit while no SD job is in flight for this slot, so a caller who
+	// presses a key mid-fetch must press again once the next message
+	// actually starts -- simpler and more honest than remembering exactly
+	// one digit whose identity would depend on arrival timing.
+	_vmRtpReceivers[slot].setDtmfPayloadType(invite->getTelephoneEventPayloadType(),
+		[this, slot](char digit, uint16_t /*durationMs*/) {
+			if (_vmSdJobState[slot].load(std::memory_order_acquire) == VmSdJobState::Idle)
+			{
+				_vmPendingDigit[slot].store(digit, std::memory_order_release);
+			}
+		});
+
+	if (!_vmRtpSenders[slot].start(destIp, destPort, callID,
+		[this, slot](uint8_t* outUlaw, size_t count) {
+			return _vmLegs[slot].fillTx(outUlaw, count);
+		}))
+	{
+		_vmRtpReceivers[slot].stop();
+		refuse("SIP/2.0 500 Server Internal Error", "voicemail RTP sender failed to start");
+		return;
+	}
+
+	auto newSession = allocateSession(callID, src);
+	if (!newSession)
+	{
+		_vmRtpReceivers[slot].stop();
+		_vmRtpSenders[slot].stop(callID);
+		refuse("SIP/2.0 503 Service Unavailable", "session pool full, rejected retrieval");
+		return;
+	}
+
+	const std::string toTag = IDGen::GenerateID(9);
+	// buildMediaSdp() still answers sendrecv unconditionally -- matches
+	// every other locally-terminated leg today (see answerVoicemailDeposit()'s
+	// identical note on buildOkWithSdp()'s offer-awareness).
+	const std::string sdpBody = buildMediaSdp(activeIp, _vmRtpReceivers[slot].localPort(),
+		/*sendrecv=*/true, invite->getTelephoneEventPayloadType());
+	auto ok = buildOkWithSdp(invite, activeIp, toTag, sdpBody);
+	if (!ok)
+	{
+		_vmRtpReceivers[slot].stop();
+		_vmRtpSenders[slot].stop(callID);
+		queueLog("Voicemail retrieval: message pool exhausted answering " + extension, true);
+		return;
+	}
+
+	// Per-session dummy dest, drawn from the virtual peer pool like every
+	// other locally-terminated leg -- see answerVoicemailDeposit()'s
+	// identical note on the #232 shape this shares (a dummy dest isn't a
+	// real phone to BYE; out of scope here too).
+	auto dummyVm = allocateVirtualPeer(kVoicemailRetrievalExt, invite->getSource());
+	newSession->setDest(dummyVm);
+	newSession->setVoicemail(true);
+	newSession->setVoicemailLegSlot(slot);
+	newSession->setVoicemailPurpose(Session::VoicemailPurpose::Retrieval);
+	// Initial arm covers "answered but the list never comes back" (a stuck
+	// SD-I/O task, say); handleVoicemailSdJobDone() re-arms this per
+	// message once real playback starts (advisor review: per-message, not
+	// once here, or a long inbox would hit this deadline mid-playback of
+	// an early message).
+	newSession->armVoicemailDeadline(std::chrono::steady_clock::now() +
+		std::chrono::seconds(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_SECONDS));
+	_sessions.emplace(callID, newSession);
+	newSession->setState(Session::State::Connected);
+	newSession->setDialogHeaders(std::string(ok->getFrom()), std::string(ok->getTo()));
+
+	_outbox.emplace_back(invite->getSource(), std::move(ok));
+
+	// Kick off the mailbox listing. VoicemailLeg itself stays Idle through
+	// this whole window (nothing to play/record yet) -- _vmSdJobState
+	// going Pending IS the busy signal findFreeVoicemailSlot() and this
+	// leg's own DTMF sink above both check; no new VoicemailLeg state was
+	// needed for "answered, loading."
+	VmSdJob job;
+	std::strncpy(job.extension, extension.c_str(), sizeof(job.extension) - 1);
+	std::strncpy(job.callId, callID.c_str(), sizeof(job.callId) - 1);
+	job.listRequested = true;
+	_vmSdJob[slot] = job;
+	_vmSdJobState[slot].store(VmSdJobState::Pending, std::memory_order_release);
+
+	queueLog("Voicemail retrieval: " + extension + " dialed in (leg " + std::to_string(slot) + ")");
+}
+
+void RequestsHandler::runVoicemailSdJob(int slot, vmarchive::Source& source)
+{
+	if (_vmSdJobState[slot].load(std::memory_order_acquire) != VmSdJobState::Pending) return;
+	const VmSdJob job = _vmSdJob[slot];   // snapshot -- SIP thread won't touch this again until Idle
+
+	// Order matters: delete-then-list-then-read (advisor review). A delete
+	// never affects the list read moments later in the SAME job (the
+	// tombstone is already appended by the time listMessages() runs), and
+	// a fresh list is what a subsequent read's name was chosen from one
+	// menu-command ago, never invalidated by this job's own delete.
+	if (job.deleteName[0] != '\0')
+	{
+		source.markDeleted(job.extension, job.deleteName);
+	}
+	if (job.listRequested)
+	{
+		_vmMessageCounts[slot] = source.listMessages(job.extension, _vmMessageLists[slot],
+			POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX);
+	}
+	if (job.readName[0] != '\0')
+	{
+		_vmReadLength[slot] = source.readMessage(job.extension, job.readName,
+			_vmRecordBufs[slot], POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES);
+	}
+	else
+	{
+		_vmReadLength[slot] = 0;
+	}
+
+	_vmSdJobState[slot].store(VmSdJobState::Done, std::memory_order_release);
+}
+
+bool RequestsHandler::handleVoicemailSdJobDone(int slot, const std::string& callID,
+	const std::shared_ptr<Session>& session)
+{
+	const bool wasListJob = _vmSdJob[slot].listRequested;
+	const bool wasReadJob = _vmSdJob[slot].readName[0] != '\0';
+	VoicemailMenu::Result r;
+
+	if (wasListJob)
+	{
+		r = _vmMenus[slot].start(_vmMessageCounts[slot]);
+	}
+	else if (wasReadJob)
+	{
+		if (_vmReadLength[slot] == 0)
+		{
+			// The message vanished under us (card pulled, race with an
+			// external delete, etc) -- treat as end-of-mailbox rather than
+			// leave the caller listening to silence forever.
+			r = {VoicemailMenu::Command::Hangup, -1, -1};
+		}
+		else if (_vmLegs[slot].startPlaying(_vmRecordBufs[slot], _vmReadLength[slot],
+			_vmSdJob[slot].extension, callID))
+		{
+			// Playing now -- re-arm per-message (see
+			// answerVoicemailRetrieval()'s doc comment) and stop here;
+			// there is nothing left to dispatch this tick.
+			session->armVoicemailDeadline(std::chrono::steady_clock::now() +
+				std::chrono::seconds(POCKETDIAL_VOICEMAIL_MAX_MESSAGE_SECONDS));
+			_vmSdJobState[slot].store(VmSdJobState::Idle, std::memory_order_release);
+			return false;
+		}
+		else
+		{
+			// startPlaying() only refuses from Recording/Finalizing, which a
+			// Retrieval leg should never be in -- defensive, not a normal path.
+			r = {VoicemailMenu::Command::Hangup, -1, -1};
+		}
+	}
+	else
+	{
+		// A delete-only job completing with nothing else to consume --
+		// normally unreachable, since dispatchVoicemailMenuCommand() hangs
+		// up immediately after issuing a delete-only job rather than
+		// waiting for it (see that function's doc comment). Nothing to do.
+		_vmSdJobState[slot].store(VmSdJobState::Idle, std::memory_order_release);
+		return false;
+	}
+
+	_vmSdJobState[slot].store(VmSdJobState::Idle, std::memory_order_release);
+	return dispatchVoicemailMenuCommand(slot, callID, session, r);
+}
+
+bool RequestsHandler::dispatchVoicemailMenuCommand(int slot, const std::string& callID,
+	const std::shared_ptr<Session>& session, const VoicemailMenu::Result& r)
+{
+	if (r.command == VoicemailMenu::Command::PlayPrompt)
+	{
+		// No prompt asset exists in this MVP -- same graceful-degradation
+		// convention the deposit-side greeting already uses when unloaded.
+		// Synthesize an immediate finish and let the menu decide what's
+		// next (with zero messages, always Hangup) -- bounded to one level
+		// of recursion, since onPlaybackDone() from PlayingPrompt always
+		// transitions straight to Done.
+		return dispatchVoicemailMenuCommand(slot, callID, session, _vmMenus[slot].onPlaybackDone());
+	}
+
+	VmSdJob job;
+	std::strncpy(job.extension, _vmSdJob[slot].extension, sizeof(job.extension) - 1);
+	std::strncpy(job.callId, callID.c_str(), sizeof(job.callId) - 1);
+	bool needsJob = false;
+
+	// Independent of `command` (Fable-Low review): a single digit-driven
+	// event (e.g. '7') can require BOTH deleting the message that was
+	// playing AND fetching the next one's bytes -- or, on the last
+	// message, deleting AND hanging up. Defensive bounds check: VoicemailMenu's
+	// own invariants mean an out-of-range index should be unreachable.
+	if (r.deleteIndex >= 0 && static_cast<size_t>(r.deleteIndex) < _vmMessageCounts[slot])
+	{
+		std::strncpy(job.deleteName, _vmMessageLists[slot][r.deleteIndex].name,
+			sizeof(job.deleteName) - 1);
+		needsJob = true;
+	}
+
+	bool hangUp = (r.command == VoicemailMenu::Command::Hangup);
+	if (r.command == VoicemailMenu::Command::PlayMessage)
+	{
+		if (r.playIndex >= 0 && static_cast<size_t>(r.playIndex) < _vmMessageCounts[slot])
+		{
+			// Reset BEFORE the SD task can be asked to write
+			// _vmRecordBufs[slot] again (advisor review, point 3): the leg
+			// may still be Playing the OLD message if a digit interrupted
+			// it mid-clip. Once state != Playing, fillTx() returns false
+			// under the leg's own mutex without touching the buffer, so
+			// the RTP sender thread (real on a WSL/Linux host build --
+			// see the flake fix earlier on this branch) is provably done
+			// reading it by the time the SD task starts writing it. This
+			// does NOT depend on RtpSender::stop() blocking (it doesn't,
+			// on ESP) -- only on fillTx()'s own state check.
+			_vmLegs[slot].reset();
+			std::strncpy(job.readName, _vmMessageLists[slot][r.playIndex].name,
+				sizeof(job.readName) - 1);
+			needsJob = true;
+		}
+		else
+		{
+			// Defensive only -- should be unreachable (see the comment
+			// above). Treat like end-of-mailbox rather than index an
+			// out-of-range slot.
+			hangUp = true;
+		}
+	}
+
+	if (needsJob)
+	{
+		_vmSdJob[slot] = job;
+		_vmSdJobState[slot].store(VmSdJobState::Pending, std::memory_order_release);
+	}
+
+	// Hangup with a delete-only job just queued (no read) is safe to leave
+	// running after teardown -- see this function's own doc comment.
+	return hangUp;
+}
+
 void RequestsHandler::sweepVoicemailLegs(std::chrono::steady_clock::time_point now)
 {
+	// Orphan-job sweep (Fable-Low review, Break 2): a caller hanging up
+	// mid-fetch releases the RTP pair (isActive() -> false) but
+	// releaseVoicemailLeg() deliberately never touches job state -- see
+	// its own doc comment. Nothing else will ever consume a Done result
+	// for a slot nobody's using any more, so it must be discarded HERE,
+	// by slot, not by session (there is no session left to iterate to).
+	for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
+	{
+		if (_vmRtpReceivers[i].isActive()) continue;   // slot is in active use, not orphaned
+		if (_vmSdJobState[i].load(std::memory_order_acquire) == VmSdJobState::Done)
+		{
+			_vmSdJobState[i].store(VmSdJobState::Idle, std::memory_order_release);
+		}
+	}
+
 	std::vector<std::string> toExpire;
 	for (const auto& [callID, session] : _sessions)
 	{
@@ -2701,13 +3061,52 @@ void RequestsHandler::sweepVoicemailLegs(std::chrono::steady_clock::time_point n
 		const int slot = session->getVoicemailLegSlot();
 		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS)) continue;
 
-		// Deposit: greeting finished -> start recording. A Retrieval leg (a
-		// later slice) manages its own PlaybackDone transitions via its menu
-		// state machine and must never be touched here -- see
-		// Session::getVoicemailPurpose()'s doc comment.
-		if (session->getVoicemailPurpose() == Session::VoicemailPurpose::Deposit &&
-			_vmLegs[slot].state() == VoicemailLeg::State::PlaybackDone)
+		if (session->getVoicemailPurpose() == Session::VoicemailPurpose::Retrieval)
 		{
+			// A pending digit is checked first: onDigit()'s own resulting
+			// dispatch resets the leg unconditionally before requesting a
+			// new Read (see dispatchVoicemailMenuCommand()), which already
+			// subsumes the natural PlaybackDone-advance path below for the
+			// same tick -- so the two checks never need to both fire.
+			bool wantsHangup = false;
+			const char digit = _vmPendingDigit[slot].exchange('\0', std::memory_order_acq_rel);
+			if (digit != '\0')
+			{
+				wantsHangup = dispatchVoicemailMenuCommand(slot, callID, session,
+					_vmMenus[slot].onDigit(digit));
+			}
+			else if (_vmLegs[slot].state() == VoicemailLeg::State::PlaybackDone)
+			{
+				_vmLegs[slot].reset();
+				wantsHangup = dispatchVoicemailMenuCommand(slot, callID, session,
+					_vmMenus[slot].onPlaybackDone());
+			}
+
+			if (!wantsHangup &&
+				_vmSdJobState[slot].load(std::memory_order_acquire) == VmSdJobState::Done &&
+				std::strncmp(_vmSdJob[slot].callId, callID.c_str(), sizeof(_vmSdJob[slot].callId) - 1) == 0)
+			{
+				wantsHangup = handleVoicemailSdJobDone(slot, callID, session);
+			}
+
+			if (wantsHangup)
+			{
+				// Deferred, same as the wall-clock expiry check below --
+				// see dispatchVoicemailMenuCommand()'s doc comment for why
+				// this must never call endCall() from inside this loop.
+				toExpire.push_back(callID);
+				continue;
+			}
+
+			// A Retrieval leg is never touched by the Deposit branch below,
+			// and its deadline is re-armed per-message inside
+			// handleVoicemailSdJobDone() instead of checked once here --
+			// still worth the same wall-clock safety net, so fall through
+			// to the shared expiry check.
+		}
+		else if (_vmLegs[slot].state() == VoicemailLeg::State::PlaybackDone)
+		{
+			// Deposit: greeting finished -> start recording.
 			// Reuse the identity the leg was already claimed under (set at
 			// startPlaying() time) rather than re-deriving from the session
 			// -- session->getSrc() is the CALLER, not the mailbox owner.
@@ -2730,21 +3129,25 @@ void RequestsHandler::sweepVoicemailLegs(std::chrono::steady_clock::time_point n
 	{
 		auto it = _sessions.find(callID);
 		if (it == _sessions.end()) continue;
-		auto session = it->second;
-		auto src = session->getSrc();
-		const std::string& dFrom = session->getDialogFrom();
-		const std::string& dTo = session->getDialogTo();
-		// Same From/To swap sweepSessionTimers() uses: we (the dialog's
-		// original To/UAS) are now originating the BYE, so our own captured
-		// To becomes the BYE's From and the caller's captured From becomes
-		// its To.
-		if (src && !dFrom.empty() && !dTo.empty())
-		{
-			auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom);
-			if (b) _outbox.emplace_back(src->getAddress(), std::move(b));
-		}
-		endCall(callID, src ? src->getNumber() : "", "700", "voicemail max duration reached");
+		sendVoicemailBye(callID, it->second);
 	}
+}
+
+void RequestsHandler::sendVoicemailBye(const std::string& callID, const std::shared_ptr<Session>& session)
+{
+	auto src = session->getSrc();
+	const std::string& dFrom = session->getDialogFrom();
+	const std::string& dTo = session->getDialogTo();
+	// Same From/To swap sweepSessionTimers() uses: we (the dialog's
+	// original To/UAS) are now originating the BYE, so our own captured
+	// To becomes the BYE's From and the caller's captured From becomes
+	// its To.
+	if (src && !dFrom.empty() && !dTo.empty())
+	{
+		auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom);
+		if (b) _outbox.emplace_back(src->getAddress(), std::move(b));
+	}
+	endCall(callID, src ? src->getNumber() : "", "700", "voicemail ended");
 }
 
 void RequestsHandler::releaseVoicemailLeg(int slot, const std::string& callId)
@@ -2753,6 +3156,20 @@ void RequestsHandler::releaseVoicemailLeg(int slot, const std::string& callId)
 	_vmRtpReceivers[slot].stop();
 	_vmRtpSenders[slot].stop(callId);
 	_vmLegs[slot].reset();
+	// A stale menu's isDone()/state is a trap for the next call to claim
+	// this slot (Fable-Low review) -- start() reinitializes it anyway, but
+	// nothing should ever read it before that. Same for a leftover digit
+	// press nobody will consume.
+	_vmMenus[slot] = VoicemailMenu{};
+	_vmPendingDigit[slot].store('\0', std::memory_order_release);
+	// Deliberately DOES NOT touch _vmSdJobState[slot]: a job may still be
+	// Pending (the caller hung up mid-fetch) or freshly Done with no
+	// session left to consume it -- the SD task owns the Pending->Done
+	// transition, and sweepVoicemailLegs()'s orphan sweep is what clears a
+	// Done result with no live session on this slot back to Idle. Resetting
+	// it here would let findFreeVoicemailSlot() hand this slot to a NEW
+	// call while the SD task is still writing _vmRecordBufs[slot] for the
+	// OLD one -- see VmSdJob::callId's doc comment.
 }
 
 void RequestsHandler::releaseMohPreviewLocked()
