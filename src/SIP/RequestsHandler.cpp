@@ -3047,6 +3047,15 @@ void RequestsHandler::sweepVoicemailLegs(std::chrono::steady_clock::time_point n
 	// by slot, not by session (there is no session left to iterate to).
 	for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
 	{
+		// isActive() timing differs by platform (Fable-Low review): on ESP,
+		// RtpReceiver::stop() is non-blocking and returns before the
+		// receive task actually exits, so isActive() can read true for a
+		// tick or two after releaseVoicemailLeg() calls it -- this sweep
+		// simply reclaims the slot a tick or two later on real hardware
+		// than a host test shows, where stop() is a synchronous no-op and
+		// isActive() flips immediately. Not a correctness gap either way,
+		// just don't read a host test's immediate reclaim as the device's
+		// actual timing.
 		if (_vmRtpReceivers[i].isActive()) continue;   // slot is in active use, not orphaned
 		if (_vmSdJobState[i].load(std::memory_order_acquire) == VmSdJobState::Done)
 		{
