@@ -38,6 +38,11 @@ add_executable(sip_parser_tests
     # against the UNISOC T612 a=acap-flood RCE class (SSD advisory, 2026), even as
     # SDP negotiation adds a= attribute handling on this branch.
     SipSdpMessage_hardening_test.cpp
+    # Issue #253: getMedia()/setMedia() disagree about which m= section they
+    # mean on a multi-section body. Explicit section selection is the fix, not
+    # aligning the two implicit defaults -- see both files' own comments.
+    SipSdpSectionSelection_test.cpp
+    ParseCallerRtp_section_test.cpp
     # Issue #196. SdpModel_test holds the structural invariants (offsets only,
     # memcpy-safe, size ceiling) at COMPILE time; SdpParse_test covers what the
     # generated parser does, weighted at the three cases the issue was filed

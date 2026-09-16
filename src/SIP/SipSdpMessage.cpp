@@ -208,6 +208,35 @@ int SipSdpMessage::getRtpPort() const
 	return extractRtpPort(getMedia());
 }
 
+// ── #253: explicit section selection ────────────────────────────────────
+
+int SipSdpMessage::firstAudioSection() const
+{
+	const sdp::Session& s = ensureParsed();
+	for (int i = 0; i < static_cast<int>(s.nMedia); ++i)
+	{
+		if (sdp::view(getBody(), s.media[i].typeName) == "audio") return i;
+	}
+	return -1;
+}
+
+int SipSdpMessage::getRtpPort(int section) const
+{
+	// Reads the model's own parsed port rather than re-scanning line text —
+	// unlike the no-arg getRtpPort() above, there is no legacy bit-for-bit
+	// behaviour to preserve here, since this accessor is new.
+	const sdp::Session& s = ensureParsed();
+	if (section < 0 || section >= static_cast<int>(s.nMedia)) return 0;
+	return s.media[section].port;
+}
+
+std::string_view SipSdpMessage::getConnectionInformation(int section) const
+{
+	const sdp::Session& s = ensureParsed();
+	if (section < 0 || section >= static_cast<int>(s.nMedia)) return std::string_view();
+	return sdp::view(getBody(), sdp::effectiveConnection(s, static_cast<unsigned>(section)));
+}
+
 bool SipSdpMessage::isHoldOffer() const
 {
 	// #253: the section a call site means must be picked explicitly, never

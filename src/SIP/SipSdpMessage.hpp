@@ -41,6 +41,27 @@ public:
 	std::string_view getMedia() const;
 	int getRtpPort() const;
 
+	// ── Explicit section selection (#253) ──────────────────────────────────
+	//
+	// getMedia()/getRtpPort()/getConnectionInformation() above answer an
+	// implicit question ("which section?") two different, disagreeing ways
+	// on a multi-section body -- see their own comments. These do not answer
+	// it either; they let the CALLER name the section, which is the actual
+	// fix #253 asks for. No current offer this PBX handles has more than one
+	// m= section, so this is unreachable-in-practice safety, not a live bug
+	// fix -- see the issue for why.
+
+	// Index of the first "audio" m= section, or -1 if the offer has none.
+	int firstAudioSection() const;
+
+	// Section-aware counterparts to getRtpPort()/getConnectionInformation().
+	// `section` is meant to come from firstAudioSection() or similar -- an
+	// out-of-range index returns 0 / an empty view rather than asserting,
+	// since nothing here can stop a caller racing a re-offer between an
+	// index lookup and the read.
+	int getRtpPort(int section) const;
+	std::string_view getConnectionInformation(int section) const;
+
 	// Issue #263: sdp::isHold() applied to the offer's first AUDIO section (see
 	// #253 -- explicit section selection, never an implicit media[0]), so the
 	// three hold/resume call sites get both RFC 3264 s8.4 direction-based hold
