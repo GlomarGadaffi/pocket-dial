@@ -79,9 +79,8 @@ namespace
 	{
 		// A 486 response echoes the ORIGINAL request's From/To (RFC 3261): From
 		// is still the caller, To is still the callee -- onBusy() reads
-		// data->getFromNumber() for the busy party (see the caller's own note
-		// in the review thread: don't re-derive this, just match what the
-		// existing CFB path already reads).
+		// data->getToNumber() for the busy party (issue #256; it used to read
+		// getFromNumber(), which named the caller instead).
 		std::string raw =
 			"SIP/2.0 486 Busy Here\r\n"
 			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=" + branch + "\r\n"
