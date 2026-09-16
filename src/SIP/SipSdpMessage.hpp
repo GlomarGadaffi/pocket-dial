@@ -80,10 +80,12 @@ private:
 	// EXCLUSION, not which handler you are in: every caller of an SDP accessor
 	// must hold RequestsHandler::_mutex before reaching it. This is not a
 	// property of the call path — RequestsHandler::parseCallerRtp
-	// (getRtpPort / getConnectionInformation) alone is reached from five
-	// sites, one of them the AnchorClient::setEventCallback lambda, which
-	// runs off the SIP thread entirely and takes the mutex explicitly before
-	// calling in. Check the lock, not the call path.
+	// (getRtpPort / getConnectionInformation) alone has several call sites
+	// spread across this file, one of them the AnchorClient::setEventCallback
+	// lambda, which runs off the SIP thread entirely and takes the mutex
+	// explicitly before calling in. Don't count them and don't trust an old
+	// count: check the lock at whatever site you're looking at, not the call
+	// path.
 	//
 	// RE-CHECK THIS if an SDP accessor is ever reachable without the caller
 	// holding that mutex. With the old per-object cache that would have been a
