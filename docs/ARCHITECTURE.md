@@ -71,25 +71,56 @@ Unlike a textbook B2BUA, it does not insert itself into the media path. SDP is r
 
 ### 1.2 Transaction-Layer Scope
 
-`TransactionLayer` is scoped by its own header comment to the "RFC 3261 §17 INVITE **client** transaction" (`TransactionLayer.hpp:14`). That scope is enforced rather than aspirational: `classify()` returns `None` for every response and for every non-INVITE request (`TransactionLayer.cpp:10-12`), so nothing else can ever claim a slot.
+`TransactionLayer` implements the full RFC 3261 §17 transaction layer: four
+transaction types across two pools (`TransactionLayer.hpp:14-37`). The
+**client pool** covers requests this PBX sends and retransmits until
+answered; the **server pool** covers responses this PBX authors, kept so a
+retransmitted request gets the same answer back and (for INVITE)
+retransmitted until it is ACKed. `classify()` is the single router that
+decides which of the four a message earns, and it is method- and
+authorship-aware rather than blanket: every INVITE **response** this PBX
+itself authored becomes an `InviteServer` transaction, `BYE`/`CANCEL`/
+`REFER`/`UPDATE` responses it authored become `NonInviteServer`, every
+INVITE **request** it sends becomes `InviteClient`, and every other request
+it sends — `BYE`, `CANCEL`, `NOTIFY`, `REFER`, `INFO`, `MESSAGE`,
+`SUBSCRIBE`, `UPDATE` — becomes `NonInviteClient` (`TransactionLayer.cpp:79-116`).
+This landed in PR #226.
 
 Implemented today:
 
 | Mechanism | Where |
 | :--- | :--- |
-| §17.1.1 INVITE client transaction (Timer A retransmit from `T1` = 500 ms, doubling per attempt; Timer B at 32 s) | `TransactionLayer.hpp:14-18`, `sweep()` |
-| RFC 6026 §8.4 Timer M (2xx) / RFC 3261 Timer D (3xx-6xx) absorb window once a final response arrives, client-side only; there is no server transaction layer, so this is not Timer L | `TransactionLayer.hpp:35`, `:65-72` |
+| §17.1.1 INVITE client transaction (Timer A retransmit from `T1` = 500 ms, doubling uncapped; Timer B gives up at 64×T1 = 32 s; a final response then absorbs duplicates under RFC 3261 Timer D — 32 s — for 3xx-6xx or RFC 6026 §8.4 Timer M — 64×T1 — for a 2xx) | `TransactionLayer.cpp:110`, `sweep()`/`sweepOne()`, `matchAndAdvance` (`:406-423`) |
+| §17.1.2 Non-INVITE client transaction (Timer E, T1 doubling capped at `T2` = 4 s; Timer F at 32 s; Timer K at `T4` = 5 s) for every non-INVITE request the PBX sends other than `ACK`/`OPTIONS`/`REGISTER` | `TransactionLayer.cpp:101-116` |
+| §17.2.1 INVITE server transaction — Timer G/H for a non-2xx final (absorbed afterward under Timer I, `T4`, once ACKed), plus §13.3.1.4 retransmission of a **2xx until ACKed** (RFC 6026 §7.1 Timer L once it is) — for an INVITE response this PBX authored | `TransactionLayer.cpp:79-85`, `:329-349`, `:474-479` |
+| §17.2.2 Non-INVITE server transaction (Timer J response cache, no retransmit schedule) for an authored `BYE`/`CANCEL`/`REFER`/`UPDATE` response | `TransactionLayer.cpp:86-98`; sizing rationale in `PoolConfig.hpp:355-367` |
+| §17.2.3 duplicate-request suppression: a retransmitted request matching a tracked server transaction is answered from the stored response and the handler is **not** re-run | `TransactionLayer::absorbRetransmittedRequest`, called from `handle()` at `RequestsHandler.cpp:915-922` |
 | §17.1.1.3 ACK for a non-2xx final to a PBX-originated INVITE | `ackInboundFinal`, `RegisterBeeper::handleInviteFailure` |
 | §18.2.1 `received=` and RFC 3581 `rport` on every response | `sipwire::viaWithReceived` |
-| §12.2 To-tag detection routing a re-INVITE onto the hold/resume path | `RequestsHandler::onInvite` |
-| §11.2 capability discovery on `OPTIONS` (`Allow` / `Supported` / `Accept` / `Allow-Events`) | `addCapabilityHeaders`, called from `onOptions` only |
+| §12.2 To-tag detection routing a re-INVITE onto the hold/resume path | `RequestsHandler::onInvite`, `RequestsHandler.cpp:1606-1611` |
+| §11.2 capability discovery (`Allow` / `Supported` / `Accept` / `Allow-Events`) | `addCapabilityHeaders()`, called from four sites: `onRegister`'s 200 OK (`RequestsHandler.cpp:1257`), `onOptions`'s 200 OK (`:1377`), the anchored-media re-INVITE/UPDATE answer shared by `onReinvite()`/`onUpdate()` (`answerAnchorReinvite`, `:8356`), and `buildOkWithSdp()` for every PBX-authored 2xx to an INVITE — the 888 conference leg, the 555/anchor bridge, the inbound-anchor handset leg (`:8941`) |
 
-Not implemented, and worth knowing before debugging a retransmission:
+Limitations and deliberate exclusions, worth knowing before debugging a retransmission:
 
-- **There is no server transaction.** No §13.3.1.4 retransmission of a 2xx until the ACK arrives, and no Timers G/H/I. A retransmitted INVITE for a session already `Invited` / `Connected` / `Held` is silently dropped rather than answered from a stored response (`onInvite`, citing §17.2.3). With no non-INVITE server transaction there is likewise no §17.2.2 Timer J absorb window.
-- **There is no non-INVITE client transaction** (§17.1.2), hence no Timers E/F. Every non-INVITE request the PBX sends (`BYE`, `CANCEL`, `NOTIFY` and the rest) is written to the outbox exactly once.
+- **Only responses this PBX itself authors get a server transaction.** An ordinary extension-to-extension call has its 200 OK **relayed** verbatim from the callee phone (`authoredHere()`, `TransactionLayer.cpp:55-64`); that phone is the real UAS and is already retransmitting its own 200 under its own transaction layer, so retransmitting it here too would just double the packets on the wire on a loss. This is also why the server pool (`POCKETDIAL_MAX_SERVER_TRANSACTIONS`) is sized so much smaller than the client pool (`POCKETDIAL_MAX_TRANSACTIONS`) — only virtual extensions, anchor/bridge legs and PBX-minted failure responses ever claim one (`PoolConfig.hpp:330-372`).
+- **A retransmitted INVITE for a session already `Invited`/`Connected`/`Held` can still be silently dropped**, exactly as it was before this layer existed — but now only in the cases the layer does not cover: an ordinary relayed dialog (no server transaction ever opens for it, per the point above); a PBX-authored provisional such as a ring-group/hunt-group fan-out's own 180 (`CallForker.cpp:89`, `:325`), whose `InviteServer` slot is freed the moment the (relayed) final response goes out rather than waiting around to answer a retransmission (`TransactionLayer.cpp:171-209`); and an authored dialog that has already reached the `Accepted` state, where a retransmission is deliberately **not** answered from the absorb cache (`TransactionLayer.cpp:507-531`) because the automatic 2xx-retransmit timer is expected to be the reliability mechanism there instead. All three fall through to `onInvite()`'s pre-existing "Task 2A" guard, unchanged (`RequestsHandler.cpp:1597-1618`).
+- **A 2xx to an INVITE that is never ACKed is not followed up with a BYE.** §13.3.1.4 says the UAS SHOULD tear the dialog down once it gives up retransmitting; this layer instead logs the give-up and frees the slot, leaving the dialog itself untouched — a TU-level decision tracked as a follow-up on #199 (`TransactionLayer.cpp:584-594`).
+- **Both pools are fixed-size and degrade rather than block.** When every slot is busy, claiming one fails and the message is still sent once, just with no retransmit/absorb coverage for it — precisely the pre-#226 behaviour for that one message (`TransactionLayer.cpp:251-257` client, `:301-310` server).
+- **A message too large to fit `POCKETDIAL_TX_MSG_BYTES`** (1500 bytes, the Ethernet MTU) is stored truncated and is never retransmitted, logged once at claim time so the gap is visible rather than silent (`TransactionLayer.cpp:136-152`).
+- **`INFO` is deliberately excluded** from the non-INVITE server set even though a duplicated DTMF digit from a retransmitted `INFO` is a real bug: a 32 s Timer J slot per keypress would dominate the server pool on its own. Tracked separately (`PoolConfig.hpp:361-367`).
+- **`OPTIONS` keepalives, outbound `REGISTER`, `ACK`, and relayed responses stay outside this layer by design**, not by gap: loss of an `OPTIONS` probe **is** the liveness signal it exists to produce, `REGISTER` already runs its own §10.2 refresh/retry schedule in `SipRegistrationClient`, and an `ACK` is never a transaction of its own under §17.1.1.3 (`TransactionLayer.hpp:39-63`).
+- **Timer granularity is coarser than the RFC's millisecond figures.** `sweep()` is driven from `RequestsHandler::tick()`, which self-throttles to 1 Hz, so a `T1` = 500 ms first retransmit actually lands around 1 s later. This predates the transaction layer and is conservative under §17 — fewer retransmits on the wire, never more (`TransactionLayer.hpp:64-71`).
 
-The consequence is bounded and worth stating plainly: for those messages, retransmission recovery is the peer's job or nobody's, so a single dropped UDP datagram carrying a PBX-originated `BYE` will not be retried by this engine. INVITE (the one transaction a call depends on to come up at all) is covered.
+The practical upshot: INVITE — client and server, including the
+2xx-retransmit-until-ACK half a UAS owes under §13.3.1.4 — and the four
+non-INVITE methods where re-running the handler on a duplicate does real
+damage (`BYE`, `CANCEL`, `REFER`, `UPDATE`) now get RFC-conformant retry and
+duplicate suppression, so a single dropped UDP datagram carrying a
+PBX-originated `BYE` **is** retried by this engine, the same as a
+PBX-originated INVITE. What is left uncovered above is either an
+intentional scope boundary (a relayed response, an `OPTIONS` ping,
+`REGISTER`, `ACK`) or a specific, logged degrade path (pool exhaustion, an
+oversized message, an unACKed 2xx) — not a missing layer.
 
 ## 2. Core Task Topology & Affinity Splits
 
