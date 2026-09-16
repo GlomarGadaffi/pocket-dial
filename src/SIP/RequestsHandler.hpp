@@ -90,6 +90,17 @@ public:
 	// ~RequestsHandler exactly).
 	~RequestsHandler();
 
+	// Non-copyable: already implicitly true (a std::mutex member alone
+	// deletes the implicit copy ctor/operator=), but this engine class also
+	// owns live sockets/RTP tasks/PSRAM buffers directly -- copying it
+	// would silently duplicate the mutex-protected state, not the
+	// resources it guards. Declared explicitly (found via CI cppcheck
+	// 2.21.0's noCopyConstructor/noOperatorEq, tripped once the voicemail
+	// slice added more directly-owned dynamic-resource members) so the
+	// invariant is documented rather than only accidentally true.
+	RequestsHandler(const RequestsHandler&) = delete;
+	RequestsHandler& operator=(const RequestsHandler&) = delete;
+
 	// Forwarders onto the static pool in SipMessagePool.hpp/.cpp (Issue #53 /
 	// #101(A) / #101(E)) — kept as public statics here because SipMessageFactory,
 	// the handler table, and the test suite all call them as
