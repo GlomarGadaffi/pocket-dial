@@ -41,6 +41,16 @@ public:
 	std::string_view getMedia() const;
 	int getRtpPort() const;
 
+	// Issue #263: sdp::isHold() applied to the offer's first AUDIO section (see
+	// #253 -- explicit section selection, never an implicit media[0]), so the
+	// three hold/resume call sites get both RFC 3264 s8.4 direction-based hold
+	// AND the legacy RFC 2543 c=0.0.0.0 signal, instead of the direction-only
+	// scan getSdpDirection() does. Does not re-validate the body: checkSdp()
+	// (RequestsHandler.cpp's SDP admission gate) has already refused a
+	// malformed one with 488 before any handler that would call this runs, so
+	// ensureParsed() can be assumed to reflect a structurally sound parse.
+	bool isHoldOffer() const;
+
 private:
 	// ── Where the parsed model lives, and why it is not in here ───────────────
 	//
