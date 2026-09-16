@@ -2,10 +2,12 @@
 #include "VoicemailArchive.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(PD_ETH_HAS_SD)
 #include <sys/stat.h>
+#include "PoolConfig.hpp"
 #endif
 
 namespace
@@ -110,6 +112,43 @@ void drainAll(WriterQueue& queue, Sink& sink, uint8_t* const* stagingBufs)
 	}
 }
 
+void chompIndexLine(char* line)
+{
+	size_t n = std::strlen(line);
+	while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+	{
+		line[--n] = '\0';
+	}
+}
+
+bool parseTombstoneLine(const char* line, char* nameOut, size_t nameCap)
+{
+	const size_t prefixLen = std::strlen(kTombstonePrefix);
+	if (std::strncmp(line, kTombstonePrefix, prefixLen) != 0) return false;
+	std::snprintf(nameOut, nameCap, "%s", line + prefixLen);
+	return true;
+}
+
+bool parseEntryLine(const char* line, MessageInfo& info)
+{
+	const char* p1 = std::strchr(line, ',');
+	if (!p1) return false;
+	const char* p2 = std::strchr(p1 + 1, ',');
+	if (!p2) return false;
+	const char* p3 = std::strchr(p2 + 1, ',');
+	if (!p3) return false;
+
+	const size_t nameLen = static_cast<size_t>(p1 - line);
+	if (nameLen == 0 || nameLen >= sizeof(info.name)) return false;
+	std::memcpy(info.name, line, nameLen);
+	info.name[nameLen] = '\0';
+
+	info.epochSeconds = std::strtoull(p1 + 1, nullptr, 10);
+	info.length = static_cast<size_t>(std::strtoull(p2 + 1, nullptr, 10));
+	std::snprintf(info.callId, sizeof(info.callId), "%s", p3 + 1);
+	return true;
+}
+
 #if defined(PD_ETH_HAS_SD)
 
 namespace
@@ -205,6 +244,147 @@ namespace
 Sink& productionSink()
 {
 	static FatFsSink s;
+	return s;
+}
+
+namespace
+{
+	class FatFsSource final : public Source
+	{
+	public:
+		size_t listMessages(const char* extension, MessageInfo* out, size_t maxCount) const override
+		{
+			char idxPath[160];
+			std::snprintf(idxPath, sizeof(idxPath), "%s/%s/index.csv", kArchiveDir, extension);
+
+			std::lock_guard<std::mutex> lock(_ioMutex);
+
+			// Pass 1: collect every tombstoned name (bounded the same way the
+			// listing itself is -- see PoolConfig.hpp's
+			// POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX comment for why a
+			// fixed array, not a growing one, here too).
+			char tombstoned[POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX][sizeof(MessageInfo::name)];
+			size_t tombstoneCount = 0;
+
+			std::FILE* f = std::fopen(idxPath, "r");
+			if (f == nullptr) return 0;   // no mailbox directory yet -- not an error
+
+			char line[512];
+			while (std::fgets(line, sizeof(line), f) != nullptr)
+			{
+				chompIndexLine(line);
+				if (tombstoneCount >= POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX) continue;
+				if (parseTombstoneLine(line, tombstoned[tombstoneCount], sizeof(tombstoned[0])))
+				{
+					++tombstoneCount;
+				}
+			}
+
+			// Pass 2: re-scan for real entries, skipping anything tombstoned.
+			std::rewind(f);
+			size_t count = 0;
+			while (count < maxCount && std::fgets(line, sizeof(line), f) != nullptr)
+			{
+				chompIndexLine(line);
+				MessageInfo info;
+				if (!parseEntryLine(line, info)) continue;   // a tombstone row, or malformed -- skip
+
+				bool skip = false;
+				for (size_t i = 0; i < tombstoneCount; ++i)
+				{
+					if (std::strcmp(tombstoned[i], info.name) == 0) { skip = true; break; }
+				}
+				if (skip) continue;
+
+				out[count++] = info;
+			}
+			std::fclose(f);
+			return count;
+		}
+
+		size_t readMessage(const char* extension, const char* name,
+			uint8_t* out, size_t capacity) const override
+		{
+			if (isTombstoned(extension, name)) return 0;
+
+			char path[160];
+			std::snprintf(path, sizeof(path), "%s/%s/%s.wav", kArchiveDir, extension, name);
+
+			std::lock_guard<std::mutex> lock(_ioMutex);
+			std::FILE* f = std::fopen(path, "rb");
+			if (f == nullptr) return 0;
+
+			std::fseek(f, 0, SEEK_END);
+			const long fileSize = std::ftell(f);
+			if (fileSize < static_cast<long>(kWavHeaderBytes))
+			{
+				std::fclose(f);
+				return 0;
+			}
+			const size_t dataLen = static_cast<size_t>(fileSize) - kWavHeaderBytes;
+			if (dataLen > capacity)
+			{
+				// Refuse outright rather than truncate -- see Source::readMessage's
+				// doc comment for why a clipped playback is worse than a clean 0.
+				std::fclose(f);
+				return 0;
+			}
+
+			std::fseek(f, static_cast<long>(kWavHeaderBytes), SEEK_SET);
+			const size_t got = std::fread(out, 1, dataLen, f);
+			std::fclose(f);
+			return got == dataLen ? got : 0;
+		}
+
+		bool markDeleted(const char* extension, const char* name) override
+		{
+			char idxPath[160];
+			std::snprintf(idxPath, sizeof(idxPath), "%s/%s/index.csv", kArchiveDir, extension);
+
+			std::lock_guard<std::mutex> lock(_ioMutex);
+			std::FILE* idx = std::fopen(idxPath, "a");
+			if (idx == nullptr) return true;   // no mailbox -- nothing to tombstone, already "deleted"
+			std::fprintf(idx, "%s%s\n", kTombstonePrefix, name);
+			std::fclose(idx);
+			return true;
+		}
+
+	private:
+		bool isTombstoned(const char* extension, const char* name) const
+		{
+			char idxPath[160];
+			std::snprintf(idxPath, sizeof(idxPath), "%s/%s/index.csv", kArchiveDir, extension);
+
+			std::lock_guard<std::mutex> lock(_ioMutex);
+			std::FILE* f = std::fopen(idxPath, "r");
+			if (f == nullptr) return false;
+
+			char line[512];
+			char candidate[sizeof(MessageInfo::name)];
+			bool found = false;
+			while (std::fgets(line, sizeof(line), f) != nullptr)
+			{
+				chompIndexLine(line);
+				if (parseTombstoneLine(line, candidate, sizeof(candidate)) &&
+					std::strcmp(candidate, name) == 0)
+				{
+					found = true;
+					break;
+				}
+			}
+			std::fclose(f);
+			return found;
+		}
+
+		// Same reasoning as FatFsSink::_ioMutex above -- a leaf lock, not a
+		// contended one today (one SD-I/O task drives both Sink and Source).
+		mutable std::mutex _ioMutex;
+	};
+}
+
+Source& productionSource()
+{
+	static FatFsSource s;
 	return s;
 }
 

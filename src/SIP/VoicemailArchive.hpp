@@ -127,6 +127,102 @@ void drainAll(WriterQueue& queue, Sink& sink, uint8_t* const* stagingBufs);
 Sink& productionSink();
 #endif
 
+// ── Source: the read counterpart, for the retrieval menu ────────────────────
+// Added once the deposit side had somewhere real to read FROM -- see
+// pocket_dial_246_voicemail.md's advisor note for why this had to exist
+// before ext 796 could route anywhere. Reads index.csv's rows exactly as
+// Sink/FatFsSink appends them.
+//
+// Delete does NOT rewrite index.csv -- a rewrite is not crash-safe (a
+// power loss mid-rewrite can lose the whole index), and the class comment
+// above already commits this file to an append-only discipline. Instead a
+// delete APPENDS A TOMBSTONE row, distinguished from a real entry row by a
+// leading "#DEL," the two names an index.csv line can never start with a
+// real message name -- both name shapes come from QueuedRecording's own
+// naming rule (epochSeconds or "boot-<sequence>"), never a "#". Every
+// Source implementation must treat the LATEST tombstone for a given name
+// as final: once tombstoned, a name never re-appears (the sequence only
+// grows, deposits never reuse a retired name).
+struct MessageInfo
+{
+	// The filename stem this message's audio lives under -- see
+	// QueuedRecording::sequence's doc comment for the naming rule. Read
+	// back a message's body with this same name via Source::readMessage().
+	char name[48] = {};
+	uint64_t epochSeconds = 0;   // 0 if the wall clock had never synced at deposit time
+	size_t length = 0;           // raw mu-law byte count, NOT counting the WAV header
+	char callId[128] = {};
+};
+
+// A row starting with this can never collide with a real entry row -- see
+// MessageInfo's doc comment above.
+constexpr const char* kTombstonePrefix = "#DEL,";
+
+// ── Pure index.csv line parsing (host-unit-tested, no filesystem) ───────────
+// Used by FatFsSource under PD_ETH_HAS_SD; split out and left unconditional
+// so the parsing logic itself is directly testable on host, mirroring
+// buildWavHeader() being pure while FatFsSink (its only real caller) stays
+// ESP-gated.
+
+// Strips a trailing \n and/or \r from `line` in place, as fgets() leaves it.
+void chompIndexLine(char* line);
+
+// True if `line` is a tombstone row ("#DEL,<name>"), copying <name> into
+// `nameOut` (up to `nameCap`). False (nameOut left untouched) for anything
+// else, including a real entry row.
+bool parseTombstoneLine(const char* line, char* nameOut, size_t nameCap);
+
+// Parses a real entry row "name,epochSeconds,length,callId" into `info`.
+// Only the first three commas are structural -- everything after the third
+// is the callId verbatim (the write side never escapes it either). Returns
+// false (info left untouched) if the line has fewer than three commas, or
+// the name field is empty or too long for MessageInfo::name. A tombstone
+// row ("#DEL,<name>", exactly one comma) always fails this parse and
+// returns false, so callers may check tombstone-then-entry in either
+// order -- FatFsSource::listMessages() still checks tombstones in a
+// separate first pass, since a tombstone can appear AFTER the entry row
+// it retires.
+bool parseEntryLine(const char* line, MessageInfo& info);
+
+class Source
+{
+public:
+	virtual ~Source() = default;
+
+	// Fills `out[0..N)` with up to `maxCount` non-tombstoned messages for
+	// `extension`, in the order index.csv recorded them (oldest first) --
+	// the menu decides playback/deletion order, not this call. Returns N.
+	// Returns 0, not an error, for an extension with no mailbox directory
+	// yet (nobody has ever left it a message).
+	virtual size_t listMessages(const char* extension, MessageInfo* out, size_t maxCount) const = 0;
+
+	// Reads message `name`'s raw mu-law body (the .wav file's audio, past
+	// its header) into `out`, up to `capacity` bytes. Returns the number
+	// of bytes actually read, or 0 if the message doesn't exist, can't be
+	// opened, or is already tombstoned. A message longer than `capacity`
+	// is refused outright (returns 0), never truncated -- a silently
+	// clipped playback with no signal to the caller is worse than a clean
+	// refusal (callers size `capacity` to POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES,
+	// which nothing on this Source's write side can ever exceed).
+	virtual size_t readMessage(const char* extension, const char* name,
+		uint8_t* out, size_t capacity) const = 0;
+
+	// Appends a tombstone row for `name` -- see the class comment for why
+	// this never rewrites index.csv or deletes the underlying .wav file
+	// (freeing that disk space is a separate, later concern; nothing reads
+	// a tombstoned .wav again once this returns). Idempotent: tombstoning
+	// an already-tombstoned or nonexistent name still returns true, since
+	// the end state ("this name never lists or reads again") already
+	// holds either way.
+	virtual bool markDeleted(const char* extension, const char* name) = 0;
+};
+
+#if defined(PD_ETH_HAS_SD)
+// The production Source, paired with productionSink() above -- same
+// PD_ETH_HAS_SD gate, same /sdcard/vm layout, same index.csv it reads.
+Source& productionSource();
+#endif
+
 }  // namespace vmarchive
 
 #endif

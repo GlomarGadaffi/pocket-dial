@@ -301,6 +301,18 @@
 #endif
 #define POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES (POCKETDIAL_VOICEMAIL_MAX_MESSAGE_SECONDS * 8000)
 
+// Bound on one vmarchive::Source::listMessages() call and on the
+// VoicemailMenu's own per-mailbox listing array -- a fixed-size std::array,
+// not a growing container, since both run in an RTOS task after init (see
+// PoolConfig.hpp's own "no malloc/new after init" convention throughout this
+// file). 20 messages is a generous mailbox for a desk extension; a mailbox
+// that fills past this simply hides its oldest entries from the menu until
+// some are deleted -- it does not refuse new deposits (that's index.csv's
+// row count, unbounded on disk, not this in-RAM listing window).
+#ifndef POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX
+#define POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX 20
+#endif
+
 // Maximum number of DID -> extension inbound routing entries (DidMapping.hpp).
 // Bounded exactly like TelephonyApiConfig::kSlots: a fixed std::array, no heap,
 // a 9th add fails cleanly ("table full") rather than growing unbounded. Small
