@@ -121,7 +121,9 @@ TEST(CallForwardBusy, RedirectsUsingCalleeIdentityNotCallerIdentity)
 
 	// Registration fires its own register-beep INVITE to each newly-registered
 	// extension (including 403), which would otherwise collide with the
-	// "INVITE sip:403@..." check below. Only the actual test call matters.
+	// "INVITE sip:403@..." check below on address alone. Cleared for tidiness,
+	// but the Call-ID check below is what actually makes the match specific to
+	// this test's own leg regardless of clear() ordering.
 	sent.clear();
 
 	const std::string callId = "cfb-1";
@@ -132,9 +134,18 @@ TEST(CallForwardBusy, RedirectsUsingCalleeIdentityNotCallerIdentity)
 	EXPECT_TRUE(findSentTo(sent, callerAddr, "SIP/2.0 486").empty())
 		<< "the caller must never see the bare 486 once the busy callee's CFB target resolves";
 
-	std::string forkedInvite = findSentTo(sent, targetAddr, "INVITE sip:403@");
-	EXPECT_FALSE(forkedInvite.empty())
+	// Match on this test's own Call-ID, not just "some INVITE reached 403" --
+	// the register-beep INVITE above shares the same address and the same
+	// "INVITE sip:403@..." prefix, so address+substring alone can't tell the
+	// forked CFB leg apart from beep noise. The beep mints its own random
+	// Call-ID (RegisterBeeper::sendBeep -> IDGen::GenerateID), so this
+	// specifically identifies the leg CallForker::redirectInvite forked from
+	// THIS call, which retains the original INVITE's Call-ID.
+	std::string forkedInvite = findSentTo(sent, targetAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(forkedInvite.empty())
 		<< "CFB must fork a fresh INVITE to 403, the busy callee's configured forward target";
+	EXPECT_NE(forkedInvite.find("INVITE sip:403@"), std::string::npos)
+		<< "the matched leg has this call's Call-ID but isn't an INVITE to 403:\n" << forkedInvite;
 }
 
 // The regression this issue is actually about: CFB configured on the CALLER
@@ -159,8 +170,9 @@ TEST(CallForwardBusy, CallersOwnForwardConfigIsNeverConsulted)
 	handler.handle(makeRegister("414", "192.168.51.24", "reg-414"));
 	handler.setForward("411", "busy", "414");   // CFB on the CALLER, 411 -- must be ignored here
 
-	// See the sibling test above: registration's own register-beep INVITE to
-	// 414 would otherwise collide with the "no INVITE to 414" check below.
+	// See the sibling test above for why this matters beyond tidiness: cleared
+	// here, but the Call-ID check below is what actually makes the "nothing
+	// reached 414" assertion specific to this test's own leg.
 	sent.clear();
 
 	const std::string callId = "cfb-2";
@@ -170,6 +182,10 @@ TEST(CallForwardBusy, CallersOwnForwardConfigIsNeverConsulted)
 
 	EXPECT_FALSE(findSentTo(sent, callerAddr, "SIP/2.0 486").empty())
 		<< "callee 412 has no CFB configured, so the caller must see the plain 486";
-	EXPECT_TRUE(findSentTo(sent, wrongTargetAddr, "INVITE sip:414@").empty())
+	// Scoped to this call's own Call-ID, not just "no INVITE reached 414" --
+	// that would also incidentally hold if sent.clear() above were ever
+	// removed and 414's own register-beep INVITE were mistaken for evidence
+	// either way. This specifically proves no leg of THIS call reached 414.
+	EXPECT_TRUE(findSentTo(sent, wrongTargetAddr, "Call-ID: " + callId).empty())
 		<< "the caller's own forward-on-busy target must never be reached from this leg";
 }

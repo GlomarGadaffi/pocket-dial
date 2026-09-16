@@ -6416,7 +6416,13 @@ bool RequestsHandler::handleBlindXferFailure(const std::shared_ptr<SipMessage>& 
 	// failure of a call the transferee placed. onBusy()'s CFB lookup used to read
 	// data->getFromNumber() here, the TRANSFEREE's number on this leg, not the
 	// busy party; fixed to data->getToNumber() by #256. This intercept still
-	// stands regardless, for the ACK-ownership reason above.
+	// stands regardless, for the ACK-ownership reason above. (Noted in review:
+	// getToNumber() now resolves to the transfer TARGET on this leg, the real
+	// busy party, so if this intercept were ever removed, onBusy() would apply
+	// the TARGET's own CFB config to a failed blind transfer, not misroute on
+	// the transferee's identity like before -- a different, still-questionable
+	// interaction, not the #256 bug. Out of scope here; flagging for whoever
+	// next touches this intercept.)
 	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string::npos) return false;
 	const std::string callID(data->getCallID());
 	auto legOpt = getSession(callID);
