@@ -1836,12 +1836,14 @@ void HttpServer::sendApiVoicemail(int sock, const std::string& body)
 	}
 
 	// Use the full reserved/emergency literal set (pbx::isReservedExtension:
-	// 777/999/888/555/440/911/933) rather than sendApiDnd's narrower
+	// 777/999/888/555/440/911/933/796 -- 796 is the voicemail retrieval
+	// pilot itself, Issue #246) rather than sendApiDnd's narrower
 	// hand-picked list (777/999/555) -- new code, no reason to carry over an
-	// existing gap. 700 is reserved separately for the voicemail retrieval
-	// pilot (Issue #246), not yet part of the shared literal set since that
-	// extension doesn't exist until it's implemented.
-	if (pbx::isReservedExtension(ext) || ext == "700")
+	// existing gap. Also block the whole park-orbit range (700-709): an
+	// orbit isn't a mailbox owner. (Was a stale `ext == "700"` literal from
+	// when 700 was the originally-planned pilot number -- see
+	// pbx::isReservedExtension()'s own comment for why that number moved.)
+	if (pbx::isReservedExtension(ext) || pbx::isParkOrbitExt(ext))
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot set voicemail on a virtual extension\"}");
