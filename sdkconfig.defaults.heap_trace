@@ -68,3 +68,29 @@ CONFIG_HEAP_TASK_TRACKING=y
 #   trace becomes interesting, and would skip the graceful out-of-memory paths
 #   that produced the observed degraded-but-alive behaviour. Same reasoning
 #   heap_debug gives for leaving it off, only more so here.
+
+# ── ipc0 stack headroom: HYPOTHESIS, not a diagnosed fix ─────────────────────
+# On one boot in three, the board took a stack-canary watchpoint in ipc0 --
+# IDF's own inter-processor-call task, not ours -- immediately after
+# "cfgschema: schema up-to-date" and long before the probe's first dump. It has
+# not recurred, so this is reasoning, not a diagnosis, and it is recorded here
+# as such.
+#
+# The reasoning: CONFIG_ESP_IPC_TASK_STACK_SIZE defaults to 1280 bytes on the
+# ESP32-S3 (esp_system/Kconfig:486). Both options above deepen EVERY
+# allocation's call chain -- HEAP_TRACING_STACK_DEPTH=8 walks and records eight
+# backtrace frames per malloc, and HEAP_TASK_TRACKING adds nested
+# multi_heap_malloc calls for its own bookkeeping. Any task already close to
+# its ceiling gets pushed past it, and at 1280 bytes ipc0 is the thinnest
+# margin on the system. That predicts a rare, timing-dependent overflow in
+# whichever task allocates while deepest -- which is what was seen.
+#
+# Costs ~1.5 KB more internal DRAM, the resource under study. Negligible
+# against ~300 KB, but stated rather than glossed, because an instrument that
+# consumes what it measures is this file's whole stated concern.
+#
+# DISCRIMINATING EVIDENCE, if it recurs: a canary trip is a watchpoint, so the
+# panic dump carries ipc0's backtrace at the moment of overflow. heap_trace_*
+# or esp_backtrace_* frames in it confirm this; their absence refutes it and
+# the cause is elsewhere. Do not treat non-recurrence as confirmation.
+CONFIG_ESP_IPC_TASK_STACK_SIZE=2048

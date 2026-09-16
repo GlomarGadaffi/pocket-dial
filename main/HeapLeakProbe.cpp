@@ -55,13 +55,13 @@
 
 #if CONFIG_HEAP_TRACING
 
-#include <cinttypes>
 
 #include "esp_heap_caps.h"
 #include "esp_heap_trace.h"
 #include "esp_memory_utils.h"   // esp_ptr_internal
 #include <cstdio>                 // snprintf
 #include "esp_log.h"
+#include "esp_rom_sys.h"    // esp_rom_printf -- see probePrintf above
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -73,6 +73,66 @@ namespace
 {
 
 constexpr char TAG[] = "HeapProbe";
+
+// EVERY LINE THIS PROBE PRINTS GOES THROUGH esp_rom_printf, NOT ESP_LOGx.
+// This is not a style choice; ESP_LOGx cannot carry this output at all.
+//
+// The non-display builds install LogQueue's non-blocking hook via
+// esp_log_set_vprintf (src/Helpers/LogQueue.hpp). That hook formats into a
+// stack buffer and does xQueueSend(..., 0) -- "drop the line if the queue is
+// full, never block a real-time task." Correct for a PBX. Fatal for a dump:
+//
+//   QUEUE_DEPTH            = 16 lines          (LogQueue.hpp:46)
+//   drain task body        = ONE drainToUart() per vTaskDelay(10 ms)
+//                            (esp_main*.cpp), so ~100 lines/second, ceiling
+//   this dump              = up to 400 record lines, emitted as fast as the
+//                            CPU can format them
+//
+// Two orders of magnitude apart. Over 99% of the records were being dropped
+// silently while the footer cheerfully reported "printed 400" -- a dump that
+// looks complete and is hollow, which is worse than one that crashes. It also
+// explains madmax's two captures exactly: boot 2 showed 4 record lines and
+// boot 3 showed 0, from the same code at the same point. That was never crash
+// timing; it was how many of ~400 lines happened to win a 16-slot queue before
+// the panic, and a panic discards whatever is still queued.
+//
+// esp_rom_printf writes the UART FIFO directly: synchronous, no heap, no
+// queue, nothing to drop, and no syslog tee (the drain task's tee does an lwip
+// send per line, on a board whose Ethernet is the thing dying). It is what
+// IDF's own heap_trace_dump_base() uses, with these same %p / %u conversions
+// -- IDF's mistake was the critical section wrapped around the loop, not the
+// print. Our loop holds no critical section.
+//
+// Blocking on the UART FIFO paces the loop to 115200 baud (~2 s for a full
+// 400-line dump), which is why the vTaskDelay(1) every batch in
+// dumpInternalRecords() is load-bearing: esp_rom_printf spins rather than
+// yielding, and starving the idle task for 2 s would trade this bug for a
+// task-watchdog panic.
+//
+// Consequence: these lines carry no "W (12345)" ESP_LOG prefix. The literal
+// "HeapProbe:" prefix below is what tooling greps for, and every line is
+// emitted in true program order -- unlike ESP_LOGx, which lags by up to the
+// drain interval and would let records overtake their own dump header.
+// ONE THING ESP_LOGx GAVE US THAT esp_rom_printf DOES NOT: format checking.
+// esp_rom_sys.h:46 declares `int esp_rom_printf(const char *fmt, ...);` with NO
+// __attribute__((format(printf, 1, 2))), so gcc will not diagnose a %u fed a
+// size_t, or a conversion with no argument behind it -- on a diagnostic whose
+// entire job is printing, and where a bad %s is precisely the bug that just
+// crashed this board twice.
+//
+// probePrintfFormatCheck() restores it. The call sits under `if (false)`, so
+// gcc type-checks the arguments against the format string at compile time and
+// then discards the branch: the arguments are evaluated zero times and no code
+// is emitted. -Werror is on in this build, so a format mistake is a build
+// failure rather than a runtime surprise.
+__attribute__((format(printf, 1, 2)))
+inline void probePrintfFormatCheck(const char*, ...) {}
+
+#define probePrintf(...)                                 \
+	do {                                                 \
+		if (false) probePrintfFormatCheck(__VA_ARGS__);  \
+		esp_rom_printf(__VA_ARGS__);                     \
+	} while (false)
 
 // 4000 records x 40-odd bytes each, in PSRAM. Sized to comfortably outlast the
 // ~220 s onset window rather than to be frugal: HEAP_TRACE_LEAKS drops a
@@ -100,16 +160,16 @@ void logInternalState(const char* phase, uint32_t atSec)
 	// Same four figures /api/status reports (#295), logged here too so a
 	// serial capture is self-contained — the dashboard is dead by the third
 	// dump, which is precisely when the numbers matter most.
-	ESP_LOGW(TAG, "[%s t=%" PRIu32 "s] internal free=%u largest=%u min=%u | dma free=%u largest=%u",
-		phase, atSec, static_cast<unsigned>(freeInt), static_cast<unsigned>(bigInt),
+	probePrintf("HeapProbe: [%s t=%us] internal free=%u largest=%u min=%u | dma free=%u largest=%u\n",
+		phase, static_cast<unsigned>(atSec), static_cast<unsigned>(freeInt), static_cast<unsigned>(bigInt),
 		static_cast<unsigned>(minInt), static_cast<unsigned>(freeDma),
 		static_cast<unsigned>(bigDma));
 
 	// free - largest is the fragmentation signal: it widening while free()
 	// holds roughly steady means the DMA bounce-buffer allocation can fail on
 	// a board that still reports plenty available.
-	ESP_LOGW(TAG, "[%s t=%" PRIu32 "s] fragmentation gap (free - largest) = %u bytes",
-		phase, atSec, static_cast<unsigned>(freeInt - bigInt));
+	probePrintf("HeapProbe: [%s t=%us] fragmentation gap (free - largest) = %u bytes\n",
+		phase, static_cast<unsigned>(atSec), static_cast<unsigned>(freeInt - bigInt));
 }
 
 #if CONFIG_HEAP_TASK_TRACKING
@@ -138,15 +198,46 @@ void logPerTask(uint32_t atSec)
 	totalsCount = 0;
 	heap_caps_get_per_task_info(&params);
 
-	ESP_LOGW(TAG, "[per-task internal DRAM t=%" PRIu32 "s] %u tasks", atSec,
-		static_cast<unsigned>(totalsCount));
+	probePrintf("HeapProbe: [per-task internal DRAM t=%us] %u owners\n",
+		static_cast<unsigned>(atSec), static_cast<unsigned>(totalsCount));
 	for (size_t i = 0; i < totalsCount; ++i)
 	{
-		const char* name = totals[i].task ? pcTaskGetName(totals[i].task) : "pre-scheduler";
-		// size[] is size_t; cast rather than trusting %d to be right on a
-		// 32-bit target by accident.
-		ESP_LOGW(TAG, "    %-16s %8u bytes", name ? name : "?",
-			static_cast<unsigned>(totals[i].size[0]));
+		// DO NOT call pcTaskGetName(totals[i].task) HERE. That crashed the
+		// bench twice, reproducibly, and the reason is in IDF's own docs.
+		//
+		// heap_caps_get_per_task_info() fills .task from
+		// MULTI_HEAP_GET_BLOCK_OWNER(p) -- the TCB pointer stamped into the
+		// block header when it was allocated (heap_task_info.c:957). It
+		// performs NO liveness check, and esp_heap_task_info.h says so
+		// explicitly: the totals array is stable across calls "even if some
+		// tasks have freed their blocks OR HAVE BEEN DELETED."
+		//
+		// So a handle here may belong to a task that no longer exists. This
+		// PBX creates and destroys a task per call leg, so by t=120 s several
+		// of these are guaranteed dead. pcTaskGetName() is pure pointer
+		// arithmetic -- &pxTCB->pcTaskName[0] -- so it happily returns an
+		// interior pointer to a freed TCB, and the fault lands downstream in
+		// vsnprintf's %s walk looking for a terminator that isn't there:
+		//
+		//   Guru Meditation Error: Core 1 panic'ed (Cache error)
+		//   Cache error: MMU entry fault error     EXCVADDR: 0x00000000
+		//   heapProbeTask -> logPerTask -> esp_log_va -> vsnprintf -> vfprintf
+		//
+		// A dead owner is not noise, it is the single most interesting row in
+		// this table: memory still held by a task that has exited is a leak by
+		// definition. So print the raw handle and let addr2line/analysis
+		// correlate it. count[0] comes free from the same struct and separates
+		// "one big block" from "a thousand small ones".
+		//
+		// IDF 6 has a safe API for this -- heap_caps_get_all_task_stat() fills
+		// task_stat_t{ char name[configMAX_TASK_NAME_LEN]; bool is_alive; },
+		// copying the name by value under CONFIG_HEAP_TRACK_DELETED_TASKS.
+		// That is the right follow-up; it is not worth a second untested change
+		// on a bench that has already taken three crashes from this file.
+		probePrintf("HeapProbe:   owner %p  %8u bytes  %5u blocks\n",
+			totals[i].task,
+			static_cast<unsigned>(totals[i].size[0]),
+			static_cast<unsigned>(totals[i].count[0]));
 	}
 }
 #endif  // CONFIG_HEAP_TASK_TRACKING
@@ -189,8 +280,8 @@ void dumpInternalRecords(uint32_t atSec)
 	const size_t total = heap_trace_get_count();
 	size_t printed = 0, internalSeen = 0;
 
-	ESP_LOGW(TAG, "[dump t=%" PRIu32 "s] %u outstanding records total; listing "
-		"internal-RAM ones (max %u)", atSec, static_cast<unsigned>(total),
+	probePrintf("HeapProbe: [dump t=%us] %u outstanding records total; listing "
+		"internal-RAM ones (max %u)\n", static_cast<unsigned>(atSec), static_cast<unsigned>(total),
 		static_cast<unsigned>(kMaxPrinted));
 
 	for (size_t i = 0; i < total; ++i)
@@ -216,8 +307,8 @@ void dumpInternalRecords(uint32_t atSec)
 				if (off >= static_cast<int>(sizeof(frames)) - 1) break;
 			}
 			frames[sizeof(frames) - 1] = '\0';
-			ESP_LOGW(TAG, "  %6u B @ %p by%s", static_cast<unsigned>(rec.size),
-				rec.address, frames);
+			probePrintf("HeapProbe:   %6u B @ %p by%s\n",
+				static_cast<unsigned>(rec.size), rec.address, frames);
 			++printed;
 		}
 
@@ -229,8 +320,8 @@ void dumpInternalRecords(uint32_t atSec)
 		}
 	}
 
-	ESP_LOGW(TAG, "[dump t=%" PRIu32 "s] internal-RAM records: %u (printed %u%s)",
-		atSec, static_cast<unsigned>(internalSeen), static_cast<unsigned>(printed),
+	probePrintf("HeapProbe: [dump t=%us] internal-RAM records: %u (printed %u%s)\n",
+		static_cast<unsigned>(atSec), static_cast<unsigned>(internalSeen), static_cast<unsigned>(printed),
 		internalSeen > printed ? ", TRUNCATED" : "");
 }
 
@@ -258,8 +349,8 @@ void heapProbeTask(void*)
 		return;
 	}
 
-	ESP_LOGW(TAG, "leak probe armed: %u records in PSRAM, HEAP_TRACE_LEAKS. "
-		"Dumps at 120/240/360/900 s (#273 onset measured 218-276 s).",
+	probePrintf("HeapProbe: leak probe armed: %u records in PSRAM, HEAP_TRACE_LEAKS. "
+		"Dumps at 120/240/360/900 s (#273 onset measured 218-276 s).\n",
 		static_cast<unsigned>(kTraceRecords));
 	logInternalState("armed", 0);
 
@@ -272,8 +363,8 @@ void heapProbeTask(void*)
 		}
 
 		logInternalState("dump", target);
-		ESP_LOGW(TAG, "[dump t=%" PRIu32 "s] outstanding trace records: %u of %u",
-			target, static_cast<unsigned>(heap_trace_get_count()),
+		probePrintf("HeapProbe: [dump t=%us] outstanding trace records: %u of %u\n",
+			static_cast<unsigned>(target), static_cast<unsigned>(heap_trace_get_count()),
 			static_cast<unsigned>(kTraceRecords));
 		// The probe's own stack depth was picked (4096, bumped to 8192 below),
 		// not measured -- heap_trace_dump_caps() walks up to
@@ -288,8 +379,8 @@ void heapProbeTask(void*)
 		// HoldMusic.cpp's/HttpServer.cpp's own convention elsewhere in this
 		// tree; multiplying by sizeof(StackType_t) is not optional.
 		const UBaseType_t freeWords = uxTaskGetStackHighWaterMark(nullptr);
-		ESP_LOGW(TAG, "[dump t=%" PRIu32 "s] heap_probe stack high-water: %u bytes free of %d",
-			target, static_cast<unsigned>(freeWords * sizeof(StackType_t)), 8192);
+		probePrintf("HeapProbe: [dump t=%us] heap_probe stack high-water: %u bytes free of %d\n",
+			static_cast<unsigned>(target), static_cast<unsigned>(freeWords * sizeof(StackType_t)), 8192);
 
 		// NOT heap_trace_dump_caps(). See dumpInternalRecords() -- IDF's own
 		// dump holds a critical section across its entire per-record print
@@ -306,7 +397,7 @@ void heapProbeTask(void*)
 	// stopping: the board stays up for 76-91 minutes in the degraded state
 	// (measured, two boots, two trees), so someone may want a manual dump much
 	// later. heap_trace_stop() is never called here.
-	ESP_LOGW(TAG, "scheduled dumps complete; tracing still ACTIVE for later manual dumps");
+	probePrintf("HeapProbe: scheduled dumps complete; tracing still ACTIVE for later manual dumps\n");
 	vTaskDelete(nullptr);
 }
 
