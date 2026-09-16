@@ -93,7 +93,23 @@ namespace
 
 	void cdrPersistWriterTask(void*)
 	{
-		CdrRingBlob blob;
+		// `blob` is deliberately a function-STATIC, not a stack-local. At the
+		// default POCKETDIAL_CDR_RECORDS=32, CdrRingBlob::kCapacity is 4481
+		// bytes -- MORE than this task's entire 4096-byte stack, before
+		// counting xQueueReceive()'s own frame or nvs_open/nvs_set_str/
+		// nvs_commit's. A stack-local here would overflow on the very first
+		// persist after boot, reintroducing this PR's own bug class inside
+		// its own fix (caught in review -- sonnet-OG, thank you -- not on
+		// hardware, where it would have looked like an unrelated new crash).
+		// Static also decouples the writer task's required stack size from
+		// POCKETDIAL_CDR_RECORDS, which CallDetailRecord.hpp documents as a
+		// compile-time -D override: a numeric stack size chosen "with
+		// margin" for today's default would silently become insufficient
+		// again if that macro is ever raised, without touching this file to
+		// notice. Safe without synchronization because this task is the
+		// only reader/writer of `blob` and processes exactly one queue item
+		// at a time on its own single thread of execution.
+		static CdrRingBlob blob;
 		while (true)
 		{
 			if (xQueueReceive(cdrPersistQueue(), &blob, portMAX_DELAY) == pdTRUE)
@@ -136,7 +152,15 @@ namespace
 		}
 		// PLAIN stack (no PD_TASK_STACK_CAPS): this task is the only place
 		// allowed to touch flash for the CDR ring -- see PsramTask.hpp.
-		if (xTaskCreatePinnedToCore(cdrPersistWriterTask, "cdr_persist", 4096,
+		// 6144 bytes matches CdrArchive.cpp's own writer task, the closest
+		// precedent (a comparable flash-adjacent worker with a blocking
+		// library call chain) -- and, like that one, this is a reasoned
+		// estimate, NOT measured with uxTaskGetStackHighWaterMark() on real
+		// hardware. `blob` itself is static now (see cdrPersistWriterTask's
+		// comment), so this only needs to cover xQueueReceive()'s frame and
+		// nvs_open/nvs_set_str/nvs_commit's internal depth. Flag for
+		// hardware bring-up, same as CdrArchive.cpp's.
+		if (xTaskCreatePinnedToCore(cdrPersistWriterTask, "cdr_persist", 6144,
 			nullptr, 1, nullptr, 0) != pdPASS)
 		{
 			ESP_LOGE("CdrRing", "xTaskCreate cdr_persist failed -- CDR ring will not persist across reboot");
@@ -148,11 +172,16 @@ namespace
 #endif
 }
 
-CdrRingBlob CdrRing::serializeForPersist(
+void CdrRing::serializeForPersist(
 	const std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS>& ring,
-	size_t head, size_t count)
+	size_t head, size_t count, CdrRingBlob& out)
 {
-	CdrRingBlob out;   // zero-initialized: already NUL-terminated at text[0]
+	// Reset first: `out` may be a reused static (see persist()'s and
+	// cdrPersistWriterTask's callers) carrying a longer previous blob, and
+	// std::memset is the only way to guarantee every trailing byte is '\0'
+	// again -- a shorter new blob must not leave stale bytes from the last
+	// call sitting after its own NUL terminator.
+	std::memset(out.text, 0, sizeof(out.text));
 	size_t used = 0;
 	const size_t cap = sizeof(out.text) - 1;   // reserve the last byte as a hard NUL
 	for (size_t i = 0; i < count; ++i)
@@ -165,7 +194,6 @@ CdrRingBlob CdrRing::serializeForPersist(
 		appendField(out.text, cap, used, std::to_string(r.durationSec), 10, '\t');
 		appendField(out.text, cap, used, std::to_string(static_cast<int>(r.result)), 1, '\n');
 	}
-	return out;
 }
 
 const CallDetailRecord& CdrRing::record(const std::shared_ptr<Session>& session,
@@ -327,7 +355,21 @@ void CdrRing::persist()
 	// buffer, no allocation) -- safe on any stack, including a PSRAM one.
 	// The actual flash write now happens ONLY on cdr_persist_writer's plain
 	// stack; this function just builds the blob and hands it off.
-	CdrRingBlob blob = serializeForPersist(_ring, _head, _count);
+	//
+	// `blob` is a function-static, not a stack-local, for the same reason
+	// cdrPersistWriterTask's is (see that function's comment): at
+	// CdrRingBlob::kCapacity ~4.5 KB, a stack-local here would add real
+	// pressure to whichever task calls persist() -- tel_wsw and the
+	// makecall worker (both 12 KB PSRAM stacks) or the SIP thread (8 KB) --
+	// on the exact tasks issue #273 spent a night finding are tight under
+	// load. Safe without synchronization: every call to persist() (via
+	// record()/clearAll()) already runs under RequestsHandler::_mutex (see
+	// this class's own locking convention), which already serializes every
+	// caller to exactly one at a time -- the same property that makes the
+	// static safe, just enforced by the engine's lock instead of by this
+	// function running on a single dedicated task.
+	static CdrRingBlob blob;
+	serializeForPersist(_ring, _head, _count, blob);
 
 	// Non-blocking: never stall the caller (which may be holding
 	// RequestsHandler::_mutex, or be a real-time task) waiting for queue
