@@ -2122,13 +2122,18 @@ std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpP
 bool RequestsHandler::parseCallerRtp(const std::shared_ptr<SipMessage>& invite,
 	std::string& outIp, uint16_t& outPort)
 {
+	// Explicit section selection (#253): getRtpPort()/getConnectionInformation()
+	// with no argument each answer "which section?" a different, disagreeing way
+	// on a multi-section body -- this PBX has never yet seen one, but that is a
+	// trap waiting for the first audio+video offer, not a guarantee. Name the
+	// section instead: the first "audio" m= line, the only thing a caller here
+	// could mean.
+	SipSdpMessage* sdp = (invite && invite->hasSdp())
+		? static_cast<SipSdpMessage*>(invite.get()) : nullptr;
+	const int section = sdp ? sdp->firstAudioSection() : -1;
+
 	// Port: the m=audio port from the caller's offered SDP (0 if absent/invalid).
-	int port = 0;
-	if (invite && invite->hasSdp())
-	{
-		auto* sdp = static_cast<SipSdpMessage*>(invite.get());
-		port = sdp->getRtpPort();
-	}
+	int port = (section >= 0) ? sdp->getRtpPort(section) : 0;
 	if (port <= 0 || port > 65535)
 	{
 		return false;
@@ -2138,10 +2143,9 @@ bool RequestsHandler::parseCallerRtp(const std::shared_ptr<SipMessage>& invite,
 	// IP: prefer the SDP c= line ("c=IN IP4 <addr>"); fall back to the INVITE source
 	// IP (handles phones that put 0.0.0.0 or a private/NAT addr in c=).
 	outIp.clear();
-	if (invite && invite->hasSdp())
+	if (section >= 0)
 	{
-		auto* sdp = static_cast<SipSdpMessage*>(invite.get());
-		std::string_view c = sdp->getConnectionInformation();   // "c=IN IP4 1.2.3.4"
+		std::string_view c = sdp->getConnectionInformation(section);   // "c=IN IP4 1.2.3.4"
 		size_t ip4 = c.find("IP4 ");
 		if (ip4 != std::string_view::npos)
 		{
