@@ -164,6 +164,12 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/LoopbackAnchorClient.cpp"
                             "../src/SIP/TelephonyAnchorClient.cpp"
                             "../src/SIP/MediaBridge.cpp"
+                            # Issue #246 (voicemail, Stage 3 of #194): the 1:1 record/playback leg.
+                            "../src/SIP/VoicemailLeg.cpp"
+                            # Issue #246: the SD-flush queue/writer-task pipeline.
+                            "../src/SIP/VoicemailArchive.cpp"
+                            # Issue #246, retrieval slice 2/3: the pure DTMF retrieval-menu.
+                            "../src/SIP/VoicemailMenu.cpp"
                             "../src/SIP/TelephonyProvider.cpp"
                             "../src/SIP/TelephonyApiConfig.cpp"
                             "../src/SIP/DidMapping.cpp"

@@ -668,6 +668,14 @@ void HttpServer::handleClient(int clientSock)
 			sendApiDnd(clientSock, req.body);
 		}
 	}
+	else if (req.method == "POST" && req.path == "/api/voicemail")
+	{
+		// Mutating: same gate as /api/dnd (same-origin + auth once provisioned).
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiVoicemail(clientSock, req.body);
+		}
+	}
 	else if (req.method == "POST" && req.path == "/api/forward")
 	{
 		// Mutating: same gate as /api/dnd (same-origin + auth once provisioned).
@@ -1271,6 +1279,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	std::vector<std::pair<std::string, std::string>> clients;
 	std::vector<std::tuple<std::string, std::string, std::string, int>> sessions;
 	std::vector<std::string> dndExtensions;
+	std::vector<std::string> voicemailExtensions;
 	std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwards;
 	std::vector<std::tuple<std::string, std::string, std::string>> ringGroups;
 	std::vector<std::tuple<std::string, std::string, std::string, int>> dialRules;
@@ -1284,6 +1293,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		clients = handler->getActiveClients();
 		sessions = handler->getActiveSessions();
 		dndExtensions = handler->getDndExtensions();
+		voicemailExtensions = handler->getVoicemailExtensions();
 		forwards = handler->getForwards();
 		ringGroups = handler->getRingGroups();
 		dialRules = handler->getDialRules();
@@ -1381,6 +1391,15 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	{
 		if (i > 0) json << ",";
 		json << "\"" << jsonEscape(dndExtensions[i]) << "\"";
+	}
+	json << "],";
+
+	// Voicemail array (Issue #246): extensions currently voicemail-enabled.
+	json << "\"voicemail\":[";
+	for (size_t i = 0; i < voicemailExtensions.size(); i++)
+	{
+		if (i > 0) json << ",";
+		json << "\"" << jsonEscape(voicemailExtensions[i]) << "\"";
 	}
 	json << "],";
 
@@ -1804,6 +1823,51 @@ void HttpServer::sendConfigCfg(int sock, const std::string& mac)
 	sendResponse(sock, 200, "OK", "text/plain", cfg);
 }
 
+void HttpServer::sendApiVoicemail(int sock, const std::string& body)
+{
+	std::string ext = getFormParam(body, "extension");
+	std::string on  = getFormParam(body, "on");
+
+	if (ext.empty())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"missing extension parameter\"}");
+		return;
+	}
+
+	// Use the full reserved/emergency literal set (pbx::isReservedExtension:
+	// 777/999/888/555/440/911/933/796 -- 796 is the voicemail retrieval
+	// pilot itself, Issue #246) rather than sendApiDnd's narrower
+	// hand-picked list (777/999/555) -- new code, no reason to carry over an
+	// existing gap. Also block the whole park-orbit range (700-709): an
+	// orbit isn't a mailbox owner. (Was a stale `ext == "700"` literal from
+	// when 700 was the originally-planned pilot number -- see
+	// pbx::isReservedExtension()'s own comment for why that number moved.)
+	if (pbx::isReservedExtension(ext) || pbx::isParkOrbitExt(ext))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot set voicemail on a virtual extension\"}");
+		return;
+	}
+	if (pbx::isServiceName(ext))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot set voicemail on a service extension\"}");
+		return;
+	}
+
+	bool enable = (on == "1" || on == "true" || on == "on");
+
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		handler->setVoicemail(ext, enable);
+	}
+
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"extension\":\"" + jsonEscape(ext) +
+	             "\",\"voicemail\":" + (enable ? "true" : "false") + "}");
+}
+
 void HttpServer::sendApiDnd(int sock, const std::string& body)
 {
 	std::string ext = getFormParam(body, "extension");
@@ -1975,7 +2039,7 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 		             "{\"error\":\"pattern may contain only letters, digits, '#' and '*'\"}");
 		return;
 	}
-	if (pattern == "777" || pattern == "999" || pattern == "440" || pattern == "555")
+	if (pbx::isReservedExtension(pattern))
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot use a reserved extension as a dial-plan pattern\"}");
@@ -2440,8 +2504,7 @@ void HttpServer::sendApiDidMappingSet(int sock, const std::string& body)
 		             "{\"error\":\"extension may contain only letters, digits, '#' and '*'\"}");
 		return;
 	}
-	if (extension == "777" || extension == "999" || extension == "555" ||
-	    extension == "888" || extension == "440")
+	if (pbx::isReservedExtension(extension))
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"cannot map a DID to a virtual/reserved extension\"}");
@@ -3592,6 +3655,21 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	}
 	pt << "],";
 
+	pt << "\"voicemail\":[";
+	{
+		bool first = true;
+		if (handler)
+		{
+			for (const auto& ext : handler->getVoicemailExtensions())
+			{
+				if (!first) pt << ",";
+				first = false;
+				pt << "\"" << jsonEscape(ext) << "\"";
+			}
+		}
+	}
+	pt << "],";
+
 	pt << "\"pageZones\":[";
 	{
 		bool first = true;
@@ -3932,6 +4010,18 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		}
 		applied.push_back("dnd");
 
+		// Voicemail (Issue #246): replace membership, same shape as DND.
+		{
+			std::set<std::string> keep;
+			for (const auto& v : pt->arrayOr("voicemail")) if (v.isString()) keep.insert(v.strVal);
+			for (const auto& ext : handler->getVoicemailExtensions())
+			{
+				if (!keep.count(ext)) handler->setVoicemail(ext, false);
+			}
+			for (const auto& ext : keep) handler->setVoicemail(ext, true);
+		}
+		applied.push_back("voicemail");
+
 		// Page zones: delete-then-set sweep.
 		{
 			std::set<std::string> keep;
@@ -4036,7 +4126,7 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 	}
 	else
 	{
-		skipped.push_back("SIP engine not attached yet -- ring groups/forwards/dnd/pageZones/"
+		skipped.push_back("SIP engine not attached yet -- ring groups/forwards/dnd/voicemail/pageZones/"
 			"dialPlan/didMappings/registrarMode/telephonyConfig not applied");
 	}
 

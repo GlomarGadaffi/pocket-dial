@@ -314,6 +314,14 @@ add_executable(sip_parser_tests
     # CDR archive like the HTTP factory reset does. Drives the real INFO digit
     # path with a spy Sink installed via cdrarchive::setSinkForTest().
     DtmfFactoryReset_test.cpp
+    # Issue #246 (voicemail Stage 3 of #194): the extension-config-model slice
+    # -- setVoicemail()/getVoicemailExtensions() must obey the same
+    # immediate-snapshot-refresh contract as setDnd()/getDndExtensions().
+    VoicemailConfig_test.cpp
+    # Issue #246: the SIP divert-hook slice -- CFNA/CFB falling back to a
+    # locally-terminated voicemail leg, the mandatory CANCEL of the
+    # still-ringing callee, and the #232-class BYE-teardown regression.
+    VoicemailDivert_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header
@@ -435,6 +443,21 @@ add_executable(sip_parser_tests
     # are no-op stubs under !ESP_PLATFORM, so the lifecycle/identity bookkeeping
     # and the feedRx -> PlayoutBuffer path are exercisable on the desktop build.
     ../src/SIP/MediaBridge.cpp
+    # Issue #246 (voicemail, Stage 3 of #194): the 1:1 record/playback leg.
+    # Pure C++17, no ESP dependency -- holds no socket/FreeRTOS state itself.
+    ../src/SIP/VoicemailLeg.cpp
+    VoicemailLeg_test.cpp
+    # Issue #246: the SD-flush queue/writer-task pipeline (WAV header,
+    # WriterQueue, drainAll) -- pure C++17, mirrors CdrArchive's shape.
+    ../src/SIP/VoicemailArchive.cpp
+    VoicemailArchive_test.cpp
+    # Issue #246, retrieval slice 2/3: the pure DTMF retrieval-menu state
+    # machine (digits/playbackDone in, one Command out). No ESP dependency.
+    ../src/SIP/VoicemailMenu.cpp
+    VoicemailMenu_test.cpp
+    # Issue #246, retrieval slice 3/3: ext-796 SIP dial-in wired to the
+    # SD-I/O job machine and VoicemailMenu, driven through handle()/tick().
+    VoicemailRetrieval_test.cpp
     # The fixed-size TelephonyProviderType registry/factory (name/implemented
     # lookups + registerProvider/select) that RequestsHandler's boot-time anchor
     # wiring now uses to select LoopbackAnchorClient. Pure C++17, no ESP dependency.

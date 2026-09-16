@@ -270,8 +270,12 @@ TEST(RegisterBeep, EnforceG711AndSyncKeepsContentLengthCorrect) {
 // stay here, alongside the rest of PbxConfig.hpp's pure logic, because they
 // need nothing else.
 
-TEST(ReservedExtension, MatchesExactlyTheSevenReservedOrEmergencyLiterals) {
-    for (const char* ext : {"777", "999", "888", "555", "440", "911", "933"}) {
+TEST(ReservedExtension, MatchesExactlyTheEightReservedOrEmergencyLiterals) {
+    // Issue #246 added "796" (the voicemail retrieval pilot) as the eighth --
+    // deliberately updated here, not left broken, since this test existing
+    // at all is the point: it forces exactly this kind of touch whenever the
+    // literal set changes.
+    for (const char* ext : {"777", "999", "888", "555", "440", "911", "933", "796"}) {
         EXPECT_TRUE(pbx::isReservedExtension(ext)) << ext;
     }
 }
@@ -302,7 +306,7 @@ TEST(LooksLikePstnAor, RejectsShortOrNonDigitOrEmpty) {
 }
 
 TEST(IsReservedOrPstnAor, BlocksEveryReservedLiteral) {
-    for (const char* ext : {"777", "999", "888", "555", "440", "911", "933"}) {
+    for (const char* ext : {"777", "999", "888", "555", "440", "911", "933", "796"}) {
         EXPECT_TRUE(pbx::isReservedOrPstnAor(ext)) << ext;
     }
 }
