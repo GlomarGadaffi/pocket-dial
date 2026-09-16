@@ -87,6 +87,16 @@ public:
 	// snapshot mirror.
 	std::vector<AdoptedDevice> adoptedDevices() const;
 
+	// Test-only seam: directly adopt a device without an ARP lookup.
+	void adoptDeviceForTest(const std::string& mac, const std::string& ext, DeviceState state = DeviceState::Learned)
+	{
+		DeviceRecord r;
+		r.extension = ext;
+		r.state = state;
+		r.online = true;
+		_devices[mac] = r;
+	}
+
 	// What moved in the registry since the last consume. Online is by far the
 	// most frequent (every registration and every lease expiry flips it, and a
 	// post-reboot storm flips it once per phone) and is the only kind that needs

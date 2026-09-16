@@ -43,11 +43,24 @@ public:
 		_handler.store(h, std::memory_order_release);
 	}
 
-	// Issue #35: true iff `path` has the shape "/config/<12 lowercase hex>.cfg"
-	// — a phone's zero-touch auto-provisioning fetch. Pure string-shape check;
-	// doesn't touch the registry (sendConfigCfg does that). Public/static so
-	// it's host-testable on its own (see tests/ProvisioningConfig_test.cpp).
+	enum class ProvisioningPathType
+	{
+		Invalid = 0,
+		Yealink,          // /config/<12 hex>.cfg
+		Grandstream,      // /config/cfg<12 hex>.xml
+		PolycomPhone,     // /config/<12 hex>-phone.cfg
+		PolycomMaster,    // /config/000000000000.cfg
+		CiscoSpaMac,      // /config/spa<12 hex>.cfg
+		CiscoSpaModel     // /config/spa<model>.cfg
+	};
+
+	// Issue #35, #234: true iff `path` has a recognized phone auto-provisioning
+	// shape: /config/<12 hex>.cfg (Yealink/default), /config/cfg<12 hex>.xml (Grandstream),
+	// /config/<12 hex>-phone.cfg (Polycom per-phone), /config/000000000000.cfg (Polycom master),
+	// /config/spa<12 hex>.cfg or /config/spa<model>.cfg (Cisco SPA).
+	// Pure string-shape check; public/static so it's host-testable on its own.
 	static bool isProvisioningConfigPath(const std::string& path);
+	static ProvisioningPathType parseProvisioningPath(const std::string& path, std::string& outKey);
 
 private:
 	// Idempotent socket lifecycle, called only from this class's own thread
@@ -66,10 +79,11 @@ private:
 		std::string method;
 		std::string path;
 		std::string body;
-		std::string origin;  // value of the Origin: header, if present
-		std::string host;    // value of the Host: header, if present
-		std::string cookie;  // value of the Cookie: header, if present
-		std::string csrf;    // value of the X-CSRF: header, if present
+		std::string origin;    // value of the Origin: header, if present
+		std::string host;      // value of the Host: header, if present
+		std::string cookie;    // value of the Cookie: header, if present
+		std::string csrf;      // value of the X-CSRF: header, if present
+		std::string userAgent; // value of the User-Agent: header, if present (Issue #234)
 		// Peer address, filled from getpeername() in handleClient(). Used only as
 		// the brute-force accounting key for /api/admin/login, never for authz:
 		// a source address is trivially spoofable on the shared link (see
@@ -155,11 +169,9 @@ private:
 	// tracer. Session-gated by the caller, same as sendApiPcap.
 	void sendApiTrace(int sock);
 
-	// Serves the Yealink auto-provisioning config for an adopted device's MAC
-	// (already validated by isProvisioningConfigPath). 404 if the MAC isn't in
-	// the adopted-device registry — same response whether it's a genuinely
-	// unknown MAC or one that just isn't provisioned yet, so a prober can't
-	// tell the difference.
+	// Issue #35, #234: Serves phone auto-provisioning config for supported vendors.
+	void sendProvisioningResponse(int sock, const HttpRequest& req);
+	// Backward-compatible wrapper for sendProvisioningResponse.
 	void sendConfigCfg(int sock, const std::string& mac);
 	// Phase 2: set per-extension Do Not Disturb. Mutating (same-origin + auth gated).
 	void sendApiDnd(int sock, const std::string& body);
