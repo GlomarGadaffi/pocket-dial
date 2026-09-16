@@ -171,6 +171,21 @@ void heapProbeTask(void*)
 		ESP_LOGW(TAG, "[dump t=%" PRIu32 "s] outstanding trace records: %u of %u",
 			target, static_cast<unsigned>(heap_trace_get_count()),
 			static_cast<unsigned>(kTraceRecords));
+		// The probe's own stack depth was picked (4096, bumped to 8192 below),
+		// not measured -- heap_trace_dump_caps() walks up to
+		// HEAP_TRACING_STACK_DEPTH (8) %p-formatted frames per outstanding
+		// record via esp_rom_printf, and at t=360s that could be hundreds of
+		// records. A diagnostic tool overflowing its own stack would look like
+		// a brand-new crash in the thing being diagnosed (the #309 bug class,
+		// inside the tool built to find it). Logging the real high-water mark
+		// each dump turns the next stack-size decision into a measurement
+		// instead of a second guess.
+		// uxTaskGetStackHighWaterMark() returns WORDS, not bytes -- matches
+		// HoldMusic.cpp's/HttpServer.cpp's own convention elsewhere in this
+		// tree; multiplying by sizeof(StackType_t) is not optional.
+		const UBaseType_t freeWords = uxTaskGetStackHighWaterMark(nullptr);
+		ESP_LOGW(TAG, "[dump t=%" PRIu32 "s] heap_probe stack high-water: %u bytes free of %d",
+			target, static_cast<unsigned>(freeWords * sizeof(StackType_t)), 8192);
 
 		// Only the internal-RAM allocations. A full dump is dominated by PSRAM
 		// traffic that has nothing to do with #273.
@@ -193,11 +208,21 @@ void heapProbeTask(void*)
 // Internal-RAM stack (plain xTaskCreate, not PD_TASK_STACK_CAPS): this task
 // calls into the heap subsystem and logs, and a PSRAM stack is the hazard
 // #277/#309 exist to prevent.
+//
+// 8192, not a measured figure yet (G-dubs, pre-hardware-pass review):
+// heap_trace_dump_caps() walks up to HEAP_TRACING_STACK_DEPTH (8) %p-formatted
+// frames per outstanding record via esp_rom_printf, and at t=360s there could
+// be hundreds of records -- the original 4096 guess wasn't sized against that.
+// A diagnostic overflowing its OWN stack would present as a fresh crash in
+// the exact thing being diagnosed, which is the #309 bug class reappearing
+// inside the tool built to find it. The dump loop above now logs the real
+// high-water mark every dump, so the next revision of this number is
+// measured, not guessed twice.
 struct HeapProbeInstaller
 {
 	HeapProbeInstaller()
 	{
-		if (xTaskCreate(heapProbeTask, "heap_probe", 4096, nullptr, 1, nullptr) != pdPASS)
+		if (xTaskCreate(heapProbeTask, "heap_probe", 8192, nullptr, 1, nullptr) != pdPASS)
 		{
 			ESP_LOGE(TAG, "xTaskCreate heap_probe failed -- probe disabled");
 		}
