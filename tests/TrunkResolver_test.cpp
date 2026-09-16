@@ -232,3 +232,59 @@ TEST(TrunkResolver, TheOutputAddressIsInitialisedEvenOnFailure)
 	EXPECT_EQ(addr.sin_family, AF_INET);
 	EXPECT_EQ(addr.sin_addr.s_addr, 0u);
 }
+
+// ── resolve()'s return must describe reality, on both platforms ──────────────
+//
+// Added after review. resolve() used to return Pending unconditionally once it
+// had started a worker. On DEVICE that is right — the task is spawned and the
+// lookup really is in flight. On HOST the stub runs the resolve INLINE, so by
+// the time startWorker() returned, the answer was already cached and Pending
+// was a lie: measured, resolve() said Pending while busy() was false,
+// cachedEntries() was 1, and lookup() in the same tick said Failed.
+//
+// Two things were wrong with that beyond the inaccuracy. A caller trusting the
+// return would retry instead of acting on an answer it already had; and the
+// status DIVERGED between host and device, which is how a host test comes to
+// prove something untrue of the firmware. resolve() now re-asks lookup()
+// instead of assuming.
+
+TEST(TrunkResolver, ResolveNeverReportsPendingForWorkThatHasFinished)
+{
+	TrunkResolver r;
+	sockaddr_in addr{};
+	const auto now = std::chrono::steady_clock::now();
+
+	const auto status = r.resolve("sbc.carrier.invalid", 5060, addr, now);
+
+	// Whatever it reports must agree with what the object can actually see.
+	if (!r.busy())
+	{
+		EXPECT_NE(status, Status::Pending)
+			<< "reported Pending with no lookup in flight -- a caller would retry "
+			   "instead of acting on the answer it already has";
+		EXPECT_EQ(status, r.lookup("sbc.carrier.invalid", 5060, addr, now))
+			<< "resolve() and lookup() must agree in the same tick";
+	}
+}
+
+// Pins the early-return path: once an answer is cached, resolve() hands it back
+// without going near the worker.
+//
+// NOT a control for the test above, despite the shape. Mutation-testing showed
+// this one passes with OR without the fix, because resolve()'s existing
+// `if (s == Hit || Pending || Failed) return s;` short-circuits before
+// startWorker() is ever reached. Only the test above actually fails when the
+// fix is reverted. Saying so rather than letting the pairing imply a rigour it
+// does not have.
+TEST(TrunkResolver, ResolveReportsACachedAnswerDirectly)
+{
+	TrunkResolver r;
+	sockaddr_in addr{};
+	const auto now = std::chrono::steady_clock::now();
+
+	r.resolve("sbc.carrier.invalid", 5060, addr, now);
+	ASSERT_EQ(r.cachedEntries(), 1u) << "precondition: something is cached";
+
+	EXPECT_EQ(r.resolve("sbc.carrier.invalid", 5060, addr, now), Status::Failed)
+		<< "a cached answer must be returned, not re-queued as Pending";
+}

@@ -186,7 +186,21 @@ TrunkResolver::Status TrunkResolver::resolve(std::string_view host, uint16_t por
 		// precisely so a bad name does not re-queue a ~7-21 s lookup per call.
 		return s;
 	}
-	return startWorker(host) ? Status::Pending : Status::Refused;
+	if (!startWorker(host)) return Status::Refused;
+
+	// Re-ask rather than assuming Pending. On device startWorker() spawns a task
+	// and returns while the lookup really is in flight, so this yields Pending --
+	// but the HOST stub runs the resolve INLINE, so by the time it returns the
+	// answer is already cached and Pending would be a lie: measured, resolve()
+	// reported Pending while busy() was already false, cachedEntries() was 1 and
+	// lookup() in the same tick returned Failed.
+	//
+	// That mattered for more than tidiness. A caller trusting the return value
+	// would retry instead of acting on an answer it already had, and the status
+	// would DIVERGE between host and device -- which is how a host test ends up
+	// proving something that is not true of the firmware. One re-check gives both
+	// platforms the same contract: whatever lookup() can see right now.
+	return lookup(host, port, out, now);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
