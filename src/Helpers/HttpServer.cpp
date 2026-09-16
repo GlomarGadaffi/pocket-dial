@@ -1460,6 +1460,12 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << ",\"freeHeap\":" << esp_get_free_heap_size();
 	json << ",\"minFreeHeap\":" << esp_get_minimum_free_heap_size();
 	json << ",\"minFreeHeapSpiram\":" << heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+	// Issue #273: internal (DRAM) low-water, reported separately. The two
+	// figures above cannot show a DRAM shortage -- MALLOC_CAP_SPIRAM is PSRAM
+	// by definition, and the all-caps minimum is dominated by 8 MB of PSRAM,
+	// so a near-exhausted 320 KB of DRAM barely moves it. Task stacks and
+	// lwIP pbufs live here and nowhere else.
+	json << ",\"minFreeHeapInternal\":" << heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
 	json << ",\"resetReason\":\"" << pdResetReasonString(esp_reset_reason()) << "\"";
 	pdAppendHwmField(json, "stackHwm_sip_server_task", pdSipServerStackHwmBytes());
 	pdAppendHwmField(json, "stackHwm_udp_receiver_task", pdStackHwmBytes(PD_UDP_RECEIVER_TASK_NAME));
@@ -1471,7 +1477,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// all-zero/null, so tests/interop/interop.py's JSON parsing never has to
 	// special-case platform -- matching this route's existing "counters read
 	// 0, arrays empty" convention for the unattached/host case (docs/API.md).
-	json << ",\"freeHeap\":0,\"minFreeHeap\":0,\"minFreeHeapSpiram\":0,\"resetReason\":\"n/a\"";
+	json << ",\"freeHeap\":0,\"minFreeHeap\":0,\"minFreeHeapSpiram\":0,\"minFreeHeapInternal\":0,\"resetReason\":\"n/a\"";
 	json << ",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
 	        "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
 	        "\"stackHwm_conf_mix_tick\":null";
