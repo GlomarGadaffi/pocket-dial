@@ -29,6 +29,21 @@ Before any PR can be merged into `main`, it must receive at least **two approval
 - [ ] **Seed Format In Lockstep**: A change to the seed record in `src/Helpers/DeviceConfig.hpp` is mirrored in `docs/flasher/index.html` in the same PR.
 - [ ] **Docs Ship With The Change**: A new or re-gated endpoint updates `docs/API.md` and `docs/API_TESTS.md`; a partition or flash-procedure change updates `docs/FLASHING.md`.
 
+### C. Working Directory Convention (Multi-Agent / Multi-Contributor Sessions)
+
+If more than one contributor (human or agent) may be working against this
+repository at the same time, keep the **primary/shared clone on `main`** at
+all times and do branch work in a **separate git worktree** per branch
+(`git worktree add <path> <branch>`), not by checking a topic branch out
+directly in the shared clone. Two contributors' sessions can otherwise race
+on the same working directory — one switching branches out from under the
+other mid-task — with no error, just confusing, silent-later failures
+(a build or `git add` quietly operating on the wrong branch). This applies
+regardless of tooling; if your environment doesn't support git worktrees or
+doesn't have access to this convention ahead of time, at minimum push your
+branch to origin frequently so it is never at risk even if someone else's
+tooling doesn't know to look for it in a worktree.
+
 ---
 
 ## 2. Security-Sensitive Areas
