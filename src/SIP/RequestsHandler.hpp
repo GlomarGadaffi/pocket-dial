@@ -1216,9 +1216,18 @@ private:
 	// dispatched. The bool RETURN means "took ownership of the INVITE" and is
 	// true for every refuse() path too, so a caller that must report what really
 	// happened -- the emergency notification does -- has to ask for this.
+	//
+	// `codecRejectedOut` (optional, Issue #314): when non-null, the codec-offer
+	// gate does NOT answer 488 itself on rejection -- it sets *codecRejectedOut
+	// and returns false with nothing sent, so the caller can substitute its own
+	// response. routeEmergencyCall() needs this: its purpose-built 503 (Issue
+	// #166) would otherwise race the generic 488 this gate already sent, giving
+	// one INVITE two final responses. Every other caller passes nullptr and gets
+	// the original behaviour unchanged.
 	bool originateAnchorCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
-		bool respondIfDisconnected, bool* placedOut = nullptr);
+		bool respondIfDisconnected, bool* placedOut = nullptr,
+		bool* codecRejectedOut = nullptr);
 
 	// First anchor media bridge with no active call, or nullptr if every slot is
 	// busy (onAnchorInvite() then answers 503 Service Unavailable, mirroring the

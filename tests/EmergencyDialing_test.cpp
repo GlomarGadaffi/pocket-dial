@@ -90,17 +90,10 @@ namespace
 		return RequestsHandler::getMessageFromPool(raw, emAddr(ip));
 	}
 
-	std::shared_ptr<SipMessage> emInvite(const std::string& fromExt, const std::string& toExt,
-		const std::string& ip, const std::string& callId)
+	std::shared_ptr<SipMessage> emInviteWithBody(const std::string& fromExt,
+		const std::string& toExt, const std::string& ip, const std::string& callId,
+		const std::string& body)
 	{
-		std::string body =
-			"v=0\r\n"
-			"o=- 0 0 IN IP4 " + ip + "\r\n"
-			"s=-\r\n"
-			"c=IN IP4 " + ip + "\r\n"
-			"t=0 0\r\n"
-			"m=audio 10000 RTP/AVP 0\r\n"
-			"a=rtpmap:0 PCMU/8000\r\n";
 		std::string raw =
 			"INVITE sip:" + toExt + "@server SIP/2.0\r\n"
 			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKi" + callId + "\r\n"
@@ -113,6 +106,36 @@ namespace
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		return RequestsHandler::getMessageFromPool(raw, emAddr(ip));
+	}
+
+	std::shared_ptr<SipMessage> emInvite(const std::string& fromExt, const std::string& toExt,
+		const std::string& ip, const std::string& callId)
+	{
+		std::string body =
+			"v=0\r\n"
+			"o=- 0 0 IN IP4 " + ip + "\r\n"
+			"s=-\r\n"
+			"c=IN IP4 " + ip + "\r\n"
+			"t=0 0\r\n"
+			"m=audio 10000 RTP/AVP 0\r\n"
+			"a=rtpmap:0 PCMU/8000\r\n";
+		return emInviteWithBody(fromExt, toExt, ip, callId, body);
+	}
+
+	// Issue #314: PCMA only, no PCMU line at all -- the exact offer #311's codec
+	// gate rejects on every server-terminated leg, originateAnchorCall's included.
+	std::shared_ptr<SipMessage> emInvitePcma(const std::string& fromExt, const std::string& toExt,
+		const std::string& ip, const std::string& callId)
+	{
+		std::string body =
+			"v=0\r\n"
+			"o=- 0 0 IN IP4 " + ip + "\r\n"
+			"s=-\r\n"
+			"c=IN IP4 " + ip + "\r\n"
+			"t=0 0\r\n"
+			"m=audio 10000 RTP/AVP 8\r\n"
+			"a=rtpmap:8 PCMA/8000\r\n";
+		return emInviteWithBody(fromExt, toExt, ip, callId, body);
 	}
 
 	// A handler with ext 101 registered and the wire captured.
@@ -348,6 +371,79 @@ TEST(EmergencyDialing, ANineOneOneDialIsNeverAnsweredTwice)
 		}
 	}
 	EXPECT_EQ(finals, 1) << "exactly one final response, got " << finals << ":\n" << b.wire.dump();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PCMA-only offer: 503, and specifically not #311's generic 488 (Issue #314)
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(EmergencyDialing, PcmaOnlyOfferGetsThePurposeBuiltFiveOhThreeNotTheGenericFourEightEight)
+{
+	Bench b;
+	ASSERT_NE(b.loopback(), nullptr);
+	ASSERT_TRUE(b.loopback()->isConnected())
+		<< "the trunk must be UP for this test -- a disconnected trunk hits the "
+		<< "\"no trunk\" path above for an unrelated reason";
+
+	b.handler->handle(emInvitePcma("101", "911", "192.168.77.11", "em-911-pcma"));
+
+	EXPECT_TRUE(b.wire.saw("SIP/2.0 503"))
+		<< "a codec-rejected 911 offer must still get 911's own 503, not 488:\n" << b.wire.dump();
+	EXPECT_FALSE(b.wire.saw("488 Not Acceptable Here"))
+		<< "originateAnchorCall's generic codec-gate response must not reach a 911 caller:\n"
+		<< b.wire.dump();
+	EXPECT_TRUE(b.wire.saw("Emergency call could not be routed"))
+		<< "same purpose-built reason phrase as the no-trunk case:\n" << b.wire.dump();
+	EXPECT_TRUE(b.wire.saw("no G.711 codec offered"))
+		<< "the Warning text must say what actually went wrong, not claim a trunk outage:\n"
+		<< b.wire.dump();
+	EXPECT_FALSE(b.wire.saw("no outbound trunk connected"))
+		<< "the trunk IS connected in this test -- that Warning text would be false:\n"
+		<< b.wire.dump();
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "")
+		<< "a codec-rejected offer must never reach makeCall()";
+}
+
+TEST(EmergencyDialing, PcmaOnlyNineOneOneIsNeverAnsweredTwice)
+{
+	// Guards the #314 fix's own hazard: routeEmergencyCall must build its 503
+	// only because originateAnchorCall's codec gate stayed silent (codecRejectedOut
+	// requested) -- if that contract slips, the handset gets both the gate's 488
+	// AND this function's 503 for one INVITE.
+	Bench b;
+	ASSERT_TRUE(b.loopback()->isConnected());
+
+	b.handler->handle(emInvitePcma("101", "911", "192.168.77.11", "em-911-pcma-once"));
+
+	int finals = 0;
+	for (const auto& s : b.wire.sent)
+	{
+		if (s.rfind("SIP/2.0 4", 0) == 0 || s.rfind("SIP/2.0 5", 0) == 0 ||
+		    s.rfind("SIP/2.0 6", 0) == 0 || s.rfind("SIP/2.0 2", 0) == 0)
+		{
+			++finals;
+		}
+	}
+	EXPECT_EQ(finals, 1) << "exactly one final response, got " << finals << ":\n" << b.wire.dump();
+}
+
+TEST(EmergencyDialing, OrdinaryTrunkCallsStillGetTheGenericFourEightEightForPcmaOnly)
+{
+	// #314 must not weaken originateAnchorCall's own codec gate for its other
+	// callers -- only routeEmergencyCall opts into the silent/substitute path.
+	// A plain 555 dial (onAnchorInvite, same function, codecRejectedOut=nullptr)
+	// must still get the original 488 unchanged.
+	Bench b;
+	ASSERT_TRUE(b.loopback()->isConnected());
+
+	b.handler->handle(emInvitePcma("101", "555", "192.168.77.11", "em-555-pcma"));
+
+	EXPECT_TRUE(b.wire.saw("488 Not Acceptable Here"))
+		<< "a non-emergency PCMA-only offer must keep #311's original behaviour:\n"
+		<< b.wire.dump();
+	EXPECT_FALSE(b.wire.saw("SIP/2.0 503"))
+		<< "555 has no purpose-built substitute response -- it must not gain one:\n"
+		<< b.wire.dump();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
