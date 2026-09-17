@@ -62,6 +62,11 @@ bool MediaBridge::startBridge(const std::string& handsetIp, uint16_t handsetPort
 	_participantId = participantId;
 	_busPort.store(busPortId, std::memory_order_release);
 	_active.store(true, std::memory_order_release);
+	// Issue #280: fresh call, fresh failure bookkeeping -- a previous call on
+	// this pooled bridge slot must never carry its write-failure history (or
+	// its "has this ever worked" flag) into a brand new one.
+	_consecutiveWriteFailures.store(0, std::memory_order_release);
+	_hasWrittenSuccessfully.store(false, std::memory_order_release);
 
 	// ANCHOR mode: the anchor's inbound audio is delivered through RequestsHandler's
 	// single rx callback, which fans out to feedRx() on the bridge owning the
@@ -171,10 +176,13 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 		return;
 	}
 
-	// ANCHOR mode: hand the PCM16 samples to the anchor
+	// ANCHOR mode: hand the PCM16 samples to the anchor. Issue #280: the
+	// result is no longer discarded -- recordWriteAudioResult() lets
+	// isAudioDegraded() (polled by RequestsHandler's tick() sweep) notice a
+	// genuinely broken write path instead of pumping audio into it forever.
 	if (_anchor)
 	{
-		_anchor->writeAudio(_participantId, decoded, decodedCount);
+		recordWriteAudioResult(_anchor->writeAudio(_participantId, decoded, decodedCount));
 	}
 }
 
@@ -264,7 +272,10 @@ void MediaBridge::feedMohTick(const uint8_t* ulawTick, size_t n)
 	size_t decodedCount = RtpReceiver::mulawDecodeBuffer(ulawTick, toDecode, decoded);
 	if (decodedCount == 0) return;
 
-	_anchor->writeAudio(std::string_view(participantIdBuf, participantIdLen), decoded, decodedCount);
+	// Issue #280: same result-tracking as onHandsetRtp() above -- this is the
+	// OTHER of the two mutually-exclusive writers (this bridge is held, so
+	// onHandsetRtp() is discarding rather than writing right now).
+	recordWriteAudioResult(_anchor->writeAudio(std::string_view(participantIdBuf, participantIdLen), decoded, decodedCount));
 }
 
 void MediaBridge::mohTapTrampoline(void* ctx, const uint8_t* ulawTick, size_t n)
@@ -433,4 +444,6 @@ void MediaBridge::stopBridge()
 	_playoutBuffer.clear();
 	_callID.clear();
 	_participantId.clear();
+	_consecutiveWriteFailures.store(0, std::memory_order_release);
+	_hasWrittenSuccessfully.store(false, std::memory_order_release);
 }
