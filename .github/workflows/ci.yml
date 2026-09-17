@@ -547,6 +547,35 @@ jobs:
                  build
           echo "Heap-poisoning profile builds (esp32s3 / eth)."
 
+  # Job 2b-ii: Heap-TRACE build (issue #273).
+  # Distinct from the poisoning job above and answering a different question:
+  # poisoning asks "is memory being corrupted", tracing asks "who is holding
+  # memory that never comes back". #273's internal-DRAM leak has been measured
+  # twice on two firmware revisions with no candidate allocator, and
+  # HEAP_TRACE_LEAKS is IDF's own tool for exactly that.
+  #
+  # This leg exists because main/HeapLeakProbe.cpp is wrapped entirely in
+  # `#if CONFIG_HEAP_TRACING`, which is OFF in every other build -- so the
+  # default matrix compiles that file to nothing and would report green on
+  # code it never parsed. Same reasoning as the poisoning job: one leg is
+  # enough to prove the profile still compiles and links, which is what rots.
+  # Actually exercising the trace needs the board.
+  build-heap-trace:
+    name: Build Firmware (heap trace / leak probe)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build with HEAP_TRACING_STANDALONE + HEAP_TASK_TRACKING
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target esp32s3
+          idf.py -D SIP_TRANSPORT=eth                  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_trace"                  build
+          echo "Heap-trace profile builds (esp32s3 / eth); HeapLeakProbe.cpp actually compiled."
+
   # Job 2c: Waveshare ESP32-S3-ETH board build.
   # PD_ETH_BOARD=waveshare (main/CMakeLists.txt) is a second pin map for the
   # 'eth' transport, documented and FATAL_ERROR-guarded like a maintained

@@ -42,6 +42,7 @@
 #include "IPHelper.hpp"
 #include "SmtpClient.hpp"
 #include "host_compat.h"
+#include "HeapLeakProbe.hpp"   // issue #273 leak probe (no-op unless CONFIG_HEAP_TRACING)
 
 static const char *TAG = "main_display";
 
@@ -623,6 +624,12 @@ static void captive_decay_task(void *pvParameters) {
 }
 
 extern "C" void app_main(void) {
+    // Issue #273: arms the internal-DRAM leak probe. No-op unless
+    // CONFIG_HEAP_TRACING is set (sdkconfig.defaults.heap_trace only).
+    // MUST be here rather than a global constructor -- constructors run
+    // before the scheduler exists; see HeapLeakProbe.hpp.
+    pdHeapLeakProbeStart();
+
     ESP_LOGI(TAG, "================================================");
     ESP_LOGI(TAG, " POCKET-DIAL ESP-IDF DISPLAY CONTROLLER");
     ESP_LOGI(TAG, "================================================");

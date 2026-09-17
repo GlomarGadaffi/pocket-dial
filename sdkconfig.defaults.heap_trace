@@ -1,0 +1,126 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Heap-TRACE profile (issue #273). Layered ON TOP of sdkconfig.defaults —
+# later files win:
+#
+#   idf.py -B C:\pdtrace -D SIP_TRANSPORT=eth \
+#          -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_trace" \
+#          build
+#
+# This is a BUG-FINDING build, not a shipping one. Do not cut a release from it.
+#
+# Distinct from sdkconfig.defaults.heap_debug, and they answer different
+# questions — do not combine them without thinking:
+#
+#   heap_debug  = HEAP_POISONING_COMPREHENSIVE. "Is memory being CORRUPTED?"
+#                 Catches uninitialised reads and use-after-free.
+#   heap_trace  = this file. "WHO is holding memory that never comes back?"
+#                 Catches leaks and names the allocator.
+#
+# Enabling both is legal but the poisoning cost lands on every allocation
+# while the trace is recording every allocation, which on a board already
+# carrying real-time audio will distort timing enough to change behaviour
+# you are trying to observe. Pick one per boot.
+#
+# WHY THIS EXISTS
+# ---------------
+# #273's internal-DRAM leak has been measured twice on two firmware revisions
+# — symptomatic exhaustion at 218–276 s of uptime, HTTP thread spawns failing,
+# W5500 DMA bounce-buffer allocations failing, board still alive 76–91 minutes
+# later — with no candidate allocator. #295's /api/status gauges
+# (freeHeapInternal, largestFreeBlockInternal, and the MALLOC_CAP_DMA pair)
+# answer how much and how fast. They cannot answer WHO, and that is the only
+# question left.
+#
+# HEAP_TRACE_LEAKS records every allocation and deletes the record on free, so
+# whatever remains in the buffer at dump time is by construction what leaked,
+# with the call stack that allocated it. main/HeapLeakProbe.cpp arms it at boot
+# and dumps at 120/240/360/900 s, bracketing the measured onset.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The trace itself. STANDALONE keeps records in a buffer on the device
+# (HeapLeakProbe.cpp puts that buffer in PSRAM, so the instrument does not
+# consume the internal DRAM it is measuring). TOHOST would need a host-side
+# JTAG collector we do not have set up.
+CONFIG_HEAP_TRACING_STANDALONE=y
+
+# Depth of the recorded call stack per allocation. The default is 2, which for
+# this bug would routinely stop inside a wrapper and name the same handful of
+# allocator shims for every finding.
+#
+# WAS 8, RAISED TO 16 after a full night of #278 work established that 8 is not
+# enough for C++. Three separate reasons, all measured on .244, not reasoned:
+#
+#   1. STACK_OFFSET is 2 (heap_trace.inc:29) and lands INSIDE the allocator,
+#      not above it. The four distinct depth-1 addresses in the first census
+#      symbolized to heap_caps_malloc_default / heap_caps_malloc / calloc /
+#      malloc. So frames[0] and frames[1] are plumbing on every single record.
+#
+#   2. libstdc++ eats most of the rest. A std::string allocation spends frames
+#      2-6 on _M_create / _M_mutate / _M_append / append / operator+=, leaving
+#      exactly ONE frame of program code out of eight.
+#
+#   3. Worse than "shallow": whole growth patterns become INVISIBLE. The
+#      operator+= chain in SipMessage::toString() (see #316) is deep enough to
+#      exhaust the 8-frame budget before reaching any resolvable caller, so a
+#      search for its call sites finds nothing even though the allocation is
+#      genuinely there. That mis-attributed the RING_SIZE=8 control/treatment
+#      run by 17x (reported 512 B, actual 8740 B) until madmax symbolized every
+#      frame of every site rather than grepping for expected line numbers.
+#
+# Consequence worth keeping: every call-site attribution taken at depth 8 is a
+# LOWER BOUND, including the control run's. Whole-heap gauges do not have this
+# problem, which is why they stayed the load-bearing evidence throughout.
+#
+# Cost: 8 more pointers in each of alloced_by[] and freed_by[], so +64 B per
+# record, ~256 KB more at 4000 records. That buffer is in PSRAM (see
+# HeapLeakProbe.cpp), so it costs the internal-DRAM measurement nothing.
+#
+# Captures taken at depth 8 and depth 16 are NOT directly comparable: the site
+# key is the full frame array, so the same allocation hashes to a different
+# site. Re-baseline rather than diffing across the change.
+CONFIG_HEAP_TRACING_STACK_DEPTH=16
+
+# Attributes outstanding heap to the OWNING TASK. Independent of the trace and
+# worth having alongside it: when a call stack is uninformative (a shared
+# allocator, a lambda, an IDF internal), "which task is holding 40 KB of
+# internal RAM" often identifies the subsystem on its own. Reported by
+# HeapLeakProbe.cpp at each dump.
+CONFIG_HEAP_TASK_TRACKING=y
+
+# NOT set, on purpose:
+#
+#   CONFIG_HEAP_POISONING_COMPREHENSIVE — that is heap_debug's job, see above.
+#
+#   CONFIG_HEAP_ABORT_WHEN_ALLOCATION_FAILS — this bug's whole signature is
+#   allocations FAILING (pthread task creation, spicommon_dma_setup_priv_buffer).
+#   Aborting on the first failure would kill the board at the exact moment the
+#   trace becomes interesting, and would skip the graceful out-of-memory paths
+#   that produced the observed degraded-but-alive behaviour. Same reasoning
+#   heap_debug gives for leaving it off, only more so here.
+
+# ── ipc0 stack headroom: HYPOTHESIS, not a diagnosed fix ─────────────────────
+# On one boot in three, the board took a stack-canary watchpoint in ipc0 --
+# IDF's own inter-processor-call task, not ours -- immediately after
+# "cfgschema: schema up-to-date" and long before the probe's first dump. It has
+# not recurred, so this is reasoning, not a diagnosis, and it is recorded here
+# as such.
+#
+# The reasoning: CONFIG_ESP_IPC_TASK_STACK_SIZE defaults to 1280 bytes on the
+# ESP32-S3 (esp_system/Kconfig:486). Both options above deepen EVERY
+# allocation's call chain -- HEAP_TRACING_STACK_DEPTH now walks and records
+# SIXTEEN backtrace frames per malloc (raised from 8, see above), and
+# HEAP_TASK_TRACKING adds nested
+# multi_heap_malloc calls for its own bookkeeping. Any task already close to
+# its ceiling gets pushed past it, and at 1280 bytes ipc0 is the thinnest
+# margin on the system. That predicts a rare, timing-dependent overflow in
+# whichever task allocates while deepest -- which is what was seen.
+#
+# Costs ~1.5 KB more internal DRAM, the resource under study. Negligible
+# against ~300 KB, but stated rather than glossed, because an instrument that
+# consumes what it measures is this file's whole stated concern.
+#
+# DISCRIMINATING EVIDENCE, if it recurs: a canary trip is a watchpoint, so the
+# panic dump carries ipc0's backtrace at the moment of overflow. heap_trace_*
+# or esp_backtrace_* frames in it confirm this; their absence refutes it and
+# the cause is elsewhere. Do not treat non-recurrence as confirmation.
+CONFIG_ESP_IPC_TASK_STACK_SIZE=2048
