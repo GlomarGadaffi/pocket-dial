@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include "esp_log.h"
+#include "esp_task_wdt.h"   // Issue #235: rtp_media_rx TWDT subscription
 #endif
 
 namespace
@@ -636,6 +637,20 @@ void RtpReceiver::runLoop()
 	bool     haveLastSeq = false;
 	uint16_t lastSeq     = 0;
 
+	// Issue #235: subscribe to the Task Watchdog (see ConferenceRoom::runDriver's
+	// identical comment for the full reasoning). Like rtp_media_tx, this task is
+	// created and destroyed with every stream, so it MUST unsubscribe before
+	// exiting below. Safe to feed on every loop wake, including a timeout: the
+	// 500 ms SO_RCVTIMEO above guarantees a wake at least that often even with
+	// zero inbound traffic, well inside the 5 s default TWDT timeout -- so this
+	// is never fed "on a lie" the way a busy-spin subscriber might be.
+	esp_err_t wdtErr = esp_task_wdt_add(NULL);
+	if (wdtErr != ESP_OK)
+	{
+		ESP_LOGE("RtpReceiver", "esp_task_wdt_add failed (%s) -- rtp_media_rx stalls will go undetected",
+			esp_err_to_name(wdtErr));
+	}
+
 	while (!_stopRequested.load(std::memory_order_acquire))
 	{
 		if (sock < 0)
@@ -647,6 +662,15 @@ void RtpReceiver::runLoop()
 		socklen_t   fromLen = sizeof(from);
 		int n = static_cast<int>(recvfrom(sock, buffer, sizeof(buffer), 0,
 			reinterpret_cast<sockaddr*>(&from), &fromLen));
+
+		// Fed on every wake -- the 500 ms recv timeout bounds how long this can
+		// go silent even with no inbound packets, same reasoning as the comment
+		// above. Harmless no-op if the subscription above failed.
+		if (wdtErr == ESP_OK)
+		{
+			(void)esp_task_wdt_reset();
+		}
+
 		if (n <= 0)
 		{
 			// Timeout (EAGAIN) or socket closed by stop(): re-check the stop flag.
@@ -711,6 +735,11 @@ void RtpReceiver::runLoop()
 		{
 			sink(pkt.payload, pkt.payloadLen, pkt.timestamp, pkt.seq);
 		}
+	}
+
+	if (wdtErr == ESP_OK)
+	{
+		(void)esp_task_wdt_delete(NULL);
 	}
 
 	// This task OWNS its socket: close the local fd and clear the shared slot so a

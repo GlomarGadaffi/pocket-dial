@@ -4,6 +4,7 @@
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "esp_log.h"
+#include "esp_task_wdt.h"   // Issue #235: conf_mix_tick TWDT subscription
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #endif
@@ -177,12 +178,42 @@ RtpSender* ConferenceRoom::senderForCall(const std::string& callID)
 void ConferenceRoom::runDriver()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Issue #235: subscribe to the Task Watchdog so a wedged tick() (stuck on a
+	// lock, a runaway loop inside MixBus) produces a logged, controlled reset
+	// instead of silent dead air on every leg. Subscribed/fed/unsubscribed on
+	// THIS task (conf_mix_tick) only -- see main/esp_main*.cpp's sip_server_task
+	// comment for why esp_task_wdt_reset() cannot be called on another task's
+	// behalf. Unlike sip_server_task (subscribed once at boot, never
+	// unsubscribed), this task is created and destroyed with every conference
+	// (startDriver()/stopDriver()), so it MUST unsubscribe before exiting below
+	// -- a subscribed handle that is deleted without esp_task_wdt_delete() keeps
+	// the TWDT waiting for a reset that can never come, turning a clean,
+	// unremarkable conference teardown into a guaranteed watchdog panic on the
+	// next timeout, not a missing safety net but an actively worse one.
+	esp_err_t wdtErr = esp_task_wdt_add(NULL);
+	if (wdtErr != ESP_OK)
+	{
+		ESP_LOGE("ConferenceRoom", "esp_task_wdt_add failed (%s) -- conf_mix_tick stalls will go undetected",
+			esp_err_to_name(wdtErr));
+	}
+
 	TickType_t next = xTaskGetTickCount();
 	const TickType_t period = pdMS_TO_TICKS(TICK_MS);
 	while (!_stopRequested.load(std::memory_order_acquire))
 	{
 		vTaskDelayUntil(&next, period);
 		_bus.tick();
+		// Fed once per TICK_MS (20 ms), far inside the 5 s default TWDT timeout.
+		// Harmless no-op if the subscription above failed.
+		if (wdtErr == ESP_OK)
+		{
+			(void)esp_task_wdt_reset();
+		}
+	}
+
+	if (wdtErr == ESP_OK)
+	{
+		(void)esp_task_wdt_delete(NULL);
 	}
 #else
 	auto next = std::chrono::steady_clock::now();

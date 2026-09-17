@@ -4,6 +4,7 @@
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "esp_log.h"
+#include "esp_task_wdt.h"   // Issue #235: udp_receiver_task TWDT subscription
 static const char* UDP_TAG = "UdpServer";
 #endif
 
@@ -167,6 +168,25 @@ void UdpServer::receiveLoop()
 	senderEndPoint = {};
 	int len = sizeof(senderEndPoint);
 
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Issue #235: subscribe to the Task Watchdog, same reasoning as
+	// sip_server_task (main/esp_main*.cpp). Unlike the three per-call media
+	// tasks (rtp_media_tx/rx, conf_mix_tick), this task is started once from
+	// SipServer's constructor and only stops in UdpServer::closeServer() at
+	// shutdown/reboot -- never during ordinary operation -- so it subscribes
+	// once and is fed forever, matching sip_server_task's own pattern. The
+	// unsubscribe below on loop exit is defensive, not load-bearing today: if
+	// closeServer() is ever called while the board keeps running, this keeps
+	// a clean stop from turning into a delayed spurious panic instead of
+	// silently relying on "this path is never taken in practice."
+	esp_err_t wdtErr = esp_task_wdt_add(NULL);
+	if (wdtErr != ESP_OK)
+	{
+		ESP_LOGE(UDP_TAG, "esp_task_wdt_add failed (%s) -- udp_receiver_task stalls will go undetected",
+			esp_err_to_name(wdtErr));
+	}
+#endif
+
 	while (_keepRunning)
 	{
 		senderEndPoint = {};
@@ -178,6 +198,16 @@ void UdpServer::receiveLoop()
 		bytesReceived = recvfrom(_sockfd, buffer, BUFFER_SIZE, 0,
 			reinterpret_cast<struct sockaddr*>(&senderEndPoint), &len);
 #endif
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		// Fed on every wake -- this socket's 500 ms recv timeout (openSocket())
+		// bounds how long a quiet period can go unfed, same reasoning as
+		// RtpReceiver's identical comment. Harmless no-op if the subscription
+		// above failed.
+		if (wdtErr == ESP_OK)
+		{
+			(void)esp_task_wdt_reset();
+		}
+#endif
 		if (!_keepRunning || bytesReceived <= 0) continue;
 		// Issue #81: zero-copy hand-off — a view of the bytes recvfrom() just wrote
 		// into this loop's own stack buffer, valid until the next iteration
@@ -186,6 +216,12 @@ void UdpServer::receiveLoop()
 		// view before this call returns (see the OnNewMessageEvent comment above).
 		_onNewMessageEvent(std::string_view(buffer, static_cast<size_t>(bytesReceived)), senderEndPoint);
 	}
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	if (wdtErr == ESP_OK)
+	{
+		(void)esp_task_wdt_delete(NULL);
+	}
+#endif
 }
 
 int UdpServer::send(const struct sockaddr_in& address, const std::string& buffer)
