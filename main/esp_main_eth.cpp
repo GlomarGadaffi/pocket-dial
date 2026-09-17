@@ -65,9 +65,9 @@
 #include "Syslog.hpp"
 #include "TimeSync.hpp"
 #include "SmtpClient.hpp"
+#include "HeapLeakProbe.hpp"   // issue #273 leak probe (no-op unless CONFIG_HEAP_TRACING)
 #if defined(PD_ETH_HAS_SD)
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive writer
-#include "HeapLeakProbe.hpp"   // issue #273 leak probe (no-op unless CONFIG_HEAP_TRACING)
 #endif
 
 // ── Tag for ESP_LOG ────────────────────────────────────────────────────────
