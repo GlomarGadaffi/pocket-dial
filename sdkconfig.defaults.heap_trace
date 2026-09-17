@@ -45,11 +45,40 @@ CONFIG_HEAP_TRACING_STANDALONE=y
 
 # Depth of the recorded call stack per allocation. The default is 2, which for
 # this bug would routinely stop inside a wrapper and name the same handful of
-# allocator shims for every finding. 8 is enough to get out of IDF's internals
-# and into project code — #273's own panic needed four frames to get from the
-# task entry point to the flash write, and a leak's interesting frame is
-# usually further out than a crash's.
-CONFIG_HEAP_TRACING_STACK_DEPTH=8
+# allocator shims for every finding.
+#
+# WAS 8, RAISED TO 16 after a full night of #278 work established that 8 is not
+# enough for C++. Three separate reasons, all measured on .244, not reasoned:
+#
+#   1. STACK_OFFSET is 2 (heap_trace.inc:29) and lands INSIDE the allocator,
+#      not above it. The four distinct depth-1 addresses in the first census
+#      symbolized to heap_caps_malloc_default / heap_caps_malloc / calloc /
+#      malloc. So frames[0] and frames[1] are plumbing on every single record.
+#
+#   2. libstdc++ eats most of the rest. A std::string allocation spends frames
+#      2-6 on _M_create / _M_mutate / _M_append / append / operator+=, leaving
+#      exactly ONE frame of program code out of eight.
+#
+#   3. Worse than "shallow": whole growth patterns become INVISIBLE. The
+#      operator+= chain in SipMessage::toString() (see #316) is deep enough to
+#      exhaust the 8-frame budget before reaching any resolvable caller, so a
+#      search for its call sites finds nothing even though the allocation is
+#      genuinely there. That mis-attributed the RING_SIZE=8 control/treatment
+#      run by 17x (reported 512 B, actual 8740 B) until madmax symbolized every
+#      frame of every site rather than grepping for expected line numbers.
+#
+# Consequence worth keeping: every call-site attribution taken at depth 8 is a
+# LOWER BOUND, including the control run's. Whole-heap gauges do not have this
+# problem, which is why they stayed the load-bearing evidence throughout.
+#
+# Cost: 8 more pointers in each of alloced_by[] and freed_by[], so +64 B per
+# record, ~256 KB more at 4000 records. That buffer is in PSRAM (see
+# HeapLeakProbe.cpp), so it costs the internal-DRAM measurement nothing.
+#
+# Captures taken at depth 8 and depth 16 are NOT directly comparable: the site
+# key is the full frame array, so the same allocation hashes to a different
+# site. Re-baseline rather than diffing across the change.
+CONFIG_HEAP_TRACING_STACK_DEPTH=16
 
 # Attributes outstanding heap to the OWNING TASK. Independent of the trace and
 # worth having alongside it: when a call stack is uninformative (a shared
@@ -78,8 +107,9 @@ CONFIG_HEAP_TASK_TRACKING=y
 #
 # The reasoning: CONFIG_ESP_IPC_TASK_STACK_SIZE defaults to 1280 bytes on the
 # ESP32-S3 (esp_system/Kconfig:486). Both options above deepen EVERY
-# allocation's call chain -- HEAP_TRACING_STACK_DEPTH=8 walks and records eight
-# backtrace frames per malloc, and HEAP_TASK_TRACKING adds nested
+# allocation's call chain -- HEAP_TRACING_STACK_DEPTH now walks and records
+# SIXTEEN backtrace frames per malloc (raised from 8, see above), and
+# HEAP_TASK_TRACKING adds nested
 # multi_heap_malloc calls for its own bookkeeping. Any task already close to
 # its ceiling gets pushed past it, and at 1280 bytes ipc0 is the thinnest
 # margin on the system. That predicts a rare, timing-dependent overflow in
