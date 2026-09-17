@@ -683,7 +683,13 @@ std::string SipMessage::toString() const
 void SipMessage::toString(std::string& out) const
 {
 	out.clear();
-	out.reserve(_startLine.size() + 2 + _body.size() + 64);
+	// Issue #316: the reserve must cover the header lines too, or std::string
+	// reallocates partway through the loop below on essentially every call --
+	// exactly the grow-copy-free churn this out-param form exists to avoid.
+	// Exact rather than approximate: no fudge factor to keep in sync by hand.
+	std::size_t need = _startLine.size() + 2 + _body.size() + 2;
+	for (const auto& line : _headerLines) need += line.size() + 2;
+	out.reserve(need);
 	out += _startLine;
 	out += "\r\n";
 	for (const auto& line : _headerLines)
