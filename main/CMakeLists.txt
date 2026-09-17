@@ -234,3 +234,23 @@ if(SIP_CONSTRAINED)
         POCKETDIAL_MSG_POOL=8)
     message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8)")
 endif()
+
+# PcapCapture.hpp has always advertised itself as "compile-time tunable
+# (-DPOCKETDIAL_PCAP_RING_SIZE=N)", but nothing translated that CMake variable
+# into a compiler define, so `idf.py -D POCKETDIAL_PCAP_RING_SIZE=8` silently
+# built the default 64. A silent no-op is the worst possible behaviour for a
+# knob used in a control/treatment experiment: the treatment build is identical
+# to the control, onset does not move, and the honest-looking conclusion is
+# "the ring is not the cause." Plumbed here so the claim in the header is true.
+#
+# The ring holds the full bytes of the largest SIP message each slot has ever
+# seen, in internal DRAM, and capture is unconditional. Measured on .244 at
+# 64 slots: ~52 KB held at steady state (#278).
+if(DEFINED POCKETDIAL_PCAP_RING_SIZE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        POCKETDIAL_PCAP_RING_SIZE=${POCKETDIAL_PCAP_RING_SIZE})
+    # Printed so the build log PROVES the override took. Do not remove: without
+    # it, the only way to tell a real result from a failed override is to go
+    # reading compile_commands.json after the fact.
+    message(STATUS "SipServer: pcap ring size OVERRIDDEN to ${POCKETDIAL_PCAP_RING_SIZE} (default 64)")
+endif()
