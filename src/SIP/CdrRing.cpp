@@ -87,10 +87,7 @@ namespace
 	// length or otherwise depends on 2 specifically. At depth 1, back-to-
 	// back call teardowns arriving faster than one NVS write completes
 	// start dropping one call sooner than they used to -- same kind of
-	// delay the design already tolerates, not a new failure mode. Each
-	// blob is CdrRingBlob::kCapacity bytes (~4.5 KB with
-	// POCKETDIAL_CDR_RECORDS=32); halving the depth halves this queue's
-	// fixed, never-freed internal-RAM cost from ~9 KB to ~4.5 KB.
+	// delay the design already tolerates, not a new failure mode.
 	constexpr size_t kQueueDepth = 1;
 
 	QueueHandle_t& cdrPersistQueue()
@@ -142,8 +139,8 @@ namespace
 	// Idempotent. Called once from load() (already the class's single-
 	// threaded, before-any-handler-dispatches boot hook -- see its doc
 	// comment) rather than lazily from the first persist(): that would
-	// otherwise make the very first call teardown pay for xQueueCreate AND
-	// xTaskCreatePinnedToCore, on the SIP thread or a PSRAM-stacked task, in
+	// otherwise make the very first call teardown pay for xQueueCreateWithCaps
+	// AND xTaskCreatePinnedToCore, on the SIP thread or a PSRAM-stacked task, in
 	// the middle of real-time work -- the same reasoning CdrArchive.cpp's
 	// init() documents for forcing its own queue to construct at boot.
 	void ensureWriterTaskStarted()
@@ -151,10 +148,28 @@ namespace
 		static bool started = false;
 		if (started) return;
 		started = true;
-		cdrPersistQueue() = xQueueCreate(kQueueDepth, sizeof(CdrRingBlob));
+		// Issue #315 (follow-up to #319's depth reduction): the queue's OWN
+		// storage (kQueueDepth * CdrRingBlob::kCapacity, ~4.5 KB at depth 1)
+		// now lives in PSRAM instead of internal DRAM -- a different question
+		// from #277's rule, and does not violate it. #277 forbids a task whose
+		// STACK is in PSRAM from touching flash, because cache-disable during
+		// the flash op makes PSRAM unreadable and the task cannot even
+		// execute (its own stack is unreadable). This queue's storage is
+		// data, not a stack, and xQueueReceive() below fully copies an item
+		// OUT of that storage into `blob` -- a function-static that already
+		// lives in internal RAM (see cdrPersistWriterTask's comment) -- before
+		// this task does anything flash-related. By the time nvs_set_str()
+		// disables the cache, the PSRAM-backed queue storage has not been
+		// touched since the copy completed and is not touched again until the
+		// NEXT xQueueReceive(), well after cache is re-enabled. Net effect:
+		// this queue's fixed, never-freed cost against internal DRAM -- #315's
+		// original 9046 B, or #319's already-halved ~4.5 KB -- is now ~0.
+		// Must be paired with vQueueDeleteWithCaps(), not vQueueDelete() --
+		// see below.
+		cdrPersistQueue() = xQueueCreateWithCaps(kQueueDepth, sizeof(CdrRingBlob), MALLOC_CAP_SPIRAM);
 		if (cdrPersistQueue() == nullptr)
 		{
-			ESP_LOGE("CdrRing", "xQueueCreate failed -- CDR ring will not persist across reboot");
+			ESP_LOGE("CdrRing", "xQueueCreateWithCaps failed -- CDR ring will not persist across reboot");
 			started = false;   // allow a retry on a later load() (there is none today, but cheap to allow)
 			return;
 		}
@@ -172,7 +187,11 @@ namespace
 			nullptr, 1, nullptr, 0) != pdPASS)
 		{
 			ESP_LOGE("CdrRing", "xTaskCreate cdr_persist failed -- CDR ring will not persist across reboot");
-			vQueueDelete(cdrPersistQueue());
+			// Issue #315: created with xQueueCreateWithCaps() above, so it must
+			// be torn down with the matching vQueueDeleteWithCaps(), not
+			// vQueueDelete() -- the plain form does not know how to free
+			// PSRAM-backed queue storage.
+			vQueueDeleteWithCaps(cdrPersistQueue());
 			cdrPersistQueue() = nullptr;
 			started = false;
 		}
@@ -391,7 +410,7 @@ void CdrRing::persist()
 	// Guard the handle (same convention TelephonyAnchorClient.cpp's
 	// _wsWorkQueue uses): xQueueSend on a null handle is a FreeRTOS
 	// configASSERT, not a safe no-op, and ensureWriterTaskStarted() can leave
-	// the queue null if xQueueCreate/xTaskCreatePinnedToCore failed under
+	// the queue null if xQueueCreateWithCaps/xTaskCreatePinnedToCore failed under
 	// memory pressure -- exactly the condition #273 was investigating, so
 	// this path degrading to "CDR not persisted this call" instead of a
 	// second crash matters more here than almost anywhere else in the tree.
