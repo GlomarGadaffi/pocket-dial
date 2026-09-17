@@ -438,8 +438,15 @@ static void sip_server_task(void* pvParameters)
         if (nowSec - lastHeartbeat >= 30)
         {
             lastHeartbeat = nowSec;
-            ESP_LOGI(TAG, "Heartbeat — IP: %s  Uptime: %lus",
-                     s_ip_addr.c_str(), nowSec);
+            // Reset reason repeated on every heartbeat, not just the one-shot
+            // boot-time log above: a serial reader that attaches after boot
+            // (this board's USB-JTAG port does not re-enumerate on reset, so
+            // there is no signal telling a late-attaching reader it missed
+            // anything) would otherwise never learn why the board last came
+            // up. This line is guaranteed to repeat within 30 s of attaching
+            // at any point in the session.
+            ESP_LOGI(TAG, "Heartbeat — IP: %s  Uptime: %lus  ResetReason: %s",
+                     s_ip_addr.c_str(), nowSec, pdResetReasonString(esp_reset_reason()));
         }
     }
 
