@@ -92,6 +92,31 @@ public:
 	// Check if the bridge is currently active
 	bool isActive() const { return _active.load(std::memory_order_acquire); }
 
+	// Issue #280: true once a call whose audio path was genuinely working has
+	// then failed kMaxConsecutiveWriteFailures writes in a row, with no
+	// success in between. onHandsetRtp()/feedMohTick() are the only writers,
+	// so a caller (RequestsHandler's tick() sweep) can poll this instead of
+	// the write path having to know anything about SIP teardown.
+	//
+	// Gated on _hasWrittenSuccessfully (advisor caught this, verified against
+	// the real call-setup ordering rather than taken on faith): the INBOUND
+	// anchor path pre-warms TelephonyAnchorClient's POST stream during local
+	// ringing so it's normally live before the handset ever answers, but
+	// answerCall()'s own fallback re-opens it AFTER the ACK already went to
+	// the handset if that pre-warm didn't take -- a real ~1s TLS handshake
+	// window (this codebase's own comments on the S3's software ECDHE cost)
+	// in which the handset can legitimately be sending RTP into a socket that
+	// isn't live yet. "Never worked yet" and "was working, now isn't" are
+	// different failure shapes, and only the second one is what #280 is
+	// actually about -- a connection that never got established isn't
+	// "degraded," it just hasn't finished starting.
+	bool isAudioDegraded() const
+	{
+		return _active.load(std::memory_order_acquire) &&
+			_hasWrittenSuccessfully.load(std::memory_order_acquire) &&
+			_consecutiveWriteFailures.load(std::memory_order_acquire) >= kMaxConsecutiveWriteFailures;
+	}
+
 	// Route one inbound PCM chunk from the anchor to this bridge's playout buffer IFF this
 	// bridge is active and serving `participantId`. Returns true if it consumed the chunk. The
 	// anchor exposes a SINGLE rx callback; RequestsHandler owns it and fans out to the bridge that
@@ -177,6 +202,17 @@ private:
 	// the short numeric participant ids kMohParticipantIdBufSize sizes for.
 	static constexpr size_t kCallIdBufSize = 128;
 
+	// Issue #280: how many consecutive AnchorClient::writeAudio() failures on
+	// one bridge mean "this leg's audio path is actually broken", not "one
+	// transient short write". Both writers run on a 20 ms cadence
+	// (onHandsetRtp per handset RTP packet, feedMohTick per HoldMusic tick),
+	// so 25 is ~500 ms of unbroken failure -- long enough that a single dropped
+	// TCP segment or one slow poll cannot trip it, short enough that a genuinely
+	// dead anchor connection is caught well inside the multi-second timescale
+	// #273's own investigation cared about, not left silently degraded for
+	// the rest of the call.
+	static constexpr int kMaxConsecutiveWriteFailures = 25;
+
 	// Hand this bridge's MixBus port back (Active -> Draining) and forget it. Caller
 	// MUST hold _mutex. Idempotent: a no-op when no port is held or in ANCHOR mode.
 	void releaseBusPortLocked();
@@ -238,6 +274,39 @@ private:
 	// (RequestsHandler's engine lock, not this class's own _mutex) — same
 	// single-writer assumption _callID/_participantId already make.
 	int _mohTapId = -1;
+
+	// Issue #280: count of consecutive AnchorClient::writeAudio() failures on
+	// the ACTIVE call, reset on every success and by startBridge()/stopBridge().
+	// Written from whichever of onHandsetRtp()/feedMohTick() is currently
+	// calling writeAudio() -- setHeld() routes handset audio to one or the
+	// other, so the two are not NORMALLY concurrent, though a hold/resume
+	// transition could in principle interleave one packet from each. Not
+	// worth a lock either way: both are plain atomic ops, so the worst a race
+	// does is under- or over-count a single frame at a transition boundary,
+	// nothing isAudioDegraded()'s ~500ms threshold would ever notice.
+	std::atomic<int> _consecutiveWriteFailures{0};
+
+	// Issue #280: true once ANY writeAudio() has succeeded on the current
+	// call. See isAudioDegraded()'s doc comment for why this gate exists --
+	// a connection still coming up must never look "degraded" just because
+	// it hasn't finished starting yet.
+	std::atomic<bool> _hasWrittenSuccessfully{false};
+
+	// Issue #280: record one writeAudio() outcome. Called from both writers
+	// right after the call, so the counters reflect the ACTUAL result rather
+	// than each writer reimplementing the same bookkeeping.
+	void recordWriteAudioResult(bool ok)
+	{
+		if (ok)
+		{
+			_hasWrittenSuccessfully.store(true, std::memory_order_release);
+			_consecutiveWriteFailures.store(0, std::memory_order_release);
+		}
+		else
+		{
+			_consecutiveWriteFailures.fetch_add(1, std::memory_order_acq_rel);
+		}
+	}
 
 	mutable std::mutex _mutex;
 };

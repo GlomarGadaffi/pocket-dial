@@ -13,6 +13,7 @@
 #include "MediaBridge.hpp"
 #include "RtpReceiver.hpp"
 #include "RtpSender.hpp"
+#include "AnchorClient.hpp"
 #include "LoopbackAnchorClient.hpp"
 #include "HoldMusic.hpp"
 
@@ -380,4 +381,186 @@ TEST(MediaBridge, StopBridgeReleasesTheHeldTapSoItDoesNotLeakIntoTheNextCall) {
 	// filled above) and this would return -1.
 	EXPECT_GE(moh.addTap([](void*, const uint8_t*, size_t) {}, nullptr), 0)
 		<< "stopBridge() must have released its tap";
+}
+
+// ── Issue #280: writeAudio() failure propagation ──────────────────────────────
+// LoopbackAnchorClient (the Fixture above) always succeeds, so it cannot drive
+// isAudioDegraded() -- these tests need an AnchorClient whose writeAudio()
+// outcome the test controls directly.
+
+namespace
+{
+	class ControllableAnchorClient : public AnchorClient
+	{
+	public:
+		bool init(const std::string&, const std::string&, const std::string&, const std::string&) override { return true; }
+		bool start() override { return true; }
+		void stop() override {}
+		bool isConnected() const override { return true; }
+		bool makeCall(const std::string&, std::string* = nullptr) override { return true; }
+		bool answerCall(const std::string&) override { return true; }
+		bool dropCall(const std::string&) override { return true; }
+		void setEventCallback(EventCallback) override {}
+		bool writeAudio(std::string_view, const int16_t*, size_t) override { return writeSucceeds; }
+		void registerAudioRxCallback(AudioRxCallback) override {}
+		void tick() override {}
+
+		bool writeSucceeds = true;
+	};
+
+	struct DegradeFixture
+	{
+		RtpReceiver receiver;
+		RtpSender sender;
+		ControllableAnchorClient anchor;
+		MediaBridge bridge;
+
+		DegradeFixture()
+		{
+			bridge.init(&receiver, &sender, &anchor);
+		}
+
+		// Drives onHandsetRtp() `n` times with the anchor's current writeSucceeds
+		// value -- one call per (simulated) 20 ms handset RTP frame.
+		void pumpHandsetFrames(int n)
+		{
+			const auto tick = ulawTick(0xFF, HoldMusic::BYTES_PER_TICK);
+			for (int i = 0; i < n; ++i)
+			{
+				bridge.onHandsetRtp(tick.data(), tick.size());
+			}
+		}
+	};
+}
+
+TEST(MediaBridgeWriteAudioFailure, NeverDegradedIfItHasNeverSucceededYet) {
+	// Advisor caught this before it shipped, verified against the real
+	// call-setup ordering rather than taken on faith: the INBOUND anchor path
+	// pre-warms the POST stream during local ringing so it's normally live by
+	// the time the handset answers, but answerCall()'s own fallback re-opens
+	// it AFTER the ACK already went to the handset if that pre-warm didn't
+	// take -- a real ~1s TLS-handshake window in which the handset can
+	// legitimately be sending RTP into a socket that isn't live yet. A
+	// connection that has NEVER worked is "still starting," not "degraded" --
+	// only a connection that WAS working and then broke is what #280 means by
+	// that word. Without this gate, tick()'s sweep would tear down a healthy
+	// call during ordinary (if slow) connection setup.
+	DegradeFixture f;
+	ASSERT_TRUE(f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1"));
+	ASSERT_TRUE(f.sender.stop("call-1"));   // issue #135
+
+	f.anchor.writeSucceeds = false;
+	f.pumpHandsetFrames(100);   // far past kMaxConsecutiveWriteFailures (25)
+
+	EXPECT_FALSE(f.bridge.isAudioDegraded())
+		<< "a connection that has never had a single successful write must "
+		   "never be reported degraded, no matter how many failures pile up "
+		   "while it's still starting";
+
+	// The moment it actually comes up, normal degrade-on-failure behavior
+	// applies again.
+	f.anchor.writeSucceeds = true;
+	f.pumpHandsetFrames(1);
+	f.anchor.writeSucceeds = false;
+	f.pumpHandsetFrames(25);
+	EXPECT_TRUE(f.bridge.isAudioDegraded())
+		<< "once it has genuinely worked at least once, it can degrade normally";
+}
+
+TEST(MediaBridgeWriteAudioFailure, NotDegradedBelowThreshold) {
+	DegradeFixture f;
+	ASSERT_TRUE(f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1"));
+	ASSERT_TRUE(f.sender.stop("call-1"));   // issue #135
+
+	f.pumpHandsetFrames(1);   // establish "has worked at least once"
+	f.anchor.writeSucceeds = false;
+	f.pumpHandsetFrames(24);   // one short of MediaBridge::kMaxConsecutiveWriteFailures (25)
+
+	EXPECT_FALSE(f.bridge.isAudioDegraded())
+		<< "24 consecutive failures must not yet trip the threshold";
+}
+
+TEST(MediaBridgeWriteAudioFailure, DegradedAtThreshold) {
+	DegradeFixture f;
+	ASSERT_TRUE(f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1"));
+	ASSERT_TRUE(f.sender.stop("call-1"));   // issue #135
+
+	f.pumpHandsetFrames(1);   // establish "has worked at least once"
+	f.anchor.writeSucceeds = false;
+	f.pumpHandsetFrames(25);
+
+	EXPECT_TRUE(f.bridge.isAudioDegraded())
+		<< "25 consecutive failures (~500ms at 20ms/frame) must trip the threshold";
+}
+
+TEST(MediaBridgeWriteAudioFailure, ASingleSuccessResetsTheStreak) {
+	DegradeFixture f;
+	ASSERT_TRUE(f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1"));
+	ASSERT_TRUE(f.sender.stop("call-1"));   // issue #135
+
+	f.pumpHandsetFrames(1);   // establish "has worked at least once"
+	f.anchor.writeSucceeds = false;
+	f.pumpHandsetFrames(24);
+	f.anchor.writeSucceeds = true;
+	f.pumpHandsetFrames(1);
+	f.anchor.writeSucceeds = false;
+	f.pumpHandsetFrames(24);   // would be 49 straight if the streak weren't reset
+
+	EXPECT_FALSE(f.bridge.isAudioDegraded())
+		<< "one successful write between two failure runs must reset the streak, "
+		   "not just delay tripping it";
+}
+
+TEST(MediaBridgeWriteAudioFailure, DegradedThroughFeedMohTickToo) {
+	// feedMohTick() is the OTHER writer (the bridge is held) -- same counter,
+	// same threshold, no separate accounting.
+	DegradeFixture f;
+	ASSERT_TRUE(f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1"));
+	ASSERT_TRUE(f.sender.stop("call-1"));   // issue #135
+	f.bridge.setHeld(true);
+
+	const auto tick = ulawTick(0xFF, HoldMusic::BYTES_PER_TICK);
+	f.bridge.feedMohTick(tick.data(), tick.size());   // establish "has worked at least once"
+	f.anchor.writeSucceeds = false;
+	for (int i = 0; i < 25; ++i)
+	{
+		f.bridge.feedMohTick(tick.data(), tick.size());
+	}
+
+	EXPECT_TRUE(f.bridge.isAudioDegraded());
+}
+
+TEST(MediaBridgeWriteAudioFailure, NotDegradedWhenInactive) {
+	DegradeFixture f;
+	EXPECT_FALSE(f.bridge.isAudioDegraded())
+		<< "an idle bridge (never started) must never report degraded";
+}
+
+TEST(MediaBridgeWriteAudioFailure, StoppingAndRestartingClearsThePreviousCallsStreak) {
+	// MediaBridge instances are pooled (POCKETDIAL_MAX_ANCHOR_CALLS-sized
+	// array) and reused across calls -- a fresh call on a previously-degraded
+	// slot must start clean, not inherit the last caller's failure history
+	// (including its "has this ever worked" flag).
+	DegradeFixture f;
+	ASSERT_TRUE(f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1"));
+	ASSERT_TRUE(f.sender.stop("call-1"));   // issue #135
+	f.pumpHandsetFrames(1);   // establish "has worked at least once"
+	f.anchor.writeSucceeds = false;
+	f.pumpHandsetFrames(25);
+	ASSERT_TRUE(f.bridge.isAudioDegraded());
+
+	f.bridge.stopBridge();
+	f.anchor.writeSucceeds = true;
+	ASSERT_TRUE(f.bridge.startBridge("127.0.0.1", 5006, "call-2", "part-2"));
+	ASSERT_TRUE(f.sender.stop("call-2"));   // issue #135
+
+	EXPECT_FALSE(f.bridge.isAudioDegraded())
+		<< "a brand new call on a reused bridge slot must not start pre-degraded";
+
+	// And the new call still degrades normally on its own merits, once it has
+	// worked at least once.
+	f.pumpHandsetFrames(1);
+	f.anchor.writeSucceeds = false;
+	f.pumpHandsetFrames(25);
+	EXPECT_TRUE(f.bridge.isAudioDegraded());
 }
