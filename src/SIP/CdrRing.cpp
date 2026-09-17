@@ -76,14 +76,22 @@ namespace
 	}
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	// Queue depth 2: one blob potentially in flight (being written) plus one
-	// more pending. Each blob is CdrRingBlob::kCapacity bytes (~4.5 KB with
-	// POCKETDIAL_CDR_RECORDS=32), so this is a fixed ~9 KB of internal RAM,
-	// allocated once at boot and never freed. Safe to drop beyond this depth
-	// (see persist()'s comment): every blob is a COMPLETE ring snapshot, not
-	// one incremental record, so a dropped blob's contents are entirely
-	// superseded by whichever later blob the writer task does drain.
-	constexpr size_t kQueueDepth = 2;
+	// Queue depth 1 (issue #315): persist() already sends non-blocking
+	// (xQueueSend(..., 0), see its comment) and already treats a dropped
+	// blob as fine -- every blob is a COMPLETE ring snapshot, not one
+	// incremental record, so a dropped blob's contents are entirely
+	// superseded by whichever later blob the writer task does drain, and
+	// persistence for that particular call is merely delayed until the
+	// next one ends. Depth 2 bought one extra buffered blob before that
+	// (already-accepted) degradation path kicks in; nothing reads queue
+	// length or otherwise depends on 2 specifically. At depth 1, back-to-
+	// back call teardowns arriving faster than one NVS write completes
+	// start dropping one call sooner than they used to -- same kind of
+	// delay the design already tolerates, not a new failure mode. Each
+	// blob is CdrRingBlob::kCapacity bytes (~4.5 KB with
+	// POCKETDIAL_CDR_RECORDS=32); halving the depth halves this queue's
+	// fixed, never-freed internal-RAM cost from ~9 KB to ~4.5 KB.
+	constexpr size_t kQueueDepth = 1;
 
 	QueueHandle_t& cdrPersistQueue()
 	{
