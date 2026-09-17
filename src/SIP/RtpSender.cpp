@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_task_wdt.h"   // Issue #235: rtp_media_tx TWDT subscription
 #elif defined(__linux__)
 #include <unistd.h>
 #include <sys/socket.h>
@@ -339,6 +340,19 @@ void RtpSender::runLoop()
 	const TickType_t period = pdMS_TO_TICKS(RtpSender::PTIME_MS);
 	TickType_t lastWake = xTaskGetTickCount();
 
+	// Issue #235: subscribe to the Task Watchdog (see ConferenceRoom::runDriver's
+	// identical comment for the full reasoning). This task is created and
+	// destroyed with every stream (start()/stop()), so it MUST unsubscribe
+	// before exiting below -- an unsubscribed-but-still-tracked handle left
+	// behind by a clean call teardown would otherwise guarantee a watchdog
+	// panic on the next timeout instead of protecting anything.
+	esp_err_t wdtErr = esp_task_wdt_add(NULL);
+	if (wdtErr != ESP_OK)
+	{
+		ESP_LOGE("RtpSender", "esp_task_wdt_add failed (%s) -- rtp_media_tx stalls will go undetected",
+			esp_err_to_name(wdtErr));
+	}
+
 	while (!_stopRequested.load(std::memory_order_acquire))
 	{
 		buildRtpHeader(packet, /*marker=*/firstPkt, RtpSender::PAYLOAD_TYPE_PCMU,
@@ -377,9 +391,21 @@ void RtpSender::runLoop()
 		++seq;
 		timestamp += RtpSender::SAMPLES_PER_PKT;   // 160 per 20 ms frame
 
+		// Fed once per 20 ms frame, far inside the 5 s default TWDT timeout.
+		// Harmless no-op if the subscription above failed.
+		if (wdtErr == ESP_OK)
+		{
+			(void)esp_task_wdt_reset();
+		}
+
 		// Pace at exactly 20 ms; vTaskDelayUntil compensates for send jitter so the
 		// stream does not drift relative to the receiver's playout clock.
 		vTaskDelayUntil(&lastWake, period);
+	}
+
+	if (wdtErr == ESP_OK)
+	{
+		(void)esp_task_wdt_delete(NULL);
 	}
 
 	// This task OWNS its socket: close the local fd and clear the shared slot so a new

@@ -10,6 +10,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_task_wdt.h"   // Issue #235: sip_server_task TWDT subscription
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_timer.h"
@@ -431,8 +432,29 @@ static void sip_server_task(void *pvParameters) {
     // Publish with release so the http/status tasks' acquire-load sees a fully
     // constructed object the moment they observe the non-null pointer.
     g_sipServer.store(srv, std::memory_order_release);
+
+    // Issue #235: this build inherited CONFIG_ESP_TASK_WDT_PANIC=y from
+    // sdkconfig.defaults (set by #225) with no matching subscription anywhere,
+    // so a wedged tick() here would starve the IDLE task and panic with no
+    // diagnostic trail instead of the controlled, logged reset every other
+    // transport main already gets. esp_task_wdt_add(NULL) subscribes the
+    // CALLING (this) task; only this task's own loop below may feed it via
+    // esp_task_wdt_reset() -- see main/esp_main.cpp's identical comment for
+    // the full reasoning. A failed subscription is logged and non-fatal:
+    // better an unmonitored SIP task than no SIP task.
+    esp_err_t wdtErr = esp_task_wdt_add(NULL);
+    if (wdtErr != ESP_OK) {
+        ESP_LOGE("SipTask", "esp_task_wdt_add failed (%s) -- this task's stalls will go undetected",
+                 esp_err_to_name(wdtErr));
+    }
+
     while (1) {
         srv->getHandler().tick();
+        // Fed once per 30 ms loop, far inside the 5 s default TWDT timeout.
+        // Harmless no-op if the subscription above failed.
+        if (wdtErr == ESP_OK) {
+            (void)esp_task_wdt_reset();
+        }
         vTaskDelay(pdMS_TO_TICKS(30)); // match Arduino 30ms latency cycle
     }
     vTaskDelete(NULL);
