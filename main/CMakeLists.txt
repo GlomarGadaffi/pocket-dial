@@ -105,6 +105,12 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/SipDigest.cpp"
                             "../src/Helpers/SipSecretStore.cpp"
                             "../src/Helpers/ArpLookup.cpp"
+                            # Issue #282 phase 2: raw esp_eth_transmit()/local IP-MAC
+                            # access for HoldMusic's L2 RTP TX bypass. Was missing from
+                            # this list entirely (PR #324) -- silently uncompiled until
+                            # HoldMusic.cpp's runLoop() became the first real caller and
+                            # the eth-transport builds link-failed on the missing symbols.
+                            "../src/Helpers/EthAccess.cpp"
                             "../src/Helpers/OtaUpdater.cpp"
                             # SNTP wall clock. Additive to steady_clock, never a
                             # replacement: steady_clock stays the clock for every
@@ -153,6 +159,11 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # to every parked leg. Clip lives in PSRAM so the SD card stays out of the
                             # 20 ms media path entirely.
                             "../src/SIP/HoldMusic.cpp"
+                            # L2 TX frame-template primitive (#282 phase 1, PR #297).
+                            # Same gap as EthAccess.cpp above: host-tested only when
+                            # merged, so nothing caught it missing from this list until
+                            # HoldMusic.cpp (phase 2) became the first real caller.
+                            "../src/SIP/L2RtpFrame.cpp"
                             "../src/SIP/BlfSubscriptions.cpp"
                             "../src/SIP/Session.cpp"
                             "../src/SIP/SipClient.cpp"
