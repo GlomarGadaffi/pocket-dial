@@ -1,6 +1,8 @@
 #include "HoldMusic.hpp"
 #include "RtpSender.hpp"
 #include "RtpReceiver.hpp"
+#include "EthAccess.hpp"
+#include "ArpLookup.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -41,6 +43,10 @@ uint32_t rd32(const uint8_t* p)
 constexpr uint16_t kWaveFormatMulaw = 7;
 
 }  // namespace
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+static DMA_ATTR l2rtp::FrameBuffer s_mohL2Frames[HoldMusic::kMaxListeners];
+#endif
 
 bool HoldMusic::parseUlawWav(const uint8_t* data, size_t len,
                              size_t& outOffset, size_t& outBytes)
@@ -297,6 +303,8 @@ int HoldMusic::addListener(const std::string& destIp, uint16_t destPort)
 		l.used = true;
 		l.seq  = 0;
 		l.timestamp = 0;
+		l.l2Ready = false;
+		l.l2ResolveTicks = 0;
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		l.ssrc = esp_random();
 #else
@@ -508,27 +516,83 @@ void HoldMusic::runLoop()
 			// (issue #218) and advances the cursor; false means no clip loaded.
 			if (!tickLocked(payload, taps, tapCount)) continue;
 
-			for (auto& l : _listeners)
+			for (size_t i = 0; i < kMaxListeners; ++i)
 			{
+				Listener& l = _listeners[i];
 				if (!l.used) continue;
-				// Marker on the very first packet of a stream (RFC 3550 §5.1): it tells
-				// the far end this is the start of a talkspurt so it primes its jitter
-				// buffer rather than treating the first frames as late.
-				RtpSender::buildRtpHeader(packet, /*marker=*/(l.seq == 0), PAYLOAD_TYPE_PCMU,
-					l.seq, l.timestamp, l.ssrc);
-				// Check the send. A silently-dropped sendto is exactly the failure that
-				// does not reproduce on a bench: the listener hears a gap, the log says
-				// nothing, and there is no counter to point at. Rate-limited so a
-				// genuinely unreachable peer cannot flood the log at 50 lines/second.
-				const int sent = sendto(_sock, packet, sizeof(packet), 0,
-					reinterpret_cast<const sockaddr*>(&l.dest), sizeof(l.dest));
-				if (sent < 0)
+
+				bool l2Success = false;
+				uint32_t localIp, localGw, localNetmask;
+				
+				// L2 TX bypass
+				if (EthAccess::getLocalIpInfo(localIp, localGw, localNetmask))
 				{
-					++_txErrors;
-					if ((_txErrors % 250u) == 1u)
+					if (!l.l2Ready || (++l.l2ResolveTicks % 250u) == 0u)
 					{
-						ESP_LOGW(TAG, "sendto failed (errno %d), %u dropped so far",
-							errno, static_cast<unsigned>(_txErrors));
+						uint32_t destIpHost = ntohl(l.dest.sin_addr.s_addr);
+						uint32_t nextHopHost = ((destIpHost ^ localIp) & localNetmask) == 0 ? destIpHost : localGw;
+						
+						sockaddr_in nextHopAddr{};
+						nextHopAddr.sin_family = AF_INET;
+						nextHopAddr.sin_addr.s_addr = htonl(nextHopHost);
+
+						auto macOpt = ArpLookup::pdLookupMac(nextHopAddr);
+						if (macOpt.has_value())
+						{
+							l.l2Ep.dstMac = *macOpt;
+							EthAccess::getLocalMac(l.l2Ep.srcMac);
+							l.l2Ep.srcIp = localIp;
+							l.l2Ep.dstIp = destIpHost;
+							l.l2Ep.srcPort = _localPort.load(std::memory_order_acquire);
+							l.l2Ep.dstPort = ntohs(l.dest.sin_port);
+
+							l2rtp::buildTemplate(s_mohL2Frames[i].bytes, l.l2Ep, l.ssrc);
+							l.l2Ready = true;
+						}
+						else
+						{
+							l.l2Ready = false;
+						}
+					}
+
+					if (l.l2Ready)
+					{
+						size_t len = l2rtp::patchTick(s_mohL2Frames[i].bytes, (l.seq == 0),
+							PAYLOAD_TYPE_PCMU, l.seq, l.timestamp, payload, BYTES_PER_TICK, l.l2IpIdent++);
+						
+						if (len > 0 && EthAccess::transmitL2(s_mohL2Frames[i].bytes, len))
+						{
+							l2Success = true;
+						}
+						else
+						{
+							l.l2Ready = false;
+							++_l2TxErrors;
+						}
+					}
+				}
+
+				if (!l2Success)
+				{
+					// Marker on the very first packet of a stream (RFC 3550 §5.1): it tells
+					// the far end this is the start of a talkspurt so it primes its jitter
+					// buffer rather than treating the first frames as late.
+					RtpSender::buildRtpHeader(packet, /*marker=*/(l.seq == 0), PAYLOAD_TYPE_PCMU,
+						l.seq, l.timestamp, l.ssrc);
+					// Check the send. A silently-dropped sendto is exactly the failure that
+					// does not reproduce on a bench: the listener hears a gap, the log says
+					// nothing, and there is no counter to point at. Rate-limited so a
+					// genuinely unreachable peer cannot flood the log at 50 lines/second.
+					const int sent = sendto(_sock, packet, sizeof(packet), 0,
+						reinterpret_cast<const sockaddr*>(&l.dest), sizeof(l.dest));
+					if (sent < 0)
+					{
+						++_txErrors;
+						if ((_txErrors % 250u) == 1u)
+						{
+							ESP_LOGW(TAG, "sendto failed (errno %d), %u dropped so far (plus %u L2 drops)",
+								errno, static_cast<unsigned>(_txErrors), static_cast<unsigned>(_l2TxErrors));
+						}
 					}
 				}
 				++l.seq;

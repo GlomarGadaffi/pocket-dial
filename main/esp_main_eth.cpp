@@ -28,6 +28,7 @@
 #include "esp_task_wdt.h"   // Issue #185: sip_server_task TWDT subscription
 #include "esp_idf_version.h"
 #include "esp_eth.h"
+#include "EthAccess.hpp"
 // W5500 driver headers. ESP-IDF v6.0 split the W5500 MAC/PHY driver out of the
 // core esp_eth component into the standalone `espressif/w5500` managed component
 // (see main/idf_component.yml), which ships these dedicated headers. On v5.x the
@@ -619,6 +620,7 @@ extern "C" void app_main(void)
 
     // ── Initialise W5500 ────────────────────────────────────────────────
     esp_eth_handle_t eth_handle = eth_init_w5500();
+    EthAccess::setEthHandle(eth_handle);
 
     // ── Glue driver to netif ────────────────────────────────────────────
     // Both calls can fail (glue alloc on OOM; attach returns esp_err_t). Discarding
