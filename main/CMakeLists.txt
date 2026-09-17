@@ -111,6 +111,11 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # HoldMusic.cpp's runLoop() became the first real caller and
                             # the eth-transport builds link-failed on the missing symbols.
                             "../src/Helpers/EthAccess.cpp"
+                            # L2 TX frame-template primitive (#282 phase 1, PR #297).
+                            # Same gap as EthAccess.cpp above: host-tested only when
+                            # merged, so nothing caught it missing from this list until
+                            # HoldMusic.cpp (phase 2) became the first real caller.
+                            "../src/Helpers/L2RtpFrame.cpp"
                             "../src/Helpers/OtaUpdater.cpp"
                             # SNTP wall clock. Additive to steady_clock, never a
                             # replacement: steady_clock stays the clock for every
@@ -159,11 +164,6 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # to every parked leg. Clip lives in PSRAM so the SD card stays out of the
                             # 20 ms media path entirely.
                             "../src/SIP/HoldMusic.cpp"
-                            # L2 TX frame-template primitive (#282 phase 1, PR #297).
-                            # Same gap as EthAccess.cpp above: host-tested only when
-                            # merged, so nothing caught it missing from this list until
-                            # HoldMusic.cpp (phase 2) became the first real caller.
-                            "../src/SIP/L2RtpFrame.cpp"
                             "../src/SIP/BlfSubscriptions.cpp"
                             "../src/SIP/Session.cpp"
                             "../src/SIP/SipClient.cpp"
