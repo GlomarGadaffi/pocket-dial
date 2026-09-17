@@ -8044,6 +8044,85 @@ void RequestsHandler::tick()
 			}
 		}
 
+		// Issue #280: a connected (talking OR held) anchor call whose media
+		// bridge has racked up too many consecutive AnchorClient::writeAudio()
+		// failures (MediaBridge::isAudioDegraded()) gets torn down here --
+		// same shape as the no-answer/ACK-deadline reap just above, but
+		// triggered by the write path itself rather than a ring timer. This is
+		// the propagation #280 asked for: writeAudio() already returned false
+		// on every failed write, but nothing ever acted on it, so a leg with a
+		// genuinely broken audio path pumped MoH/handset audio into a dead
+		// connection for the rest of the call instead of tearing down.
+		//
+		// Both Connected and Held are checked, unlike the no-answer/ACK-deadline
+		// reap above (which is Connected-only because its own trigger, an
+		// unACKed 200 OK, cannot happen once a call has been put on hold). #279's
+		// actual failure mode -- MoH playing into a dead connection -- is a HELD
+		// call by definition, so excluding Held here would miss the exact case
+		// this is also meant to close.
+		//
+		// Not excluding isAnchorInbound() either, unlike that same reap: its
+		// exclusion is about a pre-answer concern (an inbound call's own
+		// ACK-timeout semantics don't apply the same way), not about how this
+		// bridge writes audio once connected -- MediaBridge::writeAudio()
+		// failures are identical for both call directions past that point.
+		//
+		// Collected first, same reasoning as expiredCallIds above: endCall()
+		// erases from _sessions, so acting while iterating it would invalidate
+		// the iterator.
+		std::vector<std::string> degradedAnchorCallIds;
+		for (const auto& [callID, session] : _sessions)
+		{
+			if (!session->isAnchor()) continue;
+			if (session->getState() != Session::State::Connected &&
+			    session->getState() != Session::State::Held) continue;
+			MediaBridge* b = bridgeForParticipant(session->getAnchorParticipantId());
+			if (!b)
+			{
+				for (auto& mb : _mediaBridges)
+				{
+					if (mb.isForCallId(callID)) { b = &mb; break; }
+				}
+			}
+			if (b && b->isAudioDegraded())
+			{
+				degradedAnchorCallIds.push_back(callID);
+			}
+		}
+		for (const auto& callID : degradedAnchorCallIds)
+		{
+			auto sit = _sessions.find(callID);
+			if (sit == _sessions.end()) continue;
+			auto session = sit->second;
+			const std::string part = session->getAnchorParticipantId();
+			MediaBridge* b = bridgeForParticipant(part);
+			if (!b)
+			{
+				for (auto& mb : _mediaBridges)
+				{
+					if (mb.isForCallId(callID)) { b = &mb; break; }
+				}
+			}
+			if (b) b->stopBridge();
+			if (!part.empty()) asyncDropCall(part);
+			queueLog("[Telephony] anchor call torn down: audio write repeatedly failed — dropped leg " + part);
+			// CDR src/dest convention differs by direction (same as the no-answer
+			// reap above splits it): outbound treats the local extension as src
+			// and the anchor leg as dest; inbound treats the anchor participant
+			// as src and the (already-answered, since this call is Connected/
+			// Held) local extension as dest.
+			if (session->isAnchorInbound())
+			{
+				endCall(callID, part, session->getDest() ? session->getDest()->getNumber() : "",
+					"anchor audio write failure");
+			}
+			else
+			{
+				endCall(callID, session->getSrc() ? session->getSrc()->getNumber() : "", part,
+					"anchor audio write failure");
+			}
+		}
+
 		// Reap ORPHANED media bridges — active but with NO owning anchor session.
 		// Under a concurrent burst a bridge can outlive its session (a session
 		// reaped/ended while its bridge teardown didn't match, or an Answered

@@ -551,3 +551,157 @@ TEST(AnchorRouting, HoldOnAVirtualLegIsStillRefused)
 	EXPECT_NE(raw.find("SIP/2.0 488"), std::string::npos)
 		<< "777 has no real peer and must still be refused, got:\n" << raw;
 }
+
+TEST(AnchorRouting, TickTearsDownAnAnchorCallAfterRepeatedWriteAudioFailures)
+{
+	// Issue #280 end-to-end: writeAudio() failures used to be logged and
+	// discarded, so a genuinely broken anchor connection pumped handset audio
+	// (or hold music) into nowhere for the rest of the call. This drives a
+	// real 555 dial through RequestsHandler, breaks the anchor connection the
+	// same way a real failed POST write would (LoopbackAnchorClient::
+	// writeAudio() refuses once disconnected -- same observable shape as
+	// TelephonyAnchorClient's real short/failed write), and asserts tick()'s
+	// new sweep actually tears the call down instead of leaving it degraded
+	// forever.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-280"));
+	ASSERT_FALSE(sent.empty());
+
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-280");
+	ASSERT_NE(bridge, nullptr);
+	ASSERT_TRUE(bridge->isActive());
+	ASSERT_FALSE(bridge->isAudioDegraded()) << "must start healthy";
+
+	// One real G.711 20ms frame's worth of mu-law bytes (8 kHz * 20 ms), fed
+	// repeatedly the way the RTP receive task would for a live handset stream.
+	const std::vector<uint8_t> frame(160, 0xFF);
+	bridge->onHandsetRtp(frame.data(), frame.size());   // establish "has worked at least once"
+	ASSERT_FALSE(bridge->isAudioDegraded());
+
+	ASSERT_NE(handler.anchorClientForTest(), nullptr);
+	handler.anchorClientForTest()->stop();   // simulate a dead anchor connection
+
+	for (int i = 0; i < 30; ++i)
+	{
+		bridge->onHandsetRtp(frame.data(), frame.size());
+	}
+	ASSERT_TRUE(bridge->isAudioDegraded())
+		<< "30 writes against a disconnected anchor must cross the failure threshold";
+
+	handler.tick();
+
+	EXPECT_FALSE(handler.getSession("Call-ID: anchor-280").has_value())
+		<< "a degraded anchor leg must be torn down by tick(), not left "
+		   "pumping audio into a dead connection for the rest of the call";
+	EXPECT_FALSE(bridge->isActive())
+		<< "tick() must have released the bridge along with the session";
+}
+
+TEST(AnchorRouting, TickTearsDownAHeldAnchorCallAfterRepeatedMohWriteFailures)
+{
+	// Issue #279's actual shape: the call desmo found stuck was ON HOLD,
+	// MoH playing into a dead anchor connection, no crash and no remote BYE
+	// to notice by. Session::State::Held is NOT Session::State::Connected --
+	// a sweep that only checked Connected (the no-answer/ACK-deadline reap's
+	// own condition, copied without rechecking it here first) would silently
+	// never fire for exactly this case. This is the regression guard for that.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-279"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+
+	sent.clear();
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-279",
+		/*cseq=*/2, "a=sendonly\r\n"));
+	ASSERT_FALSE(sent.empty());
+
+	auto heldSession = handler.getSession("Call-ID: anchor-279");
+	ASSERT_TRUE(heldSession.has_value());
+	ASSERT_EQ(heldSession.value()->getState(), Session::State::Held);
+
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-279");
+	ASSERT_NE(bridge, nullptr);
+	ASSERT_TRUE(bridge->isHeld());
+
+	// While held, MoH ticks (not handset RTP) are what drive writeAudio().
+	const std::vector<uint8_t> tick(160, 0xFF);
+	bridge->feedMohTick(tick.data(), tick.size());   // establish "has worked at least once"
+	ASSERT_FALSE(bridge->isAudioDegraded());
+
+	ASSERT_NE(handler.anchorClientForTest(), nullptr);
+	handler.anchorClientForTest()->stop();   // simulate the dead anchor connection
+
+	for (int i = 0; i < 30; ++i)
+	{
+		bridge->feedMohTick(tick.data(), tick.size());
+	}
+	ASSERT_TRUE(bridge->isAudioDegraded());
+
+	handler.tick();
+
+	EXPECT_FALSE(handler.getSession("Call-ID: anchor-279").has_value())
+		<< "a degraded HELD anchor leg must also be torn down -- this is "
+		   "exactly the #279 shape (MoH into a dead connection, no crash, "
+		   "no remote BYE to notice by)";
+	EXPECT_FALSE(bridge->isActive());
+}
+
+TEST(AnchorRouting, TickDoesNotTearDownAnAnchorCallThatHasNeverWrittenSuccessfully)
+{
+	// Advisor caught this before it shipped: a call whose writeAudio() has
+	// NEVER succeeded yet is "still starting" (e.g. the real anchor client's
+	// pre-warm fallback window while a TLS handshake completes), not
+	// "degraded" -- tick()'s sweep must not tear it down just because its
+	// first N frames arrived before the connection was ready. Same 555 dial
+	// as the sibling test above, except the anchor is broken BEFORE any
+	// frame gets a chance to succeed.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-280-nevergood"));
+	ASSERT_FALSE(sent.empty());
+
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-280-nevergood");
+	ASSERT_NE(bridge, nullptr);
+
+	ASSERT_NE(handler.anchorClientForTest(), nullptr);
+	handler.anchorClientForTest()->stop();   // broken from the very first frame -- no prior success
+
+	const std::vector<uint8_t> frame(160, 0xFF);
+	for (int i = 0; i < 100; ++i)   // far past the failure threshold
+	{
+		bridge->onHandsetRtp(frame.data(), frame.size());
+	}
+	ASSERT_FALSE(bridge->isAudioDegraded())
+		<< "never having succeeded once must never read as degraded, no matter "
+		   "how many failed frames arrive";
+
+	handler.tick();
+
+	EXPECT_TRUE(handler.getSession("Call-ID: anchor-280-nevergood").has_value())
+		<< "tick() must not tear down a call that is still starting, only one "
+		   "that was genuinely working and then broke";
+	EXPECT_TRUE(bridge->isActive());
+}
