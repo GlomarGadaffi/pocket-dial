@@ -3640,7 +3640,9 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// NOT std::move: originateAnchorCall takes its shared_ptr by value, and this
 	// function still needs `data` afterwards to build the failure response from.
 	bool placed = false;
-	if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed))
+	bool codecRejected = false;
+	if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed,
+		&codecRejected))
 	{
 		// The call leg is enqueued. NOW notify: 47 CFR 9.16(b)(2) wants the
 		// notification contemporaneous with the call and not delaying it, and
@@ -3695,15 +3697,22 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	}
 	// A free-text reason phrase (RFC 3261 §7.2) that many handsets display.
 	// "Service Unavailable" is true but says nothing; this says what happened.
+	// Issue #314: same 503 either way, but the Warning text must say what
+	// actually went wrong -- a codec-rejected offer is not a trunk outage, and
+	// telling the caller's UA the wrong reason is the same honesty failure the
+	// 503-vs-404 rationale above was written to avoid.
+	const char* warningDetail = codecRejected
+		? "no G.711 codec offered"
+		: "no outbound trunk connected";
 	response->setHeader("SIP/2.0 503 Emergency Call Not Routable");
 	response->clearBody();
 	response->addHeader("Warning", "399 " + _localIp +
-		" \"Emergency call could not be routed: no outbound trunk connected\"");
+		" \"Emergency call could not be routed: " + warningDetail + "\"");
 	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	_outbox.emplace_back(data->getSource(), std::move(response));
 
-	queueLog("EMERGENCY: " + kind + " from " + from +
-		" COULD NOT BE ROUTED (no trunk connected) - answered 503", true);
+	queueLog("EMERGENCY: " + kind + " from " + from + " COULD NOT BE ROUTED (" +
+		warningDetail + ") - answered 503", true);
 
 	// 503 is enqueued; notify after it, same ordering rule as the routed path.
 	notifyEmergency(emergency, from, dialed, /*routed=*/false);
@@ -3750,7 +3759,7 @@ void RequestsHandler::notifyEmergency(const pbx::EmergencyDial& emergency,
 
 bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller, const std::string& destination,
-	bool respondIfDisconnected, bool* placedOut)
+	bool respondIfDisconnected, bool* placedOut, bool* codecRejectedOut)
 {
 	// Issue #166: this function's bool return means "took ownership of the
 	// INVITE", NOT "the call was placed" -- eight refuse() paths answer 4xx/5xx
@@ -3759,6 +3768,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// default, cleared by refuse() and by the one unwind path that fails without
 	// answering.
 	if (placedOut) *placedOut = true;
+	if (codecRejectedOut) *codecRejectedOut = false;
 	const std::string activeIp = _localIp;
 	const std::string callID(data->getCallID());
 	// The remote target both this response's Contact and every later in-dialog
@@ -3819,6 +3829,16 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// legally answered here.
 	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
 	{
+		if (codecRejectedOut)
+		{
+			// Issue #314: caller asked to build its own response for this reason
+			// (routeEmergencyCall's purpose-built 503) rather than the generic 488
+			// below -- send nothing here, or the handset gets two final responses
+			// to one INVITE.
+			*codecRejectedOut = true;
+			if (placedOut) *placedOut = false;
+			return false;
+		}
 		refuse("SIP/2.0 488 Not Acceptable Here", "no G.711 codec offered");
 		return true;
 	}
