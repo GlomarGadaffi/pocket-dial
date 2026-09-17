@@ -1766,11 +1766,11 @@ namespace AdminAuth
 		auto hmacFromBase = [&](const uint8_t* msg, size_t msgLen) {
 			Sha256 inner = innerBase;
 			inner.update(msg, msgLen);
-			std::array<uint8_t, 32> innerDigest;
+			std::array<uint8_t, kHLen> innerDigest;
 			inner.finalize(innerDigest.data());
 			Sha256 outer = outerBase;
 			outer.update(innerDigest.data(), innerDigest.size());
-			std::array<uint8_t, 32> result;
+			std::array<uint8_t, kHLen> result;
 			outer.finalize(result.data());
 			return result;
 		};

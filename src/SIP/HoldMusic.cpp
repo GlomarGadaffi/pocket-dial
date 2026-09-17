@@ -300,8 +300,7 @@ int HoldMusic::addListener(const std::string& destIp, uint16_t destPort)
 		l.used = true;
 		l.seq  = 0;
 		l.timestamp = 0;
-		l.l2Ready = false;
-		l.l2ResolveTicks = 0;
+		l.l2Channel.reset();
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		l.ssrc = esp_random();
 #else
@@ -519,62 +518,15 @@ void HoldMusic::runLoop()
 				if (!l.used) continue;
 
 				bool l2Success = false;
-				uint32_t localIp, localGw, localNetmask;
-				
-				// L2 TX bypass
-				if (EthAccess::getLocalIpInfo(localIp, localGw, localNetmask))
+
+				// L2 TX bypass (Issues #282 / #329)
+				if (l.l2Channel.updateAddressing(l.dest, _localPort.load(std::memory_order_acquire), l.ssrc))
 				{
-					if (!l.l2Ready || (++l.l2ResolveTicks % 250u) == 0u)
+					l2Success = l.l2Channel.transmit(l.seq == 0, PAYLOAD_TYPE_PCMU, l.seq, l.timestamp,
+						payload, BYTES_PER_TICK);
+					if (!l2Success)
 					{
-						uint32_t destIpHost = ntohl(l.dest.sin_addr.s_addr);
-						uint32_t nextHopHost = ((destIpHost ^ localIp) & localNetmask) == 0 ? destIpHost : localGw;
-						
-						sockaddr_in nextHopAddr{};
-						nextHopAddr.sin_family = AF_INET;
-						nextHopAddr.sin_addr.s_addr = htonl(nextHopHost);
-
-						auto macOpt = ArpLookup::pdLookupMac(nextHopAddr);
-						if (macOpt.has_value())
-						{
-							l.l2Ep.dstMac = *macOpt;
-							EthAccess::getLocalMac(l.l2Ep.srcMac);
-							l.l2Ep.srcIp = localIp;
-							l.l2Ep.dstIp = destIpHost;
-							l.l2Ep.srcPort = _localPort.load(std::memory_order_acquire);
-							l.l2Ep.dstPort = ntohs(l.dest.sin_port);
-
-							l2rtp::buildTemplate(l.l2Template.data(), l.l2Ep, l.ssrc);
-							l.l2Ready = true;
-						}
-						else
-						{
-							l.l2Ready = false;
-						}
-					}
-
-					if (l.l2Ready)
-					{
-						auto frame = l2rtp::DmaFramePool::acquire();
-						if (frame)
-						{
-							std::memcpy(frame.data(), l.l2Template.data(), l2rtp::kHeaderBytes);
-							size_t len = l2rtp::patchTick(frame.data(), (l.seq == 0),
-								PAYLOAD_TYPE_PCMU, l.seq, l.timestamp, payload, BYTES_PER_TICK, l.l2IpIdent++);
-							
-							if (len > 0 && EthAccess::transmitL2(frame.data(), len))
-							{
-								l2Success = true;
-							}
-							else
-							{
-								l.l2Ready = false;
-								++_l2TxErrors;
-							}
-						}
-						else
-						{
-							++_l2TxErrors;
-						}
+						++_l2TxErrors;
 					}
 				}
 

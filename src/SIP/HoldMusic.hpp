@@ -232,11 +232,7 @@ private:
 		sockaddr_in dest{};
 		
 		// L2 RTP TX (Issue #282 / #329)
-		bool            l2Ready = false;
-		l2rtp::Endpoint l2Ep{};
-		uint16_t        l2IpIdent = 0;
-		uint32_t        l2ResolveTicks = 0;
-		std::array<uint8_t, l2rtp::kHeaderBytes> l2Template{};
+		l2rtp::EgressChannel l2Channel{};
 	};
 
 	void freeClipLocked();

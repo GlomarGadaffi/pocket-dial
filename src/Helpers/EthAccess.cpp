@@ -1,4 +1,5 @@
 #include "EthAccess.hpp"
+#include <vector>
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "esp_eth.h"
@@ -48,22 +49,92 @@ namespace EthAccess
 		return esp_read_mac(mac.data(), ESP_MAC_ETH) == ESP_OK;
 	}
 #else
-	// Host stubs
+	// ── Host stubs & test injection ──────────────────────────────────────────
+	namespace
+	{
+		bool s_mockIpAvailable = false;
+		uint32_t s_mockIp = 0;
+		uint32_t s_mockGw = 0;
+		uint32_t s_mockNetmask = 0;
+
+		bool s_mockMacAvailable = false;
+		std::array<uint8_t, 6> s_mockMac{};
+
+		bool s_mockTransmitResult = false;
+		size_t s_mockTransmitCount = 0;
+		std::vector<uint8_t> s_lastTransmittedFrame{};
+	}
+
 	void setEthHandle(void* /*handle*/) {}
-	
-	bool transmitL2(void* /*frame*/, size_t /*len*/) 
-	{ 
-		return false; 
+
+	bool transmitL2(void* frame, size_t len)
+	{
+		if (!s_mockTransmitResult) return false;
+		++s_mockTransmitCount;
+		if (frame != nullptr && len > 0)
+		{
+			const uint8_t* p = static_cast<const uint8_t*>(frame);
+			s_lastTransmittedFrame.assign(p, p + len);
+		}
+		return true;
 	}
-	
-	bool getLocalIpInfo(uint32_t& /*ip*/, uint32_t& /*gw*/, uint32_t& /*netmask*/) 
-	{ 
-		return false; 
+
+	bool getLocalIpInfo(uint32_t& ip, uint32_t& gw, uint32_t& netmask)
+	{
+		if (!s_mockIpAvailable) return false;
+		ip = s_mockIp;
+		gw = s_mockGw;
+		netmask = s_mockNetmask;
+		return true;
 	}
-	
-	bool getLocalMac(std::array<uint8_t, 6>& /*mac*/) 
-	{ 
-		return false; 
+
+	bool getLocalMac(std::array<uint8_t, 6>& mac)
+	{
+		if (!s_mockMacAvailable) return false;
+		mac = s_mockMac;
+		return true;
+	}
+
+	void setMockIpInfo(bool available, uint32_t ip, uint32_t gw, uint32_t netmask)
+	{
+		s_mockIpAvailable = available;
+		s_mockIp = ip;
+		s_mockGw = gw;
+		s_mockNetmask = netmask;
+	}
+
+	void setMockMac(bool available, const std::array<uint8_t, 6>& mac)
+	{
+		s_mockMacAvailable = available;
+		s_mockMac = mac;
+	}
+
+	void setMockTransmitResult(bool success)
+	{
+		s_mockTransmitResult = success;
+	}
+
+	void resetMocks()
+	{
+		s_mockIpAvailable = false;
+		s_mockIp = 0;
+		s_mockGw = 0;
+		s_mockNetmask = 0;
+		s_mockMacAvailable = false;
+		s_mockMac.fill(0);
+		s_mockTransmitResult = false;
+		s_mockTransmitCount = 0;
+		s_lastTransmittedFrame.clear();
+	}
+
+	size_t getMockTransmitCount()
+	{
+		return s_mockTransmitCount;
+	}
+
+	const std::vector<uint8_t>& getLastTransmittedFrame()
+	{
+		return s_lastTransmittedFrame;
 	}
 #endif
 }

@@ -240,9 +240,7 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	_dest          = dest;
 	_callID        = callID;
 	_provider      = provider;
-	_l2Ready       = false;
-	_l2ResolveTicks = 0;
-	_l2IpIdent     = 0;
+	_l2Channel.reset();
 	_stopRequested.store(false, std::memory_order_release);
 	// Mark running BEFORE the task launches so a stop() racing right behind us can't
 	// clear the slot before the task exists. The task clears this LAST, on exit.
@@ -388,64 +386,15 @@ void RtpSender::runLoop()
 		}
 
 		bool l2Success = false;
-		uint32_t localIp, localGw, localNetmask;
 
 		// L2 TX bypass (Issues #282 / #329)
-		if (EthAccess::getLocalIpInfo(localIp, localGw, localNetmask))
+		if (_l2Channel.updateAddressing(dest, static_cast<uint16_t>(_serverRtpPort), ssrc))
 		{
-			if (!_l2Ready || (++_l2ResolveTicks % 250u) == 0u)
+			l2Success = _l2Channel.transmit(firstPkt, RtpSender::PAYLOAD_TYPE_PCMU, seq, timestamp,
+				packet + RtpSender::RTP_HEADER_BYTES, RtpSender::SAMPLES_PER_PKT);
+			if (!l2Success)
 			{
-				uint32_t destIpHost = ntohl(dest.sin_addr.s_addr);
-				uint32_t nextHopHost = ((destIpHost ^ localIp) & localNetmask) == 0 ? destIpHost : localGw;
-
-				sockaddr_in nextHopAddr{};
-				nextHopAddr.sin_family = AF_INET;
-				nextHopAddr.sin_addr.s_addr = htonl(nextHopHost);
-
-				auto macOpt = ArpLookup::pdLookupMac(nextHopAddr);
-				if (macOpt.has_value())
-				{
-					_l2Ep.dstMac = *macOpt;
-					EthAccess::getLocalMac(_l2Ep.srcMac);
-					_l2Ep.srcIp = localIp;
-					_l2Ep.dstIp = destIpHost;
-					_l2Ep.srcPort = static_cast<uint16_t>(_serverRtpPort);
-					_l2Ep.dstPort = ntohs(dest.sin_port);
-
-					l2rtp::buildTemplate(_l2Template.data(), _l2Ep, ssrc);
-					_l2Ready = true;
-				}
-				else
-				{
-					_l2Ready = false;
-				}
-			}
-
-			if (_l2Ready)
-			{
-				auto frame = l2rtp::DmaFramePool::acquire();
-				if (frame)
-				{
-					std::memcpy(frame.data(), _l2Template.data(), l2rtp::kHeaderBytes);
-					size_t len = l2rtp::patchTick(frame.data(), firstPkt,
-						RtpSender::PAYLOAD_TYPE_PCMU, seq, timestamp,
-						packet + RtpSender::RTP_HEADER_BYTES, RtpSender::SAMPLES_PER_PKT,
-						_l2IpIdent++);
-
-					if (len > 0 && EthAccess::transmitL2(frame.data(), len))
-					{
-						l2Success = true;
-					}
-					else
-					{
-						_l2Ready = false;
-						++_l2TxErrors;
-					}
-				}
-				else
-				{
-					++_l2TxErrors;
-				}
+				++_l2TxErrors;
 			}
 		}
 

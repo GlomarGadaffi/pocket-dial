@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 // EthAccess: provides a tiny abstraction for L2 Ethernet transmission and
 // local network info (MAC/IP/Gateway) without exposing ESP-IDF or lwIP headers
@@ -32,6 +33,16 @@ namespace EthAccess
 
 	// Retrieve the local Ethernet MAC address.
 	bool getLocalMac(std::array<uint8_t, 6>& mac);
+
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	// ── Host test injection hooks ────────────────────────────────────────────
+	void setMockIpInfo(bool available, uint32_t ip = 0, uint32_t gw = 0, uint32_t netmask = 0);
+	void setMockMac(bool available, const std::array<uint8_t, 6>& mac = {});
+	void setMockTransmitResult(bool success);
+	void resetMocks();
+	size_t getMockTransmitCount();
+	const std::vector<uint8_t>& getLastTransmittedFrame();
+#endif
 }
 
 #endif // ETH_ACCESS_HPP

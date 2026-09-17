@@ -9,6 +9,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(MSVC)
+    add_compile_options(/Zc:lambda)
+endif()
+
 enable_testing()
 
 include(FetchContent)
@@ -126,6 +130,8 @@ add_executable(sip_parser_tests
     L2RtpFrame_test.cpp
     # Issue #329: shared L2 DMA frame buffer pool.
     DmaFramePool_test.cpp
+    # Issues #282 / #329: L2 egress channel routing, cadence, and fallback tests.
+    L2EgressChannel_test.cpp
     Pbx_test.cpp
     PageZone_test.cpp
     # Issue #74: broadcast/ring-group hold-resume relay. onOk()'s Connected/Held
@@ -417,6 +423,8 @@ add_executable(sip_parser_tests
     ../src/Helpers/L2RtpFrame.cpp
     # Issue #329: shared L2 DMA frame pool.
     ../src/Helpers/DmaFramePool.cpp
+    # Issues #282 / #329: EthAccess host stubs and test injection.
+    ../src/Helpers/EthAccess.cpp
     # TimeSync: the SNTP wall clock. The formatter is pure; the SNTP client is
     # ESP-only, so the host build is PERMANENTLY unsynced — which is exactly the
     # degraded state every caller must branch on, and therefore worth exercising.

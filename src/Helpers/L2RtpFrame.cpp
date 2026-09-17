@@ -1,4 +1,7 @@
 #include "L2RtpFrame.hpp"
+#include "EthAccess.hpp"
+#include "ArpLookup.hpp"
+#include "DmaFramePool.hpp"
 
 #include <cstring>
 
@@ -121,6 +124,71 @@ size_t patchTick(uint8_t* buf, bool marker, uint8_t payloadType,
 	ip[11] = static_cast<uint8_t>(cs & 0xFF);
 
 	return kHeaderBytes + payloadLen;
+}
+
+bool EgressChannel::updateAddressing(const sockaddr_in& dest, uint16_t srcPort, uint32_t ssrc)
+{
+	uint32_t localIp = 0, localGw = 0, localNetmask = 0;
+	if (!EthAccess::getLocalIpInfo(localIp, localGw, localNetmask))
+	{
+		ready = false;
+		return false;
+	}
+
+	if (!ready || (++resolveTicks % 250u) == 0u)
+	{
+		uint32_t destIpHost = ntohl(dest.sin_addr.s_addr);
+		uint32_t nextHopHost = resolveNextHop(destIpHost, localIp, localGw, localNetmask);
+
+		sockaddr_in nextHopAddr{};
+		nextHopAddr.sin_family = AF_INET;
+		nextHopAddr.sin_addr.s_addr = htonl(nextHopHost);
+
+		auto macOpt = ArpLookup::pdLookupMac(nextHopAddr);
+		// Gate ready on BOTH ARP lookup AND getLocalMac HAL return (Review point 2)
+		if (macOpt.has_value() && EthAccess::getLocalMac(ep.srcMac))
+		{
+			ep.dstMac = *macOpt;
+			ep.srcIp = localIp;
+			ep.dstIp = destIpHost;
+			ep.srcPort = srcPort;
+			ep.dstPort = ntohs(dest.sin_port);
+
+			buildTemplate(hdrTemplate.data(), ep, ssrc);
+			ready = true;
+		}
+		else
+		{
+			ready = false;
+		}
+	}
+
+	return ready;
+}
+
+bool EgressChannel::transmit(bool marker, uint8_t payloadType, uint16_t seq, uint32_t timestamp,
+                             const uint8_t* payload, size_t payloadLen)
+{
+	if (!ready)
+	{
+		return false;
+	}
+
+	auto frame = DmaFramePool::acquire();
+	if (!frame)
+	{
+		return false;  // Pool exhausted -> fallback to socket
+	}
+
+	std::memcpy(frame.data(), hdrTemplate.data(), kHeaderBytes);
+	size_t len = patchTick(frame.data(), marker, payloadType,
+	                       seq, timestamp, payload, payloadLen, ipIdent++);
+	if (len == 0)
+	{
+		return false;
+	}
+
+	return EthAccess::transmitL2(frame.data(), len);
 }
 
 }   // namespace l2rtp
