@@ -29,6 +29,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "L2RtpFrame.hpp"
 #elif defined(__linux__)
 #include <netinet/in.h>
 #include <thread>
@@ -42,6 +43,8 @@
 #include <array>
 #include <mutex>
 #include <functional>
+
+#include "L2RtpFrame.hpp"
 
 class RtpSender
 {
@@ -132,6 +135,10 @@ private:
 	std::atomic<bool> _stopRequested{false};
 	std::atomic<bool> _taskRunning{false};
 	sockaddr_in       _dest{};
+
+	// L2 RTP TX (Issue #282 / #329)
+	l2rtp::EgressChannel _l2Channel{};
+	uint32_t             _l2TxErrors = 0;
 #elif defined(__linux__)
 	// Issue #82: real Linux media path (the ESP-only block above was the sole
 	// gap keeping pocket-dial's Linux desktop build signaling-only, per

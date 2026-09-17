@@ -7,6 +7,7 @@
 #include "ArpLookup.hpp"
 
 #include <cstdio>
+#include <map>
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "esp_netif.h"
@@ -112,12 +113,36 @@ namespace ArpLookup
 
 #else  // ── Host stub: no ARP table on the desktop/CI build ──────────────────
 
-	std::optional<Mac> pdLookupMac(const struct sockaddr_in& /*src*/)
+	namespace
 	{
+		std::map<uint32_t, Mac> s_mockArpTable;
+	}
+
+	std::optional<Mac> pdLookupMac(const struct sockaddr_in& src)
+	{
+		if (src.sin_family != AF_INET)
+		{
+			return std::nullopt;
+		}
+		auto it = s_mockArpTable.find(src.sin_addr.s_addr);
+		if (it != s_mockArpTable.end())
+		{
+			return it->second;
+		}
 		// No link layer to inspect off-device. Returning nullopt makes Learn-mode
 		// on host behave like a permanent first-packet miss (accept + defer the
 		// lock), which is the safe, test-friendly default.
 		return std::nullopt;
+	}
+
+	void setMockMac(const struct sockaddr_in& src, const Mac& mac)
+	{
+		s_mockArpTable[src.sin_addr.s_addr] = mac;
+	}
+
+	void clearMockMacs()
+	{
+		s_mockArpTable.clear();
 	}
 
 #endif

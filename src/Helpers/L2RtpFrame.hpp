@@ -5,6 +5,14 @@
 #include <cstddef>
 #include <cstdint>
 
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+#include <lwip/sockets.h>
+#elif defined(__linux__)
+#include <netinet/in.h>
+#elif defined(_WIN32) || defined(_WIN64)
+#include <WinSock2.h>
+#endif
+
 // L2RtpFrame: a static, reusable Ethernet+IPv4+UDP+RTP frame template for one
 // RTP stream, built once at stream start and patched in place every tick.
 //
@@ -146,6 +154,54 @@ namespace l2rtp
 	// this is called -- patchTick() does that internally; exposed here as
 	// its own pure, independently-testable function).
 	uint16_t ipChecksum(const uint8_t* ipHeader20Bytes);
+
+	// Resolves the next-hop IPv4 address (host byte order) for a given destination IP.
+	// If destIp is on the same subnet as localIp (given netmask), next hop is destIp.
+	// Otherwise, next hop is the local default gateway (localGw).
+	inline uint32_t resolveNextHop(uint32_t destIp, uint32_t localIp, uint32_t localGw, uint32_t netmask) noexcept
+	{
+		return ((destIp ^ localIp) & netmask) == 0 ? destIp : localGw;
+	}
+
+	// Determines whether an ARP resolution / refresh is needed.
+	// Returns true if the channel is not yet ready, or if the 250-tick (~5s) cadence has arrived.
+	inline bool shouldResolveArp(bool ready, uint32_t resolveTicks) noexcept
+	{
+		return !ready || ((resolveTicks % 250u) == 0u);
+	}
+
+	// Manages L2 RTP egress state for a single stream (RtpSender or HoldMusic listener).
+	// Encapsulates next-hop resolution, periodic ARP/MAC re-resolution, template caching,
+	// and DMA buffer acquisition/transmission.
+	struct EgressChannel
+	{
+		Endpoint ep{};
+		std::array<uint8_t, kHeaderBytes> hdrTemplate{};
+		bool ready = false;
+		uint32_t resolveTicks = 0;
+		uint16_t ipIdent = 0;
+
+		void reset() noexcept
+		{
+			ready = false;
+			resolveTicks = 0;
+			ipIdent = 0;
+			ep = Endpoint{};
+			hdrTemplate.fill(0);
+		}
+
+		// Checks if addressing needs resolution; queries EthAccess and ArpLookup;
+		// validates HAL returns (both ARP and getLocalMac); updates template if resolved.
+		// Returns true if the channel is ready for L2 transmission.
+		bool updateAddressing(const sockaddr_in& dest, uint16_t srcPort, uint32_t ssrc);
+
+		// Borrows a buffer from DmaFramePool, patches the frame with payload,
+		// and transmits via EthAccess::transmitL2().
+		// Returns true if L2 transmit was successfully queued.
+		// Returns false if pool is empty or transmit failed (caller must fallback to socket).
+		bool transmit(bool marker, uint8_t payloadType, uint16_t seq, uint32_t timestamp,
+		              const uint8_t* payload, size_t payloadLen);
+	};
 }
 
 #endif // L2_RTP_FRAME_HPP

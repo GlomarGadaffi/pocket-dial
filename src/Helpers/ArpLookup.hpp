@@ -53,6 +53,12 @@ namespace ArpLookup
 	// Format a Mac as 12 lowercase hex chars (no separators), e.g. "a1b2c3d4e5f6".
 	// This is the canonical key form used by the device registry. Pure helper.
 	std::string toHex12(const Mac& mac);
+
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	// ── Host test injection helpers ──────────────────────────────────────────
+	void setMockMac(const struct sockaddr_in& src, const Mac& mac);
+	void clearMockMacs();
+#endif
 }
 
 #endif // ARP_LOOKUP_HPP
