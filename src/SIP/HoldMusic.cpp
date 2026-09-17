@@ -3,6 +3,7 @@
 #include "RtpReceiver.hpp"
 #include "EthAccess.hpp"
 #include "ArpLookup.hpp"
+#include "DmaFramePool.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -43,10 +44,6 @@ uint32_t rd32(const uint8_t* p)
 constexpr uint16_t kWaveFormatMulaw = 7;
 
 }  // namespace
-
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-static DMA_ATTR l2rtp::FrameBuffer s_mohL2Frames[HoldMusic::kMaxListeners];
-#endif
 
 bool HoldMusic::parseUlawWav(const uint8_t* data, size_t len,
                              size_t& outOffset, size_t& outBytes)
@@ -546,7 +543,7 @@ void HoldMusic::runLoop()
 							l.l2Ep.srcPort = _localPort.load(std::memory_order_acquire);
 							l.l2Ep.dstPort = ntohs(l.dest.sin_port);
 
-							l2rtp::buildTemplate(s_mohL2Frames[i].bytes, l.l2Ep, l.ssrc);
+							l2rtp::buildTemplate(l.l2Template.data(), l.l2Ep, l.ssrc);
 							l.l2Ready = true;
 						}
 						else
@@ -557,16 +554,25 @@ void HoldMusic::runLoop()
 
 					if (l.l2Ready)
 					{
-						size_t len = l2rtp::patchTick(s_mohL2Frames[i].bytes, (l.seq == 0),
-							PAYLOAD_TYPE_PCMU, l.seq, l.timestamp, payload, BYTES_PER_TICK, l.l2IpIdent++);
-						
-						if (len > 0 && EthAccess::transmitL2(s_mohL2Frames[i].bytes, len))
+						auto frame = l2rtp::DmaFramePool::acquire();
+						if (frame)
 						{
-							l2Success = true;
+							std::memcpy(frame.data(), l.l2Template.data(), l2rtp::kHeaderBytes);
+							size_t len = l2rtp::patchTick(frame.data(), (l.seq == 0),
+								PAYLOAD_TYPE_PCMU, l.seq, l.timestamp, payload, BYTES_PER_TICK, l.l2IpIdent++);
+							
+							if (len > 0 && EthAccess::transmitL2(frame.data(), len))
+							{
+								l2Success = true;
+							}
+							else
+							{
+								l.l2Ready = false;
+								++_l2TxErrors;
+							}
 						}
 						else
 						{
-							l.l2Ready = false;
 							++_l2TxErrors;
 						}
 					}

@@ -116,6 +116,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # merged, so nothing caught it missing from this list until
                             # HoldMusic.cpp (phase 2) became the first real caller.
                             "../src/Helpers/L2RtpFrame.cpp"
+                            # Shared L2 DMA frame pool (#282, #329).
+                            "../src/Helpers/DmaFramePool.cpp"
                             "../src/Helpers/OtaUpdater.cpp"
                             # SNTP wall clock. Additive to steady_clock, never a
                             # replacement: steady_clock stays the clock for every
