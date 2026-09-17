@@ -30,10 +30,15 @@ namespace EthAccess
 		esp_netif_ip_info_t info;
 		if (esp_netif_get_ip_info(netif, &info) != ESP_OK) return false;
 
-		// Convert to host byte order
-		ip      = esp_netif_ip4_makeu32(info.ip);
-		gw      = esp_netif_ip4_makeu32(info.gw);
-		netmask = esp_netif_ip4_makeu32(info.netmask);
+		// esp_ip4_addr_t::addr is a raw uint32_t in NETWORK byte order (the
+		// same convention as sockaddr_in::sin_addr.s_addr) -- esp_netif_ip4_makeu32
+		// is a 4-argument macro that BUILDS an address from four separate octets,
+		// not a byte-order converter for an existing one; calling it with a single
+		// struct argument doesn't even preprocess. esp_netif_htonl is the actual
+		// byte-swap primitive (used the same way in esp_netif_loopback.c).
+		ip      = esp_netif_htonl(info.ip.addr);
+		gw      = esp_netif_htonl(info.gw.addr);
+		netmask = esp_netif_htonl(info.netmask.addr);
 
 		return true;
 	}
