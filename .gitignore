@@ -89,6 +89,7 @@ build_*.log
 b[0-9]*.log
 verify_*.log
 host_test*.log
+export_output.log
 
 # Shareable binary packages (built locally from build_host_ssh; never commit binaries)
 dist/
