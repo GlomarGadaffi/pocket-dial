@@ -44,6 +44,18 @@ doesn't have access to this convention ahead of time, at minimum push your
 branch to origin frequently so it is never at risk even if someone else's
 tooling doesn't know to look for it in a worktree.
 
+A documented convention is easy to miss mid-task, so this repo ships a
+`.githooks/post-checkout` hook that prints a loud (non-blocking) warning if
+the shared clone's own working tree ever ends up off `main`. It does nothing
+until you opt in, once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+It only warns — git has no hook that can block a checkout outright — and it
+only fires in the repo's main working tree, never in a linked worktree.
+
 ---
 
 ## 2. Security-Sensitive Areas
