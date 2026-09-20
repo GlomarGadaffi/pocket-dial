@@ -197,4 +197,65 @@ TEST(TelephonyLogic, ControlWsUrlSchemeRewrite)
 	          "wss://pbx.example.com/callcontrol/ws");
 }
 
+// ── tokenIsExpiringSoon (issue #336) ─────────────────────────────────────────
+// The comparison behind BOTH TelephonyAnchorClient::tokenExpiringSoon() (gates
+// the existing HTTP-side ensureToken() refresh) and requestRestartIfTokenStale()
+// (the new WS-side fix: reconnect-in-place can't rebuild a stale header, so a
+// disconnected/errored WS with an expiring token now requests a full anchor
+// restart instead of retrying forever with the same 401). One comparison,
+// tested once, trusted by both call sites.
+
+constexpr int64_t kMinute = 60LL * 1000000;
+constexpr int64_t kMargin = 5 * kMinute;
+
+TEST(TelephonyLogic, TokenExpiringSoonFalseWellBeforeMargin)
+{
+	// Obtained "now" (age 0) with a full hour of lifetime -- nowhere near the
+	// 5-minute margin.
+	EXPECT_FALSE(tokenIsExpiringSoon(/*now=*/100 * kMinute, /*obtained=*/100 * kMinute,
+	                                 /*lifetime=*/60 * kMinute, kMargin));
+}
+
+TEST(TelephonyLogic, TokenExpiringSoonTrueInsideMargin)
+{
+	// Obtained 56 minutes ago, 60-minute lifetime -- 4 minutes of real life left,
+	// inside the 5-minute margin.
+	EXPECT_TRUE(tokenIsExpiringSoon(/*now=*/156 * kMinute, /*obtained=*/100 * kMinute,
+	                                /*lifetime=*/60 * kMinute, kMargin));
+}
+
+TEST(TelephonyLogic, TokenExpiringSoonTrueAtExactMarginBoundary)
+{
+	// age == lifetime - margin is the documented boundary (>=, not >): exactly
+	// 55 minutes in on a 60-minute/5-minute-margin token must already read as
+	// expiring, not one tick later.
+	EXPECT_TRUE(tokenIsExpiringSoon(/*now=*/155 * kMinute, /*obtained=*/100 * kMinute,
+	                                /*lifetime=*/60 * kMinute, kMargin));
+}
+
+TEST(TelephonyLogic, TokenExpiringSoonTrueAfterActualExpiry)
+{
+	// Well past the JWT's own exp claim, not just inside the refresh margin --
+	// must still read as expiring, not wrap or go false.
+	EXPECT_TRUE(tokenIsExpiringSoon(/*now=*/300 * kMinute, /*obtained=*/100 * kMinute,
+	                                /*lifetime=*/60 * kMinute, kMargin));
+}
+
+TEST(TelephonyLogic, TokenExpiringSoonTrueWhenNeverObtained)
+{
+	// obtainedUs==0 (no token fetched yet) must read as expiring so a client
+	// that has never fetched a token is treated as needing one, not as holding
+	// an eternally-valid one.
+	EXPECT_TRUE(tokenIsExpiringSoon(/*now=*/1000, /*obtained=*/0, /*lifetime=*/60 * kMinute,
+	                                kMargin));
+}
+
+TEST(TelephonyLogic, TokenExpiringSoonTrueWhenLifetimeUnknown)
+{
+	// Same guard, the other missing field: lifetimeUs==0 (decodeJwtLifetimeUs
+	// itself never returns this, but the check exists independently -- pin it
+	// directly rather than only through that function's own fallback).
+	EXPECT_TRUE(tokenIsExpiringSoon(/*now=*/1000, /*obtained=*/500, /*lifetime=*/0, kMargin));
+}
+
 }  // namespace

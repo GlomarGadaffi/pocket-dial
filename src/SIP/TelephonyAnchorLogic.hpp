@@ -240,6 +240,21 @@ inline std::string controlWsUrl(const std::string& baseUrl)
 	return "wss://" + baseUrl + "/callcontrol/ws";
 }
 
+// Issue #336: the pure comparison behind TelephonyAnchorClient::tokenExpiringSoon(),
+// extracted so the decision that gates BOTH the existing HTTP-side token refresh
+// (ensureToken()) and the new WS-side stale-reconnect fix (requestRestartIfTokenStale())
+// is host-tested once rather than trusted twice. Mirrors tokenExpiringSoon()'s own
+// logic exactly: obtainedUs/lifetimeUs == 0 means "no token yet", which must read as
+// expiring (true) so a client that has never fetched one still gets treated as needing
+// one, not as having an eternally-valid token.
+inline bool tokenIsExpiringSoon(int64_t nowUs, int64_t obtainedUs, int64_t lifetimeUs,
+                                 int64_t marginUs)
+{
+	if (obtainedUs == 0 || lifetimeUs == 0) return true;
+	int64_t age = nowUs - obtainedUs;
+	return age >= (lifetimeUs - marginUs);
+}
+
 }  // namespace telephony
 
 #endif // TELEPHONY_ANCHOR_LOGIC_HPP

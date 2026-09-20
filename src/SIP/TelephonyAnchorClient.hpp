@@ -231,6 +231,10 @@ private:
 	static constexpr int kLeakRestartThreshold = 3;
 	// One-shot worker that performs the full stop()/start() reclaim cycle off-SIP.
 	static void restartTaskTrampoline(void* arg);
+	// Issue #336: same _restartRequested mechanism as the leak-count path above,
+	// triggered instead by a disconnected/errored WS with an expiring/expired
+	// token -- see its own definition for why reconnect-in-place can't fix this.
+	void requestRestartIfTokenStale();
 
 	static void wsEventTrampoline(void* handlerArgs, esp_event_base_t base, int32_t eventId, void* eventData);
 	void handleWsEvent(int32_t eventId, void* eventData);
