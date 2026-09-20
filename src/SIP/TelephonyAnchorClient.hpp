@@ -338,7 +338,14 @@ private:
 	bool httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut = nullptr, bool* requestSentOut = nullptr);
 	// The leg WE control for an outbound call: makecall result.id, else a destination digit-suffix
 	// match in the live participant list — the id Telephony authorizes us to stream/drop (issue #40).
-	std::string resolveOutboundLeg(const std::string& makecallRespBody, const std::string& destination);
+	// #349 follow-up: listStatusOut reports the HTTP status of the live-participant-list
+	// GET this falls back to, because an empty return collapses five different reasons
+	// into one value — list GET failed (transient, worth retrying) vs. the list answered
+	// and there is genuinely no controllable leg (definitive, retrying is pointless and
+	// actively harmful: see makeCall). 0 means the list was never consulted (result.id
+	// came straight from the makecall response, so the caller already has its answer).
+	std::string resolveOutboundLeg(const std::string& makecallRespBody, const std::string& destination,
+	                               int* listStatusOut = nullptr);
 	// Status of a specific leg read from the LIST (GET /participants -> find id). Replaces
 	// getParticipantStatus(id), which 403s for a leg this DN cannot directly control (issue #40).
 	std::string getLegStatus(const std::string& legId);
