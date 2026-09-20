@@ -19,6 +19,18 @@ on:
     branches: [ '**' ]
   pull_request:
     branches: [ '**' ]
+    # Explicit `types` because the GitHub default ([opened, synchronize,
+    # reopened]) does NOT include `edited` -- and `edited` is what fires
+    # when a PR's BASE branch gets retargeted (e.g. GitHub auto-retargets
+    # an open child PR from a sibling feat/** branch to main once that
+    # sibling is squash-merged and deleted -- this repo's own stacked-PR
+    # pattern, #242 again). Without `edited` here, that retarget produces
+    # no new run: commit-hygiene-guard's already-green result (computed
+    # against the OLD base) stays attached to the PR's unchanged head SHA,
+    # even though the real merge-base/commit-range it should be checking
+    # just changed underneath it. Found by adversarial review of this
+    # exact job, not in production.
+    types: [ opened, synchronize, reopened, edited ]
 
 jobs:
   # Job 1: Build and simulate the host desktop application, run static analysis and unit/smoke tests.
@@ -731,15 +743,33 @@ jobs:
           # squash commit where the trailer was buried past line 50 of a
           # 71-line body, and a manual review that used `tail -15` on that
           # same commit missed it for exactly that reason.
+          # `grep -q` exits the instant it finds a match and closes its end
+          # of the pipe -- fine for a short producer, but `git log`'s output
+          # here can be arbitrarily large (a squash-merge body, exactly the
+          # shape #326 exists to catch). If `git log` is still writing when
+          # `-q` closes the pipe early, its next write() gets SIGPIPE and it
+          # dies; under `pipefail` the PIPELINE's reported status becomes
+          # git log's (128+SIGPIPE=141), not grep's real match result -- so
+          # a commit that DOES carry the trailer silently reports "clean"
+          # once its message is big enough. Reproduced deterministically
+          # (5/5) with a ~550 KB message, trailer near the top: found by a
+          # dedicated adversarial review of this file, not in production --
+          # see the PR that added this fix.
+          #
+          # Fix: never use `-q` against a producer that might still be
+          # writing. `grep -c` (no `-q`) always reads to EOF regardless of
+          # where the match is, so it never closes the pipe early and the
+          # producer never gets SIGPIPE'd -- same exit-code semantics
+          # (0 = found, 1 = not found), just without the early-exit race.
           for sha in $(git rev-list "${BASE}..${HEAD_SHA}"); do
-            if git log -1 --format=%B "$sha" | grep -qn '^Claude-Session:'; then
+            if git log -1 --format=%B "$sha" | grep -c '^Claude-Session:' >/dev/null; then
               subject="$(git log -1 --format=%s "$sha")"
               echo "::error::Commit ${sha} (\"${subject}\") carries a Claude-Session: trailer."
               FOUND=1
             fi
           done
 
-          if printf '%s\n' "$PR_BODY" | grep -qn '^Claude-Session:'; then
+          if printf '%s\n' "$PR_BODY" | grep -c '^Claude-Session:' >/dev/null; then
             echo "::error::The PR description carries a Claude-Session: trailer."
             FOUND=1
           fi
