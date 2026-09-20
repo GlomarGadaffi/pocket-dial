@@ -3040,8 +3040,16 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	// connect with no inbound audio). Teardown still exits it immediately via
 	// _rxTaskHandle/socket shutdown.
 	constexpr int        kMaxAttempts = 240;
+	// #350: consecutive TRANSPORT-level failures — no HTTP response parsed at all —
+	// as distinct from a real non-200, which is what the 240-attempt budget exists
+	// for. A transport that is actually dead does not heal by being reopened 240
+	// times, and each rebuild below pays a full mbedTLS handshake (~0.5-1s on the
+	// S3), so grinding the full budget on a dead connection would burn ~4 minutes
+	// of handshakes for nothing. 3 is a chosen number, not a derived one.
+	constexpr int        kMaxTransportFailures = 3;
 	TickType_t           delay        = pdMS_TO_TICKS(50);   // Start fast at 50ms
 	bool opened = false;
+	int  transportFailures = 0;
 
 	{
 		std::lock_guard<std::mutex> lock(_getMutex);
@@ -3051,12 +3059,36 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 		}
 	}
 
+	// #350: rebuild the handle after a transport-level failure instead of reopening
+	// it. Reusing a handle whose TLS session died mid-operation is what produced the
+	// CORRUPT HEAP panic: the next esp_http_client_open() writes its request headers
+	// through mbedTLS's dynamic TX buffers, and esp_mbedtls_add_tx_buffer() freed one
+	// whose tail guard the failed attempt had already corrupted (0xbaadbc76, not
+	// 0xbaad5678). Holding _getMutex across makeAuthedClient() matches the initial
+	// create above — esp_http_client_init() allocates, it does not connect, so this
+	// is not a blocking network call under the lock. Re-checks _rxTaskHandle under
+	// the lock so a teardown racing us cannot resurrect a handle stopMediaStreams()
+	// just closed.
+	auto recreateGetClient = [&]() -> bool {
+		std::lock_guard<std::mutex> lock(_getMutex);
+		if (_getClient)
+		{
+			esp_http_client_close(_getClient);
+			esp_http_client_cleanup(_getClient);
+			_getClient = nullptr;
+		}
+		if (_rxTaskHandle == nullptr) return false;
+		_getClient = makeAuthedClient(getUrl, HTTP_METHOD_GET, 1024, token);
+		return _getClient != nullptr;
+	};
+
 	if (_getClient)
 	{
 		for (int attempt = 0; attempt < kMaxAttempts && _rxTaskHandle != nullptr; ++attempt)
 		{
 			const int64_t openT0 = esp_timer_get_time();
 			esp_err_t err = esp_http_client_open(_getClient, 0);
+			bool transportFailed = false;
 			if (err == ESP_OK)
 			{
 				esp_http_client_fetch_headers(_getClient);
@@ -3071,17 +3103,56 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					opened = true;
 					break;
 				}
-				ESP_LOGW(TAG, "GET stream not ready (HTTP %d), attempt %d/%d", status, attempt + 1, kMaxAttempts);
-				// Drain the error body completely so the persistent connection can
-				// carry the next attempt (an unread body poisons handle reuse).
-				char drainBuf[256];
-				while (esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
+				if (status > 0)
+				{
+					// A REAL HTTP response — 404 (participant not found yet) or 424,
+					// exactly what this loop was built to wait out. The connection is
+					// healthy, so keep the handle and the cheap ~one-RTT retry.
+					ESP_LOGW(TAG, "GET stream not ready (HTTP %d), attempt %d/%d", status, attempt + 1, kMaxAttempts);
+					// Drain the error body completely so the persistent connection can
+					// carry the next attempt (an unread body poisons handle reuse).
+					char drainBuf[256];
+					while (esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
+					transportFailures = 0;
+				}
+				else
+				{
+					// #350: status <= 0 is NOT a server saying "not ready" — it means no
+					// HTTP response was parsed at all. esp_http_client_fetch_headers()
+					// sets status_code = -1 itself before reading (esp_http_client.c:1658),
+					// so the -1 seen in the crash capture is the read failing, not a status
+					// line. Treating it like a 404 is what reused a dead connection.
+					// Deliberately NOT drained: there is no body to drain, and reading a
+					// transport that just failed is the thing being avoided.
+					ESP_LOGW(TAG, "GET stream transport failure (no HTTP response, status=%d), attempt %d/%d",
+						status, attempt + 1, kMaxAttempts);
+					transportFailed = true;
+				}
 			}
 			else
 			{
-				// Connection-level failure: esp_http_client re-establishes the
-				// transport on the next open, so still no per-retry teardown needed.
+				// #350: this previously read "esp_http_client re-establishes the transport
+				// on the next open, so still no per-retry teardown needed" — that
+				// assumption is the other half of the crash. A failed open can leave
+				// mbedTLS's dynamic buffers half-built, and the next open() frees them.
 				ESP_LOGW(TAG, "GET stream open failed (%s), attempt %d/%d", esp_err_to_name(err), attempt + 1, kMaxAttempts);
+				transportFailed = true;
+			}
+
+			if (transportFailed)
+			{
+				if (++transportFailures >= kMaxTransportFailures)
+				{
+					ESP_LOGE(TAG, "GET stream: %d consecutive transport failures — giving up "
+						"rather than reopening a dead connection %d more times",
+						transportFailures, kMaxAttempts - attempt - 1);
+					break;
+				}
+				if (!recreateGetClient())
+				{
+					ESP_LOGW(TAG, "GET stream: could not rebuild client after transport failure — giving up");
+					break;
+				}
 			}
 
 			if (_rxTaskHandle != nullptr)
