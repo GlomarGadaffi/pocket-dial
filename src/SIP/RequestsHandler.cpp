@@ -3930,6 +3930,21 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		newSession->setDest(dummyAnchor);
 		newSession->setAnchor(true);
 		newSession->setAnchorParticipantId(ownLeg);
+		// Issue #232's exact fix, missed on this branch. The async
+		// CallEvent::Answered path (:434, its own comment cites #232 by name)
+		// and the 777/888 virtual legs all record dialog headers at answer
+		// time for one reason: forceDisconnect()'s and sweepSessionTimers()'s
+		// #72 guard refuses to BYE a handset with an empty From/To, since
+		// phones drop a malformed BYE. This SYNCHRONOUS branch (the one
+		// LoopbackAnchorClient/host tests exercise, and any real deployment
+		// where anchorIsSynchronous() is true) never set them at all, so
+		// EVERY existing BYE-on-teardown path was already silently unable to
+		// notify this call's handset before this line existed -- caught
+		// while wiring #279's own new teardown BYE into the degraded-anchor
+		// sweep (:8100ish) and finding its own #72 guard correctly refusing
+		// to send, because there was nothing here to refuse with.
+		newSession->setDialogHeaders(std::string(data->getFrom()),
+			std::string(data->getTo()) + ";tag=" + toTag);
 		_sessions.emplace(callID, newSession);
 		newSession->setState(Session::State::Connected);
 
@@ -4643,6 +4658,15 @@ void RequestsHandler::onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, c
 		return;
 	}
 
+	// Issue #232's exact gap, a SECOND independent instance of it: found
+	// while wiring #279's own teardown BYE and checking every setAnchor(true)
+	// call site for the same omission, not just the one that broke the
+	// original repro. This function already builds fromHeader/ok->getTo()
+	// above for the "couldn't bridge" BYE (:4652) -- the same pair belongs on
+	// the session once the call actually succeeds, or forceDisconnect() and
+	// #279's degraded-anchor sweep can never BYE this handset either, exactly
+	// as they silently couldn't for the outbound case before that fix.
+	session->setDialogHeaders(fromHeader, std::string(ok->getTo()));
 	session->setState(Session::State::Connected);
 	// Tell the upstream to connect the PSTN leg; its Connected upsert opens the
 	// PCM streams (startMediaStreams) so audio flows handset RTP <-> bridge <-> PCM <-> upstream.
@@ -8126,6 +8150,41 @@ void RequestsHandler::tick()
 			if (b) b->stopBridge();
 			if (!part.empty()) asyncDropCall(part);
 			queueLog("[Telephony] anchor call torn down: audio write repeatedly failed — dropped leg " + part);
+
+			// Issue #279: this branch dropped the ANCHOR side (asyncDropCall) and
+			// erased the board's own bookkeeping (endCall, below) but never told
+			// the LOCAL HANDSET anything. From the phone's point of view the call
+			// simply never ends -- desmo's live repro was exactly this: the
+			// Yealink still showed the call live and a later resume attempt drew
+			// 481 Call/Transaction Does Not Exist, because the board had already
+			// silently forgotten a call it never said goodbye to.
+			//
+			// buildServerBye()/_outbox is the same mechanism sweepSessionTimers()
+			// (:8955) and forceDisconnect() (:7068) already use for exactly this
+			// kind of server-initiated teardown -- a message-pool build plus an
+			// enqueue, not a fresh heap allocation, so this does not reintroduce
+			// the allocate-at-the-worst-moment problem #279 is named after. It is
+			// still only a BEST EFFORT: the real socket transmit happens later,
+			// at the _outbox drain (:9079), and can still fail under severe DRAM
+			// exhaustion the way any outbound packet can (#278/#328). What this
+			// closes is the far more common gap above: the code path that never
+			// attempted the BYE at all, independent of whether transmission would
+			// have succeeded.
+			//
+			// The local handset is whichever leg is NOT the anchor participant --
+			// same direction split CDR attribution just below already uses.
+			// getDialogFrom()/getDialogTo() are the captured dialog headers, and
+			// which one plays which role depends on which side of the captured
+			// dialog the handset is: for an inbound anchor call the handset is
+			// the ORIGINAL callee (the "dest" role sweepSessionTimers() sends
+			// From=dFrom/To=dTo to); for outbound the handset is the ORIGINAL
+			// caller (the "src" role sweepSessionTimers() sends From=dTo/To=dFrom
+			// to, swapped). Same #72 guard as both sibling functions: an empty
+			// From or To is a malformed BYE phones will drop, so skip rather than
+			// send garbage.
+			const std::string& dFrom = session->getDialogFrom();
+			const std::string& dTo   = session->getDialogTo();
+
 			// CDR src/dest convention differs by direction (same as the no-answer
 			// reap above splits it): outbound treats the local extension as src
 			// and the anchor leg as dest; inbound treats the anchor participant
@@ -8133,12 +8192,26 @@ void RequestsHandler::tick()
 			// Held) local extension as dest.
 			if (session->isAnchorInbound())
 			{
-				endCall(callID, part, session->getDest() ? session->getDest()->getNumber() : "",
+				auto handset = session->getDest();
+				if (handset && !dFrom.empty() && !dTo.empty())
+				{
+					auto bye = buildServerBye(handset->getNumber(), handset->getAddress(),
+						callID, dFrom, dTo);
+					if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
+				}
+				endCall(callID, part, handset ? handset->getNumber() : "",
 					"anchor audio write failure");
 			}
 			else
 			{
-				endCall(callID, session->getSrc() ? session->getSrc()->getNumber() : "", part,
+				auto handset = session->getSrc();
+				if (handset && !dFrom.empty() && !dTo.empty())
+				{
+					auto bye = buildServerBye(handset->getNumber(), handset->getAddress(),
+						callID, dTo, dFrom);
+					if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
+				}
+				endCall(callID, handset ? handset->getNumber() : "", part,
 					"anchor audio write failure");
 			}
 		}
