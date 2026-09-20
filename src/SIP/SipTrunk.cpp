@@ -322,6 +322,13 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 			d->sawSessionProgress = true;
 			_env.log("Trunk: 183 session progress (early media) from carrier");
 		}
+		// 180 and 183 both mean "ringing" to the handset; only 183 says the
+		// carrier is already sending audio. 100 Trying is not a listener event:
+		// it says a proxy took the request, not that the callee is alerting.
+		if (_listener && (status == 180 || status == 183))
+		{
+			_listener->onTrunkRinging(eventFor(*d), status == 183);
+		}
 		return true;
 	}
 
@@ -348,6 +355,11 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 		}
 		d->state = State::Confirmed;
 		_env.log("Trunk: call answered (" + d->destE164 + ")");
+		// Fired last, with the ACK already on the outbox and the state already
+		// Confirmed: a listener that finds the answer's SDP unusable calls
+		// hangup() from in here, and hangup() on a Confirmed dialog emits the
+		// BYE. Firing earlier would put that BYE ahead of the ACK on the wire.
+		if (_listener) _listener->onTrunkAnswered(eventFor(*d), data);
 		return true;
 	}
 
@@ -382,7 +394,16 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 		_env.enqueue(d->peer, std::move(ack));
 	}
 	_env.log("Trunk: call failed " + std::to_string(status) + " (" + d->destE164 + ")", true);
+
+	// Move the dialog out and free the slot BEFORE notifying. The listener's
+	// job here is to refuse the handset leg, and it may well place another call
+	// straight after -- which needs this slot back. Moving rather than copying
+	// steals the string buffers instead of allocating a second set, so the
+	// event's views stay valid for the callback without a heap round trip.
+	// The ACK above is built first because buildAckForFailure() reads *d.
+	const Dialog finished = std::move(*d);
 	*d = Dialog{};
+	if (_listener) _listener->onTrunkFailed(eventFor(finished), status);
 	return true;
 }
 
@@ -428,6 +449,21 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 		_env.log("Trunk: dialog timed out in state "
 			+ std::to_string(static_cast<int>(d.state)) + " (" + d.destE164 + ")", true);
 		_env.freeTransactionsForCallId(d.callID);
+
+		// A dialog that reached Terminating is our own BYE going unanswered.
+		// The listener tore the handset down when it asked for that BYE, so
+		// reclaiming the slot is all that is left -- notifying again would be a
+		// second teardown of a leg that is already gone.
+		const bool notify = (d.state != State::Terminating);
+
+		// Same move-then-free-then-fire order as the failure path above: an
+		// INVITE that never got a final response must release the handset, and
+		// the listener may immediately reuse this slot.
+		const Dialog finished = std::move(d);
 		d = Dialog{};
+		// 408, not 0: a request that got no final response inside its deadline
+		// is a timeout in the RFC 3261 sense, and giving the listener a real
+		// status means its failure mapping needs no special case for "0".
+		if (notify && _listener) _listener->onTrunkFailed(eventFor(finished), 408);
 	}
 }
