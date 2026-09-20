@@ -741,6 +741,11 @@ bool TelephonyAnchorClient::fetchToken()
 				std::string tokenStr;
 				if (readJsonStringField(client, "access_token", tokenStr))
 				{
+					// This lock guards _accessToken (a std::string, genuinely needs it).
+					// _tokenObtainedUs/_tokenLifetimeUs are std::atomic (#344) and do not
+					// need it -- they're written here under the lock anyway only because
+					// this block already holds it for _accessToken, not because they
+					// require it. Do not read that as redundant and drop the atomics.
 					std::lock_guard<std::mutex> lock(_mutex);
 					_accessToken = tokenStr;
 					_tokenObtainedUs = esp_timer_get_time();
