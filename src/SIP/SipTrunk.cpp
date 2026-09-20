@@ -484,11 +484,32 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 	return true;
 }
 
+void SipTrunk::expireDeadlinesForTest()
+{
+	const auto past = std::chrono::steady_clock::now() - std::chrono::hours(1);
+	for (auto& d : _dialogs)
+	{
+		if (d.state != State::Free) d.deadline = past;
+	}
+}
+
 void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 {
 	for (auto& d : _dialogs)
 	{
 		if (d.state == State::Free || now < d.deadline) continue;
+
+		// A CONFIRMED dialog is a call that is up, and `deadline` still holds
+		// the NO-ANSWER budget placeCall() armed -- 60 s from when the INVITE
+		// went out, long expired on any real conversation. Reaping on it would
+		// hang up every trunk call about a minute after it was placed.
+		//
+		// There is deliberately no max-call-duration timer here to replace it:
+		// a PBX that drops calls on a timer it never told anyone about is worse
+		// than one that does not. Terminating gets its own short deadline from
+		// hangup(), which is what reclaims a slot whose BYE went unanswered, so
+		// nothing leaks by exempting only this state.
+		if (d.state == State::Confirmed) continue;
 
 		_env.log("Trunk: dialog timed out in state "
 			+ std::to_string(static_cast<int>(d.state)) + " (" + d.destE164 + ")", true);

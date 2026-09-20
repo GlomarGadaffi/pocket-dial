@@ -678,5 +678,54 @@ TEST(SipTrunkListener, AnUnsetListenerChangesNothing)
 	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
 	EXPECT_EQ(trunk.activeDialogs(), 1u);
 	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::minutes(5));
-	EXPECT_EQ(trunk.activeDialogs(), 0u);
+	EXPECT_EQ(trunk.activeDialogs(), 1u)
+		<< "an ANSWERED call is not swept -- see SweepLeavesAnAnsweredCallAlone";
+}
+
+// The no-answer deadline placeCall() arms is 60 s from the INVITE. It is still
+// sitting on the dialog after the call is answered, so a sweep that only asked
+// "is the deadline past" would hang up every trunk call about a minute in.
+//
+// This was the tested behaviour until sonnet-OG caught it on PR #355: the old
+// version of the test above answered the call, swept at +5 min and asserted the
+// dialog was GONE. It passed, because nothing called sweep() from the engine
+// yet -- the bug could not bite until the wiring it needed was added, and the
+// test was quietly asserting it was correct.
+TEST(SipTrunkDialog, SweepLeavesAnAnsweredCallAlone)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));   // Confirmed
+
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::hours(2));
+
+	EXPECT_EQ(trunk.activeDialogs(), 1u)
+		<< "a call that is UP has no no-answer deadline; there is no max-duration timer";
+}
+
+// The other half: a dialog we are trying to hang up DOES still get reclaimed,
+// so exempting Confirmed leaks nothing. hangup() moves it to Terminating with
+// its own short deadline, and that one is swept.
+TEST(SipTrunkDialog, SweepStillReclaimsADialogWhoseByeWentUnanswered)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+	ASSERT_TRUE(trunk.hangup("handset-1"));                      // Terminating
+	ASSERT_EQ(trunk.activeDialogs(), 1u) << "still held, waiting on the carrier's 200";
+
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::minutes(1));
+
+	EXPECT_EQ(trunk.activeDialogs(), 0u)
+		<< "a carrier that never answers our BYE must not pin the slot forever";
 }
