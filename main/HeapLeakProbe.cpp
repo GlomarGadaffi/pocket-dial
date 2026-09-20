@@ -65,6 +65,7 @@
 #include <cstdint>                // uintptr_t
 #include <unistd.h>               // write(), STDERR_FILENO
 #include "esp_log.h"
+#include "esp_timer.h"            // esp_timer_get_time() -- see #331's nowSec note
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -203,6 +204,23 @@ constexpr size_t kTraceRecords = 4000;
 // the collapse."
 constexpr uint32_t kDumpsSec[] = { 120, 240, 360, 900 };
 
+// #331: after the schedule above completes, no way existed to take a later
+// dump -- no console command, no HTTP endpoint, no signal, and the header's
+// own comment claimed one anyway. Both obvious "add a trigger" shapes are
+// wrong for what this probe is diagnosing: an HTTP endpoint is unreachable
+// in the exact failure (pthread task-spawn exhaustion kills the connection
+// thread first), and a console command needs a human already attached and
+// typing at the moment of interest -- the same "be there in time" problem
+// #327 exists to name. So: no trigger. Keep dumping forever instead, so
+// *when* a reader attaches stops mattering. kGaugeSec reuses logInternalState()
+// (already the exact four figures /api/status reports, "for almost nothing"
+// per #331) so the free/largest/min curve is on the wire across the whole
+// incident, not just at the four scheduled points; kPeriodicSec repeats the
+// full aggregated dump so late-attaching readers get outstanding-allocation
+// data too, not only gauges.
+constexpr uint32_t kGaugeSec    = 60;
+constexpr uint32_t kPeriodicSec = 900;
+
 void logInternalState(const char* phase, uint32_t atSec)
 {
 	const size_t freeInt = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -222,13 +240,39 @@ void logInternalState(const char* phase, uint32_t atSec)
 	// free - largest is the fragmentation signal: it widening while free()
 	// holds roughly steady means the DMA bounce-buffer allocation can fail on
 	// a board that still reports plenty available.
+	//
+	// #331 ultrareview finding: freeInt and bigInt above are two separate
+	// heap_caps_get_*() calls with no lock between them, so a concurrent free
+	// on another task can make bigInt > freeInt at the instant this reads
+	// them. Unsigned freeInt - bigInt then wraps to ~4 GB in the log line
+	// instead of reporting a small (or negative-in-spirit) gap. Rare enough
+	// at ~5 calls total before this loop ran forever; not rare once it does.
+	// Clamped rather than locked: this is a diagnostic read, and the true
+	// answer at that instant is "the two figures were inconsistent," which
+	// 0 communicates better than a nonsense multi-gigabyte number would.
+	const unsigned fragGap = (bigInt <= freeInt)
+		? static_cast<unsigned>(freeInt - bigInt) : 0u;
 	probePrintf("HeapProbe: [%s t=%us] fragmentation gap (free - largest) = %u bytes\n",
-		phase, static_cast<unsigned>(atSec), static_cast<unsigned>(freeInt - bigInt));
+		phase, static_cast<unsigned>(atSec), fragGap);
 }
 
 #if CONFIG_HEAP_TASK_TRACKING
 void logPerTask(uint32_t atSec)
 {
+	// #331 ultrareview finding, not fixed here: heap_caps_get_per_task_info()
+	// returns void and silently STOPS filling totals[] once kMaxTasks distinct
+	// owners are seen -- there is no "rows dropped" signal in the API to log.
+	// A PSRAM-only task also takes a slot (see the comment below), and a dead
+	// per-leg task keeps its slot forever (see logPerTask's caller-side note
+	// on dangling handles). At 24, real hardware has already hit the cap:
+	// both #328 captures on 2026-09-20 read exactly "24 owners". This loop
+	// used to run this check at most 4 times per boot; now it runs every
+	// kPeriodicSec forever, so saturation is the expected case on a
+	// long-running board, not an edge case. Raising kMaxTasks only moves the
+	// same silent cliff further out -- the real fix needs IDF's newer
+	// heap_caps_get_all_task_stat() (see the dead-owner note ~30 lines below,
+	// which already flagged that API as the right follow-up) or an explicit
+	// "distinct owners seen > kMaxTasks" counter kept on this side.
 	constexpr size_t kMaxTasks = 24;
 	static heap_task_totals_t totals[kMaxTasks];
 	static size_t totalsCount = 0;
@@ -639,6 +683,51 @@ void dumpInternalRecords(uint32_t atSec)
 		g_shortWrites);
 }
 
+// #331 ultrareview finding: the scheduled loop's per-dump sequence logged two
+// figures -- outstanding trace-record count and this task's OWN stack
+// high-water mark -- that the periodic loop below was silently dropping. The
+// comment on the stack line still applies here: dumpInternalRecords() is the
+// stack-heaviest path in this file, so losing that log after t=900s throws
+// away exactly the measurement that would catch a stack-size regression on
+// the dumps most likely to need one -- the ones with the largest record
+// counts, since a real incident's outstanding-record count only grows.
+// Factored out so both loops call one sequence instead of two that can drift
+// apart, which is how this gap happened in the first place.
+void fullDump(const char* phase, uint32_t atSec)
+{
+	logInternalState(phase, atSec);
+
+	probePrintf("HeapProbe: [%s t=%us] outstanding trace records: %u of %u\n",
+		phase, static_cast<unsigned>(atSec), static_cast<unsigned>(heap_trace_get_count()),
+		static_cast<unsigned>(kTraceRecords));
+
+	// The probe's own stack depth was picked (4096, bumped to 8192), not
+	// measured -- heap_trace_dump_caps() walks up to HEAP_TRACING_STACK_DEPTH
+	// (8) %p-formatted frames per outstanding record via esp_rom_printf, and
+	// at t=360s that could be hundreds of records. A diagnostic tool
+	// overflowing its own stack would look like a brand-new crash in the
+	// thing being diagnosed (the #309 bug class, inside the tool built to
+	// find it). Logging the real high-water mark each dump turns the next
+	// stack-size decision into a measurement instead of a second guess.
+	// uxTaskGetStackHighWaterMark() returns WORDS, not bytes -- matches
+	// HoldMusic.cpp's/HttpServer.cpp's own convention elsewhere in this tree;
+	// multiplying by sizeof(StackType_t) is not optional.
+	const UBaseType_t freeWords = uxTaskGetStackHighWaterMark(nullptr);
+	probePrintf("HeapProbe: [%s t=%us] heap_probe stack high-water: %u bytes free of %d\n",
+		phase, static_cast<unsigned>(atSec),
+		static_cast<unsigned>(freeWords * sizeof(StackType_t)), 8192);
+
+	// NOT heap_trace_dump_caps(). See dumpInternalRecords() -- IDF's own dump
+	// holds a critical section across its entire per-record print loop, which
+	// at 904 records tripped the interrupt watchdog and crashed the board
+	// mid-dump, losing the very data it was printing.
+	dumpInternalRecords(atSec);
+
+#if CONFIG_HEAP_TASK_TRACKING
+	logPerTask(atSec);
+#endif
+}
+
 void heapProbeTask(void*)
 {
 	auto* buf = static_cast<heap_trace_record_t*>(
@@ -678,55 +767,60 @@ void heapProbeTask(void*)
 
 	probePrintf("HeapProbe: leak probe armed: %u records in PSRAM, HEAP_TRACE_LEAKS. "
 		"Aggregating by call site (table %u, cannot overflow). "
-		"Dumps at 120/240/360/900 s (#273 onset measured 218-276 s).\n",
-		static_cast<unsigned>(kTraceRecords), static_cast<unsigned>(kMaxSites));
+		"Dumps at 120/240/360/900 s (#273 onset measured 218-276 s), then gauge "
+		"every %us and full dump every %us thereafter (#331).\n",
+		static_cast<unsigned>(kTraceRecords), static_cast<unsigned>(kMaxSites),
+		static_cast<unsigned>(kGaugeSec), static_cast<unsigned>(kPeriodicSec));
 	logInternalState("armed", 0);
 
 	for (uint32_t target : kDumpsSec)
 	{
-		const uint32_t nowSec = static_cast<uint32_t>(xTaskGetTickCount() / configTICK_RATE_HZ);
+		// #331 ultrareview: nowSec used to derive from xTaskGetTickCount(),
+		// which wraps at 2^32 ticks -- ~49.7 days at this project's
+		// CONFIG_FREERTOS_HZ=1000. Unreachable here (the task used to exit by
+		// t=900s); esp_timer_get_time() is a 64-bit microsecond counter that
+		// does not wrap on any timescale this device will see, so both this
+		// loop and the periodic one below use it instead.
+		const uint32_t nowSec = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
 		if (target > nowSec)
 		{
 			vTaskDelay(pdMS_TO_TICKS((target - nowSec) * 1000));
 		}
 
-		logInternalState("dump", target);
-		probePrintf("HeapProbe: [dump t=%us] outstanding trace records: %u of %u\n",
-			static_cast<unsigned>(target), static_cast<unsigned>(heap_trace_get_count()),
-			static_cast<unsigned>(kTraceRecords));
-		// The probe's own stack depth was picked (4096, bumped to 8192 below),
-		// not measured -- heap_trace_dump_caps() walks up to
-		// HEAP_TRACING_STACK_DEPTH (8) %p-formatted frames per outstanding
-		// record via esp_rom_printf, and at t=360s that could be hundreds of
-		// records. A diagnostic tool overflowing its own stack would look like
-		// a brand-new crash in the thing being diagnosed (the #309 bug class,
-		// inside the tool built to find it). Logging the real high-water mark
-		// each dump turns the next stack-size decision into a measurement
-		// instead of a second guess.
-		// uxTaskGetStackHighWaterMark() returns WORDS, not bytes -- matches
-		// HoldMusic.cpp's/HttpServer.cpp's own convention elsewhere in this
-		// tree; multiplying by sizeof(StackType_t) is not optional.
-		const UBaseType_t freeWords = uxTaskGetStackHighWaterMark(nullptr);
-		probePrintf("HeapProbe: [dump t=%us] heap_probe stack high-water: %u bytes free of %d\n",
-			static_cast<unsigned>(target), static_cast<unsigned>(freeWords * sizeof(StackType_t)), 8192);
-
-		// NOT heap_trace_dump_caps(). See dumpInternalRecords() -- IDF's own
-		// dump holds a critical section across its entire per-record print
-		// loop, which at 904 records tripped the interrupt watchdog and
-		// crashed the board mid-dump, losing the very data it was printing.
-		dumpInternalRecords(target);
-
-#if CONFIG_HEAP_TASK_TRACKING
-		logPerTask(target);
-#endif
+		fullDump("dump", target);
 	}
 
 	// Deliberately keeps tracing after the last scheduled dump rather than
 	// stopping: the board stays up for 76-91 minutes in the degraded state
-	// (measured, two boots, two trees), so someone may want a manual dump much
-	// later. heap_trace_stop() is never called here.
-	probePrintf("HeapProbe: scheduled dumps complete; tracing still ACTIVE for later manual dumps\n");
-	vTaskDelete(nullptr);
+	// (measured, two boots, two trees). #331: this used to claim "tracing
+	// still ACTIVE for later manual dumps" and then vTaskDelete() -- a manual
+	// dump was never actually reachable, so the promise was hollow. Now the
+	// task itself never exits: a cheap gauge every kGaugeSec, a full
+	// aggregated dump every kPeriodicSec, forever. heap_trace_stop() is still
+	// never called.
+	probePrintf("HeapProbe: scheduled dumps complete; switching to periodic "
+		"(gauge every %us, full dump every %us)\n",
+		static_cast<unsigned>(kGaugeSec), static_cast<unsigned>(kPeriodicSec));
+
+	uint32_t sinceDump = 0;
+	for (;;)
+	{
+		vTaskDelay(pdMS_TO_TICKS(kGaugeSec * 1000));
+		// See the scheduled loop above for why esp_timer_get_time() and not
+		// xTaskGetTickCount() -- this loop is the whole reason that wrap
+		// became reachable in the first place.
+		const uint32_t nowSec = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
+		sinceDump += kGaugeSec;
+		if (sinceDump >= kPeriodicSec)
+		{
+			sinceDump = 0;
+			fullDump("periodic", nowSec);
+		}
+		else
+		{
+			logInternalState("gauge", nowSec);
+		}
+	}
 }
 
 }  // namespace
