@@ -1,0 +1,37 @@
+#!/bin/sh
+# Warn loudly (never block) when this repo's MAIN working tree ends up
+# on anything but main. Branch work belongs in a dedicated linked
+# worktree (see CONTRIBUTING_FIRMWARE.md, "Working Directory
+# Convention"), not the shared clone every worktree branches off of.
+#
+# Not installed by default -- git only runs hooks from .git/hooks, so
+# this has no effect until each clone opts in once with:
+#   git config core.hooksPath .githooks
+#
+# Git has no real pre-checkout hook that can block a checkout outright,
+# so this is detect-and-surface after the fact, not prevention.
+
+MAIN_TREE=$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
+TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null)
+
+if [ -z "$MAIN_TREE" ] || [ "$TOPLEVEL" != "$MAIN_TREE" ]; then
+    exit 0
+fi
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+if [ "$BRANCH" != "main" ]; then
+    echo "" >&2
+    echo "############################################################" >&2
+    echo "#  WARNING: the main working tree is now on '$BRANCH', not  " >&2
+    echo "#  main. This is the shared clone every worktree branches   " >&2
+    echo "#  off of -- branch work belongs in a dedicated linked      " >&2
+    echo "#  worktree instead.                                        " >&2
+    echo "#  Run: git checkout main                                   " >&2
+    echo "#  See CONTRIBUTING_FIRMWARE.md, Working Directory          " >&2
+    echo "#  Convention.                                              " >&2
+    echo "############################################################" >&2
+    echo "" >&2
+fi
+
+exit 0
