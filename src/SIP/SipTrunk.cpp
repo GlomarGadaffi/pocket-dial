@@ -484,6 +484,7 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 	return true;
 }
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 void SipTrunk::expireDeadlinesForTest()
 {
 	const auto past = std::chrono::steady_clock::now() - std::chrono::hours(1);
@@ -492,6 +493,7 @@ void SipTrunk::expireDeadlinesForTest()
 		if (d.state != State::Free) d.deadline = past;
 	}
 }
+#endif
 
 void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 {
