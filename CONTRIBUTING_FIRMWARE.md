@@ -58,6 +58,43 @@ only fires in the repo's main working tree, never in a linked worktree.
 
 ---
 
+### D. No Claude-Session URL Trailer
+
+Some AI coding harnesses append a `Claude-Session: <url>` trailer to every
+commit message and PR body by default, as a generic, session-level
+convention. **pocket-dial does not use it.** A generic harness instruction
+does not override a project's own stated convention -- check this file
+before your first commit or PR in this repo, not after a reviewer flags the
+diff.
+
+`Co-Authored-By:` is fine and should stay; only the session-URL trailer is
+the problem.
+
+This has been documented before and still happened repeatedly -- most
+recently 114 commits deep on `main`, including two merged after it was
+already written down once. A note that only a human or agent has to
+remember to check does not reliably work, so this repo also enforces it
+mechanically, two ways:
+
+- **CI**: the "Commit Hygiene Guardrail" job checks every commit in a PR's
+  own range (not all of history -- the 114 pre-existing offenders are left
+  as recorded debt, not retroactively enforced) plus the PR description.
+  `main` is not currently a protected branch, so a red run here is a strong
+  signal, not an enforced gate, until it is added as a required status
+  check.
+- **Local**: `.githooks/commit-msg` rejects an offending commit before the
+  object is even created. Same opt-in as `.githooks/post-checkout` above --
+  `git config core.hooksPath .githooks` enables both at once, and since
+  `core.hooksPath` is repo-level config, one opt-in in the shared clone
+  protects every linked worktree under it.
+
+Both hooks support `--selftest` (`.githooks/post-checkout --selftest`,
+`.githooks/commit-msg --selftest`) to print what each one would decide
+without acting on it -- worth running once after opting in, rather than
+trusting a hook that has never been observed to actually do anything.
+
+---
+
 ## 2. Security-Sensitive Areas
 
 Three parts of this firmware have a single correct implementation and a

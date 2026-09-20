@@ -1,0 +1,94 @@
+#!/bin/sh
+# Reject a commit outright if its message carries a Claude-Session: trailer
+# -- pocket-dial's convention forbids it (see CONTRIBUTING_FIRMWARE.md and
+# issue #326). Co-Authored-By is fine and should stay; only the session-URL
+# trailer is the problem.
+#
+# Not installed by default -- git only runs hooks from .git/hooks, so this
+# has no effect until each clone opts in once with:
+#   git config core.hooksPath .githooks
+#
+# Same opt-in as .githooks/post-checkout; enabling one enables both, and
+# core.hooksPath is repo-level config -- one opt-in in the shared clone
+# protects every linked worktree under it at once, not just that one clone.
+#
+# Unlike post-checkout, this one CAN actually block: commit-msg fires after
+# the message is composed but before the commit object is created, and a
+# nonzero exit here aborts the commit. (`git commit --no-verify` skips every
+# hook by design -- an intentional, git-level escape hatch, not a gap in
+# this check.)
+#
+# Written the same night #326's CI-side guard was, and deliberately checks
+# the SAME pattern the same way: full message body via grep -n
+# '^Claude-Session:', not just the subject line. #326's own self-test found
+# a squash-merge commit on main whose subject was clean but whose body
+# carried the trailer 50-odd lines down, inherited from a squashed
+# sub-commit. A check that only looked at the first line would have missed
+# exactly that shape.
+
+check_message() {
+    # $1: text to check. Anchored to start-of-line, exact case, matching the
+    # literal trailer this project's tooling and harnesses actually emit --
+    # not a loose match that could false-positive on commit-message prose
+    # mentioning the words claude session mid-sentence.
+    printf '%s\n' "$1" | grep -qn '^Claude-Session:'
+}
+
+if [ "$1" = "--selftest" ]; then
+    bad="fix: something
+
+Co-authored-by: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_selftest"
+    good="fix: something
+
+Co-authored-by: Claude Sonnet 5 <noreply@anthropic.com>"
+
+    if check_message "$bad"; then
+        echo "selftest: correctly detects a trailer in a bad message"
+    else
+        echo "FAIL: did not detect a known-bad message"
+        exit 1
+    fi
+
+    if check_message "$good"; then
+        echo "FAIL: false positive on a known-good message"
+        exit 1
+    else
+        echo "selftest: correctly passes a clean message"
+    fi
+
+    exit 0
+fi
+
+MSG_FILE="$1"
+
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
+    # git ALWAYS passes a real message-file path here -- that is the
+    # commit-msg hook contract, not something to defend against. If this
+    # branch is reached at all, something ran this script directly with a
+    # missing or bad argument (not via git, and not --selftest, which is
+    # handled above). That is misuse, not a legitimate case to fail open
+    # on -- a check whose own error path silently does nothing is exactly
+    # the failure shape this whole effort exists to stop shipping.
+    echo "usage: commit-msg <message-file> | --selftest" >&2
+    exit 1
+fi
+
+MSG_BODY="$(cat "$MSG_FILE")"
+
+if check_message "$MSG_BODY"; then
+    echo "" >&2
+    echo "############################################################" >&2
+    echo "#  REJECTED: this commit message carries a Claude-Session:  " >&2
+    echo "#  trailer. pocket-dial's convention forbids it (see         " >&2
+    echo "#  CONTRIBUTING_FIRMWARE.md, issue #326).                    " >&2
+    echo "#                                                            " >&2
+    echo "#  Remove that line and keep Co-Authored-By -- that part's   " >&2
+    echo "#  fine. If your harness auto-appends the trailer, strip it  " >&2
+    echo "#  before committing rather than after.                      " >&2
+    echo "############################################################" >&2
+    echo "" >&2
+    exit 1
+fi
+
+exit 0
