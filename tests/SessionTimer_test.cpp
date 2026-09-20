@@ -356,3 +356,111 @@ TEST(SessionTimer, OptionsAdvertisesTheMethodsAndOptionTagsThisPbxReallyHandles)
 	EXPECT_NE(accept.find("application/sdp"), std::string::npos) << ok;
 	EXPECT_NE(headerValue(ok, "Allow-Events").find("dialog"), std::string::npos) << ok;
 }
+
+// ── Slot recycling must not leak per-call state (issue #353) ─────────────────
+//
+// Sessions are pooled: allocateSession() finds a slot whose Call-ID is no
+// longer live and calls reset() on it. So reset() and release() are what make
+// a recycled slot indistinguishable from a fresh one, and any per-call field
+// that survives them leaks into the next caller.
+//
+// This bit for real. _isVoicemail had no clearing writer anywhere in the tree
+// -- two sites set it true, nothing ever set it false -- so one voicemail call
+// permanently marked its pool slot, and endCall()'s
+//
+//     if (ending->isVoicemail()) releaseVoicemailLeg(getVoicemailLegSlot())
+//
+// then tore down a leg index belonging to somebody else's live deposit.
+//
+// These tests assert the general property rather than the two fields that
+// happened to be wrong, so the next field added to Session is covered by the
+// test that already exists instead of the one nobody wrote.
+
+TEST(SessionRecycling, ResetClearsVoicemailStateSoTheNextCallIsNotMistakenForOne)
+{
+	Session s("call-vm-1", nullptr);
+	s.setVoicemail(true);
+	s.setVoicemailLegSlot(2);
+	s.setVoicemailPurpose(Session::VoicemailPurpose::Retrieval);
+
+	s.reset("call-ordinary-2", nullptr);
+
+	EXPECT_FALSE(s.isVoicemail())
+		<< "a recycled slot that once served voicemail must not still claim to be one";
+	EXPECT_EQ(s.getVoicemailLegSlot(), -1)
+		<< "endCall() releases this index; a stale one tears down another call's leg";
+	EXPECT_EQ(s.getVoicemailPurpose(), Session::VoicemailPurpose::Deposit)
+		<< "purpose drives tick()'s menu advance and must not survive either";
+}
+
+// The other half of the contract, and the one that is counter-intuitive
+// enough to need pinning: release() must NOT clear this state.
+//
+// endCall() releases the pool slot first and only afterwards asks
+// ending->isVoicemail() / getVoicemailLegSlot() so it can hand the media leg
+// back. Clearing in release() wipes the flag before its reader runs and
+// orphans the leg. That is not hypothetical -- it is what the first version of
+// the #353 fix did, and four VoicemailDivert tests went red on it.
+TEST(SessionRecycling, ReleaseDeliberatelyPreservesVoicemailStateForEndCall)
+{
+	Session s("call-vm-3", nullptr);
+	s.setVoicemail(true);
+	s.setVoicemailLegSlot(1);
+
+	s.release();
+
+	EXPECT_TRUE(s.isVoicemail())
+		<< "endCall() reads this AFTER release() to hand the media leg back";
+	EXPECT_EQ(s.getVoicemailLegSlot(), 1)
+		<< "clearing here orphans the leg; reset() is the recycling path, not this";
+}
+
+TEST(SessionRecycling, ResetClearsTrunkStateSoARelayPairIsNotReleasedTwice)
+{
+	Session s("call-trunk-1", nullptr);
+	s.setTrunk(true);
+	s.setTrunkRelaySlot(1);
+
+	s.reset("call-ordinary-4", nullptr);
+
+	EXPECT_FALSE(s.isTrunk())
+		<< "a stale trunk flag makes the session-timer sweep skip an ordinary call";
+	EXPECT_EQ(s.getTrunkRelaySlot(), -1)
+		<< "endCall() releases this pair; a stale index frees somebody else's relay";
+}
+
+// Same contract for the trunk pair: endCall() will read these after release()
+// to give the relay receivers back, so release() leaves them alone.
+TEST(SessionRecycling, ReleaseDeliberatelyPreservesTrunkStateForEndCall)
+{
+	Session s("call-trunk-2", nullptr);
+	s.setTrunk(true);
+	s.setTrunkRelaySlot(0);
+
+	s.release();
+
+	EXPECT_TRUE(s.isTrunk());
+	EXPECT_EQ(s.getTrunkRelaySlot(), 0);
+}
+
+// The property itself, stated once: a reset slot is a fresh slot. Written
+// against a session carrying BOTH kinds of per-call state at once, because the
+// real pool has no idea what the previous caller did with it.
+TEST(SessionRecycling, AResetSlotIsIndistinguishableFromAFreshOne)
+{
+	const Session fresh("call-fresh", nullptr);
+
+	Session used("call-used", nullptr);
+	used.setVoicemail(true);
+	used.setVoicemailLegSlot(3);
+	used.setVoicemailPurpose(Session::VoicemailPurpose::Retrieval);
+	used.setTrunk(true);
+	used.setTrunkRelaySlot(2);
+	used.reset("call-fresh", nullptr);
+
+	EXPECT_EQ(used.isVoicemail(),          fresh.isVoicemail());
+	EXPECT_EQ(used.getVoicemailLegSlot(),  fresh.getVoicemailLegSlot());
+	EXPECT_EQ(used.getVoicemailPurpose(),  fresh.getVoicemailPurpose());
+	EXPECT_EQ(used.isTrunk(),              fresh.isTrunk());
+	EXPECT_EQ(used.getTrunkRelaySlot(),    fresh.getTrunkRelaySlot());
+}
