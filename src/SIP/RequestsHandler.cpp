@@ -156,6 +156,11 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// a separate, later step — see startHoldMusic().
 	_park.setHoldMusic(&_holdMusic);
 
+	// Issue #164: SipTrunk reports dialog transitions through this. Registered
+	// once here and never changed -- the listener is this object, which outlives
+	// the trunk it is handed to.
+	_sipTrunk.setListener(this);
+
 	// Pre-allocate pools (Issue #53). Capacities are compile-time tunable via
 	// PoolConfig.hpp (-DPOCKETDIAL_MAX_* overrides); defaults preserve 32/8/32.
 	_clientPool.reserve(POCKETDIAL_MAX_CLIENTS);
@@ -1505,6 +1510,13 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 	// branch minted a 404 Not Found straight back at the phone that had just
 	// been beeped. The 487 also went unACKed, which RFC 3261 §17.1.1.3 requires,
 	// leaving the phone retransmitting it until Timer H (~32 s).
+	// Issue #164: a response to OUR trunk INVITE belongs to SipTrunk's dialog
+	// machine, not to any session branch below -- the trunk leg is a
+	// server-originated UAC with no handset Session of its own, so those
+	// branches could not claim it anyway. Same intercept position as the
+	// beeper's, for the same reason.
+	if (_sipTrunk.handleResponse(data)) return;
+
 	if (_beeper.handleInviteFailure(data))
 	{
 		return;
@@ -1556,6 +1568,13 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 	// machine that minted them and found by Call-ID, the same intercept order
 	// onOk() uses. Whoever claims it is responsible for the ACK (RFC 3261
 	// §17.1.1.3) and for releasing its slot.
+	// Issue #164: a response to OUR trunk INVITE belongs to SipTrunk's dialog
+	// machine, not to any session branch below -- the trunk leg is a
+	// server-originated UAC with no handset Session of its own, so those
+	// branches could not claim it anyway. Same intercept position as the
+	// beeper's, for the same reason.
+	if (_sipTrunk.handleResponse(data)) return;
+
 	if (_beeper.handleInviteFailure(data))
 	{
 		return;
@@ -4726,6 +4745,13 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 	// ...) below, which resolves the beep's own From ("pbx" — not a registered
 	// extension) and answers the phone that just started ringing with a stray
 	// 404 Not Found.
+	// Issue #164: a response to OUR trunk INVITE belongs to SipTrunk's dialog
+	// machine, not to any session branch below -- the trunk leg is a
+	// server-originated UAC with no handset Session of its own, so those
+	// branches could not claim it anyway. Same intercept position as the
+	// beeper's, for the same reason.
+	if (_sipTrunk.handleResponse(data)) return;
+
 	if (_beeper.ownsCallID(data->getCallID()))
 	{
 		return;
@@ -4780,6 +4806,13 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 	// Ahead of every session branch below on purpose: a beep dialog is a
 	// server-originated UAC with NO Session, so those branches could not claim
 	// it anyway, and the ordering matches drawbridge's onBusy().
+	// Issue #164: a response to OUR trunk INVITE belongs to SipTrunk's dialog
+	// machine, not to any session branch below -- the trunk leg is a
+	// server-originated UAC with no handset Session of its own, so those
+	// branches could not claim it anyway. Same intercept position as the
+	// beeper's, for the same reason.
+	if (_sipTrunk.handleResponse(data)) return;
+
 	if (_beeper.handleInviteFailure(data))
 	{
 		return;
@@ -4918,6 +4951,13 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 	// the 486 path in onBusy(): ACK it inside the INVITE transaction (RFC 3261
 	// §17.1.1.3) and free the slot, rather than fall through to endHandle() and
 	// mint a stray 404 at the phone off the beep's own "pbx" From.
+	// Issue #164: a response to OUR trunk INVITE belongs to SipTrunk's dialog
+	// machine, not to any session branch below -- the trunk leg is a
+	// server-originated UAC with no handset Session of its own, so those
+	// branches could not claim it anyway. Same intercept position as the
+	// beeper's, for the same reason.
+	if (_sipTrunk.handleResponse(data)) return;
+
 	if (_beeper.handleInviteFailure(data))
 	{
 		return;
@@ -5010,8 +5050,37 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Issue #164: the CARRIER hanging up its own trunk dialog. Claimed before
+	// the session lookup and before the forged-teardown check below, because
+	// neither applies: a trunk dialog has no handset Session under this
+	// Call-ID, and the carrier is not a registered client, so
+	// isDialogSourceAuthorized() has no leg IP to match it against. SipTrunk
+	// recognises it by Call-ID, answers the 200, and calls back into
+	// onTrunkRemoteBye() to BYE the handset side.
+	if (_sipTrunk.handleBye(data)) return;
+
 	auto session = getSession(data->getCallID());
 	std::string destNumber(data->getToNumber());
+
+	// Issue #164: the HANDSET hanging up a trunk call. Keyed on the session
+	// flag rather than the dialled number -- by now that is a PSTN string with
+	// nothing to distinguish it. Answer the phone, then let endCall() do the
+	// rest: it is the ONE place the carrier BYE is sent and the relay pair is
+	// released, so every other teardown path (CANCEL, forceDisconnect, the
+	// sweeps) gets the same treatment without repeating it here. That is the
+	// #246 lesson, applied rather than relearned.
+	if (session.has_value() && session.value()->isTrunk())
+	{
+		if (auto response = getMessageFromPool(*data))
+		{
+			response->setHeader(SipMessageTypes::OK);
+			response->clearBody();
+			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			_outbox.emplace_back(data->getSource(), std::move(response));
+		}
+		endCall(data->getCallID(), data->getFromNumber(), destNumber, "handset hung up");
+		return;
+	}
 
 	// Issue #46: reject an off-path forged teardown. A BYE for an established
 	// two-phone dialog must originate from one of the call's leg IPs.
@@ -5289,6 +5358,13 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 
 	// Register-beep dialog (server-originated UAC, no Session): recognised by
 	// Call-ID before the normal session lookup. handleOk drives ACK→BYE→free.
+	// Issue #164: a response to OUR trunk INVITE belongs to SipTrunk's dialog
+	// machine, not to any session branch below -- the trunk leg is a
+	// server-originated UAC with no handset Session of its own, so those
+	// branches could not claim it anyway. Same intercept position as the
+	// beeper's, for the same reason.
+	if (_sipTrunk.handleResponse(data)) return;
+
 	if (_beeper.handleOk(data))
 	{
 		return;
@@ -6792,6 +6868,22 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 		const int vmSlot = ending->getVoicemailLegSlot();
 		enqueueVoicemailFlush(vmSlot);
 		releaseVoicemailLeg(vmSlot, std::string(callID));
+	}
+
+	// Issue #164, same discipline as the voicemail release directly above and
+	// for the same reason: every teardown path funnels through endCall(), so
+	// releasing here covers BYE, CANCEL, forceDisconnect and the sweeps at
+	// once. Keyed on the session flag, never on the destination -- by now the
+	// dialled number is a PSTN string that looks like nothing in particular.
+	//
+	// hangup() is idempotent on an unknown Call-ID, which matters because the
+	// carrier-initiated paths reach endCall() with the trunk dialog already
+	// released: onTrunkFailed and onTrunkRemoteBye both free it before calling
+	// in. Only the handset-initiated paths actually need the BYE sent here.
+	if (ending && ending->isTrunk())
+	{
+		_sipTrunk.hangup(callID);
+		releaseTrunkRelay(ending->getTrunkRelaySlot());
 	}
 }
 
@@ -8693,7 +8785,7 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	// CALLER's own address, so relaying would send the phone its own
 	// re-INVITE back. Decline instead, so the holding phone keeps the call on
 	// the original SDP.
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || !src || !dest)
+	if (destNum == "777" || destNum == ConferenceRoom::EXT || (session && session->isTrunk()) || !src || !dest)
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -8805,7 +8897,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	}
 
 	// Same virtual-leg guard as onReinvite() above: 777/888 have no peer leg.
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || !src || !dest)
+	if (destNum == "777" || destNum == ConferenceRoom::EXT || (session && session->isTrunk()) || !src || !dest)
 	{
 		auto resp = getMessageFromPool(*data);
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -8996,7 +9088,14 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 		auto sweepSrc  = session->getSrc();
 		auto sweepDest = session->getDest();
 		const std::string sweepDestNum = sweepDest ? sweepDest->getNumber() : "";
-		if (!sweepSrc || !sweepDest ||
+		// Issue #164: a trunk leg is in this set too, and by flag rather than
+		// by dest number -- its dummy dest is a marker, not a dialable code.
+		// The comment above is the binding constraint: the set we refuse to
+		// REFRESH and the set we refuse to REAP must stay identical, so this
+		// matches the isTrunk() guard added to onReinvite()/onUpdate(). A relay
+		// leg has no local UA to answer a refresh, so without this the sweep
+		// BYEs a perfectly healthy PSTN call partway through.
+		if (!sweepSrc || !sweepDest || session->isTrunk() ||
 			sweepDestNum == "777" || sweepDestNum == ConferenceRoom::EXT ||
 			sweepDestNum == kAnchorCallExt)
 		{
@@ -9301,4 +9400,422 @@ std::shared_ptr<SipClient> RequestsHandler::allocateVirtualPeer(std::string numb
 		// Constructor already ran the deleter on `raw` — freed and decremented.
 		return nullptr;
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Generic ITSP SIP trunk: the B2BUA wiring (Issue #164)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// SipTrunk owns the carrier-facing dialog and TrunkResolver owns the SBC's
+// address. What lives here is everything that joins them to a handset: picking
+// a relay pair, cross-wiring it, and translating between the two dialogs'
+// lifecycles in both directions.
+//
+// The relay is two RtpReceivers and no RtpSender. A trunk must put the
+// carrier's packets back on the wire byte for byte -- RFC 4733 telephone-event
+// has no representation in RtpSender's PCMU FrameProvider, so a digit crossing
+// it would arrive as noise. RtpReceiver::sendRaw() re-emits the original
+// packet from the receiver's own socket, which also makes the media symmetric
+// with the port the SDP advertised.
+
+namespace
+{
+	// Identity for the per-session dummy dest a trunk call carries. Non-numeric
+	// on purpose: every other virtual leg borrows a DIALABLE code (777, 888,
+	// 555) because you reach it by dialling it, but a trunk is reached through
+	// a dial-plan rule and has no code of its own. A non-numeric marker cannot
+	// collide with an extension, a park orbit, a page zone or a PSTN number, so
+	// it needs no entry in the reserved-identity guards -- unlike the voicemail
+	// leg's "700", which sits inside the park-orbit range.
+	constexpr const char* kTrunkCallExt = "trunk";
+
+	// RtpReceiver::RawSink is a plain function pointer plus a ctx (issue #284:
+	// std::function's small-object buffer is 8 bytes on this toolchain, so a
+	// capturing lambda would heap-allocate on a media path). The ctx is the
+	// PEER receiver, and relaying is one call.
+	void trunkRelayForward(void* ctx, const RtpReceiver::RtpPacket& pkt)
+	{
+		if (!ctx) return;
+		static_cast<RtpReceiver*>(ctx)->sendRaw(pkt);
+	}
+}
+
+void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	_sipTrunk.setConfig(cfg);
+	// The operator has pointed the trunk somewhere else, so any cached address
+	// is not merely stale, it is wrong -- see TrunkResolver::clear().
+	_trunkResolver.clear();
+}
+
+SipTrunk::Config RequestsHandler::getTrunkConfig()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _sipTrunk.config();
+}
+
+size_t RequestsHandler::trunkRelaysInUseForTest()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	size_t n = 0;
+	for (int i = 0; i < static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS); ++i)
+	{
+		if (_trunkRx[i].isActive() || _handsetRx[i].isActive()) ++n;
+	}
+	return n;
+}
+
+int RequestsHandler::findFreeTrunkRelay() const
+{
+	for (int i = 0; i < static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS); ++i)
+	{
+		if (!_trunkRx[i].isActive() && !_handsetRx[i].isActive()) return i;
+	}
+	return -1;
+}
+
+void RequestsHandler::releaseTrunkRelay(int slot)
+{
+	if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS)) return;
+
+	// Drop the cross-wiring before stopping, so a packet in flight on the other
+	// receiver's task cannot be handed to a receiver that is mid-stop. Clearing
+	// the sink is a lock-protected store inside RtpReceiver; stop() then joins.
+	_trunkRx[slot].setRawSink(nullptr, nullptr);
+	_handsetRx[slot].setRawSink(nullptr, nullptr);
+	_trunkRx[slot].stop();
+	_handsetRx[slot].stop();
+}
+
+void RequestsHandler::refuseRingingTrunk(const std::string& callId, int carrierStatus)
+{
+	// Same contract as refuseRingingAnchor(): endCall() never sends a final
+	// response, so any path that gives up while the handset is still ringing
+	// must answer it here first or the phone rings forever.
+	auto sit = _sessions.find(callId);
+	if (sit == _sessions.end() || !sit->second) return;
+	if (sit->second->getState() != Session::State::Invited) return;
+	auto invite = sit->second->getInviteMessage();
+	if (!invite) return;
+	auto resp = getMessageFromPool(*invite);
+	if (!resp) return;
+
+	// Map the carrier's status onto one that means the same thing to a handset.
+	// Passing the carrier's own code straight through is wrong for the codes
+	// that describe the CARRIER's state rather than the callee's: a 503 from
+	// the SBC means "this trunk is unavailable", which a phone should hear as
+	// the call not completing, not as the called party being unavailable.
+	const char* line = "SIP/2.0 502 Bad Gateway";
+	switch (carrierStatus)
+	{
+		case 486: line = "SIP/2.0 486 Busy Here";          break;  // callee busy: true end to end
+		case 404: line = "SIP/2.0 404 Not Found";          break;  // bad number: true end to end
+		case 480:
+		case 408:
+		case 503: line = "SIP/2.0 503 Service Unavailable"; break; // carrier-side, incl. our timeout
+		default:  break;                                           // anything else: 502
+	}
+	resp->setHeader(line);
+	resp->clearBody();
+	resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
+	resp->setContact(buildContact(std::string(invite->getToNumber())));
+	_outbox.emplace_back(invite->getSource(), std::move(resp));
+}
+
+bool RequestsHandler::routeTrunkCall(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<SipClient>& caller, const std::string& destination)
+{
+	// No generic trunk configured: this is the vendor-API anchor route it has
+	// always been. respondIfDisconnected=false keeps the "rule matched but
+	// nothing to route to" 404 with CallForker, which owns that tail.
+	if (!_sipTrunk.config().valid())
+	{
+		return originateAnchorCall(data, caller, destination, /*respondIfDisconnected=*/false);
+	}
+
+	const std::string callID(data->getCallID());
+
+	auto refuse = [&](const char* statusLine, const char* why) {
+		auto msg = getMessageFromPool(*data);
+		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
+		msg->setHeader(statusLine);
+		msg->clearBody();
+		msg->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		msg->setContact(buildContact(destination));
+		_outbox.emplace_back(data->getSource(), std::move(msg));
+		queueLog("trunk: " + std::string(why) + " for " + std::string(caller->getNumber())
+			+ " -> " + destination, true);
+	};
+
+	// Cache-only lookup. resolve() would start a DNS job, and this runs on the
+	// SIP thread under _mutex where a blocking getaddrinfo is exactly what
+	// TrunkResolver exists to keep out. tick() is what refreshes the cache, so
+	// steady state is a Hit and only the first call after boot can miss.
+	sockaddr_in sbc{};
+	const auto status = _trunkResolver.lookup(_sipTrunk.config().host,
+		_sipTrunk.config().port, sbc, std::chrono::steady_clock::now());
+	if (status != TrunkResolver::Status::Hit)
+	{
+		refuse("SIP/2.0 503 Service Unavailable", "SBC address not resolved yet");
+		return true;
+	}
+
+	const int slot = findFreeTrunkRelay();
+	if (slot < 0)
+	{
+		refuse("SIP/2.0 503 Service Unavailable", "every trunk relay pair busy");
+		return true;
+	}
+
+	// Where the handset wants its audio. Read before anything is claimed: a
+	// malformed offer costs nothing to refuse here and would otherwise leave a
+	// started receiver to unwind.
+	std::string handsetIp;
+	uint16_t    handsetPort = 0;
+	if (!parseCallerRtp(data, handsetIp, handsetPort))
+	{
+		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in INVITE");
+		return true;
+	}
+
+	sockaddr_in handsetRtp{};
+	handsetRtp.sin_family = AF_INET;
+	handsetRtp.sin_addr.s_addr = inet_addr(handsetIp.c_str());
+	handsetRtp.sin_port = htons(handsetPort);
+
+	// Bring up the carrier-facing half only. It needs to be bound before the
+	// INVITE goes out because its port is what the SDP offer advertises, but it
+	// has no peer yet -- we do not learn the carrier's RTP address until the
+	// answer. Its raw sink already points at the handset-facing receiver, so
+	// early media works the moment setRawPeer() lands on the far side; until
+	// then sendRaw() drops for want of a peer, which is the intended
+	// "drop, do not guess" behaviour.
+	//
+	// Null Sink: a relay never decodes. That is not an optimisation -- decoding
+	// is what would hand a carrier IVR's keypress to the local star-code parser.
+	if (!_handsetRx[slot].setRawPeer(handsetRtp))
+	{
+		refuse(SipMessageTypes::BAD_REQUEST, "handset RTP address is unusable");
+		return true;
+	}
+	_trunkRx[slot].setRawSink(&trunkRelayForward, &_handsetRx[slot]);
+	if (!_trunkRx[slot].start(0, nullptr))
+	{
+		releaseTrunkRelay(slot);
+		refuse("SIP/2.0 500 Server Internal Error", "trunk relay receiver failed to start");
+		return true;
+	}
+
+	auto newSession = allocateSession(callID, caller);
+	if (!newSession)
+	{
+		releaseTrunkRelay(slot);
+		refuse("SIP/2.0 503 Service Unavailable", "session pool full");
+		return true;
+	}
+
+	// Per-session dummy dest, never a shared client, exactly as the anchor and
+	// voicemail legs do -- a concurrent 777/440/888 call must not be able to
+	// overwrite this call's destination identity, and the BYE/CANCEL leg-IP
+	// check compares against its address.
+	auto dummyTrunk = allocateVirtualPeer(kTrunkCallExt, data->getSource());
+	if (!dummyTrunk)
+	{
+		releaseTrunkRelay(slot);
+		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
+		return true;
+	}
+	newSession->setDest(dummyTrunk);
+	newSession->setInviteMessage(data);
+	newSession->setTrunk(true);
+	newSession->setTrunkRelaySlot(slot);
+	newSession->setState(Session::State::Invited);
+	const std::string localTag = IDGen::GenerateID(9);
+	newSession->setLocalTag(localTag);
+	// Deliberately NO ring timer. SipTrunk::sweep() owns the no-answer deadline
+	// for this call and fires onTrunkFailed(408) when it expires; arming the
+	// session's own reaper as well would give one call two independent
+	// teardowns racing each other.
+	_sessions.emplace(callID, newSession);
+
+	auto ringing = getMessageFromPool(*data);
+	if (ringing)
+	{
+		ringing->setHeader(SipMessageTypes::RINGING);
+		ringing->clearBody();
+		ringing->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		ringing->setTo(std::string(data->getTo()) + ";tag=" + localTag);
+		ringing->setContact(buildContact(destination));
+		_outbox.emplace_back(data->getSource(), std::move(ringing));
+	}
+
+	if (!_sipTrunk.placeCall(destination, callID, sbc,
+		static_cast<uint16_t>(_trunkRx[slot].localPort())))
+	{
+		// Nothing reached the wire and no dialog slot was consumed (placeCall's
+		// contract), so unwind everything this function claimed. endCall() is
+		// what releases the relay, keyed on the session flag, so it does not
+		// need repeating here.
+		refuse("SIP/2.0 503 Service Unavailable", "trunk refused the call");
+		endCall(callID, caller->getNumber(), destination, "trunk placeCall failed");
+		return true;
+	}
+
+	queueLog("trunk: " + std::string(caller->getNumber()) + " -> " + destination
+		+ " ringing (relay pair " + std::to_string(slot) + ")");
+	return true;
+}
+
+// ── SipTrunk::Listener ───────────────────────────────────────────────────────
+
+void RequestsHandler::onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia)
+{
+	// The handset already got its 180 when the call was placed, so there is
+	// nothing to forward. A 183 carries the carrier's SDP and could start early
+	// media, which is deliberately deferred (see the issue): relaying it means
+	// answering the handset's offer before the call is answered, and getting
+	// that wrong leaves a connected-sounding call that never completes. Until
+	// then the caller hears local ringback rather than the carrier's own
+	// announcement, which is worth knowing when a SIT tone would have explained
+	// a failure.
+	if (earlyMedia)
+	{
+		queueLog("trunk: carrier signalled early media (183); not relayed yet, "
+			"caller hears local ringback for " + std::string(ev.handsetCallID));
+	}
+}
+
+void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
+	const std::shared_ptr<SipMessage>& ok)
+{
+	const std::string handsetCallID(ev.handsetCallID);
+	auto sit = _sessions.find(handsetCallID);
+	if (sit == _sessions.end() || !sit->second) return;
+	auto session = sit->second;
+	const int slot = session->getTrunkRelaySlot();
+	if (slot < 0) return;
+
+	auto invite = session->getInviteMessage();
+	if (!invite)
+	{
+		_sipTrunk.hangup(ev.trunkCallID);
+		endCall(handsetCallID, session->getSrc() ? session->getSrc()->getNumber() : "",
+			"", "trunk answered but the handset INVITE was not retained");
+		return;
+	}
+
+	// Where the carrier wants its audio. Without this the relay has nowhere to
+	// send and the call is one-way silence, so a failure here is fatal to the
+	// call rather than something to log and continue past.
+	std::string carrierIp;
+	uint16_t    carrierPort = 0;
+	if (!parseCallerRtp(ok, carrierIp, carrierPort))
+	{
+		_sipTrunk.hangup(ev.trunkCallID);
+		refuseRingingTrunk(handsetCallID, 502);
+		endCall(handsetCallID, invite->getFromNumber(), invite->getToNumber(),
+			"carrier answer carried no usable RTP destination");
+		return;
+	}
+
+	sockaddr_in carrierRtp{};
+	carrierRtp.sin_family = AF_INET;
+	carrierRtp.sin_addr.s_addr = inet_addr(carrierIp.c_str());
+	carrierRtp.sin_port = htons(carrierPort);
+	if (!_trunkRx[slot].setRawPeer(carrierRtp))
+	{
+		_sipTrunk.hangup(ev.trunkCallID);
+		refuseRingingTrunk(handsetCallID, 502);
+		endCall(handsetCallID, invite->getFromNumber(), invite->getToNumber(),
+			"carrier RTP address is unusable");
+		return;
+	}
+
+	// Bring up the handset-facing half and complete the cross-wiring. Started
+	// only now because its bound port is what the 200 OK advertises, and there
+	// was nothing to advertise it to until the call was answered.
+	_handsetRx[slot].setRawSink(&trunkRelayForward, &_trunkRx[slot]);
+	if (!_handsetRx[slot].start(0, nullptr))
+	{
+		_sipTrunk.hangup(ev.trunkCallID);
+		refuseRingingTrunk(handsetCallID, 500);
+		endCall(handsetCallID, invite->getFromNumber(), invite->getToNumber(),
+			"handset relay receiver failed to start");
+		return;
+	}
+
+	auto resp = getMessageFromPool(*invite);
+	if (!resp)
+	{
+		// Pool exhausted with the carrier already answered: hang the carrier up
+		// rather than leave a billing call with no handset attached to it.
+		_sipTrunk.hangup(ev.trunkCallID);
+		endCall(handsetCallID, invite->getFromNumber(), invite->getToNumber(),
+			"message pool exhausted answering a trunk call");
+		return;
+	}
+
+	// sendrecv: a trunk call is two-way, unlike 440's one-way tone. The DTMF
+	// payload type is echoed from the HANDSET's own offer (RFC 3264: an answer
+	// reuses the offerer's numbering), which is also what lets a keypress reach
+	// the carrier at all -- the relay passes those packets through untouched.
+	const std::string sdpBody = buildMediaSdp(_localIp, _handsetRx[slot].localPort(),
+		/*sendrecv=*/true, invite->getTelephoneEventPayloadType());
+
+	resp->setHeader(SipMessageTypes::OK);
+	resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
+	resp->setTo(std::string(invite->getTo()) + ";tag=" + session->getLocalTag());
+	resp->setContact(buildContact(std::string(invite->getToNumber())));
+	resp->setBody(sdpBody);   // resyncs Content-Length itself
+	_outbox.emplace_back(invite->getSource(), std::move(resp));
+
+	// Issue #232: this leg is server-terminated on the handset side, so this is
+	// the only place its dialog identity is ever known. Without it a
+	// server-initiated teardown cannot build a BYE toward the handset.
+	session->setDialogHeaders(std::string(invite->getFrom()),
+		std::string(invite->getTo()) + ";tag=" + session->getLocalTag());
+	session->setState(Session::State::Connected);
+	queueLog("trunk: call connected (relay pair " + std::to_string(slot) + ")");
+}
+
+void RequestsHandler::onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status)
+{
+	const std::string handsetCallID(ev.handsetCallID);
+	auto sit = _sessions.find(handsetCallID);
+	if (sit == _sessions.end() || !sit->second) return;
+
+	auto src  = sit->second->getSrc();
+	auto inv  = sit->second->getInviteMessage();
+	const std::string from = src ? std::string(src->getNumber())
+		: (inv ? std::string(inv->getFromNumber()) : std::string());
+	const std::string to   = inv ? std::string(inv->getToNumber()) : std::string();
+
+	// Answer the still-ringing handset BEFORE tearing down: endCall() sends no
+	// final response, so skipping this leaves the phone ringing at a call that
+	// is already gone.
+	refuseRingingTrunk(handsetCallID, status);
+	endCall(handsetCallID, from, to,
+		"trunk call failed (" + std::to_string(status) + ")");
+}
+
+void RequestsHandler::onTrunkRemoteBye(const SipTrunk::TrunkEvent& ev)
+{
+	const std::string handsetCallID(ev.handsetCallID);
+	auto sit = _sessions.find(handsetCallID);
+	if (sit == _sessions.end() || !sit->second) return;
+	auto session = sit->second;
+
+	auto src = session->getSrc();
+	const std::string from = src ? std::string(src->getNumber()) : std::string();
+
+	// The carrier hung up. BYE the handset off the dialog identity recorded
+	// when we answered it (#232), then tear the call down the ordinary way.
+	if (src && !session->getDialogFrom().empty() && !session->getDialogTo().empty())
+	{
+		auto bye = buildServerBye(std::string(src->getNumber()), src->getAddress(),
+			handsetCallID, session->getDialogFrom(), session->getDialogTo());
+		if (bye) _outbox.emplace_back(src->getAddress(), std::move(bye));
+	}
+	endCall(handsetCallID, from, "", "carrier hung up");
 }

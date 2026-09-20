@@ -282,6 +282,17 @@ public:
 	// case the caller must not process it further.
 	bool handleResponse(const std::shared_ptr<SipMessage>& data);
 
+	// The carrier hanging up first. Answers 200, releases the dialog and tells
+	// the listener, which is what BYEs the handset leg.
+	//
+	// Returns false for anything that is not an in-dialog BYE we recognise, so
+	// the engine can carry on treating it as an ordinary request. Recognition
+	// is by Call-ID alone: the carrier is not a registered client, so none of
+	// the registrar-backed authorisation the handset paths use applies here,
+	// and the Call-ID of a live trunk dialog is the only thing that identifies
+	// it. That is the same basis ownsCallID() already answers on.
+	bool handleBye(const std::shared_ptr<SipMessage>& data);
+
 	// Tear down the trunk leg for `callID` (either the trunk's own Call-ID or the
 	// handset leg's). Sends a BYE if the dialog is confirmed; frees it outright if
 	// it never got that far. Returns true if a dialog was found.

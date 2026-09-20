@@ -55,6 +55,8 @@
 #include "ServiceExtensions.hpp"   // Issue #202: the engine-owned pseudo-AOR table
 #include "RtpSender.hpp"
 #include "RtpReceiver.hpp"
+#include "SipTrunk.hpp"
+#include "TrunkResolver.hpp"
 #include "AnchorClient.hpp"
 #include "LoopbackAnchorClient.hpp"
 #include "TelephonyAnchorClient.hpp"
@@ -73,7 +75,11 @@
 #include "BlfSubscriptions.hpp"
 #include "ConferenceRoom.hpp"
 
-class RequestsHandler : private PbxEnv
+// SipTrunk::Listener is a PRIVATE base for the same reason PbxEnv is: these
+// are inward-facing contracts the engine implements for its own machines, not
+// part of the surface a caller gets. setListener(this) happens in the
+// constructor, where the conversion to Listener* is accessible.
+class RequestsHandler : private PbxEnv, private SipTrunk::Listener
 {
 public:
 
@@ -287,6 +293,26 @@ public:
 	void setDialRule(const std::string& pattern, const std::string& action, const std::string& target,
 		int stripDigits = 0);
 	std::vector<std::tuple<std::string, std::string, std::string, int>> getDialRules();
+
+	// ── Generic ITSP SIP trunk (Issue #164) ──────────────────────────────────
+	//
+	// The carrier side of a "route to trunk" dial rule. With no valid config
+	// the rule behaves exactly as it always has and routes to the vendor-API
+	// anchor instead, so installing this is what switches a board over.
+	//
+	// Config::host may be a dotted quad or a name. A name is resolved off the
+	// SIP thread by TrunkResolver and only the CACHE is consulted when a call
+	// is placed, so the first call after a config change can be refused with
+	// 503 while the first resolution completes. A literal is answered directly
+	// and is the common static-IP-trunk case.
+	void setTrunkConfig(const SipTrunk::Config& cfg);
+	SipTrunk::Config getTrunkConfig();
+
+	// How many of the POCKETDIAL_MAX_TRUNK_CALLS relay pairs are in use. A pair
+	// is two cross-wired RtpReceivers; this is the only external view of that,
+	// and it is what a test asserts against to show a teardown really released
+	// the media rather than only answering the signalling.
+	size_t trunkRelaysInUseForTest();
 
 	// ── Telephony-API credential slots (ported from drawbridge) ──────────────────
 	// TelephonyApiConfig.hpp owns validation + NVS/file persistence for the
@@ -643,11 +669,39 @@ private:
 	{
 		return parseRequestedExpires(msg);
 	}
+	// A dial-plan "route to trunk" action. Prefers a configured generic SIP
+	// trunk (#164); with none configured this is the vendor-API anchor path it
+	// has always been, unchanged.
 	bool routeTrunkCall(const std::shared_ptr<SipMessage>& data,
-		const std::shared_ptr<SipClient>& caller, const std::string& destination) override
-	{
-		return originateAnchorCall(data, caller, destination, /*respondIfDisconnected=*/false);
-	}
+		const std::shared_ptr<SipClient>& caller, const std::string& destination) override;
+
+	// ── SipTrunk::Listener (Issue #164) ──────────────────────────────────────
+	// Called synchronously on the SIP thread with _mutex already held, from
+	// inside SipTrunk::handleResponse()/sweep(). See SipTrunk::Listener for the
+	// ordering guarantees each one carries.
+	void onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia) override;
+	void onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
+		const std::shared_ptr<SipMessage>& ok) override;
+	void onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status) override;
+	void onTrunkRemoteBye(const SipTrunk::TrunkEvent& ev) override;
+
+	// A relay pair is free when NEITHER receiver is active. Scanned rather than
+	// tracked with a flag, the same shape the voicemail slot scan settled on:
+	// the receivers are the real resource, so asking them directly cannot drift
+	// out of step with a bookkeeping bool the way a flag can.
+	int  findFreeTrunkRelay() const;
+
+	// Stop both receivers of a pair and drop their raw wiring. Idempotent, and
+	// safe on a slot that was never started -- endCall() is the ONE place this
+	// runs, for every teardown path, which is the #246 lesson applied here
+	// rather than relearned.
+	void releaseTrunkRelay(int slot);
+
+	// Refuse a still-ringing trunk call on its retained INVITE, mapping the
+	// carrier's status onto one the handset should see. Mirrors
+	// refuseRingingAnchor(), including the rule that endCall() never sends a
+	// final response itself.
+	void refuseRingingTrunk(const std::string& callId, int carrierStatus);
 
 	// RFC 3261 §17 INVITE client transactions (Timer A/B/L). Guarded by _mutex.
 	TransactionLayer _txLayer{*this};
@@ -1482,6 +1536,33 @@ private:
 	RtpReceiver  _vmRtpReceivers[POCKETDIAL_MAX_VOICEMAIL_LEGS];
 	RtpSender    _vmRtpSenders[POCKETDIAL_MAX_VOICEMAIL_LEGS];
 	VoicemailLeg _vmLegs[POCKETDIAL_MAX_VOICEMAIL_LEGS];
+
+	// ── Generic ITSP SIP trunk (Issue #164) ──────────────────────────────────
+	//
+	// A trunk call is a B2BUA with a relay in the middle: the handset's dialog
+	// on one side, SipTrunk's dialog to the carrier on the other, and a PAIR of
+	// RtpReceivers cross-wired so each one's raw sink feeds the other's
+	// sendRaw().
+	//
+	// Two receivers and NO RtpSender, which is the part worth explaining. A
+	// relay must put the carrier's packets back on the wire byte for byte:
+	// RFC 4733 telephone-event and comfort noise have no representation in
+	// RtpSender's pull-based FrameProvider, which fills PCMU frames stamped
+	// with its own sequence and timestamp, so routing a relay through it would
+	// silently convert every DTMF digit into noise. RtpReceiver::sendRaw()
+	// transmits from the receiver's OWN bound socket instead, which also gives
+	// symmetric RTP for free -- media leaves the exact port the SDP advertised,
+	// which NAT-latching carriers require.
+	//
+	// Index-matched pair, same shape as the anchor and voicemail pools:
+	//   _trunkRx[i]   faces the CARRIER   -- its port goes in the trunk INVITE
+	//   _handsetRx[i] faces the HANDSET   -- its port goes in the 200 OK
+	// A slot is free when neither is active. The owning Session remembers the
+	// index (setTrunkRelaySlot), because a receiver carries no Call-ID.
+	TrunkResolver _trunkResolver;
+	SipTrunk      _sipTrunk{*this};
+	RtpReceiver   _trunkRx[POCKETDIAL_MAX_TRUNK_CALLS];
+	RtpReceiver   _handsetRx[POCKETDIAL_MAX_TRUNK_CALLS];
 
 	// Recording/staging buffer pool (see PoolConfig.hpp's
 	// POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES budget comment and
