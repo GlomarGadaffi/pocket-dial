@@ -315,6 +315,9 @@ one of them yet.
   SoftAP's station cap: the mesh-vs-wired-backbone decision
 - **[THREAT_MODEL.md](docs/THREAT_MODEL.md)** — STRIDE analysis and the residual risks
 - **[API.md](docs/API.md)** — every HTTP endpoint
+- **[3cxAPI+Webhooks.md](docs/3cxAPI+Webhooks.md)** — the anchor leg's 3CX Call
+  Control API: every participant action, the WebSocket event model, and why hold
+  cannot be signalled on that leg at all
 - **[CONTRIBUTING.md](docs/CONTRIBUTING.md)** — build, test and PR workflow
 
 ---
