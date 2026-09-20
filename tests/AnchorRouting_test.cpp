@@ -596,6 +596,7 @@ TEST(AnchorRouting, TickTearsDownAnAnchorCallAfterRepeatedWriteAudioFailures)
 	ASSERT_TRUE(bridge->isAudioDegraded())
 		<< "30 writes against a disconnected anchor must cross the failure threshold";
 
+	sent.clear();   // isolate this tick()'s own output, see the Held sibling test
 	handler.tick();
 
 	EXPECT_FALSE(handler.getSession("Call-ID: anchor-280").has_value())
@@ -603,6 +604,81 @@ TEST(AnchorRouting, TickTearsDownAnAnchorCallAfterRepeatedWriteAudioFailures)
 		   "pumping audio into a dead connection for the rest of the call";
 	EXPECT_FALSE(bridge->isActive())
 		<< "tick() must have released the bridge along with the session";
+
+	// Issue #279: same BYE-to-handset assertion as the Held sibling test
+	// below, here for the CONNECTED (not Held) case -- confirms the fix
+	// isn't accidentally Held-state-specific. See that test's comment for
+	// why sent.size() isn't asserted directly (ext 501's keepalive OPTIONS
+	// legitimately shares this same tick() pass).
+	std::vector<std::string> byesToHandset;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg) continue;
+		if (addr.sin_addr.s_addr != addrFor("192.168.9.51").sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.rfind("BYE ", 0) == 0) byesToHandset.push_back(raw);
+	}
+	ASSERT_EQ(byesToHandset.size(), 1u)
+		<< "expected exactly one BYE addressed to the handset among "
+		<< sent.size() << " total message(s) this tick() sent";
+	EXPECT_NE(byesToHandset.front().find("Call-ID: anchor-280"), std::string::npos)
+		<< "the BYE must carry the SAME Call-ID as the torn-down session";
+}
+
+TEST(AnchorRouting, ForceDisconnectByesTheHandsetOnASynchronousAnchorCall)
+{
+	// Advisor's ask while reviewing #279: the missing setDialogHeaders() on
+	// the synchronous anchor-answer path (fixed alongside #279's own change)
+	// silently broke every OTHER teardown path that relies on
+	// getDialogFrom()/getDialogTo(), not just the new one -- forceDisconnect()
+	// (/api/kill's engine, #228) is the other one already shipping. Confirms
+	// that fix's blast radius directly rather than asserting it.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-228"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-228").has_value());
+
+	sent.clear();
+	handler.forceDisconnect("501");
+
+	// forceDisconnect() queues to _asyncOutbox, not _outbox directly (the
+	// HTTP-thread rule -- see ForceDisconnect_test.cpp's own header comment
+	// for why) -- flushed by the next SIP-thread pass, same technique that
+	// file already uses: a benign OPTIONS from an address unrelated to this
+	// call.
+	EXPECT_TRUE(sent.empty())
+		<< "forceDisconnect() must not write _outbox directly";
+	std::string flushRaw =
+		"OPTIONS sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.9.99:5060;branch=z9hG4bKflush279\r\n"
+		"From: <sip:probe@server>;tag=probetag279\r\n"
+		"To: <sip:server@server>\r\n"
+		"Call-ID: flush-279\r\n"
+		"CSeq: 1 OPTIONS\r\n"
+		"Max-Forwards: 70\r\n"
+		"Content-Length: 0\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(flushRaw, addrFor("192.168.9.99")));
+
+	EXPECT_FALSE(handler.getSession("Call-ID: anchor-228").has_value());
+
+	std::vector<std::string> byesToHandset;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg) continue;
+		if (addr.sin_addr.s_addr != addrFor("192.168.9.51").sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.rfind("BYE ", 0) == 0) byesToHandset.push_back(raw);
+	}
+	ASSERT_EQ(byesToHandset.size(), 1u)
+		<< "forceDisconnect() on a synchronous anchor call must BYE the "
+		   "handset now that dialog headers are actually captured for it";
+	EXPECT_NE(byesToHandset.front().find("Call-ID: anchor-228"), std::string::npos)
+		<< byesToHandset.front();
 }
 
 TEST(AnchorRouting, TickTearsDownAHeldAnchorCallAfterRepeatedMohWriteFailures)
@@ -653,6 +729,13 @@ TEST(AnchorRouting, TickTearsDownAHeldAnchorCallAfterRepeatedMohWriteFailures)
 	}
 	ASSERT_TRUE(bridge->isAudioDegraded());
 
+	// #279's own gap: local bookkeeping getting torn down (asserted below) was
+	// already true before this fix. What was MISSING is the thing that
+	// actually matters to the caller holding a Yealink -- nobody ever told
+	// the handset the call ended. Clear here so only THIS tick()'s output is
+	// under test, matching this file's own idiom before every handle()/tick()
+	// whose output is checked.
+	sent.clear();
 	handler.tick();
 
 	EXPECT_FALSE(handler.getSession("Call-ID: anchor-279").has_value())
@@ -660,6 +743,42 @@ TEST(AnchorRouting, TickTearsDownAHeldAnchorCallAfterRepeatedMohWriteFailures)
 		   "exactly the #279 shape (MoH into a dead connection, no crash, "
 		   "no remote BYE to notice by)";
 	EXPECT_FALSE(bridge->isActive());
+
+	// The fix under test: extension 501 (the handset) must actually be BYE'd,
+	// not just silently forgotten. Before this change, tearing down a
+	// degraded anchor leg dropped the anchor side (asyncDropCall) and erased
+	// the session, but never queued anything toward the local phone -- so the
+	// Yealink kept believing the call was live and a later resume attempt
+	// drew a 481, which is precisely desmo's live repro.
+	//
+	// NOT asserting sent.size() == 1: this tick() pass also drives ext 501's
+	// registration keepalive (RequestsHandler.cpp's OPTIONS-ping sweep, ~5 s
+	// idle threshold), which is real, correct, unrelated behaviour -- this
+	// test's job is to find ITS BYE among whatever else legitimately fired,
+	// not to assume it is alone. Learned by running this exact assertion
+	// with size()==1 first and watching it fail with size()==2, rather than
+	// assumed.
+	std::vector<std::string> byesToHandset;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg) continue;
+		// Inline rather than a new sameAddr()-style helper -- this file's own
+		// addrFor() is the same function that generated the registered
+		// handset's address in the first place, so comparing the IP it
+		// produces is exact, not approximate. 3CX/the anchor leg is not a
+		// SIP endpoint this board dialogues with directly (reached via
+		// asyncDropCall(), already asserted above via the bridge/anchor-
+		// client state), so any BYE here can only be handset-addressed.
+		if (addr.sin_addr.s_addr != addrFor("192.168.9.51").sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.rfind("BYE ", 0) == 0) byesToHandset.push_back(raw);
+	}
+	ASSERT_EQ(byesToHandset.size(), 1u)
+		<< "expected exactly one BYE addressed to the handset among "
+		<< sent.size() << " total message(s) this tick() sent";
+	EXPECT_NE(byesToHandset.front().find("Call-ID: anchor-279"), std::string::npos)
+		<< "the BYE must carry the SAME Call-ID as the torn-down session, "
+		   "or the handset has no way to match it to the dead call";
 }
 
 TEST(AnchorRouting, TickDoesNotTearDownAnAnchorCallThatHasNeverWrittenSuccessfully)
