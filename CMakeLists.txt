@@ -18,6 +18,10 @@ else()
         add_compile_definitions(NOMINMAX)
     endif()
 
+    if (MSVC)
+        add_compile_options(/Zc:lambda)
+    endif()
+
     set(SRC_DIR "${PROJECT_SOURCE_DIR}/src")
 
     set(HELPERS_SRC_FILES "${SRC_DIR}/Helpers")

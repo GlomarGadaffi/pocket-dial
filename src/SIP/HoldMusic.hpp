@@ -53,6 +53,7 @@
 #include <string>
 
 #include "PoolConfig.hpp"
+#include "L2RtpFrame.hpp"
 
 class HoldMusic
 {
@@ -229,6 +230,9 @@ private:
 		uint16_t seq      = 0;
 		uint32_t timestamp = 0;
 		sockaddr_in dest{};
+		
+		// L2 RTP TX (Issue #282 / #329)
+		l2rtp::EgressChannel l2Channel{};
 	};
 
 	void freeClipLocked();
@@ -240,8 +244,9 @@ private:
 	std::atomic<bool> _stopRequested{false};
 	std::atomic<bool> _taskRunning{false};
 	// Touched only by the pacing task, so no synchronisation is needed or wanted.
-	uint32_t _txErrors = 0;   // failed sendto()s — a silent gap otherwise
-	uint32_t _ticks    = 0;   // drives the one-shot stack high-water report
+	uint32_t _txErrors   = 0; // failed sendto()s — a silent gap otherwise
+	uint32_t _l2TxErrors = 0; // failed L2 transmits
+	uint32_t _ticks      = 0; // drives the one-shot stack high-water report
 	// Issue #273: the deep (held-call) path's stack margin. Pacing task only.
 	bool     _deepPathSampled = false;
 	uint32_t _stackLowWater   = 0xFFFFFFFFu;

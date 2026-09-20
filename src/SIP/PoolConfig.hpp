@@ -283,6 +283,15 @@
 #define POCKETDIAL_MAX_VOICEMAIL_LEGS 2
 #endif
 
+// Depth of the shared L2 DMA frame buffer pool for real-time RTP TX (#282, #329).
+// Sized to comfortably exceed the maximum concurrent transmitting RTOS tasks
+// (rtp_media_tx, hold_music_tx, conf_mix_tick). 6 buffers = 3,336 B of internal
+// DMA SRAM. If momentarily exhausted, acquire() fails fast and drops the 20 ms
+// frame, triggering handset Packet Loss Concealment (PLC) without stalling tasks.
+#ifndef POCKETDIAL_DMA_FRAME_POOL_SIZE
+#define POCKETDIAL_DMA_FRAME_POOL_SIZE 6
+#endif
+
 // Max single voicemail message duration. 90s of 8kHz mu-law (1 byte/sample)
 // is 720,000 bytes (~703 KiB) -- long enough for a real message, short
 // enough that the full budget below still fits comfortably. Every leg needs

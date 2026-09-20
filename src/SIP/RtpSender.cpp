@@ -9,6 +9,9 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_task_wdt.h"   // Issue #235: rtp_media_tx TWDT subscription
+#include "EthAccess.hpp"
+#include "ArpLookup.hpp"
+#include "DmaFramePool.hpp"
 #elif defined(__linux__)
 #include <unistd.h>
 #include <sys/socket.h>
@@ -237,6 +240,7 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	_dest          = dest;
 	_callID        = callID;
 	_provider      = provider;
+	_l2Channel.reset();
 	_stopRequested.store(false, std::memory_order_release);
 	// Mark running BEFORE the task launches so a stop() racing right behind us can't
 	// clear the slot before the task exists. The task clears this LAST, on exit.
@@ -381,7 +385,20 @@ void RtpSender::runLoop()
 			}
 		}
 
-		if (sock >= 0)
+		bool l2Success = false;
+
+		// L2 TX bypass (Issues #282 / #329)
+		if (_l2Channel.updateAddressing(dest, static_cast<uint16_t>(_serverRtpPort), ssrc))
+		{
+			l2Success = _l2Channel.transmit(firstPkt, RtpSender::PAYLOAD_TYPE_PCMU, seq, timestamp,
+				packet + RtpSender::RTP_HEADER_BYTES, RtpSender::SAMPLES_PER_PKT);
+			if (!l2Success)
+			{
+				++_l2TxErrors;
+			}
+		}
+
+		if (!l2Success && sock >= 0)
 		{
 			sendto(sock, packet, sizeof(packet), 0,
 				reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
