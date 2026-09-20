@@ -193,7 +193,17 @@ SipTrunk::Dialog* SipTrunk::findMutableByCallID(std::string_view callID)
 	{
 		if (d.state == State::Free) continue;
 		// Match either end: a teardown can arrive naming the handset leg.
-		if (d.callID == key || (!d.handsetCallID.empty() && d.handsetCallID == key))
+		//
+		// handsetCallID is normalised on BOTH sides, unlike callID. We generate
+		// callID ourselves and always store it bare, but handsetCallID is
+		// whatever the engine handed placeCall() -- and the engine's own
+		// session map is keyed on SipMessage::getCallID(), the FULL header
+		// line. Comparing a stripped key against an unstripped stored value
+		// silently never matches, so a handset BYE found no dialog and the
+		// carrier leg stayed up and billing. Normalising here rather than at
+		// the call site keeps this class correct for either form.
+		if (d.callID == key ||
+			(!d.handsetCallID.empty() && siphdr::stripHeaderName(d.handsetCallID) == key))
 		{
 			return &d;
 		}
@@ -437,6 +447,40 @@ bool SipTrunk::hangup(std::string_view callID)
 	// than none. Releasing the slot stops us placing a duplicate call.
 	_env.freeTransactionsForCallId(d->callID);
 	*d = Dialog{};
+	return true;
+}
+
+bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
+{
+	if (!data) return false;
+	if (data->getType() != SipMessageTypes::BYE) return false;
+
+	Dialog* d = findMutableByCallID(data->getCallID());
+	if (!d || d->state == State::Free) return false;
+
+	// 200 first, off the request itself so the Via/CSeq match without this
+	// class having to know how a response is assembled.
+	// Built FROM the request so every header the carrier matches a response on
+	// -- Via with its branch, From/To with their tags, Call-ID, CSeq -- comes
+	// back byte-identical and only the start line changes.
+	auto ok = _env.messageFromPool(data->toString(), data->getSource());
+	if (ok)
+	{
+		ok->setHeader(SipMessageTypes::OK);
+		ok->clearBody();
+		ok->syncContentLength();
+		_env.enqueue(data->getSource(), std::move(ok));
+	}
+
+	// Same move-then-free-then-notify order the failure path uses, and for the
+	// same reason: the listener tears the handset leg down and may place a new
+	// call from inside the callback, so the slot must already be free and the
+	// event must not point into it.
+	_env.log("Trunk: carrier hung up (" + d->destE164 + ")");
+	_env.freeTransactionsForCallId(d->callID);
+	const Dialog finished = std::move(*d);
+	*d = Dialog{};
+	if (_listener) _listener->onTrunkRemoteBye(eventFor(finished));
 	return true;
 }
 

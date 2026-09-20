@@ -250,6 +250,7 @@ add_executable(sip_parser_tests
     # s17.1.1.3 reuses the INVITE branch, s13.2.2.4 is a new transaction to the
     # remote target), which is the easiest thing in a trunk to get wrong.
     SipTrunk_test.cpp
+    TrunkWiring_test.cpp
     # Issue #164: carrier SBC resolution off the SIP thread. The blocking
     # getaddrinfo is ESP-only and untestable here; what IS tested is the part
     # that decides whether a configured host is an ADDRESS or a NAME (getting
