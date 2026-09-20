@@ -83,6 +83,31 @@ public:
 	int getVoicemailLegSlot() const { return _voicemailLegSlot; }
 	void setVoicemailLegSlot(int slot) { _voicemailLegSlot = slot; }
 
+	// ── Trunk leg (#164) ─────────────────────────────────────────────────────
+	//
+	// A trunk call is a B2BUA: a handset dialog on one side, a SipTrunk dialog
+	// to the carrier on the other, and two cross-wired RtpReceivers relaying
+	// between them. Everything downstream has to key on THIS FLAG rather than
+	// on the dialled number, for the same reason isVoicemail() exists: by the
+	// time onBye() or endCall() runs, the dial-plan rule that produced a trunk
+	// call is long gone, and the destination is a PSTN number that looks like
+	// nothing in particular.
+	//
+	// Two behaviours depend on it and both are silent when it is missing:
+	// endCall() must release the relay pair and BYE the carrier, and the
+	// session-timer sweep must skip this session -- a relay leg has no local
+	// UA to refresh it, so the sweep would reap a call that is perfectly alive.
+	bool isTrunk() const { return _isTrunk; }
+	void setTrunk(bool val) { _isTrunk = val; }
+
+	// Which cross-wired relay pair (_trunkRx[i] / _handsetRx[i]) this call
+	// holds, or -1. Same reasoning as getVoicemailLegSlot(): the receivers
+	// themselves carry no Call-ID until start() is called, so the session is
+	// the only place the pair's identity lives, and endCall() is the one place
+	// it is released.
+	int getTrunkRelaySlot() const { return _trunkRelaySlot; }
+	void setTrunkRelaySlot(int slot) { _trunkRelaySlot = slot; }
+
 	// Deposit (leaving a message) vs Retrieval (checking the mailbox) --
 	// both answer locally and both use VoicemailLeg's Playing/PlaybackDone
 	// states, but tick()'s sweep must only auto-advance Playing ->
@@ -271,6 +296,8 @@ private:
 	bool _isAnchor = false;
 	bool _isVoicemail = false;
 	int  _voicemailLegSlot = -1;
+	bool _isTrunk = false;
+	int  _trunkRelaySlot = -1;
 	VoicemailPurpose _voicemailPurpose = VoicemailPurpose::Deposit;
 	std::chrono::steady_clock::time_point _voicemailDeadline;
 	bool _voicemailDeadlineArmed = false;
