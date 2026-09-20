@@ -377,7 +377,8 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	// uses a fresh client; performCtrl's persistent handle does not expose the body.)
 	int status = 0;
 	std::string respBody;
-	bool success = httpPostBody(makeCallUrl, "application/json", postData, respBody, &status);
+	bool requestSent = false;   // #349: did the POST body actually reach 3CX?
+	bool success = httpPostBody(makeCallUrl, "application/json", postData, respBody, &status, &requestSent);
 
 	// A device-path 404 means the cached device_id went stale (registration flap). Re-resolve once
 	// on a fresh id and retry; if that still fails, fall back to the legacy endpoint.
@@ -396,25 +397,111 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		}
 		if (!freshId.empty())
 		{
-			status = 0; respBody.clear();
-			success = httpPostBody(deviceUrl(freshId), "application/json", postData, respBody, &status);
+			status = 0; respBody.clear(); requestSent = false;
+			success = httpPostBody(deviceUrl(freshId), "application/json", postData, respBody, &status, &requestSent);
 		}
 		if (!success)
 		{
 			ESP_LOGW(TAG, "makeCall: falling back to legacy makecall endpoint");
-			status = 0; respBody.clear();
-			success = httpPostBody(legacyUrl, "application/json", postData, respBody, &status);
+			status = 0; respBody.clear(); requestSent = false;
+			success = httpPostBody(legacyUrl, "application/json", postData, respBody, &status, &requestSent);
+		}
+	}
+
+	// Select the leg WE control: makecall result.id, else the direct_control leg in the live
+	// participant list (audit #76 — NOT a destination digit-suffix match, which selects the
+	// uncontrollable far leg and re-triggers the #40 403). We deliberately do NOT adopt the
+	// participant id Telephony later surfaces over the WS — that can be the far leg, on which a
+	// specific-id GET/drop returns 403 (issue #40). Drop/media key off this owned id.
+	std::string ownLeg;
+	if (success)
+	{
+		ownLeg = resolveOutboundLeg(respBody, destination);
+	}
+	else if (requestSent && status <= 0)
+	{
+		// #349: THE REQUEST WAS SENT AND 3CX NEVER ANSWERED. That is unknown state,
+		// not a declined call, and 3CX may already have set the call up from the
+		// write it received — on .244 it did, creating participant 7 while this
+		// function was deciding it had failed.
+		//
+		// status <= 0 is the precise signal, not just "!success":
+		// esp_http_client_fetch_headers() sets status_code = -1 ITSELF before
+		// reading (esp_http_client.c:1658), so <= 0 means no response line was ever
+		// parsed. A real error status (500/403) IS an answer — 3CX declined, and
+		// adopting a leg on that would be wrong — so those still fail closed here.
+		//
+		// Why this matters beyond the return value: the WS classifier IGNORES an
+		// unmatched upset while _outboundPending > 0 (:2549-2555), on the assumption
+		// makeCall will key a slot for it. When we instead declare failure,
+		// _outboundPending drops to 0 on return and the NEXT ~750ms repeat upset for
+		// that same participant hits `nin==0 && pending==0` and is promoted to a NEW
+		// INBOUND CALL — the board rings the handset with its own outbound leg, which
+		// answers to silence. That is the "I got a call back on the yealink and
+		// nothing went through" desmo hit. Keying the slot below is what prevents it.
+		//
+		// resolveOutboundLeg("") skips straight to its live-participant-list fallback:
+		// 3CX's own state is the authority on whether the call exists, and that path
+		// is already audit-#76 safe (direct_control only) and #100 safe (skips legs
+		// another slot claimed). Retried a bounded number of times because the same
+		// allocation pressure that ate the response can eat the first reconcile too,
+		// and one blip should not drop us straight back into the phantom-ring path.
+		//
+		// RETRY ONLY WHAT IS WORTH RETRYING. An empty answer from resolveOutboundLeg
+		// is ambiguous by itself — the list GET failed (transient, retry) or the GET
+		// SUCCEEDED and 3CX has no controllable leg (definitive "no call", retrying
+		// is pointless). So probe the list first and branch on httpGetBody's status,
+		// which exists for exactly this: it returns true only on a 2xx and reports
+		// the status so a caller can separate "no evidence" from a real answer.
+		// Retrying a definitive "no" would not just waste ~800ms — _outboundPending
+		// stays >0 for the whole window (the RAII dec is at return), which suppresses
+		// classification of any genuine INBOUND upset arriving meanwhile. Holding
+		// that window open only while we still have reason to hope is the point.
+		constexpr int kReconcileAttempts = 3;
+		constexpr int kReconcileDelayMs  = 400;
+		std::string partsUrl;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			partsUrl = _baseUrl + "/callcontrol/" + _sourceDn + "/participants";
+		}
+		for (int attempt = 0; attempt < kReconcileAttempts; ++attempt)
+		{
+			if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(kReconcileDelayMs));
+
+			std::string probeBody;
+			int probeStatus = 0;
+			httpGetBody(partsUrl, probeBody, &probeStatus);
+			if (probeStatus <= 0)
+			{
+				continue;   // no evidence either way — the blip we are retrying for
+			}
+			// 3CX answered. Whatever it says is final, so this is the last attempt
+			// regardless of outcome. The second GET inside resolveOutboundLeg is
+			// accepted deliberately: duplicating its #76/#100-audited leg SELECTION
+			// here to save one warm request would be the worse trade.
+			if (probeStatus == 200) ownLeg = resolveOutboundLeg(std::string(), destination);
+			break;
+		}
+
+		if (!ownLeg.empty())
+		{
+			ESP_LOGW(TAG, "makeCall: no response read (status=%d) but 3CX has our leg %s — "
+				"adopting the call instead of failing it (#349)", status, ownLeg.c_str());
+			success = true;
+		}
+		else
+		{
+			// Loud on purpose: 3CX may be holding a call we can no longer see or
+			// control, and the next repeat upset for it can still surface as a
+			// phantom inbound. The allocation failures behind this are #328's.
+			ESP_LOGE(TAG, "makeCall: request reached 3CX but no response and no reconcilable "
+				"leg after %d attempts — a call may be ORPHANED on 3CX (#349/#328)",
+				kReconcileAttempts);
 		}
 	}
 
 	if (success)
 	{
-		// Select the leg WE control: makecall result.id, else the direct_control leg in the live
-		// participant list (audit #76 — NOT a destination digit-suffix match, which selects the
-		// uncontrollable far leg and re-triggers the #40 403). We deliberately do NOT adopt the
-		// participant id Telephony later surfaces over the WS — that can be the far leg, on which a
-		// specific-id GET/drop returns 403 (issue #40). Drop/media key off this owned id.
-		std::string ownLeg = resolveOutboundLeg(respBody, destination);
 		if (ownLegOut) *ownLegOut = ownLeg;   // #100: let the engine bind this call's session now
 		if (!ownLeg.empty())
 		{
@@ -1059,9 +1146,10 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 // makecall, whose result.id we need to read. Uses a fresh client (the persistent _ctrlClient that
 // performCtrl drives via esp_http_client_perform does not surface the body). close()+cleanup() on
 // every path; *statusOut carries the HTTP status (or -1).
-bool TelephonyAnchorClient::httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut)
+bool TelephonyAnchorClient::httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut, bool* requestSentOut)
 {
 	if (statusOut) *statusOut = -1;
+	if (requestSentOut) *requestSentOut = false;
 	respBody.clear();
 
 	std::string token;
@@ -1088,6 +1176,10 @@ bool TelephonyAnchorClient::httpPostBody(const std::string& url, const char* con
 		int wlen = (body.empty()) ? 0 : esp_http_client_write(client, body.c_str(), body.length());
 		if (wlen >= 0)
 		{
+			// #349: the full request is now on the wire. Everything that fails from
+			// here on is a RESPONSE-side failure, and the server may already have
+			// acted on what it received.
+			if (requestSentOut) *requestSentOut = true;
 			esp_http_client_fetch_headers(client);
 			int status = esp_http_client_get_status_code(client);
 			if (statusOut) *statusOut = status;
