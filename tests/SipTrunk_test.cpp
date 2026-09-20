@@ -23,6 +23,7 @@
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -410,5 +411,272 @@ TEST(SipTrunkBye, ANonTwoXxAnsweringTheInviteIsStillAcked)
 	EXPECT_EQ(ack.substr(0, 3), "ACK");
 	EXPECT_NE(ack.find(";branch=" + branch), std::string::npos)
 		<< "RFC 3261 s17.1.1.3: same branch as the INVITE";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+}
+
+// ── Listener: how the engine learns a dialog moved (#164 wiring) ─────────────
+//
+// The B2BUA wiring hangs entirely off these four callbacks, so what matters is
+// not that they fire but WHEN, relative to the wire and to the slot's lifetime.
+// Two orderings are load-bearing and each has a test that fails if it is broken:
+//
+//   * answered fires AFTER the ACK is enqueued. A listener that dislikes the
+//     answer's SDP hangs up from inside the callback, and BYE-before-ACK is a
+//     sequence carriers reject.
+//   * failed fires AFTER the slot is released, so the listener can place a
+//     replacement call from inside it. The event's string views still have to
+//     be readable at that point, which is the part a naive "reset then fire"
+//     gets wrong.
+
+namespace
+{
+	// Records what fired, in order, and copies the views immediately -- which
+	// is also what a real listener must do, so this doubles as a check that the
+	// views are readable for the callback's duration.
+	struct RecordingListener : SipTrunk::Listener
+	{
+		struct Event
+		{
+			std::string kind;
+			std::string trunkCallID;
+			std::string handsetCallID;
+			uint16_t    localRtpPort = 0;
+			int         status = 0;
+			bool        earlyMedia = false;
+		};
+
+		std::vector<Event> events;
+		SipTrunk*          trunk = nullptr;      // set to exercise re-entrancy
+		bool               hangupOnAnswer = false;
+		size_t             dialogsSeenDuringFailure = SIZE_MAX;
+		// Sampled INSIDE onTrunkAnswered. Checking env.sent AFTER handleResponse
+		// returns would pass whether the ACK went out before or after the
+		// callback, which is the whole property under test.
+		const FakePbxEnv*  env = nullptr;
+		size_t             sentAtAnswerTime = SIZE_MAX;
+
+		void record(const char* kind, const SipTrunk::TrunkEvent& ev)
+		{
+			events.push_back(Event{ kind, std::string(ev.trunkCallID),
+				std::string(ev.handsetCallID), ev.localRtpPort, 0, false });
+		}
+
+		void onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia) override
+		{
+			record("ringing", ev);
+			events.back().earlyMedia = earlyMedia;
+		}
+
+		void onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
+			const std::shared_ptr<SipMessage>& ok) override
+		{
+			record("answered", ev);
+			EXPECT_NE(ok, nullptr) << "the answer is handed over for its SDP";
+			if (env) sentAtAnswerTime = env->sent.size();
+			if (hangupOnAnswer && trunk) trunk->hangup(ev.trunkCallID);
+		}
+
+		void onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status) override
+		{
+			record("failed", ev);
+			events.back().status = status;
+			// Captured inside the callback: the slot must already be free here.
+			if (trunk) dialogsSeenDuringFailure = trunk->activeDialogs();
+		}
+
+		void onTrunkRemoteBye(const SipTrunk::TrunkEvent& ev) override
+		{
+			record("remoteBye", ev);
+		}
+	};
+
+	std::string withStatus(std::string response, const std::string& statusLine)
+	{
+		response.replace(0, response.find("\r\n"), statusLine);
+		return response;
+	}
+}
+
+TEST(SipTrunkListener, RingingReportsEarlyMediaOnlyForOneEightyThree)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string base = okFor(*d);
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(base, "SIP/2.0 100 Trying"))));
+	EXPECT_TRUE(lis.events.empty())
+		<< "100 Trying means a proxy took the request, not that anyone is alerting";
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(base, "SIP/2.0 180 Ringing"))));
+	ASSERT_EQ(lis.events.size(), 1u);
+	EXPECT_EQ(lis.events[0].kind, "ringing");
+	EXPECT_FALSE(lis.events[0].earlyMedia);
+	EXPECT_EQ(lis.events[0].handsetCallID, "handset-1") << "the leg to ring back";
+	EXPECT_EQ(lis.events[0].localRtpPort, 40000);
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(base, "SIP/2.0 183 Session Progress"))));
+	ASSERT_EQ(lis.events.size(), 2u);
+	EXPECT_TRUE(lis.events[1].earlyMedia) << "183 is the carrier already sending audio";
+}
+
+TEST(SipTrunkListener, AnsweredFiresAfterTheAckIsOnTheWire)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string trunkCallID = d->callID;
+
+	lis.env = &env;
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+
+	ASSERT_EQ(lis.events.size(), 1u);
+	EXPECT_EQ(lis.events[0].kind, "answered");
+	EXPECT_EQ(lis.events[0].trunkCallID, trunkCallID);
+	EXPECT_EQ(lis.events[0].handsetCallID, "handset-1");
+	// The load-bearing assertion, sampled inside the callback rather than after
+	// it: the ACK is already enqueued by the time the listener runs.
+	EXPECT_EQ(lis.sentAtAnswerTime, 2u)
+		<< "INVITE and its ACK must both be on the outbox before the callback fires";
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_EQ(env.sentRaw(1).substr(0, 3), "ACK");
+}
+
+TEST(SipTrunkListener, HangingUpFromInsideAnsweredPutsTheByeAfterTheAck)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	lis.trunk = &trunk;
+	lis.hangupOnAnswer = true;          // what the wiring does when the SDP is unusable
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+
+	ASSERT_EQ(env.sent.size(), 3u) << "INVITE, ACK, then the BYE the listener asked for";
+	EXPECT_EQ(env.sentRaw(1).substr(0, 3), "ACK");
+	EXPECT_EQ(env.sentRaw(2).substr(0, 3), "BYE")
+		<< "ACK must precede BYE or the carrier rejects the sequence";
+}
+
+TEST(SipTrunkListener, FailureFiresAfterTheSlotIsReleasedAndTheViewsStillRead)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	lis.trunk = &trunk;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 486 Busy Here"))));
+
+	ASSERT_EQ(lis.events.size(), 1u);
+	EXPECT_EQ(lis.events[0].kind, "failed");
+	EXPECT_EQ(lis.events[0].status, 486);
+	EXPECT_EQ(lis.events[0].handsetCallID, "handset-1")
+		<< "moved out of the slot, not read back from it -- this is the dangling case";
+	EXPECT_EQ(lis.dialogsSeenDuringFailure, 0u)
+		<< "slot released BEFORE the callback, so a replacement call can be placed from it";
+}
+
+TEST(SipTrunkListener, SweepTimeoutReportsFourOhEight)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::minutes(5));
+
+	ASSERT_EQ(lis.events.size(), 1u);
+	EXPECT_EQ(lis.events[0].kind, "failed");
+	EXPECT_EQ(lis.events[0].status, 408)
+		<< "a request with no final response inside its deadline is a timeout";
+	EXPECT_EQ(lis.events[0].handsetCallID, "handset-1");
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+}
+
+TEST(SipTrunkListener, OurOwnByeCompletingIsNotReportedAsARemoteHangup)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));   // answered
+	ASSERT_TRUE(trunk.hangup("handset-1"));                      // we hang up
+	lis.events.clear();
+
+	// The carrier's 200 to OUR BYE. The handset leg is already gone; telling the
+	// listener again would tear down a second time.
+	const SipTrunk::Dialog* term = trunk.findByCallID("handset-1");
+	ASSERT_NE(term, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*term))));
+
+	EXPECT_TRUE(lis.events.empty())
+		<< "our own BYE completing is not a carrier hangup";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+}
+
+TEST(SipTrunkListener, SweepOfOurOwnUnansweredByeNotifiesNobody)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+	ASSERT_TRUE(trunk.hangup("handset-1"));   // Terminating, waiting on the 200
+	lis.events.clear();
+
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::minutes(5));
+
+	EXPECT_TRUE(lis.events.empty())
+		<< "the handset was released when we asked for the BYE; do not fail it twice";
+	EXPECT_EQ(trunk.activeDialogs(), 0u) << "the slot is still reclaimed";
+}
+
+TEST(SipTrunkListener, AnUnsetListenerChangesNothing)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());        // deliberately no setListener()
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+	EXPECT_EQ(trunk.activeDialogs(), 1u);
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::minutes(5));
 	EXPECT_EQ(trunk.activeDialogs(), 0u);
 }

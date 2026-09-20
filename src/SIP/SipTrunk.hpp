@@ -205,6 +205,64 @@ public:
 	// would earn a 481 while leaving the call up.
 	static std::string buildBye(const Dialog& d, std::string_view freshBranch);
 
+	// ── Listener: how the engine learns a trunk dialog moved ─────────────────
+	//
+	// Every callback fires on the SIP thread, synchronously, from inside the
+	// method that observed the change -- so the engine's _mutex is already held
+	// and no queue is involved. That is the whole reason this is a raw pointer
+	// set once at init rather than anything heap-backed.
+	//
+	// The listener is handed a TrunkEvent, never the Dialog itself. The Dialog
+	// lives in a fixed slot this class recycles, and a listener is EXPECTED to
+	// call back in -- brief §3 has it calling hangup() when the answer's SDP is
+	// unusable. Handing out a reference to a slot the callback may cause to be
+	// rewritten is a dangling-reference bug waiting for a state-machine change
+	// to expose it, so the callback gets copies of the scalars and views of the
+	// strings it actually needs, and nothing else.
+	struct TrunkEvent
+	{
+		std::string_view trunkCallID;     // the trunk dialog's own Call-ID
+		std::string_view handsetCallID;   // the bridged handset leg, for session lookup
+		uint16_t         localRtpPort = 0;
+	};
+
+	// The views above point either into the live dialog slot or into a local
+	// the caller owns for the duration of the call. Either way they are valid
+	// for THE CALLBACK'S DURATION ONLY. A listener that needs to keep one must
+	// copy it into its own storage; storing the view is a use-after-free the
+	// moment the slot is reused.
+	struct Listener
+	{
+		virtual ~Listener() = default;
+
+		// 180, or 183 with earlyMedia=true. Nothing is relayed yet either way:
+		// a 183's SDP is not read here (see the class note on staying
+		// SDP-ignorant), so the caller hears silence rather than the carrier's
+		// announcement until early media is wired as a follow-up.
+		virtual void onTrunkRinging(const TrunkEvent& ev, bool earlyMedia) = 0;
+
+		// Fired AFTER the ACK is enqueued and the dialog reads Confirmed, so a
+		// listener that immediately hangs up produces ACK-then-BYE on the wire,
+		// which is the only ordering a carrier will accept.
+		virtual void onTrunkAnswered(const TrunkEvent& ev,
+			const std::shared_ptr<SipMessage>& ok) = 0;
+
+		// A 3xx-6xx final to our INVITE, or a sweep timeout (status 408). Fired
+		// AFTER the slot has been released, so the listener may place a fresh
+		// call from inside it.
+		virtual void onTrunkFailed(const TrunkEvent& ev, int status) = 0;
+
+		// The carrier hung up first. Fired after the 200 is enqueued and the
+		// slot released. Deliberately NOT fired when OUR OWN BYE completes --
+		// the listener already tore the handset down when it called hangup(),
+		// and firing here would BYE it a second time.
+		virtual void onTrunkRemoteBye(const TrunkEvent& ev) = 0;
+	};
+
+	// Set once at init. Raw pointer, no ownership, no heap: the listener is the
+	// engine itself and outlives this object.
+	void setListener(Listener* l) { _listener = l; }
+
 	// ── Engine-facing operations ─────────────────────────────────────────────
 
 	// Place an outbound call to `e164` over the trunk. `sbc` is the already
@@ -240,8 +298,16 @@ private:
 	Dialog* findMutableByCallID(std::string_view callID);
 	Dialog* allocDialog();
 
+	// Fill a TrunkEvent from a dialog. Views borrow that dialog's storage, so
+	// the result must not outlive it -- see the Listener note.
+	static TrunkEvent eventFor(const Dialog& d)
+	{
+		return TrunkEvent{ d.callID, d.handsetCallID, d.localRtpPort };
+	}
+
 	PbxEnv& _env;
 	Config  _cfg{};
+	Listener* _listener = nullptr;
 	std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS> _dialogs{};
 };
 
