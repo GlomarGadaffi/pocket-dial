@@ -849,6 +849,18 @@ bool TelephonyAnchorClient::ensureToken()
 // refreshed-if-due one.
 void TelephonyAnchorClient::requestRestartIfTokenStale()
 {
+	// Guard against the restart-storm this fix could otherwise cause: stop()
+	// (called by restartTaskTrampoline, and by shutdown) clears _running BEFORE
+	// calling esp_websocket_client_stop(), which itself fires a DISCONNECTED
+	// event for the dying client on its way out. Without this gate, that event
+	// would re-request a restart while the current one is still tearing down,
+	// and tick() would spawn a second restartTaskTrampoline the moment
+	// _restartInFlight clears -- trading a 401 loop for a restart loop.
+	// _running==false covers both shutdown and "already mid-restart" here,
+	// since restartTaskTrampoline's stop() clears it before start() sets it
+	// again. handleWsEvent's WEBSOCKET_EVENT_DATA case already gates the same
+	// way for the analogous reason (line ~2400).
+	if (!_running.load(std::memory_order_acquire)) return;
 	if (!tokenExpiringSoon()) return;
 	// _restartInFlight is checked by tick(), not here -- storing true again
 	// while a restart is already running is a harmless redundant request,
