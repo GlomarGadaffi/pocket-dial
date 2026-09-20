@@ -258,4 +258,37 @@ TEST(TelephonyLogic, TokenExpiringSoonTrueWhenLifetimeUnknown)
 	EXPECT_TRUE(tokenIsExpiringSoon(/*now=*/1000, /*obtained=*/500, /*lifetime=*/0, kMargin));
 }
 
+// ── httpResponseParsed (issues #349 / #350) ─────────────────────────────────
+// The arithmetic (status > 0) needs no test. What these pin is WHY the boundary
+// sits at zero, so that a later "tidy-up" to >= 0 -- because zero looks like it
+// could be a valid status -- fails with a test name that says what it broke.
+
+TEST(TelephonyLogic, HttpResponseParsedFalseForFetchHeadersSentinel)
+{
+	// -1 is not a status the server sent. esp_http_client_fetch_headers() assigns
+	// status_code = -1 itself before reading a byte (esp_http_client.c:1658), so a
+	// failed read leaves it there. This is the value seen in BOTH #349's and #350's
+	// hardware captures, and reading it as a verdict is what caused both bugs.
+	EXPECT_FALSE(httpResponseParsed(-1));
+}
+
+TEST(TelephonyLogic, HttpResponseParsedFalseForNeverAssigned)
+{
+	// 0 is the same class of non-answer: what a caller's own `int status = 0;`
+	// still holds when the call bailed before assigning anything.
+	EXPECT_FALSE(httpResponseParsed(0));
+}
+
+TEST(TelephonyLogic, HttpResponseParsedTrueForAnyRealStatus)
+{
+	// Every status the server actually sent is a verdict the caller can act on --
+	// including the error ones. 404/424 are the "not ready yet" this project's GET
+	// retry loop exists to wait out; 403/500 are a definitive decline. None of them
+	// are unknown state, which is the whole distinction.
+	EXPECT_TRUE(httpResponseParsed(200));
+	EXPECT_TRUE(httpResponseParsed(404));
+	EXPECT_TRUE(httpResponseParsed(424));
+	EXPECT_TRUE(httpResponseParsed(500));
+}
+
 }  // namespace

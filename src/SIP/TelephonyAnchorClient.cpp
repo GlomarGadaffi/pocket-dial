@@ -418,18 +418,17 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	{
 		ownLeg = resolveOutboundLeg(respBody, destination);
 	}
-	else if (requestSent && status <= 0)
+	else if (requestSent && !telephony::httpResponseParsed(status))
 	{
 		// #349: THE REQUEST WAS SENT AND 3CX NEVER ANSWERED. That is unknown state,
 		// not a declined call, and 3CX may already have set the call up from the
 		// write it received — on .244 it did, creating participant 7 while this
 		// function was deciding it had failed.
 		//
-		// status <= 0 is the precise signal, not just "!success":
-		// esp_http_client_fetch_headers() sets status_code = -1 ITSELF before
-		// reading (esp_http_client.c:1658), so <= 0 means no response line was ever
-		// parsed. A real error status (500/403) IS an answer — 3CX declined, and
-		// adopting a leg on that would be wrong — so those still fail closed here.
+		// "No response parsed" is the precise signal, not just "!success" — see
+		// telephony::httpResponseParsed() for why the boundary sits where it does.
+		// A real error status (500/403) IS an answer — 3CX declined, and adopting a
+		// leg on that would be wrong — so those still fail closed here.
 		//
 		// Why this matters beyond the return value: the WS classifier IGNORES an
 		// unmatched upset while _outboundPending > 0 (:2549-2555), on the assumption
@@ -465,7 +464,9 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(kReconcileDelayMs));
 			int listStatus = 0;
 			ownLeg = resolveOutboundLeg(std::string(), destination, &listStatus);
-			if (!ownLeg.empty() || listStatus > 0) break;   // found it, or 3CX answered definitively
+			// Stop on a leg, or on any real verdict from 3CX — only an unparsed
+			// response (telephony::httpResponseParsed false) is worth retrying.
+			if (!ownLeg.empty() || telephony::httpResponseParsed(listStatus)) break;
 		}
 
 		if (!ownLeg.empty())
@@ -3191,7 +3192,7 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					opened = true;
 					break;
 				}
-				if (status > 0)
+				if (telephony::httpResponseParsed(status))
 				{
 					// A REAL HTTP response — 404 (participant not found yet) or 424,
 					// exactly what this loop was built to wait out. The connection is
@@ -3205,11 +3206,9 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 				}
 				else
 				{
-					// #350: status <= 0 is NOT a server saying "not ready" — it means no
-					// HTTP response was parsed at all. esp_http_client_fetch_headers()
-					// sets status_code = -1 itself before reading (esp_http_client.c:1658),
-					// so the -1 seen in the crash capture is the read failing, not a status
-					// line. Treating it like a 404 is what reused a dead connection.
+					// #350: this is NOT a server saying "not ready" — no HTTP response was
+					// parsed at all (see telephony::httpResponseParsed for why -1 and 0 both
+					// mean that). Treating it like a 404 is what reused a dead connection.
 					// Deliberately NOT drained: there is no body to drain, and reading a
 					// transport that just failed is the thing being avoided.
 					ESP_LOGW(TAG, "GET stream transport failure (no HTTP response, status=%d), attempt %d/%d",
