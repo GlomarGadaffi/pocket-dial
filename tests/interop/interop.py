@@ -641,6 +641,149 @@ def sc_mixed_stack(env):
                   "baresip->pjsua CONFIRMED=%s, pjsua RTP rx/tx=%d/%d" % (up, rx, tx))
 
 
+# --------------------------------------------------------------------------
+# heap/stack telemetry (#235 item 3)
+# --------------------------------------------------------------------------
+# HttpServer::sendApiStatus() (src/Helpers/HttpServer.cpp) emits an additive
+# JSON block for Issue #185: 8 heap counters, resetReason, and 5 per-task
+# stackHwm_* fields. Everything in it is #if defined(ESP_PLATFORM); the #else
+# arm emits the same key set with every reading replaced by 0 (the 8 numeric
+# fields) or JSON null (the 5 stackHwm_* fields) -- see that file's own
+# comment and docs/API.md, which documents "0 on the host build" / "null on
+# the host build" for each field. #225/#321 (Issue #185, #235) wired real,
+# non-zero readings for these keys on-device; nothing exercised that wiring
+# against a live server's actual HTTP response until now.
+#
+# #235 item 3 asks to "record" these fields in "the host-test heap_debug
+# interop config". No such config exists in this file or anywhere under
+# tests/interop/ (grepped) -- the only `heap_debug` in the repo is
+# .github/workflows/ci.yml's firmware sdkconfig fragment, an unrelated
+# on-device build variant this harness cannot drive (it spawns a plain host
+# subprocess; see find_server() below). Treated as descriptive rather than
+# literal: what's actually missing is a scenario here, so that's what this
+# adds.
+#
+# This harness always drives a HOST build -- find_server() only ever locates
+# a locally-built `SipServer` binary and Pbx.start() runs it as a plain
+# subprocess -- so there is no path here that could ever produce a real
+# on-device reading. Recording these fields honestly therefore means pinning
+# the HOST branch's exact contract (key presence, right JSON type, right
+# "empty" value), not inventing a plausible non-zero host stub the firmware
+# never actually emits: a stub would assert something that isn't true of the
+# code, and a later real reading that happens to land on 0 (unusual but legal
+# right after boot) would then look like a regression that never happened.
+#
+# telemetry_check() is a pure function (no I/O) precisely so it can be
+# mutation-tested without pjsua/baresip installed at all -- feed it captured
+# or hand-built /api/status dicts and check its verdict, same as any other
+# unit test, then separately confirm sc_heap_telemetry() wires it to a real
+# running server. The recording itself is TELEMETRY_SNAPSHOT_PATH: a JSON
+# file (re)written every run, pass or fail, alongside the per-UA logs in
+# tests/interop/.logs/ -- something to diff against later, and, if this
+# harness is ever pointed at a real device's already-running /api/status
+# instead of spawning the binary itself, the same file would start holding
+# actual device numbers without any code change here.
+TELEMETRY_SNAPSHOT_PATH = os.path.join(LOGDIR, "telemetry.json")
+
+# The 8 counters that are always an int on both platforms (0 on host, never
+# null there -- these are readings that always exist, just at "nothing to
+# report yet" on a build with no FreeRTOS/heap_caps).
+TELEMETRY_NUMERIC_FIELDS = (
+    "freeHeap", "minFreeHeap", "minFreeHeapSpiram", "minFreeHeapInternal",
+    "freeHeapInternal", "largestFreeBlockInternal",
+    "freeHeapDma", "largestFreeBlockDma",
+)
+# The 5 per-task fields: int on-device (when that task exists / has run),
+# JSON null (-> Python None) otherwise -- always PRESENT as a key, on both
+# platforms, per docs/API.md.
+TELEMETRY_HWM_FIELDS = (
+    "stackHwm_sip_server_task", "stackHwm_udp_receiver_task",
+    "stackHwm_rtp_media_tx", "stackHwm_rtp_media_rx", "stackHwm_conf_mix_tick",
+)
+
+
+def telemetry_check(status):
+    """Verify one /api/status JSON value's #185 telemetry block.
+
+    Pure and side-effect-free: takes whatever http_json() would have
+    returned (a dict, or None on a transport/JSON error) and returns
+    (ok, detail, snapshot). `snapshot` is always a plain dict -- of every
+    field actually present plus a "platform" tag -- meant to be persisted
+    (to TELEMETRY_SNAPSHOT_PATH) regardless of `ok`, so a FAIL leaves
+    something to look at rather than nothing.
+    """
+    if not isinstance(status, dict):
+        return False, "/api/status did not return a JSON object", {"platform": "unknown"}
+
+    all_fields = TELEMETRY_NUMERIC_FIELDS + TELEMETRY_HWM_FIELDS + ("resetReason",)
+    snapshot = {k: status.get(k) for k in all_fields if k in status}
+    missing = [k for k in all_fields if k not in status]
+    if missing:
+        snapshot["platform"] = "unknown"
+        return False, "missing key(s): %s" % ", ".join(missing), snapshot
+
+    # pdResetReasonString() (HttpServer.cpp) never returns "n/a" -- only the
+    # host #else arm hardcodes that literal -- so this is an exact, not a
+    # heuristic, host/device discriminator.
+    is_host = status.get("resetReason") == "n/a"
+    snapshot["platform"] = "host" if is_host else "device"
+
+    if is_host:
+        bad_numeric = [k for k in TELEMETRY_NUMERIC_FIELDS if status.get(k) != 0]
+        bad_hwm = [k for k in TELEMETRY_HWM_FIELDS if status.get(k) is not None]
+        if bad_numeric or bad_hwm:
+            return False, ("host build must report 0/null (docs/API.md), got "
+                           "numeric=%s hwm=%s" % (bad_numeric, bad_hwm)), snapshot
+        return True, ("host build: shape verified (8 numeric fields=0, "
+                      "5 stackHwm_*=null, by construction)"), snapshot
+
+    # Not reachable from this harness today (see the module comment above),
+    # kept honest anyway: a real device reading must be an actual int, not
+    # null-forever and not a copy-pasted host zero. isinstance(x, bool) is
+    # excluded explicitly since bool is a subclass of int in Python and JSON
+    # has no separate bool/int confusion here, but it costs nothing to be
+    # precise about what "an int" means.
+    def is_real_int(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    bad_numeric = [k for k in TELEMETRY_NUMERIC_FIELDS if not is_real_int(status.get(k))]
+    # docs/API.md: stackHwm_sip_server_task/udp_receiver_task can also read
+    # null pre-provisioning, and the three call/conference tasks read null
+    # whenever nothing is using them -- null is an ordinary device reading
+    # for this group, not a wiring gap.
+    bad_hwm = [k for k in TELEMETRY_HWM_FIELDS
+               if status.get(k) is not None and not is_real_int(status.get(k))]
+    if bad_numeric or bad_hwm:
+        return False, ("device build has wrong type(s), numeric=%s hwm=%s"
+                       % (bad_numeric, bad_hwm)), snapshot
+    return True, "device build: fields recorded", snapshot
+
+
+def sc_heap_telemetry(env):
+    """Pin #185/#235's heap/stack telemetry block's presence, type and
+    host-build values against a real, running server, and record it.
+
+    Deliberately independent of `env` / any UA: sendApiStatus() emits this
+    block unconditionally, so asserting it only while other scenarios happen
+    to have calls up would make a real wiring gap look like flakiness.
+    Placed last in SCENARIOS so that if this harness is ever extended to run
+    against a live device instead of spawning the host binary, the snapshot
+    it records reflects post-call state (rtp_media_tx/rx, conf_mix_tick),
+    not just a cold boot.
+    """
+    status = http_json("/api/status")
+    ok, detail, snapshot = telemetry_check(status)
+    try:
+        with open(TELEMETRY_SNAPSHOT_PATH, "w") as f:
+            json.dump(snapshot, f, indent=2, sort_keys=True)
+    except OSError as e:
+        return report("heap_telemetry", "FAIL",
+                      "%s (also could not write %s: %r)"
+                      % (detail, TELEMETRY_SNAPSHOT_PATH, e))
+    return report("heap_telemetry", "OK" if ok else "FAIL",
+                  "%s (recorded -> %s)" % (detail, TELEMETRY_SNAPSHOT_PATH))
+
+
 SCENARIOS = [
     ("register", sc_register),
     ("echo777_rtp", sc_echo777_rtp),
@@ -652,6 +795,7 @@ SCENARIOS = [
     ("park_retrieve", sc_park_retrieve),
     ("dtmf_info_dnd", sc_dtmf_info_dnd),
     ("mixed_stack", sc_mixed_stack),
+    ("heap_telemetry", sc_heap_telemetry),
 ]
 
 
