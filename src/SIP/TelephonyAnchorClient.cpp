@@ -747,6 +747,18 @@ bool TelephonyAnchorClient::fetchToken()
 					_tokenLifetimeUs = decodeJwtLifetimeUs(_accessToken);
 					if (_wsClient)
 					{
+						// Issue #336 caveat, found reviewing this call while fixing that issue:
+						// per connectWs()'s own comment on this same API,
+						// esp_websocket_client_set_headers() no-ops with ESP_ERR_INVALID_ARG
+						// unless the client is CONNECTED at the moment of the call. This proactive
+						// refresh (called right after a successful fetchToken(), independent of WS
+						// state) only actually lands when the WS happens to still be connected —
+						// which is fine for a refresh ahead of expiry, but is NOT what fixes a
+						// reconnect after the WS has already dropped with a stale token: that path
+						// never reaches here at all (fetchToken() isn't re-called on disconnect).
+						// requestRestartIfTokenStale()/WEBSOCKET_EVENT_DISCONNECTED below is what
+						// actually handles the disconnected case, via a full stop()/start() that
+						// rebuilds wsCfg.headers fresh at init time rather than patching this handle.
 						std::string wsHeaders = "Authorization: Bearer " + _accessToken + "\r\n";
 						esp_websocket_client_set_headers(_wsClient, wsHeaders.c_str());
 					}
@@ -778,11 +790,12 @@ bool TelephonyAnchorClient::fetchToken()
 
 bool TelephonyAnchorClient::tokenExpiringSoon() const
 {
-	if (_tokenObtainedUs == 0 || _tokenLifetimeUs == 0) return true; // no token yet
-	// Refresh once we're within 5 minutes of the JWT's declared expiry.
+	// Refresh once we're within 5 minutes of the JWT's declared expiry. The
+	// comparison itself is telephony::tokenIsExpiringSoon() (TelephonyAnchorLogic.hpp,
+	// issue #336) -- host-tested there; this just supplies the live clock.
 	constexpr int64_t kRefreshMarginUs = 5LL * 60 * 1000000;
-	int64_t age = esp_timer_get_time() - _tokenObtainedUs;
-	return age >= (_tokenLifetimeUs - kRefreshMarginUs);
+	return telephony::tokenIsExpiringSoon(esp_timer_get_time(), _tokenObtainedUs,
+	                                       _tokenLifetimeUs, kRefreshMarginUs);
 }
 
 bool TelephonyAnchorClient::ensureToken()
@@ -815,6 +828,33 @@ bool TelephonyAnchorClient::ensureToken()
 
 	ESP_LOGI(TAG, "Access token near expiry — refreshing");
 	return fetchToken();
+}
+
+// Issue #336: connectWs() bakes _accessToken into wsCfg.headers once, at
+// esp_websocket_client_init() time. esp_websocket_client's own internal
+// reconnect_timeout_ms retry logic reuses that same init'd handle forever,
+// so once the token expires, every retry re-sends the identical stale Bearer
+// header and gets the identical 401 -- silently, indefinitely, with nothing
+// else in the tree ever telling the WS side a fresh token exists. Reconnect
+// with a stale token is unfixable in place: esp_websocket_client_set_headers()
+// is documented as "must stop the client first if it has been connected",
+// and connectWs()'s own comment already records a harder finding from this
+// project's own testing -- calling it pre-start() silently no-ops the header
+// instead of erroring, which is worse than the documented precondition.
+// Cheaper and already correct: reuse the existing #65 restart machinery
+// (_restartRequested -> tick() -> restartTaskTrampoline, off the SIP task)
+// rather than build a second stop/destroy/reconnect path. restartTaskTrampoline's
+// stop()+start() cycle calls fetchToken() unconditionally before connectWs(),
+// so it always reconnects with a genuinely current token, not just a
+// refreshed-if-due one.
+void TelephonyAnchorClient::requestRestartIfTokenStale()
+{
+	if (!tokenExpiringSoon()) return;
+	// _restartInFlight is checked by tick(), not here -- storing true again
+	// while a restart is already running is a harmless redundant request,
+	// same as the #65 leak-count path above already relies on.
+	_restartRequested.store(true, std::memory_order_release);
+	ESP_LOGW(TAG, "WS disconnected/errored with an expiring token — requesting anchor restart to refresh it");
 }
 
 bool TelephonyAnchorClient::connectWs()
@@ -2392,6 +2432,16 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 				_deviceId.clear();
 			}
 			stopAllMediaStreams();   // #100: drop every active call slot on WS loss
+			requestRestartIfTokenStale();   // #336
+			break;
+
+		// Issue #336: previously unhandled (fell to `default: break`) — this is the event
+		// the esp_websocket_client fires on EVERY failed auto-reconnect attempt, not just
+		// the first disconnect, so it is the actual repeat-offender in the stuck-401 loop
+		// (DISCONNECTED fires once; ERROR fires every 5 s after, forever, once the token
+		// is stale). Same check as DISCONNECTED, for the same reason.
+		case WEBSOCKET_EVENT_ERROR:
+			requestRestartIfTokenStale();   // #336
 			break;
 
 		case WEBSOCKET_EVENT_DATA:
