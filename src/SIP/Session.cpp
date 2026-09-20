@@ -45,6 +45,28 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_remoteSdp.clear();
 	_isTransferBridge = false;
 	_blindXferLeg = false;
+
+	// Issue #353. These survived reset() and nothing else ever cleared them --
+	// there is no setVoicemail(false) anywhere in the tree -- so a pool slot
+	// that had once served a voicemail call reported isVoicemail() true for
+	// every later call recycled into it. endCall() then released a leg index
+	// it never owned, cutting short whatever deposit actually held it, and
+	// tick()'s sweep ran the mailbox menu against an ordinary call.
+	//
+	// reset() is the recycling path: allocateSession() always calls it before
+	// handing a pooled slot out, so clearing here is sufficient and is what
+	// makes a recycled slot indistinguishable from a fresh one. Any field that
+	// survives it is a latent version of the same bug, which is why the trunk
+	// pair is here from the start rather than added once someone trips over it.
+	//
+	// Deliberately NOT mirrored in release(): see the note there.
+	_isVoicemail = false;
+	_voicemailLegSlot = -1;
+	_voicemailPurpose = VoicemailPurpose::Deposit;
+	_voicemailDeadlineArmed = false;
+	_voicemailDeadline = {};
+	_isTrunk = false;
+	_trunkRelaySlot = -1;
 }
 
 void Session::setState(State state)
@@ -145,4 +167,13 @@ void Session::release()
 	_remoteSdp.clear();
 	_isTransferBridge = false;
 	_blindXferLeg = false;
+
+	// Deliberately does NOT clear the voicemail/trunk state that reset() does.
+	// endCall() calls release() on the pool slot and only AFTERWARDS reads
+	// ending->isVoicemail() / getVoicemailLegSlot() to hand the media leg back
+	// (RequestsHandler.cpp, the release loop then the voicemail branch below
+	// it). Clearing here wiped the flag before its reader ran and orphaned the
+	// leg -- four VoicemailDivert tests catch it, which is how this was found.
+	// The recycling path is reset(), and clearing there is sufficient because
+	// allocateSession() always calls it before reusing a slot.
 }
