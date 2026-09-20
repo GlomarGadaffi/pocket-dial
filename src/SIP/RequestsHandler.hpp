@@ -308,6 +308,13 @@ public:
 	void setTrunkConfig(const SipTrunk::Config& cfg);
 	SipTrunk::Config getTrunkConfig();
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only, and not compiled into device firmware -- the same treatment
+	// the anchor/CDR/registrar accessors above already get. Nothing the
+	// firmware does needs these, and expireTrunkDeadlinesForTest() in
+	// particular would be a way to hang up every live trunk call from
+	// anywhere holding the handler.
+
 	// How many of the POCKETDIAL_MAX_TRUNK_CALLS relay pairs are in use. A pair
 	// is two cross-wired RtpReceivers; this is the only external view of that,
 	// and it is what a test asserts against to show a teardown really released
@@ -323,6 +330,7 @@ public:
 	// resolution has at least been ASKED FOR, which is what proves tick()
 	// primes the cache rather than leaving an FQDN trunk permanently dead.
 	TrunkResolver::Status trunkResolveStatusForTest();
+#endif
 
 	// ── Telephony-API credential slots (ported from drawbridge) ──────────────────
 	// TelephonyApiConfig.hpp owns validation + NVS/file persistence for the

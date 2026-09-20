@@ -9476,6 +9476,7 @@ SipTrunk::Config RequestsHandler::getTrunkConfig()
 	return _sipTrunk.config();
 }
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 size_t RequestsHandler::trunkRelaysInUseForTest()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
@@ -9500,6 +9501,7 @@ TrunkResolver::Status RequestsHandler::trunkResolveStatusForTest()
 	return _trunkResolver.lookup(_sipTrunk.config().host, _sipTrunk.config().port,
 		out, std::chrono::steady_clock::now());
 }
+#endif
 
 int RequestsHandler::findFreeTrunkRelay() const
 {

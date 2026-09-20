@@ -304,10 +304,17 @@ public:
 	// Test/diagnostic accessors. Cheap linear scans over a fixed array.
 	size_t activeDialogs() const;
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Force every live dialog's deadline into the past. Test-only: sweep()
 	// reads steady_clock and there is no injectable clock in this engine, so
 	// the alternative to this is a test that really waits 60 seconds.
+	//
+	// Compiled out of device firmware. A test accessor that survives into the
+	// image is a way to expire every live trunk call from anywhere that can
+	// reach the object, which is not a control a PBX should ship with however
+	// small it is.
 	void expireDeadlinesForTest();
+#endif
 	const Dialog* findByCallID(std::string_view callID) const;
 
 private:
