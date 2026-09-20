@@ -872,6 +872,12 @@ TEST(CdrDisclosure, ClientCountStaysVisibleSoEmptyIsNotAmbiguous)
 	const std::string body = bodyOf(httpGetRaw(18098, "/api/status"));
 	EXPECT_NE(body.find("\"clientCount\":0"), std::string::npos) << body;
 	EXPECT_NE(body.find("\"rosterVisible\":false"), std::string::npos) << body;
+	// Issue #327: resetReason is another universally-present, unauthenticated
+	// field (same category as clientCount/rosterVisible above) -- was already
+	// wired to esp_reset_reason() on-device and "n/a" on host, but had no test
+	// pinning either branch's presence in the actual JSON body.
+	EXPECT_NE(body.find("\"resetReason\":\"n/a\""), std::string::npos)
+		<< "host build must report a resetReason, not omit the key:\n" << body;
 
 	AdminAuth::clearCredential();
 }
