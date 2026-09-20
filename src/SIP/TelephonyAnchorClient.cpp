@@ -447,40 +447,25 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		// allocation pressure that ate the response can eat the first reconcile too,
 		// and one blip should not drop us straight back into the phantom-ring path.
 		//
-		// RETRY ONLY WHAT IS WORTH RETRYING. An empty answer from resolveOutboundLeg
-		// is ambiguous by itself — the list GET failed (transient, retry) or the GET
-		// SUCCEEDED and 3CX has no controllable leg (definitive "no call", retrying
-		// is pointless). So probe the list first and branch on httpGetBody's status,
-		// which exists for exactly this: it returns true only on a 2xx and reports
-		// the status so a caller can separate "no evidence" from a real answer.
-		// Retrying a definitive "no" would not just waste ~800ms — _outboundPending
-		// stays >0 for the whole window (the RAII dec is at return), which suppresses
-		// classification of any genuine INBOUND upset arriving meanwhile. Holding
-		// that window open only while we still have reason to hope is the point.
+		// RETRY ONLY WHAT IS WORTH RETRYING. An empty return from resolveOutboundLeg
+		// is ambiguous on its own: the list GET failed (transient — retrying is the
+		// whole point) or the list ANSWERED and 3CX has no controllable leg
+		// (definitive "no call" — retrying cannot change it). listStatusOut splits
+		// those apart: <= 0 means 3CX never answered, > 0 means it did.
+		//
+		// Retrying a definitive "no" would not merely waste ~800ms. _outboundPending
+		// stays > 0 for the whole window (the RAII dec is at return), which suppresses
+		// classification of any GENUINE inbound upset arriving meanwhile — so the
+		// window is held open only while there is still reason to hope, and a 200
+		// carrying no controllable leg ends it immediately.
 		constexpr int kReconcileAttempts = 3;
 		constexpr int kReconcileDelayMs  = 400;
-		std::string partsUrl;
-		{
-			std::lock_guard<std::mutex> lock(_mutex);
-			partsUrl = _baseUrl + "/callcontrol/" + _sourceDn + "/participants";
-		}
 		for (int attempt = 0; attempt < kReconcileAttempts; ++attempt)
 		{
 			if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(kReconcileDelayMs));
-
-			std::string probeBody;
-			int probeStatus = 0;
-			httpGetBody(partsUrl, probeBody, &probeStatus);
-			if (probeStatus <= 0)
-			{
-				continue;   // no evidence either way — the blip we are retrying for
-			}
-			// 3CX answered. Whatever it says is final, so this is the last attempt
-			// regardless of outcome. The second GET inside resolveOutboundLeg is
-			// accepted deliberately: duplicating its #76/#100-audited leg SELECTION
-			// here to save one warm request would be the worse trade.
-			if (probeStatus == 200) ownLeg = resolveOutboundLeg(std::string(), destination);
-			break;
+			int listStatus = 0;
+			ownLeg = resolveOutboundLeg(std::string(), destination, &listStatus);
+			if (!ownLeg.empty() || listStatus > 0) break;   // found it, or 3CX answered definitively
 		}
 
 		if (!ownLeg.empty())
@@ -1370,8 +1355,12 @@ static std::string legIdOf(cJSON* elem)
 // on the callee/FAR leg — exactly the leg class that 403'd in #40 — so a legacy-path guess could
 // re-trigger the wrong-leg 403. If no controllable leg is found we FAIL CLOSED (return "") and
 // let the reconcile/watchdog teardown handle it, rather than drop a guessed id.
-std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecallRespBody, const std::string& /*destination*/)
+std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecallRespBody, const std::string& /*destination*/,
+                                                       int* listStatusOut)
 {
+	// 0 = the live list was never consulted (result.id answered it, below).
+	if (listStatusOut) *listStatusOut = 0;
+
 	// 1) result.id from the makecall response.
 	if (!makecallRespBody.empty())
 	{
@@ -1407,7 +1396,14 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 
 	std::string body;
 	int status = 0;
-	if (!httpGetBody(url, body, &status) || status != 200) return "";
+	const bool got = httpGetBody(url, body, &status);
+	// Report the list's own status before ANY of the early returns below, so a caller
+	// can tell "3CX never answered" (status <= 0, transient) from "3CX answered and
+	// there is no leg" (status > 0, definitive). Everything past this point already
+	// had a real answer, so this single write also covers the parse-fail / not-array /
+	// no-controllable-leg returns.
+	if (listStatusOut) *listStatusOut = status;
+	if (!got || status != 200) return "";
 	cJSON* root = cJSON_Parse(body.c_str());
 	if (!root) return "";
 	CJsonDeleter deleter{root};
