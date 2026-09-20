@@ -132,8 +132,17 @@ private:
 	// SNTP dependency). Derived from the JWT's own exp/iat claims, NOT from the
 	// OAuth expires_in field — Telephony reports expires_in:60 but the JWT is valid ~1h,
 	// and re-issuing a token invalidates the one the active media streams hold.
-	int64_t _tokenObtainedUs = 0;
-	int64_t _tokenLifetimeUs = 0;
+	//
+	// Issue #344: atomic, not plain int64_t guarded by _mutex. fetchToken() writes
+	// both under _mutex, but tokenExpiringSoon() (and therefore #336's
+	// requestRestartIfTokenStale(), called from the WS client's own task) reads
+	// them WITHOUT _mutex — and ensureToken() calls tokenExpiringSoon() from
+	// WITHIN a _mutex-held scope, so having tokenExpiringSoon() itself take
+	// _mutex would deadlock on that path. Atomics sidestep the lock-ordering
+	// problem entirely rather than threading a "caller may or may not already
+	// hold the lock" contract through a const getter.
+	std::atomic<int64_t> _tokenObtainedUs{0};
+	std::atomic<int64_t> _tokenLifetimeUs{0};
 
 #if defined(ESP_PLATFORM) || defined(ESP32)
 	esp_websocket_client_handle_t _wsClient   = nullptr;
