@@ -63,10 +63,15 @@ fi
 MSG_FILE="$1"
 
 if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
-    # No message file to check (unexpected invocation) -- fail open rather
-    # than blocking every commit on a git-internals surprise this hook was
-    # never meant to guard against.
-    exit 0
+    # git ALWAYS passes a real message-file path here -- that is the
+    # commit-msg hook contract, not something to defend against. If this
+    # branch is reached at all, something ran this script directly with a
+    # missing or bad argument (not via git, and not --selftest, which is
+    # handled above). That is misuse, not a legitimate case to fail open
+    # on -- a check whose own error path silently does nothing is exactly
+    # the failure shape this whole effort exists to stop shipping.
+    echo "usage: commit-msg <message-file> | --selftest" >&2
+    exit 1
 fi
 
 MSG_BODY="$(cat "$MSG_FILE")"
