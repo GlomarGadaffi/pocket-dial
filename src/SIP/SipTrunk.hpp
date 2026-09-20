@@ -303,6 +303,11 @@ public:
 
 	// Test/diagnostic accessors. Cheap linear scans over a fixed array.
 	size_t activeDialogs() const;
+
+	// Force every live dialog's deadline into the past. Test-only: sweep()
+	// reads steady_clock and there is no injectable clock in this engine, so
+	// the alternative to this is a test that really waits 60 seconds.
+	void expireDeadlinesForTest();
 	const Dialog* findByCallID(std::string_view callID) const;
 
 private:

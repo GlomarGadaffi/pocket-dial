@@ -7996,6 +7996,27 @@ void RequestsHandler::tick()
 		// Call-park timeout: ring back the parker or BYE the parked party.
 		_park.sweep(now);
 
+		// Issue #164: a trunk INVITE that never got a final response. Without
+		// this the no-answer deadline placeCall() arms is never read by
+		// anything, so a silent SBC leaks the dialog slot, the relay pair and
+		// the handset session, with the phone ringing forever -- the trunk
+		// machine cannot time itself out, it has no clock of its own.
+		_sipTrunk.sweep(now);
+
+		// Issue #164: keep the SBC address warm. routeTrunkCall() deliberately
+		// uses the CACHE-ONLY lookup(), because resolving on the SIP thread is
+		// the blocking getaddrinfo that TrunkResolver exists to keep off it.
+		// That makes something else responsible for ever populating the cache,
+		// and this is it: resolve() returns immediately and hands the work to
+		// the resolver's own task. Without it an FQDN host never resolves at
+		// all and only a dotted-quad trunk can place a call.
+		if (_sipTrunk.config().valid())
+		{
+			sockaddr_in unusedAddr{};
+			_trunkResolver.resolve(_sipTrunk.config().host, _sipTrunk.config().port,
+				unusedAddr, now);
+		}
+
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
 		// in case a teardown path bypassed endCall(). Bounded by the small session pool.
 		_dtmf.sweepStale();
@@ -9464,6 +9485,20 @@ size_t RequestsHandler::trunkRelaysInUseForTest()
 		if (_trunkRx[i].isActive() || _handsetRx[i].isActive()) ++n;
 	}
 	return n;
+}
+
+void RequestsHandler::expireTrunkDeadlinesForTest()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	_sipTrunk.expireDeadlinesForTest();
+}
+
+TrunkResolver::Status RequestsHandler::trunkResolveStatusForTest()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	sockaddr_in out{};
+	return _trunkResolver.lookup(_sipTrunk.config().host, _sipTrunk.config().port,
+		out, std::chrono::steady_clock::now());
 }
 
 int RequestsHandler::findFreeTrunkRelay() const

@@ -314,6 +314,16 @@ public:
 	// the media rather than only answering the signalling.
 	size_t trunkRelaysInUseForTest();
 
+	// Age every live trunk dialog past its deadline, so one tick() exercises
+	// the no-answer path without a 60-second test.
+	void expireTrunkDeadlinesForTest();
+
+	// What the resolver currently knows about the configured SBC host. Refused
+	// means nothing is known and nothing is in flight; anything else means a
+	// resolution has at least been ASKED FOR, which is what proves tick()
+	// primes the cache rather than leaving an FQDN trunk permanently dead.
+	TrunkResolver::Status trunkResolveStatusForTest();
+
 	// ── Telephony-API credential slots (ported from drawbridge) ──────────────────
 	// TelephonyApiConfig.hpp owns validation + NVS/file persistence for the
 	// bounded kSlots-entry credential table; RequestsHandler owns the instance

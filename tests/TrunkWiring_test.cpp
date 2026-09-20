@@ -472,3 +472,89 @@ TEST(TrunkWiring, TheSessionTimerSweepDoesNotReapAConnectedTrunkCall)
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u)
 		<< "and the media must still be bridged afterwards";
 }
+
+// ── The engine must actually drive SipTrunk's clock ─────────────────────────
+//
+// SipTrunk has no clock of its own: placeCall() arms a 60 s no-answer deadline
+// and sweep() is what reads it. If nothing calls sweep(), a silent SBC leaks
+// the dialog slot, the relay pair AND the handset session, with the phone
+// ringing forever and no log line.
+//
+// SipTrunk_test.cpp calls trunk.sweep() directly on a standalone object, which
+// proves the machine works and proves nothing about whether the engine ever
+// turns the handle. That gap is exactly what shipped in the first version of
+// this PR: every comment said "SipTrunk::sweep() owns the no-answer deadline",
+// and no call site existed. This test asserts the wiring, through tick().
+TEST(TrunkWiring, AnUnansweredCarrierInviteTimesOutThroughTick)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	ASSERT_FALSE(b.firstWith("INVITE sip:+1").empty()) << "precondition: the call was placed";
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	b.sent.clear();
+
+	// The carrier says nothing at all -- no 100, no 180, no final response.
+	// Age the dialog past its own deadline rather than sleeping 60 s; tick()
+	// reads steady_clock and this engine has no injectable clock.
+	//
+	// Exactly ONE tick() per test, deliberately: tick() self-throttles to 1 Hz
+	// and returns immediately if called again inside the same second, so a
+	// second call in the same test proves nothing. That throttle is why the
+	// first version of this test passed a no-op off as a result.
+	b.handler.expireTrunkDeadlinesForTest();
+	b.handler.tick();
+
+	EXPECT_FALSE(b.firstWith("503").empty())
+		<< "the still-ringing handset must get a final response, not silence";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u)
+		<< "and the relay pair must come back, or the next call cannot be placed";
+}
+
+// The other side of that boundary: a carrier that is merely slow is not a
+// carrier that has failed. Same single-tick discipline.
+TEST(TrunkWiring, ASlowCarrierIsNotReapedBeforeItsDeadline)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	b.sent.clear();
+
+	b.handler.tick();   // deadline is 60 s out and untouched
+
+	EXPECT_TRUE(b.firstWith("503").empty())
+		<< "nothing has expired; hanging up here would cut off a carrier "
+		   "that is simply taking its time to ring";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+}
+
+TEST(TrunkWiring, TickKeepsTheSbcAddressResolvedForAnFqdnTrunk)
+{
+	Bench b;
+	SipTrunk::Config c = trunkConfig();
+	std::snprintf(c.host, sizeof(c.host), "%s", "sbc.carrier.example");
+	b.handler.setTrunkConfig(c);
+
+	// routeTrunkCall() uses the cache-only lookup(), so SOMETHING has to
+	// populate the cache or an FQDN trunk can never place a call. Before this
+	// was wired, nothing did: only a dotted quad worked, forever.
+	//
+	// The resolution itself needs real DNS and is covered by
+	// TrunkResolver_test.cpp; what is asserted here is the part that was
+	// missing and is cheap to state -- tick() asks the resolver, and does so
+	// without blocking the caller.
+	ASSERT_EQ(b.handler.trunkResolveStatusForTest(), TrunkResolver::Status::Refused)
+		<< "precondition: nothing known about this name and nothing in flight";
+
+	const auto before = std::chrono::steady_clock::now();
+	b.handler.tick();
+	const auto elapsed = std::chrono::steady_clock::now() - before;
+
+	EXPECT_LT(elapsed, std::chrono::seconds(2))
+		<< "tick() must never block on DNS -- that is the whole reason "
+		   "routeTrunkCall() is cache-only";
+	EXPECT_NE(b.handler.trunkResolveStatusForTest(), TrunkResolver::Status::Refused)
+		<< "after a tick the name is at least in flight; Refused means tick() "
+		   "never asked and an FQDN trunk can never place a call";
+}
