@@ -203,6 +203,23 @@ constexpr size_t kTraceRecords = 4000;
 // the collapse."
 constexpr uint32_t kDumpsSec[] = { 120, 240, 360, 900 };
 
+// #331: after the schedule above completes, no way existed to take a later
+// dump -- no console command, no HTTP endpoint, no signal, and the header's
+// own comment claimed one anyway. Both obvious "add a trigger" shapes are
+// wrong for what this probe is diagnosing: an HTTP endpoint is unreachable
+// in the exact failure (pthread task-spawn exhaustion kills the connection
+// thread first), and a console command needs a human already attached and
+// typing at the moment of interest -- the same "be there in time" problem
+// #327 exists to name. So: no trigger. Keep dumping forever instead, so
+// *when* a reader attaches stops mattering. kGaugeSec reuses logInternalState()
+// (already the exact four figures /api/status reports, "for almost nothing"
+// per #331) so the free/largest/min curve is on the wire across the whole
+// incident, not just at the four scheduled points; kPeriodicSec repeats the
+// full aggregated dump so late-attaching readers get outstanding-allocation
+// data too, not only gauges.
+constexpr uint32_t kGaugeSec    = 60;
+constexpr uint32_t kPeriodicSec = 900;
+
 void logInternalState(const char* phase, uint32_t atSec)
 {
 	const size_t freeInt = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -678,8 +695,10 @@ void heapProbeTask(void*)
 
 	probePrintf("HeapProbe: leak probe armed: %u records in PSRAM, HEAP_TRACE_LEAKS. "
 		"Aggregating by call site (table %u, cannot overflow). "
-		"Dumps at 120/240/360/900 s (#273 onset measured 218-276 s).\n",
-		static_cast<unsigned>(kTraceRecords), static_cast<unsigned>(kMaxSites));
+		"Dumps at 120/240/360/900 s (#273 onset measured 218-276 s), then gauge "
+		"every %us and full dump every %us thereafter (#331).\n",
+		static_cast<unsigned>(kTraceRecords), static_cast<unsigned>(kMaxSites),
+		static_cast<unsigned>(kGaugeSec), static_cast<unsigned>(kPeriodicSec));
 	logInternalState("armed", 0);
 
 	for (uint32_t target : kDumpsSec)
@@ -723,10 +742,37 @@ void heapProbeTask(void*)
 
 	// Deliberately keeps tracing after the last scheduled dump rather than
 	// stopping: the board stays up for 76-91 minutes in the degraded state
-	// (measured, two boots, two trees), so someone may want a manual dump much
-	// later. heap_trace_stop() is never called here.
-	probePrintf("HeapProbe: scheduled dumps complete; tracing still ACTIVE for later manual dumps\n");
-	vTaskDelete(nullptr);
+	// (measured, two boots, two trees). #331: this used to claim "tracing
+	// still ACTIVE for later manual dumps" and then vTaskDelete() -- a manual
+	// dump was never actually reachable, so the promise was hollow. Now the
+	// task itself never exits: a cheap gauge every kGaugeSec, a full
+	// aggregated dump every kPeriodicSec, forever. heap_trace_stop() is still
+	// never called.
+	probePrintf("HeapProbe: scheduled dumps complete; switching to periodic "
+		"(gauge every %us, full dump every %us)\n",
+		static_cast<unsigned>(kGaugeSec), static_cast<unsigned>(kPeriodicSec));
+
+	uint32_t sinceDump = 0;
+	for (;;)
+	{
+		vTaskDelay(pdMS_TO_TICKS(kGaugeSec * 1000));
+		const uint32_t nowSec =
+			static_cast<uint32_t>(xTaskGetTickCount() / configTICK_RATE_HZ);
+		sinceDump += kGaugeSec;
+		if (sinceDump >= kPeriodicSec)
+		{
+			sinceDump = 0;
+			logInternalState("periodic", nowSec);
+			dumpInternalRecords(nowSec);
+#if CONFIG_HEAP_TASK_TRACKING
+			logPerTask(nowSec);
+#endif
+		}
+		else
+		{
+			logInternalState("gauge", nowSec);
+		}
+	}
 }
 
 }  // namespace
