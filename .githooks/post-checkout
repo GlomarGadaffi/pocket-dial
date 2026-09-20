@@ -11,12 +11,30 @@
 # Git has no real pre-checkout hook that can block a checkout outright,
 # so this is detect-and-surface after the fact, not prevention.
 
-MAIN_TREE=$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
+# sed, not awk: `awk '{print $2}'` stops at the first space, and this repo's
+# own main working tree is "Glomar's Github". That truncated MAIN_TREE to
+# "C:/Users/desmo/Glomar's", which never equalled TOPLEVEL, so the guard
+# below always took the early exit and the hook silently did nothing -- on
+# the one clone it exists to protect.
+MAIN_TREE=$(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | head -1)
 TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null)
+
+if [ "$1" = "--selftest" ]; then
+    echo "main tree : $MAIN_TREE"
+    echo "toplevel  : $TOPLEVEL"
+    [ -n "$MAIN_TREE" ] || { echo "FAIL: could not determine the main worktree"; exit 1; }
+    if [ "$TOPLEVEL" = "$MAIN_TREE" ]; then
+        echo "verdict   : IN the shared clone -- would check the branch"
+    else
+        echo "verdict   : in a linked worktree -- correctly silent"
+    fi
+    exit 0
+fi
 
 if [ -z "$MAIN_TREE" ] || [ "$TOPLEVEL" != "$MAIN_TREE" ]; then
     exit 0
 fi
+
 
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 
