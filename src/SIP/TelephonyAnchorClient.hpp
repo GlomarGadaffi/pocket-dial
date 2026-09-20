@@ -330,7 +330,12 @@ private:
 	std::string reconcileParticipantId();
 	// POST + capture the response body (for makecall result.id). Fresh client (not the persistent
 	// ctrl connection) so the body is readable; creds snapshot under _mutex, blocking I/O lock-free.
-	bool httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut = nullptr);
+	// #349: requestSentOut distinguishes "the request never reached 3CX" from "the
+	// request was fully written and only the RESPONSE could not be read". A false
+	// return with *requestSentOut == true is UNKNOWN state, not a declined call --
+	// 3CX may well have set the call up. Callers that can reconcile must not treat
+	// the two the same.
+	bool httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut = nullptr, bool* requestSentOut = nullptr);
 	// The leg WE control for an outbound call: makecall result.id, else a destination digit-suffix
 	// match in the live participant list — the id Telephony authorizes us to stream/drop (issue #40).
 	std::string resolveOutboundLeg(const std::string& makecallRespBody, const std::string& destination);
