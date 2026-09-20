@@ -19,6 +19,12 @@ on:
     branches: [ '**' ]
   pull_request:
     branches: [ '**' ]
+    # Deliberately the GitHub default types ([opened, synchronize,
+    # reopened]), NOT including `edited` -- unlike commit-hygiene-guard
+    # (moved to its own workflow, commit-hygiene.yml, specifically so it
+    # CAN listen for `edited`/retargets without dragging the entire
+    # firmware build matrix + host tests along on every PR title/body
+    # edit, which happens far more often than a base retarget does).
 
 jobs:
   # Job 1: Build and simulate the host desktop application, run static analysis and unit/smoke tests.
@@ -645,118 +651,3 @@ jobs:
           else
             echo "Deployment audit clean! No automated GCP deployment pathways detected."
           fi
-
-  commit-hygiene-guard:
-    name: Commit Hygiene Guardrail
-    runs-on: ubuntu-latest
-    # PR-scoped only, deliberately -- this walks git history between the
-    # PR's merge-base and its head, and "the PR's commit range" is a
-    # pull_request-only concept: a push-event trigger for a branch with no
-    # PR yet has no PR range to walk. A direct push straight to main (rare;
-    # this repo's convention relies on it staying rare) is not covered here.
-    #
-    # Scoped to the PR's own range on purpose (issue #326): 114 commits
-    # already on main carry a Claude-Session: URL trailer the project's
-    # convention forbids. Retroactively enforcing this against all of
-    # history would fail every future PR forever over commits nobody
-    # touching that PR can fix. This catches NEW occurrences without
-    # blocking on old ones -- the 114 stay as recorded technical debt, not
-    # a wall everyone has to climb.
-    #
-    # main is NOT currently a protected branch (verified: GET
-    # /branches/main/protection -> 404). Until "Commit Hygiene Guardrail"
-    # is added as a required status check, a red run here is a strong
-    # signal, not an enforced gate -- see the PR that added this job for
-    # that caveat stated plainly rather than implied.
-    if: github.event_name == 'pull_request'
-    steps:
-      - name: Checkout PR head (the real commit, not the synthetic merge ref)
-        uses: actions/checkout@v4
-        with:
-          # actions/checkout's DEFAULT ref for pull_request events is
-          # refs/pull/<N>/merge -- a synthetic commit GitHub generates on
-          # the fly by merging the PR into its current base. Computing
-          # merge-base FROM that synthetic commit answers a different
-          # question than "where does this PR's real history diverge from
-          # its base." Check out the PR's actual HEAD commit instead.
-          ref: ${{ github.event.pull_request.head.sha }}
-          # Full history, not the default single-commit shallow clone.
-          # merge-base needs real ancestry to walk, and this repo's history
-          # is small enough (a few hundred commits) that the cost is
-          # negligible -- verified locally before this ever ran in CI.
-          fetch-depth: 0
-
-      - name: No Claude-Session trailers in this PR's commits or description
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-          # Passed via env, not interpolated directly into the shell script,
-          # so a hostile PR title/branch name/body can't inject shell -- the
-          # same reason BASE_REF and HEAD_SHA below are also read from env
-          # rather than spliced into the run: block as ${{ }} literals.
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-
-          # BASE_REF, not a hardcoded "main". This repo has stacked PRs --
-          # a feat/** branch based on another unmerged feat/** branch -- and
-          # this workflow's own header comment cites #242, where CI on a
-          # stacked PR silently ran against the wrong base once already.
-          # Hardcoding origin/main here would walk a stacked child PR's
-          # merge-base all the way back to main, pulling the PARENT
-          # branch's own unmerged commits into the range being checked --
-          # and failing the CHILD PR for a trailer its author can't touch.
-          #
-          # Computed from the checked-out repo, not trusted from the event
-          # payload's base.sha field -- that field reflects the base
-          # branch's tip AT THE TIME OF THE LAST SYNCHRONIZE EVENT, which
-          # can be stale if the base has moved since. merge-base against
-          # the freshly fetched origin/$BASE_REF is the actual answer,
-          # verified against the artifact rather than the metadata
-          # describing it.
-          BASE="$(git merge-base "origin/${BASE_REF}" HEAD)"
-
-          echo "Checking commit range ${BASE}..${HEAD_SHA}"
-
-          FOUND=0
-
-          # One commit at a time (not one grep over the whole range) so a
-          # hit can be reported against the specific commit that carries
-          # it -- including a squash-merge commit whose OWN first line
-          # looks clean but whose full body (every squashed sub-commit's
-          # message, which GitHub concatenates into the squash body) still
-          # carries a trailer from history further back. A check that only
-          # looked at the first line or the last few lines of a message
-          # would miss exactly that shape; this repo has already shipped a
-          # squash commit where the trailer was buried past line 50 of a
-          # 71-line body, and a manual review that used `tail -15` on that
-          # same commit missed it for exactly that reason.
-          for sha in $(git rev-list "${BASE}..${HEAD_SHA}"); do
-            if git log -1 --format=%B "$sha" | grep -qn '^Claude-Session:'; then
-              subject="$(git log -1 --format=%s "$sha")"
-              echo "::error::Commit ${sha} (\"${subject}\") carries a Claude-Session: trailer."
-              FOUND=1
-            fi
-          done
-
-          if printf '%s\n' "$PR_BODY" | grep -qn '^Claude-Session:'; then
-            echo "::error::The PR description carries a Claude-Session: trailer."
-            FOUND=1
-          fi
-
-          if [ "$FOUND" -ne 0 ]; then
-            echo ""
-            echo "pocket-dial's convention: no Claude-Session URL in commit"
-            echo "messages or PR bodies (Co-Authored-By is fine and should"
-            echo "stay -- only the session-URL trailer is the problem)."
-            echo ""
-            echo "Fix a commit: amend it and force-push the branch."
-            echo "Fix the PR body: edit the description directly."
-            echo ""
-            echo "If you have .githooks/commit-msg installed"
-            echo "(git config core.hooksPath .githooks), this cannot happen"
-            echo "at the commit stage going forward."
-            exit 1
-          fi
-
-          echo "Clean: no Claude-Session trailer in this PR's commits or description."
