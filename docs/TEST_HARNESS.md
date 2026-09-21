@@ -9,7 +9,7 @@ Nothing here replaces a script that already works.
 
 | Layer | Where | Runs in CI? | Target |
 |---|---|---|---|
-| GoogleTest suite, 95 files / 1191 cases, one ctest target `sip_parser_tests` | `tests/` | yes (ci.yml, ci-glolab.yml) | host |
+| GoogleTest suite, 96 files / 1191 cases, one ctest target `sip_parser_tests` | `tests/` | yes (ci.yml, ci-glolab.yml) | host |
 | HTTP API smoke, 30 TC ids | `tests/http/test_api.sh` | yes (host); manual on board | both |
 | pjsua/baresip interop, 11 scenarios | `tests/interop/interop.py` | **no** | host only (spawns `SipServer`) |
 | SIPp, 7 XML scenarios | `tests/sipp/run_sipp.sh` | **no** | host only (spawns `SipServer`) |
