@@ -37,8 +37,8 @@ Yealink T29 registered to a bench board placed a call that rang through to carri
 voicemail, and a second that was answered with two-way audio.
 
 That is also the honest limit of the hardware evidence. One handset model, one
-board, one carrier. Everything else in the test suite is host-side: 506 GoogleTest
-cases plus real-SIP-stack interop (pjsua, SIPp) against the **desktop** binary.
+board, one carrier. Everything else in the test suite is host-side: ~1190 GoogleTest
+cases (static `TEST`/`TEST_F` count, re-measure rather than trust this) plus real-SIP-stack interop (pjsua, SIPp) against the **desktop** binary.
 On-device RTP has no automated coverage — `RtpSender`/`RtpReceiver` compile to host
 stubs, so the green media tests exercise stubs, not silicon. OTA has never been
 exercised end to end. See [docs/PHONE_COMPATIBILITY.md](docs/PHONE_COMPATIBILITY.md)

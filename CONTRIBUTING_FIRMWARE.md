@@ -270,12 +270,11 @@ void setupNetworkMode() {
 
 ## 5. Host Test Suite
 
-touched. It is currently **799 cases** by static count of `TEST`/`TEST_F` in
-`tests/*.cpp`, of which **796 run on Linux/WSL** — which is the number CI
-enforces and the number to quote in a commit message. (This count merges
-issue #159's SMTP-client/JWT/HTTP suites with #186/#173's config-export and
-two-role suites, both landing around the same time — re-measured after the
-merge rather than carried forward from either PR alone.)
+touched. It was **1191 cases** by static count of `TEST`/`TEST_F` in
+`tests/*.cpp` as of `d92fd2d` (2026-09-20); re-measure with
+`grep -c '^TEST\(_F\)\?(' tests/*_test.cpp` and quote the number CTest actually
+ran, not this sentence. (Earlier committed counts — 506, 799 — went stale
+within weeks, which is the argument for re-deriving it.)
 
 The gap is not drift, though the exact size of it is worth re-deriving rather
 than trusting the last committed sentence: `DidMapping_test.cpp` and
