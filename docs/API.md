@@ -28,6 +28,26 @@ every admin-gated endpoint **except** `set-credential` itself is refused with
 `403 {"error":"setup_required"}`. That is "force setup on first use," enforced
 server-side, not just suggested by the dashboard UI.
 
+> [!IMPORTANT]
+> **Any endpoint in this document can answer `503 {"error":"busy","message":"too
+> many concurrent connections"}`** (issue #368). The listener still always
+> accepts — that statement above is unchanged — but the server handles a bounded
+> number of requests at once (`HttpServer::kMaxConcurrentConnections`), and over
+> that ceiling a connection is answered and closed immediately instead of being
+> given a handler.
+>
+> This is not rate limiting and it is not per-client: it is a hard ceiling on
+> *simultaneous* requests, because each handler costs a thread stack out of the
+> same internal-DRAM pool the Ethernet driver allocates its DMA buffers from.
+> Unbounded, a burst of a dozen concurrent requests was measured taking the
+> device's network interface down entirely, so refusing the surplus is the
+> conservative behaviour.
+>
+> A `503` here is **retryable and usually instant** — it means "not right now,"
+> not "that request was wrong." Clients that fan out parallel requests should
+> retry rather than treat it as a failure. The dashboard never approaches the
+> ceiling; one document plus its polled JSON is well inside it.
+
 A separate, independent numeric **DTMF admin PIN** (phone-keypad `*PIN#code`
 menu: NTP resync, topology switch, factory reset) has no default at all and
 stays fully disabled until explicitly set via the same `set-credential`

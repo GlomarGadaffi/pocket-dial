@@ -45,6 +45,23 @@ public:
 	// stackHwm_http_conn on /api/status reports the measured high-water mark so
 	// this number stays evidence-backed rather than an estimate.
 	static constexpr unsigned kHttpConnStackBytes = 4096;
+	// Issue #368: ceiling on simultaneously-running connection handler threads.
+	//
+	// Each handler costs a task stack + TCB + socket buffers out of INTERNAL
+	// DRAM -- the same pool the W5500 driver allocates its DMA bounce buffer
+	// from. Measured on .244 with the 8192-byte pthread default: 8 concurrent
+	// requests drove minFreeHeapInternal to 7412 bytes, 12 produced
+	// "spicommon_dma_setup_priv_buffer: Failed to allocate priv TX buffer" plus
+	// dropped Ethernet frames, and 16 reached 624 bytes free. Unbounded, this
+	// does not merely refuse dashboard requests -- it takes the network
+	// interface down for the duration, which on a PBX means live call
+	// signalling and audio.
+	//
+	// 4 is chosen to stay safe at the CURRENT 8192-byte stack (~35 KB worst
+	// case) rather than only at the 4096 #366/#367 moves to, so this does not
+	// depend on which of the two lands first. It is also comfortably more than
+	// the dashboard uses: the SPA is one document plus its polled JSON.
+	static constexpr int kMaxConcurrentConnections = 4;
 
 	HttpServer(const std::string& ip, int port, RequestsHandler* handler = nullptr);
 	~HttpServer();
@@ -359,6 +376,10 @@ private:
 	// rather than a last-value because the interesting case is the deepest
 	// request the board has ever served, not the most recent one.
 	std::atomic<long> _httpConnStackHwmBytes{-1};
+	// Issue #368: handler threads currently alive. Claimed by acceptLoop() before
+	// the thread is created and released by the thread itself on exit, so a burst
+	// arriving faster than threads can start cannot overshoot the cap.
+	std::atomic<int> _activeConnections{0};
 
 	// Track server uptime
 	uint64_t _startTime;

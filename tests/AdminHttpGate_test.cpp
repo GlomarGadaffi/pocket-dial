@@ -918,6 +918,83 @@ TEST(HttpConnStack, FitsUnderTheWorstObservedFreeBlock)
 		<< "leave at least 3 KB of the worst observed block unused by the stack";
 }
 
+// Issue #368. Each connection handler costs a task stack + TCB + socket buffers
+// out of internal DRAM, which on device is the same pool the W5500 driver takes
+// its DMA bounce buffer from. Unbounded, a burst of unauthenticated requests
+// stops the board transmitting Ethernet frames -- measured on .244: 12
+// concurrent GETs produced "Failed to allocate priv TX buffer" and dropped
+// frames, 16 left 624 bytes of internal DRAM free.
+//
+// The slots are held here with sockets that connect and then say nothing, so
+// each handler sits in recv() and the slot is genuinely occupied. A burst of
+// ordinary requests would not do: on the host they finish in well under a
+// millisecond and may never actually overlap, which would let this pass with
+// the cap deleted.
+TEST(HttpConnCap, OverTheCapIsRefused503AndSlotsAreReleased)
+{
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.9.2", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18099, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	// Occupy every slot DETERMINISTICALLY. A burst of ordinary requests will not
+	// do it: on the host they complete in well under a millisecond, so they may
+	// never actually overlap and the test would pass with the cap deleted. These
+	// sockets connect and then say nothing, so each handler sits in recv() until
+	// its SO_RCVTIMEO -- the slot is genuinely held for the duration.
+	std::vector<int> held;
+	for (int i = 0; i < HttpServer::kMaxConcurrentConnections; ++i)
+	{
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		ASSERT_GE(s, 0);
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port   = htons(18099);
+		inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+		ASSERT_EQ(connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+		held.push_back(s);
+	}
+	// Let the accept loop pick all of them up and claim their slots.
+	std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+	// With every slot held, the next caller must be TOLD it is busy -- not have
+	// its socket dropped silently, which is what an uncapped server does once the
+	// thread spawn itself starts failing.
+	const std::string refusedResp = httpGetRaw(18099, "/api/status");
+	EXPECT_NE(refusedResp.find("503"), std::string::npos)
+		<< "over the cap the server must answer 503, got:\n"
+		<< refusedResp.substr(0, 200);
+	EXPECT_NE(refusedResp.find("busy"), std::string::npos) << refusedResp.substr(0, 200);
+
+	// Releasing the held sockets makes each blocked recv() return 0, so the
+	// handlers exit promptly rather than waiting out the full timeout.
+	for (int s : held)
+	{
+#if defined(_WIN32) || defined(_WIN64)
+		closesocket(s);
+#else
+		close(s);
+#endif
+	}
+
+	// The decisive part: the counter has to be RELEASED on every exit path. If it
+	// leaked even once per request, the server would be permanently wedged at the
+	// cap and this follow-up request would be refused forever after -- a worse
+	// bug than the one being fixed.
+	std::this_thread::sleep_for(std::chrono::milliseconds(300));
+	const std::string after = httpGetRaw(18099, "/api/status");
+	EXPECT_NE(after.find("200 OK"), std::string::npos)
+		<< "after the burst drains, the server must accept requests again -- a "
+		   "counter that is not released turns the cap into a permanent lockout:\n"
+		<< after.substr(0, 200);
+
+	AdminAuth::clearCredential();
+}
+
 // ── OTA Status & Updater Lifecycle (Issue #271) ──────────────────────────────
 // Issue #271: /api/ota/status "running" is a partition label ("ota_0" or "host"),
 // which JS treated as a truthy boolean causing the panel to permanently read
