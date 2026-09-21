@@ -878,8 +878,44 @@ TEST(CdrDisclosure, ClientCountStaysVisibleSoEmptyIsNotAmbiguous)
 	// pinning either branch's presence in the actual JSON body.
 	EXPECT_NE(body.find("\"resetReason\":\"n/a\""), std::string::npos)
 		<< "host build must report a resetReason, not omit the key:\n" << body;
+	// Issue #366: the connection-thread stack high-water mark is how the
+	// kHttpConnStackBytes figure stays evidence-backed instead of an estimate,
+	// so the key has to survive in the payload the dashboard/tooling parses.
+	// Host has no FreeRTOS task to measure, hence null -- same convention as
+	// the other stackHwm_* fields on this branch.
+	EXPECT_NE(body.find("\"stackHwm_http_conn\":null"), std::string::npos)
+		<< "host build must report stackHwm_http_conn, not omit the key:\n" << body;
 
 	AdminAuth::clearCredential();
+}
+
+// Issue #366. The board was dropping HTTP connections with "pthread: Failed to
+// create task!" while NOTHING was leaking: internal free sat flat at ~27.7 KB
+// for twenty minutes, but largestFreeBlockInternal oscillated between 7924 and
+// 9204 and a connection thread needed one contiguous block of
+// CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT (8192) to start. Sitting exactly on
+// that boundary is what made the dashboard fail intermittently rather than
+// outright.
+//
+// This pins the headroom, not the constant: the test is written against the
+// worst largest-block figure actually measured on .244 so that raising the
+// stack back toward that boundary fails here with the reason attached, rather
+// than silently reintroducing the cliff on hardware nobody is watching.
+TEST(HttpConnStack, FitsUnderTheWorstObservedFreeBlock)
+{
+	// Smallest largestFreeBlockInternal seen across the #366 control run.
+	constexpr unsigned kWorstObservedLargestFreeBlock = 7924;
+
+	EXPECT_LT(HttpServer::kHttpConnStackBytes, kWorstObservedLargestFreeBlock)
+		<< "a connection thread must fit in the smallest contiguous internal-DRAM "
+		   "block #366 observed, or the spawn failures come back";
+
+	// And by a real margin, not a handful of bytes -- fragmentation is not going
+	// to politely stop at the figure we happened to catch. 3 KB of that worst
+	// block has to still be free once the stack is carved out of it, which also
+	// fails the 6144 half-measure, not just a straight revert to 8192.
+	EXPECT_LE(HttpServer::kHttpConnStackBytes + 3072u, kWorstObservedLargestFreeBlock)
+		<< "leave at least 3 KB of the worst observed block unused by the stack";
 }
 
 // ── OTA Status & Updater Lifecycle (Issue #271) ──────────────────────────────

@@ -59,6 +59,9 @@
 // Issue #185: heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) for
 // sendApiStatus's minFreeHeapSpiram field.
 #include "esp_heap_caps.h"
+// Issue #366: esp_pthread_set_cfg() to size the per-connection thread stack
+// independently of CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT.
+#include "esp_pthread.h"
 #endif
 
 // Forward declarations for the file-local form/URL helpers (defined lower down).
@@ -188,6 +191,33 @@ void HttpServer::start()
 
 void HttpServer::acceptLoop()
 {
+#if defined(ESP_PLATFORM)
+	// Issue #366. esp_pthread_set_cfg() applies to threads created BY THE
+	// CALLING THREAD, and this one creates nothing except the per-connection
+	// handlers below -- so setting it once here covers all of them and leaves
+	// every other std::thread in the firmware on the 8192 Kconfig default.
+	// Changing CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT instead would have
+	// re-sized threads this issue never measured.
+	//
+	// A failure here is not fatal: the threads simply keep the old default and
+	// we are back to the pre-fix behaviour, which is a dropped connection under
+	// fragmentation rather than a crash. Log it so a silent regression to 8192
+	// is visible in the boot log instead of being invisible until the board
+	// starts refusing connections again.
+	{
+		esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+		cfg.stack_size  = kHttpConnStackBytes;
+		cfg.thread_name = "http_conn";
+		const esp_err_t cfgErr = esp_pthread_set_cfg(&cfg);
+		if (cfgErr != ESP_OK)
+		{
+			std::cerr << "[HttpServer] esp_pthread_set_cfg failed (" << esp_err_to_name(cfgErr)
+				<< ") — connection threads keep the "
+				<< CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT << "-byte default\n";
+		}
+	}
+#endif
+
 	while (_running)
 	{
 		if (_listenSock < 0)
@@ -246,6 +276,7 @@ void HttpServer::acceptLoop()
 		{
 			std::thread([this, clientSock]() {
 				handleClient(clientSock);
+				recordConnStackHwm();
 			}).detach();
 		}
 		catch (const std::exception& e)
@@ -1273,6 +1304,32 @@ static void pdAppendHwmField(std::ostringstream& json, const char* key, long byt
 }
 #endif // ESP_PLATFORM
 
+void HttpServer::recordConnStackHwm()
+{
+#if defined(ESP_PLATFORM)
+	// uxTaskGetStackHighWaterMark returns the smallest amount of free stack this
+	// task has ever had, in WORDS on Xtensa -- multiply for the bytes every other
+	// stackHwm_* field reports. Called on the connection thread itself, right
+	// after the request has been served, so it covers whatever depth that
+	// particular route reached.
+	const long freeBytes =
+		static_cast<long>(uxTaskGetStackHighWaterMark(nullptr)) * sizeof(StackType_t);
+
+	// Keep the WORST (smallest-free) figure any connection has produced since
+	// boot: a compare-exchange loop rather than a plain store, because several
+	// connection threads can finish at once and the deepest one must win.
+	long prev = _httpConnStackHwmBytes.load(std::memory_order_relaxed);
+	while (prev < 0 || freeBytes < prev)
+	{
+		if (_httpConnStackHwmBytes.compare_exchange_weak(prev, freeBytes,
+			std::memory_order_relaxed))
+		{
+			break;
+		}
+	}
+#endif
+}
+
 void HttpServer::sendApiStatus(int sock, bool authenticated)
 {
 	uint64_t uptimeMs = currentTimeMs() - _startTime;
@@ -1505,6 +1562,13 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	pdAppendHwmField(json, "stackHwm_rtp_media_tx", pdStackHwmBytes("rtp_media_tx"));
 	pdAppendHwmField(json, "stackHwm_rtp_media_rx", pdStackHwmBytes("rtp_media_rx"));
 	pdAppendHwmField(json, "stackHwm_conf_mix_tick", pdStackHwmBytes("conf_mix_tick"));
+	// Issue #366: not a live-task lookup like the others -- a connection thread is
+	// gone by the time anyone reads this -- but the worst figure recorded by any
+	// of them since boot. null until the first request has completed, which in
+	// practice means the very request being served here reports null on a fresh
+	// boot and a real number from then on.
+	pdAppendHwmField(json, "stackHwm_http_conn",
+		_httpConnStackHwmBytes.load(std::memory_order_relaxed));
 #else
 	// Host build: no FreeRTOS, no heap_caps. Same key set as the ESP build,
 	// all-zero/null, so tests/interop/interop.py's JSON parsing never has to
@@ -1515,7 +1579,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	        ",\"freeHeapDma\":0,\"largestFreeBlockDma\":0,\"resetReason\":\"n/a\"";
 	json << ",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
 	        "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
-	        "\"stackHwm_conf_mix_tick\":null";
+	        "\"stackHwm_conf_mix_tick\":null,\"stackHwm_http_conn\":null";
 #endif
 
 	json << "}";
