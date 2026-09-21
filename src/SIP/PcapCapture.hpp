@@ -51,8 +51,27 @@
 // the steady-state capture path allocates nothing. Capture is unconditional
 // (there is no enable flag; see the record() sites in RequestsHandler), which is
 // what makes that worth doing rather than a micro-optimization.
+// 16, not 64 (#328 follow-up). #278 measured this ring holding **~52 KB of
+// internal DRAM at steady state** on .244 at 64 slots, and confirmed that
+// shrinking it conserved 91% of the drain -- but it fixed only the override
+// plumbing (the documented -D flag had been silently a no-op) and left the
+// default at 64, which no build overrides. So the measured, validated fix has
+// never been in anything that ships.
+//
+// A 2026-09-21 heap_trace attribution run found the two single largest
+// internal-DRAM call sites on an otherwise idle board are both this ring:
+// the inbound capture in RequestsHandler::handle() and the outbound one in
+// drainOutbox(). It is not a leak -- it fills and then holds, which is exactly
+// why idle free heap settles flat -- but it is a permanent FLOOR under a board
+// with roughly 80 KB of internal DRAM to spend, and it is what leaves so little
+// headroom that ~12 concurrent HTTP requests (#368) or a few minutes of hold
+// music (#328) can take the W5500's DMA bounce buffer with them.
+//
+// 16 keeps twice the depth of the RING_SIZE=8 treatment #278 actually measured,
+// and the plumbing above means a build that genuinely wants 64 can still ask
+// for it -- unlike before, that request now takes effect.
 #ifndef POCKETDIAL_PCAP_RING_SIZE
-#define POCKETDIAL_PCAP_RING_SIZE 64
+#define POCKETDIAL_PCAP_RING_SIZE 16
 #endif
 
 class PcapCapture

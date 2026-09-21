@@ -615,3 +615,35 @@ TEST(PcapCapture, ApiDiagnosticsPcapServesValidGlobalHeaderAndOneRecordOverRealS
 	EXPECT_NE(body.find("REGISTER sip:server"), std::string::npos)
 		<< "captured SIP bytes must appear verbatim in the record's frame";
 }
+
+// #328 follow-up. Every other test in this file references
+// POCKETDIAL_PCAP_RING_SIZE symbolically, so they pass at any value and none of
+// them would notice the DEFAULT going back up. That default is the whole point:
+// this ring holds a full copy of every SIP message in and out, in INTERNAL
+// DRAM, unconditionally, and by design never shrinks.
+//
+// #278 measured it at ~52 KB steady state on .244 at 64 slots and confirmed
+// shrinking it conserved 91% of the drain -- then shipped only the override
+// plumbing and left the default at 64, which no build overrides. A 2026-09-21
+// heap_trace attribution run found the inbound (RequestsHandler::handle) and
+// outbound (drainOutbox) capture sites are the two single largest internal-DRAM
+// consumers on an idle board.
+//
+// So this test exists to make raising the default fail loudly with the reason
+// attached, rather than quietly re-spending tens of KB of the ~80 KB this board
+// has -- the same headroom whose absence lets ~12 concurrent HTTP requests
+// (#368) or a few minutes of hold music (#328) knock out the W5500's DMA
+// bounce buffer.
+TEST(PcapCapture, DefaultRingSizeStaysOffTheInternalDramBudget)
+{
+	EXPECT_LE(POCKETDIAL_PCAP_RING_SIZE, 16)
+		<< "the pcap ring holds full SIP messages in internal DRAM and never "
+		   "shrinks; #278 measured 64 slots at ~52 KB. Raising this spends "
+		   "internal DRAM the board does not have -- override it per-build "
+		   "(-DPOCKETDIAL_PCAP_RING_SIZE=N) instead of moving the default.";
+
+	// Still more depth than the RING_SIZE=8 treatment #278 actually validated,
+	// so this is not a silent slide toward "capture nothing" either.
+	EXPECT_GE(POCKETDIAL_PCAP_RING_SIZE, 8)
+		<< "below 8 gives less post-incident capture than #278's own experiment";
+}
