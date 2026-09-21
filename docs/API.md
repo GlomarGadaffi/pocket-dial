@@ -844,7 +844,16 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
   "stackHwm_udp_receiver_task": 9820,
   "stackHwm_rtp_media_tx": null,
   "stackHwm_rtp_media_rx": null,
-  "stackHwm_conf_mix_tick": null
+  "stackHwm_conf_mix_tick": null,
+  "stackHwm_http_conn": 1364,
+  "l2Tx": {
+    "poolAllocations": 184302,
+    "poolExhaustions": 0,
+    "poolAvailable": 6,
+    "poolSize": 6,
+    "mohL2Errors": 0,
+    "mohSockErrors": 0
+  }
 }
 ```
 
@@ -899,6 +908,13 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `stackHwm_rtp_media_tx` | Integer or `null` | Same, for `rtp_media_tx` (`src/SIP/RtpSender.cpp`). **`null` most of the time by design**; every `RtpSender` instance's task shares this one literal name, and the task exists only while ONE of them is actively sending: the 440/555/888/park internal media, or a WAN-anchor-bridged call the board terminates through `MediaBridge`/`TelephonyAnchorClient`. Never for an ordinary ext-to-ext call (peer-to-peer; the board never touches that media) and not between calls. Distinguish `null` from a `0` reading, which would mean the task is running with **no stack headroom left**, the near-overflow condition this field exists to catch. |
 | `stackHwm_rtp_media_rx` | Integer or `null` | Same, for `rtp_media_rx` (`src/SIP/RtpReceiver.cpp`), same shared-task-name and "any call the board terminates media for" caveat as `stackHwm_rtp_media_tx`. |
 | `stackHwm_conf_mix_tick` | Integer or `null` | Same, for `conf_mix_tick` (`src/SIP/ConferenceRoom.cpp`), the task the #185 mixer survey flagged: `MixBus::tick()` puts roughly 2.9 KB of locals on this task's 3072 byte stack, so a low reading here (as opposed to `null`, meaning no conference is active) is the number that says whether that margin is real. `null` whenever no conference is running. |
+| `stackHwm_http_conn` | Integer or `null` | The **worst** (smallest-free) stack figure any HTTP connection thread has reported since boot, in bytes — not a live-task lookup like the rows above, since a connection thread is gone by the time anyone reads this. It is what keeps `HttpServer::kHttpConnStackBytes` (#366) an evidence-backed number rather than an estimate: measured usage on `.244` is ~2752 bytes of the 4096 reserved. `null` until the first request has completed. |
+| `l2Tx` | Object | L2 transmit-path health (#328). See below. |
+| `l2Tx.poolAllocations` | Integer | Frames borrowed from the shared `DmaFramePool` (#330) since boot. **This is the field that says whether the L2 bypass is actually carrying media.** `HoldMusic::runLoop()` and `RtpSender::runLoop()` try the pooled L2 path first and fall back to `sendto()` *silently* when L2 addressing is not ready — nothing is logged unless the `sendto()` itself errors. During an active hold or call this should climb at the packet rate (50/s at 20 ms ptime); if it is flat while audio is flowing, the traffic is going out the socket path the pool exists to avoid, and any conclusion drawn about #328 from heap figures alone is unsound. Live on the host build too. |
+| `l2Tx.poolExhaustions` | Integer | Times `acquire()` found the pool empty and returned null, so the caller dropped that 20 ms frame and fell back. Non-zero means the pool is undersized for the concurrent transmit load, which is a different failure from "L2 addressing never became ready" — the two are indistinguishable from `poolAllocations` alone. |
+| `l2Tx.poolAvailable` / `l2Tx.poolSize` | Integer | Buffers currently free, and the fixed pool size (`POCKETDIAL_DMA_FRAME_POOL_SIZE`, default 6). A persistently low `poolAvailable` with `poolExhaustions` climbing is the signature of contention between the concurrent transmit tasks. |
+| `l2Tx.mohL2Errors` | Integer or `null` | Hold-music frames where the L2 transmit was attempted and **failed** (`HoldMusic::_l2TxErrors`). Distinguishes "L2 was tried and broke" from "L2 was never ready and we quietly used the socket" — `poolAllocations` flat with this at 0 means the latter. `null` on builds with no pacing task. |
+| `l2Tx.mohSockErrors` | Integer or `null` | Hold-music `sendto()` calls that failed outright (`HoldMusic::_txErrors`). The board logs these only once per 250 failures, so this is the complete count. `null` on builds with no pacing task. |
 
 > **Task-Watchdog coverage (issue #185).** `sip_server_task` is subscribed to
 > the IDF Task Watchdog Timer (`esp_task_wdt_add()` + a per-tick

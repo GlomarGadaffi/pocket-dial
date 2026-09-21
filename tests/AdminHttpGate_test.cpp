@@ -22,6 +22,7 @@
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
 #include "AdminAuth.hpp"
+#include "DmaFramePool.hpp"   // Issue #328: /api/status's l2Tx counters
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -885,6 +886,56 @@ TEST(CdrDisclosure, ClientCountStaysVisibleSoEmptyIsNotAmbiguous)
 	// the other stackHwm_* fields on this branch.
 	EXPECT_NE(body.find("\"stackHwm_http_conn\":null"), std::string::npos)
 		<< "host build must report stackHwm_http_conn, not omit the key:\n" << body;
+
+	AdminAuth::clearCredential();
+}
+
+// Issue #328. The MoH proof run could show hold music streaming at exactly
+// 50 pkt/s and DMA heap collapsing underneath it, but not WHICH path carried
+// the audio: HoldMusic::runLoop() falls back from the L2 bypass to sendto()
+// silently. "The pool is working" and "it has been falling back the whole
+// time" were externally indistinguishable, so the proof could only ever be an
+// inference. poolAllocations is what settles it.
+//
+// This asserts the counter is LIVE, not merely present. A key that is always
+// zero would satisfy a presence check while telling a future diagnostic run
+// exactly nothing -- which is the failure mode this whole field exists to end.
+TEST(L2TxCounters, PoolAllocationsAreLiveNotJustPresent)
+{
+	AdminAuth::clearCredential();
+	l2rtp::DmaFramePool::init();
+	l2rtp::DmaFramePool::resetStats();
+
+	RequestsHandler handler("192.168.9.2", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	// Its own port: this file owns 18080-18099 and assigns one per test so a
+	// lingering listener can only ever fail its own (see the header comment).
+	HttpServer server("127.0.0.1", 18095, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string before = bodyOf(httpGetRaw(18095, "/api/status"));
+	EXPECT_NE(before.find("\"l2Tx\":"), std::string::npos) << before;
+	EXPECT_NE(before.find("\"poolAllocations\":0"), std::string::npos)
+		<< "stats were just reset, so this must start at zero:\n" << before;
+	// Off-device there is no pacing task to have failed a transmit, so these
+	// report null rather than a misleading 0 -- same convention as stackHwm_*.
+	EXPECT_NE(before.find("\"mohL2Errors\":null"), std::string::npos) << before;
+	EXPECT_NE(before.find("\"mohSockErrors\":null"), std::string::npos) << before;
+
+	// Borrow and return a frame, exactly as a transmit does.
+	{
+		auto frame = l2rtp::DmaFramePool::acquire();
+		ASSERT_TRUE(static_cast<bool>(frame));
+	}
+
+	const std::string after = bodyOf(httpGetRaw(18095, "/api/status"));
+	EXPECT_NE(after.find("\"poolAllocations\":1"), std::string::npos)
+		<< "one acquire() must be visible through the API, or the counter is "
+		   "decorative and a future #328 run learns nothing from it:\n" << after;
+	// Returned to the pool, so nothing is outstanding and nothing was starved.
+	EXPECT_NE(after.find("\"poolExhaustions\":0"), std::string::npos) << after;
 
 	AdminAuth::clearCredential();
 }
