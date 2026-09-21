@@ -293,7 +293,7 @@ day one. Update this table as items land.
 | `board-flash` | esptool `--after no_reset` + config export; no import, no power-cycle (#338), dispatch-only with a human present |
 | `board-soak` | fixed 1 min / 10 s sampler to CSV, no slope verdict |
 | `anchor` | credential presence check only |
-| CI | firmware bundles uploaded (eth, heap_trace); callgraph step in both host workflows, warn-only until #361 (it finds a real cycle on main); `hil-244` is `workflow_dispatch`-only and runs `board-smoke` without flashing |
+| CI | firmware bundles uploaded (eth, heap_trace); callgraph step blocking in both host workflows (its first run found #361, fixed in #364); `hil-244` is `workflow_dispatch`-only and runs `board-smoke` without flashing |
 | Not started | remote-target interop/SIPp (P1), serial capture, `gtest_discover_tests`, sanitizer CI job, port-base plumbing, Discussion posts |
 
 `board-smoke` still runs `office_smoke.py` unconditionally: DND and forward toggles, a
