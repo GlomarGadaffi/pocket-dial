@@ -1088,7 +1088,7 @@ private:
 	// _vmRecordBufs[slot] -- the orphan sweep at the top of
 	// sweepVoicemailLegs() reclaims the slot once it finishes.
 	bool dispatchVoicemailMenuCommand(int slot, const std::string& callID,
-		const std::shared_ptr<Session>& session, const VoicemailMenu::Result& r);
+		const std::shared_ptr<Session>& session, const VoicemailMenu::Result& initial);
 	// The BYE-then-teardown steps sweepVoicemailLegs()'s deadline-expiry
 	// path already used, factored out so its own toExpire loop is the only
 	// caller -- see dispatchVoicemailMenuCommand()'s doc comment for why a

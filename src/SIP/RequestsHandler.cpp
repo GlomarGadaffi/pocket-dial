@@ -3055,17 +3055,32 @@ bool RequestsHandler::handleVoicemailSdJobDone(int slot, const std::string& call
 }
 
 bool RequestsHandler::dispatchVoicemailMenuCommand(int slot, const std::string& callID,
-	const std::shared_ptr<Session>& session, const VoicemailMenu::Result& r)
+	const std::shared_ptr<Session>& session, const VoicemailMenu::Result& initial)
 {
-	if (r.command == VoicemailMenu::Command::PlayPrompt)
+	// #361: this was a tail call to itself, which the T-7 call-graph guard
+	// (tests/tools/check_parser_callgraph.py, CWE-674) reports as a cycle --
+	// and that guard's contract is "no cycles through project code" precisely
+	// so nobody has to argue about depth bounds on a 6 KB task stack. Same
+	// behaviour, expressed as a loop.
+	VoicemailMenu::Result r = initial;
+	while (r.command == VoicemailMenu::Command::PlayPrompt)
 	{
 		// No prompt asset exists in this MVP -- same graceful-degradation
 		// convention the deposit-side greeting already uses when unloaded.
-		// Synthesize an immediate finish and let the menu decide what's
-		// next (with zero messages, always Hangup) -- bounded to one level
-		// of recursion, since onPlaybackDone() from PlayingPrompt always
-		// transitions straight to Done.
-		return dispatchVoicemailMenuCommand(slot, callID, session, _vmMenus[slot].onPlaybackDone());
+		// Synthesize an immediate finish and let the menu decide what's next
+		// (with zero messages, always Hangup).
+		//
+		// This runs AT MOST ONCE, and that is a property of VoicemailMenu
+		// itself rather than an argument about this loop: Command::PlayPrompt
+		// is emitted by exactly one statement in the whole class -- start()
+		// with messageCount == 0 (VoicemailMenu.cpp:23) -- while advance()
+		// returns only Hangup or PlayMessage, and onPlaybackDone() from
+		// PlayingPrompt returns Hangup and moves to Done. So onPlaybackDone()
+		// cannot hand back PlayPrompt from any state, and the condition below
+		// is false on the second evaluation by construction. No iteration cap:
+		// it would be unreachable code guarding an invariant the type already
+		// enforces.
+		r = _vmMenus[slot].onPlaybackDone();
 	}
 
 	VmSdJob job;
