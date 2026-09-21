@@ -55,6 +55,27 @@ PBX_WEB_PORT = 8085          # must not silently absorb this harness's traffic
 
 RESULTS = []   # (name, status, detail)  status in {"OK", "FAIL", "SKIP"}
 
+# "This leg went down", precisely.
+#
+# pjsua runs at log level 5 here, so its log holds the full SIP trace as raw
+# text -- which makes a naive r"BYE" match two things that have nothing to do
+# with a leg ending:
+#
+#   * the "Allow: ... BYE ..." header that EVERY SIP message carries, so any
+#     traffic at all to a UA looks like a teardown; and
+#   * "Received RTCP BYE", a media event pjsua logs when a stream is re-pointed
+#     -- which is precisely what a SUCCESSFUL transfer does.
+#
+# Both fire on a perfectly healthy leg, and in blind_transfer they fired within
+# one millisecond of the transfer succeeding. Match only an inbound BYE request
+# or pjsua's own call-state line. Deliberately NOT "Request msg BYE" on its own:
+# that also matches a UA *sending* its own BYE during scenario teardown.
+TEARDOWN_RX = r"Processing incoming message: Request msg BYE|Call \d+ is DISCONNECTED"
+
+# "This leg was re-INVITEd" -- the observable for a leg being moved to a new
+# peer. Same pattern sc_attended_transfer already uses for its splice check.
+REINVITE_RX = r"Received Request msg INVITE|RX .*INVITE"
+
 
 # --------------------------------------------------------------------------
 # small helpers
@@ -489,9 +510,18 @@ def sc_blind_transfer(env):
 
     RFC 3515 s2 / RFC 5359 s2.4: B ends up talking to C and A drops out. This
     scenario used to assert the reverse ("transferee torn down"), matching a PBX
-    that BYEd B and dialled A through to C -- issue #197. The assertions below
-    are the corrected topology and have NOT been run against the bench: the
-    firmware change is host-tested only, and this harness needs the real PBX.
+    that BYEd B and dialled A through to C -- issue #197, fixed by #211.
+
+    When those corrected assertions were first actually executed (2026-09-21)
+    they reported a failure the PBX was not committing: `b_torn` used a bare
+    r"BYE", which matches both the Allow: header on the transfer's own
+    re-INVITE and the "Received RTCP BYE" pjsua logs when that re-INVITE
+    re-points the media. A correct blind transfer produces both, so the
+    assertion could never pass. See TEARDOWN_RX.
+
+    B's survival is now checked as "re-INVITEd AND not torn down": the second
+    half alone would also pass a PBX that dropped A, INVITEd C, and left B
+    sitting on a dead leg.
     """
     a, b, c = env["A"], env["B"], env["C"]
     ma = a.mark()
@@ -504,18 +534,23 @@ def sc_blind_transfer(env):
     a.cmd("call transfer sip:%s@%s:%d" % (c.ext, PBX_IP, PBX_SIP_PORT), 3.0)
     accepted = a.wait_log(r"202 Accepted|202/REFER", 6, ma2) is not None
     # The TRANSFEROR is the one that leaves.
-    a_torn = a.wait_log(r"BYE|(is|to) DISCONNECTED", 8, ma2) is not None
+    a_torn = a.wait_log(TEARDOWN_RX, 8, ma2) is not None
     c_invited = c.wait_log(r"INVITE", 8, mc2) is not None
-    # ...and B stays up. Checked last, and only as "no teardown seen": a pass
-    # costs the full timeout, which is why it is not first.
-    b_torn = b.wait_log(r"BYE|(is|to) DISCONNECTED", 6, mb2) is not None
+    # B must be MOVED, not merely left alive. "No teardown seen" alone would
+    # also pass a PBX that 202s the REFER, drops A, INVITEs C and then simply
+    # forgets B -- B would sit CONFIRMED on a dead leg, untorn and unmoved.
+    # The re-INVITE is the positive evidence that B was actually re-pointed.
+    b_reinvited = b.wait_log(REINVITE_RX, 8, mb2) is not None
+    # Checked last, and only as "no teardown seen": a pass costs the full
+    # timeout, which is why it is not first.
+    b_torn = b.wait_log(TEARDOWN_RX, 6, mb2) is not None
     for ua in (a, b, c):
         ua.hangup_all()
-    ok = accepted and a_torn and c_invited and not b_torn
+    ok = accepted and a_torn and c_invited and b_reinvited and not b_torn
     return report("blind_transfer", "OK" if ok else "FAIL",
                   "202 to REFER=%s, transferor dropped=%s, target INVITEd=%s, "
-                  "transferee survived=%s"
-                  % (accepted, a_torn, c_invited, not b_torn))
+                  "transferee re-INVITEd=%s, transferee survived=%s"
+                  % (accepted, a_torn, c_invited, b_reinvited, not b_torn))
 
 
 def sc_attended_transfer(env):
@@ -571,7 +606,7 @@ def sc_park_retrieve(env):
 
     m_bye = a.mark()
     c.hangup_all()
-    bye_relayed = a.wait_log(r"BYE|(is|to) DISCONNECTED", 8, m_bye) is not None
+    bye_relayed = a.wait_log(TEARDOWN_RX, 8, m_bye) is not None
     a.hangup_all()
     ok = parked and hold_sdp and retrieved and bye_relayed
     return report("park_retrieve", "OK" if ok else "FAIL",
