@@ -309,11 +309,34 @@ public:
 	SipTrunk::Config getTrunkConfig();
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
-	// Test-only, and not compiled into device firmware -- the same treatment
-	// the anchor/CDR/registrar accessors above already get. Nothing the
-	// firmware does needs these, and expireTrunkDeadlinesForTest() in
-	// particular would be a way to hang up every live trunk call from
-	// anywhere holding the handler.
+	// Test-only. Gated because these three are DEFINED OUT OF LINE, in
+	// RequestsHandler.cpp -- and that, not the gate, is what decides whether a
+	// test accessor reaches the firmware image:
+	//
+	//   defined out of line in a .cpp : the TU always emits the symbol. It
+	//       ships unless something removes it. --gc-sections may or may not
+	//       collect it; do not rely on that.
+	//   defined inline in this header : never emitted at all when nothing
+	//       calls it, because an unused inline member function generates no
+	//       code. Gating it is harmless but buys nothing.
+	//
+	// Worth stating plainly because the earlier version of this comment said
+	// these get "the same treatment the anchor/CDR/registrar accessors above
+	// already get", which invites the wrong conclusion. Those are gated AND
+	// inline, so their gate is belt-and-braces; the ~nine ungated voicemail
+	// accessors further down are inline too, and are already absent from the
+	// image -- verified against the link map, 0 kept and 0 discarded, not
+	// assumed. Neither group is evidence that gating is what keeps a test
+	// accessor out of firmware.
+	//
+	// So: if you add an accessor here, either define it inline below and the
+	// question does not arise, or define it in the .cpp and keep it inside
+	// this guard. Checking `nm`/the link map beats reasoning about it.
+	//
+	// The one that makes this worth caring about rather than tidy is
+	// expireTrunkDeadlinesForTest(): it forces every live trunk dialog past
+	// its deadline, so shipping it would put "hang up every call in progress"
+	// inside anything that can reach the handler.
 
 	// How many of the POCKETDIAL_MAX_TRUNK_CALLS relay pairs are in use. A pair
 	// is two cross-wired RtpReceivers; this is the only external view of that,

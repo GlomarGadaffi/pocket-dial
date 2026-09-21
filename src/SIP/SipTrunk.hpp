@@ -313,6 +313,12 @@ public:
 	// image is a way to expire every live trunk call from anywhere that can
 	// reach the object, which is not a control a PBX should ship with however
 	// small it is.
+	//
+	// The gate is load-bearing HERE specifically because this one is defined
+	// out of line, in SipTrunk.cpp: a .cpp definition always emits its symbol,
+	// so it ships unless something takes it out. An accessor defined inline in
+	// a header is never emitted at all while nothing calls it, and needs no
+	// gate. See the fuller note on RequestsHandler.hpp's own test-only block.
 	void expireDeadlinesForTest();
 #endif
 	const Dialog* findByCallID(std::string_view callID) const;
