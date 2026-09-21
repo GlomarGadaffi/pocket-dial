@@ -12,6 +12,12 @@
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
 #include "ArpLookup.hpp"
+// Issue #328: DmaFramePool's counters are reported by /api/status. Included
+// unconditionally, not in the ESP-only block below -- the pool has a real host
+// implementation and is built into the host test target, so these numbers are
+// live on both platforms and can be asserted by a host test rather than only
+// eyeballed on hardware.
+#include "DmaFramePool.hpp"
 #include "index_html.h"
 #include "IPHelper.hpp"
 #include "UrlEncode.hpp"
@@ -1628,6 +1634,39 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	        "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
 	        "\"stackHwm_conf_mix_tick\":null,\"stackHwm_http_conn\":null";
 #endif
+
+	// Issue #328: L2 transmit-path health, in one object, on the UNGATED route.
+	//
+	// The proof run for #328 could establish that hold music was streaming at
+	// exactly 50 pkt/s and that DMA heap was collapsing underneath it, but not
+	// WHICH path carried the audio -- HoldMusic::runLoop() tries the L2 bypass
+	// and falls back to sendto() silently, logging only if the sendto() itself
+	// errors. "The pool is working" and "it has been falling back all along"
+	// were externally indistinguishable. poolAllocations answers it directly:
+	// during a hold it should climb at the tick rate, and if it does not, the
+	// audio is going out the socket path the pool exists to avoid.
+	//
+	// Deliberately here rather than on the gated /api/moh: the consumer is a
+	// diagnostic harness, and a harness that needs an admin session to read a
+	// counter does not get run. These are operational counters in the same
+	// category as the heap and stack figures already on this route -- no
+	// configuration, no identities, nothing an unauthenticated caller learns
+	// that freeHeapInternal does not already tell them.
+	//
+	// The pool numbers are live on BOTH platforms (it has a real host
+	// implementation and is in the host test target). The MoH error counters
+	// are -1 off-device, emitted as null per the stackHwm_* convention.
+	json << ",\"l2Tx\":{\"poolAllocations\":" << l2rtp::DmaFramePool::getAllocations()
+	     << ",\"poolExhaustions\":" << l2rtp::DmaFramePool::getExhaustions()
+	     << ",\"poolAvailable\":"   << l2rtp::DmaFramePool::available()
+	     << ",\"poolSize\":"        << l2rtp::DmaFramePool::kPoolSize;
+	const long mohL2Err   = handler ? handler->holdMusicL2TxErrors() : -1;
+	const long mohSockErr = handler ? handler->holdMusicTxErrors()   : -1;
+	json << ",\"mohL2Errors\":";
+	if (mohL2Err < 0) json << "null"; else json << mohL2Err;
+	json << ",\"mohSockErrors\":";
+	if (mohSockErr < 0) json << "null"; else json << mohSockErr;
+	json << "}";
 
 	json << "}";
 

@@ -841,6 +841,10 @@ public:
 	bool     holdMusicLoaded()  const { return _holdMusic.isLoaded(); }
 	unsigned holdMusicSeconds() const { return _holdMusic.clipSeconds(); }
 	unsigned holdMusicListeners() const { return _holdMusic.listenerCount(); }
+	// Issue #328: L2-bypass vs socket-fallback health for the hold-music
+	// stream. -1 on builds with no pacing task. See HoldMusic::l2TxErrors().
+	long holdMusicL2TxErrors() const { return _holdMusic.l2TxErrors(); }
+	long holdMusicTxErrors()   const { return _holdMusic.txErrors(); }
 
 	// ── MoH preview: ring an extension and play the hold clip to it ────────────
 	// "Does my hold music sound right?" is otherwise answered by parking a real
