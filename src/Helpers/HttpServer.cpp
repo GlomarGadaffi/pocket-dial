@@ -272,15 +272,62 @@ void HttpServer::acceptLoop()
 		// while SIP traffic churns the heap). An uncaught throw here runs on the accept-loop
 		// pthread and calls std::terminate()/abort(), rebooting the whole device. Catch it and
 		// drop just this one connection so the server keeps serving instead of crashing.
+		// Issue #368: bound how many handler threads can exist at once. Each one
+		// costs a task stack + TCB + socket buffers out of INTERNAL DRAM, and that
+		// is the same pool the W5500 driver takes its DMA bounce buffer from -- so
+		// an unbounded count does not just refuse dashboard requests, it stops the
+		// device transmitting Ethernet frames. Measured on .244: 8 concurrent
+		// requests took minFreeHeapInternal to 7412 bytes, 12 produced
+		// "spicommon_dma_setup_priv_buffer: Failed to allocate priv TX buffer" and
+		// dropped frames, 16 took it to 624 bytes. /api/status is deliberately
+		// unauthenticated (#207) so the burst needs no credentials.
+		//
+		// Refusing early and cheaply is strictly better than letting the spawn fail
+		// deeper in: the caller gets a 503 it can retry instead of a dropped socket,
+		// and the memory is never committed in the first place.
+		if (_activeConnections.load(std::memory_order_acquire) >= kMaxConcurrentConnections)
+		{
+			// This refusal is written from the ACCEPT THREAD, not a handler, so it
+			// must not be allowed to block: a client that completes the handshake
+			// and then never reads would otherwise wedge the accept loop on send()
+			// and take the whole server down -- a far worse denial of service than
+			// the exhaustion this cap exists to prevent. handleClient()'s 5 s
+			// SO_RCVTIMEO (#23) is set on the handler path we are deliberately
+			// skipping here, so this socket needs its own bound.
+#if defined _WIN32 || defined _WIN64
+			DWORD sndTv = 1000;
+			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO,
+				reinterpret_cast<const char*>(&sndTv), sizeof(sndTv));
+#else
+			timeval sndTv{};
+			sndTv.tv_sec  = 1;
+			sndTv.tv_usec = 0;
+			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, &sndTv, sizeof(sndTv));
+#endif
+			sendResponse(clientSock, 503, "Service Unavailable", "application/json",
+				"{\"error\":\"busy\",\"message\":\"too many concurrent connections\"}");
+			closeSocket(clientSock);
+			continue;
+		}
+
+		// Claimed BEFORE the thread exists so a burst arriving faster than the
+		// threads can start cannot overshoot the cap; the thread body releases it
+		// on every exit path, and the catch below releases it if no thread was
+		// ever created.
+		_activeConnections.fetch_add(1, std::memory_order_acq_rel);
+
 		try
 		{
 			std::thread([this, clientSock]() {
 				handleClient(clientSock);
 				recordConnStackHwm();
+				_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			}).detach();
 		}
 		catch (const std::exception& e)
 		{
+			// No thread was created, so nothing will ever decrement for this one.
+			_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			std::cerr << "[HttpServer] connection thread spawn failed: " << e.what()
 				<< " — dropping connection\n";
 #if defined _WIN32 || defined _WIN64
