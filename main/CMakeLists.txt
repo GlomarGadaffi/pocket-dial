@@ -197,7 +197,12 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/ConferenceRoom.cpp"
                     INCLUDE_DIRS "../src/Helpers" "../src/SIP" "drivers" "ui" "wifi"
                     REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns app_update esp_driver_ledc console esp_timer esp_websocket_client esp_http_client cjson mbedtls esp-tls ${EXTRA_REQUIRES}
-                    PRIV_REQUIRES esp_wifi)
+                    # Issue #366: HttpServer.cpp calls esp_pthread_set_cfg() to size the
+                    # per-connection thread stack. PRIV_ because it is an implementation
+                    # detail of one .cpp, not part of anything main exposes -- but it does
+                    # have to be declared, or esp_pthread.h is simply not on the include
+                    # path and the ESP build fails where the host build cannot.
+                    PRIV_REQUIRES esp_wifi pthread)
 
 # Issue #49: the display transport reserves Core 1 for the LVGL graphics task and
 # runs the SIP engine on Core 0, so the UDP receiver (which carries SIP signaling)

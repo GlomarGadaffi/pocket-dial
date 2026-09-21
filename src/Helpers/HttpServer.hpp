@@ -27,6 +27,25 @@ class RequestsHandler;
 class HttpServer
 {
 public:
+	// Stack for the per-connection handler thread. Deliberately NOT the
+	// CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT of 8192: that default is what
+	// every std::thread in the firmware gets, and issue #366 measured the
+	// board's largestFreeBlockInternal oscillating between 7924 and 9204
+	// while total internal free sat flat at ~27.7 KB. Nothing was leaking --
+	// a connection thread simply needs ONE contiguous block this big, and at
+	// 8192 it sat right on top of the largest hole available, so requests
+	// failed with "pthread: Failed to create task!" whenever the reading dipped
+	// under. Halving it puts the requirement below the smallest largest-block
+	// figure ever observed on .244, with room to spare.
+	//
+	// 4096 is supported by what actually runs on this thread: HttpServer has no
+	// TLS at all (zero mbedtls/esp_tls references), declares no large stack
+	// buffers, builds responses through heap-backed std::string/ostringstream,
+	// and streams the multi-MB OTA/MoH uploads in chunks rather than buffering.
+	// stackHwm_http_conn on /api/status reports the measured high-water mark so
+	// this number stays evidence-backed rather than an estimate.
+	static constexpr unsigned kHttpConnStackBytes = 4096;
+
 	HttpServer(const std::string& ip, int port, RequestsHandler* handler = nullptr);
 	~HttpServer();
 
@@ -73,6 +92,11 @@ private:
 
 	void acceptLoop();
 	void handleClient(int clientSock);
+	// Issue #366: called on the connection thread once handleClient() has
+	// returned, from the thread body rather than inside handleClient itself --
+	// that function has many early returns and this way none of them can be
+	// missed. No-op on the host build (no FreeRTOS).
+	void recordConnStackHwm();
 
 	// HTTP request parsing
 	struct HttpRequest {
@@ -329,6 +353,12 @@ private:
 	std::atomic<RequestsHandler*> _handler;
 	std::atomic<bool> _running;
 	std::thread _acceptThread;
+
+	// Issue #366: smallest free-stack figure any connection thread has reported
+	// on its way out, in bytes; -1 until one has finished. Tracked as a minimum
+	// rather than a last-value because the interesting case is the deepest
+	// request the board has ever served, not the most recent one.
+	std::atomic<long> _httpConnStackHwmBytes{-1};
 
 	// Track server uptime
 	uint64_t _startTime;
