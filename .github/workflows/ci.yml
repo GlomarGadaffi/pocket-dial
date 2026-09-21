@@ -19,6 +19,23 @@ on:
     branches: [ '**' ]
   pull_request:
     branches: [ '**' ]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Firmware build profile'
+        required: false
+        default: 'default'
+        type: choice
+        options:
+          - default
+          - heap_trace
+          - heap_debug
+          - constrained
+      allow_destructive:
+        description: 'Allow destructive actions (flash, reboot, lockout)'
+        required: false
+        default: false
+        type: boolean
     # Deliberately the GitHub default types ([opened, synchronize,
     # reopened]), NOT including `edited` -- unlike commit-hygiene-guard
     # (moved to its own workflow, commit-hygiene.yml, specifically so it
@@ -351,6 +368,10 @@ jobs:
           # returns non-zero on any test failure, which FAILS this step (the gate).
           ctest --test-dir build/tests --output-on-failure
 
+      - name: Verify SIP Parser Call Graph (T-7 recursion/frame guard)
+        run: |
+          python3 tests/tools/check_parser_callgraph.py
+
       - name: Verify Partition Table (dual-OTA layout guard)
         run: |
           # Lightweight guard: assert partitions.csv keeps the dual-OTA layout
@@ -525,6 +546,18 @@ jobs:
           
           echo "Successful compilation for ${{ matrix.target-chip }} on ESP-IDF ${{ matrix.idf-version }} (Transport: ${{ matrix.sip-transport }})"
 
+      - name: Upload ESP32-S3 Ethernet Firmware Bundle
+        if: matrix.target-chip == 'esp32s3' && matrix.sip-transport == 'eth'
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-esp32s3-eth
+          path: |
+            build/app.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            partitions.csv
+          retention-days: 7
+
   # Job 2b: Heap-poisoning build.
   # The shipped default is HEAP_POISONING_LIGHT, which only checks an
   # allocation's canaries when it is freed. COMPREHENSIVE also fills on alloc and
@@ -581,6 +614,17 @@ jobs:
           idf.py set-target esp32s3
           idf.py -D SIP_TRANSPORT=eth                  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_trace"                  build
           echo "Heap-trace profile builds (esp32s3 / eth); HeapLeakProbe.cpp actually compiled."
+
+      - name: Upload Heap Trace Firmware Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-heap-trace
+          path: |
+            build/app.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            partitions.csv
+          retention-days: 7
 
   # Job 2c: Waveshare ESP32-S3-ETH board build.
   # PD_ETH_BOARD=waveshare (main/CMakeLists.txt) is a second pin map for the
@@ -651,3 +695,38 @@ jobs:
           else
             echo "Deployment audit clean! No automated GCP deployment pathways detected."
           fi
+
+  # Job 4: Hardware-in-the-loop verification on glolab bench board .244
+  hil-244:
+    name: Hardware-in-the-loop (.244, glolab)
+    needs: [build-esp-idf]
+    runs-on: [self-hosted, glolab]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    concurrency: glolab-board-244
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Firmware Bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-esp32s3-eth
+          path: build/
+
+      - name: Execute Board Smoke Suite
+        env:
+          PD_BOARD_ADMIN_PIN: ${{ secrets.PD_BOARD_ADMIN_PIN }}
+        run: |
+          ALLOW_FLAG=""
+          if [ "${{ github.event.inputs.allow_destructive }}" = "true" ]; then
+            ALLOW_FLAG="--allow-destructive"
+          fi
+          python3 tests/run.py board-smoke --target board=192.168.12.244 --json $ALLOW_FLAG
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hil-244-results-${{ github.sha }}
+          path: tests/.results/
+          retention-days: 14
