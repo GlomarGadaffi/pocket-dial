@@ -28,7 +28,6 @@ BOARD_REGISTRY = {
         "ip": "192.168.12.244",
         "name": "LilyGO T-ETH-ELITE S3",
         "serial_by_id": "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_E0:72:A1:CC:1C:04-if00",
-        "serial_win_fallback": "COM4",
         "lock_file": "/var/lock/pd244.lock",
         "hold_file": "/var/lock/pd244.hold",
         "transport": "eth",
@@ -86,7 +85,6 @@ class Harness:
             "ip": self.target_ip,
             "name": f"board-{self.target_ip}",
             "serial_by_id": None,
-            "serial_win_fallback": "COM4",
             "lock_file": f"/var/lock/pd_{self.target_ip}.lock",
             "hold_file": f"/var/lock/pd_{self.target_ip}.hold",
             "transport": "eth",
@@ -171,10 +169,11 @@ class Harness:
             f.write(f"harness {self.sha} {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
             f.flush()
             return f
-        except (IOError, BlockingIOError):
+        except BlockingIOError:
             raise HarnessError(f"Board lock {lock_file} is held by another process. Exiting.")
-        except Exception:
-            return None
+        except Exception as e:
+            # A lock we cannot open must not become a silent unlocked run.
+            raise HarnessError(f"Cannot take board lock {lock_file}: {e}")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Suite Runners
@@ -274,6 +273,12 @@ class Harness:
                 env["SERVER_PID"] = str(server_proc.pid)
             if self.allow_destructive:
                 env["ALLOW_DESTRUCTIVE"] = "1"
+            # Factory reset (TC-FR-01..03) wipes credentials, the DID table and the CDR
+            # ring. It only ever runs against a disposable host process (SERVER_PID),
+            # never against a board, whatever flags were passed.
+            env.pop("ALLOW_FACTORY_RESET", None)
+            if self.target_type == "board":
+                env.pop("SERVER_PID", None)
 
             script_cmd = ["bash", api_script, target_arg]
             if self.allow_destructive:
@@ -325,7 +330,9 @@ class Harness:
         if self.only:
             cmd.extend(["--only", ",".join(self.only)])
         if self.target_type == "board":
-            cmd.extend(["--remote", self.target_ip])
+            # interop.py can only spawn a local SipServer today (spec §4, P1).
+            self.verdicts["interop"] = {"verdict": "SKIP", "duration_s": 0.0, "details": "interop.py has no remote-target mode yet (P1)"}
+            return True
         p = subprocess.run(cmd, cwd=self.root_dir, capture_output=True, text=True)
         dur = time.time() - t0
         passed = (p.returncode == 0)
@@ -392,14 +399,16 @@ class Harness:
             return False
 
         # Verify git describe match if known
+        verdict = "PASS"
         if self.git_describe and board_ver and board_ver != "unknown":
             if self.git_describe not in board_ver and board_ver not in self.git_describe:
-                suite_log.append(f"Warning: git describe '{self.git_describe}' differs from board version '{board_ver}'")
+                verdict = "FAIL"
+                suite_log.append(f"git describe '{self.git_describe}' differs from board version '{board_ver}'")
 
         dur = time.time() - t0
-        self.verdicts["board-provenance"] = {"verdict": "PASS", "duration_s": dur, "details": f"version={board_ver} reset={reset_reason}"}
+        self.verdicts["board-provenance"] = {"verdict": verdict, "duration_s": dur, "details": f"version={board_ver} reset={reset_reason} expected={self.git_describe}"}
         self.log_suite("board-provenance", "\n".join(suite_log))
-        return True
+        return verdict == "PASS"
 
     def run_board_flash(self):
         if self.target_type != "board":
@@ -423,11 +432,13 @@ class Harness:
                 suite_log.append(f"Config export failed or unavailable: {e}")
 
             # Locate bundle / app.bin
-            app_bin = os.path.join(self.root_dir, "build", "app.bin")
+            app_bin = os.path.join(self.root_dir, "build", "SipServer.bin")
             if not os.path.exists(app_bin):
                 raise HarnessError(f"Firmware binary not found at {app_bin}")
 
-            port = self.board_info.get("serial_by_id") if platform.system() != "Windows" else self.board_info.get("serial_win_fallback", "COM4")
+            port = self.args.port or (self.board_info.get("serial_by_id") if platform.system() != "Windows" else None)
+            if not port:
+                raise HarnessError("No serial port known for this board; pass --port explicitly (never guessed on Windows)")
             # Mandatory --after no_reset (Issue #338)
             esptool_cmd = [
                 "esptool.py", "--chip", "esp32s3", "--port", port, "--no-stub", "--after", "no_reset",
@@ -457,6 +468,15 @@ class Harness:
         t0 = time.time()
         suite_log = []
         overall_pass = True
+
+        # Step 0: provenance, recorded not gating. hil-244 does not flash yet (#338), so
+        # the board is normally running an older build than the checkout's SHA.
+        try:
+            self.run_board_provenance()
+            suite_log.append(f"Step 0 (provenance) {self.verdicts['board-provenance']['verdict']}: {self.verdicts['board-provenance']['details']}")
+        except HarnessError as e:
+            overall_pass = False
+            suite_log.append(f"Step 0 (provenance) FAIL: {e}")
 
         # Step 1: Liveness / sip_probe
         probe_script = os.path.join(self.root_dir, ".smoke", "sip_probe.py")
@@ -489,8 +509,8 @@ class Harness:
         # Step 4: Final /api/status snapshot & heap fragmentation advisory
         try:
             status = self.fetch_api_status(self.target_ip)
-            largest = status.get("largestFreeBlock", 0)
-            suite_log.append(f"Final status snapshot: largestFreeBlock={largest}")
+            largest = status.get("largestFreeBlockInternal", 0)
+            suite_log.append(f"Final status snapshot: largestFreeBlockInternal={largest} freeHeapInternal={status.get('freeHeapInternal', 0)}")
         except Exception as e:
             suite_log.append(f"Final status check error: {e}")
 
@@ -510,16 +530,16 @@ class Harness:
         samples = []
 
         with open(csv_path, "w", encoding="utf-8") as f:
-            f.write("timestamp,free,largest,minFree,clients\n")
+            f.write("timestamp,freeHeapInternal,largestFreeBlockInternal,minFreeHeapInternal,freeHeapDma\n")
             end_t = time.time() + (minutes * 60)
             while time.time() < end_t:
                 try:
                     s = self.fetch_api_status(self.target_ip)
                     now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    free = s.get("freeHeap", 0)
-                    largest = s.get("largestFreeBlock", 0)
-                    min_free = s.get("minFreeHeap", 0)
-                    clients = s.get("clients", 0)
+                    free = s.get("freeHeapInternal", 0)
+                    largest = s.get("largestFreeBlockInternal", 0)
+                    min_free = s.get("minFreeHeapInternal", 0)
+                    clients = s.get("freeHeapDma", 0)
                     f.write(f"{now_str},{free},{largest},{min_free},{clients}\n")
                     f.flush()
                     samples.append((free, largest))
@@ -574,7 +594,11 @@ class Harness:
         if self.suite not in suite_map:
             raise HarnessError(f"Unknown suite: '{self.suite}'. Available: {', '.join(suite_map.keys())}")
 
+        board_lock = None
         try:
+            if self.target_type == "board" and self.suite != "board-flash":
+                # board-flash takes the lock itself; every other board suite takes it here (§5.7)
+                board_lock = self._acquire_board_lock()
             passed = suite_map[self.suite]()
         except HarnessError as he:
             self._write_manifest(exit_code=2, error=str(he))
@@ -583,6 +607,10 @@ class Harness:
             else:
                 print(f"Harness Error: {he}", file=sys.stderr)
             return 2
+
+        finally:
+            if board_lock:
+                board_lock.close()
 
         exit_code = 0 if passed else 1
         self._write_manifest(exit_code=exit_code)
@@ -630,6 +658,7 @@ def main():
     parser.add_argument("--allow-destructive", action="store_true", help="Allow destructive tests (reboot, factory-reset, lockout, flashing)")
     parser.add_argument("--only", default=None, help="Comma-separated test scenarios to filter")
     parser.add_argument("--json", action="store_true", help="Print manifest.json to stdout")
+    parser.add_argument("--port", default=None, help="Serial port for board-flash (required on Windows; by-id path used on Linux)")
 
     args = parser.parse_args()
     try:

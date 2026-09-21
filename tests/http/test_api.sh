@@ -69,9 +69,14 @@ for arg in "$@"; do
     fi
 done
 
-# If SERVER_PID is set, we are running against a disposable host process
+# If SERVER_PID is set, we are running against a disposable host process: every
+# destructive case may run, INCLUDING the factory reset. Without it, the factory
+# reset (TC-FR-01..03) never runs, whatever --allow-destructive says: it wipes
+# credentials, the OAuth secret, the DID table and the CDR ring on a real board.
+ALLOW_FACTORY_RESET=0
 if [ -n "${SERVER_PID:-}" ]; then
     ALLOW_DESTRUCTIVE=1
+    ALLOW_FACTORY_RESET=1
 fi
 
 # Accept either "host" or "host:port". Build BASE_URL accordingly and derive a
@@ -551,9 +556,9 @@ assert_status "TC-AUTH-10: POST /api/kill (session destroyed by logout -> 401)" 
 # killed the session rather than from the logout it is meant to prove) and BEFORE
 # TC-AUTH-11 (whose five wrong passwords trip the 429 lockout that would block the
 # re-login below).
-if [ "$ALLOW_DESTRUCTIVE" -ne 1 ]; then
-    echo -e "         ${YELLOW}skipping TC-FR-01..03 (factory reset): ALLOW_DESTRUCTIVE unset (0), so this"
-    echo -e "         may be real hardware. Pass --allow-destructive or export ALLOW_DESTRUCTIVE=1 to run them.${RESET}"
+if [ "$ALLOW_FACTORY_RESET" -ne 1 ]; then
+    echo -e "         ${YELLOW}skipping TC-FR-01..03 (factory reset): SERVER_PID unset, so this may be"
+    echo -e "         real hardware. The factory reset only ever runs against a host process.${RESET}"
 else
 # Re-login with the credential TC-AUTH-07 established (or ADMIN_PIN).
 RESET_LOGIN_PASS="realpassword123"
@@ -617,7 +622,7 @@ else
     echo -e "         Response Body: ${YELLOW}${BODY_CONTENT}${RESET}"
     ((FAILED_TESTS++))
 fi
-fi  # end ALLOW_DESTRUCTIVE guard around TC-FR-01..03
+fi  # end ALLOW_FACTORY_RESET guard around TC-FR-01..03
 
 # TC-AUTH-11: brute-force lockout — 5 consecutive wrong passwords trip a 429.
 # Gated behind ALLOW_DESTRUCTIVE so board runs don't lock out the admin account.

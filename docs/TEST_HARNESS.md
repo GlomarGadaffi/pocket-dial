@@ -276,3 +276,26 @@ runner still never checks out PR code.
    gives a baseline.
 5. A second board means a `--board <name>` registry (ip, by-id path, variant, phone
    extension); one-file change when it arrives.
+
+## 9. P0 status (what PR #360 actually delivers)
+
+Honest delta between this spec and the first implementation, so the doc is not wrong on
+day one. Update this table as items land.
+
+| Spec item | State in #360 |
+|---|---|
+| `tests/run.py` with `unit`, `api`, `callgraph`, `load`, `sanitize`, `board-*`, `anchor`, `all`; results dir + `manifest.json` | done |
+| `interop`, `sipp` on host | done; on board `interop` reports SKIP (no remote mode yet, §4) |
+| `test_api.sh` board safety | done: `PD_BOARD_ADMIN_PIN`, lockout behind `--allow-destructive`, factory reset only ever with `SERVER_PID` (host) |
+| Board lock + hold file (§5.7) | done for every board suite; Discussion CHECK-OUT/IN posts not yet |
+| `board-provenance` | `/api/status` version vs `git describe` + `resetReason` only; no boot banner, no binary grep |
+| `board-smoke` | provenance (recorded), `sip_probe`, `test_api.sh`, `office_smoke.py`, final heap snapshot; no serial capture, no Yealink/Timer B check |
+| `board-flash` | esptool `--after no_reset` + config export; no import, no power-cycle (#338), dispatch-only with a human present |
+| `board-soak` | fixed 1 min / 10 s sampler to CSV, no slope verdict |
+| `anchor` | credential presence check only |
+| CI | firmware bundles uploaded (eth, heap_trace); callgraph step in both host workflows, warn-only until #361 (it finds a real cycle on main); `hil-244` is `workflow_dispatch`-only and runs `board-smoke` without flashing |
+| Not started | remote-target interop/SIPp (P1), serial capture, `gtest_discover_tests`, sanitizer CI job, port-base plumbing, Discussion posts |
+
+Prerequisite before the first `hil-244` dispatch: the repo secret `PD_BOARD_ADMIN_PIN`
+(the `.244` dashboard password for user `admin`) must exist, or every run fails at
+TC-AUTH-04 and cascades.
