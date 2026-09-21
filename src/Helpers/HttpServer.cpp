@@ -4774,6 +4774,16 @@ namespace
 	constexpr size_t kMaxTrunkAuth = 63;    // ...authUser[64]
 	constexpr size_t kMaxTrunkPass = 63;    // SipTrunk::kMaxSecret - 1
 
+	// NO STRUCTURAL BACKSTOP HERE -- read this before adding a field.
+	//
+	// SipTrunk::Config cannot leak the password because it does not contain
+	// one; that guarantee is structural and covers getTrunkConfig(). It does
+	// NOT cover this function. This serializes TrunkConfigStore::Config, which
+	// DOES hold `pass` in the clear, so the only things keeping the secret out
+	// of the response are the discipline of not writing it below and
+	// TrunkConfigHttp_test.cpp's GetNeverEchoesThePasswordEvenAuthenticated.
+	// A new field added carelessly here is a #207 repeat with nothing to catch
+	// it but that one test. Report presence as a boolean; never the value.
 	std::string trunkConfigJson(const TrunkConfigStore::Config& cfg)
 	{
 		std::ostringstream json;

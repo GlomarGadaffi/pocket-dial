@@ -291,6 +291,26 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 	// is the transport address and becomes the PROXY's address the moment one
 	// is configured. Keeping the port suffix makes this byte-identical to the
 	// old sbcIpPort-derived URIs for the common dotted-quad, no-proxy case.
+	//
+	// KNOWN, DELIBERATELY DEFERRED: the ":port" is unconditional, so a trunk on
+	// the default port still emits "sip:+1555@carrier.example.com:5060" rather
+	// than the bare domain. By RFC 3261 §19.1.4 a URI omitting a component with
+	// a default value does NOT match one explicitly carrying that component at
+	// its default, so those are formally distinct URIs -- and some SBCs and
+	// proxies route on the Request-URI host and will treat them as different
+	// route keys. This config surface is what first makes FQDN registrars and
+	// outbound proxies reachable, so it is what makes the case reachable too.
+	//
+	// Not fixed here, as an explicit decision rather than an oversight: nothing
+	// can complete a call on this trunk yet (no REGISTER, no 401/407 handling),
+	// so the exposure is theoretical, and a live carrier will settle the exact
+	// semantics empirically when the digest path lands. Changing it is not the
+	// three-line conditional it looks like -- by the same §19.1.4 reasoning it
+	// alters the emitted bytes for the existing dotted-quad case, so the
+	// byte-pinned expectations in SipTrunk_test.cpp move with it.
+	//
+	// SipTrunkUriPort.PortSuffixIsCurrentlyUnconditional pins today's behaviour
+	// so this is revisited rather than silently inherited. See issue #365.
 	d->domain        = std::string(_cfg.host) + ":" + std::to_string(_cfg.port);
 	d->localIpPort   = activeIp + ":" + std::to_string(_env.serverPort());
 	d->destE164.assign(e164);

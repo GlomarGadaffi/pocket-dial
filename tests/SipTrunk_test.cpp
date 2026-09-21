@@ -853,6 +853,41 @@ TEST(TrunkProxy, PlaceCallStampsTheDomainFromConfigNotTheSocket)
 		<< "the resolved proxy address must not leak into any URI";
 }
 
+// ── The unconditional ":port" in emitted URIs (deferred, see #365) ───────────
+//
+// This pins CURRENT behaviour, not desired behaviour. The Request-URI carries
+// an explicit ":5060" even on the default port, and by RFC 3261 §19.1.4 that
+// is a formally different URI from the bare domain -- which some SBCs route
+// on differently. Deferred to the digest/REGISTER work by an explicit
+// decision, because nothing can complete a call on this trunk yet and a live
+// carrier will settle the semantics.
+//
+// The point of the test is that it goes RED when someone changes this, so the
+// change is a decision rather than a silent inheritance. If you are here
+// because it failed: that is the test working. Update it, and update the
+// deferral comment in SipTrunk::placeCall().
+TEST(SipTrunkUriPort, PortSuffixIsCurrentlyUnconditional)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	SipTrunk::Config c = workingConfig();
+	std::snprintf(c.host, sizeof(c.host), "%s", "carrier.example.com");
+	c.port = 5060;   // the DEFAULT port -- the case the RFC note is about
+	trunk.setConfig(c);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string inv = env.sentRaw(0);
+
+	EXPECT_NE(inv.find("INVITE sip:+15551234567@carrier.example.com:5060 SIP/2.0"),
+		std::string::npos)
+		<< "today the default port is emitted explicitly; #365 is where that changes";
+	EXPECT_EQ(inv.find("INVITE sip:+15551234567@carrier.example.com SIP/2.0"),
+		std::string::npos)
+		<< "the bare-domain form is NOT what is emitted yet -- if this fires, "
+		   "#365 has landed and the deferral comment needs updating too";
+}
+
 // ── Credentials ──────────────────────────────────────────────────────────────
 
 TEST(TrunkCredentials, StoredAndReportedButNeverInConfig)
