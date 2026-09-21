@@ -255,6 +255,29 @@ inline bool tokenIsExpiringSoon(int64_t nowUs, int64_t obtainedUs, int64_t lifet
 	return age >= (lifetimeUs - marginUs);
 }
 
+// Issues #349/#350: did the transport actually deliver a parsed HTTP response?
+//
+// This is the distinction both of those bugs turned on, and getting it wrong cost
+// a CORRUPT HEAP panic (#350) and a phantom inbound call (#349), so it lives in one
+// named place with the reason attached instead of as three bare `status > 0` tests.
+//
+// THE REASON THE BOUNDARY IS AT ZERO, and not something to "tidy up" later:
+// esp_http_client_fetch_headers() assigns client->response->status_code = -1 ITSELF,
+// before it reads a single byte (esp_http_client.c:1658, IDF 6.0). If the read then
+// fails, the status STAYS -1. So -1 does not mean "the server sent -1" -- it means no
+// status line was ever parsed. Zero is the same class of non-answer: it is what a
+// caller's own `int status = 0;` still holds when the call bailed before assigning
+// (and what httpGetBody/httpPostBody leave if they fail before their own -1 init runs).
+//
+// Both are UNKNOWN state, which is categorically different from an error the server
+// actually sent. A 404, a 424, a 500 -- those are verdicts, and the caller can act on
+// them. Treating "no response" as if it were one of those verdicts is precisely what
+// reused a transport-dead handle in #350 and declared a live call failed in #349.
+inline bool httpResponseParsed(int status)
+{
+	return status > 0;
+}
+
 }  // namespace telephony
 
 #endif // TELEPHONY_ANCHOR_LOGIC_HPP
