@@ -57,7 +57,28 @@ CYAN='\033[0;36m'
 NC='\033[0;1m' # No Color
 RESET='\033[0m'
 
-TARGET_INPUT="${1:-192.168.4.1}"
+TARGET_INPUT="192.168.4.1"
+ALLOW_DESTRUCTIVE="${ALLOW_DESTRUCTIVE:-0}"
+ADMIN_PIN="${PD_BOARD_ADMIN_PIN:-admin}"
+
+for arg in "$@"; do
+    if [ "$arg" = "--allow-destructive" ]; then
+        ALLOW_DESTRUCTIVE=1
+    elif [[ "$arg" != --* ]]; then
+        TARGET_INPUT="$arg"
+    fi
+done
+
+# If SERVER_PID is set, we are running against a disposable host process: every
+# destructive case may run, INCLUDING the factory reset. Without it, the factory
+# reset (TC-FR-01..03) never runs, whatever --allow-destructive says: it wipes
+# credentials, the OAuth secret, the DID table and the CDR ring on a real board.
+ALLOW_FACTORY_RESET=0
+if [ -n "${SERVER_PID:-}" ]; then
+    ALLOW_DESTRUCTIVE=1
+    ALLOW_FACTORY_RESET=1
+fi
+
 # Accept either "host" or "host:port". Build BASE_URL accordingly and derive a
 # bare host (TARGET_IP) for the Host/Origin headers the same-origin check reads.
 if [[ "$TARGET_INPUT" == *:* ]]; then
@@ -77,6 +98,7 @@ echo -e "${CYAN}          POCKET-DIAL HTTP REST API AUTOMATED VERIFICATION      
 echo -e "${CYAN}======================================================================${RESET}"
 echo -e "Target            : ${NC}${TARGET_INPUT}${RESET}"
 echo -e "Base Connection   : ${NC}${BASE_URL}/${RESET}"
+echo -e "Destructive Mode  : ${NC}${ALLOW_DESTRUCTIVE}${RESET}"
 echo -e "${CYAN}======================================================================${RESET}\n"
 
 # Statistics trackers
@@ -135,16 +157,22 @@ trap cleanup EXIT
 # on the $SESSION/$CSRF this suite establishes.
 print_suite "Admin Authentication & Initial Setup"
 
-# TC-AUTH-01: status is reachable pre-login and reports needsSetup:true.
+# TC-AUTH-01: status is reachable pre-login
 RESP_DATA=$(curl -s -w "\n%{http_code}" "${BASE_URL}/api/admin/status")
 HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
 BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
 assert_status "TC-AUTH-01: GET /api/admin/status (reachable pre-login)" "200" "$HTTP_CODE" "$BODY_CONTENT"
-if [[ "$BODY_CONTENT" == *'"needsSetup":true'* ]]; then
+
+IS_PROVISIONED=0
+if [[ "$BODY_CONTENT" == *'"needsSetup":false'* ]]; then
+    IS_PROVISIONED=1
+    echo -e "  [${GREEN}PASS${RESET}] TC-AUTH-01: device reports needsSetup:false (already provisioned)."
+    ((PASSED_TESTS++))
+elif [[ "$BODY_CONTENT" == *'"needsSetup":true'* ]]; then
     echo -e "  [${GREEN}PASS${RESET}] TC-AUTH-01: device reports needsSetup:true on the default credential."
     ((PASSED_TESTS++))
 else
-    echo -e "  [${RED}FAIL${RESET}] TC-AUTH-01: expected needsSetup:true, got: ${YELLOW}${BODY_CONTENT}${RESET}"
+    echo -e "  [${RED}FAIL${RESET}] TC-AUTH-01: unexpected needsSetup in: ${YELLOW}${BODY_CONTENT}${RESET}"
     ((FAILED_TESTS++))
 fi
 
@@ -161,26 +189,25 @@ assert_status "TC-AUTH-02: POST /api/kill (no session -> 401)" "401" "$HTTP_CODE
 RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
   -H "Host: ${HOST_HDR}" \
   -H "Origin: http://malicious-attacker-domain.com" \
-  -d "username=admin&password=admin" "${BASE_URL}/api/admin/login")
+  -d "username=admin&password=${ADMIN_PIN}" "${BASE_URL}/api/admin/login")
 HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
 BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
 assert_status "TC-AUTH-03: POST /api/admin/login (Cross-Origin rejected)" "403" "$HTTP_CODE" "$BODY_CONTENT"
 
-# TC-AUTH-04: same-origin login with the shipped default credential -> 200,
-# a pd_session cookie, and the per-session CSRF token in the response body.
-# -i (headers + body together on stdout) rather than -D to a temp file: nothing
-# to clean up, and it keeps working under a curl whose filesystem view differs
-# from the shell's (e.g. a Windows curl.exe invoked from WSL, which cannot write
-# to a /tmp path the shell just created).
+# TC-AUTH-04: same-origin login -> 200, a pd_session cookie, and CSRF token.
+LOGIN_PASS="admin"
+if [ "$IS_PROVISIONED" -eq 1 ]; then
+    LOGIN_PASS="${ADMIN_PIN}"
+fi
+
 LOGIN_RAW=$(curl -s -i -X POST \
   -H "Host: ${HOST_HDR}" \
   -H "Origin: ${ORIGIN_HDR}" \
-  -d "username=admin&password=admin" "${BASE_URL}/api/admin/login")
-# Split on the first blank line: headers before it, body after.
+  -d "username=admin&password=${LOGIN_PASS}" "${BASE_URL}/api/admin/login")
 LOGIN_HEADERS=$(printf '%s' "$LOGIN_RAW" | sed -n '1,/^\r*$/p')
 LOGIN_BODY=$(printf '%s' "$LOGIN_RAW" | sed '1,/^\r*$/d')
 LOGIN_CODE=$(printf '%s' "$LOGIN_HEADERS" | grep -i "^HTTP/" | tail -n1 | awk '{print $2}')
-assert_status "TC-AUTH-04: POST /api/admin/login (default credential -> 200)" "200" "${LOGIN_CODE:-0}" "$LOGIN_HEADERS"
+assert_status "TC-AUTH-04: POST /api/admin/login (valid credential -> 200)" "200" "${LOGIN_CODE:-0}" "$LOGIN_HEADERS"
 
 SESSION=$(printf '%s' "$LOGIN_HEADERS" \
     | grep -i "^set-cookie:" \
@@ -197,40 +224,42 @@ else
     ((FAILED_TESTS++))
 fi
 
-# TC-AUTH-05: logged in on the default credential, but setup is not complete --
-# every admin-gated action except set-credential itself must be refused (403).
-RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
-  -H "Host: ${HOST_HDR}" \
-  -H "Origin: ${ORIGIN_HDR}" \
-  -H "Cookie: pd_session=${SESSION}" \
-  -H "X-CSRF: ${CSRF}" \
-  -d "extension=123" "${BASE_URL}/api/kill")
-HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
-BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
-assert_status "TC-AUTH-05: POST /api/kill (logged in, setup not complete -> 403)" "403" "$HTTP_CODE" "$BODY_CONTENT"
+if [ "$IS_PROVISIONED" -eq 0 ]; then
+    # TC-AUTH-05: logged in on the default credential, but setup is not complete --
+    # every admin-gated action except set-credential itself must be refused (403).
+    RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
+      -H "Host: ${HOST_HDR}" \
+      -H "Origin: ${ORIGIN_HDR}" \
+      -H "Cookie: pd_session=${SESSION}" \
+      -H "X-CSRF: ${CSRF}" \
+      -d "extension=123" "${BASE_URL}/api/kill")
+    HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
+    BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
+    assert_status "TC-AUTH-05: POST /api/kill (logged in, setup not complete -> 403)" "403" "$HTTP_CODE" "$BODY_CONTENT"
 
-# TC-AUTH-06: cross-origin set-credential is rejected (403).
-RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
-  -H "Host: ${HOST_HDR}" \
-  -H "Origin: http://malicious-attacker-domain.com" \
-  -H "Cookie: pd_session=${SESSION}" \
-  -d "username=admin&password=realpassword123" "${BASE_URL}/api/admin/set-credential")
-HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
-BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
-assert_status "TC-AUTH-06: POST /api/admin/set-credential (Cross-Origin rejected)" "403" "$HTTP_CODE" "$BODY_CONTENT"
+    # TC-AUTH-06: cross-origin set-credential is rejected (403).
+    RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
+      -H "Host: ${HOST_HDR}" \
+      -H "Origin: http://malicious-attacker-domain.com" \
+      -H "Cookie: pd_session=${SESSION}" \
+      -d "username=admin&password=realpassword123" "${BASE_URL}/api/admin/set-credential")
+    HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
+    BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
+    assert_status "TC-AUTH-06: POST /api/admin/set-credential (Cross-Origin rejected)" "403" "$HTTP_CODE" "$BODY_CONTENT"
 
-# TC-AUTH-07: complete setup with a real credential -> 200. Reuses the SAME
-# session (setLoginCredential does not invalidate the session it was called
-# through), so $SESSION/$CSRF keep working for every suite below.
-RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
-  -H "Host: ${HOST_HDR}" \
-  -H "Origin: ${ORIGIN_HDR}" \
-  -H "Cookie: pd_session=${SESSION}" \
-  -H "X-CSRF: ${CSRF}" \
-  -d "username=admin&password=realpassword123" "${BASE_URL}/api/admin/set-credential")
-HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
-BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
-assert_status "TC-AUTH-07: POST /api/admin/set-credential (completes setup -> 200)" "200" "$HTTP_CODE" "$BODY_CONTENT"
+    # TC-AUTH-07: complete setup with a real credential -> 200.
+    RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
+      -H "Host: ${HOST_HDR}" \
+      -H "Origin: ${ORIGIN_HDR}" \
+      -H "Cookie: pd_session=${SESSION}" \
+      -H "X-CSRF: ${CSRF}" \
+      -d "username=admin&password=realpassword123" "${BASE_URL}/api/admin/set-credential")
+    HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
+    BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
+    assert_status "TC-AUTH-07: POST /api/admin/set-credential (completes setup -> 200)" "200" "$HTTP_CODE" "$BODY_CONTENT"
+else
+    echo -e "         ${YELLOW}skipping TC-AUTH-05..07: device already provisioned.${RESET}"
+fi
 
 # TC-AUTH-08: status now reports provisioned:true, needsSetup:false.
 RESP_DATA=$(curl -s -w "\n%{http_code}" "${BASE_URL}/api/admin/status")
@@ -413,6 +442,12 @@ BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
 assert_status "TC-OTA-02: POST /api/ota/upload (Cross-Origin rejected)" "403" "$HTTP_CODE" "$BODY_CONTENT"
 
 # TC-OTA-03: Same-origin, authenticated OTA upload of a 32 KB body.
+# On a real board this body reaches the OTA writer. Destructive-gated so a
+# smoke run never leaves a partly staged image for TC-OTA-06's reboot to pick up.
+if [ "$ALLOW_DESTRUCTIVE" -ne 1 ]; then
+    echo -e "         ${YELLOW}skipping TC-OTA-03 (32 KB OTA upload): ALLOW_DESTRUCTIVE unset (0), so this"
+    echo -e "         may be real hardware.${RESET}"
+else
 #   REGRESSION GUARD: the streaming interception bypasses the 16 KB buffered cap,
 #   so this must NOT be 413. On host the stub drains the body and returns 501;
 #   on device it would proceed to flash. We accept the device-or-host outcome
@@ -434,6 +469,8 @@ else
     # Host stub -> 501 (Not Implemented). This is the expected CI outcome.
     assert_status "TC-OTA-03: POST /api/ota/upload (32 KB streams past 16 KB cap; host stub 501)" "501" "$HTTP_CODE" "$BODY_CONTENT"
 fi
+
+fi  # end ALLOW_DESTRUCTIVE guard around TC-OTA-03
 
 # TC-OTA-04: Empty-body OTA upload (Content-Length: 0) -> REJECT 411.
 RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
@@ -527,15 +564,20 @@ assert_status "TC-AUTH-10: POST /api/kill (session destroyed by logout -> 401)" 
 # killed the session rather than from the logout it is meant to prove) and BEFORE
 # TC-AUTH-11 (whose five wrong passwords trip the 429 lockout that would block the
 # re-login below).
-if [ -z "${SERVER_PID:-}" ]; then
-    echo -e "         ${YELLOW}skipping TC-FR-01..03 (factory reset): SERVER_PID unset, so this"
-    echo -e "         may be real hardware. Export SERVER_PID to run them against a host build.${RESET}"
+if [ "$ALLOW_FACTORY_RESET" -ne 1 ]; then
+    echo -e "         ${YELLOW}skipping TC-FR-01..03 (factory reset): SERVER_PID unset, so this may be"
+    echo -e "         real hardware. The factory reset only ever runs against a host process.${RESET}"
 else
-# Re-login with the credential TC-AUTH-07 established.
+# Re-login with the credential TC-AUTH-07 established (or ADMIN_PIN).
+RESET_LOGIN_PASS="realpassword123"
+if [ "$IS_PROVISIONED" -eq 1 ]; then
+    RESET_LOGIN_PASS="${ADMIN_PIN}"
+fi
+
 FR_RAW=$(curl -s -i -X POST \
   -H "Host: ${HOST_HDR}" \
   -H "Origin: ${ORIGIN_HDR}" \
-  -d "username=admin&password=realpassword123" "${BASE_URL}/api/admin/login")
+  -d "username=admin&password=${RESET_LOGIN_PASS}" "${BASE_URL}/api/admin/login")
 FR_HEADERS=$(printf '%s' "$FR_RAW" | sed -n '1,/^\r*$/p')
 FR_BODY=$(printf '%s' "$FR_RAW" | sed '1,/^\r*$/d')
 FR_SESSION=$(printf '%s' "$FR_HEADERS" \
@@ -588,11 +630,14 @@ else
     echo -e "         Response Body: ${YELLOW}${BODY_CONTENT}${RESET}"
     ((FAILED_TESTS++))
 fi
-fi  # end SERVER_PID guard around TC-FR-01..03
+fi  # end ALLOW_FACTORY_RESET guard around TC-FR-01..03
 
 # TC-AUTH-11: brute-force lockout — 5 consecutive wrong passwords trip a 429.
-# Valid whether or not the factory-reset block above ran: "wrong" is wrong against
-# the credential TC-AUTH-07 set and against the default the reset restores.
+# Gated behind ALLOW_DESTRUCTIVE so board runs don't lock out the admin account.
+if [ "$ALLOW_DESTRUCTIVE" -ne 1 ]; then
+    echo -e "         ${YELLOW}skipping TC-AUTH-11 (brute-force lockout): ALLOW_DESTRUCTIVE unset (0), so this"
+    echo -e "         may be real hardware. Pass --allow-destructive or export ALLOW_DESTRUCTIVE=1 to run it.${RESET}"
+else
 LOCKED_OUT=1
 for attempt in 1 2 3 4 5; do
     WRONG_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
@@ -605,6 +650,7 @@ for attempt in 1 2 3 4 5; do
     fi
 done
 assert_true "TC-AUTH-11: 5x wrong password engages 429 lockout" "$LOCKED_OUT"
+fi
 
 
 # ── FINAL VERIFICATION SUMMARY REPORT ─────────────────────────────────────────

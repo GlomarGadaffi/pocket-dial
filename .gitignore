@@ -102,6 +102,8 @@ LINEAGE.md
 
 # Interop harness (tests/interop): server + per-UA SIP traces, regenerated each run
 tests/interop/.logs/
+tests/sipp/.logs/
+tests/.results/
 __pycache__/
 *.pyc
 
