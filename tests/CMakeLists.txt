@@ -110,6 +110,7 @@ add_executable(sip_parser_tests
     # /api/email/test, driven through a real HttpServer socket exactly like
     # AdminHttpGate_test.cpp's other routes. Ports 18160-18169.
     EmailHttp_test.cpp
+    TrunkConfigHttp_test.cpp
     SipDigest_test.cpp
     # Issue #164 groundwork: the CLIENT half of digest auth. SipDigest_test
     # covers the registrar direction (build a challenge, verify an inbound
@@ -596,6 +597,7 @@ add_executable(sip_parser_tests
     # Host-stubbed in-memory under !ESP_PLATFORM, same pattern as
     # AdminAuth.cpp/DeviceConfig.cpp.
     ../src/Helpers/EmailConfigStore.cpp
+    ../src/Helpers/TrunkConfigStore.cpp
 )
 
 target_link_libraries(sip_parser_tests PRIVATE gtest gtest_main)

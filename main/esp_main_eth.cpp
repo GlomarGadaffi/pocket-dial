@@ -481,6 +481,11 @@ static void http_server_task(void* pvParameters)
         if (!handlerAttached && srv != nullptr)
         {
             http.attachHandler(&srv->getHandler());
+            // Issue #164: push the persisted ITSP trunk settings into the
+            // engine now that it exists. Without this the trunk stays at
+            // Config{} (disabled) until someone re-saves the form, so a
+            // configured trunk would silently not survive a reboot.
+            srv->getHandler().applyStoredTrunkConfig();
             handlerAttached = true;
             ESP_LOGI(TAG, "Dashboard: live SIP registrar attached");
 

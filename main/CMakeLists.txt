@@ -137,6 +137,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/SmtpDialogue.cpp"
                             "../src/Helpers/SmtpClient.cpp"
                             "../src/Helpers/EmailConfigStore.cpp"
+                            "../src/Helpers/TrunkConfigStore.cpp"
                             "../src/Helpers/GoogleServiceAuth.cpp"
                             "../src/SIP/SipMessagePool.cpp"
                             "../src/SIP/PbxFeatureConfig.cpp"

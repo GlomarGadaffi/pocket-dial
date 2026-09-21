@@ -263,12 +263,20 @@ private:
 	void sendApiEmailConfig(int sock);
 	void sendApiEmailConfigSet(int sock, const std::string& body);
 	void sendApiEmailTest(int sock, const std::string& body);
+
+	// Issue #164: the ITSP trunk's configuration surface. The GET reports
+	// `hasPassword` and never the password itself -- see TrunkConfigStore.hpp.
+	void sendApiTrunkConfig(int sock);
+	void sendApiTrunkConfigSet(int sock, const std::string& body);
 	// GET /setup/email's standalone page (PD_HTML_8 -- NOT part of the "/"
 	// SPA's CGA_INDEX_HTML_PARTS assembly). Ungated like sendHtml(), for the
 	// same reason: the shell alone discloses nothing, and the dashboard's own
 	// convention is that only the DATA endpoints are session-gated (see
 	// docs/THREAT_MODEL.md §4 E-2).
 	void sendEmailSetupHtml(int sock, const HttpRequest& req);
+
+	// Issue #164: the standalone /setup/trunk admin page (PD_HTML_9).
+	void sendTrunkSetupHtml(int sock, const HttpRequest& req);
 
 	void sendApiMohStatus(int sock);
 	void sendApiMohPreview(int sock, const std::string& body);

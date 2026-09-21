@@ -8028,8 +8028,8 @@ void RequestsHandler::tick()
 		if (_sipTrunk.config().valid())
 		{
 			sockaddr_in unusedAddr{};
-			_trunkResolver.resolve(_sipTrunk.config().host, _sipTrunk.config().port,
-				unusedAddr, now);
+			_trunkResolver.resolve(_sipTrunk.config().transportHost(),
+				_sipTrunk.config().transportPort(), unusedAddr, now);
 		}
 
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
@@ -9488,7 +9488,74 @@ void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 SipTrunk::Config RequestsHandler::getTrunkConfig()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
+	// Safe to return by value: the digest password is deliberately NOT a member
+	// of Config (it lives in SipTrunk's own buffer), so this cannot leak it.
 	return _sipTrunk.config();
+}
+
+bool RequestsHandler::setTrunkCredentials(std::string_view password)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _sipTrunk.setCredentials(password);
+}
+
+void RequestsHandler::applyStoredTrunkConfig()
+{
+	// The ONE place the persisted form is translated into engine state. Boot
+	// and the HTTP PUT both come through here so the two cannot drift -- a PUT
+	// that persisted without applying would leave the running trunk pointed at
+	// the old carrier until the next reboot, which is the kind of bug that only
+	// shows up during a cutover.
+	const TrunkConfigStore::Config stored = TrunkConfigStore::load();
+
+	SipTrunk::Config cfg;
+	auto copyField = [](char* dst, size_t cap, const std::string& src)
+	{
+		const size_t n = src.size() < cap - 1 ? src.size() : cap - 1;
+		std::memcpy(dst, src.data(), n);
+		dst[n] = '\0';
+	};
+	copyField(cfg.host,      sizeof(cfg.host),      stored.host);
+	copyField(cfg.proxyHost, sizeof(cfg.proxyHost), stored.proxyHost);
+	copyField(cfg.fromUser,  sizeof(cfg.fromUser),  stored.fromUser);
+	copyField(cfg.callerId,  sizeof(cfg.callerId),  stored.callerId);
+	// Empty authUser means "use fromUser", matching SipRegistrationClient's
+	// "digest username (often == aorUser)". Resolving the default HERE rather
+	// than at the challenge site means what the operator sees in the UI and
+	// what would go on the wire are the same string.
+	copyField(cfg.authUser,  sizeof(cfg.authUser),
+		stored.authUser.empty() ? stored.fromUser : stored.authUser);
+	cfg.port      = stored.port;
+	cfg.proxyPort = stored.proxyPort;
+	cfg.enabled   = stored.enabled;
+
+	// ONE critical section for the config AND the credential. Two separate
+	// acquisitions would leave a window in which the SIP thread can route a
+	// call with the new carrier and the old password. That is harmless only
+	// while nothing transmits the password; the day 401/407 lands, a cutover
+	// save would sign INVITEs to carrier B with carrier A's credential. Fix
+	// the window now rather than leave a note for someone to miss.
+	//
+	// Note for future callers: this takes _mutex itself, so it must NOT be
+	// called with _mutex already held -- the mutex is non-recursive.
+	std::lock_guard<std::mutex> lock(_mutex);
+	_sipTrunk.setConfig(cfg);
+	// The operator has pointed the trunk somewhere else, so any cached address
+	// is not merely stale, it is wrong -- see TrunkResolver::clear().
+	_trunkResolver.clear();
+
+	// Checked, not discarded. The HTTP route caps the password well below
+	// kMaxSecret, but this path reads raw NVS, which an older or different
+	// build could have written. On rejection setCredentials() leaves the
+	// previous secret in place, so engine and store would silently diverge --
+	// which is invisible from the UI, because hasPassword is reported from the
+	// STORE, not from the engine.
+	if (!_sipTrunk.setCredentials(stored.pass))
+	{
+		_sipTrunk.clearCredentials();
+		queueLog("trunk: stored password rejected (too long for this build); "
+		         "credential cleared -- re-enter it on /setup/trunk", true);
+	}
 }
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
@@ -9513,8 +9580,8 @@ TrunkResolver::Status RequestsHandler::trunkResolveStatusForTest()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 	sockaddr_in out{};
-	return _trunkResolver.lookup(_sipTrunk.config().host, _sipTrunk.config().port,
-		out, std::chrono::steady_clock::now());
+	return _trunkResolver.lookup(_sipTrunk.config().transportHost(),
+		_sipTrunk.config().transportPort(), out, std::chrono::steady_clock::now());
 }
 #endif
 
@@ -9605,8 +9672,8 @@ bool RequestsHandler::routeTrunkCall(const std::shared_ptr<SipMessage>& data,
 	// TrunkResolver exists to keep out. tick() is what refreshes the cache, so
 	// steady state is a Hit and only the first call after boot can miss.
 	sockaddr_in sbc{};
-	const auto status = _trunkResolver.lookup(_sipTrunk.config().host,
-		_sipTrunk.config().port, sbc, std::chrono::steady_clock::now());
+	const auto status = _trunkResolver.lookup(_sipTrunk.config().transportHost(),
+		_sipTrunk.config().transportPort(), sbc, std::chrono::steady_clock::now());
 	if (status != TrunkResolver::Status::Hit)
 	{
 		refuse("SIP/2.0 503 Service Unavailable", "SBC address not resolved yet");
