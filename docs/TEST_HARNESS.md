@@ -288,13 +288,18 @@ day one. Update this table as items land.
 | `interop`, `sipp` on host | done; on board `interop` reports SKIP (no remote mode yet, §4) |
 | `test_api.sh` board safety | done: `PD_BOARD_ADMIN_PIN`, lockout behind `--allow-destructive`, factory reset only ever with `SERVER_PID` (host) |
 | Board lock + hold file (§5.7) | done for every board suite; Discussion CHECK-OUT/IN posts not yet |
-| `board-provenance` | `/api/status` version vs `git describe` + `resetReason` only; no boot banner, no binary grep |
+| `board-provenance` | `/api/status` version vs `git describe` + `resetReason` only; no boot banner, no binary grep. A version mismatch is **WARN**, not FAIL, until `board-flash` runs before `board-smoke` (#338), so expect a green `hil-244` with a WARN verdict in the manifest |
 | `board-smoke` | provenance (recorded), `sip_probe`, `test_api.sh`, `office_smoke.py`, final heap snapshot; no serial capture, no Yealink/Timer B check |
 | `board-flash` | esptool `--after no_reset` + config export; no import, no power-cycle (#338), dispatch-only with a human present |
 | `board-soak` | fixed 1 min / 10 s sampler to CSV, no slope verdict |
 | `anchor` | credential presence check only |
 | CI | firmware bundles uploaded (eth, heap_trace); callgraph step in both host workflows, warn-only until #361 (it finds a real cycle on main); `hil-244` is `workflow_dispatch`-only and runs `board-smoke` without flashing |
 | Not started | remote-target interop/SIPp (P1), serial capture, `gtest_discover_tests`, sanitizer CI job, port-base plumbing, Discussion posts |
+
+`board-smoke` still runs `office_smoke.py` unconditionally: DND and forward toggles, a
+`POST /api/group`, and the 999 page to every registered phone. Dispatch-only fixed the
+trigger, not the behaviour. Whoever dispatches `hil-244` or runs `board-smoke` by hand
+owes the CHECK-OUT broadcast; the harness does not post to the Discussion yet.
 
 Prerequisite before the first `hil-244` dispatch: the repo secret `PD_BOARD_ADMIN_PIN`
 (the `.244` dashboard password for user `admin`) must exist, or every run fails at

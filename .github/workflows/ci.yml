@@ -708,6 +708,8 @@ jobs:
   # clean dispatched runs and once #338 (remote power-cycle) is solved.
   hil-244:
     name: Hardware-in-the-loop (.244, glolab)
+    permissions:
+      contents: read
     needs: [build-esp-idf, build-heap-trace]
     runs-on: [self-hosted, glolab]
     if: github.event_name == 'workflow_dispatch'

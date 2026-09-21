@@ -442,6 +442,12 @@ BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
 assert_status "TC-OTA-02: POST /api/ota/upload (Cross-Origin rejected)" "403" "$HTTP_CODE" "$BODY_CONTENT"
 
 # TC-OTA-03: Same-origin, authenticated OTA upload of a 32 KB body.
+# On a real board this body reaches the OTA writer. Destructive-gated so a
+# smoke run never leaves a partly staged image for TC-OTA-06's reboot to pick up.
+if [ "$ALLOW_DESTRUCTIVE" -ne 1 ]; then
+    echo -e "         ${YELLOW}skipping TC-OTA-03 (32 KB OTA upload): ALLOW_DESTRUCTIVE unset (0), so this"
+    echo -e "         may be real hardware.${RESET}"
+else
 #   REGRESSION GUARD: the streaming interception bypasses the 16 KB buffered cap,
 #   so this must NOT be 413. On host the stub drains the body and returns 501;
 #   on device it would proceed to flash. We accept the device-or-host outcome
@@ -463,6 +469,8 @@ else
     # Host stub -> 501 (Not Implemented). This is the expected CI outcome.
     assert_status "TC-OTA-03: POST /api/ota/upload (32 KB streams past 16 KB cap; host stub 501)" "501" "$HTTP_CODE" "$BODY_CONTENT"
 fi
+
+fi  # end ALLOW_DESTRUCTIVE guard around TC-OTA-03
 
 # TC-OTA-04: Empty-body OTA upload (Content-Length: 0) -> REJECT 411.
 RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
