@@ -4128,7 +4128,7 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 			// several are in flight.
 			const bool bound = mca->handler->bindOutboundParticipant(mca->callId, ownLeg);
 			std::lock_guard<std::mutex> lock(mca->handler->_mutex);
-			if (!bound)
+			if (!bound && !ownLeg.empty())
 			{
 				// Issue #379: the handset hung up while makeCall() was still on
 				// the wire (a ~0.8 s TLS round trip), so the CANCEL path's
@@ -4138,7 +4138,9 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 				// local party and nothing that will ever map an event back to
 				// it. Drop it now. asyncDropCall() spawns its own worker, so it
 				// is safe from this task and under _mutex (endCall() calls it
-				// the same way).
+				// the same way). An empty ownLeg means makeCall() produced no
+				// leg id at all -- nothing on the anchor to drop, so fall through
+				// to the ordinary log exactly as before.
 				mca->handler->queueLog("[Telephony] Outbound call to " + mca->dest +
 					" was cancelled during makeCall — dropping orphaned leg " + ownLeg + " (#379)", true);
 				mca->handler->asyncDropCall(ownLeg);
@@ -4180,7 +4182,7 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 		{
 			const bool bound = bindOutboundParticipant(callId, ownLeg);   // locks _mutex itself
 			std::lock_guard<std::mutex> lock(_mutex);
-			if (!bound)
+			if (!bound && !ownLeg.empty())
 			{
 				// Issue #379: see the ESP branch above -- session already torn
 				// down by a handset CANCEL mid-makeCall; drop the orphaned leg.
