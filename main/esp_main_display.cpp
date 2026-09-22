@@ -477,6 +477,12 @@ static void http_server_task(void *pvParameters) {
     }
     g_httpServer = new HttpServer(g_localIp, 80, &srv->getHandler());
     g_httpServer->start();
+    // Issue #164: push the persisted ITSP trunk settings into the engine. This
+    // variant binds the handler at construction rather than via
+    // attachHandler(), so it needs its own call -- without it a configured
+    // trunk comes back DISABLED after every reboot and stays down silently
+    // until someone re-opens /setup/trunk and presses Save.
+    srv->getHandler().applyStoredTrunkConfig();
     ESP_LOGI("HttpTask", "CGA Web UI Running successfully!");
 
     // OTA rollback confirmation (see docs/OTA.md): after a few seconds of healthy

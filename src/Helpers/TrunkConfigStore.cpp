@@ -1,0 +1,132 @@
+#include "TrunkConfigStore.hpp"
+
+#include <mutex>
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	#include "nvs_flash.h"
+	#include "nvs.h"
+#endif
+
+namespace TrunkConfigStore
+{
+
+namespace
+{
+	constexpr const char* kNvsNamespace = "pbxcfg"; // shared PBX config namespace (see PbxPersist.hpp)
+
+	std::mutex g_mutex;
+	Config g_cache;
+	bool g_loaded = false;
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+
+	// nvs_get_str into a std::string, growing the buffer to whatever NVS
+	// reports as the stored length. Leaves `out` untouched if the key is
+	// absent, so Config{}'s default stands -- the same convention
+	// EmailConfigStore/AdminAuth/DeviceConfig use.
+	void readStr(nvs_handle_t h, const char* key, std::string& out)
+	{
+		size_t len = 0;
+		if (nvs_get_str(h, key, nullptr, &len) != ESP_OK || len == 0) return;
+		std::string buf(len, '\0');
+		if (nvs_get_str(h, key, buf.data(), &len) == ESP_OK)
+		{
+			// len includes the NUL terminator on return.
+			buf.resize(len > 0 ? len - 1 : 0);
+			out = std::move(buf);
+		}
+	}
+
+	Config loadFromNvs()
+	{
+		Config cfg; // defaults stand for anything absent/corrupt
+		nvs_handle_t h;
+		if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK)
+		{
+			return cfg;
+		}
+
+		readStr(h, "trunk_host", cfg.host);
+		uint16_t port = cfg.port;
+		if (nvs_get_u16(h, "trunk_port", &port) == ESP_OK) cfg.port = port;
+
+		readStr(h, "trunk_proxy", cfg.proxyHost);
+		uint16_t pxport = cfg.proxyPort;
+		if (nvs_get_u16(h, "trunk_pxport", &pxport) == ESP_OK) cfg.proxyPort = pxport;
+
+		readStr(h, "trunk_from", cfg.fromUser);
+		readStr(h, "trunk_cid", cfg.callerId);
+		readStr(h, "trunk_authid", cfg.authUser);
+		readStr(h, "trunk_pass", cfg.pass);
+
+		uint8_t en = cfg.enabled ? 1 : 0;
+		if (nvs_get_u8(h, "trunk_en", &en) == ESP_OK) cfg.enabled = (en != 0);
+
+		nvs_close(h);
+		return cfg;
+	}
+
+	bool saveToNvs(const Config& cfg)
+	{
+		nvs_handle_t h;
+		if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+		{
+			return false;
+		}
+		bool ok = true;
+		ok = ok && nvs_set_str(h, "trunk_host", cfg.host.c_str()) == ESP_OK;
+		ok = ok && nvs_set_u16(h, "trunk_port", cfg.port) == ESP_OK;
+		ok = ok && nvs_set_str(h, "trunk_proxy", cfg.proxyHost.c_str()) == ESP_OK;
+		ok = ok && nvs_set_u16(h, "trunk_pxport", cfg.proxyPort) == ESP_OK;
+		ok = ok && nvs_set_str(h, "trunk_from", cfg.fromUser.c_str()) == ESP_OK;
+		ok = ok && nvs_set_str(h, "trunk_cid", cfg.callerId.c_str()) == ESP_OK;
+		ok = ok && nvs_set_str(h, "trunk_authid", cfg.authUser.c_str()) == ESP_OK;
+		ok = ok && nvs_set_str(h, "trunk_pass", cfg.pass.c_str()) == ESP_OK;
+		ok = ok && nvs_set_u8(h, "trunk_en", cfg.enabled ? 1 : 0) == ESP_OK;
+		ok = ok && nvs_commit(h) == ESP_OK;
+		nvs_close(h);
+		return ok;
+	}
+
+#endif // ESP_PLATFORM
+} // namespace
+
+Config load()
+{
+	std::lock_guard<std::mutex> lk(g_mutex);
+	if (!g_loaded)
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		g_cache = loadFromNvs();
+#endif
+		// Host: g_cache starts at Config{}'s defaults and IS the store --
+		// nothing else to load, same convention as EmailConfigStore.
+		g_loaded = true;
+	}
+	return g_cache;
+}
+
+bool save(const Config& cfg)
+{
+	std::lock_guard<std::mutex> lk(g_mutex);
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	if (!saveToNvs(cfg))
+	{
+		return false;
+	}
+#endif
+	g_cache = cfg;
+	g_loaded = true;
+	return true;
+}
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+void resetForTest()
+{
+	std::lock_guard<std::mutex> lk(g_mutex);
+	g_cache = Config{};
+	g_loaded = false;
+}
+#endif
+
+} // namespace TrunkConfigStore

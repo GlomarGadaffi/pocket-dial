@@ -94,6 +94,19 @@ public:
 		char     host[64]  = {};
 		uint16_t port      = 5060;
 
+		// The outbound proxy, when the carrier puts one in front of the registrar.
+		// This is a TRANSPORT destination ONLY: when set, packets are addressed
+		// here, but `host` still supplies the Request-URI / To / From domain (see
+		// Dialog::domain). That split is the whole point of an outbound proxy --
+		// the dialog stays addressed to the carrier's SIP domain while the bytes
+		// go to the box the carrier wants them to go to. Empty means "no proxy,
+		// send to `host`".
+		//
+		// Sized to SipRegistrationClient::kMaxHost so the value passes straight
+		// through if/when digest REGISTER is wired.
+		char     proxyHost[64] = {};
+		uint16_t proxyPort     = 5060;
+
 		// The identity presented to the carrier. `fromUser` is typically the
 		// trunk's main DID or the auth username; it is what appears in the From
 		// URI and is what most carriers match against when deciding whether to
@@ -105,13 +118,47 @@ public:
 		// identity. Empty means "use fromUser".
 		char callerId[24]  = {};
 
+		// The digest authentication ID -- what carriers variously label "SIP ID",
+		// "Auth ID" or "Authentication Username", and which is frequently NOT the
+		// same string as fromUser. Empty means "use fromUser", matching
+		// SipRegistrationClient's "digest username (often == aorUser)".
+		//
+		// STORED ONLY. Nothing sends this on the wire yet: SipTrunk answers no
+		// 401/407 challenge today, and digest REGISTER is not wired. It is
+		// persisted and loaded at boot so the credential surface is complete;
+		// update this comment when the challenge path lands.
+		char authUser[64] = {};
+
 		bool enabled = false;
 
 		bool valid() const { return enabled && host[0] != '\0' && port != 0 && fromUser[0] != '\0'; }
+
+		// Where packets actually go: the proxy when one is configured, else the
+		// registrar/server itself. Callers that resolve or address the carrier
+		// MUST go through these two rather than reading host/port directly.
+		const char* transportHost() const { return proxyHost[0] ? proxyHost : host; }
+		uint16_t    transportPort() const { return proxyHost[0] ? proxyPort : port; }
 	};
 
 	void setConfig(const Config& cfg) { _cfg = cfg; }
 	const Config& config() const { return _cfg; }
+
+	// The digest password, held OUTSIDE Config on purpose. Config is handed
+	// around by value and returned by getTrunkConfig(); a secret living in it
+	// would be one forgetful caller away from a response body or a log line
+	// (the #207 bug class this project has been bitten by twice). Keeping it
+	// here makes "the getter cannot leak the password" structural rather than a
+	// discipline every future route has to remember. Mirrors
+	// SipRegistrationClient::configure(cfg, password), which splits it the same
+	// way for the same reason.
+	//
+	// STORED ONLY -- see Config::authUser. Nothing transmits this yet.
+	// A value of kMaxSecret characters or more is REJECTED outright rather
+	// than silently shortened into a password that cannot authenticate.
+	static constexpr size_t kMaxSecret = 64;   // == SipRegistrationClient::kMaxSecret
+	bool setCredentials(std::string_view password);
+	bool hasCredentials() const { return _secret[0] != '\0'; }
+	void clearCredentials();
 
 	// ── Dialog state ─────────────────────────────────────────────────────────
 	//
@@ -145,6 +192,25 @@ public:
 		// which would break the carrier's dialog matching and orphan the BYE.
 		std::string fromUser;
 
+		// The SIP domain stamped into the Request-URI, To and From -- "host:port"
+		// from Config, NOT the resolved address. These are two different things
+		// the moment an outbound proxy is configured: the dialog must stay
+		// addressed to the carrier's SIP domain while the packets go to the
+		// proxy. Snapshotted per dialog for the same reason as fromUser above.
+		//
+		// With no proxy and a dotted-quad `host` this is byte-identical to
+		// sbcIpPort, which is what it replaced at every URI build site.
+		std::string domain;
+
+		// The resolved transport address the INVITE was actually sent to (the
+		// proxy when one is set, else the registrar).
+		//
+		// CURRENTLY UNREAD by production code -- it used to feed the
+		// Request-URI, To and From, and `domain` took all of that over. It is
+		// kept because the one thing no other field records is where the bytes
+		// physically went, which is the first question a carrier-side failure
+		// raises and which `peer` only holds in binary form. Nothing logs it
+		// yet; say so rather than implying a consumer that does not exist.
 		std::string sbcIpPort;
 		std::string localIpPort;
 		std::string destE164;
@@ -336,6 +402,14 @@ private:
 
 	PbxEnv& _env;
 	Config  _cfg{};
+
+	// Fixed buffer, not std::string: this object is written from the HTTP task
+	// and read from the SIP thread, and a std::string reallocating under a
+	// concurrent read is a use-after-free -- the same reasoning the Config
+	// comment above gives for its char arrays. Also lets clearCredentials()
+	// actually overwrite the bytes, which std::string cannot promise.
+	char _secret[kMaxSecret] = {};
+
 	Listener* _listener = nullptr;
 	std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS> _dialogs{};
 };

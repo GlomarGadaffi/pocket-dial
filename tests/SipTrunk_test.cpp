@@ -69,6 +69,12 @@ namespace
 		d.fromTag      = "ftag01";
 		d.cseq         = 1;
 		d.sbcIpPort    = std::string(kSbcIp) + ":5060";
+		// The SIP domain the URIs are built from. Equal to sbcIpPort here
+		// because this fixture has no outbound proxy and a dotted-quad host --
+		// which is exactly why the byte-pinned expectations below are unchanged
+		// by the domain/transport split. TrunkProxy.* covers the case where the
+		// two genuinely differ.
+		d.domain       = std::string(kSbcIp) + ":5060";
 		d.localIpPort  = "192.168.1.10:5060";
 		d.destE164     = "+15551234567";
 		d.fromUser     = "15551230000";
@@ -218,13 +224,25 @@ TEST(SipTrunkAck, TheTwoAckFormsDifferInBranchAndTarget)
 // A carrier that answers without a Contact still has to be ACKed — falling back
 // to the SBC address is wrong-ish but reachable, whereas not acking at all loses
 // the call outright.
-TEST(SipTrunkAck, TwoXxAckFallsBackToTheSbcWhenNoContactWasOffered)
+// A 2xx with no Contact violates RFC 3261 §12.1.1, so this is a best-effort
+// path either way. The fallback targets the configured DOMAIN, not the
+// resolved transport address: a proxy forwards on the Request-URI, so naming
+// the carrier's domain is the likelier-to-route choice of the two. Transport
+// is unaffected -- the ACK is still enqueued to the dialog's `peer` socket.
+TEST(SipTrunkAck, TwoXxAckFallsBackToTheDomainWhenNoContactWasOffered)
 {
 	auto d = pinnedDialog();
 	d.toTag = "carrier-tag";   // remoteTarget deliberately left empty
 
 	const std::string ack = SipTrunk::buildAckFor2xx(d, "z9hG4bKack99");
 	EXPECT_EQ(firstLine(ack), "ACK sip:+15551234567@203.0.113.5:5060 SIP/2.0");
+
+	// Pin that it really is the domain and not the transport address, which
+	// the default fixture cannot distinguish (there the two are equal).
+	d.domain    = "sip.carrier.example:5060";
+	d.sbcIpPort = "198.51.100.77:5080";
+	const std::string viaProxy = SipTrunk::buildAckFor2xx(d, "z9hG4bKack99");
+	EXPECT_EQ(firstLine(viaProxy), "ACK sip:+15551234567@sip.carrier.example:5060 SIP/2.0");
 }
 
 // ── BYE ──────────────────────────────────────────────────────────────────────
@@ -728,4 +746,225 @@ TEST(SipTrunkDialog, SweepStillReclaimsADialogWhoseByeWentUnanswered)
 
 	EXPECT_EQ(trunk.activeDialogs(), 0u)
 		<< "a carrier that never answers our BYE must not pin the slot forever";
+}
+
+// ── Outbound proxy: the domain/transport split ───────────────────────────────
+//
+// The single subtlest thing this feature added. Before it, Dialog::sbcIpPort
+// held the RESOLVED address and fed the Request-URI, To and From. An outbound
+// proxy breaks that conflation: packets must go to the proxy while the dialog
+// stays addressed to the carrier's SIP domain. If these two ever collapse back
+// into one value the failure is silent and carrier-side -- a 403 or a 404 with
+// no diagnostic, which is exactly the kind of bug that costs a cutover window.
+
+TEST(TrunkProxy, TransportTargetsProxyWhileUrisKeepTheRegistrar)
+{
+	SipTrunk::Config c = workingConfig();
+	std::snprintf(c.proxyHost, sizeof(c.proxyHost), "%s", "proxy.carrier.example");
+	c.proxyPort = 5080;
+
+	EXPECT_STREQ(c.transportHost(), "proxy.carrier.example")
+		<< "packets must be addressed to the proxy once one is configured";
+	EXPECT_EQ(c.transportPort(), 5080);
+
+	// ...while host/port remain what the URIs are built from.
+	EXPECT_STREQ(c.host, kSbcIp);
+	EXPECT_EQ(c.port, kSbcPort);
+}
+
+TEST(TrunkProxy, NoProxyMeansTransportIsTheRegistrar)
+{
+	const SipTrunk::Config c = workingConfig();
+	EXPECT_STREQ(c.transportHost(), kSbcIp);
+	EXPECT_EQ(c.transportPort(), kSbcPort);
+}
+
+// An empty proxyHost must not be treated as "a proxy on port proxyPort". A
+// half-filled form (port typed, host left blank) would otherwise silently
+// retarget the trunk at the registrar's address on the wrong port.
+TEST(TrunkProxy, ProxyPortAloneDoesNotDivertTransport)
+{
+	SipTrunk::Config c = workingConfig();
+	c.proxyPort = 5080;           // host deliberately left empty
+	EXPECT_STREQ(c.transportHost(), kSbcIp);
+	EXPECT_EQ(c.transportPort(), kSbcPort)
+		<< "proxyPort is meaningless without a proxyHost and must be ignored";
+}
+
+// The URI builders must read domain, never the resolved transport address.
+// This is the test that goes red if someone "simplifies" domain back to
+// sbcIpPort.
+TEST(TrunkProxy, UriBuildersUseTheDomainNotTheResolvedAddress)
+{
+	SipTrunk::Dialog d = pinnedDialog();
+	d.domain    = "sip.carrier.example:5060";   // what the operator configured
+	d.sbcIpPort = "198.51.100.77:5080";         // where the packet actually went
+	d.toTag     = "carrier-tag";
+	d.remoteTarget = "sip:+15551234567@198.51.100.77:5080";
+
+	const std::string inv = SipTrunk::buildInvite(d, "v=0\r\n");
+	EXPECT_EQ(firstLine(inv), "INVITE sip:+15551234567@sip.carrier.example:5060 SIP/2.0");
+	EXPECT_TRUE(hasLine(inv, "To: <sip:+15551234567@sip.carrier.example:5060>"));
+	EXPECT_TRUE(hasLine(inv, "From: <sip:15551230000@sip.carrier.example:5060>;tag=ftag01"));
+	EXPECT_EQ(inv.find("198.51.100.77"), std::string::npos)
+		<< "the transport address must never appear in a URI";
+
+	// The failure ACK is built from the same inputs and must agree.
+	const std::string ackFail = SipTrunk::buildAckForFailure(d);
+	EXPECT_EQ(firstLine(ackFail), "ACK sip:+15551234567@sip.carrier.example:5060 SIP/2.0");
+	EXPECT_EQ(ackFail.find("198.51.100.77"), std::string::npos);
+
+	// The BYE routes to the remote target (which IS a transport-derived URI the
+	// carrier gave us, and must be honoured verbatim), but its To/From still
+	// carry the domain.
+	const std::string bye = SipTrunk::buildBye(d, "z9hG4bKbye01");
+	EXPECT_EQ(firstLine(bye), "BYE sip:+15551234567@198.51.100.77:5080 SIP/2.0")
+		<< "an in-dialog request goes to the Contact the carrier supplied";
+	EXPECT_TRUE(hasLine(bye, "To: <sip:+15551234567@sip.carrier.example:5060>;tag=carrier-tag"));
+	EXPECT_TRUE(hasLine(bye, "From: <sip:15551230000@sip.carrier.example:5060>;tag=ftag01"));
+}
+
+// placeCall() is what actually populates domain. A dialog left with an empty
+// domain would emit "sip:+1...@" -- malformed, and rejected by every carrier.
+TEST(TrunkProxy, PlaceCallStampsTheDomainFromConfigNotTheSocket)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	SipTrunk::Config c = workingConfig();
+	std::snprintf(c.host, sizeof(c.host), "%s", "sip.carrier.example");
+	std::snprintf(c.proxyHost, sizeof(c.proxyHost), "%s", "proxy.carrier.example");
+	c.proxyPort = 5080;
+	trunk.setConfig(c);
+
+	// The caller resolved the PROXY and hands us its address, as RequestsHandler
+	// now does via transportHost()/transportPort().
+	sockaddr_in proxy{};
+	proxy.sin_family = AF_INET;
+	proxy.sin_addr.s_addr = inet_addr("198.51.100.77");
+	proxy.sin_port = htons(5080);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", proxy, 40000));
+	ASSERT_EQ(env.sent.size(), 1u);
+
+	const std::string inv = env.sentRaw(0);
+	EXPECT_NE(inv.find("INVITE sip:+15551234567@sip.carrier.example:5060 SIP/2.0"), std::string::npos)
+		<< "the Request-URI must name the configured registrar, not the proxy";
+	EXPECT_EQ(inv.find("198.51.100.77"), std::string::npos)
+		<< "the resolved proxy address must not leak into any URI";
+}
+
+// ── The unconditional ":port" in emitted URIs (deferred, see #365) ───────────
+//
+// This pins CURRENT behaviour, not desired behaviour. The Request-URI carries
+// an explicit ":5060" even on the default port, and by RFC 3261 §19.1.4 that
+// is a formally different URI from the bare domain -- which some SBCs route
+// on differently. Deferred to the digest/REGISTER work by an explicit
+// decision, because nothing can complete a call on this trunk yet and a live
+// carrier will settle the semantics.
+//
+// The point of the test is that it goes RED when someone changes this, so the
+// change is a decision rather than a silent inheritance. If you are here
+// because it failed: that is the test working. Update it, and update the
+// deferral comment in SipTrunk::placeCall().
+TEST(SipTrunkUriPort, PortSuffixIsCurrentlyUnconditional)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	SipTrunk::Config c = workingConfig();
+	std::snprintf(c.host, sizeof(c.host), "%s", "carrier.example.com");
+	c.port = 5060;   // the DEFAULT port -- the case the RFC note is about
+	trunk.setConfig(c);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string inv = env.sentRaw(0);
+
+	EXPECT_NE(inv.find("INVITE sip:+15551234567@carrier.example.com:5060 SIP/2.0"),
+		std::string::npos)
+		<< "today the default port is emitted explicitly; #365 is where that changes";
+	EXPECT_EQ(inv.find("INVITE sip:+15551234567@carrier.example.com SIP/2.0"),
+		std::string::npos)
+		<< "the bare-domain form is NOT what is emitted yet -- if this fires, "
+		   "#365 has landed and the deferral comment needs updating too";
+}
+
+// ── Credentials ──────────────────────────────────────────────────────────────
+
+TEST(TrunkCredentials, StoredAndReportedButNeverInConfig)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	EXPECT_FALSE(trunk.hasCredentials());
+
+	EXPECT_TRUE(trunk.setCredentials("s3cret-pw"));
+	EXPECT_TRUE(trunk.hasCredentials());
+
+	// The whole point of keeping the secret out of Config: a caller that copies
+	// the config cannot copy the password with it.
+	const SipTrunk::Config copy = trunk.config();
+	const char* raw = reinterpret_cast<const char*>(&copy);
+	const std::string blob(raw, sizeof(copy));
+	EXPECT_EQ(blob.find("s3cret-pw"), std::string::npos)
+		<< "the password must not be reachable through a copied Config";
+}
+
+TEST(TrunkCredentials, OverLongPasswordIsRejectedNotTruncated)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	ASSERT_TRUE(trunk.setCredentials("short"));
+
+	const std::string tooLong(SipTrunk::kMaxSecret, 'x');   // one past what fits
+	EXPECT_FALSE(trunk.setCredentials(tooLong))
+		<< "silently storing a truncated password would authenticate nothing "
+		   "while the UI reported success";
+
+	// The longest value that DOES fit is accepted.
+	const std::string justFits(SipTrunk::kMaxSecret - 1, 'x');
+	EXPECT_TRUE(trunk.setCredentials(justFits));
+	EXPECT_TRUE(trunk.hasCredentials());
+}
+
+TEST(TrunkCredentials, EmptyPasswordClearsRatherThanFailing)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	ASSERT_TRUE(trunk.setCredentials("s3cret-pw"));
+	ASSERT_TRUE(trunk.hasCredentials());
+
+	EXPECT_TRUE(trunk.setCredentials("")) << "an empty credential is a valid state, not an error";
+	EXPECT_FALSE(trunk.hasCredentials());
+}
+
+TEST(TrunkCredentials, ClearCredentialsRemovesIt)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	ASSERT_TRUE(trunk.setCredentials("s3cret-pw"));
+	trunk.clearCredentials();
+	EXPECT_FALSE(trunk.hasCredentials());
+}
+
+// Guards the claim made in Config::authUser's comment and on the setup page:
+// credentials are stored but nothing transmits them yet. If a challenge path
+// lands without this test being updated, it goes red and forces the claim to
+// be corrected rather than left stale (#296's pattern).
+TEST(TrunkCredentials, NothingCredentialShapedReachesTheWireToday)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	SipTrunk::Config c = workingConfig();
+	std::snprintf(c.authUser, sizeof(c.authUser), "%s", "auth-id-9876");
+	trunk.setConfig(c);
+	ASSERT_TRUE(trunk.setCredentials("s3cret-pw"));
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	ASSERT_EQ(env.sent.size(), 1u);
+
+	const std::string inv = env.sentRaw(0);
+	EXPECT_EQ(inv.find("s3cret-pw"), std::string::npos) << "the password must never be on the wire";
+	EXPECT_EQ(inv.find("auth-id-9876"), std::string::npos)
+		<< "authUser is stored only -- no Authorization header is generated yet";
+	EXPECT_EQ(inv.find("Authorization"), std::string::npos);
+	EXPECT_EQ(inv.find("Proxy-Authorization"), std::string::npos);
 }

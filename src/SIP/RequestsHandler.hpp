@@ -57,6 +57,7 @@
 #include "RtpReceiver.hpp"
 #include "SipTrunk.hpp"
 #include "TrunkResolver.hpp"
+#include "TrunkConfigStore.hpp"
 #include "AnchorClient.hpp"
 #include "LoopbackAnchorClient.hpp"
 #include "TelephonyAnchorClient.hpp"
@@ -307,6 +308,18 @@ public:
 	// and is the common static-IP-trunk case.
 	void setTrunkConfig(const SipTrunk::Config& cfg);
 	SipTrunk::Config getTrunkConfig();
+
+	// The digest password, kept out of Config so getTrunkConfig() structurally
+	// cannot leak it. Returns false if the value is too long to store (see
+	// SipTrunk::kMaxSecret); an empty password is accepted and means "none".
+	bool setTrunkCredentials(std::string_view password);
+
+	// Load the persisted trunk settings and apply them to the engine. Called
+	// at boot (every esp_main variant) and again after every successful POST
+	// /api/trunk -- the single translation point between TrunkConfigStore's
+	// form and SipTrunk's state. Takes _mutex, which is non-recursive, so it
+	// must NOT be called with _mutex already held.
+	void applyStoredTrunkConfig();
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only. Gated because these three are DEFINED OUT OF LINE, in

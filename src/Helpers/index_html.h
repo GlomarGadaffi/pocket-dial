@@ -2302,6 +2302,167 @@ loadConfig();
 </body>
 </html>
 )html8";
+// Issue #164 (ITSP SIP trunk): the standalone /setup/trunk admin page. Same
+// reasoning as PD_HTML_8 above -- its OWN top-level document, served by
+// HttpServer::sendTrunkSetupHtml(), deliberately NOT concatenated into the "/"
+// SPA via CGA_INDEX_HTML_PARTS (this constant is intentionally absent from
+// that array). Growing an SPA part was not an option: PD_HTML_4 is within
+// ~750 bytes of MSVC's literal cap. Reuses the __PD_CSRF__ substitution
+// convention sendHtml() uses for "/".
+static const char PD_HTML_9[] =
+R"html9(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pocket-Dial SIP Trunk</title>
+<style>
+:root{--bg:#14100C;--panel:#221B15;--panel2:#2B231C;--ink:#EAE1C8;--ink-dim:#A99A7B;
+--brass:#B08D52;--brass-hi:#D4AF6A;--line:#87714A;--ok:#55A374;--bad:#D26F65;--warn:#E8C43D;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;padding:16px}
+.wrap{max-width:640px;margin:0 auto}
+h1{font-size:18px;color:var(--brass-hi);margin:0 0 4px}
+h2{font-size:13px;color:var(--brass-hi);margin:0 0 10px;text-transform:uppercase;letter-spacing:.06em}
+.sub{color:var(--ink-dim);margin:0 0 20px;font-size:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:16px}
+label{display:block;font-size:12px;color:var(--ink-dim);margin:10px 0 4px}
+label:first-child{margin-top:0}
+input[type=text],input[type=password],input[type=number]{
+  width:100%;background:var(--bg);border:1px solid var(--line);color:var(--ink);
+  border-radius:4px;padding:8px;font:inherit}
+.row{display:flex;gap:10px}
+.row>div{flex:1}
+.hint{font-size:11px;color:var(--ink-dim);margin-top:4px}
+.chk{display:flex;align-items:center;gap:8px;margin:10px 0}
+.chk input{width:auto}
+button{background:var(--brass);color:#14100C;border:none;border-radius:4px;padding:9px 16px;
+  font-weight:600;cursor:pointer;font-size:13px}
+button.sec{background:var(--panel2);color:var(--ink);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:default}
+.actions{display:flex;gap:10px;margin-top:16px}
+.msg{margin-top:12px;padding:10px;border-radius:4px;font-size:12px;display:none;white-space:pre-wrap}
+.msg.ok{display:block;background:rgba(85,163,116,.15);color:var(--ok);border:1px solid var(--ok)}
+.msg.bad{display:block;background:rgba(210,111,101,.07);color:var(--bad);border:1px solid var(--bad)}
+.badge{font-size:10px;padding:2px 6px;border-radius:3px;background:var(--panel2);color:var(--ink-dim)}
+.badge.set{color:var(--ok)}
+.note{font-size:11px;color:var(--warn);border-left:2px solid var(--warn);padding-left:8px;margin-top:12px}
+a{color:var(--brass-hi)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>&#9742; SIP Trunk</h1>
+  <p class="sub">Outbound PSTN through an ITSP. <a href="/">&larr; back to dashboard</a></p>
+
+  <div class="card">
+    <h2>Carrier</h2>
+    <div class="row">
+      <div><label>Registrar / Server</label><input type="text" id="f-host" placeholder="sip.carrier.com"></div>
+      <div style="flex:.4"><label>Port</label><input type="number" id="f-port" placeholder="5060"></div>
+    </div>
+    <div class="hint">The carrier's SIP server. Supplies the domain in the Request-URI, To and From.</div>
+    <div class="row" style="margin-top:12px">
+      <div><label>Outbound Proxy <span class="badge">optional</span></label><input type="text" id="f-proxyHost" placeholder="leave blank if not used"></div>
+      <div style="flex:.4"><label>Port</label><input type="number" id="f-proxyPort" placeholder="5060"></div>
+    </div>
+    <div class="hint">When set, packets are sent here instead, but the dialog stays addressed to the registrar above.</div>
+  </div>
+
+  <div class="card">
+    <h2>Identity</h2>
+    <label>From user / main DID</label>
+    <input type="text" id="f-fromUser" placeholder="15551230000">
+    <div class="hint">What appears in the From URI. Most carriers match outbound authorisation against this.</div>
+    <label>Caller ID <span class="badge">optional</span></label>
+    <input type="text" id="f-callerId" placeholder="defaults to the From user above">
+    <div class="hint">The DID presented as outbound CLI, when the carrier allows a range against one identity.</div>
+  </div>
+
+  <div class="card">
+    <h2>Authentication</h2>
+    <label>Authentication ID (SIP ID)</label>
+    <input type="text" id="f-authUser" placeholder="defaults to the From user above">
+    <div class="hint">Your carrier may call this the SIP ID, Auth ID or Authentication Username. It is frequently not the same as the From user.</div>
+    <label>Authentication Password <span class="badge" id="pass-badge">not set</span></label>
+    <input type="password" id="f-pass" placeholder="leave blank to keep the stored password" autocomplete="new-password">
+    <div class="chk"><input type="checkbox" id="f-clearPass"><label for="f-clearPass" style="margin:0">Clear the stored password</label></div>
+    <div class="note">Stored, but not yet sent on the wire. This build answers no 401/407 challenge and does not REGISTER, so credentials are saved for the challenge path that lands next &mdash; they do not authenticate a call today.</div>
+  </div>
+
+  <div class="card">
+    <h2>Status</h2>
+    <div class="chk"><input type="checkbox" id="f-enabled"><label for="f-enabled" style="margin:0">Trunk enabled</label></div>
+    <div class="hint">Needs a Registrar and a From user. While disabled, trunk-routed calls fall back to the anchor path.</div>
+    <div class="actions">
+      <button onclick="saveConfig()" id="save-btn">Save</button>
+      <button class="sec" onclick="loadConfig()">Reload</button>
+    </div>
+    <div class="msg" id="save-msg"></div>
+  </div>
+</div>
+
+<script>
+var PD_CSRF="__PD_CSRF__";
+function $(id){return document.getElementById(id);}
+function post(url,body){
+  return fetch(url,{method:"POST",credentials:"same-origin",
+    headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF":PD_CSRF},body:body})
+    .then(function(r){
+      if(r.status===401){throw new Error("session expired — log in at the dashboard, then reload this page");}
+      if(r.status===403){throw new Error("rejected (stale security token — reload this page)");}
+      return r.json().catch(function(){return {};}).then(function(d){return {status:r.status,body:d};});
+    });
+}
+function showMsg(id,ok,text){
+  var el=$(id);el.className="msg "+(ok?"ok":"bad");el.textContent=text;
+}
+function qs(k,v){return encodeURIComponent(k)+"="+encodeURIComponent(v==null?"":v);}
+
+function loadConfig(){
+  fetch("/api/trunk",{credentials:"same-origin"}).then(function(r){
+    if(r.status===401){showMsg("save-msg",false,"log in at the dashboard first, then reload this page");return null;}
+    return r.json();
+  }).then(function(d){
+    if(!d)return;
+    $("f-host").value=d.host||"";
+    $("f-port").value=d.port||"";
+    $("f-proxyHost").value=d.proxyHost||"";
+    $("f-proxyPort").value=d.proxyPort||"";
+    $("f-fromUser").value=d.fromUser||"";
+    $("f-callerId").value=d.callerId||"";
+    $("f-authUser").value=d.authUser||"";
+    $("f-enabled").checked=!!d.enabled;
+    $("f-pass").value="";
+    $("f-clearPass").checked=false;
+    $("pass-badge").textContent=d.hasPassword?"set":"not set";
+    $("pass-badge").className="badge"+(d.hasPassword?" set":"");
+  }).catch(function(e){showMsg("save-msg",false,String(e.message||e));});
+}
+
+function saveConfig(){
+  var body=[
+    qs("host",$("f-host").value), qs("port",$("f-port").value),
+    qs("proxyHost",$("f-proxyHost").value), qs("proxyPort",$("f-proxyPort").value),
+    qs("fromUser",$("f-fromUser").value), qs("callerId",$("f-callerId").value),
+    qs("authUser",$("f-authUser").value), qs("pass",$("f-pass").value),
+    qs("clearPassword",$("f-clearPass").checked?"1":"0"),
+    qs("enabled",$("f-enabled").checked?"1":"0")
+  ].join("&");
+  post("/api/trunk",body).then(function(res){
+    if(res.status!==200){showMsg("save-msg",false,(res.body&&res.body.error)||("HTTP "+res.status));return;}
+    showMsg("save-msg",true,"Saved.");
+    $("f-pass").value="";
+    loadConfig();
+  }).catch(function(e){showMsg("save-msg",false,String(e.message||e));});
+}
+
+loadConfig();
+</script>
+</body>
+</html>
+)html9";
+
 
 // One HttpServer::sendHtml() assembles these into a single std::string per
 // request (as it already did with the old single literal) -- the parts

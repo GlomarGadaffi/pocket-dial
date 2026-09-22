@@ -29,6 +29,7 @@
 #include "SmtpDialogue.hpp"
 #include "SmtpClient.hpp"
 #include "EmailConfigStore.hpp"
+#include "TrunkConfigStore.hpp"
 #include "GoogleServiceAuth.hpp"
 // Issue #186 (config export/import): the digest-secret and mDNS/park-timeout
 // readers below need these two subsystems' EXISTING public accessors, exactly
@@ -669,6 +670,29 @@ void HttpServer::handleClient(int clientSock)
 		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiEmailTest(clientSock, req.body);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/setup/trunk")
+	{
+		// Ungated shell, same class as "/" and /setup/email -- the page itself
+		// holds no data; every value on it arrives via the gated /api/trunk.
+		sendTrunkSetupHtml(clientSock, req);
+	}
+	else if (req.method == "GET" && req.path == "/api/trunk")
+	{
+		// Gated: discloses the carrier, the proxy and the auth ID -- exactly the
+		// infrastructure detail /api/email and /api/syslog are gated for. The
+		// password is never in this body at all (hasPassword only).
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiTrunkConfig(clientSock);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/trunk")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiTrunkConfigSet(clientSock, req.body);
 		}
 	}
 	else if (req.method == "GET" && req.path == "/api/moh")
@@ -3317,11 +3341,30 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// POCKETDIAL_HAS_WIFI below) so this also runs -- and is host-testable --
 	// on eth/desktop builds, matching AdminAuth::clearCredential()/
 	// DeviceConfig::clearAll() just above.
+	// The ITSP trunk settings are the same story once more, and the stake is
+	// higher: trunk_pass is a PLAINTEXT carrier password, and a carrier
+	// password is a billable credential. It lives in "pbxcfg", which nothing
+	// in this function otherwise reaches -- DeviceConfig::clearAll() erases
+	// only its three named "storage" keys plus reg_mode, key by key, never a
+	// namespace wipe. Without this line a factory-reset board handed to
+	// someone else still has the previous operator's SIP trunk credential in
+	// flash. Writing a default-constructed config over it is the store's own
+	// documented "save always replaces" path, so it overwrites every trunk_*
+	// key including the secret.
+	//
+	// (smtp_pass and gsa_key in the same namespace are the identical
+	// pre-existing gap and are NOT addressed here -- issue #363; fixing them
+	// is a separate change with its own test.)
+	TrunkConfigStore::save(TrunkConfigStore::Config{});
+
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
 		handler->clearAllTelephonyConfig();
 		handler->clearAllDidMappings();
 		handler->clearAllCallHistory();
+		// Push the now-empty trunk config into the running engine so the trunk
+		// goes down immediately rather than at the next reboot.
+		handler->applyStoredTrunkConfig();
 	}
 	// ── Issue #194 Stage 1 DECISION: factory reset ALSO wipes the SD CDR
 	// archive, same policy as the NVS ring immediately above. This device
@@ -4855,6 +4898,169 @@ void HttpServer::sendApiEmailTest(int sock, const std::string& body)
 	     << ",\"error\":\"" << jsonEscape(result.lastError) << "\""
 	     << "}";
 	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+// ---------------------------------------------------------------------
+// Issue #164: ITSP SIP trunk configuration. See TrunkConfigStore.hpp for the
+// persisted shape and the secret-handling rationale, SipTrunk.hpp for what the
+// engine does with it.
+//
+// The password is write-only from here: the GET reports presence as a boolean
+// and an empty submitted password means "keep the stored one", exactly as the
+// /api/email routes above handle smtp_pass. That symmetry is deliberate --
+// issue #207's bug class showed up twice in this project by treating one
+// secret differently from another.
+// ---------------------------------------------------------------------
+namespace
+{
+	// Buffer ceilings enforced at the HTTP boundary rather than left to the
+	// silent truncation in RequestsHandler::applyStoredTrunkConfig(). A trunk
+	// that half-stores a 70-character password and then cannot authenticate,
+	// with the UI cheerfully showing "set", is a support call nobody can
+	// diagnose from the outside. These mirror SipTrunk::Config's arrays.
+	constexpr size_t kMaxTrunkHost = 63;    // SipTrunk::Config::host[64]
+	constexpr size_t kMaxTrunkFrom = 39;    // ...fromUser[40]
+	constexpr size_t kMaxTrunkCid  = 23;    // ...callerId[24]
+	constexpr size_t kMaxTrunkAuth = 63;    // ...authUser[64]
+	constexpr size_t kMaxTrunkPass = 63;    // SipTrunk::kMaxSecret - 1
+
+	// NO STRUCTURAL BACKSTOP HERE -- read this before adding a field.
+	//
+	// SipTrunk::Config cannot leak the password because it does not contain
+	// one; that guarantee is structural and covers getTrunkConfig(). It does
+	// NOT cover this function. This serializes TrunkConfigStore::Config, which
+	// DOES hold `pass` in the clear, so the only things keeping the secret out
+	// of the response are the discipline of not writing it below and
+	// TrunkConfigHttp_test.cpp's GetNeverEchoesThePasswordEvenAuthenticated.
+	// A new field added carelessly here is a #207 repeat with nothing to catch
+	// it but that one test. Report presence as a boolean; never the value.
+	std::string trunkConfigJson(const TrunkConfigStore::Config& cfg)
+	{
+		std::ostringstream json;
+		json << "{\"host\":\"" << jsonEscape(cfg.host) << "\""
+		     << ",\"port\":" << cfg.port
+		     << ",\"proxyHost\":\"" << jsonEscape(cfg.proxyHost) << "\""
+		     << ",\"proxyPort\":" << cfg.proxyPort
+		     << ",\"fromUser\":\"" << jsonEscape(cfg.fromUser) << "\""
+		     << ",\"callerId\":\"" << jsonEscape(cfg.callerId) << "\""
+		     << ",\"authUser\":\"" << jsonEscape(cfg.authUser) << "\""
+		     // Secret: presence only, NEVER the value -- issue #207's class.
+		     << ",\"hasPassword\":" << (cfg.pass.empty() ? "false" : "true")
+		     << ",\"enabled\":" << (cfg.enabled ? "true" : "false")
+		     << "}";
+		return json.str();
+	}
+
+	// Parses a port field. Empty leaves `out` at its current value, which is
+	// how "the operator did not touch this" stays distinct from "set it to 0".
+	bool parseTrunkPort(const std::string& raw, uint16_t& out)
+	{
+		if (raw.empty()) return true;
+		char* end = nullptr;
+		const long v = std::strtol(raw.c_str(), &end, 10);
+		if (end == raw.c_str() || *end != '\0' || v < 1 || v > 65535) return false;
+		out = static_cast<uint16_t>(v);
+		return true;
+	}
+} // namespace
+
+void HttpServer::sendApiTrunkConfig(int sock)
+{
+	sendResponse(sock, 200, "OK", "application/json",
+	             trunkConfigJson(TrunkConfigStore::load()));
+}
+
+void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
+{
+	TrunkConfigStore::Config cfg = TrunkConfigStore::load(); // start from stored -- see the password merge below
+
+	cfg.host      = getFormParam(body, "host");
+	cfg.proxyHost = getFormParam(body, "proxyHost");
+	cfg.fromUser  = getFormParam(body, "fromUser");
+	cfg.callerId  = getFormParam(body, "callerId");
+	cfg.authUser  = getFormParam(body, "authUser");
+
+	const std::string enabledParam = getFormParam(body, "enabled");
+	cfg.enabled = (enabledParam == "1" || enabledParam == "on" || enabledParam == "true");
+
+	if (!parseTrunkPort(getFormParam(body, "port"), cfg.port) ||
+	    !parseTrunkPort(getFormParam(body, "proxyPort"), cfg.proxyPort))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"port must be 1-65535\"}");
+		return;
+	}
+
+	// Secret: an empty submitted value means "leave the stored one alone". The
+	// dashboard never re-displays the password, so there is nothing for the
+	// client to redact from and a blank field must not read as "clear this".
+	// Clearing is an explicit act -- clearPassword=1.
+	const std::string pass = getFormParam(body, "pass");
+	if (getFormParam(body, "clearPassword") == "1") cfg.pass.clear();
+	else if (!pass.empty())                          cfg.pass = pass;
+
+	struct { const char* name; const std::string& val; size_t cap; } limits[] = {
+		{ "host",      cfg.host,      kMaxTrunkHost },
+		{ "proxyHost", cfg.proxyHost, kMaxTrunkHost },
+		{ "fromUser",  cfg.fromUser,  kMaxTrunkFrom },
+		{ "callerId",  cfg.callerId,  kMaxTrunkCid  },
+		{ "authUser",  cfg.authUser,  kMaxTrunkAuth },
+		{ "pass",      cfg.pass,      kMaxTrunkPass },
+	};
+	for (const auto& l : limits)
+	{
+		if (l.val.size() > l.cap)
+		{
+			std::ostringstream err;
+			err << "{\"error\":\"" << l.name << " must be at most " << l.cap
+			    << " characters\"}";
+			sendResponse(sock, 400, "Bad Request", "application/json", err.str());
+			return;
+		}
+	}
+
+	// Enabling a trunk that cannot possibly place a call is a misconfiguration
+	// worth refusing at the door rather than discovering when someone dials 9.
+	// These are exactly SipTrunk::Config::valid()'s requirements; saving them
+	// inconsistent would leave the UI showing "enabled" beside a trunk the
+	// engine silently treats as invalid.
+	if (cfg.enabled && (cfg.host.empty() || cfg.fromUser.empty()))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"host and fromUser are required to enable the trunk\"}");
+		return;
+	}
+
+	if (!TrunkConfigStore::save(cfg))
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"error\":\"failed to persist trunk configuration\"}");
+		return;
+	}
+
+	// Apply to the running engine. Persisting without applying would leave the
+	// live trunk pointed at the previous carrier until the next reboot -- the
+	// kind of bug that only surfaces mid-cutover.
+	if (RequestsHandler* h = _handler.load(std::memory_order_acquire))
+	{
+		h->applyStoredTrunkConfig();
+	}
+
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"config\":" + trunkConfigJson(cfg) + "}");
+}
+
+void HttpServer::sendTrunkSetupHtml(int sock, const HttpRequest& req)
+{
+	std::string page(PD_HTML_9, sizeof(PD_HTML_9) - 1);
+	const std::string token = AdminAuth::sessionCsrf(sessionToken(req));
+	const std::string marker = "__PD_CSRF__";
+	const size_t at = page.find(marker);
+	if (at != std::string::npos)
+	{
+		page.replace(at, marker.size(), token);
+	}
+	sendResponse(sock, 200, "OK", "text/html; charset=utf-8", page);
 }
 
 void HttpServer::sendEmailSetupHtml(int sock, const HttpRequest& req)

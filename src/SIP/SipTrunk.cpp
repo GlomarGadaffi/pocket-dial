@@ -1,5 +1,6 @@
 #include "SipTrunk.hpp"
 
+#include <cstring>
 #include <sstream>
 
 #include "IDGen.hpp"
@@ -71,13 +72,13 @@ namespace
 std::string SipTrunk::buildInvite(const Dialog& d, const std::string& sdp)
 {
 	std::ostringstream ss;
-	ss << "INVITE " << pstnUri(d.destE164, d.sbcIpPort) << " SIP/2.0\r\n"
+	ss << "INVITE " << pstnUri(d.destE164, d.domain) << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << d.localIpPort << ";branch=" << d.branch << ";rport\r\n"
 	   // From carries the trunk identity. A carrier matches its outbound
 	   // authorisation against THIS, not against the Contact, so getting it wrong
 	   // is a 403 with no further explanation.
-	   << "From: <sip:" << d.fromUser << "@" << d.sbcIpPort << ">;tag=" << d.fromTag << "\r\n"
-	   << "To: <" << pstnUri(d.destE164, d.sbcIpPort) << ">\r\n"
+	   << "From: <sip:" << d.fromUser << "@" << d.domain << ">;tag=" << d.fromTag << "\r\n"
+	   << "To: <" << pstnUri(d.destE164, d.domain) << ">\r\n"
 	   << "Call-ID: " << d.callID << "\r\n"
 	   << "CSeq: " << d.cseq << " INVITE\r\n";
 	commonRequestTail(ss);
@@ -106,14 +107,14 @@ std::string SipTrunk::buildAckFor2xx(const Dialog& d, std::string_view freshBran
 	// only be tested by regex, which is exactly the level of rigour a wire format
 	// does not deserve to be tested at.
 	const std::string& target = d.remoteTarget.empty()
-		? d.sbcIpPort            // carrier sent no Contact: fall back, better than nothing
+		? d.domain               // carrier sent no Contact: fall back, better than nothing
 		: d.remoteTarget;
 
 	std::ostringstream ss;
 	ss << "ACK " << (d.remoteTarget.empty() ? pstnUri(d.destE164, target) : target) << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << d.localIpPort << ";branch=" << freshBranch << ";rport\r\n"
-	   << "From: <sip:" << d.fromUser << "@" << d.sbcIpPort << ">;tag=" << d.fromTag << "\r\n"
-	   << "To: <" << pstnUri(d.destE164, d.sbcIpPort) << ">";
+	   << "From: <sip:" << d.fromUser << "@" << d.domain << ">;tag=" << d.fromTag << "\r\n"
+	   << "To: <" << pstnUri(d.destE164, d.domain) << ">";
 	if (!d.toTag.empty()) ss << ";tag=" << d.toTag;
 	ss << "\r\n"
 	   << "Call-ID: " << d.callID << "\r\n"
@@ -132,10 +133,10 @@ std::string SipTrunk::buildAckForFailure(const Dialog& d)
 	// resending the 4xx until Timer H (~32 s) and the slot stays pinned at both
 	// ends.
 	std::ostringstream ss;
-	ss << "ACK " << pstnUri(d.destE164, d.sbcIpPort) << " SIP/2.0\r\n"
+	ss << "ACK " << pstnUri(d.destE164, d.domain) << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << d.localIpPort << ";branch=" << d.branch << ";rport\r\n"
-	   << "From: <sip:" << d.fromUser << "@" << d.sbcIpPort << ">;tag=" << d.fromTag << "\r\n"
-	   << "To: <" << pstnUri(d.destE164, d.sbcIpPort) << ">";
+	   << "From: <sip:" << d.fromUser << "@" << d.domain << ">;tag=" << d.fromTag << "\r\n"
+	   << "To: <" << pstnUri(d.destE164, d.domain) << ">";
 	if (!d.toTag.empty()) ss << ";tag=" << d.toTag;
 	ss << "\r\n"
 	   << "Call-ID: " << d.callID << "\r\n"
@@ -159,8 +160,8 @@ std::string SipTrunk::buildBye(const Dialog& d, std::string_view freshBranch)
 	std::ostringstream ss;
 	ss << "BYE " << d.remoteTarget << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << d.localIpPort << ";branch=" << freshBranch << ";rport\r\n"
-	   << "From: <sip:" << d.fromUser << "@" << d.sbcIpPort << ">;tag=" << d.fromTag << "\r\n"
-	   << "To: <" << pstnUri(d.destE164, d.sbcIpPort) << ">;tag=" << d.toTag << "\r\n"
+	   << "From: <sip:" << d.fromUser << "@" << d.domain << ">;tag=" << d.fromTag << "\r\n"
+	   << "To: <" << pstnUri(d.destE164, d.domain) << ">;tag=" << d.toTag << "\r\n"
 	   << "Call-ID: " << d.callID << "\r\n"
 	   // A new request in the dialog takes the NEXT sequence number (§12.2.1.1).
 	   << "CSeq: " << (d.cseq + 1) << " BYE\r\n";
@@ -209,6 +210,29 @@ SipTrunk::Dialog* SipTrunk::findMutableByCallID(std::string_view callID)
 		}
 	}
 	return nullptr;
+}
+
+bool SipTrunk::setCredentials(std::string_view password)
+{
+	// Reject rather than truncate. A silently shortened password is a trunk
+	// that fails to authenticate with no visible cause -- the worst possible
+	// failure for a field that a human typed into a form and cannot read back.
+	if (password.size() >= kMaxSecret) return false;
+
+	clearCredentials();
+	if (password.empty()) return true;   // empty == "no credential", not an error
+	std::memcpy(_secret, password.data(), password.size());
+	_secret[password.size()] = '\0';
+	return true;
+}
+
+void SipTrunk::clearCredentials()
+{
+	// volatile so the write survives an optimiser that can see the buffer is
+	// dead afterwards. Best-effort hygiene, not a security boundary -- the same
+	// caveat TelephonyApiConfig's scrub() states, and for the same reason.
+	volatile char* p = _secret;
+	for (size_t i = 0; i < kMaxSecret; ++i) p[i] = '\0';
 }
 
 const SipTrunk::Dialog* SipTrunk::findByCallID(std::string_view callID) const
@@ -263,6 +287,31 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 	d->fromTag       = IDGen::GenerateID(9);
 	d->cseq          = 1;
 	d->sbcIpPort     = addrToIpPort(sbc);
+	// The SIP domain, from Config -- deliberately not addrToIpPort(sbc), which
+	// is the transport address and becomes the PROXY's address the moment one
+	// is configured. Keeping the port suffix makes this byte-identical to the
+	// old sbcIpPort-derived URIs for the common dotted-quad, no-proxy case.
+	//
+	// KNOWN, DELIBERATELY DEFERRED: the ":port" is unconditional, so a trunk on
+	// the default port still emits "sip:+1555@carrier.example.com:5060" rather
+	// than the bare domain. By RFC 3261 §19.1.4 a URI omitting a component with
+	// a default value does NOT match one explicitly carrying that component at
+	// its default, so those are formally distinct URIs -- and some SBCs and
+	// proxies route on the Request-URI host and will treat them as different
+	// route keys. This config surface is what first makes FQDN registrars and
+	// outbound proxies reachable, so it is what makes the case reachable too.
+	//
+	// Not fixed here, as an explicit decision rather than an oversight: nothing
+	// can complete a call on this trunk yet (no REGISTER, no 401/407 handling),
+	// so the exposure is theoretical, and a live carrier will settle the exact
+	// semantics empirically when the digest path lands. Changing it is not the
+	// three-line conditional it looks like -- by the same §19.1.4 reasoning it
+	// alters the emitted bytes for the existing dotted-quad case, so the
+	// byte-pinned expectations in SipTrunk_test.cpp move with it.
+	//
+	// SipTrunkUriPort.PortSuffixIsCurrentlyUnconditional pins today's behaviour
+	// so this is revisited rather than silently inherited. See issue #365.
+	d->domain        = std::string(_cfg.host) + ":" + std::to_string(_cfg.port);
 	d->localIpPort   = activeIp + ":" + std::to_string(_env.serverPort());
 	d->destE164.assign(e164);
 	d->handsetCallID.assign(handsetCallID);
