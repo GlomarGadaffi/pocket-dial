@@ -175,12 +175,20 @@ private:
 		std::atomic<bool>        upsetPending{false};
 		esp_http_client_handle_t postClient = nullptr;
 		std::atomic<bool>        postLive{false};         // guarded by postMutex
+		// Issue #370: OWNED BY THE RX TASK. runRxLoop() is the only thing that creates
+		// this handle and the only thing that frees it, and it nulls it (under getMutex)
+		// on every exit path before returning. So getClient != nullptr means an rx task
+		// is live inside it -- NOTHING else may close/cleanup it, mutex held or not.
+		// getMutex serialises the pointer, not the handle's USE: runRxLoop deliberately
+		// does not hold it across esp_http_client_open()/read (a ~1s TLS handshake under
+		// the lock would block the very shutdown(fd) that unblocks the task), so holding
+		// the mutex tells an external caller nothing about whether someone is inside.
 		esp_http_client_handle_t getClient  = nullptr;
 		TaskHandle_t             rxTaskHandle = nullptr;
 		SemaphoreHandle_t        rxDoneSem    = nullptr;
 		std::atomic<bool>        tearingDown{false};      // single-entry gate for stopMediaStreams(slot)
 		mutable std::mutex       postMutex;               // guards postClient (writeAudio/stop)
-		std::mutex               getMutex;                // guards getClient (runRxLoop/stop)
+		std::mutex               getMutex;                // guards the getClient POINTER only — see #370 note above
 	};
 	CallSlot _calls[POCKETDIAL_MAX_ANCHOR_CALLS];
 	// Slot lookup/alloc (caller holds _mutex). slotForLocked returns the slot whose
