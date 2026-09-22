@@ -215,6 +215,37 @@ TEST(AnchorRouting, DialingReservedExtensionReachesAnchorAndBridgeAttaches)
 	EXPECT_EQ(bridge->callId(), "Call-ID: anchor-1");
 }
 
+TEST(AnchorRouting, BindOutboundParticipantReportsAMissingSession)
+{
+	// Issue #379: the asyncMakeCall() worker's success branch used to call
+	// bindOutboundParticipant() and discard the outcome. When the handset
+	// CANCELled during the makeCall() round trip, endCall() had already erased
+	// the session, the bind silently did nothing, and the freshly created 3CX
+	// leg lived on with no local party. The worker now drops the leg whenever
+	// the bind reports a miss -- so the miss must actually be reported.
+	//
+	// The worker itself cannot run in a host test (Loopback is synchronous, so
+	// asyncMakeCall() is never dispatched); this pins the signal it acts on.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	// No such session at all: the CANCEL-before-makeCall-returns case.
+	EXPECT_FALSE(handler.bindOutboundParticipantForTest("Call-ID: never-existed", "leg-379"))
+		<< "a bind onto a torn-down session must report the miss so the caller drops the leg";
+	EXPECT_FALSE(handler.bindOutboundParticipantForTest("Call-ID: never-existed", ""))
+		<< "an empty leg is nothing to bind (and nothing to drop)";
+
+	// A live anchor session binds normally and says so.
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-379"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-379").has_value());
+	EXPECT_TRUE(handler.bindOutboundParticipantForTest("Call-ID: anchor-379", "leg-379"));
+	EXPECT_EQ(handler.getSession("Call-ID: anchor-379").value()->getAnchorParticipantId(), "leg-379");
+}
+
 TEST(AnchorRouting, PcmaOnlyOfferGets488NotABridgeItCannotDecode)
 {
 	// Issue #304: MediaBridge::onHandsetRtp only mu-law-decodes, and

@@ -4047,15 +4047,21 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 
 // ── Anchor async wrappers (Stage B) ──────────────────────────────────────────
 
-void RequestsHandler::bindOutboundParticipant(const std::string& callId, const std::string& ownLeg)
+bool RequestsHandler::bindOutboundParticipant(const std::string& callId, const std::string& ownLeg)
 {
-	if (callId.empty() || ownLeg.empty()) return;
+	if (callId.empty() || ownLeg.empty()) return false;
 	std::lock_guard<std::mutex> lock(_mutex);
 	auto it = _sessions.find(callId);
 	if (it != _sessions.end() && it->second && it->second->isAnchor())
 	{
 		it->second->setAnchorParticipantId(ownLeg);
+		return true;
 	}
+	// Issue #379: the session can legitimately be gone by now -- the handset
+	// CANCELled during makeCall()'s TLS round trip and endCall() already
+	// erased it. Binding silently would leave `ownLeg` live on the anchor
+	// with nobody on the local end; the caller must drop it.
+	return false;
 }
 
 void RequestsHandler::refuseRingingAnchor(const std::string& callId,
@@ -4120,9 +4126,27 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 			// Bind this origination's own leg to its session NOW (locks _mutex
 			// internally) so a later Answered/Dropped maps to the right call when
 			// several are in flight.
-			mca->handler->bindOutboundParticipant(mca->callId, ownLeg);
+			const bool bound = mca->handler->bindOutboundParticipant(mca->callId, ownLeg);
 			std::lock_guard<std::mutex> lock(mca->handler->_mutex);
-			mca->handler->queueLog("[Telephony] Initiating outbound call to " + mca->dest);
+			if (!bound)
+			{
+				// Issue #379: the handset hung up while makeCall() was still on
+				// the wire (a ~0.8 s TLS round trip), so the CANCEL path's
+				// endCall() already destroyed the session this leg belongs to.
+				// makeCall() nonetheless SUCCEEDED, so 3CX now has a Dialing leg
+				// that will ring the far party, be answerable and bill, with no
+				// local party and nothing that will ever map an event back to
+				// it. Drop it now. asyncDropCall() spawns its own worker, so it
+				// is safe from this task and under _mutex (endCall() calls it
+				// the same way).
+				mca->handler->queueLog("[Telephony] Outbound call to " + mca->dest +
+					" was cancelled during makeCall — dropping orphaned leg " + ownLeg + " (#379)", true);
+				mca->handler->asyncDropCall(ownLeg);
+			}
+			else
+			{
+				mca->handler->queueLog("[Telephony] Initiating outbound call to " + mca->dest);
+			}
 		}
 		delete mca;
 		vTaskDeleteWithCaps(NULL);   // created WithCaps(PSRAM)
@@ -4154,9 +4178,20 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 		}
 		else
 		{
-			bindOutboundParticipant(callId, ownLeg);   // locks _mutex itself
+			const bool bound = bindOutboundParticipant(callId, ownLeg);   // locks _mutex itself
 			std::lock_guard<std::mutex> lock(_mutex);
-			queueLog("[Telephony] Initiating outbound call to " + destination);
+			if (!bound)
+			{
+				// Issue #379: see the ESP branch above -- session already torn
+				// down by a handset CANCEL mid-makeCall; drop the orphaned leg.
+				queueLog("[Telephony] Outbound call to " + destination +
+					" was cancelled during makeCall — dropping orphaned leg " + ownLeg + " (#379)", true);
+				asyncDropCall(ownLeg);
+			}
+			else
+			{
+				queueLog("[Telephony] Initiating outbound call to " + destination);
+			}
 		}
 	});
 #endif
