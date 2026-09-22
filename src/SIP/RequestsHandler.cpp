@@ -6835,6 +6835,20 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 		ending = sit->second;
 	}
 
+	// Issue #379 Case B: snapshot the anchor fields HERE, before anything below
+	// can reset them. `ending` aliases the pooled Session -- if this dialog's
+	// entry in _sessionPool matches callID, the loop further down calls
+	// release() on that SAME object (allocateSession() hands out pool slots
+	// directly, not copies), and release() unconditionally clears _isAnchor
+	// and _anchorParticipantId as part of recycling the slot. A live read of
+	// ending->isAnchor()/getAnchorParticipantId() from the anchor-drop block
+	// below would see the object AFTER that reset and always find it cleared
+	// -- caught by adding this exact fix and finding the new host test still
+	// failed once with the object's *current* state instead of its state at
+	// the moment this dialog actually ended.
+	const bool endingWasAnchor = ending && ending->isAnchor();
+	const std::string endingAnchorParticipantId = ending ? ending->getAnchorParticipantId() : std::string();
+
 	if (_sessions.erase(std::string(callID)) > 0)
 	{
 		// Record exactly once per torn-down dialog (Phase 2 CDR).
@@ -6884,6 +6898,7 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	// would stall the SIP thread for a real anchor's TLS round trip.
 	{
 		const std::string callIdStr(callID);
+		bool droppedViaBridge = false;
 		for (auto& bridge : _mediaBridges)
 		{
 			if (bridge.isForCallId(callIdStr))
@@ -6899,9 +6914,54 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 					{
 						asyncDropCall(participantId);
 					}
+					droppedViaBridge = true;
 				}
 				bridge.stopBridge();
 				break;
+			}
+		}
+
+		// Issue #379 Case B: a MediaBridge is created only once media actually
+		// bridges (after the leg is Answered). A CANCEL/teardown that arrives
+		// while the call is still ringing finds NO bridge here -- the loop
+		// above drops nothing, and the leg asyncMakeCall() already placed on
+		// 3CX is orphaned: live, ringable, answerable, and billed, with no one
+		// left to drop it. Reproduced live: hang up during setup and the far
+		// end still rang, was answered, and stayed up ~40 s with nobody local.
+		//
+		// Gated on droppedViaBridge (did we actually issue a drop), not on
+		// whether a bridge slot matched: MediaBridge::startBridge() sets
+		// _callID and _participantId together, before _active, all under the
+		// same mutex isForCallId()/participantId() take -- so a matched slot
+		// with an empty participantId() is not reachable today. Naming the
+		// gate this way means that stays true by construction rather than by
+		// a reader re-deriving MediaBridge's locking discipline.
+		//
+		// The session already carries the leg id independently --
+		// setAnchorParticipantId() is set the moment makeCall() returns (see
+		// asyncMakeCall()/bindOutboundParticipant()), well before any bridge
+		// exists -- and the WS event classifier already trusts that copy
+		// (search getAnchorParticipantId() above). Teardown didn't. Fall back
+		// to it here, same sync/async split as the bridge-found case above.
+		//
+		// Reads the SNAPSHOT taken before this function's _sessionPool loop
+		// (above) could have already called release() on this same object and
+		// cleared both fields -- see that snapshot's own comment.
+		if (!droppedViaBridge && _anchorClient && endingWasAnchor)
+		{
+			const std::string& fallbackParticipantId = endingAnchorParticipantId;
+			if (!fallbackParticipantId.empty())
+			{
+				queueLog("[Telephony] Anchor leg " + fallbackParticipantId +
+					" torn down before it bridged -- dropping orphaned leg (#379)", true);
+				if (anchorIsSynchronous())
+				{
+					_anchorClient->dropCall(fallbackParticipantId);
+				}
+				else
+				{
+					asyncDropCall(fallbackParticipantId);
+				}
 			}
 		}
 	}
