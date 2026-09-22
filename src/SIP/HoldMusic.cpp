@@ -197,6 +197,27 @@ unsigned HoldMusic::listenerCount() const
 	return n;
 }
 
+// Issue #328: see the header for why these exist. No lock -- they are atomics,
+// and taking _mutex here would put a diagnostic read on the same lock the
+// pacing task holds for its whole per-tick listener fan-out.
+long HoldMusic::l2TxErrors() const
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	return static_cast<long>(_l2TxErrors.load(std::memory_order_relaxed));
+#else
+	return -1;
+#endif
+}
+
+long HoldMusic::txErrors() const
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	return static_cast<long>(_txErrors.load(std::memory_order_relaxed));
+#else
+	return -1;
+#endif
+}
+
 bool HoldMusic::loadClip(const std::string& path)
 {
 	std::FILE* f = std::fopen(path.c_str(), "rb");

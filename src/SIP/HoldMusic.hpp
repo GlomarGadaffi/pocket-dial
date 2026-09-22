@@ -162,6 +162,19 @@ public:
 	void removeListener(int id);
 	unsigned listenerCount() const;
 
+	// Issue #328. runLoop() tries the L2 bypass first and falls back to
+	// sendto() when L2 addressing is not ready -- and that fallback is
+	// SILENT: nothing is logged unless the sendto() itself fails. From the
+	// outside there was no way to tell "the DmaFramePool path is carrying the
+	// audio" from "it has been falling back to the socket this whole time,"
+	// which is precisely the question #328's proof needed answered and could
+	// not answer. These two, alongside the pool's own counters, close that gap.
+	//
+	// -1 means "not measurable on this build" (host has no pacing task), the
+	// same convention /api/status uses for the stackHwm_* fields.
+	long l2TxErrors() const;
+	long txErrors() const;
+
 	// Issue #218: a second, smaller kind of listener for a leg that has no RTP
 	// destination of its own to register above -- a media-anchored (555) call
 	// on hold. MediaBridge already owns that leg's real transport (it decodes
@@ -243,9 +256,15 @@ private:
 	int  _sock = -1;
 	std::atomic<bool> _stopRequested{false};
 	std::atomic<bool> _taskRunning{false};
-	// Touched only by the pacing task, so no synchronisation is needed or wanted.
-	uint32_t _txErrors   = 0; // failed sendto()s — a silent gap otherwise
-	uint32_t _l2TxErrors = 0; // failed L2 transmits
+	// Incremented by the pacing task, and since #328's proof work also READ by
+	// the HTTP thread through l2TxErrors()/txErrors() for /api/status. That
+	// second reader is why these are atomic rather than plain uint32_t as they
+	// were: an unsynchronised cross-task read is exactly the defect #344 fixed
+	// in TelephonyAnchorClient, and there is no reason to reintroduce it for a
+	// diagnostic. Relaxed ordering is right -- these are counters, nothing else
+	// is published through them.
+	std::atomic<uint32_t> _txErrors{0};   // failed sendto()s — a silent gap otherwise
+	std::atomic<uint32_t> _l2TxErrors{0}; // failed L2 transmits
 	uint32_t _ticks      = 0; // drives the one-shot stack high-water report
 	// Issue #273: the deep (held-call) path's stack margin. Pacing task only.
 	bool     _deepPathSampled = false;

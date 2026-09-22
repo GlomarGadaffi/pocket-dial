@@ -12,6 +12,12 @@
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
 #include "ArpLookup.hpp"
+// Issue #328: DmaFramePool's counters are reported by /api/status. Included
+// unconditionally, not in the ESP-only block below -- the pool has a real host
+// implementation and is built into the host test target, so these numbers are
+// live on both platforms and can be asserted by a host test rather than only
+// eyeballed on hardware.
+#include "DmaFramePool.hpp"
 #include "index_html.h"
 #include "IPHelper.hpp"
 #include "UrlEncode.hpp"
@@ -60,6 +66,9 @@
 // Issue #185: heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) for
 // sendApiStatus's minFreeHeapSpiram field.
 #include "esp_heap_caps.h"
+// Issue #366: esp_pthread_set_cfg() to size the per-connection thread stack
+// independently of CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT.
+#include "esp_pthread.h"
 #endif
 
 // Forward declarations for the file-local form/URL helpers (defined lower down).
@@ -189,6 +198,33 @@ void HttpServer::start()
 
 void HttpServer::acceptLoop()
 {
+#if defined(ESP_PLATFORM)
+	// Issue #366. esp_pthread_set_cfg() applies to threads created BY THE
+	// CALLING THREAD, and this one creates nothing except the per-connection
+	// handlers below -- so setting it once here covers all of them and leaves
+	// every other std::thread in the firmware on the 8192 Kconfig default.
+	// Changing CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT instead would have
+	// re-sized threads this issue never measured.
+	//
+	// A failure here is not fatal: the threads simply keep the old default and
+	// we are back to the pre-fix behaviour, which is a dropped connection under
+	// fragmentation rather than a crash. Log it so a silent regression to 8192
+	// is visible in the boot log instead of being invisible until the board
+	// starts refusing connections again.
+	{
+		esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+		cfg.stack_size  = kHttpConnStackBytes;
+		cfg.thread_name = "http_conn";
+		const esp_err_t cfgErr = esp_pthread_set_cfg(&cfg);
+		if (cfgErr != ESP_OK)
+		{
+			std::cerr << "[HttpServer] esp_pthread_set_cfg failed (" << esp_err_to_name(cfgErr)
+				<< ") — connection threads keep the "
+				<< CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT << "-byte default\n";
+		}
+	}
+#endif
+
 	while (_running)
 	{
 		if (_listenSock < 0)
@@ -243,14 +279,62 @@ void HttpServer::acceptLoop()
 		// while SIP traffic churns the heap). An uncaught throw here runs on the accept-loop
 		// pthread and calls std::terminate()/abort(), rebooting the whole device. Catch it and
 		// drop just this one connection so the server keeps serving instead of crashing.
+		// Issue #368: bound how many handler threads can exist at once. Each one
+		// costs a task stack + TCB + socket buffers out of INTERNAL DRAM, and that
+		// is the same pool the W5500 driver takes its DMA bounce buffer from -- so
+		// an unbounded count does not just refuse dashboard requests, it stops the
+		// device transmitting Ethernet frames. Measured on .244: 8 concurrent
+		// requests took minFreeHeapInternal to 7412 bytes, 12 produced
+		// "spicommon_dma_setup_priv_buffer: Failed to allocate priv TX buffer" and
+		// dropped frames, 16 took it to 624 bytes. /api/status is deliberately
+		// unauthenticated (#207) so the burst needs no credentials.
+		//
+		// Refusing early and cheaply is strictly better than letting the spawn fail
+		// deeper in: the caller gets a 503 it can retry instead of a dropped socket,
+		// and the memory is never committed in the first place.
+		if (_activeConnections.load(std::memory_order_acquire) >= kMaxConcurrentConnections)
+		{
+			// This refusal is written from the ACCEPT THREAD, not a handler, so it
+			// must not be allowed to block: a client that completes the handshake
+			// and then never reads would otherwise wedge the accept loop on send()
+			// and take the whole server down -- a far worse denial of service than
+			// the exhaustion this cap exists to prevent. handleClient()'s 5 s
+			// SO_RCVTIMEO (#23) is set on the handler path we are deliberately
+			// skipping here, so this socket needs its own bound.
+#if defined _WIN32 || defined _WIN64
+			DWORD sndTv = 1000;
+			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO,
+				reinterpret_cast<const char*>(&sndTv), sizeof(sndTv));
+#else
+			timeval sndTv{};
+			sndTv.tv_sec  = 1;
+			sndTv.tv_usec = 0;
+			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, &sndTv, sizeof(sndTv));
+#endif
+			sendResponse(clientSock, 503, "Service Unavailable", "application/json",
+				"{\"error\":\"busy\",\"message\":\"too many concurrent connections\"}");
+			closeSocket(clientSock);
+			continue;
+		}
+
+		// Claimed BEFORE the thread exists so a burst arriving faster than the
+		// threads can start cannot overshoot the cap; the thread body releases it
+		// on every exit path, and the catch below releases it if no thread was
+		// ever created.
+		_activeConnections.fetch_add(1, std::memory_order_acq_rel);
+
 		try
 		{
 			std::thread([this, clientSock]() {
 				handleClient(clientSock);
+				recordConnStackHwm();
+				_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			}).detach();
 		}
 		catch (const std::exception& e)
 		{
+			// No thread was created, so nothing will ever decrement for this one.
+			_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			std::cerr << "[HttpServer] connection thread spawn failed: " << e.what()
 				<< " — dropping connection\n";
 #if defined _WIN32 || defined _WIN64
@@ -1297,6 +1381,32 @@ static void pdAppendHwmField(std::ostringstream& json, const char* key, long byt
 }
 #endif // ESP_PLATFORM
 
+void HttpServer::recordConnStackHwm()
+{
+#if defined(ESP_PLATFORM)
+	// uxTaskGetStackHighWaterMark returns the smallest amount of free stack this
+	// task has ever had, in WORDS on Xtensa -- multiply for the bytes every other
+	// stackHwm_* field reports. Called on the connection thread itself, right
+	// after the request has been served, so it covers whatever depth that
+	// particular route reached.
+	const long freeBytes =
+		static_cast<long>(uxTaskGetStackHighWaterMark(nullptr)) * sizeof(StackType_t);
+
+	// Keep the WORST (smallest-free) figure any connection has produced since
+	// boot: a compare-exchange loop rather than a plain store, because several
+	// connection threads can finish at once and the deepest one must win.
+	long prev = _httpConnStackHwmBytes.load(std::memory_order_relaxed);
+	while (prev < 0 || freeBytes < prev)
+	{
+		if (_httpConnStackHwmBytes.compare_exchange_weak(prev, freeBytes,
+			std::memory_order_relaxed))
+		{
+			break;
+		}
+	}
+#endif
+}
+
 void HttpServer::sendApiStatus(int sock, bool authenticated)
 {
 	uint64_t uptimeMs = currentTimeMs() - _startTime;
@@ -1529,6 +1639,13 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	pdAppendHwmField(json, "stackHwm_rtp_media_tx", pdStackHwmBytes("rtp_media_tx"));
 	pdAppendHwmField(json, "stackHwm_rtp_media_rx", pdStackHwmBytes("rtp_media_rx"));
 	pdAppendHwmField(json, "stackHwm_conf_mix_tick", pdStackHwmBytes("conf_mix_tick"));
+	// Issue #366: not a live-task lookup like the others -- a connection thread is
+	// gone by the time anyone reads this -- but the worst figure recorded by any
+	// of them since boot. null until the first request has completed, which in
+	// practice means the very request being served here reports null on a fresh
+	// boot and a real number from then on.
+	pdAppendHwmField(json, "stackHwm_http_conn",
+		_httpConnStackHwmBytes.load(std::memory_order_relaxed));
 #else
 	// Host build: no FreeRTOS, no heap_caps. Same key set as the ESP build,
 	// all-zero/null, so tests/interop/interop.py's JSON parsing never has to
@@ -1539,8 +1656,41 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	        ",\"freeHeapDma\":0,\"largestFreeBlockDma\":0,\"resetReason\":\"n/a\"";
 	json << ",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
 	        "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
-	        "\"stackHwm_conf_mix_tick\":null";
+	        "\"stackHwm_conf_mix_tick\":null,\"stackHwm_http_conn\":null";
 #endif
+
+	// Issue #328: L2 transmit-path health, in one object, on the UNGATED route.
+	//
+	// The proof run for #328 could establish that hold music was streaming at
+	// exactly 50 pkt/s and that DMA heap was collapsing underneath it, but not
+	// WHICH path carried the audio -- HoldMusic::runLoop() tries the L2 bypass
+	// and falls back to sendto() silently, logging only if the sendto() itself
+	// errors. "The pool is working" and "it has been falling back all along"
+	// were externally indistinguishable. poolAllocations answers it directly:
+	// during a hold it should climb at the tick rate, and if it does not, the
+	// audio is going out the socket path the pool exists to avoid.
+	//
+	// Deliberately here rather than on the gated /api/moh: the consumer is a
+	// diagnostic harness, and a harness that needs an admin session to read a
+	// counter does not get run. These are operational counters in the same
+	// category as the heap and stack figures already on this route -- no
+	// configuration, no identities, nothing an unauthenticated caller learns
+	// that freeHeapInternal does not already tell them.
+	//
+	// The pool numbers are live on BOTH platforms (it has a real host
+	// implementation and is in the host test target). The MoH error counters
+	// are -1 off-device, emitted as null per the stackHwm_* convention.
+	json << ",\"l2Tx\":{\"poolAllocations\":" << l2rtp::DmaFramePool::getAllocations()
+	     << ",\"poolExhaustions\":" << l2rtp::DmaFramePool::getExhaustions()
+	     << ",\"poolAvailable\":"   << l2rtp::DmaFramePool::available()
+	     << ",\"poolSize\":"        << l2rtp::DmaFramePool::kPoolSize;
+	const long mohL2Err   = handler ? handler->holdMusicL2TxErrors() : -1;
+	const long mohSockErr = handler ? handler->holdMusicTxErrors()   : -1;
+	json << ",\"mohL2Errors\":";
+	if (mohL2Err < 0) json << "null"; else json << mohL2Err;
+	json << ",\"mohSockErrors\":";
+	if (mohSockErr < 0) json << "null"; else json << mohSockErr;
+	json << "}";
 
 	json << "}";
 
