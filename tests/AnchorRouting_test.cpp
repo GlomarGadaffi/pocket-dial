@@ -23,10 +23,14 @@
 #include <algorithm>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include "LoopbackAnchorClient.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
 
@@ -213,6 +217,194 @@ TEST(AnchorRouting, DialingReservedExtensionReachesAnchorAndBridgeAttaches)
 	EXPECT_TRUE(bridge->isActive());
 	EXPECT_EQ(bridge->participantId(), "mock-part-123");
 	EXPECT_EQ(bridge->callId(), "Call-ID: anchor-1");
+}
+
+TEST(AnchorRouting, BindOutboundParticipantReportsAMissingSession)
+{
+	// Issue #379: the asyncMakeCall() worker's success branch used to call
+	// bindOutboundParticipant() and discard the outcome. When the handset
+	// CANCELled during the makeCall() round trip, endCall() had already erased
+	// the session, the bind silently did nothing, and the freshly created 3CX
+	// leg lived on with no local party. The worker now drops the leg whenever
+	// the bind reports a miss -- so the miss must actually be reported.
+	//
+	// The worker itself cannot run in a host test (Loopback is synchronous, so
+	// asyncMakeCall() is never dispatched); this pins the signal it acts on.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	// No such session at all: the CANCEL-before-makeCall-returns case.
+	EXPECT_FALSE(handler.bindOutboundParticipantForTest("Call-ID: never-existed", "leg-379"))
+		<< "a bind onto a torn-down session must report the miss so the caller drops the leg";
+	EXPECT_FALSE(handler.bindOutboundParticipantForTest("Call-ID: never-existed", ""))
+		<< "an empty leg is nothing to bind (and nothing to drop)";
+
+	// A live anchor session binds normally and says so.
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-379"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-379").has_value());
+	EXPECT_TRUE(handler.bindOutboundParticipantForTest("Call-ID: anchor-379", "leg-379"));
+	EXPECT_EQ(handler.getSession("Call-ID: anchor-379").value()->getAnchorParticipantId(), "leg-379");
+}
+
+TEST(AnchorRouting, EndCallDropsTheOrphanedLegWhenTornDownBeforeAnyBridgeExisted)
+{
+	// Issue #379 Case B. The test above pins Case A (CANCEL before makeCall()
+	// returns -- no session at all). This is the other ordering, reproduced
+	// live: makeCall() returns and BINDS successfully, then teardown races in
+	// before media ever bridges. endCall()'s existing anchor-drop block only
+	// scans _mediaBridges for a slot bound to this Call-ID -- and a
+	// MediaBridge is created only once media actually starts, so a call torn
+	// down while still ringing finds none. The block used to do nothing in
+	// that case: the freshly placed 3CX leg was left live, ringable and
+	// billed, with nobody local and nobody left to drop it. Reproduced on
+	// hardware: hanging up during setup left the far end ringing, answerable,
+	// and up ~40 s with no local party.
+	//
+	// This cannot go through asyncMakeCall()'s real worker (ESP-only; Loopback
+	// is synchronous so it never dispatches on host -- see the Case A test's
+	// own comment). It instead constructs the exact STATE endCall() branches
+	// on: a session that isAnchor() with its participant id already bound
+	// (originateAnchorCall()'s sync path sets both before ANY bridge exists;
+	// same "bind lands before the bridge" ordering as the async worker,
+	// verified against RequestsHandler.cpp directly), and NO active bridge
+	// for its Call-ID -- by stopping the one the sync dial-in path creates
+	// alongside it, so this exercises the fallback rather than the primary
+	// bridge-found path it sits beside.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-379b"));
+	ASSERT_FALSE(sent.empty());
+	ASSERT_NE(sent.front().second->toString().find("SIP/2.0 200 OK"), std::string::npos);
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-379b").has_value());
+	EXPECT_EQ(handler.getSession("Call-ID: anchor-379b").value()->getAnchorParticipantId(),
+		"mock-part-123") << "originateAnchorCall()'s sync path must have bound the leg id "
+		"onto the session already, same as the async worker does before any bridge exists";
+
+	// Simulate "torn down before it bridged": stop the bridge the dial-in
+	// flow created, WITHOUT going through BYE/CANCEL (which would call
+	// endCall() itself and erase the session before this test gets to
+	// exercise it). This leaves isForCallId() false for every slot, exactly
+	// the state a CANCEL arriving before Answered would find -- while the
+	// session, its anchor flag and its participant id are all untouched,
+	// exactly as endCall() finds them for a session it has not yet erased.
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-379b");
+	ASSERT_NE(bridge, nullptr);
+	bridge->stopBridge();
+	ASSERT_FALSE(bridge->isActive());
+
+	// LoopbackAnchorClient::dropCall() delivers its Dropped event on a spawned
+	// thread (LoopbackAnchorClient.cpp) -- same poll-with-deadline pattern as
+	// AnchorClient_test.cpp's DropCallDeliversDroppedEvent. This OVERWRITES
+	// the handler's own anchor event callback (set in its constructor), which
+	// is fine here: everything that callback would have routed for this test
+	// already happened above (the dial-in's own Answered-equivalent), and the
+	// only anchor event left to observe is the one this test triggers.
+	std::atomic<bool> gotDrop{false};
+	std::string droppedParticipantId;
+	handler.anchorClientForTest()->setEventCallback(
+		[&gotDrop, &droppedParticipantId](const AnchorClient::CallEvent& ev) {
+			if (ev.type == AnchorClient::CallEvent::Dropped)
+			{
+				droppedParticipantId = ev.participantId;
+				gotDrop = true;
+			}
+		});
+
+	// The teardown that races in before the leg ever bridged. A real CANCEL
+	// mid-ring would arrive as onCancel(); a BYE exercises the identical
+	// endCall() code path this test targets, and is what ByeReleasesTheBridge...
+	// above already uses for the ordinary case.
+	sent.clear();
+	handler.handle(makeBye("501", "555", "192.168.9.51", "anchor-379b"));
+
+	bool sawOk = false;
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		if (msg && msg->toString().find("SIP/2.0 200 OK") != std::string::npos) sawOk = true;
+	}
+	EXPECT_TRUE(sawOk) << "the teardown request itself must still be answered";
+	EXPECT_FALSE(handler.getSession("Call-ID: anchor-379b").has_value());
+
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+	while (!gotDrop.load() && std::chrono::steady_clock::now() < deadline)
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+	EXPECT_TRUE(gotDrop.load())
+		<< "endCall() found no active bridge and must have fallen back to the "
+		"session's own getAnchorParticipantId() to drop the orphaned leg (#379 "
+		"Case B) -- without that fallback nothing here ever calls dropCall(), "
+		"and the leg is exactly the one left live on hardware";
+	if (gotDrop.load())
+	{
+		EXPECT_EQ(droppedParticipantId, "mock-part-123")
+			<< "must drop the SAME leg the sync path bound, not a stale or empty id";
+	}
+}
+
+TEST(AnchorRouting, TeardownThatAlreadyDroppedTheLegDoesNotDropItAgain)
+{
+	// Issue #379 follow-up. The test above pins that endCall() drops a leg no
+	// bridge dropped. The converse must hold too: a teardown path that has
+	// ALREADY dropped the leg itself must not have endCall() drop it again.
+	// Several anchor teardowns (this degraded-audio sweep, the no-answer
+	// reaps, inbound all-busy, and the CallEvent::Dropped handler for every
+	// far-end hangup) stop the bridge, drop the leg or learn 3CX already did,
+	// THEN call endCall(). With the bridge already stopped, endCall()'s bridge
+	// loop matches nothing, so a fallback keyed only on "no bridge dropped"
+	// drops the same leg a second time: on hardware a second 12 KB worker plus
+	// a TLS round trip, under the heap pressure these bugs live in (#328).
+	//
+	// The Dropped handler itself cannot run here (it is wired only for a
+	// non-synchronous anchor -- see RequestsHandler's constructor), so this
+	// drives the degraded-audio sweep, which is reachable on host and shares
+	// the exact shape: stopBridge(); asyncDropCall(part); endCall().
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-379c"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-379c",
+		/*cseq=*/2, "a=sendonly\r\n"));
+
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-379c");
+	ASSERT_NE(bridge, nullptr);
+	ASSERT_TRUE(bridge->isHeld());
+	const std::vector<uint8_t> tick(160, 0xFF);
+	bridge->feedMohTick(tick.data(), tick.size());   // "has worked at least once"
+
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr) << "host suite is expected to boot the Loopback anchor";
+	loop->stop();   // dead anchor connection -> writes fail -> degraded
+	for (int i = 0; i < 30; ++i) bridge->feedMohTick(tick.data(), tick.size());
+	ASSERT_TRUE(bridge->isAudioDegraded());
+
+	const unsigned before = loop->dropCallCount();
+	handler.tick();
+	ASSERT_FALSE(handler.getSession("Call-ID: anchor-379c").has_value());
+
+	// The sweep's own drop runs on a host anchor worker thread; give it, and
+	// any (wrong) second drop, time to land before counting.
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), before + 1)
+		<< "the sweep dropped the leg, then endCall()'s fallback dropped it again";
 }
 
 TEST(AnchorRouting, PcmaOnlyOfferGets488NotABridgeItCannotDecode)

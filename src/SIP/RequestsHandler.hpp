@@ -527,6 +527,16 @@ public:
 	// see that accessor's comment. Not compiled into device firmware.
 	AnchorClient* anchorClientForTest() { return _anchorClient; }
 
+	// Test-only: exercise bindOutboundParticipant()'s return value (issue #379)
+	// without the async worker. The host suite boots Loopback, whose makeCall()
+	// is synchronous, so the asyncMakeCall() worker that acts on this signal is
+	// never spawned in a host test; the signal itself is pinned here. Not
+	// compiled into device firmware.
+	bool bindOutboundParticipantForTest(const std::string& callId, const std::string& ownLeg)
+	{
+		return bindOutboundParticipant(callId, ownLeg);
+	}
+
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned)
 	{
@@ -1411,8 +1421,12 @@ private:
 	// to its session, so the CallEvent::Answered/Dropped callback can match this
 	// call even with several outbound anchor calls in flight. Takes _mutex itself
 	// (called from the async worker, off the SIP thread, never while _mutex is
-	// already held).
-	void bindOutboundParticipant(const std::string& callId, const std::string& ownLeg);
+	// already held). Returns false when no anchor session exists for callId
+	// any more (issue #379: the handset CANCELled during the makeCall() round
+	// trip and endCall() already erased it) -- the caller must then drop
+	// ownLeg on the anchor, or it lives on as a billable leg with no local
+	// party.
+	bool bindOutboundParticipant(const std::string& callId, const std::string& ownLeg);
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32)
 	// Host-only worker-thread pool backing the async wrappers above (mirrors

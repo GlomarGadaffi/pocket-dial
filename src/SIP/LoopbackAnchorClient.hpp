@@ -56,12 +56,20 @@ public:
 		return _lastMakeCallDestination;
 	}
 
+	// Test hook (Issue #379): how many times dropCall() has been CALLED,
+	// counted on entry whether or not this client is connected. On hardware
+	// each call is a 12 KB worker plus a TLS round trip regardless of outcome,
+	// so a leg must be dropped exactly once -- a host test needs the count, not
+	// just "some drop happened".
+	unsigned dropCallCount() const { return _dropCallCount.load(); }
+
 private:
 	std::string _baseUrl;
 	std::string _clientId;
 	std::string _sourceDn;
 
 	std::atomic<bool> _connected{false};
+	std::atomic<unsigned> _dropCallCount{0};
 	std::string _activeParticipantId;
 	std::string _lastMakeCallDestination;
 

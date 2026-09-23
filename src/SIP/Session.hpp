@@ -151,6 +151,11 @@ public:
 	void setUacBranch(const std::string& branch) { _uacBranch = branch; }
 	const std::string& getAnchorParticipantId() const { return _anchorParticipantId; }
 	void setAnchorParticipantId(const std::string& id) { _anchorParticipantId = id; }
+	// Issue #379: set by a teardown path that has already dropped this far leg
+	// itself, or learned the upstream did (CallEvent::Dropped). endCall()'s
+	// no-bridge fallback skips a released leg, so every leg is dropped once.
+	bool isAnchorLegReleased() const { return _anchorLegReleased; }
+	void setAnchorLegReleased() { _anchorLegReleased = true; }
 
 	const std::vector<std::shared_ptr<SipClient>>& getPendingTargets() const { return _pendingTargets; }
 	void setPendingTargets(std::vector<std::shared_ptr<SipClient>> targets) { _pendingTargets = std::move(targets); }
@@ -305,6 +310,7 @@ private:
 	std::string _remoteTag;            // handset To-tag (inbound anchor leg)
 	std::string _uacBranch;            // our INVITE Via branch (inbound anchor leg)
 	std::string _anchorParticipantId;  // upstream participant id (either anchor direction)
+	bool _anchorLegReleased = false;   // far leg already dropped (#379)
 	std::vector<std::shared_ptr<SipClient>> _pendingTargets;
 	std::shared_ptr<SipMessage> _inviteMessage;
 

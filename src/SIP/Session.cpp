@@ -25,6 +25,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_remoteTag.clear();
 	_uacBranch.clear();
 	_anchorParticipantId.clear();
+	_anchorLegReleased = false;
 	_pendingTargets.clear();
 	_inviteMessage.reset();
 	_ringTimerArmed = false;
@@ -147,6 +148,7 @@ void Session::release()
 	_remoteTag.clear();
 	_uacBranch.clear();
 	_anchorParticipantId.clear();
+	_anchorLegReleased = false;
 	_pendingTargets.clear();
 	_inviteMessage.reset();
 	_ringTimerArmed = false;
