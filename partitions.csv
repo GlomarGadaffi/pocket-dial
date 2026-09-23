@@ -8,8 +8,8 @@
 #     slot is active and the rollback/validation state.
 #   * Two equal app slots (ota_0 / ota_1) enable A/B updates with rollback.
 #     6MB each is 4x the current ~1.5MB display image — generous headroom for
-#     UI growth while leaving ~3.8MB of flash free at the top (ends at 0xC20000,
-#     well within the 16MB / 0x1000000 device).
+#     UI growth. ota_1 ends at 0xC20000; everything above it is now allocated
+#     (prompts + cfgseed, below), so the top of flash has NO free space left.
 #   * App slots are 64KB-aligned (a hard requirement for app partitions on the
 #     ESP32-S3 because of the MMU flash-mapping granularity); otadata/phy are
 #     4KB-aligned (the flash sector size).
@@ -57,10 +57,23 @@
 #     missing cfgseed partition is the NORMAL case, not an error — applyFlashSeed()
 #     returns false silently and the device keeps its NVS-stored configuration.
 #
+#   * coredump (Issue #382): the panic handler's ELF coredump
+#     (CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH in sdkconfig.defaults). It sits in the
+#     gap that was already unallocated between phy_init (ends 0x12000) and ota_0
+#     (starts 0x20000, 64KB-aligned) -- 0xE000 = 56KB -- so every other partition
+#     keeps its exact offset and size and this is OTA-compatible in both
+#     directions. Same missing-partition contract as cfgseed: a board flashed
+#     before this table simply has no coredump partition, and IDF treats that as
+#     "coredumps unavailable", not as an error. A dump LARGER than the partition
+#     is abandoned whole, not truncated (see sdkconfig.defaults), so if 56KB
+#     proves too small the fix is to carve space from the front of prompts,
+#     which nothing reads yet.
+#
 # Name,     Type, SubType,  Offset,    Size
 nvs,        data, nvs,      0x9000,    0x6000
 otadata,    data, ota,      0xf000,    0x2000
 phy_init,   data, phy,      0x11000,   0x1000
+coredump,   data, coredump, 0x12000,   0xE000
 ota_0,      app,  ota_0,    0x20000,   0x600000
 ota_1,      app,  ota_1,    0x620000,  0x600000
 prompts,    data, 0x40,     0xC20000,  0x3DF000
