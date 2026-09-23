@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "LoopbackAnchorClient.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
 
@@ -350,6 +351,60 @@ TEST(AnchorRouting, EndCallDropsTheOrphanedLegWhenTornDownBeforeAnyBridgeExisted
 		EXPECT_EQ(droppedParticipantId, "mock-part-123")
 			<< "must drop the SAME leg the sync path bound, not a stale or empty id";
 	}
+}
+
+TEST(AnchorRouting, TeardownThatAlreadyDroppedTheLegDoesNotDropItAgain)
+{
+	// Issue #379 follow-up. The test above pins that endCall() drops a leg no
+	// bridge dropped. The converse must hold too: a teardown path that has
+	// ALREADY dropped the leg itself must not have endCall() drop it again.
+	// Several anchor teardowns (this degraded-audio sweep, the no-answer
+	// reaps, inbound all-busy, and the CallEvent::Dropped handler for every
+	// far-end hangup) stop the bridge, drop the leg or learn 3CX already did,
+	// THEN call endCall(). With the bridge already stopped, endCall()'s bridge
+	// loop matches nothing, so a fallback keyed only on "no bridge dropped"
+	// drops the same leg a second time: on hardware a second 12 KB worker plus
+	// a TLS round trip, under the heap pressure these bugs live in (#328).
+	//
+	// The Dropped handler itself cannot run here (it is wired only for a
+	// non-synchronous anchor -- see RequestsHandler's constructor), so this
+	// drives the degraded-audio sweep, which is reachable on host and shares
+	// the exact shape: stopBridge(); asyncDropCall(part); endCall().
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-379c"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-379c",
+		/*cseq=*/2, "a=sendonly\r\n"));
+
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-379c");
+	ASSERT_NE(bridge, nullptr);
+	ASSERT_TRUE(bridge->isHeld());
+	const std::vector<uint8_t> tick(160, 0xFF);
+	bridge->feedMohTick(tick.data(), tick.size());   // "has worked at least once"
+
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr) << "host suite is expected to boot the Loopback anchor";
+	loop->stop();   // dead anchor connection -> writes fail -> degraded
+	for (int i = 0; i < 30; ++i) bridge->feedMohTick(tick.data(), tick.size());
+	ASSERT_TRUE(bridge->isAudioDegraded());
+
+	const unsigned before = loop->dropCallCount();
+	handler.tick();
+	ASSERT_FALSE(handler.getSession("Call-ID: anchor-379c").has_value());
+
+	// The sweep's own drop runs on a host anchor worker thread; give it, and
+	// any (wrong) second drop, time to land before counting.
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), before + 1)
+		<< "the sweep dropped the leg, then endCall()'s fallback dropped it again";
 }
 
 TEST(AnchorRouting, PcmaOnlyOfferGets488NotABridgeItCannotDecode)

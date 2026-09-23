@@ -477,6 +477,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 					{
 						if (!session->isAnchor()) continue;
 						if (session->getAnchorParticipantId() != ev.participantId) continue;
+						session->setAnchorLegReleased();   // 3CX already dropped it (#379)
 
 						if (MediaBridge* b = bridgeForParticipant(ev.participantId)) b->stopBridge();
 						const std::string activeIp = _localIp;
@@ -4724,6 +4725,7 @@ void RequestsHandler::onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, c
 		                          std::string(ok->getTo()));
 		if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
 		asyncDropCall(session->getAnchorParticipantId());
+		session->setAnchorLegReleased();   // #379: endCall() must not drop it again
 		endCall(callId, session->getSrc() ? session->getSrc()->getNumber() : "", handset->getNumber(),
 		        "inbound bridge failed");
 		return;
@@ -4933,6 +4935,7 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 			if (s->getPendingTargets().empty())
 			{
 				asyncDropCall(s->getAnchorParticipantId());
+				s->setAnchorLegReleased();   // #379: endCall() must not drop it again
 				endCall(std::string(data->getCallID()), s->getAnchorParticipantId(), "",
 					"inbound all busy/declined");
 			}
@@ -5075,6 +5078,7 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 			if (s->getPendingTargets().empty())
 			{
 				asyncDropCall(s->getAnchorParticipantId());
+				s->setAnchorLegReleased();   // #379: endCall() must not drop it again
 				endCall(std::string(data->getCallID()), s->getAnchorParticipantId(), "",
 					"inbound all unavailable");
 			}
@@ -6848,6 +6852,7 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	// the moment this dialog actually ended.
 	const bool endingWasAnchor = ending && ending->isAnchor();
 	const std::string endingAnchorParticipantId = ending ? ending->getAnchorParticipantId() : std::string();
+	const bool endingAnchorLegReleased = ending && ending->isAnchorLegReleased();
 
 	if (_sessions.erase(std::string(callID)) > 0)
 	{
@@ -6947,7 +6952,17 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 		// Reads the SNAPSHOT taken before this function's _sessionPool loop
 		// (above) could have already called release() on this same object and
 		// cleared both fields -- see that snapshot's own comment.
-		if (!droppedViaBridge && _anchorClient && endingWasAnchor)
+		//
+		// Skipped when the caller already released the leg. Most anchor
+		// teardowns (the CallEvent::Dropped handler, the no-answer reaps,
+		// inbound busy/unavailable/bridge-failed, the degraded-audio sweep)
+		// stop the bridge and drop the leg -- or learn 3CX already did --
+		// BEFORE calling endCall(); the stopped bridge makes droppedViaBridge
+		// false above, so without this gate every one of them dropped the same
+		// leg twice. A path that drops the leg itself must also call
+		// setAnchorLegReleased(); one that forgets double-drops, and logs it
+		// with the line below, rather than orphaning a billable leg in silence.
+		if (!droppedViaBridge && !endingAnchorLegReleased && _anchorClient && endingWasAnchor)
 		{
 			const std::string& fallbackParticipantId = endingAnchorParticipantId;
 			if (!fallbackParticipantId.empty())
@@ -8176,6 +8191,7 @@ void RequestsHandler::tick()
 					if (cancel) _outbox.emplace_back(target->getAddress(), std::move(cancel));
 				}
 				asyncDropCall(session->getAnchorParticipantId());
+				session->setAnchorLegReleased();   // #379: endCall() must not drop it again
 				queueLog("[Telephony] Inbound: no answer from " +
 				         std::to_string(session->getPendingTargets().size()) + " extension(s) — cancelled");
 				endCall(callID, session->getAnchorParticipantId(), "", "inbound no answer");
@@ -8202,6 +8218,7 @@ void RequestsHandler::tick()
 				}
 				if (b) b->stopBridge();
 				if (!part.empty()) asyncDropCall(part);
+				session->setAnchorLegReleased();   // #379: endCall() must not drop it again
 				const bool stillRinging = (session->getState() == Session::State::Invited);
 				if (stillRinging && session->getInviteMessage())
 				{
@@ -8374,6 +8391,7 @@ void RequestsHandler::tick()
 			}
 			if (b) b->stopBridge();
 			if (!part.empty()) asyncDropCall(part);
+			session->setAnchorLegReleased();   // #379: endCall() must not drop it again
 			queueLog("[Telephony] anchor call torn down: audio write repeatedly failed — dropped leg " + part);
 
 			// Issue #279: this branch dropped the ANCHOR side (asyncDropCall) and

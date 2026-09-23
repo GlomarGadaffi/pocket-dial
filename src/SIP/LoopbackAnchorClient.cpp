@@ -217,6 +217,7 @@ void LoopbackAnchorClient::simulateInboundCall(const std::string& callerId)
 
 bool LoopbackAnchorClient::dropCall(const std::string& participantId)
 {
+	_dropCallCount++;   // every ATTEMPT, connected or not -- see dropCallCount()
 	if (!_connected)
 	{
 		return false;
