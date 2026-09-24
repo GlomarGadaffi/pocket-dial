@@ -634,6 +634,47 @@ TEST(AnchorRouting, HoldOnTheAnchorLegIsAnsweredNotRefused)
 	EXPECT_EQ(session.value()->getState(), Session::State::Held);
 }
 
+// Issue #445 (the #425 rule): the hold answer is a 2xx to a target-refresh
+// request, so its Contact becomes the phone's new remote target.
+// answerAnchorReinvite() built it by cloning the request, which carried the
+// PHONE's own Contact: after one hold the phone targeted itself and its BYE
+// looped back to its own socket. It must present the board exactly as the
+// setup 200 did.
+TEST(AnchorRouting, HoldAnswerOnTheAnchorLegPresentsTheBoardNotThePhone)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	auto contactOf = [](const std::shared_ptr<SipMessage>& m) {
+		const std::string raw = m ? m->toString() : std::string{};
+		const size_t at = raw.find("\r\nContact:");
+		if (at == std::string::npos) return std::string{};
+		const size_t eol = raw.find("\r\n", at + 2);
+		return raw.substr(at + 2, eol - (at + 2));
+	};
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-contact"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+	const std::string setupContact = contactOf(sent.front().second);
+	ASSERT_NE(setupContact.find("192.168.9.1:5060"), std::string::npos)
+		<< "precondition: the setup 200 presents the board, got: " << setupContact;
+
+	sent.clear();
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-contact",
+		/*cseq=*/2, "a=sendonly\r\n"));
+	ASSERT_FALSE(sent.empty());
+	const std::string holdContact = contactOf(sent.front().second);
+	EXPECT_EQ(holdContact, setupContact)
+		<< "#445: the hold answer must present the board with the setup identity";
+	EXPECT_EQ(holdContact.find("192.168.9.51"), std::string::npos)
+		<< "#445: echoing the phone's own Contact repoints the phone's dialog at itself";
+}
+
 TEST(AnchorRouting, ResumingTheAnchorLegClearsHeldStateAndRestoresTheHandsetPath)
 {
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
