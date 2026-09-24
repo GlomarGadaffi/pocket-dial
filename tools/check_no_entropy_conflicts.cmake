@@ -48,6 +48,13 @@ foreach(sym IN LISTS forbidden)
     endif()
 endforeach()
 
+if(NOT found)
+    # Printed on success so a build log PROVES the check ran: a POST_BUILD
+    # command is folded into the link step, and its COMMENT never appears.
+    list(LENGTH forbidden n_forbidden)
+    message(STATUS "Issue #420: eth image links no ADC/RF driver -- ${n_forbidden} entry points checked, 0 present (CHECK_I2S=${CHECK_I2S})")
+endif()
+
 if(found)
     list(JOIN found ", " found_str)
     message(FATAL_ERROR
