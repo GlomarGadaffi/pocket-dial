@@ -43,6 +43,7 @@
 #include "Session.hpp"
 #include "CallDetailRecord.hpp"
 #include "PcapCapture.hpp"
+#include "DropProbe.hpp"   // Issue #430: per-reason drop counts + recent-drop ring
 #include "PbxConfig.hpp"
 #include "DialPlan.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: pbx::EmergencyDial
@@ -154,6 +155,21 @@ public:
 	void forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
+	// Issue #430: packetsDropped split by reason (their sum), and the probe
+	// itself for its recent-drop ring (read with window()/at(); thread-safe,
+	// allocation-free on both sides).
+	uint64_t getDroppedInvalid() const;
+	uint64_t getDroppedRate() const;
+	const DropProbe& getDropProbe() const;
+	// Issue #443/#444: discards made BEFORE handle() sees a datagram -- by the
+	// UDP receive loop (oversize, empty, a failed receive) or by SipServer when
+	// the message pool is spent. Called on the receive task; never allocates or
+	// logs. An empty datagram counts as Invalid AND in packetsDropped, so #430's
+	// "invalid + rate == packetsDropped" still holds; NoPool and Oversize have
+	// their own counts, outside packetsDropped (which is handle()'s refusals).
+	void noteRxDiscard(DropProbe::Reason reason, const sockaddr_in& src,
+	                   std::string_view bytes, size_t fullLen);
+	void noteRecvError(int err);
 	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
 	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
@@ -1896,6 +1912,7 @@ private:
 
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
+	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing

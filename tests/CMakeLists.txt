@@ -410,6 +410,10 @@ add_executable(sip_parser_tests
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
     # PcapCapture.hpp has no dependency beyond sockaddr_in.
     PcapCapture_test.cpp
+    DropProbe_test.cpp
+    # Issues #443/#444: SIP receive-path discards (oversize via recvmsg+MSG_TRUNC,
+    # empty, failed receives, pool exhaustion) are counted, never silent.
+    SipRxDiscards_test.cpp
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
     ProvisioningConfig_test.cpp
@@ -561,6 +565,11 @@ add_executable(sip_parser_tests
     # into its own translation unit.
     ../src/SIP/CallPickup.cpp
     ../src/SIP/RequestsHandler.cpp
+    # Issues #443/#444: the UDP receive loop and SipServer's hand-off, linked for
+    # SipRxDiscards_test.cpp (real loopback socket, end to end).
+    ../src/Helpers/UdpServer.cpp
+    ../src/SIP/SipServer.cpp
+    ../src/SIP/SipMessageFactory.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp
     ../src/SIP/RegisterBeeper.cpp

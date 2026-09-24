@@ -14,7 +14,10 @@
 #endif
 
 SipServer::SipServer(std::string ip, int port, int httpPort) :
-	_socket(ip, port, std::bind(&SipServer::onNewMessage, this, std::placeholders::_1, std::placeholders::_2)),
+	_socket(ip, port, std::bind(&SipServer::onNewMessage, this, std::placeholders::_1, std::placeholders::_2),
+		[this](UdpServer::Discard what, std::string_view bytes, sockaddr_in src, size_t fullLen, int err) {
+			onDiscard(what, bytes, src, fullLen, err);
+		}),
 	_handler(ip, port, std::bind(&SipServer::onHandled, this, std::placeholders::_1, std::placeholders::_2))
 {
 	(void)httpPort;
@@ -72,6 +75,30 @@ void SipServer::onNewMessage(std::string_view data, sockaddr_in src)
 	if (message.has_value())
 	{
 		_handler.handle(std::move(message.value()), data);
+	}
+	else
+	{
+		// Issue #443 S1: createMessage() fails only when the message pool and
+		// its bounded heap fallback are spent. The datagram is gone -- count it
+		// (it never reaches handle(), so packetsDropped cannot see it).
+		_handler.noteRxDiscard(DropProbe::Reason::NoPool, src, data, data.size());
+	}
+}
+
+void SipServer::onDiscard(UdpServer::Discard what, std::string_view bytes, sockaddr_in src,
+                          size_t fullLen, int err)
+{
+	switch (what)
+	{
+		case UdpServer::Discard::Oversize:
+			_handler.noteRxDiscard(DropProbe::Reason::Oversize, src, bytes, fullLen);
+			break;
+		case UdpServer::Discard::Empty:
+			_handler.noteRxDiscard(DropProbe::Reason::Invalid, src, bytes, 0);
+			break;
+		case UdpServer::Discard::RecvError:
+			_handler.noteRecvError(err);
+			break;
 	}
 }
 

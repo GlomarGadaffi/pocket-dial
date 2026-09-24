@@ -5,6 +5,6 @@
 # total in the same PR. When it removes tests on purpose, lower it -- the
 # reduction then shows up in the diff instead of passing silently.
 #
-# Set to the count on main @ 5f5f0b1 (after #394's CoreDumpHttp tests):
-# 1244 tests from 173 suites.
-1244
+# Raised by #447 (#430 drop probe): main @ 8d76d64 runs 1249 (BigDog), + 7 new tests.
+# Set by #443/#444 (+6 tests), stacked on #447 (1256): 1262 tests.
+1262
