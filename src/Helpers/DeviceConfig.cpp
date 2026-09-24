@@ -100,6 +100,32 @@ namespace
 	// through writeRegistrarMode() above instead of erasing the key.)
 #endif
 
+	// Schema v1 -> v2 (#397, #441 review). Before #397 an absent reg_mode meant
+	// Open; from v2 it means Learn (Registrar::chooseBootMode). A v1 board with
+	// no key is therefore a DEPLOYED board running Open, and it must keep doing
+	// so: write Open explicitly. A board that already has a key is left alone.
+	// Returns false on any NVS failure, so runSchemaMigrations() does not stamp
+	// v2 and the step is retried next boot -- meanwhile the board boots Learn,
+	// which is the safe side of the choice.
+	bool migrateKeepPre397BoardOpen(void* /*ctx*/)
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		nvs_handle_t rh;
+		if (nvs_open(DeviceConfig::kRegistrarNvsNamespace, NVS_READWRITE, &rh) != ESP_OK)
+		{
+			return false;
+		}
+		uint8_t v = 0;
+		const esp_err_t err = nvs_get_u8(rh, kKeyRegMode, &v);
+		nvs_close(rh);
+		if (err == ESP_OK) return true;                  // an explicit mode stands
+		if (err != ESP_ERR_NVS_NOT_FOUND) return false;  // unreadable: retry next boot
+		return writeRegistrarMode(0 /* Registrar::Mode::Open */);
+#else
+		return true;   // host: no NVS, and the host never runs a migration anyway
+#endif
+	}
+
 	// Alphabet size, computed rather than written as a literal: the modulo-bias
 	// rejection threshold below depends on it, and a hand-copied constant that
 	// drifts from kPskAlphabet would silently reintroduce the bias.
@@ -887,22 +913,29 @@ namespace DeviceConfig
 #endif
 	}
 
-	void clearAll()
+	bool clearAll()
 	{
 		ConfigState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
+		bool ok = true;
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		nvs_handle_t h;
 		if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
 		{
-			nvs_erase_key(h, kKeyApSecure);
-			nvs_erase_key(h, kKeyApPsk);
+			// An absent key is the desired end state, so NOT_FOUND is success.
+			auto erased = [](esp_err_t e) { return e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND; };
+			ok = erased(nvs_erase_key(h, kKeyApSecure)) && ok;
+			ok = erased(nvs_erase_key(h, kKeyApPsk)) && ok;
 			// Dropping cfgseed_gen is deliberate — see DeviceConfig.hpp: the next
 			// boot re-applies the flash-time seed, so "factory" means "as flashed".
-			nvs_erase_key(h, kKeySeedGen);
-			nvs_commit(h);
+			ok = erased(nvs_erase_key(h, kKeySeedGen)) && ok;
+			ok = (nvs_commit(h) == ESP_OK) && ok;
 			nvs_close(h);
+		}
+		else
+		{
+			ok = false;
 		}
 
 		// The registrar admission mode goes too. This key belongs to Registrar,
@@ -923,7 +956,12 @@ namespace DeviceConfig
 		// existing deployment and keep it open; a factory reset must come back
 		// like a fresh install instead. Learn still performs the rescue above --
 		// it accepts every first REGISTER -- so nothing is lost by writing it.
-		writeRegistrarMode(1 /* Registrar::Mode::Learn */);
+		//
+		// #441 review: the result is reported. With the v2 schema a failed write
+		// can no longer end in Open (no key boots learn), but it CAN leave an old
+		// `secure` in place -- the lockout this reset exists to rescue -- so the
+		// operator must be told.
+		ok = writeRegistrarMode(1 /* Registrar::Mode::Learn */) && ok;
 #endif
 
 		s.apSecure = false;
@@ -938,6 +976,7 @@ namespace DeviceConfig
 		// future v3 firmware re-run the 1->2->3 migrations over data that is
 		// already v3. The stamp describes the layout, not the contents, and a
 		// factory reset does not change the layout.
+		return ok;
 	}
 
 	// =====================================================================
@@ -1033,17 +1072,17 @@ namespace DeviceConfig
 
 	const SchemaMigration* schemaMigrations(size_t* count)
 	{
-		// Empty on purpose. kSchemaVersion is 1: there is no earlier layout to
-		// come from, so any row here would be a speculative, untested,
-		// flash-mutating code path shipped to production. The dispatch in
-		// runSchemaMigrations() is fully exercised by the host tests against
-		// synthetic tables instead, so adding the first real row is a two-line
-		// change to this function and nothing else.
+		// One row per real change of meaning, never a speculative one. The
+		// dispatch in runSchemaMigrations() is exercised by the host tests
+		// against synthetic tables; the NVS body of each row is ESP-only.
+		static const SchemaMigration kTable[] = {
+			{1, 2, &migrateKeepPre397BoardOpen, "reg_mode: keep a pre-#397 board open"},
+		};
 		if (count != nullptr)
 		{
-			*count = 0;
+			*count = sizeof(kTable) / sizeof(kTable[0]);
 		}
-		return nullptr;
+		return kTable;
 	}
 
 	bool runSchemaMigrations(uint16_t from, uint16_t to,

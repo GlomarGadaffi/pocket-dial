@@ -3484,7 +3484,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// deliberate: the next boot re-applies whatever the flasher wrote, so a
 	// factory reset returns the board to how it was FLASHED rather than to a
 	// hardcoded default the operator never chose.
-	DeviceConfig::clearAll();
+	const bool deviceConfigCleared = DeviceConfig::clearAll();   // #441 review: reported below
 	// Also wipe the Telephony-API credential slots ("tapicfg") and the DID ->
 	// extension table ("didmap") -- both live in their OWN NVS namespace /
 	// host-file specifically so that clearing the device's own settings would NOT
@@ -3595,6 +3595,20 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// concludes nothing happened. Report the outcome truthfully everywhere; only
 	// the follow-up instruction differs, because only the radio builds come back to
 	// a captive portal.
+	// #441 review: a device-settings reset that FAILED is not a completed reset.
+	// The one that matters is reg_mode: a failed write can leave an old `secure`
+	// in place, the lockout this reset exists to rescue. Same shape as #437's
+	// secret-store check: one fixed literal (no string building on the HTTP task,
+	// #284), and the board still restarts -- staying up half-reset helps nobody.
+	if (!deviceConfigCleared)
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the device settings "
+		             "(AP password, registrar mode) could not be reset. Rebooting anyway; run the factory "
+		             "reset again after setup.\"}");
+	}
+	else
+	{
 #if defined(POCKETDIAL_HAS_WIFI)
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"message\":\"Factory reset. Rebooting to captive-portal setup...\"}");
@@ -3611,6 +3625,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"message\":\"Factory reset. Restart the process to complete.\"}");
 #endif
+	}
 #if defined(ESP_PLATFORM)
 	// Guarded on the platform, not the transport: esp_restart() and the deferred
 	// restart task exist on every ESP build (see the include block at the top of

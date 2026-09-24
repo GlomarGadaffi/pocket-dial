@@ -19,7 +19,7 @@
 // That split is the same lesson #151 taught: logic buried in the device branch
 // shipped inert through two releases because nothing could run it.
 //
-// Why `current` is a parameter of planSchema(): with kSchemaVersion pinned at 1,
+// Why `current` is a parameter of planSchema(): with kSchemaVersion at 1 (as it was),
 // "treat legacy data as v1" and "stamp a blank device with current" produce the
 // identical number, so a test against the shipped constant cannot distinguish a
 // correct implementation from one that conflates the two. Every case below that
@@ -109,16 +109,30 @@ TEST(SchemaVersion, LegacyDeviceIsAdoptedAsV1AndNeverWiped)
 
 TEST(SchemaVersion, LegacyDeviceOnBaselineFirmwareIsStampedWithoutMigrating)
 {
-	// The shipped configuration today: kSchemaVersion == 1, so adopting a legacy
-	// device converts nothing and only writes the stamp. This is the update path
-	// every deployed board takes on the release that introduces versioning, and
-	// it must not touch a single config key.
+	// Firmware whose current version IS the baseline (the release that
+	// introduced versioning, kSchemaVersion == 1): adopting a legacy device
+	// converts nothing and only writes the stamp. It must not touch a single
+	// config key.
+	const SchemaPlan plan = DeviceConfig::planSchema(
+		probeOf(false, 0, true), DeviceConfig::kSchemaBaselineVersion);
+
+	EXPECT_EQ(plan.outcome, SchemaOutcome::AdoptedLegacy);
+	EXPECT_EQ(plan.fromVersion, DeviceConfig::kSchemaBaselineVersion);
+	EXPECT_FALSE(plan.migrate);
+	EXPECT_TRUE(plan.stamp);
+}
+
+TEST(SchemaVersion, LegacyDeviceOnShippedFirmwareRunsTheV2Migration)
+{
+	// Shipped today (v2, #397/#441): a pre-versioning board is adopted as v1 and
+	// then MIGRATED, because v2 changed what an absent reg_mode means.
 	const SchemaPlan plan = DeviceConfig::planSchema(
 		probeOf(false, 0, true), DeviceConfig::kSchemaVersion);
 
 	EXPECT_EQ(plan.outcome, SchemaOutcome::AdoptedLegacy);
-	EXPECT_EQ(plan.fromVersion, DeviceConfig::kSchemaVersion);
-	EXPECT_FALSE(plan.migrate);
+	EXPECT_EQ(plan.fromVersion, DeviceConfig::kSchemaBaselineVersion);
+	EXPECT_EQ(plan.toVersion, 2);
+	EXPECT_TRUE(plan.migrate);
 	EXPECT_TRUE(plan.stamp);
 }
 
@@ -213,18 +227,35 @@ TEST(SchemaVersion, StampedZeroIsTreatedAsUnstamped)
 // Migration dispatch
 // =====================================================================
 
-TEST(SchemaVersion, ShippedTableIsEmptyAtVersionOne)
+TEST(SchemaVersion, ShippedTableIsExactlyTheRegModeRow)
 {
-	// Guard against speculative migrations. kSchemaVersion is 1: there is no
-	// earlier layout, so any row here would be untested flash-mutating code
-	// shipped to production for a change that has not happened.
+	// Guard against speculative migrations: the only row is v1 -> v2, the real
+	// change of meaning #397 made (an absent reg_mode: Open -> Learn). Its NVS
+	// body is ESP-only; this pins the table's shape.
 	size_t count = 12345;
 	const DeviceConfig::SchemaMigration* table = DeviceConfig::schemaMigrations(&count);
 
-	EXPECT_EQ(DeviceConfig::kSchemaVersion, 1);
+	EXPECT_EQ(DeviceConfig::kSchemaVersion, 2);
 	EXPECT_EQ(DeviceConfig::kSchemaBaselineVersion, 1);
-	EXPECT_EQ(count, 0u);
-	EXPECT_EQ(table, nullptr);
+	ASSERT_EQ(count, 1u);
+	ASSERT_NE(table, nullptr);
+	EXPECT_EQ(table[0].from, 1);
+	EXPECT_EQ(table[0].to, 2);
+	EXPECT_NE(table[0].fn, nullptr);
+}
+
+TEST(SchemaVersion, ShippedTableWalksBaselineToCurrentWithoutAGap)
+{
+	// A future kSchemaVersion bump that forgets its row fails here, on the host,
+	// instead of leaving every board unstamped (MigrationFailed) in the field.
+	resetRecorder();
+	size_t count = 0;
+	const DeviceConfig::SchemaMigration* table = DeviceConfig::schemaMigrations(&count);
+	uint16_t reached = 0;
+
+	EXPECT_TRUE(DeviceConfig::runSchemaMigrations(DeviceConfig::kSchemaBaselineVersion,
+		DeviceConfig::kSchemaVersion, table, count, nullptr, &recordStamp, &reached));
+	EXPECT_EQ(reached, DeviceConfig::kSchemaVersion);
 }
 
 TEST(SchemaVersion, ChainRunsInOrderAndStampsAfterEveryStep)
@@ -297,9 +328,8 @@ TEST(SchemaVersion, GapInTheTableFailsRatherThanSkipping)
 
 TEST(SchemaVersion, EmptyTableCannotSatisfyAMigration)
 {
-	// The shipped table is empty; if a future kSchemaVersion bump ever forgets
-	// its row, this is the behaviour that keeps the device honest rather than
-	// stamping it as converted.
+	// If a kSchemaVersion bump ever forgets its row, this is the behaviour that
+	// keeps the device honest rather than stamping it as converted.
 	resetRecorder();
 	uint16_t reached = 0;
 

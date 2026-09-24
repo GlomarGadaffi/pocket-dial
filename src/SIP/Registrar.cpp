@@ -31,14 +31,18 @@ void Registrar::setMode(Mode mode)
 
 Registrar::BootModeDecision Registrar::chooseBootMode(bool haveStored, Mode stored, BootSchema schema)
 {
+	// #441 review: NO path without a stored mode ends in Open. A missing key is
+	// what every failure looks like -- a persist that failed on a fresh board, a
+	// factory reset whose write failed, an unreadable store -- so it must mean
+	// the safe mode, never the permissive one. The existing deployments that
+	// must keep Open get it WRITTEN by the schema v1 -> v2 migration
+	// (DeviceConfig::schemaMigrations), which stamps v2 only once the write
+	// succeeded; they arrive here with haveStored == true.
 	if (haveStored) return {stored, false};
-	switch (schema)
-	{
-	case BootSchema::FreshInstall: return {Mode::Learn, true};
-	case BootSchema::Upgraded:     return {Mode::Open, true};
-	case BootSchema::Uncertain:    break;
-	}
-	return {Mode::Open, false};
+	// Learn, not Open: it still admits every first REGISTER, so phones keep
+	// working, but no board is left accepting anything forever. Persist only when
+	// the store is trusted; an uncertain one is re-decided on the next boot.
+	return {Mode::Learn, schema != BootSchema::Uncertain};
 }
 
 void Registrar::loadMode()
@@ -50,14 +54,24 @@ void Registrar::loadMode()
 	// app_main computes (DeviceConfig::ensureSchemaVersion) before the SIP task
 	// constructs this object.
 	nvs_handle_t h;
-	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+	const esp_err_t openErr = nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h);
+	if (openErr != ESP_OK)
 	{
-		return;   // keep the seed (Open); nothing can be persisted anyway
+		// #441 review: this used to return and keep the constructor's Open seed,
+		// so an unreadable store booted an open registrar. Learn, not persisted.
+		_mode.store(Mode::Learn, std::memory_order_relaxed);
+		_env.log(std::string("Registrar: cannot open NVS to read reg_mode (") + esp_err_to_name(openErr) +
+			"); booting learn, not saved (#441)", true);
+		return;
 	}
 	uint8_t v = 0;
-	esp_err_t err = nvs_get_u8(h, "reg_mode", &v);
+	const esp_err_t err = nvs_get_u8(h, "reg_mode", &v);
 	nvs_close(h);
 	const bool haveStored = (err == ESP_OK && v <= static_cast<uint8_t>(Mode::Secure));
+	if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
+	{
+		_env.log(std::string("Registrar: reading reg_mode failed (") + esp_err_to_name(err) + ")", true);
+	}
 
 	BootSchema schema = BootSchema::Uncertain;
 	switch (DeviceConfig::lastSchemaOutcome())
@@ -71,28 +85,51 @@ void Registrar::loadMode()
 
 	const BootModeDecision d = chooseBootMode(haveStored, static_cast<Mode>(v), schema);
 	_mode.store(d.mode, std::memory_order_relaxed);
-	if (d.persist)
+	if (haveStored) return;
+
+	if (!d.persist)
 	{
-		persistMode();
-		_env.log(std::string("Registrar: no stored mode; defaulted to ") +
-			(d.mode == Mode::Learn ? "learn (fresh install)" : "open (existing board, kept as-is)") +
-			" and saved it (#397)");
+		_env.log("Registrar: no stored mode and the schema is uncertain; booting learn, not saved (#441)", true);
+	}
+	else if (persistMode())
+	{
+		_env.log("Registrar: no stored mode; defaulted to learn and saved it (#397)");
+	}
+	else
+	{
+		// persistMode() logged the cause. Safe either way: with no key the next
+		// boot decides learn again (chooseBootMode never defaults to open).
+		_env.log("Registrar: no stored mode; booting learn, but saving it FAILED (#441)", true);
 	}
 #endif
 }
 
-void Registrar::persistMode()
+bool Registrar::persistMode()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// #441 review: every step is checked and a failure is logged with its cause.
 	nvs_handle_t h;
-	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
+	esp_err_t err = nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h);
+	const char* step = "nvs_open";
+	if (err == ESP_OK)
 	{
-		nvs_set_u8(h, "reg_mode",
-			static_cast<uint8_t>(_mode.load(std::memory_order_relaxed)));
-		nvs_commit(h);
+		err = nvs_set_u8(h, "reg_mode", static_cast<uint8_t>(_mode.load(std::memory_order_relaxed)));
+		step = "nvs_set_u8";
+		if (err == ESP_OK)
+		{
+			err = nvs_commit(h);
+			step = "nvs_commit";
+		}
 		nvs_close(h);
 	}
+	if (err != ESP_OK)
+	{
+		_env.log(std::string("Registrar: persisting reg_mode failed at ") + step + " (" +
+			esp_err_to_name(err) + ")", true);
+		return false;
+	}
 #endif
+	return true;
 }
 
 // ── REGISTER admission ────────────────────────────────────────────────────────
