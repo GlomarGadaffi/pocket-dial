@@ -287,12 +287,32 @@ class BaresipUA:
         self.sock = None
         self.rxbuf = b""
 
+    @staticmethod
+    def module_dir():
+        """Where this baresip's modules live, or None to use its built-in default.
+
+        The config must name it: without `module_path` Debian's baresip looks in
+        ./, loads nothing, never opens ctrl_tcp, and mixed_stack SKIPs exactly as
+        if baresip were absent.
+        """
+        import glob
+        for d in ["/usr/lib/baresip/modules", "/usr/local/lib/baresip/modules"] + \
+                 glob.glob("/usr/lib/*/baresip/modules"):
+            if os.path.isfile(os.path.join(d, "ctrl_tcp.so")):
+                return d
+        return None
+
     def write_config(self):
         os.makedirs(self.cfgdir, exist_ok=True)
-        cfg = "\n".join([
+        mdir = self.module_dir()
+        cfg = "\n".join(([("module_path\t\t%s" % mdir)] if mdir else []) + [
             "sip_listen\t\t%s:%d" % (self.ip, self.sip_port),
             "audio_player\t\taufile,%s" % os.path.join(self.cfgdir, "out.wav"),
             "audio_source\t\tausine,440",
+            # ausine only generates 48 kHz; without this the source fails to start
+            # against the 8 kHz PCMU codec and the call carries no RTP at all.
+            # Declaring the rate makes baresip resample 48k -> 8k.
+            "ausrc_srate\t\t48000",
             "audio_alert\t\taufile,%s" % os.path.join(self.cfgdir, "alert.wav"),
             "ctrl_tcp_listen\t\t%s:%d" % (PBX_IP, self.ctrl_port),
             "module\t\t\tstdio.so",
