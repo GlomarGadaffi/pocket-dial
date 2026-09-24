@@ -33,6 +33,7 @@
 #include "SipSecretStore.hpp"
 #include "TelephonyApiConfig.hpp"
 #include "TrunkConfigStore.hpp"
+#include "VoicemailArchive.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -125,6 +126,14 @@ namespace
 		a.csrf = AdminAuth::sessionCsrf(token);
 		return a;
 	}
+
+	// #450: counts wipes; a factory reset must wipe the SD voicemail archive.
+	struct VmWipeSpy : vmarchive::Sink
+	{
+		int wipes = 0;
+		void write(const vmarchive::QueuedRecording&, const uint8_t*) override {}
+		void wipe() override { ++wipes; }
+	};
 
 	std::vector<uint8_t> fakeDump()
 	{
@@ -293,6 +302,20 @@ TEST_F(FactoryResetSecretsTest, AFailedAdminCredentialEraseIsReportedAsAnError)
 	EXPECT_NE(resp.find("\"secrets\":false"), std::string::npos) << resp;
 	// The in-RAM credential is cleared regardless of what flash said.
 	EXPECT_FALSE(AdminAuth::isProvisioned());
+}
+
+TEST_F(FactoryResetSecretsTest, TheSdVoicemailArchiveIsWiped)
+{
+	// #450: recordings and greetings on the SD survived both reset doors; only
+	// the CDR archive was wiped.
+	VmWipeSpy spy;
+	_handler->setVoicemailSinkForTest(&spy);
+	const AdminSession s = bypassLogin();
+
+	ASSERT_EQ(statusOf(httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf)), 200);
+
+	EXPECT_EQ(spy.wipes, 1) << "the HTTP factory reset must wipe the SD voicemail archive";
+	_handler->setVoicemailSinkForTest(nullptr);
 }
 
 TEST(SipSecretStoreClearAll, RemovesEveryExtensionSecret)

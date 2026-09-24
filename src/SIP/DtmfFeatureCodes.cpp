@@ -242,6 +242,9 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 						// makes this path's wipe contract host-testable -- see
 						// DtmfFactoryReset_test.cpp.
 						cdrarchive::wipeAll();
+						// #450: voicemail recordings on the SD, same door, same reasoning as
+						// the CDR archive wipe just above (the thread is about to restart).
+						_env.wipeVoicemail();
 						// #437 review: the HTTP door erases the last coredump (a copy of
 						// task stacks, which can hold any secret in the clear), and
 						// nvs_flash_erase() below does not reach the coredump partition,

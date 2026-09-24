@@ -19,6 +19,7 @@
 #include "AdminAuth.hpp"
 #include "CdrArchive.hpp"
 #include "CoreDumpStore.hpp"
+#include "VoicemailArchive.hpp"
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
 
@@ -138,6 +139,14 @@ namespace
 {
 	// Same shape CoreDumpHttp_test/FactoryResetSecrets_test use: ELF magic at
 	// byte 12, which CoreDumpStore's "present" rule requires.
+	// #450: counts wipes; a factory reset must wipe the SD voicemail archive.
+	struct VmWipeSpy : vmarchive::Sink
+	{
+		int wipes = 0;
+		void write(const vmarchive::QueuedRecording&, const uint8_t*) override {}
+		void wipe() override { ++wipes; }
+	};
+
 	std::vector<uint8_t> fakeDump()
 	{
 		std::vector<uint8_t> img(256, 0x5A);
@@ -167,6 +176,24 @@ TEST_F(DtmfFactoryReset, AbortedConfirmKeepsTheCoredump)
 	sendDtmfSequence(*handler, "dtmf-437-abort", std::string("*") + kPin + "#9990");
 	EXPECT_TRUE(CoreDumpStore::query().present) << "an aborted reset must not erase the coredump";
 	CoreDumpStore::setImageForTest({});
+}
+
+TEST_F(DtmfFactoryReset, ConfirmedResetWipesTheSdVoicemailArchive)
+{
+	VmWipeSpy spy;
+	handler->setVoicemailSinkForTest(&spy);
+	sendDtmfSequence(*handler, "dtmf-450-vm", std::string("*") + kPin + "#9991");
+	EXPECT_EQ(spy.wipes, 1) << "*<PIN>#999#1 must wipe the SD voicemail archive, matching the HTTP reset";
+	handler->setVoicemailSinkForTest(nullptr);
+}
+
+TEST_F(DtmfFactoryReset, AbortedConfirmDoesNotWipeTheVoicemailArchive)
+{
+	VmWipeSpy spy;
+	handler->setVoicemailSinkForTest(&spy);
+	sendDtmfSequence(*handler, "dtmf-450-vm-abort", std::string("*") + kPin + "#9990");
+	EXPECT_EQ(spy.wipes, 0) << "an aborted reset must not wipe voicemail";
+	handler->setVoicemailSinkForTest(nullptr);
 }
 
 TEST_F(DtmfFactoryReset, AbortedConfirmDigitDoesNotWipe)

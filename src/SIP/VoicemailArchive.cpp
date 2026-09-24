@@ -6,7 +6,9 @@
 #include <cstring>
 
 #if defined(PD_ETH_HAS_SD)
+#include <dirent.h>     // wipe(): opendir/readdir (#450)
 #include <sys/stat.h>
+#include <unistd.h>     // wipe(): rmdir (#450)
 #include "PoolConfig.hpp"
 #endif
 
@@ -160,6 +162,44 @@ namespace
 	class FatFsSink final : public Sink
 	{
 	public:
+		// #450: the tree is exactly /sdcard/vm/<extension>/<file>, so two fixed
+		// readdir loops cover it: no recursion, no allocation. One path buffer
+		// (this can run on a 4 KB HTTP connection stack), with the directory
+		// prefix reused for its files. A name that would not fit is skipped
+		// rather than remove()d mangled -- same rule as CdrArchive's wipe().
+		void wipe() override
+		{
+			std::lock_guard<std::mutex> lock(_ioMutex);
+			DIR* top = ::opendir(kArchiveDir);
+			if (top == nullptr) return;   // nothing recorded yet
+			struct dirent* ext;
+			while ((ext = ::readdir(top)) != nullptr)
+			{
+				if (ext->d_name[0] == '.') continue;   // "." / ".."
+				char path[300];
+				const int dirLen = std::snprintf(path, sizeof(path), "%s/%s", kArchiveDir, ext->d_name);
+				if (dirLen < 0 || static_cast<size_t>(dirLen) >= sizeof(path)) continue;
+				DIR* d = ::opendir(path);
+				if (d == nullptr)
+				{
+					std::remove(path);   // a stray file directly under the root
+					continue;
+				}
+				struct dirent* f;
+				while ((f = ::readdir(d)) != nullptr)
+				{
+					if (f->d_name[0] == '.') continue;
+					const size_t room = sizeof(path) - static_cast<size_t>(dirLen);
+					const int n = std::snprintf(path + dirLen, room, "/%s", f->d_name);
+					if (n >= 0 && static_cast<size_t>(n) < room) std::remove(path);
+					path[dirLen] = '\0';   // back to the directory for the next entry
+				}
+				::closedir(d);
+				::rmdir(path);
+			}
+			::closedir(top);
+		}
+
 		void write(const QueuedRecording& rec, const uint8_t* mulaw) override
 		{
 			std::lock_guard<std::mutex> lock(_ioMutex);

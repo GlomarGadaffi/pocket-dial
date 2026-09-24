@@ -3570,6 +3570,12 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// uses, so calling it here is safe. No-op on every build without an SD
 	// archive installed (see cdrarchive::wipeAll()'s doc comment).
 	cdrarchive::wipeAll();
+	// #450: the SD voicemail archive (recordings, greetings, index), same
+	// policy and same no-_mutex HTTP-task context as the CDR archive above.
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		handler->wipeAllVoicemail();
+	}
 	//
 	// The DTMF admin menu's OWN factory-reset path (*<PIN>#999#1,
 	// DtmfFeatureCodes.cpp) does not call this function -- it runs
@@ -3608,13 +3614,18 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		// HTTP task (#284). "failed" names each store, so the operator knows what
 		// may still be in flash.
 		char body[320];
-		std::snprintf(body, sizeof(body),
+		const int n = std::snprintf(body, sizeof(body),
 			"{\"status\":\"error\",\"failed\":{\"admin\":%s,\"trunk\":%s,\"secrets\":%s,\"forwards\":%s},"
 			"\"message\":\"Factory reset INCOMPLETE: the stores marked true under failed could not be erased. "
 			"Rebooting anyway; run the factory reset again after setup.\"}",
 			adminErased ? "false" : "true", trunkErased ? "false" : "true",
 			secretsErased ? "false" : "true", forwardsErased ? "false" : "true");
-		sendResponse(sock, 500, "Internal Server Error", "application/json", body);
+		// A truncated or failed format must never ship as half a JSON object.
+		static constexpr const char* kFallback =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: one or more stores could "
+			"not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
+		const bool formatted = n > 0 && static_cast<size_t>(n) < sizeof(body);
+		sendResponse(sock, 500, "Internal Server Error", "application/json", formatted ? body : kFallback);
 	}
 	else
 	{
