@@ -226,7 +226,7 @@ namespace
 		// As countWith(), but only messages ADDRESSED to `ip`. A teardown has two
 		// parties and a BYE to the wrong one is not a BYE to the right one --
 		// countWith("BYE") alone let a handset hangup pass while the carrier leg
-		// was never told (#356).
+		// was never told (#386).
 		size_t countWithTo(const std::string& needle, const std::string& ip) const
 		{
 			const uint32_t want = inet_addr(ip.c_str());

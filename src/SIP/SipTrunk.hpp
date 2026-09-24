@@ -402,7 +402,7 @@ private:
 	// dialog, so a message on the handset's Call-ID is the handset talking --
 	// and matching it here is what let a handset's own BYE be taken for the
 	// carrier hanging up, freeing the trunk slot without ever BYEing the
-	// carrier (#356).
+	// carrier (#386).
 	Dialog* findMutableByTrunkCallID(std::string_view callID);
 	Dialog* allocDialog();
 
