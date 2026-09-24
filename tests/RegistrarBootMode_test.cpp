@@ -48,6 +48,19 @@ TEST(RegistrarBootMode, AFreshInstallIsNotAnOpenRegistrar)
 	EXPECT_TRUE(d.persist) << "the choice is made once and saved, not re-decided every boot";
 }
 
+TEST(RegistrarBootMode, AfterAFullEraseFactoryResetTheBoardBootsLearn)
+{
+	// Named for the post-reset state (asked by G-dubs): since #455/#456 the HTTP
+	// reset ends in nvs_flash_erase(), so reg_mode AND the schema stamp are gone
+	// and the next boot is FreshInstall, whatever mode the board had before.
+	for (Mode before : {Mode::Open, Mode::Learn, Mode::Secure})
+	{
+		const auto d = Registrar::chooseBootMode(false, before, Schema::FreshInstall);
+		EXPECT_EQ(d.mode, Mode::Learn) << "mode before the reset: " << static_cast<int>(before);
+		EXPECT_TRUE(d.persist);
+	}
+}
+
 TEST(RegistrarBootMode, NoStoredModeIsNeverOpenWhateverTheSchema)
 {
 	// #441 review: before, "no key + a stamped schema" meant Open. Every failed
