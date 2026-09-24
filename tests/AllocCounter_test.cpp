@@ -5,7 +5,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
+#include <new>
 #include <thread>
 
 #include "AllocCounter.hpp"
@@ -23,6 +25,28 @@ TEST(AllocCounter, ArrayNewIsCounted)
 	AllocGuard guard;
 	std::unique_ptr<char[]> p(new char[64]);
 	p[0] = 'x';
+	EXPECT_EQ(guard.delta(), 1u);
+}
+
+TEST(AllocCounter, OverAlignedNewIsCounted)
+{
+	// Above __STDCPP_DEFAULT_NEW_ALIGNMENT__ (16 on x86-64), so this goes through
+	// operator new(std::size_t, std::align_val_t), not the plain overload.
+	struct alignas(64) Wide { char c[64]; };
+	static_assert(alignof(Wide) > __STDCPP_DEFAULT_NEW_ALIGNMENT__, "not over-aligned");
+	AllocGuard guard;
+	auto one = std::make_unique<Wide>();
+	std::unique_ptr<Wide[]> many(new Wide[3]);
+	EXPECT_EQ(reinterpret_cast<std::uintptr_t>(one.get()) % 64u, 0u);
+	EXPECT_EQ(reinterpret_cast<std::uintptr_t>(many.get()) % 64u, 0u);
+	EXPECT_EQ(guard.delta(), 2u);
+}
+
+TEST(AllocCounter, NothrowNewIsCounted)
+{
+	AllocGuard guard;
+	std::unique_ptr<int> p(new (std::nothrow) int(3));
+	ASSERT_NE(p, nullptr);
 	EXPECT_EQ(guard.delta(), 1u);
 }
 
