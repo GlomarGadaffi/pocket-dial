@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "PbxPersist.hpp"
+#include "RefillVector.hpp"   // #463: in-place snapshot refill
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "nvs_flash.h"
@@ -292,14 +293,20 @@ const CallDetailRecord& CdrRing::record(const std::shared_ptr<Session>& session,
 std::vector<CallDetailRecord> CdrRing::snapshot() const
 {
 	std::vector<CallDetailRecord> out;
-	out.reserve(_count);
+	snapshotInto(out);
+	return out;
+}
+
+void CdrRing::snapshotInto(std::vector<CallDetailRecord>& out) const
+{
+	Refill<CallDetailRecord> rows(out);
 	for (size_t i = 0; i < _count; ++i)
 	{
 		// _head points one past the newest; walk backwards with wrap.
 		size_t idx = (_head + POCKETDIAL_CDR_RECORDS - 1 - i) % POCKETDIAL_CDR_RECORDS;
-		out.push_back(_ring[idx]);
+		// Copy-assign: the two strings reuse the slot's capacity (#463).
+		rows.next() = _ring[idx];
 	}
-	return out;
 }
 
 std::string CdrRing::lastCallerFor(std::string_view calleeExt) const

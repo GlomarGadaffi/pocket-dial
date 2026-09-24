@@ -4,6 +4,7 @@
 #include <sstream>
 
 #include "IDGen.hpp"
+#include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include "Session.hpp"
 #include "SipHeaderUtil.hpp"
 #include "SipMessageTypes.h"
@@ -423,13 +424,23 @@ std::vector<std::tuple<std::string, std::string, std::string, int>>
 ParkOrbit::snapshotRows(std::chrono::steady_clock::time_point now, bool onlyParked) const
 {
 	std::vector<std::tuple<std::string, std::string, std::string, int>> rows;
+	snapshotRowsInto(rows, now, onlyParked);
+	return rows;
+}
+
+void ParkOrbit::snapshotRowsInto(std::vector<std::tuple<std::string, std::string, std::string, int>>& out,
+	std::chrono::steady_clock::time_point now, bool onlyParked) const
+{
+	Refill<std::tuple<std::string, std::string, std::string, int>> rows(out);
 	for (const auto& slot : _slots)
 	{
 		if (slot.state == ParkState::Free) continue;
 		if (onlyParked && slot.state != ParkState::Parked) continue;
-		int secs = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+		auto& row = rows.next();
+		std::get<0>(row).assign(slot.orbit);
+		std::get<1>(row).assign(slot.parkedExt);
+		std::get<2>(row).assign(slot.parker);
+		std::get<3>(row) = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
 			now - slot.parkedAt).count());
-		rows.emplace_back(slot.orbit, slot.parkedExt, slot.parker, secs);
 	}
-	return rows;
 }

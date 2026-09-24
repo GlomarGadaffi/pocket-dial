@@ -6,6 +6,7 @@
 #include <cstdlib>
 
 #include "PbxPersist.hpp"
+#include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include "ServiceExtensions.hpp"   // Issue #202: the engine-owned pseudo-AOR table
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
@@ -62,12 +63,17 @@ bool PbxFeatureConfig::isDndEnabled(const std::string& extension) const
 std::vector<std::string> PbxFeatureConfig::dndSnapshot() const
 {
 	std::vector<std::string> result;
-	result.reserve(_dnd.size());
+	dndSnapshotInto(result);
+	return result;
+}
+
+void PbxFeatureConfig::dndSnapshotInto(std::vector<std::string>& out) const
+{
+	Refill<std::string> rows(out);
 	for (const auto& [ext, enabled] : _dnd)
 	{
-		if (enabled) result.push_back(ext);
+		if (enabled) rows.next().assign(ext);
 	}
-	return result;
 }
 
 // ── Voicemail (Issue #246) ───────────────────────────────────────────────────
@@ -212,12 +218,22 @@ void PbxFeatureConfig::setForwardLocked(const std::string& extension, const std:
 std::vector<std::tuple<std::string, std::string, std::string, std::string>> PbxFeatureConfig::forwardsSnapshot() const
 {
 	std::vector<std::tuple<std::string, std::string, std::string, std::string>> result;
-	result.reserve(_forwards.size());
+	forwardsSnapshotInto(result);
+	return result;
+}
+
+void PbxFeatureConfig::forwardsSnapshotInto(
+	std::vector<std::tuple<std::string, std::string, std::string, std::string>>& out) const
+{
+	Refill<std::tuple<std::string, std::string, std::string, std::string>> rows(out);
 	for (const auto& [ext, cfg] : _forwards)
 	{
-		result.emplace_back(ext, cfg.always, cfg.busy, cfg.noAnswer);
+		auto& row = rows.next();
+		std::get<0>(row).assign(ext);
+		std::get<1>(row).assign(cfg.always);
+		std::get<2>(row).assign(cfg.busy);
+		std::get<3>(row).assign(cfg.noAnswer);
 	}
-	return result;
 }
 
 // ── Ring / hunt groups ───────────────────────────────────────────────────────
@@ -286,14 +302,21 @@ void PbxFeatureConfig::setRingGroup(const std::string& groupExt, const std::stri
 std::vector<std::tuple<std::string, std::string, std::string>> PbxFeatureConfig::ringGroupsSnapshot() const
 {
 	std::vector<std::tuple<std::string, std::string, std::string>> result;
-	result.reserve(_ringGroups.size());
+	ringGroupsSnapshotInto(result);
+	return result;
+}
+
+void PbxFeatureConfig::ringGroupsSnapshotInto(
+	std::vector<std::tuple<std::string, std::string, std::string>>& out) const
+{
+	Refill<std::tuple<std::string, std::string, std::string>> rows(out);
 	for (const auto& [ext, g] : _ringGroups)
 	{
-		result.emplace_back(ext,
-			g.mode == pbx::GroupMode::Hunt ? "hunt" : "ringall",
-			pbx::joinMembers(g.members));
+		auto& row = rows.next();
+		std::get<0>(row).assign(ext);
+		std::get<1>(row).assign(g.mode == pbx::GroupMode::Hunt ? "hunt" : "ringall");
+		pbx::joinMembersInto(g.members, std::get<2>(row));
 	}
-	return result;
 }
 
 // ── Paging zones (980–989) ────────────────────────────────────────────────────
@@ -471,12 +494,22 @@ void PbxFeatureConfig::setDialRule(const std::string& pattern, const std::string
 std::vector<std::tuple<std::string, std::string, std::string, int>> PbxFeatureConfig::dialRulesSnapshot() const
 {
 	std::vector<std::tuple<std::string, std::string, std::string, int>> result;
-	result.reserve(_dialPlan.size());
+	dialRulesSnapshotInto(result);
+	return result;
+}
+
+void PbxFeatureConfig::dialRulesSnapshotInto(
+	std::vector<std::tuple<std::string, std::string, std::string, int>>& out) const
+{
+	Refill<std::tuple<std::string, std::string, std::string, int>> rows(out);
 	for (const auto& r : _dialPlan.rules())
 	{
-		result.emplace_back(r.pattern, pbx::dialActionName(r.action), r.target, r.stripDigits);
+		auto& row = rows.next();
+		std::get<0>(row).assign(r.pattern);
+		std::get<1>(row).assign(pbx::dialActionName(r.action));
+		std::get<2>(row).assign(r.target);
+		std::get<3>(row) = r.stripDigits;
 	}
-	return result;
 }
 
 // ── Directed / group call pickup (Issue #68) ──────────────────────────────────

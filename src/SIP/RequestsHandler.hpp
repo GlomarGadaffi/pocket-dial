@@ -361,6 +361,10 @@ public:
 	// the no-answer path without a 60-second test.
 	void expireTrunkDeadlinesForTest();
 
+	// #463: tick() runs at most once a second; this lets a test drive two passes
+	// back to back (the second is the steady-state one an AllocGuard measures).
+	void forceNextTickForTest() { _lastTick = {}; }
+
 	// What the resolver currently knows about the configured SBC host. Refused
 	// means nothing is known and nothing is in flight; anything else means a
 	// resolution has at least been ASKED FOR, which is what proves tick()
@@ -1930,6 +1934,10 @@ private:
 		uint64_t packetsDropped = 0;
 	};
 	RegistrarSnapshot _snapshot;
+	// #463: tick() refills this in place and swaps its tables into _snapshot, so
+	// an unchanged dashboard costs no allocation. Touched only by tick(), under
+	// _mutex -- never read by anything else.
+	RegistrarSnapshot _snapshotScratch;
 	std::mutex _snapshotMutex;
 
 	// CDR ring buffer (Phase 2) now lives on CdrRing.hpp — data, NVS persistence,
