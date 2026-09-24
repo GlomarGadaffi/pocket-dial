@@ -134,6 +134,42 @@ bool save(const Config& cfg)
 	return true;
 }
 
+bool clear()
+{
+	std::lock_guard<std::mutex> lk(g_mutex);
+	bool ok = true;
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// ERASE every key rather than save(Config{}): writing empty values relies on
+	// a zero-length nvs_set_blob succeeding for gsa_key/smtp_ca_pem, and save()'s
+	// chain stops at the first failure -- leaving the private key behind. An
+	// erase has no such dependency; NOT_FOUND (never set) is success. (#363,
+	// raised by Globox in review.)
+	static const char* const kKeys[] = {
+		"smtp_host", "smtp_port", "smtp_mode", "smtp_auth", "smtp_user", "smtp_pass",
+		"smtp_from", "smtp_to", "gsa_email", "gsa_key", "smtp_insecure", "smtp_ca_pem",
+	};
+	nvs_handle_t h;
+	esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &h);
+	if (err == ESP_OK)
+	{
+		for (const char* key : kKeys)   // every key attempted, even after a failure
+		{
+			const esp_err_t e = nvs_erase_key(h, key);
+			if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) ok = false;
+		}
+		if (nvs_commit(h) != ESP_OK) ok = false;
+		nvs_close(h);
+	}
+	else if (err != ESP_ERR_NVS_NOT_FOUND)
+	{
+		ok = false;
+	}
+#endif
+	g_cache = Config{};
+	g_loaded = true;
+	return ok;
+}
+
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 void resetForTest()
 {

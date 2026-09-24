@@ -14,8 +14,11 @@
 // rebooting the test runner.
 
 #include <gtest/gtest.h>
+#include <cstdint>
+#include <vector>
 #include "AdminAuth.hpp"
 #include "CdrArchive.hpp"
+#include "CoreDumpStore.hpp"
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
 
@@ -129,6 +132,41 @@ TEST_F(DtmfFactoryReset, ConfirmedResetWipesSdArchive)
 	EXPECT_EQ(sink.wipes, 1)
 		<< "*<PIN>#999#1 must wipe the SD CDR archive, matching the HTTP factory "
 		   "reset -- before #222 it only erased NVS and left the card intact";
+}
+
+namespace
+{
+	// Same shape CoreDumpHttp_test/FactoryResetSecrets_test use: ELF magic at
+	// byte 12, which CoreDumpStore's "present" rule requires.
+	std::vector<uint8_t> fakeDump()
+	{
+		std::vector<uint8_t> img(256, 0x5A);
+		img[12] = 0x7F; img[13] = 'E'; img[14] = 'L'; img[15] = 'F';
+		return img;
+	}
+}
+
+TEST_F(DtmfFactoryReset, ConfirmedResetErasesTheCoredump)
+{
+	// #437 review: the HTTP door erases the last coredump; this door must too.
+	CoreDumpStore::setImageForTest(fakeDump());
+	ASSERT_TRUE(CoreDumpStore::query().present) << "precondition: a dump is stored";
+
+	sendDtmfSequence(*handler, "dtmf-437-coredump", std::string("*") + kPin + "#9991");
+
+	EXPECT_FALSE(CoreDumpStore::query().present)
+		<< "*<PIN>#999#1 must erase the coredump, matching the HTTP factory reset";
+	CoreDumpStore::setImageForTest({});
+}
+
+TEST_F(DtmfFactoryReset, AbortedConfirmKeepsTheCoredump)
+{
+	// Negative control: the erase belongs to the CONFIRMED reset only, so a
+	// passing test above cannot come from some other digit path erasing it.
+	CoreDumpStore::setImageForTest(fakeDump());
+	sendDtmfSequence(*handler, "dtmf-437-abort", std::string("*") + kPin + "#9990");
+	EXPECT_TRUE(CoreDumpStore::query().present) << "an aborted reset must not erase the coredump";
+	CoreDumpStore::setImageForTest({});
 }
 
 TEST_F(DtmfFactoryReset, AbortedConfirmDigitDoesNotWipe)

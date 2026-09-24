@@ -80,6 +80,11 @@ namespace SipSecretStore
 	// erase otherwise succeeded). No-op-safe on an unknown extension.
 	bool clearSecret(const std::string& ext);
 
+	// Remove EVERY extension's secret, including one the index lost track of --
+	// the factory-reset path (#363). On ESP it wipes the whole "sipauth"
+	// namespace, which holds nothing else, and drops the RAM HA1 cache.
+	bool clearAll();
+
 	// All extensions that currently have a secret. Order is unspecified.
 	std::vector<std::string> securedExtensions();
 }
