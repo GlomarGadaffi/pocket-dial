@@ -4148,7 +4148,7 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 	// stack can fail to allocate; the outbound worker then never runs and the
 	// call is silently never placed. Surface that (and free the arg) instead of
 	// a silent, phantom non-call — mirrors asyncDropCall's check exactly.
-	if (xTaskCreateWithCaps([](void* p) {
+	if (pd::createTaskPreferPsram([](void* p) {
 		auto* mca = static_cast<MakeCallArg*>(p);
 		std::string ownLeg;
 		if (!mca->anchor->makeCall(mca->dest, &ownLeg))
@@ -4189,8 +4189,8 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 			}
 		}
 		delete mca;
-		vTaskDeleteWithCaps(NULL);   // created WithCaps(PSRAM)
-	}, "tel_makecall", 12288, arg, 5, NULL, PD_TASK_STACK_CAPS) != pdPASS)
+		pd::deleteTask(NULL);   // created WithCaps(PSRAM)
+	}, "tel_makecall", 12288, arg, 5, NULL) != pdPASS)
 	{
 		queueLog("[Telephony] asyncMakeCall: outbound worker xTaskCreate FAILED (heap exhausted) — call NOT placed", true);
 		delete arg;
@@ -4253,12 +4253,12 @@ void RequestsHandler::asyncDropCall(const std::string& participantId)
 	// stack can fail to allocate; the drop worker then never runs and the far leg
 	// never tears down. Surface that (and free the arg) instead of a silent,
 	// phantom non-drop.
-	if (xTaskCreateWithCaps([](void* p) {
+	if (pd::createTaskPreferPsram([](void* p) {
 		auto* dca = static_cast<DropCallArg*>(p);
 		dca->anchor->dropCall(dca->partId);
 		delete dca;
-		vTaskDeleteWithCaps(NULL);
-	}, "tel_dropcall", 12288, arg, 5, NULL, PD_TASK_STACK_CAPS) != pdPASS)
+		pd::deleteTask(NULL);
+	}, "tel_dropcall", 12288, arg, 5, NULL) != pdPASS)
 	{
 		queueLog("[Telephony] asyncDropCall: drop worker xTaskCreate FAILED (heap exhausted) — leg NOT dropped", true);
 		delete arg;
@@ -4287,7 +4287,7 @@ void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 	// CHECK the spawn: same heap-pressure hazard asyncDropCall's own comment
 	// describes -- without this check a failed allocation leaks `arg` and
 	// silently never answers the call.
-	if (xTaskCreateWithCaps([](void* p) {
+	if (pd::createTaskPreferPsram([](void* p) {
 		auto* aca = static_cast<AnswerCallArg*>(p);
 		if (!aca->anchor->answerCall(aca->partId))
 		{
@@ -4295,8 +4295,8 @@ void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 			aca->handler->queueLog("[Telephony] Failed to answer inbound participant " + aca->partId, true);
 		}
 		delete aca;
-		vTaskDeleteWithCaps(NULL);
-	}, "tel_answer", 12288, arg, 5, NULL, PD_TASK_STACK_CAPS) != pdPASS)
+		pd::deleteTask(NULL);
+	}, "tel_answer", 12288, arg, 5, NULL) != pdPASS)
 	{
 		queueLog("[Telephony] asyncAnswerCall: answer worker xTaskCreate FAILED (heap exhausted) — participant NOT answered", true);
 		delete arg;
