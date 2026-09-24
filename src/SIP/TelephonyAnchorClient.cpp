@@ -748,13 +748,13 @@ TelephonyAnchorClient::CallSlot* TelephonyAnchorClient::allocSlotLocked(const st
 	}
 	for (auto& s : _calls)
 	{
-		if (s.participantId.empty())
+		if (s.participantId.empty() && !s.getMutexPoisoned.load(std::memory_order_acquire))
 		{
 			s.participantId = participantId;
 			return &s;
 		}
 	}
-	return nullptr;   // all POCKETDIAL_MAX_ANCHOR_CALLS slots busy
+	return nullptr;   // all POCKETDIAL_MAX_ANCHOR_CALLS slots busy (or retired as poisoned)
 }
 
 void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
@@ -895,8 +895,13 @@ bool TelephonyAnchorClient::ensureToken()
 	for (auto& s : _calls)
 	{
 		if (s.postLive.load(std::memory_order_acquire)) { streamsActive = true; break; }
-		std::lock_guard<std::mutex> getLock(s.getMutex);
-		if (s.getClient != nullptr) { streamsActive = true; break; }
+		if (s.getMutexPoisoned.load(std::memory_order_acquire)) continue;   // retired slot, no stream
+		// try_lock, never block: a force-killed rx task may have died holding getMutex, and the
+		// poisoned flag above is set only after that kill completes. Busy counts as "maybe live".
+		if (!s.getMutex.try_lock()) { streamsActive = true; break; }
+		const bool live = (s.getClient != nullptr);
+		s.getMutex.unlock();
+		if (live) { streamsActive = true; break; }
 	}
 	if (streamsActive)
 	{
@@ -2120,10 +2125,15 @@ void TelephonyAnchorClient::closePostClient()
 			// running: stopAllMediaStreams() does not wait for a slot whose stopMediaStreams()
 			// lost the tearingDown gate to a concurrent teardown (e.g. the WS-disconnect
 			// handler), so that teardown may still be joining a task inside this handle.
-			std::lock_guard<std::mutex> getLock(slot.getMutex);
-			if (slot.getClient)
+			// try_lock, never block: this is on stop(), including #65's recovery restart, and a
+			// poisoned getMutex (see CallSlot::getMutexPoisoned) would hang it forever.
+			if (!slot.getMutexPoisoned.load(std::memory_order_acquire) && slot.getMutex.try_lock())
 			{
-				ESP_LOGW(TAG, "closePostClient: getClient still owned by a running rx task — not freeing it (#370)");
+				if (slot.getClient)
+				{
+					ESP_LOGW(TAG, "closePostClient: getClient still owned by a running rx task — not freeing it (#370)");
+				}
+				slot.getMutex.unlock();
 			}
 		}
 	}
@@ -3014,8 +3024,16 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 				}
 				else
 				{
-					// The killed task died holding getMutex; the handle cannot even be inspected.
+					// The killed task died holding getMutex; the handle cannot even be inspected, and
+					// the mutex will never unlock. Retire the slot so no later call reuses it: a new rx
+					// task and its teardown would both block on this mutex forever.
 					leakedHandle = true;
+					slot->getMutexPoisoned.store(true, std::memory_order_release);
+					const unsigned retired = _retiredSlots.fetch_add(1, std::memory_order_acq_rel) + 1;
+					ESP_LOGE(TAG, "killed rx task held getMutex — RETIRING call slot %d until reboot "
+						"(%u of %d retired; anchor capacity now %u)",
+						static_cast<int>(slot - _calls), retired, POCKETDIAL_MAX_ANCHOR_CALLS,
+						maxConcurrentCalls());
 				}
 
 				if (leakedHandle)

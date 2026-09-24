@@ -3582,7 +3582,9 @@ unsigned RequestsHandler::anchorCallLimit() const
 	// the mock inheriting a concurrency it cannot honour.
 	unsigned providerLimit = 1;
 	if (_anchorClient) providerLimit = _anchorClient->maxConcurrentCalls();
-	if (providerLimit == 0) providerLimit = 1;   // a provider claiming 0 is a bug; refuse to divide by it
+	// 0 is a real answer, not a bug: a provider whose every call slot has been
+	// retired (#421) can carry no call, and every anchored dial must get a 503.
+	// Nothing divides by this; callers only compare against it.
 
 	const unsigned poolLimit = static_cast<unsigned>(POCKETDIAL_MAX_ANCHOR_CALLS);
 	return (providerLimit < poolLimit) ? providerLimit : poolLimit;

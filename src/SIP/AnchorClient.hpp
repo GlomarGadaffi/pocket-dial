@@ -124,6 +124,11 @@ public:
 	// The engine takes min(this, POCKETDIAL_MAX_ANCHOR_CALLS) when deciding whether
 	// to accept another anchored call.
 	virtual unsigned maxConcurrentCalls() const { return 1; }
+
+	// Call capacity lost for the rest of this boot to an unrecoverable per-call
+	// failure (see TelephonyAnchorClient's poisoned-slot handling). Reported on
+	// /api/status so a board running at reduced capacity is diagnosable.
+	virtual unsigned retiredCallSlots() const { return 0; }
 };
 
 #endif // ANCHOR_CLIENT_HPP
