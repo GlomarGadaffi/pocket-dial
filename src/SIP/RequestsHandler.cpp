@@ -5111,7 +5111,9 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	// neither applies: a trunk dialog has no handset Session under this
 	// Call-ID, and the carrier is not a registered client, so
 	// isDialogSourceAuthorized() has no leg IP to match it against. SipTrunk
-	// recognises it by Call-ID, answers the 200, and calls back into
+	// recognises it by the trunk's own Call-ID (#386), runs its OWN
+	// forged-teardown check against the carrier's address and dialog tags
+	// (#356), answers 200 or 403, and on a 200 calls back into
 	// onTrunkRemoteBye() to BYE the handset side.
 	if (_sipTrunk.handleBye(data)) return;
 

@@ -346,6 +346,10 @@ public:
 
 	// Route a response for one of our dialogs. Returns true if consumed, in which
 	// case the caller must not process it further.
+	//
+	// A response from any address other than the dialog's peer is dropped --
+	// and still consumed (#356). See the note in the definition on why this is
+	// strict and handleBye() is not.
 	bool handleResponse(const std::shared_ptr<SipMessage>& data);
 
 	// The carrier hanging up first. Answers 200, releases the dialog and tells
@@ -360,6 +364,10 @@ public:
 	// match. A BYE naming the handset leg is the handset hanging up, which the
 	// engine answers and turns into a carrier BYE via endCall(); claiming it
 	// here would free the slot without the carrier ever being told.
+	//
+	// Recognised is not authorised (#356). A BYE on a trunk Call-ID is acted on
+	// only from the peer, from a dotted-quad Contact host, or with both dialog
+	// tags matching; anything else is answered 403 and consumed.
 	bool handleBye(const std::shared_ptr<SipMessage>& data);
 
 	// Tear down the trunk leg for `callID` (either the trunk's own Call-ID or the

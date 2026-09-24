@@ -8,11 +8,27 @@
 #include "SipHeaderUtil.hpp"
 #include "SipMessageTypes.h"
 #include "SipWireUtil.hpp"
+#include "TrunkResolver.hpp"
 
 using sipwire::addrToIpPort;
 
 namespace
 {
+	// The host of a SIP URI ("sip:+1555@203.0.113.9:5060;transport=udp"), as an
+	// address, when -- and only when -- it is a dotted quad. An FQDN yields false:
+	// resolving it would mean getaddrinfo on the SIP thread, which is the one
+	// thing TrunkResolver exists to prevent (#356's BYE source check).
+	bool uriHostIpv4(std::string_view uri, uint32_t& out)
+	{
+		const size_t colon = uri.find(':');
+		if (colon == std::string_view::npos) return false;   // no scheme
+		std::string_view rest = uri.substr(colon + 1);
+		const size_t at = rest.find('@');
+		if (at != std::string_view::npos) rest = rest.substr(at + 1);
+		const size_t end = rest.find_first_of(":;>?");
+		return TrunkResolver::parseDottedQuad(rest.substr(0, end), out);
+	}
+
 	// The request-URI / To URI for a PSTN destination. E.164 with the leading '+'
 	// is what essentially every ITSP expects; E164.cpp has already normalised the
 	// digits by the time a number reaches here, so this only has to not mangle it.
@@ -374,6 +390,29 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	if (!statusInfo.has_value()) return false;
 	const int status = static_cast<int>(statusInfo->code);
 
+	// Issue #356: a response must come from where its request went. Every
+	// request this dialog sends -- INVITE, both ACK forms, BYE -- is addressed
+	// to d->peer, so nothing legitimate answers from anywhere else, in any
+	// state. A forged response is otherwise the carrier: a 200 with its own
+	// SDP gets ACKed and redirects the relay's RTP, a 4xx kills the call
+	// before answer.
+	//
+	// Strict, with no tag fallback, on purpose. A forged EARLY response is what
+	// SUPPLIES the peer's tag, so there is nothing to match it against. And a
+	// wrongly dropped response cannot strand a billing leg: Trying, Proceeding
+	// and Terminating are all swept, and nothing we send in Confirmed awaits
+	// an answer.
+	//
+	// Dropped AND consumed: returning false would hand a carrier-dialog
+	// response to the handset-side paths.
+	if (data->getSource().sin_addr.s_addr != d->peer.sin_addr.s_addr)
+	{
+		_env.log("Trunk: " + std::to_string(status) + " from " + addrToIpPort(data->getSource())
+			+ " dropped -- this dialog's carrier is " + addrToIpPort(d->peer)
+			+ " (" + d->destE164 + ")", true);
+		return true;
+	}
+
 	// Latch the To-tag from the first response that carries one. Everything
 	// in-dialog afterwards -- the ACK, the BYE -- is malformed without it.
 	const std::string toTag = siphdr::tagOf(data->getTo());
@@ -517,6 +556,52 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 
 	Dialog* d = findMutableByTrunkCallID(data->getCallID());
 	if (!d || d->state == State::Free) return false;
+
+	// Issue #356: who may hang up a trunk call. Deliberately looser than the
+	// response check in handleResponse(), because the failure costs are
+	// reversed: a wrongly REJECTED carrier BYE leaves a Confirmed call up and
+	// billing with no reaper (sweep() exempts Confirmed), while a wrongly
+	// ACCEPTED one drops one call. Accepted, in order:
+	//
+	//   1. from d->peer, where every request of ours went;
+	//   2. from the remote target's host, when it is a dotted quad -- carriers
+	//      commonly send in-dialog requests from the node named in the 2xx's
+	//      Contact rather than the one that took the INVITE;
+	//   3. from anywhere else, if BOTH dialog tags match. The carrier's tag (our
+	//      toTag) is minted by the far end, not by IDGen, so an off-path sender
+	//      has to have seen the dialog to know it. Logged loudly: this is the
+	//      branch a real carrier's SBC pool would land in, and the log is what
+	//      tells whoever brings one up which address to expect (#164).
+	const sockaddr_in& src = data->getSource();
+	bool authorised = src.sin_addr.s_addr == d->peer.sin_addr.s_addr;
+	if (!authorised)
+	{
+		uint32_t target = 0;
+		authorised = uriHostIpv4(d->remoteTarget, target) && target == src.sin_addr.s_addr;
+	}
+	if (!authorised && !d->toTag.empty()
+		&& siphdr::tagOf(data->getFrom()) == d->toTag
+		&& siphdr::tagOf(data->getTo()) == d->fromTag)
+	{
+		_env.log("Trunk: BYE from " + addrToIpPort(src) + " accepted on dialog tags -- not the carrier "
+			+ addrToIpPort(d->peer) + " or its Contact (" + d->destE164 + ")", true);
+		authorised = true;
+	}
+	if (!authorised)
+	{
+		_env.log("Trunk: BYE from " + addrToIpPort(src) + " refused -- this dialog's carrier is "
+			+ addrToIpPort(d->peer) + " and the tags do not match (" + d->destE164 + ")", true);
+		auto forbidden = _env.messageFromPool(data->toString(), src);
+		if (forbidden)
+		{
+			forbidden->setHeader("SIP/2.0 403 Forbidden");
+			forbidden->clearBody();
+			forbidden->syncContentLength();
+			_env.enqueue(src, std::move(forbidden));
+		}
+		// Consumed: a false return would pass it to onBye()'s handset paths.
+		return true;
+	}
 
 	// 200 first, off the request itself so the Via/CSeq match without this
 	// class having to know how a response is assembled.
