@@ -53,7 +53,7 @@ on:
 #   superseded SHA, never on the PR's current head. That matters: branch
 #   protection reads EVERY check run with a required name on the head SHA, and
 #   a cancelled copy there blocks the merge (#427). `reopened` re-runs the
-#   same SHA, so it never cancels.
+#   same SHA, so it never cancels anything.
 # - push (main only) and workflow_dispatch group per SHA. Per REF would be
 #   wrong even without cancel-in-progress: GitHub keeps at most one PENDING
 #   run per group and silently cancels older pending ones, so back-to-back
