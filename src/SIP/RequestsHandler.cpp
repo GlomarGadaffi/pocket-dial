@@ -9134,6 +9134,19 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Spliced dialogs (pickup, park retrieve/ring-back, transfer bridges): the
+	// two phones sit in DIFFERENT dialogs, linked only by peerCallID, so src/dest
+	// point across Call-IDs. The relay below forwards the request verbatim, and a
+	// refresh arriving under a Call-ID and tags the far phone has never seen
+	// draws a 481, which ends the session (RFC 4028 §10). Review catch on #439
+	// (Globox, #453 audit). Until #453 translates in-dialog requests across the
+	// splice, the refresh is answered here, as it was before #439.
+	if (!session->getPeerCallID().empty() && !data->hasSdp())
+	{
+		answerRefreshLocally();
+		return;
+	}
+
 	std::shared_ptr<SipClient> peer;
 	if (sameAddress(data->getSource(), src->getAddress()))
 		peer = dest;
