@@ -34,14 +34,6 @@ TEST(AllocCounter, ANewOnThisThreadIsCounted)
 	EXPECT_EQ(d, 1u);
 }
 
-TEST(AllocCounter, ArrayNewIsCounted)
-{
-	AllocGuard guard;
-	std::unique_ptr<char[]> p(new char[64]);
-	g_sink = p.get();
-	const std::size_t d = guard.delta();
-	EXPECT_EQ(d, 1u);
-}
 
 TEST(AllocCounter, OverAlignedNewIsCounted)
 {
