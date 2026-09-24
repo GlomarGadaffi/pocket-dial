@@ -11,6 +11,14 @@
 // password, Telephony-API secret) are rows here too, so this test does not lean
 // on theirs existing.
 //
+// WHAT THIS PROVES, AND WHAT IT DOES NOT: on host every store is its in-memory
+// stand-in (EmailConfigStore/TrunkConfigStore's cache, SipSecretStore's map,
+// CoreDumpStore's fake image). So a passing row proves the reset reached that
+// store and emptied it through the store's own API -- the part #363 was about.
+// It does NOT prove the flash was erased: the ESP arms (save() writing NVS,
+// clearAll()'s nvs_erase_all on "sipauth", esp_core_dump_image_erase) are only
+// compiled by CI's ESP builds, never executed here. (Griot, reviewing #437.)
+//
 // Driven through the real route (HttpServer + requireAdmin + confirm=ERASE).
 // Ports: this file owns 18240-18249. See CONTRIBUTING_FIRMWARE.md's table.
 
