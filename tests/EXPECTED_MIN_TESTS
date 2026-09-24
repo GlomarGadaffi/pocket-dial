@@ -1,10 +1,11 @@
-# Minimum number of host gtest cases that must RUN in CI (#390).
+# The BASE of the host test-count floor (#390, #467).
 # Checked by tests/tools/check_test_count.py after the unit-test step.
 #
-# A floor, not an exact count. When your PR adds tests, raise this to the new
-# total in the same PR. When it removes tests on purpose, lower it -- the
-# reduction then shows up in the diff instead of passing silently.
+# The floor is this number PLUS every tests/min_tests.d/<issue>-<slug>.txt.
+# Do NOT edit this number in a PR that adds tests -- add a contribution file
+# instead (see tests/min_tests.d/README.md), so two PRs never touch one line.
+# Only a compaction PR on main changes it: check_test_count.py --compact.
 #
-# Set to the count on main @ 5f5f0b1 (after #394's CoreDumpHttp tests):
-# 1244 tests from 173 suites.
-1244
+# Set to the count on main @ e2d00c5 (after #407), measured by BigDog:
+# 1254 tests from 175 suites.
+1254

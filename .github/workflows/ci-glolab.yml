@@ -147,9 +147,13 @@ jobs:
           rm -rf build/gtest-reports
           ctest --test-dir build/tests --output-on-failure
 
-      - name: Verify Test Count (floor in tests/EXPECTED_MIN_TESTS)
+      - name: Self-test the test-count checker (#467)
+        run: python3 -m unittest discover -s tests/tools -p 'test_check_test_count.py' -v
+
+      - name: Verify Test Count (floor = tests/EXPECTED_MIN_TESTS + tests/min_tests.d)
         run: |
-          # See ci.yml: ctest reports the suite as one test (#390).
+          # See ci.yml: ctest reports the suite as one test (#390); the floor is
+          # a base plus per-PR contributions (#467).
           python3 tests/tools/check_test_count.py build/gtest-reports
 
       - name: Verify SIP Parser Call Graph (T-7 recursion/frame guard)

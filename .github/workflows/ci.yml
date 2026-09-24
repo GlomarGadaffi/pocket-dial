@@ -396,12 +396,16 @@ jobs:
           rm -rf build/gtest-reports
           ctest --test-dir build/tests --output-on-failure
 
-      - name: Verify Test Count (floor in tests/EXPECTED_MIN_TESTS)
+      - name: Self-test the test-count checker (#467)
+        run: python3 -m unittest discover -s tests/tools -p 'test_check_test_count.py' -v
+
+      - name: Verify Test Count (floor = tests/EXPECTED_MIN_TESTS + tests/min_tests.d)
         run: |
           # ctest counts the whole gtest suite as ONE test ("0 tests failed out
           # of 1"), so it cannot tell 1235 passing tests from 12 (#390). This
-          # prints how many actually ran and fails below the checked-in floor.
-          # Fails closed: a missing report is a failure, not a pass.
+          # prints how many actually ran and fails below the floor: the base
+          # plus one contribution file per PR (#467), so PRs never conflict
+          # over one number. Fails closed: a missing report is a failure.
           python3 tests/tools/check_test_count.py build/gtest-reports
 
       # The T-7 call-graph guard used to run here. It is its own job now
