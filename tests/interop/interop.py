@@ -597,7 +597,17 @@ def sc_attended_transfer(env):
     ma3, mb2, mc2 = a.mark(), b.mark(), c.mark()
     # Issued while the A-C call is current: REFER C to replace A's leg on the
     # A-B dialog, so B and C end up talking to each other.
-    a.cmd("call transfer_replaces %d" % ab_id, 3.5)
+    reply = a.cmd("call transfer_replaces %d" % ab_id, 3.5)
+    # pjsua's call-id picker refuses some ids (observed: the highest slot, 3,
+    # under --max-calls=4) by echoing a bare "^" and sending NO REFER. Left
+    # unreported that reads as "the PBX never answered the REFER" -- a harness
+    # failure dressed as a PBX one. Name it for what it is.
+    if re.search(r"^\s*\^\s*$|Invalid Arg|%Error", reply or "", re.M):
+        for ua in (a, b, c):
+            ua.hangup_all()
+        return report("attended_transfer", "FAIL",
+                      "HARNESS: pjsua CLI rejected 'call transfer_replaces %d' (no REFER sent) "
+                      "-- pjsua call-slot issue, not a PBX result" % ab_id)
     accepted = a.wait_log(r"202 Accepted|202/REFER", 8, ma3) is not None
     b_spliced = b.wait_log(r"Received Request msg INVITE|RX .*INVITE", 8, mb2) is not None
     c_spliced = c.wait_log(r"Received Request msg INVITE|RX .*INVITE", 8, mc2) is not None
@@ -868,21 +878,32 @@ def _live_session_between(ext_a, ext_b):
 
 
 def _bye_went_through_pbx(caller, callee, m_caller, m_callee):
-    """After `caller` hangs up: exactly one BYE transaction (by CSeq, so a
-    retransmit does not count twice) left the caller for the PBX, exactly one
-    reached the callee from the PBX, and the PBX kept no session for the call.
-    Returns (ok, detail). Arrival alone never passes: the ghost-session check is
-    what shows the PBX actually processed the teardown."""
+    """After `caller` hangs up, prove the teardown crossed the PBX.
+
+    The gate is two facts that a bypassed BYE cannot fake:
+      - the callee received exactly one BYE transaction (by CSeq, so a
+        retransmit does not count twice), and it came FROM THE PBX -- a BYE
+        that went phone-to-phone arrives from the caller's own address;
+      - the PBX no longer lists a session for the call -- a bypassed BYE leaves
+        it holding a ghost.
+
+    The caller's own "TX ... BYE ... to" line is corroboration only, and is
+    checked strictly when present. It cannot be the gate: pjsua buffers its log
+    file, and a caller that goes idle after hanging up is stopped by the harness
+    before the buffer flushes -- measured, the log ended mid-timestamp one line
+    after the BYE resolved to the PBX. Requiring it made a correct teardown fail
+    on log I/O, not on the PBX. Returns (ok, detail)."""
     pbx = (PBX_IP, str(PBX_SIP_PORT))
+    caller.wait_log(r"TX \d+ bytes Request msg BYE", 3, m_caller)
     tx = _bye_endpoints(caller.log_since(m_caller), "tx")
     rx = _bye_endpoints(callee.log_since(m_callee), "rx")
-    tx_ok = len({c for c, _, _ in tx}) == 1 and all((ip, pt) == pbx for _, ip, pt in tx)
     rx_ok = len({c for c, _, _ in rx}) == 1 and all((ip, pt) == pbx for _, ip, pt in rx)
+    tx_contradicts = any((ip, pt) != pbx for _, ip, pt in tx)
     gone = wait_for(lambda: _live_session_between(caller.ext, callee.ext) is False, 5) is not None
-    detail = ("caller BYE->PBX=%s (%s), callee BYE<-PBX=%s (%s), PBX session cleared=%s"
-              % (tx_ok, ["%s:%s" % (i, p) for _, i, p in tx],
-                 rx_ok, ["%s:%s" % (i, p) for _, i, p in rx], gone))
-    return tx_ok and rx_ok and gone, detail
+    tx_note = ("%s" % ["%s:%s" % (i, p) for _, i, p in tx]) if tx else "unflushed"
+    detail = ("callee BYE<-PBX=%s (%s), PBX session cleared=%s, caller log BYE->%s"
+              % (rx_ok, ["%s:%s" % (i, p) for _, i, p in rx], gone, tx_note))
+    return rx_ok and gone and not tx_contradicts, detail
 
 
 def sc_hold_bye_via_pbx(env):
@@ -891,22 +912,27 @@ def sc_hold_bye_via_pbx(env):
     re-INVITE is a target refresh: the Contact in the relayed request and in its
     relayed 200 becomes each phone's remote target. Forwarded untouched they
     carried the other phone's real address, so after one hold the BYE went
-    phone-to-phone and the PBX kept a ghost session after both had hung up."""
-    a, b = env["A"], env["B"]
-    ma = a.mark()
-    a.call(b.ext)
-    if not a.wait_log(r"state changed to CONFIRMED", 10, ma):
-        a.hangup_all()
+    phone-to-phone and the PBX kept a ghost session after both had hung up.
+
+    Placed on C (not A) deliberately: pjsua hands out call slots round-robin,
+    and `call transfer_replaces` rejects the highest slot with a bare caret and
+    no REFER (see sc_attended_transfer). One extra A-originated call here
+    rotated A's slots so attended_transfer's A-B call landed on that slot."""
+    c, b = env["C"], env["B"]
+    mc = c.mark()
+    c.call(b.ext)
+    if not c.wait_log(r"state changed to CONFIRMED", 10, mc):
+        c.hangup_all()
         return report("hold_bye_via_pbx", "FAIL", "setup call never CONFIRMED")
     time.sleep(1.0)
-    a.cmd("call hold", 2.0)
-    a.cmd("call reinvite", 2.0)
+    c.cmd("call hold", 2.0)
+    c.cmd("call reinvite", 2.0)
     time.sleep(1.0)
-    m_a, m_b = a.mark(), b.mark()
-    a.hangup_all()
+    m_c, m_b = c.mark(), b.mark()
+    c.hangup_all()
     b.wait_log(r"RX \d+ bytes Request msg BYE", 6, m_b)
     time.sleep(0.5)
-    ok, detail = _bye_went_through_pbx(a, b, m_a, m_b)
+    ok, detail = _bye_went_through_pbx(c, b, m_c, m_b)
     b.hangup_all()
     return report("hold_bye_via_pbx", "OK" if ok else "FAIL", detail)
 
