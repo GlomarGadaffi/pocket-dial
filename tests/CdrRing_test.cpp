@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <string>
+#include <vector>
 
 // CdrRing_test.cpp -- issue #273/#277/#288's fix.
 //
@@ -227,4 +228,45 @@ TEST(CdrRingBlobType, CapacityMatchesTheDocumentedArithmetic)
 	// other fails a test, not just silently compiles differently than
 	// documented.
 	EXPECT_EQ(CdrRingBlob::kCapacity, static_cast<size_t>(POCKETDIAL_CDR_RECORDS) * 140 + 1);
+}
+
+// Issue #458: clearAll() resets the slots in place (no ring-sized temporary on
+// the http_conn stack). Whatever the mechanism, the contract is that EVERY
+// slot -- not just the live window -- is emptied, and that a cleared record
+// never resurfaces once new ones are written.
+TEST(CdrRingClearAll, EmptiesEverySlotAndNothingResurfaces)
+{
+	CdrRing ring;
+	// Wrap the ring more than once, so every slot holds a record and _head is
+	// somewhere in the middle.
+	const size_t n = POCKETDIAL_CDR_RECORDS + POCKETDIAL_CDR_RECORDS / 2 + 3;
+	for (size_t i = 0; i < n; ++i)
+		ring.record(nullptr, "old-caller-" + std::to_string(i), "old-callee-" + std::to_string(i));
+	for (const CallDetailRecord& r : ring.slotsForTest())
+		ASSERT_FALSE(r.caller.empty()) << "precondition: every slot is written";
+	ASSERT_EQ(ring.snapshot().size(), static_cast<size_t>(POCKETDIAL_CDR_RECORDS));
+
+	ring.clearAll();
+
+	size_t slot = 0;
+	for (const CallDetailRecord& r : ring.slotsForTest())
+	{
+		SCOPED_TRACE(::testing::Message() << "slot " << slot++);
+		EXPECT_TRUE(r.caller.empty());
+		EXPECT_TRUE(r.callee.empty());
+		EXPECT_EQ(r.startMs, 0u);
+		EXPECT_EQ(r.durationSec, 0u);
+		EXPECT_EQ(r.result, CallDetailRecord{}.result);
+	}
+	EXPECT_TRUE(ring.snapshot().empty());
+	EXPECT_EQ(ring.lastCallerFor("old-callee-" + std::to_string(n - 1)), "");
+
+	// New records start from a clean ring: exactly what was written, nothing old.
+	ring.record(nullptr, "new-caller", "new-callee");
+	const std::vector<CallDetailRecord> snap = ring.snapshot();
+	ASSERT_EQ(snap.size(), 1u);
+	EXPECT_EQ(snap[0].caller, "new-caller");
+	EXPECT_EQ(ring.lastCallerFor("new-callee"), "new-caller");
+	for (size_t i = 0; i < n; ++i)
+		EXPECT_EQ(ring.lastCallerFor("old-callee-" + std::to_string(i)), "") << i;
 }

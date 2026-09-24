@@ -97,6 +97,12 @@ public:
 		const std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS>& ring,
 		size_t head, size_t count, CdrRingBlob& out);
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#458): every slot, live or not, so a test can pin that
+	// clearAll() leaves none of them holding a record.
+	const std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS>& slotsForTest() const { return _ring; }
+#endif
+
 private:
 	void persist();
 
