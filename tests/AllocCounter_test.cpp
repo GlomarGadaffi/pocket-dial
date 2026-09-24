@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -71,21 +72,28 @@ TEST(AllocCounter, NothrowNewIsCounted)
 
 TEST(AllocCounter, AnotherThreadsAllocationIsInvisibleToThisThreadsGuard)
 {
-	AllocGuard guard;
-	const std::size_t globalBefore = heapAllocCount();
+	// Gated, so the other thread allocates only AFTER this thread's snapshot. Then the
+	// only way this thread's count can move is a counter that is not per-thread. An
+	// ungated version passed ~1% of the time on a broken counter (Griot, 200 runs).
+	std::atomic<bool> go{false};
 	std::size_t otherThreadDelta = 0;
-	std::thread t([&otherThreadDelta] {
+	const std::size_t globalBefore = heapAllocCount();
+
+	std::thread t([&go, &otherThreadDelta] {
+		while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
 		AllocGuard inner;
 		auto q = std::make_unique<long>(1);
 		g_sink = q.get();
 		otherThreadDelta = inner.delta();
 	});
-	const std::size_t sinceSpawn = guard.delta();   // std::thread itself may allocate here
+
+	AllocGuard guard;   // after std::thread's own allocations, before the other thread's
+	go.store(true, std::memory_order_release);
 	t.join();
-	const std::size_t afterJoin = guard.delta();
+	const std::size_t mine = guard.delta();
 	const std::size_t globalDelta = heapAllocCount() - globalBefore;
 
 	EXPECT_EQ(otherThreadDelta, 1u);
-	EXPECT_EQ(afterJoin, sinceSpawn) << "the other thread's new leaked into this thread's count";
+	EXPECT_EQ(mine, 0u) << "the other thread's new leaked into this thread's count";
 	EXPECT_GE(globalDelta, 1u) << "the process-wide counter missed the other thread";
 }
