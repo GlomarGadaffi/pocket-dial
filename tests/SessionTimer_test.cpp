@@ -456,6 +456,7 @@ TEST(SessionRecycling, AResetSlotIsIndistinguishableFromAFreshOne)
 	used.setVoicemailPurpose(Session::VoicemailPurpose::Retrieval);
 	used.setTrunk(true);
 	used.setTrunkRelaySlot(2);
+	used.noteServerCSeq(7);
 	used.reset("call-fresh", nullptr);
 
 	EXPECT_EQ(used.isVoicemail(),          fresh.isVoicemail());
@@ -463,4 +464,7 @@ TEST(SessionRecycling, AResetSlotIsIndistinguishableFromAFreshOne)
 	EXPECT_EQ(used.getVoicemailPurpose(),  fresh.getVoicemailPurpose());
 	EXPECT_EQ(used.isTrunk(),              fresh.isTrunk());
 	EXPECT_EQ(used.getTrunkRelaySlot(),    fresh.getTrunkRelaySlot());
+	// #389: a stale server CSeq would push a recycled slot's first BYE off 2.
+	EXPECT_EQ(used.lastServerCSeq(),       fresh.lastServerCSeq());
+	EXPECT_EQ(used.nextServerCSeq(),       fresh.nextServerCSeq());
 }
