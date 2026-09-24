@@ -311,7 +311,12 @@ namespace
 	}
 
 	// Strip surrounding whitespace and a single pair of double-quotes.
-	std::string trimQuoted(std::string_view sv)
+	//
+	// Returns a VIEW into `sv`, not a copy. It only ever narrows its input, so a
+	// std::string here was an allocation that bought nothing -- and it sat on the
+	// digest client's wire path, which #399 requires to be heap-free. Callers
+	// must not let the result outlive the buffer `sv` points into.
+	std::string_view trimQuoted(std::string_view sv)
 	{
 		size_t b = 0, e = sv.size();
 		while (b < e && std::isspace(static_cast<unsigned char>(sv[b]))) ++b;
@@ -321,7 +326,7 @@ namespace
 			++b;
 			--e;
 		}
-		return std::string(sv.substr(b, e - b));
+		return sv.substr(b, e - b);
 	}
 
 	bool iequalsAscii(std::string_view a, std::string_view b)
@@ -333,6 +338,20 @@ namespace
 			    std::tolower(static_cast<unsigned char>(b[i]))) return false;
 		}
 		return true;
+	}
+
+	// True if `s` holds a byte that breaks out of a quoted-string in an emitted
+	// header value: CR or LF INJECTS a new header line into the outbound SIP
+	// request, and `"` ends the quoted-string early so whatever follows is read
+	// as more auth-params. Both buildAuthorization overloads refuse any field
+	// they would write inside quotes that fails this -- see the gate there.
+	bool breaksQuotedString(std::string_view s)
+	{
+		for (char c : s)
+		{
+			if (c == '\r' || c == '\n' || c == '"') return true;
+		}
+		return false;
 	}
 
 	// =====================================================================
@@ -360,9 +379,18 @@ namespace
 	// `fn(key,value)`: invoked once per parameter. `key` is whitespace-trimmed
 	//                  but case-preserved; `value` is already unquoted.
 	//
+	// ALLOCATION-FREE (#399). Both `key` and `value` are VIEWS into
+	// `headerValue`, valid only for the duration of the callback: a callback
+	// that needs to keep a value must copy it out before returning. That is
+	// what lets one scanner serve the std::string API (which copies into
+	// std::string members) and the bounded client API (which copies into fixed
+	// char buffers) without either paying for the other's representation. It is
+	// sound because no quoted value is escape-processed here -- a quoted value
+	// is the literal bytes between the quotes, so it is always a substring.
+	//
 	// Returns false iff the "Digest" scheme token is absent.
 	template <typename Fn>
-	bool scanDigestParams(const std::string& headerValue,
+	bool scanDigestParams(std::string_view headerValue,
 	                      std::initializer_list<std::string_view> names,
 	                      std::string_view* matchedName,
 	                      Fn&& fn)
@@ -380,7 +408,7 @@ namespace
 			// the colon, which would indicate this colon belongs to a param value).
 			if (name.find('=') == std::string_view::npos)
 			{
-				const std::string trimmed = trimQuoted(name);
+				const std::string_view trimmed = trimQuoted(name);
 				for (std::string_view candidate : names)
 				{
 					if (iequalsAscii(trimmed, candidate))
@@ -430,14 +458,14 @@ namespace
 			++i; // consume '='
 
 			// Value: quoted or bare token (terminated by an unquoted comma).
-			std::string value;
+			std::string_view value;
 			while (i < n && std::isspace(static_cast<unsigned char>(rest[i]))) ++i;
 			if (i < n && rest[i] == '"')
 			{
 				++i; // opening quote
 				size_t valStart = i;
 				while (i < n && rest[i] != '"') ++i;
-				value.assign(rest.substr(valStart, i - valStart));
+				value = rest.substr(valStart, i - valStart);
 				if (i < n) ++i; // closing quote
 			}
 			else
@@ -494,7 +522,7 @@ namespace SipDigest
 		// check and return false), and the registrar has no proxy role to need it.
 		const bool isDigest = scanDigestParams(
 			authHeaderValue, {"authorization"}, nullptr,
-			[&out](std::string_view k, const std::string& value) {
+			[&out](std::string_view k, std::string_view value) {
 				if      (iequalsAscii(k, "username"))  out.username  = value;
 				else if (iequalsAscii(k, "realm"))     out.realm     = value;
 				else if (iequalsAscii(k, "nonce"))     out.nonce     = value;
@@ -657,7 +685,7 @@ namespace SipDigest
 		std::string_view matched;
 		const bool isDigest = scanDigestParams(
 			challengeHeaderValue, {"www-authenticate", "proxy-authenticate"}, &matched,
-			[&out](std::string_view k, const std::string& value) {
+			[&out](std::string_view k, std::string_view value) {
 				if      (iequalsAscii(k, "realm"))     out.realm       = value;
 				else if (iequalsAscii(k, "nonce"))     out.nonce       = value;
 				else if (iequalsAscii(k, "opaque"))    out.opaque      = value;
@@ -790,6 +818,22 @@ namespace SipDigest
 			return false;
 		}
 
+		// Header injection. Every field below is written inside a quoted-string
+		// without escaping: a `"` breaks the header's quoting, and a CR or LF
+		// injects SIP header lines into the outbound request. `username` comes
+		// from operator config (the trunk's Authentication ID), and a challenge
+		// field can carry a `"` too -- the scanner ends a QUOTED value at its
+		// closing quote, but a BARE value runs to the next comma, so `nonce=ab"cd`
+		// parses to `ab"cd`. Refused here, at the API boundary, rather than
+		// trusting every caller to validate. The bounded overload runs the SAME
+		// gate at the SAME point, so the two still agree on every input.
+		if (breaksQuotedString(username) || breaksQuotedString(uri) ||
+		    breaksQuotedString(cnonce)   || breaksQuotedString(ch.realm) ||
+		    breaksQuotedString(ch.nonce) || breaksQuotedString(ch.opaque))
+		{
+			return false;
+		}
+
 		const DigestAlgorithm alg = algorithmOf(ch);
 		if (alg == DigestAlgorithm::Unsupported)
 		{
@@ -881,6 +925,353 @@ namespace SipDigest
 			out += ", opaque=\"" + ch.opaque + "\"";
 		}
 
+		return true;
+	}
+	// =====================================================================
+	// ALLOCATION-FREE CLIENT (UAC) API -- issue #399. See the header.
+	//
+	// Nothing below may construct a std::string, a std::vector, or anything else
+	// that reaches operator new. SipDigestBounded_test pins that with the shared
+	// allocation counter; if you add a helper here, keep it on fixed buffers and
+	// string_views or that test goes red.
+	// =====================================================================
+
+	namespace
+	{
+		constexpr size_t kHexDigestLen = 32;   // MD5 is 16 bytes -> 32 hex chars
+
+		// Lowercase hex, matching toHex() above byte for byte.
+		void hex16(const uint8_t in[16], char (&out)[kHexDigestLen + 1])
+		{
+			static const char* digits = "0123456789abcdef";
+			for (size_t i = 0; i < 16; ++i)
+			{
+				out[i * 2]     = digits[(in[i] >> 4) & 0x0F];
+				out[i * 2 + 1] = digits[in[i] & 0x0F];
+			}
+			out[kHexDigestLen] = '\0';
+		}
+
+		// MD5 over the CONCATENATION of `parts`, without ever concatenating them.
+		// Feeding the pieces to one Md5 in order hashes exactly the same byte
+		// stream as md5Hex(a + ":" + b + ...) -- that equivalence is the whole
+		// basis for this API producing the std::string API's bytes, and
+		// SipDigestBounded_test checks it against the RFC vectors.
+		//
+		// std::initializer_list is a view over a stack array: no allocation.
+		void md5HexOf(std::initializer_list<std::string_view> parts,
+		              char (&out)[kHexDigestLen + 1])
+		{
+			Md5 h;
+			for (std::string_view p : parts)
+			{
+				h.update(reinterpret_cast<const uint8_t*>(p.data()), p.size());
+			}
+			uint8_t digest[16];
+			h.finalize(digest);
+			hex16(digest, out);
+		}
+
+		// Appends into a caller buffer and remembers whether anything failed to
+		// fit. Once overflowed it writes nothing further, so a partial value can
+		// never be mistaken for a complete one: the caller checks `overflow` once,
+		// at the end, and discards the buffer.
+		struct BoundedWriter
+		{
+			char*  buf;
+			size_t cap;
+			size_t len      = 0;
+			bool   overflow = false;
+
+			BoundedWriter(char* b, size_t c) : buf(b), cap(c)
+			{
+				if (cap == 0) overflow = true;   // no room even for the NUL
+				else          buf[0] = '\0';
+			}
+
+			void put(std::string_view s)
+			{
+				if (overflow) return;
+				// `>=` not `>`: one byte must stay free for the terminator.
+				if (s.size() >= cap - len)
+				{
+					overflow = true;
+					return;
+				}
+				std::memcpy(buf + len, s.data(), s.size());
+				len += s.size();
+				buf[len] = '\0';
+			}
+		};
+
+		// Overwrites a fixed buffer when it goes out of scope, on every return
+		// path. For HA1 / HA1-sess, which are password-equivalent for the realm:
+		// anyone holding one can answer this realm's challenges as this user.
+		// `volatile` so an optimiser that can see the buffer is dead afterwards
+		// still has to do the writes. Best-effort hygiene, not a security
+		// boundary -- a register or an earlier spill can still hold a copy.
+		struct ScopedWipe
+		{
+			char*  p;
+			size_t n;
+			~ScopedWipe()
+			{
+				volatile char* v = p;
+				for (size_t i = 0; i < n; ++i) v[i] = 0;
+			}
+		};
+
+		// Copy `v` into a fixed field. Refuses (sets `overflow`) rather than
+		// truncating -- see the header on why a shortened nonce is worse than no
+		// answer at all.
+		void storeBounded(char* dst, size_t cap, std::string_view v, bool& overflow)
+		{
+			if (v.size() >= cap)
+			{
+				overflow = true;
+				return;
+			}
+			std::memcpy(dst, v.data(), v.size());
+			dst[v.size()] = '\0';
+		}
+	}
+
+	bool parseChallenge(std::string_view challengeHeaderValue,
+	                    BoundedChallenge& out,
+	                    bool proxyDefault)
+	{
+		out = BoundedChallenge{};
+		out.proxy = proxyDefault;
+
+		bool overflow = false;
+		std::string_view matched;
+		// The SAME scanner and the SAME key set as the std::string overload, so
+		// the two can only differ in where the values are stored.
+		const bool isDigest = scanDigestParams(
+			challengeHeaderValue, {"www-authenticate", "proxy-authenticate"}, &matched,
+			[&out, &overflow](std::string_view k, std::string_view value) {
+				if      (iequalsAscii(k, "realm"))     storeBounded(out.realm,     sizeof(out.realm),     value, overflow);
+				else if (iequalsAscii(k, "nonce"))     storeBounded(out.nonce,     sizeof(out.nonce),     value, overflow);
+				else if (iequalsAscii(k, "opaque"))    storeBounded(out.opaque,    sizeof(out.opaque),    value, overflow);
+				else if (iequalsAscii(k, "algorithm")) storeBounded(out.algorithm, sizeof(out.algorithm), value, overflow);
+				else if (iequalsAscii(k, "qop"))       storeBounded(out.qopList,   sizeof(out.qopList),   value, overflow);
+				else if (iequalsAscii(k, "stale"))     out.stale = iequalsAscii(value, "true");
+				// "domain" and unknown parameters are ignored -- see the header.
+			});
+		if (!isDigest)
+		{
+			return false;
+		}
+		if (overflow)
+		{
+			// Never leave a half-parsed challenge behind for a caller that ignores
+			// the return value.
+			out = BoundedChallenge{};
+			return false;
+		}
+
+		if (!matched.empty())
+		{
+			out.proxy = iequalsAscii(matched, "proxy-authenticate");
+		}
+		return out.nonce[0] != '\0';
+	}
+
+	DigestAlgorithm algorithmOf(const BoundedChallenge& ch)
+	{
+		const std::string_view alg(ch.algorithm);
+		if (alg.empty())                    return DigestAlgorithm::Md5;
+		if (iequalsAscii(alg, "md5"))       return DigestAlgorithm::Md5;
+		if (iequalsAscii(alg, "md5-sess"))  return DigestAlgorithm::Md5Sess;
+		return DigestAlgorithm::Unsupported;
+	}
+
+	bool selectQop(const BoundedChallenge& ch, bool& useAuth)
+	{
+		useAuth = false;
+		const std::string_view list(ch.qopList);
+		if (list.empty())
+		{
+			return true;   // no qop at all -> legacy RFC 2069
+		}
+
+		// Token walk, NOT list.find("auth"): "auth-int" contains "auth", so a
+		// substring test would answer an auth-int-only challenge with qop=auth.
+		// Identical walk to the std::string overload.
+		size_t i = 0;
+		const size_t n = list.size();
+		while (i < n)
+		{
+			while (i < n && (list[i] == ',' ||
+			                 std::isspace(static_cast<unsigned char>(list[i])))) ++i;
+			size_t start = i;
+			while (i < n && list[i] != ',') ++i;
+			size_t end = i;
+			while (end > start &&
+			       std::isspace(static_cast<unsigned char>(list[end - 1]))) --end;
+			if (iequalsAscii(list.substr(start, end - start), "auth"))
+			{
+				useAuth = true;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	const char* authorizationHeaderName(const BoundedChallenge& ch)
+	{
+		return ch.proxy ? "Proxy-Authorization" : "Authorization";
+	}
+
+	void formatNc(uint32_t count, char (&out)[kNcLen + 1])
+	{
+		static const char* d = "0123456789abcdef";
+		uint32_t v = count;
+		for (int i = static_cast<int>(kNcLen) - 1; i >= 0; --i)
+		{
+			out[i] = d[v & 0xF];
+			v >>= 4;
+		}
+		out[kNcLen] = '\0';
+	}
+
+	void makeCnonce(char (&out)[kCnonceLen + 1])
+	{
+		// Same source and width as the std::string makeCnonce(): 8 CSPRNG bytes.
+		uint8_t raw[kCnonceLen / 2];
+		fillRandom(raw, sizeof(raw));
+		static const char* digits = "0123456789abcdef";
+		for (size_t i = 0; i < sizeof(raw); ++i)
+		{
+			out[i * 2]     = digits[(raw[i] >> 4) & 0x0F];
+			out[i * 2 + 1] = digits[raw[i] & 0x0F];
+		}
+		out[kCnonceLen] = '\0';
+	}
+
+	bool buildAuthorization(const BoundedChallenge& ch,
+	                        std::string_view username,
+	                        std::string_view password,
+	                        std::string_view method,
+	                        std::string_view uri,
+	                        uint32_t ncValue,
+	                        std::string_view cnonce,
+	                        char* out,
+	                        size_t cap,
+	                        size_t& outLen)
+	{
+		// --- Refusal gates: the std::string overload's, in its order. On any of
+		// --- these `out` and `outLen` are left untouched, as that overload leaves
+		// --- its `out`.
+		const std::string_view nonce(ch.nonce);
+		if (nonce.empty())
+		{
+			return false;
+		}
+
+		// Header injection: the std::string overload's gate, at the same point,
+		// over the same fields -- see the comment there.
+		if (breaksQuotedString(username) || breaksQuotedString(uri) ||
+		    breaksQuotedString(cnonce)   || breaksQuotedString(ch.realm) ||
+		    breaksQuotedString(nonce)    || breaksQuotedString(ch.opaque))
+		{
+			return false;
+		}
+
+		const DigestAlgorithm alg = algorithmOf(ch);
+		if (alg == DigestAlgorithm::Unsupported)
+		{
+			return false;   // RFC 8760 SHA-2: an MD5 answer would simply be wrong
+		}
+
+		bool useAuth = false;
+		if (!selectQop(ch, useAuth))
+		{
+			return false;   // auth-int only: we do not hash message bodies
+		}
+
+		if (useAuth && cnonce.empty())
+		{
+			return false;   // qop=auth requires a cnonce (RFC 7616 §3.4)
+		}
+		if (alg == DigestAlgorithm::Md5Sess && cnonce.empty())
+		{
+			return false;   // HA1-sess is defined over the cnonce
+		}
+		if (alg == DigestAlgorithm::Md5Sess && !useAuth)
+		{
+			return false;   // unverifiable: see the std::string overload's note
+		}
+
+		// --- Compute. Every hash is streamed; nothing is concatenated.
+		const std::string_view realm(ch.realm);
+
+		char ha1[kHexDigestLen + 1];
+		const ScopedWipe wipeHa1{ha1, sizeof(ha1)};
+		md5HexOf({username, ":", realm, ":", password}, ha1);
+		if (alg == DigestAlgorithm::Md5Sess)
+		{
+			char ha1sess[kHexDigestLen + 1];
+			const ScopedWipe wipeHa1Sess{ha1sess, sizeof(ha1sess)};
+			md5HexOf({ha1, ":", nonce, ":", cnonce}, ha1sess);
+			std::memcpy(ha1, ha1sess, sizeof(ha1));
+		}
+
+		char ha2[kHexDigestLen + 1];
+		md5HexOf({method, ":", uri}, ha2);
+
+		char nc[kNcLen + 1];
+		formatNc(ncValue, nc);
+
+		char response[kHexDigestLen + 1];
+		if (useAuth)
+		{
+			md5HexOf({ha1, ":", nonce, ":", nc, ":", cnonce, ":", "auth", ":", ha2}, response);
+		}
+		else
+		{
+			md5HexOf({ha1, ":", nonce, ":", ha2}, response);
+		}
+
+		// --- Emit. Parameter order and quoting are the std::string overload's
+		// --- exactly: username/realm/nonce/uri/response/cnonce/opaque quoted,
+		// --- algorithm/qop/nc bare (a quoted nc is rejected by Kamailio and
+		// --- several SBCs).
+		BoundedWriter w(out, cap);
+		w.put("Digest username=\""); w.put(username);
+		w.put("\", realm=\"");      w.put(realm);
+		w.put("\", nonce=\"");      w.put(nonce);
+		w.put("\", uri=\"");        w.put(uri);
+		w.put("\", response=\"");   w.put(response);
+		w.put("\"");
+
+		const std::string_view algorithm(ch.algorithm);
+		if (!algorithm.empty())
+		{
+			w.put(", algorithm="); w.put(algorithm);
+		}
+
+		if (useAuth)
+		{
+			w.put(", cnonce=\""); w.put(cnonce);
+			w.put("\", qop=auth, nc="); w.put(nc);
+		}
+
+		const std::string_view opaque(ch.opaque);
+		if (!opaque.empty())
+		{
+			w.put(", opaque=\""); w.put(opaque); w.put("\"");
+		}
+
+		if (w.overflow)
+		{
+			// Some bytes may already be in `out`. A truncated Authorization must
+			// never be sendable, so leave an empty string rather than a prefix.
+			if (cap > 0) out[0] = '\0';
+			outLen = 0;
+			return false;
+		}
+		outLen = w.len;
 		return true;
 	}
 }

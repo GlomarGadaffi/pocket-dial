@@ -123,6 +123,9 @@ add_executable(sip_parser_tests
     # Errata 749 — because a digest implementation that only agrees with itself
     # will agree with itself while failing against every real SBC.
     SipDigestClient_test.cpp
+    # Issue #399: the allocation-free digest client API, checked byte for byte
+    # against the std::string API above and against the published RFC vectors.
+    SipDigestBounded_test.cpp
     # The REGISTER user agent built on top of it: challenge/retry, nc
     # incrementing across refreshes, stale-nonce re-challenge, 423 + Min-Expires,
     # a server-shortened Expires, and the backoff that keeps a refusing carrier

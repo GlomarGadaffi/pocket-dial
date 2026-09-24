@@ -29,7 +29,9 @@
 //
 // The realm is fixed to "pocketdial" by the caller (not hard-coded here).
 
+#include <cstddef>
 #include <string>
+#include <string_view>
 #include <cstdint>
 
 namespace SipDigest
@@ -276,6 +278,112 @@ namespace SipDigest
 	                        uint32_t ncValue,
 	                        const std::string& cnonce,
 	                        std::string& out);
+
+	// =====================================================================
+	// ALLOCATION-FREE CLIENT (UAC) API -- issue #399
+	// =====================================================================
+	//
+	// The std::string API above allocates on every call: DigestChallenge's
+	// fields are std::string, and md5Hex/formatNc/makeCnonce/buildAuthorization
+	// all build strings. That is fine for the registrar and for tests, and it is
+	// NOT fine for a UAC answering a 401/407 on the SIP thread at call time,
+	// which is where desmo's no-allocation-after-init bar (#284) applies. So this
+	// is a second, fixed-buffer surface over the SAME algorithm:
+	//
+	//   * one parameter scanner, shared with the std::string API (now itself
+	//     allocation-free), so the two cannot drift in how they read a header;
+	//   * the same vendored MD5, fed incrementally -- "user:realm:pass" is hashed
+	//     by streaming its pieces, never by concatenating them;
+	//   * the same refusal gates, in the same order, with the same emitted bytes.
+	//
+	// The std::string API is the ORACLE for this one: SipDigestBounded_test
+	// asserts byte-identical output across the RFC 2617 / 7616 / 2069 vectors and
+	// every refusal case, and that none of it touches the heap.
+	//
+	// The ONE deliberate behavioural difference: a field too long for its buffer
+	// makes the bounded parse FAIL, where the std::string parse would accept it.
+	// Truncating instead would be worse than refusing -- a shortened nonce or
+	// realm yields a response the server can never reproduce, which on the wire
+	// is indistinguishable from a wrong password and loops forever.
+
+	// Fixed-capacity mirror of DigestChallenge. Capacities are
+	// SipRegistrationClient's own stored-challenge buffers exactly, so a value
+	// parsed here fits there with no second bounds decision. Every field is
+	// NUL-terminated; an absent parameter is an empty string.
+	//
+	// DigestChallenge's `domainParam` has no counterpart: it is documented as
+	// unused, and storing it would give an unused field the power to reject an
+	// otherwise answerable challenge.
+	struct BoundedChallenge
+	{
+		static constexpr size_t kMaxRealm     = 64;   // == SipRegistrationClient::kMaxHost
+		static constexpr size_t kMaxNonce     = 128;  // == SipRegistrationClient::kMaxNonce
+		static constexpr size_t kMaxOpaque    = 128;  // == SipRegistrationClient::kMaxNonce
+		static constexpr size_t kMaxAlgorithm = 16;   // == SipRegistrationClient::kMaxAlgo
+		static constexpr size_t kMaxQopList   = 32;   // == SipRegistrationClient::kMaxQop
+
+		char realm[kMaxRealm]         = {};
+		char nonce[kMaxNonce]         = {};
+		char opaque[kMaxOpaque]       = {};   // echoed back verbatim if present
+		char algorithm[kMaxAlgorithm] = {};   // AS SENT; "" means MD5
+		char qopList[kMaxQopList]     = {};   // RAW list as sent
+		bool stale = false;
+		bool proxy = false;
+	};
+
+	// Bounded parseChallenge. Same input forms, same `proxyDefault` rule, same
+	// "true iff a Digest challenge carrying a nonce" result as the std::string
+	// overload -- PLUS false if any stored field would not fit its buffer. On
+	// that overflow `out` is reset to a default BoundedChallenge, so a caller
+	// that ignores the return still cannot answer a half-parsed challenge.
+	bool parseChallenge(std::string_view challengeHeaderValue,
+	                    BoundedChallenge& out,
+	                    bool proxyDefault = false);
+
+	DigestAlgorithm algorithmOf(const BoundedChallenge& ch);
+
+	// Same contract as the std::string selectQop, with the chosen qop reported
+	// as a flag instead of a string (the only answerable qop is "auth"):
+	//   true , useAuth == true  : qop=auth
+	//   true , useAuth == false : no qop parameter -- legacy RFC 2069
+	//   false, useAuth == false : a list was offered without "auth"
+	bool selectQop(const BoundedChallenge& ch, bool& useAuth);
+
+	const char* authorizationHeaderName(const BoundedChallenge& ch);
+
+	// Fixed-width text forms. Both write exactly the digits plus a NUL.
+	static constexpr size_t kNcLen     = 8;    // RFC 7616 §3.4.3: 8 hex digits
+	static constexpr size_t kCnonceLen = 16;   // 8 CSPRNG bytes, hex -- same as makeCnonce()
+	void formatNc(uint32_t count, char (&out)[kNcLen + 1]);
+	void makeCnonce(char (&out)[kCnonceLen + 1]);
+
+	// A buffer this size holds any header value buildAuthorization can emit for
+	// a BoundedChallenge, a 63-char username and a URI of up to 160 chars.
+	// Callers with longer URIs pass a bigger buffer; overflow is detected, not
+	// assumed away.
+	static constexpr size_t kMaxAuthorizationValue = 768;
+
+	// Bounded buildAuthorization. Same refusal gates and same emitted bytes as
+	// the std::string overload, written into `out[0..cap)` NUL-terminated, with
+	// the length (excluding the NUL) in `outLen`.
+	//
+	// Returns false when:
+	//   * the challenge cannot be answered (the std::string overload's gates) --
+	//     `out` and `outLen` are left UNTOUCHED, exactly as that overload leaves
+	//     its `out`;
+	//   * the value would not fit in `cap` -- `out` is then an empty string and
+	//     `outLen` is 0, because by the time overflow is known some bytes are
+	//     already written, and a truncated Authorization must never be sendable.
+	bool buildAuthorization(const BoundedChallenge& ch,
+	                        std::string_view username,
+	                        std::string_view password,
+	                        std::string_view method,
+	                        std::string_view uri,
+	                        uint32_t ncValue,
+	                        std::string_view cnonce,
+	                        char* out,
+	                        size_t cap,
+	                        size_t& outLen);
 }
 
 #endif // SIP_DIGEST_HPP
