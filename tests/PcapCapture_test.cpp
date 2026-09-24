@@ -4,7 +4,9 @@
 
 #include <gtest/gtest.h>
 
+#include "AllocCounter.hpp"
 #include "PcapCapture.hpp"
+#include "SipMessage.hpp"
 #include "RequestsHandler.hpp"
 #include "HttpServer.hpp"
 #include "AdminAuth.hpp"
@@ -20,7 +22,9 @@
 #include <unistd.h>
 #endif
 
+#include <array>
 #include <chrono>
+#include <memory>
 #include <thread>
 
 namespace
@@ -382,47 +386,124 @@ TEST(PcapCapture, RequestsHandlerGetTraceRecordsMirrorsGetPcapCapture)
 
 // ── Issue #101(D): the capture path must stop allocating once the ring is full ──
 //
-// Capture is unconditional and runs under RequestsHandler::_mutex, so a
-// per-packet malloc/free sat inside the SIP critical section. The fix recycles
-// each evicted entry's buffer in place. These tests assert that recycling
-// directly rather than trusting the comment: a freshly-constructed std::string
-// would come back with small-string capacity and a different data pointer.
+// Issue #416: the ring is fixed-size storage inside PcapCapture, so recording a
+// packet must never touch the heap. This is desmo's no-allocation-after-init rule
+// on the SIP hot path, and the lazily-grown, capacity-ratcheting std::string ring
+// it replaced was a suspect for #328's internal-DRAM drift.
 
-TEST(PcapCapture, RecordIntoRecyclesEvictedBufferInsteadOfReallocating) {
-	PcapCapture cap;
-	const sockaddr_in peer = addr("10.0.0.9", 5060);
-	// Comfortably past any small-string optimization, so the buffer is a real
-	// heap allocation whose identity we can track.
-	const std::string big(1200, 'x');
-
-	// Fill the ring exactly once.
-	for (size_t i = 0; i < POCKETDIAL_PCAP_RING_SIZE; ++i)
+namespace
+{
+	uint32_t readU32LE(const std::string& s, std::size_t at)
 	{
-		cap.recordInto(false, peer).assign(big);
+		return static_cast<uint32_t>(static_cast<unsigned char>(s[at])) |
+		       (static_cast<uint32_t>(static_cast<unsigned char>(s[at + 1])) << 8) |
+		       (static_cast<uint32_t>(static_cast<unsigned char>(s[at + 2])) << 16) |
+		       (static_cast<uint32_t>(static_cast<unsigned char>(s[at + 3])) << 24);
 	}
-	ASSERT_EQ(cap.size(), POCKETDIAL_PCAP_RING_SIZE);
-
-	// The next record wraps onto the oldest slot. Its buffer must be the one that
-	// slot already owned: emptied, but with its capacity — and its address — kept.
-	std::string& wrapped = cap.recordInto(false, peer);
-	const char* recycledData = wrapped.data();
-	EXPECT_EQ(wrapped.size(), 0u);
-	EXPECT_GE(wrapped.capacity(), big.size());
-	wrapped.assign(big);
-
-	// Come all the way around again: the same slot, hence the same buffer, with
-	// no reallocation in between.
-	for (size_t i = 0; i < POCKETDIAL_PCAP_RING_SIZE - 1; ++i)
+	uint16_t readU16BE(const std::string& s, std::size_t at)
 	{
-		cap.recordInto(false, peer).assign(big);
+		return static_cast<uint16_t>((static_cast<unsigned char>(s[at]) << 8) |
+		                             static_cast<unsigned char>(s[at + 1]));
 	}
-	std::string& sameSlot = cap.recordInto(false, peer);
-	EXPECT_EQ(sameSlot.data(), recycledData);
-	EXPECT_GE(sameSlot.capacity(), big.size());
 }
 
-// The ring must not grow past its cap, and must not shrink back either — a slot
-// that has been used keeps its buffer for the next packet that lands there.
+TEST(PcapCapture, RecordingAllocatesNothingAfterConstruction) {
+	auto cap = std::make_unique<PcapCapture>();   // 16 x ~2 KB: keep it off the test's stack
+	const sockaddr_in peer = addr("10.0.0.9", 5060);
+	// Every payload is built BEFORE the guard: small, SSO-sized, a full slot, and
+	// one past the slot, so the truncating path is inside the counted block too.
+	const std::string small = "OPTIONS sip:x SIP/2.0\r\n\r\n";
+	const std::string invite(1500, 'i');
+	const std::string exact(PcapCapture::kSlotBytes, 'e');
+	const std::string oversize(PcapCapture::kSlotBytes + 300, 'o');
+	SipMessage msg("INVITE sip:200@10.0.0.1 SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.9:5060\r\n"
+	               "To: <sip:200@10.0.0.1>\r\nFrom: <sip:100@10.0.0.1>;tag=a\r\n"
+	               "Call-ID: c1\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n", peer);
+
+	AllocGuard guard;
+	// Three times round the ring, so filling, wrapping and overwriting are all counted.
+	for (std::size_t i = 0; i < PcapCapture::kRingSize * 3; ++i)
+	{
+		cap->record(false, peer, small);
+		cap->record(true,  peer, invite);
+		cap->record(false, peer, exact);
+		cap->record(true,  peer, oversize);
+		cap->recordWith(true, peer, [&msg](char* buf, std::size_t n) { return msg.serializeInto(buf, n); });
+	}
+	EXPECT_EQ(guard.delta(), 0u) << "PcapCapture::record()/recordWith() touched the heap";
+	EXPECT_EQ(cap->size(), PcapCapture::kRingSize);
+}
+
+TEST(PcapCapture, SerializeIntoAllocatesNothingAndMatchesToString) {
+	const sockaddr_in peer = addr("10.0.0.9", 5060);
+	SipMessage msg("SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.0.0.9:5060\r\nTo: <sip:a@b>;tag=t\r\n"
+	               "From: <sip:c@d>;tag=f\r\nCall-ID: z\r\nCSeq: 2 INVITE\r\n"
+	               "Content-Type: application/sdp\r\nContent-Length: 4\r\n\r\nv=0\n", peer);
+	const std::string expected = msg.toString();
+	std::array<char, 4096> buf{};
+
+	AllocGuard guard;
+	const std::size_t full = msg.serializeInto(buf.data(), buf.size());
+	EXPECT_EQ(guard.delta(), 0u);
+	ASSERT_EQ(full, expected.size());
+	EXPECT_EQ(std::string(buf.data(), full), expected);
+
+	// Truncated: writes exactly `cap` bytes, still reports the full length, and
+	// leaves everything past `cap` untouched.
+	std::array<char, 40> small;
+	small.fill('#');
+	const std::size_t cap = 25;
+	EXPECT_EQ(msg.serializeInto(small.data(), cap), expected.size());
+	EXPECT_EQ(std::string(small.data(), cap), expected.substr(0, cap));
+	EXPECT_EQ(small[cap], '#');
+}
+
+TEST(PcapCapture, OversizeMessageIsTruncatedAndFlaggedNotReallocated) {
+	auto cap = std::make_unique<PcapCapture>();
+	const sockaddr_in peer = addr("10.0.0.9", 5060);
+	const std::size_t extra = 300;
+	std::string big(PcapCapture::kSlotBytes + extra, 'x');
+	big.replace(0, 5, "HEAD:");
+	cap->record(true, peer, big);
+	cap->record(false, peer, "fits");
+
+	auto recs = cap->traceRecords();
+	ASSERT_EQ(recs.size(), 2u);
+	EXPECT_TRUE(recs[0].truncated);
+	EXPECT_EQ(recs[0].text.size(), PcapCapture::kSlotBytes);
+	EXPECT_EQ(recs[0].text, big.substr(0, PcapCapture::kSlotBytes));
+	EXPECT_FALSE(recs[1].truncated);
+	EXPECT_EQ(recs[1].text, "fits");
+
+	// In the pcap file the truncation is visible the standard way: incl_len is
+	// what was kept, orig_len and the IP/UDP length fields are the real size.
+	const std::string file = cap->toPcapFile("10.0.0.1", 5060);
+	const std::size_t rec0 = 24;
+	const uint32_t incl = readU32LE(file, rec0 + 8);
+	const uint32_t orig = readU32LE(file, rec0 + 12);
+	EXPECT_EQ(incl, 14u + 20u + 8u + PcapCapture::kSlotBytes);
+	EXPECT_EQ(orig, incl + extra);
+	const std::size_t ip = rec0 + 16 + 14;
+	EXPECT_EQ(readU16BE(file, ip + 2), 20u + 8u + big.size());       // IPv4 total length
+	EXPECT_EQ(readU16BE(file, ip + 20 + 4), 8u + big.size());        // UDP length
+
+	// The following record starts exactly after the kept bytes, so the file still parses.
+	const std::size_t rec1 = rec0 + 16 + incl;
+	EXPECT_EQ(readU32LE(file, rec1 + 8), readU32LE(file, rec1 + 12));
+	EXPECT_EQ(file.size(), rec1 + 16 + readU32LE(file, rec1 + 8));
+}
+
+TEST(PcapCapture, AMessageExactlyOneSlotLongIsNotFlaggedTruncated) {
+	auto cap = std::make_unique<PcapCapture>();
+	const std::string exact(PcapCapture::kSlotBytes, 'e');
+	cap->record(false, addr("10.0.0.9", 5060), exact);
+	auto recs = cap->traceRecords();
+	ASSERT_EQ(recs.size(), 1u);
+	EXPECT_FALSE(recs[0].truncated);
+	EXPECT_EQ(recs[0].text, exact);
+}
+
+// The ring must not grow past its cap, and clear() must restart ordering.
 TEST(PcapCapture, RingSizeSaturatesAtCapacityAndClearResetsOrdering) {
 	PcapCapture cap;
 	const sockaddr_in peer = addr("10.0.0.9", 5060);

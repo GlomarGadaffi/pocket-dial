@@ -831,23 +831,22 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// signaling-research aid, not a wire-level DoS forensics tool, and
 		// capturing before the rate limiter would mean pulling the ring buffer
 		// out from under _mutex for every flood packet too.
-		// Written straight into the ring slot — no per-packet temporary inside
-		// the critical section (Issue #101(D)).
-		std::string& pcapSlot = _pcapCapture.recordInto(/*outbound=*/false, request->getSource());
+		// Written straight into a fixed ring slot: no allocation (Issue #416).
 		if (!rawBytes.empty())
 		{
 			// Issue #105: capture the exact bytes recvfrom() delivered, not a
 			// re-serialization of the parsed message — whitespace, compact header
 			// forms (f:/t:/v:/i:), CRLF-vs-LF tolerance, or any malformed-but-
 			// tolerated line the parser normalized must survive in the capture.
-			pcapSlot.assign(rawBytes.data(), rawBytes.size());
+			_pcapCapture.record(/*outbound=*/false, request->getSource(), rawBytes);
 		}
 		else
 		{
 			// No wire bytes offered (a message built in-process, or a test calling
 			// handle() directly with no UdpServer/SipServer involved) — the parsed
 			// form is genuinely what such a caller means to inspect.
-			request->toString(pcapSlot);
+			_pcapCapture.recordWith(/*outbound=*/false, request->getSource(),
+				[&request](char* buf, std::size_t cap) { return request->serializeInto(buf, cap); });
 		}
 
 		// ── SDP admission gate (docs/THREAT_MODEL.md T-7) ──────────────────────
@@ -9415,7 +9414,8 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 		// the retransmit registration above — every deferred message leaves
 		// through here regardless of which call site (handle(), tick(),
 		// sendMessageTo()) queued it.
-		msg->toString(_pcapCapture.recordInto(/*outbound=*/true, addr));
+		_pcapCapture.recordWith(/*outbound=*/true, addr,
+			[&msg](char* buf, std::size_t cap) { return msg->serializeInto(buf, cap); });
 	}
 
 	auto drained = std::move(_outbox);
