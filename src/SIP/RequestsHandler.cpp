@@ -1,6 +1,7 @@
 // RequestsHandler.cpp: Issues #24 and #28 resolved.
 #include "RequestsHandler.hpp"
 #include "SipMessagePool.hpp"
+#include <cassert>
 #include <atomic>
 #include <iostream>
 #include <sstream>
@@ -6347,8 +6348,19 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// be hung up on here is the one now being kept.
 	if (!targetClient.has_value())
 	{
-		auto notify = buildReferNotify(data, transferor, "SIP/2.0 404 Not Found", /*terminated=*/true);
+		// Issue #422: above everything this dialog has carried, like the success
+		// NOTIFY (#402) -- not the builder's default 2.
+		//
+		// `original` cannot be null here: `transferee` is only ever set inside
+		// the `if (originalOpt.has_value())` block above, and a null transferee
+		// has already returned through the 481/603 decline. So there is no
+		// fallback CSeq to get wrong (#459 review).
+		assert(original && "blind-REFER decline reached without a session");
+		const uint32_t notifyCSeq = original->nextServerCSeq();
+		auto notify = buildReferNotify(data, transferor, "SIP/2.0 404 Not Found", /*terminated=*/true,
+			notifyCSeq);
 		if (notify) _outbox.emplace_back(transferor->getAddress(), std::move(notify));
+		original->noteServerCSeq(notifyCSeq);
 		queueLog("REFER: blind transfer to " + target + " declined (no such target) — "
 			"call left up", true);
 		return;
@@ -6793,9 +6805,13 @@ bool RequestsHandler::handleBlindXferFailure(const std::shared_ptr<SipMessage>& 
 				: orig->getDialogTo();
 			const std::string& transfereeHdr = orig->wasTransferorSrc() ? orig->getDialogTo()
 				: orig->getDialogFrom();
+			// Issue #422: in A's name on the relayed A-B dialog, where the
+			// transferee has seen A's CSeqs -- above them, not the default 2.
+			const uint32_t byeCSeq = orig->nextServerCSeq();
 			auto bye = buildServerBye(transferee->getNumber(), transferee->getAddress(),
-				leg->getPeerCallID(), transferorHdr, transfereeHdr);
+				leg->getPeerCallID(), transferorHdr, transfereeHdr, byeCSeq);
 			if (bye) _outbox.emplace_back(transferee->getAddress(), std::move(bye));
+			orig->noteServerCSeq(byeCSeq);
 		}
 		endCall(leg->getPeerCallID(),
 			orig->getSrc() ? orig->getSrc()->getNumber() : std::string(),
@@ -7325,9 +7341,11 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 			// From or To is malformed and phones drop it. A dialog that never
 			// reached Connected (still ringing) has no To-tag yet and gets no
 			// BYE — endCall() below still clears it server-side, as before.
+			// Issue #422: same relayed-dialog CSeq rule as the session-timer reaper.
+			const uint32_t byeCSeq = session->nextServerCSeq();
 			if (src && !dFrom.empty() && !dTo.empty())
 			{
-				auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom);
+				auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom, byeCSeq);
 				if (b) _asyncOutbox.emplace_back(src->getAddress(), std::move(b));
 			}
 			// A virtual-extension leg (777 echo, 888 conference, 555 anchor) has no
@@ -7340,9 +7358,10 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 			                           destNum == kAnchorCallExt;
 			if (dest && !destIsVirtual && !dFrom.empty() && !dTo.empty())
 			{
-				auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo);
+				auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo, byeCSeq);
 				if (b) _asyncOutbox.emplace_back(dest->getAddress(), std::move(b));
 			}
+			session->noteServerCSeq(byeCSeq);
 			endCall(callID,
 			        src  ? src->getNumber()  : "",
 			        dest ? dest->getNumber() : "",
@@ -9292,16 +9311,21 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 		// and phones will drop it, leaving the session alive and re-firing every sweep
 		// tick. dTo can be empty if armSessionTimer was invoked before the 200 OK set
 		// dialog headers (e.g. a partial onReinvite path). (#72)
+		// Issue #422: this dialog is relayed, so each phone has already seen the
+		// OTHER phone's CSeqs (pjsua starts at a random ~5-digit value). A BYE at
+		// the old default 2 was refused 500 Invalid CSeq and left the leg up.
+		const uint32_t byeCSeq = session->nextServerCSeq();
 		if (src && !dFrom.empty() && !dTo.empty())
 		{
-			auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom);
+			auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom, byeCSeq);
 			if (b) _outbox.emplace_back(src->getAddress(), std::move(b));
 		}
 		if (dest && !dFrom.empty() && !dTo.empty())
 		{
-			auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo);
+			auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo, byeCSeq);
 			if (b) _outbox.emplace_back(dest->getAddress(), std::move(b));
 		}
+		session->noteServerCSeq(byeCSeq);
 		queueLog("[session timer] expired — BYE sent for " + callID, true);
 		endCall(callID,
 		        src  ? src->getNumber()  : "",
