@@ -1191,8 +1191,15 @@ void HttpServer::sendResponseWithHeader(int sock, int statusCode, const std::str
                               const std::string& contentType, const std::string& body,
                               const std::string& extraHeader)
 {
-	std::string data = buildResponseHead(statusCode, statusText, contentType, body.size(), extraHeader);
-	data += body;
+	// Assembled through an ostringstream exactly as before the streamed coredump
+	// download (#382) split buildResponseHead() out. A plain `head += body`
+	// made CodeQL newly trace emailConfigJson() -- whose secrets leave only as
+	// hasPassword/hasGsaKey booleans (#207) -- to this send as "cleartext
+	// transmission of sensitive information" (a false positive on PR #394).
+	// Keeping main's shape keeps this change out of every other route.
+	std::ostringstream resp;
+	resp << buildResponseHead(statusCode, statusText, contentType, body.size(), extraHeader) << body;
+	const std::string data = resp.str();
 	sendAllBytes(sock, data.data(), data.size());
 }
 
