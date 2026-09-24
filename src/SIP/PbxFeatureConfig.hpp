@@ -83,6 +83,11 @@ public:
 	// external phone numbers, i.e. PII) and erases its NVS key. Caller holds
 	// _mutex. Returns false if the NVS erase failed; RAM is cleared regardless.
 	bool clearForwardsLocked();
+	// Issue #450, poll #454 (A): factory reset erases the E911 settings too --
+	// they are PII (the site address) and, after a reset, most likely the
+	// PREVIOUS site's. Callers surface "E911 not configured" instead of
+	// gating anything (a reset board must still dial 911). Caller holds _mutex.
+	bool clearE911Locked();
 	std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwardsSnapshot() const;
 
 	// ── Ring / hunt groups ────────────────────────────────────────────────────

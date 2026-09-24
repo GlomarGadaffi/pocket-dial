@@ -99,6 +99,38 @@ namespace
 		return resp;
 	}
 
+	// GET twin of httpPost() above (#450: reads /api/status). Same raw socket.
+	std::string httpGet(int port, const std::string& path, const std::string& cookie)
+	{
+#if defined(_WIN32) || defined(_WIN64)
+		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s == INVALID_SOCKET) return "";
+#else
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0) return "";
+#endif
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(static_cast<uint16_t>(port));
+		inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+		std::string resp;
+		if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
+		{
+			const std::string req = "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+				"Cookie: " + cookie + "\r\nConnection: close\r\n\r\n";
+			send(s, req.c_str(), static_cast<int>(req.size()), 0);
+			char buf[512];
+			int n;
+			while ((n = recv(s, buf, sizeof(buf), 0)) > 0) resp.append(buf, static_cast<size_t>(n));
+		}
+#if defined(_WIN32) || defined(_WIN64)
+		closesocket(s);
+#else
+		close(s);
+#endif
+		return resp;
+	}
+
 	int statusOf(const std::string& resp)
 	{
 		size_t sp1 = resp.find(' ');
@@ -223,6 +255,7 @@ TEST_F(FactoryResetSecretsTest, NoStoredSecretSurvivesAFactoryReset)
 
 	CoreDumpStore::setImageForTest(fakeDump());
 	_handler->setForward("501", "always", "5557654321");   // #450: an external number
+	_handler->setE911Config("501", "5550100", "12 Old Site Rd, Suite 4");   // #450 / poll #454
 	const AdminSession s = bypassLogin();
 
 	// Every row really is set, so an "empty after" below cannot pass vacuously.
@@ -233,6 +266,7 @@ TEST_F(FactoryResetSecretsTest, NoStoredSecretSurvivesAFactoryReset)
 	ASSERT_TRUE(_handler->getTelephonyConfigSlot(0).secretSet);
 	ASSERT_TRUE(CoreDumpStore::query().present);
 	ASSERT_FALSE(_handler->getForwards().empty()) << "precondition: a forward is stored";
+	ASSERT_TRUE(_handler->isE911Configured()) << "precondition: E911 is configured";
 	ASSERT_TRUE(AdminAuth::isProvisioned());
 
 	// ── Act ──
@@ -262,6 +296,13 @@ TEST_F(FactoryResetSecretsTest, NoStoredSecretSurvivesAFactoryReset)
 
 	EXPECT_TRUE(_handler->getForwards().empty())
 		<< "a call-forward target (an external phone number) survived the reset (#450)";
+
+	const auto [e911Exts, e911Callback, e911Location] = _handler->getE911Config();
+	EXPECT_TRUE(e911Location.empty()) << "the previous site's address survived the reset (#450, poll #454)";
+	EXPECT_TRUE(e911Exts.empty());
+	EXPECT_TRUE(e911Callback.empty());
+	EXPECT_FALSE(_handler->isE911Configured())
+		<< "after a reset the board must report E911 as not configured";
 }
 
 TEST_F(FactoryResetSecretsTest, AFailedSecretEraseIsReportedAsAnErrorNotOk)
@@ -316,6 +357,22 @@ TEST_F(FactoryResetSecretsTest, TheSdVoicemailArchiveIsWiped)
 
 	EXPECT_EQ(spy.wipes, 1) << "the HTTP factory reset must wipe the SD voicemail archive";
 	_handler->setVoicemailSinkForTest(nullptr);
+}
+
+TEST_F(FactoryResetSecretsTest, StatusReportsWhetherE911IsConfiguredAndNothingIsGated)
+{
+	// Poll #454 (A): a reset board shows "E911 not configured" -- as a flag on
+	// /api/status, never as a gate. So: the flag tracks the config both ways,
+	// and the status route answers 200 while it is false.
+	const AdminSession s = bypassLogin();
+	_handler->setE911Config("", "", "");
+	std::string st = httpGet(_port, "/api/status", s.cookie);
+	EXPECT_EQ(statusOf(st), 200);
+	EXPECT_NE(st.find("\"e911Configured\":false"), std::string::npos) << st;
+
+	_handler->setE911Config("501", "5550100", "Front desk");
+	st = httpGet(_port, "/api/status", s.cookie);
+	EXPECT_NE(st.find("\"e911Configured\":true"), std::string::npos) << st;
 }
 
 TEST(SipSecretStoreClearAll, RemovesEveryExtensionSecret)

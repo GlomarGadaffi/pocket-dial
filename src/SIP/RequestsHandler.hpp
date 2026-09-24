@@ -452,6 +452,13 @@ public:
 	// Issue #450: /api/factory-reset. Empties the call-forward table and erases
 	// it from NVS (forward targets are external numbers). False if the erase failed.
 	bool clearAllForwards();
+	// Issue #450 / poll #454: /api/factory-reset erases the E911 settings. False
+	// if the NVS erase failed. Leaves "E911 not configured" showing.
+	bool clearE911Config();
+	// True when a 911 call would notify someone on site. Lock-free (an atomic
+	// kept in step with every load/set/clear), so /api/status reads it on the
+	// HTTP thread without touching _mutex.
+	bool isE911Configured() const { return _e911Configured.load(std::memory_order_acquire); }
 
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint
@@ -1710,6 +1717,13 @@ private:
 	// #450: excludes a factory-reset wipe from a drain in progress (see
 	// drainVoicemailFlush()). Plain member, no allocation.
 	std::mutex _vmDrainWipeMutex;
+	// See isE911Configured(). Written under _mutex (or single-threaded in the
+	// constructor) by refreshE911ConfiguredLocked().
+	std::atomic<bool> _e911Configured{false};
+	void refreshE911ConfiguredLocked()
+	{
+		_e911Configured.store(!_cfg.e911Config().notifyExts.empty(), std::memory_order_release);
+	}
 	vmarchive::Sink* _vmSinkForTest = nullptr;
 
 	// ── Retrieval SD-I/O job machine (Issue #246, retrieval slice 3/3) ──────

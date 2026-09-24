@@ -660,6 +660,28 @@ bool PbxFeatureConfig::clearForwardsLocked()
 	return ok;
 }
 
+bool PbxFeatureConfig::clearE911Locked()
+{
+	_e911 = pbx::E911Config{};
+	bool ok = true;
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	nvs_handle_t h;
+	const esp_err_t oe = nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h);
+	if (oe == ESP_OK)
+	{
+		const esp_err_t ee = nvs_erase_key(h, "e911");
+		ok = (ee == ESP_OK || ee == ESP_ERR_NVS_NOT_FOUND);
+		if (nvs_commit(h) != ESP_OK) ok = false;
+		nvs_close(h);
+	}
+	else
+	{
+		ok = (oe == ESP_ERR_NVS_NOT_FOUND);
+	}
+#endif
+	return ok;
+}
+
 void PbxFeatureConfig::persistForwards()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
