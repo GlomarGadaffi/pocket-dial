@@ -45,6 +45,25 @@ on:
     # firmware build matrix + host tests along on every PR title/body
     # edit, which happens far more often than a base retarget does).
 
+# Issue #423: a new push to a PR cancels that PR's previous, now-superseded
+# run instead of letting its whole matrix finish for nothing.
+#
+# - pull_request runs group per PR NUMBER, and cancel only on `synchronize`,
+#   which always means a new head SHA. So a cancelled run is always on a
+#   superseded SHA, never on the PR's current head. That matters: branch
+#   protection reads EVERY check run with a required name on the head SHA, and
+#   a cancelled copy there blocks the merge (#427). `reopened` re-runs the
+#   same SHA, so it never cancels anything.
+# - push (main only) and workflow_dispatch group per SHA. Per REF would be
+#   wrong even without cancel-in-progress: GitHub keeps at most one PENDING
+#   run per group and silently cancels older pending ones, so back-to-back
+#   merges would lose main's post-merge status.
+# - The HIL job's own job-level `concurrency: glolab-board-244` (exclusive
+#   board) composes with this and is untouched; it runs on dispatch only.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
+
 jobs:
   # Job 1: Build and simulate the host desktop application, run static analysis and unit/smoke tests.
   # This serves as our simulation-based test suite, validating SIP and HTTP server logic on host runners.
