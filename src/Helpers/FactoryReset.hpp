@@ -28,4 +28,11 @@ namespace FactoryReset
 	// Erases every store listed as "NOT reached" above. Returns false if any
 	// erase failed; it still attempts all of them.
 	bool eraseStoredSecrets();
+
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	// Test-only: the next eraseStoredSecrets() still attempts every erase but
+	// reports failure, so the route's error path is reachable on host, where
+	// the in-memory stores never fail on their own.
+	void failNextEraseForTest();
+#endif
 }

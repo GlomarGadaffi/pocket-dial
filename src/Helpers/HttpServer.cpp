@@ -3523,11 +3523,11 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// documented "save always replaces" path, so it overwrites every trunk_*
 	// key including the secret.
 	//
-	TrunkConfigStore::save(TrunkConfigStore::Config{});
+	const bool trunkErased = TrunkConfigStore::save(TrunkConfigStore::Config{});
 	// Issue #363: every other stored secret this function does not name --
 	// smtp_pass/gsa_key, every extension's digest HA1, the last coredump. The
 	// enumeration and the reasons live in FactoryReset.hpp.
-	FactoryReset::eraseStoredSecrets();
+	const bool secretsErased = FactoryReset::eraseStoredSecrets();
 
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
@@ -3589,6 +3589,27 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		nvs_close(nvs_handle);
 	}
 #endif
+	// #437 review: a secret-store erase that FAILED must not be reported as a
+	// completed reset. The operator is about to hand this board on believing its
+	// credentials are gone. The board still restarts: the admin credential is
+	// already cleared above, so staying up half-reset helps nobody, and the reset
+	// can be run again once setup completes. (AdminAuth::clearCredential() and
+	// DeviceConfig::clearAll() return void, so their outcome is not visible here.)
+	if (!trunkErased || !secretsErased)
+	{
+		std::string failed;
+		if (!trunkErased) failed += "the carrier trunk credentials";
+		if (!secretsErased)
+		{
+			if (!failed.empty()) failed += " and ";
+			failed += "the email/SIP-digest secret stores";
+		}
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: " + failed +
+		             " could not be erased. Rebooting anyway; run the factory reset again after setup.\"}");
+	}
+	else
+	{
 	// Every build that reaches this line has completed the wipe above, so every
 	// build has to say so. This used to answer 200 only under POCKETDIAL_HAS_WIFI
 	// and drop eth/lan8720 into a 501 "factory reset not available on desktop" --
@@ -3613,6 +3634,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"message\":\"Factory reset. Restart the process to complete.\"}");
 #endif
+	}
 #if defined(ESP_PLATFORM)
 	// Guarded on the platform, not the transport: esp_restart() and the deferred
 	// restart task exist on every ESP build (see the include block at the top of
