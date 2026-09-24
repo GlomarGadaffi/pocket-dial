@@ -802,6 +802,10 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	if (!request || !request->isValidMessage())
 	{
 		_packetsDropped.fetch_add(1, std::memory_order_relaxed);
+		// Issue #430: record the source and first bytes, so an idle drop rate can
+		// be traced to its sender (e.g. a CRLF keep-alive) without a LAN capture.
+		const sockaddr_in src = request ? request->getSource() : sockaddr_in{};
+		_dropProbe.note(DropProbe::Reason::Invalid, src.sin_addr.s_addr, src.sin_port, rawBytes);
 		return;
 	}
 
@@ -814,6 +818,8 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
 		{
 			_packetsDropped.fetch_add(1, std::memory_order_relaxed);
+			const sockaddr_in src = request->getSource();
+			_dropProbe.note(DropProbe::Reason::Rate, src.sin_addr.s_addr, src.sin_port, rawBytes);
 			return;
 		}
 	}
@@ -7468,6 +7474,21 @@ void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipM
 uint64_t RequestsHandler::getPacketsDropped() const
 {
 	return _packetsDropped.load(std::memory_order_relaxed);
+}
+
+uint64_t RequestsHandler::getDroppedInvalid() const
+{
+	return _dropProbe.invalidCount();
+}
+
+uint64_t RequestsHandler::getDroppedRate() const
+{
+	return _dropProbe.rateCount();
+}
+
+const DropProbe& RequestsHandler::getDropProbe() const
+{
+	return _dropProbe;
 }
 
 std::vector<CallDetailRecord> RequestsHandler::getCallDetailRecords()
