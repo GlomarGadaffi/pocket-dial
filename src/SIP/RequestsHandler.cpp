@@ -5535,6 +5535,22 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 					}
 					if (peer)
 					{
+						// A 2xx to a re-INVITE/UPDATE is a target refresh too
+						// (#425): its Contact becomes the requester's new remote
+						// target. Relayed as-is it carries the RESPONDER's real
+						// address, and after one hold the requester targets the
+						// other phone directly — the BYE bypasses this PBX and
+						// the session outlives the call. Present the responder
+						// the way the setup 200 did. Anchor and trunk legs have
+						// their own answer paths and keep their existing
+						// behaviour.
+						const bool relayDialog = !session.value()->isTrunk() &&
+							legDest->getNumber() != kAnchorCallExt;
+						if (relayDialog)
+						{
+							const auto& responder = (peer == legDest) ? legSrc : legDest;
+							data->setContact(buildContact(responder->getNumber()));
+						}
 						_outbox.emplace_back(peer->getAddress(), data);
 						return;
 					}
@@ -8967,8 +8983,21 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 		return; // not from either leg of this dialog: ignore
 	}
 
-	// Relay UNTOUCHED — no clearBody()/enforceG711() — so the hold SDP
+	// Relay the SDP UNTOUCHED — no clearBody()/enforceG711() — so the hold SDP
 	// (a=sendonly/inactive) and its Content-Length reach the peer intact.
+	//
+	// The Contact is the one header that must change (#425). A re-INVITE is a
+	// target-refresh request (RFC 3261 §12.2): its Contact REPLACES the peer's
+	// remote target for this dialog. Forwarded as-is it carries the sender's real
+	// address, so after one hold each phone targets the other directly, the BYE
+	// goes phone-to-phone, and this PBX is left holding a session for a call that
+	// has ended. Present the sender exactly as call setup did —
+	// contactFor(<sender's extension>), an address on this board — so the
+	// dialog's identity never changes mid-call.
+	{
+		const auto& sender = (peer == dest) ? src : dest;
+		data->setContact(buildContact(sender->getNumber()));
+	}
 	_outbox.emplace_back(peer->getAddress(), data);
 
 	// A re-INVITE from either leg is evidence the endpoint is alive — it counts
@@ -9016,15 +9045,33 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		return;
 	}
 	auto session = sessionOpt.value();
-	std::string activeIp = _localIp;
 
-	if (!data->hasSdp())
+	// ── Bodiless UPDATE = a session-timer refresh (#198) ─────────────────────
+	// Who answers it depends on who the far end of this dialog IS, so it is
+	// decided below, after the leg is classified, never up front. This used to be
+	// the first thing onUpdate() did, for every session, which broke both kinds
+	// of dialog (measured with real pjsua):
+	//   - relay dialog: the PBX answered on the far phone's behalf, so the far
+	//     phone never saw the refresh, its own timer expired, and it hung up a
+	//     healthy call ("408 No session refresh received") — the ~30-minute drop
+	//     at Session-Expires: 1800;
+	//   - a leg this PBX terminates (777): the 200 was a clone of the request and
+	//     kept the CALLER's Contact. UPDATE is a target refresh (RFC 3311 §5.2),
+	//     so the caller repointed the dialog at itself, and its next refresh and
+	//     its BYE looped to its own socket.
+	//
+	// On a leg this PBX terminates it IS the UAS, so it answers — with its own
+	// Contact, the same contactFor(<the extension the phone dialled>) identity
+	// the setup 200 carried (the INVITE answers use buildContact(invite->
+	// getToNumber()); an in-dialog request from the phone carries the same
+	// To-user). No request is minted, so no server CSeq is involved.
+	auto answerRefreshLocally = [&]()
 	{
-		// Bodiless UPDATE: session-timer refresh — 200 OK and reset expiry.
 		auto resp = getMessageFromPool(*data);
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader(SipMessageTypes::OK);
 		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		resp->setContact(buildContact(data->getToNumber()));
 		resp->clearBody();
 		resp->syncContentLength();
 		_outbox.emplace_back(data->getSource(), std::move(resp));
@@ -9035,25 +9082,36 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 			                         session->isRefresher(),
 			                         std::chrono::steady_clock::now());
 		}
-		return;
-	}
+	};
 
-	// SDP-bearing UPDATE: relay to the peer leg (same logic as onReinvite).
 	auto src  = session->getSrc();
 	auto dest = session->getDest();
 	const std::string destNum = dest ? dest->getNumber() : "";
 
 	// Issue #218: same anchored-leg answer as onReinvite() — see
-	// answerAnchorReinvite()'s doc comment.
+	// answerAnchorReinvite()'s doc comment. The anchored leg is terminated here,
+	// so a bodiless refresh is answered locally rather than offered to the anchor.
 	if (destNum == kAnchorCallExt && src && dest)
 	{
+		if (!data->hasSdp())
+		{
+			answerRefreshLocally();
+			return;
+		}
 		answerAnchorReinvite(data, session, src);
 		return;
 	}
 
-	// Same virtual-leg guard as onReinvite() above: 777/888 have no peer leg.
+	// Same virtual-leg guard as onReinvite() above: 777/888 have no peer leg, and
+	// a trunk leg is terminated here too. A refresh is answered; an SDP change
+	// is declined so the phone keeps the original SDP.
 	if (destNum == "777" || destNum == ConferenceRoom::EXT || (session && session->isTrunk()) || !src || !dest)
 	{
+		if (!data->hasSdp())
+		{
+			answerRefreshLocally();
+			return;
+		}
 		auto resp = getMessageFromPool(*data);
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader("SIP/2.0 488 Not Acceptable Here");
@@ -9070,6 +9128,18 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 
 	if (!peer) return;
 
+	// ── Relay dialog: forward the UPDATE, bodiless refresh or SDP change ──────
+	// The far phone is the UAS here, so the refresh and its 200 are the phones'
+	// business, not ours (#198). Forwarded with the phone's own CSeq, untouched.
+	//
+	// Only the Contact changes (#425): UPDATE is a target refresh, so a
+	// forwarded Contact replaces the far phone's remote target. Present the
+	// sender exactly as call setup did, or the far phone starts targeting the
+	// sender directly and the PBX drops out of the dialog.
+	{
+		const auto& sender = (peer == dest) ? src : dest;
+		data->setContact(buildContact(sender->getNumber()));
+	}
 	_outbox.emplace_back(peer->getAddress(), data);
 
 	if (session->getSessionExpiresSeconds() > 0)
@@ -9079,10 +9149,12 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		                         std::chrono::steady_clock::now());
 	}
 
+	// A refresh carries no offer: it must not move the call in or out of hold.
+	if (!data->hasSdp()) return;
+
 	// Issue #263: same isHoldOffer()+recvonly swap as onReinvite() above. The
-	// cast is unguarded here (unlike the other two sites) because the
-	// `!data->hasSdp()` branch above already returned for a bodiless UPDATE --
-	// every message reaching this point has SDP.
+	// cast is unguarded here (unlike the other two sites) because the bodiless
+	// case returned just above -- every message reaching this point has SDP.
 	SipSdpMessage* sdpMsg = static_cast<SipSdpMessage*>(data.get());
 	const auto dir = data->getSdpDirection();
 	if (sdpMsg->isHoldOffer() || dir == SipMessage::SdpDirection::RecvOnly)

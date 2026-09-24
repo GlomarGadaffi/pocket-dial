@@ -848,16 +848,117 @@ def sc_heap_telemetry(env):
                   "%s (recorded -> %s)" % (detail, TELEMETRY_SNAPSHOT_PATH))
 
 
+def _bye_endpoints(log, direction):
+    """(cseq, ip, port) for every BYE request a UA sent ("TX ... to") or received
+    ("RX ... from") in `log`. Parsed rather than string-compared: pjsua writes
+    the address with a trailing colon ("to UDP 127.0.0.1:5070:"), which is
+    exactly how a naive equality check reports the PBX as "not the PBX"."""
+    verb, prep = ("TX", "to") if direction == "tx" else ("RX", "from")
+    return re.findall(r"%s \d+ bytes Request msg BYE/cseq=(\d+) \([^)]*\) %s UDP ([0-9.]+):(\d+)"
+                      % (verb, prep), log)
+
+
+def _live_session_between(ext_a, ext_b):
+    """True if the PBX still lists a session between these two extensions. None
+    if /api/status is unreachable -- never read as False."""
+    st = http_json("/api/status")
+    if st is None or "sessions" not in st:
+        return None
+    return any({s.get("caller"), s.get("callee")} == {ext_a, ext_b} for s in st["sessions"])
+
+
+def _bye_went_through_pbx(caller, callee, m_caller, m_callee):
+    """After `caller` hangs up: exactly one BYE transaction (by CSeq, so a
+    retransmit does not count twice) left the caller for the PBX, exactly one
+    reached the callee from the PBX, and the PBX kept no session for the call.
+    Returns (ok, detail). Arrival alone never passes: the ghost-session check is
+    what shows the PBX actually processed the teardown."""
+    pbx = (PBX_IP, str(PBX_SIP_PORT))
+    tx = _bye_endpoints(caller.log_since(m_caller), "tx")
+    rx = _bye_endpoints(callee.log_since(m_callee), "rx")
+    tx_ok = len({c for c, _, _ in tx}) == 1 and all((ip, pt) == pbx for _, ip, pt in tx)
+    rx_ok = len({c for c, _, _ in rx}) == 1 and all((ip, pt) == pbx for _, ip, pt in rx)
+    gone = wait_for(lambda: _live_session_between(caller.ext, callee.ext) is False, 5) is not None
+    detail = ("caller BYE->PBX=%s (%s), callee BYE<-PBX=%s (%s), PBX session cleared=%s"
+              % (tx_ok, ["%s:%s" % (i, p) for _, i, p in tx],
+                 rx_ok, ["%s:%s" % (i, p) for _, i, p in rx], gone))
+    return tx_ok and rx_ok and gone, detail
+
+
+def sc_hold_bye_via_pbx(env):
+    """#425: after a hold/resume the PBX must still be IN the dialog.
+
+    re-INVITE is a target refresh: the Contact in the relayed request and in its
+    relayed 200 becomes each phone's remote target. Forwarded untouched they
+    carried the other phone's real address, so after one hold the BYE went
+    phone-to-phone and the PBX kept a ghost session after both had hung up."""
+    a, b = env["A"], env["B"]
+    ma = a.mark()
+    a.call(b.ext)
+    if not a.wait_log(r"state changed to CONFIRMED", 10, ma):
+        a.hangup_all()
+        return report("hold_bye_via_pbx", "FAIL", "setup call never CONFIRMED")
+    time.sleep(1.0)
+    a.cmd("call hold", 2.0)
+    a.cmd("call reinvite", 2.0)
+    time.sleep(1.0)
+    m_a, m_b = a.mark(), b.mark()
+    a.hangup_all()
+    b.wait_log(r"RX \d+ bytes Request msg BYE", 6, m_b)
+    time.sleep(0.5)
+    ok, detail = _bye_went_through_pbx(a, b, m_a, m_b)
+    b.hangup_all()
+    return report("hold_bye_via_pbx", "OK" if ok else "FAIL", detail)
+
+
+def sc_session_refresh(env):
+    """#198: a session-timer refresh on an ordinary call must reach the far phone.
+
+    T offers Session-Expires: 90 (the RFC 4028 floor), so it refreshes at 45 s
+    and B's own timer would end the call at ~60 s without one. The PBX used to
+    answer every bodiless refresh UPDATE itself: B never saw it and hung up a
+    healthy call ("408 No session refresh received") -- the ~30-minute drop at
+    the common 1800 s. Held 70 s: past the refresh and past B's deadline."""
+    t, b = env["T"], env["B"]
+    mt = t.mark()
+    t.call(b.ext)
+    if not t.wait_log(r"state changed to CONFIRMED", 10, mt):
+        t.hangup_all()
+        return report("session_refresh", "FAIL", "setup call never CONFIRMED")
+    m_t, m_b = t.mark(), b.mark()
+    time.sleep(70)
+    tlog, blog = t.log_since(m_t), b.log_since(m_b)
+    b_got = len(re.findall(r"RX \d+ bytes Request msg UPDATE", blog))
+    pbx_contact = "<sip:%s@%s:%d;transport=UDP>" % (b.ext, PBX_IP, PBX_SIP_PORT)
+    oks = re.findall(r"RX \d+ bytes Response msg 200/UPDATE/cseq=\d+[^\n]*\n(?:.*\n){0,25}?Contact: ([^\n]+)", tlog)
+    contact_ok = bool(oks) and all(c.strip() == pbx_contact for c in oks)
+    survived = re.search(r"(is|to) DISCONNECTED", tlog) is None and \
+        re.search(r"(is|to) DISCONNECTED", blog) is None
+    m_t2, m_b2 = t.mark(), b.mark()
+    t.hangup_all()
+    b.wait_log(r"RX \d+ bytes Request msg BYE", 6, m_b2)
+    time.sleep(0.5)
+    bye_ok, bye_detail = _bye_went_through_pbx(t, b, m_t2, m_b2)
+    b.hangup_all()
+    ok = b_got >= 1 and contact_ok and survived and bye_ok
+    return report("session_refresh", "OK" if ok else "FAIL",
+                  "B received refresh UPDATEs=%d, 200s via PBX Contact=%s, call outlived "
+                  "Session-Expires=%s; %s" % (b_got, contact_ok, survived, bye_detail))
+
+
 SCENARIOS = [
     ("register", sc_register),
     ("echo777_rtp", sc_echo777_rtp),
     ("p2p_call", sc_p2p_call),
     ("hold_resume", sc_hold_resume),
+    ("hold_bye_via_pbx", sc_hold_bye_via_pbx),
     ("cancel_ringing", sc_cancel_ringing),
     ("blind_transfer", sc_blind_transfer),
     ("attended_transfer", sc_attended_transfer),
     ("park_retrieve", sc_park_retrieve),
     ("dtmf_info_dnd", sc_dtmf_info_dnd),
+    # ~75 s: must outlive a 90 s Session-Expires peer deadline (60 s). See #198.
+    ("session_refresh", sc_session_refresh),
     ("mixed_stack", sc_mixed_stack),
     ("heap_telemetry", sc_heap_telemetry),
 ]
@@ -913,6 +1014,11 @@ def main():
         # R answers 180 and stays ringing: the only way to hold an INVITE open
         # long enough to CANCEL it.
         PjsuaUA("R", "604", 14, 5174, 6400, 2314, auto_answer=180),
+        # T offers the RFC 4028 floor (Session-Expires 90) so session_refresh can
+        # exercise a refresh inside a test-sized window. Its own UA, so no other
+        # scenario's calls run with a 90 s timer.
+        PjsuaUA("T", "606", 16, 5176, 6600, 2316,
+                extra=["--timer-se=90", "--timer-min-se=90"]),
     ]
     for ua in uas:
         env[ua.name] = ua.start(pjsua)

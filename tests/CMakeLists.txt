@@ -140,6 +140,7 @@ add_executable(sip_parser_tests
     # 200 OK was silently dropped instead of reaching the held leg. Drives a full
     # 999 broadcast call through connect -> hold -> resume via handle().
     BroadcastHoldResume_test.cpp
+    TargetRefreshContact_test.cpp
     # Issue #263: sdp::isHold() (#255) had zero production callers -- the two
     # non-anchor hold/resume sites (onReinvite, onUpdate) called the older
     # direction-only getSdpDirection() instead, missing the legacy RFC 2543
