@@ -414,6 +414,8 @@ add_executable(sip_parser_tests
     # Issues #443/#444: SIP receive-path discards (oversize via recvmsg+MSG_TRUNC,
     # empty, failed receives, pool exhaustion) are counted, never silent.
     SipRxDiscards_test.cpp
+    # Issues #444/#469: the shared truncation-aware UDP receive (UdpRecv.hpp).
+    UdpRecv_test.cpp
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
     ProvisioningConfig_test.cpp
