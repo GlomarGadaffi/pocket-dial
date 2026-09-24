@@ -43,6 +43,7 @@
 #include "Session.hpp"
 #include "CallDetailRecord.hpp"
 #include "PcapCapture.hpp"
+#include "DropProbe.hpp"   // Issue #430: per-reason drop counts + recent-drop ring
 #include "PbxConfig.hpp"
 #include "DialPlan.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: pbx::EmergencyDial
@@ -154,6 +155,12 @@ public:
 	void forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
+	// Issue #430: packetsDropped split by reason (their sum), and the last
+	// DropProbe::kRingSize refusals oldest first. The vector is built on the
+	// caller's (HTTP) thread; recording a drop never allocates.
+	uint64_t getDroppedInvalid() const;
+	uint64_t getDroppedRate() const;
+	std::vector<DropProbe::Record> getRecentDrops() const;
 	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
 	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
@@ -1890,6 +1897,7 @@ private:
 
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
+	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing

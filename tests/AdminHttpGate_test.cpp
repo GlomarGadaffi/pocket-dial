@@ -1092,3 +1092,47 @@ TEST(OtaUpdater, ProgressFlagTracksSessionLifecycle)
 	}
 	EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
 }
+
+// Issue #430: /api/status splits packetsDropped by reason for everyone, but the
+// per-drop source addresses and bytes are a session-only view, like the roster
+// (#207). The keep-alive fed here is the #430 suspect: "\r\n\r\n" from a phone.
+TEST(DropProbeStatus, CountsArePublicRecentDropsNeedASession)
+{
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	sockaddr_in phone{};
+	phone.sin_family = AF_INET;
+	phone.sin_port = htons(5062);
+	inet_pton(AF_INET, "192.168.9.181", &phone.sin_addr);
+	const std::string ping = "\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(ping, phone), ping);
+
+	HttpServer server("127.0.0.1", 18135, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string anon = bodyOf(httpGetRaw(18135, "/api/status"));
+	EXPECT_NE(anon.find("\"packetsDropped\":1,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"droppedInvalid\":1,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"droppedRate\":0,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"recentDrops\":[]"), std::string::npos)
+		<< "drop sources must be withheld without a session:\n" << anon;
+	EXPECT_EQ(anon.find("192.168.9.181"), std::string::npos) << anon;
+
+	const std::string loginResp = httpPostRaw(18135, "/api/admin/login", "username=admin&password=admin");
+	ASSERT_EQ(statusOf(loginResp), 200) << loginResp;
+	const std::string cookie = cookieOf(loginResp, "pd_session");
+	const std::string csrf   = csrfOf(loginResp);
+	ASSERT_EQ(statusOf(httpPostRaw(18135, "/api/admin/set-credential",
+		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
+
+	const std::string authed = bodyOf(httpGetRaw(18135, "/api/status", "pd_session=" + cookie));
+	EXPECT_NE(authed.find("\"reason\":\"invalid\",\"src\":\"192.168.9.181:5062\",\"len\":4,\"head\":\"0d0a0d0a\"}"),
+	          std::string::npos)
+		<< "a session must see who sent the dropped packet and its first bytes:\n" << authed;
+
+	AdminAuth::clearCredential();
+}
