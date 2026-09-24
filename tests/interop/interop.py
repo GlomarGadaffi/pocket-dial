@@ -311,10 +311,12 @@ class BaresipUA:
             "sip_listen\t\t%s:%d" % (self.ip, self.sip_port),
             "audio_player\t\taufile,%s" % os.path.join(self.cfgdir, "out.wav"),
             "audio_source\t\tausine,440",
-            # ausine only generates 48 kHz; without this the source fails to start
-            # against the 8 kHz PCMU codec and the call carries no RTP at all.
-            # Declaring the rate makes baresip resample 48k -> 8k.
+            # ausine only generates 48 kHz, and baresip 1.0.0's (ubuntu-24.04) only
+            # stereo -- 1.1.0 accepts stereo too. Without these the source fails to
+            # start against the 8 kHz mono PCMU codec and the call carries no RTP at
+            # all. Declaring both makes baresip resample 48k/2ch -> 8k/1ch.
             "ausrc_srate\t\t48000",
+            "ausrc_channels\t\t2",
             "audio_alert\t\taufile,%s" % os.path.join(self.cfgdir, "alert.wav"),
             "ctrl_tcp_listen\t\t%s:%d" % (PBX_IP, self.ctrl_port),
             "module\t\t\tstdio.so",
