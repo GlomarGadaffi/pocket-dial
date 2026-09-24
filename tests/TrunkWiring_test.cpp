@@ -431,6 +431,66 @@ TEST(TrunkWiring, TheCarrierHangingUpByesTheHandsetAndReleasesTheRelay)
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
 }
 
+// ── Forged carrier messages (#356) ──────────────────────────────────────────
+//
+// SipTrunk_test.cpp covers the rules state by state. These pin what the rules
+// protect end to end: a forger who knows a live trunk Call-ID can neither
+// tear the call down nor answer it with its own media address.
+
+namespace
+{
+	constexpr const char* kForgerIp = "198.51.100.66";   // RFC 5737 TEST-NET-2
+}
+
+TEST(TrunkWiring, AForgedCarrierByeLeavesTheCallUp)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	b.sent.clear();
+
+	// Right Call-ID, wrong carrier tag, from neither the SBC nor its Contact.
+	CarrierView forger = carrier;
+	forger.toTag = "guessed";
+	b.handler.handle(RequestsHandler::getMessageFromPool(forger.bye(), addrFor(kForgerIp)));
+
+	EXPECT_EQ(b.countWithTo("403", kForgerIp), 1u) << "the forger is refused";
+	EXPECT_EQ(b.sent.size(), 1u) << "and that is the only thing that happens";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "the handset's call is not torn down";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "and its media keeps flowing";
+
+	// The real carrier can still hang up.
+	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.bye(), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+TEST(TrunkWiring, AForgedAnswerIsNeitherAckedNorBridged)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	// A 200 carrying SDP, racing the carrier's own answer. Accepted, it would
+	// be ACKed and the relay pointed at whatever media address it names.
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kForgerIp)));
+
+	EXPECT_TRUE(b.sent.empty()) << "no ACK to anyone, and the handset is not answered";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "still ringing, pair still held";
+
+	// The carrier's real answer connects normally afterwards.
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 1u);
+	EXPECT_EQ(b.countWithTo("200 OK", kHandsetIp), 1u);
+}
+
 // ── Capacity ────────────────────────────────────────────────────────────────
 
 TEST(TrunkWiring, RelayPairsAreBoundedAndReusableOnceReleased)
