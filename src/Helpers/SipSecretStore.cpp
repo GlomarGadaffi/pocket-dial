@@ -336,6 +336,35 @@ namespace SipSecretStore
 #endif
 	}
 
+	bool clearAll()
+	{
+		std::lock_guard<std::mutex> lock(storeMutex());
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		// "sipauth" holds nothing but these secrets and their index, so a
+		// namespace wipe is exact -- and unlike walking the index it also catches
+		// an ext_* key the index lost track of (an interrupted setSecret()).
+		nvs_handle_t h;
+		esp_err_t err = nvs_open(kNamespace, NVS_READWRITE, &h);
+		if (err == ESP_ERR_NVS_NOT_FOUND)
+		{
+			ha1Cache().clear();
+			return true;   // never written: nothing to clear
+		}
+		if (err != ESP_OK)
+		{
+			return false;
+		}
+		bool ok = (nvs_erase_all(h) == ESP_OK) && (nvs_commit(h) == ESP_OK);
+		nvs_close(h);
+		ha1Cache().clear();   // a cached HA1 must not keep authenticating
+		return ok;
+#else
+		hostMap().clear();
+		return true;
+#endif
+	}
+
 	std::vector<std::string> securedExtensions()
 	{
 		std::lock_guard<std::mutex> lock(storeMutex());
