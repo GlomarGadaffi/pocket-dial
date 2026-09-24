@@ -1,14 +1,25 @@
 name: Post-Merge Host Verification (glolab)
 
-# Runs the host build/test job a second time on the self-hosted 'glolab' runner,
-# purely as a fast post-merge confidence check (measured ~4min vs ~8-9min on
-# ubuntu-latest). Deliberately NOT triggered on pull_request: this workflow only
-# fires on push to main (i.e. after a PR has already merged) or manual dispatch,
-# so code from an untrusted fork PR can never execute on this runner. The
-# pull_request-triggered ci.yml on ubuntu-latest remains the actual PR gate.
+# Runs the host build/test job a second time on the self-hosted 'glolab' runner
+# (the bench Raspberry Pi, ARM64), as a confidence check on a second
+# architecture. Deliberately NOT triggered on pull_request, so code from an
+# untrusted fork PR can never execute on this runner. The pull_request-triggered
+# ci.yml on ubuntu-latest remains the actual PR gate.
+#
+# NIGHTLY + MANUAL ONLY (desmo, 2026-09-24). It used to fire on every push to
+# main. The Pi is also the bench host (it drives the ESP32 boards over USB and
+# runs household DNS on a second board), so a full cppcheck + clang-tidy +
+# gtest build after every merge is load it should not carry. A busy night
+# queued five runs behind an offline runner, each due to fire in turn when it
+# came back. Once a day on the latest main is enough for an ARM64 cross-check;
+# dispatch it by hand when a specific commit needs it.
+#
+# 09:00 UTC = 05:00 US Eastern (EDT), clear of the Pi's unattended-upgrades
+# Automatic-Reboot at 03:30 local. Cron is UTC, so under EST this lands at 04:00
+# local, still clear of the reboot.
 on:
-  push:
-    branches: [ main ]
+  schedule:
+    - cron: '0 9 * * *'
   workflow_dispatch: {}
 
 permissions:
