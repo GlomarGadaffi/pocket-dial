@@ -325,6 +325,9 @@ add_executable(sip_parser_tests
     # the no-owner-yet fallback, lockout keyed by (channel, principal), and
     # owner-vs-sysop gating on the three owner-only HTTP actions.
     TwoRoleAuth_test.cpp
+    # Issue #382: /api/coredump* -- owner-only download, CSRF-checked erase,
+    # ungated presence on /api/status, against a fake CoreDumpStore image.
+    CoreDumpHttp_test.cpp
     # Issue #186: GET/POST /api/config/export and POST /api/config/import,
     # driven end-to-end through a real HttpServer -- plaintext round-trip,
     # password-gated round-trip, replace-not-merge, and the 400/422 rejection
@@ -442,6 +445,9 @@ add_executable(sip_parser_tests
     # !ESP_PLATFORM). RequestsHandler::onDtmfInfo references AdminAuth::verifyPin for
     # the DTMF *PIN# admin menu, so it must be linked into the host binary too.
     ../src/Helpers/AdminAuth.cpp
+    # Issue #382: HttpServer's /api/coredump* routes call it; the host arm serves
+    # a test-installed fake image instead of flash.
+    ../src/Helpers/CoreDumpStore.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
     # length/charset bounds that stop a typo from bringing the AP up open.
     DeviceConfig_test.cpp
