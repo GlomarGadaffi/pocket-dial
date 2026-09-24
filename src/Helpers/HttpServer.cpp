@@ -41,9 +41,11 @@
 #include "PoolConfig.hpp"    // POCKETDIAL_PARK_TIMEOUT_SEC (informational export field)
 #include "JsonReader.hpp"    // strict, dependency-free JSON reader for /api/config/import
 #include <cctype>
+#include <cstdio>        // snprintf: sendStaticHtml's allocation-free head (#410)
 #include <cstdlib>
 #include <mutex>
 #include <cstring>
+#include <string_view>
 #include <sstream>
 #include <iostream>
 #include <chrono>
@@ -1219,9 +1221,32 @@ bool HttpServer::sendAllBytes(int sock, const char* ptr, size_t remaining)
 	return true;
 }
 
+// --- Security headers, emitted centrally so no endpoint can forget them ---
+// One constant, written verbatim both by buildResponseHead() and by the
+// streamed static pages (sendStaticHtml, #410), so the two paths cannot drift.
+//
+// The dashboard is a single self-contained page with inline <script>/<style>
+// and no external origins, so the policy can be this tight: nothing loads
+// from anywhere, the page cannot be framed, and XHR/fetch is same-origin.
+// Cache-Control: responses carry call metadata, the CSRF token and (on
+// /api/pcap) raw SIP bytes; none of it should sit in a shared browser cache or
+// on disk. Referrer-Policy is same-origin, not no-referrer: the Referer header
+// stays available as a same-origin signal, and nothing here is linked
+// off-device anyway. Deliberately NO Strict-Transport-Security: the dashboard
+// is plain HTTP on a LAN appliance; pinning HSTS here would make the host
+// unreachable over http:// forever with no way for a user to override it.
+static constexpr char kSecurityHeaders[] =
+	"Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; "
+	"style-src 'unsafe-inline'; img-src data:; connect-src 'self'; "
+	"form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n"
+	"X-Frame-Options: DENY\r\n"
+	"X-Content-Type-Options: nosniff\r\n"
+	"Cache-Control: no-store\r\n"
+	"Referrer-Policy: same-origin\r\n";
+
 // Status line + every header + the blank line, for a body of contentLength
-// bytes. Shared by sendResponseWithHeader() and the streamed coredump download
-// so the security headers below stay emitted in exactly one place.
+// bytes. Shared by sendResponseWithHeader() and the streamed coredump download;
+// the security headers come from kSecurityHeaders, their single source.
 std::string HttpServer::buildResponseHead(int statusCode, const std::string& statusText,
                               const std::string& contentType, size_t contentLength,
                               const std::string& extraHeader)
@@ -1232,25 +1257,7 @@ std::string HttpServer::buildResponseHead(int statusCode, const std::string& sta
 	resp << "Content-Length: " << contentLength << "\r\n";
 	// No Access-Control-Allow-Origin header: wildcard CORS would allow any
 	// browser tab on the same AP to fire side-effecting POSTs without a preflight.
-
-	// --- Security headers, emitted centrally so no endpoint can forget them ---
-	// The dashboard is a single self-contained page with inline <script>/<style>
-	// and no external origins, so the policy can be this tight: nothing loads
-	// from anywhere, the page cannot be framed, and XHR/fetch is same-origin.
-	resp << "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; "
-	        "style-src 'unsafe-inline'; img-src data:; connect-src 'self'; "
-	        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n";
-	resp << "X-Frame-Options: DENY\r\n";
-	resp << "X-Content-Type-Options: nosniff\r\n";
-	// Responses carry call metadata, the CSRF token and (on /api/pcap) raw SIP
-	// bytes. None of it should sit in a shared browser cache or on disk.
-	resp << "Cache-Control: no-store\r\n";
-	// same-origin, not no-referrer: the Referer header stays available as a
-	// same-origin signal, and nothing here is linked off-device anyway.
-	resp << "Referrer-Policy: same-origin\r\n";
-	// Deliberately NO Strict-Transport-Security. The dashboard is plain HTTP on
-	// a LAN appliance; pinning HSTS here would make the host unreachable over
-	// http:// forever with no way for a user to override it.
+	resp << kSecurityHeaders;
 	if (!extraHeader.empty())
 	{
 		resp << extraHeader << "\r\n";
@@ -1266,19 +1273,77 @@ void HttpServer::sendResponse(int sock, int statusCode, const std::string& statu
 	sendResponseWithHeader(sock, statusCode, statusText, contentType, body, "");
 }
 
+// The placeholder every static page carries where the session's CSRF token goes.
+static constexpr char kCsrfMarker[] = "__PD_CSRF__";
+
+void HttpServer::sendStaticHtml(int sock, const char* const* parts, const size_t* sizes,
+                                size_t count, const std::string& token)
+{
+	// Where is the marker? Scanned per call over the flash-resident parts with
+	// string_view (no allocation), never cached: a page edit that moves the
+	// marker to another part must not silently ship a literal "__PD_CSRF__" and
+	// no token -- every form POST would then fail CSRF with no diagnostic. Only
+	// the FIRST occurrence is replaced, exactly as the old find()/replace() did;
+	// HttpStaticPages_test pins that every page carries exactly one. A marker
+	// MUST NOT straddle two parts -- a re-split of index_html.h may fall at any
+	// byte, and a straddled marker would be sent literally. That is not
+	// structural: EveryPageCarriesExactlyOneCsrfMarker enforces it.
+	const std::string_view marker(kCsrfMarker, sizeof(kCsrfMarker) - 1);
+	size_t markPart = count, markAt = 0, total = 0;
+	for (size_t i = 0; i < count; ++i)
+	{
+		total += sizes[i];
+		if (markPart == count)
+		{
+			const size_t at = std::string_view(parts[i], sizes[i]).find(marker);
+			if (at != std::string_view::npos) { markPart = i; markAt = at; }
+		}
+	}
+	const size_t contentLength = (markPart == count)
+		? total : total - marker.size() + token.size();
+
+	// The head, byte-identical to buildResponseHead(200, "OK", <html>, len, "")
+	// but formatted into a small stack buffer instead of an ostringstream: the
+	// status line and the only variable header, then the shared security block.
+	char line[128];
+	const int n = std::snprintf(line, sizeof(line),
+		"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %zu\r\n",
+		contentLength);
+	if (n <= 0 || static_cast<size_t>(n) >= sizeof(line)) return;   // cannot happen; never send a torn head
+	static constexpr char kTail[] = "Connection: close\r\n\r\n";
+	if (!sendAllBytes(sock, line, static_cast<size_t>(n))) return;
+	if (!sendAllBytes(sock, kSecurityHeaders, sizeof(kSecurityHeaders) - 1)) return;
+	if (!sendAllBytes(sock, kTail, sizeof(kTail) - 1)) return;
+
+	// The body, straight from flash. Only the marker's part is split.
+	for (size_t i = 0; i < count; ++i)
+	{
+		if (i != markPart)
+		{
+			if (!sendAllBytes(sock, parts[i], sizes[i])) return;
+			continue;
+		}
+		if (!sendAllBytes(sock, parts[i], markAt)) return;
+		if (!sendAllBytes(sock, token.data(), token.size())) return;
+		const size_t after = markAt + marker.size();
+		if (!sendAllBytes(sock, parts[i] + after, sizes[i] - after)) return;
+	}
+}
+
 void HttpServer::sendHtml(int sock, const HttpRequest& req)
 {
 	// index_html.h stores the page as independent const char[] parts (each
 	// its own flash-resident literal, never concatenated at compile time --
 	// see that header's comment for why) rather than one combined constant.
-	// This is the one place that ever pays for assembling them into a single
-	// std::string, exactly like it did before that split existed.
-	std::string page;
+	// Since #410 they are never assembled at all: sendStaticHtml() writes each
+	// part to the socket in place. Assembling them used to cost ~116 KB per load,
+	// three times over (the page, then sendResponse's two body copies).
+	const char* parts[CGA_INDEX_HTML_PART_COUNT];
+	size_t sizes[CGA_INDEX_HTML_PART_COUNT];
+	for (size_t i = 0; i < CGA_INDEX_HTML_PART_COUNT; ++i)
 	{
-		size_t total = 0;
-		for (size_t i = 0; i < CGA_INDEX_HTML_PART_COUNT; ++i) total += CGA_INDEX_HTML_PARTS[i].size;
-		page.reserve(total);
-		for (size_t i = 0; i < CGA_INDEX_HTML_PART_COUNT; ++i) page.append(CGA_INDEX_HTML_PARTS[i].data, CGA_INDEX_HTML_PARTS[i].size);
+		parts[i] = CGA_INDEX_HTML_PARTS[i].data;
+		sizes[i] = CGA_INDEX_HTML_PARTS[i].size;
 	}
 
 	// Bind the page to this session's CSRF token. It is rendered INTO the
@@ -1291,14 +1356,7 @@ void HttpServer::sendHtml(int sock, const HttpRequest& req)
 	// is no session yet, and the login response carries the token the page then
 	// uses without needing a reload.
 	const std::string token = AdminAuth::sessionCsrf(sessionToken(req));
-	const std::string marker = "__PD_CSRF__";
-	const size_t at = page.find(marker);
-	if (at != std::string::npos)
-	{
-		page.replace(at, marker.size(), token);
-	}
-
-	sendResponse(sock, 200, "OK", "text/html; charset=utf-8", page);
+	sendStaticHtml(sock, parts, sizes, CGA_INDEX_HTML_PART_COUNT, token);
 }
 
 // Helper: JSON-escape a string. Beyond the five named C0 escapes, JSON (RFC
@@ -5220,31 +5278,48 @@ void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 	             "{\"status\":\"ok\",\"config\":" + trunkConfigJson(cfg) + "}");
 }
 
+// The two standalone setup pages: one flash part each, streamed in place with
+// the CSRF token substituted on the way out (#410). They used to copy the whole
+// page (~7.7 KB / ~10.5 KB) into a std::string -- under the 16 KB
+// SPIRAM_MALLOC_ALWAYSINTERNAL line, so from internal DRAM, #328's constraint.
 void HttpServer::sendTrunkSetupHtml(int sock, const HttpRequest& req)
 {
-	std::string page(PD_HTML_9, sizeof(PD_HTML_9) - 1);
+	const char* parts[] = { PD_HTML_9 };
+	const size_t sizes[] = { sizeof(PD_HTML_9) - 1 };
 	const std::string token = AdminAuth::sessionCsrf(sessionToken(req));
-	const std::string marker = "__PD_CSRF__";
-	const size_t at = page.find(marker);
-	if (at != std::string::npos)
-	{
-		page.replace(at, marker.size(), token);
-	}
-	sendResponse(sock, 200, "OK", "text/html; charset=utf-8", page);
+	sendStaticHtml(sock, parts, sizes, 1, token);
 }
 
 void HttpServer::sendEmailSetupHtml(int sock, const HttpRequest& req)
 {
-	std::string page(PD_HTML_8, sizeof(PD_HTML_8) - 1);
+	const char* parts[] = { PD_HTML_8 };
+	const size_t sizes[] = { sizeof(PD_HTML_8) - 1 };
 	const std::string token = AdminAuth::sessionCsrf(sessionToken(req));
-	const std::string marker = "__PD_CSRF__";
-	const size_t at = page.find(marker);
-	if (at != std::string::npos)
-	{
-		page.replace(at, marker.size(), token);
-	}
-	sendResponse(sock, 200, "OK", "text/html; charset=utf-8", page);
+	sendStaticHtml(sock, parts, sizes, 1, token);
 }
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+void HttpServer::servePageForTest(int sock, int page, const std::string& cookieHeader)
+{
+	HttpRequest req;
+	req.cookie = cookieHeader;
+	if (page == 0)      sendHtml(sock, req);
+	else if (page == 8) sendEmailSetupHtml(sock, req);
+	else if (page == 9) sendTrunkSetupHtml(sock, req);
+}
+
+std::string HttpServer::csrfForTest(const std::string& cookieHeader)
+{
+	HttpRequest req;
+	req.cookie = cookieHeader;
+	return AdminAuth::sessionCsrf(sessionToken(req));
+}
+
+std::string HttpServer::legacyHtmlHeadForTest(size_t len)
+{
+	return buildResponseHead(200, "OK", "text/html; charset=utf-8", len, "");
+}
+#endif
 
 void HttpServer::sendApiMohStatus(int sock)
 {
