@@ -1083,34 +1083,48 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
 		_blf.refresh();
 
-		// #462 (#284 rank 5): into the receive path's own persistent scratch,
-		// swapped rather than moved, so neither _outbox nor _logQueue restarts
-		// at zero capacity on every packet. Safe without a lock of their own:
-		// handle() has exactly one production caller, the UDP receive loop
-		// (SipServer.cpp), so only that thread ever touches these two.
-		drainOutboxInto(_rxOutboxScratch);
+		// #462 (#284 rank 5): into the receive path's own persistent scratch.
+		// Safe without a lock of their own: handle() has exactly one production
+		// caller, the UDP receive loop (SipServer.cpp), so only that thread ever
+		// touches this pair.
+		drainPassLocked(_rxOutboxScratch, _rxLogScratch);
 		_passThroughMsg = nullptr;
-
-		_rxLogScratch.clear();
-		_rxLogScratch.swap(_logQueue);
 	}
 
-	// Print deferred logs safely outside of the lock
-	for (const auto& log : _rxLogScratch)
+	// Issue #24: logs are printed and the UDP sendto runs outside the lock.
+	flushPass(_rxOutboxScratch, _rxLogScratch);
+}
+
+void RequestsHandler::drainPassLocked(
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	std::vector<std::pair<bool, std::string>>& logScratch)
+{
+	// #462 (#284 rank 5): swapped rather than moved, so neither _outbox nor
+	// _logQueue restarts at zero capacity on every pass (see drainOutboxInto()).
+	// logScratch was clear()ed by the previous flushPass(), so the swap loses
+	// nothing; the clear() here only guards a caller that skipped it.
+	drainOutboxInto(outScratch);
+	logScratch.clear();
+	logScratch.swap(_logQueue);
+}
+
+void RequestsHandler::flushPass(
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	std::vector<std::pair<bool, std::string>>& logScratch)
+{
+	for (const auto& log : logScratch)
 	{
 		if (log.first) std::cerr << log.second << '\n';
 		else std::cout << log.second << '\n';
 	}
-
-	// Issue #24 resolved: UDP socket syscall sendto is now executed outside the locked section to prevent lock contention.
-	for (auto& event : _rxOutboxScratch)
+	for (auto& event : outScratch)
 	{
 		_onHandled(event.first, std::move(event.second));
 	}
-	// clear() keeps the capacity: that is the point. The shared_ptrs were moved
-	// into _onHandled above, so nothing here still pins a pooled message.
-	_rxOutboxScratch.clear();
-	_rxLogScratch.clear();
+	// clear() keeps the capacity, which is the whole point. The shared_ptrs were
+	// moved into _onHandled above, so nothing here still pins a pooled message.
+	outScratch.clear();
+	logScratch.clear();
 }
 
 void RequestsHandler::noteDialogCSeq(const std::string& callID, uint32_t cseq,
@@ -8636,29 +8650,14 @@ void RequestsHandler::tick()
 			_snapshot = std::move(nextSnapshot);
 		}
 
-		// #462 (#284 rank 5): the tick path's own persistent scratch, swapped
-		// rather than moved -- same reasoning as handle(). Its own pair, never
-		// shared with handle()'s: tick() runs on a different task (the host
-		// tickLoop, or each esp_main variant's tick task), and each scratch must
-		// belong to exactly one thread.
-		drainOutboxInto(_tickOutboxScratch);
-
-		_tickLogScratch.clear();
-		_tickLogScratch.swap(_logQueue);
+		// #462 (#284 rank 5): the tick path's own persistent scratch. Its own
+		// pair, never shared with handle()'s: tick() runs on a different task
+		// (the host tickLoop, or each esp_main variant's tick task), and each
+		// scratch pair must belong to exactly one thread.
+		drainPassLocked(_tickOutboxScratch, _tickLogScratch);
 	}
 
-	for (const auto& log : _tickLogScratch)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
-
-	for (auto& event : _tickOutboxScratch)
-	{
-		_onHandled(event.first, std::move(event.second));
-	}
-	_tickOutboxScratch.clear();
-	_tickLogScratch.clear();
+	flushPass(_tickOutboxScratch, _tickLogScratch);
 }
 
 std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClientByAddress(const sockaddr_in& addr)
