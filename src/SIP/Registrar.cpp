@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "ArpLookup.hpp"
+#include "DeviceConfig.hpp"   // Issue #397: lastSchemaOutcome() decides the boot default
 #include "IDGen.hpp"
 #include "PbxPersist.hpp"
 #include "PoolConfig.hpp"
@@ -28,22 +29,55 @@ void Registrar::setMode(Mode mode)
 	_env.log(std::string("Registrar mode set to ") + name);
 }
 
+Registrar::BootModeDecision Registrar::chooseBootMode(bool haveStored, Mode stored, BootSchema schema)
+{
+	if (haveStored) return {stored, false};
+	switch (schema)
+	{
+	case BootSchema::FreshInstall: return {Mode::Learn, true};
+	case BootSchema::Upgraded:     return {Mode::Open, true};
+	case BootSchema::Uncertain:    break;
+	}
+	return {Mode::Open, false};
+}
+
 void Registrar::loadMode()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Issue #397: the compiled-in seed used to be Open unconditionally, so every
+	// board out of the box ran an open registrar. Now a board with no stored
+	// mode gets one decided by chooseBootMode() from #181's schema outcome, which
+	// app_main computes (DeviceConfig::ensureSchemaVersion) before the SIP task
+	// constructs this object.
 	nvs_handle_t h;
 	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
 	{
-		return;
+		return;   // keep the seed (Open); nothing can be persisted anyway
 	}
 	uint8_t v = 0;
 	esp_err_t err = nvs_get_u8(h, "reg_mode", &v);
 	nvs_close(h);
-	if (err == ESP_OK && v <= static_cast<uint8_t>(Mode::Secure))
+	const bool haveStored = (err == ESP_OK && v <= static_cast<uint8_t>(Mode::Secure));
+
+	BootSchema schema = BootSchema::Uncertain;
+	switch (DeviceConfig::lastSchemaOutcome())
 	{
-		_mode.store(static_cast<Mode>(v), std::memory_order_relaxed);
+	case DeviceConfig::SchemaOutcome::FreshInstall:  schema = BootSchema::FreshInstall; break;
+	case DeviceConfig::SchemaOutcome::AdoptedLegacy:
+	case DeviceConfig::SchemaOutcome::UpToDate:
+	case DeviceConfig::SchemaOutcome::Migrated:      schema = BootSchema::Upgraded; break;
+	default:                                         schema = BootSchema::Uncertain; break;
 	}
-	// else: keep the compile-time-seeded default (Open under POCKETDIAL_OPEN_REGISTRAR).
+
+	const BootModeDecision d = chooseBootMode(haveStored, static_cast<Mode>(v), schema);
+	_mode.store(d.mode, std::memory_order_relaxed);
+	if (d.persist)
+	{
+		persistMode();
+		_env.log(std::string("Registrar: no stored mode; defaulted to ") +
+			(d.mode == Mode::Learn ? "learn (fresh install)" : "open (existing board, kept as-is)") +
+			" and saved it (#397)");
+	}
 #endif
 }
 

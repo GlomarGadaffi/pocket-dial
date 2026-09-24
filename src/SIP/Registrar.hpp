@@ -48,6 +48,24 @@ public:
 
 	Registrar(PbxEnv& env, Mode defaultMode) : _env(env), _mode(defaultMode) {}
 
+	// ── Boot-time default (issue #397) ────────────────────────────────────────
+	// What mode a board boots in when NVS has no reg_mode, and whether to write
+	// it back. Pure, so the host suite tests the rule the board runs.
+	//   stored mode present            -> that mode, nothing written
+	//   FreshInstall                   -> Learn, persisted (a new board is not open)
+	//   AdoptedLegacy/UpToDate/Migrated-> Open, persisted (a DEPLOYED board keeps
+	//                                     the behaviour its phones rely on, now as
+	//                                     a visible setting)
+	//   anything else (store unreadable, failed/downgrade schema) -> Open, NOT
+	//                                     persisted: decide on the next healthy boot
+	enum class BootSchema : uint8_t { FreshInstall, Upgraded, Uncertain };
+	struct BootModeDecision
+	{
+		Mode mode;
+		bool persist;
+	};
+	static BootModeDecision chooseBootMode(bool haveStored, Mode stored, BootSchema schema);
+
 	// ── Mode ──────────────────────────────────────────────────────────────────
 	// setMode persists write-through (caller holds _mutex); getMode is lock-free.
 	void setMode(Mode mode);

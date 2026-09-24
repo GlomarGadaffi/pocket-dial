@@ -222,8 +222,8 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	_cdr.load();
 	// Task 2B: load the admin extension from NVS (defaults to "1001" if absent).
 	_dtmf.load();
-	// STAGE 2: load the registrar mode (defaults to the POCKETDIAL_OPEN_REGISTRAR
-	// seed) and the adopted-device registry from NVS.
+	// STAGE 2: load the registrar mode (with none stored, decided once and saved
+	// by Registrar::chooseBootMode(), #397) and the adopted-device registry.
 	_registrar.loadMode();
 	_registrar.loadDevices();
 	// Prewarm the per-extension HA1 cache off the REGISTER hot path so the first

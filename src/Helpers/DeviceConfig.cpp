@@ -96,19 +96,8 @@ namespace
 		return ok;
 	}
 
-	// Drop the persisted mode so the next boot falls back to the compiled-in
-	// default. Absent key is success: nothing to clear is the desired end state.
-	void eraseRegistrarMode()
-	{
-		nvs_handle_t rh;
-		if (nvs_open(DeviceConfig::kRegistrarNvsNamespace, NVS_READWRITE, &rh) != ESP_OK)
-		{
-			return;
-		}
-		nvs_erase_key(rh, kKeyRegMode);   // ESP_ERR_NVS_NOT_FOUND is fine
-		nvs_commit(rh);
-		nvs_close(rh);
-	}
+	// (eraseRegistrarMode() was removed by #397: factory reset now WRITES learn
+	// through writeRegistrarMode() above instead of erasing the key.)
 #endif
 
 	// Alphabet size, computed rather than written as a literal: the modulo-bias
@@ -927,8 +916,14 @@ namespace DeviceConfig
 		// is the wrong namespace — Registrar keeps reg_mode in `pbxcfg` — so the
 		// rescue never actually worked. It is OUTSIDE the block above because it
 		// is a different namespace and must happen whether or not `storage`
-		// opened; eraseRegistrarMode() owns that choice now.
-		eraseRegistrarMode();
+		// opened.
+		//
+		// #397: it is now WRITTEN as learn rather than erased. With no stored
+		// mode the next boot would read this (schema-stamped) board as an
+		// existing deployment and keep it open; a factory reset must come back
+		// like a fresh install instead. Learn still performs the rescue above --
+		// it accepts every first REGISTER -- so nothing is lost by writing it.
+		writeRegistrarMode(1 /* Registrar::Mode::Learn */);
 #endif
 
 		s.apSecure = false;

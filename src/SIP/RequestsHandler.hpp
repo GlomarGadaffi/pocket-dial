@@ -1,18 +1,13 @@
 #ifndef REQUESTS_HANDLER_HPP
 #define REQUESTS_HANDLER_HPP
 
-// Seeds the DEFAULT registrar admission mode at boot (Issue #56).
-//
-// NOTE: this #define is UNCONDITIONAL, so passing -UPOCKETDIAL_OPEN_REGISTRAR on
-// the compiler command line does nothing — the header simply re-defines it. That
-// also makes the #else branch further down (which would select Mode::Secure)
-// unreachable in practice. Do not document this as a build knob; it is not one.
-//
-// Mode selection is a RUNTIME setting, persisted in NVS as reg_mode and loaded by
-// Registrar::loadMode() at construction. Change it from the dashboard
-// (POST /api/registrar), or at flash time via the cfgseed record — see
-// docs/LEARN_MODE.md and src/Helpers/DeviceConfig.hpp.
-#define POCKETDIAL_OPEN_REGISTRAR
+// Registrar admission mode is a RUNTIME setting, persisted in NVS as reg_mode and
+// loaded by Registrar::loadMode() at construction. Change it from the dashboard
+// (POST /api/registrar), or at flash time via the cfgseed record -- see
+// docs/LEARN_MODE.md and src/Helpers/DeviceConfig.hpp. With no stored mode the
+// board decides once and saves it (issue #397, Registrar::chooseBootMode()):
+// learn on a fresh install, open kept on an existing board. The old
+// POCKETDIAL_OPEN_REGISTRAR #define (unconditional, so never really a knob) is gone.
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include <lwip/sockets.h>
@@ -771,14 +766,11 @@ private:
 	TransactionLayer _txLayer{*this};
 
 	// REGISTER admission policy + adopted-device registry (STAGE 2). Guarded by
-	// _mutex except the lock-free mode atomic. The compile-time
-	// POCKETDIAL_OPEN_REGISTRAR symbol only seeds the DEFAULT mode at boot; the
-	// NVS-persisted value (loaded in the constructor) overrides it.
-#ifdef POCKETDIAL_OPEN_REGISTRAR
+	// _mutex except the lock-free mode atomic. Open here is only the pre-load
+	// seed: on ESP, loadMode() in the constructor replaces it with the stored
+	// mode or chooseBootMode()'s decision (#397). The host has no NVS, so the
+	// host suite runs Open -- its REGISTERs carry no credentials.
 	Registrar _registrar{*this, Registrar::Mode::Open};
-#else
-	Registrar _registrar{*this, Registrar::Mode::Secure};
-#endif
 
 	// RFC 4028 session timer helpers. Caller holds _mutex.
 	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);
