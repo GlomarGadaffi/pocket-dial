@@ -206,6 +206,8 @@ void HttpServer::acceptLoop()
 	// served on (#405 measured those down to 472 bytes free). start() itself
 	// is the wrong place: the display build calls it from app_main's 3.5 KB
 	// stack. Costs the first accept one checksum walk over at most 128 KB.
+	// It also caches the presence probe itself (#405): after this, /api/status
+	// and the coredump routes never touch the partition per request.
 	CoreDumpStore::prime();
 
 #if defined(ESP_PLATFORM)
