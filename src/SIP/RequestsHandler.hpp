@@ -1562,8 +1562,10 @@ private:
 		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2);
 
 	// Issue #402: record a request's CSeq on its dialog's session, if it has one
-	// and `source` is a party on it. Caller holds _mutex.
-	void noteDialogCSeq(const std::string& callID, uint32_t cseq, const sockaddr_in& source);
+	// and `source` is a party on it. Returns the session found (or nullptr).
+	// Caller holds _mutex.
+	std::shared_ptr<Session> noteDialogCSeq(std::string_view callID, uint32_t cseq,
+		const sockaddr_in& source);
 
 	// Verify that the in-dialog request comes from a peer recorded at dialog setup
 	// (source IP match). Returns false → respond 403 Forbidden. Caller holds _mutex.
