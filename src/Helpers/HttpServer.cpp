@@ -20,6 +20,7 @@
 // live on both platforms and can be asserted by a host test rather than only
 // eyeballed on hardware.
 #include "DmaFramePool.hpp"
+#include "RtpReceiver.hpp"     // Issue #469: rxOversizeDrops() on /api/status
 #include "index_html.h"
 #include "IPHelper.hpp"
 #include "UrlEncode.hpp"
@@ -1551,6 +1552,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// not counted.
 	json << "\"droppedNoPool\":" << droppedNoPool << ",";
 	json << "\"droppedOversize\":" << droppedOversize << ",";
+	// Issue #469: the RTP side of the same check -- media datagrams over
+	// RtpReceiver::MAX_DATAGRAM_BYTES, dropped instead of parsed cut.
+	json << "\"rtpRxOversize\":" << RtpReceiver::rxOversizeDrops() << ",";
 	json << "\"recvErrors\":" << recvErrors << ",";
 	json << "\"lastRecvErrno\":" << lastRecvErrno << ",";
 	json << "\"recentDrops\":[";

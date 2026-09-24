@@ -1,4 +1,5 @@
 #include "UdpServer.hpp"
+#include "UdpRecv.hpp"   // Issues #444/#469: the shared truncation-aware receive
 #include <thread>
 #include <cstring>
 #include <cerrno>
@@ -194,45 +195,13 @@ void UdpServer::receiveLoop()
 	{
 		senderEndPoint = {};
 		int bytesReceived = 0;
-		int recvErr = 0;          // errno of a failed receive
-		bool truncated = false;   // #444: the datagram was longer than BUFFER_SIZE
-#if defined(__linux__) || defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-		// Issue #444: recvmsg(), not recvfrom(). For UDP both silently drop
-		// whatever does not fit in the buffer, and lwIP's recvfrom() returns
-		// min(len, datagram) with no way to tell -- only recvmsg() reports it,
-		// as MSG_TRUNC in msg_flags (lwIP and Linux alike). lwIP rejects any
-		// INPUT flag but MSG_PEEK/MSG_DONTWAIT (lwip_recvmsg fails with -1), so
-		// MSG_TRUNC is passed in only on Linux, where it makes the return value
-		// the real datagram length -- which lwIP returns anyway.
-		struct iovec iov;
-		iov.iov_base = buffer;
-		iov.iov_len = BUFFER_SIZE;
-		struct msghdr msg;
-		std::memset(&msg, 0, sizeof(msg));
-		msg.msg_name = &senderEndPoint;
-		msg.msg_namelen = sizeof(senderEndPoint);
-		msg.msg_iov = &iov;
-		msg.msg_iovlen = 1;
-#if defined(__linux__) && !defined(ESP_PLATFORM)
-		const int recvFlags = MSG_TRUNC;
-#else
-		const int recvFlags = 0;
-#endif
-		bytesReceived = static_cast<int>(recvmsg(_sockfd, &msg, recvFlags));
-		if (bytesReceived < 0) recvErr = errno;
-		truncated = bytesReceived >= 0 && (msg.msg_flags & MSG_TRUNC) != 0;
+		// Issues #444/#469: recvmsg()+MSG_TRUNC via the one shared helper --
+		// see UdpRecv.hpp for why recvfrom() cannot tell a cut datagram.
+		const udprecv::Result rx = udprecv::recvDatagram(_sockfd, buffer, BUFFER_SIZE, &senderEndPoint);
+		bytesReceived = rx.n;
+		const int recvErr = rx.err;
+		const bool truncated = rx.truncated;
 		(void)len;
-#elif defined _WIN32 || defined _WIN64
-		bytesReceived = recvfrom(_sockfd, buffer, BUFFER_SIZE, 0,
-			reinterpret_cast<struct sockaddr*>(&senderEndPoint), &len);
-		if (bytesReceived == SOCKET_ERROR)
-		{
-			recvErr = WSAGetLastError();
-			// Winsock reports a truncated datagram as an error, with the
-			// first BUFFER_SIZE bytes filled in; its real length is unknown.
-			if (recvErr == WSAEMSGSIZE) { truncated = true; bytesReceived = BUFFER_SIZE; }
-		}
-#endif
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		// Fed on every wake -- this socket's 500 ms recv timeout (openSocket())
 		// bounds how long a quiet period can go unfed, same reasoning as
@@ -282,11 +251,7 @@ void UdpServer::receiveLoop()
 
 bool UdpServer::isIdleWake(int err)
 {
-#if defined _WIN32 || defined _WIN64
-	return err == WSAETIMEDOUT || err == WSAEWOULDBLOCK || err == WSAEINTR;
-#else
-	return err == EAGAIN || err == EWOULDBLOCK || err == EINTR;
-#endif
+	return udprecv::isIdleWake(err);
 }
 
 int UdpServer::send(const struct sockaddr_in& address, const std::string& buffer)

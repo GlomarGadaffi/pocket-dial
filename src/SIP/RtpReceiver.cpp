@@ -1,4 +1,17 @@
 #include "RtpReceiver.hpp"
+#include "UdpRecv.hpp"   // Issue #469: truncation-aware receive (shared with UdpServer)
+
+namespace
+{
+	// Issue #469: RTP datagrams longer than MAX_DATAGRAM_BYTES, dropped by any
+	// receiver. Process-wide (every stream), device and host alike.
+	std::atomic<uint32_t> s_rxOversizeDrops{0};
+}
+
+uint32_t RtpReceiver::rxOversizeDrops()
+{
+	return s_rxOversizeDrops.load(std::memory_order_relaxed);
+}
 
 // buildRtpHeader() is reused rather than reimplemented. Two copies of the
 // RFC 3550 header layout would be two places to get the big-endian packing
@@ -659,9 +672,13 @@ void RtpReceiver::runLoop()
 		}
 
 		sockaddr_in from{};
-		socklen_t   fromLen = sizeof(from);
-		int n = static_cast<int>(recvfrom(sock, buffer, sizeof(buffer), 0,
-			reinterpret_cast<sockaddr*>(&from), &fromLen));
+		// Issue #469: recvfrom() into this 512 B buffer silently CUT any longer
+		// datagram (lwIP returns min(len, datagram) and says nothing), and the
+		// cut packet was parsed as valid RTP. The shared helper reports the cut
+		// (recvmsg + MSG_TRUNC, UdpRecv.hpp); a cut datagram is dropped and
+		// counted -- never parsed, decoded or relayed.
+		const udprecv::Result rx = udprecv::recvDatagram(sock, buffer, sizeof(buffer), &from);
+		int n = rx.n;
 
 		// Fed on every wake -- the 500 ms recv timeout bounds how long this can
 		// go silent even with no inbound packets, same reasoning as the comment
@@ -671,6 +688,11 @@ void RtpReceiver::runLoop()
 			(void)esp_task_wdt_reset();
 		}
 
+		if (rx.truncated)
+		{
+			s_rxOversizeDrops.fetch_add(1, std::memory_order_relaxed);   // #469
+			continue;
+		}
 		if (n <= 0)
 		{
 			// Timeout (EAGAIN) or socket closed by stop(): re-check the stop flag.
