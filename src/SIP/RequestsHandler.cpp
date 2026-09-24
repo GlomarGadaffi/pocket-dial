@@ -1401,7 +1401,8 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 
 		if (decision == Registrar::AuthDecision::Challenge || decision == Registrar::AuthDecision::RetryLater)
 		{
-			// The registrar already enqueued the 401 (or #515's 503 + Retry-After).
+			// The registrar already enqueued the 401 (or a 503 + Retry-After: #515's
+			// adoption limit, #440's ARP miss on a locked extension).
 			return;
 		}
 		if (decision == Registrar::AuthDecision::Reject)

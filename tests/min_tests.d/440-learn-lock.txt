@@ -1,0 +1,2 @@
+# RegistrarLearnLock_test.cpp, #440 (Learn locks an adopted extension to its device)
+7

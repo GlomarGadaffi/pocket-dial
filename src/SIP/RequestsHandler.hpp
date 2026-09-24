@@ -763,10 +763,11 @@ public:
 		for (auto& event : localOutbox) _onHandled(event.first, std::move(event.second));
 	}
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
-	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned)
+	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned,
+		bool locked = false)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		_registrar.adoptDeviceForTest(mac, ext, state);
+		_registrar.adoptDeviceForTest(mac, ext, state, locked);
 		refreshDeviceSnapshot();
 	}
 	// Test-only (#550): bind a client WITHOUT onRegister's identity guard, so a
