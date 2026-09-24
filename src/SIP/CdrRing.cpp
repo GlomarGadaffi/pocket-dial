@@ -131,6 +131,14 @@ namespace
 		return q;
 	}
 
+	// True when cdrPersistQueue() came from xQueueCreateWithCaps (PSRAM), so the
+	// teardown uses vQueueDeleteWithCaps (#476).
+	bool& queueHasCaps()
+	{
+		static bool caps = false;
+		return caps;
+	}
+
 	void cdrPersistWriterTask(void*)
 	{
 		// `blob` is deliberately a function-STATIC, not a stack-local. At the
@@ -251,10 +259,25 @@ namespace
 		// original 9046 B, or #319's already-halved ~4.5 KB -- is now ~0.
 		// Must be paired with vQueueDeleteWithCaps(), not vQueueDelete() --
 		// see below.
+		//
+		// #476 (BigDog): PSRAM only where the build HAS it. On a CONFIG_SPIRAM=n
+		// profile (sdkconfig.defaults.esp32_constrained) a SPIRAM-caps create
+		// always fails, so the CDR ring silently never persisted there. Fall back
+		// to a plain internal-RAM queue -- also if PSRAM is present but exhausted
+		// -- and remember which one we got, so teardown uses the matching delete.
+#if defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
 		cdrPersistQueue() = xQueueCreateWithCaps(kQueueDepth, sizeof(CdrRingBlob), MALLOC_CAP_SPIRAM);
+		queueHasCaps() = (cdrPersistQueue() != nullptr);
+#endif
 		if (cdrPersistQueue() == nullptr)
 		{
-			ESP_LOGE("CdrRing", "xQueueCreateWithCaps failed -- CDR ring will not persist across reboot");
+			cdrPersistQueue() = xQueueCreate(kQueueDepth, sizeof(CdrRingBlob));
+			queueHasCaps() = false;
+		}
+		if (cdrPersistQueue() == nullptr)
+		{
+			ESP_LOGE("CdrRing", "persist queue create failed -- CDR ring will not persist across reboot");
+			persistFailures().fetch_add(1);   // visible on /api/status, not just the log (#470)
 			started = false;   // allow a retry on a later load() (there is none today, but cheap to allow)
 			return;
 		}
@@ -272,11 +295,13 @@ namespace
 			nullptr, 1, nullptr, 0) != pdPASS)
 		{
 			ESP_LOGE("CdrRing", "xTaskCreate cdr_persist failed -- CDR ring will not persist across reboot");
-			// Issue #315: created with xQueueCreateWithCaps() above, so it must
-			// be torn down with the matching vQueueDeleteWithCaps(), not
-			// vQueueDelete() -- the plain form does not know how to free
-			// PSRAM-backed queue storage.
-			vQueueDeleteWithCaps(cdrPersistQueue());
+			// Issue #315: a caps-created queue must be torn down with the matching
+			// vQueueDeleteWithCaps(), not vQueueDelete() -- the plain form does not
+			// know how to free PSRAM-backed queue storage -- and a plain one with
+			// vQueueDelete() (#476: which one we got is recorded above).
+			persistFailures().fetch_add(1);
+			if (queueHasCaps()) vQueueDeleteWithCaps(cdrPersistQueue());
+			else                vQueueDelete(cdrPersistQueue());
 			cdrPersistQueue() = nullptr;
 			started = false;
 		}
