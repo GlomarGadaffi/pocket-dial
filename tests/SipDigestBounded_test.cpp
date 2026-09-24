@@ -21,10 +21,10 @@
 // Plus what only the bounded API has: overflow refusal rather than truncation,
 // and exact-fit behaviour at every buffer edge.
 //
-// NOT YET HERE: the zero-heap assertion. It lands with the shared
-// tests/support/AllocCounter hook (G-dubs, for #409/#416/#399) -- there can be
-// exactly one global operator new in this binary, so this file does not define
-// its own.
+// And the reason the API exists at all: ZERO heap allocations, asserted with
+// the binary's one shared counting operator new (tests/support/AllocCounter,
+// #426) through its per-thread AllocGuard -- this file does not define its own,
+// because a second global operator new would not link.
 
 #include <gtest/gtest.h>
 
@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "AllocCounter.hpp"
 #include "SipDigest.hpp"
 
 using namespace SipDigest;
@@ -429,4 +430,93 @@ TEST(SipDigestBounded, MakeCnonceIsSixteenLowercaseHexAndFreshEachTime)
 	}
 	// 64 random bits: a collision here is ~2^-64, i.e. a broken generator.
 	EXPECT_STRNE(a, b);
+}
+
+// ── 6. Zero heap: the reason this API exists ────────────────────────────────
+//
+// Uses the binary's one counting operator new (tests/support/AllocCounter,
+// #426) through AllocGuard, whose delta() counts THIS thread only -- RtpSender's
+// pacer and the conference tick driver allocate concurrently elsewhere in this
+// binary and must not be able to make these flaky. That the counter really
+// moves, and really is per-thread, is AllocCounter_test's job; these only
+// assert zero.
+//
+// Everything that is allowed to allocate -- the challenge string, the corpus,
+// gtest's own bookkeeping -- is built BEFORE the guard. Inside it runs only
+// the bounded API.
+
+TEST(SipDigestBounded, ParsingAChallengeAllocatesNothing)
+{
+	const std::string hdr = k7616Challenge;   // allocated before the guard
+	BoundedChallenge ch;
+
+	AllocGuard guard;
+	const bool ok = parseChallenge(std::string_view(hdr), ch);
+	const std::size_t allocs = guard.delta();
+
+	ASSERT_TRUE(ok);
+	EXPECT_EQ(allocs, 0u) << "bounded parseChallenge touched the heap";
+}
+
+TEST(SipDigestBounded, BuildingAnAuthorizationAllocatesNothing)
+{
+	BoundedChallenge ch;
+	ASSERT_TRUE(parseChallenge(k7616Challenge, ch));
+	char buf[kMaxAuthorizationValue];
+	size_t len = 0;
+
+	AllocGuard guard;
+	const bool ok = buildAuthorization(ch, "Mufasa", "Circle of Life", "GET",
+		"/dir/index.html", 1, k7616Cnonce, buf, sizeof(buf), len);
+	const std::size_t allocs = guard.delta();
+
+	ASSERT_TRUE(ok);
+	EXPECT_EQ(allocs, 0u) << "bounded buildAuthorization touched the heap";
+}
+
+TEST(SipDigestBounded, TheWholeAnswerPathAllocatesNothingAcrossTheCorpus)
+{
+	// Every shape, every branch: qop and legacy, MD5 and MD5-sess, refusals,
+	// overflow. A path that only allocates on, say, the MD5-sess branch or
+	// the overflow reset would slip past a single-vector test.
+	const std::vector<std::string>& c = corpus();   // built before the guard
+	std::vector<std::string_view> views(c.begin(), c.end());
+	const std::string overflowing = "Digest realm=\"r\", nonce=\"" +
+		std::string(BoundedChallenge::kMaxNonce, 'n') + "\"";
+
+	// First-call initialisation is not the steady state: on host, fillRandom()
+	// seeds a static std::mt19937_64 from std::random_device on first use.
+	// Warm it up outside the guard so the measurement is the per-call cost.
+	char warm[kCnonceLen + 1];
+	makeCnonce(warm);
+
+	int answered = 0;
+	AllocGuard guard;
+	for (std::string_view hdr : views)
+	{
+		BoundedChallenge ch;
+		if (!parseChallenge(hdr, ch)) continue;
+		char cnonce[kCnonceLen + 1];
+		makeCnonce(cnonce);
+		char nc[kNcLen + 1];
+		formatNc(7, nc);
+		bool useAuth = false;
+		(void)selectQop(ch, useAuth);
+		(void)algorithmOf(ch);
+		(void)authorizationHeaderName(ch);
+		char buf[kMaxAuthorizationValue];
+		size_t len = 0;
+		if (buildAuthorization(ch, "user", "pass", "INVITE", "sip:+15551234567@sbc",
+		                       7, cnonce, buf, sizeof(buf), len))
+		{
+			++answered;
+		}
+	}
+	BoundedChallenge over;
+	(void)parseChallenge(std::string_view(overflowing), over);   // overflow + reset path
+	const std::size_t allocs = guard.delta();
+
+	EXPECT_EQ(allocs, 0u) << "the bounded answer path touched the heap";
+	// And the loop really did run the emit path, so the zero is not vacuous.
+	EXPECT_GE(answered, 15);
 }
