@@ -5,6 +5,6 @@
 # total in the same PR. When it removes tests on purpose, lower it -- the
 # reduction then shows up in the diff instead of passing silently.
 #
-# Set to the count on main @ 5f5f0b1 (after #394's CoreDumpHttp tests):
-# 1244 tests from 173 suites.
-1244
+# Set to the count after #411's FirmwareInfo tests (main @ e2d00c5 + #461):
+# 1259 tests from 176 suites.
+1259
