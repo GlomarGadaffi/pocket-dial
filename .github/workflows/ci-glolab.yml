@@ -1,22 +1,20 @@
-name: Nightly Host Verification (glolab)
+name: Nightly Host Verification (bigdog)
 
-# Runs the host build/test job a second time on the self-hosted 'glolab' runner
-# (the bench Raspberry Pi, ARM64), as a confidence check on a second
-# architecture. Deliberately NOT triggered on pull_request, so code from an
-# untrusted fork PR can never execute on this runner. The pull_request-triggered
-# ci.yml on ubuntu-latest remains the actual PR gate.
+# Runs the host build/test job a second time, nightly, on the self-hosted
+# 'bigdog' runner: a dedicated Hyper-V Gen2 VM (Debian 13, x64) on desmo's XPS,
+# built by BigDog on 2026-09-24. It replaced the glolab Raspberry Pi runner
+# (ARM64). desmo: "we don't need arm", and the Pi is the bench host (it drives
+# the ESP32 boards and household DNS), so it should not carry CI load.
 #
-# NIGHTLY + MANUAL ONLY (desmo, 2026-09-24). It used to fire on every push to
-# main. The Pi is also the bench host (it drives the ESP32 boards over USB and
-# runs household DNS on a second board), so a full cppcheck + clang-tidy +
-# gtest build after every merge is load it should not carry. A busy night
-# queued five runs behind an offline runner, each due to fire in turn when it
-# came back. Once a day on the latest main is enough for an ARM64 cross-check;
-# dispatch it by hand when a specific commit needs it.
+# SECURITY BOUNDARY. This is a PUBLIC repo, so this runner must only ever run
+# code already merged to main: triggers are schedule + workflow_dispatch, and
+# NEVER pull_request / pull_request_target (fork code must not reach desmo's
+# machine). The VM is the isolation boundary, not a WSL distro: WSL2 distros
+# share one kernel and WSL interop is global, which was proven unfit on
+# 2026-09-24. The first step below re-proves the boundary on every run and
+# fails the job if any part of it is missing.
 #
-# 09:17 UTC = 05:17 US Eastern (EDT), 04:17 under EST: early morning, away from
-# the Pi's unattended-upgrades window (Automatic-Reboot is configured for 03:30
-# local, and fires only when an upgrade requires a reboot). Minute 17, not :00:
+# 09:17 UTC = 05:17 US Eastern (EDT), 04:17 under EST. Minute 17, not :00:
 # GitHub delays or drops scheduled runs at the top of the hour under load, and a
 # missed nightly is silent.
 on:
@@ -34,18 +32,37 @@ concurrency:
   # a static group under the old push trigger starved every run during merge
   # bursts, 29/29 cancelled in a row on 2026-09-16. Per-SHA groups fixed that
   # and are kept so two different SHAs never cancel each other.)
-  group: glolab-host-verify-${{ github.sha }}
+  group: bigdog-host-verify-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test-host-glolab:
-    name: Host Build & Simulation Testing (glolab, nightly)
-    runs-on: [self-hosted, glolab]
+  build-and-test-host-nightly:
+    name: Host Build & Simulation Testing (bigdog, nightly)
+    runs-on: [self-hosted, bigdog]
     env:
       # Kept in sync with the CPPCHECK_VERSION pin in ci.yml (Issue #112).
       CPPCHECK_VERSION: 2.21.0
 
     steps:
+      # FIRST, before any repo code runs: prove the isolation boundary this
+      # runner exists for (see the header). Any failure fails the job, so a
+      # nightly can never quietly run on a box that has lost its isolation.
+      - name: Verify runner isolation (VM boundary)
+        run: |
+          fail=0
+          check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
+          check "no /mnt/c (no Windows filesystem)"          '[ ! -e /mnt/c ]'
+          check "no 9p/drvfs/virtiofs/cifs mounts"           '! grep -Eq " (9p|drvfs|virtiofs|cifs) " /proc/mounts'
+          check "no WSL interop handler"                     '[ ! -e /proc/sys/fs/binfmt_misc/WSLInterop ]'
+          check "no Windows executables on PATH"             '! command -v cmd.exe >/dev/null && ! command -v powershell.exe >/dev/null'
+          check "runner user has no sudo"                    '! sudo -n true 2>/dev/null'
+          check "no SSH private keys in home"                '! grep -rlsE "BEGIN (OPENSSH|RSA|EC|DSA) PRIVATE KEY" "$HOME" --exclude-dir=_work --exclude-dir=_diag'
+          check "not running as root"                        '[ "$(id -u)" -ne 0 ]'
+          check "triggered by schedule or dispatch only"     'case "$GITHUB_EVENT_NAME" in schedule|workflow_dispatch) true;; *) false;; esac'
+          check "no GitHub tokens in home"                   '! grep -rlsE "(ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}" "$HOME" --exclude-dir=_work --exclude-dir=_diag'
+          echo "runner: $(uname -srm) as $(id -un)"
+          [ "$fail" -eq 0 ] || { echo "::error::Runner isolation check failed; refusing to run repo code on this host."; exit 1; }
+
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -122,8 +139,18 @@ jobs:
           echo "clang-tidy total diagnostics: ${COUNT} (${UNIQUE} distinct, see ci.yml for the pinned/baselined version)"
 
       - name: Run Unit Test Suite (GoogleTest via CTest)
+        env:
+          GTEST_OUTPUT: json:${{ github.workspace }}/build/gtest-reports/
         run: |
+          # Self-hosted: the workspace can outlive a run, so clear any report a
+          # previous run left behind before counting this one.
+          rm -rf build/gtest-reports
           ctest --test-dir build/tests --output-on-failure
+
+      - name: Verify Test Count (floor in tests/EXPECTED_MIN_TESTS)
+        run: |
+          # See ci.yml: ctest reports the suite as one test (#390).
+          python3 tests/tools/check_test_count.py build/gtest-reports
 
       - name: Verify SIP Parser Call Graph (T-7 recursion/frame guard)
         run: |
