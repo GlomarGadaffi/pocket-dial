@@ -5,5 +5,6 @@
 # total in the same PR. When it removes tests on purpose, lower it -- the
 # reduction then shows up in the diff instead of passing silently.
 #
-# Set to the count on main @ 98cc830 (#391): 1235 tests from 171 suites.
-1235
+# Set to the count on main @ 8365361 (#403, which added 2): 1237 tests from
+# 171 suites.
+1237
