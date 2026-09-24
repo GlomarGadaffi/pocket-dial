@@ -567,11 +567,17 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 	//   2. from the remote target's host, when it is a dotted quad -- carriers
 	//      commonly send in-dialog requests from the node named in the 2xx's
 	//      Contact rather than the one that took the INVITE;
-	//   3. from anywhere else, if BOTH dialog tags match. The carrier's tag (our
-	//      toTag) is minted by the far end, not by IDGen, so an off-path sender
-	//      has to have seen the dialog to know it. Logged loudly: this is the
-	//      branch a real carrier's SBC pool would land in, and the log is what
-	//      tells whoever brings one up which address to expect (#164).
+	//   3. from anywhere else, if the call is CONFIRMED and BOTH dialog tags
+	//      match. The carrier's tag (our toTag) is minted by the far end, not by
+	//      IDGen, so an off-path sender has to have seen the dialog to know it.
+	//      Confirmed only, because the no-reaper cost above is a Confirmed-only
+	//      cost: an early dialog is swept, and a 180 can latch toTag before any
+	//      answer. RFC 3261 s15 forbids the callee a BYE on an early dialog, so
+	//      this refuses nothing a real carrier sends; Terminating is left out
+	//      too, since our own BYE is already pending and sweep() reclaims it.
+	//      Logged loudly: this is the branch a real carrier's SBC pool would
+	//      land in, and the log is what tells whoever brings one up which
+	//      address to expect (#164).
 	const sockaddr_in& src = data->getSource();
 	bool authorised = src.sin_addr.s_addr == d->peer.sin_addr.s_addr;
 	if (!authorised)
@@ -579,7 +585,7 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 		uint32_t target = 0;
 		authorised = uriHostIpv4(d->remoteTarget, target) && target == src.sin_addr.s_addr;
 	}
-	if (!authorised && !d->toTag.empty()
+	if (!authorised && d->state == State::Confirmed && !d->toTag.empty()
 		&& siphdr::tagOf(data->getFrom()) == d->toTag
 		&& siphdr::tagOf(data->getTo()) == d->fromTag)
 	{

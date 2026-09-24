@@ -955,8 +955,8 @@ TEST(SipTrunkSource, AnFqdnContactGrantsNoAddress)
 	EXPECT_EQ(trunk.activeDialogs(), 1u);
 }
 
-// Before the answer there is no carrier tag to match, so only the peer counts.
-TEST(SipTrunkSource, AnUnansweredDialogAcceptsNoByeOnTags)
+// With no carrier tag latched yet, an empty guessed tag must not "match" it.
+TEST(SipTrunkSource, AnEmptyCarrierTagMatchesNothing)
 {
 	FakePbxEnv env;
 	SipTrunk trunk(env);
@@ -970,6 +970,36 @@ TEST(SipTrunkSource, AnUnansweredDialogAcceptsNoByeOnTags)
 	ASSERT_TRUE(trunk.handleBye(carrierByeFrom(*d, kForgerIp, "", d->fromTag)));
 	EXPECT_EQ(firstLine(env.sentRaw(0)), "SIP/2.0 403 Forbidden");
 	EXPECT_EQ(d->state, SipTrunk::State::Trying);
+}
+
+// The tag rule is for CONFIRMED calls only. A 180 carrying a To-tag latches the
+// carrier's tag before any answer, so without the state gate a tag-matched BYE
+// from anywhere would be accepted on an early dialog -- which the rule's own
+// justification (a refused BYE bills forever) does not cover: an unanswered
+// dialog is swept. RFC 3261 s15: the callee MUST NOT send a BYE on an early
+// dialog, so the gate refuses nothing a real carrier sends.
+TEST(SipTrunkSource, AnEarlyDialogAcceptsNoByeOnTags)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	ASSERT_EQ(d->state, SipTrunk::State::Proceeding);
+	ASSERT_EQ(d->toTag, "carrier-tag") << "the 180 latched the carrier's tag";
+	env.sent.clear();
+	lis.events.clear();
+
+	ASSERT_TRUE(trunk.handleBye(carrierByeFrom(*d, kForgerIp, "carrier-tag", d->fromTag)));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)), "SIP/2.0 403 Forbidden");
+	EXPECT_EQ(d->state, SipTrunk::State::Proceeding) << "the call is still ringing";
+	EXPECT_TRUE(lis.events.empty()) << "the handset must not be torn down";
+	EXPECT_EQ(logsContaining(env, "accepted on dialog tags"), 0u);
 }
 
 // ── Outbound proxy: the domain/transport split ───────────────────────────────

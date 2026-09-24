@@ -366,8 +366,9 @@ public:
 	// here would free the slot without the carrier ever being told.
 	//
 	// Recognised is not authorised (#356). A BYE on a trunk Call-ID is acted on
-	// only from the peer, from a dotted-quad Contact host, or with both dialog
-	// tags matching; anything else is answered 403 and consumed.
+	// only from the peer, from a dotted-quad Contact host, or -- on a Confirmed
+	// call only -- with both dialog tags matching; anything else is answered
+	// 403 and consumed.
 	bool handleBye(const std::shared_ptr<SipMessage>& data);
 
 	// Tear down the trunk leg for `callID` (either the trunk's own Call-ID or the
