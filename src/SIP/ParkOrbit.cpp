@@ -11,6 +11,15 @@
 
 using sipwire::addrToIpPort;
 
+namespace
+{
+	// The retrieve re-INVITE is the server's first request on the parked dialog
+	// (a slot is released once retrieved), so it keeps the long-standing 2. One
+	// constant for the INVITE, its ACK, and the session record, so that a later
+	// server BYE on this dialog (#389) goes above it rather than reusing it.
+	constexpr uint32_t kRetrieveReinviteCSeq = 2;
+}
+
 int ParkOrbit::orbitIndex(std::string_view ext) const
 {
 	if (ext.size() != 3 || ext[0] != '7' || ext[1] != '0') return -1;
@@ -199,7 +208,7 @@ void ParkOrbit::sendReinvite(ParkSlot& slot, const std::string& sdp)
 	   // — otherwise the re-INVITE ships "Call-ID: Call-ID: x@host" and the parked
 	   // phone never matches it to the dialog.
 	   << "Call-ID: " << siphdr::stripHeaderName(slot.callID) << "\r\n"
-	   << "CSeq: 2 INVITE\r\n"
+	   << "CSeq: " << kRetrieveReinviteCSeq << " INVITE\r\n"
 	   << "Max-Forwards: 70\r\n"
 	   << "Contact: <sip:" << slot.orbit << "@" << srcIpPort << ";transport=UDP>\r\n"
 	   << "User-Agent: pocket-dial\r\n"
@@ -212,6 +221,7 @@ void ParkOrbit::sendReinvite(ParkSlot& slot, const std::string& sdp)
 	(void)inv->filterAudioCodecs(/*allowWideband=*/true);   // phone SDP relayed P2P
 	inv->syncContentLength();
 	_env.enqueue(slot.parkedAddr, std::move(inv));
+	if (auto parked = _env.findSession(slot.callID)) parked->noteServerCSeq(kRetrieveReinviteCSeq);
 	_pendingAcks.push_back(slot.callID);
 	_env.log("Park: re-INVITE -> parked party " + slot.parkedExt);
 }
@@ -287,7 +297,7 @@ bool ParkOrbit::handleOk(const std::shared_ptr<SipMessage>& data)
 		   << "From: " << siphdr::stripHeaderName(data->getFrom()) << "\r\n"
 		   << "To: " << siphdr::stripHeaderName(data->getTo()) << "\r\n"
 		   << callID << "\r\n"
-		   << "CSeq: 2 ACK\r\n"
+		   << "CSeq: " << kRetrieveReinviteCSeq << " ACK\r\n"
 		   << "Max-Forwards: 70\r\n"
 		   << "Content-Length: 0\r\n\r\n";
 		_env.enqueue(data->getSource(), _env.messageFromPool(ss.str(), data->getSource()));

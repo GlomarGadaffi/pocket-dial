@@ -195,13 +195,6 @@ class PjsuaUA:
         self.cli = PjsuaCli(self.cli_port)
         return self
 
-    def log(self):
-        try:
-            with open(self.logfile, "r", errors="replace") as f:
-                return f.read()
-        except OSError:
-            return ""
-
     def mark(self):
         """Byte offset into the log, so later waits ignore earlier scenarios."""
         try:
@@ -210,7 +203,16 @@ class PjsuaUA:
             return 0
 
     def log_since(self, mark):
-        return self.log()[mark:]
+        # Seek in BYTES, the unit mark() records. Slicing text-mode read() output
+        # by a byte offset starts late by one char per \r\n before the mark (text
+        # mode folds each to \n), and the log carries full SIP messages, so by
+        # mid-suite that is ~2000 chars of skipped fresh log -- issue #378.
+        try:
+            with open(self.logfile, "rb") as f:
+                f.seek(mark)
+                return f.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
 
     def wait_log(self, pattern, timeout=8.0, mark=0, flags=0):
         rx = re.compile(pattern, flags)
@@ -287,12 +289,32 @@ class BaresipUA:
         self.sock = None
         self.rxbuf = b""
 
+    @staticmethod
+    def module_dir():
+        """Where this baresip's modules live, or None to use its built-in default.
+
+        The config must name it: without `module_path` Debian's baresip looks in
+        ./, loads nothing, never opens ctrl_tcp, and mixed_stack SKIPs exactly as
+        if baresip were absent.
+        """
+        import glob
+        for d in ["/usr/lib/baresip/modules", "/usr/local/lib/baresip/modules"] + \
+                 glob.glob("/usr/lib/*/baresip/modules"):
+            if os.path.isfile(os.path.join(d, "ctrl_tcp.so")):
+                return d
+        return None
+
     def write_config(self):
         os.makedirs(self.cfgdir, exist_ok=True)
-        cfg = "\n".join([
+        mdir = self.module_dir()
+        cfg = "\n".join(([("module_path\t\t%s" % mdir)] if mdir else []) + [
             "sip_listen\t\t%s:%d" % (self.ip, self.sip_port),
             "audio_player\t\taufile,%s" % os.path.join(self.cfgdir, "out.wav"),
             "audio_source\t\tausine,440",
+            # ausine only generates 48 kHz; without this the source fails to start
+            # against the 8 kHz PCMU codec and the call carries no RTP at all.
+            # Declaring the rate makes baresip resample 48k -> 8k.
+            "ausrc_srate\t\t48000",
             "audio_alert\t\taufile,%s" % os.path.join(self.cfgdir, "alert.wav"),
             "ctrl_tcp_listen\t\t%s:%d" % (PBX_IP, self.ctrl_port),
             "module\t\t\tstdio.so",
@@ -606,12 +628,19 @@ def sc_park_retrieve(env):
 
     m_bye = a.mark()
     c.hangup_all()
-    bye_relayed = a.wait_log(TEARDOWN_RX, 8, m_bye) is not None
+    # The parker's leg must actually END, not merely receive a BYE: #389's BYE
+    # arrived on every run but reused the re-INVITE's CSeq, pjsua answered
+    # "500 Invalid CSeq", and the leg stayed CONFIRMED -- which TEARDOWN_RX's
+    # "Request msg BYE" half matched as success. A's 777 call stays up until
+    # hangup_all below, so the only DISCONNECTED in this window is the 700 leg.
+    parker_ended = a.wait_log(r"Call \d+ is DISCONNECTED", 8, m_bye) is not None
+    bye_rejected = re.search(r"Response msg 500/BYE", a.log_since(m_bye)) is not None
     a.hangup_all()
-    ok = parked and hold_sdp and retrieved and bye_relayed
+    ok = parked and hold_sdp and retrieved and parker_ended and not bye_rejected
     return report("park_retrieve", "OK" if ok else "FAIL",
-                  "park 200 w/ a=inactive=%s, retrieve CONFIRMED=%s, BYE relayed to parker=%s"
-                  % (parked and hold_sdp, retrieved, bye_relayed))
+                  "park 200 w/ a=inactive=%s, retrieve CONFIRMED=%s, parker's leg ended=%s, "
+                  "parker 500'd the BYE=%s"
+                  % (parked and hold_sdp, retrieved, parker_ended, bye_rejected))
 
 
 def dnd_flag(ext):

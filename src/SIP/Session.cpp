@@ -46,6 +46,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_remoteSdp.clear();
 	_isTransferBridge = false;
 	_blindXferLeg = false;
+	_lastServerCSeq = 0;
 
 	// Issue #353. These survived reset() and nothing else ever cleared them --
 	// there is no setVoicemail(false) anywhere in the tree -- so a pool slot
@@ -169,6 +170,7 @@ void Session::release()
 	_remoteSdp.clear();
 	_isTransferBridge = false;
 	_blindXferLeg = false;
+	_lastServerCSeq = 0;
 
 	// Deliberately does NOT clear the voicemail/trunk state that reset() does.
 	// endCall() calls release() on the pool slot and only AFTERWARDS reads
