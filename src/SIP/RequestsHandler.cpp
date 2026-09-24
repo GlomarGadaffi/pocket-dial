@@ -8969,6 +8969,15 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 	// so the phone already echoed the tag it learned from the ORIGINAL 200 OK.
 	// buildOkWithSdp() mints a fresh tag for a first answer; calling it here
 	// would append a second tag onto the one already present.
+	//
+	// Contact is NOT left as `data` carried it (#445, the #425 rule): this is a
+	// 2xx to a target-refresh request, so its Contact becomes the phone's new
+	// remote target. The clone carried the PHONE's own Contact, so after one hold
+	// on an anchored call the phone targeted itself and its BYE looped back to
+	// its own socket. Present the board as setup did: the request's To-user is
+	// the PBX's user on this dialog (555 outbound; the handset's own DN inbound,
+	// see buildInboundInviteFork()).
+	ok->setContact(buildContact(data->getToNumber()));
 	addCapabilityHeaders(*ok);
 	const std::string sdpBody = buildMediaSdp(_localIp, bridge->receiverPort(),
 		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
@@ -9038,6 +9047,17 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	if (destNum == kAnchorCallExt && src && dest)
 	{
 		answerAnchorReinvite(data, session, src);
+		return;
+	}
+
+	// Issue #445: the INBOUND anchored call (PSTN -> handset) is terminated here
+	// just the same, but it cannot be matched by `destNum == 555`: its src is the
+	// synthetic PSTN peer (a ZEROED address) and its dest is the handset. Missed,
+	// it fell through to the relay below and the handset's hold went to 0.0.0.0,
+	// unanswered. The phone leg here is dest.
+	if (session->isAnchorInbound() && dest)
+	{
+		answerAnchorReinvite(data, session, dest);
 		return;
 	}
 
@@ -9192,6 +9212,24 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Issue #445: the INBOUND anchored call (PSTN -> handset) is terminated here
+	// too. src is the synthetic PSTN peer (a ZEROED address) and dest is the
+	// handset, so it never matches `destNum == 555` above; unhandled, an SDP
+	// UPDATE was relayed to 0.0.0.0 and a refresh (the #439 review catch) the
+	// same. The phone leg here is dest. Both answers carry buildContact(To-user):
+	// on this dialog the PBX's own user is the handset's DN
+	// (buildInboundInviteFork()), exactly the Contact the handset was offered.
+	if (session->isAnchorInbound() && dest)
+	{
+		if (!data->hasSdp())
+		{
+			answerRefreshLocally();
+			return;
+		}
+		answerAnchorReinvite(data, session, dest);
+		return;
+	}
+
 	// Same virtual-leg guard as onReinvite() above: 777/888 have no peer leg, and
 	// a trunk leg is terminated here too. A refresh is answered; an SDP change
 	// is declined so the phone keeps the original SDP.
@@ -9207,19 +9245,6 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		resp->setHeader("SIP/2.0 488 Not Acceptable Here");
 		resp->clearBody();
 		_outbox.emplace_back(data->getSource(), std::move(resp));
-		return;
-	}
-
-	// Inbound anchored call (PSTN -> handset): src is the synthetic PSTN peer,
-	// allocated with a ZEROED address, and dest is the handset -- there is no SIP
-	// peer to relay to, and this PBX is the handset's UAS. A refresh is answered
-	// here, with the Contact the handset was offered (buildInboundInviteFork uses
-	// the handset's own DN as the dialog user, which is this request's To-user).
-	// Review catch on #439: without this the reordered classification forwarded
-	// the refresh to 0.0.0.0 and nobody answered it.
-	if (session->isAnchorInbound() && !data->hasSdp())
-	{
-		answerRefreshLocally();
 		return;
 	}
 
