@@ -1483,6 +1483,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	std::vector<std::tuple<std::string, std::string, std::string, int>> parkedCalls;
 	uint64_t packets = 0;
 	uint64_t dropped = 0;
+	unsigned anchorRetiredSlots = 0;
 
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
 	if (handler != nullptr)
@@ -1497,6 +1498,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		parkedCalls = handler->getParkedCalls();
 		packets = handler->getPacketsProcessed();
 		dropped = handler->getPacketsDropped();   // Issue #38
+		anchorRetiredSlots = handler->getAnchorRetiredSlots();   // #421
 	}
 
 	std::string displayIp = _ip;
@@ -1522,6 +1524,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
+	// #421: anchor call slots retired until reboot. Non-zero means reduced anchor
+	// capacity; equal to the max means every anchored call is refused with 503.
+	json << "\"anchorRetiredSlots\":" << anchorRetiredSlots << ",";
 
 	// microSD, on builds that have a slot wired (currently the T-ETH-ELITE `eth`
 	// board only). Always present so a client can tell "no card" from "this build

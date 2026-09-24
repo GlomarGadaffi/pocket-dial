@@ -512,6 +512,69 @@ TEST(AnchorRouting, DialPastCapacityIsRefusedWithoutConsumingASession)
 	}
 }
 
+namespace
+{
+	// Stands in for a TelephonyAnchorClient that has retired some call slots (#421):
+	// a force-killed rx task died holding a slot's getMutex, so that slot can never
+	// carry a call again and the provider reports correspondingly less capacity.
+	class ReducedCapacityLoopback : public LoopbackAnchorClient
+	{
+	public:
+		ReducedCapacityLoopback(unsigned capacity, unsigned retired) : _capacity(capacity), _retired(retired) {}
+		unsigned maxConcurrentCalls() const override { return _capacity; }
+		unsigned retiredCallSlots() const override { return _retired; }
+
+	private:
+		unsigned _capacity;
+		unsigned _retired;
+	};
+}
+
+TEST(AnchorRouting, AProviderWithEverySlotRetiredRefusesAnchoredCallsWith503)
+{
+	// capacity 1 is the positive control: the same swapped-in provider, the same
+	// dial, admitted. Without it a 503 at capacity 0 could come from some other
+	// refusal (provider not started, wrong wiring) and still pass.
+	for (const unsigned capacity : {1u, 0u})
+	{
+		SCOPED_TRACE("provider capacity " + std::to_string(capacity));
+		const unsigned retired = static_cast<unsigned>(POCKETDIAL_MAX_ANCHOR_CALLS) - capacity;
+		ReducedCapacityLoopback provider(capacity, retired);   // outlives the handler below
+		ASSERT_TRUE(provider.init("", "", "", "100"));
+		ASSERT_TRUE(provider.start());
+
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+		RequestsHandler handler("192.168.9.1", 5060,
+			[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+				sent.emplace_back(addr, std::move(msg));
+			});
+		handler.setAnchorClientForTest(&provider);
+		EXPECT_EQ(handler.getAnchorRetiredSlots(), retired);
+
+		handler.handle(makeRegister("621", "192.168.9.121", "reg-621"));
+		sent.clear();
+		const std::string callId = "anchor-retired-" + std::to_string(capacity);
+		handler.handle(makeInvite("621", "555", "192.168.9.121", callId));
+		ASSERT_FALSE(sent.empty());
+		const std::string raw = sent.front().second ? sent.front().second->toString() : std::string{};
+
+		if (capacity > 0)
+		{
+			EXPECT_NE(raw.find("SIP/2.0 200 OK"), std::string::npos)
+				<< "positive control: a provider with capacity must admit the call, got:\n" << raw;
+		}
+		else
+		{
+			EXPECT_NE(raw.find("503 Service Unavailable"), std::string::npos)
+				<< "every slot retired: the dial must be refused with 503, got:\n" << raw;
+			EXPECT_EQ(raw.find("SIP/2.0 200 OK"), std::string::npos);
+			EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value())
+				<< "a refused anchor dial must not consume a session slot";
+		}
+		provider.stop();
+	}
+}
+
 TEST(AnchorRouting, ByeReleasesTheBridgeAndEndsTheSessionThenTheSlotCanBeReused)
 {
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;

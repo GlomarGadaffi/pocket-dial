@@ -59,7 +59,15 @@ public:
 	// bridge anything. drawbridge validated 4 on this same silicon as the point
 	// where calls still bridge with no playout glitches and the next one is cleanly
 	// refused with 503 rather than attempted and dropped.
-	unsigned maxConcurrentCalls() const override { return POCKETDIAL_MAX_ANCHOR_CALLS; }
+	// Minus any slot retired because a force-killed rx task died holding its getMutex
+	// (#421): that slot can never carry a call again, so the engine must not admit one
+	// for it. With every slot retired this is 0 and every anchored call gets a 503.
+	unsigned maxConcurrentCalls() const override
+	{
+		const unsigned retired = _retiredSlots.load(std::memory_order_acquire);
+		return retired >= POCKETDIAL_MAX_ANCHOR_CALLS ? 0u : POCKETDIAL_MAX_ANCHOR_CALLS - retired;
+	}
+	unsigned retiredCallSlots() const override { return _retiredSlots.load(std::memory_order_acquire); }
 
 	// Counts of POST media-stream opens by handshake type (set in startMediaStreams from the
 	// open's wall time — a full S3 ECDHE is always >~400ms, a resumed session well under).
@@ -70,6 +78,10 @@ public:
 	}
 
 private:
+	// Call slots retired by CallSlot::getMutexPoisoned (#421). Only ever grows; a reboot
+	// clears it. Outside the ESP-only block so maxConcurrentCalls() compiles everywhere.
+	std::atomic<unsigned> _retiredSlots{0};
+
 	std::string _baseUrl;
 	std::string _clientId;
 	std::string _clientSecret;
@@ -175,12 +187,25 @@ private:
 		std::atomic<bool>        upsetPending{false};
 		esp_http_client_handle_t postClient = nullptr;
 		std::atomic<bool>        postLive{false};         // guarded by postMutex
+		// Issue #370: OWNED BY THE RX TASK. runRxLoop() is the only thing that creates
+		// this handle and the only thing that frees it, and it nulls it (under getMutex)
+		// on every exit path; after a forced kill stopMediaStreams() nulls it without
+		// freeing. So getClient != nullptr means a live rx task owns it -- NOTHING else
+		// may close/cleanup it, mutex held or not.
+		// getMutex serialises the pointer, not the handle's USE: runRxLoop deliberately
+		// does not hold it across esp_http_client_open()/read (a ~1s TLS handshake under
+		// the lock would block the very shutdown(fd) that unblocks the task), so holding
+		// the mutex tells an external caller nothing about whether someone is inside.
 		esp_http_client_handle_t getClient  = nullptr;
 		TaskHandle_t             rxTaskHandle = nullptr;
 		SemaphoreHandle_t        rxDoneSem    = nullptr;
 		std::atomic<bool>        tearingDown{false};      // single-entry gate for stopMediaStreams(slot)
+		// Set when a force-killed rx task died holding getMutex. That mutex stays locked forever,
+		// so the slot is retired: allocSlotLocked() never hands it out again, and nothing may block
+		// on its getMutex. Costs one call's capacity until reboot (#65's restart cannot reclaim it).
+		std::atomic<bool>        getMutexPoisoned{false};
 		mutable std::mutex       postMutex;               // guards postClient (writeAudio/stop)
-		std::mutex               getMutex;                // guards getClient (runRxLoop/stop)
+		std::mutex               getMutex;                // guards the getClient POINTER only — see #370 note above
 	};
 	CallSlot _calls[POCKETDIAL_MAX_ANCHOR_CALLS];
 	// Slot lookup/alloc (caller holds _mutex). slotForLocked returns the slot whose

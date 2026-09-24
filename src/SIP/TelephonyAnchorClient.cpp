@@ -748,13 +748,13 @@ TelephonyAnchorClient::CallSlot* TelephonyAnchorClient::allocSlotLocked(const st
 	}
 	for (auto& s : _calls)
 	{
-		if (s.participantId.empty())
+		if (s.participantId.empty() && !s.getMutexPoisoned.load(std::memory_order_acquire))
 		{
 			s.participantId = participantId;
 			return &s;
 		}
 	}
-	return nullptr;   // all POCKETDIAL_MAX_ANCHOR_CALLS slots busy
+	return nullptr;   // all POCKETDIAL_MAX_ANCHOR_CALLS slots busy (or retired as poisoned)
 }
 
 void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
@@ -895,8 +895,13 @@ bool TelephonyAnchorClient::ensureToken()
 	for (auto& s : _calls)
 	{
 		if (s.postLive.load(std::memory_order_acquire)) { streamsActive = true; break; }
-		std::lock_guard<std::mutex> getLock(s.getMutex);
-		if (s.getClient != nullptr) { streamsActive = true; break; }
+		if (s.getMutexPoisoned.load(std::memory_order_acquire)) continue;   // retired slot, no stream
+		// try_lock, never block: a force-killed rx task may have died holding getMutex, and the
+		// poisoned flag above is set only after that kill completes. Busy counts as "maybe live".
+		if (!s.getMutex.try_lock()) { streamsActive = true; break; }
+		const bool live = (s.getClient != nullptr);
+		s.getMutex.unlock();
+		if (live) { streamsActive = true; break; }
 	}
 	if (streamsActive)
 	{
@@ -2116,12 +2121,19 @@ void TelephonyAnchorClient::closePostClient()
 			}
 		}
 		{
-			std::lock_guard<std::mutex> getLock(slot.getMutex);
-			if (slot.getClient)
+			// #370: never free getClient here. A non-null handle means its rx task is still
+			// running: stopAllMediaStreams() does not wait for a slot whose stopMediaStreams()
+			// lost the tearingDown gate to a concurrent teardown (e.g. the WS-disconnect
+			// handler), so that teardown may still be joining a task inside this handle.
+			// try_lock, never block: this is on stop(), including #65's recovery restart, and a
+			// poisoned getMutex (see CallSlot::getMutexPoisoned) would hang it forever.
+			if (!slot.getMutexPoisoned.load(std::memory_order_acquire) && slot.getMutex.try_lock())
 			{
-				esp_http_client_close(slot.getClient);
-				esp_http_client_cleanup(slot.getClient);
-				slot.getClient = nullptr;
+				if (slot.getClient)
+				{
+					ESP_LOGW(TAG, "closePostClient: getClient still owned by a running rx task — not freeing it (#370)");
+				}
+				slot.getMutex.unlock();
 			}
 		}
 	}
@@ -2994,26 +3006,43 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 			if (xSemaphoreTake(doneSem, pdMS_TO_TICKS(2000)) != pdTRUE)
 			{
 				ESP_LOGE(TAG, "Rx task failed to exit in time! Forcing task deletion.");
+				// Synchronous for another task: IDF 6's vTaskDeleteWithCaps() suspends it and spins
+				// until it is not current on any core before deleting. The rx task never runs again.
 				vTaskDeleteWithCaps(taskToKill);   // #100: rx task is WithCaps(PSRAM) — reclaim its stack
-				// try_lock: if the deleted task was holding getMutex when killed, the mutex is
-				// permanently poisoned and a blocking lock_guard would deadlock here.
+
+				// #370: forget the handle, never free it. The task was killed at an arbitrary point,
+				// possibly mid-handshake, so the handle's mbedTLS state may be half-built and
+				// cleanup() could fault walking it. Null the pointer so nothing mistakes a dead
+				// task's handle for a live stream (refreshTokenIfNeeded() defers while any slot's
+				// getClient is non-null, so a stale pointer wedges token refresh).
+				bool leakedHandle = false;
 				if (slot->getMutex.try_lock())
 				{
-					if (slot->getClient)
-					{
-						esp_http_client_close(slot->getClient);
-						esp_http_client_cleanup(slot->getClient);
-						slot->getClient = nullptr;
-					}
+					leakedHandle = (slot->getClient != nullptr);
+					slot->getClient = nullptr;
 					slot->getMutex.unlock();
 				}
 				else
+				{
+					// The killed task died holding getMutex; the handle cannot even be inspected, and
+					// the mutex will never unlock. Retire the slot so no later call reuses it: a new rx
+					// task and its teardown would both block on this mutex forever.
+					leakedHandle = true;
+					slot->getMutexPoisoned.store(true, std::memory_order_release);
+					const unsigned retired = _retiredSlots.fetch_add(1, std::memory_order_acq_rel) + 1;
+					ESP_LOGE(TAG, "killed rx task held getMutex — RETIRING call slot %d until reboot "
+						"(%u of %d retired; anchor capacity now %u)",
+						static_cast<int>(slot - _calls), retired, POCKETDIAL_MAX_ANCHOR_CALLS,
+						maxConcurrentCalls());
+				}
+
+				if (leakedHandle)
 				{
 					// Issue #65 (L-1): getClient (and its LWIP socket) is unrecoverable in place.
 					// Count it; once too many leak, request a full anchor restart so the next
 					// stop()/start() reclaims the whole socket pool (done off-SIP by tick()).
 					const int leaked = _leakedGetClients.fetch_add(1, std::memory_order_relaxed) + 1;
-					ESP_LOGE(TAG, "getMutex poisoned by killed task — leaking getClient to avoid deadlock (%d leaked)", leaked);
+					ESP_LOGE(TAG, "killed rx task's getClient leaked, not freed (%d leaked)", leaked);
 					if (leaked >= kLeakRestartThreshold)
 					{
 						_restartRequested.store(true, std::memory_order_release);
@@ -3021,17 +3050,6 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 					}
 				}
 			}
-		}
-	}
-	else
-	{
-		// No rx task running — safe to clean up directly.
-		std::lock_guard<std::mutex> lock(slot->getMutex);
-		if (slot->getClient)
-		{
-			esp_http_client_close(slot->getClient);
-			esp_http_client_cleanup(slot->getClient);
-			slot->getClient = nullptr;
 		}
 	}
 

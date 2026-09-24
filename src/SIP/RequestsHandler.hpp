@@ -154,6 +154,9 @@ public:
 	void forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
+	// Anchor call slots lost until reboot (#421). Safe without _mutex: _anchorClient is
+	// fixed at construction and the count is an atomic.
+	unsigned getAnchorRetiredSlots() const { return _anchorClient ? _anchorClient->retiredCallSlots() : 0u; }
 	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
 	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
@@ -526,6 +529,9 @@ public:
 	// prove a dial-plan Trunk rule's transform actually reached makeCall() —
 	// see that accessor's comment. Not compiled into device firmware.
 	AnchorClient* anchorClientForTest() { return _anchorClient; }
+	// Swap in a test provider (e.g. one reporting reduced capacity). The caller keeps
+	// it alive for the handler's lifetime; call before any anchored traffic.
+	void setAnchorClientForTest(AnchorClient* client) { _anchorClient = client; }
 
 	// Test-only: exercise bindOutboundParticipant()'s return value (issue #379)
 	// without the async worker. The host suite boots Loopback, whose makeCall()
