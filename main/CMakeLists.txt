@@ -101,6 +101,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/UdpServer.cpp"
                             "../src/Helpers/HttpServer.cpp"
                             "../src/Helpers/AdminAuth.cpp"
+                            # Issue #382: read-back of the panic handler's flash coredump.
+                            "../src/Helpers/CoreDumpStore.cpp"
                             "../src/Helpers/DeviceConfig.cpp"
                             "../src/Helpers/SipDigest.cpp"
                             "../src/Helpers/SipSecretStore.cpp"
@@ -203,7 +205,9 @@ idf_component_register(SRCS ${MAIN_SRC}
                     # detail of one .cpp, not part of anything main exposes -- but it does
                     # have to be declared, or esp_pthread.h is simply not on the include
                     # path and the ESP build fails where the host build cannot.
-                    PRIV_REQUIRES esp_wifi pthread)
+                    # Issue #382: CoreDumpStore.cpp reads the coredump partition
+                    # (esp_core_dump.h, esp_flash.h). Same reasoning as pthread above.
+                    PRIV_REQUIRES esp_wifi pthread espcoredump spi_flash)
 
 # Issue #49: the display transport reserves Core 1 for the LVGL graphics task and
 # runs the SIP engine on Core 0, so the UDP receiver (which carries SIP signaling)
