@@ -85,10 +85,23 @@ jobs:
             exit 1
           fi
 
+      - name: Show interop log tails
+        # In the job log itself, so a failure is diagnosable without the artifact.
+        if: failure()
+        run: |
+          baresip -h 2>&1 | head -n 1 || true
+          for f in tests/interop/.logs/pbx.log tests/interop/.logs/baresip-*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$f (last 80 lines)"; tail -n 80 "$f"; echo "::endgroup::"
+          done
+
       - name: Upload interop logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: interop-logs-${{ github.sha }}
           path: tests/interop/.logs/
+          # .logs is a dot-directory: upload-artifact@v4 skips hidden files by
+          # default and then reports success with nothing uploaded.
+          include-hidden-files: true
           retention-days: 14
