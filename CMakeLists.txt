@@ -4,6 +4,26 @@ if(DEFINED ENV{IDF_PATH})
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
     project("SipServer")
     idf_build_set_property(COMPILE_DEFINITIONS "LV_TICK_CUSTOM_SYS_TIME_EXPR=((esp_timer_get_time()/1000LL))" APPEND)
+
+    # Issue #420: the Ethernet transports leave the SAR ADC entropy source on
+    # for their whole uptime (esp_main_eth*.cpp). Fail the build if the linked
+    # image ever gains an ADC / RF (or, on lan8720's classic ESP32, I2S) driver
+    # -- random.rst forbids using those with the source on, and the conflict
+    # is silent. SIP_TRANSPORT defaults to "eth" (main/CMakeLists.txt).
+    if(NOT DEFINED SIP_TRANSPORT OR SIP_TRANSPORT STREQUAL "eth" OR SIP_TRANSPORT STREQUAL "lan8720")
+        idf_build_get_property(pd_elf EXECUTABLE)
+        if(SIP_TRANSPORT STREQUAL "lan8720")
+            set(pd_check_i2s ON)
+        else()
+            set(pd_check_i2s OFF)
+        endif()
+        add_custom_command(TARGET ${pd_elf} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DELF=$<TARGET_FILE:${pd_elf}>
+                    -DCHECK_I2S=${pd_check_i2s}
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_entropy_conflicts.cmake
+            COMMENT "Issue #420: checking the eth image links no ADC/RF driver"
+            VERBATIM)
+    endif()
 else()
     project ("SipServer")
 

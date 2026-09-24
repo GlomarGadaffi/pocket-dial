@@ -23,6 +23,7 @@
 #include "freertos/event_groups.h"
 
 #include "esp_system.h"
+#include "bootloader_random.h"   // Issue #420: SAR ADC entropy source for esp_random()
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #185: sip_server_task TWDT subscription
@@ -566,6 +567,25 @@ extern "C" void app_main(void)
     // below) actually stalled on the PREVIOUS boot -- the only place a headless
     // unit can report that.
     ESP_LOGI(TAG, "[boot] reset reason: %s", pdResetReasonString(esp_reset_reason()));
+
+    // ── True entropy for esp_random() (issue #420) ──────────────────────────
+    // ESP-IDF's esp_random()/esp_fill_random() are TRUE random only while an
+    // entropy source runs: the RF subsystem (Wi-Fi/BT), or the SAR ADC source
+    // bootloader_random_enable() turns on (docs/en/api-reference/system/
+    // random.rst). This build never starts Wi-Fi or BT, so without this call
+    // every draw after boot is PSEUDO-random -- and every security-relevant
+    // number on the board comes from esp_random(): AdminAuth session tokens and
+    // salts, SipDigest's nonce secret and cnonce, DeviceConfig's generated
+    // secrets, IDGen's Call-IDs/tags/branches (#385), RTP SSRCs, and mbedTLS's
+    // own TLS RNG (IDF routes psa_generate_random to esp_fill_random).
+    //
+    // Enabled FIRST, before NVS/DeviceConfig can generate anything, and LEFT ON:
+    // random.rst requires bootloader_random_disable() only before the ADC, I2S
+    // (classic ESP32) or RF are used, and this build uses none of them. ANYONE
+    // ADDING an ADC or I2S user to this transport must disable it first, or
+    // move to a seed-then-disable DRBG -- the conflict is silent, not a crash.
+    bootloader_random_enable();
+    ESP_LOGI(TAG, "[boot] entropy: SAR ADC source enabled and left on -- esp_random() is a TRNG (#420)");
 
     // ── NVS init (keep ESP_ERROR_CHECK here — unrecoverable without flash) ──
     esp_err_t ret = nvs_flash_init();
