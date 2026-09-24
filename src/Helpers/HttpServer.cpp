@@ -9,6 +9,7 @@
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive wipe on factory reset
 #include "AdminAuth.hpp"
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
+#include "FactoryReset.hpp"    // Issue #363: the secrets factory reset must erase
 #include "DeviceConfig.hpp"
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
@@ -3584,10 +3585,11 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// documented "save always replaces" path, so it overwrites every trunk_*
 	// key including the secret.
 	//
-	// (smtp_pass and gsa_key in the same namespace are the identical
-	// pre-existing gap and are NOT addressed here -- issue #363; fixing them
-	// is a separate change with its own test.)
 	TrunkConfigStore::save(TrunkConfigStore::Config{});
+	// Issue #363: every other stored secret this function does not name --
+	// smtp_pass/gsa_key, every extension's digest HA1, the last coredump. The
+	// enumeration and the reasons live in FactoryReset.hpp.
+	FactoryReset::eraseStoredSecrets();
 
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{

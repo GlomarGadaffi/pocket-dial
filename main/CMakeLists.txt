@@ -103,6 +103,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/AdminAuth.cpp"
                             # Issue #382: read-back of the panic handler's flash coredump.
                             "../src/Helpers/CoreDumpStore.cpp"
+                            # Issue #363: the secrets a factory reset must erase.
+                            "../src/Helpers/FactoryReset.cpp"
                             "../src/Helpers/DeviceConfig.cpp"
                             "../src/Helpers/SipDigest.cpp"
                             "../src/Helpers/SipSecretStore.cpp"
