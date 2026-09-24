@@ -26,6 +26,7 @@
 #include "AdminAuth.hpp"
 #include "CoreDumpStore.hpp"
 #include "EmailConfigStore.hpp"
+#include "FactoryReset.hpp"
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
@@ -247,6 +248,25 @@ TEST_F(FactoryResetSecretsTest, NoStoredSecretSurvivesAFactoryReset)
 	EXPECT_FALSE(CoreDumpStore::query().present) << "the last coredump (a copy of task stacks) survived the reset";
 
 	EXPECT_FALSE(AdminAuth::isProvisioned()) << "the admin credential survived the reset";
+}
+
+TEST_F(FactoryResetSecretsTest, AFailedSecretEraseIsReportedAsAnErrorNotOk)
+{
+	// #437 review: the route used to answer {"status":"ok"} whatever the erases
+	// returned. An operator handing a board on must not be told its secrets are
+	// gone when a store failed to erase.
+	ASSERT_TRUE(SipSecretStore::setSecret("501", "ext-501-secret"));
+	const AdminSession s = bypassLogin();
+	FactoryReset::failNextEraseForTest();
+
+	const std::string resp = httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf);
+
+	EXPECT_EQ(statusOf(resp), 500) << resp;
+	EXPECT_NE(resp.find("\"status\":\"error\""), std::string::npos) << resp;
+	EXPECT_EQ(resp.find("\"status\":\"ok\""), std::string::npos) << "a failed erase was reported as ok";
+	EXPECT_NE(resp.find("secret stores"), std::string::npos) << "the message must say WHAT failed: " << resp;
+	// Every erase is still attempted even when one reports failure.
+	EXPECT_FALSE(SipSecretStore::hasSecret("501"));
 }
 
 TEST(SipSecretStoreClearAll, RemovesEveryExtensionSecret)

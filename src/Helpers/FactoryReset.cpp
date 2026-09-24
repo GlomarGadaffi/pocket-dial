@@ -6,6 +6,11 @@
 
 namespace FactoryReset
 {
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	namespace { bool g_failNext = false; }
+	void failNextEraseForTest() { g_failNext = true; }
+#endif
+
 	bool eraseStoredSecrets()
 	{
 		bool ok = true;
@@ -21,6 +26,9 @@ namespace FactoryReset
 		// coredump partition at all), which is not a failed reset. erase()
 		// invalidates CoreDumpStore's own cached Info/Summary.
 		(void)CoreDumpStore::erase();
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+		if (g_failNext) { g_failNext = false; ok = false; }
+#endif
 		return ok;
 	}
 }
