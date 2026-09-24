@@ -1,0 +1,10 @@
+# Minimum number of host gtest cases that must RUN in CI (#390).
+# Checked by tests/tools/check_test_count.py after the unit-test step.
+#
+# A floor, not an exact count. When your PR adds tests, raise this to the new
+# total in the same PR. When it removes tests on purpose, lower it -- the
+# reduction then shows up in the diff instead of passing silently.
+#
+# Set to the count on main @ 5f5f0b1 (after #394's CoreDumpHttp tests):
+# 1244 tests from 173 suites.
+1244
