@@ -1285,7 +1285,9 @@ void HttpServer::sendStaticHtml(int sock, const char* const* parts, const size_t
 	// no token -- every form POST would then fail CSRF with no diagnostic. Only
 	// the FIRST occurrence is replaced, exactly as the old find()/replace() did;
 	// HttpStaticPages_test pins that every page carries exactly one. A marker
-	// cannot straddle two parts: each part is its own literal (index_html.h).
+	// MUST NOT straddle two parts -- a re-split of index_html.h may fall at any
+	// byte, and a straddled marker would be sent literally. That is not
+	// structural: EveryPageCarriesExactlyOneCsrfMarker enforces it.
 	const std::string_view marker(kCsrfMarker, sizeof(kCsrfMarker) - 1);
 	size_t markPart = count, markAt = 0, total = 0;
 	for (size_t i = 0; i < count; ++i)

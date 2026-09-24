@@ -123,8 +123,10 @@ TEST(HttpStaticPagesPrecondition, EveryPageCarriesExactlyOneCsrfMarker)
 			<< p.name << ": the streamer (like the old find/replace) substitutes only the "
 			   "first marker, so a page needs exactly one";
 	}
-	// Per part for "/": the marker lives in one part and never straddles two
-	// (each part is its own literal), so the per-part counts must sum to 1.
+	// Per part for "/": the marker must sit whole inside ONE part. That is NOT
+	// structural -- index_html.h's parts may be re-split at any byte -- so this
+	// check is what enforces it. A straddled marker counts 1 assembled but 0 per
+	// part, and the streamer would then send it literally.
 	size_t perPart = 0;
 	for (size_t i = 0; i < CGA_INDEX_HTML_PART_COUNT; ++i)
 		perPart += countOf(std::string_view(CGA_INDEX_HTML_PARTS[i].data, CGA_INDEX_HTML_PARTS[i].size), kMarker);
