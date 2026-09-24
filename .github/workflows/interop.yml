@@ -1,0 +1,111 @@
+name: Interop (real SIP stacks)
+
+# Issue #377, PR-gating half: the interop suite (tests/interop/: real pjsua and
+# baresip UAs against the host SipServer) ran in no workflow at all, so a
+# scenario that could never pass sat unnoticed for a week (#375). The nightly
+# half runs on the self-hosted glolab runner; THIS one gates pull requests.
+#
+# GitHub-hosted only, never self-hosted: pull_request runs code from forks, and
+# fork code must not reach desmo's machines.
+#
+# Its own workflow (like commit-hygiene.yml) so the check keeps a stable name to
+# mark required, and so ci.yml's host job isn't slowed by a pjsua build.
+on:
+  # '**', not [main]: a stacked PR based on an unmerged branch must still get
+  # this check -- same reasoning as ci.yml's trigger comment (#242).
+  pull_request:
+    branches: [ '**' ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Same shape as ci.yml's (#423): PR runs group per PR and cancel only on a new
+# head SHA (never the current head, whose cancelled check would block the
+# merge); main pushes and dispatches group per SHA, so back-to-back merges
+# never cancel -- or, via GitHub's one-pending-per-group rule, drop -- each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
+
+jobs:
+  interop:
+    name: Interop Suite (pjsua + baresip vs host PBX)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        # baresip: without it mixed_stack SKIPs, and a SKIP here would be as
+        # silent as the one #393 fixed. libssl-dev: the host build's OpenSSL use.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libssl-dev baresip baresip-core
+
+      - name: Cache pinned pjsua build
+        id: pjsua-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/pjsua-bin
+          # The pin and the configure flags both live in ci_setup.sh, so its
+          # hash IS the build's identity: bumping either misses the cache.
+          key: ${{ runner.os }}-pjsua-${{ hashFiles('tests/interop/ci_setup.sh') }}
+
+      - name: Build pinned pjsua (cache miss only)
+        if: steps.pjsua-cache.outputs.cache-hit != 'true'
+        run: bash tests/interop/ci_setup.sh ~/pjsua-bin
+
+      - name: Build host SipServer
+        # Only the binary under test; the host unit suite is ci.yml's job.
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target SipServer -j"$(nproc)"
+
+      - name: Run interop suite
+        # Exit status is the verdict: FAIL is non-zero, SKIP is not. baresip is
+        # installed above, so mixed_stack is expected to RUN; check the SKIP
+        # count in the summary line rather than trusting a green exit alone.
+        #
+        # Every assertion is windowed to its own scenario. That is deliberate:
+        # each pjsua answers the PBX's register-beep with 503 while its media is
+        # still initialising (#408) -- correct on both sides, and outside every
+        # window. A suite-wide "no 5xx" rule must allowlist it.
+        run: |
+          set -o pipefail
+          # Own line, so a failed setup (non-zero, nothing on stdout) stops here
+          # instead of handing the harness an empty PJSUA.
+          PJSUA="$(bash tests/interop/ci_setup.sh ~/pjsua-bin)"
+          export PJSUA
+          bash tests/interop/run_interop.sh build/SipServer | tee interop-summary.txt
+          summary="$(grep -E '^== [0-9]+ passed' interop-summary.txt)"
+          echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+          skipped="$(echo "$summary" | sed -E 's/.* ([0-9]+) skipped.*/\1/')"
+          if [ "$skipped" != "0" ]; then
+            echo "::error::$skipped interop scenario(s) SKIPPED on a runner that has baresip -- a skip here is a silent pass (#393)"
+            exit 1
+          fi
+
+      - name: Show interop log tails
+        # In the job log itself, so a failure is diagnosable without the artifact.
+        if: failure()
+        run: |
+          baresip -h 2>&1 | head -n 1 || true
+          for f in tests/interop/.logs/pbx.log tests/interop/.logs/baresip-*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$f (last 80 lines)"; tail -n 80 "$f"; echo "::endgroup::"
+          done
+
+      - name: Upload interop logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-logs-${{ github.sha }}
+          path: tests/interop/.logs/
+          # .logs is a dot-directory: upload-artifact@v4 skips hidden files by
+          # default and then reports success with nothing uploaded.
+          include-hidden-files: true
+          retention-days: 14
