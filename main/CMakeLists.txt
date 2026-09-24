@@ -209,7 +209,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                     # (esp_core_dump.h, esp_flash.h). Same reasoning as pthread above.
                     # Issue #420: bootloader_support for bootloader_random.h (the eth
                     # app_mains leave the SAR ADC entropy source on).
-                    PRIV_REQUIRES esp_wifi pthread espcoredump spi_flash bootloader_support)
+                    PRIV_REQUIRES esp_wifi pthread espcoredump spi_flash bootloader_support esp_adc)
 
 # Issue #49: the display transport reserves Core 1 for the LVGL graphics task and
 # runs the SIP engine on Core 0, so the UDP receiver (which carries SIP signaling)

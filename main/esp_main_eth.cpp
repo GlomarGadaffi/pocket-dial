@@ -24,6 +24,7 @@
 
 #include "esp_system.h"
 #include "bootloader_random.h"   // Issue #420: SAR ADC entropy source for esp_random()
+#include "esp_adc/adc_oneshot.h"  // THROWAWAY: #420 guard bite proof -- never merge
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #185: sip_server_task TWDT subscription
@@ -586,6 +587,10 @@ extern "C" void app_main(void)
     // move to a seed-then-disable DRBG -- the conflict is silent, not a crash.
     bootloader_random_enable();
     ESP_LOGI(TAG, "[boot] entropy: SAR ADC source enabled and left on -- esp_random() is a TRNG (#420)");
+    {   // THROWAWAY: links adc_oneshot_new_unit, never runs it. The #420 guard must fail this build.
+        static volatile bool s_pd420Bite = false;
+        if (s_pd420Bite) { adc_oneshot_unit_handle_t h = nullptr; adc_oneshot_unit_init_cfg_t cfg = {}; adc_oneshot_new_unit(&cfg, &h); }
+    }
 
     // ── NVS init (keep ESP_ERROR_CHECK here — unrecoverable without flash) ──
     esp_err_t ret = nvs_flash_init();
