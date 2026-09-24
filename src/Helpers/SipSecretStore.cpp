@@ -168,14 +168,35 @@ namespace
 
 namespace SipSecretStore
 {
+	namespace
+	{
+		// #482: an HA1 as the store holds it -- 32 lowercase hex characters.
+		bool isValidHa1(const std::string& h)
+		{
+			if (h.size() != 32) return false;
+			for (char c : h)
+			{
+				if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+			}
+			return true;
+		}
+	}
+
 	bool setSecret(const std::string& ext, const std::string& plaintextSecret)
 	{
 		if (!isValidExt(ext) || plaintextSecret.empty())
 		{
 			return false;
 		}
+		return setHa1(ext, SipDigest::computeHa1(ext, kRealm, plaintextSecret));
+	}
 
-		std::string ha1 = SipDigest::computeHa1(ext, kRealm, plaintextSecret);
+	bool setHa1(const std::string& ext, const std::string& ha1)
+	{
+		if (!isValidExt(ext) || !isValidHa1(ha1))
+		{
+			return false;
+		}
 
 		std::lock_guard<std::mutex> lock(storeMutex());
 

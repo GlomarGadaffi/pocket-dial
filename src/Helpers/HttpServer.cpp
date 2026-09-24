@@ -4201,22 +4201,22 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	}
 	pt << "],";
 
-	// Per-extension digest secrets (HA1 -- see SipSecretStore.hpp: this IS
-	// the persisted, plaintext-equivalent secret; there is no separate
-	// original password stored anywhere to export instead). Matches #186's
-	// field list verbatim ("per-extension digest secrets" is named as an
-	// always-plaintext field). EXPORT ONLY -- see gap 1 above.
-	pt << "\"extensionSecrets\":[";
+	// Issue #482: WHICH extensions are secured -- names only, the
+	// secretSet-not-secret contract. Their HA1s are plaintext-EQUIVALENT (an
+	// HA1 alone answers any digest challenge for that extension), so they
+	// travel ONLY inside the password-encrypted `secretsEnc` block below, never
+	// here: this part is served to any sysop and is also the encrypted
+	// export's readable `plaintext` member. (#186's field list named them as
+	// always-plaintext; that is the choice #482 reverses.)
+	pt << "\"securedExtensions\":[";
 	{
 		bool first = true;
 		for (const auto& ext : SipSecretStore::securedExtensions())
 		{
-			auto ha1 = SipSecretStore::getHa1(ext);
-			if (!ha1.has_value()) continue;
+			if (!SipSecretStore::hasSecret(ext)) continue;
 			if (!first) pt << ",";
 			first = false;
-			pt << "{\"extension\":\"" << jsonEscape(ext)
-			   << "\",\"ha1\":\"" << jsonEscape(*ha1) << "\"}";
+			pt << "\"" << jsonEscape(ext) << "\"";
 		}
 	}
 	pt << "],";
@@ -4402,6 +4402,23 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 				}
 			}
 		}
+		gated << "]";
+		// #482: the per-extension digest secrets (HA1s) live HERE and only here,
+		// so a restore can bring secured extensions back (SipSecretStore::setHa1)
+		// without ever putting them in the readable part of the file.
+		gated << ",\"extensionSecrets\":[";
+		{
+			bool first = true;
+			for (const auto& ext : SipSecretStore::securedExtensions())
+			{
+				auto ha1 = SipSecretStore::getHa1(ext);
+				if (!ha1.has_value()) continue;
+				if (!first) gated << ",";
+				first = false;
+				gated << "{\"extension\":\"" << jsonEscape(ext)
+				      << "\",\"ha1\":\"" << jsonEscape(*ha1) << "\"}";
+			}
+		}
 		gated << "]}";
 		const std::string gatedPlaintext = gated.str();
 
@@ -4565,10 +4582,16 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 	{
 		skipped.push_back("extensions (MAC bindings: no import accessor -- see PR description)");
 	}
+	// #482: digest secrets come back ONLY from the decrypted secretsEnc block
+	// (applied further below). An export from before #482 carried them in the
+	// plaintext part: that file already leaked them, and it is not trusted as
+	// a restore source -- say so instead of silently dropping them.
 	if (!pt->arrayOr("extensionSecrets").empty())
 	{
-		skipped.push_back("extensionSecrets (digest secrets: no import accessor -- see PR description)");
+		skipped.push_back("extensionSecrets (legacy export carries digest secrets in CLEAR -- "
+			"re-export with a password; see #482)");
 	}
+	const size_t securedListed = pt->arrayOr("securedExtensions").size();
 
 	if (handler)
 	{
@@ -4806,12 +4829,32 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 			}
 			applied.push_back("telephonyConfig (baseUrl/clientId/routeDn)");
 		}
+
+		// #482: per-extension digest secrets, restored from the encrypted block.
+		size_t restored = 0, rejected = 0;
+		for (const auto& e : secretsValue.arrayOr("extensionSecrets"))
+		{
+			if (SipSecretStore::setHa1(e.stringOr("extension"), e.stringOr("ha1"))) ++restored;
+			else ++rejected;
+		}
+		if (restored > 0)
+			applied.push_back("extensionSecrets (" + std::to_string(restored) + ")");
+		if (rejected > 0)
+			skipped.push_back("extensionSecrets (" + std::to_string(rejected) + " malformed entries)");
 	}
 	else if (secretsEncNode)
 	{
 		skipped.push_back(password.empty()
 			? "secretsEnc present but no password supplied"
 			: "secretsEnc present but not applied");
+	}
+	// #482: secured extensions the export named but whose secrets did not come
+	// back (a plaintext-only export, or no password) must be re-provisioned.
+	if (!haveSecrets && securedListed > 0)
+	{
+		skipped.push_back("extensionSecrets (" + std::to_string(securedListed) +
+			" secured extension(s): digest secrets travel only in the password-encrypted "
+			"export -- re-export with a password, or re-set them)");
 	}
 
 	std::ostringstream json;
