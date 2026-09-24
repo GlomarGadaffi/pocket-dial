@@ -3597,16 +3597,19 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// DeviceConfig::clearAll() return void, so their outcome is not visible here.)
 	if (!trunkErased || !secretsErased)
 	{
-		std::string failed;
-		if (!trunkErased) failed += "the carrier trunk credentials";
-		if (!secretsErased)
-		{
-			if (!failed.empty()) failed += " and ";
-			failed += "the email/SIP-digest secret stores";
-		}
-		sendResponse(sock, 500, "Internal Server Error", "application/json",
-		             "{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: " + failed +
-		             " could not be erased. Rebooting anyway; run the factory reset again after setup.\"}");
+		// One fixed literal per outcome: no string building on the HTTP task (#284).
+		static constexpr const char* kTrunkOnly =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the carrier trunk credentials "
+			"could not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
+		static constexpr const char* kSecretsOnly =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the email/SIP-digest secret stores "
+			"could not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
+		static constexpr const char* kBoth =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the carrier trunk credentials and "
+			"the email/SIP-digest secret stores could not be erased. Rebooting anyway; run the factory reset "
+			"again after setup.\"}";
+		const char* body = (!trunkErased && !secretsErased) ? kBoth : (!trunkErased ? kTrunkOnly : kSecretsOnly);
+		sendResponse(sock, 500, "Internal Server Error", "application/json", body);
 	}
 	else
 	{
