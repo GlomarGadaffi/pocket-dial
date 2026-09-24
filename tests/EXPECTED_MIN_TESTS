@@ -5,6 +5,6 @@
 # total in the same PR. When it removes tests on purpose, lower it -- the
 # reduction then shows up in the diff instead of passing silently.
 #
-# Set by #438 (#410 phase 1, +3 tests) on main @ 8d76d64: 1252 tests from 176
-# suites.
-1252
+# Set by #410 phase 2 (+3 tests), stacked on #438, on main @ 8d76d64: 1255
+# tests from 178 suites.
+1255
