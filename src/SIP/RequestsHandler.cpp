@@ -985,14 +985,20 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// server later sends on that dialog must go above it. Noted before dispatch,
 		// so onRefer() already counts its own REFER, and again after, so an INVITE
 		// that CREATES its session is counted too.
-		std::string noteCallId;
+		// No copy of the Call-ID (milestone 1: no allocation per packet): hold a
+		// reference to the request so its view stays valid past dispatch.
+		std::shared_ptr<SipMessage> noteReq;
+		std::shared_ptr<Session> noteSession;
 		uint32_t noteCSeq = 0;
 		const sockaddr_in noteSource = request->getSource();
-		if (!status.has_value())
+		// REGISTER/OPTIONS/SUBSCRIBE never carry a call session's Call-ID, and are
+		// most of an idle board's traffic: don't pay a session lookup for them.
+		if (!status.has_value() && handlerKey != SipMessageTypes::REGISTER &&
+			handlerKey != SipMessageTypes::OPTIONS && handlerKey != SipMessageTypes::SUBSCRIBE)
 		{
-			noteCallId = std::string(request->getCallID());
+			noteReq = request;
 			noteCSeq = siphdr::cseqNumber(request->getCSeq());
-			noteDialogCSeq(noteCallId, noteCSeq, noteSource);
+			noteSession = noteDialogCSeq(request->getCallID(), noteCSeq, noteSource);
 		}
 
 		// Task 2C: SIP INFO with DTMF relay body — handle before the handler table
@@ -1064,7 +1070,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				it->second(std::move(request));
 			}
 		}
-		noteDialogCSeq(noteCallId, noteCSeq, noteSource);
+		// Only needed when the request CREATED its session (an initial INVITE).
+		if (noteReq && !noteSession && handlerKey == SipMessageTypes::INVITE)
+			noteDialogCSeq(noteReq->getCallID(), noteCSeq, noteSource);
 		}   // !sdpRefused
 
 		// Device-registry change detection: a REGISTER may have adopted a device,
@@ -1106,20 +1114,20 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	}
 }
 
-void RequestsHandler::noteDialogCSeq(const std::string& callID, uint32_t cseq,
+std::shared_ptr<Session> RequestsHandler::noteDialogCSeq(std::string_view callID, uint32_t cseq,
 	const sockaddr_in& source)
 {
-	if (cseq == 0 || callID.empty()) return;
+	if (callID.empty()) return nullptr;
 	auto s = findSession(callID);
 	// Only a party ON this dialog moves its CSeq floor; Session also refuses
 	// out-of-range values, which is the part a spoofed source can't get past.
-	if (!s || !isDialogSourceAuthorized(s, source)) return;
-	s->noteObservedCSeq(cseq);
+	if (s && cseq != 0 && isDialogSourceAuthorized(s, source)) s->noteObservedCSeq(cseq);
+	return s;
 }
 
 std::optional<std::shared_ptr<Session>> RequestsHandler::getSession(std::string_view callID)
 {
-	auto sessionIt = _sessions.find(std::string(callID));
+	auto sessionIt = _sessions.find(callID);   // heterogeneous: no temporary key (#464)
 	if (sessionIt != _sessions.end())
 	{
 		return sessionIt->second;

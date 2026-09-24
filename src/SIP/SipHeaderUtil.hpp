@@ -39,22 +39,30 @@ namespace siphdr
 	// server-minted requests emit a clean value and never ship a doubled prefix.
 	// Safe on bare values (the check is that the text before ':' contains only
 	// letter/hyphen chars — so "<sip:...>" is left untouched). Idempotent.
-	inline std::string stripHeaderName(std::string_view h)
+	//
+	// The view form (#464) is for comparisons, where the copy stripHeaderName()
+	// makes is pure per-packet waste. It views into `h`, so it lives as long as h.
+	inline std::string_view stripHeaderNameView(std::string_view h)
 	{
 		size_t colon = h.find(':');
 		if (colon == std::string_view::npos || colon == 0 || colon > 15)
-			return std::string(h);
+			return h;
 		for (size_t i = 0; i < colon; ++i)
 		{
 			char c = h[i];
 			if (!(std::isalpha(static_cast<unsigned char>(c)) || c == '-'))
-				return std::string(h);
+				return h;
 		}
 		size_t v = colon + 1;
 		while (v < h.size() && (h[v] == ' ' || h[v] == '\t')) ++v;
 		size_t e = h.size();
 		while (e > v && (h[e - 1] == '\r' || h[e - 1] == '\n')) --e;
-		return std::string(h.substr(v, e - v));
+		return h.substr(v, e - v);
+	}
+
+	inline std::string stripHeaderName(std::string_view h)
+	{
+		return std::string(stripHeaderNameView(h));
 	}
 
 	// Parse the leading digits out of a CSeq header line ("CSeq: 100 INVITE")
