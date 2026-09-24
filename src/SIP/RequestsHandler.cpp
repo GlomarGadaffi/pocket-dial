@@ -11,6 +11,8 @@
 #include "SipMessageTypes.h"
 #include "SipSdpMessage.hpp"
 #include "IDGen.hpp"
+#include "RefillVector.hpp"   // #463: in-place snapshot refill
+#include <cstdio>             // #463: snprintf for the OPTIONS ping and snapshot ip:port
 #include "IPHelper.hpp"
 #include "PoolConfig.hpp"
 #include "CallDetailRecord.hpp"
@@ -8567,68 +8569,89 @@ void RequestsHandler::tick()
 		_beeper.sweep(now);
 
 		// Build snapshot under registrar mutex lock, then save it under snapshot mutex lock
-		RegistrarSnapshot nextSnapshot;
-		nextSnapshot.packetsProcessed = _packetsProcessed.load(std::memory_order_relaxed);
-		nextSnapshot.packetsDropped = _packetsDropped.load(std::memory_order_relaxed);
-		for (const auto& client : _clientPool)
+		// Issue #463 (#284 rank 8): the snapshot is refilled IN PLACE into a
+		// persistent scratch copy, then its tables are swapped into _snapshot. The
+		// scratch then holds the previous tick's tables -- same shapes, strings with
+		// capacity -- so the next refill reuses them. A board whose tables did not
+		// change allocates nothing here; it used to build and free every table,
+		// ~2-5 KB of internal-DRAM churn per second. Only this block touches
+		// _snapshotScratch, under _mutex.
+		RegistrarSnapshot& next = _snapshotScratch;
 		{
-			if (client->getNumber().empty()) continue;
-			const auto& addr = client->getAddress();
-			std::string ipPort = sipwire::addrToIpPort(addr);
-			nextSnapshot.clients.emplace_back(client->getNumber(), ipPort);
-		}
-
-		nextSnapshot.sessions.reserve(_sessions.size());
-		for (const auto& [callID, session] : _sessions)
-		{
-			std::string caller = session->getSrc() ? session->getSrc()->getNumber() : "?";
-			std::string callee = session->getDest() ? session->getDest()->getNumber() : "?";
-
-			int durationSec = 0;
-			if (session->getState() == Session::State::Connected)
+			Refill<std::pair<std::string, std::string>> clients(next.clients);
+			for (const auto& client : _clientPool)
 			{
-				durationSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-					now - session->getStartTime()).count());
+				if (client->getNumber().empty()) continue;
+				char ipPort[INET_ADDRSTRLEN + 8];
+				char ip[INET_ADDRSTRLEN]{};
+				inet_ntop(AF_INET, &client->getAddress().sin_addr, ip, sizeof(ip));
+				std::snprintf(ipPort, sizeof(ipPort), "%s:%u", ip,
+					static_cast<unsigned>(ntohs(client->getAddress().sin_port)));
+				auto& row = clients.next();
+				row.first.assign(client->getNumber());
+				row.second.assign(ipPort);
 			}
-			nextSnapshot.sessions.emplace_back(caller, callee, sessionStateToString(session->getState()), durationSec);
+		}
+		{
+			Refill<std::tuple<std::string, std::string, std::string, int>> sessions(next.sessions);
+			for (const auto& [callID, session] : _sessions)
+			{
+				int durationSec = 0;
+				if (session->getState() == Session::State::Connected)
+				{
+					durationSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+						now - session->getStartTime()).count());
+				}
+				auto& row = sessions.next();
+				std::get<0>(row).assign(session->getSrc() ? session->getSrc()->getNumber() : std::string_view("?"));
+				std::get<1>(row).assign(session->getDest() ? session->getDest()->getNumber() : std::string_view("?"));
+				std::get<2>(row).assign(sessionStateToString(session->getState()));
+				std::get<3>(row) = durationSec;
+			}
 		}
 
 		// CDR view: newest-first copy of the ring into the snapshot.
-		nextSnapshot.cdr = _cdr.snapshot();
+		_cdr.snapshotInto(next.cdr);
 
 		// DND view: extensions currently in DND.
-		nextSnapshot.dnd = _cfg.dndSnapshot();
+		_cfg.dndSnapshotInto(next.dnd);
 
 		// Call-forward view.
-		nextSnapshot.forwards = _cfg.forwardsSnapshot();
+		_cfg.forwardsSnapshotInto(next.forwards);
 
 		// Ring/hunt-group view.
-		nextSnapshot.ringGroups = _cfg.ringGroupsSnapshot();
+		_cfg.ringGroupsSnapshotInto(next.ringGroups);
 
 		// Dial-plan rules (Issue #69), in table order. Rebuilt from _cfg's dial
 		// plan here alongside ringGroups rather than mirrored out of band like
 		// pageZones, so the snapshot swap below can never blank or re-order them.
-		nextSnapshot.dialRules = _cfg.dialRulesSnapshot();
+		_cfg.dialRulesSnapshotInto(next.dialRules);
 
 		// Parked calls view: {orbit, parkedExt, parker, secondsParked}. This full
 		// rebuild already reflects anything _park.sweep() just did above, so clear
 		// the dirty flag here rather than leaving it to trigger a redundant mirror
 		// on the next packet.
-		nextSnapshot.parkedCalls = _park.snapshotRows(now, /*onlyParked=*/true);
+		_park.snapshotRowsInto(next.parkedCalls, now, /*onlyParked=*/true);
 		_park.consumeParkChanged();
 
 		{
 			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-			// `devices` and `pageZones` are NOT rebuilt above: they are mirrored out
-			// of band (applyDeviceChange on a registry change, and the page-zone
-			// config path) because their sources only move on an admin action or a
-			// REGISTER. Carry them across the swap — assigning a fresh snapshot over
-			// the old one would blank both every tick, so the dashboard's adopted
-			// devices and paging zones would flash empty a second after any update
-			// and stay empty until the next change.
-			nextSnapshot.devices   = std::move(_snapshot.devices);
-			nextSnapshot.pageZones = std::move(_snapshot.pageZones);
-			_snapshot = std::move(nextSnapshot);
+			// Swap ONLY the tables rebuilt above. `devices`, `pageZones` and
+			// `voicemail` are mirrored out of band (applyDeviceChange on a registry
+			// change, refreshPbxConfigSnapshot() on a config change) and must be left
+			// exactly as they are. The old whole-struct move-assign preserved devices
+			// and pageZones by hand but not voicemail, so the dashboard's voicemail
+			// list was blanked one tick after every change (found in #463).
+			_snapshot.packetsProcessed = _packetsProcessed.load(std::memory_order_relaxed);
+			_snapshot.packetsDropped   = _packetsDropped.load(std::memory_order_relaxed);
+			std::swap(_snapshot.clients,     next.clients);
+			std::swap(_snapshot.sessions,    next.sessions);
+			std::swap(_snapshot.cdr,         next.cdr);
+			std::swap(_snapshot.dnd,         next.dnd);
+			std::swap(_snapshot.forwards,    next.forwards);
+			std::swap(_snapshot.ringGroups,  next.ringGroups);
+			std::swap(_snapshot.dialRules,   next.dialRules);
+			std::swap(_snapshot.parkedCalls, next.parkedCalls);
 		}
 
 		localOutbox = drainOutbox();
@@ -8665,29 +8688,43 @@ std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClientByAddress(c
 
 std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_ptr<SipClient>& client)
 {
-	std::string clientNum = client->getNumber();
+	// Issue #463 (#284 rank 3): the dominant allocator on an idle board -- one of
+	// these per registered phone every 5 s. It used to be an ostringstream (512 B
+	// on its first overflow) plus a str() copy plus seven std::string temporaries.
+	// Now it is formatted into a stack buffer. Every random ID is kept at or under
+	// the 15-character SSO bound, so IDGen allocates nothing either: the Call-ID's
+	// random part is 15 characters (~89 bits) rather than 16, and the branch's
+	// "z9hG4bK" magic cookie is written by the format, not concatenated.
+	char destIp[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &client->getAddress().sin_addr, destIp, sizeof(destIp));
+	const unsigned destPort = ntohs(client->getAddress().sin_port);
+	const std::string callId  = IDGen::GenerateID(15);
+	const std::string branch  = IDGen::GenerateID(12);
+	const std::string fromTag = IDGen::GenerateID(9);
+	const std::string& num = client->getNumber();
+	const int numLen = static_cast<int>(num.size());
+	const int svcLen = static_cast<int>(pbx::kServiceServer.size());
 
-	std::string destIpPort = sipwire::addrToIpPort(client->getAddress());
-
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	std::string callId = IDGen::GenerateID(16) + "@" + activeIp;
-	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
-	std::string fromTag = IDGen::GenerateID(9);
-
-	std::ostringstream ss;
-	ss << "OPTIONS sip:" << clientNum << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "To: <sip:" << clientNum << "@" << destIpPort << ">\r\n"
-	   << "From: <sip:" << pbx::kServiceServer << "@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
-	   << "Call-ID: " << callId << "\r\n"
-	   << "CSeq: 1 OPTIONS\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "User-Agent: pocket-dial\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-
-	return getMessageFromPool(ss.str(), client->getAddress());
+	char buf[640];
+	const int n = std::snprintf(buf, sizeof(buf),
+		"OPTIONS sip:%.*s@%s:%u SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP %s:%d;branch=z9hG4bK%s\r\n"
+		"To: <sip:%.*s@%s:%u>\r\n"
+		"From: <sip:%.*s@%s:%d>;tag=%s\r\n"
+		"Call-ID: %s@%s\r\n"
+		"CSeq: 1 OPTIONS\r\n"
+		"Max-Forwards: 70\r\n"
+		"User-Agent: pocket-dial\r\n"
+		"Content-Length: 0\r\n\r\n",
+		numLen, num.data(), destIp, destPort,
+		_localIp.c_str(), _serverPort, branch.c_str(),
+		numLen, num.data(), destIp, destPort,
+		svcLen, pbx::kServiceServer.data(), _localIp.c_str(), _serverPort, fromTag.c_str(),
+		callId.c_str(), _localIp.c_str());
+	// A truncated ping would be a malformed request; the caller already treats
+	// nullptr as "no ping this round" and does not stamp the interval.
+	if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf)) return nullptr;
+	return getMessageFromPool(std::string_view(buf, static_cast<size_t>(n)), client->getAddress());
 }
 
 std::shared_ptr<SipClient> RequestsHandler::allocateClient(std::string number, sockaddr_in address, int expiresSeconds)

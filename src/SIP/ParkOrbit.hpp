@@ -60,6 +60,9 @@ public:
 	// view); otherwise every occupied slot is listed (the park-op refresh view).
 	std::vector<std::tuple<std::string, std::string, std::string, int>>
 	snapshotRows(std::chrono::steady_clock::time_point now, bool onlyParked) const;
+	// #463: the same, refilled in place (zero allocations when unchanged).
+	void snapshotRowsInto(std::vector<std::tuple<std::string, std::string, std::string, int>>& out,
+		std::chrono::steady_clock::time_point now, bool onlyParked) const;
 
 	// True (and resets the flag) if an orbit slot changed since the last call —
 	// the cue to re-mirror snapshotRows() into the dashboard snapshot. Same
