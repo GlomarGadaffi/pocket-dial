@@ -254,8 +254,13 @@ if(SIP_CONSTRAINED)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         POCKETDIAL_MAX_CLIENTS=8
         POCKETDIAL_MAX_SESSIONS=4
-        POCKETDIAL_MSG_POOL=8)
-    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8)")
+        POCKETDIAL_MSG_POOL=8
+        # Issue #466: no PSRAM on this profile, so a MoH clip or voicemail
+        # greeting can only live in internal DRAM -- capped at 16 KB (2 s of
+        # 8 kHz mu-law), loaded at boot/admin upload only, refused and counted
+        # above it.
+        POCKETDIAL_CLIP_INTERNAL_MAX_BYTES=16384)
+    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384)")
 endif()
 
 # PcapCapture.hpp has always advertised itself as "compile-time tunable

@@ -35,6 +35,31 @@
 //   introducing jitter or triggering watchdog timeouts.
 namespace l2rtp
 {
+namespace detail
+{
+	// Issue #466: build a shared resource OUTSIDE any lock, then publish it
+	// exactly once. `make()` may allocate (it must never run inside a
+	// critical section -- allocating with interrupts masked is invalid on
+	// IDF); a caller that loses the publish race destroys its own copy. Returns
+	// whatever is published afterwards (null only if make() failed and nobody
+	// else has published). Header-only and platform-free so the race logic is
+	// host-tested (DmaFramePool_test) even though its user is ESP-only.
+	template <class T, class Make, class Destroy>
+	T publishOnce(std::atomic<T>& slot, Make make, Destroy destroy)
+	{
+		T cur = slot.load(std::memory_order_acquire);
+		if (cur != T{}) return cur;
+		T mine = make();
+		if (mine == T{}) return slot.load(std::memory_order_acquire);
+		T expected{};
+		if (slot.compare_exchange_strong(expected, mine, std::memory_order_acq_rel,
+		                                 std::memory_order_acquire))
+			return mine;
+		destroy(mine);
+		return expected;
+	}
+}
+
 class DmaFramePool
 {
 public:
