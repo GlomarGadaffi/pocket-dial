@@ -176,6 +176,12 @@ private:
 		esp_http_client_handle_t postClient = nullptr;
 		std::atomic<bool>        postLive{false};         // guarded by postMutex
 		esp_http_client_handle_t getClient  = nullptr;
+		// #370 DIAGNOSTIC ONLY -- never ships. True while the rx task is inside
+		// esp_http_client_open(), i.e. exactly while freeing getClient is a UAF.
+		// Measures the predicate directly rather than inferring it from
+		// eTaskGetState (blocked-inside-open still dereferences on wake, and at
+		// the timeout free site the task handle has already been vTaskDelete'd).
+		std::atomic<bool>        inOpen{false};
 		TaskHandle_t             rxTaskHandle = nullptr;
 		SemaphoreHandle_t        rxDoneSem    = nullptr;
 		std::atomic<bool>        tearingDown{false};      // single-entry gate for stopMediaStreams(slot)

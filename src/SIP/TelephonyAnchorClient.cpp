@@ -2119,6 +2119,8 @@ void TelephonyAnchorClient::closePostClient()
 			std::lock_guard<std::mutex> getLock(slot.getMutex);
 			if (slot.getClient)
 			{
+				ESP_LOGE(TAG, "DIAG370: closePostClient FREE, inOpen=%d (1 == freeing under a live open())",
+					(int)slot.inOpen.load(std::memory_order_acquire));
 				esp_http_client_close(slot.getClient);
 				esp_http_client_cleanup(slot.getClient);
 				slot.getClient = nullptr;
@@ -3001,6 +3003,8 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 				{
 					if (slot->getClient)
 					{
+						ESP_LOGE(TAG, "DIAG370: TIMEOUT-PATH FREE, inOpen=%d (1 == freeing under a live open())",
+							(int)slot->inOpen.load(std::memory_order_acquire));
 						esp_http_client_close(slot->getClient);
 						esp_http_client_cleanup(slot->getClient);
 						slot->getClient = nullptr;
@@ -3029,6 +3033,8 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 		std::lock_guard<std::mutex> lock(slot->getMutex);
 		if (slot->getClient)
 		{
+			ESP_LOGE(TAG, "DIAG370: ELSE-BRANCH FREE, inOpen=%d (1 == freeing under a live open())",
+				(int)slot->inOpen.load(std::memory_order_acquire));
 			esp_http_client_close(slot->getClient);
 			esp_http_client_cleanup(slot->getClient);
 			slot->getClient = nullptr;
@@ -3176,7 +3182,12 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 		for (int attempt = 0; attempt < kMaxAttempts && _rxTaskHandle != nullptr; ++attempt)
 		{
 			const int64_t openT0 = esp_timer_get_time();
+			// #370 DIAGNOSTIC ONLY -- never ships.
+			slot->inOpen.store(true, std::memory_order_release);
+			ESP_LOGW(TAG, "DIAG370: entering open() attempt %d", attempt + 1);
 			esp_err_t err = esp_http_client_open(_getClient, 0);
+			slot->inOpen.store(false, std::memory_order_release);
+			ESP_LOGW(TAG, "DIAG370: left open() attempt %d err=%d", attempt + 1, (int)err);
 			bool transportFailed = false;
 			if (err == ESP_OK)
 			{
