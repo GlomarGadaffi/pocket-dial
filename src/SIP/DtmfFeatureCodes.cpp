@@ -8,6 +8,7 @@
 
 #include "AdminAuth.hpp"
 #include "CdrArchive.hpp"
+#include "CoreDumpStore.hpp"
 #include "PbxPersist.hpp"
 #include "SipClient.hpp"
 #include "SipMessage.hpp"
@@ -241,6 +242,19 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 						// makes this path's wipe contract host-testable -- see
 						// DtmfFactoryReset_test.cpp.
 						cdrarchive::wipeAll();
+						// #450: voicemail recordings on the SD, same door, same reasoning as
+						// the CDR archive wipe just above (the thread is about to restart).
+						_env.wipeVoicemail();
+						// #437 review: the HTTP door erases the last coredump (a copy of
+						// task stacks, which can hold any secret in the clear), and
+						// nvs_flash_erase() below does not reach the coredump partition,
+						// so this door must erase it too. A flash erase on this thread is
+						// safe: every esp_main variant creates sip_server_task with an
+						// internal-RAM stack (plain xTaskCreatePinnedToCore). Its result
+						// is ignored for the same reason FactoryReset ignores it: a board
+						// whose partition table predates #382 has no coredump partition.
+						// Outside the platform guard, so the host suite can pin it.
+						(void)CoreDumpStore::erase();
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 						nvs_flash_erase();
 						esp_restart();

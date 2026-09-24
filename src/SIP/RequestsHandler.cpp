@@ -214,6 +214,13 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// NVS so they survive reboot. No-ops on host. Construction is single-threaded
 	// (no handler is dispatching yet), so these run without holding _mutex.
 	_cfg.loadPbxConfig();
+	refreshE911ConfiguredLocked();
+	if (!isE911Configured())
+	{
+		// Poll #454: surfaced, never gated -- 911 still routes out either way.
+		queueLog("WARNING: E911 not configured -- a 911 call still routes out, but nobody on "
+			"site will be notified. Set the E911 notify list on the dashboard.", true);
+	}
 	// Telephony-API credential slots + DID->extension mapping (new, Part 2):
 	// same "reload once at construction, single-threaded, no lock needed" story
 	// as _cfg.loadPbxConfig() just above.
@@ -7555,6 +7562,7 @@ void RequestsHandler::setE911Config(const std::string& exts, const std::string& 
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_cfg.setE911Config(exts, callback, location);
+		refreshE911ConfiguredLocked();
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -7813,6 +7821,20 @@ void RequestsHandler::clearAllCallHistory()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 	_cdr.clearAll();
+}
+
+bool RequestsHandler::clearAllForwards()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _cfg.clearForwardsLocked();
+}
+
+bool RequestsHandler::clearE911Config()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	const bool ok = _cfg.clearE911Locked();
+	refreshE911ConfiguredLocked();
+	return ok;
 }
 
 // ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────

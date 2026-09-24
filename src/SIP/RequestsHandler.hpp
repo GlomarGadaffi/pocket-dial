@@ -449,6 +449,16 @@ public:
 	// as sensitive as the credential tables above and lives in its own NVS
 	// namespace, "cdrlog" — see CdrRing::clearAll()).
 	void clearAllCallHistory();
+	// Issue #450: /api/factory-reset. Empties the call-forward table and erases
+	// it from NVS (forward targets are external numbers). False if the erase failed.
+	bool clearAllForwards();
+	// Issue #450 / poll #454: /api/factory-reset erases the E911 settings. False
+	// if the NVS erase failed. Leaves "E911 not configured" showing.
+	bool clearE911Config();
+	// True when a 911 call would notify someone on site. Lock-free (an atomic
+	// kept in step with every load/set/clear), so /api/status reads it on the
+	// HTTP thread without touching _mutex.
+	bool isE911Configured() const { return _e911Configured.load(std::memory_order_acquire); }
 
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint
@@ -640,6 +650,9 @@ private:
 	// reaching the engine only through PbxEnv, so it adds one member and one
 	// call rather than more surface to this file.
 	EmergencyNotifier _e911Notifier{*this};
+
+	// PbxEnv hook for the DTMF factory-reset door (#450).
+	void wipeVoicemail() override { wipeAllVoicemail(); }
 
 	// ── PbxEnv: shared-infrastructure surface for the extracted machines ───────
 	// RequestsHandler is the PbxEnv implementation each decomposed state machine
@@ -1134,6 +1147,11 @@ public:
 	// with no writer task needed.
 	void drainVoicemailFlush(vmarchive::Sink& sink)
 	{
+		// #450: held for the whole drain so a factory reset's clear+wipe cannot
+		// land between a pop and its write (which would put a pre-reset message
+		// back on the card after the wipe). Leaf lock: never held with _mutex taken
+		// inside it.
+		std::lock_guard<std::mutex> drainLock(_vmDrainWipeMutex);
 		vmarchive::drainAll(_vmFlushQueue, sink, _vmStagingBufs,
 			[this](const vmarchive::QueuedRecording& rec) {
 				if (rec.stagingSlot >= 0 && rec.stagingSlot < static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS))
@@ -1145,6 +1163,30 @@ public:
 			});
 	}
 	size_t voicemailFlushQueueDepthForTest() const { return _vmFlushQueue.size(); }
+	// Issue #450: factory reset. Drops every queued recording (so none is written
+	// after the wipe) and wipes `sink`, under the same lock drainVoicemailFlush()
+	// holds. Blocking SD I/O: HTTP task, or the DTMF door right before restart.
+	void wipeVoicemailArchive(vmarchive::Sink& sink)
+	{
+		std::lock_guard<std::mutex> drainLock(_vmDrainWipeMutex);
+		_vmFlushQueue.clear();
+		for (auto& busy : _vmFlushBusy) busy.store(false, std::memory_order_release);
+		sink.wipe();
+	}
+	// The archive this build actually has: the production SD sink on
+	// PD_ETH_HAS_SD builds, a test-installed one on host, otherwise nothing.
+	void wipeAllVoicemail()
+	{
+		vmarchive::Sink* sink = _vmSinkForTest;
+#if defined(PD_ETH_HAS_SD)
+		if (!sink) sink = &vmarchive::productionSink();
+#endif
+		if (sink) wipeVoicemailArchive(*sink);
+	}
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only: the sink wipeAllVoicemail() uses on host. Not owned.
+	void setVoicemailSinkForTest(vmarchive::Sink* sink) { _vmSinkForTest = sink; }
+#endif
 	// Runs every slot's pending retrieval SD job (list/read/delete), a
 	// no-op for any slot not Pending. The ESP+PD_ETH_HAS_SD writer task
 	// (spawned in the constructor, same task drainVoicemailFlush() above
@@ -1678,6 +1720,17 @@ private:
 	// returned for it (see drainVoicemailFlush() below) -- i.e. exactly the
 	// window findFreeVoicemailSlot() must refuse to reuse the slot in.
 	std::atomic<bool> _vmFlushBusy[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
+	// #450: excludes a factory-reset wipe from a drain in progress (see
+	// drainVoicemailFlush()). Plain member, no allocation.
+	std::mutex _vmDrainWipeMutex;
+	// See isE911Configured(). Written under _mutex (or single-threaded in the
+	// constructor) by refreshE911ConfiguredLocked().
+	std::atomic<bool> _e911Configured{false};
+	void refreshE911ConfiguredLocked()
+	{
+		_e911Configured.store(!_cfg.e911Config().notifyExts.empty(), std::memory_order_release);
+	}
+	vmarchive::Sink* _vmSinkForTest = nullptr;
 
 	// ── Retrieval SD-I/O job machine (Issue #246, retrieval slice 3/3) ──────
 	// listMessages()/readMessage()/markDeleted() are all SD I/O and must
