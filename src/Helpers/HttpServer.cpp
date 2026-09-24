@@ -11,6 +11,7 @@
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
 #include "FactoryReset.hpp"    // Issue #363: the secrets factory reset must erase
 #include "DeviceConfig.hpp"
+#include <cstdio>   // std::snprintf: the factory-reset error body (#450)
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
 #include "ArpLookup.hpp"
@@ -3480,7 +3481,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP
 	// (NVS) and host (in-memory).
-	AdminAuth::clearCredential();
+	const bool adminErased = AdminAuth::clearCredential();
 	// Also drop ap_secure / ap_psk / cfgseed_gen. Clearing the seed generation is
 	// deliberate: the next boot re-applies whatever the flasher wrote, so a
 	// factory reset returns the board to how it was FLASHED rather than to a
@@ -3529,9 +3530,15 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// enumeration and the reasons live in FactoryReset.hpp.
 	const bool secretsErased = FactoryReset::eraseStoredSecrets();
 
+	bool forwardsErased = true;
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
 		handler->clearAllTelephonyConfig();
+		// #450: call-forward targets are external phone numbers (PII), in "pbxcfg",
+		// which nothing above reaches. The E911 settings deliberately are NOT erased
+		// here: #166 keeps them in their own key so a reset cannot silently drop who
+		// is told when someone dials 911. Whether a reset should is #450's poll.
+		forwardsErased = handler->clearAllForwards();
 		handler->clearAllDidMappings();
 		handler->clearAllCallHistory();
 		// Push the now-empty trunk config into the running engine so the trunk
@@ -3593,22 +3600,20 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// completed reset. The operator is about to hand this board on believing its
 	// credentials are gone. The board still restarts: the admin credential is
 	// already cleared above, so staying up half-reset helps nobody, and the reset
-	// can be run again once setup completes. (AdminAuth::clearCredential() and
-	// DeviceConfig::clearAll() return void, so their outcome is not visible here.)
-	if (!trunkErased || !secretsErased)
+	// can be run again once setup completes. (DeviceConfig::clearAll() still
+	// returns void; its result is Pal's #441.)
+	if (!adminErased || !trunkErased || !secretsErased || !forwardsErased)
 	{
-		// One fixed literal per outcome: no string building on the HTTP task (#284).
-		static constexpr const char* kTrunkOnly =
-			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the carrier trunk credentials "
-			"could not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
-		static constexpr const char* kSecretsOnly =
-			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the email/SIP-digest secret stores "
-			"could not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
-		static constexpr const char* kBoth =
-			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the carrier trunk credentials and "
-			"the email/SIP-digest secret stores could not be erased. Rebooting anyway; run the factory reset "
-			"again after setup.\"}";
-		const char* body = (!trunkErased && !secretsErased) ? kBoth : (!trunkErased ? kTrunkOnly : kSecretsOnly);
+		// #450: one fixed format, filled on the stack -- no string building on the
+		// HTTP task (#284). "failed" names each store, so the operator knows what
+		// may still be in flash.
+		char body[320];
+		std::snprintf(body, sizeof(body),
+			"{\"status\":\"error\",\"failed\":{\"admin\":%s,\"trunk\":%s,\"secrets\":%s,\"forwards\":%s},"
+			"\"message\":\"Factory reset INCOMPLETE: the stores marked true under failed could not be erased. "
+			"Rebooting anyway; run the factory reset again after setup.\"}",
+			adminErased ? "false" : "true", trunkErased ? "false" : "true",
+			secretsErased ? "false" : "true", forwardsErased ? "false" : "true");
 		sendResponse(sock, 500, "Internal Server Error", "application/json", body);
 	}
 	else

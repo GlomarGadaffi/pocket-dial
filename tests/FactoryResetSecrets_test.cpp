@@ -213,6 +213,7 @@ TEST_F(FactoryResetSecretsTest, NoStoredSecretSurvivesAFactoryReset)
 	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, slot, /*keepSecret=*/false), "");
 
 	CoreDumpStore::setImageForTest(fakeDump());
+	_handler->setForward("501", "always", "5557654321");   // #450: an external number
 	const AdminSession s = bypassLogin();
 
 	// Every row really is set, so an "empty after" below cannot pass vacuously.
@@ -222,6 +223,7 @@ TEST_F(FactoryResetSecretsTest, NoStoredSecretSurvivesAFactoryReset)
 	ASSERT_TRUE(SipSecretStore::hasSecret("501"));
 	ASSERT_TRUE(_handler->getTelephonyConfigSlot(0).secretSet);
 	ASSERT_TRUE(CoreDumpStore::query().present);
+	ASSERT_FALSE(_handler->getForwards().empty()) << "precondition: a forward is stored";
 	ASSERT_TRUE(AdminAuth::isProvisioned());
 
 	// ── Act ──
@@ -248,6 +250,9 @@ TEST_F(FactoryResetSecretsTest, NoStoredSecretSurvivesAFactoryReset)
 	EXPECT_FALSE(CoreDumpStore::query().present) << "the last coredump (a copy of task stacks) survived the reset";
 
 	EXPECT_FALSE(AdminAuth::isProvisioned()) << "the admin credential survived the reset";
+
+	EXPECT_TRUE(_handler->getForwards().empty())
+		<< "a call-forward target (an external phone number) survived the reset (#450)";
 }
 
 TEST_F(FactoryResetSecretsTest, AFailedSecretEraseIsReportedAsAnErrorNotOk)
@@ -264,9 +269,30 @@ TEST_F(FactoryResetSecretsTest, AFailedSecretEraseIsReportedAsAnErrorNotOk)
 	EXPECT_EQ(statusOf(resp), 500) << resp;
 	EXPECT_NE(resp.find("\"status\":\"error\""), std::string::npos) << resp;
 	EXPECT_EQ(resp.find("\"status\":\"ok\""), std::string::npos) << "a failed erase was reported as ok";
-	EXPECT_NE(resp.find("secret stores"), std::string::npos) << "the message must say WHAT failed: " << resp;
+	// The report must say WHICH store failed, and must not blame the others.
+	EXPECT_NE(resp.find("\"secrets\":true"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"admin\":false"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"trunk\":false"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"forwards\":false"), std::string::npos) << resp;
 	// Every erase is still attempted even when one reports failure.
 	EXPECT_FALSE(SipSecretStore::hasSecret("501"));
+}
+
+TEST_F(FactoryResetSecretsTest, AFailedAdminCredentialEraseIsReportedAsAnError)
+{
+	// #450: AdminAuth::clearCredential() used to return void, so a failed erase
+	// of the admin/owner password hashes and the DTMF PIN was invisible here.
+	const AdminSession s = bypassLogin();
+	AdminAuth::failNextEraseForTest();
+
+	const std::string resp = httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf);
+
+	EXPECT_EQ(statusOf(resp), 500) << resp;
+	EXPECT_EQ(resp.find("\"status\":\"ok\""), std::string::npos) << "a failed erase was reported as ok";
+	EXPECT_NE(resp.find("\"admin\":true"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"secrets\":false"), std::string::npos) << resp;
+	// The in-RAM credential is cleared regardless of what flash said.
+	EXPECT_FALSE(AdminAuth::isProvisioned());
 }
 
 TEST(SipSecretStoreClearAll, RemovesEveryExtensionSecret)

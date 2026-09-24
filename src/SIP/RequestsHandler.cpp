@@ -7800,6 +7800,12 @@ void RequestsHandler::clearAllCallHistory()
 	_cdr.clearAll();
 }
 
+bool RequestsHandler::clearAllForwards()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _cfg.clearForwardsLocked();
+}
+
 // ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
 
 void RequestsHandler::setRegistrarMode(RegistrarMode mode)

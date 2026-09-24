@@ -79,6 +79,10 @@ public:
 	// Lock-already-held mutation core (Issue #77), same sharing rationale as
 	// setDndLocked above (onDtmfInfo's *73/*72NNNN CLASS codes).
 	void setForwardLocked(const std::string& extension, const std::string& trigger, const std::string& target);
+	// Issue #450: factory reset. Empties the forward table (its targets are
+	// external phone numbers, i.e. PII) and erases its NVS key. Caller holds
+	// _mutex. Returns false if the NVS erase failed; RAM is cleared regardless.
+	bool clearForwardsLocked();
 	std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwardsSnapshot() const;
 
 	// ── Ring / hunt groups ────────────────────────────────────────────────────

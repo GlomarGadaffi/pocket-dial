@@ -449,6 +449,9 @@ public:
 	// as sensitive as the credential tables above and lives in its own NVS
 	// namespace, "cdrlog" — see CdrRing::clearAll()).
 	void clearAllCallHistory();
+	// Issue #450: /api/factory-reset. Empties the call-forward table and erases
+	// it from NVS (forward targets are external numbers). False if the erase failed.
+	bool clearAllForwards();
 
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint
