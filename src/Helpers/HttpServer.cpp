@@ -2161,7 +2161,8 @@ void HttpServer::sendApiTrace(int sock)
 		     << "\"tsUs\":" << r.tsUs << ","
 		     << "\"dir\":\"" << (r.outbound ? "out" : "in") << "\","
 		     << "\"peer\":\"" << jsonEscape(r.peer) << "\","
-		     << "\"text\":\"" << jsonEscape(r.text) << "\"}";
+		     << "\"text\":\"" << jsonEscape(r.text) << "\","
+		     << "\"truncated\":" << (r.truncated ? "true" : "false") << "}";
 	}
 	json << "]";
 

@@ -1,4 +1,5 @@
 #include "SipMessage.hpp"
+#include <algorithm>
 #include <vector>
 #include <cctype>
 #include "SipMessageTypes.h"
@@ -699,6 +700,25 @@ void SipMessage::toString(std::string& out) const
 	}
 	out += "\r\n";
 	out += _body;
+}
+
+std::size_t SipMessage::serializeInto(char* out, std::size_t cap) const
+{
+	std::size_t pos = 0;
+	auto put = [&](const char* p, std::size_t n) {
+		if (pos < cap) std::memcpy(out + pos, p, std::min(n, cap - pos));
+		pos += n;
+	};
+	put(_startLine.data(), _startLine.size());
+	put("\r\n", 2);
+	for (const auto& line : _headerLines)
+	{
+		put(line.data(), line.size());
+		put("\r\n", 2);
+	}
+	put("\r\n", 2);
+	put(_body.data(), _body.size());
+	return pos;
 }
 
 bool SipMessage::isValidMessage() const

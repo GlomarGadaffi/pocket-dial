@@ -9,6 +9,11 @@
 
 // Issue #47: mDNS hostname is compile-time configurable so two units on one LAN
 // don't both claim "pocketdial.local". Override with -DPOCKETDIAL_HOSTNAME=\"foo\".
+// Issue #416: a pcap slot must hold any datagram the parser can be handed, so
+// only messages this server built itself can ever be truncated in the capture.
+static_assert(PcapCapture::kSlotBytes >= static_cast<std::size_t>(UdpServer::BUFFER_SIZE),
+              "POCKETDIAL_PCAP_SLOT_BYTES is smaller than the UDP receive buffer");
+
 #ifndef POCKETDIAL_HOSTNAME
 #define POCKETDIAL_HOSTNAME "pocketdial"
 #endif
