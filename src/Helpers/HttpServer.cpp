@@ -1485,6 +1485,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	uint64_t dropped = 0;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate = 0;
+	uint64_t droppedNoPool = 0;    // Issue #443/#444: discarded before handle()
+	uint64_t droppedOversize = 0;
+	uint64_t recvErrors = 0;
+	int lastRecvErrno = 0;
 
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
 	if (handler != nullptr)
@@ -1501,6 +1505,11 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		dropped = handler->getPacketsDropped();   // Issue #38
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate = handler->getDroppedRate();
+		const DropProbe& probe = handler->getDropProbe();
+		droppedNoPool = probe.count(DropProbe::Reason::NoPool);
+		droppedOversize = probe.count(DropProbe::Reason::Oversize);
+		recvErrors = probe.recvErrorCount();
+		lastRecvErrno = probe.lastRecvErrno();
 	}
 
 	std::string displayIp = _ip;
@@ -1532,6 +1541,15 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// do not.
 	json << "\"droppedInvalid\":" << droppedInvalid << ",";
 	json << "\"droppedRate\":" << droppedRate << ",";
+	// Issue #443/#444: discarded before handle() -- NOT part of packetsDropped.
+	// No message was ever built for these; the ring below records their source
+	// (no_pool, oversize with the datagram's real length). recvErrors are failed
+	// receives (no datagram, so no source); the receive timeout's idle wake is
+	// not counted.
+	json << "\"droppedNoPool\":" << droppedNoPool << ",";
+	json << "\"droppedOversize\":" << droppedOversize << ",";
+	json << "\"recvErrors\":" << recvErrors << ",";
+	json << "\"lastRecvErrno\":" << lastRecvErrno << ",";
 	json << "\"recentDrops\":[";
 	if (authenticated && handler != nullptr)
 	{
@@ -1890,6 +1908,9 @@ void HttpServer::sendApiMetrics(int sock)
 	uint64_t sdpRejected  = 0;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate  = 0;
+	uint64_t droppedNoPool = 0;    // Issue #443/#444
+	uint64_t droppedOversize = 0;
+	uint64_t recvErrors = 0;
 	size_t   clientCount  = 0;
 	size_t   sessionCount = 0;
 
@@ -1905,6 +1926,10 @@ void HttpServer::sendApiMetrics(int sock)
 		dropped      = handler->getPacketsDropped();
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate  = handler->getDroppedRate();
+		const DropProbe& probe = handler->getDropProbe();
+		droppedNoPool   = probe.count(DropProbe::Reason::NoPool);
+		droppedOversize = probe.count(DropProbe::Reason::Oversize);
+		recvErrors      = probe.recvErrorCount();
 		sdpRejected  = handler->getSdpRejected();
 		clientCount  = handler->getClientCount();
 		sessionCount = handler->getSessionCount();
@@ -1962,6 +1987,19 @@ void HttpServer::sendApiMetrics(int sock)
 	        "The refused share of pocketdial_packets_dropped_total: allowlist or per-IP "
 	        "rate limit (issue #430).",
 	        droppedRate);
+	counter("pocketdial_packets_dropped_no_pool_total",
+	        "SIP datagrams discarded before parsing because the message pool and its "
+	        "bounded heap fallback were spent (issue #443). Not in "
+	        "pocketdial_packets_dropped_total.",
+	        droppedNoPool);
+	counter("pocketdial_packets_dropped_oversize_total",
+	        "SIP datagrams longer than the receive buffer, refused rather than parsed "
+	        "truncated (issue #444). Not in pocketdial_packets_dropped_total.",
+	        droppedOversize);
+	counter("pocketdial_sip_recv_errors_total",
+	        "Failed SIP socket receives, excluding the receive timeout's idle wake "
+	        "(issue #443).",
+	        recvErrors);
 	counter("pocketdial_sdp_rejected_total",
 	        "SDP bodies refused by the admission gate since boot, whether answered 488 "
 	        "or dropped silently (docs/THREAT_MODEL.md T-7).",

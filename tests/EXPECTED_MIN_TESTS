@@ -6,4 +6,5 @@
 # reduction then shows up in the diff instead of passing silently.
 #
 # Raised by #447 (#430 drop probe): main @ 8d76d64 runs 1249 (BigDog), + 7 new tests.
-1256
+# Set by #443/#444 (+6 tests), stacked on #447 (1256): 1262 tests.
+1262

@@ -32,11 +32,17 @@
 class DropProbe
 {
 public:
+	// Invalid and Rate are handle()'s refusals and sum to packetsDropped. The
+	// rest are discarded BEFORE handle() ever sees the datagram (#443/#444),
+	// so they have their own counts and are not part of packetsDropped.
 	enum class Reason : uint8_t
 	{
-		Invalid,   // null or !isValidMessage() (SEC-02 / #265)
+		Invalid,   // null or !isValidMessage() (SEC-02 / #265), or a 0-byte datagram
 		Rate,      // !ipAllowed() || !allowPacket() (#38)
+		NoPool,    // #443 S1: message pool and its bounded heap fallback spent
+		Oversize,  // #444: longer than UdpServer::BUFFER_SIZE -- refused, never parsed
 	};
+	static constexpr std::size_t kReasonCount = 4;
 
 	static constexpr std::size_t kRingSize  = 16;
 	static constexpr std::size_t kHeadBytes = 16;
@@ -53,10 +59,13 @@ public:
 		std::array<uint8_t, kHeadBytes> head{};
 	};
 
-	// ip/port in network byte order, straight from sockaddr_in.
-	void note(Reason reason, uint32_t ip, uint16_t port, std::string_view bytes)
+	// ip/port in network byte order, straight from sockaddr_in. `fullLen` is the
+	// datagram's real length when `bytes` is only its first part (an oversize
+	// datagram, #444); by default it is bytes.size().
+	void note(Reason reason, uint32_t ip, uint16_t port, std::string_view bytes,
+	          std::size_t fullLen = kUseViewLen)
 	{
-		(reason == Reason::Invalid ? _invalid : _rate).fetch_add(1, std::memory_order_relaxed);
+		_counts[index(reason)].fetch_add(1, std::memory_order_relaxed);
 
 		std::lock_guard<std::mutex> lk(_mutex);
 		Record& r = _ring[_nextSeq % kRingSize];
@@ -66,14 +75,28 @@ public:
 			std::chrono::steady_clock::now().time_since_epoch()).count());
 		r.ip      = ip;
 		r.port    = port;
-		r.len     = static_cast<uint16_t>(std::min<std::size_t>(bytes.size(), 0xFFFFu));
+		r.len     = static_cast<uint16_t>(std::min<std::size_t>(
+			fullLen == kUseViewLen ? bytes.size() : fullLen, 0xFFFFu));
 		r.reason  = reason;
 		r.headLen = static_cast<uint8_t>(std::min(bytes.size(), kHeadBytes));
 		if (r.headLen > 0) std::memcpy(r.head.data(), bytes.data(), r.headLen);   // an empty view's data() may be null
 	}
 
-	uint32_t invalidCount() const { return _invalid.load(std::memory_order_relaxed); }
-	uint32_t rateCount() const { return _rate.load(std::memory_order_relaxed); }
+	uint32_t count(Reason reason) const { return _counts[index(reason)].load(std::memory_order_relaxed); }
+	uint32_t invalidCount() const { return count(Reason::Invalid); }
+	uint32_t rateCount() const { return count(Reason::Rate); }
+
+	// #443 S2: a failed recvfrom()/recvmsg() -- not a datagram, so no source
+	// and no ring record; only a count and the last errno. The receive
+	// timeout's idle wake (EAGAIN/EWOULDBLOCK) is NOT an error and never
+	// reaches here (UdpServer::isIdleWake), so an idle board does not count up.
+	void noteRecvError(int err)
+	{
+		_recvErrors.fetch_add(1, std::memory_order_relaxed);
+		_lastRecvErrno.store(err, std::memory_order_relaxed);
+	}
+	uint32_t recvErrorCount() const { return _recvErrors.load(std::memory_order_relaxed); }
+	int lastRecvErrno() const { return _lastRecvErrno.load(std::memory_order_relaxed); }
 
 	// The live window as sequence numbers [first, end): oldest first, at most
 	// kRingSize. Read it with at(); a record evicted in between reports false.
@@ -93,11 +116,29 @@ public:
 		return true;
 	}
 
-	static const char* reasonName(Reason r) { return r == Reason::Rate ? "rate" : "invalid"; }
+	static const char* reasonName(Reason r)
+	{
+		switch (r)
+		{
+			case Reason::Rate:     return "rate";
+			case Reason::NoPool:   return "no_pool";
+			case Reason::Oversize: return "oversize";
+			case Reason::Invalid:  break;
+		}
+		return "invalid";
+	}
 
 private:
-	std::atomic<uint32_t> _invalid{0};
-	std::atomic<uint32_t> _rate{0};
+	static constexpr std::size_t kUseViewLen = static_cast<std::size_t>(-1);
+	static std::size_t index(Reason r)
+	{
+		const std::size_t i = static_cast<std::size_t>(r);
+		return i < kReasonCount ? i : 0;
+	}
+
+	std::array<std::atomic<uint32_t>, kReasonCount> _counts{};
+	std::atomic<uint32_t> _recvErrors{0};
+	std::atomic<int> _lastRecvErrno{0};
 	mutable std::mutex _mutex;
 	std::array<Record, kRingSize> _ring{};
 	uint32_t _nextSeq = 0;

@@ -161,6 +161,15 @@ public:
 	uint64_t getDroppedInvalid() const;
 	uint64_t getDroppedRate() const;
 	const DropProbe& getDropProbe() const;
+	// Issue #443/#444: discards made BEFORE handle() sees a datagram -- by the
+	// UDP receive loop (oversize, empty, a failed receive) or by SipServer when
+	// the message pool is spent. Called on the receive task; never allocates or
+	// logs. An empty datagram counts as Invalid AND in packetsDropped, so #430's
+	// "invalid + rate == packetsDropped" still holds; NoPool and Oversize have
+	// their own counts, outside packetsDropped (which is handle()'s refusals).
+	void noteRxDiscard(DropProbe::Reason reason, const sockaddr_in& src,
+	                   std::string_view bytes, size_t fullLen);
+	void noteRecvError(int err);
 	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
 	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
 	// Counted whether the refusal went out as a 488 (requests) or as a silent

@@ -7423,6 +7423,19 @@ const DropProbe& RequestsHandler::getDropProbe() const
 	return _dropProbe;
 }
 
+void RequestsHandler::noteRxDiscard(DropProbe::Reason reason, const sockaddr_in& src,
+                                    std::string_view bytes, size_t fullLen)
+{
+	if (reason == DropProbe::Reason::Invalid || reason == DropProbe::Reason::Rate)
+		_packetsDropped.fetch_add(1, std::memory_order_relaxed);   // keep #430's sum exact
+	_dropProbe.note(reason, src.sin_addr.s_addr, src.sin_port, bytes, fullLen);
+}
+
+void RequestsHandler::noteRecvError(int err)
+{
+	_dropProbe.noteRecvError(err);
+}
+
 std::vector<CallDetailRecord> RequestsHandler::getCallDetailRecords()
 {
 	std::lock_guard<std::mutex> lock(_snapshotMutex);
