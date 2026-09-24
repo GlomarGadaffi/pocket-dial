@@ -77,6 +77,19 @@
 #     otherwise read back as a dump header (CoreDumpStore rejects anything
 #     without the ELF magic, but an erased region is the clean state).
 #
+#   * RESERVED TAIL OF prompts (Issue #473): the LAST 4KB sector of prompts
+#     (0xFFE000..0xFFF000 with this table) is the factory-reset journal --
+#     src/Helpers/ResetJournal.{hpp,cpp}. A reset writes a "begun" record there
+#     before it erases anything and removes it only once the reset completed,
+#     so the next boot can report an interrupted or failed reset even when NVS
+#     itself is what failed. The firmware finds it at runtime as (prompts size -
+#     4KB), so no constant here can drift. CONTRACT for the future prompt /
+#     voicemail writer: stay out of that sector -- write only the image's own
+#     length and never erase the whole partition. tools/gen_prompts.py and CI's
+#     partition guard both enforce the reserved tail. (Erasing it anyway only
+#     clears a PENDING marker -- it cannot corrupt audio, because the journal
+#     never writes outside its sector.)
+#
 # Name,     Type, SubType,  Offset,    Size
 nvs,        data, nvs,      0x9000,    0x6000
 otadata,    data, ota,      0xf000,    0x2000

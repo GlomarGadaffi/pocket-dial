@@ -7,6 +7,7 @@
 #include <chrono>
 
 #include "AdminAuth.hpp"
+#include "ResetJournal.hpp"   // #473
 #include "CdrArchive.hpp"
 #include "PbxPersist.hpp"
 #include "SipClient.hpp"
@@ -242,7 +243,14 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 						// DtmfFactoryReset_test.cpp.
 						cdrarchive::wipeAll();
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-						nvs_flash_erase();
+						// #473: same journal as the HTTP door. begin() before the
+						// erase, finish() after it -- a failed erase (or a power cut
+						// in between) is reported on the next boot.
+						(void)resetjournal::begin();   // failure is logged + counted inside
+						{
+							const esp_err_t eraseErr = nvs_flash_erase();
+							resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
+						}
 						esp_restart();
 #else
 						_env.log("[admin] factory reset (NVS erase + restart stubbed on host)");

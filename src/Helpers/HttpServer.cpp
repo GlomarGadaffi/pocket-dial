@@ -10,6 +10,7 @@
 #include "AdminAuth.hpp"
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
 #include "DeviceConfig.hpp"
+#include "ResetJournal.hpp"     // #473: report an incomplete factory reset on the next boot
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
 #include "ArpLookup.hpp"
@@ -1581,6 +1582,19 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 #else
 	json << "\"sd\":{\"present\":false,\"mounted\":false,\"capacityMb\":0},";
 #endif
+
+	// #473: did the last factory reset complete? Public, like the counts: it
+	// discloses no identity, and an operator taking the board over needs to
+	// see it before logging in. `resetJournal` says where the record lives
+	// ("flash" survives a power cut, "rtc" only a restart -- see ResetJournal.hpp).
+	{
+		const resetjournal::BootStatus rj = resetjournal::bootStatus();
+		json << "\"resetIncomplete\":" << (rj.incomplete() ? "true" : "false") << ","
+		     << "\"resetIncompleteStage\":\"" << resetjournal::stageName(rj.stage) << "\","
+		     << "\"resetFailedMask\":" << static_cast<unsigned>(rj.failedMask) << ","
+		     << "\"resetJournal\":\"" << resetjournal::storageName(rj.storage) << "\","
+		     << "\"resetJournalWriteFailures\":" << resetjournal::writeFailureCount() << ",";
+	}
 
 	// Clients array
 	// #207: the roster is withheld from an unauthenticated caller. The counts
@@ -3538,6 +3552,12 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		             "{\"error\":\"factory reset requires confirm=ERASE\"}");
 		return;
 	}
+	// #473: open the reset journal FIRST, outside NVS, so that if anything below
+	// fails -- or power is cut before the restart task closes it -- the next
+	// boot reports the reset as incomplete (/api/status "resetIncomplete").
+	// A journal write failure is logged and counted inside begin(); the reset
+	// proceeds regardless (#481 review).
+	(void)resetjournal::begin();
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP
 	// (NVS) and host (in-memory).
@@ -3677,10 +3697,20 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// Guarded on the platform, not the transport: esp_restart() and the deferred
 	// restart task exist on every ESP build (see the include block at the top of
 	// this file, which already makes exactly this distinction for the OTA path).
+	//
+	// #473: the reset journal is closed here, the last step before the restart,
+	// so anything that runs in this task and fails (#456's nvs_flash_erase(),
+	// once it lands: pass resetjournal::kNvsErase to finish() on failure) is
+	// recorded, and a hang or power cut before this point leaves "interrupted".
+	// 4096, not 2048: finish() erases and writes a flash sector.
 	xTaskCreate([](void*) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
+		resetjournal::finish();
 		esp_restart();
-	}, "restart_task", 2048, NULL, 5, NULL);
+	}, "restart_task", 4096, NULL, 5, NULL);
+#else
+	// Host: no restart task, so the reset "completes" here.
+	resetjournal::finish();
 #endif
 }
 

@@ -104,6 +104,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # Issue #382: read-back of the panic handler's flash coredump.
                             "../src/Helpers/CoreDumpStore.cpp"
                             "../src/Helpers/DeviceConfig.cpp"
+                            # Issue #473: "factory reset incomplete" journal (prompts' last sector).
+                            "../src/Helpers/ResetJournal.cpp"
                             "../src/Helpers/SipDigest.cpp"
                             "../src/Helpers/SipSecretStore.cpp"
                             "../src/Helpers/ArpLookup.cpp"

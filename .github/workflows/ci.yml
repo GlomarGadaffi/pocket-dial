@@ -432,6 +432,23 @@ jobs:
               for s in ("ota_0", "ota_1"):
                   if slots[s][1] != "app":
                       errors.append("%s is type '%s', expected 'app'" % (s, slots[s][1]))
+          # #473: the LAST 4 KB sector of `prompts` is the factory-reset journal
+          # (src/Helpers/ResetJournal.hpp). It must exist as a raw 0x40 partition,
+          # sector-aligned, with room for prompts in front of the reserved tail.
+          prompts = [r for r in rows if r[0] == "prompts"]
+          if not prompts:
+              errors.append("missing 'prompts' partition: its last sector is the factory-reset journal (#473)")
+          else:
+              _, ptype, subtype, off, size = prompts[0]
+              if ptype != "data" or subtype.lower() != "0x40":
+                  errors.append("prompts must be data/0x40 (raw), got %s/%s" % (ptype, subtype))
+              if off % 0x1000 or size % 0x1000:
+                  errors.append("prompts must be 4 KB aligned (journal sector)")
+              if size < 2 * 0x1000:
+                  errors.append("prompts too small to keep the 4 KB journal tail")
+              else:
+                  print("reserved: factory-reset journal at 0x%x..0x%x (last sector of prompts)"
+                        % (off + size - 0x1000, off + size))
 
           if errors:
               print("PARTITION GUARD: FAIL")

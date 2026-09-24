@@ -62,7 +62,9 @@
 // See CdrRing.cpp's writer task for the reference caller.
 #define PD_ASSERT_NOT_PSRAM_STACK() \
 	do { \
-		int pd_stack_probe_; \
+		/* Only the ADDRESS is used; initialised so GCC 15's */ \
+		/* -Werror=maybe-uninitialized accepts it in small callers (#481). */ \
+		int pd_stack_probe_ = 0; \
 		assert(!esp_ptr_external_ram(&pd_stack_probe_) && \
 			"flash operation attempted from a PSRAM-stacked task (PD_TASK_STACK_CAPS) -- " \
 			"see PsramTask.hpp and issue #277"); \
