@@ -1534,7 +1534,15 @@ void TelephonyAnchorClient::tick()
 	    !_restartInFlight.load(std::memory_order_acquire))
 	{
 		_restartInFlight.store(true, std::memory_order_release);
-		if (xTaskCreate(&TelephonyAnchorClient::restartTaskTrampoline, "tel_restart", 6144, this, 5, nullptr) != pdPASS)
+		// #465: tel_restart, tel_rewarm and tel_reconcile were the last plain-xTaskCreate anchor
+		// tasks (6 KB internal stack + TCB each). All three are PSRAM-safe per PsramTask.hpp's
+		// rule, traced transitively: restart = stop() (sockets, WS/worker teardown; it nulls
+		// _eventCb first) + start() (fetchToken, connectWs, warm*, which are TLS only; the token
+		// stays in RAM); rewarm = rewarmPostSession() (TLS open/close); reconcile = httpGetBody +
+		// cJSON + stopMediaStreams() (slot bookkeeping + socket shutdown, no callbacks). None
+		// reaches nvs_*, esp_partition_*, esp_flash_* or esp_ota_*, and none fires _eventCb, the
+		// path by which #273's CDR write reached a PSRAM stack.
+		if (xTaskCreateWithCaps(&TelephonyAnchorClient::restartTaskTrampoline, "tel_restart", 6144, this, 5, nullptr, PD_TASK_STACK_CAPS) != pdPASS)
 		{
 			ESP_LOGE(TAG, "tick: failed to spawn anchor-restart worker");
 			_restartInFlight.store(false, std::memory_order_release);
@@ -1578,7 +1586,7 @@ void TelephonyAnchorClient::tick()
 			// Stamp BEFORE the spawn so the next-due math is correct even if the worker is slow.
 			_lastRewarmUs.store(now, std::memory_order_release);
 			_rewarmInFlight.store(true, std::memory_order_release);
-			if (xTaskCreate(&TelephonyAnchorClient::rewarmTaskTrampoline, "tel_rewarm", 6144, this, 5, nullptr) != pdPASS)
+			if (xTaskCreateWithCaps(&TelephonyAnchorClient::rewarmTaskTrampoline, "tel_rewarm", 6144, this, 5, nullptr, PD_TASK_STACK_CAPS) != pdPASS)
 			{
 				ESP_LOGE(TAG, "tick: failed to spawn TLS re-warm worker");
 				_rewarmInFlight.store(false, std::memory_order_release);
@@ -1624,7 +1632,7 @@ void TelephonyAnchorClient::tick()
 
 	// Claim the one-shot slot BEFORE the spawn so a second tick can't double-spawn the worker.
 	_reconcileInFlight.store(true, std::memory_order_release);
-	if (xTaskCreate(&TelephonyAnchorClient::reconcileTaskTrampoline, "tel_reconcile", 6144, this, 5, nullptr) != pdPASS)
+	if (xTaskCreateWithCaps(&TelephonyAnchorClient::reconcileTaskTrampoline, "tel_reconcile", 6144, this, 5, nullptr, PD_TASK_STACK_CAPS) != pdPASS)
 	{
 		// Rare error path (not the hot path): release the slot, else the watchdog wedges forever.
 		ESP_LOGE(TAG, "tick: failed to spawn reconcile worker");
@@ -1705,7 +1713,7 @@ void TelephonyAnchorClient::reconcileTaskTrampoline(void* arg)
 	// does not unwind the C++ stack, so this clear must be explicit here (not an RAII guard) — and
 	// the only cJSON RAII above is confined to an inner scope that has already run.
 	self->_reconcileInFlight.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
+	vTaskDeleteWithCaps(nullptr);   // #465: created WithCaps(PSRAM)
 }
 
 // #107: one-shot worker spawned by tick() when the anchor is idle. Reopens the persistent
@@ -1718,7 +1726,7 @@ void TelephonyAnchorClient::rewarmTaskTrampoline(void* arg)
 	self->rewarmPostSession();
 	// Single exit: release the one-shot slot so tick() can re-arm, then self-delete.
 	self->_rewarmInFlight.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
+	vTaskDeleteWithCaps(nullptr);   // #465: created WithCaps(PSRAM)
 }
 
 void TelephonyAnchorClient::rewarmPostSession()
@@ -1918,7 +1926,7 @@ void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 
 	// Clear the in-flight gate LAST so tick() can spawn a future restart if needed.
 	self->_restartInFlight.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
+	vTaskDeleteWithCaps(nullptr);   // #465: created WithCaps(PSRAM)
 }
 
 esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token)
@@ -2559,17 +2567,16 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 			// 0x02=binary, 0x08=close, 0x09=ping, 0x0A=pong, 0x00=continuation.
 			ESP_LOGD(TAG, "WS frame: op=0x%02x len=%d off=%d total=%d", data->op_code,
 			         data->data_len, data->payload_offset, data->payload_len);
-			if (data->op_code == 0x01 && data->data_ptr != nullptr && data->data_len > 0)
-			{
-				std::string rawDump(data->data_ptr, data->data_len);
-				ESP_LOGD(TAG, "WS payload: %s", rawDump.c_str());   // #100: ESP_LOGD — full-JSON dump flooded UART at multi-call scale
-			}
+			// #465: printed straight from the frame buffer. This used to copy the payload into a
+			// std::string on EVERY text frame just to feed this ESP_LOGD, which the release log
+			// level compiles out -- the copy (0.2-1 KB of internal DRAM) happened anyway.
+			ESP_LOGD(TAG, "WS payload: %.*s", data->data_len, data->data_ptr != nullptr ? data->data_ptr : "");
 
 			if (data->op_code == 0x01 && data->data_ptr != nullptr && data->data_len > 0)
 			{
-				// Received text data from WSS
-				std::string payload(data->data_ptr, data->data_len);
-				cJSON* root = cJSON_Parse(payload.c_str());
+				// Received text data from WSS. #465: parsed in place -- the frame buffer is not
+				// NUL-terminated, which is the only reason a std::string copy used to precede this.
+				cJSON* root = cJSON_ParseWithLength(data->data_ptr, static_cast<size_t>(data->data_len));
 				if (!root) break;
 				CJsonDeleter deleter{root};
 
