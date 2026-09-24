@@ -563,6 +563,26 @@ public:
 		return bindOutboundParticipant(callId, ownLeg);
 	}
 
+	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
+	// anchor's CallEvent::Incoming does, and return the new session's Call-ID
+	// line ("" if routing declined). Without this no host test can reach an
+	// isAnchorInbound() session at all -- Loopback's own inbound hook is never
+	// wired through RequestsHandler (see anchorIsSynchronous()) -- and that gap
+	// is how #439's first cut relayed a handset's session refresh to the PSTN
+	// peer's zeroed address unnoticed. Not compiled into device firmware.
+	std::string routeInboundAnchorCallForTest(const std::string& routeDn,
+	                                          const std::string& participantId,
+	                                          const std::string& callerId)
+	{
+		_anchorRouteDn = routeDn;
+		routeInboundAnchorCall(participantId, callerId);
+		for (const auto& [cid, s] : _sessions)
+		{
+			if (s->isAnchorInbound()) return std::string(s->getCallID());
+		}
+		return {};
+	}
+
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned)
 	{
