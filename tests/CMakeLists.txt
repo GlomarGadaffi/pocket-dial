@@ -24,7 +24,7 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers)
+include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers support)
 
 add_executable(sip_parser_tests
     SipMessage_test.cpp
@@ -59,6 +59,9 @@ add_executable(sip_parser_tests
     # applies them to every SDP-bearing message before any decode or relay.
     # Also pins the decode paths as zero-heap via a counting operator new.
     SdpAdmission_test.cpp
+    # The binary's one counting operator new, plus its own positive controls.
+    support/AllocCounter.cpp
+    AllocCounter_test.cpp
     # Issue #101(A)/(E): message-pool backpressure (bounded heap fallback, then
     # refuse) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
