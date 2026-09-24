@@ -1553,9 +1553,11 @@ private:
 		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody);
 	// Build a server-initiated in-dialog BYE. From/To must include tags because the
 	// dialog role differs per call path (beep = server UAC; park = server UAS).
+	// `cseq` must exceed any request the server already sent on this dialog
+	// (Session::nextServerCSeq(), #389); 2 is only right when it has sent none.
 	std::shared_ptr<SipMessage> buildServerBye(const std::string& destExt,
 		const sockaddr_in& destAddr, const std::string& callId,
-		const std::string& fromHeader, const std::string& toHeader);
+		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2);
 
 	// Verify that the in-dialog request comes from a peer recorded at dialog setup
 	// (source IP match). Returns false → respond 403 Forbidden. Caller holds _mutex.

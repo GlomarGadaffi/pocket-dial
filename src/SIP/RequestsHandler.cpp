@@ -5383,8 +5383,10 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			if (auto notify = peer->getSrc();
 				notify && !peer->getDialogFrom().empty() && !peer->getDialogTo().empty())
 			{
+				// #389: a retrieved park leg has already had the server's re-INVITE
+				// on this dialog, so the BYE must go above that CSeq, not reuse it.
 				auto bye = buildServerBye(notify->getNumber(), notify->getAddress(),
-					peerCallId, peer->getDialogTo(), peer->getDialogFrom());
+					peerCallId, peer->getDialogTo(), peer->getDialogFrom(), peer->nextServerCSeq());
 				if (bye) _outbox.emplace_back(notify->getAddress(), std::move(bye));
 			}
 			endCall(peerCallId, peer->getSrc() ? peer->getSrc()->getNumber() : "",
@@ -9485,7 +9487,8 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 	const sockaddr_in& destAddr,
 	const std::string& callId,
 	const std::string& fromHeader,
-	const std::string& toHeader)
+	const std::string& toHeader,
+	uint32_t cseq)
 {
 	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
@@ -9498,7 +9501,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 	   << "From: " << stripHeaderName(fromHeader) << "\r\n"
 	   << "To: " << stripHeaderName(toHeader) << "\r\n"
 	   << "Call-ID: " << stripHeaderName(callId) << "\r\n"
-	   << "CSeq: 2 BYE\r\n"
+	   << "CSeq: " << cseq << " BYE\r\n"
 	   << "Max-Forwards: 70\r\n"
 	   << "Content-Length: 0\r\n\r\n";
 
