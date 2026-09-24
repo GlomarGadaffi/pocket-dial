@@ -368,9 +368,8 @@ jobs:
           # returns non-zero on any test failure, which FAILS this step (the gate).
           ctest --test-dir build/tests --output-on-failure
 
-      - name: Verify SIP Parser Call Graph (T-7 recursion/frame guard)
-        run: |
-          python3 tests/tools/check_parser_callgraph.py
+      # The T-7 call-graph guard used to run here. It is its own job now
+      # (callgraph-guard, below) -- see the note there.
 
       - name: Verify Partition Table (dual-OTA layout guard)
         run: |
@@ -473,6 +472,40 @@ jobs:
             exit "$RC"
           fi
           echo "HTTP API smoke suite PASSED."
+
+  # T-7 call-graph guard (CWE-674): no recursion cycle and no dynamic stack
+  # frame in the SIP signalling translation units. BLOCKING by desmo's
+  # decision on #361 -- no continue-on-error, as a transition or otherwise
+  # (#262 is why: a non-blocking check's green only says it ran).
+  #
+  # Its own job rather than a step of build-and-test-host, for two reasons:
+  #   * a step after ctest never runs when a unit test fails, so a new cycle
+  #     landing alongside a red test would be invisible until the test was
+  #     fixed -- the guard's verdict must not depend on anything else passing;
+  #   * required status checks are per JOB. As a step, the guard could only
+  #     be made required by requiring the whole host job with it.
+  # It needs nothing from the host build: the script compiles the TUs itself.
+  #
+  # SCOPE, stated explicitly (#361: gate the part that is ready): the default
+  # SIP-TU set in check_parser_callgraph.py, which is clean. `--all` is NOT
+  # gated -- it finds JsonReader's parseValue <-> parseArray/parseObject
+  # recursion, bounded by kMaxDepth=8 / kMaxBytes=16384 but still a cycle
+  # under this guard's no-cycles contract. Widening the gate means resolving
+  # that first, as a decision of its own.
+  callgraph-guard:
+    name: Call-Graph Guard (T-7)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Verify SIP Parser Call Graph (T-7 recursion/frame guard)
+        run: |
+          # The version matters: -fcallgraph-info needs GCC >= 10, and an old
+          # compiler failing the flag exits 2 (compile failure), which would
+          # read as "the guard broke" rather than "the code broke".
+          g++ --version | head -1
+          python3 tests/tools/check_parser_callgraph.py
 
   # Job 2: Build firmware for target ESP32 and ESP32-S3 boards using official Espressif Docker Images.
   # This establishes compiler verification across multiple ESP-IDF versions and target architectures.
