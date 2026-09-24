@@ -323,6 +323,11 @@ add_executable(sip_parser_tests
     # Issue #382: /api/coredump* -- owner-only download, CSRF-checked erase,
     # ungated presence on /api/status, against a fake CoreDumpStore image.
     CoreDumpHttp_test.cpp
+    # Issue #385: the brute-force state-recovery attack on IDGen, run for real
+    # (DISABLED_ by default -- a full 2^31 search each; see the file header).
+    IDGenPredict_test.cpp
+    # Issue #385: always-on seam/mapping guards for IDGen.
+    IDGen_test.cpp
     # Issue #186: GET/POST /api/config/export and POST /api/config/import,
     # driven end-to-end through a real HttpServer -- plaintext round-trip,
     # password-gated round-trip, replace-not-merge, and the 400/422 rejection
