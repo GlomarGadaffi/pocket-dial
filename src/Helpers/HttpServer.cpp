@@ -1511,22 +1511,18 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"ip\":\"" << jsonEscape(displayIp) << "\",";
 	json << "\"port\":" << 5060 << ",";
 	json << "\"httpPort\":" << _port << ",";
-	// #411: which build is this. Top-level "version" is what tests/run.py's
-	// board-provenance check and the bench run sheets read and compare with
-	// `git describe` (TEST_HARNESS.md §5.3); "firmware" carries the rest.
-	// All from FirmwareInfo, so the two cannot disagree.
+	// #411: which build is this. "version" is what tests/run.py's
+	// board-provenance check and the bench run sheets compare with
+	// `git describe` (TEST_HARNESS.md §5.3).
 	//
-	// Deliberately NOT withheld from an unauthenticated caller, unlike the
-	// roster (#207). The provenance check fetches this without a session, and
-	// if "version" were missing it would skip the comparison, not fail it:
-	// gating the field would silently switch provenance off. The cost is that
-	// anyone on the LAN can read the build string. /metrics is ungated on the
-	// same reasoning.
-	json << "\"version\":\"" << jsonEscape(FirmwareInfo::version()) << "\","
-	     << "\"firmware\":{\"version\":\"" << jsonEscape(FirmwareInfo::version()) << "\""
-	     << ",\"idf\":\"" << jsonEscape(FirmwareInfo::idfVersion()) << "\""
-	     << ",\"built\":\"" << jsonEscape(FirmwareInfo::buildDate()) << " "
-	     << jsonEscape(FirmwareInfo::buildTime()) << "\"},";
+	// Public, like the roster is not (#207): provenance fetches this without a
+	// session, and a check that cannot see the field must not quietly pass.
+	// ONLY the version string, by design -- the same class of disclosure as a
+	// SIP User-Agent. No build host, no path, no build timestamp and no IDF
+	// version here: those tell an attacker more than which build this is, and
+	// provenance needs none of them. They go to the boot banner on the serial
+	// console instead, which is not network-reachable.
+	json << "\"version\":\"" << jsonEscape(FirmwareInfo::version()) << "\",";
 	// #167: state the board's WiFi capability rather than leaving the dashboard
 	// to infer it from an empty scan result. An eth/lan8720 build has no radio at
 	// all, so "found 0 networks" is not an empty scan -- it is a scan that can

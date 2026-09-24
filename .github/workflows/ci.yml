@@ -404,6 +404,14 @@ jobs:
           # Fails closed: a missing report is a failure, not a pass.
           python3 tests/tools/check_test_count.py build/gtest-reports
 
+      - name: Tool tests (firmware version gate, board provenance)
+        run: |
+          # #411: tools/ci/check_app_version.py (the image gate every ESP leg
+          # runs) and tests/run.py's board-provenance verdicts, including the
+          # over-length and release-dirty cases. Real git repos and synthetic
+          # images, nothing mocked; stdlib unittest, so no install step.
+          python3 -m unittest discover -s tests/tools -p "test_*.py" -v
+
       # The T-7 call-graph guard used to run here. It is its own job now
       # (callgraph-guard, below) -- see the note there.
 

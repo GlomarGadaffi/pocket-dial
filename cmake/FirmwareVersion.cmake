@@ -29,12 +29,22 @@
 # reproducible builds that stamp an exact string. It is still held to the
 # 31-character limit.
 
-set(POCKETDIAL_FW_VERSION_MAX_LEN 31)
-
 # Captured at include time: inside the function CMAKE_CURRENT_LIST_DIR would be
 # the CALLER's directory, and CMAKE_CURRENT_FUNCTION_LIST_DIR needs CMake 3.17
 # while the top-level project declares 3.16 as its minimum.
 set(_POCKETDIAL_FWVER_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+
+# The length limit comes from ONE file, shared with tools/ci/check_app_version.py,
+# so the build and the gate that checks it cannot disagree about when the
+# fallback applies. (A number here and another in the script is exactly the
+# drift a gate exists to catch, not to suffer from.)
+file(STRINGS "${_POCKETDIAL_FWVER_CMAKE_DIR}/FirmwareVersionMaxLen.txt"
+     POCKETDIAL_FW_VERSION_MAX_LEN LIMIT_COUNT 1)
+string(STRIP "${POCKETDIAL_FW_VERSION_MAX_LEN}" POCKETDIAL_FW_VERSION_MAX_LEN)
+if(NOT POCKETDIAL_FW_VERSION_MAX_LEN MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "cmake/FirmwareVersionMaxLen.txt must hold a single number, "
+                        "got '${POCKETDIAL_FW_VERSION_MAX_LEN}'")
+endif()
 
 # STALENESS: the stamp is decided at CONFIGURE time, and an incremental
 # `idf.py build` does not reconfigure by itself. Without this, committing and

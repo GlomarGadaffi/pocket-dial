@@ -162,18 +162,37 @@ namespace
 TEST_F(FirmwareStatusTest, StatusCarriesTheVersionToAnUnauthenticatedCaller)
 {
 	// No session, on purpose: this is how tests/run.py's board-provenance check
-	// fetches it. If "version" were withheld here, run.py would see an empty
-	// value and SKIP the comparison instead of failing it.
+	// fetches it.
 	const std::string resp = httpGet(_port, "/api/status");
 	ASSERT_EQ(statusOf(resp), 200);
 	const std::string body = bodyOf(resp);
 	const std::string v = FirmwareInfo::version();
 
 	EXPECT_NE(body.find("\"version\":\"" + v + "\""), std::string::npos)
-		<< "top-level \"version\" (what tests/run.py reads) is missing or wrong: " << body;
-	EXPECT_NE(body.find("\"firmware\":{\"version\":\"" + v + "\""), std::string::npos)
-		<< "the firmware block must carry the SAME string: " << body;
-	EXPECT_NE(body.find("\"idf\":\"host\""), std::string::npos) << body;
+		<< "\"version\" (what tests/run.py reads) is missing or wrong: " << body;
 	EXPECT_EQ(body.find("\"version\":\"1\""), std::string::npos)
 		<< "the ESP-IDF fallback must never reach /api/status";
+}
+
+TEST_F(FirmwareStatusTest, StatusDisclosesOnlyTheVersionString)
+{
+	// Public, so it carries the version and NOTHING else about the build: no
+	// build timestamp, no IDF version, no host or path. Those tell an attacker
+	// more than which build this is, and provenance needs none of them. They
+	// belong to the serial boot banner, which is not network-reachable.
+	const std::string body = bodyOf(httpGet(_port, "/api/status"));
+	ASSERT_FALSE(body.empty());
+
+	EXPECT_EQ(body.find(FirmwareInfo::buildDate()), std::string::npos)
+		<< "the build date leaked into /api/status: " << body;
+	EXPECT_EQ(body.find(FirmwareInfo::buildTime()), std::string::npos)
+		<< "the build time leaked into /api/status: " << body;
+	EXPECT_EQ(body.find("\"firmware\""), std::string::npos) << body;
+	EXPECT_EQ(body.find("\"idf\""), std::string::npos) << body;
+	EXPECT_EQ(body.find("\"built\""), std::string::npos) << body;
+	// Exactly one "version" key: the public one, not a second copy elsewhere.
+	size_t n = 0;
+	for (size_t at = body.find("\"version\":"); at != std::string::npos;
+	     at = body.find("\"version\":", at + 1)) ++n;
+	EXPECT_EQ(n, 1u) << body;
 }
