@@ -459,3 +459,53 @@ TEST(CallPickup, ParkRetrieveBridgeByeGetsCleanupWithoutMalformedBye)
 	EXPECT_FALSE(handler.getSession(sessionKey("retrieve-call")).has_value());
 	EXPECT_FALSE(handler.getSession(sessionKey("park-call")).has_value());
 }
+
+// Issue #389: when the retriever hangs up, the BYE relayed to the PARKER goes on
+// the same dialog as the server's retrieve re-INVITE, so its CSeq must be higher.
+// Reusing it (both were a hardcoded 2) got pjsua's "500 Invalid CSeq" on every
+// interop run and left the parker's leg up. Counted, not just found: exactly one.
+TEST(CallPickup, ParkRetrieveByeToParkerGoesAboveTheReinviteCSeq)
+{
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+
+	handler.handle(makeRegister("100", "192.168.9.52", "reg-parked-389"));
+	handler.handle(makeRegister("101", "192.168.9.53", "reg-retriever-389"));
+
+	handler.handle(makeInvite("100", "700", "192.168.9.52", "park-call-389"));
+	handler.handle(makeInvite("101", "700", "192.168.9.53", "retrieve-call-389"));
+
+	auto cseqOf = [](const std::string& raw) -> long {
+		const auto at = raw.find("CSeq: ");
+		return at == std::string::npos ? -1 : std::stol(raw.substr(at + 6));
+	};
+	long reinviteCSeq = -1;
+	for (const auto& s : sent)
+	{
+		if (s.destIp == "192.168.9.52" && s.raw.rfind("INVITE sip:", 0) == 0 &&
+			s.raw.find("Call-ID: park-call-389\r\n") != std::string::npos)
+		{
+			reinviteCSeq = cseqOf(s.raw);
+		}
+	}
+	ASSERT_GT(reinviteCSeq, 0) << "retrieve must re-INVITE the parker on its own dialog";
+
+	sent.clear();
+	handler.handle(makeBye("101", "700", "192.168.9.53", "retrieve-call-389"));
+
+	std::vector<long> byeCSeqs;
+	for (const auto& s : sent)
+	{
+		if (s.destIp == "192.168.9.52" && s.raw.rfind("BYE sip:", 0) == 0 &&
+			s.raw.find("Call-ID: park-call-389\r\n") != std::string::npos)
+		{
+			byeCSeqs.push_back(cseqOf(s.raw));
+		}
+	}
+	ASSERT_EQ(byeCSeqs.size(), 1u) << "exactly one BYE to the parker";
+	EXPECT_GT(byeCSeqs[0], reinviteCSeq)
+		<< "BYE CSeq " << byeCSeqs[0] << " must exceed the re-INVITE's " << reinviteCSeq;
+}

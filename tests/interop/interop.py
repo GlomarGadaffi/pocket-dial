@@ -606,12 +606,19 @@ def sc_park_retrieve(env):
 
     m_bye = a.mark()
     c.hangup_all()
-    bye_relayed = a.wait_log(TEARDOWN_RX, 8, m_bye) is not None
+    # The parker's leg must actually END, not merely receive a BYE: #389's BYE
+    # arrived on every run but reused the re-INVITE's CSeq, pjsua answered
+    # "500 Invalid CSeq", and the leg stayed CONFIRMED -- which TEARDOWN_RX's
+    # "Request msg BYE" half matched as success. A's 777 call stays up until
+    # hangup_all below, so the only DISCONNECTED in this window is the 700 leg.
+    parker_ended = a.wait_log(r"Call \d+ is DISCONNECTED", 8, m_bye) is not None
+    bye_rejected = re.search(r"Response msg 500/BYE", a.log_since(m_bye)) is not None
     a.hangup_all()
-    ok = parked and hold_sdp and retrieved and bye_relayed
+    ok = parked and hold_sdp and retrieved and parker_ended and not bye_rejected
     return report("park_retrieve", "OK" if ok else "FAIL",
-                  "park 200 w/ a=inactive=%s, retrieve CONFIRMED=%s, BYE relayed to parker=%s"
-                  % (parked and hold_sdp, retrieved, bye_relayed))
+                  "park 200 w/ a=inactive=%s, retrieve CONFIRMED=%s, parker's leg ended=%s, "
+                  "parker 500'd the BYE=%s"
+                  % (parked and hold_sdp, retrieved, parker_ended, bye_rejected))
 
 
 def dnd_flag(ext):

@@ -178,6 +178,36 @@ TEST(ParkOrbit, RetrieveCapturesDialogHeadersOnBothLegsForByeRelay)
 	EXPECT_EQ(retriever->getPeerCallID(), "Call-ID: parked-call-5@192.168.1.50");
 }
 
+// Issue #389: the retrieve re-INVITE is a server request on the parked dialog,
+// so it must be recorded there -- with the SAME CSeq that went on the wire --
+// or the BYE that later ends this leg reuses it and the phone 500s it.
+TEST(ParkOrbit, RetrieveRecordsItsReinviteCSeqOnTheParkedSession)
+{
+	FakePbxEnv env;
+	ParkOrbit park(env);
+
+	const sockaddr_in parkedAddr    = FakePbxEnv::addr("192.168.1.50", 5060);
+	const sockaddr_in retrieverAddr = FakePbxEnv::addr("192.168.1.51", 5060);
+
+	park.onInvite(inviteTo("700", "101", "parked-call-7@192.168.1.50", parkedAddr, "192.168.1.50"),
+		std::make_shared<SipClient>("101", parkedAddr), 0);
+	auto parked = env.findSession("Call-ID: parked-call-7@192.168.1.50");
+	ASSERT_TRUE(parked);
+	EXPECT_EQ(parked->lastServerCSeq(), 0u);   // parking alone sends the parker no request
+
+	park.onInvite(inviteTo("700", "102", "retrieve-call-7@192.168.1.51", retrieverAddr, "192.168.1.51"),
+		std::make_shared<SipClient>("102", retrieverAddr), 0);
+	ASSERT_EQ(env.sent.size(), 3u);            // hold 200, retriever 200, re-INVITE
+	const std::string reinvite = env.sentRaw(2);
+	ASSERT_EQ(reinvite.rfind("INVITE sip:101@", 0), 0u) << reinvite;
+
+	const auto at = reinvite.find("CSeq: ");
+	ASSERT_NE(at, std::string::npos) << reinvite;
+	const uint32_t wireCSeq = static_cast<uint32_t>(std::stoul(reinvite.substr(at + 6)));
+	EXPECT_EQ(parked->lastServerCSeq(), wireCSeq);
+	EXPECT_GT(parked->nextServerCSeq(), wireCSeq);
+}
+
 // A retrieve that cannot get a session must 503 the retriever and leave the
 // orbit occupied rather than half-tearing-down the parked leg (#71).
 TEST(ParkOrbit, RetrieveWithExhaustedSessionPoolLeavesSlotParked)
