@@ -438,12 +438,35 @@ TEST(SipDigestBounded, MakeCnonceIsSixteenLowercaseHexAndFreshEachTime)
 // #426) through AllocGuard, whose delta() counts THIS thread only -- RtpSender's
 // pacer and the conference tick driver allocate concurrently elsewhere in this
 // binary and must not be able to make these flaky. That the counter really
-// moves, and really is per-thread, is AllocCounter_test's job; these only
-// assert zero.
+// moves, and really is per-thread, is AllocCounter_test's job in general; the
+// positive control just below proves it here, in this file, too.
 //
 // Everything that is allowed to allocate -- the challenge string, the corpus,
 // gtest's own bookkeeping -- is built BEFORE the guard. Inside it runs only
 // the bounded API.
+
+// POSITIVE CONTROL for the three zero-heap tests after it. An EXPECT_EQ(0)
+// passes vacuously if the counter is not live -- the hook dropped from this
+// binary's link, AllocGuard reading a stale value, counting broken in some
+// way AllocCounter_test's own cases happen not to exercise. So before trusting
+// "zero" here, prove a real allocation IS seen here.
+//
+// Escaped through a volatile sink on purpose: CI builds the host tests in
+// Release, and a `new` whose result is unused may be elided outright as a
+// replaceable new/delete pair. An elided control would read 0 and look exactly
+// like a broken counter -- or, worse, make a broken counter look fine.
+TEST(SipDigestBounded, TheCounterSeesARealAllocationInThisFile)
+{
+	static void* volatile sink = nullptr;
+	AllocGuard guard;
+	int* p = new int(42);
+	sink = p;
+	const std::size_t allocs = guard.delta();
+	delete p;
+	sink = nullptr;
+	EXPECT_EQ(allocs, 1u) << "AllocGuard did not see a real, escaped allocation: "
+	                         "every zero-heap assertion below would pass vacuously";
+}
 
 TEST(SipDigestBounded, ParsingAChallengeAllocatesNothing)
 {
