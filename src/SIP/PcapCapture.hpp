@@ -134,22 +134,19 @@ public:
 	// tracer, which polls GET /api/trace and appends whatever it hasn't already
 	// shown (`seq` is monotonic and never reused, so the client can track a
 	// high-water mark instead of the server tracking per-client state).
-	// cppcheck flags the scalar members below (uninitMemberVarNoCtor). False
-	// positive: TraceRecord is a plain aggregate, and its one construction
-	// site (traceRecords() below) always brace-initialises every field.
+	// Every scalar has a default member initializer, so a default-constructed
+	// record is fully defined and cppcheck's uninitMemberVarNoCtor has nothing to
+	// flag. Still an aggregate (C++14+), so traceRecords()' brace-init works.
 	struct TraceRecord
 	{
-		// cppcheck-suppress uninitMemberVarNoCtor
-		uint64_t    seq;
-		// cppcheck-suppress uninitMemberVarNoCtor
-		uint64_t    tsUs;
-		// cppcheck-suppress uninitMemberVarNoCtor
-		bool        outbound;
+		uint64_t    seq      = 0;
+		uint64_t    tsUs     = 0;
+		bool        outbound = false;
 		std::string peer;   // "ip:port", via sipwire::addrToIpPort
 		std::string text;
 		// True when the message was longer than kSlotBytes and `text` holds only
 		// its first kSlotBytes bytes.
-		bool        truncated;
+		bool        truncated = false;
 	};
 	std::vector<TraceRecord> traceRecords() const
 	{
