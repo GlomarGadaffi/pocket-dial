@@ -27,6 +27,7 @@
 #include <functional>
 #include <iostream>
 #include <unordered_map>
+#include <map>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -714,7 +715,7 @@ private:
 		return buildServerBye(destExt, destAddr, callId, fromHeader, toHeader);
 	}
 	void forEachSessionInvolving(std::string_view aor,
-		const std::function<void(const std::string&, const Session&, DialogRole)>& fn) const override
+		FunctionRef<void(const std::string&, const Session&, DialogRole)> fn) const override
 	{
 		for (const auto& [callID, session] : _sessions)
 		{
@@ -1826,7 +1827,12 @@ private:
 
 	// RequestsHandler.hpp: Issues #24 and #28 resolved.
 	std::unordered_map<std::string, std::function<void(std::shared_ptr<SipMessage> request)>> _handlers;
-	std::unordered_map<std::string, std::shared_ptr<Session>>   _sessions;
+	// std::map with a transparent comparator, not unordered_map (#464): C++17 has
+	// heterogeneous lookup only for ordered containers, so this is what lets
+	// getSession(string_view) find a session WITHOUT building a std::string key --
+	// which it used to do up to three times per request. At POCKETDIAL_MAX_SESSIONS
+	// entries, O(log n) string compares cost nothing measurable.
+	std::map<std::string, std::shared_ptr<Session>, std::less<>> _sessions;
 
 	// Call-IDs of attended-transfer splice re-INVITEs (issue #131) pending their
 	// 200 OK -> ACK, so handleTransferOk() can find them (same bounded-vector

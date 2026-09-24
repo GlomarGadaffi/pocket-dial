@@ -1127,7 +1127,7 @@ std::shared_ptr<Session> RequestsHandler::noteDialogCSeq(std::string_view callID
 
 std::optional<std::shared_ptr<Session>> RequestsHandler::getSession(std::string_view callID)
 {
-	auto sessionIt = _sessions.find(std::string(callID));
+	auto sessionIt = _sessions.find(callID);   // heterogeneous: no temporary key (#464)
 	if (sessionIt != _sessions.end())
 	{
 		return sessionIt->second;

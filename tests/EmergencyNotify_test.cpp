@@ -552,7 +552,7 @@ namespace
 		std::shared_ptr<SipMessage> serverBye(const std::string&, const sockaddr_in&,
 			const std::string&, const std::string&, const std::string&) override { return nullptr; }
 		void forEachSessionInvolving(std::string_view,
-			const std::function<void(const std::string&, const Session&, DialogRole)>&) const override {}
+			FunctionRef<void(const std::string&, const Session&, DialogRole)>) const override {}
 		bool validAor(std::string_view) const override { return true; }
 		int requestedExpires(const std::shared_ptr<SipMessage>&) const override { return 3600; }
 		bool routeTrunkCall(const std::shared_ptr<SipMessage>&,
