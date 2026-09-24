@@ -246,7 +246,7 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 						// #473: same journal as the HTTP door. begin() before the
 						// erase, finish() after it -- a failed erase (or a power cut
 						// in between) is reported on the next boot.
-						resetjournal::begin();
+						(void)resetjournal::begin();   // failure is logged + counted inside
 						{
 							const esp_err_t eraseErr = nvs_flash_erase();
 							resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);

@@ -1543,7 +1543,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		json << "\"resetIncomplete\":" << (rj.incomplete() ? "true" : "false") << ","
 		     << "\"resetIncompleteStage\":\"" << resetjournal::stageName(rj.stage) << "\","
 		     << "\"resetFailedMask\":" << static_cast<unsigned>(rj.failedMask) << ","
-		     << "\"resetJournal\":\"" << resetjournal::storageName(rj.storage) << "\",";
+		     << "\"resetJournal\":\"" << resetjournal::storageName(rj.storage) << "\","
+		     << "\"resetJournalWriteFailures\":" << resetjournal::writeFailureCount() << ",";
 	}
 
 	// Clients array
@@ -3492,7 +3493,9 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// #473: open the reset journal FIRST, outside NVS, so that if anything below
 	// fails -- or power is cut before the restart task closes it -- the next
 	// boot reports the reset as incomplete (/api/status "resetIncomplete").
-	resetjournal::begin();
+	// A journal write failure is logged and counted inside begin(); the reset
+	// proceeds regardless (#481 review).
+	(void)resetjournal::begin();
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP
 	// (NVS) and host (in-memory).

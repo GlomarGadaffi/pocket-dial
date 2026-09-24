@@ -8,6 +8,7 @@
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "PsramTask.hpp"   // PD_ASSERT_NOT_PSRAM_STACK: #277/#480, see load()/store()
 #else
 #include <iostream>
 #endif
@@ -77,6 +78,13 @@ namespace
 		return m;
 	}
 
+	// Journal writes that failed (begin/finish), for /api/status.
+	std::atomic<uint32_t>& writeFailures()
+	{
+		static std::atomic<uint32_t> n{0};
+		return n;
+	}
+
 	// ── Backends ─────────────────────────────────────────────────────────────
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	constexpr const char* TAG = "ResetJournal";
@@ -101,6 +109,9 @@ namespace
 
 	Read load(Record& out)
 	{
+		// #481 review: a flash op from a PSRAM-stacked task is the #273 panic,
+		// and #480 is moving tasks to PSRAM -- fail loudly here instead.
+		PD_ASSERT_NOT_PSRAM_STACK();
 		size_t off = 0;
 		if (const esp_partition_t* p = journalPartition(off))
 		{
@@ -116,6 +127,7 @@ namespace
 
 	bool store(const Record* r)   // nullptr = erase
 	{
+		PD_ASSERT_NOT_PSRAM_STACK();   // see load()
 		size_t off = 0;
 		if (const esp_partition_t* p = journalPartition(off))
 		{
@@ -132,6 +144,7 @@ namespace
 #else
 	Record s_hostRecord;
 	bool   s_hostHasRecord = false;
+	bool   s_hostFailNextStore = false;
 
 	Storage backend() { return Storage::Flash; }   // host models the flash backend
 
@@ -148,6 +161,7 @@ namespace
 
 	bool store(const Record* r)
 	{
+		if (s_hostFailNextStore) { s_hostFailNextStore = false; return false; }
 		if (r) { s_hostRecord = *r; s_hostHasRecord = true; }
 		else   { s_hostHasRecord = false; }
 		return true;
@@ -203,12 +217,17 @@ namespace
 	}
 }
 
-void begin()
+bool begin()
 {
 	ensureLoaded();   // capture what THIS boot found before overwriting it
 	ramMask().store(0);
 	const Record r = make(Stage::Begun, 0, ++cache().seq);
-	if (!store(&r)) warn("could not record the reset start; an interrupted reset will not be reported");
+	if (store(&r)) return true;
+	// The reset still proceeds -- refusing to wipe secrets because the journal
+	// could not be written would be the worse failure. It is logged and counted.
+	writeFailures().fetch_add(1);
+	warn("could not record the reset start; an interrupted reset will not be reported");
+	return false;
 }
 
 void noteFailure(uint8_t mask)
@@ -222,11 +241,24 @@ void finish(uint8_t extraMask)
 	const uint8_t mask = static_cast<uint8_t>(ramMask().load() | extraMask);
 	if (mask == 0)
 	{
-		if (!store(nullptr)) warn("could not clear the reset journal; the next boot may report a stale incomplete reset");
+		if (!store(nullptr))
+		{
+			writeFailures().fetch_add(1);
+			warn("could not clear the reset journal; the next boot may report a stale incomplete reset");
+		}
 		return;
 	}
 	const Record r = make(Stage::Failed, mask, ++cache().seq);
-	if (!store(&r)) warn("could not record the failed reset");
+	if (!store(&r))
+	{
+		writeFailures().fetch_add(1);
+		warn("could not record the failed reset");
+	}
+}
+
+uint32_t writeFailureCount()
+{
+	return writeFailures().load();
 }
 
 BootStatus bootStatus()
@@ -272,6 +304,13 @@ void resetForTest()
 {
 	simulateRebootForTest();
 	s_hostHasRecord = false;
+	s_hostFailNextStore = false;
+	writeFailures().store(0);
+}
+
+void failNextWriteForTest()
+{
+	s_hostFailNextStore = true;
 }
 
 void corruptRecordForTest()

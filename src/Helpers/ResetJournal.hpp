@@ -60,7 +60,9 @@ namespace resetjournal
 		bool incomplete() const { return stage != Stage::None; }
 	};
 
-	void begin();
+	// False if the record could not be written (logged at WARN and counted in
+	// writeFailureCount()); the caller proceeds with the reset regardless.
+	bool begin();
 	void noteFailure(uint8_t mask);
 	void finish(uint8_t extraMask = 0);
 
@@ -69,6 +71,8 @@ namespace resetjournal
 	// WARN if the last reset was incomplete.
 	BootStatus bootStatus();
 	Storage storage();
+	// Journal writes that failed this boot (begin/finish), for /api/status.
+	uint32_t writeFailureCount();
 
 	const char* stageName(Stage s);
 	const char* storageName(Storage s);
@@ -81,5 +85,7 @@ namespace resetjournal
 	void resetForTest();
 	// Write raw bytes over the record (a torn or corrupt write).
 	void corruptRecordForTest();
+	// The next record write/erase fails, as a flash error would.
+	void failNextWriteForTest();
 #endif
 }

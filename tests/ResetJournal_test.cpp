@@ -105,3 +105,19 @@ TEST(ResetJournal, AnUnreadableRecordIsTreatedAsIncomplete)
 	EXPECT_TRUE(s.incomplete());
 	EXPECT_EQ(s.stage, resetjournal::Stage::Unreadable);
 }
+
+// #481 review: a journal that cannot be written must not stop the reset. begin()
+// says so and the failure is counted (/api/status "resetJournalWriteFailures");
+// finish() still runs normally afterwards.
+TEST(ResetJournal, AJournalWriteFailureIsCountedAndTheResetProceeds)
+{
+	Fresh f;
+	resetjournal::failNextWriteForTest();
+	EXPECT_FALSE(resetjournal::begin());
+	EXPECT_EQ(resetjournal::writeFailureCount(), 1u);
+	resetjournal::finish();
+	resetjournal::simulateRebootForTest();
+	EXPECT_FALSE(resetjournal::bootStatus().incomplete()) << "nothing was recorded, and the reset completed";
+
+	EXPECT_TRUE(resetjournal::begin()) << "a later write succeeds again";
+}
