@@ -135,6 +135,23 @@ public:
 	// keeping whatever was already playing rather than dropping every listener
 	// into silence because someone uploaded the wrong file.
 	bool loadClip(const std::string& path);
+	// True when the last loadClip() found a valid clip but REFUSED to hold it
+	// (#466): PSRAM exhausted on a PSRAM build, or over
+	// POCKETDIAL_CLIP_INTERNAL_MAX_BYTES on a build without PSRAM.
+	bool lastLoadRefused() const { return _lastLoadRefused.load(std::memory_order_relaxed); }
+
+	// ── Clip buffers (#466; shared with the voicemail greeting loader) ───────
+	// Where a clip of `bytes` may live. PSRAM builds: PSRAM only -- never
+	// internal DRAM, #328's binding constraint. No-PSRAM builds: internal,
+	// but only up to `internalCap`. Pure, so the policy is host-tested.
+	enum class ClipPlacement : uint8_t { Psram, Internal, RefusedOverCap };
+	static ClipPlacement clipPlacement(size_t bytes, bool havePsram, size_t internalCap);
+	// Allocates a clip buffer per clipPlacement() with this build's PSRAM and
+	// cap; nullptr -- and one more clipRefusals() -- if the policy refuses or
+	// the chosen region is exhausted. Free with heap_caps_free (device) /
+	// std::free (host), as before.
+	static uint8_t* allocClip(size_t bytes);
+	static uint32_t clipRefusals();
 
 	bool   isLoaded()   const { return _clipBytes.load(std::memory_order_acquire) > 0; }
 	size_t clipBytes()  const { return _clipBytes.load(std::memory_order_acquire); }
@@ -274,6 +291,7 @@ private:
 	// The clip. Owned here, freed on destruction / replacement.
 	uint8_t*            _clip = nullptr;
 	std::atomic<size_t> _clipBytes{0};
+	std::atomic<bool>   _lastLoadRefused{false};   // #466
 
 	// THE single cursor — the whole radio-station idea in one variable. Touched
 	// only by the pacing task.

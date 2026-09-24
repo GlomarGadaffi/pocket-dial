@@ -36,9 +36,10 @@
 // frames away. Trace the full call graph of anything new created with PD_TASK_STACK_CAPS before
 // assuming it is safe.
 //
-// Tasks created WithCaps MUST be deleted with vTaskDeleteWithCaps (including self-delete:
-// vTaskDeleteWithCaps(NULL)) so the PSRAM stack+TCB are reclaimed. Host builds get nothing (the
-// callers are all inside ESP_PLATFORM guards).
+// Create PSRAM-stack tasks with pd::createTaskPreferPsram() and delete them with pd::deleteTask()
+// (#466, below): the pair works on boards without PSRAM and picks vTaskDeleteWithCaps vs
+// vTaskDelete from where the stack actually is, so a PSRAM stack + TCB is always reclaimed. Host
+// builds get nothing (the callers are all inside ESP_PLATFORM guards).
 
 #if defined(ESP_PLATFORM) || defined(ESP32)
 #include <cassert>
@@ -67,6 +68,56 @@
 			"flash operation attempted from a PSRAM-stacked task (PD_TASK_STACK_CAPS) -- " \
 			"see PsramTask.hpp and issue #277"); \
 	} while (0)
+
+#include "sdkconfig.h"          // CONFIG_SPIRAM
+#include "esp_log.h"
+#include "PsramAllocator.hpp"   // psram::internalFallbacks() -- the one PSRAM-fallback counter
+
+namespace pd
+{
+	// Issue #466: create a task with its stack + TCB in PSRAM where the board has
+	// PSRAM, and an ordinary internal-stack task otherwise. Every PSRAM-stack
+	// task goes through here, because a bare xTaskCreate*WithCaps(PD_TASK_STACK_CAPS)
+	// simply FAILS on a board without PSRAM (esp32_constrained: CONFIG_SPIRAM=n)
+	// -- every such task silently never started there.
+	//   * No PSRAM configured: plain create, by design (not counted).
+	//   * PSRAM configured but the WithCaps create fails (PSRAM exhausted): falls
+	//     back to a plain create, COUNTED in psram::internalFallbacks() (/api/status
+	//     memory.psramFallbacks) and logged at WARN -- never silent.
+	// The same #273/#277 rule applies to anything created here: the task must
+	// never perform a flash operation itself, even transitively.
+	// Delete with pd::deleteTask(), which picks the matching delete call from
+	// where the stack actually is.
+	inline BaseType_t createTaskPreferPsram(TaskFunction_t fn, const char* name, uint32_t stackBytes,
+	                                        void* arg, UBaseType_t prio, TaskHandle_t* out,
+	                                        BaseType_t core = tskNO_AFFINITY)
+	{
+#if defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
+		if (xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg, prio, out, core,
+		                                    PD_TASK_STACK_CAPS) == pdPASS)
+			return pdPASS;
+		psram::internalFallbacks().fetch_add(1, std::memory_order_relaxed);
+		ESP_LOGW("PsramTask", "%s: no PSRAM for a %u B stack -- falling back to INTERNAL (#466)",
+		         name, static_cast<unsigned>(stackBytes));
+#endif
+		return xTaskCreatePinnedToCore(fn, name, stackBytes, arg, prio, out, core);
+	}
+
+	// Delete `task` (nullptr: the calling task) with the call that matches where
+	// its stack really lives: vTaskDeleteWithCaps for a PSRAM stack (reclaims the
+	// PSRAM stack + TCB), vTaskDelete for an internal one. Deciding from the
+	// stack's address rather than from how the task was meant to be created is
+	// what makes createTaskPreferPsram()'s fallback safe to delete -- the wrong
+	// call either asserts or leaks.
+	inline void deleteTask(TaskHandle_t task)
+	{
+		TaskHandle_t t = (task != nullptr) ? task : xTaskGetCurrentTaskHandle();
+		if (esp_ptr_external_ram(xTaskGetStackStart(t)))
+			vTaskDeleteWithCaps(task);
+		else
+			vTaskDelete(task);
+	}
+}
 #endif
 
 #endif // PD_PSRAM_TASK_HPP

@@ -28,13 +28,13 @@
 	#include "freertos/task.h"
 	#include "freertos/queue.h"
 	#include "freertos/semphr.h"
-	#include "freertos/idf_additions.h" // xTaskCreateWithCaps / vTaskDeleteWithCaps
+	#include "freertos/idf_additions.h" // pd::createTaskPreferPsram / pd::deleteTask (#466)
 	#include "esp_heap_caps.h"
 	#include "esp_timer.h"
 	#include "TimeSync.hpp"
 	#include "GoogleServiceAuth.hpp"
 	static const char* kTag = "SmtpClient";
-	#define PD_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+	#include "PsramTask.hpp"   // #466: pd::createTaskPreferPsram (was a private copy of PD_TASK_STACK_CAPS)
 #endif
 
 namespace SmtpClient
@@ -575,11 +575,11 @@ void init()
 	// PsramTask.hpp's rule. 12 KB matches the other "transient TLS worker"
 	// tasks that file documents (a crt-bundle handshake plus the streaming
 	// DATA writer wants the headroom).
-	BaseType_t created = xTaskCreateWithCaps(workerTaskFn, "smtp_worker", 12288, nullptr,
-	                                          4, &g_workerTask, PD_TASK_STACK_CAPS);
+	BaseType_t created = pd::createTaskPreferPsram(workerTaskFn, "smtp_worker", 12288, nullptr,
+	                                          4, &g_workerTask);
 	if (created != pdPASS)
 	{
-		ESP_LOGE(kTag, "xTaskCreateWithCaps failed -- email sending disabled");
+		ESP_LOGE(kTag, "smtp_worker task create failed -- email sending disabled");
 		g_workerTask = nullptr;
 	}
 }

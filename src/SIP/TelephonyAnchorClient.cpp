@@ -238,7 +238,7 @@ bool TelephonyAnchorClient::start()
 	// 4. #100: cold-prime EVERY call slot's POST TLS session (keep-alive) in the background so a
 	// cold-start concurrent burst RESUMES each per-call POST open instead of paying the S3's ~1s
 	// software ECDHE. One-shot, off this task. (GET stays cold per call — see prewarmAllSlots.)
-	if (xTaskCreateWithCaps(&TelephonyAnchorClient::prewarmTaskTrampoline, "tel_prewarm", 6144, this, 4, nullptr, PD_TASK_STACK_CAPS) != pdPASS)
+	if (pd::createTaskPreferPsram(&TelephonyAnchorClient::prewarmTaskTrampoline, "tel_prewarm", 6144, this, 4, nullptr) != pdPASS)
 	{
 		ESP_LOGW(TAG, "start: failed to spawn slot pre-warm worker (first concurrent burst pays cold handshakes)");
 	}
@@ -1809,7 +1809,7 @@ void TelephonyAnchorClient::prewarmTaskTrampoline(void* arg)
 {
 	auto* self = static_cast<TelephonyAnchorClient*>(arg);
 	self->prewarmAllSlots();
-	vTaskDeleteWithCaps(nullptr);
+	pd::deleteTask(nullptr);
 }
 
 void TelephonyAnchorClient::prewarmAllSlots()
@@ -2212,8 +2212,8 @@ bool TelephonyAnchorClient::startWsWorkers()
 		// TLS HTTP the WS task used to carry. Unpinned so the scheduler keeps it off the SIP core.
 		// #100: stack in PSRAM (WithCaps) — with kWsWorkers>1 for concurrent setup, N*12 KB would
 		// otherwise eat internal RAM. TLS I/O only (no flash writes) → PSRAM-safe; self-deletes WithCaps.
-		if (xTaskCreateWithCaps(&TelephonyAnchorClient::wsWorkerTrampoline, "tel_wsw", 12288, this, 4,
-		                &_wsWorkerHandles[i], PD_TASK_STACK_CAPS) != pdPASS)
+		if (pd::createTaskPreferPsram(&TelephonyAnchorClient::wsWorkerTrampoline, "tel_wsw", 12288, this, 4,
+		                &_wsWorkerHandles[i]) != pdPASS)
 		{
 			ESP_LOGE(TAG, "startWsWorkers: xTaskCreate worker %d failed (heap?)", i);
 			_wsWorkerHandles[i] = nullptr;
@@ -2268,7 +2268,7 @@ void TelephonyAnchorClient::wsWorkerTrampoline(void* arg)
 	auto* self = static_cast<TelephonyAnchorClient*>(arg);
 	self->runWsWorker();
 	if (self->_wsWorkerDoneSem) xSemaphoreGive(self->_wsWorkerDoneSem);   // released BEFORE delete
-	vTaskDeleteWithCaps(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
+	pd::deleteTask(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
 }
 
 void TelephonyAnchorClient::runWsWorker()
@@ -2807,7 +2807,7 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 	// #100: stack in PSRAM (WithCaps) — N concurrent calls' GET-rx tasks would otherwise exhaust
 	// internal RAM. The task does HTTPS GET reads + the audio rx callback only (no flash writes),
 	// so a PSRAM stack is safe. Force-kill + self-exit both use vTaskDeleteWithCaps.
-	BaseType_t rc = xTaskCreatePinnedToCoreWithCaps(&TelephonyAnchorClient::rxTaskTrampoline, "tel_media_rx", 6144, arg, 6, &slot->rxTaskHandle, 1, PD_TASK_STACK_CAPS);
+	BaseType_t rc = pd::createTaskPreferPsram(&TelephonyAnchorClient::rxTaskTrampoline, "tel_media_rx", 6144, arg, 6, &slot->rxTaskHandle, 1);
 	if (rc != pdPASS)
 	{
 		ESP_LOGE(TAG, "Failed to create Rx task for %s", participantId.c_str());
@@ -2994,7 +2994,7 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 			if (xSemaphoreTake(doneSem, pdMS_TO_TICKS(2000)) != pdTRUE)
 			{
 				ESP_LOGE(TAG, "Rx task failed to exit in time! Forcing task deletion.");
-				vTaskDeleteWithCaps(taskToKill);   // #100: rx task is WithCaps(PSRAM) — reclaim its stack
+				pd::deleteTask(taskToKill);   // #100: rx task is WithCaps(PSRAM) — reclaim its stack
 				// try_lock: if the deleted task was holding getMutex when killed, the mutex is
 				// permanently poisoned and a blocking lock_guard would deadlock here.
 				if (slot->getMutex.try_lock())
@@ -3070,7 +3070,7 @@ void TelephonyAnchorClient::rxTaskTrampoline(void* arg)
 	{
 		xSemaphoreGive(slot->rxDoneSem);
 	}
-	vTaskDeleteWithCaps(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
+	pd::deleteTask(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
 }
 
 void TelephonyAnchorClient::runRxLoop(CallSlot* slot)

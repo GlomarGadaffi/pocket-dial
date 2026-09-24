@@ -19,6 +19,8 @@
 // live on both platforms and can be asserted by a host test rather than only
 // eyeballed on hardware.
 #include "DmaFramePool.hpp"
+#include "HoldMusic.hpp"       // Issue #466: clipRefusals() on /api/status
+#include "PsramAllocator.hpp"  // Issue #466: psram::internalFallbacks() on /api/status
 #include "index_html.h"
 #include "IPHelper.hpp"
 #include "UrlEncode.hpp"
@@ -1761,6 +1763,18 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << ",\"mohSockErrors\":";
 	if (mohSockErr < 0) json << "null"; else json << mohSockErr;
 	json << "}";
+
+	// Issue #466: memory placement. clipRefusals counts clip buffers refused
+	// (PSRAM short on a PSRAM board, or over POCKETDIAL_CLIP_INTERNAL_MAX_BYTES
+	// on one without); the two flags say which clip is now absent -- MoH plays
+	// silence, deposits record without a greeting. psramFallbacks counts
+	// PSRAM-preferred buffers (the jitter rings) that PSRAM could not hold and
+	// internal DRAM had to -- always 0 on a board without PSRAM.
+	json << ",\"memory\":{\"clipRefusals\":" << HoldMusic::clipRefusals()
+	     << ",\"mohClipRefused\":" << ((handler && handler->holdMusicClipRefused()) ? "true" : "false")
+	     << ",\"greetingRefused\":" << ((handler && handler->voicemailGreetingRefused()) ? "true" : "false")
+	     << ",\"psramFallbacks\":" << psram::internalFallbacks().load(std::memory_order_relaxed)
+	     << "}";
 
 	json << "}";
 

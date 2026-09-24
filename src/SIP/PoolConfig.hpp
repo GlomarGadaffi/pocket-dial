@@ -213,10 +213,9 @@
 // implementation -- so raising this is safe once that port lands. It is
 // deliberately NOT raised in that same pass: more slots multiply socket count
 // (see the sdkconfig.defaults CONFIG_LWIP_MAX_SOCKETS note), per-call task-stack
-// footprint (12 KB PSRAM x kWsWorkers; 6 KB INTERNAL RAM x N media-rx tasks --
-// RtpReceiver.cpp/RtpSender.cpp both use plain xTaskCreatePinnedToCore, not
-// PSRAM, despite PsramTask.hpp's name -- corrected here, found while sizing
-// POCKETDIAL_MAX_VOICEMAIL_LEGS below, which hits the same tasks), and proving
+// footprint (12 KB PSRAM x kWsWorkers; per media leg, 6 KB PSRAM for
+// rtp_media_rx since #466 plus 6 KB INTERNAL RAM for rtp_media_tx, which stays
+// internal because the W5500 driver runs on it -- see RtpSender.cpp), and proving
 // the single-call path end-to-end on real hardware is its own verification
 // pass before concurrency is added on top.
 // RAISED 1 -> 4. Both conditions the paragraph above set for this are now met:
@@ -267,8 +266,8 @@
 // than one call at a time per leg. Each leg owns its own RtpReceiver/RtpSender
 // pair, the same per-leg RTP-task cost as a conference leg or anchor bridge
 // (POCKETDIAL_CONF_LEGS / POCKETDIAL_MAX_ANCHOR_CALLS above) -- 2 x 6144B of
-// task stack in INTERNAL RAM per leg (RtpReceiver.cpp/RtpSender.cpp both use
-// plain xTaskCreatePinnedToCore, not PSRAM, despite PsramTask.hpp's name).
+// task stack per leg: rtp_media_rx's in PSRAM since #466, rtp_media_tx's in
+// INTERNAL RAM (the W5500 driver runs on it; see RtpSender.cpp).
 //
 // Fixed at 2, deliberately small: each leg ALSO holds a PSRAM recording
 // buffer sized to the per-message duration cap (see VoicemailLeg.hpp), so
@@ -290,6 +289,17 @@
 // frame, triggering handset Packet Loss Concealment (PLC) without stalling tasks.
 #ifndef POCKETDIAL_DMA_FRAME_POOL_SIZE
 #define POCKETDIAL_DMA_FRAME_POOL_SIZE 6
+#endif
+
+// Issue #466 (decision recorded on #466): the largest music-on-hold clip or
+// voicemail greeting a board WITHOUT PSRAM may hold in internal DRAM. PSRAM
+// builds ignore it -- their clips are PSRAM-only, refused rather than ever
+// spilled into internal RAM. 16 KB is 2 s of 8 kHz mu-law; a longer clip is
+// refused and counted (clipRefusals / mohClipRefused / greetingRefused on
+// /api/status). Loaded only at boot or on an admin upload, never at call time.
+// Set explicitly by main/CMakeLists.txt's SIP_CONSTRAINED block.
+#ifndef POCKETDIAL_CLIP_INTERNAL_MAX_BYTES
+#define POCKETDIAL_CLIP_INTERNAL_MAX_BYTES 16384
 #endif
 
 // Max single voicemail message duration. 90s of 8kHz mu-law (1 byte/sample)

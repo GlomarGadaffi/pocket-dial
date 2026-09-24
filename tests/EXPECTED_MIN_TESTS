@@ -7,4 +7,5 @@
 #
 # Set to the count on main @ 5f5f0b1 (after #394's CoreDumpHttp tests):
 # 1244 tests from 173 suites.
-1244
+# Set by #466 PR A (+5 tests) on main @ e2d00c5 (1254): 1259 tests.
+1259

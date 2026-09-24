@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #235: rtp_media_rx TWDT subscription
+#include "PsramTask.hpp"     // Issue #466: pd::createTaskPreferPsram / pd::deleteTask
 #endif
 
 namespace
@@ -552,7 +553,17 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	// (one above the udp_receiver/SIP task at 5) so inbound media is not starved by
 	// signaling bursts. Handle is nullptr: the task self-manages its lifecycle via
 	// _stopRequested / _taskRunning, so we never store (and race on) a TaskHandle_t.
-	BaseType_t ok = xTaskCreatePinnedToCore(
+	//
+	// Issue #466: the stack (6 KB per stream -- one per bridged leg, conference
+	// leg, voicemail leg, trunk leg) lives in PSRAM, not internal DRAM. Audited
+	// safe under the #273 rule: nothing reachable from this task writes flash --
+	// every sink hands off (DTMF -> _dtmfInbox, drained on the SIP task;
+	// voicemail -> a PSRAM buffer, flushed to /sdcard (SDSPI) by vm_archive; CDR
+	// -> cdr_persist's queue), and its only transmit, sendRaw(), is a sendto()
+	// whose Ethernet work runs on the tcpip task (LWIP_TCPIP_CORE_LOCKING is
+	// off), never on this stack. Falls back to internal, counted, where PSRAM
+	// is short or absent (pd::createTaskPreferPsram).
+	BaseType_t ok = pd::createTaskPreferPsram(
 		&RtpReceiver::taskTrampoline,
 		"rtp_media_rx",
 		6144,   // headroom for lwIP recvfrom() + sink callback (decode is in-place)
@@ -563,7 +574,7 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 
 	if (ok != pdPASS)
 	{
-		ESP_LOGE("RtpReceiver", "xTaskCreatePinnedToCore failed");
+		ESP_LOGE("RtpReceiver", "rtp_media_rx task create failed");
 		close(_sock);
 		_sock = -1;
 		clearSlotLocked();
@@ -609,7 +620,7 @@ void RtpReceiver::taskTrampoline(void* arg)
 	// Clearing _taskRunning is the LAST access to `self`: after this the destructor
 	// may observe the task as gone and allow the object to be destroyed.
 	self->_taskRunning.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
+	pd::deleteTask(nullptr);   // #466: vTaskDeleteWithCaps for a PSRAM stack, vTaskDelete otherwise
 }
 
 void RtpReceiver::runLoop()

@@ -862,6 +862,10 @@ public:
 
 	// Dashboard/status accessors.
 	bool     holdMusicLoaded()  const { return _holdMusic.isLoaded(); }
+	// Issue #466: a valid clip that was refused a buffer (see HoldMusic::
+	// allocClip) -- MoH is then silence, the greeting absent.
+	bool     holdMusicClipRefused()     const { return _holdMusic.lastLoadRefused(); }
+	bool     voicemailGreetingRefused() const { return _greetingRefused.load(std::memory_order_relaxed); }
 	unsigned holdMusicSeconds() const { return _holdMusic.clipSeconds(); }
 	unsigned holdMusicListeners() const { return _holdMusic.listenerCount(); }
 	// Issue #328: L2-bypass vs socket-fallback health for the hold-music
@@ -1789,6 +1793,7 @@ private:
 	// correct default: the constructor's own loadVoicemailGreeting() call is
 	// the only OTHER writer, and that path always heap-allocates.
 	bool _vmGreetingClipOwned = true;
+	std::atomic<bool> _greetingRefused{false};   // #466: valid greeting, refused a buffer
 	void loadVoicemailGreeting();
 
 	// The boot-selected provider TYPE (cached alongside _anchorClient itself —
