@@ -9,11 +9,10 @@ namespace FactoryReset
 	bool eraseStoredSecrets()
 	{
 		bool ok = true;
-		// save() always replaces every field -- its documented contract; the
-		// "empty means keep" policy belongs to the HTTP route, not the store --
-		// so a default Config overwrites smtp_pass, gsa_key and smtp_ca_pem.
-		// Same mechanism the route already uses for TrunkConfigStore.
-		ok &= EmailConfigStore::save(EmailConfigStore::Config{});
+		// clear(), not save(Config{}): erasing each key does not depend on a
+		// zero-length nvs_set_blob succeeding for gsa_key, and save()'s chain
+		// would stop at the first failure with the private key still in flash.
+		ok &= EmailConfigStore::clear();
 		ok &= SipSecretStore::clearAll();
 		// Erased unconditionally, with no query() first: before #405's cache,
 		// query() is itself a deep flash probe, and this runs on a 4 KB
