@@ -21,6 +21,7 @@ namespace CoreDumpStore
 #if defined(ESP_PLATFORM) && CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
 
 #include <cstdio>
+#include <mutex>
 
 #include "esp_core_dump.h"
 #include "esp_flash.h"
@@ -60,28 +61,53 @@ namespace CoreDumpStore
 		return info;
 	}
 
+	namespace
+	{
+		std::mutex g_summaryMutex;
+		Summary g_summary;   // valid only while g_summaryPrimed
+		bool g_summaryPrimed = false;
+	}
+
+	void prime()
+	{
+		// Runs once from HttpServer::start() on the 8 KB http_server_task (or
+		// the display build's main task), NEVER on a 4 KB per-connection thread:
+		// the checksum walk holds a SHA-256 context and a read cache on the
+		// stack, get_summary() adds a few hundred bytes more, and those
+		// connection threads have measured as little as 472 bytes free (#405).
+		// A dump cannot change while the app runs (only a panic writes one),
+		// so computing it once per boot loses nothing.
+		Summary out;
+		if (query().present)
+		{
+			out.valid = (esp_core_dump_image_check() == ESP_OK);
+
+			esp_core_dump_summary_t s{};
+			if (esp_core_dump_get_summary(&s) == ESP_OK)
+			{
+				s.exc_task[sizeof(s.exc_task) - 1] = '\0';
+				out.task = s.exc_task;
+				out.pc = s.exc_pc;
+				s.app_elf_sha256[sizeof(s.app_elf_sha256) - 1] = '\0';
+				out.elfSha = reinterpret_cast<const char*>(s.app_elf_sha256);
+			}
+			char reason[128] = {};
+			if (esp_core_dump_get_panic_reason(reason, sizeof(reason)) == ESP_OK)
+			{
+				reason[sizeof(reason) - 1] = '\0';
+				out.reason = reason;
+			}
+		}
+		std::lock_guard<std::mutex> lock(g_summaryMutex);
+		g_summary = std::move(out);
+		g_summaryPrimed = true;
+	}
+
 	Summary summary()
 	{
-		Summary out;
-		if (!query().present) return out;
-		out.valid = (esp_core_dump_image_check() == ESP_OK);
-
-		esp_core_dump_summary_t s{};
-		if (esp_core_dump_get_summary(&s) == ESP_OK)
-		{
-			s.exc_task[sizeof(s.exc_task) - 1] = '\0';
-			out.task = s.exc_task;
-			out.pc = s.exc_pc;
-			s.app_elf_sha256[sizeof(s.app_elf_sha256) - 1] = '\0';
-			out.elfSha = reinterpret_cast<const char*>(s.app_elf_sha256);
-		}
-		char reason[128] = {};
-		if (esp_core_dump_get_panic_reason(reason, sizeof(reason)) == ESP_OK)
-		{
-			reason[sizeof(reason) - 1] = '\0';
-			out.reason = reason;
-		}
-		return out;
+		// Copies the boot-time result; does no flash or checksum work itself.
+		std::lock_guard<std::mutex> lock(g_summaryMutex);
+		return g_summaryPrimed ? g_summary : Summary{};
 	}
 
 	bool read(uint32_t offset, uint8_t* out, size_t len)
@@ -96,7 +122,13 @@ namespace CoreDumpStore
 
 	bool erase()
 	{
-		return esp_core_dump_image_erase() == ESP_OK;
+		const bool ok = esp_core_dump_image_erase() == ESP_OK;
+		if (ok)
+		{
+			std::lock_guard<std::mutex> lock(g_summaryMutex);
+			g_summary = Summary{};
+		}
+		return ok;
 	}
 }
 
@@ -106,6 +138,7 @@ namespace CoreDumpStore
 namespace CoreDumpStore
 {
 	Info query() { return Info{}; }
+	void prime() {}
 	Summary summary() { return Summary{}; }
 	bool read(uint32_t, uint8_t*, size_t) { return false; }
 	bool erase() { return false; }
@@ -129,6 +162,10 @@ namespace CoreDumpStore
 		std::lock_guard<std::mutex> lock(g_mutex);
 		g_image = std::move(image);
 	}
+
+	// Host threads have MB-sized stacks and the fake needs no checksum walk, so
+	// summary() below computes directly; there is nothing to cache.
+	void prime() {}
 
 	// Host stand-in for the 16MB table's 128KB partition.
 	constexpr uint32_t kFakePartitionSize = 0x20000;

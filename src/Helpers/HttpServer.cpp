@@ -199,6 +199,14 @@ void HttpServer::start()
 
 void HttpServer::acceptLoop()
 {
+	// Issue #382: checksum + summarise any stored coredump ONCE, here -- this
+	// thread runs on the 8192-byte pthread default (it never resizes itself,
+	// see below), unlike the 4 KB per-connection threads /api/coredump/info is
+	// served on (#405 measured those down to 472 bytes free). start() itself
+	// is the wrong place: the display build calls it from app_main's 3.5 KB
+	// stack. Costs the first accept one checksum walk over at most 128 KB.
+	CoreDumpStore::prime();
+
 #if defined(ESP_PLATFORM)
 	// Issue #366. esp_pthread_set_cfg() applies to threads created BY THE
 	// CALLING THREAD, and this one creates nothing except the per-connection

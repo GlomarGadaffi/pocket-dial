@@ -45,7 +45,11 @@ namespace CoreDumpStore
 	// the ELF magic must also sit at byte 12. `head` is the first 16 bytes.
 	bool looksLikeDump(const uint8_t* head, size_t headLen, uint32_t storedSize,
 		uint32_t partitionSize);
-	// Verifies the checksum over the whole image, so only on an explicit request.
+	// Verifies the checksum and parses the dump ONCE, on the caller's stack --
+	// call it from a task with stack to spare (HttpServer::start() does, on the
+	// 8 KB http_server_task), never from a 4 KB per-connection thread.
+	void prime();
+	// The result prime() cached; no flash work. Empty until prime() has run.
 	Summary summary();
 	// Copies [offset, offset + len) of the stored image. False on any bounds or
 	// flash error, never a partial copy.
