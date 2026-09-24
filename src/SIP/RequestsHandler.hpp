@@ -949,11 +949,13 @@ private:
 	// result.
 
 	// Build a NOTIFY (Event: refer) carrying a message/sipfrag body reporting the
-	// transfer result back to the transferor. Caller holds _mutex.
+	// transfer result back to the transferor. Caller holds _mutex. `cseq`: same
+	// rule as buildServerBye's -- above everything already used on the dialog (#402).
 	std::shared_ptr<SipMessage> buildReferNotify(const std::shared_ptr<SipMessage>& refer,
 		const std::shared_ptr<SipClient>& transferor,
 		const std::string& sipfrag,
-		bool terminated);
+		bool terminated,
+		uint32_t cseq = 2);
 
 	// Attended transfer (RFC 3891 Replaces), issue #131: onRefer() splices two live
 	// P2P sessions (A-B and A-C) into one B-C call via cross re-INVITEs carrying
@@ -1545,11 +1547,15 @@ private:
 		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody);
 	// Build a server-initiated in-dialog BYE. From/To must include tags because the
 	// dialog role differs per call path (beep = server UAC; park = server UAS).
-	// `cseq` must exceed any request the server already sent on this dialog
-	// (Session::nextServerCSeq(), #389); 2 is only right when it has sent none.
+	// `cseq` must exceed every CSeq already used on this dialog, by either party or
+	// the server (Session::nextServerCSeq(), #389/#402); 2 is right only when none is known.
 	std::shared_ptr<SipMessage> buildServerBye(const std::string& destExt,
 		const sockaddr_in& destAddr, const std::string& callId,
 		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2);
+
+	// Issue #402: record a request's CSeq on its dialog's session, if it has one
+	// and `source` is a party on it. Caller holds _mutex.
+	void noteDialogCSeq(const std::string& callID, uint32_t cseq, const sockaddr_in& source);
 
 	// Verify that the in-dialog request comes from a peer recorded at dialog setup
 	// (source IP match). Returns false → respond 403 Forbidden. Caller holds _mutex.

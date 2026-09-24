@@ -76,6 +76,19 @@ TEARDOWN_RX = r"Processing incoming message: Request msg BYE|Call \d+ is DISCONN
 # peer. Same pattern sc_attended_transfer already uses for its splice check.
 REINVITE_RX = r"Received Request msg INVITE|RX .*INVITE"
 
+# ...and that UA ACCEPTING it: its 200 on the wire. Arrival alone proves nothing
+# -- #402's splice re-INVITEs arrived on every run and were 500'd.
+ACCEPTED_REINVITE_RX = r"TX \d+ bytes Response msg 200/INVITE"
+
+# A UA refusing something the PBX sent it: any 5xx it transmitted. #389/#402's
+# requests were refused this way ("500 Invalid CSeq") while the checks passed.
+REFUSAL_RX = r"TX \d+ bytes Response msg 5\d\d/"
+
+
+def refusals(*marked):
+    """Names of the UAs that sent a 5xx since their mark: [(ua, mark), ...]."""
+    return [ua.name for ua, m in marked if re.search(REFUSAL_RX, ua.log_since(m))]
+
 
 # --------------------------------------------------------------------------
 # small helpers
@@ -563,18 +576,23 @@ def sc_blind_transfer(env):
     # B must be MOVED, not merely left alive. "No teardown seen" alone would
     # also pass a PBX that 202s the REFER, drops A, INVITEs C and then simply
     # forgets B -- B would sit CONFIRMED on a dead leg, untorn and unmoved.
-    # The re-INVITE is the positive evidence that B was actually re-pointed.
-    b_reinvited = b.wait_log(REINVITE_RX, 8, mb2) is not None
+    # B ACCEPTING the swap re-INVITE is the positive evidence it was re-pointed.
+    b_reinvited = b.wait_log(ACCEPTED_REINVITE_RX, 8, mb2) is not None
     # Checked last, and only as "no teardown seen": a pass costs the full
     # timeout, which is why it is not first.
     b_torn = b.wait_log(TEARDOWN_RX, 6, mb2) is not None
     for ua in (a, b, c):
         ua.hangup_all()
-    ok = accepted and a_torn and c_invited and b_reinvited and not b_torn
+    # #402: A's own BYE (after the NOTIFY) ends A's leg whatever the PBX sends,
+    # so "dropped" can't see a refused server BYE -- this does. Checked after
+    # cleanup so the PBX's teardown BYEs are covered too.
+    time.sleep(1.0)
+    refused = refusals((a, ma2), (b, mb2), (c, mc2))
+    ok = accepted and a_torn and c_invited and b_reinvited and not b_torn and not refused
     return report("blind_transfer", "OK" if ok else "FAIL",
                   "202 to REFER=%s, transferor dropped=%s, target INVITEd=%s, "
-                  "transferee re-INVITEd=%s, transferee survived=%s"
-                  % (accepted, a_torn, c_invited, b_reinvited, not b_torn))
+                  "transferee accepted re-INVITE=%s, transferee survived=%s, 5xx from=%s"
+                  % (accepted, a_torn, c_invited, b_reinvited, not b_torn, refused or "none"))
 
 
 def sc_attended_transfer(env):
@@ -601,14 +619,20 @@ def sc_attended_transfer(env):
     # A-B dialog, so B and C end up talking to each other.
     a.cmd("call transfer_replaces %d" % ab_id, 3.5)
     accepted = a.wait_log(r"202 Accepted|202/REFER", 8, ma3) is not None
-    b_spliced = b.wait_log(r"Received Request msg INVITE|RX .*INVITE", 8, mb2) is not None
-    c_spliced = c.wait_log(r"Received Request msg INVITE|RX .*INVITE", 8, mc2) is not None
+    # #402: each side must ACCEPT its splice re-INVITE. Arrival passed for every
+    # run while B 500'd its re-INVITE and was never connected to C.
+    b_spliced = b.wait_log(ACCEPTED_REINVITE_RX, 8, mb2) is not None
+    c_spliced = c.wait_log(ACCEPTED_REINVITE_RX, 8, mc2) is not None
     for ua in (a, b, c):
         ua.hangup_all()
-    ok = accepted and b_spliced and c_spliced
+    # After cleanup: the bridge's teardown BYE to the surviving side only goes
+    # out when the other side hangs up here, and it was 500'd too.
+    time.sleep(1.0)
+    refused = refusals((a, ma3), (b, mb2), (c, mc2))
+    ok = accepted and b_spliced and c_spliced and not refused
     return report("attended_transfer", "OK" if ok else "FAIL",
-                  "202 to REFER=%s, B re-INVITEd=%s, C re-INVITEd=%s"
-                  % (accepted, b_spliced, c_spliced))
+                  "202 to REFER=%s, B accepted splice=%s, C accepted splice=%s, 5xx from=%s"
+                  % (accepted, b_spliced, c_spliced, refused or "none"))
 
 
 def sc_park_retrieve(env):

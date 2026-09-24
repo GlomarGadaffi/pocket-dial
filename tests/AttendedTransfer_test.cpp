@@ -699,3 +699,83 @@ TEST(AttendedTransfer, SpliceHandlesBothLegsAAsCallee)
 	EXPECT_NE(invToC.find("c=IN IP4 192.168.40.20"), std::string::npos)
 		<< "C's re-INVITE must carry B's real (offered) SDP, not A's own answer:\n" << invToC;
 }
+
+// Issue #402: the flow pjsua (and RFC 5589) actually uses. A holds B with a
+// re-INVITE, consults C, then REFERs on the CONSULT dialog with Replaces naming
+// the held A-B one. The held dialog's splice re-INVITE used to be "its setup
+// INVITE's CSeq + 1" -- exactly the hold re-INVITE's CSeq -- so B answered 500
+// Invalid CSeq on every interop run and was never connected to C. Every
+// server-built request on each dialog must go above what that dialog carried.
+TEST(AttendedTransfer, ReferOnConsultDialogSplicesAboveTheHoldReinviteCSeq)
+{
+	Rig rig;
+	setUpSplicedCalls(rig);   // A-B and A-C both set up at CSeq 1
+
+	auto cseqOf = [](const std::string& raw) -> long {
+		const auto at = raw.find("CSeq: ");
+		return at == std::string::npos ? -1 : std::stol(raw.substr(at + 6));
+	};
+
+	// A holds B: an in-dialog re-INVITE on A-B at CSeq 2, relayed to B untouched.
+	{
+		std::string body = sdpBody("192.168.40.10", 10000) + "a=sendonly\r\n";
+		std::string raw =
+			"INVITE sip:106@192.168.40.20:5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 192.168.40.10:5060;branch=z9hG4bKhold\r\n"
+			"From: <sip:100@server>;tag=abtag\r\n"
+			"To: <sip:106@server>;tag=btag\r\n"
+			"Call-ID: " + rig.abCallId + "\r\n"
+			"CSeq: 2 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:100@192.168.40.10:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		rig.handler->handle(RequestsHandler::getMessageFromPool(raw, rig.aAddr));
+	}
+	const std::string holdToB = findSentTo(rig.sent, rig.bAddr, "Call-ID: " + rig.abCallId);
+	ASSERT_FALSE(holdToB.empty()) << "the hold re-INVITE must be relayed to B";
+	const long holdCSeq = cseqOf(holdToB);
+	ASSERT_EQ(holdCSeq, 2);
+
+	// A REFERs on the CONSULT dialog (A-C) at CSeq 2: Refer-To B, Replaces=A-B.
+	rig.sent.clear();
+	{
+		std::string raw =
+			"REFER sip:107@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 192.168.40.10:5060;branch=z9hG4bKrefc\r\n"
+			"From: <sip:100@server>;tag=actag\r\n"
+			"To: <sip:107@server>;tag=ctag\r\n"
+			"Call-ID: " + rig.acCallId + "\r\n"
+			"CSeq: 2 REFER\r\n"
+			"Max-Forwards: 70\r\n"
+			"Refer-To: <sip:106@server?Replaces=" + rig.abCallId +
+				"%3Bfrom-tag%3Dabtag%3Bto-tag%3Dbtag>\r\n"
+			"Contact: <sip:100@192.168.40.10:5060>\r\n"
+			"Content-Length: 0\r\n\r\n";
+		rig.handler->handle(RequestsHandler::getMessageFromPool(raw, rig.aAddr));
+	}
+	ASSERT_FALSE(findSentTo(rig.sent, rig.aAddr, "202 Accepted").empty())
+		<< "the splice must be accepted";
+
+	// B's splice re-INVITE travels on the HELD dialog and must go above the hold.
+	ASSERT_EQ(countContaining(rig.sent, rig.bAddr, "Call-ID: " + rig.abCallId), 1u)
+		<< "exactly one splice re-INVITE to B";
+	const std::string spliceToB = findSentTo(rig.sent, rig.bAddr, "Call-ID: " + rig.abCallId);
+	ASSERT_EQ(spliceToB.rfind("INVITE sip:", 0), 0u) << spliceToB;
+	EXPECT_GT(cseqOf(spliceToB), holdCSeq)
+		<< "splice re-INVITE CSeq " << cseqOf(spliceToB) << " must exceed the hold re-INVITE's "
+		<< holdCSeq << " -- B answers 500 Invalid CSeq otherwise";
+
+	// C's splice re-INVITE travels on the consult dialog and must go above A's REFER.
+	const std::string spliceToC = findSentTo(rig.sent, rig.cAddr, "INVITE sip:");
+	ASSERT_FALSE(spliceToC.empty());
+	EXPECT_GT(cseqOf(spliceToC), 2) << "must exceed the REFER's CSeq on the consult dialog";
+
+	// Everything the server sends A on each dialog goes above what that dialog carried.
+	const std::string byeAonAB = findSentToBoth(rig.sent, rig.aAddr, "BYE sip:", "Call-ID: " + rig.abCallId);
+	const std::string byeAonAC = findSentToBoth(rig.sent, rig.aAddr, "BYE sip:", "Call-ID: " + rig.acCallId);
+	ASSERT_FALSE(byeAonAB.empty());
+	ASSERT_FALSE(byeAonAC.empty());
+	EXPECT_GT(cseqOf(byeAonAB), holdCSeq);
+	EXPECT_GT(cseqOf(byeAonAC), 2);
+}
