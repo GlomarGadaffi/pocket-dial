@@ -25,13 +25,14 @@ namespace CoreDumpStore
 		uint32_t size = 0;        // bytes, as stored (raw flash image)
 	};
 
+	// Fixed-size, so caching and copying it never touches the heap.
 	struct Summary
 	{
 		bool valid = false;       // stored checksum verified
-		std::string task;         // name of the task that panicked
+		char task[16] = {};       // name of the task that panicked
 		uint32_t pc = 0;          // its program counter
-		std::string elfSha;       // SHA-256 prefix of the ELF that produced it
-		std::string reason;       // panic reason, e.g. "LoadProhibited"
+		char elfSha[17] = {};     // SHA-256 prefix of the ELF that produced it
+		char reason[64] = {};     // panic reason, e.g. "LoadProhibited"
 	};
 
 	// Cheap: reads only the first 16 bytes. Safe on the ungated status route.

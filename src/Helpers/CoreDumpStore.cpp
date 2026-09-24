@@ -1,5 +1,6 @@
 #include "CoreDumpStore.hpp"
 
+#include <cstdio>
 #include <cstring>
 
 namespace CoreDumpStore
@@ -70,13 +71,14 @@ namespace CoreDumpStore
 
 	void prime()
 	{
-		// Runs once from HttpServer::start() on the 8 KB http_server_task (or
-		// the display build's main task), NEVER on a 4 KB per-connection thread:
-		// the checksum walk holds a SHA-256 context and a read cache on the
-		// stack, get_summary() adds a few hundred bytes more, and those
-		// connection threads have measured as little as 472 bytes free (#405).
-		// A dump cannot change while the app runs (only a panic writes one),
-		// so computing it once per boot loses nothing.
+		// Runs once from HttpServer::acceptLoop (8 KB pthread stack) before the
+		// first accept, NEVER on a 4 KB per-connection thread: the checksum walk
+		// holds a SHA-256 context and a read cache on the stack, get_summary()
+		// adds a few hundred bytes more, and those connection threads have
+		// measured as little as 472 bytes free (#405). A dump cannot change
+		// while the app runs (only a panic writes one), so once per boot loses
+		// nothing. Nothing here allocates except inside IDF's get_summary(),
+		// which maps the partition -- init-time, before the server serves.
 		Summary out;
 		if (query().present)
 		{
@@ -85,21 +87,19 @@ namespace CoreDumpStore
 			esp_core_dump_summary_t s{};
 			if (esp_core_dump_get_summary(&s) == ESP_OK)
 			{
-				s.exc_task[sizeof(s.exc_task) - 1] = '\0';
-				out.task = s.exc_task;
+				std::snprintf(out.task, sizeof(out.task), "%.*s",
+					static_cast<int>(sizeof(s.exc_task)), s.exc_task);
 				out.pc = s.exc_pc;
-				s.app_elf_sha256[sizeof(s.app_elf_sha256) - 1] = '\0';
-				out.elfSha = reinterpret_cast<const char*>(s.app_elf_sha256);
+				std::snprintf(out.elfSha, sizeof(out.elfSha), "%.*s",
+					static_cast<int>(sizeof(s.app_elf_sha256)),
+					reinterpret_cast<const char*>(s.app_elf_sha256));
 			}
-			char reason[128] = {};
-			if (esp_core_dump_get_panic_reason(reason, sizeof(reason)) == ESP_OK)
-			{
-				reason[sizeof(reason) - 1] = '\0';
-				out.reason = reason;
-			}
+			if (esp_core_dump_get_panic_reason(out.reason, sizeof(out.reason)) != ESP_OK)
+				out.reason[0] = '\0';
+			out.reason[sizeof(out.reason) - 1] = '\0';
 		}
 		std::lock_guard<std::mutex> lock(g_summaryMutex);
-		g_summary = std::move(out);
+		g_summary = out;
 		g_summaryPrimed = true;
 	}
 
@@ -192,7 +192,7 @@ namespace CoreDumpStore
 		Summary out;
 		if (!presentLocked()) return out;
 		out.valid = true;
-		out.task = "host_test";
+		std::snprintf(out.task, sizeof(out.task), "%s", "host_test");
 		return out;
 	}
 

@@ -42,7 +42,7 @@
 #include "JsonReader.hpp"    // strict, dependency-free JSON reader for /api/config/import
 #include <cctype>
 #include <cstdlib>
-#include <memory>
+#include <mutex>
 #include <cstring>
 #include <sstream>
 #include <iostream>
@@ -2065,10 +2065,23 @@ void HttpServer::sendApiCoreDump(int sock)
 	// SPIRAM_MALLOC_ALWAYSINTERNAL) borrows its own internal temp buffer of up
 	// to 16 KB for the whole read (esp_flash_api.c, MAX_READ_CHUNK) -- internal
 	// DRAM being exactly what #328 runs out of. A DRAM destination takes the
-	// direct-read path instead. The buffer is heap, not stack: these
+	// direct-read path instead. Found in review by BigDog on PR #394.
+	//
+	// The buffer is a STATIC in .bss (internal DRAM), not heap -- no dynamic
+	// allocation on a request path, ever (desmo) -- and not stack, since these
 	// per-connection threads have measured as little as 472 bytes free (#405).
-	// Found in review by BigDog on PR #394.
+	// One buffer means one download at a time; a second concurrent one gets
+	// 503 rather than waiting, so no connection thread ever blocks on another.
 	static constexpr size_t kChunk = 1024;
+	static uint8_t s_chunk[kChunk];
+	static std::mutex s_chunkMutex;
+	std::unique_lock<std::mutex> chunkLock(s_chunkMutex, std::try_to_lock);
+	if (!chunkLock.owns_lock())
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+			"{\"error\":\"another coredump download is in progress\"}");
+		return;
+	}
 	const CoreDumpStore::Info info = CoreDumpStore::query();
 	if (!info.present)
 	{
@@ -2076,16 +2089,11 @@ void HttpServer::sendApiCoreDump(int sock)
 			std::string("{\"error\":\"") + (info.supported ? "no coredump stored" : "coredump not supported") + "\"}");
 		return;
 	}
-#if defined(ESP_PLATFORM)
-	std::unique_ptr<uint8_t, void (*)(void*)> buf(
-		static_cast<uint8_t*>(heap_caps_malloc(kChunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)), heap_caps_free);
-#else
-	std::unique_ptr<uint8_t, void (*)(void*)> buf(static_cast<uint8_t*>(std::malloc(kChunk)), std::free);
-#endif
+	uint8_t* const buf = s_chunk;
 	// Read the first chunk BEFORE committing to a 200, so an early flash
 	// failure is still a clean 500 rather than a truncated download.
 	size_t len = std::min(kChunk, static_cast<size_t>(info.size));
-	if (!buf || !CoreDumpStore::read(0, buf.get(), len))
+	if (!CoreDumpStore::read(0, buf, len))
 	{
 		sendResponse(sock, 500, "Internal Server Error", "application/json",
 			"{\"error\":\"coredump read failed\"}");
@@ -2096,13 +2104,13 @@ void HttpServer::sendApiCoreDump(int sock)
 	if (!sendAllBytes(sock, head.data(), head.size())) return;
 	for (uint32_t off = 0;;)
 	{
-		if (!sendAllBytes(sock, reinterpret_cast<const char*>(buf.get()), len)) return;
+		if (!sendAllBytes(sock, reinterpret_cast<const char*>(buf), len)) return;
 		off += static_cast<uint32_t>(len);
 		if (off >= info.size) return;
 		len = std::min(kChunk, static_cast<size_t>(info.size - off));
 		// A mid-stream failure can no longer change the status line; stopping
 		// short of Content-Length is what tells the client the body is bad.
-		if (!CoreDumpStore::read(off, buf.get(), len)) return;
+		if (!CoreDumpStore::read(off, buf, len)) return;
 	}
 }
 
