@@ -1,11 +1,13 @@
 // CdrRing.cpp: the CDR ring buffer, extracted out of RequestsHandler.
 #include "CdrRing.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 
 #include "PbxPersist.hpp"
+#include "ResetGuard.hpp"   // #473: no data writes while a factory reset runs
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "nvs_flash.h"
@@ -25,6 +27,24 @@ namespace
 	// pbxpersist::kNvsNamespace — the CDR blob has its own key shape and is
 	// unrelated to the PBX feature-config tables).
 	constexpr auto NVS_CDR_NS = "cdrlog";
+	// Issue #470: the ring is a BLOB under its own key. "ring" is the legacy
+	// nvs_set_str value, read once by load() if no blob exists yet, then
+	// rewritten as a blob and erased. A new key rather than a type change on the
+	// old one, because IDF NVS keys are typed and a second type under one key
+	// is not something to lean on.
+	constexpr auto kBlobKey   = "ringb";
+	constexpr auto kLegacyKey = "ring";
+
+	std::atomic<uint32_t>& persistFailures()
+	{
+		static std::atomic<uint32_t> n{0};
+		return n;
+	}
+	std::atomic<uint32_t>& persistSuppressed()
+	{
+		static std::atomic<uint32_t> n{0};
+		return n;
+	}
 
 	// Same clock RequestsHandler::nowEpochMs() uses; duplicated here rather than
 	// reached through an engine indirection, since it is stateless and this
@@ -73,6 +93,21 @@ namespace
 		{
 			buf[used++] = sep;
 		}
+	}
+
+	// #470: the decimal form of `v` via appendField, formatted on the stack --
+	// std::to_string here was the one allocation left in serializeForPersist.
+	void appendUInt(char* buf, size_t cap, size_t& used, uint64_t v, size_t maxDigits, char sep)
+	{
+		char digits[24];
+		size_t n = 0;
+		do
+		{
+			digits[sizeof(digits) - 1 - n] = static_cast<char>('0' + (v % 10));
+			v /= 10;
+			++n;
+		} while (v != 0 && n < sizeof(digits));
+		appendField(buf, cap, used, std::string_view(digits + sizeof(digits) - n, n), maxDigits, sep);
 	}
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
@@ -125,12 +160,62 @@ namespace
 				// someone changed the task creation call without reading
 				// PsramTask.hpp first.
 				PD_ASSERT_NOT_PSRAM_STACK();
-				nvs_handle_t h;
-				if (nvs_open(NVS_CDR_NS, NVS_READWRITE, &h) == ESP_OK)
+				if (blob.erase)
 				{
-					nvs_set_str(h, "ring", blob.text);
-					nvs_commit(h);
+					// An empty ring (clearAll(), incl. factory reset): remove it.
+					// Not gated by resetguard -- erasing is what a reset wants.
+					nvs_handle_t h;
+					if (nvs_open(NVS_CDR_NS, NVS_READWRITE, &h) != ESP_OK)
+					{
+						persistFailures().fetch_add(1);
+						continue;
+					}
+					bool ok = true;
+					for (const char* key : {kBlobKey, kLegacyKey})
+					{
+						const esp_err_t e = nvs_erase_key(h, key);
+						if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) ok = false;
+					}
+					if (nvs_commit(h) != ESP_OK) ok = false;
 					nvs_close(h);
+					if (!ok) persistFailures().fetch_add(1);
+					continue;
+				}
+
+				// #473: a factory reset in progress refuses new data -- the ring
+				// may hold exactly the call history the reset is removing.
+				resetguard::WriteScope scope;
+				if (!scope.allowed())
+				{
+					persistSuppressed().fetch_add(1);
+					continue;
+				}
+				// Issue #470: every return checked, failures counted and logged.
+				// A blob, not a string: nvs_set_str caps at 4000 B and the ring
+				// can reach CdrRingBlob::kCapacity.
+				nvs_handle_t h;
+				esp_err_t e = nvs_open(NVS_CDR_NS, NVS_READWRITE, &h);
+				if (e != ESP_OK)
+				{
+					persistFailures().fetch_add(1);
+					ESP_LOGW("CdrRing", "persist: nvs_open failed (%s)", esp_err_to_name(e));
+					continue;
+				}
+				e = nvs_set_blob(h, kBlobKey, blob.text, blob.len);
+				if (e == ESP_OK)
+				{
+					// Migration: the legacy string must not outlive a good blob,
+					// or a later downgrade/fallback would resurrect stale history.
+					const esp_err_t le = nvs_erase_key(h, kLegacyKey);
+					if (le != ESP_OK && le != ESP_ERR_NVS_NOT_FOUND) e = le;
+				}
+				if (e == ESP_OK) e = nvs_commit(h);
+				nvs_close(h);
+				if (e != ESP_OK)
+				{
+					persistFailures().fetch_add(1);
+					ESP_LOGW("CdrRing", "persist: CDR ring not saved (%s, %u bytes)",
+						esp_err_to_name(e), static_cast<unsigned>(blob.len));
 				}
 			}
 		}
@@ -217,10 +302,43 @@ void CdrRing::serializeForPersist(
 		const CallDetailRecord& r = ring[idx];
 		appendField(out.text, cap, used, r.caller, kMaxAorRaw, '\t');
 		appendField(out.text, cap, used, r.callee, kMaxAorRaw, '\t');
-		appendField(out.text, cap, used, std::to_string(r.startMs), 20, '\t');
-		appendField(out.text, cap, used, std::to_string(r.durationSec), 10, '\t');
-		appendField(out.text, cap, used, std::to_string(static_cast<int>(r.result)), 1, '\n');
+		appendUInt(out.text, cap, used, r.startMs, 20, '\t');
+		appendUInt(out.text, cap, used, r.durationSec, 10, '\t');
+		appendUInt(out.text, cap, used, static_cast<uint64_t>(r.result), 1, '\n');
 	}
+	out.len = static_cast<uint16_t>(used);
+	out.erase = false;
+}
+
+uint32_t CdrRing::persistFailureCount()   { return persistFailures().load(); }
+uint32_t CdrRing::persistSuppressedCount() { return persistSuppressed().load(); }
+
+size_t CdrRing::loadFromText(std::string_view text)
+{
+	// Slot by slot, not `_ring = {}`: that materialises a 2 KB temporary ring on
+	// the caller's stack (#458/#460).
+	for (auto& slot : _ring) slot = CallDetailRecord{};
+	_head = 0;
+	_count = 0;
+	// Record: caller \t callee \t startMs \t durationSec \t result(int)
+	for (const auto& rec : deserializeBlob(std::string(text)))
+	{
+		if (rec.size() < 5) continue;
+		if (_count >= POCKETDIAL_CDR_RECORDS) break;
+		CallDetailRecord r;
+		r.caller = rec[0];
+		r.callee = rec[1];
+		r.startMs = static_cast<uint64_t>(strtoull(rec[2].c_str(), nullptr, 10));
+		r.durationSec = static_cast<uint32_t>(strtoul(rec[3].c_str(), nullptr, 10));
+		int ri = atoi(rec[4].c_str());
+		r.result = (ri >= 0 && ri <= static_cast<int>(CdrResult::Failed))
+			? static_cast<CdrResult>(ri) : CdrResult::Failed;
+		// Records were serialized oldest-first; append preserving order.
+		_ring[_head] = std::move(r);
+		_head = (_head + 1) % POCKETDIAL_CDR_RECORDS;
+		++_count;
+	}
+	return _count;
 }
 
 const CallDetailRecord& CdrRing::record(const std::shared_ptr<Session>& session,
@@ -328,34 +446,39 @@ void CdrRing::load()
 	{
 		return;
 	}
+	// Issue #470: the blob first. If there is none yet, fall back ONCE to the
+	// legacy nvs_set_str value and re-persist it below as a blob; the writer
+	// then erases the legacy key after the blob write succeeds.
+	std::string buf;
+	bool migrate = false;
 	size_t len = 0;
-	if (nvs_get_str(h, "ring", nullptr, &len) == ESP_OK && len > 0)
+	esp_err_t e = nvs_get_blob(h, kBlobKey, nullptr, &len);
+	if (e == ESP_OK && len > 0)
 	{
-		std::string buf(len, '\0');
-		if (nvs_get_str(h, "ring", buf.data(), &len) == ESP_OK)
+		buf.resize(len);
+		if (nvs_get_blob(h, kBlobKey, buf.data(), &len) == ESP_OK) buf.resize(len);
+		else buf.clear();
+	}
+	else if (e == ESP_ERR_NVS_NOT_FOUND &&
+		nvs_get_str(h, kLegacyKey, nullptr, &len) == ESP_OK && len > 0)
+	{
+		buf.resize(len);
+		if (nvs_get_str(h, kLegacyKey, buf.data(), &len) == ESP_OK)
 		{
 			if (!buf.empty() && buf.back() == '\0') buf.pop_back();
-			// Record: caller \t callee \t startMs \t durationSec \t result(int)
-			for (const auto& rec : deserializeBlob(buf))
-			{
-				if (rec.size() < 5) continue;
-				if (_count >= POCKETDIAL_CDR_RECORDS) break;
-				CallDetailRecord r;
-				r.caller = rec[0];
-				r.callee = rec[1];
-				r.startMs = static_cast<uint64_t>(strtoull(rec[2].c_str(), nullptr, 10));
-				r.durationSec = static_cast<uint32_t>(strtoul(rec[3].c_str(), nullptr, 10));
-				int ri = atoi(rec[4].c_str());
-				r.result = (ri >= 0 && ri <= static_cast<int>(CdrResult::Failed))
-					? static_cast<CdrResult>(ri) : CdrResult::Failed;
-				// Records were serialized oldest-first; append preserving order.
-				_ring[_head] = std::move(r);
-				_head = (_head + 1) % POCKETDIAL_CDR_RECORDS;
-				++_count;
-			}
+			migrate = true;
 		}
+		else buf.clear();
 	}
 	nvs_close(h);
+
+	loadFromText(buf);
+	if (migrate && _count > 0)
+	{
+		ESP_LOGI("CdrRing", "CDR ring migrated from the legacy string key (%u records)",
+			static_cast<unsigned>(_count));
+		persist();
+	}
 #endif
 }
 
@@ -397,6 +520,10 @@ void CdrRing::persist()
 	// function running on a single dedicated task.
 	static CdrRingBlob blob;
 	serializeForPersist(_ring, _head, _count, blob);
+	// Issue #470: an empty ring is persisted as the ABSENCE of one (clearAll(),
+	// including the factory reset), so the writer erases the keys instead of
+	// storing an empty blob -- and that erase is allowed during a reset.
+	blob.erase = (_count == 0);
 
 	// Non-blocking: never stall the caller (which may be holding
 	// RequestsHandler::_mutex, or be a real-time task) waiting for queue

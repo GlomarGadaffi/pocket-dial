@@ -18,11 +18,21 @@
 // ended the call, including a PSRAM-stacked one (issues #273/#288) -- to the
 // dedicated, plain-stack writer task via a fixed-size FreeRTOS queue item.
 // The actual flash write happens only on that task; nothing here does I/O.
+//
+// Issue #470: stored with nvs_set_blob (limit ~508 KB), no longer nvs_set_str,
+// which IDF caps at 4000 B including the NUL -- below kCapacity (4481 B at the
+// default 32 records), so a ring of long AORs used to fail to persist, and
+// the writer ignored the error. `len` is the serialized length (text is still
+// NUL-terminated for the host tests and the legacy reader); `erase` asks the
+// writer to remove the persisted ring instead (an empty ring -- clearAll()).
 struct CdrRingBlob
 {
 	static constexpr size_t kCapacity = POCKETDIAL_CDR_RECORDS * 140 + 1;
+	uint16_t len = 0;
+	bool     erase = false;
 	char text[kCapacity] = {};
 };
+static_assert(CdrRingBlob::kCapacity <= 0xFFFF, "CdrRingBlob::len is 16-bit");
 
 // ── Call Detail Record ring buffer, extracted out of RequestsHandler ─────────
 // Fixed capacity (POCKETDIAL_CDR_RECORDS), no heap growth: writes wrap and
@@ -96,6 +106,18 @@ public:
 	static void serializeForPersist(
 		const std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS>& ring,
 		size_t head, size_t count, CdrRingBlob& out);
+
+	// Issue #470: rebuild the ring from a persisted blob's text (the format
+	// serializeForPersist() writes). Replaces the current contents; returns the
+	// number of records loaded. Boot-time only (it allocates while parsing,
+	// once); split out of load() so the round trip is host-testable.
+	size_t loadFromText(std::string_view text);
+
+	// Issue #470: NVS failures in the persist writer (open, set, commit, or the
+	// legacy-key erase), and data writes refused because a factory reset was in
+	// progress (#473). Always 0 on host, which has no writer. For /api/status.
+	static uint32_t persistFailureCount();
+	static uint32_t persistSuppressedCount();
 
 private:
 	void persist();
