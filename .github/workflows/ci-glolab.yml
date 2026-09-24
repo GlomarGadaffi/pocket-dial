@@ -1,33 +1,45 @@
-name: Post-Merge Host Verification (glolab)
+name: Nightly Host Verification (glolab)
 
-# Runs the host build/test job a second time on the self-hosted 'glolab' runner,
-# purely as a fast post-merge confidence check (measured ~4min vs ~8-9min on
-# ubuntu-latest). Deliberately NOT triggered on pull_request: this workflow only
-# fires on push to main (i.e. after a PR has already merged) or manual dispatch,
-# so code from an untrusted fork PR can never execute on this runner. The
-# pull_request-triggered ci.yml on ubuntu-latest remains the actual PR gate.
+# Runs the host build/test job a second time on the self-hosted 'glolab' runner
+# (the bench Raspberry Pi, ARM64), as a confidence check on a second
+# architecture. Deliberately NOT triggered on pull_request, so code from an
+# untrusted fork PR can never execute on this runner. The pull_request-triggered
+# ci.yml on ubuntu-latest remains the actual PR gate.
+#
+# NIGHTLY + MANUAL ONLY (desmo, 2026-09-24). It used to fire on every push to
+# main. The Pi is also the bench host (it drives the ESP32 boards over USB and
+# runs household DNS on a second board), so a full cppcheck + clang-tidy +
+# gtest build after every merge is load it should not carry. A busy night
+# queued five runs behind an offline runner, each due to fire in turn when it
+# came back. Once a day on the latest main is enough for an ARM64 cross-check;
+# dispatch it by hand when a specific commit needs it.
+#
+# 09:17 UTC = 05:17 US Eastern (EDT), 04:17 under EST: early morning, away from
+# the Pi's unattended-upgrades window (Automatic-Reboot is configured for 03:30
+# local, and fires only when an upgrade requires a reboot). Minute 17, not :00:
+# GitHub delays or drops scheduled runs at the top of the hour under load, and a
+# missed nightly is silent.
 on:
-  push:
-    branches: [ main ]
+  schedule:
+    - cron: '17 9 * * *'
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  # Scoped per-commit, not per-branch: a static group name meant "only the
-  # latest push's verification matters", which is fine when merges are rare
-  # but starves this job outright during a merge burst -- every push cancels
-  # the still-running previous one, so on a busy night NONE of them ever
-  # reach a conclusion (confirmed: 29/29 cancelled in a row on 2026-09-16).
-  # Per-SHA groups let each push's run queue and actually finish; cancel-in-
-  # progress only fires now for a genuine duplicate dispatch of the same SHA.
+  # Scoped per-commit. With the push trigger gone, the only collision left is
+  # a nightly run and a manual dispatch landing on the same unchanged SHA,
+  # where cancelling the older of two identical builds is harmless. (History:
+  # a static group under the old push trigger starved every run during merge
+  # bursts, 29/29 cancelled in a row on 2026-09-16. Per-SHA groups fixed that
+  # and are kept so two different SHAs never cancel each other.)
   group: glolab-host-verify-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
   build-and-test-host-glolab:
-    name: Host Build & Simulation Testing (glolab, post-merge)
+    name: Host Build & Simulation Testing (glolab, nightly)
     runs-on: [self-hosted, glolab]
     env:
       # Kept in sync with the CPPCHECK_VERSION pin in ci.yml (Issue #112).
