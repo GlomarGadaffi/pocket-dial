@@ -8,7 +8,10 @@
 #   * otadata (0x2000) + phy_init (0x1000) unchanged.
 #   * Two equal app slots, 0x1E0000 (~1.875MB) each — comfortably fits the ~1.0MB
 #     eth/lan8720/wifi image with ~0.9MB headroom, and still fits the 1.6MB display
-#     image if ever needed. 64KB-aligned (MMU requirement). ~128KB left free at top.
+#     image if ever needed. 64KB-aligned (MMU requirement). The ~128KB left at the top is coredump (below).
+#   * coredump (Issue #382): the ~128KB that was free at the top (0x3E0000) -- the
+#     same 128KB partitions.csv sizes it at, from the same measurement (see there),
+#     and nothing moves. Leaves the top of this 4MB layout fully allocated.
 #
 # Select via sdkconfig.defaults.esp32_constrained (CONFIG_PARTITION_TABLE_CUSTOM_FILENAME).
 #
@@ -18,3 +21,4 @@ otadata,    data, ota,      0xf000,    0x2000
 phy_init,   data, phy,      0x11000,   0x1000
 ota_0,      app,  ota_0,    0x20000,   0x1E0000
 ota_1,      app,  ota_1,    0x200000,  0x1E0000
+coredump,   data, coredump, 0x3E0000,  0x20000

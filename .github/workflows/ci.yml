@@ -1,22 +1,24 @@
 name: ESP32 Pocket-Dial Firmware CI
 
 on:
-  # Both filters are '**' (every branch) rather than an explicit allowlist.
-  # This block hadn't been touched since the file was first added (2026-06-01,
-  # git blame), predating this repo's actual branch conventions -- push's old
-  # 'feature/**' glob never matched a real branch (this repo uses feat/, fix/,
-  # docs/, and assorted ad-hoc names) and pull_request's [main, master] meant a
-  # PR based on an unmerged feat/** branch (a stacked PR) got NO CI at all: no
-  # host tests, no cppcheck, nothing, and `gh pr checks` just reports "no
-  # checks reported" instead of erroring. Bit us for real on #242. A whitelist
-  # of prefixes drifts again the next time someone invents a new one (see
-  # ci-perf-lints/, claude/, embedded-fixes/, phase2-polish/ in history) --
-  # '**' can't go stale. push and pull_request firing on the same branch
-  # double-runs CI for a normal PR; that costs runner minutes, not signal.
+  # pull_request on EVERY base branch ('**'), push on main ONLY.
+  #
+  # pull_request '**' keeps the #242 fix: a PR based on an unmerged branch (a
+  # stacked PR) still gets full CI. The old [main, master] filter gave those
+  # none. An allowlist of prefixes would drift, so this stays '**'.
+  #
+  # push is main-only because push '**' ran the ENTIRE matrix a second time
+  # for every commit on every PR branch (push run + pull_request run, same
+  # SHA, same jobs). On the free plan the limit is concurrent jobs, not
+  # minutes (public repo), and on 2026-09-24 six open PRs x ~25 jobs x 2
+  # saturated it, stalling the merge queue for hours. push on main still
+  # gives main its own post-merge status. A branch with no PR yet gets no
+  # CI until one is opened; open a draft PR to get it.
+  #
   # Neither filter matches tag pushes (no `tags:` key here), so this stays
   # disjoint from release.yml's tags-only trigger.
   push:
-    branches: [ '**' ]
+    branches: [ main ]
   pull_request:
     branches: [ '**' ]
   workflow_dispatch:
