@@ -49,10 +49,12 @@
 // after-init rule). It used to grow lazily and let each slot's std::string ratchet
 // up to the largest message it had held, in small internal-DRAM allocations on the
 // SIP hot path. Footprint is now exactly
-//   POCKETDIAL_PCAP_RING_SIZE x sizeof(Entry)  ~= 16 x 2.1 KB ~= 33.5 KB
-// and it lives wherever the owner does. On ESP that is inside the heap-allocated
-// SipServer (esp_main.cpp `new SipServer`), far above
-// CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, so PSRAM, not internal DRAM.
+//   POCKETDIAL_PCAP_RING_SIZE x sizeof(Entry)  ~= 16 x 2.1 KB ~= 33.7 KB
+// and it lives wherever the owner does. On S3 builds that is inside the
+// heap-allocated SipServer (esp_main.cpp `new SipServer`), far above
+// CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, so PSRAM. A build without PSRAM pays it
+// in internal DRAM, which is why the SIP_CONSTRAINED profile (main/CMakeLists.txt)
+// drops the ring to 4 slots, ~8.4 KB.
 // 16, not 64 (#328 follow-up). #278 measured this ring holding **~52 KB of
 // internal DRAM at steady state** on .244 at 64 slots, and confirmed that
 // shrinking it conserved 91% of the drain -- but it fixed only the override
@@ -90,6 +92,8 @@ class PcapCapture
 public:
 	static constexpr std::size_t kRingSize = POCKETDIAL_PCAP_RING_SIZE;
 	static constexpr std::size_t kSlotBytes = POCKETDIAL_PCAP_SLOT_BYTES;
+	static_assert(kRingSize > 0, "POCKETDIAL_PCAP_RING_SIZE must be at least 1 (claim() indexes modulo it)");
+	static_assert(kSlotBytes > 0, "POCKETDIAL_PCAP_SLOT_BYTES must be at least 1");
 
 	// Record one SIP message. `outbound` is from the server's own perspective:
 	// false for something received from `peer`, true for something sent to
