@@ -292,9 +292,23 @@ public:
 	// above it (RFC 3261 s12.2.1.1), or the phone rejects it 500 Invalid CSeq.
 	uint32_t lastServerCSeq() const { return _lastServerCSeq; }
 	void noteServerCSeq(uint32_t v) { if (v > _lastServerCSeq) _lastServerCSeq = v; }
-	// CSeq for the server's next request on this dialog: the long-standing 2 when
-	// it has sent none (e.g. call pickup's legs), otherwise one past the last.
-	uint32_t nextServerCSeq() const { return _lastServerCSeq ? _lastServerCSeq + 1 : 2; }
+
+	// Issue #402. The highest CSeq of any request either PARTY has sent on this
+	// dialog, noted centrally in RequestsHandler::handle(). In-dialog requests are
+	// relayed untouched, so the phone at the other end has seen these numbers
+	// too -- and a server request impersonating one party toward the other (a
+	// transfer splice, a teardown BYE) must go above them, not above a guess.
+	uint32_t maxObservedCSeq() const { return _maxObservedCSeq; }
+	void noteObservedCSeq(uint32_t v) { if (v > _maxObservedCSeq) _maxObservedCSeq = v; }
+
+	// CSeq for the server's next request on this dialog: above every number any
+	// party (or the server) has used on it, so it is valid whichever side it is
+	// sent to; the long-standing 2 only when nothing at all is known.
+	uint32_t nextServerCSeq() const
+	{
+		const uint32_t hi = _lastServerCSeq > _maxObservedCSeq ? _lastServerCSeq : _maxObservedCSeq;
+		return hi ? hi + 1 : 2;
+	}
 
 	void release();
 
@@ -355,6 +369,7 @@ private:
 	bool _wasTransferorSrc = true; // meaningful only when _isTransferBridge
 	uint32_t _transferorCseqAtRefer = 0; // issue #257, see the accessor's comment
 	uint32_t _lastServerCSeq = 0;        // issue #389, see the accessor's comment
+	uint32_t _maxObservedCSeq = 0;       // issue #402, see the accessor's comment
 };
 
 #endif

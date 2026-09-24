@@ -1056,3 +1056,52 @@ TEST(BlindTransfer, SwapReinviteUsesACseqHigherThanTheDialogsRealOne)
 	// of that coverage.
 	EXPECT_NE(reinviteToB.find("c=IN IP4 10.3.3.3"), std::string::npos) << reinviteToB;
 }
+
+// Issue #402: the refer NOTIFY and the BYE both go to the transferor on the
+// REFER's own dialog. They shared a hardcoded CSeq 2, so a real UA accepted the
+// NOTIFY and answered the BYE 500 Invalid CSeq -- the transferor was never
+// dropped by it. Each must be above everything the dialog carried (INVITE 1,
+// REFER 2), and the BYE above the NOTIFY sent just before it.
+TEST(BlindTransfer, NotifyAndByeToTheTransferorGetDistinctIncreasingCSeqs)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.30.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in transferorAddr = addrFor("192.168.30.10");
+	const sockaddr_in transfereeAddr = addrFor("192.168.30.20");
+
+	handler.handle(makeRegister("100", "192.168.30.10", "reg-100-402"));
+	handler.handle(makeRegister("106", "192.168.30.20", "reg-106-402"));
+	handler.handle(makeRegister("107", "192.168.30.30", "reg-107-402"));
+
+	const std::string callId = "blindxfer-402";
+	connectCall(handler, sent, callId,
+		"100", transferorAddr, "atag", sdpBodyFor("10.1.1.1", 10001),
+		"106", transfereeAddr, "btag", sdpBodyFor("10.2.2.2", 20002));
+	sent.clear();
+
+	handler.handle(makeRefer(callId, "100", transferorAddr, "atag", "106", "btag", "107"));
+
+	auto cseqOf = [](const std::string& raw) -> long {
+		const auto at = raw.find("CSeq: ");
+		return at == std::string::npos ? -1 : std::stol(raw.substr(at + 6));
+	};
+	std::vector<long> notifies, byes;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg || addr.sin_addr.s_addr != transferorAddr.sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.find("Call-ID: " + callId + "\r\n") == std::string::npos) continue;
+		if (raw.rfind("NOTIFY sip:", 0) == 0) notifies.push_back(cseqOf(raw));
+		if (raw.rfind("BYE sip:", 0) == 0) byes.push_back(cseqOf(raw));
+	}
+	ASSERT_EQ(notifies.size(), 1u) << "exactly one refer NOTIFY to the transferor";
+	ASSERT_EQ(byes.size(), 1u) << "exactly one BYE to the transferor";
+	EXPECT_GT(notifies[0], 2) << "NOTIFY must go above the REFER's CSeq (2) on this dialog";
+	EXPECT_GT(byes[0], notifies[0])
+		<< "BYE CSeq " << byes[0] << " must exceed the NOTIFY's " << notifies[0]
+		<< " sent just before it on the same dialog";
+}

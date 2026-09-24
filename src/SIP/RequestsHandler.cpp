@@ -980,6 +980,20 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				+ std::string(request->getHeader()), !status->softFail);
 		}
 
+		// Issue #402: every request's CSeq is a number the other party on its dialog
+		// has now seen (in-dialog requests are relayed untouched), so any request the
+		// server later sends on that dialog must go above it. Noted before dispatch,
+		// so onRefer() already counts its own REFER, and again after, so an INVITE
+		// that CREATES its session is counted too.
+		std::string noteCallId;
+		uint32_t noteCSeq = 0;
+		if (!status.has_value())
+		{
+			noteCallId = std::string(request->getCallID());
+			noteCSeq = siphdr::cseqNumber(request->getCSeq());
+			noteDialogCSeq(noteCallId, noteCSeq);
+		}
+
 		// Task 2C: SIP INFO with DTMF relay body — handle before the handler table
 		// so it is never mistakenly forwarded by a catch-all entry.
 		if (handlerKey == "INFO")
@@ -1049,6 +1063,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				it->second(std::move(request));
 			}
 		}
+		noteDialogCSeq(noteCallId, noteCSeq);
 		}   // !sdpRefused
 
 		// Device-registry change detection: a REGISTER may have adopted a device,
@@ -1088,6 +1103,12 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	{
 		_onHandled(event.first, std::move(event.second));
 	}
+}
+
+void RequestsHandler::noteDialogCSeq(const std::string& callID, uint32_t cseq)
+{
+	if (cseq == 0 || callID.empty()) return;
+	if (auto s = findSession(callID)) s->noteObservedCSeq(cseq);
 }
 
 std::optional<std::shared_ptr<Session>> RequestsHandler::getSession(std::string_view callID)
@@ -5345,8 +5366,10 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 				// own From/To tags are exactly what that phone's dialog expects.
 				const std::string& peerAHdr     = peerAIsSrc ? peerSess->getDialogFrom() : peerSess->getDialogTo();
 				const std::string& peerOtherHdr = peerAIsSrc ? peerSess->getDialogTo()   : peerSess->getDialogFrom();
+				// #402: above everything this dialog has carried -- including the
+				// splice re-INVITE the server already sent here in A's name.
 				auto bye = buildServerBye(survivor->getNumber(), survivor->getAddress(),
-					peerId, peerAHdr, peerOtherHdr);
+					peerId, peerAHdr, peerOtherHdr, peerSess->nextServerCSeq());
 				if (bye) _outbox.emplace_back(survivor->getAddress(), std::move(bye));
 			}
 			endCall(peerId, survivor ? survivor->getNumber() : std::string(),
@@ -6041,38 +6064,23 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		// so on ANY refusal below nothing is sent and nothing mutates.
 		const std::string srcIpPort = _localIp + ":" + std::to_string(_serverPort);
 
-		// Issue #257 follow-up. invToB and invToC each impersonate A inside
-		// A-B/A-C's PRE-EXISTING dialog, exactly like handleBlindXferOk()'s swap
-		// re-INVITE -- so each needs a CSeq higher than anything that dialog has
-		// already seen from A, or the real UA on the other end correctly rejects
-		// it with 500 Invalid CSeq (RFC 3261 s12.2.2). Unlike blind transfer,
-		// there are two dialogs and the REFER only arrives on one of them.
+		// Issue #402 (replacing #257's per-dialog floors). invToB/invToC impersonate
+		// A inside each PRE-EXISTING dialog, and the BYEs/NOTIFY below speak on them
+		// too, so every one needs a CSeq above anything that dialog has already
+		// carried, or the phone rejects it 500 Invalid CSeq (RFC 3261 s12.2.2).
 		//
-		// AB: this REFER (data) is itself a real, fresh in-dialog request from A
-		// on the AB dialog -- the same directly-observed-floor technique
-		// transferorCseqAtRefer() uses, just consumed immediately instead of
-		// stashed for later, since invToB is built in this same function.
-		//
-		// AC: no request from A arrives on this dialog at REFER time, so there is
-		// no equivalent live signal. The next best real (not invented) value is
-		// the CSeq A's own UA used on the consult INVITE that established this
-		// dialog (ac->getInviteMessage()) -- same reasoning the SDP capture above
-		// already relies on for this dialog: nothing else has changed its state
-		// since setup in the ordinary case, and the existing comment two
-		// paragraphs up already accepts a later re-INVITE here as a known,
-		// undetected gap, not a new one this introduces. If that message or its
-		// CSeq is ever unavailable, fall back to the REFER's own CSeq (abCseq)
-		// rather than a constant -- a real, recently-observed value from the
-		// same UA's single running counter (RFC 3261 places no per-dialog floor
-		// on it) is far more likely to be a safe lower bound than any fixed
-		// number.
-		const uint32_t abCseq = siphdr::cseqNumber(data->getCSeq());
-		uint32_t acCseq = 0;
-		if (auto acInvite = ac->getInviteMessage())
-		{
-			acCseq = siphdr::cseqNumber(acInvite->getCSeq());
-		}
-		if (acCseq == 0) acCseq = abCseq;
+		// The old floors assumed the REFER arrives on the HELD dialog and took the
+		// other one's setup-INVITE CSeq +1. A transferor may REFER on either
+		// dialog (RFC 5589); pjsua REFERs on the consult one, which makes the
+		// replaced dialog the held one -- and holding is a re-INVITE at exactly
+		// setup+1, so the splice collided with it on every call. Each session now
+		// records every CSeq either party has sent on it (handle(), which already
+		// counted this REFER), so each dialog simply goes above its own record.
+		// Numbers are reserved (noted) only once every draw below has succeeded.
+		// Per dialog, in this order: the re-INVITE, then what goes to A (BYE, then
+		// NOTIFY). Distinct recipients only need their own numbers increasing.
+		const uint32_t abBase = ab->nextServerCSeq();   // invToB, byeAfromAB, NOTIFY
+		const uint32_t acBase = ac->nextServerCSeq();   // invToC, byeAfromAC
 
 		// A's own tag/header in each dialog, and the other party's -- these flip
 		// with orientation. A message the server sends impersonating A carries
@@ -6085,12 +6093,10 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		const std::string& otherHdrAC = aIsSrcAC ? dToAC   : dFromAC;
 
 		auto byeAfromAB = buildServerBye(transferor->getNumber(), transferor->getAddress(),
-			callID, otherHdrAB, aHdrAB);
+			callID, otherHdrAB, aHdrAB, abBase + 1);
 		auto byeAfromAC = buildServerBye(transferor->getNumber(), transferor->getAddress(),
-			replacesCallIdKey, otherHdrAC, aHdrAC);
+			replacesCallIdKey, otherHdrAC, aHdrAC, acBase + 1);
 
-		// #257: invToB's CSeq uses abCseq+1 (see the comment above at its
-		// computation), a real directly-observed floor rather than a constant.
 		std::shared_ptr<SipMessage> invToB;
 		{
 			std::ostringstream ss;
@@ -6099,7 +6105,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 			   << "From: " << stripHeaderName(aHdrAB) << "\r\n"
 			   << "To: " << stripHeaderName(otherHdrAB) << "\r\n"
 			   << "Call-ID: " << stripHeaderName(callID) << "\r\n"
-			   << "CSeq: " << (abCseq + 1) << " INVITE\r\n"
+			   << "CSeq: " << abBase << " INVITE\r\n"
 			   << "Max-Forwards: 70\r\n"
 			   << "Contact: <sip:" << bClient->getNumber() << "@" << srcIpPort << ">\r\n"
 			   << "User-Agent: pocket-dial\r\n"
@@ -6108,8 +6114,6 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 			   << cSdp;
 			invToB = getMessageFromPool(ss.str(), bClient->getAddress());
 		}
-		// #257: invToC's CSeq uses acCseq+1 (see the comment above at its
-		// computation), a real directly-observed floor rather than a constant.
 		std::shared_ptr<SipMessage> invToC;
 		{
 			std::ostringstream ss;
@@ -6118,7 +6122,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 			   << "From: " << stripHeaderName(aHdrAC) << "\r\n"
 			   << "To: " << stripHeaderName(otherHdrAC) << "\r\n"
 			   << "Call-ID: " << replacesCallIdBare << "\r\n"
-			   << "CSeq: " << (acCseq + 1) << " INVITE\r\n"
+			   << "CSeq: " << acBase << " INVITE\r\n"
 			   << "Max-Forwards: 70\r\n"
 			   << "Contact: <sip:" << cClient->getNumber() << "@" << srcIpPort << ">\r\n"
 			   << "User-Agent: pocket-dial\r\n"
@@ -6154,6 +6158,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		_outbox.emplace_back(cClient->getAddress(), std::move(invToC));
 		_transferPendingAcks.push_back(callID);
 		_transferPendingAcks.push_back(replacesCallIdKey);
+		ab->noteServerCSeq(abBase + 2);   // + the NOTIFY below, sent best-effort
+		ac->noteServerCSeq(acBase + 1);
 
 		// Link the two sessions as a transfer bridge: a BYE from either B or C
 		// (onBye's isTransferBridge() branch) relays to the other, using
@@ -6170,7 +6176,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		// NOTIFY A with the success sipfrag — best-effort: the splice itself is
 		// already fully committed and on the wire by this point, so a pool refusal
 		// here just means A's phone doesn't get the courtesy status update.
-		auto notify = buildReferNotify(data, transferor, "SIP/2.0 200 OK", /*terminated=*/true);
+		auto notify = buildReferNotify(data, transferor, "SIP/2.0 200 OK", /*terminated=*/true,
+			abBase + 2);
 		if (notify) _outbox.emplace_back(transferor->getAddress(), std::move(notify));
 
 		queueLog("REFER: attended transfer " + transferor->getNumber() + " -> " +
@@ -6388,8 +6395,12 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// transferor's: the REFER's own To/From, swapped (the REFER travelled A->B, this
 	// BYE travels B->A). Getting these backwards produces a message the phone
 	// rejects as a stranger's dialog, which is why #128 regression-tests the slots.
+	// Issue #402: the NOTIFY and this BYE both go to the transferor on this one
+	// dialog, so each needs its own CSeq above everything the dialog has carried.
+	// They used to share a hardcoded 2 and the phone 500'd the BYE.
+	const uint32_t xferBase = original->nextServerCSeq();   // NOTIFY, then BYE
 	auto byeToTransferor = buildServerBye(transferor->getNumber(), transferor->getAddress(),
-		callID, std::string(data->getTo()), std::string(data->getFrom()));
+		callID, std::string(data->getTo()), std::string(data->getFrom()), xferBase + 1);
 
 	// NOTE (issue #197, secondary item 1): this sipfrag still claims 200 OK the
 	// moment the INVITE is queued, before the target has been rung. RFC 3515 §2.4.5
@@ -6397,7 +6408,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// notification (§2.4.4). Deliberately NOT changed here: it is a separate defect
 	// with its own failure mode (a phone told the truth late vs. told a lie early),
 	// and folding it in would make this change about two things.
-	auto notify = buildReferNotify(data, transferor, "SIP/2.0 200 OK", /*terminated=*/true);
+	auto notify = buildReferNotify(data, transferor, "SIP/2.0 200 OK", /*terminated=*/true,
+		xferBase);
 
 	auto legSession = allocateSession(legCallID, transferee);
 
@@ -6458,6 +6470,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// has every right to 481 the notification it is waiting for.
 	_outbox.emplace_back(transferor->getAddress(), std::move(notify));
 	_outbox.emplace_back(transferor->getAddress(), std::move(byeToTransferor));
+	original->noteServerCSeq(xferBase + 1);
 
 	queueLog("REFER: blind transfer " + transferee->getNumber() + " -> " + target +
 		" (transferor " + transferor->getNumber() + " dropped)");
@@ -6480,7 +6493,8 @@ void RequestsHandler::onMessage(std::shared_ptr<SipMessage> data)
 std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_ptr<SipMessage>& refer,
 	const std::shared_ptr<SipClient>& transferor,
 	const std::string& sipfrag,
-	bool terminated)
+	bool terminated,
+	uint32_t cseq)
 {
 	// RFC 3515 §2.4.5 NOTIFY: Event: refer + message/sipfrag body reporting the
 	// transfer result. Sent within the REFER's dialog back to the transferor.
@@ -6502,7 +6516,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 	   << "From: " << stripHeaderName(refer->getTo()) << "\r\n"
 	   << "To: " << stripHeaderName(refer->getFrom()) << "\r\n"
 	   << "Call-ID: " << stripHeaderName(refer->getCallID()) << "\r\n"
-	   << "CSeq: 2 NOTIFY\r\n"
+	   << "CSeq: " << cseq << " NOTIFY\r\n"
 	   << "Max-Forwards: 70\r\n"
 	   << "Event: refer\r\n"
 	   << "Subscription-State: " << subState << "\r\n"
@@ -6647,6 +6661,15 @@ bool RequestsHandler::handleBlindXferOk(const std::shared_ptr<SipMessage>& data)
 	const std::string& transfereeHdr = orig->wasTransferorSrc() ? orig->getDialogTo()
 		: orig->getDialogFrom();
 
+	// Issue #257, then #402. This impersonates A inside A-B's PRE-EXISTING dialog,
+	// so its CSeq must exceed everything B has seen there -- A's REFER (#257's
+	// floor) and, since #402, whatever the server itself already sent on this
+	// dialog in A's or B's name (the NOTIFY and BYE of onRefer). nextServerCSeq()
+	// covers both; the REFER floor stays as a belt-and-braces lower bound.
+	// handleTransferOk() ACKs with whatever CSeq the 200 echoes, so nothing
+	// downstream needs this number -- only that it is real and monotonic.
+	const uint32_t swapCSeq = std::max(orig->transferorCseqAtRefer() + 1, orig->nextServerCSeq());
+
 	std::shared_ptr<SipMessage> reinvite;
 	{
 		// The target's answer becomes the transferee's new offer. Normalised to
@@ -6661,22 +6684,7 @@ bool RequestsHandler::handleBlindXferOk(const std::shared_ptr<SipMessage>& data)
 		   << "From: " << stripHeaderName(transferorHdr) << "\r\n"
 		   << "To: " << stripHeaderName(transfereeHdr) << "\r\n"
 		   << "Call-ID: " << stripHeaderName(leg->getPeerCallID()) << "\r\n"
-		   // Issue #257. This impersonates the transferor (A) inside A and B's
-		   // PRE-EXISTING dialog, so the CSeq must be higher than anything B's
-		   // own dialog layer has already seen from A -- a hardcoded constant
-		   // (previously 100) broke on any real UA whose own CSeq counter had
-		   // already climbed past it, which real UAs routinely do; RFC 3261
-		   // places no floor on where that counter starts. orig's
-		   // transferorCseqAtRefer() is the REFER's own CSeq, captured in
-		   // onRefer() as a real, directly-observed floor for "A's" numbering
-		   // on this exact dialog -- +1 is the next value A's own UA would
-		   // legitimately have used, which is guaranteed unused and in order.
-		   // handleTransferOk() recognises this dialog's 200 OK by Call-ID
-		   // membership in _transferPendingAcks (not by CSeq value), and ACKs
-		   // it with whatever CSeq that response itself echoes back -- so
-		   // nothing downstream needs to know this number, only that it is
-		   // real and monotonic.
-		   << "CSeq: " << (orig->transferorCseqAtRefer() + 1) << " INVITE\r\n"
+		   << "CSeq: " << swapCSeq << " INVITE\r\n"
 		   << "Max-Forwards: 70\r\n"
 		   << "Contact: <sip:" << transferee->getNumber() << "@" << srcIpPort << ">\r\n"
 		   << "User-Agent: pocket-dial\r\n"
@@ -6707,6 +6715,7 @@ bool RequestsHandler::handleBlindXferOk(const std::shared_ptr<SipMessage>& data)
 	leg->setWasTransferorSrc(true);
 	_transferPendingAcks.push_back(leg->getPeerCallID());
 	_outbox.emplace_back(transferee->getAddress(), std::move(reinvite));
+	orig->noteServerCSeq(swapCSeq);
 
 	queueLog("REFER: blind transfer completed — " + transferee->getNumber() + " <-> " +
 		(leg->getDest() ? leg->getDest()->getNumber() : std::string("?")));

@@ -457,6 +457,7 @@ TEST(SessionRecycling, AResetSlotIsIndistinguishableFromAFreshOne)
 	used.setTrunk(true);
 	used.setTrunkRelaySlot(2);
 	used.noteServerCSeq(7);
+	used.noteObservedCSeq(40);
 	used.reset("call-fresh", nullptr);
 
 	EXPECT_EQ(used.isVoicemail(),          fresh.isVoicemail());
@@ -466,5 +467,27 @@ TEST(SessionRecycling, AResetSlotIsIndistinguishableFromAFreshOne)
 	EXPECT_EQ(used.getTrunkRelaySlot(),    fresh.getTrunkRelaySlot());
 	// #389: a stale server CSeq would push a recycled slot's first BYE off 2.
 	EXPECT_EQ(used.lastServerCSeq(),       fresh.lastServerCSeq());
+	EXPECT_EQ(used.maxObservedCSeq(),      fresh.maxObservedCSeq());
 	EXPECT_EQ(used.nextServerCSeq(),       fresh.nextServerCSeq());
+}
+
+// Issue #402: the server's next CSeq on a dialog goes above EVERYTHING used on
+// it -- its own requests and either party's -- whichever of the two is higher.
+TEST(SessionRecycling, NextServerCSeqGoesAboveBothServerAndObservedCSeqs)
+{
+	Session s("call-402", nullptr);
+	EXPECT_EQ(s.nextServerCSeq(), 2u);         // nothing known: the long-standing 2
+
+	s.noteObservedCSeq(23670);                  // e.g. a phone's hold re-INVITE
+	EXPECT_EQ(s.nextServerCSeq(), 23671u);
+
+	s.noteServerCSeq(3);                        // a lower server CSeq doesn't pull it down
+	EXPECT_EQ(s.nextServerCSeq(), 23671u);
+
+	s.noteServerCSeq(23671);                    // after the server uses it
+	EXPECT_EQ(s.nextServerCSeq(), 23672u);
+
+	s.noteObservedCSeq(100);                    // observations never move it backwards
+	EXPECT_EQ(s.maxObservedCSeq(), 23670u);
+	EXPECT_EQ(s.nextServerCSeq(), 23672u);
 }
