@@ -328,6 +328,8 @@ add_executable(sip_parser_tests
     CoreDumpHttp_test.cpp
     # Issue #397: the boot-time registrar default (fresh -> learn, existing -> open).
     RegistrarBootMode_test.cpp
+    # Issue #440: Learn locks an adopted extension to its device.
+    RegistrarLearnLock_test.cpp
     # Issue #186: GET/POST /api/config/export and POST /api/config/import,
     # driven end-to-end through a real HttpServer -- plaintext round-trip,
     # password-gated round-trip, replace-not-merge, and the 400/422 rejection

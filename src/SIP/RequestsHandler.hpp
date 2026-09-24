@@ -533,10 +533,11 @@ public:
 	}
 
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
-	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned)
+	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned,
+		bool locked = false)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		_registrar.adoptDeviceForTest(mac, ext, state);
+		_registrar.adoptDeviceForTest(mac, ext, state, locked);
 	}
 #endif
 

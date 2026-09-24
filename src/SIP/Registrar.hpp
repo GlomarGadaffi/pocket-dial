@@ -42,6 +42,8 @@ public:
 		std::string extension;   // the AOR it last registered as
 		DeviceState state = DeviceState::Learned;
 		bool online = false;     // currently has a live registration binding
+		bool locked = false;     // #440: Learn has bound its extension to this MAC
+		bool shared = false;     // #440: this MAC registered >1 extension (NAT) -- never locked
 	};
 
 	enum class AuthDecision : uint8_t { Accept, Challenge, Reject };
@@ -79,9 +81,17 @@ public:
 	AuthDecision admitSecure(const std::shared_ptr<SipMessage>& data,
 		const std::string& ext, std::string& outRejectReason);
 	// Learn-mode admission: resolves the source MAC, applies TOFU + MAC-lock and
-	// returns the digest decision. On a first-packet ARP miss returns Accept
-	// (deferring the lock to the next REGISTER). Records/updates the adoption
-	// entry — poll consumeDevicesChange() afterwards to mirror the snapshot.
+	// returns the digest decision. Records/updates the adoption entry -- poll
+	// consumeDevicesChange() afterwards to mirror the snapshot. Issue #440:
+	//   - an extension is LOCKED to a MAC on its second REGISTER from that same
+	//     resolved MAC (never the first, never on an ARP miss);
+	//   - another MAC registering a locked (or Secured) extension -> Reject;
+	//   - an ARP miss for a locked extension -> a 503 + Retry-After is enqueued
+	//     here and Challenge ("response already sent") is returned: retryable,
+	//     never a lockout, and sending it makes lwIP ARP the source;
+	//   - a MAC that registers a second extension is marked shared (the
+	//     signature of phones behind one NAT router) and never locks;
+	//   - a first-packet ARP miss for an unlocked extension still Accepts.
 	AuthDecision admitLearn(const std::shared_ptr<SipMessage>& data,
 		const std::string& ext, std::string& outRejectReason);
 	// Emit a 401 Unauthorized with a fresh WWW-Authenticate challenge. `stale`
@@ -89,6 +99,10 @@ public:
 	void sendChallenge(const std::shared_ptr<SipMessage>& data, bool stale);
 	// Emit a 403 Forbidden with a reason phrase.
 	void sendForbidden(const std::shared_ptr<SipMessage>& data, const std::string& reason);
+	// Emit a 503 Service Unavailable with Retry-After (#440). Kept short: per
+	// RFC 3261 §21.5.4 the phone holds off the WHOLE server for that long.
+	void sendRetryLater(const std::shared_ptr<SipMessage>& data, int retryAfterSeconds);
+	static constexpr int kLockedArpMissRetrySeconds = 5;
 
 	// ── Adopted-device registry ───────────────────────────────────────────────
 	void loadDevices();   // boot-time NVS reload; runs single-threaded pre-dispatch
@@ -107,12 +121,15 @@ public:
 	std::vector<AdoptedDevice> adoptedDevices() const;
 
 	// Test-only seam: directly adopt a device without an ARP lookup.
-	void adoptDeviceForTest(const std::string& mac, const std::string& ext, DeviceState state = DeviceState::Learned)
+	void adoptDeviceForTest(const std::string& mac, const std::string& ext, DeviceState state = DeviceState::Learned,
+		bool locked = false)
 	{
 		DeviceRecord r;
 		r.extension = ext;
 		r.state = state;
 		r.online = true;
+		r.locked = locked;
+		r.seq = _nextSeq++;
 		_devices[mac] = r;
 	}
 
@@ -140,10 +157,18 @@ private:
 		std::string extension;
 		DeviceState state = DeviceState::Learned;
 		bool online = false;   // volatile; not persisted
+		bool locked = false;   // #440: extension bound to this MAC (persisted)
+		bool shared = false;   // #440: MAC seen with >1 extension; never locks (persisted)
+		uint32_t seq = 0;      // #440: adoption order, for eviction (persisted)
 	};
 
 	bool persistMode();   // false (and logged at ERROR) if any NVS step failed
 	void persistDevices();
+	// #440: make room at POCKETDIAL_MAX_CLIENTS by forgetting the OLDEST plain
+	// Learned entry (offline ones first). Never evicts a locked or Secured
+	// device. False when every entry is locked/Secured.
+	bool evictOneLearned();
+	uint32_t _nextSeq = 1;
 	// Find a record by MAC key or, failing that, by adopted extension.
 	std::unordered_map<std::string, DeviceRecord>::iterator findDevice(const std::string& macOrExt);
 
