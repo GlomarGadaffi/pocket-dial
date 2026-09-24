@@ -297,6 +297,19 @@ def write_wav(path, ulaw):
         f.write(b"data" + struct.pack("<I", len(pcm)) + pcm)
 
 
+JOURNAL_SECTOR = 0x1000   # #473: reserved at the END of the prompts partition
+
+
+def prompts_partition_size(path=os.path.join(os.path.dirname(__file__), "..", "partitions.csv")):
+    """Size of the `prompts` partition, read from partitions.csv (never a copy of it)."""
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = [p.strip() for p in line.split("#", 1)[0].split(",")]
+            if len(parts) >= 5 and parts[0] == "prompts":
+                return int(parts[4], 0)
+    sys.exit("partitions.csv has no `prompts` partition")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--key-file", required=True)
@@ -325,6 +338,15 @@ def main():
               open(os.path.join(a.out, "manifest.json"), "w"), indent=2)
     total = sum(m["bytes"] for m in manifest.values())
     print(f"\n{len(manifest)} prompts, {total/1024:.0f} KB total, {chars} characters billed this run")
+    # #473: the prompts partition's LAST 4 KB sector is the factory-reset
+    # journal (src/Helpers/ResetJournal.hpp). A prompt image must fit in front of
+    # it, or flashing the prompts would overwrite a pending "reset incomplete"
+    # marker and the marker's writes would corrupt the last prompt.
+    budget = prompts_partition_size() - JOURNAL_SECTOR
+    if total > budget:
+        sys.exit(f"prompts total {total} bytes exceeds the {budget}-byte budget "
+                 f"(prompts partition minus its reserved {JOURNAL_SECTOR}-byte journal sector)")
+    print(f"fits the prompts partition: {total} / {budget} bytes (last {JOURNAL_SECTOR} B reserved)")
 
 
 if __name__ == "__main__":

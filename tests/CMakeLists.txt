@@ -446,6 +446,9 @@ add_executable(sip_parser_tests
     # Issue #382: HttpServer's /api/coredump* routes call it; the host arm serves
     # a test-installed fake image instead of flash.
     ../src/Helpers/CoreDumpStore.cpp
+    # Issue #473: the factory-reset journal (host arm keeps the record in memory).
+    ../src/Helpers/ResetJournal.cpp
+    ResetJournal_test.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
     # length/charset bounds that stop a typo from bringing the AP up open.
     DeviceConfig_test.cpp
