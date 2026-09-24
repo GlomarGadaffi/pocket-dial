@@ -104,6 +104,59 @@ TEST(CdrPersistBlob, EmptyRingHasZeroLength)
 	EXPECT_STREQ(blob.text, "");
 }
 
+// loadFromText() keeps at most POCKETDIAL_CDR_RECORDS records however long the
+// persisted text is (a corrupt or hand-edited value must not overrun the ring).
+TEST(CdrPersistBlob, LoadingMoreLinesThanTheRingHoldsStopsAtTheRingSize)
+{
+	std::string text;
+	for (size_t i = 0; i < POCKETDIAL_CDR_RECORDS + 8; ++i)
+	{
+		text += "c" + std::to_string(i) + "\te\t1\t1\t0\n";
+	}
+	CdrRing r;
+	EXPECT_EQ(r.loadFromText(text), static_cast<size_t>(POCKETDIAL_CDR_RECORDS));
+	const auto snap = r.snapshot();
+	ASSERT_EQ(snap.size(), static_cast<size_t>(POCKETDIAL_CDR_RECORDS));
+	EXPECT_EQ(snap.back().caller, "c0") << "the first (oldest) lines are the ones kept";
+	EXPECT_EQ(snap.front().caller, "c" + std::to_string(POCKETDIAL_CDR_RECORDS - 1));
+}
+
+namespace
+{
+	bool g_idleSeenByReset = false;
+
+	// Runs inside WriteScope, between "count me" and "am I allowed?".
+	void startResetMidScope()
+	{
+		resetguard::begin();
+		g_idleSeenByReset = resetguard::waitForWritersIdle(0);
+	}
+}
+
+// #476 review: the guard's real job, deterministically. A reset that begins at
+// the worst moment -- inside a writer's WriteScope, between its two steps --
+// must never both see the writers idle AND let that writer write. With the
+// steps in the right order (count, then check) the reset sees one writer in
+// flight and the writer is refused. Reverse them and the reset sees zero
+// writers while the writer has already been told it may write.
+TEST(ResetGuard, AResetBeginningInsideAWriteScopeNeverSeesIdleWhileItWrites)
+{
+	resetguard::resetForTest();
+	g_idleSeenByReset = true;
+	resetguard::betweenStepsHookForTest() = &startResetMidScope;
+	bool allowed = true;
+	{
+		resetguard::WriteScope scope;
+		allowed = scope.allowed();
+	}
+	resetguard::betweenStepsHookForTest() = nullptr;
+
+	EXPECT_FALSE(g_idleSeenByReset) << "the reset must count the writer that is mid-scope";
+	EXPECT_FALSE(allowed) << "a writer whose scope saw the reset begin must not write";
+	EXPECT_FALSE(g_idleSeenByReset && allowed) << "the invariant: never idle-and-writing";
+	resetguard::resetForTest();
+}
+
 // #473: once begin() has run, a writer that starts afterwards is refused, and
 // waitForWritersIdle() only reports idle once every in-flight write is done.
 TEST(ResetGuard, WritersAreRefusedAfterBeginAndDrainedBeforeTheErase)

@@ -53,11 +53,33 @@ namespace resetguard
 	inline void begin() { flagRef().store(true); }
 	inline bool inProgress() { return flagRef().load(); }
 
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	// Host-only seam (#476 review): runs INSIDE WriteScope's constructor, between
+	// its two steps, so a test can start a reset at exactly the point where the
+	// order of those steps matters -- deterministically, with no timing race.
+	using BetweenStepsHook = void (*)();
+	inline BetweenStepsHook& betweenStepsHookForTest()
+	{
+		static BetweenStepsHook h = nullptr;
+		return h;
+	}
+#endif
+
 	// RAII around one NVS data write. Construct first, then check allowed().
 	class WriteScope
 	{
 	public:
-		WriteScope() { writersRef().fetch_add(1); _allowed = !inProgress(); }
+		WriteScope()
+		{
+			// Count first, THEN check. The reverse order lets a reset that
+			// begins between the two steps see zero writers and erase under a
+			// writer that has already decided it is allowed.
+			writersRef().fetch_add(1);
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+			if (BetweenStepsHook h = betweenStepsHookForTest()) h();
+#endif
+			_allowed = !inProgress();
+		}
 		~WriteScope() { writersRef().fetch_sub(1); }
 		WriteScope(const WriteScope&) = delete;
 		WriteScope& operator=(const WriteScope&) = delete;
@@ -85,6 +107,6 @@ namespace resetguard
 
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 	// Host tests share one process: clear the flag a test set.
-	inline void resetForTest() { flagRef().store(false); writersRef().store(0); }
+	inline void resetForTest() { flagRef().store(false); writersRef().store(0); betweenStepsHookForTest() = nullptr; }
 #endif
 }
