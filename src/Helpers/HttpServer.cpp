@@ -42,6 +42,7 @@
 #include "JsonReader.hpp"    // strict, dependency-free JSON reader for /api/config/import
 #include <cctype>
 #include <cstdlib>
+#include <memory>
 #include <cstring>
 #include <sstream>
 #include <iostream>
@@ -1190,10 +1191,38 @@ void HttpServer::sendResponseWithHeader(int sock, int statusCode, const std::str
                               const std::string& contentType, const std::string& body,
                               const std::string& extraHeader)
 {
+	std::string data = buildResponseHead(statusCode, statusText, contentType, body.size(), extraHeader);
+	data += body;
+	sendAllBytes(sock, data.data(), data.size());
+}
+
+bool HttpServer::sendAllBytes(int sock, const char* ptr, size_t remaining)
+{
+	while (remaining > 0)
+	{
+#if defined _WIN32 || defined _WIN64
+		int sent = ::send(sock, ptr, static_cast<int>(remaining), 0);
+#else
+		int sent = static_cast<int>(::send(sock, ptr, remaining, 0));
+#endif
+		if (sent <= 0) return false;
+		ptr += sent;
+		remaining -= static_cast<size_t>(sent);
+	}
+	return true;
+}
+
+// Status line + every header + the blank line, for a body of contentLength
+// bytes. Shared by sendResponseWithHeader() and the streamed coredump download
+// so the security headers below stay emitted in exactly one place.
+std::string HttpServer::buildResponseHead(int statusCode, const std::string& statusText,
+                              const std::string& contentType, size_t contentLength,
+                              const std::string& extraHeader)
+{
 	std::ostringstream resp;
 	resp << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n";
 	resp << "Content-Type: " << contentType << "\r\n";
-	resp << "Content-Length: " << body.size() << "\r\n";
+	resp << "Content-Length: " << contentLength << "\r\n";
 	// No Access-Control-Allow-Origin header: wildcard CORS would allow any
 	// browser tab on the same AP to fire side-effecting POSTs without a preflight.
 
@@ -1221,22 +1250,7 @@ void HttpServer::sendResponseWithHeader(int sock, int statusCode, const std::str
 	}
 	resp << "Connection: close\r\n";
 	resp << "\r\n";
-	resp << body;
-
-	std::string data = resp.str();
-	const char* ptr = data.c_str();
-	size_t remaining = data.size();
-	while (remaining > 0)
-	{
-#if defined _WIN32 || defined _WIN64
-		int sent = ::send(sock, ptr, static_cast<int>(remaining), 0);
-#else
-		int sent = static_cast<int>(::send(sock, ptr, remaining, 0));
-#endif
-		if (sent <= 0) break;
-		ptr += sent;
-		remaining -= static_cast<size_t>(sent);
-	}
+	return resp.str();
 }
 
 void HttpServer::sendResponse(int sock, int statusCode, const std::string& statusText,
@@ -2043,12 +2057,18 @@ void HttpServer::sendApiCoreDump(int sock)
 	// Issue #382. Reached only through requireAdmin(..., Owner). The body is the
 	// raw flash image (header + ELF + checksum), exactly what
 	// `esp-coredump info_corefile -t raw -c <file> <SipServer.elf>` reads -- see
-	// docs/COREDUMP.md. Built as one string like sendApiPcap(). Cost, stated so
-	// nobody has to re-derive it on a #328 board: a dump is at most the 128 KB
-	// partition (45 KB measured idle on .244), which is above
-	// CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL (16384), so this buffer and
-	// sendResponseWithHeader()'s two copies (ostringstream + str()) all land in
-	// PSRAM -- at most ~390 KB transient out of 8 MB, zero internal DRAM.
+	// docs/COREDUMP.md.
+	//
+	// STREAMED in 1 KB chunks through one small INTERNAL-DRAM buffer, never
+	// assembled whole. esp_flash_read() into anything that is not internal DRAM
+	// (a whole-dump std::string lands in PSRAM, being above
+	// SPIRAM_MALLOC_ALWAYSINTERNAL) borrows its own internal temp buffer of up
+	// to 16 KB for the whole read (esp_flash_api.c, MAX_READ_CHUNK) -- internal
+	// DRAM being exactly what #328 runs out of. A DRAM destination takes the
+	// direct-read path instead. The buffer is heap, not stack: these
+	// per-connection threads have measured as little as 472 bytes free (#405).
+	// Found in review by BigDog on PR #394.
+	static constexpr size_t kChunk = 1024;
 	const CoreDumpStore::Info info = CoreDumpStore::query();
 	if (!info.present)
 	{
@@ -2056,15 +2076,34 @@ void HttpServer::sendApiCoreDump(int sock)
 			std::string("{\"error\":\"") + (info.supported ? "no coredump stored" : "coredump not supported") + "\"}");
 		return;
 	}
-	std::string body(info.size, '\0');
-	if (!CoreDumpStore::read(0, reinterpret_cast<uint8_t*>(&body[0]), body.size()))
+#if defined(ESP_PLATFORM)
+	std::unique_ptr<uint8_t, void (*)(void*)> buf(
+		static_cast<uint8_t*>(heap_caps_malloc(kChunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)), heap_caps_free);
+#else
+	std::unique_ptr<uint8_t, void (*)(void*)> buf(static_cast<uint8_t*>(std::malloc(kChunk)), std::free);
+#endif
+	// Read the first chunk BEFORE committing to a 200, so an early flash
+	// failure is still a clean 500 rather than a truncated download.
+	size_t len = std::min(kChunk, static_cast<size_t>(info.size));
+	if (!buf || !CoreDumpStore::read(0, buf.get(), len))
 	{
 		sendResponse(sock, 500, "Internal Server Error", "application/json",
 			"{\"error\":\"coredump read failed\"}");
 		return;
 	}
-	sendResponseWithHeader(sock, 200, "OK", "application/octet-stream", body,
+	const std::string head = buildResponseHead(200, "OK", "application/octet-stream", info.size,
 		"Content-Disposition: attachment; filename=\"pocket-dial-coredump.bin\"");
+	if (!sendAllBytes(sock, head.data(), head.size())) return;
+	for (uint32_t off = 0;;)
+	{
+		if (!sendAllBytes(sock, reinterpret_cast<const char*>(buf.get()), len)) return;
+		off += static_cast<uint32_t>(len);
+		if (off >= info.size) return;
+		len = std::min(kChunk, static_cast<size_t>(info.size - off));
+		// A mid-stream failure can no longer change the status line; stopping
+		// short of Content-Length is what tells the client the body is bad.
+		if (!CoreDumpStore::read(off, buf.get(), len)) return;
+	}
 }
 
 void HttpServer::sendApiCoreDumpErase(int sock)

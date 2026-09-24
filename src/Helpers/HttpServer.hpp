@@ -171,6 +171,12 @@ private:
 	void sendResponseWithHeader(int sock, int statusCode, const std::string& statusText,
 	                   const std::string& contentType, const std::string& body,
 	                   const std::string& extraHeader);
+	// Every response's status line + headers (security headers included), for a
+	// body sent separately -- the streamed /api/coredump download (#382).
+	static std::string buildResponseHead(int statusCode, const std::string& statusText,
+	                   const std::string& contentType, size_t contentLength,
+	                   const std::string& extraHeader);
+	static bool sendAllBytes(int sock, const char* ptr, size_t len);
 	void sendRedirect(int sock, const std::string& location);
 	// Takes the request so the rendered page can carry this session's CSRF token.
 	void sendHtml(int sock, const HttpRequest& req);

@@ -194,6 +194,27 @@ TEST_F(CoreDumpHttpTest, DownloadIsOwnerOnlyAndReturnsTheExactBytes)
 		<< "the download must be the stored image byte for byte";
 }
 
+TEST_F(CoreDumpHttpTest, StreamedDownloadIsExactOnAChunkBoundary)
+{
+	// The download is streamed in 1 KB chunks (a whole-dump buffer made
+	// esp_flash_read() borrow 16 KB of internal DRAM). The 1500-byte image
+	// above ends mid-chunk; this one is an exact multiple, where an off-by-one
+	// in the chunk loop would drop or repeat the last chunk.
+	AdminSession sysop, owner;
+	provisionBoth(_port, sysop, owner);
+	std::vector<uint8_t> img = fakeImage();
+	img.resize(3 * 1024);
+	for (size_t i = 1500; i < img.size(); ++i) img[i] = static_cast<uint8_t>(i * 13 + 1);
+	CoreDumpStore::setImageForTest(img);
+
+	const std::string resp = httpRaw(_port, "GET", "/api/coredump", "", "pd_session=" + owner.cookie);
+	ASSERT_EQ(statusOf(resp), 200);
+	EXPECT_NE(resp.find("Content-Length: 3072\r\n"), std::string::npos);
+	const std::string body = bodyOf(resp);
+	ASSERT_EQ(body.size(), img.size());
+	EXPECT_EQ(0, std::memcmp(body.data(), img.data(), img.size()));
+}
+
 TEST_F(CoreDumpHttpTest, DownloadFallsBackToSysopOnlyWhileNoOwnerExists)
 {
 	// Same no-owner-yet fallback as every #173 owner action: a board upgraded
