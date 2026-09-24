@@ -158,6 +158,53 @@ namespace
 	}
 }
 
+// A response RELAYED between two lines of one handset must NOT be refused.
+// #424 review (Sonny-OG): a multi-line phone (the T29 on .244) registers every
+// line from one IP:port, so on a line1 -> line2 call the callee's 180 and 200
+// are relayed to the very address they came from, with the same Call-ID and
+// CSeq. By address they are indistinguishable from a reply; only the relay
+// mark tells them apart. Dropping them would leave every such call unanswered.
+TEST(NoReplyToResponse, RelayedResponsesBetweenTwoLinesOfOneHandsetAreNotRefused)
+{
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.24.1", 5060, recorder(sent));
+	const sockaddr_in handset = addrFor("192.168.24.30");
+
+	handler.handle(makeRegister("101", "192.168.24.30"));
+	handler.handle(makeRegister("102", "192.168.24.30"));
+	sent.clear();
+	const auto refusedBefore = handler.getRepliesRefused();
+
+	handler.handle(makeInvite("101", "102", "192.168.24.30", "twoline-424"));
+	std::string relayed;
+	for (const auto& s : sent)
+		if (sameAddr(s.to, handset) && s.raw.rfind("INVITE sip:102@", 0) == 0) relayed = s.raw;
+	ASSERT_FALSE(relayed.empty()) << "precondition: the INVITE is relayed to line 2, at the same address";
+	const std::string callId = headerLine(relayed, "Call-ID:");
+	const std::string cseq = headerLine(relayed, "CSeq:");
+	sent.clear();
+
+	handler.handle(answerTo(relayed, "SIP/2.0 180 Ringing", "102", "192.168.24.30", false));
+	handler.handle(answerTo(relayed, "SIP/2.0 200 OK", "102", "192.168.24.30", true));
+
+	bool got180 = false, got200 = false;
+	for (const auto& s : sent)
+	{
+		if (!sameAddr(s.to, handset) || headerLine(s.raw, "Call-ID:") != callId ||
+			headerLine(s.raw, "CSeq:") != cseq) continue;
+		if (s.raw.rfind("SIP/2.0 180", 0) == 0) got180 = true;
+		if (s.raw.rfind("SIP/2.0 200", 0) == 0) got200 = true;
+		EXPECT_EQ(s.raw.rfind("SIP/2.0 404", 0), std::string::npos) << "no stray 404 either:\n" << s.raw;
+	}
+	EXPECT_TRUE(got180) << "line 2's 180 must be relayed to line 1";
+	EXPECT_TRUE(got200) << "line 2's 200 must be relayed to line 1";
+	EXPECT_EQ(handler.getRepliesRefused(), refusedBefore) << "a relay was refused as a reply";
+
+	auto session = handler.getSession(callId);
+	ASSERT_TRUE(session.has_value());
+	EXPECT_EQ(session.value()->getState(), Session::State::Connected) << "the line-to-line call is answered";
+}
+
 // (a) The register beep's 100 Trying must not be answered, and the beep must
 // still complete: the phone's 200 is ACKed and the leg is hung up with a BYE.
 TEST(NoReplyToResponse, RegisterBeepTryingIsNeverAnsweredAndTheBeepStillCompletes)
