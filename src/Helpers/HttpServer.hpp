@@ -209,6 +209,12 @@ private:
 	// Issue #32: the same capture ring as JSON, for the dashboard's polling live
 	// tracer. Session-gated by the caller, same as sendApiPcap.
 	void sendApiTrace(int sock);
+	// Issue #382: the panic handler's flash coredump (CoreDumpStore). Each is
+	// reached only through requireAdmin(); the raw download is Owner-gated (with
+	// #173's no-owner-yet fallback to sysop).
+	void sendApiCoreDumpInfo(int sock);
+	void sendApiCoreDump(int sock);
+	void sendApiCoreDumpErase(int sock);
 
 	// Issue #35, #234: Serves phone auto-provisioning config for supported vendors.
 	void sendProvisioningResponse(int sock, const HttpRequest& req);

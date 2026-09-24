@@ -8,6 +8,7 @@
 #include "CallDetailRecord.hpp"
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive wipe on factory reset
 #include "AdminAuth.hpp"
+#include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
 #include "DeviceConfig.hpp"
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
@@ -746,6 +747,37 @@ void HttpServer::handleClient(int clientSock)
 		if (requireAdmin(clientSock, req, false))
 		{
 			sendApiPcap(clientSock);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/api/coredump/info")
+	{
+		// Issue #382: which task panicked, at what PC, from which ELF. Gated like
+		// /api/pcap -- a PC and task name are diagnostic detail, not login-form
+		// material (THREAT_MODEL.md section 4 E-2).
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiCoreDumpInfo(clientSock);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/api/coredump")
+	{
+		// Issue #382: the raw dump. Owner-gated, the same tier as config export
+		// WITH secrets (#173): a coredump is a copy of task stacks at the moment
+		// of the panic, and a stack can hold a digest secret, an OAuth token or a
+		// TLS session key as easily as a return address. Like every #173 owner
+		// action, a sysop passes while NO owner account exists yet
+		// (AdminAuth::sessionSatisfiesRole's no-owner fallback).
+		if (requireAdmin(clientSock, req, false, AdminAuth::Role::Owner))
+		{
+			sendApiCoreDump(clientSock);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/coredump/erase")
+	{
+		// Mutating (destroys evidence), so CSRF-checked like every other POST.
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiCoreDumpErase(clientSock);
 		}
 	}
 	else if (req.method == "GET" && req.path == "/api/trace")
@@ -1658,6 +1690,15 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	        "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
 	        "\"stackHwm_conf_mix_tick\":null,\"stackHwm_http_conn\":null";
 #endif
+	// Issue #382: ungated for the same reason resetReason is -- "a dump exists,
+	// N bytes" is the fact a bench run needs to notice an unwatched panic, and it
+	// discloses nothing the reset reason above does not. The dump itself and its
+	// summary stay behind /api/coredump*.
+	{
+		const CoreDumpStore::Info cd = CoreDumpStore::query();
+		json << ",\"coredump\":{\"present\":" << (cd.present ? "true" : "false")
+		     << ",\"size\":" << cd.size << "}";
+	}
 
 	// Issue #328: L2 transmit-path health, in one object, on the UNGATED route.
 	//
@@ -1964,6 +2005,72 @@ void HttpServer::sendApiPcap(int sock)
 	// the guard lives, not whether this function performs it.
 	sendResponseWithHeader(sock, 200, "OK", "application/vnd.tcpdump.pcap", pcap,
 		"Content-Disposition: attachment; filename=\"pocket-dial.pcap\"");
+}
+
+void HttpServer::sendApiCoreDumpInfo(int sock)
+{
+	// Issue #382. Reached only through requireAdmin() -- see the route table.
+	const CoreDumpStore::Info info = CoreDumpStore::query();
+	std::ostringstream json;
+	json << "{\"supported\":" << (info.supported ? "true" : "false")
+	     << ",\"present\":" << (info.present ? "true" : "false")
+	     << ",\"size\":" << info.size;
+	if (info.present)
+	{
+		const CoreDumpStore::Summary s = CoreDumpStore::summary();
+		char pc[11];
+		std::snprintf(pc, sizeof(pc), "0x%08x", static_cast<unsigned>(s.pc));
+		json << ",\"valid\":" << (s.valid ? "true" : "false")
+		     << ",\"task\":\"" << jsonEscape(s.task) << "\""
+		     << ",\"pc\":\"" << pc << "\""
+		     << ",\"elfSha\":\"" << jsonEscape(s.elfSha) << "\""
+		     << ",\"reason\":\"" << jsonEscape(s.reason) << "\"";
+	}
+	json << "}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiCoreDump(int sock)
+{
+	// Issue #382. Reached only through requireAdmin(..., Owner). The body is the
+	// raw flash image (header + ELF + checksum), exactly what
+	// `esp-coredump info_corefile -t raw -c <file> <SipServer.elf>` reads -- see
+	// docs/COREDUMP.md. Built as one string like sendApiPcap(). Cost, stated so
+	// nobody has to re-derive it on a #328 board: the partition is at most 56 KB,
+	// which is above CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL (16384), so this buffer
+	// and sendResponseWithHeader()'s two copies (ostringstream + str()) all land
+	// in PSRAM -- ~170 KB transient out of 8 MB, zero internal DRAM.
+	const CoreDumpStore::Info info = CoreDumpStore::query();
+	if (!info.present)
+	{
+		sendResponse(sock, 404, "Not Found", "application/json",
+			std::string("{\"error\":\"") + (info.supported ? "no coredump stored" : "coredump not supported") + "\"}");
+		return;
+	}
+	std::string body(info.size, '\0');
+	if (!CoreDumpStore::read(0, reinterpret_cast<uint8_t*>(&body[0]), body.size()))
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+			"{\"error\":\"coredump read failed\"}");
+		return;
+	}
+	sendResponseWithHeader(sock, 200, "OK", "application/octet-stream", body,
+		"Content-Disposition: attachment; filename=\"pocket-dial-coredump.bin\"");
+}
+
+void HttpServer::sendApiCoreDumpErase(int sock)
+{
+	// Issue #382. Reached only through requireAdmin(..., needCsrf=true).
+	const CoreDumpStore::Info info = CoreDumpStore::query();
+	if (!info.supported)
+	{
+		sendResponse(sock, 404, "Not Found", "application/json",
+			"{\"error\":\"coredump not supported\"}");
+		return;
+	}
+	const bool ok = CoreDumpStore::erase();
+	sendResponse(sock, ok ? 200 : 500, ok ? "OK" : "Internal Server Error", "application/json",
+		std::string("{\"erased\":") + (ok ? "true" : "false") + "}");
 }
 
 void HttpServer::sendApiTrace(int sock)
