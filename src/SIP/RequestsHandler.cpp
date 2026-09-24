@@ -5545,6 +5545,7 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 						// their own answer paths and keep their existing
 						// behaviour.
 						const bool relayDialog = !session.value()->isTrunk() &&
+							!session.value()->isAnchorInbound() &&
 							legDest->getNumber() != kAnchorCallExt;
 						if (relayDialog)
 						{
@@ -9117,6 +9118,19 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		resp->setHeader("SIP/2.0 488 Not Acceptable Here");
 		resp->clearBody();
 		_outbox.emplace_back(data->getSource(), std::move(resp));
+		return;
+	}
+
+	// Inbound anchored call (PSTN -> handset): src is the synthetic PSTN peer,
+	// allocated with a ZEROED address, and dest is the handset -- there is no SIP
+	// peer to relay to, and this PBX is the handset's UAS. A refresh is answered
+	// here, with the Contact the handset was offered (buildInboundInviteFork uses
+	// the handset's own DN as the dialog user, which is this request's To-user).
+	// Review catch on #439: without this the reordered classification forwarded
+	// the refresh to 0.0.0.0 and nobody answered it.
+	if (session->isAnchorInbound() && !data->hasSdp())
+	{
+		answerRefreshLocally();
 		return;
 	}
 

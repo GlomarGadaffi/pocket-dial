@@ -308,6 +308,79 @@ TEST(TargetRefreshContact, SdpUpdateOnARelayCallReachesTheCalleeWithThePbxContac
 	EXPECT_EQ(headerLine(atCallee, "Contact:"), pbxContactFor("100"));
 }
 
+// ── #198: refresh on an INBOUND anchored call (PSTN -> handset) ──────────────
+// Review catch on #439 (G-dubs). The session's src is the synthetic PSTN peer,
+// allocated with a ZEROED address; dest is the handset. It is neither 555, 777
+// nor a trunk, so the first cut of the reordered onUpdate() classified it as a
+// relay dialog and forwarded the handset's refresh to 0.0.0.0 -- never answered
+// -- where main had answered it locally. The PBX is the handset's UAS here.
+
+TEST(TargetRefreshContact, BodilessRefreshOnAnInboundAnchoredCallIsAnsweredLocallyNotSentToThePstnPeer)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	handler.handle(makeRegister("106", kCalleeIp));
+
+	const std::string callIdLine = handler.routeInboundAnchorCallForTest("106", "part-inbound-1", "5551234567");
+	ASSERT_FALSE(callIdLine.empty()) << "precondition: an inbound anchored session must exist";
+
+	// The handset must ANSWER first. Before the answer the session has no dest,
+	// and `!dest` already routes to the local answer -- a green result for the
+	// wrong reason (the first draft of this test passed on the broken code for
+	// exactly that). The review's case is the answered call: dest == handset.
+	handler.tick();   // drainOutbox() merges _asyncOutbox, where the fork INVITE waits
+	const std::string fork = findSentTo(sent, addrFor(kCalleeIp), "INVITE sip:106@");
+	ASSERT_FALSE(fork.empty()) << "precondition: the inbound call must be forked to the handset";
+	{
+		std::string body = sdpBody("sendrecv");
+		std::string ok =
+			"SIP/2.0 200 OK\r\n" +
+			headerLine(fork, "Via:") + "\r\n" +
+			headerLine(fork, "From:") + "\r\n"
+			"To: <sip:106@" + std::string(kPbxIp) + ">;tag=hs106\r\n" +
+			callIdLine + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Contact: <sip:106@" + std::string(kCalleeIp) + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		handler.handle(RequestsHandler::getMessageFromPool(ok, addrFor(kCalleeIp)));
+	}
+	auto sess = handler.getSession(callIdLine);
+	ASSERT_TRUE(sess.has_value());
+	ASSERT_EQ(sess.value()->getState(), Session::State::Connected) << "precondition: the handset answered";
+	ASSERT_TRUE(sess.value()->getDest()) << "precondition: dest is the handset, the review's case";
+	ASSERT_EQ(sess.value()->getDest()->getNumber(), "106");
+
+	// The handset's in-dialog refresh. On this dialog the PBX's own From/Contact
+	// user is the handset's DN (buildInboundInviteFork), so the refresh's To-user
+	// is 106 and the Contact the handset was offered is contactFor("106").
+	std::string raw =
+		"UPDATE sip:106@" + std::string(kPbxIp) + ":5060 SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kCalleeIp) + ":5060;branch=z9hG4bKinbupd\r\n"
+		"From: <sip:106@" + std::string(kPbxIp) + ">;tag=hs106\r\n"
+		"To: <sip:106@" + std::string(kPbxIp) + ":5060>;tag=pbxtag\r\n" +
+		callIdLine + "\r\n"
+		"CSeq: 2 UPDATE\r\n"
+		"Contact: <sip:106@" + std::string(kCalleeIp) + ":5060>\r\n"
+		"Session-Expires: 90;refresher=uac\r\n"
+		"Content-Length: 0\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kCalleeIp)));
+
+	size_t toZero = 0;
+	for (const auto& [a, msg] : sent)
+	{
+		if (a.sin_addr.s_addr == 0 && msg && msg->toString().find("CSeq: 2 UPDATE") != std::string::npos) ++toZero;
+	}
+	EXPECT_EQ(toZero, 0u) << "the refresh must never be relayed to the PSTN peer's zeroed address";
+
+	std::string atHandset = findSentTo(sent, addrFor(kCalleeIp), "CSeq: 2 UPDATE");
+	ASSERT_FALSE(atHandset.empty()) << "the PBX is the handset's UAS here: it must answer the refresh";
+	EXPECT_NE(atHandset.find("SIP/2.0 200 OK"), std::string::npos);
+	EXPECT_EQ(headerLine(atHandset, "Contact:"), pbxContactFor("106"))
+		<< "the answer must carry the Contact the handset was offered on this dialog";
+}
+
 // ── #198: session-refresh UPDATE on a leg the PBX terminates (777) ───────────
 
 TEST(TargetRefreshContact, BodilessRefreshUpdateOn777IsAnsweredWithThePbxsOwnContact)
