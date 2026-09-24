@@ -195,13 +195,6 @@ class PjsuaUA:
         self.cli = PjsuaCli(self.cli_port)
         return self
 
-    def log(self):
-        try:
-            with open(self.logfile, "r", errors="replace") as f:
-                return f.read()
-        except OSError:
-            return ""
-
     def mark(self):
         """Byte offset into the log, so later waits ignore earlier scenarios."""
         try:
@@ -210,7 +203,16 @@ class PjsuaUA:
             return 0
 
     def log_since(self, mark):
-        return self.log()[mark:]
+        # Seek in BYTES, the unit mark() records. Slicing text-mode read() output
+        # by a byte offset starts late by one char per \r\n before the mark (text
+        # mode folds each to \n), and the log carries full SIP messages, so by
+        # mid-suite that is ~2000 chars of skipped fresh log -- issue #378.
+        try:
+            with open(self.logfile, "rb") as f:
+                f.seek(mark)
+                return f.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
 
     def wait_log(self, pattern, timeout=8.0, mark=0, flags=0):
         rx = re.compile(pattern, flags)
