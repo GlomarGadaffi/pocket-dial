@@ -92,19 +92,10 @@ jobs:
           cmake --install cppcheck-build
 
       - name: Run Static Analysis (cppcheck)
-        run: |
-          export PATH="$HOME/cppcheck-install/bin:$PATH"
-          cppcheck --version
-          cppcheck --error-exitcode=1 \
-                   --enable=warning,performance \
-                   --inline-suppr \
-                   --suppress=missingIncludeSystem \
-                   --suppress=unmatchedSuppression \
-                   --suppress=*:main/ui/qrcode.c \
-                   --suppress=*:main/ui/qrcode.h \
-                   --suppress=unknownMacro:main/ui/ui.cpp \
-                   -I src/Helpers -I src/SIP -I main \
-                   src/ main/
+        # The invocation and its suppressions (including why Sdp.cpp is
+        # suppressed) live in tools/ci/run_cppcheck.sh, shared with the
+        # other workflow so the two gates can't drift apart again.
+        run: bash tools/ci/run_cppcheck.sh
 
       - name: Configure CMake (Host Build)
         run: |
