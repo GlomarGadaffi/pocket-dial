@@ -22,9 +22,13 @@ on:
 permissions:
   contents: read
 
+# Same shape as ci.yml's (#423): PR runs group per PR and cancel only on a new
+# head SHA (never the current head, whose cancelled check would block the
+# merge); main pushes and dispatches group per SHA, so back-to-back merges
+# never cancel -- or, via GitHub's one-pending-per-group rule, drop -- each other.
 concurrency:
-  group: interop-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
 
 jobs:
   interop:
