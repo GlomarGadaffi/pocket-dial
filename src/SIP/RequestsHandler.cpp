@@ -933,6 +933,11 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// drainOutbox() reads this to keep a retransmit timer off it; see the
 		// member's declaration for why that matters.
 		_passThroughMsg = request.get();
+		// #424: drainOutbox() refuses any reply to a response or an ACK.
+		if (request->getStatusInfo().has_value() || request->getType() == SipMessageTypes::ACK)
+			_noReplyInbound = request;
+		else
+			_noReplyInbound.reset();
 
 		if (!sdpRefused && !absorbed)
 		{
@@ -1087,6 +1092,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 
 		localOutbox = drainOutbox();
 		_passThroughMsg = nullptr;
+		_noReplyInbound.reset();
 
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -7383,6 +7389,32 @@ uint64_t RequestsHandler::getSdpRejected() const
 	return _sdpRejected.load(std::memory_order_relaxed);
 }
 
+uint64_t RequestsHandler::getRepliesRefused() const
+{
+	return _repliesRefused.load(std::memory_order_relaxed);
+}
+
+// A reply to _noReplyInbound is a RESPONSE, sent back to the address the
+// inbound message came from, in the same transaction: same Call-ID and same
+// CSeq line (number and method). Every "answer" a handler builds is a clone of
+// the message it answers, so it carries both unchanged. A relay of the inbound
+// response goes to the OTHER leg's address, and an ACK or BYE the PBX sends in
+// reaction is a request, so neither matches.
+bool RequestsHandler::isReplyToUnanswerable(const sockaddr_in& addr, const SipMessage& msg)
+{
+	const SipMessage& in = *_noReplyInbound;
+	if (!msg.getStatusInfo().has_value()) return false;
+	if (!sameAddress(addr, in.getSource())) return false;
+	if (msg.getCallID() != in.getCallID() || msg.getCSeq() != in.getCSeq()) return false;
+
+	_repliesRefused.fetch_add(1, std::memory_order_relaxed);
+	queueLog("[SIP] #424 refused a reply to " +
+		std::string(in.getStatusInfo().has_value() ? "a response" : "an ACK") + ": " +
+		std::string(msg.getHeader()) + " / " + std::string(in.getCSeq()) + " " +
+		std::string(in.getCallID()), true);
+	return true;
+}
+
 void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipMessage::SdpVerdict verdict)
 {
 	_sdpRejected.fetch_add(1, std::memory_order_relaxed);
@@ -7928,6 +7960,7 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 	bool sent = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
+		_noReplyInbound.reset();   // #424: no inbound message owns this drain
 
 		auto client = findClient(ext);
 		if (!client.has_value())
@@ -8117,6 +8150,7 @@ void RequestsHandler::tick()
 		// pointer left behind would silently suppress retransmit tracking for
 		// whatever pooled SipMessage next lands on that address.
 		_passThroughMsg = nullptr;
+		_noReplyInbound.reset();   // #424: same reason; a tick answers nothing
 
 		// The only drain a conference gets when nobody is signalling: an 888 leg
 		// carries RTP but no SIP, so feature codes pressed mid-conference arrive
@@ -9418,6 +9452,16 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 	// ring-back, hunt-group next-ring, CFNA redirect — and now the async-anchor
 	// merge above), which is exactly why it belongs at the drain rather than at
 	// any individual enqueue.
+	// Issue #424: nothing answers a response or an ACK. Refused here, before
+	// retransmit tracking, because a refused reply that got tracked would be
+	// re-sent on Timer G for 32 s (what the register beep's stray 404 did).
+	if (_noReplyInbound)
+	{
+		_outbox.erase(std::remove_if(_outbox.begin(), _outbox.end(),
+			[this](const auto& e) { return e.second && isReplyToUnanswerable(e.first, *e.second); }),
+			_outbox.end());
+	}
+
 	for (const auto& [addr, msg] : _outbox)
 	{
 		// Skip the one thing that is not ours to retransmit: the inbound message

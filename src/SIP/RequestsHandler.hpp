@@ -159,6 +159,9 @@ public:
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
 	// drop (responses, ACK).
 	uint64_t getSdpRejected() const;
+	// Issue #424: responses drainOutbox() refused to send because they answered
+	// a response or an ACK. Any non-zero value is a handler bug the guard caught.
+	uint64_t getRepliesRefused() const;
 	size_t getClientCount();
 	size_t getSessionCount();
 	// Legs currently mixed on the meet-me conference (virtual extension 888); 0 while
@@ -1249,6 +1252,7 @@ public:
 	void sweepVoicemailLegsForTest()
 	{
 		sweepVoicemailLegs(std::chrono::steady_clock::now());
+		_noReplyInbound.reset();
 		auto localOutbox = drainOutbox();
 		auto localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -1861,6 +1865,22 @@ private:
 	// and the shared_ptr in `request` outlives the whole pass.
 	const SipMessage* _passThroughMsg = nullptr;
 
+	// Issue #424: the inbound message of this handle() pass when it is one that
+	// must never be answered, a response (RFC 3261 §17.1) or an ACK (§17.2.1);
+	// null otherwise. drainOutbox() refuses any response addressed back to its
+	// sender in the same transaction (same Call-ID and CSeq), whichever handler
+	// built it. That makes "reply to a response or an ACK" impossible at the one
+	// exit, rather than one handler claim at a time: endHandle()'s not-found
+	// branch did it for an unclaimed 100 Trying (the register beep) and for an
+	// ACK (park retrieve), and it has 35 callers.
+	//
+	// A shared_ptr, unlike _passThroughMsg, because drainOutbox() dereferences
+	// it: a stale one can then only cost a refusal, never a dangling read. It is
+	// reset after handle()'s drain and at the top of every other drain path.
+	std::shared_ptr<SipMessage> _noReplyInbound;
+	// Refuses (and counts, and logs) `msg` if it is a reply to _noReplyInbound.
+	bool isReplyToUnanswerable(const sockaddr_in& addr, const SipMessage& msg);
+
 	// ── RFC 4733 DTMF hand-off ring ─────────────────────────────────────────────
 	// Producer: any RTP receive task (one per conference leg / anchor bridge).
 	// Consumer: the SIP thread, via drainDtmfInbox() from handle() and tick().
@@ -1897,6 +1917,7 @@ private:
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	std::atomic<uint64_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
 	// count is the packet-loss signal this layer exists to absorb, so it is worth

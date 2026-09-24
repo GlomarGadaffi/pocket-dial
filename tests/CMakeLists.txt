@@ -368,6 +368,7 @@ add_executable(sip_parser_tests
     # race in both directions, and the cross-dialog BYE bridge are all
     # asserted at the wire level.
     CallPickup_test.cpp
+    NoReplyToResponse_test.cpp
     RegisterBeeper_test.cpp
     # Issue #148: the duplicate-tracking feedback loop between sweep()'s Timer-A
     # retransmit and drainOutbox()'s maybeTrack() scan, driven directly so the
