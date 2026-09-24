@@ -742,25 +742,6 @@ RequestsHandler::~RequestsHandler()
 	}
 }
 
-// Same bounded-fallback bookkeeping for the virtual-peer pool as the message
-// pool uses (SipMessagePool.cpp). Separate budget: a virtual peer is a
-// long-lived per-park-slot stand-in, not a per-packet object.
-static std::atomic<std::size_t> s_vpeerHeapFallbacksInFlight{0};
-
-namespace
-{
-	// Same no-locking rule as SipMessagePool's HeapFallbackDeleter: the last
-	// reference can drop while a pool-critical-section lock is held elsewhere,
-	// so the deleter must not itself take any lock.
-	struct VpeerFallbackDeleter
-	{
-		void operator()(SipClient* p) const noexcept
-		{
-			delete p;
-			s_vpeerHeapFallbacksInFlight.fetch_sub(1, std::memory_order_relaxed);
-		}
-	};
-}
 
 // Forwarders onto the static pool in SipMessagePool.cpp (Issue #53 / #101(A) /
 // #101(E)). Kept as public statics on RequestsHandler because SipMessageFactory,
@@ -1790,7 +1771,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		// pool is sized POCKETDIAL_MAX_SESSIONS + POCKETDIAL_PARK_SLOTS, so the
 		// allocateSession() above is the real gate and this should never fail —
 		// but unlike drawbridge's allocator, which always heap-falls-back, ours
-		// returns nullptr past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX, so the null
+		// returns nullptr once the pool is empty (#409), so the null
 		// MUST be checked: setDest(nullptr) would publish a Connected session
 		// whose teardown/CDR paths dereference getDest(). Refuse with the same
 		// 503 the session-pool-full branch above sends, and refuse HERE, before
@@ -2296,7 +2277,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	// slot for a session that never existed. The pool is sized
 	// POCKETDIAL_MAX_SESSIONS + POCKETDIAL_PARK_SLOTS, so with the session in
 	// hand this should never fail — but pocket-dial's allocator returns nullptr
-	// past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX (drawbridge's always heap-falls
+	// once the pool is empty (#409; drawbridge's always heap-falls
 	// back), and setDest(nullptr) would publish a Connected session whose
 	// teardown/CDR paths dereference getDest(). Unwind the RTP stream and answer
 	// 503, exactly as the session-pool-full branch directly above does.
@@ -9574,42 +9555,17 @@ std::shared_ptr<SipClient> RequestsHandler::allocateVirtualPeer(std::string numb
 			return peer;
 		}
 	}
-	// Pool drained: fall back to the heap, bounded the same way the message pool
-	// is (Issue #101(A)). Past the ceiling this returns nullptr and the caller
-	// abandons the park/BLF operation rather than allocating without limit.
+	// Pool drained: REFUSE. There is no heap fallback (#409): the #101(A)
+	// fallback did `new SipClient` on the SIP task, from internal DRAM, exactly
+	// when the pool had run out. Every caller handles nullptr by refusing its
+	// request (#412) -- 503 to the phone, or dropping the anchor leg.
 	//
-	// No pool lock here, unlike SipMessagePool's acquirePooledMessage(): _virtualPeerPool is a
-	// per-instance member and every caller — the internal sites and ParkOrbit via
-	// PbxEnv::allocVirtualPeer — already runs under _mutex. The counter is still
-	// atomic because its decrement happens in the deleter, which runs wherever
-	// the owning Session finally releases it.
+	// No pool lock here, unlike SipMessagePool's acquirePooledMessage():
+	// _virtualPeerPool is a per-instance member and every caller -- the internal
+	// sites and ParkOrbit via PbxEnv::allocVirtualPeer -- already runs under _mutex.
 	static std::atomic<std::size_t> vpeerWarnCount{0};
-	if (s_vpeerHeapFallbacksInFlight.load(std::memory_order_relaxed) >= POCKETDIAL_VPEER_HEAP_FALLBACK_MAX)
-	{
-		sipmsgpool::logPoolExhausted("Virtual-peer", sipmsgpool::PoolPressure::Refused, vpeerWarnCount);
-		return nullptr;
-	}
-	sipmsgpool::logPoolExhausted("Virtual-peer", sipmsgpool::PoolPressure::Fallback, vpeerWarnCount);
-
-	SipClient* raw = nullptr;
-	try
-	{
-		raw = new SipClient(std::move(number), address, expiresSeconds);
-	}
-	catch (const std::bad_alloc&)
-	{
-		return nullptr;   // budget untouched
-	}
-	s_vpeerHeapFallbacksInFlight.fetch_add(1, std::memory_order_relaxed);
-	try
-	{
-		return std::shared_ptr<SipClient>(raw, VpeerFallbackDeleter{});
-	}
-	catch (const std::bad_alloc&)
-	{
-		// Constructor already ran the deleter on `raw` — freed and decremented.
-		return nullptr;
-	}
+	sipmsgpool::logPoolExhausted("Virtual-peer", vpeerWarnCount);
+	return nullptr;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

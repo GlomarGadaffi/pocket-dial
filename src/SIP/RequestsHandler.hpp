@@ -371,13 +371,17 @@ public:
 	// until it refuses, and hand back everything it gave out. Hold the vector
 	// to keep capacity exhausted; drop it to restore. Drawing through
 	// allocateVirtualPeer() rather than reading _virtualPeerPool directly is
-	// deliberate -- it exhausts whatever the allocator has behind the pool
-	// too (the #101A heap fallback while it exists), so the next draw really
-	// returns nullptr, which is the state every caller must survive.
-	std::vector<std::shared_ptr<SipClient>> exhaustVirtualPeersForTest()
+	// deliberate -- it exhausts the allocator's real capacity whatever that
+	// is (since #409 there is no heap fallback behind the pool), so the next
+	// draw really returns nullptr, which is the state every caller must survive.
+	//
+	// `maxDraws` caps the draws, so a test can take exactly the pool's worth and
+	// then measure the single draw past it in isolation (#409's gate).
+	std::vector<std::shared_ptr<SipClient>> exhaustVirtualPeersForTest(
+		size_t maxDraws = 4 * POCKETDIAL_VIRTUAL_PEERS + 64)
 	{
 		std::vector<std::shared_ptr<SipClient>> held;
-		for (size_t guard = 0; guard < 4 * POCKETDIAL_VIRTUAL_PEERS + 64; ++guard)
+		for (size_t guard = 0; guard < maxDraws; ++guard)
 		{
 			auto p = allocateVirtualPeer("vpeer-drain", sockaddr_in{});
 			if (!p) break;

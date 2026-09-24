@@ -1,7 +1,7 @@
 // VpeerExhaustion_vm_anchor_test.cpp — Issue #412: every caller of
 // RequestsHandler::allocateVirtualPeer() must survive a nullptr, which it
-// returns once its capacity is spent (the pool, plus the #101A heap fallback
-// until #409 removes it).
+// returns once its capacity -- the pool, with no heap fallback since #409 --
+// is spent.
 // This file pins the voicemail and anchor call sites; the conference site
 // lives beside it in VpeerExhaustion_test.cpp.
 //

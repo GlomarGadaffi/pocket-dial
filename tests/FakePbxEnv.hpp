@@ -58,8 +58,8 @@ public:
 	// Set false to simulate a drained session pool (the 503 guard paths).
 	bool sessionPoolAvailable = true;
 	// Set false to simulate an exhausted message pool (Issue #101(A) territory):
-	// messageFromPool() returns nullptr, as the real pool does once it and its
-	// bounded heap fallback are both spent.
+	// messageFromPool() returns nullptr, as the real pool does once it is empty
+	// (since #409 nothing sits behind it: the pool is the whole capacity).
 	bool messagePoolAvailable = true;
 
 	// Call-IDs passed to freeTransactionsForCallId(), in order.

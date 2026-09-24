@@ -40,27 +40,6 @@ namespace sipmsgpool
 		// #101(E) audit, fixed here because it lives in the function #101(A) rewrites.
 		std::mutex s_msgPoolMutex;
 
-		// Heap-fallback messages currently alive. Atomic because the decrement happens
-		// in the deleter, which runs wherever the last reference happens to drop —
-		// commonly on the socket-send path after the outbox is drained, outside every
-		// lock we hold here.
-		std::atomic<std::size_t> s_msgHeapFallbacksInFlight{0};
-
-		// Releases a bounded heap-fallback message and gives its budget back.
-		//
-		// MUST NOT take s_msgPoolMutex (or any lock): the last reference can drop
-		// while that mutex is held — dropping a superseded message inside the pool
-		// critical section would self-deadlock on a non-recursive mutex. An atomic
-		// decrement is all this is allowed to do.
-		struct HeapFallbackDeleter
-		{
-			void operator()(SipMessage* p) const noexcept
-			{
-				delete p;
-				s_msgHeapFallbacksInFlight.fetch_sub(1, std::memory_order_relaxed);
-			}
-		};
-
 		std::shared_ptr<SipMessage> acquirePooledMessage()
 		{
 			std::lock_guard<std::mutex> poolLock(s_msgPoolMutex);
@@ -86,47 +65,21 @@ namespace sipmsgpool
 				}
 			}
 
-			// Pool drawn down: fall back to the heap, but only up to a fixed number alive
-			// at once (Issue #101(A)). Past that, refuse and let the caller drop. Both
-			// transitions are logged, from here rather than the callers, so the two
-			// getMessageFromPool overloads share one rate-limit counter per pool instead
-			// of each sampling 1-in-100 independently under the same label.
+			// Pool drawn down: REFUSE. There is no heap fallback (#409, desmo's rule:
+			// no dynamic allocation on any task after init). The #101A fallback this
+			// replaces heap-allocated a SipSdpMessage from internal DRAM -- on the SIP
+			// task, under exactly the memory pressure #328 is about -- so "degrading"
+			// meant spending the scarcest resource at the worst moment. Callers already
+			// treat nullptr as drop-and-let-the-peer-retransmit (see the header).
+			// Logged from here rather than the callers so the two getMessageFromPool
+			// overloads share one rate-limit counter per pool.
 			static std::atomic<std::size_t> msgWarnCount{0};
-			if (s_msgHeapFallbacksInFlight.load(std::memory_order_relaxed) >= POCKETDIAL_MSG_HEAP_FALLBACK_MAX)
-			{
-				logPoolExhausted("SIP Message", PoolPressure::Refused, msgWarnCount);
-				return nullptr;
-			}
-			logPoolExhausted("SIP Message", PoolPressure::Fallback, msgWarnCount);
-
-			SipMessage* raw = nullptr;
-			try
-			{
-				raw = new SipSdpMessage("", sockaddr_in{});
-			}
-			catch (const std::bad_alloc&)
-			{
-				return nullptr;   // budget untouched — nothing was handed out
-			}
-
-			s_msgHeapFallbacksInFlight.fetch_add(1, std::memory_order_relaxed);
-			try
-			{
-				return std::shared_ptr<SipMessage>(raw, HeapFallbackDeleter{});
-			}
-			catch (const std::bad_alloc&)
-			{
-				// The shared_ptr constructor takes ownership of `raw` before it can throw,
-				// and the standard requires it to run the deleter if it does. So `raw` is
-				// already deleted and the counter already decremented — undoing either
-				// here would be a double free / double decrement.
-				return nullptr;
-			}
+			logPoolExhausted("SIP Message", msgWarnCount);
+			return nullptr;
 		}
 	}   // namespace
 
-	void logPoolExhausted(const char* poolName, PoolPressure level,
-		std::atomic<std::size_t>& warnCount)
+	void logPoolExhausted(const char* poolName, std::atomic<std::size_t>& warnCount)
 	{
 		// Rate-limited 1-in-100: a flood that drains the pool would otherwise also
 		// flood the log pipe. The running total is kept in the message so the sampling
@@ -135,10 +88,7 @@ namespace sipmsgpool
 		if ((n - 1) % 100 == 0)
 		{
 			std::cerr << "[WARNING] " << poolName << " pool exhausted ("
-				<< n << " total)! "
-				<< (level == PoolPressure::Fallback
-					? "Falling back to bounded heap allocation.\n"
-					: "Fallback budget spent — DROPPING packets.\n");
+				<< n << " total)! Refusing -- no heap fallback.\n";
 		}
 	}
 

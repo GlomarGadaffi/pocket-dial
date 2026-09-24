@@ -27,23 +27,13 @@ class SipMessage;
 // callers use (SipMessageFactory, the handler table, tests); it forwards here.
 namespace sipmsgpool
 {
-	// Two distinct pool-pressure signals: `Fallback` fires the moment a pool runs
-	// dry and its heap fallback takes over (pressure building, nothing lost yet);
-	// `Refused` fires once the fallback budget is spent too and packets are
-	// actually being dropped. Collapsing them (as an earlier cut of #101(A) did)
-	// removes the only early warning an operator gets and reports trouble solely
-	// after the damage. Shared with RequestsHandler::allocateVirtualPeer(), which
-	// logs its own (separate) virtual-peer pool exhaustion through the same
-	// helper and label scheme — that is why this enum and logPoolExhausted() are
-	// exposed here rather than kept file-local.
-	enum class PoolPressure : uint8_t { Fallback, Refused };
-
 	// Rate-limited (1-in-100) exhaustion logger, shared by every bounded pool in
 	// the engine (the message pool here, and RequestsHandler's virtual-peer pool).
 	// The running total is kept in the message so sampling does not hide the true
-	// magnitude of a flood.
-	void logPoolExhausted(const char* poolName, PoolPressure level,
-		std::atomic<std::size_t>& warnCount);
+	// magnitude of a flood. There is one pressure level only: exhausted means
+	// REFUSED. The #101(A) heap fallback, and the Fallback/Refused split that
+	// warned of it, were removed by #409 -- no pool allocates when it runs dry.
+	void logPoolExhausted(const char* poolName, std::atomic<std::size_t>& warnCount);
 
 	// Idempotent prefill of the static pool to POCKETDIAL_MSG_POOL slots. Called
 	// once from RequestsHandler's constructor; safe to call from more than one
@@ -54,9 +44,9 @@ namespace sipmsgpool
 	void ensureInitialized();
 
 	// `rawBytes`/`src`: draw a pool slot and reset() it to hold this wire message.
-	// Returns NULL under sustained pressure — check it. The pool is bounded and
-	// its heap fallback is now bounded too (Issue #101(A)); once both are spent
-	// this refuses rather than allocating without limit. The contract for a
+	// Returns NULL when the pool is empty — check it. The pool is fixed at
+	// POCKETDIAL_MSG_POOL slots and nothing is allocated past it (#409: the
+	// #101(A) heap fallback is gone). The contract for a
 	// caller that gets nullptr is to DROP: it cannot answer 503, because building
 	// the 503 would need a message out of the same empty pool. SIP over UDP
 	// retransmits, so a dropped packet costs latency, not the call.
