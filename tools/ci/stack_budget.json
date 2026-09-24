@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Issue #457: every NAMED task entry, its configured stack, and the headroom it must keep.",
+    "A chain deeper than (stack - margin) fails CI, as does any single frame over frameCeiling",
+    "on a path from these roots unless it is allowlisted with a reason. Roots are EXACT mangled",
+    "names: a rename fails loudly instead of silently un-covering a task. The margin absorbs what a",
+    "static walk cannot see: the task's entry trampoline (pthread_task_func / std::thread / FreeRTOS",
+    "wrappers), an interrupt's context save on the task stack, and indirect calls not followed.",
+    "The runtime stackHwm_* on .244 (#451) stays the ground truth; this catches regressions in CI.",
+    "Keep `stack` in step with the xTaskCreate*/pthread call it names (the `site` field)."
+  ],
+  "frameCeiling": 1024,
+  "defaultMargin": 512,
+  "tasks": [
+    { "name": "http_conn",       "root": "_ZN10HttpServer12handleClientEi",                    "stack": 4096,  "site": "src/Helpers/HttpServer.hpp kHttpConnStackBytes (esp_pthread_cfg)" },
+    { "name": "http_dashboard",  "root": "_ZL16http_server_taskPv",                              "stack": 8192,  "site": "main/esp_main_eth.cpp" },
+    { "name": "sip_server",      "root": "_ZL15sip_server_taskPv",                               "stack": 8192,  "site": "main/esp_main_eth.cpp" },
+    { "name": "log_drain",       "root": "_ZL14log_drain_taskPv",                                "stack": 3072,  "site": "main/esp_main_eth.cpp" },
+    { "name": "udp_receiver",    "root": "_ZN9UdpServer11receiveLoopEv",                         "stack": 8192,  "site": "src/Helpers/UdpServer.cpp (lambda -> receiveLoop)" },
+    { "name": "rtp_media_rx",    "root": "_ZN11RtpReceiver7runLoopEv",                           "stack": 6144,  "site": "src/SIP/RtpReceiver.cpp" },
+    { "name": "rtp_media_tx",    "root": "_ZN9RtpSender7runLoopEv",                              "stack": 6144,  "site": "src/SIP/RtpSender.cpp" },
+    { "name": "moh_tx",          "root": "_ZN9HoldMusic7runLoopEv",                              "stack": 6144,  "site": "src/SIP/HoldMusic.hpp kTaskStackBytes" },
+    { "name": "conf_mix_tick",   "root": "_ZN14ConferenceRoom14taskTrampolineEPv",               "stack": 3072,  "site": "src/SIP/ConferenceRoom.cpp" },
+    { "name": "cdr_persist",     "root": "_ZN12_GLOBAL__N_1L20cdrPersistWriterTaskEPv",          "stack": 6144,  "site": "src/SIP/CdrRing.cpp" },
+    { "name": "cdr_archive",     "root": "_ZN10cdrarchive12_GLOBAL__N_1L14writerTaskBodyEPv",    "stack": 6144,  "site": "src/SIP/CdrArchive.cpp" },
+    { "name": "trunk_dns",       "root": "_ZN13TrunkResolver11workerEntryEPv",                   "stack": 4096,  "site": "src/SIP/TrunkResolver.cpp" },
+    { "name": "smtp_worker",     "root": "_ZN10SmtpClient12_GLOBAL__N_1L12workerTaskFnEPv",      "stack": 12288, "site": "src/Helpers/SmtpClient.cpp" },
+    { "name": "tel_prewarm",     "root": "_ZN21TelephonyAnchorClient21prewarmTaskTrampolineEPv", "stack": 6144,  "site": "src/SIP/TelephonyAnchorClient.cpp" },
+    { "name": "tel_restart",     "root": "_ZN21TelephonyAnchorClient21restartTaskTrampolineEPv", "stack": 6144,  "site": "src/SIP/TelephonyAnchorClient.cpp" },
+    { "name": "tel_rewarm",      "root": "_ZN21TelephonyAnchorClient20rewarmTaskTrampolineEPv",  "stack": 6144,  "site": "src/SIP/TelephonyAnchorClient.cpp" },
+    { "name": "tel_reconcile",   "root": "_ZN21TelephonyAnchorClient23reconcileTaskTrampolineEPv", "stack": 6144, "site": "src/SIP/TelephonyAnchorClient.cpp" },
+    { "name": "tel_wsw",         "root": "_ZN21TelephonyAnchorClient18wsWorkerTrampolineEPv",    "stack": 12288, "site": "src/SIP/TelephonyAnchorClient.cpp" },
+    { "name": "tel_media_rx",    "root": "_ZN21TelephonyAnchorClient16rxTaskTrampolineEPv",      "stack": 6144,  "site": "src/SIP/TelephonyAnchorClient.cpp" }
+  ],
+  "notCovered": [
+    "Anonymous-lambda task entries have no stable symbol to root at: HttpServer's restart/reset tasks,",
+    "RequestsHandler's vm_archive and one-shot anchor workers (tel_makecall/tel_dropcall/tel_answer).",
+    "Give each a named entry function to bring it under this gate."
+  ],
+  "frameAllowlist": []
+}
