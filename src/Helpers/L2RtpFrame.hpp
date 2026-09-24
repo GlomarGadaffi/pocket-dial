@@ -88,10 +88,10 @@ namespace l2rtp
 	//     with no bounce, no allocation. This is the only correct choice.
 	//   * a task-stack local (`uint8_t buf[kMaxFrameBytes];` inside a function
 	//     running on an RTOS task) is WRONG on this codebase specifically:
-	//     RTP/media task stacks here are allocated with
-	//     PD_TASK_STACK_CAPS = MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT (see
-	//     PsramTask.hpp -- the same PSRAM-stack fact that is #273's root
-	//     cause), so a stack-local buffer lives in PSRAM. The SPI driver
+	//     media task stacks may be PSRAM (PD_TASK_STACK_CAPS /
+	//     pd::createTaskPreferPsram, PsramTask.hpp -- rtp_media_rx is, since
+	//     #466; rtp_media_tx is kept INTERNAL precisely because the W5500
+	//     driver runs on it), so a stack-local buffer can live in PSRAM. The SPI driver
 	//     bounces it exactly as it would an lwIP pbuf, and this whole PR
 	//     delivers ZERO benefit while looking correct. RtpSender::runLoop's
 	//     existing `uint8_t packet[PACKET_BYTES];` is that exact pattern --
