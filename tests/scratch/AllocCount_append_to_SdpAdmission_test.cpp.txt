@@ -1,0 +1,79 @@
+// SCRATCH ONLY (not committed): appended to tests/SdpAdmission_test.cpp in a
+// scratch copy, to reuse that file's process-wide g_allocs counter. Counts heap
+// allocations inside one handle() call for idle-board-shaped traffic, after warm-up.
+#include <functional>
+#include <arpa/inet.h>
+#include "RequestsHandler.hpp"
+
+namespace
+{
+	sockaddr_in addrOf(const std::string& ip)
+	{
+		sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = inet_addr(ip.c_str()); a.sin_port = htons(5060);
+		return a;
+	}
+	std::shared_ptr<SipMessage> msg(const std::string& raw, const std::string& ip)
+	{
+		return RequestsHandler::getMessageFromPool(raw, addrOf(ip));
+	}
+	std::string reg(const std::string& ext, const std::string& ip, int cseq)
+	{
+		return "REGISTER sip:server SIP/2.0\r\nVia: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKr" + std::to_string(cseq) +
+			"\r\nFrom: <sip:" + ext + "@server>;tag=rt" + ext + "\r\nTo: <sip:" + ext + "@server>\r\n"
+			"Call-ID: reg-" + ext + "-abcdefghijklmnop@" + ip + "\r\nCSeq: " + std::to_string(cseq) + " REGISTER\r\n"
+			"Contact: <sip:" + ext + "@" + ip + ":5060>;expires=3600\r\nContent-Length: 0\r\n\r\n";
+	}
+	std::string sdpOf(const std::string& ip, const std::string& dir)
+	{
+		return "v=0\r\no=- 1 1 IN IP4 " + ip + "\r\ns=-\r\nc=IN IP4 " + ip + "\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\na=" + dir + "\r\n";
+	}
+	const std::string CID = "call-abcdefghijklmnopqrstuvwxyz@192.168.50.10";
+}
+
+TEST(AllocCount, IdleShapedPacketsPerHandle)
+{
+	std::vector<std::shared_ptr<SipMessage>> keep;
+	RequestsHandler h("192.168.50.1", 5060, [&](const sockaddr_in&, std::shared_ptr<SipMessage> m) { keep.push_back(std::move(m)); if (keep.size() > 64) keep.clear(); });
+	h.handle(msg(reg("100", "192.168.50.10", 1), "192.168.50.10"));
+	h.handle(msg(reg("101", "192.168.50.20", 1), "192.168.50.20"));
+	// A calls B, B answers.
+	{
+		std::string b = sdpOf("192.168.50.10", "sendrecv");
+		h.handle(msg("INVITE sip:101@server SIP/2.0\r\nVia: SIP/2.0/UDP 192.168.50.10:5060;branch=z9hG4bKi1\r\n"
+			"From: <sip:100@server>;tag=atag\r\nTo: <sip:101@server>\r\nCall-ID: " + CID + "\r\nCSeq: 1 INVITE\r\n"
+			"Contact: <sip:100@192.168.50.10:5060>\r\nContent-Type: application/sdp\r\nContent-Length: " + std::to_string(b.size()) + "\r\n\r\n" + b, "192.168.50.10"));
+		std::string c = sdpOf("192.168.50.20", "sendrecv");
+		h.handle(msg("SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 192.168.50.1:5060;branch=z9hG4bKx\r\nFrom: <sip:100@server>;tag=atag\r\n"
+			"To: <sip:101@server>;tag=btag\r\nCall-ID: " + CID + "\r\nCSeq: 1 INVITE\r\nContact: <sip:101@192.168.50.20:5060>\r\n"
+			"Content-Type: application/sdp\r\nContent-Length: " + std::to_string(c.size()) + "\r\n\r\n" + c, "192.168.50.20"));
+	}
+	auto info = [&](int cseq) {
+		return "INFO sip:101@server SIP/2.0\r\nVia: SIP/2.0/UDP 192.168.50.10:5060;branch=z9hG4bKinfo" + std::to_string(cseq) +
+			"\r\nFrom: <sip:100@server>;tag=atag\r\nTo: <sip:101@server>;tag=btag\r\nCall-ID: " + CID +
+			"\r\nCSeq: " + std::to_string(cseq) + " INFO\r\nContent-Length: 0\r\n\r\n";
+	};
+	auto reinv = [&](int cseq, const std::string& dir) {
+		std::string b = sdpOf("192.168.50.10", dir);
+		return "INVITE sip:101@192.168.50.20 SIP/2.0\r\nVia: SIP/2.0/UDP 192.168.50.10:5060;branch=z9hG4bKre" + std::to_string(cseq) +
+			"\r\nFrom: <sip:100@server>;tag=atag\r\nTo: <sip:101@server>;tag=btag\r\nCall-ID: " + CID +
+			"\r\nCSeq: " + std::to_string(cseq) + " INVITE\r\nContact: <sip:100@192.168.50.10:5060>\r\n"
+			"Content-Type: application/sdp\r\nContent-Length: " + std::to_string(b.size()) + "\r\n\r\n" + b;
+	};
+
+	int cseq = 10, regCseq = 2;
+	auto measure = [&](const char* what, const std::function<std::shared_ptr<SipMessage>()>& make) {
+		for (int w = 0; w < 3; ++w) h.handle(make());          // warm-up: capacities settle
+		long total = 0; const int N = 20;
+		for (int i = 0; i < N; ++i)
+		{
+			auto m = make();                                    // building the packet is NOT counted
+			g_allocs.store(0);
+			h.handle(m);
+			total += long(g_allocs.load());
+		}
+		std::printf("ALLOCS %-34s %.1f per handle()\n", what, double(total) / N);
+	};
+	measure("REGISTER refresh (existing binding)", [&] { return msg(reg("100", "192.168.50.10", regCseq++), "192.168.50.10"); });
+	measure("in-dialog INFO (no body)", [&] { return msg(info(cseq++), "192.168.50.10"); });
+	measure("hold/resume re-INVITE (relay)", [&] { static int k = 0; return msg(reinv(cseq++, (k++ % 2) ? "sendrecv" : "sendonly"), "192.168.50.10"); });
+}
