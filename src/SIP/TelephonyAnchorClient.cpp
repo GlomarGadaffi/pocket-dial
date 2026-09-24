@@ -2116,24 +2116,14 @@ void TelephonyAnchorClient::closePostClient()
 			}
 		}
 		{
-			// Issue #370: do NOT free getClient here either. This runs from shutdownImpl()
-			// after stopAllMediaStreams(), so in the normal case every rx task has already
-			// joined and nulled its own handle -- and then there is nothing to do. The case
-			// that matters is the abnormal one: a join that timed out leaves a task that may
-			// still be inside esp_http_client_open()'s TLS handshake, and this would free the
-			// handle under it. Same use-after-free as the teardown path, just reached during
-			// shutdown instead of mid-call.
-			//
-			// runRxLoop() owns this handle's whole lifetime (sole creator, and it nulls the
-			// handle on both exit paths). A non-null handle here is by definition one whose
-			// task did not exit, i.e. exactly the handle it is unsafe to free. It stays
-			// leaked and counted by stopMediaStreams(); #65's restart path is what reclaims
-			// the socket pool.
+			// #370: never free getClient here. A non-null handle means its rx task is still
+			// running: stopAllMediaStreams() does not wait for a slot whose stopMediaStreams()
+			// lost the tearingDown gate to a concurrent teardown (e.g. the WS-disconnect
+			// handler), so that teardown may still be joining a task inside this handle.
 			std::lock_guard<std::mutex> getLock(slot.getMutex);
 			if (slot.getClient)
 			{
-				ESP_LOGW(TAG, "closePostClient: getClient still live at shutdown — leaking it "
-					"rather than freeing under a possibly-running rx task (#370)");
+				ESP_LOGW(TAG, "closePostClient: getClient still owned by a running rx task — not freeing it (#370)");
 			}
 		}
 	}
@@ -3006,37 +2996,25 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 			if (xSemaphoreTake(doneSem, pdMS_TO_TICKS(2000)) != pdTRUE)
 			{
 				ESP_LOGE(TAG, "Rx task failed to exit in time! Forcing task deletion.");
+				// Synchronous for another task: IDF 6's vTaskDeleteWithCaps() suspends it and spins
+				// until it is not current on any core before deleting. The rx task never runs again.
 				vTaskDeleteWithCaps(taskToKill);   // #100: rx task is WithCaps(PSRAM) — reclaim its stack
 
-				// Issue #370: DO NOT free getClient here. This used to close()+cleanup()
-				// behind a try_lock, on the theory that a failed try_lock meant the killed
-				// task had died holding getMutex. That guard tested the wrong proposition
-				// and disengaged in exactly the case that panics: runRxLoop() does not hold
-				// getMutex across esp_http_client_open(), so while the task is inside the
-				// ~1s TLS handshake the try_lock SUCCEEDS -- and we freed the handle out
-				// from under it (StoreProhibited in ssl_write_client_key_exchange).
-				//
-				// vTaskDeleteWithCaps() on a task running on the OTHER core does not halt
-				// it synchronously either; it marks it for removal. So arriving here proves
-				// nothing about whether anyone is still inside this handle.
-				//
-				// runRxLoop() is the sole creator AND sole destroyer of getClient, and it
-				// nulls it (under getMutex) on both of its exit paths before returning. So
-				// a NON-NULL handle at this point means the rx task has not finished --
-				// which is precisely when freeing is fatal. Leak it and count it instead:
-				// one orphaned handle plus socket is strictly better than a panic, and #65's
-				// counter already turns repeated leaks into a full anchor restart, which is
-				// the only safe way to reclaim the pool.
+				// #370: forget the handle, never free it. The task was killed at an arbitrary point,
+				// possibly mid-handshake, so the handle's mbedTLS state may be half-built and
+				// cleanup() could fault walking it. Null the pointer so nothing mistakes a dead
+				// task's handle for a live stream (refreshTokenIfNeeded() defers while any slot's
+				// getClient is non-null, so a stale pointer wedges token refresh).
 				bool leakedHandle = false;
 				if (slot->getMutex.try_lock())
 				{
 					leakedHandle = (slot->getClient != nullptr);
+					slot->getClient = nullptr;
 					slot->getMutex.unlock();
 				}
 				else
 				{
-					// Mutex unavailable: the killed task may have died holding it. Same
-					// conclusion, arrived at without being able to inspect the handle.
+					// The killed task died holding getMutex; the handle cannot even be inspected.
 					leakedHandle = true;
 				}
 
@@ -3046,8 +3024,7 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 					// Count it; once too many leak, request a full anchor restart so the next
 					// stop()/start() reclaims the whole socket pool (done off-SIP by tick()).
 					const int leaked = _leakedGetClients.fetch_add(1, std::memory_order_relaxed) + 1;
-					ESP_LOGE(TAG, "rx task did not exit — leaking getClient rather than freeing it "
-						"under a task that may still be inside it (%d leaked)", leaked);
+					ESP_LOGE(TAG, "killed rx task's getClient leaked, not freed (%d leaked)", leaked);
 					if (leaked >= kLeakRestartThreshold)
 					{
 						_restartRequested.store(true, std::memory_order_release);
@@ -3055,26 +3032,6 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 					}
 				}
 			}
-		}
-	}
-	else
-	{
-		// Issue #370: taskToKill == nullptr means rxTaskHandle was ALREADY nulled --
-		// "signalled to exit", not "has exited". Those are different, and this branch
-		// used to treat them as the same and free the handle. With six stopMediaStreams()
-		// call sites and tearingDown cleared by RAII on exit, a second call for the same
-		// participant reaching here while the first one's rx task is still winding down
-		// is ordinary, not exotic.
-		//
-		// Since runRxLoop() creates the handle and nulls it on every exit path, a non-null
-		// handle here means that task is still running. There is nothing for an external
-		// caller to free: either the handle is null (task gone, or never started) or it
-		// belongs to a live task. Left to the owner in both cases.
-		std::lock_guard<std::mutex> lock(slot->getMutex);
-		if (slot->getClient)
-		{
-			ESP_LOGW(TAG, "stopMediaStreams: getClient still live with no rx task handle — "
-				"leaving it to the rx task rather than freeing under it (#370)");
 		}
 	}
 

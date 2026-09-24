@@ -177,8 +177,9 @@ private:
 		std::atomic<bool>        postLive{false};         // guarded by postMutex
 		// Issue #370: OWNED BY THE RX TASK. runRxLoop() is the only thing that creates
 		// this handle and the only thing that frees it, and it nulls it (under getMutex)
-		// on every exit path before returning. So getClient != nullptr means an rx task
-		// is live inside it -- NOTHING else may close/cleanup it, mutex held or not.
+		// on every exit path; after a forced kill stopMediaStreams() nulls it without
+		// freeing. So getClient != nullptr means a live rx task owns it -- NOTHING else
+		// may close/cleanup it, mutex held or not.
 		// getMutex serialises the pointer, not the handle's USE: runRxLoop deliberately
 		// does not hold it across esp_http_client_open()/read (a ~1s TLS handshake under
 		// the lock would block the very shutdown(fd) that unblocks the task), so holding
