@@ -2036,10 +2036,11 @@ void HttpServer::sendApiCoreDump(int sock)
 	// raw flash image (header + ELF + checksum), exactly what
 	// `esp-coredump info_corefile -t raw -c <file> <SipServer.elf>` reads -- see
 	// docs/COREDUMP.md. Built as one string like sendApiPcap(). Cost, stated so
-	// nobody has to re-derive it on a #328 board: the partition is at most 56 KB,
-	// which is above CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL (16384), so this buffer
-	// and sendResponseWithHeader()'s two copies (ostringstream + str()) all land
-	// in PSRAM -- ~170 KB transient out of 8 MB, zero internal DRAM.
+	// nobody has to re-derive it on a #328 board: a dump is at most the 128 KB
+	// partition (45 KB measured idle on .244), which is above
+	// CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL (16384), so this buffer and
+	// sendResponseWithHeader()'s two copies (ostringstream + str()) all land in
+	// PSRAM -- at most ~390 KB transient out of 8 MB, zero internal DRAM.
 	const CoreDumpStore::Info info = CoreDumpStore::query();
 	if (!info.present)
 	{

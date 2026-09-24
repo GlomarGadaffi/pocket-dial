@@ -129,13 +129,15 @@ namespace
 	}
 
 	// Includes NUL and 0xFF, and is longer than one recv() buffer, so a
-	// text-mode or truncating path cannot pass by accident.
+	// text-mode or truncating path cannot pass by accident. Carries the ELF
+	// magic at byte 12, where a real flash image has it.
 	std::vector<uint8_t> fakeImage()
 	{
 		std::vector<uint8_t> img(1500);
 		for (size_t i = 0; i < img.size(); ++i) img[i] = static_cast<uint8_t>(i * 7);
 		img[0] = 0x00;
 		img[1] = 0xFF;
+		img[12] = 0x7F; img[13] = 'E'; img[14] = 'L'; img[15] = 'F';
 		return img;
 	}
 
@@ -227,6 +229,42 @@ TEST_F(CoreDumpHttpTest, StatusReportsPresenceUngatedAndInfoNeedsASession)
 	EXPECT_EQ(statusOf(info), 200);
 	EXPECT_NE(bodyOf(info).find("\"present\":true"), std::string::npos) << bodyOf(info);
 	EXPECT_NE(bodyOf(info).find("\"task\":\"host_test\""), std::string::npos) << bodyOf(info);
+}
+
+TEST(CoreDumpStore, StaleBytesWithoutTheElfMagicAreNotADump)
+{
+	// Measured on .244 (#382): the region the partition now covers held
+	// stale, non-0xFF data from an older layout. IDF accepts ANY first word
+	// from 4 to the partition size as a dump size; that alone must not make a
+	// dump "present".
+	uint8_t head[16] = {};
+	const uint32_t part = 0x20000;
+	head[0] = 0x00; head[1] = 0x10;                    // plausible size word
+	EXPECT_FALSE(CoreDumpStore::looksLikeDump(head, sizeof(head), 4096, part))
+		<< "no ELF magic at byte 12: stale data, not a dump";
+
+	head[12] = 0x7F; head[13] = 'E'; head[14] = 'L'; head[15] = 'F';
+	EXPECT_TRUE(CoreDumpStore::looksLikeDump(head, sizeof(head), 4096, part));
+	EXPECT_FALSE(CoreDumpStore::looksLikeDump(head, sizeof(head), part + 1, part))
+		<< "a size larger than the partition is never a dump";
+	EXPECT_FALSE(CoreDumpStore::looksLikeDump(head, sizeof(head), 15, part))
+		<< "too small to even hold the header";
+	EXPECT_FALSE(CoreDumpStore::looksLikeDump(head, 8, 4096, part))
+		<< "a short read cannot vouch for the magic";
+}
+
+TEST_F(CoreDumpHttpTest, StaleRegionReportsNoDumpOverHttp)
+{
+	AdminSession sysop, owner;
+	provisionBoth(_port, sysop, owner);
+	std::vector<uint8_t> junk = fakeImage();
+	junk[12] = 'E'; junk[13] = 'O'; junk[14] = 'U'; junk[15] = 'T';   // what .244 actually held
+	CoreDumpStore::setImageForTest(junk);
+
+	const std::string status = bodyOf(httpRaw(_port, "GET", "/api/status", ""));
+	EXPECT_NE(status.find("\"coredump\":{\"present\":false,\"size\":0}"), std::string::npos) << status;
+	EXPECT_EQ(statusOf(httpRaw(_port, "GET", "/api/coredump", "", "pd_session=" + owner.cookie)), 404)
+		<< "stale flash must never be served as a dump";
 }
 
 TEST_F(CoreDumpHttpTest, EraseNeedsTheCsrfTokenAndClearsTheDump)

@@ -9,7 +9,8 @@
 #   * Two equal app slots (ota_0 / ota_1) enable A/B updates with rollback.
 #     6MB each is 4x the current ~1.5MB display image — generous headroom for
 #     UI growth. ota_1 ends at 0xC20000; everything above it is now allocated
-#     (prompts + cfgseed, below), so the top of flash has NO free space left.
+#     (coredump + prompts + cfgseed, below), so the top of flash has NO free
+#     space left.
 #   * App slots are 64KB-aligned (a hard requirement for app partitions on the
 #     ESP32-S3 because of the MMU flash-mapping granularity); otadata/phy are
 #     4KB-aligned (the flash sector size).
@@ -58,23 +59,30 @@
 #     returns false silently and the device keeps its NVS-stored configuration.
 #
 #   * coredump (Issue #382): the panic handler's ELF coredump
-#     (CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH in sdkconfig.defaults). It sits in the
-#     gap that was already unallocated between phy_init (ends 0x12000) and ota_0
-#     (starts 0x20000, 64KB-aligned) -- 0xE000 = 56KB -- so every other partition
-#     keeps its exact offset and size and this is OTA-compatible in both
-#     directions. Same missing-partition contract as cfgseed: a board flashed
-#     before this table simply has no coredump partition, and IDF treats that as
-#     "coredumps unavailable", not as an error. A dump LARGER than the partition
-#     is abandoned whole, not truncated (see sdkconfig.defaults), so if 56KB
-#     proves too small the fix is to carve space from the front of prompts,
-#     which nothing reads yet.
+#     (CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH in sdkconfig.defaults), 128KB taken
+#     from the FRONT of prompts, which shrank 0x3DF000 -> 0x3BF000 and moved up
+#     to 0xC40000. prompts could move because nothing reads it yet (see above);
+#     that stops being free the day voicemail data lands there. nvs, otadata,
+#     phy_init, ota_0, ota_1 and cfgseed keep their exact offsets and sizes.
+#     SIZED FROM A MEASUREMENT, not an estimate: an induced panic on .244 (idle,
+#     anchor connected) wrote a 45184-byte dump -- 25 tasks at ~720 B each
+#     (TCB + register note) plus their live stacks. A panic mid-call adds the
+#     media/anchor tasks and deep TLS stacks, and a dump LARGER than the
+#     partition is abandoned whole, not truncated (see sdkconfig.defaults), so
+#     the 56KB gap between phy_init and ota_0 (first choice) was too tight.
+#     Same missing-partition contract as cfgseed: a board flashed before this
+#     table has no coredump partition, which IDF treats as "coredumps
+#     unavailable", not as an error. A board that DOES get this table should
+#     have the region erased once -- stale bytes from an older layout are
+#     otherwise read back as a dump header (CoreDumpStore rejects anything
+#     without the ELF magic, but an erased region is the clean state).
 #
 # Name,     Type, SubType,  Offset,    Size
 nvs,        data, nvs,      0x9000,    0x6000
 otadata,    data, ota,      0xf000,    0x2000
 phy_init,   data, phy,      0x11000,   0x1000
-coredump,   data, coredump, 0x12000,   0xE000
 ota_0,      app,  ota_0,    0x20000,   0x600000
 ota_1,      app,  ota_1,    0x620000,  0x600000
-prompts,    data, 0x40,     0xC20000,  0x3DF000
+coredump,   data, coredump, 0xC20000,  0x20000
+prompts,    data, 0x40,     0xC40000,  0x3BF000
 cfgseed,    data, 0x41,     0xFFF000,  0x1000

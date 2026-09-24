@@ -34,8 +34,17 @@ namespace CoreDumpStore
 		std::string reason;       // panic reason, e.g. "LoadProhibited"
 	};
 
-	// Cheap: reads only the stored header. Safe on the ungated status route.
+	// Cheap: reads only the first 16 bytes. Safe on the ungated status route.
 	Info query();
+
+	// The "present" rule, pure so the host suite tests the same code the board
+	// runs. IDF's own check trusts the first word alone -- any value from 4 up
+	// to the partition size counts as a dump -- so stale bytes left in the
+	// region by an older partition layout read back as a bogus dump. A real
+	// flash image is [u32 size][u32 version][u32 ...] followed by an ELF, so
+	// the ELF magic must also sit at byte 12. `head` is the first 16 bytes.
+	bool looksLikeDump(const uint8_t* head, size_t headLen, uint32_t storedSize,
+		uint32_t partitionSize);
 	// Verifies the checksum over the whole image, so only on an explicit request.
 	Summary summary();
 	// Copies [offset, offset + len) of the stored image. False on any bounds or
