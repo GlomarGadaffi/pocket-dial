@@ -77,7 +77,12 @@ void SipServer::onNewMessage(std::string_view data, sockaddr_in src)
 
 void SipServer::onHandled(const sockaddr_in& dest, std::shared_ptr<SipMessage> message)
 {
-	_socket.send(dest, message->toString());
+	// #462: serialise into the one reusable buffer (see _sendBuf). toString(out)
+	// clear()s and reserve()s the exact size, which only reallocates when a
+	// message is larger than any sent before -- so after warm-up, no allocation.
+	std::lock_guard<std::mutex> lock(_sendMutex);
+	message->toString(_sendBuf);
+	_socket.send(dest, _sendBuf);
 }
 
 #if !defined(ESP_PLATFORM) && !defined(ARDUINO)

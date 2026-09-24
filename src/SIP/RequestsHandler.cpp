@@ -818,8 +818,6 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		}
 	}
 
-	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
-	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 
@@ -1085,25 +1083,34 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
 		_blf.refresh();
 
-		localOutbox = drainOutbox();
+		// #462 (#284 rank 5): into the receive path's own persistent scratch,
+		// swapped rather than moved, so neither _outbox nor _logQueue restarts
+		// at zero capacity on every packet. Safe without a lock of their own:
+		// handle() has exactly one production caller, the UDP receive loop
+		// (SipServer.cpp), so only that thread ever touches these two.
+		drainOutboxInto(_rxOutboxScratch);
 		_passThroughMsg = nullptr;
 
-		localLogs = std::move(_logQueue);
-		_logQueue.clear();
+		_rxLogScratch.clear();
+		_rxLogScratch.swap(_logQueue);
 	}
 
 	// Print deferred logs safely outside of the lock
-	for (const auto& log : localLogs)
+	for (const auto& log : _rxLogScratch)
 	{
 		if (log.first) std::cerr << log.second << '\n';
 		else std::cout << log.second << '\n';
 	}
 
 	// Issue #24 resolved: UDP socket syscall sendto is now executed outside the locked section to prevent lock contention.
-	for (auto& event : localOutbox)
+	for (auto& event : _rxOutboxScratch)
 	{
 		_onHandled(event.first, std::move(event.second));
 	}
+	// clear() keeps the capacity: that is the point. The shared_ptrs were moved
+	// into _onHandled above, so nothing here still pins a pooled message.
+	_rxOutboxScratch.clear();
+	_rxLogScratch.clear();
 }
 
 void RequestsHandler::noteDialogCSeq(const std::string& callID, uint32_t cseq,
@@ -8106,8 +8113,6 @@ void RequestsHandler::tick()
 	}
 	_lastTick = now;
 
-	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
-	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_outbox.clear();
@@ -8631,22 +8636,29 @@ void RequestsHandler::tick()
 			_snapshot = std::move(nextSnapshot);
 		}
 
-		localOutbox = drainOutbox();
+		// #462 (#284 rank 5): the tick path's own persistent scratch, swapped
+		// rather than moved -- same reasoning as handle(). Its own pair, never
+		// shared with handle()'s: tick() runs on a different task (the host
+		// tickLoop, or each esp_main variant's tick task), and each scratch must
+		// belong to exactly one thread.
+		drainOutboxInto(_tickOutboxScratch);
 
-		localLogs = std::move(_logQueue);
-		_logQueue.clear();
+		_tickLogScratch.clear();
+		_tickLogScratch.swap(_logQueue);
 	}
 
-	for (const auto& log : localLogs)
+	for (const auto& log : _tickLogScratch)
 	{
 		if (log.first) std::cerr << log.second << '\n';
 		else std::cout << log.second << '\n';
 	}
 
-	for (auto& event : localOutbox)
+	for (auto& event : _tickOutboxScratch)
 	{
 		_onHandled(event.first, std::move(event.second));
 	}
+	_tickOutboxScratch.clear();
+	_tickLogScratch.clear();
 }
 
 std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClientByAddress(const sockaddr_in& addr)
@@ -9391,6 +9403,17 @@ std::vector<std::pair<std::string, std::string>> RequestsHandler::getPageZones()
 
 std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler::drainOutbox()
 {
+	// By-value form, for the rare drains (sendMessageTo(), test seams). The two
+	// per-packet / per-tick drains use drainOutboxInto() with a persistent
+	// scratch instead -- see there for why that matters.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> drained;
+	drainOutboxInto(drained);
+	return drained;
+}
+
+void RequestsHandler::drainOutboxInto(
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& out)
+{
 	// Stage B of the TelephonyAnchorClient port: merge in anything the CallEvent
 	// callback (or an async worker's completion) queued to _asyncOutbox — it runs
 	// off the SIP receive thread, after handle()/tick() already cleared _outbox
@@ -9433,9 +9456,27 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 		msg->toString(_pcapCapture.recordInto(/*outbound=*/true, addr));
 	}
 
-	auto drained = std::move(_outbox);
-	_outbox.clear();
-	return drained;
+	// #462 (#284 rank 5): SWAP, don't move. `auto drained = std::move(_outbox)`
+	// handed _outbox's buffer to a caller-local vector that was destroyed after
+	// the send loop, so _outbox restarted at ZERO capacity every pass and
+	// reallocated 1, 2, 4... on every packet. Swapping gives _outbox back the
+	// caller's (cleared, still-allocated) buffer instead. A caller that keeps
+	// `out` alive between passes -- handle() and tick() each own one -- makes
+	// the drain allocation-free once both buffers have grown to the working
+	// size.
+	//
+	// The callers clear `out` after their send loop, so it is empty here. If it
+	// ever is not, what is in it was never sent: append rather than clear, so a
+	// broken caller costs an allocation, never a silently dropped message.
+	if (out.empty())
+	{
+		out.swap(_outbox);
+	}
+	else
+	{
+		for (auto& e : _outbox) out.push_back(std::move(e));
+		_outbox.clear();
+	}
 }
 
 void RequestsHandler::refreshParkSnapshot()

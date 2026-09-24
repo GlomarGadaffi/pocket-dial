@@ -6,6 +6,9 @@
 #include "Session.hpp"
 #include "SipMessageFactory.hpp"
 
+#include <mutex>
+#include <string>
+
 #if !defined(ESP_PLATFORM) && !defined(ARDUINO)
 #include <thread>
 #include <atomic>
@@ -29,6 +32,22 @@ private:
 	// so it never needs to outlive the call.
 	void onNewMessage(std::string_view data, sockaddr_in src);
 	void onHandled(const sockaddr_in& dest, std::shared_ptr<SipMessage> message);
+
+	// #462 (#284 rank 2): one reusable send buffer instead of a fresh
+	// toString() string per outbound message (300-1500 B each).
+	//
+	// onHandled() is reached from THREE threads -- the UDP receive task
+	// (handle()), the tick task (tick()) and the HTTP task (sendMessageTo()) --
+	// so the buffer has its own leaf mutex. Leaf: nothing else is ever locked
+	// while it is held, and the socket send takes none of ours, so it cannot
+	// take part in a lock-order cycle. It also serialises the three threads'
+	// sends on the socket, which they previously entered concurrently.
+	//
+	// Declared BEFORE _socket on purpose: members are destroyed in reverse
+	// order, and _socket's receive thread is what calls onHandled(). Declared
+	// after it, these would be destroyed while that thread could still use them.
+	std::mutex  _sendMutex;
+	std::string _sendBuf;
 
 	UdpServer _socket;
 	RequestsHandler _handler;

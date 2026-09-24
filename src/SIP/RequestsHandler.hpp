@@ -1840,6 +1840,22 @@ private:
 	// retransmit on the way out. The one place messages leave _outbox — see the
 	// #70 ordering note on the definition. Caller holds _mutex.
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> drainOutbox();
+	// Same, into a caller-owned vector by SWAP, so _outbox keeps a warm buffer
+	// instead of restarting at zero capacity (#462). The per-packet and per-tick
+	// drains use this with the persistent scratch members below. Caller holds
+	// _mutex, and `out` is empty on entry (it appends, never drops, if not).
+	void drainOutboxInto(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& out);
+
+	// #462 (#284 rank 5): persistent drain scratch, ONE PAIR PER THREAD that
+	// drains on the hot path. handle() has exactly one production caller (the
+	// UDP receive loop) and tick() exactly one (the tick task), so each pair is
+	// touched by a single thread and needs no lock of its own. Filled under
+	// _mutex, consumed after it is released, then clear()ed -- which keeps the
+	// capacity, the whole point. Never share a pair between handle() and tick().
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _rxOutboxScratch;
+	std::vector<std::pair<bool, std::string>>                        _rxLogScratch;
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _tickOutboxScratch;
+	std::vector<std::pair<bool, std::string>>                        _tickLogScratch;
 
 	// The inbound message currently being handled, or nullptr outside a handle()
 	// pass (tick() drains with this unset). Used by drainOutbox() for exactly one

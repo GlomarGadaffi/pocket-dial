@@ -60,17 +60,65 @@ namespace
 		return v;
 	}
 
+	// #462 (#284 rank 1): keep every header-line BUFFER alive across parses.
+	//
+	// `lines` must end up holding exactly the parsed lines. The old way --
+	// clear() then emplace_back() -- destroyed each std::string (freeing its
+	// buffer) and allocated a fresh one per line on the next parse: roughly one
+	// allocation per header line, on every packet, since almost every SIP header
+	// line is longer than libstdc++'s 15-byte small-string buffer.
+	//
+	// Instead lines are ASSIGNED into strings that already have capacity, and
+	// the ones a shorter message does not need are PARKED in `spare` rather than
+	// destroyed, so the next longer message takes them back. Reuse in place
+	// alone would not be enough: real traffic alternates shapes on the same
+	// pooled slot (REGISTER, a 200, OPTIONS...), and shrinking the vector would
+	// free exactly the buffers the next longer message then reallocates. Moving
+	// a std::string moves its buffer, so parking and un-parking never allocate.
+	std::string& nextLine(std::vector<std::string>& lines, std::vector<std::string>& spare,
+		size_t& n)
+	{
+		if (n == lines.size())
+		{
+			if (!spare.empty())
+			{
+				lines.push_back(std::move(spare.back()));
+				spare.pop_back();
+			}
+			else
+			{
+				lines.emplace_back();   // warm-up only: a buffer nobody has had yet
+			}
+		}
+		return lines[n++];
+	}
+
+	// Park everything past the first `n` lines, buffers intact.
+	void parkSurplus(std::vector<std::string>& lines, std::vector<std::string>& spare, size_t n)
+	{
+		while (lines.size() > n)
+		{
+			spare.push_back(std::move(lines.back()));
+			lines.pop_back();
+		}
+	}
+
 	// Splits a raw SIP message into its start line, header lines (verbatim, in
 	// order, duplicates preserved), and body. Tolerates bare-LF line endings and
 	// a bare "\n\n" header/body separator — defensive parsing of untrusted
 	// network input (SEC-02), mirroring the tolerance the old buffer-scanning
 	// parse() had.
+	//
+	// Every output is written with assign() into storage that survives the call
+	// (see nextLine()/parkSurplus() above), so parsing into a warmed pooled
+	// message allocates nothing.
 	void splitMessage(std::string_view raw, std::string& startLine,
-		std::vector<std::string>& headerLines, std::string& body)
+		std::vector<std::string>& headerLines, std::vector<std::string>& spare,
+		std::string& body)
 	{
 		startLine.clear();
-		headerLines.clear();
 		body.clear();
+		size_t n = 0;   // header lines filled so far; everything past it is parked on exit
 
 		size_t bodyStart = raw.find("\r\n\r\n");
 		size_t sepLen = 4;
@@ -96,6 +144,7 @@ namespace
 
 		if (headerBlock.empty())
 		{
+			parkSurplus(headerLines, spare, 0);
 			return;
 		}
 
@@ -110,11 +159,13 @@ namespace
 
 		if (pos_end == std::string::npos)
 		{
-			startLine = std::string(headerBlock);
+			startLine.assign(headerBlock);
+			parkSurplus(headerLines, spare, 0);
 			return;
 		}
 
-		startLine = std::string(headerBlock.substr(pos_start, pos_end - pos_start));
+		// assign(), not `= std::string(...)`: the temporary always allocated.
+		startLine.assign(headerBlock.substr(pos_start, pos_end - pos_start));
 		pos_start = pos_end + lineDelimLen;
 
 		while (pos_start < headerBlock.size())
@@ -141,16 +192,17 @@ namespace
 
 			if (!line.empty())
 			{
-				headerLines.emplace_back(line);
+				nextLine(headerLines, spare, n).assign(line);
 			}
 		}
+		parkSurplus(headerLines, spare, n);
 	}
 }
 
 SipMessage::SipMessage(const std::string& message, sockaddr_in src) : _src(src)
 {
 	_hasSdp = mentionsSdpContentType(message);
-	splitMessage(message, _startLine, _headerLines, _body);
+	splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body);
 }
 
 // Member-wise copy of everything EXCEPT _bodyGen, which advances instead — see
@@ -166,7 +218,16 @@ SipMessage& SipMessage::operator=(const SipMessage& other)
 
 	_hasSdp      = other._hasSdp;
 	_startLine   = other._startLine;
-	_headerLines = other._headerLines;
+	// Element-wise through the same keep-the-buffers path as splitMessage(),
+	// rather than vector copy-assignment, which destroys the surplus strings
+	// of a longer previous message. The pool copies into its slots this way
+	// (getMessageFromPool(const SipMessage&)), so this is a hot path too.
+	size_t n = 0;
+	for (const std::string& line : other._headerLines)
+	{
+		nextLine(_headerLines, _spareHeaderLines, n).assign(line);
+	}
+	parkSurplus(_headerLines, _spareHeaderLines, n);
 	_body        = other._body;
 	_src         = other._src;
 	++_bodyGen;
@@ -179,7 +240,7 @@ void SipMessage::reset(std::string_view message, sockaddr_in src)
 	_hasSdp = mentionsSdpContentType(message);
 	// splitMessage() clear()s _headerLines rather than reassigning it, so a
 	// pooled message's vector capacity survives across reset() calls.
-	splitMessage(message, _startLine, _headerLines, _body);
+	splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body);
 	++_bodyGen;   // this is the pool-recycle path — see bodyGeneration()
 }
 
