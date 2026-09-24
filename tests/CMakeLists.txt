@@ -66,6 +66,12 @@ add_executable(sip_parser_tests
     # refuse) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
     RequestsHandler_pool_test.cpp
+    # Issue #410 phase 1: the static HTML pages stream from flash (byte-identical
+    # to the old path, zero allocation beyond the CSRF token).
+    HttpStaticPages_test.cpp
+    # Issue #410 phase 2: every response goes out in place via one scatter-gather
+    # sendmsg() (byte-identical, short writes resumed, zero allocation).
+    HttpSendPath_test.cpp
     # Issue #115: the 777 SDP-loopback echo test must call allocateSession()
     # BEFORE building any 180/200, mirroring the ordinary call-to-call INVITE
     # path, so a full session pool gets a real 503 instead of a false 200.
