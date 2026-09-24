@@ -3496,8 +3496,8 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// cleared here too.
 	//
 	// Nothing else in this function reaches them: DeviceConfig::clearAll() just
-	// above erases only its three named "storage" keys plus reg_mode in "pbxcfg"
-	// (via that file's eraseRegistrarMode(), src/Helpers/DeviceConfig.cpp), and the
+	// above erases only its three named "storage" keys and resets reg_mode in
+	// "pbxcfg" to learn (writeRegistrarMode(), src/Helpers/DeviceConfig.cpp; #397), and the
 	// WiFi block further down erases four more "storage" keys by name. Both of
 	// those are key-by-key, never a namespace wipe, so a namespace no line here
 	// names is not reached at all. (An earlier version of this comment said

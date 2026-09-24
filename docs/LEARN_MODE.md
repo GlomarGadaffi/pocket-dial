@@ -1,6 +1,6 @@
 # Learn Mode: Fleet-Cutover Runbook
 
-Status: Shipped on `main` (digest auth + Learn mode), and operator-selectable from the dashboard, `POST /api/registrar`, or the flash-time `cfgseed` seed. The seed route works from **v1.4.1** onward; on v1.3.0 and v1.4.0 it silently did nothing ([#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)). The registrar default is still `open`, so this runbook describes a mode you must switch **to**. | Audience: Installers / field operators converting an existing phone deployment to pocket-dial. | Scope: Operational runbook, not implementation spec.
+Status: Shipped on `main` (digest auth + Learn mode), and operator-selectable from the dashboard, `POST /api/registrar`, or the flash-time `cfgseed` seed. The seed route works from **v1.4.1** onward; on v1.3.0 and v1.4.0 it silently did nothing ([#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)). The default depends on the board (#397): a **fresh install boots in `learn`**; an **existing board upgraded with no stored mode keeps `open`**, now written to NVS so it shows as a real setting; a **factory reset returns the board to `learn`**. A stored mode (dashboard, API or `cfgseed`) always wins. | Audience: Installers / field operators converting an existing phone deployment to pocket-dial. | Scope: Operational runbook, not implementation spec.
 
 > **TL;DR.** Learn mode lets you drop pocket-dial into a *running* phone deployment and
 > adopt the handsets that are already there, without re-typing a SIP account into every
@@ -43,7 +43,7 @@ on a network you can reach:
 
 | Mode | What it does | When to use it |
 |------|--------------|----------------|
-| **Open** (`0`, standalone) | No SIP authentication. Any phone that knows an extension can REGISTER and place calls. This is today's default behavior. | Bench testing, a brand-new isolated deployment you will secure immediately, or a fully trusted/closed lab. **Not** for production on a shared link. |
+| **Open** (`0`, standalone) | No SIP authentication. Any phone that knows an extension can REGISTER and place calls. The default kept on an existing board that had no stored mode when it was upgraded past #397 (fresh boards and factory resets start in Learn). | Bench testing, a brand-new isolated deployment you will secure immediately, or a fully trusted/closed lab. **Not** for production on a shared link. |
 | **Learn** (`1`, TOFU adoption) | Adopts unknown phones on first REGISTER **without verifying** (trust-on-first-use), records `{MAC, extension}`, and keeps them alive on their *current* credentials. Already-secured devices are still digest-challenged. A different MAC claiming a secured extension is rejected. | **The cutover mode.** Use it only during a bounded adoption window while migrating an existing fleet, then leave it. |
 | **Secure** (`2`, closed) | Every REGISTER is digest-challenged (RFC 2617, MD5). Only extensions whose secret you have set/rotated can register, and each is locked to its adopted MAC. | **Steady-state production.** The target you flip to once the fleet is adopted and secrets are issued. |
 
@@ -251,8 +251,11 @@ extension is adopted **without verification**. Treat the window like an open doo
 
 - **Bound it.** Open Learn mode, do the cutover, leave. Do not run a registrar in Learn
   mode indefinitely; that is functionally an open registrar for any *unclaimed* extension.
-- **Admin-initiated.** Entering Learn is an explicit admin action, not a default. Re-opening
-  it later is also admin-gated.
+- **Default on a fresh board, admin-gated after.** Since #397 a fresh install (and a factory
+  reset) boots in Learn, because the alternatives are worse out of the box: Open accepts
+  anyone, and Secure refuses every phone until secrets exist. Treat that as the start of
+  the adoption window above, not a resting state: secure the phones, then leave Learn.
+  Re-opening it later is admin-gated.
 - **Prefer an encrypted/trusted link.** Run the window on WPA2 (or a trusted wired segment)
   so a passive sniffer can't observe the cutover and a stranger can't associate and race to
   claim an extension. On an open AP the window is materially riskier; see
