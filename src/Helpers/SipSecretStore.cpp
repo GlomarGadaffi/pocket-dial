@@ -60,12 +60,16 @@ namespace
 		return std::string(kKeyPrefix) + ext;
 	}
 
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 	// --- Host-side in-memory mirror (also the store on host) ---
+	// Host-only: every caller is a host #else arm, so defining it on ESP was an
+	// unused function (-Wunused-function; BigDog's ESP build of #437).
 	std::map<std::string, std::string>& hostMap()
 	{
 		static std::map<std::string, std::string> m;
 		return m;
 	}
+#endif
 
 	// --- CSPRNG secret generation (single audited entropy source) ---
 	// Unambiguous alphabet: no 0/O/1/I/l, 54 symbols, ~5.755 bits/char.
