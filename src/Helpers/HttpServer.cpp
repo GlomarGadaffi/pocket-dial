@@ -10,6 +10,7 @@
 #include "AdminAuth.hpp"
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
 #include "DeviceConfig.hpp"
+#include "ResetGuard.hpp"      // #473: block NVS data writes while resetting
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
 #include "ArpLookup.hpp"
@@ -1520,6 +1521,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"wifiCapable\":false,";
 #endif
 	json << "\"uptime\":" << uptimeSec << ",";
+	// #470: CDR ring persist health. A non-zero failure count means call history
+	// is NOT surviving reboots; suppressed counts writes refused mid-reset (#473).
+	json << "\"cdrPersistFailures\":" << CdrRing::persistFailureCount() << ",";
+	json << "\"cdrPersistSuppressed\":" << CdrRing::persistSuppressedCount() << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
 
@@ -3475,6 +3480,15 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"factory reset requires confirm=ERASE\"}");
 		return;
+	}
+	// #473: from here on, NVS writers refuse new data (the CDR persist writer
+	// first), and in-flight writes are drained before anything is erased, so
+	// nothing a background task writes can put PII back behind this reset. The
+	// board restarts at the end, which is what clears the flag.
+	resetguard::begin();
+	if (!resetguard::waitForWritersIdle(500))
+	{
+		std::cerr << "[reset] an NVS writer was still busy after 500 ms; erasing anyway" << std::endl;
 	}
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP

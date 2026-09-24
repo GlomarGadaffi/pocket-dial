@@ -7,6 +7,7 @@
 #include <chrono>
 
 #include "AdminAuth.hpp"
+#include "ResetGuard.hpp"   // #473
 #include "CdrArchive.hpp"
 #include "PbxPersist.hpp"
 #include "SipClient.hpp"
@@ -242,6 +243,10 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 						// DtmfFactoryReset_test.cpp.
 						cdrarchive::wipeAll();
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+						// #473: same guard as the HTTP door -- no writer may be
+						// mid-write while the partition is erased under it.
+						resetguard::begin();
+						(void)resetguard::waitForWritersIdle(500);
 						nvs_flash_erase();
 						esp_restart();
 #else
