@@ -2572,15 +2572,18 @@ void RequestsHandler::loadVoicemailGreeting()
 	}
 	if (dataOff + dataLen > static_cast<size_t>(total)) dataLen = static_cast<size_t>(total) - dataOff;
 
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(dataLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-	if (buf == nullptr) buf = static_cast<uint8_t*>(heap_caps_malloc(dataLen, MALLOC_CAP_8BIT));
-#else
-	uint8_t* buf = static_cast<uint8_t*>(std::malloc(dataLen));
-#endif
+	// Issue #466: the same placement rule as the MoH clip -- PSRAM only where
+	// the board has it, capped internal DRAM where it has none, and a refusal
+	// is counted and flagged rather than silently spilling into internal RAM.
+	uint8_t* buf = HoldMusic::allocClip(dataLen);
+	_greetingRefused.store(buf == nullptr, std::memory_order_relaxed);
 	if (buf == nullptr)
 	{
 		std::fclose(f);
+		queueLog("[WARN] Voicemail: greeting at " + std::string(kGreetingPath) + " (" +
+			std::to_string(dataLen) + " B) REFUSED -- PSRAM short, or over the " +
+			std::to_string(POCKETDIAL_CLIP_INTERNAL_MAX_BYTES) +
+			" B internal cap on a board without PSRAM (#466); deposits will record immediately", true);
 		return;
 	}
 
@@ -3576,6 +3579,13 @@ bool RequestsHandler::startHoldMusic(const std::string& clipPath)
 	// park on its pre-#162 silent hold.
 	if (!_holdMusic.loadClip(clipPath))
 	{
+		if (_holdMusic.lastLoadRefused())
+		{
+			queueLog("[WARN] MoH: clip at " + clipPath + " REFUSED -- PSRAM short, or over the " +
+			         std::to_string(POCKETDIAL_CLIP_INTERNAL_MAX_BYTES) +
+			         " B internal cap on a board without PSRAM (#466); parked callers will hear silence", true);
+			return false;
+		}
 		queueLog("MoH: no clip at " + clipPath +
 		         " (or not 8 kHz mono mu-law) — parked callers will hear silence", true);
 		return false;

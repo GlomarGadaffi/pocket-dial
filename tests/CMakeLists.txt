@@ -263,6 +263,9 @@ add_executable(sip_parser_tests
     # bounded-cache/in-flight state machine.
     TrunkResolver_test.cpp
     PlayoutBuffer_test.cpp
+    # Issue #466: clip placement policy, DmaFramePool's lock-free publish, the
+    # PSRAM-preferring allocator behind PlayoutBuffer.
+    PsramPlacement_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp
     # Wires the AnchorClient/MediaBridge/TelephonyProvider extension point into

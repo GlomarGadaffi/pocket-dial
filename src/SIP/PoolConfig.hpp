@@ -292,6 +292,17 @@
 #define POCKETDIAL_DMA_FRAME_POOL_SIZE 6
 #endif
 
+// Issue #466 (decision recorded on #466): the largest music-on-hold clip or
+// voicemail greeting a board WITHOUT PSRAM may hold in internal DRAM. PSRAM
+// builds ignore it -- their clips are PSRAM-only, refused rather than ever
+// spilled into internal RAM. 16 KB is 2 s of 8 kHz mu-law; a longer clip is
+// refused and counted (clipRefusals / mohClipRefused / greetingRefused on
+// /api/status). Loaded only at boot or on an admin upload, never at call time.
+// Set explicitly by main/CMakeLists.txt's SIP_CONSTRAINED block.
+#ifndef POCKETDIAL_CLIP_INTERNAL_MAX_BYTES
+#define POCKETDIAL_CLIP_INTERNAL_MAX_BYTES 16384
+#endif
+
 // Max single voicemail message duration. 90s of 8kHz mu-law (1 byte/sample)
 // is 720,000 bytes (~703 KiB) -- long enough for a real message, short
 // enough that the full budget below still fits comfortably. Every leg needs
