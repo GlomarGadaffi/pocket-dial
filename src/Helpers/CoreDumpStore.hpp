@@ -35,7 +35,14 @@ namespace CoreDumpStore
 		char reason[64] = {};     // panic reason, e.g. "LoadProhibited"
 	};
 
-	// Cheap: reads only the first 16 bytes. Safe on the ungated status route.
+	// No flash access (#405): returns what prime() found at boot, as updated by
+	// erase(). That is the whole truth at runtime -- only a panic writes a dump,
+	// so a new one appears only across a reboot, and prime() runs every boot.
+	// Probing flash here instead (image_get + partition_find + flash_read) put
+	// the flash driver's deep call chain on every /api/status poll, on 4 KB
+	// per-connection threads: the ~836 B of stack #405 measured going missing.
+	// Before prime() has run it probes directly, which only the accept loop can
+	// reach (prime() runs before the first accept).
 	Info query();
 
 	// The "present" rule, pure so the host suite tests the same code the board
@@ -53,12 +60,20 @@ namespace CoreDumpStore
 	// The result prime() cached; no flash work. Empty until prime() has run.
 	Summary summary();
 	// Copies [offset, offset + len) of the stored image. False on any bounds or
-	// flash error, never a partial copy.
+	// flash error, never a partial copy. Uses the location prime() cached, so
+	// each chunk is one flash read, not a re-probe of the partition.
 	bool read(uint32_t offset, uint8_t* out, size_t len);
+	// Also invalidates the cached Info and Summary, so a caller that erases
+	// (the erase route, factory reset) needs no second call to keep query()
+	// and summary() truthful.
 	bool erase();
 
 #if !defined(ESP_PLATFORM)
-	// Test-only: an empty vector means "no dump".
+	// Test-only: an empty vector means "no dump". Models a panic + reboot: the
+	// new image is probed and cached exactly as prime() would at boot.
 	void setImageForTest(std::vector<uint8_t> image);
+	// Test-only: how many times the stored image was probed or read -- the host
+	// stand-in for "touched flash". /api/status must not move it (#405).
+	uint32_t flashAccessCountForTest();
 #endif
 }
