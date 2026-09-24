@@ -742,25 +742,6 @@ RequestsHandler::~RequestsHandler()
 	}
 }
 
-// Same bounded-fallback bookkeeping for the virtual-peer pool as the message
-// pool uses (SipMessagePool.cpp). Separate budget: a virtual peer is a
-// long-lived per-park-slot stand-in, not a per-packet object.
-static std::atomic<std::size_t> s_vpeerHeapFallbacksInFlight{0};
-
-namespace
-{
-	// Same no-locking rule as SipMessagePool's HeapFallbackDeleter: the last
-	// reference can drop while a pool-critical-section lock is held elsewhere,
-	// so the deleter must not itself take any lock.
-	struct VpeerFallbackDeleter
-	{
-		void operator()(SipClient* p) const noexcept
-		{
-			delete p;
-			s_vpeerHeapFallbacksInFlight.fetch_sub(1, std::memory_order_relaxed);
-		}
-	};
-}
 
 // Forwarders onto the static pool in SipMessagePool.cpp (Issue #53 / #101(A) /
 // #101(E)). Kept as public statics on RequestsHandler because SipMessageFactory,
@@ -1790,7 +1771,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		// pool is sized POCKETDIAL_MAX_SESSIONS + POCKETDIAL_PARK_SLOTS, so the
 		// allocateSession() above is the real gate and this should never fail —
 		// but unlike drawbridge's allocator, which always heap-falls-back, ours
-		// returns nullptr past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX, so the null
+		// returns nullptr once the pool is empty (#409), so the null
 		// MUST be checked: setDest(nullptr) would publish a Connected session
 		// whose teardown/CDR paths dereference getDest(). Refuse with the same
 		// 503 the session-pool-full branch above sends, and refuse HERE, before
@@ -2296,7 +2277,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	// slot for a session that never existed. The pool is sized
 	// POCKETDIAL_MAX_SESSIONS + POCKETDIAL_PARK_SLOTS, so with the session in
 	// hand this should never fail — but pocket-dial's allocator returns nullptr
-	// past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX (drawbridge's always heap-falls
+	// once the pool is empty (#409; drawbridge's always heap-falls
 	// back), and setDest(nullptr) would publish a Connected session whose
 	// teardown/CDR paths dereference getDest(). Unwind the RTP stream and answer
 	// 503, exactly as the session-pool-full branch directly above does.
@@ -2471,6 +2452,18 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 
+	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888 call
+	// can't overwrite this call's destination identity. Drawn here, beside the
+	// session, so an exhausted pool is refused before anything is answered
+	// (#412: allocateVirtualPeer() returns nullptr once its capacity is spent).
+	auto dummyConf = allocateVirtualPeer(confExt, data->getSource());
+	if (!dummyConf)
+	{
+		_conference->leave(callID);
+		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
+		return;
+	}
+
 	// Draw the answer BEFORE publishing the session — past _sessions.emplace() the
 	// retransmission guard at the top of onInvite() silently drops the caller's retry,
 	// so a pool refusal here would strand a joined leg with no answer ever sent.
@@ -2491,9 +2484,6 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 
-	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888 call
-	// can't overwrite this call's destination identity.
-	auto dummyConf = allocateVirtualPeer(confExt, data->getSource());
 	newSession->setDest(dummyConf);
 	// Issue #232: same reasoning as the 777 echo leg (RequestsHandler.cpp,
 	// onInvite's "777" branch) — record this leg's own To-tag now, since
@@ -2703,6 +2693,27 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		return;
 	}
 
+	// Per-session dummy dest, drawn from the virtual peer pool like every
+	// other locally-terminated leg (777/888/anchor) -- never a shared
+	// client, so a concurrent voicemail call can't overwrite this one's
+	// destination identity. Drawn beside the session so exhaustion is refused
+	// with the same unwind (#412: it returns nullptr once its capacity is spent).
+	//
+	// Noted, not fixed here (found in review): forceDisconnect() BYEs both
+	// legs of a session, so an admin-killed voicemail call will emit a BYE
+	// toward this dummy "700" address -- the same #232 shape 777/888 already
+	// have (a locally-terminated leg's dummy dest isn't a real phone to BYE).
+	// Whoever picks up #232 broadly should include this leg.
+	auto dummyVm = allocateVirtualPeer("700", invite->getSource());
+	if (!dummyVm)
+	{
+		_vmRtpReceivers[slot].stop();
+		_vmRtpSenders[slot].stop(callID);
+		_vmLegs[slot].reset();
+		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted, rejected deposit");
+		return;
+	}
+
 	const std::string toTag = IDGen::GenerateID(9);
 	// buildMediaSdp() still answers sendrecv unconditionally (not offer-aware)
 	// -- matches every OTHER locally-terminated leg today (777/888/anchor)
@@ -2720,17 +2731,6 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		return;
 	}
 
-	// Per-session dummy dest, drawn from the virtual peer pool like every
-	// other locally-terminated leg (777/888/anchor) -- never a shared
-	// client, so a concurrent voicemail call can't overwrite this one's
-	// destination identity.
-	//
-	// Noted, not fixed here (found in review): forceDisconnect() BYEs both
-	// legs of a session, so an admin-killed voicemail call will emit a BYE
-	// toward this dummy "700" address -- the same #232 shape 777/888 already
-	// have (a locally-terminated leg's dummy dest isn't a real phone to BYE).
-	// Whoever picks up #232 broadly should include this leg.
-	auto dummyVm = allocateVirtualPeer("700", invite->getSource());
 	newSession->setDest(dummyVm);
 	newSession->setVoicemail(true);
 	newSession->setVoicemailLegSlot(slot);
@@ -2919,6 +2919,20 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 		return;
 	}
 
+	// Per-session dummy dest, drawn from the virtual peer pool like every
+	// other locally-terminated leg -- see answerVoicemailDeposit()'s
+	// identical note on the #232 shape this shares (a dummy dest isn't a
+	// real phone to BYE; out of scope here too). Drawn beside the session and
+	// refused the same way when the pool is empty (#412).
+	auto dummyVm = allocateVirtualPeer(kVoicemailRetrievalExt, invite->getSource());
+	if (!dummyVm)
+	{
+		_vmRtpReceivers[slot].stop();
+		_vmRtpSenders[slot].stop(callID);
+		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted, rejected retrieval");
+		return;
+	}
+
 	const std::string toTag = IDGen::GenerateID(9);
 	// buildMediaSdp() still answers sendrecv unconditionally -- matches
 	// every other locally-terminated leg today (see answerVoicemailDeposit()'s
@@ -2934,11 +2948,6 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 		return;
 	}
 
-	// Per-session dummy dest, drawn from the virtual peer pool like every
-	// other locally-terminated leg -- see answerVoicemailDeposit()'s
-	// identical note on the #232 shape this shares (a dummy dest isn't a
-	// real phone to BYE; out of scope here too).
-	auto dummyVm = allocateVirtualPeer(kVoicemailRetrievalExt, invite->getSource());
 	newSession->setDest(dummyVm);
 	newSession->setVoicemail(true);
 	newSession->setVoicemailLegSlot(slot);
@@ -3937,6 +3946,21 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 			return true;
 		}
 
+		// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
+		// call can't overwrite this call's destination identity. Always kAnchorCallExt
+		// (not remoteExt): this is dialog bookkeeping isAnchor()-adjacent code keys on
+		// (onReinvite/onUpdate), not the dialed digits, so it must stay stable across
+		// both a plain 555 dial and a Trunk-routed one. Drawn beside the session and
+		// unwound the same way when the pool is empty (#412).
+		auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
+		if (!dummyAnchor)
+		{
+			bridge->stopBridge();
+			_anchorClient->dropCall(ownLeg);
+			refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
+			return true;
+		}
+
 		// Draw the answer BEFORE publishing the session — same "a pool refusal must
 		// never strand a call that already mutated state" reasoning as onConferenceInvite
 		// above. The SDP advertises THIS BRIDGE's receive port (not any other slot's):
@@ -3956,12 +3980,6 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 			return true;
 		}
 
-		// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
-		// call can't overwrite this call's destination identity. Always kAnchorCallExt
-		// (not remoteExt): this is dialog bookkeeping isAnchor()-adjacent code keys on
-		// (onReinvite/onUpdate), not the dialed digits, so it must stay stable across
-		// both a plain 555 dial and a Trunk-routed one.
-		auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
 		newSession->setDest(dummyAnchor);
 		newSession->setAnchor(true);
 		newSession->setAnchorParticipantId(ownLeg);
@@ -4014,6 +4032,13 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// isDialogSourceAuthorized() BYE/CANCEL leg-IP check compares against (its
 	// address is the caller's own, matching src — see that function's comment).
 	auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
+	if (!dummyAnchor)
+	{
+		// Nothing claimed yet beyond the unpublished session, which the pool
+		// reclaims when newSession goes out of scope (#412).
+		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
+		return true;
+	}
 	newSession->setDest(dummyAnchor);
 	newSession->setInviteMessage(data);
 	newSession->setAnchor(true);
@@ -4447,6 +4472,16 @@ void RequestsHandler::routeInboundAnchorCall(const std::string& participantId, c
 	sockaddr_in pstnAddr{};
 	pstnAddr.sin_family = AF_INET;
 	auto pstn = allocateVirtualPeer(callerDisplay, pstnAddr);
+	if (!pstn)
+	{
+		// No SIP request to 503 here -- the call arrived from the anchor, so the
+		// refusal is the same as a full session pool's: drop the PSTN leg. A null
+		// src must never reach allocateSession(); everything downstream reads
+		// getSrc() for the caller label and the CDR (#412).
+		queueLog("[Telephony] Inbound: virtual-peer pool exhausted — dropping", true);
+		asyncDropCall(participantId);
+		return;
+	}
 	auto session = allocateSession(callId, pstn);
 	if (!session)
 	{
@@ -9520,42 +9555,17 @@ std::shared_ptr<SipClient> RequestsHandler::allocateVirtualPeer(std::string numb
 			return peer;
 		}
 	}
-	// Pool drained: fall back to the heap, bounded the same way the message pool
-	// is (Issue #101(A)). Past the ceiling this returns nullptr and the caller
-	// abandons the park/BLF operation rather than allocating without limit.
+	// Pool drained: REFUSE. There is no heap fallback (#409): the #101(A)
+	// fallback did `new SipClient` on the SIP task, from internal DRAM, exactly
+	// when the pool had run out. Every caller handles nullptr by refusing its
+	// request (#412) -- 503 to the phone, or dropping the anchor leg.
 	//
-	// No pool lock here, unlike SipMessagePool's acquirePooledMessage(): _virtualPeerPool is a
-	// per-instance member and every caller — the internal sites and ParkOrbit via
-	// PbxEnv::allocVirtualPeer — already runs under _mutex. The counter is still
-	// atomic because its decrement happens in the deleter, which runs wherever
-	// the owning Session finally releases it.
+	// No pool lock here, unlike SipMessagePool's acquirePooledMessage():
+	// _virtualPeerPool is a per-instance member and every caller -- the internal
+	// sites and ParkOrbit via PbxEnv::allocVirtualPeer -- already runs under _mutex.
 	static std::atomic<std::size_t> vpeerWarnCount{0};
-	if (s_vpeerHeapFallbacksInFlight.load(std::memory_order_relaxed) >= POCKETDIAL_VPEER_HEAP_FALLBACK_MAX)
-	{
-		sipmsgpool::logPoolExhausted("Virtual-peer", sipmsgpool::PoolPressure::Refused, vpeerWarnCount);
-		return nullptr;
-	}
-	sipmsgpool::logPoolExhausted("Virtual-peer", sipmsgpool::PoolPressure::Fallback, vpeerWarnCount);
-
-	SipClient* raw = nullptr;
-	try
-	{
-		raw = new SipClient(std::move(number), address, expiresSeconds);
-	}
-	catch (const std::bad_alloc&)
-	{
-		return nullptr;   // budget untouched
-	}
-	s_vpeerHeapFallbacksInFlight.fetch_add(1, std::memory_order_relaxed);
-	try
-	{
-		return std::shared_ptr<SipClient>(raw, VpeerFallbackDeleter{});
-	}
-	catch (const std::bad_alloc&)
-	{
-		// Constructor already ran the deleter on `raw` — freed and decremented.
-		return nullptr;
-	}
+	sipmsgpool::logPoolExhausted("Virtual-peer", vpeerWarnCount);
+	return nullptr;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

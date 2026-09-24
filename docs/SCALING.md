@@ -212,14 +212,12 @@ an out-of-memory abort. Each pool degrades in its own well-behaved way:
   **`503 Service Unavailable`** (see `onInvite()` and the broadcast handler in
   `RequestsHandler.cpp`). The caller hears fast-busy / "service unavailable"
   rather than the call hanging. Existing calls are untouched.
-* **Message pool drained (transient), then hard-stopped.** `getMessageFromPool()`
-  logs `"[WARNING] SIP Message pool exhausted (N total)! Falling back to bounded
-  heap allocation."` (rate-limited to 1-in-100) and serves a one-off
-  `std::make_shared` instead. **This is not an unlimited soft limit.** The heap
-  fallback is capped at `POCKETDIAL_MSG_HEAP_FALLBACK_MAX` = 8 concurrent
-  allocations (`PoolConfig.hpp:87-89`); past that `getMessageFromPool()` returns
-  `nullptr`, logs `"Fallback budget spent — DROPPING packets."`
-  (`SipMessagePool.cpp:95-99`, `:134-141`), and the ~20 call sites in
+* **Message pool drained: hard stop, no heap.** `getMessageFromPool()` returns
+  `nullptr` the moment the pool is empty and logs `"[WARNING] SIP Message pool
+  exhausted (N total)! Refusing -- no heap fallback."` (rate-limited to
+  1-in-100). There is **no** heap fallback behind the pool: the #101(A) one, and
+  its `POCKETDIAL_MSG_HEAP_FALLBACK_MAX` ceiling, were removed by #409 (a build
+  that still defines the knob fails at compile time). The call sites in
   `RequestsHandler.cpp` that check it drop the packet and rely on the peer's
   RFC 3261 §17 retransmit. Shedding load is the intended behaviour at that depth,
   but it *does* refuse work. An earlier revision of this bullet said it never

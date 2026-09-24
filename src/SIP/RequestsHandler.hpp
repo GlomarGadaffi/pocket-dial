@@ -366,6 +366,29 @@ public:
 	// resolution has at least been ASKED FOR, which is what proves tick()
 	// primes the cache rather than leaving an FQDN trunk permanently dead.
 	TrunkResolver::Status trunkResolveStatusForTest();
+
+	// Exhaust virtual-peer capacity (#412): draw through the REAL allocator
+	// until it refuses, and hand back everything it gave out. Hold the vector
+	// to keep capacity exhausted; drop it to restore. Drawing through
+	// allocateVirtualPeer() rather than reading _virtualPeerPool directly is
+	// deliberate -- it exhausts the allocator's real capacity whatever that
+	// is (since #409 there is no heap fallback behind the pool), so the next
+	// draw really returns nullptr, which is the state every caller must survive.
+	//
+	// `maxDraws` caps the draws, so a test can take exactly the pool's worth and
+	// then measure the single draw past it in isolation (#409's gate).
+	std::vector<std::shared_ptr<SipClient>> exhaustVirtualPeersForTest(
+		size_t maxDraws = 4 * POCKETDIAL_VIRTUAL_PEERS + 64)
+	{
+		std::vector<std::shared_ptr<SipClient>> held;
+		for (size_t guard = 0; guard < maxDraws; ++guard)
+		{
+			auto p = allocateVirtualPeer("vpeer-drain", sockaddr_in{});
+			if (!p) break;
+			held.push_back(std::move(p));
+		}
+		return held;
+	}
 #endif
 
 	// ── Telephony-API credential slots (ported from drawbridge) ──────────────────

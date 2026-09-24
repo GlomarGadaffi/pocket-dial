@@ -24,7 +24,7 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers)
+include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers support)
 
 add_executable(sip_parser_tests
     SipMessage_test.cpp
@@ -59,10 +59,21 @@ add_executable(sip_parser_tests
     # applies them to every SDP-bearing message before any decode or relay.
     # Also pins the decode paths as zero-heap via a counting operator new.
     SdpAdmission_test.cpp
-    # Issue #101(A)/(E): message-pool backpressure (bounded heap fallback, then
+    # The binary's one counting operator new, plus its own positive controls.
+    support/AllocCounter.cpp
+    AllocCounter_test.cpp
+    # Issue #409: pools REFUSE when empty and never heap-allocate -- pinned with
+    # the shared counting operator new (tests/support/AllocCounter).
+    PoolNoHeapFallback_test.cpp
+    # Issue #101(A)/(E): message-pool backpressure (refuse when the pool is empty
     # refuse) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
     RequestsHandler_pool_test.cpp
+    # Issue #412: every allocateVirtualPeer() caller must survive an exhausted
+    # pool -- refuse with 503 (or drop the anchor leg) and release what it had
+    # claimed, never publish a session with a null peer.
+    VpeerExhaustion_test.cpp
+    VpeerExhaustion_vm_anchor_test.cpp
     # Issue #115: the 777 SDP-loopback echo test must call allocateSession()
     # BEFORE building any 180/200, mirroring the ordinary call-to-call INVITE
     # path, so a full session pool gets a real 503 instead of a false 200.
