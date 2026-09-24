@@ -311,7 +311,12 @@ namespace
 	}
 
 	// Strip surrounding whitespace and a single pair of double-quotes.
-	std::string trimQuoted(std::string_view sv)
+	//
+	// Returns a VIEW into `sv`, not a copy. It only ever narrows its input, so a
+	// std::string here was an allocation that bought nothing -- and it sat on the
+	// digest client's wire path, which #399 requires to be heap-free. Callers
+	// must not let the result outlive the buffer `sv` points into.
+	std::string_view trimQuoted(std::string_view sv)
 	{
 		size_t b = 0, e = sv.size();
 		while (b < e && std::isspace(static_cast<unsigned char>(sv[b]))) ++b;
@@ -321,7 +326,7 @@ namespace
 			++b;
 			--e;
 		}
-		return std::string(sv.substr(b, e - b));
+		return sv.substr(b, e - b);
 	}
 
 	bool iequalsAscii(std::string_view a, std::string_view b)
@@ -360,9 +365,18 @@ namespace
 	// `fn(key,value)`: invoked once per parameter. `key` is whitespace-trimmed
 	//                  but case-preserved; `value` is already unquoted.
 	//
+	// ALLOCATION-FREE (#399). Both `key` and `value` are VIEWS into
+	// `headerValue`, valid only for the duration of the callback: a callback
+	// that needs to keep a value must copy it out before returning. That is
+	// what lets one scanner serve the std::string API (which copies into
+	// std::string members) and the bounded client API (which copies into fixed
+	// char buffers) without either paying for the other's representation. It is
+	// sound because no quoted value is escape-processed here -- a quoted value
+	// is the literal bytes between the quotes, so it is always a substring.
+	//
 	// Returns false iff the "Digest" scheme token is absent.
 	template <typename Fn>
-	bool scanDigestParams(const std::string& headerValue,
+	bool scanDigestParams(std::string_view headerValue,
 	                      std::initializer_list<std::string_view> names,
 	                      std::string_view* matchedName,
 	                      Fn&& fn)
@@ -380,7 +394,7 @@ namespace
 			// the colon, which would indicate this colon belongs to a param value).
 			if (name.find('=') == std::string_view::npos)
 			{
-				const std::string trimmed = trimQuoted(name);
+				const std::string_view trimmed = trimQuoted(name);
 				for (std::string_view candidate : names)
 				{
 					if (iequalsAscii(trimmed, candidate))
@@ -430,14 +444,14 @@ namespace
 			++i; // consume '='
 
 			// Value: quoted or bare token (terminated by an unquoted comma).
-			std::string value;
+			std::string_view value;
 			while (i < n && std::isspace(static_cast<unsigned char>(rest[i]))) ++i;
 			if (i < n && rest[i] == '"')
 			{
 				++i; // opening quote
 				size_t valStart = i;
 				while (i < n && rest[i] != '"') ++i;
-				value.assign(rest.substr(valStart, i - valStart));
+				value = rest.substr(valStart, i - valStart);
 				if (i < n) ++i; // closing quote
 			}
 			else
@@ -494,7 +508,7 @@ namespace SipDigest
 		// check and return false), and the registrar has no proxy role to need it.
 		const bool isDigest = scanDigestParams(
 			authHeaderValue, {"authorization"}, nullptr,
-			[&out](std::string_view k, const std::string& value) {
+			[&out](std::string_view k, std::string_view value) {
 				if      (iequalsAscii(k, "username"))  out.username  = value;
 				else if (iequalsAscii(k, "realm"))     out.realm     = value;
 				else if (iequalsAscii(k, "nonce"))     out.nonce     = value;
@@ -657,7 +671,7 @@ namespace SipDigest
 		std::string_view matched;
 		const bool isDigest = scanDigestParams(
 			challengeHeaderValue, {"www-authenticate", "proxy-authenticate"}, &matched,
-			[&out](std::string_view k, const std::string& value) {
+			[&out](std::string_view k, std::string_view value) {
 				if      (iequalsAscii(k, "realm"))     out.realm       = value;
 				else if (iequalsAscii(k, "nonce"))     out.nonce       = value;
 				else if (iequalsAscii(k, "opaque"))    out.opaque      = value;
