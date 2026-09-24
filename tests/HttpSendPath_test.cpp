@@ -142,10 +142,13 @@ TEST(HttpSendPathResume, ShortWritesResumeAtTheRightByteForEverySplit)
 		for (int alternate = 0; alternate < 2; ++alternate)
 		{
 			SCOPED_TRACE(::testing::Message() << "k=" << k << " alternate=" << alternate);
-			HttpServer::SendPiece rest[] = {
-				{ a.data(), a.size() }, { b.data(), b.size() }, { c.data(), c.size() },
-				{ d.data(), d.size() }, { e.data(), e.size() },
-			};
+			HttpServer::SendPiece rest[5];
+			const std::string* src[] = { &a, &b, &c, &d, &e };
+			for (size_t i = 0; i < 5; ++i)
+			{
+				rest[i].iov_base = const_cast<char*>(src[i]->data());
+				rest[i].iov_len = src[i]->size();
+			}
 			const size_t n = sizeof(rest) / sizeof(rest[0]);
 			std::string out;
 			size_t first = 0, calls = 0;
@@ -155,8 +158,8 @@ TEST(HttpSendPathResume, ShortWritesResumeAtTheRightByteForEverySplit)
 				size_t want = (alternate && (calls % 2 == 0)) ? 1 : k, sent = 0;
 				for (size_t i = first; i < n && sent < want; ++i)
 				{
-					const size_t take = std::min(want - sent, rest[i].size);
-					out.append(rest[i].data, take);
+					const size_t take = std::min(want - sent, static_cast<size_t>(rest[i].iov_len));
+					out.append(static_cast<const char*>(rest[i].iov_base), take);
 					sent += take;
 				}
 				first = HttpServer::consumeSent(rest, first, n, sent);

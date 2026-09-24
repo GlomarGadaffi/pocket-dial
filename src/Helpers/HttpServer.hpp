@@ -100,12 +100,18 @@ public:
 	static ProvisioningPathType parseProvisioningPath(const std::string& path, std::string& outKey);
 
 	// #410 phase 2: one byte range to be sent in place (see sendAllPieces()).
-	struct SendPiece { const char* data; size_t size; };
-	// After a (possibly short) write of `sent` bytes from rest[first..n), skips
-	// the ranges that went out whole and trims the one it stopped inside;
-	// returns the new `first` (== n once everything is out). Pure, so the
-	// resume logic is testable at every split without a socket.
-	static size_t consumeSent(SendPiece* rest, size_t first, size_t n, size_t sent);
+	// It IS struct iovec on POSIX and lwIP, so an array of them goes to
+	// sendmsg() as is, with no second copy on the http_conn stack (#405).
+#if defined _WIN32 || defined _WIN64
+	struct SendPiece { void* iov_base; size_t iov_len; };   // iovec's shape; no sendmsg() on Winsock
+#else
+	using SendPiece = struct iovec;
+#endif
+	// After a (possibly short) write of `sent` bytes from v[first..n), skips
+	// the ranges that went out whole and trims the one it stopped inside, in
+	// place; returns the new `first` (== n once everything is out). Pure, so
+	// the resume logic is testable at every split without a socket.
+	static size_t consumeSent(SendPiece* v, size_t first, size_t n, size_t sent);
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only (#410): serve one static page onto `sock` ON THE CALLING THREAD,
@@ -201,6 +207,9 @@ private:
 	// string_view throughout (#410 phase 2): a literal status, content type or
 	// error body no longer builds a std::string temporary at every call site,
 	// and nothing here is copied -- see sendResponseWithHeader().
+	// Views must outlive the call: pass temporaries straight in (they live to
+	// the end of the statement), but NEVER store a view taken from one, e.g.
+	// `std::string_view v = a + b; sendResponse(..., v);` dangles.
 	void sendResponse(int sock, int statusCode, std::string_view statusText,
 	                   std::string_view contentType, std::string_view body);
 	// Same as sendResponse, but injects an extra raw header line (e.g.
@@ -209,19 +218,38 @@ private:
 	void sendResponseWithHeader(int sock, int statusCode, std::string_view statusText,
 	                   std::string_view contentType, std::string_view body,
 	                   std::string_view extraHeader);
-	// Every response's status line + headers (security headers included), for a
-	// body sent separately -- the streamed /api/coredump download (#382).
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// The pre-#410 head as one std::string. Test-only now: every production
+	// head goes through headPieces(); the tests compare against this.
 	static std::string buildResponseHead(int statusCode, const std::string& statusText,
 	                   const std::string& contentType, size_t contentLength,
 	                   const std::string& extraHeader);
+#endif
 	static bool sendAllBytes(int sock, const char* ptr, size_t len);
-	static constexpr size_t kMaxSendPieces = 12;
-	// #410 phase 2: writes `count` (<= kMaxSendPieces) ranges back to back as
-	// one scatter-gather sendmsg() on POSIX and lwIP, resuming after short
-	// writes (consumeSent()): no allocation, nothing copied on our side. Empty
-	// ranges are skipped. False on a send error or too many ranges, like
-	// sendAllBytes().
-	static bool sendAllPieces(int sock, const SendPiece* pieces, size_t count);
+	// #410 phase 2: the only two formatted numbers of a response head. Lives in
+	// the caller's frame and must outlive the send.
+	struct HeadNumbers
+	{
+		char status[24];   // "HTTP/1.1 %d "
+		char length[44];   // "\r\nContent-Length: %zu\r\n"
+	};
+	// status, statusText, "Content-Type: ", type, length, kSecurityHeaders,
+	// extra header, its CRLF, "Connection: close" -- headPieces() adds them in
+	// that order and checks the count against this before returning.
+	static constexpr size_t kHeadPieces = 9;
+	// Every response's status line + headers (security headers included) as
+	// in-place ranges: fills v[0..) -- at most kHeadPieces, never an empty one --
+	// and returns how many; 0 only if formatting failed (then send nothing).
+	// The single head builder for sendResponseWithHeader(), the streamed
+	// /api/coredump download (#382) and the static pages (sendStaticHtml).
+	static size_t headPieces(SendPiece* v, HeadNumbers& nums, int statusCode,
+	                   std::string_view statusText, std::string_view contentType,
+	                   size_t contentLength, std::string_view extraHeader);
+	// #410 phase 2: writes v[0..n) back to back as one scatter-gather sendmsg()
+	// on POSIX and lwIP, resuming after short writes via consumeSent(), which
+	// trims `v` in place: no allocation, no copy of the ranges or the bytes.
+	// False on a send error, like sendAllBytes().
+	static bool sendAllPieces(int sock, SendPiece* v, size_t n);
 	// #410: a static HTML page written straight from its flash-resident parts,
 	// with the session's CSRF token substituted for the __PD_CSRF__ marker on the
 	// way out. No copy of the page is ever made: a 200 head is formatted into a
