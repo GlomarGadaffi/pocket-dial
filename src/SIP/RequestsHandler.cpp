@@ -1,6 +1,7 @@
 // RequestsHandler.cpp: Issues #24 and #28 resolved.
 #include "RequestsHandler.hpp"
 #include "SipMessagePool.hpp"
+#include <cassert>
 #include <atomic>
 #include <iostream>
 #include <sstream>
@@ -6349,11 +6350,17 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	{
 		// Issue #422: above everything this dialog has carried, like the success
 		// NOTIFY (#402) -- not the builder's default 2.
-		const uint32_t notifyCSeq = original ? original->nextServerCSeq() : 2u;
+		//
+		// `original` cannot be null here: `transferee` is only ever set inside
+		// the `if (originalOpt.has_value())` block above, and a null transferee
+		// has already returned through the 481/603 decline. So there is no
+		// fallback CSeq to get wrong (#459 review).
+		assert(original && "blind-REFER decline reached without a session");
+		const uint32_t notifyCSeq = original->nextServerCSeq();
 		auto notify = buildReferNotify(data, transferor, "SIP/2.0 404 Not Found", /*terminated=*/true,
 			notifyCSeq);
 		if (notify) _outbox.emplace_back(transferor->getAddress(), std::move(notify));
-		if (original) original->noteServerCSeq(notifyCSeq);
+		original->noteServerCSeq(notifyCSeq);
 		queueLog("REFER: blind transfer to " + target + " declined (no such target) — "
 			"call left up", true);
 		return;
