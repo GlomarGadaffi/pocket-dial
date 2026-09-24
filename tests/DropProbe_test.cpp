@@ -18,6 +18,7 @@
 #endif
 
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -37,6 +38,26 @@ namespace
 	void feed(RequestsHandler& h, const std::string& raw, const sockaddr_in& src)
 	{
 		h.handle(RequestsHandler::getMessageFromPool(raw, src), raw);
+	}
+
+	// Test-side read of the ring, through the same window()/at() the HTTP
+	// path uses. (The vector is the test's; the product never builds one.)
+	std::vector<DropProbe::Record> recentOf(const DropProbe& probe)
+	{
+		std::vector<DropProbe::Record> out;
+		uint32_t first = 0, end = 0;
+		probe.window(first, end);
+		for (uint32_t seq = first; seq != end; ++seq)
+		{
+			DropProbe::Record r;
+			if (probe.at(seq, r)) out.push_back(r);
+		}
+		return out;
+	}
+
+	void note(DropProbe& p, DropProbe::Reason r, const sockaddr_in& a, std::string_view bytes)
+	{
+		p.note(r, a.sin_addr.s_addr, a.sin_port, bytes);
 	}
 
 	std::string options(int n)
@@ -68,11 +89,11 @@ TEST(DropProbe, CrlfKeepAliveIsRecordedAsInvalidWithSourceAndBytes)
 	EXPECT_EQ(handler.getDroppedRate(), 0u);
 	EXPECT_EQ(handler.getPacketsProcessed(), 0u);
 
-	const auto drops = handler.getRecentDrops();
+	const auto drops = recentOf(handler.getDropProbe());
 	ASSERT_EQ(drops.size(), 2u);
 	EXPECT_EQ(drops[0].reason, DropProbe::Reason::Invalid);
-	EXPECT_EQ(drops[0].src.sin_addr.s_addr, phone.sin_addr.s_addr);
-	EXPECT_EQ(drops[0].src.sin_port, phone.sin_port);
+	EXPECT_EQ(drops[0].ip, phone.sin_addr.s_addr);
+	EXPECT_EQ(drops[0].port, phone.sin_port);
 	EXPECT_EQ(drops[0].len, 4u);
 	ASSERT_EQ(drops[0].headLen, 4u);
 	EXPECT_EQ(std::string(reinterpret_cast<const char*>(drops[0].head.data()), 4), "\r\n\r\n");
@@ -96,17 +117,36 @@ TEST(DropProbe, TokenBucketRefusalIsRecordedAsRateAndCountersSum)
 	EXPECT_EQ(handler.getPacketsDropped(), handler.getDroppedInvalid() + handler.getDroppedRate());
 
 	bool sawRate = false;
-	for (const auto& d : handler.getRecentDrops())
+	for (const auto& d : recentOf(handler.getDropProbe()))
 	{
 		if (d.reason == DropProbe::Reason::Rate)
 		{
 			sawRate = true;
-			EXPECT_EQ(d.src.sin_addr.s_addr, src.sin_addr.s_addr);
+			EXPECT_EQ(d.ip, src.sin_addr.s_addr);
 			ASSERT_EQ(d.headLen, DropProbe::kHeadBytes);
 			EXPECT_EQ(std::string(reinterpret_cast<const char*>(d.head.data()), 7), "OPTIONS");
 		}
 	}
 	EXPECT_TRUE(sawRate);
+}
+
+// A reader that races the writer never gets a stale slot: once a sequence
+// number has been evicted, at() refuses it rather than returning its successor.
+TEST(DropProbe, EvictedSequenceIsRefusedNotAliased)
+{
+	DropProbe probe;
+	const sockaddr_in src = addr("10.0.0.3", 5060);
+	note(probe, DropProbe::Reason::Invalid, src, "first");
+	uint32_t first = 0, end = 0;
+	probe.window(first, end);
+	ASSERT_EQ(end - first, 1u);
+	for (std::size_t i = 0; i < DropProbe::kRingSize; ++i) note(probe, DropProbe::Reason::Rate, src, "later");
+
+	DropProbe::Record r;
+	EXPECT_FALSE(probe.at(first, r)) << "seq " << first << " was overwritten and must not be served";
+	EXPECT_TRUE(probe.at(first + 1, r));
+	EXPECT_EQ(r.seq, first + 1);
+	EXPECT_FALSE(probe.at(first + 1 + DropProbe::kRingSize, r)) << "not written yet";
 }
 
 // Bounded: the ring keeps the newest kRingSize, oldest first, and the counts
@@ -116,10 +156,10 @@ TEST(DropProbe, RingKeepsTheNewestAndCountsKeepGoing)
 	DropProbe probe;
 	const sockaddr_in src = addr("10.0.0.1", 5060);
 	const std::size_t total = DropProbe::kRingSize + 5;
-	for (std::size_t i = 0; i < total; ++i) probe.note(DropProbe::Reason::Invalid, src, "x");
+	for (std::size_t i = 0; i < total; ++i) note(probe, DropProbe::Reason::Invalid, src, "x");
 
 	EXPECT_EQ(probe.invalidCount(), total);
-	const auto drops = probe.recent();
+	const auto drops = recentOf(probe);
 	ASSERT_EQ(drops.size(), DropProbe::kRingSize);
 	EXPECT_EQ(drops.front().seq, total - DropProbe::kRingSize);
 	EXPECT_EQ(drops.back().seq, total - 1);
@@ -133,18 +173,31 @@ TEST(DropProbe, RecordingAllocatesNothing)
 	DropProbe probe;
 	const sockaddr_in src = addr("10.0.0.2", 5060);
 	const std::string big(3000, 'A');
-	probe.note(DropProbe::Reason::Invalid, src, "warm");   // first-use effects, if any
+	note(probe, DropProbe::Reason::Invalid, src, "warm");   // first-use effects, if any
 
 	AllocGuard guard;
 	for (int i = 0; i < 3 * static_cast<int>(DropProbe::kRingSize); ++i)
 	{
-		probe.note(DropProbe::Reason::Invalid, src, std::string_view());
-		probe.note(DropProbe::Reason::Rate, src, "\r\n\r\n");
-		probe.note(DropProbe::Reason::Invalid, src, big);
+		note(probe, DropProbe::Reason::Invalid, src, std::string_view());
+		note(probe, DropProbe::Reason::Rate, src, "\r\n\r\n");
+		note(probe, DropProbe::Reason::Invalid, src, big);
 	}
-	EXPECT_EQ(guard.delta(), 0u);
+	EXPECT_EQ(guard.delta(), 0u) << "note() allocated";
 
-	const auto drops = probe.recent();
+	// The reader side too: /api/status copies one Record at a time.
+	AllocGuard readGuard;
+	uint32_t first = 0, end = 0;
+	probe.window(first, end);
+	uint32_t read = 0;
+	for (uint32_t seq = first; seq != end; ++seq)
+	{
+		DropProbe::Record r;
+		if (probe.at(seq, r)) ++read;
+	}
+	EXPECT_EQ(readGuard.delta(), 0u) << "window()/at() allocated";
+	EXPECT_EQ(read, DropProbe::kRingSize);
+
+	const auto drops = recentOf(probe);
 	EXPECT_EQ(drops.back().len, 3000u);
 	EXPECT_EQ(drops.back().headLen, DropProbe::kHeadBytes);
 }

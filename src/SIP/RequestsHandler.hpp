@@ -155,12 +155,12 @@ public:
 	void forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
-	// Issue #430: packetsDropped split by reason (their sum), and the last
-	// DropProbe::kRingSize refusals oldest first. The vector is built on the
-	// caller's (HTTP) thread; recording a drop never allocates.
+	// Issue #430: packetsDropped split by reason (their sum), and the probe
+	// itself for its recent-drop ring (read with window()/at(); thread-safe,
+	// allocation-free on both sides).
 	uint64_t getDroppedInvalid() const;
 	uint64_t getDroppedRate() const;
-	std::vector<DropProbe::Record> getRecentDrops() const;
+	const DropProbe& getDropProbe() const;
 	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
 	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
 	// Counted whether the refusal went out as a 488 (requests) or as a silent

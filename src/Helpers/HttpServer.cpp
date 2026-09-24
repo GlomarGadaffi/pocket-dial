@@ -1485,7 +1485,6 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	uint64_t dropped = 0;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate = 0;
-	std::vector<DropProbe::Record> recentDrops;
 
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
 	if (handler != nullptr)
@@ -1502,7 +1501,6 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		dropped = handler->getPacketsDropped();   // Issue #38
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate = handler->getDroppedRate();
-		if (authenticated) recentDrops = handler->getRecentDrops();
 	}
 
 	std::string displayIp = _ip;
@@ -1535,24 +1533,40 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"droppedInvalid\":" << droppedInvalid << ",";
 	json << "\"droppedRate\":" << droppedRate << ",";
 	json << "\"recentDrops\":[";
-	for (size_t i = 0; i < recentDrops.size(); i++)
+	if (authenticated && handler != nullptr)
 	{
-		const DropProbe::Record& d = recentDrops[i];
-		static const char kHex[] = "0123456789abcdef";
-		char head[2 * DropProbe::kHeadBytes + 1];
-		for (size_t b = 0; b < d.headLen; b++)
+		// One Record on the stack at a time, no allocation, and the probe's lock
+		// is held only for each copy, never across the formatting (DropProbe.hpp).
+		const DropProbe& probe = handler->getDropProbe();
+		uint32_t first = 0, end = 0;
+		probe.window(first, end);
+		bool any = false;
+		for (uint32_t seq = first; seq != end; ++seq)
 		{
-			head[2 * b]     = kHex[d.head[b] >> 4];
-			head[2 * b + 1] = kHex[d.head[b] & 0x0f];
+			DropProbe::Record d;
+			if (!probe.at(seq, d)) continue;   // evicted since window()
+			static const char kHex[] = "0123456789abcdef";
+			char head[2 * DropProbe::kHeadBytes + 1];
+			const size_t headLen = (std::min)(static_cast<size_t>(d.headLen), DropProbe::kHeadBytes);
+			for (size_t b = 0; b < headLen; b++)
+			{
+				head[2 * b]     = kHex[d.head[b] >> 4];
+				head[2 * b + 1] = kHex[d.head[b] & 0x0f];
+			}
+			head[2 * headLen] = '\0';
+			sockaddr_in src{};
+			src.sin_family      = AF_INET;
+			src.sin_addr.s_addr = d.ip;
+			src.sin_port        = d.port;
+			if (any) json << ",";
+			any = true;
+			json << "{\"seq\":" << d.seq
+			     << ",\"tsUs\":" << d.tsUs
+			     << ",\"reason\":\"" << DropProbe::reasonName(d.reason) << "\""
+			     << ",\"src\":\"" << jsonEscape(sipwire::addrToIpPort(src)) << "\""
+			     << ",\"len\":" << d.len
+			     << ",\"head\":\"" << head << "\"}";
 		}
-		head[2 * d.headLen] = ' ';
-		if (i > 0) json << ",";
-		json << "{\"seq\":" << d.seq
-		     << ",\"tsUs\":" << d.tsUs
-		     << ",\"reason\":\"" << DropProbe::reasonName(d.reason) << "\""
-		     << ",\"src\":\"" << jsonEscape(sipwire::addrToIpPort(d.src)) << "\""
-		     << ",\"len\":" << d.len
-		     << ",\"head\":\"" << head << "\"}";
 	}
 	json << "],";
 
