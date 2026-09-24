@@ -1189,41 +1189,10 @@ HttpServer::HttpRequest HttpServer::parseRequest(const std::string& raw)
 	return req;
 }
 
-void HttpServer::sendResponseWithHeader(int sock, int statusCode, const std::string& statusText,
-                              const std::string& contentType, const std::string& body,
-                              const std::string& extraHeader)
-{
-	// Assembled through an ostringstream exactly as before the streamed coredump
-	// download (#382) split buildResponseHead() out. A plain `head += body`
-	// made CodeQL newly trace emailConfigJson() -- whose secrets leave only as
-	// hasPassword/hasGsaKey booleans (#207) -- to this send as "cleartext
-	// transmission of sensitive information" (a false positive on PR #394).
-	// Keeping main's shape keeps this change out of every other route.
-	std::ostringstream resp;
-	resp << buildResponseHead(statusCode, statusText, contentType, body.size(), extraHeader) << body;
-	const std::string data = resp.str();
-	sendAllBytes(sock, data.data(), data.size());
-}
-
-bool HttpServer::sendAllBytes(int sock, const char* ptr, size_t remaining)
-{
-	while (remaining > 0)
-	{
-#if defined _WIN32 || defined _WIN64
-		int sent = ::send(sock, ptr, static_cast<int>(remaining), 0);
-#else
-		int sent = static_cast<int>(::send(sock, ptr, remaining, 0));
-#endif
-		if (sent <= 0) return false;
-		ptr += sent;
-		remaining -= static_cast<size_t>(sent);
-	}
-	return true;
-}
-
 // --- Security headers, emitted centrally so no endpoint can forget them ---
-// One constant, written verbatim both by buildResponseHead() and by the
-// streamed static pages (sendStaticHtml, #410), so the two paths cannot drift.
+// One constant, written verbatim by sendResponseWithHeader(), by
+// buildResponseHead() and by the streamed static pages (sendStaticHtml, #410),
+// so no two paths can drift.
 //
 // The dashboard is a single self-contained page with inline <script>/<style>
 // and no external origins, so the policy can be this tight: nothing loads
@@ -1243,6 +1212,115 @@ static constexpr char kSecurityHeaders[] =
 	"X-Content-Type-Options: nosniff\r\n"
 	"Cache-Control: no-store\r\n"
 	"Referrer-Policy: same-origin\r\n";
+
+void HttpServer::sendResponseWithHeader(int sock, int statusCode, std::string_view statusText,
+                              std::string_view contentType, std::string_view body,
+                              std::string_view extraHeader)
+{
+	// #410 phase 2: every route's response goes out IN PLACE. This used to
+	// build the head in an ostringstream, copy it and the whole body into a
+	// second one, then copy that again with str() -- two full body copies plus
+	// the head per response, all from internal DRAM for anything under the
+	// 16 KB SPIRAM_MALLOC_ALWAYSINTERNAL line (#328), i.e. nearly every JSON
+	// body, /api/status polling included. Now only the two numbers are
+	// formatted, into stack buffers; everything else (status text, content
+	// type, kSecurityHeaders, the extra header, the body) is sent from where it
+	// already lives, in one scatter-gather write. The bytes are unchanged:
+	// HttpSendPath_test compares them with buildResponseHead() + body.
+	//
+	// (CodeQL flagged a `head += body` shape here as "cleartext transmission"
+	// of emailConfigJson() on PR #394 -- a false positive: its secrets leave
+	// only as hasPassword/hasGsaKey booleans, #207.)
+	char status[24];
+	const int ns = std::snprintf(status, sizeof(status), "HTTP/1.1 %d ", statusCode);
+	char length[48];
+	const int nl = std::snprintf(length, sizeof(length), "\r\nContent-Length: %zu\r\n", body.size());
+	if (ns <= 0 || static_cast<size_t>(ns) >= sizeof(status) ||
+	    nl <= 0 || static_cast<size_t>(nl) >= sizeof(length))
+		return;   // cannot happen for an int and a size_t; never send a torn head
+	static constexpr char kTypeKey[] = "\r\nContent-Type: ";
+	static constexpr char kCrlf[] = "\r\n";
+	static constexpr char kTail[] = "Connection: close\r\n\r\n";
+	const bool extra = !extraHeader.empty();
+	const SendPiece pieces[] = {
+		{ status, static_cast<size_t>(ns) },
+		{ statusText.data(), statusText.size() },
+		{ kTypeKey, sizeof(kTypeKey) - 1 },
+		{ contentType.data(), contentType.size() },
+		{ length, static_cast<size_t>(nl) },
+		{ kSecurityHeaders, sizeof(kSecurityHeaders) - 1 },
+		{ extraHeader.data(), extraHeader.size() },
+		{ kCrlf, extra ? sizeof(kCrlf) - 1 : 0 },
+		{ kTail, sizeof(kTail) - 1 },
+		{ body.data(), body.size() },
+	};
+	static_assert(sizeof(pieces) / sizeof(pieces[0]) <= kMaxSendPieces, "raise kMaxSendPieces");
+	sendAllPieces(sock, pieces, sizeof(pieces) / sizeof(pieces[0]));
+}
+
+size_t HttpServer::consumeSent(SendPiece* rest, size_t first, size_t n, size_t sent)
+{
+	// Whole ranges first, then into a partial one.
+	while (first < n && sent >= rest[first].size)
+	{
+		sent -= rest[first].size;
+		++first;
+	}
+	if (first < n && sent > 0)
+	{
+		rest[first].data += sent;
+		rest[first].size -= sent;
+	}
+	return first;
+}
+
+bool HttpServer::sendAllPieces(int sock, const SendPiece* pieces, size_t count)
+{
+	if (count > kMaxSendPieces) return false;
+	SendPiece rest[kMaxSendPieces];
+	size_t n = 0;
+	for (size_t i = 0; i < count; ++i)
+		if (pieces[i].size != 0) rest[n++] = pieces[i];
+	size_t first = 0;
+	while (first < n)
+	{
+#if defined _WIN32 || defined _WIN64
+		// No sendmsg() on Winsock; host-only, so one range per send() will do.
+		const int sent = ::send(sock, rest[first].data, static_cast<int>(rest[first].size), 0);
+#else
+		struct iovec iov[kMaxSendPieces];
+		for (size_t i = first; i < n; ++i)
+		{
+			iov[i - first].iov_base = const_cast<char*>(rest[i].data);
+			iov[i - first].iov_len = rest[i].size;
+		}
+		struct msghdr msg;
+		std::memset(&msg, 0, sizeof(msg));
+		msg.msg_iov = iov;
+		msg.msg_iovlen = static_cast<decltype(msg.msg_iovlen)>(n - first);
+		const ssize_t sent = ::sendmsg(sock, &msg, 0);
+#endif
+		if (sent <= 0) return false;
+		first = consumeSent(rest, first, n, static_cast<size_t>(sent));
+	}
+	return true;
+}
+
+bool HttpServer::sendAllBytes(int sock, const char* ptr, size_t remaining)
+{
+	while (remaining > 0)
+	{
+#if defined _WIN32 || defined _WIN64
+		int sent = ::send(sock, ptr, static_cast<int>(remaining), 0);
+#else
+		int sent = static_cast<int>(::send(sock, ptr, remaining, 0));
+#endif
+		if (sent <= 0) return false;
+		ptr += sent;
+		remaining -= static_cast<size_t>(sent);
+	}
+	return true;
+}
 
 // Status line + every header + the blank line, for a body of contentLength
 // bytes. Shared by sendResponseWithHeader() and the streamed coredump download;
@@ -1267,8 +1345,8 @@ std::string HttpServer::buildResponseHead(int statusCode, const std::string& sta
 	return resp.str();
 }
 
-void HttpServer::sendResponse(int sock, int statusCode, const std::string& statusText,
-                              const std::string& contentType, const std::string& body)
+void HttpServer::sendResponse(int sock, int statusCode, std::string_view statusText,
+                              std::string_view contentType, std::string_view body)
 {
 	sendResponseWithHeader(sock, statusCode, statusText, contentType, body, "");
 }
@@ -5318,6 +5396,20 @@ std::string HttpServer::csrfForTest(const std::string& cookieHeader)
 std::string HttpServer::legacyHtmlHeadForTest(size_t len)
 {
 	return buildResponseHead(200, "OK", "text/html; charset=utf-8", len, "");
+}
+
+void HttpServer::sendResponseForTest(int sock, int statusCode, std::string_view statusText,
+                                     std::string_view contentType, std::string_view body,
+                                     std::string_view extraHeader)
+{
+	sendResponseWithHeader(sock, statusCode, statusText, contentType, body, extraHeader);
+}
+
+std::string HttpServer::legacyResponseForTest(int statusCode, const std::string& statusText,
+                                              const std::string& contentType, const std::string& body,
+                                              const std::string& extraHeader)
+{
+	return buildResponseHead(statusCode, statusText, contentType, body.size(), extraHeader) + body;
 }
 #endif
 

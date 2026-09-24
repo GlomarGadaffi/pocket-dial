@@ -14,6 +14,7 @@
 #endif
 
 #include <string>
+#include <string_view>
 #include <functional>
 #include <atomic>
 #include <thread>
@@ -98,6 +99,14 @@ public:
 	static bool isProvisioningConfigPath(const std::string& path);
 	static ProvisioningPathType parseProvisioningPath(const std::string& path, std::string& outKey);
 
+	// #410 phase 2: one byte range to be sent in place (see sendAllPieces()).
+	struct SendPiece { const char* data; size_t size; };
+	// After a (possibly short) write of `sent` bytes from rest[first..n), skips
+	// the ranges that went out whole and trims the one it stopped inside;
+	// returns the new `first` (== n once everything is out). Pure, so the
+	// resume logic is testable at every split without a socket.
+	static size_t consumeSent(SendPiece* rest, size_t first, size_t n, size_t sent);
+
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only (#410): serve one static page onto `sock` ON THE CALLING THREAD,
 	// for a request carrying `cookieHeader`, so a test can count the page's heap
@@ -112,6 +121,16 @@ public:
 	// of `len` bytes -- buildResponseHead() itself, so a test compares the
 	// streamed page against the old head, not against a copy of it.
 	static std::string legacyHtmlHeadForTest(size_t len);
+	// #410 phase 2: sendResponseWithHeader() ON THE CALLING THREAD (it is
+	// private), so a test can count its allocations with AllocGuard; and what
+	// the pre-#410 path put on the wire for the same response --
+	// buildResponseHead() + body -- to compare the two byte for byte.
+	void sendResponseForTest(int sock, int statusCode, std::string_view statusText,
+	                   std::string_view contentType, std::string_view body,
+	                   std::string_view extraHeader);
+	static std::string legacyResponseForTest(int statusCode, const std::string& statusText,
+	                   const std::string& contentType, const std::string& body,
+	                   const std::string& extraHeader);
 #endif
 
 private:
@@ -179,20 +198,30 @@ private:
 	std::string sessionToken(const HttpRequest& req) const;
 
 	// Response builders
-	void sendResponse(int sock, int statusCode, const std::string& statusText,
-	                   const std::string& contentType, const std::string& body);
+	// string_view throughout (#410 phase 2): a literal status, content type or
+	// error body no longer builds a std::string temporary at every call site,
+	// and nothing here is copied -- see sendResponseWithHeader().
+	void sendResponse(int sock, int statusCode, std::string_view statusText,
+	                   std::string_view contentType, std::string_view body);
 	// Same as sendResponse, but injects an extra raw header line (e.g.
 	// "Set-Cookie: pd_session=...; HttpOnly; Path=/; SameSite=Strict"). The
 	// extraHeader must NOT include the trailing CRLF.
-	void sendResponseWithHeader(int sock, int statusCode, const std::string& statusText,
-	                   const std::string& contentType, const std::string& body,
-	                   const std::string& extraHeader);
+	void sendResponseWithHeader(int sock, int statusCode, std::string_view statusText,
+	                   std::string_view contentType, std::string_view body,
+	                   std::string_view extraHeader);
 	// Every response's status line + headers (security headers included), for a
 	// body sent separately -- the streamed /api/coredump download (#382).
 	static std::string buildResponseHead(int statusCode, const std::string& statusText,
 	                   const std::string& contentType, size_t contentLength,
 	                   const std::string& extraHeader);
 	static bool sendAllBytes(int sock, const char* ptr, size_t len);
+	static constexpr size_t kMaxSendPieces = 12;
+	// #410 phase 2: writes `count` (<= kMaxSendPieces) ranges back to back as
+	// one scatter-gather sendmsg() on POSIX and lwIP, resuming after short
+	// writes (consumeSent()): no allocation, nothing copied on our side. Empty
+	// ranges are skipped. False on a send error or too many ranges, like
+	// sendAllBytes().
+	static bool sendAllPieces(int sock, const SendPiece* pieces, size_t count);
 	// #410: a static HTML page written straight from its flash-resident parts,
 	// with the session's CSRF token substituted for the __PD_CSRF__ marker on the
 	// way out. No copy of the page is ever made: a 200 head is formatted into a
