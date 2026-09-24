@@ -57,6 +57,8 @@ jobs:
           check "no Windows executables on PATH"             '! command -v cmd.exe >/dev/null && ! command -v powershell.exe >/dev/null'
           check "runner user has no sudo"                    '! sudo -n true 2>/dev/null'
           check "no SSH private keys in home"                '! grep -rlsE "BEGIN (OPENSSH|RSA|EC|DSA) PRIVATE KEY" "$HOME" --exclude-dir=_work --exclude-dir=_diag'
+          check "not running as root"                        '[ "$(id -u)" -ne 0 ]'
+          check "triggered by schedule or dispatch only"     'case "$GITHUB_EVENT_NAME" in schedule|workflow_dispatch) true;; *) false;; esac'
           check "no GitHub tokens in home"                   '! grep -rlsE "(ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}" "$HOME" --exclude-dir=_work --exclude-dir=_diag'
           echo "runner: $(uname -srm) as $(id -un)"
           [ "$fail" -eq 0 ] || { echo "::error::Runner isolation check failed; refusing to run repo code on this host."; exit 1; }
