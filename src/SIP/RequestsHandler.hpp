@@ -1575,6 +1575,54 @@ private:
 	// dialog role differs per call path (beep = server UAC; park = server UAS).
 	// `cseq` must exceed any request the server already sent on this dialog
 	// (Session::nextServerCSeq(), #389); 2 is only right when it has sent none.
+	// ── #453: in-dialog requests across a B2BUA splice ────────────────────────
+	// A splice (call pickup, park retrieve/ring-back, attended/blind transfer)
+	// joins two dialogs with DIFFERENT Call-IDs, linked only by peerCallID. An
+	// in-dialog request from one phone must be REBUILT in the other dialog --
+	// that dialog's Call-ID, tags, a CSeq above everything the PBX sent on it
+	// (#402) and the PBX's own Contact (#425) -- never forwarded as it came.
+	// The far phone's answer comes back onto the originator's own transaction
+	// through a fixed, bounded table (no allocation), and the PBX ACKs the far
+	// leg itself.
+	struct PeerDialog
+	{
+		std::shared_ptr<Session>   peer;
+		std::shared_ptr<SipClient> target;          // the phone on the peer dialog
+		const std::string*         fromHdr = nullptr; // the PBX's side of the peer dialog
+		const std::string*         toHdr   = nullptr; // the target's own URI and tag
+	};
+	// The peer dialog of a spliced session: who to send to and as whom. BYE's
+	// two bridge branches and the in-dialog relay all resolve it the same way.
+	bool resolvePeerDialog(const std::shared_ptr<Session>& s, PeerDialog& out);
+	// The phone that owns a spliced session's dialog (its src, or on a
+	// transfer bridge whichever side the dropped transferor was not).
+	std::shared_ptr<SipClient> ownPartyOf(const std::shared_ptr<Session>& s) const;
+	void relayIntoPeerDialog(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<Session>& session);
+	// A far-leg response to a request relayIntoPeerDialog() sent: answers the
+	// originator and ACKs the far leg. False if it is not one of ours.
+	bool handleSpliceResponse(const std::shared_ptr<SipMessage>& data);
+	// The originator's ACK to the 2xx we answered it with: absorbed, never relayed.
+	bool absorbSpliceAck(const std::shared_ptr<SipMessage>& data);
+	void sweepSpliceTxns(std::chrono::steady_clock::time_point now);
+	void answerSpliceLocally(const std::shared_ptr<SipMessage>& data, const char* statusLine);
+
+	struct SpliceTxn
+	{
+		enum class State : uint8_t { Free, AwaitingPeer, AwaitingOriginAck };
+		State state = State::Free;
+		bool isInvite = false;
+		std::shared_ptr<SipMessage> origin;   // the originator's request (its transaction)
+		std::shared_ptr<Session> peer;        // the dialog it was rebuilt into
+		uint32_t peerCSeq = 0;
+		char branch[32] = {};                 // our Via branch toward the peer (non-2xx ACK)
+		std::chrono::steady_clock::time_point since{};
+	};
+	// One in-flight splice request per slot. Two directions per spliced pair can
+	// be in flight at once; 8 covers several concurrent splices. A full table
+	// answers 500 + Retry-After rather than ever relaying untranslated.
+	static constexpr size_t kSpliceTxns = 8;
+	std::array<SpliceTxn, kSpliceTxns> _spliceTxns{};
+
 	std::shared_ptr<SipMessage> buildServerBye(const std::string& destExt,
 		const sockaddr_in& destAddr, const std::string& callId,
 		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2);
