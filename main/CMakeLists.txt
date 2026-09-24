@@ -255,7 +255,15 @@ if(SIP_CONSTRAINED)
         POCKETDIAL_MAX_CLIENTS=8
         POCKETDIAL_MAX_SESSIONS=4
         POCKETDIAL_MSG_POOL=8)
-    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8)")
+    # #416: the pcap ring is fixed storage (ring x ~2.1 KB), and a constrained build
+    # has no PSRAM (sdkconfig.defaults.esp32_constrained: CONFIG_SPIRAM=n), so all of
+    # it is internal DRAM. 4 slots ~= 8.4 KB instead of 16 ~= 33.7 KB. Set as a CMake
+    # variable, not a define, so an explicit -D POCKETDIAL_PCAP_RING_SIZE still wins
+    # and the plumbing below prints what took effect.
+    if(NOT DEFINED POCKETDIAL_PCAP_RING_SIZE)
+        set(POCKETDIAL_PCAP_RING_SIZE 4)
+    endif()
+    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 pcap=${POCKETDIAL_PCAP_RING_SIZE})")
 endif()
 
 # PcapCapture.hpp has always advertised itself as "compile-time tunable
@@ -266,14 +274,23 @@ endif()
 # to the control, onset does not move, and the honest-looking conclusion is
 # "the ring is not the cause." Plumbed here so the claim in the header is true.
 #
-# The ring holds the full bytes of the largest SIP message each slot has ever
-# seen, in internal DRAM, and capture is unconditional. Measured on .244 at
-# 64 slots: ~52 KB held at steady state (#278).
+# #416: the ring is now fixed storage, POCKETDIAL_PCAP_RING_SIZE x ~2.1 KB,
+# allocated with RequestsHandler (PSRAM on S3 builds, internal DRAM without
+# PSRAM). Before #416 it grew lazily in internal DRAM; measured on .244 at 64
+# slots: ~52 KB held at steady state (#278).
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         POCKETDIAL_PCAP_RING_SIZE=${POCKETDIAL_PCAP_RING_SIZE})
     # Printed so the build log PROVES the override took. Do not remove: without
     # it, the only way to tell a real result from a failed override is to go
     # reading compile_commands.json after the fact.
-    message(STATUS "SipServer: pcap ring size OVERRIDDEN to ${POCKETDIAL_PCAP_RING_SIZE} (default 64)")
+    message(STATUS "SipServer: pcap ring size OVERRIDDEN to ${POCKETDIAL_PCAP_RING_SIZE} (default 16)")
+endif()
+# Same plumbing for the per-slot byte budget (#416). Must stay >= UdpServer::
+# BUFFER_SIZE (2048): SipServer.cpp static_asserts it, so a smaller value fails
+# the build instead of silently truncating inbound messages.
+if(DEFINED POCKETDIAL_PCAP_SLOT_BYTES)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        POCKETDIAL_PCAP_SLOT_BYTES=${POCKETDIAL_PCAP_SLOT_BYTES})
+    message(STATUS "SipServer: pcap slot size OVERRIDDEN to ${POCKETDIAL_PCAP_SLOT_BYTES} bytes (default 2048)")
 endif()
