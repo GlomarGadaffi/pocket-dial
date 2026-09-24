@@ -1308,6 +1308,25 @@ public:
 			_onHandled(event.first, std::move(event.second));
 		}
 	}
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#462): queue `msgs` on _outbox, then run the SAME end-of-pass
+	// cycle handle() runs -- drainPassLocked() under _mutex, flushPass() after,
+	// through handle()'s own scratch pair -- so a test can count the drain's
+	// allocations without the rest of handle() (batch B's builders, batch C's
+	// lookups) in the way. It calls the production functions rather than
+	// re-implementing the flush, so it cannot drift from what handle() does.
+	// Inline and host-only: never emitted into firmware.
+	void drainCycleForTest(
+		const std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& msgs)
+	{
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			for (const auto& m : msgs) _outbox.push_back(m);
+			drainPassLocked(_rxOutboxScratch, _rxLogScratch);
+		}
+		flushPass(_rxOutboxScratch, _rxLogScratch);
+	}
+#endif
 	// Test-only: inject a greeting clip without a real filesystem at
 	// /sdcard/vm/greeting.wav (which doesn't exist on host, or exist as a
 	// portable path at all). `clip` must outlive the handler -- tests pass a
@@ -1886,6 +1905,32 @@ private:
 	// retransmit on the way out. The one place messages leave _outbox — see the
 	// #70 ordering note on the definition. Caller holds _mutex.
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> drainOutbox();
+	// Same, into a caller-owned vector by SWAP, so _outbox keeps a warm buffer
+	// instead of restarting at zero capacity (#462). The per-packet and per-tick
+	// drains use this with the persistent scratch members below. Caller holds
+	// _mutex, and `out` is empty on entry (it appends, never drops, if not).
+	void drainOutboxInto(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& out);
+
+	// #462 (#284 rank 5): persistent drain scratch, ONE PAIR PER THREAD that
+	// drains on the hot path. handle() has exactly one production caller (the
+	// UDP receive loop) and tick() exactly one (the tick task), so each pair is
+	// touched by a single thread and needs no lock of its own. Filled under
+	// _mutex, consumed after it is released, then clear()ed -- which keeps the
+	// capacity, the whole point. Never share a pair between handle() and tick().
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _rxOutboxScratch;
+	std::vector<std::pair<bool, std::string>>                        _rxLogScratch;
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _tickOutboxScratch;
+	std::vector<std::pair<bool, std::string>>                        _tickLogScratch;
+
+	// The end of every handle()/tick() pass, in two halves around the lock:
+	// drainPassLocked() under _mutex (take this pass's outbox and log queue into
+	// the caller's scratch pair), flushPass() after releasing it (print, send,
+	// clear -- keeping capacity). One implementation for both passes, so the
+	// test seam below exercises exactly what production runs.
+	void drainPassLocked(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	                     std::vector<std::pair<bool, std::string>>& logScratch);
+	void flushPass(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	               std::vector<std::pair<bool, std::string>>& logScratch);
 
 	// The inbound message currently being handled, or nullptr outside a handle()
 	// pass (tick() drains with this unset). Used by drainOutbox() for exactly one
