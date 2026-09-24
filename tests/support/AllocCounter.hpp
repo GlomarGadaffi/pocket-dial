@@ -8,6 +8,19 @@
 // to assert "this path touches no heap" includes this header rather than
 // defining its own. Memory still comes from malloc/free; counting is the only
 // behavioural change. Deallocations are not counted.
+//
+// COUNTED: every C++ operator new / new[], including the over-aligned
+// (std::align_val_t) and nothrow forms.
+// NOT COUNTED: direct C allocation -- malloc, calloc, realloc, strdup,
+// aligned_alloc, and anything that reaches them without going through operator
+// new. So "delta() == 0" proves zero C++ heap use only. Never assert zero heap
+// over code that calls the C allocator (or a shim around heap_caps_malloc): the
+// assertion would pass while the code allocates.
+//
+// OPTIMIZER: at -O3 (CMake Release, which CI builds) GCC removes a new-expression
+// whose result is never used. That can only lower a count, so a "delta() == 0"
+// check stays sound; but any test expecting a count > 0 must let the pointer
+// escape (e.g. store it to a volatile), or it will count 0 in CI and pass locally.
 
 #include <cstddef>
 
