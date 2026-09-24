@@ -543,3 +543,137 @@ TEST(SipDigestBounded, TheWholeAnswerPathAllocatesNothingAcrossTheCorpus)
 	// And the loop really did run the emit path, so the zero is not vacuous.
 	EXPECT_GE(answered, 15);
 }
+
+// ── 7. Header injection: refused at the API boundary, by BOTH overloads ──────
+//
+// Every field below is written into a quoted-string in the emitted header.
+// A `"` breaks the header's quoting; a CR or LF INJECTS SIP HEADER LINES into
+// the outbound request -- and `username` comes from operator config (the
+// trunk's Authentication ID). So both overloads refuse, in the same gate, and
+// these tests pin that they agree: the byte-identical parity above must keep
+// holding for refusals too.
+//
+// Not only the caller's fields. A challenge field can carry a `"` as well: the
+// scanner ends a QUOTED value at its closing quote, but a BARE value runs to
+// the next comma, so `nonce=ab"cd` parses to `ab"cd` and would be emitted as
+// `nonce="ab"cd"`. CR/LF cannot arrive that way through the SIP parser (it
+// splits header lines), but parseChallenge is a public API over arbitrary
+// text, so the gate does not rely on that.
+
+namespace
+{
+	constexpr char kBreakers[] = {'\r', '\n', '"'};
+
+	std::string withBreaker(char c) { return std::string("ab") + c + "cd"; }
+
+	std::string nameOf(char c)
+	{
+		return c == '\r' ? "CR" : c == '\n' ? "LF" : "quote";
+	}
+
+	// Both overloads must refuse, and both must leave their output untouched --
+	// the same contract as every other refusal gate.
+	void expectBothRefuse(const std::string& hdr, const std::string& user,
+	                      const std::string& uri, const std::string& cnonce)
+	{
+		DigestChallenge s;
+		BoundedChallenge b;
+		ASSERT_TRUE(parseChallenge(hdr, s));
+		ASSERT_TRUE(parseChallenge(std::string_view(hdr), b));
+
+		std::string outS = "UNTOUCHED";
+		EXPECT_FALSE(buildAuthorization(s, user, "pw", "INVITE", uri, 1, cnonce, outS));
+		EXPECT_EQ(outS, "UNTOUCHED") << "the std::string overload wrote on refusal";
+
+		char buf[kMaxAuthorizationValue];
+		std::memset(buf, '#', sizeof(buf));
+		size_t len = 4242;
+		EXPECT_FALSE(buildAuthorization(b, user, "pw", "INVITE", uri, 1, cnonce,
+		                                buf, sizeof(buf), len));
+		EXPECT_EQ(len, 4242u) << "the bounded overload wrote outLen on refusal";
+		EXPECT_EQ(buf[0], '#') << "the bounded overload wrote on refusal";
+	}
+
+	const std::string kQopChallenge = "Digest realm=\"r\", nonce=\"n\", qop=\"auth\"";
+}
+
+TEST(SipDigestInjection, UsernameWithCrLfOrQuoteIsRefused)
+{
+	for (char c : kBreakers)
+	{
+		SCOPED_TRACE("username carries " + nameOf(c));
+		expectBothRefuse(kQopChallenge, withBreaker(c), "sip:x", "cn");
+	}
+}
+
+TEST(SipDigestInjection, UriWithCrLfOrQuoteIsRefused)
+{
+	for (char c : kBreakers)
+	{
+		SCOPED_TRACE("uri carries " + nameOf(c));
+		expectBothRefuse(kQopChallenge, "user", "sip:" + withBreaker(c), "cn");
+	}
+}
+
+TEST(SipDigestInjection, CnonceWithCrLfOrQuoteIsRefused)
+{
+	// Generated as hex in practice, but the API takes it as a parameter, and a
+	// boundary that trusts one caller's discipline is not a boundary.
+	for (char c : kBreakers)
+	{
+		SCOPED_TRACE("cnonce carries " + nameOf(c));
+		expectBothRefuse(kQopChallenge, "user", "sip:x", withBreaker(c));
+	}
+}
+
+TEST(SipDigestInjection, AChallengeFieldCarryingAQuoteInABareTokenIsRefused)
+{
+	// The case the "the scanner stops at the closing quote" argument misses:
+	// a BARE value is taken up to the next comma, quotes and all.
+	const char* fields[] = {"realm", "nonce", "opaque"};
+	for (const char* f : fields)
+	{
+		SCOPED_TRACE(std::string("bare ") + f + " carrying a quote");
+		std::string hdr = "Digest ";
+		if (std::string(f) != "realm") hdr += "realm=\"r\", ";
+		if (std::string(f) != "nonce") hdr += "nonce=\"n\", ";
+		hdr += std::string(f) + "=ab\"cd, qop=\"auth\"";
+
+		// Precondition, so this test cannot pass for the wrong reason: the quote
+		// really does survive parsing into the field.
+		DigestChallenge probe;
+		ASSERT_TRUE(parseChallenge(hdr, probe));
+		const std::string& got = std::string(f) == "realm" ? probe.realm
+		                       : std::string(f) == "nonce" ? probe.nonce : probe.opaque;
+		ASSERT_NE(got.find('"'), std::string::npos) << "precondition: the quote survived the parse";
+
+		expectBothRefuse(hdr, "user", "sip:x", "cn");
+	}
+}
+
+TEST(SipDigestInjection, AChallengeFieldCarryingCrLfViaTheDirectApiIsRefused)
+{
+	for (const char* crlf : {"\r", "\n"})
+	{
+		SCOPED_TRACE(crlf[0] == '\r' ? "CR in a bare nonce" : "LF in a bare nonce");
+		const std::string hdr = std::string("Digest realm=\"r\", nonce=ab") + crlf +
+			"X-Injected: 1, qop=\"auth\"";
+		expectBothRefuse(hdr, "user", "sip:x", "cn");
+	}
+}
+
+TEST(SipDigestInjection, CleanValuesAreStillAnsweredIdentically)
+{
+	// The gate must refuse ONLY what it should: an ordinary SIP URI with the
+	// characters real carriers use (+ ; = @ : .) still answers, byte-identically.
+	DigestChallenge s;
+	BoundedChallenge b;
+	ASSERT_TRUE(parseChallenge(kQopChallenge, s));
+	ASSERT_TRUE(parseChallenge(std::string_view(kQopChallenge), b));
+	const char* uri = "sip:+15551234567@sbc.carrier.example:5060;transport=udp";
+	std::string outS;
+	std::string outB;
+	ASSERT_TRUE(buildAuthorization(s, "auth-id_9876.x", "pw", "INVITE", uri, 1, "0a4f113b", outS));
+	ASSERT_TRUE(bounded(b, "auth-id_9876.x", "pw", "INVITE", uri, 1, "0a4f113b", outB));
+	EXPECT_EQ(outS, outB);
+}

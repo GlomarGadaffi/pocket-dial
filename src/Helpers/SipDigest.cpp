@@ -340,6 +340,20 @@ namespace
 		return true;
 	}
 
+	// True if `s` holds a byte that breaks out of a quoted-string in an emitted
+	// header value: CR or LF INJECTS a new header line into the outbound SIP
+	// request, and `"` ends the quoted-string early so whatever follows is read
+	// as more auth-params. Both buildAuthorization overloads refuse any field
+	// they would write inside quotes that fails this -- see the gate there.
+	bool breaksQuotedString(std::string_view s)
+	{
+		for (char c : s)
+		{
+			if (c == '\r' || c == '\n' || c == '"') return true;
+		}
+		return false;
+	}
+
 	// =====================================================================
 	// ONE parameter scanner, shared by both directions.
 	//
@@ -804,6 +818,22 @@ namespace SipDigest
 			return false;
 		}
 
+		// Header injection. Every field below is written inside a quoted-string
+		// without escaping: a `"` breaks the header's quoting, and a CR or LF
+		// injects SIP header lines into the outbound request. `username` comes
+		// from operator config (the trunk's Authentication ID), and a challenge
+		// field can carry a `"` too -- the scanner ends a QUOTED value at its
+		// closing quote, but a BARE value runs to the next comma, so `nonce=ab"cd`
+		// parses to `ab"cd`. Refused here, at the API boundary, rather than
+		// trusting every caller to validate. The bounded overload runs the SAME
+		// gate at the SAME point, so the two still agree on every input.
+		if (breaksQuotedString(username) || breaksQuotedString(uri) ||
+		    breaksQuotedString(cnonce)   || breaksQuotedString(ch.realm) ||
+		    breaksQuotedString(ch.nonce) || breaksQuotedString(ch.opaque))
+		{
+			return false;
+		}
+
 		const DigestAlgorithm alg = algorithmOf(ch);
 		if (alg == DigestAlgorithm::Unsupported)
 		{
@@ -974,6 +1004,23 @@ namespace SipDigest
 			}
 		};
 
+		// Overwrites a fixed buffer when it goes out of scope, on every return
+		// path. For HA1 / HA1-sess, which are password-equivalent for the realm:
+		// anyone holding one can answer this realm's challenges as this user.
+		// `volatile` so an optimiser that can see the buffer is dead afterwards
+		// still has to do the writes. Best-effort hygiene, not a security
+		// boundary -- a register or an earlier spill can still hold a copy.
+		struct ScopedWipe
+		{
+			char*  p;
+			size_t n;
+			~ScopedWipe()
+			{
+				volatile char* v = p;
+				for (size_t i = 0; i < n; ++i) v[i] = 0;
+			}
+		};
+
 		// Copy `v` into a fixed field. Refuses (sets `overflow`) rather than
 		// truncating -- see the header on why a shortened nonce is worse than no
 		// answer at all.
@@ -1122,6 +1169,15 @@ namespace SipDigest
 			return false;
 		}
 
+		// Header injection: the std::string overload's gate, at the same point,
+		// over the same fields -- see the comment there.
+		if (breaksQuotedString(username) || breaksQuotedString(uri) ||
+		    breaksQuotedString(cnonce)   || breaksQuotedString(ch.realm) ||
+		    breaksQuotedString(nonce)    || breaksQuotedString(ch.opaque))
+		{
+			return false;
+		}
+
 		const DigestAlgorithm alg = algorithmOf(ch);
 		if (alg == DigestAlgorithm::Unsupported)
 		{
@@ -1151,10 +1207,12 @@ namespace SipDigest
 		const std::string_view realm(ch.realm);
 
 		char ha1[kHexDigestLen + 1];
+		const ScopedWipe wipeHa1{ha1, sizeof(ha1)};
 		md5HexOf({username, ":", realm, ":", password}, ha1);
 		if (alg == DigestAlgorithm::Md5Sess)
 		{
 			char ha1sess[kHexDigestLen + 1];
+			const ScopedWipe wipeHa1Sess{ha1sess, sizeof(ha1sess)};
 			md5HexOf({ha1, ":", nonce, ":", cnonce}, ha1sess);
 			std::memcpy(ha1, ha1sess, sizeof(ha1));
 		}
