@@ -26,6 +26,19 @@ FetchContent_MakeAvailable(googletest)
 
 include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers support)
 
+# Issue #411: the test binary gets the same firmware version stamp as the device
+# and the host SipServer, so /api/status can be asserted to carry it.
+#
+# Only when built standalone (`cmake ../tests`, what CI and the WSL workflow
+# run). When the top-level host project pulls this in via add_subdirectory, it
+# has already decided the stamp and added the definition, and both are
+# inherited here; recomputing would run git twice and pass the flag twice.
+if(NOT DEFINED POCKETDIAL_RESOLVED_FW_VERSION)
+    include(${CMAKE_CURRENT_LIST_DIR}/../cmake/FirmwareVersion.cmake)
+    pocketdial_firmware_version(POCKETDIAL_RESOLVED_FW_VERSION)
+    add_compile_definitions(POCKETDIAL_FW_VERSION="${POCKETDIAL_RESOLVED_FW_VERSION}")
+endif()
+
 add_executable(sip_parser_tests
     SipMessage_test.cpp
     # RFC regressions found by tests/interop/ (real pjsip stack): SDP answers
@@ -113,6 +126,8 @@ add_executable(sip_parser_tests
     # /api/email/test, driven through a real HttpServer socket exactly like
     # AdminHttpGate_test.cpp's other routes. Ports 18160-18169.
     EmailHttp_test.cpp
+    # Issue #411: the build identifies itself (stamp + /api/status "version").
+    FirmwareInfo_test.cpp
     TrunkConfigHttp_test.cpp
     SipDigest_test.cpp
     # Issue #164 groundwork: the CLIENT half of digest auth. SipDigest_test
@@ -589,6 +604,7 @@ add_executable(sip_parser_tests
     # guards on every ESP-only branch) but not previously linked into this
     # target. Needed by AdminHttpGate_test.cpp above.
     ../src/Helpers/HttpServer.cpp
+    ../src/Helpers/FirmwareInfo.cpp
     ../src/Helpers/OtaUpdater.cpp
     # Issue #159 (SMTP client): the pure protocol engine (no sockets/TLS --
     # see SmtpDialogue.hpp's header comment) and the real transport

@@ -1,11 +1,27 @@
 cmake_minimum_required (VERSION 3.16)
 
+# Issue #411: decide the firmware version once, for every build flavour. See
+# cmake/FirmwareVersion.cmake for why ESP-IDF's own fallback always said "1".
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/FirmwareVersion.cmake)
+pocketdial_firmware_version(POCKETDIAL_RESOLVED_FW_VERSION)
+
 if(DEFINED ENV{IDF_PATH})
+    # Must be set BEFORE project(): that is where ESP-IDF reads PROJECT_VER into
+    # the app descriptor. Set it after and IDF runs its own `git describe`,
+    # which is the call that fails in CI's container.
+    set(PROJECT_VER "${POCKETDIAL_RESOLVED_FW_VERSION}")
+    # Also written next to the build, so tools/ci/check_app_version.py can
+    # compare the binary against what CMake actually chose.
+    file(WRITE "${CMAKE_BINARY_DIR}/pocketdial_fw_version.txt" "${POCKETDIAL_RESOLVED_FW_VERSION}")
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
     project("SipServer")
     idf_build_set_property(COMPILE_DEFINITIONS "LV_TICK_CUSTOM_SYS_TIME_EXPR=((esp_timer_get_time()/1000LL))" APPEND)
 else()
     project ("SipServer")
+
+    # Issue #411: the host binary reports the same version string the firmware
+    # would (FirmwareInfo.cpp reads it), so /api/status has one shape everywhere.
+    add_compile_definitions(POCKETDIAL_FW_VERSION="${POCKETDIAL_RESOLVED_FW_VERSION}")
 
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)

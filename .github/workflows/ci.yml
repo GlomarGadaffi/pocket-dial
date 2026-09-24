@@ -591,6 +591,12 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          # #411: full history and tags, so the firmware's version stamp is the
+          # whole `git describe` (v1.5.0-beta.2-104-g8d76d64) rather than a bare
+          # hash. Either would identify the build; the full form also says how
+          # far past the last release it is.
+          fetch-depth: 0
 
       - name: Cache ESP-IDF Build Artifacts
         uses: actions/cache@v4
@@ -614,6 +620,20 @@ jobs:
           idf.py -D SIP_TRANSPORT=${{ matrix.sip-transport }} build
           
           echo "Successful compilation for ${{ matrix.target-chip }} on ESP-IDF ${{ matrix.idf-version }} (Transport: ${{ matrix.sip-transport }})"
+
+      # #411: the built image must name the commit it was built from. Before
+      # this, every image said version "1": git refused this container's
+      # checkout ("dubious ownership"), so ESP-IDF fell back. The script reads
+      # esp_app_desc_t straight out of the .bin and fails on a fallback, on a
+      # stamp that never reached the image, and on one naming a different
+      # commit (a stale build dir from the cache above would be exactly that).
+      # Runs on every matrix leg, so all four esp_main variants are checked.
+      - name: Verify the firmware identifies its build (#411)
+        run: |
+          python3 tools/ci/check_app_version.py \
+            --bin build/SipServer.bin \
+            --chosen build/pocketdial_fw_version.txt \
+            --repo "$GITHUB_WORKSPACE"
 
       - name: Upload ESP32-S3 Ethernet Firmware Bundle
         if: matrix.target-chip == 'esp32s3' && matrix.sip-transport == 'eth'
