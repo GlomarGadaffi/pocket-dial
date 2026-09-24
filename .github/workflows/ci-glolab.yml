@@ -122,8 +122,18 @@ jobs:
           echo "clang-tidy total diagnostics: ${COUNT} (${UNIQUE} distinct, see ci.yml for the pinned/baselined version)"
 
       - name: Run Unit Test Suite (GoogleTest via CTest)
+        env:
+          GTEST_OUTPUT: json:${{ github.workspace }}/build/gtest-reports/
         run: |
+          # Self-hosted: the workspace can outlive a run, so clear any report a
+          # previous run left behind before counting this one.
+          rm -rf build/gtest-reports
           ctest --test-dir build/tests --output-on-failure
+
+      - name: Verify Test Count (floor in tests/EXPECTED_MIN_TESTS)
+        run: |
+          # See ci.yml: ctest reports the suite as one test (#390).
+          python3 tests/tools/check_test_count.py build/gtest-reports
 
       - name: Verify SIP Parser Call Graph (T-7 recursion/frame guard)
         run: |

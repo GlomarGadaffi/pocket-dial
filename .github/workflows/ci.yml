@@ -381,13 +381,28 @@ jobs:
           echo "================================================================"
 
       - name: Run Unit Test Suite (GoogleTest via CTest)
+        env:
+          # gtest writes one JSON report per test binary into this directory
+          # (#390). The count check below reads it; the tests run once.
+          GTEST_OUTPUT: json:${{ github.workspace }}/build/gtest-reports/
         run: |
           # The sip_parser_tests target is registered with CTest in
           # tests/CMakeLists.txt. Because the root CMakeLists.txt enables testing
           # only inside the tests/ subdirectory, the CTest test set lives at
           # build/tests (not the build root) — so we point ctest there. ctest
           # returns non-zero on any test failure, which FAILS this step (the gate).
+          # Start from an empty report dir so the count below can only ever
+          # read THIS run's reports, never a stale one.
+          rm -rf build/gtest-reports
           ctest --test-dir build/tests --output-on-failure
+
+      - name: Verify Test Count (floor in tests/EXPECTED_MIN_TESTS)
+        run: |
+          # ctest counts the whole gtest suite as ONE test ("0 tests failed out
+          # of 1"), so it cannot tell 1235 passing tests from 12 (#390). This
+          # prints how many actually ran and fails below the checked-in floor.
+          # Fails closed: a missing report is a failure, not a pass.
+          python3 tests/tools/check_test_count.py build/gtest-reports
 
       # The T-7 call-graph guard used to run here. It is its own job now
       # (callgraph-guard, below) -- see the note there.
