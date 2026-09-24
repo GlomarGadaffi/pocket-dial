@@ -491,3 +491,25 @@ TEST(SessionRecycling, NextServerCSeqGoesAboveBothServerAndObservedCSeqs)
 	EXPECT_EQ(s.maxObservedCSeq(), 23670u);
 	EXPECT_EQ(s.nextServerCSeq(), 23672u);
 }
+
+// #402 review: RFC 3261 s8.1.1.5 caps CSeq below 2^31. A forged 4294967295 must
+// not be recorded (it would wrap nextServerCSeq() to 0), and the server's next
+// CSeq must stay legal -- never 0, never >= 2^31 -- even at the ceiling.
+TEST(SessionRecycling, ServerCSeqIgnoresIllegalValuesAndNeverWraps)
+{
+	const uint32_t limit = Session::kCSeqLimit;   // 2^31
+
+	Session s("call-402-forged", nullptr);
+	s.noteObservedCSeq(4294967295u);
+	s.noteObservedCSeq(limit);
+	s.noteObservedCSeq(0);
+	EXPECT_EQ(s.maxObservedCSeq(), 0u) << "values at/above 2^31 (and 0) are not CSeqs any UA may send";
+	EXPECT_EQ(s.nextServerCSeq(), 2u);
+
+	s.noteServerCSeq(4294967295u);
+	EXPECT_EQ(s.lastServerCSeq(), 0u);
+
+	s.noteObservedCSeq(limit - 1);              // the largest legal value
+	EXPECT_EQ(s.nextServerCSeq(), limit - 1) << "saturates at 2^31-1 rather than wrapping";
+	EXPECT_NE(s.nextServerCSeq(), 0u);
+}

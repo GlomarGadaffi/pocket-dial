@@ -290,8 +290,13 @@ public:
 	// this session's dialog (0 = none) -- e.g. ParkOrbit's retrieve re-INVITE.
 	// A later server-originated request on the same dialog must go strictly
 	// above it (RFC 3261 s12.2.1.1), or the phone rejects it 500 Invalid CSeq.
+	// RFC 3261 s8.1.1.5: a CSeq MUST be below 2^31. A value at or above it (or 0)
+	// is never recorded -- one forged in-dialog request carrying 4294967295 would
+	// otherwise wrap nextServerCSeq() to 0 (#402 review).
+	static constexpr uint32_t kCSeqLimit = 0x80000000u;
+
 	uint32_t lastServerCSeq() const { return _lastServerCSeq; }
-	void noteServerCSeq(uint32_t v) { if (v > _lastServerCSeq) _lastServerCSeq = v; }
+	void noteServerCSeq(uint32_t v) { if (v < kCSeqLimit && v > _lastServerCSeq) _lastServerCSeq = v; }
 
 	// Issue #402. The highest CSeq of any request either PARTY has sent on this
 	// dialog, noted centrally in RequestsHandler::handle(). In-dialog requests are
@@ -299,15 +304,21 @@ public:
 	// too -- and a server request impersonating one party toward the other (a
 	// transfer splice, a teardown BYE) must go above them, not above a guess.
 	uint32_t maxObservedCSeq() const { return _maxObservedCSeq; }
-	void noteObservedCSeq(uint32_t v) { if (v > _maxObservedCSeq) _maxObservedCSeq = v; }
+	void noteObservedCSeq(uint32_t v)
+	{
+		if (v != 0 && v < kCSeqLimit && v > _maxObservedCSeq) _maxObservedCSeq = v;
+	}
 
 	// CSeq for the server's next request on this dialog: above every number any
 	// party (or the server) has used on it, so it is valid whichever side it is
-	// sent to; the long-standing 2 only when nothing at all is known.
+	// sent to; the long-standing 2 only when nothing at all is known. Never 0 and
+	// never 2^31 or more: it saturates at 2^31-1, a legal value even if a dialog
+	// has somehow been driven to the ceiling.
 	uint32_t nextServerCSeq() const
 	{
 		const uint32_t hi = _lastServerCSeq > _maxObservedCSeq ? _lastServerCSeq : _maxObservedCSeq;
-		return hi ? hi + 1 : 2;
+		if (hi == 0) return 2;
+		return hi + 1 < kCSeqLimit ? hi + 1 : kCSeqLimit - 1;
 	}
 
 	void release();
