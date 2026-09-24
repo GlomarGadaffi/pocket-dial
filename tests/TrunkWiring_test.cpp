@@ -222,6 +222,23 @@ namespace
 			}
 			return n;
 		}
+
+		// As countWith(), but only messages ADDRESSED to `ip`. A teardown has two
+		// parties and a BYE to the wrong one is not a BYE to the right one --
+		// countWith("BYE") alone let a handset hangup pass while the carrier leg
+		// was never told (#386).
+		size_t countWithTo(const std::string& needle, const std::string& ip) const
+		{
+			const uint32_t want = inet_addr(ip.c_str());
+			size_t n = 0;
+			for (const auto& [addr, msg] : sent)
+			{
+				if (!msg || addr.sin_addr.s_addr != want) continue;
+				const std::string raw = msg->toString();
+				if (raw.substr(0, raw.find("\r\n")).find(needle) != std::string::npos) ++n;
+			}
+			return n;
+		}
 	};
 }
 
@@ -387,8 +404,10 @@ TEST(TrunkWiring, TheHandsetHangingUpByesTheCarrierAndReleasesTheRelay)
 
 	b.handler.handle(makeHandsetBye("1001", "92025550123", "call-1", localTag));
 
-	EXPECT_FALSE(b.firstWith("BYE").empty())
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u)
 		<< "the carrier leg is billing until it is hung up";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u)
+		<< "the handset hung up itself; it gets a 200, not a BYE of its own";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u)
 		<< "endCall() is the one place the pair is released, on every path";
 }
@@ -405,9 +424,71 @@ TEST(TrunkWiring, TheCarrierHangingUpByesTheHandsetAndReleasesTheRelay)
 
 	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.bye(), addrFor(kSbcIp)));
 
-	EXPECT_FALSE(b.firstWith("BYE").empty())
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u)
 		<< "the handset has to be told; it is not in the carrier's dialog";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u)
+		<< "the carrier hung up itself; BYEing it back would earn a 481";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+// ── Forged carrier messages (#356) ──────────────────────────────────────────
+//
+// SipTrunk_test.cpp covers the rules state by state. These pin what the rules
+// protect end to end: a forger who knows a live trunk Call-ID can neither
+// tear the call down nor answer it with its own media address.
+
+namespace
+{
+	constexpr const char* kForgerIp = "198.51.100.66";   // RFC 5737 TEST-NET-2
+}
+
+TEST(TrunkWiring, AForgedCarrierByeLeavesTheCallUp)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	b.sent.clear();
+
+	// Right Call-ID, wrong carrier tag, from neither the SBC nor its Contact.
+	CarrierView forger = carrier;
+	forger.toTag = "guessed";
+	b.handler.handle(RequestsHandler::getMessageFromPool(forger.bye(), addrFor(kForgerIp)));
+
+	EXPECT_EQ(b.countWithTo("403", kForgerIp), 1u) << "the forger is refused";
+	EXPECT_EQ(b.sent.size(), 1u) << "and that is the only thing that happens";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "the handset's call is not torn down";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "and its media keeps flowing";
+
+	// The real carrier can still hang up.
+	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.bye(), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+TEST(TrunkWiring, AForgedAnswerIsNeitherAckedNorBridged)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	// A 200 carrying SDP, racing the carrier's own answer. Accepted, it would
+	// be ACKed and the relay pointed at whatever media address it names.
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kForgerIp)));
+
+	EXPECT_TRUE(b.sent.empty()) << "no ACK to anyone, and the handset is not answered";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "still ringing, pair still held";
+
+	// The carrier's real answer connects normally afterwards.
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 1u);
+	EXPECT_EQ(b.countWithTo("200 OK", kHandsetIp), 1u);
 }
 
 // ── Capacity ────────────────────────────────────────────────────────────────

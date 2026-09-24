@@ -748,6 +748,260 @@ TEST(SipTrunkDialog, SweepStillReclaimsADialogWhoseByeWentUnanswered)
 		<< "a carrier that never answers our BYE must not pin the slot forever";
 }
 
+// ── Source authorisation (#356) ──────────────────────────────────────────────
+//
+// A Call-ID alone must not let an arbitrary sender act as the carrier. The two
+// directions get different rules because their failure costs differ:
+//
+//   responses  strict: from d->peer or dropped, every state. A wrongly dropped
+//              response is bounded by sweep(); a forged 200 redirects RTP.
+//   BYE        peer, OR the Contact's dotted-quad host, OR both dialog tags.
+//              A wrongly refused BYE bills forever -- Confirmed has no reaper.
+//
+// Every "nothing happened" below is asserted as a COUNT on the wire, the
+// listener and the log, not as the absence of one particular message.
+
+namespace
+{
+	constexpr const char* kForgerIp  = "198.51.100.66";   // RFC 5737 TEST-NET-2
+	constexpr const char* kContactIp = "203.0.113.99";    // okFor()'s Contact host
+
+	std::shared_ptr<SipMessage> responseFrom(const std::string& raw, const char* ip)
+	{
+		return std::make_shared<SipMessage>(raw, FakePbxEnv::addr(ip, 5060));
+	}
+
+	// The carrier hanging up: its tag in From, ours in To.
+	std::shared_ptr<SipMessage> carrierByeFrom(const SipTrunk::Dialog& d, const char* ip,
+		const std::string& carrierTag, const std::string& ourTag)
+	{
+		const std::string raw =
+			"BYE sip:15551230000@192.168.1.10:5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(ip) + ":5060;branch=z9hG4bKcbye\r\n"
+			"From: <sip:" + d.destE164 + "@" + d.sbcIpPort + ">;tag=" + carrierTag + "\r\n"
+			"To: <sip:15551230000@" + d.sbcIpPort + ">;tag=" + ourTag + "\r\n"
+			"Call-ID: " + d.callID + "\r\n"
+			"CSeq: 2 BYE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return std::make_shared<SipMessage>(raw, FakePbxEnv::addr(ip, 5060));
+	}
+
+	size_t logsContaining(const FakePbxEnv& env, const std::string& needle)
+	{
+		size_t n = 0;
+		for (const auto& l : env.logs) if (l.find(needle) != std::string::npos) ++n;
+		return n;
+	}
+
+	size_t sentTo(const FakePbxEnv& env, const char* ip)
+	{
+		const uint32_t want = inet_addr(ip);
+		size_t n = 0;
+		for (const auto& s : env.sent) if (s.to.sin_addr.s_addr == want) ++n;
+		return n;
+	}
+
+	// A call answered by the real carrier, ready for a BYE.
+	struct Answered
+	{
+		FakePbxEnv        env;
+		SipTrunk          trunk{env};
+		RecordingListener lis;
+		std::string       trunkCallID, ourTag;
+
+		Answered()
+		{
+			trunk.setConfig(workingConfig());
+			trunk.setListener(&lis);
+			EXPECT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+			const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+			EXPECT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+			trunkCallID = d->callID;
+			ourTag      = d->fromTag;
+			lis.events.clear();
+			env.sent.clear();
+			env.logs.clear();
+		}
+		// Only valid while the dialog is live -- use before a BYE, not after.
+		const SipTrunk::Dialog& dialog() const { return *trunk.findByCallID("handset-1"); }
+	};
+}
+
+TEST(SipTrunkSource, ForgedResponsesChangeNothingInAnyState)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string ok = okFor(*d);
+
+	// Trying: ringing, a failure, and the dangerous one -- an answer with the
+	// forger's Contact, which would be ACKed and have its SDP relayed.
+	for (const char* status : { "SIP/2.0 180 Ringing", "SIP/2.0 486 Busy Here", "SIP/2.0 200 OK" })
+	{
+		EXPECT_TRUE(trunk.handleResponse(responseFrom(withStatus(ok, status), kForgerIp)))
+			<< status << ": a response on a trunk Call-ID is consumed even when refused";
+	}
+	EXPECT_EQ(d->state, SipTrunk::State::Trying) << "no forged response may move the dialog";
+	EXPECT_TRUE(d->toTag.empty()) << "nor latch the forger's tag";
+	EXPECT_TRUE(d->remoteTarget.empty()) << "nor latch the forger's Contact as our route";
+	EXPECT_EQ(env.sent.size(), 1u) << "the INVITE, and no ACK to anything forged";
+	EXPECT_TRUE(lis.events.empty()) << "the handset side must hear nothing";
+
+	// The real answer still works afterwards.
+	ASSERT_TRUE(trunk.handleResponse(responseFor(ok)));
+	EXPECT_EQ(d->state, SipTrunk::State::Confirmed);
+	ASSERT_EQ(lis.events.size(), 1u);
+	EXPECT_EQ(lis.events[0].kind, "answered");
+
+	// Terminating: a forged 200 to our BYE must not release the slot early.
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	EXPECT_TRUE(trunk.handleResponse(responseFrom(ok, kForgerIp)));
+	EXPECT_EQ(trunk.activeDialogs(), 1u) << "still waiting on the carrier's own 200";
+
+	EXPECT_EQ(logsContaining(env, "dropped"), 4u) << "one line per refused response";
+}
+
+TEST(SipTrunkSource, ByeFromThePeerIsAccepted)
+{
+	Answered a;
+	ASSERT_TRUE(a.trunk.handleBye(carrierByeFrom(a.dialog(), kSbcIp, "carrier-tag", a.ourTag)));
+
+	EXPECT_EQ(a.env.sent.size(), 1u);
+	EXPECT_EQ(sentTo(a.env, kSbcIp), 1u) << "the 200 goes back to the carrier";
+	EXPECT_EQ(firstLine(a.env.sentRaw(0)), "SIP/2.0 200 OK");
+	ASSERT_EQ(a.lis.events.size(), 1u);
+	EXPECT_EQ(a.lis.events[0].kind, "remoteBye");
+	EXPECT_EQ(a.trunk.activeDialogs(), 0u);
+}
+
+// Wrong tags on purpose: this must pass on the ADDRESS, so the tag rule cannot
+// be what lets it through.
+TEST(SipTrunkSource, ByeFromTheDottedQuadContactIsAcceptedOnAddressAlone)
+{
+	Answered a;
+	ASSERT_EQ(a.dialog().remoteTarget, "sip:+15551234567@" + std::string(kContactIp) + ":5060");
+
+	ASSERT_TRUE(a.trunk.handleBye(carrierByeFrom(a.dialog(), kContactIp, "wrong", "wrong")));
+
+	EXPECT_EQ(sentTo(a.env, kContactIp), 1u);
+	EXPECT_EQ(firstLine(a.env.sentRaw(0)), "SIP/2.0 200 OK");
+	EXPECT_EQ(a.lis.events.size(), 1u);
+	EXPECT_EQ(logsContaining(a.env, "accepted on dialog tags"), 0u)
+		<< "a Contact-host BYE is not a tag-rule acceptance";
+}
+
+TEST(SipTrunkSource, ByeFromElsewhereWithBothTagsIsAcceptedAndLogged)
+{
+	Answered a;
+	ASSERT_TRUE(a.trunk.handleBye(carrierByeFrom(a.dialog(), kForgerIp, "carrier-tag", a.ourTag)));
+
+	EXPECT_EQ(firstLine(a.env.sentRaw(0)), "SIP/2.0 200 OK");
+	EXPECT_EQ(a.lis.events.size(), 1u);
+	EXPECT_EQ(a.trunk.activeDialogs(), 0u);
+	EXPECT_EQ(logsContaining(a.env, "accepted on dialog tags"), 1u)
+		<< "the SBC-pool case must be visible to whoever brings a carrier up";
+}
+
+TEST(SipTrunkSource, ByeFromElsewhereWithoutBothTagsIsRefused)
+{
+	// Each tag alone is not enough, and neither is a pair in swapped positions.
+	struct Case { const char* carrierTag; bool ourTagRight; const char* what; };
+	for (const Case c : { Case{ "wrong",       true,  "carrier tag wrong" },
+	                      Case{ "carrier-tag", false, "our tag wrong" },
+	                      Case{ "wrong",       false, "both wrong" } })
+	{
+		Answered a;
+		const std::string ourTag = c.ourTagRight ? a.ourTag : "wrong";
+		ASSERT_TRUE(a.trunk.handleBye(carrierByeFrom(a.dialog(), kForgerIp, c.carrierTag, ourTag)))
+			<< c.what << ": consumed, never passed to the handset paths";
+
+		EXPECT_EQ(a.env.sent.size(), 1u) << c.what;
+		EXPECT_EQ(sentTo(a.env, kForgerIp), 1u) << c.what;
+		EXPECT_EQ(firstLine(a.env.sentRaw(0)), "SIP/2.0 403 Forbidden") << c.what;
+		EXPECT_TRUE(a.lis.events.empty()) << c.what << ": the handset must not be hung up";
+		// Looked up, not a.dialog(): an accepted BYE frees the slot, and a
+		// regression must fail here, not segfault the whole binary.
+		const SipTrunk::Dialog* still = a.trunk.findByCallID("handset-1");
+		ASSERT_NE(still, nullptr) << c.what << ": the dialog was released";
+		EXPECT_EQ(still->state, SipTrunk::State::Confirmed) << c.what << ": the call is still up";
+		EXPECT_TRUE(a.env.freedTransactionCallIds.empty()) << c.what;
+		EXPECT_EQ(logsContaining(a.env, "refused"), 1u) << c.what;
+	}
+}
+
+// An FQDN Contact cannot be resolved on the SIP thread, so it grants nothing;
+// the peer and the tags remain the only ways in.
+TEST(SipTrunkSource, AnFqdnContactGrantsNoAddress)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	std::string ok = okFor(*d);
+	ok.replace(ok.find(kContactIp), std::string(kContactIp).size(), "media.carrier.example");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(ok)));
+	ASSERT_EQ(d->remoteTarget, "sip:+15551234567@media.carrier.example:5060");
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.handleBye(carrierByeFrom(*d, kContactIp, "wrong", "wrong")));
+	EXPECT_EQ(firstLine(env.sentRaw(0)), "SIP/2.0 403 Forbidden");
+	EXPECT_EQ(trunk.activeDialogs(), 1u);
+}
+
+// With no carrier tag latched yet, an empty guessed tag must not "match" it.
+TEST(SipTrunkSource, AnEmptyCarrierTagMatchesNothing)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(d->toTag.empty());
+	env.sent.clear();
+
+	// The forger guesses an empty carrier tag to match our empty toTag.
+	ASSERT_TRUE(trunk.handleBye(carrierByeFrom(*d, kForgerIp, "", d->fromTag)));
+	EXPECT_EQ(firstLine(env.sentRaw(0)), "SIP/2.0 403 Forbidden");
+	EXPECT_EQ(d->state, SipTrunk::State::Trying);
+}
+
+// The tag rule is for CONFIRMED calls only. A 180 carrying a To-tag latches the
+// carrier's tag before any answer, so without the state gate a tag-matched BYE
+// from anywhere would be accepted on an early dialog -- which the rule's own
+// justification (a refused BYE bills forever) does not cover: an unanswered
+// dialog is swept. RFC 3261 s15: the callee MUST NOT send a BYE on an early
+// dialog, so the gate refuses nothing a real carrier sends.
+TEST(SipTrunkSource, AnEarlyDialogAcceptsNoByeOnTags)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	ASSERT_EQ(d->state, SipTrunk::State::Proceeding);
+	ASSERT_EQ(d->toTag, "carrier-tag") << "the 180 latched the carrier's tag";
+	env.sent.clear();
+	lis.events.clear();
+
+	ASSERT_TRUE(trunk.handleBye(carrierByeFrom(*d, kForgerIp, "carrier-tag", d->fromTag)));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)), "SIP/2.0 403 Forbidden");
+	EXPECT_EQ(d->state, SipTrunk::State::Proceeding) << "the call is still ringing";
+	EXPECT_TRUE(lis.events.empty()) << "the handset must not be torn down";
+	EXPECT_EQ(logsContaining(env, "accepted on dialog tags"), 0u);
+}
+
 // ── Outbound proxy: the domain/transport split ───────────────────────────────
 //
 // The single subtlest thing this feature added. Before it, Dialog::sbcIpPort

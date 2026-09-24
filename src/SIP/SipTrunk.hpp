@@ -346,6 +346,10 @@ public:
 
 	// Route a response for one of our dialogs. Returns true if consumed, in which
 	// case the caller must not process it further.
+	//
+	// A response from any address other than the dialog's peer is dropped --
+	// and still consumed (#356). See the note in the definition on why this is
+	// strict and handleBye() is not.
 	bool handleResponse(const std::shared_ptr<SipMessage>& data);
 
 	// The carrier hanging up first. Answers 200, releases the dialog and tells
@@ -356,7 +360,15 @@ public:
 	// is by Call-ID alone: the carrier is not a registered client, so none of
 	// the registrar-backed authorisation the handset paths use applies here,
 	// and the Call-ID of a live trunk dialog is the only thing that identifies
-	// it. That is the same basis ownsCallID() already answers on.
+	// it. The TRUNK's Call-ID, specifically -- not ownsCallID()'s either-leg
+	// match. A BYE naming the handset leg is the handset hanging up, which the
+	// engine answers and turns into a carrier BYE via endCall(); claiming it
+	// here would free the slot without the carrier ever being told.
+	//
+	// Recognised is not authorised (#356). A BYE on a trunk Call-ID is acted on
+	// only from the peer, from a dotted-quad Contact host, or -- on a Confirmed
+	// call only -- with both dialog tags matching; anything else is answered
+	// 403 and consumed.
 	bool handleBye(const std::shared_ptr<SipMessage>& data);
 
 	// Tear down the trunk leg for `callID` (either the trunk's own Call-ID or the
@@ -390,7 +402,17 @@ public:
 	const Dialog* findByCallID(std::string_view callID) const;
 
 private:
+	// Either leg's Call-ID: the trunk's own, or the bridged handset's. For
+	// ENGINE-initiated operations (hangup()) where the engine may name either.
 	Dialog* findMutableByCallID(std::string_view callID);
+
+	// The trunk's OWN Call-ID only. For messages arriving FROM THE WIRE
+	// (handleResponse(), handleBye()). The carrier only ever speaks in the trunk
+	// dialog, so a message on the handset's Call-ID is the handset talking --
+	// and matching it here is what let a handset's own BYE be taken for the
+	// carrier hanging up, freeing the trunk slot without ever BYEing the
+	// carrier (#386).
+	Dialog* findMutableByTrunkCallID(std::string_view callID);
 	Dialog* allocDialog();
 
 	// Fill a TrunkEvent from a dialog. Views borrow that dialog's storage, so

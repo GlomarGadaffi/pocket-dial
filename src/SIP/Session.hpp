@@ -151,6 +151,11 @@ public:
 	void setUacBranch(const std::string& branch) { _uacBranch = branch; }
 	const std::string& getAnchorParticipantId() const { return _anchorParticipantId; }
 	void setAnchorParticipantId(const std::string& id) { _anchorParticipantId = id; }
+	// Issue #379: set by a teardown path that has already dropped this far leg
+	// itself, or learned the upstream did (CallEvent::Dropped). endCall()'s
+	// no-bridge fallback skips a released leg, so every leg is dropped once.
+	bool isAnchorLegReleased() const { return _anchorLegReleased; }
+	void setAnchorLegReleased() { _anchorLegReleased = true; }
 
 	const std::vector<std::shared_ptr<SipClient>>& getPendingTargets() const { return _pendingTargets; }
 	void setPendingTargets(std::vector<std::shared_ptr<SipClient>> targets) { _pendingTargets = std::move(targets); }
@@ -281,6 +286,16 @@ public:
 	uint32_t transferorCseqAtRefer() const { return _transferorCseqAtRefer; }
 	void setTransferorCseqAtRefer(uint32_t v) { _transferorCseqAtRefer = v; }
 
+	// Issue #389. The highest CSeq the SERVER itself has sent as a request on
+	// this session's dialog (0 = none) -- e.g. ParkOrbit's retrieve re-INVITE.
+	// A later server-originated request on the same dialog must go strictly
+	// above it (RFC 3261 s12.2.1.1), or the phone rejects it 500 Invalid CSeq.
+	uint32_t lastServerCSeq() const { return _lastServerCSeq; }
+	void noteServerCSeq(uint32_t v) { if (v > _lastServerCSeq) _lastServerCSeq = v; }
+	// CSeq for the server's next request on this dialog: the long-standing 2 when
+	// it has sent none (e.g. call pickup's legs), otherwise one past the last.
+	uint32_t nextServerCSeq() const { return _lastServerCSeq ? _lastServerCSeq + 1 : 2; }
+
 	void release();
 
 private:
@@ -305,6 +320,7 @@ private:
 	std::string _remoteTag;            // handset To-tag (inbound anchor leg)
 	std::string _uacBranch;            // our INVITE Via branch (inbound anchor leg)
 	std::string _anchorParticipantId;  // upstream participant id (either anchor direction)
+	bool _anchorLegReleased = false;   // far leg already dropped (#379)
 	std::vector<std::shared_ptr<SipClient>> _pendingTargets;
 	std::shared_ptr<SipMessage> _inviteMessage;
 
@@ -338,6 +354,7 @@ private:
 	bool _blindXferLeg = false;    // true for the server-UAC leg toward a blind-transfer target
 	bool _wasTransferorSrc = true; // meaningful only when _isTransferBridge
 	uint32_t _transferorCseqAtRefer = 0; // issue #257, see the accessor's comment
+	uint32_t _lastServerCSeq = 0;        // issue #389, see the accessor's comment
 };
 
 #endif
