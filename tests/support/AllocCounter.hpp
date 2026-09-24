@@ -16,6 +16,11 @@
 // new. So "delta() == 0" proves zero C++ heap use only. Never assert zero heap
 // over code that calls the C allocator (or a shim around heap_caps_malloc): the
 // assertion would pass while the code allocates.
+//
+// OPTIMIZER: at -O3 (CMake Release, which CI builds) GCC removes a new-expression
+// whose result is never used. That can only lower a count, so a "delta() == 0"
+// check stays sound; but any test expecting a count > 0 must let the pointer
+// escape (e.g. store it to a volatile), or it will count 0 in CI and pass locally.
 
 #include <cstddef>
 
