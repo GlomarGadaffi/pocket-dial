@@ -212,6 +212,17 @@ SipTrunk::Dialog* SipTrunk::findMutableByCallID(std::string_view callID)
 	return nullptr;
 }
 
+SipTrunk::Dialog* SipTrunk::findMutableByTrunkCallID(std::string_view callID)
+{
+	// Same normalisation as findMutableByCallID(); callID is always stored bare.
+	const std::string key = siphdr::stripHeaderName(callID);
+	for (auto& d : _dialogs)
+	{
+		if (d.state != State::Free && d.callID == key) return &d;
+	}
+	return nullptr;
+}
+
 bool SipTrunk::setCredentials(std::string_view password)
 {
 	// Reject rather than truncate. A silently shortened password is a trunk
@@ -350,7 +361,7 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 {
 	if (!data) return false;
 
-	Dialog* d = findMutableByCallID(data->getCallID());
+	Dialog* d = findMutableByTrunkCallID(data->getCallID());
 	if (!d) return false;
 
 	// Only responses to OUR INVITE advance this machine. A response to the BYE is
@@ -504,7 +515,7 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 	if (!data) return false;
 	if (data->getType() != SipMessageTypes::BYE) return false;
 
-	Dialog* d = findMutableByCallID(data->getCallID());
+	Dialog* d = findMutableByTrunkCallID(data->getCallID());
 	if (!d || d->state == State::Free) return false;
 
 	// 200 first, off the request itself so the Via/CSeq match without this

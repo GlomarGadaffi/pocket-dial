@@ -222,6 +222,23 @@ namespace
 			}
 			return n;
 		}
+
+		// As countWith(), but only messages ADDRESSED to `ip`. A teardown has two
+		// parties and a BYE to the wrong one is not a BYE to the right one --
+		// countWith("BYE") alone let a handset hangup pass while the carrier leg
+		// was never told (#386).
+		size_t countWithTo(const std::string& needle, const std::string& ip) const
+		{
+			const uint32_t want = inet_addr(ip.c_str());
+			size_t n = 0;
+			for (const auto& [addr, msg] : sent)
+			{
+				if (!msg || addr.sin_addr.s_addr != want) continue;
+				const std::string raw = msg->toString();
+				if (raw.substr(0, raw.find("\r\n")).find(needle) != std::string::npos) ++n;
+			}
+			return n;
+		}
 	};
 }
 
@@ -387,8 +404,10 @@ TEST(TrunkWiring, TheHandsetHangingUpByesTheCarrierAndReleasesTheRelay)
 
 	b.handler.handle(makeHandsetBye("1001", "92025550123", "call-1", localTag));
 
-	EXPECT_FALSE(b.firstWith("BYE").empty())
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u)
 		<< "the carrier leg is billing until it is hung up";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u)
+		<< "the handset hung up itself; it gets a 200, not a BYE of its own";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u)
 		<< "endCall() is the one place the pair is released, on every path";
 }
@@ -405,8 +424,10 @@ TEST(TrunkWiring, TheCarrierHangingUpByesTheHandsetAndReleasesTheRelay)
 
 	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.bye(), addrFor(kSbcIp)));
 
-	EXPECT_FALSE(b.firstWith("BYE").empty())
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u)
 		<< "the handset has to be told; it is not in the carrier's dialog";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u)
+		<< "the carrier hung up itself; BYEing it back would earn a 481";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
 }
 
