@@ -280,6 +280,13 @@ endif()
 # allocated with RequestsHandler (PSRAM on S3 builds, internal DRAM without
 # PSRAM). Before #416 it grew lazily in internal DRAM; measured on .244 at 64
 # slots: ~52 KB held at steady state (#278).
+# Issue #395: BENCH-ONLY rollback probe image for tools/ota/remote_ota.sh stage 4
+# (never marks itself valid; restarts itself while pending). Never ship it.
+if(POCKETDIAL_OTA_ROLLBACK_PROBE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_OTA_ROLLBACK_PROBE=1)
+    message(WARNING "SipServer: OTA ROLLBACK PROBE image -- bench only, it never marks itself valid (#395)")
+endif()
+
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         POCKETDIAL_PCAP_RING_SIZE=${POCKETDIAL_PCAP_RING_SIZE})
