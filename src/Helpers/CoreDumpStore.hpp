@@ -20,7 +20,9 @@ namespace CoreDumpStore
 {
 	struct Info
 	{
-		bool supported = false;   // firmware built with coredump-to-flash
+		bool supported = false;   // built with coredump-to-flash AND the board has a
+		                          // coredump partition (#514: boards flashed before
+		                          // #382 have none, and OTA never adds it)
 		bool present = false;     // the partition holds a dump
 		uint32_t size = 0;        // bytes, as stored (raw flash image)
 	};
@@ -72,6 +74,10 @@ namespace CoreDumpStore
 	// Test-only: an empty vector means "no dump". Models a panic + reboot: the
 	// new image is probed and cached exactly as prime() would at boot.
 	void setImageForTest(std::vector<uint8_t> image);
+	// Test-only (#514): whether the board has a coredump partition at all (true
+	// by default). Without one, supported and present are both false, as on a
+	// board whose partition table predates #382.
+	void setPartitionForTest(bool present);
 	// Test-only: how many times the stored image was probed or read -- the host
 	// stand-in for "touched flash". /api/status must not move it (#405).
 	uint32_t flashAccessCountForTest();

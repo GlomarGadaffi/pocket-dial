@@ -22,6 +22,7 @@
 // live on both platforms and can be asserted by a host test rather than only
 // eyeballed on hardware.
 #include "DmaFramePool.hpp"
+#include "RtpReceiver.hpp"     // Issue #469: rxOversizeDrops() on /api/status
 #include "HoldMusic.hpp"       // Issue #466: clipRefusals() on /api/status
 #include "PsramAllocator.hpp"  // Issue #466: psram::internalFallbacks() on /api/status
 #include "index_html.h"
@@ -568,6 +569,12 @@ void HttpServer::handleClient(int clientSock)
 	}
 
 	HttpRequest req = parseRequest(raw);
+	// Issue #528: the peer address captured above, on EVERY request -- only the
+	// OTA/MoH streaming branch used to set it. Without it the login lockout keyed
+	// every client to the same "" bucket, so one host guessing passwords locked
+	// the real admin out too, and Cisco SPA model-keyed provisioning never ran
+	// its ARP lookup.
+	req.clientIp = peerIp;
 	// Out-param for the two telephony-config routes below, whose slot index is
 	// a URL path segment rather than a form param (see parseTelephonyConfigSlotPath).
 	size_t telSlotIdx = 0;
@@ -1661,6 +1668,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	bool e911Configured = false;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate = 0;
+	uint64_t droppedNoPool = 0;    // Issue #443/#444: discarded before handle()
+	uint64_t droppedOversize = 0;
+	uint64_t recvErrors = 0;
+	int lastRecvErrno = 0;
 
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
 	if (handler != nullptr)
@@ -1678,6 +1689,11 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		e911Configured = handler->isE911Configured();   // #450
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate = handler->getDroppedRate();
+		const DropProbe& probe = handler->getDropProbe();
+		droppedNoPool = probe.count(DropProbe::Reason::NoPool);
+		droppedOversize = probe.count(DropProbe::Reason::Oversize);
+		recvErrors = probe.recvErrorCount();
+		lastRecvErrno = probe.lastRecvErrno();
 	}
 
 	std::string displayIp = _ip;
@@ -1716,6 +1732,18 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// do not.
 	json << "\"droppedInvalid\":" << droppedInvalid << ",";
 	json << "\"droppedRate\":" << droppedRate << ",";
+	// Issue #443/#444: discarded before handle() -- NOT part of packetsDropped.
+	// No message was ever built for these; the ring below records their source
+	// (no_pool, oversize with the datagram's real length). recvErrors are failed
+	// receives (no datagram, so no source); the receive timeout's idle wake is
+	// not counted.
+	json << "\"droppedNoPool\":" << droppedNoPool << ",";
+	json << "\"droppedOversize\":" << droppedOversize << ",";
+	// Issue #469: the RTP side of the same check -- media datagrams over
+	// RtpReceiver::MAX_DATAGRAM_BYTES, dropped instead of parsed cut.
+	json << "\"rtpRxOversize\":" << RtpReceiver::rxOversizeDrops() << ",";
+	json << "\"recvErrors\":" << recvErrors << ",";
+	json << "\"lastRecvErrno\":" << lastRecvErrno << ",";
 	json << "\"recentDrops\":[";
 	if (authenticated && handler != nullptr)
 	{
@@ -1956,8 +1984,11 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// summary stay behind /api/coredump*.
 	{
 		const CoreDumpStore::Info cd = CoreDumpStore::query();
+		// `supported` (#514): false when the board has no coredump partition,
+		// so "present":false is not misread as "no crash happened".
 		json << ",\"coredump\":{\"present\":" << (cd.present ? "true" : "false")
-		     << ",\"size\":" << cd.size << "}";
+		     << ",\"size\":" << cd.size
+		     << ",\"supported\":" << (cd.supported ? "true" : "false") << "}";
 	}
 
 	// Issue #328: L2 transmit-path health, in one object, on the UNGATED route.
@@ -2086,6 +2117,9 @@ void HttpServer::sendApiMetrics(int sock)
 	uint64_t sdpRejected  = 0;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate  = 0;
+	uint64_t droppedNoPool = 0;    // Issue #443/#444
+	uint64_t droppedOversize = 0;
+	uint64_t recvErrors = 0;
 	size_t   clientCount  = 0;
 	size_t   sessionCount = 0;
 
@@ -2101,6 +2135,10 @@ void HttpServer::sendApiMetrics(int sock)
 		dropped      = handler->getPacketsDropped();
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate  = handler->getDroppedRate();
+		const DropProbe& probe = handler->getDropProbe();
+		droppedNoPool   = probe.count(DropProbe::Reason::NoPool);
+		droppedOversize = probe.count(DropProbe::Reason::Oversize);
+		recvErrors      = probe.recvErrorCount();
 		sdpRejected  = handler->getSdpRejected();
 		clientCount  = handler->getClientCount();
 		sessionCount = handler->getSessionCount();
@@ -2158,6 +2196,19 @@ void HttpServer::sendApiMetrics(int sock)
 	        "The refused share of pocketdial_packets_dropped_total: allowlist or per-IP "
 	        "rate limit (issue #430).",
 	        droppedRate);
+	counter("pocketdial_packets_dropped_no_pool_total",
+	        "SIP datagrams discarded before parsing because the message pool and its "
+	        "bounded heap fallback were spent (issue #443). Not in "
+	        "pocketdial_packets_dropped_total.",
+	        droppedNoPool);
+	counter("pocketdial_packets_dropped_oversize_total",
+	        "SIP datagrams longer than the receive buffer, refused rather than parsed "
+	        "truncated (issue #444). Not in pocketdial_packets_dropped_total.",
+	        droppedOversize);
+	counter("pocketdial_sip_recv_errors_total",
+	        "Failed SIP socket receives, excluding the receive timeout's idle wake "
+	        "(issue #443).",
+	        recvErrors);
 	counter("pocketdial_sdp_rejected_total",
 	        "SDP bodies refused by the admission gate since boot, whether answered 488 "
 	        "or dropped silently (docs/THREAT_MODEL.md T-7).",
@@ -3761,7 +3812,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// deliberate: the next boot re-applies whatever the flasher wrote, so a
 	// factory reset returns the board to how it was FLASHED rather than to a
 	// hardcoded default the operator never chose.
-	DeviceConfig::clearAll();
+	const bool deviceConfigCleared = DeviceConfig::clearAll();   // #441 review: reported below
 	// Also wipe the Telephony-API credential slots ("tapicfg") and the DID ->
 	// extension table ("didmap") -- both live in their OWN NVS namespace /
 	// host-file specifically so that clearing the device's own settings would NOT
@@ -3773,8 +3824,8 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// cleared here too.
 	//
 	// Nothing else in this function reaches them: DeviceConfig::clearAll() just
-	// above erases only its three named "storage" keys plus reg_mode in "pbxcfg"
-	// (via that file's eraseRegistrarMode(), src/Helpers/DeviceConfig.cpp), and the
+	// above erases only its three named "storage" keys and resets reg_mode in
+	// "pbxcfg" to learn (writeRegistrarMode(), src/Helpers/DeviceConfig.cpp; #397), and the
 	// WiFi block further down erases four more "storage" keys by name. Both of
 	// those are key-by-key, never a namespace wipe, so a namespace no line here
 	// names is not reached at all. (An earlier version of this comment said
@@ -3896,25 +3947,29 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// completed reset. The operator is about to hand this board on believing its
 	// credentials are gone. The board still restarts: the admin credential is
 	// already cleared above, so staying up half-reset helps nobody, and the reset
-	// can be run again once setup completes. (DeviceConfig::clearAll() still
-	// returns void; its result is Pal's #441.)
+	// can be run again once setup completes. (DeviceConfig::clearAll()'s result is
+	// deviceConfigCleared, #441.)
+	// #441 (G-dubs's fold, taken over by Globox): the device-settings reset joins
+	// this same check as "device" -- a failed reg_mode write can leave an old
+	// `secure` in place, the lockout this reset exists to rescue.
 	if (!adminErased || !trunkErased || !secretsErased || !forwardsErased || !e911Erased ||
-		!tapiErased || !didmapErased || !wifiErased)
+		!tapiErased || !didmapErased || !wifiErased || !deviceConfigCleared)
 	{
 		// #450: one fixed format, filled on the stack -- no string building on the
 		// HTTP task (#284). "failed" names each store, so the operator knows what
-		// may still be in flash. Worst case 298 B of 384 (#456 review: tapi,
-		// didmap and wifi added).
+		// may still be in flash. Worst case 312 B of 384 (#456 review: tapi,
+		// didmap and wifi added; #441: device).
 		char body[384];
 		const int n = std::snprintf(body, sizeof(body),
 			"{\"status\":\"error\",\"failed\":{\"admin\":%s,\"trunk\":%s,\"secrets\":%s,\"forwards\":%s,\"e911\":%s,"
-			"\"tapi\":%s,\"didmap\":%s,\"wifi\":%s},"
+			"\"tapi\":%s,\"didmap\":%s,\"wifi\":%s,\"device\":%s},"
 			"\"message\":\"Factory reset INCOMPLETE: the stores marked true under failed could not be erased. "
 			"Rebooting anyway; run the factory reset again after setup.\"}",
 			adminErased ? "false" : "true", trunkErased ? "false" : "true",
 			secretsErased ? "false" : "true", forwardsErased ? "false" : "true",
 			e911Erased ? "false" : "true", tapiErased ? "false" : "true",
-			didmapErased ? "false" : "true", wifiErased ? "false" : "true");
+			didmapErased ? "false" : "true", wifiErased ? "false" : "true",
+			deviceConfigCleared ? "false" : "true");
 		// A truncated or failed format must never ship as half a JSON object.
 		static constexpr const char* kFallback =
 			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: one or more stores could "
@@ -3999,14 +4054,14 @@ static const char* registrarModeName(RequestsHandler::RegistrarMode m)
 	{
 		case RequestsHandler::RegistrarMode::Learn:  return "learn";
 		case RequestsHandler::RegistrarMode::Secure: return "secure";
-		case RequestsHandler::RegistrarMode::Open:   break;
 	}
-	return "open";
+	return "learn";
 }
 
+// "open" is NOT a mode any more (#500): the live setter answers 400 for it, and
+// config import maps it to learn and says so (see sendApiConfigImport).
 static bool parseRegistrarMode(const std::string& s, RequestsHandler::RegistrarMode& out)
 {
-	if (s == "open")   { out = RequestsHandler::RegistrarMode::Open;   return true; }
 	if (s == "learn")  { out = RequestsHandler::RegistrarMode::Learn;  return true; }
 	if (s == "secure") { out = RequestsHandler::RegistrarMode::Secure; return true; }
 	return false;
@@ -4059,7 +4114,7 @@ void HttpServer::sendApiRegistrarSet(int sock, const std::string& body)
 	if (!parseRegistrarMode(getFormParam(body, "mode"), mode))
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
-		             "{\"error\":\"mode must be one of: open, learn, secure\"}");
+		             "{\"error\":\"mode must be one of: learn, secure (open is retired)\"}");
 		return;
 	}
 
@@ -4651,7 +4706,7 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	pt << "],";
 
 	pt << "\"registrarMode\":\""
-	   << (handler ? registrarModeName(handler->getRegistrarMode()) : "open") << "\",";
+	   << (handler ? registrarModeName(handler->getRegistrarMode()) : "learn") << "\",";
 
 	// Telephony-API slot METADATA only. baseUrl/clientId/routeDn are
 	// password-gated (#186: "anchor/trunk base URL, client ID/secret, source
@@ -5034,8 +5089,26 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		// extensions/extensionSecrets skip above) would digest-challenge every
 		// REGISTER with no working handset left to notice. Every other mode
 		// applies outright.
+		//
+		// #500: an export from before the open registrar was retired may say
+		// "open". Apply learn, the closest mode that still exists (it admits every
+		// phone's first REGISTER), and say so, so the operator is not surprised.
 		RequestsHandler::RegistrarMode parsedMode;
-		if (parseRegistrarMode(pt->stringOr("registrarMode", "open"), parsedMode))
+		// A blob with no registrarMode key leaves the mode as it is (BigDog's #502
+		// review): defaulting a missing key would quietly drop a Secure board to
+		// Learn, reported only under "applied". The empty string parses as no
+		// mode, so nothing below applies it.
+		std::string importedMode = pt->stringOr("registrarMode", "");
+		if (importedMode.empty())
+		{
+			skipped.push_back("registrarMode (not in the file; left unchanged)");
+		}
+		if (importedMode == "open")
+		{
+			importedMode = "learn";
+			skipped.push_back("registrarMode=open (the open registrar is retired; applied learn instead)");
+		}
+		if (parseRegistrarMode(importedMode, parsedMode))
 		{
 			if (parsedMode == RequestsHandler::RegistrarMode::Secure)
 			{

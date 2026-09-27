@@ -567,6 +567,7 @@ TEST(CapabilityHeaders, AServerOriginatedByeIsTrackedForRetransmitByTheRealEngin
 
 	const std::string phoneIp = "192.168.41.50";
 	handler.handle(makeRegister("450", phoneIp, "reg-450"));
+	handler.fireRegisterBeepsForTest();   // #408: sent after the 200 OK, from tick()
 
 	// The beep INVITE the registration just fired. Echo its dialog back so the
 	// 200 OK is matched to it.

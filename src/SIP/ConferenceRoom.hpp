@@ -135,6 +135,16 @@ public:
 	// of fillHandsetTx.
 	RtpSender* senderForCall(const std::string& callID);
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test seam (#513): leg `index`'s sender whatever its state, including a leg
+	// that has left, so a test can hold it "still stopping" the way an ESP leg is
+	// for a few ticks after leave(). nullptr for an out-of-range index.
+	RtpSender* legSenderForTest(int index)
+	{
+		return (index >= 0 && index < MAX_LEGS) ? &_legs[static_cast<size_t>(index)].tx : nullptr;
+	}
+#endif
+
 private:
 	struct Leg
 	{

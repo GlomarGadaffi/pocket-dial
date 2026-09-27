@@ -96,20 +96,36 @@ namespace
 		return ok;
 	}
 
-	// Drop the persisted mode so the next boot falls back to the compiled-in
-	// default. Absent key is success: nothing to clear is the desired end state.
-	void eraseRegistrarMode()
+	// (eraseRegistrarMode() was removed by #397: factory reset now WRITES learn
+	// through writeRegistrarMode() above instead of erasing the key.)
+#endif
+
+	// Schema v1 -> v2 (#397, #441 review, #500). On a v1 board an absent reg_mode
+	// meant open, and a stored 0 WAS open. The open registrar is retired (#500,
+	// desmo 2026-09-27), so both become Learn, written explicitly. Learn admits
+	// each phone's first REGISTER, so a deployed board keeps its phones. A stored
+	// Learn or Secure is left alone.
+	// Returns false on any NVS failure, so runSchemaMigrations() does not stamp
+	// v2 and the step is retried next boot -- meanwhile the board boots Learn
+	// anyway (chooseBootMode / Registrar::decodeStored).
+	bool migrateRetireOpenRegistrar(void* /*ctx*/)
 	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		nvs_handle_t rh;
 		if (nvs_open(DeviceConfig::kRegistrarNvsNamespace, NVS_READWRITE, &rh) != ESP_OK)
 		{
-			return;
+			return false;
 		}
-		nvs_erase_key(rh, kKeyRegMode);   // ESP_ERR_NVS_NOT_FOUND is fine
-		nvs_commit(rh);
+		uint8_t v = 0;
+		const esp_err_t err = nvs_get_u8(rh, kKeyRegMode, &v);
 		nvs_close(rh);
-	}
+		if (err == ESP_OK && v != 0) return true;                   // learn/secure stand
+		if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return false;  // unreadable: retry next boot
+		return writeRegistrarMode(1 /* Registrar::Mode::Learn */);
+#else
+		return true;   // host: no NVS, and the host never runs a migration anyway
 #endif
+	}
 
 	// Alphabet size, computed rather than written as a literal: the modulo-bias
 	// rejection threshold below depends on it, and a hand-copied constant that
@@ -845,11 +861,14 @@ namespace DeviceConfig
 			// registrar. A dashboard endpoint covers the boards that do have one.
 			if (regMode <= 2)
 			{
+				// #500: 0 was open, which is retired. A seed written by an older
+				// flasher that still says open installs learn instead.
+				const uint8_t effective = (regMode == 0) ? 1 : regMode;
 				// Separate handle on a different namespace from every other field
 				// this function writes, committed and closed inside the helper
 				// rather than deferred to the shared commit below, which only
 				// covers `h`. See writeRegistrarMode (issues #151 / #188).
-				if (writeRegistrarMode(regMode))
+				if (writeRegistrarMode(effective))
 				{
 					applied = true;
 				}
@@ -898,22 +917,29 @@ namespace DeviceConfig
 #endif
 	}
 
-	void clearAll()
+	bool clearAll()
 	{
 		ConfigState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
+		bool ok = true;
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		nvs_handle_t h;
 		if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
 		{
-			nvs_erase_key(h, kKeyApSecure);
-			nvs_erase_key(h, kKeyApPsk);
+			// An absent key is the desired end state, so NOT_FOUND is success.
+			auto erased = [](esp_err_t e) { return e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND; };
+			ok = erased(nvs_erase_key(h, kKeyApSecure)) && ok;
+			ok = erased(nvs_erase_key(h, kKeyApPsk)) && ok;
 			// Dropping cfgseed_gen is deliberate — see DeviceConfig.hpp: the next
 			// boot re-applies the flash-time seed, so "factory" means "as flashed".
-			nvs_erase_key(h, kKeySeedGen);
-			nvs_commit(h);
+			ok = erased(nvs_erase_key(h, kKeySeedGen)) && ok;
+			ok = (nvs_commit(h) == ESP_OK) && ok;
 			nvs_close(h);
+		}
+		else
+		{
+			ok = false;
 		}
 
 		// The registrar admission mode goes too. This key belongs to Registrar,
@@ -927,8 +953,22 @@ namespace DeviceConfig
 		// is the wrong namespace — Registrar keeps reg_mode in `pbxcfg` — so the
 		// rescue never actually worked. It is OUTSIDE the block above because it
 		// is a different namespace and must happen whether or not `storage`
-		// opened; eraseRegistrarMode() owns that choice now.
-		eraseRegistrarMode();
+		// opened.
+		//
+		// #397: it is now WRITTEN as learn rather than erased. With no stored
+		// mode the next boot would read this (schema-stamped) board as an
+		// existing deployment and keep it open; a factory reset must come back
+		// like a fresh install instead. Learn performs the rescue above -- it
+		// accepts every first REGISTER -- as long as no extension was Secured:
+		// the device table survives this key-by-key reset, so a Secured phone
+		// whose HA1 #437 just wiped is refused until an admin forgets it (#441
+		// review). #456's whole-partition erase removes the table too.
+		//
+		// #441 review: the result is reported. With the v2 schema a failed write
+		// can no longer end in Open (no key boots learn), but it CAN leave an old
+		// `secure` in place -- the lockout this reset exists to rescue -- so the
+		// operator must be told.
+		ok = writeRegistrarMode(1 /* Registrar::Mode::Learn */) && ok;
 #endif
 
 		s.apSecure = false;
@@ -943,6 +983,7 @@ namespace DeviceConfig
 		// future v3 firmware re-run the 1->2->3 migrations over data that is
 		// already v3. The stamp describes the layout, not the contents, and a
 		// factory reset does not change the layout.
+		return ok;
 	}
 
 	// =====================================================================
@@ -1038,17 +1079,17 @@ namespace DeviceConfig
 
 	const SchemaMigration* schemaMigrations(size_t* count)
 	{
-		// Empty on purpose. kSchemaVersion is 1: there is no earlier layout to
-		// come from, so any row here would be a speculative, untested,
-		// flash-mutating code path shipped to production. The dispatch in
-		// runSchemaMigrations() is fully exercised by the host tests against
-		// synthetic tables instead, so adding the first real row is a two-line
-		// change to this function and nothing else.
+		// One row per real change of meaning, never a speculative one. The
+		// dispatch in runSchemaMigrations() is exercised by the host tests
+		// against synthetic tables; the NVS body of each row is ESP-only.
+		static const SchemaMigration kTable[] = {
+			{1, 2, &migrateRetireOpenRegistrar, "reg_mode: retire open, write learn (#500)"},
+		};
 		if (count != nullptr)
 		{
-			*count = 0;
+			*count = sizeof(kTable) / sizeof(kTable[0]);
 		}
-		return nullptr;
+		return kTable;
 	}
 
 	bool runSchemaMigrations(uint16_t from, uint16_t to,

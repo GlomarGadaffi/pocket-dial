@@ -117,13 +117,13 @@ Symptom: The SIP client never reaches "registered", times out, or shows an error
 
 > [!NOTE]
 > **What a `401` on REGISTER means depends on the registrar mode.** Check it first:
-> `GET /api/registrar` returns `{"mode":"open"|"learn"|"secure", …}` ([API.md](API.md#get-apiregistrar)).
+> `GET /api/registrar` returns `{"mode":"learn"|"secure", …}` ([API.md](API.md#get-apiregistrar)). (There is no `open` mode since #500.)
 > That `GET` needs a session (and completed setup), but no `X-CSRF`.
-> * In `open` (the shipped default) there is no SIP authentication at all, so a `401`
->   is *not* from pocket-dial. It is almost always the phone's own account dialog, or,
->   separately, the **HTTP admin** gate (`/api/admin/*`), a different subsystem.
-> * In `learn`, already-secured devices are digest-challenged; unknown MACs are adopted
->   on first contact without a credential.
+> * In `learn` (the default since #397/#500), already-secured devices are
+>   digest-challenged; unknown MACs are adopted on first contact without a credential.
+>   A `401` for an extension that isn't Secured is *not* from pocket-dial: it is almost
+>   always the phone's own account dialog, or, separately, the **HTTP admin** gate
+>   (`/api/admin/*`), a different subsystem. (The old `open` mode is retired, #500.)
 > * In `secure`, a `401` with `WWW-Authenticate: Digest …` is real SIP digest auth
 >   (RFC 2617, MD5). The phone needs the extension's secret set on the handset.
 >
@@ -181,8 +181,11 @@ reachable, so you have as long as you need.
 > This file already stated the corrected behaviour further down, in the factory-reset
 > section; the two disagreed. **Source-verified; still not exercised on hardware.**
 >
-> `POST /api/registrar mode=open` remains the lighter-touch fix and is still the first
-> thing to try; it changes one setting instead of wiping the box.
+> `POST /api/registrar mode=learn` is the lighter-touch fix and is still the first thing to
+> try; it changes one setting instead of wiping the box. (`mode=open` was the old answer: the
+> open registrar is retired (#500) and that request now gets `400`.) A phone whose device was
+> **Secured** stays digest-enforced in Learn, so also `forget` it
+> (`POST /api/registrar/device action=forget`) if its secret is lost.
 >
 > Factory reset also **re-arms the flash-time seed.** Dropping `cfgseed_gen` means the next
 > boot re-applies whatever the browser flasher wrote, which can include `regMode`

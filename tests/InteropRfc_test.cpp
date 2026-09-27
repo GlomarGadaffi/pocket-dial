@@ -291,6 +291,7 @@ TEST(InteropRfc, BeepInviteRefusedByThePhoneIsAckedNotLeftHanging)
 
 	// A new registration triggers the register-beep INVITE.
 	handler.handle(makeRegister("504", "192.168.7.54", "reg-504", /*withRport=*/false));
+	handler.fireRegisterBeepsForTest();   // #408: sent after the 200 OK, from tick()
 	const std::string beep = firstMatching(sent, "INVITE sip:504@");
 	ASSERT_FALSE(beep.empty()) << "no register-beep INVITE was sent";
 
