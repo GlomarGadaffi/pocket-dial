@@ -2,11 +2,11 @@
 
 ## v1.5.0-rc.1 — 2026-09-27
 
-The first release candidate. 148 commits landed on top of beta.2, most of them from a
+The first release candidate. 154 commits landed on top of beta.2, most of them from a
 two-week push on milestones 1–7 of #401: no crashes under memory pressure, every call
 leg torn down exactly once, secure by default, and real carriers. The host suite grew
-from 799 to 1,396 test cases by static count. CI now enforces a checked-in floor of
-1,391 (a base of 1,280 plus one contribution file per PR; #390, #467), and the
+from 799 to 1,426 test cases (train E's gate ran 1,426, 0 failed). CI now enforces a
+checked-in floor (a base of 1,280 plus one contribution file per PR; #390, #467), and the
 interop suite (pjsua + baresip against the host PBX) is a required check on every
 pull request.
 
@@ -43,6 +43,14 @@ for 911.
 - **The admin-login lockout is per client again (#530; #528).** The per-client bucket
   existed but was never keyed, so one guessing client locked the real admin out. An
   aggregate backstop is still shared across clients, by design.
+- **An INVITE must come from its caller's registered address (#503; #497).** A spoofed
+  From no longer places calls as another extension.
+- **A credentialed INVITE can't be replayed elsewhere (#555; #549).** The digest `uri`
+  must be the Request-URI, the Request-URI user must match To, and the credentials are
+  stripped before relay. Credentials on in-dialog relays are #560.
+- **One LAN host can't hold every HTTP slot (#534; #529).** Everything read before
+  dispatch must arrive within 10 s, one source may hold 3 of the 4 slots, and both
+  drops are counted.
 - **HTTP hardening:** concurrent connection threads are capped (#369; #368) and run
   on 4 KB stacks (#367; #366). The first admin login no longer takes `http_conn` down
   to ~400 B of stack (#494; #492).
@@ -131,6 +139,11 @@ Per-extension voicemail, deposit and retrieval.
 
 ### Emergency calling (#166)
 
+- **The loopback simulator never answers a 911 (#538; #521).** A 911 goes to a real
+  anchor, else the SIP trunk (a bare `sip:911@`, never `+911`), else
+  `503 Emergency Call Not Routable`. `/api/status` reports `emergencyRoute`, and the
+  dashboard and boot log warn while it is `none`. A dial-plan rule that produces 911
+  takes the same emergency path.
 - **911 comes first.** `911`, `9911` and the `933` test number are resolved before the
   dial plan and before any registrar policy.
 - **No route answers 503.** With no anchor connected the caller gets 503, not 404
@@ -142,7 +155,8 @@ Per-extension voicemail, deposit and retrieval.
 ### Observability
 
 - **Drops by reason.** `packetsDropped` is split by reason, with an allocation-free
-  ring of recent drops (#447; #430).
+  ring of recent drops (#447; #430). CR/LF keep-alives are counted apart, not as
+  drops (#506).
 - **Receive paths.** No receive-path discard goes uncounted, and a datagram too big for
   the buffer is refused, not parsed truncated (#468; #443, #444). RTP datagrams over
   512 B are dropped and counted (#485; #469).
@@ -158,6 +172,7 @@ Per-extension voicemail, deposit and retrieval.
   plus one contribution file per PR (#478; #467).
 - **Staged remote OTA** with a stop rule at every stage and a rollback probe
   (`tools/ota/remote_ota.sh`, #491; #395). Its first run on `.244` passed.
+- **Soak tools for #401 (#537).** A 1 Hz `/api/status` logger and a PASS/FAIL verdict.
 - **A unified test harness** (`tests/run.py`) and a HIL pipeline (#360).
 - **CI hardening.**
   - One cppcheck invocation (#442).
@@ -174,32 +189,32 @@ Per-extension voicemail, deposit and retrieval.
   (#199) were re-checked (#520; part of #401). The 3CX Call Control reference is in
   `docs/` (#332).
 
-<!-- TRAIN E/F: Globox fills these in when they land -->
-### Pending: trains E and F (not in this build until they land)
+<!-- TRAIN F: Globox fills these in when they land -->
+### Pending: train F (not in this build until it lands)
 
-These are reviewed or in review, and they are **not** described as shipped:
-- **#538**: a 911 goes to a real anchor, else the SIP trunk, else 503. The loopback
-  simulator is never offered one (Fixes #521).
-- **#503**: an INVITE must come from the caller's registered address (#497).
-- **#506**: CR/LF keep-alives are counted, not dropped (#430).
-- **#534**: an HTTP read deadline and a per-source slot cap (#529).
-- **#537**: the #401 soak logger and its PASS/FAIL verdict.
-- **#555**: a credentialed INVITE cannot be replayed to another destination (#549).
+These are in review and are **not** shipped:
 - **#556**: a CANCEL mid-ring answers the anchored INVITE 487 (#548).
 - **#557**: follow-up doc corrections.
-- **#509**: IPv4 reassembly, with per-socket receive caps and an IPv4 input guard
-  (#496).
+- **#562**: no in-dialog relay carries the INVITE's credentials (#560).
+- **#509**: IPv4 reassembly, with per-socket receive caps and an IPv4 input guard (#496).
+- **#563**: unauthenticated `/api/status` names no callers or callees (#539).
+- **#564**: the whole emergency-number set is reserved as an extension name (#550).
+- **#565**: the handset is BYEd when an anchored call is reaped (#533).
 
 ---
 
 ### Not proved on hardware / known open
 
-- **911 on a default board (#521).** Until #538 lands, a board whose only anchor is
-  the loopback simulator "answers" a 911 itself: the caller hears a connected call
-  that never left the box. **Do not rely on this build for emergency calling.**
-- **Emergency routing gaps.** A trunk that reports configured is not proven to
-  complete a call (#546). An extension named like a prefixed emergency number (#550)
-  is fixed in a PR that follows #538.
+- **911 is fixed but not proven on a live call.** #538 is merged, and its boot check ran
+  on `.244`, but no 911 has been routed out to a real carrier. Treat emergency calling
+  as unverified.
+- **Emergency routing gaps.** A trunk that reports configured is not proven to complete
+  a call (#546). An extension named like a prefixed emergency number is #550 (PR #564).
+- **Security follow-ups.** #560 covers credentials on in-dialog relays (PR #562), and
+  #561 the DTMF PIN bucket, which web-login buckets can evict. #525 still owes the
+  nonce-reuse limit.
+- **IPv4 reassembly is still off.** #509 is pending, and the mDNS chain question with it
+  is #559.
 - **The anchor rx task is still force-killed on a slow teardown (#370, #553).** #421's
   guard passed the X4 re-run on `.244`, but review found the external kill itself
   unsafe. The cooperative-cancellation redesign is #553. A late upsert re-priming a
