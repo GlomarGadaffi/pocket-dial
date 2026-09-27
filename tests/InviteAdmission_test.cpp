@@ -471,6 +471,29 @@ TEST(InviteAdmission, ARelayedReinviteCarriesNoCredential)
 	EXPECT_EQ(relayed.find("Authorization:"), std::string::npos) << relayed;
 }
 
+TEST(InviteAdmission, ARelayedUpdateCarriesNoCredential)
+{
+	// #560: onUpdate() relays an in-dialog UPDATE to the peer; a phone that
+	// resends its INVITE credential there must not hand it to the callee.
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+	const std::string creds = admitCredentialedCall(h, "up560");
+	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
+
+	auto update = makeInvite("up560", 3, kPcmuOffer, creds);
+	update->setHeader("UPDATE sip:600@server SIP/2.0");
+	update->setCSeq("CSeq: 3 UPDATE");
+	update->setTo("To: <sip:600@server>;tag=callee560");
+	h.sent.clear();
+	h.handler.handle(update);
+
+	const std::string relayed = lastSentTo600Starting(h.sent, "UPDATE ");
+	ASSERT_FALSE(relayed.empty()) << "the UPDATE is relayed to the callee";
+	EXPECT_EQ(relayed.find("Authorization:"), std::string::npos) << relayed;
+}
+
 TEST(InviteAdmission, ARegisterWhoseDigestUriIsNotItsRequestUriIsRefused)
 {
 	// #549's uri binding covers REGISTER too (admitSecure is shared).

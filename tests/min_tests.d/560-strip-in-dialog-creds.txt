@@ -1,2 +1,2 @@
-# InviteAdmission_test.cpp: 4 (#560: in-dialog relays carry no credential; REGISTER uri binding; Learn fork strip)
-4
+# InviteAdmission_test.cpp: 5 (#560: in-dialog relays (ACK, re-INVITE, UPDATE) carry no credential; REGISTER uri binding; Learn fork strip)
+5
