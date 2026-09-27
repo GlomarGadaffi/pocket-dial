@@ -99,6 +99,10 @@ public:
 	bool hasLeg(const std::string& callID) const;
 	int  legCount() const;
 
+	// False if the bus landed off its 16-byte alignment (only possible if the room
+	// was not allocated with `new`); join() then refuses every leg. Issue #498.
+	bool busAligned() const { return _busAligned; }
+
 	// The extension dialed in on each occupied leg, for the dashboard / logs.
 	std::array<std::string, MAX_LEGS> legExtensions() const;
 
@@ -152,6 +156,7 @@ private:
 	MixBus                    _bus;
 	std::array<Leg, MAX_LEGS> _legs;
 	mutable std::mutex        _mutex;
+	bool                      _busAligned = false;   // set once by the constructor
 
 	// Driver control. Same ownership shape as RtpSender's media task: the owner asks
 	// the driver to stop, the driver clears _driverRunning as its last act.

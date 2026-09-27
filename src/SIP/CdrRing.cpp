@@ -361,7 +361,13 @@ void CdrRing::load()
 
 void CdrRing::clearAll()
 {
-	_ring = {};
+	// Issue #458: reset each slot IN PLACE. `_ring = {};` value-initialised a
+	// temporary std::array of the whole ring (~2 KB on the S3) on the caller's
+	// stack before move-assigning it -- a 2,096 B frame on the 4 KB http_conn
+	// task, reached from /api/factory-reset, which could overflow halfway
+	// through a reset. Now the only temporary is one record.
+	for (CallDetailRecord& r : _ring)
+		r = CallDetailRecord{};
 	_head = 0;
 	_count = 0;
 	persist();

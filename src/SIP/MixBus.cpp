@@ -50,7 +50,7 @@ bool MixBus::outputFrame(int port, int16_t* pcm, size_t n)
 // ── The mix tick = master clock ─────────────────────────────────────────────
 void MixBus::tick()
 {
-    alignas(16) int16_t frame[MAX_PORTS][FRAME];   // 16-byte aligned for the PIE path
+    // Scratch is _frame/_out (members, issue #498): this runs on conf_mix_tick's 3 KB stack.
     unsigned char present[MAX_PORTS];
 
     // (1) Snapshot participation for THIS tick; pull one frame per active port;
@@ -69,20 +69,19 @@ void MixBus::tick()
         }
 
         present[p] = (s == State::Active) ? 1 : 0;
-        if (present[p] && !_ports[p].in.read(frame[p], FRAME))
-            std::memset(frame[p], 0, sizeof frame[p]);   // late leg -> silence this tick
+        if (present[p] && !_ports[p].in.read(_frame[p], FRAME))
+            std::memset(_frame[p], 0, sizeof _frame[p]);   // late leg -> silence this tick
     }
 
     // (2) Full mix in int32 — NEVER saturate here.            [PIE kernel A]
-    mix_accumulate(_mix, frame, present, MAX_PORTS, FRAME);
+    mix_accumulate(_mix, _frame, present, MAX_PORTS, FRAME);
 
     // (3) Fan out: each active port hears (mix - self), saturated once. [PIE kernel B]
     for (int p = 0; p < MAX_PORTS; ++p)
     {
         if (!present[p]) continue;
-        alignas(16) int16_t out[FRAME];
-        mix_minus_self(out, _mix, frame[p], FRAME);
-        _ports[p].out.write(out, FRAME);
+        mix_minus_self(_out, _mix, _frame[p], FRAME);
+        _ports[p].out.write(_out, FRAME);
     }
 }
 
