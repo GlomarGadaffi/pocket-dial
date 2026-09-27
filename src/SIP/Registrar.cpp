@@ -303,6 +303,15 @@ std::vector<Registrar::AdoptedDevice> Registrar::adoptedDevices() const
 	return out;
 }
 
+bool Registrar::isExtensionSecured(const std::string& ext) const
+{
+	for (const auto& [mac, rec] : _devices)
+	{
+		if (rec.extension == ext && rec.state == DeviceState::Secured) return true;
+	}
+	return false;
+}
+
 void Registrar::noteChange(Change kind)
 {
 	// The enum is ordered None < OnlineOnly < Structural, so taking the max keeps

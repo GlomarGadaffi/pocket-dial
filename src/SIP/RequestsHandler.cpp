@@ -1739,11 +1739,19 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// so it verifies against INVITE. The stateless 401 needs no session; the
 	// credentialed retry arrives with CSeq+1 and falls through here. Learn mode
 	// keeps its TOFU semantics and Open mode never challenges.
-	if (_registrar.getMode() == RegistrarMode::Secure)
+	//
+	// Issue #505: in Learn mode a device an admin has promoted to Secured is
+	// digest-enforced on REGISTER already; its CALLS now prove the same secret.
+	// Otherwise a spoofed INVITE naming a Secured extension (with its source IP
+	// forged past #497's binding) would place calls as it. Unsecured Learned
+	// extensions keep TOFU (they have no secret to check; #440).
+	const std::string callerExt(data->getFromNumber());
+	if (_registrar.getMode() == RegistrarMode::Secure ||
+		_registrar.isExtensionSecured(callerExt))
 	{
 		std::string rejectReason;
 		const Registrar::AuthDecision decision =
-			_registrar.admitSecure(data, std::string(data->getFromNumber()), rejectReason);
+			_registrar.admitSecure(data, callerExt, rejectReason);
 		if (decision == Registrar::AuthDecision::Challenge) return;   // 401 enqueued
 		if (decision == Registrar::AuthDecision::Reject)
 		{

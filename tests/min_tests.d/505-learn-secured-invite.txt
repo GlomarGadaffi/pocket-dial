@@ -1,0 +1,2 @@
+# InviteAdmission_test.cpp: Learn-mode Secured INVITE challenge + unsecured still admitted, #505
+2
