@@ -707,3 +707,33 @@ TEST(TrunkWiring, A183WithoutSdpLeavesLocalRingback)
 		carrier.response("SIP/2.0 183 Session Progress", /*withSdp=*/false), addrFor(kSbcIp)));
 	EXPECT_TRUE(b.firstWith("183 Session Progress").empty()) << "nothing to relay without SDP";
 }
+
+TEST(TrunkWiring, ACarrierRefusalAfterEarlyMediaRefusesTheHandsetAndFreesTheRelay)
+{
+	// #600 review: a 183 with SDP took a relay pair; a carrier 486 afterwards
+	// must answer the handset 486 in the SAME early dialog (the 183's To-tag)
+	// and give the pair back.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-em3"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 183 Session Progress", /*withSdp=*/true), addrFor(kSbcIp)));
+	const std::string early = b.firstWith("183 Session Progress");
+	ASSERT_FALSE(early.empty());
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	const std::string earlyTo = CarrierView::between(early, "\nTo: ", "\r\n");
+	ASSERT_NE(earlyTo.find(";tag="), std::string::npos) << early;
+
+	b.sent.clear();
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 486 Busy Here", /*withSdp=*/false), addrFor(kSbcIp)));
+	const std::string busy = b.firstWith("SIP/2.0 486 Busy Here");
+	ASSERT_FALSE(busy.empty()) << "the handset must hear the carrier's busy";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 486 Busy Here", kHandsetIp), 1u);
+	EXPECT_EQ(CarrierView::between(busy, "\nTo: ", "\r\n"), earlyTo)
+		<< "the refusal ends the early dialog the 183 opened";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}

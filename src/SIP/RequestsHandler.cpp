@@ -10399,6 +10399,10 @@ void RequestsHandler::refuseRingingTrunk(const std::string& callId, int carrierS
 	resp->setHeader(line);
 	resp->clearBody();
 	resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
+	// #400 review: same To-tag as the 183/200, so a failure after early media
+	// ends the early dialog the handset already has.
+	if (const std::string& tag = sit->second->getLocalTag(); !tag.empty())
+		resp->setTo(std::string(invite->getTo()) + ";tag=" + tag);
 	resp->setContact(buildContact(std::string(invite->getToNumber())));
 	_outbox.emplace_back(invite->getSource(), std::move(resp));
 }
