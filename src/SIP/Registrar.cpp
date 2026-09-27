@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 #include "ArpLookup.hpp"
 #include "DeviceConfig.hpp"   // Issue #397: lastSchemaOutcome() decides the boot default
@@ -203,6 +204,26 @@ Registrar::AuthDecision Registrar::admitSecure(
 		return AuthDecision::Challenge;
 	}
 
+	// #512 review (Crew, MEDIUM): the response hash covers auth.uri, not the
+	// Request-URI this request is actually routed on. Without this check one
+	// captured INVITE's credentials authorise a different destination for the
+	// nonce's whole lifetime. RFC 2617 §3.2.2.5: they must be the same URI.
+	// (nc/nonce reuse limits are #525.)
+	{
+		const std::string_view line = data->getHeader();
+		const size_t sp1 = line.find(' ');
+		const size_t sp2 = sp1 == std::string_view::npos ? sp1 : line.find(' ', sp1 + 1);
+		const std::string_view requestUri = sp2 == std::string_view::npos
+			? std::string_view{} : line.substr(sp1 + 1, sp2 - sp1 - 1);
+		if (requestUri.empty() || auth.uri != requestUri)
+		{
+			outRejectReason = "Credentials Not For This Request";
+			_env.log("Secure " + std::string(data->getType()) + " for ext " + ext +
+				": digest uri does not match the Request-URI", true);
+			return AuthDecision::Reject;
+		}
+	}
+
 	// Recompute + constant-time compare. Method is REGISTER.
 	if (!SipDigest::verify(auth, *ha1, std::string(data->getType())))
 	{
@@ -211,7 +232,78 @@ Registrar::AuthDecision Registrar::admitSecure(
 		return AuthDecision::Reject;
 	}
 
+	// Issue #525: the credentials are right, but have they been used before?
+	// With qop=auth each request carries nc, which must rise per nonce. A
+	// repeat is answered with a stale challenge, not a 403: the genuine phone
+	// silently retries with a fresh nonce (it has the password), a replayer
+	// cannot, and no one is locked out or told anything. Legacy RFC 2069
+	// credentials carry no nc and are not checked here (their replay window is
+	// the nonce's 5-minute lifetime, as before).
+	if (!auth.nc.empty())
+	{
+		// #525 review: strict -- an RFC 2617 nc-value is exactly 8 hex digits.
+		bool ncValid = auth.nc.size() == 8;
+		unsigned long nc = 0;
+		for (char c : auth.nc)
+		{
+			const int v = (c >= '0' && c <= '9') ? c - '0'
+				: (c >= 'a' && c <= 'f') ? c - 'a' + 10
+				: (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+			if (v < 0) { ncValid = false; break; }
+			nc = (nc << 4) | static_cast<unsigned long>(v);
+		}
+		if (!ncValid || !noteNonceUse(auth.nonce, static_cast<uint32_t>(nc), std::chrono::steady_clock::now()))
+		{
+			_env.log("Secure " + std::string(data->getType()) + " for ext " + ext +
+				": digest nonce/nc already used, re-challenged (#525)", true);
+			sendChallenge(data, /*stale=*/true);
+			return AuthDecision::Challenge;
+		}
+	}
+
 	return AuthDecision::Accept;
+}
+
+bool Registrar::noteNonceUse(const std::string& nonce, uint32_t nc, std::chrono::steady_clock::time_point now)
+{
+	// validateNonce() has already proved this is one of ours, which always fits;
+	// anything longer is not a shape we issue, so there is nothing to track.
+	if (nonce.size() >= sizeof(NonceUse::nonce)) return true;
+	// Our nonces start with their issue time in hex, up to the '.' (SipDigest.hpp).
+	uint64_t issuedMs = 0;
+	for (char c : nonce)
+	{
+		const int v = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+		if (v < 0) break;
+		issuedMs = (issuedMs << 4) | static_cast<uint64_t>(v);
+	}
+	NonceUse* victim = nullptr;
+	for (NonceUse& u : _nonceUses)
+	{
+		const bool live = u.until > now;
+		if (live && nonce == u.nonce)
+		{
+			if (nc <= u.nc) return false;   // replay: nc must rise
+			u.nc = nc;
+			return true;
+		}
+		// Prefer a dead (expired or never used) slot; else the oldest-issued.
+		if (victim == nullptr) { victim = &u; continue; }
+		if (victim->until > now && (!live || u.issuedMs < victim->issuedMs)) victim = &u;
+	}
+	// Unknown here. If a nonce issued this early could have been evicted while
+	// live, it may already have been used: re-challenge rather than trust it.
+	if (_nonceLiveEvictions > 0 && issuedMs <= _nonceEvictedIssuedMs) return false;
+	if (victim->until > now)
+	{
+		++_nonceLiveEvictions;
+		if (victim->issuedMs > _nonceEvictedIssuedMs) _nonceEvictedIssuedMs = victim->issuedMs;
+	}
+	std::memcpy(victim->nonce, nonce.c_str(), nonce.size() + 1);
+	victim->nc = nc;
+	victim->issuedMs = issuedMs;
+	victim->until = now + std::chrono::milliseconds(SipDigest::kNonceTtlMs);
+	return true;
 }
 
 Registrar::AuthDecision Registrar::admitLearn(
