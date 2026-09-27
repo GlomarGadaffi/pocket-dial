@@ -1564,6 +1564,9 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 			{
 				auto cancelMsg = getMessageFromPool(*data);
 				if (!cancelMsg) continue;   // pool exhausted: skip this target (#101A)
+				// #560: the caller's credential stays here.
+				cancelMsg->removeHeaders("Authorization");
+				cancelMsg->removeHeaders("Proxy-Authorization");
 				std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
 
 				cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
@@ -5516,6 +5519,9 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 				std::string newTo = "To: <sip:" + answeringClient->getNumber() + "@" + serverIpPort + ">";
 				siphdr::appendTagFrom(newTo, originalTo);
 				byeFork->setTo(newTo);
+				// #560: same as the ackFork -- the caller's credential stays here.
+				byeFork->removeHeaders("Authorization");
+				byeFork->removeHeaders("Proxy-Authorization");
 
 				_outbox.emplace_back(answeringClient->getAddress(), std::move(byeFork));
 				}

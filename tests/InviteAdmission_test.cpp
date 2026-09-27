@@ -526,6 +526,12 @@ namespace
 		return creds;
 	}
 
+	// Appended to every in-dialog relay test's credential, so the
+	// find("Authorization:") checks pin the Proxy-Authorization strip too.
+	const std::string kProxyAuth =
+		"Proxy-Authorization: Digest username=\"500\", realm=\"pocketdial\", nonce=\"n560\", "
+		"uri=\"sip:600@server\", response=\"00000000000000000000000000000000\"\r\n";
+
 	std::string lastSentTo600Starting(const Sent& sent, const std::string& start)
 	{
 		std::string out;
@@ -549,7 +555,7 @@ TEST(InviteAdmission, TheRelayedAckCarriesNoCredential)
 	const std::string creds = admitCredentialedCall(h, "ack560");
 	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
 
-	auto ack = makeInvite("ack560", 2, kPcmuOffer, creds);
+	auto ack = makeInvite("ack560", 2, kPcmuOffer, creds + kProxyAuth);
 	ack->setHeader("ACK sip:600@server SIP/2.0");
 	ack->setCSeq("CSeq: 2 ACK");
 	ack->setTo("To: <sip:600@server>;tag=callee560");
@@ -571,7 +577,7 @@ TEST(InviteAdmission, ARelayedReinviteCarriesNoCredential)
 	const std::string creds = admitCredentialedCall(h, "re560");
 	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
 
-	auto reinvite = makeInvite("re560", 3, kPcmuOffer, creds);
+	auto reinvite = makeInvite("re560", 3, kPcmuOffer, creds + kProxyAuth);
 	reinvite->setTo("To: <sip:600@server>;tag=callee560");
 	h.sent.clear();
 	h.handler.handle(reinvite);
@@ -592,7 +598,7 @@ TEST(InviteAdmission, ARelayedUpdateCarriesNoCredential)
 	const std::string creds = admitCredentialedCall(h, "up560");
 	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
 
-	auto update = makeInvite("up560", 3, kPcmuOffer, creds);
+	auto update = makeInvite("up560", 3, kPcmuOffer, creds + kProxyAuth);
 	update->setHeader("UPDATE sip:600@server SIP/2.0");
 	update->setCSeq("CSeq: 3 UPDATE");
 	update->setTo("To: <sip:600@server>;tag=callee560");
@@ -639,4 +645,69 @@ TEST(InviteAdmission, ALearnModeForkDropsUnsolicitedCredentials)
 	const std::string fork = firstSentContaining(h.sent, "INVITE sip:600@");
 	ASSERT_FALSE(fork.empty());
 	EXPECT_EQ(fork.find("Authorization:"), std::string::npos) << fork;
+}
+
+TEST(InviteAdmission, TheBroadcastAckForkCarriesNoCredential)
+{
+	// #560: onAck's 999 branch clones the caller's ACK for the answering phone
+	// (ackFork). A preemptive credential on that ACK must not ride along.
+	Harness h;
+	const std::string callId = "bc560";
+	const std::string body =
+		"v=0\r\no=- 0 0 IN IP4 192.168.7.50\r\ns=-\r\nc=IN IP4 192.168.7.50\r\nt=0 0\r\n" +
+		std::string(kPcmuOffer) + "a=sendrecv\r\n";
+	h.handler.handle(RequestsHandler::getMessageFromPool(
+		"INVITE sip:999@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.7.50:5060;branch=z9hG4bKbc560\r\n"
+		"From: <sip:500@server>;tag=fbc560\r\n"
+		"To: <sip:999@server>\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:500@192.168.7.50:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body,
+		addrFor("192.168.7.50")));
+	const std::string fork = firstSentContaining(h.sent, "INVITE sip:600@");
+	ASSERT_FALSE(fork.empty()) << "999 forks to the other registered phone";
+
+	// 600 answers the fork.
+	auto viaOf = [](const std::string& raw) {
+		const size_t a = raw.find("Via:");
+		return raw.substr(a, raw.find("\r\n", a) - a);
+	};
+	auto fromOf = [](const std::string& raw) {
+		const size_t a = raw.find("From:");
+		return raw.substr(a, raw.find("\r\n", a) - a);
+	};
+	const std::string answer = "v=0\r\no=- 0 0 IN IP4 192.168.7.60\r\ns=-\r\nc=IN IP4 192.168.7.60\r\nt=0 0\r\n" +
+		std::string(kPcmuOffer) + "a=sendrecv\r\n";
+	h.handler.handle(RequestsHandler::getMessageFromPool(
+		"SIP/2.0 200 OK\r\n" + viaOf(fork) + "\r\n" + fromOf(fork) + "\r\n"
+		"To: <sip:600@server>;tag=ans560\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Contact: <sip:600@192.168.7.60:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(answer.size()) + "\r\n\r\n" + answer,
+		addrFor("192.168.7.60")));
+
+	// The caller ACKs the 200, carrying a (preemptive) credential.
+	h.sent.clear();
+	h.handler.handle(RequestsHandler::getMessageFromPool(
+		"ACK sip:999@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.7.50:5060;branch=z9hG4bKbc560a\r\n"
+		"From: <sip:500@server>;tag=fbc560\r\n"
+		"To: <sip:999@server>;tag=ans560\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 1 ACK\r\n"
+		"Authorization: Digest username=\"500\", realm=\"pocketdial\", nonce=\"n560\", "
+		"uri=\"sip:999@server\", response=\"00000000000000000000000000000000\"\r\n" +
+		kProxyAuth +
+		"Content-Length: 0\r\n\r\n",
+		addrFor("192.168.7.50")));
+
+	const std::string relayed = lastSentTo600Starting(h.sent, "ACK ");
+	ASSERT_FALSE(relayed.empty()) << "the 999 ACK is forked to the answering phone";
+	EXPECT_EQ(relayed.find("Authorization:"), std::string::npos) << relayed;
 }
