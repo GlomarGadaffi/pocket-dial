@@ -214,6 +214,7 @@ TEST(NoReplyToResponse, RegisterBeepTryingIsNeverAnsweredAndTheBeepStillComplete
 	const sockaddr_in phone = addrFor("192.168.24.10");
 
 	handler.handle(makeRegister("200", "192.168.24.10"));
+	handler.fireRegisterBeepsForTest();   // #408: sent after the 200 OK, from tick()
 	std::string beep;
 	for (const auto& s : sent)
 		if (sameAddr(s.to, phone) && s.raw.rfind("INVITE sip:200@", 0) == 0) beep = s.raw;
