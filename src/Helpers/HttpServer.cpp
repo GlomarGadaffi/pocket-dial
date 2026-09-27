@@ -567,6 +567,12 @@ void HttpServer::handleClient(int clientSock)
 	}
 
 	HttpRequest req = parseRequest(raw);
+	// Issue #528: the peer address captured above, on EVERY request -- only the
+	// OTA/MoH streaming branch used to set it. Without it the login lockout keyed
+	// every client to the same "" bucket, so one host guessing passwords locked
+	// the real admin out too, and Cisco SPA model-keyed provisioning never ran
+	// its ARP lookup.
+	req.clientIp = peerIp;
 	// Out-param for the two telephony-config routes below, whose slot index is
 	// a URL path segment rather than a form param (see parseTelephonyConfigSlotPath).
 	size_t telSlotIdx = 0;
