@@ -129,6 +129,49 @@ namespace
 	};
 }
 
+namespace
+{
+	// An INVITE naming `fromExt` as its caller, sent from `srcIp` (#497).
+	std::shared_ptr<SipMessage> makeInviteAs(const std::string& fromExt, const std::string& srcIp,
+	                                          const std::string& callId)
+	{
+		std::string body =
+			"v=0\r\no=- 0 0 IN IP4 " + srcIp + "\r\ns=-\r\nc=IN IP4 " + srcIp + "\r\nt=0 0\r\n" +
+			kPcmuOffer + "a=sendrecv\r\n";
+		std::string raw =
+			"INVITE sip:600@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKb" + callId + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=fb" + callId + "\r\n"
+			"To: <sip:600@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + fromExt + "@" + srcIp + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
+	}
+}
+
+TEST(InviteAdmission, ACallFromAnotherAddressThanTheCallerRegisteredFromIsRefused)
+{
+	// #497: 500 registered from .50. The same From, sent from any other host, is
+	// refused -- it must not be forked, and must not reach dial plan or trunk.
+	Harness h;
+	h.handler.handle(makeInviteAs("500", "192.168.7.99", "spoof"));
+	EXPECT_TRUE(anySentContains(h.sent, "SIP/2.0 403 Caller Not Registered From This Address"));
+	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@")) << "a spoofed caller must not ring anyone";
+}
+
+TEST(InviteAdmission, ACallFromTheCallersRegisteredAddressIsAdmitted)
+{
+	// The bound case, through the same builder: only the source differs above.
+	Harness h;
+	h.handler.handle(makeInviteAs("500", "192.168.7.50", "bound"));
+	EXPECT_FALSE(anySentContains(h.sent, "Caller Not Registered From This Address"));
+	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@"));
+}
+
 TEST(InviteAdmission, OfferWithNoRelayableAudioCodecGets488BeforeAnySession)
 {
 	Harness h;
