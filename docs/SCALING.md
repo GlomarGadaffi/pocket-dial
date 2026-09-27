@@ -212,18 +212,14 @@ an out-of-memory abort. Each pool degrades in its own well-behaved way:
   **`503 Service Unavailable`** (see `onInvite()` and the broadcast handler in
   `RequestsHandler.cpp`). The caller hears fast-busy / "service unavailable"
   rather than the call hanging. Existing calls are untouched.
-* **Message pool drained (transient), then hard-stopped.** `getMessageFromPool()`
-  logs `"[WARNING] SIP Message pool exhausted (N total)! Falling back to bounded
-  heap allocation."` (rate-limited to 1-in-100) and serves a one-off
-  `std::make_shared` instead. **This is not an unlimited soft limit.** The heap
-  fallback is capped at `POCKETDIAL_MSG_HEAP_FALLBACK_MAX` = 8 concurrent
-  allocations (`PoolConfig.hpp:87-89`); past that `getMessageFromPool()` returns
-  `nullptr`, logs `"Fallback budget spent — DROPPING packets."`
-  (`SipMessagePool.cpp:95-99`, `:134-141`), and the ~20 call sites in
-  `RequestsHandler.cpp` that check it drop the packet and rely on the peer's
-  RFC 3261 §17 retransmit. Shedding load is the intended behaviour at that depth,
-  but it *does* refuse work. An earlier revision of this bullet said it never
-  does. It matters most during a 999 all-page, which transiently needs one message
+* **Message pool drained: refused, no fallback (#409).** `getMessageFromPool()`
+  returns `nullptr` as soon as all `POCKETDIAL_MSG_POOL` slots are in use, logs
+  `"[WARNING] SIP Message pool exhausted (N total)! Refusing (no heap fallback, #409)."`
+  (rate-limited to 1-in-100), and counts it in `/api/status` `msgPoolRefusals`.
+  The call sites in `RequestsHandler.cpp` that check it drop the packet and rely on
+  the peer's RFC 3261 §17 retransmit. The #101A bounded heap fallback (8 messages)
+  is gone: it allocated internal DRAM on the SIP task exactly when it was scarcest.
+  Shedding load is the intended behaviour at that depth, but it *does* refuse work. It matters most during a 999 all-page, which transiently needs one message
   per paged target; see §6.
 
 All three counters surface on the dashboard (`getClientCount()`,

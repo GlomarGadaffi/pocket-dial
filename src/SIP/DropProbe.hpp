@@ -39,7 +39,7 @@ public:
 	{
 		Invalid,   // null or !isValidMessage() (SEC-02 / #265), or a 0-byte datagram
 		Rate,      // !ipAllowed() || !allowPacket() (#38)
-		NoPool,    // #443 S1: message pool and its bounded heap fallback spent
+		NoPool,    // #443 S1: message pool spent (no heap fallback since #409)
 		Oversize,  // #444: longer than UdpServer::BUFFER_SIZE -- refused, never parsed
 	};
 	static constexpr std::size_t kReasonCount = 4;
