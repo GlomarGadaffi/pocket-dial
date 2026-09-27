@@ -371,7 +371,7 @@ jobs:
           ctest --test-dir build/tests --output-on-failure
 
       - name: Self-test the test-count checker (#467)
-        run: python3 -m unittest discover -s tests/tools -p 'test_check_test_count.py' -v
+        run: python3 -m unittest discover -s tests/tools -p 'test_*.py' -v
 
       - name: Verify Test Count (floor = tests/EXPECTED_MIN_TESTS + tests/min_tests.d)
         run: |
@@ -595,49 +595,14 @@ jobs:
 
       # Issue #489: how full is the app slot? The build fails outright only once
       # the image no longer fits; this fails EARLIER, while there is still room to
-      # ship a fix. Reads the partition table this leg actually built (so the
-      # constrained 4 MB layout and the 16 MB one are each checked against their
-      # own slots), and compares the smallest app partition with SipServer.bin.
-      # The two thresholds live here and nowhere else.
+      # ship a fix. The script reads the partition table this leg actually built,
+      # so each layout is checked against its own slots. The constrained 4 MB
+      # layout, which is the one near its limit, is built and checked by the
+      # build-constrained job below (this matrix never builds that profile).
       - name: App slot margin (issue #489)
         run: |
           . $IDF_PATH/export.sh > /dev/null
-          python3 - <<'PY'
-          import os, subprocess, sys
-          FAIL_BELOW = 32 * 1024   # fail: a fix-forward OTA may no longer fit
-          WARN_BELOW = 64 * 1024   # warn: time to trim or change the layout
-          app = os.path.getsize("build/SipServer.bin")
-          gen = os.path.join(os.environ["IDF_PATH"], "components", "partition_table", "gen_esp32part.py")
-          csv = subprocess.run([sys.executable, gen, "build/partition_table/partition-table.bin"],
-                               capture_output=True, text=True, check=True).stdout
-          def num(s):
-              s = s.strip()
-              mult = 1
-              if s[-1:] in ("K", "k"): mult, s = 1024, s[:-1]
-              elif s[-1:] in ("M", "m"): mult, s = 1024 * 1024, s[:-1]
-              return int(s, 0) * mult
-          slots = []
-          for line in csv.splitlines():
-              f = [x.strip() for x in line.split(",")]
-              if len(f) >= 5 and not f[0].startswith("#") and f[1] == "app":
-                  slots.append((f[0], num(f[4])))
-          if not slots:
-              print("::error::no app partition found in the built partition table (issue #489)")
-              sys.exit(1)
-          name, slot = min(slots, key=lambda s: s[1])
-          free = slot - app
-          line = ("app slot: SipServer.bin %d B in %s (%d B): %d B free (%.1f %%)"
-                  % (app, name, slot, free, 100.0 * free / slot))
-          print(line)
-          with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as summary:
-              summary.write("- " + line + "\n")
-          if free < FAIL_BELOW:
-              print("::error::app slot margin %d B is below the %d B floor (issue #489)" % (free, FAIL_BELOW))
-              sys.exit(1)
-          if free < WARN_BELOW:
-              print("::warning::app slot margin %d B is below %d B: trim or change the layout (issue #489)"
-                    % (free, WARN_BELOW))
-          PY
+          python3 tools/ci/app_slot_margin.py build
 
       - name: Upload ESP32-S3 Ethernet Firmware Bundle
         if: matrix.target-chip == 'esp32s3' && matrix.sip-transport == 'eth'
@@ -757,6 +722,32 @@ jobs:
           idf.py set-target esp32s3
           idf.py -D SIP_TRANSPORT=eth -D PD_ETH_BOARD=waveshare build
           echo "Compiles for esp32s3 / eth / PD_ETH_BOARD=waveshare (compile-only; not hardware-verified)."
+
+  # Issue #489: the resource-constrained profile (classic esp32, lan8720, no PSRAM,
+  # partitions_4mb.csv with 0x1E0000 app slots). No other job builds it -- the
+  # matrix's lan8720 leg uses the 16 MB defaults -- and it is the one layout near
+  # its limit, so it is built here and its app-slot margin checked. The recipe
+  # is main/CMakeLists.txt's SIP_CONSTRAINED comment.
+  build-constrained:
+    name: Build Firmware (esp32 / lan8720 / SIP_CONSTRAINED, 4 MB) + app-slot margin
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build the constrained profile
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 \
+                 -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
+                 set-target esp32 build
+
+      - name: App slot margin (issue #489)
+        run: |
+          . $IDF_PATH/export.sh > /dev/null
+          python3 tools/ci/app_slot_margin.py build
 
   # Job 3: Security & Guardrails
   # Explicitly validates that no accidental GCP or outside deployment files are configured.
