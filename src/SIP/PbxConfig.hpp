@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cctype>
 
+#include "EmergencyCall.hpp"   // Issue #550: classifyEmergencyDial() for isReservedExtension()
 #include "PoolConfig.hpp"
 
 namespace pbx
@@ -240,10 +241,18 @@ namespace pbx
 	// it and got "parked" instead of "ringing" (voicemail's own internal
 	// dummy-dest label "700" is a different thing: it's never dialed, just
 	// a session's bookkeeping identity, so that one is fine as-is).
+	// Issue #550: the WHOLE emergency set is reserved, not just the bare codes.
+	// classifyEmergencyDial() also takes a trunk-access-prefixed 9911/9933; an
+	// extension registered (or a DID mapped) under one of those and then
+	// dialing 555 had a real anchor dial it -- no EMERGENCY log, no Kari's Law
+	// notification. Every validator that calls this helper (REGISTER via
+	// isReservedOrPstnAor, forwards, ring groups, dial rules, voicemail, DID map)
+	// now refuses them too.
 	inline bool isReservedExtension(std::string_view ext)
 	{
 		return ext == "777" || ext == "999" || ext == "888" || ext == "555" ||
-			ext == "440" || ext == "911" || ext == "933" || ext == "796";
+			ext == "440" || ext == "911" || ext == "933" || ext == "796" ||
+			classifyEmergencyDial(ext).isEmergency;
 	}
 
 	// True iff `aor` "looks like a direct PSTN number" rather than an internal
