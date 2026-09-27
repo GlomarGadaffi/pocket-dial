@@ -52,6 +52,9 @@ struct PbxEnv
 
 	// Append to the deferred log queue (flushed off-lock).
 	virtual void log(std::string msg, bool isError = false) = 0;
+	// Issue #450: the DTMF factory-reset door wipes the SD voicemail archive, as
+	// the HTTP door does. Not pure: a test env with no archive has nothing to wipe.
+	virtual void wipeVoicemail() {}
 
 	// The server's active local IP (resolved once at construction) and SIP port —
 	// the identity the machines stamp into Via/From/Contact headers they build.

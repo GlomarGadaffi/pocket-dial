@@ -1034,23 +1034,29 @@ namespace
 	}
 
 	// Caller must hold state().mutex.
-	void eraseCredentialLocked()
+	// #450: reports success. A key that is already absent counts as erased; a
+	// namespace that was never created means there is nothing to erase.
+	bool eraseCredentialLocked()
 	{
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		nvs_handle_t h;
-		if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK)
+		const esp_err_t oe = nvs_open("storage", NVS_READWRITE, &h);
+		if (oe == ESP_ERR_NVS_NOT_FOUND) return true;
+		if (oe != ESP_OK) return false;
+		static const char* const kKeys[] = {
+			"admin_user", "admin_pw_salt", "admin_pw_hash", "admin_pin_salt",
+			"admin_pin_hash", "owner_user", "owner_pw_salt", "owner_pw_hash"};
+		bool ok = true;
+		for (const char* key : kKeys)   // every key attempted even after a failure
 		{
-			nvs_erase_key(h, "admin_user");
-			nvs_erase_key(h, "admin_pw_salt");
-			nvs_erase_key(h, "admin_pw_hash");
-			nvs_erase_key(h, "admin_pin_salt");
-			nvs_erase_key(h, "admin_pin_hash");
-			nvs_erase_key(h, "owner_user");
-			nvs_erase_key(h, "owner_pw_salt");
-			nvs_erase_key(h, "owner_pw_hash");
-			nvs_commit(h);
-			nvs_close(h);
+			const esp_err_t e = nvs_erase_key(h, key);
+			if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) ok = false;
 		}
+		if (nvs_commit(h) != ESP_OK) ok = false;
+		nvs_close(h);
+		return ok;
+#else
+		return true;
 #endif
 	}
 }
@@ -1582,12 +1588,20 @@ namespace AdminAuth
 		}
 	}
 
-	void clearCredential()
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	namespace { bool g_failNextErase = false; }
+	void failNextEraseForTest() { g_failNextErase = true; }
+#endif
+
+	bool clearCredential()
 	{
 		AuthState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
 
-		eraseCredentialLocked();
+		bool erased = eraseCredentialLocked();
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+		if (g_failNextErase) { g_failNextErase = false; erased = false; }
+#endif
 
 		s.username.clear();
 		s.pwSalt.clear();
@@ -1614,6 +1628,7 @@ namespace AdminAuth
 			sess.csrf.clear();
 			sess.expiresAtMs = 0;
 		}
+		return erased;
 	}
 
 	std::string sessionCsrf(const std::string& token)
