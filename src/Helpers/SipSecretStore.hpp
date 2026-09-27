@@ -65,6 +65,12 @@ namespace SipSecretStore
 	// (empty / too long / unsafe chars), an empty secret, or persistence failure.
 	bool setSecret(const std::string& ext, const std::string& plaintextSecret);
 
+	// Store a ready-made HA1 for `ext` (32 lowercase hex chars) -- the config
+	// import's restore path (#482: HA1s travel only inside the password-
+	// encrypted export block). Same validation, persistence and cache update as
+	// setSecret(); false on an invalid extension or a malformed HA1.
+	bool setHa1(const std::string& ext, const std::string& ha1);
+
 	// Generate a fresh random secret for `ext`, store its HA1, and return the
 	// PLAINTEXT secret (the only chance to read it — only HA1 is persisted) so the
 	// caller can show/deliver it. Returns std::nullopt on failure.
@@ -79,6 +85,11 @@ namespace SipSecretStore
 	// Remove `ext`'s secret. Returns true if it existed and was removed (or if the
 	// erase otherwise succeeded). No-op-safe on an unknown extension.
 	bool clearSecret(const std::string& ext);
+
+	// Remove EVERY extension's secret, including one the index lost track of --
+	// the factory-reset path (#363). On ESP it wipes the whole "sipauth"
+	// namespace, which holds nothing else, and drops the RAM HA1 cache.
+	bool clearAll();
 
 	// All extensions that currently have a secret. Order is unspecified.
 	std::vector<std::string> securedExtensions();

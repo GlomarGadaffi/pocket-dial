@@ -12,6 +12,7 @@
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "esp_log.h"
+#include "sdkconfig.h"        // CONFIG_SPIRAM: allocClip()'s placement (#466)
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include <lwip/inet.h>
@@ -218,6 +219,51 @@ long HoldMusic::txErrors() const
 #endif
 }
 
+namespace
+{
+	std::atomic<uint32_t> s_clipRefusals{0};
+}
+
+HoldMusic::ClipPlacement HoldMusic::clipPlacement(size_t bytes, bool havePsram, size_t internalCap)
+{
+	if (havePsram) return ClipPlacement::Psram;
+	return bytes <= internalCap ? ClipPlacement::Internal : ClipPlacement::RefusedOverCap;
+}
+
+uint8_t* HoldMusic::allocClip(size_t bytes)
+{
+	uint8_t* buf = nullptr;
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+#if defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
+	const bool havePsram = true;
+#else
+	const bool havePsram = false;
+#endif
+	switch (clipPlacement(bytes, havePsram, POCKETDIAL_CLIP_INTERNAL_MAX_BYTES))
+	{
+		case ClipPlacement::Psram:
+			buf = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+			break;
+		case ClipPlacement::Internal:
+			buf = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
+			break;
+		case ClipPlacement::RefusedOverCap:
+			break;
+	}
+#else
+	// Host: no PSRAM/internal split to police; the policy itself is tested
+	// through clipPlacement().
+	buf = static_cast<uint8_t*>(std::malloc(bytes));
+#endif
+	if (buf == nullptr) s_clipRefusals.fetch_add(1, std::memory_order_relaxed);
+	return buf;
+}
+
+uint32_t HoldMusic::clipRefusals()
+{
+	return s_clipRefusals.load(std::memory_order_relaxed);
+}
+
 bool HoldMusic::loadClip(const std::string& path)
 {
 	std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -263,15 +309,13 @@ bool HoldMusic::loadClip(const std::string& path)
 	//     the largest clip anyone might ever upload, permanently, on a device
 	//     where most users load none at all.
 	//
-	// PSRAM by preference: the clip is large, long-lived and only ever read
-	// sequentially, which is exactly what PSRAM is good at. Internal RAM is scarce
-	// and needed for task stacks and the SIP pools.
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(dataLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-	if (buf == nullptr) buf = static_cast<uint8_t*>(heap_caps_malloc(dataLen, MALLOC_CAP_8BIT));
-#else
-	uint8_t* buf = static_cast<uint8_t*>(std::malloc(dataLen));
-#endif
+	// PSRAM only, where the board has it: the clip is large, long-lived and only
+	// ever read sequentially, which is exactly what PSRAM is good at, and
+	// internal RAM is #328's binding constraint. Issue #466: this used to fall
+	// back to internal DRAM silently when PSRAM was short; allocClip() refuses
+	// and counts instead (and caps it on builds with no PSRAM at all).
+	uint8_t* buf = allocClip(dataLen);
+	_lastLoadRefused.store(buf == nullptr, std::memory_order_relaxed);
 	if (buf == nullptr)
 	{
 		std::fclose(f);

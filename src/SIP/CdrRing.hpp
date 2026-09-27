@@ -55,6 +55,8 @@ public:
 	// Newest-first copy of the ring, for the dashboard snapshot. Caller holds
 	// _mutex.
 	std::vector<CallDetailRecord> snapshot() const;
+	// #463: the same, refilled in place (zero allocations when unchanged).
+	void snapshotInto(std::vector<CallDetailRecord>& out) const;
 
 	// *69: extension of the last party that called `calleeExt`, walking
 	// newest to oldest; empty string if none found. Caller holds _mutex.
@@ -96,6 +98,12 @@ public:
 	static void serializeForPersist(
 		const std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS>& ring,
 		size_t head, size_t count, CdrRingBlob& out);
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#458): every slot, live or not, so a test can pin that
+	// clearAll() leaves none of them holding a record.
+	const std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS>& slotsForTest() const { return _ring; }
+#endif
 
 private:
 	void persist();

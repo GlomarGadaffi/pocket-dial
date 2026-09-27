@@ -403,11 +403,10 @@ extern "C" void app_main(void)
 
     // ── Task 1B: install non-blocking log queue + drain task ────────────────
     LogQueue::create();
-    // Remote logging (#183). loadFromNvs() is a no-op when syslog_host is unset,
-    // and send() returns immediately while unconfigured, so an unprovisioned board
-    // pays nothing but the branch. Registered before the task starts so no line
-    // drained during boot is missed once a host IS configured.
-    Syslog::loadFromNvs();
+    // Remote logging (#183): the tee is registered here, before the drain task starts;
+    // send() returns immediately until a host is configured, so an unprovisioned board
+    // pays nothing but the branch. The saved host itself is loaded further down, after
+    // esp_netif_init() -- see there (#508).
     LogQueue::setTee(log_tee_to_syslog);
     // 3072, up from 2048: the tee adds an lwip send() to this task's deepest path.
     // The high-water mark logged by the task itself is what justifies this number
@@ -422,6 +421,12 @@ extern "C" void app_main(void)
     // recoverable, retry-with-backoff layer is the UDP socket in UdpServer, not this.
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Remote logging (#183, #508): load the saved syslog host only now. configure()
+    // opens its UDP socket immediately, and before esp_netif_init() has started lwIP's
+    // tcpip thread that socket() asserts ("Invalid mbox" in tcpip_send_msg_wait_sem):
+    // every restart after a host was saved became a boot loop.
+    Syslog::loadFromNvs();
 
     // ── Task 1D: read topology from NVS ─────────────────────────────────────
     uint8_t topology_mode = TOPOLOGY_INFRA;  // default: INFRA (AP + DHCP)

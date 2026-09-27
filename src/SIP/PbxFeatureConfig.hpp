@@ -58,6 +58,8 @@ public:
 	// RequestsHandler::refreshPbxConfigSnapshot() and tick()'s periodic full
 	// rebuild. Caller holds _mutex — this performs no locking of its own.
 	std::vector<std::string> dndSnapshot() const;
+	// #463: the same, refilled in place (zero allocations when unchanged).
+	void dndSnapshotInto(std::vector<std::string>& out) const;
 
 	// ── Voicemail (Issue #246) ───────────────────────────────────────────────
 	// Per-extension "voicemail enabled" flag. Structurally identical to DND
@@ -79,7 +81,17 @@ public:
 	// Lock-already-held mutation core (Issue #77), same sharing rationale as
 	// setDndLocked above (onDtmfInfo's *73/*72NNNN CLASS codes).
 	void setForwardLocked(const std::string& extension, const std::string& trigger, const std::string& target);
+	// Issue #450: factory reset. Empties the forward table (its targets are
+	// external phone numbers, i.e. PII) and erases its NVS key. Caller holds
+	// _mutex. Returns false if the NVS erase failed; RAM is cleared regardless.
+	bool clearForwardsLocked();
+	// Issue #450, poll #454 (A): factory reset erases the E911 settings too --
+	// they are PII (the site address) and, after a reset, most likely the
+	// PREVIOUS site's. Callers surface "E911 not configured" instead of
+	// gating anything (a reset board must still dial 911). Caller holds _mutex.
+	bool clearE911Locked();
 	std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwardsSnapshot() const;
+	void forwardsSnapshotInto(std::vector<std::tuple<std::string, std::string, std::string, std::string>>& out) const;
 
 	// ── Ring / hunt groups ────────────────────────────────────────────────────
 	// Internal lookup from onInvite(). Caller MUST already hold _mutex.
@@ -98,6 +110,7 @@ public:
 		const std::string& location);
 	const pbx::E911Config& e911Config() const { return _e911; }
 	std::vector<std::tuple<std::string, std::string, std::string>> ringGroupsSnapshot() const;
+	void ringGroupsSnapshotInto(std::vector<std::tuple<std::string, std::string, std::string>>& out) const;
 
 	// ── Paging zones (980–989) ────────────────────────────────────────────────
 	const pbx::PageZone* findPageZone(const std::string& extension) const;
@@ -112,6 +125,7 @@ public:
 	void setDialRule(const std::string& pattern, const std::string& action, const std::string& target,
 		int stripDigits = 0);
 	std::vector<std::tuple<std::string, std::string, std::string, int>> dialRulesSnapshot() const;
+	void dialRulesSnapshotInto(std::vector<std::tuple<std::string, std::string, std::string, int>>& out) const;
 	// Read-only access for CallForker::routeDialPlan() (CallForker.hpp) to call
 	// .empty()/.match() on directly.
 	const pbx::DialPlan& dialPlan() const { return _dialPlan; }
