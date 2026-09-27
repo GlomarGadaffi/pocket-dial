@@ -76,14 +76,22 @@ login() {
   local u="${PD_OTA_USER:-}" p="${PD_OTA_PASS:-}" resp role
   [ -n "$u" ] || { read -r -p "owner username: " u; }
   [ -n "$p" ] || { read -r -s -p "owner password: " p; echo; }
+  u=${u%$'\r'}; p=${p%$'\r'}   # a CRLF pipe (e.g. from Windows) must not become part of the credential
   # Form body built and url-encoded off the command line, fed on stdin.
   resp=$(PD_U="$u" PD_P="$p" python3 -c 'import os,urllib.parse; print(urllib.parse.urlencode({"username":os.environ["PD_U"],"password":os.environ["PD_P"]}),end="")' \
          | curl -s -m 10 -c "$JAR" -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @- "$BASE/api/admin/login")
   unset p PD_OTA_PASS
   role=$(json_get "$resp" role); CSRF=$(json_get "$resp" csrf)
   [ "$(json_get "$resp" authenticated)" = "true" ] || stop "login refused ($(json_get "$resp" error))"
-  [ "$role" = "owner" ] || stop "logged in as '$role'; OTA needs the OWNER"
-  log "logged in (owner)"
+  case "$role" in
+    owner) log "logged in (owner)" ;;
+    # #173's no-owner-yet fallback: until an owner account exists, a sysop
+    # satisfies the owner gate. The BOARD enforces it -- if an owner does
+    # exist, the upload answers 403, which every stage treats as a STOP with
+    # nothing written.
+    sysop) log "logged in as sysop: OTA works only if no owner account exists yet (the board decides; 403 = stop)" ;;
+    *) stop "unexpected role '$role'" ;;
+  esac
 }
 
 # upload <file> -> prints the HTTP code; body saved to $TMP/up.json
@@ -174,9 +182,57 @@ stage3() {
   log "stage 3 OK: $EXPECT runs from $2 and is valid. Phone re-registration: watch clientCount (can lag by the registration expiry)."
 }
 
+stage4() {
+  # The rollback test. --image is a PROBE (built with -D POCKETDIAL_OTA_ROLLBACK_PROBE=1:
+  # never marks itself valid, restarts itself ~60 s after boot while pending).
+  # Expected: probe boots pending on the other slot -> restarts itself -> the
+  # bootloader aborts it and boots back into the running image. Run only after
+  # stage 3 has PROVEN rollback (pendingVerify seen).
+  [ -f "$IMAGE" ] || stop "--image required (the probe image)"
+  [ -n "$EXPECT" ] || stop "--expect-version required (the probe's app-desc version)"
+  log "== stage 4: rollback test with probe $(basename "$IMAGE") ($EXPECT)"
+  need_idle
+  local keepVer; keepVer=$(json_get "$(status)" version)
+  [ -n "$keepVer" ] || stop "the running image reports no version: cannot prove where it lands"
+  login
+  local code o t0 sawProbe=0 up
+  code=$(upload "$IMAGE")
+  [ "$code" = DRY ] && { log "dry-run: would reboot into the probe and expect a return to $RUN0 ($keepVer)"; return; }
+  log "upload -> HTTP $code $(head -c 200 "$TMP/up.json")"
+  [ "$code" = 200 ] || stop "probe upload not accepted (HTTP $code)"
+  code=$(curl -s -m 10 -o "$TMP/rb.json" -w '%{http_code}' -b "$JAR" -H "X-CSRF: $CSRF" -X POST "$BASE/api/ota/reboot")
+  [ "$code" = 200 ] || stop "reboot refused (HTTP $code); the probe stays staged -- stage 3 the good image back"
+  CSRF=""
+  t0=$(date +%s)
+  while [ $(( $(date +%s) - t0 )) -lt "$TIMEOUT" ]; do
+    o=$(curl -s -m 1 "$BASE/api/ota/status" 2>/dev/null)
+    if [ -n "$o" ]; then
+      if [ "$(json_get "$o" running)" = "$NEXT0" ] && [ "$sawProbe" = 0 ]; then
+        sawProbe=1
+        log "probe running on $NEXT0 after $(( $(date +%s) - t0 ))s: pendingVerify=$(json_get "$o" pendingVerify)"
+        [ "$(json_get "$o" pendingVerify)" = "true" ] || stop "probe booted VALID (no rollback state) -- it will keep running; stage 3 the good image back"
+      fi
+      if [ "$sawProbe" = 1 ] && [ "$(json_get "$o" running)" = "$RUN0" ]; then
+        log "back on $RUN0 after $(( $(date +%s) - t0 ))s -> ROLLED BACK: $o"
+        break
+      fi
+    fi
+    sleep 0.2
+  done
+  [ "$sawProbe" = 1 ] || stop "never saw the probe running within ${TIMEOUT}s"
+  [ "$(json_get "$(ota_status)" running)" = "$RUN0" ] || stop "did not roll back to $RUN0 within ${TIMEOUT}s -- needs recovery"
+  sleep 3
+  up=$(status)
+  log "final: $(ota_status) version=$(json_get "$up" version) uptime=$(json_get "$up" uptime)"
+  [ "$(json_get "$up" version)" = "$keepVer" ] || stop "running '$(json_get "$up" version)', expected the kept image '$keepVer'"
+  [ "$(json_get "$(ota_status)" pendingVerify)" = "false" ] || stop "the kept image is pending again"
+  log "stage 4 OK: the probe never marked itself valid, restarted, and the bootloader ROLLED BACK to $keepVer on $RUN0"
+}
+
 case "$STAGE" in
   0) stage0 ;;
   2) stage2 ;;
   3) stage3 ;;
-  *) echo "stage must be 0, 2 or 3" >&2; exit 2 ;;
+  4) stage4 ;;
+  *) echo "stage must be 0, 2, 3 or 4" >&2; exit 2 ;;
 esac
