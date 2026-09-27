@@ -27,6 +27,7 @@
 #include <functional>
 #include <iostream>
 #include <unordered_map>
+#include <map>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -483,6 +484,16 @@ public:
 	// as sensitive as the credential tables above and lives in its own NVS
 	// namespace, "cdrlog" — see CdrRing::clearAll()).
 	void clearAllCallHistory();
+	// Issue #450: /api/factory-reset. Empties the call-forward table and erases
+	// it from NVS (forward targets are external numbers). False if the erase failed.
+	bool clearAllForwards();
+	// Issue #450 / poll #454: /api/factory-reset erases the E911 settings. False
+	// if the NVS erase failed. Leaves "E911 not configured" showing.
+	bool clearE911Config();
+	// True when a 911 call would notify someone on site. Lock-free (an atomic
+	// kept in step with every load/set/clear), so /api/status reads it on the
+	// HTTP thread without touching _mutex.
+	bool isE911Configured() const { return _e911Configured.load(std::memory_order_acquire); }
 
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint
@@ -695,6 +706,9 @@ private:
 	// call rather than more surface to this file.
 	EmergencyNotifier _e911Notifier{*this};
 
+	// PbxEnv hook for the DTMF factory-reset door (#450).
+	void wipeVoicemail() override { wipeAllVoicemail(); }
+
 	// ── PbxEnv: shared-infrastructure surface for the extracted machines ───────
 	// RequestsHandler is the PbxEnv implementation each decomposed state machine
 	// (TransactionLayer, ...) talks back through. All three assume the caller
@@ -768,7 +782,7 @@ private:
 		return buildServerBye(destExt, destAddr, callId, fromHeader, toHeader);
 	}
 	void forEachSessionInvolving(std::string_view aor,
-		const std::function<void(const std::string&, const Session&, DialogRole)>& fn) const override
+		FunctionRef<void(const std::string&, const Session&, DialogRole)> fn) const override
 	{
 		for (const auto& [callID, session] : _sessions)
 		{
@@ -916,6 +930,10 @@ public:
 
 	// Dashboard/status accessors.
 	bool     holdMusicLoaded()  const { return _holdMusic.isLoaded(); }
+	// Issue #466: a valid clip that was refused a buffer (see HoldMusic::
+	// allocClip) -- MoH is then silence, the greeting absent.
+	bool     holdMusicClipRefused()     const { return _holdMusic.lastLoadRefused(); }
+	bool     voicemailGreetingRefused() const { return _greetingRefused.load(std::memory_order_relaxed); }
 	unsigned holdMusicSeconds() const { return _holdMusic.clipSeconds(); }
 	unsigned holdMusicListeners() const { return _holdMusic.listenerCount(); }
 	// Issue #328: L2-bypass vs socket-fallback health for the hold-music
@@ -1188,6 +1206,11 @@ public:
 	// with no writer task needed.
 	void drainVoicemailFlush(vmarchive::Sink& sink)
 	{
+		// #450: held for the whole drain so a factory reset's clear+wipe cannot
+		// land between a pop and its write (which would put a pre-reset message
+		// back on the card after the wipe). Leaf lock: never held with _mutex taken
+		// inside it.
+		std::lock_guard<std::mutex> drainLock(_vmDrainWipeMutex);
 		vmarchive::drainAll(_vmFlushQueue, sink, _vmStagingBufs,
 			[this](const vmarchive::QueuedRecording& rec) {
 				if (rec.stagingSlot >= 0 && rec.stagingSlot < static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS))
@@ -1199,6 +1222,30 @@ public:
 			});
 	}
 	size_t voicemailFlushQueueDepthForTest() const { return _vmFlushQueue.size(); }
+	// Issue #450: factory reset. Drops every queued recording (so none is written
+	// after the wipe) and wipes `sink`, under the same lock drainVoicemailFlush()
+	// holds. Blocking SD I/O: HTTP task, or the DTMF door right before restart.
+	void wipeVoicemailArchive(vmarchive::Sink& sink)
+	{
+		std::lock_guard<std::mutex> drainLock(_vmDrainWipeMutex);
+		_vmFlushQueue.clear();
+		for (auto& busy : _vmFlushBusy) busy.store(false, std::memory_order_release);
+		sink.wipe();
+	}
+	// The archive this build actually has: the production SD sink on
+	// PD_ETH_HAS_SD builds, a test-installed one on host, otherwise nothing.
+	void wipeAllVoicemail()
+	{
+		vmarchive::Sink* sink = _vmSinkForTest;
+#if defined(PD_ETH_HAS_SD)
+		if (!sink) sink = &vmarchive::productionSink();
+#endif
+		if (sink) wipeVoicemailArchive(*sink);
+	}
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only: the sink wipeAllVoicemail() uses on host. Not owned.
+	void setVoicemailSinkForTest(vmarchive::Sink* sink) { _vmSinkForTest = sink; }
+#endif
 	// Runs every slot's pending retrieval SD job (list/read/delete), a
 	// no-op for any slot not Pending. The ESP+PD_ETH_HAS_SD writer task
 	// (spawned in the constructor, same task drainVoicemailFlush() above
@@ -1616,8 +1663,10 @@ private:
 		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2);
 
 	// Issue #402: record a request's CSeq on its dialog's session, if it has one
-	// and `source` is a party on it. Caller holds _mutex.
-	void noteDialogCSeq(const std::string& callID, uint32_t cseq, const sockaddr_in& source);
+	// and `source` is a party on it. Returns the session found (or nullptr).
+	// Caller holds _mutex.
+	std::shared_ptr<Session> noteDialogCSeq(std::string_view callID, uint32_t cseq,
+		const sockaddr_in& source);
 
 	// Verify that the in-dialog request comes from a peer recorded at dialog setup
 	// (source IP match). Returns false → respond 403 Forbidden. Caller holds _mutex.
@@ -1732,6 +1781,17 @@ private:
 	// returned for it (see drainVoicemailFlush() below) -- i.e. exactly the
 	// window findFreeVoicemailSlot() must refuse to reuse the slot in.
 	std::atomic<bool> _vmFlushBusy[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
+	// #450: excludes a factory-reset wipe from a drain in progress (see
+	// drainVoicemailFlush()). Plain member, no allocation.
+	std::mutex _vmDrainWipeMutex;
+	// See isE911Configured(). Written under _mutex (or single-threaded in the
+	// constructor) by refreshE911ConfiguredLocked().
+	std::atomic<bool> _e911Configured{false};
+	void refreshE911ConfiguredLocked()
+	{
+		_e911Configured.store(!_cfg.e911Config().notifyExts.empty(), std::memory_order_release);
+	}
+	vmarchive::Sink* _vmSinkForTest = nullptr;
 
 	// ── Retrieval SD-I/O job machine (Issue #246, retrieval slice 3/3) ──────
 	// listMessages()/readMessage()/markDeleted() are all SD I/O and must
@@ -1843,6 +1903,7 @@ private:
 	// correct default: the constructor's own loadVoicemailGreeting() call is
 	// the only OTHER writer, and that path always heap-allocates.
 	bool _vmGreetingClipOwned = true;
+	std::atomic<bool> _greetingRefused{false};   // #466: valid greeting, refused a buffer
 	void loadVoicemailGreeting();
 
 	// The boot-selected provider TYPE (cached alongside _anchorClient itself —
@@ -1878,7 +1939,12 @@ private:
 
 	// RequestsHandler.hpp: Issues #24 and #28 resolved.
 	std::unordered_map<std::string, std::function<void(std::shared_ptr<SipMessage> request)>> _handlers;
-	std::unordered_map<std::string, std::shared_ptr<Session>>   _sessions;
+	// std::map with a transparent comparator, not unordered_map (#464): C++17 has
+	// heterogeneous lookup only for ordered containers, so this is what lets
+	// getSession(string_view) find a session WITHOUT building a std::string key --
+	// which it used to do up to three times per request. At POCKETDIAL_MAX_SESSIONS
+	// entries, O(log n) string compares cost nothing measurable.
+	std::map<std::string, std::shared_ptr<Session>, std::less<>> _sessions;
 
 	// Call-IDs of attended-transfer splice re-INVITEs (issue #131) pending their
 	// 200 OK -> ACK, so handleTransferOk() can find them (same bounded-vector

@@ -1,0 +1,2 @@
+# Server-originated BYE / declined NOTIFY CSeq sites, #422
+4

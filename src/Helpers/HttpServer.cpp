@@ -9,7 +9,9 @@
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive wipe on factory reset
 #include "AdminAuth.hpp"
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
+#include "FactoryReset.hpp"    // Issue #363: the secrets factory reset must erase
 #include "DeviceConfig.hpp"
+#include <cstdio>   // std::snprintf: the factory-reset error body (#450)
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
 #include "ArpLookup.hpp"
@@ -19,6 +21,8 @@
 // live on both platforms and can be asserted by a host test rather than only
 // eyeballed on hardware.
 #include "DmaFramePool.hpp"
+#include "HoldMusic.hpp"       // Issue #466: clipRefusals() on /api/status
+#include "PsramAllocator.hpp"  // Issue #466: psram::internalFallbacks() on /api/status
 #include "index_html.h"
 #include "IPHelper.hpp"
 #include "UrlEncode.hpp"
@@ -41,9 +45,11 @@
 #include "PoolConfig.hpp"    // POCKETDIAL_PARK_TIMEOUT_SEC (informational export field)
 #include "JsonReader.hpp"    // strict, dependency-free JSON reader for /api/config/import
 #include <cctype>
+#include <cstdio>        // snprintf: sendStaticHtml's allocation-free head (#410)
 #include <cstdlib>
 #include <mutex>
 #include <cstring>
+#include <string_view>
 #include <sstream>
 #include <iostream>
 #include <chrono>
@@ -59,6 +65,9 @@
 #endif
 
 #if defined(ESP_PLATFORM)
+// #450 (poll #455): the factory reset ends with a whole-NVS-partition erase.
+#include "nvs_flash.h"
+#include "esp_log.h"
 // OTA reboot path needs esp_restart() + a deferred-restart FreeRTOS task. These
 // are available on EVERY ESP transport (WiFi, Ethernet, display), not just
 // POCKETDIAL_HAS_WIFI, so guard them on the platform rather than the transport.
@@ -989,8 +998,9 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "GET" && req.path == "/api/config/export")
 	{
-		// Plaintext-only export. Read, but genuinely sensitive (digest secrets,
-		// dial plan, MAC bindings) -- sysop-gated, not public like /api/status.
+		// Plaintext-only export. Read, but genuinely sensitive (which extensions
+		// are secured, the dial plan, MAC bindings -- never a digest HA1, #482) --
+		// sysop-gated, not public like /api/status.
 		if (requireAdmin(clientSock, req, false))
 		{
 			sendApiConfigExport(clientSock, /*withSecrets=*/false, "");
@@ -1008,17 +1018,35 @@ void HttpServer::handleClient(int clientSock)
 		if (requireAdmin(clientSock, req, true,
 			withSecrets ? AdminAuth::Role::Owner : AdminAuth::Role::Sysop))
 		{
-			sendApiConfigExport(clientSock, withSecrets, password);
+			// #484 review finding 4: the encrypted block now holds a
+			// password-equivalent for every secured extension, and PBKDF2 buys
+			// little against an offline guess of a short password.
+			static constexpr size_t kMinExportPasswordLen = 12;
+			if (withSecrets && password.size() < kMinExportPasswordLen)
+			{
+				sendResponse(clientSock, 400, "Bad Request", "application/json",
+				             "{\"error\":\"the export password must be at least 12 characters\"}");
+			}
+			else
+			{
+				sendApiConfigExport(clientSock, withSecrets, password);
+			}
 		}
 	}
 	else if (req.method == "POST" && req.path == "/api/config/import")
 	{
-		// Sysop-level: #173 lists factory reset / export-with-secrets / OTA
-		// upload as the three owner-only actions, and restoring config is not
-		// one of them -- it gets its own confirm-before-overwrite interlock
-		// instead (checked inside the handler), matching "sysop gets add/
-		// change with a confirm-before-overwrite interlock".
-		if (requireAdmin(clientSock, req, true))
+		// A plaintext-only restore is sysop-level: restoring config is not one of
+		// #173's owner-only actions, and it has its own confirm-before-overwrite
+		// interlock (checked inside the handler). But a non-empty `password`
+		// means the encrypted secretsEnc block will be applied -- digest HA1s,
+		// the Wi-Fi password, the AP PSK -- and that is exactly what
+		// export-with-secrets reads, so it takes the SAME owner gate. The
+		// block authenticates the password, not who made the file: without this,
+		// a sysop could seal their own HA1 for any extension offline and take it
+		// over (#484 review, Crew finding 1).
+		const bool withSecrets = !getFormParam(req.body, "password").empty();
+		if (requireAdmin(clientSock, req, true,
+			withSecrets ? AdminAuth::Role::Owner : AdminAuth::Role::Sysop))
 		{
 			sendApiConfigImport(clientSock, req.body);
 		}
@@ -1189,20 +1217,137 @@ HttpServer::HttpRequest HttpServer::parseRequest(const std::string& raw)
 	return req;
 }
 
-void HttpServer::sendResponseWithHeader(int sock, int statusCode, const std::string& statusText,
-                              const std::string& contentType, const std::string& body,
-                              const std::string& extraHeader)
+// --- Security headers, emitted centrally so no endpoint can forget them ---
+// One constant, written verbatim by sendResponseWithHeader(), by
+// buildResponseHead() and by the streamed static pages (sendStaticHtml, #410),
+// so no two paths can drift.
+//
+// The dashboard is a single self-contained page with inline <script>/<style>
+// and no external origins, so the policy can be this tight: nothing loads
+// from anywhere, the page cannot be framed, and XHR/fetch is same-origin.
+// Cache-Control: responses carry call metadata, the CSRF token and (on
+// /api/pcap) raw SIP bytes; none of it should sit in a shared browser cache or
+// on disk. Referrer-Policy is same-origin, not no-referrer: the Referer header
+// stays available as a same-origin signal, and nothing here is linked
+// off-device anyway. Deliberately NO Strict-Transport-Security: the dashboard
+// is plain HTTP on a LAN appliance; pinning HSTS here would make the host
+// unreachable over http:// forever with no way for a user to override it.
+static constexpr char kSecurityHeaders[] =
+	"Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; "
+	"style-src 'unsafe-inline'; img-src data:; connect-src 'self'; "
+	"form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n"
+	"X-Frame-Options: DENY\r\n"
+	"X-Content-Type-Options: nosniff\r\n"
+	"Cache-Control: no-store\r\n"
+	"Referrer-Policy: same-origin\r\n";
+
+size_t HttpServer::headPieces(SendPiece* v, HeadNumbers& nums, int statusCode,
+                              std::string_view statusText, std::string_view contentType,
+                              size_t contentLength, std::string_view extraHeader)
 {
-	// Assembled through an ostringstream exactly as before the streamed coredump
-	// download (#382) split buildResponseHead() out. A plain `head += body`
-	// made CodeQL newly trace emailConfigJson() -- whose secrets leave only as
-	// hasPassword/hasGsaKey booleans (#207) -- to this send as "cleartext
-	// transmission of sensitive information" (a false positive on PR #394).
-	// Keeping main's shape keeps this change out of every other route.
-	std::ostringstream resp;
-	resp << buildResponseHead(statusCode, statusText, contentType, body.size(), extraHeader) << body;
-	const std::string data = resp.str();
-	sendAllBytes(sock, data.data(), data.size());
+	// Only the two numbers are formatted; every other range is sent from where
+	// it already lives. Byte-identical to the pre-#410 ostringstream head
+	// (HttpSendPath_test compares against buildResponseHead() itself).
+	// No Access-Control-Allow-Origin header: wildcard CORS would allow any
+	// browser tab on the same AP to fire side-effecting POSTs without a preflight.
+	const int ns = std::snprintf(nums.status, sizeof(nums.status), "HTTP/1.1 %d ", statusCode);
+	const int nl = std::snprintf(nums.length, sizeof(nums.length), "\r\nContent-Length: %zu\r\n", contentLength);
+	if (ns <= 0 || static_cast<size_t>(ns) >= sizeof(nums.status) ||
+	    nl <= 0 || static_cast<size_t>(nl) >= sizeof(nums.length))
+		return 0;   // cannot happen for an int and a size_t; never send a torn head
+	static constexpr char kTypeKey[] = "\r\nContent-Type: ";
+	static constexpr char kCrlf[] = "\r\n";
+	static constexpr char kTail[] = "Connection: close\r\n\r\n";
+	size_t n = 0;
+	const auto add = [&](const char* p, size_t len) {
+		if (len == 0) return;   // sendAllPieces() never sees an empty range
+		if (n >= kHeadPieces) { n = kHeadPieces + 1; return; }   // cannot happen (9 add() calls); poisons the result below
+		v[n].iov_base = const_cast<char*>(p);
+		v[n].iov_len = len;
+		++n;
+	};
+	add(nums.status, static_cast<size_t>(ns));
+	add(statusText.data(), statusText.size());
+	add(kTypeKey, sizeof(kTypeKey) - 1);
+	add(contentType.data(), contentType.size());
+	add(nums.length, static_cast<size_t>(nl));
+	add(kSecurityHeaders, sizeof(kSecurityHeaders) - 1);
+	if (!extraHeader.empty())
+	{
+		add(extraHeader.data(), extraHeader.size());
+		add(kCrlf, sizeof(kCrlf) - 1);
+	}
+	add(kTail, sizeof(kTail) - 1);
+	return n <= kHeadPieces ? n : 0;   // never overrun a caller's v[kHeadPieces (+1)]
+}
+
+void HttpServer::sendResponseWithHeader(int sock, int statusCode, std::string_view statusText,
+                              std::string_view contentType, std::string_view body,
+                              std::string_view extraHeader)
+{
+	// #410 phase 2: every route's response goes out IN PLACE. This used to
+	// build the head in an ostringstream, copy it and the whole body into a
+	// second one, then copy that again with str() -- two full body copies plus
+	// the head per response, all from internal DRAM for anything under the
+	// 16 KB SPIRAM_MALLOC_ALWAYSINTERNAL line (#328), i.e. nearly every JSON
+	// body, /api/status polling included. Now the head is headPieces()'s
+	// ranges and the body is one more, all in one scatter-gather write. The
+	// frame is kept small on purpose -- this runs on the 4 KB http_conn stack
+	// for every route (#405): the ranges are built once, as the iovec array
+	// sendmsg() takes, and trimmed in place on a short write.
+	//
+	// (CodeQL flagged a `head += body` shape here as "cleartext transmission"
+	// of emailConfigJson() on PR #394 -- a false positive: its secrets leave
+	// only as hasPassword/hasGsaKey booleans, #207.)
+	HeadNumbers nums;
+	SendPiece v[kHeadPieces + 1];
+	size_t n = headPieces(v, nums, statusCode, statusText, contentType, body.size(), extraHeader);
+	if (n == 0) return;
+	if (!body.empty())
+	{
+		v[n].iov_base = const_cast<char*>(body.data());
+		v[n].iov_len = body.size();
+		++n;
+	}
+	sendAllPieces(sock, v, n);
+}
+
+size_t HttpServer::consumeSent(SendPiece* v, size_t first, size_t n, size_t sent)
+{
+	// Whole ranges first, then into a partial one.
+	while (first < n && sent >= v[first].iov_len)
+	{
+		sent -= v[first].iov_len;
+		++first;
+	}
+	if (first < n && sent > 0)
+	{
+		v[first].iov_base = static_cast<char*>(v[first].iov_base) + sent;
+		v[first].iov_len -= sent;
+	}
+	return first;
+}
+
+bool HttpServer::sendAllPieces(int sock, SendPiece* v, size_t n)
+{
+	size_t first = 0;
+	while (first < n)
+	{
+#if defined _WIN32 || defined _WIN64
+		// No sendmsg() on Winsock; host-only, so one range per send() will do.
+		const int sent = ::send(sock, static_cast<const char*>(v[first].iov_base),
+		                        static_cast<int>(v[first].iov_len), 0);
+#else
+		struct msghdr msg;
+		std::memset(&msg, 0, sizeof(msg));   // msg_name must be null for TCP (lwIP checks)
+		msg.msg_iov = v + first;
+		msg.msg_iovlen = static_cast<decltype(msg.msg_iovlen)>(n - first);
+		const ssize_t sent = ::sendmsg(sock, &msg, 0);
+#endif
+		if (sent <= 0) return false;
+		first = consumeSent(v, first, n, static_cast<size_t>(sent));
+	}
+	return true;
 }
 
 bool HttpServer::sendAllBytes(int sock, const char* ptr, size_t remaining)
@@ -1221,9 +1366,9 @@ bool HttpServer::sendAllBytes(int sock, const char* ptr, size_t remaining)
 	return true;
 }
 
-// Status line + every header + the blank line, for a body of contentLength
-// bytes. Shared by sendResponseWithHeader() and the streamed coredump download
-// so the security headers below stay emitted in exactly one place.
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+// The pre-#410 head, kept verbatim as the tests' reference: status line +
+// every header + the blank line, for a body of contentLength bytes.
 std::string HttpServer::buildResponseHead(int statusCode, const std::string& statusText,
                               const std::string& contentType, size_t contentLength,
                               const std::string& extraHeader)
@@ -1232,27 +1377,7 @@ std::string HttpServer::buildResponseHead(int statusCode, const std::string& sta
 	resp << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n";
 	resp << "Content-Type: " << contentType << "\r\n";
 	resp << "Content-Length: " << contentLength << "\r\n";
-	// No Access-Control-Allow-Origin header: wildcard CORS would allow any
-	// browser tab on the same AP to fire side-effecting POSTs without a preflight.
-
-	// --- Security headers, emitted centrally so no endpoint can forget them ---
-	// The dashboard is a single self-contained page with inline <script>/<style>
-	// and no external origins, so the policy can be this tight: nothing loads
-	// from anywhere, the page cannot be framed, and XHR/fetch is same-origin.
-	resp << "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; "
-	        "style-src 'unsafe-inline'; img-src data:; connect-src 'self'; "
-	        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n";
-	resp << "X-Frame-Options: DENY\r\n";
-	resp << "X-Content-Type-Options: nosniff\r\n";
-	// Responses carry call metadata, the CSRF token and (on /api/pcap) raw SIP
-	// bytes. None of it should sit in a shared browser cache or on disk.
-	resp << "Cache-Control: no-store\r\n";
-	// same-origin, not no-referrer: the Referer header stays available as a
-	// same-origin signal, and nothing here is linked off-device anyway.
-	resp << "Referrer-Policy: same-origin\r\n";
-	// Deliberately NO Strict-Transport-Security. The dashboard is plain HTTP on
-	// a LAN appliance; pinning HSTS here would make the host unreachable over
-	// http:// forever with no way for a user to override it.
+	resp << kSecurityHeaders;
 	if (!extraHeader.empty())
 	{
 		resp << extraHeader << "\r\n";
@@ -1261,11 +1386,64 @@ std::string HttpServer::buildResponseHead(int statusCode, const std::string& sta
 	resp << "\r\n";
 	return resp.str();
 }
+#endif
 
-void HttpServer::sendResponse(int sock, int statusCode, const std::string& statusText,
-                              const std::string& contentType, const std::string& body)
+void HttpServer::sendResponse(int sock, int statusCode, std::string_view statusText,
+                              std::string_view contentType, std::string_view body)
 {
 	sendResponseWithHeader(sock, statusCode, statusText, contentType, body, "");
+}
+
+// The placeholder every static page carries where the session's CSRF token goes.
+static constexpr char kCsrfMarker[] = "__PD_CSRF__";
+
+void HttpServer::sendStaticHtml(int sock, const char* const* parts, const size_t* sizes,
+                                size_t count, const std::string& token)
+{
+	// Where is the marker? Scanned per call over the flash-resident parts with
+	// string_view (no allocation), never cached: a page edit that moves the
+	// marker to another part must not silently ship a literal "__PD_CSRF__" and
+	// no token -- every form POST would then fail CSRF with no diagnostic. Only
+	// the FIRST occurrence is replaced, exactly as the old find()/replace() did;
+	// HttpStaticPages_test pins that every page carries exactly one. A marker
+	// MUST NOT straddle two parts -- a re-split of index_html.h may fall at any
+	// byte, and a straddled marker would be sent literally. That is not
+	// structural: EveryPageCarriesExactlyOneCsrfMarker enforces it.
+	const std::string_view marker(kCsrfMarker, sizeof(kCsrfMarker) - 1);
+	size_t markPart = count, markAt = 0, total = 0;
+	for (size_t i = 0; i < count; ++i)
+	{
+		total += sizes[i];
+		if (markPart == count)
+		{
+			const size_t at = std::string_view(parts[i], sizes[i]).find(marker);
+			if (at != std::string_view::npos) { markPart = i; markAt = at; }
+		}
+	}
+	const size_t contentLength = (markPart == count)
+		? total : total - marker.size() + token.size();
+
+	// The head: the same builder every response uses (headPieces), in one write.
+	{
+		HeadNumbers nums;
+		SendPiece v[kHeadPieces];
+		const size_t n = headPieces(v, nums, 200, "OK", "text/html; charset=utf-8", contentLength, "");
+		if (n == 0 || !sendAllPieces(sock, v, n)) return;
+	}
+
+	// The body, straight from flash. Only the marker's part is split.
+	for (size_t i = 0; i < count; ++i)
+	{
+		if (i != markPart)
+		{
+			if (!sendAllBytes(sock, parts[i], sizes[i])) return;
+			continue;
+		}
+		if (!sendAllBytes(sock, parts[i], markAt)) return;
+		if (!sendAllBytes(sock, token.data(), token.size())) return;
+		const size_t after = markAt + marker.size();
+		if (!sendAllBytes(sock, parts[i] + after, sizes[i] - after)) return;
+	}
 }
 
 void HttpServer::sendHtml(int sock, const HttpRequest& req)
@@ -1273,14 +1451,15 @@ void HttpServer::sendHtml(int sock, const HttpRequest& req)
 	// index_html.h stores the page as independent const char[] parts (each
 	// its own flash-resident literal, never concatenated at compile time --
 	// see that header's comment for why) rather than one combined constant.
-	// This is the one place that ever pays for assembling them into a single
-	// std::string, exactly like it did before that split existed.
-	std::string page;
+	// Since #410 they are never assembled at all: sendStaticHtml() writes each
+	// part to the socket in place. Assembling them used to cost ~116 KB per load,
+	// three times over (the page, then sendResponse's two body copies).
+	const char* parts[CGA_INDEX_HTML_PART_COUNT];
+	size_t sizes[CGA_INDEX_HTML_PART_COUNT];
+	for (size_t i = 0; i < CGA_INDEX_HTML_PART_COUNT; ++i)
 	{
-		size_t total = 0;
-		for (size_t i = 0; i < CGA_INDEX_HTML_PART_COUNT; ++i) total += CGA_INDEX_HTML_PARTS[i].size;
-		page.reserve(total);
-		for (size_t i = 0; i < CGA_INDEX_HTML_PART_COUNT; ++i) page.append(CGA_INDEX_HTML_PARTS[i].data, CGA_INDEX_HTML_PARTS[i].size);
+		parts[i] = CGA_INDEX_HTML_PARTS[i].data;
+		sizes[i] = CGA_INDEX_HTML_PARTS[i].size;
 	}
 
 	// Bind the page to this session's CSRF token. It is rendered INTO the
@@ -1293,14 +1472,7 @@ void HttpServer::sendHtml(int sock, const HttpRequest& req)
 	// is no session yet, and the login response carries the token the page then
 	// uses without needing a reload.
 	const std::string token = AdminAuth::sessionCsrf(sessionToken(req));
-	const std::string marker = "__PD_CSRF__";
-	const size_t at = page.find(marker);
-	if (at != std::string::npos)
-	{
-		page.replace(at, marker.size(), token);
-	}
-
-	sendResponse(sock, 200, "OK", "text/html; charset=utf-8", page);
+	sendStaticHtml(sock, parts, sizes, CGA_INDEX_HTML_PART_COUNT, token);
 }
 
 // Helper: JSON-escape a string. Beyond the five named C0 escapes, JSON (RFC
@@ -1485,6 +1657,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	std::vector<std::tuple<std::string, std::string, std::string, int>> parkedCalls;
 	uint64_t packets = 0;
 	uint64_t dropped = 0;
+	bool e911Configured = false;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate = 0;
 
@@ -1501,6 +1674,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		parkedCalls = handler->getParkedCalls();
 		packets = handler->getPacketsProcessed();
 		dropped = handler->getPacketsDropped();   // Issue #38
+		e911Configured = handler->isE911Configured();   // #450
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate = handler->getDroppedRate();
 	}
@@ -1528,6 +1702,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
+	// #450 / poll #454: false after a factory reset until the E911 notify list is
+	// set again. The dashboard shows a banner; nothing is gated on it.
+	json << "\"e911Configured\":" << (e911Configured ? "true" : "false") << ",";
 	// Issue #430: the same drops by reason (they sum to packetsDropped, modulo a
 	// race between the loads), then the most recent ones. Like the roster below
 	// (#207), the per-drop source addresses and bytes need a session; the counts
@@ -1810,6 +1987,18 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << ",\"mohSockErrors\":";
 	if (mohSockErr < 0) json << "null"; else json << mohSockErr;
 	json << "}";
+
+	// Issue #466: memory placement. clipRefusals counts clip buffers refused
+	// (PSRAM short on a PSRAM board, or over POCKETDIAL_CLIP_INTERNAL_MAX_BYTES
+	// on one without); the two flags say which clip is now absent -- MoH plays
+	// silence, deposits record without a greeting. psramFallbacks counts
+	// PSRAM-preferred buffers (the jitter rings) that PSRAM could not hold and
+	// internal DRAM had to -- always 0 on a board without PSRAM.
+	json << ",\"memory\":{\"clipRefusals\":" << HoldMusic::clipRefusals()
+	     << ",\"mohClipRefused\":" << ((handler && handler->holdMusicClipRefused()) ? "true" : "false")
+	     << ",\"greetingRefused\":" << ((handler && handler->voicemailGreetingRefused()) ? "true" : "false")
+	     << ",\"psramFallbacks\":" << psram::internalFallbacks().load(std::memory_order_relaxed)
+	     << "}";
 
 	json << "}";
 
@@ -2167,18 +2356,30 @@ void HttpServer::sendApiCoreDump(int sock)
 			"{\"error\":\"coredump read failed\"}");
 		return;
 	}
-	const std::string head = buildResponseHead(200, "OK", "application/octet-stream", info.size,
-		"Content-Disposition: attachment; filename=\"pocket-dial-coredump.bin\"");
-	if (!sendAllBytes(sock, head.data(), head.size())) return;
-	for (uint32_t off = 0;;)
+	// The head and the first chunk go out together, in place (#410): no
+	// std::string head any more -- this was the last one built.
 	{
-		if (!sendAllBytes(sock, reinterpret_cast<const char*>(buf), len)) return;
-		off += static_cast<uint32_t>(len);
-		if (off >= info.size) return;
+		HeadNumbers nums;
+		SendPiece v[kHeadPieces + 1];
+		size_t n = headPieces(v, nums, 200, "OK", "application/octet-stream", info.size,
+			"Content-Disposition: attachment; filename=\"pocket-dial-coredump.bin\"");
+		if (n == 0) return;
+		if (len > 0)
+		{
+			v[n].iov_base = buf;
+			v[n].iov_len = len;
+			++n;
+		}
+		if (!sendAllPieces(sock, v, n)) return;
+	}
+	for (uint32_t off = static_cast<uint32_t>(len); off < info.size;)
+	{
 		len = std::min(kChunk, static_cast<size_t>(info.size - off));
 		// A mid-stream failure can no longer change the status line; stopping
 		// short of Content-Length is what tells the client the body is bad.
 		if (!CoreDumpStore::read(off, buf, len)) return;
+		if (!sendAllBytes(sock, reinterpret_cast<const char*>(buf), len)) return;
+		off += static_cast<uint32_t>(len);
 	}
 }
 
@@ -3541,7 +3742,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP
 	// (NVS) and host (in-memory).
-	AdminAuth::clearCredential();
+	const bool adminErased = AdminAuth::clearCredential();
 	// Also drop ap_secure / ap_psk / cfgseed_gen. Clearing the seed generation is
 	// deliberate: the next boot re-applies whatever the flasher wrote, so a
 	// factory reset returns the board to how it was FLASHED rather than to a
@@ -3584,15 +3785,30 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// documented "save always replaces" path, so it overwrites every trunk_*
 	// key including the secret.
 	//
-	// (smtp_pass and gsa_key in the same namespace are the identical
-	// pre-existing gap and are NOT addressed here -- issue #363; fixing them
-	// is a separate change with its own test.)
-	TrunkConfigStore::save(TrunkConfigStore::Config{});
+	const bool trunkErased = TrunkConfigStore::save(TrunkConfigStore::Config{});
+	// Issue #363: every other stored secret this function does not name --
+	// smtp_pass/gsa_key, every extension's digest HA1, the last coredump. The
+	// enumeration and the reasons live in FactoryReset.hpp.
+	const bool secretsErased = FactoryReset::eraseStoredSecrets();
 
+	bool forwardsErased = true;
+	bool e911Erased = true;
+	bool tapiErased = true;     // #456 review: the carrier OAuth client_secret lives here
+	bool didmapErased = true;   // #456 review: the DID table is PII
+	bool wifiErased = true;     // #456 review: wifi_pass etc. (radio builds only; true elsewhere)
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
-		handler->clearAllTelephonyConfig();
-		handler->clearAllDidMappings();
+		// Both return "" on success, else the persist error (#456 review: these
+		// results used to be discarded, so a failure still answered 200 "ok").
+		tapiErased = handler->clearAllTelephonyConfig().empty();
+		// #450: call-forward targets are external phone numbers (PII), in "pbxcfg",
+		// which nothing above reaches.
+		forwardsErased = handler->clearAllForwards();
+		// Poll #454 (A): the E911 settings are PII and, after a reset, likely the
+		// previous site's. Erased; /api/status then shows e911Configured:false and
+		// boot logs a WARNING. Nothing is gated -- 911 still routes out.
+		e911Erased = handler->clearE911Config();
+		didmapErased = handler->clearAllDidMappings().empty();
 		handler->clearAllCallHistory();
 		// Push the now-empty trunk config into the running engine so the trunk
 		// goes down immediately rather than at the next reboot.
@@ -3623,6 +3839,12 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// uses, so calling it here is safe. No-op on every build without an SD
 	// archive installed (see cdrarchive::wipeAll()'s doc comment).
 	cdrarchive::wipeAll();
+	// #450: the SD voicemail archive (recordings, greetings, index), same
+	// policy and same no-_mutex HTTP-task context as the CDR archive above.
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		handler->wipeAllVoicemail();
+	}
 	//
 	// The DTMF admin menu's OWN factory-reset path (*<PIN>#999#1,
 	// DtmfFeatureCodes.cpp) does not call this function -- it runs
@@ -3638,17 +3860,56 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// The ONLY genuinely radio-specific work in this handler. It stays gated on the
 	// transport (not the platform) for a second reason beyond the keys themselves:
 	// nvs.h/nvs_flash.h are included under POCKETDIAL_HAS_WIFI alone (top of file),
-	// so nothing outside this block may touch NVS directly.
+	// so nothing outside this block may touch NVS directly -- except the
+	// whole-partition erase in the restart task at the end (#450), which uses
+	// nvs_flash.h from the ESP_PLATFORM include block.
+	// #456 review: every erase is checked; NOT_FOUND (never set) is success.
 	nvs_handle_t nvs_handle;
-	if (nvs_open("storage", NVS_READWRITE, &nvs_handle) == ESP_OK) {
-		nvs_erase_key(nvs_handle, "wifi_mode");
-		nvs_erase_key(nvs_handle, "wifi_ssid");
-		nvs_erase_key(nvs_handle, "wifi_pass");
-		nvs_erase_key(nvs_handle, "decayed");
-		nvs_commit(nvs_handle);
+	const esp_err_t wifiOpen = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+	if (wifiOpen == ESP_OK) {
+		for (const char* key : {"wifi_mode", "wifi_ssid", "wifi_pass", "decayed"})
+		{
+			const esp_err_t e = nvs_erase_key(nvs_handle, key);
+			if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) wifiErased = false;
+		}
+		if (nvs_commit(nvs_handle) != ESP_OK) wifiErased = false;
 		nvs_close(nvs_handle);
+	} else if (wifiOpen != ESP_ERR_NVS_NOT_FOUND) {
+		wifiErased = false;
 	}
 #endif
+	// #437 review: a secret-store erase that FAILED must not be reported as a
+	// completed reset. The operator is about to hand this board on believing its
+	// credentials are gone. The board still restarts: the admin credential is
+	// already cleared above, so staying up half-reset helps nobody, and the reset
+	// can be run again once setup completes. (DeviceConfig::clearAll() still
+	// returns void; its result is Pal's #441.)
+	if (!adminErased || !trunkErased || !secretsErased || !forwardsErased || !e911Erased ||
+		!tapiErased || !didmapErased || !wifiErased)
+	{
+		// #450: one fixed format, filled on the stack -- no string building on the
+		// HTTP task (#284). "failed" names each store, so the operator knows what
+		// may still be in flash. Worst case 298 B of 384 (#456 review: tapi,
+		// didmap and wifi added).
+		char body[384];
+		const int n = std::snprintf(body, sizeof(body),
+			"{\"status\":\"error\",\"failed\":{\"admin\":%s,\"trunk\":%s,\"secrets\":%s,\"forwards\":%s,\"e911\":%s,"
+			"\"tapi\":%s,\"didmap\":%s,\"wifi\":%s},"
+			"\"message\":\"Factory reset INCOMPLETE: the stores marked true under failed could not be erased. "
+			"Rebooting anyway; run the factory reset again after setup.\"}",
+			adminErased ? "false" : "true", trunkErased ? "false" : "true",
+			secretsErased ? "false" : "true", forwardsErased ? "false" : "true",
+			e911Erased ? "false" : "true", tapiErased ? "false" : "true",
+			didmapErased ? "false" : "true", wifiErased ? "false" : "true");
+		// A truncated or failed format must never ship as half a JSON object.
+		static constexpr const char* kFallback =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: one or more stores could "
+			"not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
+		const bool formatted = n > 0 && static_cast<size_t>(n) < sizeof(body);
+		sendResponse(sock, 500, "Internal Server Error", "application/json", formatted ? body : kFallback);
+	}
+	else
+	{
 	// Every build that reaches this line has completed the wipe above, so every
 	// build has to say so. This used to answer 200 only under POCKETDIAL_HAS_WIFI
 	// and drop eth/lan8720 into a 501 "factory reset not available on desktop" --
@@ -3673,14 +3934,41 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"message\":\"Factory reset. Restart the process to complete.\"}");
 #endif
+	}
 #if defined(ESP_PLATFORM)
 	// Guarded on the platform, not the transport: esp_restart() and the deferred
 	// restart task exist on every ESP build (see the include block at the top of
 	// this file, which already makes exactly this distinction for the OTA path).
-	xTaskCreate([](void*) {
+	// #450, poll #455 (A): end the same way the DTMF door does -- erase the WHOLE
+	// NVS partition, then restart immediately. nvs_erase_key() above leaves the
+	// old bytes readable in flash until page GC; nvs_flash_erase() takes the
+	// pages. The per-key erases stay and are still reported: they are what the
+	// response can speak to, and this is the backstop. Done in the restart task,
+	// AFTER the response is sent and with nothing between the erase and the
+	// restart, because every open NVS handle in other tasks is invalid from
+	// here on. Keep-list checked on poll #455: nothing that must survive lives in
+	// the nvs partition (cfgseed, prompts, coredump, otadata and phy_init are their
+	// own partitions; a fresh boot re-runs PHY calibration, which is harmless).
+	// 4096, not 2048 (#456 review): nvs_flash_erase()'s worst static chain is
+	// ~1,920 B, which left too little for the lambda and an interrupt frame, and
+	// an overflow here would panic mid-erase -- the half-reset state.
+	if (xTaskCreate([](void*) {
+		vTaskDelay(pdMS_TO_TICKS(1000));
+		if (nvs_flash_erase() != ESP_OK)
+		{
+			ESP_LOGE("factory_reset", "nvs_flash_erase failed -- per-key erases stand, old NVS bytes may remain");
+		}
+		esp_restart();
+	}, "restart_task", 4096, NULL, 5, NULL) != pdPASS)
+	{
+		// The reply has gone out and the per-key erases are done; without the task
+		// there is no whole-partition erase, but the board must still restart
+		// rather than stay up half-reset. Not erased here: this is the http_conn
+		// stack, already deep (#458).
+		ESP_LOGE("factory_reset", "restart task not created -- restarting without the whole-NVS erase");
 		vTaskDelay(pdMS_TO_TICKS(1000));
 		esp_restart();
-	}, "restart_task", 2048, NULL, 5, NULL);
+	}
 #endif
 }
 
@@ -4101,6 +4389,14 @@ void HttpServer::sendApiAdminLogout(int sock, const HttpRequest& req)
 // ── Config export/import (issue #186) ─────────────────────────────────────
 namespace
 {
+	// #484 review finding 5: wipe key material and HA1-bearing buffers once used.
+	// volatile, so the compiler cannot drop the stores as dead.
+	void secureWipe(void* p, size_t n)
+	{
+		volatile unsigned char* v = static_cast<volatile unsigned char*>(p);
+		while (n--) *v++ = 0;
+	}
+
 	std::string toHexLocal(const uint8_t* data, size_t len)
 	{
 		static const char* d = "0123456789abcdef";
@@ -4201,22 +4497,22 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	}
 	pt << "],";
 
-	// Per-extension digest secrets (HA1 -- see SipSecretStore.hpp: this IS
-	// the persisted, plaintext-equivalent secret; there is no separate
-	// original password stored anywhere to export instead). Matches #186's
-	// field list verbatim ("per-extension digest secrets" is named as an
-	// always-plaintext field). EXPORT ONLY -- see gap 1 above.
-	pt << "\"extensionSecrets\":[";
+	// Issue #482: WHICH extensions are secured -- names only, the
+	// secretSet-not-secret contract. Their HA1s are plaintext-EQUIVALENT (an
+	// HA1 alone answers any digest challenge for that extension), so they
+	// travel ONLY inside the password-encrypted `secretsEnc` block below, never
+	// here: this part is served to any sysop and is also the encrypted
+	// export's readable `plaintext` member. (#186's field list named them as
+	// always-plaintext; that is the choice #482 reverses.)
+	pt << "\"securedExtensions\":[";
 	{
 		bool first = true;
 		for (const auto& ext : SipSecretStore::securedExtensions())
 		{
-			auto ha1 = SipSecretStore::getHa1(ext);
-			if (!ha1.has_value()) continue;
+			if (!SipSecretStore::hasSecret(ext)) continue;
 			if (!first) pt << ",";
 			first = false;
-			pt << "{\"extension\":\"" << jsonEscape(ext)
-			   << "\",\"ha1\":\"" << jsonEscape(*ha1) << "\"}";
+			pt << "\"" << jsonEscape(ext) << "\"";
 		}
 	}
 	pt << "],";
@@ -4402,8 +4698,25 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 				}
 			}
 		}
+		gated << "]";
+		// #482: the per-extension digest secrets (HA1s) live HERE and only here,
+		// so a restore can bring secured extensions back (SipSecretStore::setHa1)
+		// without ever putting them in the readable part of the file.
+		gated << ",\"extensionSecrets\":[";
+		{
+			bool first = true;
+			for (const auto& ext : SipSecretStore::securedExtensions())
+			{
+				auto ha1 = SipSecretStore::getHa1(ext);
+				if (!ha1.has_value()) continue;
+				if (!first) gated << ",";
+				first = false;
+				gated << "{\"extension\":\"" << jsonEscape(ext)
+				      << "\",\"ha1\":\"" << jsonEscape(*ha1) << "\"}";
+			}
+		}
 		gated << "]}";
-		const std::string gatedPlaintext = gated.str();
+		std::string gatedPlaintext = gated.str();
 
 		uint8_t salt[AdminAuth::kKdfSaltBytes];
 		uint8_t nonce[AdminAuth::kGcmNonceBytes];
@@ -4421,6 +4734,8 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 		// from two different exports, or against a tampered plaintext
 		// section, without failing authentication on import.
 		AdminAuth::aesGcmSeal(key, nonce, plaintextJson, gatedPlaintext, ct);
+		secureWipe(key, sizeof(key));
+		secureWipe(&gatedPlaintext[0], gatedPlaintext.size());
 
 		out << ",\"secretsEnc\":{\"kdf\":\"pbkdf2-sha256\""
 		    << ",\"iter\":" << AdminAuth::kExportKdfIterations
@@ -4539,7 +4854,9 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		const std::string ctStr(reinterpret_cast<const char*>(ct.data()), ct.size());
 		const std::string aad = blob.substr(pt->spanStart, pt->spanEnd - pt->spanStart);
 		std::string plaintextOut;
-		if (!AdminAuth::aesGcmOpen(key, nonce.data(), aad, ctStr, plaintextOut))
+		const bool opened = AdminAuth::aesGcmOpen(key, nonce.data(), aad, ctStr, plaintextOut);
+		secureWipe(key, sizeof(key));
+		if (!opened)
 		{
 			sendResponse(sock, 422, "Unprocessable Entity", "application/json",
 			             "{\"error\":\"bad password or corrupted secrets block\"}");
@@ -4547,7 +4864,9 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		}
 
 		std::string innerErr;
-		if (!JsonReader::parse(plaintextOut, secretsValue, innerErr) || !secretsValue.isObject())
+		const bool parsed = JsonReader::parse(plaintextOut, secretsValue, innerErr);
+		if (!plaintextOut.empty()) secureWipe(&plaintextOut[0], plaintextOut.size());
+		if (!parsed || !secretsValue.isObject())
 		{
 			sendResponse(sock, 400, "Bad Request", "application/json",
 			             "{\"error\":\"decrypted secrets block is not valid JSON\"}");
@@ -4565,10 +4884,16 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 	{
 		skipped.push_back("extensions (MAC bindings: no import accessor -- see PR description)");
 	}
+	// #482: digest secrets come back ONLY from the decrypted secretsEnc block
+	// (applied further below). An export from before #482 carried them in the
+	// plaintext part: that file already leaked them, and it is not trusted as
+	// a restore source -- say so instead of silently dropping them.
 	if (!pt->arrayOr("extensionSecrets").empty())
 	{
-		skipped.push_back("extensionSecrets (digest secrets: no import accessor -- see PR description)");
+		skipped.push_back("extensionSecrets (legacy export carries digest secrets in CLEAR -- "
+			"re-export with a password; see #482)");
 	}
+	const size_t securedListed = pt->arrayOr("securedExtensions").size();
 
 	if (handler)
 	{
@@ -4806,12 +5131,63 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 			}
 			applied.push_back("telephonyConfig (baseUrl/clientId/routeDn)");
 		}
+
+		// #482: per-extension digest secrets, restored from the encrypted block
+		// (owner-gated at the route, #484 review finding 1).
+		//
+		// #484 review finding 2: REPLACE means replace. When the file carries an
+		// extensionSecrets list, a secured extension that is NOT in it loses its
+		// secret, so a stale credential cannot survive the restore. Only when the
+		// key is present: an encrypted export from before #482 has no such list,
+		// and must not wipe every secret on the board. The count is capped at the
+		// device's own client capacity, so a crafted file cannot flood the store.
+		const JsonReader::Value* secretsList = secretsValue.find("extensionSecrets");
+		if (secretsList != nullptr && secretsList->isArray())
+		{
+			const size_t cap = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS);
+			size_t restored = 0, rejected = 0, overCap = 0;
+			std::vector<std::string> inFile;
+			for (const auto& e : secretsValue.arrayOr("extensionSecrets"))
+			{
+				if (restored + rejected >= cap) { ++overCap; continue; }
+				const std::string ext = e.stringOr("extension");
+				if (SipSecretStore::setHa1(ext, e.stringOr("ha1"))) { ++restored; inFile.push_back(ext); }
+				else ++rejected;
+			}
+			size_t cleared = 0;
+			for (const auto& ext : SipSecretStore::securedExtensions())
+			{
+				if (std::find(inFile.begin(), inFile.end(), ext) == inFile.end() &&
+					SipSecretStore::clearSecret(ext))
+				{
+					++cleared;
+				}
+			}
+			if (restored > 0)
+				applied.push_back("extensionSecrets (" + std::to_string(restored) + ")");
+			if (cleared > 0)
+				applied.push_back("extensionSecrets cleared (" + std::to_string(cleared) +
+					" secured extension(s) not in the file)");
+			if (rejected > 0)
+				skipped.push_back("extensionSecrets (" + std::to_string(rejected) + " malformed entries)");
+			if (overCap > 0)
+				skipped.push_back("extensionSecrets (" + std::to_string(overCap) +
+					" entries over the device's capacity of " + std::to_string(cap) + ")");
+		}
 	}
 	else if (secretsEncNode)
 	{
 		skipped.push_back(password.empty()
 			? "secretsEnc present but no password supplied"
 			: "secretsEnc present but not applied");
+	}
+	// #482: secured extensions the export named but whose secrets did not come
+	// back (a plaintext-only export, or no password) must be re-provisioned.
+	if (!haveSecrets && securedListed > 0)
+	{
+		skipped.push_back("extensionSecrets (" + std::to_string(securedListed) +
+			" secured extension(s): digest secrets travel only in the password-encrypted "
+			"export -- re-export with a password, or re-set them)");
 	}
 
 	std::ostringstream json;
@@ -5282,31 +5658,62 @@ void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 	             "{\"status\":\"ok\",\"config\":" + trunkConfigJson(cfg) + "}");
 }
 
+// The two standalone setup pages: one flash part each, streamed in place with
+// the CSRF token substituted on the way out (#410). They used to copy the whole
+// page (~7.7 KB / ~10.5 KB) into a std::string -- under the 16 KB
+// SPIRAM_MALLOC_ALWAYSINTERNAL line, so from internal DRAM, #328's constraint.
 void HttpServer::sendTrunkSetupHtml(int sock, const HttpRequest& req)
 {
-	std::string page(PD_HTML_9, sizeof(PD_HTML_9) - 1);
+	const char* parts[] = { PD_HTML_9 };
+	const size_t sizes[] = { sizeof(PD_HTML_9) - 1 };
 	const std::string token = AdminAuth::sessionCsrf(sessionToken(req));
-	const std::string marker = "__PD_CSRF__";
-	const size_t at = page.find(marker);
-	if (at != std::string::npos)
-	{
-		page.replace(at, marker.size(), token);
-	}
-	sendResponse(sock, 200, "OK", "text/html; charset=utf-8", page);
+	sendStaticHtml(sock, parts, sizes, 1, token);
 }
 
 void HttpServer::sendEmailSetupHtml(int sock, const HttpRequest& req)
 {
-	std::string page(PD_HTML_8, sizeof(PD_HTML_8) - 1);
+	const char* parts[] = { PD_HTML_8 };
+	const size_t sizes[] = { sizeof(PD_HTML_8) - 1 };
 	const std::string token = AdminAuth::sessionCsrf(sessionToken(req));
-	const std::string marker = "__PD_CSRF__";
-	const size_t at = page.find(marker);
-	if (at != std::string::npos)
-	{
-		page.replace(at, marker.size(), token);
-	}
-	sendResponse(sock, 200, "OK", "text/html; charset=utf-8", page);
+	sendStaticHtml(sock, parts, sizes, 1, token);
 }
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+void HttpServer::servePageForTest(int sock, int page, const std::string& cookieHeader)
+{
+	HttpRequest req;
+	req.cookie = cookieHeader;
+	if (page == 0)      sendHtml(sock, req);
+	else if (page == 8) sendEmailSetupHtml(sock, req);
+	else if (page == 9) sendTrunkSetupHtml(sock, req);
+}
+
+std::string HttpServer::csrfForTest(const std::string& cookieHeader)
+{
+	HttpRequest req;
+	req.cookie = cookieHeader;
+	return AdminAuth::sessionCsrf(sessionToken(req));
+}
+
+std::string HttpServer::legacyHtmlHeadForTest(size_t len)
+{
+	return buildResponseHead(200, "OK", "text/html; charset=utf-8", len, "");
+}
+
+void HttpServer::sendResponseForTest(int sock, int statusCode, std::string_view statusText,
+                                     std::string_view contentType, std::string_view body,
+                                     std::string_view extraHeader)
+{
+	sendResponseWithHeader(sock, statusCode, statusText, contentType, body, extraHeader);
+}
+
+std::string HttpServer::legacyResponseForTest(int statusCode, const std::string& statusText,
+                                              const std::string& contentType, const std::string& body,
+                                              const std::string& extraHeader)
+{
+	return buildResponseHead(statusCode, statusText, contentType, body.size(), extraHeader) + body;
+}
+#endif
 
 void HttpServer::sendApiMohStatus(int sock)
 {

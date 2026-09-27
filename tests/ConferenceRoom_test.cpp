@@ -32,6 +32,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -361,6 +362,20 @@ TEST(ConferenceRoom, JoinRejectsAnUnusableMediaDestination)
 	EXPECT_LT(room.join("call-a", "101", "127.0.0.1", 0), 0);
 	EXPECT_LT(room.join("", "101", "127.0.0.1", 15001), 0);
 	EXPECT_EQ(room.legCount(), 0);
+}
+
+// Issue #498: tick()'s scratch now lives in the bus, 16-byte aligned for the mix
+// kernels. make_unique is how RequestsHandler builds the room; alignof(ConferenceRoom)
+// being above the target's 8-byte default new alignment is what makes that the
+// aligned operator new.
+TEST(ConferenceRoom, BusIsSixteenByteAlignedWhenBuiltTheWayTheServerBuildsIt)
+{
+	static_assert(alignof(ConferenceRoom) >= 16, "the room must carry the bus's alignment");
+	auto room = std::make_unique<ConferenceRoom>();
+	EXPECT_TRUE(room->busAligned());
+	EXPECT_EQ(reinterpret_cast<std::uintptr_t>(&room->bus()) % 16, 0u);
+	EXPECT_GE(room->join("call-a", "101", "127.0.0.1", 15101), 0)
+		<< "an aligned room must accept a leg";
 }
 
 // ── The single tick driver ───────────────────────────────────────────────────

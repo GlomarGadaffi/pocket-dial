@@ -1,0 +1,2 @@
+# HttpStaticPages_test.cpp: 3 tests (#410 phase 1, PR #438)
+3

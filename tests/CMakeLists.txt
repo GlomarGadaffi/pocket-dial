@@ -66,6 +66,12 @@ add_executable(sip_parser_tests
     # refuse) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
     RequestsHandler_pool_test.cpp
+    # Issue #410 phase 1: the static HTML pages stream from flash (byte-identical
+    # to the old path, zero allocation beyond the CSRF token).
+    HttpStaticPages_test.cpp
+    # Issue #410 phase 2: every response goes out in place via one scatter-gather
+    # sendmsg() (byte-identical, short writes resumed, zero allocation).
+    HttpSendPath_test.cpp
     # Issue #412: every allocateVirtualPeer() caller must survive an exhausted
     # pool -- refuse with 503 (or drop the anchor leg) and release what it had
     # claimed, never publish a session with a null peer.
@@ -162,6 +168,8 @@ add_executable(sip_parser_tests
     # gets a BYE for the dialog it was on (not just that the target gets an
     # INVITE).
     BlindTransfer_test.cpp
+    # Issue #422: the four server-originated in-dialog CSeqs #407 did not reach.
+    ServerCSeqSites_test.cpp
     # Issue #198: RFC 4028 session timers. Pins the arming DECISION (a 2xx with
     # Session-Expires but no refresher parameter obliges nobody, so arming a
     # reaper could only ever produce a spurious BYE) and the OPTIONS capability
@@ -269,6 +277,9 @@ add_executable(sip_parser_tests
     # bounded-cache/in-flight state machine.
     TrunkResolver_test.cpp
     PlayoutBuffer_test.cpp
+    # Issue #466: clip placement policy, DmaFramePool's lock-free publish, the
+    # PSRAM-preferring allocator behind PlayoutBuffer.
+    PsramPlacement_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp
     # Wires the AnchorClient/MediaBridge/TelephonyProvider extension point into
@@ -332,6 +343,8 @@ add_executable(sip_parser_tests
     # Issue #382: /api/coredump* -- owner-only download, CSRF-checked erase,
     # ungated presence on /api/status, against a fake CoreDumpStore image.
     CoreDumpHttp_test.cpp
+    # Issue #363: every secret-bearing store is empty after a factory reset.
+    FactoryResetSecrets_test.cpp
     # Issue #385: the brute-force state-recovery attack on IDGen, run for real
     # (DISABLED_ by default -- a full 2^31 search each; see the file header).
     IDGenPredict_test.cpp
@@ -423,6 +436,8 @@ add_executable(sip_parser_tests
     PcapCapture_test.cpp
     # Issue #463 (#284 batch B): the idle tick, OPTIONS ping and header rewrites.
     IdleTickAlloc_test.cpp
+    # Issue #464 (#284 batch C): per-request lookups allocate nothing.
+    AllocFreeLookups_test.cpp
     DropProbe_test.cpp
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
@@ -460,6 +475,8 @@ add_executable(sip_parser_tests
     # Issue #382: HttpServer's /api/coredump* routes call it; the host arm serves
     # a test-installed fake image instead of flash.
     ../src/Helpers/CoreDumpStore.cpp
+    # Issue #363: the secrets a factory reset must erase.
+    ../src/Helpers/FactoryReset.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
     # length/charset bounds that stop a typo from bringing the AP up open.
     DeviceConfig_test.cpp

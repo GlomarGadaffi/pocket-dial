@@ -60,12 +60,16 @@ namespace
 		return std::string(kKeyPrefix) + ext;
 	}
 
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 	// --- Host-side in-memory mirror (also the store on host) ---
+	// Host-only: every caller is a host #else arm, so defining it on ESP was an
+	// unused function (-Wunused-function; BigDog's ESP build of #437).
 	std::map<std::string, std::string>& hostMap()
 	{
 		static std::map<std::string, std::string> m;
 		return m;
 	}
+#endif
 
 	// --- CSPRNG secret generation (single audited entropy source) ---
 	// Unambiguous alphabet: no 0/O/1/I/l, 54 symbols, ~5.755 bits/char.
@@ -143,39 +147,65 @@ namespace
 		return nvs_set_str(h, kIndexKey, joined.c_str()) == ESP_OK;
 	}
 
-	void indexAddLocked(nvs_handle_t h, const std::string& ext)
+	// Both return false only if the index needed a write and it failed (#484
+	// review finding 3: every NVS return is checked). The index is one NVS
+	// string, capped at 4000 B by IDF, so a full index is a real failure mode.
+	bool indexAddLocked(nvs_handle_t h, const std::string& ext)
 	{
 		auto exts = readIndexLocked(h);
 		if (std::find(exts.begin(), exts.end(), ext) == exts.end())
 		{
 			exts.push_back(ext);
-			writeIndexLocked(h, exts);
+			return writeIndexLocked(h, exts);
 		}
+		return true;
 	}
 
-	void indexRemoveLocked(nvs_handle_t h, const std::string& ext)
+	bool indexRemoveLocked(nvs_handle_t h, const std::string& ext)
 	{
 		auto exts = readIndexLocked(h);
 		auto it = std::remove(exts.begin(), exts.end(), ext);
 		if (it != exts.end())
 		{
 			exts.erase(it, exts.end());
-			writeIndexLocked(h, exts);
+			return writeIndexLocked(h, exts);
 		}
+		return true;
 	}
 #endif
 }
 
 namespace SipSecretStore
 {
+	namespace
+	{
+		// #482: an HA1 as the store holds it -- 32 lowercase hex characters.
+		bool isValidHa1(const std::string& h)
+		{
+			if (h.size() != 32) return false;
+			for (char c : h)
+			{
+				if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+			}
+			return true;
+		}
+	}
+
 	bool setSecret(const std::string& ext, const std::string& plaintextSecret)
 	{
 		if (!isValidExt(ext) || plaintextSecret.empty())
 		{
 			return false;
 		}
+		return setHa1(ext, SipDigest::computeHa1(ext, kRealm, plaintextSecret));
+	}
 
-		std::string ha1 = SipDigest::computeHa1(ext, kRealm, plaintextSecret);
+	bool setHa1(const std::string& ext, const std::string& ha1)
+	{
+		if (!isValidExt(ext) || !isValidHa1(ha1))
+		{
+			return false;
+		}
 
 		std::lock_guard<std::mutex> lock(storeMutex());
 
@@ -186,9 +216,17 @@ namespace SipSecretStore
 			return false;
 		}
 		bool ok = (nvs_set_str(h, nvsKeyFor(ext).c_str(), ha1.c_str()) == ESP_OK);
-		if (ok)
+		if (ok && !indexAddLocked(h, ext))
 		{
-			indexAddLocked(h, ext);
+			// #484 review finding 3: a secret the index does not list would
+			// authenticate yet be invisible to securedExtensions() -- and so drop
+			// out of the next export. Undo the key rather than leave that state.
+			(void)nvs_erase_key(h, nvsKeyFor(ext).c_str());
+			(void)nvs_commit(h);
+			ok = false;
+		}
+		else if (ok)
+		{
 			ok = (nvs_commit(h) == ESP_OK);
 		}
 		nvs_close(h);
@@ -324,14 +362,45 @@ namespace SipSecretStore
 		bool ok = (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND);
 		if (ok)
 		{
-			indexRemoveLocked(h, ext);
-			ok = (nvs_commit(h) == ESP_OK);
+			// The key is gone either way; a failed index write is still reported
+			// (#484 review finding 3) -- the index would list an unsecured ext.
+			const bool indexOk = indexRemoveLocked(h, ext);
+			ok = (nvs_commit(h) == ESP_OK) && indexOk;
 		}
 		nvs_close(h);
 		ha1Cache().erase(ext);   // drop the RAM copy so a stale HA1 can't authenticate
 		return ok;
 #else
 		hostMap().erase(ext);
+		return true;
+#endif
+	}
+
+	bool clearAll()
+	{
+		std::lock_guard<std::mutex> lock(storeMutex());
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		// "sipauth" holds nothing but these secrets and their index, so a
+		// namespace wipe is exact -- and unlike walking the index it also catches
+		// an ext_* key the index lost track of (an interrupted setSecret()).
+		nvs_handle_t h;
+		esp_err_t err = nvs_open(kNamespace, NVS_READWRITE, &h);
+		if (err == ESP_ERR_NVS_NOT_FOUND)
+		{
+			ha1Cache().clear();
+			return true;   // never written: nothing to clear
+		}
+		if (err != ESP_OK)
+		{
+			return false;
+		}
+		bool ok = (nvs_erase_all(h) == ESP_OK) && (nvs_commit(h) == ESP_OK);
+		nvs_close(h);
+		ha1Cache().clear();   // a cached HA1 must not keep authenticating
+		return ok;
+#else
+		hostMap().clear();
 		return true;
 #endif
 	}
