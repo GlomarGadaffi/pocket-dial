@@ -613,6 +613,9 @@ TEST(SessionTimer, EmergencyCallsAreNever422dForAShortSessionExpires)
 		sent.clear();
 		handler.handle(makeTimerInvite(number, std::string("timer-e") + number, "Session-Expires: 30"));
 		EXPECT_TRUE(firstMatching(sent, "SIP/2.0 422").empty()) << number << " must never be bounced 422";
+		// Positive: it reached routeEmergencyCall() (no route on this handler, so its 503).
+		EXPECT_FALSE(firstMatching(sent, "SIP/2.0 503 Emergency Call Not Routable").empty())
+			<< number << " must reach routeEmergencyCall()";
 	}
 }
 
