@@ -11,16 +11,22 @@ on:
   pull_request:
     branches: [ '**' ]
     types: [ opened, synchronize, reopened, edited ]
+  # Issue #341 gap 6: the commit that actually lands -- a squash/merge commit
+  # whose message is composed (and editable) in the merge dialog AFTER the PR's
+  # last run, or a direct push -- is invisible to the pull_request trigger. A
+  # push run can't block what already landed, but it turns main red so the
+  # trailer is seen instead of silently entering history.
+  push:
+    branches: [ main ]
 
 jobs:
   commit-hygiene-guard:
     name: Commit Hygiene Guardrail
     runs-on: ubuntu-latest
-    # PR-scoped only, deliberately -- this walks git history between the
-    # PR's merge-base and its head, and "the PR's commit range" is a
-    # pull_request-only concept: a push-event trigger for a branch with no
-    # PR yet has no PR range to walk. A direct push straight to main (rare;
-    # this repo's convention relies on it staying rare) is not covered here.
+    # On a pull_request it walks the PR's own range (merge-base..head). On a
+    # push to main (#341 gap 6) it walks exactly the pushed commits
+    # (before..after): the squash/merge commit a PR run never saw, or a direct
+    # push. It can't un-land them, but main goes red.
     #
     # Scoped to the PR's own range on purpose (issue #326): 114 commits
     # already on main carry a Claude-Session: URL trailer the project's
@@ -30,11 +36,10 @@ jobs:
     # blocking on old ones -- the 114 stay as recorded technical debt, not
     # a wall everyone has to climb.
     #
-    # main is NOT currently a protected branch (verified: GET
-    # /branches/main/protection -> 404). Until "Commit Hygiene Guardrail"
-    # is added as a required status check, a red run here is a strong
-    # signal, not an enforced gate -- see the PR that added this job for
-    # that caveat stated plainly rather than implied.
+    # main IS protected now (required: Host Build, Call-Graph Guard, Interop
+    # Suite), but "Commit Hygiene Guardrail" is not among the required checks
+    # (#341 gap 7, a settings call for the maintainer), so a red run here is
+    # still a strong signal rather than an enforced gate.
     steps:
       - name: Checkout PR head (the real commit, not the synthetic merge ref)
         uses: actions/checkout@v4
@@ -45,12 +50,19 @@ jobs:
           # merge-base FROM that synthetic commit answers a different
           # question than "where does this PR's real history diverge from
           # its base." Check out the PR's actual HEAD commit instead.
-          ref: ${{ github.event.pull_request.head.sha }}
+          # (On a push to main there is no PR: check out the pushed commit.)
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           # Full history, not the default single-commit shallow clone.
           # merge-base needs real ancestry to walk, and this repo's history
           # is small enough (a few hundred commits) that the cost is
           # negligible -- verified locally before this ever ran in CI.
           fetch-depth: 0
+
+      - name: Self-test the shared trailer pattern (.githooks/commit-msg)
+        # #341: the hook and the check below share one pattern; run the hook's
+        # own self-test so a regex edit that stops catching a known-bad message,
+        # or starts flagging prose, fails here instead of silently passing.
+        run: sh .githooks/commit-msg --selftest
 
       - name: No Claude-Session trailers in this PR's commits or description
         env:
@@ -60,9 +72,46 @@ jobs:
           # same reason BASE_REF and HEAD_SHA below are also read from env
           # rather than spliced into the run: block as ${{ }} literals.
           BASE_REF: ${{ github.event.pull_request.base.ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
+
+          # Issue #341 gaps 3 + 4. One pattern, shared with .githooks/commit-msg:
+          #   ^claude-session:                   the trailer, ANY case (gap 3: a
+          #                                      hand-typed "claude-session:" passed)
+          #   claude-session:[[:space:]]*https?://  the trailer anywhere in a line,
+          #                                      followed by its URL (gap 4: a
+          #                                      72-column reflow joins it onto
+          #                                      the Co-authored-by line)
+          # Prose that merely names the trailer ("the Claude-Session trailer")
+          # and a bare session URL on its own line do not match.
+          TRAILER_RE='(^claude-session:)|(claude-session:[[:space:]]*https?://)'
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            # Gap 6: check exactly what landed. A new-branch push has an all-zero
+            # "before"; main always exists, so fall back to the pushed commit alone.
+            if [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              RANGE_ARGS="-1 ${HEAD_SHA}"
+            else
+              RANGE_ARGS="${PUSH_BEFORE}..${HEAD_SHA}"
+            fi
+            echo "Checking pushed commits ${RANGE_ARGS}"
+            FOUND=0
+            for sha in $(git rev-list ${RANGE_ARGS}); do
+              if git log -1 --format=%B "$sha" | grep -Eic "$TRAILER_RE" >/dev/null; then
+                echo "::error::Commit ${sha} (\"$(git log -1 --format=%s "$sha")\") landed on main with a Claude-Session: trailer."
+                FOUND=1
+              fi
+            done
+            if [ "$FOUND" -ne 0 ]; then
+              echo "A merge-time message edit or a direct push slipped a trailer past the PR check (#326, #341)."
+              exit 1
+            fi
+            echo "Clean: no Claude-Session trailer in the pushed commits."
+            exit 0
+          fi
 
           # BASE_REF, not a hardcoded "main". This repo has stacked PRs --
           # a feat/** branch based on another unmerged feat/** branch -- and
@@ -115,14 +164,14 @@ jobs:
           # producer never gets SIGPIPE'd -- same exit-code semantics
           # (0 = found, 1 = not found), just without the early-exit race.
           for sha in $(git rev-list "${BASE}..${HEAD_SHA}"); do
-            if git log -1 --format=%B "$sha" | grep -c '^Claude-Session:' >/dev/null; then
+            if git log -1 --format=%B "$sha" | grep -Eic "$TRAILER_RE" >/dev/null; then
               subject="$(git log -1 --format=%s "$sha")"
               echo "::error::Commit ${sha} (\"${subject}\") carries a Claude-Session: trailer."
               FOUND=1
             fi
           done
 
-          if printf '%s\n' "$PR_BODY" | grep -c '^Claude-Session:' >/dev/null; then
+          if printf '%s\n' "$PR_BODY" | grep -Eic "$TRAILER_RE" >/dev/null; then
             echo "::error::The PR description carries a Claude-Session: trailer."
             FOUND=1
           fi
