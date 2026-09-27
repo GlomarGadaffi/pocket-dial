@@ -8813,8 +8813,20 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 		svcLen, pbx::kServiceServer.data(), _localIp.c_str(), _serverPort, fromTag.c_str(),
 		callId.c_str(), _localIp.c_str());
 	// A truncated ping would be a malformed request; the caller already treats
-	// nullptr as "no ping this round" and does not stamp the interval.
-	if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf)) return nullptr;
+	// nullptr as "no ping this round" and does not stamp the interval, so it is
+	// retried next tick. Counted, and logged the first time, rather than silent
+	// (Sonny-OG's review, same pattern as #438/#456). The worst case with a
+	// 64-character AOR (kMaxAorLen) and a dotted-quad local IP is ~450 B, so
+	// this needs an input no real board has.
+	if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf))
+	{
+		if (_optionsPingTruncated.fetch_add(1, std::memory_order_relaxed) == 0)
+		{
+			queueLog("OPTIONS ping to " + num + " refused: it does not fit the " +
+				std::to_string(sizeof(buf)) + " B buffer (#463)", true);
+		}
+		return nullptr;
+	}
 	return getMessageFromPool(std::string_view(buf, static_cast<size_t>(n)), client->getAddress());
 }
 

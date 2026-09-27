@@ -169,6 +169,37 @@ TEST(IdleTickAlloc, OptionsPingIsWellFormed)
 	EXPECT_EQ(headerValue(ping, "Content-Length"), "0");
 }
 
+// A ping that would not fit its stack buffer is refused and counted, never sent
+// clipped, and it is retried on the next tick (the interval is not stamped). No
+// real board can reach this -- a 64-character AOR and a dotted-quad IP come to
+// ~450 B of the 640 -- so an oversized local address stands in: it appears in
+// the Via, the From and the Call-ID.
+TEST(IdleTickAlloc, AnOversizedPingIsRefusedAndCountedNotSentClipped)
+{
+	SentList sent;
+	const std::string hugeLocal(300, 'h');
+	RequestsHandler handler(hugeLocal, 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("100", "192.168.63.10"));
+	sent.clear();
+
+	handler.forceNextTickForTest();
+	handler.tick();
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		EXPECT_NE(msg->toString().rfind("OPTIONS ", 0), 0u) << "a clipped OPTIONS went out";
+	}
+	EXPECT_EQ(handler.getOptionsPingTruncated(), 1u);
+
+	// Not stamped, so the very next tick tries again (and is refused again).
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_EQ(handler.getOptionsPingTruncated(), 2u);
+}
+
 // setHeaderOnce() over an existing line rewrites it in place, and
 // syncContentLength() rewrites its line from a stack buffer: neither needs a
 // new allocation when the line already has room.

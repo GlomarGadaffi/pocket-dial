@@ -1,2 +1,2 @@
-# IdleAllocation tests, #463 (#284)
-4
+# IdleAllocation tests, #463 (#284): 4 + the refused-and-counted oversized ping
+5
