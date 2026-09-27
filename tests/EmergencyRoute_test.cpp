@@ -573,9 +573,7 @@ TEST(EmergencyRoute, TheDashboardWarnsWhileTheTrunkRouteIsUnverified)
 
 	const size_t fn = page.find("function applyEmergencyRoute(d){");
 	ASSERT_NE(fn, std::string::npos);
-	const std::string body = page.substr(fn, page.find("
-}
-", fn) - fn);
+	const std::string body = page.substr(fn, page.find("\n}\n", fn) - fn);
 	EXPECT_NE(body.find("e911-unverified-banner"), std::string::npos) << body;
 	EXPECT_NE(body.find("d.emergencyRoute===\"trunk-unverified\""), std::string::npos) << body;
 }
