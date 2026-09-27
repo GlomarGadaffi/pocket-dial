@@ -267,6 +267,17 @@ namespace
 	}
 }
 
+size_t SipMessage::removeHeaders(std::string_view name)
+{
+	size_t removed = 0;
+	for (size_t idx = findHeaderIndex(name); idx != std::string::npos; idx = findHeaderIndex(name))
+	{
+		_headerLines.erase(_headerLines.begin() + static_cast<long>(idx));
+		++removed;
+	}
+	return removed;
+}
+
 void SipMessage::addHeader(std::string_view name, std::string_view value)
 {
 	std::string line;

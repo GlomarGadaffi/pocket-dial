@@ -227,6 +227,11 @@ add_executable(sip_parser_tests
     # Kari's Law notification (#166 part 2): ordering (call leg before
     # notification), firing on a FAILED 911, and the config bound.
     EmergencyNotify_test.cpp
+    # Issue #521: an emergency number is carried by a provider that places
+    # REAL calls (a real anchor, else the SIP trunk) or refused with 503 --
+    # never answered by the loopback simulator -- plus the route report,
+    # the boot WARN, /api/status's emergencyRoute and the dashboard banner.
+    EmergencyRoute_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is
@@ -338,6 +343,9 @@ add_executable(sip_parser_tests
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp
+    # Issue #529: a trickled request body is dropped at the read deadline, and one
+    # source address cannot hold every connection slot. Ports 18250-18259.
+    HttpReadDeadline_test.cpp
     # Issue #186: AdminAuth::pbkdf2Sha256/aesGcmSeal/aesGcmOpen against
     # published RFC 7914 / GCM-spec vectors, plus the tamper/wrong-AAD/
     # wrong-key properties the config-export "secrets_enc" block depends on.
