@@ -1,0 +1,44 @@
+// RxRestart_test.cpp -- issue #554, #575 review. The pure decisions behind
+// TelephonyAnchorClient::startRxIfNeeded() (src/SIP/RxRestart.hpp); the anchor
+// client itself is ESP-only.
+
+#include <gtest/gtest.h>
+
+#include <string>
+
+#include "RxRestart.hpp"
+
+using pd::RxStart;
+using pd::rxRestartDecision;
+
+TEST(RxRestart, NoHandleStartsAndALiveOrTearingDownTaskIsLeftAlone)
+{
+	EXPECT_EQ(rxRestartDecision(false, false, false, false), RxStart::Start);
+	EXPECT_EQ(rxRestartDecision(true, true, false, false), RxStart::AlreadyPolling);
+	EXPECT_EQ(rxRestartDecision(true, false, true, false), RxStart::AlreadyPolling)
+		<< "teardown owns the slot; never restart under it";
+	EXPECT_EQ(rxRestartDecision(true, true, true, false), RxStart::AlreadyPolling);
+}
+
+TEST(RxRestart, AnExitedTaskIsReplacedOnlyOnceItsDoneSemIsTaken)
+{
+	// The #575 review's race: rxRunning is clear but the task has not given its
+	// done-sem yet, so it still touches the slot. Restarting there deleted the
+	// sem under it and put a second task on the slot.
+	EXPECT_EQ(rxRestartDecision(true, false, false, false), RxStart::StillExiting);
+	EXPECT_EQ(rxRestartDecision(true, false, false, true), RxStart::Restart);
+}
+
+TEST(RxRestart, ADroppedLegIsRefusedAnotherIsNot)
+{
+	RecentIdRing<8, 64> dropped;
+	dropped.add("leg-554");
+	EXPECT_FALSE(pd::rxStartAllowedFor(dropped, "leg-554"))
+		<< "a late upsert for a leg we dropped must not get a fresh rx task";
+	EXPECT_TRUE(pd::rxStartAllowedFor(dropped, "leg-555"));
+	EXPECT_TRUE(pd::rxStartAllowedFor(dropped, "leg-55"))
+		<< "a prefix of a dropped id is a different leg";
+	// Bounded: after 8 newer drops the oldest is forgotten (documented bound).
+	for (int i = 0; i < 8; ++i) dropped.add("newer-" + std::to_string(i));
+	EXPECT_TRUE(pd::rxStartAllowedFor(dropped, "leg-554"));
+}

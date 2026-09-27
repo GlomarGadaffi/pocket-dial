@@ -1,7 +1,9 @@
 #ifndef REGISTRAR_HPP
 #define REGISTRAR_HPP
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -177,6 +179,41 @@ private:
 	// (namespace "pbxcfg", key "devices") minus the volatile online flags.
 	std::unordered_map<std::string, DeviceRecord> _devices;
 	Change _devicesChanged = Change::None;
+
+	// Issue #525: digest replay limit. Nonces are stateless (HMAC-tagged, 5 min,
+	// SipDigest.hpp), so without this one captured Authorization could be sent
+	// again for the nonce's whole lifetime. Each nonce that has authenticated a
+	// request remembers the highest nc it was used with; a request must present
+	// a HIGHER nc (RFC 2617 §3.2.2) or it is re-challenged. Fixed size, no heap:
+	// when full, the entry that expires first is reused. Only a request that
+	// already passed verify() is recorded, so filling the table takes valid
+	// credentials. Touched only under RequestsHandler's _mutex (SIP thread).
+	//
+	// #525 review: evicting a LIVE entry would let that nonce be replayed once
+	// more, as an unknown nonce. So every eviction of a live entry raises a
+	// watermark of nonce issue times (the timestamp our nonces carry,
+	// SipDigest.hpp), and an unknown nonce issued at or before it is
+	// re-challenged instead of trusted. Evicting the oldest-issued entry keeps
+	// the watermark, and so those extra challenges, as low as possible.
+	struct NonceUse
+	{
+		char nonce[64] = {};
+		uint32_t nc = 0;
+		uint64_t issuedMs = 0;   // from the nonce itself
+		std::chrono::steady_clock::time_point until{};
+	};
+	static constexpr size_t kNonceUses = 32;
+	std::array<NonceUse, kNonceUses> _nonceUses{};
+	uint64_t _nonceEvictedIssuedMs = 0;   // watermark; see above
+	uint32_t _nonceLiveEvictions = 0;     // how often the table overflowed
+	// True if (nonce, nc) is new, and records it; false if it is a replay (an nc
+	// not above the highest already accepted for this nonce).
+	bool noteNonceUse(const std::string& nonce, uint32_t nc, std::chrono::steady_clock::time_point now);
+public:
+	// #525 review: live entries evicted since boot (table overflow). Non-zero
+	// means more than kNonceUses nonces authenticated within one nonce lifetime.
+	uint32_t nonceLiveEvictions() const { return _nonceLiveEvictions; }
+private:
 	// Raise the pending change to at least `kind` (Structural is sticky).
 	void noteChange(Change kind);
 };

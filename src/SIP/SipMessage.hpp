@@ -108,6 +108,13 @@ public:
 	// #463: when the line already exists it is rewritten IN PLACE (its capacity
 	// reused), so re-stamping a cloned response's capability headers is free.
 	void setHeaderOnce(std::string_view name, std::string_view value);
+	// Drop EVERY line of one header (case-insensitive; no compact form). Returns
+	// how many were removed. Used to keep hop-by-hop credentials (Authorization,
+	// Proxy-Authorization) off a request this PBX relays (#549).
+	size_t removeHeaders(std::string_view name);
+	// The user part of the Request-URI ("600" in "INVITE sip:600@host SIP/2.0");
+	// empty for a response, or a Request-URI with no sip: user part.
+	std::string_view getRequestUriUser() const { return extractNumber(_startLine); }
 	// Pins the SDP payload list to "0 8 101".
 	//
 	// DEPRECATED, and as of ISSUES.md #139 called from NO production path -- only
@@ -286,6 +293,12 @@ private:
 	// the cache's owner can tell when its parse went stale.
 	std::string              _startLine;
 	std::vector<std::string> _headerLines;
+	// #462: header-line strings a shorter message did not need, kept with their
+	// buffers instead of being destroyed, so the next longer message parsed into
+	// this (pooled) object reuses them rather than allocating. NOT message
+	// state: nothing reads it except the parse/copy paths in SipMessage.cpp,
+	// and its contents are meaningless leftovers. Only its capacity matters.
+	std::vector<std::string> _spareHeaderLines;
 	std::string              _body;
 	// Bumped by every _body mutation — see bodyGeneration().
 	//

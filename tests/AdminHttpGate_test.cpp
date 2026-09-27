@@ -1122,11 +1122,30 @@ TEST(HttpConnCap, OverTheCapIsRefused503AndSlotsAreReleased)
 	// never actually overlap and the test would pass with the cap deleted. These
 	// sockets connect and then say nothing, so each handler sits in recv() until
 	// its SO_RCVTIMEO -- the slot is genuinely held for the duration.
+	// Issue #529: one source may hold only kMaxConnectionsPerSource of the slots,
+	// so the holders come from two loopback sources (127.0.0.2 up to its share,
+	// 127.0.0.3 for the rest) and the probe below from a third (127.0.0.1). That
+	// way the refusal it gets is the GLOBAL cap's, not the per-source one.
 	std::vector<int> held;
 	for (int i = 0; i < HttpServer::kMaxConcurrentConnections; ++i)
 	{
 		int s = socket(AF_INET, SOCK_STREAM, 0);
 		ASSERT_GE(s, 0);
+		sockaddr_in src{};
+		src.sin_family = AF_INET;
+		inet_pton(AF_INET, i < HttpServer::kMaxConnectionsPerSource ? "127.0.0.2" : "127.0.0.3",
+			&src.sin_addr);
+		if (bind(s, reinterpret_cast<sockaddr*>(&src), sizeof(src)) != 0)
+		{
+#if defined(_WIN32) || defined(_WIN64)
+			closesocket(s);
+			for (int h : held) closesocket(h);
+#else
+			close(s);
+			for (int h : held) close(h);
+#endif
+			GTEST_SKIP() << "this stack can't use 127.0.0.2/.3 as source addresses";
+		}
 		sockaddr_in addr{};
 		addr.sin_family = AF_INET;
 		addr.sin_port   = htons(18099);
@@ -1145,6 +1164,9 @@ TEST(HttpConnCap, OverTheCapIsRefused503AndSlotsAreReleased)
 		<< "over the cap the server must answer 503, got:\n"
 		<< refusedResp.substr(0, 200);
 	EXPECT_NE(refusedResp.find("busy"), std::string::npos) << refusedResp.substr(0, 200);
+	EXPECT_NE(refusedResp.find("too many concurrent connections"), std::string::npos)
+		<< "this must be the global cap's refusal, not the per-source one (#529): "
+		<< refusedResp.substr(0, 200);
 
 	// Releasing the held sockets makes each blocked recv() return 0, so the
 	// handlers exit promptly rather than waiting out the full timeout.
@@ -1231,6 +1253,10 @@ TEST(DropProbeStatus, CountsArePublicRecentDropsNeedASession)
 	phone.sin_family = AF_INET;
 	phone.sin_port = htons(5062);
 	inet_pton(AF_INET, "192.168.9.181", &phone.sin_addr);
+	// #430: a CR/LF-only datagram is a keep-alive, not a drop, so the malformed
+	// packet here is real junk; the ping is fed too, to pin its public counter.
+	const std::string junk = "junk";
+	handler.handle(RequestsHandler::getMessageFromPool(junk, phone), junk);
 	const std::string ping = "\r\n\r\n";
 	handler.handle(RequestsHandler::getMessageFromPool(ping, phone), ping);
 
@@ -1243,6 +1269,8 @@ TEST(DropProbeStatus, CountsArePublicRecentDropsNeedASession)
 	EXPECT_NE(anon.find("\"packetsDropped\":1,"), std::string::npos) << anon;
 	EXPECT_NE(anon.find("\"droppedInvalid\":1,"), std::string::npos) << anon;
 	EXPECT_NE(anon.find("\"droppedRate\":0,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"keepalivesCrlf\":1,"), std::string::npos)
+		<< "the keep-alive is counted, publicly, and not as a drop:\n" << anon;
 	EXPECT_NE(anon.find("\"recentDrops\":[]"), std::string::npos)
 		<< "drop sources must be withheld without a session:\n" << anon;
 	EXPECT_EQ(anon.find("192.168.9.181"), std::string::npos) << anon;
@@ -1255,7 +1283,7 @@ TEST(DropProbeStatus, CountsArePublicRecentDropsNeedASession)
 		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
 
 	const std::string authed = bodyOf(httpGetRaw(18135, "/api/status", "pd_session=" + cookie));
-	EXPECT_NE(authed.find("\"reason\":\"invalid\",\"src\":\"192.168.9.181:5062\",\"len\":4,\"head\":\"0d0a0d0a\"}"),
+	EXPECT_NE(authed.find("\"reason\":\"invalid\",\"src\":\"192.168.9.181:5062\",\"len\":4,\"head\":\"6a756e6b\"}"),
 	          std::string::npos)
 		<< "a session must see who sent the dropped packet and its first bytes:\n" << authed;
 
@@ -1316,6 +1344,70 @@ TEST(DropProbeStatus, HeadHexIsExactAtZeroOneAndFullLength)
 		EXPECT_EQ(d.stringOr("reason"), "invalid");
 		EXPECT_EQ(d.stringOr("src"), "192.168.9.77:5070");
 	}
+
+	AdminAuth::clearCredential();
+}
+
+// Issue #539: live calls are the CURRENT version of the call log (#207 gated
+// /api/cdr), so who is calling whom needs a session. The counts stay public:
+// the dashboard shows them before login, and the #401 soak reads them.
+TEST(CdrDisclosure, LiveCallsNeedASessionButTheirCountDoesNot)
+{
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	sockaddr_in phone{};
+	phone.sin_family = AF_INET;
+	phone.sin_port = htons(5060);
+	inet_pton(AF_INET, "192.168.9.50", &phone.sin_addr);
+	const std::string reg =
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.9.50:5060;branch=z9hG4bKr539\r\n"
+		"From: <sip:539@server>;tag=r539\r\n"
+		"To: <sip:539@server>\r\n"
+		"Call-ID: reg-539\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"Contact: <sip:539@192.168.9.50:5060>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(reg, phone));
+	const std::string sdp =
+		"v=0\r\no=- 0 0 IN IP4 192.168.9.50\r\ns=-\r\nc=IN IP4 192.168.9.50\r\nt=0 0\r\n"
+		"m=audio 10000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	const std::string invite =
+		"INVITE sip:777@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.9.50:5060;branch=z9hG4bKi539\r\n"
+		"From: <sip:539@server>;tag=f539\r\n"
+		"To: <sip:777@server>\r\n"
+		"Call-ID: echo-539\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:539@192.168.9.50:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+	handler.handle(RequestsHandler::getMessageFromPool(invite, phone));
+	handler.forceNextTickForTest();   // /api/status reads the snapshot tick() publishes
+	handler.tick();
+
+	HttpServer server("127.0.0.1", 18082, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string body = bodyOf(httpGetRaw(18082, "/api/status"));
+	EXPECT_NE(body.find("\"sessionCount\":1"), std::string::npos)
+		<< "the echo call must be counted publicly:\n" << body;
+	EXPECT_NE(body.find("\"oldestSessionSec\":"), std::string::npos) << body;
+	EXPECT_NE(body.find("\"sessions\":[]"), std::string::npos)
+		<< "who is on the call must be withheld without a session:\n" << body;
+	EXPECT_EQ(body.find("\"caller\":"), std::string::npos) << body;
+	EXPECT_NE(body.find("\"parkedCalls\":[]"), std::string::npos) << body;
+	EXPECT_NE(body.find("\"parkedCount\":0"), std::string::npos) << body;
+
+	const AdminSession a = loginAndCompleteSetup(18082);
+	const std::string authed = bodyOf(httpGetRaw(18082, "/api/status", "pd_session=" + a.cookie));
+	EXPECT_NE(authed.find("\"caller\":\"539\""), std::string::npos)
+		<< "a logged-in operator still sees who is calling:\n" << authed;
 
 	AdminAuth::clearCredential();
 }

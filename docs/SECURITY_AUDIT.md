@@ -34,9 +34,13 @@ Status: Complete, Post-Refactor Review & Threat Evaluation
 > 3. **INVITE *is* now independently challenged in Secure mode**: the residual-risk
 >    paragraph under SEC-04 that says otherwise is stale. See
 >    [RequestsHandler.cpp:1195-1206](../src/SIP/RequestsHandler.cpp#L1195-L1206).
-> 4. **The shipped default registrar mode is still `open`.** A fresh board accepts any
->    REGISTER and any INVITE until an operator changes `reg_mode`. Digest auth and the
->    Learn-mode TOFU/ARP MAC-lock are implemented; they are simply not on by default.
+> 4. **The shipped default registrar mode is `learn`** (#441), and `open` is retired
+>    (#502). A fresh board adopts an unknown MAC on its first REGISTER of an unclaimed
+>    extension, and admits an INVITE from a Learned (unsecured) extension without a
+>    challenge; digest is enforced for devices promoted to Secured (REGISTER and, since
+>    #512, INVITE) and for every extension in `secure` mode, with two open bypasses:
+>    #507 (an ARP miss admits a Secured extension without digest) and
+>    #560 (the relayed ACK and re-INVITE/UPDATE still carry the INVITE's credential; fix #562 open) and #525 (a nonce/`nc` can be reused within its 5-minute life). #549 (replay to another destination) is fixed by #555.
 >
 > Line numbers quoted throughout this document predate the decomposition of
 > `RequestsHandler` into `CallForker` / `CallPickup` / `ParkOrbit` / `BlfSubscriptions` /
@@ -214,7 +218,7 @@ Because Flash Encryption is disabled by default, an attacker with physical acces
 
 | Plane | Shipped control |
 |---|---|
-| HTTP admin | Admin credential + server-side session (128-bit token, `HttpOnly`/`SameSite=Strict` `pd_session` cookie) on every mutating endpoint; brute-force lockout with exponential backoff and an aggregate backstop (**global, not per-client**, the per-IP key is never supplied on the login path, `HttpServer.cpp:2720-2732`; see [THREAT_MODEL.md](THREAT_MODEL.md) D-3); per-session CSRF token required in `X-CSRF`; same-origin checking; security response headers. All admission decisions go through one [`HttpServer::requireAdmin()`](../src/Helpers/HttpServer.cpp#L1828). |
+| HTTP admin | Admin credential + server-side session (128-bit token, `HttpOnly`/`SameSite=Strict` `pd_session` cookie) on every mutating endpoint; brute-force lockout with exponential backoff and an aggregate backstop (per client since #530, `HttpServer.cpp:684`, but the per-principal backstop can still be tripped by one address; see [THREAT_MODEL.md](THREAT_MODEL.md) D-3); per-session CSRF token required in `X-CSRF`; same-origin checking; security response headers. All admission decisions go through one [`HttpServer::requireAdmin()`](../src/Helpers/HttpServer.cpp#L1828). |
 | HTTP transport | ~~**Dark by default**: on a provisioned device the listen socket is not bound at all except inside a bounded window opened by a source-IP-verified DTMF code, a fresh-provisioning grace period, or an authenticated keepalive. An attacker usually cannot even reach the login endpoint.~~ |
 | SIP registrar | Digest authentication (RFC 2617, MD5, `qop=auth`) challenging `REGISTER`, with runtime-selectable `open` / `learn` / `secure` modes and a per-extension HA1 secret store. **But `secure` is not deployable** since nothing in the firmware calls `SipSecretStore::setSecret()`, so no extension can be given a secret, `Registrar::secure()` refuses, and `secure` mode rejects every phone instead of authenticating it. `learn` (TOFU + ARP MAC lock) is the strongest mode that can actually be run, see [THREAT_MODEL.md](THREAT_MODEL.md) §9 and [LEARN_MODE.md](LEARN_MODE.md) Step 4. |
 
@@ -239,7 +243,9 @@ Because Flash Encryption is disabled by default, an attacker with physical acces
 Residual risk, stated plainly *(as amended 2026-09-13)*: the **first-run window is still
 open by design**: a factory-fresh device ships `admin`/`admin` with a forced change on
 first use, so onboarding stays possible (THREAT_MODEL §5.1); the registrar's **default
-mode is still `open`**, so the digest control protects only deployments that switch it;
+mode is `learn`** (#441; `open` is retired, #502), so the digest control protects only
+devices promoted to Secured, or every extension in a `secure` deployment, and even
+that has open gaps (#507, #560, #525; #549 fixed by #555);
 and the stored HA1 is a bearer credential at rest, which is what makes SEC-03's
 flash-encryption fix matter. See [THREAT_MODEL.md](THREAT_MODEL.md) §5 and §9.
 

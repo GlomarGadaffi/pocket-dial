@@ -15,7 +15,7 @@
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	#include "nvs_flash.h"
 	#include "nvs.h"
-	#include "esp_random.h"   // esp_random() — hardware CSPRNG (RF subsystem active)
+	#include "esp_random.h"   // esp_random() — hardware TRNG (RF on Wi-Fi builds; SAR ADC source on eth, #420)
 #else
 	#include <random>         // std::random_device — host CSPRNG
 #endif
@@ -77,8 +77,8 @@ namespace
 		"ABCDEFGHJKLMNPQRSTUVWXYZ23456789abcdefghijkmnpqrstuvwxyz";
 	constexpr int kSecretAlphabetLen = (int)sizeof(kSecretAlphabet) - 1;   // 54
 
-	// One CSPRNG byte. esp_random() is the hardware RNG (CSPRNG-grade while the RF
-	// subsystem is up, which it always is here); std::random_device is the host's
+	// One CSPRNG byte. esp_random() is the hardware RNG (true-random while the RF subsystem is up
+	// on Wi-Fi builds, or the SAR ADC source the eth app_mains enable, #420); std::random_device is the host's
 	// non-deterministic source. Both are uniform over 0..255.
 	unsigned char csprngByte()
 	{

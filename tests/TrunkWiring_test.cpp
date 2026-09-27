@@ -639,3 +639,30 @@ TEST(TrunkWiring, TickKeepsTheSbcAddressResolvedForAnFqdnTrunk)
 		<< "after a tick the name is at least in flight; Refused means tick() "
 		   "never asked and an FQDN trunk can never place a call";
 }
+
+// ── Issue #546: "trunk" only after the carrier has answered ─────────────────
+
+TEST(TrunkWiring, TheEmergencyRouteIsUnverifiedUntilTheCarrierAnswers)
+{
+	// A valid config proves the trunk is CONFIGURED, nothing more: a carrier
+	// that demands digest (#399) would fail every 911 with 502. The report
+	// only reads "trunk" after a real 2xx to one of our INVITEs.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	EXPECT_EQ(b.handler.emergencyRoute(), RequestsHandler::EmergencyRoute::TrunkUnverified);
+
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-546"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	ASSERT_FALSE(carrier.callID.empty());
+	EXPECT_EQ(b.handler.emergencyRoute(), RequestsHandler::EmergencyRoute::TrunkUnverified)
+		<< "sending an INVITE proves nothing";
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	EXPECT_EQ(b.handler.emergencyRoute(), RequestsHandler::EmergencyRoute::Trunk)
+		<< "a carrier 2xx is the proof";
+
+	b.handler.setTrunkConfig(trunkConfig());
+	EXPECT_EQ(b.handler.emergencyRoute(), RequestsHandler::EmergencyRoute::TrunkUnverified)
+		<< "a changed trunk config starts unproved again";
+}
