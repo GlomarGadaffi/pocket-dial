@@ -9,6 +9,7 @@
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive wipe on factory reset
 #include "AdminAuth.hpp"
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
+#include "FactoryReset.hpp"    // Issue #363: the secrets factory reset must erase
 #include "DeviceConfig.hpp"
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
@@ -208,6 +209,8 @@ void HttpServer::acceptLoop()
 	// served on (#405 measured those down to 472 bytes free). start() itself
 	// is the wrong place: the display build calls it from app_main's 3.5 KB
 	// stack. Costs the first accept one checksum walk over at most 128 KB.
+	// It also caches the presence probe itself (#405): after this, /api/status
+	// and the coredump routes never touch the partition per request.
 	CoreDumpStore::prime();
 
 #if defined(ESP_PLATFORM)
@@ -1485,6 +1488,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	std::vector<std::tuple<std::string, std::string, std::string, int>> parkedCalls;
 	uint64_t packets = 0;
 	uint64_t dropped = 0;
+	uint64_t droppedInvalid = 0;   // Issue #430
+	uint64_t droppedRate = 0;
 
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
 	if (handler != nullptr)
@@ -1499,6 +1504,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		parkedCalls = handler->getParkedCalls();
 		packets = handler->getPacketsProcessed();
 		dropped = handler->getPacketsDropped();   // Issue #38
+		droppedInvalid = handler->getDroppedInvalid();
+		droppedRate = handler->getDroppedRate();
 	}
 
 	std::string displayIp = _ip;
@@ -1524,6 +1531,49 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
+	// Issue #430: the same drops by reason (they sum to packetsDropped, modulo a
+	// race between the loads), then the most recent ones. Like the roster below
+	// (#207), the per-drop source addresses and bytes need a session; the counts
+	// do not.
+	json << "\"droppedInvalid\":" << droppedInvalid << ",";
+	json << "\"droppedRate\":" << droppedRate << ",";
+	json << "\"recentDrops\":[";
+	if (authenticated && handler != nullptr)
+	{
+		// One Record on the stack at a time, no allocation, and the probe's lock
+		// is held only for each copy, never across the formatting (DropProbe.hpp).
+		const DropProbe& probe = handler->getDropProbe();
+		uint32_t first = 0, end = 0;
+		probe.window(first, end);
+		bool any = false;
+		for (uint32_t seq = first; seq != end; ++seq)
+		{
+			DropProbe::Record d;
+			if (!probe.at(seq, d)) continue;   // evicted since window()
+			static const char kHex[] = "0123456789abcdef";
+			char head[2 * DropProbe::kHeadBytes + 1];
+			const size_t headLen = (std::min)(static_cast<size_t>(d.headLen), DropProbe::kHeadBytes);
+			for (size_t b = 0; b < headLen; b++)
+			{
+				head[2 * b]     = kHex[d.head[b] >> 4];
+				head[2 * b + 1] = kHex[d.head[b] & 0x0f];
+			}
+			head[2 * headLen] = '\0';
+			sockaddr_in src{};
+			src.sin_family      = AF_INET;
+			src.sin_addr.s_addr = d.ip;
+			src.sin_port        = d.port;
+			if (any) json << ",";
+			any = true;
+			json << "{\"seq\":" << d.seq
+			     << ",\"tsUs\":" << d.tsUs
+			     << ",\"reason\":\"" << DropProbe::reasonName(d.reason) << "\""
+			     << ",\"src\":\"" << jsonEscape(sipwire::addrToIpPort(src)) << "\""
+			     << ",\"len\":" << d.len
+			     << ",\"head\":\"" << head << "\"}";
+		}
+	}
+	json << "],";
 
 	// microSD, on builds that have a slot wired (currently the T-ETH-ELITE `eth`
 	// board only). Always present so a client can tell "no card" from "this build
@@ -1855,6 +1905,8 @@ void HttpServer::sendApiMetrics(int sock)
 	uint64_t packets      = 0;
 	uint64_t dropped      = 0;
 	uint64_t sdpRejected  = 0;
+	uint64_t droppedInvalid = 0;   // Issue #430
+	uint64_t droppedRate  = 0;
 	size_t   clientCount  = 0;
 	size_t   sessionCount = 0;
 
@@ -1868,6 +1920,8 @@ void HttpServer::sendApiMetrics(int sock)
 	{
 		packets      = handler->getPacketsProcessed();
 		dropped      = handler->getPacketsDropped();
+		droppedInvalid = handler->getDroppedInvalid();
+		droppedRate  = handler->getDroppedRate();
 		sdpRejected  = handler->getSdpRejected();
 		clientCount  = handler->getClientCount();
 		sessionCount = handler->getSessionCount();
@@ -1917,6 +1971,14 @@ void HttpServer::sendApiMetrics(int sock)
 	counter("pocketdial_packets_dropped_total",
 	        "SIP packets dropped since boot as malformed or rate-limited (issue #38).",
 	        dropped);
+	counter("pocketdial_packets_dropped_invalid_total",
+	        "The malformed share of pocketdial_packets_dropped_total: null, or failing "
+	        "isValidMessage() (issue #430).",
+	        droppedInvalid);
+	counter("pocketdial_packets_dropped_rate_total",
+	        "The refused share of pocketdial_packets_dropped_total: allowlist or per-IP "
+	        "rate limit (issue #430).",
+	        droppedRate);
 	counter("pocketdial_sdp_rejected_total",
 	        "SDP bodies refused by the admission gate since boot, whether answered 488 "
 	        "or dropped silently (docs/THREAT_MODEL.md T-7).",
@@ -2173,7 +2235,8 @@ void HttpServer::sendApiTrace(int sock)
 		     << "\"tsUs\":" << r.tsUs << ","
 		     << "\"dir\":\"" << (r.outbound ? "out" : "in") << "\","
 		     << "\"peer\":\"" << jsonEscape(r.peer) << "\","
-		     << "\"text\":\"" << jsonEscape(r.text) << "\"}";
+		     << "\"text\":\"" << jsonEscape(r.text) << "\","
+		     << "\"truncated\":" << (r.truncated ? "true" : "false") << "}";
 	}
 	json << "]";
 
@@ -3536,10 +3599,11 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// documented "save always replaces" path, so it overwrites every trunk_*
 	// key including the secret.
 	//
-	// (smtp_pass and gsa_key in the same namespace are the identical
-	// pre-existing gap and are NOT addressed here -- issue #363; fixing them
-	// is a separate change with its own test.)
-	TrunkConfigStore::save(TrunkConfigStore::Config{});
+	const bool trunkErased = TrunkConfigStore::save(TrunkConfigStore::Config{});
+	// Issue #363: every other stored secret this function does not name --
+	// smtp_pass/gsa_key, every extension's digest HA1, the last coredump. The
+	// enumeration and the reasons live in FactoryReset.hpp.
+	const bool secretsErased = FactoryReset::eraseStoredSecrets();
 
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
@@ -3601,6 +3665,30 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		nvs_close(nvs_handle);
 	}
 #endif
+	// #437 review: a secret-store erase that FAILED must not be reported as a
+	// completed reset. The operator is about to hand this board on believing its
+	// credentials are gone. The board still restarts: the admin credential is
+	// already cleared above, so staying up half-reset helps nobody, and the reset
+	// can be run again once setup completes. (AdminAuth::clearCredential() and
+	// DeviceConfig::clearAll() return void, so their outcome is not visible here.)
+	if (!trunkErased || !secretsErased)
+	{
+		// One fixed literal per outcome: no string building on the HTTP task (#284).
+		static constexpr const char* kTrunkOnly =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the carrier trunk credentials "
+			"could not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
+		static constexpr const char* kSecretsOnly =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the email/SIP-digest secret stores "
+			"could not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
+		static constexpr const char* kBoth =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the carrier trunk credentials and "
+			"the email/SIP-digest secret stores could not be erased. Rebooting anyway; run the factory reset "
+			"again after setup.\"}";
+		const char* body = (!trunkErased && !secretsErased) ? kBoth : (!trunkErased ? kTrunkOnly : kSecretsOnly);
+		sendResponse(sock, 500, "Internal Server Error", "application/json", body);
+	}
+	else
+	{
 	// Every build that reaches this line has completed the wipe above, so every
 	// build has to say so. This used to answer 200 only under POCKETDIAL_HAS_WIFI
 	// and drop eth/lan8720 into a 501 "factory reset not available on desktop" --
@@ -3625,6 +3713,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"message\":\"Factory reset. Restart the process to complete.\"}");
 #endif
+	}
 #if defined(ESP_PLATFORM)
 	// Guarded on the platform, not the transport: esp_restart() and the deferred
 	// restart task exist on every ESP build (see the include block at the top of
