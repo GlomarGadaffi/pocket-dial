@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <vector>
 #include "AdminAuth.hpp"
+#include "ResetGuard.hpp"
+#include "ResetJournal.hpp"
 #include "CdrArchive.hpp"
 #include "CoreDumpStore.hpp"
 #include "VoicemailArchive.hpp"
@@ -118,6 +120,8 @@ namespace
 		{
 			handler.reset();
 			AdminAuth::clearCredential();
+			resetguard::resetForTest();     // the host door leaves the guard up (no restart)
+			resetjournal::resetForTest();
 		}
 		std::unique_ptr<RequestsHandler> handler;
 	};
@@ -254,4 +258,40 @@ TEST_F(DtmfFactoryReset, NoSinkInstalledIsAHarmlessNoOp)
 
 	EXPECT_EQ(cdrarchive::pendingForTest(), 0u);
 	SUCCEED() << "reached the confirm branch with no Sink and did not crash";
+}
+
+// #481 review (MAJOR): the DTMF door must open the write guard AND the reset
+// journal BEFORE its first wipe, as the HTTP door does -- otherwise a power cut
+// during the SD/voicemail/coredump wipes is never reported, and a writer can
+// put data back behind them. The first wipe is the SD CDR archive; the spy
+// records what was already true at that moment.
+namespace
+{
+	struct OrderSpySink : cdrarchive::Sink
+	{
+		bool guardUp = false;
+		resetjournal::Stage stage = resetjournal::Stage::None;
+		int wipes = 0;
+		void append(const cdrarchive::QueuedLine&) override {}
+		void wipe() override
+		{
+			++wipes;
+			guardUp = resetguard::inProgress();
+			stage = resetjournal::storedStageForTest();
+		}
+	};
+}
+
+TEST_F(DtmfFactoryReset, TheGuardAndJournalAreOpenBeforeTheFirstWipe)
+{
+	resetguard::resetForTest();
+	resetjournal::resetForTest();
+	OrderSpySink sink;
+	ScopedSink installed(&sink);
+
+	sendDtmfSequence(*handler, "dtmf-481-order", std::string("*") + kPin + "#9991");
+
+	ASSERT_EQ(sink.wipes, 1);
+	EXPECT_TRUE(sink.guardUp) << "resetguard::begin() must run before the first wipe";
+	EXPECT_EQ(sink.stage, resetjournal::Stage::Begun) << "resetjournal::begin() must run before the first wipe";
 }
