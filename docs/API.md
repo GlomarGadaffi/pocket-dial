@@ -880,7 +880,9 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `clients` | Array | Array of objects listing active VoIP extensions. |
 | `clients[].number` | String | SIP extension number (e.g., `"1001"`). |
 | `clients[].address` | String | Client's IP and port (e.g., `"192.168.4.12:5060"`). |
-| `sessions` | Array | Array of active SIP communication channels. |
+| `sessions` | Array | Active calls: `{caller, callee, state, duration}`. **Empty without an admin session** (#539): who is calling whom is the live call log, gated like `/api/cdr` and the `clients` roster (#207). |
+| `sessionCount` | Integer | (#539) Number of active calls. Always present, authenticated or not. |
+| `oldestSessionSec` | Integer | (#539) Age in seconds of the oldest active call, 0 when none. Always present; the #401 soak reads it to find a stuck leg without a credential. |
 | `sessions[].caller` | String | Extension that initiated the call. |
 | `sessions[].callee` | String | Target extension receiving the call. |
 | `sessions[].state` | String | Active session state. Exactly one of `Invited`, `Connected`, `Busy`, `Unavailable`, `Cancel`, `Bye`, or `Unknown` for an unmapped enumerator (`sessionStateToString`, `src/SIP/RequestsHandler.cpp:4262`). |
@@ -894,7 +896,8 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `dialplan[].action` | String | `group`, `page`, `park`, or `trunk`. |
 | `dialplan[].target` | String | The group / paging-zone / park-orbit extension the rule routes to, or, for `trunk`, the string prepended to the dialed number after stripping (possibly empty, meaning "prepend nothing"). |
 | `dialplan[].stripDigits` | Number | `trunk` only (Issue #165): leading digits removed from the dialed number before prepending `target`. `0` for every other action. |
-| `parkedCalls` | Array | Calls currently sitting on a park orbit: `{orbit, parkedExt, parker, secondsParked}`. Lets a client tell a parked extension apart from an idle or connected one. |
+| `parkedCalls` | Array | Calls currently sitting on a park orbit: `{orbit, parkedExt, parker, secondsParked}`. Lets a client tell a parked extension apart from an idle or connected one. **Empty without an admin session** (#539). |
+| `parkedCount` | Integer | (#539) Number of parked calls. Always present. |
 | `freeHeap` | Integer | `esp_get_free_heap_size()` (issue #185), free internal+PSRAM heap right now, in bytes. `0` on the host build (no heap_caps there). |
 | `minFreeHeap` | Integer | `esp_get_minimum_free_heap_size()` (#185), the LOWEST free-heap level seen since boot, not the current one. A transient allocation spike that `freeHeap` never catches (it's only sampled when something happens to poll this route) still shows up here. `0` on the host build. |
 | `minFreeHeapSpiram` | Integer | `heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)` (#185), same "lowest ever" reading, PSRAM only. `PsramTask.hpp`'s own comment is the reason this exists separately from `minFreeHeap`: internal RAM is what actually starves under concurrent calls (task stacks, TLS), and a combined number hides that a PSRAM-heavy board can look fine in aggregate while internal RAM is exhausted. `0` on the host build **and** on any no-PSRAM build (`sdkconfig.defaults.esp32_constrained`); the call itself is always safe, but a build with no SPIRAM capability has nothing in that pool to report. |

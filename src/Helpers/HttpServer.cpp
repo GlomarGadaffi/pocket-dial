@@ -1811,8 +1811,20 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"rosterVisible\":" << (authenticated ? "true" : "false") << ",";
 
 	// Sessions array
+	// Issue #539: live callers and callees are the CURRENT version of the CDR,
+	// which #207 put behind the session gate -- so they follow the roster's
+	// rule. An unauthenticated caller gets an empty array plus two identity-
+	// free fields: how many calls are up, and how old the oldest one is (the
+	// #401 soak tooling reads these to find a stuck leg without a credential).
+	int oldestSessionSec = 0;
+	for (const auto& s : sessions)
+	{
+		oldestSessionSec = (std::max)(oldestSessionSec, std::get<3>(s));
+	}
+	json << "\"sessionCount\":" << sessions.size() << ",";
+	json << "\"oldestSessionSec\":" << oldestSessionSec << ",";
 	json << "\"sessions\":[";
-	for (size_t i = 0; i < sessions.size(); i++)
+	for (size_t i = 0; authenticated && i < sessions.size(); i++)
 	{
 		if (i > 0) json << ",";
 		int durationSec = std::get<3>(sessions[i]);
@@ -1894,8 +1906,11 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// Parked calls: {orbit, parkedExt, parker, secondsParked} — Issue #65's
 	// ParkOrbit::snapshotRows(onlyParked=true), used by the dashboard to tell
 	// a parked jack apart from an idle or actively-connected one.
+	// Issue #539: which extension is parked, and by whom, is identity too.
+	// The count stays public.
+	json << "\"parkedCount\":" << parkedCalls.size() << ",";
 	json << "\"parkedCalls\":[";
-	for (size_t i = 0; i < parkedCalls.size(); i++)
+	for (size_t i = 0; authenticated && i < parkedCalls.size(); i++)
 	{
 		if (i > 0) json << ",";
 		json << "{\"orbit\":\"" << jsonEscape(std::get<0>(parkedCalls[i]))

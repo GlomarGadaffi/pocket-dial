@@ -1415,11 +1415,11 @@ function updateRail(d){
   $("s-uptime").textContent=fmtUptime(d.uptime);
   $("s-ip").textContent=(d.ip||"0.0.0.0")+":"+(d.port||5060);
   $("s-jacks").textContent=((d.clients||[]).length)+"/"+POOL;
-  $("s-calls").textContent=(d.sessions||[]).length;
+  $("s-calls").textContent=(typeof d.sessionCount==="number")?d.sessionCount:(d.sessions||[]).length;
   /* item 21: derived from the same payload fields the Calls stat reads,
      so it appears and disappears with real state. No invented number. */
   var bi=$("bay-idle");
-  if(bi)bi.style.display=((d.sessions||[]).length||(d.parkedCalls||[]).length)?"none":"";
+  if(bi)bi.style.display=((d.sessionCount||(d.sessions||[]).length)||(d.parkedCount||(d.parkedCalls||[]).length))?"none":""; /* #539: counts are public */
   $("s-pkts").textContent=(d.packetsProcessed||0).toLocaleString();
 }
 function refreshNow(){fetchStatus();fetchCdr();toast("Refreshed","ok");}
