@@ -31,6 +31,7 @@
 #endif
 
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -308,4 +309,34 @@ TEST(HttpReadDeadline, ARefusalWhoseSendTimeoutCannotBeSetClosesUnanswered)
 
 	for (Sock h : holders) closeSock(h);
 	waitIdle(server);
+}
+
+TEST(HttpReadDeadline, DestroyingTheServerWaitsForItsConnectionThreads)
+{
+	// #540: connection threads are detached and touch the server after
+	// handleClient() returns. The destructor used to return at once, freeing the
+	// server under a live handler (the segfault seen in a later, unrelated test).
+	// A handler parked in the body loop must hold the destructor until it exits
+	// at the 300 ms read deadline; without the wait this took ~0 ms.
+	RequestsHandler handler("192.168.52.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	auto server = std::make_unique<HttpServer>("127.0.0.1", 18254, nullptr);
+	server->attachHandler(&handler);
+	server->setReadDeadlineMsForTest(300);
+	server->start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	Sock s = connectFrom("127.0.0.1", 18254);
+	ASSERT_TRUE(valid(s));
+	ASSERT_TRUE(sendAll(s, kSlowHead));
+	for (int i = 0; i < 100 && server->activeConnectionsForTest() < 1; ++i)
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	ASSERT_EQ(server->activeConnectionsForTest(), 1);
+
+	const auto t0 = std::chrono::steady_clock::now();
+	server.reset();
+	const auto destroyMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - t0).count();
+	closeSock(s);
+	EXPECT_GE(destroyMs, 150) << "the destructor must wait for the parked handler";
 }
