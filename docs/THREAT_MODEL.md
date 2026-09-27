@@ -113,12 +113,13 @@ CSPRNG `esp_random()`. The trust boundaries below describe the **device**.
 > admits an INVITE from a Learned (unsecured) extension without a challenge; only a device
 > an admin has promoted to Secured proves a secret on REGISTER and on INVITE (#505/#512),
 > and even that has two open bypasses: #507 (an ARP miss admits a Secured extension without
-> digest; a known MAC's extension is rewritten before the check) and #549/#525 (a
-> credentialed INVITE's Authorization is relayed verbatim and not bound to the
-> Request-URI, so it can be replayed; fix #555, not merged).
+> digest; a known MAC's extension is rewritten before the check) and the residuals of
+> credential replay: #549 is fixed by #555 (the digest uri must equal the Request-URI,
+> To must match it, and the INVITE's credential is stripped before any fork), but
+> #560 (the relayed ACK and re-INVITE/UPDATE still carry the INVITE's credential; fix #562 open) and #525 (a nonce/`nc` can be reused within its 5-minute life).
 > So any peer that can reach UDP/5060, over the open AP *or* over a wired LAN, where TB-1
 > does not apply at all, can still claim an unclaimed extension and call as an unsecured
-> one. Binding an INVITE to its caller's registered address is #503 (in flight). The HTTP
+> one, from the address it registered from (#503 refuses an INVITE from any other). The HTTP
 > admin plane has no equivalent hole: it is credential-gated from the first boot.
 > Securing the fleet's devices (or running `secure`) is therefore the one hardening step
 > that every deployment needs, ahead of everything else in §7.
@@ -177,8 +178,8 @@ Each row lists the threat, the current mitigation, and the **residual risk**.
 |----|--------|-----------|---------------|
 | D-1 | Connection/slowloris exhaustion on HTTP | Detached per-connection threads, `SO_RCVTIMEO` (5 s), body cap; since #529 a 10 s deadline on everything read before dispatch (a trickled body is dropped and counted) and at most 3 of the 4 slots per source address. | A flood from the open AP can still pressure a constrained MCU. **This row assumes a *flood* is what it takes. On `main` today it is not, see D-5, where a handful of ordinary rejected requests is enough.** |
 | D-5 | **Resource exhaustion via the admin plane, what a *rejected* request costs.** E-2 reasons about what an unauthenticated read *discloses*; nothing in this section reasoned about the cost of a request the server refuses. An attacker who cannot authenticate at all can still make the server do work, and still make it allocate. | **Partial, and currently defeated by a bug.** The intended design is that every route in `handleClient()` falls through to the single `closeSocket(clientSock)` at `src/Helpers/HttpServer.cpp:763`, so a refused request costs one short-lived socket and nothing else. Gated routes are written `if (requireAdmin(...)) { ... }` precisely so the false branch reaches that close. **Three routes are written the other way**, `if (!requireAdmin(clientSock, req, false)) return;` at `:493` (`GET /api/moh`), `:500` (`POST /api/moh/preview`) and `:505` (`POST /api/moh/preview/stop`), and that early `return` jumps straight over the close. The socket is leaked on **every** rejected request, and `requireAdmin()` (`:2079-2125`) rejects on four separate paths: failed same-origin, no/invalid session (`401`), missing CSRF (`403`), and `setup_required` on a board whose default credential has not been replaced (`403`). Rate limiting on the SIP socket does not apply to the HTTP listener. | **High, and reachable with no credential.** Each refused request permanently consumes one lwIP socket; the descriptor table is the whole budget, and the WAN anchor holds persistent TLS sockets out of that same pool. **The bench board's effective budget is unresolved**: `sdkconfig.defaults:165` sets `CONFIG_LWIP_MAX_SOCKETS=48` (the constrained profile, `sdkconfig.defaults.esp32_constrained:43`, sets 8), while [PR #215](https://github.com/GlomarGadaffi/pocket-dial/pull/215)'s write-up cites 16 for the board it measured. The 14-request figure below is the **measurement**, not a derivation from either number, treat the exact threshold as board-dependent and the failure mode as certain. Bench measurement on merged `main` (`e20226d`): unauthenticated requests to `/api/moh`, **request 14 could not connect, 0/60 connections cleanly closed, and `/api/status` went unreachable**, i.e. the board left the network. The board does not recover without a reboot. A fresh board is *more* exposed, not less: before the operator sets a credential every gated route answers `403 setup_required` through the same leaking path. Fixed by [#215](https://github.com/GlomarGadaffi/pocket-dial/pull/215) (converted the three MOH routes to the fall-through form), **but the pattern was reintroduced afterward**: commit `9356d2d` ("wire up the dead RFC 5424 module") added `GET /api/syslog` and `POST /api/syslog` using the exact `if (!requireAdmin(...)) return;` form #215 had just eliminated, and neither route nor the reintroduction was caught until issue #159's PR noticed it while adding adjacent routes to the same file and fixed both (converted to the fall-through form, same as the rest of `handleClient()`). The durable fix, an RAII socket guard in `handleClient()` so the close cannot depend on each future route author noticing the convention, is still not done; until it is, **treat the HTTP listener as reachable-only-by-trusted-hosts on any board that matters**, and treat every future PR touching this file as needing this row re-checked, not just its own new routes. |
-| D-2 | Malicious call teardown (`/api/kill` abuse) | Admin-gated (session + CSRF) from first boot. | The fresh-board credential race (§5.1); **SIP-layer teardown (BYE spoofing)** is checked against a dialog leg's source address (#46, `isDialogSourceAuthorized()`), which is spoofable on the link. The check is not total: a handset-side BYE on a trunk call is answered before it (`RequestsHandler.cpp:5268`), and it fails open on a half-set-up dialog (`:9500-9503`). `open`, the old default, is retired (#441/#502), but a Learned (unsecured) extension still proves nothing (S-3, §9). |
-| D-3 | Login-lockout used as self-DoS | **NOT retired. Per-client keying is wired since #530, but the aggregate backstop still lets one address lock the admin out.** `handleClient()` sets `req.clientIp` from the peer address on every request (`HttpServer.cpp:576`), and `sendApiAdminLogin` keys both the lockout check and the accounting on that address plus the principal the username resolves to (`isLockedOutForAuth()` / `authenticate()`, `HttpServer.cpp:4375-4386`; principals from #173). One guessing client's *bucket* locks after 5 failures (60/120/240 s, doubling). (Before #530 nothing filled in the key, so every web login shared one unkeyed bucket and a single guesser *could* lock the admin out; an audit caught this row claiming otherwise.) Pre-existing sessions stay valid, and only `login` is throttled (`429`). | An **aggregate** backstop per principal (20 consecutive failures across all clients, the same doubling cooldown, capped at 16 min; `kMaxFailedAttemptsGlobal`, `AdminAuth.hpp:82`) still exists by design; without it, address spoofing would buy an attacker a fresh bucket every 5 guesses (§5.2). It is shared across clients, and **one address is enough to trip it**: `gb.failures` keeps counting across that client's own 60/120/240 s cooldowns and is cleared only by a correct login or a trip (`AdminAuth.cpp:1339-1356`), so a single guesser reaches the 20th failure in about 7 minutes and locks the real admin out, escalating to 16 minutes per trip. It auto-clears, and pre-existing sessions stay valid. The DTMF PIN path has no HTTP peer, so it uses the unkeyed `""` bucket and its own legacy counter. **Residual (#561):** that bucket lives in the same 8-slot LRU table as the per-address web-login buckets (`AdminAuth.cpp:941-966`, `:1480`), so eight failed web logins from fresh addresses evict it and clear an engaged PIN lockout, and the PIN guards the remote factory reset (E-4). |
+| D-2 | Malicious call teardown (`/api/kill` abuse) | Admin-gated (session + CSRF) from first boot. | The fresh-board credential race (§5.1); **SIP-layer teardown (BYE spoofing)** is checked against a dialog leg's source address (#46, `isDialogSourceAuthorized()`), which is spoofable on the link. The check is not total: a handset-side BYE on a trunk call is answered before it (`RequestsHandler.cpp:5385`), and it fails open on a half-set-up dialog (`:9622-9625`). `open`, the old default, is retired (#441/#502), but a Learned (unsecured) extension still proves nothing (S-3, §9). |
+| D-3 | Login-lockout used as self-DoS | **NOT retired. Per-client keying is wired since #530, but the aggregate backstop still lets one address lock the admin out.** `handleClient()` sets `req.clientIp` from the peer address on every request (`HttpServer.cpp:684`), and `sendApiAdminLogin` keys both the lockout check and the accounting on that address plus the principal the username resolves to (`isLockedOutForAuth()` / `authenticate()`, `HttpServer.cpp:4517-4528`; principals from #173). One guessing client's *bucket* locks after 5 failures (60/120/240 s, doubling). (Before #530 nothing filled in the key, so every web login shared one unkeyed bucket and a single guesser *could* lock the admin out; an audit caught this row claiming otherwise.) Pre-existing sessions stay valid, and only `login` is throttled (`429`). | An **aggregate** backstop per principal (20 consecutive failures across all clients, the same doubling cooldown, capped at 16 min; `kMaxFailedAttemptsGlobal`, `AdminAuth.hpp:82`) still exists by design; without it, address spoofing would buy an attacker a fresh bucket every 5 guesses (§5.2). It is shared across clients, and **one address is enough to trip it**: `gb.failures` keeps counting across that client's own 60/120/240 s cooldowns and is cleared only by a correct login or a trip (`AdminAuth.cpp:1339-1356`), so a single guesser reaches the 20th failure in about 7 minutes and locks the real admin out, escalating to 16 minutes per trip. It auto-clears, and pre-existing sessions stay valid. The DTMF PIN path has no HTTP peer, so it uses the unkeyed `""` bucket and its own legacy counter. **Residual (#561):** that bucket lives in the same 8-slot LRU table as the per-address web-login buckets (`AdminAuth.cpp:941-966`, `:1480`), so eight failed web logins from fresh addresses evict it and clear an engaged PIN lockout, and the PIN guards the remote factory reset (E-4). |
 | D-4 | RF jamming / deauth of the SoftAP | None (inherent to WiFi). | Out of scope; physical/RF layer. |
 
 ### Elevation of Privilege
@@ -287,9 +288,9 @@ Two boot-time behaviours interact with this:
   nothing supplied the key on the login path, so every web login shared one bucket. #530
   wired it.)* `AdminAuth` keeps a fixed table of 8 least-recently-seen-evicted buckets keyed
   on a client string (`kMaxAttemptBuckets`, `AdminAuth.hpp:70`). `handleClient()` now sets
-  `req.clientIp` from the peer address on every request (`HttpServer.cpp:576`), and
+  `req.clientIp` from the peer address on every request (`HttpServer.cpp:684`), and
   `sendApiAdminLogin` keys each attempt on that address plus the principal the username
-  resolves to (`HttpServer.cpp:4375-4386`, #173). One guessing client on the link locks out
+  resolves to (`HttpServer.cpp:4517-4528`, #173). One guessing client on the link locks out
   only its own bucket, but the aggregate backstop below still lets it lock the admin out
   (D-3 is not retired). The key is for *fairness, not trust*,
   since a source address is trivially spoofable on the shared link,
@@ -483,8 +484,8 @@ trusted-LAN assumption and the registrar mode (§9) carry the whole load.
   (digest auth, Learn mode, the extension↔MAC lock, a dashboard panel, `GET`/`POST
   /api/registrar`, and the flash-time `cfgseed` route for headless boards). What is left is
   operator work: promote devices to Secured (or run `secure`) so their REGISTER and INVITE
-  prove a secret (#505/#512; open bypasses #507 and #549/#525); binding an INVITE to its caller's registered address is #503
-  (in flight). See §9 and the operator runbook [LEARN_MODE.md](LEARN_MODE.md). *Narrows
+  prove a secret (#505/#512; open residuals #507, #560 and #525; #549 fixed by #555); an INVITE
+  is bound to its caller's registered address (#503). See §9 and the operator runbook [LEARN_MODE.md](LEARN_MODE.md). *Narrows
   S-3/D-2, which nothing else in this list does: WPA2 gates who joins the link, but a
   legitimately-joined peer is still unauthenticated at the SIP layer until its device is
   Secured.*
@@ -512,10 +513,10 @@ trusted-LAN assumption and the registrar mode (§9) carry the whole load.
 ### P1, soon (meaningful, moderate effort)
 - **SIP digest authentication. DONE.** Challenges REGISTER, and INVITE too (`401`, the
   same stateless nonce): every INVITE in `secure` mode, and a Secured device's INVITE in
-  `learn` mode (#512; `RequestsHandler.cpp:1783-1784`). It protects the extensions that have
+  `learn` mode (#512; `RequestsHandler.cpp:1833-1834`). It protects the extensions that have
   a secret, i.e. devices promoted to Secured or a `secure` deployment, except through two
-  open bypasses: #507 (an ARP miss skips it) and #549/#525 (a credentialed INVITE can be
-  replayed; fix #555, not merged). A Learned extension proves nothing (P0 above).
+  open gaps: #507 (an ARP miss skips it) and #560 (the relayed ACK and re-INVITE/UPDATE still carry the INVITE's credential; fix #562 open) and #525 (a nonce/`nc` can be reused within its 5-minute life). #549 (uri/To binding,
+  credential stripped before a fork) is fixed by #555. A Learned extension proves nothing (P0 above).
 - **Per-client brute-force tracking for `login`. DONE, wired since #530** (replaces the global counter
   and stops the cooldown from resetting the
   failure budget; an aggregate backstop bounds address-spoofing). D-3 is **not** retired: one
@@ -632,7 +633,7 @@ single biggest residual risk on a fresh board. What follows is the machinery tha
 an operator switches modes**, it is shipped and reachable, not automatic. SIP **digest
 authentication** (RFC 2617, MD5 / `qop=auth`) challenges **REGISTER**, 
 and **INVITE** too: every INVITE in `secure`, and a Secured device's INVITE in `learn` (#512),
-with the #507 and #549/#525 bypasses still open. The registrar mode is **runtime-selectable**
+with #507, #560 and #525 still open (#549 is fixed by #555). The registrar mode is **runtime-selectable**
 (`learn` / `secure`; `open` is retired, #502);
 **Learn mode** adopts an existing fleet trust-on-first-use, keyed by **device MAC** (resolved
 from the REGISTER's source IP via the LAN ARP table, phones do not carry MAC in SIP), then

@@ -35,8 +35,8 @@ Quick references: [SETUP_GUIDE.md](SETUP_GUIDE.md) ·
 > * The registrar ships in `learn` mode (#441; `open` is retired, #502): a new phone is
 >   adopted on its first REGISTER with no SIP authentication, and its INVITEs are admitted
 >   unchallenged. Digest auth (RFC 2617) applies once an admin promotes the device to
->   Secured, or to every extension in `secure` mode, minus two open bypasses (#507:
->   an ARP miss skips it; #549/#525: an INVITE credential can be replayed).
+>   Secured, or to every extension in `secure` mode, minus open gaps (#507: an ARP miss
+>   skips it; #560: in-dialog relays still carry the credential; #525: nonce reuse).
 > * The SoftAP is **open** by default, the dashboard is **plain HTTP**, and OTA images are
 >   **unsigned**. All three are deliberate defaults, not oversights.
 
@@ -400,7 +400,7 @@ Two counters can produce it (`AdminAuth.hpp:60-82`, [THREAT_MODEL.md §5.2](THRE
 | Counter | Threshold | Cooldown |
 | :--- | :--- | :--- |
 | **Per-client** (since #530), keyed on the HTTP peer address and principal, 8 LRU buckets | **5** consecutive failures (`kMaxFailedAttempts`) | 60 s (`kLockoutMs`), **doubling on each successive lockout**, capped at ~16 min (`kMaxLockoutShift = 4`) |
-| **Aggregate backstop**, across *all* clients | **20** consecutive failures (`kMaxFailedAttemptsGlobal`) | Same doubling ladder, also up to ~16 min; locks out **everyone** |
+| **Aggregate backstop**, per principal (username), across *all* clients | **20** consecutive failures (`kMaxFailedAttemptsGlobal`) | Same doubling ladder, also up to ~16 min; locks out that principal from **every** client (the other principal is unaffected) |
 
 What will surprise you:
 

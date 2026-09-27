@@ -463,7 +463,7 @@ re-login mints a **new** token, re-capture it, do not reuse the old one. `GET
 | Counter | Trips at | Cooldown |
 | :--- | :--- | :--- |
 | **Per-client** (since #530), keyed on the HTTP peer address and principal, 8 LRU buckets | 5 consecutive failures (`kMaxFailedAttempts`) | 60 s (`kLockoutMs`), **doubling per successive trip**, capped ~16 min (`kMaxLockoutShift = 4`) |
-| **Aggregate backstop**, across all clients | 20 consecutive failures (`kMaxFailedAttemptsGlobal`) | Same doubling ladder, also up to ~16 min; locks out **everyone** |
+| **Aggregate backstop**, per principal (username), across all clients | 20 consecutive failures (`kMaxFailedAttemptsGlobal`) | Same doubling ladder, also up to ~16 min; locks out that principal from **every** client (the other principal is unaffected) |
 
 * **The trip count survives the cooldown.** The second lockout is 2 min, the third 4 min, and only a **correct login** clears either counter.
 * **The DTMF PIN has its own bucket in the same table.** `AdminAuth::verifyDtmfPin()` accounts against the unkeyed `""` bucket, so PIN and web failures no longer lock each other out, but eight failed web logins from fresh addresses can evict it and clear a PIN lockout (#561).
