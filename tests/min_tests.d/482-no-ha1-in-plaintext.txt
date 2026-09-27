@@ -1,0 +1,4 @@
+# ConfigExportImport_test.cpp: no HA1 in a plaintext/readable export (2), encrypted
+# round trip, plaintext-only import, legacy plaintext HA1s, and the #484 review:
+# sysop cannot import secrets, REPLACE clears absent secrets, short export password (#482)
+8

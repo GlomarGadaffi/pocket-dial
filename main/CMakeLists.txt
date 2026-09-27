@@ -259,7 +259,12 @@ if(SIP_CONSTRAINED)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         POCKETDIAL_MAX_CLIENTS=8
         POCKETDIAL_MAX_SESSIONS=4
-        POCKETDIAL_MSG_POOL=8)
+        POCKETDIAL_MSG_POOL=8
+        # Issue #466: no PSRAM on this profile, so a MoH clip or voicemail
+        # greeting can only live in internal DRAM -- capped at 16 KB (2 s of
+        # 8 kHz mu-law), loaded at boot/admin upload only, refused and counted
+        # above it.
+        POCKETDIAL_CLIP_INTERNAL_MAX_BYTES=16384)
     # #416: the pcap ring is fixed storage (ring x ~2.1 KB), and a constrained build
     # has no PSRAM (sdkconfig.defaults.esp32_constrained: CONFIG_SPIRAM=n), so all of
     # it is internal DRAM. 4 slots ~= 8.4 KB instead of 16 ~= 33.7 KB. Set as a CMake
@@ -268,7 +273,7 @@ if(SIP_CONSTRAINED)
     if(NOT DEFINED POCKETDIAL_PCAP_RING_SIZE)
         set(POCKETDIAL_PCAP_RING_SIZE 4)
     endif()
-    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 pcap=${POCKETDIAL_PCAP_RING_SIZE})")
+    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 pcap=${POCKETDIAL_PCAP_RING_SIZE})")
 endif()
 
 # PcapCapture.hpp has always advertised itself as "compile-time tunable
