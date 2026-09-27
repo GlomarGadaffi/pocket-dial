@@ -1772,7 +1772,16 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// so it verifies against INVITE. The stateless 401 needs no session; the
 	// credentialed retry arrives with CSeq+1 and falls through here. Learn mode
 	// keeps its TOFU semantics (the open mode is retired, #500).
-	if (_registrar.getMode() == RegistrarMode::Secure)
+	//
+	// Issue #505: in Learn mode a device an admin has promoted to Secured is
+	// digest-enforced on REGISTER already; its CALLS now prove the same secret.
+	// Otherwise a spoofed INVITE naming a Secured extension (with its source IP
+	// forged past #497's binding) would place calls as it. Unsecured Learned
+	// extensions keep TOFU (they have no secret to check; #440).
+	// std::string_view: no allocation on every INVITE; the string is built only
+	// when a challenge actually runs (BigDog's #512 review, #284).
+	if (_registrar.getMode() == RegistrarMode::Secure ||
+		_registrar.isExtensionSecured(data->getFromNumber()))
 	{
 		std::string rejectReason;
 		const Registrar::AuthDecision decision =
