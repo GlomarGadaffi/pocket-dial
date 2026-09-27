@@ -13,7 +13,7 @@
 
 // ── Registrar admission + adopted-device registry (STAGE 2) ───────────────────
 // The REGISTER-side state machine extracted from RequestsHandler: runtime
-// registrar policy (Open / Learn / Secure), digest challenge/verify, and the
+// registrar policy (Learn / Secure; open is retired, #500), digest challenge/verify, and the
 // Learn-mode TOFU + MAC-lock adoption lifecycle with its NVS-persisted device
 // table.
 //
@@ -23,12 +23,31 @@
 class Registrar
 {
 public:
+	// The open registrar (value 0: accept every REGISTER, no challenge) is
+	// RETIRED (#500, desmo 2026-09-27). The byte 0 still decodes (decodeStored),
+	// as Learn, so a board that stored it keeps admitting its phones -- but no
+	// code path can select open any more, which the missing enumerator proves.
 	enum class Mode : uint8_t
 	{
-		Open   = 0,   // standalone: accept every REGISTER, no challenge (legacy)
 		Learn  = 1,   // TOFU + MAC-lock: adopt unknown devices, enforce secured ones
 		Secure = 2,   // require digest auth for every provisioned extension
 	};
+
+	// NVS byte -> mode. 1 and 2 are themselves; 0 (the retired open) is Learn,
+	// flagged so loadMode() rewrites it once. Anything else is not a mode.
+	struct StoredMode
+	{
+		bool valid;
+		Mode mode;
+		bool wasRetiredOpen;
+	};
+	static StoredMode decodeStored(uint8_t v)
+	{
+		if (v == 0) return {true, Mode::Learn, true};
+		if (v == static_cast<uint8_t>(Mode::Learn)) return {true, Mode::Learn, false};
+		if (v == static_cast<uint8_t>(Mode::Secure)) return {true, Mode::Secure, false};
+		return {false, Mode::Learn, false};
+	}
 
 	enum class DeviceState : uint8_t
 	{
@@ -47,6 +66,25 @@ public:
 	enum class AuthDecision : uint8_t { Accept, Challenge, Reject };
 
 	Registrar(PbxEnv& env, Mode defaultMode) : _env(env), _mode(defaultMode) {}
+
+	// ── Boot-time default (issue #397) ────────────────────────────────────────
+	// What mode a board boots in when NVS has no reg_mode, and whether to write
+	// it back. Pure, so the host suite tests the rule the board runs.
+	//   stored mode present            -> that mode, nothing written
+	//   no stored mode, trusted store  -> Learn, persisted
+	//   no stored mode, Uncertain store (unreadable, failed/downgrade schema)
+	//                                  -> Learn, NOT persisted: re-decided next boot
+	// A missing key is also what every failed write looks like, so it fails safe
+	// (#441 review). Open no longer exists at all (#500): a deployed pre-#397
+	// board that ran it gets Learn written by the schema v1 -> v2 migration
+	// (DeviceConfig.cpp, migrateRetireOpenRegistrar).
+	enum class BootSchema : uint8_t { FreshInstall, Upgraded, Uncertain };
+	struct BootModeDecision
+	{
+		Mode mode;
+		bool persist;
+	};
+	static BootModeDecision chooseBootMode(bool haveStored, Mode stored, BootSchema schema);
 
 	// ── Mode ──────────────────────────────────────────────────────────────────
 	// setMode persists write-through (caller holds _mutex); getMode is lock-free.
@@ -75,7 +113,7 @@ public:
 	void loadDevices();   // boot-time NVS reload; runs single-threaded pre-dispatch
 	// Mark a device online/offline after a (de)registration. Online state is
 	// volatile registration state — never persisted. No-op if the MAC isn't
-	// adopted (e.g. Open mode never records).
+	// adopted (e.g. a Learn REGISTER whose ARP lookup missed never records).
 	void markOnline(const std::string& mac, bool online);
 	// Promote a device to Secured (MAC-locked + digest-enforced). Accepts a
 	// 12-hex MAC or an extension. Returns true if a record actually changed.
@@ -123,7 +161,7 @@ private:
 		bool online = false;   // volatile; not persisted
 	};
 
-	void persistMode();
+	bool persistMode();   // false (and logged at ERROR) if any NVS step failed
 	void persistDevices();
 	// Find a record by MAC key or, failing that, by adopted extension.
 	std::unordered_map<std::string, DeviceRecord>::iterator findDevice(const std::string& macOrExt);

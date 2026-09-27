@@ -230,8 +230,8 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	_cdr.load();
 	// Task 2B: load the admin extension from NVS (defaults to "1001" if absent).
 	_dtmf.load();
-	// STAGE 2: load the registrar mode (defaults to the POCKETDIAL_OPEN_REGISTRAR
-	// seed) and the adopted-device registry from NVS.
+	// STAGE 2: load the registrar mode (with none stored, decided once and saved
+	// by Registrar::chooseBootMode(), #397) and the adopted-device registry.
 	_registrar.loadMode();
 	_registrar.loadDevices();
 	// Prewarm the per-extension HA1 cache off the REGISTER hot path so the first
@@ -946,6 +946,12 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// drainOutbox() reads this to keep a retransmit timer off it; see the
 		// member's declaration for why that matters.
 		_passThroughMsg = request.get();
+		// #424: drainOutbox() refuses any reply to a response or an ACK.
+		if (request->getStatusInfo().has_value() || request->getType() == SipMessageTypes::ACK)
+			_noReplyInbound = request;
+		else
+			_noReplyInbound.reset();
+		clearRelayMarks();
 
 		if (!sdpRefused && !absorbed)
 		{
@@ -1108,6 +1114,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 
 		localOutbox = drainOutbox();
 		_passThroughMsg = nullptr;
+		_noReplyInbound.reset();
 
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -1199,7 +1206,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	// (PbxConfig.hpp) for the full reasoning behind each case.
 	//
 	// Same placement rationale as the service-name guard just above: BEFORE the
-	// registrar-mode admission so Open/Secure/Learn all refuse identically, and
+	// registrar-mode admission so Learn and Secure refuse identically, and
 	// 403 (not 400) because the AOR is well-formed — it is the identity that is
 	// refused.
 	if (pbx::isReservedOrPstnAor(fromNumber))
@@ -1211,18 +1218,16 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	}
 
 	// ── Registrar-mode admission (STAGE 2) ───────────────────────────────────────
-	// Runtime policy replaces the old compile-time POCKETDIAL_OPEN_REGISTRAR gate.
-	//   Open   : accept every REGISTER (legacy standalone behaviour).
+	// Every REGISTER is admitted by policy; there is no accept-everything mode
+	// (the open registrar is retired, #500).
 	//   Secure : digest-challenge + verify against the stored HA1 for this ext.
 	//   Learn  : TOFU + MAC-lock — adopt unknown devices, enforce secured ones.
 	// On Challenge the helper has already enqueued the 401 + WWW-Authenticate; on
 	// Reject we emit the 403 here from rejectReason. Either way a non-Accept stops.
 	const std::string extStr(fromNumber);
-	const RegistrarMode mode = _registrar.getMode();
-	if (mode != RegistrarMode::Open)
 	{
 		std::string rejectReason;
-		Registrar::AuthDecision decision = (mode == RegistrarMode::Secure)
+		const Registrar::AuthDecision decision = (_registrar.getMode() == RegistrarMode::Secure)
 			? _registrar.admitSecure(data, extStr, rejectReason)
 			: _registrar.admitLearn(data, extStr, rejectReason);
 
@@ -1272,9 +1277,12 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			// brief intercom auto-answer INVITE so it plays its own tone, then tear
 			// the call back down. Signaling-only: the server sources NO RTP. Bounded
 			// and best-effort — if the beep table is full the beep is simply skipped.
+			// Issue #408: never in the same pass as this REGISTER's 200 OK -- it goes
+			// out from tick() about kAfterRegisterDelay later, once the phone has had
+			// time to finish its own startup.
 			if (isNewBinding)
 			{
-				_beeper.sendBeep(newClient);
+				_beeper.sendBeep(newClient, RegisterBeeper::kAfterRegisterDelay);
 			}
 			if (deviceMac.has_value()) _registrar.markOnline(*deviceMac, true);
 		}
@@ -1309,7 +1317,14 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	// The PBX is unambiguously the UAS of a REGISTER, so there is no relay
 	// question on this path.
 	addCapabilityHeaders(*response);
-	endHandle(fromNumber, response);
+	// Issue #523: answer the transaction's source, like the 400/503 above, never
+	// through endHandle(). endHandle() finds the destination by number, and an
+	// Expires: 0 de-REGISTER has just released that number's client, so it took
+	// the not-found branch and answered every de-registration 404. RFC 3261 §10.3:
+	// a removal (even of a binding that never existed) is a 200. For a lease
+	// grant the two addresses are the same: allocateClient() has just stored
+	// data->getSource() as the binding's address.
+	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
 // ── Capability advertisement (issue #199, root cause 2) ──────────────────────
@@ -1754,7 +1769,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// digest machinery -- admitSecure() takes the method from the request line,
 	// so it verifies against INVITE. The stateless 401 needs no session; the
 	// credentialed retry arrives with CSeq+1 and falls through here. Learn mode
-	// keeps its TOFU semantics and Open mode never challenges.
+	// keeps its TOFU semantics (the open mode is retired, #500).
 	if (_registrar.getMode() == RegistrarMode::Secure)
 	{
 		std::string rejectReason;
@@ -7340,6 +7355,7 @@ void RequestsHandler::endHandle(std::string_view destNumber, std::shared_ptr<Sip
 	auto destClient = findClient(destNumber);
 	if (destClient.has_value())
 	{
+		markRelay(message.get());   // #424: a relay, exempt from the no-reply guard
 		_outbox.emplace_back(destClient.value()->getAddress(), std::move(message));
 	}
 	else
@@ -7501,6 +7517,55 @@ uint64_t RequestsHandler::getPacketsProcessed() const
 uint64_t RequestsHandler::getSdpRejected() const
 {
 	return _sdpRejected.load(std::memory_order_relaxed);
+}
+
+uint32_t RequestsHandler::getRepliesRefused() const
+{
+	return _repliesRefused.load(std::memory_order_relaxed);
+}
+
+void RequestsHandler::markRelay(const SipMessage* msg)
+{
+	if (_relayMarkCount < _relayMarks.size())
+		_relayMarks[_relayMarkCount++] = msg;
+	else
+		_relayMarkOverflow = true;
+}
+
+bool RequestsHandler::isMarkedRelay(const SipMessage* msg) const
+{
+	for (size_t i = 0; i < _relayMarkCount; ++i)
+		if (_relayMarks[i] == msg) return true;
+	return false;
+}
+
+void RequestsHandler::clearRelayMarks()
+{
+	_relayMarkCount = 0;
+	_relayMarkOverflow = false;
+}
+
+// A reply to _noReplyInbound is a RESPONSE the PBX built (not relayed), sent
+// back to the address the inbound message came from, in the same transaction:
+// same Call-ID and same CSeq line (number and method). Every "answer" a handler
+// builds is a clone of the message it answers, so it carries both unchanged.
+// An ACK or BYE the PBX sends in reaction is a request, so it never matches.
+// A relay is told apart by its mark, NOT its address (see _relayMarks): two
+// lines of one handset share an address. The address test only narrows it.
+bool RequestsHandler::isReplyToUnanswerable(const sockaddr_in& addr, const SipMessage& msg)
+{
+	const SipMessage& in = *_noReplyInbound;
+	if (!msg.getStatusInfo().has_value()) return false;
+	if (&msg == &in || isMarkedRelay(&msg)) return false;
+	if (!sameAddress(addr, in.getSource())) return false;
+	if (msg.getCallID() != in.getCallID() || msg.getCSeq() != in.getCSeq()) return false;
+
+	_repliesRefused.fetch_add(1, std::memory_order_relaxed);
+	queueLog("[SIP] #424 refused a reply to " +
+		std::string(in.getStatusInfo().has_value() ? "a response" : "an ACK") + ": " +
+		std::string(msg.getHeader()) + " / " + std::string(in.getCSeq()) + " " +
+		std::string(in.getCallID()), true);
+	return true;
 }
 
 void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipMessage::SdpVerdict verdict)
@@ -8091,6 +8156,7 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 	bool sent = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
+		_noReplyInbound.reset();   // #424: no inbound message owns this drain
 
 		auto client = findClient(ext);
 		if (!client.has_value())
@@ -8280,6 +8346,7 @@ void RequestsHandler::tick()
 		// pointer left behind would silently suppress retransmit tracking for
 		// whatever pooled SipMessage next lands on that address.
 		_passThroughMsg = nullptr;
+		_noReplyInbound.reset();   // #424: same reason; a tick answers nothing
 
 		// The only drain a conference gets when nobody is signalling: an 888 leg
 		// carries RTP but no SIP, so feature codes pressed mid-conference arrive
@@ -9668,6 +9735,20 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 	// ring-back, hunt-group next-ring, CFNA redirect — and now the async-anchor
 	// merge above), which is exactly why it belongs at the drain rather than at
 	// any individual enqueue.
+	// Issue #424: nothing answers a response or an ACK. Refused here, before
+	// retransmit tracking, because a refused reply that got tracked would be
+	// re-sent on Timer G for 32 s (what the register beep's stray 404 did).
+	if (_noReplyInbound && _relayMarkOverflow)
+	{
+		queueLog("[SIP] #424 relay marks overflowed; no reply refused this pass", true);
+	}
+	else if (_noReplyInbound)
+	{
+		_outbox.erase(std::remove_if(_outbox.begin(), _outbox.end(),
+			[this](const auto& e) { return e.second && isReplyToUnanswerable(e.first, *e.second); }),
+			_outbox.end());
+	}
+
 	for (const auto& [addr, msg] : _outbox)
 	{
 		// Skip the one thing that is not ours to retransmit: the inbound message
@@ -9960,6 +10041,23 @@ void RequestsHandler::expireTrunkDeadlinesForTest()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 	_sipTrunk.expireDeadlinesForTest();
+}
+
+void RequestsHandler::fireRegisterBeepsForTest()
+{
+	// Same shape as tick(): produce under _mutex, drain, send outside it.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_outbox.clear();
+		_passThroughMsg = nullptr;
+		_beeper.firePendingNowForTest(std::chrono::steady_clock::now());
+		localOutbox = drainOutbox();
+	}
+	for (auto& event : localOutbox)
+	{
+		_onHandled(event.first, std::move(event.second));
+	}
 }
 
 TrunkResolver::Status RequestsHandler::trunkResolveStatusForTest()

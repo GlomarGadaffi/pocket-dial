@@ -221,6 +221,19 @@ public:
 	// registrar checks this to enforce the single-stream cap.
 	bool isActive() const { return _active.load(std::memory_order_acquire); }
 
+	// True when start() would not be refused for being busy: no live stream and,
+	// on ESP, no earlier receive task still tearing itself down (start() refuses
+	// that too). See RtpSender::canStart() and issue #513.
+	bool canStart() const
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		return !_active.load(std::memory_order_acquire) &&
+		       !_taskRunning.load(std::memory_order_acquire);
+#else
+		return !_active.load(std::memory_order_acquire);
+#endif
+	}
+
 	// The UDP port the receiver is bound on (0 means not started). Lets the
 	// caller advertise it in an SDP answer.
 	int localPort() const { return _localPort.load(std::memory_order_acquire); }

@@ -161,10 +161,12 @@ TEST(InviteAdmission, WidebandOfferIsForwardedWithPreferenceOrderIntact)
 	EXPECT_EQ(fork.find("RTP/AVP 0 8 101"), std::string::npos) << "no blind rewrite";
 }
 
-TEST(InviteAdmission, OpenModeNeverChallengesAnInvite)
+TEST(InviteAdmission, LearnModeNeverChallengesAnInvite)
 {
+	// Learn is the default and the floor now that open is retired (#500).
 	Harness h;
-	h.handler.handle(makeInvite("open", 1, kPcmuOffer));
+	ASSERT_EQ(h.handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
+	h.handler.handle(makeInvite("learn", 1, kPcmuOffer));
 	EXPECT_FALSE(anySentContains(h.sent, "401 Unauthorized"));
 	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@"));
 }
@@ -225,5 +227,5 @@ TEST(InviteAdmission, SecureModeChallengesInviteThenAdmitsCredentialedRetry)
 	EXPECT_TRUE(anySentContains(h.sent, "SIP/2.0 403 Bad Credentials"));
 	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@"));
 
-	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Open);
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
 }

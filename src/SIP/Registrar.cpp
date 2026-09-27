@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "ArpLookup.hpp"
+#include "DeviceConfig.hpp"   // Issue #397: lastSchemaOutcome() decides the boot default
 #include "IDGen.hpp"
 #include "PbxPersist.hpp"
 #include "PoolConfig.hpp"
@@ -22,43 +23,122 @@ void Registrar::setMode(Mode mode)
 {
 	_mode.store(mode, std::memory_order_relaxed);
 	persistMode();
-	const char* name = (mode == Mode::Open)  ? "open"
-	                 : (mode == Mode::Learn) ? "learn"
-	                                         : "secure";
+	const char* name = (mode == Mode::Learn) ? "learn" : "secure";
 	_env.log(std::string("Registrar mode set to ") + name);
+}
+
+Registrar::BootModeDecision Registrar::chooseBootMode(bool haveStored, Mode stored, BootSchema schema)
+{
+	// A missing key is what every failure looks like -- a persist that failed on
+	// a fresh board, a factory reset whose write failed, an unreadable store --
+	// so it means Learn (#441 review). There is no permissive mode left to fall
+	// into: open is retired (#500), and a stored retired-open byte reaches here
+	// already decoded as Learn (decodeStored).
+	if (haveStored) return {stored, false};
+	// Learn admits every first REGISTER, so phones keep working, then MAC-locks
+	// each extension. Persist only when the store is trusted; an uncertain one is
+	// re-decided on the next boot.
+	return {Mode::Learn, schema != BootSchema::Uncertain};
 }
 
 void Registrar::loadMode()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Issue #397: the compiled-in seed used to be Open unconditionally, so every
+	// board out of the box ran an open registrar. Now a board with no stored
+	// mode gets one decided by chooseBootMode() from #181's schema outcome, which
+	// app_main computes (DeviceConfig::ensureSchemaVersion) before the SIP task
+	// constructs this object.
 	nvs_handle_t h;
-	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+	const esp_err_t openErr = nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h);
+	if (openErr != ESP_OK)
 	{
+		// #441 review: this used to return and keep the constructor's Open seed,
+		// so an unreadable store booted an open registrar. Learn, not persisted.
+		_mode.store(Mode::Learn, std::memory_order_relaxed);
+		_env.log(std::string("Registrar: cannot open NVS to read reg_mode (") + esp_err_to_name(openErr) +
+			"); booting learn, not saved (#441)", true);
 		return;
 	}
 	uint8_t v = 0;
-	esp_err_t err = nvs_get_u8(h, "reg_mode", &v);
+	const esp_err_t err = nvs_get_u8(h, "reg_mode", &v);
 	nvs_close(h);
-	if (err == ESP_OK && v <= static_cast<uint8_t>(Mode::Secure))
+	const StoredMode stored = (err == ESP_OK) ? decodeStored(v) : StoredMode{false, Mode::Learn, false};
+	const bool haveStored = stored.valid;
+	if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
 	{
-		_mode.store(static_cast<Mode>(v), std::memory_order_relaxed);
+		_env.log(std::string("Registrar: reading reg_mode failed (") + esp_err_to_name(err) + ")", true);
 	}
-	// else: keep the compile-time-seeded default (Open under POCKETDIAL_OPEN_REGISTRAR).
+
+	BootSchema schema = BootSchema::Uncertain;
+	switch (DeviceConfig::lastSchemaOutcome())
+	{
+	case DeviceConfig::SchemaOutcome::FreshInstall:  schema = BootSchema::FreshInstall; break;
+	case DeviceConfig::SchemaOutcome::AdoptedLegacy:
+	case DeviceConfig::SchemaOutcome::UpToDate:
+	case DeviceConfig::SchemaOutcome::Migrated:      schema = BootSchema::Upgraded; break;
+	default:                                         schema = BootSchema::Uncertain; break;
+	}
+
+	const BootModeDecision d = chooseBootMode(haveStored, stored.mode, schema);
+	_mode.store(d.mode, std::memory_order_relaxed);
+	if (haveStored)
+	{
+		// #500: this board had stored the retired open mode. It now runs Learn;
+		// write that down once so the byte on flash says what the board does.
+		if (stored.wasRetiredOpen)
+		{
+			if (persistMode())
+				_env.log("Registrar: stored mode was open, which is retired; now learn, saved (#500)", true);
+			else
+				_env.log("Registrar: stored mode was open, which is retired; running learn, save FAILED (#500)", true);
+		}
+		return;
+	}
+
+	if (!d.persist)
+	{
+		_env.log("Registrar: no stored mode and the schema is uncertain; booting learn, not saved (#441)", true);
+	}
+	else if (persistMode())
+	{
+		_env.log("Registrar: no stored mode; defaulted to learn and saved it (#397)");
+	}
+	else
+	{
+		// persistMode() logged the cause. Safe either way: with no key the next
+		// boot decides learn again (chooseBootMode never defaults to open).
+		_env.log("Registrar: no stored mode; booting learn, but saving it FAILED (#441)", true);
+	}
 #endif
 }
 
-void Registrar::persistMode()
+bool Registrar::persistMode()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// #441 review: every step is checked and a failure is logged with its cause.
 	nvs_handle_t h;
-	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
+	esp_err_t err = nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h);
+	const char* step = "nvs_open";
+	if (err == ESP_OK)
 	{
-		nvs_set_u8(h, "reg_mode",
-			static_cast<uint8_t>(_mode.load(std::memory_order_relaxed)));
-		nvs_commit(h);
+		err = nvs_set_u8(h, "reg_mode", static_cast<uint8_t>(_mode.load(std::memory_order_relaxed)));
+		step = "nvs_set_u8";
+		if (err == ESP_OK)
+		{
+			err = nvs_commit(h);
+			step = "nvs_commit";
+		}
 		nvs_close(h);
 	}
+	if (err != ESP_OK)
+	{
+		_env.log(std::string("Registrar: persisting reg_mode failed at ") + step + " (" +
+			esp_err_to_name(err) + ")", true);
+		return false;
+	}
 #endif
+	return true;
 }
 
 // ── REGISTER admission ────────────────────────────────────────────────────────
