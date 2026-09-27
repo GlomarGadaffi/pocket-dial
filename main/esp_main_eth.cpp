@@ -506,6 +506,23 @@ static void http_server_task(void* pvParameters)
             srv->getHandler().startHoldMusic("/sdcard/moh.wav");
 #endif
         }
+#if defined(POCKETDIAL_OTA_ROLLBACK_PROBE)
+        // BENCH-ONLY (#395, tools/ota/remote_ota.sh stage 4): an image that
+        // NEVER confirms itself, and restarts itself ~60 s after boot while
+        // still pending -- so the bootloader's rollback can be proven on a board
+        // nobody can reset. Restarts ONLY while pendingVerify: on a bootloader
+        // without rollback the image boots as valid and simply keeps running,
+        // so this can never boot-loop. Never ship it (CMake warns loudly).
+        if (!otaConfirmed && ++otaSettleSec >= 60)
+        {
+            otaConfirmed = true;
+            if (OtaUpdater::isPendingVerify())
+            {
+                ESP_LOGW(TAG, "OTA ROLLBACK PROBE: still pending after 60 s -- restarting WITHOUT markValid()");
+                esp_restart();
+            }
+        }
+#else
         if (!otaConfirmed && ++otaSettleSec >= 5)
         {
             otaConfirmed = true;
@@ -515,6 +532,7 @@ static void http_server_task(void* pvParameters)
                 ESP_LOGI(TAG, "OTA: new image confirmed valid after healthy boot");
             }
         }
+#endif
     }
 
     vTaskDelete(nullptr);
