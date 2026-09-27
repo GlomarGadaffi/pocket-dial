@@ -84,6 +84,10 @@ class Sink
 public:
 	virtual ~Sink() = default;
 	virtual void write(const QueuedRecording& rec, const uint8_t* mulaw) = 0;
+	// Issue #450: factory reset. Deletes every stored recording, greeting and
+	// index under the archive root. Pure virtual on purpose, so no Sink can
+	// silently skip it.
+	virtual void wipe() = 0;
 };
 
 // ── WriterQueue: the enqueue/dequeue mechanics, decoupled from FreeRTOS ─────
