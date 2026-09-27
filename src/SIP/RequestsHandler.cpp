@@ -1792,6 +1792,20 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 			_registrar.sendForbidden(data, rejectReason.empty() ? "Forbidden" : rejectReason);
 			return;
 		}
+		// #512 review (Crew, MEDIUM): the digest now binds the Request-URI
+		// (admitSecure checks auth.uri against it), but this function routes on
+		// the To user. A replayed credential with only To rewritten would still
+		// reach another destination, so on the credentialed path they must agree.
+		if (data->getRequestUriUser() != destNumber)
+		{
+			_registrar.sendForbidden(data, "Request-URI And To Disagree");
+			return;
+		}
+		// The credentials were for this PBX and are spent. Nothing downstream
+		// (a fork, a transfer leg, a response cloned from this request) may carry
+		// them on to anyone who could replay them.
+		data->removeHeaders("Authorization");
+		data->removeHeaders("Proxy-Authorization");
 	}
 
 	if (destNumber == "777")
