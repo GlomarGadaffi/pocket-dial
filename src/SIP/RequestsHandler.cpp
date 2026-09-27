@@ -11,6 +11,9 @@
 #include <algorithm>
 #include "SipMessageTypes.h"
 #include "SipSdpMessage.hpp"
+#if defined(ESP_PLATFORM)
+#include "esp_log.h"   // #533 diag: queueLog() prints to stdout, which syslog never sees
+#endif
 #include "IDGen.hpp"
 #include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include <cstdio>             // #463: snprintf for the OPTIONS ping and snapshot ip:port
@@ -7129,6 +7132,15 @@ bool RequestsHandler::setCallState(std::string_view callID, Session::State state
 
 void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason)
 {
+#if defined(ESP_PLATFORM)
+	// #533 diag: every session teardown funnels through here, and its reason
+	// names the path (reap, audio write failure, session timer, BYE, CANCEL...).
+	// esp_log, not queueLog: queueLog goes to stdout, which syslog never carries.
+	// No numbers: dest can be a dialed PSTN number, which stays out of logs.
+	ESP_LOGW("pbx", "endCall %.*s reason=%.*s",
+		static_cast<int>(callID.size()), callID.data(),
+		static_cast<int>(reason.size()), reason.data());
+#endif
 	// DTMF accumulators are keyed by Call-ID and share the dialog lifecycle; drop
 	// this dialog's entry so DtmfFeatureCodes's _dtmfState can't grow unbounded
 	// across calls (Fix #4).
@@ -7429,6 +7441,27 @@ void RequestsHandler::sweepExpired()
 
 		bool keepAliveTimedOut = (now - client->getLastActiveTime() > std::chrono::seconds(15));
 		bool leaseExpired = client->isExpired(now);
+
+		// Issue #533: a phone mid-call that does not answer our OPTIONS pings (RTP
+		// does not count as activity) was pruned 15 s after its last SIP packet,
+		// and its sessions erased below with no endCall() and no BYE: the anchor
+		// leg dropped, the handset kept a dead call and its later BYE drew 404.
+		// A missed keepalive alone no longer prunes a client that is in a call;
+		// an expired lease still does.
+		if (keepAliveTimedOut && !leaseExpired)
+		{
+			bool inCall = false;
+			for (const auto& [cid, s] : _sessions)
+			{
+				if ((s->getSrc() && s->getSrc()->getNumber() == client->getNumber()) ||
+				    (s->getDest() && s->getDest()->getNumber() == client->getNumber()))
+				{
+					inCall = true;
+					break;
+				}
+			}
+			if (inCall) continue;
+		}
 
 		if (keepAliveTimedOut || leaseExpired)
 		{

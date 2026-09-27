@@ -40,6 +40,10 @@ public:
 
 	void setLastPingTime(std::chrono::steady_clock::time_point t);
 	std::chrono::steady_clock::time_point getLastPingTime() const;
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#533): age the keepalive clock without sleeping 15 s.
+	void setLastActiveTimeForTest(std::chrono::steady_clock::time_point t) { _lastActiveTime = t; }
+#endif
 
 private:
 	std::string _number;

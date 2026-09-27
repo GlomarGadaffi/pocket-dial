@@ -661,6 +661,13 @@ public:
 		return {};
 	}
 
+	// Test-only (#533): make `ext` look silent for `idle`, then run the client sweep.
+	void idleClientAndSweepForTest(const std::string& ext, std::chrono::seconds idle)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (auto c = findClient(ext)) c.value()->setLastActiveTimeForTest(std::chrono::steady_clock::now() - idle);
+		sweepExpired();
+	}
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned)
 	{
