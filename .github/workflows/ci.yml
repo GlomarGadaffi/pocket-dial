@@ -373,6 +373,9 @@ jobs:
       - name: Self-test the test-count checker (#467)
         run: python3 -m unittest discover -s tests/tools -p 'test_check_test_count.py' -v
 
+      - name: Self-test the soak verdict (#401)
+        run: python3 -m unittest discover -s tests/tools -p 'test_soak_verdict.py' -v
+
       - name: Verify Test Count (floor = tests/EXPECTED_MIN_TESTS + tests/min_tests.d)
         run: |
           # ctest counts the whole gtest suite as ONE test ("0 tests failed out
