@@ -172,6 +172,9 @@ namespace
 		{ "pocketdial_packets_dropped_invalid_total", "counter" },   // #430
 		{ "pocketdial_packets_dropped_rate_total", "counter" },      // #430
 		{ "pocketdial_sip_keepalives_crlf_total",  "counter" },      // #430: not drops
+		{ "pocketdial_packets_dropped_no_pool_total", "counter" },   // #443
+		{ "pocketdial_packets_dropped_oversize_total", "counter" },  // #444
+		{ "pocketdial_sip_recv_errors_total",      "counter" },      // #443
 		{ "pocketdial_sdp_rejected_total",         "counter" },
 	};
 }

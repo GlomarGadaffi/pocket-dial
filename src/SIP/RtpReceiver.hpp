@@ -73,6 +73,9 @@ public:
 	// is read but truncated by the kernel to this cap; parseRtp() then bounds-
 	// checks against the actual byte count so a short/oversize read is safe.
 	static constexpr int     MAX_DATAGRAM_BYTES = 512;
+	// Issue #469: inbound RTP datagrams longer than MAX_DATAGRAM_BYTES, dropped
+	// rather than parsed truncated -- across every receiver since boot.
+	static uint32_t rxOversizeDrops();
 
 	// Parsed view of one RTP packet (RFC 3550 §5.1). `payload`/`payloadLen`
 	// point INTO the caller's receive buffer — no copy, no allocation. Valid
@@ -217,6 +220,19 @@ public:
 	// True while a stream is live (socket bound + receive task running). The
 	// registrar checks this to enforce the single-stream cap.
 	bool isActive() const { return _active.load(std::memory_order_acquire); }
+
+	// True when start() would not be refused for being busy: no live stream and,
+	// on ESP, no earlier receive task still tearing itself down (start() refuses
+	// that too). See RtpSender::canStart() and issue #513.
+	bool canStart() const
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		return !_active.load(std::memory_order_acquire) &&
+		       !_taskRunning.load(std::memory_order_acquire);
+#else
+		return !_active.load(std::memory_order_acquire);
+#endif
+	}
 
 	// The UDP port the receiver is bound on (0 means not started). Lets the
 	// caller advertise it in an SDP answer.

@@ -220,6 +220,58 @@ namespace
 		return statusOf(httpPostRaw(port, path, body));
 	}
 
+	// Issue #528: POST from a chosen loopback SOURCE address (127.0.0.2, ...),
+	// so one test can play two clients against one server. Returns "" when
+	// that source can't be bound (a stack that only answers on 127.0.0.1).
+	std::string httpPostFrom(int port, const std::string& srcIp, const std::string& path,
+	                         const std::string& body)
+	{
+#if defined(_WIN32) || defined(_WIN64)
+		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s == INVALID_SOCKET) return "";
+#else
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0) return "";
+#endif
+		sockaddr_in src{};
+		src.sin_family = AF_INET;
+		src.sin_port = 0;
+		inet_pton(AF_INET, srcIp.c_str(), &src.sin_addr);
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(static_cast<uint16_t>(port));
+		inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+		if (bind(s, reinterpret_cast<sockaddr*>(&src), sizeof(src)) != 0 ||
+			connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+		{
+#if defined(_WIN32) || defined(_WIN64)
+			closesocket(s);
+#else
+			close(s);
+#endif
+			return "";
+		}
+		std::string req = "POST " + path + " HTTP/1.1\r\n"
+			"Host: 127.0.0.1\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n"
+			"Content-Type: application/x-www-form-urlencoded\r\n"
+			"Connection: close\r\n\r\n" + body;
+		send(s, req.c_str(), static_cast<int>(req.size()), 0);
+		std::string resp;
+		char buf[512];
+		int n;
+		while ((n = recv(s, buf, sizeof(buf), 0)) > 0)
+		{
+			resp.append(buf, static_cast<size_t>(n));
+		}
+#if defined(_WIN32) || defined(_WIN64)
+		closesocket(s);
+#else
+		close(s);
+#endif
+		return resp;
+	}
+
 }
 
 // ── Boot behavior ────────────────────────────────────────────────────────────
@@ -654,6 +706,48 @@ TEST(WebHardening, GlobalBackstopSitsWellAboveOrdinaryTypos)
 	AdminAuth::clearCredential();
 }
 
+TEST(WebHardening, OneClientsLoginLockoutDoesNotLockOutAnotherOverHttp)
+{
+	// Issue #528: the tests above prove the per-client buckets at the AdminAuth
+	// level, but the HTTP route never passed a client key -- req.clientIp was
+	// set only on the OTA streaming branch -- so every login shared one ""
+	// bucket and one guesser locked the real admin out. This drives the real
+	// route from two loopback source addresses.
+	AdminAuth::clearCredential();
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18085, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string first = httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+		"username=admin&password=wrong-0");
+	if (first.empty())
+	{
+		AdminAuth::clearCredential();
+		GTEST_SKIP() << "this stack can't use 127.0.0.2 as a source address";
+	}
+	EXPECT_EQ(statusOf(first), 401);
+	for (int i = 1; i < AdminAuth::kMaxFailedAttempts; ++i)
+	{
+		const int st = statusOf(httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+			"username=admin&password=wrong-" + std::to_string(i)));
+		EXPECT_TRUE(st == 401 || st == 429) << "attempt " << i << " got " << st;
+	}
+
+	// The guesser is locked out, even with the right password...
+	EXPECT_EQ(statusOf(httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+		"username=admin&password=realpassword123")), 429);
+	// ...and the real admin, from another address, is not.
+	EXPECT_EQ(statusOf(httpPostFrom(18085, "127.0.0.1", "/api/admin/login",
+		"username=admin&password=realpassword123")), 200)
+		<< "one client's lockout must not lock out another (#528)";
+
+	AdminAuth::clearCredential();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Registrar admission mode + Learn-mode extension onboarding.
 //
@@ -680,22 +774,52 @@ TEST(Registrar, ModeRoundTripsThroughTheDashboard)
 	AdminSession a = loginAndCompleteSetup(18100);
 	ASSERT_FALSE(a.cookie.empty());
 
-	// Ships open: POCKETDIAL_OPEN_REGISTRAR seeds the default, and until now
-	// nothing could change it.
+	// Ships learn (#397); the open registrar is retired (#500).
 	std::string get = httpGetRaw(18100, "/api/registrar", "pd_session=" + a.cookie);
 	EXPECT_EQ(statusOf(get), 200);
-	EXPECT_NE(get.find("\"mode\":\"open\""), std::string::npos);
+	EXPECT_NE(get.find("\"mode\":\"learn\""), std::string::npos);
 	EXPECT_NE(get.find("\"attached\":true"), std::string::npos);
 
-	std::string set = httpPostRaw(18100, "/api/registrar", "mode=learn",
+	std::string set = httpPostRaw(18100, "/api/registrar", "mode=secure&confirm=LOCKOUT",
 	                              "pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(set), 200);
-	EXPECT_NE(set.find("\"mode\":\"learn\""), std::string::npos);
-	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
+	EXPECT_NE(set.find("\"mode\":\"secure\""), std::string::npos);
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Secure);
 
 	// And it is readable back, not just accepted.
 	get = httpGetRaw(18100, "/api/registrar", "pd_session=" + a.cookie);
-	EXPECT_NE(get.find("\"mode\":\"learn\""), std::string::npos);
+	EXPECT_NE(get.find("\"mode\":\"secure\""), std::string::npos);
+
+	set = httpPostRaw(18100, "/api/registrar", "mode=learn", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(set), 200);
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
+
+	AdminAuth::clearCredential();
+}
+
+TEST(Registrar, OpenIsNotAModeAnyMore)
+{
+	// #500 (desmo, 2026-09-27): the open registrar is retired. The live setter
+	// refuses it with 400 and changes nothing.
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18104, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	AdminSession a = loginAndCompleteSetup(18104);
+	ASSERT_FALSE(a.cookie.empty());
+	// Start from Secure, not the default, so "unchanged" proves something (#502 review).
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+
+	std::string set = httpPostRaw(18104, "/api/registrar", "mode=open",
+	                              "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(set), 400) << set;
+	EXPECT_NE(set.find("open is retired"), std::string::npos) << set;
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Secure)
+		<< "a refused mode must not change the mode";
 
 	AdminAuth::clearCredential();
 }
@@ -719,7 +843,7 @@ TEST(Registrar, SwitchingToSecureWithNothingSecuredNeedsConfirmation)
 	std::string blocked = httpPostRaw(18101, "/api/registrar", "mode=secure",
 	                                  "pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(blocked), 409);
-	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Open)
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn)
 		<< "a refused switch must not have changed the mode";
 
 	std::string forced = httpPostRaw(18101, "/api/registrar",
@@ -772,7 +896,7 @@ TEST(Registrar, MutatingEndpointsRequireTheCsrfToken)
 
 	AdminSession a = loginAndCompleteSetup(18103);
 
-	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar", "mode=open",
+	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar", "mode=learn",
 	                               "pd_session=" + a.cookie)), 403);
 	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar/device",
 	                               "action=forget&target=1001",

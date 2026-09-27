@@ -127,6 +127,9 @@ namespace
 			});
 
 		s->handler->handle(makeRegister(ext, phoneIp, "reg-" + ext));
+		// #408: the beep goes out a moment after the REGISTER's 200 OK, from
+		// tick(); fire it now rather than wait.
+		s->handler->fireRegisterBeepsForTest();
 		const std::string beep = firstMatching(s->sent, "INVITE sip:" + ext + "@");
 		if (beep.empty()) return s;   // caller ASSERTs on the empty callId
 
@@ -243,4 +246,25 @@ TEST(RegisterBeepRouting, RingingIsSwallowedWithoutAckAndLeavesTheDialogLive)
 	EXPECT_FALSE(firstMatching(s->sent, "BYE sip:508@").empty())
 		<< "the answered beep was never torn down with a BYE";
 	expectNo404(*s, "the 200 OK following a 180");
+}
+
+// Issue #408: pjsua (and a real handset early in its own boot) answers an INVITE
+// with 503 until it is ready, and the beep used to arrive ~1 ms after the
+// REGISTER's 200 OK, in the same pass. It must never share that pass now.
+TEST(RegisterBeepRouting, TheBeepNeverGoesOutInTheRegistersOwnPass)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("460", "192.168.9.46", "reg-460"));
+	EXPECT_FALSE(firstMatching(sent, "SIP/2.0 200 OK").empty()) << "the REGISTER is answered";
+	EXPECT_TRUE(firstMatching(sent, "INVITE sip:460@").empty())
+		<< "the beep must not go out in the same pass as the 200 OK";
+
+	// Once its delay has passed (forced here), it does go out.
+	handler.fireRegisterBeepsForTest();
+	EXPECT_FALSE(firstMatching(sent, "INVITE sip:460@").empty()) << "the beep was lost, not deferred";
 }
