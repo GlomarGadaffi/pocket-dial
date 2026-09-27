@@ -161,6 +161,9 @@ public:
 	uint64_t getDroppedInvalid() const;
 	uint64_t getDroppedRate() const;
 	const DropProbe& getDropProbe() const;
+	// Issue #430: datagrams made only of CR/LF -- RFC 5626 keep-alives, which
+	// phones also send over UDP to hold a NAT binding. Counted, NOT dropped.
+	uint64_t getKeepalivesCrlf() const;
 	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
 	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
@@ -1943,6 +1946,7 @@ private:
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
+	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing

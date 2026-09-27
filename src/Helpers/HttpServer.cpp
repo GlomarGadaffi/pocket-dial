@@ -1487,6 +1487,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	uint64_t dropped = 0;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate = 0;
+	uint64_t keepalivesCrlf = 0;   // Issue #430: not drops
 
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
 	if (handler != nullptr)
@@ -1503,6 +1504,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		dropped = handler->getPacketsDropped();   // Issue #38
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate = handler->getDroppedRate();
+		keepalivesCrlf = handler->getKeepalivesCrlf();
 	}
 
 	std::string displayIp = _ip;
@@ -1534,6 +1536,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// do not.
 	json << "\"droppedInvalid\":" << droppedInvalid << ",";
 	json << "\"droppedRate\":" << droppedRate << ",";
+	// Issue #430: CR/LF-only keep-alives. Counted apart: they are not drops.
+	json << "\"keepalivesCrlf\":" << keepalivesCrlf << ",";
 	json << "\"recentDrops\":[";
 	if (authenticated && handler != nullptr)
 	{
@@ -1892,6 +1896,7 @@ void HttpServer::sendApiMetrics(int sock)
 	uint64_t sdpRejected  = 0;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate  = 0;
+	uint64_t keepalivesCrlf = 0;   // Issue #430
 	size_t   clientCount  = 0;
 	size_t   sessionCount = 0;
 
@@ -1907,6 +1912,7 @@ void HttpServer::sendApiMetrics(int sock)
 		dropped      = handler->getPacketsDropped();
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate  = handler->getDroppedRate();
+		keepalivesCrlf = handler->getKeepalivesCrlf();
 		sdpRejected  = handler->getSdpRejected();
 		clientCount  = handler->getClientCount();
 		sessionCount = handler->getSessionCount();
@@ -1964,6 +1970,11 @@ void HttpServer::sendApiMetrics(int sock)
 	        "The refused share of pocketdial_packets_dropped_total: allowlist or per-IP "
 	        "rate limit (issue #430).",
 	        droppedRate);
+	counter("pocketdial_sip_keepalives_crlf_total",
+	        "CR/LF-only SIP keep-alives (RFC 5626 ping, or a UDP NAT keep-alive) since boot. "
+	        "Not drops: they are counted here instead of pocketdial_packets_dropped_total "
+	        "(issue #430).",
+	        keepalivesCrlf);
 	counter("pocketdial_sdp_rejected_total",
 	        "SDP bodies refused by the admission gate since boot, whether answered 488 "
 	        "or dropped silently (docs/THREAT_MODEL.md T-7).",

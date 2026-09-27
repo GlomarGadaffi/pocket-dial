@@ -798,6 +798,21 @@ void RequestsHandler::initHandlers()
 
 void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_view rawBytes)
 {
+	// Issue #430: a datagram of nothing but CR/LF is a keep-alive, not a malformed
+	// message -- RFC 5626 §3.5.1's double-CRLF ping, which phones also send over
+	// UDP to hold a NAT binding open (on .244, ext 113 sends "\r\n\r\n" every
+	// 32 s, which was the whole idle "drop" rate). RFC 3261 §7.5 says stray CRLFs
+	// are ignored, and over UDP no pong is owed (RFC 5626 §4.4.1 pongs belong to
+	// connection-oriented flows). Count it and stop: it is not a drop, so it no
+	// longer hides real malformed traffic behind a steady floor. Classified from
+	// the wire bytes; a caller that passes none (no rawBytes) cannot claim it.
+	if (!rawBytes.empty() &&
+		rawBytes.find_first_not_of("\r\n") == std::string_view::npos)
+	{
+		_keepalivesCrlf.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
 	// Input validation: Drop null or structurally malformed packets instantly (SEC-02)
 	if (!request || !request->isValidMessage())
 	{
@@ -7501,6 +7516,11 @@ uint64_t RequestsHandler::getDroppedInvalid() const
 uint64_t RequestsHandler::getDroppedRate() const
 {
 	return _dropProbe.rateCount();
+}
+
+uint64_t RequestsHandler::getKeepalivesCrlf() const
+{
+	return _keepalivesCrlf.load(std::memory_order_relaxed);
 }
 
 const DropProbe& RequestsHandler::getDropProbe() const
