@@ -1,0 +1,2 @@
+# CdrPersistBlob_test.cpp: CDR ring as an NVS blob + the #473 reset write guard (+1 #476 review: erase-on-empty) (+1 persistAction)
+8
