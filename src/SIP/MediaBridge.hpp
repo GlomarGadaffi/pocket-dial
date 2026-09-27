@@ -92,6 +92,17 @@ public:
 	// Check if the bridge is currently active
 	bool isActive() const { return _active.load(std::memory_order_acquire); }
 
+	// True when startBridge() would not be refused for being busy: the bridge is
+	// idle and both its RTP endpoints can start now. Issue #513: after
+	// stopBridge() the sender's and receiver's tasks (ESP) take a few ticks to
+	// exit, and until then their start() refuses, so a slot picker asks this
+	// first. Does not predict other failures (bus full, socket errors).
+	bool canStart() const
+	{
+		return !_active.load(std::memory_order_acquire) && _receiver && _sender &&
+		       _receiver->canStart() && _sender->canStart();
+	}
+
 	// Issue #280: true once a call whose audio path was genuinely working has
 	// then failed kMaxConsecutiveWriteFailures writes in a row, with no
 	// success in between. onHandsetRtp()/feedMohTick() are the only writers,
