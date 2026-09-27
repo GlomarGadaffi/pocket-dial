@@ -343,6 +343,28 @@ TEST_F(TrunkHttpTest, RejectsAnOutOfRangePort)
 	EXPECT_TRUE(TrunkConfigStore::load().host.empty()) << "no rejected request may have persisted";
 }
 
+TEST_F(TrunkHttpTest, RejectsATrunkPointedAtThisBoard)
+{
+	// Issue #546: loopback or the board's own address satisfies valid() and
+	// would report an emergency route, but can never reach a carrier.
+	auto s = bypassLogin();
+	for (const char* body : {
+		"host=127.0.0.1&fromUser=1555&enabled=1",
+		"host=localhost&fromUser=1555&enabled=1",
+		"host=127.9.9.9&fromUser=1555&enabled=1",
+		"host=localhost.&fromUser=1555&enabled=1",                      // trailing-dot FQDN
+		"host=%5B%3A%3A1%5D&fromUser=1555&enabled=1",                   // [::1]
+		"host=%3A%3Affff%3A127.0.0.1&fromUser=1555&enabled=1",          // ::ffff:127.0.0.1
+		"host=sip.carrier.example&proxyHost=127.0.0.1&fromUser=1555&enabled=1" })
+	{
+		EXPECT_EQ(statusOf(httpPost(_port, "/api/trunk", body, s.cookie, s.csrf)), 400) << body;
+	}
+	EXPECT_TRUE(TrunkConfigStore::load().host.empty()) << "no rejected request may have persisted";
+	EXPECT_EQ(statusOf(httpPost(_port, "/api/trunk",
+		"host=sip.carrier.example&fromUser=1555&enabled=1", s.cookie, s.csrf)), 200)
+		<< "positive control: a real carrier host still saves";
+}
+
 TEST_F(TrunkHttpTest, RejectsAnOutOfRangeProxyPort)
 {
 	auto s = bypassLogin();

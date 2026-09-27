@@ -171,10 +171,12 @@ namespace
 		{ "pocketdial_packets_dropped_total",      "counter" },
 		{ "pocketdial_packets_dropped_invalid_total", "counter" },   // #430
 		{ "pocketdial_packets_dropped_rate_total", "counter" },      // #430
+		{ "pocketdial_sip_keepalives_crlf_total",  "counter" },      // #430: not drops
 		{ "pocketdial_packets_dropped_no_pool_total", "counter" },   // #443
 		{ "pocketdial_packets_dropped_oversize_total", "counter" },  // #444
 		{ "pocketdial_sip_recv_errors_total",      "counter" },      // #443
 		{ "pocketdial_sdp_rejected_total",         "counter" },
+		{ "pocketdial_invite_unbound_caller_total", "counter" },   // #497
 	};
 }
 
@@ -275,8 +277,8 @@ TEST(MetricsEndpoint, ReachableWithNoSession)
 {
 	// The gating decision, pinned. /metrics is in THREAT_MODEL.md §4 E-2's
 	// read-only-unauthenticated class alongside /api/status, which already
-	// exposes strictly more (the client roster with IPs, live sessions, the
-	// dial plan). It stays reachable even on a fully provisioned board with no
+	// exposes more (the dial plan and the session/park counts; the roster and,
+	// since #539, live sessions' identities need a session). It stays reachable even on a fully provisioned board with no
 	// cookie presented, because a stock Prometheus scraper cannot log in or
 	// echo a CSRF token — a gated /metrics would be a permanently-401 endpoint,
 	// not a hardened one.

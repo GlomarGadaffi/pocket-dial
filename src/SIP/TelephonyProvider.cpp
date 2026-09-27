@@ -18,6 +18,11 @@ bool telephonyProviderImplemented(TelephonyProviderType t)
 	return t == TelephonyProviderType::Loopback || t == TelephonyProviderType::Telephony;
 }
 
+bool telephonyProviderPlacesRealCalls(TelephonyProviderType t)
+{
+	return t == TelephonyProviderType::Telephony;
+}
+
 bool TelephonyProviderRegistry::registerProvider(TelephonyProviderType t, AnchorClient* provider)
 {
 	const size_t i = static_cast<size_t>(t);
