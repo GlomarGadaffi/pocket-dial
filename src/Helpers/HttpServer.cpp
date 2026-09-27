@@ -200,6 +200,33 @@ HttpServer::~HttpServer()
 	{
 		_acceptThread.join();
 	}
+	// Issue #540: every connection runs on a DETACHED thread whose lambda uses
+	// `this` after handleClient() returns (recordConnStackHwm, releaseSource,
+	// _activeConnections). Returning here while one is still running freed the
+	// server under it -- a use-after-free that showed up as a segfault in a
+	// later, unrelated test. No new connection can start (the accept thread is
+	// joined), and each handler is bounded by the read deadline plus its own
+	// work, so wait them out; the bound only guards against a wedged handler.
+	const auto giveUp = std::chrono::steady_clock::now() +
+		std::chrono::milliseconds(_readDeadlineMs + 5000);
+	while (_activeConnections.load(std::memory_order_acquire) > 0 &&
+		std::chrono::steady_clock::now() < giveUp)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	// #540 review: giving up with a handler still running IS the use-after-free
+	// above, just deferred. Never let it pass silently: say so, and on the host
+	// (tests) stop right here, where the cause is, not in whatever runs next.
+	const int stillRunning = _activeConnections.load(std::memory_order_acquire);
+	if (stillRunning > 0)
+	{
+		std::cerr << "[HttpServer] destroyed with " << stillRunning
+			<< " connection handler(s) still running after the read deadline + 5 s"
+			   " -- a wedged handler will touch freed memory (#540)\n";
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+		std::abort();
+#endif
+	}
 }
 
 void HttpServer::start()
