@@ -203,6 +203,26 @@ Registrar::AuthDecision Registrar::admitSecure(
 		return AuthDecision::Challenge;
 	}
 
+	// #512 review (Crew, MEDIUM): the response hash covers auth.uri, not the
+	// Request-URI this request is actually routed on. Without this check one
+	// captured INVITE's credentials authorise a different destination for the
+	// nonce's whole lifetime. RFC 2617 §3.2.2.5: they must be the same URI.
+	// (nc/nonce reuse limits are #525.)
+	{
+		const std::string_view line = data->getHeader();
+		const size_t sp1 = line.find(' ');
+		const size_t sp2 = sp1 == std::string_view::npos ? sp1 : line.find(' ', sp1 + 1);
+		const std::string_view requestUri = sp2 == std::string_view::npos
+			? std::string_view{} : line.substr(sp1 + 1, sp2 - sp1 - 1);
+		if (requestUri.empty() || auth.uri != requestUri)
+		{
+			outRejectReason = "Credentials Not For This Request";
+			_env.log("Secure " + std::string(data->getType()) + " for ext " + ext +
+				": digest uri does not match the Request-URI", true);
+			return AuthDecision::Reject;
+		}
+	}
+
 	// Recompute + constant-time compare. Method is REGISTER.
 	if (!SipDigest::verify(auth, *ha1, std::string(data->getType())))
 	{

@@ -208,8 +208,48 @@ void HttpServer::start()
 	_acceptThread = std::thread(&HttpServer::acceptLoop, this);
 }
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+static std::atomic<bool> s_failSocketTimeoutsForTest{false};
+void HttpServer::setFailSocketTimeoutsForTest(bool fail) { s_failSocketTimeoutsForTest.store(fail); }
+#endif
+
+// Issue #529: SO_RCVTIMEO / SO_SNDTIMEO in milliseconds (at least 1, so 0 never
+// means "forever"). Returns false if the option did not take (#534 review):
+// the caller must then not block on the socket at all, because an unbounded
+// recv() or send() is exactly the slot-holding hang the timeout is there for.
+static bool setSocketTimeoutMs(int sock, int opt, long ms)
+{
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	if (s_failSocketTimeoutsForTest.load()) return false;
+#endif
+	if (ms < 1) ms = 1;
+#if defined _WIN32 || defined _WIN64
+	DWORD tv = static_cast<DWORD>(ms);
+	return setsockopt(sock, SOL_SOCKET, opt, reinterpret_cast<const char*>(&tv), sizeof(tv)) == 0;
+#else
+	struct timeval tv{};
+	tv.tv_sec  = ms / 1000;
+	tv.tv_usec = (ms % 1000) * 1000;
+	return setsockopt(sock, SOL_SOCKET, opt, &tv, sizeof(tv)) == 0;
+#endif
+}
+
+static bool setRecvTimeoutMs(int sock, long ms) { return setSocketTimeoutMs(sock, SO_RCVTIMEO, ms); }
+
 void HttpServer::acceptLoop()
 {
+	// The accept thread's refusals (#368 global cap, #529 per-source) must never
+	// block it: bound the send, and if even that cannot be set, close unanswered
+	// (#534 review). A dropped connection costs the refused client a retry; a
+	// send() that blocks forever costs every client the whole server.
+	const auto refuseBusy = [this](int sock, const char* body) {
+		if (setSocketTimeoutMs(sock, SO_SNDTIMEO, 1000))
+		{
+			sendResponse(sock, 503, "Service Unavailable", "application/json", body);
+		}
+		closeSocket(sock);
+	};
+
 	// Issue #382: checksum + summarise any stored coredump ONCE, here -- this
 	// thread runs on the 8192-byte pthread default (it never resizes itself,
 	// see below), unlike the 4 KB per-connection threads /api/coredump/info is
@@ -322,20 +362,18 @@ void HttpServer::acceptLoop()
 			// and take the whole server down -- a far worse denial of service than
 			// the exhaustion this cap exists to prevent. handleClient()'s 5 s
 			// SO_RCVTIMEO (#23) is set on the handler path we are deliberately
-			// skipping here, so this socket needs its own bound.
-#if defined _WIN32 || defined _WIN64
-			DWORD sndTv = 1000;
-			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO,
-				reinterpret_cast<const char*>(&sndTv), sizeof(sndTv));
-#else
-			timeval sndTv{};
-			sndTv.tv_sec  = 1;
-			sndTv.tv_usec = 0;
-			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, &sndTv, sizeof(sndTv));
-#endif
-			sendResponse(clientSock, 503, "Service Unavailable", "application/json",
-				"{\"error\":\"busy\",\"message\":\"too many concurrent connections\"}");
-			closeSocket(clientSock);
+			// skipping here, so this socket needs its own bound (refuseBusy).
+			refuseBusy(clientSock, "{\"error\":\"busy\",\"message\":\"too many concurrent connections\"}");
+			continue;
+		}
+
+		// Issue #529: one source may not hold every slot. Refused the same
+		// non-blocking way as the global cap above, and counted.
+		const uint32_t sourceAddr = clientAddr.sin_addr.s_addr;
+		if (!claimSource(sourceAddr))
+		{
+			_perSourceRefusals.fetch_add(1, std::memory_order_relaxed);
+			refuseBusy(clientSock, "{\"error\":\"busy\",\"message\":\"too many connections from this address\"}");
 			continue;
 		}
 
@@ -347,15 +385,17 @@ void HttpServer::acceptLoop()
 
 		try
 		{
-			std::thread([this, clientSock]() {
+			std::thread([this, clientSock, sourceAddr]() {
 				handleClient(clientSock);
 				recordConnStackHwm();
+				releaseSource(sourceAddr);
 				_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			}).detach();
 		}
 		catch (const std::exception& e)
 		{
 			// No thread was created, so nothing will ever decrement for this one.
+			releaseSource(sourceAddr);
 			_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			std::cerr << "[HttpServer] connection thread spawn failed: " << e.what()
 				<< " — dropping connection\n";
@@ -370,8 +410,51 @@ void HttpServer::acceptLoop()
 	}
 }
 
+bool HttpServer::claimSource(uint32_t addr)
+{
+	std::lock_guard<std::mutex> lock(_sourcesMutex);
+	SourceSlot* freeSlot = nullptr;
+	for (SourceSlot& s : _sources)
+	{
+		if (s.count > 0 && s.addr == addr)
+		{
+			if (s.count >= kMaxConnectionsPerSource) return false;
+			++s.count;
+			return true;
+		}
+		if (s.count == 0 && freeSlot == nullptr) freeSlot = &s;
+	}
+	// The global cap is checked first, so a live source always has a slot here;
+	// refuse rather than overrun if that ever stops being true.
+	if (freeSlot == nullptr) return false;
+	freeSlot->addr = addr;
+	freeSlot->count = 1;
+	return true;
+}
+
+void HttpServer::releaseSource(uint32_t addr)
+{
+	std::lock_guard<std::mutex> lock(_sourcesMutex);
+	for (SourceSlot& s : _sources)
+	{
+		if (s.count > 0 && s.addr == addr)
+		{
+			--s.count;
+			return;
+		}
+	}
+}
+
+
 void HttpServer::handleClient(int clientSock)
 {
+	// Issue #529: everything read before dispatch shares one deadline.
+	const auto readDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(_readDeadlineMs);
+	const auto msLeft = [&readDeadline]() -> long {
+		return static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+			readDeadline - std::chrono::steady_clock::now()).count());
+	};
+
 	// Peer address, for per-client brute-force accounting on /api/admin/login.
 	// Best-effort: an empty string falls back to AdminAuth's shared unkeyed
 	// bucket, which is the old global behaviour rather than an open door.
@@ -394,13 +477,15 @@ void HttpServer::handleClient(int clientSock)
 	}
 
 	// Issue #23 resolved: Added SO_RCVTIMEO per-client socket timeout and capped Content-Length to 16KB to prevent Accept thread DoS
-#if defined _WIN32 || defined _WIN64
-	DWORD tv = 5000; // 5 seconds timeout
-	setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-	struct timeval tv{ .tv_sec = 5, .tv_usec = 0 };
-	setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
+	// Issue #529: 5 s per recv(), but never past the read deadline. If the
+	// timeout cannot be set, recv() would wait forever: drop the connection
+	// unread and count it with the deadline drops (#534 review).
+	if (!setRecvTimeoutMs(clientSock, (std::min)(5000L, _readDeadlineMs)))
+	{
+		_readDeadlineDrops.fetch_add(1, std::memory_order_relaxed);
+		closeSocket(clientSock);
+		return;
+	}
 
 	// Heap-allocate the read buffer. On ESP32 each connection runs on a detached
 	// std::thread, i.e. an IDF pthread; sdkconfig.defaults sets
@@ -553,12 +638,35 @@ void HttpServer::handleClient(int clientSock)
 				size_t bodyHave   = raw.size() > bodyStart ? raw.size() - bodyStart : 0;
 				while (bodyHave < contentLength)
 				{
+					// Issue #529: a body trickled in a byte every few seconds used to
+					// hold this slot for as long as the sender liked, before any auth
+					// check. Each wait is now cut to what is left of the deadline,
+					// and a body not in by then is dropped and counted.
+					const long left = msLeft();
+					if (left <= 0)
+					{
+						_readDeadlineDrops.fetch_add(1, std::memory_order_relaxed);
+						closeSocket(clientSock);
+						return;
+					}
+					if (!setRecvTimeoutMs(clientSock, (std::min)(5000L, left)))
+					{
+						_readDeadlineDrops.fetch_add(1, std::memory_order_relaxed);
+						closeSocket(clientSock);
+						return;
+					}
 					buf.assign(buf.size(), 0);
 #if defined _WIN32 || defined _WIN64
 					int n = recv(clientSock, buf.data(), static_cast<int>(buf.size()) - 1, 0);
 #else
 					int n = static_cast<int>(recv(clientSock, buf.data(), buf.size() - 1, 0));
 #endif
+					if (n <= 0 && msLeft() <= 0)
+					{
+						_readDeadlineDrops.fetch_add(1, std::memory_order_relaxed);
+						closeSocket(clientSock);
+						return;
+					}
 					if (n <= 0) break;
 					raw.append(buf.data(), static_cast<size_t>(n));
 					bodyHave += static_cast<size_t>(n);
@@ -1667,6 +1775,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	bool e911Configured = false;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate = 0;
+	uint64_t keepalivesCrlf = 0;   // Issue #430: not drops
+	const char* emergencyRoute = nullptr;   // Issue #521; omitted with no engine
 	uint64_t droppedNoPool = 0;    // Issue #443/#444: discarded before handle()
 	uint64_t droppedOversize = 0;
 	uint64_t recvErrors = 0;
@@ -1688,6 +1798,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		e911Configured = handler->isE911Configured();   // #450
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate = handler->getDroppedRate();
+		keepalivesCrlf = handler->getKeepalivesCrlf();
+		emergencyRoute = RequestsHandler::emergencyRouteName(handler->emergencyRoute());
 		const DropProbe& probe = handler->getDropProbe();
 		droppedNoPool = probe.count(DropProbe::Reason::NoPool);
 		droppedOversize = probe.count(DropProbe::Reason::Oversize);
@@ -1706,6 +1818,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"ip\":\"" << jsonEscape(displayIp) << "\",";
 	json << "\"port\":" << 5060 << ",";
 	json << "\"httpPort\":" << _port << ",";
+	// #529: HTTP connections dropped for a slow request, and refused because
+	// one source already held its share of the slots.
+	json << "\"httpReadDeadlineDrops\":" << readDeadlineDrops() << ",";
+	json << "\"httpPerSourceRefusals\":" << perSourceRefusals() << ",";
 	// #167: state the board's WiFi capability rather than leaving the dashboard
 	// to infer it from an empty scan result. An eth/lan8720 build has no radio at
 	// all, so "found 0 networks" is not an empty scan -- it is a scan that can
@@ -1715,6 +1831,16 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 #else
 	json << "\"wifiCapable\":false,";
 #endif
+	// Issue #521: where a 911 dial would go -- "anchor", "trunk" or "none".
+	// "none" means the board refuses it with 503 (only the loopback simulator
+	// is configured), and the dashboard keeps a warning banner up for as long
+	// as it says so. Ungated like the rest of this block: whether this phone
+	// system can reach 911 is something anyone at a handset is entitled to
+	// know, and it names no host, account or credential.
+	if (emergencyRoute != nullptr)
+	{
+		json << "\"emergencyRoute\":\"" << emergencyRoute << "\",";
+	}
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
@@ -1727,6 +1853,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// do not.
 	json << "\"droppedInvalid\":" << droppedInvalid << ",";
 	json << "\"droppedRate\":" << droppedRate << ",";
+	// Issue #430: CR/LF-only keep-alives. Counted apart: they are not drops.
+	json << "\"keepalivesCrlf\":" << keepalivesCrlf << ",";
 	// Issue #443/#444: discarded before handle() -- NOT part of packetsDropped.
 	// No message was ever built for these; the ring below records their source
 	// (no_pool, oversize with the datagram's real length). recvErrors are failed
@@ -2125,8 +2253,10 @@ void HttpServer::sendApiMetrics(int sock)
 	uint64_t packets      = 0;
 	uint64_t dropped      = 0;
 	uint64_t sdpRejected  = 0;
+	uint64_t unboundCaller = 0;   // #497
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate  = 0;
+	uint64_t keepalivesCrlf = 0;   // Issue #430
 	uint64_t droppedNoPool = 0;    // Issue #443/#444
 	uint64_t droppedOversize = 0;
 	uint64_t recvErrors = 0;
@@ -2145,11 +2275,13 @@ void HttpServer::sendApiMetrics(int sock)
 		dropped      = handler->getPacketsDropped();
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate  = handler->getDroppedRate();
+		keepalivesCrlf = handler->getKeepalivesCrlf();
 		const DropProbe& probe = handler->getDropProbe();
 		droppedNoPool   = probe.count(DropProbe::Reason::NoPool);
 		droppedOversize = probe.count(DropProbe::Reason::Oversize);
 		recvErrors      = probe.recvErrorCount();
 		sdpRejected  = handler->getSdpRejected();
+		unboundCaller = handler->getUnboundCallerRefusals();
 		clientCount  = handler->getClientCount();
 		sessionCount = handler->getSessionCount();
 	}
@@ -2206,6 +2338,11 @@ void HttpServer::sendApiMetrics(int sock)
 	        "The refused share of pocketdial_packets_dropped_total: allowlist or per-IP "
 	        "rate limit (issue #430).",
 	        droppedRate);
+	counter("pocketdial_sip_keepalives_crlf_total",
+	        "CR/LF-only SIP keep-alives (RFC 5626 ping, or a UDP NAT keep-alive) since boot. "
+	        "Not drops: they are counted here instead of pocketdial_packets_dropped_total "
+	        "(issue #430).",
+	        keepalivesCrlf);
 	counter("pocketdial_packets_dropped_no_pool_total",
 	        "SIP datagrams discarded before parsing because the message pool and its "
 	        "bounded heap fallback were spent (issue #443). Not in "
@@ -2223,6 +2360,11 @@ void HttpServer::sendApiMetrics(int sock)
 	        "SDP bodies refused by the admission gate since boot, whether answered 488 "
 	        "or dropped silently (docs/THREAT_MODEL.md T-7).",
 	        sdpRejected);
+	counter("pocketdial_invite_unbound_caller_total",
+	        "INVITEs refused 403 because they did not come from the address the calling "
+	        "extension registered from (issue #497): spoofed callers, or a phone that moved "
+	        "without re-registering.",
+	        unboundCaller);
 
 	// "text/plain; version=0.0.4" is THE exposition-format content type — the
 	// version parameter is how a scraper picks its parser, so it is not

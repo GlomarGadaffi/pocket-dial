@@ -158,6 +158,9 @@ public:
 	uint64_t getDroppedInvalid() const;
 	uint64_t getDroppedRate() const;
 	const DropProbe& getDropProbe() const;
+	// Issue #430: datagrams made only of CR/LF -- RFC 5626 keep-alives, which
+	// phones also send over UDP to hold a NAT binding. Counted, NOT dropped.
+	uint64_t getKeepalivesCrlf() const;
 	// Issue #443/#444: discards made BEFORE handle() sees a datagram -- by the
 	// UDP receive loop (oversize, empty, a failed receive) or by SipServer when
 	// the message pool is spent. Called on the receive task; never allocates or
@@ -172,6 +175,9 @@ public:
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
 	// drop (responses, ACK).
 	uint64_t getSdpRejected() const;
+	// Issue #497: INVITEs refused because they did not come from the caller's
+	// registered address (the 403 "Caller Not Registered From This Address").
+	uint64_t getUnboundCallerRefusals() const { return _unboundCallerRefusals.load(std::memory_order_relaxed); }
 	// Issue #424: responses drainOutbox() refused to send because they answered
 	// a response or an ACK. Any non-zero value is a handler bug the guard caught.
 	uint32_t getRepliesRefused() const;
@@ -340,6 +346,37 @@ public:
 	// form and SipTrunk's state. Takes _mutex, which is non-recursive, so it
 	// must NOT be called with _mutex already held.
 	void applyStoredTrunkConfig();
+
+	// ── Emergency calling readiness (Issue #521) ─────────────────────────────
+	//
+	// Where a 911/933 dial can go right now. Anchor: the boot-selected
+	// telephony provider places real calls (telephonyProviderPlacesRealCalls).
+	// Trunk: no such anchor, but a valid generic SIP trunk is configured.
+	// None: neither -- the board has only the loopback simulator, which answers
+	// every call it is handed, so an emergency dial is refused with 503 rather
+	// than "connected" to nothing. /api/status reports this so the dashboard
+	// can keep a warning up for as long as it is None, and
+	// applyStoredTrunkConfig() logs a WARN at boot and on every trunk save that
+	// leaves it None. Anchor with a trunk also configured still reports Anchor;
+	// routeEmergencyCall() falls through to the trunk when that anchor is down.
+	// Takes _mutex, so it must NOT be called with _mutex already held.
+	enum class EmergencyRoute : uint8_t { None, Anchor, Trunk };
+	EmergencyRoute emergencyRoute();
+	// "anchor", "trunk" or "none": the /api/status spelling.
+	static const char* emergencyRouteName(EmergencyRoute r);
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (Issue #521). Every host test boots the loopback anchor, which
+	// can never carry an emergency call. This lets it stand in for a real
+	// provider so the anchor route's own behaviour (the bare number, the 503
+	// when it is down, the notification) stays testable. Inline, so it never
+	// reaches firmware (see the comment below).
+	void setAnchorPlacesRealCallsForTest(bool real)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_anchorPlacesRealCalls = real;
+	}
+#endif
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only. Gated because these three are DEFINED OUT OF LINE, in
@@ -1447,6 +1484,20 @@ private:
 		const std::shared_ptr<SipClient>& caller,
 		const pbx::EmergencyDial& emergency, const std::string& dialed);
 
+	// emergencyRoute() for a caller that already holds _mutex.
+	EmergencyRoute emergencyRouteLocked() const;
+
+	// The generic-SIP-trunk half of routeTrunkCall(): everything after its
+	// "is a trunk configured" check. Split out so routeEmergencyCall() can
+	// reach the trunk directly (Issue #521) and learn whether a carrier INVITE
+	// actually went out -- routeTrunkCall()'s bool, like originateAnchorCall()'s,
+	// means only "took ownership of the INVITE". `placedOut`, when non-null, is
+	// true only on the one path that hands the call to the carrier. Caller
+	// holds _mutex.
+	bool placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller, const std::string& destination,
+		bool* placedOut);
+
 	// `placedOut` (optional, Issue #166): true only when a call was actually
 	// dispatched. The bool RETURN means "took ownership of the INVITE" and is
 	// true for every refuse() path too, so a caller that must report what really
@@ -1925,6 +1976,11 @@ private:
 	// _anchorRouteDn as the RING-ALL gate and the DID-mapping lookup key.
 	TelephonyProviderType _anchorBootType = TelephonyProviderType::Loopback;
 	std::string _anchorRouteDn;
+	// Issue #521: telephonyProviderPlacesRealCalls(_anchorBootType), cached in
+	// the constructor next to it. False means the anchor is the loopback
+	// simulator and must never be handed an emergency number. Written only
+	// there and by setAnchorPlacesRealCallsForTest(); read under _mutex.
+	bool _anchorPlacesRealCalls = false;
 
 	// Stage B of the TelephonyAnchorClient port: sends that originate OFF the SIP
 	// receive thread (the CallEvent callback, which runs on the anchor's own WS
@@ -2066,7 +2122,10 @@ private:
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
+	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
+	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
 	std::atomic<uint32_t> _optionsPingTruncated{0};   // #463: see getOptionsPingTruncated()
 	// Requests answered from a §17.2 server transaction's stored response rather
