@@ -200,6 +200,20 @@ HttpServer::~HttpServer()
 	{
 		_acceptThread.join();
 	}
+	// Issue #540: every connection runs on a DETACHED thread whose lambda uses
+	// `this` after handleClient() returns (recordConnStackHwm, releaseSource,
+	// _activeConnections). Returning here while one is still running freed the
+	// server under it -- a use-after-free that showed up as a segfault in a
+	// later, unrelated test. No new connection can start (the accept thread is
+	// joined), and each handler is bounded by the read deadline plus its own
+	// work, so wait them out; the bound only guards against a wedged handler.
+	const auto giveUp = std::chrono::steady_clock::now() +
+		std::chrono::milliseconds(_readDeadlineMs + 5000);
+	while (_activeConnections.load(std::memory_order_acquire) > 0 &&
+		std::chrono::steady_clock::now() < giveUp)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
 }
 
 void HttpServer::start()
