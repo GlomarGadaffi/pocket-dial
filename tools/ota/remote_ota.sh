@@ -60,6 +60,23 @@ stop() { log "STOP: $*"; log "The board is left as it is. Do not retry; report i
 # json_get <json> <key>: top-level scalar only (python3 is on every host we use).
 json_get() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); v=d.get(sys.argv[2]); print("" if v is None else (str(v).lower() if isinstance(v,bool) else v))' "$1" "$2" 2>/dev/null; }
 
+# An eth board must only ever be given an esp32s3-ETH APP image: a wifi or
+# display app -- or a bootloader .bin -- passes the magic byte and chip id and
+# boots with no Ethernet, with no remote way back (Globox, #491 review). Checked
+# on --image in stages 3 and 4 BEFORE anything else; stage 2's --wrong-chip is
+# meant to be wrong and is not checked.
+check_eth_app() {
+  local f=$1 magic chip
+  magic=$(od -An -tx1 -N1 "$f" | tr -d ' \n')
+  chip=$(od -An -tu2 -j12 -N2 "$f" | tr -d ' \n')          # esp_image_header_t.chip_id (LE)
+  [ "$magic" = e9 ] || stop "$(basename "$f"): not an ESP app image (magic $magic)"
+  [ "$chip" = 9 ]   || stop "$(basename "$f"): chip id $chip, not ESP32-S3 (9)"
+  LC_ALL=C grep -a -q -F 'SipServerETH' "$f" || stop "$(basename "$f"): no 'SipServerETH' tag -- NOT an esp32s3-eth app image; refusing"
+  LC_ALL=C grep -a -q -F 'wifi softAP' "$f" && stop "$(basename "$f"): carries the wifi transport tag; refusing"
+  log "$(basename "$f"): esp32s3-eth app image (magic e9, chip 9, SipServerETH)"
+  return 0
+}
+
 ota_status() { curl -s -m 5 "$BASE/api/ota/status"; }
 status()     { curl -s -m 5 "$BASE/api/status"; }
 
@@ -82,6 +99,8 @@ login() {
          | curl -s -m 10 -c "$JAR" -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @- "$BASE/api/admin/login")
   unset p PD_OTA_PASS
   role=$(json_get "$resp" role); CSRF=$(json_get "$resp" csrf)
+  printf 'X-CSRF: %s
+' "$CSRF" > "$TMP/csrf.h"   # sent with -H @file: kept out of argv
   [ "$(json_get "$resp" authenticated)" = "true" ] || stop "login refused ($(json_get "$resp" error))"
   case "$role" in
     owner) log "logged in (owner)" ;;
@@ -96,8 +115,8 @@ login() {
 
 # upload <file> -> prints the HTTP code; body saved to $TMP/up.json
 upload() {
-  if [ "$DRY" = 1 ]; then log "dry-run: would POST /api/ota/upload ($(wc -c < "$1" | tr -d " ") B, octet-stream, X-CSRF)"; echo DRY; return; fi
-  curl -s -m 180 -o "$TMP/up.json" -w '%{http_code}' -b "$JAR" -H "X-CSRF: $CSRF" \
+  if [ "$DRY" = 1 ]; then log "dry-run: would POST /api/ota/upload ($(stat -c %s "$1") B, octet-stream, X-CSRF)"; echo DRY; return; fi
+  curl -s -m 180 -o "$TMP/up.json" -w '%{http_code}' -b "$JAR" -H @"$TMP/csrf.h" \
        -H 'Content-Type: application/octet-stream' --data-binary @"$1" "$BASE/api/ota/upload"
 }
 
@@ -147,7 +166,8 @@ stage2() {
 stage3() {
   [ -f "$IMAGE" ] || stop "--image required"
   [ -n "$EXPECT" ] || stop "--expect-version required (the app-desc version of --image)"
-  log "== stage 3: real OTA of $(basename "$IMAGE") ($(wc -c < "$IMAGE" | tr -d " ") B), expecting version $EXPECT"
+  check_eth_app "$IMAGE"
+  log "== stage 3: real OTA of $(basename "$IMAGE") ($(stat -c %s "$IMAGE") B), expecting version $EXPECT"
   need_idle; login
   local code o snap t0 seenPV=0 back=0
   code=$(upload "$IMAGE")
@@ -156,7 +176,7 @@ stage3() {
   [ "$code" = 200 ] || stop "upload not accepted (HTTP $code)"
   o=$(ota_status); log "after upload: $o"
   [ "$(json_get "$o" boot)" = "$NEXT0" ] || stop "boot slot is not $NEXT0 after upload"
-  code=$(curl -s -m 10 -o "$TMP/rb.json" -w '%{http_code}' -b "$JAR" -H "X-CSRF: $CSRF" -X POST "$BASE/api/ota/reboot")
+  code=$(curl -s -m 10 -o "$TMP/rb.json" -w '%{http_code}' -b "$JAR" -H @"$TMP/csrf.h" -X POST "$BASE/api/ota/reboot")
   log "reboot -> HTTP $code $(head -c 200 "$TMP/rb.json")"
   [ "$code" = 200 ] || stop "reboot refused (HTTP $code): the image stays staged, the old one keeps running"
   CSRF=""   # the session dies with the reboot
@@ -171,7 +191,7 @@ stage3() {
     sleep 0.2
   done
   [ "$back" = 1 ] || stop "board did not come back within ${TIMEOUT}s -- needs recovery at home"
-  snap=$(snapshot) || stop "board answered once, then stopped"
+  snap=$(snapshot) || stop "board did not come back on the new image (it may have answered once before the deferred restart) -- needs recovery at home"
   set -- $snap
   log "final: uptime=$1 running=$2 boot=$3 pendingVerify=$5 version=${7:-<none>}"
   [ "$1" -lt "$UPTIME0" ] || stop "uptime did not reset ($UPTIME0 -> $1): did it reboot?"
@@ -190,6 +210,7 @@ stage4() {
   # stage 3 has PROVEN rollback (pendingVerify seen).
   [ -f "$IMAGE" ] || stop "--image required (the probe image)"
   [ -n "$EXPECT" ] || stop "--expect-version required (the probe's app-desc version)"
+  check_eth_app "$IMAGE"
   log "== stage 4: rollback test with probe $(basename "$IMAGE") ($EXPECT)"
   need_idle
   local keepVer; keepVer=$(json_get "$(status)" version)
@@ -200,7 +221,7 @@ stage4() {
   [ "$code" = DRY ] && { log "dry-run: would reboot into the probe and expect a return to $RUN0 ($keepVer)"; return; }
   log "upload -> HTTP $code $(head -c 200 "$TMP/up.json")"
   [ "$code" = 200 ] || stop "probe upload not accepted (HTTP $code)"
-  code=$(curl -s -m 10 -o "$TMP/rb.json" -w '%{http_code}' -b "$JAR" -H "X-CSRF: $CSRF" -X POST "$BASE/api/ota/reboot")
+  code=$(curl -s -m 10 -o "$TMP/rb.json" -w '%{http_code}' -b "$JAR" -H @"$TMP/csrf.h" -X POST "$BASE/api/ota/reboot")
   [ "$code" = 200 ] || stop "reboot refused (HTTP $code); the probe stays staged -- stage 3 the good image back"
   CSRF=""
   t0=$(date +%s)
