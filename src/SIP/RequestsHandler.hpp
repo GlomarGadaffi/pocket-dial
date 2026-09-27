@@ -368,6 +368,11 @@ public:
 	// the no-answer path without a 60-second test.
 	void expireTrunkDeadlinesForTest();
 
+	// Issue #408: send every pending register beep now and deliver it through
+	// the send callback, as tick() would once RegisterBeeper::kAfterRegisterDelay
+	// has passed. Does not depend on tick()'s 1 s gate.
+	void fireRegisterBeepsForTest();
+
 	// What the resolver currently knows about the configured SBC host. Refused
 	// means nothing is known and nothing is in flight; anything else means a
 	// resolution has at least been ASKED FOR, which is what proves tick()
