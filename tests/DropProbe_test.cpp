@@ -73,10 +73,11 @@ namespace
 	}
 }
 
-// The hypothesis #430 is testing: an RFC 5626 double-CRLF keep-alive (and
-// pjsip's single-CRLF one) is refused as malformed. The probe must say so,
-// with the sender and the bytes, and must not call it a rate-limit refusal.
-TEST(DropProbe, CrlfKeepAliveIsRecordedAsInvalidWithSourceAndBytes)
+// #430's H1, confirmed on .244 (ext 113 sends "\r\n\r\n" every 32 s): an RFC 5626
+// double-CRLF keep-alive (and pjsip's single-CRLF one) is a keep-alive, not a
+// malformed message. It is counted as one and is NOT a drop, so it no longer
+// hides real malformed traffic behind a steady idle floor.
+TEST(DropProbe, CrlfKeepAliveIsCountedAsAKeepAliveNotADrop)
 {
 	RequestsHandler handler("192.168.4.1", 5060, noSend);
 	const sockaddr_in phone = addr("192.168.4.181", 5062);
@@ -84,21 +85,30 @@ TEST(DropProbe, CrlfKeepAliveIsRecordedAsInvalidWithSourceAndBytes)
 	feed(handler, "\r\n\r\n", phone);
 	feed(handler, "\r\n", phone);
 
-	EXPECT_EQ(handler.getPacketsDropped(), 2u);
-	EXPECT_EQ(handler.getDroppedInvalid(), 2u);
+	EXPECT_EQ(handler.getKeepalivesCrlf(), 2u);
+	EXPECT_EQ(handler.getPacketsDropped(), 0u) << "a keep-alive is not a drop";
+	EXPECT_EQ(handler.getDroppedInvalid(), 0u);
 	EXPECT_EQ(handler.getDroppedRate(), 0u);
-	EXPECT_EQ(handler.getPacketsProcessed(), 0u);
+	EXPECT_EQ(handler.getPacketsProcessed(), 0u) << "nor is it a SIP message to dispatch";
+	EXPECT_TRUE(recentOf(handler.getDropProbe()).empty()) << "the drop ring stays for real drops";
+}
 
+// Only CR/LF qualifies. Anything else -- even one other byte in a run of CRLFs --
+// is still malformed and still recorded, with its sender and bytes.
+TEST(DropProbe, AnythingButPureCrlfIsStillAnInvalidDrop)
+{
+	RequestsHandler handler("192.168.4.1", 5060, noSend);
+	const sockaddr_in src = addr("192.168.4.181", 5062);
+
+	feed(handler, "\r\nX\r\n", src);
+
+	EXPECT_EQ(handler.getKeepalivesCrlf(), 0u);
+	EXPECT_EQ(handler.getDroppedInvalid(), 1u);
 	const auto drops = recentOf(handler.getDropProbe());
-	ASSERT_EQ(drops.size(), 2u);
+	ASSERT_EQ(drops.size(), 1u);
 	EXPECT_EQ(drops[0].reason, DropProbe::Reason::Invalid);
-	EXPECT_EQ(drops[0].ip, phone.sin_addr.s_addr);
-	EXPECT_EQ(drops[0].port, phone.sin_port);
-	EXPECT_EQ(drops[0].len, 4u);
-	ASSERT_EQ(drops[0].headLen, 4u);
-	EXPECT_EQ(std::string(reinterpret_cast<const char*>(drops[0].head.data()), 4), "\r\n\r\n");
-	EXPECT_EQ(drops[1].len, 2u);
-	EXPECT_LT(drops[0].seq, drops[1].seq);
+	EXPECT_EQ(drops[0].ip, src.sin_addr.s_addr);
+	EXPECT_EQ(drops[0].len, 5u);
 }
 
 // A burst past the token bucket (40) from one address is a Rate refusal, and
@@ -109,7 +119,7 @@ TEST(DropProbe, TokenBucketRefusalIsRecordedAsRateAndCountersSum)
 	const sockaddr_in src = addr("192.168.4.60", 5060);
 
 	for (int i = 0; i < 60; ++i) feed(handler, options(i), src);
-	feed(handler, "\r\n\r\n", src);
+	feed(handler, "not sip\r\n\r\n", src);   // malformed (a pure-CRLF keep-alive is not a drop, #430)
 
 	EXPECT_GE(handler.getDroppedRate(), 1u)
 		<< "60 packets inside one burst must exhaust a 40-token bucket";
