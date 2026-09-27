@@ -519,13 +519,30 @@ namespace
 {
 	// Secure mode, a challenged-then-admitted call 500 -> 600 on Call-ID `id`.
 	// Returns the credential line the admitted INVITE carried.
-	std::string admitCredentialedCall(Harness& h, const std::string& id)
+	std::string admitCredentialedCall(Harness& h, const std::string& id, std::string* nonceOut = nullptr)
 	{
 		h.handler.handle(makeInvite(id, 1, kPcmuOffer));
 		const std::string challenge = firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized");
+		if (nonceOut) *nonceOut = paramOf(challenge, "nonce");
 		const std::string creds = credentialsFor(challenge, "sip:600@server");
 		h.handler.handle(makeInvite(id, 2, kPcmuOffer, creds));
 		return creds;
+	}
+
+	// The credential a conformant phone sends on a LATER request under the same
+	// nonce: a digest over that request's own method, with the nonce-count
+	// incremented and a fresh cnonce (RFC 2617 §3.2.2, RFC 7616 §3.4). #570
+	// re-challenges a repeated (nonce, nc), so re-sending the INVITE's nc=1 is a
+	// replay, not a relay test.
+	std::string inDialogCredential(const std::string& nonce, const std::string& method,
+		const std::string& nc, const std::string& cnonce)
+	{
+		const std::string ha1 = SipDigest::computeHa1("500", SipSecretStore::kRealm, "s3cret");
+		const std::string response = SipDigest::computeResponse(
+			ha1, method, "sip:600@server", nonce, nc, cnonce, "auth");
+		return "Authorization: Digest username=\"500\", realm=\"pocketdial\", nonce=\"" + nonce +
+			"\", uri=\"sip:600@server\", response=\"" + response +
+			"\", algorithm=MD5, qop=auth, nc=" + nc + ", cnonce=\"" + cnonce + "\"\r\n";
 	}
 
 	// Appended to every in-dialog relay test's credential, so the
@@ -576,10 +593,21 @@ TEST(InviteAdmission, ARelayedReinviteCarriesNoCredential)
 	SecretGuard guard{"500"};
 	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
 	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
-	const std::string creds = admitCredentialedCall(h, "re560");
+	std::string nonce;
+	const std::string creds = admitCredentialedCall(h, "re560", &nonce);
 	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
 
-	auto reinvite = makeInvite("re560", 3, kPcmuOffer, creds + kProxyAuth);
+	// The INVITE's own (nonce, nc=1) again is a replay (#570): re-challenged,
+	// nothing reaches the callee.
+	auto replay = makeInvite("re560", 3, kPcmuOffer, creds + kProxyAuth);
+	replay->setTo("To: <sip:600@server>;tag=callee560");
+	h.sent.clear();
+	h.handler.handle(replay);
+	EXPECT_TRUE(lastSentTo600Starting(h.sent, "INVITE ").empty()) << "a replayed nc relays nothing";
+	EXPECT_TRUE(anySentContains(h.sent, "401 Unauthorized")) << "a replayed nc is re-challenged";
+
+	auto reinvite = makeInvite("re560", 4, kPcmuOffer,
+		inDialogCredential(nonce, "INVITE", "00000002", "5e1f0c77") + kProxyAuth);
 	reinvite->setTo("To: <sip:600@server>;tag=callee560");
 	h.sent.clear();
 	h.handler.handle(reinvite);
@@ -597,12 +625,25 @@ TEST(InviteAdmission, ARelayedUpdateCarriesNoCredential)
 	SecretGuard guard{"500"};
 	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
 	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
-	const std::string creds = admitCredentialedCall(h, "up560");
+	std::string nonce;
+	const std::string creds = admitCredentialedCall(h, "up560", &nonce);
 	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
 
-	auto update = makeInvite("up560", 3, kPcmuOffer, creds + kProxyAuth);
+	// The INVITE's own (nonce, nc=1) again is a replay (#570): re-challenged,
+	// nothing reaches the callee.
+	auto replay = makeInvite("up560", 3, kPcmuOffer, creds + kProxyAuth);
+	replay->setHeader("UPDATE sip:600@server SIP/2.0");
+	replay->setCSeq("CSeq: 3 UPDATE");
+	replay->setTo("To: <sip:600@server>;tag=callee560");
+	h.sent.clear();
+	h.handler.handle(replay);
+	EXPECT_TRUE(lastSentTo600Starting(h.sent, "UPDATE ").empty()) << "a replayed nc relays nothing";
+	EXPECT_TRUE(anySentContains(h.sent, "401 Unauthorized")) << "a replayed nc is re-challenged";
+
+	auto update = makeInvite("up560", 4, kPcmuOffer,
+		inDialogCredential(nonce, "UPDATE", "00000002", "5e1f0c78") + kProxyAuth);
 	update->setHeader("UPDATE sip:600@server SIP/2.0");
-	update->setCSeq("CSeq: 3 UPDATE");
+	update->setCSeq("CSeq: 4 UPDATE");
 	update->setTo("To: <sip:600@server>;tag=callee560");
 	h.sent.clear();
 	h.handler.handle(update);
