@@ -1871,6 +1871,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
+	// Issue #409: draws refused by a spent pool (neither has a heap fallback).
+	// The message pool is process-global, so it reads even with no engine.
+	json << "\"msgPoolRefusals\":" << RequestsHandler::getMessagePoolRefusals() << ",";
+	json << "\"vpeerPoolRefusals\":" << (handler ? handler->getVirtualPeerRefusals() : 0) << ",";
 	// #450 / poll #454: false after a factory reset until the E911 notify list is
 	// set again. The dashboard shows a banner; nothing is gated on it.
 	json << "\"e911Configured\":" << (e911Configured ? "true" : "false") << ",";
@@ -2372,8 +2376,8 @@ void HttpServer::sendApiMetrics(int sock)
 	        "(issue #430).",
 	        keepalivesCrlf);
 	counter("pocketdial_packets_dropped_no_pool_total",
-	        "SIP datagrams discarded before parsing because the message pool and its "
-	        "bounded heap fallback were spent (issue #443). Not in "
+	        "SIP datagrams discarded before parsing because the message pool was "
+	        "spent (issue #443; no heap fallback since #409). Not in "
 	        "pocketdial_packets_dropped_total.",
 	        droppedNoPool);
 	counter("pocketdial_packets_dropped_oversize_total",
