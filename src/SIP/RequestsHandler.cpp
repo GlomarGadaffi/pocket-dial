@@ -1743,8 +1743,18 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// Deliberately AFTER the emergency branch: 911 is never gated (#454).
 	if (caller.value()->getAddress().sin_addr.s_addr != data->getSource().sin_addr.s_addr)
 	{
-		queueLog("INVITE refused: caller \"" + std::string(data->getFromNumber()) +
-			"\" is registered from a different address (#497)", true);
+		// Counted every time (/metrics); logged at most once per 10 s. A spoofer
+		// can send these as fast as it likes, and each log line allocates on this
+		// task (#284; BigDog's and Crew's #503 reviews).
+		_unboundCallerRefusals.fetch_add(1, std::memory_order_relaxed);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - _lastUnboundCallerLog >= std::chrono::seconds(10))
+		{
+			_lastUnboundCallerLog = now;
+			queueLog("INVITE refused: caller \"" + std::string(data->getFromNumber()) +
+				"\" is registered from a different address (#497; further refusals counted, "
+				"logged at most every 10 s)", true);
+		}
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader("SIP/2.0 403 Caller Not Registered From This Address");

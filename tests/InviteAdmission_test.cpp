@@ -172,6 +172,73 @@ TEST(InviteAdmission, ACallFromTheCallersRegisteredAddressIsAdmitted)
 	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@"));
 }
 
+namespace
+{
+	// A REGISTER for `ext` from ip:port. Its own branch and CSeq, so the server
+	// transaction layer treats it as a new request, not a retransmission of the
+	// Harness's registration (#503 tests).
+	std::shared_ptr<SipMessage> makeRegisterFrom(const std::string& ext, const std::string& ip,
+	                                              uint16_t port, const std::string& tag)
+	{
+		const std::string hp = ip + ":" + std::to_string(port);
+		std::string raw =
+			"REGISTER sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + hp + ";branch=z9hG4bKrr" + tag + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=rr" + tag + "\r\n"
+			"To: <sip:" + ext + "@server>\r\n"
+			"Call-ID: rereg-" + tag + "\r\n"
+			"CSeq: 2 REGISTER\r\n"
+			"Contact: <sip:" + ext + "@" + hp + ">;expires=3600\r\n"
+			"Content-Length: 0\r\n\r\n";
+		sockaddr_in s = addrFor(ip);
+		s.sin_port = htons(port);
+		return RequestsHandler::getMessageFromPool(raw, s);
+	}
+}
+
+TEST(InviteAdmission, TheBindingIsPortAgnostic)
+{
+	// BigDog's #503 review: ext 113 on .244 registers from .204:5062; a phone may
+	// place calls from another ephemeral port. Same IP, different port: admitted.
+	Harness h;
+	h.handler.handle(makeRegisterFrom("500", "192.168.7.50", 5062, "port"));
+	h.sent.clear();
+	h.handler.handle(makeInviteAs("500", "192.168.7.50", "port-invite"));   // from :5060
+	EXPECT_FALSE(anySentContains(h.sent, "Caller Not Registered From This Address"));
+	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@"));
+}
+
+TEST(InviteAdmission, TheBindingFollowsTheLatestRegister)
+{
+	// A DHCP/NAT rebind heals on the phone's next REGISTER: the new address is
+	// admitted, the old one is now the stranger.
+	Harness h;
+	const uint64_t refusedBefore = h.handler.getUnboundCallerRefusals();
+	h.handler.handle(makeRegisterFrom("500", "192.168.7.51", 5060, "rebind"));
+	h.sent.clear();
+	h.handler.handle(makeInviteAs("500", "192.168.7.51", "rebind-new"));
+	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@")) << "the new address places calls";
+	h.sent.clear();
+	h.handler.handle(makeInviteAs("500", "192.168.7.50", "rebind-old"));
+	EXPECT_TRUE(anySentContains(h.sent, "SIP/2.0 403 Caller Not Registered From This Address"));
+	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@"));
+	EXPECT_EQ(h.handler.getUnboundCallerRefusals(), refusedBefore + 1) << "every refusal is counted";
+}
+
+TEST(InviteAdmission, InSecureModeASpoofedSourceGets403NotAChallenge)
+{
+	// Ordering (BigDog's #503 review): the binding check runs BEFORE the Secure
+	// challenge, so a spoofer never receives a nonce to work with.
+	Harness h;
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+	h.handler.handle(makeInviteAs("500", "192.168.7.99", "sec-spoof"));
+	EXPECT_TRUE(anySentContains(h.sent, "SIP/2.0 403 Caller Not Registered From This Address"));
+	EXPECT_FALSE(anySentContains(h.sent, "401 Unauthorized"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+	SipSecretStore::clearSecret("500");
+}
+
 TEST(InviteAdmission, OfferWithNoRelayableAudioCodecGets488BeforeAnySession)
 {
 	Harness h;

@@ -1,2 +1,2 @@
-# InviteAdmission_test.cpp (2) + EmergencyDialing_test.cpp (1), #497
-3
+# InviteAdmission (5) + EmergencyDialing (1), #497 source binding
+6

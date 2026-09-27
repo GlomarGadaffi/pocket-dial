@@ -1890,6 +1890,7 @@ void HttpServer::sendApiMetrics(int sock)
 	uint64_t packets      = 0;
 	uint64_t dropped      = 0;
 	uint64_t sdpRejected  = 0;
+	uint64_t unboundCaller = 0;   // #497
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate  = 0;
 	size_t   clientCount  = 0;
@@ -1908,6 +1909,7 @@ void HttpServer::sendApiMetrics(int sock)
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate  = handler->getDroppedRate();
 		sdpRejected  = handler->getSdpRejected();
+		unboundCaller = handler->getUnboundCallerRefusals();
 		clientCount  = handler->getClientCount();
 		sessionCount = handler->getSessionCount();
 	}
@@ -1968,6 +1970,11 @@ void HttpServer::sendApiMetrics(int sock)
 	        "SDP bodies refused by the admission gate since boot, whether answered 488 "
 	        "or dropped silently (docs/THREAT_MODEL.md T-7).",
 	        sdpRejected);
+	counter("pocketdial_invite_unbound_caller_total",
+	        "INVITEs refused 403 because they did not come from the address the calling "
+	        "extension registered from (issue #497): spoofed callers, or a phone that moved "
+	        "without re-registering.",
+	        unboundCaller);
 
 	// "text/plain; version=0.0.4" is THE exposition-format content type — the
 	// version parameter is how a scraper picks its parser, so it is not

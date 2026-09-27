@@ -166,6 +166,9 @@ public:
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
 	// drop (responses, ACK).
 	uint64_t getSdpRejected() const;
+	// Issue #497: INVITEs refused because they did not come from the caller's
+	// registered address (the 403 "Caller Not Registered From This Address").
+	uint64_t getUnboundCallerRefusals() const { return _unboundCallerRefusals.load(std::memory_order_relaxed); }
 	size_t getClientCount();
 	size_t getSessionCount();
 	// Legs currently mixed on the meet-me conference (virtual extension 888); 0 while
@@ -1944,6 +1947,8 @@ private:
 	std::atomic<uint64_t> _packetsDropped{0};
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
+	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
 	// count is the packet-loss signal this layer exists to absorb, so it is worth
