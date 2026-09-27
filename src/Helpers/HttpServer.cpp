@@ -13,6 +13,7 @@
 #include "DeviceConfig.hpp"
 #include "ResetJournal.hpp"     // #473: report an incomplete factory reset on the next boot
 #include "ResetGuard.hpp"      // #473: block NVS data writes while resetting
+#include "FirmwareInfo.hpp"    // Issue #411: "version" / "firmware" in /api/status
 #include <cstdio>   // std::snprintf: the factory-reset error body (#450)
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
@@ -1851,6 +1852,21 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"ip\":\"" << jsonEscape(displayIp) << "\",";
 	json << "\"port\":" << 5060 << ",";
 	json << "\"httpPort\":" << _port << ",";
+	// #411: which build is this. "version" is what tests/run.py's
+	// board-provenance check and the bench run sheets compare with
+	// `git describe` (TEST_HARNESS.md §5.3).
+	//
+	// Public, like the roster is not (#207): provenance fetches this without a
+	// session, and a check that cannot see the field must not quietly pass.
+	// ONLY the version string, by design -- the same class of disclosure as a
+	// SIP User-Agent. No build host, no path, no build timestamp and no IDF
+	// version here: those tell an attacker more than which build this is, and
+	// provenance needs none of them. They go to the boot banner on the serial
+	// console instead, which is not network-reachable.
+	// Raw, no jsonEscape() (#461 review: it built a std::string per request).
+	// cmake/FirmwareVersion.cmake refuses any stamp outside [A-Za-z0-9._+-] at
+	// configure time, and FirmwareInfo_test pins the charset of the one built in.
+	json << "\"version\":\"" << FirmwareInfo::version() << "\",";
 	// #529: HTTP connections dropped for a slow request, and refused because
 	// one source already held its share of the slots.
 	json << "\"httpReadDeadlineDrops\":" << readDeadlineDrops() << ",";
