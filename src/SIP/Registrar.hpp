@@ -114,7 +114,9 @@ public:
 	//     never a lockout, and sending it makes lwIP ARP the source;
 	//   - a MAC that registers a second extension is marked shared (the
 	//     signature of phones behind one NAT router) and never locks;
-	//   - a first-packet ARP miss for an unlocked extension still Accepts.
+	//   - a first-packet ARP miss for an unlocked extension still Accepts;
+	//   - #507: a Secured extension or device is always digest-checked
+	//     (admitSecure), on an ARP miss too, and its record never moves.
 	// #515: adopting a NEW MAC spends a token (kAdoptBurst, one back per
 	// kAdoptRefill); with none left it answers 503 + Retry-After and returns
 	// RetryLater. Known MACs never spend one. `now` is a test seam.

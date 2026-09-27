@@ -19,6 +19,7 @@
 #include "ArpLookup.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
+#include "SipSecretStore.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -225,4 +226,38 @@ TEST_F(LearnLockTest, SecuredDevicesBehaveAsBefore)
 	ArpLookup::setMockMac(addrFor("192.168.60.66"), macOf(0x66));
 	EXPECT_EQ(registerFrom("201", "192.168.60.66").substr(0, 11), "SIP/2.0 403")
 		<< "a Secured extension stays locked to its device, as before #440";
+}
+
+// #507 finding 1 (Crew): an ARP miss must not admit a Secured extension. An
+// off-subnet or never-ARP'd source always misses; it now has to prove the secret.
+TEST_F(LearnLockTest, ASecuredExtensionFromAnArpMissIsChallengedNotAccepted)
+{
+	ASSERT_TRUE(SipSecretStore::setSecret("201", "s3cret-201"));
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Secured);
+	ArpLookup::clearMockMacs();   // the source resolves to nothing
+
+	EXPECT_EQ(registerFrom("201", "10.9.9.9").substr(0, 11), "SIP/2.0 401")
+		<< "a Secured extension is authenticated on a miss, never waved through";
+	SipSecretStore::clearSecret("201");
+}
+
+// #507 finding 2 (Crew): a REGISTER for another extension from a Secured device's
+// MAC (e.g. with its source IP forged) must not move that device's record off
+// its Secured extension before any digest is checked.
+TEST_F(LearnLockTest, AnUnauthenticatedRegisterCannotMoveASecuredDevicesExtension)
+{
+	ASSERT_TRUE(SipSecretStore::setSecret("201", "s3cret-201"));
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Secured);
+	ArpLookup::setMockMac(addrFor("192.168.60.21"), macOf(0x21));
+
+	EXPECT_NE(registerFrom("999", "192.168.60.21").substr(0, 11), "SIP/2.0 200");
+	const auto* d = device(hexOf(0x21));
+	ASSERT_NE(d, nullptr);
+	EXPECT_EQ(d->extension, "201") << "the Secured record must not have moved";
+	EXPECT_EQ(d->state, Registrar::DeviceState::Secured);
+
+	// And the extension is still locked against another device.
+	ArpLookup::setMockMac(addrFor("192.168.60.66"), macOf(0x66));
+	EXPECT_EQ(registerFrom("201", "192.168.60.66").substr(0, 11), "SIP/2.0 403");
+	SipSecretStore::clearSecret("201");
 }

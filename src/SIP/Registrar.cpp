@@ -344,7 +344,7 @@ Registrar::AuthDecision Registrar::admitLearn(
 {
 	// Learn mode = TOFU + MAC-lock (issue #440 made the lock real).
 	//   ext Secured, or Learn-LOCKED, to a DIFFERENT mac -> reject (anti-spoof).
-	//   ARP miss, ext locked/Secured somewhere -> 503 + Retry-After (retryable;
+	//   ARP miss, ext Learn-locked somewhere -> 503 + Retry-After (retryable;
 	//                            we cannot tell the owner from an impostor yet).
 	//   ARP miss otherwise     -> accept + defer, as before (never brick the first
 	//                            registration).
@@ -354,7 +354,9 @@ Registrar::AuthDecision Registrar::admitLearn(
 	//                            resolve to the router's MAC); a shared MAC never
 	//                            locks. A re-provisioned phone looks the same and
 	//                            is also left unlocked -- fail open, not locked out.
-	//   KNOWN + Secured mac    -> enforce digest (same path as secure mode).
+	//   KNOWN + Secured mac    -> enforce digest (same path as secure mode), and
+	//                            never touch its record first (#507).
+	//   ARP miss, ext Secured  -> enforce digest; never accept on a miss (#507).
 	// A routed off-subnet phone's IP is never in the ARP table, so it always
 	// misses: it is never locked, and Learn cannot protect it (use Secure).
 	auto lockedElsewhere = [&](const std::string& selfMac) -> const std::string* {
@@ -369,6 +371,16 @@ Registrar::AuthDecision Registrar::admitLearn(
 	auto macOpt = ArpLookup::pdLookupMac(data->getSource());
 	if (!macOpt.has_value())
 	{
+		// #507 finding 1: a Secured extension is AUTHENTICATED, never waved
+		// through on a miss. etharp only knows on-link hosts, so an off-subnet or
+		// never-ARP'd source always misses (and the host build's lookup always
+		// does). The real phone has its credentials, so this breaks nothing that
+		// works -- and unlike the retry below, it lets an off-subnet Secured phone
+		// register at all.
+		if (isExtensionSecured(ext))
+		{
+			return admitSecure(data, ext, outRejectReason);
+		}
 		if (const std::string* owner = lockedElsewhere(std::string()))
 		{
 			// The owner's ARP entry may simply have aged out. A 403 here would lock
@@ -459,6 +471,18 @@ Registrar::AuthDecision Registrar::admitLearn(
 	}
 
 	DeviceRecord& rec = it->second;
+	if (rec.state == DeviceState::Secured)
+	{
+		// #507 finding 2: a Secured device's record never moves on a REGISTER.
+		// Checked BEFORE anything below touches the record: a single REGISTER for
+		// another extension, sent with the source IP forged to this phone's (so
+		// ARP returns its real MAC), used to rewrite the record away from its
+		// Secured extension -- stripping the lock -- before any digest was checked.
+		// The device authenticates for whatever extension it asks for, exactly as
+		// secure mode does, and its record stays as it is.
+		return admitSecure(data, ext, outRejectReason);
+	}
+
 	if (rec.extension != ext)
 	{
 		// One MAC, a second extension: phones behind a NAT router, or a phone
@@ -476,12 +500,7 @@ Registrar::AuthDecision Registrar::admitLearn(
 		noteChange(Change::Structural);
 	}
 
-	if (rec.state == DeviceState::Secured)
-	{
-		// Promoted device: enforce digest exactly as secure mode does.
-		return admitSecure(data, ext, outRejectReason);
-	}
-
+	// (A Secured record returned above, before the record could be touched.)
 	if (!rec.locked && !rec.shared)
 	{
 		// Second sighting of this MAC for this extension: bind it.
