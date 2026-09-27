@@ -273,6 +273,28 @@ TEST(EmergencyRoute, ADialRuleCannotHandTheLoopbackAnEmergencyNumber)
 	EXPECT_EQ(b.count("SIP/2.0 200"), 0u) << b.dump();
 }
 
+TEST(EmergencyRoute, ADialRuleThatProducesAnEmergencyNumberTakesTheEmergencyPath)
+{
+	// #538 review M2: pstnUri() sends 911 bare, so on a trunk board a rule
+	// rewriting 0 to 911 places a REAL 911. It must be the emergency path's 911:
+	// logged, and the front desk notified. Before the fix it was a plain trunk
+	// call with no notification at all.
+	Bench b;
+	b.handler->handle(makeRegister("200", "192.168.79.20"));   // front desk
+	b.handler->setE911Config("200", "", "");
+	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->setDialRule("0", "trunk", "911", 1);
+	b.sent.clear();
+
+	b.handler->handle(makeInvite("0", "er-rule-trunk-911"));
+
+	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u)
+		<< "the front desk must hear about a 911 however it was dialed:\n" << b.dump();
+	EXPECT_TRUE(b.saw("ROUTED TO TRUNK")) << b.dump();
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "");
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // B. What #521 added.
 // ═════════════════════════════════════════════════════════════════════════════
@@ -366,6 +388,23 @@ TEST(EmergencyRoute, ACodecRejectedOfferIsNotRetriedOnTheTrunk)
 	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
 	EXPECT_TRUE(b.saw("no G.711 codec offered")) << b.dump();
 	EXPECT_EQ(b.count("INVITE sip:"), 0u) << b.dump();
+}
+
+TEST(EmergencyRoute, ATrunkOnlyBoardRefusesAnOfferItCannotRelay)
+{
+	// #538 review M1: the anchor's codec gate never runs on a trunk-only board,
+	// and onTrunkAnswered answers PCMU whatever was offered. Without a gate of its
+	// own the trunk connected a PCMA-only 911 with dead audio.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+
+	b.handler->handle(makeInvite("911", "er-trunk-pcma", /*payloadType=*/8));
+
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("no G.711 codec offered")) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:"), 0u)
+		<< "the carrier must not be sent a call the handset cannot hear:\n" << b.dump();
+	EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 0u);
 }
 
 TEST(EmergencyRoute, TheFrontDeskIsToldTheTrunkTookTheCall)

@@ -1,2 +1,2 @@
-# EmergencyRoute_test.cpp: 17 (5 red on main before the fix, 12 on what #521 added)
-17
+# EmergencyRoute_test.cpp: 19 (5 red on main before the fix, 12 on what #521 added, 2 for the #538 review M1/M2)
+19

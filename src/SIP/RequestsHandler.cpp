@@ -3796,6 +3796,17 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// A codec-rejected offer is not retried on the trunk: the trunk RELAYS the
 	// handset's audio rather than transcoding it, so an offer the anchor cannot
 	// carry is no better there, and the 503 below says exactly why.
+	//
+	// #538 review M1: the anchor's gate only runs when the anchor is real AND up,
+	// so a trunk-only board (or an anchor that is down) needs its own. onTrunkAnswered
+	// answers the handset with buildMediaSdp's PCMU-only SDP, so a PCMA- or
+	// G.722-only 911 would otherwise CONNECT with dead audio while the front desk
+	// is told ROUTED TO TRUNK.
+	if (!codecRejected && data->hasSdp() &&
+		!data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+	{
+		codecRejected = true;
+	}
 	if (!codecRejected && _sipTrunk.config().valid())
 	{
 		// Always owns the INVITE: every refusal on this path answers it, and
@@ -10095,6 +10106,21 @@ void RequestsHandler::refuseRingingTrunk(const std::string& callId, int carrierS
 bool RequestsHandler::routeTrunkCall(const std::shared_ptr<SipMessage>& data,
 	const std::shared_ptr<SipClient>& caller, const std::string& destination)
 {
+	// #538 review M2: a dial-plan Trunk rule whose transform PRODUCES an
+	// emergency number ("0" -> "911") takes the emergency path, not a plain trunk
+	// call. pstnUri() sends 911/933 bare, so without this the carrier gets a real
+	// 911 with no EMERGENCY log line and no Kari's Law notification, and with no
+	// trunk a real anchor dials it the same way. routeEmergencyCall() always
+	// answers the INVITE, so this owns it. The loopback guard in
+	// originateAnchorCall() stays as the backstop.
+	if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(destination); em.isEmergency)
+	{
+		queueLog("EMERGENCY: a dial-plan rule turned " + std::string(data->getToNumber()) +
+			" into " + destination + "; routing it as an emergency call", true);
+		routeEmergencyCall(data, caller, em, destination);
+		return true;
+	}
+
 	// No generic trunk configured: this is the vendor-API anchor route it has
 	// always been. respondIfDisconnected=false keeps the "rule matched but
 	// nothing to route to" 404 with CallForker, which owns that tail.
