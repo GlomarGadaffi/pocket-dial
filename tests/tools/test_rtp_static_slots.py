@@ -59,21 +59,23 @@ class RtpStaticSlots(unittest.TestCase):
         ctor = text.index("RequestsHandler::RequestsHandler(")
         after_ctor = re.search(r"\n\}\n", text[ctor:]).end() + ctor
         self.assertTrue(ctor < sites[0] < after_ctor, "ConferenceRoom must be built in the constructor")
+        # ... and only when the build has a conference (POCKETDIAL_CONFERENCE).
+        guard = text.rfind("#if", ctor, sites[0])
+        self.assertRegex(text[guard:sites[0]], r"^#if POCKETDIAL_CONFERENCE\b")
+        self.assertNotIn("#endif", text[guard:sites[0]])
 
-    def test_constrained_caps_shrink_the_slots(self):
+    def test_constrained_has_no_conference_and_fits_72kb(self):
         with open(os.path.join(ROOT, "main", "CMakeLists.txt"), encoding="utf-8") as f:
             cm = f.read()
         block = cm[cm.index("if(SIP_CONSTRAINED)"):]
         block = block[:block.index("endif()")]
-        caps = dict(re.findall(r"(POCKETDIAL_(?:MAX_ANCHOR_CALLS|MAX_VOICEMAIL_LEGS|MAX_TRUNK_CALLS|CONF_LEGS))=(\d+)", block))
-        self.assertEqual(len(caps), 4, caps)
-        a, v, t, c = (int(caps[k]) for k in ("POCKETDIAL_MAX_ANCHOR_CALLS", "POCKETDIAL_MAX_VOICEMAIL_LEGS",
-                                            "POCKETDIAL_MAX_TRUNK_CALLS", "POCKETDIAL_CONF_LEGS"))
-        tx, rx = 1 + a + v + c, a + v + 2 * t + c
-        # No PSRAM: tx + rx stacks and the conference room (3 rings of 3200 B per
-        # leg + ~4 KB object, MixBus::MAX_PORTS == legs) are all internal, fixed at
-        # boot. Stated cost: 66 KB + ~23 KB = ~89 KB (ConferenceRoom.hpp asserts it).
-        self.assertLessEqual((tx + rx) * 6144 + 3 * c * 3200 + 4096, 90 * 1024)
+        caps = dict(re.findall(r"(POCKETDIAL_(?:MAX_ANCHOR_CALLS|MAX_VOICEMAIL_LEGS|MAX_TRUNK_CALLS|CONFERENCE))=(\d+)", block))
+        self.assertEqual(caps.get("POCKETDIAL_CONFERENCE"), "0", "constrained must build no conference room")
+        a, v, t = (int(caps[k]) for k in ("POCKETDIAL_MAX_ANCHOR_CALLS", "POCKETDIAL_MAX_VOICEMAIL_LEGS",
+                                         "POCKETDIAL_MAX_TRUNK_CALLS"))
+        tx, rx = 1 + a + v, a + v + 2 * t
+        # No PSRAM: every slot is internal, fixed at boot. Stated cost: 7 x 6 KB = 42 KB.
+        self.assertLessEqual((tx + rx) * 6144, 72 * 1024)
 
     def test_mix_ports_follow_the_conference_legs(self):
         text = "".join(code("src/SIP/MixBus.hpp"))

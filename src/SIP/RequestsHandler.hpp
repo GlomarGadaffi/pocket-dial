@@ -435,6 +435,10 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #479: the boot-built conference room, so a test can make its driver fail.
+	ConferenceRoom* conferenceForTest() { return _conference.get(); }
+	// #479: as a POCKETDIAL_CONFERENCE=0 build, which never builds the room.
+	void dropConferenceForTest() { _conference.reset(); }
 
 	// What the resolver currently knows about the configured SBC host. Refused
 	// means nothing is known and nothing is in flight; anything else means a

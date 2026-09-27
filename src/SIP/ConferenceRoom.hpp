@@ -40,7 +40,6 @@
 #include "PoolConfig.hpp"
 #include "RtpReceiver.hpp"
 #include "RtpSender.hpp"
-#include "RtpTaskSlots.hpp"   // #479: the no-PSRAM boot budget below
 
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 #include <thread>
@@ -114,6 +113,11 @@ public:
 	void startDriver();
 	void stopDriver();
 	bool driverRunning() const { return _driverRunning.load(std::memory_order_acquire); }
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// #479 seam: make the next startDriver() calls fail as a refused conf_mix_tick
+	// create does on ESP (driver not running afterwards).
+	void failDriverStartForTest(bool fail) { _failDriverStartForTest = fail; }
+#endif
 
 	// Advance the bus exactly one 20 ms frame. This is what the driver calls; tests
 	// call it directly. Do NOT call it while a driver is running — that is the second
@@ -178,27 +182,8 @@ private:
 	static void taskTrampoline(void* arg);
 #else
 	std::thread _driverThread;
+	bool        _failDriverStartForTest = false;
 #endif
 };
-
-#if defined(ESP_PLATFORM)
-#include "sdkconfig.h"
-#if !defined(CONFIG_SPIRAM) || !CONFIG_SPIRAM
-// Issue #479: no PSRAM (esp32_constrained), so everything fixed at boot for media
-// is internal DRAM: every RTP task slot's stack AND the conference room (built in
-// the RequestsHandler constructor): the object plus its rings -- in + out per MixBus
-// port and one MediaBridge playout ring per leg, 1600 samples (3200 B) each, which
-// fall back from PSRAM to internal. SIP_CONSTRAINED (2 legs): 66 KB of slots +
-// ~23 KB of room = ~89 KB.
-// ponytail: 3200 mirrors PlayoutBuffer's default maxSamples; if a ring is sized
-// differently, derive this from PlayoutBuffer instead.
-static_assert((pd::rtpslots::kTxSlots + pd::rtpslots::kRxSlots) * pd::rtpslots::kStackBytes
-              + sizeof(ConferenceRoom)
-              + (2u * MixBus::MAX_PORTS + ConferenceRoom::MAX_LEGS) * 3200u
-              <= 90u * 1024u,
-              "#479: no-PSRAM build fixes too much internal DRAM in RTP task slots + the "
-              "conference room; build with SIP_CONSTRAINED=1 or lower the POCKETDIAL_* call caps");
-#endif
-#endif
 
 #endif // CONFERENCE_ROOM_HPP

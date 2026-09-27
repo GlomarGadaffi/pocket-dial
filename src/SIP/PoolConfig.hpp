@@ -178,6 +178,13 @@
 #define POCKETDIAL_CONF_LEGS 4
 #endif
 
+// Issue #479: 1 builds the 888 room at boot (its legs' RTP task slots and rings are
+// fixed then); 0 (SIP_CONSTRAINED, no PSRAM) builds no room, reserves no conference
+// slots, and answers 888 "403 conference disabled on this build".
+#ifndef POCKETDIAL_CONFERENCE
+#define POCKETDIAL_CONFERENCE 1
+#endif
+
 // Number of concurrent anchor media bridges (the 555 virtual extension --
 // docs/FEATURE_ROADMAP.md's "Anchored media" extension point, wired into call
 // routing in RequestsHandler). Each bridge owns its own RtpReceiver/RtpSender

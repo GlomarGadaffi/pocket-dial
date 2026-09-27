@@ -167,7 +167,9 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// Issue #479: the conference room is built HERE, at boot, so its legs'
 	// RTP task slots (RtpSender/RtpReceiver stacks + TCBs) are allocated at
 	// init, never on the first 888 dial-in. Its mix-tick driver still starts
-	// on the first dial-in (onConferenceInvite), as before.
+	// on the first dial-in (onConferenceInvite), as before. POCKETDIAL_CONFERENCE=0
+	// (SIP_CONSTRAINED, no PSRAM) builds no room: 888 is refused.
+#if POCKETDIAL_CONFERENCE
 	_conference = std::make_unique<ConferenceRoom>();
 	// Issue #199 item 3: give every leg a way to hand an RFC 4733 key press
 	// back to the engine. Invoked on that leg's RTP receive task, so it goes
@@ -176,6 +178,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	_conference->setDigitSink([this](std::string_view legCallId, char digit) {
 		queueDtmfDigit(legCallId, digit);
 	});
+#endif
 
 	// Pre-allocate pools (Issue #53). Capacities are compile-time tunable via
 	// PoolConfig.hpp (-DPOCKETDIAL_MAX_* overrides); defaults preserve 32/8/32.
@@ -2605,6 +2608,14 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 			+ std::string(data->getFromNumber()), true);
 	};
 
+	// #479: no room on this build (POCKETDIAL_CONFERENCE=0, SIP_CONSTRAINED). 403, as
+	// the other feature-off answer here ("voicemail not enabled"); refuse() logs it.
+	if (!_conference)
+	{
+		refuse("SIP/2.0 403 Forbidden", "conference disabled on this build");
+		return;
+	}
+
 	// Issue #304: conference mixing only understands PCMU -- RtpReceiver.cpp
 	// only recognizes PAYLOAD_TYPE_PCMU as audio; anything else (PCMA
 	// included) falls through to the DTMF-event check and is dropped. Same
@@ -2631,6 +2642,14 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	// exactly the teardown race the bus's Draining state exists to avoid. startDriver()
 	// is a no-op once running, so calling it on every dial-in also retries a failed start.
 	_conference->startDriver();
+	// #479 review: no driver means no tick, so no port ever leaves Draining and every
+	// leg would be dead air. Refuse before a leg or session is taken; the next 888
+	// retries the start.
+	if (!_conference->driverRunning())
+	{
+		refuse("SIP/2.0 503 Service Unavailable", "conference mix tick could not be started");
+		return;
+	}
 
 	// Join first: a full room must not consume a session slot. The leg index is also
 	// the proof the media actually came up, so nothing is answered on a dead leg.
