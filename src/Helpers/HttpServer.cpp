@@ -5836,6 +5836,39 @@ void HttpServer::sendApiTrunkConfig(int sock)
 	             trunkConfigJson(TrunkConfigStore::load()));
 }
 
+
+// Issue #546: true for a host that names this board itself -- loopback in any
+// spelling this parser sees, or the board's own address. Such a trunk can
+// never reach a carrier.
+// #573 review: compared in place, no allocation on the HTTP task.
+static bool asciiIEquals(std::string_view a, std::string_view b)
+{
+	if (a.size() != b.size()) return false;
+	for (size_t i = 0; i < a.size(); ++i)
+	{
+		if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
+			return false;
+	}
+	return true;
+}
+
+static bool asciiIStartsWith(std::string_view s, std::string_view prefix)
+{
+	return s.size() >= prefix.size() && asciiIEquals(s.substr(0, prefix.size()), prefix);
+}
+
+static bool isSelfTrunkHost(std::string_view host, std::string_view ownIp)
+{
+	if (host.empty()) return false;
+	for (std::string_view loop : { "localhost", "localhost.", "::1", "[::1]", "0.0.0.0" })
+	{
+		if (asciiIEquals(host, loop)) return true;
+	}
+	if (asciiIStartsWith(host, "127.") || asciiIStartsWith(host, "::ffff:127.") ||
+		asciiIStartsWith(host, "[::ffff:127.")) return true;
+	return !ownIp.empty() && ownIp != "0.0.0.0" && asciiIEquals(host, ownIp);
+}
+
 void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 {
 	TrunkConfigStore::Config cfg = TrunkConfigStore::load(); // start from stored -- see the password merge below
@@ -5895,6 +5928,24 @@ void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"host and fromUser are required to enable the trunk\"}");
 		return;
+	}
+
+	// Issue #546: a trunk pointed at this board itself -- loopback, or its own
+	// address -- can never reach a carrier, yet it would satisfy valid() and
+	// report an emergency route. Refuse it at the door, like the check above.
+	{
+		char ownIp[INET_ADDRSTRLEN] = {0};   // #573 review: fixed buffer, no std::string
+		if (_ip == "0.0.0.0") (void)getPrimaryLocalIPInto(ownIp, sizeof(ownIp));
+		else std::snprintf(ownIp, sizeof(ownIp), "%s", _ip.c_str());
+		for (const std::string* h : { &cfg.host, &cfg.proxyHost })
+		{
+			if (isSelfTrunkHost(*h, ownIp))
+			{
+				sendResponse(sock, 400, "Bad Request", "application/json",
+				             "{\"error\":\"the trunk host must be the carrier, not this board (loopback or its own address)\"}");
+				return;
+			}
+		}
 	}
 
 	if (!TrunkConfigStore::save(cfg))

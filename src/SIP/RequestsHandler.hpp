@@ -359,10 +359,16 @@ public:
 	// applyStoredTrunkConfig() logs a WARN at boot and on every trunk save that
 	// leaves it None. Anchor with a trunk also configured still reports Anchor;
 	// routeEmergencyCall() falls through to the trunk when that anchor is down.
+	// Issue #546: TrunkUnverified -- a valid trunk is CONFIGURED but has not
+	// answered a single INVITE 2xx since boot (or since its config last
+	// changed). Routing is the same as Trunk (the call is still tried); the
+	// report differs because "configured" is not "can complete a call": the
+	// generic trunk cannot answer a 401/407 yet (#399), so a digest-auth
+	// carrier fails every 911 with 502 while the route read "trunk".
 	// Takes _mutex, so it must NOT be called with _mutex already held.
-	enum class EmergencyRoute : uint8_t { None, Anchor, Trunk };
+	enum class EmergencyRoute : uint8_t { None, Anchor, Trunk, TrunkUnverified };
 	EmergencyRoute emergencyRoute();
-	// "anchor", "trunk" or "none": the /api/status spelling.
+	// "anchor", "trunk", "trunk-unverified" or "none": the /api/status spelling.
 	static const char* emergencyRouteName(EmergencyRoute r);
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
@@ -2008,6 +2014,10 @@ private:
 	// simulator and must never be handed an emergency number. Written only
 	// there and by setAnchorPlacesRealCallsForTest(); read under _mutex.
 	bool _anchorPlacesRealCalls = false;
+	// Issue #546: the SIP trunk has answered an INVITE with a 2xx since boot /
+	// since setTrunkConfig(). Set in onTrunkAnswered(), cleared by
+	// setTrunkConfig(); under _mutex.
+	bool _trunkVerified = false;
 
 	// Stage B of the TelephonyAnchorClient port: sends that originate OFF the SIP
 	// receive thread (the CallEvent callback, which runs on the anchor's own WS
