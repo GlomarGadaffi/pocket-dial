@@ -1149,3 +1149,70 @@ TEST(AnchorRouting, AnAckDeadlineReapOfAConnectedAnchorCallByesTheHandset)
 	ASSERT_EQ(byesToHandset.size(), 1u) << "the handset must be told the call is over";
 	EXPECT_NE(byesToHandset.front().find("Call-ID: anchor-533"), std::string::npos);
 }
+
+TEST(AnchorRouting, TheHandsetsAckDisarmsTheAnchorAckDeadline)
+{
+	// Issue #533 root cause: a healthy anchored call whose handset ACKed the 2xx
+	// must not be reaped by the ACK deadline. The deadline is armed already
+	// expired (as a real anchor's Answered handler arms it, 15 s on), the handset
+	// ACKs as a real UA does (Request-URI = the 200's Contact, To carries our tag,
+	// fresh branch), then tick() runs past it.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-533a"));
+	auto session = handler.getSession("Call-ID: anchor-533a");
+	ASSERT_TRUE(session.has_value());
+	ASSERT_EQ(session.value()->getState(), Session::State::Connected);
+
+	std::string ok;
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		const std::string raw = msg ? msg->toString() : std::string();
+		if (raw.rfind("SIP/2.0 200 OK", 0) == 0 && raw.find("CSeq: 1 INVITE") != std::string::npos) ok = raw;
+	}
+	ASSERT_FALSE(ok.empty()) << "the anchor answered 200";
+	auto line = [&ok](const char* name) {
+		const size_t at = ok.find(std::string("\r\n") + name);
+		if (at == std::string::npos) return std::string();
+		const size_t start = at + 2;
+		return ok.substr(start, ok.find("\r\n", start) - start);
+	};
+	const std::string to = line("To:");
+	const std::string contact = line("Contact:");
+	ASSERT_NE(to.find(";tag="), std::string::npos) << ok;
+	std::string ruri = "sip:555@192.168.9.1:5060";
+	const size_t lt = contact.find('<'), gt = contact.find('>');
+	if (lt != std::string::npos && gt != std::string::npos) ruri = contact.substr(lt + 1, gt - lt - 1);
+
+	session.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	const std::string ack =
+		"ACK " + ruri + " SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.9.51:5060;branch=z9hG4bKack533a\r\n"
+		"From: <sip:501@server>;tag=ftanchor-533a\r\n"
+		+ to + "\r\n"
+		"Call-ID: anchor-533a\r\n"
+		"CSeq: 1 ACK\r\n"
+		"Max-Forwards: 70\r\n"
+		"Content-Length: 0\r\n\r\n";
+	auto ackMsg = RequestsHandler::getMessageFromPool(ack, addrFor("192.168.9.51"));
+	ASSERT_TRUE(ackMsg);
+	handler.handle(ackMsg);
+
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+
+	auto after = handler.getSession("Call-ID: anchor-533a");
+	ASSERT_TRUE(after.has_value()) << "an ACKed anchor call must not be reaped";
+	EXPECT_EQ(after.value()->getState(), Session::State::Connected);
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		EXPECT_NE(msg ? msg->toString().rfind("BYE ", 0) : 1u, 0u) << "no BYE on a healthy call";
+	}
+}
