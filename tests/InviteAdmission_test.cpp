@@ -711,3 +711,96 @@ TEST(InviteAdmission, TheBroadcastAckForkCarriesNoCredential)
 	ASSERT_FALSE(relayed.empty()) << "the 999 ACK is forked to the answering phone";
 	EXPECT_EQ(relayed.find("Authorization:"), std::string::npos) << relayed;
 }
+
+namespace
+{
+	// #560: a 999 all-page call from 500 whose fork to 600 is pending, then
+	// optionally answered by 600. Returns the fork 600 received.
+	std::string startBroadcast(Harness& h, const std::string& callId, bool answer)
+	{
+		const std::string body =
+			"v=0\r\no=- 0 0 IN IP4 192.168.7.50\r\ns=-\r\nc=IN IP4 192.168.7.50\r\nt=0 0\r\n" +
+			std::string(kPcmuOffer) + "a=sendrecv\r\n";
+		h.handler.handle(RequestsHandler::getMessageFromPool(
+			"INVITE sip:999@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 192.168.7.50:5060;branch=z9hG4bK" + callId + "\r\n"
+			"From: <sip:500@server>;tag=f" + callId + "\r\n"
+			"To: <sip:999@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:500@192.168.7.50:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body,
+			addrFor("192.168.7.50")));
+		const std::string fork = firstSentContaining(h.sent, "INVITE sip:600@");
+		if (fork.empty() || !answer) return fork;
+		auto lineOf = [&fork](const char* name) {
+			const size_t a = fork.find(name);
+			return fork.substr(a, fork.find("\r\n", a) - a);
+		};
+		const std::string sdp = "v=0\r\no=- 0 0 IN IP4 192.168.7.60\r\ns=-\r\nc=IN IP4 192.168.7.60\r\nt=0 0\r\n" +
+			std::string(kPcmuOffer) + "a=sendrecv\r\n";
+		h.handler.handle(RequestsHandler::getMessageFromPool(
+			"SIP/2.0 200 OK\r\n" + lineOf("Via:") + "\r\n" + lineOf("From:") + "\r\n"
+			"To: <sip:600@server>;tag=ans" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Contact: <sip:600@192.168.7.60:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp,
+			addrFor("192.168.7.60")));
+		return fork;
+	}
+
+	const std::string kCallerCredential =
+		"Authorization: Digest username=\"500\", realm=\"pocketdial\", nonce=\"n560\", "
+		"uri=\"sip:999@server\", response=\"00000000000000000000000000000000\"\r\n";
+}
+
+TEST(InviteAdmission, TheBroadcastCancelForkCarriesNoCredential)
+{
+	// #560: onCancel's 999 branch clones the caller's CANCEL once per ringing
+	// target. A credential on that CANCEL must not ride along to them.
+	Harness h;
+	ASSERT_FALSE(startBroadcast(h, "cx560", /*answer=*/false).empty())
+		<< "999 forks to the other registered phone";
+
+	h.sent.clear();
+	h.handler.handle(RequestsHandler::getMessageFromPool(
+		"CANCEL sip:999@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.7.50:5060;branch=z9hG4bKcx560\r\n"
+		"From: <sip:500@server>;tag=fcx560\r\n"
+		"To: <sip:999@server>\r\n"
+		"Call-ID: cx560\r\n"
+		"CSeq: 1 CANCEL\r\n" + kCallerCredential + kProxyAuth +
+		"Content-Length: 0\r\n\r\n",
+		addrFor("192.168.7.50")));
+
+	const std::string relayed = lastSentTo600Starting(h.sent, "CANCEL ");
+	ASSERT_FALSE(relayed.empty()) << "the CANCEL is forked to the ringing phone";
+	EXPECT_EQ(relayed.find("Authorization:"), std::string::npos) << relayed;
+}
+
+TEST(InviteAdmission, TheBroadcastByeForkCarriesNoCredential)
+{
+	// #560: onBye's 999 branch clones the caller's BYE for the answering phone
+	// (byeFork). A credential on that BYE must not ride along.
+	Harness h;
+	ASSERT_FALSE(startBroadcast(h, "by560", /*answer=*/true).empty());
+
+	h.sent.clear();
+	h.handler.handle(RequestsHandler::getMessageFromPool(
+		"BYE sip:999@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.7.50:5060;branch=z9hG4bKby560b\r\n"
+		"From: <sip:500@server>;tag=fby560\r\n"
+		"To: <sip:999@server>;tag=ansby560\r\n"
+		"Call-ID: by560\r\n"
+		"CSeq: 2 BYE\r\n" + kCallerCredential + kProxyAuth +
+		"Content-Length: 0\r\n\r\n",
+		addrFor("192.168.7.50")));
+
+	const std::string relayed = lastSentTo600Starting(h.sent, "BYE ");
+	ASSERT_FALSE(relayed.empty()) << "the 999 BYE is forked to the answering phone";
+	EXPECT_EQ(relayed.find("Authorization:"), std::string::npos) << relayed;
+}
