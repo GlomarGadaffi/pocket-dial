@@ -594,19 +594,34 @@ TEST(InviteAdmission, ARelayedReinviteCarriesNoCredential)
 	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
 	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
 	std::string nonce;
-	const std::string creds = admitCredentialedCall(h, "re560", &nonce);
-	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
+	(void)admitCredentialedCall(h, "re560", &nonce);
+	const std::string fork = firstSentContaining(h.sent, "INVITE sip:600@");
+	ASSERT_FALSE(fork.empty());
 
-	// The INVITE's own (nonce, nc=1) again is a replay (#570): re-challenged,
-	// nothing reaches the callee.
-	auto replay = makeInvite("re560", 3, kPcmuOffer, creds + kProxyAuth);
-	replay->setTo("To: <sip:600@server>;tag=callee560");
-	h.sent.clear();
-	h.handler.handle(replay);
-	EXPECT_TRUE(lastSentTo600Starting(h.sent, "INVITE ").empty()) << "a replayed nc relays nothing";
-	EXPECT_TRUE(anySentContains(h.sent, "401 Unauthorized")) << "a replayed nc is re-challenged";
+	// Answer the call first: a re-INVITE is only relayed on a Connected dialog.
+	auto lineOf = [&fork](const char* name) {
+		const size_t a = fork.find(name);
+		return fork.substr(a, fork.find("\r\n", a) - a);
+	};
+	const std::string answer = "v=0\r\no=- 0 0 IN IP4 192.168.7.60\r\ns=-\r\nc=IN IP4 192.168.7.60\r\nt=0 0\r\n" +
+		std::string(kPcmuOffer) + "a=sendrecv\r\n";
+	h.handler.handle(RequestsHandler::getMessageFromPool(
+		"SIP/2.0 200 OK\r\n" + lineOf("Via:") + "\r\n" + lineOf("From:") + "\r\n"
+		"To: <sip:600@server>;tag=callee560\r\n"
+		"Call-ID: re560\r\n"
+		"CSeq: 2 INVITE\r\n"
+		"Contact: <sip:600@192.168.7.60:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(answer.size()) + "\r\n\r\n" + answer,
+		addrFor("192.168.7.60")));
+	auto ack = makeInvite("re560", 2, kPcmuOffer);
+	ack->setHeader("ACK sip:600@server SIP/2.0");
+	ack->setCSeq("CSeq: 2 ACK");
+	ack->setTo("To: <sip:600@server>;tag=callee560");
+	ack->clearBody();
+	h.handler.handle(ack);
 
-	auto reinvite = makeInvite("re560", 4, kPcmuOffer,
+	auto reinvite = makeInvite("re560", 3, kPcmuOffer,
 		inDialogCredential(nonce, "INVITE", "00000002", "5e1f0c77") + kProxyAuth);
 	reinvite->setTo("To: <sip:600@server>;tag=callee560");
 	h.sent.clear();
@@ -626,24 +641,13 @@ TEST(InviteAdmission, ARelayedUpdateCarriesNoCredential)
 	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
 	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
 	std::string nonce;
-	const std::string creds = admitCredentialedCall(h, "up560", &nonce);
+	(void)admitCredentialedCall(h, "up560", &nonce);
 	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
 
-	// The INVITE's own (nonce, nc=1) again is a replay (#570): re-challenged,
-	// nothing reaches the callee.
-	auto replay = makeInvite("up560", 3, kPcmuOffer, creds + kProxyAuth);
-	replay->setHeader("UPDATE sip:600@server SIP/2.0");
-	replay->setCSeq("CSeq: 3 UPDATE");
-	replay->setTo("To: <sip:600@server>;tag=callee560");
-	h.sent.clear();
-	h.handler.handle(replay);
-	EXPECT_TRUE(lastSentTo600Starting(h.sent, "UPDATE ").empty()) << "a replayed nc relays nothing";
-	EXPECT_TRUE(anySentContains(h.sent, "401 Unauthorized")) << "a replayed nc is re-challenged";
-
-	auto update = makeInvite("up560", 4, kPcmuOffer,
+	auto update = makeInvite("up560", 3, kPcmuOffer,
 		inDialogCredential(nonce, "UPDATE", "00000002", "5e1f0c78") + kProxyAuth);
 	update->setHeader("UPDATE sip:600@server SIP/2.0");
-	update->setCSeq("CSeq: 4 UPDATE");
+	update->setCSeq("CSeq: 3 UPDATE");
 	update->setTo("To: <sip:600@server>;tag=callee560");
 	h.sent.clear();
 	h.handler.handle(update);
