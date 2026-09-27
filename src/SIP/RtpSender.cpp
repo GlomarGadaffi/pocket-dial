@@ -12,6 +12,7 @@
 #include "EthAccess.hpp"
 #include "ArpLookup.hpp"
 #include "DmaFramePool.hpp"
+#include "RtpTaskSlots.hpp"   // Issue #479: pd::rtpslots::kStackBytes
 #elif defined(__linux__)
 #include <unistd.h>
 #include <sys/socket.h>
@@ -156,6 +157,13 @@ void RtpSender::buildRtpHeader(uint8_t* out, bool marker, uint8_t pt,
 
 RtpSender::RtpSender() : _serverRtpPort(SERVER_RTP_PORT)
 {
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Issue #479: this slot's rtp_media_tx stack + TCB, once, at boot. INTERNAL
+	// and DMA-capable, no PSRAM fallback: the W5500 driver passes stack buffers
+	// to a DMA SPI bus (#466). A failed allocation leaves start() refusing.
+	_taskMem.alloc("rtp_media_tx", pd::rtpslots::kStackBytes,
+	               MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+#endif
 }
 
 RtpSender::~RtpSender()
@@ -168,6 +176,15 @@ RtpSender::~RtpSender()
 	for (int i = 0; i < 100 && _taskRunning.load(std::memory_order_acquire); ++i)
 	{
 		vTaskDelay(pdMS_TO_TICKS(5));
+	}
+	// Issue #479: reap the parked task only if it provably parked (#572).
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		if (!pd::reapParkedStaticTask(_parkedTask,
+			_taskRunning.load(std::memory_order_acquire), _reapDeferred))
+		{
+			ESP_LOGE("RtpSender", "tx task not parked at destruction; handle left undeleted (#479)");
+		}
 	}
 #else
 	// Issue #108: destroying a joinable std::thread calls std::terminate, so a
@@ -204,6 +221,13 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	// exiting task clear _callID/_active/_sock without a racing start() reusing them.
 	// The registrar also gates on isActive() before calling.
 	if (_active.load(std::memory_order_acquire) || _taskRunning.load(std::memory_order_acquire))
+	{
+		return false;
+	}
+	// Issue #479: the previous stream's task parked; reap it (#572 rule) so
+	// this slot's static stack is free, or refuse this start.
+	if (!pd::reapParkedStaticTask(_parkedTask,
+		_taskRunning.load(std::memory_order_acquire), _reapDeferred))
 	{
 		return false;
 	}
@@ -251,8 +275,7 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	// Core 0; the media task joins SIP on Core 0 so the heavy LVGL full_refresh blits
 	// on Core 1 never steal cycles from the 20 ms RTP cadence. Priority 6 (one above
 	// the udp_receiver/SIP task at 5) so pacing is not starved by signaling bursts.
-	// Handle is nullptr: the task self-manages its lifecycle via _stopRequested /
-	// _taskRunning, so we never store (and race on) a TaskHandle_t.
+	// The handle is kept only so the owner can reap the parked task (#479).
 	//
 	// Issue #466: deliberately an INTERNAL stack, unlike rtp_media_rx. The L2
 	// egress path (l2rtp::EgressChannel::transmit -> esp_eth_transmit ->
@@ -262,20 +285,22 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	// PSRAM stack spi_master's setup_priv_desc() -> spicommon_dma_setup_priv_buffer()
 	// would malloc an internal DMA bounce buffer for EVERY frame, 50/s per
 	// stream -- exactly the #282/#368 "Failed to allocate priv TX buffer" class.
-	// The endpoint is per-slot xTaskCreateStatic on stacks preallocated at boot
-	// (see #466's follow-up issue), which removes this per-call allocation too.
-	BaseType_t ok = xTaskCreatePinnedToCore(
-		&RtpSender::taskTrampoline,
-		"rtp_media_tx",
-		6144,   // headroom for lwIP sendto() + tone synth (4KB was marginal)
-		this,
-		6,
-		nullptr,
-		0 /* Core 0 */);
+	// Issue #479: created on this slot's boot-preallocated internal stack + TCB
+	// (_taskMem), so the call path allocates nothing.
+	_parkedTask = (_taskMem.stack == nullptr) ? nullptr
+		: xTaskCreateStaticPinnedToCore(
+			&RtpSender::taskTrampoline,
+			"rtp_media_tx",
+			_taskMem.bytes,   // headroom for lwIP sendto() + tone synth (4KB was marginal)
+			this,
+			6,
+			_taskMem.stack,
+			_taskMem.tcb,
+			0 /* Core 0 */);
 
-	if (ok != pdPASS)
+	if (_parkedTask == nullptr)
 	{
-		ESP_LOGE("RtpSender", "xTaskCreatePinnedToCore failed");
+		ESP_LOGE("RtpSender", "rtp_media_tx static task create failed");
 		close(_sock);
 		_sock = -1;
 		_callID.clear();
@@ -323,7 +348,13 @@ void RtpSender::taskTrampoline(void* arg)
 	// Clearing _taskRunning is the LAST access to `self`: after this the destructor may
 	// observe the task as gone and allow the object to be destroyed.
 	self->_taskRunning.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
+	// Issue #479: park, never self-delete (as RtpReceiver, #535). The owner
+	// reaps it from outside so the slot's static stack is reusable at once.
+	// Suspending touches no member, so it is safe after the store above.
+	for (;;)
+	{
+		vTaskSuspend(nullptr);
+	}
 }
 
 void RtpSender::runLoop()

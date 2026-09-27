@@ -1,0 +1,2 @@
+# RtpTaskSlots_test.cpp: 3 (#479: per-slot static RTP task stacks, fixed boot cost)
+3

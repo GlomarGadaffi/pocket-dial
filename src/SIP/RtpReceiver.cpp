@@ -26,7 +26,8 @@ uint32_t RtpReceiver::rxOversizeDrops()
 #include <sys/socket.h>
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #235: rtp_media_rx TWDT subscription
-#include "PsramTask.hpp"     // Issue #466: pd::createTaskPreferPsram / pd::deleteTask
+#include "PsramTask.hpp"     // Issue #479: pd::StaticTaskSlot / pd::reapParkedStaticTask
+#include "RtpTaskSlots.hpp"  // Issue #479: pd::rtpslots::kStackBytes
 #include "ParkedTaskReap.hpp"   // Issue #535 / #572 review: when the parked task may be deleted
 #endif
 
@@ -425,6 +426,13 @@ bool RtpReceiver::dispatchDtmf(const RtpPacket& pkt)
 RtpReceiver::RtpReceiver()
 {
 	_localPort.store(SERVER_RTP_RX_PORT, std::memory_order_release);
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Issue #479: this slot's rtp_media_rx stack + TCB, once, at boot. PSRAM
+	// (the #273 audit on #466: nothing reachable writes flash), internal where
+	// there is none. A failed allocation leaves start() refusing, logged.
+	_taskMem.alloc("rtp_media_rx", pd::rtpslots::kStackBytes, PD_TASK_STACK_CAPS,
+	               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#endif
 }
 
 RtpReceiver::~RtpReceiver()
@@ -595,16 +603,21 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	// whose Ethernet work runs on the tcpip task (LWIP_TCPIP_CORE_LOCKING is
 	// off), never on this stack. Falls back to internal, counted, where PSRAM
 	// is short or absent (pd::createTaskPreferPsram).
-	BaseType_t ok = pd::createTaskPreferPsram(
-		&RtpReceiver::taskTrampoline,
-		"rtp_media_rx",
-		6144,   // headroom for lwIP recvfrom() + sink callback (decode is in-place)
-		this,
-		6,
-		&_parkedTask,   // #535: kept so the owner can reap the parked task
-		0 /* Core 0 */);
+	//
+	// Issue #479: created on this slot's boot-preallocated stack + TCB
+	// (_taskMem), so the call path allocates nothing.
+	_parkedTask = (_taskMem.stack == nullptr) ? nullptr
+		: xTaskCreateStaticPinnedToCore(
+			&RtpReceiver::taskTrampoline,
+			"rtp_media_rx",
+			_taskMem.bytes,   // headroom for lwIP recvfrom() + sink callback (decode is in-place)
+			this,
+			6,
+			_taskMem.stack,
+			_taskMem.tcb,
+			0 /* Core 0 */);   // #535: handle kept so the owner can reap the parked task
 
-	if (ok != pdPASS)
+	if (_parkedTask == nullptr)
 	{
 		ESP_LOGE("RtpReceiver", "rtp_media_rx task create failed");
 		close(_sock);
@@ -658,7 +671,7 @@ void RtpReceiver::taskTrampoline(void* arg)
 	// abort()s if that ~1.9 KB allocation fails -- on every media-leg teardown,
 	// under exactly the internal-DRAM pressure #466/#328 are about. The owner
 	// (next start() or ~RtpReceiver) deletes this task from outside with
-	// pd::deleteTask(handle), which allocates nothing. Suspending touches no
+	// pd::reapParkedStaticTask (#479), which allocates nothing. Suspending touches no
 	// member, so it is safe after the _taskRunning store above.
 	for (;;)
 	{
@@ -673,21 +686,9 @@ bool RtpReceiver::reapParkedTaskLocked()
 	// not-yet-suspended task may hold _slotMutex or be mid-way on the other
 	// core; deleting it there is the #421 class of bug. So on anything else,
 	// keep the handle, count it, and let the next start()/destructor retry.
-	switch (pd::reapDecision(_parkedTask != nullptr,
-		_taskRunning.load(std::memory_order_acquire),
-		_parkedTask != nullptr && eTaskGetState(_parkedTask) == eSuspended))
-	{
-		case pd::ReapDecision::Nothing:
-			return true;
-		case pd::ReapDecision::Reap:
-			pd::deleteTask(_parkedTask);   // another task: no helper, no allocation
-			_parkedTask = nullptr;
-			return true;
-		case pd::ReapDecision::Wait:
-		default:
-			_reapDeferred.fetch_add(1, std::memory_order_relaxed);
-			return false;
-	}
+	// #479: the task sits on this slot's static memory; the reap frees nothing.
+	return pd::reapParkedStaticTask(_parkedTask,
+		_taskRunning.load(std::memory_order_acquire), _reapDeferred);
 }
 
 void RtpReceiver::runLoop()

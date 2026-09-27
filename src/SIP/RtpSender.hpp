@@ -30,6 +30,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "L2RtpFrame.hpp"
+#include "PsramTask.hpp"   // Issue #479: pd::StaticTaskSlot / pd::reapParkedStaticTask
 #elif defined(__linux__)
 #include <netinet/in.h>
 #include <thread>
@@ -161,6 +162,13 @@ private:
 	//                    on it and start() can refuse to overlap a dying task.
 	std::atomic<bool> _stopRequested{false};
 	std::atomic<bool> _taskRunning{false};
+	// Issue #479: the finished task PARKS (as RtpReceiver's, #535) and its owner
+	// reaps it on the next start() or in the destructor, via
+	// pd::reapParkedStaticTask. It runs on _taskMem: this slot's INTERNAL DMA
+	// stack + TCB, allocated once in the constructor (see RtpTaskSlots.hpp).
+	TaskHandle_t          _parkedTask = nullptr;
+	std::atomic<uint32_t> _reapDeferred{0};
+	pd::StaticTaskSlot    _taskMem;
 	sockaddr_in       _dest{};
 
 	// L2 RTP TX (Issue #282 / #329)
