@@ -33,6 +33,7 @@
 #include "SipSecretStore.hpp"
 #include "TelephonyApiConfig.hpp"
 #include "TrunkConfigStore.hpp"
+#include "VoicemailArchive.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -98,6 +99,38 @@ namespace
 		return resp;
 	}
 
+	// GET twin of httpPost() above (#450: reads /api/status). Same raw socket.
+	std::string httpGet(int port, const std::string& path, const std::string& cookie)
+	{
+#if defined(_WIN32) || defined(_WIN64)
+		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s == INVALID_SOCKET) return "";
+#else
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0) return "";
+#endif
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(static_cast<uint16_t>(port));
+		inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+		std::string resp;
+		if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
+		{
+			const std::string req = "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+				"Cookie: " + cookie + "\r\nConnection: close\r\n\r\n";
+			send(s, req.c_str(), static_cast<int>(req.size()), 0);
+			char buf[512];
+			int n;
+			while ((n = recv(s, buf, sizeof(buf), 0)) > 0) resp.append(buf, static_cast<size_t>(n));
+		}
+#if defined(_WIN32) || defined(_WIN64)
+		closesocket(s);
+#else
+		close(s);
+#endif
+		return resp;
+	}
+
 	int statusOf(const std::string& resp)
 	{
 		size_t sp1 = resp.find(' ');
@@ -125,6 +158,14 @@ namespace
 		a.csrf = AdminAuth::sessionCsrf(token);
 		return a;
 	}
+
+	// #450: counts wipes; a factory reset must wipe the SD voicemail archive.
+	struct VmWipeSpy : vmarchive::Sink
+	{
+		int wipes = 0;
+		void write(const vmarchive::QueuedRecording&, const uint8_t*) override {}
+		void wipe() override { ++wipes; }
+	};
 
 	std::vector<uint8_t> fakeDump()
 	{
@@ -213,6 +254,8 @@ TEST_F(FactoryResetSecretsTest, NoStoredSecretSurvivesAFactoryReset)
 	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, slot, /*keepSecret=*/false), "");
 
 	CoreDumpStore::setImageForTest(fakeDump());
+	_handler->setForward("501", "always", "5557654321");   // #450: an external number
+	_handler->setE911Config("501", "5550100", "12 Old Site Rd, Suite 4");   // #450 / poll #454
 	const AdminSession s = bypassLogin();
 
 	// Every row really is set, so an "empty after" below cannot pass vacuously.
@@ -222,6 +265,8 @@ TEST_F(FactoryResetSecretsTest, NoStoredSecretSurvivesAFactoryReset)
 	ASSERT_TRUE(SipSecretStore::hasSecret("501"));
 	ASSERT_TRUE(_handler->getTelephonyConfigSlot(0).secretSet);
 	ASSERT_TRUE(CoreDumpStore::query().present);
+	ASSERT_FALSE(_handler->getForwards().empty()) << "precondition: a forward is stored";
+	ASSERT_TRUE(_handler->isE911Configured()) << "precondition: E911 is configured";
 	ASSERT_TRUE(AdminAuth::isProvisioned());
 
 	// ── Act ──
@@ -248,6 +293,16 @@ TEST_F(FactoryResetSecretsTest, NoStoredSecretSurvivesAFactoryReset)
 	EXPECT_FALSE(CoreDumpStore::query().present) << "the last coredump (a copy of task stacks) survived the reset";
 
 	EXPECT_FALSE(AdminAuth::isProvisioned()) << "the admin credential survived the reset";
+
+	EXPECT_TRUE(_handler->getForwards().empty())
+		<< "a call-forward target (an external phone number) survived the reset (#450)";
+
+	const auto [e911Exts, e911Callback, e911Location] = _handler->getE911Config();
+	EXPECT_TRUE(e911Location.empty()) << "the previous site's address survived the reset (#450, poll #454)";
+	EXPECT_TRUE(e911Exts.empty());
+	EXPECT_TRUE(e911Callback.empty());
+	EXPECT_FALSE(_handler->isE911Configured())
+		<< "after a reset the board must report E911 as not configured";
 }
 
 TEST_F(FactoryResetSecretsTest, AFailedSecretEraseIsReportedAsAnErrorNotOk)
@@ -264,9 +319,90 @@ TEST_F(FactoryResetSecretsTest, AFailedSecretEraseIsReportedAsAnErrorNotOk)
 	EXPECT_EQ(statusOf(resp), 500) << resp;
 	EXPECT_NE(resp.find("\"status\":\"error\""), std::string::npos) << resp;
 	EXPECT_EQ(resp.find("\"status\":\"ok\""), std::string::npos) << "a failed erase was reported as ok";
-	EXPECT_NE(resp.find("secret stores"), std::string::npos) << "the message must say WHAT failed: " << resp;
+	// The report must say WHICH store failed, and must not blame the others.
+	EXPECT_NE(resp.find("\"secrets\":true"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"admin\":false"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"trunk\":false"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"forwards\":false"), std::string::npos) << resp;
+	// #456 review: every field is present and false for the stores that erased
+	// (a typo in a key, or a dropped condition, used to stay green).
+	EXPECT_NE(resp.find("\"e911\":false"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"tapi\":false"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"didmap\":false"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"wifi\":false"), std::string::npos) << resp;
 	// Every erase is still attempted even when one reports failure.
 	EXPECT_FALSE(SipSecretStore::hasSecret("501"));
+}
+
+// #456 review: clearAllTelephonyConfig() (the carrier OAuth client_secret) and
+// clearAllDidMappings() (PII) used to have their results discarded, so a failed
+// persist still answered 200 "ok". Pointing the stores at a directory that does
+// not exist makes each persist fail for real -- no seam needed.
+TEST_F(FactoryResetSecretsTest, AFailedTelephonyOrDidEraseIsReportedAsAnError)
+{
+#if defined(_WIN32)
+	// TelephonyApiConfig/DidMapping::persist() are no-ops on a Windows host
+	// build, so there is no failure to provoke there.
+	GTEST_SKIP() << "the host stores do not persist on _WIN32";
+#endif
+	const std::string missingDir = "no_such_dir_456_review/";
+	_handler->setTelephonyStorePathsForTest(missingDir + "tapicfg.cfg", missingDir + "didmap.cfg");
+	const AdminSession s = bypassLogin();
+
+	const std::string resp = httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf);
+
+	EXPECT_EQ(statusOf(resp), 500) << resp;
+	EXPECT_NE(resp.find("\"tapi\":true"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"didmap\":true"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"secrets\":false"), std::string::npos) << "only the failed stores are blamed: " << resp;
+	_handler->setTelephonyStorePathsForTest(_tapiPath, _didPath);
+}
+
+TEST_F(FactoryResetSecretsTest, AFailedAdminCredentialEraseIsReportedAsAnError)
+{
+	// #450: AdminAuth::clearCredential() used to return void, so a failed erase
+	// of the admin/owner password hashes and the DTMF PIN was invisible here.
+	const AdminSession s = bypassLogin();
+	AdminAuth::failNextEraseForTest();
+
+	const std::string resp = httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf);
+
+	EXPECT_EQ(statusOf(resp), 500) << resp;
+	EXPECT_EQ(resp.find("\"status\":\"ok\""), std::string::npos) << "a failed erase was reported as ok";
+	EXPECT_NE(resp.find("\"admin\":true"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"secrets\":false"), std::string::npos) << resp;
+	// The in-RAM credential is cleared regardless of what flash said.
+	EXPECT_FALSE(AdminAuth::isProvisioned());
+}
+
+TEST_F(FactoryResetSecretsTest, TheSdVoicemailArchiveIsWiped)
+{
+	// #450: recordings and greetings on the SD survived both reset doors; only
+	// the CDR archive was wiped.
+	VmWipeSpy spy;
+	_handler->setVoicemailSinkForTest(&spy);
+	const AdminSession s = bypassLogin();
+
+	ASSERT_EQ(statusOf(httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf)), 200);
+
+	EXPECT_EQ(spy.wipes, 1) << "the HTTP factory reset must wipe the SD voicemail archive";
+	_handler->setVoicemailSinkForTest(nullptr);
+}
+
+TEST_F(FactoryResetSecretsTest, StatusReportsWhetherE911IsConfiguredAndNothingIsGated)
+{
+	// Poll #454 (A): a reset board shows "E911 not configured" -- as a flag on
+	// /api/status, never as a gate. So: the flag tracks the config both ways,
+	// and the status route answers 200 while it is false.
+	const AdminSession s = bypassLogin();
+	_handler->setE911Config("", "", "");
+	std::string st = httpGet(_port, "/api/status", s.cookie);
+	EXPECT_EQ(statusOf(st), 200);
+	EXPECT_NE(st.find("\"e911Configured\":false"), std::string::npos) << st;
+
+	_handler->setE911Config("501", "5550100", "Front desk");
+	st = httpGet(_port, "/api/status", s.cookie);
+	EXPECT_NE(st.find("\"e911Configured\":true"), std::string::npos) << st;
 }
 
 TEST(SipSecretStoreClearAll, RemovesEveryExtensionSecret)

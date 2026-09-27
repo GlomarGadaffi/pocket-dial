@@ -19,6 +19,17 @@ ConferenceRoom::ConferenceRoom()
 	{
 		leg.bridge.init(&leg.rx, &leg.tx, /*anchor=*/nullptr, &_bus);
 	}
+
+	// Issue #498: the bus's mix scratch is 16-byte aligned only if this room is. `new`
+	// guarantees it (see MixBus.hpp); anything that allocates a room by hand might not.
+	_busAligned = (reinterpret_cast<std::uintptr_t>(&_bus) % alignof(MixBus)) == 0;
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	if (!_busAligned)
+	{
+		ESP_LOGE("ConferenceRoom", "mix bus at %p is not %u-byte aligned -- every join is refused",
+			static_cast<void*>(&_bus), static_cast<unsigned>(alignof(MixBus)));
+	}
+#endif
 }
 
 ConferenceRoom::~ConferenceRoom()
@@ -68,6 +79,13 @@ int ConferenceRoom::join(const std::string& callID, const std::string& ext,
 		return -1;
 	}
 
+	// A misaligned bus is refused rather than ticked (issue #498); the caller answers
+	// 486 and logs the refusal, the same as a full room.
+	if (!_busAligned)
+	{
+		return -1;
+	}
+
 	// Re-INVITE / retransmit safety: one Call-ID owns at most one leg. Answering the
 	// same dialog twice would burn a second bus port that nothing can ever release.
 	if (indexOfLocked(callID) >= 0)
@@ -79,6 +97,13 @@ int ConferenceRoom::join(const std::string& callID, const std::string& ext,
 	{
 		Leg& leg = _legs[static_cast<size_t>(i)];
 		if (leg.inUse) continue;
+
+		// Issue #513: leave() frees a slot at once, but on ESP its RTP tasks keep
+		// winding down for a few ticks and start() refuses until they exit. A
+		// quick re-dial took that same first free slot, failed to start and was
+		// answered 486. Skip a slot that cannot start yet and try the next free
+		// one; the room refuses only when no free slot can start.
+		if (!leg.bridge.canStart()) continue;
 
 		// startBridge() attaches the MixBus port and, on any failure past that point,
 		// unwinds it itself — so a false return leaves this slot exactly as free as it

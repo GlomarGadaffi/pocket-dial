@@ -204,8 +204,9 @@ SipTrunk::Dialog* SipTrunk::findMutableByCallID(std::string_view callID)
 	// Callers hand us SipMessage::getCallID(), which returns the FULL header line
 	// ("Call-ID: x@host") while our slots hold the bare id we generated. Normalise
 	// before comparing -- the same mismatch that once left every register beep
-	// un-ACKed (see RegisterBeeper::findByCallID).
-	const std::string key = siphdr::stripHeaderName(callID);
+	// un-ACKed (see RegisterBeeper::findByCallID). A view, not a copy (#464):
+	// this runs on every SIP response and BYE the engine handles, trunk or not.
+	const std::string_view key = siphdr::stripHeaderNameView(callID);
 	for (auto& d : _dialogs)
 	{
 		if (d.state == State::Free) continue;
@@ -220,7 +221,7 @@ SipTrunk::Dialog* SipTrunk::findMutableByCallID(std::string_view callID)
 		// carrier leg stayed up and billing. Normalising here rather than at
 		// the call site keeps this class correct for either form.
 		if (d.callID == key ||
-			(!d.handsetCallID.empty() && siphdr::stripHeaderName(d.handsetCallID) == key))
+			(!d.handsetCallID.empty() && siphdr::stripHeaderNameView(d.handsetCallID) == key))
 		{
 			return &d;
 		}
@@ -231,7 +232,7 @@ SipTrunk::Dialog* SipTrunk::findMutableByCallID(std::string_view callID)
 SipTrunk::Dialog* SipTrunk::findMutableByTrunkCallID(std::string_view callID)
 {
 	// Same normalisation as findMutableByCallID(); callID is always stored bare.
-	const std::string key = siphdr::stripHeaderName(callID);
+	const std::string_view key = siphdr::stripHeaderNameView(callID);
 	for (auto& d : _dialogs)
 	{
 		if (d.state != State::Free && d.callID == key) return &d;
@@ -316,29 +317,19 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 	d->sbcIpPort     = addrToIpPort(sbc);
 	// The SIP domain, from Config -- deliberately not addrToIpPort(sbc), which
 	// is the transport address and becomes the PROXY's address the moment one
-	// is configured. Keeping the port suffix makes this byte-identical to the
-	// old sbcIpPort-derived URIs for the common dotted-quad, no-proxy case.
+	// is configured.
 	//
-	// KNOWN, DELIBERATELY DEFERRED: the ":port" is unconditional, so a trunk on
-	// the default port still emits "sip:+1555@carrier.example.com:5060" rather
-	// than the bare domain. By RFC 3261 §19.1.4 a URI omitting a component with
-	// a default value does NOT match one explicitly carrying that component at
-	// its default, so those are formally distinct URIs -- and some SBCs and
-	// proxies route on the Request-URI host and will treat them as different
-	// route keys. This config surface is what first makes FQDN registrars and
-	// outbound proxies reachable, so it is what makes the case reachable too.
-	//
-	// Not fixed here, as an explicit decision rather than an oversight: nothing
-	// can complete a call on this trunk yet (no REGISTER, no 401/407 handling),
-	// so the exposure is theoretical, and a live carrier will settle the exact
-	// semantics empirically when the digest path lands. Changing it is not the
-	// three-line conditional it looks like -- by the same §19.1.4 reasoning it
-	// alters the emitted bytes for the existing dotted-quad case, so the
-	// byte-pinned expectations in SipTrunk_test.cpp move with it.
-	//
-	// SipTrunkUriPort.PortSuffixIsCurrentlyUnconditional pins today's behaviour
-	// so this is revisited rather than silently inherited. See issue #365.
-	d->domain        = std::string(_cfg.host) + ":" + std::to_string(_cfg.port);
+	// Issue #365 (option A): the default port is omitted. By RFC 3261 §19.1.4 a
+	// URI omitting a component with a default value does NOT match one that
+	// carries it explicitly, so "sip:+1555@carrier.example.com:5060" and
+	// "sip:+1555@carrier.example.com" are distinct -- and SBCs and proxies that
+	// route on the Request-URI host treat them as different route keys. So the
+	// default port is left implicit, and any other configured port, being part
+	// of the route key, is kept. This changes the emitted bytes for the
+	// dotted-quad default-port case too; SipTrunkUriPort.* pins both halves.
+	d->domain        = (_cfg.port == 5060)
+		? std::string(_cfg.host)
+		: std::string(_cfg.host) + ":" + std::to_string(_cfg.port);
 	d->localIpPort   = activeIp + ":" + std::to_string(_env.serverPort());
 	d->destE164.assign(e164);
 	d->handsetCallID.assign(handsetCallID);

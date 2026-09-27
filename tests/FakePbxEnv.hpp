@@ -163,7 +163,7 @@ public:
 		return std::make_shared<SipMessage>(raw, destAddr);
 	}
 	void forEachSessionInvolving(std::string_view aor,
-		const std::function<void(const std::string&, const Session&, DialogRole)>& fn) const override
+		FunctionRef<void(const std::string&, const Session&, DialogRole)> fn) const override
 	{
 		for (const auto& [callID, session] : sessions)
 		{

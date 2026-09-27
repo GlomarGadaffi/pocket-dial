@@ -21,6 +21,13 @@
 //     CoreDumpStore:    the last panic's dump -- a copy of task stacks, which can
 //                       hold any of the above in the clear
 //
+//   NOT erased, by design:
+//     the `cfgseed` partition (the browser flasher's install-time seed, which
+//                       can carry credentials). DeviceConfig::clearAll() drops
+//                       cfgseed_gen so the next boot RE-APPLIES the seed: a
+//                       reset returns the board to how it was flashed. To
+//                       forget seeded credentials too, re-flash the seed.
+//
 // Kept out of HttpServer.cpp on purpose, so the route's only change is one call
 // (the HTTP layer is being restructured under #410).
 namespace FactoryReset
