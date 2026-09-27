@@ -562,6 +562,78 @@ TEST(SessionTimer, TooSmallSessionExpiresOnInviteIsAnswered422WithMinSE)
 	EXPECT_FALSE(handler.getSession("Call-ID: timer-small").has_value()) << "no session allocated";
 }
 
+namespace
+{
+	// An INVITE from 100 to `to` carrying `seLine` (e.g. "Session-Expires: 30").
+	std::shared_ptr<SipMessage> makeTimerInvite(const std::string& to, const std::string& callId,
+	                                            const std::string& seLine,
+	                                            const std::string& toTag = "", int cseq = 1)
+	{
+		const std::string ip = "192.168.40.10";
+		const std::string body = sdpBody(ip);
+		const std::string raw =
+			"INVITE sip:" + to + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bK" + callId + std::to_string(cseq) + "\r\n"
+			"From: <sip:100@server>;tag=ctag" + callId + "\r\n"
+			"To: <sip:" + to + "@server>" + (toTag.empty() ? "" : ";tag=" + toTag) + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(cseq) + " INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:100@" + ip + ":5060>\r\n"
+			"Supported: timer\r\n" + seLine + "\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
+	}
+}
+
+TEST(SessionTimer, CompactFormSessionExpiresIsAlsoHeld422)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	registerBothLegs(handler);
+	sent.clear();
+	handler.handle(makeTimerInvite("106", "timer-compact", "x: 30"));
+	EXPECT_FALSE(firstMatching(sent, "SIP/2.0 422").empty()) << "compact 'x:' is Session-Expires (RFC 4028 §4)";
+}
+
+TEST(SessionTimer, EmergencyCallsAreNever422dForAShortSessionExpires)
+{
+	for (const char* number : {"911", "933"})
+	{
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+		RequestsHandler handler(kServerIp, 5060,
+			[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+				sent.emplace_back(addr, std::move(msg));
+			});
+		registerBothLegs(handler);
+		sent.clear();
+		handler.handle(makeTimerInvite(number, std::string("timer-e") + number, "Session-Expires: 30"));
+		EXPECT_TRUE(firstMatching(sent, "SIP/2.0 422").empty()) << number << " must never be bounced 422";
+	}
+}
+
+TEST(SessionTimer, ReinviteWithShortSessionExpiresIsNot422d)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	registerBothLegs(handler);
+	auto session = runCallAnsweredWith(handler, "timer-reinv", "Session-Expires: 1800;refresher=uac\r\n");
+	ASSERT_TRUE(session != nullptr);
+	ASSERT_EQ(session->getState(), Session::State::Connected);
+	sent.clear();
+	handler.handle(makeTimerInvite("106", "timer-reinv", "Session-Expires: 30", "etagtimer-reinv", 2));
+	EXPECT_TRUE(firstMatching(sent, "SIP/2.0 422").empty())
+		<< "the floor applies to the initial INVITE only; re-INVITEs go to onReinvite()";
+	EXPECT_FALSE(sent.empty()) << "the re-INVITE must still be handled, not dropped";
+}
+
 TEST(SessionTimer, ExpiryDrivenByTickByesEachLegExactlyOnce)
 {
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;

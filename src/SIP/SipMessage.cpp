@@ -870,7 +870,7 @@ std::string_view SipMessage::getCSeqMethod() const
 
 uint32_t SipMessage::getSessionExpiresSecs() const
 {
-	size_t idx = findHeaderIndex("session-expires");
+	size_t idx = findHeaderIndex("session-expires", "x");
 	if (idx == std::string::npos) return 0;
 	std::string_view v = headerValueOf(_headerLines[idx]);
 	uint32_t val = 0;
@@ -882,7 +882,7 @@ uint32_t SipMessage::getSessionExpiresSecs() const
 
 std::string_view SipMessage::getSessionExpiresRefresher() const
 {
-	size_t idx = findHeaderIndex("session-expires");
+	size_t idx = findHeaderIndex("session-expires", "x");
 	if (idx == std::string::npos) return {};
 	std::string_view line = _headerLines[idx];
 	size_t rp = line.find("refresher=");

@@ -1821,24 +1821,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// Issue #198: RFC 4028 §8.1/§9 floor. Below the emergency branch so 911 is
-	// never bounced; re-INVITEs took the onReinvite() path above.
-	if (const uint32_t minSe = pbx::sessionIntervalMinSEFor422(
-			data->getSessionExpiresSecs(), data->getMinSESecs()); minSe != 0)
-	{
-		auto response = getMessageFromPool(*data);
-		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
-		response->setHeader("SIP/2.0 422 Session Interval Too Small");
-		response->clearBody();
-		char minSeBuf[11];
-		const auto conv = std::to_chars(minSeBuf, minSeBuf + sizeof(minSeBuf), minSe);
-		if (conv.ec != std::errc{}) return;
-		response->setHeaderOnce("Min-SE", std::string_view(minSeBuf, conv.ptr - minSeBuf));
-		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		_outbox.emplace_back(data->getSource(), std::move(response));
-		return;
-	}
-
 	// Issue #497: the From header only NAMES the caller. Before this, any host on
 	// the link could place a call -- dial plan and trunk egress included -- as any
 	// registered extension just by writing its number in From, and in Learn mode
@@ -1910,6 +1892,24 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		// them on to anyone who could replay them.
 		data->removeHeaders("Authorization");
 		data->removeHeaders("Proxy-Authorization");
+	}
+
+	// Issue #198: RFC 4028 §8.1/§9 floor. Below the emergency branch (911 never
+	// bounced) and the #497/auth gates; re-INVITEs took onReinvite() above.
+	if (const uint32_t minSe = pbx::sessionIntervalMinSEFor422(
+			data->getSessionExpiresSecs(), data->getMinSESecs()); minSe != 0)
+	{
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 422 Session Interval Too Small");
+		response->clearBody();
+		char minSeBuf[11];
+		const auto conv = std::to_chars(minSeBuf, minSeBuf + sizeof(minSeBuf), minSe);
+		if (conv.ec != std::errc{}) return;
+		response->setHeaderOnce("Min-SE", std::string_view(minSeBuf, conv.ptr - minSeBuf));
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		return;
 	}
 
 	if (destNumber == "777")
