@@ -11,9 +11,9 @@ namespace
 {
 	constexpr uint32_t kHdr = 20;   // IPv4 header, no options
 
-	int unfragmented(uint32_t totLen, uint32_t ipLen, bool driverOwned = true)
+	int unfragmented(uint32_t totLen, uint32_t ipLen)
 	{
-		return pd_ip4_input_verdict(totLen, ipLen, kHdr, 0, 0, driverOwned ? 1 : 0);
+		return pd_ip4_input_verdict(totLen, ipLen, kHdr, /*moreFragments=*/0);
 	}
 }
 
@@ -33,26 +33,25 @@ TEST(Ip4InputGuard, PaddingBeyondEthernetsMinimumIsDropped)
 	// The #509 review's attack: a full-size frame whose IP header claims 92 B.
 	// Trimmed, it would count 72 B of payload against SO_RCVBUF while pinning
 	// the whole 1,514 B driver buffer.
-	EXPECT_EQ(pd_ip4_input_verdict(1500, 92, kHdr, 1, 0, 1), PD_IP4_DROP_PADDED);
+	EXPECT_EQ(pd_ip4_input_verdict(1500, 92, kHdr, 1), PD_IP4_DROP_PADDED);
 	EXPECT_EQ(unfragmented(1500, 92), PD_IP4_DROP_PADDED)
 		<< "unfragmented too: the pin is the same without reassembly";
 	EXPECT_EQ(unfragmented(51, 28), PD_IP4_DROP_PADDED) << "one byte past the slack";
 	EXPECT_EQ(unfragmented(1505, 1500), PD_IP4_DROP_PADDED);
 }
 
-TEST(Ip4InputGuard, FragmentsAreCopiedOutOfDriverBuffersOrDroppedWhenTiny)
+TEST(Ip4InputGuard, ShortNonFinalFragmentsAreDroppedEverythingElsePasses)
 {
-	// A real non-final fragment at the Ethernet MTU: copied, then reassembled.
-	EXPECT_EQ(pd_ip4_input_verdict(1500, 1500, kHdr, 1, 0, 1), PD_IP4_CLONE);
-	// The final fragment may be any size.
-	EXPECT_EQ(pd_ip4_input_verdict(46, 28, kHdr, 0, 1480, 1), PD_IP4_CLONE);
-	// A copy never re-copies: once in PBUF_RAM it passes (the hook re-enters).
-	EXPECT_EQ(pd_ip4_input_verdict(1500, 1500, kHdr, 1, 0, 0), PD_IP4_PASS);
-	// A non-final fragment under 512 B of payload: no real sender, only a
-	// per-fragment overhead multiplier against the byte cap.
-	EXPECT_EQ(pd_ip4_input_verdict(120, 120, kHdr, 1, 0, 1), PD_IP4_DROP_TINY_FRAGMENT);
-	EXPECT_EQ(pd_ip4_input_verdict(kHdr + 511, kHdr + 511, kHdr, 1, 8, 1), PD_IP4_DROP_TINY_FRAGMENT);
-	EXPECT_EQ(pd_ip4_input_verdict(kHdr + 512, kHdr + 512, kHdr, 1, 8, 1), PD_IP4_CLONE);
-	// Unfragmented traffic is never copied, however it arrived.
-	EXPECT_EQ(unfragmented(1500, 1500, /*driverOwned=*/true), PD_IP4_PASS);
+	// A real non-final fragment at the Ethernet MTU passes to reassembly as is:
+	// the driver buffer is the frame's own size, so nothing needs copying.
+	EXPECT_EQ(pd_ip4_input_verdict(1500, 1500, kHdr, 1), PD_IP4_PASS);
+	// The final fragment (MF clear) may be any size.
+	EXPECT_EQ(pd_ip4_input_verdict(46, 28, kHdr, 0), PD_IP4_PASS);
+	// A non-final fragment under 256 B of payload: dropped, the cheapest
+	// per-pbuf overhead multiplier against the byte cap.
+	EXPECT_EQ(pd_ip4_input_verdict(120, 120, kHdr, 1), PD_IP4_DROP_TINY_FRAGMENT);
+	EXPECT_EQ(pd_ip4_input_verdict(kHdr + 255, kHdr + 255, kHdr, 1), PD_IP4_DROP_TINY_FRAGMENT);
+	EXPECT_EQ(pd_ip4_input_verdict(kHdr + 256, kHdr + 256, kHdr, 1), PD_IP4_PASS);
+	// IP options count in the header, not the payload.
+	EXPECT_EQ(pd_ip4_input_verdict(24 + 255, 24 + 255, 24, 1), PD_IP4_DROP_TINY_FRAGMENT);
 }

@@ -1530,15 +1530,11 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"uptime\":" << uptimeSec << ",";
 #if defined(ESP_PLATFORM)
 	// Issue #496 / #509 review: frames and fragments the IPv4 input guard
-	// (Ip4InputGuard.h) refused or copied since boot. Any non-zero padded or
-	// tinyFragments count is hostile or broken traffic on the LAN.
+	// (Ip4InputGuard.h) dropped since boot.
 	{
-		uint32_t g[4] = {0, 0, 0, 0};
+		uint32_t g[2] = {0, 0};
 		pd_ip4_guard_counts(g);
-		json << "\"ip4Guard\":{\"padded\":" << g[PD_IP4_DROP_PADDED]
-		     << ",\"tinyFragments\":" << g[PD_IP4_DROP_TINY_FRAGMENT]
-		     << ",\"fragmentsCopied\":" << g[PD_IP4_CLONE]
-		     << ",\"copyFailed\":" << g[0] << "},";
+		json << "\"ip4Guard\":{\"padded\":" << g[0] << ",\"tinyFragments\":" << g[1] << "},";
 	}
 #endif
 	json << "\"packetsProcessed\":" << packets << ",";

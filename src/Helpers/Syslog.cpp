@@ -286,6 +286,17 @@ namespace Syslog
 			return false;   // no ESP_LOGx here — see the RE-ENTRANCY RULE
 		}
 
+		// Issue #496 / #509 review: this socket is only ever sent on, and a
+		// connected UDP socket still queues whatever its peer sends back.
+		// Queue nothing -- set BEFORE connect(), so the socket is never live
+		// uncapped. A failure is not logged (see the RE-ENTRANCY RULE); it is
+		// refused the same way a failed connect() is.
+		if (!udprcvbuf::set(fd, udprcvbuf::kSendOnly))
+		{
+			close(fd);
+			return false;
+		}
+
 		// connect() on a UDP socket only fixes the default peer for send(): no
 		// handshake, no round trip, still connectionless. It is what lets the hot
 		// path call send() with no sockaddr and skip a per-datagram route lookup.
@@ -294,11 +305,6 @@ namespace Syslog
 			close(fd);
 			return false;
 		}
-		// Issue #496 / #509 review: this socket is only ever sent on, and a
-		// connected UDP socket still queues whatever its peer sends back.
-		// Queue nothing. A failure is not logged -- see the RE-ENTRANCY RULE;
-		// only the collector (or a sender spoofing it) can reach this socket.
-		(void)udprcvbuf::set(fd, udprcvbuf::kSendOnly);
 		s.sock = fd;
 #endif
 

@@ -13,6 +13,14 @@ if(DEFINED ENV{IDF_PATH})
     idf_component_get_property(pd_lwip_lib lwip COMPONENT_LIB)
     target_compile_options(${pd_lwip_lib} PRIVATE "-I${CMAKE_CURRENT_SOURCE_DIR}/main/lwip_hooks")
     target_compile_definitions(${pd_lwip_lib} PRIVATE "-DESP_IDF_LWIP_HOOK_FILENAME=\"pd_lwip_hooks.h\"")
+    # ...and prove it on every transport: fail the build unless lwIP's ip4.c
+    # object references the hook (-u alone would link it either way).
+    idf_build_get_property(pd_hook_elf EXECUTABLE)
+    add_custom_command(TARGET ${pd_hook_elf} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DLWIP_LIB=$<TARGET_FILE:${pd_lwip_lib}>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_lwip_ip4_hook.cmake
+        COMMENT "Issue #496: checking lwIP calls the IPv4 input guard"
+        VERBATIM)
 
     # Issue #420: the Ethernet transports leave the SAR ADC entropy source on
     # for their whole uptime (esp_main_eth*.cpp). Fail the build if the linked
