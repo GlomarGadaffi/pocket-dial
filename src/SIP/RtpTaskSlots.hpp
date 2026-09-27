@@ -10,8 +10,8 @@
 //                 buffers to a DMA SPI bus -- #466), kTxSlots x kStackBytes;
 //   rtp_media_rx: PSRAM (internal fallback where there is none), kRxSlots x
 //                 kStackBytes.
-// The conference legs' slots are allocated when the room is first built (it is
-// then kept for the life of the process).
+// The conference room is built in the RequestsHandler constructor, so its legs'
+// slots are boot-time too. tests/tools/test_rtp_static_slots.py gates all this.
 
 #include <cstdint>
 
@@ -34,5 +34,18 @@ namespace pd
 		constexpr uint32_t kRxPsramBytes    = kRxSlots * kStackBytes;
 	}
 }
+
+#if defined(ESP_PLATFORM)
+#include "sdkconfig.h"
+#if !defined(CONFIG_SPIRAM) || !CONFIG_SPIRAM
+// No PSRAM (esp32_constrained): the rx stacks fall back to internal too, so
+// every slot is internal DRAM, fixed at boot. SIP_CONSTRAINED's caps
+// (main/CMakeLists.txt) give 11 slots = 66 KB; the defaults would be 150 KB.
+static_assert((pd::rtpslots::kTxSlots + pd::rtpslots::kRxSlots) * pd::rtpslots::kStackBytes
+              <= 72u * 1024u,
+              "#479: no-PSRAM build fixes too much internal DRAM in RTP task slots; "
+              "build with SIP_CONSTRAINED=1 or lower the POCKETDIAL_* call caps");
+#endif
+#endif
 
 #endif // PD_RTP_TASK_SLOTS_HPP

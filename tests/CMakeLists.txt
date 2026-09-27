@@ -612,8 +612,6 @@ add_executable(sip_parser_tests
     CdrRing_test.cpp
     # Issue #535 / #572 review: when a parked media task may be deleted.
     ParkedTaskReap_test.cpp
-    # Issue #479: per-slot static RTP task stacks, fixed boot cost.
-    RtpTaskSlots_test.cpp
     # Issue #554 (b): the dropped-leg tombstone ring.
     RecentIdRing_test.cpp
     # Issue #554 (#575 review): rx restart decision + tombstone refusal.

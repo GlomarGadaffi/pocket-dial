@@ -263,7 +263,15 @@ if(SIP_CONSTRAINED)
         # greeting can only live in internal DRAM -- capped at 16 KB (2 s of
         # 8 kHz mu-law), loaded at boot/admin upload only, refused and counted
         # above it.
-        POCKETDIAL_CLIP_INTERNAL_MAX_BYTES=16384)
+        POCKETDIAL_CLIP_INTERNAL_MAX_BYTES=16384
+        # Issue #479: every RTP media slot's 6 KB task stack is allocated at
+        # boot, and with no PSRAM the rx stacks are internal too. These caps
+        # give 5 tx + 6 rx = 11 slots = 66 KB internal (RtpTaskSlots.hpp
+        # static_asserts the no-PSRAM ceiling); the defaults would be 150 KB.
+        POCKETDIAL_MAX_ANCHOR_CALLS=1
+        POCKETDIAL_MAX_VOICEMAIL_LEGS=1
+        POCKETDIAL_MAX_TRUNK_CALLS=1
+        POCKETDIAL_CONF_LEGS=2)
     # #416: the pcap ring is fixed storage (ring x ~2.1 KB), and a constrained build
     # has no PSRAM (sdkconfig.defaults.esp32_constrained: CONFIG_SPIRAM=n), so all of
     # it is internal DRAM. 4 slots ~= 8.4 KB instead of 16 ~= 33.7 KB. Set as a CMake
@@ -272,7 +280,7 @@ if(SIP_CONSTRAINED)
     if(NOT DEFINED POCKETDIAL_PCAP_RING_SIZE)
         set(POCKETDIAL_PCAP_RING_SIZE 4)
     endif()
-    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 pcap=${POCKETDIAL_PCAP_RING_SIZE})")
+    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 rtpslots=5tx+6rx=66KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
 endif()
 
 # PcapCapture.hpp has always advertised itself as "compile-time tunable

@@ -164,6 +164,19 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// the trunk it is handed to.
 	_sipTrunk.setListener(this);
 
+	// Issue #479: the conference room is built HERE, at boot, so its legs'
+	// RTP task slots (RtpSender/RtpReceiver stacks + TCBs) are allocated at
+	// init, never on the first 888 dial-in. Its mix-tick driver still starts
+	// on the first dial-in (onConferenceInvite), as before.
+	_conference = std::make_unique<ConferenceRoom>();
+	// Issue #199 item 3: give every leg a way to hand an RFC 4733 key press
+	// back to the engine. Invoked on that leg's RTP receive task, so it goes
+	// to queueDtmfDigit(), which is the one entry point here built to be
+	// called without _mutex held.
+	_conference->setDigitSink([this](std::string_view legCallId, char digit) {
+		queueDtmfDigit(legCallId, digit);
+	});
+
 	// Pre-allocate pools (Issue #53). Capacities are compile-time tunable via
 	// PoolConfig.hpp (-DPOCKETDIAL_MAX_* overrides); defaults preserve 32/8/32.
 	_clientPool.reserve(POCKETDIAL_MAX_CLIENTS);
@@ -2627,24 +2640,12 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 
-	// The room (and its single mix-tick driver) is built on the first dial-in and then
-	// kept for the life of the process: standing the tick task up and down underneath
-	// legs whose RTP tasks may still be in flight is exactly the teardown race the bus's
-	// Draining state exists to avoid. Idle cost is the bus rings; see PoolConfig.hpp.
-	if (!_conference)
-	{
-		_conference = std::make_unique<ConferenceRoom>();
-		// Issue #199 item 3: give every leg a way to hand an RFC 4733 key press
-		// back to the engine. Invoked on that leg's RTP receive task, so it goes
-		// to queueDtmfDigit(), which is the one entry point here built to be
-		// called without _mutex held.
-		_conference->setDigitSink([this](std::string_view legCallId, char digit) {
-			queueDtmfDigit(legCallId, digit);
-		});
-		_conference->startDriver();
-		queueLog("888 conference: room created (" + std::to_string(ConferenceRoom::MAX_LEGS)
-			+ " legs, " + std::to_string(ConferenceRoom::TICK_MS) + " ms mix tick)");
-	}
+	// The room is built at boot (constructor, #479); its single mix-tick driver starts
+	// on the first dial-in and is then kept for the life of the process: standing the
+	// tick task up and down underneath legs whose RTP tasks may still be in flight is
+	// exactly the teardown race the bus's Draining state exists to avoid. startDriver()
+	// is a no-op once running, so calling it on every dial-in also retries a failed start.
+	_conference->startDriver();
 
 	// Join first: a full room must not consume a session slot. The leg index is also
 	// the proof the media actually came up, so nothing is answered on a dead leg.
