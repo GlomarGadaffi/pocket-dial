@@ -147,6 +147,7 @@ namespace
 		void SetUp() override
 		{
 			AdminAuth::clearCredential();
+			CoreDumpStore::setPartitionForTest(true);
 			CoreDumpStore::setImageForTest({});
 			_port = _nextPort++;
 			_handler = std::make_unique<RequestsHandler>("192.168.4.1", 5060,
@@ -161,6 +162,7 @@ namespace
 		{
 			_server.reset();
 			_handler.reset();
+			CoreDumpStore::setPartitionForTest(true);
 			CoreDumpStore::setImageForTest({});
 			AdminAuth::clearCredential();
 		}
@@ -236,13 +238,13 @@ TEST_F(CoreDumpHttpTest, StatusReportsPresenceUngatedAndInfoNeedsASession)
 	provisionBoth(_port, sysop, owner);
 
 	std::string status = bodyOf(httpRaw(_port, "GET", "/api/status", ""));
-	EXPECT_NE(status.find("\"coredump\":{\"present\":false,\"size\":0}"), std::string::npos) << status;
+	EXPECT_NE(status.find("\"coredump\":{\"present\":false,\"size\":0,\"supported\":true}"), std::string::npos) << status;
 	EXPECT_EQ(statusOf(httpRaw(_port, "GET", "/api/coredump", "", "pd_session=" + owner.cookie)), 404)
 		<< "no dump stored";
 
 	CoreDumpStore::setImageForTest(fakeImage());
 	status = bodyOf(httpRaw(_port, "GET", "/api/status", ""));
-	EXPECT_NE(status.find("\"coredump\":{\"present\":true,\"size\":1500}"), std::string::npos)
+	EXPECT_NE(status.find("\"coredump\":{\"present\":true,\"size\":1500,\"supported\":true}"), std::string::npos)
 		<< "an unwatched panic must be noticeable without logging in: " << status;
 
 	EXPECT_EQ(statusOf(httpRaw(_port, "GET", "/api/coredump/info", "")), 401);
@@ -283,7 +285,7 @@ TEST_F(CoreDumpHttpTest, StaleRegionReportsNoDumpOverHttp)
 	CoreDumpStore::setImageForTest(junk);
 
 	const std::string status = bodyOf(httpRaw(_port, "GET", "/api/status", ""));
-	EXPECT_NE(status.find("\"coredump\":{\"present\":false,\"size\":0}"), std::string::npos) << status;
+	EXPECT_NE(status.find("\"coredump\":{\"present\":false,\"size\":0,\"supported\":true}"), std::string::npos) << status;
 	EXPECT_EQ(statusOf(httpRaw(_port, "GET", "/api/coredump", "", "pd_session=" + owner.cookie)), 404)
 		<< "stale flash must never be served as a dump";
 }
@@ -303,4 +305,83 @@ TEST_F(CoreDumpHttpTest, EraseNeedsTheCsrfTokenAndClearsTheDump)
 	EXPECT_EQ(statusOf(resp), 200) << resp;
 	EXPECT_NE(bodyOf(resp).find("\"erased\":true"), std::string::npos) << bodyOf(resp);
 	EXPECT_FALSE(CoreDumpStore::query().present);
+}
+
+// Issue #405: /api/status is polled continuously on 4 KB per-connection
+// threads. It must report the dump from the boot-time cache, never by probing
+// the partition (the flash driver's call chain is the ~836 B of stack #405
+// lost), and erase() must keep that cache truthful on its own.
+TEST_F(CoreDumpHttpTest, StatusAndInfoReadTheCacheNeverTheFlash)
+{
+	AdminSession sysop, owner;
+	provisionBoth(_port, sysop, owner);
+	CoreDumpStore::setImageForTest(fakeImage());   // a panic + reboot: probed once, here
+	const uint32_t before = CoreDumpStore::flashAccessCountForTest();
+
+	for (int i = 0; i < 3; ++i)
+	{
+		const std::string status = bodyOf(httpRaw(_port, "GET", "/api/status", ""));
+		EXPECT_NE(status.find("\"coredump\":{\"present\":true,\"size\":1500,\"supported\":true}"), std::string::npos) << status;
+	}
+	const std::string info = httpRaw(_port, "GET", "/api/coredump/info", "", "pd_session=" + sysop.cookie);
+	EXPECT_EQ(statusOf(info), 200);
+	EXPECT_NE(bodyOf(info).find("\"present\":true"), std::string::npos) << bodyOf(info);
+	EXPECT_EQ(CoreDumpStore::flashAccessCountForTest(), before)
+		<< "/api/status and /api/coredump/info must not touch the partition (#405)";
+
+	// erase() alone invalidates the cache: no stale "present":true, and no
+	// re-probe needed to find out.
+	EXPECT_EQ(statusOf(httpRaw(_port, "POST", "/api/coredump/erase", "",
+		"pd_session=" + sysop.cookie, sysop.csrf)), 200);
+	const std::string after = bodyOf(httpRaw(_port, "GET", "/api/status", ""));
+	EXPECT_NE(after.find("\"coredump\":{\"present\":false,\"size\":0,\"supported\":true}"), std::string::npos) << after;
+	EXPECT_EQ(CoreDumpStore::flashAccessCountForTest(), before)
+		<< "erase() must update the cache itself, not force a probe on the next poll";
+}
+
+// ── #514: a board with no coredump partition says so ─────────────────────────
+// OTA never rewrites the partition table, so a board first flashed before #382
+// has no coredump partition and can never keep a dump. It used to report
+// supported:true, present:false -- which reads as "no crash happened".
+
+TEST(CoreDumpStore, ABoardWithoutTheCoredumpPartitionIsNotSupportedAndHasNoDump)
+{
+	CoreDumpStore::setPartitionForTest(false);
+	CoreDumpStore::setImageForTest(fakeImage());   // even bytes that look like a dump
+
+	const CoreDumpStore::Info info = CoreDumpStore::query();
+	EXPECT_FALSE(info.supported) << "no partition: nowhere a panic could have been saved";
+	EXPECT_FALSE(info.present);
+	EXPECT_EQ(info.size, 0u);
+	uint8_t b[4] = {};
+	EXPECT_FALSE(CoreDumpStore::read(0, b, sizeof(b)));
+	EXPECT_FALSE(CoreDumpStore::erase()) << "as on the board: nothing to erase";
+
+	CoreDumpStore::setPartitionForTest(true);
+	CoreDumpStore::setImageForTest({});
+}
+
+TEST(CoreDumpStore, AnEmptyPartitionIsSupportedButHasNoDump)
+{
+	// The distinction #514 is about: this board COULD keep a dump, and has none.
+	CoreDumpStore::setPartitionForTest(true);
+	CoreDumpStore::setImageForTest({});
+	const CoreDumpStore::Info info = CoreDumpStore::query();
+	EXPECT_TRUE(info.supported);
+	EXPECT_FALSE(info.present);
+}
+
+TEST_F(CoreDumpHttpTest, StatusSaysUnsupportedWhenTheBoardHasNoCoredumpPartition)
+{
+	AdminSession sysop, owner;
+	provisionBoth(_port, sysop, owner);
+	CoreDumpStore::setPartitionForTest(false);
+
+	const std::string status = bodyOf(httpRaw(_port, "GET", "/api/status", ""));
+	EXPECT_NE(status.find("\"coredump\":{\"present\":false,\"size\":0,\"supported\":false}"),
+		std::string::npos) << "no partition must not read as \"no crash\": " << status;
+
+	const std::string info = httpRaw(_port, "GET", "/api/coredump/info", "", "pd_session=" + sysop.cookie);
+	EXPECT_EQ(statusOf(info), 200);
+	EXPECT_NE(bodyOf(info).find("\"supported\":false"), std::string::npos) << bodyOf(info);
 }

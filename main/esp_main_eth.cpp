@@ -23,6 +23,7 @@
 #include "freertos/event_groups.h"
 
 #include "esp_system.h"
+#include "bootloader_random.h"   // Issue #420: SAR ADC entropy source for esp_random()
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #185: sip_server_task TWDT subscription
@@ -505,6 +506,23 @@ static void http_server_task(void* pvParameters)
             srv->getHandler().startHoldMusic("/sdcard/moh.wav");
 #endif
         }
+#if defined(POCKETDIAL_OTA_ROLLBACK_PROBE)
+        // BENCH-ONLY (#395, tools/ota/remote_ota.sh stage 4): an image that
+        // NEVER confirms itself, and restarts itself ~60 s after boot while
+        // still pending -- so the bootloader's rollback can be proven on a board
+        // nobody can reset. Restarts ONLY while pendingVerify: on a bootloader
+        // without rollback the image boots as valid and simply keeps running,
+        // so this can never boot-loop. Never ship it (CMake warns loudly).
+        if (!otaConfirmed && ++otaSettleSec >= 60)
+        {
+            otaConfirmed = true;
+            if (OtaUpdater::isPendingVerify())
+            {
+                ESP_LOGW(TAG, "OTA ROLLBACK PROBE: still pending after 60 s -- restarting WITHOUT markValid()");
+                esp_restart();
+            }
+        }
+#else
         if (!otaConfirmed && ++otaSettleSec >= 5)
         {
             otaConfirmed = true;
@@ -514,6 +532,7 @@ static void http_server_task(void* pvParameters)
                 ESP_LOGI(TAG, "OTA: new image confirmed valid after healthy boot");
             }
         }
+#endif
     }
 
     vTaskDelete(nullptr);
@@ -567,6 +586,25 @@ extern "C" void app_main(void)
     // unit can report that.
     ESP_LOGI(TAG, "[boot] reset reason: %s", pdResetReasonString(esp_reset_reason()));
 
+    // ── True entropy for esp_random() (issue #420) ──────────────────────────
+    // ESP-IDF's esp_random()/esp_fill_random() are TRUE random only while an
+    // entropy source runs: the RF subsystem (Wi-Fi/BT), or the SAR ADC source
+    // bootloader_random_enable() turns on (docs/en/api-reference/system/
+    // random.rst). This build never starts Wi-Fi or BT, so without this call
+    // every draw after boot is PSEUDO-random -- and every security-relevant
+    // number on the board comes from esp_random(): AdminAuth session tokens and
+    // salts, SipDigest's nonce secret and cnonce, DeviceConfig's generated
+    // secrets, IDGen's Call-IDs/tags/branches (#385), RTP SSRCs, and mbedTLS's
+    // own TLS RNG (IDF routes psa_generate_random to esp_fill_random).
+    //
+    // Enabled FIRST, before NVS/DeviceConfig can generate anything, and LEFT ON:
+    // random.rst requires bootloader_random_disable() only before the ADC, I2S
+    // (classic ESP32) or RF are used, and this build uses none of them. ANYONE
+    // ADDING an ADC or I2S user to this transport must disable it first, or
+    // move to a seed-then-disable DRBG -- the conflict is silent, not a crash.
+    bootloader_random_enable();
+    ESP_LOGI(TAG, "[boot] entropy: SAR ADC source enabled and left on -- esp_random() is a TRNG (#420)");
+
     // ── NVS init (keep ESP_ERROR_CHECK here — unrecoverable without flash) ──
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
@@ -598,11 +636,10 @@ extern "C" void app_main(void)
 
     // ── Task 1B: install non-blocking log queue + drain task ────────────────
     LogQueue::create();
-    // Remote logging (#183). loadFromNvs() is a no-op when syslog_host is unset,
-    // and send() returns immediately while unconfigured, so an unprovisioned board
-    // pays nothing but the branch. Registered before the task starts so no line
-    // drained during boot is missed once a host IS configured.
-    Syslog::loadFromNvs();
+    // Remote logging (#183): the tee is registered here, before the drain task starts;
+    // send() returns immediately until a host is configured, so an unprovisioned board
+    // pays nothing but the branch. The saved host itself is loaded further down, after
+    // esp_netif_init() -- see there (#508).
     LogQueue::setTee(log_tee_to_syslog);
     // 3072, up from 2048: the tee adds an lwip send() to this task's deepest path.
     // The high-water mark logged by the task itself is what justifies this number
@@ -615,6 +652,12 @@ extern "C" void app_main(void)
     // uninitialized stack. UdpServer's socket back-off is the recoverable-retry layer.
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Remote logging (#183, #508): load the saved syslog host only now. configure()
+    // opens its UDP socket immediately, and before esp_netif_init() has started lwIP's
+    // tcpip thread that socket() asserts ("Invalid mbox" in tcpip_send_msg_wait_sem):
+    // every restart after a host was saved became a boot loop.
+    Syslog::loadFromNvs();
 
     s_eth_event_group = xEventGroupCreate();
 

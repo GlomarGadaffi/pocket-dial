@@ -192,36 +192,10 @@ jobs:
           cmake --install cppcheck-build
 
       - name: Run Static Analysis (cppcheck)
-        # On the Sdp.cpp suppression below: that file is re2c OUTPUT (issue
-        # #196). It is never hand-edited and is drift-checked against Sdp.re,
-        # so a finding in it cannot be fixed in place -- any edit would just be
-        # reverted by the next regeneration and flagged as drift.
-        #
-        # The finding itself is benign codegen: the generated DFA walks its
-        # input by incrementing a by-value `const char* YYCURSOR` parameter,
-        # which cppcheck reports as uselessAssignmentPtrArg -- an assignment to
-        # a pointer parameter with no effect outside the function. Literally
-        # true and beside the point: the caller wants the returned token, not
-        # the final cursor position.
-        #
-        # Scoped to that ONE check on that ONE file, deliberately, rather than
-        # the blanket `--suppress=*:<path>` used for qrcode.c below. Generated
-        # code can still contain findings worth acting on; silencing the whole
-        # file would hide them permanently.
-        run: |
-          export PATH="$HOME/cppcheck-install/bin:$PATH"
-          cppcheck --version
-          cppcheck --error-exitcode=1 \
-                   --enable=warning,performance \
-                   --inline-suppr \
-                   --suppress=missingIncludeSystem \
-                   --suppress=unmatchedSuppression \
-                   --suppress=*:main/ui/qrcode.c \
-                   --suppress=*:main/ui/qrcode.h \
-                   --suppress=unknownMacro:main/ui/ui.cpp \
-                   --suppress=uselessAssignmentPtrArg:src/SIP/Sdp.cpp \
-                   -I src/Helpers -I src/SIP -I main \
-                   src/ main/
+        # The invocation and its suppressions (including why Sdp.cpp is
+        # suppressed) live in tools/ci/run_cppcheck.sh, shared with the
+        # other workflow so the two gates can't drift apart again.
+        run: bash tools/ci/run_cppcheck.sh
 
       - name: Cache pinned re2c build
         id: re2c-cache
@@ -396,12 +370,19 @@ jobs:
           rm -rf build/gtest-reports
           ctest --test-dir build/tests --output-on-failure
 
-      - name: Verify Test Count (floor in tests/EXPECTED_MIN_TESTS)
+      - name: Self-test the test-count checker (#467)
+        run: python3 -m unittest discover -s tests/tools -p 'test_*.py' -v
+
+      - name: Self-test the soak verdict (#401)
+        run: python3 -m unittest discover -s tests/tools -p 'test_soak_verdict.py' -v
+
+      - name: Verify Test Count (floor = tests/EXPECTED_MIN_TESTS + tests/min_tests.d)
         run: |
           # ctest counts the whole gtest suite as ONE test ("0 tests failed out
           # of 1"), so it cannot tell 1235 passing tests from 12 (#390). This
-          # prints how many actually ran and fails below the checked-in floor.
-          # Fails closed: a missing report is a failure, not a pass.
+          # prints how many actually ran and fails below the floor: the base
+          # plus one contribution file per PR (#467), so PRs never conflict
+          # over one number. Fails closed: a missing report is a failure.
           python3 tests/tools/check_test_count.py build/gtest-reports
 
       # The T-7 call-graph guard used to run here. It is its own job now
@@ -615,6 +596,17 @@ jobs:
           
           echo "Successful compilation for ${{ matrix.target-chip }} on ESP-IDF ${{ matrix.idf-version }} (Transport: ${{ matrix.sip-transport }})"
 
+      # Issue #489: how full is the app slot? The build fails outright only once
+      # the image no longer fits; this fails EARLIER, while there is still room to
+      # ship a fix. The script reads the partition table this leg actually built,
+      # so each layout is checked against its own slots. The constrained 4 MB
+      # layout, which is the one near its limit, is built and checked by the
+      # build-constrained job below (this matrix never builds that profile).
+      - name: App slot margin (issue #489)
+        run: |
+          . $IDF_PATH/export.sh > /dev/null
+          python3 tools/ci/app_slot_margin.py build
+
       - name: Upload ESP32-S3 Ethernet Firmware Bundle
         if: matrix.target-chip == 'esp32s3' && matrix.sip-transport == 'eth'
         uses: actions/upload-artifact@v4
@@ -733,6 +725,32 @@ jobs:
           idf.py set-target esp32s3
           idf.py -D SIP_TRANSPORT=eth -D PD_ETH_BOARD=waveshare build
           echo "Compiles for esp32s3 / eth / PD_ETH_BOARD=waveshare (compile-only; not hardware-verified)."
+
+  # Issue #489: the resource-constrained profile (classic esp32, lan8720, no PSRAM,
+  # partitions_4mb.csv with 0x1E0000 app slots). No other job builds it -- the
+  # matrix's lan8720 leg uses the 16 MB defaults -- and it is the one layout near
+  # its limit, so it is built here and its app-slot margin checked. The recipe
+  # is main/CMakeLists.txt's SIP_CONSTRAINED comment.
+  build-constrained:
+    name: Build Firmware (esp32 / lan8720 / SIP_CONSTRAINED, 4 MB) + app-slot margin
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build the constrained profile
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 \
+                 -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
+                 set-target esp32 build
+
+      - name: App slot margin (issue #489)
+        run: |
+          . $IDF_PATH/export.sh > /dev/null
+          python3 tools/ci/app_slot_margin.py build
 
   # Job 3: Security & Guardrails
   # Explicitly validates that no accidental GCP or outside deployment files are configured.

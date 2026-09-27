@@ -66,6 +66,17 @@ add_executable(sip_parser_tests
     # refuse) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
     RequestsHandler_pool_test.cpp
+    # Issue #410 phase 1: the static HTML pages stream from flash (byte-identical
+    # to the old path, zero allocation beyond the CSRF token).
+    HttpStaticPages_test.cpp
+    # Issue #410 phase 2: every response goes out in place via one scatter-gather
+    # sendmsg() (byte-identical, short writes resumed, zero allocation).
+    HttpSendPath_test.cpp
+    # Issue #412: every allocateVirtualPeer() caller must survive an exhausted
+    # pool -- refuse with 503 (or drop the anchor leg) and release what it had
+    # claimed, never publish a session with a null peer.
+    VpeerExhaustion_test.cpp
+    VpeerExhaustion_vm_anchor_test.cpp
     # Issue #115: the 777 SDP-loopback echo test must call allocateSession()
     # BEFORE building any 180/200, mirroring the ordinary call-to-call INVITE
     # path, so a full session pool gets a real 503 instead of a false 200.
@@ -123,6 +134,9 @@ add_executable(sip_parser_tests
     # Errata 749 — because a digest implementation that only agrees with itself
     # will agree with itself while failing against every real SBC.
     SipDigestClient_test.cpp
+    # Issue #399: the allocation-free digest client API, checked byte for byte
+    # against the std::string API above and against the published RFC vectors.
+    SipDigestBounded_test.cpp
     # The REGISTER user agent built on top of it: challenge/retry, nc
     # incrementing across refreshes, stale-nonce re-challenge, 423 + Min-Expires,
     # a server-shortened Expires, and the backoff that keeps a refusing carrier
@@ -158,6 +172,8 @@ add_executable(sip_parser_tests
     # gets a BYE for the dialog it was on (not just that the target gets an
     # INVITE).
     BlindTransfer_test.cpp
+    # Issue #422: the four server-originated in-dialog CSeqs #407 did not reach.
+    ServerCSeqSites_test.cpp
     # Issue #198: RFC 4028 session timers. Pins the arming DECISION (a 2xx with
     # Session-Expires but no refresher parameter obliges nobody, so arming a
     # reaper could only ever produce a spurious BYE) and the OPTIONS capability
@@ -212,6 +228,11 @@ add_executable(sip_parser_tests
     # Kari's Law notification (#166 part 2): ordering (call leg before
     # notification), firing on a FAILED 911, and the config bound.
     EmergencyNotify_test.cpp
+    # Issue #521: an emergency number is carried by a provider that places
+    # REAL calls (a real anchor, else the SIP trunk) or refused with 503 --
+    # never answered by the loopback simulator -- plus the route report,
+    # the boot WARN, /api/status's emergencyRoute and the dashboard banner.
+    EmergencyRoute_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is
@@ -265,6 +286,9 @@ add_executable(sip_parser_tests
     # bounded-cache/in-flight state machine.
     TrunkResolver_test.cpp
     PlayoutBuffer_test.cpp
+    # Issue #466: clip placement policy, DmaFramePool's lock-free publish, the
+    # PSRAM-preferring allocator behind PlayoutBuffer.
+    PsramPlacement_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp
     # Wires the AnchorClient/MediaBridge/TelephonyProvider extension point into
@@ -314,9 +338,15 @@ add_executable(sip_parser_tests
     # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real
     # µ-law rim, a leg leaving mid-conference, and the RequestsHandler 888 intercept.
     ConferenceRoom_test.cpp
+    # Issue #513: a quick 888 re-dial skips a leg whose RTP tasks are still
+    # stopping instead of failing the join (486).
+    ConferenceRejoin_test.cpp
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp
+    # Issue #529: a trickled request body is dropped at the read deadline, and one
+    # source address cannot hold every connection slot. Ports 18250-18259.
+    HttpReadDeadline_test.cpp
     # Issue #186: AdminAuth::pbkdf2Sha256/aesGcmSeal/aesGcmOpen against
     # published RFC 7914 / GCM-spec vectors, plus the tamper/wrong-AAD/
     # wrong-key properties the config-export "secrets_enc" block depends on.
@@ -328,6 +358,15 @@ add_executable(sip_parser_tests
     # Issue #382: /api/coredump* -- owner-only download, CSRF-checked erase,
     # ungated presence on /api/status, against a fake CoreDumpStore image.
     CoreDumpHttp_test.cpp
+    # Issue #397: the boot-time registrar default (fresh -> learn; existing -> learn too since #500).
+    RegistrarBootMode_test.cpp
+    # Issue #363: every secret-bearing store is empty after a factory reset.
+    FactoryResetSecrets_test.cpp
+    # Issue #385: the brute-force state-recovery attack on IDGen, run for real
+    # (DISABLED_ by default -- a full 2^31 search each; see the file header).
+    IDGenPredict_test.cpp
+    # Issue #385: always-on seam/mapping guards for IDGen.
+    IDGen_test.cpp
     # Issue #186: GET/POST /api/config/export and POST /api/config/import,
     # driven end-to-end through a real HttpServer -- plaintext round-trip,
     # password-gated round-trip, replace-not-merge, and the 400/422 rejection
@@ -373,6 +412,7 @@ add_executable(sip_parser_tests
     # Issue #453: in-dialog requests across a B2BUA splice (pickup, park,
     # transfer) are rebuilt in the peer dialog, never relayed verbatim.
     SpliceInDialog_test.cpp
+    NoReplyToResponse_test.cpp
     RegisterBeeper_test.cpp
     # Issue #148: the duplicate-tracking feedback loop between sweep()'s Timer-A
     # retransmit and drainOutbox()'s maybeTrack() scan, driven directly so the
@@ -401,6 +441,9 @@ add_executable(sip_parser_tests
     # answer keeps the callee's own capabilities, and that a phone's own Allow
     # never survives into ours as a second header line.
     CapabilityHeaders_test.cpp
+    # Issue #523: a de-REGISTER (Expires: 0) is answered 200 at its source, not
+    # 404 through endHandle()'s by-number lookup of the client it just released.
+    Deregistration_test.cpp
     # Issue #229: `Supported: replaces` backs onRefer()'s REFER ?Replaces=
     # attended-transfer splice (#131) only -- RFC 3891 §3's OTHER use of the
     # same tag, an INVITE that itself carries a Replaces header (the BLF-key
@@ -415,6 +458,16 @@ add_executable(sip_parser_tests
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
     # PcapCapture.hpp has no dependency beyond sockaddr_in.
     PcapCapture_test.cpp
+    # Issue #463 (#284 batch B): the idle tick, OPTIONS ping and header rewrites.
+    IdleTickAlloc_test.cpp
+    # Issue #464 (#284 batch C): per-request lookups allocate nothing.
+    AllocFreeLookups_test.cpp
+    DropProbe_test.cpp
+    # Issues #443/#444: SIP receive-path discards (oversize via recvmsg+MSG_TRUNC,
+    # empty, failed receives, pool exhaustion) are counted, never silent.
+    SipRxDiscards_test.cpp
+    # Issues #444/#469: the shared truncation-aware UDP receive (UdpRecv.hpp).
+    UdpRecv_test.cpp
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
     ProvisioningConfig_test.cpp
@@ -451,6 +504,8 @@ add_executable(sip_parser_tests
     # Issue #382: HttpServer's /api/coredump* routes call it; the host arm serves
     # a test-installed fake image instead of flash.
     ../src/Helpers/CoreDumpStore.cpp
+    # Issue #363: the secrets a factory reset must erase.
+    ../src/Helpers/FactoryReset.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
     # length/charset bounds that stop a typo from bringing the AP up open.
     DeviceConfig_test.cpp
@@ -566,6 +621,11 @@ add_executable(sip_parser_tests
     # into its own translation unit.
     ../src/SIP/CallPickup.cpp
     ../src/SIP/RequestsHandler.cpp
+    # Issues #443/#444: the UDP receive loop and SipServer's hand-off, linked for
+    # SipRxDiscards_test.cpp (real loopback socket, end to end).
+    ../src/Helpers/UdpServer.cpp
+    ../src/SIP/SipServer.cpp
+    ../src/SIP/SipMessageFactory.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp
     ../src/SIP/RegisterBeeper.cpp

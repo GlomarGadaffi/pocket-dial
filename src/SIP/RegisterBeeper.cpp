@@ -20,7 +20,9 @@ RegisterBeeper::BeepDialog* RegisterBeeper::findByCallID(std::string_view callID
 	const std::string key = siphdr::stripHeaderName(callID);
 	for (auto& bd : _dialogs)
 	{
-		if (bd.state != BeepState::Free && bd.callID == key)
+		// A Pending slot (#408) has sent nothing and has no Call-ID yet; never let
+		// a malformed message whose Call-ID strips to "" match one.
+		if (bd.state != BeepState::Free && bd.state != BeepState::Pending && bd.callID == key)
 		{
 			return &bd;
 		}
@@ -28,7 +30,7 @@ RegisterBeeper::BeepDialog* RegisterBeeper::findByCallID(std::string_view callID
 	return nullptr;
 }
 
-void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone)
+void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone, std::chrono::milliseconds delay)
 {
 	if (!phone || phone->getNumber().empty())
 	{
@@ -47,8 +49,27 @@ void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone)
 		return;
 	}
 
-	std::string clientNum = phone->getNumber();
-	const sockaddr_in& addr = phone->getAddress();
+	slot->callID.clear();
+	slot->ext  = phone->getNumber();
+	slot->addr = phone->getAddress();
+	const auto now = std::chrono::steady_clock::now();
+	if (delay.count() > 0)
+	{
+		// Issue #408: not in the same pass as the REGISTER's 200 OK. The slot is
+		// claimed now (so the table bound still holds), the INVITE goes out from
+		// sweep() once the delay has passed.
+		slot->state    = BeepState::Pending;
+		slot->deadline = now + delay;
+		return;
+	}
+	fire(*slot, now);
+}
+
+void RegisterBeeper::fire(BeepDialog& bd, std::chrono::steady_clock::time_point now)
+{
+	BeepDialog* slot = &bd;
+	const std::string clientNum = slot->ext;
+	const sockaddr_in addr = slot->addr;
 	std::string destIpPort = addrToIpPort(addr);
 
 	std::string activeIp = _env.localIp();
@@ -66,7 +87,7 @@ void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone)
 	slot->fromTag  = fromTag;
 	slot->ext      = clientNum;
 	slot->addr     = addr;
-	slot->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	slot->deadline = now + std::chrono::seconds(5);
 
 	// Minimal, well-formed SDP. a=inactive: no RTP will flow (server sources none).
 	const std::string body = sipwire::makeInactiveHoldSdp(activeIp);
@@ -189,6 +210,11 @@ void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
 		auto& bd = _dialogs[i];
 		if (bd.state == BeepState::Free || now < bd.deadline)
 		{
+			continue;
+		}
+		if (bd.state == BeepState::Pending)
+		{
+			fire(bd, now);   // #408: its delay after the REGISTER's 200 OK has passed
 			continue;
 		}
 		if (bd.state == BeepState::AwaitingInviteOk)

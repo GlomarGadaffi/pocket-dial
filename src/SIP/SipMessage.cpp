@@ -1,4 +1,6 @@
 #include "SipMessage.hpp"
+#include <cstdio>   // #463: syncContentLength formats into a stack buffer
+#include <algorithm>
 #include <vector>
 #include <cctype>
 #include "SipMessageTypes.h"
@@ -252,14 +254,48 @@ void SipMessage::setContentLength(std::string value)
 	}
 }
 
-void SipMessage::addHeader(const std::string& name, const std::string& value)
+namespace
 {
-	insertHeaderLine(name + ": " + value);
+	// "<name>: <value>" into `line`, reusing whatever capacity it has (#463).
+	void composeHeaderLine(std::string& line, std::string_view name, std::string_view value)
+	{
+		line.clear();
+		line.reserve(name.size() + 2 + value.size());
+		line.append(name.data(), name.size());
+		line.append(": ", 2);
+		line.append(value.data(), value.size());
+	}
 }
 
-void SipMessage::setHeaderOnce(const std::string& name, const std::string& value)
+size_t SipMessage::removeHeaders(std::string_view name)
 {
-	setNamedHeader(name, {}, name + ": " + value);
+	size_t removed = 0;
+	for (size_t idx = findHeaderIndex(name); idx != std::string::npos; idx = findHeaderIndex(name))
+	{
+		_headerLines.erase(_headerLines.begin() + static_cast<long>(idx));
+		++removed;
+	}
+	return removed;
+}
+
+void SipMessage::addHeader(std::string_view name, std::string_view value)
+{
+	std::string line;
+	composeHeaderLine(line, name, value);
+	insertHeaderLine(std::move(line));
+}
+
+void SipMessage::setHeaderOnce(std::string_view name, std::string_view value)
+{
+	const size_t idx = findHeaderIndex(name, {});
+	if (idx != std::string::npos)
+	{
+		composeHeaderLine(_headerLines[idx], name, value);   // in place: no new allocation
+		return;
+	}
+	std::string line;
+	composeHeaderLine(line, name, value);
+	insertHeaderLine(std::move(line));
 }
 
 void SipMessage::enforceG711()
@@ -630,8 +666,14 @@ void SipMessage::syncContentLength()
 
 	// Preserve whichever header-name form the message already uses.
 	bool fullForm = _headerLines[idx].find("Content-Length") != std::string::npos;
-	std::string newLine = (fullForm ? "Content-Length: " : "l: ") + std::to_string(_body.size());
-	_headerLines[idx] = std::move(newLine);
+	// #463: rewritten in place from a stack buffer. The old "Content-Length: " +
+	// to_string() built a 17+ char temporary (past SSO) on every clearBody() /
+	// setBody() -- i.e. on most responses this PBX builds.
+	char digits[24];
+	const int n = std::snprintf(digits, sizeof(digits), "%zu", _body.size());
+	std::string& line = _headerLines[idx];
+	line.assign(fullForm ? "Content-Length: " : "l: ");
+	if (n > 0) line.append(digits, static_cast<size_t>(n));
 }
 
 void SipMessage::clearBody()
@@ -699,6 +741,25 @@ void SipMessage::toString(std::string& out) const
 	}
 	out += "\r\n";
 	out += _body;
+}
+
+std::size_t SipMessage::serializeInto(char* out, std::size_t cap) const
+{
+	std::size_t pos = 0;
+	auto put = [&](const char* p, std::size_t n) {
+		if (pos < cap) std::memcpy(out + pos, p, std::min(n, cap - pos));
+		pos += n;
+	};
+	put(_startLine.data(), _startLine.size());
+	put("\r\n", 2);
+	for (const auto& line : _headerLines)
+	{
+		put(line.data(), line.size());
+		put("\r\n", 2);
+	}
+	put("\r\n", 2);
+	put(_body.data(), _body.size());
+	return pos;
 }
 
 bool SipMessage::isValidMessage() const

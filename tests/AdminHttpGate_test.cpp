@@ -22,6 +22,7 @@
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
 #include "AdminAuth.hpp"
+#include "JsonReader.hpp"    // Issue #430: parse /api/status in the DropProbe tests
 #include "DmaFramePool.hpp"   // Issue #328: /api/status's l2Tx counters
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -217,6 +218,58 @@ namespace
 	int httpPostStatus(int port, const std::string& path, const std::string& body)
 	{
 		return statusOf(httpPostRaw(port, path, body));
+	}
+
+	// Issue #528: POST from a chosen loopback SOURCE address (127.0.0.2, ...),
+	// so one test can play two clients against one server. Returns "" when
+	// that source can't be bound (a stack that only answers on 127.0.0.1).
+	std::string httpPostFrom(int port, const std::string& srcIp, const std::string& path,
+	                         const std::string& body)
+	{
+#if defined(_WIN32) || defined(_WIN64)
+		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s == INVALID_SOCKET) return "";
+#else
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0) return "";
+#endif
+		sockaddr_in src{};
+		src.sin_family = AF_INET;
+		src.sin_port = 0;
+		inet_pton(AF_INET, srcIp.c_str(), &src.sin_addr);
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(static_cast<uint16_t>(port));
+		inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+		if (bind(s, reinterpret_cast<sockaddr*>(&src), sizeof(src)) != 0 ||
+			connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+		{
+#if defined(_WIN32) || defined(_WIN64)
+			closesocket(s);
+#else
+			close(s);
+#endif
+			return "";
+		}
+		std::string req = "POST " + path + " HTTP/1.1\r\n"
+			"Host: 127.0.0.1\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n"
+			"Content-Type: application/x-www-form-urlencoded\r\n"
+			"Connection: close\r\n\r\n" + body;
+		send(s, req.c_str(), static_cast<int>(req.size()), 0);
+		std::string resp;
+		char buf[512];
+		int n;
+		while ((n = recv(s, buf, sizeof(buf), 0)) > 0)
+		{
+			resp.append(buf, static_cast<size_t>(n));
+		}
+#if defined(_WIN32) || defined(_WIN64)
+		closesocket(s);
+#else
+		close(s);
+#endif
+		return resp;
 	}
 
 }
@@ -653,6 +706,48 @@ TEST(WebHardening, GlobalBackstopSitsWellAboveOrdinaryTypos)
 	AdminAuth::clearCredential();
 }
 
+TEST(WebHardening, OneClientsLoginLockoutDoesNotLockOutAnotherOverHttp)
+{
+	// Issue #528: the tests above prove the per-client buckets at the AdminAuth
+	// level, but the HTTP route never passed a client key -- req.clientIp was
+	// set only on the OTA streaming branch -- so every login shared one ""
+	// bucket and one guesser locked the real admin out. This drives the real
+	// route from two loopback source addresses.
+	AdminAuth::clearCredential();
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18085, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string first = httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+		"username=admin&password=wrong-0");
+	if (first.empty())
+	{
+		AdminAuth::clearCredential();
+		GTEST_SKIP() << "this stack can't use 127.0.0.2 as a source address";
+	}
+	EXPECT_EQ(statusOf(first), 401);
+	for (int i = 1; i < AdminAuth::kMaxFailedAttempts; ++i)
+	{
+		const int st = statusOf(httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+			"username=admin&password=wrong-" + std::to_string(i)));
+		EXPECT_TRUE(st == 401 || st == 429) << "attempt " << i << " got " << st;
+	}
+
+	// The guesser is locked out, even with the right password...
+	EXPECT_EQ(statusOf(httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+		"username=admin&password=realpassword123")), 429);
+	// ...and the real admin, from another address, is not.
+	EXPECT_EQ(statusOf(httpPostFrom(18085, "127.0.0.1", "/api/admin/login",
+		"username=admin&password=realpassword123")), 200)
+		<< "one client's lockout must not lock out another (#528)";
+
+	AdminAuth::clearCredential();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Registrar admission mode + Learn-mode extension onboarding.
 //
@@ -679,22 +774,52 @@ TEST(Registrar, ModeRoundTripsThroughTheDashboard)
 	AdminSession a = loginAndCompleteSetup(18100);
 	ASSERT_FALSE(a.cookie.empty());
 
-	// Ships open: POCKETDIAL_OPEN_REGISTRAR seeds the default, and until now
-	// nothing could change it.
+	// Ships learn (#397); the open registrar is retired (#500).
 	std::string get = httpGetRaw(18100, "/api/registrar", "pd_session=" + a.cookie);
 	EXPECT_EQ(statusOf(get), 200);
-	EXPECT_NE(get.find("\"mode\":\"open\""), std::string::npos);
+	EXPECT_NE(get.find("\"mode\":\"learn\""), std::string::npos);
 	EXPECT_NE(get.find("\"attached\":true"), std::string::npos);
 
-	std::string set = httpPostRaw(18100, "/api/registrar", "mode=learn",
+	std::string set = httpPostRaw(18100, "/api/registrar", "mode=secure&confirm=LOCKOUT",
 	                              "pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(set), 200);
-	EXPECT_NE(set.find("\"mode\":\"learn\""), std::string::npos);
-	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
+	EXPECT_NE(set.find("\"mode\":\"secure\""), std::string::npos);
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Secure);
 
 	// And it is readable back, not just accepted.
 	get = httpGetRaw(18100, "/api/registrar", "pd_session=" + a.cookie);
-	EXPECT_NE(get.find("\"mode\":\"learn\""), std::string::npos);
+	EXPECT_NE(get.find("\"mode\":\"secure\""), std::string::npos);
+
+	set = httpPostRaw(18100, "/api/registrar", "mode=learn", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(set), 200);
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
+
+	AdminAuth::clearCredential();
+}
+
+TEST(Registrar, OpenIsNotAModeAnyMore)
+{
+	// #500 (desmo, 2026-09-27): the open registrar is retired. The live setter
+	// refuses it with 400 and changes nothing.
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18104, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	AdminSession a = loginAndCompleteSetup(18104);
+	ASSERT_FALSE(a.cookie.empty());
+	// Start from Secure, not the default, so "unchanged" proves something (#502 review).
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+
+	std::string set = httpPostRaw(18104, "/api/registrar", "mode=open",
+	                              "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(set), 400) << set;
+	EXPECT_NE(set.find("open is retired"), std::string::npos) << set;
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Secure)
+		<< "a refused mode must not change the mode";
 
 	AdminAuth::clearCredential();
 }
@@ -718,7 +843,7 @@ TEST(Registrar, SwitchingToSecureWithNothingSecuredNeedsConfirmation)
 	std::string blocked = httpPostRaw(18101, "/api/registrar", "mode=secure",
 	                                  "pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(blocked), 409);
-	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Open)
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn)
 		<< "a refused switch must not have changed the mode";
 
 	std::string forced = httpPostRaw(18101, "/api/registrar",
@@ -771,7 +896,7 @@ TEST(Registrar, MutatingEndpointsRequireTheCsrfToken)
 
 	AdminSession a = loginAndCompleteSetup(18103);
 
-	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar", "mode=open",
+	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar", "mode=learn",
 	                               "pd_session=" + a.cookie)), 403);
 	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar/device",
 	                               "action=forget&target=1001",
@@ -997,11 +1122,30 @@ TEST(HttpConnCap, OverTheCapIsRefused503AndSlotsAreReleased)
 	// never actually overlap and the test would pass with the cap deleted. These
 	// sockets connect and then say nothing, so each handler sits in recv() until
 	// its SO_RCVTIMEO -- the slot is genuinely held for the duration.
+	// Issue #529: one source may hold only kMaxConnectionsPerSource of the slots,
+	// so the holders come from two loopback sources (127.0.0.2 up to its share,
+	// 127.0.0.3 for the rest) and the probe below from a third (127.0.0.1). That
+	// way the refusal it gets is the GLOBAL cap's, not the per-source one.
 	std::vector<int> held;
 	for (int i = 0; i < HttpServer::kMaxConcurrentConnections; ++i)
 	{
 		int s = socket(AF_INET, SOCK_STREAM, 0);
 		ASSERT_GE(s, 0);
+		sockaddr_in src{};
+		src.sin_family = AF_INET;
+		inet_pton(AF_INET, i < HttpServer::kMaxConnectionsPerSource ? "127.0.0.2" : "127.0.0.3",
+			&src.sin_addr);
+		if (bind(s, reinterpret_cast<sockaddr*>(&src), sizeof(src)) != 0)
+		{
+#if defined(_WIN32) || defined(_WIN64)
+			closesocket(s);
+			for (int h : held) closesocket(h);
+#else
+			close(s);
+			for (int h : held) close(h);
+#endif
+			GTEST_SKIP() << "this stack can't use 127.0.0.2/.3 as source addresses";
+		}
 		sockaddr_in addr{};
 		addr.sin_family = AF_INET;
 		addr.sin_port   = htons(18099);
@@ -1020,6 +1164,9 @@ TEST(HttpConnCap, OverTheCapIsRefused503AndSlotsAreReleased)
 		<< "over the cap the server must answer 503, got:\n"
 		<< refusedResp.substr(0, 200);
 	EXPECT_NE(refusedResp.find("busy"), std::string::npos) << refusedResp.substr(0, 200);
+	EXPECT_NE(refusedResp.find("too many concurrent connections"), std::string::npos)
+		<< "this must be the global cap's refusal, not the per-source one (#529): "
+		<< refusedResp.substr(0, 200);
 
 	// Releasing the held sockets makes each blocked recv() return 0, so the
 	// handlers exit promptly rather than waiting out the full timeout.
@@ -1091,4 +1238,112 @@ TEST(OtaUpdater, ProgressFlagTracksSessionLifecycle)
 		EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
 	}
 	EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
+}
+
+// Issue #430: /api/status splits packetsDropped by reason for everyone, but the
+// per-drop source addresses and bytes are a session-only view, like the roster
+// (#207). The keep-alive fed here is the #430 suspect: "\r\n\r\n" from a phone.
+TEST(DropProbeStatus, CountsArePublicRecentDropsNeedASession)
+{
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	sockaddr_in phone{};
+	phone.sin_family = AF_INET;
+	phone.sin_port = htons(5062);
+	inet_pton(AF_INET, "192.168.9.181", &phone.sin_addr);
+	// #430: a CR/LF-only datagram is a keep-alive, not a drop, so the malformed
+	// packet here is real junk; the ping is fed too, to pin its public counter.
+	const std::string junk = "junk";
+	handler.handle(RequestsHandler::getMessageFromPool(junk, phone), junk);
+	const std::string ping = "\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(ping, phone), ping);
+
+	HttpServer server("127.0.0.1", 18135, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string anon = bodyOf(httpGetRaw(18135, "/api/status"));
+	EXPECT_NE(anon.find("\"packetsDropped\":1,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"droppedInvalid\":1,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"droppedRate\":0,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"keepalivesCrlf\":1,"), std::string::npos)
+		<< "the keep-alive is counted, publicly, and not as a drop:\n" << anon;
+	EXPECT_NE(anon.find("\"recentDrops\":[]"), std::string::npos)
+		<< "drop sources must be withheld without a session:\n" << anon;
+	EXPECT_EQ(anon.find("192.168.9.181"), std::string::npos) << anon;
+
+	const std::string loginResp = httpPostRaw(18135, "/api/admin/login", "username=admin&password=admin");
+	ASSERT_EQ(statusOf(loginResp), 200) << loginResp;
+	const std::string cookie = cookieOf(loginResp, "pd_session");
+	const std::string csrf   = csrfOf(loginResp);
+	ASSERT_EQ(statusOf(httpPostRaw(18135, "/api/admin/set-credential",
+		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
+
+	const std::string authed = bodyOf(httpGetRaw(18135, "/api/status", "pd_session=" + cookie));
+	EXPECT_NE(authed.find("\"reason\":\"invalid\",\"src\":\"192.168.9.181:5062\",\"len\":4,\"head\":\"6a756e6b\"}"),
+	          std::string::npos)
+		<< "a session must see who sent the dropped packet and its first bytes:\n" << authed;
+
+	AdminAuth::clearCredential();
+}
+
+// Issue #430 review: the per-drop "head" hex must be exactly 2 x headLen
+// characters and properly terminated at every length -- 0 (no wire bytes), 1,
+// and the full kHeadBytes (a longer datagram is clamped). Parsed as JSON, so a
+// stray byte past the hex (an unterminated buffer) fails the parse or the
+// length check rather than slipping through a substring find().
+TEST(DropProbeStatus, HeadHexIsExactAtZeroOneAndFullLength)
+{
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	sockaddr_in src{};
+	src.sin_family = AF_INET;
+	src.sin_port = htons(5070);
+	inet_pton(AF_INET, "192.168.9.77", &src.sin_addr);
+
+	const std::string ping = "\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(ping, src));          // no raw bytes: headLen 0
+	const std::string one = "x";
+	handler.handle(RequestsHandler::getMessageFromPool(one, src), one);      // headLen 1
+	const std::string longJunk = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	handler.handle(RequestsHandler::getMessageFromPool(longJunk, src), longJunk);   // clamped to 16
+	ASSERT_EQ(handler.getDroppedInvalid(), 3u);
+
+	HttpServer server("127.0.0.1", 18136, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string loginResp = httpPostRaw(18136, "/api/admin/login", "username=admin&password=admin");
+	ASSERT_EQ(statusOf(loginResp), 200) << loginResp;
+	const std::string cookie = cookieOf(loginResp, "pd_session");
+	const std::string csrf   = csrfOf(loginResp);
+	ASSERT_EQ(statusOf(httpPostRaw(18136, "/api/admin/set-credential",
+		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
+
+	const std::string body = bodyOf(httpGetRaw(18136, "/api/status", "pd_session=" + cookie));
+	JsonReader::Value root;
+	std::string err;
+	ASSERT_TRUE(JsonReader::parse(body, root, err)) << err << "\n" << body;
+	const auto& drops = root.arrayOr("recentDrops");
+	ASSERT_EQ(drops.size(), 3u) << body;
+
+	EXPECT_EQ(drops[0].stringOr("head", "?"), "");
+	EXPECT_EQ(drops[0].intOr("len", -1), 0);
+	EXPECT_EQ(drops[1].stringOr("head"), "78");
+	EXPECT_EQ(drops[1].intOr("len", -1), 1);
+	EXPECT_EQ(drops[2].stringOr("head"), "4142434445464748494a4b4c4d4e4f50");
+	EXPECT_EQ(drops[2].intOr("len", -1), 26);
+	for (const auto& d : drops)
+	{
+		EXPECT_EQ(d.stringOr("reason"), "invalid");
+		EXPECT_EQ(d.stringOr("src"), "192.168.9.77:5070");
+	}
+
+	AdminAuth::clearCredential();
 }

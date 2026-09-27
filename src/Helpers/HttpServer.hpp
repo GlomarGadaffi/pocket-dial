@@ -14,8 +14,10 @@
 #endif
 
 #include <string>
+#include <string_view>
 #include <functional>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <cstdint>
 
@@ -62,6 +64,32 @@ public:
 	// depend on which of the two lands first. It is also comfortably more than
 	// the dashboard uses: the SPA is one document plus its polled JSON.
 	static constexpr int kMaxConcurrentConnections = 4;
+	// Issue #529: those 4 slots were cheap to hold. The only read timeout was
+	// per recv() (5 s), and the buffered body loop runs BEFORE any auth check,
+	// so one unauthenticated host could trickle a body a byte every few seconds
+	// on all four and keep the admin plane at 503 for hours. Two bounds:
+	//  - one source address may hold at most kMaxConnectionsPerSource slots,
+	//    so at least one is always left for everyone else;
+	//  - everything read before dispatch (headers + buffered body) must arrive
+	//    within kReadDeadlineMs of the accept, or the connection is dropped.
+	// Authenticated streaming uploads (OTA, MoH) keep their own budgets: they
+	// leave the buffered path after the auth check, before the body.
+	static constexpr int kMaxConnectionsPerSource = kMaxConcurrentConnections - 1;
+	static constexpr long kReadDeadlineMs = 10000;
+	// Counted drops (#529), for /api/status.
+	uint32_t readDeadlineDrops() const { return _readDeadlineDrops.load(std::memory_order_relaxed); }
+	uint32_t perSourceRefusals() const { return _perSourceRefusals.load(std::memory_order_relaxed); }
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#529): a short deadline so a slow-client test runs in well
+	// under a second instead of kReadDeadlineMs.
+	void setReadDeadlineMsForTest(long ms) { _readDeadlineMs = ms; }
+	// Handler threads still alive, so a test can wait for them before the
+	// server (which they reference) is destroyed.
+	int activeConnectionsForTest() const { return _activeConnections.load(std::memory_order_acquire); }
+	// Test-only (#534 review): make every SO_RCVTIMEO/SO_SNDTIMEO set fail, so
+	// the "cannot bound this socket" paths can be driven deterministically.
+	static void setFailSocketTimeoutsForTest(bool fail);
+#endif
 
 	HttpServer(const std::string& ip, int port, RequestsHandler* handler = nullptr);
 	~HttpServer();
@@ -97,6 +125,46 @@ public:
 	// Pure string-shape check; public/static so it's host-testable on its own.
 	static bool isProvisioningConfigPath(const std::string& path);
 	static ProvisioningPathType parseProvisioningPath(const std::string& path, std::string& outKey);
+
+	// #410 phase 2: one byte range to be sent in place (see sendAllPieces()).
+	// It IS struct iovec on POSIX and lwIP, so an array of them goes to
+	// sendmsg() as is, with no second copy on the http_conn stack (#405).
+#if defined _WIN32 || defined _WIN64
+	struct SendPiece { void* iov_base; size_t iov_len; };   // iovec's shape; no sendmsg() on Winsock
+#else
+	using SendPiece = struct iovec;
+#endif
+	// After a (possibly short) write of `sent` bytes from v[first..n), skips
+	// the ranges that went out whole and trims the one it stopped inside, in
+	// place; returns the new `first` (== n once everything is out). Pure, so
+	// the resume logic is testable at every split without a socket.
+	static size_t consumeSent(SendPiece* v, size_t first, size_t n, size_t sent);
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#410): serve one static page onto `sock` ON THE CALLING THREAD,
+	// for a request carrying `cookieHeader`, so a test can count the page's heap
+	// allocations with a per-thread AllocGuard (the real server answers on a
+	// connection thread the guard cannot see). `page`: 0 = "/", 8 = /setup/email,
+	// 9 = /setup/trunk. csrfForTest() does only the token derivation for the same
+	// request, built the same way, so allocs(page) - allocs(token) is exactly
+	// what serving the page costs on top of looking up its token.
+	void servePageForTest(int sock, int page, const std::string& cookieHeader);
+	std::string csrfForTest(const std::string& cookieHeader);
+	// What the pre-#410 path put on the wire as a 200 text/html head for a body
+	// of `len` bytes -- buildResponseHead() itself, so a test compares the
+	// streamed page against the old head, not against a copy of it.
+	static std::string legacyHtmlHeadForTest(size_t len);
+	// #410 phase 2: sendResponseWithHeader() ON THE CALLING THREAD (it is
+	// private), so a test can count its allocations with AllocGuard; and what
+	// the pre-#410 path put on the wire for the same response --
+	// buildResponseHead() + body -- to compare the two byte for byte.
+	void sendResponseForTest(int sock, int statusCode, std::string_view statusText,
+	                   std::string_view contentType, std::string_view body,
+	                   std::string_view extraHeader);
+	static std::string legacyResponseForTest(int statusCode, const std::string& statusText,
+	                   const std::string& contentType, const std::string& body,
+	                   const std::string& extraHeader);
+#endif
 
 private:
 	// Idempotent socket lifecycle, called only from this class's own thread
@@ -163,20 +231,61 @@ private:
 	std::string sessionToken(const HttpRequest& req) const;
 
 	// Response builders
-	void sendResponse(int sock, int statusCode, const std::string& statusText,
-	                   const std::string& contentType, const std::string& body);
+	// string_view throughout (#410 phase 2): a literal status, content type or
+	// error body no longer builds a std::string temporary at every call site,
+	// and nothing here is copied -- see sendResponseWithHeader().
+	// Views must outlive the call: pass temporaries straight in (they live to
+	// the end of the statement), but NEVER store a view taken from one, e.g.
+	// `std::string_view v = a + b; sendResponse(..., v);` dangles.
+	void sendResponse(int sock, int statusCode, std::string_view statusText,
+	                   std::string_view contentType, std::string_view body);
 	// Same as sendResponse, but injects an extra raw header line (e.g.
 	// "Set-Cookie: pd_session=...; HttpOnly; Path=/; SameSite=Strict"). The
 	// extraHeader must NOT include the trailing CRLF.
-	void sendResponseWithHeader(int sock, int statusCode, const std::string& statusText,
-	                   const std::string& contentType, const std::string& body,
-	                   const std::string& extraHeader);
-	// Every response's status line + headers (security headers included), for a
-	// body sent separately -- the streamed /api/coredump download (#382).
+	void sendResponseWithHeader(int sock, int statusCode, std::string_view statusText,
+	                   std::string_view contentType, std::string_view body,
+	                   std::string_view extraHeader);
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// The pre-#410 head as one std::string. Test-only now: every production
+	// head goes through headPieces(); the tests compare against this.
 	static std::string buildResponseHead(int statusCode, const std::string& statusText,
 	                   const std::string& contentType, size_t contentLength,
 	                   const std::string& extraHeader);
+#endif
 	static bool sendAllBytes(int sock, const char* ptr, size_t len);
+	// #410 phase 2: the only two formatted numbers of a response head. Lives in
+	// the caller's frame and must outlive the send.
+	struct HeadNumbers
+	{
+		char status[24];   // "HTTP/1.1 %d "
+		char length[44];   // "\r\nContent-Length: %zu\r\n"
+	};
+	// status, statusText, "Content-Type: ", type, length, kSecurityHeaders,
+	// extra header, its CRLF, "Connection: close" -- headPieces() adds them in
+	// that order and checks the count against this before returning.
+	static constexpr size_t kHeadPieces = 9;
+	// Every response's status line + headers (security headers included) as
+	// in-place ranges: fills v[0..) -- at most kHeadPieces, never an empty one --
+	// and returns how many; 0 only if formatting failed (then send nothing).
+	// The single head builder for sendResponseWithHeader(), the streamed
+	// /api/coredump download (#382) and the static pages (sendStaticHtml).
+	static size_t headPieces(SendPiece* v, HeadNumbers& nums, int statusCode,
+	                   std::string_view statusText, std::string_view contentType,
+	                   size_t contentLength, std::string_view extraHeader);
+	// #410 phase 2: writes v[0..n) back to back as one scatter-gather sendmsg()
+	// on POSIX and lwIP, resuming after short writes via consumeSent(), which
+	// trims `v` in place: no allocation, no copy of the ranges or the bytes.
+	// False on a send error, like sendAllBytes().
+	static bool sendAllPieces(int sock, SendPiece* v, size_t n);
+	// #410: a static HTML page written straight from its flash-resident parts,
+	// with the session's CSRF token substituted for the __PD_CSRF__ marker on the
+	// way out. No copy of the page is ever made: a 200 head is formatted into a
+	// small stack buffer (Content-Length computed up front), then each part is
+	// sent in place and only the part holding the marker is split around it. The
+	// marker is located per call by scanning the parts, never cached, so a page
+	// edit that moves it cannot silently ship a literal marker and no token.
+	static void sendStaticHtml(int sock, const char* const* parts, const size_t* sizes,
+	                   size_t count, const std::string& token);
 	void sendRedirect(int sock, const std::string& location);
 	// Takes the request so the rendered page can carry this session's CSRF token.
 	void sendHtml(int sock, const HttpRequest& req);
@@ -400,6 +509,17 @@ private:
 	// the thread is created and released by the thread itself on exit, so a burst
 	// arriving faster than threads can start cannot overshoot the cap.
 	std::atomic<int> _activeConnections{0};
+	// Issue #529: live connections per source address. Fixed size -- at most
+	// kMaxConcurrentConnections distinct sources can be live at once -- so it
+	// never allocates. The accept thread claims, the handler thread releases.
+	struct SourceSlot { uint32_t addr = 0; int count = 0; };
+	SourceSlot _sources[kMaxConcurrentConnections]{};
+	std::mutex _sourcesMutex;
+	bool claimSource(uint32_t addr);     // false: that source is at its cap
+	void releaseSource(uint32_t addr);
+	std::atomic<uint32_t> _readDeadlineDrops{0};
+	std::atomic<uint32_t> _perSourceRefusals{0};
+	long _readDeadlineMs = kReadDeadlineMs;
 
 	// Track server uptime
 	uint64_t _startTime;

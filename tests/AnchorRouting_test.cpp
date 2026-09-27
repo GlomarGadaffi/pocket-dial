@@ -110,6 +110,23 @@ namespace
 	// toHeaderOf() below — not a fresh one, since this is a request on an
 	// already-established dialog. `direction` is the SDP attribute line to
 	// offer ("a=sendonly\r\n" for hold, "a=sendrecv\r\n" for resume).
+	// The CANCEL for makeInvite()'s INVITE: same Request-URI, Via branch, From,
+	// To (no tag), Call-ID and CSeq number (RFC 3261 §9.1).
+	std::shared_ptr<SipMessage> makeCancel(const std::string& fromExt, const std::string& toExt,
+		const std::string& srcIp, const std::string& callId)
+	{
+		std::string raw =
+			"CANCEL sip:" + toExt + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKi" + callId + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + toExt + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 CANCEL\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
+	}
+
 	std::shared_ptr<SipMessage> makeHoldReinvite(const std::string& fromExt,
 		const std::string& toHeaderLine, const std::string& srcIp, const std::string& callId,
 		int cseq, const std::string& direction, int rtpPort = 10000)
@@ -1056,4 +1073,80 @@ TEST(AnchorRouting, TickDoesNotTearDownAnAnchorCallThatHasNeverWrittenSuccessful
 		<< "tick() must not tear down a call that is still starting, only one "
 		   "that was genuinely working and then broke";
 	EXPECT_TRUE(bridge->isActive());
+}
+
+TEST(AnchorRouting, ACancelWhileTheAnchorLegRingsAnswersTheInvite487)
+{
+	// Issue #548 (#451 X4): after a CANCEL mid-ring the board answered the
+	// CANCEL 200 and then sent NOTHING for the INVITE, leaving the phone's
+	// INVITE transaction in Proceeding. RFC 3261 §9.2 wants a 487.
+	//
+	// The host anchor is Loopback, which answers synchronously, so the ringing
+	// window a real (async) anchor has is recreated on the session itself: back
+	// to Invited, with the To-tag the async path's 180 Ringing would carry.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-548"));
+	auto session = handler.getSession("Call-ID: anchor-548");
+	ASSERT_TRUE(session.has_value());
+	session.value()->setState(Session::State::Invited);
+	session.value()->setLocalTag("ring548");
+
+	sent.clear();
+	handler.handle(makeCancel("501", "555", "192.168.9.51", "anchor-548"));
+
+	std::string cancelOk, terminated;
+	size_t n487 = 0;
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		const std::string raw = msg ? msg->toString() : std::string();
+		if (raw.rfind("SIP/2.0 200 OK", 0) == 0 && raw.find("CSeq: 1 CANCEL") != std::string::npos) cancelOk = raw;
+		if (raw.rfind("SIP/2.0 487 Request Terminated", 0) == 0) { terminated = raw; ++n487; }
+	}
+	EXPECT_EQ(n487, 1u) << "exactly one 487";
+	EXPECT_FALSE(cancelOk.empty()) << "the CANCEL itself is answered 200";
+	ASSERT_FALSE(terminated.empty()) << "the INVITE must be answered 487";
+	EXPECT_NE(terminated.find("CSeq: 1 INVITE"), std::string::npos) << terminated;
+	EXPECT_NE(terminated.find("branch=z9hG4bKianchor-548"), std::string::npos)
+		<< "the INVITE's own transaction:\n" << terminated;
+	EXPECT_NE(terminated.find("tag=ring548"), std::string::npos)
+		<< "the To-tag the 180 Ringing carried:\n" << terminated;
+	EXPECT_FALSE(handler.getSession("Call-ID: anchor-548").has_value());
+
+	// A retransmitted CANCEL is answered again, but the INVITE is not re-terminated.
+	sent.clear();
+	handler.handle(makeCancel("501", "555", "192.168.9.51", "anchor-548"));
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		EXPECT_NE(msg ? msg->toString().rfind("SIP/2.0 487", 0) : 1u, 0u) << "no second 487";
+	}
+}
+
+TEST(AnchorRouting, ACancelAfterTheAnchorAnsweredSendsNo487)
+{
+	// §9.2: once the INVITE has its final response a CANCEL has no effect on
+	// it. The (synchronous) Loopback answered 200 before the CANCEL arrived.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-548b"));
+	ASSERT_EQ(handler.getSession("Call-ID: anchor-548b").value()->getState(), Session::State::Connected);
+
+	sent.clear();
+	handler.handle(makeCancel("501", "555", "192.168.9.51", "anchor-548b"));
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		EXPECT_NE(msg ? msg->toString().rfind("SIP/2.0 487", 0) : 1u, 0u)
+			<< "an answered INVITE gets no 487";
+	}
 }

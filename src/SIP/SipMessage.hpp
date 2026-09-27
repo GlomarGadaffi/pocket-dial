@@ -86,7 +86,9 @@ public:
 	void setCSeq(std::string value);
 	void setContact(std::string value);
 	void setContentLength(std::string value);
-	void addHeader(const std::string& name, const std::string& value);
+	// string_view parameters (#463): a literal name/value no longer builds a
+	// std::string temporary, and the line is built in one exact-size allocation.
+	void addHeader(std::string_view name, std::string_view value);
 	// Replace-or-insert ONE header line by name — what setVia/setTo/setContact do
 	// for their fixed names, generalised to an arbitrary header.
 	//
@@ -103,7 +105,16 @@ public:
 	// written in its canonical form. Compact forms are NOT matched: pass the
 	// compact spelling explicitly via setNamedHeader if a header has one that
 	// matters. None of the capability headers do.
-	void setHeaderOnce(const std::string& name, const std::string& value);
+	// #463: when the line already exists it is rewritten IN PLACE (its capacity
+	// reused), so re-stamping a cloned response's capability headers is free.
+	void setHeaderOnce(std::string_view name, std::string_view value);
+	// Drop EVERY line of one header (case-insensitive; no compact form). Returns
+	// how many were removed. Used to keep hop-by-hop credentials (Authorization,
+	// Proxy-Authorization) off a request this PBX relays (#549).
+	size_t removeHeaders(std::string_view name);
+	// The user part of the Request-URI ("600" in "INVITE sip:600@host SIP/2.0");
+	// empty for a response, or a Request-URI with no sip: user part.
+	std::string_view getRequestUriUser() const { return extractNumber(_startLine); }
 	// Pins the SDP payload list to "0 8 101".
 	//
 	// DEPRECATED, and as of ISSUES.md #139 called from NO production path -- only
@@ -239,6 +250,10 @@ public:
 	// reuse one allocation instead of a fresh temporary each time (Issue #101(D)).
 	// `out` is cleared first, retaining its capacity.
 	void toString(std::string& out) const;
+	// Same bytes as toString(), written into a fixed caller buffer with NO heap use:
+	// writes at most `cap` bytes and returns the full serialized length
+	// (snprintf-style), so a return value > cap means the output was truncated.
+	std::size_t serializeInto(char* out, std::size_t cap) const;
 	bool isValidMessage() const;
 
 protected:

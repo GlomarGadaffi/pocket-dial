@@ -517,3 +517,47 @@ TEST(SpliceInDialog, AttendedTransferDroppedTransferorsReinviteIsNotRelayedAnywh
 		EXPECT_NE(m.destIp, "192.168.9.62") << "nothing from A reaches C:\n" << m.raw;
 	}
 }
+
+TEST(SpliceInDialog, APickupBetweenTwoLinesOfOneHandsetIsStillTranslatedAndAnswered)
+{
+	// Sonny-OG's #488 note: two lines of one handset share an IP:port, so both
+	// dialogs of this splice live at the same address. The translated request
+	// must still carry the PEER dialog's Call-ID, and the answer built while
+	// handling the peer's 200 (a response built from a response -- what #472's
+	// no-reply guard watches) must still reach the originator exactly once.
+	Harness h;
+	h.handler.handle(makeRegister("200", "192.168.9.10"));
+	h.handler.handle(makeRegister("100", "192.168.9.20"));
+	h.handler.handle(makeRegister("102", "192.168.9.10"));   // the same handset as 200
+	h.handler.setRingGroup("607", "100,102", "ringall");
+	h.handler.handle(makeInvite("200", "100", "192.168.9.10", "call-S"));
+	h.handler.handle(makeInvite("102", "**100", "192.168.9.10", "pickup-S"));
+
+	auto own = h.handler.getSession(sessionKey("pickup-S"));
+	ASSERT_TRUE(own.has_value());
+	ASSERT_FALSE(own.value()->getPeerCallID().empty()) << "precondition: spliced";
+
+	h.sent.clear();
+	h.handler.handle(inDialog("INVITE", own.value(), "192.168.9.10", 5, sdpBody("192.168.9.10", "sendonly")));
+	std::string req;
+	size_t n = 0;
+	for (const auto& s : h.sent)
+	{
+		if (s.raw.rfind("INVITE ", 0) == 0) { req = s.raw; ++n; }
+		EXPECT_EQ(s.raw.find("481 Call"), std::string::npos) << s.raw;
+	}
+	ASSERT_EQ(n, 1u) << "exactly one re-INVITE crosses the splice";
+	EXPECT_EQ(headerValue(req, "Call-ID"), "call-S") << "the PEER dialog's Call-ID, not the sender's:\n" << req;
+
+	h.sent.clear();
+	h.handler.handle(answerTo(req, "192.168.9.10", "200 OK", sdpBody("192.168.9.10")));
+	n = 0;
+	std::string ok;
+	for (const auto& s : h.sent)
+	{
+		if (s.raw.rfind("SIP/2.0 200 OK", 0) == 0 && headerValue(s.raw, "Call-ID") == "pickup-S") { ok = s.raw; ++n; }
+	}
+	EXPECT_EQ(n, 1u) << "the originator gets exactly one answer on its own transaction";
+	EXPECT_EQ(headerValue(ok, "CSeq"), "5 INVITE") << ok;
+	EXPECT_EQ(h.handler.getRepliesRefused(), 0u) << "no translated message may trip the #472 guard";
+}

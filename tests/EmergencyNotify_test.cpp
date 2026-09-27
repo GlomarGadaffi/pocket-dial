@@ -98,6 +98,11 @@ namespace
 				});
 			handler->handle(enRegister("101", "192.168.78.11", "en-r-101"));  // the dialer
 			handler->handle(enRegister("200", "192.168.78.20", "en-r-200"));  // front desk
+			// Issue #521: the loopback anchor refuses every emergency number
+			// (EmergencyRoute_test.cpp pins that). These tests are about the
+			// notification around a routed call, so it stands in for a real
+			// provider here.
+			handler->setAnchorPlacesRealCallsForTest(true);
 			wire.clear();
 		}
 
@@ -552,7 +557,7 @@ namespace
 		std::shared_ptr<SipMessage> serverBye(const std::string&, const sockaddr_in&,
 			const std::string&, const std::string&, const std::string&) override { return nullptr; }
 		void forEachSessionInvolving(std::string_view,
-			const std::function<void(const std::string&, const Session&, DialogRole)>&) const override {}
+			FunctionRef<void(const std::string&, const Session&, DialogRole)>) const override {}
 		bool validAor(std::string_view) const override { return true; }
 		int requestedExpires(const std::shared_ptr<SipMessage>&) const override { return 3600; }
 		bool routeTrunkCall(const std::shared_ptr<SipMessage>&,

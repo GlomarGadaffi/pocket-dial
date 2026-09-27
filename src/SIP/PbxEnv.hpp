@@ -15,6 +15,8 @@
 #include <string>
 #include <string_view>
 
+#include "FunctionRef.hpp"   // #464: allocation-free visitor parameter
+
 class SipMessage;
 class SipClient;
 class Session;
@@ -52,6 +54,9 @@ struct PbxEnv
 
 	// Append to the deferred log queue (flushed off-lock).
 	virtual void log(std::string msg, bool isError = false) = 0;
+	// Issue #450: the DTMF factory-reset door wipes the SD voicemail archive, as
+	// the HTTP door does. Not pure: a test env with no archive has nothing to wipe.
+	virtual void wipeVoicemail() {}
 
 	// The server's active local IP (resolved once at construction) and SIP port —
 	// the identity the machines stamp into Via/From/Contact headers they build.
@@ -90,8 +95,10 @@ struct PbxEnv
 	// storage choice (map type, key, per-session locking) leak into the machines.
 	// The role is passed through because matching already determined it — the
 	// visitor would otherwise recompute the same comparison it was selected by.
+	// A FunctionRef, not a std::function (#464): the BLF visitor captures 16 B,
+	// over std::function's 8 B inline buffer, and this runs on every packet.
 	virtual void forEachSessionInvolving(std::string_view aor,
-		const std::function<void(const std::string&, const Session&, DialogRole)>& fn) const = 0;
+		FunctionRef<void(const std::string&, const Session&, DialogRole)> fn) const = 0;
 	// AOR charset validation (the engine's isValidAor policy).
 	virtual bool validAor(std::string_view s) const = 0;
 	// Parse the requested registration/subscription lease from Expires/Contact

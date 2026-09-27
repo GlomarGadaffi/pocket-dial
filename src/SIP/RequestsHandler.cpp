@@ -1,6 +1,7 @@
 // RequestsHandler.cpp: Issues #24 and #28 resolved.
 #include "RequestsHandler.hpp"
 #include "SipMessagePool.hpp"
+#include <cassert>
 #include <atomic>
 #include <iostream>
 #include <sstream>
@@ -11,6 +12,8 @@
 #include "SipMessageTypes.h"
 #include "SipSdpMessage.hpp"
 #include "IDGen.hpp"
+#include "RefillVector.hpp"   // #463: in-place snapshot refill
+#include <cstdio>             // #463: snprintf for the OPTIONS ping and snapshot ip:port
 #include "IPHelper.hpp"
 #include "PoolConfig.hpp"
 #include "CallDetailRecord.hpp"
@@ -214,6 +217,13 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// NVS so they survive reboot. No-ops on host. Construction is single-threaded
 	// (no handler is dispatching yet), so these run without holding _mutex.
 	_cfg.loadPbxConfig();
+	refreshE911ConfiguredLocked();
+	if (!isE911Configured())
+	{
+		// Poll #454: surfaced, never gated -- 911 still routes out either way.
+		queueLog("WARNING: E911 not configured -- a 911 call still routes out, but nobody on "
+			"site will be notified. Set the E911 notify list on the dashboard.", true);
+	}
 	// Telephony-API credential slots + DID->extension mapping (new, Part 2):
 	// same "reload once at construction, single-threaded, no lock needed" story
 	// as _cfg.loadPbxConfig() just above.
@@ -222,8 +232,8 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	_cdr.load();
 	// Task 2B: load the admin extension from NVS (defaults to "1001" if absent).
 	_dtmf.load();
-	// STAGE 2: load the registrar mode (defaults to the POCKETDIAL_OPEN_REGISTRAR
-	// seed) and the adopted-device registry from NVS.
+	// STAGE 2: load the registrar mode (with none stored, decided once and saved
+	// by Registrar::chooseBootMode(), #397) and the adopted-device registry.
 	_registrar.loadMode();
 	_registrar.loadDevices();
 	// Prewarm the per-extension HA1 cache off the REGISTER hot path so the first
@@ -295,6 +305,9 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// (Loopback boot).
 	_anchorBootType = bootType;
 	_anchorRouteDn = tapiDn;
+	// Issue #521: whether this anchor may carry an emergency call. Loopback
+	// may not -- it simulates an answer to whatever it is handed.
+	_anchorPlacesRealCalls = telephonyProviderPlacesRealCalls(bootType);
 
 	if (_anchorClient)
 	{
@@ -798,10 +811,30 @@ void RequestsHandler::initHandlers()
 
 void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_view rawBytes)
 {
+	// Issue #430: a datagram of nothing but CR/LF is a keep-alive, not a malformed
+	// message. Phones send RFC 5626's double-CRLF ping over UDP as a vendor NAT
+	// keep-alive (on .244, ext 113 sends "\r\n\r\n" every 32 s, which was the
+	// whole idle "drop" rate). Nothing is owed back: RFC 5626 reserves the CRLF
+	// keep-alive and its pong for connection-oriented transports (§4.4.1, §5.4),
+	// and this PBX does not implement outbound at all. Answering would also make
+	// 5060 reply to spoofed datagrams. Count it and stop: it is not a drop, so it
+	// no longer hides real malformed traffic behind a steady floor. Classified
+	// from the wire bytes; a caller that passes none (no rawBytes) cannot claim it.
+	if (!rawBytes.empty() &&
+		rawBytes.find_first_not_of("\r\n") == std::string_view::npos)
+	{
+		_keepalivesCrlf.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
 	// Input validation: Drop null or structurally malformed packets instantly (SEC-02)
 	if (!request || !request->isValidMessage())
 	{
 		_packetsDropped.fetch_add(1, std::memory_order_relaxed);
+		// Issue #430: record the source and first bytes, so an idle drop rate can
+		// be traced to its sender (e.g. a CRLF keep-alive) without a LAN capture.
+		const sockaddr_in src = request ? request->getSource() : sockaddr_in{};
+		_dropProbe.note(DropProbe::Reason::Invalid, src.sin_addr.s_addr, src.sin_port, rawBytes);
 		return;
 	}
 
@@ -814,6 +847,8 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
 		{
 			_packetsDropped.fetch_add(1, std::memory_order_relaxed);
+			const sockaddr_in src = request->getSource();
+			_dropProbe.note(DropProbe::Reason::Rate, src.sin_addr.s_addr, src.sin_port, rawBytes);
 			return;
 		}
 	}
@@ -831,23 +866,22 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// signaling-research aid, not a wire-level DoS forensics tool, and
 		// capturing before the rate limiter would mean pulling the ring buffer
 		// out from under _mutex for every flood packet too.
-		// Written straight into the ring slot — no per-packet temporary inside
-		// the critical section (Issue #101(D)).
-		std::string& pcapSlot = _pcapCapture.recordInto(/*outbound=*/false, request->getSource());
+		// Written straight into a fixed ring slot: no allocation (Issue #416).
 		if (!rawBytes.empty())
 		{
 			// Issue #105: capture the exact bytes recvfrom() delivered, not a
 			// re-serialization of the parsed message — whitespace, compact header
 			// forms (f:/t:/v:/i:), CRLF-vs-LF tolerance, or any malformed-but-
 			// tolerated line the parser normalized must survive in the capture.
-			pcapSlot.assign(rawBytes.data(), rawBytes.size());
+			_pcapCapture.record(/*outbound=*/false, request->getSource(), rawBytes);
 		}
 		else
 		{
 			// No wire bytes offered (a message built in-process, or a test calling
 			// handle() directly with no UdpServer/SipServer involved) — the parsed
 			// form is genuinely what such a caller means to inspect.
-			request->toString(pcapSlot);
+			_pcapCapture.recordWith(/*outbound=*/false, request->getSource(),
+				[&request](char* buf, std::size_t cap) { return request->serializeInto(buf, cap); });
 		}
 
 		// ── SDP admission gate (docs/THREAT_MODEL.md T-7) ──────────────────────
@@ -933,6 +967,12 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// drainOutbox() reads this to keep a retransmit timer off it; see the
 		// member's declaration for why that matters.
 		_passThroughMsg = request.get();
+		// #424: drainOutbox() refuses any reply to a response or an ACK.
+		if (request->getStatusInfo().has_value() || request->getType() == SipMessageTypes::ACK)
+			_noReplyInbound = request;
+		else
+			_noReplyInbound.reset();
+		clearRelayMarks();
 
 		if (!sdpRefused && !absorbed)
 		{
@@ -978,6 +1018,27 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		{
 			queueLog("[SIP] " + std::string(status->softFail ? "WARN " : "ERROR ")
 				+ std::string(request->getHeader()), !status->softFail);
+		}
+
+		// Issue #402: every request's CSeq is a number the other party on its dialog
+		// has now seen (in-dialog requests are relayed untouched), so any request the
+		// server later sends on that dialog must go above it. Noted before dispatch,
+		// so onRefer() already counts its own REFER, and again after, so an INVITE
+		// that CREATES its session is counted too.
+		// No copy of the Call-ID (milestone 1: no allocation per packet): hold a
+		// reference to the request so its view stays valid past dispatch.
+		std::shared_ptr<SipMessage> noteReq;
+		std::shared_ptr<Session> noteSession;
+		uint32_t noteCSeq = 0;
+		const sockaddr_in noteSource = request->getSource();
+		// REGISTER/OPTIONS/SUBSCRIBE never carry a call session's Call-ID, and are
+		// most of an idle board's traffic: don't pay a session lookup for them.
+		if (!status.has_value() && handlerKey != SipMessageTypes::REGISTER &&
+			handlerKey != SipMessageTypes::OPTIONS && handlerKey != SipMessageTypes::SUBSCRIBE)
+		{
+			noteReq = request;
+			noteCSeq = siphdr::cseqNumber(request->getCSeq());
+			noteSession = noteDialogCSeq(request->getCallID(), noteCSeq, noteSource);
 		}
 
 		// Task 2C: SIP INFO with DTMF relay body — handle before the handler table
@@ -1049,6 +1110,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				it->second(std::move(request));
 			}
 		}
+		// Only needed when the request CREATED its session (an initial INVITE).
+		if (noteReq && !noteSession && handlerKey == SipMessageTypes::INVITE)
+			noteDialogCSeq(noteReq->getCallID(), noteCSeq, noteSource);
 		}   // !sdpRefused
 
 		// Device-registry change detection: a REGISTER may have adopted a device,
@@ -1071,6 +1135,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 
 		localOutbox = drainOutbox();
 		_passThroughMsg = nullptr;
+		_noReplyInbound.reset();
 
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -1090,9 +1155,20 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	}
 }
 
+std::shared_ptr<Session> RequestsHandler::noteDialogCSeq(std::string_view callID, uint32_t cseq,
+	const sockaddr_in& source)
+{
+	if (callID.empty()) return nullptr;
+	auto s = findSession(callID);
+	// Only a party ON this dialog moves its CSeq floor; Session also refuses
+	// out-of-range values, which is the part a spoofed source can't get past.
+	if (s && cseq != 0 && isDialogSourceAuthorized(s, source)) s->noteObservedCSeq(cseq);
+	return s;
+}
+
 std::optional<std::shared_ptr<Session>> RequestsHandler::getSession(std::string_view callID)
 {
-	auto sessionIt = _sessions.find(std::string(callID));
+	auto sessionIt = _sessions.find(callID);   // heterogeneous: no temporary key (#464)
 	if (sessionIt != _sessions.end())
 	{
 		return sessionIt->second;
@@ -1151,7 +1227,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	// (PbxConfig.hpp) for the full reasoning behind each case.
 	//
 	// Same placement rationale as the service-name guard just above: BEFORE the
-	// registrar-mode admission so Open/Secure/Learn all refuse identically, and
+	// registrar-mode admission so Learn and Secure refuse identically, and
 	// 403 (not 400) because the AOR is well-formed — it is the identity that is
 	// refused.
 	if (pbx::isReservedOrPstnAor(fromNumber))
@@ -1163,18 +1239,16 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	}
 
 	// ── Registrar-mode admission (STAGE 2) ───────────────────────────────────────
-	// Runtime policy replaces the old compile-time POCKETDIAL_OPEN_REGISTRAR gate.
-	//   Open   : accept every REGISTER (legacy standalone behaviour).
+	// Every REGISTER is admitted by policy; there is no accept-everything mode
+	// (the open registrar is retired, #500).
 	//   Secure : digest-challenge + verify against the stored HA1 for this ext.
 	//   Learn  : TOFU + MAC-lock — adopt unknown devices, enforce secured ones.
 	// On Challenge the helper has already enqueued the 401 + WWW-Authenticate; on
 	// Reject we emit the 403 here from rejectReason. Either way a non-Accept stops.
 	const std::string extStr(fromNumber);
-	const RegistrarMode mode = _registrar.getMode();
-	if (mode != RegistrarMode::Open)
 	{
 		std::string rejectReason;
-		Registrar::AuthDecision decision = (mode == RegistrarMode::Secure)
+		const Registrar::AuthDecision decision = (_registrar.getMode() == RegistrarMode::Secure)
 			? _registrar.admitSecure(data, extStr, rejectReason)
 			: _registrar.admitLearn(data, extStr, rejectReason);
 
@@ -1224,9 +1298,12 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			// brief intercom auto-answer INVITE so it plays its own tone, then tear
 			// the call back down. Signaling-only: the server sources NO RTP. Bounded
 			// and best-effort — if the beep table is full the beep is simply skipped.
+			// Issue #408: never in the same pass as this REGISTER's 200 OK -- it goes
+			// out from tick() about kAfterRegisterDelay later, once the phone has had
+			// time to finish its own startup.
 			if (isNewBinding)
 			{
-				_beeper.sendBeep(newClient);
+				_beeper.sendBeep(newClient, RegisterBeeper::kAfterRegisterDelay);
 			}
 			if (deviceMac.has_value()) _registrar.markOnline(*deviceMac, true);
 		}
@@ -1261,7 +1338,14 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	// The PBX is unambiguously the UAS of a REGISTER, so there is no relay
 	// question on this path.
 	addCapabilityHeaders(*response);
-	endHandle(fromNumber, response);
+	// Issue #523: answer the transaction's source, like the 400/503 above, never
+	// through endHandle(). endHandle() finds the destination by number, and an
+	// Expires: 0 de-REGISTER has just released that number's client, so it took
+	// the not-found branch and answered every de-registration 404. RFC 3261 §10.3:
+	// a removal (even of a binding that never existed) is a 200. For a lease
+	// grant the two addresses are the same: allocateClient() has just stored
+	// data->getSource() as the binding's address.
+	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
 // ── Capability advertisement (issue #199, root cause 2) ──────────────────────
@@ -1451,6 +1535,40 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 			response->clearBody();
 			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 			_outbox.emplace_back(data->getSource(), std::move(response));
+		}
+		// Issue #548: RFC 3261 §9.2 -- the INVITE itself is then answered 487. The
+		// PBX is this INVITE's UAS (the far leg is the anchor's, not a SIP peer
+		// whose own 487 could be relayed), so nothing else ever answers it: the
+		// phone's INVITE transaction sat in Proceeding until its own timer. Only
+		// while the call is still ringing -- once the 200 OK went out the INVITE
+		// has its final response and a CANCEL changes nothing (§9.2). Built from
+		// the CANCEL, which carries the INVITE's Via branch, From, To, Call-ID and
+		// CSeq number (§9.1); the To-tag is the one the 180 Ringing carried.
+		if (cancelSess.has_value() &&
+			cancelSess.value()->getState() == Session::State::Invited)
+		{
+			// The stored INVITE when there is one (its own Via/CSeq verbatim);
+			// else the CANCEL, which carries the same fields (§9.1).
+			const std::shared_ptr<SipMessage> invite = cancelSess.value()->getInviteMessage();
+			auto terminated = getMessageFromPool(invite ? *invite : *data);
+			if (terminated)
+			{
+				std::string cseq(data->getCSeq());
+				const size_t m = cseq.find("CANCEL");
+				if (m != std::string::npos) cseq.replace(m, 6, "INVITE");
+				const std::string& tag = cancelSess.value()->getLocalTag();
+				terminated->setHeader(SipMessageTypes::REQUEST_TERMINATED);
+				terminated->clearBody();
+				terminated->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+				terminated->setCSeq(cseq);
+				std::string to(data->getTo());
+				if (to.find(";tag=") == std::string::npos)
+				{
+					to += ";tag=" + (tag.empty() ? IDGen::GenerateID(9) : tag);
+				}
+				terminated->setTo(std::move(to));
+				_outbox.emplace_back(data->getSource(), std::move(terminated));
+			}
 		}
 		endCall(data->getCallID(), data->getFromNumber(), destNumber, "handset CANCEL");
 		return;
@@ -1703,13 +1821,53 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Issue #497: the From header only NAMES the caller. Before this, any host on
+	// the link could place a call -- dial plan and trunk egress included -- as any
+	// registered extension just by writing its number in From, and in Learn mode
+	// (the default, #500) nothing else was checked. A call now has to come from
+	// the address that extension registered from. Source IP only, port-agnostic:
+	// the same rule isDialogSourceAuthorized() applies to BYE, since a phone may
+	// place calls from a different ephemeral port than it registered from.
+	// Deliberately AFTER the emergency branch: 911 is never gated (#454).
+	if (caller.value()->getAddress().sin_addr.s_addr != data->getSource().sin_addr.s_addr)
+	{
+		// Counted every time (/metrics); logged at most once per 10 s. A spoofer
+		// can send these as fast as it likes, and each log line allocates on this
+		// task (#284; BigDog's and Crew's #503 reviews).
+		_unboundCallerRefusals.fetch_add(1, std::memory_order_relaxed);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - _lastUnboundCallerLog >= std::chrono::seconds(10))
+		{
+			_lastUnboundCallerLog = now;
+			queueLog("INVITE refused: caller \"" + std::string(data->getFromNumber()) +
+				"\" is registered from a different address (#497; further refusals counted, "
+				"logged at most every 10 s)", true);
+		}
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 403 Caller Not Registered From This Address");
+		response->clearBody();
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		return;
+	}
+
 	// Secure mode: registration auth alone leaves call setup open to anyone who
 	// can reach UDP/5060 (drawbridge #125). Challenge the INVITE with the same
 	// digest machinery -- admitSecure() takes the method from the request line,
 	// so it verifies against INVITE. The stateless 401 needs no session; the
 	// credentialed retry arrives with CSeq+1 and falls through here. Learn mode
-	// keeps its TOFU semantics and Open mode never challenges.
-	if (_registrar.getMode() == RegistrarMode::Secure)
+	// keeps its TOFU semantics (the open mode is retired, #500).
+	//
+	// Issue #505: in Learn mode a device an admin has promoted to Secured is
+	// digest-enforced on REGISTER already; its CALLS now prove the same secret.
+	// Otherwise a spoofed INVITE naming a Secured extension (with its source IP
+	// forged past #497's binding) would place calls as it. Unsecured Learned
+	// extensions keep TOFU (they have no secret to check; #440).
+	// std::string_view: no allocation on every INVITE; the string is built only
+	// when a challenge actually runs (BigDog's #512 review, #284).
+	if (_registrar.getMode() == RegistrarMode::Secure ||
+		_registrar.isExtensionSecured(data->getFromNumber()))
 	{
 		std::string rejectReason;
 		const Registrar::AuthDecision decision =
@@ -1720,6 +1878,20 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 			_registrar.sendForbidden(data, rejectReason.empty() ? "Forbidden" : rejectReason);
 			return;
 		}
+		// #512 review (Crew, MEDIUM): the digest now binds the Request-URI
+		// (admitSecure checks auth.uri against it), but this function routes on
+		// the To user. A replayed credential with only To rewritten would still
+		// reach another destination, so on the credentialed path they must agree.
+		if (data->getRequestUriUser() != destNumber)
+		{
+			_registrar.sendForbidden(data, "Request-URI And To Disagree");
+			return;
+		}
+		// The credentials were for this PBX and are spent. Nothing downstream
+		// (a fork, a transfer leg, a response cloned from this request) may carry
+		// them on to anyone who could replay them.
+		data->removeHeaders("Authorization");
+		data->removeHeaders("Proxy-Authorization");
 	}
 
 	if (destNumber == "777")
@@ -2473,6 +2645,18 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 
+	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888 call
+	// can't overwrite this call's destination identity. Drawn here, beside the
+	// session, so an exhausted pool is refused before anything is answered
+	// (#412: allocateVirtualPeer() returns nullptr once its capacity is spent).
+	auto dummyConf = allocateVirtualPeer(confExt, data->getSource());
+	if (!dummyConf)
+	{
+		_conference->leave(callID);
+		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
+		return;
+	}
+
 	// Draw the answer BEFORE publishing the session — past _sessions.emplace() the
 	// retransmission guard at the top of onInvite() silently drops the caller's retry,
 	// so a pool refusal here would strand a joined leg with no answer ever sent.
@@ -2493,9 +2677,6 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 
-	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888 call
-	// can't overwrite this call's destination identity.
-	auto dummyConf = allocateVirtualPeer(confExt, data->getSource());
 	newSession->setDest(dummyConf);
 	// Issue #232: same reasoning as the 777 echo leg (RequestsHandler.cpp,
 	// onInvite's "777" branch) — record this leg's own To-tag now, since
@@ -2547,15 +2728,18 @@ void RequestsHandler::loadVoicemailGreeting()
 	}
 	if (dataOff + dataLen > static_cast<size_t>(total)) dataLen = static_cast<size_t>(total) - dataOff;
 
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(dataLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-	if (buf == nullptr) buf = static_cast<uint8_t*>(heap_caps_malloc(dataLen, MALLOC_CAP_8BIT));
-#else
-	uint8_t* buf = static_cast<uint8_t*>(std::malloc(dataLen));
-#endif
+	// Issue #466: the same placement rule as the MoH clip -- PSRAM only where
+	// the board has it, capped internal DRAM where it has none, and a refusal
+	// is counted and flagged rather than silently spilling into internal RAM.
+	uint8_t* buf = HoldMusic::allocClip(dataLen);
+	_greetingRefused.store(buf == nullptr, std::memory_order_relaxed);
 	if (buf == nullptr)
 	{
 		std::fclose(f);
+		queueLog("[WARN] Voicemail: greeting at " + std::string(kGreetingPath) + " (" +
+			std::to_string(dataLen) + " B) REFUSED -- PSRAM short, or over the " +
+			std::to_string(POCKETDIAL_CLIP_INTERNAL_MAX_BYTES) +
+			" B internal cap on a board without PSRAM (#466); deposits will record immediately", true);
 		return;
 	}
 
@@ -2705,6 +2889,27 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		return;
 	}
 
+	// Per-session dummy dest, drawn from the virtual peer pool like every
+	// other locally-terminated leg (777/888/anchor) -- never a shared
+	// client, so a concurrent voicemail call can't overwrite this one's
+	// destination identity. Drawn beside the session so exhaustion is refused
+	// with the same unwind (#412: it returns nullptr once its capacity is spent).
+	//
+	// Noted, not fixed here (found in review): forceDisconnect() BYEs both
+	// legs of a session, so an admin-killed voicemail call will emit a BYE
+	// toward this dummy "700" address -- the same #232 shape 777/888 already
+	// have (a locally-terminated leg's dummy dest isn't a real phone to BYE).
+	// Whoever picks up #232 broadly should include this leg.
+	auto dummyVm = allocateVirtualPeer("700", invite->getSource());
+	if (!dummyVm)
+	{
+		_vmRtpReceivers[slot].stop();
+		_vmRtpSenders[slot].stop(callID);
+		_vmLegs[slot].reset();
+		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted, rejected deposit");
+		return;
+	}
+
 	const std::string toTag = IDGen::GenerateID(9);
 	// buildMediaSdp() still answers sendrecv unconditionally (not offer-aware)
 	// -- matches every OTHER locally-terminated leg today (777/888/anchor)
@@ -2722,17 +2927,6 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		return;
 	}
 
-	// Per-session dummy dest, drawn from the virtual peer pool like every
-	// other locally-terminated leg (777/888/anchor) -- never a shared
-	// client, so a concurrent voicemail call can't overwrite this one's
-	// destination identity.
-	//
-	// Noted, not fixed here (found in review): forceDisconnect() BYEs both
-	// legs of a session, so an admin-killed voicemail call will emit a BYE
-	// toward this dummy "700" address -- the same #232 shape 777/888 already
-	// have (a locally-terminated leg's dummy dest isn't a real phone to BYE).
-	// Whoever picks up #232 broadly should include this leg.
-	auto dummyVm = allocateVirtualPeer("700", invite->getSource());
 	newSession->setDest(dummyVm);
 	newSession->setVoicemail(true);
 	newSession->setVoicemailLegSlot(slot);
@@ -2921,6 +3115,20 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 		return;
 	}
 
+	// Per-session dummy dest, drawn from the virtual peer pool like every
+	// other locally-terminated leg -- see answerVoicemailDeposit()'s
+	// identical note on the #232 shape this shares (a dummy dest isn't a
+	// real phone to BYE; out of scope here too). Drawn beside the session and
+	// refused the same way when the pool is empty (#412).
+	auto dummyVm = allocateVirtualPeer(kVoicemailRetrievalExt, invite->getSource());
+	if (!dummyVm)
+	{
+		_vmRtpReceivers[slot].stop();
+		_vmRtpSenders[slot].stop(callID);
+		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted, rejected retrieval");
+		return;
+	}
+
 	const std::string toTag = IDGen::GenerateID(9);
 	// buildMediaSdp() still answers sendrecv unconditionally -- matches
 	// every other locally-terminated leg today (see answerVoicemailDeposit()'s
@@ -2936,11 +3144,6 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 		return;
 	}
 
-	// Per-session dummy dest, drawn from the virtual peer pool like every
-	// other locally-terminated leg -- see answerVoicemailDeposit()'s
-	// identical note on the #232 shape this shares (a dummy dest isn't a
-	// real phone to BYE; out of scope here too).
-	auto dummyVm = allocateVirtualPeer(kVoicemailRetrievalExt, invite->getSource());
 	newSession->setDest(dummyVm);
 	newSession->setVoicemail(true);
 	newSession->setVoicemailLegSlot(slot);
@@ -3551,6 +3754,13 @@ bool RequestsHandler::startHoldMusic(const std::string& clipPath)
 	// park on its pre-#162 silent hold.
 	if (!_holdMusic.loadClip(clipPath))
 	{
+		if (_holdMusic.lastLoadRefused())
+		{
+			queueLog("[WARN] MoH: clip at " + clipPath + " REFUSED -- PSRAM short, or over the " +
+			         std::to_string(POCKETDIAL_CLIP_INTERNAL_MAX_BYTES) +
+			         " B internal cap on a board without PSRAM (#466); parked callers will hear silence", true);
+			return false;
+		}
 		queueLog("MoH: no clip at " + clipPath +
 		         " (or not 8 kHz mono mu-law) — parked callers will hear silence", true);
 		return false;
@@ -3671,27 +3881,66 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// companion half of #166 and lands separately.
 	queueLog("EMERGENCY: " + kind + " dialed by " + from + asDialed, true);
 
-	// respondIfDisconnected=false: when no trunk is connected, originateAnchorCall
-	// returns false having sent NOTHING, so this function owns the failure
-	// response and the handset never receives two final responses to one INVITE.
-	// NOT std::move: originateAnchorCall takes its shared_ptr by value, and this
-	// function still needs `data` afterwards to build the failure response from.
+	// Issue #521: only a provider that places REAL calls is offered the call.
+	// The loopback simulator answers whatever it is handed, so giving it 911
+	// "connects" the caller to nothing: they wait on a line no one will pick
+	// up instead of reaching for another phone. That is worse than any
+	// refusal. Order: a real anchor first (it is what has always carried 911,
+	// and when it is down it returns having sent nothing, so a fallback is
+	// still possible); then the generic SIP trunk, whose refusals answer the
+	// INVITE themselves and so must come last; then the 503 below.
+	const EmergencyRoute route = emergencyRouteLocked();
 	bool placed = false;
 	bool codecRejected = false;
-	if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed,
-		&codecRejected))
+	if (route == EmergencyRoute::Anchor)
 	{
-		// The call leg is enqueued. NOW notify: 47 CFR 9.16(b)(2) wants the
-		// notification contemporaneous with the call and not delaying it, and
-		// both leave on the same drainOutbox() pass, so that holds literally
-		// rather than approximately. Nothing in notifyEmergency() can fail in a
-		// way this function has to handle -- see EmergencyNotifier.hpp.
-		// `placed`, not `true`: the anchor may have ANSWERED with a 503 (every
-		// bridge slot busy, session pool full, makeCall declined) and still
-		// returned true. Telling the front desk a 911 call went through when it
-		// was refused for capacity is the worst error this feature could make.
-		notifyEmergency(emergency, from, dialed, /*routed=*/placed);
-		return;
+		// respondIfDisconnected=false: when the anchor is not connected,
+		// originateAnchorCall returns false having sent NOTHING, so this
+		// function owns what happens next and the handset never receives two
+		// final responses to one INVITE. NOT std::move: originateAnchorCall
+		// takes its shared_ptr by value, and `data` is still needed below.
+		if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed,
+			&codecRejected))
+		{
+			// The call leg is enqueued. NOW notify: 47 CFR 9.16(b)(2) wants the
+			// notification contemporaneous with the call and not delaying it, and
+			// both leave on the same drainOutbox() pass, so that holds literally
+			// rather than approximately. Nothing in notifyEmergency() can fail in
+			// a way this function has to handle -- see EmergencyNotifier.hpp.
+			// `placed`, not `true`: the anchor may have ANSWERED with a 503 (every
+			// bridge slot busy, session pool full, makeCall declined) and still
+			// returned true. Telling the front desk a 911 call went through when
+			// it was refused for capacity is the worst error this feature could make.
+			notifyEmergency(emergency, from, dialed, /*routed=*/placed);
+			return;
+		}
+	}
+
+	// A codec-rejected offer is not retried on the trunk: the trunk RELAYS the
+	// handset's audio rather than transcoding it, so an offer the anchor cannot
+	// carry is no better there, and the 503 below says exactly why.
+	//
+	if (!codecRejected && _sipTrunk.config().valid())
+	{
+		// #538 review M1: the anchor's gate only runs when the anchor is real AND
+		// up, so the trunk needs its own. onTrunkAnswered answers the handset with
+		// buildMediaSdp's PCMU-only SDP, so a PCMA- or G.722-only 911 would
+		// otherwise CONNECT with dead audio while the front desk is told ROUTED TO
+		// TRUNK. Checked here, inside the trunk branch, so a board with no route
+		// at all still says "no emergency route configured" below.
+		if (data->hasSdp() &&
+			!data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+		{
+			codecRejected = true;   // the 503 below says why
+		}
+		else
+		{
+			// Always owns the INVITE: every refusal on this path answers it, and
+			// logs which one it was ("trunk: <why> for <ext> -> 911").
+			(void)placeSipTrunkCall(data, caller, bare, &placed);
+			notifyEmergency(emergency, from, dialed, /*routed=*/placed);
+			return;
+		}
 	}
 
 	// ── No route. 503, and specifically not 404 ──────────────────────────────
@@ -3740,7 +3989,9 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// 503-vs-404 rationale above was written to avoid.
 	const char* warningDetail = codecRejected
 		? "no G.711 codec offered"
-		: "no outbound trunk connected";
+		: (route == EmergencyRoute::None
+			? "no emergency route configured"   // Issue #521: loopback only
+			: "no outbound trunk connected");
 	response->setHeader("SIP/2.0 503 Emergency Call Not Routable");
 	response->clearBody();
 	response->addHeader("Warning", "399 " + _localIp +
@@ -3830,6 +4081,22 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		queueLog("anchor(" + remoteExt + "): " + std::string(why) + " for "
 			+ std::string(data->getFromNumber()), true);
 	};
+
+	// Issue #521: the loopback simulator never takes an emergency number, by
+	// ANY path. routeEmergencyCall() does not hand it one, but a dial-plan
+	// Trunk rule's transform can produce one ("0" -> prepend "911"), and on a
+	// board with no trunk that lands here. Answering it would simulate a
+	// connected 911 call.
+	// Now DEFENCE IN DEPTH, unreachable by design: routeTrunkCall() diverts a
+	// rule-produced emergency number to routeEmergencyCall() (#538 review M2),
+	// and no client can be named like one (#550), so 555's own-number dial
+	// cannot produce one either. Pinned by a test that forces the #550 state.
+	if (!_anchorPlacesRealCalls && pbx::classifyEmergencyDial(destination).isEmergency)
+	{
+		refuse("SIP/2.0 503 Emergency Call Not Routable",
+			"loopback test provider refused an emergency number");
+		return true;
+	}
 
 	if (!_anchorClient || !_anchorClient->isConnected())
 	{
@@ -3939,6 +4206,21 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 			return true;
 		}
 
+		// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
+		// call can't overwrite this call's destination identity. Always kAnchorCallExt
+		// (not remoteExt): this is dialog bookkeeping isAnchor()-adjacent code keys on
+		// (onReinvite/onUpdate), not the dialed digits, so it must stay stable across
+		// both a plain 555 dial and a Trunk-routed one. Drawn beside the session and
+		// unwound the same way when the pool is empty (#412).
+		auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
+		if (!dummyAnchor)
+		{
+			bridge->stopBridge();
+			_anchorClient->dropCall(ownLeg);
+			refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
+			return true;
+		}
+
 		// Draw the answer BEFORE publishing the session — same "a pool refusal must
 		// never strand a call that already mutated state" reasoning as onConferenceInvite
 		// above. The SDP advertises THIS BRIDGE's receive port (not any other slot's):
@@ -3958,12 +4240,6 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 			return true;
 		}
 
-		// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
-		// call can't overwrite this call's destination identity. Always kAnchorCallExt
-		// (not remoteExt): this is dialog bookkeeping isAnchor()-adjacent code keys on
-		// (onReinvite/onUpdate), not the dialed digits, so it must stay stable across
-		// both a plain 555 dial and a Trunk-routed one.
-		auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
 		newSession->setDest(dummyAnchor);
 		newSession->setAnchor(true);
 		newSession->setAnchorParticipantId(ownLeg);
@@ -4016,6 +4292,13 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// isDialogSourceAuthorized() BYE/CANCEL leg-IP check compares against (its
 	// address is the caller's own, matching src — see that function's comment).
 	auto dummyAnchor = allocateVirtualPeer(kAnchorCallExt, data->getSource());
+	if (!dummyAnchor)
+	{
+		// Nothing claimed yet beyond the unpublished session, which the pool
+		// reclaims when newSession goes out of scope (#412).
+		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
+		return true;
+	}
 	newSession->setDest(dummyAnchor);
 	newSession->setInviteMessage(data);
 	newSession->setAnchor(true);
@@ -4113,7 +4396,7 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 	// stack can fail to allocate; the outbound worker then never runs and the
 	// call is silently never placed. Surface that (and free the arg) instead of
 	// a silent, phantom non-call — mirrors asyncDropCall's check exactly.
-	if (xTaskCreateWithCaps([](void* p) {
+	if (pd::createTaskPreferPsram([](void* p) {
 		auto* mca = static_cast<MakeCallArg*>(p);
 		std::string ownLeg;
 		if (!mca->anchor->makeCall(mca->dest, &ownLeg))
@@ -4154,8 +4437,8 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 			}
 		}
 		delete mca;
-		vTaskDeleteWithCaps(NULL);   // created WithCaps(PSRAM)
-	}, "tel_makecall", 12288, arg, 5, NULL, PD_TASK_STACK_CAPS) != pdPASS)
+		pd::deleteTask(NULL);   // created WithCaps(PSRAM)
+	}, "tel_makecall", 12288, arg, 5, NULL) != pdPASS)
 	{
 		queueLog("[Telephony] asyncMakeCall: outbound worker xTaskCreate FAILED (heap exhausted) — call NOT placed", true);
 		delete arg;
@@ -4218,12 +4501,12 @@ void RequestsHandler::asyncDropCall(const std::string& participantId)
 	// stack can fail to allocate; the drop worker then never runs and the far leg
 	// never tears down. Surface that (and free the arg) instead of a silent,
 	// phantom non-drop.
-	if (xTaskCreateWithCaps([](void* p) {
+	if (pd::createTaskPreferPsram([](void* p) {
 		auto* dca = static_cast<DropCallArg*>(p);
 		dca->anchor->dropCall(dca->partId);
 		delete dca;
-		vTaskDeleteWithCaps(NULL);
-	}, "tel_dropcall", 12288, arg, 5, NULL, PD_TASK_STACK_CAPS) != pdPASS)
+		pd::deleteTask(NULL);
+	}, "tel_dropcall", 12288, arg, 5, NULL) != pdPASS)
 	{
 		queueLog("[Telephony] asyncDropCall: drop worker xTaskCreate FAILED (heap exhausted) — leg NOT dropped", true);
 		delete arg;
@@ -4252,7 +4535,7 @@ void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 	// CHECK the spawn: same heap-pressure hazard asyncDropCall's own comment
 	// describes -- without this check a failed allocation leaks `arg` and
 	// silently never answers the call.
-	if (xTaskCreateWithCaps([](void* p) {
+	if (pd::createTaskPreferPsram([](void* p) {
 		auto* aca = static_cast<AnswerCallArg*>(p);
 		if (!aca->anchor->answerCall(aca->partId))
 		{
@@ -4260,8 +4543,8 @@ void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 			aca->handler->queueLog("[Telephony] Failed to answer inbound participant " + aca->partId, true);
 		}
 		delete aca;
-		vTaskDeleteWithCaps(NULL);
-	}, "tel_answer", 12288, arg, 5, NULL, PD_TASK_STACK_CAPS) != pdPASS)
+		pd::deleteTask(NULL);
+	}, "tel_answer", 12288, arg, 5, NULL) != pdPASS)
 	{
 		queueLog("[Telephony] asyncAnswerCall: answer worker xTaskCreate FAILED (heap exhausted) — participant NOT answered", true);
 		delete arg;
@@ -4449,6 +4732,16 @@ void RequestsHandler::routeInboundAnchorCall(const std::string& participantId, c
 	sockaddr_in pstnAddr{};
 	pstnAddr.sin_family = AF_INET;
 	auto pstn = allocateVirtualPeer(callerDisplay, pstnAddr);
+	if (!pstn)
+	{
+		// No SIP request to 503 here -- the call arrived from the anchor, so the
+		// refusal is the same as a full session pool's: drop the PSTN leg. A null
+		// src must never reach allocateSession(); everything downstream reads
+		// getSrc() for the caller label and the CDR (#412).
+		queueLog("[Telephony] Inbound: virtual-peer pool exhausted — dropping", true);
+		asyncDropCall(participantId);
+		return;
+	}
 	auto session = allocateSession(callId, pstn);
 	if (!session)
 	{
@@ -5351,8 +5644,10 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 				// own From/To tags are exactly what that phone's dialog expects.
 				const std::string& peerAHdr     = peerAIsSrc ? peerSess->getDialogFrom() : peerSess->getDialogTo();
 				const std::string& peerOtherHdr = peerAIsSrc ? peerSess->getDialogTo()   : peerSess->getDialogFrom();
+				// #402: above everything this dialog has carried -- including the
+				// splice re-INVITE the server already sent here in A's name.
 				auto bye = buildServerBye(survivor->getNumber(), survivor->getAddress(),
-					peerId, peerAHdr, peerOtherHdr);
+					peerId, peerAHdr, peerOtherHdr, peerSess->nextServerCSeq());
 				if (bye) _outbox.emplace_back(survivor->getAddress(), std::move(bye));
 			}
 			endCall(peerId, survivor ? survivor->getNumber() : std::string(),
@@ -6067,38 +6362,23 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		// so on ANY refusal below nothing is sent and nothing mutates.
 		const std::string srcIpPort = _localIp + ":" + std::to_string(_serverPort);
 
-		// Issue #257 follow-up. invToB and invToC each impersonate A inside
-		// A-B/A-C's PRE-EXISTING dialog, exactly like handleBlindXferOk()'s swap
-		// re-INVITE -- so each needs a CSeq higher than anything that dialog has
-		// already seen from A, or the real UA on the other end correctly rejects
-		// it with 500 Invalid CSeq (RFC 3261 s12.2.2). Unlike blind transfer,
-		// there are two dialogs and the REFER only arrives on one of them.
+		// Issue #402 (replacing #257's per-dialog floors). invToB/invToC impersonate
+		// A inside each PRE-EXISTING dialog, and the BYEs/NOTIFY below speak on them
+		// too, so every one needs a CSeq above anything that dialog has already
+		// carried, or the phone rejects it 500 Invalid CSeq (RFC 3261 s12.2.2).
 		//
-		// AB: this REFER (data) is itself a real, fresh in-dialog request from A
-		// on the AB dialog -- the same directly-observed-floor technique
-		// transferorCseqAtRefer() uses, just consumed immediately instead of
-		// stashed for later, since invToB is built in this same function.
-		//
-		// AC: no request from A arrives on this dialog at REFER time, so there is
-		// no equivalent live signal. The next best real (not invented) value is
-		// the CSeq A's own UA used on the consult INVITE that established this
-		// dialog (ac->getInviteMessage()) -- same reasoning the SDP capture above
-		// already relies on for this dialog: nothing else has changed its state
-		// since setup in the ordinary case, and the existing comment two
-		// paragraphs up already accepts a later re-INVITE here as a known,
-		// undetected gap, not a new one this introduces. If that message or its
-		// CSeq is ever unavailable, fall back to the REFER's own CSeq (abCseq)
-		// rather than a constant -- a real, recently-observed value from the
-		// same UA's single running counter (RFC 3261 places no per-dialog floor
-		// on it) is far more likely to be a safe lower bound than any fixed
-		// number.
-		const uint32_t abCseq = siphdr::cseqNumber(data->getCSeq());
-		uint32_t acCseq = 0;
-		if (auto acInvite = ac->getInviteMessage())
-		{
-			acCseq = siphdr::cseqNumber(acInvite->getCSeq());
-		}
-		if (acCseq == 0) acCseq = abCseq;
+		// The old floors assumed the REFER arrives on the HELD dialog and took the
+		// other one's setup-INVITE CSeq +1. A transferor may REFER on either
+		// dialog (RFC 5589); pjsua REFERs on the consult one, which makes the
+		// replaced dialog the held one -- and holding is a re-INVITE at exactly
+		// setup+1, so the splice collided with it on every call. Each session now
+		// records every CSeq either party has sent on it (handle(), which already
+		// counted this REFER), so each dialog simply goes above its own record.
+		// Numbers are reserved (noted) only once every draw below has succeeded.
+		// Per dialog, in this order: the re-INVITE, then what goes to A (BYE, then
+		// NOTIFY). Distinct recipients only need their own numbers increasing.
+		const uint32_t abBase = ab->nextServerCSeq();   // invToB, byeAfromAB, NOTIFY
+		const uint32_t acBase = ac->nextServerCSeq();   // invToC, byeAfromAC
 
 		// A's own tag/header in each dialog, and the other party's -- these flip
 		// with orientation. A message the server sends impersonating A carries
@@ -6111,12 +6391,10 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		const std::string& otherHdrAC = aIsSrcAC ? dToAC   : dFromAC;
 
 		auto byeAfromAB = buildServerBye(transferor->getNumber(), transferor->getAddress(),
-			callID, otherHdrAB, aHdrAB);
+			callID, otherHdrAB, aHdrAB, abBase + 1);
 		auto byeAfromAC = buildServerBye(transferor->getNumber(), transferor->getAddress(),
-			replacesCallIdKey, otherHdrAC, aHdrAC);
+			replacesCallIdKey, otherHdrAC, aHdrAC, acBase + 1);
 
-		// #257: invToB's CSeq uses abCseq+1 (see the comment above at its
-		// computation), a real directly-observed floor rather than a constant.
 		std::shared_ptr<SipMessage> invToB;
 		{
 			std::ostringstream ss;
@@ -6125,7 +6403,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 			   << "From: " << stripHeaderName(aHdrAB) << "\r\n"
 			   << "To: " << stripHeaderName(otherHdrAB) << "\r\n"
 			   << "Call-ID: " << stripHeaderName(callID) << "\r\n"
-			   << "CSeq: " << (abCseq + 1) << " INVITE\r\n"
+			   << "CSeq: " << abBase << " INVITE\r\n"
 			   << "Max-Forwards: 70\r\n"
 			   << "Contact: <sip:" << bClient->getNumber() << "@" << srcIpPort << ">\r\n"
 			   << "User-Agent: pocket-dial\r\n"
@@ -6134,8 +6412,6 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 			   << cSdp;
 			invToB = getMessageFromPool(ss.str(), bClient->getAddress());
 		}
-		// #257: invToC's CSeq uses acCseq+1 (see the comment above at its
-		// computation), a real directly-observed floor rather than a constant.
 		std::shared_ptr<SipMessage> invToC;
 		{
 			std::ostringstream ss;
@@ -6144,7 +6420,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 			   << "From: " << stripHeaderName(aHdrAC) << "\r\n"
 			   << "To: " << stripHeaderName(otherHdrAC) << "\r\n"
 			   << "Call-ID: " << replacesCallIdBare << "\r\n"
-			   << "CSeq: " << (acCseq + 1) << " INVITE\r\n"
+			   << "CSeq: " << acBase << " INVITE\r\n"
 			   << "Max-Forwards: 70\r\n"
 			   << "Contact: <sip:" << cClient->getNumber() << "@" << srcIpPort << ">\r\n"
 			   << "User-Agent: pocket-dial\r\n"
@@ -6180,6 +6456,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		_outbox.emplace_back(cClient->getAddress(), std::move(invToC));
 		_transferPendingAcks.push_back(callID);
 		_transferPendingAcks.push_back(replacesCallIdKey);
+		ab->noteServerCSeq(abBase + 2);   // + the NOTIFY below, sent best-effort
+		ac->noteServerCSeq(acBase + 1);
 
 		// Link the two sessions as a transfer bridge: a BYE from either B or C
 		// (onBye's isTransferBridge() branch) relays to the other, using
@@ -6196,7 +6474,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		// NOTIFY A with the success sipfrag — best-effort: the splice itself is
 		// already fully committed and on the wire by this point, so a pool refusal
 		// here just means A's phone doesn't get the courtesy status update.
-		auto notify = buildReferNotify(data, transferor, "SIP/2.0 200 OK", /*terminated=*/true);
+		auto notify = buildReferNotify(data, transferor, "SIP/2.0 200 OK", /*terminated=*/true,
+			abBase + 2);
 		if (notify) _outbox.emplace_back(transferor->getAddress(), std::move(notify));
 
 		queueLog("REFER: attended transfer " + transferor->getNumber() + " -> " +
@@ -6360,8 +6639,19 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// be hung up on here is the one now being kept.
 	if (!targetClient.has_value())
 	{
-		auto notify = buildReferNotify(data, transferor, "SIP/2.0 404 Not Found", /*terminated=*/true);
+		// Issue #422: above everything this dialog has carried, like the success
+		// NOTIFY (#402) -- not the builder's default 2.
+		//
+		// `original` cannot be null here: `transferee` is only ever set inside
+		// the `if (originalOpt.has_value())` block above, and a null transferee
+		// has already returned through the 481/603 decline. So there is no
+		// fallback CSeq to get wrong (#459 review).
+		assert(original && "blind-REFER decline reached without a session");
+		const uint32_t notifyCSeq = original->nextServerCSeq();
+		auto notify = buildReferNotify(data, transferor, "SIP/2.0 404 Not Found", /*terminated=*/true,
+			notifyCSeq);
 		if (notify) _outbox.emplace_back(transferor->getAddress(), std::move(notify));
+		original->noteServerCSeq(notifyCSeq);
 		queueLog("REFER: blind transfer to " + target + " declined (no such target) — "
 			"call left up", true);
 		return;
@@ -6414,8 +6704,12 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// transferor's: the REFER's own To/From, swapped (the REFER travelled A->B, this
 	// BYE travels B->A). Getting these backwards produces a message the phone
 	// rejects as a stranger's dialog, which is why #128 regression-tests the slots.
+	// Issue #402: the NOTIFY and this BYE both go to the transferor on this one
+	// dialog, so each needs its own CSeq above everything the dialog has carried.
+	// They used to share a hardcoded 2 and the phone 500'd the BYE.
+	const uint32_t xferBase = original->nextServerCSeq();   // NOTIFY, then BYE
 	auto byeToTransferor = buildServerBye(transferor->getNumber(), transferor->getAddress(),
-		callID, std::string(data->getTo()), std::string(data->getFrom()));
+		callID, std::string(data->getTo()), std::string(data->getFrom()), xferBase + 1);
 
 	// NOTE (issue #197, secondary item 1): this sipfrag still claims 200 OK the
 	// moment the INVITE is queued, before the target has been rung. RFC 3515 §2.4.5
@@ -6423,7 +6717,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// notification (§2.4.4). Deliberately NOT changed here: it is a separate defect
 	// with its own failure mode (a phone told the truth late vs. told a lie early),
 	// and folding it in would make this change about two things.
-	auto notify = buildReferNotify(data, transferor, "SIP/2.0 200 OK", /*terminated=*/true);
+	auto notify = buildReferNotify(data, transferor, "SIP/2.0 200 OK", /*terminated=*/true,
+		xferBase);
 
 	auto legSession = allocateSession(legCallID, transferee);
 
@@ -6484,6 +6779,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// has every right to 481 the notification it is waiting for.
 	_outbox.emplace_back(transferor->getAddress(), std::move(notify));
 	_outbox.emplace_back(transferor->getAddress(), std::move(byeToTransferor));
+	original->noteServerCSeq(xferBase + 1);
 
 	queueLog("REFER: blind transfer " + transferee->getNumber() + " -> " + target +
 		" (transferor " + transferor->getNumber() + " dropped)");
@@ -6506,7 +6802,8 @@ void RequestsHandler::onMessage(std::shared_ptr<SipMessage> data)
 std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_ptr<SipMessage>& refer,
 	const std::shared_ptr<SipClient>& transferor,
 	const std::string& sipfrag,
-	bool terminated)
+	bool terminated,
+	uint32_t cseq)
 {
 	// RFC 3515 §2.4.5 NOTIFY: Event: refer + message/sipfrag body reporting the
 	// transfer result. Sent within the REFER's dialog back to the transferor.
@@ -6528,7 +6825,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 	   << "From: " << stripHeaderName(refer->getTo()) << "\r\n"
 	   << "To: " << stripHeaderName(refer->getFrom()) << "\r\n"
 	   << "Call-ID: " << stripHeaderName(refer->getCallID()) << "\r\n"
-	   << "CSeq: 2 NOTIFY\r\n"
+	   << "CSeq: " << cseq << " NOTIFY\r\n"
 	   << "Max-Forwards: 70\r\n"
 	   << "Event: refer\r\n"
 	   << "Subscription-State: " << subState << "\r\n"
@@ -6673,6 +6970,15 @@ bool RequestsHandler::handleBlindXferOk(const std::shared_ptr<SipMessage>& data)
 	const std::string& transfereeHdr = orig->wasTransferorSrc() ? orig->getDialogTo()
 		: orig->getDialogFrom();
 
+	// Issue #257, then #402. This impersonates A inside A-B's PRE-EXISTING dialog,
+	// so its CSeq must exceed everything B has seen there -- A's REFER (#257's
+	// floor) and, since #402, whatever the server itself already sent on this
+	// dialog in A's or B's name (the NOTIFY and BYE of onRefer). nextServerCSeq()
+	// covers both; the REFER floor stays as a belt-and-braces lower bound.
+	// handleTransferOk() ACKs with whatever CSeq the 200 echoes, so nothing
+	// downstream needs this number -- only that it is real and monotonic.
+	const uint32_t swapCSeq = std::max(orig->transferorCseqAtRefer() + 1, orig->nextServerCSeq());
+
 	std::shared_ptr<SipMessage> reinvite;
 	{
 		// The target's answer becomes the transferee's new offer. Normalised to
@@ -6687,22 +6993,7 @@ bool RequestsHandler::handleBlindXferOk(const std::shared_ptr<SipMessage>& data)
 		   << "From: " << stripHeaderName(transferorHdr) << "\r\n"
 		   << "To: " << stripHeaderName(transfereeHdr) << "\r\n"
 		   << "Call-ID: " << stripHeaderName(leg->getPeerCallID()) << "\r\n"
-		   // Issue #257. This impersonates the transferor (A) inside A and B's
-		   // PRE-EXISTING dialog, so the CSeq must be higher than anything B's
-		   // own dialog layer has already seen from A -- a hardcoded constant
-		   // (previously 100) broke on any real UA whose own CSeq counter had
-		   // already climbed past it, which real UAs routinely do; RFC 3261
-		   // places no floor on where that counter starts. orig's
-		   // transferorCseqAtRefer() is the REFER's own CSeq, captured in
-		   // onRefer() as a real, directly-observed floor for "A's" numbering
-		   // on this exact dialog -- +1 is the next value A's own UA would
-		   // legitimately have used, which is guaranteed unused and in order.
-		   // handleTransferOk() recognises this dialog's 200 OK by Call-ID
-		   // membership in _transferPendingAcks (not by CSeq value), and ACKs
-		   // it with whatever CSeq that response itself echoes back -- so
-		   // nothing downstream needs to know this number, only that it is
-		   // real and monotonic.
-		   << "CSeq: " << (orig->transferorCseqAtRefer() + 1) << " INVITE\r\n"
+		   << "CSeq: " << swapCSeq << " INVITE\r\n"
 		   << "Max-Forwards: 70\r\n"
 		   << "Contact: <sip:" << transferee->getNumber() << "@" << srcIpPort << ">\r\n"
 		   << "User-Agent: pocket-dial\r\n"
@@ -6733,6 +7024,7 @@ bool RequestsHandler::handleBlindXferOk(const std::shared_ptr<SipMessage>& data)
 	leg->setWasTransferorSrc(true);
 	_transferPendingAcks.push_back(leg->getPeerCallID());
 	_outbox.emplace_back(transferee->getAddress(), std::move(reinvite));
+	orig->noteServerCSeq(swapCSeq);
 
 	queueLog("REFER: blind transfer completed — " + transferee->getNumber() + " <-> " +
 		(leg->getDest() ? leg->getDest()->getNumber() : std::string("?")));
@@ -6804,9 +7096,13 @@ bool RequestsHandler::handleBlindXferFailure(const std::shared_ptr<SipMessage>& 
 				: orig->getDialogTo();
 			const std::string& transfereeHdr = orig->wasTransferorSrc() ? orig->getDialogTo()
 				: orig->getDialogFrom();
+			// Issue #422: in A's name on the relayed A-B dialog, where the
+			// transferee has seen A's CSeqs -- above them, not the default 2.
+			const uint32_t byeCSeq = orig->nextServerCSeq();
 			auto bye = buildServerBye(transferee->getNumber(), transferee->getAddress(),
-				leg->getPeerCallID(), transferorHdr, transfereeHdr);
+				leg->getPeerCallID(), transferorHdr, transfereeHdr, byeCSeq);
 			if (bye) _outbox.emplace_back(transferee->getAddress(), std::move(bye));
+			orig->noteServerCSeq(byeCSeq);
 		}
 		endCall(leg->getPeerCallID(),
 			orig->getSrc() ? orig->getSrc()->getNumber() : std::string(),
@@ -7234,6 +7530,7 @@ void RequestsHandler::endHandle(std::string_view destNumber, std::shared_ptr<Sip
 	auto destClient = findClient(destNumber);
 	if (destClient.has_value())
 	{
+		markRelay(message.get());   // #424: a relay, exempt from the no-reply guard
 		_outbox.emplace_back(destClient.value()->getAddress(), std::move(message));
 	}
 	else
@@ -7336,9 +7633,11 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 			// From or To is malformed and phones drop it. A dialog that never
 			// reached Connected (still ringing) has no To-tag yet and gets no
 			// BYE — endCall() below still clears it server-side, as before.
+			// Issue #422: same relayed-dialog CSeq rule as the session-timer reaper.
+			const uint32_t byeCSeq = session->nextServerCSeq();
 			if (src && !dFrom.empty() && !dTo.empty())
 			{
-				auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom);
+				auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom, byeCSeq);
 				if (b) _asyncOutbox.emplace_back(src->getAddress(), std::move(b));
 			}
 			// A virtual-extension leg (777 echo, 888 conference, 555 anchor) has no
@@ -7351,9 +7650,10 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 			                           destNum == kAnchorCallExt;
 			if (dest && !destIsVirtual && !dFrom.empty() && !dTo.empty())
 			{
-				auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo);
+				auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo, byeCSeq);
 				if (b) _asyncOutbox.emplace_back(dest->getAddress(), std::move(b));
 			}
+			session->noteServerCSeq(byeCSeq);
 			endCall(callID,
 			        src  ? src->getNumber()  : "",
 			        dest ? dest->getNumber() : "",
@@ -7394,6 +7694,55 @@ uint64_t RequestsHandler::getSdpRejected() const
 	return _sdpRejected.load(std::memory_order_relaxed);
 }
 
+uint32_t RequestsHandler::getRepliesRefused() const
+{
+	return _repliesRefused.load(std::memory_order_relaxed);
+}
+
+void RequestsHandler::markRelay(const SipMessage* msg)
+{
+	if (_relayMarkCount < _relayMarks.size())
+		_relayMarks[_relayMarkCount++] = msg;
+	else
+		_relayMarkOverflow = true;
+}
+
+bool RequestsHandler::isMarkedRelay(const SipMessage* msg) const
+{
+	for (size_t i = 0; i < _relayMarkCount; ++i)
+		if (_relayMarks[i] == msg) return true;
+	return false;
+}
+
+void RequestsHandler::clearRelayMarks()
+{
+	_relayMarkCount = 0;
+	_relayMarkOverflow = false;
+}
+
+// A reply to _noReplyInbound is a RESPONSE the PBX built (not relayed), sent
+// back to the address the inbound message came from, in the same transaction:
+// same Call-ID and same CSeq line (number and method). Every "answer" a handler
+// builds is a clone of the message it answers, so it carries both unchanged.
+// An ACK or BYE the PBX sends in reaction is a request, so it never matches.
+// A relay is told apart by its mark, NOT its address (see _relayMarks): two
+// lines of one handset share an address. The address test only narrows it.
+bool RequestsHandler::isReplyToUnanswerable(const sockaddr_in& addr, const SipMessage& msg)
+{
+	const SipMessage& in = *_noReplyInbound;
+	if (!msg.getStatusInfo().has_value()) return false;
+	if (&msg == &in || isMarkedRelay(&msg)) return false;
+	if (!sameAddress(addr, in.getSource())) return false;
+	if (msg.getCallID() != in.getCallID() || msg.getCSeq() != in.getCSeq()) return false;
+
+	_repliesRefused.fetch_add(1, std::memory_order_relaxed);
+	queueLog("[SIP] #424 refused a reply to " +
+		std::string(in.getStatusInfo().has_value() ? "a response" : "an ACK") + ": " +
+		std::string(msg.getHeader()) + " / " + std::string(in.getCSeq()) + " " +
+		std::string(in.getCallID()), true);
+	return true;
+}
+
 void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipMessage::SdpVerdict verdict)
 {
 	_sdpRejected.fetch_add(1, std::memory_order_relaxed);
@@ -7426,6 +7775,39 @@ void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipM
 uint64_t RequestsHandler::getPacketsDropped() const
 {
 	return _packetsDropped.load(std::memory_order_relaxed);
+}
+
+uint64_t RequestsHandler::getDroppedInvalid() const
+{
+	return _dropProbe.invalidCount();
+}
+
+uint64_t RequestsHandler::getDroppedRate() const
+{
+	return _dropProbe.rateCount();
+}
+
+uint64_t RequestsHandler::getKeepalivesCrlf() const
+{
+	return _keepalivesCrlf.load(std::memory_order_relaxed);
+}
+
+const DropProbe& RequestsHandler::getDropProbe() const
+{
+	return _dropProbe;
+}
+
+void RequestsHandler::noteRxDiscard(DropProbe::Reason reason, const sockaddr_in& src,
+                                    std::string_view bytes, size_t fullLen)
+{
+	if (reason == DropProbe::Reason::Invalid || reason == DropProbe::Reason::Rate)
+		_packetsDropped.fetch_add(1, std::memory_order_relaxed);   // keep #430's sum exact
+	_dropProbe.note(reason, src.sin_addr.s_addr, src.sin_port, bytes, fullLen);
+}
+
+void RequestsHandler::noteRecvError(int err)
+{
+	_dropProbe.noteRecvError(err);
 }
 
 std::vector<CallDetailRecord> RequestsHandler::getCallDetailRecords()
@@ -7566,6 +7948,7 @@ void RequestsHandler::setE911Config(const std::string& exts, const std::string& 
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_cfg.setE911Config(exts, callback, location);
+		refreshE911ConfiguredLocked();
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -7826,6 +8209,20 @@ void RequestsHandler::clearAllCallHistory()
 	_cdr.clearAll();
 }
 
+bool RequestsHandler::clearAllForwards()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _cfg.clearForwardsLocked();
+}
+
+bool RequestsHandler::clearE911Config()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	const bool ok = _cfg.clearE911Locked();
+	refreshE911ConfiguredLocked();
+	return ok;
+}
+
 // ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
 
 void RequestsHandler::setRegistrarMode(RegistrarMode mode)
@@ -7939,6 +8336,7 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 	bool sent = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
+		_noReplyInbound.reset();   // #424: no inbound message owns this drain
 
 		auto client = findClient(ext);
 		if (!client.has_value())
@@ -8129,6 +8527,7 @@ void RequestsHandler::tick()
 		// pointer left behind would silently suppress retransmit tracking for
 		// whatever pooled SipMessage next lands on that address.
 		_passThroughMsg = nullptr;
+		_noReplyInbound.reset();   // #424: same reason; a tick answers nothing
 
 		// The only drain a conference gets when nobody is signalling: an 888 leg
 		// carries RTP but no SIP, so feature codes pressed mid-conference arrive
@@ -8579,68 +8978,89 @@ void RequestsHandler::tick()
 		_beeper.sweep(now);
 
 		// Build snapshot under registrar mutex lock, then save it under snapshot mutex lock
-		RegistrarSnapshot nextSnapshot;
-		nextSnapshot.packetsProcessed = _packetsProcessed.load(std::memory_order_relaxed);
-		nextSnapshot.packetsDropped = _packetsDropped.load(std::memory_order_relaxed);
-		for (const auto& client : _clientPool)
+		// Issue #463 (#284 rank 8): the snapshot is refilled IN PLACE into a
+		// persistent scratch copy, then its tables are swapped into _snapshot. The
+		// scratch then holds the previous tick's tables -- same shapes, strings with
+		// capacity -- so the next refill reuses them. A board whose tables did not
+		// change allocates nothing here; it used to build and free every table,
+		// ~2-5 KB of internal-DRAM churn per second. Only this block touches
+		// _snapshotScratch, under _mutex.
+		RegistrarSnapshot& next = _snapshotScratch;
 		{
-			if (client->getNumber().empty()) continue;
-			const auto& addr = client->getAddress();
-			std::string ipPort = sipwire::addrToIpPort(addr);
-			nextSnapshot.clients.emplace_back(client->getNumber(), ipPort);
-		}
-
-		nextSnapshot.sessions.reserve(_sessions.size());
-		for (const auto& [callID, session] : _sessions)
-		{
-			std::string caller = session->getSrc() ? session->getSrc()->getNumber() : "?";
-			std::string callee = session->getDest() ? session->getDest()->getNumber() : "?";
-
-			int durationSec = 0;
-			if (session->getState() == Session::State::Connected)
+			Refill<std::pair<std::string, std::string>> clients(next.clients);
+			for (const auto& client : _clientPool)
 			{
-				durationSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-					now - session->getStartTime()).count());
+				if (client->getNumber().empty()) continue;
+				char ipPort[INET_ADDRSTRLEN + 8];
+				char ip[INET_ADDRSTRLEN]{};
+				inet_ntop(AF_INET, &client->getAddress().sin_addr, ip, sizeof(ip));
+				std::snprintf(ipPort, sizeof(ipPort), "%s:%u", ip,
+					static_cast<unsigned>(ntohs(client->getAddress().sin_port)));
+				auto& row = clients.next();
+				row.first.assign(client->getNumber());
+				row.second.assign(ipPort);
 			}
-			nextSnapshot.sessions.emplace_back(caller, callee, sessionStateToString(session->getState()), durationSec);
+		}
+		{
+			Refill<std::tuple<std::string, std::string, std::string, int>> sessions(next.sessions);
+			for (const auto& [callID, session] : _sessions)
+			{
+				int durationSec = 0;
+				if (session->getState() == Session::State::Connected)
+				{
+					durationSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+						now - session->getStartTime()).count());
+				}
+				auto& row = sessions.next();
+				std::get<0>(row).assign(session->getSrc() ? session->getSrc()->getNumber() : std::string_view("?"));
+				std::get<1>(row).assign(session->getDest() ? session->getDest()->getNumber() : std::string_view("?"));
+				std::get<2>(row).assign(sessionStateToString(session->getState()));
+				std::get<3>(row) = durationSec;
+			}
 		}
 
 		// CDR view: newest-first copy of the ring into the snapshot.
-		nextSnapshot.cdr = _cdr.snapshot();
+		_cdr.snapshotInto(next.cdr);
 
 		// DND view: extensions currently in DND.
-		nextSnapshot.dnd = _cfg.dndSnapshot();
+		_cfg.dndSnapshotInto(next.dnd);
 
 		// Call-forward view.
-		nextSnapshot.forwards = _cfg.forwardsSnapshot();
+		_cfg.forwardsSnapshotInto(next.forwards);
 
 		// Ring/hunt-group view.
-		nextSnapshot.ringGroups = _cfg.ringGroupsSnapshot();
+		_cfg.ringGroupsSnapshotInto(next.ringGroups);
 
 		// Dial-plan rules (Issue #69), in table order. Rebuilt from _cfg's dial
 		// plan here alongside ringGroups rather than mirrored out of band like
 		// pageZones, so the snapshot swap below can never blank or re-order them.
-		nextSnapshot.dialRules = _cfg.dialRulesSnapshot();
+		_cfg.dialRulesSnapshotInto(next.dialRules);
 
 		// Parked calls view: {orbit, parkedExt, parker, secondsParked}. This full
 		// rebuild already reflects anything _park.sweep() just did above, so clear
 		// the dirty flag here rather than leaving it to trigger a redundant mirror
 		// on the next packet.
-		nextSnapshot.parkedCalls = _park.snapshotRows(now, /*onlyParked=*/true);
+		_park.snapshotRowsInto(next.parkedCalls, now, /*onlyParked=*/true);
 		_park.consumeParkChanged();
 
 		{
 			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-			// `devices` and `pageZones` are NOT rebuilt above: they are mirrored out
-			// of band (applyDeviceChange on a registry change, and the page-zone
-			// config path) because their sources only move on an admin action or a
-			// REGISTER. Carry them across the swap — assigning a fresh snapshot over
-			// the old one would blank both every tick, so the dashboard's adopted
-			// devices and paging zones would flash empty a second after any update
-			// and stay empty until the next change.
-			nextSnapshot.devices   = std::move(_snapshot.devices);
-			nextSnapshot.pageZones = std::move(_snapshot.pageZones);
-			_snapshot = std::move(nextSnapshot);
+			// Swap ONLY the tables rebuilt above. `devices`, `pageZones` and
+			// `voicemail` are mirrored out of band (applyDeviceChange on a registry
+			// change, refreshPbxConfigSnapshot() on a config change) and must be left
+			// exactly as they are. The old whole-struct move-assign preserved devices
+			// and pageZones by hand but not voicemail, so the dashboard's voicemail
+			// list was blanked one tick after every change (found in #463).
+			_snapshot.packetsProcessed = _packetsProcessed.load(std::memory_order_relaxed);
+			_snapshot.packetsDropped   = _packetsDropped.load(std::memory_order_relaxed);
+			std::swap(_snapshot.clients,     next.clients);
+			std::swap(_snapshot.sessions,    next.sessions);
+			std::swap(_snapshot.cdr,         next.cdr);
+			std::swap(_snapshot.dnd,         next.dnd);
+			std::swap(_snapshot.forwards,    next.forwards);
+			std::swap(_snapshot.ringGroups,  next.ringGroups);
+			std::swap(_snapshot.dialRules,   next.dialRules);
+			std::swap(_snapshot.parkedCalls, next.parkedCalls);
 		}
 
 		localOutbox = drainOutbox();
@@ -8677,29 +9097,55 @@ std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClientByAddress(c
 
 std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_ptr<SipClient>& client)
 {
-	std::string clientNum = client->getNumber();
+	// Issue #463 (#284 rank 3): the dominant allocator on an idle board -- one of
+	// these per registered phone every 5 s. It used to be an ostringstream (512 B
+	// on its first overflow) plus a str() copy plus seven std::string temporaries.
+	// Now it is formatted into a stack buffer. Every random ID is kept at or under
+	// the 15-character SSO bound, so IDGen allocates nothing either: the Call-ID's
+	// random part is 15 characters (~89 bits) rather than 16, and the branch's
+	// "z9hG4bK" magic cookie is written by the format, not concatenated.
+	char destIp[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &client->getAddress().sin_addr, destIp, sizeof(destIp));
+	const unsigned destPort = ntohs(client->getAddress().sin_port);
+	const std::string callId  = IDGen::GenerateID(15);
+	const std::string branch  = IDGen::GenerateID(12);
+	const std::string fromTag = IDGen::GenerateID(9);
+	const std::string& num = client->getNumber();
+	const int numLen = static_cast<int>(num.size());
+	const int svcLen = static_cast<int>(pbx::kServiceServer.size());
 
-	std::string destIpPort = sipwire::addrToIpPort(client->getAddress());
-
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	std::string callId = IDGen::GenerateID(16) + "@" + activeIp;
-	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
-	std::string fromTag = IDGen::GenerateID(9);
-
-	std::ostringstream ss;
-	ss << "OPTIONS sip:" << clientNum << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "To: <sip:" << clientNum << "@" << destIpPort << ">\r\n"
-	   << "From: <sip:" << pbx::kServiceServer << "@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
-	   << "Call-ID: " << callId << "\r\n"
-	   << "CSeq: 1 OPTIONS\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "User-Agent: pocket-dial\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-
-	return getMessageFromPool(ss.str(), client->getAddress());
+	char buf[640];
+	const int n = std::snprintf(buf, sizeof(buf),
+		"OPTIONS sip:%.*s@%s:%u SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP %s:%d;branch=z9hG4bK%s\r\n"
+		"To: <sip:%.*s@%s:%u>\r\n"
+		"From: <sip:%.*s@%s:%d>;tag=%s\r\n"
+		"Call-ID: %s@%s\r\n"
+		"CSeq: 1 OPTIONS\r\n"
+		"Max-Forwards: 70\r\n"
+		"User-Agent: pocket-dial\r\n"
+		"Content-Length: 0\r\n\r\n",
+		numLen, num.data(), destIp, destPort,
+		_localIp.c_str(), _serverPort, branch.c_str(),
+		numLen, num.data(), destIp, destPort,
+		svcLen, pbx::kServiceServer.data(), _localIp.c_str(), _serverPort, fromTag.c_str(),
+		callId.c_str(), _localIp.c_str());
+	// A truncated ping would be a malformed request; the caller already treats
+	// nullptr as "no ping this round" and does not stamp the interval, so it is
+	// retried next tick. Counted, and logged the first time, rather than silent
+	// (Sonny-OG's review, same pattern as #438/#456). The worst case with a
+	// 64-character AOR (kMaxAorLen) and a dotted-quad local IP is ~450 B, so
+	// this needs an input no real board has.
+	if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf))
+	{
+		if (_optionsPingTruncated.fetch_add(1, std::memory_order_relaxed) == 0)
+		{
+			queueLog("OPTIONS ping to " + num + " refused: it does not fit the " +
+				std::to_string(sizeof(buf)) + " B buffer (#463)", true);
+		}
+		return nullptr;
+	}
+	return getMessageFromPool(std::string_view(buf, static_cast<size_t>(n)), client->getAddress());
 }
 
 std::shared_ptr<SipClient> RequestsHandler::allocateClient(std::string number, sockaddr_in address, int expiresSeconds)
@@ -9429,16 +9875,21 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 		// and phones will drop it, leaving the session alive and re-firing every sweep
 		// tick. dTo can be empty if armSessionTimer was invoked before the 200 OK set
 		// dialog headers (e.g. a partial onReinvite path). (#72)
+		// Issue #422: this dialog is relayed, so each phone has already seen the
+		// OTHER phone's CSeqs (pjsua starts at a random ~5-digit value). A BYE at
+		// the old default 2 was refused 500 Invalid CSeq and left the leg up.
+		const uint32_t byeCSeq = session->nextServerCSeq();
 		if (src && !dFrom.empty() && !dTo.empty())
 		{
-			auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom);
+			auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom, byeCSeq);
 			if (b) _outbox.emplace_back(src->getAddress(), std::move(b));
 		}
 		if (dest && !dFrom.empty() && !dTo.empty())
 		{
-			auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo);
+			auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo, byeCSeq);
 			if (b) _outbox.emplace_back(dest->getAddress(), std::move(b));
 		}
+		session->noteServerCSeq(byeCSeq);
 		queueLog("[session timer] expired — BYE sent for " + callID, true);
 		endCall(callID,
 		        src  ? src->getNumber()  : "",
@@ -9555,6 +10006,20 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 	// ring-back, hunt-group next-ring, CFNA redirect — and now the async-anchor
 	// merge above), which is exactly why it belongs at the drain rather than at
 	// any individual enqueue.
+	// Issue #424: nothing answers a response or an ACK. Refused here, before
+	// retransmit tracking, because a refused reply that got tracked would be
+	// re-sent on Timer G for 32 s (what the register beep's stray 404 did).
+	if (_noReplyInbound && _relayMarkOverflow)
+	{
+		queueLog("[SIP] #424 relay marks overflowed; no reply refused this pass", true);
+	}
+	else if (_noReplyInbound)
+	{
+		_outbox.erase(std::remove_if(_outbox.begin(), _outbox.end(),
+			[this](const auto& e) { return e.second && isReplyToUnanswerable(e.first, *e.second); }),
+			_outbox.end());
+	}
+
 	for (const auto& [addr, msg] : _outbox)
 	{
 		// Skip the one thing that is not ours to retransmit: the inbound message
@@ -9567,7 +10032,8 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 		// the retransmit registration above — every deferred message leaves
 		// through here regardless of which call site (handle(), tick(),
 		// sendMessageTo()) queued it.
-		msg->toString(_pcapCapture.recordInto(/*outbound=*/true, addr));
+		_pcapCapture.recordWith(/*outbound=*/true, addr,
+			[&msg](char* buf, std::size_t cap) { return msg->serializeInto(buf, cap); });
 	}
 
 	auto drained = std::move(_outbox);
@@ -9894,6 +10360,10 @@ bool RequestsHandler::handleSpliceResponse(const std::shared_ptr<SipMessage>& da
 				if (status->code < 300 && data->hasSdp()) resp->setBody(std::string(data->getBody()));
 				else resp->clearBody();
 				resp->syncContentLength();
+				// #424/#472: a response built while handling a response. It carries
+				// the ORIGINATOR's Call-ID, so the no-reply guard would not match it
+				// anyway, but it is a translated relay: say so, the same as endHandle().
+				markRelay(resp.get());
 				_outbox.emplace_back(t.origin->getSource(), std::move(resp));
 			}
 		}
@@ -10110,6 +10580,42 @@ void RequestsHandler::applyStoredTrunkConfig()
 		queueLog("trunk: stored password rejected (too long for this build); "
 		         "credential cleared -- re-enter it on /setup/trunk", true);
 	}
+
+	// Issue #521: every esp_main variant calls this at boot, and the trunk
+	// form calls it on every save, so this is the one place that sees both
+	// "the board came up without an emergency route" and "a save just took
+	// the last one away". The dashboard banner and /api/status say it too;
+	// this is the line that reaches the console and the syslog.
+	if (emergencyRouteLocked() == EmergencyRoute::None)
+	{
+		queueLog("WARN: EMERGENCY CALLING IS NOT CONFIGURED -- 911/933 calls will be "
+		         "refused (503). Only the loopback test provider is present; configure "
+		         "a SIP trunk (/setup/trunk) or a telephony provider.", true);
+	}
+}
+
+RequestsHandler::EmergencyRoute RequestsHandler::emergencyRoute()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return emergencyRouteLocked();
+}
+
+RequestsHandler::EmergencyRoute RequestsHandler::emergencyRouteLocked() const
+{
+	if (_anchorPlacesRealCalls) return EmergencyRoute::Anchor;
+	if (_sipTrunk.config().valid()) return EmergencyRoute::Trunk;
+	return EmergencyRoute::None;
+}
+
+const char* RequestsHandler::emergencyRouteName(EmergencyRoute r)
+{
+	switch (r)
+	{
+	case EmergencyRoute::Anchor: return "anchor";
+	case EmergencyRoute::Trunk:  return "trunk";
+	case EmergencyRoute::None:   return "none";
+	}
+	return "none";
 }
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
@@ -10128,6 +10634,23 @@ void RequestsHandler::expireTrunkDeadlinesForTest()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 	_sipTrunk.expireDeadlinesForTest();
+}
+
+void RequestsHandler::fireRegisterBeepsForTest()
+{
+	// Same shape as tick(): produce under _mutex, drain, send outside it.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_outbox.clear();
+		_passThroughMsg = nullptr;
+		_beeper.firePendingNowForTest(std::chrono::steady_clock::now());
+		localOutbox = drainOutbox();
+	}
+	for (auto& event : localOutbox)
+	{
+		_onHandled(event.first, std::move(event.second));
+	}
 }
 
 TrunkResolver::Status RequestsHandler::trunkResolveStatusForTest()
@@ -10199,6 +10722,21 @@ void RequestsHandler::refuseRingingTrunk(const std::string& callId, int carrierS
 bool RequestsHandler::routeTrunkCall(const std::shared_ptr<SipMessage>& data,
 	const std::shared_ptr<SipClient>& caller, const std::string& destination)
 {
+	// #538 review M2: a dial-plan Trunk rule whose transform PRODUCES an
+	// emergency number ("0" -> "911") takes the emergency path, not a plain trunk
+	// call. pstnUri() sends 911/933 bare, so without this the carrier gets a real
+	// 911 with no EMERGENCY log line and no Kari's Law notification, and with no
+	// trunk a real anchor dials it the same way. routeEmergencyCall() always
+	// answers the INVITE, so this owns it. The loopback guard in
+	// originateAnchorCall() stays as the backstop.
+	if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(destination); em.isEmergency)
+	{
+		queueLog("EMERGENCY: a dial-plan rule turned " + std::string(data->getToNumber()) +
+			" into " + destination + "; routing it as an emergency call", true);
+		routeEmergencyCall(data, caller, em, destination);
+		return true;
+	}
+
 	// No generic trunk configured: this is the vendor-API anchor route it has
 	// always been. respondIfDisconnected=false keeps the "rule matched but
 	// nothing to route to" 404 with CallForker, which owns that tail.
@@ -10206,6 +10744,16 @@ bool RequestsHandler::routeTrunkCall(const std::shared_ptr<SipMessage>& data,
 	{
 		return originateAnchorCall(data, caller, destination, /*respondIfDisconnected=*/false);
 	}
+	return placeSipTrunkCall(data, caller, destination, /*placedOut=*/nullptr);
+}
+
+bool RequestsHandler::placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<SipClient>& caller, const std::string& destination,
+	bool* placedOut)
+{
+	// Pessimistic, unlike originateAnchorCall()'s: exactly one path below hands
+	// the call to the carrier, and only that one sets it.
+	if (placedOut) *placedOut = false;
 
 	const std::string callID(data->getCallID());
 
@@ -10335,6 +10883,7 @@ bool RequestsHandler::routeTrunkCall(const std::shared_ptr<SipMessage>& data,
 		return true;
 	}
 
+	if (placedOut) *placedOut = true;
 	queueLog("trunk: " + std::string(caller->getNumber()) + " -> " + destination
 		+ " ringing (relay pair " + std::to_string(slot) + ")");
 	return true;

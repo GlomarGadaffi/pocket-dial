@@ -1,18 +1,14 @@
 #ifndef REQUESTS_HANDLER_HPP
 #define REQUESTS_HANDLER_HPP
 
-// Seeds the DEFAULT registrar admission mode at boot (Issue #56).
-//
-// NOTE: this #define is UNCONDITIONAL, so passing -UPOCKETDIAL_OPEN_REGISTRAR on
-// the compiler command line does nothing — the header simply re-defines it. That
-// also makes the #else branch further down (which would select Mode::Secure)
-// unreachable in practice. Do not document this as a build knob; it is not one.
-//
-// Mode selection is a RUNTIME setting, persisted in NVS as reg_mode and loaded by
-// Registrar::loadMode() at construction. Change it from the dashboard
-// (POST /api/registrar), or at flash time via the cfgseed record — see
-// docs/LEARN_MODE.md and src/Helpers/DeviceConfig.hpp.
-#define POCKETDIAL_OPEN_REGISTRAR
+// Registrar admission mode is a RUNTIME setting, persisted in NVS as reg_mode and
+// loaded by Registrar::loadMode() at construction. Change it from the dashboard
+// (POST /api/registrar), or at flash time via the cfgseed record -- see
+// docs/LEARN_MODE.md and src/Helpers/DeviceConfig.hpp. With no stored mode the
+// board decides once and saves it (issue #397, Registrar::chooseBootMode()):
+// learn on a fresh install, and learn on an existing board too: the open
+// registrar is retired (#500). The old POCKETDIAL_OPEN_REGISTRAR #define
+// (unconditional, so never really a knob) is gone.
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include <lwip/sockets.h>
@@ -27,6 +23,7 @@
 #include <functional>
 #include <iostream>
 #include <unordered_map>
+#include <map>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -43,6 +40,7 @@
 #include "Session.hpp"
 #include "CallDetailRecord.hpp"
 #include "PcapCapture.hpp"
+#include "DropProbe.hpp"   // Issue #430: per-reason drop counts + recent-drop ring
 #include "PbxConfig.hpp"
 #include "DialPlan.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: pbx::EmergencyDial
@@ -154,11 +152,39 @@ public:
 	void forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
+	// Issue #430: packetsDropped split by reason (their sum), and the probe
+	// itself for its recent-drop ring (read with window()/at(); thread-safe,
+	// allocation-free on both sides).
+	uint64_t getDroppedInvalid() const;
+	uint64_t getDroppedRate() const;
+	const DropProbe& getDropProbe() const;
+	// Issue #430: datagrams made only of CR/LF -- RFC 5626 keep-alives, which
+	// phones also send over UDP to hold a NAT binding. Counted, NOT dropped.
+	uint64_t getKeepalivesCrlf() const;
+	// Issue #443/#444: discards made BEFORE handle() sees a datagram -- by the
+	// UDP receive loop (oversize, empty, a failed receive) or by SipServer when
+	// the message pool is spent. Called on the receive task; never allocates or
+	// logs. An empty datagram counts as Invalid AND in packetsDropped, so #430's
+	// "invalid + rate == packetsDropped" still holds; NoPool and Oversize have
+	// their own counts, outside packetsDropped (which is handle()'s refusals).
+	void noteRxDiscard(DropProbe::Reason reason, const sockaddr_in& src,
+	                   std::string_view bytes, size_t fullLen);
+	void noteRecvError(int err);
 	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
 	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
 	// drop (responses, ACK).
 	uint64_t getSdpRejected() const;
+	// Issue #497: INVITEs refused because they did not come from the caller's
+	// registered address (the 403 "Caller Not Registered From This Address").
+	uint64_t getUnboundCallerRefusals() const { return _unboundCallerRefusals.load(std::memory_order_relaxed); }
+	// Issue #424: responses drainOutbox() refused to send because they answered
+	// a response or an ACK. Any non-zero value is a handler bug the guard caught.
+	uint32_t getRepliesRefused() const;
+	// OPTIONS keep-alive pings refused because they would not fit their stack
+	// buffer (#463). Not reachable with a real AOR and IPv4 address; counted so
+	// a clipped request can never go out silently.
+	uint32_t getOptionsPingTruncated() const { return _optionsPingTruncated.load(std::memory_order_relaxed); }
 	size_t getClientCount();
 	size_t getSessionCount();
 	// Legs currently mixed on the meet-me conference (virtual extension 888); 0 while
@@ -321,6 +347,37 @@ public:
 	// must NOT be called with _mutex already held.
 	void applyStoredTrunkConfig();
 
+	// ── Emergency calling readiness (Issue #521) ─────────────────────────────
+	//
+	// Where a 911/933 dial can go right now. Anchor: the boot-selected
+	// telephony provider places real calls (telephonyProviderPlacesRealCalls).
+	// Trunk: no such anchor, but a valid generic SIP trunk is configured.
+	// None: neither -- the board has only the loopback simulator, which answers
+	// every call it is handed, so an emergency dial is refused with 503 rather
+	// than "connected" to nothing. /api/status reports this so the dashboard
+	// can keep a warning up for as long as it is None, and
+	// applyStoredTrunkConfig() logs a WARN at boot and on every trunk save that
+	// leaves it None. Anchor with a trunk also configured still reports Anchor;
+	// routeEmergencyCall() falls through to the trunk when that anchor is down.
+	// Takes _mutex, so it must NOT be called with _mutex already held.
+	enum class EmergencyRoute : uint8_t { None, Anchor, Trunk };
+	EmergencyRoute emergencyRoute();
+	// "anchor", "trunk" or "none": the /api/status spelling.
+	static const char* emergencyRouteName(EmergencyRoute r);
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (Issue #521). Every host test boots the loopback anchor, which
+	// can never carry an emergency call. This lets it stand in for a real
+	// provider so the anchor route's own behaviour (the bare number, the 503
+	// when it is down, the notification) stays testable. Inline, so it never
+	// reaches firmware (see the comment below).
+	void setAnchorPlacesRealCallsForTest(bool real)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_anchorPlacesRealCalls = real;
+	}
+#endif
+
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only. Gated because these three are DEFINED OUT OF LINE, in
 	// RequestsHandler.cpp -- and that, not the gate, is what decides whether a
@@ -361,11 +418,38 @@ public:
 	// the no-answer path without a 60-second test.
 	void expireTrunkDeadlinesForTest();
 
+	// Issue #408: send every pending register beep now and deliver it through
+	// the send callback, as tick() would once RegisterBeeper::kAfterRegisterDelay
+	// has passed. Does not depend on tick()'s 1 s gate.
+	void fireRegisterBeepsForTest();
+	// #463: tick() runs at most once a second; this lets a test drive two passes
+	// back to back (the second is the steady-state one an AllocGuard measures).
+	void forceNextTickForTest() { _lastTick = {}; }
+
 	// What the resolver currently knows about the configured SBC host. Refused
 	// means nothing is known and nothing is in flight; anything else means a
 	// resolution has at least been ASKED FOR, which is what proves tick()
 	// primes the cache rather than leaving an FQDN trunk permanently dead.
 	TrunkResolver::Status trunkResolveStatusForTest();
+
+	// Exhaust virtual-peer capacity (#412): draw through the REAL allocator
+	// until it refuses, and hand back everything it gave out. Hold the vector
+	// to keep capacity exhausted; drop it to restore. Drawing through
+	// allocateVirtualPeer() rather than reading _virtualPeerPool directly is
+	// deliberate -- it exhausts whatever the allocator has behind the pool
+	// too (the #101A heap fallback while it exists), so the next draw really
+	// returns nullptr, which is the state every caller must survive.
+	std::vector<std::shared_ptr<SipClient>> exhaustVirtualPeersForTest()
+	{
+		std::vector<std::shared_ptr<SipClient>> held;
+		for (size_t guard = 0; guard < 4 * POCKETDIAL_VIRTUAL_PEERS + 64; ++guard)
+		{
+			auto p = allocateVirtualPeer("vpeer-drain", sockaddr_in{});
+			if (!p) break;
+			held.push_back(std::move(p));
+		}
+		return held;
+	}
 #endif
 
 	// ── Telephony-API credential slots (ported from drawbridge) ──────────────────
@@ -449,6 +533,16 @@ public:
 	// as sensitive as the credential tables above and lives in its own NVS
 	// namespace, "cdrlog" — see CdrRing::clearAll()).
 	void clearAllCallHistory();
+	// Issue #450: /api/factory-reset. Empties the call-forward table and erases
+	// it from NVS (forward targets are external numbers). False if the erase failed.
+	bool clearAllForwards();
+	// Issue #450 / poll #454: /api/factory-reset erases the E911 settings. False
+	// if the NVS erase failed. Leaves "E911 not configured" showing.
+	bool clearE911Config();
+	// True when a 911 call would notify someone on site. Lock-free (an atomic
+	// kept in step with every load/set/clear), so /api/status reads it on the
+	// HTTP thread without touching _mutex.
+	bool isE911Configured() const { return _e911Configured.load(std::memory_order_acquire); }
 
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint
@@ -563,6 +657,14 @@ public:
 		std::lock_guard<std::mutex> lock(_mutex);
 		_registrar.adoptDeviceForTest(mac, ext, state);
 	}
+	// Test-only (#550): bind a client WITHOUT onRegister's identity guard, so a
+	// test can stand up the state the guard now forbids (a client named like an
+	// emergency number) and pin the defence-in-depth checks behind it.
+	void bindClientBypassingGuardsForTest(const std::string& ext, const sockaddr_in& addr)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		(void)allocateClient(ext, addr, 3600);
+	}
 #endif
 
 	// ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
@@ -661,6 +763,9 @@ private:
 	// call rather than more surface to this file.
 	EmergencyNotifier _e911Notifier{*this};
 
+	// PbxEnv hook for the DTMF factory-reset door (#450).
+	void wipeVoicemail() override { wipeAllVoicemail(); }
+
 	// ── PbxEnv: shared-infrastructure surface for the extracted machines ───────
 	// RequestsHandler is the PbxEnv implementation each decomposed state machine
 	// (TransactionLayer, ...) talks back through. All three assume the caller
@@ -734,7 +839,7 @@ private:
 		return buildServerBye(destExt, destAddr, callId, fromHeader, toHeader);
 	}
 	void forEachSessionInvolving(std::string_view aor,
-		const std::function<void(const std::string&, const Session&, DialogRole)>& fn) const override
+		FunctionRef<void(const std::string&, const Session&, DialogRole)> fn) const override
 	{
 		for (const auto& [callID, session] : _sessions)
 		{
@@ -791,14 +896,11 @@ private:
 	TransactionLayer _txLayer{*this};
 
 	// REGISTER admission policy + adopted-device registry (STAGE 2). Guarded by
-	// _mutex except the lock-free mode atomic. The compile-time
-	// POCKETDIAL_OPEN_REGISTRAR symbol only seeds the DEFAULT mode at boot; the
-	// NVS-persisted value (loaded in the constructor) overrides it.
-#ifdef POCKETDIAL_OPEN_REGISTRAR
-	Registrar _registrar{*this, Registrar::Mode::Open};
-#else
-	Registrar _registrar{*this, Registrar::Mode::Secure};
-#endif
+	// _mutex except the lock-free mode atomic. Open here is only the pre-load
+	// seed: on ESP, loadMode() in the constructor replaces it with the stored
+	// mode or chooseBootMode()'s decision (#397). The host has no NVS, so the
+	// host suite runs Open -- its REGISTERs carry no credentials.
+	Registrar _registrar{*this, Registrar::Mode::Learn};   // loadMode() decides on the board (#397, #500)
 
 	// RFC 4028 session timer helpers. Caller holds _mutex.
 	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);
@@ -882,6 +984,10 @@ public:
 
 	// Dashboard/status accessors.
 	bool     holdMusicLoaded()  const { return _holdMusic.isLoaded(); }
+	// Issue #466: a valid clip that was refused a buffer (see HoldMusic::
+	// allocClip) -- MoH is then silence, the greeting absent.
+	bool     holdMusicClipRefused()     const { return _holdMusic.lastLoadRefused(); }
+	bool     voicemailGreetingRefused() const { return _greetingRefused.load(std::memory_order_relaxed); }
 	unsigned holdMusicSeconds() const { return _holdMusic.clipSeconds(); }
 	unsigned holdMusicListeners() const { return _holdMusic.listenerCount(); }
 	// Issue #328: L2-bypass vs socket-fallback health for the hold-music
@@ -977,11 +1083,13 @@ private:
 	// result.
 
 	// Build a NOTIFY (Event: refer) carrying a message/sipfrag body reporting the
-	// transfer result back to the transferor. Caller holds _mutex.
+	// transfer result back to the transferor. Caller holds _mutex. `cseq`: same
+	// rule as buildServerBye's -- above everything already used on the dialog (#402).
 	std::shared_ptr<SipMessage> buildReferNotify(const std::shared_ptr<SipMessage>& refer,
 		const std::shared_ptr<SipClient>& transferor,
 		const std::string& sipfrag,
-		bool terminated);
+		bool terminated,
+		uint32_t cseq = 2);
 
 	// Attended transfer (RFC 3891 Replaces), issue #131: onRefer() splices two live
 	// P2P sessions (A-B and A-C) into one B-C call via cross re-INVITEs carrying
@@ -1152,6 +1260,11 @@ public:
 	// with no writer task needed.
 	void drainVoicemailFlush(vmarchive::Sink& sink)
 	{
+		// #450: held for the whole drain so a factory reset's clear+wipe cannot
+		// land between a pop and its write (which would put a pre-reset message
+		// back on the card after the wipe). Leaf lock: never held with _mutex taken
+		// inside it.
+		std::lock_guard<std::mutex> drainLock(_vmDrainWipeMutex);
 		vmarchive::drainAll(_vmFlushQueue, sink, _vmStagingBufs,
 			[this](const vmarchive::QueuedRecording& rec) {
 				if (rec.stagingSlot >= 0 && rec.stagingSlot < static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS))
@@ -1163,6 +1276,30 @@ public:
 			});
 	}
 	size_t voicemailFlushQueueDepthForTest() const { return _vmFlushQueue.size(); }
+	// Issue #450: factory reset. Drops every queued recording (so none is written
+	// after the wipe) and wipes `sink`, under the same lock drainVoicemailFlush()
+	// holds. Blocking SD I/O: HTTP task, or the DTMF door right before restart.
+	void wipeVoicemailArchive(vmarchive::Sink& sink)
+	{
+		std::lock_guard<std::mutex> drainLock(_vmDrainWipeMutex);
+		_vmFlushQueue.clear();
+		for (auto& busy : _vmFlushBusy) busy.store(false, std::memory_order_release);
+		sink.wipe();
+	}
+	// The archive this build actually has: the production SD sink on
+	// PD_ETH_HAS_SD builds, a test-installed one on host, otherwise nothing.
+	void wipeAllVoicemail()
+	{
+		vmarchive::Sink* sink = _vmSinkForTest;
+#if defined(PD_ETH_HAS_SD)
+		if (!sink) sink = &vmarchive::productionSink();
+#endif
+		if (sink) wipeVoicemailArchive(*sink);
+	}
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only: the sink wipeAllVoicemail() uses on host. Not owned.
+	void setVoicemailSinkForTest(vmarchive::Sink* sink) { _vmSinkForTest = sink; }
+#endif
 	// Runs every slot's pending retrieval SD job (list/read/delete), a
 	// no-op for any slot not Pending. The ESP+PD_ETH_HAS_SD writer task
 	// (spawned in the constructor, same task drainVoicemailFlush() above
@@ -1267,6 +1404,7 @@ public:
 	void sweepVoicemailLegsForTest()
 	{
 		sweepVoicemailLegs(std::chrono::steady_clock::now());
+		_noReplyInbound.reset();
 		auto localOutbox = drainOutbox();
 		auto localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -1353,6 +1491,20 @@ private:
 	void routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller,
 		const pbx::EmergencyDial& emergency, const std::string& dialed);
+
+	// emergencyRoute() for a caller that already holds _mutex.
+	EmergencyRoute emergencyRouteLocked() const;
+
+	// The generic-SIP-trunk half of routeTrunkCall(): everything after its
+	// "is a trunk configured" check. Split out so routeEmergencyCall() can
+	// reach the trunk directly (Issue #521) and learn whether a carrier INVITE
+	// actually went out -- routeTrunkCall()'s bool, like originateAnchorCall()'s,
+	// means only "took ownership of the INVITE". `placedOut`, when non-null, is
+	// true only on the one path that hands the call to the carrier. Caller
+	// holds _mutex.
+	bool placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller, const std::string& destination,
+		bool* placedOut);
 
 	// `placedOut` (optional, Issue #166): true only when a call was actually
 	// dispatched. The bool RETURN means "took ownership of the INVITE" and is
@@ -1573,8 +1725,8 @@ private:
 		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody);
 	// Build a server-initiated in-dialog BYE. From/To must include tags because the
 	// dialog role differs per call path (beep = server UAC; park = server UAS).
-	// `cseq` must exceed any request the server already sent on this dialog
-	// (Session::nextServerCSeq(), #389); 2 is only right when it has sent none.
+	// `cseq` must exceed every CSeq already used on this dialog, by either party or
+	// the server (Session::nextServerCSeq(), #389/#402); 2 is right only when none is known.
 	// ── #453: in-dialog requests across a B2BUA splice ────────────────────────
 	// A splice (call pickup, park retrieve/ring-back, attended/blind transfer)
 	// joins two dialogs with DIFFERENT Call-IDs, linked only by peerCallID. An
@@ -1626,6 +1778,12 @@ private:
 	std::shared_ptr<SipMessage> buildServerBye(const std::string& destExt,
 		const sockaddr_in& destAddr, const std::string& callId,
 		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2);
+
+	// Issue #402: record a request's CSeq on its dialog's session, if it has one
+	// and `source` is a party on it. Returns the session found (or nullptr).
+	// Caller holds _mutex.
+	std::shared_ptr<Session> noteDialogCSeq(std::string_view callID, uint32_t cseq,
+		const sockaddr_in& source);
 
 	// Verify that the in-dialog request comes from a peer recorded at dialog setup
 	// (source IP match). Returns false → respond 403 Forbidden. Caller holds _mutex.
@@ -1740,6 +1898,17 @@ private:
 	// returned for it (see drainVoicemailFlush() below) -- i.e. exactly the
 	// window findFreeVoicemailSlot() must refuse to reuse the slot in.
 	std::atomic<bool> _vmFlushBusy[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
+	// #450: excludes a factory-reset wipe from a drain in progress (see
+	// drainVoicemailFlush()). Plain member, no allocation.
+	std::mutex _vmDrainWipeMutex;
+	// See isE911Configured(). Written under _mutex (or single-threaded in the
+	// constructor) by refreshE911ConfiguredLocked().
+	std::atomic<bool> _e911Configured{false};
+	void refreshE911ConfiguredLocked()
+	{
+		_e911Configured.store(!_cfg.e911Config().notifyExts.empty(), std::memory_order_release);
+	}
+	vmarchive::Sink* _vmSinkForTest = nullptr;
 
 	// ── Retrieval SD-I/O job machine (Issue #246, retrieval slice 3/3) ──────
 	// listMessages()/readMessage()/markDeleted() are all SD I/O and must
@@ -1851,6 +2020,7 @@ private:
 	// correct default: the constructor's own loadVoicemailGreeting() call is
 	// the only OTHER writer, and that path always heap-allocates.
 	bool _vmGreetingClipOwned = true;
+	std::atomic<bool> _greetingRefused{false};   // #466: valid greeting, refused a buffer
 	void loadVoicemailGreeting();
 
 	// The boot-selected provider TYPE (cached alongside _anchorClient itself —
@@ -1862,6 +2032,11 @@ private:
 	// _anchorRouteDn as the RING-ALL gate and the DID-mapping lookup key.
 	TelephonyProviderType _anchorBootType = TelephonyProviderType::Loopback;
 	std::string _anchorRouteDn;
+	// Issue #521: telephonyProviderPlacesRealCalls(_anchorBootType), cached in
+	// the constructor next to it. False means the anchor is the loopback
+	// simulator and must never be handed an emergency number. Written only
+	// there and by setAnchorPlacesRealCallsForTest(); read under _mutex.
+	bool _anchorPlacesRealCalls = false;
 
 	// Stage B of the TelephonyAnchorClient port: sends that originate OFF the SIP
 	// receive thread (the CallEvent callback, which runs on the anchor's own WS
@@ -1886,7 +2061,12 @@ private:
 
 	// RequestsHandler.hpp: Issues #24 and #28 resolved.
 	std::unordered_map<std::string, std::function<void(std::shared_ptr<SipMessage> request)>> _handlers;
-	std::unordered_map<std::string, std::shared_ptr<Session>>   _sessions;
+	// std::map with a transparent comparator, not unordered_map (#464): C++17 has
+	// heterogeneous lookup only for ordered containers, so this is what lets
+	// getSession(string_view) find a session WITHOUT building a std::string key --
+	// which it used to do up to three times per request. At POCKETDIAL_MAX_SESSIONS
+	// entries, O(log n) string compares cost nothing measurable.
+	std::map<std::string, std::shared_ptr<Session>, std::less<>> _sessions;
 
 	// Call-IDs of attended-transfer splice re-INVITEs (issue #131) pending their
 	// 200 OK -> ACK, so handleTransferOk() can find them (same bounded-vector
@@ -1923,6 +2103,45 @@ private:
 	// and the shared_ptr in `request` outlives the whole pass.
 	const SipMessage* _passThroughMsg = nullptr;
 
+	// Issue #424: the inbound message of this handle() pass when it is one that
+	// must never be answered, a response (RFC 3261 §17.1) or an ACK (§17.2.1);
+	// null otherwise. drainOutbox() refuses any response addressed back to its
+	// sender in the same transaction (same Call-ID and CSeq), whichever handler
+	// built it. That makes "reply to a response or an ACK" impossible at the one
+	// exit, rather than one handler claim at a time: endHandle()'s not-found
+	// branch did it for an unclaimed 100 Trying (the register beep) and for an
+	// ACK (park retrieve), and it has 35 callers.
+	//
+	// A shared_ptr, unlike _passThroughMsg, because drainOutbox() dereferences
+	// it: a stale one can then only cost a refusal, never a dangling read. It is
+	// reset after handle()'s drain and at the top of every other drain path.
+	std::shared_ptr<SipMessage> _noReplyInbound;
+	// Refuses (and counts, and logs) `msg` if it is a reply to _noReplyInbound.
+	bool isReplyToUnanswerable(const sockaddr_in& addr, const SipMessage& msg);
+
+	// #424 review (Sonny-OG): a RELAYED response is exempt by marking, never by
+	// address. The address can't tell them apart: a multi-line handset (the T29
+	// on .244) registers every line from one IP:port, so on a line1 -> line2 call
+	// the callee's relayed 200 goes to the very address it came from, with the
+	// same Call-ID and CSeq, and is byte-for-byte a "reply" except for intent.
+	// Relays are exempt when they are the inbound object itself (pointer
+	// identity, as for _passThroughMsg) or were marked by markRelay() -- which
+	// endHandle()'s found branch does for every message it forwards, cloned or
+	// not. Reset on every handle() pass. Raw pointers, compared only.
+	//
+	// Fixed capacity, no allocation. A pass that marks more than this many
+	// relays (none does today: a response is relayed to one leg) sets the
+	// overflow flag, and drainOutbox() then refuses nothing for that pass and
+	// logs it: dropping a real relay kills a call, while a missed refusal is
+	// only the pre-#424 behaviour.
+	static constexpr size_t kRelayMarkSlots = 8;
+	std::array<const SipMessage*, kRelayMarkSlots> _relayMarks{};
+	size_t _relayMarkCount = 0;
+	bool   _relayMarkOverflow = false;
+	void markRelay(const SipMessage* msg);
+	bool isMarkedRelay(const SipMessage* msg) const;
+	void clearRelayMarks();
+
 	// ── RFC 4733 DTMF hand-off ring ─────────────────────────────────────────────
 	// Producer: any RTP receive task (one per conference leg / anchor bridge).
 	// Consumer: the SIP thread, via drainDtmfInbox() from handle() and tick().
@@ -1958,7 +2177,13 @@ private:
 
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
+	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
+	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
+	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
+	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
+	std::atomic<uint32_t> _optionsPingTruncated{0};   // #463: see getOptionsPingTruncated()
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
 	// count is the packet-loss signal this layer exists to absorb, so it is worth
@@ -1992,6 +2217,10 @@ private:
 		uint64_t packetsDropped = 0;
 	};
 	RegistrarSnapshot _snapshot;
+	// #463: tick() refills this in place and swaps its tables into _snapshot, so
+	// an unchanged dashboard costs no allocation. Touched only by tick(), under
+	// _mutex -- never read by anything else.
+	RegistrarSnapshot _snapshotScratch;
 	std::mutex _snapshotMutex;
 
 	// CDR ring buffer (Phase 2) now lives on CdrRing.hpp — data, NVS persistence,
