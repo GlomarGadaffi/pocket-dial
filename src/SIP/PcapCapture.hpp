@@ -30,7 +30,10 @@
 #include <ws2tcpip.h>
 #endif
 
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -38,19 +41,20 @@
 
 #include "SipWireUtil.hpp"
 
-// Number of recent SIP packets retained for /api/pcap. Each entry costs
-// roughly the size of the SIP message it captured (a few hundred bytes to
-// ~1.5 KB for an INVITE+SDP) rather than a fixed slot, so — unlike the object
-// pools in PoolConfig.hpp — this bounds *count*, not a static footprint.
-// Compile-time tunable (-DPOCKETDIAL_PCAP_RING_SIZE=N); lower it to claw back
-// RAM on a constrained node.
+// Number of recent SIP packets retained for /api/pcap. Compile-time tunable
+// (-DPOCKETDIAL_PCAP_RING_SIZE=N); lower it to claw back RAM on a constrained node.
 //
-// Issue #101(D): the ring still grows lazily, but it no longer shrinks — once a
-// slot has been used its buffer is recycled for the next packet to land there
-// rather than freed. So the high-water mark is what a busy node settles at, and
-// the steady-state capture path allocates nothing. Capture is unconditional
-// (there is no enable flag; see the record() sites in RequestsHandler), which is
-// what makes that worth doing rather than a micro-optimization.
+// Issue #416: the ring is a fixed-size array of fixed-size slots, part of the
+// owning object, so recording a packet never allocates (desmo's no-allocation-
+// after-init rule). It used to grow lazily and let each slot's std::string ratchet
+// up to the largest message it had held, in small internal-DRAM allocations on the
+// SIP hot path. Footprint is now exactly
+//   POCKETDIAL_PCAP_RING_SIZE x sizeof(Entry)  ~= 16 x 2.1 KB ~= 33.7 KB
+// and it lives wherever the owner does. On S3 builds that is inside the
+// heap-allocated SipServer (esp_main.cpp `new SipServer`), far above
+// CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, so PSRAM. A build without PSRAM pays it
+// in internal DRAM, which is why the SIP_CONSTRAINED profile (main/CMakeLists.txt)
+// drops the ring to 4 slots, ~8.4 KB.
 // 16, not 64 (#328 follow-up). #278 measured this ring holding **~52 KB of
 // internal DRAM at steady state** on .244 at 64 slots, and confirmed that
 // shrinking it conserved 91% of the drain -- but it fixed only the override
@@ -74,60 +78,55 @@
 #define POCKETDIAL_PCAP_RING_SIZE 16
 #endif
 
+// Bytes kept per captured message. Default = UdpServer::BUFFER_SIZE, the largest
+// datagram the parser can ever be handed (static_asserted in SipServer.cpp), so an
+// inbound message is never truncated. Longer messages, which can only be ones this
+// server built itself, are truncated and flagged: the pcap record's orig_len and
+// the IP/UDP length fields keep the real size, as a snaplen-limited capture would.
+#ifndef POCKETDIAL_PCAP_SLOT_BYTES
+#define POCKETDIAL_PCAP_SLOT_BYTES 2048
+#endif
+
 class PcapCapture
 {
 public:
+	static constexpr std::size_t kRingSize = POCKETDIAL_PCAP_RING_SIZE;
+	static constexpr std::size_t kSlotBytes = POCKETDIAL_PCAP_SLOT_BYTES;
+	static_assert(kRingSize > 0, "POCKETDIAL_PCAP_RING_SIZE must be at least 1 (claim() indexes modulo it)");
+	static_assert(kSlotBytes > 0, "POCKETDIAL_PCAP_SLOT_BYTES must be at least 1");
+
 	// Record one SIP message. `outbound` is from the server's own perspective:
 	// false for something received from `peer`, true for something sent to
 	// `peer`. Not internally synchronized — callers capture under whatever lock
 	// already guards the call site (RequestsHandler captures under its own
 	// _mutex, the same lock guarding everything else a packet touches).
+	// Allocation-free: copies at most kSlotBytes into the evicted slot.
 	void record(bool outbound, const sockaddr_in& peer, std::string_view bytes)
 	{
-		recordInto(outbound, peer).assign(bytes.data(), bytes.size());
+		Entry& e = claim(outbound, peer);
+		const std::size_t kept = std::min(bytes.size(), kSlotBytes);
+		if (kept > 0) std::memcpy(e.bytes.data(), bytes.data(), kept);   // an empty view's data() may be null
+		e.len     = kept;
+		e.origLen = bytes.size();
 	}
 
-	// Issue #101(D): as record(), but hands back the entry's byte buffer for the
-	// caller to serialize straight into instead of making it materialize a
-	// temporary std::string first. Both capture sites are on the SIP hot path and
-	// run under RequestsHandler::_mutex, and capture is unconditional, so that
-	// temporary was a malloc/free per packet inside the critical section — on top
-	// of the one this class used to do copying it in.
-	//
-	// The returned buffer is empty but keeps whatever capacity the evicted entry
-	// had, so once the ring has filled — the steady state — recording a packet
-	// allocates nothing at all. The reference is valid until the next
-	// recordInto()/record()/clear().
-	std::string& recordInto(bool outbound, const sockaddr_in& peer)
+	// As record(), for a caller that serializes straight into the slot instead of
+	// materializing the message first. `fill(char* buf, std::size_t cap)` must write
+	// at most `cap` bytes and return the message's FULL length (snprintf-style), so
+	// truncation is detected, not silent. See SipMessage::serializeInto().
+	template <typename Fill>
+	void recordWith(bool outbound, const sockaddr_in& peer, Fill&& fill)
 	{
-		Entry* slot;
-		if (_entries.size() < POCKETDIAL_PCAP_RING_SIZE)
-		{
-			// Still filling: grow by one. The ring is deliberately grown lazily
-			// rather than reserved up front, so a node that never sees traffic
-			// never pays for slots it has not used (see the sizing note above).
-			_entries.emplace_back();
-			slot = &_entries.back();
-		}
-		else
-		{
-			// Full: overwrite the oldest entry in place and advance the ring head.
-			// No pop/push, so nothing is freed and nothing is allocated.
-			slot = &_entries[_head];
-			_head = (_head + 1) % _entries.size();
-		}
-		slot->seq      = _nextSeq++;
-		slot->outbound = outbound;
-		slot->peer     = peer;
-		slot->tsUs     = monotonicUs();
-		slot->bytes.clear();   // clear() keeps capacity; assign()/append() reuse it
-		return slot->bytes;
+		Entry& e = claim(outbound, peer);
+		const std::size_t full = fill(e.bytes.data(), kSlotBytes);
+		e.len     = std::min(full, kSlotBytes);
+		e.origLen = full;
 	}
 
-	std::size_t size() const { return _entries.size(); }
+	std::size_t size() const { return _count; }
 	void clear()
 	{
-		_entries.clear();
+		_count = 0;
 		_head = 0;
 	}
 
@@ -135,27 +134,28 @@ public:
 	// tracer, which polls GET /api/trace and appends whatever it hasn't already
 	// shown (`seq` is monotonic and never reused, so the client can track a
 	// high-water mark instead of the server tracking per-client state).
-	// cppcheck flags the scalar members below (uninitMemberVarNoCtor). False
-	// positive: TraceRecord is a plain aggregate, and its one construction
-	// site (traceRecords() below) always brace-initialises every field.
+	// Every scalar has a default member initializer, so a default-constructed
+	// record is fully defined and cppcheck's uninitMemberVarNoCtor has nothing to
+	// flag. Still an aggregate (C++14+), so traceRecords()' brace-init works.
 	struct TraceRecord
 	{
-		// cppcheck-suppress uninitMemberVarNoCtor
-		uint64_t    seq;
-		// cppcheck-suppress uninitMemberVarNoCtor
-		uint64_t    tsUs;
-		// cppcheck-suppress uninitMemberVarNoCtor
-		bool        outbound;
+		uint64_t    seq      = 0;
+		uint64_t    tsUs     = 0;
+		bool        outbound = false;
 		std::string peer;   // "ip:port", via sipwire::addrToIpPort
 		std::string text;
+		// True when the message was longer than kSlotBytes and `text` holds only
+		// its first kSlotBytes bytes.
+		bool        truncated = false;
 	};
 	std::vector<TraceRecord> traceRecords() const
 	{
 		std::vector<TraceRecord> out;
-		out.reserve(_entries.size());
+		out.reserve(_count);
 		forEachOldestFirst([&out](const Entry& e) {
 			out.push_back(TraceRecord{e.seq, e.tsUs, e.outbound,
-				sipwire::addrToIpPort(e.peer), e.bytes});
+				sipwire::addrToIpPort(e.peer), std::string(e.bytes.data(), e.len),
+				e.truncated()});
 		});
 		return out;
 	}
@@ -166,7 +166,7 @@ public:
 	std::string toPcapFile(const std::string& localIp, uint16_t localPort) const
 	{
 		std::string out;
-		out.reserve(24 + _entries.size() * 128);
+		out.reserve(24 + _count * 128);
 
 		// Global header. LE container (magic 0xa1b2c3d4 written little-endian);
 		// LINKTYPE_ETHERNET = 1.
@@ -185,51 +185,68 @@ public:
 			const uint32_t sec  = static_cast<uint32_t>(e.tsUs / 1000000ULL);
 			const uint32_t usec = static_cast<uint32_t>(e.tsUs % 1000000ULL);
 			const uint32_t len  = static_cast<uint32_t>(frame.size());
+			const uint32_t orig = static_cast<uint32_t>(frame.size() - e.len + e.origLen);
 			appendU32LE(out, sec);
 			appendU32LE(out, usec);
-			appendU32LE(out, len);   // incl_len
-			appendU32LE(out, len);   // orig_len: never truncated, so equal
+			appendU32LE(out, len);    // incl_len: what this capture holds
+			appendU32LE(out, orig);   // orig_len: larger when the slot truncated it
 			out.append(frame);
 		});
 		return out;
 	}
 
 private:
-	// cppcheck flags the scalar members below (uninitMemberVarNoCtor). False
-	// positive: recordInto() above is Entry's only populator, and every field
-	// (seq/outbound/peer/tsUs) is assigned there immediately after the
-	// emplace_back()/reuse that default-constructs the slot, before any of
-	// them is ever read.
 	struct Entry
 	{
-		// cppcheck-suppress uninitMemberVarNoCtor
-		uint64_t    seq;
-		// cppcheck-suppress uninitMemberVarNoCtor
-		bool        outbound;
-		sockaddr_in peer;
-		std::string bytes;
-		// cppcheck-suppress uninitMemberVarNoCtor
-		uint64_t    tsUs;
+		uint64_t    seq      = 0;
+		uint64_t    tsUs     = 0;
+		sockaddr_in peer{};
+		std::size_t len      = 0;   // bytes held in `bytes`
+		std::size_t origLen  = 0;   // the message's real length; > len when truncated
+		bool        outbound = false;
+		std::array<char, kSlotBytes> bytes{};
+
+		bool truncated() const { return origLen > len; }
 	};
-	// Ring buffer. Grows to POCKETDIAL_PCAP_RING_SIZE and then stops: entries are
-	// overwritten in place, so storage order stops matching capture order once it
-	// wraps. `_head` is the index of the OLDEST entry (0 while still filling);
-	// everything that reads the ring goes through forEachOldestFirst().
-	std::vector<Entry> _entries;
-	std::size_t _head = 0;
+	// Fixed ring. `_head` is the index of the OLDEST entry and `_count` how many are
+	// live; storage order stops matching capture order once it wraps, so everything
+	// that reads the ring goes through forEachOldestFirst().
+	std::array<Entry, kRingSize> _entries{};
+	std::size_t _head  = 0;
+	std::size_t _count = 0;
 	// Monotonic, never reused (even across evictions) so a client's high-water
 	// mark from traceRecords() stays meaningful after older entries roll off.
 	uint64_t _nextSeq = 0;
 
-	// Oldest-to-newest traversal. While the ring is still filling `_head` is 0 and
-	// this is plain in-order iteration; after it wraps it walks from `_head`.
+	// Claims the next slot (the oldest one once the ring is full) and stamps its
+	// metadata. Pure index arithmetic: nothing is freed or allocated.
+	Entry& claim(bool outbound, const sockaddr_in& peer)
+	{
+		Entry* slot;
+		if (_count < kRingSize)
+		{
+			slot = &_entries[(_head + _count) % kRingSize];
+			++_count;
+		}
+		else
+		{
+			slot = &_entries[_head];
+			_head = (_head + 1) % kRingSize;
+		}
+		slot->seq      = _nextSeq++;
+		slot->outbound = outbound;
+		slot->peer     = peer;
+		slot->tsUs     = monotonicUs();
+		return *slot;
+	}
+
+	// Oldest-to-newest traversal.
 	template <typename F>
 	void forEachOldestFirst(F&& fn) const
 	{
-		const std::size_t n = _entries.size();
-		for (std::size_t i = 0; i < n; ++i)
+		for (std::size_t i = 0; i < _count; ++i)
 		{
-			fn(_entries[(_head + i) % n]);
+			fn(_entries[(_head + i) % kRingSize]);
 		}
 	}
 
@@ -285,7 +302,7 @@ private:
 	static std::string frameFor(const Entry& e, uint32_t localAddr, uint16_t localPort)
 	{
 		std::string frame;
-		frame.reserve(14 + 20 + 8 + e.bytes.size());
+		frame.reserve(14 + 20 + 8 + e.len);
 
 		// Ethernet (14 bytes): locally-administered dummy MACs — the link layer
 		// carries no real information here — then EtherType IPv4.
@@ -300,7 +317,11 @@ private:
 		const uint16_t srcPort = e.outbound ? localPort : ntohs(e.peer.sin_port);
 		const uint16_t dstPort = e.outbound ? ntohs(e.peer.sin_port) : localPort;
 
-		const uint16_t udpLen     = static_cast<uint16_t>(8 + e.bytes.size());
+		// Header lengths describe the ORIGINAL message, as in a snaplen-limited
+		// capture; only e.len payload bytes follow. Clamped to what a UDP datagram
+		// can carry so a pathological origLen cannot wrap the 16-bit fields.
+		const std::size_t wireLen = std::min<std::size_t>(e.origLen, 65535u - 28u);
+		const uint16_t udpLen     = static_cast<uint16_t>(8 + wireLen);
 		const uint16_t ipTotalLen = static_cast<uint16_t>(20 + udpLen);
 
 		// IPv4 header (20 bytes, no options).
@@ -328,7 +349,7 @@ private:
 		appendU16BE(frame, dstPort);
 		appendU16BE(frame, udpLen);
 		appendU16BE(frame, 0);
-		frame.append(e.bytes);
+		frame.append(e.bytes.data(), e.len);
 
 		return frame;
 	}
