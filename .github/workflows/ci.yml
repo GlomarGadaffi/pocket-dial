@@ -1,22 +1,24 @@
 name: ESP32 Pocket-Dial Firmware CI
 
 on:
-  # Both filters are '**' (every branch) rather than an explicit allowlist.
-  # This block hadn't been touched since the file was first added (2026-06-01,
-  # git blame), predating this repo's actual branch conventions -- push's old
-  # 'feature/**' glob never matched a real branch (this repo uses feat/, fix/,
-  # docs/, and assorted ad-hoc names) and pull_request's [main, master] meant a
-  # PR based on an unmerged feat/** branch (a stacked PR) got NO CI at all: no
-  # host tests, no cppcheck, nothing, and `gh pr checks` just reports "no
-  # checks reported" instead of erroring. Bit us for real on #242. A whitelist
-  # of prefixes drifts again the next time someone invents a new one (see
-  # ci-perf-lints/, claude/, embedded-fixes/, phase2-polish/ in history) --
-  # '**' can't go stale. push and pull_request firing on the same branch
-  # double-runs CI for a normal PR; that costs runner minutes, not signal.
+  # pull_request on EVERY base branch ('**'), push on main ONLY.
+  #
+  # pull_request '**' keeps the #242 fix: a PR based on an unmerged branch (a
+  # stacked PR) still gets full CI. The old [main, master] filter gave those
+  # none. An allowlist of prefixes would drift, so this stays '**'.
+  #
+  # push is main-only because push '**' ran the ENTIRE matrix a second time
+  # for every commit on every PR branch (push run + pull_request run, same
+  # SHA, same jobs). On the free plan the limit is concurrent jobs, not
+  # minutes (public repo), and on 2026-09-24 six open PRs x ~25 jobs x 2
+  # saturated it, stalling the merge queue for hours. push on main still
+  # gives main its own post-merge status. A branch with no PR yet gets no
+  # CI until one is opened; open a draft PR to get it.
+  #
   # Neither filter matches tag pushes (no `tags:` key here), so this stays
   # disjoint from release.yml's tags-only trigger.
   push:
-    branches: [ '**' ]
+    branches: [ main ]
   pull_request:
     branches: [ '**' ]
   workflow_dispatch:
@@ -42,6 +44,25 @@ on:
     # CAN listen for `edited`/retargets without dragging the entire
     # firmware build matrix + host tests along on every PR title/body
     # edit, which happens far more often than a base retarget does).
+
+# Issue #423: a new push to a PR cancels that PR's previous, now-superseded
+# run instead of letting its whole matrix finish for nothing.
+#
+# - pull_request runs group per PR NUMBER, and cancel only on `synchronize`,
+#   which always means a new head SHA. So a cancelled run is always on a
+#   superseded SHA, never on the PR's current head. That matters: branch
+#   protection reads EVERY check run with a required name on the head SHA, and
+#   a cancelled copy there blocks the merge (#427). `reopened` re-runs the
+#   same SHA, so it never cancels anything.
+# - push (main only) and workflow_dispatch group per SHA. Per REF would be
+#   wrong even without cancel-in-progress: GitHub keeps at most one PENDING
+#   run per group and silently cancels older pending ones, so back-to-back
+#   merges would lose main's post-merge status.
+# - The HIL job's own job-level `concurrency: glolab-board-244` (exclusive
+#   board) composes with this and is untouched; it runs on dispatch only.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
 
 jobs:
   # Job 1: Build and simulate the host desktop application, run static analysis and unit/smoke tests.
@@ -171,36 +192,10 @@ jobs:
           cmake --install cppcheck-build
 
       - name: Run Static Analysis (cppcheck)
-        # On the Sdp.cpp suppression below: that file is re2c OUTPUT (issue
-        # #196). It is never hand-edited and is drift-checked against Sdp.re,
-        # so a finding in it cannot be fixed in place -- any edit would just be
-        # reverted by the next regeneration and flagged as drift.
-        #
-        # The finding itself is benign codegen: the generated DFA walks its
-        # input by incrementing a by-value `const char* YYCURSOR` parameter,
-        # which cppcheck reports as uselessAssignmentPtrArg -- an assignment to
-        # a pointer parameter with no effect outside the function. Literally
-        # true and beside the point: the caller wants the returned token, not
-        # the final cursor position.
-        #
-        # Scoped to that ONE check on that ONE file, deliberately, rather than
-        # the blanket `--suppress=*:<path>` used for qrcode.c below. Generated
-        # code can still contain findings worth acting on; silencing the whole
-        # file would hide them permanently.
-        run: |
-          export PATH="$HOME/cppcheck-install/bin:$PATH"
-          cppcheck --version
-          cppcheck --error-exitcode=1 \
-                   --enable=warning,performance \
-                   --inline-suppr \
-                   --suppress=missingIncludeSystem \
-                   --suppress=unmatchedSuppression \
-                   --suppress=*:main/ui/qrcode.c \
-                   --suppress=*:main/ui/qrcode.h \
-                   --suppress=unknownMacro:main/ui/ui.cpp \
-                   --suppress=uselessAssignmentPtrArg:src/SIP/Sdp.cpp \
-                   -I src/Helpers -I src/SIP -I main \
-                   src/ main/
+        # The invocation and its suppressions (including why Sdp.cpp is
+        # suppressed) live in tools/ci/run_cppcheck.sh, shared with the
+        # other workflow so the two gates can't drift apart again.
+        run: bash tools/ci/run_cppcheck.sh
 
       - name: Cache pinned re2c build
         id: re2c-cache
@@ -360,13 +355,32 @@ jobs:
           echo "================================================================"
 
       - name: Run Unit Test Suite (GoogleTest via CTest)
+        env:
+          # gtest writes one JSON report per test binary into this directory
+          # (#390). The count check below reads it; the tests run once.
+          GTEST_OUTPUT: json:${{ github.workspace }}/build/gtest-reports/
         run: |
           # The sip_parser_tests target is registered with CTest in
           # tests/CMakeLists.txt. Because the root CMakeLists.txt enables testing
           # only inside the tests/ subdirectory, the CTest test set lives at
           # build/tests (not the build root) — so we point ctest there. ctest
           # returns non-zero on any test failure, which FAILS this step (the gate).
+          # Start from an empty report dir so the count below can only ever
+          # read THIS run's reports, never a stale one.
+          rm -rf build/gtest-reports
           ctest --test-dir build/tests --output-on-failure
+
+      - name: Self-test the test-count checker (#467)
+        run: python3 -m unittest discover -s tests/tools -p 'test_check_test_count.py' -v
+
+      - name: Verify Test Count (floor = tests/EXPECTED_MIN_TESTS + tests/min_tests.d)
+        run: |
+          # ctest counts the whole gtest suite as ONE test ("0 tests failed out
+          # of 1"), so it cannot tell 1235 passing tests from 12 (#390). This
+          # prints how many actually ran and fails below the floor: the base
+          # plus one contribution file per PR (#467), so PRs never conflict
+          # over one number. Fails closed: a missing report is a failure.
+          python3 tests/tools/check_test_count.py build/gtest-reports
 
       # The T-7 call-graph guard used to run here. It is its own job now
       # (callgraph-guard, below) -- see the note there.

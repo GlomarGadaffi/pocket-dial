@@ -101,6 +101,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/UdpServer.cpp"
                             "../src/Helpers/HttpServer.cpp"
                             "../src/Helpers/AdminAuth.cpp"
+                            # Issue #382: read-back of the panic handler's flash coredump.
+                            "../src/Helpers/CoreDumpStore.cpp"
                             "../src/Helpers/DeviceConfig.cpp"
                             "../src/Helpers/SipDigest.cpp"
                             "../src/Helpers/SipSecretStore.cpp"
@@ -203,7 +205,11 @@ idf_component_register(SRCS ${MAIN_SRC}
                     # detail of one .cpp, not part of anything main exposes -- but it does
                     # have to be declared, or esp_pthread.h is simply not on the include
                     # path and the ESP build fails where the host build cannot.
-                    PRIV_REQUIRES esp_wifi pthread)
+                    # Issue #382: CoreDumpStore.cpp reads the coredump partition
+                    # (esp_core_dump.h, esp_flash.h). Same reasoning as pthread above.
+                    # Issue #420: bootloader_support for bootloader_random.h (the eth
+                    # app_mains leave the SAR ADC entropy source on).
+                    PRIV_REQUIRES esp_wifi pthread espcoredump spi_flash bootloader_support)
 
 # Issue #49: the display transport reserves Core 1 for the LVGL graphics task and
 # runs the SIP engine on Core 0, so the UDP receiver (which carries SIP signaling)
@@ -251,7 +257,15 @@ if(SIP_CONSTRAINED)
         POCKETDIAL_MAX_CLIENTS=8
         POCKETDIAL_MAX_SESSIONS=4
         POCKETDIAL_MSG_POOL=8)
-    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8)")
+    # #416: the pcap ring is fixed storage (ring x ~2.1 KB), and a constrained build
+    # has no PSRAM (sdkconfig.defaults.esp32_constrained: CONFIG_SPIRAM=n), so all of
+    # it is internal DRAM. 4 slots ~= 8.4 KB instead of 16 ~= 33.7 KB. Set as a CMake
+    # variable, not a define, so an explicit -D POCKETDIAL_PCAP_RING_SIZE still wins
+    # and the plumbing below prints what took effect.
+    if(NOT DEFINED POCKETDIAL_PCAP_RING_SIZE)
+        set(POCKETDIAL_PCAP_RING_SIZE 4)
+    endif()
+    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 pcap=${POCKETDIAL_PCAP_RING_SIZE})")
 endif()
 
 # PcapCapture.hpp has always advertised itself as "compile-time tunable
@@ -262,14 +276,37 @@ endif()
 # to the control, onset does not move, and the honest-looking conclusion is
 # "the ring is not the cause." Plumbed here so the claim in the header is true.
 #
-# The ring holds the full bytes of the largest SIP message each slot has ever
-# seen, in internal DRAM, and capture is unconditional. Measured on .244 at
-# 64 slots: ~52 KB held at steady state (#278).
+# #416: the ring is now fixed storage, POCKETDIAL_PCAP_RING_SIZE x ~2.1 KB,
+# allocated with RequestsHandler (PSRAM on S3 builds, internal DRAM without
+# PSRAM). Before #416 it grew lazily in internal DRAM; measured on .244 at 64
+# slots: ~52 KB held at steady state (#278).
+# Issue #395: BENCH-ONLY rollback probe image for tools/ota/remote_ota.sh stage 4
+# (never marks itself valid; restarts itself while pending). Never ship it.
+if(POCKETDIAL_OTA_ROLLBACK_PROBE)
+    # The probe lives only in esp_main_eth.cpp's health gate. On any other transport the
+    # define would be silently ignored, the image would mark itself valid, and stage 4
+    # would end in "needs recovery" (Globox, #491 review) -- so refuse the build.
+    if(NOT SIP_TRANSPORT STREQUAL "eth")
+        message(FATAL_ERROR "POCKETDIAL_OTA_ROLLBACK_PROBE is only implemented for SIP_TRANSPORT=eth "
+                            "(esp_main_eth.cpp); got '${SIP_TRANSPORT}'")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_OTA_ROLLBACK_PROBE=1)
+    message(WARNING "SipServer: OTA ROLLBACK PROBE image -- bench only, it never marks itself valid (#395)")
+endif()
+
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         POCKETDIAL_PCAP_RING_SIZE=${POCKETDIAL_PCAP_RING_SIZE})
     # Printed so the build log PROVES the override took. Do not remove: without
     # it, the only way to tell a real result from a failed override is to go
     # reading compile_commands.json after the fact.
-    message(STATUS "SipServer: pcap ring size OVERRIDDEN to ${POCKETDIAL_PCAP_RING_SIZE} (default 64)")
+    message(STATUS "SipServer: pcap ring size OVERRIDDEN to ${POCKETDIAL_PCAP_RING_SIZE} (default 16)")
+endif()
+# Same plumbing for the per-slot byte budget (#416). Must stay >= UdpServer::
+# BUFFER_SIZE (2048): SipServer.cpp static_asserts it, so a smaller value fails
+# the build instead of silently truncating inbound messages.
+if(DEFINED POCKETDIAL_PCAP_SLOT_BYTES)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        POCKETDIAL_PCAP_SLOT_BYTES=${POCKETDIAL_PCAP_SLOT_BYTES})
+    message(STATUS "SipServer: pcap slot size OVERRIDDEN to ${POCKETDIAL_PCAP_SLOT_BYTES} bytes (default 2048)")
 endif()

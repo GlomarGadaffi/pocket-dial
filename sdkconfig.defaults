@@ -149,6 +149,25 @@ CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 # than a jump. The code-size cost is a few percent on the parser TUs only.
 CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
 
+# ── Coredump to flash (Issue #382) ─────────────────────────────────────────
+# Every panic used to be a one-shot that existed only if someone happened to be
+# recording serial (#370's only panic was lost that way). With this on, the panic
+# handler writes an ELF coredump to the `coredump` partition (partitions.csv /
+# partitions_4mb.csv) and the board reboots as before; read it back with
+# espcoredump.py against the SAME ELF (see docs/COREDUMP.md).
+#
+# IDF 6 has no format/checksum choice left: ESP_COREDUMP_ENABLE selects ELF +
+# SHA256 itself, so this one line is the whole configuration. PSRAM task stacks
+# (PD_TASK_STACK_CAPS) are captured -- the Kconfig help text saying otherwise is
+# stale; FREERTOS_TASK_CREATE_ALLOW_EXT_MEM makes IDF run the dump on its own
+# 1792-byte DRAM stack (ESP_COREDUMP_USE_STACK_SIZE) instead.
+#
+# SIZE IS ALL-OR-NOTHING: a dump larger than the partition is not truncated,
+# it is abandoned (esp_core_dump_flash_write_prepare -> ESP_ERR_NO_MEM, "Not
+# enough space to save core dump!" on UART only). Size the partition from a
+# measured dump, not an estimate.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+
 # ── Telephony WAN anchor: socket pool + TLS session resumption ──────────────
 # TelephonyAnchorClient (ported from drawbridge) opens 3 persistent TLS sockets
 # regardless of call count (control WS + ctrl POST + status GET) plus +2 per

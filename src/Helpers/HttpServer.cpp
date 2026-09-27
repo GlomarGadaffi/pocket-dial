@@ -8,6 +8,7 @@
 #include "CallDetailRecord.hpp"
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive wipe on factory reset
 #include "AdminAuth.hpp"
+#include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
 #include "DeviceConfig.hpp"
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
@@ -41,6 +42,7 @@
 #include "JsonReader.hpp"    // strict, dependency-free JSON reader for /api/config/import
 #include <cctype>
 #include <cstdlib>
+#include <mutex>
 #include <cstring>
 #include <sstream>
 #include <iostream>
@@ -198,6 +200,16 @@ void HttpServer::start()
 
 void HttpServer::acceptLoop()
 {
+	// Issue #382: checksum + summarise any stored coredump ONCE, here -- this
+	// thread runs on the 8192-byte pthread default (it never resizes itself,
+	// see below), unlike the 4 KB per-connection threads /api/coredump/info is
+	// served on (#405 measured those down to 472 bytes free). start() itself
+	// is the wrong place: the display build calls it from app_main's 3.5 KB
+	// stack. Costs the first accept one checksum walk over at most 128 KB.
+	// It also caches the presence probe itself (#405): after this, /api/status
+	// and the coredump routes never touch the partition per request.
+	CoreDumpStore::prime();
+
 #if defined(ESP_PLATFORM)
 	// Issue #366. esp_pthread_set_cfg() applies to threads created BY THE
 	// CALLING THREAD, and this one creates nothing except the per-connection
@@ -748,6 +760,37 @@ void HttpServer::handleClient(int clientSock)
 			sendApiPcap(clientSock);
 		}
 	}
+	else if (req.method == "GET" && req.path == "/api/coredump/info")
+	{
+		// Issue #382: which task panicked, at what PC, from which ELF. Gated like
+		// /api/pcap -- a PC and task name are diagnostic detail, not login-form
+		// material (THREAT_MODEL.md section 4 E-2).
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiCoreDumpInfo(clientSock);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/api/coredump")
+	{
+		// Issue #382: the raw dump. Owner-gated, the same tier as config export
+		// WITH secrets (#173): a coredump is a copy of task stacks at the moment
+		// of the panic, and a stack can hold a digest secret, an OAuth token or a
+		// TLS session key as easily as a return address. Like every #173 owner
+		// action, a sysop passes while NO owner account exists yet
+		// (AdminAuth::sessionSatisfiesRole's no-owner fallback).
+		if (requireAdmin(clientSock, req, false, AdminAuth::Role::Owner))
+		{
+			sendApiCoreDump(clientSock);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/coredump/erase")
+	{
+		// Mutating (destroys evidence), so CSRF-checked like every other POST.
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiCoreDumpErase(clientSock);
+		}
+	}
 	else if (req.method == "GET" && req.path == "/api/trace")
 	{
 		// Same sensitivity/gate as /api/pcap — this is the same capture ring.
@@ -1150,10 +1193,45 @@ void HttpServer::sendResponseWithHeader(int sock, int statusCode, const std::str
                               const std::string& contentType, const std::string& body,
                               const std::string& extraHeader)
 {
+	// Assembled through an ostringstream exactly as before the streamed coredump
+	// download (#382) split buildResponseHead() out. A plain `head += body`
+	// made CodeQL newly trace emailConfigJson() -- whose secrets leave only as
+	// hasPassword/hasGsaKey booleans (#207) -- to this send as "cleartext
+	// transmission of sensitive information" (a false positive on PR #394).
+	// Keeping main's shape keeps this change out of every other route.
+	std::ostringstream resp;
+	resp << buildResponseHead(statusCode, statusText, contentType, body.size(), extraHeader) << body;
+	const std::string data = resp.str();
+	sendAllBytes(sock, data.data(), data.size());
+}
+
+bool HttpServer::sendAllBytes(int sock, const char* ptr, size_t remaining)
+{
+	while (remaining > 0)
+	{
+#if defined _WIN32 || defined _WIN64
+		int sent = ::send(sock, ptr, static_cast<int>(remaining), 0);
+#else
+		int sent = static_cast<int>(::send(sock, ptr, remaining, 0));
+#endif
+		if (sent <= 0) return false;
+		ptr += sent;
+		remaining -= static_cast<size_t>(sent);
+	}
+	return true;
+}
+
+// Status line + every header + the blank line, for a body of contentLength
+// bytes. Shared by sendResponseWithHeader() and the streamed coredump download
+// so the security headers below stay emitted in exactly one place.
+std::string HttpServer::buildResponseHead(int statusCode, const std::string& statusText,
+                              const std::string& contentType, size_t contentLength,
+                              const std::string& extraHeader)
+{
 	std::ostringstream resp;
 	resp << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n";
 	resp << "Content-Type: " << contentType << "\r\n";
-	resp << "Content-Length: " << body.size() << "\r\n";
+	resp << "Content-Length: " << contentLength << "\r\n";
 	// No Access-Control-Allow-Origin header: wildcard CORS would allow any
 	// browser tab on the same AP to fire side-effecting POSTs without a preflight.
 
@@ -1181,22 +1259,7 @@ void HttpServer::sendResponseWithHeader(int sock, int statusCode, const std::str
 	}
 	resp << "Connection: close\r\n";
 	resp << "\r\n";
-	resp << body;
-
-	std::string data = resp.str();
-	const char* ptr = data.c_str();
-	size_t remaining = data.size();
-	while (remaining > 0)
-	{
-#if defined _WIN32 || defined _WIN64
-		int sent = ::send(sock, ptr, static_cast<int>(remaining), 0);
-#else
-		int sent = static_cast<int>(::send(sock, ptr, remaining, 0));
-#endif
-		if (sent <= 0) break;
-		ptr += sent;
-		remaining -= static_cast<size_t>(sent);
-	}
+	return resp.str();
 }
 
 void HttpServer::sendResponse(int sock, int statusCode, const std::string& statusText,
@@ -1423,6 +1486,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	uint64_t packets = 0;
 	uint64_t dropped = 0;
 	unsigned anchorRetiredSlots = 0;
+	uint64_t droppedInvalid = 0;   // Issue #430
+	uint64_t droppedRate = 0;
 
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
 	if (handler != nullptr)
@@ -1438,6 +1503,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		packets = handler->getPacketsProcessed();
 		dropped = handler->getPacketsDropped();   // Issue #38
 		anchorRetiredSlots = handler->getAnchorRetiredSlots();   // #421
+		droppedInvalid = handler->getDroppedInvalid();
+		droppedRate = handler->getDroppedRate();
 	}
 
 	std::string displayIp = _ip;
@@ -1466,6 +1533,49 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// #421: anchor call slots retired until reboot. Non-zero means reduced anchor
 	// capacity; equal to the max means every anchored call is refused with 503.
 	json << "\"anchorRetiredSlots\":" << anchorRetiredSlots << ",";
+	// Issue #430: the same drops by reason (they sum to packetsDropped, modulo a
+	// race between the loads), then the most recent ones. Like the roster below
+	// (#207), the per-drop source addresses and bytes need a session; the counts
+	// do not.
+	json << "\"droppedInvalid\":" << droppedInvalid << ",";
+	json << "\"droppedRate\":" << droppedRate << ",";
+	json << "\"recentDrops\":[";
+	if (authenticated && handler != nullptr)
+	{
+		// One Record on the stack at a time, no allocation, and the probe's lock
+		// is held only for each copy, never across the formatting (DropProbe.hpp).
+		const DropProbe& probe = handler->getDropProbe();
+		uint32_t first = 0, end = 0;
+		probe.window(first, end);
+		bool any = false;
+		for (uint32_t seq = first; seq != end; ++seq)
+		{
+			DropProbe::Record d;
+			if (!probe.at(seq, d)) continue;   // evicted since window()
+			static const char kHex[] = "0123456789abcdef";
+			char head[2 * DropProbe::kHeadBytes + 1];
+			const size_t headLen = (std::min)(static_cast<size_t>(d.headLen), DropProbe::kHeadBytes);
+			for (size_t b = 0; b < headLen; b++)
+			{
+				head[2 * b]     = kHex[d.head[b] >> 4];
+				head[2 * b + 1] = kHex[d.head[b] & 0x0f];
+			}
+			head[2 * headLen] = '\0';
+			sockaddr_in src{};
+			src.sin_family      = AF_INET;
+			src.sin_addr.s_addr = d.ip;
+			src.sin_port        = d.port;
+			if (any) json << ",";
+			any = true;
+			json << "{\"seq\":" << d.seq
+			     << ",\"tsUs\":" << d.tsUs
+			     << ",\"reason\":\"" << DropProbe::reasonName(d.reason) << "\""
+			     << ",\"src\":\"" << jsonEscape(sipwire::addrToIpPort(src)) << "\""
+			     << ",\"len\":" << d.len
+			     << ",\"head\":\"" << head << "\"}";
+		}
+	}
+	json << "],";
 
 	// microSD, on builds that have a slot wired (currently the T-ETH-ELITE `eth`
 	// board only). Always present so a client can tell "no card" from "this build
@@ -1663,6 +1773,15 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	        "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
 	        "\"stackHwm_conf_mix_tick\":null,\"stackHwm_http_conn\":null";
 #endif
+	// Issue #382: ungated for the same reason resetReason is -- "a dump exists,
+	// N bytes" is the fact a bench run needs to notice an unwatched panic, and it
+	// discloses nothing the reset reason above does not. The dump itself and its
+	// summary stay behind /api/coredump*.
+	{
+		const CoreDumpStore::Info cd = CoreDumpStore::query();
+		json << ",\"coredump\":{\"present\":" << (cd.present ? "true" : "false")
+		     << ",\"size\":" << cd.size << "}";
+	}
 
 	// Issue #328: L2 transmit-path health, in one object, on the UNGATED route.
 	//
@@ -1776,6 +1895,8 @@ void HttpServer::sendApiMetrics(int sock)
 	uint64_t packets      = 0;
 	uint64_t dropped      = 0;
 	uint64_t sdpRejected  = 0;
+	uint64_t droppedInvalid = 0;   // Issue #430
+	uint64_t droppedRate  = 0;
 	size_t   clientCount  = 0;
 	size_t   sessionCount = 0;
 
@@ -1789,6 +1910,8 @@ void HttpServer::sendApiMetrics(int sock)
 	{
 		packets      = handler->getPacketsProcessed();
 		dropped      = handler->getPacketsDropped();
+		droppedInvalid = handler->getDroppedInvalid();
+		droppedRate  = handler->getDroppedRate();
 		sdpRejected  = handler->getSdpRejected();
 		clientCount  = handler->getClientCount();
 		sessionCount = handler->getSessionCount();
@@ -1838,6 +1961,14 @@ void HttpServer::sendApiMetrics(int sock)
 	counter("pocketdial_packets_dropped_total",
 	        "SIP packets dropped since boot as malformed or rate-limited (issue #38).",
 	        dropped);
+	counter("pocketdial_packets_dropped_invalid_total",
+	        "The malformed share of pocketdial_packets_dropped_total: null, or failing "
+	        "isValidMessage() (issue #430).",
+	        droppedInvalid);
+	counter("pocketdial_packets_dropped_rate_total",
+	        "The refused share of pocketdial_packets_dropped_total: allowlist or per-IP "
+	        "rate limit (issue #430).",
+	        droppedRate);
 	counter("pocketdial_sdp_rejected_total",
 	        "SDP bodies refused by the admission gate since boot, whether answered 488 "
 	        "or dropped silently (docs/THREAT_MODEL.md T-7).",
@@ -1971,6 +2102,106 @@ void HttpServer::sendApiPcap(int sock)
 		"Content-Disposition: attachment; filename=\"pocket-dial.pcap\"");
 }
 
+void HttpServer::sendApiCoreDumpInfo(int sock)
+{
+	// Issue #382. Reached only through requireAdmin() -- see the route table.
+	const CoreDumpStore::Info info = CoreDumpStore::query();
+	std::ostringstream json;
+	json << "{\"supported\":" << (info.supported ? "true" : "false")
+	     << ",\"present\":" << (info.present ? "true" : "false")
+	     << ",\"size\":" << info.size;
+	if (info.present)
+	{
+		const CoreDumpStore::Summary s = CoreDumpStore::summary();
+		char pc[11];
+		std::snprintf(pc, sizeof(pc), "0x%08x", static_cast<unsigned>(s.pc));
+		json << ",\"valid\":" << (s.valid ? "true" : "false")
+		     << ",\"task\":\"" << jsonEscape(s.task) << "\""
+		     << ",\"pc\":\"" << pc << "\""
+		     << ",\"elfSha\":\"" << jsonEscape(s.elfSha) << "\""
+		     << ",\"reason\":\"" << jsonEscape(s.reason) << "\"";
+	}
+	json << "}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiCoreDump(int sock)
+{
+	// Issue #382. Reached only through requireAdmin(..., Owner). The body is the
+	// raw flash image (header + ELF + checksum), exactly what
+	// `esp-coredump info_corefile -t raw -c <file> <SipServer.elf>` reads -- see
+	// docs/COREDUMP.md.
+	//
+	// STREAMED in 1 KB chunks through one small INTERNAL-DRAM buffer, never
+	// assembled whole. esp_flash_read() into anything that is not internal DRAM
+	// (a whole-dump std::string lands in PSRAM, being above
+	// SPIRAM_MALLOC_ALWAYSINTERNAL) borrows its own internal temp buffer of up
+	// to 16 KB for the whole read (esp_flash_api.c, MAX_READ_CHUNK) -- internal
+	// DRAM being exactly what #328 runs out of. A DRAM destination takes the
+	// direct-read path instead. Found in review by BigDog on PR #394.
+	//
+	// The buffer is a STATIC in .bss (internal DRAM), not heap -- no dynamic
+	// allocation on a request path, ever (desmo) -- and not stack, since these
+	// per-connection threads have measured as little as 472 bytes free (#405).
+	// One buffer means one download at a time; a second concurrent one gets
+	// 503 rather than waiting, so no connection thread ever blocks on another.
+	static constexpr size_t kChunk = 1024;
+	static uint8_t s_chunk[kChunk];
+	static std::mutex s_chunkMutex;
+	std::unique_lock<std::mutex> chunkLock(s_chunkMutex, std::try_to_lock);
+	if (!chunkLock.owns_lock())
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+			"{\"error\":\"another coredump download is in progress\"}");
+		return;
+	}
+	const CoreDumpStore::Info info = CoreDumpStore::query();
+	if (!info.present)
+	{
+		sendResponse(sock, 404, "Not Found", "application/json",
+			std::string("{\"error\":\"") + (info.supported ? "no coredump stored" : "coredump not supported") + "\"}");
+		return;
+	}
+	uint8_t* const buf = s_chunk;
+	// Read the first chunk BEFORE committing to a 200, so an early flash
+	// failure is still a clean 500 rather than a truncated download.
+	size_t len = std::min(kChunk, static_cast<size_t>(info.size));
+	if (!CoreDumpStore::read(0, buf, len))
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+			"{\"error\":\"coredump read failed\"}");
+		return;
+	}
+	const std::string head = buildResponseHead(200, "OK", "application/octet-stream", info.size,
+		"Content-Disposition: attachment; filename=\"pocket-dial-coredump.bin\"");
+	if (!sendAllBytes(sock, head.data(), head.size())) return;
+	for (uint32_t off = 0;;)
+	{
+		if (!sendAllBytes(sock, reinterpret_cast<const char*>(buf), len)) return;
+		off += static_cast<uint32_t>(len);
+		if (off >= info.size) return;
+		len = std::min(kChunk, static_cast<size_t>(info.size - off));
+		// A mid-stream failure can no longer change the status line; stopping
+		// short of Content-Length is what tells the client the body is bad.
+		if (!CoreDumpStore::read(off, buf, len)) return;
+	}
+}
+
+void HttpServer::sendApiCoreDumpErase(int sock)
+{
+	// Issue #382. Reached only through requireAdmin(..., needCsrf=true).
+	const CoreDumpStore::Info info = CoreDumpStore::query();
+	if (!info.supported)
+	{
+		sendResponse(sock, 404, "Not Found", "application/json",
+			"{\"error\":\"coredump not supported\"}");
+		return;
+	}
+	const bool ok = CoreDumpStore::erase();
+	sendResponse(sock, ok ? 200 : 500, ok ? "OK" : "Internal Server Error", "application/json",
+		std::string("{\"erased\":") + (ok ? "true" : "false") + "}");
+}
+
 void HttpServer::sendApiTrace(int sock)
 {
 	std::vector<PcapCapture::TraceRecord> records;
@@ -1994,7 +2225,8 @@ void HttpServer::sendApiTrace(int sock)
 		     << "\"tsUs\":" << r.tsUs << ","
 		     << "\"dir\":\"" << (r.outbound ? "out" : "in") << "\","
 		     << "\"peer\":\"" << jsonEscape(r.peer) << "\","
-		     << "\"text\":\"" << jsonEscape(r.text) << "\"}";
+		     << "\"text\":\"" << jsonEscape(r.text) << "\","
+		     << "\"truncated\":" << (r.truncated ? "true" : "false") << "}";
 	}
 	json << "]";
 

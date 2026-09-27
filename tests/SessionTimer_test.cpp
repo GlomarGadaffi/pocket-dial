@@ -457,6 +457,7 @@ TEST(SessionRecycling, AResetSlotIsIndistinguishableFromAFreshOne)
 	used.setTrunk(true);
 	used.setTrunkRelaySlot(2);
 	used.noteServerCSeq(7);
+	used.noteObservedCSeq(40);
 	used.reset("call-fresh", nullptr);
 
 	EXPECT_EQ(used.isVoicemail(),          fresh.isVoicemail());
@@ -466,5 +467,49 @@ TEST(SessionRecycling, AResetSlotIsIndistinguishableFromAFreshOne)
 	EXPECT_EQ(used.getTrunkRelaySlot(),    fresh.getTrunkRelaySlot());
 	// #389: a stale server CSeq would push a recycled slot's first BYE off 2.
 	EXPECT_EQ(used.lastServerCSeq(),       fresh.lastServerCSeq());
+	EXPECT_EQ(used.maxObservedCSeq(),      fresh.maxObservedCSeq());
 	EXPECT_EQ(used.nextServerCSeq(),       fresh.nextServerCSeq());
+}
+
+// Issue #402: the server's next CSeq on a dialog goes above EVERYTHING used on
+// it -- its own requests and either party's -- whichever of the two is higher.
+TEST(SessionRecycling, NextServerCSeqGoesAboveBothServerAndObservedCSeqs)
+{
+	Session s("call-402", nullptr);
+	EXPECT_EQ(s.nextServerCSeq(), 2u);         // nothing known: the long-standing 2
+
+	s.noteObservedCSeq(23670);                  // e.g. a phone's hold re-INVITE
+	EXPECT_EQ(s.nextServerCSeq(), 23671u);
+
+	s.noteServerCSeq(3);                        // a lower server CSeq doesn't pull it down
+	EXPECT_EQ(s.nextServerCSeq(), 23671u);
+
+	s.noteServerCSeq(23671);                    // after the server uses it
+	EXPECT_EQ(s.nextServerCSeq(), 23672u);
+
+	s.noteObservedCSeq(100);                    // observations never move it backwards
+	EXPECT_EQ(s.maxObservedCSeq(), 23670u);
+	EXPECT_EQ(s.nextServerCSeq(), 23672u);
+}
+
+// #402 review: RFC 3261 s8.1.1.5 caps CSeq below 2^31. A forged 4294967295 must
+// not be recorded (it would wrap nextServerCSeq() to 0), and the server's next
+// CSeq must stay legal -- never 0, never >= 2^31 -- even at the ceiling.
+TEST(SessionRecycling, ServerCSeqIgnoresIllegalValuesAndNeverWraps)
+{
+	const uint32_t limit = Session::kCSeqLimit;   // 2^31
+
+	Session s("call-402-forged", nullptr);
+	s.noteObservedCSeq(4294967295u);
+	s.noteObservedCSeq(limit);
+	s.noteObservedCSeq(0);
+	EXPECT_EQ(s.maxObservedCSeq(), 0u) << "values at/above 2^31 (and 0) are not CSeqs any UA may send";
+	EXPECT_EQ(s.nextServerCSeq(), 2u);
+
+	s.noteServerCSeq(4294967295u);
+	EXPECT_EQ(s.lastServerCSeq(), 0u);
+
+	s.noteObservedCSeq(limit - 1);              // the largest legal value
+	EXPECT_EQ(s.nextServerCSeq(), limit - 1) << "saturates at 2^31-1 rather than wrapping";
+	EXPECT_NE(s.nextServerCSeq(), 0u);
 }
