@@ -64,6 +64,11 @@ namespace EmailConfigStore
 	// value in that case.
 	bool save(const Config& cfg);
 
+	// Erase every stored field (the factory-reset path, #363) and reset the
+	// cache to Config{}. Unlike save(Config{}) it does not depend on writing a
+	// zero-length blob, and it attempts every key even after a failure.
+	bool clear();
+
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Host-only: resets the in-memory cache to Config{}'s defaults and clears
 	// the "loaded" flag, so the next load() re-reads (finding nothing, on
