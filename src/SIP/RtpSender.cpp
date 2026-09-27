@@ -466,7 +466,8 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 {
 	std::lock_guard<std::mutex> lock(_slotMutex);
 
-	if (_active.load(std::memory_order_acquire))
+	if (_active.load(std::memory_order_acquire) ||
+		_teardownPendingForTest.load(std::memory_order_acquire))   // #513 test seam
 	{
 		return false;
 	}
@@ -645,7 +646,8 @@ void RtpSender::runLoop()
 bool RtpSender::start(const std::string& /*destIp*/, uint16_t /*destPort*/, const std::string& callID, FrameProvider provider)
 {
 	std::lock_guard<std::mutex> lock(_slotMutex);
-	if (_active.load(std::memory_order_acquire))
+	if (_active.load(std::memory_order_acquire) ||
+		_teardownPendingForTest.load(std::memory_order_acquire))   // #513 test seam
 	{
 		return false;   // single-stream cap still enforced on host (for tests)
 	}
