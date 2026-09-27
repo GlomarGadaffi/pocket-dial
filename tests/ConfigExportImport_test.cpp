@@ -601,6 +601,10 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_RestoresSecuredExtensions)
 	SecuredExts secured;
 	const std::string ha1_101 = *SipSecretStore::getHa1("101");
 	const std::string ha1_102 = *SipSecretStore::getHa1("102");
+	// The host store is process-global, and other suites in this binary leave
+	// extensions secured, so the export carries every one of them, not just ours.
+	const size_t securedAtExport = SipSecretStore::securedExtensions().size();
+	ASSERT_GE(securedAtExport, 2u);
 	AdminSession owner = loginOwner();
 	std::string exportResp = httpRaw(_port, "POST", "/api/config/export",
 		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf);
@@ -615,7 +619,8 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_RestoresSecuredExtensions)
 		"blob=" + urlEncode(blob) + "&password=exportpass123&confirm=REPLACE",
 		"pd_session=" + _sysop.cookie, _sysop.csrf);
 	ASSERT_EQ(statusOf(importResp), 200) << importResp;
-	EXPECT_NE(bodyOf(importResp).find("extensionSecrets (2)"), std::string::npos) << bodyOf(importResp);
+	EXPECT_NE(bodyOf(importResp).find("extensionSecrets (" + std::to_string(securedAtExport) + ")"),
+		std::string::npos) << bodyOf(importResp);
 	ASSERT_TRUE(SipSecretStore::getHa1("101").has_value());
 	EXPECT_EQ(*SipSecretStore::getHa1("101"), ha1_101) << "the restored HA1 must be the exported one";
 	EXPECT_EQ(*SipSecretStore::getHa1("102"), ha1_102);
@@ -624,6 +629,9 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_RestoresSecuredExtensions)
 TEST_F(ConfigExportImportTest, PlaintextOnlyImport_SaysSecuredExtensionsNeedTheirSecrets)
 {
 	SecuredExts secured;
+	// Process-global host store: count what the export will list, not just ours.
+	const size_t securedAtExport = SipSecretStore::securedExtensions().size();
+	ASSERT_GE(securedAtExport, 2u);
 	std::string exportResp = httpRaw(_port, "GET", "/api/config/export", "",
 		"pd_session=" + _sysop.cookie);
 	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
@@ -634,7 +642,8 @@ TEST_F(ConfigExportImportTest, PlaintextOnlyImport_SaysSecuredExtensionsNeedThei
 		"blob=" + urlEncode(bodyOf(exportResp)) + "&confirm=REPLACE",
 		"pd_session=" + _sysop.cookie, _sysop.csrf);
 	ASSERT_EQ(statusOf(importResp), 200) << importResp;
-	EXPECT_NE(bodyOf(importResp).find("2 secured extension(s)"), std::string::npos) << bodyOf(importResp);
+	EXPECT_NE(bodyOf(importResp).find(std::to_string(securedAtExport) + " secured extension(s)"),
+		std::string::npos) << bodyOf(importResp);
 	EXPECT_FALSE(SipSecretStore::hasSecret("101"));
 }
 
