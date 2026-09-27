@@ -424,6 +424,9 @@ add_executable(sip_parser_tests
     # answer keeps the callee's own capabilities, and that a phone's own Allow
     # never survives into ours as a second header line.
     CapabilityHeaders_test.cpp
+    # Issue #523: a de-REGISTER (Expires: 0) is answered 200 at its source, not
+    # 404 through endHandle()'s by-number lookup of the client it just released.
+    Deregistration_test.cpp
     # Issue #229: `Supported: replaces` backs onRefer()'s REFER ?Replaces=
     # attended-transfer splice (#131) only -- RFC 3891 §3's OTHER use of the
     # same tag, an INVITE that itself carries a Replaces header (the BLF-key
