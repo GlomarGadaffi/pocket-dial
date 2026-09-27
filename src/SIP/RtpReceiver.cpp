@@ -438,6 +438,11 @@ RtpReceiver::~RtpReceiver()
 	{
 		vTaskDelay(pdMS_TO_TICKS(5));
 	}
+	// Issue #535: the task parked itself; this is its one deleter.
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		reapParkedTaskLocked();
+	}
 #else
 	stop();   // host stub: just clears the (no-task) active flag + sink
 #endif
@@ -497,6 +502,9 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	{
 		return false;
 	}
+	// Issue #535: the previous stream's task has finished (_taskRunning is
+	// false) and parked; reap it before creating the next one.
+	reapParkedTaskLocked();
 	// A stream needs SOMEWHERE to deliver, but the audio Sink is no longer the
 	// only answer. A raw-relay leg (a SIP trunk) arms setRawSink() instead and
 	// has no use for an audio sink at all -- the raw path claims every packet
@@ -582,7 +590,7 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 		6144,   // headroom for lwIP recvfrom() + sink callback (decode is in-place)
 		this,
 		6,
-		nullptr,
+		&_parkedTask,   // #535: kept so the owner can reap the parked task
 		0 /* Core 0 */);
 
 	if (ok != pdPASS)
@@ -592,6 +600,7 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 		_sock = -1;
 		clearSlotLocked();
 		_taskRunning.store(false, std::memory_order_release);
+		_parkedTask = nullptr;
 		return false;
 	}
 
@@ -633,7 +642,30 @@ void RtpReceiver::taskTrampoline(void* arg)
 	// Clearing _taskRunning is the LAST access to `self`: after this the destructor
 	// may observe the task as gone and allow the object to be destroyed.
 	self->_taskRunning.store(false, std::memory_order_release);
-	pd::deleteTask(nullptr);   // #466: vTaskDeleteWithCaps for a PSRAM stack, vTaskDelete otherwise
+	// Issue #535: park, never self-delete. vTaskDeleteWithCaps(NULL) (a PSRAM
+	// stack, #466) creates an internal helper task to free this one and
+	// abort()s if that ~1.9 KB allocation fails -- on every media-leg teardown,
+	// under exactly the internal-DRAM pressure #466/#328 are about. The owner
+	// (next start() or ~RtpReceiver) deletes this task from outside with
+	// pd::deleteTask(handle), which allocates nothing. Suspending touches no
+	// member, so it is safe after the _taskRunning store above.
+	for (;;)
+	{
+		vTaskSuspend(nullptr);
+	}
+}
+
+void RtpReceiver::reapParkedTaskLocked()
+{
+	if (_parkedTask == nullptr) return;
+	// The task clears _taskRunning and then suspends itself: wait (a few ticks
+	// at most) for the suspend so the delete lands on a parked task.
+	for (int i = 0; i < 100 && eTaskGetState(_parkedTask) != eSuspended; ++i)
+	{
+		vTaskDelay(1);
+	}
+	pd::deleteTask(_parkedTask);   // another task: no helper, no allocation
+	_parkedTask = nullptr;
 }
 
 void RtpReceiver::runLoop()
