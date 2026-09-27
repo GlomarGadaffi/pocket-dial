@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 #include "ArpLookup.hpp"
 #include "DeviceConfig.hpp"   // Issue #397: lastSchemaOutcome() decides the boot default
@@ -231,7 +232,50 @@ Registrar::AuthDecision Registrar::admitSecure(
 		return AuthDecision::Reject;
 	}
 
+	// Issue #525: the credentials are right, but have they been used before?
+	// With qop=auth each request carries nc, which must rise per nonce. A
+	// repeat is answered with a stale challenge, not a 403: the genuine phone
+	// silently retries with a fresh nonce (it has the password), a replayer
+	// cannot, and no one is locked out or told anything. Legacy RFC 2069
+	// credentials carry no nc and are not checked here (their replay window is
+	// the nonce's 5-minute lifetime, as before).
+	if (!auth.nc.empty())
+	{
+		char* end = nullptr;
+		const unsigned long nc = std::strtoul(auth.nc.c_str(), &end, 16);
+		const bool ncValid = end != auth.nc.c_str() && *end == '\0' && nc <= 0xFFFFFFFFul;
+		if (!ncValid || !noteNonceUse(auth.nonce, static_cast<uint32_t>(nc), std::chrono::steady_clock::now()))
+		{
+			_env.log("Secure " + std::string(data->getType()) + " for ext " + ext +
+				": digest nonce/nc already used, re-challenged (#525)", true);
+			sendChallenge(data, /*stale=*/true);
+			return AuthDecision::Challenge;
+		}
+	}
+
 	return AuthDecision::Accept;
+}
+
+bool Registrar::noteNonceUse(const std::string& nonce, uint32_t nc, std::chrono::steady_clock::time_point now)
+{
+	// validateNonce() has already proved this is one of ours, which always fits;
+	// anything longer is not a shape we issue, so there is nothing to track.
+	if (nonce.size() >= sizeof(NonceUse::nonce)) return true;
+	NonceUse* victim = &_nonceUses[0];
+	for (NonceUse& u : _nonceUses)
+	{
+		if (u.until > now && nonce == u.nonce)
+		{
+			if (nc <= u.nc) return false;   // replay: nc must rise
+			u.nc = nc;
+			return true;
+		}
+		if (u.until < victim->until) victim = &u;   // expired (or never used) first
+	}
+	std::memcpy(victim->nonce, nonce.c_str(), nonce.size() + 1);
+	victim->nc = nc;
+	victim->until = now + std::chrono::milliseconds(SipDigest::kNonceTtlMs);
+	return true;
 }
 
 Registrar::AuthDecision Registrar::admitLearn(

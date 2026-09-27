@@ -1,0 +1,2 @@
+# InviteAdmission_test.cpp: 2 (#525: a replayed nonce/nc is re-challenged; a rising nc still passes)
+2

@@ -1,7 +1,9 @@
 #ifndef REGISTRAR_HPP
 #define REGISTRAR_HPP
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -177,6 +179,26 @@ private:
 	// (namespace "pbxcfg", key "devices") minus the volatile online flags.
 	std::unordered_map<std::string, DeviceRecord> _devices;
 	Change _devicesChanged = Change::None;
+
+	// Issue #525: digest replay limit. Nonces are stateless (HMAC-tagged, 5 min,
+	// SipDigest.hpp), so without this one captured Authorization could be sent
+	// again for the nonce's whole lifetime. Each nonce that has authenticated a
+	// request remembers the highest nc it was used with; a request must present
+	// a HIGHER nc (RFC 2617 §3.2.2) or it is re-challenged. Fixed size, no heap:
+	// when full, the entry that expires first is reused. Only a request that
+	// already passed verify() is recorded, so filling the table takes valid
+	// credentials. Touched only under RequestsHandler's _mutex (SIP thread).
+	struct NonceUse
+	{
+		char nonce[64] = {};
+		uint32_t nc = 0;
+		std::chrono::steady_clock::time_point until{};
+	};
+	static constexpr size_t kNonceUses = 32;
+	std::array<NonceUse, kNonceUses> _nonceUses{};
+	// True if (nonce, nc) is new, and records it; false if it is a replay (an nc
+	// not above the highest already accepted for this nonce).
+	bool noteNonceUse(const std::string& nonce, uint32_t nc, std::chrono::steady_clock::time_point now);
 	// Raise the pending change to at least `kind` (Structural is sticky).
 	void noteChange(Change kind);
 };
