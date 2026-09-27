@@ -247,8 +247,8 @@ What is on by default:
 
 - **Username + password on the dashboard**, with forced credential setup on first
   boot, brute-force lockout with exponential backoff, server-side sessions and CSRF
-  tokens. (The lockout is currently **global, not per-client** — the per-IP key is
-  computed but never reaches the login path, so one guesser can lock out the real
+  tokens. (The lockout is per client since #530, but its per-principal aggregate
+  backstop can still be tripped by one persistent guesser, locking out the real
   admin. See [THREAT_MODEL.md](docs/THREAT_MODEL.md) D-3.)
 - **SDP admission gate** — every SDP body is structurally checked before any
   decoder runs or it is relayed onward

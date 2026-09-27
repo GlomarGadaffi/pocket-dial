@@ -1,0 +1,2 @@
+# InviteAdmission_test.cpp: 3 (#525: a replayed nonce/nc is re-challenged; a rising nc still passes; the replay table overflowing does not reopen a replay)
+3
