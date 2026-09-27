@@ -1,2 +1,2 @@
-# SipTrunk_test.cpp: 4 (#399: a 401/407 on our INVITE is answered once with digest credentials)
-4
+# SipTrunk_test.cpp: 6 (#399 challenge answering, 4; #581 review B1/B2, 2)
+6

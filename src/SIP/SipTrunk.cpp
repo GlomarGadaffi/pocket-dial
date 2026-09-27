@@ -415,6 +415,48 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 		return true;
 	}
 
+	// #581 review B1: once a challenge has been answered this dialog has two
+	// INVITE transactions. A response for the FIRST (challenged) one -- the
+	// carrier retransmitting its 401/407 until our ACK lands (RFC 3261
+	// s17.2.1), or anything else stamped with the old CSeq -- must not drive
+	// the live retry: it would latch the dead transaction's To-tag and fail the
+	// call while the retry INVITE still rings at the far end. A final response
+	// is answered with the first transaction's own ACK again (s17.1.1.2's
+	// Completed state); a provisional one is simply absorbed.
+	if (d->authAttempted && d->state != State::Terminating)
+	{
+		const std::string_view cseqLine = data->getCSeq();
+		const size_t colon = cseqLine.find(':');
+		const std::string_view cseqValue = colon == std::string_view::npos ? cseqLine : cseqLine.substr(colon + 1);
+		uint32_t respCseq = 0;
+		size_t i = 0;
+		while (i < cseqValue.size() && (cseqValue[i] == ' ' || cseqValue[i] == '\t')) ++i;
+		while (i < cseqValue.size() && cseqValue[i] >= '0' && cseqValue[i] <= '9')
+		{
+			respCseq = respCseq * 10u + static_cast<uint32_t>(cseqValue[i] - '0');
+			++i;
+		}
+		if (respCseq != d->cseq)
+		{
+			if (status >= 200 && respCseq == d->challengedCseq)
+			{
+				Dialog first = *d;
+				first.branch = d->challengedBranch;
+				first.toTag = d->challengedToTag;
+				first.cseq = d->challengedCseq;
+				auto reAck = _env.messageFromPool(buildAckForFailure(first), d->peer);
+				if (reAck)
+				{
+					reAck->syncContentLength();
+					_env.enqueue(d->peer, std::move(reAck));
+				}
+			}
+			_env.log("Trunk: " + std::to_string(status) + " for a superseded INVITE transaction absorbed ("
+				+ d->destE164 + ")");
+			return true;
+		}
+	}
+
 	// Latch the To-tag from the first response that carries one. Everything
 	// in-dialog afterwards -- the ACK, the BYE -- is malformed without it.
 	const std::string toTag = siphdr::tagOf(data->getTo());
@@ -733,28 +775,45 @@ bool SipTrunk::answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& cha
 		return false;
 	}
 
-	// ACK the challenge in the INVITE's own transaction (it still carries the
-	// challenge's To-tag), THEN move the dialog to the new transaction.
+	// Draw BOTH messages before anything is sent or changed (#581 review B2),
+	// so a pool refusal returns false having sent nothing and left `d` as it
+	// was -- the caller's failure path then ACKs the challenge from the
+	// untouched transaction, exactly once. The ACK belongs to the challenged
+	// transaction (it still carries the challenge's To-tag); the retry is a new
+	// one: CSeq+1, a fresh branch, no To-tag.
 	auto ack = _env.messageFromPool(buildAckForFailure(d), d.peer);
-	if (ack)
+	if (!ack)
 	{
-		ack->syncContentLength();
-		_env.enqueue(d.peer, std::move(ack));
+		std::memset(_authLine, 0, sizeof(_authLine));
+		_env.log("Trunk: challenge answer dropped, message pool exhausted (" + d.destE164 + ")", true);
+		return false;
 	}
-	d.authAttempted = true;
+	const std::string savedBranch = d.branch;
+	const std::string savedToTag = d.toTag;
+	const uint32_t savedCseq = d.cseq;
 	d.cseq += 1;
 	d.branch = "z9hG4bK" + IDGen::GenerateID(12);
 	d.toTag.clear();
-	d.state = State::Trying;
 
 	auto invite = _env.messageFromPool(
 		buildInvite(d, d.offerSdp, std::string_view(_authLine, nameLen + 2 + valueLen)), d.peer);
 	std::memset(_authLine, 0, sizeof(_authLine));
 	if (!invite)
 	{
+		d.branch = savedBranch;   // back to the challenged transaction, unsent
+		d.toTag = savedToTag;
+		d.cseq = savedCseq;
 		_env.log("Trunk: challenge answer dropped, message pool exhausted (" + d.destE164 + ")", true);
 		return false;
 	}
+	d.authAttempted = true;
+	d.challengedBranch = savedBranch;
+	d.challengedToTag = savedToTag;
+	d.challengedCseq = savedCseq;
+	d.state = State::Trying;
+
+	ack->syncContentLength();
+	_env.enqueue(d.peer, std::move(ack));
 	invite->syncContentLength();
 	_env.enqueue(d.peer, std::move(invite));
 	_env.log("Trunk: " + std::to_string(status) + " challenge answered (" + d.destE164 + ")");

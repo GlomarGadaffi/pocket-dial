@@ -233,6 +233,12 @@ public:
 		// second challenge is a failure, never a loop.
 		std::string offerSdp;
 		bool        authAttempted = false;
+		// The challenged (first) INVITE transaction, kept once authAttempted is
+		// set: a retransmitted final response for it is re-ACKed in ITS
+		// transaction and never touches the live retry (CaveJay's #581 B1).
+		std::string challengedBranch;
+		std::string challengedToTag;
+		uint32_t    challengedCseq = 0;
 
 		sockaddr_in peer{};
 		std::chrono::steady_clock::time_point deadline{};

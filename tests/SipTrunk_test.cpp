@@ -1351,3 +1351,67 @@ TEST(SipTrunkAuth, WithoutCredentialsAChallengeIsAnOrdinaryFailure)
 	ASSERT_EQ(env.sent.size(), 2u) << "INVITE and its ACK only";
 	EXPECT_EQ(trunk.activeDialogs(), 0u);
 }
+
+TEST(SipTrunkAuth, ARetransmittedFirstChallengeAfterTheRetryDoesNotFailTheCall)
+{
+	// #581 review B1: the carrier resends its 401 for CSeq 1 until our ACK lands
+	// (RFC 3261 s17.2.1). Arriving after the credentialed retry went out, it
+	// used to latch the dead transaction's To-tag and fail the call while the
+	// CSeq 2 INVITE still rang at the far end.
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-399"));
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string firstBranch = d->branch;
+	const std::string challenge = challengeFor(*d, 401, "WWW-Authenticate");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(challenge)));
+	ASSERT_EQ(env.sent.size(), 3u) << "INVITE, the challenge's ACK, the credentialed INVITE";
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(challenge)));   // the same CSeq 1 401, again
+
+	EXPECT_EQ(trunk.activeDialogs(), 1u) << "the retry is still live; the call must not fail";
+	d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	EXPECT_EQ(d->cseq, 2u);
+	ASSERT_EQ(env.sent.size(), 4u) << "one new message only: the first transaction's ACK again";
+	const std::string reAck = env.sentRaw(3);
+	EXPECT_EQ(reAck.substr(0, 3), "ACK");
+	EXPECT_NE(reAck.find(";branch=" + firstBranch), std::string::npos) << reAck;
+	EXPECT_NE(reAck.find("CSeq: 1 ACK"), std::string::npos) << reAck;
+}
+
+TEST(SipTrunkAuth, APoolRefusalOnTheRetryAcksTheChallengeOnceFromTheUntouchedTransaction)
+{
+	// #581 review B2: the retry INVITE's pool draw failed AFTER the ACK went out
+	// and the dialog had moved to CSeq 2, so the failure path sent a second ACK
+	// from the mutated dialog (new branch, CSeq 2, no To-tag).
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-399"));
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string firstBranch = d->branch;
+	const std::string challenge = challengeFor(*d, 401, "WWW-Authenticate");
+	env.messagePoolFailDrawIn = 2;   // the challenge's ACK draws; the retry INVITE does not
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(challenge)));
+
+	std::size_t acks = 0;
+	for (std::size_t i = 0; i < env.sent.size(); ++i)
+	{
+		const std::string raw = env.sentRaw(i);
+		if (raw.rfind("ACK", 0) != 0) continue;
+		++acks;
+		EXPECT_NE(raw.find(";branch=" + firstBranch), std::string::npos) << raw;
+		EXPECT_NE(raw.find("CSeq: 1 ACK"), std::string::npos) << raw;
+	}
+	EXPECT_EQ(acks, 1u) << "exactly one ACK, in the challenged transaction";
+	EXPECT_EQ(trunk.activeDialogs(), 0u) << "unanswerable for now: an ordinary failure";
+}
