@@ -1272,7 +1272,7 @@ namespace
 		return std::atoi(resp.substr(sp1 + 1, sp2 - sp1 - 1).c_str());
 	}
 
-	std::string httpGetRaw(int port, const std::string& path)
+	std::string httpGetRaw(int port, const std::string& path, const std::string& cookie = "")
 	{
 #if defined(_WIN32) || defined(_WIN64)
 		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
@@ -1295,7 +1295,8 @@ namespace
 			return "";
 		}
 		std::string req = "GET " + path + " HTTP/1.1\r\n"
-			"Host: 127.0.0.1\r\n"
+			"Host: 127.0.0.1\r\n" +
+			(cookie.empty() ? std::string() : "Cookie: " + cookie + "\r\n") +
 			"Connection: close\r\n\r\n";
 		send(s, req.c_str(), static_cast<int>(req.size()), 0);
 
@@ -1410,10 +1411,21 @@ TEST(DialPlanHttp, ApiStatusReportsParkedCalls)
 	handler.setDialRule("8XX", "park", "701");
 	handler.handle(makeInvite("600", "800", "192.168.9.60", "http-park"));
 
+	// #539: logged out, the parked table names no one -- only its count.
 	std::string status = httpGetRaw(18102, "/api/status");
-	EXPECT_NE(status.find("\"parkedCalls\":["), std::string::npos) << status;
+	EXPECT_NE(status.find("\"parkedCount\":1"), std::string::npos) << status;
+	EXPECT_NE(status.find("\"parkedCalls\":[]"), std::string::npos) << status;
+	EXPECT_EQ(status.find("\"parkedExt\""), std::string::npos) << "an identity leaked logged out:\n" << status;
+	EXPECT_EQ(status.find("\"parker\""), std::string::npos) << status;
+
+	// With a session, the full rows (#165's patch-bay dashboard needs them).
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
+	const std::string cookie = "pd_session=" + AdminAuth::createSession();
+	status = httpGetRaw(18102, "/api/status", cookie);
+	EXPECT_NE(status.find("\"parkedCount\":1"), std::string::npos) << status;
 	EXPECT_NE(status.find("\"orbit\":\"701\""), std::string::npos) << status;
 	EXPECT_NE(status.find("\"parkedExt\":\"600\""), std::string::npos) << status;
+	AdminAuth::clearCredential();
 }
 
 TEST(DialPlanHttp, PostApiDialPlanRejectsBadParametersWith400)

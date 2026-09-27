@@ -61,8 +61,8 @@ The proposed `src/Media/` directory was never created; everything landed under `
 > on a real board, so it is genuine on-target proof of the **anchor-bridge shape** of this
 > media stack. It proves nothing about `440`, whose standalone tone path has **never been run
 > on hardware**. The `MixBus` / `ConferenceRoom` mixer (`888`) **has** since run on `.244`
-> (2026-09-27), and on `main` it panics the board (#498: `MixBus::tick`'s frames overflow the
-> 3,072-byte `conf_mix_tick` stack; fix #499).
+> (2026-09-27). That run panicked the board (#498: `MixBus::tick`'s frames overflowed the
+> 3,072-byte `conf_mix_tick` stack); the fix (#499) is merged and has not been re-run on hardware.
 
 ### 0.2 What is still absent
 

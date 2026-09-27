@@ -946,7 +946,12 @@ namespace
 			return *existing;
 		}
 
-		AttemptBucket* victim = &s.attempts[0];
+		// Issue #561: the unkeyed "" bucket (the DTMF admin PIN, and any HTTP
+		// request with no peer address) is never the eviction victim. Otherwise
+		// eight failed web logins from fresh -- spoofable -- addresses recycled
+		// it and cleared an engaged PIN lockout. Only one "" bucket can exist, so
+		// the other slots always leave a victim.
+		AttemptBucket* victim = nullptr;
 		for (auto& b : s.attempts)
 		{
 			if (!b.used)
@@ -954,10 +959,18 @@ namespace
 				victim = &b;
 				break;
 			}
-			if (b.lastSeenMs < victim->lastSeenMs)
+			if (b.key.empty())
+			{
+				continue;
+			}
+			if (victim == nullptr || b.lastSeenMs < victim->lastSeenMs)
 			{
 				victim = &b;
 			}
+		}
+		if (victim == nullptr)
+		{
+			victim = &s.attempts[0];   // unreachable with kMaxAttemptBuckets > 1
 		}
 
 		*victim = AttemptBucket{};
