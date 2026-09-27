@@ -258,7 +258,14 @@ namespace AdminAuth
 	// Wipe the stored login credential AND the DTMF PIN AND all live sessions,
 	// and reset the lockout state. Used by factory-reset so the device returns
 	// to the default-credential/needs-initial-setup state.
-	void clearCredential();
+	// Returns false if the persisted credential could not be erased (the in-RAM
+	// state is cleared regardless). Not [[nodiscard]]: most callers are tests.
+	bool clearCredential();
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	// Test-only: the next clearCredential() reports failure (the host store
+	// never fails on its own), so /api/factory-reset's error path is reachable.
+	void failNextEraseForTest();
+#endif
 
 	// True iff a REAL (non-default) login credential is persisted in NVS.
 	// Intended for the boot provisioning gate in app_main() — called before

@@ -283,3 +283,50 @@ TEST(RegisterBeeper, SlotFreedByFallbackWhenNoResponseFollowsTheCancel)
 	// longer recognized as ours.
 	EXPECT_FALSE(beeper.handleOk(okFor(callId, phoneAddr)));
 }
+
+// Issue #408: the register path passes kAfterRegisterDelay. Nothing goes out in
+// the REGISTER's own pass; sweep() sends the INVITE once the delay has passed,
+// and from then on it is an ordinary beep dialog (answer window, CANCEL).
+TEST(RegisterBeeper, ADelayedBeepIsSentOnlyOnceItsDelayHasPassed)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	const auto t0 = std::chrono::steady_clock::now();
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr), RegisterBeeper::kAfterRegisterDelay);
+	EXPECT_TRUE(env.sent.empty()) << "nothing may go out in the REGISTER's own pass";
+
+	beeper.sweep(t0 + RegisterBeeper::kAfterRegisterDelay - std::chrono::milliseconds(100));
+	EXPECT_TRUE(env.sent.empty()) << "not before the delay";
+
+	const auto fired = t0 + std::chrono::seconds(2);
+	beeper.sweep(fired);
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(env.sentRaw(0).rfind("INVITE sip:101@192.168.1.50:5060", 0), 0u) << env.sentRaw(0);
+	const std::string callId = callIdOf(env.sentRaw(0));
+	ASSERT_FALSE(callId.empty());
+
+	beeper.sweep(fired + std::chrono::seconds(1));
+	EXPECT_EQ(env.sent.size(), 1u) << "sent once, not again on the next sweep";
+
+	// Unanswered past its own 5 s window: CANCELled like any beep.
+	beeper.sweep(fired + std::chrono::seconds(6));
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_EQ(env.sentRaw(1).rfind("CANCEL ", 0), 0u) << env.sentRaw(1);
+}
+
+// A Pending beep has no Call-ID yet. A response whose Call-ID is empty must not
+// be taken for it (findByCallID skips Pending), or it would be "answered" before
+// its INVITE was ever sent.
+TEST(RegisterBeeper, APendingBeepMatchesNoResponse)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr), RegisterBeeper::kAfterRegisterDelay);
+	EXPECT_FALSE(beeper.handleOk(okFor("", phoneAddr)));
+	EXPECT_FALSE(beeper.ownsCallID("Call-ID: "));
+	EXPECT_TRUE(env.sent.empty());
+}

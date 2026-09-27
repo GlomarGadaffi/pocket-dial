@@ -1,4 +1,17 @@
 #include "RtpReceiver.hpp"
+#include "UdpRecv.hpp"   // Issue #469: truncation-aware receive (shared with UdpServer)
+
+namespace
+{
+	// Issue #469: RTP datagrams longer than MAX_DATAGRAM_BYTES, dropped by any
+	// receiver. Process-wide (every stream), device and host alike.
+	std::atomic<uint32_t> s_rxOversizeDrops{0};
+}
+
+uint32_t RtpReceiver::rxOversizeDrops()
+{
+	return s_rxOversizeDrops.load(std::memory_order_relaxed);
+}
 
 // buildRtpHeader() is reused rather than reimplemented. Two copies of the
 // RFC 3550 header layout would be two places to get the big-endian packing
@@ -14,6 +27,7 @@
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #235: rtp_media_rx TWDT subscription
 #include "UdpRcvBuf.hpp"    // Issue #496: per-socket receive cap
+#include "PsramTask.hpp"     // Issue #466: pd::createTaskPreferPsram / pd::deleteTask
 #endif
 
 namespace
@@ -559,7 +573,17 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	// (one above the udp_receiver/SIP task at 5) so inbound media is not starved by
 	// signaling bursts. Handle is nullptr: the task self-manages its lifecycle via
 	// _stopRequested / _taskRunning, so we never store (and race on) a TaskHandle_t.
-	BaseType_t ok = xTaskCreatePinnedToCore(
+	//
+	// Issue #466: the stack (6 KB per stream -- one per bridged leg, conference
+	// leg, voicemail leg, trunk leg) lives in PSRAM, not internal DRAM. Audited
+	// safe under the #273 rule: nothing reachable from this task writes flash --
+	// every sink hands off (DTMF -> _dtmfInbox, drained on the SIP task;
+	// voicemail -> a PSRAM buffer, flushed to /sdcard (SDSPI) by vm_archive; CDR
+	// -> cdr_persist's queue), and its only transmit, sendRaw(), is a sendto()
+	// whose Ethernet work runs on the tcpip task (LWIP_TCPIP_CORE_LOCKING is
+	// off), never on this stack. Falls back to internal, counted, where PSRAM
+	// is short or absent (pd::createTaskPreferPsram).
+	BaseType_t ok = pd::createTaskPreferPsram(
 		&RtpReceiver::taskTrampoline,
 		"rtp_media_rx",
 		6144,   // headroom for lwIP recvfrom() + sink callback (decode is in-place)
@@ -570,7 +594,7 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 
 	if (ok != pdPASS)
 	{
-		ESP_LOGE("RtpReceiver", "xTaskCreatePinnedToCore failed");
+		ESP_LOGE("RtpReceiver", "rtp_media_rx task create failed");
 		close(_sock);
 		_sock = -1;
 		clearSlotLocked();
@@ -616,7 +640,7 @@ void RtpReceiver::taskTrampoline(void* arg)
 	// Clearing _taskRunning is the LAST access to `self`: after this the destructor
 	// may observe the task as gone and allow the object to be destroyed.
 	self->_taskRunning.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
+	pd::deleteTask(nullptr);   // #466: vTaskDeleteWithCaps for a PSRAM stack, vTaskDelete otherwise
 }
 
 void RtpReceiver::runLoop()
@@ -666,9 +690,13 @@ void RtpReceiver::runLoop()
 		}
 
 		sockaddr_in from{};
-		socklen_t   fromLen = sizeof(from);
-		int n = static_cast<int>(recvfrom(sock, buffer, sizeof(buffer), 0,
-			reinterpret_cast<sockaddr*>(&from), &fromLen));
+		// Issue #469: recvfrom() into this 512 B buffer silently CUT any longer
+		// datagram (lwIP returns min(len, datagram) and says nothing), and the
+		// cut packet was parsed as valid RTP. The shared helper reports the cut
+		// (recvmsg + MSG_TRUNC, UdpRecv.hpp); a cut datagram is dropped and
+		// counted -- never parsed, decoded or relayed.
+		const udprecv::Result rx = udprecv::recvDatagram(sock, buffer, sizeof(buffer), &from);
+		int n = rx.n;
 
 		// Fed on every wake -- the 500 ms recv timeout bounds how long this can
 		// go silent even with no inbound packets, same reasoning as the comment
@@ -678,6 +706,11 @@ void RtpReceiver::runLoop()
 			(void)esp_task_wdt_reset();
 		}
 
+		if (rx.truncated)
+		{
+			s_rxOversizeDrops.fetch_add(1, std::memory_order_relaxed);   // #469
+			continue;
+		}
 		if (n <= 0)
 		{
 			// Timeout (EAGAIN) or socket closed by stop(): re-check the stop flag.

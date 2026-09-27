@@ -146,10 +146,10 @@ error to report.
 
 ### Defaults stay conservative
 
-The shipped posture is an **open** SoftAP, an **`open`** SIP registrar, plain
-HTTP, and unsigned OTA. WPA2 on the SoftAP (`ap_secure`) and the `learn`/`secure`
-registrar modes are opt-in, because each of them breaks an already-deployed fleet
-the moment it is turned on. A PR that flips one of these defaults is a
+The shipped posture is an **open** SoftAP, a **`learn`** SIP registrar (the `open`
+registrar is retired, #500), plain HTTP, and unsigned OTA. WPA2 on the SoftAP
+(`ap_secure`) and the `secure` registrar mode are opt-in, because each of them breaks
+an already-deployed fleet the moment it is turned on. A PR that flips one of these defaults is a
 breaking change and needs to be argued as one, not slipped in as a hardening
 tidy-up.
 
@@ -371,6 +371,7 @@ Current allocation:
 | `18170`-`18179` | `ProvisioningConfig_test.cpp` (auto-incrementing `_nextPort`) |
 | `18200`-`18229` | `SmtpDialogue_test.cpp` (fake SMTP server, raw sockets — not HttpServer, but still claims its own block; ~17 scripted-server tests via auto-incrementing `g_nextPort`, sized with headroom. Originally claimed 18130-18159 — renumbered here, at merge time, when that turned out to collide with the two rows above it, which claimed the same "next free block" independently and landed first. See #159's PR for the story; the lesson is in `SmtpDialogue_test.cpp`'s own header comment.) |
 | `18230`-`18239` | `CoreDumpHttp_test.cpp` (auto-incrementing `_nextPort`) |
+| `18240`-`18249` | `FactoryResetSecrets_test.cpp` (auto-incrementing `_nextPort`) |
 | `19100`+ | `TelephonyConfigHttp_test.cpp` (auto-incrementing `_nextPort`) |
 | `193xx` | `ApiKillParse_test.cpp` (auto-incrementing `_nextPort`) |
 

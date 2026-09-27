@@ -35,6 +35,8 @@ namespace
 			c.mulaw.assign(mulaw, mulaw + rec.length);
 			calls.push_back(std::move(c));
 		}
+		int wipes = 0;
+		void wipe() override { ++wipes; }
 	};
 
 	vmarchive::QueuedRecording makeRec(int slot, const char* ext, const char* callId,

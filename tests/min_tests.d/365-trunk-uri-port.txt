@@ -1,0 +1,2 @@
+# SipTrunk_test.cpp SipTrunkUriPort: pin test replaced by 2 (#365)
+1

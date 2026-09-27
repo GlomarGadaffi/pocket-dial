@@ -238,7 +238,7 @@ bool TelephonyAnchorClient::start()
 	// 4. #100: cold-prime EVERY call slot's POST TLS session (keep-alive) in the background so a
 	// cold-start concurrent burst RESUMES each per-call POST open instead of paying the S3's ~1s
 	// software ECDHE. One-shot, off this task. (GET stays cold per call — see prewarmAllSlots.)
-	if (xTaskCreateWithCaps(&TelephonyAnchorClient::prewarmTaskTrampoline, "tel_prewarm", 6144, this, 4, nullptr, PD_TASK_STACK_CAPS) != pdPASS)
+	if (pd::createTaskPreferPsram(&TelephonyAnchorClient::prewarmTaskTrampoline, "tel_prewarm", 6144, this, 4, nullptr) != pdPASS)
 	{
 		ESP_LOGW(TAG, "start: failed to spawn slot pre-warm worker (first concurrent burst pays cold handshakes)");
 	}
@@ -1809,7 +1809,7 @@ void TelephonyAnchorClient::prewarmTaskTrampoline(void* arg)
 {
 	auto* self = static_cast<TelephonyAnchorClient*>(arg);
 	self->prewarmAllSlots();
-	vTaskDeleteWithCaps(nullptr);
+	pd::deleteTask(nullptr);
 }
 
 void TelephonyAnchorClient::prewarmAllSlots()
@@ -2212,8 +2212,8 @@ bool TelephonyAnchorClient::startWsWorkers()
 		// TLS HTTP the WS task used to carry. Unpinned so the scheduler keeps it off the SIP core.
 		// #100: stack in PSRAM (WithCaps) — with kWsWorkers>1 for concurrent setup, N*12 KB would
 		// otherwise eat internal RAM. TLS I/O only (no flash writes) → PSRAM-safe; self-deletes WithCaps.
-		if (xTaskCreateWithCaps(&TelephonyAnchorClient::wsWorkerTrampoline, "tel_wsw", 12288, this, 4,
-		                &_wsWorkerHandles[i], PD_TASK_STACK_CAPS) != pdPASS)
+		if (pd::createTaskPreferPsram(&TelephonyAnchorClient::wsWorkerTrampoline, "tel_wsw", 12288, this, 4,
+		                &_wsWorkerHandles[i]) != pdPASS)
 		{
 			ESP_LOGE(TAG, "startWsWorkers: xTaskCreate worker %d failed (heap?)", i);
 			_wsWorkerHandles[i] = nullptr;
@@ -2268,7 +2268,7 @@ void TelephonyAnchorClient::wsWorkerTrampoline(void* arg)
 	auto* self = static_cast<TelephonyAnchorClient*>(arg);
 	self->runWsWorker();
 	if (self->_wsWorkerDoneSem) xSemaphoreGive(self->_wsWorkerDoneSem);   // released BEFORE delete
-	vTaskDeleteWithCaps(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
+	pd::deleteTask(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
 }
 
 void TelephonyAnchorClient::runWsWorker()
@@ -2807,7 +2807,7 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 	// #100: stack in PSRAM (WithCaps) — N concurrent calls' GET-rx tasks would otherwise exhaust
 	// internal RAM. The task does HTTPS GET reads + the audio rx callback only (no flash writes),
 	// so a PSRAM stack is safe. Force-kill + self-exit both use vTaskDeleteWithCaps.
-	BaseType_t rc = xTaskCreatePinnedToCoreWithCaps(&TelephonyAnchorClient::rxTaskTrampoline, "tel_media_rx", 6144, arg, 6, &slot->rxTaskHandle, 1, PD_TASK_STACK_CAPS);
+	BaseType_t rc = pd::createTaskPreferPsram(&TelephonyAnchorClient::rxTaskTrampoline, "tel_media_rx", 6144, arg, 6, &slot->rxTaskHandle, 1);
 	if (rc != pdPASS)
 	{
 		ESP_LOGE(TAG, "Failed to create Rx task for %s", participantId.c_str());
@@ -2994,7 +2994,7 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 			if (xSemaphoreTake(doneSem, pdMS_TO_TICKS(2000)) != pdTRUE)
 			{
 				ESP_LOGE(TAG, "Rx task failed to exit in time! Forcing task deletion.");
-				vTaskDeleteWithCaps(taskToKill);   // #100: rx task is WithCaps(PSRAM) — reclaim its stack
+				pd::deleteTask(taskToKill);   // #100: rx task is WithCaps(PSRAM) — reclaim its stack
 				// try_lock: if the deleted task was holding getMutex when killed, the mutex is
 				// permanently poisoned and a blocking lock_guard would deadlock here.
 				if (slot->getMutex.try_lock())
@@ -3070,7 +3070,7 @@ void TelephonyAnchorClient::rxTaskTrampoline(void* arg)
 	{
 		xSemaphoreGive(slot->rxDoneSem);
 	}
-	vTaskDeleteWithCaps(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
+	pd::deleteTask(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
 }
 
 void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
@@ -3139,6 +3139,11 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	TickType_t           delay        = pdMS_TO_TICKS(50);   // Start fast at 50ms
 	bool opened = false;
 	int  transportFailures = 0;
+	// #518: one diagnostic line per DISTINCT refusal status per stream, not per
+	// retry and not just the first -- a 404 while the far end is still ringing
+	// must not use up the line the 403 needs. At most 4 lines per stream.
+	int loggedRefusals[4] = {};
+	int loggedRefusalCount = 0;
 
 	{
 		std::lock_guard<std::mutex> lock(_getMutex);
@@ -3201,7 +3206,27 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					// Drain the error body completely so the persistent connection can
 					// carry the next attempt (an unread body poisons handle reuse).
 					char drainBuf[256];
-					while (esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
+					int firstChunk = esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf));
+					bool seen = false;
+					for (int i = 0; i < loggedRefusalCount; ++i) seen = seen || (loggedRefusals[i] == status);
+					if (!seen && loggedRefusalCount < 4)
+					{
+						// #518: on .244 every anchored call's GET answered 403 for all 240
+						// attempts, and the log said only the status. Once per distinct
+						// status, say which URL and what the server said (3CX names the
+						// reason in the body). The URL carries no credential -- the token
+						// is a header -- and the body is 3CX's error text, truncated to
+						// 200 bytes, with control characters blanked so a CR/LF in it
+						// cannot split the line on a syslog collector.
+						loggedRefusals[loggedRefusalCount++] = status;
+						const int shown = firstChunk > 0 ? (firstChunk < 200 ? firstChunk : 200) : 0;
+						for (int i = 0; i < shown; ++i)
+							if (static_cast<unsigned char>(drainBuf[i]) < 0x20) drainBuf[i] = ' ';
+						ESP_LOGW(TAG, "GET stream refused (HTTP %d) for %s: %.*s", status, getUrl.c_str(),
+							shown, drainBuf);
+					}
+					while (firstChunk > 0 &&
+						esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
 					transportFailures = 0;
 				}
 				else

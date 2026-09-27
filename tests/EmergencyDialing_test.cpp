@@ -227,6 +227,24 @@ TEST(EmergencyDialing, DialingNineOneOneReachesTheTrunkWithTheBareNumber)
 		<< "the anchor must be asked to dial exactly 911";
 }
 
+TEST(EmergencyDialing, ASecuredCallerInLearnModeReachesNineOneOneWithoutCredentials)
+{
+	// #505 challenges INVITEs from Secured devices in Learn mode. 911 is never
+	// gated (#454): the emergency branch runs before that challenge, so a Secured
+	// phone with no (or expired) credentials still reaches the trunk.
+	Bench b;
+	ASSERT_NE(b.loopback(), nullptr);
+	ASSERT_TRUE(b.loopback()->isConnected());
+	b.handler->setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+	b.handler->adoptDeviceForTest("0200000000cc", "101", Registrar::DeviceState::Secured);
+
+	b.handler->handle(emInvite("101", "911", "192.168.77.11", "em-911-secured"));
+
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
+		<< "a Secured caller without credentials must still reach 911";
+	EXPECT_FALSE(b.wire.saw("SIP/2.0 401"));
+}
+
 TEST(EmergencyDialing, DialingNineNineOneOneStillReachesTheTrunkAsNineOneOne)
 {
 	Bench b;
