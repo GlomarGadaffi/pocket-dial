@@ -247,7 +247,9 @@ namespace DeviceConfig
 	// seed, so "factory" means "as flashed", not "as hardcoded".
 	//
 	// `schema_ver` is deliberately NOT dropped — see the schema section below.
-	void clearAll();
+	// Returns false if any NVS step failed (#441 review): the factory-reset
+	// route reports that instead of claiming a completed reset.
+	bool clearAll();
 
 	// =====================================================================
 	// NVS schema versioning (issue #181)
@@ -325,7 +327,11 @@ namespace DeviceConfig
 	// migration table. Do not bump it for a key that is merely ADDED — an absent
 	// key already has a defined meaning everywhere in this codebase (use the
 	// default), which is why adding syslog_host or reg_mode needed no migration.
-	constexpr uint16_t kSchemaVersion = 1;
+	//
+	// v2 (#397/#441): an ABSENT reg_mode used to mean Open and now means Learn.
+	// The v1 -> v2 row writes Open onto every pre-#397 board that has no key, so
+	// deployed boards keep admitting their phones exactly as before.
+	constexpr uint16_t kSchemaVersion = 2;
 
 	// What a pre-versioning device is assumed to be holding. Every release up to
 	// and including the one that introduced this framework wrote exactly this
