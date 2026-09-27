@@ -249,7 +249,7 @@ There is deliberately no HSTS. This is plain HTTP on a LAN appliance, and pinnin
 make the device permanently unreachable over `http://`.
 
 ### Worker Protection & Robustness (Issue #23)
-* Slowloris protection: The worker thread sets a strict 5-second socket receive timeout (`SO_RCVTIMEO`) using `setsockopt` to terminate slow-sending or dead TCP connections.
+* Slowloris protection (#529): everything read before a request is dispatched (headers plus the buffered body) must arrive within 10 s of the accept (`HttpServer::kReadDeadlineMs`); each `recv()` waits at most 5 s and never past that deadline, and a request not in by then is dropped and counted (`httpReadDeadlineDrops`). One source address may hold at most 3 of the 4 connection slots (`kMaxConnectionsPerSource`); a fourth is refused `503` and counted (`httpPerSourceRefusals`). Authenticated OTA/MoH uploads leave this path after the auth check and keep their own budgets.
 * Heap stack safety: Rather than allocating a raw stack-local character buffer, the worker uses a heap-allocated `std::vector<char>` read buffer. `sdkconfig.defaults` sets `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192`, so a 4 KB stack-local buffer would consume half the thread's stack before any handler ran.
 * Buffer overflow cap: The worker parses the `Content-Length` header and enforces a maximum payload limit of **16 KB** (16,384 bytes). If a client attempts to upload a larger body (e.g., in a malicious POST flood to `/api/wifi/connect`), the worker immediately responds with `413 Payload Too Large` and aborts the connection, securing the target's RAM.
 

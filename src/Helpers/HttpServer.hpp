@@ -17,6 +17,7 @@
 #include <string_view>
 #include <functional>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <cstdint>
 
@@ -63,6 +64,29 @@ public:
 	// depend on which of the two lands first. It is also comfortably more than
 	// the dashboard uses: the SPA is one document plus its polled JSON.
 	static constexpr int kMaxConcurrentConnections = 4;
+	// Issue #529: those 4 slots were cheap to hold. The only read timeout was
+	// per recv() (5 s), and the buffered body loop runs BEFORE any auth check,
+	// so one unauthenticated host could trickle a body a byte every few seconds
+	// on all four and keep the admin plane at 503 for hours. Two bounds:
+	//  - one source address may hold at most kMaxConnectionsPerSource slots,
+	//    so at least one is always left for everyone else;
+	//  - everything read before dispatch (headers + buffered body) must arrive
+	//    within kReadDeadlineMs of the accept, or the connection is dropped.
+	// Authenticated streaming uploads (OTA, MoH) keep their own budgets: they
+	// leave the buffered path after the auth check, before the body.
+	static constexpr int kMaxConnectionsPerSource = kMaxConcurrentConnections - 1;
+	static constexpr long kReadDeadlineMs = 10000;
+	// Counted drops (#529), for /api/status.
+	uint32_t readDeadlineDrops() const { return _readDeadlineDrops.load(std::memory_order_relaxed); }
+	uint32_t perSourceRefusals() const { return _perSourceRefusals.load(std::memory_order_relaxed); }
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#529): a short deadline so a slow-client test runs in well
+	// under a second instead of kReadDeadlineMs.
+	void setReadDeadlineMsForTest(long ms) { _readDeadlineMs = ms; }
+	// Handler threads still alive, so a test can wait for them before the
+	// server (which they reference) is destroyed.
+	int activeConnectionsForTest() const { return _activeConnections.load(std::memory_order_acquire); }
+#endif
 
 	HttpServer(const std::string& ip, int port, RequestsHandler* handler = nullptr);
 	~HttpServer();
@@ -482,6 +506,17 @@ private:
 	// the thread is created and released by the thread itself on exit, so a burst
 	// arriving faster than threads can start cannot overshoot the cap.
 	std::atomic<int> _activeConnections{0};
+	// Issue #529: live connections per source address. Fixed size -- at most
+	// kMaxConcurrentConnections distinct sources can be live at once -- so it
+	// never allocates. The accept thread claims, the handler thread releases.
+	struct SourceSlot { uint32_t addr = 0; int count = 0; };
+	SourceSlot _sources[kMaxConcurrentConnections]{};
+	std::mutex _sourcesMutex;
+	bool claimSource(uint32_t addr);     // false: that source is at its cap
+	void releaseSource(uint32_t addr);
+	std::atomic<uint32_t> _readDeadlineDrops{0};
+	std::atomic<uint32_t> _perSourceRefusals{0};
+	long _readDeadlineMs = kReadDeadlineMs;
 
 	// Track server uptime
 	uint64_t _startTime;
