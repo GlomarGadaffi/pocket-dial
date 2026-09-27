@@ -200,7 +200,7 @@ private:
 	};
 
 	bool persistMode();   // false (and logged at ERROR) if any NVS step failed
-	void persistDevices();
+	bool persistDevices();   // false (and logged at error) if any NVS step failed
 	// #440: the entry to forget when a new MAC needs room at POCKETDIAL_MAX_CLIENTS:
 	// the OLDEST plain Learned entry (offline ones first). Never a locked or
 	// Secured device; end() when every entry is locked/Secured.

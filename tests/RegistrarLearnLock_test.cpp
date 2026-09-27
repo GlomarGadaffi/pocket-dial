@@ -205,17 +205,19 @@ TEST_F(LearnLockTest, AFullTableEvictsTheOldestUnlockedNeverALockedDevice)
 			Registrar::DeviceState::Learned, /*locked=*/true);
 	ASSERT_EQ(_handler->getAdoptedDevices().size(), static_cast<size_t>(POCKETDIAL_MAX_CLIENTS));
 
-	ArpLookup::setMockMac(addrFor("192.168.60.99"), macOf(0x99));
+	// Newcomer MACs sit OUTSIDE the seeded 0x80.. range (Crew, #487 review: 0x99
+	// and 0x98 were already seeded, so nothing was new and nothing was evicted).
+	ArpLookup::setMockMac(addrFor("192.168.60.99"), macOf(0x41));
 	EXPECT_EQ(registerFrom("399", "192.168.60.99").substr(0, 11), "SIP/2.0 200")
 		<< "a full table must not refuse every new phone forever";
 	EXPECT_EQ(device(hexOf(0x80)), nullptr) << "the oldest UNLOCKED entry is the one evicted";
-	EXPECT_NE(device(hexOf(0x99)), nullptr);
+	EXPECT_NE(device(hexOf(0x41)), nullptr);
 	for (int i = 1; i < POCKETDIAL_MAX_CLIENTS; ++i)
 		EXPECT_NE(device(hexOf(static_cast<uint8_t>(0x80 + i))), nullptr) << "a locked device was evicted";
 
 	// Now every entry but the newcomer is locked; lock the newcomer too.
 	registerFrom("399", "192.168.60.99");
-	ArpLookup::setMockMac(addrFor("192.168.60.98"), macOf(0x98));
+	ArpLookup::setMockMac(addrFor("192.168.60.98"), macOf(0x40));
 	EXPECT_EQ(registerFrom("398", "192.168.60.98").substr(0, 11), "SIP/2.0 403")
 		<< "with only locked devices left, refuse rather than release a lock";
 }
@@ -226,6 +228,30 @@ TEST_F(LearnLockTest, SecuredDevicesBehaveAsBefore)
 	ArpLookup::setMockMac(addrFor("192.168.60.66"), macOf(0x66));
 	EXPECT_EQ(registerFrom("201", "192.168.60.66").substr(0, 11), "SIP/2.0 403")
 		<< "a Secured extension stays locked to its device, as before #440";
+}
+
+// Crew's #487 review (MEDIUM 1): one REGISTER for another extension with a locked
+// phone's source IP forged (so ARP returns its real MAC) used to release the lock
+// and mark the MAC shared for good. A locked record never moves: the other
+// extension is plain TOFU and the lock holds.
+TEST_F(LearnLockTest, AForgedRegisterForAnotherExtensionCannotReleaseALock)
+{
+	ArpLookup::setMockMac(addrFor("192.168.60.21"), macOf(0x21));
+	registerFrom("201", "192.168.60.21");
+	registerFrom("201", "192.168.60.21");
+	ASSERT_TRUE(device(hexOf(0x21)) && device(hexOf(0x21))->locked);
+
+	EXPECT_EQ(registerFrom("202", "192.168.60.21").substr(0, 11), "SIP/2.0 200")
+		<< "the other extension is admitted as TOFU";
+	const auto* d = device(hexOf(0x21));
+	ASSERT_NE(d, nullptr);
+	EXPECT_EQ(d->extension, "201") << "a locked record must not move";
+	EXPECT_TRUE(d->locked);
+	EXPECT_FALSE(d->shared) << "a locked MAC is never marked shared by one packet";
+
+	ArpLookup::setMockMac(addrFor("192.168.60.66"), macOf(0x66));
+	EXPECT_EQ(registerFrom("201", "192.168.60.66").substr(0, 11), "SIP/2.0 403")
+		<< "and the attacker still cannot take the locked extension";
 }
 
 // #507 finding 1 (Crew): an ARP miss must not admit a Secured extension. An
@@ -250,7 +276,9 @@ TEST_F(LearnLockTest, AnUnauthenticatedRegisterCannotMoveASecuredDevicesExtensio
 	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Secured);
 	ArpLookup::setMockMac(addrFor("192.168.60.21"), macOf(0x21));
 
-	EXPECT_NE(registerFrom("999", "192.168.60.21").substr(0, 11), "SIP/2.0 200");
+	// An ORDINARY extension: "999" is refused by the reserved-AOR guard before
+	// admitLearn ever runs, which left this test green without the fix (Crew, #487).
+	EXPECT_NE(registerFrom("202", "192.168.60.21").substr(0, 11), "SIP/2.0 200");
 	const auto* d = device(hexOf(0x21));
 	ASSERT_NE(d, nullptr);
 	EXPECT_EQ(d->extension, "201") << "the Secured record must not have moved";

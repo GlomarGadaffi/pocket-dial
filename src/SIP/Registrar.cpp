@@ -483,11 +483,27 @@ Registrar::AuthDecision Registrar::admitLearn(
 		return admitSecure(data, ext, outRejectReason);
 	}
 
+	if (rec.extension != ext && rec.locked && !rec.shared)
+	{
+		// Crew's #487 review: a LOCKED record never moves on an unauthenticated
+		// REGISTER -- the same rule #507 applies to Secured records. One REGISTER
+		// for another extension with the locked phone's source IP forged used to
+		// release the lock, mark the MAC shared (persisted, so it could never lock
+		// again) and let the attacker take the extension. Admit the other
+		// extension as TOFU and leave this device's record exactly as it is.
+		// Phones behind NAT keep working: the router's MAC stays locked to its
+		// first extension, the others register as plain TOFU.
+		_env.log("Learn: locked device " + mac + " (ext " + rec.extension + ") registered ext " +
+			ext + "; admitted as TOFU, the lock stays");
+		return AuthDecision::Accept;
+	}
+
 	if (rec.extension != ext)
 	{
-		// One MAC, a second extension: phones behind a NAT router, or a phone
-		// re-provisioned to a new AOR. Either way this MAC can no longer vouch for
-		// one extension, so it stops locking. Keep the extension in sync as before.
+		// One MAC, a second extension, while still UNLOCKED: phones behind a NAT
+		// router, or a phone re-provisioned to a new AOR. Either way this MAC can no
+		// longer vouch for one extension, so it stops locking. Keep the extension in
+		// sync as before.
 		if (!rec.shared)
 		{
 			rec.shared = true;
@@ -707,10 +723,11 @@ void Registrar::loadDevices()
 #endif
 }
 
-void Registrar::persistDevices()
+bool Registrar::persistDevices()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	// mac \t extension \t state(int). Bounded by POCKETDIAL_MAX_CLIENTS, so the blob
+	// mac \t extension \t state(int) \t flags(int) \t seq(u32); the last two are
+	// #440's (see loadDevices()). Bounded by POCKETDIAL_MAX_CLIENTS, so the blob
 	// is fixed-footprint. Write-through after each adoption / secure / forget. Caller
 	// holds _mutex; online state is NOT persisted (it is volatile registration state).
 	std::string blob;
@@ -722,12 +739,28 @@ void Registrar::persistDevices()
 		blob += std::to_string((rec.locked ? 1 : 0) | (rec.shared ? 2 : 0)); blob += '\t';
 		blob += std::to_string(rec.seq); blob += '\n';
 	}
+	// Every NVS return is checked (Crew's #487 review): the lock and shared flags
+	// live only here, so a silently failed write would revert locks on the next
+	// reboot. Logged at error; callers carry on (the in-RAM table is still right).
 	nvs_handle_t h;
-	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
+	const esp_err_t openErr = nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h);
+	if (openErr != ESP_OK)
 	{
-		nvs_set_str(h, "devices", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
+		_env.log(std::string("Registrar: persisting the device table failed at open (") +
+			esp_err_to_name(openErr) + ")", true);
+		return false;
 	}
+	const esp_err_t setErr = nvs_set_str(h, "devices", blob.c_str());
+	const esp_err_t commitErr = (setErr == ESP_OK) ? nvs_commit(h) : setErr;
+	nvs_close(h);
+	if (setErr != ESP_OK || commitErr != ESP_OK)
+	{
+		_env.log(std::string("Registrar: persisting the device table FAILED (") +
+			esp_err_to_name(setErr != ESP_OK ? setErr : commitErr) + ")", true);
+		return false;
+	}
+	return true;
+#else
+	return true;
 #endif
 }
