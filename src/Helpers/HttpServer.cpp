@@ -9,6 +9,7 @@
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive wipe on factory reset
 #include "AdminAuth.hpp"
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
+#include "FactoryReset.hpp"    // Issue #363: the secrets factory reset must erase
 #include "DeviceConfig.hpp"
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
@@ -3584,10 +3585,11 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// documented "save always replaces" path, so it overwrites every trunk_*
 	// key including the secret.
 	//
-	// (smtp_pass and gsa_key in the same namespace are the identical
-	// pre-existing gap and are NOT addressed here -- issue #363; fixing them
-	// is a separate change with its own test.)
-	TrunkConfigStore::save(TrunkConfigStore::Config{});
+	const bool trunkErased = TrunkConfigStore::save(TrunkConfigStore::Config{});
+	// Issue #363: every other stored secret this function does not name --
+	// smtp_pass/gsa_key, every extension's digest HA1, the last coredump. The
+	// enumeration and the reasons live in FactoryReset.hpp.
+	const bool secretsErased = FactoryReset::eraseStoredSecrets();
 
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
@@ -3649,6 +3651,46 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		nvs_close(nvs_handle);
 	}
 #endif
+	// #437 review: a secret-store erase that FAILED must not be reported as a
+	// completed reset. The operator is about to hand this board on believing its
+	// credentials are gone. The board still restarts: the admin credential is
+	// already cleared above, so staying up half-reset helps nobody, and the reset
+	// can be run again once setup completes. (AdminAuth::clearCredential() and
+	// DeviceConfig::clearAll() return void, so their outcome is not visible here.)
+	// #441 (G-dubs's fold, taken over by Globox): the device-settings reset joins
+	// this same check. ONE 500 path for every failure; still one fixed literal per
+	// outcome, with no string building and no buffer on this deep http_conn frame
+	// (#284, #458). A failed reg_mode write can leave an old `secure` in place, the
+	// lockout this reset exists to rescue.
+	if (!trunkErased || !secretsErased || !deviceConfigCleared)
+	{
+		// One fixed literal per outcome: no string building on the HTTP task (#284).
+		static constexpr const char* kTrunkOnly =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the carrier trunk credentials "
+			"could not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
+		static constexpr const char* kSecretsOnly =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the email/SIP-digest secret stores "
+			"could not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
+		static constexpr const char* kBoth =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the carrier trunk credentials and "
+			"the email/SIP-digest secret stores could not be erased. Rebooting anyway; run the factory reset "
+			"again after setup.\"}";
+		static constexpr const char* kDeviceOnly =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the device settings "
+			"(AP password, registrar mode) could not be reset. Rebooting anyway; run the factory "
+			"reset again after setup.\"}";
+		static constexpr const char* kDeviceAndStores =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the device settings (AP password, "
+			"registrar mode) and one or more credential stores could not be reset. Rebooting anyway; run the "
+			"factory reset again after setup.\"}";
+		const bool storesOk = trunkErased && secretsErased;
+		const char* body = !deviceConfigCleared
+			? (storesOk ? kDeviceOnly : kDeviceAndStores)
+			: ((!trunkErased && !secretsErased) ? kBoth : (!trunkErased ? kTrunkOnly : kSecretsOnly));
+		sendResponse(sock, 500, "Internal Server Error", "application/json", body);
+	}
+	else
+	{
 	// Every build that reaches this line has completed the wipe above, so every
 	// build has to say so. This used to answer 200 only under POCKETDIAL_HAS_WIFI
 	// and drop eth/lan8720 into a 501 "factory reset not available on desktop" --
@@ -3657,20 +3699,6 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// concludes nothing happened. Report the outcome truthfully everywhere; only
 	// the follow-up instruction differs, because only the radio builds come back to
 	// a captive portal.
-	// #441 review: a device-settings reset that FAILED is not a completed reset.
-	// The one that matters is reg_mode: a failed write can leave an old `secure`
-	// in place, the lockout this reset exists to rescue. Same shape as #437's
-	// secret-store check: one fixed literal (no string building on the HTTP task,
-	// #284), and the board still restarts -- staying up half-reset helps nobody.
-	if (!deviceConfigCleared)
-	{
-		sendResponse(sock, 500, "Internal Server Error", "application/json",
-		             "{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the device settings "
-		             "(AP password, registrar mode) could not be reset. Rebooting anyway; run the factory "
-		             "reset again after setup.\"}");
-	}
-	else
-	{
 #if defined(POCKETDIAL_HAS_WIFI)
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"message\":\"Factory reset. Rebooting to captive-portal setup...\"}");

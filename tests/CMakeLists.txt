@@ -334,6 +334,8 @@ add_executable(sip_parser_tests
     CoreDumpHttp_test.cpp
     # Issue #397: the boot-time registrar default (fresh -> learn, existing -> open).
     RegistrarBootMode_test.cpp
+    # Issue #363: every secret-bearing store is empty after a factory reset.
+    FactoryResetSecrets_test.cpp
     # Issue #385: the brute-force state-recovery attack on IDGen, run for real
     # (DISABLED_ by default -- a full 2^31 search each; see the file header).
     IDGenPredict_test.cpp
@@ -460,6 +462,8 @@ add_executable(sip_parser_tests
     # Issue #382: HttpServer's /api/coredump* routes call it; the host arm serves
     # a test-installed fake image instead of flash.
     ../src/Helpers/CoreDumpStore.cpp
+    # Issue #363: the secrets a factory reset must erase.
+    ../src/Helpers/FactoryReset.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
     # length/charset bounds that stop a typo from bringing the AP up open.
     DeviceConfig_test.cpp
