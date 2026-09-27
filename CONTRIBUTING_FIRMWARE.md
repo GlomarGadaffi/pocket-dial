@@ -373,6 +373,7 @@ Current allocation:
 | `18230`-`18239` | `CoreDumpHttp_test.cpp` (auto-incrementing `_nextPort`) |
 | `18240`-`18249` | `FactoryResetSecrets_test.cpp` (auto-incrementing `_nextPort`) |
 | `18250`-`18259` | `HttpReadDeadline_test.cpp` (#529; 18250-18251 used) |
+| `18290`-`18299` | `EmergencyRoute_test.cpp` (one fixed port today, `18290`) |
 | `19100`+ | `TelephonyConfigHttp_test.cpp` (auto-incrementing `_nextPort`) |
 | `193xx` | `ApiKillParse_test.cpp` (auto-incrementing `_nextPort`) |
 

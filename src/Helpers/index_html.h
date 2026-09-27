@@ -238,6 +238,9 @@ input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(176
 .note{font-size:11px;color:var(--ink-dim);margin:4px 0}
 .msg{font-size:12px;font-family:var(--mono);min-height:16px;margin-top:4px}
 .ok{color:var(--idle)}.err{color:var(--alert)}.warn{color:var(--ringing)}
+/* #521: the no-emergency-route warning. Deliberately loud and full width. */
+.e911{background:rgba(210,111,101,.18);border-bottom:2px solid var(--alert);color:var(--ink);font-size:13px;padding:8px 14px;text-align:center}
+.e911 a{color:var(--ink)}
 
 .toggle{position:relative;display:inline-block;width:46px;height:24px;flex-shrink:0}
 .toggle input{opacity:0;width:0;height:0}
@@ -387,6 +390,9 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
     <button class="rbtn" onclick="openModal('help-modal')" title="Help (F1)">? Help</button>
   </div>
 </div>
+
+<!-- #521: shown while /api/status says no real provider can carry a 911 call. -->
+<div class="e911" id="e911-route-banner" role="alert" style="display:none">&#9888; <b>Emergency calling is not configured.</b> This system refuses 911 and 933 calls until a SIP trunk (<a href="/setup/trunk">/setup/trunk</a>) or a telephony provider (Interconnect) is set up. Keep another way to call 911 near every phone.</div>
 
 <main>
 
@@ -1376,12 +1382,22 @@ function put(url,body){return httpMethod("PUT",url,body);}
 function del(url,body){return httpMethod("DELETE",url,body);}
 function fetchStatus(){
   fetch("/api/status").then(function(r){return r.json();}).then(function(d){
-    statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);renderDialplan(d);pushPacketSample(d.packetsProcessed||0);applyWifiCapability(d);applyE911(d);
+    statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);renderDialplan(d);pushPacketSample(d.packetsProcessed||0);applyWifiCapability(d);applyE911(d);applyEmergencyRoute(d);
   }).catch(function(){failCount++;if(failCount>=2)setOnline(false);});
 }
+/* #521: where a 911 dial would go. "none" means the board refuses it, so the
+   banner stays up on every refresh until that changes. An ABSENT field (older
+   firmware, or no SIP engine attached yet) says nothing either way. */
+function applyEmergencyRoute(d){
+  var b=$("e911-route-banner");
+  if(!b||!d||typeof d.emergencyRoute==="undefined")return;
+  b.style.display=d.emergencyRoute==="none"?"":"none";
+}
 /* #450 / poll #454: the E911 banner. An ABSENT field (older firmware) shows
-   nothing, same rule as wifiCapable below. */
-function applyE911(d){var b=$("e911-banner");if(!b||!d||typeof d.e911Configured==="undefined")return;b.style.display=d.e911Configured?"none":"";}
+   nothing, same rule as wifiCapable below. Hidden while emergencyRoute is "none":
+   its text says a 911 call "still routes out", which is false then, and #521's
+   route banner already says 911 is refused. */
+function applyE911(d){var b=$("e911-banner");if(!b||!d||typeof d.e911Configured==="undefined")return;b.style.display=(d.e911Configured||d.emergencyRoute==="none")?"none":"";}
 /* #167: the board states whether it has a radio; the UI must not infer it from
    an empty scan. Older firmware predates the field, so an ABSENT wifiCapable is
    treated as capable -- the dashboard is served by the same board it manages, so

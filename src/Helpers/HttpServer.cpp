@@ -1776,6 +1776,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate = 0;
 	uint64_t keepalivesCrlf = 0;   // Issue #430: not drops
+	const char* emergencyRoute = nullptr;   // Issue #521; omitted with no engine
 	uint64_t droppedNoPool = 0;    // Issue #443/#444: discarded before handle()
 	uint64_t droppedOversize = 0;
 	uint64_t recvErrors = 0;
@@ -1798,6 +1799,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate = handler->getDroppedRate();
 		keepalivesCrlf = handler->getKeepalivesCrlf();
+		emergencyRoute = RequestsHandler::emergencyRouteName(handler->emergencyRoute());
 		const DropProbe& probe = handler->getDropProbe();
 		droppedNoPool = probe.count(DropProbe::Reason::NoPool);
 		droppedOversize = probe.count(DropProbe::Reason::Oversize);
@@ -1829,6 +1831,16 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 #else
 	json << "\"wifiCapable\":false,";
 #endif
+	// Issue #521: where a 911 dial would go -- "anchor", "trunk" or "none".
+	// "none" means the board refuses it with 503 (only the loopback simulator
+	// is configured), and the dashboard keeps a warning banner up for as long
+	// as it says so. Ungated like the rest of this block: whether this phone
+	// system can reach 911 is something anyone at a handset is entitled to
+	// know, and it names no host, account or credential.
+	if (emergencyRoute != nullptr)
+	{
+		json << "\"emergencyRoute\":\"" << emergencyRoute << "\",";
+	}
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
