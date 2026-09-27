@@ -46,6 +46,7 @@ namespace resetjournal
 		kSecrets  = 1u << 2,   // email / SIP-digest secret stores (#363)
 		kForwards = 1u << 3,   // call-forward targets (#450)
 		kNvsErase = 1u << 4,   // the whole-partition nvs_flash_erase()
+		kE911     = 1u << 5,   // E911 notify list (#450)
 		kOther    = 1u << 7,
 	};
 

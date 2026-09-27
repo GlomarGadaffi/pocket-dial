@@ -43,6 +43,7 @@
 #include "Session.hpp"
 #include "CallDetailRecord.hpp"
 #include "PcapCapture.hpp"
+#include "DropProbe.hpp"   // Issue #430: per-reason drop counts + recent-drop ring
 #include "PbxConfig.hpp"
 #include "DialPlan.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: pbx::EmergencyDial
@@ -154,6 +155,12 @@ public:
 	void forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
+	// Issue #430: packetsDropped split by reason (their sum), and the probe
+	// itself for its recent-drop ring (read with window()/at(); thread-safe,
+	// allocation-free on both sides).
+	uint64_t getDroppedInvalid() const;
+	uint64_t getDroppedRate() const;
+	const DropProbe& getDropProbe() const;
 	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
 	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
@@ -366,6 +373,25 @@ public:
 	// resolution has at least been ASKED FOR, which is what proves tick()
 	// primes the cache rather than leaving an FQDN trunk permanently dead.
 	TrunkResolver::Status trunkResolveStatusForTest();
+
+	// Exhaust virtual-peer capacity (#412): draw through the REAL allocator
+	// until it refuses, and hand back everything it gave out. Hold the vector
+	// to keep capacity exhausted; drop it to restore. Drawing through
+	// allocateVirtualPeer() rather than reading _virtualPeerPool directly is
+	// deliberate -- it exhausts whatever the allocator has behind the pool
+	// too (the #101A heap fallback while it exists), so the next draw really
+	// returns nullptr, which is the state every caller must survive.
+	std::vector<std::shared_ptr<SipClient>> exhaustVirtualPeersForTest()
+	{
+		std::vector<std::shared_ptr<SipClient>> held;
+		for (size_t guard = 0; guard < 4 * POCKETDIAL_VIRTUAL_PEERS + 64; ++guard)
+		{
+			auto p = allocateVirtualPeer("vpeer-drain", sockaddr_in{});
+			if (!p) break;
+			held.push_back(std::move(p));
+		}
+		return held;
+	}
 #endif
 
 	// ── Telephony-API credential slots (ported from drawbridge) ──────────────────
@@ -449,6 +475,16 @@ public:
 	// as sensitive as the credential tables above and lives in its own NVS
 	// namespace, "cdrlog" — see CdrRing::clearAll()).
 	void clearAllCallHistory();
+	// Issue #450: /api/factory-reset. Empties the call-forward table and erases
+	// it from NVS (forward targets are external numbers). False if the erase failed.
+	bool clearAllForwards();
+	// Issue #450 / poll #454: /api/factory-reset erases the E911 settings. False
+	// if the NVS erase failed. Leaves "E911 not configured" showing.
+	bool clearE911Config();
+	// True when a 911 call would notify someone on site. Lock-free (an atomic
+	// kept in step with every load/set/clear), so /api/status reads it on the
+	// HTTP thread without touching _mutex.
+	bool isE911Configured() const { return _e911Configured.load(std::memory_order_acquire); }
 
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint
@@ -535,6 +571,26 @@ public:
 	bool bindOutboundParticipantForTest(const std::string& callId, const std::string& ownLeg)
 	{
 		return bindOutboundParticipant(callId, ownLeg);
+	}
+
+	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
+	// anchor's CallEvent::Incoming does, and return the new session's Call-ID
+	// line ("" if routing declined). Without this no host test can reach an
+	// isAnchorInbound() session at all -- Loopback's own inbound hook is never
+	// wired through RequestsHandler (see anchorIsSynchronous()) -- and that gap
+	// is how #439's first cut relayed a handset's session refresh to the PSTN
+	// peer's zeroed address unnoticed. Not compiled into device firmware.
+	std::string routeInboundAnchorCallForTest(const std::string& routeDn,
+	                                          const std::string& participantId,
+	                                          const std::string& callerId)
+	{
+		_anchorRouteDn = routeDn;
+		routeInboundAnchorCall(participantId, callerId);
+		for (const auto& [cid, s] : _sessions)
+		{
+			if (s->isAnchorInbound()) return std::string(s->getCallID());
+		}
+		return {};
 	}
 
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
@@ -640,6 +696,9 @@ private:
 	// reaching the engine only through PbxEnv, so it adds one member and one
 	// call rather than more surface to this file.
 	EmergencyNotifier _e911Notifier{*this};
+
+	// PbxEnv hook for the DTMF factory-reset door (#450).
+	void wipeVoicemail() override { wipeAllVoicemail(); }
 
 	// ── PbxEnv: shared-infrastructure surface for the extracted machines ───────
 	// RequestsHandler is the PbxEnv implementation each decomposed state machine
@@ -1134,6 +1193,11 @@ public:
 	// with no writer task needed.
 	void drainVoicemailFlush(vmarchive::Sink& sink)
 	{
+		// #450: held for the whole drain so a factory reset's clear+wipe cannot
+		// land between a pop and its write (which would put a pre-reset message
+		// back on the card after the wipe). Leaf lock: never held with _mutex taken
+		// inside it.
+		std::lock_guard<std::mutex> drainLock(_vmDrainWipeMutex);
 		vmarchive::drainAll(_vmFlushQueue, sink, _vmStagingBufs,
 			[this](const vmarchive::QueuedRecording& rec) {
 				if (rec.stagingSlot >= 0 && rec.stagingSlot < static_cast<int>(POCKETDIAL_MAX_VOICEMAIL_LEGS))
@@ -1145,6 +1209,30 @@ public:
 			});
 	}
 	size_t voicemailFlushQueueDepthForTest() const { return _vmFlushQueue.size(); }
+	// Issue #450: factory reset. Drops every queued recording (so none is written
+	// after the wipe) and wipes `sink`, under the same lock drainVoicemailFlush()
+	// holds. Blocking SD I/O: HTTP task, or the DTMF door right before restart.
+	void wipeVoicemailArchive(vmarchive::Sink& sink)
+	{
+		std::lock_guard<std::mutex> drainLock(_vmDrainWipeMutex);
+		_vmFlushQueue.clear();
+		for (auto& busy : _vmFlushBusy) busy.store(false, std::memory_order_release);
+		sink.wipe();
+	}
+	// The archive this build actually has: the production SD sink on
+	// PD_ETH_HAS_SD builds, a test-installed one on host, otherwise nothing.
+	void wipeAllVoicemail()
+	{
+		vmarchive::Sink* sink = _vmSinkForTest;
+#if defined(PD_ETH_HAS_SD)
+		if (!sink) sink = &vmarchive::productionSink();
+#endif
+		if (sink) wipeVoicemailArchive(*sink);
+	}
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only: the sink wipeAllVoicemail() uses on host. Not owned.
+	void setVoicemailSinkForTest(vmarchive::Sink* sink) { _vmSinkForTest = sink; }
+#endif
 	// Runs every slot's pending retrieval SD job (list/read/delete), a
 	// no-op for any slot not Pending. The ESP+PD_ETH_HAS_SD writer task
 	// (spawned in the constructor, same task drainVoicemailFlush() above
@@ -1678,6 +1766,17 @@ private:
 	// returned for it (see drainVoicemailFlush() below) -- i.e. exactly the
 	// window findFreeVoicemailSlot() must refuse to reuse the slot in.
 	std::atomic<bool> _vmFlushBusy[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
+	// #450: excludes a factory-reset wipe from a drain in progress (see
+	// drainVoicemailFlush()). Plain member, no allocation.
+	std::mutex _vmDrainWipeMutex;
+	// See isE911Configured(). Written under _mutex (or single-threaded in the
+	// constructor) by refreshE911ConfiguredLocked().
+	std::atomic<bool> _e911Configured{false};
+	void refreshE911ConfiguredLocked()
+	{
+		_e911Configured.store(!_cfg.e911Config().notifyExts.empty(), std::memory_order_release);
+	}
+	vmarchive::Sink* _vmSinkForTest = nullptr;
 
 	// ── Retrieval SD-I/O job machine (Issue #246, retrieval slice 3/3) ──────
 	// listMessages()/readMessage()/markDeleted() are all SD I/O and must
@@ -1896,6 +1995,7 @@ private:
 
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
+	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
