@@ -3139,6 +3139,11 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	TickType_t           delay        = pdMS_TO_TICKS(50);   // Start fast at 50ms
 	bool opened = false;
 	int  transportFailures = 0;
+	// #518: one diagnostic line per DISTINCT refusal status per stream, not per
+	// retry and not just the first -- a 404 while the far end is still ringing
+	// must not use up the line the 403 needs. At most 4 lines per stream.
+	int loggedRefusals[4] = {};
+	int loggedRefusalCount = 0;
 
 	{
 		std::lock_guard<std::mutex> lock(_getMutex);
@@ -3201,7 +3206,27 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					// Drain the error body completely so the persistent connection can
 					// carry the next attempt (an unread body poisons handle reuse).
 					char drainBuf[256];
-					while (esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
+					int firstChunk = esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf));
+					bool seen = false;
+					for (int i = 0; i < loggedRefusalCount; ++i) seen = seen || (loggedRefusals[i] == status);
+					if (!seen && loggedRefusalCount < 4)
+					{
+						// #518: on .244 every anchored call's GET answered 403 for all 240
+						// attempts, and the log said only the status. Once per distinct
+						// status, say which URL and what the server said (3CX names the
+						// reason in the body). The URL carries no credential -- the token
+						// is a header -- and the body is 3CX's error text, truncated to
+						// 200 bytes, with control characters blanked so a CR/LF in it
+						// cannot split the line on a syslog collector.
+						loggedRefusals[loggedRefusalCount++] = status;
+						const int shown = firstChunk > 0 ? (firstChunk < 200 ? firstChunk : 200) : 0;
+						for (int i = 0; i < shown; ++i)
+							if (static_cast<unsigned char>(drainBuf[i]) < 0x20) drainBuf[i] = ' ';
+						ESP_LOGW(TAG, "GET stream refused (HTTP %d) for %s: %.*s", status, getUrl.c_str(),
+							shown, drainBuf);
+					}
+					while (firstChunk > 0 &&
+						esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
 					transportFailures = 0;
 				}
 				else
