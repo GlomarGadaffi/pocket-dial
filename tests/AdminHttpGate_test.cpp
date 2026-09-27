@@ -22,6 +22,7 @@
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
 #include "AdminAuth.hpp"
+#include "JsonReader.hpp"    // Issue #430: parse /api/status in the DropProbe tests
 #include "DmaFramePool.hpp"   // Issue #328: /api/status's l2Tx counters
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -1091,4 +1092,106 @@ TEST(OtaUpdater, ProgressFlagTracksSessionLifecycle)
 		EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
 	}
 	EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
+}
+
+// Issue #430: /api/status splits packetsDropped by reason for everyone, but the
+// per-drop source addresses and bytes are a session-only view, like the roster
+// (#207). The keep-alive fed here is the #430 suspect: "\r\n\r\n" from a phone.
+TEST(DropProbeStatus, CountsArePublicRecentDropsNeedASession)
+{
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	sockaddr_in phone{};
+	phone.sin_family = AF_INET;
+	phone.sin_port = htons(5062);
+	inet_pton(AF_INET, "192.168.9.181", &phone.sin_addr);
+	const std::string ping = "\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(ping, phone), ping);
+
+	HttpServer server("127.0.0.1", 18135, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string anon = bodyOf(httpGetRaw(18135, "/api/status"));
+	EXPECT_NE(anon.find("\"packetsDropped\":1,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"droppedInvalid\":1,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"droppedRate\":0,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"recentDrops\":[]"), std::string::npos)
+		<< "drop sources must be withheld without a session:\n" << anon;
+	EXPECT_EQ(anon.find("192.168.9.181"), std::string::npos) << anon;
+
+	const std::string loginResp = httpPostRaw(18135, "/api/admin/login", "username=admin&password=admin");
+	ASSERT_EQ(statusOf(loginResp), 200) << loginResp;
+	const std::string cookie = cookieOf(loginResp, "pd_session");
+	const std::string csrf   = csrfOf(loginResp);
+	ASSERT_EQ(statusOf(httpPostRaw(18135, "/api/admin/set-credential",
+		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
+
+	const std::string authed = bodyOf(httpGetRaw(18135, "/api/status", "pd_session=" + cookie));
+	EXPECT_NE(authed.find("\"reason\":\"invalid\",\"src\":\"192.168.9.181:5062\",\"len\":4,\"head\":\"0d0a0d0a\"}"),
+	          std::string::npos)
+		<< "a session must see who sent the dropped packet and its first bytes:\n" << authed;
+
+	AdminAuth::clearCredential();
+}
+
+// Issue #430 review: the per-drop "head" hex must be exactly 2 x headLen
+// characters and properly terminated at every length -- 0 (no wire bytes), 1,
+// and the full kHeadBytes (a longer datagram is clamped). Parsed as JSON, so a
+// stray byte past the hex (an unterminated buffer) fails the parse or the
+// length check rather than slipping through a substring find().
+TEST(DropProbeStatus, HeadHexIsExactAtZeroOneAndFullLength)
+{
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.9.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	sockaddr_in src{};
+	src.sin_family = AF_INET;
+	src.sin_port = htons(5070);
+	inet_pton(AF_INET, "192.168.9.77", &src.sin_addr);
+
+	const std::string ping = "\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(ping, src));          // no raw bytes: headLen 0
+	const std::string one = "x";
+	handler.handle(RequestsHandler::getMessageFromPool(one, src), one);      // headLen 1
+	const std::string longJunk = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	handler.handle(RequestsHandler::getMessageFromPool(longJunk, src), longJunk);   // clamped to 16
+	ASSERT_EQ(handler.getDroppedInvalid(), 3u);
+
+	HttpServer server("127.0.0.1", 18136, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string loginResp = httpPostRaw(18136, "/api/admin/login", "username=admin&password=admin");
+	ASSERT_EQ(statusOf(loginResp), 200) << loginResp;
+	const std::string cookie = cookieOf(loginResp, "pd_session");
+	const std::string csrf   = csrfOf(loginResp);
+	ASSERT_EQ(statusOf(httpPostRaw(18136, "/api/admin/set-credential",
+		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
+
+	const std::string body = bodyOf(httpGetRaw(18136, "/api/status", "pd_session=" + cookie));
+	JsonReader::Value root;
+	std::string err;
+	ASSERT_TRUE(JsonReader::parse(body, root, err)) << err << "\n" << body;
+	const auto& drops = root.arrayOr("recentDrops");
+	ASSERT_EQ(drops.size(), 3u) << body;
+
+	EXPECT_EQ(drops[0].stringOr("head", "?"), "");
+	EXPECT_EQ(drops[0].intOr("len", -1), 0);
+	EXPECT_EQ(drops[1].stringOr("head"), "78");
+	EXPECT_EQ(drops[1].intOr("len", -1), 1);
+	EXPECT_EQ(drops[2].stringOr("head"), "4142434445464748494a4b4c4d4e4f50");
+	EXPECT_EQ(drops[2].intOr("len", -1), 26);
+	for (const auto& d : drops)
+	{
+		EXPECT_EQ(d.stringOr("reason"), "invalid");
+		EXPECT_EQ(d.stringOr("src"), "192.168.9.77:5070");
+	}
+
+	AdminAuth::clearCredential();
 }
