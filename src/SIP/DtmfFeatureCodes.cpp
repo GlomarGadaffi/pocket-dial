@@ -369,8 +369,8 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 				// applies here too (drawbridge audit #70).
 				//
 				// allocVirtualPeer can return nullptr — pocket-dial's allocator
-				// refuses past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX rather than
-				// heap-falling-back forever the way drawbridge's does. There is no
+				// refuses as soon as the pool is spent (no heap fallback, #409),
+				// unlike drawbridge's, which heap-falls-back forever. There is no
 				// response to fail here (this is a mid-dialog DTMF feature, not a
 				// transaction), so the graceful degradation is to leave the call's
 				// existing destination alone: the caller simply doesn't get the

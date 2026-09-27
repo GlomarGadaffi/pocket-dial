@@ -1844,6 +1844,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
+	// Issue #409: draws refused by a spent pool (neither has a heap fallback).
+	// The message pool is process-global, so it reads even with no engine.
+	json << "\"msgPoolRefusals\":" << RequestsHandler::getMessagePoolRefusals() << ",";
+	json << "\"vpeerPoolRefusals\":" << (handler ? handler->getVirtualPeerRefusals() : 0) << ",";
 	// #450 / poll #454: false after a factory reset until the E911 notify list is
 	// set again. The dashboard shows a banner; nothing is gated on it.
 	json << "\"e911Configured\":" << (e911Configured ? "true" : "false") << ",";

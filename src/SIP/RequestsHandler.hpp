@@ -175,6 +175,10 @@ public:
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
 	// drop (responses, ACK).
 	uint64_t getSdpRejected() const;
+	// Issue #409: draws refused because a pool was spent -- there is no heap
+	// fallback behind either pool. The message pool is process-global.
+	uint64_t getVirtualPeerRefusals() const { return _vpeerRefusals.load(std::memory_order_relaxed); }
+	static uint64_t getMessagePoolRefusals();
 	// Issue #497: INVITEs refused because they did not come from the caller's
 	// registered address (the 403 "Caller Not Registered From This Address").
 	uint64_t getUnboundCallerRefusals() const { return _unboundCallerRefusals.load(std::memory_order_relaxed); }
@@ -2132,6 +2136,7 @@ private:
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	std::atomic<uint64_t> _vpeerRefusals{0};   // #409: allocateVirtualPeer() refusals
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
 	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped

@@ -234,7 +234,7 @@ TEST_F(SipRxEndToEnd, EmptyDatagramCountsAsInvalidAndKeepsThe430Sum)
 
 TEST_F(SipRxEndToEnd, PoolExhaustionDropIsCountedAsNoPool)
 {
-	// Genuinely spend the process-global pool and its heap fallback (as
+	// Genuinely spend the process-global pool (no heap fallback since #409) (as
 	// RequestsHandler_pool_test does), so createMessage() fails for real.
 	sockaddr_in src{};
 	src.sin_family = AF_INET;
@@ -242,7 +242,7 @@ TEST_F(SipRxEndToEnd, PoolExhaustionDropIsCountedAsNoPool)
 	const uint64_t processed = h().getPacketsProcessed();
 	{
 		std::vector<std::shared_ptr<SipMessage>> held;
-		const size_t cap = (POCKETDIAL_MSG_POOL + POCKETDIAL_MSG_HEAP_FALLBACK_MAX) * 4 + 16;
+		const size_t cap = POCKETDIAL_MSG_POOL * 4 + 16;
 		for (size_t i = 0; i < cap; ++i)
 		{
 			auto m = RequestsHandler::getMessageFromPool(registerRaw("hold" + std::to_string(i)), src);

@@ -2,11 +2,9 @@
 //
 // Two properties are under test here, and they are easy to conflate:
 //
-//   A. Exhaustion is BOUNDED and RECOVERABLE. Past the pool plus
-//      POCKETDIAL_MSG_HEAP_FALLBACK_MAX live heap fallbacks, getMessageFromPool()
-//      refuses instead of allocating without limit; releasing messages restores
-//      capacity, which is also the only way to observe that the fallback
-//      deleter gives its budget back.
+//   A. Exhaustion is BOUNDED and RECOVERABLE. Past the pool (there is no heap
+//      fallback since #409), getMessageFromPool() refuses instead of allocating;
+//      releasing messages restores capacity.
 //
 //   E. Every draw hands out a DISTINCT message. The pool is a process-global
 //      static scanned for use_count()==1 from the UDP receive task (off-lock)
@@ -56,9 +54,9 @@ namespace
 		       "Content-Length: 0\r\n\r\n";
 	}
 
-	// Pool depth plus the fallback ceiling: the total this process can ever have
-	// in flight at once.
-	constexpr size_t kCeiling = POCKETDIAL_MSG_POOL + POCKETDIAL_MSG_HEAP_FALLBACK_MAX;
+	// The pool depth: since #409 there is no heap fallback, so this is the total
+	// this process can ever have in flight at once.
+	constexpr size_t kCeiling = POCKETDIAL_MSG_POOL;
 
 	// The static _messagePool is populated lazily by the first RequestsHandler
 	// constructed in the process. A test that draws from the pool without one in

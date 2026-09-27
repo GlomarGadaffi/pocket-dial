@@ -63,38 +63,20 @@
 // flushed. Those pooled refs all live at once, so the pool must cover MAX_CLIENTS
 // (fan-out) + MAX_SUBSCRIPTIONS (NOTIFY burst), plus a little headroom for the
 // inbound request being processed and its direct response(s). Sizing it this way
-// keeps the broadcast+NOTIFY peak allocation-free instead of spilling to the
-// hot-path heap fallback in getMessageFromPool(). Override to claw back RAM on a
-// constrained node.
+// keeps the broadcast+NOTIFY peak inside the pool. Issue #409: past this depth
+// getMessageFromPool() REFUSES (there is no heap fallback), so this is a hard
+// ceiling on in-flight messages. Override to claw back RAM on a constrained node.
 #ifndef POCKETDIAL_MSG_POOL
 #define POCKETDIAL_MSG_POOL (POCKETDIAL_MAX_CLIENTS + POCKETDIAL_MAX_SUBSCRIPTIONS + 4)
 #endif
 
-// Issue #101(A): ceiling on the heap fallback taken when the message pool above
-// is fully drawn. It used to be unbounded — a sustained retransmit flood could
-// churn the heap indefinitely, and on a no-MMU ESP32 the eventual failure mode
-// is a bad_alloc out of the middle of the SIP task, not graceful degradation.
-//
-// This caps messages ALIVE AT ONCE on the fallback path, not a rate: the count
-// drops again as each one is released, so a burst is absorbed and only sustained
-// over-subscription is refused. Past the cap, getMessageFromPool() returns
-// nullptr and the caller drops the packet.
-//
-// Dropping is the honest answer rather than 503: building a 503 would itself
-// need a message out of the very pool that just came up empty. SIP over UDP
-// retransmits (RFC 3261 §17 T1 backoff), so a dropped packet costs latency, not
-// the call — and shedding load is the point when the server is this far behind.
-#ifndef POCKETDIAL_MSG_HEAP_FALLBACK_MAX
-#define POCKETDIAL_MSG_HEAP_FALLBACK_MAX 8
-#endif
-
-// Same ceiling for the virtual-peer pool (park orbits / BLF presence stand-ins).
-// Smaller because a virtual peer is a long-lived per-park-slot object, not a
-// per-packet one: needing more than a handful past the pool means the orbit
-// table is already full.
-#ifndef POCKETDIAL_VPEER_HEAP_FALLBACK_MAX
-#define POCKETDIAL_VPEER_HEAP_FALLBACK_MAX 4
-#endif
+// Issue #409: neither pool has a heap fallback any more (#101A's
+// POCKETDIAL_MSG_HEAP_FALLBACK_MAX / POCKETDIAL_VPEER_HEAP_FALLBACK_MAX are gone,
+// so it cannot be switched back on by config). A drained message pool makes the
+// caller DROP -- building a 503 would need a message out of the same empty pool,
+// and SIP over UDP retransmits (RFC 3261 §17). A drained virtual-peer pool makes
+// the caller answer 503 or abandon the feature cleanly (#412). Both are counted
+// in /api/status (msgPoolRefusals, vpeerPoolRefusals).
 
 // Maximum number of concurrent server-originated "register beep" dialogs. Each new
 // REGISTER fires a brief signaling-only auto-answer INVITE (the phone's intercom
