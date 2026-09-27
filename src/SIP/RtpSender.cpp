@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_task_wdt.h"   // Issue #235: rtp_media_tx TWDT subscription
+#include "UdpRcvBuf.hpp"    // Issue #496: per-socket receive cap
 #include "EthAccess.hpp"
 #include "ArpLookup.hpp"
 #include "DmaFramePool.hpp"
@@ -222,6 +223,13 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	{
 		ESP_LOGE("RtpSender", "socket() failed");
 		return false;
+	}
+	// Issue #496 / #509 review: this socket is bound but never read, so anything
+	// sent to it would sit in its mailbox until close -- with reassembly on, up
+	// to ~14.8 KB per datagram. Queue nothing.
+	if (!udprcvbuf::set(sock, udprcvbuf::kSendOnly))
+	{
+		ESP_LOGE("RtpSender", "SO_RCVBUF(0) failed: unread receive queue is UNBOUNDED");
 	}
 
 	// Bind the dedicated server media port so the source port is deterministic and

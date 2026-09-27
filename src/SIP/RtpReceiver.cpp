@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #235: rtp_media_rx TWDT subscription
+#include "UdpRcvBuf.hpp"    // Issue #496: per-socket receive cap
 #endif
 
 namespace
@@ -516,6 +517,12 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
 	{
 		ESP_LOGW("RtpReceiver", "SO_RCVTIMEO setsockopt failed (non-fatal)");
+	}
+	// Issue #496 / #509 review: with IPv4 reassembly on, a flood of completed
+	// fragmented datagrams at this port would queue up to ~14.8 KB each.
+	if (!udprcvbuf::set(sock, udprcvbuf::kRtp))
+	{
+		ESP_LOGE("RtpReceiver", "SO_RCVBUF(%d) failed: receive queue is UNBOUNDED", udprcvbuf::kRtp);
 	}
 
 	sockaddr_in local{};
