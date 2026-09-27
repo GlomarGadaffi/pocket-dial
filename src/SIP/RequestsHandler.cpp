@@ -1749,6 +1749,37 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Issue #497: the From header only NAMES the caller. Before this, any host on
+	// the link could place a call -- dial plan and trunk egress included -- as any
+	// registered extension just by writing its number in From, and in Learn mode
+	// (the default, #500) nothing else was checked. A call now has to come from
+	// the address that extension registered from. Source IP only, port-agnostic:
+	// the same rule isDialogSourceAuthorized() applies to BYE, since a phone may
+	// place calls from a different ephemeral port than it registered from.
+	// Deliberately AFTER the emergency branch: 911 is never gated (#454).
+	if (caller.value()->getAddress().sin_addr.s_addr != data->getSource().sin_addr.s_addr)
+	{
+		// Counted every time (/metrics); logged at most once per 10 s. A spoofer
+		// can send these as fast as it likes, and each log line allocates on this
+		// task (#284; BigDog's and Crew's #503 reviews).
+		_unboundCallerRefusals.fetch_add(1, std::memory_order_relaxed);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - _lastUnboundCallerLog >= std::chrono::seconds(10))
+		{
+			_lastUnboundCallerLog = now;
+			queueLog("INVITE refused: caller \"" + std::string(data->getFromNumber()) +
+				"\" is registered from a different address (#497; further refusals counted, "
+				"logged at most every 10 s)", true);
+		}
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 403 Caller Not Registered From This Address");
+		response->clearBody();
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		return;
+	}
+
 	// Secure mode: registration auth alone leaves call setup open to anyone who
 	// can reach UDP/5060 (drawbridge #125). Challenge the INVITE with the same
 	// digest machinery -- admitSecure() takes the method from the request line,
