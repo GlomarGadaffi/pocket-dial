@@ -3655,8 +3655,8 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// completed reset. The operator is about to hand this board on believing its
 	// credentials are gone. The board still restarts: the admin credential is
 	// already cleared above, so staying up half-reset helps nobody, and the reset
-	// can be run again once setup completes. (AdminAuth::clearCredential() and
-	// DeviceConfig::clearAll() return void, so their outcome is not visible here.)
+	// can be run again once setup completes. (AdminAuth::clearCredential() still
+	// returns void; DeviceConfig::clearAll()'s result is deviceConfigCleared.)
 	// #441 (G-dubs's fold, taken over by Globox): the device-settings reset joins
 	// this same check. ONE 500 path for every failure; still one fixed literal per
 	// outcome, with no string building and no buffer on this deep http_conn frame

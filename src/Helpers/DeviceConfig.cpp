@@ -954,8 +954,11 @@ namespace DeviceConfig
 		// #397: it is now WRITTEN as learn rather than erased. With no stored
 		// mode the next boot would read this (schema-stamped) board as an
 		// existing deployment and keep it open; a factory reset must come back
-		// like a fresh install instead. Learn still performs the rescue above --
-		// it accepts every first REGISTER -- so nothing is lost by writing it.
+		// like a fresh install instead. Learn performs the rescue above -- it
+		// accepts every first REGISTER -- as long as no extension was Secured:
+		// the device table survives this key-by-key reset, so a Secured phone
+		// whose HA1 #437 just wiped is refused until an admin forgets it (#441
+		// review). #456's whole-partition erase removes the table too.
 		//
 		// #441 review: the result is reported. With the v2 schema a failed write
 		// can no longer end in Open (no key boots learn), but it CAN leave an old

@@ -39,9 +39,9 @@ namespace
 
 TEST(RegistrarBootMode, AFreshInstallIsNotAnOpenRegistrar)
 {
-	// This is also the case after a factory reset: poll #455 made the reset a
-	// full nvs_flash_erase(), which takes the schema stamp with it, so the next
-	// boot is FreshInstall -> Learn.
+	// This is also the case after a full-erase factory reset (poll #455: the DTMF
+	// reset today, the HTTP reset once #456 lands): nvs_flash_erase() takes the
+	// schema stamp with it, so the next boot is FreshInstall -> Learn.
 	const auto d = Registrar::chooseBootMode(false, Mode::Open, Schema::FreshInstall);
 	EXPECT_EQ(d.mode, Mode::Learn)
 		<< "a board out of the box must not accept every REGISTER (#397)";
@@ -50,9 +50,10 @@ TEST(RegistrarBootMode, AFreshInstallIsNotAnOpenRegistrar)
 
 TEST(RegistrarBootMode, AfterAFullEraseFactoryResetTheBoardBootsLearn)
 {
-	// Named for the post-reset state (asked by G-dubs): since #455/#456 the HTTP
-	// reset ends in nvs_flash_erase(), so reg_mode AND the schema stamp are gone
-	// and the next boot is FreshInstall, whatever mode the board had before.
+	// Named for the post-reset state (asked by G-dubs): once #456 lands the HTTP
+	// reset ends in nvs_flash_erase() (the DTMF reset already does), so reg_mode
+	// AND the schema stamp are gone and the next boot is FreshInstall, whatever
+	// mode the board had before.
 	for (Mode before : {Mode::Open, Mode::Learn, Mode::Secure})
 	{
 		const auto d = Registrar::chooseBootMode(false, before, Schema::FreshInstall);
