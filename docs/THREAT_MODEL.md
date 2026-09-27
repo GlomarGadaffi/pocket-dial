@@ -107,13 +107,22 @@ CSPRNG `esp_random()`. The trust boundaries below describe the **device**.
 > realistic attacker is local/proximate, not remote.
 >
 > **The single biggest residual risk on a fresh board of *any* build, however, is the
-> OPEN SIP registrar** (§9). Digest auth, Learn mode and the extension↔MAC lock all ship
-> and all work, but `reg_mode` defaults to `open`, so out of the box any peer that can
-> reach UDP/5060, over the open AP *or* over a wired LAN, where TB-1 does not apply at
-> all, can REGISTER as any extension, place calls, and tear down other people's. The
-> HTTP admin plane has no equivalent hole: it is credential-gated from the first boot.
-> Turning the registrar off `open` is therefore the one hardening step that every
-> deployment needs, ahead of everything else in §7.
+> SIP registrar's trust-on-first-use** (§9). Since #441/#502 a fresh board boots `learn`
+> and `open` is retired, so the fully open registrar is gone. But Learn adopts an unknown
+> MAC on its first REGISTER of an unclaimed extension without any credential (S-4), and
+> admits an INVITE from a Learned (unsecured) extension without a challenge; only a device
+> an admin has promoted to Secured proves a secret on REGISTER and on INVITE (#505/#512),
+> and even that has two open bypasses: #507 (an ARP miss admits a Secured extension without
+> digest; a known MAC's extension is rewritten before the check) and the residuals of
+> credential replay: #549 is fixed by #555 (the digest uri must equal the Request-URI,
+> To must match it, and the INVITE's credential is stripped before any fork), but
+> #560 (the relayed ACK and re-INVITE/UPDATE still carry the INVITE's credential; fix #562 open) and #525 (a nonce/`nc` can be reused within its 5-minute life).
+> So any peer that can reach UDP/5060, over the open AP *or* over a wired LAN, where TB-1
+> does not apply at all, can still claim an unclaimed extension and call as an unsecured
+> one, from the address it registered from (#503 refuses an INVITE from any other). The HTTP
+> admin plane has no equivalent hole: it is credential-gated from the first boot.
+> Securing the fleet's devices (or running `secure`) is therefore the one hardening step
+> that every deployment needs, ahead of everything else in §7.
 
 
 ## 3. Assets
@@ -169,8 +178,8 @@ Each row lists the threat, the current mitigation, and the **residual risk**.
 |----|--------|-----------|---------------|
 | D-1 | Connection/slowloris exhaustion on HTTP | Detached per-connection threads, `SO_RCVTIMEO` (5 s), body cap; since #529 a 10 s deadline on everything read before dispatch (a trickled body is dropped and counted) and at most 3 of the 4 slots per source address. | A flood from the open AP can still pressure a constrained MCU. **This row assumes a *flood* is what it takes. On `main` today it is not, see D-5, where a handful of ordinary rejected requests is enough.** |
 | D-5 | **Resource exhaustion via the admin plane, what a *rejected* request costs.** E-2 reasons about what an unauthenticated read *discloses*; nothing in this section reasoned about the cost of a request the server refuses. An attacker who cannot authenticate at all can still make the server do work, and still make it allocate. | **Partial, and currently defeated by a bug.** The intended design is that every route in `handleClient()` falls through to the single `closeSocket(clientSock)` at `src/Helpers/HttpServer.cpp:763`, so a refused request costs one short-lived socket and nothing else. Gated routes are written `if (requireAdmin(...)) { ... }` precisely so the false branch reaches that close. **Three routes are written the other way**, `if (!requireAdmin(clientSock, req, false)) return;` at `:493` (`GET /api/moh`), `:500` (`POST /api/moh/preview`) and `:505` (`POST /api/moh/preview/stop`), and that early `return` jumps straight over the close. The socket is leaked on **every** rejected request, and `requireAdmin()` (`:2079-2125`) rejects on four separate paths: failed same-origin, no/invalid session (`401`), missing CSRF (`403`), and `setup_required` on a board whose default credential has not been replaced (`403`). Rate limiting on the SIP socket does not apply to the HTTP listener. | **High, and reachable with no credential.** Each refused request permanently consumes one lwIP socket; the descriptor table is the whole budget, and the WAN anchor holds persistent TLS sockets out of that same pool. **The bench board's effective budget is unresolved**: `sdkconfig.defaults:165` sets `CONFIG_LWIP_MAX_SOCKETS=48` (the constrained profile, `sdkconfig.defaults.esp32_constrained:43`, sets 8), while [PR #215](https://github.com/GlomarGadaffi/pocket-dial/pull/215)'s write-up cites 16 for the board it measured. The 14-request figure below is the **measurement**, not a derivation from either number, treat the exact threshold as board-dependent and the failure mode as certain. Bench measurement on merged `main` (`e20226d`): unauthenticated requests to `/api/moh`, **request 14 could not connect, 0/60 connections cleanly closed, and `/api/status` went unreachable**, i.e. the board left the network. The board does not recover without a reboot. A fresh board is *more* exposed, not less: before the operator sets a credential every gated route answers `403 setup_required` through the same leaking path. Fixed by [#215](https://github.com/GlomarGadaffi/pocket-dial/pull/215) (converted the three MOH routes to the fall-through form), **but the pattern was reintroduced afterward**: commit `9356d2d` ("wire up the dead RFC 5424 module") added `GET /api/syslog` and `POST /api/syslog` using the exact `if (!requireAdmin(...)) return;` form #215 had just eliminated, and neither route nor the reintroduction was caught until issue #159's PR noticed it while adding adjacent routes to the same file and fixed both (converted to the fall-through form, same as the rest of `handleClient()`). The durable fix, an RAII socket guard in `handleClient()` so the close cannot depend on each future route author noticing the convention, is still not done; until it is, **treat the HTTP listener as reachable-only-by-trusted-hosts on any board that matters**, and treat every future PR touching this file as needing this row re-checked, not just its own new routes. |
-| D-2 | Malicious call teardown (`/api/kill` abuse) | Admin-gated (session + CSRF) from first boot. | The fresh-board credential race (§5.1); **SIP-layer teardown (BYE spoofing) is still trivially possible while the registrar is `open`, which is the default** (S-3, §9). |
-| D-3 | Login-lockout used as self-DoS | **NOT retired, this row was wrong.** The per-client bucketing it claims is implemented in `AdminAuth` but **is never actually keyed**, because nothing fills in the key. `HttpServer::handleClient()` computes `peerIp` "for per-client brute-force accounting on `/api/admin/login`" (`HttpServer.cpp:247-263`) but assigns it only to `otaReq.clientIp` (`:330`, the OTA streaming path). `parseRequest()` (`:765-828`) never sets `req.clientIp`, so `sendApiAdminLogin` passes a default-constructed **empty string** to `isLockedOut()` and `verifyCredential()` (`:2720`, `:2729`, `:2732`), the same unkeyed bucket the DTMF PIN path uses. In effect there is **one global lockout bucket**, so a single guessing client on the link *can* lock the legitimate admin out of new logins, which is exactly the self-DoS this row says was fixed. Pre-existing sessions do stay valid, and only `login` is throttled (`429`), those two halves are true. | An **aggregate** backstop (20 consecutive failures across all clients, same doubling cooldown, capped at 16 min) still exists by design, without it, address spoofing would buy an attacker a fresh bucket every 5 guesses (§5.2). It is deliberately set far above ordinary fat-fingering, but it *is* shared: the DTMF PIN path has no HTTP peer and so uses the unkeyed bucket, meaning any SIP peer that can reach the admin menu (E-4) can also contribute failures toward that global counter and delay web logins. Bounded, auto-clearing, and cleared outright by any successful login, a nuisance, not a lockout. |
+| D-2 | Malicious call teardown (`/api/kill` abuse) | Admin-gated (session + CSRF) from first boot. | The fresh-board credential race (§5.1); **SIP-layer teardown (BYE spoofing)** is checked against a dialog leg's source address (#46, `isDialogSourceAuthorized()`), which is spoofable on the link. The check is not total: a handset-side BYE on a trunk call is answered before it (`RequestsHandler.cpp:5385`), and it fails open on a half-set-up dialog (`:9622-9625`). `open`, the old default, is retired (#441/#502), but a Learned (unsecured) extension still proves nothing (S-3, §9). |
+| D-3 | Login-lockout used as self-DoS | **NOT retired. Per-client keying is wired since #530, but the aggregate backstop still lets one address lock the admin out.** `handleClient()` sets `req.clientIp` from the peer address on every request (`HttpServer.cpp:684`), and `sendApiAdminLogin` keys both the lockout check and the accounting on that address plus the principal the username resolves to (`isLockedOutForAuth()` / `authenticate()`, `HttpServer.cpp:4517-4528`; principals from #173). One guessing client's *bucket* locks after 5 failures (60/120/240 s, doubling). (Before #530 nothing filled in the key, so every web login shared one unkeyed bucket and a single guesser *could* lock the admin out; an audit caught this row claiming otherwise.) Pre-existing sessions stay valid, and only `login` is throttled (`429`). | An **aggregate** backstop per principal (20 consecutive failures across all clients, the same doubling cooldown, capped at 16 min; `kMaxFailedAttemptsGlobal`, `AdminAuth.hpp:82`) still exists by design; without it, address spoofing would buy an attacker a fresh bucket every 5 guesses (§5.2). It is shared across clients, and **one address is enough to trip it**: `gb.failures` keeps counting across that client's own 60/120/240 s cooldowns and is cleared only by a correct login or a trip (`AdminAuth.cpp:1339-1356`), so a single guesser reaches the 20th failure in about 7 minutes and locks the real admin out, escalating to 16 minutes per trip. It auto-clears, and pre-existing sessions stay valid. The DTMF PIN path has no HTTP peer, so it uses the unkeyed `""` bucket and its own legacy counter. **Residual (#561):** that bucket lives in the same 8-slot LRU table as the per-address web-login buckets (`AdminAuth.cpp:941-966`, `:1480`), so eight failed web logins from fresh addresses evict it and clear an engaged PIN lockout, and the PIN guards the remote factory reset (E-4). |
 | D-4 | RF jamming / deauth of the SoftAP | None (inherent to WiFi). | Out of scope; physical/RF layer. |
 
 ### Elevation of Privilege
@@ -179,7 +188,7 @@ Each row lists the threat, the current mitigation, and the **residual risk**.
 | E-1 | Anonymous AP/LAN peer → full admin control | Fixed: session (+CSRF) gate on every admin endpoint, unconditional from first boot. There is no "unprovisioned, admit everyone" branch left in `requireAdmin()`. | The fresh-board credential race (§5.1); physical/OTA paths (T-4/T-5). |
 | E-2 | Read endpoints leaking privileged actions | **The unauthenticated read surface is larger than this row used to claim, and not all of it was assessed.** Taken from the route table in `HttpServer::handleClient()` (`src/Helpers/HttpServer.cpp:457-755`), the routes that reach a handler with **no** `requireAdmin()` call are: `GET /` (`:457`), `GET /config/<mac>.cfg` (`:461`), `GET /api/status` (`:471`), `GET /metrics` (`:475`), `GET /api/wifi/scan` (`:638`), `GET /api/admin/status` (`:713`) and `GET /api/ota/status` (`:742`). Only the first four of those were ever argued here. The *sensitive* reads are **not** in this class: `/api/pcap`, `/api/trace`, `/api/diagnostics/pcap`, `/api/registrar`, `/api/telephony-config`, `/api/did-mapping`, `/api/ap-security` and `/api/moh` all require a session (they serve raw SIP bytes, credentials-adjacent config, or the AP passphrase in clear). Per endpoint: `/api/admin/status` returns only `{provisioned, needsSetup, authenticated, sessionRemainingSec}`, no secrets. `/metrics` emits six unlabelled aggregate counters and is ungated deliberately, because a Prometheus scraper cannot drive a login/CSRF handshake, the argument is written out at `HttpServer.cpp:1124-1159`. `/api/ota/status` returns partition labels and the pending-image flag. `GET /config/<mac>.cfg` returns a Yealink provisioning file for any MAC in the Learn-mode adopted-device registry, extension number and server IP, but **not** the SIP password (`ProvisioningConfig.hpp:66` emits `account.1.password =` empty). | **No longer "Low".** Two items justify the change. (1) **`/api/cdr` is unauthenticated** (`:508`) and returns caller, callee, start time and duration for every call in the ring, the recent call log of the site, to any host that can reach the board. It was ungated by an in-code analogy to `/api/status` and was never assessed in this row. Filed as [#207](https://github.com/GlomarGadaffi/pocket-dial/issues/207) and **fixed in [PR #215](https://github.com/GlomarGadaffi/pocket-dial/pull/215)**, `/api/cdr` now requires a session, exactly as `/api/trace` does. (2) **`/api/status` disclosed the extension roster with each handset's IP and port** (also fixed in #215: the roster is now withheld from an unauthenticated caller, while `clientCount` and `rosterVisible` remain visible so a client can tell "nobody is registered" from "you may not see who is"; the endpoint itself stays reachable because the login form genuinely needs it), plus every live session's caller/callee/state, the dial plan and the parked-call table. That is precisely the target list for E-4 below, whose mitigation is "set a long PIN" and whose attack needs the admin extension number to put in a spoofed `From:`, this endpoint hands it over. The "dashboard needs it to render the login form" justification is real for `/api/status`'s *existence*, but it does not extend to the roster, and it never applied to `/api/cdr`, `/metrics`, `/api/ota/status` or `/config/<mac>.cfg` at all. `needsSetup: true` still advertises "this board is on `admin`/`admin`" to anyone who asks (§5.1). (3) **#185 added `freeHeap`, `minFreeHeap`, `minFreeHeapSpiram`, `resetReason` and five `stackHwm_*` fields** to this same unauthenticated `/api/status` response. Reassessed here rather than left implicit: these are unlabelled operational numbers (heap byte counts, a boot-reset-cause enum, per-task stack headroom in bytes) carrying no extension number, no peer address, no call content and no credential. They are the same class already argued ungated for `/metrics` above (six unlabelled aggregate counters), not the roster/session/dial-plan class (2) describes. No reassessment of `/api/status`'s gating is needed on their account. **Issue #159 added `GET /setup/email`** to the ungated-shell list, in the same class as `GET /`: the page itself renders no configuration, every field is fetched client-side from `GET /api/email`, which IS gated (session required, and both stored secrets (the AUTH password and the Workspace service-account private key) are redacted to `hasPassword`/`hasGsaKey` booleans, never echoed even to an authenticated caller, matching `TelephonyApiConfig`'s `secretSet` discipline this row already established for E-2's category). |
 | E-3 | **SSH sysop terminal as a second, unbounded admin surface** | **REMOVED this phase.** `SshServer`/`Tui` and their wolfSSH transport were deleted entirely rather than further hardened, see §5.5. HTTP is now the only admin surface. | None; the surface no longer exists. |
-| E-4 | **Spoofed DTMF admin menu**, an attacker on the local link sends a crafted SIP INFO carrying `*PIN#code` and a `From:` header claiming to be the admin extension, to fire NTP resync (`001`), a topology switch + reboot (`101`), or a **factory reset** (`999` + confirm digit `1`, which runs `nvs_flash_erase()` and restarts). | **The DTMF PIN is the only real gate, and it is the whole gate.** The menu fires only when the `From:` number equals the configured admin extension (`admin_ext`, NVS `pbxcfg`, default `1001`) **and** `AdminAuth::verifyDtmfPin()` accepts the digits between `*` and `#`. The PIN is stored salted + iterated-SHA-256 like the web password, is verified **exactly once per completed code** (so one mistyped entry costs one counted failure, not several), and shares the brute-force lockout machinery (§5.2). Critically, there is no default DTMF PIN: `verifyDtmfPin()` returns false without hashing until an operator explicitly sets one, so the entire menu is unreachable on a freshly-flashed or freshly-reset device. A non-admin caller dialing the `*…#…` shape gets `403`. | **Do not assume the source-IP check described in earlier revisions of this document.** It applied to the deleted `*4887` transport-opener and went away with it. As the code stands, *any* SIP INFO whose `Content-Type` is `application/dtmf-relay` reaches the admin parser, no dialog match, no check that the claimed extension is registered, and **no source-IP verification**. A `From:` header is free text, and on the default `open` registrar (§9) nothing stops an attacker asserting the admin extension. So the PIN is load-bearing on its own: **set a long one, and treat a short numeric PIN as a factory-reset button reachable by any peer that can send UDP to port 5060.** Setting `reg_mode` away from `open` does not by itself fix this (the check is on `From:`, not on the registration), but it removes the attacker's easy foothold. |
+| E-4 | **Spoofed DTMF admin menu**, an attacker on the local link sends a crafted SIP INFO carrying `*PIN#code` and a `From:` header claiming to be the admin extension, to fire NTP resync (`001`), a topology switch + reboot (`101`), or a **factory reset** (`999` + confirm digit `1`, which runs `nvs_flash_erase()` and restarts). | **The DTMF PIN is the only real gate, and it is the whole gate.** The menu fires only when the `From:` number equals the configured admin extension (`admin_ext`, NVS `pbxcfg`, default `1001`) **and** `AdminAuth::verifyDtmfPin()` accepts the digits between `*` and `#`. The PIN is stored salted + iterated-SHA-256 like the web password, is verified **exactly once per completed code** (so one mistyped entry costs one counted failure, not several), and shares the brute-force lockout machinery (§5.2). Critically, there is no default DTMF PIN: `verifyDtmfPin()` returns false without hashing until an operator explicitly sets one, so the entire menu is unreachable on a freshly-flashed or freshly-reset device. A non-admin caller dialing the `*…#…` shape gets `403`. | **Do not assume the source-IP check described in earlier revisions of this document.** It applied to the deleted `*4887` transport-opener and went away with it. As the code stands, *any* SIP INFO whose `Content-Type` is `application/dtmf-relay` reaches the admin parser, no dialog match, no check that the claimed extension is registered, and **no source-IP verification**. A `From:` header is free text, and nothing in this path checks it against a registration (the default is `learn` since #441, and `open` is retired, but the INFO handler does not consult either), so nothing stops an attacker asserting the admin extension. So the PIN is load-bearing on its own: **set a long one, and treat a short numeric PIN as a factory-reset button reachable by any peer that can send UDP to port 5060.** The retirement of `open` (#441/#502) does not by itself fix this (the check is on `From:`, not on the registration), but it removes the attacker's easy foothold. |
 
 
 ## 5. Detailed Notes on Key Threats
@@ -257,7 +266,9 @@ Two boot-time behaviours interact with this:
 
 ### 5.2 Credential brute force
 - Online: `verifyCredential()` (web login) and `verifyDtmfPin()` (phone keypad) share
-  one accounting path. It counts consecutive failures; after **5** it engages a **60 s**
+  one bucket table (`AdminAuth`), but not one bucket: web logins are keyed per client
+  since #530, the PIN uses the unkeyed `""` bucket, and a per-address flood can evict it
+  (#561). Each bucket counts consecutive failures; after **5** it engages a **60 s**
   lockout during which even a correct credential is refused, `429 Too Many Requests` on
   the HTTP side.
   The counter used to be zeroed the moment the lockout engaged, so every cooldown handed
@@ -273,30 +284,31 @@ Two boot-time behaviours interact with this:
   only send digits, 4 to 16 of them. A 4-digit PIN is 10⁴ candidates and falls instantly
   offline. **Choose a long DTMF PIN** (it is the credential behind a remote factory reset,
   E-4), and note that the real backstop for offline attack is flash encryption (P2).
-- **Per-client accounting. BUILT BUT NOT WIRED. Not done.** *(Corrected by audit: this
-  bullet, and D-3 with it, claimed a control the login path does not reach.)* `AdminAuth`
-  really does keep a fixed table of 8 least-recently-seen-evicted buckets keyed on a client
-  string, but **nothing ever supplies the key on the login path**. `handleClient()`
-  computes `peerIp` for exactly this purpose (`HttpServer.cpp:247-263`) and then assigns it
-  only to `otaReq.clientIp` (`:330`); `parseRequest()` (`:765-828`) never sets
-  `req.clientIp`, so `sendApiAdminLogin` passes an empty string (`:2720`, `:2729`, `:2732`).
-  Every web-login failure therefore lands in the same unkeyed bucket as the DTMF PIN, and
-  **one guessing client on the link can still lock the legitimate admin out**, the D-3
-  self-DoS is live, not retired. Read the rest of this bullet as the intended design:
-  the key would be for *fairness, not trust*, since a source address is trivially spoofable
-  on the shared link,
+- **Per-client accounting. DONE, wired since #530.** *(An audit found it built but unkeyed:
+  nothing supplied the key on the login path, so every web login shared one bucket. #530
+  wired it.)* `AdminAuth` keeps a fixed table of 8 least-recently-seen-evicted buckets keyed
+  on a client string (`kMaxAttemptBuckets`, `AdminAuth.hpp:70`). `handleClient()` now sets
+  `req.clientIp` from the peer address on every request (`HttpServer.cpp:684`), and
+  `sendApiAdminLogin` keys each attempt on that address plus the principal the username
+  resolves to (`HttpServer.cpp:4517-4528`, #173). One guessing client on the link locks out
+  only its own bucket, but the aggregate backstop below still lets it lock the admin out
+  (D-3 is not retired). The key is for *fairness, not trust*,
+  since a source address is trivially spoofable on the shared link,
   and a spoofer only ever buys themselves a fresh bucket. The bucket table is bounded, so a
   flood of distinct addresses recycles records rather than growing memory, accepted on a
   device whose AP holds ten stations. Callers with no HTTP peer (the DTMF admin menu) share
-  one unkeyed bucket, which is the old global behaviour.
+  one unkeyed bucket, in the same table, so eight failed web logins from fresh addresses
+  evict it and clear an engaged PIN lockout (#561).
 - **Aggregate backstop (why per-IP alone would have been a downgrade).** Source addresses
   are spoofable on this link, so per-client buckets *by themselves* would hand an attacker a
   fresh bucket and a fresh escalation ladder every 5 guesses, strictly better for them than
   the single global counter it replaced. A second counter therefore runs across **all**
-  clients at a much higher threshold (**20** consecutive failures) with the same doubling
+  clients, one per principal (sysop and owner, so spraying one cannot lock out the other),
+  at a much higher threshold (**20** consecutive failures) with the same doubling
   cooldown, bounding the aggregate guess rate no matter how many identities the attacker
-  invents. It sits far above ordinary fat-fingering, so a fumbling operator still only trips
-  their own short cooldown, which is what keeps D-3 retired. Any successful login clears it.
+  invents. It sits far above ordinary fat-fingering, but it counts across a client's own
+  cooldowns and never decays, so one persistent guesser reaches it in about 7 minutes and
+  locks the principal out (D-3). Any successful login clears it.
 
 ### 5.3 Session token theft & replay
 Tokens are 128-bit, server-side, with a **30-minute *sliding* expiry**, every successful
@@ -351,8 +363,9 @@ control.
 What the always-open listener costs, honestly: `/api/admin/login` is permanently reachable
 to anyone who can route to the device, so online password guessing is permanently possible.
 That is what §5.2's lockout machinery and aggregate backstop are for, and what makes them
-load-bearing rather than belt-and-braces. Note the per-client half of that is currently
-inert (§5.2, D-3), so the aggregate backstop is carrying this on its own. The dark-plane design bought a smaller exposure
+load-bearing rather than belt-and-braces. Since #530 the per-client half is wired (§5.2,
+D-3): a single guesser is throttled on its own bucket, and the aggregate backstop bounds a
+spoofing spray. The dark-plane design bought a smaller exposure
 window at the price of an availability failure that made the device unadministrable; the
 trade was not worth it.
 
@@ -378,7 +391,7 @@ The **DTMF PIN is a wholly separate secret from the web login.** Do not conflate
 | Set via | `POST /api/admin/set-credential` (`username=`+`password=`) | the same route's `dtmfPin=` field |
 | NVS keys | `admin_user`, `admin_pw_salt`, `admin_pw_hash` | `admin_pin_salt`, `admin_pin_hash` |
 | Storage | salted, 50k-iteration SHA-256 | salted, 50k-iteration SHA-256 |
-| Rate limiting | *intended* per-client bucket keyed on peer IP, **but the key is never supplied, so this is the unkeyed bucket too** (D-3) | the unkeyed bucket (no HTTP peer), plus the shared aggregate backstop |
+| Rate limiting | per-client bucket keyed on the peer address and the principal (since #530), plus the per-principal aggregate backstop, which one address can still trip (D-3) | the unkeyed `""` bucket (no HTTP peer) in the same LRU table, which web-login buckets can evict (#561), plus the legacy aggregate counter |
 
 Having no default is the important property: `verifyDtmfPin()` returns false without even
 hashing while `dtmfPinIsSet()` is false, so a freshly-flashed or freshly-factory-reset
@@ -466,14 +479,16 @@ trusted-LAN assumption and the registrar mode (§9) carry the whole load.
 ## 7. Prioritized Hardening Roadmap
 
 ### P0: do now / next (highest priority, low-to-moderate effort)
-- **Move the registrar off `open`. NOT DONE, and the top item on a fresh board of any
-  build.** Everything needed ships (digest auth, Learn mode, the extension↔MAC lock, a
-  dashboard panel, `GET`/`POST /api/registrar`, and the flash-time `cfgseed` route for
-  headless boards), but `reg_mode` defaults to `open`, so the protections are opt-in and a
-  shipped board has none of them. See §9 and the operator runbook
-  [LEARN_MODE.md](LEARN_MODE.md). *Closes S-3/D-2, which nothing else in this list does, 
-  WPA2 gates who joins the link, but a legitimately-joined peer is still unauthenticated at
-  the SIP layer.*
+- **Move the registrar off `open`. DONE** (#441: a fresh board boots `learn`; #502:
+  `open` is retired, and a stored retired value boots as Learn). Everything needed ships
+  (digest auth, Learn mode, the extension↔MAC lock, a dashboard panel, `GET`/`POST
+  /api/registrar`, and the flash-time `cfgseed` route for headless boards). What is left is
+  operator work: promote devices to Secured (or run `secure`) so their REGISTER and INVITE
+  prove a secret (#505/#512; open residuals #507, #560 and #525; #549 fixed by #555); an INVITE
+  is bound to its caller's registered address (#503). See §9 and the operator runbook [LEARN_MODE.md](LEARN_MODE.md). *Narrows
+  S-3/D-2, which nothing else in this list does: WPA2 gates who joins the link, but a
+  legitimately-joined peer is still unauthenticated at the SIP layer until its device is
+  Secured.*
 - **WPA2 on the SoftAP. DONE (opt-in).** `WIFI_AUTH_WPA2_PSK` behind the NVS flag
   `ap_secure` (default off for fleet compatibility), with a per-device `esp_random()`
   passphrase surfaced on-screen, over serial, in the dashboard, and settable at flash time.
@@ -482,7 +497,7 @@ trusted-LAN assumption and the registrar mode (§9) carry the whole load.
   did not count. Not applicable to the `eth`/`lan8720` builds.
 - **Mandatory admin credential. DONE** (username + password, server-side session and
   per-session CSRF token on every admin endpoint, brute-force lockout with exponential
-  backoff (**global rather than per-client, see D-3**) forced replacement of the shipped
+  backoff (per client since #530, see D-3), forced replacement of the shipped
   default before anything else is permitted, factory reset clears it). §5.1.
 - **SSH admin surface removed. DONE.** `SshServer`/`Tui` and wolfSSH deleted rather than
   hardened (E-3). HTTP is the only network admin surface.
@@ -496,12 +511,16 @@ trusted-LAN assumption and the registrar mode (§9) carry the whole load.
   should leave it unset so the surface does not exist at all.
 
 ### P1, soon (meaningful, moderate effort)
-- **SIP digest authentication. DONE as code, opt-in in practice.** Challenges REGISTER;
-  independent INVITE challenge (`407`) is still a follow-up (§9.1). It only protects
-  deployments that actually switch `reg_mode`, hence the P0 item above.
-- **Per-client brute-force tracking for `login`. DONE** (replaces the global counter,
-  removes the admin-lockout self-DoS in D-3, and stops the cooldown from resetting the
-  failure budget; an aggregate backstop bounds address-spoofing). See §5.2.
+- **SIP digest authentication. DONE.** Challenges REGISTER, and INVITE too (`401`, the
+  same stateless nonce): every INVITE in `secure` mode, and a Secured device's INVITE in
+  `learn` mode (#512; `RequestsHandler.cpp:1833-1834`). It protects the extensions that have
+  a secret, i.e. devices promoted to Secured or a `secure` deployment, except through two
+  open gaps: #507 (an ARP miss skips it) and #560 (the relayed ACK and re-INVITE/UPDATE still carry the INVITE's credential; fix #562 open) and #525 (a nonce/`nc` can be reused within its 5-minute life). #549 (uri/To binding,
+  credential stripped before a fork) is fixed by #555. A Learned extension proves nothing (P0 above).
+- **Per-client brute-force tracking for `login`. DONE, wired since #530** (replaces the global counter
+  and stops the cooldown from resetting the
+  failure budget; an aggregate backstop bounds address-spoofing). D-3 is **not** retired: one
+  address can still trip that backstop, and the DTMF bucket can be evicted (#561). See §5.2.
 - **OTA gated behind the admin session. DONE.** The upload route runs through the same
   `requireAdmin()` (session + CSRF) as every other mutating endpoint. Remaining: **image
   signing**, and an actual end-to-end execution, the OTA path, dual-slot rollback
@@ -597,23 +616,25 @@ end to end (T-5).
 >   rather than assuming the seed took.
 >
 > The S-3/D-2 registrar gap in §4 is therefore closable in the field now, but note it is
-> only *closable*, not closed: the shipped default is still `open`, so it protects
-> deployments that actually switch.
+> only *closable*, not closed: since #441/#502 the shipped default is `learn` and `open`
+> is retired, but Learn protects only devices promoted to Secured, so it protects
+> deployments that actually secure their devices (or run `secure`).
 >
 > It extends the STRIDE analysis above with the new IDs `S-4`, `D-5`, `I-6`, `T-6`, `E-3`
 > and continues the residual-risk convention. Cross-refs: [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md)
 > §3.3 (SIP digest auth, WPA2), the operator runbook [LEARN_MODE.md](LEARN_MODE.md), and
 > [PROVISIONING.md](PROVISIONING.md) §7.3 (the shared per-extension secret store).
 
-The registrar is **open on a shipped board** (`POCKETDIAL_OPEN_REGISTRAR` is the
-compiled-in default that `Registrar::loadMode()` falls back to when NVS holds no
-`reg_mode`); §4 records this as the S-3/D-2 SIP-layer gap, and §2/§8 name it as the single
-biggest residual risk on a fresh board. What follows is the machinery that **closes it once
+The registrar boots **`learn` on a shipped board** (#441): `Registrar::loadMode()` falls
+back to Learn when NVS holds no `reg_mode`, and decodes the retired `open` byte as Learn
+(#502, `Registrar.cpp:44-66`). §4 records Learn's residual (TOFU adoption, unchallenged
+INVITEs from unsecured devices) as the S-3/D-2 SIP-layer gap, and §2/§8 name it as the
+single biggest residual risk on a fresh board. What follows is the machinery that **closes it once
 an operator switches modes**, it is shipped and reachable, not automatic. SIP **digest
 authentication** (RFC 2617, MD5 / `qop=auth`) challenges **REGISTER**, 
-**INVITE is not independently challenged in M1** (it relies on the registration binding an
-authenticated REGISTER established; per-INVITE/proxy-auth `407` is a tracked follow-up, see
-§9.1). The registrar mode becomes **runtime-selectable** (`open` / `learn` / `secure`);
+and **INVITE** too: every INVITE in `secure`, and a Secured device's INVITE in `learn` (#512),
+with #507, #560 and #525 still open (#549 is fixed by #555). The registrar mode is **runtime-selectable**
+(`learn` / `secure`; `open` is retired, #502);
 **Learn mode** adopts an existing fleet trust-on-first-use, keyed by **device MAC** (resolved
 from the REGISTER's source IP via the LAN ARP table, phones do not carry MAC in SIP), then
 **locks each extension ↔ MAC** once secured. (RFC 8760 SHA-256 digest is not implemented;
@@ -630,7 +651,7 @@ MD5 is the wire algorithm, matching the installed-phone fleet. SHA-256 is a hard
 
 | ID | Threat | Mitigation | Residual risk |
 |----|--------|-----------|---------------|
-| S-4 | **Learn-mode TOFU adoption window**, while the registrar is in `learn`, an **unknown MAC** that REGISTERs an unclaimed extension is adopted **without verifying** any credential (trust-on-first-use). A stranger on the segment can race to claim an unclaimed extension before the legitimate phone does. | The window is **bounded, admin-initiated, and not a default**: entering `learn` is an explicit action, re-opening is admin-gated, and the operator verifies the adopted roster (MAC · ext · state) before securing (see [LEARN_MODE.md](LEARN_MODE.md) §5). Already-secured devices are digest-enforced even during the window. TOFU applies only to *unknown* MACs. The intended posture is to run the window on a **trusted/WPA2 link**. | **If the window is left open, this is functionally an open registrar for any unclaimed extension.** On an open AP a proximate attacker can both observe the cutover and race a claim. The control is procedural (bound the window, watch the roster, prefer an encrypted link), not cryptographic. Honest framing: Learn mode is a deliberate, temporary weakening to enable low-friction cutover. It must not be run as a steady state. |
+| S-4 | **Learn-mode TOFU adoption window**, while the registrar is in `learn`, an **unknown MAC** that REGISTERs an unclaimed extension is adopted **without verifying** any credential (trust-on-first-use). A stranger on the segment can race to claim an unclaimed extension before the legitimate phone does. | **Since #441/#502 `learn` is the shipped default and the floor, so this window is open on every fresh board until an admin secures its devices (or switches to `secure`).** The operator verifies the adopted roster (MAC · ext · state) before securing (see [LEARN_MODE.md](LEARN_MODE.md) §5). Already-secured devices are digest-enforced even during the window. TOFU applies only to *unknown* MACs. The intended posture is to run the window on a **trusted/WPA2 link**. | **If the window is left open, this is functionally an open registrar for any unclaimed extension.** On an open AP a proximate attacker can both observe the cutover and race a claim. The control is procedural (bound the window, watch the roster, prefer an encrypted link), not cryptographic. Honest framing: this is now the fresh-board posture, not a temporary cutover mode, so securing devices (P0, §7) is the mitigation, and #440/#487 (locking adopted extensions to their MAC) narrows it. |
 | E-3 | **MAC-based extension↔MAC lock is trust-the-LAN, not cryptographic**, once an extension is secured, a different MAC claiming it is rejected (`403`/`401`). The MAC is learned from the **ARP table**, and ARP/MAC are spoofable on a hostile L2. | The lock defeats accidental collisions, duplicate-extension misconfig, and casual impersonation on a trusted segment. It composes with digest (a rogue must *also* present a valid digest for a secured extension), so it is defense-in-depth, not the sole gate. | **The lock raises the bar but is not a security boundary on a hostile L2**, an attacker who can spoof a MAC and who knows the secret defeats it. **The real boundary is WPA2 / a trusted LAN** (gating association). State this plainly to operators: MAC-lock ≠ cryptographic device identity. ARP first-packet misses (§Learn-mode timing) also mean the lock binds a beat after first contact, not instantaneously. |
 
 ### 9.3 Secret-at-rest (the digest credential store)
