@@ -48,4 +48,18 @@ private:
 
     Port    _ports[MAX_PORTS];
     int32_t _mix[FRAME] = {};      // wide accumulator — clipped once, at output
+
+    // tick()'s working set. Members, not locals: 2,880 B on the stack gave tick() a
+    // 2,928 B frame on conf_mix_tick's 3,072 B stack, and the first 888 call
+    // overflowed it (issue #498). Safe as members because tick() has exactly one
+    // caller (the single driver, or tickOnce() in tests). 16-byte aligned for the PIE path.
+    alignas(16) int16_t _frame[MAX_PORTS][FRAME] = {};
+    alignas(16) int16_t _out[FRAME] = {};
 };
+
+// The members above only stay 16-byte aligned if the object holding them is. That
+// holds for `new`/make_unique: alignof is 16, above the target's 8-byte
+// __STDCPP_DEFAULT_NEW_ALIGNMENT__, so C++17 picks the aligned operator new. A raw
+// heap_caps_malloc() of an owner would NOT guarantee it -- ConferenceRoom also
+// checks at runtime (issue #498).
+static_assert(alignof(MixBus) >= 16, "MixBus's mix scratch must stay 16-byte aligned");
