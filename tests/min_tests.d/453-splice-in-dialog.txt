@@ -1,2 +1,2 @@
-# SpliceInDialog_test.cpp: 15 (#453 splices, plus the #589 review: re-ACK, no pooled pin, hold on 2xx)
-15
+# SpliceInDialog_test.cpp (#453/#488/#589): 16
+16

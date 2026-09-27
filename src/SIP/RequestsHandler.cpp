@@ -11055,9 +11055,11 @@ void RequestsHandler::answerSpliceLocally(const std::shared_ptr<SipMessage>& dat
 	_outbox.emplace_back(data->getSource(), std::move(resp));
 }
 
-// #589 review: copy a header line into a SpliceTxn's fixed buffer. A line that
-// does not fit is cut (the stored copy is only ever used to answer, and every
-// field here is far shorter than its buffer on any real phone).
+// #589 review: copy a header line into a SpliceTxn's fixed buffer. Callers check
+// fitsIn() for every field BEFORE sending anything, so nothing is ever cut.
+template <size_t N>
+static bool fitsIn(const char (&)[N], std::string_view src) { return src.size() < N; }
+
 template <size_t N>
 static void copyInto(char (&dst)[N], std::string_view src)
 {
@@ -11081,7 +11083,7 @@ void RequestsHandler::relayIntoPeerDialog(const std::shared_ptr<SipMessage>& dat
 	// An INVITE's retransmit gets its 100 Trying again (RFC 3261 §17.2.1).
 	for (const auto& t : _spliceTxns)
 	{
-		if (t.state == SpliceTxn::State::AwaitingPeer && t.isInvite == isInvite &&
+		if (t.state != SpliceTxn::State::Free && t.isInvite == isInvite &&
 			data->getCallID() == std::string_view(t.originCallId) && t.originCSeq == originCSeq)
 		{
 			if (isInvite) answerSpliceLocally(data, "SIP/2.0 100 Trying");
@@ -11130,6 +11132,16 @@ void RequestsHandler::relayIntoPeerDialog(const std::shared_ptr<SipMessage>& dat
 		resp->clearBody();
 		resp->syncContentLength();
 		_outbox.emplace_back(data->getSource(), std::move(resp));
+		return;
+	}
+
+	// A field too long for its buffer could never be matched or answered
+	// correctly later; refuse now, before anything is sent to the peer.
+	if (!fitsIn(slot->originVia, data->getVia()) || !fitsIn(slot->originFrom, data->getFrom()) ||
+		!fitsIn(slot->originTo, data->getTo()) || !fitsIn(slot->originCallId, data->getCallID()) ||
+		!fitsIn(slot->originToNumber, data->getToNumber()))
+	{
+		answerSpliceLocally(data, "SIP/2.0 500 Server Internal Error");
 		return;
 	}
 

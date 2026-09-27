@@ -624,6 +624,27 @@ TEST(SpliceInDialog, AnInFlightSpliceDoesNotPinTheOriginatorsPooledMessage)
 	EXPECT_EQ(request.use_count(), 1) << "the splice table must not keep the request alive";
 }
 
+TEST(SpliceInDialog, AFieldTooLongToStoreIsRefusedBeforeAnythingIsSent)
+{
+	// #589 review: the stored copy of a header was cut silently AFTER the peer
+	// request went out, so a long Via/Call-ID could never be matched again.
+	Harness h;
+	setUpPickup(h);
+	auto own = h.handler.getSession(sessionKey("pickup-P"));
+	ASSERT_TRUE(own.has_value());
+	auto request = inDialog("INVITE", own.value(), "192.168.9.30", 5, sdpBody("192.168.9.30", "sendonly"));
+	ASSERT_TRUE(request);
+	request->setVia("Via: SIP/2.0/UDP 192.168.9.30:5060;branch=z9hG4bK" + std::string(300, 'a'));
+	h.sent.clear();
+	h.handler.handle(request);
+	size_t toPeer = 0;
+	(void)onlyOne(h.sent, "192.168.9.10", "INVITE ", toPeer);
+	EXPECT_EQ(toPeer, 0u) << "nothing may reach the peer";
+	size_t refusals = 0;
+	(void)onlyOne(h.sent, "192.168.9.30", "SIP/2.0 500", refusals);
+	EXPECT_EQ(refusals, 1u);
+}
+
 TEST(SpliceInDialog, HoldTakesEffectOnThePeers2xxNotOnSend)
 {
 	// A far leg that refuses the hold offer (488) must not leave the session
