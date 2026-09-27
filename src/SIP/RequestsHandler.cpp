@@ -4051,6 +4051,10 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// Trunk rule's transform can produce one ("0" -> prepend "911"), and on a
 	// board with no trunk that lands here. Answering it would simulate a
 	// connected 911 call.
+	// Now DEFENCE IN DEPTH, unreachable by design: routeTrunkCall() diverts a
+	// rule-produced emergency number to routeEmergencyCall() (#538 review M2),
+	// and no client can be named like one (#550), so 555's own-number dial
+	// cannot produce one either. Pinned by a test that forces the #550 state.
 	if (!_anchorPlacesRealCalls && pbx::classifyEmergencyDial(destination).isEmergency)
 	{
 		refuse("SIP/2.0 503 Emergency Call Not Routable",
