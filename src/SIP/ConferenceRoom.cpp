@@ -19,6 +19,17 @@ ConferenceRoom::ConferenceRoom()
 	{
 		leg.bridge.init(&leg.rx, &leg.tx, /*anchor=*/nullptr, &_bus);
 	}
+
+	// Issue #498: the bus's mix scratch is 16-byte aligned only if this room is. `new`
+	// guarantees it (see MixBus.hpp); anything that allocates a room by hand might not.
+	_busAligned = (reinterpret_cast<std::uintptr_t>(&_bus) % alignof(MixBus)) == 0;
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	if (!_busAligned)
+	{
+		ESP_LOGE("ConferenceRoom", "mix bus at %p is not %u-byte aligned -- every join is refused",
+			static_cast<void*>(&_bus), static_cast<unsigned>(alignof(MixBus)));
+	}
+#endif
 }
 
 ConferenceRoom::~ConferenceRoom()
@@ -64,6 +75,13 @@ int ConferenceRoom::join(const std::string& callID, const std::string& ext,
 	std::lock_guard<std::mutex> lock(_mutex);
 
 	if (callID.empty() || handsetIp.empty() || handsetPort == 0)
+	{
+		return -1;
+	}
+
+	// A misaligned bus is refused rather than ticked (issue #498); the caller answers
+	// 486 and logs the refusal, the same as a full room.
+	if (!_busAligned)
 	{
 		return -1;
 	}
