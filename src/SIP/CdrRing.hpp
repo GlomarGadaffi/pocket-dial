@@ -83,6 +83,18 @@ public:
 	// lives in its own NVS namespace ("cdrlog"), so a reset must clear it too.
 	void clearAll();
 
+	// #476 review: what persist() does with a freshly built blob, decided here
+	// so the host suite can pin it (the FreeRTOS queue is ESP-only).
+	//   OverwriteQueued -- xQueueOverwrite: the depth-1 queue holds only the
+	//                      NEWEST snapshot; an older queued one is replaced.
+	//   Suppress        -- count it as suppressed and do not enqueue: a data
+	//                      snapshot arriving while a factory reset is running
+	//                      would otherwise displace the reset's queued erase,
+	//                      and the writer then refuses that snapshot, so no
+	//                      erase would happen at all.
+	enum class PersistAction : uint8_t { OverwriteQueued, Suppress };
+	static PersistAction persistAction(bool incomingIsErase, bool resetInProgress);
+
 	// Pure, host-testable, never allocates: builds the exact NVS blob format
 	// persist() writes -- oldest-first, tab-separated, one line per record --
 	// directly into `out`. Unchanged by issue #273's fix, which only moved

@@ -340,6 +340,12 @@ void CdrRing::serializeForPersist(
 	out.erase = (count == 0);
 }
 
+CdrRing::PersistAction CdrRing::persistAction(bool incomingIsErase, bool resetInProgress)
+{
+	return (resetInProgress && !incomingIsErase) ? PersistAction::Suppress
+	                                             : PersistAction::OverwriteQueued;
+}
+
 uint32_t CdrRing::persistFailureCount()   { return persistFailures().load(); }
 uint32_t CdrRing::persistSuppressedCount() { return persistSuppressed().load(); }
 
@@ -587,9 +593,18 @@ void CdrRing::persist()
 	// snapshot, so the newest must always win -- which is exactly what
 	// overwrite does, and it never blocks.
 	static_assert(kQueueDepth == 1, "xQueueOverwrite is only valid on a length-1 queue");
-	if (cdrPersistQueue() != nullptr)
+	if (persistAction(blob.erase, resetguard::inProgress()) == PersistAction::Suppress)
 	{
-		(void)xQueueOverwrite(cdrPersistQueue(), &blob);   // always pdPASS on a length-1 queue
+		// A call that ended after clearAllCallHistory() during a factory reset:
+		// overwriting the queued ERASE with it would lose the erase (the writer
+		// refuses data during a reset). Counted, never enqueued (#476 review).
+		persistSuppressed().fetch_add(1);
+		return;
+	}
+	if (cdrPersistQueue() != nullptr &&
+		xQueueOverwrite(cdrPersistQueue(), &blob) != pdPASS)   // pdPASS by contract on length 1; checked anyway
+	{
+		persistFailures().fetch_add(1);
 	}
 #endif
 }
