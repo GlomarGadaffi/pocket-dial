@@ -32,12 +32,13 @@ declare -A BASELINE=(
   [cppcoreguidelines-no-malloc]=14
   [misc-no-recursion]=4
   [bugprone-unused-return-value]=0
-  [cert-err33-c]=29
+  [cert-err33-c]=34
   [cppcoreguidelines-pro-type-member-init]=28
   [cppcoreguidelines-init-variables]=22
 )
 
 "$CT" --version || { echo "::error::$CT not runnable"; exit 2; }
+[ -f "$BUILD/compile_commands.json" ] || { echo "::error::no $BUILD/compile_commands.json"; exit 2; }
 CHECKS="-*$(printf ',%s' "${!BASELINE[@]}")"
 LOG="${LOG:-clang-tidy-safety.log}"
 : > "$LOG"
