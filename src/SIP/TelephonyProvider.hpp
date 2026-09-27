@@ -71,6 +71,13 @@ const char* telephonyProviderName(TelephonyProviderType t);
 // false so config/UI surfaces can be honest about what actually dials.
 bool telephonyProviderImplemented(TelephonyProviderType t);
 
+// Issue #521: true only for providers that place calls on a real network.
+// "Implemented" is not enough: Loopback is fully implemented, and what it
+// implements is a SIMULATED answered call, which is the one thing an emergency
+// dial must never get. An allowlist rather than "!= Loopback", so a provider
+// added later is treated as unable to carry 911 until it says otherwise.
+bool telephonyProviderPlacesRealCalls(TelephonyProviderType t);
+
 // ── Honest stub provider ─────────────────────────────────────────────────────
 // Compile-time scaffolding for a declared-but-unimplemented provider. Every
 // operation fails cleanly: start() returns false, isConnected() is always

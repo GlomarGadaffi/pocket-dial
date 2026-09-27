@@ -806,6 +806,8 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
   "ip": "192.168.4.1",
   "port": 5060,
   "httpPort": 80,
+  "httpReadDeadlineDrops": 0,
+  "httpPerSourceRefusals": 0,
   "uptime": 14205,
   "packetsProcessed": 10543,
   "packetsDropped": 12,
@@ -870,6 +872,9 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `ip` | String | The primary active IP address of the SIP server interface. |
 | `port` | Integer | The UDP signaling port. **Always the literal `5060`**; it is hardcoded in the handler (`HttpServer.cpp:951`), not read from configuration, because this codebase has no way to run the SIP listener on another port. Do not treat it as a discovered value. |
 | `httpPort` | Integer | The active TCP HTTP port (typically 80). |
+| `httpReadDeadlineDrops` | Integer | HTTP connections dropped because the request (headers + buffered body) did not arrive within 10 s of the accept (#529), or whose receive timeout could not be set at all (#534; closed unread rather than left to block). A climbing count means a slow or hostile client. |
+| `httpPerSourceRefusals` | Integer | HTTP connections refused `503` because one source address already held 3 of the 4 connection slots (#529). |
+| `emergencyRoute` | String | (#521) Where a 911/933 dial would go right now: `"anchor"` (the boot-selected telephony provider places real calls; a configured SIP trunk is its fallback when it is down), `"trunk"` (no such provider, but a valid SIP trunk is configured; this means *configured*, not *verified*: the generic trunk cannot answer a 401/407 digest challenge yet, so place a 933 test call to prove the route), or `"none"` (only the loopback test provider is present, so the board **refuses** emergency calls with `503 Emergency Call Not Routable`; the loopback simulator never answers one). The dashboard shows a warning banner while this is `"none"`. Ungated like the rest of the block. **Absent** while no SIP engine is attached yet (the first seconds after boot), which a client should treat as unknown, not as `"none"`. |
 | `uptime` | Integer | Time in seconds since the HTTP server initialized. |
 | `packetsProcessed` | Integer | Total UDP signaling packets processed by the state machine. |
 | `packetsDropped` | Integer | Total UDP signaling packets dropped by rate-limiting or firewall rules. |

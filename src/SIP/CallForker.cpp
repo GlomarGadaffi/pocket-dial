@@ -33,6 +33,12 @@ bool CallForker::buildInviteFork(const std::shared_ptr<SipMessage>& invite,
 
 	inviteFork->setHeader("INVITE sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
 	inviteFork->setTo("To: <sip:" + target->getNumber() + "@" + serverIpPort + ">");
+	// #512 review (Crew, MEDIUM): the caller's digest credentials were for THIS
+	// PBX, and were checked here (Registrar::admitSecure). Relayed verbatim, the
+	// callee got a working Authorization it could replay at us for the nonce's
+	// lifetime. They are hop-by-hop in effect; the callee never needs them.
+	inviteFork->removeHeaders("Authorization");
+	inviteFork->removeHeaders("Proxy-Authorization");
 
 	if (intercom)
 	{
