@@ -27,6 +27,7 @@ uint32_t RtpReceiver::rxOversizeDrops()
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #235: rtp_media_rx TWDT subscription
 #include "PsramTask.hpp"     // Issue #466: pd::createTaskPreferPsram / pd::deleteTask
+#include "ParkedTaskReap.hpp"   // Issue #535 / #572 review: when the parked task may be deleted
 #endif
 
 namespace
@@ -438,6 +439,16 @@ RtpReceiver::~RtpReceiver()
 	{
 		vTaskDelay(pdMS_TO_TICKS(5));
 	}
+	// Issue #535: the task parked itself; this is its one deleter -- but only
+	// if it provably parked (#572 review). Otherwise log and leave it: deleting
+	// a task that may still hold _slotMutex is worse than leaking its handle.
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		if (!reapParkedTaskLocked())
+		{
+			ESP_LOGE("RtpReceiver", "rx task not parked at destruction; handle left undeleted (#535)");
+		}
+	}
 #else
 	stop();   // host stub: just clears the (no-task) active flag + sink
 #endif
@@ -494,6 +505,14 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	// prior task is still tearing itself down (_taskRunning) so the new task never
 	// overlaps the old one on the shared socket/slot.
 	if (_active.load(std::memory_order_acquire) || _taskRunning.load(std::memory_order_acquire))
+	{
+		return false;
+	}
+	// Issue #535: the previous stream's task has finished (_taskRunning is
+	// false) and parked; reap it before creating the next one. If it is not
+	// provably parked yet (#572 review), refuse this start rather than run two
+	// tasks on one slot or delete one that may still be running.
+	if (!reapParkedTaskLocked())
 	{
 		return false;
 	}
@@ -582,7 +601,7 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 		6144,   // headroom for lwIP recvfrom() + sink callback (decode is in-place)
 		this,
 		6,
-		nullptr,
+		&_parkedTask,   // #535: kept so the owner can reap the parked task
 		0 /* Core 0 */);
 
 	if (ok != pdPASS)
@@ -592,6 +611,7 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 		_sock = -1;
 		clearSlotLocked();
 		_taskRunning.store(false, std::memory_order_release);
+		_parkedTask = nullptr;
 		return false;
 	}
 
@@ -633,7 +653,41 @@ void RtpReceiver::taskTrampoline(void* arg)
 	// Clearing _taskRunning is the LAST access to `self`: after this the destructor
 	// may observe the task as gone and allow the object to be destroyed.
 	self->_taskRunning.store(false, std::memory_order_release);
-	pd::deleteTask(nullptr);   // #466: vTaskDeleteWithCaps for a PSRAM stack, vTaskDelete otherwise
+	// Issue #535: park, never self-delete. vTaskDeleteWithCaps(NULL) (a PSRAM
+	// stack, #466) creates an internal helper task to free this one and
+	// abort()s if that ~1.9 KB allocation fails -- on every media-leg teardown,
+	// under exactly the internal-DRAM pressure #466/#328 are about. The owner
+	// (next start() or ~RtpReceiver) deletes this task from outside with
+	// pd::deleteTask(handle), which allocates nothing. Suspending touches no
+	// member, so it is safe after the _taskRunning store above.
+	for (;;)
+	{
+		vTaskSuspend(nullptr);
+	}
+}
+
+bool RtpReceiver::reapParkedTaskLocked()
+{
+	// #572 review: delete ONLY a task that has cleared _taskRunning (its last
+	// touch of `this`) AND is suspended in its park loop. A running or
+	// not-yet-suspended task may hold _slotMutex or be mid-way on the other
+	// core; deleting it there is the #421 class of bug. So on anything else,
+	// keep the handle, count it, and let the next start()/destructor retry.
+	switch (pd::reapDecision(_parkedTask != nullptr,
+		_taskRunning.load(std::memory_order_acquire),
+		_parkedTask != nullptr && eTaskGetState(_parkedTask) == eSuspended))
+	{
+		case pd::ReapDecision::Nothing:
+			return true;
+		case pd::ReapDecision::Reap:
+			pd::deleteTask(_parkedTask);   // another task: no helper, no allocation
+			_parkedTask = nullptr;
+			return true;
+		case pd::ReapDecision::Wait:
+		default:
+			_reapDeferred.fetch_add(1, std::memory_order_relaxed);
+			return false;
+	}
 }
 
 void RtpReceiver::runLoop()
