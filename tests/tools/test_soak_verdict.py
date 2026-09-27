@@ -147,6 +147,21 @@ class SoakVerdictTest(unittest.TestCase):
     def test_too_short_a_run_fails_duration(self):
         self.assertEqual(failed(clean_run(seconds=2000)), {"duration"})
 
+    def test_the_identity_free_shape_is_judged_the_same(self):
+        # #539: an unauthenticated poll gets sessionCount/oldestSessionSec and an
+        # empty sessions array. Busy/idle and stuck-leg must still work.
+        s = clean_run()
+        for t, st in s:
+            live = st["sessions"]
+            st["sessionCount"] = len(live)
+            st["oldestSessionSec"] = sv._duration_s(live[0]["duration"]) if live else 0
+            st["sessions"] = []
+        self.assertEqual(failed(s), set())
+        for i in range(1000, 1500):
+            s[i][1]["sessionCount"] = 1
+            s[i][1]["oldestSessionSec"] = i - 1000
+        self.assertEqual(failed(s), {"no-stuck-leg"})
+
     def test_load_reads_logger_lines_and_counts_failed_polls(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "log.jsonl")

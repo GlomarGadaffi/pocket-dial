@@ -99,7 +99,10 @@ def _slope(points):
 
 
 def _busy(s):
-    return bool(s.get("sessions") or []) or bool(s.get("parkedCalls") or [])
+    # #539 shape: an unauthenticated poll gets sessionCount instead of the array.
+    count = _num(s.get("sessionCount"))
+    return (bool(s.get("sessions") or []) or (count is not None and count > 0)
+            or bool(s.get("parkedCalls") or []))
 
 
 def evaluate(samples, bad, cfg):
@@ -167,6 +170,11 @@ def evaluate(samples, bad, cfg):
                 longest = d
                 longest_desc = (f"{sess.get('caller')}->{sess.get('callee')} "
                                 f"({sess.get('state')}) at +{t - t0:.0f} s")
+        # #539 shape: the identity-free age of the oldest session.
+        oldest = _num(s.get("oldestSessionSec"))
+        if oldest is not None and oldest > longest:
+            longest = int(oldest)
+            longest_desc = f"oldestSessionSec at +{t - t0:.0f} s"
     detail = f"longest session {longest} s (limit {cfg.max_call_s} s)"
     if longest > cfg.max_call_s:
         detail += f": {longest_desc}"
