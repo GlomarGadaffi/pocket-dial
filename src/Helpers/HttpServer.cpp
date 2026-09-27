@@ -1848,9 +1848,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// Issue #496 / #509 review: frames and fragments the IPv4 input guard
 	// (Ip4InputGuard.h) dropped since boot.
 	{
-		uint32_t g[2] = {0, 0};
+		uint32_t g[3] = {0, 0, 0};
 		pd_ip4_guard_counts(g);
-		json << "\"ip4Guard\":{\"padded\":" << g[0] << ",\"tinyFragments\":" << g[1] << "},";
+		json << "\"ip4Guard\":{\"padded\":" << g[0] << ",\"tinyFragments\":" << g[1]
+		     << ",\"mdnsFragments\":" << g[2] << "},";
 	}
 #endif
 	json << "\"packetsProcessed\":" << packets << ",";

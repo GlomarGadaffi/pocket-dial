@@ -55,3 +55,15 @@ TEST(Ip4InputGuard, ShortNonFinalFragmentsAreDroppedEverythingElsePasses)
 	// IP options count in the header, not the payload.
 	EXPECT_EQ(pd_ip4_input_verdict(24 + 255, 24 + 255, 24, 1), PD_IP4_DROP_TINY_FRAGMENT);
 }
+
+TEST(Ip4InputGuard, EveryFragmentOfAnMdnsDatagramIsRecognised)
+{
+	// #559: the mDNS receiver would split a reassembled chain into pieces.
+	const uint32_t mdns = 0xE00000FBu;      // 224.0.0.251
+	const uint32_t board = 0xC0A80CF4u;     // a unicast address
+	EXPECT_TRUE(pd_ip4_is_mdns_fragment(mdns, 1, 0)) << "first fragment";
+	EXPECT_TRUE(pd_ip4_is_mdns_fragment(mdns, 1, 1480)) << "middle fragment";
+	EXPECT_TRUE(pd_ip4_is_mdns_fragment(mdns, 0, 1480)) << "last fragment";
+	EXPECT_FALSE(pd_ip4_is_mdns_fragment(mdns, 0, 0)) << "an ordinary mDNS packet passes";
+	EXPECT_FALSE(pd_ip4_is_mdns_fragment(board, 1, 0)) << "other fragments are the byte cap's job";
+}
