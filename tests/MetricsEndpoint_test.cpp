@@ -175,6 +175,7 @@ namespace
 		{ "pocketdial_packets_dropped_oversize_total", "counter" },  // #444
 		{ "pocketdial_sip_recv_errors_total",      "counter" },      // #443
 		{ "pocketdial_sdp_rejected_total",         "counter" },
+		{ "pocketdial_invite_unbound_caller_total", "counter" },   // #497
 	};
 }
 
