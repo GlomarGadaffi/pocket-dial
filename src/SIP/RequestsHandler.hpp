@@ -27,6 +27,7 @@
 #include <functional>
 #include <iostream>
 #include <unordered_map>
+#include <map>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -773,7 +774,7 @@ private:
 		return buildServerBye(destExt, destAddr, callId, fromHeader, toHeader);
 	}
 	void forEachSessionInvolving(std::string_view aor,
-		const std::function<void(const std::string&, const Session&, DialogRole)>& fn) const override
+		FunctionRef<void(const std::string&, const Session&, DialogRole)> fn) const override
 	{
 		for (const auto& [callID, session] : _sessions)
 		{
@@ -921,6 +922,10 @@ public:
 
 	// Dashboard/status accessors.
 	bool     holdMusicLoaded()  const { return _holdMusic.isLoaded(); }
+	// Issue #466: a valid clip that was refused a buffer (see HoldMusic::
+	// allocClip) -- MoH is then silence, the greeting absent.
+	bool     holdMusicClipRefused()     const { return _holdMusic.lastLoadRefused(); }
+	bool     voicemailGreetingRefused() const { return _greetingRefused.load(std::memory_order_relaxed); }
 	unsigned holdMusicSeconds() const { return _holdMusic.clipSeconds(); }
 	unsigned holdMusicListeners() const { return _holdMusic.listenerCount(); }
 	// Issue #328: L2-bypass vs socket-fallback health for the hold-music
@@ -1650,8 +1655,10 @@ private:
 		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2);
 
 	// Issue #402: record a request's CSeq on its dialog's session, if it has one
-	// and `source` is a party on it. Caller holds _mutex.
-	void noteDialogCSeq(const std::string& callID, uint32_t cseq, const sockaddr_in& source);
+	// and `source` is a party on it. Returns the session found (or nullptr).
+	// Caller holds _mutex.
+	std::shared_ptr<Session> noteDialogCSeq(std::string_view callID, uint32_t cseq,
+		const sockaddr_in& source);
 
 	// Verify that the in-dialog request comes from a peer recorded at dialog setup
 	// (source IP match). Returns false → respond 403 Forbidden. Caller holds _mutex.
@@ -1888,6 +1895,7 @@ private:
 	// correct default: the constructor's own loadVoicemailGreeting() call is
 	// the only OTHER writer, and that path always heap-allocates.
 	bool _vmGreetingClipOwned = true;
+	std::atomic<bool> _greetingRefused{false};   // #466: valid greeting, refused a buffer
 	void loadVoicemailGreeting();
 
 	// The boot-selected provider TYPE (cached alongside _anchorClient itself —
@@ -1923,7 +1931,12 @@ private:
 
 	// RequestsHandler.hpp: Issues #24 and #28 resolved.
 	std::unordered_map<std::string, std::function<void(std::shared_ptr<SipMessage> request)>> _handlers;
-	std::unordered_map<std::string, std::shared_ptr<Session>>   _sessions;
+	// std::map with a transparent comparator, not unordered_map (#464): C++17 has
+	// heterogeneous lookup only for ordered containers, so this is what lets
+	// getSession(string_view) find a session WITHOUT building a std::string key --
+	// which it used to do up to three times per request. At POCKETDIAL_MAX_SESSIONS
+	// entries, O(log n) string compares cost nothing measurable.
+	std::map<std::string, std::shared_ptr<Session>, std::less<>> _sessions;
 
 	// Call-IDs of attended-transfer splice re-INVITEs (issue #131) pending their
 	// 200 OK -> ACK, so handleTransferOk() can find them (same bounded-vector
