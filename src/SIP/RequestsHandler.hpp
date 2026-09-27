@@ -158,6 +158,9 @@ public:
 	uint64_t getDroppedInvalid() const;
 	uint64_t getDroppedRate() const;
 	const DropProbe& getDropProbe() const;
+	// Issue #430: datagrams made only of CR/LF -- RFC 5626 keep-alives, which
+	// phones also send over UDP to hold a NAT binding. Counted, NOT dropped.
+	uint64_t getKeepalivesCrlf() const;
 	// Issue #443/#444: discards made BEFORE handle() sees a datagram -- by the
 	// UDP receive loop (oversize, empty, a failed receive) or by SipServer when
 	// the message pool is spent. Called on the receive task; never allocates or
@@ -2069,6 +2072,7 @@ private:
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
+	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
 	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
