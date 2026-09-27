@@ -448,17 +448,16 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
           <label for="seed-reg-mode">SIP registrar mode</label>
           <select id="seed-reg-mode" aria-describedby="seed-reg-hint">
             <option value="keep" selected>Leave as is</option>
-            <option value="0">Open &mdash; any endpoint, no password</option>
             <option value="1">Learn &mdash; adopt phones on first sight</option>
             <option value="2">Secure &mdash; every REGISTER is authenticated</option>
           </select>
           <p class="muted hint" id="seed-reg-hint">Who is allowed to register as an extension. A board that has never been
-            told otherwise runs in <strong>open</strong>, so on a fresh board <em>Leave as is</em> means open.
-            <br><strong>Open:</strong> any endpoint on the network can register as any extension, with no credential. That is
-            the current default. Fine on a bench, a lab or a classroom; not on a link anyone else shares.
+            told otherwise runs in <strong>learn</strong>, so on a fresh board <em>Leave as is</em> means learn. There is no
+            open mode any more: accepting any endpoint with no credential let anyone on the link register as any extension,
+            and firmware that finds it stored switches the board to learn.
             <br><strong>Learn:</strong> trust-on-first-use. An unknown device is adopted and locked to the extension it asked
-            for by MAC address, while devices already secured are digest-enforced as usual. Meant for adopting a fleet of
-            phones you already own, then turning off again.
+            for by MAC address, while devices already secured are digest-enforced as usual. Your phones register with
+            nothing to configure.
             <br><strong>Secure:</strong> every REGISTER is digest-challenged, so an extension can only be claimed by
             something that knows its secret. An extension with no secret stored yet cannot register at all &mdash; the
             registrar answers <em>Extension Not Provisioned</em> &mdash; so provision your extensions before you switch a
@@ -466,11 +465,10 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
         </div>
 
         <div class="notice warn hidden" id="seed-reg-learn-warn">
-          <p style="margin-bottom:0"><strong>Learn mode is a deliberate, temporary weakening.</strong>
-            <span class="muted">While it is on, anything that can reach the PBX can claim any extension that has not been
-            adopted yet &mdash; that is the whole point, and it is why it must not be left on as a steady state. Run it on a
-            trusted or WPA2 link, adopt the phones, then come back and set <em>Secure</em>. Until the dashboard control for
-            this lands, reflashing with this panel is how you change it back.</span></p>
+          <p style="margin-bottom:0"><strong>Learn trusts first contact.</strong>
+            <span class="muted">Anything that can reach the PBX can claim an extension that no phone has adopted yet.
+            Once a phone has it, the extension is locked to that device. Adopt your phones on a trusted or WPA2 link; for
+            the strongest setting, secure them and switch to <em>Secure</em> from the dashboard.</span></p>
         </div>
 
         <p class="muted" style="margin-bottom:0">The seed is written on both <em>Full flash</em> and <em>App only</em>, but a board
@@ -748,8 +746,8 @@ function activeSlot(entry0, entry1) {
 //     8     4  gen       generation counter; a UNIX timestamp, so every opt-in
 //                        write is a new value and the firmware applies it once
 //    12     1  wifiMode  0 = captive-portal default, 1 = STATION, 2 = AP
-//    13     1  regMode   SIP registrar admission: 0 = open, 1 = learn,
-//                        2 = secure (matches the NVS key "reg_mode")
+//    13     1  regMode   SIP registrar admission: 1 = learn, 2 = secure (matches
+//                        the NVS key "reg_mode"); 0 was open, retired (#500)
 //    14     2  --        reserved, zero
 //    16    64  apPsk     SoftAP WPA2 passphrase
 //    80    33  staSsid   upstream Wi-Fi SSID
@@ -849,7 +847,7 @@ function putField(bytes, offset, width, s) {
 }
 
 // cfg: { apSecure: "keep"|"on"|"off", apPsk, wifiMode: "keep"|"0"|"1"|"2",
-//        regMode: "keep"|"0"|"1"|"2", staSsid, staPass, gen? }
+//        regMode: "keep"|"1"|"2", staSsid, staPass, gen? }
 //        ->  Uint8Array(256)
 function buildSeed(cfg) {
   const bytes = new Uint8Array(SEED_SIZE);
@@ -870,8 +868,9 @@ function buildSeed(cfg) {
     // The select cannot produce anything else, but buildSeed() is also called
     // by hand through __pdFlasher; a value the firmware does not recognise
     // would land in NVS as-is, so refuse it here rather than write it.
-    if (!["0", "1", "2"].includes(String(cfg.regMode))) {
-      throw new Error(`Registrar mode must be 0 (open), 1 (learn) or 2 (secure); got "${cfg.regMode}".`);
+    // 0 (open) is retired (#500); firmware would install learn for it anyway.
+    if (!["1", "2"].includes(String(cfg.regMode))) {
+      throw new Error(`Registrar mode must be 1 (learn) or 2 (secure); open is retired. Got "${cfg.regMode}".`);
     }
     flags |= SEED_HAS_REG_MODE;
   }

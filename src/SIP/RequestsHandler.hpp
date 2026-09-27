@@ -6,8 +6,9 @@
 // (POST /api/registrar), or at flash time via the cfgseed record -- see
 // docs/LEARN_MODE.md and src/Helpers/DeviceConfig.hpp. With no stored mode the
 // board decides once and saves it (issue #397, Registrar::chooseBootMode()):
-// learn on a fresh install, open kept on an existing board. The old
-// POCKETDIAL_OPEN_REGISTRAR #define (unconditional, so never really a knob) is gone.
+// learn on a fresh install, and learn on an existing board too: the open
+// registrar is retired (#500). The old POCKETDIAL_OPEN_REGISTRAR #define
+// (unconditional, so never really a knob) is gone.
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include <lwip/sockets.h>
@@ -833,7 +834,7 @@ private:
 	// seed: on ESP, loadMode() in the constructor replaces it with the stored
 	// mode or chooseBootMode()'s decision (#397). The host has no NVS, so the
 	// host suite runs Open -- its REGISTERs carry no credentials.
-	Registrar _registrar{*this, Registrar::Mode::Open};
+	Registrar _registrar{*this, Registrar::Mode::Learn};   // loadMode() decides on the board (#397, #500)
 
 	// RFC 4028 session timer helpers. Caller holds _mutex.
 	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);

@@ -338,8 +338,8 @@ The firmware is reinforced against remote attacks, memory leaks, and exhaustion 
 
 | Mode | Admission | Where it comes from |
 | :--- | :--- | :--- |
-| `open` | No SIP authentication at all. **The shipped default**, a fresh board accepts any `REGISTER` and any `INVITE`. | Compiled-in default; `POST /api/registrar mode=open` |
-| `learn` | Trust-on-first-use: an unknown MAC claiming an unclaimed extension is adopted and locked to it; already-secured devices stay digest-enforced. **Temporary, by design.** | Dashboard *Extension Registration & Onboarding* panel; `POST /api/registrar` |
+| ~~`open`~~ | **Retired (#500).** It accepted any `REGISTER` and any `INVITE` with no credential. A board that stored it boots `learn`; `POST /api/registrar mode=open` now answers `400`. | — |
+| `learn` | Trust-on-first-use: an unknown MAC claiming an unclaimed extension is adopted and locked to it; already-secured devices stay digest-enforced. **The default** (fresh boards #397; every former `open` board #500). | Dashboard *Extension Registration & Onboarding* panel; `POST /api/registrar` |
 | `secure` | Every `REGISTER` **and every `INVITE`** digest-challenged; extension ↔ MAC locked. | As above, or the flash-time `cfgseed` record (`regMode`, byte 13), the only way to set it on a headless board before first boot. Requires v1.4.1+: on v1.3.0/v1.4.0 that field wrote to the wrong NVS namespace and did nothing ([#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)) |
 
 Triage:
