@@ -38,7 +38,9 @@ Status: Complete, Post-Refactor Review & Threat Evaluation
 >    (#502). A fresh board adopts an unknown MAC on its first REGISTER of an unclaimed
 >    extension, and admits an INVITE from a Learned (unsecured) extension without a
 >    challenge; digest is enforced for devices promoted to Secured (REGISTER and, since
->    #512, INVITE) and for every extension in `secure` mode.
+>    #512, INVITE) and for every extension in `secure` mode, with two open bypasses:
+>    #507 (an ARP miss admits a Secured extension without digest) and #549/#525 (a
+>    credentialed INVITE can be replayed to another destination; fix #555 not merged).
 >
 > Line numbers quoted throughout this document predate the decomposition of
 > `RequestsHandler` into `CallForker` / `CallPickup` / `ParkOrbit` / `BlfSubscriptions` /
@@ -242,7 +244,8 @@ Residual risk, stated plainly *(as amended 2026-09-13)*: the **first-run window 
 open by design**: a factory-fresh device ships `admin`/`admin` with a forced change on
 first use, so onboarding stays possible (THREAT_MODEL §5.1); the registrar's **default
 mode is `learn`** (#441; `open` is retired, #502), so the digest control protects only
-devices promoted to Secured, or every extension in a `secure` deployment;
+devices promoted to Secured, or every extension in a `secure` deployment, and even
+that has two open bypasses (#507, #549/#525);
 and the stored HA1 is a bearer credential at rest, which is what makes SEC-03's
 flash-encryption fix matter. See [THREAT_MODEL.md](THREAT_MODEL.md) §5 and §9.
 

@@ -514,13 +514,11 @@ attach it to cross-site requests). There is **no `Secure` flag**; the dashboard 
 plain HTTP on a LAN appliance, and `Secure` would make the cookie unusable. The
 cookie value is the session token; the CSRF token is never a cookie, by design.
 
-**Brute-force accounting** is **global, not per-client.** `AdminAuth` implements
-per-client buckets and `handleClient()` even derives `peerIp` from `getpeername()` for
-them (`HttpServer.cpp:247-263`), but it stores that only on the OTA request (`:330`).
-`parseRequest()` never sets `req.clientIp`, so `sendApiAdminLogin` passes an empty string
-(`:2720`, `:2729`, `:2732`) and every failure shares one unkeyed bucket with the DTMF PIN
-path. **One guesser can therefore lock the real admin out**; see
-[THREAT_MODEL.md](THREAT_MODEL.md) D-3. The thresholds below are real:
+**Brute-force accounting** is **per client since #530**: `handleClient()` sets
+`req.clientIp` from the peer address on every request, and `sendApiAdminLogin` keys the
+lockout on that address plus the principal. **One guesser can still lock the real admin
+out** through the per-principal aggregate backstop, which counts across that client's own
+cooldowns; see [THREAT_MODEL.md](THREAT_MODEL.md) D-3. The thresholds below are real:
 `kMaxFailedAttempts` = 5 consecutive failures engage a
 `kLockoutMs` = 60 s cooldown, and consecutive lockouts back off exponentially to a
 cap of 60 s << 4 ≈ 16 minutes. A separate aggregate backstop
