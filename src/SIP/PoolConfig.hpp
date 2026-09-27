@@ -22,7 +22,7 @@
 // (32 clients, 8 sessions). The message-pool default was historically 32 (== client
 // count); it is now sized to cover the worst-case broadcast + BLF-NOTIFY burst
 // (MAX_CLIENTS + MAX_SUBSCRIPTIONS + headroom, Issue #54) so peak fan-out no longer
-// spills into the hot-path heap fallback.
+// is refused (#409; there is no heap fallback).
 //
 // Trade-off in one line: raise these for capacity, lower them to claw back RAM
 // on a constrained SoftAP node. See docs/SCALING.md for per-tier recommendations,

@@ -5,7 +5,7 @@
 //         buffer by recvfrom() and handed on as if complete (a cut SDP parsed
 //         as a whole INVITE). It is now detected (recvmsg() + MSG_TRUNC),
 //         refused, and counted as `oversize` with its real length.
-//   #443 S1: when the message pool and its bounded heap fallback are spent,
+//   #443 S1: when the message pool is spent (no heap fallback since #409),
 //         SipServer::onNewMessage() dropped the datagram with no count. Now
 //         `no_pool`.
 //   #443 S2: a failed receive was skipped silently. Now counted with its errno,

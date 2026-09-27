@@ -60,7 +60,7 @@ namespace
 
 	// The static _messagePool is populated lazily by the first RequestsHandler
 	// constructed in the process. A test that draws from the pool without one in
-	// existence measures only the heap fallback and silently proves nothing, so
+	// existence measures nothing real and silently proves nothing, so
 	// every test here holds one — and does not depend on another test having run
 	// first to fill it.
 	RequestsHandler makeHandler()

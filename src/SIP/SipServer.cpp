@@ -83,8 +83,8 @@ void SipServer::onNewMessage(std::string_view data, sockaddr_in src)
 	}
 	else
 	{
-		// Issue #443 S1: createMessage() fails only when the message pool and
-		// its bounded heap fallback are spent. The datagram is gone -- count it
+		// Issue #443 S1: createMessage() fails only when the message pool is
+		// spent (no heap fallback since #409). The datagram is gone -- count it
 		// (it never reaches handle(), so packetsDropped cannot see it).
 		_handler.noteRxDiscard(DropProbe::Reason::NoPool, src, data, data.size());
 	}

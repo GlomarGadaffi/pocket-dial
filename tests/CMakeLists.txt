@@ -62,8 +62,8 @@ add_executable(sip_parser_tests
     # The binary's one counting operator new, plus its own positive controls.
     support/AllocCounter.cpp
     AllocCounter_test.cpp
-    # Issue #101(A)/(E): message-pool backpressure (bounded heap fallback, then
-    # refuse) and the concurrent-handout invariant. Draws on the process-global
+    # Issue #101(A)/(E): message-pool backpressure (refuse when spent; no heap
+    # fallback since #409) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
     RequestsHandler_pool_test.cpp
     # Issue #409: a spent pool refuses, never heap-falls-back.

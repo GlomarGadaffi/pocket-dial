@@ -441,7 +441,7 @@ public:
 	// to keep capacity exhausted; drop it to restore. Drawing through
 	// allocateVirtualPeer() rather than reading _virtualPeerPool directly is
 	// deliberate -- it exhausts whatever the allocator has behind the pool
-	// too (the #101A heap fallback while it exists), so the next draw really
+	// too, so the next draw really
 	// returns nullptr, which is the state every caller must survive.
 	std::vector<std::shared_ptr<SipClient>> exhaustVirtualPeersForTest()
 	{

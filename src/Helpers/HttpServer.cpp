@@ -2376,8 +2376,8 @@ void HttpServer::sendApiMetrics(int sock)
 	        "(issue #430).",
 	        keepalivesCrlf);
 	counter("pocketdial_packets_dropped_no_pool_total",
-	        "SIP datagrams discarded before parsing because the message pool and its "
-	        "bounded heap fallback were spent (issue #443). Not in "
+	        "SIP datagrams discarded before parsing because the message pool was "
+	        "spent (issue #443; no heap fallback since #409). Not in "
 	        "pocketdial_packets_dropped_total.",
 	        droppedNoPool);
 	counter("pocketdial_packets_dropped_oversize_total",
