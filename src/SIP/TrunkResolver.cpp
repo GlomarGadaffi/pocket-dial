@@ -266,7 +266,7 @@ void TrunkResolver::workerEntry(void* arg)
 	auto* self = static_cast<TrunkResolver*>(arg);
 	self->runResolve();
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	vTaskDelete(nullptr);
+	pd::deleteTask(nullptr);   // #466: was vTaskDelete on a WithCaps(PSRAM) task -- leaked its PSRAM stack + TCB
 #endif
 }
 
@@ -294,8 +294,8 @@ bool TrunkResolver::startWorker(std::string_view host)
 	// 4 KB: getaddrinfo plus a fixed frame, no TLS and no parsing. Priority 4
 	// matches SmtpClient's worker -- below the SIP task, because a name lookup
 	// must never preempt signalling.
-	BaseType_t ok = xTaskCreateWithCaps(&TrunkResolver::workerEntry, "trunk_dns",
-		4096, this, 4, nullptr, PD_TASK_STACK_CAPS);
+	BaseType_t ok = pd::createTaskPreferPsram(&TrunkResolver::workerEntry, "trunk_dns",
+		4096, this, 4, nullptr);
 	if (ok != pdPASS)
 	{
 		ESP_LOGW("TrunkResolver", "could not start resolver task");
