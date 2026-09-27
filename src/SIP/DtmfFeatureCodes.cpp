@@ -7,6 +7,7 @@
 #include <chrono>
 
 #include "AdminAuth.hpp"
+#include "ResetGuard.hpp"   // #473
 #include "CdrArchive.hpp"
 #include "CoreDumpStore.hpp"
 #include "PbxPersist.hpp"
@@ -256,6 +257,10 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 						// Outside the platform guard, so the host suite can pin it.
 						(void)CoreDumpStore::erase();
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+						// #473: same guard as the HTTP door -- no writer may be
+						// mid-write while the partition is erased under it.
+						resetguard::begin();
+						(void)resetguard::waitForWritersIdle(500);
 						nvs_flash_erase();
 						esp_restart();
 #else
