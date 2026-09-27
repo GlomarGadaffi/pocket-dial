@@ -12,8 +12,13 @@ Inputs:
 Fails (exit 1) when, for any task,
   * worst static chain + margin > configured bytes, or
   * the entry function is not in the call graph (fails closed), or
-  * a single project frame exceeds frame_ceiling without an allowlist entry;
-and when the number of xTaskCreate*/createTaskPreferPsram call sites in a
+  * a single project frame exceeds frame_ceiling without an allowlist entry, or
+  * a reachable function has a dynamic/VLA frame without an allowlist entry, or
+  * a reachable project function has no frame data (a partial --ci-dir), or
+  * a reachable library callee has no frame data, no library_defaults
+    match and no allowlist entry;
+and when the number of task-creation sites (xTaskCreate*, including Static
+and WithCaps, pd::createTaskPreferPsram, std::thread/jthread) in a
 source file differs from the number of table entries for that file (a new
 task that nobody budgeted fails closed). Line numbers in the table are
 references only, so unrelated edits don't break the gate.
@@ -41,7 +46,8 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "tests", "tools"))
 from check_parser_callgraph import load_graph, pretty, is_project  # noqa: E402
 
-CREATE_RE = re.compile(r"\b(?:xTaskCreate(?:PinnedToCore)?|pd::createTaskPreferPsram)\s*\(")
+CREATE_RE = re.compile(r"\b(?:xTaskCreate\w*|pd::createTaskPreferPsram)\s*\("
+                       r"|\bstd::j?thread\s*(?:\w+\s*)?[({]")
 
 
 def count_sites(src_root):
@@ -60,9 +66,10 @@ def count_sites(src_root):
     return out
 
 
-def worst_chain(v, edges, frames, memo, path):
+def worst_chain(v, edges, size, memo, path, seen):
     """(bytes, [nodes]) of the deepest direct-call chain from v, plus whether a
     cycle was cut below v. Cut results are not memoised (#457 determinism)."""
+    seen.add(v)
     if v in memo:
         return memo[v], False
     if v in path:
@@ -70,12 +77,12 @@ def worst_chain(v, edges, frames, memo, path):
     path.add(v)
     best, cut = (0, []), False
     for w in sorted(edges.get(v, ())):
-        r, c = worst_chain(w, edges, frames, memo, path)
+        r, c = worst_chain(w, edges, size, memo, path, seen)
         cut |= c
         if r[0] > best[0]:
             best = r
     path.discard(v)
-    res = (frames.get(v, (0,))[0] + best[0], [v] + best[1])
+    res = (size[v] + best[0], [v] + best[1])
     if not cut:
         memo[v] = res
     # ponytail: uncached cut subtrees are re-walked, exponential on dense
@@ -99,11 +106,35 @@ def run(ci_dir, table_path, src_root, main_variant):
     allow = table.get("frame_allowlist", {})
     tasks = table["tasks"]
     nodes, edges, frames = load_graph(ci_dir)
+    for vs in list(edges.values()):
+        for w in vs:
+            nodes.setdefault(w, w)   # a callee seen only as an edge target
+    lib = [(re.compile(k), b) for k, b in sorted(table.get("library_defaults", {}).items())]
+
+    def allowed(x):
+        return any(k in pretty(nodes.get(x, x)) for k in allow)
+
+    size, problem = {}, {}
+    for v in nodes:
+        label = pretty(nodes[v])
+        if v in frames:
+            size[v] = frames[v][0]
+            if frames[v][1] != "static" and not allowed(v):
+                problem[v] = f"{frames[v][1]} frame, no allowlist entry"
+        elif is_project(nodes[v]):
+            size[v] = 0
+            problem[v] = "project function with no frame data (partial --ci-dir?)"
+        else:
+            size[v] = next((b for rx, b in lib if rx.search(label)), None)
+            if size[v] is None:
+                size[v] = 0
+                if not allowed(v):
+                    problem[v] = "library callee with no frame data, no library_defaults match"
     print(f"call graph: {len(nodes)} functions, {len(frames)} frames with stack data; "
           f"margin {margin} B, frame ceiling {ceiling} B")
     rc = 0
 
-    want = collections.Counter(t["file"] for t in tasks if t.get("counted", True))
+    want = collections.Counter(t["file"] for t in tasks)
     have = count_sites(src_root)
     for f in sorted(set(want) | set(have)):
         if want[f] != have.get(f, 0):
@@ -111,7 +142,7 @@ def run(ci_dir, table_path, src_root, main_variant):
             print(f"FAIL table: {f} has {have.get(f, 0)} task-creation site(s), "
                   f"task_stacks.json lists {want[f]}")
 
-    memo = {}
+    memo, seen = {}, set()
     for t in sorted(tasks, key=lambda t: (t["name"], t["file"], t["line"])):
         # One image links one esp_main variant; the others' tasks aren't in it.
         if t["entry"] is None or (MAIN_VARIANT_RE.match(t["file"]) and t["file"] != main_variant):
@@ -121,19 +152,23 @@ def run(ci_dir, table_path, src_root, main_variant):
             rc = 1
             print(f"FAIL {t['name']}: entry '{t['entry']}' not in call graph ({t['file']}:{t['line']})")
             continue
-        total, path = max((worst_chain(h, edges, frames, memo, set())[0] for h in hits),
+        total, path = max((worst_chain(h, edges, size, memo, set(), seen)[0] for h in hits),
                           key=lambda r: r[0])
         ok = total + margin <= t["bytes"]
         rc |= 0 if ok else 1
         print(f"{'ok  ' if ok else 'FAIL'} {t['name']}: {total} B + {margin} margin "
               f"{'<=' if ok else '>'} {t['bytes']} B ({t['file']}:{t['line']})")
         for x in path:
-            print(f"        {frames.get(x, (0,))[0]:6d}  {pretty(nodes.get(x, x))[:100]}")
+            print(f"        {size[x]:6d}  {pretty(nodes.get(x, x))[:100]}")
+
+    for x in sorted(seen & set(problem)):
+        rc = 1
+        print(f"FAIL frame: {problem[x]}: {pretty(nodes[x])[:100]}")
 
     for x in sorted(frames):
         b = frames[x][0]
         label = pretty(nodes.get(x, x))
-        if b > ceiling and is_project(nodes.get(x, "")) and not any(k in label for k in allow):
+        if b > ceiling and is_project(nodes.get(x, "")) and not allowed(x):
             rc = 1
             print(f"FAIL frame: {b} B > {ceiling} B ceiling, no allowlist entry: {label[:100]}")
     return rc
