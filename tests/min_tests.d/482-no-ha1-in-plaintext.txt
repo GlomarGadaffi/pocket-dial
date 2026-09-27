@@ -1,0 +1,3 @@
+# ConfigExportImport_test.cpp: no HA1 in a plaintext or readable export (2),
+# encrypted round trip, plaintext-only import, legacy plaintext HA1s (#482)
+5
