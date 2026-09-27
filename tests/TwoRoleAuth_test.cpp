@@ -565,6 +565,13 @@ TEST(TwoRoleAuthCore, WebLoginsFromFreshAddressesCannotEvictAnEngagedPinLockout)
 	// the per-client web-login buckets (#530). Eight failed logins from fresh --
 	// spoofable -- addresses used to recycle it and clear the PIN lockout that
 	// guards the remote factory reset.
+	//
+	// The web logins below must stay under the aggregate backstop, or the PIN
+	// would read "locked out" because the backstop tripped rather than because
+	// its own bucket survived, and this test would pass for the wrong reason.
+	static_assert(AdminAuth::kMaxFailedAttempts + static_cast<int>(AdminAuth::kMaxAttemptBuckets) + 2
+		< AdminAuth::kMaxFailedAttemptsGlobal,
+		"precondition: PIN lockout + the web logins below stay under the aggregate backstop");
 	AdminAuth::clearCredential();
 	ASSERT_TRUE(AdminAuth::setDtmfPin("2468"));
 	for (int i = 0; i < 50 && !AdminAuth::isLockedOut(); ++i)
