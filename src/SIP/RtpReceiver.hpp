@@ -73,6 +73,9 @@ public:
 	// is read but truncated by the kernel to this cap; parseRtp() then bounds-
 	// checks against the actual byte count so a short/oversize read is safe.
 	static constexpr int     MAX_DATAGRAM_BYTES = 512;
+	// Issue #469: inbound RTP datagrams longer than MAX_DATAGRAM_BYTES, dropped
+	// rather than parsed truncated -- across every receiver since boot.
+	static uint32_t rxOversizeDrops();
 
 	// Parsed view of one RTP packet (RFC 3550 §5.1). `payload`/`payloadLen`
 	// point INTO the caller's receive buffer — no copy, no allocation. Valid
