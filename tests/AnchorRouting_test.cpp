@@ -1109,3 +1109,43 @@ TEST(AnchorRouting, ACancelAfterTheAnchorAnsweredSendsNo487)
 			<< "an answered INVITE gets no 487";
 	}
 }
+
+TEST(AnchorRouting, AnAckDeadlineReapOfAConnectedAnchorCallByesTheHandset)
+{
+	// Issue #533 (#451 X1): tick()'s ACK-deadline reap of a CONNECTED outbound
+	// anchor call dropped the anchor leg and ended the session but never told
+	// the handset, on the theory that a phone that never ACKed is gone. The
+	// phone was not gone: it showed a live call with dead air, and its own BYE
+	// later drew 404. The reap now BYEs it, like every other server teardown.
+	//
+	// Loopback answers synchronously and never arms the ACK deadline, so the
+	// expired deadline a real (async) anchor's Answered handler arms is set on
+	// the session directly.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-533"));
+	auto session = handler.getSession("Call-ID: anchor-533");
+	ASSERT_TRUE(session.has_value());
+	ASSERT_EQ(session.value()->getState(), Session::State::Connected);
+	session.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+
+	EXPECT_FALSE(handler.getSession("Call-ID: anchor-533").has_value()) << "the reap still ends the call";
+	std::vector<std::string> byesToHandset;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg) continue;
+		if (addr.sin_addr.s_addr != addrFor("192.168.9.51").sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.rfind("BYE ", 0) == 0) byesToHandset.push_back(raw);
+	}
+	ASSERT_EQ(byesToHandset.size(), 1u) << "the handset must be told the call is over";
+	EXPECT_NE(byesToHandset.front().find("Call-ID: anchor-533"), std::string::npos);
+}
