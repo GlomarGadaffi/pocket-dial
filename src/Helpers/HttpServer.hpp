@@ -98,6 +98,22 @@ public:
 	static bool isProvisioningConfigPath(const std::string& path);
 	static ProvisioningPathType parseProvisioningPath(const std::string& path, std::string& outKey);
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#410): serve one static page onto `sock` ON THE CALLING THREAD,
+	// for a request carrying `cookieHeader`, so a test can count the page's heap
+	// allocations with a per-thread AllocGuard (the real server answers on a
+	// connection thread the guard cannot see). `page`: 0 = "/", 8 = /setup/email,
+	// 9 = /setup/trunk. csrfForTest() does only the token derivation for the same
+	// request, built the same way, so allocs(page) - allocs(token) is exactly
+	// what serving the page costs on top of looking up its token.
+	void servePageForTest(int sock, int page, const std::string& cookieHeader);
+	std::string csrfForTest(const std::string& cookieHeader);
+	// What the pre-#410 path put on the wire as a 200 text/html head for a body
+	// of `len` bytes -- buildResponseHead() itself, so a test compares the
+	// streamed page against the old head, not against a copy of it.
+	static std::string legacyHtmlHeadForTest(size_t len);
+#endif
+
 private:
 	// Idempotent socket lifecycle, called only from this class's own thread
 	// (the constructor, or acceptLoop() once running) — never from another
@@ -177,6 +193,15 @@ private:
 	                   const std::string& contentType, size_t contentLength,
 	                   const std::string& extraHeader);
 	static bool sendAllBytes(int sock, const char* ptr, size_t len);
+	// #410: a static HTML page written straight from its flash-resident parts,
+	// with the session's CSRF token substituted for the __PD_CSRF__ marker on the
+	// way out. No copy of the page is ever made: a 200 head is formatted into a
+	// small stack buffer (Content-Length computed up front), then each part is
+	// sent in place and only the part holding the marker is split around it. The
+	// marker is located per call by scanning the parts, never cached, so a page
+	// edit that moves it cannot silently ship a literal marker and no token.
+	static void sendStaticHtml(int sock, const char* const* parts, const size_t* sizes,
+	                   size_t count, const std::string& token);
 	void sendRedirect(int sock, const std::string& location);
 	// Takes the request so the rendered page can carry this session's CSRF token.
 	void sendHtml(int sock, const HttpRequest& req);
