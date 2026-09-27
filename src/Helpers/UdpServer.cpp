@@ -243,7 +243,7 @@ void UdpServer::receiveLoop()
 			(void)esp_task_wdt_reset();
 		}
 #endif
-		if (!_keepRunning) continue;
+		if (!_keepRunning.load()) continue;   // a real re-read: stop() may have run while recvfrom() blocked
 		// Issue #443/#444: nothing below is thrown away silently any more.
 		if (truncated)
 		{
