@@ -7,6 +7,8 @@
 #include <chrono>
 
 #include "AdminAuth.hpp"
+#include "ResetJournal.hpp"   // #473
+#include "ResetGuard.hpp"   // #473
 #include "CdrArchive.hpp"
 #include "CoreDumpStore.hpp"
 #include "PbxPersist.hpp"
@@ -212,6 +214,15 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 					if (rest[3] == '1')
 					{
 						_env.log("[admin] factory reset confirmed via DTMF");
+						// #473 / #481 review: same order as the HTTP door, and FIRST --
+						// before any wipe below. The guard refuses new NVS data writes
+						// from here on; the journal records the reset as begun, so a
+						// power cut during the SD/voicemail/coredump wipes or the NVS
+						// erase is reported on the next boot. Outside the platform
+						// guard so the host suite pins the order
+						// (DtmfFactoryReset.TheGuardAndJournalAreOpenBeforeTheFirstWipe).
+						resetguard::begin();
+						(void)resetjournal::begin();   // failure is logged + counted inside
 						// Issue #222: wipe the SD CDR archive too, so this door and the
 						// HTTP one (HttpServer::sendApiFactoryReset) forget the same
 						// things. nvs_flash_erase() below takes out the NVS "cdrlog"
@@ -256,7 +267,14 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 						// Outside the platform guard, so the host suite can pin it.
 						(void)CoreDumpStore::erase();
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-						nvs_flash_erase();
+						// #473: the guard and journal were opened at the top of this
+						// branch. Drain in-flight writes, erase (checked), then close
+						// the journal with the result.
+						(void)resetguard::waitForWritersIdle(500);
+						{
+							const esp_err_t eraseErr = nvs_flash_erase();
+							resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
+						}
 						esp_restart();
 #else
 						_env.log("[admin] factory reset (NVS erase + restart stubbed on host)");
@@ -369,8 +387,8 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 				// applies here too (drawbridge audit #70).
 				//
 				// allocVirtualPeer can return nullptr — pocket-dial's allocator
-				// refuses past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX rather than
-				// heap-falling-back forever the way drawbridge's does. There is no
+				// refuses as soon as the pool is spent (no heap fallback, #409),
+				// unlike drawbridge's, which heap-falls-back forever. There is no
 				// response to fail here (this is a mid-dialog DTMF feature, not a
 				// transaction), so the graceful degradation is to leave the call's
 				// existing destination alone: the caller simply doesn't get the

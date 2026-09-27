@@ -11,6 +11,9 @@
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
 #include "FactoryReset.hpp"    // Issue #363: the secrets factory reset must erase
 #include "DeviceConfig.hpp"
+#include "ResetJournal.hpp"     // #473: report an incomplete factory reset on the next boot
+#include "ResetGuard.hpp"      // #473: block NVS data writes while resetting
+#include "FirmwareInfo.hpp"    // Issue #411: "version" / "firmware" in /api/status
 #include <cstdio>   // std::snprintf: the factory-reset error body (#450)
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
@@ -286,6 +289,10 @@ void HttpServer::acceptLoop()
 	// It also caches the presence probe itself (#405): after this, /api/status
 	// and the coredump routes never touch the partition per request.
 	CoreDumpStore::prime();
+	// #481 review: load the reset journal's boot status here too, before the
+	// first accept -- the flash read and the one-time lock setup happen on this
+	// 8 KB thread once, never on a 4 KB http_conn thread per request.
+	(void)resetjournal::bootStatus();
 
 #if defined(ESP_PLATFORM)
 	// Issue #366. esp_pthread_set_cfg() applies to threads created BY THE
@@ -1845,6 +1852,21 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"ip\":\"" << jsonEscape(displayIp) << "\",";
 	json << "\"port\":" << 5060 << ",";
 	json << "\"httpPort\":" << _port << ",";
+	// #411: which build is this. "version" is what tests/run.py's
+	// board-provenance check and the bench run sheets compare with
+	// `git describe` (TEST_HARNESS.md §5.3).
+	//
+	// Public, like the roster is not (#207): provenance fetches this without a
+	// session, and a check that cannot see the field must not quietly pass.
+	// ONLY the version string, by design -- the same class of disclosure as a
+	// SIP User-Agent. No build host, no path, no build timestamp and no IDF
+	// version here: those tell an attacker more than which build this is, and
+	// provenance needs none of them. They go to the boot banner on the serial
+	// console instead, which is not network-reachable.
+	// Raw, no jsonEscape() (#461 review: it built a std::string per request).
+	// cmake/FirmwareVersion.cmake refuses any stamp outside [A-Za-z0-9._+-] at
+	// configure time, and FirmwareInfo_test pins the charset of the one built in.
+	json << "\"version\":\"" << FirmwareInfo::version() << "\",";
 	// #529: HTTP connections dropped for a slow request, and refused because
 	// one source already held its share of the slots.
 	json << "\"httpReadDeadlineDrops\":" << readDeadlineDrops() << ",";
@@ -1869,8 +1891,16 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		json << "\"emergencyRoute\":\"" << emergencyRoute << "\",";
 	}
 	json << "\"uptime\":" << uptimeSec << ",";
+	// #470: CDR ring persist health. A non-zero failure count means call history
+	// is NOT surviving reboots; suppressed counts writes refused mid-reset (#473).
+	json << "\"cdrPersistFailures\":" << CdrRing::persistFailureCount() << ",";
+	json << "\"cdrPersistSuppressed\":" << CdrRing::persistSuppressedCount() << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
+	// Issue #409: draws refused by a spent pool (neither has a heap fallback).
+	// The message pool is process-global, so it reads even with no engine.
+	json << "\"msgPoolRefusals\":" << RequestsHandler::getMessagePoolRefusals() << ",";
+	json << "\"vpeerPoolRefusals\":" << (handler ? handler->getVirtualPeerRefusals() : 0) << ",";
 	// #450 / poll #454: false after a factory reset until the E911 notify list is
 	// set again. The dashboard shows a banner; nothing is gated on it.
 	json << "\"e911Configured\":" << (e911Configured ? "true" : "false") << ",";
@@ -1941,6 +1971,19 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 #else
 	json << "\"sd\":{\"present\":false,\"mounted\":false,\"capacityMb\":0},";
 #endif
+
+	// #473: did the last factory reset complete? Public, like the counts: it
+	// discloses no identity, and an operator taking the board over needs to
+	// see it before logging in. `resetJournal` says where the record lives
+	// ("flash" survives a power cut, "rtc" only a restart -- see ResetJournal.hpp).
+	{
+		const resetjournal::BootStatus rj = resetjournal::bootStatus();
+		json << "\"resetIncomplete\":" << (rj.incomplete() ? "true" : "false") << ","
+		     << "\"resetIncompleteStage\":\"" << resetjournal::stageName(rj.stage) << "\","
+		     << "\"resetFailedMask\":" << static_cast<unsigned>(rj.failedMask) << ","
+		     << "\"resetJournal\":\"" << resetjournal::storageName(rj.storage) << "\","
+		     << "\"resetJournalWriteFailures\":" << resetjournal::writeFailureCount() << ",";
+	}
 
 	// Clients array
 	// #207: the roster is withheld from an unauthenticated caller. The counts
@@ -2372,8 +2415,8 @@ void HttpServer::sendApiMetrics(int sock)
 	        "(issue #430).",
 	        keepalivesCrlf);
 	counter("pocketdial_packets_dropped_no_pool_total",
-	        "SIP datagrams discarded before parsing because the message pool and its "
-	        "bounded heap fallback were spent (issue #443). Not in "
+	        "SIP datagrams discarded before parsing because the message pool was "
+	        "spent (issue #443; no heap fallback since #409). Not in "
 	        "pocketdial_packets_dropped_total.",
 	        droppedNoPool);
 	counter("pocketdial_packets_dropped_oversize_total",
@@ -3975,9 +4018,37 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		             "{\"error\":\"factory reset requires confirm=ERASE\"}");
 		return;
 	}
+	// #473: from here on, NVS writers refuse new data (the CDR persist writer
+	// first), so nothing a background task writes can put PII back behind this
+	// reset. The board restarts at the end, which is what clears the flag.
+	resetguard::begin();
+	// #473: then open the reset journal, outside NVS, so that if anything below
+	// fails -- or power is cut before the restart task closes it -- the next
+	// boot reports the reset as incomplete (/api/status "resetIncomplete").
+	// A journal write failure is logged and counted inside begin(); the reset
+	// proceeds regardless (#481 review).
+	(void)resetjournal::begin();
+#if defined(POCKETDIAL_RESET_INTERRUPT_PROBE) && defined(ESP_PLATFORM)
+	// BENCH-ONLY (#451 P4, #473): stands in for a power cut in the middle of a
+	// reset, which nobody can pull on a remote bench. The journal is open and
+	// nothing is erased yet, so this restart is exactly "the reset began and
+	// never finished": the next boot must report resetIncomplete, with the
+	// record surviving the restart from flash (resetJournal:"flash"). Nothing
+	// is wiped, so the board keeps its config. Never ship it (CMake warns).
+	ESP_LOGW("factory_reset", "RESET INTERRUPT PROBE: journal begun, restarting before any erase (#473)");
+	esp_restart();
+#endif
+	// In-flight writes are drained before anything is erased.
+	if (!resetguard::waitForWritersIdle(500))
+	{
+		std::cerr << "[reset] an NVS writer was still busy after 500 ms; erasing anyway" << std::endl;
+	}
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP
 	// (NVS) and host (in-memory).
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	if (auto h = resetguard::beforeFirstEraseHookForTest()) h();   // #481 review: ordering pin
+#endif
 	const bool adminErased = AdminAuth::clearCredential();
 	// Also drop ap_secure / ap_psk / cfgseed_gen. Clearing the seed generation is
 	// deliberate: the next boot re-applies whatever the flasher wrote, so a
@@ -4123,6 +4194,18 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// #441 (G-dubs's fold, taken over by Globox): the device-settings reset joins
 	// this same check as "device" -- a failed reg_mode write can leave an old
 	// `secure` in place, the lockout this reset exists to rescue.
+	//
+	// #473: each store that failed also goes into the reset journal, so the next
+	// boot reports it even if this reply never reaches the operator. tapi, didmap,
+	// wifi (#456 review) and the device settings (#441, #481 review) share the
+	// journal's kOther bit.
+	if (!adminErased)    resetjournal::noteFailure(resetjournal::kAdmin);
+	if (!trunkErased)    resetjournal::noteFailure(resetjournal::kTrunk);
+	if (!secretsErased)  resetjournal::noteFailure(resetjournal::kSecrets);
+	if (!forwardsErased) resetjournal::noteFailure(resetjournal::kForwards);
+	if (!e911Erased)     resetjournal::noteFailure(resetjournal::kE911);
+	if (!tapiErased || !didmapErased || !wifiErased || !deviceConfigCleared)
+		resetjournal::noteFailure(resetjournal::kOther);
 	if (!adminErased || !trunkErased || !secretsErased || !forwardsErased || !e911Erased ||
 		!tapiErased || !didmapErased || !wifiErased || !deviceConfigCleared)
 	{
@@ -4189,26 +4272,41 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// here on. Keep-list checked on poll #455: nothing that must survive lives in
 	// the nvs partition (cfgseed, prompts, coredump, otadata and phy_init are their
 	// own partitions; a fresh boot re-runs PHY calibration, which is harmless).
+	//
+	// #473: the reset journal is closed here, the last step before the restart,
+	// recording whether the whole-partition erase worked. The journal lives in
+	// the prompts partition, which the NVS erase does not touch, so it survives
+	// to the next boot; a hang or power cut before finish() leaves "interrupted".
 	// 4096, not 2048 (#456 review): nvs_flash_erase()'s worst static chain is
-	// ~1,920 B, which left too little for the lambda and an interrupt frame, and
-	// an overflow here would panic mid-erase -- the half-reset state.
+	// ~1,920 B and finish() writes a flash sector; an overflow here would panic
+	// mid-erase -- the half-reset state.
 	if (xTaskCreate([](void*) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
-		if (nvs_flash_erase() != ESP_OK)
+		// #473: the guard begun above still refuses new NVS data writes; drain any
+		// write already in flight (the CDR persist writer) before the partition is
+		// erased under it, as the DTMF door does.
+		(void)resetguard::waitForWritersIdle(500);
+		const esp_err_t eraseErr = nvs_flash_erase();
+		if (eraseErr != ESP_OK)
 		{
 			ESP_LOGE("factory_reset", "nvs_flash_erase failed -- per-key erases stand, old NVS bytes may remain");
 		}
+		resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
 		esp_restart();
 	}, "restart_task", 4096, NULL, 5, NULL) != pdPASS)
 	{
 		// The reply has gone out and the per-key erases are done; without the task
 		// there is no whole-partition erase, but the board must still restart
 		// rather than stay up half-reset. Not erased here: this is the http_conn
-		// stack, already deep (#458).
+		// stack, already deep (#458). The journal is deliberately NOT finished, so
+		// it stays Begun and the next boot reports the reset as interrupted -- true.
 		ESP_LOGE("factory_reset", "restart task not created -- restarting without the whole-NVS erase");
 		vTaskDelay(pdMS_TO_TICKS(1000));
 		esp_restart();
 	}
+#else
+	// Host: no restart task, so the reset "completes" here.
+	resetjournal::finish();
 #endif
 }
 
