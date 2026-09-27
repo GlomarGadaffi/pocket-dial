@@ -3139,6 +3139,7 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	TickType_t           delay        = pdMS_TO_TICKS(50);   // Start fast at 50ms
 	bool opened = false;
 	int  transportFailures = 0;
+	bool loggedFirstRefusal = false;   // #518: one diagnostic line per stream, not per retry
 
 	{
 		std::lock_guard<std::mutex> lock(_getMutex);
@@ -3201,7 +3202,20 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					// Drain the error body completely so the persistent connection can
 					// carry the next attempt (an unread body poisons handle reuse).
 					char drainBuf[256];
-					while (esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
+					int firstChunk = esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf));
+					if (!loggedFirstRefusal)
+					{
+						// #518: on .244 every anchored call's GET answered 403 for all 240
+						// attempts, and the log said only the status. Once per stream, say
+						// which URL and what the server said (3CX names the reason in the
+						// body). The URL carries no credential -- the token is a header --
+						// and the body is 3CX's error text, truncated to 200 bytes.
+						loggedFirstRefusal = true;
+						ESP_LOGW(TAG, "GET stream refused (HTTP %d) for %s: %.*s", status, getUrl.c_str(),
+							firstChunk > 0 ? (firstChunk < 200 ? firstChunk : 200) : 0, drainBuf);
+					}
+					while (firstChunk > 0 &&
+						esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
 					transportFailures = 0;
 				}
 				else
