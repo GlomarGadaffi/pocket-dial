@@ -14,7 +14,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -510,4 +512,102 @@ TEST(InviteAdmission, TheCalleeNeverSeesTheCallersCredentials)
 		EXPECT_EQ(raw.find("Authorization:"), std::string::npos)
 			<< "no message this PBX sends may carry the caller's credentials:\n" << raw;
 	}
+}
+
+namespace
+{
+	// credentialsFor() with an explicit nonce-count (#525).
+	std::string credentialsWithNc(const std::string& nonce, const std::string& nc)
+	{
+		const std::string ha1 = SipDigest::computeHa1("500", SipSecretStore::kRealm, "s3cret");
+		const std::string response = SipDigest::computeResponse(
+			ha1, "INVITE", "sip:600@server", nonce, nc, "0a4f113b", "auth");
+		return "Authorization: Digest username=\"500\", realm=\"pocketdial\", nonce=\"" + nonce +
+			"\", uri=\"sip:600@server\", response=\"" + response +
+			"\", algorithm=MD5, qop=auth, nc=" + nc + ", cnonce=\"0a4f113b\"\r\n";
+	}
+}
+
+TEST(InviteAdmission, AReplayedCredentialIsReChallengedNotAdmitted)
+{
+	// #525: the nonce is stateless and lives 5 minutes, so the SAME
+	// Authorization (same nonce, same nc) sent again on a new call used to
+	// place it. Now a (nonce, nc) that already authenticated gets a stale 401.
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+
+	h.handler.handle(makeInvite("rp1", 1, kPcmuOffer));
+	const std::string nonce = paramOf(firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized"), "nonce");
+	ASSERT_FALSE(nonce.empty());
+	const std::string creds = credentialsWithNc(nonce, "00000001");
+
+	h.sent.clear();
+	h.handler.handle(makeInvite("rp1", 2, kPcmuOffer, creds));
+	ASSERT_TRUE(anySentContains(h.sent, "INVITE sip:600@")) << "the first use is admitted";
+
+	h.sent.clear();
+	h.handler.handle(makeInvite("rp2", 1, kPcmuOffer, creds));
+	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@"))
+		<< "the same nonce and nc on another call must not place it";
+	const std::string again = firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized");
+	ASSERT_FALSE(again.empty()) << "a replay is re-challenged";
+	EXPECT_NE(again.find("stale=true"), std::string::npos)
+		<< "stale, so the genuine phone silently retries:\n" << again;
+}
+
+TEST(InviteAdmission, ARisingNonceCountOnTheSameNonceIsStillAdmitted)
+{
+	// RFC 2617 §3.2.2: a client may reuse a nonce with a higher nc. That must
+	// keep working, or every phone pays an extra 401 round trip per request.
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+
+	h.handler.handle(makeInvite("nc1", 1, kPcmuOffer));
+	const std::string nonce = paramOf(firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized"), "nonce");
+	ASSERT_FALSE(nonce.empty());
+	h.handler.handle(makeInvite("nc1", 2, kPcmuOffer, credentialsWithNc(nonce, "00000001")));
+
+	h.sent.clear();
+	h.handler.handle(makeInvite("nc2", 1, kPcmuOffer, credentialsWithNc(nonce, "00000002")));
+	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@")) << "nc 2 on the same nonce is a new request";
+	EXPECT_FALSE(anySentContains(h.sent, "401 Unauthorized"));
+}
+
+TEST(InviteAdmission, AReplayedNonceStaysRefusedAfterTheReplayTableOverflows)
+{
+	// #525 review: the table holds 32 nonces. Evicting a live one used to make
+	// it an unknown nonce again, so a replay of it after 32 others was
+	// admitted. Now eviction raises a watermark of issue times, and a nonce
+	// issued at or before it is re-challenged instead of trusted.
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+
+	std::vector<std::string> nonces;
+	for (int i = 0; i < 33; ++i)
+	{
+		// Our nonces carry a millisecond timestamp: space them so each is new.
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		nonces.push_back(SipDigest::generateNonce());
+		ASSERT_TRUE(i == 0 || nonces[i] != nonces[i - 1]) << "precondition: distinct nonces";
+		h.sent.clear();
+		h.handler.handle(makeInvite("ov" + std::to_string(i), 1, kPcmuOffer,
+			credentialsWithNc(nonces[i], "00000001")));
+		ASSERT_FALSE(anySentContains(h.sent, "401 Unauthorized"))
+			<< "precondition: nonce " << i << " authenticates once";
+	}
+
+	// The first nonce has been pushed out of the table by the other 32.
+	h.sent.clear();
+	h.handler.handle(makeInvite("ov-replay", 1, kPcmuOffer, credentialsWithNc(nonces[0], "00000001")));
+	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@"))
+		<< "a replay of an evicted nonce must not place a call";
+	const std::string again = firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized");
+	ASSERT_FALSE(again.empty()) << "it is re-challenged";
+	EXPECT_NE(again.find("stale=true"), std::string::npos) << again;
 }
