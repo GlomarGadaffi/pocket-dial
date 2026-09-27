@@ -1,0 +1,2 @@
+# AdminHttpGate_test.cpp: 1 (#539: live calls need a session, their count does not)
+1
