@@ -106,6 +106,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # Issue #363: the secrets a factory reset must erase.
                             "../src/Helpers/FactoryReset.cpp"
                             "../src/Helpers/DeviceConfig.cpp"
+                            # Issue #473: "factory reset incomplete" journal (prompts' last sector).
+                            "../src/Helpers/ResetJournal.cpp"
                             "../src/Helpers/SipDigest.cpp"
                             "../src/Helpers/SipSecretStore.cpp"
                             "../src/Helpers/ArpLookup.cpp"
@@ -299,6 +301,14 @@ if(POCKETDIAL_OTA_ROLLBACK_PROBE)
     endif()
     target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_OTA_ROLLBACK_PROBE=1)
     message(WARNING "SipServer: OTA ROLLBACK PROBE image -- bench only, it never marks itself valid (#395)")
+endif()
+
+# Issue #473 / #451 P4: BENCH-ONLY reset-interruption probe. POST /api/factory-reset
+# opens the reset journal and restarts before erasing anything, standing in for a
+# power cut nobody can pull on a remote bench. Never ship it.
+if(POCKETDIAL_RESET_INTERRUPT_PROBE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_RESET_INTERRUPT_PROBE=1)
+    message(WARNING "SipServer: RESET INTERRUPT PROBE image -- bench only, a factory reset restarts before erasing (#473)")
 endif()
 
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)
