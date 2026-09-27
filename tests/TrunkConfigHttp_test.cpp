@@ -352,6 +352,9 @@ TEST_F(TrunkHttpTest, RejectsATrunkPointedAtThisBoard)
 		"host=127.0.0.1&fromUser=1555&enabled=1",
 		"host=localhost&fromUser=1555&enabled=1",
 		"host=127.9.9.9&fromUser=1555&enabled=1",
+		"host=localhost.&fromUser=1555&enabled=1",                      // trailing-dot FQDN
+		"host=%5B%3A%3A1%5D&fromUser=1555&enabled=1",                   // [::1]
+		"host=%3A%3Affff%3A127.0.0.1&fromUser=1555&enabled=1",          // ::ffff:127.0.0.1
 		"host=sip.carrier.example&proxyHost=127.0.0.1&fromUser=1555&enabled=1" })
 	{
 		EXPECT_EQ(statusOf(httpPost(_port, "/api/trunk", body, s.cookie, s.csrf)), 400) << body;
