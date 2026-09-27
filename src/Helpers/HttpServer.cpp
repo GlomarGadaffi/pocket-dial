@@ -12,6 +12,7 @@
 #include "FactoryReset.hpp"    // Issue #363: the secrets factory reset must erase
 #include "DeviceConfig.hpp"
 #include "ResetJournal.hpp"     // #473: report an incomplete factory reset on the next boot
+#include "ResetGuard.hpp"      // #473: block NVS data writes while resetting
 #include <cstdio>   // std::snprintf: the factory-reset error body (#450)
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
@@ -1701,6 +1702,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"wifiCapable\":false,";
 #endif
 	json << "\"uptime\":" << uptimeSec << ",";
+	// #470: CDR ring persist health. A non-zero failure count means call history
+	// is NOT surviving reboots; suppressed counts writes refused mid-reset (#473).
+	json << "\"cdrPersistFailures\":" << CdrRing::persistFailureCount() << ",";
+	json << "\"cdrPersistSuppressed\":" << CdrRing::persistSuppressedCount() << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
 	// #450 / poll #454: false after a factory reset until the E911 notify list is
@@ -3753,7 +3758,11 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		             "{\"error\":\"factory reset requires confirm=ERASE\"}");
 		return;
 	}
-	// #473: open the reset journal FIRST, outside NVS, so that if anything below
+	// #473: from here on, NVS writers refuse new data (the CDR persist writer
+	// first), so nothing a background task writes can put PII back behind this
+	// reset. The board restarts at the end, which is what clears the flag.
+	resetguard::begin();
+	// #473: then open the reset journal, outside NVS, so that if anything below
 	// fails -- or power is cut before the restart task closes it -- the next
 	// boot reports the reset as incomplete (/api/status "resetIncomplete").
 	// A journal write failure is logged and counted inside begin(); the reset
@@ -3769,6 +3778,11 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	ESP_LOGW("factory_reset", "RESET INTERRUPT PROBE: journal begun, restarting before any erase (#473)");
 	esp_restart();
 #endif
+	// In-flight writes are drained before anything is erased.
+	if (!resetguard::waitForWritersIdle(500))
+	{
+		std::cerr << "[reset] an NVS writer was still busy after 500 ms; erasing anyway" << std::endl;
+	}
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP
 	// (NVS) and host (in-memory).
@@ -3999,6 +4013,10 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// mid-erase -- the half-reset state.
 	if (xTaskCreate([](void*) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
+		// #473: the guard begun above still refuses new NVS data writes; drain any
+		// write already in flight (the CDR persist writer) before the partition is
+		// erased under it, as the DTMF door does.
+		(void)resetguard::waitForWritersIdle(500);
 		const esp_err_t eraseErr = nvs_flash_erase();
 		if (eraseErr != ESP_OK)
 		{

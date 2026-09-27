@@ -8,6 +8,7 @@
 
 #include "AdminAuth.hpp"
 #include "ResetJournal.hpp"   // #473
+#include "ResetGuard.hpp"   // #473
 #include "CdrArchive.hpp"
 #include "CoreDumpStore.hpp"
 #include "PbxPersist.hpp"
@@ -257,10 +258,13 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 						// Outside the platform guard, so the host suite can pin it.
 						(void)CoreDumpStore::erase();
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-						// #473: same journal as the HTTP door. begin() before the
-						// erase, finish() after it -- a failed erase (or a power cut
-						// in between) is reported on the next boot.
+						// #473: same order as the HTTP door. The guard refuses new NVS
+						// data writes; the journal opens before the erase and closes
+						// after it (a failed erase, or a power cut in between, is
+						// reported on the next boot); in-flight writes drain first.
+						resetguard::begin();
 						(void)resetjournal::begin();   // failure is logged + counted inside
+						(void)resetguard::waitForWritersIdle(500);
 						{
 							const esp_err_t eraseErr = nvs_flash_erase();
 							resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
