@@ -255,3 +255,57 @@ TEST(HttpReadDeadline, ASocketWhoseTimeoutCannotBeSetIsClosedUnanswered)
 	HttpServer::setFailSocketTimeoutsForTest(false);
 	waitIdle(server);
 }
+
+TEST(HttpReadDeadline, ARefusalWhoseSendTimeoutCannotBeSetClosesUnanswered)
+{
+	// #534 review: the accept thread's 503 refusals must never block it. If
+	// SO_SNDTIMEO cannot be set, refuseBusy() closes WITHOUT sending, rather
+	// than risk a send() with no bound on the one thread every client needs.
+	struct ResetSeam
+	{
+		~ResetSeam() { HttpServer::setFailSocketTimeoutsForTest(false); }
+	} resetSeam;
+
+	RequestsHandler handler("192.168.52.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18253, nullptr);
+	server.attachHandler(&handler);
+	server.setReadDeadlineMsForTest(3000);   // long enough to hold the slots for the test
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	// One source takes every slot it is allowed, each parked in the body loop.
+	std::vector<Sock> holders;
+	for (int i = 0; i < HttpServer::kMaxConnectionsPerSource; ++i)
+	{
+		Sock h = connectFrom("127.0.0.2", 18253);
+		if (!valid(h))
+		{
+			for (Sock x : holders) closeSock(x);
+			waitIdle(server);
+			GTEST_SKIP() << "this stack can't use 127.0.0.2 as a source address";
+		}
+		ASSERT_TRUE(sendAll(h, kSlowHead));
+		holders.push_back(h);
+	}
+	for (int i = 0; i < 100 && server.activeConnectionsForTest() < HttpServer::kMaxConnectionsPerSource; ++i)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	ASSERT_EQ(server.activeConnectionsForTest(), HttpServer::kMaxConnectionsPerSource);
+
+	// The holders' own timeouts are already set; only the refusal's fails.
+	HttpServer::setFailSocketTimeoutsForTest(true);
+	Sock extra = connectFrom("127.0.0.2", 18253);
+	ASSERT_TRUE(valid(extra));
+	sendAll(extra, "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+	const std::string refused = recvAll(extra);
+	closeSock(extra);
+	HttpServer::setFailSocketTimeoutsForTest(false);
+
+	EXPECT_TRUE(refused.empty()) << "no send without a send bound: " << refused;
+	EXPECT_EQ(server.perSourceRefusals(), 1u);
+
+	for (Sock h : holders) closeSock(h);
+	waitIdle(server);
+}
