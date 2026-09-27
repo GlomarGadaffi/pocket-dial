@@ -94,7 +94,7 @@ namespace
 //  Pure builders
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::string SipTrunk::buildInvite(const Dialog& d, const std::string& sdp)
+std::string SipTrunk::buildInvite(const Dialog& d, const std::string& sdp, std::string_view authLine)
 {
 	std::ostringstream ss;
 	ss << "INVITE " << pstnUri(d.destE164, d.domain) << " SIP/2.0\r\n"
@@ -107,6 +107,7 @@ std::string SipTrunk::buildInvite(const Dialog& d, const std::string& sdp)
 	   << "Call-ID: " << d.callID << "\r\n"
 	   << "CSeq: " << d.cseq << " INVITE\r\n";
 	commonRequestTail(ss);
+	if (!authLine.empty()) ss << authLine << "\r\n";   // #399: answering a 401/407
 	// Contact must be OUR address, not the SBC's: it is where the carrier sends
 	// in-dialog requests, including the BYE when the far party hangs up first.
 	ss << "Contact: <sip:" << d.fromUser << "@" << d.localIpPort << ";transport=udp>\r\n"
@@ -358,6 +359,7 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 	const std::string sdp = RequestsHandler::buildMediaSdp(activeIp, localRtpPort,
 		/*sendrecv=*/true, /*dtmfPt=*/101);
 
+	d->offerSdp = sdp;   // #399: re-offered unchanged if the carrier challenges
 	auto invite = _env.messageFromPool(buildInvite(*d, sdp), sbc);
 	if (!invite)
 	{
@@ -491,6 +493,15 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 		_env.log("Trunk: BYE answered " + std::to_string(status)
 			+ " (" + d->destE164 + ") -- dialog released regardless", true);
 		*d = Dialog{};
+		return true;
+	}
+
+	// Issue #399: a 401/407 to our INVITE, answered once with digest
+	// credentials. answerChallenge() ACKs the challenge itself; if it cannot
+	// answer (no credentials, an unanswerable challenge, already tried once) it
+	// returns false and the challenge is an ordinary failure below.
+	if ((status == 401 || status == 407) && answerChallenge(*d, data, status))
+	{
 		return true;
 	}
 
@@ -684,4 +695,68 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 		// status means its failure mapping needs no special case for "0".
 		if (notify && _listener) _listener->onTrunkFailed(eventFor(finished), 408);
 	}
+}
+
+// Issue #399: answer a 401/407 to our INVITE, once. RFC 3261 s22.2: ACK the
+// challenge in its own transaction, then send a NEW INVITE transaction -- same
+// Call-ID and From-tag, CSeq+1, a fresh branch, no To-tag -- carrying
+// Authorization (401) or Proxy-Authorization (407). The credential is never
+// logged. Returns false, having sent nothing, when it cannot answer; the
+// caller then treats the challenge as the call's failure.
+bool SipTrunk::answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status)
+{
+	if (d.authAttempted || !hasCredentials()) return false;
+
+	const bool proxy = (status == 407);
+	std::string_view hdr = challenge->getHeaderLine(proxy ? "proxy-authenticate" : "www-authenticate");
+	if (hdr.empty()) return false;
+	if (!SipDigest::parseChallenge(hdr, _challenge, proxy)) return false;
+
+	char cnonce[SipDigest::kCnonceLen + 1];
+	SipDigest::makeCnonce(cnonce);
+	const std::string_view user = _cfg.authUser[0] ? std::string_view(_cfg.authUser)
+	                                               : std::string_view(_cfg.fromUser);
+	const std::string uri = pstnUri(d.destE164, d.domain);   // the Request-URI, verbatim
+
+	const char* name = SipDigest::authorizationHeaderName(_challenge);
+	const size_t nameLen = std::strlen(name);
+	std::memcpy(_authLine, name, nameLen);
+	_authLine[nameLen] = ':';
+	_authLine[nameLen + 1] = ' ';
+	size_t valueLen = 0;
+	if (!SipDigest::buildAuthorization(_challenge, user, std::string_view(_secret), "INVITE", uri,
+		/*ncValue=*/1, std::string_view(cnonce, SipDigest::kCnonceLen),
+		_authLine + nameLen + 2, sizeof(_authLine) - nameLen - 2, valueLen))
+	{
+		_env.log("Trunk: " + std::to_string(status) + " challenge cannot be answered ("
+			+ d.destE164 + ")", true);
+		return false;
+	}
+
+	// ACK the challenge in the INVITE's own transaction (it still carries the
+	// challenge's To-tag), THEN move the dialog to the new transaction.
+	auto ack = _env.messageFromPool(buildAckForFailure(d), d.peer);
+	if (ack)
+	{
+		ack->syncContentLength();
+		_env.enqueue(d.peer, std::move(ack));
+	}
+	d.authAttempted = true;
+	d.cseq += 1;
+	d.branch = "z9hG4bK" + IDGen::GenerateID(12);
+	d.toTag.clear();
+	d.state = State::Trying;
+
+	auto invite = _env.messageFromPool(
+		buildInvite(d, d.offerSdp, std::string_view(_authLine, nameLen + 2 + valueLen)), d.peer);
+	std::memset(_authLine, 0, sizeof(_authLine));
+	if (!invite)
+	{
+		_env.log("Trunk: challenge answer dropped, message pool exhausted (" + d.destE164 + ")", true);
+		return false;
+	}
+	invite->syncContentLength();
+	_env.enqueue(d.peer, std::move(invite));
+	_env.log("Trunk: " + std::to_string(status) + " challenge answered (" + d.destE164 + ")");
+	return true;
 }

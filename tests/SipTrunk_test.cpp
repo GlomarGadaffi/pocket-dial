@@ -1231,3 +1231,123 @@ TEST(TrunkCredentials, NothingCredentialShapedReachesTheWireToday)
 	EXPECT_EQ(inv.find("Authorization"), std::string::npos);
 	EXPECT_EQ(inv.find("Proxy-Authorization"), std::string::npos);
 }
+
+// ── #399: answering a 401/407 on our INVITE ─────────────────────────────────
+//
+// All against the TEST-NET-3 SBC through FakePbxEnv's capture; nothing leaves
+// the process and no real number is dialled.
+namespace
+{
+	std::string challengeFor(const SipTrunk::Dialog& d, int code, const char* header)
+	{
+		std::string r = okFor(d);
+		r.replace(0, r.find("\r\n"), code == 407
+			? "SIP/2.0 407 Proxy Authentication Required"
+			: "SIP/2.0 401 Unauthorized");
+		const std::string cseqLine = "CSeq: " + std::to_string(d.cseq) + " INVITE";
+		r.replace(r.find("CSeq: 1 INVITE"), std::string("CSeq: 1 INVITE").size(), cseqLine);
+		r.insert(r.find("Content-Length"),
+			std::string(header) + ": Digest realm=\"carrier.example\", nonce=\"n0nce399\", qop=\"auth\"\r\n");
+		return r;
+	}
+
+	bool anySentOrLoggedContains(const FakePbxEnv& env, const std::string& needle)
+	{
+		for (std::size_t i = 0; i < env.sent.size(); ++i)
+			if (env.sentRaw(i).find(needle) != std::string::npos) return true;
+		for (const auto& l : env.logs)
+			if (l.find(needle) != std::string::npos) return true;
+		return false;
+	}
+}
+
+TEST(SipTrunkAuth, A401IsAckedAndTheInviteResentOnceWithCredentials)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-399"));
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string firstBranch = d->branch;
+	const std::string callId = d->callID;
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 401, "WWW-Authenticate"))));
+
+	ASSERT_EQ(env.sent.size(), 3u) << "INVITE, the challenge's ACK, the credentialed INVITE";
+	const std::string ack = env.sentRaw(1);
+	EXPECT_EQ(ack.substr(0, 3), "ACK");
+	EXPECT_NE(ack.find(";branch=" + firstBranch), std::string::npos)
+		<< "RFC 3261 s17.1.1.3: the challenge is ACKed in the first INVITE's transaction";
+
+	const std::string retry = env.sentRaw(2);
+	EXPECT_EQ(firstLine(retry), "INVITE sip:+15551234567@203.0.113.5 SIP/2.0");
+	EXPECT_NE(retry.find("Call-ID: " + callId), std::string::npos) << "same dialog";
+	EXPECT_NE(retry.find("CSeq: 2 INVITE"), std::string::npos) << "a new transaction: CSeq+1";
+	EXPECT_EQ(retry.find(";branch=" + firstBranch), std::string::npos) << "and a fresh branch";
+	EXPECT_NE(retry.find("\r\nAuthorization: Digest username=\"15551230000\""), std::string::npos) << retry;
+	EXPECT_NE(retry.find("uri=\"sip:+15551234567@203.0.113.5\""), std::string::npos)
+		<< "the digest uri is the Request-URI";
+	EXPECT_NE(retry.find("nonce=\"n0nce399\""), std::string::npos);
+	EXPECT_NE(retry.find("v=0"), std::string::npos) << "the same offer goes out again";
+	EXPECT_EQ(trunk.activeDialogs(), 1u) << "the call is still being placed";
+	EXPECT_FALSE(anySentOrLoggedContains(env, "s3cret-399")) << "the password never leaves the box";
+}
+
+TEST(SipTrunkAuth, A407IsAnsweredWithProxyAuthorizationAndTheAuthUser)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	SipTrunk::Config cfg = workingConfig();
+	std::snprintf(cfg.authUser, sizeof(cfg.authUser), "%s", "auth-id-399");
+	trunk.setConfig(cfg);
+	ASSERT_TRUE(trunk.setCredentials("s3cret-399"));
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 407, "Proxy-Authenticate"))));
+
+	ASSERT_EQ(env.sent.size(), 3u);
+	const std::string retry = env.sentRaw(2);
+	EXPECT_NE(retry.find("\r\nProxy-Authorization: Digest username=\"auth-id-399\""), std::string::npos)
+		<< "a 407 is answered in Proxy-Authorization, as the configured auth ID:\n" << retry;
+	EXPECT_EQ(retry.find("\r\nAuthorization:"), std::string::npos);
+}
+
+TEST(SipTrunkAuth, ASecondChallengeFailsTheCallInsteadOfLooping)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.setCredentials("wrong-password"));
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 401, "WWW-Authenticate"))));
+	d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 401, "WWW-Authenticate"))));
+
+	ASSERT_EQ(env.sent.size(), 4u) << "INVITE, ACK, INVITE, ACK -- never a third INVITE";
+	EXPECT_EQ(env.sentRaw(3).substr(0, 3), "ACK");
+	EXPECT_EQ(trunk.activeDialogs(), 0u) << "the rejected call is released";
+}
+
+TEST(SipTrunkAuth, WithoutCredentialsAChallengeIsAnOrdinaryFailure)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 401, "WWW-Authenticate"))));
+
+	ASSERT_EQ(env.sent.size(), 2u) << "INVITE and its ACK only";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+}

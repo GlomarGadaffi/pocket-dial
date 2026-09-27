@@ -223,6 +223,9 @@ public:
 	// Full `Authorization:` request-header line (or empty if absent). The value
 	// is fed to SipDigest::parseAuthorization, which tolerates the header name.
 	std::string_view getAuthorization() const;
+	// The full line of the first header named `name` (case-insensitive, no
+	// compact form), or empty. #399: the trunk reads WWW-/Proxy-Authenticate.
+	std::string_view getHeaderLine(std::string_view name) const;
 	// Full `Event:` header line (RFC 6665), compact form `o:`. Empty when absent.
 	// The subscription machinery wants the package name only — strip the header
 	// name with siphdr::stripHeaderName and cut at the first ';' parameter.
