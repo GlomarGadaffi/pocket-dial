@@ -14,9 +14,9 @@
 #
 # Each check has its own baseline, measured with the pinned clang-tidy-18 over
 # src/** (generated Sdp.cpp excluded, as in ci.yml's generic step). A count
-# ABOVE its baseline fails: a new violation. A count BELOW it warns: the
-# baseline is slack, re-pin it down in the PR that fixed the findings, so the
-# numbers only ratchet toward zero.
+# that differs from its baseline FAILS. Above: a new violation. Below: either
+# findings were fixed (re-pin down in that PR) or the analysis silently did
+# not run (dead compile DB reads as 0). Numbers only ratchet toward zero.
 #
 # Usage, from the repo root: tools/ci/run_clang_tidy_safety.sh [build-dir]
 # The build dir needs compile_commands.json (CMAKE_EXPORT_COMPILE_COMMANDS=ON).
@@ -56,7 +56,9 @@ for c in $(printf '%s\n' "${!BASELINE[@]}" | sort); do
     grep -E "(warning|error):.*[[,]${c}[],]" "$LOG" | sort -u
     rc=1
   elif [ "$n" -lt "$b" ]; then
-    echo "::warning::$c: $n < baseline $b -- findings fixed; re-pin its baseline to $n in this PR"
+    # FAIL, not warn: a dead compile DB or broken tool also reads as 0.
+    echo "::error::$c: $n < baseline $b -- findings fixed (re-pin to $n in this PR) or the analysis did not run"
+    rc=1
   else
     echo "$c: $n (baseline $b) ok"
   fi
