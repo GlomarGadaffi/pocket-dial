@@ -755,29 +755,14 @@ RequestsHandler::~RequestsHandler()
 	}
 }
 
-// Same bounded-fallback bookkeeping for the virtual-peer pool as the message
-// pool uses (SipMessagePool.cpp). Separate budget: a virtual peer is a
-// long-lived per-park-slot stand-in, not a per-packet object.
-static std::atomic<std::size_t> s_vpeerHeapFallbacksInFlight{0};
-
-namespace
-{
-	// Same no-locking rule as SipMessagePool's HeapFallbackDeleter: the last
-	// reference can drop while a pool-critical-section lock is held elsewhere,
-	// so the deleter must not itself take any lock.
-	struct VpeerFallbackDeleter
-	{
-		void operator()(SipClient* p) const noexcept
-		{
-			delete p;
-			s_vpeerHeapFallbacksInFlight.fetch_sub(1, std::memory_order_relaxed);
-		}
-	};
-}
-
 // Forwarders onto the static pool in SipMessagePool.cpp (Issue #53 / #101(A) /
 // #101(E)). Kept as public statics on RequestsHandler because SipMessageFactory,
 // the handler table, and the test suite all call them by this name.
+uint64_t RequestsHandler::getMessagePoolRefusals()
+{
+	return sipmsgpool::refusedCount();
+}
+
 std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(std::string_view message, sockaddr_in src)
 {
 	return sipmsgpool::getMessageFromPool(message, src);
@@ -853,8 +838,6 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		}
 	}
 
-	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
-	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 
@@ -1133,26 +1116,49 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
 		_blf.refresh();
 
-		localOutbox = drainOutbox();
+		// #462 (#284 rank 5): into the receive path's own persistent scratch.
+		// Safe without a lock of their own: handle() has exactly one production
+		// caller, the UDP receive loop (SipServer.cpp), so only that thread ever
+		// touches this pair.
+		drainPassLocked(_rxOutboxScratch, _rxLogScratch);
 		_passThroughMsg = nullptr;
 		_noReplyInbound.reset();
-
-		localLogs = std::move(_logQueue);
-		_logQueue.clear();
 	}
 
-	// Print deferred logs safely outside of the lock
-	for (const auto& log : localLogs)
+	// Issue #24: logs are printed and the UDP sendto runs outside the lock.
+	flushPass(_rxOutboxScratch, _rxLogScratch);
+}
+
+void RequestsHandler::drainPassLocked(
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	std::vector<std::pair<bool, std::string>>& logScratch)
+{
+	// #462 (#284 rank 5): swapped rather than moved, so neither _outbox nor
+	// _logQueue restarts at zero capacity on every pass (see drainOutboxInto()).
+	// logScratch was clear()ed by the previous flushPass(), so the swap loses
+	// nothing; the clear() here only guards a caller that skipped it.
+	drainOutboxInto(outScratch);
+	logScratch.clear();
+	logScratch.swap(_logQueue);
+}
+
+void RequestsHandler::flushPass(
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	std::vector<std::pair<bool, std::string>>& logScratch)
+{
+	for (const auto& log : logScratch)
 	{
 		if (log.first) std::cerr << log.second << '\n';
 		else std::cout << log.second << '\n';
 	}
-
-	// Issue #24 resolved: UDP socket syscall sendto is now executed outside the locked section to prevent lock contention.
-	for (auto& event : localOutbox)
+	for (auto& event : outScratch)
 	{
 		_onHandled(event.first, std::move(event.second));
 	}
+	// clear() keeps the capacity, which is the whole point. The shared_ptrs were
+	// moved into _onHandled above, so nothing here still pins a pooled message.
+	outScratch.clear();
+	logScratch.clear();
 }
 
 std::shared_ptr<Session> RequestsHandler::noteDialogCSeq(std::string_view callID, uint32_t cseq,
@@ -1965,7 +1971,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		// pool is sized POCKETDIAL_MAX_SESSIONS + POCKETDIAL_PARK_SLOTS, so the
 		// allocateSession() above is the real gate and this should never fail —
 		// but unlike drawbridge's allocator, which always heap-falls-back, ours
-		// returns nullptr past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX, so the null
+		// returns nullptr as soon as the pool is spent (#409), so the null
 		// MUST be checked: setDest(nullptr) would publish a Connected session
 		// whose teardown/CDR paths dereference getDest(). Refuse with the same
 		// 503 the session-pool-full branch above sends, and refuse HERE, before
@@ -2471,7 +2477,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	// slot for a session that never existed. The pool is sized
 	// POCKETDIAL_MAX_SESSIONS + POCKETDIAL_PARK_SLOTS, so with the session in
 	// hand this should never fail — but pocket-dial's allocator returns nullptr
-	// past POCKETDIAL_VPEER_HEAP_FALLBACK_MAX (drawbridge's always heap-falls
+	// as soon as the pool is spent, #409 (drawbridge's always heap-falls
 	// back), and setDest(nullptr) would publish a Connected session whose
 	// teardown/CDR paths dereference getDest(). Unwind the RTP stream and answer
 	// 503, exactly as the session-pool-full branch directly above does.
@@ -8518,8 +8524,6 @@ void RequestsHandler::tick()
 	}
 	_lastTick = now;
 
-	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
-	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_outbox.clear();
@@ -9085,22 +9089,14 @@ void RequestsHandler::tick()
 			std::swap(_snapshot.parkedCalls, next.parkedCalls);
 		}
 
-		localOutbox = drainOutbox();
-
-		localLogs = std::move(_logQueue);
-		_logQueue.clear();
+		// #462 (#284 rank 5): the tick path's own persistent scratch. Its own
+		// pair, never shared with handle()'s: tick() runs on a different task
+		// (the host tickLoop, or each esp_main variant's tick task), and each
+		// scratch pair must belong to exactly one thread.
+		drainPassLocked(_tickOutboxScratch, _tickLogScratch);
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
-
-	for (auto& event : localOutbox)
-	{
-		_onHandled(event.first, std::move(event.second));
-	}
+	flushPass(_tickOutboxScratch, _tickLogScratch);
 }
 
 std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClientByAddress(const sockaddr_in& addr)
@@ -9964,6 +9960,17 @@ std::vector<std::pair<std::string, std::string>> RequestsHandler::getPageZones()
 
 std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler::drainOutbox()
 {
+	// By-value form, for the rare drains (sendMessageTo(), test seams). The two
+	// per-packet / per-tick drains use drainOutboxInto() with a persistent
+	// scratch instead -- see there for why that matters.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> drained;
+	drainOutboxInto(drained);
+	return drained;
+}
+
+void RequestsHandler::drainOutboxInto(
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& out)
+{
 	// Stage B of the TelephonyAnchorClient port: merge in anything the CallEvent
 	// callback (or an async worker's completion) queued to _asyncOutbox — it runs
 	// off the SIP receive thread, after handle()/tick() already cleared _outbox
@@ -10021,9 +10028,27 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 			[&msg](char* buf, std::size_t cap) { return msg->serializeInto(buf, cap); });
 	}
 
-	auto drained = std::move(_outbox);
-	_outbox.clear();
-	return drained;
+	// #462 (#284 rank 5): SWAP, don't move. `auto drained = std::move(_outbox)`
+	// handed _outbox's buffer to a caller-local vector that was destroyed after
+	// the send loop, so _outbox restarted at ZERO capacity every pass and
+	// reallocated 1, 2, 4... on every packet. Swapping gives _outbox back the
+	// caller's (cleared, still-allocated) buffer instead. A caller that keeps
+	// `out` alive between passes -- handle() and tick() each own one -- makes
+	// the drain allocation-free once both buffers have grown to the working
+	// size.
+	//
+	// The callers clear `out` after their send loop, so it is empty here. If it
+	// ever is not, what is in it was never sent: append rather than clear, so a
+	// broken caller costs an allocation, never a silently dropped message.
+	if (out.empty())
+	{
+		out.swap(_outbox);
+	}
+	else
+	{
+		for (auto& e : _outbox) out.push_back(std::move(e));
+		_outbox.clear();
+	}
 }
 
 void RequestsHandler::refreshParkSnapshot()
@@ -10123,42 +10148,14 @@ std::shared_ptr<SipClient> RequestsHandler::allocateVirtualPeer(std::string numb
 			return peer;
 		}
 	}
-	// Pool drained: fall back to the heap, bounded the same way the message pool
-	// is (Issue #101(A)). Past the ceiling this returns nullptr and the caller
-	// abandons the park/BLF operation rather than allocating without limit.
-	//
-	// No pool lock here, unlike SipMessagePool's acquirePooledMessage(): _virtualPeerPool is a
-	// per-instance member and every caller — the internal sites and ParkOrbit via
-	// PbxEnv::allocVirtualPeer — already runs under _mutex. The counter is still
-	// atomic because its decrement happens in the deleter, which runs wherever
-	// the owning Session finally releases it.
+	// Pool drained: refuse (Issue #409). No heap fallback -- every caller handles
+	// nullptr with a 503 or a clean abandon (#412), and a drained pool is exactly
+	// when the internal DRAM a fallback would take is scarcest. Counted for
+	// /api/status and logged 1-in-100. Callers run under _mutex (or are test seams).
 	static std::atomic<std::size_t> vpeerWarnCount{0};
-	if (s_vpeerHeapFallbacksInFlight.load(std::memory_order_relaxed) >= POCKETDIAL_VPEER_HEAP_FALLBACK_MAX)
-	{
-		sipmsgpool::logPoolExhausted("Virtual-peer", sipmsgpool::PoolPressure::Refused, vpeerWarnCount);
-		return nullptr;
-	}
-	sipmsgpool::logPoolExhausted("Virtual-peer", sipmsgpool::PoolPressure::Fallback, vpeerWarnCount);
-
-	SipClient* raw = nullptr;
-	try
-	{
-		raw = new SipClient(std::move(number), address, expiresSeconds);
-	}
-	catch (const std::bad_alloc&)
-	{
-		return nullptr;   // budget untouched
-	}
-	s_vpeerHeapFallbacksInFlight.fetch_add(1, std::memory_order_relaxed);
-	try
-	{
-		return std::shared_ptr<SipClient>(raw, VpeerFallbackDeleter{});
-	}
-	catch (const std::bad_alloc&)
-	{
-		// Constructor already ran the deleter on `raw` — freed and decremented.
-		return nullptr;
-	}
+	_vpeerRefusals.fetch_add(1, std::memory_order_relaxed);
+	sipmsgpool::logPoolExhausted("Virtual-peer", vpeerWarnCount);
+	return nullptr;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -10206,6 +10203,8 @@ void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
+	// Issue #546: and whatever proved the OLD trunk proves nothing about this one.
+	_trunkVerified = false;
 }
 
 SipTrunk::Config RequestsHandler::getTrunkConfig()
@@ -10266,6 +10265,8 @@ void RequestsHandler::applyStoredTrunkConfig()
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
+	// Issue #546: and whatever proved the OLD trunk proves nothing about this one.
+	_trunkVerified = false;
 
 	// Checked, not discarded. The HTTP route caps the password well below
 	// kMaxSecret, but this path reads raw NVS, which an older or different
@@ -10302,7 +10303,8 @@ RequestsHandler::EmergencyRoute RequestsHandler::emergencyRoute()
 RequestsHandler::EmergencyRoute RequestsHandler::emergencyRouteLocked() const
 {
 	if (_anchorPlacesRealCalls) return EmergencyRoute::Anchor;
-	if (_sipTrunk.config().valid()) return EmergencyRoute::Trunk;
+	if (_sipTrunk.config().valid())
+		return _trunkVerified ? EmergencyRoute::Trunk : EmergencyRoute::TrunkUnverified;
 	return EmergencyRoute::None;
 }
 
@@ -10312,6 +10314,7 @@ const char* RequestsHandler::emergencyRouteName(EmergencyRoute r)
 	{
 	case EmergencyRoute::Anchor: return "anchor";
 	case EmergencyRoute::Trunk:  return "trunk";
+	case EmergencyRoute::TrunkUnverified: return "trunk-unverified";
 	case EmergencyRoute::None:   return "none";
 	}
 	return "none";
@@ -10610,6 +10613,10 @@ void RequestsHandler::onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyM
 void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 	const std::shared_ptr<SipMessage>& ok)
 {
+	// Issue #546: a carrier 2xx to our INVITE is the proof "configured" lacks.
+	// Recorded before anything below can bail out: the route works whether or
+	// not this particular handset leg is still there to connect.
+	_trunkVerified = true;
 	const std::string handsetCallID(ev.handsetCallID);
 	auto sit = _sessions.find(handsetCallID);
 	if (sit == _sessions.end() || !sit->second) return;

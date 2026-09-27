@@ -60,6 +60,7 @@
 
 #include "SipServer.hpp"
 #include "HttpServer.hpp"
+#include "FirmwareInfo.hpp"
 #include "OtaUpdater.hpp"
 #include "AdminAuth.hpp"
 #include "DeviceConfig.hpp"
@@ -383,6 +384,12 @@ extern "C" void app_main(void)
     // below) actually stalled on the PREVIOUS boot -- the only place a headless
     // unit can report that.
     ESP_LOGI(TAG, "[boot] reset reason: %s", pdResetReasonString(esp_reset_reason()));
+    // #411: which build is running. tests/run.py board-provenance greps the
+    // serial capture for this stamp (TEST_HARNESS.md §5.3); it must match
+    // /api/status and the `git describe` of the built commit.
+    ESP_LOGI(TAG, "[boot] firmware %s (IDF %s, built %s %s)",
+             FirmwareInfo::version(), FirmwareInfo::idfVersion(),
+             FirmwareInfo::buildDate(), FirmwareInfo::buildTime());
 
     // ── True entropy for esp_random() (issue #420) ──────────────────────────
     // Same reasoning as esp_main_eth.cpp's block: without Wi-Fi/BT, esp_random()

@@ -391,3 +391,37 @@ TEST(SipSecretStore, MakeRandomSecretLengthCharsetAndVariety)
     // generator is not actually random (the LCG bug this replaced repeated itself).
     EXPECT_NE(SipSecretStore::makeRandomSecret(), SipSecretStore::makeRandomSecret());
 }
+
+// #578: after the #525 replay table overflows, any unknown nonce stamped at or
+// before the eviction watermark is re-challenged. If the stamp came from the
+// wall clock, an SNTP step backward would make every fresh nonce read as "at
+// or before" the watermark and every phone (emergency INVITEs included) would
+// loop on stale 401s. The stamp must come from the monotonic clock, which
+// never steps: the issued stamp must lie inside a steady_clock window.
+TEST(SipDigestNonce, StampIsMonotonicSoAWallClockStepCannotStrandFreshNonces)
+{
+    using namespace std::chrono;
+    const auto steadyMs = [] {
+        return static_cast<uint64_t>(
+            duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+    };
+    const uint64_t before = steadyMs();
+    const std::string nonce = generateNonce();
+    const uint64_t after = steadyMs();
+    const size_t dot = nonce.find('.');
+    ASSERT_NE(dot, std::string::npos);
+    const uint64_t stamp = std::stoull(nonce.substr(0, dot), nullptr, 16);
+    EXPECT_GE(stamp, before);
+    EXPECT_LE(stamp, after);
+    EXPECT_TRUE(validateNonce(nonce)); // HMAC + freshness still hold
+}
+
+// #584 review: the monotonic clock restarts at boot, so a pre-reboot nonce can
+// carry a stamp AHEAD of now. If the secret repeats (weak entropy, #420) its tag
+// verifies; it must still be refused, never clamped to age 0 and read as fresh.
+TEST(SipDigestNonce, ANonceStampedAheadOfNowIsRefused)
+{
+    bool expired = true;
+    EXPECT_FALSE(validateNonce(nonceAt(UINT64_C(1) << 60), &expired));
+    EXPECT_FALSE(expired); // not "stale": a stale 401 would invite a retry on it
+}

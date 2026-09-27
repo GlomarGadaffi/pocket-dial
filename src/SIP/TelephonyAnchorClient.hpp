@@ -2,6 +2,7 @@
 #define TELEPHONY_ANCHOR_CLIENT_HPP
 
 #include "AnchorClient.hpp"
+#include "RecentIdRing.hpp"   // Issue #554
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -179,10 +180,17 @@ private:
 		TaskHandle_t             rxTaskHandle = nullptr;
 		SemaphoreHandle_t        rxDoneSem    = nullptr;
 		std::atomic<bool>        tearingDown{false};      // single-entry gate for stopMediaStreams(slot)
+		// Issue #554: true from just before the rx task is created until it has given
+		// rxDoneSem on its way out. rxTaskHandle is never cleared by a task that exits on
+		// its own, so a set handle with this false means "exited", not "polling".
+		std::atomic<bool>        rxRunning{false};
 		mutable std::mutex       postMutex;               // guards postClient (writeAudio/stop)
 		std::mutex               getMutex;                // guards getClient (runRxLoop/stop)
 	};
 	CallSlot _calls[POCKETDIAL_MAX_ANCHOR_CALLS];
+	// Issue #554 (b): legs we dropped recently. An upsert for one of them must not
+	// claim a slot and start rx/POST again. Guarded by _mutex.
+	RecentIdRing<8, 64> _droppedLegs;
 	// Slot lookup/alloc (caller holds _mutex). slotForLocked returns the slot whose
 	// participantId matches (nullptr if none); allocSlotLocked claims a free slot for a new
 	// participant (nullptr if all busy). freeSlotLocked clears a slot back to free.
