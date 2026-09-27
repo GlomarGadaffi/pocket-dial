@@ -1293,7 +1293,14 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	// The PBX is unambiguously the UAS of a REGISTER, so there is no relay
 	// question on this path.
 	addCapabilityHeaders(*response);
-	endHandle(fromNumber, response);
+	// Issue #523: answer the transaction's source, like the 400/503 above, never
+	// through endHandle(). endHandle() finds the destination by number, and an
+	// Expires: 0 de-REGISTER has just released that number's client, so it took
+	// the not-found branch and answered every de-registration 404. RFC 3261 §10.3:
+	// a removal (even of a binding that never existed) is a 200. For a lease
+	// grant the two addresses are the same: allocateClient() has just stored
+	// data->getSource() as the binding's address.
+	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
 // ── Capability advertisement (issue #199, root cause 2) ──────────────────────
