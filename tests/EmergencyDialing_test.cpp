@@ -151,6 +151,10 @@ namespace
 					wire.sent.push_back(m->toString());
 				});
 			handler->handle(emRegister("101", "192.168.77.11", "em-reg-101"));
+			// Issue #521: the loopback anchor refuses every emergency number
+			// (EmergencyRoute_test.cpp pins that). These tests are about how a
+			// provider is asked to dial, so it stands in for a real one here.
+			handler->setAnchorPlacesRealCallsForTest(true);
 			wire.clear();
 		}
 
@@ -225,6 +229,22 @@ TEST(EmergencyDialing, DialingNineOneOneReachesTheTrunkWithTheBareNumber)
 
 	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
 		<< "the anchor must be asked to dial exactly 911";
+}
+
+TEST(EmergencyDialing, ANineOneOneFromAnotherAddressIsNotRefusedByTheCallerBinding)
+{
+	// #497 refuses a call whose source is not the caller's registered address.
+	// 911 is never gated (#454): the check sits after the emergency branch, so a
+	// 911 naming ext 101 from a different host still reaches the trunk.
+	Bench b;
+	ASSERT_NE(b.loopback(), nullptr);
+	ASSERT_TRUE(b.loopback()->isConnected());
+
+	b.handler->handle(emInvite("101", "911", "192.168.77.99", "em-911-unbound"));
+
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
+		<< "the caller binding must not block an emergency call";
+	EXPECT_FALSE(b.wire.saw("Caller Not Registered From This Address"));
 }
 
 TEST(EmergencyDialing, ASecuredCallerInLearnModeReachesNineOneOneWithoutCredentials)
