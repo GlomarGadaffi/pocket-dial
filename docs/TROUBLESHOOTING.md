@@ -32,9 +32,11 @@ Quick references: [SETUP_GUIDE.md](SETUP_GUIDE.md) ·
 >   [Phone won't register](#phone-wont-register-timeout-or-401). The **`display`** build
 >   deliberately has no such gate and starts SIP unconditionally
 >   (`main/esp_main_display.cpp:799-806`).
-> * The registrar ships in `open` mode: any phone may REGISTER and any INVITE is
->   accepted, with no SIP authentication. Digest auth is fully implemented (RFC 2617) but
->   it is *off* until an operator moves the registrar to `learn` or `secure`.
+> * The registrar ships in `learn` mode (#441; `open` is retired, #502): a new phone is
+>   adopted on its first REGISTER with no SIP authentication, and its INVITEs are admitted
+>   unchallenged. Digest auth (RFC 2617) applies once an admin promotes the device to
+>   Secured, or to every extension in `secure` mode, minus open gaps (#507: an ARP miss
+>   skips it; #560: in-dialog relays still carry the credential; #525: nonce reuse).
 > * The SoftAP is **open** by default, the dashboard is **plain HTTP**, and OTA images are
 >   **unsigned**. All three are deliberate defaults, not oversights.
 
@@ -193,7 +195,7 @@ reachable, so you have as long as you need.
 > both a factory reset and a bare NVS erase. To clear the seed you must re-flash it, or
 > erase its sector (`erase_region 0xFFF000 0x1000` on the 16 MB layout). An NVS erase
 > (`erase_region 0x9000 0x6000`) clears *every* namespace, `pbxcfg` included, so that path
-> does return the registrar to `open`.
+> does return the registrar to the default, `learn` (#441; `open` is retired, #502).
 
 > [!TIP]
 > **This is what the `409` guard is for.** `POST /api/registrar` with `mode=secure` while no
@@ -397,28 +399,24 @@ Two counters can produce it (`AdminAuth.hpp:60-82`, [THREAT_MODEL.md §5.2](THRE
 
 | Counter | Threshold | Cooldown |
 | :--- | :--- | :--- |
-| ~~**Per-client**, keyed on the HTTP peer address, 8 LRU buckets~~ **Effectively GLOBAL; see the note below the table.** | **5** consecutive failures (`kMaxFailedAttempts`) | 60 s (`kLockoutMs`), **doubling on each successive lockout**, capped at ~16 min (`kMaxLockoutShift = 4`) |
-| **Aggregate backstop**, across *all* clients | **20** consecutive failures (`kMaxFailedAttemptsGlobal`) | Same doubling ladder, also up to ~16 min; locks out **everyone** |
+| **Per-client** (since #530), keyed on the HTTP peer address and principal, 8 LRU buckets | **5** consecutive failures (`kMaxFailedAttempts`) | 60 s (`kLockoutMs`), **doubling on each successive lockout**, capped at ~16 min (`kMaxLockoutShift = 4`) |
+| **Aggregate backstop**, per principal (username), across *all* clients | **20** consecutive failures (`kMaxFailedAttemptsGlobal`) | Same doubling ladder, also up to ~16 min; locks out that principal from **every** client (the other principal is unaffected) |
 
 What will surprise you:
 
-- **The "per-client" bucket is not actually per-client.** `AdminAuth` implements per-client
-  buckets and `HttpServer::handleClient()` even computes `peerIp` for them
-  (`HttpServer.cpp:247-263`), but that value is only ever stored on the OTA request
-  (`:330`). `parseRequest()` never populates `req.clientIp`, so `sendApiAdminLogin` hands
-  `isLockedOut()` and `verifyCredential()` an **empty string** (`:2720`, `:2729`, `:2732`)
-  and every failure, web login and DTMF PIN alike, lands in the one unkeyed bucket. **In
-  practice there is a single global lockout**, so one guesser on the link can lock the real
-  admin out after five wrong passwords, which is exactly what the per-client design was
-  meant to prevent. Plan recovery around that (power-cycle clears it; see below), and see
-  [THREAT_MODEL.md](THREAT_MODEL.md) D-3.
+- **The per-client bucket is per client since #530** (`req.clientIp` is set on every
+  request), so five wrong passwords lock out only that address. **But one address can still
+  lock you out:** the aggregate backstop counts across that address's own cooldowns and
+  trips at 20 failures, about 7 minutes of persistent guessing. Plan recovery around that
+  (power-cycle clears it; see below), and see [THREAT_MODEL.md](THREAT_MODEL.md) D-3.
 - **The cooldown does not reset the failure budget.** The trip count survives it, so a
   second lockout is 2 min, a third 4 min, and so on. Repeatedly retrying while locked out
   does not extend it, but each fresh set of 5 wrong passwords does.
 - Only a correct login clears it, and it clears both counters.
-- **The phone-keypad DTMF PIN shares the same bucket table.** `verifyDtmfPin()` uses the
-  unkeyed `""` bucket, so hammering the `*PIN#` menu can lock out the web login and vice
-  versa.
+- **The phone-keypad DTMF PIN has its own bucket in the same table.** `verifyDtmfPin()` uses
+  the unkeyed `""` bucket, so PIN and web-login failures no longer lock each other out, but
+  eight failed web logins from fresh addresses can evict the PIN's bucket and clear a PIN
+  lockout (#561).
 - **You can be locked out by someone else.** The aggregate counter sits far above ordinary
   fat-fingering, so hitting it without guessing means something on the link is hammering
   `/api/admin/login`.

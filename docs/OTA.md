@@ -91,6 +91,18 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 ```
 
+### 1.2a OTA never changes the partition table (#514)
+
+The table above is out of date: `partitions.csv` now also has a `coredump` partition (#382) and more data partitions above `ota_1`. See the file itself; it is the source of truth.
+
+**An OTA update rewrites one app slot and nothing else.** The partition table at `0x8000` is only written by a serial (USB) flash of the full image set. So a board flashed before a partition was added (the `coredump` partition, #382) **keeps its old table after any number of OTA updates**. It runs the new firmware, but without that partition, and a panic on it cannot save a coredump.
+
+To tell whether a board has the coredump partition, read `/api/status` → `coredump.supported` (#531):
+- `true`: the partition exists, and `/api/coredump*` works.
+- `false`: the board was flashed before the partition existed. `/api/coredump` and `/api/coredump/erase` answer `404 coredump not supported`.
+
+To gain the partition, do one full **serial** flash of the whole image set (bootloader, partition table and app; see FLASHING.md). Before that, take a config export (`/api/config/export`) and back up NVS if the board holds anything you need, because a table change is a destructive reflash. The #401 soak's verdict (`tools/soak/soak_verdict.py`) fails its `no-new-coredump` check on a `supported:false` board unless `--allow-no-coredump` is passed, because such a board can't record a crash.
+
 ### 1.3 Rollback Kconfig
 
 Added to `sdkconfig.defaults`:
