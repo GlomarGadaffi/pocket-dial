@@ -774,22 +774,52 @@ TEST(Registrar, ModeRoundTripsThroughTheDashboard)
 	AdminSession a = loginAndCompleteSetup(18100);
 	ASSERT_FALSE(a.cookie.empty());
 
-	// Ships open: POCKETDIAL_OPEN_REGISTRAR seeds the default, and until now
-	// nothing could change it.
+	// Ships learn (#397); the open registrar is retired (#500).
 	std::string get = httpGetRaw(18100, "/api/registrar", "pd_session=" + a.cookie);
 	EXPECT_EQ(statusOf(get), 200);
-	EXPECT_NE(get.find("\"mode\":\"open\""), std::string::npos);
+	EXPECT_NE(get.find("\"mode\":\"learn\""), std::string::npos);
 	EXPECT_NE(get.find("\"attached\":true"), std::string::npos);
 
-	std::string set = httpPostRaw(18100, "/api/registrar", "mode=learn",
+	std::string set = httpPostRaw(18100, "/api/registrar", "mode=secure&confirm=LOCKOUT",
 	                              "pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(set), 200);
-	EXPECT_NE(set.find("\"mode\":\"learn\""), std::string::npos);
-	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
+	EXPECT_NE(set.find("\"mode\":\"secure\""), std::string::npos);
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Secure);
 
 	// And it is readable back, not just accepted.
 	get = httpGetRaw(18100, "/api/registrar", "pd_session=" + a.cookie);
-	EXPECT_NE(get.find("\"mode\":\"learn\""), std::string::npos);
+	EXPECT_NE(get.find("\"mode\":\"secure\""), std::string::npos);
+
+	set = httpPostRaw(18100, "/api/registrar", "mode=learn", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(set), 200);
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
+
+	AdminAuth::clearCredential();
+}
+
+TEST(Registrar, OpenIsNotAModeAnyMore)
+{
+	// #500 (desmo, 2026-09-27): the open registrar is retired. The live setter
+	// refuses it with 400 and changes nothing.
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18104, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	AdminSession a = loginAndCompleteSetup(18104);
+	ASSERT_FALSE(a.cookie.empty());
+	// Start from Secure, not the default, so "unchanged" proves something (#502 review).
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+
+	std::string set = httpPostRaw(18104, "/api/registrar", "mode=open",
+	                              "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(set), 400) << set;
+	EXPECT_NE(set.find("open is retired"), std::string::npos) << set;
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Secure)
+		<< "a refused mode must not change the mode";
 
 	AdminAuth::clearCredential();
 }
@@ -813,7 +843,7 @@ TEST(Registrar, SwitchingToSecureWithNothingSecuredNeedsConfirmation)
 	std::string blocked = httpPostRaw(18101, "/api/registrar", "mode=secure",
 	                                  "pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(blocked), 409);
-	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Open)
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn)
 		<< "a refused switch must not have changed the mode";
 
 	std::string forced = httpPostRaw(18101, "/api/registrar",
@@ -866,7 +896,7 @@ TEST(Registrar, MutatingEndpointsRequireTheCsrfToken)
 
 	AdminSession a = loginAndCompleteSetup(18103);
 
-	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar", "mode=open",
+	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar", "mode=learn",
 	                               "pd_session=" + a.cookie)), 403);
 	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar/device",
 	                               "action=forget&target=1001",

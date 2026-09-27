@@ -209,7 +209,7 @@ namespace provisioning
 		// account-1 P-value set (GXP/GXV/HT generations alike). An earlier draft
 		// had these two reversed, which would have handed the phone the extension
 		// as its digest PASSWORD and an empty auth ID -- unregisterable against a
-		// Secure-mode registrar, and only "working" in Learn/Open mode because no
+		// Secure-mode registrar, and only "working" in Learn mode because no
 		// digest is checked there. Caught in review of PR #224.
 		out += "<P36>" + ext + "</P36>\r\n";                          // SIP Authenticate ID
 		out += "<P34></P34>\r\n";                                     // SIP Authenticate Password -- always blank, see yealinkConfigFor's rationale above (HA1-only storage)

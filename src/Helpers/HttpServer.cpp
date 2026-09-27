@@ -4032,14 +4032,14 @@ static const char* registrarModeName(RequestsHandler::RegistrarMode m)
 	{
 		case RequestsHandler::RegistrarMode::Learn:  return "learn";
 		case RequestsHandler::RegistrarMode::Secure: return "secure";
-		case RequestsHandler::RegistrarMode::Open:   break;
 	}
-	return "open";
+	return "learn";
 }
 
+// "open" is NOT a mode any more (#500): the live setter answers 400 for it, and
+// config import maps it to learn and says so (see sendApiConfigImport).
 static bool parseRegistrarMode(const std::string& s, RequestsHandler::RegistrarMode& out)
 {
-	if (s == "open")   { out = RequestsHandler::RegistrarMode::Open;   return true; }
 	if (s == "learn")  { out = RequestsHandler::RegistrarMode::Learn;  return true; }
 	if (s == "secure") { out = RequestsHandler::RegistrarMode::Secure; return true; }
 	return false;
@@ -4092,7 +4092,7 @@ void HttpServer::sendApiRegistrarSet(int sock, const std::string& body)
 	if (!parseRegistrarMode(getFormParam(body, "mode"), mode))
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
-		             "{\"error\":\"mode must be one of: open, learn, secure\"}");
+		             "{\"error\":\"mode must be one of: learn, secure (open is retired)\"}");
 		return;
 	}
 
@@ -4684,7 +4684,7 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	pt << "],";
 
 	pt << "\"registrarMode\":\""
-	   << (handler ? registrarModeName(handler->getRegistrarMode()) : "open") << "\",";
+	   << (handler ? registrarModeName(handler->getRegistrarMode()) : "learn") << "\",";
 
 	// Telephony-API slot METADATA only. baseUrl/clientId/routeDn are
 	// password-gated (#186: "anchor/trunk base URL, client ID/secret, source
@@ -5067,8 +5067,26 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		// extensions/extensionSecrets skip above) would digest-challenge every
 		// REGISTER with no working handset left to notice. Every other mode
 		// applies outright.
+		//
+		// #500: an export from before the open registrar was retired may say
+		// "open". Apply learn, the closest mode that still exists (it admits every
+		// phone's first REGISTER), and say so, so the operator is not surprised.
 		RequestsHandler::RegistrarMode parsedMode;
-		if (parseRegistrarMode(pt->stringOr("registrarMode", "open"), parsedMode))
+		// A blob with no registrarMode key leaves the mode as it is (BigDog's #502
+		// review): defaulting a missing key would quietly drop a Secure board to
+		// Learn, reported only under "applied". The empty string parses as no
+		// mode, so nothing below applies it.
+		std::string importedMode = pt->stringOr("registrarMode", "");
+		if (importedMode.empty())
+		{
+			skipped.push_back("registrarMode (not in the file; left unchanged)");
+		}
+		if (importedMode == "open")
+		{
+			importedMode = "learn";
+			skipped.push_back("registrarMode=open (the open registrar is retired; applied learn instead)");
+		}
+		if (parseRegistrarMode(importedMode, parsedMode))
 		{
 			if (parsedMode == RequestsHandler::RegistrarMode::Secure)
 			{
