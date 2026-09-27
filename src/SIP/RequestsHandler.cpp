@@ -10228,6 +10228,8 @@ void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
+	// Issue #546: and whatever proved the OLD trunk proves nothing about this one.
+	_trunkVerified = false;
 }
 
 SipTrunk::Config RequestsHandler::getTrunkConfig()
@@ -10288,6 +10290,8 @@ void RequestsHandler::applyStoredTrunkConfig()
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
+	// Issue #546: and whatever proved the OLD trunk proves nothing about this one.
+	_trunkVerified = false;
 
 	// Checked, not discarded. The HTTP route caps the password well below
 	// kMaxSecret, but this path reads raw NVS, which an older or different
@@ -10324,7 +10328,8 @@ RequestsHandler::EmergencyRoute RequestsHandler::emergencyRoute()
 RequestsHandler::EmergencyRoute RequestsHandler::emergencyRouteLocked() const
 {
 	if (_anchorPlacesRealCalls) return EmergencyRoute::Anchor;
-	if (_sipTrunk.config().valid()) return EmergencyRoute::Trunk;
+	if (_sipTrunk.config().valid())
+		return _trunkVerified ? EmergencyRoute::Trunk : EmergencyRoute::TrunkUnverified;
 	return EmergencyRoute::None;
 }
 
@@ -10334,6 +10339,7 @@ const char* RequestsHandler::emergencyRouteName(EmergencyRoute r)
 	{
 	case EmergencyRoute::Anchor: return "anchor";
 	case EmergencyRoute::Trunk:  return "trunk";
+	case EmergencyRoute::TrunkUnverified: return "trunk-unverified";
 	case EmergencyRoute::None:   return "none";
 	}
 	return "none";
@@ -10632,6 +10638,10 @@ void RequestsHandler::onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyM
 void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 	const std::shared_ptr<SipMessage>& ok)
 {
+	// Issue #546: a carrier 2xx to our INVITE is the proof "configured" lacks.
+	// Recorded before anything below can bail out: the route works whether or
+	// not this particular handset leg is still there to connect.
+	_trunkVerified = true;
 	const std::string handsetCallID(ev.handsetCallID);
 	auto sit = _sessions.find(handsetCallID);
 	if (sit == _sessions.end() || !sit->second) return;
