@@ -23,25 +23,21 @@ void Registrar::setMode(Mode mode)
 {
 	_mode.store(mode, std::memory_order_relaxed);
 	persistMode();
-	const char* name = (mode == Mode::Open)  ? "open"
-	                 : (mode == Mode::Learn) ? "learn"
-	                                         : "secure";
+	const char* name = (mode == Mode::Learn) ? "learn" : "secure";
 	_env.log(std::string("Registrar mode set to ") + name);
 }
 
 Registrar::BootModeDecision Registrar::chooseBootMode(bool haveStored, Mode stored, BootSchema schema)
 {
-	// #441 review: NO path without a stored mode ends in Open. A missing key is
-	// what every failure looks like -- a persist that failed on a fresh board, a
-	// factory reset whose write failed, an unreadable store -- so it must mean
-	// the safe mode, never the permissive one. The existing deployments that
-	// must keep Open get it WRITTEN by the schema v1 -> v2 migration
-	// (DeviceConfig::schemaMigrations), which stamps v2 only once the write
-	// succeeded; they arrive here with haveStored == true.
+	// A missing key is what every failure looks like -- a persist that failed on
+	// a fresh board, a factory reset whose write failed, an unreadable store --
+	// so it means Learn (#441 review). There is no permissive mode left to fall
+	// into: open is retired (#500), and a stored retired-open byte reaches here
+	// already decoded as Learn (decodeStored).
 	if (haveStored) return {stored, false};
-	// Learn, not Open: it still admits every first REGISTER, so phones keep
-	// working, but no board is left accepting anything forever. Persist only when
-	// the store is trusted; an uncertain one is re-decided on the next boot.
+	// Learn admits every first REGISTER, so phones keep working, then MAC-locks
+	// each extension. Persist only when the store is trusted; an uncertain one is
+	// re-decided on the next boot.
 	return {Mode::Learn, schema != BootSchema::Uncertain};
 }
 
@@ -67,7 +63,8 @@ void Registrar::loadMode()
 	uint8_t v = 0;
 	const esp_err_t err = nvs_get_u8(h, "reg_mode", &v);
 	nvs_close(h);
-	const bool haveStored = (err == ESP_OK && v <= static_cast<uint8_t>(Mode::Secure));
+	const StoredMode stored = (err == ESP_OK) ? decodeStored(v) : StoredMode{false, Mode::Learn, false};
+	const bool haveStored = stored.valid;
 	if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
 	{
 		_env.log(std::string("Registrar: reading reg_mode failed (") + esp_err_to_name(err) + ")", true);
@@ -83,9 +80,21 @@ void Registrar::loadMode()
 	default:                                         schema = BootSchema::Uncertain; break;
 	}
 
-	const BootModeDecision d = chooseBootMode(haveStored, static_cast<Mode>(v), schema);
+	const BootModeDecision d = chooseBootMode(haveStored, stored.mode, schema);
 	_mode.store(d.mode, std::memory_order_relaxed);
-	if (haveStored) return;
+	if (haveStored)
+	{
+		// #500: this board had stored the retired open mode. It now runs Learn;
+		// write that down once so the byte on flash says what the board does.
+		if (stored.wasRetiredOpen)
+		{
+			if (persistMode())
+				_env.log("Registrar: stored mode was open, which is retired; now learn, saved (#500)", true);
+			else
+				_env.log("Registrar: stored mode was open, which is retired; running learn, save FAILED (#500)", true);
+		}
+		return;
+	}
 
 	if (!d.persist)
 	{
