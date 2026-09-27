@@ -151,6 +151,9 @@ add_executable(sip_parser_tests
     # Errata 749 — because a digest implementation that only agrees with itself
     # will agree with itself while failing against every real SBC.
     SipDigestClient_test.cpp
+    # Issue #399: the allocation-free digest client API, checked byte for byte
+    # against the std::string API above and against the published RFC vectors.
+    SipDigestBounded_test.cpp
     # The REGISTER user agent built on top of it: challenge/retry, nc
     # incrementing across refreshes, stale-nonce re-challenge, 423 + Min-Expires,
     # a server-shortened Expires, and the backoff that keeps a refusing carrier
@@ -346,6 +349,9 @@ add_executable(sip_parser_tests
     # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real
     # µ-law rim, a leg leaving mid-conference, and the RequestsHandler 888 intercept.
     ConferenceRoom_test.cpp
+    # Issue #513: a quick 888 re-dial skips a leg whose RTP tasks are still
+    # stopping instead of failing the join (486).
+    ConferenceRejoin_test.cpp
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp
@@ -360,6 +366,8 @@ add_executable(sip_parser_tests
     # Issue #382: /api/coredump* -- owner-only download, CSRF-checked erase,
     # ungated presence on /api/status, against a fake CoreDumpStore image.
     CoreDumpHttp_test.cpp
+    # Issue #397: the boot-time registrar default (fresh -> learn; existing -> learn too since #500).
+    RegistrarBootMode_test.cpp
     # Issue #363: every secret-bearing store is empty after a factory reset.
     FactoryResetSecrets_test.cpp
     # Issue #385: the brute-force state-recovery attack on IDGen, run for real
@@ -409,6 +417,7 @@ add_executable(sip_parser_tests
     # race in both directions, and the cross-dialog BYE bridge are all
     # asserted at the wire level.
     CallPickup_test.cpp
+    NoReplyToResponse_test.cpp
     RegisterBeeper_test.cpp
     # Issue #148: the duplicate-tracking feedback loop between sweep()'s Timer-A
     # retransmit and drainOutbox()'s maybeTrack() scan, driven directly so the
@@ -437,6 +446,9 @@ add_executable(sip_parser_tests
     # answer keeps the callee's own capabilities, and that a phone's own Allow
     # never survives into ours as a second header line.
     CapabilityHeaders_test.cpp
+    # Issue #523: a de-REGISTER (Expires: 0) is answered 200 at its source, not
+    # 404 through endHandle()'s by-number lookup of the client it just released.
+    Deregistration_test.cpp
     # Issue #229: `Supported: replaces` backs onRefer()'s REFER ?Replaces=
     # attended-transfer splice (#131) only -- RFC 3891 §3's OTHER use of the
     # same tag, an INVITE that itself carries a Replaces header (the BLF-key
@@ -451,9 +463,16 @@ add_executable(sip_parser_tests
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
     # PcapCapture.hpp has no dependency beyond sockaddr_in.
     PcapCapture_test.cpp
+    # Issue #463 (#284 batch B): the idle tick, OPTIONS ping and header rewrites.
+    IdleTickAlloc_test.cpp
     # Issue #464 (#284 batch C): per-request lookups allocate nothing.
     AllocFreeLookups_test.cpp
     DropProbe_test.cpp
+    # Issues #443/#444: SIP receive-path discards (oversize via recvmsg+MSG_TRUNC,
+    # empty, failed receives, pool exhaustion) are counted, never silent.
+    SipRxDiscards_test.cpp
+    # Issues #444/#469: the shared truncation-aware UDP receive (UdpRecv.hpp).
+    UdpRecv_test.cpp
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
     ProvisioningConfig_test.cpp
@@ -607,6 +626,11 @@ add_executable(sip_parser_tests
     # into its own translation unit.
     ../src/SIP/CallPickup.cpp
     ../src/SIP/RequestsHandler.cpp
+    # Issues #443/#444: the UDP receive loop and SipServer's hand-off, linked for
+    # SipRxDiscards_test.cpp (real loopback socket, end to end).
+    ../src/Helpers/UdpServer.cpp
+    ../src/SIP/SipServer.cpp
+    ../src/SIP/SipMessageFactory.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp
     ../src/SIP/RegisterBeeper.cpp

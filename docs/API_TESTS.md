@@ -381,9 +381,9 @@ Reports the SIP registrar admission mode and the adopted-extension roster. Gated
   `wifi`/`eth`/`lan8720` device this is not merely a transient: such a board runs **no SIP
   task at all** until a credential has been committed (`main/esp_main_eth.cpp:465-496`), so
   `attached` stays `false` for as long as setup is outstanding. (The `display` build has no
-  such gate, `main/esp_main_display.cpp:799-806`.) A test that asserts `mode == "open"` on
+  such gate, `main/esp_main_display.cpp:799-806`.) A test that asserts `mode == "learn"` on
   a fresh boot will flake against this, assert on `attached` first.
-* `mode`, `open`, `learn` or `secure`. **`open` is the shipped default.**
+* `mode`, `learn` or `secure`. **`learn` is the default**; `open` is retired (#500).
 * `state`, `learned` (adopted on first contact, not yet enforced) or `secured`
   (MAC-locked and digest-enforced for its extension).
 * `online`, volatile registration state; never persisted.
@@ -393,12 +393,12 @@ Sets the admission mode. Cookie **and** `X-CSRF`.
 
 | Param | Values | Effect |
 |---|---|---|
-| `mode` | `open` \| `learn` \| `secure` | Required. |
+| `mode` | `learn` \| `secure` | Required. `open` is retired (#500) and answers `400`. |
 | `confirm` | `LOCKOUT` | Only consulted when switching to `secure`. |
 
-`open` is the shipped default: every `REGISTER` and every `INVITE` is accepted with no
-credential. `learn` is trust-on-first-use and a deliberate, **temporary** weakening for
-adopting an existing fleet. `secure` digest-challenges every `REGISTER` **and** every
+`learn` is the default: trust-on-first-use, where an unknown device is adopted on its first
+`REGISTER` and locked to its extension. (`open`, which accepted every `REGISTER` and
+`INVITE` with no credential, is retired, #500: `mode=open` answers `400`.) `secure` digest-challenges every `REGISTER` **and** every
 `INVITE` (`RequestsHandler::onInvite()` → `Registrar::admitSecure()`,
 `src/SIP/RequestsHandler.cpp:1195-1206`).
 
@@ -418,7 +418,7 @@ Resend with `confirm=LOCKOUT` to override, the same shape as `/api/factory-reset
 > registrar keeps it in `pbxcfg`. That was a real bug and it was fixed in issue #188:
 > `clearAll()` now calls `eraseRegistrarMode()` (`DeviceConfig.cpp:698`), which opens
 > `pbxcfg`, and the comment at `:693-697` records exactly this. [API.md](API.md)'s
-> factory-reset section already stated it correctly. Restoring `mode=open` in the same run
+> factory-reset section already stated it correctly. Restoring `mode=learn` in the same run
 > is still good hygiene, but a reset is no longer a way to strand the board. Still not
 > exercised on hardware.
 
@@ -476,9 +476,9 @@ session cookie, and the MAC is the credential.
 
 * The MAC in the path must be **12 lowercase hex characters**.
 * The file is served **only** for a MAC already in the Learn-mode adopted-device registry.
-* **Open mode never records devices**, so on a default (`open`) board this route is a
-  structural `404` for every MAC. A test that expects a `200` must first put the registrar
-  into `learn` and let a phone (or a test fixture) be adopted.
+* On a fresh board this route is a `404` for every MAC until a phone registers once: the
+  default `learn` mode adopts it on that first REGISTER. A test that expects a `200` must
+  first let a phone (or a test fixture) be adopted.
 * **The Yealink key set has never been confirmed against a physical handset.** Treat a
   `200` as "the route served bytes", not as "a phone would accept them".
 
@@ -606,7 +606,7 @@ login preamble (including setup completion) to have run first.
   passphrase. A rejected write must not clear the stored value.
 * TC-ED-06 (Registrar lockout guard) (A): With no extension in state `secured`, POST
   `/api/registrar` with `mode=secure` → `409` and the quoted body above. Repeat with
-  `mode=secure&confirm=LOCKOUT` → `200` and `"mode":"secure"`. **Restore `mode=open`
+  `mode=secure&confirm=LOCKOUT` → `200` and `"mode":"secure"`. **Restore `mode=learn`
   explicitly afterwards**, every later SIP case is otherwise digest-challenged, and on real
   hardware a factory reset will not undo it (§3.13).
 * TC-ED-07 (Registrar unknown device) (A): POST `/api/registrar/device` with
@@ -626,8 +626,8 @@ login preamble (including setup completion) to have run first.
 > "rest of the string".
 * TC-ED-09 (Reserved dial-plan patterns) (A): `pattern=777` → `400 {"error":"cannot use
   a reserved extension as a dial-plan pattern"}`. Same for `999`, `440`, `555`.
-* TC-ED-10 (Provisioning config 404s in open mode): GET `/config/805ec079c37f.cfg` on a
-  default (`open`) board → `404`, because open mode records no adopted devices. Uppercase or
+* TC-ED-10 (Provisioning config 404s for an unadopted MAC): GET `/config/805ec079c37f.cfg`
+  on a board where that MAC never registered → `404`, because only adopted devices are served. Uppercase or
   short MACs must also `404`, not `500`.
 
 ### Same-Origin Tests (gate layer 1)

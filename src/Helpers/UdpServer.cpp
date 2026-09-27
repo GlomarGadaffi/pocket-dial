@@ -1,6 +1,9 @@
 #include "UdpServer.hpp"
+#include "UdpRecv.hpp"   // Issues #444/#469: the shared truncation-aware receive
 #include <thread>
 #include <cstring>
+#include <cerrno>
+#include <algorithm>
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "esp_log.h"
@@ -111,8 +114,9 @@ bool UdpServer::openSocket()
 }
 
 // ── Constructor ───────────────────────────────────────────────────────────────
-UdpServer::UdpServer(std::string ip, int port, OnNewMessageEvent event)
-    : _ip(std::move(ip)), _port(port), _onNewMessageEvent(event), _keepRunning(false)
+UdpServer::UdpServer(std::string ip, int port, OnNewMessageEvent event, OnDiscardEvent discard)
+    : _ip(std::move(ip)), _port(port), _onNewMessageEvent(std::move(event)),
+      _onDiscardEvent(std::move(discard)), _keepRunning(false)
 {
 	// openSocket() handles WSAStartup on Windows and the recv-timeout setsockopt.
 	// On ESP it retries with back-off; on desktop it may throw.
@@ -191,13 +195,13 @@ void UdpServer::receiveLoop()
 	{
 		senderEndPoint = {};
 		int bytesReceived = 0;
-#if defined(__linux__) || defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-		bytesReceived = static_cast<int>(recvfrom(_sockfd, buffer, BUFFER_SIZE, 0,
-			reinterpret_cast<struct sockaddr*>(&senderEndPoint), reinterpret_cast<socklen_t*>(&len)));
-#elif defined _WIN32 || defined _WIN64
-		bytesReceived = recvfrom(_sockfd, buffer, BUFFER_SIZE, 0,
-			reinterpret_cast<struct sockaddr*>(&senderEndPoint), &len);
-#endif
+		// Issues #444/#469: recvmsg()+MSG_TRUNC via the one shared helper --
+		// see UdpRecv.hpp for why recvfrom() cannot tell a cut datagram.
+		const udprecv::Result rx = udprecv::recvDatagram(_sockfd, buffer, BUFFER_SIZE, &senderEndPoint);
+		bytesReceived = rx.n;
+		const int recvErr = rx.err;
+		const bool truncated = rx.truncated;
+		(void)len;
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		// Fed on every wake -- this socket's 500 ms recv timeout (openSocket())
 		// bounds how long a quiet period can go unfed, same reasoning as
@@ -208,7 +212,28 @@ void UdpServer::receiveLoop()
 			(void)esp_task_wdt_reset();
 		}
 #endif
-		if (!_keepRunning || bytesReceived <= 0) continue;
+		if (!_keepRunning.load()) continue;   // a real re-read: stop() may have run while recvfrom() blocked
+		// Issue #443/#444: nothing below is thrown away silently any more.
+		if (truncated)
+		{
+			if (_onDiscardEvent)
+				_onDiscardEvent(Discard::Oversize,
+					std::string_view(buffer, (std::min)(static_cast<size_t>(bytesReceived), static_cast<size_t>(BUFFER_SIZE))),
+					senderEndPoint, static_cast<size_t>(bytesReceived), 0);
+			continue;
+		}
+		if (bytesReceived < 0)
+		{
+			if (!isIdleWake(recvErr) && _onDiscardEvent)
+				_onDiscardEvent(Discard::RecvError, std::string_view(), sockaddr_in{}, 0, recvErr);
+			continue;
+		}
+		if (bytesReceived == 0)
+		{
+			if (_onDiscardEvent)
+				_onDiscardEvent(Discard::Empty, std::string_view(), senderEndPoint, 0, 0);
+			continue;
+		}
 		// Issue #81: zero-copy hand-off — a view of the bytes recvfrom() just wrote
 		// into this loop's own stack buffer, valid until the next iteration
 		// overwrites it. No allocation on the per-packet hot path; every downstream
@@ -222,6 +247,11 @@ void UdpServer::receiveLoop()
 		(void)esp_task_wdt_delete(NULL);
 	}
 #endif
+}
+
+bool UdpServer::isIdleWake(int err)
+{
+	return udprecv::isIdleWake(err);
 }
 
 int UdpServer::send(const struct sockaddr_in& address, const std::string& buffer)
