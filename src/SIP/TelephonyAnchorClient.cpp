@@ -1,4 +1,5 @@
 #include "TelephonyAnchorClient.hpp"
+#include "RxRestart.hpp"   // Issue #554: pure restart/tombstone decisions
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32)
 
@@ -2785,7 +2786,7 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 	std::lock_guard<std::mutex> lock(_mutex);
 	// Issue #554 (b): a late upsert for a leg we already dropped. Claiming a slot now would
 	// start rx + POST for a call nobody is on.
-	if (_droppedLegs.contains(participantId))
+	if (!pd::rxStartAllowedFor(_droppedLegs, participantId))
 	{
 		ESP_LOGW(TAG, "startRxIfNeeded: %s was dropped -- not re-priming (#554)", participantId.c_str());
 		return false;
@@ -2799,21 +2800,36 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 		         participantId.c_str(), POCKETDIAL_MAX_ANCHOR_CALLS);
 		return false;
 	}
-	if (slot->rxTaskHandle != nullptr)
 	{
-		if (slot->rxRunning.load(std::memory_order_acquire) ||
-			slot->tearingDown.load(std::memory_order_acquire))
+		const bool handleSet   = slot->rxTaskHandle != nullptr;
+		const bool rxRunning   = slot->rxRunning.load(std::memory_order_acquire);
+		const bool tearingDown = slot->tearingDown.load(std::memory_order_acquire);
+		// Take the done-sem ONLY for a handle that is neither running nor tearing down:
+		// the take is how we learn the old task has finished with the slot (#575 review).
+		const bool semTaken = handleSet && !rxRunning && !tearingDown && slot->rxDoneSem &&
+			xSemaphoreTake(slot->rxDoneSem, 0) == pdTRUE;
+		switch (pd::rxRestartDecision(handleSet, rxRunning, tearingDown, semTaken))
 		{
-			// Already polling (ring-time prime or a duplicate call) — nothing to do.
-			return true;
+			case pd::RxStart::AlreadyPolling:
+				// Already polling (ring-time prime or a duplicate call) — nothing to do.
+				return true;
+			case pd::RxStart::StillExiting:
+				// Cleared rxRunning but has not given its done-sem yet: it still touches the
+				// slot. Refuse this time; the next upsert or re-prime retries.
+				ESP_LOGW(TAG, "startRxIfNeeded: rx task for %s still exiting -- not restarting yet (#554)",
+				         participantId.c_str());
+				return false;
+			case pd::RxStart::Restart:
+				// Issue #554 (a): the rx task gave up on its own (ring-time retry budget,
+				// transport failures, or the stream ended) and exited, leaving its handle
+				// behind. Its done-sem is taken, so it no longer touches the slot: replace it.
+				ESP_LOGW(TAG, "startRxIfNeeded: rx task for %s had exited -- restarting (#554)",
+				         participantId.c_str());
+				slot->rxTaskHandle = nullptr;
+				break;
+			case pd::RxStart::Start:
+				break;
 		}
-		// Issue #554 (a): the rx task gave up on its own (ring-time retry budget, transport
-		// failures, or the stream ended) and exited, leaving its handle behind. Treating that
-		// as "already polling" left the call with no GET audio for the rest of its life.
-		// The exited task no longer touches the slot (it clears rxRunning after its last use),
-		// so start a fresh one below.
-		ESP_LOGW(TAG, "startRxIfNeeded: rx task for %s had exited -- restarting (#554)", participantId.c_str());
-		slot->rxTaskHandle = nullptr;
 	}
 	if (slot->rxDoneSem)
 	{
@@ -3090,14 +3106,17 @@ void TelephonyAnchorClient::rxTaskTrampoline(void* arg)
 	CallSlot* slot = a->slot;
 	delete a;                  // one-time per-call heap arg (see startRxIfNeeded)
 	self->runRxLoop(slot);
+	// Issue #554 (#575 review): clear rxRunning FIRST, then give. The give is the task's
+	// last touch of the slot, and startRxIfNeeded() restarts only after TAKING that sem
+	// (pd::rxRestartDecision), so a restart can never delete/recreate the sem, or start a
+	// second task, while this one still uses the slot.
+	slot->rxRunning.store(false, std::memory_order_release);
 	// Give THIS slot's done-sem so stopMediaStreams() can join. stop() holds off any realloc of
 	// the slot until it has taken this sem, so slot->rxDoneSem is still the one it waits on.
 	if (slot->rxDoneSem)
 	{
 		xSemaphoreGive(slot->rxDoneSem);
 	}
-	// Issue #554: the last touch of the slot. After this a restart may reuse it.
-	slot->rxRunning.store(false, std::memory_order_release);
 	pd::deleteTask(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
 }
 
