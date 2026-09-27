@@ -214,6 +214,19 @@ HttpServer::~HttpServer()
 	{
 		std::this_thread::sleep_for(std::chrono::milliseconds(5));
 	}
+	// #540 review: giving up with a handler still running IS the use-after-free
+	// above, just deferred. Never let it pass silently: say so, and on the host
+	// (tests) stop right here, where the cause is, not in whatever runs next.
+	const int stillRunning = _activeConnections.load(std::memory_order_acquire);
+	if (stillRunning > 0)
+	{
+		std::cerr << "[HttpServer] destroyed with " << stillRunning
+			<< " connection handler(s) still running after the read deadline + 5 s"
+			   " -- a wedged handler will touch freed memory (#540)\n";
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+		std::abort();
+#endif
+	}
 }
 
 void HttpServer::start()
