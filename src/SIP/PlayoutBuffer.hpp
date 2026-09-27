@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <atomic>
 
+#include "PsramAllocator.hpp"
+
 class PlayoutBuffer
 {
 public:
@@ -44,7 +46,13 @@ public:
 	void setTargetDepth(size_t samples);
 
 private:
-	std::vector<int16_t> _buffer;
+	// Issue #466: the ring lives in PSRAM where the board has it. At the
+	// default 1600 samples it is 3,200 B -- under IDF's 16 KB PSRAM threshold,
+	// so a plain vector put every ring in internal DRAM: the first 888 call's
+	// ConferenceRoom alone holds 20 of them (64 KB, never freed), and every
+	// bridged call's MediaBridge more. Only tasks touch it (RTP rx/tx, the
+	// conference tick) -- never an ISR, DMA, or a task mid flash-write.
+	std::vector<int16_t, PsramAllocator<int16_t>> _buffer;
 	size_t _maxSamples;
 	size_t _readPtr = 0;
 	size_t _writePtr = 0;
