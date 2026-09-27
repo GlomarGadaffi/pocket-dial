@@ -303,7 +303,7 @@ std::vector<Registrar::AdoptedDevice> Registrar::adoptedDevices() const
 	return out;
 }
 
-bool Registrar::isExtensionSecured(const std::string& ext) const
+bool Registrar::isExtensionSecured(std::string_view ext) const
 {
 	for (const auto& [mac, rec] : _devices)
 	{

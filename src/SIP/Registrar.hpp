@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -88,7 +89,7 @@ public:
 	std::vector<AdoptedDevice> adoptedDevices() const;
 	// True if any adopted device holding `ext` has been promoted to Secured
 	// (issue #505: Learn mode then authenticates that extension's calls too).
-	bool isExtensionSecured(const std::string& ext) const;
+	bool isExtensionSecured(std::string_view ext) const;   // no allocation on the INVITE path
 
 	// Test-only seam: directly adopt a device without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, DeviceState state = DeviceState::Learned)
