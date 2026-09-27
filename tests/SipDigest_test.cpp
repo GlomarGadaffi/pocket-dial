@@ -415,3 +415,13 @@ TEST(SipDigestNonce, StampIsMonotonicSoAWallClockStepCannotStrandFreshNonces)
     EXPECT_LE(stamp, after);
     EXPECT_TRUE(validateNonce(nonce)); // HMAC + freshness still hold
 }
+
+// #584 review: the monotonic clock restarts at boot, so a pre-reboot nonce can
+// carry a stamp AHEAD of now. If the secret repeats (weak entropy, #420) its tag
+// verifies; it must still be refused, never clamped to age 0 and read as fresh.
+TEST(SipDigestNonce, ANonceStampedAheadOfNowIsRefused)
+{
+    bool expired = true;
+    EXPECT_FALSE(validateNonce(nonceAt(UINT64_C(1) << 60), &expired));
+    EXPECT_FALSE(expired); // not "stale": a stale 401 would invite a retry on it
+}

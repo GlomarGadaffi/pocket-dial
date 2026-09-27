@@ -628,10 +628,14 @@ namespace SipDigest
 		}
 	}
 
+	std::string nonceAt(uint64_t ts)
+	{
+		return toHexU64(ts) + "." + nonceTag(ts);
+	}
+
 	std::string generateNonce()
 	{
-		uint64_t ts = nowMs();
-		return toHexU64(ts) + "." + nonceTag(ts);
+		return nonceAt(nowMs());
 	}
 
 	bool validateNonce(const std::string& nonce, bool* expiredOut, uint64_t ttlMs)
@@ -659,9 +663,13 @@ namespace SipDigest
 			return false; // forged / corrupt — NOT stale
 		}
 
-		// Freshness. Guard against clock skew making `now < ts`.
+		// Freshness. The clock is monotonic, so within one boot ts <= now always.
+		// A stamp ahead of now is from before a reboot (the clock restarted); it
+		// can only verify if the secret repeated (weak entropy, #420). Refuse it
+		// outright, never clamp it to age 0 (#584 review).
 		uint64_t now = nowMs();
-		uint64_t age = (now >= ts) ? (now - ts) : 0;
+		if (ts > now) return false;
+		uint64_t age = now - ts;
 		bool expired = age > ttlMs;
 		if (expiredOut) *expiredOut = expired;
 		return !expired;
