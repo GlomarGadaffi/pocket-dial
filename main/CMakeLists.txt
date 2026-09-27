@@ -103,6 +103,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/AdminAuth.cpp"
                             # Issue #382: read-back of the panic handler's flash coredump.
                             "../src/Helpers/CoreDumpStore.cpp"
+                            # Issue #363: the secrets a factory reset must erase.
+                            "../src/Helpers/FactoryReset.cpp"
                             "../src/Helpers/DeviceConfig.cpp"
                             "../src/Helpers/SipDigest.cpp"
                             "../src/Helpers/SipSecretStore.cpp"
@@ -280,6 +282,20 @@ endif()
 # allocated with RequestsHandler (PSRAM on S3 builds, internal DRAM without
 # PSRAM). Before #416 it grew lazily in internal DRAM; measured on .244 at 64
 # slots: ~52 KB held at steady state (#278).
+# Issue #395: BENCH-ONLY rollback probe image for tools/ota/remote_ota.sh stage 4
+# (never marks itself valid; restarts itself while pending). Never ship it.
+if(POCKETDIAL_OTA_ROLLBACK_PROBE)
+    # The probe lives only in esp_main_eth.cpp's health gate. On any other transport the
+    # define would be silently ignored, the image would mark itself valid, and stage 4
+    # would end in "needs recovery" (Globox, #491 review) -- so refuse the build.
+    if(NOT SIP_TRANSPORT STREQUAL "eth")
+        message(FATAL_ERROR "POCKETDIAL_OTA_ROLLBACK_PROBE is only implemented for SIP_TRANSPORT=eth "
+                            "(esp_main_eth.cpp); got '${SIP_TRANSPORT}'")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_OTA_ROLLBACK_PROBE=1)
+    message(WARNING "SipServer: OTA ROLLBACK PROBE image -- bench only, it never marks itself valid (#395)")
+endif()
+
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         POCKETDIAL_PCAP_RING_SIZE=${POCKETDIAL_PCAP_RING_SIZE})
