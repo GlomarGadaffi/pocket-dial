@@ -159,9 +159,10 @@ namespace DeviceConfig
 	//                        timestamp so every opt-in write is a new value
 	//    12     1  wifiMode  0 = captive-portal default, 1 = STATION, 2 = AP
 	//                        (matches the existing NVS key "wifi_mode")
-	//    13     1  regMode   SIP registrar admission mode: 0 = open, 1 = learn,
-	//                        2 = secure. Matches Registrar::Mode and the existing
-	//                        NVS key "reg_mode" (u8) byte-for-byte.
+	//    13     1  regMode   SIP registrar admission mode: 1 = learn, 2 = secure.
+	//                        Matches Registrar::Mode and the NVS key "reg_mode"
+	//                        (u8) byte-for-byte. 0 was open, now retired (#500):
+	//                        a seed still carrying 0 installs learn.
 	//    14     2  --        reserved, zero
 	//    16    64  apPsk     SoftAP WPA2 passphrase
 	//    80    33  staSsid   upstream WiFi SSID (STATION mode)
@@ -328,9 +329,10 @@ namespace DeviceConfig
 	// key already has a defined meaning everywhere in this codebase (use the
 	// default), which is why adding syslog_host or reg_mode needed no migration.
 	//
-	// v2 (#397/#441): an ABSENT reg_mode used to mean Open and now means Learn.
-	// The v1 -> v2 row writes Open onto every pre-#397 board that has no key, so
-	// deployed boards keep admitting their phones exactly as before.
+	// v2 (#397/#441/#500): an ABSENT reg_mode used to mean open and now means
+	// Learn, and open itself is retired. The v1 -> v2 row writes Learn onto every
+	// pre-#397 board with no key or a stored open, so deployed boards keep
+	// admitting their phones (Learn admits each first REGISTER) with no open mode.
 	constexpr uint16_t kSchemaVersion = 2;
 
 	// What a pre-versioning device is assumed to be holding. Every release up to

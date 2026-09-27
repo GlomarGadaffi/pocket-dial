@@ -659,18 +659,17 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <div class="subhead">&#9990; Extension Registration &amp; Onboarding</div>
       <div class="note">
         Controls what a phone must prove before it can register as an extension.
-        <strong>Open</strong> accepts any endpoint with no credential, convenient
-        for a lab, but on a shared link anyone can register as any extension and tear
-        down calls. <strong>Learn</strong> adopts unknown phones on first contact and
-        locks each to its extension; run it briefly to onboard a fleet, then move on.
-        <strong>Secure</strong> digest-challenges every registration.
+        <strong>Learn</strong> adopts an unknown phone on first contact and locks
+        its extension to that device, so nobody else can take it over.
+        <strong>Secure</strong> digest-challenges every registration. There is no
+        open mode: accepting any endpoint with no credential let anyone on the link
+        register as any extension.
       </div>
       <div class="kv"><span class="k">Current mode</span><span id="reg-mode-cur">&mdash;</span></div>
       <div class="field">
         <label for="reg-mode">Registration mode</label>
         <select id="reg-mode">
-          <option value="open">Open: no credential required</option>
-          <option value="learn">Learn: adopt new phones (temporary)</option>
+          <option value="learn">Learn: adopt new phones, lock each to its device</option>
           <option value="secure">Secure: digest auth required</option>
         </select>
       </div>

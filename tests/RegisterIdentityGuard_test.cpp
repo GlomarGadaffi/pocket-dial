@@ -177,7 +177,7 @@ TEST(RegisterIdentityGuard, ReservedAndEmergencyExtensionsRefusedInLearnMode)
 		EXPECT_FALSE(wire.sawContaining("SIP/2.0 200 OK")) << "ext " << ext;
 	}
 
-	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Open);
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
 }
 
 TEST(RegisterIdentityGuard, ReservedAndEmergencyExtensionsRefusedInSecureModeBeforeAnyChallenge)
@@ -208,22 +208,24 @@ TEST(RegisterIdentityGuard, ReservedAndEmergencyExtensionsRefusedInSecureModeBef
 			   "mode's separate unprovisioned-extension rejection";
 	}
 
-	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Open);
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2. A normal extension is unaffected, in every registrar mode
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST(RegisterIdentityGuard, OrdinaryExtensionStillRegistersInOpenMode)
+TEST(RegisterIdentityGuard, OrdinaryExtensionStillRegistersInTheDefaultMode)
 {
+	// The default is Learn (#397); there is no open mode any more (#500).
 	RidWire wire;
 	RequestsHandler handler("192.168.50.4", 5060,
 		[&wire](const sockaddr_in& a, std::shared_ptr<SipMessage> m) {
 			wire.sent.emplace_back(a, std::move(m));
 		});
+	ASSERT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
 
-	handler.handle(ridRegister("101", "192.168.50.13", "open-ok"));
+	handler.handle(ridRegister("101", "192.168.50.13", "default-ok"));
 	EXPECT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
 	EXPECT_FALSE(wire.sawContaining("SIP/2.0 403"));
 }
@@ -245,7 +247,7 @@ TEST(RegisterIdentityGuard, OrdinaryExtensionStillRegistersInLearnMode)
 	EXPECT_TRUE(wire.sawContaining("SIP/2.0 200 OK"));
 	EXPECT_FALSE(wire.sawContaining("SIP/2.0 403"));
 
-	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Open);
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
 }
 
 TEST(RegisterIdentityGuard, OrdinaryExtensionStillChallengedThenAdmittedInSecureMode)
@@ -283,7 +285,7 @@ TEST(RegisterIdentityGuard, OrdinaryExtensionStillChallengedThenAdmittedInSecure
 	EXPECT_FALSE(wire.sawContaining("SIP/2.0 403"));
 
 	SipSecretStore::clearSecret("103");
-	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Open);
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -307,7 +309,7 @@ TEST(RegisterIdentityGuard, PlusPrefixedAorRefusedRegardlessOfMode)
 	handler.handle(ridRegister("+15551234567", "192.168.50.17", "plus-learn"));
 	EXPECT_TRUE(wire.sawContaining("SIP/2.0 403 Reserved or PSTN-shaped extension"));
 
-	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Open);
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
 }
 
 TEST(RegisterIdentityGuard, LongAllDigitPstnShapedAorRefused)

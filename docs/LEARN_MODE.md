@@ -1,6 +1,6 @@
 # Learn Mode: Fleet-Cutover Runbook
 
-Status: Shipped on `main` (digest auth + Learn mode), and operator-selectable from the dashboard, `POST /api/registrar`, or the flash-time `cfgseed` seed. The seed route works from **v1.4.1** onward; on v1.3.0 and v1.4.0 it silently did nothing ([#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)). The default depends on the board (#397): a **fresh install boots in `learn`**; an **existing board upgraded with no stored mode keeps `open`**, written to NVS once by the schema v2 migration so it shows as a real setting; a **factory reset returns the board to `learn`**. If the mode can't be read or saved, the board boots `learn`, never `open` (#441). A stored mode (dashboard, API or `cfgseed`) always wins. | Audience: Installers / field operators converting an existing phone deployment to pocket-dial. | Scope: Operational runbook, not implementation spec.
+Status: Shipped on `main` (digest auth + Learn mode), and operator-selectable from the dashboard, `POST /api/registrar`, or the flash-time `cfgseed` seed. The seed route works from **v1.4.1** onward; on v1.3.0 and v1.4.0 it silently did nothing ([#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)). **The open registrar is retired** (#500, desmo 2026-09-27). Every board runs `learn` or `secure`: a **fresh install boots in `learn`**; an **existing board that had no stored mode, or had `open` stored, is switched to `learn`** by the schema v2 migration (and `loadMode()` rewrites a stored `open` if it ever sees one); a **factory reset returns the board to `learn`**. If the mode can't be read or saved, the board boots `learn` (#441). A stored mode (dashboard, API or `cfgseed`) always wins. | Audience: Installers / field operators converting an existing phone deployment to pocket-dial. | Scope: Operational runbook, not implementation spec.
 
 > **TL;DR.** Learn mode lets you drop pocket-dial into a *running* phone deployment and
 > adopt the handsets that are already there, without re-typing a SIP account into every
@@ -38,17 +38,17 @@ on a network you can reach:
 > **That panel only works from firmware v1.4.1 onward.** On v1.3.0 and v1.4.0 the seed's
 > `regMode` was written to NVS namespace `storage` while `Registrar::loadMode()` reads
 > `pbxcfg`, so it silently did nothing ([#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)). If you seeded a mode at
-> flash time on one of those builds the board came up `open` regardless. Check
+> flash time on one of those builds the board came up in its compiled-in default regardless (at the time, `open`). Check
 > `GET /api/registrar` rather than assuming.
 
 | Mode | What it does | When to use it |
 |------|--------------|----------------|
-| **Open** (`0`, standalone) | No SIP authentication. Any phone that knows an extension can REGISTER and place calls. The default kept on an existing board that had no stored mode when it was upgraded past #397 (fresh boards and factory resets start in Learn). | Bench testing, a brand-new isolated deployment you will secure immediately, or a fully trusted/closed lab. **Not** for production on a shared link. |
-| **Learn** (`1`, TOFU adoption) | Adopts unknown phones on first REGISTER **without verifying** (trust-on-first-use), records `{MAC, extension}`, and keeps them alive on their *current* credentials. Already-secured devices are still digest-challenged. A different MAC claiming a secured extension is rejected. | **The cutover mode.** Use it only during a bounded adoption window while migrating an existing fleet, then leave it. |
+| **Learn** (`1`, TOFU adoption) | Adopts unknown phones on first REGISTER **without verifying** (trust-on-first-use), records `{MAC, extension}`, and keeps them alive on their *current* credentials. Already-secured devices are still digest-challenged. A different MAC claiming a secured extension is rejected. | **The default and the floor.** Phones work with nothing to configure; an extension nobody has adopted yet can still be claimed first-come (#440), so adopt on a trusted link. |
 | **Secure** (`2`, closed) | Every REGISTER is digest-challenged (RFC 2617, MD5). Only extensions whose secret you have set/rotated can register, and each is locked to its adopted MAC. | **Steady-state production.** The target you flip to once the fleet is adopted and secrets are issued. |
 
-Mode transitions are explicit admin actions: there is no silent downgrade. Moving
-Secure → Open/Learn re-opens the registrar and is logged; do it only deliberately. See
+There is no open mode (`0`) any more (#500): the API answers `400` for it, and a board or
+config import that still says `open` gets `learn`. Mode transitions are explicit admin
+actions: there is no silent downgrade. Moving Secure → Learn is logged; do it only deliberately. See
 [THREAT_MODEL.md](THREAT_MODEL.md) §9 (no-silent-downgrade).
 
 ## 2. How a phone's MAC is obtained (read this first)
@@ -245,17 +245,18 @@ ASCII fallback:
 
 ## 5. The TOFU window discipline
 
-Learn mode's trust-on-first-use is a **deliberate, bounded weakening** of the registrar,
-not a steady state. During the window any unprovisioned phone that REGISTERs an unclaimed
-extension is adopted **without verification**. Treat the window like an open door:
+Learn is the default and the floor (the open registrar is retired, #500). Once a phone is
+adopted its extension is locked to that device, so Learn protects every extension that
+has been claimed. Its remaining exposure is an extension **nobody has adopted yet**: the
+first device to REGISTER it is adopted **without verification** (#440 tracks closing that).
+So:
 
-- **Bound it.** Open Learn mode, do the cutover, leave. Do not run a registrar in Learn
-  mode indefinitely; that is functionally an open registrar for any *unclaimed* extension.
-- **Default on a fresh board, admin-gated after.** Since #397 a fresh install (and a factory
-  reset) boots in Learn, because the alternatives are worse out of the box: Open accepts
-  anyone, and Secure refuses every phone until secrets exist. Treat that as the start of
-  the adoption window above, not a resting state: secure the phones, then leave Learn.
-  Re-opening it later is admin-gated.
+- **Adopt what you own, promptly.** Let every phone register once on a trusted link, check
+  the roster, and **forget** anything you don't recognise.
+- **Default on every board.** A fresh install, a factory reset and (since #500) any board
+  that used to run the retired open mode all boot in Learn, because the alternatives are
+  worse out of the box: open accepted anyone, and Secure refuses every phone until secrets
+  exist. For the strongest posture, secure each phone and switch to Secure.
 - **Prefer an encrypted/trusted link.** Run the window on WPA2 (or a trusted wired segment)
   so a passive sniffer can't observe the cutover and a stranger can't associate and race to
   claim an extension. On an open AP the window is materially riskier; see
@@ -293,15 +294,15 @@ extension, so re-adoption is a deliberate admin action, by design.
 - ~~Rotate instead of forget~~: **not available.** There is no rotate path, for the
   same reason Step 4 is blocked: nothing in the firmware calls
   `SipSecretStore::setSecret()`. See the caution box in Step 4.
-- Roll the whole box back to Learn/Open: explicit admin mode change (logged, no silent
+- Roll the whole box back to Learn: explicit admin mode change (logged, no silent
   downgrade). Reverts to the cutover posture; use only deliberately and re-secure promptly.
 
 ## 7. What is M1 vs later (M2)
 
 | Capability | Milestone | Notes |
 |------------|-----------|-------|
-| Runtime registrar mode (Open/Learn/Secure) | **M1 (now)** | NVS-backed; chosen at onboarding. |
-| Digest auth on REGISTER (challenge/verify) | **M1 (now)** | RFC 2617 (MD5); closes the open registrar. INVITE auth (407) is a follow-up. |
+| Runtime registrar mode (Learn/Secure) | **M1 (now)** | NVS-backed; chosen at onboarding. Open retired (#500). |
+| Digest auth on REGISTER (challenge/verify) | **M1 (now)** | RFC 2617 (MD5). Secure mode also digest-challenges INVITE (drawbridge #125); binding a call to its caller's registered address is #497. |
 | Learn-mode TOFU adoption keyed by MAC | **M1 (now)** | Unknown MAC adopted; recorded `{MAC, ext}`. |
 | Extension ↔ MAC lock (anti-spoof) | **M1 (now)** | Different MAC for a secured ext → reject. |
 | Set / rotate per-extension secret in config panel | **NOT BUILT** | Listed as "M1 (now)" in earlier revisions; there is no route, no UI field and no console for it; `SipSecretStore::setSecret()` has no production caller. This is the gap that blocks Steps 4-5. |

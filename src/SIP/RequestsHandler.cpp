@@ -1183,7 +1183,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	// (PbxConfig.hpp) for the full reasoning behind each case.
 	//
 	// Same placement rationale as the service-name guard just above: BEFORE the
-	// registrar-mode admission so Open/Secure/Learn all refuse identically, and
+	// registrar-mode admission so Learn and Secure refuse identically, and
 	// 403 (not 400) because the AOR is well-formed — it is the identity that is
 	// refused.
 	if (pbx::isReservedOrPstnAor(fromNumber))
@@ -1195,18 +1195,16 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	}
 
 	// ── Registrar-mode admission (STAGE 2) ───────────────────────────────────────
-	// Runtime policy replaces the old compile-time POCKETDIAL_OPEN_REGISTRAR gate.
-	//   Open   : accept every REGISTER (legacy standalone behaviour).
+	// Every REGISTER is admitted by policy; there is no accept-everything mode
+	// (the open registrar is retired, #500).
 	//   Secure : digest-challenge + verify against the stored HA1 for this ext.
 	//   Learn  : TOFU + MAC-lock — adopt unknown devices, enforce secured ones.
 	// On Challenge the helper has already enqueued the 401 + WWW-Authenticate; on
 	// Reject we emit the 403 here from rejectReason. Either way a non-Accept stops.
 	const std::string extStr(fromNumber);
-	const RegistrarMode mode = _registrar.getMode();
-	if (mode != RegistrarMode::Open)
 	{
 		std::string rejectReason;
-		Registrar::AuthDecision decision = (mode == RegistrarMode::Secure)
+		const Registrar::AuthDecision decision = (_registrar.getMode() == RegistrarMode::Secure)
 			? _registrar.admitSecure(data, extStr, rejectReason)
 			: _registrar.admitLearn(data, extStr, rejectReason);
 
@@ -1738,7 +1736,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// digest machinery -- admitSecure() takes the method from the request line,
 	// so it verifies against INVITE. The stateless 401 needs no session; the
 	// credentialed retry arrives with CSeq+1 and falls through here. Learn mode
-	// keeps its TOFU semantics and Open mode never challenges.
+	// keeps its TOFU semantics (the open mode is retired, #500).
 	if (_registrar.getMode() == RegistrarMode::Secure)
 	{
 		std::string rejectReason;

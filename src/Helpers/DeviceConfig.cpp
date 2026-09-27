@@ -100,14 +100,15 @@ namespace
 	// through writeRegistrarMode() above instead of erasing the key.)
 #endif
 
-	// Schema v1 -> v2 (#397, #441 review). Before #397 an absent reg_mode meant
-	// Open; from v2 it means Learn (Registrar::chooseBootMode). A v1 board with
-	// no key is therefore a DEPLOYED board running Open, and it must keep doing
-	// so: write Open explicitly. A board that already has a key is left alone.
+	// Schema v1 -> v2 (#397, #441 review, #500). On a v1 board an absent reg_mode
+	// meant open, and a stored 0 WAS open. The open registrar is retired (#500,
+	// desmo 2026-09-27), so both become Learn, written explicitly. Learn admits
+	// each phone's first REGISTER, so a deployed board keeps its phones. A stored
+	// Learn or Secure is left alone.
 	// Returns false on any NVS failure, so runSchemaMigrations() does not stamp
-	// v2 and the step is retried next boot -- meanwhile the board boots Learn,
-	// which is the safe side of the choice.
-	bool migrateKeepPre397BoardOpen(void* /*ctx*/)
+	// v2 and the step is retried next boot -- meanwhile the board boots Learn
+	// anyway (chooseBootMode / Registrar::decodeStored).
+	bool migrateRetireOpenRegistrar(void* /*ctx*/)
 	{
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		nvs_handle_t rh;
@@ -118,9 +119,9 @@ namespace
 		uint8_t v = 0;
 		const esp_err_t err = nvs_get_u8(rh, kKeyRegMode, &v);
 		nvs_close(rh);
-		if (err == ESP_OK) return true;                  // an explicit mode stands
-		if (err != ESP_ERR_NVS_NOT_FOUND) return false;  // unreadable: retry next boot
-		return writeRegistrarMode(0 /* Registrar::Mode::Open */);
+		if (err == ESP_OK && v != 0) return true;                   // learn/secure stand
+		if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return false;  // unreadable: retry next boot
+		return writeRegistrarMode(1 /* Registrar::Mode::Learn */);
 #else
 		return true;   // host: no NVS, and the host never runs a migration anyway
 #endif
@@ -860,11 +861,14 @@ namespace DeviceConfig
 			// registrar. A dashboard endpoint covers the boards that do have one.
 			if (regMode <= 2)
 			{
+				// #500: 0 was open, which is retired. A seed written by an older
+				// flasher that still says open installs learn instead.
+				const uint8_t effective = (regMode == 0) ? 1 : regMode;
 				// Separate handle on a different namespace from every other field
 				// this function writes, committed and closed inside the helper
 				// rather than deferred to the shared commit below, which only
 				// covers `h`. See writeRegistrarMode (issues #151 / #188).
-				if (writeRegistrarMode(regMode))
+				if (writeRegistrarMode(effective))
 				{
 					applied = true;
 				}
@@ -1076,7 +1080,7 @@ namespace DeviceConfig
 		// dispatch in runSchemaMigrations() is exercised by the host tests
 		// against synthetic tables; the NVS body of each row is ESP-only.
 		static const SchemaMigration kTable[] = {
-			{1, 2, &migrateKeepPre397BoardOpen, "reg_mode: keep a pre-#397 board open"},
+			{1, 2, &migrateRetireOpenRegistrar, "reg_mode: retire open, write learn (#500)"},
 		};
 		if (count != nullptr)
 		{
