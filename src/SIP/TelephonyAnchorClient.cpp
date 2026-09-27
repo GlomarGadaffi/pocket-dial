@@ -1,4 +1,5 @@
 #include "TelephonyAnchorClient.hpp"
+#include "RxRestart.hpp"   // Issue #554: pure restart/tombstone decisions
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32)
 
@@ -559,6 +560,12 @@ bool TelephonyAnchorClient::dropCall(const std::string& participantId)
 	// the drop POST room (else it fails with sock<0 / mbedtls alloc-fail and the PSTN leg lingers).
 	// stopMediaStreams(partId) frees this participant's slot; its per-slot _tearingDown gate makes
 	// it idempotent if the WS 'Dropped' event races us. Runs on the off-SIP tel_dropcall worker.
+	// Issue #554 (b): tombstone the leg FIRST, so an upsert racing this teardown cannot
+	// re-prime it once stopMediaStreams() has freed the slot.
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_droppedLegs.add(partId);
+	}
 	stopMediaStreams(partId);
 
 	// Trigger drop via HTTP POST /callcontrol/{sourceDn}/participants/{participantId}/drop
@@ -2789,6 +2796,13 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 {
 	std::lock_guard<std::mutex> lock(_mutex);
+	// Issue #554 (b): a late upsert for a leg we already dropped. Claiming a slot now would
+	// start rx + POST for a call nobody is on.
+	if (!pd::rxStartAllowedFor(_droppedLegs, participantId))
+	{
+		ESP_LOGW(TAG, "startRxIfNeeded: %s was dropped -- not re-priming (#554)", participantId.c_str());
+		return false;
+	}
 	// Find-or-claim THIS participant's call slot (#100). A full table means we are already
 	// bridging POCKETDIAL_MAX_ANCHOR_CALLS calls — refuse the new one rather than overrun.
 	CallSlot* slot = allocSlotLocked(participantId);
@@ -2798,10 +2812,36 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 		         participantId.c_str(), POCKETDIAL_MAX_ANCHOR_CALLS);
 		return false;
 	}
-	if (slot->rxTaskHandle != nullptr)
 	{
-		// Already polling (ring-time prime or a duplicate call) — nothing to do.
-		return true;
+		const bool handleSet   = slot->rxTaskHandle != nullptr;
+		const bool rxRunning   = slot->rxRunning.load(std::memory_order_acquire);
+		const bool tearingDown = slot->tearingDown.load(std::memory_order_acquire);
+		// Take the done-sem ONLY for a handle that is neither running nor tearing down:
+		// the take is how we learn the old task has finished with the slot (#575 review).
+		const bool semTaken = handleSet && !rxRunning && !tearingDown && slot->rxDoneSem &&
+			xSemaphoreTake(slot->rxDoneSem, 0) == pdTRUE;
+		switch (pd::rxRestartDecision(handleSet, rxRunning, tearingDown, semTaken))
+		{
+			case pd::RxStart::AlreadyPolling:
+				// Already polling (ring-time prime or a duplicate call) — nothing to do.
+				return true;
+			case pd::RxStart::StillExiting:
+				// Cleared rxRunning but has not given its done-sem yet: it still touches the
+				// slot. Refuse this time; the next upsert or re-prime retries.
+				ESP_LOGW(TAG, "startRxIfNeeded: rx task for %s still exiting -- not restarting yet (#554)",
+				         participantId.c_str());
+				return false;
+			case pd::RxStart::Restart:
+				// Issue #554 (a): the rx task gave up on its own (ring-time retry budget,
+				// transport failures, or the stream ended) and exited, leaving its handle
+				// behind. Its done-sem is taken, so it no longer touches the slot: replace it.
+				ESP_LOGW(TAG, "startRxIfNeeded: rx task for %s had exited -- restarting (#554)",
+				         participantId.c_str());
+				slot->rxTaskHandle = nullptr;
+				break;
+			case pd::RxStart::Start:
+				break;
+		}
 	}
 	if (slot->rxDoneSem)
 	{
@@ -2819,9 +2859,11 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 	// #100: stack in PSRAM (WithCaps) — N concurrent calls' GET-rx tasks would otherwise exhaust
 	// internal RAM. The task does HTTPS GET reads + the audio rx callback only (no flash writes),
 	// so a PSRAM stack is safe. Force-kill + self-exit both use vTaskDeleteWithCaps.
+	slot->rxRunning.store(true, std::memory_order_release);   // #554: before the task can exit
 	BaseType_t rc = pd::createTaskPreferPsram(&TelephonyAnchorClient::rxTaskTrampoline, "tel_media_rx", 6144, arg, 6, &slot->rxTaskHandle, 1);
 	if (rc != pdPASS)
 	{
+		slot->rxRunning.store(false, std::memory_order_release);
 		ESP_LOGE(TAG, "Failed to create Rx task for %s", participantId.c_str());
 		delete arg;
 		slot->rxTaskHandle = nullptr;
@@ -3076,6 +3118,11 @@ void TelephonyAnchorClient::rxTaskTrampoline(void* arg)
 	CallSlot* slot = a->slot;
 	delete a;                  // one-time per-call heap arg (see startRxIfNeeded)
 	self->runRxLoop(slot);
+	// Issue #554 (#575 review): clear rxRunning FIRST, then give. The give is the task's
+	// last touch of the slot, and startRxIfNeeded() restarts only after TAKING that sem
+	// (pd::rxRestartDecision), so a restart can never delete/recreate the sem, or start a
+	// second task, while this one still uses the slot.
+	slot->rxRunning.store(false, std::memory_order_release);
 	// Give THIS slot's done-sem so stopMediaStreams() can join. stop() holds off any realloc of
 	// the slot until it has taken this sem, so slot->rxDoneSem is still the one it waits on.
 	if (slot->rxDoneSem)
