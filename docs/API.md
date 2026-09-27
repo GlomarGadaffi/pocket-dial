@@ -872,7 +872,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `ip` | String | The primary active IP address of the SIP server interface. |
 | `port` | Integer | The UDP signaling port. **Always the literal `5060`**; it is hardcoded in the handler (`HttpServer.cpp:951`), not read from configuration, because this codebase has no way to run the SIP listener on another port. Do not treat it as a discovered value. |
 | `httpPort` | Integer | The active TCP HTTP port (typically 80). |
-| `httpReadDeadlineDrops` | Integer | HTTP connections dropped because the request (headers + buffered body) did not arrive within 10 s of the accept (#529). A climbing count means a slow or hostile client. |
+| `httpReadDeadlineDrops` | Integer | HTTP connections dropped because the request (headers + buffered body) did not arrive within 10 s of the accept (#529), or whose receive timeout could not be set at all (#534; closed unread rather than left to block). A climbing count means a slow or hostile client. |
 | `httpPerSourceRefusals` | Integer | HTTP connections refused `503` because one source address already held 3 of the 4 connection slots (#529). |
 | `uptime` | Integer | Time in seconds since the HTTP server initialized. |
 | `packetsProcessed` | Integer | Total UDP signaling packets processed by the state machine. |

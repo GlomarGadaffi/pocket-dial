@@ -199,8 +199,48 @@ void HttpServer::start()
 	_acceptThread = std::thread(&HttpServer::acceptLoop, this);
 }
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+static std::atomic<bool> s_failSocketTimeoutsForTest{false};
+void HttpServer::setFailSocketTimeoutsForTest(bool fail) { s_failSocketTimeoutsForTest.store(fail); }
+#endif
+
+// Issue #529: SO_RCVTIMEO / SO_SNDTIMEO in milliseconds (at least 1, so 0 never
+// means "forever"). Returns false if the option did not take (#534 review):
+// the caller must then not block on the socket at all, because an unbounded
+// recv() or send() is exactly the slot-holding hang the timeout is there for.
+static bool setSocketTimeoutMs(int sock, int opt, long ms)
+{
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	if (s_failSocketTimeoutsForTest.load()) return false;
+#endif
+	if (ms < 1) ms = 1;
+#if defined _WIN32 || defined _WIN64
+	DWORD tv = static_cast<DWORD>(ms);
+	return setsockopt(sock, SOL_SOCKET, opt, reinterpret_cast<const char*>(&tv), sizeof(tv)) == 0;
+#else
+	struct timeval tv{};
+	tv.tv_sec  = ms / 1000;
+	tv.tv_usec = (ms % 1000) * 1000;
+	return setsockopt(sock, SOL_SOCKET, opt, &tv, sizeof(tv)) == 0;
+#endif
+}
+
+static bool setRecvTimeoutMs(int sock, long ms) { return setSocketTimeoutMs(sock, SO_RCVTIMEO, ms); }
+
 void HttpServer::acceptLoop()
 {
+	// The accept thread's refusals (#368 global cap, #529 per-source) must never
+	// block it: bound the send, and if even that cannot be set, close unanswered
+	// (#534 review). A dropped connection costs the refused client a retry; a
+	// send() that blocks forever costs every client the whole server.
+	const auto refuseBusy = [this](int sock, const char* body) {
+		if (setSocketTimeoutMs(sock, SO_SNDTIMEO, 1000))
+		{
+			sendResponse(sock, 503, "Service Unavailable", "application/json", body);
+		}
+		closeSocket(sock);
+	};
+
 	// Issue #382: checksum + summarise any stored coredump ONCE, here -- this
 	// thread runs on the 8192-byte pthread default (it never resizes itself,
 	// see below), unlike the 4 KB per-connection threads /api/coredump/info is
@@ -313,20 +353,8 @@ void HttpServer::acceptLoop()
 			// and take the whole server down -- a far worse denial of service than
 			// the exhaustion this cap exists to prevent. handleClient()'s 5 s
 			// SO_RCVTIMEO (#23) is set on the handler path we are deliberately
-			// skipping here, so this socket needs its own bound.
-#if defined _WIN32 || defined _WIN64
-			DWORD sndTv = 1000;
-			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO,
-				reinterpret_cast<const char*>(&sndTv), sizeof(sndTv));
-#else
-			timeval sndTv{};
-			sndTv.tv_sec  = 1;
-			sndTv.tv_usec = 0;
-			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, &sndTv, sizeof(sndTv));
-#endif
-			sendResponse(clientSock, 503, "Service Unavailable", "application/json",
-				"{\"error\":\"busy\",\"message\":\"too many concurrent connections\"}");
-			closeSocket(clientSock);
+			// skipping here, so this socket needs its own bound (refuseBusy).
+			refuseBusy(clientSock, "{\"error\":\"busy\",\"message\":\"too many concurrent connections\"}");
 			continue;
 		}
 
@@ -336,19 +364,7 @@ void HttpServer::acceptLoop()
 		if (!claimSource(sourceAddr))
 		{
 			_perSourceRefusals.fetch_add(1, std::memory_order_relaxed);
-#if defined _WIN32 || defined _WIN64
-			DWORD sndTv = 1000;
-			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO,
-				reinterpret_cast<const char*>(&sndTv), sizeof(sndTv));
-#else
-			timeval sndTv{};
-			sndTv.tv_sec  = 1;
-			sndTv.tv_usec = 0;
-			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, &sndTv, sizeof(sndTv));
-#endif
-			sendResponse(clientSock, 503, "Service Unavailable", "application/json",
-				"{\"error\":\"busy\",\"message\":\"too many connections from this address\"}");
-			closeSocket(clientSock);
+			refuseBusy(clientSock, "{\"error\":\"busy\",\"message\":\"too many connections from this address\"}");
 			continue;
 		}
 
@@ -420,20 +436,6 @@ void HttpServer::releaseSource(uint32_t addr)
 	}
 }
 
-// Issue #529: SO_RCVTIMEO in milliseconds (at least 1, so 0 never means "forever").
-static void setRecvTimeoutMs(int sock, long ms)
-{
-	if (ms < 1) ms = 1;
-#if defined _WIN32 || defined _WIN64
-	DWORD tv = static_cast<DWORD>(ms);
-	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-	struct timeval tv{};
-	tv.tv_sec  = ms / 1000;
-	tv.tv_usec = (ms % 1000) * 1000;
-	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
-}
 
 void HttpServer::handleClient(int clientSock)
 {
@@ -466,8 +468,15 @@ void HttpServer::handleClient(int clientSock)
 	}
 
 	// Issue #23 resolved: Added SO_RCVTIMEO per-client socket timeout and capped Content-Length to 16KB to prevent Accept thread DoS
-	// Issue #529: 5 s per recv(), but never past the read deadline.
-	setRecvTimeoutMs(clientSock, (std::min)(5000L, _readDeadlineMs));
+	// Issue #529: 5 s per recv(), but never past the read deadline. If the
+	// timeout cannot be set, recv() would wait forever: drop the connection
+	// unread and count it with the deadline drops (#534 review).
+	if (!setRecvTimeoutMs(clientSock, (std::min)(5000L, _readDeadlineMs)))
+	{
+		_readDeadlineDrops.fetch_add(1, std::memory_order_relaxed);
+		closeSocket(clientSock);
+		return;
+	}
 
 	// Heap-allocate the read buffer. On ESP32 each connection runs on a detached
 	// std::thread, i.e. an IDF pthread; sdkconfig.defaults sets
@@ -631,7 +640,12 @@ void HttpServer::handleClient(int clientSock)
 						closeSocket(clientSock);
 						return;
 					}
-					setRecvTimeoutMs(clientSock, (std::min)(5000L, left));
+					if (!setRecvTimeoutMs(clientSock, (std::min)(5000L, left)))
+					{
+						_readDeadlineDrops.fetch_add(1, std::memory_order_relaxed);
+						closeSocket(clientSock);
+						return;
+					}
 					buf.assign(buf.size(), 0);
 #if defined _WIN32 || defined _WIN64
 					int n = recv(clientSock, buf.data(), static_cast<int>(buf.size()) - 1, 0);

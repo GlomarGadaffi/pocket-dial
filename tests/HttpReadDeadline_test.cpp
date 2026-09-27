@@ -224,3 +224,34 @@ TEST(HttpReadDeadline, OneSourceCannotHoldEverySlot)
 	for (Sock h : holders) closeSock(h);
 	waitIdle(server);
 }
+
+TEST(HttpReadDeadline, ASocketWhoseTimeoutCannotBeSetIsClosedUnanswered)
+{
+	// #534 review: setsockopt(SO_RCVTIMEO)'s result was discarded, so a socket
+	// it failed on would recv() with no bound at all -- the very hang #529
+	// exists to stop. It is now closed unread, and counted with the deadline
+	// drops. The seam makes the failure deterministic.
+	struct ResetSeam
+	{
+		~ResetSeam() { HttpServer::setFailSocketTimeoutsForTest(false); }
+	} resetSeam;
+
+	RequestsHandler handler("192.168.52.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18252, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	HttpServer::setFailSocketTimeoutsForTest(true);
+	Sock s = connectFrom("127.0.0.1", 18252);
+	ASSERT_TRUE(valid(s));
+	ASSERT_TRUE(sendAll(s, "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"));
+	const std::string resp = recvAll(s);
+	closeSock(s);
+
+	EXPECT_TRUE(resp.empty()) << "an unbounded socket must not be served: " << resp;
+	EXPECT_EQ(server.readDeadlineDrops(), 1u);
+	HttpServer::setFailSocketTimeoutsForTest(false);
+	waitIdle(server);
+}

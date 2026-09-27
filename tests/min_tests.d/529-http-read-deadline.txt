@@ -1,2 +1,2 @@
-# HttpReadDeadline_test.cpp: 2 (#529)
-2
+# HttpReadDeadline_test.cpp: 3 (#529, and the #534 review's setsockopt check)
+3
