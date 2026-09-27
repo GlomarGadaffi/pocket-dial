@@ -1395,8 +1395,10 @@ function applyEmergencyRoute(d){
   b.style.display=d.emergencyRoute==="none"?"":"none";
 }
 /* #450 / poll #454: the E911 banner. An ABSENT field (older firmware) shows
-   nothing, same rule as wifiCapable below. */
-function applyE911(d){var b=$("e911-banner");if(!b||!d||typeof d.e911Configured==="undefined")return;b.style.display=d.e911Configured?"none":"";}
+   nothing, same rule as wifiCapable below. Hidden while emergencyRoute is "none":
+   its text says a 911 call "still routes out", which is false then, and #521's
+   route banner already says 911 is refused. */
+function applyE911(d){var b=$("e911-banner");if(!b||!d||typeof d.e911Configured==="undefined")return;b.style.display=(d.e911Configured||d.emergencyRoute==="none")?"none":"";}
 /* #167: the board states whether it has a radio; the UI must not infer it from
    an empty scan. Older firmware predates the field, so an ABSENT wifiCapable is
    treated as capable -- the dashboard is served by the same board it manages, so
