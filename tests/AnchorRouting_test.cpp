@@ -1059,13 +1059,15 @@ TEST(AnchorRouting, ACancelWhileTheAnchorLegRingsAnswersTheInvite487)
 	handler.handle(makeCancel("501", "555", "192.168.9.51", "anchor-548"));
 
 	std::string cancelOk, terminated;
+	size_t n487 = 0;
 	for (const auto& [addr, msg] : sent)
 	{
 		(void)addr;
 		const std::string raw = msg ? msg->toString() : std::string();
 		if (raw.rfind("SIP/2.0 200 OK", 0) == 0 && raw.find("CSeq: 1 CANCEL") != std::string::npos) cancelOk = raw;
-		if (raw.rfind("SIP/2.0 487 Request Terminated", 0) == 0) terminated = raw;
+		if (raw.rfind("SIP/2.0 487 Request Terminated", 0) == 0) { terminated = raw; ++n487; }
 	}
+	EXPECT_EQ(n487, 1u) << "exactly one 487";
 	EXPECT_FALSE(cancelOk.empty()) << "the CANCEL itself is answered 200";
 	ASSERT_FALSE(terminated.empty()) << "the INVITE must be answered 487";
 	EXPECT_NE(terminated.find("CSeq: 1 INVITE"), std::string::npos) << terminated;
@@ -1074,6 +1076,15 @@ TEST(AnchorRouting, ACancelWhileTheAnchorLegRingsAnswersTheInvite487)
 	EXPECT_NE(terminated.find("tag=ring548"), std::string::npos)
 		<< "the To-tag the 180 Ringing carried:\n" << terminated;
 	EXPECT_FALSE(handler.getSession("Call-ID: anchor-548").has_value());
+
+	// A retransmitted CANCEL is answered again, but the INVITE is not re-terminated.
+	sent.clear();
+	handler.handle(makeCancel("501", "555", "192.168.9.51", "anchor-548"));
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		EXPECT_NE(msg ? msg->toString().rfind("SIP/2.0 487", 0) : 1u, 0u) << "no second 487";
+	}
 }
 
 TEST(AnchorRouting, ACancelAfterTheAnchorAnsweredSendsNo487)

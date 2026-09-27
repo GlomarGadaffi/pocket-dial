@@ -1528,7 +1528,10 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		if (cancelSess.has_value() &&
 			cancelSess.value()->getState() == Session::State::Invited)
 		{
-			auto terminated = getMessageFromPool(*data);
+			// The stored INVITE when there is one (its own Via/CSeq verbatim);
+			// else the CANCEL, which carries the same fields (§9.1).
+			const std::shared_ptr<SipMessage> invite = cancelSess.value()->getInviteMessage();
+			auto terminated = getMessageFromPool(invite ? *invite : *data);
 			if (terminated)
 			{
 				std::string cseq(data->getCSeq());
