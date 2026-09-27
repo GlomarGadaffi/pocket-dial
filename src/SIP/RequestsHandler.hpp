@@ -668,6 +668,13 @@ public:
 		if (auto c = findClient(ext)) c.value()->setLastActiveTimeForTest(std::chrono::steady_clock::now() - idle);
 		sweepExpired();
 	}
+	// Test-only (#603 review): expire `ext`'s registration lease, then run the sweep.
+	void expireLeaseAndSweepForTest(const std::string& ext)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
+		sweepExpired();
+	}
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned)
 	{

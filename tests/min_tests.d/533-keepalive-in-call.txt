@@ -1,2 +1,2 @@
-# AnchorRouting_test.cpp: 1 (#533: a missed keepalive does not prune a phone in a call)
-1
+# AnchorRouting_test.cpp: 1 (#533: a missed keepalive does not prune a phone in a call); TrunkWiring_test.cpp: 1 (#603 review: an expired lease mid-call ends it through endCall)
+2

@@ -43,6 +43,8 @@ public:
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only (#533): age the keepalive clock without sleeping 15 s.
 	void setLastActiveTimeForTest(std::chrono::steady_clock::time_point t) { _lastActiveTime = t; }
+	// Test-only (#603 review): expire the registration lease now.
+	void expireLeaseForTest() { _expiresAt = std::chrono::steady_clock::now() - std::chrono::seconds(1); }
 #endif
 
 private:

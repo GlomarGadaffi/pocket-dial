@@ -7474,36 +7474,27 @@ void RequestsHandler::sweepExpired()
 				queueLog("Registration lease expired: " + client->getNumber());
 			}
 
-			// Clean up sessions involving this client
-			std::string extension = client->getNumber();
-			for (auto sit = _sessions.begin(); sit != _sessions.end(); )
+			// Issue #533 (#603 review): end this client's calls through endCall(),
+			// not a hand-rolled erase, so the far leg is hung up (trunk BYE), relays
+			// and bridges are released and the CDR is written -- the same teardown
+			// every other path gets. Call-IDs are collected first: endCall() erases
+			// from _sessions.
+			const std::string extension = client->getNumber();
+			std::vector<std::pair<std::string, std::string>> ending;   // {callID, other party}
+			for (const auto& [cid, s] : _sessions)
 			{
-				bool involved = false;
-				if (sit->second->getSrc() && sit->second->getSrc()->getNumber() == extension)
-					involved = true;
-				if (sit->second->getDest() && sit->second->getDest()->getNumber() == extension)
-					involved = true;
-				if (involved)
+				const bool isSrc = s->getSrc() && s->getSrc()->getNumber() == extension;
+				const bool isDest = s->getDest() && s->getDest()->getNumber() == extension;
+				if (isSrc || isDest)
 				{
-					std::string callID = sit->first;
-					// Media beachhead: if this dialog owned the live RTP tone stream,
-					// stop it so a caller whose lease expires mid-stream doesn't leak
-					// the socket/task. Idempotent no-op otherwise.
-					_rtpSender.stop(callID);
-					sit = _sessions.erase(sit);
-					for (auto& session : _sessionPool)
-					{
-						if (session->getCallID() == callID)
-						{
-							session->release();
-							break;
-						}
-					}
+					const auto& other = isSrc ? s->getDest() : s->getSrc();
+					ending.emplace_back(cid, other ? other->getNumber() : std::string());
 				}
-				else
-				{
-					++sit;
-				}
+			}
+			for (const auto& [cid, other] : ending)
+			{
+				endCall(cid, extension, other, leaseExpired ? "registration lease expired"
+				                                            : "missed OPTIONS keepalive pings");
 			}
 
 			client->release();
