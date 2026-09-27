@@ -12,8 +12,15 @@ layout, and the security posture.
 > session plus a per-session CSRF token, and should be restricted to the local
 > link until Secure Boot v2 lands (see [THREAT_MODEL.md](THREAT_MODEL.md)).
 
+> [!NOTE]
+> **First end-to-end run on hardware: 2026-09-26, on `.244` (esp32s3 elite eth), fully
+> remote** with `tools/ota/remote_ota.sh` (#395): refusals (truncated and wrong-chip images, 422, no reboot),
+> a real OTA `ota_0 -> ota_1` that booted pending, marked itself valid and re-registered the phone, and a
+> rollback probe that never confirmed itself and was rolled back by the bootloader. Results: #395.
+> The historical caution below describes what CI still does not cover.
+>
 > [!CAUTION]
-> **The dual-slot OTA flow with rollback has never been executed end to end on
+> **CI still never executes the dual-slot OTA flow with rollback on
 > real hardware.** Nothing below has been proven on a device. Specifically:
 >
 > - **The only OTA code CI ever executes is the HTTP wrapper on the host build**,
