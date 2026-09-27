@@ -11,12 +11,21 @@ reader was attached, it was gone (#370's only panic was lost that way).
 `GET /api/status` (no login needed) carries:
 
 ```json
-"coredump": {"present": true, "size": 45184}
+"coredump": {"present": true, "size": 45184, "supported": true}
 ```
 
 `present` means the partition holds a dump with a plausible size **and** the
 ELF magic where a real one has it. Stale bytes from an older partition layout
 are not reported as a dump.
+
+`supported` says whether this board **could** keep a dump at all (#514). It is
+`false` when the firmware was built without coredump-to-flash, or when the
+board has **no `coredump` partition**: a board first flashed before #382 keeps
+its old partition table across every OTA (OTA never rewrites the table), so
+its panics are never saved. The firmware logs one warning at boot when that is
+the case. So `"present": false` means "no crash since the last erase" **only**
+when `supported` is `true`; with `"supported": false` it means nothing. The fix
+for such a board is a one-time serial flash of the current partition table.
 
 ## Read it back over HTTP
 
