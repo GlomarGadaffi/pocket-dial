@@ -38,6 +38,7 @@ declare -A BASELINE=(
 )
 
 "$CT" --version || { echo "::error::$CT not runnable"; exit 2; }
+[ -f "$BUILD/compile_commands.json" ] || { echo "::error::no $BUILD/compile_commands.json"; exit 2; }
 CHECKS="-*$(printf ',%s' "${!BASELINE[@]}")"
 LOG="${LOG:-clang-tidy-safety.log}"
 : > "$LOG"
