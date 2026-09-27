@@ -21,6 +21,22 @@
 #include <thread>
 #include <cstdint>
 
+#if defined(ESP_PLATFORM)
+#include "sdkconfig.h"     // CONFIG_SPIRAM: sizes the /api/status buffers below
+#endif
+// #410: bytes per /api/status output buffer (x kMaxConcurrentConnections, once,
+// at construction). 24 KB covers a full small office (~15 KB, Globox's #410
+// inventory); a board with PSRAM keeps all 96 KB there. Without PSRAM they would
+// come from internal DRAM, so that profile gets 8 KB x 4. Bigger bodies (32 ring
+// groups of 32 members is ~96 KB) are refused with a 500, counted.
+// ponytail: fixed buffer, not chunked streaming; stream if refusals show up.
+#ifndef POCKETDIAL_HTTP_STATUS_BUF_BYTES
+#if defined(ESP_PLATFORM) && !(defined(CONFIG_SPIRAM) && CONFIG_SPIRAM)
+#define POCKETDIAL_HTTP_STATUS_BUF_BYTES 8192
+#else
+#define POCKETDIAL_HTTP_STATUS_BUF_BYTES 24576
+#endif
+#endif
 #include "AdminAuth.hpp"   // AdminAuth::Role, used by requireAdmin()'s minRole param
 
 // Forward declaration — the HttpServer queries the SIP engine via this
@@ -79,6 +95,12 @@ public:
 	// Counted drops (#529), for /api/status.
 	uint32_t readDeadlineDrops() const { return _readDeadlineDrops.load(std::memory_order_relaxed); }
 	uint32_t perSourceRefusals() const { return _perSourceRefusals.load(std::memory_order_relaxed); }
+	// #410: /api/status is formatted into one of kMaxConcurrentConnections fixed
+	// buffers of this size, allocated once in the constructor. A body that would
+	// not fit is refused with a 500 (never truncated, never reallocated) and
+	// counted here, as is a request that found no buffer.
+	static constexpr size_t kStatusBufBytes = POCKETDIAL_HTTP_STATUS_BUF_BYTES;
+	uint32_t statusRefusals() const { return _statusRefusals.load(std::memory_order_relaxed); }
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only (#529): a short deadline so a slow-client test runs in well
 	// under a second instead of kReadDeadlineMs.
@@ -158,6 +180,10 @@ public:
 	// private), so a test can count its allocations with AllocGuard; and what
 	// the pre-#410 path put on the wire for the same response --
 	// buildResponseHead() + body -- to compare the two byte for byte.
+	// #410 phase 3: GET /api/status ON THE CALLING THREAD, for AllocGuard; and a
+	// smaller buffer capacity (<= kStatusBufBytes) so the refusal path is testable.
+	void sendApiStatusForTest(int sock, bool authenticated) { sendApiStatus(sock, authenticated); }
+	void setStatusCapForTest(size_t cap) { _statusCap = cap; }
 	void sendResponseForTest(int sock, int statusCode, std::string_view statusText,
 	                   std::string_view contentType, std::string_view body,
 	                   std::string_view extraHeader);
@@ -519,6 +545,11 @@ private:
 	void releaseSource(uint32_t addr);
 	std::atomic<uint32_t> _readDeadlineDrops{0};
 	std::atomic<uint32_t> _perSourceRefusals{0};
+	// #410: /api/status output buffers, one per connection slot (see kStatusBufBytes).
+	char* _statusBuf[kMaxConcurrentConnections]{};
+	std::atomic<bool> _statusBufBusy[kMaxConcurrentConnections]{};
+	std::atomic<uint32_t> _statusRefusals{0};
+	size_t _statusCap = kStatusBufBytes;
 	long _readDeadlineMs = kReadDeadlineMs;
 
 	// Track server uptime

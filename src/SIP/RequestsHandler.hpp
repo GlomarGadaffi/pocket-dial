@@ -147,6 +147,13 @@ public:
 	std::optional<std::shared_ptr<Session>> getSession(std::string_view callID);
 
 	// ── Dashboard query API (thread-safe) ────────────────────────────
+	// #410: calls f(const snapshot&) under _snapshotMutex, so /api/status formats
+	// the tables in place instead of copying them out. f must not block.
+	template <class F> void withSnapshot(F&& f)
+	{
+		std::lock_guard<std::mutex> lock(_snapshotMutex);
+		f(static_cast<const RegistrarSnapshot&>(_snapshot));
+	}
 	std::vector<std::pair<std::string, std::string>> getActiveClients();
 	std::vector<std::tuple<std::string, std::string, std::string, int>> getActiveSessions();
 	void forceDisconnect(const std::string& extension);
