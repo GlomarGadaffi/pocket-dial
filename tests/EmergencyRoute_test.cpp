@@ -590,3 +590,63 @@ TEST(EmergencyRoute, ALoopbackOnlyBoardSaysNoRouteEvenForAnOfferItCouldNotCarry)
 	EXPECT_TRUE(b.saw("no emergency route configured")) << b.dump();
 	EXPECT_FALSE(b.saw("no G.711 codec offered")) << b.dump();
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #550: no extension may be named like an emergency number.
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(EmergencyRoute, TheWholeEmergencySetIsReserved)
+{
+	for (const char* aor : {"911", "933", "9911", "9933"})
+	{
+		SCOPED_TRACE(aor);
+		EXPECT_TRUE(pbx::isReservedExtension(aor));
+		EXPECT_TRUE(pbx::isReservedOrPstnAor(aor));
+	}
+	for (const char* aor : {"912", "9912", "99111", "1911", "201"})
+	{
+		SCOPED_TRACE(aor);
+		EXPECT_FALSE(pbx::isReservedExtension(aor)) << "only the emergency set, nothing near it";
+	}
+}
+
+TEST(EmergencyRoute, APhoneCannotRegisterUnderAPrefixedEmergencyNumber)
+{
+	Bench b;
+
+	b.handler->handle(makeRegister("9911"));
+
+	EXPECT_EQ(b.count("SIP/2.0 403"), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 200"), 0u) << "9911 dials 911; it can't be an extension:\n" << b.dump();
+}
+
+TEST(EmergencyRoute, The555OwnNumberDialCannotHandTheLoopbackAnEmergencyNumber)
+{
+	// The state #550 now forbids, forced through a seam: a client named 9911
+	// dials 555, whose destination is the caller's own number. The loopback
+	// guard in originateAnchorCall() is the backstop that must still refuse.
+	Bench b;
+	b.handler->bindClientBypassingGuardsForTest("9911", addrFor(kHandsetIp));
+	const std::string body =
+		"v=0\r\no=- 0 0 IN IP4 " + std::string(kHandsetIp) + "\r\ns=-\r\n"
+		"c=IN IP4 " + std::string(kHandsetIp) + "\r\nt=0 0\r\n"
+		"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	const std::string raw =
+		"INVITE sip:555@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKer550\r\n"
+		"From: <sip:9911@server>;tag=er550\r\n"
+		"To: <sip:555@server>\r\n"
+		"Call-ID: er-550\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:9911@" + std::string(kHandsetIp) + ":5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+
+	b.handler->handle(RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp)));
+
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "")
+		<< "the simulator must never be asked to dial 9911";
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 200"), 0u) << b.dump();
+}

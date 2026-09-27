@@ -657,6 +657,14 @@ public:
 		std::lock_guard<std::mutex> lock(_mutex);
 		_registrar.adoptDeviceForTest(mac, ext, state);
 	}
+	// Test-only (#550): bind a client WITHOUT onRegister's identity guard, so a
+	// test can stand up the state the guard now forbids (a client named like an
+	// emergency number) and pin the defence-in-depth checks behind it.
+	void bindClientBypassingGuardsForTest(const std::string& ext, const sockaddr_in& addr)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		(void)allocateClient(ext, addr, 3600);
+	}
 #endif
 
 	// ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
