@@ -878,7 +878,12 @@ private:
 	// Called synchronously on the SIP thread with _mutex already held, from
 	// inside SipTrunk::handleResponse()/sweep(). See SipTrunk::Listener for the
 	// ordering guarantees each one carries.
-	void onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia) override;
+	void onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia,
+		const std::shared_ptr<SipMessage>& progress) override;
+	// Issue #400: point relay pair `slot` at the carrier's SDP in `carrier` and
+	// start its handset-facing half if not already up. 0 on success, else the
+	// status to refuse the handset with (502 unusable carrier RTP, 500 local).
+	int bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessage>& carrier);
 	void onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 		const std::shared_ptr<SipMessage>& ok) override;
 	void onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status) override;
