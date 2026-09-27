@@ -104,6 +104,22 @@ TEST(CdrPersistBlob, EmptyRingHasZeroLength)
 	EXPECT_STREQ(blob.text, "");
 }
 
+// #476 review (BLOCKING): an empty ring is persisted as an ERASE command, never
+// as an empty blob -- that is how clearAll() and the factory reset remove the
+// stored history. The flag is set by serializeForPersist() itself, so it is
+// pinned here on the host; persist() only hands the blob to the writer.
+TEST(CdrPersistBlob, AnEmptyRingIsAnEraseCommandAndAFullOneIsNot)
+{
+	std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS> empty{};
+	static CdrRingBlob blob;   // reused, as persist()'s static is
+	CdrRing::serializeForPersist(maxRing(), 0, POCKETDIAL_CDR_RECORDS, blob);
+	EXPECT_FALSE(blob.erase) << "a ring with records is written, not erased";
+	CdrRing::serializeForPersist(empty, 0, 0, blob);
+	EXPECT_TRUE(blob.erase) << "an empty ring must erase the stored keys (clearAll / factory reset)";
+	CdrRing::serializeForPersist(maxRing(), 0, 1, blob);
+	EXPECT_FALSE(blob.erase) << "a reused blob must not carry a stale erase into the next write";
+}
+
 // loadFromText() keeps at most POCKETDIAL_CDR_RECORDS records however long the
 // persisted text is (a corrupt or hand-edited value must not overrun the ring).
 TEST(CdrPersistBlob, LoadingMoreLinesThanTheRingHoldsStopsAtTheRingSize)

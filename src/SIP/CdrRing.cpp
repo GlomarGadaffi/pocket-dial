@@ -332,7 +332,11 @@ void CdrRing::serializeForPersist(
 		appendUInt(out.text, cap, used, static_cast<uint64_t>(r.result), 1, '\n');
 	}
 	out.len = static_cast<uint16_t>(used);
-	out.erase = false;
+	// Issue #470: an empty ring is persisted as the ABSENCE of one (clearAll(),
+	// including the factory reset), so the writer erases the keys instead of
+	// storing an empty blob -- and that erase is allowed during a reset. Set
+	// here rather than in persist() so it is host-testable (#476 review).
+	out.erase = (count == 0);
 }
 
 uint32_t CdrRing::persistFailureCount()   { return persistFailures().load(); }
@@ -550,11 +554,7 @@ void CdrRing::persist()
 	// static safe, just enforced by the engine's lock instead of by this
 	// function running on a single dedicated task.
 	static CdrRingBlob blob;
-	serializeForPersist(_ring, _head, _count, blob);
-	// Issue #470: an empty ring is persisted as the ABSENCE of one (clearAll(),
-	// including the factory reset), so the writer erases the keys instead of
-	// storing an empty blob -- and that erase is allowed during a reset.
-	blob.erase = (_count == 0);
+	serializeForPersist(_ring, _head, _count, blob);   // sets blob.erase for an empty ring
 
 	// Non-blocking: never stall the caller (which may be holding
 	// RequestsHandler::_mutex, or be a real-time task) waiting for queue
@@ -572,9 +572,17 @@ void CdrRing::persist()
 	// memory pressure -- exactly the condition #273 was investigating, so
 	// this path degrading to "CDR not persisted this call" instead of a
 	// second crash matters more here than almost anywhere else in the tree.
+	//
+	// xQueueOverwrite, not xQueueSend (#476 review): with a depth-1 queue a
+	// full queue made xQueueSend drop THIS blob and keep the older one. When
+	// this blob is the reset's erase command, that left the stale snapshot to be
+	// written and the history survived the reset. Every blob is a complete
+	// snapshot, so the newest must always win -- which is exactly what
+	// overwrite does, and it never blocks.
+	static_assert(kQueueDepth == 1, "xQueueOverwrite is only valid on a length-1 queue");
 	if (cdrPersistQueue() != nullptr)
 	{
-		xQueueSend(cdrPersistQueue(), &blob, 0);
+		(void)xQueueOverwrite(cdrPersistQueue(), &blob);   // always pdPASS on a length-1 queue
 	}
 #endif
 }
