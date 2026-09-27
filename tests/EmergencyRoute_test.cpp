@@ -501,7 +501,7 @@ TEST(EmergencyRoute, TheDashboardShowsTheBannerWhileTheRouteIsNone)
 	std::string page;
 	for (const auto& part : CGA_INDEX_HTML_PARTS) page.append(part.data, part.size);
 
-	const size_t banner = page.find("id=\"e911-banner\"");
+	const size_t banner = page.find("id=\"e911-route-banner\"");
 	ASSERT_NE(banner, std::string::npos) << "no emergency-route banner on the dashboard";
 	const size_t tagEnd = page.find('>', banner);
 	EXPECT_NE(page.substr(banner, tagEnd - banner).find("display:none"), std::string::npos)

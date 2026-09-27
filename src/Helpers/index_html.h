@@ -392,7 +392,7 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
 </div>
 
 <!-- #521: shown while /api/status says no real provider can carry a 911 call. -->
-<div class="e911" id="e911-banner" role="alert" style="display:none">&#9888; <b>Emergency calling is not configured.</b> This system refuses 911 and 933 calls until a SIP trunk (<a href="/setup/trunk">/setup/trunk</a>) or a telephony provider (Interconnect) is set up. Keep another way to call 911 near every phone.</div>
+<div class="e911" id="e911-route-banner" role="alert" style="display:none">&#9888; <b>Emergency calling is not configured.</b> This system refuses 911 and 933 calls until a SIP trunk (<a href="/setup/trunk">/setup/trunk</a>) or a telephony provider (Interconnect) is set up. Keep another way to call 911 near every phone.</div>
 
 <main>
 
@@ -1383,7 +1383,7 @@ function fetchStatus(){
    banner stays up on every refresh until that changes. An ABSENT field (older
    firmware, or no SIP engine attached yet) says nothing either way. */
 function applyEmergencyRoute(d){
-  var b=$("e911-banner");
+  var b=$("e911-route-banner");
   if(!b||!d||typeof d.emergencyRoute==="undefined")return;
   b.style.display=d.emergencyRoute==="none"?"":"none";
 }
