@@ -298,6 +298,14 @@ if(POCKETDIAL_OTA_ROLLBACK_PROBE)
     message(WARNING "SipServer: OTA ROLLBACK PROBE image -- bench only, it never marks itself valid (#395)")
 endif()
 
+# Issue #473 / #451 P4: BENCH-ONLY reset-interruption probe. POST /api/factory-reset
+# opens the reset journal and restarts before erasing anything, standing in for a
+# power cut nobody can pull on a remote bench. Never ship it.
+if(POCKETDIAL_RESET_INTERRUPT_PROBE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_RESET_INTERRUPT_PROBE=1)
+    message(WARNING "SipServer: RESET INTERRUPT PROBE image -- bench only, a factory reset restarts before erasing (#473)")
+endif()
+
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         POCKETDIAL_PCAP_RING_SIZE=${POCKETDIAL_PCAP_RING_SIZE})

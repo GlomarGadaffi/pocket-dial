@@ -3568,6 +3568,16 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// A journal write failure is logged and counted inside begin(); the reset
 	// proceeds regardless (#481 review).
 	(void)resetjournal::begin();
+#if defined(POCKETDIAL_RESET_INTERRUPT_PROBE) && defined(ESP_PLATFORM)
+	// BENCH-ONLY (#451 P4, #473): stands in for a power cut in the middle of a
+	// reset, which nobody can pull on a remote bench. The journal is open and
+	// nothing is erased yet, so this restart is exactly "the reset began and
+	// never finished": the next boot must report resetIncomplete, with the
+	// record surviving the restart from flash (resetJournal:"flash"). Nothing
+	// is wiped, so the board keeps its config. Never ship it (CMake warns).
+	ESP_LOGW("factory_reset", "RESET INTERRUPT PROBE: journal begun, restarting before any erase (#473)");
+	esp_restart();
+#endif
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP
 	// (NVS) and host (in-memory).
