@@ -330,6 +330,9 @@ add_executable(sip_parser_tests
     # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real
     # µ-law rim, a leg leaving mid-conference, and the RequestsHandler 888 intercept.
     ConferenceRoom_test.cpp
+    # Issue #513: a quick 888 re-dial skips a leg whose RTP tasks are still
+    # stopping instead of failing the join (486).
+    ConferenceRejoin_test.cpp
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp

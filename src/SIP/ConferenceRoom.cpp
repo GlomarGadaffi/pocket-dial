@@ -98,6 +98,13 @@ int ConferenceRoom::join(const std::string& callID, const std::string& ext,
 		Leg& leg = _legs[static_cast<size_t>(i)];
 		if (leg.inUse) continue;
 
+		// Issue #513: leave() frees a slot at once, but on ESP its RTP tasks keep
+		// winding down for a few ticks and start() refuses until they exit. A
+		// quick re-dial took that same first free slot, failed to start and was
+		// answered 486. Skip a slot that cannot start yet and try the next free
+		// one; the room refuses only when no free slot can start.
+		if (!leg.bridge.canStart()) continue;
+
 		// startBridge() attaches the MixBus port and, on any failure past that point,
 		// unwinds it itself — so a false return leaves this slot exactly as free as it
 		// was, with no port leaked.
