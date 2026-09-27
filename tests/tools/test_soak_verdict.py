@@ -139,6 +139,26 @@ class SoakVerdictTest(unittest.TestCase):
             st["coredump"] = {"present": True, "size": 47264}
         self.assertEqual(failed(s), set())
 
+    def test_a_board_without_a_coredump_partition_fails_unless_accepted(self):
+        # #531: supported:false means no crash could ever leave a core, so a
+        # "no new coredump" pass would prove nothing.
+        s = clean_run()
+        for t, st in s:
+            st["coredump"] = {"supported": False, "present": False, "size": 0}
+        self.assertEqual(failed(s), {"no-new-coredump"})
+        c = cfg()
+        c.allow_no_coredump = True
+        self.assertEqual({n for n, ok, _ in sv.evaluate(s, 0, c) if not ok}, set())
+
+    def test_supported_true_is_judged_as_before(self):
+        s = clean_run()
+        for t, st in s:
+            st["coredump"] = {"supported": True, "present": False, "size": 0}
+        self.assertEqual(failed(s), set())
+        for i in range(2000, len(s)):
+            s[i][1]["coredump"] = {"supported": True, "present": True, "size": 47264}
+        self.assertEqual(failed(s), {"no-new-coredump"})
+
     def test_a_stack_below_the_floor_fails(self):
         s = clean_run()
         s[1234][1]["stackHwm_sip_server_task"] = 400

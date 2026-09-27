@@ -12,7 +12,7 @@ Every field judged here is on the unauthenticated route, so the logger needs no
 credential.
 
 Usage:
-    python3 tools/soak/soak_verdict.py soak-status.jsonl [--min-hours 4] [--json]
+    python3 tools/soak/soak_verdict.py soak-status.jsonl [--min-hours 4] [--allow-no-coredump] [--json]
 Exit status 0 = PASS, 1 = FAIL. stdlib only.
 """
 
@@ -38,6 +38,10 @@ class Config:
         self.min_free_internal = 16384    # minFreeHeapInternal at the end
         self.min_largest_block = 8192     # smallest idle largestFreeBlockInternal
         self.min_stack_hwm = 512          # bytes free, every stackHwm_* field
+        # A board with no coredump partition reports coredump.supported:false
+        # (#514/#531); no-new-coredump then cannot see a crash, so it fails
+        # unless the operator accepts that. no-reboot still catches a panic.
+        self.allow_no_coredump = False
 
 
 def default_config():
@@ -147,7 +151,13 @@ def evaluate(samples, bad, cfg):
     add("no-reboot", not reboots and len(reasons) <= 1, detail)
 
     cds = [s.get("coredump") for _, s in samples if isinstance(s.get("coredump"), dict)]
-    if cds:
+    if any(c.get("supported") is False for c in cds):
+        detail = ("the board reports coredump supported:false (no coredump partition), "
+                  "so this check cannot see a crash; no-reboot still does")
+        if not cfg.allow_no_coredump:
+            detail += " (pass --allow-no-coredump to accept that)"
+        add("no-new-coredump", cfg.allow_no_coredump, detail)
+    elif cds:
         first, last = cds[0], cds[-1]
         was_present = first.get("present") is True
         appeared = (not was_present) and any(c.get("present") is True for c in cds)
@@ -263,6 +273,8 @@ def main(argv=None):
     ap.add_argument("--min-hours", type=float, default=4.0)
     ap.add_argument("--warmup-s", type=float, default=900)
     ap.add_argument("--max-call-s", type=int, default=180)
+    ap.add_argument("--allow-no-coredump", action="store_true",
+                    help="accept a board with no coredump partition (supported:false)")
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
     args = ap.parse_args(argv)
 
@@ -270,6 +282,7 @@ def main(argv=None):
     cfg.min_duration_s = args.min_hours * 3600
     cfg.warmup_s = args.warmup_s
     cfg.max_call_s = args.max_call_s
+    cfg.allow_no_coredump = args.allow_no_coredump
 
     samples, bad = load(args.log)
     checks = evaluate(samples, bad, cfg)
