@@ -25,6 +25,7 @@ namespace CoreDumpStore
 #include <mutex>
 
 #include "esp_core_dump.h"
+#include "esp_log.h"
 #include "esp_flash.h"
 #include "esp_partition.h"
 
@@ -56,7 +57,13 @@ namespace CoreDumpStore
 		Info probe(size_t& addr)
 		{
 			Info info;
-			info.supported = true;
+			// #514: OTA never rewrites the partition table, so a board first
+			// flashed before #382 added the coredump partition has nowhere to
+			// save a dump. Report that as unsupported rather than "no dump",
+			// which reads as "no crash happened".
+			info.supported = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+				ESP_PARTITION_SUBTYPE_DATA_COREDUMP, nullptr) != nullptr;
+			if (!info.supported) return info;
 			size_t size = 0;
 			if (locate(addr, size))
 			{
@@ -96,6 +103,13 @@ namespace CoreDumpStore
 		// which maps the partition -- init-time, before the server serves.
 		size_t addr = 0;
 		const Info info = probe(addr);
+		if (!info.supported)
+		{
+			// Once per boot (#514): the reason no panic on this board is ever kept.
+			ESP_LOGW("CoreDumpStore", "no coredump partition on flash: a panic cannot be "
+				"saved (the partition table predates #382; OTA never rewrites it, a serial "
+				"flash of the current table does)");
+		}
 		Summary out;
 		if (info.present)
 		{
@@ -192,6 +206,7 @@ namespace CoreDumpStore
 	{
 		std::mutex g_mutex;
 		std::vector<uint8_t> g_image;   // stands in for the coredump partition
+		bool g_partition = true;        // does the board have that partition (#514)
 		Info g_info;                    // the cached result, as on the board (#405)
 		bool g_infoPrimed = false;
 		uint32_t g_flashAccesses = 0;   // probes + reads of g_image
@@ -202,7 +217,7 @@ namespace CoreDumpStore
 
 	bool presentLocked()
 	{
-		return looksLikeDump(g_image.data(), g_image.size(),
+		return g_partition && looksLikeDump(g_image.data(), g_image.size(),
 			static_cast<uint32_t>(g_image.size()), kFakePartitionSize);
 	}
 
@@ -212,7 +227,7 @@ namespace CoreDumpStore
 	{
 		++g_flashAccesses;
 		Info info;
-		info.supported = !g_image.empty();
+		info.supported = g_partition;   // as on the board: the partition exists (#514)
 		info.present = presentLocked();
 		info.size = info.present ? static_cast<uint32_t>(g_image.size()) : 0;
 		return info;
@@ -223,6 +238,14 @@ namespace CoreDumpStore
 		std::lock_guard<std::mutex> lock(g_mutex);
 		g_image = std::move(image);
 		g_info = probeLocked();   // a panic + reboot: the next boot's prime()
+		g_infoPrimed = true;
+	}
+
+	void setPartitionForTest(bool present)
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_partition = present;
+		g_info = probeLocked();   // as prime() would find it at the next boot
 		g_infoPrimed = true;
 	}
 
@@ -270,6 +293,7 @@ namespace CoreDumpStore
 	bool erase()
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
+		if (!g_partition) return false;   // as on the board: nothing to erase
 		g_image.clear();
 		// As on the board: erase() itself keeps the cache truthful.
 		g_info.present = false;

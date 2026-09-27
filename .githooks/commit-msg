@@ -27,11 +27,16 @@
 # exactly that shape.
 
 check_message() {
-    # $1: text to check. Anchored to start-of-line, exact case, matching the
-    # literal trailer this project's tooling and harnesses actually emit --
-    # not a loose match that could false-positive on commit-message prose
-    # mentioning the words claude session mid-sentence.
-    printf '%s\n' "$1" | grep -qn '^Claude-Session:'
+    # $1: text to check. The SAME pattern as the CI job (commit-hygiene.yml,
+    # TRAILER_RE), so the two can never disagree (issue #341):
+    #   ^claude-session:                     the trailer, any case (gap 3)
+    #   claude-session:[[:space:]]*https?://  the trailer anywhere in a line,
+    #                                        followed by its URL (gap 4: a
+    #                                        72-column reflow joins it onto the
+    #                                        Co-authored-by line)
+    # Prose that merely names the trailer, and a bare session URL on its own
+    # line, do not match.
+    printf '%s\n' "$1" | grep -Eiq '(^claude-session:)|(claude-session:[[:space:]]*https?://)'
 }
 
 if [ "$1" = "--selftest" ]; then
@@ -39,23 +44,36 @@ if [ "$1" = "--selftest" ]; then
 
 Co-authored-by: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_selftest"
+    bad_lower="fix: something
+
+claude-session: https://claude.ai/code/session_selftest"
+    bad_reflowed="fix: something
+
+Co-authored-by: Claude Sonnet 5 <noreply@anthropic.com> Claude-Session: https://claude.ai/code/session_selftest"
     good="fix: something
 
 Co-authored-by: Claude Sonnet 5 <noreply@anthropic.com>"
+    good_prose="docs: the Claude-Session trailer stays forbidden (see #326)"
 
-    if check_message "$bad"; then
-        echo "selftest: correctly detects a trailer in a bad message"
-    else
-        echo "FAIL: did not detect a known-bad message"
-        exit 1
-    fi
+    for name in bad bad_lower bad_reflowed; do
+        eval "msg=\$$name"
+        if check_message "$msg"; then
+            echo "selftest: correctly detects a trailer ($name)"
+        else
+            echo "FAIL: did not detect a known-bad message ($name)"
+            exit 1
+        fi
+    done
 
-    if check_message "$good"; then
-        echo "FAIL: false positive on a known-good message"
-        exit 1
-    else
-        echo "selftest: correctly passes a clean message"
-    fi
+    for name in good good_prose; do
+        eval "msg=\$$name"
+        if check_message "$msg"; then
+            echo "FAIL: false positive on a known-good message ($name)"
+            exit 1
+        else
+            echo "selftest: correctly passes a clean message ($name)"
+        fi
+    done
 
     exit 0
 fi

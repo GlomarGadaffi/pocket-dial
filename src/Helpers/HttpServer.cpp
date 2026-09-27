@@ -567,6 +567,12 @@ void HttpServer::handleClient(int clientSock)
 	}
 
 	HttpRequest req = parseRequest(raw);
+	// Issue #528: the peer address captured above, on EVERY request -- only the
+	// OTA/MoH streaming branch used to set it. Without it the login lockout keyed
+	// every client to the same "" bucket, so one host guessing passwords locked
+	// the real admin out too, and Cisco SPA model-keyed provisioning never ran
+	// its ARP lookup.
+	req.clientIp = peerIp;
 	// Out-param for the two telephony-config routes below, whose slot index is
 	// a URL path segment rather than a form param (see parseTelephonyConfigSlotPath).
 	size_t telSlotIdx = 0;
@@ -1660,6 +1666,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	bool e911Configured = false;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate = 0;
+	uint64_t droppedNoPool = 0;    // Issue #443/#444: discarded before handle()
+	uint64_t droppedOversize = 0;
+	uint64_t recvErrors = 0;
+	int lastRecvErrno = 0;
 
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
 	if (handler != nullptr)
@@ -1677,6 +1687,11 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		e911Configured = handler->isE911Configured();   // #450
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate = handler->getDroppedRate();
+		const DropProbe& probe = handler->getDropProbe();
+		droppedNoPool = probe.count(DropProbe::Reason::NoPool);
+		droppedOversize = probe.count(DropProbe::Reason::Oversize);
+		recvErrors = probe.recvErrorCount();
+		lastRecvErrno = probe.lastRecvErrno();
 	}
 
 	std::string displayIp = _ip;
@@ -1711,6 +1726,15 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// do not.
 	json << "\"droppedInvalid\":" << droppedInvalid << ",";
 	json << "\"droppedRate\":" << droppedRate << ",";
+	// Issue #443/#444: discarded before handle() -- NOT part of packetsDropped.
+	// No message was ever built for these; the ring below records their source
+	// (no_pool, oversize with the datagram's real length). recvErrors are failed
+	// receives (no datagram, so no source); the receive timeout's idle wake is
+	// not counted.
+	json << "\"droppedNoPool\":" << droppedNoPool << ",";
+	json << "\"droppedOversize\":" << droppedOversize << ",";
+	json << "\"recvErrors\":" << recvErrors << ",";
+	json << "\"lastRecvErrno\":" << lastRecvErrno << ",";
 	json << "\"recentDrops\":[";
 	if (authenticated && handler != nullptr)
 	{
@@ -1951,8 +1975,11 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// summary stay behind /api/coredump*.
 	{
 		const CoreDumpStore::Info cd = CoreDumpStore::query();
+		// `supported` (#514): false when the board has no coredump partition,
+		// so "present":false is not misread as "no crash happened".
 		json << ",\"coredump\":{\"present\":" << (cd.present ? "true" : "false")
-		     << ",\"size\":" << cd.size << "}";
+		     << ",\"size\":" << cd.size
+		     << ",\"supported\":" << (cd.supported ? "true" : "false") << "}";
 	}
 
 	// Issue #328: L2 transmit-path health, in one object, on the UNGATED route.
@@ -2081,6 +2108,9 @@ void HttpServer::sendApiMetrics(int sock)
 	uint64_t sdpRejected  = 0;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate  = 0;
+	uint64_t droppedNoPool = 0;    // Issue #443/#444
+	uint64_t droppedOversize = 0;
+	uint64_t recvErrors = 0;
 	size_t   clientCount  = 0;
 	size_t   sessionCount = 0;
 
@@ -2096,6 +2126,10 @@ void HttpServer::sendApiMetrics(int sock)
 		dropped      = handler->getPacketsDropped();
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate  = handler->getDroppedRate();
+		const DropProbe& probe = handler->getDropProbe();
+		droppedNoPool   = probe.count(DropProbe::Reason::NoPool);
+		droppedOversize = probe.count(DropProbe::Reason::Oversize);
+		recvErrors      = probe.recvErrorCount();
 		sdpRejected  = handler->getSdpRejected();
 		clientCount  = handler->getClientCount();
 		sessionCount = handler->getSessionCount();
@@ -2153,6 +2187,19 @@ void HttpServer::sendApiMetrics(int sock)
 	        "The refused share of pocketdial_packets_dropped_total: allowlist or per-IP "
 	        "rate limit (issue #430).",
 	        droppedRate);
+	counter("pocketdial_packets_dropped_no_pool_total",
+	        "SIP datagrams discarded before parsing because the message pool and its "
+	        "bounded heap fallback were spent (issue #443). Not in "
+	        "pocketdial_packets_dropped_total.",
+	        droppedNoPool);
+	counter("pocketdial_packets_dropped_oversize_total",
+	        "SIP datagrams longer than the receive buffer, refused rather than parsed "
+	        "truncated (issue #444). Not in pocketdial_packets_dropped_total.",
+	        droppedOversize);
+	counter("pocketdial_sip_recv_errors_total",
+	        "Failed SIP socket receives, excluding the receive timeout's idle wake "
+	        "(issue #443).",
+	        recvErrors);
 	counter("pocketdial_sdp_rejected_total",
 	        "SDP bodies refused by the admission gate since boot, whether answered 488 "
 	        "or dropped silently (docs/THREAT_MODEL.md T-7).",

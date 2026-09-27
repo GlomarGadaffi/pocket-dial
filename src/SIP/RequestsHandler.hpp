@@ -158,11 +158,23 @@ public:
 	uint64_t getDroppedInvalid() const;
 	uint64_t getDroppedRate() const;
 	const DropProbe& getDropProbe() const;
+	// Issue #443/#444: discards made BEFORE handle() sees a datagram -- by the
+	// UDP receive loop (oversize, empty, a failed receive) or by SipServer when
+	// the message pool is spent. Called on the receive task; never allocates or
+	// logs. An empty datagram counts as Invalid AND in packetsDropped, so #430's
+	// "invalid + rate == packetsDropped" still holds; NoPool and Oversize have
+	// their own counts, outside packetsDropped (which is handle()'s refusals).
+	void noteRxDiscard(DropProbe::Reason reason, const sockaddr_in& src,
+	                   std::string_view bytes, size_t fullLen);
+	void noteRecvError(int err);
 	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
 	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
 	// drop (responses, ACK).
 	uint64_t getSdpRejected() const;
+	// Issue #424: responses drainOutbox() refused to send because they answered
+	// a response or an ACK. Any non-zero value is a handler bug the guard caught.
+	uint32_t getRepliesRefused() const;
 	size_t getClientCount();
 	size_t getSessionCount();
 	// Legs currently mixed on the meet-me conference (virtual extension 888); 0 while
@@ -364,6 +376,11 @@ public:
 	// Age every live trunk dialog past its deadline, so one tick() exercises
 	// the no-answer path without a 60-second test.
 	void expireTrunkDeadlinesForTest();
+
+	// Issue #408: send every pending register beep now and deliver it through
+	// the send callback, as tick() would once RegisterBeeper::kAfterRegisterDelay
+	// has passed. Does not depend on tick()'s 1 s gate.
+	void fireRegisterBeepsForTest();
 
 	// What the resolver currently knows about the configured SBC host. Refused
 	// means nothing is known and nothing is in flight; anything else means a
@@ -1335,6 +1352,7 @@ public:
 	void sweepVoicemailLegsForTest()
 	{
 		sweepVoicemailLegs(std::chrono::steady_clock::now());
+		_noReplyInbound.reset();
 		auto localOutbox = drainOutbox();
 		auto localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -1966,6 +1984,45 @@ private:
 	// and the shared_ptr in `request` outlives the whole pass.
 	const SipMessage* _passThroughMsg = nullptr;
 
+	// Issue #424: the inbound message of this handle() pass when it is one that
+	// must never be answered, a response (RFC 3261 §17.1) or an ACK (§17.2.1);
+	// null otherwise. drainOutbox() refuses any response addressed back to its
+	// sender in the same transaction (same Call-ID and CSeq), whichever handler
+	// built it. That makes "reply to a response or an ACK" impossible at the one
+	// exit, rather than one handler claim at a time: endHandle()'s not-found
+	// branch did it for an unclaimed 100 Trying (the register beep) and for an
+	// ACK (park retrieve), and it has 35 callers.
+	//
+	// A shared_ptr, unlike _passThroughMsg, because drainOutbox() dereferences
+	// it: a stale one can then only cost a refusal, never a dangling read. It is
+	// reset after handle()'s drain and at the top of every other drain path.
+	std::shared_ptr<SipMessage> _noReplyInbound;
+	// Refuses (and counts, and logs) `msg` if it is a reply to _noReplyInbound.
+	bool isReplyToUnanswerable(const sockaddr_in& addr, const SipMessage& msg);
+
+	// #424 review (Sonny-OG): a RELAYED response is exempt by marking, never by
+	// address. The address can't tell them apart: a multi-line handset (the T29
+	// on .244) registers every line from one IP:port, so on a line1 -> line2 call
+	// the callee's relayed 200 goes to the very address it came from, with the
+	// same Call-ID and CSeq, and is byte-for-byte a "reply" except for intent.
+	// Relays are exempt when they are the inbound object itself (pointer
+	// identity, as for _passThroughMsg) or were marked by markRelay() -- which
+	// endHandle()'s found branch does for every message it forwards, cloned or
+	// not. Reset on every handle() pass. Raw pointers, compared only.
+	//
+	// Fixed capacity, no allocation. A pass that marks more than this many
+	// relays (none does today: a response is relayed to one leg) sets the
+	// overflow flag, and drainOutbox() then refuses nothing for that pass and
+	// logs it: dropping a real relay kills a call, while a missed refusal is
+	// only the pre-#424 behaviour.
+	static constexpr size_t kRelayMarkSlots = 8;
+	std::array<const SipMessage*, kRelayMarkSlots> _relayMarks{};
+	size_t _relayMarkCount = 0;
+	bool   _relayMarkOverflow = false;
+	void markRelay(const SipMessage* msg);
+	bool isMarkedRelay(const SipMessage* msg) const;
+	void clearRelayMarks();
+
 	// ── RFC 4733 DTMF hand-off ring ─────────────────────────────────────────────
 	// Producer: any RTP receive task (one per conference leg / anchor bridge).
 	// Consumer: the SIP thread, via drainDtmfInbox() from handle() and tick().
@@ -2003,6 +2060,7 @@ private:
 	std::atomic<uint64_t> _packetsDropped{0};
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
 	// count is the packet-loss signal this layer exists to absorb, so it is worth
