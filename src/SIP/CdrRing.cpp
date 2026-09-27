@@ -8,6 +8,7 @@
 
 #include "PbxPersist.hpp"
 #include "ResetGuard.hpp"   // #473: no data writes while a factory reset runs
+#include "RefillVector.hpp"   // #463: in-place snapshot refill
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "nvs_flash.h"
@@ -339,6 +340,12 @@ void CdrRing::serializeForPersist(
 	out.erase = (count == 0);
 }
 
+CdrRing::PersistAction CdrRing::persistAction(bool incomingIsErase, bool resetInProgress)
+{
+	return (resetInProgress && !incomingIsErase) ? PersistAction::Suppress
+	                                             : PersistAction::OverwriteQueued;
+}
+
 uint32_t CdrRing::persistFailureCount()   { return persistFailures().load(); }
 uint32_t CdrRing::persistSuppressedCount() { return persistSuppressed().load(); }
 
@@ -439,14 +446,20 @@ const CallDetailRecord& CdrRing::record(const std::shared_ptr<Session>& session,
 std::vector<CallDetailRecord> CdrRing::snapshot() const
 {
 	std::vector<CallDetailRecord> out;
-	out.reserve(_count);
+	snapshotInto(out);
+	return out;
+}
+
+void CdrRing::snapshotInto(std::vector<CallDetailRecord>& out) const
+{
+	Refill<CallDetailRecord> rows(out);
 	for (size_t i = 0; i < _count; ++i)
 	{
 		// _head points one past the newest; walk backwards with wrap.
 		size_t idx = (_head + POCKETDIAL_CDR_RECORDS - 1 - i) % POCKETDIAL_CDR_RECORDS;
-		out.push_back(_ring[idx]);
+		// Copy-assign: the two strings reuse the slot's capacity (#463).
+		rows.next() = _ring[idx];
 	}
-	return out;
 }
 
 std::string CdrRing::lastCallerFor(std::string_view calleeExt) const
@@ -580,9 +593,18 @@ void CdrRing::persist()
 	// snapshot, so the newest must always win -- which is exactly what
 	// overwrite does, and it never blocks.
 	static_assert(kQueueDepth == 1, "xQueueOverwrite is only valid on a length-1 queue");
-	if (cdrPersistQueue() != nullptr)
+	if (persistAction(blob.erase, resetguard::inProgress()) == PersistAction::Suppress)
 	{
-		(void)xQueueOverwrite(cdrPersistQueue(), &blob);   // always pdPASS on a length-1 queue
+		// A call that ended after clearAllCallHistory() during a factory reset:
+		// overwriting the queued ERASE with it would lose the erase (the writer
+		// refuses data during a reset). Counted, never enqueued (#476 review).
+		persistSuppressed().fetch_add(1);
+		return;
+	}
+	if (cdrPersistQueue() != nullptr &&
+		xQueueOverwrite(cdrPersistQueue(), &blob) != pdPASS)   // pdPASS by contract on length 1; checked anyway
+	{
+		persistFailures().fetch_add(1);
 	}
 #endif
 }

@@ -59,8 +59,10 @@ The proposed `src/Media/` directory was never created; everything landed under `
 > trunk call from a Yealink T29 answered by a person **with two-way audio** (2026-09-13). That
 > call ran the handset leg through `RtpReceiver` / `RtpSender` / `MediaBridge` / `PlayoutBuffer`
 > on a real board, so it is genuine on-target proof of the **anchor-bridge shape** of this
-> media stack. It proves nothing about `440` or `888`: the tone sender's standalone path and
-> the whole `MixBus` / `ConferenceRoom` mixer have **never been run on hardware at all**.
+> media stack. It proves nothing about `440`, whose standalone tone path has **never been run
+> on hardware**. The `MixBus` / `ConferenceRoom` mixer (`888`) **has** since run on `.244`
+> (2026-09-27), and on `main` it panics the board (#498: `MixBus::tick`'s frames overflow the
+> 3,072-byte `conf_mix_tick` stack; fix #499).
 
 ### 0.2 What is still absent
 

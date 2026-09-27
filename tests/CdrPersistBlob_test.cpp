@@ -204,3 +204,20 @@ TEST(ResetGuard, WritersAreRefusedAfterBeginAndDrainedBeforeTheErase)
 
 	resetguard::resetForTest();
 }
+
+// #476 review (BLOCKING + MAJOR): persist()'s enqueue decision, pinned on the host.
+// Newest wins: every blob is a full snapshot, so a queued one is overwritten.
+// But during a factory reset a DATA snapshot (a call that ended after
+// clearAllCallHistory()) must not displace the reset's queued ERASE -- the writer
+// refuses data during a reset, so the erase would be lost with it.
+TEST(CdrPersistBlob, NewestSnapshotWinsButNeverDisplacesAResetsErase)
+{
+	using A = CdrRing::PersistAction;
+	EXPECT_EQ(CdrRing::persistAction(/*erase=*/false, /*reset=*/false), A::OverwriteQueued)
+		<< "outside a reset the newest snapshot replaces a queued one";
+	EXPECT_EQ(CdrRing::persistAction(true, false), A::OverwriteQueued);
+	EXPECT_EQ(CdrRing::persistAction(true, true), A::OverwriteQueued)
+		<< "the reset's own erase always goes through";
+	EXPECT_EQ(CdrRing::persistAction(false, true), A::Suppress)
+		<< "a data snapshot during a reset must not overwrite the queued erase";
+}
