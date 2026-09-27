@@ -68,6 +68,8 @@
 // Issue #185: heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) for
 // sendApiStatus's minFreeHeapSpiram field.
 #include "esp_heap_caps.h"
+// Issue #496 / #509 review: the IPv4 input guard's counts for /api/status.
+#include "Ip4InputGuard.h"
 // Issue #366: esp_pthread_set_cfg() to size the per-connection thread stack
 // independently of CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT.
 #include "esp_pthread.h"
@@ -1526,6 +1528,19 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"wifiCapable\":false,";
 #endif
 	json << "\"uptime\":" << uptimeSec << ",";
+#if defined(ESP_PLATFORM)
+	// Issue #496 / #509 review: frames and fragments the IPv4 input guard
+	// (Ip4InputGuard.h) refused or copied since boot. Any non-zero padded or
+	// tinyFragments count is hostile or broken traffic on the LAN.
+	{
+		uint32_t g[4] = {0, 0, 0, 0};
+		pd_ip4_guard_counts(g);
+		json << "\"ip4Guard\":{\"padded\":" << g[PD_IP4_DROP_PADDED]
+		     << ",\"tinyFragments\":" << g[PD_IP4_DROP_TINY_FRAGMENT]
+		     << ",\"fragmentsCopied\":" << g[PD_IP4_CLONE]
+		     << ",\"copyFailed\":" << g[0] << "},";
+	}
+#endif
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
 	// Issue #430: the same drops by reason (they sum to packetsDropped, modulo a

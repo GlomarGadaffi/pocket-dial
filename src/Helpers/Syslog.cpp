@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "UdpRcvBuf.hpp"   // Issue #496 / #509 review
 #endif
 
 namespace
@@ -293,6 +294,11 @@ namespace Syslog
 			close(fd);
 			return false;
 		}
+		// Issue #496 / #509 review: this socket is only ever sent on, and a
+		// connected UDP socket still queues whatever its peer sends back.
+		// Queue nothing. A failure is not logged -- see the RE-ENTRANCY RULE;
+		// only the collector (or a sender spoofing it) can reach this socket.
+		(void)udprcvbuf::set(fd, udprcvbuf::kSendOnly);
 		s.sock = fd;
 #endif
 

@@ -44,9 +44,16 @@ namespace udprcvbuf
 	// so for normal media the 32-entry mailbox still fills first.
 	constexpr int kRtp = 8192;
 
-	// A bound socket that is never read (RtpSender, HoldMusic): whatever
-	// arrives there would sit in its mailbox until close. Queue nothing.
+	// A bound socket that is never read (RtpSender, HoldMusic, Syslog): whatever
+	// arrives there would sit in its mailbox until close. Queue nothing. lwIP's
+	// test is recv_avail + len > recv_bufsize, so a 0-LENGTH datagram still gets
+	// in: on Ethernet it pins only its own minimum frame (the IPv4 input guard,
+	// Ip4InputGuard.h, stops padding), ~3 KB for a full 32-entry mailbox.
 	constexpr int kSendOnly = 0;
+
+	// The captive-portal DNS server (main/wifi/DnsServer.cpp, SoftAP builds). A
+	// query is one small datagram (<= 512 B classic, 4 KB with EDNS0).
+	constexpr int kDns = 4096;
 
 	// Returns false if the cap did not take. The caller logs it; the socket
 	// still works, just without the bound.
