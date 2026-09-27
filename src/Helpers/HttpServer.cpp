@@ -11,6 +11,7 @@
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
 #include "FactoryReset.hpp"    // Issue #363: the secrets factory reset must erase
 #include "DeviceConfig.hpp"
+#include <cstdio>   // std::snprintf: the factory-reset error body (#450)
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
 #include "ArpLookup.hpp"
@@ -62,6 +63,9 @@
 #endif
 
 #if defined(ESP_PLATFORM)
+// #450 (poll #455): the factory reset ends with a whole-NVS-partition erase.
+#include "nvs_flash.h"
+#include "esp_log.h"
 // OTA reboot path needs esp_restart() + a deferred-restart FreeRTOS task. These
 // are available on EVERY ESP transport (WiFi, Ethernet, display), not just
 // POCKETDIAL_HAS_WIFI, so guard them on the platform rather than the transport.
@@ -1632,6 +1636,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	std::vector<std::tuple<std::string, std::string, std::string, int>> parkedCalls;
 	uint64_t packets = 0;
 	uint64_t dropped = 0;
+	bool e911Configured = false;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate = 0;
 
@@ -1648,6 +1653,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		parkedCalls = handler->getParkedCalls();
 		packets = handler->getPacketsProcessed();
 		dropped = handler->getPacketsDropped();   // Issue #38
+		e911Configured = handler->isE911Configured();   // #450
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate = handler->getDroppedRate();
 	}
@@ -1675,6 +1681,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
 	json << "\"packetsDropped\":" << dropped << ",";
+	// #450 / poll #454: false after a factory reset until the E911 notify list is
+	// set again. The dashboard shows a banner; nothing is gated on it.
+	json << "\"e911Configured\":" << (e911Configured ? "true" : "false") << ",";
 	// Issue #430: the same drops by reason (they sum to packetsDropped, modulo a
 	// race between the loads), then the most recent ones. Like the roster below
 	// (#207), the per-drop source addresses and bytes need a session; the counts
@@ -3700,7 +3709,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP
 	// (NVS) and host (in-memory).
-	AdminAuth::clearCredential();
+	const bool adminErased = AdminAuth::clearCredential();
 	// Also drop ap_secure / ap_psk / cfgseed_gen. Clearing the seed generation is
 	// deliberate: the next boot re-applies whatever the flasher wrote, so a
 	// factory reset returns the board to how it was FLASHED rather than to a
@@ -3749,10 +3758,24 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// enumeration and the reasons live in FactoryReset.hpp.
 	const bool secretsErased = FactoryReset::eraseStoredSecrets();
 
+	bool forwardsErased = true;
+	bool e911Erased = true;
+	bool tapiErased = true;     // #456 review: the carrier OAuth client_secret lives here
+	bool didmapErased = true;   // #456 review: the DID table is PII
+	bool wifiErased = true;     // #456 review: wifi_pass etc. (radio builds only; true elsewhere)
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
-		handler->clearAllTelephonyConfig();
-		handler->clearAllDidMappings();
+		// Both return "" on success, else the persist error (#456 review: these
+		// results used to be discarded, so a failure still answered 200 "ok").
+		tapiErased = handler->clearAllTelephonyConfig().empty();
+		// #450: call-forward targets are external phone numbers (PII), in "pbxcfg",
+		// which nothing above reaches.
+		forwardsErased = handler->clearAllForwards();
+		// Poll #454 (A): the E911 settings are PII and, after a reset, likely the
+		// previous site's. Erased; /api/status then shows e911Configured:false and
+		// boot logs a WARNING. Nothing is gated -- 911 still routes out.
+		e911Erased = handler->clearE911Config();
+		didmapErased = handler->clearAllDidMappings().empty();
 		handler->clearAllCallHistory();
 		// Push the now-empty trunk config into the running engine so the trunk
 		// goes down immediately rather than at the next reboot.
@@ -3783,6 +3806,12 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// uses, so calling it here is safe. No-op on every build without an SD
 	// archive installed (see cdrarchive::wipeAll()'s doc comment).
 	cdrarchive::wipeAll();
+	// #450: the SD voicemail archive (recordings, greetings, index), same
+	// policy and same no-_mutex HTTP-task context as the CDR archive above.
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		handler->wipeAllVoicemail();
+	}
 	//
 	// The DTMF admin menu's OWN factory-reset path (*<PIN>#999#1,
 	// DtmfFeatureCodes.cpp) does not call this function -- it runs
@@ -3798,38 +3827,53 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// The ONLY genuinely radio-specific work in this handler. It stays gated on the
 	// transport (not the platform) for a second reason beyond the keys themselves:
 	// nvs.h/nvs_flash.h are included under POCKETDIAL_HAS_WIFI alone (top of file),
-	// so nothing outside this block may touch NVS directly.
+	// so nothing outside this block may touch NVS directly -- except the
+	// whole-partition erase in the restart task at the end (#450), which uses
+	// nvs_flash.h from the ESP_PLATFORM include block.
+	// #456 review: every erase is checked; NOT_FOUND (never set) is success.
 	nvs_handle_t nvs_handle;
-	if (nvs_open("storage", NVS_READWRITE, &nvs_handle) == ESP_OK) {
-		nvs_erase_key(nvs_handle, "wifi_mode");
-		nvs_erase_key(nvs_handle, "wifi_ssid");
-		nvs_erase_key(nvs_handle, "wifi_pass");
-		nvs_erase_key(nvs_handle, "decayed");
-		nvs_commit(nvs_handle);
+	const esp_err_t wifiOpen = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+	if (wifiOpen == ESP_OK) {
+		for (const char* key : {"wifi_mode", "wifi_ssid", "wifi_pass", "decayed"})
+		{
+			const esp_err_t e = nvs_erase_key(nvs_handle, key);
+			if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) wifiErased = false;
+		}
+		if (nvs_commit(nvs_handle) != ESP_OK) wifiErased = false;
 		nvs_close(nvs_handle);
+	} else if (wifiOpen != ESP_ERR_NVS_NOT_FOUND) {
+		wifiErased = false;
 	}
 #endif
 	// #437 review: a secret-store erase that FAILED must not be reported as a
 	// completed reset. The operator is about to hand this board on believing its
 	// credentials are gone. The board still restarts: the admin credential is
 	// already cleared above, so staying up half-reset helps nobody, and the reset
-	// can be run again once setup completes. (AdminAuth::clearCredential() and
-	// DeviceConfig::clearAll() return void, so their outcome is not visible here.)
-	if (!trunkErased || !secretsErased)
+	// can be run again once setup completes. (DeviceConfig::clearAll() still
+	// returns void; its result is Pal's #441.)
+	if (!adminErased || !trunkErased || !secretsErased || !forwardsErased || !e911Erased ||
+		!tapiErased || !didmapErased || !wifiErased)
 	{
-		// One fixed literal per outcome: no string building on the HTTP task (#284).
-		static constexpr const char* kTrunkOnly =
-			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the carrier trunk credentials "
-			"could not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
-		static constexpr const char* kSecretsOnly =
-			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the email/SIP-digest secret stores "
-			"could not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
-		static constexpr const char* kBoth =
-			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: the carrier trunk credentials and "
-			"the email/SIP-digest secret stores could not be erased. Rebooting anyway; run the factory reset "
-			"again after setup.\"}";
-		const char* body = (!trunkErased && !secretsErased) ? kBoth : (!trunkErased ? kTrunkOnly : kSecretsOnly);
-		sendResponse(sock, 500, "Internal Server Error", "application/json", body);
+		// #450: one fixed format, filled on the stack -- no string building on the
+		// HTTP task (#284). "failed" names each store, so the operator knows what
+		// may still be in flash. Worst case 298 B of 384 (#456 review: tapi,
+		// didmap and wifi added).
+		char body[384];
+		const int n = std::snprintf(body, sizeof(body),
+			"{\"status\":\"error\",\"failed\":{\"admin\":%s,\"trunk\":%s,\"secrets\":%s,\"forwards\":%s,\"e911\":%s,"
+			"\"tapi\":%s,\"didmap\":%s,\"wifi\":%s},"
+			"\"message\":\"Factory reset INCOMPLETE: the stores marked true under failed could not be erased. "
+			"Rebooting anyway; run the factory reset again after setup.\"}",
+			adminErased ? "false" : "true", trunkErased ? "false" : "true",
+			secretsErased ? "false" : "true", forwardsErased ? "false" : "true",
+			e911Erased ? "false" : "true", tapiErased ? "false" : "true",
+			didmapErased ? "false" : "true", wifiErased ? "false" : "true");
+		// A truncated or failed format must never ship as half a JSON object.
+		static constexpr const char* kFallback =
+			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: one or more stores could "
+			"not be erased. Rebooting anyway; run the factory reset again after setup.\"}";
+		const bool formatted = n > 0 && static_cast<size_t>(n) < sizeof(body);
+		sendResponse(sock, 500, "Internal Server Error", "application/json", formatted ? body : kFallback);
 	}
 	else
 	{
@@ -3862,10 +3906,36 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// Guarded on the platform, not the transport: esp_restart() and the deferred
 	// restart task exist on every ESP build (see the include block at the top of
 	// this file, which already makes exactly this distinction for the OTA path).
-	xTaskCreate([](void*) {
+	// #450, poll #455 (A): end the same way the DTMF door does -- erase the WHOLE
+	// NVS partition, then restart immediately. nvs_erase_key() above leaves the
+	// old bytes readable in flash until page GC; nvs_flash_erase() takes the
+	// pages. The per-key erases stay and are still reported: they are what the
+	// response can speak to, and this is the backstop. Done in the restart task,
+	// AFTER the response is sent and with nothing between the erase and the
+	// restart, because every open NVS handle in other tasks is invalid from
+	// here on. Keep-list checked on poll #455: nothing that must survive lives in
+	// the nvs partition (cfgseed, prompts, coredump, otadata and phy_init are their
+	// own partitions; a fresh boot re-runs PHY calibration, which is harmless).
+	// 4096, not 2048 (#456 review): nvs_flash_erase()'s worst static chain is
+	// ~1,920 B, which left too little for the lambda and an interrupt frame, and
+	// an overflow here would panic mid-erase -- the half-reset state.
+	if (xTaskCreate([](void*) {
+		vTaskDelay(pdMS_TO_TICKS(1000));
+		if (nvs_flash_erase() != ESP_OK)
+		{
+			ESP_LOGE("factory_reset", "nvs_flash_erase failed -- per-key erases stand, old NVS bytes may remain");
+		}
+		esp_restart();
+	}, "restart_task", 4096, NULL, 5, NULL) != pdPASS)
+	{
+		// The reply has gone out and the per-key erases are done; without the task
+		// there is no whole-partition erase, but the board must still restart
+		// rather than stay up half-reset. Not erased here: this is the http_conn
+		// stack, already deep (#458).
+		ESP_LOGE("factory_reset", "restart task not created -- restarting without the whole-NVS erase");
 		vTaskDelay(pdMS_TO_TICKS(1000));
 		esp_restart();
-	}, "restart_task", 2048, NULL, 5, NULL);
+	}
 #endif
 }
 

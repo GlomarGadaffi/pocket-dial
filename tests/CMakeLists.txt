@@ -168,6 +168,8 @@ add_executable(sip_parser_tests
     # gets a BYE for the dialog it was on (not just that the target gets an
     # INVITE).
     BlindTransfer_test.cpp
+    # Issue #422: the four server-originated in-dialog CSeqs #407 did not reach.
+    ServerCSeqSites_test.cpp
     # Issue #198: RFC 4028 session timers. Pins the arming DECISION (a 2xx with
     # Session-Expires but no refresher parameter obliges nobody, so arming a
     # reaper could only ever produce a spurious BYE) and the OPTIONS capability
@@ -429,6 +431,8 @@ add_executable(sip_parser_tests
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
     # PcapCapture.hpp has no dependency beyond sockaddr_in.
     PcapCapture_test.cpp
+    # Issue #464 (#284 batch C): per-request lookups allocate nothing.
+    AllocFreeLookups_test.cpp
     DropProbe_test.cpp
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
