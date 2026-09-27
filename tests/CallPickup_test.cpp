@@ -509,3 +509,89 @@ TEST(CallPickup, ParkRetrieveByeToParkerGoesAboveTheReinviteCSeq)
 	EXPECT_GT(byeCSeqs[0], reinviteCSeq)
 		<< "BYE CSeq " << byeCSeqs[0] << " must exceed the re-INVITE's " << reinviteCSeq;
 }
+
+// #439 review (Globox, #453 audit): a bodiless UPDATE is a session-timer
+// refresh (RFC 4028). #439 forwards it on an ordinary relay dialog, where both
+// legs share one Call-ID. A picked-up call is NOT that: the picker's dialog
+// (pickup-7) and the caller's (call-7) have different Call-IDs, linked only by
+// peerCallID, and src/dest point across them. Forwarded verbatim, the refresh
+// lands in the other phone under a Call-ID and tags it has never seen, draws a
+// 481, and a 481 to a refresh ends the session (RFC 4028 §10). Until #453 adds
+// real cross-dialog translation, the PBX answers the refresh locally, as main
+// did, with a Contact that points at the PBX (#425), and relays nothing.
+TEST(CallPickup, BodilessRefreshOnAPickedUpCallIsAnsweredLocallyNotRelayedAcrossCallIds)
+{
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+
+	handler.handle(makeRegister("200", "192.168.9.10", "reg-caller7"));
+	handler.handle(makeRegister("100", "192.168.9.20", "reg-target7"));
+	handler.handle(makeRegister("102", "192.168.9.30", "reg-picker7"));
+	handler.setRingGroup("607", "100,102", "ringall");
+
+	handler.handle(makeInvite("200", "100", "192.168.9.10", "call-7"));
+	handler.handle(makeInvite("102", "**100", "192.168.9.30", "pickup-7"));
+
+	// Preconditions: both halves are Connected and spliced. Without them the
+	// refresh would take the no-peer branch and be answered locally for a
+	// reason that has nothing to do with the splice.
+	struct Leg { const char* callId; const char* fromExt; const char* toUser; const char* fromIp; const char* otherIp; };
+	const Leg legs[] = {
+		{ "pickup-7", "102", "**100", "192.168.9.30", "192.168.9.10" },   // picker refreshes
+		{ "call-7",   "200", "100",   "192.168.9.10", "192.168.9.30" },   // caller refreshes
+	};
+	for (const auto& leg : legs)
+	{
+		auto s = handler.getSession(sessionKey(leg.callId));
+		ASSERT_TRUE(s.has_value()) << leg.callId;
+		ASSERT_EQ(s.value()->getState(), Session::State::Connected) << leg.callId;
+		ASSERT_FALSE(s.value()->getPeerCallID().empty()) << leg.callId << " precondition: spliced";
+		ASSERT_NE(s.value()->getSrc(), nullptr);
+		ASSERT_NE(s.value()->getDest(), nullptr);
+	}
+
+	for (const auto& leg : legs)
+	{
+		sent.clear();
+		std::string raw =
+			std::string("UPDATE sip:") + leg.toUser + "@192.168.9.1:5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + leg.fromIp + ":5060;branch=z9hG4bKupd" + leg.callId + "\r\n"
+			"From: <sip:" + leg.fromExt + "@server>;tag=from" + leg.callId + "\r\n"
+			"To: <sip:" + leg.toUser + "@server>;tag=pbx" + leg.callId + "\r\n"
+			"Call-ID: " + leg.callId + "\r\n"
+			"CSeq: 2 UPDATE\r\n"
+			"Session-Expires: 90;refresher=uac\r\n"
+			"Contact: <sip:" + leg.fromExt + "@" + leg.fromIp + ":5060>\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(leg.fromIp)));
+
+		EXPECT_EQ(countTo(sent, leg.otherIp), 0u)
+			<< leg.callId << ": the refresh must not cross into the other dialog";
+
+		size_t answers = 0;
+		std::string answer;
+		for (const auto& s : sent)
+		{
+			if (s.destIp == leg.fromIp && s.raw.find("CSeq: 2 UPDATE") != std::string::npos &&
+				s.raw.rfind("SIP/2.0 ", 0) == 0)
+			{
+				++answers;
+				answer = s.raw;
+			}
+		}
+		ASSERT_EQ(answers, 1u) << leg.callId << ": exactly one answer to the refreshing phone";
+		EXPECT_EQ(answer.rfind("SIP/2.0 200 OK\r\n", 0), 0u) << leg.callId;
+		EXPECT_NE(answer.find("Contact: <sip:"), std::string::npos);
+		EXPECT_NE(answer.find("@192.168.9.1:5060"), std::string::npos)
+			<< leg.callId << ": the 200's Contact points at the PBX (#425)";
+		EXPECT_EQ(answer.find("Contact: <sip:" + std::string(leg.fromExt) + "@" + leg.fromIp),
+			std::string::npos) << leg.callId << ": never the phone's own Contact";
+
+		auto s = handler.getSession(sessionKey(leg.callId));
+		ASSERT_TRUE(s.has_value());
+		EXPECT_EQ(s.value()->getState(), Session::State::Connected) << leg.callId;
+	}
+}
