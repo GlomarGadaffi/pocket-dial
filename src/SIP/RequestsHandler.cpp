@@ -21,6 +21,8 @@
 #include "TimeSync.hpp"    // Issue #246: voicemail flush timestamp (endCall() hook)
 #include "PbxConfig.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: 911/933 classification, ahead of the dial plan
+#include "SessionTimer.hpp"   // Issue #198: RFC 4028 422 floor
+#include <charconv>
 #include "PbxPersist.hpp"
 #include "SipHeaderUtil.hpp"
 #include "SipWireUtil.hpp"
@@ -1816,6 +1818,24 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		emergency.isEmergency)
 	{
 		routeEmergencyCall(data, caller.value(), emergency, destNumber);
+		return;
+	}
+
+	// Issue #198: RFC 4028 §8.1/§9 floor. Below the emergency branch so 911 is
+	// never bounced; re-INVITEs took the onReinvite() path above.
+	if (const uint32_t minSe = pbx::sessionIntervalMinSEFor422(
+			data->getSessionExpiresSecs(), data->getMinSESecs()); minSe != 0)
+	{
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 422 Session Interval Too Small");
+		response->clearBody();
+		char minSeBuf[11];
+		const auto conv = std::to_chars(minSeBuf, minSeBuf + sizeof(minSeBuf), minSe);
+		if (conv.ec != std::errc{}) return;
+		response->setHeaderOnce("Min-SE", std::string_view(minSeBuf, conv.ptr - minSeBuf));
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
 

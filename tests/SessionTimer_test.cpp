@@ -513,3 +513,88 @@ TEST(SessionRecycling, ServerCSeqIgnoresIllegalValuesAndNeverWraps)
 	EXPECT_EQ(s.nextServerCSeq(), limit - 1) << "saturates at 2^31-1 rather than wrapping";
 	EXPECT_NE(s.nextServerCSeq(), 0u);
 }
+
+// ── Issue #198: RFC 4028 422 floor and tick-driven expiry ────────────────────
+
+#include "SessionTimer.hpp"
+
+TEST(SessionTimer, MinSEFor422DecisionTable)
+{
+	EXPECT_EQ(pbx::sessionIntervalMinSEFor422(0, 0), 0u) << "no Session-Expires: nothing to reject";
+	EXPECT_EQ(pbx::sessionIntervalMinSEFor422(90, 0), 0u) << "exactly the floor is accepted";
+	EXPECT_EQ(pbx::sessionIntervalMinSEFor422(1800, 90), 0u);
+	EXPECT_EQ(pbx::sessionIntervalMinSEFor422(89, 0), 90u);
+	EXPECT_EQ(pbx::sessionIntervalMinSEFor422(30, 60), 90u);
+	EXPECT_EQ(pbx::sessionIntervalMinSEFor422(30, 120), 120u) << "the request's larger Min-SE wins";
+}
+
+TEST(SessionTimer, TooSmallSessionExpiresOnInviteIsAnswered422WithMinSE)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	registerBothLegs(handler);
+	sent.clear();
+
+	const std::string ip = "192.168.40.10";
+	const std::string body = sdpBody(ip);
+	const std::string raw =
+		"INVITE sip:106@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKsmall\r\n"
+		"From: <sip:100@server>;tag=ctagsmall\r\n"
+		"To: <sip:106@server>\r\n"
+		"Call-ID: timer-small\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:100@" + ip + ":5060>\r\n"
+		"Supported: timer\r\n"
+		"Session-Expires: 30\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(ip)));
+
+	const std::string resp = firstMatching(sent, "SIP/2.0 422");
+	ASSERT_FALSE(resp.empty()) << "Session-Expires below 90 must be refused 422 (RFC 4028 §8.1)";
+	EXPECT_EQ(headerValue(resp, "Min-SE"), "90");
+	EXPECT_TRUE(firstMatching(sent, "INVITE sip:").empty()) << "the INVITE must not reach the callee";
+	EXPECT_FALSE(handler.getSession("Call-ID: timer-small").has_value()) << "no session allocated";
+}
+
+TEST(SessionTimer, ExpiryDrivenByTickByesEachLegExactlyOnce)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	registerBothLegs(handler);
+
+	auto session = runCallAnsweredWith(handler, "timer-expire",
+		"Session-Expires: 1800;refresher=uac\r\n");
+	ASSERT_TRUE(session != nullptr);
+	ASSERT_EQ(session->getSessionExpiresSeconds(), 1800u);
+
+	// Backdate the arm so the interval has already elapsed with no refresh.
+	session->armSessionTimer(1800, false, std::chrono::steady_clock::now() - std::chrono::seconds(1801));
+	sent.clear();
+
+	auto countByes = [&](const std::string& ip) {
+		int n = 0;
+		for (const auto& [addr, msg] : sent)
+		{
+			if (!msg || addr.sin_addr.s_addr != inet_addr(ip.c_str())) continue;
+			if (msg->toString().rfind("BYE ", 0) == 0) ++n;
+		}
+		return n;
+	};
+
+	handler.tick();
+	EXPECT_EQ(countByes("192.168.40.10"), 1) << "caller leg BYEd exactly once";
+	EXPECT_EQ(countByes("192.168.40.20"), 1) << "callee leg BYEd exactly once";
+
+	handler.tick();
+	EXPECT_EQ(countByes("192.168.40.10"), 1) << "a second tick must not re-BYE";
+	EXPECT_EQ(countByes("192.168.40.20"), 1);
+}
