@@ -1,2 +1,2 @@
-# SpliceInDialog_test.cpp: 12 (#453: pickup/park/attended-transfer splices rebuilt in the peer dialog; same-address pickup)
-12
+# SpliceInDialog_test.cpp: 15 (#453 splices, plus the #589 review: re-ACK, no pooled pin, hold on 2xx)
+15

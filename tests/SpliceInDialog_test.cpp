@@ -561,3 +561,97 @@ TEST(SpliceInDialog, APickupBetweenTwoLinesOfOneHandsetIsStillTranslatedAndAnswe
 	EXPECT_EQ(headerValue(ok, "CSeq"), "5 INVITE") << ok;
 	EXPECT_EQ(h.handler.getRepliesRefused(), 0u) << "no translated message may trip the #472 guard";
 }
+
+// ── #589 review (CaveJay) ────────────────────────────────────────────────────
+
+TEST(SpliceInDialog, ARetransmittedFarLeg2xxIsReAckedWithTheSameAck)
+{
+	// B1: the PBX is the UAC on the far leg. If its ACK is lost the far phone
+	// retransmits the 200, and without a fresh ACK it BYEs the call after 64*T1.
+	Harness h;
+	setUpPickup(h);
+	auto own = h.handler.getSession(sessionKey("pickup-P"));
+	ASSERT_TRUE(own.has_value());
+	h.sent.clear();
+	h.handler.handle(inDialog("INVITE", own.value(), "192.168.9.30", 5, sdpBody("192.168.9.30", "sendonly")));
+	size_t n = 0;
+	const Sent* req = onlyOne(h.sent, "192.168.9.10", "INVITE ", n);
+	ASSERT_EQ(n, 1u);
+	const std::string reqRaw = req->raw;
+
+	h.sent.clear();
+	h.handler.handle(answerTo(reqRaw, "192.168.9.10", "200 OK", sdpBody("192.168.9.10")));
+	const Sent* ack1 = onlyOne(h.sent, "192.168.9.10", "ACK ", n);
+	ASSERT_EQ(n, 1u) << "the first 200 is ACKed";
+	const std::string firstAck = ack1->raw;
+	const Sent* ok = onlyOne(h.sent, "192.168.9.30", "SIP/2.0 200 OK", n);
+	ASSERT_EQ(n, 1u);
+	const std::string okRaw = ok->raw;
+
+	// The far phone never got that ACK: it sends the same 200 again.
+	h.sent.clear();
+	h.handler.handle(answerTo(reqRaw, "192.168.9.10", "200 OK", sdpBody("192.168.9.10")));
+	const Sent* ack2 = onlyOne(h.sent, "192.168.9.10", "ACK ", n);
+	ASSERT_EQ(n, 1u) << "a retransmitted 200 must be ACKed again";
+	EXPECT_EQ(ack2->raw, firstAck) << "with the SAME ACK";
+	(void)onlyOne(h.sent, "192.168.9.30", "SIP/2.0 200", n);
+	EXPECT_EQ(n, 0u) << "the originator is not answered twice";
+
+	// ...and still after the originator's own ACK has been absorbed.
+	h.handler.handle(ackFor(okRaw, "192.168.9.30"));
+	h.sent.clear();
+	h.handler.handle(answerTo(reqRaw, "192.168.9.10", "200 OK", sdpBody("192.168.9.10")));
+	(void)onlyOne(h.sent, "192.168.9.10", "ACK ", n);
+	EXPECT_EQ(n, 1u) << "the 64*T1 window outlives the originator's ACK";
+}
+
+TEST(SpliceInDialog, AnInFlightSpliceDoesNotPinTheOriginatorsPooledMessage)
+{
+	// B2: a pooled SipMessage is reused only once nothing else references it.
+	// Holding the originator's request for up to 32 s took a pool slot per
+	// in-flight splice, against a pool with no heap fallback behind it (#583).
+	Harness h;
+	setUpPickup(h);
+	auto own = h.handler.getSession(sessionKey("pickup-P"));
+	ASSERT_TRUE(own.has_value());
+	auto request = inDialog("INVITE", own.value(), "192.168.9.30", 5, sdpBody("192.168.9.30", "sendonly"));
+	ASSERT_TRUE(request);
+	h.sent.clear();
+	h.handler.handle(request);
+	size_t n = 0;
+	(void)onlyOne(h.sent, "192.168.9.10", "INVITE ", n);
+	ASSERT_EQ(n, 1u) << "precondition: the splice is in flight, awaiting the peer";
+	EXPECT_EQ(request.use_count(), 1) << "the splice table must not keep the request alive";
+}
+
+TEST(SpliceInDialog, HoldTakesEffectOnThePeers2xxNotOnSend)
+{
+	// A far leg that refuses the hold offer (488) must not leave the session
+	// showing a hold that never happened.
+	Harness h;
+	setUpPickup(h);
+	auto own = h.handler.getSession(sessionKey("pickup-P"));
+	ASSERT_TRUE(own.has_value());
+	const auto before = own.value()->getState();
+	ASSERT_NE(before, Session::State::Held) << "precondition";
+	h.sent.clear();
+	h.handler.handle(inDialog("INVITE", own.value(), "192.168.9.30", 5, sdpBody("192.168.9.30", "sendonly")));
+	size_t n = 0;
+	const Sent* req = onlyOne(h.sent, "192.168.9.10", "INVITE ", n);
+	ASSERT_EQ(n, 1u);
+	EXPECT_EQ(own.value()->getState(), before) << "not held yet: the peer has not accepted";
+	(void)onlyOne(h.sent, "192.168.9.30", "SIP/2.0 100 Trying", n);
+	EXPECT_EQ(n, 1u) << "the originator gets a 100 Trying for its re-INVITE";
+
+	const std::string reqRaw = req->raw;
+	h.handler.handle(answerTo(reqRaw, "192.168.9.10", "488 Not Acceptable Here"));
+	EXPECT_EQ(own.value()->getState(), before) << "a refused hold leaves the session as it was";
+
+	h.sent.clear();
+	h.handler.handle(inDialog("INVITE", own.value(), "192.168.9.30", 6, sdpBody("192.168.9.30", "sendonly")));
+	req = onlyOne(h.sent, "192.168.9.10", "INVITE ", n);
+	ASSERT_EQ(n, 1u);
+	const std::string req2 = req->raw;
+	h.handler.handle(answerTo(req2, "192.168.9.10", "200 OK", sdpBody("192.168.9.10", "recvonly")));
+	EXPECT_EQ(own.value()->getState(), Session::State::Held) << "an accepted hold is a hold";
+}

@@ -1922,17 +1922,37 @@ private:
 	void sweepSpliceTxns(std::chrono::steady_clock::time_point now);
 	void answerSpliceLocally(const std::shared_ptr<SipMessage>& data, const char* statusLine);
 
+	// #589 review (CaveJay B2): the originator's request is NOT held. A pooled
+	// SipMessage stays unreusable while referenced, so eight in-flight splices
+	// pinned eight message-pool slots for up to 32 s, against the pool's +4
+	// headroom (#409/#583 removed the heap fallback behind it). Only the fields
+	// an answer needs are kept, in fixed buffers.
+	// B1: after a final response the slot lingers (AwaitingOriginAck, then
+	// Completed) for 64*T1 so a RETRANSMITTED far-leg final can be re-ACKed with
+	// the same ACK; losing that ACK otherwise makes the far phone BYE the call.
 	struct SpliceTxn
 	{
-		enum class State : uint8_t { Free, AwaitingPeer, AwaitingOriginAck };
+		enum class State : uint8_t { Free, AwaitingPeer, AwaitingOriginAck, Completed };
 		State state = State::Free;
 		bool isInvite = false;
-		std::shared_ptr<SipMessage> origin;   // the originator's request (its transaction)
+		bool holdOffer = false;               // the offer holds; applied on the peer's 2xx
+		sockaddr_in originSrc{};              // the originator's transaction
+		uint32_t originCSeq = 0;
+		char originVia[256] = {};             // full "Via: ..." line of the originator's request
+		char originFrom[192] = {};            // full header lines
+		char originTo[192] = {};
+		char originCallId[128] = {};          // full "Call-ID: ..." line
+		char originToNumber[48] = {};
 		std::shared_ptr<Session> peer;        // the dialog it was rebuilt into
 		uint32_t peerCSeq = 0;
 		char branch[32] = {};                 // our Via branch toward the peer (non-2xx ACK)
+		char ackBranch[32] = {};              // the branch our ACK for the peer's final used
 		std::chrono::steady_clock::time_point since{};
 	};
+	// Answers the originator's transaction from a slot's stored fields.
+	void answerSpliceOrigin(const SpliceTxn& t, std::string_view statusLine, std::string_view sdpBody);
+	// Builds and sends our ACK for the peer's final response `resp`.
+	void sendSpliceAck(const SpliceTxn& t, const std::shared_ptr<SipMessage>& resp);
 	// One in-flight splice request per slot. Two directions per spliced pair can
 	// be in flight at once; 8 covers several concurrent splices. A full table
 	// answers 500 + Retry-After rather than ever relaying untranslated.
