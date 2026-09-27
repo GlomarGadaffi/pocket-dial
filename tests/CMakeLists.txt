@@ -69,6 +69,9 @@ add_executable(sip_parser_tests
     # Issue #410 phase 1: the static HTML pages stream from flash (byte-identical
     # to the old path, zero allocation beyond the CSRF token).
     HttpStaticPages_test.cpp
+    # Issue #410 phase 2: every response goes out in place via one scatter-gather
+    # sendmsg() (byte-identical, short writes resumed, zero allocation).
+    HttpSendPath_test.cpp
     # Issue #412: every allocateVirtualPeer() caller must survive an exhausted
     # pool -- refuse with 503 (or drop the anchor leg) and release what it had
     # claimed, never publish a session with a null peer.
