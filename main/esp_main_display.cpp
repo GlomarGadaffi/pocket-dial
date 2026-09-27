@@ -7,6 +7,7 @@
 #include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "bootloader_random.h"   // Issue #588: SAR ADC entropy for the pre-start PSK draw
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -37,6 +38,7 @@
 #include <unordered_set>
 #include "SipServer.hpp"
 #include "HttpServer.hpp"
+#include "FirmwareInfo.hpp"
 #include "OtaUpdater.hpp"
 #include "DnsServer.hpp"
 #include "DeviceConfig.hpp"
@@ -661,6 +663,12 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "================================================");
     ESP_LOGI(TAG, " POCKET-DIAL ESP-IDF DISPLAY CONTROLLER");
     ESP_LOGI(TAG, "================================================");
+    // #411: which build is running. tests/run.py board-provenance greps the
+    // serial capture for this stamp (TEST_HARNESS.md §5.3); it must match
+    // /api/status and the `git describe` of the built commit.
+    ESP_LOGI(TAG, "[boot] firmware %s (IDF %s, built %s %s)",
+             FirmwareInfo::version(), FirmwareInfo::idfVersion(),
+             FirmwareInfo::buildDate(), FirmwareInfo::buildTime());
 
     // Initialise Kconfig systems
     esp_err_t ret = nvs_flash_init();
@@ -689,7 +697,14 @@ extern "C" void app_main(void) {
 
     // The AP passphrase is generated on first access, so pull it once here — well
     // before any bringup path needs it — rather than at three separate call sites.
+    //
+    // Issue #588: that first-boot draw happens before esp_wifi_start(), when
+    // esp_random() is only pseudo-random (IDF random.rst). Run it with the SAR ADC
+    // entropy source on, then turn the source OFF before esp_wifi_init() (Wi-Fi
+    // uses the ADC itself) and before the display/touch/audio init below.
+    bootloader_random_enable();
     g_apPsk = DeviceConfig::getApPsk();
+    bootloader_random_disable();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());

@@ -48,6 +48,26 @@ def host_env():
     return env
 
 
+
+_HEX_HASH = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def same_commit(board_ver, describe):
+    """True only when the board's stamp names the checkout's commit (#461 review).
+
+    Exact match, or -- for cmake/FirmwareVersion.cmake's short-hash fallback past
+    the app descriptor's 31 chars -- a >= 7-char hash that is a prefix of the
+    describe's -g<hash> (or of a bare-hash describe). Never a substring either
+    way: "v1.6.0" is a different commit from "v1.6.0-7-gabc1234".
+    """
+    if board_ver == describe:
+        return True
+    if not _HEX_HASH.match(board_ver):
+        return False
+    m = re.search(r"-g([0-9a-f]{7,40})$", describe)
+    dh = m.group(1) if m else (describe if _HEX_HASH.match(describe) else None)
+    return dh is not None and (dh.startswith(board_ver) or board_ver.startswith(dh))
+
 class HarnessError(Exception):
     """Exit code 2: target unreachable, lock held, provenance mismatch, etc."""
     pass
@@ -415,10 +435,38 @@ class Harness:
             self.log_suite("board-provenance", "\n".join(suite_log))
             return False
 
-        # Verify git describe match if known
+        # #411: a board that cannot say which build it runs FAILS provenance.
+        # This used to fall through to PASS: an absent "version" skipped the
+        # comparison below instead of failing it -- the fail-open shape #337
+        # catalogues. "1" is ESP-IDF's fallback when nothing set PROJECT_VER
+        # (every pre-#411 image), and "unknown" is what a build with no git
+        # reports; neither identifies a build, so neither can pass.
+        #
+        # Consequence, stated: a board still running pre-#411 firmware FAILS
+        # here until it is flashed with a build that stamps itself.
+        if board_ver in ("", "1", "unknown"):
+            dur = time.time() - t0
+            why = ("no \"version\" in /api/status (pre-#411 firmware?)" if board_ver == ""
+                   else f"version '{board_ver}' does not identify a build (#411)")
+            suite_log.append(why)
+            self.verdicts["board-provenance"] = {"verdict": "FAIL", "duration_s": dur,
+                                                 "details": f"{why}; reset={reset_reason} expected={self.git_describe}"}
+            self.log_suite("board-provenance", "\n".join(suite_log))
+            return False
+
+        # Verify git describe match if known. The question is WHICH COMMIT, so a
+        # trailing "-dirty" is set aside for the match and noted instead. Without
+        # that, the same dirty build would PASS in its full form
+        # ("v1.5.0-...-g8d76d64-dirty" contains the describe) but WARN in the
+        # short form cmake/FirmwareVersion.cmake falls back to past the app
+        # descriptor's 31 chars ("8d76d64-dirty" contains neither way) -- one
+        # commit, two verdicts, decided by string length alone.
         verdict = "PASS"
-        if self.git_describe and board_ver and board_ver != "unknown":
-            if self.git_describe not in board_ver and board_ver not in self.git_describe:
+        commit_ver = board_ver[:-len("-dirty")] if board_ver.endswith("-dirty") else board_ver
+        if commit_ver != board_ver:
+            suite_log.append(f"board runs a dirty build of '{commit_ver}' (uncommitted changes)")
+        if self.git_describe:
+            if not same_commit(commit_ver, self.git_describe):
                 # WARN, not FAIL: hil-244 cannot flash yet (#338), so the board is
                 # expected to run an older build than the checkout. Becomes FAIL
                 # once board-flash runs before board-smoke.

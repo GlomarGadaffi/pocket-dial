@@ -100,12 +100,15 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "HeapLeakProbe.cpp"
                             "../src/Helpers/UdpServer.cpp"
                             "../src/Helpers/HttpServer.cpp"
+                            "../src/Helpers/FirmwareInfo.cpp"
                             "../src/Helpers/AdminAuth.cpp"
                             # Issue #382: read-back of the panic handler's flash coredump.
                             "../src/Helpers/CoreDumpStore.cpp"
                             # Issue #363: the secrets a factory reset must erase.
                             "../src/Helpers/FactoryReset.cpp"
                             "../src/Helpers/DeviceConfig.cpp"
+                            # Issue #473: "factory reset incomplete" journal (prompts' last sector).
+                            "../src/Helpers/ResetJournal.cpp"
                             "../src/Helpers/SipDigest.cpp"
                             "../src/Helpers/SipSecretStore.cpp"
                             "../src/Helpers/ArpLookup.cpp"
@@ -201,7 +204,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/mix_kernels_scalar.cpp"
                             "../src/SIP/ConferenceRoom.cpp"
                     INCLUDE_DIRS "../src/Helpers" "../src/SIP" "drivers" "ui" "wifi"
-                    REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns app_update esp_driver_ledc console esp_timer esp_websocket_client esp_http_client cjson mbedtls esp-tls ${EXTRA_REQUIRES}
+                    REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns app_update esp_app_format esp_driver_ledc console esp_timer esp_websocket_client esp_http_client cjson mbedtls esp-tls ${EXTRA_REQUIRES}
                     # Issue #366: HttpServer.cpp calls esp_pthread_set_cfg() to size the
                     # per-connection thread stack. PRIV_ because it is an implementation
                     # detail of one .cpp, not part of anything main exposes -- but it does
@@ -299,6 +302,14 @@ if(POCKETDIAL_OTA_ROLLBACK_PROBE)
     endif()
     target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_OTA_ROLLBACK_PROBE=1)
     message(WARNING "SipServer: OTA ROLLBACK PROBE image -- bench only, it never marks itself valid (#395)")
+endif()
+
+# Issue #473 / #451 P4: BENCH-ONLY reset-interruption probe. POST /api/factory-reset
+# opens the reset journal and restarts before erasing anything, standing in for a
+# power cut nobody can pull on a remote bench. Never ship it.
+if(POCKETDIAL_RESET_INTERRUPT_PROBE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_RESET_INTERRUPT_PROBE=1)
+    message(WARNING "SipServer: RESET INTERRUPT PROBE image -- bench only, a factory reset restarts before erasing (#473)")
 endif()
 
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)

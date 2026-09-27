@@ -881,6 +881,8 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `uptime` | Integer | Time in seconds since the HTTP server initialized. |
 | `packetsProcessed` | Integer | Total UDP signaling packets processed by the state machine. |
 | `packetsDropped` | Integer | Total UDP signaling packets dropped by rate-limiting or firewall rules. |
+| `msgPoolRefusals` | Integer | (#409) Draws the process-wide SIP message pool refused because every slot was in use. There is no heap fallback, so each one is a request dropped (the peer retransmits) or a response not sent. Non-zero means the pool is undersized for the load, or the board is being flooded. |
+| `vpeerPoolRefusals` | Integer | (#409) Virtual-peer pool refusals (777/440/888/555/voicemail/park stand-ins). Each one was answered `503` or its feature abandoned cleanly (#412). |
 | `sd` | Object | microSD state. **Always present**, on every build and transport, so a client never has to distinguish "key missing" from "no card". |
 | `sd.present` | Boolean | Whether this *build* has a card slot wired, i.e. was compiled with `PD_ETH_HAS_SD`. True only for `eth` on `PD_ETH_BOARD=elite`; false on `wifi`, `lan8720`, `display`, the Waveshare `eth` board, and the host build. This is a build capability, not a runtime observation. |
 | `sd.mounted` | Boolean | Whether a card is actually mounted at `/sdcard` right now. Distinguishing this from `present` matters: `present:true, mounted:false` means the slot exists but the card is missing, unreadable, or **exFAT** (ESP-IDF's FatFs mounts FAT16/FAT32 only, and cards over 32 GB ship exFAT from the factory). |
