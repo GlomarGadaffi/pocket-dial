@@ -325,6 +325,12 @@ TEST_F(FactoryResetSecretsTest, AFailedSecretEraseIsReportedAsAnErrorNotOk)
 	EXPECT_NE(resp.find("\"admin\":false"), std::string::npos) << resp;
 	EXPECT_NE(resp.find("\"trunk\":false"), std::string::npos) << resp;
 	EXPECT_NE(resp.find("\"forwards\":false"), std::string::npos) << resp;
+	// #456 review: every field is present and false for the stores that erased
+	// (a typo in a key, or a dropped condition, used to stay green).
+	EXPECT_NE(resp.find("\"e911\":false"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"tapi\":false"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"didmap\":false"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"wifi\":false"), std::string::npos) << resp;
 	// Every erase is still attempted even when one reports failure.
 	EXPECT_FALSE(SipSecretStore::hasSecret("501"));
 }
@@ -348,6 +354,28 @@ TEST_F(FactoryResetSecretsTest, AFailedStoreEraseIsRecordedInTheResetJournal)
 	EXPECT_EQ(st.failedMask & resetjournal::kAdmin, 0) << "a store that erased is not blamed";
 	EXPECT_EQ(st.failedMask & resetjournal::kE911, 0);
 	resetjournal::resetForTest();
+// #456 review: clearAllTelephonyConfig() (the carrier OAuth client_secret) and
+// clearAllDidMappings() (PII) used to have their results discarded, so a failed
+// persist still answered 200 "ok". Pointing the stores at a directory that does
+// not exist makes each persist fail for real -- no seam needed.
+TEST_F(FactoryResetSecretsTest, AFailedTelephonyOrDidEraseIsReportedAsAnError)
+{
+#if defined(_WIN32)
+	// TelephonyApiConfig/DidMapping::persist() are no-ops on a Windows host
+	// build, so there is no failure to provoke there.
+	GTEST_SKIP() << "the host stores do not persist on _WIN32";
+#endif
+	const std::string missingDir = "no_such_dir_456_review/";
+	_handler->setTelephonyStorePathsForTest(missingDir + "tapicfg.cfg", missingDir + "didmap.cfg");
+	const AdminSession s = bypassLogin();
+
+	const std::string resp = httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf);
+
+	EXPECT_EQ(statusOf(resp), 500) << resp;
+	EXPECT_NE(resp.find("\"tapi\":true"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"didmap\":true"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"secrets\":false"), std::string::npos) << "only the failed stores are blamed: " << resp;
+	_handler->setTelephonyStorePathsForTest(_tapiPath, _didPath);
 }
 
 TEST_F(FactoryResetSecretsTest, AFailedAdminCredentialEraseIsReportedAsAnError)

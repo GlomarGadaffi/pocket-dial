@@ -47,7 +47,7 @@ namespace resetjournal
 		kForwards = 1u << 3,   // call-forward targets (#450)
 		kNvsErase = 1u << 4,   // the whole-partition nvs_flash_erase()
 		kE911     = 1u << 5,   // E911 notify list (#450)
-		kOther    = 1u << 7,
+		kOther    = 1u << 7,   // tapi / DID map / Wi-Fi stores (#456)
 	};
 
 	enum class Stage : uint8_t { None = 0, Begun = 1, Failed = 2, Unreadable = 3 };

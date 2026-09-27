@@ -3632,19 +3632,22 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 
 	bool forwardsErased = true;
 	bool e911Erased = true;
+	bool tapiErased = true;     // #456 review: the carrier OAuth client_secret lives here
+	bool didmapErased = true;   // #456 review: the DID table is PII
+	bool wifiErased = true;     // #456 review: wifi_pass etc. (radio builds only; true elsewhere)
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
-		handler->clearAllTelephonyConfig();
+		// Both return "" on success, else the persist error (#456 review: these
+		// results used to be discarded, so a failure still answered 200 "ok").
+		tapiErased = handler->clearAllTelephonyConfig().empty();
 		// #450: call-forward targets are external phone numbers (PII), in "pbxcfg",
-		// which nothing above reaches. The E911 settings deliberately are NOT erased
-		// here: #166 keeps them in their own key so a reset cannot silently drop who
-		// is told when someone dials 911. Whether a reset should is #450's poll.
+		// which nothing above reaches.
 		forwardsErased = handler->clearAllForwards();
 		// Poll #454 (A): the E911 settings are PII and, after a reset, likely the
 		// previous site's. Erased; /api/status then shows e911Configured:false and
 		// boot logs a WARNING. Nothing is gated -- 911 still routes out.
 		e911Erased = handler->clearE911Config();
-		handler->clearAllDidMappings();
+		didmapErased = handler->clearAllDidMappings().empty();
 		handler->clearAllCallHistory();
 		// Push the now-empty trunk config into the running engine so the trunk
 		// goes down immediately rather than at the next reboot.
@@ -3699,14 +3702,19 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// so nothing outside this block may touch NVS directly -- except the
 	// whole-partition erase in the restart task at the end (#450), which uses
 	// nvs_flash.h from the ESP_PLATFORM include block.
+	// #456 review: every erase is checked; NOT_FOUND (never set) is success.
 	nvs_handle_t nvs_handle;
-	if (nvs_open("storage", NVS_READWRITE, &nvs_handle) == ESP_OK) {
-		nvs_erase_key(nvs_handle, "wifi_mode");
-		nvs_erase_key(nvs_handle, "wifi_ssid");
-		nvs_erase_key(nvs_handle, "wifi_pass");
-		nvs_erase_key(nvs_handle, "decayed");
-		nvs_commit(nvs_handle);
+	const esp_err_t wifiOpen = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+	if (wifiOpen == ESP_OK) {
+		for (const char* key : {"wifi_mode", "wifi_ssid", "wifi_pass", "decayed"})
+		{
+			const esp_err_t e = nvs_erase_key(nvs_handle, key);
+			if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) wifiErased = false;
+		}
+		if (nvs_commit(nvs_handle) != ESP_OK) wifiErased = false;
 		nvs_close(nvs_handle);
+	} else if (wifiOpen != ESP_ERR_NVS_NOT_FOUND) {
+		wifiErased = false;
 	}
 #endif
 	// #437 review: a secret-store erase that FAILED must not be reported as a
@@ -3717,25 +3725,31 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// returns void; its result is Pal's #441.)
 	//
 	// #473: each store that failed also goes into the reset journal, so the next
-	// boot reports it even if this reply never reaches the operator.
+	// boot reports it even if this reply never reaches the operator. tapi, didmap
+	// and wifi (#456 review) share the journal's kOther bit.
 	if (!adminErased)    resetjournal::noteFailure(resetjournal::kAdmin);
 	if (!trunkErased)    resetjournal::noteFailure(resetjournal::kTrunk);
 	if (!secretsErased)  resetjournal::noteFailure(resetjournal::kSecrets);
 	if (!forwardsErased) resetjournal::noteFailure(resetjournal::kForwards);
 	if (!e911Erased)     resetjournal::noteFailure(resetjournal::kE911);
-	if (!adminErased || !trunkErased || !secretsErased || !forwardsErased || !e911Erased)
+	if (!tapiErased || !didmapErased || !wifiErased) resetjournal::noteFailure(resetjournal::kOther);
+	if (!adminErased || !trunkErased || !secretsErased || !forwardsErased || !e911Erased ||
+		!tapiErased || !didmapErased || !wifiErased)
 	{
 		// #450: one fixed format, filled on the stack -- no string building on the
 		// HTTP task (#284). "failed" names each store, so the operator knows what
-		// may still be in flash.
+		// may still be in flash. Worst case 298 B of 384 (#456 review: tapi,
+		// didmap and wifi added).
 		char body[384];
 		const int n = std::snprintf(body, sizeof(body),
-			"{\"status\":\"error\",\"failed\":{\"admin\":%s,\"trunk\":%s,\"secrets\":%s,\"forwards\":%s,\"e911\":%s},"
+			"{\"status\":\"error\",\"failed\":{\"admin\":%s,\"trunk\":%s,\"secrets\":%s,\"forwards\":%s,\"e911\":%s,"
+			"\"tapi\":%s,\"didmap\":%s,\"wifi\":%s},"
 			"\"message\":\"Factory reset INCOMPLETE: the stores marked true under failed could not be erased. "
 			"Rebooting anyway; run the factory reset again after setup.\"}",
 			adminErased ? "false" : "true", trunkErased ? "false" : "true",
 			secretsErased ? "false" : "true", forwardsErased ? "false" : "true",
-			e911Erased ? "false" : "true");
+			e911Erased ? "false" : "true", tapiErased ? "false" : "true",
+			didmapErased ? "false" : "true", wifiErased ? "false" : "true");
 		// A truncated or failed format must never ship as half a JSON object.
 		static constexpr const char* kFallback =
 			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: one or more stores could "
@@ -3789,8 +3803,10 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// recording whether the whole-partition erase worked. The journal lives in
 	// the prompts partition, which the NVS erase does not touch, so it survives
 	// to the next boot; a hang or power cut before finish() leaves "interrupted".
-	// 4096, not 2048: finish() erases and writes a flash sector.
-	xTaskCreate([](void*) {
+	// 4096, not 2048 (#456 review): nvs_flash_erase()'s worst static chain is
+	// ~1,920 B and finish() writes a flash sector; an overflow here would panic
+	// mid-erase -- the half-reset state.
+	if (xTaskCreate([](void*) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
 		const esp_err_t eraseErr = nvs_flash_erase();
 		if (eraseErr != ESP_OK)
@@ -3799,7 +3815,17 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		}
 		resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
 		esp_restart();
-	}, "restart_task", 4096, NULL, 5, NULL);
+	}, "restart_task", 4096, NULL, 5, NULL) != pdPASS)
+	{
+		// The reply has gone out and the per-key erases are done; without the task
+		// there is no whole-partition erase, but the board must still restart
+		// rather than stay up half-reset. Not erased here: this is the http_conn
+		// stack, already deep (#458). The journal is deliberately NOT finished, so
+		// it stays Begun and the next boot reports the reset as interrupted -- true.
+		ESP_LOGE("factory_reset", "restart task not created -- restarting without the whole-NVS erase");
+		vTaskDelay(pdMS_TO_TICKS(1000));
+		esp_restart();
+	}
 #else
 	// Host: no restart task, so the reset "completes" here.
 	resetjournal::finish();
