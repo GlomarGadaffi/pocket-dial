@@ -63,7 +63,8 @@ const sdp::Session& SipSdpMessage::ensureParsed() const
 	// destroyed and a new one landing at the same address.
 	//
 	// ON ADDRESS REUSE (ABA), because it is the case a reader will worry about:
-	// the heap-fallback path deletes and re-allocates SipSdpMessage, so a NEW
+	// a pool slot is re-assigned to a different message (and before #409 the heap
+	// fallback path deleted and re-allocated SipSdpMessage), so a NEW
 	// object really can land on an address a scratch slot is still tagged with.
 	// It is safe, but only because of the ORDER below. `_spansGen == gen` is
 	// checked FIRST and is per-object state: it can only be true if THIS object
