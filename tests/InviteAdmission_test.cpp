@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <utility>
@@ -587,6 +588,40 @@ TEST(InviteAdmission, TheRelayedAckCarriesNoCredential)
 	EXPECT_EQ(relayed.find("Authorization:"), std::string::npos) << relayed;
 }
 
+namespace
+{
+	// Answer the forked INVITE (callee 200 OK, caller ACK) so the dialog is
+	// Connected: in-dialog requests are relayed only on a Connected dialog.
+	// Every CSeq comes from the fork itself, never a hard-coded number.
+	void answerForkedCall(Harness& h, const std::string& callId)
+	{
+		const std::string fork = firstSentContaining(h.sent, "INVITE sip:600@");
+		ASSERT_FALSE(fork.empty());
+		auto lineOf = [&fork](const char* name) {
+			const size_t a = fork.find(name);
+			return fork.substr(a, fork.find("\r\n", a) - a);
+		};
+		const std::string cseq = lineOf("CSeq:");   // "CSeq: <n> INVITE"
+		const std::string answer = "v=0\r\no=- 0 0 IN IP4 192.168.7.60\r\ns=-\r\nc=IN IP4 192.168.7.60\r\nt=0 0\r\n" +
+			std::string(kPcmuOffer) + "a=sendrecv\r\n";
+		h.handler.handle(RequestsHandler::getMessageFromPool(
+			"SIP/2.0 200 OK\r\n" + lineOf("Via:") + "\r\n" + lineOf("From:") + "\r\n"
+			"To: <sip:600@server>;tag=callee560\r\n"
+			"Call-ID: " + callId + "\r\n" + cseq + "\r\n"
+			"Contact: <sip:600@192.168.7.60:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(answer.size()) + "\r\n\r\n" + answer,
+			addrFor("192.168.7.60")));
+		const int n = std::atoi(cseq.c_str() + 5);
+		auto ack = makeInvite(callId, n, kPcmuOffer);
+		ack->setHeader("ACK sip:600@server SIP/2.0");
+		ack->setCSeq("CSeq: " + std::to_string(n) + " ACK");
+		ack->setTo("To: <sip:600@server>;tag=callee560");
+		ack->clearBody();
+		h.handler.handle(ack);
+	}
+}
+
 TEST(InviteAdmission, ARelayedReinviteCarriesNoCredential)
 {
 	Harness h;
@@ -595,31 +630,7 @@ TEST(InviteAdmission, ARelayedReinviteCarriesNoCredential)
 	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
 	std::string nonce;
 	(void)admitCredentialedCall(h, "re560", &nonce);
-	const std::string fork = firstSentContaining(h.sent, "INVITE sip:600@");
-	ASSERT_FALSE(fork.empty());
-
-	// Answer the call first: a re-INVITE is only relayed on a Connected dialog.
-	auto lineOf = [&fork](const char* name) {
-		const size_t a = fork.find(name);
-		return fork.substr(a, fork.find("\r\n", a) - a);
-	};
-	const std::string answer = "v=0\r\no=- 0 0 IN IP4 192.168.7.60\r\ns=-\r\nc=IN IP4 192.168.7.60\r\nt=0 0\r\n" +
-		std::string(kPcmuOffer) + "a=sendrecv\r\n";
-	h.handler.handle(RequestsHandler::getMessageFromPool(
-		"SIP/2.0 200 OK\r\n" + lineOf("Via:") + "\r\n" + lineOf("From:") + "\r\n"
-		"To: <sip:600@server>;tag=callee560\r\n"
-		"Call-ID: re560\r\n"
-		"CSeq: 2 INVITE\r\n"
-		"Contact: <sip:600@192.168.7.60:5060>\r\n"
-		"Content-Type: application/sdp\r\n"
-		"Content-Length: " + std::to_string(answer.size()) + "\r\n\r\n" + answer,
-		addrFor("192.168.7.60")));
-	auto ack = makeInvite("re560", 2, kPcmuOffer);
-	ack->setHeader("ACK sip:600@server SIP/2.0");
-	ack->setCSeq("CSeq: 2 ACK");
-	ack->setTo("To: <sip:600@server>;tag=callee560");
-	ack->clearBody();
-	h.handler.handle(ack);
+	ASSERT_NO_FATAL_FAILURE(answerForkedCall(h, "re560"));
 
 	auto reinvite = makeInvite("re560", 3, kPcmuOffer,
 		inDialogCredential(nonce, "INVITE", "00000002", "5e1f0c77") + kProxyAuth);
@@ -642,7 +653,7 @@ TEST(InviteAdmission, ARelayedUpdateCarriesNoCredential)
 	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
 	std::string nonce;
 	(void)admitCredentialedCall(h, "up560", &nonce);
-	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
+	ASSERT_NO_FATAL_FAILURE(answerForkedCall(h, "up560"));
 
 	auto update = makeInvite("up560", 3, kPcmuOffer,
 		inDialogCredential(nonce, "UPDATE", "00000002", "5e1f0c78") + kProxyAuth);
