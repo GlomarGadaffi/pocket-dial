@@ -524,6 +524,15 @@ jobs:
           g++ --version | head -1
           python3 tests/tools/check_parser_callgraph.py
 
+      - name: Self-test the per-task stack depth gate (#457)
+        # Fixture .ci inputs only: over/under budget, a task missing from
+        # tools/ci/task_stacks.json, frame ceiling, PYTHONHASHSEED determinism,
+        # and the checked-in table against today's src/ + main/ task sites.
+        # Real numbers need Xtensa -fcallgraph-info=su output from the ESP eth
+        # build, which this runner doesn't produce; BigDog's local gate runs
+        # tools/ci/task_stack_gate.py --ci-dir <esp build dir> for that.
+        run: python3 -m unittest discover -s tests/tools -p 'test_task_stack_gate.py' -v
+
   # Job 2: Build firmware for target ESP32 and ESP32-S3 boards using official Espressif Docker Images.
   # This establishes compiler verification across multiple ESP-IDF versions and target architectures.
   build-esp-idf:
