@@ -69,6 +69,11 @@ add_executable(sip_parser_tests
     # Issue #410 phase 1: the static HTML pages stream from flash (byte-identical
     # to the old path, zero allocation beyond the CSRF token).
     HttpStaticPages_test.cpp
+    # Issue #412: every allocateVirtualPeer() caller must survive an exhausted
+    # pool -- refuse with 503 (or drop the anchor leg) and release what it had
+    # claimed, never publish a session with a null peer.
+    VpeerExhaustion_test.cpp
+    VpeerExhaustion_vm_anchor_test.cpp
     # Issue #115: the 777 SDP-loopback echo test must call allocateSession()
     # BEFORE building any 180/200, mirroring the ordinary call-to-call INVITE
     # path, so a full session pool gets a real 503 instead of a false 200.
@@ -146,6 +151,7 @@ add_executable(sip_parser_tests
     # 200 OK was silently dropped instead of reaching the held leg. Drives a full
     # 999 broadcast call through connect -> hold -> resume via handle().
     BroadcastHoldResume_test.cpp
+    TargetRefreshContact_test.cpp
     # Issue #263: sdp::isHold() (#255) had zero production callers -- the two
     # non-anchor hold/resume sites (onReinvite, onUpdate) called the older
     # direction-only getSdpDirection() instead, missing the legacy RFC 2543
@@ -329,6 +335,13 @@ add_executable(sip_parser_tests
     # Issue #382: /api/coredump* -- owner-only download, CSRF-checked erase,
     # ungated presence on /api/status, against a fake CoreDumpStore image.
     CoreDumpHttp_test.cpp
+    # Issue #363: every secret-bearing store is empty after a factory reset.
+    FactoryResetSecrets_test.cpp
+    # Issue #385: the brute-force state-recovery attack on IDGen, run for real
+    # (DISABLED_ by default -- a full 2^31 search each; see the file header).
+    IDGenPredict_test.cpp
+    # Issue #385: always-on seam/mapping guards for IDGen.
+    IDGen_test.cpp
     # Issue #186: GET/POST /api/config/export and POST /api/config/import,
     # driven end-to-end through a real HttpServer -- plaintext round-trip,
     # password-gated round-trip, replace-not-merge, and the 400/422 rejection
@@ -413,6 +426,7 @@ add_executable(sip_parser_tests
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
     # PcapCapture.hpp has no dependency beyond sockaddr_in.
     PcapCapture_test.cpp
+    DropProbe_test.cpp
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
     ProvisioningConfig_test.cpp
@@ -449,6 +463,8 @@ add_executable(sip_parser_tests
     # Issue #382: HttpServer's /api/coredump* routes call it; the host arm serves
     # a test-installed fake image instead of flash.
     ../src/Helpers/CoreDumpStore.cpp
+    # Issue #363: the secrets a factory reset must erase.
+    ../src/Helpers/FactoryReset.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
     # length/charset bounds that stop a typo from bringing the AP up open.
     DeviceConfig_test.cpp

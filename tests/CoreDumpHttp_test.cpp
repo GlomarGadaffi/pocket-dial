@@ -304,3 +304,35 @@ TEST_F(CoreDumpHttpTest, EraseNeedsTheCsrfTokenAndClearsTheDump)
 	EXPECT_NE(bodyOf(resp).find("\"erased\":true"), std::string::npos) << bodyOf(resp);
 	EXPECT_FALSE(CoreDumpStore::query().present);
 }
+
+// Issue #405: /api/status is polled continuously on 4 KB per-connection
+// threads. It must report the dump from the boot-time cache, never by probing
+// the partition (the flash driver's call chain is the ~836 B of stack #405
+// lost), and erase() must keep that cache truthful on its own.
+TEST_F(CoreDumpHttpTest, StatusAndInfoReadTheCacheNeverTheFlash)
+{
+	AdminSession sysop, owner;
+	provisionBoth(_port, sysop, owner);
+	CoreDumpStore::setImageForTest(fakeImage());   // a panic + reboot: probed once, here
+	const uint32_t before = CoreDumpStore::flashAccessCountForTest();
+
+	for (int i = 0; i < 3; ++i)
+	{
+		const std::string status = bodyOf(httpRaw(_port, "GET", "/api/status", ""));
+		EXPECT_NE(status.find("\"coredump\":{\"present\":true,\"size\":1500}"), std::string::npos) << status;
+	}
+	const std::string info = httpRaw(_port, "GET", "/api/coredump/info", "", "pd_session=" + sysop.cookie);
+	EXPECT_EQ(statusOf(info), 200);
+	EXPECT_NE(bodyOf(info).find("\"present\":true"), std::string::npos) << bodyOf(info);
+	EXPECT_EQ(CoreDumpStore::flashAccessCountForTest(), before)
+		<< "/api/status and /api/coredump/info must not touch the partition (#405)";
+
+	// erase() alone invalidates the cache: no stale "present":true, and no
+	// re-probe needed to find out.
+	EXPECT_EQ(statusOf(httpRaw(_port, "POST", "/api/coredump/erase", "",
+		"pd_session=" + sysop.cookie, sysop.csrf)), 200);
+	const std::string after = bodyOf(httpRaw(_port, "GET", "/api/status", ""));
+	EXPECT_NE(after.find("\"coredump\":{\"present\":false,\"size\":0}"), std::string::npos) << after;
+	EXPECT_EQ(CoreDumpStore::flashAccessCountForTest(), before)
+		<< "erase() must update the cache itself, not force a probe on the next poll";
+}
