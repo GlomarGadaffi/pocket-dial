@@ -97,6 +97,10 @@ public:
 	// stopBridge() the sender's and receiver's tasks (ESP) take a few ticks to
 	// exit, and until then their start() refuses, so a slot picker asks this
 	// first. Does not predict other failures (bus full, socket errors).
+	// Reads _receiver/_sender without _mutex on purpose: they are set once by
+	// init(), which for a conference leg runs only in ConferenceRoom's
+	// constructor, before any join() can call this. Taking the lock here would
+	// only add contention on the INVITE path.
 	bool canStart() const
 	{
 		return !_active.load(std::memory_order_acquire) && _receiver && _sender &&
