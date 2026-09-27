@@ -272,11 +272,16 @@ namespace
 #endif
 	}
 
+	// Nonce stamp clock. Monotonic, not wall time (#578): an SNTP step backward
+	// after a #525 replay-table overflow would stamp every fresh nonce at or
+	// before the eviction watermark and strand every phone on stale 401s. The
+	// stamp is never read as wall time. It restarts at boot, but so does the
+	// HMAC secret, so a pre-reboot nonce fails its tag rather than reading fresh.
 	uint64_t nowMs()
 	{
 		return static_cast<uint64_t>(
 			std::chrono::duration_cast<std::chrono::milliseconds>(
-				std::chrono::system_clock::now().time_since_epoch()).count());
+				std::chrono::steady_clock::now().time_since_epoch()).count());
 	}
 
 	// Constant-time string compare. Returns true iff equal. Does not short-circuit

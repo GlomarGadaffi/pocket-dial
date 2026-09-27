@@ -1,0 +1,2 @@
+# SipDigest_test.cpp: 1 (#578: nonce stamp is monotonic, immune to wall-clock steps)
+1
