@@ -1,2 +1,0 @@
-# Deregistration_test.cpp: 3 (#523)
-3
