@@ -241,9 +241,17 @@ Registrar::AuthDecision Registrar::admitSecure(
 	// the nonce's 5-minute lifetime, as before).
 	if (!auth.nc.empty())
 	{
-		char* end = nullptr;
-		const unsigned long nc = std::strtoul(auth.nc.c_str(), &end, 16);
-		const bool ncValid = end != auth.nc.c_str() && *end == '\0' && nc <= 0xFFFFFFFFul;
+		// #525 review: strict -- an RFC 2617 nc-value is exactly 8 hex digits.
+		bool ncValid = auth.nc.size() == 8;
+		unsigned long nc = 0;
+		for (char c : auth.nc)
+		{
+			const int v = (c >= '0' && c <= '9') ? c - '0'
+				: (c >= 'a' && c <= 'f') ? c - 'a' + 10
+				: (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+			if (v < 0) { ncValid = false; break; }
+			nc = (nc << 4) | static_cast<unsigned long>(v);
+		}
 		if (!ncValid || !noteNonceUse(auth.nonce, static_cast<uint32_t>(nc), std::chrono::steady_clock::now()))
 		{
 			_env.log("Secure " + std::string(data->getType()) + " for ext " + ext +
@@ -261,19 +269,39 @@ bool Registrar::noteNonceUse(const std::string& nonce, uint32_t nc, std::chrono:
 	// validateNonce() has already proved this is one of ours, which always fits;
 	// anything longer is not a shape we issue, so there is nothing to track.
 	if (nonce.size() >= sizeof(NonceUse::nonce)) return true;
-	NonceUse* victim = &_nonceUses[0];
+	// Our nonces start with their issue time in hex, up to the '.' (SipDigest.hpp).
+	uint64_t issuedMs = 0;
+	for (char c : nonce)
+	{
+		const int v = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+		if (v < 0) break;
+		issuedMs = (issuedMs << 4) | static_cast<uint64_t>(v);
+	}
+	NonceUse* victim = nullptr;
 	for (NonceUse& u : _nonceUses)
 	{
-		if (u.until > now && nonce == u.nonce)
+		const bool live = u.until > now;
+		if (live && nonce == u.nonce)
 		{
 			if (nc <= u.nc) return false;   // replay: nc must rise
 			u.nc = nc;
 			return true;
 		}
-		if (u.until < victim->until) victim = &u;   // expired (or never used) first
+		// Prefer a dead (expired or never used) slot; else the oldest-issued.
+		if (victim == nullptr) { victim = &u; continue; }
+		if (victim->until > now && (!live || u.issuedMs < victim->issuedMs)) victim = &u;
+	}
+	// Unknown here. If a nonce issued this early could have been evicted while
+	// live, it may already have been used: re-challenge rather than trust it.
+	if (_nonceLiveEvictions > 0 && issuedMs <= _nonceEvictedIssuedMs) return false;
+	if (victim->until > now)
+	{
+		++_nonceLiveEvictions;
+		if (victim->issuedMs > _nonceEvictedIssuedMs) _nonceEvictedIssuedMs = victim->issuedMs;
 	}
 	std::memcpy(victim->nonce, nonce.c_str(), nonce.size() + 1);
 	victim->nc = nc;
+	victim->issuedMs = issuedMs;
 	victim->until = now + std::chrono::milliseconds(SipDigest::kNonceTtlMs);
 	return true;
 }

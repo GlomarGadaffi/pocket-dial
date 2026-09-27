@@ -14,7 +14,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -573,4 +575,39 @@ TEST(InviteAdmission, ARisingNonceCountOnTheSameNonceIsStillAdmitted)
 	h.handler.handle(makeInvite("nc2", 1, kPcmuOffer, credentialsWithNc(nonce, "00000002")));
 	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@")) << "nc 2 on the same nonce is a new request";
 	EXPECT_FALSE(anySentContains(h.sent, "401 Unauthorized"));
+}
+
+TEST(InviteAdmission, AReplayedNonceStaysRefusedAfterTheReplayTableOverflows)
+{
+	// #525 review: the table holds 32 nonces. Evicting a live one used to make
+	// it an unknown nonce again, so a replay of it after 32 others was
+	// admitted. Now eviction raises a watermark of issue times, and a nonce
+	// issued at or before it is re-challenged instead of trusted.
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+
+	std::vector<std::string> nonces;
+	for (int i = 0; i < 33; ++i)
+	{
+		// Our nonces carry a millisecond timestamp: space them so each is new.
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		nonces.push_back(SipDigest::generateNonce());
+		ASSERT_TRUE(i == 0 || nonces[i] != nonces[i - 1]) << "precondition: distinct nonces";
+		h.sent.clear();
+		h.handler.handle(makeInvite("ov" + std::to_string(i), 1, kPcmuOffer,
+			credentialsWithNc(nonces[i], "00000001")));
+		ASSERT_FALSE(anySentContains(h.sent, "401 Unauthorized"))
+			<< "precondition: nonce " << i << " authenticates once";
+	}
+
+	// The first nonce has been pushed out of the table by the other 32.
+	h.sent.clear();
+	h.handler.handle(makeInvite("ov-replay", 1, kPcmuOffer, credentialsWithNc(nonces[0], "00000001")));
+	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@"))
+		<< "a replay of an evicted nonce must not place a call";
+	const std::string again = firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized");
+	ASSERT_FALSE(again.empty()) << "it is re-challenged";
+	EXPECT_NE(again.find("stale=true"), std::string::npos) << again;
 }
