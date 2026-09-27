@@ -57,6 +57,15 @@ namespace resetguard
 	// Host-only seam (#476 review): runs INSIDE WriteScope's constructor, between
 	// its two steps, so a test can start a reset at exactly the point where the
 	// order of those steps matters -- deterministically, with no timing race.
+	// Host-only seam (#481 review): the HTTP reset door calls this right before
+	// its first erase (AdminAuth::clearCredential()), so a test can check that
+	// the guard and the journal are already open at that moment.
+	inline void (*&beforeFirstEraseHookForTest())()
+	{
+		static void (*h)() = nullptr;
+		return h;
+	}
+
 	using BetweenStepsHook = void (*)();
 	inline BetweenStepsHook& betweenStepsHookForTest()
 	{
@@ -107,6 +116,6 @@ namespace resetguard
 
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 	// Host tests share one process: clear the flag a test set.
-	inline void resetForTest() { flagRef().store(false); writersRef().store(0); betweenStepsHookForTest() = nullptr; }
+	inline void resetForTest() { flagRef().store(false); writersRef().store(0); betweenStepsHookForTest() = nullptr; beforeFirstEraseHookForTest() = nullptr; }
 #endif
 }
