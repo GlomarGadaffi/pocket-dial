@@ -717,12 +717,14 @@ TEST(Registrar, OpenIsNotAModeAnyMore)
 
 	AdminSession a = loginAndCompleteSetup(18104);
 	ASSERT_FALSE(a.cookie.empty());
+	// Start from Secure, not the default, so "unchanged" proves something (#502 review).
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
 
 	std::string set = httpPostRaw(18104, "/api/registrar", "mode=open",
 	                              "pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(set), 400) << set;
 	EXPECT_NE(set.find("open is retired"), std::string::npos) << set;
-	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Learn)
+	EXPECT_EQ(handler.getRegistrarMode(), RequestsHandler::RegistrarMode::Secure)
 		<< "a refused mode must not change the mode";
 
 	AdminAuth::clearCredential();

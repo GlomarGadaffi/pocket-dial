@@ -500,6 +500,27 @@ TEST_F(ConfigExportImportTest, Import_WifiModeOutOfRange_SkippedNotWrappedIntoRa
 		<< "an out-of-range mode must not have been silently applied via integer wraparound";
 }
 
+TEST_F(ConfigExportImportTest, Import_WithoutARegistrarMode_LeavesTheModeUnchanged)
+{
+	// BigDog's #502 review: a trimmed blob with no registrarMode key used to apply
+	// the default (open, then learn), quietly dropping a Secure board.
+	_handler->setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+	std::string blob =
+		R"({"exportVer":1,"plaintext":{"extensions":[],"extensionSecrets":[],)"
+		R"("ringGroups":[],"forwards":[],"dnd":[],"pageZones":[],"dialPlan":[],)"
+		R"("didMappings":[],"telephonyConfig":[],)"
+		R"("wifiSsid":"","wifiMode":0,"apSecure":false,"parkTimeoutSec":90,)"
+		R"("mdnsHostname":"pocketdial","schemaVer":1}})";
+	std::string resp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&confirm=REPLACE",
+		"pd_session=" + _sysop.cookie, _sysop.csrf);
+	ASSERT_EQ(statusOf(resp), 200) << resp;
+	EXPECT_EQ(_handler->getRegistrarMode(), RequestsHandler::RegistrarMode::Secure);
+	EXPECT_NE(bodyOf(resp).find("registrarMode (not in the file; left unchanged)"), std::string::npos)
+		<< bodyOf(resp);
+	_handler->setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+}
+
 TEST_F(ConfigExportImportTest, Import_RetiredOpenMode_AppliesLearnAndSaysSo)
 {
 	// #500: an export from before the open registrar was retired says "open".

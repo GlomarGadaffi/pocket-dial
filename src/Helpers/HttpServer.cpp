@@ -4739,7 +4739,15 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		// "open". Apply learn, the closest mode that still exists (it admits every
 		// phone's first REGISTER), and say so, so the operator is not surprised.
 		RequestsHandler::RegistrarMode parsedMode;
-		std::string importedMode = pt->stringOr("registrarMode", "learn");
+		// A blob with no registrarMode key leaves the mode as it is (BigDog's #502
+		// review): defaulting a missing key would quietly drop a Secure board to
+		// Learn, reported only under "applied". The empty string parses as no
+		// mode, so nothing below applies it.
+		std::string importedMode = pt->stringOr("registrarMode", "");
+		if (importedMode.empty())
+		{
+			skipped.push_back("registrarMode (not in the file; left unchanged)");
+		}
 		if (importedMode == "open")
 		{
 			importedMode = "learn";
