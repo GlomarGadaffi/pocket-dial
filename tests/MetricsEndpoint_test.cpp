@@ -169,6 +169,8 @@ namespace
 		{ "pocketdial_sip_calls_active",           "gauge"   },
 		{ "pocketdial_packets_processed_total",    "counter" },
 		{ "pocketdial_packets_dropped_total",      "counter" },
+		{ "pocketdial_packets_dropped_invalid_total", "counter" },   // #430
+		{ "pocketdial_packets_dropped_rate_total", "counter" },      // #430
 		{ "pocketdial_sdp_rejected_total",         "counter" },
 	};
 }

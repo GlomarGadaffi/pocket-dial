@@ -38,6 +38,7 @@
 #include "Session.hpp"
 #include "CallDetailRecord.hpp"
 #include "PcapCapture.hpp"
+#include "DropProbe.hpp"   // Issue #430: per-reason drop counts + recent-drop ring
 #include "PbxConfig.hpp"
 #include "DialPlan.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: pbx::EmergencyDial
@@ -149,6 +150,12 @@ public:
 	void forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
+	// Issue #430: packetsDropped split by reason (their sum), and the probe
+	// itself for its recent-drop ring (read with window()/at(); thread-safe,
+	// allocation-free on both sides).
+	uint64_t getDroppedInvalid() const;
+	uint64_t getDroppedRate() const;
+	const DropProbe& getDropProbe() const;
 	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
 	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
@@ -361,6 +368,25 @@ public:
 	// resolution has at least been ASKED FOR, which is what proves tick()
 	// primes the cache rather than leaving an FQDN trunk permanently dead.
 	TrunkResolver::Status trunkResolveStatusForTest();
+
+	// Exhaust virtual-peer capacity (#412): draw through the REAL allocator
+	// until it refuses, and hand back everything it gave out. Hold the vector
+	// to keep capacity exhausted; drop it to restore. Drawing through
+	// allocateVirtualPeer() rather than reading _virtualPeerPool directly is
+	// deliberate -- it exhausts whatever the allocator has behind the pool
+	// too (the #101A heap fallback while it exists), so the next draw really
+	// returns nullptr, which is the state every caller must survive.
+	std::vector<std::shared_ptr<SipClient>> exhaustVirtualPeersForTest()
+	{
+		std::vector<std::shared_ptr<SipClient>> held;
+		for (size_t guard = 0; guard < 4 * POCKETDIAL_VIRTUAL_PEERS + 64; ++guard)
+		{
+			auto p = allocateVirtualPeer("vpeer-drain", sockaddr_in{});
+			if (!p) break;
+			held.push_back(std::move(p));
+		}
+		return held;
+	}
 #endif
 
 	// ── Telephony-API credential slots (ported from drawbridge) ──────────────────
@@ -530,6 +556,26 @@ public:
 	bool bindOutboundParticipantForTest(const std::string& callId, const std::string& ownLeg)
 	{
 		return bindOutboundParticipant(callId, ownLeg);
+	}
+
+	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
+	// anchor's CallEvent::Incoming does, and return the new session's Call-ID
+	// line ("" if routing declined). Without this no host test can reach an
+	// isAnchorInbound() session at all -- Loopback's own inbound hook is never
+	// wired through RequestsHandler (see anchorIsSynchronous()) -- and that gap
+	// is how #439's first cut relayed a handset's session refresh to the PSTN
+	// peer's zeroed address unnoticed. Not compiled into device firmware.
+	std::string routeInboundAnchorCallForTest(const std::string& routeDn,
+	                                          const std::string& participantId,
+	                                          const std::string& callerId)
+	{
+		_anchorRouteDn = routeDn;
+		routeInboundAnchorCall(participantId, callerId);
+		for (const auto& [cid, s] : _sessions)
+		{
+			if (s->isAnchorInbound()) return std::string(s->getCallID());
+		}
+		return {};
 	}
 
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
@@ -1888,6 +1934,7 @@ private:
 
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
+	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
