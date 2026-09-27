@@ -58,9 +58,12 @@ public:
 	// Set false to simulate a drained session pool (the 503 guard paths).
 	bool sessionPoolAvailable = true;
 	// Set false to simulate an exhausted message pool (Issue #101(A) territory):
-	// messageFromPool() returns nullptr, as the real pool does once it and its
-	// bounded heap fallback are both spent.
+	// messageFromPool() returns nullptr, as the real pool does once it is spent
+	// (no heap fallback since #409).
 	bool messagePoolAvailable = true;
+	// When > 0: the Nth draw from now fails, once, and every other draw succeeds
+	// (#581 review: fail ONE specific draw, e.g. only a challenge retry's INVITE).
+	int messagePoolFailDrawIn = 0;
 
 	// Call-IDs passed to freeTransactionsForCallId(), in order.
 	std::vector<std::string> freedTransactionCallIds;
@@ -101,6 +104,7 @@ public:
 	std::shared_ptr<SipMessage> messageFromPool(std::string raw, sockaddr_in src) override
 	{
 		if (!messagePoolAvailable) return nullptr;
+		if (messagePoolFailDrawIn > 0 && --messagePoolFailDrawIn == 0) return nullptr;
 		return std::make_shared<SipMessage>(raw, src);
 	}
 	// Records every Call-ID whose client transactions were released, so a test can

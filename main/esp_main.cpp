@@ -6,6 +6,7 @@
 #include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "bootloader_random.h"   // Issue #588: SAR ADC entropy for the pre-start PSK draw
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #185: sip_server_task TWDT subscription
@@ -93,6 +94,15 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 // ── INFRA topology: Wi-Fi SoftAP + DHCP server ────────────────────────────────
 static std::string wifi_init_softap(void)
 {
+    // Issue #588: esp_random() is only a TRNG while RF or the SAR ADC entropy
+    // source runs (IDF random.rst). getApPsk() generates the passphrase on first
+    // boot, and RF is not up yet, so draw it here with the ADC source on -- and
+    // turn that source OFF before esp_wifi_init(): Wi-Fi uses the ADC itself.
+    const bool ap_secure = DeviceConfig::isApSecure();
+    bootloader_random_enable();
+    const std::string psk = ap_secure ? DeviceConfig::getApPsk() : std::string();
+    bootloader_random_disable();
+
     esp_netif_t* ap_netif = esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -116,9 +126,7 @@ static std::string wifi_init_softap(void)
     // alike, went out in the clear. DeviceConfig owns the choice now; it defaults
     // to open so an already-deployed fleet is not cut off by a firmware update
     // (see DeviceConfig.hpp), and is flipped from the dashboard or at flash time.
-    const bool ap_secure = DeviceConfig::isApSecure();
     if (ap_secure) {
-        std::string psk = DeviceConfig::getApPsk();
         strlcpy((char*)wifi_config.ap.password, psk.c_str(), sizeof(wifi_config.ap.password));
         wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
         // Yes, this logs the passphrase in the clear. This is the HEADLESS build:

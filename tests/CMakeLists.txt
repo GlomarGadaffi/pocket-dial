@@ -80,10 +80,12 @@ add_executable(sip_parser_tests
     # The binary's one counting operator new, plus its own positive controls.
     support/AllocCounter.cpp
     AllocCounter_test.cpp
-    # Issue #101(A)/(E): message-pool backpressure (bounded heap fallback, then
-    # refuse) and the concurrent-handout invariant. Draws on the process-global
+    # Issue #101(A)/(E): message-pool backpressure (refuse when spent; no heap
+    # fallback since #409) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
     RequestsHandler_pool_test.cpp
+    # Issue #409: a spent pool refuses, never heap-falls-back.
+    PoolNoHeapFallback_test.cpp
     # Issue #410 phase 1: the static HTML pages stream from flash (byte-identical
     # to the old path, zero allocation beyond the CSRF token).
     HttpStaticPages_test.cpp
@@ -474,6 +476,8 @@ add_executable(sip_parser_tests
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
     # PcapCapture.hpp has no dependency beyond sockaddr_in.
     PcapCapture_test.cpp
+    # Issue #470 / #473: CDR ring as an NVS blob, and the factory-reset write guard.
+    CdrPersistBlob_test.cpp
     # Issue #463 (#284 batch B): the idle tick, OPTIONS ping and header rewrites.
     IdleTickAlloc_test.cpp
     # Issue #464 (#284 batch C): per-request lookups allocate nothing.
@@ -520,6 +524,9 @@ add_executable(sip_parser_tests
     # Issue #382: HttpServer's /api/coredump* routes call it; the host arm serves
     # a test-installed fake image instead of flash.
     ../src/Helpers/CoreDumpStore.cpp
+    # Issue #473: the factory-reset journal (host arm keeps the record in memory).
+    ../src/Helpers/ResetJournal.cpp
+    ResetJournal_test.cpp
     # Issue #363: the secrets a factory reset must erase.
     ../src/Helpers/FactoryReset.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
