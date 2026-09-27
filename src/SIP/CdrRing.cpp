@@ -112,18 +112,14 @@ namespace
 	}
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	// Queue depth 1 (issue #315): persist() already sends non-blocking
-	// (xQueueSend(..., 0), see its comment) and already treats a dropped
-	// blob as fine -- every blob is a COMPLETE ring snapshot, not one
-	// incremental record, so a dropped blob's contents are entirely
-	// superseded by whichever later blob the writer task does drain, and
-	// persistence for that particular call is merely delayed until the
-	// next one ends. Depth 2 bought one extra buffered blob before that
-	// (already-accepted) degradation path kicks in; nothing reads queue
-	// length or otherwise depends on 2 specifically. At depth 1, back-to-
-	// back call teardowns arriving faster than one NVS write completes
-	// start dropping one call sooner than they used to -- same kind of
-	// delay the design already tolerates, not a new failure mode.
+	// Queue depth 1 (issue #315): persist() sends non-blocking with
+	// xQueueOverwrite (#476 review; see its comment), so the NEWEST complete
+	// ring snapshot always replaces an undrained older one -- every blob is a
+	// complete snapshot, not one incremental record. Back-to-back call
+	// teardowns arriving faster than one NVS write completes therefore
+	// coalesce into the latest snapshot; no history is lost, only written
+	// later. A reset's erase is never overwritten by a data snapshot
+	// (persistAction()).
 	constexpr size_t kQueueDepth = 1;
 
 	QueueHandle_t& cdrPersistQueue()
@@ -571,15 +567,13 @@ void CdrRing::persist()
 
 	// Non-blocking: never stall the caller (which may be holding
 	// RequestsHandler::_mutex, or be a real-time task) waiting for queue
-	// space. Dropping is safe here in a way it would not be for
-	// CdrArchive.cpp's per-row queue: every blob is a COMPLETE snapshot of
-	// the whole ring, not one incremental record, so a dropped blob's
-	// contents are entirely superseded by whichever later blob the writer
-	// task does end up draining -- nothing is permanently lost, persistence
-	// for THIS particular call is merely delayed until the next one ends.
+	// space. Replacing an undrained blob is safe here in a way it would not
+	// be for CdrArchive.cpp's per-row queue: every blob is a COMPLETE
+	// snapshot of the whole ring, so the one this call overwrites is fully
+	// contained in this newer one.
 	//
 	// Guard the handle (same convention TelephonyAnchorClient.cpp's
-	// _wsWorkQueue uses): xQueueSend on a null handle is a FreeRTOS
+	// _wsWorkQueue uses): a queue send on a null handle is a FreeRTOS
 	// configASSERT, not a safe no-op, and ensureWriterTaskStarted() can leave
 	// the queue null if xQueueCreateWithCaps/xTaskCreatePinnedToCore failed under
 	// memory pressure -- exactly the condition #273 was investigating, so
