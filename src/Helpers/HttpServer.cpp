@@ -989,8 +989,9 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "GET" && req.path == "/api/config/export")
 	{
-		// Plaintext-only export. Read, but genuinely sensitive (digest secrets,
-		// dial plan, MAC bindings) -- sysop-gated, not public like /api/status.
+		// Plaintext-only export. Read, but genuinely sensitive (which extensions
+		// are secured, the dial plan, MAC bindings -- never a digest HA1, #482) --
+		// sysop-gated, not public like /api/status.
 		if (requireAdmin(clientSock, req, false))
 		{
 			sendApiConfigExport(clientSock, /*withSecrets=*/false, "");
@@ -1008,17 +1009,35 @@ void HttpServer::handleClient(int clientSock)
 		if (requireAdmin(clientSock, req, true,
 			withSecrets ? AdminAuth::Role::Owner : AdminAuth::Role::Sysop))
 		{
-			sendApiConfigExport(clientSock, withSecrets, password);
+			// #484 review finding 4: the encrypted block now holds a
+			// password-equivalent for every secured extension, and PBKDF2 buys
+			// little against an offline guess of a short password.
+			static constexpr size_t kMinExportPasswordLen = 12;
+			if (withSecrets && password.size() < kMinExportPasswordLen)
+			{
+				sendResponse(clientSock, 400, "Bad Request", "application/json",
+				             "{\"error\":\"the export password must be at least 12 characters\"}");
+			}
+			else
+			{
+				sendApiConfigExport(clientSock, withSecrets, password);
+			}
 		}
 	}
 	else if (req.method == "POST" && req.path == "/api/config/import")
 	{
-		// Sysop-level: #173 lists factory reset / export-with-secrets / OTA
-		// upload as the three owner-only actions, and restoring config is not
-		// one of them -- it gets its own confirm-before-overwrite interlock
-		// instead (checked inside the handler), matching "sysop gets add/
-		// change with a confirm-before-overwrite interlock".
-		if (requireAdmin(clientSock, req, true))
+		// A plaintext-only restore is sysop-level: restoring config is not one of
+		// #173's owner-only actions, and it has its own confirm-before-overwrite
+		// interlock (checked inside the handler). But a non-empty `password`
+		// means the encrypted secretsEnc block will be applied -- digest HA1s,
+		// the Wi-Fi password, the AP PSK -- and that is exactly what
+		// export-with-secrets reads, so it takes the SAME owner gate. The
+		// block authenticates the password, not who made the file: without this,
+		// a sysop could seal their own HA1 for any extension offline and take it
+		// over (#484 review, Crew finding 1).
+		const bool withSecrets = !getFormParam(req.body, "password").empty();
+		if (requireAdmin(clientSock, req, true,
+			withSecrets ? AdminAuth::Role::Owner : AdminAuth::Role::Sysop))
 		{
 			sendApiConfigImport(clientSock, req.body);
 		}
@@ -4101,6 +4120,14 @@ void HttpServer::sendApiAdminLogout(int sock, const HttpRequest& req)
 // ── Config export/import (issue #186) ─────────────────────────────────────
 namespace
 {
+	// #484 review finding 5: wipe key material and HA1-bearing buffers once used.
+	// volatile, so the compiler cannot drop the stores as dead.
+	void secureWipe(void* p, size_t n)
+	{
+		volatile unsigned char* v = static_cast<volatile unsigned char*>(p);
+		while (n--) *v++ = 0;
+	}
+
 	std::string toHexLocal(const uint8_t* data, size_t len)
 	{
 		static const char* d = "0123456789abcdef";
@@ -4420,7 +4447,7 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 			}
 		}
 		gated << "]}";
-		const std::string gatedPlaintext = gated.str();
+		std::string gatedPlaintext = gated.str();
 
 		uint8_t salt[AdminAuth::kKdfSaltBytes];
 		uint8_t nonce[AdminAuth::kGcmNonceBytes];
@@ -4438,6 +4465,8 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 		// from two different exports, or against a tampered plaintext
 		// section, without failing authentication on import.
 		AdminAuth::aesGcmSeal(key, nonce, plaintextJson, gatedPlaintext, ct);
+		secureWipe(key, sizeof(key));
+		secureWipe(&gatedPlaintext[0], gatedPlaintext.size());
 
 		out << ",\"secretsEnc\":{\"kdf\":\"pbkdf2-sha256\""
 		    << ",\"iter\":" << AdminAuth::kExportKdfIterations
@@ -4556,7 +4585,9 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		const std::string ctStr(reinterpret_cast<const char*>(ct.data()), ct.size());
 		const std::string aad = blob.substr(pt->spanStart, pt->spanEnd - pt->spanStart);
 		std::string plaintextOut;
-		if (!AdminAuth::aesGcmOpen(key, nonce.data(), aad, ctStr, plaintextOut))
+		const bool opened = AdminAuth::aesGcmOpen(key, nonce.data(), aad, ctStr, plaintextOut);
+		secureWipe(key, sizeof(key));
+		if (!opened)
 		{
 			sendResponse(sock, 422, "Unprocessable Entity", "application/json",
 			             "{\"error\":\"bad password or corrupted secrets block\"}");
@@ -4564,7 +4595,9 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		}
 
 		std::string innerErr;
-		if (!JsonReader::parse(plaintextOut, secretsValue, innerErr) || !secretsValue.isObject())
+		const bool parsed = JsonReader::parse(plaintextOut, secretsValue, innerErr);
+		if (!plaintextOut.empty()) secureWipe(&plaintextOut[0], plaintextOut.size());
+		if (!parsed || !secretsValue.isObject())
 		{
 			sendResponse(sock, 400, "Bad Request", "application/json",
 			             "{\"error\":\"decrypted secrets block is not valid JSON\"}");
@@ -4830,17 +4863,48 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 			applied.push_back("telephonyConfig (baseUrl/clientId/routeDn)");
 		}
 
-		// #482: per-extension digest secrets, restored from the encrypted block.
-		size_t restored = 0, rejected = 0;
-		for (const auto& e : secretsValue.arrayOr("extensionSecrets"))
+		// #482: per-extension digest secrets, restored from the encrypted block
+		// (owner-gated at the route, #484 review finding 1).
+		//
+		// #484 review finding 2: REPLACE means replace. When the file carries an
+		// extensionSecrets list, a secured extension that is NOT in it loses its
+		// secret, so a stale credential cannot survive the restore. Only when the
+		// key is present: an encrypted export from before #482 has no such list,
+		// and must not wipe every secret on the board. The count is capped at the
+		// device's own client capacity, so a crafted file cannot flood the store.
+		const JsonReader::Value* secretsList = secretsValue.find("extensionSecrets");
+		if (secretsList != nullptr && secretsList->isArray())
 		{
-			if (SipSecretStore::setHa1(e.stringOr("extension"), e.stringOr("ha1"))) ++restored;
-			else ++rejected;
+			const size_t cap = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS);
+			size_t restored = 0, rejected = 0, overCap = 0;
+			std::vector<std::string> inFile;
+			for (const auto& e : secretsValue.arrayOr("extensionSecrets"))
+			{
+				if (restored + rejected >= cap) { ++overCap; continue; }
+				const std::string ext = e.stringOr("extension");
+				if (SipSecretStore::setHa1(ext, e.stringOr("ha1"))) { ++restored; inFile.push_back(ext); }
+				else ++rejected;
+			}
+			size_t cleared = 0;
+			for (const auto& ext : SipSecretStore::securedExtensions())
+			{
+				if (std::find(inFile.begin(), inFile.end(), ext) == inFile.end() &&
+					SipSecretStore::clearSecret(ext))
+				{
+					++cleared;
+				}
+			}
+			if (restored > 0)
+				applied.push_back("extensionSecrets (" + std::to_string(restored) + ")");
+			if (cleared > 0)
+				applied.push_back("extensionSecrets cleared (" + std::to_string(cleared) +
+					" secured extension(s) not in the file)");
+			if (rejected > 0)
+				skipped.push_back("extensionSecrets (" + std::to_string(rejected) + " malformed entries)");
+			if (overCap > 0)
+				skipped.push_back("extensionSecrets (" + std::to_string(overCap) +
+					" entries over the device's capacity of " + std::to_string(cap) + ")");
 		}
-		if (restored > 0)
-			applied.push_back("extensionSecrets (" + std::to_string(restored) + ")");
-		if (rejected > 0)
-			skipped.push_back("extensionSecrets (" + std::to_string(rejected) + " malformed entries)");
 	}
 	else if (secretsEncNode)
 	{

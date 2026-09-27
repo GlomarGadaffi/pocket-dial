@@ -143,25 +143,30 @@ namespace
 		return nvs_set_str(h, kIndexKey, joined.c_str()) == ESP_OK;
 	}
 
-	void indexAddLocked(nvs_handle_t h, const std::string& ext)
+	// Both return false only if the index needed a write and it failed (#484
+	// review finding 3: every NVS return is checked). The index is one NVS
+	// string, capped at 4000 B by IDF, so a full index is a real failure mode.
+	bool indexAddLocked(nvs_handle_t h, const std::string& ext)
 	{
 		auto exts = readIndexLocked(h);
 		if (std::find(exts.begin(), exts.end(), ext) == exts.end())
 		{
 			exts.push_back(ext);
-			writeIndexLocked(h, exts);
+			return writeIndexLocked(h, exts);
 		}
+		return true;
 	}
 
-	void indexRemoveLocked(nvs_handle_t h, const std::string& ext)
+	bool indexRemoveLocked(nvs_handle_t h, const std::string& ext)
 	{
 		auto exts = readIndexLocked(h);
 		auto it = std::remove(exts.begin(), exts.end(), ext);
 		if (it != exts.end())
 		{
 			exts.erase(it, exts.end());
-			writeIndexLocked(h, exts);
+			return writeIndexLocked(h, exts);
 		}
+		return true;
 	}
 #endif
 }
@@ -207,9 +212,17 @@ namespace SipSecretStore
 			return false;
 		}
 		bool ok = (nvs_set_str(h, nvsKeyFor(ext).c_str(), ha1.c_str()) == ESP_OK);
-		if (ok)
+		if (ok && !indexAddLocked(h, ext))
 		{
-			indexAddLocked(h, ext);
+			// #484 review finding 3: a secret the index does not list would
+			// authenticate yet be invisible to securedExtensions() -- and so drop
+			// out of the next export. Undo the key rather than leave that state.
+			(void)nvs_erase_key(h, nvsKeyFor(ext).c_str());
+			(void)nvs_commit(h);
+			ok = false;
+		}
+		else if (ok)
+		{
 			ok = (nvs_commit(h) == ESP_OK);
 		}
 		nvs_close(h);
@@ -345,8 +358,10 @@ namespace SipSecretStore
 		bool ok = (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND);
 		if (ok)
 		{
-			indexRemoveLocked(h, ext);
-			ok = (nvs_commit(h) == ESP_OK);
+			// The key is gone either way; a failed index write is still reported
+			// (#484 review finding 3) -- the index would list an unsecured ext.
+			const bool indexOk = indexRemoveLocked(h, ext);
+			ok = (nvs_commit(h) == ESP_OK) && indexOk;
 		}
 		nvs_close(h);
 		ha1Cache().erase(ext);   // drop the RAM copy so a stale HA1 can't authenticate

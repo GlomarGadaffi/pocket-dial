@@ -357,7 +357,7 @@ TEST_F(ConfigExportImportTest, PasswordGatedRoundTrip_WifiPasswordAndApPsk)
 
 	std::string importResp = httpRaw(_port, "POST", "/api/config/import",
 		"blob=" + urlEncode(blob) + "&password=exportpass123&confirm=REPLACE",
-		"pd_session=" + _sysop.cookie, _sysop.csrf);
+		"pd_session=" + owner.cookie, owner.csrf);
 	ASSERT_EQ(statusOf(importResp), 200) << importResp;
 	EXPECT_NE(bodyOf(importResp).find("\"wifiPassword\""), std::string::npos) << bodyOf(importResp);
 
@@ -401,7 +401,7 @@ TEST_F(ConfigExportImportTest, Import_WrongPassword_Rejected422_StateUntouched)
 
 	std::string importResp = httpRaw(_port, "POST", "/api/config/import",
 		"blob=" + urlEncode(blob) + "&password=totallywrongpassword&confirm=REPLACE",
-		"pd_session=" + _sysop.cookie, _sysop.csrf);
+		"pd_session=" + owner.cookie, owner.csrf);
 	EXPECT_EQ(statusOf(importResp), 422) << importResp;
 
 	// A 422 must leave the previously-set secret exactly as it was.
@@ -453,7 +453,7 @@ TEST_F(ConfigExportImportTest, Import_TamperedSecretsBlock_Rejected422)
 
 	std::string importResp = httpRaw(_port, "POST", "/api/config/import",
 		"blob=" + urlEncode(blob) + "&password=correctpassword1&confirm=REPLACE",
-		"pd_session=" + _sysop.cookie, _sysop.csrf);
+		"pd_session=" + owner.cookie, owner.csrf);
 	EXPECT_EQ(statusOf(importResp), 422) << importResp;
 }
 
@@ -477,9 +477,10 @@ TEST_F(ConfigExportImportTest, Import_ExcessiveKdfIterations_Rejected400)
 		R"({"exportVer":1,"plaintext":{},"secretsEnc":{"kdf":"pbkdf2-sha256",)"
 		R"("iter":2000000000,"salt":"00112233445566778899aabbccddeeff",)"
 		R"("nonce":"00112233445566778899aabb","ct":"00112233445566778899aabbccddeeff"}})";
+	AdminSession owner = loginOwner();   // #484 review: importing secrets is owner-only
 	std::string resp = httpRaw(_port, "POST", "/api/config/import",
 		"blob=" + urlEncode(blob) + "&password=whatever&confirm=REPLACE",
-		"pd_session=" + _sysop.cookie, _sysop.csrf);
+		"pd_session=" + owner.cookie, owner.csrf);
 	EXPECT_EQ(statusOf(resp), 400) << resp;
 }
 
@@ -528,7 +529,7 @@ TEST_F(ConfigExportImportTest, AdminHashNeverAppearsInExport_PlaintextOrGated)
 	// not just in the plaintext section.
 	std::string decryptImportResp = httpRaw(_port, "POST", "/api/config/import",
 		"blob=" + urlEncode(blob) + "&password=exportpass123&confirm=REPLACE",
-		"pd_session=" + _sysop.cookie, _sysop.csrf);
+		"pd_session=" + owner.cookie, owner.csrf);
 	// This assertion only needs the request to have been PROCESSED (200 or a
 	// benign partial-skip is fine); the real check already happened above on
 	// the wire bytes actually sent, which is what an attacker could read.
@@ -617,7 +618,7 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_RestoresSecuredExtensions)
 
 	std::string importResp = httpRaw(_port, "POST", "/api/config/import",
 		"blob=" + urlEncode(blob) + "&password=exportpass123&confirm=REPLACE",
-		"pd_session=" + _sysop.cookie, _sysop.csrf);
+		"pd_session=" + owner.cookie, owner.csrf);
 	ASSERT_EQ(statusOf(importResp), 200) << importResp;
 	EXPECT_NE(bodyOf(importResp).find("extensionSecrets (" + std::to_string(securedAtExport) + ")"),
 		std::string::npos) << bodyOf(importResp);
@@ -664,4 +665,56 @@ TEST_F(ConfigExportImportTest, LegacyPlaintextHa1s_AreReportedNotRestored)
 	EXPECT_NE(bodyOf(importResp).find("legacy export carries digest secrets in CLEAR"), std::string::npos)
 		<< bodyOf(importResp);
 	EXPECT_FALSE(SipSecretStore::hasSecret("101"));
+}
+
+// #484 review finding 1 (Crew): the encrypted block authenticates the password,
+// not who made the file, so a sysop could seal their own HA1 for any extension
+// offline. Applying secrets is owner-only, exactly like exporting them.
+TEST_F(ConfigExportImportTest, SysopImportCarryingSecrets_IsRefused_HaUnchanged)
+{
+	SecuredExts secured;
+	const std::string before = *SipSecretStore::getHa1("101");
+	AdminSession owner = loginOwner();
+	std::string exportResp = httpRaw(_port, "POST", "/api/config/export",
+		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+
+	std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(bodyOf(exportResp)) + "&password=exportpass123&confirm=REPLACE",
+		"pd_session=" + _sysop.cookie, _sysop.csrf);
+	EXPECT_EQ(statusOf(importResp), 403) << importResp;
+	EXPECT_EQ(*SipSecretStore::getHa1("101"), before) << "a refused import must not touch a secret";
+}
+
+// #484 review finding 2 (Crew): REPLACE means replace. A secured extension the
+// restored file does not list loses its secret, so a stale credential cannot
+// survive the restore.
+TEST_F(ConfigExportImportTest, EncryptedRestore_ClearsSecuredExtensionsNotInTheFile)
+{
+	SecuredExts secured;   // 101 and 102, in the export below
+	AdminSession owner = loginOwner();
+	std::string exportResp = httpRaw(_port, "POST", "/api/config/export",
+		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+
+	ASSERT_TRUE(SipSecretStore::setSecret("109", "added-after-the-export"));
+	std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(bodyOf(exportResp)) + "&password=exportpass123&confirm=REPLACE",
+		"pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+	EXPECT_FALSE(SipSecretStore::hasSecret("109")) << "a secret the file does not carry must not survive REPLACE";
+	EXPECT_TRUE(SipSecretStore::hasSecret("101"));
+	EXPECT_NE(bodyOf(importResp).find("extensionSecrets cleared"), std::string::npos) << bodyOf(importResp);
+	SipSecretStore::clearSecret("109");
+}
+
+// #484 review finding 4 (Crew): the encrypted export holds a password-equivalent
+// for every secured extension; a short password is refused before any work.
+TEST_F(ConfigExportImportTest, EncryptedExport_WithAShortPassword_Is400)
+{
+	AdminSession owner = loginOwner();
+	std::string resp = httpRaw(_port, "POST", "/api/config/export",
+		"password=short", "pd_session=" + owner.cookie, owner.csrf);
+	EXPECT_EQ(statusOf(resp), 400) << resp;
+	EXPECT_EQ(bodyOf(resp).find("secretsEnc"), std::string::npos);
 }
