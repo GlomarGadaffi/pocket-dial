@@ -3797,23 +3797,27 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// handset's audio rather than transcoding it, so an offer the anchor cannot
 	// carry is no better there, and the 503 below says exactly why.
 	//
-	// #538 review M1: the anchor's gate only runs when the anchor is real AND up,
-	// so a trunk-only board (or an anchor that is down) needs its own. onTrunkAnswered
-	// answers the handset with buildMediaSdp's PCMU-only SDP, so a PCMA- or
-	// G.722-only 911 would otherwise CONNECT with dead audio while the front desk
-	// is told ROUTED TO TRUNK.
-	if (!codecRejected && data->hasSdp() &&
-		!data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
-	{
-		codecRejected = true;
-	}
 	if (!codecRejected && _sipTrunk.config().valid())
 	{
-		// Always owns the INVITE: every refusal on this path answers it, and
-		// logs which one it was ("trunk: <why> for <ext> -> 911").
-		(void)placeSipTrunkCall(data, caller, bare, &placed);
-		notifyEmergency(emergency, from, dialed, /*routed=*/placed);
-		return;
+		// #538 review M1: the anchor's gate only runs when the anchor is real AND
+		// up, so the trunk needs its own. onTrunkAnswered answers the handset with
+		// buildMediaSdp's PCMU-only SDP, so a PCMA- or G.722-only 911 would
+		// otherwise CONNECT with dead audio while the front desk is told ROUTED TO
+		// TRUNK. Checked here, inside the trunk branch, so a board with no route
+		// at all still says "no emergency route configured" below.
+		if (data->hasSdp() &&
+			!data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+		{
+			codecRejected = true;   // the 503 below says why
+		}
+		else
+		{
+			// Always owns the INVITE: every refusal on this path answers it, and
+			// logs which one it was ("trunk: <why> for <ext> -> 911").
+			(void)placeSipTrunkCall(data, caller, bare, &placed);
+			notifyEmergency(emergency, from, dialed, /*routed=*/placed);
+			return;
+		}
 	}
 
 	// ── No route. 503, and specifically not 404 ──────────────────────────────

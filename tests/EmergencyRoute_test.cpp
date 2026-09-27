@@ -553,3 +553,40 @@ TEST(EmergencyRoute, TheDashboardShowsTheBannerWhileTheRouteIsNone)
 		<< "the status poll must drive the banner";
 	EXPECT_NE(page.find("d.emergencyRoute===\"none\""), std::string::npos);
 }
+
+TEST(EmergencyRoute, TheE911BannerDefersToTheRouteBannerWhileTheRouteIsNone)
+{
+	// BigDog's be57113: a fresh board showed both banners at once, "911 still
+	// routes out" (e911Configured false) beside "emergency calling is not
+	// configured" (route none), which contradict each other. applyE911() hides
+	// its banner while the route is none, and the status poll drives both.
+	std::string page;
+	for (const auto& part : CGA_INDEX_HTML_PARTS) page.append(part.data, part.size);
+
+	const size_t fn = page.find("function applyE911(");
+	ASSERT_NE(fn, std::string::npos);
+	const size_t fnEnd = page.find('\n', fn);
+	const std::string body = page.substr(fn, fnEnd - fn);
+	EXPECT_NE(body.find("e911-banner"), std::string::npos) << body;
+	EXPECT_NE(body.find("d.emergencyRoute===\"none\""), std::string::npos)
+		<< "the E911 banner must stand down while the route banner is up:\n" << body;
+
+	const size_t poll = page.find("function fetchStatus(){");
+	ASSERT_NE(poll, std::string::npos);
+	const std::string pollBody = page.substr(poll, page.find("\n}\n", poll) - poll);
+	EXPECT_NE(pollBody.find("applyE911(d)"), std::string::npos);
+	EXPECT_NE(pollBody.find("applyEmergencyRoute(d)"), std::string::npos);
+}
+
+TEST(EmergencyRoute, ALoopbackOnlyBoardSaysNoRouteEvenForAnOfferItCouldNotCarry)
+{
+	// The M1 codec gate belongs to the trunk branch. With no route at all the
+	// honest reason is "no emergency route configured", whatever was offered.
+	Bench b;
+
+	b.handler->handle(makeInvite("911", "er-loop-pcma", /*payloadType=*/8));
+
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("no emergency route configured")) << b.dump();
+	EXPECT_FALSE(b.saw("no G.711 codec offered")) << b.dump();
+}
