@@ -390,6 +390,13 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
 
 <main>
 
+  <!-- #450 / poll #454: shown only when /api/status reports e911Configured:false
+       (e.g. right after a factory reset). Informational: nothing is gated on it,
+       and 911 still routes out. -->
+  <div class="note" id="e911-banner" role="status" style="display:none;color:var(--warn)">&#9888;
+    <b>E911 not configured.</b> A 911 call still routes out, but nobody on site is
+    notified. Set the notify list and location via <code>PUT /api/e911-config</code>.</div>
+
   <!-- ══ PATCH BAY ══ -->
   <section class="patch-bay">
     <div class="bay-face" id="board-wrap">
@@ -659,18 +666,17 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <div class="subhead">&#9990; Extension Registration &amp; Onboarding</div>
       <div class="note">
         Controls what a phone must prove before it can register as an extension.
-        <strong>Open</strong> accepts any endpoint with no credential, convenient
-        for a lab, but on a shared link anyone can register as any extension and tear
-        down calls. <strong>Learn</strong> adopts unknown phones on first contact and
-        locks each to its extension; run it briefly to onboard a fleet, then move on.
-        <strong>Secure</strong> digest-challenges every registration.
+        <strong>Learn</strong> adopts an unknown phone on first contact and locks
+        its extension to that device, so nobody else can take it over.
+        <strong>Secure</strong> digest-challenges every registration. There is no
+        open mode: accepting any endpoint with no credential let anyone on the link
+        register as any extension.
       </div>
       <div class="kv"><span class="k">Current mode</span><span id="reg-mode-cur">&mdash;</span></div>
       <div class="field">
         <label for="reg-mode">Registration mode</label>
         <select id="reg-mode">
-          <option value="open">Open: no credential required</option>
-          <option value="learn">Learn: adopt new phones (temporary)</option>
+          <option value="learn">Learn: adopt new phones, lock each to its device</option>
           <option value="secure">Secure: digest auth required</option>
         </select>
       </div>
@@ -1370,9 +1376,12 @@ function put(url,body){return httpMethod("PUT",url,body);}
 function del(url,body){return httpMethod("DELETE",url,body);}
 function fetchStatus(){
   fetch("/api/status").then(function(r){return r.json();}).then(function(d){
-    statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);renderDialplan(d);pushPacketSample(d.packetsProcessed||0);applyWifiCapability(d);
+    statusData=d;failCount=0;setOnline(true);updateRail(d);renderBoard(d);renderGroups(d);renderDialplan(d);pushPacketSample(d.packetsProcessed||0);applyWifiCapability(d);applyE911(d);
   }).catch(function(){failCount++;if(failCount>=2)setOnline(false);});
 }
+/* #450 / poll #454: the E911 banner. An ABSENT field (older firmware) shows
+   nothing, same rule as wifiCapable below. */
+function applyE911(d){var b=$("e911-banner");if(!b||!d||typeof d.e911Configured==="undefined")return;b.style.display=d.e911Configured?"none":"";}
 /* #167: the board states whether it has a radio; the UI must not infer it from
    an empty scan. Older firmware predates the field, so an ABSENT wifiCapable is
    treated as capable -- the dashboard is served by the same board it manages, so

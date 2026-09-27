@@ -147,14 +147,22 @@ namespace pbx
 
 	// Join a member list back into the canonical comma-separated form used for NVS
 	// persistence and the dashboard snapshot.
-	inline std::string joinMembers(const std::vector<std::string>& members)
+	// The same, into `out` (#463): clear() keeps its capacity, so rejoining an
+	// unchanged list every snapshot tick allocates nothing.
+	inline void joinMembersInto(const std::vector<std::string>& members, std::string& out)
 	{
-		std::string out;
+		out.clear();
 		for (size_t i = 0; i < members.size(); ++i)
 		{
 			if (i) out.push_back(',');
 			out += members[i];
 		}
+	}
+
+	inline std::string joinMembers(const std::vector<std::string>& members)
+	{
+		std::string out;
+		joinMembersInto(members, out);
 		return out;
 	}
 

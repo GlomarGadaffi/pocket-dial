@@ -371,7 +371,7 @@ jobs:
           ctest --test-dir build/tests --output-on-failure
 
       - name: Self-test the test-count checker (#467)
-        run: python3 -m unittest discover -s tests/tools -p 'test_check_test_count.py' -v
+        run: python3 -m unittest discover -s tests/tools -p 'test_*.py' -v
 
       - name: Self-test the soak verdict (#401)
         run: python3 -m unittest discover -s tests/tools -p 'test_soak_verdict.py' -v
@@ -596,6 +596,17 @@ jobs:
           
           echo "Successful compilation for ${{ matrix.target-chip }} on ESP-IDF ${{ matrix.idf-version }} (Transport: ${{ matrix.sip-transport }})"
 
+      # Issue #489: how full is the app slot? The build fails outright only once
+      # the image no longer fits; this fails EARLIER, while there is still room to
+      # ship a fix. The script reads the partition table this leg actually built,
+      # so each layout is checked against its own slots. The constrained 4 MB
+      # layout, which is the one near its limit, is built and checked by the
+      # build-constrained job below (this matrix never builds that profile).
+      - name: App slot margin (issue #489)
+        run: |
+          . $IDF_PATH/export.sh > /dev/null
+          python3 tools/ci/app_slot_margin.py build
+
       - name: Upload ESP32-S3 Ethernet Firmware Bundle
         if: matrix.target-chip == 'esp32s3' && matrix.sip-transport == 'eth'
         uses: actions/upload-artifact@v4
@@ -714,6 +725,32 @@ jobs:
           idf.py set-target esp32s3
           idf.py -D SIP_TRANSPORT=eth -D PD_ETH_BOARD=waveshare build
           echo "Compiles for esp32s3 / eth / PD_ETH_BOARD=waveshare (compile-only; not hardware-verified)."
+
+  # Issue #489: the resource-constrained profile (classic esp32, lan8720, no PSRAM,
+  # partitions_4mb.csv with 0x1E0000 app slots). No other job builds it -- the
+  # matrix's lan8720 leg uses the 16 MB defaults -- and it is the one layout near
+  # its limit, so it is built here and its app-slot margin checked. The recipe
+  # is main/CMakeLists.txt's SIP_CONSTRAINED comment.
+  build-constrained:
+    name: Build Firmware (esp32 / lan8720 / SIP_CONSTRAINED, 4 MB) + app-slot margin
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build the constrained profile
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 \
+                 -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
+                 set-target esp32 build
+
+      - name: App slot margin (issue #489)
+        run: |
+          . $IDF_PATH/export.sh > /dev/null
+          python3 tools/ci/app_slot_margin.py build
 
   # Job 3: Security & Guardrails
   # Explicitly validates that no accidental GCP or outside deployment files are configured.
