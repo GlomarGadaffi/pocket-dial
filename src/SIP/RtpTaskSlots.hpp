@@ -35,17 +35,7 @@ namespace pd
 	}
 }
 
-#if defined(ESP_PLATFORM)
-#include "sdkconfig.h"
-#if !defined(CONFIG_SPIRAM) || !CONFIG_SPIRAM
-// No PSRAM (esp32_constrained): the rx stacks fall back to internal too, so
-// every slot is internal DRAM, fixed at boot. SIP_CONSTRAINED's caps
-// (main/CMakeLists.txt) give 11 slots = 66 KB; the defaults would be 150 KB.
-static_assert((pd::rtpslots::kTxSlots + pd::rtpslots::kRxSlots) * pd::rtpslots::kStackBytes
-              <= 72u * 1024u,
-              "#479: no-PSRAM build fixes too much internal DRAM in RTP task slots; "
-              "build with SIP_CONSTRAINED=1 or lower the POCKETDIAL_* call caps");
-#endif
-#endif
+// The no-PSRAM boot budget (slots + the conference room) is static_asserted in
+// ConferenceRoom.hpp, which knows sizeof(ConferenceRoom).
 
 #endif // PD_RTP_TASK_SLOTS_HPP

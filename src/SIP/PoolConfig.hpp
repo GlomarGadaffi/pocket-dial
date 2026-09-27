@@ -185,7 +185,7 @@
 #endif
 
 // Number of legs the local N-way conference room (virtual extension 888) accepts —
-// see ConferenceRoom.hpp and docs/CONFERENCE_MIXER.md. Must be ≤ MixBus::MAX_PORTS (8).
+// see ConferenceRoom.hpp and docs/CONFERENCE_MIXER.md. MixBus::MAX_PORTS follows it (#479).
 //
 // Unlike the peer-to-peer call paths, a conference leg IS server media: it costs one
 // Session slot, one RTP receive task, one RTP send task and two MixBus rings (~6 KB)

@@ -70,8 +70,14 @@ class RtpStaticSlots(unittest.TestCase):
         a, v, t, c = (int(caps[k]) for k in ("POCKETDIAL_MAX_ANCHOR_CALLS", "POCKETDIAL_MAX_VOICEMAIL_LEGS",
                                             "POCKETDIAL_MAX_TRUNK_CALLS", "POCKETDIAL_CONF_LEGS"))
         tx, rx = 1 + a + v + c, a + v + 2 * t + c
-        # No PSRAM: tx and rx stacks are all internal. Stated cost: 66 KB.
-        self.assertLessEqual((tx + rx) * 6144, 72 * 1024)
+        # No PSRAM: tx + rx stacks and the conference room (3 rings of 3200 B per
+        # leg + ~4 KB object, MixBus::MAX_PORTS == legs) are all internal, fixed at
+        # boot. Stated cost: 66 KB + ~23 KB = ~89 KB (ConferenceRoom.hpp asserts it).
+        self.assertLessEqual((tx + rx) * 6144 + 3 * c * 3200 + 4096, 90 * 1024)
+
+    def test_mix_ports_follow_the_conference_legs(self):
+        text = "".join(code("src/SIP/MixBus.hpp"))
+        self.assertRegex(text, r"MAX_PORTS\s*=\s*POCKETDIAL_CONF_LEGS\s*;")
 
 
 if __name__ == "__main__":
