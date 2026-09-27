@@ -719,6 +719,7 @@ private:
 	void onInvite(std::shared_ptr<SipMessage> data);
 	void onTrying(std::shared_ptr<SipMessage> data);
 	void onRinging(std::shared_ptr<SipMessage> data);
+	void onSessionProgress(std::shared_ptr<SipMessage> data);
 	void onBusy(std::shared_ptr<SipMessage> data);
 	void onUnavailable(std::shared_ptr<SipMessage> data);
 	void onBye(std::shared_ptr<SipMessage> data);

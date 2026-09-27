@@ -781,6 +781,7 @@ void RequestsHandler::initHandlers()
 	_handlers.emplace(SipMessageTypes::INVITE,            std::bind(&RequestsHandler::onInvite,         this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::TRYING,            std::bind(&RequestsHandler::onTrying,         this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::RINGING,           std::bind(&RequestsHandler::onRinging,        this, std::placeholders::_1));
+	_handlers.emplace(SipMessageTypes::SESSION_PROGRESS,  std::bind(&RequestsHandler::onSessionProgress, this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::BUSY,              std::bind(&RequestsHandler::onBusy,           this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::UNAVAILABLE,       std::bind(&RequestsHandler::onUnavailable,    this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::OK,                std::bind(&RequestsHandler::onOk,             this, std::placeholders::_1));
@@ -971,6 +972,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			{
 				case 100: handlerKey = SipMessageTypes::TRYING;             break;
 				case 180: handlerKey = SipMessageTypes::RINGING;            break;
+				case 183: handlerKey = SipMessageTypes::SESSION_PROGRESS;   break;
 				case 200: handlerKey = SipMessageTypes::OK;                 break;
 				case 480: handlerKey = SipMessageTypes::UNAVAILABLE;        break;
 				case 486: handlerKey = SipMessageTypes::BUSY;               break;
@@ -5084,6 +5086,14 @@ void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 		return;
 	}
 	endHandle(data->getFromNumber(), data);
+}
+
+// #400: a 183 matched no handler key, so it was dropped before SipTrunk ever saw
+// it and the carrier's early media never reached the handset. Only the trunk's
+// own dialog is claimed here; any other 183 is still dropped, as before.
+void RequestsHandler::onSessionProgress(std::shared_ptr<SipMessage> data)
+{
+	(void)_sipTrunk.handleResponse(data);
 }
 
 void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
