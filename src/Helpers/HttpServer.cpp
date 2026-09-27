@@ -330,6 +330,28 @@ void HttpServer::acceptLoop()
 			continue;
 		}
 
+		// Issue #529: one source may not hold every slot. Refused the same
+		// non-blocking way as the global cap above, and counted.
+		const uint32_t sourceAddr = clientAddr.sin_addr.s_addr;
+		if (!claimSource(sourceAddr))
+		{
+			_perSourceRefusals.fetch_add(1, std::memory_order_relaxed);
+#if defined _WIN32 || defined _WIN64
+			DWORD sndTv = 1000;
+			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO,
+				reinterpret_cast<const char*>(&sndTv), sizeof(sndTv));
+#else
+			timeval sndTv{};
+			sndTv.tv_sec  = 1;
+			sndTv.tv_usec = 0;
+			setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, &sndTv, sizeof(sndTv));
+#endif
+			sendResponse(clientSock, 503, "Service Unavailable", "application/json",
+				"{\"error\":\"busy\",\"message\":\"too many connections from this address\"}");
+			closeSocket(clientSock);
+			continue;
+		}
+
 		// Claimed BEFORE the thread exists so a burst arriving faster than the
 		// threads can start cannot overshoot the cap; the thread body releases it
 		// on every exit path, and the catch below releases it if no thread was
@@ -338,15 +360,17 @@ void HttpServer::acceptLoop()
 
 		try
 		{
-			std::thread([this, clientSock]() {
+			std::thread([this, clientSock, sourceAddr]() {
 				handleClient(clientSock);
 				recordConnStackHwm();
+				releaseSource(sourceAddr);
 				_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			}).detach();
 		}
 		catch (const std::exception& e)
 		{
 			// No thread was created, so nothing will ever decrement for this one.
+			releaseSource(sourceAddr);
 			_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			std::cerr << "[HttpServer] connection thread spawn failed: " << e.what()
 				<< " — dropping connection\n";
@@ -361,8 +385,65 @@ void HttpServer::acceptLoop()
 	}
 }
 
+bool HttpServer::claimSource(uint32_t addr)
+{
+	std::lock_guard<std::mutex> lock(_sourcesMutex);
+	SourceSlot* freeSlot = nullptr;
+	for (SourceSlot& s : _sources)
+	{
+		if (s.count > 0 && s.addr == addr)
+		{
+			if (s.count >= kMaxConnectionsPerSource) return false;
+			++s.count;
+			return true;
+		}
+		if (s.count == 0 && freeSlot == nullptr) freeSlot = &s;
+	}
+	// The global cap is checked first, so a live source always has a slot here;
+	// refuse rather than overrun if that ever stops being true.
+	if (freeSlot == nullptr) return false;
+	freeSlot->addr = addr;
+	freeSlot->count = 1;
+	return true;
+}
+
+void HttpServer::releaseSource(uint32_t addr)
+{
+	std::lock_guard<std::mutex> lock(_sourcesMutex);
+	for (SourceSlot& s : _sources)
+	{
+		if (s.count > 0 && s.addr == addr)
+		{
+			--s.count;
+			return;
+		}
+	}
+}
+
+// Issue #529: SO_RCVTIMEO in milliseconds (at least 1, so 0 never means "forever").
+static void setRecvTimeoutMs(int sock, long ms)
+{
+	if (ms < 1) ms = 1;
+#if defined _WIN32 || defined _WIN64
+	DWORD tv = static_cast<DWORD>(ms);
+	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+#else
+	struct timeval tv{};
+	tv.tv_sec  = ms / 1000;
+	tv.tv_usec = (ms % 1000) * 1000;
+	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 void HttpServer::handleClient(int clientSock)
 {
+	// Issue #529: everything read before dispatch shares one deadline.
+	const auto readDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(_readDeadlineMs);
+	const auto msLeft = [&readDeadline]() -> long {
+		return static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+			readDeadline - std::chrono::steady_clock::now()).count());
+	};
+
 	// Peer address, for per-client brute-force accounting on /api/admin/login.
 	// Best-effort: an empty string falls back to AdminAuth's shared unkeyed
 	// bucket, which is the old global behaviour rather than an open door.
@@ -385,13 +466,8 @@ void HttpServer::handleClient(int clientSock)
 	}
 
 	// Issue #23 resolved: Added SO_RCVTIMEO per-client socket timeout and capped Content-Length to 16KB to prevent Accept thread DoS
-#if defined _WIN32 || defined _WIN64
-	DWORD tv = 5000; // 5 seconds timeout
-	setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-	struct timeval tv{ .tv_sec = 5, .tv_usec = 0 };
-	setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
+	// Issue #529: 5 s per recv(), but never past the read deadline.
+	setRecvTimeoutMs(clientSock, (std::min)(5000L, _readDeadlineMs));
 
 	// Heap-allocate the read buffer. On ESP32 each connection runs on a detached
 	// std::thread, i.e. an IDF pthread; sdkconfig.defaults sets
@@ -544,12 +620,30 @@ void HttpServer::handleClient(int clientSock)
 				size_t bodyHave   = raw.size() > bodyStart ? raw.size() - bodyStart : 0;
 				while (bodyHave < contentLength)
 				{
+					// Issue #529: a body trickled in a byte every few seconds used to
+					// hold this slot for as long as the sender liked, before any auth
+					// check. Each wait is now cut to what is left of the deadline,
+					// and a body not in by then is dropped and counted.
+					const long left = msLeft();
+					if (left <= 0)
+					{
+						_readDeadlineDrops.fetch_add(1, std::memory_order_relaxed);
+						closeSocket(clientSock);
+						return;
+					}
+					setRecvTimeoutMs(clientSock, (std::min)(5000L, left));
 					buf.assign(buf.size(), 0);
 #if defined _WIN32 || defined _WIN64
 					int n = recv(clientSock, buf.data(), static_cast<int>(buf.size()) - 1, 0);
 #else
 					int n = static_cast<int>(recv(clientSock, buf.data(), buf.size() - 1, 0));
 #endif
+					if (n <= 0 && msLeft() <= 0)
+					{
+						_readDeadlineDrops.fetch_add(1, std::memory_order_relaxed);
+						closeSocket(clientSock);
+						return;
+					}
 					if (n <= 0) break;
 					raw.append(buf.data(), static_cast<size_t>(n));
 					bodyHave += static_cast<size_t>(n);
@@ -1517,6 +1611,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"ip\":\"" << jsonEscape(displayIp) << "\",";
 	json << "\"port\":" << 5060 << ",";
 	json << "\"httpPort\":" << _port << ",";
+	// #529: HTTP connections dropped for a slow request, and refused because
+	// one source already held its share of the slots.
+	json << "\"httpReadDeadlineDrops\":" << readDeadlineDrops() << ",";
+	json << "\"httpPerSourceRefusals\":" << perSourceRefusals() << ",";
 	// #167: state the board's WiFi capability rather than leaving the dashboard
 	// to infer it from an empty scan result. An eth/lan8720 build has no radio at
 	// all, so "found 0 networks" is not an empty scan -- it is a scan that can

@@ -998,11 +998,30 @@ TEST(HttpConnCap, OverTheCapIsRefused503AndSlotsAreReleased)
 	// never actually overlap and the test would pass with the cap deleted. These
 	// sockets connect and then say nothing, so each handler sits in recv() until
 	// its SO_RCVTIMEO -- the slot is genuinely held for the duration.
+	// Issue #529: one source may hold only kMaxConnectionsPerSource of the slots,
+	// so the holders come from two loopback sources (127.0.0.2 up to its share,
+	// 127.0.0.3 for the rest) and the probe below from a third (127.0.0.1). That
+	// way the refusal it gets is the GLOBAL cap's, not the per-source one.
 	std::vector<int> held;
 	for (int i = 0; i < HttpServer::kMaxConcurrentConnections; ++i)
 	{
 		int s = socket(AF_INET, SOCK_STREAM, 0);
 		ASSERT_GE(s, 0);
+		sockaddr_in src{};
+		src.sin_family = AF_INET;
+		inet_pton(AF_INET, i < HttpServer::kMaxConnectionsPerSource ? "127.0.0.2" : "127.0.0.3",
+			&src.sin_addr);
+		if (bind(s, reinterpret_cast<sockaddr*>(&src), sizeof(src)) != 0)
+		{
+#if defined(_WIN32) || defined(_WIN64)
+			closesocket(s);
+			for (int h : held) closesocket(h);
+#else
+			close(s);
+			for (int h : held) close(h);
+#endif
+			GTEST_SKIP() << "this stack can't use 127.0.0.2/.3 as source addresses";
+		}
 		sockaddr_in addr{};
 		addr.sin_family = AF_INET;
 		addr.sin_port   = htons(18099);
@@ -1021,6 +1040,9 @@ TEST(HttpConnCap, OverTheCapIsRefused503AndSlotsAreReleased)
 		<< "over the cap the server must answer 503, got:\n"
 		<< refusedResp.substr(0, 200);
 	EXPECT_NE(refusedResp.find("busy"), std::string::npos) << refusedResp.substr(0, 200);
+	EXPECT_NE(refusedResp.find("too many concurrent connections"), std::string::npos)
+		<< "this must be the global cap's refusal, not the per-source one (#529): "
+		<< refusedResp.substr(0, 200);
 
 	// Releasing the held sockets makes each blocked recv() return 0, so the
 	// handlers exit promptly rather than waiting out the full timeout.
