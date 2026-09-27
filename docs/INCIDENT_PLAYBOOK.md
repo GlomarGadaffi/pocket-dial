@@ -25,8 +25,9 @@ This document serves as the authoritative production-grade field operation and i
 > * The SoftAP may be **WPA2** (`GET /api/ap-security`, once logged in and set up), you
 >   may not be able to join at all (§7).
 > * The SIP registrar may be **`learn`/`secure`** (`GET /api/registrar`, same gate), 
->   phones may be refused by design (§4.3). The shipped default is `open`: no SIP
->   authentication at all.
+>   phones may be refused by design (§4.3). The shipped default is `learn` (#441): an
+>   unknown phone is adopted on its first REGISTER, and only Secured devices must prove a
+>   secret. `open` is retired (#502).
 
 
 ## Quick Reference Matrix
@@ -142,7 +143,8 @@ The device uses Non-Volatile Storage (NVS) to save Wi-Fi SSID, passphrases, mode
 > | `cdrlog` | Call-detail ring | |
 >
 > An NVS erase therefore **re-opens the access point, returns the login to the
-> `admin`/`admin` default, returns the registrar to `open`, and re-arms the boot
+> `admin`/`admin` default, returns the registrar to `learn` (the default since #441; `open`
+> is retired, #502), and re-arms the boot
 > provisioning gate** (`provisioned` goes away, so SIP is held dark again until a credential
 > is committed). It does **not** change the HTTP listener, which is always open regardless.
 > That combination is what makes an NVS erase a real recovery tool, and also what makes it

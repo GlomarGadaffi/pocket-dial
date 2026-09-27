@@ -32,9 +32,10 @@ Quick references: [SETUP_GUIDE.md](SETUP_GUIDE.md) ·
 >   [Phone won't register](#phone-wont-register-timeout-or-401). The **`display`** build
 >   deliberately has no such gate and starts SIP unconditionally
 >   (`main/esp_main_display.cpp:799-806`).
-> * The registrar ships in `open` mode: any phone may REGISTER and any INVITE is
->   accepted, with no SIP authentication. Digest auth is fully implemented (RFC 2617) but
->   it is *off* until an operator moves the registrar to `learn` or `secure`.
+> * The registrar ships in `learn` mode (#441; `open` is retired, #502): a new phone is
+>   adopted on its first REGISTER with no SIP authentication, and its INVITEs are admitted
+>   unchallenged. Digest auth (RFC 2617) applies once an admin promotes the device to
+>   Secured, or to every extension in `secure` mode.
 > * The SoftAP is **open** by default, the dashboard is **plain HTTP**, and OTA images are
 >   **unsigned**. All three are deliberate defaults, not oversights.
 
@@ -193,7 +194,7 @@ reachable, so you have as long as you need.
 > both a factory reset and a bare NVS erase. To clear the seed you must re-flash it, or
 > erase its sector (`erase_region 0xFFF000 0x1000` on the 16 MB layout). An NVS erase
 > (`erase_region 0x9000 0x6000`) clears *every* namespace, `pbxcfg` included, so that path
-> does return the registrar to `open`.
+> does return the registrar to the default, `learn` (#441; `open` is retired, #502).
 
 > [!TIP]
 > **This is what the `409` guard is for.** `POST /api/registrar` with `mode=secure` while no

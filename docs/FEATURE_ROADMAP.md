@@ -64,7 +64,7 @@ Cross-references:
 | Capability | Notes | Where |
 |-----------|-------|-------|
 | Registrar + back-to-back call broker | `REGISTER`, `INVITE`, `ACK`, `BYE`, `CANCEL`, `OPTIONS`, provisional/final responses | `src/SIP/RequestsHandler.cpp` |
-| **SIP digest auth (RFC 2617)** | Implemented and operable. **The shipped default is `open`**, see §1.4. | `src/Helpers/SipDigest.*`, `src/SIP/Registrar.*` |
+| **SIP digest auth (RFC 2617)** | Implemented and operable. The shipped default is `learn` (#441) and `open` is retired (#500/#502): Learn enforces digest on Secured devices, Secure on every extension; see §1.4. | `src/Helpers/SipDigest.*`, `src/SIP/Registrar.*` |
 | Blind transfer (REFER) | Source-authorized against the dialog's own legs (#133). Moves the **transferee**: a new dialog to the target carries B's media (`RequestsHandler.cpp:6270-6300`), the transferor A is BYEd (`:6474-6485`), and the A–B leg is kept (`:6533-6538`). The old inverted topology (#197) is fixed by #211 and the tests pin the corrected one (`tests/BlindTransfer_test.cpp:7-10`). Unresolvable targets no longer destroy the call (#203, fixed). Remaining: the NOTIFY reports `200` as soon as the INVITE is queued, with no `100 Trying` progress. | `onRefer` |
 | Attended transfer (REFER + Replaces, RFC 3891) | Splices B and C, BYEs A out of both, relays a later BYE across the bridge. The hardcoded `CSeq: 100` of #257 was removed by its own fix (#308, per-dialog floors), and #402 replaced those floors with `nextServerCSeq()` (`RequestsHandler.cpp:6149`). Only REFER `?Replaces=` is handled; an INVITE carrying `Replaces` (BLF pickup) is not. | `onRefer`, `handleTransferOk` |
 | Hold / resume | Re-INVITE relayed with its **SDP** untouched, so the SDP survives; `Contact` is rewritten on every relayed re-INVITE (#425, `RequestsHandler.cpp:9079-9090`) | `onReinvite`, `onOk` |
@@ -144,7 +144,7 @@ edited through `/api/telephony-config`, see [API.md](API.md).
 | **Admin login** | **Username + password** (`AdminAuth`), salted/iterated SHA-256, server-side sessions, per-session CSRF token on every mutating route, and brute-force lockout with exponential backoff plus an aggregate backstop. **The lockout is per client** since #530: `req.clientIp` is set on every buffered request (`HttpServer.cpp:576`), as it already was for the streaming OTA/MoH upload (`:461`), and the login handler keys its lockout on it (`:4375-4386`). The aggregate backstop is still shared by design, see [THREAT_MODEL.md](THREAT_MODEL.md) D-3. Ships as `admin`/`admin` with forced first-use setup: every admin route except `set-credential` answers `403 setup_required` until it is replaced. |
 | **DTMF admin PIN** | A *separate*, independent numeric secret for the phone-keypad `*PIN#code` menu. **No default**, so that menu is disabled until explicitly configured. Unrelated to the web session. |
 | **HTTP reachability** | **The dashboard is always reachable.** The listener opens at construction and stays open. The dark-by-default plane and the `*4887` reopen star-code were **removed** (`de1a36e`); `grantAdminHttpGraceWindow` no longer exists. |
-| **Registrar admission** | Three modes: `open` / `learn` / `secure`. Digest auth is real; Learn is TOFU + an ARP-learned MAC lock. **The shipped default is `open`: a fresh board accepts any REGISTER, and any INVITE whose `From` is a registered extension** (an unregistered caller gets `403`, `RequestsHandler.cpp:1684-1694`), until an operator changes `reg_mode`. **Switching to Learn does not close the INVITE half:** only Secure challenges an INVITE (`:1740-1742`). In flight: #502 (retire `open`), #503/#512 (Learn INVITE checks). |
+| **Registrar admission** | Two modes: `learn` / `secure`; `open` is retired (#500/#502), and a stored retired value boots as Learn. Digest auth is real; Learn is TOFU + an ARP-learned MAC lock. **The shipped default is `learn`** (#441): a fresh board adopts an unknown MAC on its first REGISTER, and an unregistered INVITE caller gets `403` (`RequestsHandler.cpp:1717-1727`). **Learn still admits an INVITE from a Learned (unsecured) extension without a challenge:** Secure challenges every INVITE, and Learn challenges only a device an admin has promoted to Secured (#512, `:1783-1784`). In flight: #503 (bind the INVITE to the caller's registered address). |
 | **SoftAP WPA2** | Implemented, **opt-in, default off** (NVS `ap_secure`) so a firmware update never re-pairs a live fleet. Encrypts dashboard, SIP and RTP together. |
 | Signalling hardening | per-source-IP token bucket, AOR whitelist, bounded parser, SDP admission gate. **The "optional CIDR allowlist" this row used to list is not a shipped control**: `_allowNet`/`_allowMask` are never assigned, so `ipAllowed()` returns true for every source (`RequestsHandler.cpp:8837-8842`). See [ARCHITECTURE.md](ARCHITECTURE.md) §Rate Limiting. |
 | HTTP hardening | same-origin + CSRF, 16 KB body cap, `SO_RCVTIMEO`, no wildcard CORS, central security response headers (CSP, `X-Frame-Options: DENY`, `nosniff`, `no-store`), deliberately no HSTS |
@@ -197,7 +197,7 @@ hardware, and it is deliberately short.
 | Everything else | Host-only: gtest, or `pjsua`/SIPp driven against the **desktop** binary over loopback. |
 | On-device RTP | **No automated test exercises it.** The host build's `RtpSender`/`RtpReceiver` are stubs (a Linux-desktop socket path aside), so every green media test exercises a stub, not the ESP32 path. The one manual T29 trunk call above ran the handset leg through `RtpReceiver`/`RtpSender`/`MediaBridge`/`PlayoutBuffer` on a real board, which proves the **anchor-bridge** shape only ([RTP.md](RTP.md), `docs/RTP.md:58-63`). The `888` mixer **has** run on `.244` (2026-09-27); that run panicked the board (#498), and the fix (#499) is merged but not yet re-run on hardware (see §1.2). MoH has never been *verified* on hardware: the preview call's signalling was seen on the bench (`e20226d`, #206) but its audio was not recorded. `440`, voicemail and the SIP-trunk relay have never run on hardware. |
 | OTA | **Proved once, on one board, by hand.** First end-to-end run 2026-09-26 on `.244` (ESP32-S3 Ethernet) with `tools/ota/remote_ota.sh` (#395): refusals (truncated and wrong-chip images, `422`, no reboot), a real `ota_0 → ota_1` that booted pending and marked itself valid, and a rollback probe that the bootloader rolled back ([OTA.md](OTA.md), `docs/OTA.md:16-20`). CI still never runs an OTA. |
-| Zero-touch provisioning | Implemented, but inert on a default board: `GET /config/<mac>.cfg` only serves a MAC in the Learn-mode adopted-device registry, and `open` mode never records one, so on a fresh board it is a structural 404 for every MAC. None of the four vendor renderers (Yealink, Grandstream, Polycom, Cisco SPA) has been confirmed against a physical handset. |
+| Zero-touch provisioning | Implemented: `GET /config/<mac>.cfg` only serves a MAC in the Learn-mode adopted-device registry (`HttpServer.cpp:605-612`). Learn is now the default (#441), so a phone that has registered once is served; a MAC never seen is still a 404. None of the four vendor renderers (Yealink, Grandstream, Polycom, Cisco SPA) has been confirmed against a physical handset. |
 
 **This table is the roadmap's most load-bearing content.** The highest-value work in the
 project right now is not a new feature; it is moving rows out of the bottom half of this
@@ -239,7 +239,7 @@ zones, pickup, **has shipped** and now lives in §1. What remains is below.
 
 | Pri | Item | State / rationale | Complexity |
 |-----|------|-------------------|------------|
-| **P0** | **Flip the registrar default, or make flipping it unmissable** | Digest auth, Learn mode and the MAC lock are all built, and the shipped default on `main` is still `open` (the unconditional `#define POCKETDIAL_OPEN_REGISTRAR`, `RequestsHandler.hpp:15`), so most boards run with none of it. **In flight:** #441 (a fresh board boots Learn) and #502 (retire `open` entirely), both open. Cheapest real security win available. | **S–M** |
+| **P0** | **Flip the registrar default. DONE** | #441 (a fresh board boots Learn) and #502 (`open` retired; Learn is the floor). What is left of the INVITE half is #503 (caller address binding) and the Secured-device challenge Learn already does (#512). | **S–M** |
 | ~~P0~~ **DONE** | WPA2 on the SoftAP | Shipped, opt-in, default off (NVS `ap_secure`). Encrypts dashboard, SIP *and* RTP in one change. | N/A |
 | ~~P0~~ **DONE** | SIP digest auth (RFC 2617) | Shipped and operable via `/api/registrar` + the `cfgseed` `regMode` field. See the P0 above for what is left. | N/A |
 | **P1** | **Per-IP brute-force tracking on login: wire it up** | **Built but not wired.** `AdminAuth` has per-client buckets and an aggregate backstop, but the login path never populates `req.clientIp` (§1.4), so every failure lands in one global bucket: one attacker can lock every admin out. The fix is to carry the accepted socket's peer address into the buffered request, as the streaming upload path already does (`HttpServer.cpp:452`). | **S** |
@@ -297,8 +297,8 @@ Why this order:
   one narrow path, *true*". The gap between those two words is now the largest risk in the
   codebase, and closing it costs bench time rather than design.
 - **The registrar default before any new hardening** because the expensive part (digest
-  auth, Learn mode, the MAC lock) is already built and most boards are not using it. There
-  is no cheaper security work available than making an existing control the default.
+  auth, Learn mode, the MAC lock) was already built. Done: Learn is the default (#441) and
+  `open` is retired (#502).
 - **Config export before the config surface grows again.** Done (#186), with the carrier
   credentials in a password-encrypted block; what it still cannot restore (MAC bindings)
   is listed in §3.2.
@@ -349,11 +349,10 @@ architecture, or, in a couple of cases, simply absent and not planned.
    a real handset fetching its own `.cfg`; and re-run `888` now that its panic fix has landed
    (#498, #499). OTA has now been proved once on hardware (#395); the rest of §1 is still host-test
    confidence, and a few bench sessions would convert most of it.
-2. **Resolve the registrar default.** Digest auth, Learn mode and the MAC lock are built and
-   reachable; the shipped default on `main` is `open`, so a fresh board accepts any
-   REGISTER, and any INVITE from a registered extension. #441 and #502 change that, and
-   #503/#512 close the INVITE half, which Learn alone does not; this is the
-   cheapest real security improvement left, because the hard half is already done.
+2. **Registrar default: resolved.** A fresh board boots Learn (#441), `open` is retired
+   (#502), and Learn challenges a Secured device's INVITE (#512). The INVITE half is not
+   fully closed: a Learned extension's INVITE is admitted unchallenged, and binding it to
+   the caller's registered address is #503.
 3. **Make emergency dialing honest on a default board.** A `911` on a board with no real
    anchor provider is answered by the loopback simulator (§5, #521), which is worse than the
    `503` it gets when no anchor is connected at all.

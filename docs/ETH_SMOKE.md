@@ -240,11 +240,10 @@ python .smoke\sip_probe.py <BOARD_IP> 5060
 
 > [!NOTE]
 > **Which status you get depends on the registrar mode, and all of them are a pass.**
-> * **`open`**: the shipped default. There is no SIP authentication at all, so the probe's
->   REGISTER for extension `9001` is simply accepted: `200 OK`. It really does take a client
+> * **`learn`**: the shipped default (#441; `open` is retired, #502). An unknown MAC
+>   claiming an unclaimed extension is adopted on first contact, so the probe's REGISTER
+>   for extension `9001` is likely to be answered `200 OK`. It really does take a client
 >   slot; the registrar prunes it after ~15 s of not answering `OPTIONS`.
-> * **`learn`**: an unknown MAC claiming an unclaimed extension is adopted on first
->   contact, so the probe is also likely to be answered `200 OK`.
 > * **`secure`**: every `REGISTER` is digest-challenged (RFC 2617), so the probe can never
 >   reach `200 OK`. `401` is the answer and it is still a pass for *this* test: it proves
 >   the stack parses and answers. It does **not** prove a real handset can register.
