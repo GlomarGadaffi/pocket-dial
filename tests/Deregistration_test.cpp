@@ -63,6 +63,8 @@ namespace
 
 	bool isBound(RequestsHandler& handler, const std::string& ext)
 	{
+		handler.forceNextTickForTest();   // getActiveClients() reads the snapshot tick() publishes,
+		handler.tick();                   // and tick() republishes at most once a second
 		for (const auto& [number, address] : handler.getActiveClients())
 		{
 			(void)address;
