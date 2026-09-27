@@ -59,6 +59,9 @@ add_executable(sip_parser_tests
     # applies them to every SDP-bearing message before any decode or relay.
     # Also pins the decode paths as zero-heap via a counting operator new.
     SdpAdmission_test.cpp
+    AllocBaseline_test.cpp
+    # #462 (#284 batch A): parse, send and drain allocate nothing in steady state.
+    HotPathInPlace_test.cpp
     # The binary's one counting operator new, plus its own positive controls.
     support/AllocCounter.cpp
     AllocCounter_test.cpp
@@ -607,6 +610,8 @@ add_executable(sip_parser_tests
     # the FreeRTOS queue and writer task the fix adds (ESP-only, see
     # CdrRing_test.cpp's header comment).
     CdrRing_test.cpp
+    # Issue #535 / #572 review: when a parked media task may be deleted.
+    ParkedTaskReap_test.cpp
     # Issue #554 (b): the dropped-leg tombstone ring.
     RecentIdRing_test.cpp
     # Issue #554 (#575 review): rx restart decision + tombstone refusal.

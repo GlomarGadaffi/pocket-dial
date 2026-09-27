@@ -392,6 +392,17 @@ private:
 	//                    can join on it and start() refuses to overlap a dying task.
 	std::atomic<bool> _stopRequested{false};
 	std::atomic<bool> _taskRunning{false};
+	// Issue #535: the finished task PARKS (vTaskSuspend) instead of deleting
+	// itself -- vTaskDeleteWithCaps(NULL)'s self-delete allocates an internal
+	// helper task and abort()s when none fits. Its owner reaps it with
+	// pd::deleteTask(handle), which allocates nothing, on the next start() or in
+	// the destructor. Written only under _slotMutex (start) or by the
+	// destructor, never by the task.
+	TaskHandle_t      _parkedTask = nullptr;
+	// Deletes the parked task only when pd::reapDecision() says Reap (#572
+	// review); true when the slot is free. On Wait it counts in _reapDeferred.
+	bool reapParkedTaskLocked();
+	std::atomic<uint32_t> _reapDeferred{0};
 #endif
 
 	std::atomic<bool> _active{false};
