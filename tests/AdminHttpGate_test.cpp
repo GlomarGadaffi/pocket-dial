@@ -220,6 +220,58 @@ namespace
 		return statusOf(httpPostRaw(port, path, body));
 	}
 
+	// Issue #528: POST from a chosen loopback SOURCE address (127.0.0.2, ...),
+	// so one test can play two clients against one server. Returns "" when
+	// that source can't be bound (a stack that only answers on 127.0.0.1).
+	std::string httpPostFrom(int port, const std::string& srcIp, const std::string& path,
+	                         const std::string& body)
+	{
+#if defined(_WIN32) || defined(_WIN64)
+		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s == INVALID_SOCKET) return "";
+#else
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0) return "";
+#endif
+		sockaddr_in src{};
+		src.sin_family = AF_INET;
+		src.sin_port = 0;
+		inet_pton(AF_INET, srcIp.c_str(), &src.sin_addr);
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(static_cast<uint16_t>(port));
+		inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+		if (bind(s, reinterpret_cast<sockaddr*>(&src), sizeof(src)) != 0 ||
+			connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+		{
+#if defined(_WIN32) || defined(_WIN64)
+			closesocket(s);
+#else
+			close(s);
+#endif
+			return "";
+		}
+		std::string req = "POST " + path + " HTTP/1.1\r\n"
+			"Host: 127.0.0.1\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n"
+			"Content-Type: application/x-www-form-urlencoded\r\n"
+			"Connection: close\r\n\r\n" + body;
+		send(s, req.c_str(), static_cast<int>(req.size()), 0);
+		std::string resp;
+		char buf[512];
+		int n;
+		while ((n = recv(s, buf, sizeof(buf), 0)) > 0)
+		{
+			resp.append(buf, static_cast<size_t>(n));
+		}
+#if defined(_WIN32) || defined(_WIN64)
+		closesocket(s);
+#else
+		close(s);
+#endif
+		return resp;
+	}
+
 }
 
 // ── Boot behavior ────────────────────────────────────────────────────────────
@@ -650,6 +702,48 @@ TEST(WebHardening, GlobalBackstopSitsWellAboveOrdinaryTypos)
 	// Everyone else is still free to log in.
 	EXPECT_FALSE(AdminAuth::isLockedOut("10.2.2.2"));
 	EXPECT_TRUE(AdminAuth::verifyCredential("admin", "realpassword123", "10.2.2.2"));
+
+	AdminAuth::clearCredential();
+}
+
+TEST(WebHardening, OneClientsLoginLockoutDoesNotLockOutAnotherOverHttp)
+{
+	// Issue #528: the tests above prove the per-client buckets at the AdminAuth
+	// level, but the HTTP route never passed a client key -- req.clientIp was
+	// set only on the OTA streaming branch -- so every login shared one ""
+	// bucket and one guesser locked the real admin out. This drives the real
+	// route from two loopback source addresses.
+	AdminAuth::clearCredential();
+	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18085, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	const std::string first = httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+		"username=admin&password=wrong-0");
+	if (first.empty())
+	{
+		AdminAuth::clearCredential();
+		GTEST_SKIP() << "this stack can't use 127.0.0.2 as a source address";
+	}
+	EXPECT_EQ(statusOf(first), 401);
+	for (int i = 1; i < AdminAuth::kMaxFailedAttempts; ++i)
+	{
+		const int st = statusOf(httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+			"username=admin&password=wrong-" + std::to_string(i)));
+		EXPECT_TRUE(st == 401 || st == 429) << "attempt " << i << " got " << st;
+	}
+
+	// The guesser is locked out, even with the right password...
+	EXPECT_EQ(statusOf(httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+		"username=admin&password=realpassword123")), 429);
+	// ...and the real admin, from another address, is not.
+	EXPECT_EQ(statusOf(httpPostFrom(18085, "127.0.0.1", "/api/admin/login",
+		"username=admin&password=realpassword123")), 200)
+		<< "one client's lockout must not lock out another (#528)";
 
 	AdminAuth::clearCredential();
 }
