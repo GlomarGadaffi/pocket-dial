@@ -198,7 +198,17 @@ private:
 		// the mutex tells an external caller nothing about whether someone is inside.
 		esp_http_client_handle_t getClient  = nullptr;
 		TaskHandle_t             rxTaskHandle = nullptr;
+		// Created once per slot, never deleted while the client lives (the destructor frees
+		// it): startRxIfNeeded() used to delete and recreate it per start, which a join still
+		// waiting on the old one, or a still-running task about to give it, would then touch
+		// after free. Drained (take, 0 ticks) before each start instead.
 		SemaphoreHandle_t        rxDoneSem    = nullptr;
+		// Issue #370 (row X4 on .244, 2026-09-27): true from startRxIfNeeded() creating the rx
+		// task until that task has given rxDoneSem on its way out, or stopMediaStreams() has
+		// force-killed it. The getClient single-owner rule above needs exactly ONE rx task per
+		// slot; the dump showed two on one slot, one rebuilding the handle under the other's
+		// TLS handshake. A start while this is set is refused, whatever rxTaskHandle says.
+		std::atomic<bool>        rxAlive{false};
 		std::atomic<bool>        tearingDown{false};      // single-entry gate for stopMediaStreams(slot)
 		// Set when a force-killed rx task died holding getMutex. That mutex stays locked forever,
 		// so the slot is retired: allocSlotLocked() never hands it out again, and nothing may block
@@ -220,7 +230,9 @@ private:
 	CallSlot* allocSlotLocked(const std::string& participantId);
 	void      freeSlotLocked(CallSlot& slot);
 	// Heap arg handed to a slot's rx task so the static trampoline knows its slot.
-	struct RxTaskArg { TelephonyAnchorClient* self; CallSlot* slot; };
+	// doneSem is this slot's rxDoneSem, handed over at creation so the task gives exactly the
+	// semaphore its own join waits on (#370).
+	struct RxTaskArg { TelephonyAnchorClient* self; CallSlot* slot; SemaphoreHandle_t doneSem; };
 
 	// Persistent control-plane HTTPS connection (makecall / participant drop).
 	// Kept open across requests so each command is one RTT instead of a fresh

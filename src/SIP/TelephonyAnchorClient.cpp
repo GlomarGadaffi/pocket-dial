@@ -2803,19 +2803,37 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 		// Already polling (ring-time prime or a duplicate call) — nothing to do.
 		return true;
 	}
-	if (slot->rxDoneSem)
+	if (slot->rxAlive.load(std::memory_order_acquire) || slot->tearingDown.load(std::memory_order_acquire))
 	{
-		vSemaphoreDelete(slot->rxDoneSem);
-	}
-	slot->rxDoneSem = xSemaphoreCreateBinary();
-	// Heap arg so the static trampoline knows its slot (one-time per call setup, off the hot
-	// path — same discipline as the heap WsWorkItem). Freed by the rx task on exit.
-	RxTaskArg* arg = new (std::nothrow) RxTaskArg{this, slot};
-	if (!arg)
-	{
-		if (slot->rxDoneSem) { vSemaphoreDelete(slot->rxDoneSem); slot->rxDoneSem = nullptr; }
+		// Issue #370 (X4): the handle is clear but this slot's previous rx task has not
+		// finished exiting -- it may still be inside a TLS handshake on getClient -- or a
+		// stopMediaStreams() is still joining it. A second task here would rebuild that
+		// handle under the first (the StoreProhibited in esp_tls_low_level_conn), and the
+		// drain below would steal the give the join is waiting for. Refuse; the caller
+		// treats this like a busy slot, and the next upset (~750 ms) retries once the old
+		// task is gone. Loud, so the bench sees it happen.
+		ESP_LOGW(TAG, "startRxIfNeeded: previous rx task for %s still exiting -- not starting a second (#370)",
+		         participantId.c_str());
 		return false;
 	}
+	// One done-sem per slot, for the slot's lifetime (see CallSlot::rxDoneSem). Drain any
+	// give left from the previous task so the next join waits for THIS one.
+	if (!slot->rxDoneSem)
+	{
+		slot->rxDoneSem = xSemaphoreCreateBinary();
+		if (!slot->rxDoneSem) return false;
+	}
+	(void)xSemaphoreTake(slot->rxDoneSem, 0);
+	// Heap arg so the static trampoline knows its slot (one-time per call setup, off the hot
+	// path — same discipline as the heap WsWorkItem). Freed by the rx task on exit.
+	RxTaskArg* arg = new (std::nothrow) RxTaskArg{this, slot, slot->rxDoneSem};
+	if (!arg)
+	{
+		return false;
+	}
+	// Claimed before the task exists (the task clears it on its way out), under _mutex like
+	// every start, so two starts can never both pass the check above.
+	slot->rxAlive.store(true, std::memory_order_release);
 	// #100: stack in PSRAM (WithCaps) — N concurrent calls' GET-rx tasks would otherwise exhaust
 	// internal RAM. The task does HTTPS GET reads + the audio rx callback only (no flash writes),
 	// so a PSRAM stack is safe. Force-kill + self-exit both use vTaskDeleteWithCaps.
@@ -2825,7 +2843,7 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 		ESP_LOGE(TAG, "Failed to create Rx task for %s", participantId.c_str());
 		delete arg;
 		slot->rxTaskHandle = nullptr;
-		if (slot->rxDoneSem) { vSemaphoreDelete(slot->rxDoneSem); slot->rxDoneSem = nullptr; }
+		slot->rxAlive.store(false, std::memory_order_release);
 		return false;
 	}
 	ESP_LOGI(TAG, "Rx stream task started for participant %s", participantId.c_str());
@@ -3009,6 +3027,8 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 				// Synchronous for another task: IDF 6's vTaskDeleteWithCaps() suspends it and spins
 				// until it is not current on any core before deleting. The rx task never runs again.
 				vTaskDeleteWithCaps(taskToKill);   // #100: rx task is WithCaps(PSRAM) — reclaim its stack
+				// #370: it will never clear its own rxAlive now; the slot is free of it.
+				slot->rxAlive.store(false, std::memory_order_release);
 
 				// #370: forget the handle, never free it. The task was killed at an arbitrary point,
 				// possibly mid-handshake, so the handle's mbedTLS state may be half-built and
@@ -3080,14 +3100,17 @@ void TelephonyAnchorClient::rxTaskTrampoline(void* arg)
 	auto* a = static_cast<RxTaskArg*>(arg);
 	TelephonyAnchorClient* self = a->self;
 	CallSlot* slot = a->slot;
+	SemaphoreHandle_t doneSem = a->doneSem;
 	delete a;                  // one-time per-call heap arg (see startRxIfNeeded)
 	self->runRxLoop(slot);
-	// Give THIS slot's done-sem so stopMediaStreams() can join. stop() holds off any realloc of
-	// the slot until it has taken this sem, so slot->rxDoneSem is still the one it waits on.
-	if (slot->rxDoneSem)
+	// Give the done-sem this task was started with -- the slot's one, lifetime semaphore -- so
+	// stopMediaStreams() can join. Then, and only then, let a new rx task start on this slot
+	// (#370): after this point the task touches neither getClient nor the semaphore.
+	if (doneSem)
 	{
-		xSemaphoreGive(slot->rxDoneSem);
+		xSemaphoreGive(doneSem);
 	}
+	slot->rxAlive.store(false, std::memory_order_release);
 	vTaskDeleteWithCaps(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
 }
 
