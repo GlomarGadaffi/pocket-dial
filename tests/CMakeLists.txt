@@ -449,6 +449,8 @@ add_executable(sip_parser_tests
     PcapCapture_test.cpp
     # Issue #470 / #473: CDR ring as an NVS blob, and the factory-reset write guard.
     CdrPersistBlob_test.cpp
+    # Issue #463 (#284 batch B): the idle tick, OPTIONS ping and header rewrites.
+    IdleTickAlloc_test.cpp
     # Issue #464 (#284 batch C): per-request lookups allocate nothing.
     AllocFreeLookups_test.cpp
     DropProbe_test.cpp
