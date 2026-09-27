@@ -339,3 +339,81 @@ TEST(InviteAdmission, SecureModeChallengesInviteThenAdmitsCredentialedRetry)
 
 	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
 }
+
+// #505 (#497 layer 2): in Learn mode, a device an admin promoted to Secured is
+// digest-enforced on REGISTER; its INVITEs now prove the same secret, exactly
+// as in Secure mode. Otherwise a spoofed INVITE naming it places calls as it.
+namespace
+{
+	// Clears a test secret on EVERY exit, including an early ASSERT return, so it
+	// cannot leak into later tests (BigDog's #512 review).
+	struct SecretGuard
+	{
+		std::string ext;
+		~SecretGuard() { SipSecretStore::clearSecret(ext); }
+	};
+}
+
+TEST(InviteAdmission, LearnModeChallengesAnInviteFromASecuredDevice)
+{
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+	h.handler.adoptDeviceForTest("0200000000aa", "500", Registrar::DeviceState::Secured);
+
+	h.handler.handle(makeInvite("lsec", 1, kPcmuOffer));
+	const std::string challenge = firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized");
+	ASSERT_FALSE(challenge.empty()) << "a Secured device's INVITE must be challenged in Learn mode";
+	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@"));
+
+	const std::string nonce = paramOf(challenge, "nonce");
+	ASSERT_FALSE(nonce.empty());
+	const std::string ha1 = SipDigest::computeHa1("500", SipSecretStore::kRealm, "s3cret");
+	const std::string response = SipDigest::computeResponse(
+		ha1, "INVITE", "sip:600@server", nonce, "00000001", "0a4f113b", "auth");
+	const std::string authz =
+		"Authorization: Digest username=\"500\", realm=\"pocketdial\", nonce=\"" + nonce +
+		"\", uri=\"sip:600@server\", response=\"" + response +
+		"\", algorithm=MD5, qop=auth, nc=00000001, cnonce=\"0a4f113b\"\r\n";
+	h.sent.clear();
+	h.handler.handle(makeInvite("lsec", 2, kPcmuOffer, authz));
+	EXPECT_FALSE(anySentContains(h.sent, "401 Unauthorized"));
+	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@")) << "the credentialed retry is admitted";
+}
+
+TEST(InviteAdmission, LearnModeRefusesASecuredDevicesInviteWithWrongCredentials)
+{
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+	h.handler.adoptDeviceForTest("0200000000aa", "500", Registrar::DeviceState::Secured);
+	h.handler.handle(makeInvite("lbad", 1, kPcmuOffer));
+	const std::string nonce = paramOf(firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized"), "nonce");
+	ASSERT_FALSE(nonce.empty());
+	const std::string ha1 = SipDigest::computeHa1("500", SipSecretStore::kRealm, "not-the-secret");
+	const std::string response = SipDigest::computeResponse(
+		ha1, "INVITE", "sip:600@server", nonce, "00000001", "0a4f113b", "auth");
+	const std::string authz =
+		"Authorization: Digest username=\"500\", realm=\"pocketdial\", nonce=\"" + nonce +
+		"\", uri=\"sip:600@server\", response=\"" + response +
+		"\", algorithm=MD5, qop=auth, nc=00000001, cnonce=\"0a4f113b\"\r\n";
+	h.sent.clear();
+	h.handler.handle(makeInvite("lbad", 2, kPcmuOffer, authz));
+	EXPECT_TRUE(anySentContains(h.sent, "SIP/2.0 403 Bad Credentials"));
+	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@"));
+}
+
+TEST(InviteAdmission, LearnModeStillAdmitsAnUnsecuredCallerWithoutAChallenge)
+{
+	// #505 must not reach Learned (TOFU) extensions: they have no secret. Another
+	// extension (600) IS Secured, so a mutation that challenges whenever ANY device
+	// is Secured, ignoring the caller, goes red here (BigDog's #512 review).
+	Harness h;
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+	h.handler.adoptDeviceForTest("0200000000bb", "600", Registrar::DeviceState::Secured);
+	h.handler.handle(makeInvite("lplain", 1, kPcmuOffer));
+	EXPECT_FALSE(anySentContains(h.sent, "401 Unauthorized"));
+	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@"));
+}
