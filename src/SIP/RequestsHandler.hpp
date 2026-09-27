@@ -328,6 +328,37 @@ public:
 	// must NOT be called with _mutex already held.
 	void applyStoredTrunkConfig();
 
+	// ── Emergency calling readiness (Issue #521) ─────────────────────────────
+	//
+	// Where a 911/933 dial can go right now. Anchor: the boot-selected
+	// telephony provider places real calls (telephonyProviderPlacesRealCalls).
+	// Trunk: no such anchor, but a valid generic SIP trunk is configured.
+	// None: neither -- the board has only the loopback simulator, which answers
+	// every call it is handed, so an emergency dial is refused with 503 rather
+	// than "connected" to nothing. /api/status reports this so the dashboard
+	// can keep a warning up for as long as it is None, and
+	// applyStoredTrunkConfig() logs a WARN at boot and on every trunk save that
+	// leaves it None. Anchor with a trunk also configured still reports Anchor;
+	// routeEmergencyCall() falls through to the trunk when that anchor is down.
+	// Takes _mutex, so it must NOT be called with _mutex already held.
+	enum class EmergencyRoute : uint8_t { None, Anchor, Trunk };
+	EmergencyRoute emergencyRoute();
+	// "anchor", "trunk" or "none": the /api/status spelling.
+	static const char* emergencyRouteName(EmergencyRoute r);
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (Issue #521). Every host test boots the loopback anchor, which
+	// can never carry an emergency call. This lets it stand in for a real
+	// provider so the anchor route's own behaviour (the bare number, the 503
+	// when it is down, the notification) stays testable. Inline, so it never
+	// reaches firmware (see the comment below).
+	void setAnchorPlacesRealCallsForTest(bool real)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_anchorPlacesRealCalls = real;
+	}
+#endif
+
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only. Gated because these three are DEFINED OUT OF LINE, in
 	// RequestsHandler.cpp -- and that, not the gate, is what decides whether a
@@ -1382,6 +1413,20 @@ private:
 		const std::shared_ptr<SipClient>& caller,
 		const pbx::EmergencyDial& emergency, const std::string& dialed);
 
+	// emergencyRoute() for a caller that already holds _mutex.
+	EmergencyRoute emergencyRouteLocked() const;
+
+	// The generic-SIP-trunk half of routeTrunkCall(): everything after its
+	// "is a trunk configured" check. Split out so routeEmergencyCall() can
+	// reach the trunk directly (Issue #521) and learn whether a carrier INVITE
+	// actually went out -- routeTrunkCall()'s bool, like originateAnchorCall()'s,
+	// means only "took ownership of the INVITE". `placedOut`, when non-null, is
+	// true only on the one path that hands the call to the carrier. Caller
+	// holds _mutex.
+	bool placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller, const std::string& destination,
+		bool* placedOut);
+
 	// `placedOut` (optional, Issue #166): true only when a call was actually
 	// dispatched. The bool RETURN means "took ownership of the INVITE" and is
 	// true for every refuse() path too, so a caller that must report what really
@@ -1846,6 +1891,11 @@ private:
 	// _anchorRouteDn as the RING-ALL gate and the DID-mapping lookup key.
 	TelephonyProviderType _anchorBootType = TelephonyProviderType::Loopback;
 	std::string _anchorRouteDn;
+	// Issue #521: telephonyProviderPlacesRealCalls(_anchorBootType), cached in
+	// the constructor next to it. False means the anchor is the loopback
+	// simulator and must never be handed an emergency number. Written only
+	// there and by setAnchorPlacesRealCallsForTest(); read under _mutex.
+	bool _anchorPlacesRealCalls = false;
 
 	// Stage B of the TelephonyAnchorClient port: sends that originate OFF the SIP
 	// receive thread (the CallEvent callback, which runs on the anchor's own WS

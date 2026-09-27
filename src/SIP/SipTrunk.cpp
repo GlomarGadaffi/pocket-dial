@@ -3,6 +3,7 @@
 #include <cstring>
 #include <sstream>
 
+#include "EmergencyCall.hpp"
 #include "IDGen.hpp"
 #include "RequestsHandler.hpp"
 #include "SipHeaderUtil.hpp"
@@ -32,10 +33,18 @@ namespace
 	// The request-URI / To URI for a PSTN destination. E.164 with the leading '+'
 	// is what essentially every ITSP expects; E164.cpp has already normalised the
 	// digits by the time a number reaches here, so this only has to not mangle it.
+	//
+	// Issue #521: except an emergency service number. 911 and 933 are dial
+	// strings, not E.164 numbers -- "+911" reads as country code 91 -- and
+	// carriers expect them bare in the user part. Exact match only, the same
+	// closed set EmergencyCall.hpp recognises; routeEmergencyCall() always
+	// hands the trunk the bare form.
 	std::string pstnUri(std::string_view e164, std::string_view host)
 	{
 		std::string u = "sip:";
-		if (!e164.empty() && e164.front() != '+') u += '+';
+		const bool serviceNumber =
+			e164 == pbx::kEmergencyNumber || e164 == pbx::kEmergencyTestNumber;
+		if (!e164.empty() && e164.front() != '+' && !serviceNumber) u += '+';
 		u.append(e164);
 		u += '@';
 		u.append(host);

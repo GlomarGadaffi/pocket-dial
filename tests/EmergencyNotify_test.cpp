@@ -98,6 +98,11 @@ namespace
 				});
 			handler->handle(enRegister("101", "192.168.78.11", "en-r-101"));  // the dialer
 			handler->handle(enRegister("200", "192.168.78.20", "en-r-200"));  // front desk
+			// Issue #521: the loopback anchor refuses every emergency number
+			// (EmergencyRoute_test.cpp pins that). These tests are about the
+			// notification around a routed call, so it stands in for a real
+			// provider here.
+			handler->setAnchorPlacesRealCallsForTest(true);
 			wire.clear();
 		}
 
