@@ -96,5 +96,21 @@ class FirmwareVersionCmakeTest(unittest.TestCase):
                 self.assertNotEqual(r.returncode, 0, f"{bad!r} was accepted:\n{r.stdout}{r.stderr}")
 
 
+class NoDirectoryWideDefineTest(unittest.TestCase):
+    # #461 fix 3: the stamp reaches host code only through the generated
+    # header. A directory-wide define would put it on every compile line and
+    # rebuild the world on each commit.
+    def test_no_cmakelists_adds_the_version_as_a_compile_definition(self):
+        hits = []
+        for root, dirs, files in os.walk(REPO):
+            dirs[:] = [d for d in dirs if not d.startswith((".", "build"))]
+            if "CMakeLists.txt" in files:
+                path = os.path.join(root, "CMakeLists.txt")
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    if re.search(r"add_compile_definitions\([^)]*POCKETDIAL_FW_VERSION", fh.read()):
+                        hits.append(path)
+        self.assertEqual(hits, [])
+
+
 if __name__ == "__main__":
     unittest.main()

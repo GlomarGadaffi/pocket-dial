@@ -9,8 +9,8 @@
 //
 //   * on the device it is ESP-IDF's PROJECT_VER, read back from the app
 //     descriptor (esp_app_get_description()), i.e. from the image itself;
-//   * on host builds it is the same string, passed in as the
-//     POCKETDIAL_FW_VERSION compile definition.
+//   * on host builds it is the same string, read from the generated header
+//     pocketdial_fw_version.h (never a directory-wide compile definition).
 //
 // So a board's /api/status and the `git describe` of the commit it was built
 // from match, which is what TEST_HARNESS.md §5.3's board-provenance check and
