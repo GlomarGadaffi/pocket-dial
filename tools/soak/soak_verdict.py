@@ -67,7 +67,9 @@ def load(path):
                 continue
             t = _num(rec.get("t"))
             s = rec.get("s")
-            if t is None or not isinstance(s, dict):
+            # A 503/429 refusal body is a JSON object too (#537 review): a
+            # sample with no uptime is not a status body, so it is a failed poll.
+            if t is None or not isinstance(s, dict) or _num(s.get("uptime")) is None:
                 bad += 1
                 continue
             samples.append((float(t), s))

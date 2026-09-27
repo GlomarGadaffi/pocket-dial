@@ -189,11 +189,16 @@ class SoakVerdictTest(unittest.TestCase):
                 f.write(json.dumps({"t": T0 + 1, "s": status(11)}) + "\n")
                 f.write(json.dumps({"t": T0, "s": status(10)}) + "\n")
                 f.write('{"t":%d,"s":null}\n' % (T0 + 2))
+                f.write('{"t":%d,"s":null,"code":503}\n' % (T0 + 3))
+                # An older logger wrote a refusal body as if it were a sample
+                # (#537 review): it has no uptime, so it is a failed poll.
+                f.write(json.dumps({"t": T0 + 4, "s": {"error": "busy",
+                                    "message": "too many concurrent connections"}}) + "\n")
                 f.write("not json\n")
                 f.write("\n")
             samples, bad = sv.load(path)
         self.assertEqual(len(samples), 2)
-        self.assertEqual(bad, 2)
+        self.assertEqual(bad, 4)
         self.assertEqual([st["uptime"] for _, st in samples], [10, 11], "sorted by t")
 
 
