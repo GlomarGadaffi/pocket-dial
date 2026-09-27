@@ -5793,6 +5793,20 @@ void HttpServer::sendApiTrunkConfig(int sock)
 	             trunkConfigJson(TrunkConfigStore::load()));
 }
 
+
+// Issue #546: true for a host that names this board itself -- loopback in any
+// spelling this parser sees, or the board's own address. Such a trunk can
+// never reach a carrier.
+static bool isSelfTrunkHost(const std::string& host, const std::string& ownIp)
+{
+	if (host.empty()) return false;
+	std::string h;
+	h.reserve(host.size());
+	for (char c : host) h += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	if (h == "localhost" || h == "::1" || h == "0.0.0.0" || h.rfind("127.", 0) == 0) return true;
+	return !ownIp.empty() && ownIp != "0.0.0.0" && h == ownIp;
+}
+
 void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 {
 	TrunkConfigStore::Config cfg = TrunkConfigStore::load(); // start from stored -- see the password merge below
@@ -5852,6 +5866,22 @@ void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"host and fromUser are required to enable the trunk\"}");
 		return;
+	}
+
+	// Issue #546: a trunk pointed at this board itself -- loopback, or its own
+	// address -- can never reach a carrier, yet it would satisfy valid() and
+	// report an emergency route. Refuse it at the door, like the check above.
+	{
+		const std::string ownIp = (_ip == "0.0.0.0") ? getPrimaryLocalIP() : _ip;
+		for (const std::string* h : { &cfg.host, &cfg.proxyHost })
+		{
+			if (isSelfTrunkHost(*h, ownIp))
+			{
+				sendResponse(sock, 400, "Bad Request", "application/json",
+				             "{\"error\":\"the trunk host must be the carrier, not this board (loopback or its own address)\"}");
+				return;
+			}
+		}
 	}
 
 	if (!TrunkConfigStore::save(cfg))

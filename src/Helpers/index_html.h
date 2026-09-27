@@ -393,6 +393,7 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
 
 <!-- #521: shown while /api/status says no real provider can carry a 911 call. -->
 <div class="e911" id="e911-route-banner" role="alert" style="display:none">&#9888; <b>Emergency calling is not configured.</b> This system refuses 911 and 933 calls until a SIP trunk (<a href="/setup/trunk">/setup/trunk</a>) or a telephony provider (Interconnect) is set up. Keep another way to call 911 near every phone.</div>
+<div class="e911" id="e911-unverified-banner" role="alert" style="display:none">&#9888; <b>Emergency route not verified.</b> A SIP trunk is configured but has not completed a call since it was last started or changed. Place a 933 test call to prove 911 can get out.</div>
 
 <main>
 
@@ -1392,6 +1393,9 @@ function applyEmergencyRoute(d){
   var b=$("e911-route-banner");
   if(!b||!d||typeof d.emergencyRoute==="undefined")return;
   b.style.display=d.emergencyRoute==="none"?"":"none";
+  /* #546: a configured trunk that has never answered is not a proven route. */
+  var u=$("e911-unverified-banner");
+  if(u)u.style.display=d.emergencyRoute==="trunk-unverified"?"":"none";
 }
 /* #450 / poll #454: the E911 banner. An ABSENT field (older firmware) shows
    nothing, same rule as wifiCapable below. Hidden while emergencyRoute is "none":
