@@ -1604,6 +1604,9 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 			{
 				auto cancelMsg = getMessageFromPool(*data);
 				if (!cancelMsg) continue;   // pool exhausted: skip this target (#101A)
+				// #560: the caller's credential stays here.
+				cancelMsg->removeHeaders("Authorization");
+				cancelMsg->removeHeaders("Proxy-Authorization");
 				std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
 
 				cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
@@ -5560,6 +5563,9 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 				std::string newTo = "To: <sip:" + answeringClient->getNumber() + "@" + serverIpPort + ">";
 				siphdr::appendTagFrom(newTo, originalTo);
 				byeFork->setTo(newTo);
+				// #560: same as the ackFork -- the caller's credential stays here.
+				byeFork->removeHeaders("Authorization");
+				byeFork->removeHeaders("Proxy-Authorization");
 
 				_outbox.emplace_back(answeringClient->getAddress(), std::move(byeFork));
 				}
@@ -6070,6 +6076,9 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 			siphdr::appendTagFrom(newTo, originalTo);
 			ackFork->setTo(newTo);
 
+			// #560: the caller's digest credential is for this PBX; never relay it.
+			ackFork->removeHeaders("Authorization");
+			ackFork->removeHeaders("Proxy-Authorization");
 			_outbox.emplace_back(answeringClient->getAddress(), std::move(ackFork));
 		}
 		return;
@@ -7527,6 +7536,9 @@ void RequestsHandler::endHandle(std::string_view destNumber, std::shared_ptr<Sip
 	auto destClient = findClient(destNumber);
 	if (destClient.has_value())
 	{
+		// #560: the caller's digest credential is for this PBX; never relay it.
+		message->removeHeaders("Authorization");
+		message->removeHeaders("Proxy-Authorization");
 		markRelay(message.get());   // #424: a relay, exempt from the no-reply guard
 		_outbox.emplace_back(destClient.value()->getAddress(), std::move(message));
 	}
@@ -9461,6 +9473,9 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 		const auto& sender = (peer == dest) ? src : dest;
 		data->setContact(buildContact(sender->getNumber()));
 	}
+	// #560: the caller's digest credential is for this PBX; never relay it.
+	data->removeHeaders("Authorization");
+	data->removeHeaders("Proxy-Authorization");
 	_outbox.emplace_back(peer->getAddress(), data);
 
 	// A re-INVITE from either leg is evidence the endpoint is alive — it counts
@@ -9629,6 +9644,9 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		const auto& sender = (peer == dest) ? src : dest;
 		data->setContact(buildContact(sender->getNumber()));
 	}
+	// #560: the caller's digest credential is for this PBX; never relay it.
+	data->removeHeaders("Authorization");
+	data->removeHeaders("Proxy-Authorization");
 	_outbox.emplace_back(peer->getAddress(), data);
 
 	if (session->getSessionExpiresSeconds() > 0)
