@@ -30,6 +30,7 @@
 #include "freertos/event_groups.h"
 
 #include "esp_system.h"
+#include "bootloader_random.h"   // Issue #420: SAR ADC entropy source for esp_random()
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #185: sip_server_task TWDT subscription
@@ -382,6 +383,19 @@ extern "C" void app_main(void)
     // below) actually stalled on the PREVIOUS boot -- the only place a headless
     // unit can report that.
     ESP_LOGI(TAG, "[boot] reset reason: %s", pdResetReasonString(esp_reset_reason()));
+
+    // ── True entropy for esp_random() (issue #420) ──────────────────────────
+    // Same reasoning as esp_main_eth.cpp's block: without Wi-Fi/BT, esp_random()
+    // is pseudo-random unless the SAR ADC source is on (random.rst), and every
+    // security-relevant number on the board -- TLS included -- comes from it.
+    // Enabled before anything can draw, and LEFT ON: this transport uses no ADC,
+    // no I2S and no RF. On the classic ESP32 the source runs through I2S0 and
+    // SAR2 (bootloader_random_esp32.c) -- it does not touch the APLL that clocks
+    // the LAN8720's RMII reference out on GPIO0. ANYONE ADDING an ADC or I2S
+    // user here must disable it first. Build-verified only: no lan8720 board on
+    // the bench as of #420.
+    bootloader_random_enable();
+    ESP_LOGI(TAG, "[boot] entropy: SAR ADC source enabled and left on -- esp_random() is a TRNG (#420)");
 
     // ── NVS init (keep ESP_ERROR_CHECK here — unrecoverable without flash) ──
     esp_err_t ret = nvs_flash_init();

@@ -24,7 +24,7 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers)
+include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers support)
 
 add_executable(sip_parser_tests
     SipMessage_test.cpp
@@ -59,10 +59,18 @@ add_executable(sip_parser_tests
     # applies them to every SDP-bearing message before any decode or relay.
     # Also pins the decode paths as zero-heap via a counting operator new.
     SdpAdmission_test.cpp
+    # The binary's one counting operator new, plus its own positive controls.
+    support/AllocCounter.cpp
+    AllocCounter_test.cpp
     # Issue #101(A)/(E): message-pool backpressure (bounded heap fallback, then
     # refuse) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
     RequestsHandler_pool_test.cpp
+    # Issue #412: every allocateVirtualPeer() caller must survive an exhausted
+    # pool -- refuse with 503 (or drop the anchor leg) and release what it had
+    # claimed, never publish a session with a null peer.
+    VpeerExhaustion_test.cpp
+    VpeerExhaustion_vm_anchor_test.cpp
     # Issue #115: the 777 SDP-loopback echo test must call allocateSession()
     # BEFORE building any 180/200, mirroring the ordinary call-to-call INVITE
     # path, so a full session pool gets a real 503 instead of a false 200.
@@ -140,6 +148,7 @@ add_executable(sip_parser_tests
     # 200 OK was silently dropped instead of reaching the held leg. Drives a full
     # 999 broadcast call through connect -> hold -> resume via handle().
     BroadcastHoldResume_test.cpp
+    TargetRefreshContact_test.cpp
     # Issue #263: sdp::isHold() (#255) had zero production callers -- the two
     # non-anchor hold/resume sites (onReinvite, onUpdate) called the older
     # direction-only getSdpDirection() instead, missing the legacy RFC 2543
@@ -325,6 +334,11 @@ add_executable(sip_parser_tests
     CoreDumpHttp_test.cpp
     # Issue #363: every secret-bearing store is empty after a factory reset.
     FactoryResetSecrets_test.cpp
+    # Issue #385: the brute-force state-recovery attack on IDGen, run for real
+    # (DISABLED_ by default -- a full 2^31 search each; see the file header).
+    IDGenPredict_test.cpp
+    # Issue #385: always-on seam/mapping guards for IDGen.
+    IDGen_test.cpp
     # Issue #186: GET/POST /api/config/export and POST /api/config/import,
     # driven end-to-end through a real HttpServer -- plaintext round-trip,
     # password-gated round-trip, replace-not-merge, and the 400/422 rejection
@@ -409,6 +423,7 @@ add_executable(sip_parser_tests
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
     # PcapCapture.hpp has no dependency beyond sockaddr_in.
     PcapCapture_test.cpp
+    DropProbe_test.cpp
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
     ProvisioningConfig_test.cpp

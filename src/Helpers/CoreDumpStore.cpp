@@ -48,25 +48,40 @@ namespace CoreDumpStore
 		}
 	}
 
-	Info query()
-	{
-		Info info;
-		info.supported = true;
-		size_t addr = 0;
-		size_t size = 0;
-		if (locate(addr, size))
-		{
-			info.present = true;
-			info.size = static_cast<uint32_t>(size);
-		}
-		return info;
-	}
-
 	namespace
 	{
-		std::mutex g_summaryMutex;
+		// The flash probe: image_get + partition_find (which heap-allocates an
+		// iterator) + a 16-byte flash_read. Deep stack, so only prime() and the
+		// pre-prime fallback in query() ever run it (#405).
+		Info probe(size_t& addr)
+		{
+			Info info;
+			info.supported = true;
+			size_t size = 0;
+			if (locate(addr, size))
+			{
+				info.present = true;
+				info.size = static_cast<uint32_t>(size);
+			}
+			return info;
+		}
+
+		std::mutex g_summaryMutex;   // guards everything below
 		Summary g_summary;   // valid only while g_summaryPrimed
 		bool g_summaryPrimed = false;
+		Info g_info;         // valid only while g_infoPrimed
+		size_t g_addr = 0;   // flash address of the dump, when g_info.present
+		bool g_infoPrimed = false;
+	}
+
+	Info query()
+	{
+		{
+			std::lock_guard<std::mutex> lock(g_summaryMutex);
+			if (g_infoPrimed) return g_info;
+		}
+		size_t addr = 0;
+		return probe(addr);
 	}
 
 	void prime()
@@ -79,8 +94,10 @@ namespace CoreDumpStore
 		// while the app runs (only a panic writes one), so once per boot loses
 		// nothing. Nothing here allocates except inside IDF's get_summary(),
 		// which maps the partition -- init-time, before the server serves.
+		size_t addr = 0;
+		const Info info = probe(addr);
 		Summary out;
-		if (query().present)
+		if (info.present)
 		{
 			out.valid = (esp_core_dump_image_check() == ESP_OK);
 
@@ -101,6 +118,9 @@ namespace CoreDumpStore
 		std::lock_guard<std::mutex> lock(g_summaryMutex);
 		g_summary = out;
 		g_summaryPrimed = true;
+		g_info = info;
+		g_addr = addr;
+		g_infoPrimed = true;
 	}
 
 	Summary summary()
@@ -112,9 +132,21 @@ namespace CoreDumpStore
 
 	bool read(uint32_t offset, uint8_t* out, size_t len)
 	{
+		if (!out) return false;
 		size_t addr = 0;
 		size_t size = 0;
-		if (!out || !locate(addr, size)) return false;
+		bool primed = false;
+		{
+			std::lock_guard<std::mutex> lock(g_summaryMutex);
+			if (g_infoPrimed)
+			{
+				primed = true;
+				if (!g_info.present) return false;
+				addr = g_addr;
+				size = g_info.size;
+			}
+		}
+		if (!primed && !locate(addr, size)) return false;
 		if (offset > size || len > size - offset) return false;
 		return esp_flash_read(nullptr, out, static_cast<uint32_t>(addr + offset),
 			static_cast<uint32_t>(len)) == ESP_OK;
@@ -127,6 +159,11 @@ namespace CoreDumpStore
 		{
 			std::lock_guard<std::mutex> lock(g_summaryMutex);
 			g_summary = Summary{};
+			g_info.supported = true;
+			g_info.present = false;
+			g_info.size = 0;
+			g_addr = 0;
+			g_infoPrimed = true;
 		}
 		return ok;
 	}
@@ -154,18 +191,11 @@ namespace CoreDumpStore
 	namespace
 	{
 		std::mutex g_mutex;
-		std::vector<uint8_t> g_image;
+		std::vector<uint8_t> g_image;   // stands in for the coredump partition
+		Info g_info;                    // the cached result, as on the board (#405)
+		bool g_infoPrimed = false;
+		uint32_t g_flashAccesses = 0;   // probes + reads of g_image
 	}
-
-	void setImageForTest(std::vector<uint8_t> image)
-	{
-		std::lock_guard<std::mutex> lock(g_mutex);
-		g_image = std::move(image);
-	}
-
-	// Host threads have MB-sized stacks and the fake needs no checksum walk, so
-	// summary() below computes directly; there is nothing to cache.
-	void prime() {}
 
 	// Host stand-in for the 16MB table's 128KB partition.
 	constexpr uint32_t kFakePartitionSize = 0x20000;
@@ -176,14 +206,45 @@ namespace CoreDumpStore
 			static_cast<uint32_t>(g_image.size()), kFakePartitionSize);
 	}
 
-	Info query()
+	// The host's "flash probe": counted, so a test can prove a route never
+	// reaches it.
+	Info probeLocked()
 	{
-		std::lock_guard<std::mutex> lock(g_mutex);
+		++g_flashAccesses;
 		Info info;
 		info.supported = !g_image.empty();
 		info.present = presentLocked();
 		info.size = info.present ? static_cast<uint32_t>(g_image.size()) : 0;
 		return info;
+	}
+
+	void setImageForTest(std::vector<uint8_t> image)
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_image = std::move(image);
+		g_info = probeLocked();   // a panic + reboot: the next boot's prime()
+		g_infoPrimed = true;
+	}
+
+	uint32_t flashAccessCountForTest()
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		return g_flashAccesses;
+	}
+
+	// Caches Info exactly as the board does. The summary needs no checksum walk
+	// on the host (summary() below computes it directly), so only Info is cached.
+	void prime()
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_info = probeLocked();
+		g_infoPrimed = true;
+	}
+
+	Info query()
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		return g_infoPrimed ? g_info : probeLocked();
 	}
 
 	Summary summary()
@@ -199,6 +260,7 @@ namespace CoreDumpStore
 	bool read(uint32_t offset, uint8_t* out, size_t len)
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
+		++g_flashAccesses;
 		if (!out || !presentLocked()) return false;
 		if (offset > g_image.size() || len > g_image.size() - offset) return false;
 		std::memcpy(out, g_image.data() + offset, len);
@@ -209,6 +271,10 @@ namespace CoreDumpStore
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		g_image.clear();
+		// As on the board: erase() itself keeps the cache truthful.
+		g_info.present = false;
+		g_info.size = 0;
+		g_infoPrimed = true;
 		return true;
 	}
 }

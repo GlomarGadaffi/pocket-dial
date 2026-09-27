@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "AllocCounter.hpp"
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
 #include "SipSdpMessage.hpp"
@@ -42,26 +43,9 @@
 #include <arpa/inet.h>
 #endif
 
-// ── Process-wide allocation counter ─────────────────────────────────────────
-// Replaces the global operator new for this test binary so a test can assert
-// that a decode path performed ZERO heap allocations. Counting is the only
-// change — memory still comes from malloc/free, so every other test in the
-// binary behaves exactly as before.
-namespace
-{
-	std::atomic<size_t> g_allocs{0};
-}
-void* operator new(std::size_t n)
-{
-	g_allocs.fetch_add(1, std::memory_order_relaxed);
-	if (void* p = std::malloc(n ? n : 1)) return p;
-	throw std::bad_alloc();
-}
-void* operator new[](std::size_t n) { return operator new(n); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+// Zero-heap assertions use the binary-wide counting operator new in
+// tests/support/AllocCounter.cpp; a second replacement here would not link.
+
 
 namespace
 {
@@ -390,13 +374,13 @@ TEST(SdpAdmission, DecodePathsAllocateNothing)
 	std::string reinviteHold = kSessionLines + "m=audio 10000 RTP/AVP 0\r\na=sendonly\r\n";
 	SipMessage hold = make(reinviteHold);
 
-	g_allocs.store(0, std::memory_order_relaxed);
+	const size_t before = heapAllocCount();
 	const auto verdict = msg.checkSdp();
 	const bool audio = msg.offersSupportedAudio(/*allowWideband=*/true);
 	const auto dir = hold.getSdpDirection();
 	const int port = sdp.getRtpPort();
 	const auto conn = sdp.getConnectionInformation();
-	const size_t allocs = g_allocs.load(std::memory_order_relaxed);
+	const size_t allocs = heapAllocCount() - before;
 
 	EXPECT_EQ(verdict, SipMessage::SdpVerdict::Ok);
 	EXPECT_TRUE(audio);

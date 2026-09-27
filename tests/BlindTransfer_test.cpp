@@ -1056,3 +1056,117 @@ TEST(BlindTransfer, SwapReinviteUsesACseqHigherThanTheDialogsRealOne)
 	// of that coverage.
 	EXPECT_NE(reinviteToB.find("c=IN IP4 10.3.3.3"), std::string::npos) << reinviteToB;
 }
+
+// Issue #402: the refer NOTIFY and the BYE both go to the transferor on the
+// REFER's own dialog. They shared a hardcoded CSeq 2, so a real UA accepted the
+// NOTIFY and answered the BYE 500 Invalid CSeq -- the transferor was never
+// dropped by it. Each must be above everything the dialog carried (INVITE 1,
+// REFER 2), and the BYE above the NOTIFY sent just before it.
+TEST(BlindTransfer, NotifyAndByeToTheTransferorGetDistinctIncreasingCSeqs)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.30.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in transferorAddr = addrFor("192.168.30.10");
+	const sockaddr_in transfereeAddr = addrFor("192.168.30.20");
+
+	handler.handle(makeRegister("100", "192.168.30.10", "reg-100-402"));
+	handler.handle(makeRegister("106", "192.168.30.20", "reg-106-402"));
+	handler.handle(makeRegister("107", "192.168.30.30", "reg-107-402"));
+
+	const std::string callId = "blindxfer-402";
+	connectCall(handler, sent, callId,
+		"100", transferorAddr, "atag", sdpBodyFor("10.1.1.1", 10001),
+		"106", transfereeAddr, "btag", sdpBodyFor("10.2.2.2", 20002));
+	sent.clear();
+
+	handler.handle(makeRefer(callId, "100", transferorAddr, "atag", "106", "btag", "107"));
+
+	auto cseqOf = [](const std::string& raw) -> long {
+		const auto at = raw.find("CSeq: ");
+		return at == std::string::npos ? -1 : std::stol(raw.substr(at + 6));
+	};
+	std::vector<long> notifies, byes;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg || addr.sin_addr.s_addr != transferorAddr.sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.find("Call-ID: " + callId + "\r\n") == std::string::npos) continue;
+		if (raw.rfind("NOTIFY sip:", 0) == 0) notifies.push_back(cseqOf(raw));
+		if (raw.rfind("BYE sip:", 0) == 0) byes.push_back(cseqOf(raw));
+	}
+	ASSERT_EQ(notifies.size(), 1u) << "exactly one refer NOTIFY to the transferor";
+	ASSERT_EQ(byes.size(), 1u) << "exactly one BYE to the transferor";
+	EXPECT_GT(notifies[0], 2) << "NOTIFY must go above the REFER's CSeq (2) on this dialog";
+	EXPECT_GT(byes[0], notifies[0])
+		<< "BYE CSeq " << byes[0] << " must exceed the NOTIFY's " << notifies[0]
+		<< " sent just before it on the same dialog";
+}
+
+// #402 review: every inbound request's CSeq feeds the dialog's floor, so a forged
+// one must not be able to poison it. Two forgeries on the A-B dialog before the
+// REFER: one from A's own address carrying CSeq 4294967295 (>= 2^31, illegal per
+// RFC 3261 s8.1.1.5 -- would have wrapped the server's next CSeq to 0), and one
+// with a LEGAL but huge CSeq from an address that is not a party to the dialog.
+// Neither may move the NOTIFY/BYE the server then sends the transferor.
+TEST(BlindTransfer, ForgedInDialogCSeqsCannotPoisonTheServersNextCSeq)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.30.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in transferorAddr = addrFor("192.168.30.10");
+	const sockaddr_in transfereeAddr = addrFor("192.168.30.20");
+	const sockaddr_in strangerAddr   = addrFor("192.168.30.99");
+
+	handler.handle(makeRegister("100", "192.168.30.10", "reg-100-402f"));
+	handler.handle(makeRegister("106", "192.168.30.20", "reg-106-402f"));
+	handler.handle(makeRegister("107", "192.168.30.30", "reg-107-402f"));
+
+	const std::string callId = "blindxfer-402-forged";
+	connectCall(handler, sent, callId,
+		"100", transferorAddr, "atag", sdpBodyFor("10.1.1.1", 10001),
+		"106", transfereeAddr, "btag", sdpBodyFor("10.2.2.2", 20002));
+
+	auto forgedInfo = [&](const sockaddr_in& from, const std::string& cseq) {
+		std::string raw =
+			"INFO sip:106@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(inet_ntoa(from.sin_addr)) + ":5060;branch=z9hG4bKforge" + cseq + "\r\n"
+			"From: <sip:100@server>;tag=atag\r\n"
+			"To: <sip:106@server>;tag=btag\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + cseq + " INFO\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, from));
+	};
+	forgedInfo(transferorAddr, "4294967295");   // illegal value, plausible source
+	forgedInfo(strangerAddr,   "1000000");      // legal value, not a dialog party
+	sent.clear();
+
+	handler.handle(makeRefer(callId, "100", transferorAddr, "atag", "106", "btag", "107"));
+
+	auto cseqOf = [](const std::string& raw) -> long long {
+		const auto at = raw.find("CSeq: ");
+		return at == std::string::npos ? -1 : std::stoll(raw.substr(at + 6));
+	};
+	long long notifyCSeq = -1, byeCSeq = -1;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg || addr.sin_addr.s_addr != transferorAddr.sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.find("Call-ID: " + callId + "\r\n") == std::string::npos) continue;
+		if (raw.rfind("NOTIFY sip:", 0) == 0) notifyCSeq = cseqOf(raw);
+		if (raw.rfind("BYE sip:", 0) == 0) byeCSeq = cseqOf(raw);
+	}
+	const long long limit = 2147483648LL;   // 2^31
+	ASSERT_GT(notifyCSeq, 2) << "NOTIFY must still go above the REFER's CSeq";
+	EXPECT_LT(notifyCSeq, 1000000) << "a non-party's CSeq must not move the dialog's floor";
+	EXPECT_GT(byeCSeq, notifyCSeq);
+	EXPECT_LT(byeCSeq, limit) << "never 2^31 or more (RFC 3261 s8.1.1.5), and in particular never wrapped";
+}
