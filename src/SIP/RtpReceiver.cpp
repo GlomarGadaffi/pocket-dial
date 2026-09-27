@@ -27,6 +27,7 @@ uint32_t RtpReceiver::rxOversizeDrops()
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #235: rtp_media_rx TWDT subscription
 #include "PsramTask.hpp"     // Issue #466: pd::createTaskPreferPsram / pd::deleteTask
+#include "ParkedTaskReap.hpp"   // Issue #535 / #572 review: when the parked task may be deleted
 #endif
 
 namespace
@@ -438,10 +439,15 @@ RtpReceiver::~RtpReceiver()
 	{
 		vTaskDelay(pdMS_TO_TICKS(5));
 	}
-	// Issue #535: the task parked itself; this is its one deleter.
+	// Issue #535: the task parked itself; this is its one deleter -- but only
+	// if it provably parked (#572 review). Otherwise log and leave it: deleting
+	// a task that may still hold _slotMutex is worse than leaking its handle.
 	{
 		std::lock_guard<std::mutex> lock(_slotMutex);
-		reapParkedTaskLocked();
+		if (!reapParkedTaskLocked())
+		{
+			ESP_LOGE("RtpReceiver", "rx task not parked at destruction; handle left undeleted (#535)");
+		}
 	}
 #else
 	stop();   // host stub: just clears the (no-task) active flag + sink
@@ -503,8 +509,13 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 		return false;
 	}
 	// Issue #535: the previous stream's task has finished (_taskRunning is
-	// false) and parked; reap it before creating the next one.
-	reapParkedTaskLocked();
+	// false) and parked; reap it before creating the next one. If it is not
+	// provably parked yet (#572 review), refuse this start rather than run two
+	// tasks on one slot or delete one that may still be running.
+	if (!reapParkedTaskLocked())
+	{
+		return false;
+	}
 	// A stream needs SOMEWHERE to deliver, but the audio Sink is no longer the
 	// only answer. A raw-relay leg (a SIP trunk) arms setRawSink() instead and
 	// has no use for an audio sink at all -- the raw path claims every packet
@@ -655,17 +666,28 @@ void RtpReceiver::taskTrampoline(void* arg)
 	}
 }
 
-void RtpReceiver::reapParkedTaskLocked()
+bool RtpReceiver::reapParkedTaskLocked()
 {
-	if (_parkedTask == nullptr) return;
-	// The task clears _taskRunning and then suspends itself: wait (a few ticks
-	// at most) for the suspend so the delete lands on a parked task.
-	for (int i = 0; i < 100 && eTaskGetState(_parkedTask) != eSuspended; ++i)
+	// #572 review: delete ONLY a task that has cleared _taskRunning (its last
+	// touch of `this`) AND is suspended in its park loop. A running or
+	// not-yet-suspended task may hold _slotMutex or be mid-way on the other
+	// core; deleting it there is the #421 class of bug. So on anything else,
+	// keep the handle, count it, and let the next start()/destructor retry.
+	switch (pd::reapDecision(_parkedTask != nullptr,
+		_taskRunning.load(std::memory_order_acquire),
+		_parkedTask != nullptr && eTaskGetState(_parkedTask) == eSuspended))
 	{
-		vTaskDelay(1);
+		case pd::ReapDecision::Nothing:
+			return true;
+		case pd::ReapDecision::Reap:
+			pd::deleteTask(_parkedTask);   // another task: no helper, no allocation
+			_parkedTask = nullptr;
+			return true;
+		case pd::ReapDecision::Wait:
+		default:
+			_reapDeferred.fetch_add(1, std::memory_order_relaxed);
+			return false;
 	}
-	pd::deleteTask(_parkedTask);   // another task: no helper, no allocation
-	_parkedTask = nullptr;
 }
 
 void RtpReceiver::runLoop()

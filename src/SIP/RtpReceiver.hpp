@@ -399,7 +399,10 @@ private:
 	// the destructor. Written only under _slotMutex (start) or by the
 	// destructor, never by the task.
 	TaskHandle_t      _parkedTask = nullptr;
-	void reapParkedTaskLocked();
+	// Deletes the parked task only when pd::reapDecision() says Reap (#572
+	// review); true when the slot is free. On Wait it counts in _reapDeferred.
+	bool reapParkedTaskLocked();
+	std::atomic<uint32_t> _reapDeferred{0};
 #endif
 
 	std::atomic<bool> _active{false};
