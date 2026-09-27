@@ -158,6 +158,9 @@ public:
 	uint64_t getDroppedInvalid() const;
 	uint64_t getDroppedRate() const;
 	const DropProbe& getDropProbe() const;
+	// Issue #430: datagrams made only of CR/LF -- RFC 5626 keep-alives, which
+	// phones also send over UDP to hold a NAT binding. Counted, NOT dropped.
+	uint64_t getKeepalivesCrlf() const;
 	// Issue #443/#444: discards made BEFORE handle() sees a datagram -- by the
 	// UDP receive loop (oversize, empty, a failed receive) or by SipServer when
 	// the message pool is spent. Called on the receive task; never allocates or
@@ -172,6 +175,9 @@ public:
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
 	// drop (responses, ACK).
 	uint64_t getSdpRejected() const;
+	// Issue #497: INVITEs refused because they did not come from the caller's
+	// registered address (the 403 "Caller Not Registered From This Address").
+	uint64_t getUnboundCallerRefusals() const { return _unboundCallerRefusals.load(std::memory_order_relaxed); }
 	// Issue #424: responses drainOutbox() refused to send because they answered
 	// a response or an ACK. Any non-zero value is a handler bug the guard caught.
 	uint32_t getRepliesRefused() const;
@@ -2116,7 +2122,10 @@ private:
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
+	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
+	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
 	std::atomic<uint32_t> _optionsPingTruncated{0};   // #463: see getOptionsPingTruncated()
 	// Requests answered from a §17.2 server transaction's stored response rather

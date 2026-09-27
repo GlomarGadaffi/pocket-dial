@@ -811,6 +811,22 @@ void RequestsHandler::initHandlers()
 
 void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_view rawBytes)
 {
+	// Issue #430: a datagram of nothing but CR/LF is a keep-alive, not a malformed
+	// message. Phones send RFC 5626's double-CRLF ping over UDP as a vendor NAT
+	// keep-alive (on .244, ext 113 sends "\r\n\r\n" every 32 s, which was the
+	// whole idle "drop" rate). Nothing is owed back: RFC 5626 reserves the CRLF
+	// keep-alive and its pong for connection-oriented transports (§4.4.1, §5.4),
+	// and this PBX does not implement outbound at all. Answering would also make
+	// 5060 reply to spoofed datagrams. Count it and stop: it is not a drop, so it
+	// no longer hides real malformed traffic behind a steady floor. Classified
+	// from the wire bytes; a caller that passes none (no rawBytes) cannot claim it.
+	if (!rawBytes.empty() &&
+		rawBytes.find_first_not_of("\r\n") == std::string_view::npos)
+	{
+		_keepalivesCrlf.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
 	// Input validation: Drop null or structurally malformed packets instantly (SEC-02)
 	if (!request || !request->isValidMessage())
 	{
@@ -1766,6 +1782,37 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		emergency.isEmergency)
 	{
 		routeEmergencyCall(data, caller.value(), emergency, destNumber);
+		return;
+	}
+
+	// Issue #497: the From header only NAMES the caller. Before this, any host on
+	// the link could place a call -- dial plan and trunk egress included -- as any
+	// registered extension just by writing its number in From, and in Learn mode
+	// (the default, #500) nothing else was checked. A call now has to come from
+	// the address that extension registered from. Source IP only, port-agnostic:
+	// the same rule isDialogSourceAuthorized() applies to BYE, since a phone may
+	// place calls from a different ephemeral port than it registered from.
+	// Deliberately AFTER the emergency branch: 911 is never gated (#454).
+	if (caller.value()->getAddress().sin_addr.s_addr != data->getSource().sin_addr.s_addr)
+	{
+		// Counted every time (/metrics); logged at most once per 10 s. A spoofer
+		// can send these as fast as it likes, and each log line allocates on this
+		// task (#284; BigDog's and Crew's #503 reviews).
+		_unboundCallerRefusals.fetch_add(1, std::memory_order_relaxed);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - _lastUnboundCallerLog >= std::chrono::seconds(10))
+		{
+			_lastUnboundCallerLog = now;
+			queueLog("INVITE refused: caller \"" + std::string(data->getFromNumber()) +
+				"\" is registered from a different address (#497; further refusals counted, "
+				"logged at most every 10 s)", true);
+		}
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 403 Caller Not Registered From This Address");
+		response->clearBody();
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
 
@@ -7677,6 +7724,11 @@ uint64_t RequestsHandler::getDroppedInvalid() const
 uint64_t RequestsHandler::getDroppedRate() const
 {
 	return _dropProbe.rateCount();
+}
+
+uint64_t RequestsHandler::getKeepalivesCrlf() const
+{
+	return _keepalivesCrlf.load(std::memory_order_relaxed);
 }
 
 const DropProbe& RequestsHandler::getDropProbe() const
