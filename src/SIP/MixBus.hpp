@@ -48,4 +48,11 @@ private:
 
     Port    _ports[MAX_PORTS];
     int32_t _mix[FRAME] = {};      // wide accumulator — clipped once, at output
+
+    // tick()'s working set. Members, not locals: 2,880 B on the stack gave tick() a
+    // 2,928 B frame on conf_mix_tick's 3,072 B stack, and the first 888 call
+    // overflowed it (issue #498). Safe as members because tick() has exactly one
+    // caller (the single driver, or tickOnce() in tests). 16-byte aligned for the PIE path.
+    alignas(16) int16_t _frame[MAX_PORTS][FRAME] = {};
+    alignas(16) int16_t _out[FRAME] = {};
 };
