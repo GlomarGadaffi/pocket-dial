@@ -1667,6 +1667,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	bool e911Configured = false;
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate = 0;
+	uint64_t keepalivesCrlf = 0;   // Issue #430: not drops
 	uint64_t droppedNoPool = 0;    // Issue #443/#444: discarded before handle()
 	uint64_t droppedOversize = 0;
 	uint64_t recvErrors = 0;
@@ -1688,6 +1689,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		e911Configured = handler->isE911Configured();   // #450
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate = handler->getDroppedRate();
+		keepalivesCrlf = handler->getKeepalivesCrlf();
 		const DropProbe& probe = handler->getDropProbe();
 		droppedNoPool = probe.count(DropProbe::Reason::NoPool);
 		droppedOversize = probe.count(DropProbe::Reason::Oversize);
@@ -1727,6 +1729,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// do not.
 	json << "\"droppedInvalid\":" << droppedInvalid << ",";
 	json << "\"droppedRate\":" << droppedRate << ",";
+	// Issue #430: CR/LF-only keep-alives. Counted apart: they are not drops.
+	json << "\"keepalivesCrlf\":" << keepalivesCrlf << ",";
 	// Issue #443/#444: discarded before handle() -- NOT part of packetsDropped.
 	// No message was ever built for these; the ring below records their source
 	// (no_pool, oversize with the datagram's real length). recvErrors are failed
@@ -2113,6 +2117,7 @@ void HttpServer::sendApiMetrics(int sock)
 	uint64_t unboundCaller = 0;   // #497
 	uint64_t droppedInvalid = 0;   // Issue #430
 	uint64_t droppedRate  = 0;
+	uint64_t keepalivesCrlf = 0;   // Issue #430
 	uint64_t droppedNoPool = 0;    // Issue #443/#444
 	uint64_t droppedOversize = 0;
 	uint64_t recvErrors = 0;
@@ -2131,6 +2136,7 @@ void HttpServer::sendApiMetrics(int sock)
 		dropped      = handler->getPacketsDropped();
 		droppedInvalid = handler->getDroppedInvalid();
 		droppedRate  = handler->getDroppedRate();
+		keepalivesCrlf = handler->getKeepalivesCrlf();
 		const DropProbe& probe = handler->getDropProbe();
 		droppedNoPool   = probe.count(DropProbe::Reason::NoPool);
 		droppedOversize = probe.count(DropProbe::Reason::Oversize);
@@ -2193,6 +2199,11 @@ void HttpServer::sendApiMetrics(int sock)
 	        "The refused share of pocketdial_packets_dropped_total: allowlist or per-IP "
 	        "rate limit (issue #430).",
 	        droppedRate);
+	counter("pocketdial_sip_keepalives_crlf_total",
+	        "CR/LF-only SIP keep-alives (RFC 5626 ping, or a UDP NAT keep-alive) since boot. "
+	        "Not drops: they are counted here instead of pocketdial_packets_dropped_total "
+	        "(issue #430).",
+	        keepalivesCrlf);
 	counter("pocketdial_packets_dropped_no_pool_total",
 	        "SIP datagrams discarded before parsing because the message pool and its "
 	        "bounded heap fallback were spent (issue #443). Not in "
