@@ -350,6 +350,8 @@ add_executable(sip_parser_tests
     # Issue #382: /api/coredump* -- owner-only download, CSRF-checked erase,
     # ungated presence on /api/status, against a fake CoreDumpStore image.
     CoreDumpHttp_test.cpp
+    # Issue #397: the boot-time registrar default (fresh -> learn, existing -> open).
+    RegistrarBootMode_test.cpp
     # Issue #363: every secret-bearing store is empty after a factory reset.
     FactoryResetSecrets_test.cpp
     # Issue #385: the brute-force state-recovery attack on IDGen, run for real

@@ -48,6 +48,25 @@ public:
 
 	Registrar(PbxEnv& env, Mode defaultMode) : _env(env), _mode(defaultMode) {}
 
+	// ── Boot-time default (issue #397) ────────────────────────────────────────
+	// What mode a board boots in when NVS has no reg_mode, and whether to write
+	// it back. Pure, so the host suite tests the rule the board runs.
+	//   stored mode present            -> that mode, nothing written
+	//   no stored mode, trusted store  -> Learn, persisted
+	//   no stored mode, Uncertain store (unreadable, failed/downgrade schema)
+	//                                  -> Learn, NOT persisted: re-decided next boot
+	// Never Open by default (#441 review): a missing key is also what every failed
+	// write looks like, so it must fail safe. A DEPLOYED pre-#397 board keeps Open
+	// because the schema v1 -> v2 migration WRITES it (DeviceConfig.cpp,
+	// migrateKeepPre397BoardOpen), and the v2 stamp lands only if that succeeded.
+	enum class BootSchema : uint8_t { FreshInstall, Upgraded, Uncertain };
+	struct BootModeDecision
+	{
+		Mode mode;
+		bool persist;
+	};
+	static BootModeDecision chooseBootMode(bool haveStored, Mode stored, BootSchema schema);
+
 	// ── Mode ──────────────────────────────────────────────────────────────────
 	// setMode persists write-through (caller holds _mutex); getMode is lock-free.
 	void setMode(Mode mode);
@@ -123,7 +142,7 @@ private:
 		bool online = false;   // volatile; not persisted
 	};
 
-	void persistMode();
+	bool persistMode();   // false (and logged at ERROR) if any NVS step failed
 	void persistDevices();
 	// Find a record by MAC key or, failing that, by adopted extension.
 	std::unordered_map<std::string, DeviceRecord>::iterator findDevice(const std::string& macOrExt);
