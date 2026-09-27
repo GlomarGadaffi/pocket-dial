@@ -1107,6 +1107,10 @@ TEST(DropProbeStatus, CountsArePublicRecentDropsNeedASession)
 	phone.sin_family = AF_INET;
 	phone.sin_port = htons(5062);
 	inet_pton(AF_INET, "192.168.9.181", &phone.sin_addr);
+	// #430: a CR/LF-only datagram is a keep-alive, not a drop, so the malformed
+	// packet here is real junk; the ping is fed too, to pin its public counter.
+	const std::string junk = "junk";
+	handler.handle(RequestsHandler::getMessageFromPool(junk, phone), junk);
 	const std::string ping = "\r\n\r\n";
 	handler.handle(RequestsHandler::getMessageFromPool(ping, phone), ping);
 
@@ -1119,6 +1123,8 @@ TEST(DropProbeStatus, CountsArePublicRecentDropsNeedASession)
 	EXPECT_NE(anon.find("\"packetsDropped\":1,"), std::string::npos) << anon;
 	EXPECT_NE(anon.find("\"droppedInvalid\":1,"), std::string::npos) << anon;
 	EXPECT_NE(anon.find("\"droppedRate\":0,"), std::string::npos) << anon;
+	EXPECT_NE(anon.find("\"keepalivesCrlf\":1,"), std::string::npos)
+		<< "the keep-alive is counted, publicly, and not as a drop:\n" << anon;
 	EXPECT_NE(anon.find("\"recentDrops\":[]"), std::string::npos)
 		<< "drop sources must be withheld without a session:\n" << anon;
 	EXPECT_EQ(anon.find("192.168.9.181"), std::string::npos) << anon;
@@ -1131,7 +1137,7 @@ TEST(DropProbeStatus, CountsArePublicRecentDropsNeedASession)
 		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
 
 	const std::string authed = bodyOf(httpGetRaw(18135, "/api/status", "pd_session=" + cookie));
-	EXPECT_NE(authed.find("\"reason\":\"invalid\",\"src\":\"192.168.9.181:5062\",\"len\":4,\"head\":\"0d0a0d0a\"}"),
+	EXPECT_NE(authed.find("\"reason\":\"invalid\",\"src\":\"192.168.9.181:5062\",\"len\":4,\"head\":\"6a756e6b\"}"),
 	          std::string::npos)
 		<< "a session must see who sent the dropped packet and its first bytes:\n" << authed;
 
