@@ -204,8 +204,9 @@ SipTrunk::Dialog* SipTrunk::findMutableByCallID(std::string_view callID)
 	// Callers hand us SipMessage::getCallID(), which returns the FULL header line
 	// ("Call-ID: x@host") while our slots hold the bare id we generated. Normalise
 	// before comparing -- the same mismatch that once left every register beep
-	// un-ACKed (see RegisterBeeper::findByCallID).
-	const std::string key = siphdr::stripHeaderName(callID);
+	// un-ACKed (see RegisterBeeper::findByCallID). A view, not a copy (#464):
+	// this runs on every SIP response and BYE the engine handles, trunk or not.
+	const std::string_view key = siphdr::stripHeaderNameView(callID);
 	for (auto& d : _dialogs)
 	{
 		if (d.state == State::Free) continue;
@@ -220,7 +221,7 @@ SipTrunk::Dialog* SipTrunk::findMutableByCallID(std::string_view callID)
 		// carrier leg stayed up and billing. Normalising here rather than at
 		// the call site keeps this class correct for either form.
 		if (d.callID == key ||
-			(!d.handsetCallID.empty() && siphdr::stripHeaderName(d.handsetCallID) == key))
+			(!d.handsetCallID.empty() && siphdr::stripHeaderNameView(d.handsetCallID) == key))
 		{
 			return &d;
 		}
@@ -231,7 +232,7 @@ SipTrunk::Dialog* SipTrunk::findMutableByCallID(std::string_view callID)
 SipTrunk::Dialog* SipTrunk::findMutableByTrunkCallID(std::string_view callID)
 {
 	// Same normalisation as findMutableByCallID(); callID is always stored bare.
-	const std::string key = siphdr::stripHeaderName(callID);
+	const std::string_view key = siphdr::stripHeaderNameView(callID);
 	for (auto& d : _dialogs)
 	{
 		if (d.state != State::Free && d.callID == key) return &d;
