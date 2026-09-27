@@ -354,6 +354,8 @@ TEST_F(FactoryResetSecretsTest, AFailedStoreEraseIsRecordedInTheResetJournal)
 	EXPECT_EQ(st.failedMask & resetjournal::kAdmin, 0) << "a store that erased is not blamed";
 	EXPECT_EQ(st.failedMask & resetjournal::kE911, 0);
 	resetjournal::resetForTest();
+}
+
 // #456 review: clearAllTelephonyConfig() (the carrier OAuth client_secret) and
 // clearAllDidMappings() (PII) used to have their results discarded, so a failed
 // persist still answered 200 "ok". Pointing the stores at a directory that does

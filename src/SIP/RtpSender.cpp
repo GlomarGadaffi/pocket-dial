@@ -253,6 +253,17 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	// the udp_receiver/SIP task at 5) so pacing is not starved by signaling bursts.
 	// Handle is nullptr: the task self-manages its lifecycle via _stopRequested /
 	// _taskRunning, so we never store (and race on) a TaskHandle_t.
+	//
+	// Issue #466: deliberately an INTERNAL stack, unlike rtp_media_rx. The L2
+	// egress path (l2rtp::EgressChannel::transmit -> esp_eth_transmit ->
+	// emac_w5500_transmit) runs the W5500 driver ON THIS TASK, and the driver's
+	// small register writes pass stack variables as the SPI tx_buffer (not
+	// SPI_TRANS_USE_TXDATA). The W5500 bus is DMA (SPI_DMA_CH_AUTO), so from a
+	// PSRAM stack spi_master's setup_priv_desc() -> spicommon_dma_setup_priv_buffer()
+	// would malloc an internal DMA bounce buffer for EVERY frame, 50/s per
+	// stream -- exactly the #282/#368 "Failed to allocate priv TX buffer" class.
+	// The endpoint is per-slot xTaskCreateStatic on stacks preallocated at boot
+	// (see #466's follow-up issue), which removes this per-call allocation too.
 	BaseType_t ok = xTaskCreatePinnedToCore(
 		&RtpSender::taskTrampoline,
 		"rtp_media_tx",

@@ -18,25 +18,29 @@ namespace
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	// Pool storage in internal SRAM with DMA attribute.
 	static DMA_ATTR FrameBuffer s_frames[DmaFramePool::kPoolSize];
-	static QueueHandle_t       s_poolQueue = nullptr;
-	static portMUX_TYPE         s_initMux   = portMUX_INITIALIZER_UNLOCKED;
+	static std::atomic<QueueHandle_t> s_poolQueue{nullptr};
 
-	void poolInitInternal()
+	// Issue #466: this used to call xQueueCreate() -- a heap allocation --
+	// inside portENTER_CRITICAL, which is invalid on IDF (allocating with
+	// interrupts masked can assert or deadlock the heap lock). The queue is
+	// now built and filled privately, with no lock held, and published once
+	// with a compare-exchange; a racing initialiser deletes its own copy.
+	QueueHandle_t poolInitInternal()
 	{
-		portENTER_CRITICAL(&s_initMux);
-		if (s_poolQueue == nullptr)
-		{
-			s_poolQueue = xQueueCreate(DmaFramePool::kPoolSize, sizeof(FrameBuffer*));
-			if (s_poolQueue != nullptr)
-			{
-				for (size_t i = 0; i < DmaFramePool::kPoolSize; ++i)
+		return detail::publishOnce(s_poolQueue,
+			[] {
+				QueueHandle_t q = xQueueCreate(DmaFramePool::kPoolSize, sizeof(FrameBuffer*));
+				if (q != nullptr)
 				{
-					FrameBuffer* p = &s_frames[i];
-					(void)xQueueSend(s_poolQueue, &p, 0);
+					for (size_t i = 0; i < DmaFramePool::kPoolSize; ++i)
+					{
+						FrameBuffer* p = &s_frames[i];
+						(void)xQueueSend(q, &p, 0);
+					}
 				}
-			}
-		}
-		portEXIT_CRITICAL(&s_initMux);
+				return q;
+			},
+			[](QueueHandle_t q) { vQueueDelete(q); });
 	}
 #else
 	static FrameBuffer  s_frames[DmaFramePool::kPoolSize];
@@ -74,13 +78,14 @@ void DmaFramePool::init()
 DmaFramePool::Handle DmaFramePool::acquire()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	if (s_poolQueue == nullptr)
+	QueueHandle_t q = s_poolQueue.load(std::memory_order_acquire);
+	if (q == nullptr)
 	{
-		poolInitInternal();
+		q = poolInitInternal();
 	}
 
 	FrameBuffer* buf = nullptr;
-	if (s_poolQueue != nullptr && xQueueReceive(s_poolQueue, &buf, 0) == pdTRUE)
+	if (q != nullptr && xQueueReceive(q, &buf, 0) == pdTRUE)
 	{
 		s_allocations.fetch_add(1, std::memory_order_relaxed);
 		return Handle(buf);
@@ -116,9 +121,9 @@ void DmaFramePool::Handle::release() noexcept
 	_buf = nullptr;
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	if (s_poolQueue != nullptr)
+	if (QueueHandle_t q = s_poolQueue.load(std::memory_order_acquire))
 	{
-		(void)xQueueSend(s_poolQueue, &bufToReturn, 0);
+		(void)xQueueSend(q, &bufToReturn, 0);
 	}
 #else
 	std::lock_guard<std::mutex> lock(s_mutex);
@@ -142,11 +147,12 @@ uint32_t DmaFramePool::getAllocations() noexcept
 size_t DmaFramePool::available() noexcept
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	if (s_poolQueue == nullptr)
+	QueueHandle_t q = s_poolQueue.load(std::memory_order_acquire);
+	if (q == nullptr)
 	{
 		return 0;
 	}
-	return static_cast<size_t>(uxQueueMessagesWaiting(s_poolQueue));
+	return static_cast<size_t>(uxQueueMessagesWaiting(q));
 #else
 	std::lock_guard<std::mutex> lock(s_mutex);
 	return s_top;

@@ -23,6 +23,7 @@
 #include <vector>
 #include <cstring>
 #include <chrono>
+#include <utility>
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	// On the device, credentials persist in NVS and randomness comes from the
@@ -772,6 +773,25 @@ namespace
 	}
 
 	// --- NVS-backed persistence (ESP only); no-ops on host. ---
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Reads one non-empty string key (at most 127 chars, as before) into `out`.
+	// Issue #492: the ONE 128-byte buffer lives in this frame, not the caller's.
+	// loadCredentialLocked used to hold eight char[128] at once -- a 1,104 B frame
+	// that left the 4 KB http_conn stack ~400 B on the first login after boot.
+	// noinline, or the compiler folds the buffer back into the caller.
+	__attribute__((noinline)) bool readNvsStr(nvs_handle_t h, const char* key, std::string& out)
+	{
+		char buf[128];
+		size_t len = sizeof(buf);
+		if (nvs_get_str(h, key, buf, &len) != ESP_OK || buf[0] == '\0')
+		{
+			return false;
+		}
+		out.assign(buf);
+		return true;
+	}
+#endif
+
 	// Caller must hold state().mutex.
 	void loadCredentialLocked(AuthState& s)
 	{
@@ -782,57 +802,48 @@ namespace
 		s.loaded = true;
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		// Read-only: this only reads, and a missing "storage" namespace is the
+		// same answer as no stored credential (#492).
 		nvs_handle_t h;
-		if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK)
+		if (nvs_open("storage", NVS_READONLY, &h) == ESP_OK)
 		{
-			char userBuf[128] = {0};
-			char saltBuf[128] = {0};
-			char hashBuf[128] = {0};
-			size_t userLen = sizeof(userBuf);
-			size_t saltLen = sizeof(saltBuf);
-			size_t hashLen = sizeof(hashBuf);
-			esp_err_t e1 = nvs_get_str(h, "admin_user", userBuf, &userLen);
-			esp_err_t e2 = nvs_get_str(h, "admin_pw_salt", saltBuf, &saltLen);
-			esp_err_t e3 = nvs_get_str(h, "admin_pw_hash", hashBuf, &hashLen);
-			if (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK &&
-				userBuf[0] != '\0' && saltBuf[0] != '\0' && hashBuf[0] != '\0')
+			// Each principal is all-or-nothing: its fields are committed only if
+			// every one of them was read and non-empty. One block per principal,
+			// so the temporaries' stack slots are reused rather than stacked.
 			{
-				s.username = userBuf;
-				s.pwSalt = saltBuf;
-				s.pwHash = hashBuf;
-				s.provisioned = true;
+				std::string user, salt, hash;
+				if (readNvsStr(h, "admin_user", user) &&
+					readNvsStr(h, "admin_pw_salt", salt) &&
+					readNvsStr(h, "admin_pw_hash", hash))
+				{
+					s.username = std::move(user);
+					s.pwSalt = std::move(salt);
+					s.pwHash = std::move(hash);
+					s.provisioned = true;
+				}
 			}
-
-			char pinSaltBuf[128] = {0};
-			char pinHashBuf[128] = {0};
-			size_t pinSaltLen = sizeof(pinSaltBuf);
-			size_t pinHashLen = sizeof(pinHashBuf);
-			esp_err_t e4 = nvs_get_str(h, "admin_pin_salt", pinSaltBuf, &pinSaltLen);
-			esp_err_t e5 = nvs_get_str(h, "admin_pin_hash", pinHashBuf, &pinHashLen);
-			if (e4 == ESP_OK && e5 == ESP_OK && pinSaltBuf[0] != '\0' && pinHashBuf[0] != '\0')
 			{
-				s.pinSalt = pinSaltBuf;
-				s.pinHash = pinHashBuf;
-				s.dtmfPinSet = true;
+				std::string pinSalt, pinHash;
+				if (readNvsStr(h, "admin_pin_salt", pinSalt) &&
+					readNvsStr(h, "admin_pin_hash", pinHash))
+				{
+					s.pinSalt = std::move(pinSalt);
+					s.pinHash = std::move(pinHash);
+					s.dtmfPinSet = true;
+				}
 			}
-
-			// Issue #173: the OWNER principal, own NVS keys.
-			char ownerUserBuf[128] = {0};
-			char ownerSaltBuf[128] = {0};
-			char ownerHashBuf[128] = {0};
-			size_t ownerUserLen = sizeof(ownerUserBuf);
-			size_t ownerSaltLen = sizeof(ownerSaltBuf);
-			size_t ownerHashLen = sizeof(ownerHashBuf);
-			esp_err_t e6 = nvs_get_str(h, "owner_user", ownerUserBuf, &ownerUserLen);
-			esp_err_t e7 = nvs_get_str(h, "owner_pw_salt", ownerSaltBuf, &ownerSaltLen);
-			esp_err_t e8 = nvs_get_str(h, "owner_pw_hash", ownerHashBuf, &ownerHashLen);
-			if (e6 == ESP_OK && e7 == ESP_OK && e8 == ESP_OK &&
-				ownerUserBuf[0] != '\0' && ownerSaltBuf[0] != '\0' && ownerHashBuf[0] != '\0')
 			{
-				s.ownerUsername = ownerUserBuf;
-				s.ownerPwSalt = ownerSaltBuf;
-				s.ownerPwHash = ownerHashBuf;
-				s.ownerProvisioned = true;
+				// Issue #173: the OWNER principal, own NVS keys.
+				std::string ownerUser, ownerSalt, ownerHash;
+				if (readNvsStr(h, "owner_user", ownerUser) &&
+					readNvsStr(h, "owner_pw_salt", ownerSalt) &&
+					readNvsStr(h, "owner_pw_hash", ownerHash))
+				{
+					s.ownerUsername = std::move(ownerUser);
+					s.ownerPwSalt = std::move(ownerSalt);
+					s.ownerPwHash = std::move(ownerHash);
+					s.ownerProvisioned = true;
+				}
 			}
 			nvs_close(h);
 		}
