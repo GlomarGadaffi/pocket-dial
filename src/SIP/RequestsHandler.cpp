@@ -1536,6 +1536,40 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 			_outbox.emplace_back(data->getSource(), std::move(response));
 		}
+		// Issue #548: RFC 3261 §9.2 -- the INVITE itself is then answered 487. The
+		// PBX is this INVITE's UAS (the far leg is the anchor's, not a SIP peer
+		// whose own 487 could be relayed), so nothing else ever answers it: the
+		// phone's INVITE transaction sat in Proceeding until its own timer. Only
+		// while the call is still ringing -- once the 200 OK went out the INVITE
+		// has its final response and a CANCEL changes nothing (§9.2). Built from
+		// the CANCEL, which carries the INVITE's Via branch, From, To, Call-ID and
+		// CSeq number (§9.1); the To-tag is the one the 180 Ringing carried.
+		if (cancelSess.has_value() &&
+			cancelSess.value()->getState() == Session::State::Invited)
+		{
+			// The stored INVITE when there is one (its own Via/CSeq verbatim);
+			// else the CANCEL, which carries the same fields (§9.1).
+			const std::shared_ptr<SipMessage> invite = cancelSess.value()->getInviteMessage();
+			auto terminated = getMessageFromPool(invite ? *invite : *data);
+			if (terminated)
+			{
+				std::string cseq(data->getCSeq());
+				const size_t m = cseq.find("CANCEL");
+				if (m != std::string::npos) cseq.replace(m, 6, "INVITE");
+				const std::string& tag = cancelSess.value()->getLocalTag();
+				terminated->setHeader(SipMessageTypes::REQUEST_TERMINATED);
+				terminated->clearBody();
+				terminated->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+				terminated->setCSeq(cseq);
+				std::string to(data->getTo());
+				if (to.find(";tag=") == std::string::npos)
+				{
+					to += ";tag=" + (tag.empty() ? IDGen::GenerateID(9) : tag);
+				}
+				terminated->setTo(std::move(to));
+				_outbox.emplace_back(data->getSource(), std::move(terminated));
+			}
+		}
 		endCall(data->getCallID(), data->getFromNumber(), destNumber, "handset CANCEL");
 		return;
 	}
