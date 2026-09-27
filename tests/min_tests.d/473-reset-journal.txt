@@ -1,2 +1,2 @@
-# ResetJournal_test.cpp (8) + FactoryResetSecrets journal wiring (1), #473/#481
-9
+# ResetJournal_test.cpp (8) + FactoryResetSecrets journal wiring (1), #473/#481 (+1 #481 review: concurrent first look)
+10

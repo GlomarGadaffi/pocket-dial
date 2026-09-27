@@ -8,6 +8,11 @@
 
 #include "ResetJournal.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <thread>
+
 namespace
 {
 	struct Fresh
@@ -120,4 +125,45 @@ TEST(ResetJournal, AJournalWriteFailureIsCountedAndTheResetProceeds)
 	EXPECT_FALSE(resetjournal::bootStatus().incomplete()) << "nothing was recorded, and the reset completed";
 
 	EXPECT_TRUE(resetjournal::begin()) << "a later write succeeds again";
+}
+
+// #481 review (BLOCKING): two http_conn threads can make the very first
+// GET /api/status at the same moment. The one that arrives while the other is
+// still reading the record must NOT get the default "complete" status: it
+// waits for the load. The hook runs inside the load, before the record is
+// read, and asks for bootStatus() from a second thread.
+namespace
+{
+	std::promise<resetjournal::BootStatus>* g_second = nullptr;
+	void askFromAnotherThreadMidLoad()
+	{
+		resetjournal::setLoadHookForTest(nullptr);   // the second caller must not re-enter this
+		auto* p = g_second;
+		std::thread([p] { p->set_value(resetjournal::bootStatus()); }).detach();
+		// Give the second thread time to return early if the cache lets it.
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
+}
+
+TEST(ResetJournal, AConcurrentFirstLookWaitsForTheLoadInsteadOfReportingComplete)
+{
+	Fresh f;
+	resetjournal::begin();                    // a reset that never finished
+	resetjournal::simulateRebootForTest();
+
+	std::promise<resetjournal::BootStatus> second;
+	auto fut = second.get_future();
+	g_second = &second;
+	resetjournal::setLoadHookForTest(&askFromAnotherThreadMidLoad);
+
+	const auto first = resetjournal::bootStatus();
+	ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+	const auto other = fut.get();
+	resetjournal::setLoadHookForTest(nullptr);
+	g_second = nullptr;
+
+	EXPECT_TRUE(first.incomplete());
+	EXPECT_TRUE(other.incomplete())
+		<< "a status request racing the first load reported the interrupted reset as complete";
+	EXPECT_EQ(other.stage, resetjournal::Stage::Begun);
 }

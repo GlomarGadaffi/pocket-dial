@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <mutex>
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "esp_attr.h"
@@ -168,6 +169,8 @@ namespace
 	}
 
 	void warn(const char* msg) { std::cerr << "[W] ResetJournal: " << msg << std::endl; }
+
+	void (*s_loadHook)() = nullptr;
 #endif
 
 	struct Cache
@@ -182,12 +185,26 @@ namespace
 		return c;
 	}
 
+	// #481 review: the first GET /api/status can arrive on two http_conn threads
+	// at once. `loaded` used to be set BEFORE the record was read, so the second
+	// thread returned the default ("complete") status for an interrupted reset.
+	// The load now runs under a mutex and `loaded` is set only after `status` is
+	// filled; a racing caller waits for it. No heap: a function-local std::mutex.
+	std::mutex& loadMutex()
+	{
+		static std::mutex m;
+		return m;
+	}
+
 	void ensureLoaded()
 	{
+		std::lock_guard<std::mutex> lock(loadMutex());
 		Cache& c = cache();
 		if (c.loaded) return;
-		c.loaded = true;
 		c.status.storage = backend();
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+		if (s_loadHook) s_loadHook();
+#endif
 		Record r{};
 		switch (load(r))
 		{
@@ -214,6 +231,7 @@ namespace
 				  "run the factory reset again"
 				: "the factory-reset journal is unreadable (torn write); treat the last reset as incomplete");
 		}
+		c.loaded = true;   // last: a racing caller waits on the mutex, never sees a half-loaded cache
 	}
 }
 
@@ -306,6 +324,11 @@ void resetForTest()
 	s_hostHasRecord = false;
 	s_hostFailNextStore = false;
 	writeFailures().store(0);
+}
+
+void setLoadHookForTest(void (*hook)())
+{
+	s_loadHook = hook;
 }
 
 void failNextWriteForTest()
