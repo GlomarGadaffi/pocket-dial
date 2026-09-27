@@ -2055,8 +2055,11 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// summary stay behind /api/coredump*.
 	{
 		const CoreDumpStore::Info cd = CoreDumpStore::query();
+		// `supported` (#514): false when the board has no coredump partition,
+		// so "present":false is not misread as "no crash happened".
 		json << ",\"coredump\":{\"present\":" << (cd.present ? "true" : "false")
-		     << ",\"size\":" << cd.size << "}";
+		     << ",\"size\":" << cd.size
+		     << ",\"supported\":" << (cd.supported ? "true" : "false") << "}";
 	}
 
 	// Issue #328: L2 transmit-path health, in one object, on the UNGATED route.
