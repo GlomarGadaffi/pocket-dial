@@ -11210,6 +11210,10 @@ bool RequestsHandler::handleSpliceResponse(const std::shared_ptr<SipMessage>& da
 				if (status->code < 300 && data->hasSdp()) resp->setBody(std::string(data->getBody()));
 				else resp->clearBody();
 				resp->syncContentLength();
+				// #424/#472: a response built while handling a response. It carries
+				// the ORIGINATOR's Call-ID, so the no-reply guard would not match it
+				// anyway, but it is a translated relay: say so, the same as endHandle().
+				markRelay(resp.get());
 				_outbox.emplace_back(t.origin->getSource(), std::move(resp));
 			}
 		}
