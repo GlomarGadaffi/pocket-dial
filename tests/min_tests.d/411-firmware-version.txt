@@ -1,2 +1,2 @@
-# FirmwareInfo tests (#411)
-5
+# FirmwareInfo tests (#411) (+1 #461 review: JSON-safe stamp)
+6

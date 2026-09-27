@@ -175,6 +175,16 @@ function(pocketdial_firmware_version out_var)
         endif()
     endif()
 
+    # JSON-safe by construction (#461 review): /api/status streams the version
+    # into its JSON raw, with no per-request escaping (which allocated on the
+    # http_conn stack). git describe and the short-hash fallback always fit
+    # this set; an override that does not is refused here, not at runtime.
+    if(NOT "${version}" MATCHES "^[A-Za-z0-9._+-]+$")
+        message(FATAL_ERROR
+            "pocket-dial: firmware version '${version}' has characters outside "
+            "[A-Za-z0-9._+-]; /api/status emits it into JSON unescaped.")
+    endif()
+
     string(LENGTH "${version}" len)
     if(len GREATER POCKETDIAL_FW_VERSION_MAX_LEN)
         message(FATAL_ERROR

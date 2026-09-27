@@ -1718,7 +1718,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// version here: those tell an attacker more than which build this is, and
 	// provenance needs none of them. They go to the boot banner on the serial
 	// console instead, which is not network-reachable.
-	json << "\"version\":\"" << jsonEscape(FirmwareInfo::version()) << "\",";
+	// Raw, no jsonEscape() (#461 review: it built a std::string per request).
+	// cmake/FirmwareVersion.cmake refuses any stamp outside [A-Za-z0-9._+-] at
+	// configure time, and FirmwareInfo_test pins the charset of the one built in.
+	json << "\"version\":\"" << FirmwareInfo::version() << "\",";
 	// #167: state the board's WiFi capability rather than leaving the dashboard
 	// to infer it from an empty scan result. An eth/lan8720 build has no radio at
 	// all, so "found 0 networks" is not an empty scan -- it is a scan that can

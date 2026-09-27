@@ -197,3 +197,14 @@ TEST_F(FirmwareStatusTest, StatusDisclosesOnlyTheVersionString)
 	     at = body.find("\"version\":", at + 1)) ++n;
 	EXPECT_EQ(n, 1u) << body;
 }
+
+// #461 review: /api/status streams the version into JSON unescaped, so the stamp
+// this binary carries must be JSON-safe. cmake/FirmwareVersion.cmake enforces
+// the same set at configure time (tests/tools/test_firmware_version_cmake.py).
+TEST(FirmwareInfo, TheStampIsJsonSafeSoStatusCanStreamItRaw)
+{
+	const std::string v = FirmwareInfo::version();
+	ASSERT_FALSE(v.empty());
+	EXPECT_TRUE(std::regex_match(v, std::regex("^[A-Za-z0-9._+-]+$")))
+		<< "version '" << v << "' has characters /api/status would have to escape";
+}
