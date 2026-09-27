@@ -151,6 +151,10 @@ namespace
 					wire.sent.push_back(m->toString());
 				});
 			handler->handle(emRegister("101", "192.168.77.11", "em-reg-101"));
+			// Issue #521: the loopback anchor refuses every emergency number
+			// (EmergencyRoute_test.cpp pins that). These tests are about how a
+			// provider is asked to dial, so it stands in for a real one here.
+			handler->setAnchorPlacesRealCallsForTest(true);
 			wire.clear();
 		}
 
