@@ -354,6 +354,12 @@ jobs:
           grep -E "warning:|error:" clang-tidy.log | sort -u || true
           echo "================================================================"
 
+      - name: Static Analysis (clang-tidy safety subset, blocking ratchet)
+        # #372: six MISRA C++:2023-mapped checks, each with its own measured
+        # baseline in the script. BLOCKING: fails only when a check's count
+        # rises above its baseline. Same script runs in BigDog's local gate.
+        run: CT="clang-tidy-${CLANG_TIDY_VERSION}" tools/ci/run_clang_tidy_safety.sh build
+
       - name: Run Unit Test Suite (GoogleTest via CTest)
         env:
           # gtest writes one JSON report per test binary into this directory
