@@ -28,6 +28,10 @@ private:
 	// the raw view handed to handle() below is consumed before handle() returns),
 	// so it never needs to outlive the call.
 	void onNewMessage(std::string_view data, sockaddr_in src);
+	// Issue #443/#444: what the receive loop threw away, counted on the
+	// handler's DropProbe (same view-lifetime rule as onNewMessage).
+	void onDiscard(UdpServer::Discard what, std::string_view bytes, sockaddr_in src,
+	               size_t fullLen, int err);
 	void onHandled(const sockaddr_in& dest, std::shared_ptr<SipMessage> message);
 
 	UdpServer _socket;
