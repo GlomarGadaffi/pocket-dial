@@ -31,13 +31,15 @@ include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers suppor
 #
 # Only when built standalone (`cmake ../tests`, what CI and the WSL workflow
 # run). When the top-level host project pulls this in via add_subdirectory, it
-# has already decided the stamp and added the definition, and both are
+# has already decided the stamp and written the header, and both are
 # inherited here; recomputing would run git twice and pass the flag twice.
 if(NOT DEFINED POCKETDIAL_RESOLVED_FW_VERSION)
     include(${CMAKE_CURRENT_LIST_DIR}/../cmake/FirmwareVersion.cmake)
     pocketdial_firmware_version(POCKETDIAL_RESOLVED_FW_VERSION)
-    add_compile_definitions(POCKETDIAL_FW_VERSION="${POCKETDIAL_RESOLVED_FW_VERSION}")
+    pocketdial_write_fw_version_header("${POCKETDIAL_RESOLVED_FW_VERSION}")
 endif()
+# pocketdial_fw_version.h, read only by FirmwareInfo.cpp (#461 review).
+include_directories(${CMAKE_BINARY_DIR}/generated)
 
 add_executable(sip_parser_tests
     SipMessage_test.cpp

@@ -65,6 +65,32 @@ class ProvenanceTest(unittest.TestCase):
         self.assertEqual(v, "WARN")
         self.assertTrue(ok)
 
+    def test_a_prefix_or_substring_of_the_describe_is_not_a_match(self):
+        # #461 review (Globox, MAJOR 1): the match was two-way SUBSTRING, so a
+        # board on the release tag passed against a checkout 7 commits past it,
+        # and a board 7 commits past passed against the bare tag. Different
+        # commits must not PASS.
+        cases = [
+            ("v1.6.0", "v1.6.0-7-gabc1234"),        # board on the tag, checkout past it
+            ("v1.6.0-7-gabc1234", "v1.6.0"),        # the reverse
+            ("abc12", "v1.6.0-7-gabc1234"),         # a hash too short to name a commit
+            ("bc1234", "v1.6.0-7-gabc1234"),        # a hash that is not a prefix
+            ("v1.6.0-7-gabc12", "v1.6.0-7-gabc1234"),
+        ]
+        for board, describe in cases:
+            with self.subTest(board=board, describe=describe):
+                v, ok, _ = self.verdict({"version": board, "resetReason": "POWERON"}, describe=describe)
+                self.assertEqual(v, "WARN")
+
+    def test_the_short_hash_fallback_matches_the_describes_commit(self):
+        for board, describe in (("abc1234", "v1.6.0-7-gabc1234"),
+                                ("abc1234-dirty", "v1.6.0-7-gabc12345"),
+                                ("abc1234", "abc1234"),
+                                ("v1.6.0", "v1.6.0")):
+            with self.subTest(board=board, describe=describe):
+                v, ok, _ = self.verdict({"version": board, "resetReason": "POWERON"}, describe=describe)
+                self.assertEqual(v, "PASS")
+
     def test_missing_reset_reason_still_fails_first(self):
         v, ok, details = self.verdict({"version": DESCRIBE})
         self.assertEqual(v, "FAIL")

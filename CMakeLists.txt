@@ -41,7 +41,10 @@ else()
 
     # Issue #411: the host binary reports the same version string the firmware
     # would (FirmwareInfo.cpp reads it), so /api/status has one shape everywhere.
-    add_compile_definitions(POCKETDIAL_FW_VERSION="${POCKETDIAL_RESOLVED_FW_VERSION}")
+    # One generated header, read only by FirmwareInfo.cpp (#461 review): a
+    # per-commit compile definition here rebuilt every TU on every commit.
+    pocketdial_write_fw_version_header("${POCKETDIAL_RESOLVED_FW_VERSION}")
+    include_directories(${CMAKE_BINARY_DIR}/generated)
 
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)

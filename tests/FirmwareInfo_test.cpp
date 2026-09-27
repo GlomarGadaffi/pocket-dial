@@ -41,6 +41,7 @@
 
 #include "AdminAuth.hpp"
 #include "FirmwareInfo.hpp"
+#include "pocketdial_fw_version.h"   // the generated stamp (#461 review)
 #include "HttpServer.hpp"
 
 namespace

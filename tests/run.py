@@ -48,6 +48,26 @@ def host_env():
     return env
 
 
+
+_HEX_HASH = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def same_commit(board_ver, describe):
+    """True only when the board's stamp names the checkout's commit (#461 review).
+
+    Exact match, or -- for cmake/FirmwareVersion.cmake's short-hash fallback past
+    the app descriptor's 31 chars -- a >= 7-char hash that is a prefix of the
+    describe's -g<hash> (or of a bare-hash describe). Never a substring either
+    way: "v1.6.0" is a different commit from "v1.6.0-7-gabc1234".
+    """
+    if board_ver == describe:
+        return True
+    if not _HEX_HASH.match(board_ver):
+        return False
+    m = re.search(r"-g([0-9a-f]{7,40})$", describe)
+    dh = m.group(1) if m else (describe if _HEX_HASH.match(describe) else None)
+    return dh is not None and (dh.startswith(board_ver) or board_ver.startswith(dh))
+
 class HarnessError(Exception):
     """Exit code 2: target unreachable, lock held, provenance mismatch, etc."""
     pass
@@ -446,7 +466,7 @@ class Harness:
         if commit_ver != board_ver:
             suite_log.append(f"board runs a dirty build of '{commit_ver}' (uncommitted changes)")
         if self.git_describe:
-            if self.git_describe not in commit_ver and commit_ver not in self.git_describe:
+            if not same_commit(commit_ver, self.git_describe):
                 # WARN, not FAIL: hil-244 cannot flash yet (#338), so the board is
                 # expected to run an older build than the checkout. Becomes FAIL
                 # once board-flash runs before board-smoke.
