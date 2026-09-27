@@ -58,7 +58,7 @@ only fires in the repo's main working tree, never in a linked worktree.
 
 ---
 
-### D. No Claude-Session URL Trailer
+### D. Agent Attribution: Nickname in Co-Authored-By, No Claude-Session Trailer
 
 Some AI coding harnesses append a `Claude-Session: <url>` trailer to every
 commit message and PR body by default, as a generic, session-level
@@ -67,8 +67,20 @@ does not override a project's own stated convention -- check this file
 before your first commit or PR in this repo, not after a reviewer flags the
 diff.
 
-`Co-Authored-By:` is fine and should stay; only the session-URL trailer is
-the problem.
+**Credit the agent by its crew nickname** (desmo, 2026-09-27). Several agent
+sessions share one GitHub account, so the nickname is the only thing that
+says which session wrote a commit. A commit an agent session wrote ends with:
+
+```
+Co-Authored-By: <Nickname> (Claude <model>) <noreply@anthropic.com>
+```
+
+for example `Co-Authored-By: Globox (Claude Opus 5.5) <noreply@anthropic.com>`
+or `Co-Authored-By: BigDog (Claude Opus 5.5) <noreply@anthropic.com>`. The
+nickname is the one the session uses on the crew board; the model in
+parentheses keeps it plain that an AI wrote it. A generic
+`Co-Authored-By: Claude <model>` without the nickname is not wrong, but it
+drops the one fact a reader needs. Only the session-URL trailer is forbidden.
 
 This has been documented before and still happened repeatedly -- most
 recently 114 commits deep on `main`, including two merged after it was
@@ -359,6 +371,7 @@ Current allocation:
 | `18170`-`18179` | `ProvisioningConfig_test.cpp` (auto-incrementing `_nextPort`) |
 | `18200`-`18229` | `SmtpDialogue_test.cpp` (fake SMTP server, raw sockets — not HttpServer, but still claims its own block; ~17 scripted-server tests via auto-incrementing `g_nextPort`, sized with headroom. Originally claimed 18130-18159 — renumbered here, at merge time, when that turned out to collide with the two rows above it, which claimed the same "next free block" independently and landed first. See #159's PR for the story; the lesson is in `SmtpDialogue_test.cpp`'s own header comment.) |
 | `18230`-`18239` | `CoreDumpHttp_test.cpp` (auto-incrementing `_nextPort`) |
+| `18240`-`18249` | `FactoryResetSecrets_test.cpp` (auto-incrementing `_nextPort`) |
 | `19100`+ | `TelephonyConfigHttp_test.cpp` (auto-incrementing `_nextPort`) |
 | `193xx` | `ApiKillParse_test.cpp` (auto-incrementing `_nextPort`) |
 

@@ -239,6 +239,10 @@ public:
 	// reuse one allocation instead of a fresh temporary each time (Issue #101(D)).
 	// `out` is cleared first, retaining its capacity.
 	void toString(std::string& out) const;
+	// Same bytes as toString(), written into a fixed caller buffer with NO heap use:
+	// writes at most `cap` bytes and returns the full serialized length
+	// (snprintf-style), so a return value > cap means the output was truncated.
+	std::size_t serializeInto(char* out, std::size_t cap) const;
 	bool isValidMessage() const;
 
 protected:
