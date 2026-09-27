@@ -74,7 +74,7 @@ namespace
 		// which is exactly why the byte-pinned expectations below are unchanged
 		// by the domain/transport split. TrunkProxy.* covers the case where the
 		// two genuinely differ.
-		d.domain       = std::string(kSbcIp) + ":5060";
+		d.domain       = std::string(kSbcIp);   // #365: the default port is omitted
 		d.localIpPort  = "192.168.1.10:5060";
 		d.destE164     = "+15551234567";
 		d.fromUser     = "15551230000";
@@ -131,8 +131,8 @@ TEST(SipTrunkInvite, RequestUriAndToAreE164AtTheSbc)
 	const auto d = pinnedDialog();
 	const std::string inv = SipTrunk::buildInvite(d, "v=0\r\n");
 
-	EXPECT_EQ(firstLine(inv), "INVITE sip:+15551234567@203.0.113.5:5060 SIP/2.0");
-	EXPECT_TRUE(hasLine(inv, "To: <sip:+15551234567@203.0.113.5:5060>"));
+	EXPECT_EQ(firstLine(inv), "INVITE sip:+15551234567@203.0.113.5 SIP/2.0");
+	EXPECT_TRUE(hasLine(inv, "To: <sip:+15551234567@203.0.113.5>"));
 	EXPECT_TRUE(hasLine(inv, "CSeq: 1 INVITE"));
 }
 
@@ -144,7 +144,7 @@ TEST(SipTrunkInvite, AddsThePlusWhenTheNumberLacksIt)
 	auto d = pinnedDialog();
 	d.destE164 = "15551234567";
 	const std::string inv = SipTrunk::buildInvite(d, "v=0\r\n");
-	EXPECT_EQ(firstLine(inv), "INVITE sip:+15551234567@203.0.113.5:5060 SIP/2.0");
+	EXPECT_EQ(firstLine(inv), "INVITE sip:+15551234567@203.0.113.5 SIP/2.0");
 }
 
 // Contact is OUR address, never the SBC's. It is where the carrier sends the BYE
@@ -184,7 +184,7 @@ TEST(SipTrunkAck, FailureAckReusesTheInviteBranch)
 	EXPECT_NE(ack.find(";branch=z9hG4bKinvite01"), std::string::npos)
 		<< "RFC 3261 s17.1.1.3: a non-2xx ACK belongs to the INVITE transaction";
 	EXPECT_TRUE(hasLine(ack, "CSeq: 1 ACK")) << "same sequence number as the INVITE";
-	EXPECT_TRUE(hasLine(ack, "To: <sip:+15551234567@203.0.113.5:5060>;tag=carrier-tag"));
+	EXPECT_TRUE(hasLine(ack, "To: <sip:+15551234567@203.0.113.5>;tag=carrier-tag"));
 	EXPECT_TRUE(hasLine(ack, "Content-Length: 0"));
 }
 
@@ -235,14 +235,14 @@ TEST(SipTrunkAck, TwoXxAckFallsBackToTheDomainWhenNoContactWasOffered)
 	d.toTag = "carrier-tag";   // remoteTarget deliberately left empty
 
 	const std::string ack = SipTrunk::buildAckFor2xx(d, "z9hG4bKack99");
-	EXPECT_EQ(firstLine(ack), "ACK sip:+15551234567@203.0.113.5:5060 SIP/2.0");
+	EXPECT_EQ(firstLine(ack), "ACK sip:+15551234567@203.0.113.5 SIP/2.0");
 
 	// Pin that it really is the domain and not the transport address, which
 	// the default fixture cannot distinguish (there the two are equal).
-	d.domain    = "sip.carrier.example:5060";
+	d.domain    = "sip.carrier.example";
 	d.sbcIpPort = "198.51.100.77:5080";
 	const std::string viaProxy = SipTrunk::buildAckFor2xx(d, "z9hG4bKack99");
-	EXPECT_EQ(firstLine(viaProxy), "ACK sip:+15551234567@sip.carrier.example:5060 SIP/2.0");
+	EXPECT_EQ(firstLine(viaProxy), "ACK sip:+15551234567@sip.carrier.example SIP/2.0");
 }
 
 // ── BYE ──────────────────────────────────────────────────────────────────────
@@ -258,8 +258,8 @@ TEST(SipTrunkBye, TakesTheNextCseqAndRoutesToTheRemoteTarget)
 
 	EXPECT_EQ(firstLine(bye), "BYE sip:+15551234567@203.0.113.99:5060 SIP/2.0");
 	EXPECT_TRUE(hasLine(bye, "CSeq: 2 BYE")) << "RFC 3261 s12.2.1.1: next sequence number";
-	EXPECT_TRUE(hasLine(bye, "To: <sip:+15551234567@203.0.113.5:5060>;tag=carrier-tag"));
-	EXPECT_TRUE(hasLine(bye, "From: <sip:15551230000@203.0.113.5:5060>;tag=ftag01"));
+	EXPECT_TRUE(hasLine(bye, "To: <sip:+15551234567@203.0.113.5>;tag=carrier-tag"));
+	EXPECT_TRUE(hasLine(bye, "From: <sip:15551230000@203.0.113.5>;tag=ftag01"));
 }
 
 // Refusing to build a half-formed BYE is the feature. One sent without a To-tag
@@ -1051,21 +1051,21 @@ TEST(TrunkProxy, ProxyPortAloneDoesNotDivertTransport)
 TEST(TrunkProxy, UriBuildersUseTheDomainNotTheResolvedAddress)
 {
 	SipTrunk::Dialog d = pinnedDialog();
-	d.domain    = "sip.carrier.example:5060";   // what the operator configured
+	d.domain    = "sip.carrier.example";   // what the operator configured
 	d.sbcIpPort = "198.51.100.77:5080";         // where the packet actually went
 	d.toTag     = "carrier-tag";
 	d.remoteTarget = "sip:+15551234567@198.51.100.77:5080";
 
 	const std::string inv = SipTrunk::buildInvite(d, "v=0\r\n");
-	EXPECT_EQ(firstLine(inv), "INVITE sip:+15551234567@sip.carrier.example:5060 SIP/2.0");
-	EXPECT_TRUE(hasLine(inv, "To: <sip:+15551234567@sip.carrier.example:5060>"));
-	EXPECT_TRUE(hasLine(inv, "From: <sip:15551230000@sip.carrier.example:5060>;tag=ftag01"));
+	EXPECT_EQ(firstLine(inv), "INVITE sip:+15551234567@sip.carrier.example SIP/2.0");
+	EXPECT_TRUE(hasLine(inv, "To: <sip:+15551234567@sip.carrier.example>"));
+	EXPECT_TRUE(hasLine(inv, "From: <sip:15551230000@sip.carrier.example>;tag=ftag01"));
 	EXPECT_EQ(inv.find("198.51.100.77"), std::string::npos)
 		<< "the transport address must never appear in a URI";
 
 	// The failure ACK is built from the same inputs and must agree.
 	const std::string ackFail = SipTrunk::buildAckForFailure(d);
-	EXPECT_EQ(firstLine(ackFail), "ACK sip:+15551234567@sip.carrier.example:5060 SIP/2.0");
+	EXPECT_EQ(firstLine(ackFail), "ACK sip:+15551234567@sip.carrier.example SIP/2.0");
 	EXPECT_EQ(ackFail.find("198.51.100.77"), std::string::npos);
 
 	// The BYE routes to the remote target (which IS a transport-derived URI the
@@ -1074,8 +1074,8 @@ TEST(TrunkProxy, UriBuildersUseTheDomainNotTheResolvedAddress)
 	const std::string bye = SipTrunk::buildBye(d, "z9hG4bKbye01");
 	EXPECT_EQ(firstLine(bye), "BYE sip:+15551234567@198.51.100.77:5080 SIP/2.0")
 		<< "an in-dialog request goes to the Contact the carrier supplied";
-	EXPECT_TRUE(hasLine(bye, "To: <sip:+15551234567@sip.carrier.example:5060>;tag=carrier-tag"));
-	EXPECT_TRUE(hasLine(bye, "From: <sip:15551230000@sip.carrier.example:5060>;tag=ftag01"));
+	EXPECT_TRUE(hasLine(bye, "To: <sip:+15551234567@sip.carrier.example>;tag=carrier-tag"));
+	EXPECT_TRUE(hasLine(bye, "From: <sip:15551230000@sip.carrier.example>;tag=ftag01"));
 }
 
 // placeCall() is what actually populates domain. A dialog left with an empty
@@ -1101,26 +1101,20 @@ TEST(TrunkProxy, PlaceCallStampsTheDomainFromConfigNotTheSocket)
 	ASSERT_EQ(env.sent.size(), 1u);
 
 	const std::string inv = env.sentRaw(0);
-	EXPECT_NE(inv.find("INVITE sip:+15551234567@sip.carrier.example:5060 SIP/2.0"), std::string::npos)
+	EXPECT_NE(inv.find("INVITE sip:+15551234567@sip.carrier.example SIP/2.0"), std::string::npos)
 		<< "the Request-URI must name the configured registrar, not the proxy";
 	EXPECT_EQ(inv.find("198.51.100.77"), std::string::npos)
 		<< "the resolved proxy address must not leak into any URI";
 }
 
-// ── The unconditional ":port" in emitted URIs (deferred, see #365) ───────────
+// ── The ":port" in emitted URIs (#365, option A) ─────────────────────────────
 //
-// This pins CURRENT behaviour, not desired behaviour. The Request-URI carries
-// an explicit ":5060" even on the default port, and by RFC 3261 §19.1.4 that
-// is a formally different URI from the bare domain -- which some SBCs route
-// on differently. Deferred to the digest/REGISTER work by an explicit
-// decision, because nothing can complete a call on this trunk yet and a live
-// carrier will settle the semantics.
-//
-// The point of the test is that it goes RED when someone changes this, so the
-// change is a decision rather than a silent inheritance. If you are here
-// because it failed: that is the test working. Update it, and update the
-// deferral comment in SipTrunk::placeCall().
-TEST(SipTrunkUriPort, PortSuffixIsCurrentlyUnconditional)
+// By RFC 3261 §19.1.4 a URI that omits a component with a default value does
+// NOT match one that carries it explicitly, so "sip:x@carrier.example.com"
+// and "sip:x@carrier.example.com:5060" are different route keys to an SBC that
+// routes on the Request-URI. #365 (option A, decided 2026-09-27): the default
+// 5060 is omitted; any other configured port is kept. No storage change.
+TEST(SipTrunkUriPort, TheDefaultPortIsOmittedFromEveryUri)
 {
 	FakePbxEnv env;
 	SipTrunk trunk(env);
@@ -1133,13 +1127,28 @@ TEST(SipTrunkUriPort, PortSuffixIsCurrentlyUnconditional)
 	ASSERT_EQ(env.sent.size(), 1u);
 	const std::string inv = env.sentRaw(0);
 
-	EXPECT_NE(inv.find("INVITE sip:+15551234567@carrier.example.com:5060 SIP/2.0"),
-		std::string::npos)
-		<< "today the default port is emitted explicitly; #365 is where that changes";
-	EXPECT_EQ(inv.find("INVITE sip:+15551234567@carrier.example.com SIP/2.0"),
-		std::string::npos)
-		<< "the bare-domain form is NOT what is emitted yet -- if this fires, "
-		   "#365 has landed and the deferral comment needs updating too";
+	EXPECT_EQ(firstLine(inv), "INVITE sip:+15551234567@carrier.example.com SIP/2.0");
+	EXPECT_TRUE(hasLine(inv, "To: <sip:+15551234567@carrier.example.com>"));
+	EXPECT_EQ(inv.find("carrier.example.com:5060"), std::string::npos)
+		<< "no URI may carry the default port explicitly (#365)";
+}
+
+TEST(SipTrunkUriPort, ANonDefaultPortIsKeptInEveryUri)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	SipTrunk::Config c = workingConfig();
+	std::snprintf(c.host, sizeof(c.host), "%s", "carrier.example.com");
+	c.port = 5080;   // an operator-chosen port is part of the route key: keep it
+	trunk.setConfig(c);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string inv = env.sentRaw(0);
+
+	EXPECT_EQ(firstLine(inv), "INVITE sip:+15551234567@carrier.example.com:5080 SIP/2.0");
+	EXPECT_TRUE(hasLine(inv, "To: <sip:+15551234567@carrier.example.com:5080>"));
+	EXPECT_NE(inv.find("From: <sip:15551230000@carrier.example.com:5080>"), std::string::npos);
 }
 
 // ── Credentials ──────────────────────────────────────────────────────────────
