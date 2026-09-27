@@ -8,7 +8,7 @@ This document provides a highly technical, deep architectural analysis of the **
 
 The firmware architecture is divided into three core logical layers:
 1. Network Hardware & Driver Layer: controls physical media (Wi-Fi radio, W5500 SPI Ethernet MAC/PHY, LAN8720 RMII PHY) and registers low-level event handlers.
-2. Signaling & State Engine Layer (`RequestsHandler`): A lightweight SIP registrar and session controller managing client registration leases, active SIP sessions, and intercom broadcasting/paging features. It implements a deliberately partial subset of RFC 3261: no §16 proxy behaviour (§1.1), but a full §17 transaction layer; §1.2 states which messages that layer covers and which it deliberately leaves out.
+2. Signaling & State Engine Layer (`RequestsHandler`): A lightweight SIP registrar and session controller managing client registration leases, active SIP sessions, and intercom broadcasting/paging features. It implements a deliberately partial subset of RFC 3261: no §16 proxy behaviour (§1.1), but all four §17 transaction machines; §1.2 states which messages they cover, which they deliberately leave out, and where timing and coverage fall short (1 Hz sweep, pool exhaustion).
 3. User Interface & Query Layer: consists of a custom select-based, thread-dispatching `HttpServer` serving a retro CGA CRT web dashboard, an mDNS service responder, and a high-frequency LVGL-based GUI display task.
 
 The diagram below shows the **display (JC3248W535) build**, where LVGL runs on Core 1 and
@@ -22,18 +22,21 @@ unpinned thread (§4), not `http_server_task` itself.
 
 ```mermaid
 graph TD
-    subgraph Core 1 [Core 1: Graphics Only - display build]
+    subgraph Core 1 [Core 1: LVGL - display build; also tel_media_rx]
         A[lvgl_task 16ms] -->|Drives| B["AXS15231B LCD (QSPI)"]
         A -->|Reads| C["AXS15231B Touch (I2C)"]
     end
 
-    subgraph Core 0 [Core 0: Network, SIP & Web Control]
+    subgraph Core 0 [Core 0: SIP, UDP, status and media tasks]
         D[sip_server_task] -->|Runs| E[RequestsHandler::tick]
-        F["HTTP accept thread (unpinned)"] -->|Listens| G[TCP Port 80]
-        G -->|Select Activity| H["Detached Thread Dispatch"]
-        H -->|Lock-Free Read| I["Registrar Snapshot (Clients/Sessions)"]
         J[status_task 500ms] -->|Updates| K[Wallboard: clients & calls]
         L[udp_receiver_task] -->|Reads| M[UDP Port 5060]
+    end
+
+    subgraph Unpinned [No core affinity]
+        F["HTTP accept thread"] -->|Listens| G[TCP Port 80]
+        G -->|Select Activity| H["Detached http_conn threads"]
+        H -->|Lock-Free Read| I["Registrar Snapshot (Clients/Sessions)"]
     end
 
     subgraph Hardware [Physical Hardware Layer]
@@ -66,11 +69,11 @@ The clearest evidence is in what the outbound path never writes:
 What the engine *is* instead is a forked UAC coupled to a UAS, what `docs/FEATURE_ROADMAP.md` §1.1 calls a **back-to-back call broker**. Two distinct leg shapes share that label, and the difference surfaces in every header a debugger looks at:
 
 - **Legs the PBX originates** (the inbound-trunk fork, park ring-back, register beep, BLF `NOTIFY`) are a fresh UAC: its own `Via` and branch, its own `From`-tag, and a `CSeq` space restarting at 1, while reusing the caller's `Call-ID` (`buildInboundInviteFork`).
-- **Ordinary extension-to-extension legs** are the wholesale copy described above, so `From` (tag included), `CSeq` and `Via` all reach the callee exactly as the caller wrote them. Keeping the caller's `Via` is what lets the return path work without a second rewrite: the callee's `180`/`200` already bears the `Via` the caller expects, so the relay hands it straight back with only `Contact`, `To` and the codec list touched (`onOk`, `RequestsHandler.cpp:5692-5707`, → `endHandle`, which merely enqueues to the destination).
+- **Ordinary extension-to-extension legs** are the wholesale copy described above, so `From` (tag included), `CSeq` and `Via` all reach the callee exactly as the caller wrote them. Keeping the caller's `Via` is what lets the return path work without a second rewrite: the callee's `180`/`200` already bears the `Via` the caller expects, so the relay hands the `180` back verbatim (`onRinging` → `endHandle`, `RequestsHandler.cpp:4932`) and the `200` with **only its `Contact`** rewritten (`:5785-5788`). The wider `Contact`/`To`/codec rewrite at `:5692-5707` is the **broadcast** branch, taken for the `999` intercom, ring-all and hunt forks (`setBroadcast(true)`, `CallForker.cpp:84`, `:314`).
 
-Either way the caller's `Call-ID` spans both legs. That is deliberate rather than sloppy: it is the `_sessions` key, which is how a mid-dialog request arriving from *either* leg resolves to the one session via `getSession(data->getCallID())`.
+On both shapes the caller's `Call-ID` spans both legs. That is deliberate rather than sloppy: it is the `_sessions` key, which is how a mid-dialog request arriving from *either* leg resolves to the one session via `getSession(data->getCallID())`. Two legs are the exception: the blind-transfer leg to the target has its **own** Call-ID, linked to the kept A–B session by `setPeerCallID` (`RequestsHandler.cpp:6295-6299`, `:6532`, `:6538`), and the SIP-trunk carrier leg's Call-ID is minted by `SipTrunk` (`SipTrunk.cpp:98`, `:214-215`).
 
-Unlike a textbook B2BUA, it does not insert itself into the media path. SDP is relayed with only unsupported codecs filtered out, so an ordinary extension-to-extension call streams RTP directly phone-to-phone and the board never handles a media packet. The exceptions (`440`, `888`, `555` and outside lines) are tabulated under "Audio: what touches the board, and what doesn't" in the README, which now also lists a parked call with a music-on-hold clip loaded (`ParkOrbit.cpp:64-84` answers the parked leg `sendonly` from the `HoldMusic` port, and `HoldMusic` then transmits to it every 20 ms). **Three more the README table does not list:** the dashboard's MoH preview call (`startMohPreview`, `RequestsHandler.cpp:3363-3433`), which rings an extension purely to play the clip at it; the far side of an anchor call a handset puts on hold, which `MediaBridge::setHeld()` feeds from `HoldMusic` (#218); and **voicemail** deposit and retrieval (`796`), each leg a board-terminated `RtpReceiver`/`RtpSender` pair (`VoicemailLeg.hpp:10-16`; the deposit is answered by `answerVoicemailDeposit`, `RequestsHandler.cpp:2634`). Park with no clip loaded (the default) still answers `a=inactive` and sources nothing.
+Unlike a textbook B2BUA, it does not insert itself into the media path. SDP is relayed with only unsupported codecs filtered out, so an ordinary extension-to-extension call streams RTP directly phone-to-phone and the board never handles a media packet. The exceptions (`440`, `888`, `555` and outside lines) are tabulated under "Audio: what touches the board, and what doesn't" in the README, which now also lists a parked call with a music-on-hold clip loaded (`ParkOrbit.cpp:64-84` answers the parked leg `sendonly` from the `HoldMusic` port, and `HoldMusic` then transmits to it every 20 ms). **Three more the README table does not list:** the dashboard's MoH preview call (`startMohPreview`, `RequestsHandler.cpp:3363-3433`), which rings an extension purely to play the clip at it; the far side of an **outbound** anchor call a handset puts on hold, which `MediaBridge::setHeld()` feeds from `HoldMusic` as a per-call tap, decoded to PCM16 and written to the anchor (#218; a hold on an **inbound** anchored call goes unanswered, #445, fix #449); and **voicemail** deposit and retrieval (`796`), each leg a board-terminated `RtpReceiver`/`RtpSender` pair (`VoicemailLeg.hpp:10-16`; the deposit is answered by `answerVoicemailDeposit`, `RequestsHandler.cpp:2634`). Park with no clip loaded (the default) still answers `a=inactive` and sources nothing.
 
 ### 1.2 Transaction-Layer Scope
 
@@ -127,7 +130,7 @@ oversized message, an unACKed 2xx) — not a missing layer.
 
 ## 2. Core Task Topology & Affinity Splits
 
-To prevent render frame drops and network packet loss, **pocket-dial** enforces a strict core affinity split that isolates real-time communication tasks from CPU-intensive graphics rendering.
+To limit render frame drops and network packet loss, **pocket-dial** pins its real-time SIP, UDP-receive and media tasks away from the LVGL render loop where it can. The split is not strict: `tel_media_rx` shares Core 1 with LVGL, and the HTTP threads and several workers are unpinned (see the IMPORTANT box below).
 
 The system assigns FreeRTOS tasks to specific cores using `xTaskCreatePinnedToCore`:
 
@@ -138,7 +141,7 @@ The system assigns FreeRTOS tasks to specific cores using `xTaskCreatePinnedToCo
 | `lvgl_task` | 5 | **Core 1** | *N/A* | 8192 Bytes | Runs the LVGL render loop (`lv_timer_handler()`) every 16 ms (~60 Hz, `esp_main_display.cpp:328`). |
 | `sip_server_task` (`sip_server` on eth/lan8720) | 5 | **Core 0** | **Core 1** | 8192 Bytes | Ticks the SIP state engine (`RequestsHandler::tick()`, which self-throttles to 1 Hz) and sweeps expired leases. The headless Wi-Fi build also puts it on Core 1 (`esp_main.cpp:522`). |
 | `udp_receiver_task` | 5 | **Core 0** | **Core 1** | **16384 Bytes** | Listens on UDP port 5060, parses incoming packet headers, and dispatches them to the handler. **Not 8 KB**. `RequestsHandler::handle()` runs inline on this task, and the string-heavy message building plus the register-beep UAC and the `440` SDP path together overflowed the old 8 KB allocation (stack-overflow panic). Raised to 16 KB at `UdpServer.cpp:135-158`; the core is `POCKETDIAL_UDP_RX_CORE`. |
-| `http_server_task` (`http_dashboard` on eth) | 4 | **Core 0** | **Core 0** | 8192 Bytes | Starts the HTTP server, whose accept loop runs on its **own unpinned `std::thread`** (`HttpServer.cpp:191-192`), then idles in a 1 s OTA-confirm loop. Connection threads are separate (§4). |
+| `http_server_task` (`http_dashboard` on eth and lan8720; absent in the display build's captive-portal branch, `esp_main_display.cpp:946-947`) | 4 | **Core 0** | **Core 0** | 8192 Bytes | Starts the HTTP server, whose accept loop runs on its **own unpinned `std::thread`** (spawned in `start()`, `HttpServer.cpp:199`; loop `acceptLoop`, `:202`), then idles in a 1 s OTA-confirm loop. Connection threads are separate (§4). |
 | `status_task` | 3 | **Core 0** | *N/A* | 4096 Bytes | Rebuilds the on-screen wallboard (registered clients, active calls) every 500 ms. There is no battery ADC code; `ui_set_battery()` is a no-op (`main/ui/ui.cpp:992-995`). |
 
 Tasks the table above does not cover (name, stack, priority, core), from the `xTaskCreatePinnedToCore` / `xTaskCreate` calls in the tree:
@@ -202,7 +205,7 @@ Dynamic heap allocations (`new`, `malloc`, `make_shared`) within the hot UDP sig
 
 The post-refactor signaling engine implements static memory pre-allocation:
 * During initialization, `RequestsHandler` pre-allocates contiguous arrays of `SipClient` and `Session` smart pointers inside the constructor (`_clientPool` of size 32, and `_sessionPool` of size 8).
-* In steady-state operation, `allocateClient` and `allocateSession` search these pre-allocated pools to recycle unused objects, entirely bypassing the runtime heap.
+* In steady-state operation, `allocateClient` and `allocateSession` search these pre-allocated pools to recycle unused objects, without touching the runtime heap. **That is not yet true of every pool:** the SIP message pool and the virtual-peer pool fall back to the heap when drained (`SipMessagePool.cpp:95-100`, `RequestsHandler.cpp:9722`; #409, with #434 and the #284 batches in flight).
 * If the pool is exhausted under heavy load, the server reuses the first expired client registration lease it finds (`allocateClient`, `RequestsHandler.cpp:8808-8816`; not necessarily the oldest) or returns `503 Service Unavailable`, protecting the core heap from out-of-memory (OOM) silent panics.
 
 ## 4. Select-Based HTTP Server Thread Dispatch Model
@@ -234,10 +237,10 @@ To prevent slow-client TCP connections from stalling the main HTTP accept thread
 ```
 
 ### Accept Loop Implementation
-1. The main HTTP accept loop runs on its own `std::thread` (`_acceptThread`, `HttpServer.cpp:191-192`) and uses `select()` on the listening socket with a `250ms` timeout to periodically yield execution and verify if the server is still running.
+1. The main HTTP accept loop runs on its own `std::thread` (`_acceptThread`, spawned at `HttpServer.cpp:199`, loop `acceptLoop` at `:202`) and uses `select()` on the listening socket with a `250ms` timeout to periodically yield execution and verify if the server is still running.
 2. Upon activity, `accept()` is called to retrieve the client socket.
 3. **At most 4 connections are served at once** (`kMaxConcurrentConnections`, `HttpServer.hpp:64`); a fifth gets `503` and is closed (`HttpServer.cpp:308-331`).
-4. Otherwise the server dispatches client processing to a detached `std::thread` (the spawn is wrapped in `try`/`catch`), instantly freeing the accept thread to monitor subsequent connections. Connection threads are named `http_conn` and get a **4096-byte** stack via `esp_pthread_set_cfg` (`kHttpConnStackBytes`, `HttpServer.cpp:224-230`), not the 8192-byte pthread default.
+4. Otherwise the server dispatches client processing to a detached `std::thread` (the spawn is wrapped in `try`/`catch`), instantly freeing the accept thread to monitor subsequent connections. Connection threads are named `http_conn` and get a **4096-byte** stack via `esp_pthread_set_cfg` (`kHttpConnStackBytes`, `HttpServer.cpp:224-231`), not the 8192-byte pthread default.
 
 ### The Admission Gate (`requireAdmin`)
 Every non-public endpoint passes through one function rather than open-coding its own
@@ -256,10 +259,12 @@ checks, in this order:
    browser attaches a cookie to a same-site request on its own, so only a value our own
    script has to read and echo back proves the request came from our page.
 4. **Forced initial setup.** Until the default credential is replaced, every admin route
-   except the one that replaces it answers `403 setup_required` (`HttpServer.cpp:3303-3308`).
-5. **Role.** Owner-only actions (factory reset, OTA upload, the encrypted config export)
-   require an owner session; a sysop session is admitted only while no owner credential has
-   ever been set (`HttpServer.cpp:3316-3321`, #173).
+   except the one that replaces it answers `403 setup_required` (`HttpServer.cpp:3304-3308`).
+5. **Role.** Owner-only actions (factory reset, OTA upload, the encrypted config export, the
+   coredump download `GET /api/coredump` at `:782`, `POST /api/admin/set-owner-credential` at
+   `:1084`, and the DTMF-PIN route at `:4021`) require an owner session; a sysop session is
+   admitted only while no owner credential has ever been set (`HttpServer.cpp:3317-3321`, #173).
+   `POST /api/ota/reboot` is sysop-level (`:1109-1115`).
 
 **Why it is centralised.** These three checks used to be copy-pasted at roughly fifteen
 routes, and two had drifted: `POST /api/configuring` had no gate at all, and `/api/pcap`,
@@ -274,7 +279,7 @@ There is deliberately no HSTS. This is plain HTTP on a LAN appliance, and pinnin
 make the device permanently unreachable over `http://`.
 
 ### Worker Protection & Robustness (Issue #23)
-* Slowloris protection: The worker thread sets a strict 5-second socket receive timeout (`SO_RCVTIMEO`) using `setsockopt` to terminate slow-sending or dead TCP connections.
+* Slowloris protection, **partial**: the worker thread sets a 5-second socket receive timeout (`SO_RCVTIMEO`, `HttpServer.cpp:390-393`), which ends a connection that goes silent. It is **per `recv()`**, though: the buffered body loop (`:545-556`) has no overall deadline and runs before any auth check, so one unauthenticated host trickling a byte every few seconds can hold all 4 connection slots.
 * Heap stack safety: Rather than allocating a raw stack-local character buffer, the worker uses a heap-allocated `std::vector<char>` read buffer. Connection threads run on a 4096-byte stack (§ Accept Loop above; the 8192-byte `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT` in `sdkconfig.defaults` applies to other pthreads), so a 4 KB stack-local buffer would consume the whole thread's stack before any handler ran.
 * Buffer overflow cap: The worker parses the `Content-Length` header and enforces a maximum payload limit of **16 KB** (16,384 bytes). If a client attempts to upload a larger body (e.g., in a malicious POST flood to `/api/wifi/connect`), the worker immediately responds with `413 Payload Too Large` and aborts the connection, securing the target's RAM.
 
@@ -292,7 +297,7 @@ To prevent Cross-Site Request Forgery (CSRF), the server implements a **Same-Ori
 ### Per-Source-IP Token Bucket Rate Limiting (Issue #38)
 To protect the registrar from UDP flood denial-of-service (DoS) attacks, the `RequestsHandler` integrates a thread-safe token bucket rate limiter:
 * Sustained/burst thresholds: UDP packets are evaluated using a per-source IP token bucket with a default burst depth of **40 packets** and a sustained replenishment rate of **20 packets per second**.
-* Where it runs: **after** parsing, not before. `SipServer::onNewMessage` fully parses the datagram (`SipServer.cpp:75`) and `handle()` rejects a structurally invalid message (`RequestsHandler.cpp:802`) before the rate check (`:816-825`). The check does run before the central `_mutex`, under its own `_rateMutex`, so a flood never contends with call processing. If an IP exceeds its burst threshold, the packet is discarded and the atomic `_packetsDropped` counter is incremented. The 40/20 figures are inline literals (`:8858`, `:8867`).
+* Where it runs: **after** parsing, not before. `SipServer::onNewMessage` fully parses the datagram (`SipServer.cpp:76`) and `handle()` rejects a structurally invalid message (`RequestsHandler.cpp:802`) before the rate check (`:816-825`). The check does run before the central `_mutex`, under its own `_rateMutex`, so a flood never contends with call processing. If an IP exceeds its burst threshold, the packet is discarded and the atomic `_packetsDropped` counter is incremented. The 40/20 figures are inline literals (`:8858`, `:8867`).
 * Bounded table: at most **256** buckets; a new source IP arriving when the table is full is dropped outright (`:8852-8856`).
 * Eviction cycle: To prevent memory leak accumulation from transient spoofed IPs, buckets idle for 60 s are evicted from `tick()` (`:8617-8632`).
 * **Subnet CIDR Filtering is NOT AVAILABLE. Do not plan a deployment around this.** Earlier revisions of this document said the registrar could be compiled with `-DPOCKETDIAL_ALLOW_CIDR="192.168.1.0/24"` to reject traffic from outside a segment. **No such macro exists anywhere in the tree.** The only occurrence of that name in the repository was this sentence. The matching runtime state does exist but is inert: `_allowNet` / `_allowMask` (`src/SIP/RequestsHandler.hpp:2073-2075`) are initialised to `0` and **never assigned by any code path**. There is no setter, no constructor argument, no HTTP route and no NVS key. `RequestsHandler::ipAllowed()` (`RequestsHandler.cpp:8837-8842`) therefore takes its `if (_allowMask == 0) return true;` early exit on every packet, so **every source IP is allowed, always**. The token bucket above is real and does run; the subnet filter is scaffolding that was never wired up. Segment isolation has to come from the network (VLAN, firewall, or simply not routing the board's link), not from this firmware.
