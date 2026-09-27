@@ -607,6 +607,8 @@ add_executable(sip_parser_tests
     # the FreeRTOS queue and writer task the fix adds (ESP-only, see
     # CdrRing_test.cpp's header comment).
     CdrRing_test.cpp
+    # Issue #554 (b): the dropped-leg tombstone ring.
+    RecentIdRing_test.cpp
     # The DTMF digit-collection state machine + CLASS/admin codes, extracted
     # out of RequestsHandler into its own translation unit.
     ../src/SIP/DtmfFeatureCodes.cpp
