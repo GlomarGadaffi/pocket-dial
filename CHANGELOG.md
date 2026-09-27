@@ -1,5 +1,215 @@
 # Changelog
 
+## v1.5.0-rc.1 — 2026-09-27
+
+The first release candidate. 148 commits landed on top of beta.2, most of them from a
+two-week push on milestones 1–7 of #401: no crashes under memory pressure, every call
+leg torn down exactly once, secure by default, and real carriers. The host suite grew
+from 799 to 1,396 test cases by static count. CI now enforces a checked-in floor of
+1,391 (a base of 1,280 plus one contribution file per PR; #390, #467), and the
+interop suite (pjsua + baresip against the host PBX) is a required check on every
+pull request.
+
+Unlike beta.2, a good part of this was run on the bench board (`.244`, W5500) through
+the #451 run sheet: staged remote OTA, the 888 panic, the anchor CANCEL race. It was
+**not** all proven there. Read "Not proved on hardware / known open" at the end before
+putting this on a board that carries real calls, and above all before relying on it
+for 911.
+
+---
+
+### Security: secure by default
+
+- **The open registrar is gone (#441, #502; #397, #500).** A fresh board boots
+  **Learn** (trust-on-first-use plus an ARP-learned MAC lock), not `open`. `open` is
+  retired: a board whose NVS still says `open` decodes it as Learn, and so does an
+  unreadable or missing store. Digest auth (Secure mode) is unchanged.
+- **Learn challenges INVITEs from Secured devices (#512; #505).** A device an admin
+  has promoted to Secured already had to prove its secret on REGISTER. Its calls now
+  prove it too. Unsecured Learned phones keep trust-on-first-use; 911 is never
+  challenged.
+- **Factory reset erases every stored secret (#437, #456; #363, #450).** These used
+  to survive a reset in plaintext flash, and now don't: the SMTP password, the Google
+  service-account key, every extension's digest HA1, the stored coredump, and the
+  call-forward targets. A failed erase is reported per store instead of claiming a
+  clean reset.
+- **HA1s leave the box only inside the password-encrypted export (#484; #482).** The
+  sysop-level plaintext export carried every secured extension's HA1, which is
+  password-equivalent for SIP digest. It now carries names only.
+- **Real randomness (#415, #429; #385, #420).** `IDGen` (Call-IDs, tags, branches,
+  nonces) draws from the hardware CSPRNG instead of a 31-bit LCG. The Ethernet builds
+  keep the SAR ADC entropy source on, so `esp_random()` is a true RNG there. The build
+  fails if an eth image ever links a driver that conflicts with it.
+- **The admin-login lockout is per client again (#530; #528).** The per-client bucket
+  existed but was never keyed, so one guessing client locked the real admin out. An
+  aggregate backstop is still shared across clients, by design.
+- **HTTP hardening:** concurrent connection threads are capped (#369; #368) and run
+  on 4 KB stacks (#367; #366). The first admin login no longer takes `http_conn` down
+  to ~400 B of stack (#494; #492).
+
+### No crashes under memory pressure
+
+- **888 no longer panics the board (#499; #498).** `MixBus::tick()` kept ~2.9 KB of
+  scratch on a 3 KB task stack. Any 888 dial-in panicked on the first mix tick.
+- **Panics leave a coredump (#394, #435, #531; #382, #405, #514).** A panic writes a
+  128 KB ELF coredump to flash. `/api/status` reports `coredump:{supported,present,size}`
+  from a boot-time cache, and the admin API reads it back (`/api/coredump/info`,
+  `/api/coredump`, `/api/coredump/erase`). A board with no coredump partition says
+  `supported:false` instead of pretending.
+- **PSRAM placement (#475, #480; #466).** Jitter rings and the RTP receive stacks move
+  to PSRAM. RTP TX stays pinned to internal RAM for the W5500's DMA. One helper
+  (`pd::createTaskPreferPsram` / `pd::deleteTask`) creates and deletes every
+  PSRAM-stacked task and counts any fallback to internal RAM.
+- **Allocation-free hot paths.**
+  - An idle `tick()` allocates nothing (#474; #463).
+  - Per-request lookups allocate nothing (#471; #464).
+  - Every HTTP response goes out in place, as one scatter-gather `sendmsg`, and the
+    static pages stream from flash (#438, #448; #410).
+  - `CdrRing::clearAll()` no longer builds a 2 KB temporary on the HTTP stack
+    (#460; #458).
+  - The pcap ring is fixed-size (#436, #373).
+- **Watchdog on every named task (#321; #235).** beta.2 covered only the SIP task.
+- **Diagnosis for #273:** DRAM free and largest-block gauges (#295), L2 TX path health
+  (#371; #328), a heap-trace build profile and leak probe (#310, #347).
+
+### SIP correctness
+
+- **CSeq.** Every server-originated request now goes above every CSeq its dialog has
+  carried: transfer (#407; #402), park (#403; #389), server BYEs and the declined
+  NOTIFY (#459; #422), and the attended/blind transfer splices, which used a
+  hardcoded 100 (#308, #291).
+- **Target refreshes keep the PBX in the dialog (#439; #425, #198).** Hold no longer
+  leaks a ghost call, and a session refresh no longer drops the call at ~30 minutes.
+- **Never answer a response or an ACK (#472; #424).** This is enforced once, at
+  `drainOutbox()`, and anything refused is counted.
+- **A de-REGISTER is answered 200 at its source (#527; #523).** It used to get a 404.
+- **The register beep waits for the 200 OK (#542; #408).** Phones still in their own
+  startup no longer refuse it.
+- **Hold detection (#266, #285, #253)** reads the right SDP section and level.
+  `isValidMessage()` finally checks what SEC-02 said it did (#272).
+- **The SDP model is RFC 8866** behind `SipSdpMessage`, with a re2c parser
+  (#255; #196 phase 2).
+- **Pool exhaustion is refused cleanly.** Every virtual-peer caller refuses when the
+  pool is empty (#413; #412). A recycled session clears its voicemail state (#353).
+
+### Voicemail (#261; #246)
+
+Per-extension voicemail, deposit and retrieval.
+- **Deposit:** call-forward on busy or no-answer diverts to a local leg, which plays a
+  greeting and records to SD crash-safely.
+- **Retrieval:** dial `796` from your own extension. Messages play with a DTMF menu:
+  `7` deletes, `#` skips, `*` hangs up.
+- **No PIN.** Caller-ID authenticates the mailbox, an accepted tradeoff for a LAN-only
+  PBX. Its strength now depends on the registrar mode (THREAT_MODEL, #283).
+
+### Carriers and the anchor
+
+- **A generic SIP trunk (#164).** It runs as a B2BUA with its own dialog machine and a
+  raw RTP relay (#250, #260), plus the configuration UI, API and persistence (#362).
+  - The SBC address is resolved off the SIP thread (#258).
+  - Only the carrier may answer or hang up a trunk call (#388; #356), and a handset
+    hangup BYEs the carrier (#387; #386).
+  - The trunk URI omits the default `:5060` and keeps any other port (#532; #365).
+  - Hold music plays on trunk-anchored calls (#218).
+- **SBC mode (#201).** One toggle routes every call, extension-to-extension included,
+  out the telephony route. It works as a lowest-priority dial-plan rule, so 911,
+  reserved extensions and explicit rules still win. Changing the route takes a reboot.
+- **E.164 (#165).** A DID matches however it is written.
+- **Anchor (3CX Call Control) reliability.**
+  - The orphaned far leg is dropped in every teardown window, exactly once (#380; #379).
+  - An unanswered makecall is treated as unknown state, not a failed call (#352).
+  - Retry covers only transport blips (#354; #349).
+  - The GET handle is rebuilt after a transport failure (#351; #350).
+  - The WebSocket reconnect refreshes its Bearer token (#343).
+  - `writeAudio()` failures tear the call down (#323).
+  - The handset is notified when a degraded anchor tears down (#345; #279).
+  - The first refused GET is logged once per stream (#519; #518).
+- **Digest client (#541; part of #399).** An allocation-free client-side API. The trunk
+  does not answer 401/407 yet.
+- **Provisioning.** The Grandstream, Polycom and Cisco SPA renderers are reachable from
+  a phone (#313; #234).
+
+### Emergency calling (#166)
+
+- **911 comes first.** `911`, `9911` and the `933` test number are resolved before the
+  dial plan and before any registrar policy.
+- **No route answers 503.** With no anchor connected the caller gets 503, not 404
+  (#240).
+- **PCMA-only offers.** A PCMA-only offer gets that 503 too, with its reason (#317).
+- **Kari's Law.** An on-site notification (a MESSAGE plus an audible alert) goes to the
+  configured extensions when 911 is dialed. **Read the 911 caveat below.**
+
+### Observability
+
+- **Drops by reason.** `packetsDropped` is split by reason, with an allocation-free
+  ring of recent drops (#447; #430).
+- **Receive paths.** No receive-path discard goes uncounted, and a datagram too big for
+  the buffer is refused, not parsed truncated (#468; #443, #444). RTP datagrams over
+  512 B are dropped and counted (#485; #469).
+- **Status fields.** `/api/status` adds the heap and stack gauges (#185, #295), the L2
+  TX health (#371), the reset reason on the heartbeat (#340), and `/metrics` counters
+  for the above.
+
+### Tooling, CI and tests
+
+- **Interop gate.** The interop suite runs on every pull request and is a required
+  check (#417; #377).
+- **Test-count floor.** The count is gated on a checked-in floor (#404; #390): a base
+  plus one contribution file per PR (#478; #467).
+- **Staged remote OTA** with a stop rule at every stage and a rollback probe
+  (`tools/ota/remote_ota.sh`, #491; #395). Its first run on `.244` passed.
+- **A unified test harness** (`tests/run.py`) and a HIL pipeline (#360).
+- **CI hardening.**
+  - One cppcheck invocation (#442).
+  - clang-tidy is pinned to a two-way baseline (#262, #298).
+  - MSVC's string-literal cap is enforced on Linux (#289).
+  - The ESP matrix fails when an app slot has less than 32 KB free (#510; #489).
+  - Commit-hygiene gaps are closed, and the hook is actually executable (#516; #341).
+  - Superseded PR runs are cancelled (#432; #423).
+  - The nightly runs on an isolated Hyper-V runner (#431).
+
+### Docs
+
+- **Re-checked against the code.** FEATURE_ROADMAP, ARCHITECTURE and the RFC map
+  (#199) were re-checked (#520; part of #401). The 3CX Call Control reference is in
+  `docs/` (#332).
+
+<!-- TRAIN E/F: Globox fills these in when they land -->
+### Pending: trains E and F (not in this build until they land)
+
+These are reviewed or in review, and they are **not** described as shipped:
+- **#538**: a 911 goes to a real anchor, else the SIP trunk, else 503. The loopback
+  simulator is never offered one (Fixes #521).
+- **#503**: an INVITE must come from the caller's registered address (#497).
+- **#506**: CR/LF keep-alives are counted, not dropped (#430).
+- **#534**: an HTTP read deadline and a per-source slot cap (#529).
+- **#537**: the #401 soak logger and its PASS/FAIL verdict.
+- **#555**: a credentialed INVITE cannot be replayed to another destination (#549).
+- **#556**: a CANCEL mid-ring answers the anchored INVITE 487 (#548).
+- **#557**: follow-up doc corrections.
+- **#509**: IPv4 reassembly, with per-socket receive caps and an IPv4 input guard
+  (#496).
+
+---
+
+### Not proved on hardware / known open
+
+- **911 on a default board (#521).** Until #538 lands, a board whose only anchor is
+  the loopback simulator "answers" a 911 itself: the caller hears a connected call
+  that never left the box. **Do not rely on this build for emergency calling.**
+- **Emergency routing gaps.** A trunk that reports configured is not proven to
+  complete a call (#546). An extension named like a prefixed emergency number (#550)
+  is fixed in a PR that follows #538.
+- **The anchor rx task is still force-killed on a slow teardown (#370, #553).** #421's
+  guard passed the X4 re-run on `.244`, but review found the external kill itself
+  unsafe. The cooperative-cancellation redesign is #553. A late upsert re-priming a
+  dropped leg is #554.
+- **#401 is not done.** The multi-hour soak under call load is still owed; its tools
+  are in #537. Several FEATURE_ROADMAP §2 rows are not yet proven on hardware.
+  #499's 888 fix is merged but not re-run on `.244`.
+- **Host-proven only.** The trunk, voicemail and SBC mode are proven on the host
+  suite, but no real carrier has been rung from `.244`.
+
 ## v1.5.0-beta.2 — 2026-09-14
 
 Still a beta. Twelve pull requests landed in one evening on top of beta.1, every
