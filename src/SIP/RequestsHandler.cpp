@@ -8672,6 +8672,26 @@ void RequestsHandler::tick()
 						_outbox.emplace_back(invite->getSource(), std::move(resp));
 					}
 				}
+				// Issue #533: a CONNECTED reap used to end the session without a word
+				// to the handset, on the theory that a phone that never ACKed is gone.
+				// It is not always: an ACK can be lost, or not disarm this timer, and
+				// then the phone shows a live call with dead air until the user hangs
+				// up (and that BYE draws 404, the session being gone). BYE it, best
+				// effort -- the same outbound-direction BYE the audio-write-failure
+				// teardown sends (From=dTo/To=dFrom), and harmless to a phone that
+				// really has left.
+				if (!stillRinging)
+				{
+					auto handset = session->getSrc();
+					const std::string& dFrom = session->getDialogFrom();
+					const std::string& dTo   = session->getDialogTo();
+					if (handset && !dFrom.empty() && !dTo.empty())
+					{
+						auto bye = buildServerBye(handset->getNumber(), handset->getAddress(),
+							callID, dTo, dFrom);
+						if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
+					}
+				}
 				queueLog(std::string("[Telephony] anchor call reaped (no ") + (stillRinging ? "answer" : "ACK") +
 				         ") — dropped leg " + part);
 				endCall(callID, session->getSrc() ? session->getSrc()->getNumber() : "", part, "anchor reap");

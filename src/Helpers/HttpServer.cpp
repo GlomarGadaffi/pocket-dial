@@ -200,6 +200,33 @@ HttpServer::~HttpServer()
 	{
 		_acceptThread.join();
 	}
+	// Issue #540: every connection runs on a DETACHED thread whose lambda uses
+	// `this` after handleClient() returns (recordConnStackHwm, releaseSource,
+	// _activeConnections). Returning here while one is still running freed the
+	// server under it -- a use-after-free that showed up as a segfault in a
+	// later, unrelated test. No new connection can start (the accept thread is
+	// joined), and each handler is bounded by the read deadline plus its own
+	// work, so wait them out; the bound only guards against a wedged handler.
+	const auto giveUp = std::chrono::steady_clock::now() +
+		std::chrono::milliseconds(_readDeadlineMs + 5000);
+	while (_activeConnections.load(std::memory_order_acquire) > 0 &&
+		std::chrono::steady_clock::now() < giveUp)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	// #540 review: giving up with a handler still running IS the use-after-free
+	// above, just deferred. Never let it pass silently: say so, and on the host
+	// (tests) stop right here, where the cause is, not in whatever runs next.
+	const int stillRunning = _activeConnections.load(std::memory_order_acquire);
+	if (stillRunning > 0)
+	{
+		std::cerr << "[HttpServer] destroyed with " << stillRunning
+			<< " connection handler(s) still running after the read deadline + 5 s"
+			   " -- a wedged handler will touch freed memory (#540)\n";
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+		std::abort();
+#endif
+	}
 }
 
 void HttpServer::start()
@@ -1939,8 +1966,20 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json << "\"rosterVisible\":" << (authenticated ? "true" : "false") << ",";
 
 	// Sessions array
+	// Issue #539: live callers and callees are the CURRENT version of the CDR,
+	// which #207 put behind the session gate -- so they follow the roster's
+	// rule. An unauthenticated caller gets an empty array plus two identity-
+	// free fields: how many calls are up, and how old the oldest one is (the
+	// #401 soak tooling reads these to find a stuck leg without a credential).
+	int oldestSessionSec = 0;
+	for (const auto& s : sessions)
+	{
+		oldestSessionSec = (std::max)(oldestSessionSec, std::get<3>(s));
+	}
+	json << "\"sessionCount\":" << sessions.size() << ",";
+	json << "\"oldestSessionSec\":" << oldestSessionSec << ",";
 	json << "\"sessions\":[";
-	for (size_t i = 0; i < sessions.size(); i++)
+	for (size_t i = 0; authenticated && i < sessions.size(); i++)
 	{
 		if (i > 0) json << ",";
 		int durationSec = std::get<3>(sessions[i]);
@@ -2022,8 +2061,11 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// Parked calls: {orbit, parkedExt, parker, secondsParked} — Issue #65's
 	// ParkOrbit::snapshotRows(onlyParked=true), used by the dashboard to tell
 	// a parked jack apart from an idle or actively-connected one.
+	// Issue #539: which extension is parked, and by whom, is identity too.
+	// The count stays public.
+	json << "\"parkedCount\":" << parkedCalls.size() << ",";
 	json << "\"parkedCalls\":[";
-	for (size_t i = 0; i < parkedCalls.size(); i++)
+	for (size_t i = 0; authenticated && i < parkedCalls.size(); i++)
 	{
 		if (i > 0) json << ",";
 		json << "{\"orbit\":\"" << jsonEscape(std::get<0>(parkedCalls[i]))
@@ -2183,13 +2225,14 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 //     no secrets. It belongs in the first class, not the second.
 //
 //  2. /api/status is dispatched ungated from handleClient()'s route table (the
-//     entry directly above /metrics, ~line 449) and returns strictly MORE than
-//     this page does — the whole registered-client roster with each phone's
-//     IP:port, every live session's caller/callee/state, the
-//     dial plan, and the parked-call table. Gating /metrics while that stays
-//     open would not withhold a single bit from an anonymous peer on the link;
-//     it would only look like a control. Operational detail does leak here, but
-//     it is a strict subset of what already leaks next door.
+//     entry directly above /metrics, ~line 449) and returns MORE than this
+//     page does -- the dial plan, forwards and group tables, and the session
+//     and park COUNTS. (Since #207 the roster, and since #539 every live
+//     session's caller/callee and the parked-call rows, need a session.)
+//     Gating /metrics while that stays open would not withhold anything from
+//     an anonymous peer on the link; it would only look like a control.
+//     Operational detail does leak here, but it is a subset of what already
+//     leaks next door.
 //
 //  3. A stock Prometheus scraper cannot authenticate to this server even if we
 //     wanted it to. It issues a bare GET with no cookie jar; it cannot drive
