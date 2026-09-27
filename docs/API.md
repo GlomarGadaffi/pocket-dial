@@ -319,7 +319,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/ap-security`](#get-apiap-security) | `GET` | Medium | Gated | Reports whether the SoftAP requires WPA2 and returns its passphrase. |
 | [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
 | [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster. |
-| [`/api/registrar`](#post-apiregistrar) | `POST` | High | Gated (+ `X-CSRF`) | Sets the admission mode (`open`/`learn`/`secure`). |
+| [`/api/registrar`](#post-apiregistrar) | `POST` | High | Gated (+ `X-CSRF`) | Sets the admission mode (`learn`/`secure`; `open` is retired, #500). |
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
 | [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
@@ -1214,7 +1214,7 @@ Reports how a `REGISTER` is admitted, and which phones have been adopted.
   `"unknown"` and `devices` is empty meanwhile. Every
   other endpoint that reads registrar state behaves the same way: empty datasets, not
   failures.
-* `mode`: `open`, `learn` or `secure` (see `POST` below).
+* `mode`: `learn` or `secure` (see `POST` below). There is no `open` mode (#500).
 * `state`: `learned` (adopted on first contact, not yet enforced) or `secured`
   (MAC-locked and digest-enforced for its extension).
 * `online`: volatile registration state; never persisted.
@@ -1238,16 +1238,16 @@ curl -s "http://$DEV/api/registrar" -b "pd_session=$SESSION"
 
 | Param | Values | Effect |
 | :--- | :--- | :--- |
-| `mode` | `open` \| `learn` \| `secure` | Required. The admission policy. |
+| `mode` | `learn` \| `secure` | Required. The admission policy. `open` is retired (#500) and answers `400`. |
 | `confirm` | `LOCKOUT` | Only consulted when switching to `secure`; see below. |
 
-* `open`: every `REGISTER` is accepted with no credential. The shipped default. Any
-  endpoint on the link can register as any extension and tear down calls with a spoofed
-  `BYE`. Fine for a lab; not for a shared link.
-* `learn`: trust-on-first-use. An unknown MAC registering an unclaimed extension is
-  adopted and locked to it, while already-secured devices stay digest-enforced. A
-  deliberate, **temporary** weakening to adopt an existing fleet: bound the window, review
-  the roster, then move on. Run it on a trusted/WPA2 link.
+* `learn`: trust-on-first-use, and the default. An unknown MAC registering an unclaimed
+  extension is adopted and locked to it, while already-secured devices stay
+  digest-enforced. Adopt phones on a trusted/WPA2 link; an extension nobody has adopted
+  yet can still be claimed by the first device to ask (#440).
+* `open` (retired, #500): used to accept every `REGISTER` with no credential. A board that
+  had it stored boots `learn` and rewrites the setting; a config import that says `open`
+  applies `learn` and lists it under `skipped`.
 * `secure`: every `REGISTER` is digest-challenged; an extension is registrable only by
   a party that knows its secret.
 
@@ -1266,7 +1266,7 @@ Responds with the same body as the `GET`.
 * Request Content-Type: `application/x-www-form-urlencoded`
 * Response Status Codes:
   * `200 OK`: Mode set. Body is the `GET`'s `{attached, mode, devices}` shape.
-  * `400 Bad Request`: `{"error":"mode must be one of: open, learn, secure"}`. `mode` missing or not one of the three. The check is exact and case-sensitive.
+  * `400 Bad Request`: `{"error":"mode must be one of: learn, secure (open is retired)"}`. `mode` missing, `open`, or anything else. The check is exact and case-sensitive.
   * `401`/`403`: gates 1-4 as in §0.1.
   * `409 Conflict`: the no-secured-devices guard above.
   * `503 Service Unavailable`: `{"error":"SIP engine not attached yet"}`, unlike the `GET`, which reports `"attached":false` and `200`, the `POST` refuses outright rather than accepting a mode it cannot apply.
@@ -1534,11 +1534,11 @@ Zero-touch phone auto-provisioning (Issue #35). `<mac>` is 12 lowercase hex char
 Only serves configs for MACs already in the Registrar's adopted-device registry (Learn or Secure mode, see `docs/LEARN_MODE.md`/`Registrar.hpp`), so this covers **re**-provisioning (factory reset, handset swap, config refresh) rather than a phone's very first-ever contact: that first REGISTER is what gets a MAC adopted in the first place, and still needs the phone told its own extension number by some other means (typically typed once on the handset, or carried over from a previous config). Every subsequent boot can fetch this URL and get the account/server/codec settings back with no typing.
 
 > [!IMPORTANT]
-> **On a default board this endpoint is a 404 for every MAC.** The shipped registrar
-> mode is `open` (see [`POST /api/registrar`](#post-apiregistrar)), and `open` never
-> records a device; only Learn mode adopts, and only Secure mode keeps what Learn
-> adopted. So zero-touch provisioning is implemented and reachable, but it is inert
-> until an operator moves the registrar to `learn` and lets the phones register once.
+> **On a fresh board this endpoint is a 404 for every MAC until the phones register
+> once.** The default registrar mode is `learn` (see [`POST /api/registrar`](#post-apiregistrar)),
+> which adopts each phone on its first REGISTER; only then does its MAC have a config
+> to serve. (Before #500 the default on existing boards was `open`, which never recorded
+> a device, so this endpoint stayed inert until an operator switched modes.)
 > That is a configuration prerequisite, not a bug, and it is the single thing most
 > likely to make this endpoint look broken.
 

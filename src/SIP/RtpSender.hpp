@@ -100,6 +100,33 @@ public:
 	// stream cap (a 2nd dial of 440 is rejected 486 while this is true).
 	bool isActive() const { return _active.load(std::memory_order_acquire); }
 
+	// True when start() would not be refused for being busy: no live stream and,
+	// on ESP, no earlier media task still tearing itself down. Issue #513: a
+	// conference leg that has just left is free at once, but its task needs a few
+	// ticks to exit and start() refuses until it has, so a caller picking a slot
+	// asks this first instead of failing the start.
+	bool canStart() const
+	{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		return !_active.load(std::memory_order_acquire) &&
+		       !_taskRunning.load(std::memory_order_acquire);
+#else
+		return !_active.load(std::memory_order_acquire) &&
+		       !_teardownPendingForTest.load(std::memory_order_acquire);
+#endif
+	}
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test seam (#513): make this sender behave like an ESP sender whose earlier
+	// task is still exiting -- canStart() false and start() refused. The host
+	// build never shows that state on its own, because its stop() joins
+	// synchronously.
+	void holdTeardownForTest(bool pending)
+	{
+		_teardownPendingForTest.store(pending, std::memory_order_release);
+	}
+#endif
+
 	// The UDP port the server sources RTP from (advertised in the 440 200-OK SDP).
 	int serverRtpPort() const { return _serverRtpPort; }
 
@@ -155,6 +182,9 @@ private:
 #endif
 
 	std::atomic<bool> _active{false};
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	std::atomic<bool> _teardownPendingForTest{false};   // see holdTeardownForTest()
+#endif
 	int               _serverRtpPort;     // fixed dedicated media port
 
 	// Guards _callID and the start/stop transition so the SIP thread and the media

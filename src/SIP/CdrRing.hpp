@@ -55,6 +55,8 @@ public:
 	// Newest-first copy of the ring, for the dashboard snapshot. Caller holds
 	// _mutex.
 	std::vector<CallDetailRecord> snapshot() const;
+	// #463: the same, refilled in place (zero allocations when unchanged).
+	void snapshotInto(std::vector<CallDetailRecord>& out) const;
 
 	// *69: extension of the last party that called `calleeExt`, walking
 	// newest to oldest; empty string if none found. Caller holds _mutex.

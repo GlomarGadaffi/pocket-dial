@@ -146,10 +146,10 @@ error to report.
 
 ### Defaults stay conservative
 
-The shipped posture is an **open** SoftAP, an **`open`** SIP registrar, plain
-HTTP, and unsigned OTA. WPA2 on the SoftAP (`ap_secure`) and the `learn`/`secure`
-registrar modes are opt-in, because each of them breaks an already-deployed fleet
-the moment it is turned on. A PR that flips one of these defaults is a
+The shipped posture is an **open** SoftAP, a **`learn`** SIP registrar (the `open`
+registrar is retired, #500), plain HTTP, and unsigned OTA. WPA2 on the SoftAP
+(`ap_secure`) and the `secure` registrar mode are opt-in, because each of them breaks
+an already-deployed fleet the moment it is turned on. A PR that flips one of these defaults is a
 breaking change and needs to be argued as one, not slipped in as a hardening
 tidy-up.
 

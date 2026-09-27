@@ -46,12 +46,28 @@ public:
 	using OnNewMessageEvent = std::function<void(std::string_view, sockaddr_in)>;
 	static constexpr int BUFFER_SIZE = 2048;
 
+	// Issue #443/#444: every datagram (or receive) the loop throws away instead
+	// of delivering, so none of them goes uncounted:
+	//   Oversize  -- longer than BUFFER_SIZE. `bytes` is the first BUFFER_SIZE
+	//                bytes, `fullLen` the real length. Refused, never delivered
+	//                truncated (a cut SDP would parse as a whole message).
+	//   Empty     -- a 0-byte datagram (`bytes` empty).
+	//   RecvError -- the receive call failed; `err` is its errno (no source).
+	// The receive timeout's idle wake is not a discard (isIdleWake()). Same
+	// lifetime rule for `bytes` as OnNewMessageEvent's view.
+	enum class Discard : uint8_t { Oversize, Empty, RecvError };
+	using OnDiscardEvent = std::function<void(Discard, std::string_view bytes, sockaddr_in src,
+	                                          size_t fullLen, int err)>;
+	// True for the errno a receive returns when nothing arrived before the
+	// SO_RCVTIMEO watchdog wake (or on a signal) -- idle, not an error.
+	static bool isIdleWake(int err);
+
 	// Back-off constants for socket/bind retry (ESP builds only).
 	// Initial delay 500 ms, doubles each attempt, hard cap at 30 s.
 	static constexpr uint32_t kBackoffInitialMs = 500;
 	static constexpr uint32_t kBackoffMaxMs     = 30000;
 
-	UdpServer(std::string ip, int port, OnNewMessageEvent event);
+	UdpServer(std::string ip, int port, OnNewMessageEvent event, OnDiscardEvent discard = {});
 	~UdpServer();
 
 	void startReceive();
@@ -72,6 +88,7 @@ private:
 	int _sockfd = -1;
 	sockaddr_in _servaddr;
 	OnNewMessageEvent _onNewMessageEvent;
+	OnDiscardEvent _onDiscardEvent;
 	std::atomic<bool> _keepRunning;
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
