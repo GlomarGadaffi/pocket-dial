@@ -9,6 +9,8 @@
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "PsramTask.hpp"   // PD_ASSERT_NOT_PSRAM_STACK: #277/#480, see load()/store()
 #else
 #include <iostream>
@@ -190,15 +192,39 @@ namespace
 	// thread returned the default ("complete") status for an interrupted reset.
 	// The load now runs under a mutex and `loaded` is set only after `status` is
 	// filled; a racing caller waits for it. No heap: a function-local std::mutex.
-	std::mutex& loadMutex()
+	// #481 review (BLOCKING): a std::mutex on ESP-IDF allocates its FreeRTOS
+	// mutex lazily, on first lock -- on the HTTP path. The ESP arm uses a
+	// statically allocated mutex (the SmtpClient.cpp precedent), and
+	// HttpServer::acceptLoop() primes the load before its first accept, so no
+	// request ever pays for it. The host keeps std::mutex.
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	class LoadLock
 	{
-		static std::mutex m;
-		return m;
-	}
+	public:
+		LoadLock() { xSemaphoreTake(handle(), portMAX_DELAY); }
+		~LoadLock() { xSemaphoreGive(handle()); }
+	private:
+		static SemaphoreHandle_t handle()
+		{
+			static StaticSemaphore_t buf;
+			static SemaphoreHandle_t h = xSemaphoreCreateMutexStatic(&buf);   // no heap
+			return h;
+		}
+	};
+#else
+	class LoadLock
+	{
+	public:
+		LoadLock() : _g(mutex()) {}
+	private:
+		static std::mutex& mutex() { static std::mutex m; return m; }
+		std::lock_guard<std::mutex> _g;
+	};
+#endif
 
 	void ensureLoaded()
 	{
-		std::lock_guard<std::mutex> lock(loadMutex());
+		LoadLock lock;
 		Cache& c = cache();
 		if (c.loaded) return;
 		c.status.storage = backend();
@@ -221,6 +247,17 @@ namespace
 				c.seq = r.seq;
 				break;
 		}
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		// No silent downgrade (#481 review): the flash backend needs the
+		// `prompts` partition, and esp_partition_find_first() can also come back
+		// empty under memory pressure. Say so whenever the journal ends up in RTC
+		// memory, which a power cut clears.
+		if (c.status.storage == Storage::Rtc)
+		{
+			warn("no 'prompts' partition found (or the lookup failed); the reset journal is in RTC "
+			     "memory, so an interrupted reset is NOT reported after a power cut");
+		}
+#endif
 		if (c.status.incomplete())
 		{
 			warn(c.status.stage == Stage::Begun
@@ -324,6 +361,11 @@ void resetForTest()
 	s_hostHasRecord = false;
 	s_hostFailNextStore = false;
 	writeFailures().store(0);
+}
+
+Stage storedStageForTest()
+{
+	return s_hostHasRecord ? static_cast<Stage>(s_hostRecord.stage) : Stage::None;
 }
 
 void setLoadHookForTest(void (*hook)())

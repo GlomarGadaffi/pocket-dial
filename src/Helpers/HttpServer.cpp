@@ -221,6 +221,10 @@ void HttpServer::acceptLoop()
 	// It also caches the presence probe itself (#405): after this, /api/status
 	// and the coredump routes never touch the partition per request.
 	CoreDumpStore::prime();
+	// #481 review: load the reset journal's boot status here too, before the
+	// first accept -- the flash read and the one-time lock setup happen on this
+	// 8 KB thread once, never on a 4 KB http_conn thread per request.
+	(void)resetjournal::bootStatus();
 
 #if defined(ESP_PLATFORM)
 	// Issue #366. esp_pthread_set_cfg() applies to threads created BY THE
@@ -3837,6 +3841,9 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP
 	// (NVS) and host (in-memory).
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	if (auto h = resetguard::beforeFirstEraseHookForTest()) h();   // #481 review: ordering pin
+#endif
 	const bool adminErased = AdminAuth::clearCredential();
 	// Also drop ap_secure / ap_psk / cfgseed_gen. Clearing the seed generation is
 	// deliberate: the next boot re-applies whatever the flasher wrote, so a

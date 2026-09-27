@@ -91,5 +91,8 @@ namespace resetjournal
 	// Called inside the one-time boot-status load, before the record is read,
 	// so a test can make a second thread ask for bootStatus() mid-load (#481).
 	void setLoadHookForTest(void (*hook)());
+	// The stage of the record in the (host) journal right now, None if absent --
+	// lets an ordering test see that begin() already ran at a given moment.
+	Stage storedStageForTest();
 #endif
 }
