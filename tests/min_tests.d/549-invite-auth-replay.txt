@@ -1,0 +1,2 @@
+# InviteAdmission_test.cpp: 3 (#549: uri bound to the Request-URI, To checked, credentials never relayed)
+3

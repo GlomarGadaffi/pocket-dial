@@ -413,7 +413,101 @@ TEST(InviteAdmission, LearnModeStillAdmitsAnUnsecuredCallerWithoutAChallenge)
 	Harness h;
 	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
 	h.handler.adoptDeviceForTest("0200000000bb", "600", Registrar::DeviceState::Secured);
+	// The caller itself is an ADOPTED Learned device, so dropping the Secured
+	// state test from isExtensionSecured() ("any adopted device") goes red too
+	// (Crew's #512 review, finding 4).
+	h.handler.adoptDeviceForTest("0200000000ab", "500", Registrar::DeviceState::Learned);
 	h.handler.handle(makeInvite("lplain", 1, kPcmuOffer));
 	EXPECT_FALSE(anySentContains(h.sent, "401 Unauthorized"));
 	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@"));
+}
+
+namespace
+{
+	// A credentialed INVITE for 500, answering the 401 the bare one drew. The
+	// digest covers `digestUri`, which a replay may point somewhere else.
+	std::string credentialsFor(const std::string& challenge, const std::string& digestUri)
+	{
+		const std::string nonce = paramOf(challenge, "nonce");
+		const std::string ha1 = SipDigest::computeHa1("500", SipSecretStore::kRealm, "s3cret");
+		const std::string response = SipDigest::computeResponse(
+			ha1, "INVITE", digestUri, nonce, "00000001", "0a4f113b", "auth");
+		return "Authorization: Digest username=\"500\", realm=\"pocketdial\", nonce=\"" + nonce +
+			"\", uri=\"" + digestUri + "\", response=\"" + response +
+			"\", algorithm=MD5, qop=auth, nc=00000001, cnonce=\"0a4f113b\"\r\n";
+	}
+}
+
+TEST(InviteAdmission, CredentialsForAnotherRequestUriAreRefused)
+{
+	// #512 review (Crew, MEDIUM): the hash covers the Authorization's uri, not
+	// the Request-URI the call is routed on. A valid digest over sip:700@server
+	// must not place a call to 600.
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+
+	h.handler.handle(makeInvite("xuri", 1, kPcmuOffer));
+	const std::string challenge = firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized");
+	ASSERT_FALSE(challenge.empty());
+
+	h.sent.clear();
+	h.handler.handle(makeInvite("xuri", 2, kPcmuOffer, credentialsFor(challenge, "sip:700@server")));
+	EXPECT_TRUE(anySentContains(h.sent, "SIP/2.0 403 Credentials Not For This Request"));
+	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@"))
+		<< "a digest over another URI must not authorise this call";
+}
+
+TEST(InviteAdmission, ACredentialedInviteWhoseToDisagreesWithTheRequestUriIsRefused)
+{
+	// #512 review: the digest binds the Request-URI, but routing reads the To
+	// user. A replay that keeps the Request-URI and rewrites only To must not
+	// reach the new destination.
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+
+	h.handler.handle(makeInvite("xto", 1, kPcmuOffer));
+	const std::string challenge = firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized");
+	ASSERT_FALSE(challenge.empty());
+
+	h.sent.clear();
+	auto invite = makeInvite("xto", 2, kPcmuOffer, credentialsFor(challenge, "sip:600@server"));
+	ASSERT_TRUE(invite);
+	invite->setTo("To: <sip:700@server>");
+	h.handler.handle(invite);
+	EXPECT_TRUE(anySentContains(h.sent, "SIP/2.0 403 Request-URI And To Disagree"));
+	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:700@"));
+	EXPECT_FALSE(anySentContains(h.sent, "INVITE sip:600@"));
+}
+
+TEST(InviteAdmission, TheCalleeNeverSeesTheCallersCredentials)
+{
+	// #512 review (Crew, MEDIUM): relayed verbatim, the Authorization let the
+	// callee replay the caller's credentials at this PBX for the nonce's life.
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+
+	h.handler.handle(makeInvite("strip", 1, kPcmuOffer));
+	const std::string challenge = firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized");
+	ASSERT_FALSE(challenge.empty());
+
+	h.sent.clear();
+	h.handler.handle(makeInvite("strip", 2, kPcmuOffer,
+		credentialsFor(challenge, "sip:600@server") +
+		"Proxy-Authorization: Digest username=\"500\", realm=\"x\", nonce=\"n\", uri=\"sip:600@server\", response=\"0\"\r\n"));
+	const std::string fork = firstSentContaining(h.sent, "INVITE sip:600@");
+	ASSERT_FALSE(fork.empty()) << "the credentialed INVITE is admitted and forked";
+	EXPECT_EQ(fork.find("Authorization:"), std::string::npos)
+		<< "neither Authorization nor Proxy-Authorization may reach the callee:\n" << fork;
+	for (const auto& entry : h.sent)
+	{
+		const std::string raw = entry.second->toString();
+		EXPECT_EQ(raw.find("Authorization:"), std::string::npos)
+			<< "no message this PBX sends may carry the caller's credentials:\n" << raw;
+	}
 }
