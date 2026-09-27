@@ -401,3 +401,109 @@ TEST(InviteAdmission, TheCalleeNeverSeesTheCallersCredentials)
 			<< "no message this PBX sends may carry the caller's credentials:\n" << raw;
 	}
 }
+
+// ── #560: in-dialog relays never carry the INVITE's credential ───────────────
+namespace
+{
+	// Secure mode, a challenged-then-admitted call 500 -> 600 on Call-ID `id`.
+	// Returns the credential line the admitted INVITE carried.
+	std::string admitCredentialedCall(Harness& h, const std::string& id)
+	{
+		h.handler.handle(makeInvite(id, 1, kPcmuOffer));
+		const std::string challenge = firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized");
+		const std::string creds = credentialsFor(challenge, "sip:600@server");
+		h.handler.handle(makeInvite(id, 2, kPcmuOffer, creds));
+		return creds;
+	}
+
+	std::string lastSentTo600Starting(const Sent& sent, const std::string& start)
+	{
+		std::string out;
+		for (const auto& [addr, msg] : sent)
+		{
+			const std::string raw = msg ? msg->toString() : std::string{};
+			if (addr.sin_addr.s_addr == inet_addr("192.168.7.60") && raw.rfind(start, 0) == 0) out = raw;
+		}
+		return out;
+	}
+}
+
+TEST(InviteAdmission, TheRelayedAckCarriesNoCredential)
+{
+	// RFC 3261 §13.2.2.4 has the caller repeat the INVITE's credentials on the
+	// 2xx ACK; relayed verbatim (onAck -> endHandle) the callee got them anyway.
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+	const std::string creds = admitCredentialedCall(h, "ack560");
+	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
+
+	auto ack = makeInvite("ack560", 2, kPcmuOffer, creds);
+	ack->setHeader("ACK sip:600@server SIP/2.0");
+	ack->setCSeq("CSeq: 2 ACK");
+	ack->setTo("To: <sip:600@server>;tag=callee560");
+	ack->clearBody();
+	h.sent.clear();
+	h.handler.handle(ack);
+
+	const std::string relayed = lastSentTo600Starting(h.sent, "ACK ");
+	ASSERT_FALSE(relayed.empty()) << "the ACK is relayed to the callee";
+	EXPECT_EQ(relayed.find("Authorization:"), std::string::npos) << relayed;
+}
+
+TEST(InviteAdmission, ARelayedReinviteCarriesNoCredential)
+{
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+	const std::string creds = admitCredentialedCall(h, "re560");
+	ASSERT_FALSE(firstSentContaining(h.sent, "INVITE sip:600@").empty());
+
+	auto reinvite = makeInvite("re560", 3, kPcmuOffer, creds);
+	reinvite->setTo("To: <sip:600@server>;tag=callee560");
+	h.sent.clear();
+	h.handler.handle(reinvite);
+
+	const std::string relayed = lastSentTo600Starting(h.sent, "INVITE ");
+	ASSERT_FALSE(relayed.empty()) << "the re-INVITE is relayed to the callee";
+	EXPECT_EQ(relayed.find("Authorization:"), std::string::npos) << relayed;
+}
+
+TEST(InviteAdmission, ARegisterWhoseDigestUriIsNotItsRequestUriIsRefused)
+{
+	// #549's uri binding covers REGISTER too (admitSecure is shared).
+	Harness h;
+	SecretGuard guard{"500"};
+	ASSERT_TRUE(SipSecretStore::setSecret("500", "s3cret"));
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+	h.handler.handle(makeRegister("500", "192.168.7.50"));
+	const std::string challenge = firstSentContaining(h.sent, "SIP/2.0 401 Unauthorized");
+	ASSERT_FALSE(challenge.empty());
+	const std::string nonce = paramOf(challenge, "nonce");
+	const std::string resp = SipDigest::computeResponse(
+		SipDigest::computeHa1("500", SipSecretStore::kRealm, "s3cret"),
+		"REGISTER", "sip:elsewhere", nonce, "00000001", "0a4f113b", "auth");
+
+	auto reg = makeRegister("500", "192.168.7.50");
+	reg->addHeader("Authorization", "Digest username=\"500\", realm=\"pocketdial\", nonce=\"" + nonce +
+		"\", uri=\"sip:elsewhere\", response=\"" + resp +
+		"\", algorithm=MD5, qop=auth, nc=00000001, cnonce=\"0a4f113b\"");
+	h.sent.clear();
+	h.handler.handle(reg);
+	EXPECT_TRUE(anySentContains(h.sent, "SIP/2.0 403 Credentials Not For This Request"));
+}
+
+TEST(InviteAdmission, ALearnModeForkDropsUnsolicitedCredentials)
+{
+	// An unsecured Learned caller is never challenged, but a phone may still
+	// send credentials unasked; CallForker::buildInviteFork strips them.
+	Harness h;
+	h.handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+	h.handler.handle(makeInvite("learn560", 1, kPcmuOffer,
+		"Authorization: Digest username=\"500\", realm=\"pocketdial\", nonce=\"n\", uri=\"sip:600@server\", response=\"0\"\r\n"));
+	const std::string fork = firstSentContaining(h.sent, "INVITE sip:600@");
+	ASSERT_FALSE(fork.empty());
+	EXPECT_EQ(fork.find("Authorization:"), std::string::npos) << fork;
+}
