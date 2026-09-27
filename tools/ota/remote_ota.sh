@@ -96,7 +96,7 @@ login() {
 
 # upload <file> -> prints the HTTP code; body saved to $TMP/up.json
 upload() {
-  if [ "$DRY" = 1 ]; then log "dry-run: would POST /api/ota/upload ($(stat -c %s "$1") B, octet-stream, X-CSRF)"; echo DRY; return; fi
+  if [ "$DRY" = 1 ]; then log "dry-run: would POST /api/ota/upload ($(wc -c < "$1" | tr -d " ") B, octet-stream, X-CSRF)"; echo DRY; return; fi
   curl -s -m 180 -o "$TMP/up.json" -w '%{http_code}' -b "$JAR" -H "X-CSRF: $CSRF" \
        -H 'Content-Type: application/octet-stream' --data-binary @"$1" "$BASE/api/ota/upload"
 }
@@ -147,7 +147,7 @@ stage2() {
 stage3() {
   [ -f "$IMAGE" ] || stop "--image required"
   [ -n "$EXPECT" ] || stop "--expect-version required (the app-desc version of --image)"
-  log "== stage 3: real OTA of $(basename "$IMAGE") ($(stat -c %s "$IMAGE") B), expecting version $EXPECT"
+  log "== stage 3: real OTA of $(basename "$IMAGE") ($(wc -c < "$IMAGE" | tr -d " ") B), expecting version $EXPECT"
   need_idle; login
   local code o snap t0 seenPV=0 back=0
   code=$(upload "$IMAGE")
