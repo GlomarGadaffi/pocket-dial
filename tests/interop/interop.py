@@ -900,7 +900,14 @@ def _live_session_between(ext_a, ext_b):
     st = http_json("/api/status")
     if st is None or "sessions" not in st:
         return None
-    return any({s.get("caller"), s.get("callee")} == {ext_a, ext_b} for s in st["sessions"])
+    if st["sessions"]:
+        return any({s.get("caller"), s.get("callee")} == {ext_a, ext_b} for s in st["sessions"])
+    # #539: an unauthenticated read gets an empty array plus sessionCount. The
+    # scenarios run one at a time (hangup_all() between them), so any live
+    # session here is this call's. A board without sessionCount predates #539,
+    # where an empty array really meant none.
+    count = st.get("sessionCount")
+    return bool(count) if isinstance(count, int) else False
 
 
 def _bye_went_through_pbx(caller, callee, m_caller, m_callee):

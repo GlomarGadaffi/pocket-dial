@@ -2342,7 +2342,19 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 		}
 		else
 		{
-			ESP_LOGW(TAG, "WS Remove for %s matched no slot", w.partId.c_str());
+			// Issue #533: no slot any more -- usually the echo of our own drop (the
+			// slot was freed by dropCall's stopMediaStreams before 3CX's Remove
+			// arrived). But a slot can also be freed while the SIP session it served
+			// is still up, and then this Remove is the only word that the call is
+			// over. Report it anyway: RequestsHandler's Dropped handler matches on
+			// the session's participant id, so an already-ended call (or a far-leg
+			// id) matches nothing and this is a no-op; a live one gets its BYE.
+			ESP_LOGW(TAG, "WS Remove for %s matched no slot -- reporting Dropped anyway", w.partId.c_str());
+			if (evCb)
+			{
+				CallEvent ev{CallEvent::Dropped, w.partId, "", ""};
+				evCb(ev);
+			}
 		}
 		return;
 	}

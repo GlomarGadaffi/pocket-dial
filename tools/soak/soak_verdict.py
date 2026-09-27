@@ -107,8 +107,9 @@ def _slope(points):
 def _busy(s):
     # #539 shape: an unauthenticated poll gets sessionCount instead of the array.
     count = _num(s.get("sessionCount"))
+    parked = _num(s.get("parkedCount"))   # #539: the unauthenticated park count
     return (bool(s.get("sessions") or []) or (count is not None and count > 0)
-            or bool(s.get("parkedCalls") or []))
+            or bool(s.get("parkedCalls") or []) or (parked is not None and parked > 0))
 
 
 def evaluate(samples, bad, cfg):

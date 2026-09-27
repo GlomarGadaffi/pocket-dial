@@ -322,9 +322,9 @@ Enabling WPA2 from the dashboard does **not** restart the radio; that would drop
 the client that just asked for the passphrase. The change lands at the next AP
 bringup, so power-cycle the board to see it take effect.
 
-> The shipped defaults remain an **open** SoftAP, an **`open`** SIP registrar,
-> plain HTTP, and unsigned OTA. Everything in this section is something an
-> operator turns on deliberately.
+> The shipped defaults remain an **open** SoftAP, a **`learn`** SIP registrar
+> (trust-on-first-use; `open` is retired, #502), plain HTTP, and unsigned OTA.
+> Everything in this section is something an operator turns on deliberately.
 
 ## 6. Troubleshooting
 
