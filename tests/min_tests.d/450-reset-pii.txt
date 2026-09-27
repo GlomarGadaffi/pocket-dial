@@ -1,2 +1,2 @@
-# FactoryResetSecrets_test.cpp (#450 additions) etc., #450/#456
-5
+# FactoryResetSecrets_test.cpp: #450 additions + the tapi/didmap failure report (#456 review)
+6
