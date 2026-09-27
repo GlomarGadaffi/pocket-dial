@@ -819,6 +819,9 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
   "sessions": [
     { "caller": "1001", "callee": "1002", "state": "Connected", "duration": "03:45" }
   ],
+  "sessionCount": 1,
+  "oldestSessionSec": 225,
+  "parkedCount": 0,
   "dnd": ["1003"],
   "forwards": [
     { "extension": "1001", "always": "", "busy": "1002", "noanswer": "" }
@@ -886,12 +889,12 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `clients[].number` | String | SIP extension number (e.g., `"1001"`). |
 | `clients[].address` | String | Client's IP and port (e.g., `"192.168.4.12:5060"`). |
 | `sessions` | Array | Active calls: `{caller, callee, state, duration}`. **Empty without an admin session** (#539): who is calling whom is the live call log, gated like `/api/cdr` and the `clients` roster (#207). |
-| `sessionCount` | Integer | (#539) Number of active calls. Always present, authenticated or not. |
-| `oldestSessionSec` | Integer | (#539) Age in seconds of the oldest active call, 0 when none. Always present; the #401 soak reads it to find a stuck leg without a credential. |
 | `sessions[].caller` | String | Extension that initiated the call. |
 | `sessions[].callee` | String | Target extension receiving the call. |
 | `sessions[].state` | String | Active session state. Exactly one of `Invited`, `Connected`, `Busy`, `Unavailable`, `Cancel`, `Bye`, or `Unknown` for an unmapped enumerator (`sessionStateToString`, `src/SIP/RequestsHandler.cpp:4262`). |
 | `sessions[].duration` | String | **A preformatted display string, not a number.** `MM:SS` under an hour, `HH:MM:SS` at or above it, zero-padded either way (`"03:45"`, `"01:02:03"`). The underlying integer seconds is not exposed anywhere; a client that wants arithmetic has to parse this back. |
+| `sessionCount` | Integer | (#539) Number of active calls. Always present, authenticated or not. |
+| `oldestSessionSec` | Integer | (#539) Age in seconds of the oldest active call, 0 when none. Always present; the #401 soak reads it to find a stuck leg without a credential. |
 | `dnd` | Array | Extension numbers (**strings**, not objects) currently in Do-Not-Disturb. |
 | `forwards` | Array | Per-extension call-forward targets: `{extension, always, busy, noanswer}`. An unset trigger is an empty string, never `null` or a missing key. |
 | `groups` | Array | Ring/hunt groups: `{extension, mode, members}`, where `mode` is `ringall` or `hunt`. |

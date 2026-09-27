@@ -2198,13 +2198,14 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 //     no secrets. It belongs in the first class, not the second.
 //
 //  2. /api/status is dispatched ungated from handleClient()'s route table (the
-//     entry directly above /metrics, ~line 449) and returns strictly MORE than
-//     this page does — the whole registered-client roster with each phone's
-//     IP:port, every live session's caller/callee/state, the
-//     dial plan, and the parked-call table. Gating /metrics while that stays
-//     open would not withhold a single bit from an anonymous peer on the link;
-//     it would only look like a control. Operational detail does leak here, but
-//     it is a strict subset of what already leaks next door.
+//     entry directly above /metrics, ~line 449) and returns MORE than this
+//     page does -- the dial plan, forwards and group tables, and the session
+//     and park COUNTS. (Since #207 the roster, and since #539 every live
+//     session's caller/callee and the parked-call rows, need a session.)
+//     Gating /metrics while that stays open would not withhold anything from
+//     an anonymous peer on the link; it would only look like a control.
+//     Operational detail does leak here, but it is a subset of what already
+//     leaks next door.
 //
 //  3. A stock Prometheus scraper cannot authenticate to this server even if we
 //     wanted it to. It issues a bare GET with no cookie jar; it cannot drive
