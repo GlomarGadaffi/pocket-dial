@@ -1857,7 +1857,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// fit is refused with a 500 and counted -- never truncated, never grown.
 	char* buf = nullptr;
 	std::atomic<bool>* busy = nullptr;
-	for (int i = 0; i < kMaxConcurrentConnections && buf == nullptr; ++i)
+	for (int i = 0; i < kStatusBufCount && buf == nullptr; ++i)
 	{
 		if (_statusBuf[i] != nullptr && !_statusBufBusy[i].exchange(true, std::memory_order_acquire))
 		{
@@ -1865,7 +1865,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 			busy = &_statusBufBusy[i];
 		}
 	}
-	if (buf == nullptr)   // allocation failed at boot; the slot cap makes "all busy" unreachable
+	if (buf == nullptr)   // all busy (fewer buffers than slots without PSRAM), or failed at boot
 	{
 		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
 		sendResponse(sock, 503, "Service Unavailable", "application/json",

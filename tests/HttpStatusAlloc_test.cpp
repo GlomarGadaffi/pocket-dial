@@ -105,6 +105,32 @@ TEST(HttpStatusAlloc, ServingStatusAllocatesNothing)
 	}
 }
 
+TEST(HttpStatusAlloc, AnOfficeSizedBodyFitsTheSmallestBuffer)
+{
+	// #599 review: the no-PSRAM profile's buffer is 16 KB. A full small office
+	// (~15 KB, Globox's #410 inventory) must be served there, not refused.
+	StatusBench b;
+	for (int g = 0; g < 32; ++g)
+	{
+		std::string members;
+		for (int m = 0; m < 32; ++m)
+		{
+			if (m) members += ",";
+			members += std::to_string(10000000 + g * 100 + m);
+		}
+		b.handler->setRingGroup(std::to_string(600 + g), members, "ringall");
+		b.handler->setForward(std::to_string(1000 + g), "busy", std::to_string(2000 + g));
+	}
+	b.handler->tick();
+	b.server.setStatusCapForTest(16384);
+	const std::string resp = b.serve(true);
+	ASSERT_EQ(resp.rfind("HTTP/1.1 200", 0), 0u) << resp.substr(0, 200);
+	const size_t body = resp.size() - (resp.find("\r\n\r\n") + 4);
+	EXPECT_GE(body, 14000u) << "not office-sized; grow the bench";
+	EXPECT_LE(body, 16384u);
+	EXPECT_EQ(b.server.statusRefusals(), 0u);
+}
+
 TEST(HttpStatusAlloc, ABodyThatDoesNotFitIsRefusedAndCounted)
 {
 	StatusBench b;
