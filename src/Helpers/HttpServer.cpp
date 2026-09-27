@@ -3861,7 +3861,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// deliberate: the next boot re-applies whatever the flasher wrote, so a
 	// factory reset returns the board to how it was FLASHED rather than to a
 	// hardcoded default the operator never chose.
-	DeviceConfig::clearAll();
+	const bool deviceConfigCleared = DeviceConfig::clearAll();   // #441 review: reported below
 	// Also wipe the Telephony-API credential slots ("tapicfg") and the DID ->
 	// extension table ("didmap") -- both live in their OWN NVS namespace /
 	// host-file specifically so that clearing the device's own settings would NOT
@@ -3873,8 +3873,8 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// cleared here too.
 	//
 	// Nothing else in this function reaches them: DeviceConfig::clearAll() just
-	// above erases only its three named "storage" keys plus reg_mode in "pbxcfg"
-	// (via that file's eraseRegistrarMode(), src/Helpers/DeviceConfig.cpp), and the
+	// above erases only its three named "storage" keys and resets reg_mode in
+	// "pbxcfg" to learn (writeRegistrarMode(), src/Helpers/DeviceConfig.cpp; #397), and the
 	// WiFi block further down erases four more "storage" keys by name. Both of
 	// those are key-by-key, never a namespace wipe, so a namespace no line here
 	// names is not reached at all. (An earlier version of this comment said
@@ -3996,25 +3996,28 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// completed reset. The operator is about to hand this board on believing its
 	// credentials are gone. The board still restarts: the admin credential is
 	// already cleared above, so staying up half-reset helps nobody, and the reset
-	// can be run again once setup completes. (DeviceConfig::clearAll() still
-	// returns void; its result is Pal's #441.)
+	// can be run again once setup completes. #441: DeviceConfig::clearAll()'s
+	// result is deviceConfigCleared -- a failed reg_mode write can leave an old
+	// `secure` in place, the lockout this reset exists to rescue -- so it joins
+	// this same check and gets its own "device" flag (train C merge of #441/#456).
 	if (!adminErased || !trunkErased || !secretsErased || !forwardsErased || !e911Erased ||
-		!tapiErased || !didmapErased || !wifiErased)
+		!tapiErased || !didmapErased || !wifiErased || !deviceConfigCleared)
 	{
 		// #450: one fixed format, filled on the stack -- no string building on the
 		// HTTP task (#284). "failed" names each store, so the operator knows what
 		// may still be in flash. Worst case 298 B of 384 (#456 review: tapi,
-		// didmap and wifi added).
+		// didmap and wifi added; +16 B for #441's device).
 		char body[384];
 		const int n = std::snprintf(body, sizeof(body),
 			"{\"status\":\"error\",\"failed\":{\"admin\":%s,\"trunk\":%s,\"secrets\":%s,\"forwards\":%s,\"e911\":%s,"
-			"\"tapi\":%s,\"didmap\":%s,\"wifi\":%s},"
+			"\"tapi\":%s,\"didmap\":%s,\"wifi\":%s,\"device\":%s},"
 			"\"message\":\"Factory reset INCOMPLETE: the stores marked true under failed could not be erased. "
 			"Rebooting anyway; run the factory reset again after setup.\"}",
 			adminErased ? "false" : "true", trunkErased ? "false" : "true",
 			secretsErased ? "false" : "true", forwardsErased ? "false" : "true",
 			e911Erased ? "false" : "true", tapiErased ? "false" : "true",
-			didmapErased ? "false" : "true", wifiErased ? "false" : "true");
+			didmapErased ? "false" : "true", wifiErased ? "false" : "true",
+			deviceConfigCleared ? "false" : "true");
 		// A truncated or failed format must never ship as half a JSON object.
 		static constexpr const char* kFallback =
 			"{\"status\":\"error\",\"message\":\"Factory reset INCOMPLETE: one or more stores could "
