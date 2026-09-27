@@ -558,3 +558,28 @@ TEST_F(TwoRoleAuthTest, AdminStatusReportsRoleAndOwnerProvisioned)
 	EXPECT_NE(bodyOf(afterOwner).find("\"role\":\"owner\""), std::string::npos) << bodyOf(afterOwner);
 	EXPECT_NE(bodyOf(afterOwner).find("\"ownerProvisioned\":true"), std::string::npos) << bodyOf(afterOwner);
 }
+
+TEST(TwoRoleAuthCore, WebLoginsFromFreshAddressesCannotEvictAnEngagedPinLockout)
+{
+	// Issue #561: the DTMF PIN's unkeyed "" bucket shares the 8-slot table with
+	// the per-client web-login buckets (#530). Eight failed logins from fresh --
+	// spoofable -- addresses used to recycle it and clear the PIN lockout that
+	// guards the remote factory reset.
+	AdminAuth::clearCredential();
+	ASSERT_TRUE(AdminAuth::setDtmfPin("2468"));
+	for (int i = 0; i < 50 && !AdminAuth::isLockedOut(); ++i)
+	{
+		(void)AdminAuth::verifyDtmfPin("1357");
+	}
+	ASSERT_TRUE(AdminAuth::isLockedOut()) << "precondition: the PIN lockout is engaged";
+
+	for (int i = 0; i < static_cast<int>(AdminAuth::kMaxAttemptBuckets) + 2; ++i)
+	{
+		(void)AdminAuth::verifyCredential("admin", "not-the-password",
+			"10.61.0." + std::to_string(i + 1));
+	}
+
+	EXPECT_TRUE(AdminAuth::isLockedOut())
+		<< "web-login buckets must never evict the PIN's lockout";
+	AdminAuth::clearCredential();
+}
