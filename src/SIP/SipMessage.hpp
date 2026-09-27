@@ -108,6 +108,13 @@ public:
 	// #463: when the line already exists it is rewritten IN PLACE (its capacity
 	// reused), so re-stamping a cloned response's capability headers is free.
 	void setHeaderOnce(std::string_view name, std::string_view value);
+	// Drop EVERY line of one header (case-insensitive; no compact form). Returns
+	// how many were removed. Used to keep hop-by-hop credentials (Authorization,
+	// Proxy-Authorization) off a request this PBX relays (#549).
+	size_t removeHeaders(std::string_view name);
+	// The user part of the Request-URI ("600" in "INVITE sip:600@host SIP/2.0");
+	// empty for a response, or a Request-URI with no sip: user part.
+	std::string_view getRequestUriUser() const { return extractNumber(_startLine); }
 	// Pins the SDP payload list to "0 8 101".
 	//
 	// DEPRECATED, and as of ISSUES.md #139 called from NO production path -- only
