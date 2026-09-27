@@ -1279,9 +1279,12 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			// brief intercom auto-answer INVITE so it plays its own tone, then tear
 			// the call back down. Signaling-only: the server sources NO RTP. Bounded
 			// and best-effort — if the beep table is full the beep is simply skipped.
+			// Issue #408: never in the same pass as this REGISTER's 200 OK -- it goes
+			// out from tick() about kAfterRegisterDelay later, once the phone has had
+			// time to finish its own startup.
 			if (isNewBinding)
 			{
-				_beeper.sendBeep(newClient);
+				_beeper.sendBeep(newClient, RegisterBeeper::kAfterRegisterDelay);
 			}
 			if (deviceMac.has_value()) _registrar.markOnline(*deviceMac, true);
 		}
@@ -10065,6 +10068,23 @@ void RequestsHandler::expireTrunkDeadlinesForTest()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 	_sipTrunk.expireDeadlinesForTest();
+}
+
+void RequestsHandler::fireRegisterBeepsForTest()
+{
+	// Same shape as tick(): produce under _mutex, drain, send outside it.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_outbox.clear();
+		_passThroughMsg = nullptr;
+		_beeper.firePendingNowForTest(std::chrono::steady_clock::now());
+		localOutbox = drainOutbox();
+	}
+	for (auto& event : localOutbox)
+	{
+		_onHandled(event.first, std::move(event.second));
+	}
 }
 
 TrunkResolver::Status RequestsHandler::trunkResolveStatusForTest()

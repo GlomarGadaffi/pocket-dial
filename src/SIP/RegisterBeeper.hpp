@@ -50,9 +50,32 @@ class RegisterBeeper
 public:
 	explicit RegisterBeeper(PbxEnv& env) : _env(env) {}
 
-	// Kick off a beep dialog toward a freshly registered phone. Bounded and
-	// best-effort — if the table is full the beep is simply skipped.
-	void sendBeep(const std::shared_ptr<SipClient>& phone);
+	// Issue #408: how long after a REGISTER's 200 OK the register beep goes out.
+	// Sent in the same pass as the 200, it reached phones that had just sent
+	// their REGISTER during their own startup and were not ready for a call yet
+	// (pjsua answers 503 until it is RUNNING; a real handset after a reboot can
+	// be in the same window). Fired from sweep(), i.e. from tick() (<= 1 Hz),
+	// so the real delay is this plus up to one tick.
+	static constexpr std::chrono::milliseconds kAfterRegisterDelay{500};
+
+	// Kick off a beep dialog toward a phone. Bounded and best-effort — if the
+	// table is full the beep is simply skipped. delay 0 sends now (the E911
+	// alert path); a non-zero delay parks the slot as Pending and sweep()
+	// sends it once the delay has passed (the register path, #408).
+	void sendBeep(const std::shared_ptr<SipClient>& phone,
+		std::chrono::milliseconds delay = std::chrono::milliseconds(0));
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#408): send every Pending beep now, whatever its deadline, so a
+	// handler-level test need not wait out kAfterRegisterDelay.
+	void firePendingNowForTest(std::chrono::steady_clock::time_point now)
+	{
+		for (auto& bd : _dialogs)
+		{
+			if (bd.state == BeepState::Pending) fire(bd, now);
+		}
+	}
+#endif
 
 	// Route a 200 OK that belongs to a beep dialog (matched by Call-ID). Returns
 	// true if the response was consumed (the caller must not process it further).
@@ -94,7 +117,9 @@ private:
 	// AwaitingCancelDone: CANCEL sent for an unanswered INVITE, lingering for a
 	// bounded window in case the phone's 200 OK raced the CANCEL (RFC 3261 §9.1) —
 	// handleOk() still matches this state so a raced answer gets ACKed+BYEd.
-	enum class BeepState : uint8_t { Free, AwaitingInviteOk, AwaitingByeOk, AwaitingCancelDone };
+	// Pending (#408): slot claimed, INVITE not sent yet; sweep() sends it at the
+	// deadline. It has no Call-ID yet, so no response can match it.
+	enum class BeepState : uint8_t { Free, Pending, AwaitingInviteOk, AwaitingByeOk, AwaitingCancelDone };
 	struct BeepDialog
 	{
 		BeepState state = BeepState::Free;
@@ -113,6 +138,9 @@ private:
 	};
 
 	BeepDialog* findByCallID(std::string_view callID);
+	// Build and send the INVITE for a claimed slot (its ext/addr already set),
+	// moving it to AwaitingInviteOk with the 5 s answer deadline.
+	void fire(BeepDialog& slot, std::chrono::steady_clock::time_point now);
 	// Free this dialog's INVITE transaction, then clear the slot. EVERY terminal
 	// path must go through here rather than assigning BeepDialog{} directly —
 	// see the definition for why (issue #148).
