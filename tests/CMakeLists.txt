@@ -446,6 +446,8 @@ add_executable(sip_parser_tests
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
     # PcapCapture.hpp has no dependency beyond sockaddr_in.
     PcapCapture_test.cpp
+    # Issue #463 (#284 batch B): the idle tick, OPTIONS ping and header rewrites.
+    IdleTickAlloc_test.cpp
     # Issue #464 (#284 batch C): per-request lookups allocate nothing.
     AllocFreeLookups_test.cpp
     DropProbe_test.cpp

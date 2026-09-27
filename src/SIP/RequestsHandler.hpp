@@ -175,6 +175,10 @@ public:
 	// Issue #424: responses drainOutbox() refused to send because they answered
 	// a response or an ACK. Any non-zero value is a handler bug the guard caught.
 	uint32_t getRepliesRefused() const;
+	// OPTIONS keep-alive pings refused because they would not fit their stack
+	// buffer (#463). Not reachable with a real AOR and IPv4 address; counted so
+	// a clipped request can never go out silently.
+	uint32_t getOptionsPingTruncated() const { return _optionsPingTruncated.load(std::memory_order_relaxed); }
 	size_t getClientCount();
 	size_t getSessionCount();
 	// Legs currently mixed on the meet-me conference (virtual extension 888); 0 while
@@ -381,6 +385,9 @@ public:
 	// the send callback, as tick() would once RegisterBeeper::kAfterRegisterDelay
 	// has passed. Does not depend on tick()'s 1 s gate.
 	void fireRegisterBeepsForTest();
+	// #463: tick() runs at most once a second; this lets a test drive two passes
+	// back to back (the second is the steady-state one an AllocGuard measures).
+	void forceNextTickForTest() { _lastTick = {}; }
 
 	// What the resolver currently knows about the configured SBC host. Refused
 	// means nothing is known and nothing is in flight; anything else means a
@@ -2061,6 +2068,7 @@ private:
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
+	std::atomic<uint32_t> _optionsPingTruncated{0};   // #463: see getOptionsPingTruncated()
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
 	// count is the packet-loss signal this layer exists to absorb, so it is worth
@@ -2094,6 +2102,10 @@ private:
 		uint64_t packetsDropped = 0;
 	};
 	RegistrarSnapshot _snapshot;
+	// #463: tick() refills this in place and swaps its tables into _snapshot, so
+	// an unchanged dashboard costs no allocation. Touched only by tick(), under
+	// _mutex -- never read by anything else.
+	RegistrarSnapshot _snapshotScratch;
 	std::mutex _snapshotMutex;
 
 	// CDR ring buffer (Phase 2) now lives on CdrRing.hpp — data, NVS persistence,
