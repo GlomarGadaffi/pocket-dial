@@ -1318,6 +1318,33 @@ TEST(OtaStatus, ReportsIdleWhenNoUploadInProgress)
 		<< "runningPartition alias must match running:\n" << body;
 }
 
+// #645: with no staged image, POST /api/ota/reboot is a plain restart. It used
+// to answer 409, so the dashboard's confirmed Reboot button could not restart
+// the device. The host's boot and running partitions are both "host", i.e.
+// nothing staged; the admin gate (session + CSRF) must still hold.
+TEST(OtaReboot, NoStagedImageIsAPlainRestartNotA409)
+{
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	AdminSession a = loginAndCompleteSetup(port);
+
+	// Gate still in front: a session without the CSRF token is refused.
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/ota/reboot", "", "pd_session=" + a.cookie)), 403);
+
+	const std::string resp = httpPostRaw(port, "/api/ota/reboot", "", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(resp), 200) << resp;
+	EXPECT_NE(bodyOf(resp).find("\"staged\":false"), std::string::npos) << resp;
+
+	AdminAuth::clearCredential();
+}
+
 TEST(OtaUpdater, ProgressFlagTracksSessionLifecycle)
 {
 	EXPECT_FALSE(OtaUpdater::isUpdateInProgress());

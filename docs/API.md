@@ -323,7 +323,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
 | [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
-| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image. Simulated (`200`, no-op) on desktop. |
+| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts if none is staged (#645). Simulated (`200`, no-op) on desktop. |
 | [`/setup/email`](#get-setupemail) | `GET` | Low | None | Standalone SMTP-configuration page (own document, not part of the `/` SPA). Shell only, no data. |
 | [`/api/email`](#get-apiemail) | `GET` | Medium | Gated | Current SMTP configuration. Secrets redacted to `hasPassword`/`hasGsaKey` booleans. |
 | [`/api/email`](#post-apiemail) | `POST` | High | Gated (+ `X-CSRF`) | Saves SMTP host/port/mode/auth/credentials. Empty `pass`/`gsaKey`/`caPem` keeps the stored value. |
@@ -2486,22 +2486,22 @@ streams past the 16 KB buffered cap; a `413` there would mean the streaming bypa
 regressed) and TC-OTA-04 (`Content-Length: 0` → `411`).
 
 ### `POST /api/ota/reboot`
-Reboots into the image staged by a prior `/api/ota/upload`. ESP32: refuses if there is no pending image (the boot and running partitions already match). Desktop: always returns a simulated success without exiting the process, so the smoke-test harness keeps running.
+Reboots into the image staged by a prior `/api/ota/upload`, or, with nothing staged (the boot and running partitions already match), does a plain restart (#645; this used to be a `409`). Desktop: always returns a simulated success without exiting the process, so the smoke-test harness keeps running.
 
 * Requires Same-Origin Check: Yes
 * Requires `pd_session` cookie: Always (see §0)
 * Build: `ESP_PLATFORM`-guarded, so it is real on `eth`/`lan8720` and simulated only on the host build; see §4.2.
-* Request Headers: None. **No request parameters and no confirmation token**, unlike `/api/factory-reset`; an empty authenticated POST reboots the device. The `409` guard below is the only thing standing between a stray POST and a reboot.
+* Request Headers: None. **No request parameters and no confirmation token**, unlike `/api/factory-reset`; an empty authenticated POST reboots the device. The session and CSRF gates are what stand between a stray POST and a reboot; the dashboard asks for confirmation first.
 * Response Content-Type: `application/json`
 * Response Status Codes:
   * `200 OK`: Reboot scheduled ~1 s out (ESP) or simulated (desktop).
   * `401`/`403`: gates 1-4 as in §0.1.
-  * `409 Conflict` (ESP): `{"error":"no pending OTA image to boot into"}`, the boot partition already equals the running one, i.e. nothing was staged.
 
 #### Response Example (200 OK, ESP32)
 ```json
 {
   "status": "ok",
+  "staged": true,
   "message": "rebooting into the new image..."
 }
 ```
@@ -2510,6 +2510,7 @@ Reboots into the image staged by a prior `/api/ota/upload`. ESP32: refuses if th
 ```json
 {
   "status": "ok",
+  "staged": false,
   "simulated": true,
   "message": "reboot is a no-op on the desktop build"
 }
@@ -2517,14 +2518,15 @@ Reboots into the image staged by a prior `/api/ota/upload`. ESP32: refuses if th
 
 The `"simulated":true` key is present **only** on the desktop response; a real ESP
 reboot response omits it entirely. That is the one reliable way to tell the two apart.
+`staged` is `false` for a plain restart with no OTA image staged (`"message":"rebooting..."` on ESP).
 
 ```bash
 curl -s -X POST "http://$DEV/api/ota/reboot" \
      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF"
 ```
 
-Covered by `test_api.sh` TC-OTA-05 (cross-origin → `403`), TC-OTA-06 (`200` or `409`
-same-origin) and TC-OTA-07 (the desktop stub must not exit the process).
+Covered by `test_api.sh` TC-OTA-05 (cross-origin → `403`), TC-OTA-06 (`200`
+same-origin), the host test `OtaReboot.NoStagedImageIsAPlainRestartNotA409` and TC-OTA-07 (the desktop stub must not exit the process).
 
 ### `GET /setup/email`
 

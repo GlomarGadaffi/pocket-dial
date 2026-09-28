@@ -6582,18 +6582,15 @@ void HttpServer::sendApiOtaStatus(int sock)
 
 void HttpServer::sendApiOtaReboot(int sock)
 {
+	// #645: with no staged image (boot == running partition) this is a plain
+	// restart. It used to answer 409, which left the dashboard's confirmed
+	// Reboot button no way to restart the device. requireAdmin (session + CSRF)
+	// still gates the route. Decided outside the ESP guard so the host tests it.
+	const bool staged = OtaUpdater::bootPartitionLabel() != OtaUpdater::runningPartitionLabel();
+	std::string json = std::string("{\"status\":\"ok\",\"staged\":") + (staged ? "true" : "false");
 #if defined(ESP_PLATFORM)
-	// Only reboot if there is actually a staged image to boot into; otherwise a
-	// stray POST would needlessly bounce the device.
-	if (OtaUpdater::bootPartitionLabel() == OtaUpdater::runningPartitionLabel())
-	{
-		sendResponse(sock, 409, "Conflict", "application/json",
-		             "{\"error\":\"no pending OTA image to boot into\"}");
-		return;
-	}
-
-	sendResponse(sock, 200, "OK", "application/json",
-	             "{\"status\":\"ok\",\"message\":\"rebooting into the new image...\"}");
+	json += staged ? ",\"message\":\"rebooting into the new image...\"}" : ",\"message\":\"rebooting...\"}";
+	sendResponse(sock, 200, "OK", "application/json", json);
 
 	// Defer the restart so the HTTP response flushes first (mirrors the WiFi
 	// connect/mode endpoints' delayed-restart pattern).
@@ -6604,9 +6601,8 @@ void HttpServer::sendApiOtaReboot(int sock)
 #else
 	// Host stub: never actually exit the process (the smoke-test harness keeps
 	// running). Report a simulated success.
-	sendResponse(sock, 200, "OK", "application/json",
-	             "{\"status\":\"ok\",\"simulated\":true,"
-	             "\"message\":\"reboot is a no-op on the desktop build\"}");
+	json += ",\"simulated\":true,\"message\":\"reboot is a no-op on the desktop build\"}";
+	sendResponse(sock, 200, "OK", "application/json", json);
 #endif
 }
 
