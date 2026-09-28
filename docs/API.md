@@ -922,6 +922,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `sessionCount` | Integer | (#539) Number of active calls. Always present, authenticated or not. |
 | `oldestSessionSec` | Integer | (#539) Age in seconds of the oldest active call, 0 when none. Always present; the #401 soak reads it to find a stuck leg without a credential. |
 | `dnd` | Array | Extension numbers (**strings**, not objects) currently in Do-Not-Disturb. |
+| `voicemail` | Array | (#246) Extension numbers (**strings**, not objects) that currently have voicemail enabled. |
 | `forwards` | Array | Per-extension call-forward targets: `{extension, always, busy, noanswer}`. An unset trigger is an empty string, never `null` or a missing key. |
 | `groups` | Array | Ring/hunt groups: `{extension, mode, members}`, where `mode` is `ringall` or `hunt`. |
 | `groups[].members` | String | **A comma-joined string, not an array**, e.g. `"1001,1002,1003"` (`pbx::joinMembers`). Split it on `,` client-side. It round-trips: this is exactly the format [`POST /api/group`](#post-apigroup) accepts back. |
