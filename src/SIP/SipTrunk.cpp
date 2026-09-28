@@ -415,9 +415,13 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	// response to the handset-side paths.
 	if (data->getSource().sin_addr.s_addr != d->peer.sin_addr.s_addr)
 	{
-		_env.log("Trunk: " + std::to_string(status) + " from " + addrToIpPort(data->getSource())
-			+ " dropped -- this dialog's carrier is " + addrToIpPort(d->peer)
-			+ " (" + d->destE164 + ")", true);
+		const uint32_t n = ++_dialogForgedResponses;   // #663: counted; logged at 1, 2, 4, 8, ...
+		if ((n & (n - 1)) == 0)
+		{
+			_env.log("Trunk: " + std::to_string(status) + " from " + addrToIpPort(data->getSource())
+				+ " dropped -- this dialog's carrier is " + addrToIpPort(d->peer)
+				+ " (" + d->destE164 + "; " + std::to_string(n) + " dropped so far)", true);
+		}
 		return true;
 	}
 
@@ -655,8 +659,13 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 	}
 	if (!authorised)
 	{
-		_env.log("Trunk: BYE from " + addrToIpPort(src) + " refused -- this dialog's carrier is "
-			+ addrToIpPort(d->peer) + " and the tags do not match (" + d->destE164 + ")", true);
+		const uint32_t n = ++_dialogRefusedByes;   // #666: counted; logged at 1, 2, 4, 8, ...
+		if ((n & (n - 1)) == 0)
+		{
+			_env.log("Trunk: BYE from " + addrToIpPort(src) + " refused -- this dialog's carrier is "
+				+ addrToIpPort(d->peer) + " and the tags do not match (" + d->destE164 + "; "
+				+ std::to_string(n) + " refused so far)", true);
+		}
 		auto forbidden = _env.messageFromPool(data->toString(), src);
 		if (forbidden)
 		{
@@ -871,8 +880,14 @@ bool SipTrunk::handleRegisterResponse(const std::shared_ptr<SipMessage>& data)
 	// went to may answer it. Consumed either way.
 	if (data->getSource().sin_addr.s_addr != _regPeer.sin_addr.s_addr)
 	{
-		++_regForgedResponses;   // #617: spoofing is countable, not just a log line
-		_env.log("Trunk: REGISTER response from a non-carrier address dropped", true);
+		// #617: spoofing is countable, not just a log line. #663: and logged
+		// only at 1, 2, 4, 8, ... so a flood cannot flood the log.
+		const uint32_t n = ++_regForgedResponses;
+		if ((n & (n - 1)) == 0)
+		{
+			_env.log("Trunk: REGISTER response from a non-carrier address dropped ("
+				+ std::to_string(n) + " so far)", true);
+		}
 		return true;
 	}
 

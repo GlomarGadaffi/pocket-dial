@@ -2031,6 +2031,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// The message pool is process-global, so it reads even with no engine.
 	json.s("\"msgPoolRefusals\":").n(RequestsHandler::getMessagePoolRefusals()).s(",");
 	json.s("\"vpeerPoolRefusals\":").n(handler ? handler->getVirtualPeerRefusals() : 0).s(",");
+	// Issue #663: trunk responses dropped as not from the carrier (#617, #356).
+	json.s("\"trunkForgedRegisterResponses\":").n(handler ? handler->getTrunkForgedRegisterResponses() : 0).s(",");
+	json.s("\"trunkForgedDialogResponses\":").n(handler ? handler->getTrunkForgedDialogResponses() : 0).s(",");
+	json.s("\"trunkRefusedDialogByes\":").n(handler ? handler->getTrunkRefusedDialogByes() : 0).s(",");
 	// #450 / poll #454: false after a factory reset until the E911 notify list is
 	// set again. The dashboard shows a banner; nothing is gated on it.
 	json.s("\"e911Configured\":").b(e911Configured).s(",");

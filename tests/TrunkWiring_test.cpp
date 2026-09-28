@@ -20,16 +20,23 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
+#include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
+#include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
 
 namespace
@@ -935,4 +942,130 @@ TEST(TrunkWiring, TickRegistersTheTrunkAndA401ThroughHandleIsAnswered)
 	EXPECT_NE(signedReg.find("\r\nAuthorization: Digest username=\"15551230000\""),
 		std::string::npos) << signedReg;
 	EXPECT_EQ(b.sent.size(), 1u) << "and nothing else answers the carrier's 401";
+}
+
+// ── Issue #663: the forged-response counters reach /api/status ─────────────
+//
+// SipTrunk_test.cpp pins the counting and the power-of-two logging. This pins
+// that an operator can actually see the counts: both drops arrive through
+// handle(), and /api/status reports each with its own value.
+namespace
+{
+	std::string statusBody(int port)
+	{
+#if defined(_WIN32) || defined(_WIN64)
+		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s == INVALID_SOCKET) return "";
+#else
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0) return "";
+#endif
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(static_cast<uint16_t>(port));
+		inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+		std::string resp;
+		if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
+		{
+			const std::string req = "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+			                        "Connection: close\r\n\r\n";
+			send(s, req.c_str(), static_cast<int>(req.size()), 0);
+			char buf[512];
+			int n;
+			while ((n = recv(s, buf, sizeof(buf), 0)) > 0) resp.append(buf, static_cast<size_t>(n));
+		}
+#if defined(_WIN32) || defined(_WIN64)
+		closesocket(s);
+#else
+		close(s);
+#endif
+		return resp;
+	}
+}
+
+TEST(TrunkWiring, StatusReportsForgedRegisterAndDialogResponseCounts)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	ASSERT_TRUE(b.handler.setTrunkCredentials("s3cret-reg"));
+	b.handler.tick();
+	const std::string reg = b.firstWith("REGISTER sip:");
+	ASSERT_FALSE(reg.empty()) << "tick() must have registered the trunk";
+
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&b.handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	// Positive control: both fields are there, at zero, before anything is forged.
+	std::string status = statusBody(port);
+	EXPECT_NE(status.find("\"trunkForgedRegisterResponses\":0,"), std::string::npos) << status;
+	EXPECT_NE(status.find("\"trunkForgedDialogResponses\":0,"), std::string::npos) << status;
+
+	// Two forged answers to our REGISTER...
+	const std::string regOk =
+		"SIP/2.0 200 OK\r\n"
+		"Via: " + CarrierView::field(reg, "Via: ") + "\r\n"
+		"From: " + CarrierView::field(reg, "From: ") + "\r\n"
+		"To: " + CarrierView::field(reg, "To: ") + ";tag=reg-tag\r\n"
+		"Call-ID: " + CarrierView::field(reg, "Call-ID: ") + "\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"Expires: 3600\r\n"
+		"Content-Length: 0\r\n\r\n";
+	for (int i = 0; i < 2; ++i)
+	{
+		b.handler.handle(RequestsHandler::getMessageFromPool(regOk, addrFor(kForgerIp)));
+	}
+
+	// ...and three forged answers to a trunk call's INVITE.
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	for (int i = 0; i < 3; ++i)
+	{
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", true), addrFor(kForgerIp)));
+	}
+
+	status = statusBody(port);
+	EXPECT_NE(status.find("\"trunkForgedRegisterResponses\":2,"), std::string::npos) << status;
+	EXPECT_NE(status.find("\"trunkForgedDialogResponses\":3,"), std::string::npos) << status;
+}
+
+// Issue #666: BYEs refused by the #356 check show in /api/status too.
+TEST(TrunkWiring, StatusReportsRefusedDialogByes)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&b.handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	// Positive control: the field is there, at zero, before any BYE.
+	std::string status = statusBody(port);
+	EXPECT_NE(status.find("\"trunkRefusedDialogByes\":0,"), std::string::npos) << status;
+
+	CarrierView forger = carrier;
+	forger.toTag = "guessed";
+	b.sent.clear();
+	// Two distinct BYEs (own branch and CSeq): an identical resend is a
+	// retransmission, answered without reaching the #356 check again.
+	for (int i = 0; i < 2; ++i)
+	{
+		std::string bye = forger.bye();
+		bye.replace(bye.find("z9hG4bKcarrierbye"), 17, "z9hG4bKforgedbye" + std::to_string(i));
+		bye.replace(bye.find("CSeq: 2 BYE"), 11, "CSeq: " + std::to_string(2 + i) + " BYE");
+		b.handler.handle(RequestsHandler::getMessageFromPool(bye, addrFor(kForgerIp)));
+	}
+	ASSERT_EQ(b.countWithTo("403", kForgerIp), 2u);
+
+	status = statusBody(port);
+	EXPECT_NE(status.find("\"trunkRefusedDialogByes\":2,"), std::string::npos) << status;
 }

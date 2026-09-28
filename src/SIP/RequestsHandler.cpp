@@ -1438,11 +1438,10 @@ namespace
 	// handled, because nothing in src/ reads that header. Kept per #229's
 	// scope call rather than withdrawn, since the REFER usage is real.
 	//
-	// NOT "timer": docs/FEATURE_ROADMAP.md calls the RFC 4028 support "passive —
-	// honours a timer a phone requests, but never requests one itself and never
-	// sends 422/Min-SE". §5 and §6 make Min-SE processing and the 422 response
-	// mandatory for an entity that advertises the extension, and neither exists
-	// here (getMinSESecs() has no caller), so advertising it would be a lie.
+	// NOT "timer": the RFC 4028 support is passive -- it honours a timer a phone
+	// requests but never requests one itself. Since #591 an initial INVITE whose
+	// Session-Expires is too small gets 422 + Min-SE (onInvite reads
+	// getMinSESecs()), but the rest of #198 is still open, so the tag stays off.
 	// NOT "100rel" (RFC 3262 needs PRACK), "norefersub", "path", "gruu" or
 	// "outbound" — none of them have any implementation in this codebase.
 	constexpr const char* kSupportedOptionTags = "replaces";

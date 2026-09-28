@@ -888,7 +888,8 @@ TEST(SipTrunkSource, ForgedResponsesChangeNothingInAnyState)
 	EXPECT_TRUE(trunk.handleResponse(responseFrom(ok, kForgerIp)));
 	EXPECT_EQ(trunk.activeDialogs(), 1u) << "still waiting on the carrier's own 200";
 
-	EXPECT_EQ(logsContaining(env, "dropped"), 4u) << "one line per refused response";
+	EXPECT_EQ(trunk.forgedDialogResponses(), 4u) << "every refused response is counted";
+	EXPECT_EQ(logsContaining(env, "dropped"), 3u) << "#663: logged at counts 1, 2 and 4 only";
 }
 
 TEST(SipTrunkSource, ByeFromThePeerIsAccepted)
@@ -1643,4 +1644,80 @@ TEST(SipTrunkRegister, AForgedRegisterResponseIsCounted)
 	ASSERT_TRUE(trunk.handleResponse(responseFor(ok)));
 	EXPECT_EQ(trunk.forgedRegisterResponses(), 1u);
 	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registered);
+}
+
+// Issue #663: both drops are counted, and each logs only when its count reaches
+// a power of two, so a spoofing flood costs log lines logarithmically. Five
+// drops: counted 5, logged at 1, 2 and 4.
+TEST(SipTrunkSource, ForgedDialogResponsesLogOnlyAtPowersOfTwo)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string ringing = withStatus(okFor(*d), "SIP/2.0 180 Ringing");
+	env.logs.clear();
+
+	for (int i = 0; i < 5; ++i)
+	{
+		EXPECT_TRUE(trunk.handleResponse(responseFrom(ringing, kForgerIp)));
+	}
+	EXPECT_EQ(trunk.forgedDialogResponses(), 5u);
+	EXPECT_EQ(logsContaining(env, "dropped"), 3u) << "one line at 1, 2 and 4 each";
+	EXPECT_EQ(logsContaining(env, "; 1 dropped so far"), 1u);
+	EXPECT_EQ(logsContaining(env, "; 2 dropped so far"), 1u);
+	EXPECT_EQ(logsContaining(env, "; 4 dropped so far"), 1u);
+	EXPECT_EQ(logsContaining(env, "; 3 dropped so far"), 0u);
+	EXPECT_EQ(logsContaining(env, "; 5 dropped so far"), 0u);
+}
+
+// Issue #666: the #356 BYE refusal gets the same treatment. Five refused BYEs:
+// each answered 403, counted 5, logged at 1, 2 and 4.
+TEST(SipTrunkSource, RefusedByesAreCountedAndLogOnlyAtPowersOfTwo)
+{
+	Answered a;
+	for (int i = 0; i < 5; ++i)
+	{
+		a.env.sent.clear();
+		ASSERT_TRUE(a.trunk.handleBye(carrierByeFrom(a.dialog(), kForgerIp, "wrong", "wrong")));
+		ASSERT_EQ(a.env.sent.size(), 1u);
+		EXPECT_EQ(firstLine(a.env.sentRaw(0)), "SIP/2.0 403 Forbidden") << "BYE " << i + 1;
+	}
+	EXPECT_EQ(a.trunk.refusedDialogByes(), 5u);
+	EXPECT_EQ(logsContaining(a.env, "refused"), 3u) << "one line at 1, 2 and 4 each";
+	EXPECT_EQ(logsContaining(a.env, "; 4 refused so far"), 1u);
+	EXPECT_EQ(logsContaining(a.env, "; 3 refused so far"), 0u);
+	EXPECT_EQ(logsContaining(a.env, "; 5 refused so far"), 0u);
+
+	// Control: the carrier's own BYE is accepted and not counted.
+	a.env.sent.clear();
+	ASSERT_TRUE(a.trunk.handleBye(carrierByeFrom(a.dialog(), kSbcIp, "carrier-tag", a.ourTag)));
+	EXPECT_EQ(firstLine(a.env.sentRaw(0)), "SIP/2.0 200 OK");
+	EXPECT_EQ(a.trunk.refusedDialogByes(), 5u);
+}
+
+TEST(SipTrunkRegister, ForgedRegisterResponsesLogOnlyAtPowersOfTwo)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+	trunk.tickRegistration(steadyMs(), sbcAddr());
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string ok = regResponse(env.sentRaw(0), "SIP/2.0 200 OK", "Expires: 3600\r\n");
+	env.logs.clear();
+
+	sockaddr_in forger = sbcAddr();
+	forger.sin_addr.s_addr = inet_addr("198.51.100.7");   // TEST-NET-2
+	for (int i = 0; i < 5; ++i)
+	{
+		EXPECT_TRUE(trunk.handleResponse(std::make_shared<SipMessage>(ok, forger)));
+	}
+	EXPECT_EQ(trunk.forgedRegisterResponses(), 5u);
+	EXPECT_EQ(logsContaining(env, "REGISTER response from a non-carrier address"), 3u)
+		<< "one line at 1, 2 and 4 each";
+	EXPECT_EQ(logsContaining(env, "(4 so far)"), 1u);
+	EXPECT_EQ(logsContaining(env, "(5 so far)"), 0u);
 }

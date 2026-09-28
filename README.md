@@ -37,11 +37,11 @@ Yealink T29 registered to a bench board placed a call that rang through to carri
 voicemail, and a second that was answered with two-way audio.
 
 That is also the honest limit of the hardware evidence. One handset model, one
-board, one carrier. Everything else in the test suite is host-side: ~1190 GoogleTest
+board, one carrier. Everything else in the test suite is host-side: ~1580 GoogleTest
 cases (static `TEST`/`TEST_F` count, re-measure rather than trust this) plus real-SIP-stack interop (pjsua, SIPp) against the **desktop** binary.
 On-device RTP has no automated coverage — `RtpSender`/`RtpReceiver` compile to host
-stubs, so the green media tests exercise stubs, not silicon. OTA has never been
-exercised end to end. See [docs/PHONE_COMPATIBILITY.md](docs/PHONE_COMPATIBILITY.md)
+stubs, so the green media tests exercise stubs, not silicon. OTA has been
+exercised end to end once, by the staged remote OTA tool (#491). See [docs/PHONE_COMPATIBILITY.md](docs/PHONE_COMPATIBILITY.md)
 for what has actually been tried.
 
 ---
@@ -104,19 +104,12 @@ forward on always / busy / no-answer · per-extension DND · paging zones
 RFC 4235 dialog events) · DTMF star codes over SIP INFO, and over RFC 4733
 telephone-event on server-terminated legs.
 
-Three of those need an asterisk before you design around them:
-
-- **Blind transfer currently moves the wrong party.** On a `REFER` the PBX sends `BYE`
-  to the party being transferred and re-INVITEs the **transferor** to the target
-  (`RequestsHandler.cpp:4459`, `:4471`). For the commonest real shape — a receptionist
-  transferring an inbound caller — the customer is hung up on and the receptionist is
-  dialled through to the target, while the receptionist's phone reports success. This is
-  [#197](https://github.com/GlomarGadaffi/pocket-dial/issues/197); a fix is in flight.
-  Attended transfer and call forwarding are not affected — both move the correct leg.
+Two of those need an asterisk before you design around them:
 
 - **Session timers are passive.** The board honours a `Session-Expires` a phone
-  asks for and drops the call when it lapses, but it never requests one itself and
-  never answers `422`/`Min-SE`. It deliberately leaves `timer` out of its
+  asks for and drops the call when it lapses, but it never requests one itself. It
+  answers an initial INVITE whose `Session-Expires` is below 90 s with `422` and
+  `Min-SE` (#591). It deliberately leaves `timer` out of its
   `Supported` header, because RFC 4028 §5–6 make `Min-SE` handling and the `422`
   mandatory for anything that claims the extension. A phone that asks for no timer
   gets no dead-peer detection from the board.
@@ -168,11 +161,10 @@ panel (`F6`) for uploading and previewing the hold-music clip, dual-slot OTA
 updates with rollback, a Prometheus-style **`GET /metrics`** endpoint, and
 zero-touch phone provisioning over `GET /config/<mac>.cfg`.
 
-> Not every read endpoint is behind the login. `/api/status`, `/api/cdr`,
+> Not every read endpoint is behind the login. `/api/status`,
 > `/metrics`, `/api/ota/status`, `/api/wifi/scan`, `/api/admin/status` and
 > `GET /config/<mac>.cfg` all answer without a session — see
-> [THREAT_MODEL.md §4 E-2](docs/THREAT_MODEL.md). `/api/cdr` in particular hands
-> the recent call log to any host that can reach the board.
+> [THREAT_MODEL.md §4 E-2](docs/THREAT_MODEL.md).
 
 ---
 
@@ -208,26 +200,31 @@ There is no transcoding, and none is planned. See [docs/RTP.md](docs/RTP.md).
 
 ## Outside lines
 
-pocket-dial reaches the public network through a **call-control API**, not a SIP
-trunk. The shipping client speaks the 3CX Call Control API: OAuth2, a WebSocket for
+pocket-dial reaches the public network through a **SIP trunk** or a **call-control
+API**. A dial-plan `trunk` rule uses the SIP trunk when its configuration is valid,
+otherwise the call-control client. Configure the trunk at `/setup/trunk` (#362). The
+call-control client speaks the 3CX Call Control API: OAuth2, a WebSocket for
 call control, and PCM16 audio over chunked HTTPS. Configure it under
-**Interconnect** on the dashboard, then point a dial-plan `trunk` rule at it.
+**Interconnect** on the dashboard.
 
 Two consequences worth knowing before you plan around it:
 
-- **The box never registers to an ITSP.** Nothing in the tree sends a SIP `REGISTER`
-  as a client, so it cannot connect to a generic SIP carrier today. That is
-  [#164](https://github.com/GlomarGadaffi/pocket-dial/issues/164).
+- **The SIP trunk registers only with a password.** A trunk with a password sends
+  `REGISTER` to the carrier and answers a `401`/`407` with digest (#615); an
+  IP-authenticated trunk does not register. Outbound calls over the trunk are still
+  under investigation: the carrier accepts the `REGISTER` but does not answer the
+  `INVITE` ([#618](https://github.com/GlomarGadaffi/pocket-dial/issues/618)).
 - **One outside call at a time on default firmware — up to four with a real trunk.**
   `POCKETDIAL_MAX_ANCHOR_CALLS` is **4** (it was raised from 1 once the 3CX client landed
   and the single-call path was proven on the bench). The effective ceiling is
   `min(provider, 4)`: the `LoopbackAnchorClient` that ships by default declares **1**,
   because its participant id is a constant, so a stock board still gets one. The 3CX
   `TelephonyAnchorClient` declares 4 — the limit there is the ESP32-S3's software ECDHE,
-  not RAM or sockets. The fifth call is refused `503`.
+  not RAM or sockets. The fifth call is refused `503`. The SIP trunk has its own cap,
+  `POCKETDIAL_MAX_TRUNK_CALLS` = **2**.
 
-There is also no E.164 normalisation anywhere — `+15551234567`, `15551234567` and
-`5551234567` are three different destinations to the dial plan and the call log.
+E.164 normalisation covers DID matching only (#165): the dial plan and the call log
+still treat differently written forms of one number as different destinations.
 
 ---
 
@@ -270,7 +267,7 @@ only the dashboard — not SIP or RTP. The reasoning is in
 
 ## What it deliberately does not do
 
-No voicemail, no IVR or auto-attendant, no call recording, no queues or ACD, no
+No IVR or auto-attendant, no call recording, no queues or ACD, no
 time-based routing, no MWI, no fax, no video, no multi-tenancy.
 
 Music on hold *was* on that list and no longer is: a G.711 clip on the SD card now

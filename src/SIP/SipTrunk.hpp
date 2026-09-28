@@ -2,6 +2,7 @@
 #define SIP_TRUNK_HPP
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -410,7 +411,14 @@ public:
 	const SipRegistrationClient& registration() const { return _reg; }
 	// #617: REGISTER responses dropped because they came from an address other
 	// than the one the REGISTER went to.
-	uint32_t forgedRegisterResponses() const { return _regForgedResponses; }
+	uint32_t forgedRegisterResponses() const { return _regForgedResponses.load(std::memory_order_relaxed); }
+	// #663: dialog responses dropped for not coming from the dialog's peer
+	// (#356). Both counters are read by /api/status from the HTTP task, hence
+	// atomic; each drop logs only at a power-of-two count, so a flood cannot
+	// flood the log.
+	uint32_t forgedDialogResponses() const { return _dialogForgedResponses.load(std::memory_order_relaxed); }
+	// #666: BYEs refused with 403 by handleBye()'s #356 check. Same shape.
+	uint32_t refusedDialogByes() const { return _dialogRefusedByes.load(std::memory_order_relaxed); }
 
 	// Test/diagnostic accessors. Cheap linear scans over a fixed array.
 	size_t activeDialogs() const;
@@ -480,7 +488,9 @@ private:
 	SipRegistrationClient::Request _regReq{};
 	sockaddr_in                    _regPeer{};
 	bool                           _regLive = false;
-	uint32_t                       _regForgedResponses = 0;
+	std::atomic<uint32_t>          _regForgedResponses{0};
+	std::atomic<uint32_t>          _dialogForgedResponses{0};
+	std::atomic<uint32_t>          _dialogRefusedByes{0};
 
 	Listener* _listener = nullptr;
 	std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS> _dialogs{};
