@@ -16,6 +16,7 @@
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include <lwip/inet.h>
+#include "UdpRcvBuf.hpp"    // Issue #496: per-socket receive cap
 #else
 #include <cstdlib>
 // inet_addr / htons live here off-device; lwip/inet.h supplies them on the board.
@@ -482,6 +483,12 @@ bool HoldMusic::start()
 
 	_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (_sock < 0) return false;
+	// Issue #496 / #509 review: send-only, never read -- queue nothing, or a
+	// flood at this port would sit in the mailbox for the socket's life.
+	if (!udprcvbuf::set(_sock, udprcvbuf::kSendOnly))
+	{
+		ESP_LOGE("HoldMusic", "SO_RCVBUF(0) failed: unread receive queue is UNBOUNDED");
+	}
 
 	sockaddr_in bindAddr{};
 	bindAddr.sin_family = AF_INET;

@@ -294,6 +294,35 @@ To prevent Cross-Site Request Forgery (CSRF), the server implements a **Same-Ori
 * If they do not match, the request is immediately rejected with `403 Forbidden` (`{"error":"cross-origin request rejected"}`).
 * No wildcard `Access-Control-Allow-Origin: *` headers are ever returned on API routes, preventing cross-origin browser reads of active registration profiles.
 
+### UDP Receive Memory: IPv4 Reassembly and Per-Socket Caps (Issues #496, #509)
+IPv4 reassembly is on (`CONFIG_LWIP_IP4_REASSEMBLY=y`), so a SIP message over 1,472 B is no longer dropped by lwIP. lwIP holds received datagrams **before** any of this firmware's code runs, so the token bucket below cannot bound that memory. It is bounded in two stages:
+* **In flight:** an incomplete datagram is freed after `IP_REASS_MAXAGE` = 3 s, and `LWIP_IP_REASS_MAX_PBUFS` = 10 caps the fragments held at once (~16 KB, global).
+* **Completed:** a finished datagram sits in its socket's recvmbox until read. The mailbox caps only the *count* (`CONFIG_LWIP_UDP_RECVMBOX_SIZE`: 32, or 6 on the constrained profile). `CONFIG_LWIP_SO_RCVBUF=y` plus a per-socket `SO_RCVBUF` (`src/Helpers/UdpRcvBuf.hpp`) caps the queued payload bytes:
+  * SIP: 32 KB, or 16 KB on the constrained profile.
+  * Each RTP receive leg: 8 KB. The captive-portal DNS server (SoftAP builds): 4 KB.
+  * Sockets that are only ever sent on (`RtpSender`, `HoldMusic`, the connected Syslog socket): 0.
+  * lwIP's default cap is `INT_MAX`, so the `setsockopt` is what bounds it. A failure is logged at boot or call start as `SO_RCVBUF(...) failed ... UNBOUNDED` (Syslog's is silent: it cannot log). `UdpRcvBuf.hpp` refuses to compile reassembly without `SO_RCVBUF`.
+* **The IPv4 input guard (#509 review).** `SO_RCVBUF` counts the IP payload *after* `ip4_input()` trims the pbuf, but what a received pbuf pins is the driver's buffer: a `malloc` of the frame as received, wrapped as a `PBUF_REF` custom pbuf that `pbuf_realloc` cannot shrink. `ip_reass()` chains fragments without copying. Without a guard, ten 1,514 B frames each padded around ~72 B of IP payload passed a 32 KB cap while pinning ~15 KB per datagram (~500 KB per socket). `LWIP_HOOK_IP4_INPUT` (`main/pd_lwip_hooks.c`; decision in `src/Helpers/Ip4InputGuard.h`; wired through `ESP_IDF_LWIP_HOOK_FILENAME` in the top-level `CMakeLists.txt`) runs before the trim and:
+  * **drops** a frame longer than max(IP length, 46) + 4 B, because Ethernet pads to 46 B of payload and never further;
+  * **drops** a non-final fragment carrying under 256 B of payload. Senders fragment at the path MTU, so this is the cheapest overhead multiplier against the byte cap. It is rare legitimately, though a router re-fragmenting onto a smaller MTU can produce one, and that datagram is lost and counted;
+  * passes everything else untouched, with no copy. Both Ethernet drivers (W5500, ESP32 EMAC) and IDF's dynamic Wi-Fi RX buffers allocate the frame's own length, so once padding is refused, what a pbuf pins tracks what `SO_RCVBUF` counts.
+
+  Drops since boot are in `/api/status` `ip4Guard` (`padded`, `tinyFragments`), and the first of each kind is logged once. `tools/check_lwip_ip4_hook.cmake` fails every ESP build unless lwIP's `ip4.c` object references `pd_ip4_input_hook`, i.e. unless the hook really is compiled into `ip4_input()`.
+
+Worst-case lwIP-held RAM, per socket, while its reader is stalled. On Ethernet a queued fragment pins its frame plus ~50 B of pbuf and heap overhead. A non-final fragment is at least 290 B on the wire, so what is pinned is at most ~1.33x what `SO_RCVBUF` counts:
+
+| Socket | `main` (no reassembly) | Reassembly, caps, no guard | With caps + guard |
+|---|---|---|---|
+| SIP, 32-entry mailbox (S3 eth/wifi, ESP32 lan8720) | ~50 KB | ~500 KB (padded fragments) | **~42 KB** (32 KB cap x 1.33) |
+| SIP, constrained (6-entry mailbox, no PSRAM) | ~9.4 KB | ~94 KB | **~21 KB** |
+| RTP receive leg (up to 14: 4 anchor, 2 voicemail, 4 trunk, 4 conference) | ~50 KB each (~9.4 KB constrained) | ~500 KB each | **~11 KB** each (~9.4 KB constrained) |
+| `RtpSender` / `HoldMusic` / Syslog (never read) | ~50 KB each, for the socket's life | 0-length datagrams only | **~3.5 KB** each (32 empty datagrams of ~110 B; see below) |
+| Reassembly in flight (global) | 0 | ~16 KB | **~15 KB** (10 frames) |
+
+* `SO_RCVBUF` = 0 still admits a **0-length** datagram, because lwIP compares `recv_avail + len > recv_bufsize`. On Ethernet each one pins only its own minimum frame, hence ~3.5 KB for a full mailbox. On Wi-Fi each pins a driver RX buffer, which any small datagram can already do on `main` (#78). Connecting those sockets to their peer would close this gap and is a follow-up.
+* The constrained profile's SIP socket can hold ~11 KB more than on `main`. That is the price of accepting one maximum-size reassembled datagram, so that #468 counts it instead of it vanishing.
+* `SO_RCVBUF` refusals themselves are not counted: lwIP frees the datagram in `recv_udp` with no hook. The guard's counts cover the hostile shapes.
+
 ### Per-Source-IP Token Bucket Rate Limiting (Issue #38)
 To protect the registrar from UDP flood denial-of-service (DoS) attacks, the `RequestsHandler` integrates a thread-safe token bucket rate limiter:
 * Sustained/burst thresholds: UDP packets are evaluated using a per-source IP token bucket with a default burst depth of **40 packets** and a sustained replenishment rate of **20 packets per second**.

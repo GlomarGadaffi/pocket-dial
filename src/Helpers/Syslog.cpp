@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "UdpRcvBuf.hpp"   // Issue #496 / #509 review
 #endif
 
 namespace
@@ -283,6 +284,17 @@ namespace Syslog
 		if (fd < 0)
 		{
 			return false;   // no ESP_LOGx here — see the RE-ENTRANCY RULE
+		}
+
+		// Issue #496 / #509 review: this socket is only ever sent on, and a
+		// connected UDP socket still queues whatever its peer sends back.
+		// Queue nothing -- set BEFORE connect(), so the socket is never live
+		// uncapped. A failure is not logged (see the RE-ENTRANCY RULE); it is
+		// refused the same way a failed connect() is.
+		if (!udprcvbuf::set(fd, udprcvbuf::kSendOnly))
+		{
+			close(fd);
+			return false;
 		}
 
 		// connect() on a UDP socket only fixes the default peer for send(): no

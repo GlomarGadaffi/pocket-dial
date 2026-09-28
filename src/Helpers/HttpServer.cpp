@@ -83,6 +83,8 @@
 // Issue #185: heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) for
 // sendApiStatus's minFreeHeapSpiram field.
 #include "esp_heap_caps.h"
+// Issue #496 / #509 review: the IPv4 input guard's counts for /api/status.
+#include "Ip4InputGuard.h"
 // Issue #366: esp_pthread_set_cfg() to size the per-connection thread stack
 // independently of CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT.
 #include "esp_pthread.h"
@@ -1971,6 +1973,15 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		json.s("\"emergencyRoute\":\"").s(emergencyRoute).s("\",");
 	}
 	json.s("\"uptime\":").n(uptimeSec).s(",");
+#if defined(ESP_PLATFORM)
+	// Issue #496 / #509 review: frames and fragments the IPv4 input guard
+	// (Ip4InputGuard.h) dropped since boot.
+	{
+		uint32_t g[2] = {0, 0};
+		pd_ip4_guard_counts(g);
+		json.s("\"ip4Guard\":{\"padded\":").n(g[0]).s(",\"tinyFragments\":").n(g[1]).s("},");
+	}
+#endif
 	// #470: CDR ring persist health. A non-zero failure count means call history
 	// is NOT surviving reboots; suppressed counts writes refused mid-reset (#473).
 	json.s("\"cdrPersistFailures\":").n(CdrRing::persistFailureCount()).s(",");
