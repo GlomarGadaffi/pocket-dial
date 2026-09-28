@@ -1055,9 +1055,14 @@ TEST(TrunkWiring, StatusReportsRefusedDialogByes)
 	CarrierView forger = carrier;
 	forger.toTag = "guessed";
 	b.sent.clear();
+	// Two distinct BYEs (own branch and CSeq): an identical resend is a
+	// retransmission, answered without reaching the #356 check again.
 	for (int i = 0; i < 2; ++i)
 	{
-		b.handler.handle(RequestsHandler::getMessageFromPool(forger.bye(), addrFor(kForgerIp)));
+		std::string bye = forger.bye();
+		bye.replace(bye.find("z9hG4bKcarrierbye"), 17, "z9hG4bKforgedbye" + std::to_string(i));
+		bye.replace(bye.find("CSeq: 2 BYE"), 11, "CSeq: " + std::to_string(2 + i) + " BYE");
+		b.handler.handle(RequestsHandler::getMessageFromPool(bye, addrFor(kForgerIp)));
 	}
 	ASSERT_EQ(b.countWithTo("403", kForgerIp), 2u);
 
