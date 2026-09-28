@@ -442,6 +442,10 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #479: the boot-built conference room, so a test can make its driver fail.
+	ConferenceRoom* conferenceForTest() { return _conference.get(); }
+	// #479: as a POCKETDIAL_CONFERENCE=0 build, which never builds the room.
+	void dropConferenceForTest() { _conference.reset(); }
 	// #604: one RTP packet arriving on a trunk call's carrier or handset leg,
 	// through the same dispatchRaw() the receive task calls. False if not relayed.
 	bool trunkRtpForTest(const std::string& callID, bool fromCarrier)
@@ -684,6 +688,28 @@ public:
 		return {};
 	}
 
+	// Test-only (#533): make `ext` look silent for `idle`, then run the client sweep.
+	void idleClientAndSweepForTest(const std::string& ext, std::chrono::seconds idle)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (auto c = findClient(ext)) c.value()->setLastActiveTimeForTest(std::chrono::steady_clock::now() - idle);
+		sweepExpired();
+	}
+	// Test-only (#603 review): expire `ext`'s registration lease, then run the sweep.
+	void expireLeaseAndSweepForTest(const std::string& ext)
+	{
+		// Same shape as tick(): produce under _mutex, drain, send outside it, so
+		// the BYEs endCall() enqueues actually leave.
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			_passThroughMsg = nullptr;
+			if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
+			sweepExpired();
+			localOutbox = drainOutbox();
+		}
+		for (auto& event : localOutbox) _onHandled(event.first, std::move(event.second));
+	}
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned)
 	{

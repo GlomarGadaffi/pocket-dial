@@ -350,6 +350,9 @@ TEST(ConferenceRoom, RoomIsBoundedAndOneCallIdOwnsOneLeg)
 
 	// A retransmitted INVITE must not burn a second port for the same dialog.
 	EXPECT_TRUE(room.leave("call-0"));
+	// #479: MixBus::MAX_PORTS == MAX_LEGS, so no spare port: the freed one is
+	// Draining until the next mix tick reclaims it (the driver's 20 ms tick).
+	room.bus().tick();
 	ASSERT_GE(room.join("dup", "150", "127.0.0.1", 14500), 0);
 	EXPECT_LT(room.join("dup", "150", "127.0.0.1", 14500), 0);
 	EXPECT_EQ(room.legCount(), ConferenceRoom::MAX_LEGS);

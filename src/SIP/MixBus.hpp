@@ -2,7 +2,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include "PlayoutBuffer.hpp"   // pocket-dial's existing ring (src/SIP/PlayoutBuffer.hpp)
+#include "PoolConfig.hpp"     // POCKETDIAL_CONF_LEGS (#479)
+#include "PlayoutBuffer.hpp"  // pocket-dial's existing ring (src/SIP/PlayoutBuffer.hpp)
 
 // ── Conference mix bus ───────────────────────────────────────────────────────
 // The summing junction. Sits between the decode edge (RtpReceiver / anchor rx)
@@ -19,7 +20,9 @@ class MixBus
 {
 public:
     static constexpr int FRAME     = 160;  // samples/tick; MUST equal RTP ptime (20 ms @ 8 kHz)
-    static constexpr int MAX_PORTS = 8;
+    // #479: one port per conference leg. Every port carries two rings, fixed with the
+    // room at boot, so unused ports were pure internal DRAM on a no-PSRAM build.
+    static constexpr int MAX_PORTS = POCKETDIAL_CONF_LEGS;
 
     MixBus() = default;
 

@@ -1217,6 +1217,40 @@ TEST(AnchorRouting, TheHandsetsAckDisarmsTheAnchorAckDeadline)
 	}
 }
 
+TEST(AnchorRouting, AMissedKeepaliveDoesNotPruneAPhoneThatIsInACall)
+{
+	// Issue #533 (#451 X1 on .244): a handset that did not answer the board's
+	// OPTIONS pings mid-call was pruned 15 s after its last SIP packet, and the
+	// sweep erased its anchored call with no endCall() and no BYE. The orphan
+	// reaper then dropped the leg; the phone kept a dead call and its BYE drew
+	// 404. RTP is not SIP activity, so a live call must not be swept this way.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeRegister("502", "192.168.9.52", "reg-502"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-533-ka"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-533-ka").has_value());
+
+	handler.idleClientAndSweepForTest("501", std::chrono::seconds(20));
+	EXPECT_TRUE(handler.getSession("Call-ID: anchor-533-ka").has_value())
+		<< "a phone in a call must not be pruned for a missed keepalive";
+
+	// Positive control: a silent phone with no call is still pruned.
+	handler.idleClientAndSweepForTest("502", std::chrono::seconds(20));
+	handler.forceNextTickForTest();   // getActiveClients() reads the tick snapshot
+	handler.tick();
+	bool still502 = false;
+	for (const auto& [number, address] : handler.getActiveClients())
+	{
+		(void)address;
+		if (number == "502") still502 = true;
+	}
+	EXPECT_FALSE(still502) << "an idle phone with no call is still swept";
+}
+
 TEST(AnchorRouting, AnAnchorCallWhoseHandsetGoesSilentIsEndedButNeverWhileHeld)
 {
 	// Issue #604: with no BYE and (after #603) no keepalive prune, a dead phone

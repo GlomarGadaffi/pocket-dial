@@ -1,0 +1,2 @@
+# ResetJournal_test.cpp: AFailedWriteLeavesThePreviousRecordNotAClean, AFullSectorStillRecordsTheNewestReset; FactoryResetSecrets_test.cpp: AFailedAdminCredentialEraseIsJournalledAsKAdmin (#595)
+3

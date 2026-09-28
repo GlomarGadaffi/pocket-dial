@@ -266,11 +266,16 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 						// whose partition table predates #382 has no coredump partition.
 						// Outside the platform guard, so the host suite can pin it.
 						(void)CoreDumpStore::erase();
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 						// #473: the guard and journal were opened at the top of this
 						// branch. Drain in-flight writes, erase (checked), then close
-						// the journal with the result.
-						(void)resetguard::waitForWritersIdle(500);
+						// the journal with the result. #594: a timed-out drain is
+						// logged, as the HTTP door does; the reset still proceeds.
+						// Outside the platform guard so the host suite pins the WARN.
+						if (!resetguard::waitForWritersIdle(500))
+						{
+							_env.log("[admin] factory reset: an NVS writer was still busy after 500 ms; erasing anyway", true);
+						}
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 						{
 							const esp_err_t eraseErr = nvs_flash_erase();
 							resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
