@@ -33,7 +33,8 @@ TEST(DashboardRosterText, LoggedOutTheBoardCountsPhonesAndTheCallLogAsksForLogin
 	const std::string board = functionBody(p, "function renderBoard(d){");
 	ASSERT_FALSE(board.empty());
 	EXPECT_NE(board.find("d.rosterVisible===false"), std::string::npos) << board;
-	EXPECT_NE(board.find("phones registered. Log in to see them."), std::string::npos);
+	EXPECT_NE(board.find("' registered. Log in to see them.'"), std::string::npos);
+	EXPECT_NE(board.find("d.clientCount===1?' phone'"), std::string::npos) << "1 phone, not 1 phones";
 
 	const std::string rail = functionBody(p, "function updateRail(d){");
 	ASSERT_FALSE(rail.empty());
@@ -42,6 +43,7 @@ TEST(DashboardRosterText, LoggedOutTheBoardCountsPhonesAndTheCallLogAsksForLogin
 
 	const std::string cdr = functionBody(p, "function fetchCdr(){");
 	ASSERT_FALSE(cdr.empty());
-	EXPECT_NE(cdr.find("r.ok"), std::string::npos) << cdr;
+	// #637 review: only a 401 means "log in"; a boot-time 503 must not say so.
+	EXPECT_NE(cdr.find("r.status===401"), std::string::npos) << cdr;
 	EXPECT_NE(cdr.find("Log in to view the call log"), std::string::npos) << cdr;
 }

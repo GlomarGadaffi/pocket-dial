@@ -1,0 +1,2 @@
+# AnchorWedge_test.cpp: 2 (#667: a ringing outbound anchor leg is not a #100 wedge)
+2

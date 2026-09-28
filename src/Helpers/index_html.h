@@ -1018,7 +1018,7 @@ function renderBoard(d){
       +'<span class="label">'+esc(n)+'</span>'
       +'<span class="sublabel">'+esc(jackSublabel(e,state))+'</span></button>';
   });
-  if(!nums.length)html='<div class="note" style="text-align:center;padding:24px">'+(d.rosterVisible===false?esc(String(d.clientCount||0))+' phones registered. Log in to see them.':'No extensions seen yet. Register a phone to light a jack.')+'</div>';
+  if(!nums.length)html='<div class="note" style="text-align:center;padding:24px">'+(d.rosterVisible===false?esc(String(d.clientCount||0))+(d.clientCount===1?' phone':' phones')+' registered. Log in to see them.':'No extensions seen yet. Register a phone to light a jack.')+'</div>';
   board.innerHTML=html;
   if(keepExt){
     var refocus=board.querySelector('.jack[data-ext="'+cssEsc(keepExt)+'"]');
@@ -1431,7 +1431,7 @@ function applyWifiCapability(d){
 }
 function fetchCdr(){
   fetch("/api/cdr").then(function(r){
-    if(!r.ok){$("cdr-tbody").innerHTML='<tr class="empty-row"><td colspan="6">Log in to view the call log</td></tr>';return null;}
+    if(r.status===401){$("cdr-tbody").innerHTML='<tr class="empty-row"><td colspan="6">Log in to view the call log</td></tr>';return null;}if(!r.ok)return null;
     return r.json();
   }).then(function(recs){if(recs)renderCdr(recs);}).catch(function(){});
 }
