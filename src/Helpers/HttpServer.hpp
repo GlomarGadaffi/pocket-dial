@@ -342,6 +342,9 @@ private:
 	// full reasoning, including why a gated scrape endpoint would be a dead one,
 	// is at sendApiMetrics's definition in the .cpp).
 	void sendApiMetrics(int sock);
+	// #410/#630: take a free /api/status output buffer (sets `busy`, which the
+	// caller must clear once the send has finished), or nullptr if none is free.
+	char* leaseStatusBuf(std::atomic<bool>*& busy);
 	// SoftAP security (docs/THREAT_MODEL.md §6 / FEATURE_ROADMAP P0): report and
 	// toggle WPA2 on the standalone AP, and show/rotate its passphrase. Turning
 	// it on is a breaking change for already-associated phones, so it is an

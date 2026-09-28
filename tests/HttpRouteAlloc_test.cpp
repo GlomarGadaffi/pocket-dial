@@ -120,7 +120,7 @@ namespace
 		{"GET /api/syslog", 4}, {"GET /api/trunk", 4}, {"GET /api/moh", 4},
 		{"GET /api/coredump/info", 4}, {"GET /api/e911-config", 4}, {"GET /api/sbc-mode", 4},
 		{"GET /api/registrar", 4},
-		{"GET /metrics", 5}, {"GET /api/email", 5}, {"GET /api/admin/status", 5},
+		{"GET /api/email", 5}, {"GET /api/admin/status", 5},
 		{"GET /api/ap-security", 6}, {"POST /api/dialplan", 9}, {"GET /api/config/export", 10},
 		{"GET /api/telephony-config", 14},
 	};
@@ -218,13 +218,14 @@ TEST(HttpRouteAlloc, EveryRouteOffTheAllowlistAllocatesNothing)
 
 TEST(HttpRouteAlloc, TheGateSeesAnAllocatingRoute)
 {
-	// Positive control: /metrics still builds its body in an ostringstream, so
-	// the gate must count something for it. A gate that counted zero here would
-	// pass every route vacuously.
+	// Positive control: the authenticated /api/cdr still allocates (its ceiling
+	// is 2), so the gate must count something for it. A gate that counted zero
+	// here would pass every route vacuously. (/metrics was the control until
+	// #630 made it allocation-free.)
 	RouteBench b;
-	const Route metrics{"GET /metrics", "GET", "/metrics", "", false};
-	b.serve(metrics);
-	EXPECT_GT(b.serve(metrics), 0);
+	const Route cdr{"GET /api/cdr", "GET", "/api/cdr", "", true};
+	b.serve(cdr);
+	EXPECT_GT(b.serve(cdr), 0);
 }
 
 #endif
