@@ -69,7 +69,7 @@ Cross-references:
 | Attended transfer (REFER + Replaces, RFC 3891) | Splices B and C, BYEs A out of both, relays a later BYE across the bridge. The hardcoded `CSeq: 100` of #257 was removed by its own fix (#308, per-dialog floors), and #402 replaced those floors with `nextServerCSeq()` (`RequestsHandler.cpp:6149`). Only REFER `?Replaces=` is handled; an INVITE carrying `Replaces` (BLF pickup) is not. | `onRefer`, `handleTransferOk` |
 | Hold / resume | Re-INVITE relayed with its **SDP** untouched, so the SDP survives; `Contact` is rewritten on every relayed re-INVITE (#425, `RequestsHandler.cpp:9079-9090`) | `onReinvite`, `onOk` |
 | RFC 3311 `UPDATE` | | `onUpdate` |
-| RFC 4028 session timers | Passive: the PBX honours a timer a phone requests, but never requests one itself and never sends `422`/`Min-SE`. | `armSessionTimer` |
+| RFC 4028 session timers | Passive: the PBX honours a timer a phone requests, but never requests one itself. An initial INVITE with too small a `Session-Expires` gets `422` + `Min-SE` (#591). | `armSessionTimer` |
 | Ring / hunt groups | ring-all or sequential hunt | `CallForker` |
 | Call park + retrieve | orbits `700`–`709` (`POCKETDIAL_PARK_SLOTS` = 10) | `ParkOrbit.*` |
 | Call pickup | group `*8`, directed `**<ext>`; pickup groups reuse ring-group membership | `CallPickup.*` |
@@ -114,9 +114,11 @@ the **SIP trunk** whenever its configuration is valid, otherwise an **`AnchorCli
 
 What surprises people:
 
-- **The SIP trunk never registers and never answers a challenge.** `SipRegistrationClient`
-  is compiled but never instantiated, and `SipTrunk` has no `401`/`407` handling
-  (`SipTrunk.hpp:126-129`), so only an IP-authenticated carrier works. Server location is a
+- **The SIP trunk registers only when it has a password.** `SipTrunk` then REGISTERs at
+  boot, refreshes before Expires and answers a `401`/`407` to the REGISTER with digest
+  (#615); a `401`/`407` to its INVITE is answered with digest credentials once (#581). An
+  IP-authenticated trunk does not register. Outbound calls over a registered trunk are still
+  under investigation: the carrier does not answer the INVITE (#618). Server location is a
   plain A-record lookup (`TrunkResolver`): no SRV/NAPTR, UDP only.
 - **A dial-plan rule with `action=trunk` is the only way out for an ordinary number.** No
   hardcoded `9` prefix, no unregistered-destination fallback: with an empty dial plan every
@@ -218,7 +220,7 @@ zones, pickup, **has shipped** and now lives in §1. What remains is below.
 | Pri | Feature | Rationale | Complexity | Constraints |
 |-----|---------|-----------|------------|-------------|
 | **P1** | **Outbound E.164 normalization** | Inbound DID matching already uses E.164 equivalence (#165, `E164.*`), but nothing normalizes an **outbound** number: a trunk rule's strip/prepend is the entire transformation, which works for one national dial habit and breaks on the next, and the SIP trunk just prefixes `+`. | **S** | Reuse `pbx::e164Normalize()`, which has no outbound caller yet. A bounded table, not a regex engine. |
-| **P1** | **Session timers, active side** | The PBX honours a phone's `Session-Expires` but never requests one and never answers `422`/`Min-SE`. A phone that dies mid-call therefore leaves the session to the orphan sweep rather than a refresh failure. | **M** | Pure signalling; the passive half already parses `refresher=`. |
+| **P1** | **Session timers, active side** | The PBX honours a phone's `Session-Expires` but never requests one. (`422`/`Min-SE` on a too-small initial `Session-Expires` shipped in #591.) A phone that dies mid-call therefore leaves the session to the orphan sweep rather than a refresh failure. | **M** | Pure signalling; the passive half already parses `refresher=`. |
 | **P2** | **Trunk failover** | `MAX_ANCHOR_CALLS` has since been raised to 4, so "a second concurrent outside call" is **done** on a real provider. What remains is **failover between the four configured telephony slots**: there is none: one slot is active at a time and a dead provider is not detected or switched away from. | **M** | Signalling/orchestration, not media; the concurrency half was the media decision and it has been taken. |
 | **P2** | **Conference rooms with PINs** | One global room, no PIN, cap 4. Multiple rooms means a room table and per-room `MixBus` instances. | **M–L (media)** | Memory-bound: the rings are ~50 KB per room. |
 | **P2** | **MWI / `message-summary`** | The BLF machinery only implements the `dialog` event package. MWI is cheap *given* a voicemail store, and there now is one: on-device voicemail (§1.2, #246). A phone has no lamp or stutter tone for a new message and has to dial `796` to find out. | **S** | SD builds only, since that is where voicemail exists. Rides the existing NOTIFY path, which already has Timer E/F retransmission. |
