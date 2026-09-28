@@ -4598,6 +4598,20 @@ void HttpServer::sendApiRegistrarDevice(int sock, const std::string& body)
 		return;
 	}
 
+	if (!ok && action == "secure")
+	{
+		// Registrar::secure() refuses an extension with no SIP secret; say so
+		// rather than claim the device does not exist.
+		for (const auto& d : handler->getAdoptedDevices())
+		{
+			if ((d.mac == target || d.extension == target) && !SipSecretStore::hasSecret(d.extension))
+			{
+				sendResponse(sock, 409, "Conflict", "application/json",
+				             "{\"error\":\"no SIP secret for ext " + d.extension + "\"}");
+				return;
+			}
+		}
+	}
 	if (!ok)
 	{
 		sendResponse(sock, 404, "Not Found", "application/json",

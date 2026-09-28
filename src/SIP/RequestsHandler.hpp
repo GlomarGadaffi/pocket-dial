@@ -715,6 +715,7 @@ public:
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_registrar.adoptDeviceForTest(mac, ext, state);
+		refreshDeviceSnapshot();
 	}
 	// Test-only (#550): bind a client WITHOUT onRegister's identity guard, so a
 	// test can stand up the state the guard now forbids (a client named like an
