@@ -117,8 +117,8 @@ By default, the SIP engine starts in **Learn** mode (trust-on-first-use; Open Mo
   `POST /api/registrar` (`mode=learn` or `mode=secure`) from a logged-in dashboard session,
   or seed it at flash time through the `cfgseed` record. See
   [LEARN_MODE.md](LEARN_MODE.md) for the cutover procedure.
-* Effect: in `learn`, an unknown MAC is adopted trust-on-first-use and then locked to
-  that MAC; in `secure`, every `REGISTER` **and** `INVITE` is digest-challenged.
+* Effect: in `learn`, an unknown MAC is adopted trust-on-first-use, and its extension is
+  locked to that MAC only once an admin secures it; in `secure`, every `REGISTER` **and** `INVITE` is digest-challenged.
 * Before you plan on `secure`: read [LEARN_MODE.md](LEARN_MODE.md) Step 4 first. There
   is currently no way to set a per-extension SIP secret, so `secure` rejects every phone
   rather than protecting them, and `POST /api/registrar mode=secure` refuses with `409`

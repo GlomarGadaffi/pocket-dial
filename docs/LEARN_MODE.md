@@ -43,7 +43,7 @@ on a network you can reach:
 
 | Mode | What it does | When to use it |
 |------|--------------|----------------|
-| **Learn** (`1`, TOFU adoption) | Adopts unknown phones on first REGISTER **without verifying** (trust-on-first-use), records `{MAC, extension}`, and keeps them alive on their *current* credentials. Already-secured devices are still digest-challenged. A different MAC claiming a secured extension is rejected. | **The default and the floor.** Phones work with nothing to configure; an extension nobody has adopted yet can still be claimed first-come (#440), so adopt on a trusted link. |
+| **Learn** (`1`, TOFU adoption) | Adopts unknown phones on first REGISTER **without verifying** (trust-on-first-use), records `{MAC, extension}`, and keeps them alive on their *current* credentials. Already-secured devices are still digest-challenged. A different MAC claiming a secured extension is rejected. | **The default and the floor.** Phones work with nothing to configure; an extension that is not secured can still be claimed by any device (#440), so adopt on a trusted link. |
 | **Secure** (`2`, closed) | Every REGISTER is digest-challenged (RFC 2617, MD5). Only extensions whose secret you have set/rotated can register, and each is locked to its adopted MAC. | **Steady-state production.** The target you flip to once the fleet is adopted and secrets are issued. |
 
 There is no open mode (`0`) any more (#500): the API answers `400` for it, and a board or
@@ -245,10 +245,10 @@ ASCII fallback:
 
 ## 5. The TOFU window discipline
 
-Learn is the default and the floor (the open registrar is retired, #500). Once a phone is
-adopted its extension is locked to that device, so Learn protects every extension that
-has been claimed. Its remaining exposure is an extension **nobody has adopted yet**: the
-first device to REGISTER it is adopted **without verification** (#440 tracks closing that).
+Learn is the default and the floor (the open registrar is retired, #500). Adopting a phone
+does not lock its extension; only a Secured extension is locked to its MAC
+(`Registrar.cpp:331`). Its exposure is every extension **not yet secured**: any device
+that REGISTERs it is adopted **without verification** (#440 tracks closing that).
 So:
 
 - **Adopt what you own, promptly.** Let every phone register once on a trusted link, check
