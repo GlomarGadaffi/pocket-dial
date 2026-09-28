@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -1416,4 +1417,147 @@ TEST(SipTrunkAuth, APoolRefusalOnTheRetryAcksTheChallengeOnceFromTheUntouchedTra
 	}
 	EXPECT_EQ(acks, 1u) << "exactly one ACK, in the challenged transaction";
 	EXPECT_EQ(trunk.activeDialogs(), 0u) << "unanswerable for now: an ordinary failure";
+}
+
+// ── #399: REGISTER with the carrier, digest-signed ──────────────────────────
+//
+// Engage's SBC never answered .244's INVITEs because the trunk never
+// registered. Same TEST-NET-3 SBC and FakePbxEnv capture as above; nothing
+// leaves the process. `nowMs` is steady_clock, because handleResponse() reads
+// the real clock when it hands a response to the registration client.
+namespace
+{
+	uint64_t steadyMs()
+	{
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+	}
+
+	std::string headerValue(const std::string& m, const std::string& name)
+	{
+		const size_t p = m.find("\r\n" + name + ": ");
+		if (p == std::string::npos) return {};
+		const size_t v = p + 2 + name.size() + 2;
+		return m.substr(v, m.find("\r\n", v) - v);
+	}
+
+	// The registrar's answer to `reg`, echoing its Via/From/To/Call-ID/CSeq.
+	std::string regResponse(const std::string& reg, const std::string& statusLine,
+		const std::string& extraHeaders)
+	{
+		return statusLine + "\r\n"
+			"Via: " + headerValue(reg, "Via") + "\r\n"
+			"From: " + headerValue(reg, "From") + "\r\n"
+			"To: " + headerValue(reg, "To") + ";tag=reg-tag\r\n"
+			"Call-ID: " + headerValue(reg, "Call-ID") + "\r\n"
+			"CSeq: " + headerValue(reg, "CSeq") + "\r\n"
+			+ extraHeaders +
+			"Content-Length: 0\r\n\r\n";
+	}
+
+	SipTrunk::Config regConfig()
+	{
+		SipTrunk::Config c = workingConfig();
+		std::snprintf(c.authUser, sizeof(c.authUser), "%s", "authid399");
+		return c;
+	}
+
+	const char* const kRegChallenge =
+		"Digest realm=\"carrier.example\", nonce=\"regn0nce\", qop=\"auth\", algorithm=MD5";
+}
+
+TEST(SipTrunkRegister, TheFirstTickSendsAnUnsignedRegisterToTheSbc)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+
+	trunk.tickRegistration(steadyMs(), sbcAddr());
+
+	ASSERT_EQ(env.sent.size(), 1u) << "boot must REGISTER, or the carrier never routes to us";
+	const std::string reg = env.sentRaw(0);
+	EXPECT_EQ(firstLine(reg), "REGISTER sip:203.0.113.5 SIP/2.0");
+	EXPECT_EQ(env.sent[0].to.sin_addr.s_addr, sbcAddr().sin_addr.s_addr);
+	EXPECT_EQ(headerValue(reg, "To"), "<sip:15551230000@203.0.113.5>");
+	EXPECT_EQ(reg.find("Authorization"), std::string::npos) << "nothing to sign until challenged";
+}
+
+TEST(SipTrunkRegister, A401IsAnsweredWithDigestAndThe200ArmsARefreshBeforeExpires)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+	const uint64_t t0 = steadyMs();
+	trunk.tickRegistration(t0, sbcAddr());
+	ASSERT_EQ(env.sent.size(), 1u);
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(env.sentRaw(0),
+		"SIP/2.0 401 Unauthorized", std::string("WWW-Authenticate: ") + kRegChallenge + "\r\n"))))
+		<< "a response on the REGISTER Call-ID is the trunk's";
+	ASSERT_EQ(env.sent.size(), 2u) << "the 401 is answered at once, not a tick later";
+	const std::string signedReg = env.sentRaw(1);
+	EXPECT_EQ(headerValue(signedReg, "CSeq"), "2 REGISTER");
+
+	SipDigest::DigestAuth auth;
+	ASSERT_TRUE(SipDigest::parseAuthorization(headerValue(signedReg, "Authorization"), auth))
+		<< signedReg;
+	EXPECT_EQ(auth.username, "authid399") << "the auth ID, not the AOR user";
+	EXPECT_EQ(auth.uri, "sip:203.0.113.5");
+	EXPECT_TRUE(SipDigest::verify(auth,
+		SipDigest::computeHa1("authid399", "carrier.example", "s3cret-reg"), "REGISTER"))
+		<< "the carrier must be able to verify it";
+	EXPECT_EQ(signedReg.find("s3cret-reg"), std::string::npos);
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(signedReg,
+		"SIP/2.0 200 OK", "Expires: 120\r\n"))));
+	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registered);
+	EXPECT_EQ(env.sent.size(), 2u) << "a 200 needs no answer";
+
+	trunk.tickRegistration(t0 + 60 * 1000, sbcAddr());
+	EXPECT_EQ(env.sent.size(), 2u) << "no refresh half way through the lease";
+
+	trunk.tickRegistration(t0 + 115 * 1000, sbcAddr());
+	ASSERT_EQ(env.sent.size(), 3u) << "the binding must be refreshed before it lapses at 120 s";
+	EXPECT_NE(env.sentRaw(2).find("nc=00000002"), std::string::npos)
+		<< "the refresh re-signs against the cached nonce: " << env.sentRaw(2);
+}
+
+TEST(SipTrunkRegister, A407IsAnsweredInProxyAuthorization)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+	trunk.tickRegistration(steadyMs(), sbcAddr());
+	ASSERT_EQ(env.sent.size(), 1u);
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(env.sentRaw(0),
+		"SIP/2.0 407 Proxy Authentication Required",
+		std::string("Proxy-Authenticate: ") + kRegChallenge + "\r\n"))));
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_NE(env.sentRaw(1).find("\r\nProxy-Authorization: Digest username=\"authid399\""),
+		std::string::npos) << env.sentRaw(1);
+}
+
+TEST(SipTrunkRegister, ARegisterResponseFromAnotherAddressIsConsumedAndIgnored)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+	trunk.tickRegistration(steadyMs(), sbcAddr());
+	ASSERT_EQ(env.sent.size(), 1u);
+
+	sockaddr_in forger = sbcAddr();
+	forger.sin_addr.s_addr = inet_addr("198.51.100.7");   // TEST-NET-2
+	const auto forged = std::make_shared<SipMessage>(regResponse(env.sentRaw(0),
+		"SIP/2.0 401 Unauthorized", std::string("WWW-Authenticate: ") + kRegChallenge + "\r\n"),
+		forger);
+
+	EXPECT_TRUE(trunk.handleResponse(forged)) << "claimed, so no handset path sees it";
+	EXPECT_EQ(env.sent.size(), 1u) << "and never answered: a signed REGISTER is not "
+		"something a third party gets to ask for";
+	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registering);
 }

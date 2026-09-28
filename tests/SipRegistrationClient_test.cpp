@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 
+#include "AllocCounter.hpp"
 #include "SipDigest.hpp"
 #include "SipRegistrationClient.hpp"
 
@@ -766,4 +767,36 @@ TEST(SipRegistrationClient, A407IsAnsweredInProxyAuthorization)
     ASSERT_FALSE(pa.empty());
     EXPECT_EQ(digestParam(pa, "nonce"), "P1");
     EXPECT_EQ(digestParam(pa, "realm"), "sbc.carrier.example");
+}
+
+// ---------------------------------------------------------------------------
+// #399: the trunk drives this from the SIP thread after init, where nothing
+// may touch the heap. Counted with the binary's one counting operator new
+// (tests/support/AllocCounter, #426); SipDigestBounded_test's
+// TheCounterSeesARealAllocationInThisFile is the positive control that a
+// zero here is a real zero.
+// ---------------------------------------------------------------------------
+
+TEST(SipRegistrationClient, ChallengeRetryAndRefreshAllocateNothing)
+{
+    SipRegistrationClient c;
+    ASSERT_TRUE(c.configure(makeConfig(60), "hunter2"));
+    SipRegistrationClient::Request unsignedReg, signedReg, refresh;
+    uint64_t now = 1000;
+
+    AllocGuard guard;
+    c.start(now);
+    const bool sent1 = c.tick(now, unsignedReg);
+    c.onResponse(now, challenge401());
+    const bool sent2 = c.tick(now, signedReg);
+    c.onResponse(now, ok200("60"));
+    now += 55 * 1000;
+    const bool sent3 = c.tick(now, refresh);
+    const std::size_t allocs = guard.delta();
+
+    ASSERT_TRUE(sent1 && sent2 && sent3);
+    EXPECT_NE(wire(signedReg).find("\r\nAuthorization: Digest "), std::string::npos)
+        << "precondition: the challenge was really answered";
+    EXPECT_NE(wire(refresh).find("nc=00000002"), std::string::npos);
+    EXPECT_EQ(allocs, 0u) << "the REGISTER path touched the heap";
 }
