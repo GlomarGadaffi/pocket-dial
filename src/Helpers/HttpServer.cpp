@@ -4486,8 +4486,13 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
 		// #652: a 911/933 placed after the 409 check above would be dropped by the
 		// restart; hold it until no emergency session is live, as the OTA reboot does.
-		while (h && static_cast<RequestsHandler*>(h)->hasLiveEmergencyCall())
-			vTaskDelay(pdMS_TO_TICKS(1000));
+		// Logged once, so an operator knows why the erased board has not rebooted.
+		if (h && static_cast<RequestsHandler*>(h)->hasLiveEmergencyCall())
+		{
+			ESP_LOGW("factory_reset", "restart held: emergency call in progress (#652)");
+			do vTaskDelay(pdMS_TO_TICKS(1000));
+			while (static_cast<RequestsHandler*>(h)->hasLiveEmergencyCall());
+		}
 		esp_restart();
 	}, "restart_task", 4096, _handler.load(std::memory_order_acquire), 5, NULL) != pdPASS)
 	{
@@ -6625,11 +6630,15 @@ void HttpServer::sendApiOtaReboot(int sock, const std::string& body)
 	// connect/mode endpoints' delayed-restart pattern).
 	xTaskCreate([](void* h) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
-		// #652: hold the restart while any emergency call is live.
-		while (h && static_cast<RequestsHandler*>(h)->hasLiveEmergencyCall())
-			vTaskDelay(pdMS_TO_TICKS(1000));
+		// #652: hold the restart while any emergency call is live, and say so once.
+		if (h && static_cast<RequestsHandler*>(h)->hasLiveEmergencyCall())
+		{
+			ESP_LOGW("ota_reboot", "restart held: emergency call in progress (#652)");
+			do vTaskDelay(pdMS_TO_TICKS(1000));
+			while (static_cast<RequestsHandler*>(h)->hasLiveEmergencyCall());
+		}
 		esp_restart();
-	}, "ota_reboot", 2048, handler, 5, NULL);
+	}, "ota_reboot", 4096, handler, 5, NULL);   // #677: ESP_LOGW -> vprintf needs more than 2048 B
 #else
 	// Host stub: never actually exit the process (the smoke-test harness keeps
 	// running). Report a simulated success.
