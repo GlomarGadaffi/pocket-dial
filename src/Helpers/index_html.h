@@ -1623,11 +1623,14 @@ function saveRegistrarMode(){
 }
 /* ════ E911 NOTIFICATION (#641): form lives in #pbx-modal ════ */
 function fillE911(d){if(!d)return;$("e911-exts").value=d.notifyExts||"";$("e911-callback").value=d.callback||"";$("e911-location").value=d.location||"";}
+/* Save stays off until a load succeeds: saving blank fields would erase the notify list. */
 function fetchE911(){
   fetch("/api/e911-config",{credentials:"same-origin"}).then(function(r){
-    if(r.status===401){handleAuthExpired();return null;}
-    return r.ok?r.json():null;
-  }).then(fillE911).catch(function(){});
+    if(r.status===401){handleAuthExpired();throw new Error("session expired");}
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(d){fillE911(d);$("e911-save").disabled=false;setMsg("e911-msg","","");})
+  .catch(function(e){$("e911-save").disabled=true;setMsg("e911-msg","Could not load E911 settings ("+e.message+"). Save is off; reopen to retry.","err");});
 }
 /* The server echoes what it kept (list truncated, bad field dropped), so show that. */
 function saveE911(){
@@ -2109,7 +2112,7 @@ setInterval(function(){if($("pbx-modal").classList.contains("show"))fetchMohStat
       <div class="field"><label for="e911-exts">Notify extensions (spaces or commas)</label><input type="text" id="e911-exts"></div>
       <div class="field"><label for="e911-callback">Callback number</label><input type="text" id="e911-callback"></div>
       <div class="field"><label for="e911-location">Location</label><input type="text" id="e911-location"></div>
-      <div class="row"><button class="btn primary" onclick="saveE911()">Save</button></div>
+      <div class="row"><button class="btn primary" id="e911-save" disabled onclick="saveE911()">Save</button></div>
       <div class="msg" id="e911-msg"></div>
 
     </div>
