@@ -444,8 +444,8 @@ Not nothing. A successful fetch tells the requester:
 
 * that this MAC is an adopted device on this board,
 * which extension it is: useful for targeting an INVITE, or for registering as that extension yourself: under
-  Learn an unsecured extension is not locked at all, and a Secured one additionally needs a
-  spoofed MAC on the same LAN (the lock is ARP-learned),
+  Learn an unsecured extension is not locked at all; taking over a Secured one needs both its
+  MAC (spoofed on the same LAN; the lock is ARP-learned) and its SIP password,
 * the board's active IP and SIP port,
 * whether that extension requires digest auth (the comment block is a one-bit oracle for
   "this device is Secured / the registrar is in Secure mode").
