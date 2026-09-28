@@ -1,2 +1,2 @@
-# AdminHttpGate_test.cpp OtaReboot: 1 (emergency call blocks reboot/reset)
-1
+# AdminHttpGate_test.cpp OtaReboot: 1 + DtmfFactoryReset_test.cpp: 1 (emergency call blocks reboot/reset)
+2

@@ -181,6 +181,13 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 			}
 			else if (code == "101")
 			{
+				// #652: the restart would drop a live 911/933 on another handset.
+				if (_env.emergencyCallLive())
+				{
+					_env.log("[admin] topology switch refused: emergency call in progress", true);
+					accum.digits.clear();
+					return;
+				}
 				// Topology switch: toggle wifi_mode between 1 (CLIENT) and 2 (AP).
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 				nvs_handle_t h;
@@ -213,6 +220,13 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 				{
 					if (rest[3] == '1')
 					{
+						// #652: the reset restarts the board, which would drop a live 911/933.
+						if (_env.emergencyCallLive())
+						{
+							_env.log("[admin] factory reset refused: emergency call in progress", true);
+							accum.digits.clear();
+							return;
+						}
 						_env.log("[admin] factory reset confirmed via DTMF");
 						// #473 / #481 review: same order as the HTTP door, and FIRST --
 						// before any wipe below. The guard refuses new NVS data writes

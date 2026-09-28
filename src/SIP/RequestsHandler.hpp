@@ -384,6 +384,11 @@ public:
 	bool hasLiveEmergencyCall()
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
+		return emergencyCallLive();
+	}
+	// PbxEnv hook for the DTMF restart doors (#652). Caller holds _mutex.
+	bool emergencyCallLive() override
+	{
 		for (const auto& [cid, s] : _sessions)
 			if (s && s->isEmergency()) return true;
 		return false;
