@@ -24,6 +24,8 @@
 #include "AdminAuth.hpp"
 #include "JsonReader.hpp"    // Issue #430: parse /api/status in the DropProbe tests
 #include "DmaFramePool.hpp"   // Issue #328: /api/status's l2Tx counters
+#include "SipSecretStore.hpp"
+#include "index_html.h"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -904,6 +906,81 @@ TEST(Registrar, RejectsUnknownModeAndUnknownDevice)
 	                               "pd_session=" + a.cookie, a.csrf)), 400);
 
 	AdminAuth::clearCredential();
+}
+
+TEST(Registrar, SecuringAnExtensionWithNoSipSecretIs409NotANotFound)
+{
+	// Registrar::secure() refuses an extension with no stored SIP secret (it
+	// would lock the phone out). The route used to report that as 404 "no
+	// adopted device", which sent the operator looking for the wrong problem.
+	AdminAuth::clearCredential();
+	SipSecretStore::clearSecret("1001");
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.adoptDeviceForTest("0200000000aa", "1001");
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	AdminSession a = loginAndCompleteSetup(port);
+	for (const char* target : {"1001", "0200000000aa"})
+	{
+		const std::string r = httpPostRaw(port, "/api/registrar/device",
+			std::string("action=secure&target=") + target, "pd_session=" + a.cookie, a.csrf);
+		EXPECT_EQ(statusOf(r), 409) << target << "\n" << r;
+		EXPECT_NE(r.find("no SIP secret for ext 1001"), std::string::npos) << r;
+	}
+
+	AdminAuth::clearCredential();
+}
+
+namespace
+{
+	std::string indexPage()
+	{
+		std::string page;
+		for (const auto& part : CGA_INDEX_HTML_PARTS) page.append(part.data, part.size);
+		return page;
+	}
+	std::string jsFunction(const std::string& page, const std::string& name)
+	{
+		const size_t at = page.find("function " + name + "(");
+		if (at == std::string::npos) return {};
+		return page.substr(at, page.find("\n}\n", at) - at);
+	}
+}
+
+TEST(Dashboard, MaintenanceButtonsGoThroughPostSoTheySendTheCsrfToken)
+{
+	// requireAdmin(..., true) answers 403 without X-CSRF. These four used raw
+	// fetch() with no header, so they always failed while the UI said success.
+	const std::string page = indexPage();
+	for (const char* fn : {"factoryReset", "startApMode", "holdConfigMode", "otaReboot"})
+	{
+		const std::string body = jsFunction(page, fn);
+		ASSERT_FALSE(body.empty()) << fn;
+		EXPECT_NE(body.find("post(\"/api/"), std::string::npos) << body;
+		EXPECT_EQ(body.find("fetch("), std::string::npos) << body;
+	}
+}
+
+TEST(Dashboard, HttpMethodSurfacesTheServersErrorMessage)
+{
+	const std::string body = jsFunction(indexPage(), "httpMethod");
+	ASSERT_FALSE(body.empty());
+	EXPECT_NE(body.find("d.error||d.message||"), std::string::npos) << body;
+	EXPECT_NE(body.find("e.status=r.status"), std::string::npos) << "postRegistrarMode keys on 409:\n" << body;
+	EXPECT_NE(body.find("handleAuthExpired()"), std::string::npos) << body;
+}
+
+TEST(Dashboard, SecureIsDisabledUntilASipPasswordCanBeSet)
+{
+	const std::string page = indexPage();
+	EXPECT_NE(page.find("<option value=\"secure\" disabled>"), std::string::npos);
+	EXPECT_NE(jsFunction(page, "renderRegistrar").find("b.disabled=true"), std::string::npos);
+	EXPECT_NE(page.find("needs a SIP password (not yet supported)"), std::string::npos);
 }
 
 TEST(Registrar, MutatingEndpointsRequireTheCsrfToken)
