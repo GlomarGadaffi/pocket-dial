@@ -903,7 +903,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `resetIncomplete` | Boolean | (#473) `true` if the last factory reset did not complete. Public, so an operator taking the board over sees it before logging in. |
 | `resetIncompleteStage` | String | (#473) The reset stage that did not complete. |
 | `resetFailedMask` | Integer | (#473) Bitmask of the stores whose erase failed during the last reset. |
-| `resetJournal` | String | (#473) Where the reset record lives: `"flash"` (survives a power cut) or `"rtc"` (survives only a restart). |
+| `resetJournal` | String | (#473) Where the reset record lives: `"flash"` (survives a power cut), `"rtc"` (survives only a restart), or `"none"` (no journal record was found at boot). |
 | `resetJournalWriteFailures` | Integer | (#473) Failed writes of the reset journal since boot. |
 | `sd` | Object | microSD state. **Always present**, on every build and transport, so a client never has to distinguish "key missing" from "no card". |
 | `sd.present` | Boolean | Whether this *build* has a card slot wired, i.e. was compiled with `PD_ETH_HAS_SD`. True only for `eth` on `PD_ETH_BOARD=elite`; false on `wifi`, `lan8720`, `display`, the Waveshare `eth` board, and the host build. This is a build capability, not a runtime observation. |
