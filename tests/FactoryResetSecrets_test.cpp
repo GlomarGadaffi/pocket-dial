@@ -29,6 +29,8 @@
 #include "FactoryReset.hpp"
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
+#include "ResetGuard.hpp"
+#include "ResetJournal.hpp"
 #include "SipMessage.hpp"
 #include "SipSecretStore.hpp"
 #include "TelephonyApiConfig.hpp"
@@ -334,6 +336,62 @@ TEST_F(FactoryResetSecretsTest, AFailedSecretEraseIsReportedAsAnErrorNotOk)
 	EXPECT_FALSE(SipSecretStore::hasSecret("501"));
 }
 
+TEST_F(FactoryResetSecretsTest, AFailedStoreEraseIsRecordedInTheResetJournal)
+{
+	// #473 + #456: the 500 above only reaches an operator who is watching. The
+	// journal carries the same failure to the next boot's /api/status.
+	resetjournal::resetForTest();
+	const AdminSession s = bypassLogin();
+	FactoryReset::failNextEraseForTest();
+
+	const std::string resp = httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf);
+	ASSERT_EQ(statusOf(resp), 500) << resp;
+
+	resetjournal::simulateRebootForTest();
+	const resetjournal::BootStatus st = resetjournal::bootStatus();
+	EXPECT_TRUE(st.incomplete()) << "a reset with a failed store is not a completed reset";
+	EXPECT_EQ(st.stage, resetjournal::Stage::Failed);
+	EXPECT_NE(st.failedMask & resetjournal::kSecrets, 0) << "the store that failed is named";
+	EXPECT_EQ(st.failedMask & resetjournal::kAdmin, 0) << "a store that erased is not blamed";
+	EXPECT_EQ(st.failedMask & resetjournal::kE911, 0);
+	resetjournal::resetForTest();
+}
+
+// #481 review (MAJOR): the HTTP door's ordering, pinned. At the moment of its
+// first erase (AdminAuth::clearCredential()), the write guard must already be up
+// and the journal must already say Begun -- otherwise a writer can put data back
+// behind the erases, or a power cut mid-reset goes unreported.
+namespace
+{
+	bool g_guardAtFirstErase = false;
+	resetjournal::Stage g_stageAtFirstErase = resetjournal::Stage::None;
+	void captureAtFirstErase()
+	{
+		g_guardAtFirstErase = resetguard::inProgress();
+		g_stageAtFirstErase = resetjournal::storedStageForTest();
+	}
+}
+
+TEST_F(FactoryResetSecretsTest, TheGuardAndJournalAreOpenBeforeTheFirstErase)
+{
+	resetguard::resetForTest();
+	resetjournal::resetForTest();
+	g_guardAtFirstErase = false;
+	g_stageAtFirstErase = resetjournal::Stage::None;
+	resetguard::beforeFirstEraseHookForTest() = &captureAtFirstErase;
+	const AdminSession s = bypassLogin();
+
+	const std::string resp = httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf);
+	resetguard::beforeFirstEraseHookForTest() = nullptr;
+	ASSERT_EQ(statusOf(resp), 200) << resp;
+
+	EXPECT_TRUE(g_guardAtFirstErase) << "resetguard::begin() must run before the first erase";
+	EXPECT_EQ(g_stageAtFirstErase, resetjournal::Stage::Begun)
+		<< "resetjournal::begin() must run before the first erase";
+	resetguard::resetForTest();
+	resetjournal::resetForTest();
+}
+
 // #456 review: clearAllTelephonyConfig() (the carrier OAuth client_secret) and
 // clearAllDidMappings() (PII) used to have their results discarded, so a failed
 // persist still answered 200 "ok". Pointing the stores at a directory that does
@@ -373,6 +431,23 @@ TEST_F(FactoryResetSecretsTest, AFailedAdminCredentialEraseIsReportedAsAnError)
 	EXPECT_NE(resp.find("\"secrets\":false"), std::string::npos) << resp;
 	// The in-RAM credential is cleared regardless of what flash said.
 	EXPECT_FALSE(AdminAuth::isProvisioned());
+}
+
+// #595 item 3: the admin-credential erase failure is journalled as kAdmin.
+TEST_F(FactoryResetSecretsTest, AFailedAdminCredentialEraseIsJournalledAsKAdmin)
+{
+	resetjournal::resetForTest();
+	const AdminSession s = bypassLogin();
+	AdminAuth::failNextEraseForTest();
+
+	const std::string resp = httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf);
+	ASSERT_EQ(statusOf(resp), 500) << resp;
+
+	resetjournal::simulateRebootForTest();
+	const resetjournal::BootStatus st = resetjournal::bootStatus();
+	EXPECT_EQ(st.stage, resetjournal::Stage::Failed);
+	EXPECT_EQ(st.failedMask, resetjournal::kAdmin) << "only the admin store failed";
+	resetjournal::resetForTest();
 }
 
 TEST_F(FactoryResetSecretsTest, TheSdVoicemailArchiveIsWiped)

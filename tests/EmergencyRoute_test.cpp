@@ -306,7 +306,8 @@ TEST(EmergencyRoute, TheReportedRouteIsNoneUntilARealProviderOrATrunkExists)
 		<< "the loopback simulator is not a route";
 
 	b.handler->setTrunkConfig(trunkConfig());
-	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::Trunk);
+	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::TrunkUnverified)
+		<< "#546: configured, but no call has proved it yet";
 
 	b.handler->setAnchorPlacesRealCallsForTest(true);
 	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::Anchor)
@@ -320,6 +321,8 @@ TEST(EmergencyRoute, TheReportedRouteIsNoneUntilARealProviderOrATrunkExists)
 	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::None), "none");
 	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::Anchor), "anchor");
 	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::Trunk), "trunk");
+	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::TrunkUnverified),
+		"trunk-unverified");
 }
 
 TEST(EmergencyRoute, OnlyTheTelephonyApiProviderPlacesRealCalls)
@@ -471,7 +474,8 @@ TEST(EmergencyRoute, BootingWithAStoredTrunkLogsNoWarning)
 	b.handler->tick();
 	const std::string log = testing::internal::GetCapturedStderr();
 
-	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::Trunk);
+	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::TrunkUnverified)
+		<< "#546: a stored trunk is configured, not yet proved";
 	EXPECT_EQ(log.find("EMERGENCY CALLING IS NOT CONFIGURED"), std::string::npos)
 		<< "a board that can reach 911 must not cry wolf:\n" << log;
 	TrunkConfigStore::resetForTest();
@@ -525,7 +529,8 @@ TEST(EmergencyRoute, StatusReportsTheRouteWithoutASession)
 		<< "the dashboard banner keys on this, and it must not need a login";
 
 	b.handler->setTrunkConfig(trunkConfig());
-	EXPECT_NE(httpGet(kPort, "/api/status").find("\"emergencyRoute\":\"trunk\""), std::string::npos);
+	EXPECT_NE(httpGet(kPort, "/api/status").find("\"emergencyRoute\":\"trunk-unverified\""), std::string::npos)
+		<< "#546: no carrier 2xx yet";
 
 	b.handler->setAnchorPlacesRealCallsForTest(true);
 	EXPECT_NE(httpGet(kPort, "/api/status").find("\"emergencyRoute\":\"anchor\""), std::string::npos);
@@ -552,6 +557,25 @@ TEST(EmergencyRoute, TheDashboardShowsTheBannerWhileTheRouteIsNone)
 	EXPECT_NE(page.substr(poll, pollEnd - poll).find("applyEmergencyRoute(d)"), std::string::npos)
 		<< "the status poll must drive the banner";
 	EXPECT_NE(page.find("d.emergencyRoute===\"none\""), std::string::npos);
+}
+
+TEST(EmergencyRoute, TheDashboardWarnsWhileTheTrunkRouteIsUnverified)
+{
+	// #546: the unverified banner exists, starts hidden, and the status poll's
+	// applyEmergencyRoute() shows it for exactly "trunk-unverified".
+	std::string page;
+	for (const auto& part : CGA_INDEX_HTML_PARTS) page.append(part.data, part.size);
+
+	const size_t banner = page.find("id=\"e911-unverified-banner\"");
+	ASSERT_NE(banner, std::string::npos) << "no unverified-route banner on the dashboard";
+	const size_t tagEnd = page.find('>', banner);
+	EXPECT_NE(page.substr(banner, tagEnd - banner).find("display:none"), std::string::npos);
+
+	const size_t fn = page.find("function applyEmergencyRoute(d){");
+	ASSERT_NE(fn, std::string::npos);
+	const std::string body = page.substr(fn, page.find("\n}\n", fn) - fn);
+	EXPECT_NE(body.find("e911-unverified-banner"), std::string::npos) << body;
+	EXPECT_NE(body.find("d.emergencyRoute===\"trunk-unverified\""), std::string::npos) << body;
 }
 
 TEST(EmergencyRoute, TheE911BannerDefersToTheRouteBannerWhileTheRouteIsNone)

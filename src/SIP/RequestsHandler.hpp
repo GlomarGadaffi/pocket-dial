@@ -147,6 +147,13 @@ public:
 	std::optional<std::shared_ptr<Session>> getSession(std::string_view callID);
 
 	// ── Dashboard query API (thread-safe) ────────────────────────────
+	// #410: calls f(const snapshot&) under _snapshotMutex, so /api/status formats
+	// the tables in place instead of copying them out. f must not block.
+	template <class F> void withSnapshot(F&& f)
+	{
+		std::lock_guard<std::mutex> lock(_snapshotMutex);
+		f(static_cast<const RegistrarSnapshot&>(_snapshot));
+	}
 	std::vector<std::pair<std::string, std::string>> getActiveClients();
 	std::vector<std::tuple<std::string, std::string, std::string, int>> getActiveSessions();
 	void forceDisconnect(const std::string& extension);
@@ -175,6 +182,10 @@ public:
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
 	// drop (responses, ACK).
 	uint64_t getSdpRejected() const;
+	// Issue #409: draws refused because a pool was spent -- there is no heap
+	// fallback behind either pool. The message pool is process-global.
+	uint64_t getVirtualPeerRefusals() const { return _vpeerRefusals.load(std::memory_order_relaxed); }
+	static uint64_t getMessagePoolRefusals();
 	// Issue #497: INVITEs refused because they did not come from the caller's
 	// registered address (the 403 "Caller Not Registered From This Address").
 	uint64_t getUnboundCallerRefusals() const { return _unboundCallerRefusals.load(std::memory_order_relaxed); }
@@ -359,10 +370,16 @@ public:
 	// applyStoredTrunkConfig() logs a WARN at boot and on every trunk save that
 	// leaves it None. Anchor with a trunk also configured still reports Anchor;
 	// routeEmergencyCall() falls through to the trunk when that anchor is down.
+	// Issue #546: TrunkUnverified -- a valid trunk is CONFIGURED but has not
+	// answered a single INVITE 2xx since boot (or since its config last
+	// changed). Routing is the same as Trunk (the call is still tried); the
+	// report differs because "configured" is not "can complete a call": the
+	// generic trunk cannot answer a 401/407 yet (#399), so a digest-auth
+	// carrier fails every 911 with 502 while the route read "trunk".
 	// Takes _mutex, so it must NOT be called with _mutex already held.
-	enum class EmergencyRoute : uint8_t { None, Anchor, Trunk };
+	enum class EmergencyRoute : uint8_t { None, Anchor, Trunk, TrunkUnverified };
 	EmergencyRoute emergencyRoute();
-	// "anchor", "trunk" or "none": the /api/status spelling.
+	// "anchor", "trunk", "trunk-unverified" or "none": the /api/status spelling.
 	static const char* emergencyRouteName(EmergencyRoute r);
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
@@ -425,6 +442,10 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #479: the boot-built conference room, so a test can make its driver fail.
+	ConferenceRoom* conferenceForTest() { return _conference.get(); }
+	// #479: as a POCKETDIAL_CONFERENCE=0 build, which never builds the room.
+	void dropConferenceForTest() { _conference.reset(); }
 
 	// What the resolver currently knows about the configured SBC host. Refused
 	// means nothing is known and nothing is in flight; anything else means a
@@ -437,7 +458,7 @@ public:
 	// to keep capacity exhausted; drop it to restore. Drawing through
 	// allocateVirtualPeer() rather than reading _virtualPeerPool directly is
 	// deliberate -- it exhausts whatever the allocator has behind the pool
-	// too (the #101A heap fallback while it exists), so the next draw really
+	// too, so the next draw really
 	// returns nullptr, which is the state every caller must survive.
 	std::vector<std::shared_ptr<SipClient>> exhaustVirtualPeersForTest()
 	{
@@ -651,6 +672,28 @@ public:
 		return {};
 	}
 
+	// Test-only (#533): make `ext` look silent for `idle`, then run the client sweep.
+	void idleClientAndSweepForTest(const std::string& ext, std::chrono::seconds idle)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (auto c = findClient(ext)) c.value()->setLastActiveTimeForTest(std::chrono::steady_clock::now() - idle);
+		sweepExpired();
+	}
+	// Test-only (#603 review): expire `ext`'s registration lease, then run the sweep.
+	void expireLeaseAndSweepForTest(const std::string& ext)
+	{
+		// Same shape as tick(): produce under _mutex, drain, send outside it, so
+		// the BYEs endCall() enqueues actually leave.
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			_passThroughMsg = nullptr;
+			if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
+			sweepExpired();
+			localOutbox = drainOutbox();
+		}
+		for (auto& event : localOutbox) _onHandled(event.first, std::move(event.second));
+	}
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned)
 	{
@@ -709,6 +752,7 @@ private:
 	void onInvite(std::shared_ptr<SipMessage> data);
 	void onTrying(std::shared_ptr<SipMessage> data);
 	void onRinging(std::shared_ptr<SipMessage> data);
+	void onSessionProgress(std::shared_ptr<SipMessage> data);
 	void onBusy(std::shared_ptr<SipMessage> data);
 	void onUnavailable(std::shared_ptr<SipMessage> data);
 	void onBye(std::shared_ptr<SipMessage> data);
@@ -868,7 +912,12 @@ private:
 	// Called synchronously on the SIP thread with _mutex already held, from
 	// inside SipTrunk::handleResponse()/sweep(). See SipTrunk::Listener for the
 	// ordering guarantees each one carries.
-	void onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia) override;
+	void onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia,
+		const std::shared_ptr<SipMessage>& progress) override;
+	// Issue #400: point relay pair `slot` at the carrier's SDP in `carrier` and
+	// start its handset-facing half if not already up. 0 on success, else the
+	// status to refuse the handset with (502 unusable carrier RTP, 500 local).
+	int bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessage>& carrier);
 	void onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 		const std::shared_ptr<SipMessage>& ok) override;
 	void onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status) override;
@@ -1418,6 +1467,25 @@ public:
 			_onHandled(event.first, std::move(event.second));
 		}
 	}
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#462): queue `msgs` on _outbox, then run the SAME end-of-pass
+	// cycle handle() runs -- drainPassLocked() under _mutex, flushPass() after,
+	// through handle()'s own scratch pair -- so a test can count the drain's
+	// allocations without the rest of handle() (batch B's builders, batch C's
+	// lookups) in the way. It calls the production functions rather than
+	// re-implementing the flush, so it cannot drift from what handle() does.
+	// Inline and host-only: never emitted into firmware.
+	void drainCycleForTest(
+		const std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& msgs)
+	{
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			for (const auto& m : msgs) _outbox.push_back(m);
+			drainPassLocked(_rxOutboxScratch, _rxLogScratch);
+		}
+		flushPass(_rxOutboxScratch, _rxLogScratch);
+	}
+#endif
 	// Test-only: inject a greeting clip without a real filesystem at
 	// /sdcard/vm/greeting.wav (which doesn't exist on host, or exist as a
 	// portable path at all). `clip` must outlive the handler -- tests pass a
@@ -1989,6 +2057,10 @@ private:
 	// simulator and must never be handed an emergency number. Written only
 	// there and by setAnchorPlacesRealCallsForTest(); read under _mutex.
 	bool _anchorPlacesRealCalls = false;
+	// Issue #546: the SIP trunk has answered an INVITE with a 2xx since boot /
+	// since setTrunkConfig(). Set in onTrunkAnswered(), cleared by
+	// setTrunkConfig(); under _mutex.
+	bool _trunkVerified = false;
 
 	// Stage B of the TelephonyAnchorClient port: sends that originate OFF the SIP
 	// receive thread (the CallEvent callback, which runs on the anchor's own WS
@@ -2034,6 +2106,32 @@ private:
 	// retransmit on the way out. The one place messages leave _outbox — see the
 	// #70 ordering note on the definition. Caller holds _mutex.
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> drainOutbox();
+	// Same, into a caller-owned vector by SWAP, so _outbox keeps a warm buffer
+	// instead of restarting at zero capacity (#462). The per-packet and per-tick
+	// drains use this with the persistent scratch members below. Caller holds
+	// _mutex, and `out` is empty on entry (it appends, never drops, if not).
+	void drainOutboxInto(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& out);
+
+	// #462 (#284 rank 5): persistent drain scratch, ONE PAIR PER THREAD that
+	// drains on the hot path. handle() has exactly one production caller (the
+	// UDP receive loop) and tick() exactly one (the tick task), so each pair is
+	// touched by a single thread and needs no lock of its own. Filled under
+	// _mutex, consumed after it is released, then clear()ed -- which keeps the
+	// capacity, the whole point. Never share a pair between handle() and tick().
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _rxOutboxScratch;
+	std::vector<std::pair<bool, std::string>>                        _rxLogScratch;
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _tickOutboxScratch;
+	std::vector<std::pair<bool, std::string>>                        _tickLogScratch;
+
+	// The end of every handle()/tick() pass, in two halves around the lock:
+	// drainPassLocked() under _mutex (take this pass's outbox and log queue into
+	// the caller's scratch pair), flushPass() after releasing it (print, send,
+	// clear -- keeping capacity). One implementation for both passes, so the
+	// test seam below exercises exactly what production runs.
+	void drainPassLocked(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	                     std::vector<std::pair<bool, std::string>>& logScratch);
+	void flushPass(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	               std::vector<std::pair<bool, std::string>>& logScratch);
 
 	// The inbound message currently being handled, or nullptr outside a handle()
 	// pass (tick() drains with this unset). Used by drainOutbox() for exactly one
@@ -2132,6 +2230,7 @@ private:
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	std::atomic<uint64_t> _vpeerRefusals{0};   // #409: allocateVirtualPeer() refusals
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
 	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped

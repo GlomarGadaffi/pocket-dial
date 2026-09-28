@@ -26,7 +26,9 @@ uint32_t RtpReceiver::rxOversizeDrops()
 #include <sys/socket.h>
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #235: rtp_media_rx TWDT subscription
-#include "PsramTask.hpp"     // Issue #466: pd::createTaskPreferPsram / pd::deleteTask
+#include "PsramTask.hpp"     // Issue #479: pd::StaticTaskSlot / pd::reapParkedStaticTask
+#include "RtpTaskSlots.hpp"  // Issue #479: pd::rtpslots::kRxStackBytes
+#include "ParkedTaskReap.hpp"   // Issue #535 / #572 review: when the parked task may be deleted
 #endif
 
 namespace
@@ -424,6 +426,13 @@ bool RtpReceiver::dispatchDtmf(const RtpPacket& pkt)
 RtpReceiver::RtpReceiver()
 {
 	_localPort.store(SERVER_RTP_RX_PORT, std::memory_order_release);
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Issue #479: this slot's rtp_media_rx stack + TCB, once, at boot. PSRAM
+	// (the #273 audit on #466: nothing reachable writes flash), internal where
+	// there is none. A failed allocation leaves start() refusing, logged.
+	_taskMem.alloc("rtp_media_rx", pd::rtpslots::kRxStackBytes, PD_TASK_STACK_CAPS,
+	               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#endif
 }
 
 RtpReceiver::~RtpReceiver()
@@ -437,6 +446,16 @@ RtpReceiver::~RtpReceiver()
 	for (int i = 0; i < 100 && _taskRunning.load(std::memory_order_acquire); ++i)
 	{
 		vTaskDelay(pdMS_TO_TICKS(5));
+	}
+	// Issue #535: the task parked itself; this is its one deleter -- but only
+	// if it provably parked (#572 review). Otherwise log and leave it: deleting
+	// a task that may still hold _slotMutex is worse than leaking its handle.
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		if (!reapParkedTaskLocked())
+		{
+			ESP_LOGE("RtpReceiver", "rx task not parked at destruction; handle left undeleted (#535)");
+		}
 	}
 #else
 	stop();   // host stub: just clears the (no-task) active flag + sink
@@ -494,6 +513,14 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	// prior task is still tearing itself down (_taskRunning) so the new task never
 	// overlaps the old one on the shared socket/slot.
 	if (_active.load(std::memory_order_acquire) || _taskRunning.load(std::memory_order_acquire))
+	{
+		return false;
+	}
+	// Issue #535: the previous stream's task has finished (_taskRunning is
+	// false) and parked; reap it before creating the next one. If it is not
+	// provably parked yet (#572 review), refuse this start rather than run two
+	// tasks on one slot or delete one that may still be running.
+	if (!reapParkedTaskLocked())
 	{
 		return false;
 	}
@@ -576,22 +603,28 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	// whose Ethernet work runs on the tcpip task (LWIP_TCPIP_CORE_LOCKING is
 	// off), never on this stack. Falls back to internal, counted, where PSRAM
 	// is short or absent (pd::createTaskPreferPsram).
-	BaseType_t ok = pd::createTaskPreferPsram(
-		&RtpReceiver::taskTrampoline,
-		"rtp_media_rx",
-		6144,   // headroom for lwIP recvfrom() + sink callback (decode is in-place)
-		this,
-		6,
-		nullptr,
-		0 /* Core 0 */);
+	//
+	// Issue #479: created on this slot's boot-preallocated stack + TCB
+	// (_taskMem), so the call path allocates nothing.
+	_parkedTask = (_taskMem.stack == nullptr) ? nullptr
+		: xTaskCreateStaticPinnedToCore(
+			&RtpReceiver::taskTrampoline,
+			"rtp_media_rx",
+			_taskMem.bytes,   // headroom for lwIP recvfrom() + sink callback (decode is in-place)
+			this,
+			6,
+			_taskMem.stack,
+			_taskMem.tcb,
+			0 /* Core 0 */);   // #535: handle kept so the owner can reap the parked task
 
-	if (ok != pdPASS)
+	if (_parkedTask == nullptr)
 	{
 		ESP_LOGE("RtpReceiver", "rtp_media_rx task create failed");
 		close(_sock);
 		_sock = -1;
 		clearSlotLocked();
 		_taskRunning.store(false, std::memory_order_release);
+		_parkedTask = nullptr;
 		return false;
 	}
 
@@ -633,7 +666,29 @@ void RtpReceiver::taskTrampoline(void* arg)
 	// Clearing _taskRunning is the LAST access to `self`: after this the destructor
 	// may observe the task as gone and allow the object to be destroyed.
 	self->_taskRunning.store(false, std::memory_order_release);
-	pd::deleteTask(nullptr);   // #466: vTaskDeleteWithCaps for a PSRAM stack, vTaskDelete otherwise
+	// Issue #535: park, never self-delete. vTaskDeleteWithCaps(NULL) (a PSRAM
+	// stack, #466) creates an internal helper task to free this one and
+	// abort()s if that ~1.9 KB allocation fails -- on every media-leg teardown,
+	// under exactly the internal-DRAM pressure #466/#328 are about. The owner
+	// (next start() or ~RtpReceiver) deletes this task from outside with
+	// pd::reapParkedStaticTask (#479), which allocates nothing. Suspending touches no
+	// member, so it is safe after the _taskRunning store above.
+	for (;;)
+	{
+		vTaskSuspend(nullptr);
+	}
+}
+
+bool RtpReceiver::reapParkedTaskLocked()
+{
+	// #572 review: delete ONLY a task that has cleared _taskRunning (its last
+	// touch of `this`) AND is suspended in its park loop. A running or
+	// not-yet-suspended task may hold _slotMutex or be mid-way on the other
+	// core; deleting it there is the #421 class of bug. So on anything else,
+	// keep the handle, count it, and let the next start()/destructor retry.
+	// #479: the task sits on this slot's static memory; the reap frees nothing.
+	return pd::reapParkedStaticTask(_parkedTask,
+		_taskRunning.load(std::memory_order_acquire), _reapDeferred);
 }
 
 void RtpReceiver::runLoop()

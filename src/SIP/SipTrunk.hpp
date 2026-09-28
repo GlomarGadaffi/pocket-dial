@@ -10,6 +10,7 @@
 
 #include "PbxEnv.hpp"
 #include "PoolConfig.hpp"
+#include "SipDigest.hpp"   // #399: answering 401/407
 #include "SipMessage.hpp"
 
 // ── Generic ITSP SIP trunk, outbound half (issue #164) ───────────────────────
@@ -123,10 +124,8 @@ public:
 		// same string as fromUser. Empty means "use fromUser", matching
 		// SipRegistrationClient's "digest username (often == aorUser)".
 		//
-		// STORED ONLY. Nothing sends this on the wire yet: SipTrunk answers no
-		// 401/407 challenge today, and digest REGISTER is not wired. It is
-		// persisted and loaded at boot so the credential surface is complete;
-		// update this comment when the challenge path lands.
+		// Issue #399: the username a 401/407 on our INVITE is answered with
+		// (answerChallenge()). Digest REGISTER is still not wired.
 		char authUser[64] = {};
 
 		bool enabled = false;
@@ -152,7 +151,7 @@ public:
 	// SipRegistrationClient::configure(cfg, password), which splits it the same
 	// way for the same reason.
 	//
-	// STORED ONLY -- see Config::authUser. Nothing transmits this yet.
+	// Used to answer a 401/407 on our INVITE (#399); never logged.
 	// A value of kMaxSecret characters or more is REJECTED outright rather
 	// than silently shortened into a password that cannot authenticate.
 	static constexpr size_t kMaxSecret = 64;   // == SipRegistrationClient::kMaxSecret
@@ -229,6 +228,18 @@ public:
 		uint16_t localRtpPort = 0;
 		bool     sawSessionProgress = false;   // a 183 arrived: early media is live
 
+		// Issue #399: the offer, kept so a 401/407 can be answered with the same
+		// SDP, and whether that has already happened. One answer per dialog: a
+		// second challenge is a failure, never a loop.
+		std::string offerSdp;
+		bool        authAttempted = false;
+		// The challenged (first) INVITE transaction, kept once authAttempted is
+		// set: a retransmitted final response for it is re-ACKed in ITS
+		// transaction and never touches the live retry (CaveJay's #581 B1).
+		std::string challengedBranch;
+		std::string challengedToTag;
+		uint32_t    challengedCseq = 0;
+
 		sockaddr_in peer{};
 		std::chrono::steady_clock::time_point deadline{};
 	};
@@ -244,7 +255,10 @@ public:
 	// sdp.size(); the caller still calls syncContentLength() after pooling, for
 	// the same reason RegisterBeeper does -- a wrong Content-Length silently
 	// truncates the offer on UDP and the carrier answers 400.
-	static std::string buildInvite(const Dialog& d, const std::string& sdp);
+	// `authLine`, when non-empty, is a complete "Authorization: ..." or
+	// "Proxy-Authorization: ..." header line (no CRLF) answering a challenge (#399).
+	static std::string buildInvite(const Dialog& d, const std::string& sdp,
+		std::string_view authLine = {});
 
 	// ACK for a 2xx (RFC 3261 §13.2.2.4): a NEW transaction with a fresh branch,
 	// sent to the dialog's remote target, carrying the To-tag from the answer.
@@ -301,11 +315,11 @@ public:
 	{
 		virtual ~Listener() = default;
 
-		// 180, or 183 with earlyMedia=true. Nothing is relayed yet either way:
-		// a 183's SDP is not read here (see the class note on staying
-		// SDP-ignorant), so the caller hears silence rather than the carrier's
-		// announcement until early media is wired as a follow-up.
-		virtual void onTrunkRinging(const TrunkEvent& ev, bool earlyMedia) = 0;
+		// 180, or 183 with earlyMedia=true. For a 183, `progress` is the
+		// carrier's response itself, so the listener can read its SDP and relay
+		// early media (#400); SipTrunk stays SDP-ignorant. nullptr for a 180.
+		virtual void onTrunkRinging(const TrunkEvent& ev, bool earlyMedia,
+			const std::shared_ptr<SipMessage>& progress) = 0;
 
 		// Fired AFTER the ACK is enqueued and the dialog reads Confirmed, so a
 		// listener that immediately hangs up produces ACK-then-BYE on the wire,
@@ -431,6 +445,13 @@ private:
 	// comment above gives for its char arrays. Also lets clearCredentials()
 	// actually overwrite the bytes, which std::string cannot promise.
 	char _secret[kMaxSecret] = {};
+
+	// Issue #399: scratch for answering a 401/407, as members rather than stack
+	// locals (~1.1 KB on the SIP thread otherwise). Only touched under the
+	// engine's _mutex, like every other SipTrunk method.
+	bool answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status);
+	SipDigest::BoundedChallenge _challenge{};
+	char _authLine[32 + SipDigest::kMaxAuthorizationValue] = {};
 
 	Listener* _listener = nullptr;
 	std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS> _dialogs{};

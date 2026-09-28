@@ -83,8 +83,8 @@ void SipServer::onNewMessage(std::string_view data, sockaddr_in src)
 	}
 	else
 	{
-		// Issue #443 S1: createMessage() fails only when the message pool and
-		// its bounded heap fallback are spent. The datagram is gone -- count it
+		// Issue #443 S1: createMessage() fails only when the message pool is
+		// spent (no heap fallback since #409). The datagram is gone -- count it
 		// (it never reaches handle(), so packetsDropped cannot see it).
 		_handler.noteRxDiscard(DropProbe::Reason::NoPool, src, data, data.size());
 	}
@@ -109,7 +109,12 @@ void SipServer::onDiscard(UdpServer::Discard what, std::string_view bytes, socka
 
 void SipServer::onHandled(const sockaddr_in& dest, std::shared_ptr<SipMessage> message)
 {
-	_socket.send(dest, message->toString());
+	// #462: serialise into the one reusable buffer (see _sendBuf). toString(out)
+	// clear()s and reserve()s the exact size, which only reallocates when a
+	// message is larger than any sent before -- so after warm-up, no allocation.
+	std::lock_guard<std::mutex> lock(_sendMutex);
+	message->toString(_sendBuf);
+	_socket.send(dest, _sendBuf);
 }
 
 #if !defined(ESP_PLATFORM) && !defined(ARDUINO)

@@ -1109,3 +1109,144 @@ TEST(AnchorRouting, ACancelAfterTheAnchorAnsweredSendsNo487)
 			<< "an answered INVITE gets no 487";
 	}
 }
+
+TEST(AnchorRouting, AnAckDeadlineReapOfAConnectedAnchorCallByesTheHandset)
+{
+	// Issue #533 (#451 X1): tick()'s ACK-deadline reap of a CONNECTED outbound
+	// anchor call dropped the anchor leg and ended the session but never told
+	// the handset, on the theory that a phone that never ACKed is gone. The
+	// phone was not gone: it showed a live call with dead air, and its own BYE
+	// later drew 404. The reap now BYEs it, like every other server teardown.
+	//
+	// Loopback answers synchronously and never arms the ACK deadline, so the
+	// expired deadline a real (async) anchor's Answered handler arms is set on
+	// the session directly.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-533"));
+	auto session = handler.getSession("Call-ID: anchor-533");
+	ASSERT_TRUE(session.has_value());
+	ASSERT_EQ(session.value()->getState(), Session::State::Connected);
+	session.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+
+	EXPECT_FALSE(handler.getSession("Call-ID: anchor-533").has_value()) << "the reap still ends the call";
+	std::vector<std::string> byesToHandset;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg) continue;
+		if (addr.sin_addr.s_addr != addrFor("192.168.9.51").sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.rfind("BYE ", 0) == 0) byesToHandset.push_back(raw);
+	}
+	ASSERT_EQ(byesToHandset.size(), 1u) << "the handset must be told the call is over";
+	EXPECT_NE(byesToHandset.front().find("Call-ID: anchor-533"), std::string::npos);
+}
+
+TEST(AnchorRouting, TheHandsetsAckDisarmsTheAnchorAckDeadline)
+{
+	// Issue #533 root cause: a healthy anchored call whose handset ACKed the 2xx
+	// must not be reaped by the ACK deadline. The deadline is armed already
+	// expired (as a real anchor's Answered handler arms it, 15 s on), the handset
+	// ACKs as a real UA does (Request-URI = the 200's Contact, To carries our tag,
+	// fresh branch), then tick() runs past it.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-533a"));
+	auto session = handler.getSession("Call-ID: anchor-533a");
+	ASSERT_TRUE(session.has_value());
+	ASSERT_EQ(session.value()->getState(), Session::State::Connected);
+
+	std::string ok;
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		const std::string raw = msg ? msg->toString() : std::string();
+		if (raw.rfind("SIP/2.0 200 OK", 0) == 0 && raw.find("CSeq: 1 INVITE") != std::string::npos) ok = raw;
+	}
+	ASSERT_FALSE(ok.empty()) << "the anchor answered 200";
+	auto line = [&ok](const char* name) {
+		const size_t at = ok.find(std::string("\r\n") + name);
+		if (at == std::string::npos) return std::string();
+		const size_t start = at + 2;
+		return ok.substr(start, ok.find("\r\n", start) - start);
+	};
+	const std::string to = line("To:");
+	const std::string contact = line("Contact:");
+	ASSERT_NE(to.find(";tag="), std::string::npos) << ok;
+	std::string ruri = "sip:555@192.168.9.1:5060";
+	const size_t lt = contact.find('<'), gt = contact.find('>');
+	if (lt != std::string::npos && gt != std::string::npos) ruri = contact.substr(lt + 1, gt - lt - 1);
+
+	session.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	const std::string ack =
+		"ACK " + ruri + " SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.9.51:5060;branch=z9hG4bKack533a\r\n"
+		"From: <sip:501@server>;tag=ftanchor-533a\r\n"
+		+ to + "\r\n"
+		"Call-ID: anchor-533a\r\n"
+		"CSeq: 1 ACK\r\n"
+		"Max-Forwards: 70\r\n"
+		"Content-Length: 0\r\n\r\n";
+	auto ackMsg = RequestsHandler::getMessageFromPool(ack, addrFor("192.168.9.51"));
+	ASSERT_TRUE(ackMsg);
+	handler.handle(ackMsg);
+
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+
+	auto after = handler.getSession("Call-ID: anchor-533a");
+	ASSERT_TRUE(after.has_value()) << "an ACKed anchor call must not be reaped";
+	EXPECT_EQ(after.value()->getState(), Session::State::Connected);
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		EXPECT_NE(msg ? msg->toString().rfind("BYE ", 0) : 1u, 0u) << "no BYE on a healthy call";
+	}
+}
+
+TEST(AnchorRouting, AMissedKeepaliveDoesNotPruneAPhoneThatIsInACall)
+{
+	// Issue #533 (#451 X1 on .244): a handset that did not answer the board's
+	// OPTIONS pings mid-call was pruned 15 s after its last SIP packet, and the
+	// sweep erased its anchored call with no endCall() and no BYE. The orphan
+	// reaper then dropped the leg; the phone kept a dead call and its BYE drew
+	// 404. RTP is not SIP activity, so a live call must not be swept this way.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeRegister("502", "192.168.9.52", "reg-502"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-533-ka"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-533-ka").has_value());
+
+	handler.idleClientAndSweepForTest("501", std::chrono::seconds(20));
+	EXPECT_TRUE(handler.getSession("Call-ID: anchor-533-ka").has_value())
+		<< "a phone in a call must not be pruned for a missed keepalive";
+
+	// Positive control: a silent phone with no call is still pruned.
+	handler.idleClientAndSweepForTest("502", std::chrono::seconds(20));
+	handler.forceNextTickForTest();   // getActiveClients() reads the tick snapshot
+	handler.tick();
+	bool still502 = false;
+	for (const auto& [number, address] : handler.getActiveClients())
+	{
+		(void)address;
+		if (number == "502") still502 = true;
+	}
+	EXPECT_FALSE(still502) << "an idle phone with no call is still swept";
+}

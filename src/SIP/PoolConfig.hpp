@@ -22,7 +22,7 @@
 // (32 clients, 8 sessions). The message-pool default was historically 32 (== client
 // count); it is now sized to cover the worst-case broadcast + BLF-NOTIFY burst
 // (MAX_CLIENTS + MAX_SUBSCRIPTIONS + headroom, Issue #54) so peak fan-out no longer
-// spills into the hot-path heap fallback.
+// is refused (#409; there is no heap fallback).
 //
 // Trade-off in one line: raise these for capacity, lower them to claw back RAM
 // on a constrained SoftAP node. See docs/SCALING.md for per-tier recommendations,
@@ -63,38 +63,20 @@
 // flushed. Those pooled refs all live at once, so the pool must cover MAX_CLIENTS
 // (fan-out) + MAX_SUBSCRIPTIONS (NOTIFY burst), plus a little headroom for the
 // inbound request being processed and its direct response(s). Sizing it this way
-// keeps the broadcast+NOTIFY peak allocation-free instead of spilling to the
-// hot-path heap fallback in getMessageFromPool(). Override to claw back RAM on a
-// constrained node.
+// keeps the broadcast+NOTIFY peak inside the pool. Issue #409: past this depth
+// getMessageFromPool() REFUSES (there is no heap fallback), so this is a hard
+// ceiling on in-flight messages. Override to claw back RAM on a constrained node.
 #ifndef POCKETDIAL_MSG_POOL
 #define POCKETDIAL_MSG_POOL (POCKETDIAL_MAX_CLIENTS + POCKETDIAL_MAX_SUBSCRIPTIONS + 4)
 #endif
 
-// Issue #101(A): ceiling on the heap fallback taken when the message pool above
-// is fully drawn. It used to be unbounded — a sustained retransmit flood could
-// churn the heap indefinitely, and on a no-MMU ESP32 the eventual failure mode
-// is a bad_alloc out of the middle of the SIP task, not graceful degradation.
-//
-// This caps messages ALIVE AT ONCE on the fallback path, not a rate: the count
-// drops again as each one is released, so a burst is absorbed and only sustained
-// over-subscription is refused. Past the cap, getMessageFromPool() returns
-// nullptr and the caller drops the packet.
-//
-// Dropping is the honest answer rather than 503: building a 503 would itself
-// need a message out of the very pool that just came up empty. SIP over UDP
-// retransmits (RFC 3261 §17 T1 backoff), so a dropped packet costs latency, not
-// the call — and shedding load is the point when the server is this far behind.
-#ifndef POCKETDIAL_MSG_HEAP_FALLBACK_MAX
-#define POCKETDIAL_MSG_HEAP_FALLBACK_MAX 8
-#endif
-
-// Same ceiling for the virtual-peer pool (park orbits / BLF presence stand-ins).
-// Smaller because a virtual peer is a long-lived per-park-slot object, not a
-// per-packet one: needing more than a handful past the pool means the orbit
-// table is already full.
-#ifndef POCKETDIAL_VPEER_HEAP_FALLBACK_MAX
-#define POCKETDIAL_VPEER_HEAP_FALLBACK_MAX 4
-#endif
+// Issue #409: neither pool has a heap fallback any more (#101A's
+// POCKETDIAL_MSG_HEAP_FALLBACK_MAX / POCKETDIAL_VPEER_HEAP_FALLBACK_MAX are gone,
+// so it cannot be switched back on by config). A drained message pool makes the
+// caller DROP -- building a 503 would need a message out of the same empty pool,
+// and SIP over UDP retransmits (RFC 3261 §17). A drained virtual-peer pool makes
+// the caller answer 503 or abandon the feature cleanly (#412). Both are counted
+// in /api/status (msgPoolRefusals, vpeerPoolRefusals).
 
 // Maximum number of concurrent server-originated "register beep" dialogs. Each new
 // REGISTER fires a brief signaling-only auto-answer INVITE (the phone's intercom
@@ -185,7 +167,7 @@
 #endif
 
 // Number of legs the local N-way conference room (virtual extension 888) accepts —
-// see ConferenceRoom.hpp and docs/CONFERENCE_MIXER.md. Must be ≤ MixBus::MAX_PORTS (8).
+// see ConferenceRoom.hpp and docs/CONFERENCE_MIXER.md. MixBus::MAX_PORTS follows it (#479).
 //
 // Unlike the peer-to-peer call paths, a conference leg IS server media: it costs one
 // Session slot, one RTP receive task, one RTP send task and two MixBus rings (~6 KB)
@@ -194,6 +176,21 @@
 // POCKETDIAL_MAX_SESSIONS and a look at free heap.
 #ifndef POCKETDIAL_CONF_LEGS
 #define POCKETDIAL_CONF_LEGS 4
+#endif
+
+// Issue #479: 1 builds the 888 room at boot (its legs' RTP task slots and rings are
+// fixed then); 0 (SIP_CONSTRAINED, no PSRAM) builds no room, reserves no conference
+// slots, and answers 888 "403 conference disabled on this build".
+#ifndef POCKETDIAL_CONFERENCE
+#define POCKETDIAL_CONFERENCE 1
+#endif
+
+// Issue #479 (option D): rtp_media_tx stacks (3 KB, internal DMA) form ONE pool
+// shared by every RtpSender, sized to the concurrent outbound media streams. A
+// start() that finds it full is refused and counted (/api/status
+// rtpTxPoolRefused), never heap. 6 x 3 KB = 18 KB internal, fixed at boot.
+#ifndef POCKETDIAL_RTP_TX_POOL
+#define POCKETDIAL_RTP_TX_POOL 6
 #endif
 
 // Number of concurrent anchor media bridges (the 555 virtual extension --

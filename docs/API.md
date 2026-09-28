@@ -514,13 +514,11 @@ attach it to cross-site requests). There is **no `Secure` flag**; the dashboard 
 plain HTTP on a LAN appliance, and `Secure` would make the cookie unusable. The
 cookie value is the session token; the CSRF token is never a cookie, by design.
 
-**Brute-force accounting** is **global, not per-client.** `AdminAuth` implements
-per-client buckets and `handleClient()` even derives `peerIp` from `getpeername()` for
-them (`HttpServer.cpp:247-263`), but it stores that only on the OTA request (`:330`).
-`parseRequest()` never sets `req.clientIp`, so `sendApiAdminLogin` passes an empty string
-(`:2720`, `:2729`, `:2732`) and every failure shares one unkeyed bucket with the DTMF PIN
-path. **One guesser can therefore lock the real admin out**; see
-[THREAT_MODEL.md](THREAT_MODEL.md) D-3. The thresholds below are real:
+**Brute-force accounting** is **per client since #530**: `handleClient()` sets
+`req.clientIp` from the peer address on every request, and `sendApiAdminLogin` keys the
+lockout on that address plus the principal. **One guesser can still lock the real admin
+out** through the per-principal aggregate backstop, which counts across that client's own
+cooldowns; see [THREAT_MODEL.md](THREAT_MODEL.md) D-3. The thresholds below are real:
 `kMaxFailedAttempts` = 5 consecutive failures engage a
 `kLockoutMs` = 60 s cooldown, and consecutive lockouts back off exponentially to a
 cap of 60 s << 4 ≈ 16 minutes. A separate aggregate backstop
@@ -808,6 +806,7 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
   "httpPort": 80,
   "httpReadDeadlineDrops": 0,
   "httpPerSourceRefusals": 0,
+  "httpStatusRefusals": 0,
   "uptime": 14205,
   "packetsProcessed": 10543,
   "packetsDropped": 12,
@@ -819,6 +818,9 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
   "sessions": [
     { "caller": "1001", "callee": "1002", "state": "Connected", "duration": "03:45" }
   ],
+  "sessionCount": 1,
+  "oldestSessionSec": 225,
+  "parkedCount": 0,
   "dnd": ["1003"],
   "forwards": [
     { "extension": "1001", "always": "", "busy": "1002", "noanswer": "" }
@@ -874,10 +876,13 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `httpPort` | Integer | The active TCP HTTP port (typically 80). |
 | `httpReadDeadlineDrops` | Integer | HTTP connections dropped because the request (headers + buffered body) did not arrive within 10 s of the accept (#529), or whose receive timeout could not be set at all (#534; closed unread rather than left to block). A climbing count means a slow or hostile client. |
 | `httpPerSourceRefusals` | Integer | HTTP connections refused `503` because one source address already held 3 of the 4 connection slots (#529). |
-| `emergencyRoute` | String | (#521) Where a 911/933 dial would go right now: `"anchor"` (the boot-selected telephony provider places real calls; a configured SIP trunk is its fallback when it is down), `"trunk"` (no such provider, but a valid SIP trunk is configured; this means *configured*, not *verified*: the generic trunk cannot answer a 401/407 digest challenge yet, so place a 933 test call to prove the route), or `"none"` (only the loopback test provider is present, so the board **refuses** emergency calls with `503 Emergency Call Not Routable`; the loopback simulator never answers one). The dashboard shows a warning banner while this is `"none"`. Ungated like the rest of the block. **Absent** while no SIP engine is attached yet (the first seconds after boot), which a client should treat as unknown, not as `"none"`. |
+| `httpStatusRefusals` | Integer | `/api/status` responses refused `500` because the body did not fit its fixed per-connection buffer (24 KB x 4; 16 KB x 2 without PSRAM, where a third concurrent poll gets the `503`), or `503` because that buffer failed to allocate at boot (#410). Never truncated. |
+| `emergencyRoute` | String | (#521) Where a 911/933 dial would go right now: `"anchor"` (the boot-selected telephony provider places real calls; a configured SIP trunk is its fallback when it is down), `"trunk"` (no such provider, but a valid SIP trunk is configured **and has answered an INVITE with a 2xx since boot or since its configuration last changed**), `"trunk-unverified"` (#546: a valid trunk is configured but has not yet completed a call, so it is *configured*, not *proved*: the generic trunk cannot answer a 401/407 digest challenge yet (#399). The dashboard shows a banner asking for a 933 test call. Emergency calls are still tried on it), or `"none"` (only the loopback test provider is present, so the board **refuses** emergency calls with `503 Emergency Call Not Routable`; the loopback simulator never answers one). The dashboard shows a warning banner while this is `"none"`. Ungated like the rest of the block. **Absent** while no SIP engine is attached yet (the first seconds after boot), which a client should treat as unknown, not as `"none"`. |
 | `uptime` | Integer | Time in seconds since the HTTP server initialized. |
 | `packetsProcessed` | Integer | Total UDP signaling packets processed by the state machine. |
 | `packetsDropped` | Integer | Total UDP signaling packets dropped by rate-limiting or firewall rules. |
+| `msgPoolRefusals` | Integer | (#409) Draws the process-wide SIP message pool refused because every slot was in use. There is no heap fallback, so each one is a request dropped (the peer retransmits) or a response not sent. Non-zero means the pool is undersized for the load, or the board is being flooded. |
+| `vpeerPoolRefusals` | Integer | (#409) Virtual-peer pool refusals (777/440/888/555/voicemail/park stand-ins). Each one was answered `503` or its feature abandoned cleanly (#412). |
 | `sd` | Object | microSD state. **Always present**, on every build and transport, so a client never has to distinguish "key missing" from "no card". |
 | `sd.present` | Boolean | Whether this *build* has a card slot wired, i.e. was compiled with `PD_ETH_HAS_SD`. True only for `eth` on `PD_ETH_BOARD=elite`; false on `wifi`, `lan8720`, `display`, the Waveshare `eth` board, and the host build. This is a build capability, not a runtime observation. |
 | `sd.mounted` | Boolean | Whether a card is actually mounted at `/sdcard` right now. Distinguishing this from `present` matters: `present:true, mounted:false` means the slot exists but the card is missing, unreadable, or **exFAT** (ESP-IDF's FatFs mounts FAT16/FAT32 only, and cards over 32 GB ship exFAT from the factory). |
@@ -885,11 +890,13 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `clients` | Array | Array of objects listing active VoIP extensions. |
 | `clients[].number` | String | SIP extension number (e.g., `"1001"`). |
 | `clients[].address` | String | Client's IP and port (e.g., `"192.168.4.12:5060"`). |
-| `sessions` | Array | Array of active SIP communication channels. |
+| `sessions` | Array | Active calls: `{caller, callee, state, duration}`. **Empty without an admin session** (#539): who is calling whom is the live call log, gated like `/api/cdr` and the `clients` roster (#207). |
 | `sessions[].caller` | String | Extension that initiated the call. |
 | `sessions[].callee` | String | Target extension receiving the call. |
 | `sessions[].state` | String | Active session state. Exactly one of `Invited`, `Connected`, `Busy`, `Unavailable`, `Cancel`, `Bye`, or `Unknown` for an unmapped enumerator (`sessionStateToString`, `src/SIP/RequestsHandler.cpp:4262`). |
 | `sessions[].duration` | String | **A preformatted display string, not a number.** `MM:SS` under an hour, `HH:MM:SS` at or above it, zero-padded either way (`"03:45"`, `"01:02:03"`). The underlying integer seconds is not exposed anywhere; a client that wants arithmetic has to parse this back. |
+| `sessionCount` | Integer | (#539) Number of active calls. Always present, authenticated or not. |
+| `oldestSessionSec` | Integer | (#539) Age in seconds of the oldest active call, 0 when none. Always present; the #401 soak reads it to find a stuck leg without a credential. |
 | `dnd` | Array | Extension numbers (**strings**, not objects) currently in Do-Not-Disturb. |
 | `forwards` | Array | Per-extension call-forward targets: `{extension, always, busy, noanswer}`. An unset trigger is an empty string, never `null` or a missing key. |
 | `groups` | Array | Ring/hunt groups: `{extension, mode, members}`, where `mode` is `ringall` or `hunt`. |
@@ -899,7 +906,8 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `dialplan[].action` | String | `group`, `page`, `park`, or `trunk`. |
 | `dialplan[].target` | String | The group / paging-zone / park-orbit extension the rule routes to, or, for `trunk`, the string prepended to the dialed number after stripping (possibly empty, meaning "prepend nothing"). |
 | `dialplan[].stripDigits` | Number | `trunk` only (Issue #165): leading digits removed from the dialed number before prepending `target`. `0` for every other action. |
-| `parkedCalls` | Array | Calls currently sitting on a park orbit: `{orbit, parkedExt, parker, secondsParked}`. Lets a client tell a parked extension apart from an idle or connected one. |
+| `parkedCalls` | Array | Calls currently sitting on a park orbit: `{orbit, parkedExt, parker, secondsParked}`. Lets a client tell a parked extension apart from an idle or connected one. **Empty without an admin session** (#539). |
+| `parkedCount` | Integer | (#539) Number of parked calls. Always present. |
 | `freeHeap` | Integer | `esp_get_free_heap_size()` (issue #185), free internal+PSRAM heap right now, in bytes. `0` on the host build (no heap_caps there). |
 | `minFreeHeap` | Integer | `esp_get_minimum_free_heap_size()` (#185), the LOWEST free-heap level seen since boot, not the current one. A transient allocation spike that `freeHeap` never catches (it's only sampled when something happens to poll this route) still shows up here. `0` on the host build. |
 | `minFreeHeapSpiram` | Integer | `heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)` (#185), same "lowest ever" reading, PSRAM only. `PsramTask.hpp`'s own comment is the reason this exists separately from `minFreeHeap`: internal RAM is what actually starves under concurrent calls (task stacks, TLS), and a combined number hides that a PSRAM-heavy board can look fine in aggregate while internal RAM is exhausted. `0` on the host build **and** on any no-PSRAM build (`sdkconfig.defaults.esp32_constrained`); the call itself is always safe, but a build with no SPIRAM capability has nothing in that pool to report. |

@@ -272,11 +272,16 @@ namespace
 #endif
 	}
 
+	// Nonce stamp clock. Monotonic, not wall time (#578): an SNTP step backward
+	// after a #525 replay-table overflow would stamp every fresh nonce at or
+	// before the eviction watermark and strand every phone on stale 401s. The
+	// stamp is never read as wall time. It restarts at boot, but so does the
+	// HMAC secret, so a pre-reboot nonce fails its tag rather than reading fresh.
 	uint64_t nowMs()
 	{
 		return static_cast<uint64_t>(
 			std::chrono::duration_cast<std::chrono::milliseconds>(
-				std::chrono::system_clock::now().time_since_epoch()).count());
+				std::chrono::steady_clock::now().time_since_epoch()).count());
 	}
 
 	// Constant-time string compare. Returns true iff equal. Does not short-circuit
@@ -623,10 +628,14 @@ namespace SipDigest
 		}
 	}
 
+	std::string nonceAt(uint64_t ts)
+	{
+		return toHexU64(ts) + "." + nonceTag(ts);
+	}
+
 	std::string generateNonce()
 	{
-		uint64_t ts = nowMs();
-		return toHexU64(ts) + "." + nonceTag(ts);
+		return nonceAt(nowMs());
 	}
 
 	bool validateNonce(const std::string& nonce, bool* expiredOut, uint64_t ttlMs)
@@ -654,9 +663,13 @@ namespace SipDigest
 			return false; // forged / corrupt — NOT stale
 		}
 
-		// Freshness. Guard against clock skew making `now < ts`.
+		// Freshness. The clock is monotonic, so within one boot ts <= now always.
+		// A stamp ahead of now is from before a reboot (the clock restarted); it
+		// can only verify if the secret repeated (weak entropy, #420). Refuse it
+		// outright, never clamp it to age 0 (#584 review).
 		uint64_t now = nowMs();
-		uint64_t age = (now >= ts) ? (now - ts) : 0;
+		if (ts > now) return false;
+		uint64_t age = now - ts;
 		bool expired = age > ttlMs;
 		if (expiredOut) *expiredOut = expired;
 		return !expired;

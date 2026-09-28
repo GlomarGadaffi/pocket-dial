@@ -63,7 +63,9 @@
 // See CdrRing.cpp's writer task for the reference caller.
 #define PD_ASSERT_NOT_PSRAM_STACK() \
 	do { \
-		int pd_stack_probe_; \
+		/* Only the ADDRESS is used; initialised so GCC 15's */ \
+		/* -Werror=maybe-uninitialized accepts it in small callers (#481). */ \
+		int pd_stack_probe_ = 0; \
 		assert(!esp_ptr_external_ram(&pd_stack_probe_) && \
 			"flash operation attempted from a PSRAM-stacked task (PD_TASK_STACK_CAPS) -- " \
 			"see PsramTask.hpp and issue #277"); \
@@ -72,6 +74,8 @@
 #include "sdkconfig.h"          // CONFIG_SPIRAM
 #include "esp_log.h"
 #include "PsramAllocator.hpp"   // psram::internalFallbacks() -- the one PSRAM-fallback counter
+#include "ParkedTaskReap.hpp"   // pd::reapDecision (#479 static-slot reap)
+#include <atomic>
 
 namespace pd
 {
@@ -116,6 +120,71 @@ namespace pd
 			vTaskDeleteWithCaps(task);
 		else
 			vTaskDelete(task);
+	}
+
+	// Issue #479: a media-task slot's preallocated stack + TCB, for
+	// xTaskCreateStaticPinnedToCore. Allocated ONCE, at construction (boot),
+	// and reused by every stream the slot runs; never freed while a task may
+	// still sit on it. The TCB is always internal. The stack takes `caps`, then
+	// `fallbackCaps` if nonzero (counted in psram::internalFallbacks() when the
+	// first choice was PSRAM). A slot whose allocation failed stays empty and
+	// its start() refuses -- logged, never a crash.
+	struct StaticTaskSlot
+	{
+		StackType_t*  stack = nullptr;
+		StaticTask_t* tcb   = nullptr;
+		uint32_t      bytes = 0;
+
+		bool alloc(const char* name, uint32_t stackBytes, uint32_t caps, uint32_t fallbackCaps = 0)
+		{
+			tcb   = static_cast<StaticTask_t*>(heap_caps_calloc(1, sizeof(StaticTask_t),
+			                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+			stack = static_cast<StackType_t*>(heap_caps_malloc(stackBytes, caps));
+			if (stack == nullptr && fallbackCaps != 0)
+			{
+				stack = static_cast<StackType_t*>(heap_caps_malloc(stackBytes, fallbackCaps));
+				if (stack != nullptr && (caps & MALLOC_CAP_SPIRAM))
+					psram::internalFallbacks().fetch_add(1, std::memory_order_relaxed);
+			}
+			if (tcb == nullptr || stack == nullptr)
+			{
+				ESP_LOGE("PsramTask", "%s: no memory for a %u B static task slot (#479)",
+				         name, static_cast<unsigned>(stackBytes));
+				heap_caps_free(tcb);
+				heap_caps_free(stack);
+				tcb = nullptr;
+				stack = nullptr;
+				return false;
+			}
+			bytes = stackBytes;
+			return true;
+		}
+	};
+
+	// Issue #479 (#535 / #572 review): reap a parked task created on a
+	// StaticTaskSlot. Deletes ONLY when pd::reapDecision() says Reap, with a
+	// plain vTaskDelete from this (another) task: a static task's memory is the
+	// slot's, so nothing is freed and nothing is allocated, and the slot can host
+	// the next stream at once. (pd::deleteTask would pick vTaskDeleteWithCaps
+	// for a PSRAM stack and free the slot's memory.) True when the slot is free;
+	// on Wait the handle is kept and `deferred` counts it.
+	inline bool reapParkedStaticTask(TaskHandle_t& task, bool taskRunning,
+	                                 std::atomic<uint32_t>& deferred)
+	{
+		switch (reapDecision(task != nullptr, taskRunning,
+		                     task != nullptr && eTaskGetState(task) == eSuspended))
+		{
+			case ReapDecision::Nothing:
+				return true;
+			case ReapDecision::Reap:
+				vTaskDelete(task);
+				task = nullptr;
+				return true;
+			case ReapDecision::Wait:
+			default:
+				deferred.fetch_add(1, std::memory_order_relaxed);
+				return false;
+		}
 	}
 }
 #endif
