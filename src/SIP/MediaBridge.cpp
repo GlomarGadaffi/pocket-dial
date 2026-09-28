@@ -1,5 +1,8 @@
 #include "MediaBridge.hpp"
 #include <cstring>
+#if defined(ESP_PLATFORM)
+#include "esp_log.h"   // #533 diag: syslog only carries esp_log output
+#endif
 
 MediaBridge::MediaBridge() = default;
 
@@ -410,6 +413,11 @@ void MediaBridge::stopBridge()
 	}
 
 	_active.store(false, std::memory_order_release);
+#if defined(ESP_PLATFORM)
+	// #533 diag: which bridge stopped. Paired with endCall()'s line, this tells a
+	// session teardown apart from a bridge-only stop (e.g. the orphan reaper).
+	ESP_LOGW("MediaBridge", "stopBridge call=%s part=%s", _callID.c_str(), _participantId.c_str());
+#endif
 
 	// Leave the bus BEFORE the sockets stop (docs/CONFERENCE_MIXER.md §7): the port is
 	// marked Draining first, so any frame still in flight from the receive task is

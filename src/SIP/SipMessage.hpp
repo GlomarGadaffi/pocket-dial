@@ -223,6 +223,9 @@ public:
 	// Full `Authorization:` request-header line (or empty if absent). The value
 	// is fed to SipDigest::parseAuthorization, which tolerates the header name.
 	std::string_view getAuthorization() const;
+	// The full line of the first header named `name` (case-insensitive, no
+	// compact form), or empty. #399: the trunk reads WWW-/Proxy-Authenticate.
+	std::string_view getHeaderLine(std::string_view name) const;
 	// Full `Event:` header line (RFC 6665), compact form `o:`. Empty when absent.
 	// The subscription machinery wants the package name only — strip the header
 	// name with siphdr::stripHeaderName and cut at the first ';' parameter.
@@ -293,6 +296,12 @@ private:
 	// the cache's owner can tell when its parse went stale.
 	std::string              _startLine;
 	std::vector<std::string> _headerLines;
+	// #462: header-line strings a shorter message did not need, kept with their
+	// buffers instead of being destroyed, so the next longer message parsed into
+	// this (pooled) object reuses them rather than allocating. NOT message
+	// state: nothing reads it except the parse/copy paths in SipMessage.cpp,
+	// and its contents are meaningless leftovers. Only its capacity matters.
+	std::vector<std::string> _spareHeaderLines;
 	std::string              _body;
 	// Bumped by every _body mutation — see bodyGeneration().
 	//

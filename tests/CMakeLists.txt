@@ -26,6 +26,21 @@ FetchContent_MakeAvailable(googletest)
 
 include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers support)
 
+# Issue #411: the test binary gets the same firmware version stamp as the device
+# and the host SipServer, so /api/status can be asserted to carry it.
+#
+# Only when built standalone (`cmake ../tests`, what CI and the WSL workflow
+# run). When the top-level host project pulls this in via add_subdirectory, it
+# has already decided the stamp and written the header, and both are
+# inherited here; recomputing would run git twice and pass the flag twice.
+if(NOT DEFINED POCKETDIAL_RESOLVED_FW_VERSION)
+    include(${CMAKE_CURRENT_LIST_DIR}/../cmake/FirmwareVersion.cmake)
+    pocketdial_firmware_version(POCKETDIAL_RESOLVED_FW_VERSION)
+    pocketdial_write_fw_version_header("${POCKETDIAL_RESOLVED_FW_VERSION}")
+endif()
+# pocketdial_fw_version.h, read only by FirmwareInfo.cpp (#461 review).
+include_directories(${CMAKE_BINARY_DIR}/generated)
+
 add_executable(sip_parser_tests
     SipMessage_test.cpp
     # RFC regressions found by tests/interop/ (real pjsip stack): SDP answers
@@ -59,19 +74,25 @@ add_executable(sip_parser_tests
     # applies them to every SDP-bearing message before any decode or relay.
     # Also pins the decode paths as zero-heap via a counting operator new.
     SdpAdmission_test.cpp
+    AllocBaseline_test.cpp
+    # #462 (#284 batch A): parse, send and drain allocate nothing in steady state.
+    HotPathInPlace_test.cpp
     # The binary's one counting operator new, plus its own positive controls.
     support/AllocCounter.cpp
     AllocCounter_test.cpp
-    # Issue #101(A)/(E): message-pool backpressure (bounded heap fallback, then
-    # refuse) and the concurrent-handout invariant. Draws on the process-global
+    # Issue #101(A)/(E): message-pool backpressure (refuse when spent; no heap
+    # fallback since #409) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
     RequestsHandler_pool_test.cpp
+    # Issue #409: a spent pool refuses, never heap-falls-back.
+    PoolNoHeapFallback_test.cpp
     # Issue #410 phase 1: the static HTML pages stream from flash (byte-identical
     # to the old path, zero allocation beyond the CSRF token).
     HttpStaticPages_test.cpp
     # Issue #410 phase 2: every response goes out in place via one scatter-gather
     # sendmsg() (byte-identical, short writes resumed, zero allocation).
     HttpSendPath_test.cpp
+    HttpStatusAlloc_test.cpp
     # Issue #412: every allocateVirtualPeer() caller must survive an exhausted
     # pool -- refuse with 503 (or drop the anchor leg) and release what it had
     # claimed, never publish a session with a null peer.
@@ -124,6 +145,8 @@ add_executable(sip_parser_tests
     # /api/email/test, driven through a real HttpServer socket exactly like
     # AdminHttpGate_test.cpp's other routes. Ports 18160-18169.
     EmailHttp_test.cpp
+    # Issue #411: the build identifies itself (stamp + /api/status "version").
+    FirmwareInfo_test.cpp
     TrunkConfigHttp_test.cpp
     SipDigest_test.cpp
     # Issue #164 groundwork: the CLIENT half of digest auth. SipDigest_test
@@ -454,6 +477,8 @@ add_executable(sip_parser_tests
     # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
     # PcapCapture.hpp has no dependency beyond sockaddr_in.
     PcapCapture_test.cpp
+    # Issue #470 / #473: CDR ring as an NVS blob, and the factory-reset write guard.
+    CdrPersistBlob_test.cpp
     # Issue #463 (#284 batch B): the idle tick, OPTIONS ping and header rewrites.
     IdleTickAlloc_test.cpp
     # Issue #464 (#284 batch C): per-request lookups allocate nothing.
@@ -500,6 +525,9 @@ add_executable(sip_parser_tests
     # Issue #382: HttpServer's /api/coredump* routes call it; the host arm serves
     # a test-installed fake image instead of flash.
     ../src/Helpers/CoreDumpStore.cpp
+    # Issue #473: the factory-reset journal (host arm keeps the record in memory).
+    ../src/Helpers/ResetJournal.cpp
+    ResetJournal_test.cpp
     # Issue #363: the secrets a factory reset must erase.
     ../src/Helpers/FactoryReset.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
@@ -609,6 +637,14 @@ add_executable(sip_parser_tests
     CdrRing_test.cpp
     # Issue #496 / #509 review: the IPv4 input guard (Ip4InputGuard.h).
     Ip4InputGuard_test.cpp
+    # Issue #535 / #572 review: when a parked media task may be deleted.
+    ParkedTaskReap_test.cpp
+    # Issue #479: the shared rtp_media_tx stack pool (claim/refuse/return).
+    TxSlotPool_test.cpp
+    # Issue #554 (b): the dropped-leg tombstone ring.
+    RecentIdRing_test.cpp
+    # Issue #554 (#575 review): rx restart decision + tombstone refusal.
+    RxRestart_test.cpp
     # The DTMF digit-collection state machine + CLASS/admin codes, extracted
     # out of RequestsHandler into its own translation unit.
     ../src/SIP/DtmfFeatureCodes.cpp
@@ -652,6 +688,7 @@ add_executable(sip_parser_tests
     # guards on every ESP-only branch) but not previously linked into this
     # target. Needed by AdminHttpGate_test.cpp above.
     ../src/Helpers/HttpServer.cpp
+    ../src/Helpers/FirmwareInfo.cpp
     ../src/Helpers/OtaUpdater.cpp
     # Issue #159 (SMTP client): the pure protocol engine (no sockets/TLS --
     # see SmtpDialogue.hpp's header comment) and the real transport

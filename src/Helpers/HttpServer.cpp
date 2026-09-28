@@ -11,6 +11,9 @@
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
 #include "FactoryReset.hpp"    // Issue #363: the secrets factory reset must erase
 #include "DeviceConfig.hpp"
+#include "ResetJournal.hpp"     // #473: report an incomplete factory reset on the next boot
+#include "ResetGuard.hpp"      // #473: block NVS data writes while resetting
+#include "FirmwareInfo.hpp"    // Issue #411: "version" / "firmware" in /api/status
 #include <cstdio>   // std::snprintf: the factory-reset error body (#450)
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
@@ -22,6 +25,7 @@
 // eyeballed on hardware.
 #include "DmaFramePool.hpp"
 #include "RtpReceiver.hpp"     // Issue #469: rxOversizeDrops() on /api/status
+#include "RtpSender.hpp"       // Issue #479: txPoolRefusals() on /api/status
 #include "HoldMusic.hpp"       // Issue #466: clipRefusals() on /api/status
 #include "PsramAllocator.hpp"  // Issue #466: psram::internalFallbacks() on /api/status
 #include "index_html.h"
@@ -50,6 +54,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <cstring>
+#include <charconv>   // std::to_chars: /api/status numbers, no heap (#410)
 #include <string_view>
 #include <sstream>
 #include <iostream>
@@ -130,6 +135,13 @@ HttpServer::HttpServer(const std::string& ip, int port, RequestsHandler* handler
 	{
 		throw std::runtime_error("HttpServer: failed to open listen socket on port " + std::to_string(_port));
 	}
+
+	// #410: /api/status's output buffers, once, here -- never per request. A
+	// failed allocation leaves that slot null; the route then answers 503.
+	for (char*& b : _statusBuf)
+	{
+		b = static_cast<char*>(psram::allocPreferPsram(kStatusBufBytes));
+	}
 }
 
 bool HttpServer::openListenSocket()
@@ -202,6 +214,38 @@ HttpServer::~HttpServer()
 	{
 		_acceptThread.join();
 	}
+	// Issue #540: every connection runs on a DETACHED thread whose lambda uses
+	// `this` after handleClient() returns (recordConnStackHwm, releaseSource,
+	// _activeConnections). Returning here while one is still running freed the
+	// server under it -- a use-after-free that showed up as a segfault in a
+	// later, unrelated test. No new connection can start (the accept thread is
+	// joined), and each handler is bounded by the read deadline plus its own
+	// work, so wait them out; the bound only guards against a wedged handler.
+	const auto giveUp = std::chrono::steady_clock::now() +
+		std::chrono::milliseconds(_readDeadlineMs + 5000);
+	while (_activeConnections.load(std::memory_order_acquire) > 0 &&
+		std::chrono::steady_clock::now() < giveUp)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	// #540 review: giving up with a handler still running IS the use-after-free
+	// above, just deferred. Never let it pass silently: say so, and on the host
+	// (tests) stop right here, where the cause is, not in whatever runs next.
+	const int stillRunning = _activeConnections.load(std::memory_order_acquire);
+	if (stillRunning > 0)
+	{
+		std::cerr << "[HttpServer] destroyed with " << stillRunning
+			<< " connection handler(s) still running after the read deadline + 5 s"
+			   " -- a wedged handler will touch freed memory (#540)\n";
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+		std::abort();
+#endif
+	}
+	// #410: a still-running handler may be reading its status buffer; leak them then.
+	for (char* b : _statusBuf)
+	{
+		if (b != nullptr && stillRunning == 0) psram::freePreferPsram(b);
+	}
 }
 
 void HttpServer::start()
@@ -261,6 +305,10 @@ void HttpServer::acceptLoop()
 	// It also caches the presence probe itself (#405): after this, /api/status
 	// and the coredump routes never touch the partition per request.
 	CoreDumpStore::prime();
+	// #481 review: load the reset journal's boot status here too, before the
+	// first accept -- the flash read and the one-time lock setup happen on this
+	// 8 KB thread once, never on a 4 KB http_conn thread per request.
+	(void)resetjournal::bootStatus();
 
 #if defined(ESP_PLATFORM)
 	// Issue #366. esp_pthread_set_cfg() applies to threads created BY THE
@@ -1630,6 +1678,64 @@ static std::string jsonEscape(const std::string& s)
 	return out;
 }
 
+// #410: bounded JSON writer over a caller-owned fixed buffer -- no heap. Once
+// an append does not fit, `full` latches and every later append is a no-op;
+// the caller refuses the response rather than send a truncated body.
+namespace
+{
+	struct JsonOut
+	{
+		char* buf = nullptr;
+		size_t cap = 0;
+		size_t len = 0;
+		bool full = false;
+
+		JsonOut& s(std::string_view v)
+		{
+			if (full || v.size() > cap - len) { full = true; return *this; }
+			std::memcpy(buf + len, v.data(), v.size());
+			len += v.size();
+			return *this;
+		}
+		JsonOut& b(bool v) { return s(v ? "true" : "false"); }
+		template <class T> JsonOut& n(T v)
+		{
+			char t[24];
+			const auto r = std::to_chars(t, t + sizeof(t), v);
+			if (r.ec != std::errc{}) { full = true; return *this; }
+			return s(std::string_view(t, static_cast<size_t>(r.ptr - t)));
+		}
+		// Same escaping as jsonEscape(), written in place.
+		JsonOut& e(std::string_view v)
+		{
+			static const char* hex = "0123456789abcdef";
+			for (unsigned char c : v)
+			{
+				switch (c)
+				{
+					case '"':  s("\\\""); break;
+					case '\\': s("\\\\"); break;
+					case '\n': s("\\n");  break;
+					case '\r': s("\\r");  break;
+					case '\t': s("\\t");  break;
+					default:
+						if (c < 0x20)
+						{
+							const char u[6] = { '\\', 'u', '0', '0', hex[(c >> 4) & 0x0F], hex[c & 0x0F] };
+							s(std::string_view(u, 6));
+						}
+						else
+						{
+							const char ch = static_cast<char>(c);
+							s(std::string_view(&ch, 1));
+						}
+				}
+			}
+			return *this;
+		}
+	};
+}
+
 #if defined(ESP_PLATFORM)
 // ── Issue #185: task-watchdog + heap/stack telemetry for GET /api/status ────
 // Read-only and zero-coupling: every stack high-water mark below is looked up
@@ -1719,17 +1825,10 @@ static const char* pdResetReasonString(esp_reset_reason_t reason)
 }
 
 // Appends ,"<key>":<bytes|null> -- the shared shape for every stackHwm_* field.
-static void pdAppendHwmField(std::ostringstream& json, const char* key, long bytes)
+static void pdAppendHwmField(JsonOut& json, const char* key, long bytes)
 {
-	json << ",\"" << key << "\":";
-	if (bytes < 0)
-	{
-		json << "null";
-	}
-	else
-	{
-		json << bytes;
-	}
+	json.s(",\"").s(key).s("\":");
+	if (bytes < 0) json.s("null"); else json.n(bytes);
 }
 #endif // ESP_PLATFORM
 
@@ -1761,17 +1860,38 @@ void HttpServer::recordConnStackHwm()
 
 void HttpServer::sendApiStatus(int sock, bool authenticated)
 {
+	// #410: polled every second by the dashboard, so no heap per request. The
+	// body is written into this connection's fixed buffer (allocated in the
+	// constructor) and sent from there; the snapshot tables are formatted in
+	// place under the snapshot lock instead of copied out. A body that does not
+	// fit is refused with a 500 and counted -- never truncated, never grown.
+	char* buf = nullptr;
+	std::atomic<bool>* busy = nullptr;
+	for (int i = 0; i < kStatusBufCount && buf == nullptr; ++i)
+	{
+		if (_statusBuf[i] != nullptr && !_statusBufBusy[i].exchange(true, std::memory_order_acquire))
+		{
+			buf = _statusBuf[i];
+			busy = &_statusBufBusy[i];
+		}
+	}
+	if (buf == nullptr)   // all busy (fewer buffers than slots without PSRAM), or failed at boot
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+			"{\"error\":\"no status buffer\"}");
+		return;
+	}
+	struct Release
+	{
+		std::atomic<bool>* f;
+		~Release() { f->store(false, std::memory_order_release); }
+	} release{busy};   // held until the send below has finished reading buf
+	JsonOut json{buf, (std::min)(_statusCap, kStatusBufBytes)};
+
 	uint64_t uptimeMs = currentTimeMs() - _startTime;
 	uint64_t uptimeSec = uptimeMs / 1000;
 
-	std::vector<std::pair<std::string, std::string>> clients;
-	std::vector<std::tuple<std::string, std::string, std::string, int>> sessions;
-	std::vector<std::string> dndExtensions;
-	std::vector<std::string> voicemailExtensions;
-	std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwards;
-	std::vector<std::tuple<std::string, std::string, std::string>> ringGroups;
-	std::vector<std::tuple<std::string, std::string, std::string, int>> dialRules;
-	std::vector<std::tuple<std::string, std::string, std::string, int>> parkedCalls;
 	uint64_t packets = 0;
 	uint64_t dropped = 0;
 	bool e911Configured = false;
@@ -1787,14 +1907,6 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
 	if (handler != nullptr)
 	{
-		clients = handler->getActiveClients();
-		sessions = handler->getActiveSessions();
-		dndExtensions = handler->getDndExtensions();
-		voicemailExtensions = handler->getVoicemailExtensions();
-		forwards = handler->getForwards();
-		ringGroups = handler->getRingGroups();
-		dialRules = handler->getDialRules();
-		parkedCalls = handler->getParkedCalls();
 		packets = handler->getPacketsProcessed();
 		dropped = handler->getPacketsDropped();   // Issue #38
 		e911Configured = handler->isE911Configured();   // #450
@@ -1809,29 +1921,46 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		lastRecvErrno = probe.lastRecvErrno();
 	}
 
-	std::string displayIp = _ip;
-	if (displayIp == "0.0.0.0")
+	char displayIp[INET_ADDRSTRLEN] = "";
+	if (_ip == "0.0.0.0")
 	{
-		displayIp = getPrimaryLocalIP();
+		// false leaves "127.0.0.1" in displayIp, the same fallback getPrimaryLocalIP() gives.
+		(void)getPrimaryLocalIPInto(displayIp, sizeof(displayIp));
 	}
 
-	std::ostringstream json;
-	json << "{";
-	json << "\"ip\":\"" << jsonEscape(displayIp) << "\",";
-	json << "\"port\":" << 5060 << ",";
-	json << "\"httpPort\":" << _port << ",";
+	json.s("{");
+	json.s("\"ip\":\"").e(displayIp[0] ? std::string_view(displayIp) : std::string_view(_ip)).s("\",");
+	json.s("\"port\":").n(5060).s(",");
+	json.s("\"httpPort\":").n(_port).s(",");
+	// #411: which build is this. "version" is what tests/run.py's
+	// board-provenance check and the bench run sheets compare with
+	// `git describe` (TEST_HARNESS.md §5.3).
+	//
+	// Public, like the roster is not (#207): provenance fetches this without a
+	// session, and a check that cannot see the field must not quietly pass.
+	// ONLY the version string, by design -- the same class of disclosure as a
+	// SIP User-Agent. No build host, no path, no build timestamp and no IDF
+	// version here: those tell an attacker more than which build this is, and
+	// provenance needs none of them. They go to the boot banner on the serial
+	// console instead, which is not network-reachable.
+	// Raw, no jsonEscape() (#461 review: it built a std::string per request).
+	// cmake/FirmwareVersion.cmake refuses any stamp outside [A-Za-z0-9._+-] at
+	// configure time, and FirmwareInfo_test pins the charset of the one built in.
+	json.s("\"version\":\"").s(FirmwareInfo::version()).s("\",");
 	// #529: HTTP connections dropped for a slow request, and refused because
 	// one source already held its share of the slots.
-	json << "\"httpReadDeadlineDrops\":" << readDeadlineDrops() << ",";
-	json << "\"httpPerSourceRefusals\":" << perSourceRefusals() << ",";
+	json.s("\"httpReadDeadlineDrops\":").n(readDeadlineDrops()).s(",");
+	json.s("\"httpPerSourceRefusals\":").n(perSourceRefusals()).s(",");
+	// #410: /api/status bodies refused for not fitting the fixed buffer.
+	json.s("\"httpStatusRefusals\":").n(statusRefusals()).s(",");
 	// #167: state the board's WiFi capability rather than leaving the dashboard
 	// to infer it from an empty scan result. An eth/lan8720 build has no radio at
 	// all, so "found 0 networks" is not an empty scan -- it is a scan that can
 	// never succeed, and the two are indistinguishable to a client without this.
 #if defined(POCKETDIAL_HAS_WIFI)
-	json << "\"wifiCapable\":true,";
+	json.s("\"wifiCapable\":true,");
 #else
-	json << "\"wifiCapable\":false,";
+	json.s("\"wifiCapable\":false,");
 #endif
 	// Issue #521: where a 911 dial would go -- "anchor", "trunk" or "none".
 	// "none" means the board refuses it with 503 (only the loopback simulator
@@ -1841,44 +1970,56 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// know, and it names no host, account or credential.
 	if (emergencyRoute != nullptr)
 	{
-		json << "\"emergencyRoute\":\"" << emergencyRoute << "\",";
+		json.s("\"emergencyRoute\":\"").s(emergencyRoute).s("\",");
 	}
-	json << "\"uptime\":" << uptimeSec << ",";
+	json.s("\"uptime\":").n(uptimeSec).s(",");
 #if defined(ESP_PLATFORM)
 	// Issue #496 / #509 review: frames and fragments the IPv4 input guard
 	// (Ip4InputGuard.h) dropped since boot.
 	{
 		uint32_t g[2] = {0, 0};
 		pd_ip4_guard_counts(g);
-		json << "\"ip4Guard\":{\"padded\":" << g[0] << ",\"tinyFragments\":" << g[1] << "},";
+		json.s("\"ip4Guard\":{\"padded\":").n(g[0]).s(",\"tinyFragments\":").n(g[1]).s("},");
 	}
 #endif
-	json << "\"packetsProcessed\":" << packets << ",";
-	json << "\"packetsDropped\":" << dropped << ",";
+	// #470: CDR ring persist health. A non-zero failure count means call history
+	// is NOT surviving reboots; suppressed counts writes refused mid-reset (#473).
+	json.s("\"cdrPersistFailures\":").n(CdrRing::persistFailureCount()).s(",");
+	json.s("\"cdrPersistSuppressed\":").n(CdrRing::persistSuppressedCount()).s(",");
+	json.s("\"cdrLoadFailures\":").n(CdrRing::loadFailureCount()).s(",");   // #594: load() read failures
+	json.s("\"packetsProcessed\":").n(packets).s(",");
+	json.s("\"packetsDropped\":").n(dropped).s(",");
+	// Issue #409: draws refused by a spent pool (neither has a heap fallback).
+	// The message pool is process-global, so it reads even with no engine.
+	json.s("\"msgPoolRefusals\":").n(RequestsHandler::getMessagePoolRefusals()).s(",");
+	json.s("\"vpeerPoolRefusals\":").n(handler ? handler->getVirtualPeerRefusals() : 0).s(",");
 	// #450 / poll #454: false after a factory reset until the E911 notify list is
 	// set again. The dashboard shows a banner; nothing is gated on it.
-	json << "\"e911Configured\":" << (e911Configured ? "true" : "false") << ",";
+	json.s("\"e911Configured\":").b(e911Configured).s(",");
 	// Issue #430: the same drops by reason (they sum to packetsDropped, modulo a
 	// race between the loads), then the most recent ones. Like the roster below
 	// (#207), the per-drop source addresses and bytes need a session; the counts
 	// do not.
-	json << "\"droppedInvalid\":" << droppedInvalid << ",";
-	json << "\"droppedRate\":" << droppedRate << ",";
+	json.s("\"droppedInvalid\":").n(droppedInvalid).s(",");
+	json.s("\"droppedRate\":").n(droppedRate).s(",");
 	// Issue #430: CR/LF-only keep-alives. Counted apart: they are not drops.
-	json << "\"keepalivesCrlf\":" << keepalivesCrlf << ",";
+	json.s("\"keepalivesCrlf\":").n(keepalivesCrlf).s(",");
 	// Issue #443/#444: discarded before handle() -- NOT part of packetsDropped.
 	// No message was ever built for these; the ring below records their source
 	// (no_pool, oversize with the datagram's real length). recvErrors are failed
 	// receives (no datagram, so no source); the receive timeout's idle wake is
 	// not counted.
-	json << "\"droppedNoPool\":" << droppedNoPool << ",";
-	json << "\"droppedOversize\":" << droppedOversize << ",";
+	json.s("\"droppedNoPool\":").n(droppedNoPool).s(",");
+	json.s("\"droppedOversize\":").n(droppedOversize).s(",");
 	// Issue #469: the RTP side of the same check -- media datagrams over
 	// RtpReceiver::MAX_DATAGRAM_BYTES, dropped instead of parsed cut.
-	json << "\"rtpRxOversize\":" << RtpReceiver::rxOversizeDrops() << ",";
-	json << "\"recvErrors\":" << recvErrors << ",";
-	json << "\"lastRecvErrno\":" << lastRecvErrno << ",";
-	json << "\"recentDrops\":[";
+	json.s("\"rtpRxOversize\":").n(RtpReceiver::rxOversizeDrops()).s(",");
+	// #479: tx stack pool starts refused (pool full) and slots retired at boot.
+	json.s("\"rtpTxPoolRefused\":").n(RtpSender::txPoolRefusals()).s(",");
+	json.s("\"rtpTxPoolRetired\":").n(RtpSender::txPoolRetired()).s(",");
+	json.s("\"recvErrors\":").n(recvErrors).s(",");
+	json.s("\"lastRecvErrno\":").n(lastRecvErrno).s(",");
+	json.s("\"recentDrops\":[");
 	if (authenticated && handler != nullptr)
 	{
 		// One Record on the stack at a time, no allocation, and the probe's lock
@@ -1900,162 +2041,205 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 				head[2 * b + 1] = kHex[d.head[b] & 0x0f];
 			}
 			head[2 * headLen] = '\0';
-			sockaddr_in src{};
-			src.sin_family      = AF_INET;
-			src.sin_addr.s_addr = d.ip;
-			src.sin_port        = d.port;
-			if (any) json << ",";
+			// "ip:port", as sipwire::addrToIpPort() formats it, without its std::string.
+			in_addr srcAddr{};
+			srcAddr.s_addr = d.ip;
+			char srcIp[INET_ADDRSTRLEN] = "";
+			if (inet_ntop(AF_INET, &srcAddr, srcIp, sizeof(srcIp)) == nullptr) srcIp[0] = '\0';
+			if (any) json.s(",");
 			any = true;
-			json << "{\"seq\":" << d.seq
-			     << ",\"tsUs\":" << d.tsUs
-			     << ",\"reason\":\"" << DropProbe::reasonName(d.reason) << "\""
-			     << ",\"src\":\"" << jsonEscape(sipwire::addrToIpPort(src)) << "\""
-			     << ",\"len\":" << d.len
-			     << ",\"head\":\"" << head << "\"}";
+			json.s("{\"seq\":").n(d.seq)
+			    .s(",\"tsUs\":").n(d.tsUs)
+			    .s(",\"reason\":\"").s(DropProbe::reasonName(d.reason)).s("\"")
+			    .s(",\"src\":\"").e(srcIp).s(":").n(ntohs(d.port)).s("\"")
+			    .s(",\"len\":").n(d.len)
+			    .s(",\"head\":\"").s(head).s("\"}");
 		}
 	}
-	json << "],";
+	json.s("],");
 
 	// microSD, on builds that have a slot wired (currently the T-ETH-ELITE `eth`
 	// board only). Always present so a client can tell "no card" from "this build
 	// has no slot": `present` is the build capability, `mounted` the runtime fact.
 #if defined(PD_ETH_HAS_SD)
-	json << "\"sd\":{\"present\":true,\"mounted\":" << (pd_sd_mounted() ? "true" : "false")
-	     << ",\"capacityMb\":" << pd_sd_capacity_mb() << "},";
+	json.s("\"sd\":{\"present\":true,\"mounted\":").b(pd_sd_mounted())
+	    .s(",\"capacityMb\":").n(pd_sd_capacity_mb()).s("},");
 #else
-	json << "\"sd\":{\"present\":false,\"mounted\":false,\"capacityMb\":0},";
+	json.s("\"sd\":{\"present\":false,\"mounted\":false,\"capacityMb\":0},");
 #endif
 
-	// Clients array
-	// #207: the roster is withheld from an unauthenticated caller. The counts
-	// below stay visible -- "4 phones registered" is operational status, and the
-	// dashboard shows it before login -- but WHICH extensions, at WHICH
-	// addresses, is a target list and requires a session.
-	json << "\"clients\":[";
-	if (authenticated)
+	// #473: did the last factory reset complete? Public, like the counts: it
+	// discloses no identity, and an operator taking the board over needs to
+	// see it before logging in. `resetJournal` says where the record lives
+	// ("flash" survives a power cut, "rtc" only a restart -- see ResetJournal.hpp).
 	{
-		for (size_t i = 0; i < clients.size(); i++)
+		const resetjournal::BootStatus rj = resetjournal::bootStatus();
+		json.s("\"resetIncomplete\":").b(rj.incomplete()).s(",")
+		    .s("\"resetIncompleteStage\":\"").s(resetjournal::stageName(rj.stage)).s("\",")
+		    .s("\"resetFailedMask\":").n(static_cast<unsigned>(rj.failedMask)).s(",")
+		    .s("\"resetJournal\":\"").s(resetjournal::storageName(rj.storage)).s("\",")
+		    .s("\"resetJournalWriteFailures\":").n(resetjournal::writeFailureCount()).s(",");
+	}
+
+	// The snapshot tables, formatted in place under the snapshot lock (#410).
+	// Nothing in here blocks: it only appends to the fixed buffer.
+	auto tables = [&](const auto& snap)
+	{
+		// Clients array
+		// #207: the roster is withheld from an unauthenticated caller. The counts
+		// below stay visible -- "4 phones registered" is operational status, and the
+		// dashboard shows it before login -- but WHICH extensions, at WHICH
+		// addresses, is a target list and requires a session.
+		json.s("\"clients\":[");
+		for (size_t i = 0; authenticated && i < snap.clients.size(); i++)
 		{
-			if (i > 0) json << ",";
-			json << "{\"number\":\"" << jsonEscape(clients[i].first)
-			     << "\",\"address\":\"" << jsonEscape(clients[i].second) << "\"}";
+			if (i > 0) json.s(",");
+			json.s("{\"number\":\"").e(snap.clients[i].first)
+			    .s("\",\"address\":\"").e(snap.clients[i].second).s("\"}");
 		}
-	}
-	json << "],";
-	// The COUNT is not withheld -- "4 phones registered" is operational status the
-	// dashboard shows before login, and it discloses no identity. Emitted
-	// unconditionally so an unauthenticated client can tell "nobody is registered"
-	// from "you are not allowed to see who is", which an empty array alone cannot.
-	json << "\"clientCount\":" << clients.size() << ",";
-	json << "\"rosterVisible\":" << (authenticated ? "true" : "false") << ",";
+		json.s("],");
+		// The COUNT is not withheld -- "4 phones registered" is operational status the
+		// dashboard shows before login, and it discloses no identity. Emitted
+		// unconditionally so an unauthenticated client can tell "nobody is registered"
+		// from "you are not allowed to see who is", which an empty array alone cannot.
+		json.s("\"clientCount\":").n(snap.clients.size()).s(",");
+		json.s("\"rosterVisible\":").b(authenticated).s(",");
 
-	// Sessions array
-	json << "\"sessions\":[";
-	for (size_t i = 0; i < sessions.size(); i++)
-	{
-		if (i > 0) json << ",";
-		int durationSec = std::get<3>(sessions[i]);
-		int hrs = durationSec / 3600;
-		int mins = (durationSec % 3600) / 60;
-		int secs = durationSec % 60;
-		char durationBuf[32]{};
-		if (hrs > 0)
+		// Sessions array
+		// Issue #539: live callers and callees are the CURRENT version of the CDR,
+		// which #207 put behind the session gate -- so they follow the roster's
+		// rule. An unauthenticated caller gets an empty array plus two identity-
+		// free fields: how many calls are up, and how old the oldest one is (the
+		// #401 soak tooling reads these to find a stuck leg without a credential).
+		int oldestSessionSec = 0;
+		for (const auto& s : snap.sessions)
 		{
-			snprintf(durationBuf, sizeof(durationBuf), "%02d:%02d:%02d", hrs, mins, secs);
+			oldestSessionSec = (std::max)(oldestSessionSec, std::get<3>(s));
 		}
-		else
+		json.s("\"sessionCount\":").n(snap.sessions.size()).s(",");
+		json.s("\"oldestSessionSec\":").n(oldestSessionSec).s(",");
+		json.s("\"sessions\":[");
+		for (size_t i = 0; authenticated && i < snap.sessions.size(); i++)
 		{
-			snprintf(durationBuf, sizeof(durationBuf), "%02d:%02d", mins, secs);
+			if (i > 0) json.s(",");
+			int durationSec = std::get<3>(snap.sessions[i]);
+			int hrs = durationSec / 3600;
+			int mins = (durationSec % 3600) / 60;
+			int secs = durationSec % 60;
+			char durationBuf[32]{};
+			if (hrs > 0)
+			{
+				snprintf(durationBuf, sizeof(durationBuf), "%02d:%02d:%02d", hrs, mins, secs);
+			}
+			else
+			{
+				snprintf(durationBuf, sizeof(durationBuf), "%02d:%02d", mins, secs);
+			}
+
+			json.s("{\"caller\":\"").e(std::get<0>(snap.sessions[i]))
+			    .s("\",\"callee\":\"").e(std::get<1>(snap.sessions[i]))
+			    .s("\",\"state\":\"").e(std::get<2>(snap.sessions[i]))
+			    .s("\",\"duration\":\"").s(durationBuf).s("\"}");
 		}
+		json.s("],");
 
-		json << "{\"caller\":\"" << jsonEscape(std::get<0>(sessions[i]))
-		     << "\",\"callee\":\"" << jsonEscape(std::get<1>(sessions[i]))
-		     << "\",\"state\":\"" << jsonEscape(std::get<2>(sessions[i]))
-		     << "\",\"duration\":\"" << durationBuf << "\"}";
-	}
-	json << "],";
+		// DND array: extensions currently in Do Not Disturb (Phase 2).
+		json.s("\"dnd\":[");
+		for (size_t i = 0; i < snap.dnd.size(); i++)
+		{
+			if (i > 0) json.s(",");
+			json.s("\"").e(snap.dnd[i]).s("\"");
+		}
+		json.s("],");
 
-	// DND array: extensions currently in Do Not Disturb (Phase 2).
-	json << "\"dnd\":[";
-	for (size_t i = 0; i < dndExtensions.size(); i++)
+		// Voicemail array (Issue #246): extensions currently voicemail-enabled.
+		json.s("\"voicemail\":[");
+		for (size_t i = 0; i < snap.voicemail.size(); i++)
+		{
+			if (i > 0) json.s(",");
+			json.s("\"").e(snap.voicemail[i]).s("\"");
+		}
+		json.s("],");
+
+		// Call-forward array (Class A sweep): per-extension always/busy/noanswer targets.
+		json.s("\"forwards\":[");
+		for (size_t i = 0; i < snap.forwards.size(); i++)
+		{
+			if (i > 0) json.s(",");
+			json.s("{\"extension\":\"").e(std::get<0>(snap.forwards[i]))
+			    .s("\",\"always\":\"").e(std::get<1>(snap.forwards[i]))
+			    .s("\",\"busy\":\"").e(std::get<2>(snap.forwards[i]))
+			    .s("\",\"noanswer\":\"").e(std::get<3>(snap.forwards[i])).s("\"}");
+		}
+		json.s("],");
+
+		// Ring/hunt-group array (Class A sweep): group ext, mode, comma-joined members.
+		json.s("\"groups\":[");
+		for (size_t i = 0; i < snap.ringGroups.size(); i++)
+		{
+			if (i > 0) json.s(",");
+			json.s("{\"extension\":\"").e(std::get<0>(snap.ringGroups[i]))
+			    .s("\",\"mode\":\"").e(std::get<1>(snap.ringGroups[i]))
+			    .s("\",\"members\":\"").e(std::get<2>(snap.ringGroups[i])).s("\"}");
+		}
+		json.s("],");
+
+		// Dial-plan rules (Issue #69, stripDigits for the Trunk action Issue #165).
+		// Emitted in TABLE ORDER — this array's order is load-bearing (first match
+		// wins), unlike the sets above.
+		json.s("\"dialplan\":[");
+		for (size_t i = 0; i < snap.dialRules.size(); i++)
+		{
+			if (i > 0) json.s(",");
+			json.s("{\"pattern\":\"").e(std::get<0>(snap.dialRules[i]))
+			    .s("\",\"action\":\"").e(std::get<1>(snap.dialRules[i]))
+			    .s("\",\"target\":\"").e(std::get<2>(snap.dialRules[i]))
+			    .s("\",\"stripDigits\":").n(std::get<3>(snap.dialRules[i])).s("}");
+		}
+		json.s("],");
+
+		// Parked calls: {orbit, parkedExt, parker, secondsParked} — Issue #65's
+		// ParkOrbit::snapshotRows(onlyParked=true), used by the dashboard to tell
+		// a parked jack apart from an idle or actively-connected one.
+		// Issue #539: which extension is parked, and by whom, is identity too.
+		// The count stays public.
+		json.s("\"parkedCount\":").n(snap.parkedCalls.size()).s(",");
+		json.s("\"parkedCalls\":[");
+		for (size_t i = 0; authenticated && i < snap.parkedCalls.size(); i++)
+		{
+			if (i > 0) json.s(",");
+			json.s("{\"orbit\":\"").e(std::get<0>(snap.parkedCalls[i]))
+			    .s("\",\"parkedExt\":\"").e(std::get<1>(snap.parkedCalls[i]))
+			    .s("\",\"parker\":\"").e(std::get<2>(snap.parkedCalls[i]))
+			    .s("\",\"secondsParked\":").n(std::get<3>(snap.parkedCalls[i])).s("}");
+		}
+		json.s("]");
+	};
+	if (handler != nullptr)
 	{
-		if (i > 0) json << ",";
-		json << "\"" << jsonEscape(dndExtensions[i]) << "\"";
+		handler->withSnapshot(tables);
 	}
-	json << "],";
-
-	// Voicemail array (Issue #246): extensions currently voicemail-enabled.
-	json << "\"voicemail\":[";
-	for (size_t i = 0; i < voicemailExtensions.size(); i++)
+	else
 	{
-		if (i > 0) json << ",";
-		json << "\"" << jsonEscape(voicemailExtensions[i]) << "\"";
+		// No engine yet: the same keys, empty (docs/API.md).
+		json.s("\"clients\":[],\"clientCount\":0,\"rosterVisible\":").b(authenticated)
+		    .s(",\"sessionCount\":0,\"oldestSessionSec\":0,\"sessions\":[],\"dnd\":[],"
+		       "\"voicemail\":[],\"forwards\":[],\"groups\":[],\"dialplan\":[],"
+		       "\"parkedCount\":0,\"parkedCalls\":[]");
 	}
-	json << "],";
-
-	// Call-forward array (Class A sweep): per-extension always/busy/noanswer targets.
-	json << "\"forwards\":[";
-	for (size_t i = 0; i < forwards.size(); i++)
-	{
-		if (i > 0) json << ",";
-		json << "{\"extension\":\"" << jsonEscape(std::get<0>(forwards[i]))
-		     << "\",\"always\":\""   << jsonEscape(std::get<1>(forwards[i]))
-		     << "\",\"busy\":\""     << jsonEscape(std::get<2>(forwards[i]))
-		     << "\",\"noanswer\":\"" << jsonEscape(std::get<3>(forwards[i])) << "\"}";
-	}
-	json << "],";
-
-	// Ring/hunt-group array (Class A sweep): group ext, mode, comma-joined members.
-	json << "\"groups\":[";
-	for (size_t i = 0; i < ringGroups.size(); i++)
-	{
-		if (i > 0) json << ",";
-		json << "{\"extension\":\"" << jsonEscape(std::get<0>(ringGroups[i]))
-		     << "\",\"mode\":\""     << jsonEscape(std::get<1>(ringGroups[i]))
-		     << "\",\"members\":\""  << jsonEscape(std::get<2>(ringGroups[i])) << "\"}";
-	}
-	json << "],";
-
-	// Dial-plan rules (Issue #69, stripDigits for the Trunk action Issue #165).
-	// Emitted in TABLE ORDER — this array's order is load-bearing (first match
-	// wins), unlike the sets above.
-	json << "\"dialplan\":[";
-	for (size_t i = 0; i < dialRules.size(); i++)
-	{
-		if (i > 0) json << ",";
-		json << "{\"pattern\":\"" << jsonEscape(std::get<0>(dialRules[i]))
-		     << "\",\"action\":\"" << jsonEscape(std::get<1>(dialRules[i]))
-		     << "\",\"target\":\"" << jsonEscape(std::get<2>(dialRules[i]))
-		     << "\",\"stripDigits\":" << std::get<3>(dialRules[i]) << "}";
-	}
-	json << "],";
-
-	// Parked calls: {orbit, parkedExt, parker, secondsParked} — Issue #65's
-	// ParkOrbit::snapshotRows(onlyParked=true), used by the dashboard to tell
-	// a parked jack apart from an idle or actively-connected one.
-	json << "\"parkedCalls\":[";
-	for (size_t i = 0; i < parkedCalls.size(); i++)
-	{
-		if (i > 0) json << ",";
-		json << "{\"orbit\":\"" << jsonEscape(std::get<0>(parkedCalls[i]))
-		     << "\",\"parkedExt\":\"" << jsonEscape(std::get<1>(parkedCalls[i]))
-		     << "\",\"parker\":\"" << jsonEscape(std::get<2>(parkedCalls[i]))
-		     << "\",\"secondsParked\":" << std::get<3>(parkedCalls[i]) << "}";
-	}
-	json << "]";
 
 	// Issue #185: task-watchdog / heap / per-task stack telemetry. Purely
 	// additive -- every key here is new; nothing above this line changed.
 #if defined(ESP_PLATFORM)
-	json << ",\"freeHeap\":" << esp_get_free_heap_size();
-	json << ",\"minFreeHeap\":" << esp_get_minimum_free_heap_size();
-	json << ",\"minFreeHeapSpiram\":" << heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+	json.s(",\"freeHeap\":").n(esp_get_free_heap_size());
+	json.s(",\"minFreeHeap\":").n(esp_get_minimum_free_heap_size());
+	json.s(",\"minFreeHeapSpiram\":").n(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
 	// Issue #273: internal (DRAM) low-water, reported separately. The two
 	// figures above cannot show a DRAM shortage -- MALLOC_CAP_SPIRAM is PSRAM
 	// by definition, and the all-caps minimum is dominated by 8 MB of PSRAM,
 	// so a near-exhausted 320 KB of DRAM barely moves it. Task stacks and
 	// lwIP pbufs live here and nowhere else.
-	json << ",\"minFreeHeapInternal\":" << heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+	json.s(",\"minFreeHeapInternal\":").n(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 	// Issue #273, second pass: the field above is a LOW-WATER MARK since boot
 	// (heap_caps_get_minimum_free_size), which is monotonically non-increasing
 	// and therefore cannot distinguish a slow leak from one large transient
@@ -2083,11 +2267,11 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// exact pool. On ESP32-S3 the two sets are nearly identical -- and
 	// "nearly" is precisely the kind of word that has already produced wrong
 	// conclusions on #273, so measure both and let the numbers say.
-	json << ",\"freeHeapInternal\":" << heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-	json << ",\"largestFreeBlockInternal\":" << heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-	json << ",\"freeHeapDma\":" << heap_caps_get_free_size(MALLOC_CAP_DMA);
-	json << ",\"largestFreeBlockDma\":" << heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
-	json << ",\"resetReason\":\"" << pdResetReasonString(esp_reset_reason()) << "\"";
+	json.s(",\"freeHeapInternal\":").n(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+	json.s(",\"largestFreeBlockInternal\":").n(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+	json.s(",\"freeHeapDma\":").n(heap_caps_get_free_size(MALLOC_CAP_DMA));
+	json.s(",\"largestFreeBlockDma\":").n(heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+	json.s(",\"resetReason\":\"").s(pdResetReasonString(esp_reset_reason())).s("\"");
 	pdAppendHwmField(json, "stackHwm_sip_server_task", pdSipServerStackHwmBytes());
 	pdAppendHwmField(json, "stackHwm_udp_receiver_task", pdStackHwmBytes(PD_UDP_RECEIVER_TASK_NAME));
 	pdAppendHwmField(json, "stackHwm_rtp_media_tx", pdStackHwmBytes("rtp_media_tx"));
@@ -2105,12 +2289,12 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// all-zero/null, so tests/interop/interop.py's JSON parsing never has to
 	// special-case platform -- matching this route's existing "counters read
 	// 0, arrays empty" convention for the unattached/host case (docs/API.md).
-	json << ",\"freeHeap\":0,\"minFreeHeap\":0,\"minFreeHeapSpiram\":0,\"minFreeHeapInternal\":0"
-	        ",\"freeHeapInternal\":0,\"largestFreeBlockInternal\":0"
-	        ",\"freeHeapDma\":0,\"largestFreeBlockDma\":0,\"resetReason\":\"n/a\"";
-	json << ",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
-	        "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
-	        "\"stackHwm_conf_mix_tick\":null,\"stackHwm_http_conn\":null";
+	json.s(",\"freeHeap\":0,\"minFreeHeap\":0,\"minFreeHeapSpiram\":0,\"minFreeHeapInternal\":0"
+	       ",\"freeHeapInternal\":0,\"largestFreeBlockInternal\":0"
+	       ",\"freeHeapDma\":0,\"largestFreeBlockDma\":0,\"resetReason\":\"n/a\"");
+	json.s(",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
+	       "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
+	       "\"stackHwm_conf_mix_tick\":null,\"stackHwm_http_conn\":null");
 #endif
 	// Issue #382: ungated for the same reason resetReason is -- "a dump exists,
 	// N bytes" is the fact a bench run needs to notice an unwatched panic, and it
@@ -2120,9 +2304,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		const CoreDumpStore::Info cd = CoreDumpStore::query();
 		// `supported` (#514): false when the board has no coredump partition,
 		// so "present":false is not misread as "no crash happened".
-		json << ",\"coredump\":{\"present\":" << (cd.present ? "true" : "false")
-		     << ",\"size\":" << cd.size
-		     << ",\"supported\":" << (cd.supported ? "true" : "false") << "}";
+		json.s(",\"coredump\":{\"present\":").b(cd.present)
+		    .s(",\"size\":").n(cd.size)
+		    .s(",\"supported\":").b(cd.supported).s("}");
 	}
 
 	// Issue #328: L2 transmit-path health, in one object, on the UNGATED route.
@@ -2146,17 +2330,17 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// The pool numbers are live on BOTH platforms (it has a real host
 	// implementation and is in the host test target). The MoH error counters
 	// are -1 off-device, emitted as null per the stackHwm_* convention.
-	json << ",\"l2Tx\":{\"poolAllocations\":" << l2rtp::DmaFramePool::getAllocations()
-	     << ",\"poolExhaustions\":" << l2rtp::DmaFramePool::getExhaustions()
-	     << ",\"poolAvailable\":"   << l2rtp::DmaFramePool::available()
-	     << ",\"poolSize\":"        << l2rtp::DmaFramePool::kPoolSize;
+	json.s(",\"l2Tx\":{\"poolAllocations\":").n(l2rtp::DmaFramePool::getAllocations())
+	    .s(",\"poolExhaustions\":").n(l2rtp::DmaFramePool::getExhaustions())
+	    .s(",\"poolAvailable\":").n(l2rtp::DmaFramePool::available())
+	    .s(",\"poolSize\":").n(static_cast<size_t>(l2rtp::DmaFramePool::kPoolSize));
 	const long mohL2Err   = handler ? handler->holdMusicL2TxErrors() : -1;
 	const long mohSockErr = handler ? handler->holdMusicTxErrors()   : -1;
-	json << ",\"mohL2Errors\":";
-	if (mohL2Err < 0) json << "null"; else json << mohL2Err;
-	json << ",\"mohSockErrors\":";
-	if (mohSockErr < 0) json << "null"; else json << mohSockErr;
-	json << "}";
+	json.s(",\"mohL2Errors\":");
+	if (mohL2Err < 0) json.s("null"); else json.n(mohL2Err);
+	json.s(",\"mohSockErrors\":");
+	if (mohSockErr < 0) json.s("null"); else json.n(mohSockErr);
+	json.s("}");
 
 	// Issue #466: memory placement. clipRefusals counts clip buffers refused
 	// (PSRAM short on a PSRAM board, or over POCKETDIAL_CLIP_INTERNAL_MAX_BYTES
@@ -2164,15 +2348,22 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// silence, deposits record without a greeting. psramFallbacks counts
 	// PSRAM-preferred buffers (the jitter rings) that PSRAM could not hold and
 	// internal DRAM had to -- always 0 on a board without PSRAM.
-	json << ",\"memory\":{\"clipRefusals\":" << HoldMusic::clipRefusals()
-	     << ",\"mohClipRefused\":" << ((handler && handler->holdMusicClipRefused()) ? "true" : "false")
-	     << ",\"greetingRefused\":" << ((handler && handler->voicemailGreetingRefused()) ? "true" : "false")
-	     << ",\"psramFallbacks\":" << psram::internalFallbacks().load(std::memory_order_relaxed)
-	     << "}";
+	json.s(",\"memory\":{\"clipRefusals\":").n(HoldMusic::clipRefusals())
+	    .s(",\"mohClipRefused\":").b(handler && handler->holdMusicClipRefused())
+	    .s(",\"greetingRefused\":").b(handler && handler->voicemailGreetingRefused())
+	    .s(",\"psramFallbacks\":").n(psram::internalFallbacks().load(std::memory_order_relaxed))
+	    .s("}");
 
-	json << "}";
+	json.s("}");
 
-	sendResponse(sock, 200, "OK", "application/json", json.str());
+	if (json.full)
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+			"{\"error\":\"status response too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, json.len));
 }
 
 // GET /metrics (issue #184) — Prometheus text-exposition format, ported from
@@ -2194,13 +2385,14 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 //     no secrets. It belongs in the first class, not the second.
 //
 //  2. /api/status is dispatched ungated from handleClient()'s route table (the
-//     entry directly above /metrics, ~line 449) and returns strictly MORE than
-//     this page does — the whole registered-client roster with each phone's
-//     IP:port, every live session's caller/callee/state, the
-//     dial plan, and the parked-call table. Gating /metrics while that stays
-//     open would not withhold a single bit from an anonymous peer on the link;
-//     it would only look like a control. Operational detail does leak here, but
-//     it is a strict subset of what already leaks next door.
+//     entry directly above /metrics, ~line 449) and returns MORE than this
+//     page does -- the dial plan, forwards and group tables, and the session
+//     and park COUNTS. (Since #207 the roster, and since #539 every live
+//     session's caller/callee and the parked-call rows, need a session.)
+//     Gating /metrics while that stays open would not withhold anything from
+//     an anonymous peer on the link; it would only look like a control.
+//     Operational detail does leak here, but it is a subset of what already
+//     leaks next door.
 //
 //  3. A stock Prometheus scraper cannot authenticate to this server even if we
 //     wanted it to. It issues a bare GET with no cookie jar; it cannot drive
@@ -2340,8 +2532,8 @@ void HttpServer::sendApiMetrics(int sock)
 	        "(issue #430).",
 	        keepalivesCrlf);
 	counter("pocketdial_packets_dropped_no_pool_total",
-	        "SIP datagrams discarded before parsing because the message pool and its "
-	        "bounded heap fallback were spent (issue #443). Not in "
+	        "SIP datagrams discarded before parsing because the message pool was "
+	        "spent (issue #443; no heap fallback since #409). Not in "
 	        "pocketdial_packets_dropped_total.",
 	        droppedNoPool);
 	counter("pocketdial_packets_dropped_oversize_total",
@@ -3943,9 +4135,37 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		             "{\"error\":\"factory reset requires confirm=ERASE\"}");
 		return;
 	}
+	// #473: from here on, NVS writers refuse new data (the CDR persist writer
+	// first), so nothing a background task writes can put PII back behind this
+	// reset. The board restarts at the end, which is what clears the flag.
+	resetguard::begin();
+	// #473: then open the reset journal, outside NVS, so that if anything below
+	// fails -- or power is cut before the restart task closes it -- the next
+	// boot reports the reset as incomplete (/api/status "resetIncomplete").
+	// A journal write failure is logged and counted inside begin(); the reset
+	// proceeds regardless (#481 review).
+	(void)resetjournal::begin();
+#if defined(POCKETDIAL_RESET_INTERRUPT_PROBE) && defined(ESP_PLATFORM)
+	// BENCH-ONLY (#451 P4, #473): stands in for a power cut in the middle of a
+	// reset, which nobody can pull on a remote bench. The journal is open and
+	// nothing is erased yet, so this restart is exactly "the reset began and
+	// never finished": the next boot must report resetIncomplete, with the
+	// record surviving the restart from flash (resetJournal:"flash"). Nothing
+	// is wiped, so the board keeps its config. Never ship it (CMake warns).
+	ESP_LOGW("factory_reset", "RESET INTERRUPT PROBE: journal begun, restarting before any erase (#473)");
+	esp_restart();
+#endif
+	// In-flight writes are drained before anything is erased.
+	if (!resetguard::waitForWritersIdle(500))
+	{
+		std::cerr << "[reset] an NVS writer was still busy after 500 ms; erasing anyway" << std::endl;
+	}
 	// Clear the login credential, the DTMF PIN, and all sessions so the device
 	// returns to the default-credential/needs-initial-setup state on both ESP
 	// (NVS) and host (in-memory).
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	if (auto h = resetguard::beforeFirstEraseHookForTest()) h();   // #481 review: ordering pin
+#endif
 	const bool adminErased = AdminAuth::clearCredential();
 	// Also drop ap_secure / ap_psk / cfgseed_gen. Clearing the seed generation is
 	// deliberate: the next boot re-applies whatever the flasher wrote, so a
@@ -4091,6 +4311,18 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// #441 (G-dubs's fold, taken over by Globox): the device-settings reset joins
 	// this same check as "device" -- a failed reg_mode write can leave an old
 	// `secure` in place, the lockout this reset exists to rescue.
+	//
+	// #473: each store that failed also goes into the reset journal, so the next
+	// boot reports it even if this reply never reaches the operator. tapi, didmap,
+	// wifi (#456 review) and the device settings (#441, #481 review) share the
+	// journal's kOther bit.
+	if (!adminErased)    resetjournal::noteFailure(resetjournal::kAdmin);
+	if (!trunkErased)    resetjournal::noteFailure(resetjournal::kTrunk);
+	if (!secretsErased)  resetjournal::noteFailure(resetjournal::kSecrets);
+	if (!forwardsErased) resetjournal::noteFailure(resetjournal::kForwards);
+	if (!e911Erased)     resetjournal::noteFailure(resetjournal::kE911);
+	if (!tapiErased || !didmapErased || !wifiErased || !deviceConfigCleared)
+		resetjournal::noteFailure(resetjournal::kOther);
 	if (!adminErased || !trunkErased || !secretsErased || !forwardsErased || !e911Erased ||
 		!tapiErased || !didmapErased || !wifiErased || !deviceConfigCleared)
 	{
@@ -4157,26 +4389,44 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// here on. Keep-list checked on poll #455: nothing that must survive lives in
 	// the nvs partition (cfgseed, prompts, coredump, otadata and phy_init are their
 	// own partitions; a fresh boot re-runs PHY calibration, which is harmless).
+	//
+	// #473: the reset journal is closed here, the last step before the restart,
+	// recording whether the whole-partition erase worked. The journal lives in
+	// the prompts partition, which the NVS erase does not touch, so it survives
+	// to the next boot; a hang or power cut before finish() leaves "interrupted".
 	// 4096, not 2048 (#456 review): nvs_flash_erase()'s worst static chain is
-	// ~1,920 B, which left too little for the lambda and an interrupt frame, and
-	// an overflow here would panic mid-erase -- the half-reset state.
+	// ~1,920 B and finish() writes a flash sector; an overflow here would panic
+	// mid-erase -- the half-reset state.
 	if (xTaskCreate([](void*) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
-		if (nvs_flash_erase() != ESP_OK)
+		// #473: the guard begun above still refuses new NVS data writes; drain any
+		// write already in flight (the CDR persist writer) before the partition is
+		// erased under it, as the DTMF door does.
+		if (!resetguard::waitForWritersIdle(500))
+		{
+			ESP_LOGW("factory_reset", "an NVS writer was still busy after 500 ms; erasing anyway (#594)");
+		}
+		const esp_err_t eraseErr = nvs_flash_erase();
+		if (eraseErr != ESP_OK)
 		{
 			ESP_LOGE("factory_reset", "nvs_flash_erase failed -- per-key erases stand, old NVS bytes may remain");
 		}
+		resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
 		esp_restart();
 	}, "restart_task", 4096, NULL, 5, NULL) != pdPASS)
 	{
 		// The reply has gone out and the per-key erases are done; without the task
 		// there is no whole-partition erase, but the board must still restart
 		// rather than stay up half-reset. Not erased here: this is the http_conn
-		// stack, already deep (#458).
+		// stack, already deep (#458). The journal is deliberately NOT finished, so
+		// it stays Begun and the next boot reports the reset as interrupted -- true.
 		ESP_LOGE("factory_reset", "restart task not created -- restarting without the whole-NVS erase");
 		vTaskDelay(pdMS_TO_TICKS(1000));
 		esp_restart();
 	}
+#else
+	// Host: no restart task, so the reset "completes" here.
+	resetjournal::finish();
 #endif
 }
 
@@ -5804,6 +6054,39 @@ void HttpServer::sendApiTrunkConfig(int sock)
 	             trunkConfigJson(TrunkConfigStore::load()));
 }
 
+
+// Issue #546: true for a host that names this board itself -- loopback in any
+// spelling this parser sees, or the board's own address. Such a trunk can
+// never reach a carrier.
+// #573 review: compared in place, no allocation on the HTTP task.
+static bool asciiIEquals(std::string_view a, std::string_view b)
+{
+	if (a.size() != b.size()) return false;
+	for (size_t i = 0; i < a.size(); ++i)
+	{
+		if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
+			return false;
+	}
+	return true;
+}
+
+static bool asciiIStartsWith(std::string_view s, std::string_view prefix)
+{
+	return s.size() >= prefix.size() && asciiIEquals(s.substr(0, prefix.size()), prefix);
+}
+
+static bool isSelfTrunkHost(std::string_view host, std::string_view ownIp)
+{
+	if (host.empty()) return false;
+	for (std::string_view loop : { "localhost", "localhost.", "::1", "[::1]", "0.0.0.0" })
+	{
+		if (asciiIEquals(host, loop)) return true;
+	}
+	if (asciiIStartsWith(host, "127.") || asciiIStartsWith(host, "::ffff:127.") ||
+		asciiIStartsWith(host, "[::ffff:127.")) return true;
+	return !ownIp.empty() && ownIp != "0.0.0.0" && asciiIEquals(host, ownIp);
+}
+
 void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 {
 	TrunkConfigStore::Config cfg = TrunkConfigStore::load(); // start from stored -- see the password merge below
@@ -5863,6 +6146,24 @@ void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"host and fromUser are required to enable the trunk\"}");
 		return;
+	}
+
+	// Issue #546: a trunk pointed at this board itself -- loopback, or its own
+	// address -- can never reach a carrier, yet it would satisfy valid() and
+	// report an emergency route. Refuse it at the door, like the check above.
+	{
+		char ownIp[INET_ADDRSTRLEN] = {0};   // #573 review: fixed buffer, no std::string
+		if (_ip == "0.0.0.0") (void)getPrimaryLocalIPInto(ownIp, sizeof(ownIp));
+		else std::snprintf(ownIp, sizeof(ownIp), "%s", _ip.c_str());
+		for (const std::string* h : { &cfg.host, &cfg.proxyHost })
+		{
+			if (isSelfTrunkHost(*h, ownIp))
+			{
+				sendResponse(sock, 400, "Bad Request", "application/json",
+				             "{\"error\":\"the trunk host must be the carrier, not this board (loopback or its own address)\"}");
+				return;
+			}
+		}
 	}
 
 	if (!TrunkConfigStore::save(cfg))

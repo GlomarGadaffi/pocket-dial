@@ -118,6 +118,9 @@ namespace SipDigest
 
 	// Generate a fresh nonce bound to "now" and signed with the server secret.
 	std::string generateNonce();
+	// A nonce signed for monotonic stamp `tsMs` (generateNonce() == nonceAt(now)).
+	// Exposed so tests can mint a correctly signed nonce with any stamp.
+	std::string nonceAt(uint64_t tsMs);
 
 	// Validate a nonce's integrity AND freshness. Returns true iff the tag verifies
 	// (it is one WE issued) AND the nonce is within `ttlMs`. If `expiredOut` is

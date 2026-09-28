@@ -147,6 +147,12 @@ public:
 	// The Call-ID of the live stream ("" when idle). Lets onCancel/onBye match.
 	std::string activeCallId() const;
 
+	// Issue #479: starts refused because every shared rtp_media_tx stack was in
+	// use (never a heap fallback). 0 on host builds, which have no pool.
+	static uint32_t txPoolRefusals();
+	// Slots whose boot allocation failed: out of service for good (#598 review).
+	static uint32_t txPoolRetired();
+
 private:
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	static void taskTrampoline(void* arg);
@@ -161,6 +167,14 @@ private:
 	//                    on it and start() can refuse to overlap a dying task.
 	std::atomic<bool> _stopRequested{false};
 	std::atomic<bool> _taskRunning{false};
+	// Issue #479 (option D): the task runs on a slot of ONE shared, boot-allocated
+	// pool of INTERNAL DMA stacks (TxPool, RtpSender.cpp; size in RtpTaskSlots.hpp).
+	// _poolSlot is this stream's slot (-1: none), written only in start() under
+	// _slotMutex. The finished task PARKS and marks its slot; the pool reaps it
+	// (#572 rule) before handing the slot to the next stream.
+	struct TxPool;
+	static TxPool& txPool();
+	int               _poolSlot = -1;
 	sockaddr_in       _dest{};
 
 	// L2 RTP TX (Issue #282 / #329)

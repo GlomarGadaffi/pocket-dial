@@ -306,7 +306,8 @@ TEST(EmergencyRoute, TheReportedRouteIsNoneUntilARealProviderOrATrunkExists)
 		<< "the loopback simulator is not a route";
 
 	b.handler->setTrunkConfig(trunkConfig());
-	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::Trunk);
+	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::TrunkUnverified)
+		<< "#546: configured, but no call has proved it yet";
 
 	b.handler->setAnchorPlacesRealCallsForTest(true);
 	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::Anchor)
@@ -320,6 +321,8 @@ TEST(EmergencyRoute, TheReportedRouteIsNoneUntilARealProviderOrATrunkExists)
 	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::None), "none");
 	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::Anchor), "anchor");
 	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::Trunk), "trunk");
+	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::TrunkUnverified),
+		"trunk-unverified");
 }
 
 TEST(EmergencyRoute, OnlyTheTelephonyApiProviderPlacesRealCalls)
@@ -471,7 +474,8 @@ TEST(EmergencyRoute, BootingWithAStoredTrunkLogsNoWarning)
 	b.handler->tick();
 	const std::string log = testing::internal::GetCapturedStderr();
 
-	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::Trunk);
+	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::TrunkUnverified)
+		<< "#546: a stored trunk is configured, not yet proved";
 	EXPECT_EQ(log.find("EMERGENCY CALLING IS NOT CONFIGURED"), std::string::npos)
 		<< "a board that can reach 911 must not cry wolf:\n" << log;
 	TrunkConfigStore::resetForTest();
@@ -525,7 +529,8 @@ TEST(EmergencyRoute, StatusReportsTheRouteWithoutASession)
 		<< "the dashboard banner keys on this, and it must not need a login";
 
 	b.handler->setTrunkConfig(trunkConfig());
-	EXPECT_NE(httpGet(kPort, "/api/status").find("\"emergencyRoute\":\"trunk\""), std::string::npos);
+	EXPECT_NE(httpGet(kPort, "/api/status").find("\"emergencyRoute\":\"trunk-unverified\""), std::string::npos)
+		<< "#546: no carrier 2xx yet";
 
 	b.handler->setAnchorPlacesRealCallsForTest(true);
 	EXPECT_NE(httpGet(kPort, "/api/status").find("\"emergencyRoute\":\"anchor\""), std::string::npos);
@@ -552,6 +557,25 @@ TEST(EmergencyRoute, TheDashboardShowsTheBannerWhileTheRouteIsNone)
 	EXPECT_NE(page.substr(poll, pollEnd - poll).find("applyEmergencyRoute(d)"), std::string::npos)
 		<< "the status poll must drive the banner";
 	EXPECT_NE(page.find("d.emergencyRoute===\"none\""), std::string::npos);
+}
+
+TEST(EmergencyRoute, TheDashboardWarnsWhileTheTrunkRouteIsUnverified)
+{
+	// #546: the unverified banner exists, starts hidden, and the status poll's
+	// applyEmergencyRoute() shows it for exactly "trunk-unverified".
+	std::string page;
+	for (const auto& part : CGA_INDEX_HTML_PARTS) page.append(part.data, part.size);
+
+	const size_t banner = page.find("id=\"e911-unverified-banner\"");
+	ASSERT_NE(banner, std::string::npos) << "no unverified-route banner on the dashboard";
+	const size_t tagEnd = page.find('>', banner);
+	EXPECT_NE(page.substr(banner, tagEnd - banner).find("display:none"), std::string::npos);
+
+	const size_t fn = page.find("function applyEmergencyRoute(d){");
+	ASSERT_NE(fn, std::string::npos);
+	const std::string body = page.substr(fn, page.find("\n}\n", fn) - fn);
+	EXPECT_NE(body.find("e911-unverified-banner"), std::string::npos) << body;
+	EXPECT_NE(body.find("d.emergencyRoute===\"trunk-unverified\""), std::string::npos) << body;
 }
 
 TEST(EmergencyRoute, TheE911BannerDefersToTheRouteBannerWhileTheRouteIsNone)
@@ -589,4 +613,64 @@ TEST(EmergencyRoute, ALoopbackOnlyBoardSaysNoRouteEvenForAnOfferItCouldNotCarry)
 	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
 	EXPECT_TRUE(b.saw("no emergency route configured")) << b.dump();
 	EXPECT_FALSE(b.saw("no G.711 codec offered")) << b.dump();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #550: no extension may be named like an emergency number.
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(EmergencyRoute, TheWholeEmergencySetIsReserved)
+{
+	for (const char* aor : {"911", "933", "9911", "9933"})
+	{
+		SCOPED_TRACE(aor);
+		EXPECT_TRUE(pbx::isReservedExtension(aor));
+		EXPECT_TRUE(pbx::isReservedOrPstnAor(aor));
+	}
+	for (const char* aor : {"912", "9912", "99111", "1911", "201"})
+	{
+		SCOPED_TRACE(aor);
+		EXPECT_FALSE(pbx::isReservedExtension(aor)) << "only the emergency set, nothing near it";
+	}
+}
+
+TEST(EmergencyRoute, APhoneCannotRegisterUnderAPrefixedEmergencyNumber)
+{
+	Bench b;
+
+	b.handler->handle(makeRegister("9911"));
+
+	EXPECT_EQ(b.count("SIP/2.0 403"), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 200"), 0u) << "9911 dials 911; it can't be an extension:\n" << b.dump();
+}
+
+TEST(EmergencyRoute, The555OwnNumberDialCannotHandTheLoopbackAnEmergencyNumber)
+{
+	// The state #550 now forbids, forced through a seam: a client named 9911
+	// dials 555, whose destination is the caller's own number. The loopback
+	// guard in originateAnchorCall() is the backstop that must still refuse.
+	Bench b;
+	b.handler->bindClientBypassingGuardsForTest("9911", addrFor(kHandsetIp));
+	const std::string body =
+		"v=0\r\no=- 0 0 IN IP4 " + std::string(kHandsetIp) + "\r\ns=-\r\n"
+		"c=IN IP4 " + std::string(kHandsetIp) + "\r\nt=0 0\r\n"
+		"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	const std::string raw =
+		"INVITE sip:555@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKer550\r\n"
+		"From: <sip:9911@server>;tag=er550\r\n"
+		"To: <sip:555@server>\r\n"
+		"Call-ID: er-550\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:9911@" + std::string(kHandsetIp) + ":5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+
+	b.handler->handle(RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp)));
+
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "")
+		<< "the simulator must never be asked to dial 9911";
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 200"), 0u) << b.dump();
 }
