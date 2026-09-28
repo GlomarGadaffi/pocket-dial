@@ -1015,7 +1015,7 @@ function renderBoard(d){
       +'<span class="label">'+esc(n)+'</span>'
       +'<span class="sublabel">'+esc(jackSublabel(e,state))+'</span></button>';
   });
-  if(!nums.length)html='<div class="note" style="text-align:center;padding:24px">No extensions seen yet. Register a phone to light a jack.</div>';
+  if(!nums.length)html='<div class="note" style="text-align:center;padding:24px">'+(d.rosterVisible===false?esc(String(d.clientCount||0))+' phones registered. Log in to see them.':'No extensions seen yet. Register a phone to light a jack.')+'</div>';
   board.innerHTML=html;
   if(keepExt){
     var refocus=board.querySelector('.jack[data-ext="'+cssEsc(keepExt)+'"]');
@@ -1427,7 +1427,10 @@ function applyWifiCapability(d){
   }
 }
 function fetchCdr(){
-  fetch("/api/cdr").then(function(r){return r.json();}).then(renderCdr).catch(function(){});
+  fetch("/api/cdr").then(function(r){
+    if(!r.ok){$("cdr-tbody").innerHTML='<tr class="empty-row"><td colspan="6">Log in to view the call log</td></tr>';return null;}
+    return r.json();
+  }).then(function(recs){if(recs)renderCdr(recs);}).catch(function(){});
 }
 function setOnline(ok){
   var dot=$("dot"),txt=$("online-txt"),rec=$("recon");
@@ -1437,7 +1440,7 @@ function setOnline(ok){
 function updateRail(d){
   $("s-uptime").textContent=fmtUptime(d.uptime);
   $("s-ip").textContent=(d.ip||"0.0.0.0")+":"+(d.port||5060);
-  $("s-jacks").textContent=((d.clients||[]).length)+"/"+POOL;
+  $("s-jacks").textContent=(d.rosterVisible===false?(d.clientCount||0):(d.clients||[]).length)+"/"+POOL;
   $("s-calls").textContent=(typeof d.sessionCount==="number")?d.sessionCount:(d.sessions||[]).length;
   /* item 21: derived from the same payload fields the Calls stat reads,
      so it appears and disappears with real state. No invented number. */
