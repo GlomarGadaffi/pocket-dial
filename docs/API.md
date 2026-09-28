@@ -323,7 +323,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
 | [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
-| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts if none is staged (#645). Simulated (`200`, no-op) on desktop. |
+| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts with `confirm=1` if none is staged (#645). Simulated (`200`, no-op) on desktop. |
 | [`/setup/email`](#get-setupemail) | `GET` | Low | None | Standalone SMTP-configuration page (own document, not part of the `/` SPA). Shell only, no data. |
 | [`/api/email`](#get-apiemail) | `GET` | Medium | Gated | Current SMTP configuration. Secrets redacted to `hasPassword`/`hasGsaKey` booleans. |
 | [`/api/email`](#post-apiemail) | `POST` | High | Gated (+ `X-CSRF`) | Saves SMTP host/port/mode/auth/credentials. Empty `pass`/`gsaKey`/`caPem` keeps the stored value. |
@@ -2491,10 +2491,12 @@ Reboots into the image staged by a prior `/api/ota/upload`, or, with nothing sta
 * Requires Same-Origin Check: Yes
 * Requires `pd_session` cookie: Always (see §0)
 * Build: `ESP_PLATFORM`-guarded, so it is real on `eth`/`lan8720` and simulated only on the host build; see §4.2.
-* Request Headers: None. **No request parameters and no confirmation token**, unlike `/api/factory-reset`; an empty authenticated POST reboots the device. The session and CSRF gates are what stand between a stray POST and a reboot; the dashboard asks for confirmation first.
+* Request Headers: None.
+* Request Body (`application/x-www-form-urlencoded`): `confirm=1`, required for a plain restart (no staged image), like `confirm=ERASE` on `/api/factory-reset`: a reboot drops live calls, 911 included. A reboot into a staged image needs no parameter.
 * Response Content-Type: `application/json`
 * Response Status Codes:
   * `200 OK`: Reboot scheduled ~1 s out (ESP) or simulated (desktop).
+  * `400 Bad Request`: `{"error":"reboot with no staged image requires confirm=1"}`, nothing staged and no `confirm=1`.
   * `401`/`403`: gates 1-4 as in §0.1.
 
 #### Response Example (200 OK, ESP32)
@@ -2522,7 +2524,7 @@ reboot response omits it entirely. That is the one reliable way to tell the two 
 
 ```bash
 curl -s -X POST "http://$DEV/api/ota/reboot" \
-     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF"
+     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" -d "confirm=1"
 ```
 
 Covered by `test_api.sh` TC-OTA-05 (cross-origin → `403`), TC-OTA-06 (`200`

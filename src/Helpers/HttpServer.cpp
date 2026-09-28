@@ -1334,7 +1334,7 @@ void HttpServer::handleClient(int clientSock)
 	{
 		if (requireAdmin(clientSock, req, true))
 		{
-			sendApiOtaReboot(clientSock);
+			sendApiOtaReboot(clientSock, req.body);
 		}
 	}
 	// NOTE: POST /api/ota/upload is handled earlier in handleClient() via the
@@ -6580,13 +6580,21 @@ void HttpServer::sendApiOtaStatus(int sock)
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 
-void HttpServer::sendApiOtaReboot(int sock)
+void HttpServer::sendApiOtaReboot(int sock, const std::string& body)
 {
 	// #645: with no staged image (boot == running partition) this is a plain
 	// restart. It used to answer 409, which left the dashboard's confirmed
 	// Reboot button no way to restart the device. requireAdmin (session + CSRF)
 	// still gates the route. Decided outside the ESP guard so the host tests it.
 	const bool staged = OtaUpdater::bootPartitionLabel() != OtaUpdater::runningPartitionLabel();
+	// A plain reboot drops live calls (911 included), so it needs an explicit
+	// confirm token, like confirm=ERASE on /api/factory-reset. A staged-OTA
+	// reboot keeps its old no-parameter behaviour.
+	if (!staged && getFormParam(body, "confirm") != "1") {
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"reboot with no staged image requires confirm=1\"}");
+		return;
+	}
 	std::string json = std::string("{\"status\":\"ok\",\"staged\":") + (staged ? "true" : "false");
 #if defined(ESP_PLATFORM)
 	json += staged ? ",\"message\":\"rebooting into the new image...\"}" : ",\"message\":\"rebooting...\"}";

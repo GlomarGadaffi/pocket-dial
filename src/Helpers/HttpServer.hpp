@@ -511,7 +511,7 @@ private:
 	// Read-only JSON: running / boot / next partition, pending flag, last error.
 	void sendApiOtaStatus(int sock);
 	// Reboots into a staged image (device) or simulates it (host).
-	void sendApiOtaReboot(int sock);
+	void sendApiOtaReboot(int sock, const std::string& body);
 
 	// Streaming helper for the OTA upload: drains exactly `contentLength` bytes
 	// from `sock`, feeding `chunkSink(ptr, len)` for each chunk. `prefix`/

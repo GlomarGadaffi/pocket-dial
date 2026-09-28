@@ -1321,7 +1321,8 @@ TEST(OtaStatus, ReportsIdleWhenNoUploadInProgress)
 // #645: with no staged image, POST /api/ota/reboot is a plain restart. It used
 // to answer 409, so the dashboard's confirmed Reboot button could not restart
 // the device. The host's boot and running partitions are both "host", i.e.
-// nothing staged; the admin gate (session + CSRF) must still hold.
+// nothing staged; the admin gate (session + CSRF) must still hold, and a plain
+// reboot needs confirm=1.
 TEST(OtaReboot, NoStagedImageIsAPlainRestartNotA409)
 {
 	AdminAuth::clearCredential();
@@ -1338,7 +1339,12 @@ TEST(OtaReboot, NoStagedImageIsAPlainRestartNotA409)
 	// Gate still in front: a session without the CSRF token is refused.
 	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/ota/reboot", "", "pd_session=" + a.cookie)), 403);
 
-	const std::string resp = httpPostRaw(port, "/api/ota/reboot", "", "pd_session=" + a.cookie, a.csrf);
+	// With nothing staged, a plain reboot needs confirm=1: a stray authed POST
+	// must not drop live calls.
+	const std::string bare = httpPostRaw(port, "/api/ota/reboot", "", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(bare), 400) << bare;
+
+	const std::string resp = httpPostRaw(port, "/api/ota/reboot", "confirm=1", "pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(resp), 200) << resp;
 	EXPECT_NE(bodyOf(resp).find("\"staged\":false"), std::string::npos) << resp;
 
