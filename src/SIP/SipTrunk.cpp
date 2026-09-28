@@ -480,7 +480,8 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 		// it says a proxy took the request, not that the callee is alerting.
 		if (_listener && (status == 180 || status == 183))
 		{
-			_listener->onTrunkRinging(eventFor(*d), status == 183);
+			_listener->onTrunkRinging(eventFor(*d), status == 183,
+				status == 183 ? data : std::shared_ptr<SipMessage>());
 		}
 		return true;
 	}
