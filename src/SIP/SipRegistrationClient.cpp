@@ -3,8 +3,6 @@
 
 #include "SipRegistrationClient.hpp"
 
-#include "IDGen.hpp"
-
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -155,10 +153,12 @@ bool SipRegistrationClient::configure(const Config& cfg, std::string_view passwo
 	// §10.2: reusing the previous Call-ID with a LOWER CSeq is exactly how a
 	// reboot gets its REGISTER rejected as out of order, so the safe move on a
 	// reconfigure is a new Call-ID rather than a resumed one).
-	const std::string cid = IDGen::GenerateID(16);
-	const std::string tag = IDGen::GenerateID(12);
-	copyBounded(_callId, sizeof(_callId), cid);
-	copyBounded(_fromTag, sizeof(_fromTag), tag);
+	// #399: CSPRNG hex into fixed buffers; IDGen would allocate.
+	char id[SipDigest::kCnonceLen + 1];
+	SipDigest::makeCnonce(id);
+	copyBounded(_callId, sizeof(_callId), id);
+	SipDigest::makeCnonce(id);
+	copyBounded(_fromTag, sizeof(_fromTag), id);
 
 	_cseq                = 0;
 	_haveChallenge       = false;
@@ -255,7 +255,7 @@ void SipRegistrationClient::failCycle(uint64_t nowMs, int code, const char* reas
 	armSend(nowMs + delay);
 }
 
-bool SipRegistrationClient::cacheChallenge(const SipDigest::DigestChallenge& ch)
+bool SipRegistrationClient::cacheChallenge(const SipDigest::BoundedChallenge& ch)
 {
 	// Refuse an oversized field rather than truncate it (see copyBounded).
 	char realm[kMaxHost], nonce[kMaxNonce], opaque[kMaxNonce];
@@ -285,16 +285,20 @@ bool SipRegistrationClient::cacheChallenge(const SipDigest::DigestChallenge& ch)
 	return true;
 }
 
-SipDigest::DigestChallenge SipRegistrationClient::cachedChallenge() const
+SipDigest::BoundedChallenge SipRegistrationClient::cachedChallenge() const
 {
-	SipDigest::DigestChallenge ch;
-	ch.realm     = _chRealm;
-	ch.nonce     = _chNonce;
-	ch.opaque    = _chOpaque;
-	ch.algorithm = _chAlgorithm;
-	ch.qopList   = _chQop;
-	ch.stale     = _chStale;
-	ch.proxy     = _chProxy;
+	using B = SipDigest::BoundedChallenge;
+	static_assert(B::kMaxRealm == kMaxHost && B::kMaxNonce == kMaxNonce &&
+	              B::kMaxOpaque == kMaxNonce && B::kMaxAlgorithm == kMaxAlgo &&
+	              B::kMaxQopList == kMaxQop, "cache and BoundedChallenge must match");
+	SipDigest::BoundedChallenge ch;
+	std::memcpy(ch.realm,    _chRealm,     sizeof(ch.realm));
+	std::memcpy(ch.nonce,     _chNonce,     sizeof(ch.nonce));
+	std::memcpy(ch.opaque,    _chOpaque,    sizeof(ch.opaque));
+	std::memcpy(ch.algorithm, _chAlgorithm, sizeof(ch.algorithm));
+	std::memcpy(ch.qopList,   _chQop,       sizeof(ch.qopList));
+	ch.stale = _chStale;
+	ch.proxy = _chProxy;
 	return ch;
 }
 
@@ -324,16 +328,19 @@ bool SipRegistrationClient::composeRegister(Request& out)
 	// Authorization, if we are answering a cached challenge. nc increments HERE,
 	// on the request that actually carries it — not on the challenge — because
 	// the count is "requests sent with this nonce".
-	std::string authValue;
 	const char* authName = nullptr;
 	if (_haveChallenge)
 	{
-		const SipDigest::DigestChallenge ch = cachedChallenge();
+		_parsed = cachedChallenge();
+		const SipDigest::BoundedChallenge& ch = _parsed;
 		const uint32_t nextNc = _nc + 1;
-		const std::string cnonce = SipDigest::makeCnonce();
+		char cnonce[SipDigest::kCnonceLen + 1];
+		SipDigest::makeCnonce(cnonce);
+		size_t authLen = 0;
 		if (!SipDigest::buildAuthorization(ch, _cfg.authUser, _password,
 		                                   "REGISTER", requestUri,
-		                                   nextNc, cnonce, authValue))
+		                                   nextNc, cnonce,
+		                                   _authValue, sizeof(_authValue), authLen))
 		{
 			// Unanswerable challenge (SHA-256, auth-int only, MD5-sess with no
 			// qop). Refusing to ANSWER is the point: an MD5 response to a SHA-256
@@ -358,17 +365,13 @@ bool SipRegistrationClient::composeRegister(Request& out)
 		_nc      = nextNc;
 	}
 
-	// Held in a named local: it is the backing store for the %s below, and a
-	// temporary built inline inside the snprintf argument list is a dangling-
-	// pointer bug waiting for someone to "simplify" the expression.
-	const std::string authLine = authName ? (authValue + "\r\n") : std::string();
-
-	const std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
+	char branch[SipDigest::kCnonceLen + 1];
+	SipDigest::makeCnonce(branch);
 	const uint32_t cseq = _cseq + 1;
 
 	n = std::snprintf(out.bytes, sizeof(out.bytes),
 		"REGISTER %s SIP/2.0\r\n"
-		"Via: SIP/2.0/UDP %s:%u;branch=%s;rport\r\n"
+		"Via: SIP/2.0/UDP %s:%u;branch=z9hG4bK%s;rport\r\n"
 		"Max-Forwards: 70\r\n"
 		"From: <sip:%s@%s>;tag=%s\r\n"
 		"To: <sip:%s@%s>\r\n"
@@ -376,19 +379,20 @@ bool SipRegistrationClient::composeRegister(Request& out)
 		"CSeq: %u REGISTER\r\n"
 		"Contact: <sip:%s@%s:%u>\r\n"
 		"Expires: %u\r\n"
-		"%s%s%s"
+		"%s%s%s%s"
 		"User-Agent: pocket-dial\r\n"
 		"Content-Length: 0\r\n"
 		"\r\n",
 		requestUri,
-		_cfg.localIp, static_cast<unsigned>(_cfg.localPort), branch.c_str(),
+		_cfg.localIp, static_cast<unsigned>(_cfg.localPort), branch,
 		_cfg.aorUser, _cfg.domain, _fromTag,
 		_cfg.aorUser, _cfg.domain,
 		_callId,
 		static_cast<unsigned>(cseq),
 		_cfg.aorUser, _cfg.localIp, static_cast<unsigned>(_cfg.localPort),
 		static_cast<unsigned>(_requestedExpiresSec),
-		authName ? authName : "", authName ? ": " : "", authLine.c_str());
+		authName ? authName : "", authName ? ": " : "",
+		authName ? _authValue : "", authName ? "\r\n" : "");
 
 	if (n < 0 || static_cast<size_t>(n) >= sizeof(out.bytes))
 	{
@@ -591,10 +595,10 @@ void SipRegistrationClient::onResponse(uint64_t nowMs, const ResponseView& r)
 			return;
 		}
 
-		SipDigest::DigestChallenge ch;
-		if (!SipDigest::parseChallenge(std::string(hdr), ch, proxy))
+		SipDigest::BoundedChallenge& ch = _parsed;
+		if (!SipDigest::parseChallenge(hdr, ch, proxy))
 		{
-			failCycle(nowMs, r.code, "unparseable challenge");
+			failCycle(nowMs, r.code, "unparseable challenge, or a field exceeds a fixed buffer");
 			return;
 		}
 
@@ -603,7 +607,7 @@ void SipRegistrationClient::onResponse(uint64_t nowMs, const ResponseView& r)
 		// the credential is what it rejected — not the nonce. Retrying cannot
 		// help, and retrying fast is how an account gets auto-blacklisted.
 		if (_haveChallenge && _nc > 0 && !ch.stale &&
-		    ch.nonce == std::string_view(_chNonce))
+		    std::strcmp(ch.nonce, _chNonce) == 0)
 		{
 			_haveChallenge = false;
 			_nc            = 0;

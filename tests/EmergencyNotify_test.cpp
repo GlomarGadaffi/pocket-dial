@@ -544,7 +544,7 @@ namespace
 			                  // is fine -- we are counting loop iterations.
 		}
 		void enqueue(const sockaddr_in&, std::shared_ptr<SipMessage>) override { ++enqueued; }
-		std::shared_ptr<SipMessage> messageFromPool(std::string, sockaddr_in) override { return nullptr; }
+		std::shared_ptr<SipMessage> messageFromPool(std::string_view, sockaddr_in) override { return nullptr; }
 		void freeTransactionsForCallId(std::string_view) override {}
 		void log(std::string, bool = false) override {}
 		const std::string& localIp() const override { return _ip; }

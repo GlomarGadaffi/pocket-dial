@@ -1,5 +1,8 @@
 #include "MediaBridge.hpp"
 #include <cstring>
+#if defined(ESP_PLATFORM)
+#include "esp_log.h"   // #533 diag: syslog only carries esp_log output
+#endif
 
 MediaBridge::MediaBridge() = default;
 
@@ -145,6 +148,7 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 	{
 		return;
 	}
+	_handsetRtpPackets.fetch_add(1, std::memory_order_relaxed);   // #604
 
 	// Issue #218: held ANCHOR-mode legs get their anchor-bound audio from
 	// feedMohTick() instead of the handset -- discard what the handset sends
@@ -352,6 +356,7 @@ bool MediaBridge::feedRx(std::string_view participantId, const int16_t* samples,
 	{
 		return false;
 	}
+	_anchorRxChunks.fetch_add(1, std::memory_order_relaxed);   // #604: the anchor leg is alive
 	// BUS mode: refuse rather than write into a buffer nothing reads. See the header's
 	// feedRx() comment — the anchor leg needs its OWN MixBus port, which is follow-up
 	// work; silently swallowing the chunk here would look like working audio.
@@ -410,6 +415,11 @@ void MediaBridge::stopBridge()
 	}
 
 	_active.store(false, std::memory_order_release);
+#if defined(ESP_PLATFORM)
+	// #533 diag: which bridge stopped. Paired with endCall()'s line, this tells a
+	// session teardown apart from a bridge-only stop (e.g. the orphan reaper).
+	ESP_LOGW("MediaBridge", "stopBridge call=%s part=%s", _callID.c_str(), _participantId.c_str());
+#endif
 
 	// Leave the bus BEFORE the sockets stop (docs/CONFERENCE_MIXER.md §7): the port is
 	// marked Draining first, so any frame still in flight from the receive task is

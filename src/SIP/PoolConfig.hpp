@@ -167,7 +167,7 @@
 #endif
 
 // Number of legs the local N-way conference room (virtual extension 888) accepts —
-// see ConferenceRoom.hpp and docs/CONFERENCE_MIXER.md. Must be ≤ MixBus::MAX_PORTS (8).
+// see ConferenceRoom.hpp and docs/CONFERENCE_MIXER.md. MixBus::MAX_PORTS follows it (#479).
 //
 // Unlike the peer-to-peer call paths, a conference leg IS server media: it costs one
 // Session slot, one RTP receive task, one RTP send task and two MixBus rings (~6 KB)
@@ -176,6 +176,21 @@
 // POCKETDIAL_MAX_SESSIONS and a look at free heap.
 #ifndef POCKETDIAL_CONF_LEGS
 #define POCKETDIAL_CONF_LEGS 4
+#endif
+
+// Issue #479: 1 builds the 888 room at boot (its legs' RTP task slots and rings are
+// fixed then); 0 (SIP_CONSTRAINED, no PSRAM) builds no room, reserves no conference
+// slots, and answers 888 "403 conference disabled on this build".
+#ifndef POCKETDIAL_CONFERENCE
+#define POCKETDIAL_CONFERENCE 1
+#endif
+
+// Issue #479 (option D): rtp_media_tx stacks (3 KB, internal DMA) form ONE pool
+// shared by every RtpSender, sized to the concurrent outbound media streams. A
+// start() that finds it full is refused and counted (/api/status
+// rtpTxPoolRefused), never heap. 6 x 3 KB = 18 KB internal, fixed at boot.
+#ifndef POCKETDIAL_RTP_TX_POOL
+#define POCKETDIAL_RTP_TX_POOL 6
 #endif
 
 // Number of concurrent anchor media bridges (the 555 virtual extension --

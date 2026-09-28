@@ -41,6 +41,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "PsramTask.hpp"   // Issue #479: pd::StaticTaskSlot
 #elif defined(__linux__)
 #include <netinet/in.h>
 #elif defined _WIN32 || defined _WIN64
@@ -282,6 +283,10 @@ public:
 	// recvfrom() would otherwise be unreachable off-device.
 	bool dispatchRaw(const RtpPacket& pkt);
 
+	// Issue #604: packets the raw relay has taken since boot. tick() watches it
+	// for change to end a relayed call whose media stopped with no BYE. Wraps.
+	uint32_t rawRxPackets() const { return _rawRxPackets.load(std::memory_order_relaxed); }
+
 	// Point this receiver's socket at a peer, so sendRaw() can transmit from
 	// it. May be called before or after start().
 	//
@@ -395,10 +400,13 @@ private:
 	// Issue #535: the finished task PARKS (vTaskSuspend) instead of deleting
 	// itself -- vTaskDeleteWithCaps(NULL)'s self-delete allocates an internal
 	// helper task and abort()s when none fits. Its owner reaps it with
-	// pd::deleteTask(handle), which allocates nothing, on the next start() or in
-	// the destructor. Written only under _slotMutex (start) or by the
-	// destructor, never by the task.
+	// vTaskDelete(handle) (pd::reapParkedStaticTask), which allocates nothing,
+	// on the next start() or in the destructor. Written only under _slotMutex
+	// (start) or by the destructor, never by the task.
 	TaskHandle_t      _parkedTask = nullptr;
+	// Issue #479: this slot's stack (PSRAM) + TCB, allocated once in the
+	// constructor; every stream's task is created statically on it.
+	pd::StaticTaskSlot _taskMem;
 	// Deletes the parked task only when pd::reapDecision() says Reap (#572
 	// review); true when the slot is free. On Wait it counts in _reapDeferred.
 	bool reapParkedTaskLocked();
@@ -427,6 +435,7 @@ private:
 	// _sink; the atomic flag lets the receive task skip the lock entirely on
 	// the common non-relay path -- one acquire-load per packet, not a mutex.
 	std::atomic<bool> _rawArmed{false};
+	std::atomic<uint32_t> _rawRxPackets{0};   // #604, see rawRxPackets()
 	RawSink           _rawSink = nullptr;
 	void*             _rawSinkCtx = nullptr;
 

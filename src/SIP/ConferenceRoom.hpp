@@ -113,6 +113,11 @@ public:
 	void startDriver();
 	void stopDriver();
 	bool driverRunning() const { return _driverRunning.load(std::memory_order_acquire); }
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// #479 seam: make the next startDriver() calls fail as a refused conf_mix_tick
+	// create does on ESP (driver not running afterwards).
+	void failDriverStartForTest(bool fail) { _failDriverStartForTest = fail; }
+#endif
 
 	// Advance the bus exactly one 20 ms frame. This is what the driver calls; tests
 	// call it directly. Do NOT call it while a driver is running — that is the second
@@ -177,6 +182,7 @@ private:
 	static void taskTrampoline(void* arg);
 #else
 	std::thread _driverThread;
+	bool        _failDriverStartForTest = false;
 #endif
 };
 

@@ -164,6 +164,20 @@ namespace
 				"Content-Length: 0\r\n\r\n";
 		}
 
+		// The carrier's session-refresh re-INVITE (RFC 4028): in-dialog, so tagged.
+		std::string reinvite(const std::string& id) const
+		{
+			return
+				"INVITE sip:15551230000@192.168.50.1:5060 SIP/2.0\r\n"
+				"Via: SIP/2.0/UDP " + std::string(kSbcIp) + ":5060;branch=z9hG4bKreinv" + id + "\r\n"
+				"From: <sip:+12025550123@" + kSbcIp + ":5060>;tag=" + toTag + "\r\n"
+				"To: <sip:15551230000@" + kSbcIp + ":5060>;tag=" + fromTag + "\r\n"
+				"Call-ID: " + id + "\r\n"
+				"CSeq: 2 INVITE\r\n"
+				"Contact: <sip:+12025550123@203.0.113.9:5060>\r\n"
+				"Content-Length: 0\r\n\r\n";
+		}
+
 		static std::string field(const std::string& m, const std::string& name)
 		{
 			const size_t p = m.find(name);
@@ -410,6 +424,25 @@ TEST(TrunkWiring, TheHandsetHangingUpByesTheCarrierAndReleasesTheRelay)
 		<< "the handset hung up itself; it gets a 200, not a BYE of its own";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u)
 		<< "endCall() is the one place the pair is released, on every path";
+}
+
+TEST(TrunkWiring, AnExpiredLeaseMidCallByesTheCarrierAndReleasesTheRelay)
+{
+	// #603 review: sweepExpired() erased an expired phone's sessions by hand --
+	// no endCall(), so the carrier leg kept billing and the relay pair leaked.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-lease"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+	b.sent.clear();
+
+	b.handler.expireLeaseAndSweepForTest("1001");
+
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the carrier leg must be hung up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and its relay pair released";
 }
 
 TEST(TrunkWiring, TheCarrierHangingUpByesTheHandsetAndReleasesTheRelay)
@@ -736,4 +769,170 @@ TEST(TrunkWiring, ACarrierRefusalAfterEarlyMediaRefusesTheHandsetAndFreesTheRela
 	EXPECT_EQ(CarrierView::between(busy, "\nTo: ", "\r\n"), earlyTo)
 		<< "the refusal ends the early dialog the 183 opened";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+TEST(TrunkWiring, ACarrierRefreshReinviteOnATrunkCallIsNotAnswered481)
+{
+	// #611 review: the trunk dialog has no Session, so #379's "tagged INVITE for
+	// an unknown dialog gets 481" answered the carrier's session refresh with a
+	// 481 -- which ends the call, 911 over the trunk included.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	ASSERT_FALSE(carrier.callID.empty());
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+
+	b.sent.clear();
+	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.reinvite(carrier.callID), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("481", kSbcIp), 0u) << "the carrier's refresh must not end the call";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+
+	// Positive control: the same tagged re-INVITE naming a dialog nobody owns
+	// IS answered 481, so the check above is not passing for want of a 481 path.
+	b.sent.clear();
+	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.reinvite("nobody-owns-this"), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("481", kSbcIp), 1u);
+}
+
+// ── Issue #604: RTP inactivity ends a call whose media stopped with no BYE ──
+
+TEST(TrunkWiring, ATrunkCallWhoseLegsBothGoSilentIsEndedAfterTheInactivityTimeout)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-604"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+	const std::string id = "Call-ID: call-604";
+	auto session = b.handler.getSession(id);
+	ASSERT_TRUE(session.has_value());
+	b.handler.tick();   // arms the watch
+
+	// Control: both legs still flowing 61 s on. The call stays up.
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	ASSERT_TRUE(b.handler.trunkRtpForTest(id, /*fromCarrier=*/true));
+	ASSERT_TRUE(b.handler.trunkRtpForTest(id, /*fromCarrier=*/false));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+	b.handler.tick();
+	ASSERT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "a call with media both ways is live";
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+
+	// The phone loses power and the carrier goes quiet: both legs dead for 61 s.
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+	b.handler.tick();
+
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the billed carrier leg must be hung up";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u) << "and the handset told, best effort";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and the relay pair released";
+	EXPECT_FALSE(b.handler.getSession(id).has_value());
+}
+
+TEST(TrunkWiring, ATrunkCallWithOneLegSilentAndTheOtherTalkingStaysUp)
+{
+	// CaveJay on #612: one silent leg is a healthy call (a VAD-silent listener,
+	// far-end hold, mute). Only BOTH legs silent ends it.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-604c"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+	const std::string id = "Call-ID: call-604c";
+	auto session = b.handler.getSession(id);
+	ASSERT_TRUE(session.has_value());
+	b.handler.tick();   // arms the watch
+
+	for (bool fromCarrier : {true, false})
+	{
+		session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+		ASSERT_TRUE(b.handler.trunkRtpForTest(id, fromCarrier));
+		b.handler.forceNextTickForTest();
+		b.sent.clear();
+		b.handler.tick();
+		ASSERT_TRUE(b.handler.getSession(id).has_value())
+			<< "only the " << (fromCarrier ? "carrier" : "handset") << " leg talked; the call stays up";
+		ASSERT_EQ(b.countWithTo("BYE", kSbcIp), 0u);
+	}
+}
+
+TEST(TrunkWiring, AnEmergencyCallIsNeverEndedForRtpSilence)
+{
+	// A 911 caller who cannot speak, on a phone with silence suppression, sends
+	// no RTP. Hanging up on them is worse than holding a leg. Positive control:
+	// an ordinary call equally silent beside it IS ended.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-911"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	b.sent.clear();
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-604b", 40002));
+	const auto plain = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		plain.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 2u) << "precondition: both calls are up";
+	auto s911 = b.handler.getSession("Call-ID: call-911");
+	auto sPlain = b.handler.getSession("Call-ID: call-604b");
+	ASSERT_TRUE(s911.has_value() && sPlain.has_value());
+	b.handler.tick();   // arms the watch
+
+	s911.value()->ageRtpWatchForTest(std::chrono::seconds(600));
+	sPlain.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+	b.handler.tick();
+
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-911").has_value()) << "911 is never reaped";
+	EXPECT_FALSE(b.handler.getSession("Call-ID: call-604b").has_value())
+		<< "control: the ordinary silent call is";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "exactly one carrier leg hung up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "the 911 relay pair is untouched";
+}
+
+// ── Issue #399: the trunk REGISTERs, from tick(), and answers the 401 ───────
+//
+// SipTrunk_test.cpp pins the REGISTER itself. This pins the part #355 taught
+// us to check separately: that the engine actually calls it, and that a
+// response arriving through handle() reaches it.
+TEST(TrunkWiring, TickRegistersTheTrunkAndA401ThroughHandleIsAnswered)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	ASSERT_TRUE(b.handler.setTrunkCredentials("s3cret-reg"));
+
+	b.handler.tick();
+	ASSERT_EQ(b.countWithTo("REGISTER sip:", kSbcIp), 1u)
+		<< "tick() never registered the trunk: the carrier will not answer our INVITEs";
+
+	const std::string reg = b.firstWith("REGISTER sip:");
+	const std::string callId = CarrierView::field(reg, "Call-ID: ");
+	const std::string challenge =
+		"SIP/2.0 401 Unauthorized\r\n"
+		"Via: " + CarrierView::field(reg, "Via: ") + "\r\n"
+		"From: " + CarrierView::field(reg, "From: ") + "\r\n"
+		"To: " + CarrierView::field(reg, "To: ") + ";tag=reg-tag\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"WWW-Authenticate: Digest realm=\"carrier.example\", nonce=\"wiren0nce\", qop=\"auth\"\r\n"
+		"Content-Length: 0\r\n\r\n";
+	b.sent.clear();
+	b.handler.handle(RequestsHandler::getMessageFromPool(challenge, addrFor(kSbcIp)));
+
+	ASSERT_EQ(b.countWithTo("REGISTER sip:", kSbcIp), 1u) << "the 401 must be answered";
+	const std::string signedReg = b.firstWith("REGISTER sip:");
+	EXPECT_NE(signedReg.find("Call-ID: " + callId), std::string::npos);
+	EXPECT_NE(signedReg.find("\r\nAuthorization: Digest username=\"15551230000\""),
+		std::string::npos) << signedReg;
+	EXPECT_EQ(b.sent.size(), 1u) << "and nothing else answers the carrier's 401";
 }

@@ -271,6 +271,8 @@ void SipTrunk::clearCredentials()
 	// caveat TelephonyApiConfig's scrub() states, and for the same reason.
 	volatile char* p = _secret;
 	for (size_t i = 0; i < kMaxSecret; ++i) p[i] = '\0';
+	_regLive = false;          // #399: the registration's copy goes too
+	_reg.clearCredentials();
 }
 
 const SipTrunk::Dialog* SipTrunk::findByCallID(std::string_view callID) const
@@ -371,13 +373,17 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 	}
 	invite->syncContentLength();
 	_env.enqueue(sbc, std::move(invite));
-	_env.log("Trunk: INVITE -> " + std::string(e164));
+	// #618: where it went and from which port, so a silent carrier can be told
+	// apart from a misaddressed INVITE without a capture.
+	_env.log("Trunk: INVITE -> " + std::string(e164) + " to " + d->sbcIpPort
+		+ " from local port " + std::to_string(_env.serverPort()) + " (From " + d->fromUser + ")");
 	return true;
 }
 
 bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 {
 	if (!data) return false;
+	if (handleRegisterResponse(data)) return true;   // #399
 
 	Dialog* d = findMutableByTrunkCallID(data->getCallID());
 	if (!d) return false;
@@ -818,5 +824,77 @@ bool SipTrunk::answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& cha
 	invite->syncContentLength();
 	_env.enqueue(d.peer, std::move(invite));
 	_env.log("Trunk: " + std::to_string(status) + " challenge answered (" + d.destE164 + ")");
+	return true;
+}
+
+// ── Issue #399: REGISTER with the carrier ────────────────────────────────────
+
+void SipTrunk::tickRegistration(uint64_t nowMs, const sockaddr_in& sbc)
+{
+	if (!_cfg.valid() || !hasCredentials()) return;
+	if (!_regLive)
+	{
+		SipRegistrationClient::Config rc;
+		std::snprintf(rc.registrarHost, sizeof(rc.registrarHost), "%s", _cfg.host);
+		rc.registrarPort = _cfg.port;
+		std::snprintf(rc.domain,   sizeof(rc.domain),   "%s", _cfg.host);
+		std::snprintf(rc.aorUser,  sizeof(rc.aorUser),  "%s", _cfg.fromUser);
+		std::snprintf(rc.authUser, sizeof(rc.authUser), "%s",
+			_cfg.authUser[0] ? _cfg.authUser : _cfg.fromUser);
+		std::snprintf(rc.localIp,  sizeof(rc.localIp),  "%s", _env.localIp().c_str());
+		rc.localPort = static_cast<uint16_t>(_env.serverPort());
+		if (!_reg.configure(rc, _secret)) return;
+		_reg.start(nowMs);
+		_regLive = true;
+	}
+	_regPeer = sbc;
+	sendRegisterIfDue(nowMs);
+}
+
+void SipTrunk::sendRegisterIfDue(uint64_t nowMs)
+{
+	if (!_reg.tick(nowMs, _regReq)) return;
+	_env.enqueue(_regPeer, _env.messageFromPool(
+		std::string_view(_regReq.bytes, _regReq.len), _regPeer));
+}
+
+bool SipTrunk::handleRegisterResponse(const std::shared_ptr<SipMessage>& data)
+{
+	if (!_regLive || siphdr::stripHeaderNameView(data->getCallID()) != _reg.callId()) return false;
+	const auto st = data->getStatusInfo();
+	if (!st.has_value()) return false;
+
+	// Same posture as a dialog response (#356): only the address the REGISTER
+	// went to may answer it. Consumed either way.
+	if (data->getSource().sin_addr.s_addr != _regPeer.sin_addr.s_addr)
+	{
+		_env.log("Trunk: REGISTER response from a non-carrier address dropped", true);
+		return true;
+	}
+
+	auto value = [&](std::string_view name) {
+		return siphdr::stripHeaderNameView(data->getHeaderLine(name));
+	};
+	SipRegistrationClient::ResponseView v;
+	v.code              = static_cast<int>(st->code);
+	v.wwwAuthenticate   = value("WWW-Authenticate");
+	v.proxyAuthenticate = value("Proxy-Authenticate");
+	v.expires           = value("Expires");
+	v.contact           = value("Contact");
+	v.minExpires        = value("Min-Expires");
+	v.retryAfter        = value("Retry-After");
+
+	const uint64_t nowMs = static_cast<uint64_t>(
+		std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+	const auto before = _reg.state();
+	_reg.onResponse(nowMs, v);
+	const auto after = _reg.state();
+	if (after != before && after == SipRegistrationClient::State::Registered)
+		_env.log("Trunk: registered with the carrier");
+	else if (after != before && after == SipRegistrationClient::State::Failed)
+		_env.log("Trunk: REGISTER failed; backing off", true);
+
+	sendRegisterIfDue(nowMs);   // a 401/407/423 retry goes out now, not a tick later
 	return true;
 }

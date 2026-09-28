@@ -1216,3 +1216,108 @@ TEST(AnchorRouting, TheHandsetsAckDisarmsTheAnchorAckDeadline)
 		EXPECT_NE(msg ? msg->toString().rfind("BYE ", 0) : 1u, 0u) << "no BYE on a healthy call";
 	}
 }
+
+TEST(AnchorRouting, AMissedKeepaliveDoesNotPruneAPhoneThatIsInACall)
+{
+	// Issue #533 (#451 X1 on .244): a handset that did not answer the board's
+	// OPTIONS pings mid-call was pruned 15 s after its last SIP packet, and the
+	// sweep erased its anchored call with no endCall() and no BYE. The orphan
+	// reaper then dropped the leg; the phone kept a dead call and its BYE drew
+	// 404. RTP is not SIP activity, so a live call must not be swept this way.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeRegister("502", "192.168.9.52", "reg-502"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-533-ka"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-533-ka").has_value());
+
+	handler.idleClientAndSweepForTest("501", std::chrono::seconds(20));
+	EXPECT_TRUE(handler.getSession("Call-ID: anchor-533-ka").has_value())
+		<< "a phone in a call must not be pruned for a missed keepalive";
+
+	// Positive control: a silent phone with no call is still pruned.
+	handler.idleClientAndSweepForTest("502", std::chrono::seconds(20));
+	handler.forceNextTickForTest();   // getActiveClients() reads the tick snapshot
+	handler.tick();
+	bool still502 = false;
+	for (const auto& [number, address] : handler.getActiveClients())
+	{
+		(void)address;
+		if (number == "502") still502 = true;
+	}
+	EXPECT_FALSE(still502) << "an idle phone with no call is still swept";
+}
+
+TEST(AnchorRouting, AnAnchorCallWhoseHandsetGoesSilentIsEndedButNeverWhileHeld)
+{
+	// Issue #604: with no BYE and (after #603) no keepalive prune, a dead phone
+	// held its anchor leg until the lease ran out. Held is exempt: a sendonly or
+	// inactive leg legitimately sends nothing.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-604"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+	const std::string id = "Call-ID: anchor-604";
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest(id);
+	ASSERT_NE(bridge, nullptr);
+	auto session = handler.getSession(id);
+	ASSERT_TRUE(session.has_value());
+	handler.tick();   // arms the watch
+
+	// Held and silent well past the timeout: kept.
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-604", 2, "a=sendonly\r\n"));
+	ASSERT_EQ(session.value()->getState(), Session::State::Held);
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_TRUE(handler.getSession(id).has_value()) << "a held call is never ended for silence";
+
+	// Resumed: the watch starts over rather than firing at once.
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-604", 3, "a=sendrecv\r\n"));
+	ASSERT_EQ(session.value()->getState(), Session::State::Connected);
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_TRUE(handler.getSession(id).has_value()) << "resume restarts the clock";
+
+	// Control: handset audio still arriving 61 s on keeps the call.
+	const std::vector<uint8_t> frame(160, 0xFF);
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	bridge->onHandsetRtp(frame.data(), frame.size());
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_TRUE(handler.getSession(id).has_value()) << "a talking handset is live";
+
+	// CaveJay on #612: a silent handset whose anchor side still talks (a
+	// VAD-silent listener) is live too -- only both legs silent ends it.
+	const int16_t pcm[160] = {};
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	ASSERT_TRUE(bridge->feedRx(bridge->participantId(), pcm, 160));
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_TRUE(handler.getSession(id).has_value()) << "anchor audio alone keeps the call";
+
+	// The handset goes silent for 61 s: ended, bridge released, handset BYEd.
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	handler.forceNextTickForTest();
+	sent.clear();
+	handler.tick();
+	EXPECT_FALSE(handler.getSession(id).has_value());
+	EXPECT_FALSE(bridge->isActive());
+	size_t byes = 0;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg || addr.sin_addr.s_addr != addrFor("192.168.9.51").sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.rfind("BYE ", 0) == 0 && raw.find("Call-ID: anchor-604") != std::string::npos) ++byes;
+	}
+	EXPECT_EQ(byes, 1u);
+}

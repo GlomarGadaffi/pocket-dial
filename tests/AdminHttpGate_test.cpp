@@ -37,6 +37,7 @@
 #endif
 
 #include <chrono>
+#include <stdexcept>
 #include <cstdlib>
 #include <thread>
 
@@ -472,20 +473,38 @@ namespace
 	}
 }
 
+TEST(WebHardening, APortAlreadyInUseIsAnErrorNotACrash)
+{
+	// Issue #540: a suite that lost its port to another suite must fail
+	// cleanly. The constructor opens and binds the listen socket and throws on
+	// failure; nothing is ever dereferenced after a failed bind.
+	HttpServer first("127.0.0.1", 0, nullptr);
+	const int taken = first.port();
+	ASSERT_GT(taken, 0) << "port 0 must read back the OS-assigned port";
+#if defined(_WIN32) || defined(_WIN64)
+	// Windows SO_REUSEADDR lets a second socket bind a listening port, so the
+	// collision cannot be forced here; the port-0 readback above still runs.
+	GTEST_SKIP() << "SO_REUSEADDR does not refuse a second bind on Windows";
+#else
+	EXPECT_THROW(HttpServer("127.0.0.1", taken, nullptr), std::runtime_error);
+#endif
+}
+
 TEST(WebHardening, Csrf_MissingToken_Rejected403)
 {
 	AdminAuth::clearCredential();
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18090, nullptr);
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
 	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	AdminSession a = loginAndCompleteSetup(18090);
+	AdminSession a = loginAndCompleteSetup(port);
 
 	// A valid session but no token: the cookie alone must not be enough.
-	std::string resp = httpPostRaw(18090, "/api/ap-security", "regenerate=1",
+	std::string resp = httpPostRaw(port, "/api/ap-security", "regenerate=1",
 	                               "pd_session=" + a.cookie);
 	EXPECT_EQ(statusOf(resp), 403);
 
@@ -497,14 +516,15 @@ TEST(WebHardening, Csrf_WrongToken_Rejected403)
 	AdminAuth::clearCredential();
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18091, nullptr);
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
 	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	AdminSession a = loginAndCompleteSetup(18091);
+	AdminSession a = loginAndCompleteSetup(port);
 
-	std::string resp = httpPostRaw(18091, "/api/ap-security", "regenerate=1",
+	std::string resp = httpPostRaw(port, "/api/ap-security", "regenerate=1",
 	                               "pd_session=" + a.cookie,
 	                               "00000000000000000000000000000000");
 	EXPECT_EQ(statusOf(resp), 403);
@@ -517,15 +537,16 @@ TEST(WebHardening, Csrf_ValidToken_Accepted)
 	AdminAuth::clearCredential();
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18092, nullptr);
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
 	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	AdminSession a = loginAndCompleteSetup(18092);
+	AdminSession a = loginAndCompleteSetup(port);
 	ASSERT_EQ(a.csrf.size(), AdminAuth::kCsrfTokenHex);
 
-	std::string resp = httpPostRaw(18092, "/api/ap-security", "regenerate=1",
+	std::string resp = httpPostRaw(port, "/api/ap-security", "regenerate=1",
 	                               "pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(resp), 200);
 
@@ -544,25 +565,26 @@ TEST(WebHardening, ConfiguringRequiresLoginThenSetupCompletion)
 	AdminAuth::clearCredential();
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18093, nullptr);
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
 	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	EXPECT_EQ(httpPostStatus(18093, "/api/configuring", ""), 401);
+	EXPECT_EQ(httpPostStatus(port, "/api/configuring", ""), 401);
 
-	std::string loginResp = httpPostRaw(18093, "/api/admin/login", "username=admin&password=admin");
+	std::string loginResp = httpPostRaw(port, "/api/admin/login", "username=admin&password=admin");
 	ASSERT_EQ(statusOf(loginResp), 200);
 	std::string cookie = cookieOf(loginResp, "pd_session");
 	std::string csrf = csrfOf(loginResp);
 
-	EXPECT_EQ(statusOf(httpPostRaw(18093, "/api/configuring", "", "pd_session=" + cookie, csrf)), 403)
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/configuring", "", "pd_session=" + cookie, csrf)), 403)
 		<< "logged in on the default credential, but setup is not complete yet";
 
-	ASSERT_EQ(statusOf(httpPostRaw(18093, "/api/admin/set-credential",
+	ASSERT_EQ(statusOf(httpPostRaw(port, "/api/admin/set-credential",
 		"username=admin&password=realpassword123", "pd_session=" + cookie, csrf)), 200);
 
-	EXPECT_EQ(statusOf(httpPostRaw(18093, "/api/configuring", "", "pd_session=" + cookie, csrf)), 200);
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/configuring", "", "pd_session=" + cookie, csrf)), 200);
 
 	AdminAuth::clearCredential();
 }
@@ -576,7 +598,8 @@ TEST(WebHardening, PcapAndTrace_RejectCrossOrigin)
 	AdminAuth::clearCredential();
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18094, nullptr);
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
 	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -585,15 +608,15 @@ TEST(WebHardening, PcapAndTrace_RejectCrossOrigin)
 	// check, so a cross-origin request is rejected whether or not a session
 	// cookie is even presented.
 	const std::string evil = "http://evil.example";
-	EXPECT_EQ(statusOf(httpGetRaw(18094, "/api/pcap", "", evil)), 403);
-	EXPECT_EQ(statusOf(httpGetRaw(18094, "/api/trace", "", evil)), 403);
-	EXPECT_EQ(statusOf(httpGetRaw(18094, "/api/diagnostics/pcap", "", evil)), 403);
+	EXPECT_EQ(statusOf(httpGetRaw(port, "/api/pcap", "", evil)), 403);
+	EXPECT_EQ(statusOf(httpGetRaw(port, "/api/trace", "", evil)), 403);
+	EXPECT_EQ(statusOf(httpGetRaw(port, "/api/diagnostics/pcap", "", evil)), 403);
 
 	// Same-origin (no Origin header at all) reaches the session check next —
 	// needs a real, fully-set-up login to get all the way through to the
 	// handler and see 200.
-	AdminSession a = loginAndCompleteSetup(18094);
-	EXPECT_EQ(statusOf(httpGetRaw(18094, "/api/trace", "pd_session=" + a.cookie)), 200);
+	AdminSession a = loginAndCompleteSetup(port);
+	EXPECT_EQ(statusOf(httpGetRaw(port, "/api/trace", "pd_session=" + a.cookie)), 200);
 
 	AdminAuth::clearCredential();
 }
@@ -601,14 +624,15 @@ TEST(WebHardening, PcapAndTrace_RejectCrossOrigin)
 TEST(WebHardening, SecurityHeadersOnEveryResponse)
 {
 	AdminAuth::clearCredential();
-	HttpServer server("127.0.0.1", 18096, nullptr);
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
 	// A read endpoint and an error response: the headers are emitted centrally in
 	// sendResponseWithHeader, so both must carry them.
-	const std::string ok  = httpGetRaw(18096, "/api/status");
-	const std::string err = httpGetRaw(18096, "/api/pcap", "", "http://evil.example");
+	const std::string ok  = httpGetRaw(port, "/api/status");
+	const std::string err = httpGetRaw(port, "/api/pcap", "", "http://evil.example");
 
 	for (const std::string* r : {&ok, &err})
 	{
@@ -717,12 +741,13 @@ TEST(WebHardening, OneClientsLoginLockoutDoesNotLockOutAnotherOverHttp)
 	ASSERT_TRUE(AdminAuth::setLoginCredential("admin", "realpassword123"));
 	RequestsHandler handler("192.168.4.1", 5060,
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	HttpServer server("127.0.0.1", 18085, nullptr);
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
 	server.attachHandler(&handler);
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	const std::string first = httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+	const std::string first = httpPostFrom(port, "127.0.0.2", "/api/admin/login",
 		"username=admin&password=wrong-0");
 	if (first.empty())
 	{
@@ -732,16 +757,16 @@ TEST(WebHardening, OneClientsLoginLockoutDoesNotLockOutAnotherOverHttp)
 	EXPECT_EQ(statusOf(first), 401);
 	for (int i = 1; i < AdminAuth::kMaxFailedAttempts; ++i)
 	{
-		const int st = statusOf(httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+		const int st = statusOf(httpPostFrom(port, "127.0.0.2", "/api/admin/login",
 			"username=admin&password=wrong-" + std::to_string(i)));
 		EXPECT_TRUE(st == 401 || st == 429) << "attempt " << i << " got " << st;
 	}
 
 	// The guesser is locked out, even with the right password...
-	EXPECT_EQ(statusOf(httpPostFrom(18085, "127.0.0.2", "/api/admin/login",
+	EXPECT_EQ(statusOf(httpPostFrom(port, "127.0.0.2", "/api/admin/login",
 		"username=admin&password=realpassword123")), 429);
 	// ...and the real admin, from another address, is not.
-	EXPECT_EQ(statusOf(httpPostFrom(18085, "127.0.0.1", "/api/admin/login",
+	EXPECT_EQ(statusOf(httpPostFrom(port, "127.0.0.1", "/api/admin/login",
 		"username=admin&password=realpassword123")), 200)
 		<< "one client's lockout must not lock out another (#528)";
 

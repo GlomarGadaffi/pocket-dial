@@ -108,6 +108,36 @@ public:
 	int getTrunkRelaySlot() const { return _trunkRelaySlot; }
 	void setTrunkRelaySlot(int slot) { _trunkRelaySlot = slot; }
 
+	// Issue #604: a 911/933 call. tick()'s RTP-inactivity reap never ends one:
+	// a caller who cannot speak on a phone with silence suppression sends no
+	// RTP, and hanging up on them is the one failure this PBX must not have.
+	bool isEmergency() const { return _isEmergency; }
+	void setEmergency(bool val) { _isEmergency = val; }
+
+	// Issue #604: RTP inactivity watch. `legA`/`legB` are the received-packet
+	// counters of the call's two relayed legs (pass one counter twice for a
+	// one-leg bridge). The clock restarts whenever EITHER leg has received
+	// since the last restart, so only BOTH legs silent runs it out: one quiet
+	// leg (VAD-silent listener, far-end hold, mute) is a healthy call. Returns
+	// how long it has run. disarmRtpWatch() restarts it from the next call.
+	std::chrono::steady_clock::duration rtpSilence(uint32_t legA, uint32_t legB,
+		std::chrono::steady_clock::time_point now)
+	{
+		if (!_rtpWatchArmed || (legA != _rtpMarkA || legB != _rtpMarkB))
+		{
+			_rtpWatchArmed = true;
+			_rtpMarkA = legA;
+			_rtpMarkB = legB;
+			_rtpMarkAt = now;
+		}
+		return now - _rtpMarkAt;
+	}
+	void disarmRtpWatch() { _rtpWatchArmed = false; }
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#604): run the watch's clock forward without sleeping.
+	void ageRtpWatchForTest(std::chrono::steady_clock::duration d) { _rtpMarkAt -= d; }
+#endif
+
 	// Deposit (leaving a message) vs Retrieval (checking the mailbox) --
 	// both answer locally and both use VoicemailLeg's Playing/PlaybackDone
 	// states, but tick()'s sweep must only auto-advance Playing ->
@@ -338,6 +368,11 @@ private:
 	int  _voicemailLegSlot = -1;
 	bool _isTrunk = false;
 	int  _trunkRelaySlot = -1;
+	bool _isEmergency = false;                          // #604
+	bool _rtpWatchArmed = false;                        // #604
+	uint32_t _rtpMarkA = 0;                             // #604
+	uint32_t _rtpMarkB = 0;                             // #604
+	std::chrono::steady_clock::time_point _rtpMarkAt{}; // #604
 	VoicemailPurpose _voicemailPurpose = VoicemailPurpose::Deposit;
 	std::chrono::steady_clock::time_point _voicemailDeadline;
 	bool _voicemailDeadlineArmed = false;

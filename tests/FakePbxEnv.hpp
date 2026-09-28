@@ -101,11 +101,11 @@ public:
 	{
 		sent.push_back(Sent{to, msg ? msg->toString() : std::string{}});
 	}
-	std::shared_ptr<SipMessage> messageFromPool(std::string raw, sockaddr_in src) override
+	std::shared_ptr<SipMessage> messageFromPool(std::string_view raw, sockaddr_in src) override
 	{
 		if (!messagePoolAvailable) return nullptr;
 		if (messagePoolFailDrawIn > 0 && --messagePoolFailDrawIn == 0) return nullptr;
-		return std::make_shared<SipMessage>(raw, src);
+		return std::make_shared<SipMessage>(std::string(raw), src);
 	}
 	// Records every Call-ID whose client transactions were released, so a test can
 	// assert that a teardown path actually stopped the retransmits (issue #148).

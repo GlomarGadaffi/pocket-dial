@@ -25,6 +25,7 @@
 // eyeballed on hardware.
 #include "DmaFramePool.hpp"
 #include "RtpReceiver.hpp"     // Issue #469: rxOversizeDrops() on /api/status
+#include "RtpSender.hpp"       // Issue #479: txPoolRefusals() on /api/status
 #include "HoldMusic.hpp"       // Issue #466: clipRefusals() on /api/status
 #include "PsramAllocator.hpp"  // Issue #466: psram::internalFallbacks() on /api/status
 #include "index_html.h"
@@ -82,6 +83,8 @@
 // Issue #185: heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) for
 // sendApiStatus's minFreeHeapSpiram field.
 #include "esp_heap_caps.h"
+// Issue #496 / #509 review: the IPv4 input guard's counts for /api/status.
+#include "Ip4InputGuard.h"
 // Issue #366: esp_pthread_set_cfg() to size the per-connection thread stack
 // independently of CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT.
 #include "esp_pthread.h"
@@ -185,6 +188,25 @@ bool HttpServer::openListenSocket()
 	{
 		closeSocket(sock);
 		return false;
+	}
+
+	// Issue #540: port 0 asks the OS for a free port. Read back the one it
+	// chose, so port() reports it -- host test suites no longer need fixed
+	// ports and can run in parallel.
+	if (_port == 0)
+	{
+		sockaddr_in bound{};
+#if defined _WIN32 || defined _WIN64
+		int boundLen = static_cast<int>(sizeof(bound));
+#else
+		socklen_t boundLen = sizeof(bound);
+#endif
+		if (getsockname(sock, reinterpret_cast<struct sockaddr*>(&bound), &boundLen) != 0)
+		{
+			closeSocket(sock);
+			return false;
+		}
+		_port = ntohs(bound.sin_port);
 	}
 
 	_listenSock = sock;
@@ -1970,10 +1992,21 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		json.s("\"emergencyRoute\":\"").s(emergencyRoute).s("\",");
 	}
 	json.s("\"uptime\":").n(uptimeSec).s(",");
+#if defined(ESP_PLATFORM)
+	// Issue #496 / #509 review: frames and fragments the IPv4 input guard
+	// (Ip4InputGuard.h) dropped since boot.
+	{
+		uint32_t g[3] = {0, 0, 0};
+		pd_ip4_guard_counts(g);
+		json.s("\"ip4Guard\":{\"padded\":").n(g[0]).s(",\"tinyFragments\":").n(g[1])
+		    .s(",\"mdnsFragments\":").n(g[2]).s("},");
+	}
+#endif
 	// #470: CDR ring persist health. A non-zero failure count means call history
 	// is NOT surviving reboots; suppressed counts writes refused mid-reset (#473).
 	json.s("\"cdrPersistFailures\":").n(CdrRing::persistFailureCount()).s(",");
 	json.s("\"cdrPersistSuppressed\":").n(CdrRing::persistSuppressedCount()).s(",");
+	json.s("\"cdrLoadFailures\":").n(CdrRing::loadFailureCount()).s(",");   // #594: load() read failures
 	json.s("\"packetsProcessed\":").n(packets).s(",");
 	json.s("\"packetsDropped\":").n(dropped).s(",");
 	// Issue #409: draws refused by a spent pool (neither has a heap fallback).
@@ -2001,6 +2034,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// Issue #469: the RTP side of the same check -- media datagrams over
 	// RtpReceiver::MAX_DATAGRAM_BYTES, dropped instead of parsed cut.
 	json.s("\"rtpRxOversize\":").n(RtpReceiver::rxOversizeDrops()).s(",");
+	// #479: tx stack pool starts refused (pool full) and slots retired at boot.
+	json.s("\"rtpTxPoolRefused\":").n(RtpSender::txPoolRefusals()).s(",");
+	json.s("\"rtpTxPoolRetired\":").n(RtpSender::txPoolRetired()).s(",");
 	json.s("\"recvErrors\":").n(recvErrors).s(",");
 	json.s("\"lastRecvErrno\":").n(lastRecvErrno).s(",");
 	json.s("\"recentDrops\":[");
@@ -4386,7 +4422,10 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		// #473: the guard begun above still refuses new NVS data writes; drain any
 		// write already in flight (the CDR persist writer) before the partition is
 		// erased under it, as the DTMF door does.
-		(void)resetguard::waitForWritersIdle(500);
+		if (!resetguard::waitForWritersIdle(500))
+		{
+			ESP_LOGW("factory_reset", "an NVS writer was still busy after 500 ms; erasing anyway (#594)");
+		}
 		const esp_err_t eraseErr = nvs_flash_erase();
 		if (eraseErr != ESP_OK)
 		{

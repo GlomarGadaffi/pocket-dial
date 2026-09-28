@@ -126,6 +126,9 @@ public:
 	~HttpServer();
 
 	void start();
+	// The port this server listens on. Construct with port 0 and this reports
+	// the one the OS assigned (issue #540).
+	int port() const { return _port; }
 
 	// Late-bind the live SIP registrar. The dashboard must be able to start
 	// BEFORE the SIP stack exists — an unprovisioned device holds SIP dark

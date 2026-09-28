@@ -1,4 +1,5 @@
 #include "DnsServer.hpp"
+#include "UdpRcvBuf.hpp"   // Issue #496 / #509 review
 #include <cstring>
 #include <errno.h>
 #include <sys/param.h>
@@ -109,6 +110,12 @@ void DnsServer::dns_task(void* pvParameters) {
     tv.tv_sec  = 0;
     tv.tv_usec = 500000;   // 500 ms
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Issue #496 / #509 review: with IPv4 reassembly on, one queued datagram can
+    // be ~14.8 KB. A DNS query is one small packet; cap the queue (UdpRcvBuf.hpp).
+    if (!udprcvbuf::set(sock, udprcvbuf::kDns)) {
+        ESP_LOGE(TAG, "SO_RCVBUF(%d) failed: DNS receive queue is UNBOUNDED", udprcvbuf::kDns);
+    }
 
     // Standard BSD-sockets idiom: bind()/recvfrom() take `struct sockaddr *`,
     // and casting the concrete `sockaddr_in` up to it is how every sockets API

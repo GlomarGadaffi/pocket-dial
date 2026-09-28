@@ -11,6 +11,9 @@
 #include <algorithm>
 #include "SipMessageTypes.h"
 #include "SipSdpMessage.hpp"
+#if defined(ESP_PLATFORM)
+#include "esp_log.h"   // #533 diag: queueLog() prints to stdout, which syslog never sees
+#endif
 #include "IDGen.hpp"
 #include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include <cstdio>             // #463: snprintf for the OPTIONS ping and snapshot ip:port
@@ -117,6 +120,11 @@ namespace
 	// branch): it answers synchronously and clears any timer immediately.
 	constexpr auto ANCHOR_ACK_TIMEOUT = std::chrono::seconds(15);
 
+	// Issue #604: how long a CONNECTED relayed leg may receive no RTP before
+	// tick() ends the call. Well past silence-suppression gaps; Held calls are
+	// exempt outright.
+	constexpr auto kRtpInactivityTimeout = std::chrono::seconds(60);
+
 	// How long an outbound anchor/trunk call may RING before tick() reaps it.
 	//
 	// Deliberately NOT pbx::kNoAnswerTimeout. That constant is documented as "how
@@ -165,6 +173,22 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// once here and never changed -- the listener is this object, which outlives
 	// the trunk it is handed to.
 	_sipTrunk.setListener(this);
+
+	// Issue #479: the conference room is built HERE, at boot, so its legs'
+	// RTP task slots (RtpSender/RtpReceiver stacks + TCBs) are allocated at
+	// init, never on the first 888 dial-in. Its mix-tick driver still starts
+	// on the first dial-in (onConferenceInvite), as before. POCKETDIAL_CONFERENCE=0
+	// (SIP_CONSTRAINED, no PSRAM) builds no room: 888 is refused.
+#if POCKETDIAL_CONFERENCE
+	_conference = std::make_unique<ConferenceRoom>();
+	// Issue #199 item 3: give every leg a way to hand an RFC 4733 key press
+	// back to the engine. Invoked on that leg's RTP receive task, so it goes
+	// to queueDtmfDigit(), which is the one entry point here built to be
+	// called without _mutex held.
+	_conference->setDigitSink([this](std::string_view legCallId, char digit) {
+		queueDtmfDigit(legCallId, digit);
+	});
+#endif
 
 	// Pre-allocate pools (Issue #53). Capacities are compile-time tunable via
 	// PoolConfig.hpp (-DPOCKETDIAL_MAX_* overrides); defaults preserve 32/8/32.
@@ -1769,6 +1793,26 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		}
 	}
 
+	// Issue #379: a To-tag means an in-dialog request, and the dialog is not live
+	// here (no session, or one already ended). RFC 3261 §12.2.2: answer 481, never
+	// treat it as a new call -- a late hold re-INVITE used to place a fresh anchored
+	// leg to "pbx" that nothing ever dropped.
+	// A dialog the trunk or the register beep owns has no Session: a carrier's
+	// session-refresh re-INVITE lands here and must keep its old path, never a
+	// 481 that would end the call (#611 review; 911 over the trunk included).
+	if (std::string_view(data->getTo()).find("tag=") != std::string_view::npos &&
+		!_sipTrunk.ownsCallID(data->getCallID()) && !_beeper.ownsCallID(data->getCallID()))
+	{
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 481 Call/Transaction Does Not Exist");
+		response->clearBody();
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		queueLog("INVITE for unknown dialog " + std::string(data->getCallID()) + " answered 481", true);
+		return;
+	}
+
 	if (!isValidAor(data->getFromNumber()) || !isValidAor(data->getToNumber()))
 	{
 		auto response = getMessageFromPool(*data);
@@ -2617,6 +2661,14 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 			+ std::string(data->getFromNumber()), true);
 	};
 
+	// #479: no room on this build (POCKETDIAL_CONFERENCE=0, SIP_CONSTRAINED). 403, as
+	// the other feature-off answer here ("voicemail not enabled"); refuse() logs it.
+	if (!_conference)
+	{
+		refuse("SIP/2.0 403 Forbidden", "conference disabled on this build");
+		return;
+	}
+
 	// Issue #304: conference mixing only understands PCMU -- RtpReceiver.cpp
 	// only recognizes PAYLOAD_TYPE_PCMU as audio; anything else (PCMA
 	// included) falls through to the DTMF-event check and is dropped. Same
@@ -2637,23 +2689,19 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 
-	// The room (and its single mix-tick driver) is built on the first dial-in and then
-	// kept for the life of the process: standing the tick task up and down underneath
-	// legs whose RTP tasks may still be in flight is exactly the teardown race the bus's
-	// Draining state exists to avoid. Idle cost is the bus rings; see PoolConfig.hpp.
-	if (!_conference)
+	// The room is built at boot (constructor, #479); its single mix-tick driver starts
+	// on the first dial-in and is then kept for the life of the process: standing the
+	// tick task up and down underneath legs whose RTP tasks may still be in flight is
+	// exactly the teardown race the bus's Draining state exists to avoid. startDriver()
+	// is a no-op once running, so calling it on every dial-in also retries a failed start.
+	_conference->startDriver();
+	// #479 review: no driver means no tick, so no port ever leaves Draining and every
+	// leg would be dead air. Refuse before a leg or session is taken; the next 888
+	// retries the start.
+	if (!_conference->driverRunning())
 	{
-		_conference = std::make_unique<ConferenceRoom>();
-		// Issue #199 item 3: give every leg a way to hand an RFC 4733 key press
-		// back to the engine. Invoked on that leg's RTP receive task, so it goes
-		// to queueDtmfDigit(), which is the one entry point here built to be
-		// called without _mutex held.
-		_conference->setDigitSink([this](std::string_view legCallId, char digit) {
-			queueDtmfDigit(legCallId, digit);
-		});
-		_conference->startDriver();
-		queueLog("888 conference: room created (" + std::to_string(ConferenceRoom::MAX_LEGS)
-			+ " legs, " + std::to_string(ConferenceRoom::TICK_MS) + " ms mix tick)");
+		refuse("SIP/2.0 503 Service Unavailable", "conference mix tick could not be started");
+		return;
 	}
 
 	// Join first: a full room must not consume a session slot. The leg index is also
@@ -3919,6 +3967,13 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// still possible); then the generic SIP trunk, whose refusals answer the
 	// INVITE themselves and so must come last; then the 503 below.
 	const EmergencyRoute route = emergencyRouteLocked();
+	// #604: flag the session the route just made, so tick()'s RTP-inactivity
+	// reap never hangs up a 911 (the dialed number alone misses a dial-plan
+	// transform such as "0" -> "911").
+	auto markEmergency = [&] {
+		auto s = _sessions.find(std::string(data->getCallID()));
+		if (s != _sessions.end() && s->second) s->second->setEmergency(true);
+	};
 	bool placed = false;
 	bool codecRejected = false;
 	if (route == EmergencyRoute::Anchor)
@@ -3931,6 +3986,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed,
 			&codecRejected))
 		{
+			markEmergency();   // #604
 			// The call leg is enqueued. NOW notify: 47 CFR 9.16(b)(2) wants the
 			// notification contemporaneous with the call and not delaying it, and
 			// both leave on the same drainOutbox() pass, so that holds literally
@@ -3967,6 +4023,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 			// Always owns the INVITE: every refusal on this path answers it, and
 			// logs which one it was ("trunk: <why> for <ext> -> 911").
 			(void)placeSipTrunkCall(data, caller, bare, &placed);
+			markEmergency();   // #604
 			notifyEmergency(emergency, from, dialed, /*routed=*/placed);
 			return;
 		}
@@ -7168,6 +7225,15 @@ bool RequestsHandler::setCallState(std::string_view callID, Session::State state
 
 void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason)
 {
+#if defined(ESP_PLATFORM)
+	// #533 diag: every session teardown funnels through here, and its reason
+	// names the path (reap, audio write failure, session timer, BYE, CANCEL...).
+	// esp_log, not queueLog: queueLog goes to stdout, which syslog never carries.
+	// No numbers: dest can be a dialed PSTN number, which stays out of logs.
+	ESP_LOGW("pbx", "endCall %.*s reason=%.*s",
+		static_cast<int>(callID.size()), callID.data(),
+		static_cast<int>(reason.size()), reason.data());
+#endif
 	// DTMF accumulators are keyed by Call-ID and share the dialog lifecycle; drop
 	// this dialog's entry so DtmfFeatureCodes's _dtmfState can't grow unbounded
 	// across calls (Fix #4).
@@ -7469,6 +7535,27 @@ void RequestsHandler::sweepExpired()
 		bool keepAliveTimedOut = (now - client->getLastActiveTime() > std::chrono::seconds(15));
 		bool leaseExpired = client->isExpired(now);
 
+		// Issue #533: a phone mid-call that does not answer our OPTIONS pings (RTP
+		// does not count as activity) was pruned 15 s after its last SIP packet,
+		// and its sessions erased below with no endCall() and no BYE: the anchor
+		// leg dropped, the handset kept a dead call and its later BYE drew 404.
+		// A missed keepalive alone no longer prunes a client that is in a call;
+		// an expired lease still does.
+		if (keepAliveTimedOut && !leaseExpired)
+		{
+			bool inCall = false;
+			for (const auto& [cid, s] : _sessions)
+			{
+				if ((s->getSrc() && s->getSrc()->getNumber() == client->getNumber()) ||
+				    (s->getDest() && s->getDest()->getNumber() == client->getNumber()))
+				{
+					inCall = true;
+					break;
+				}
+			}
+			if (inCall) continue;
+		}
+
 		if (keepAliveTimedOut || leaseExpired)
 		{
 			if (keepAliveTimedOut)
@@ -7480,36 +7567,27 @@ void RequestsHandler::sweepExpired()
 				queueLog("Registration lease expired: " + client->getNumber());
 			}
 
-			// Clean up sessions involving this client
-			std::string extension = client->getNumber();
-			for (auto sit = _sessions.begin(); sit != _sessions.end(); )
+			// Issue #533 (#603 review): end this client's calls through endCall(),
+			// not a hand-rolled erase, so the far leg is hung up (trunk BYE), relays
+			// and bridges are released and the CDR is written -- the same teardown
+			// every other path gets. Call-IDs are collected first: endCall() erases
+			// from _sessions.
+			const std::string extension = client->getNumber();
+			std::vector<std::pair<std::string, std::string>> ending;   // {callID, other party}
+			for (const auto& [cid, s] : _sessions)
 			{
-				bool involved = false;
-				if (sit->second->getSrc() && sit->second->getSrc()->getNumber() == extension)
-					involved = true;
-				if (sit->second->getDest() && sit->second->getDest()->getNumber() == extension)
-					involved = true;
-				if (involved)
+				const bool isSrc = s->getSrc() && s->getSrc()->getNumber() == extension;
+				const bool isDest = s->getDest() && s->getDest()->getNumber() == extension;
+				if (isSrc || isDest)
 				{
-					std::string callID = sit->first;
-					// Media beachhead: if this dialog owned the live RTP tone stream,
-					// stop it so a caller whose lease expires mid-stream doesn't leak
-					// the socket/task. Idempotent no-op otherwise.
-					_rtpSender.stop(callID);
-					sit = _sessions.erase(sit);
-					for (auto& session : _sessionPool)
-					{
-						if (session->getCallID() == callID)
-						{
-							session->release();
-							break;
-						}
-					}
+					const auto& other = isSrc ? s->getDest() : s->getSrc();
+					ending.emplace_back(cid, other ? other->getNumber() : std::string());
 				}
-				else
-				{
-					++sit;
-				}
+			}
+			for (const auto& [cid, other] : ending)
+			{
+				endCall(cid, extension, other, leaseExpired ? "registration lease expired"
+				                                            : "missed OPTIONS keepalive pings");
 			}
 
 			client->release();
@@ -8605,9 +8683,17 @@ void RequestsHandler::tick()
 		// all and only a dotted-quad trunk can place a call.
 		if (_sipTrunk.config().valid())
 		{
-			sockaddr_in unusedAddr{};
-			_trunkResolver.resolve(_sipTrunk.config().transportHost(),
-				_sipTrunk.config().transportPort(), unusedAddr, now);
+			sockaddr_in sbc{};
+			// Issue #399: and REGISTER once there is an address -- at boot, on
+			// a 401/407 retry, and to refresh before Expires. The carrier does
+			// not route to an unregistered trunk.
+			if (_trunkResolver.resolve(_sipTrunk.config().transportHost(),
+				_sipTrunk.config().transportPort(), sbc, now) == TrunkResolver::Status::Hit)
+			{
+				_sipTrunk.tickRegistration(static_cast<uint64_t>(
+					std::chrono::duration_cast<std::chrono::milliseconds>(
+						now.time_since_epoch()).count()), sbc);
+			}
 		}
 
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
@@ -8943,6 +9029,82 @@ void RequestsHandler::tick()
 				endCall(callID, handset ? handset->getNumber() : "", part,
 					"anchor audio write failure");
 			}
+		}
+
+		// Issue #604: RTP inactivity. A relayed call whose media stops with no
+		// SIP BYE (the phone lost power or left the LAN, the far end vanished)
+		// was held until the registration lease ran out -- up to an hour of a
+		// session, a relay pair and a billed carrier leg. End it once BOTH
+		// relayed legs have received nothing for kRtpInactivityTimeout; one
+		// quiet leg (VAD-silent listener, far-end hold, mute) is a live call.
+		// Only legs the board relays can be watched: a trunk call's two
+		// receivers and an anchor bridge's handset RTP + anchor audio. Exempt: Held calls
+		// (a sendonly/inactive leg legitimately sends nothing; the watch
+		// restarts on resume) and 911/933 (see Session::isEmergency()).
+		std::vector<std::string> silentCallIds;
+		for (const auto& [callID, session] : _sessions)
+		{
+			if (session->getState() != Session::State::Connected || session->isEmergency())
+			{
+				session->disarmRtpWatch();
+				continue;
+			}
+			uint32_t legA = 0, legB = 0;
+			if (session->isTrunk())
+			{
+				const int slot = session->getTrunkRelaySlot();
+				if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS) ||
+				    !_trunkRx[slot].isActive() || !_handsetRx[slot].isActive()) continue;
+				legA = _handsetRx[slot].rawRxPackets();
+				legB = _trunkRx[slot].rawRxPackets();
+			}
+			else if (session->isAnchor())
+			{
+				MediaBridge* b = nullptr;
+				for (auto& mb : _mediaBridges)
+				{
+					if (mb.isForCallId(callID)) { b = &mb; break; }
+				}
+				if (!b || !b->isActive()) continue;
+				legA = b->handsetRtpPackets();
+				legB = b->anchorRxChunks();
+			}
+			else
+			{
+				continue;   // peer-to-peer media never passes through the board
+			}
+			if (session->rtpSilence(legA, legB, now) >= kRtpInactivityTimeout)
+			{
+				silentCallIds.push_back(callID);
+			}
+		}
+		for (const auto& callID : silentCallIds)
+		{
+			auto sit = _sessions.find(callID);
+			if (sit == _sessions.end()) continue;
+			auto session = sit->second;
+			// The handset is src on both relayed shapes except an inbound anchor
+			// call, where it is dest. BYE it best effort, the same way each shape's
+			// own far-end hangup does (onTrunkRemoteBye, the #279 anchor teardown);
+			// endCall() then BYEs the carrier or drops the anchor leg and frees the
+			// relay or bridge.
+			const bool inbound = session->isAnchorInbound();
+			auto handset = inbound ? session->getDest() : session->getSrc();
+			const std::string& dFrom = session->getDialogFrom();
+			const std::string& dTo   = session->getDialogTo();
+			if (handset && !dFrom.empty() && !dTo.empty())
+			{
+				const bool fromIsUs = session->isTrunk() || inbound;
+				auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), callID,
+					fromIsUs ? dFrom : dTo, fromIsUs ? dTo : dFrom);
+				if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
+			}
+			queueLog("[media] no RTP for " + std::to_string(kRtpInactivityTimeout.count()) +
+				" s -- ending " + callID, true);
+			const std::string handsetNum = handset ? handset->getNumber() : std::string();
+			const std::string farNum = session->isAnchor() ? session->getAnchorParticipantId() : std::string();
+			if (inbound) endCall(callID, farNum, handsetNum, "rtp inactivity");
+			else         endCall(callID, handsetNum, farNum, "rtp inactivity");
 		}
 
 		// Reap ORPHANED media bridges — active but with NO owning anchor session.

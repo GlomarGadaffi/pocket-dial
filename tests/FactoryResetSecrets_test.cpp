@@ -433,6 +433,23 @@ TEST_F(FactoryResetSecretsTest, AFailedAdminCredentialEraseIsReportedAsAnError)
 	EXPECT_FALSE(AdminAuth::isProvisioned());
 }
 
+// #595 item 3: the admin-credential erase failure is journalled as kAdmin.
+TEST_F(FactoryResetSecretsTest, AFailedAdminCredentialEraseIsJournalledAsKAdmin)
+{
+	resetjournal::resetForTest();
+	const AdminSession s = bypassLogin();
+	AdminAuth::failNextEraseForTest();
+
+	const std::string resp = httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf);
+	ASSERT_EQ(statusOf(resp), 500) << resp;
+
+	resetjournal::simulateRebootForTest();
+	const resetjournal::BootStatus st = resetjournal::bootStatus();
+	EXPECT_EQ(st.stage, resetjournal::Stage::Failed);
+	EXPECT_EQ(st.failedMask, resetjournal::kAdmin) << "only the admin store failed";
+	resetjournal::resetForTest();
+}
+
 TEST_F(FactoryResetSecretsTest, TheSdVoicemailArchiveIsWiped)
 {
 	// #450: recordings and greetings on the SD survived both reset doors; only
