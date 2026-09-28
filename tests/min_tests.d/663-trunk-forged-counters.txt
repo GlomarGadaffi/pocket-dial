@@ -1,0 +1,2 @@
+# SipTrunk_test.cpp: 2 (pow2 logging) + TrunkWiring_test.cpp: 1 (/api/status counters)
+3
