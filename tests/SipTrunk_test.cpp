@@ -1321,6 +1321,37 @@ TEST(SipTrunkAuth, A401IsAckedAndTheInviteResentOnceWithCredentials)
 	EXPECT_FALSE(anySentOrLoggedContains(env, "s3cret-399")) << "the password never leaves the box";
 }
 
+// #618: both INVITEs are on the console in full, and the credentialed one's
+// Authorization value (the digest response) is not.
+TEST(SipTrunkAuth, TheFullInviteIsLoggedWithAuthorizationRedacted)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-399"));
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 401, "WWW-Authenticate"))));
+
+	std::string all;
+	for (const auto& l : env.logs)
+	{
+		EXPECT_LE(l.size(), 200u) << "over LogQueue's line cap: " << l;
+		if (l.rfind("Trunk: INVITE> ", 0) == 0) all += l + "\n";
+	}
+	EXPECT_NE(all.find("Trunk: INVITE> INVITE sip:+15551234567@203.0.113.5 SIP/2.0 | Via: "),
+		std::string::npos) << all;
+	EXPECT_NE(all.find("CSeq: 1 INVITE"), std::string::npos) << all;
+	EXPECT_NE(all.find("CSeq: 2 INVITE"), std::string::npos) << "the retry too: " << all;
+	EXPECT_NE(all.find("Contact: "), std::string::npos) << all;
+	EXPECT_NE(all.find("c=IN IP4 "), std::string::npos) << "the SDP too: " << all;
+	EXPECT_NE(all.find("Authorization: <redacted>"), std::string::npos) << all;
+	EXPECT_EQ(all.find("response="), std::string::npos) << all;
+	EXPECT_EQ(all.find("nonce="), std::string::npos) << all;
+	EXPECT_FALSE(anySentOrLoggedContains(env, "s3cret-399"));
+}
+
 TEST(SipTrunkAuth, A407IsAnsweredWithProxyAuthorizationAndTheAuthUser)
 {
 	FakePbxEnv env;
@@ -1544,6 +1575,35 @@ TEST(SipTrunkRegister, A401IsAnsweredWithDigestAndThe200ArmsARefreshBeforeExpire
 	ASSERT_EQ(env.sent.size(), 3u) << "the binding must be refreshed before it lapses at 120 s";
 	EXPECT_NE(env.sentRaw(2).find("nc=00000002"), std::string::npos)
 		<< "the refresh re-signs against the cached nonce: " << env.sentRaw(2);
+}
+
+// #618: Engage answers a FAILED REGISTER with "200 Authorization failure", and
+// .244 sits behind CGNAT. The console must show the reason phrase and what the
+// carrier saw of us (Via received/rport), or "registered" cannot be trusted.
+TEST(SipTrunkRegister, AFinalRegisterResponseLogsItsStatusLineAndViaReceived)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+	trunk.tickRegistration(steadyMs(), sbcAddr());
+	ASSERT_EQ(env.sent.size(), 1u);
+
+	std::string resp = regResponse(env.sentRaw(0), "SIP/2.0 200 Authorization failure",
+		"Contact: <sip:198.51.100.14:5065>\r\n");
+	const size_t rp = resp.find(";rport");
+	ASSERT_NE(rp, std::string::npos) << resp;
+	resp.replace(rp, 6, ";rport=40123;received=198.51.100.7");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(resp)));
+
+	std::string line;
+	for (const auto& l : env.logs)
+		if (l.find("Trunk: REGISTER <-") != std::string::npos) line = l;
+	std::printf("[#618] %s\n", line.c_str());
+	EXPECT_NE(line.find("SIP/2.0 200 Authorization failure"), std::string::npos) << line;
+	EXPECT_NE(line.find("received=198.51.100.7"), std::string::npos) << line;
+	EXPECT_NE(line.find("rport=40123"), std::string::npos) << line;
+	EXPECT_NE(line.find("Contact <sip:198.51.100.14:5065>"), std::string::npos) << line;
 }
 
 TEST(SipTrunkRegister, A407IsAnsweredInProxyAuthorization)

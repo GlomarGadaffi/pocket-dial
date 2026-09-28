@@ -1,5 +1,7 @@
 #include "SipTrunk.hpp"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 
@@ -15,6 +17,35 @@ using sipwire::addrToIpPort;
 
 namespace
 {
+	// #618: the whole outbound INVITE on the console, its lines " | "-joined
+	// into a few log lines under LogQueue's 256-byte line cap (its queue is only
+	// 16 deep, so one log line per SIP line would drop). The body is cut after
+	// kMaxLines SIP lines. Authorization values are never logged.
+	void logInvite(PbxEnv& env, std::string_view msg)
+	{
+		constexpr std::string_view kPre = "Trunk: INVITE> ";
+		constexpr size_t kMaxLines = 40;
+		char buf[200];
+		size_t n = 0;
+		auto put = [&](std::string_view s) { std::memcpy(buf + n, s.data(), s.size()); n += s.size(); };
+		for (size_t i = 0; i < kMaxLines && !msg.empty(); ++i)
+		{
+			const size_t e = msg.find("\r\n");
+			std::string_view l = msg.substr(0, e);
+			msg = (e == std::string_view::npos) ? std::string_view{} : msg.substr(e + 2);
+			if (l.empty()) continue;   // the blank line before the body
+			const std::string_view name = l.substr(0, l.find(':'));
+			const bool redact = name == "Authorization" || name == "Proxy-Authorization";
+			const std::string_view tail = redact ? ": <redacted>" : "";
+			if (redact) l = name;
+			if (n && n + 3 + l.size() + tail.size() > sizeof(buf)) { env.log(std::string(buf, n)); n = 0; }
+			put(n ? " | " : kPre);
+			put(l.substr(0, sizeof(buf) - n - tail.size()));   // a lone over-long line is cut
+			put(tail);
+		}
+		if (n) env.log(std::string(buf, n));
+	}
+
 	// The host of a SIP URI ("sip:+1555@203.0.113.9:5060;transport=udp"), as an
 	// address, when -- and only when -- it is a dotted quad. An FQDN yields false:
 	// resolving it would mean getaddrinfo on the SIP thread, which is the one
@@ -362,7 +393,8 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 		/*sendrecv=*/true, /*dtmfPt=*/101);
 
 	d->offerSdp = sdp;   // #399: re-offered unchanged if the carrier challenges
-	auto invite = _env.messageFromPool(buildInvite(*d, sdp), sbc);
+	const std::string inviteText = buildInvite(*d, sdp);
+	auto invite = _env.messageFromPool(inviteText, sbc);
 	if (!invite)
 	{
 		// Pool exhausted. Release the slot -- unlike a retransmittable inbound
@@ -377,6 +409,7 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 	// apart from a misaddressed INVITE without a capture.
 	_env.log("Trunk: INVITE -> " + std::string(e164) + " to " + d->sbcIpPort
 		+ " from local port " + std::to_string(_env.serverPort()) + " (From " + d->fromUser + ")");
+	logInvite(_env, inviteText);
 	return true;
 }
 
@@ -811,11 +844,13 @@ bool SipTrunk::answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& cha
 	d.branch = "z9hG4bK" + IDGen::GenerateID(12);
 	d.toTag.clear();
 
-	auto invite = _env.messageFromPool(
-		buildInvite(d, d.offerSdp, std::string_view(_authLine, nameLen + 2 + valueLen)), d.peer);
+	std::string inviteText =
+		buildInvite(d, d.offerSdp, std::string_view(_authLine, nameLen + 2 + valueLen));
+	auto invite = _env.messageFromPool(inviteText, d.peer);
 	std::memset(_authLine, 0, sizeof(_authLine));
 	if (!invite)
 	{
+		std::fill(inviteText.begin(), inviteText.end(), '\0');
 		d.branch = savedBranch;   // back to the challenged transaction, unsent
 		d.toTag = savedToTag;
 		d.cseq = savedCseq;
@@ -833,6 +868,8 @@ bool SipTrunk::answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& cha
 	invite->syncContentLength();
 	_env.enqueue(d.peer, std::move(invite));
 	_env.log("Trunk: " + std::to_string(status) + " challenge answered (" + d.destE164 + ")");
+	logInvite(_env, inviteText);   // #618: Authorization redacted there
+	std::fill(inviteText.begin(), inviteText.end(), '\0');
 	return true;
 }
 
@@ -909,6 +946,35 @@ bool SipTrunk::handleRegisterResponse(const std::shared_ptr<SipMessage>& data)
 	const auto before = _reg.state();
 	_reg.onResponse(nowMs, v);
 	const auto after = _reg.state();
+
+	// #618: every final answer, with its reason phrase (Engage answers a failed
+	// REGISTER "200 Authorization failure"), the lease, and the Via
+	// received/rport the carrier saw of us from behind CGNAT. Registration
+	// behaviour is unchanged; this only reports.
+	if (v.code >= 200)
+	{
+		const std::string_view via = data->getVia();
+		auto param = [&](std::string_view key) -> std::string_view {
+			const size_t p = via.find(key);
+			if (p == std::string_view::npos) return "-";
+			const std::string_view r = via.substr(p + key.size());
+			return r.substr(0, r.find_first_of(";, \t"));
+		};
+		auto sv = [](std::string_view s) { return s.empty() ? std::string_view("-") : s; };
+		const std::string_view status = data->getHeader();
+		const std::string_view received = param(";received="), rport = param(";rport=");
+		const std::string_view expires = sv(v.expires), contact = sv(v.contact);
+		char line[200];   // under LogQueue's 256-byte cap; Contact is cut first
+		std::snprintf(line, sizeof(line),
+			"Trunk: REGISTER <- %.*s; Expires %.*s, granted %us; Via received=%.*s rport=%.*s; Contact %.*s",
+			static_cast<int>(std::min<size_t>(status.size(), 64)), status.data(),
+			static_cast<int>(std::min<size_t>(expires.size(), 10)), expires.data(),
+			v.code < 300 ? static_cast<unsigned>(_reg.status().grantedExpiresSec) : 0u,
+			static_cast<int>(std::min<size_t>(received.size(), 40)), received.data(),
+			static_cast<int>(std::min<size_t>(rport.size(), 6)), rport.data(),
+			static_cast<int>(contact.size()), contact.data());
+		_env.log(line);
+	}
 	if (after != before && after == SipRegistrationClient::State::Registered)
 		_env.log("Trunk: registered with the carrier");
 	else if (after != before && after == SipRegistrationClient::State::Failed)
