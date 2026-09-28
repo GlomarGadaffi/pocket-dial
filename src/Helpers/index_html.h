@@ -394,6 +394,8 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
 <!-- #521: shown while /api/status says no real provider can carry a 911 call. -->
 <div class="e911" id="e911-route-banner" role="alert" style="display:none">&#9888; <b>Emergency calling is not configured.</b> This system refuses 911 and 933 calls until a SIP trunk (<a href="/setup/trunk">/setup/trunk</a>) or a telephony provider (Interconnect) is set up. Keep another way to call 911 near every phone.</div>
 <div class="e911" id="e911-unverified-banner" role="alert" style="display:none">&#9888; <b>Emergency route not verified.</b> A SIP trunk is configured but has not completed a call since it was last started or changed. Place a 933 test call to prove 911 can get out.</div>
+<!-- #644: needsSetup (SIP is held off until the admin login is set) or an /api/admin/status failure. -->
+<div class="e911" id="setup-banner" role="alert" style="display:none"></div>
 
 <main>
 
@@ -1476,12 +1478,15 @@ window.addEventListener("resize",function(){clearTimeout(rsTimer);rsTimer=setTim
 
 /* ════ ADMIN / AUTH ════ */
 function fetchAdminStatus(){
-  return fetch("/api/admin/status",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(d){
+  return fetch("/api/admin/status",{credentials:"same-origin"}).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(function(d){
     adminState.provisioned=!!d.provisioned;adminState.needsSetup=!!d.needsSetup;adminState.authenticated=!!d.authenticated;
     adminState.sessionRemainingSec=d.sessionRemainingSec||0;adminState.sessionExpired=false;
     renderAdminPanel();renderAdminBadge();applyAuthGating();
     if(adminState.authenticated&&!adminState.needsSetup){fetchApSecurity();fetchRegistrar();}
-  }).catch(function(){});
+    setupBanner(adminState.needsSetup?"\u26a0 Set the admin login first. Phones cannot register until you do: SIP stays off until a real admin login is set (Admin, top right).":"");
+  }).catch(function(e){setupBanner("\u26a0 Could not read admin status: "+e.message);});
+}
+function setupBanner(txt){var b=$("setup-banner");if(b){b.textContent=txt;b.style.display=txt?"":"none";}
 }
 function renderAdminPanel(){
   $("admin-loading").style.display="none";
@@ -1581,7 +1586,10 @@ function renderRegistrar(d){
   body.innerHTML="";
   var devs=(d&&d.devices)||[];
   if(!devs.length){
-    var tr=document.createElement("tr");
+)html5";
+
+static const char PD_HTML_6[] =
+R"html6(    var tr=document.createElement("tr");
     var td=document.createElement("td");
     td.colSpan=4;
     td.textContent=(mode==="learn")
@@ -1595,10 +1603,7 @@ function renderRegistrar(d){
     var tdM=document.createElement("td");tdM.textContent=x.mac||"\u2014";
     var tdS=document.createElement("td");
     tdS.textContent=(x.state==="secured"?"secured":"learned")+(x.online?" \u00b7 online":"");
-)html5";
-
-static const char PD_HTML_6[] =
-R"html6(    var tdA=document.createElement("td");
+    var tdA=document.createElement("td");
     if(x.state!=="secured"){
       var b=document.createElement("button");
       b.className="btn";b.textContent="Secure";b.disabled=true;b.title="needs a SIP password (not yet supported)";
