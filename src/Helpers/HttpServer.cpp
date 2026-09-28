@@ -2372,6 +2372,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	    .s(",\"mohClipRefused\":").b(handler && handler->holdMusicClipRefused())
 	    .s(",\"greetingRefused\":").b(handler && handler->voicemailGreetingRefused())
 	    .s(",\"psramFallbacks\":").n(psram::internalFallbacks().load(std::memory_order_relaxed))
+	    .s(",\"dynamicTaskCreates\":").n(psram::dynamicTaskCreates().load(std::memory_order_relaxed))   // #479
 	    .s("}");
 
 	json.s("}");

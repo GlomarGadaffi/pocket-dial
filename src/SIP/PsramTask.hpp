@@ -99,12 +99,17 @@ namespace pd
 #if defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
 		if (xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg, prio, out, core,
 		                                    PD_TASK_STACK_CAPS) == pdPASS)
+		{
+			psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 			return pdPASS;
+		}
 		psram::internalFallbacks().fetch_add(1, std::memory_order_relaxed);
 		ESP_LOGW("PsramTask", "%s: no PSRAM for a %u B stack -- falling back to INTERNAL (#466)",
 		         name, static_cast<unsigned>(stackBytes));
 #endif
-		return xTaskCreatePinnedToCore(fn, name, stackBytes, arg, prio, out, core);
+		const BaseType_t rc = xTaskCreatePinnedToCore(fn, name, stackBytes, arg, prio, out, core);
+		if (rc == pdPASS) psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
+		return rc;
 	}
 
 	// Delete `task` (nullptr: the calling task) with the call that matches where
