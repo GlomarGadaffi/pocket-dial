@@ -27,7 +27,7 @@ uint32_t RtpReceiver::rxOversizeDrops()
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #235: rtp_media_rx TWDT subscription
 #include "PsramTask.hpp"     // Issue #479: pd::StaticTaskSlot / pd::reapParkedStaticTask
-#include "RtpTaskSlots.hpp"  // Issue #479: pd::rtpslots::kStackBytes
+#include "RtpTaskSlots.hpp"  // Issue #479: pd::rtpslots::kRxStackBytes
 #include "ParkedTaskReap.hpp"   // Issue #535 / #572 review: when the parked task may be deleted
 #endif
 
@@ -430,7 +430,7 @@ RtpReceiver::RtpReceiver()
 	// Issue #479: this slot's rtp_media_rx stack + TCB, once, at boot. PSRAM
 	// (the #273 audit on #466: nothing reachable writes flash), internal where
 	// there is none. A failed allocation leaves start() refusing, logged.
-	_taskMem.alloc("rtp_media_rx", pd::rtpslots::kStackBytes, PD_TASK_STACK_CAPS,
+	_taskMem.alloc("rtp_media_rx", pd::rtpslots::kRxStackBytes, PD_TASK_STACK_CAPS,
 	               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #endif
 }

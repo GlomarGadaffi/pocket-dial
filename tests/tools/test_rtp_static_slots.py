@@ -48,9 +48,32 @@ class RtpStaticSlots(unittest.TestCase):
             self.assertEqual(violations(lines), [], path)
             text = "".join(lines)
             self.assertEqual(len(re.findall(r"\bxTaskCreateStaticPinnedToCore\s*\(", text)), 1, path)
-            self.assertRegex(text, r"_taskMem\.stack,\s*_taskMem\.tcb", path)
-            self.assertRegex(text, r"_taskMem\.alloc\(", path)
             self.assertRegex(text, r"pd::reapParkedStaticTask\(", path)
+        rx = "".join(code("src/SIP/RtpReceiver.cpp"))
+        self.assertRegex(rx, r"_taskMem\.stack,\s*_taskMem\.tcb")
+        self.assertRegex(rx, r"_taskMem\.alloc\(\"rtp_media_rx\", pd::rtpslots::kRxStackBytes")
+
+    def test_tx_runs_on_the_shared_pool(self):
+        # Option D: one boot-allocated pool, claimed in start(), reaped before reuse.
+        tx = "".join(code("src/SIP/RtpSender.cpp"))
+        self.assertRegex(tx, r"pd::SlotPool<N>\s+slots;")
+        self.assertRegex(tx, r"StaticTaskSlot\s+mem\[N\];")
+        self.assertRegex(tx, r"m\.alloc\(\"rtp_media_tx\", pd::rtpslots::kTxStackBytes,\s*MALLOC_CAP_INTERNAL \| MALLOC_CAP_DMA")
+        self.assertRegex(tx, r"sweepLocked\(\);\s*_poolSlot = pool\.slots\.claim\(\);")
+        self.assertRegex(tx, r"m\.stack,\s*m\.tcb")
+        self.assertNotRegex(tx, r"_taskMem\b", "RtpSender must not own a per-object stack")
+        slots = "".join(code("src/SIP/RtpTaskSlots.hpp"))
+        self.assertRegex(slots, r"kTxSlots = POCKETDIAL_RTP_TX_POOL;")
+
+    def test_default_eth_fixed_internal_is_within_target(self):
+        # .244 idled at 21.2 KB free with 11 x 6 KB tx slots (66 KB); the target is
+        # >= 60 KB idle, so the tx pool may fix at most ~27 KB of internal RAM.
+        cfg = "".join(code("src/SIP/PoolConfig.hpp"))
+        pool = int(re.search(r"#define POCKETDIAL_RTP_TX_POOL (\d+)", cfg).group(1))
+        slots = "".join(code("src/SIP/RtpTaskSlots.hpp"))
+        tx_stack = int(re.search(r"kTxStackBytes = (\d+);", slots).group(1))
+        self.assertLessEqual(tx_stack, 3072, "tx stack sized from .244 HWM (~1.9 KB used)")
+        self.assertLessEqual(pool * tx_stack, 27 * 1024)
 
     def test_conference_slots_are_built_at_boot(self):
         text = "".join(code("src/SIP/RequestsHandler.cpp"))
@@ -69,13 +92,13 @@ class RtpStaticSlots(unittest.TestCase):
             cm = f.read()
         block = cm[cm.index("if(SIP_CONSTRAINED)"):]
         block = block[:block.index("endif()")]
-        caps = dict(re.findall(r"(POCKETDIAL_(?:MAX_ANCHOR_CALLS|MAX_VOICEMAIL_LEGS|MAX_TRUNK_CALLS|CONFERENCE))=(\d+)", block))
+        caps = dict(re.findall(r"(POCKETDIAL_(?:MAX_ANCHOR_CALLS|MAX_VOICEMAIL_LEGS|MAX_TRUNK_CALLS|CONFERENCE|RTP_TX_POOL))=(\d+)", block))
         self.assertEqual(caps.get("POCKETDIAL_CONFERENCE"), "0", "constrained must build no conference room")
-        a, v, t = (int(caps[k]) for k in ("POCKETDIAL_MAX_ANCHOR_CALLS", "POCKETDIAL_MAX_VOICEMAIL_LEGS",
-                                         "POCKETDIAL_MAX_TRUNK_CALLS"))
-        tx, rx = 1 + a + v, a + v + 2 * t
-        # No PSRAM: every slot is internal, fixed at boot. Stated cost: 7 x 6 KB = 42 KB.
-        self.assertLessEqual((tx + rx) * 6144, 72 * 1024)
+        a, v, t, p = (int(caps[k]) for k in ("POCKETDIAL_MAX_ANCHOR_CALLS", "POCKETDIAL_MAX_VOICEMAIL_LEGS",
+                                            "POCKETDIAL_MAX_TRUNK_CALLS", "POCKETDIAL_RTP_TX_POOL"))
+        rx = a + v + 2 * t
+        # No PSRAM: every stack is internal, fixed at boot. Stated: 3 x 3 KB + 4 x 6 KB = 33 KB.
+        self.assertLessEqual(p * 3072 + rx * 6144, 72 * 1024)
 
     def test_mix_ports_follow_the_conference_legs(self):
         text = "".join(code("src/SIP/MixBus.hpp"))

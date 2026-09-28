@@ -25,6 +25,7 @@
 // eyeballed on hardware.
 #include "DmaFramePool.hpp"
 #include "RtpReceiver.hpp"     // Issue #469: rxOversizeDrops() on /api/status
+#include "RtpSender.hpp"       // Issue #479: txPoolRefusals() on /api/status
 #include "HoldMusic.hpp"       // Issue #466: clipRefusals() on /api/status
 #include "PsramAllocator.hpp"  // Issue #466: psram::internalFallbacks() on /api/status
 #include "index_html.h"
@@ -1922,6 +1923,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// Issue #469: the RTP side of the same check -- media datagrams over
 	// RtpReceiver::MAX_DATAGRAM_BYTES, dropped instead of parsed cut.
 	json << "\"rtpRxOversize\":" << RtpReceiver::rxOversizeDrops() << ",";
+	json << "\"rtpTxPoolRefused\":" << RtpSender::txPoolRefusals() << ",";   // #479
 	json << "\"recvErrors\":" << recvErrors << ",";
 	json << "\"lastRecvErrno\":" << lastRecvErrno << ",";
 	json << "\"recentDrops\":[";

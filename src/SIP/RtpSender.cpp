@@ -12,7 +12,9 @@
 #include "EthAccess.hpp"
 #include "ArpLookup.hpp"
 #include "DmaFramePool.hpp"
-#include "RtpTaskSlots.hpp"   // Issue #479: pd::rtpslots::kStackBytes
+#include "RtpTaskSlots.hpp"   // Issue #479: pd::rtpslots::kTxStackBytes / kTxSlots
+#include "PsramTask.hpp"      // Issue #479: pd::StaticTaskSlot / pd::reapParkedStaticTask
+#include "SlotPool.hpp"       // Issue #479: the shared tx stack pool
 #elif defined(__linux__)
 #include <unistd.h>
 #include <sys/socket.h>
@@ -158,11 +160,7 @@ void RtpSender::buildRtpHeader(uint8_t* out, bool marker, uint8_t pt,
 RtpSender::RtpSender() : _serverRtpPort(SERVER_RTP_PORT)
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	// Issue #479: this slot's rtp_media_tx stack + TCB, once, at boot. INTERNAL
-	// and DMA-capable, no PSRAM fallback: the W5500 driver passes stack buffers
-	// to a DMA SPI bus (#466). A failed allocation leaves start() refusing.
-	_taskMem.alloc("rtp_media_tx", pd::rtpslots::kStackBytes,
-	               MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+	txPool();   // Issue #479: the first sender (built at boot) allocates the shared pool
 #endif
 }
 
@@ -177,15 +175,8 @@ RtpSender::~RtpSender()
 	{
 		vTaskDelay(pdMS_TO_TICKS(5));
 	}
-	// Issue #479: reap the parked task only if it provably parked (#572).
-	{
-		std::lock_guard<std::mutex> lock(_slotMutex);
-		if (!pd::reapParkedStaticTask(_parkedTask,
-			_taskRunning.load(std::memory_order_acquire), _reapDeferred))
-		{
-			ESP_LOGE("RtpSender", "tx task not parked at destruction; handle left undeleted (#479)");
-		}
-	}
+	// Issue #479: the parked task and its stack belong to the shared pool, which
+	// reaps it (#572 rule) before handing the slot to the next stream.
 #else
 	// Issue #108: destroying a joinable std::thread calls std::terminate, so a
 	// stream must never be left running when this object goes away. stop("")
@@ -211,6 +202,58 @@ std::string RtpSender::activeCallId() const
 // ─────────────────────────────────────────────────────────────────────────────
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 
+// Issue #479 (option D): rtp_media_tx stacks are ONE pool shared by every
+// RtpSender, sized to the concurrent media streams (POCKETDIAL_RTP_TX_POOL), not
+// one per object. Allocated once, at boot (the first RtpSender's constructor),
+// INTERNAL + DMA-capable with no PSRAM fallback (the W5500 driver passes stack
+// buffers to a DMA SPI bus, #466). A stream claims a slot in start(); its task
+// parks when done and marks the slot parked; the next claim reaps it (#572:
+// only when pd::reapDecision says Reap) and returns the slot. Pool empty: the
+// start is refused and counted in txPoolRefusals(). Never the heap.
+struct RtpSender::TxPool
+{
+	static constexpr int N = pd::rtpslots::kTxSlots;
+	pd::SlotPool<N>    slots;
+	pd::StaticTaskSlot mem[N];
+	TaskHandle_t       handle[N] = {};
+	std::atomic<bool>  parked[N] = {};
+	std::mutex         mutex;           // serializes sweep + claim across senders
+	std::atomic<uint32_t> reapDeferred{0};
+
+	TxPool()
+	{
+		for (auto& m : mem)
+			m.alloc("rtp_media_tx", pd::rtpslots::kTxStackBytes,
+			        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+	}
+
+	// Caller holds `mutex`. Reap every provably parked task and free its slot.
+	void sweepLocked()
+	{
+		for (int i = 0; i < N; ++i)
+		{
+			if (handle[i] == nullptr) continue;
+			const bool done = parked[i].load(std::memory_order_acquire);
+			if (pd::reapParkedStaticTask(handle[i], !done, reapDeferred))
+			{
+				parked[i].store(false, std::memory_order_release);
+				slots.release(i);
+			}
+		}
+	}
+};
+
+RtpSender::TxPool& RtpSender::txPool()
+{
+	static TxPool pool;
+	return pool;
+}
+
+uint32_t RtpSender::txPoolRefusals()
+{
+	return txPool().slots.refused();
+}
+
 bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::string& callID, FrameProvider provider)
 {
 	std::lock_guard<std::mutex> lock(_slotMutex);
@@ -221,13 +264,6 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	// exiting task clear _callID/_active/_sock without a racing start() reusing them.
 	// The registrar also gates on isActive() before calling.
 	if (_active.load(std::memory_order_acquire) || _taskRunning.load(std::memory_order_acquire))
-	{
-		return false;
-	}
-	// Issue #479: the previous stream's task parked; reap it (#572 rule) so
-	// this slot's static stack is free, or refuse this start.
-	if (!pd::reapParkedStaticTask(_parkedTask,
-		_taskRunning.load(std::memory_order_acquire), _reapDeferred))
 	{
 		return false;
 	}
@@ -285,22 +321,43 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	// PSRAM stack spi_master's setup_priv_desc() -> spicommon_dma_setup_priv_buffer()
 	// would malloc an internal DMA bounce buffer for EVERY frame, 50/s per
 	// stream -- exactly the #282/#368 "Failed to allocate priv TX buffer" class.
-	// Issue #479: created on this slot's boot-preallocated internal stack + TCB
-	// (_taskMem), so the call path allocates nothing.
-	_parkedTask = (_taskMem.stack == nullptr) ? nullptr
-		: xTaskCreateStaticPinnedToCore(
-			&RtpSender::taskTrampoline,
-			"rtp_media_tx",
-			_taskMem.bytes,   // headroom for lwIP sendto() + tone synth (4KB was marginal)
-			this,
-			6,
-			_taskMem.stack,
-			_taskMem.tcb,
-			0 /* Core 0 */);
-
-	if (_parkedTask == nullptr)
+	// Issue #479: created on a slot of the shared boot-preallocated pool (reaping
+	// parked tasks first), so the call path allocates nothing. Pool lock held
+	// through the create so a sweep never sees the slot without its handle.
+	TaskHandle_t task = nullptr;
 	{
-		ESP_LOGE("RtpSender", "rtp_media_tx static task create failed");
+		TxPool& pool = txPool();
+		std::lock_guard<std::mutex> plock(pool.mutex);
+		pool.sweepLocked();
+		_poolSlot = pool.slots.claim();   // -1: pool exhausted, counted
+		if (_poolSlot >= 0 && pool.mem[_poolSlot].stack != nullptr)
+		{
+			pd::StaticTaskSlot& m = pool.mem[_poolSlot];
+			task = xTaskCreateStaticPinnedToCore(
+				&RtpSender::taskTrampoline,
+				"rtp_media_tx",
+				m.bytes,   // headroom for lwIP sendto() + tone synth (4KB was marginal)
+				this,
+				6,
+				m.stack,
+				m.tcb,
+				0 /* Core 0 */);
+			pool.handle[_poolSlot] = task;
+		}
+		if (task == nullptr && _poolSlot >= 0)
+		{
+			pool.slots.release(_poolSlot);
+		}
+	}
+
+	if (task == nullptr)
+	{
+		if (_poolSlot < 0)
+			ESP_LOGE("RtpSender", "rtp_media_tx pool exhausted (%u refused, #479)",
+			         static_cast<unsigned>(txPoolRefusals()));
+		else
+			ESP_LOGE("RtpSender", "rtp_media_tx static task create failed (#479)");
+		_poolSlot = -1;
 		close(_sock);
 		_sock = -1;
 		_callID.clear();
@@ -345,12 +402,15 @@ void RtpSender::taskTrampoline(void* arg)
 {
 	auto* self = static_cast<RtpSender*>(arg);
 	self->runLoop();   // closes the socket + clears the slot under _slotMutex
+	// Read before the store below: the next start() may reassign it after that.
+	const int slot = self->_poolSlot;
 	// Clearing _taskRunning is the LAST access to `self`: after this the destructor may
 	// observe the task as gone and allow the object to be destroyed.
 	self->_taskRunning.store(false, std::memory_order_release);
-	// Issue #479: park, never self-delete (as RtpReceiver, #535). The owner
-	// reaps it from outside so the slot's static stack is reusable at once.
-	// Suspending touches no member, so it is safe after the store above.
+	// Issue #479: park, never self-delete (as RtpReceiver, #535). Mark this pool
+	// slot parked; the next claim reaps this task from outside (#572 rule) and
+	// hands the stack on. Touches only the static pool, never `self`.
+	txPool().parked[slot].store(true, std::memory_order_release);
 	for (;;)
 	{
 		vTaskSuspend(nullptr);
@@ -488,6 +548,10 @@ void RtpSender::runLoop()
 	ESP_LOGI("RtpSender", "Media stream stopped");
 }
 
+#else
+uint32_t RtpSender::txPoolRefusals() { return 0; }   // no pool off-device (#479)
+#endif
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #elif defined(__linux__)
 // ─────────────────────────────────────────────────────────────────────────────
 //  Linux desktop: real UDP socket + 20 ms std::thread pacing (Issue #82)

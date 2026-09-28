@@ -30,7 +30,6 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "L2RtpFrame.hpp"
-#include "PsramTask.hpp"   // Issue #479: pd::StaticTaskSlot / pd::reapParkedStaticTask
 #elif defined(__linux__)
 #include <netinet/in.h>
 #include <thread>
@@ -148,6 +147,10 @@ public:
 	// The Call-ID of the live stream ("" when idle). Lets onCancel/onBye match.
 	std::string activeCallId() const;
 
+	// Issue #479: starts refused because every shared rtp_media_tx stack was in
+	// use (never a heap fallback). 0 on host builds, which have no pool.
+	static uint32_t txPoolRefusals();
+
 private:
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	static void taskTrampoline(void* arg);
@@ -162,13 +165,14 @@ private:
 	//                    on it and start() can refuse to overlap a dying task.
 	std::atomic<bool> _stopRequested{false};
 	std::atomic<bool> _taskRunning{false};
-	// Issue #479: the finished task PARKS (as RtpReceiver's, #535) and its owner
-	// reaps it on the next start() or in the destructor, via
-	// pd::reapParkedStaticTask. It runs on _taskMem: this slot's INTERNAL DMA
-	// stack + TCB, allocated once in the constructor (see RtpTaskSlots.hpp).
-	TaskHandle_t          _parkedTask = nullptr;
-	std::atomic<uint32_t> _reapDeferred{0};
-	pd::StaticTaskSlot    _taskMem;
+	// Issue #479 (option D): the task runs on a slot of ONE shared, boot-allocated
+	// pool of INTERNAL DMA stacks (TxPool, RtpSender.cpp; size in RtpTaskSlots.hpp).
+	// _poolSlot is this stream's slot (-1: none), written only in start() under
+	// _slotMutex. The finished task PARKS and marks its slot; the pool reaps it
+	// (#572 rule) before handing the slot to the next stream.
+	struct TxPool;
+	static TxPool& txPool();
+	int               _poolSlot = -1;
 	sockaddr_in       _dest{};
 
 	// L2 RTP TX (Issue #282 / #329)

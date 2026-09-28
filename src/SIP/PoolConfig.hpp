@@ -185,6 +185,14 @@
 #define POCKETDIAL_CONFERENCE 1
 #endif
 
+// Issue #479 (option D): rtp_media_tx stacks (3 KB, internal DMA) form ONE pool
+// shared by every RtpSender, sized to the concurrent outbound media streams. A
+// start() that finds it full is refused and counted (/api/status
+// rtpTxPoolRefused), never heap. 6 x 3 KB = 18 KB internal, fixed at boot.
+#ifndef POCKETDIAL_RTP_TX_POOL
+#define POCKETDIAL_RTP_TX_POOL 6
+#endif
+
 // Number of concurrent anchor media bridges (the 555 virtual extension --
 // docs/FEATURE_ROADMAP.md's "Anchored media" extension point, wired into call
 // routing in RequestsHandler). Each bridge owns its own RtpReceiver/RtpSender

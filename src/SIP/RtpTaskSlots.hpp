@@ -7,9 +7,9 @@
 // the call path). The objects are fixed members sized by the PoolConfig caps,
 // so the cost is fixed too:
 //   rtp_media_tx: internal DMA-capable RAM (the W5500 driver passes stack
-//                 buffers to a DMA SPI bus -- #466), kTxSlots x kStackBytes;
+//                 buffers to a DMA SPI bus -- #466), kTxSlots x kTxStackBytes, one pool shared by all senders;
 //   rtp_media_rx: PSRAM (internal fallback where there is none), kRxSlots x
-//                 kStackBytes.
+//                 kRxStackBytes, one per receiver.
 // The conference room (POCKETDIAL_CONFERENCE) is built in the RequestsHandler
 // constructor, so its legs' slots are boot-time too; with it off there are none.
 // tests/tools/test_rtp_static_slots.py gates all this.
@@ -22,18 +22,24 @@ namespace pd
 {
 	namespace rtpslots
 	{
-		constexpr uint32_t kStackBytes = 6144;   // lwIP send/recv + tone synth / sink headroom
+		// Measured on .244 (#598, BigDog2): rtp_media_tx min free 4212 of 6144, so
+		// ~1.9 KB used; 3072 keeps >= 1 KB margin. Trunk legs relay through
+		// RtpReceiver::sendRaw (rx objects), so no trunk path runs on this stack.
+		// rtp_media_rx min free 1464 of 6144 (~4.7 KB used): stays 6144.
+		constexpr uint32_t kTxStackBytes = 3072;
+		constexpr uint32_t kRxStackBytes = 6144;
 		constexpr uint32_t kConfSlots  = POCKETDIAL_CONFERENCE ? POCKETDIAL_CONF_LEGS : 0;
 
-		// _rtpSender + _anchorRtpSenders + _vmRtpSenders + conference legs.
-		constexpr uint32_t kTxSlots = 1 + POCKETDIAL_MAX_ANCHOR_CALLS
-			+ POCKETDIAL_MAX_VOICEMAIL_LEGS + kConfSlots;
-		// _anchorRtpReceivers + _vmRtpReceivers + _trunkRx + _handsetRx + conference legs.
+		// Option D (desmo): tx stacks are one shared pool sized to the concurrent
+		// media streams, not one per RtpSender object; a full pool refuses (counted).
+		constexpr uint32_t kTxSlots = POCKETDIAL_RTP_TX_POOL;
+		// Receivers keep one slot each (PSRAM): _anchorRtpReceivers + _vmRtpReceivers
+		// + _trunkRx + _handsetRx + conference legs.
 		constexpr uint32_t kRxSlots = POCKETDIAL_MAX_ANCHOR_CALLS
 			+ POCKETDIAL_MAX_VOICEMAIL_LEGS + 2 * POCKETDIAL_MAX_TRUNK_CALLS + kConfSlots;
 
-		constexpr uint32_t kTxInternalBytes = kTxSlots * kStackBytes;
-		constexpr uint32_t kRxPsramBytes    = kRxSlots * kStackBytes;
+		constexpr uint32_t kTxInternalBytes = kTxSlots * kTxStackBytes;
+		constexpr uint32_t kRxPsramBytes    = kRxSlots * kRxStackBytes;
 	}
 }
 
@@ -41,13 +47,12 @@ namespace pd
 #include "sdkconfig.h"
 #if !defined(CONFIG_SPIRAM) || !CONFIG_SPIRAM
 // No PSRAM (esp32_constrained): rx stacks fall back to internal too, so every
-// slot is internal DRAM, fixed at boot. SIP_CONSTRAINED (no conference):
-// 3 tx + 4 rx = 7 slots = 42 KB. The conference room is not allowed here.
+// slot is internal DRAM, fixed at boot. SIP_CONSTRAINED (no conference, tx
+// pool 3): 3 x 3 KB tx + 4 x 6 KB rx = 33 KB. No conference room here.
 static_assert(!POCKETDIAL_CONFERENCE,
               "#479: no conference room on a no-PSRAM build (SIP_CONSTRAINED sets "
               "POCKETDIAL_CONFERENCE=0)");
-static_assert((pd::rtpslots::kTxSlots + pd::rtpslots::kRxSlots) * pd::rtpslots::kStackBytes
-              <= 72u * 1024u,
+static_assert(pd::rtpslots::kTxInternalBytes + pd::rtpslots::kRxPsramBytes <= 72u * 1024u,
               "#479: no-PSRAM build fixes too much internal DRAM in RTP task slots; "
               "build with SIP_CONSTRAINED=1 or lower the POCKETDIAL_* call caps");
 #endif
