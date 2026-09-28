@@ -254,7 +254,7 @@ Symptom: Established calls hang up on their own.
 | Session pool exhausted | New INVITEs get `503` when the session pool is full; existing calls are untouched. Raise the tier ([SCALING.md §4](SCALING.md)). |
 | Outbound trunk call ended at ~60 s of ringing with `480` | Not a fault. An outbound call through the anchor client gets its own no-answer window (`ANCHOR_NO_ANSWER_TIMEOUT`, 60 s) rather than the 20 s internal-extension constant, and the teardown answers **`480 Temporarily Unavailable`**, not `503`. |
 | Admin force-disconnect | `POST /api/kill` de-registers an extension and tears down its calls ([API.md](API.md)). Check whether someone used the dashboard's kill control. |
-| Spoofed BYE | A forged teardown from **off the call path** is now rejected `403`: a BYE for an established dialog must arrive from one of the call's leg IPs (`RequestsHandler::onBye()`'s `isDialogSourceAuthorized()` guard, `src/SIP/RequestsHandler.cpp:2918-2928`). What that does *not* stop is a peer who can source packets from a leg's address; on an open AP in `open` mode that is still reachable, so WPA2 on the SoftAP remains the real fix. In-dialog requests are not digest-challenged even in `secure` mode. |
+| Spoofed BYE | A forged teardown from **off the call path** is now rejected `403`: a BYE for an established dialog must arrive from one of the call's leg IPs (`RequestsHandler::onBye()`'s `isDialogSourceAuthorized()` guard, `src/SIP/RequestsHandler.cpp:2918-2928`). What that does *not* stop is a peer who can source packets from a leg's address; on an open AP that is still reachable, so WPA2 on the SoftAP remains the real fix. In-dialog requests are not digest-challenged even in `secure` mode. |
 
 ## Dashboard unreachable
 
