@@ -134,13 +134,17 @@ TEST(ResetJournal, AJournalWriteFailureIsCountedAndTheResetProceeds)
 // read, and asks for bootStatus() from a second thread.
 namespace
 {
+	// #595 item 1: the hook stays installed and counts loads, so a second
+	// caller that ran its own load (no lock) is caught by EXPECT_EQ(loads, 1).
 	std::promise<resetjournal::BootStatus>* g_second = nullptr;
+	std::atomic<int> g_loads{0};
 	void askFromAnotherThreadMidLoad()
 	{
-		resetjournal::setLoadHookForTest(nullptr);   // the second caller must not re-enter this
+		if (g_loads.fetch_add(1) != 0) return;   // only the first load spawns the second caller
 		auto* p = g_second;
 		std::thread([p] { p->set_value(resetjournal::bootStatus()); }).detach();
-		// Give the second thread time to return early if the cache lets it.
+		// Give the second thread time to return early if the cache lets it, or
+		// to run its own load if the lock does not stop it.
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 	}
 }
@@ -154,6 +158,7 @@ TEST(ResetJournal, AConcurrentFirstLookWaitsForTheLoadInsteadOfReportingComplete
 	std::promise<resetjournal::BootStatus> second;
 	auto fut = second.get_future();
 	g_second = &second;
+	g_loads = 0;
 	resetjournal::setLoadHookForTest(&askFromAnotherThreadMidLoad);
 
 	const auto first = resetjournal::bootStatus();
@@ -166,4 +171,36 @@ TEST(ResetJournal, AConcurrentFirstLookWaitsForTheLoadInsteadOfReportingComplete
 	EXPECT_TRUE(other.incomplete())
 		<< "a status request racing the first load reported the interrupted reset as complete";
 	EXPECT_EQ(other.stage, resetjournal::Stage::Begun);
+	EXPECT_EQ(g_loads.load(), 1) << "the racing caller ran its own load instead of waiting for the first";
+}
+
+// #595 item 2: a write that fails (a crash right after an erase, on the old
+// erase-then-write journal) must leave the PREVIOUS record readable. Here the
+// reset began, then the "failed" record could not be written: the next boot
+// must still say interrupted, never clean.
+TEST(ResetJournal, AFailedWriteLeavesThePreviousRecordNotAClean)
+{
+	Fresh f;
+	ASSERT_TRUE(resetjournal::begin());
+	resetjournal::failNextWriteForTest();
+	resetjournal::finish(resetjournal::kTrunk);
+	EXPECT_EQ(resetjournal::writeFailureCount(), 1u);
+	resetjournal::simulateRebootForTest();
+	const auto s = resetjournal::bootStatus();
+	EXPECT_TRUE(s.incomplete()) << "a lost write erased the record before it: reported clean";
+	EXPECT_EQ(s.stage, resetjournal::Stage::Begun);
+}
+
+// #595 item 2: records append to slots; a sector full of unclean resets
+// (more than 256 in a row, no clean one) still ends with the newest record.
+TEST(ResetJournal, AFullSectorStillRecordsTheNewestReset)
+{
+	Fresh f;
+	for (int i = 0; i < 300; ++i) ASSERT_TRUE(resetjournal::begin()) << "write " << i;
+	resetjournal::finish(resetjournal::kE911);
+	resetjournal::simulateRebootForTest();
+	const auto s = resetjournal::bootStatus();
+	EXPECT_EQ(s.stage, resetjournal::Stage::Failed);
+	EXPECT_EQ(s.failedMask, resetjournal::kE911);
+	EXPECT_EQ(resetjournal::writeFailureCount(), 0u);
 }
