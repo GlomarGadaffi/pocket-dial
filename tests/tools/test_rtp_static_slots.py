@@ -58,7 +58,9 @@ class RtpStaticSlots(unittest.TestCase):
         tx = "".join(code("src/SIP/RtpSender.cpp"))
         self.assertRegex(tx, r"pd::SlotPool<N>\s+slots;")
         self.assertRegex(tx, r"StaticTaskSlot\s+mem\[N\];")
-        self.assertRegex(tx, r"m\.alloc\(\"rtp_media_tx\", pd::rtpslots::kTxStackBytes,\s*MALLOC_CAP_INTERNAL \| MALLOC_CAP_DMA")
+        # A slot whose boot memory failed is retired, never claimable (#598 review).
+        self.assertRegex(tx, r"if \(!mem\[i\]\.alloc\(\"rtp_media_tx\", pd::rtpslots::kTxStackBytes,\s*"
+                             r"MALLOC_CAP_INTERNAL \| MALLOC_CAP_DMA \| MALLOC_CAP_8BIT\)\)\s*slots\.retire\(i\);")
         self.assertRegex(tx, r"sweepLocked\(\);\s*_poolSlot = pool\.slots\.claim\(\);")
         self.assertRegex(tx, r"m\.stack,\s*m\.tcb")
         self.assertNotRegex(tx, r"_taskMem\b", "RtpSender must not own a per-object stack")

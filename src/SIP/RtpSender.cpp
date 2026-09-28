@@ -222,9 +222,14 @@ struct RtpSender::TxPool
 
 	TxPool()
 	{
-		for (auto& m : mem)
-			m.alloc("rtp_media_tx", pd::rtpslots::kTxStackBytes,
-			        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+		for (int i = 0; i < N; ++i)
+		{
+			// #598 review: a slot whose memory failed is retired for good (counted,
+			// logged by alloc()), or every start would claim it, fail, and release it.
+			if (!mem[i].alloc("rtp_media_tx", pd::rtpslots::kTxStackBytes,
+			                  MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT))
+				slots.retire(i);
+		}
 	}
 
 	// Caller holds `mutex`. Reap every provably parked task and free its slot.
@@ -233,8 +238,9 @@ struct RtpSender::TxPool
 		for (int i = 0; i < N; ++i)
 		{
 			if (handle[i] == nullptr) continue;
-			const bool done = parked[i].load(std::memory_order_acquire);
-			if (pd::reapParkedStaticTask(handle[i], !done, reapDeferred))
+			// A live stream is not a deferred reap: only look at parked slots.
+			if (!parked[i].load(std::memory_order_acquire)) continue;
+			if (pd::reapParkedStaticTask(handle[i], /*taskRunning=*/false, reapDeferred))
 			{
 				parked[i].store(false, std::memory_order_release);
 				slots.release(i);
@@ -252,6 +258,11 @@ RtpSender::TxPool& RtpSender::txPool()
 uint32_t RtpSender::txPoolRefusals()
 {
 	return txPool().slots.refused();
+}
+
+uint32_t RtpSender::txPoolRetired()
+{
+	return txPool().slots.retired();
 }
 
 bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::string& callID, FrameProvider provider)
@@ -550,6 +561,7 @@ void RtpSender::runLoop()
 
 #else
 uint32_t RtpSender::txPoolRefusals() { return 0; }   // no pool off-device (#479)
+uint32_t RtpSender::txPoolRetired() { return 0; }
 #endif
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #elif defined(__linux__)

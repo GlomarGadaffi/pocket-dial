@@ -40,7 +40,9 @@ namespace pd
 		// Return a claimed slot. Out-of-range and repeated returns are no-ops.
 		void release(int i)
 		{
-			if (i >= 0 && i < N) _used.fetch_and(~(1u << i), std::memory_order_acq_rel);
+			if (i < 0 || i >= N) return;
+			if ((_retiredMask.load(std::memory_order_acquire) & (1u << i)) != 0) return;
+			_used.fetch_and(~(1u << i), std::memory_order_acq_rel);
 		}
 
 		int inUse() const
@@ -53,9 +55,27 @@ namespace pd
 
 		uint32_t refused() const { return _refused.load(std::memory_order_relaxed); }
 
+		// #598 review: take slot i out of service for good (its boot memory failed),
+		// so claim() never hands it out and release() never revives it. Counted.
+		void retire(int i)
+		{
+			if (i < 0 || i >= N) return;
+			const uint32_t bit = 1u << i;
+			if ((_retiredMask.fetch_or(bit, std::memory_order_acq_rel) & bit) != 0) return;
+			_used.fetch_or(bit, std::memory_order_acq_rel);
+		}
+
+		uint32_t retired() const
+		{
+			uint32_t r = _retiredMask.load(std::memory_order_acquire), n = 0;
+			for (; r != 0; r &= r - 1) ++n;
+			return n;
+		}
+
 	private:
 		std::atomic<uint32_t> _used{0};
 		std::atomic<uint32_t> _refused{0};
+		std::atomic<uint32_t> _retiredMask{0};
 	};
 }
 

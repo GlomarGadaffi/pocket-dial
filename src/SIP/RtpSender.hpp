@@ -150,6 +150,8 @@ public:
 	// Issue #479: starts refused because every shared rtp_media_tx stack was in
 	// use (never a heap fallback). 0 on host builds, which have no pool.
 	static uint32_t txPoolRefusals();
+	// Slots whose boot allocation failed: out of service for good (#598 review).
+	static uint32_t txPoolRetired();
 
 private:
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)

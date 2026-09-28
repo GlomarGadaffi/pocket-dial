@@ -1924,6 +1924,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// RtpReceiver::MAX_DATAGRAM_BYTES, dropped instead of parsed cut.
 	json << "\"rtpRxOversize\":" << RtpReceiver::rxOversizeDrops() << ",";
 	json << "\"rtpTxPoolRefused\":" << RtpSender::txPoolRefusals() << ",";   // #479
+	json << "\"rtpTxPoolRetired\":" << RtpSender::txPoolRetired() << ",";
 	json << "\"recvErrors\":" << recvErrors << ",";
 	json << "\"lastRecvErrno\":" << lastRecvErrno << ",";
 	json << "\"recentDrops\":[";

@@ -1,2 +1,2 @@
-# TxSlotPool_test.cpp: 3 (#479 option D: shared rtp_media_tx stack pool claim/refuse/return)
-3
+# TxSlotPool_test.cpp: 4 (#479 option D: shared rtp_media_tx stack pool; +1 #598 review: a failed slot is retired)
+4

@@ -40,6 +40,26 @@ TEST(TxSlotPool, AReturnedSlotIsClaimedAgain)
 	EXPECT_EQ(pool.claim(), -1);
 }
 
+TEST(TxSlotPool, ASlotWhoseMemoryFailedIsNeverClaimedAndTheOthersStillWork)
+{
+	// #598 review: if slot 0's boot allocation failed and it stayed claimable,
+	// every start would claim 0, fail, release it, and all tx would be dead.
+	pd::SlotPool<3> pool;
+	pool.retire(0);
+	EXPECT_EQ(pool.retired(), 1u);
+	pool.release(0);   // a stray return must not revive it
+	const int a = pool.claim();
+	const int b = pool.claim();
+	EXPECT_NE(a, 0);
+	EXPECT_NE(b, 0);
+	EXPECT_GE(a, 0);
+	EXPECT_GE(b, 0);
+	EXPECT_NE(a, b);
+	EXPECT_EQ(pool.claim(), -1);
+	pool.release(a);
+	EXPECT_EQ(pool.claim(), a);
+}
+
 TEST(TxSlotPool, BadOrRepeatedReleaseCannotFreeAnotherSlot)
 {
 	pd::SlotPool<2> pool;
