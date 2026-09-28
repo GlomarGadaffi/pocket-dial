@@ -190,6 +190,8 @@ public:
 	// the carrier -- REGISTER responses (#617) and dialog responses (#356).
 	uint32_t getTrunkForgedRegisterResponses() const { return _sipTrunk.forgedRegisterResponses(); }
 	uint32_t getTrunkForgedDialogResponses() const { return _sipTrunk.forgedDialogResponses(); }
+	// Issue #666: trunk BYEs refused with 403 by the #356 check.
+	uint32_t getTrunkRefusedDialogByes() const { return _sipTrunk.refusedDialogByes(); }
 	// Issue #497: INVITEs refused because they did not come from the caller's
 	// registered address (the 403 "Caller Not Registered From This Address").
 	uint64_t getUnboundCallerRefusals() const { return _unboundCallerRefusals.load(std::memory_order_relaxed); }
