@@ -9,7 +9,7 @@
   {"name": "restart_task", "entry": "sendApiWifiConnect\\(.*<lambda", "bytes": 2048, "file": "src/Helpers/HttpServer.cpp", "line": 3925},
   {"name": "restart_task", "entry": "sendApiWifiModeAp\\(.*<lambda", "bytes": 2048, "file": "src/Helpers/HttpServer.cpp", "line": 3951},
   {"name": "restart_task", "entry": "sendApiFactoryReset\\(.*<lambda", "bytes": 4096, "file": "src/Helpers/HttpServer.cpp", "line": 4195},
-  {"name": "ota_reboot", "entry": "sendApiOtaReboot\\(.*<lambda", "bytes": 2048, "file": "src/Helpers/HttpServer.cpp", "line": 6255},
+  {"name": "ota_reboot", "entry": "sendApiOtaReboot\\(.*<lambda", "bytes": 4096, "file": "src/Helpers/HttpServer.cpp", "line": 6255},
   {"name": "http_conn", "entry": "HttpServer::acceptLoop\\(.*<lambda", "bytes": 4096, "file": "src/Helpers/HttpServer.cpp", "line": 415, "note": "std::thread per connection; stack set by esp_pthread_set_cfg(kHttpConnStackBytes) at HttpServer.cpp:305, value at HttpServer.hpp:49"},
   {"name": "http_accept", "entry": "HttpServer::acceptLoop\\(\\)$", "bytes": 8192, "file": "src/Helpers/HttpServer.cpp", "line": 235, "note": "std::thread created before esp_pthread_set_cfg, so the pthread default CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192 (sdkconfig.defaults:108)"},
   {"name": "udp_receiver (host)", "entry": null, "bytes": 0, "file": "src/Helpers/UdpServer.cpp", "line": 164, "note": "host-only std::thread (#else of ESP_PLATFORM); not in the device image"},

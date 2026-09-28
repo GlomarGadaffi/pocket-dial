@@ -6637,7 +6637,7 @@ void HttpServer::sendApiOtaReboot(int sock, const std::string& body)
 			while (static_cast<RequestsHandler*>(h)->hasLiveEmergencyCall());
 		}
 		esp_restart();
-	}, "ota_reboot", 2048, handler, 5, NULL);
+	}, "ota_reboot", 4096, handler, 5, NULL);   // #677: ESP_LOGW -> vprintf needs more than 2048 B
 #else
 	// Host stub: never actually exit the process (the smoke-test harness keeps
 	// running). Report a simulated success.
