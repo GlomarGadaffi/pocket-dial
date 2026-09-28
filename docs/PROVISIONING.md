@@ -443,8 +443,8 @@ provisioning window, HTTP Basic on the fetch) are not load-bearing and were not 
 Not nothing. A successful fetch tells the requester:
 
 * that this MAC is an adopted device on this board,
-* which extension it is: useful for targeting an INVITE, or (on an Open-mode board) for
-  registering as that extension yourself,
+* which extension it is: useful for targeting an INVITE, or (together with a spoofed MAC on the same LAN, since
+  Learn's lock is ARP-learned) for registering as that extension yourself,
 * the board's active IP and SIP port,
 * whether that extension requires digest auth (the comment block is a one-bit oracle for
   "this device is Secured / the registrar is in Secure mode").
