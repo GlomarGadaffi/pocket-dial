@@ -284,8 +284,8 @@ R"html1(  align-items:flex-start;justify-content:center;padding:24px 14px;overfl
 .fwd-row label{font-size:11px;color:var(--brass);font-family:var(--mono)}
 .did-row{display:grid;grid-template-columns:1fr 110px auto;gap:8px;align-items:center;margin-top:8px}
 
-.wifi-net{display:flex;justify-content:space-between;align-items:center;padding:7px 9px;border:1px solid transparent;border-radius:4px;cursor:pointer}
-.wifi-net:hover{background:rgba(176,141,82,.08);border-color:var(--line-hi)}
+.wifi-net{display:flex;justify-content:space-between;align-items:center;padding:7px 9px;border:1px solid transparent;border-radius:4px;cursor:pointer;width:100%;background:none;color:inherit;font:inherit;text-align:left}
+.wifi-net:hover,.wifi-net:focus-visible{background:rgba(176,141,82,.08);border-color:var(--line-hi)}
 .wifi-ssid{color:var(--ink);font-family:var(--mono)}
 .wifi-meta{font-size:11px;color:var(--ink-dim);font-family:var(--mono)}
 
@@ -394,6 +394,8 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
 <!-- #521: shown while /api/status says no real provider can carry a 911 call. -->
 <div class="e911" id="e911-route-banner" role="alert" style="display:none">&#9888; <b>Emergency calling is not configured.</b> This system refuses 911 and 933 calls until a SIP trunk (<a href="/setup/trunk">/setup/trunk</a>) or a telephony provider (Interconnect) is set up. Keep another way to call 911 near every phone.</div>
 <div class="e911" id="e911-unverified-banner" role="alert" style="display:none">&#9888; <b>Emergency route not verified.</b> A SIP trunk is configured but has not completed a call since it was last started or changed. Place a 933 test call to prove 911 can get out.</div>
+<!-- #644: needsSetup (SIP is held off until the admin login is set) or an /api/admin/status failure. -->
+<div class="e911" id="setup-banner" role="alert" style="display:none"></div>
 
 <main>
 
@@ -402,7 +404,7 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
        and 911 still routes out. -->
   <div class="note" id="e911-banner" role="status" style="display:none;color:var(--warn)">&#9888;
     <b>E911 not configured.</b> A 911 call still routes out, but nobody on site is
-    notified. Set the notify list and location via <code>PUT /api/e911-config</code>.</div>
+    notified. Set the notify list and location in <a href="#" onclick="openPbxModal();return false">PBX Settings &rarr; E911 Notification</a>.</div>
 
   <!-- ══ PATCH BAY ══ -->
   <section class="patch-bay">
@@ -673,8 +675,9 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <div class="subhead">&#9990; Extension Registration &amp; Onboarding</div>
       <div class="note">
         Controls what a phone must prove before it can register as an extension.
-        <strong>Learn</strong> adopts an unknown phone on first contact and locks
-        its extension to that device, so nobody else can take it over.
+        <strong>Learn</strong> adopts an unknown phone on first contact. The extension
+        is only locked to that device once an admin secures it; until then another
+        phone can register on the same extension.
         <strong>Secure</strong> digest-challenges every registration. There is no
         open mode: accepting any endpoint with no credential let anyone on the link
         register as any extension.
@@ -878,7 +881,7 @@ function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"
 function cssEsc(s){return String(s==null?"":s).replace(/["\\]/g,"\\$&");}
 function toast(msg,cls){var t=$("toast");t.textContent=msg;t.className=cls?("show "+cls):"show";clearTimeout(t._t);t._t=setTimeout(function(){t.className="";},2600);}
 function fmtUptime(sec){sec=Math.floor(sec||0);var h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;function p(n){return(n<10?"0":"")+n;}return p(h)+":"+p(m)+":"+p(s);}
-function setMsg(id,txt,cls){var e=$(id);if(e){e.textContent=txt||"";e.className="msg"+(cls?" "+cls:"");}}
+function setMsg(id,txt,cls){var e=$(id);if(e){e.setAttribute("role",cls==="err"?"alert":"status");e.textContent=txt||"";e.className="msg"+(cls?" "+cls:"");}}
 
 /* ── modals ── */
 /* One controller, replacing four separate gaps: two modals could be open at
@@ -1475,12 +1478,15 @@ window.addEventListener("resize",function(){clearTimeout(rsTimer);rsTimer=setTim
 
 /* ════ ADMIN / AUTH ════ */
 function fetchAdminStatus(){
-  return fetch("/api/admin/status",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(d){
+  return fetch("/api/admin/status",{credentials:"same-origin"}).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(function(d){
     adminState.provisioned=!!d.provisioned;adminState.needsSetup=!!d.needsSetup;adminState.authenticated=!!d.authenticated;
     adminState.sessionRemainingSec=d.sessionRemainingSec||0;adminState.sessionExpired=false;
     renderAdminPanel();renderAdminBadge();applyAuthGating();
     if(adminState.authenticated&&!adminState.needsSetup){fetchApSecurity();fetchRegistrar();}
-  }).catch(function(){});
+    setupBanner(adminState.needsSetup?"\u26a0 Set the admin login first. Phones cannot register until you do: SIP stays off until a real admin login is set (Admin, top right).":"");
+  }).catch(function(e){setupBanner("\u26a0 Could not read admin status: "+e.message);});
+}
+function setupBanner(txt){var b=$("setup-banner");if(b){b.textContent=txt;b.style.display=txt?"":"none";}
 }
 function renderAdminPanel(){
   $("admin-loading").style.display="none";
@@ -1580,7 +1586,10 @@ function renderRegistrar(d){
   body.innerHTML="";
   var devs=(d&&d.devices)||[];
   if(!devs.length){
-    var tr=document.createElement("tr");
+)html5";
+
+static const char PD_HTML_6[] =
+R"html6(    var tr=document.createElement("tr");
     var td=document.createElement("td");
     td.colSpan=4;
     td.textContent=(mode==="learn")
@@ -1594,10 +1603,7 @@ function renderRegistrar(d){
     var tdM=document.createElement("td");tdM.textContent=x.mac||"\u2014";
     var tdS=document.createElement("td");
     tdS.textContent=(x.state==="secured"?"secured":"learned")+(x.online?" \u00b7 online":"");
-)html5";
-
-static const char PD_HTML_6[] =
-R"html6(    var tdA=document.createElement("td");
+    var tdA=document.createElement("td");
     if(x.state!=="secured"){
       var b=document.createElement("button");
       b.className="btn";b.textContent="Secure";b.disabled=true;b.title="needs a SIP password (not yet supported)";
@@ -1620,6 +1626,24 @@ function fetchRegistrar(){
 function saveRegistrarMode(){
   var mode=$("reg-mode").value;
   postRegistrarMode(mode,false);
+}
+/* ════ E911 NOTIFICATION (#641): form lives in #pbx-modal ════ */
+function fillE911(d){if(!d)return;$("e911-exts").value=d.notifyExts||"";$("e911-callback").value=d.callback||"";$("e911-location").value=d.location||"";}
+/* Save stays off until a load succeeds: saving blank fields would erase the notify list. */
+function fetchE911(){
+  fetch("/api/e911-config",{credentials:"same-origin"}).then(function(r){
+    if(r.status===401){handleAuthExpired();throw new Error("session expired");}
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(d){fillE911(d);$("e911-save").disabled=false;setMsg("e911-msg","","");})
+  .catch(function(e){$("e911-save").disabled=true;setMsg("e911-msg","Could not load E911 settings ("+e.message+"). Save is off; reopen to retry.","err");});
+}
+/* The server echoes what it kept (list truncated, bad field dropped), so show that. */
+function saveE911(){
+  if(!gateCheck())return;
+  put("/api/e911-config","notifyExts="+encodeURIComponent($("e911-exts").value.trim())+"&callback="+encodeURIComponent($("e911-callback").value.trim())+"&location="+encodeURIComponent($("e911-location").value.trim()))
+    .then(function(t){fillE911(parseJsonOr(t));setMsg("e911-msg","Saved. The fields show what was kept.","ok");fetchStatus();})
+    .catch(function(e){setMsg("e911-msg",e.message,"err");});
 }
 function postRegistrarMode(mode,confirmLockout){
   var body="mode="+encodeURIComponent(mode)+(confirmLockout?"&confirm=LOCKOUT":"");
@@ -1734,7 +1758,7 @@ function renderWifi(nets){
   nets.forEach(function(n){
     var ssid=String(n.ssid==null?"":n.ssid);var rssi=Number(n.rssi)||0;var enc=n.encryption||"OPEN";
     var bars=rssi>-50?"▂▄▆█":rssi>-65?"▂▄▆ ":rssi>-75?"▂▄  ":"▂   ";
-    var row=document.createElement("div");row.className="wifi-net";
+    var row=document.createElement("button");row.type="button";row.className="wifi-net";
     row.addEventListener("click",function(){selectWifi(ssid);});
     var s=document.createElement("span");s.className="wifi-ssid";s.textContent=ssid;
     var m=document.createElement("span");m.className="wifi-meta";m.textContent=bars+" "+rssi+"dBm ["+enc+"]";
@@ -1928,7 +1952,7 @@ function removeDidMapping(did){
 
 /* ════ PBX SETTINGS / MUSIC ON HOLD ════ */
 var mohUploading=false;
-function openPbxModal(){if(!gateCheck())return;openModal("pbx-modal");fetchMohStatus();}
+function openPbxModal(){if(!gateCheck())return;openModal("pbx-modal");fetchMohStatus();fetchE911();}
 function fmtClock(s){s=Math.max(0,Math.round(s||0));var m=Math.floor(s/60);var r=s%60;return m+":"+(r<10?"0":"")+r;}
 function fetchMohStatus(){
   fetch("/api/moh",{credentials:"same-origin"}).then(function(r){
@@ -2022,6 +2046,8 @@ document.addEventListener("keydown",function(e){
 (function(){var el=$("adm-changedtmfpin-val");if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminChangeDtmfPin();});})();
 
 /* ── init ── */
+/* Live regions must exist before their text changes, or screen readers miss the first message. */
+document.querySelectorAll(".msg[id]").forEach(function(e){e.setAttribute("role","status");});
 fetchStatus();fetchCdr();fetchAdminStatus();fetchOtaStatus();
 setInterval(fetchStatus,2000);
 setInterval(fetchCdr,5000);
@@ -2087,6 +2113,15 @@ setInterval(function(){if($("pbx-modal").classList.contains("show"))fetchMohStat
         <button class="btn" id="moh-stop-btn" onclick="mohPreviewStop()">&#9632; Stop</button>
       </div>
       <div class="msg" id="moh-preview-msg"></div>
+
+      <hr class="hr">
+      <div class="subhead">E911 Notification</div>
+      <div class="note">Who is told on site when somebody dials 911. A factory reset clears these.</div>
+      <div class="field"><label for="e911-exts">Notify extensions (spaces or commas)</label><input type="text" id="e911-exts"></div>
+      <div class="field"><label for="e911-callback">Callback number</label><input type="text" id="e911-callback"></div>
+      <div class="field"><label for="e911-location">Location</label><input type="text" id="e911-location"></div>
+      <div class="row"><button class="btn primary" id="e911-save" disabled onclick="saveE911()">Save</button></div>
+      <div class="msg" id="e911-msg"></div>
 
     </div>
   </div>
