@@ -1773,7 +1773,11 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// here (no session, or one already ended). RFC 3261 §12.2.2: answer 481, never
 	// treat it as a new call -- a late hold re-INVITE used to place a fresh anchored
 	// leg to "pbx" that nothing ever dropped.
-	if (std::string_view(data->getTo()).find("tag=") != std::string_view::npos)
+	// A dialog the trunk or the register beep owns has no Session: a carrier's
+	// session-refresh re-INVITE lands here and must keep its old path, never a
+	// 481 that would end the call (#611 review; 911 over the trunk included).
+	if (std::string_view(data->getTo()).find("tag=") != std::string_view::npos &&
+		!_sipTrunk.ownsCallID(data->getCallID()) && !_beeper.ownsCallID(data->getCallID()))
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
