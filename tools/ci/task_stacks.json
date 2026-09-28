@@ -40,7 +40,7 @@
   {"name": "tel_rewarm", "entry": "rewarmTaskTrampoline\\(", "bytes": 6144, "file": "src/SIP/TelephonyAnchorClient.cpp", "line": 1581},
   {"name": "tel_reconcile", "entry": "reconcileTaskTrampoline\\(", "bytes": 6144, "file": "src/SIP/TelephonyAnchorClient.cpp", "line": 1627},
   {"name": "tel_wsw", "entry": "wsWorkerTrampoline\\(", "bytes": 12288, "file": "src/SIP/TelephonyAnchorClient.cpp", "line": 2215},
-  {"name": "tel_media_rx", "entry": "TelephonyAnchorClient::rxTaskTrampoline\\(", "bytes": 6144, "file": "src/SIP/TelephonyAnchorClient.cpp", "line": 2822},
+  {"name": "tel_media_rx", "entry": "TelephonyAnchorClient::rxTaskTrampoline\\(", "bytes": 6144, "file": "src/SIP/TelephonyAnchorClient.cpp", "line": 2897, "note": "#479: xTaskCreateStaticPinnedToCore on the call slot's boot-allocated PSRAM stack (CallSlot::rxMem)"},
   {"name": "trunk_dns", "entry": "TrunkResolver::workerEntry\\(", "bytes": 4096, "file": "src/SIP/TrunkResolver.cpp", "line": 297},
   {"name": "heap_probe", "entry": "^heapProbeTask\\(", "bytes": 8192, "file": "main/HeapLeakProbe.cpp", "line": 843},
   {"name": "log_drain", "entry": "^log_drain_task\\(", "bytes": 3072, "file": "main/esp_main.cpp", "line": 414},
