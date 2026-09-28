@@ -637,6 +637,8 @@ add_executable(sip_parser_tests
     # the FreeRTOS queue and writer task the fix adds (ESP-only, see
     # CdrRing_test.cpp's header comment).
     CdrRing_test.cpp
+    # Issue #496 / #509 review: the IPv4 input guard (Ip4InputGuard.h).
+    Ip4InputGuard_test.cpp
     # Issue #535 / #572 review: when a parked media task may be deleted.
     ParkedTaskReap_test.cpp
     # Issue #479: the shared rtp_media_tx stack pool (claim/refuse/return).

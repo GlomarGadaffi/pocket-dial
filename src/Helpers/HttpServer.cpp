@@ -83,6 +83,8 @@
 // Issue #185: heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) for
 // sendApiStatus's minFreeHeapSpiram field.
 #include "esp_heap_caps.h"
+// Issue #496 / #509 review: the IPv4 input guard's counts for /api/status.
+#include "Ip4InputGuard.h"
 // Issue #366: esp_pthread_set_cfg() to size the per-connection thread stack
 // independently of CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT.
 #include "esp_pthread.h"
@@ -186,6 +188,25 @@ bool HttpServer::openListenSocket()
 	{
 		closeSocket(sock);
 		return false;
+	}
+
+	// Issue #540: port 0 asks the OS for a free port. Read back the one it
+	// chose, so port() reports it -- host test suites no longer need fixed
+	// ports and can run in parallel.
+	if (_port == 0)
+	{
+		sockaddr_in bound{};
+#if defined _WIN32 || defined _WIN64
+		int boundLen = static_cast<int>(sizeof(bound));
+#else
+		socklen_t boundLen = sizeof(bound);
+#endif
+		if (getsockname(sock, reinterpret_cast<struct sockaddr*>(&bound), &boundLen) != 0)
+		{
+			closeSocket(sock);
+			return false;
+		}
+		_port = ntohs(bound.sin_port);
 	}
 
 	_listenSock = sock;
@@ -1971,6 +1992,16 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		json.s("\"emergencyRoute\":\"").s(emergencyRoute).s("\",");
 	}
 	json.s("\"uptime\":").n(uptimeSec).s(",");
+#if defined(ESP_PLATFORM)
+	// Issue #496 / #509 review: frames and fragments the IPv4 input guard
+	// (Ip4InputGuard.h) dropped since boot.
+	{
+		uint32_t g[3] = {0, 0, 0};
+		pd_ip4_guard_counts(g);
+		json.s("\"ip4Guard\":{\"padded\":").n(g[0]).s(",\"tinyFragments\":").n(g[1])
+		    .s(",\"mdnsFragments\":").n(g[2]).s("},");
+	}
+#endif
 	// #470: CDR ring persist health. A non-zero failure count means call history
 	// is NOT surviving reboots; suppressed counts writes refused mid-reset (#473).
 	json.s("\"cdrPersistFailures\":").n(CdrRing::persistFailureCount()).s(",");

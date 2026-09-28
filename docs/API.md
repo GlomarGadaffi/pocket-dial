@@ -884,6 +884,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `cdrPersistFailures` | Integer | (#470) CDR ring writes to flash that failed. Non-zero means call history is not surviving reboots. |
 | `cdrPersistSuppressed` | Integer | (#473) CDR ring writes refused while a factory reset was in progress. |
 | `cdrLoadFailures` | Integer | (#594) Failures reading the stored CDR ring at boot. |
+| `ip4Guard` | Object | (#496, ESP builds only) What the IPv4 input guard dropped since boot: `padded` (frames padded past Ethernet's 46-byte minimum; no real stack sends these) and `tinyFragments` (non-final fragments under 256 B of payload), `mdnsFragments` (any fragment addressed to the mDNS group 224.0.0.251, #559: the mDNS receiver would parse a reassembled datagram in pieces). A climbing `padded` count means hostile or broken traffic on the LAN. `tinyFragments` usually means the same, but a datagram re-fragmented by a router onto a smaller-MTU link can also land there, and that datagram is lost. See ARCHITECTURE.md, "UDP Receive Memory". |
 | `packetsProcessed` | Integer | Total UDP signaling packets processed by the state machine. |
 | `packetsDropped` | Integer | Total UDP signaling packets dropped by rate-limiting or firewall rules. |
 | `msgPoolRefusals` | Integer | (#409) Draws the process-wide SIP message pool refused because every slot was in use. There is no heap fallback, so each one is a request dropped (the peer retransmits) or a response not sent. Non-zero means the pool is undersized for the load, or the board is being flooded. |

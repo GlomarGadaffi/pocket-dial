@@ -8,6 +8,7 @@
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "esp_log.h"
 #include "esp_task_wdt.h"   // Issue #235: udp_receiver_task TWDT subscription
+#include "UdpRcvBuf.hpp"    // Issue #496: per-socket receive cap
 static const char* UDP_TAG = "UdpServer";
 #endif
 
@@ -55,6 +56,17 @@ bool UdpServer::openSocket()
 		tv.tv_sec  = 0;
 		tv.tv_usec = 500000; // 500 ms
 		setsockopt(_sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+		// Issue #496 / #509 review: cap what lwIP may queue here. Reassembled
+		// datagrams are up to ~14.8 KB each, and this task parses inline, so a
+		// slow handler would otherwise let one LAN sender park ~470 KB in the
+		// mailbox. Non-fatal: SIP still works without the cap, so say so loudly
+		// rather than refuse to serve.
+		if (!udprcvbuf::set(_sockfd, udprcvbuf::kSip))
+		{
+			ESP_LOGE(UDP_TAG, "SO_RCVBUF(%d) failed (errno %d): SIP receive queue is UNBOUNDED",
+			         udprcvbuf::kSip, errno);
+		}
 
 		_servaddr = {};
 		_servaddr.sin_family      = AF_INET;

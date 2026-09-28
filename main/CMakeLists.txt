@@ -97,6 +97,9 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # CONFIG_HEAP_TRACING is set, which only
                             # sdkconfig.defaults.heap_trace does -- so this costs the
                             # shipping build a preprocessor pass and no bytes.
+                            # Issue #496 / #509 review: the LWIP_HOOK_IP4_INPUT body (see the
+                            # top-level CMakeLists.txt for how lwIP is pointed at it).
+                            "pd_lwip_hooks.c"
                             "HeapLeakProbe.cpp"
                             "../src/Helpers/UdpServer.cpp"
                             "../src/Helpers/HttpServer.cpp"
@@ -338,3 +341,7 @@ if(DEFINED POCKETDIAL_PCAP_SLOT_BYTES)
         POCKETDIAL_PCAP_SLOT_BYTES=${POCKETDIAL_PCAP_SLOT_BYTES})
     message(STATUS "SipServer: pcap slot size OVERRIDDEN to ${POCKETDIAL_PCAP_SLOT_BYTES} bytes (default 2048)")
 endif()
+
+# Issue #496 / #509 review: lwIP (linked after main) references
+# pd_ip4_input_hook; force it in so link order can never drop it.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u pd_ip4_input_hook")

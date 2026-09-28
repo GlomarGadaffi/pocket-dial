@@ -32,14 +32,11 @@
 // ── Memory ────────────────────────────────────────────────────────────────────
 //
 // Every long-lived field is a fixed char array and the composed request goes
-// into a caller-provided fixed buffer via snprintf. The object allocates nothing
-// after configure(), and a challenge field that does not fit is REFUSED rather
-// than truncated (a truncated nonce hashes to a digest the server can never
-// reproduce — silently, forever). The transient std::strings inside
-// SipDigest::buildAuthorization() are the same ones the inbound REGISTER path
-// already builds on every challenge it verifies; this half does not add a new
-// allocation class, and it does so at most once per registration cycle rather
-// than once per packet.
+// into a caller-provided fixed buffer via snprintf. Nothing here allocates,
+// configure() included (#399: the digest uses SipDigest's bounded API, and the
+// Call-ID, tag and branch come from its CSPRNG hex), and a challenge field that
+// does not fit is REFUSED rather than truncated (a truncated nonce hashes to a
+// digest the server can never reproduce — silently, forever).
 //
 // ── The credential ────────────────────────────────────────────────────────────
 //
@@ -238,8 +235,8 @@ private:
 	bool composeRegister(Request& out);
 	void failCycle(uint64_t nowMs, int code, const char* reason, uint64_t retryAfterMs = 0);
 	void armSend(uint64_t whenMs);
-	bool cacheChallenge(const SipDigest::DigestChallenge& ch);
-	SipDigest::DigestChallenge cachedChallenge() const;
+	bool cacheChallenge(const SipDigest::BoundedChallenge& ch);
+	SipDigest::BoundedChallenge cachedChallenge() const;
 	void setError(const char* reason);
 	uint64_t backoffMs() const;
 
@@ -267,6 +264,11 @@ private:
 	char _chQop[kMaxQop]             = {0};
 	bool _chStale                    = false;
 	bool _chProxy                    = false;
+
+	// #399: scratch for the Authorization value and the parsed challenge, as
+	// members rather than ~1 KB of stack on the SIP thread.
+	char _authValue[SipDigest::kMaxAuthorizationValue] = {0};
+	SipDigest::BoundedChallenge _parsed{};
 
 	// nonce-count for the CACHED nonce. Reset to 0 whenever the nonce changes, so
 	// the first request against a new nonce sends nc=00000001.
