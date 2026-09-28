@@ -300,6 +300,27 @@ TEST(SipTrunkDialog, PlaceCallSendsOneInviteAndHoldsOneSlot)
 	EXPECT_TRUE(trunk.ownsCallID("handset-1"));
 }
 
+// #618: the carrier answered the REGISTER but not the INVITE, and the console
+// could not say where the INVITE went. The log line must name the destination
+// ip:port, the local port it leaves from, and the From user the carrier checks.
+TEST(SipTrunkDialog, InviteLogNamesDestinationLocalPortAndFromUser)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	sockaddr_in proxy = sbcAddr();
+	proxy.sin_port = htons(5080);   // distinct from the local 5060
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", proxy, 40000));
+	bool found = false;
+	for (const auto& l : env.logs)
+		if (l.find("Trunk: INVITE") != std::string::npos &&
+		    l.find("203.0.113.5:5080") != std::string::npos &&
+		    l.find("local port 5060") != std::string::npos &&
+		    l.find("From 15551230000") != std::string::npos) found = true;
+	EXPECT_TRUE(found);
+}
+
 // The slot cap refuses rather than queues. An outbound PSTN call that cannot be
 // placed must fail now, not wait somewhere the caller cannot see.
 TEST(SipTrunkDialog, RefusesBeyondTheSlotCapWithoutSending)

@@ -373,7 +373,10 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 	}
 	invite->syncContentLength();
 	_env.enqueue(sbc, std::move(invite));
-	_env.log("Trunk: INVITE -> " + std::string(e164));
+	// #618: where it went and from which port, so a silent carrier can be told
+	// apart from a misaddressed INVITE without a capture.
+	_env.log("Trunk: INVITE -> " + std::string(e164) + " to " + d->sbcIpPort
+		+ " from local port " + std::to_string(_env.serverPort()) + " (From " + d->fromUser + ")");
 	return true;
 }
 
