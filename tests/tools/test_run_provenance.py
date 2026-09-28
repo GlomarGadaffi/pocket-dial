@@ -22,8 +22,9 @@ import run  # noqa: E402  (tests/run.py)
 DESCRIBE = "v1.5.0-beta.2-104-g8d76d64"
 
 
-def harness(status, describe=DESCRIBE):
+def harness(status, describe=DESCRIBE, tags=None):
     h = run.Harness.__new__(run.Harness)
+    h._rev_parse = (tags or {}).get  # fake `git rev-parse <tag>^{commit}` (#593)
     h.target_type = "board"
     h.target_ip = "192.0.2.10"
     h.git_describe = describe
@@ -90,6 +91,23 @@ class ProvenanceTest(unittest.TestCase):
             with self.subTest(board=board, describe=describe):
                 v, ok, _ = self.verdict({"version": board, "resetReason": "POWERON"}, describe=describe)
                 self.assertEqual(v, "PASS")
+
+    def test_the_same_commit_under_a_new_tag_passes(self):
+        # #593: a tag landing on the built commit changes the checkout's describe
+        # but not its commit. Compare hashes, not describe strings.
+        sha = "8d76d64" + "0" * 33
+        tags = {"v1.5.0-rc.1": sha, "v1.5.0-beta.2": "98cc830" + "0" * 33}
+        for board, describe in ((DESCRIBE, "v1.5.0-rc.1"),        # board built pre-tag
+                                ("8d76d64", "v1.5.0-rc.1"),       # short-hash stamp
+                                ("v1.5.0-rc.1", DESCRIBE)):       # stamp is the tag
+            with self.subTest(board=board, describe=describe):
+                v, ok, _ = self.verdict({"version": board, "resetReason": "POWERON"},
+                                        describe=describe, tags=tags)
+                self.assertEqual(v, "PASS")
+        # Positive control: a tag on a DIFFERENT commit still mismatches.
+        v, _, _ = self.verdict({"version": DESCRIBE, "resetReason": "POWERON"},
+                               describe="v1.5.0-beta.2", tags=tags)
+        self.assertEqual(v, "WARN")
 
     def test_missing_reset_reason_still_fails_first(self):
         v, ok, details = self.verdict({"version": DESCRIBE})
