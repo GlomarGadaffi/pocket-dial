@@ -783,6 +783,7 @@ void RequestsHandler::initHandlers()
 	_handlers.emplace(SipMessageTypes::INVITE,            std::bind(&RequestsHandler::onInvite,         this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::TRYING,            std::bind(&RequestsHandler::onTrying,         this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::RINGING,           std::bind(&RequestsHandler::onRinging,        this, std::placeholders::_1));
+	_handlers.emplace(SipMessageTypes::SESSION_PROGRESS,  std::bind(&RequestsHandler::onSessionProgress, this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::BUSY,              std::bind(&RequestsHandler::onBusy,           this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::UNAVAILABLE,       std::bind(&RequestsHandler::onUnavailable,    this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::OK,                std::bind(&RequestsHandler::onOk,             this, std::placeholders::_1));
@@ -973,6 +974,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			{
 				case 100: handlerKey = SipMessageTypes::TRYING;             break;
 				case 180: handlerKey = SipMessageTypes::RINGING;            break;
+				case 183: handlerKey = SipMessageTypes::SESSION_PROGRESS;   break;
 				case 200: handlerKey = SipMessageTypes::OK;                 break;
 				case 480: handlerKey = SipMessageTypes::UNAVAILABLE;        break;
 				case 486: handlerKey = SipMessageTypes::BUSY;               break;
@@ -5107,6 +5109,14 @@ void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 		return;
 	}
 	endHandle(data->getFromNumber(), data);
+}
+
+// #400: a 183 matched no handler key, so it was dropped before SipTrunk ever saw
+// it and the carrier's early media never reached the handset. Only the trunk's
+// own dialog is claimed here; any other 183 is still dropped, as before.
+void RequestsHandler::onSessionProgress(std::shared_ptr<SipMessage> data)
+{
+	(void)_sipTrunk.handleResponse(data);
 }
 
 void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
@@ -10437,6 +10447,10 @@ void RequestsHandler::refuseRingingTrunk(const std::string& callId, int carrierS
 	resp->setHeader(line);
 	resp->clearBody();
 	resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
+	// #400 review: same To-tag as the 183/200, so a failure after early media
+	// ends the early dialog the handset already has.
+	if (const std::string& tag = sit->second->getLocalTag(); !tag.empty())
+		resp->setTo(std::string(invite->getTo()) + ";tag=" + tag);
 	resp->setContact(buildContact(std::string(invite->getToNumber())));
 	_outbox.emplace_back(invite->getSource(), std::move(resp));
 }
@@ -10613,21 +10627,65 @@ bool RequestsHandler::placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
 
 // ── SipTrunk::Listener ───────────────────────────────────────────────────────
 
-void RequestsHandler::onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia)
+int RequestsHandler::bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessage>& carrier)
 {
-	// The handset already got its 180 when the call was placed, so there is
-	// nothing to forward. A 183 carries the carrier's SDP and could start early
-	// media, which is deliberately deferred (see the issue): relaying it means
-	// answering the handset's offer before the call is answered, and getting
-	// that wrong leaves a connected-sounding call that never completes. Until
-	// then the caller hears local ringback rather than the carrier's own
-	// announcement, which is worth knowing when a SIT tone would have explained
-	// a failure.
-	if (earlyMedia)
+	// Where the carrier wants its audio. Without this the relay has nowhere to
+	// send and the call is one-way silence.
+	std::string carrierIp;
+	uint16_t    carrierPort = 0;
+	if (!parseCallerRtp(carrier, carrierIp, carrierPort)) return 502;
+
+	sockaddr_in carrierRtp{};
+	carrierRtp.sin_family = AF_INET;
+	carrierRtp.sin_addr.s_addr = inet_addr(carrierIp.c_str());
+	carrierRtp.sin_port = htons(carrierPort);
+	if (!_trunkRx[slot].setRawPeer(carrierRtp)) return 502;
+
+	// Bring up the handset-facing half and complete the cross-wiring. Its bound
+	// port is what the 183/200 advertises. Already up after early media (#400):
+	// the 200 then only re-points the carrier side and keeps the same relay.
+	if (!_handsetRx[slot].isActive())
 	{
-		queueLog("trunk: carrier signalled early media (183); not relayed yet, "
-			"caller hears local ringback for " + std::string(ev.handsetCallID));
+		_handsetRx[slot].setRawSink(&trunkRelayForward, &_trunkRx[slot]);
+		if (!_handsetRx[slot].start(0, nullptr)) return 500;
 	}
+	return 0;
+}
+
+void RequestsHandler::onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia,
+	const std::shared_ptr<SipMessage>& progress)
+{
+	// The handset already got its 180 when the call was placed. A 180 needs
+	// nothing more. A 183 with SDP (#400) means the carrier is already sending
+	// audio -- ringback, or a SIT tone / announcement explaining a failure -- so
+	// open the relay now and answer the handset 183 with our side of it. The
+	// later 200 continues on the same relay (bringUpTrunkRelay keeps it up).
+	if (!earlyMedia || !progress || !progress->hasSdp()) return;
+	const std::string handsetCallID(ev.handsetCallID);
+	auto sit = _sessions.find(handsetCallID);
+	if (sit == _sessions.end() || !sit->second) return;
+	auto session = sit->second;
+	const int slot = session->getTrunkRelaySlot();
+	auto invite = session->getInviteMessage();
+	if (slot < 0 || !invite) return;
+
+	// Early media is best effort: on any failure the caller keeps local
+	// ringback and the call itself is untouched.
+	if (bringUpTrunkRelay(slot, progress) != 0)
+	{
+		queueLog("trunk: early media (183) could not be relayed; local ringback for " + handsetCallID);
+		return;
+	}
+	auto resp = getMessageFromPool(*invite);
+	if (!resp) return;
+	resp->setHeader("SIP/2.0 183 Session Progress");
+	resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
+	resp->setTo(std::string(invite->getTo()) + ";tag=" + session->getLocalTag());
+	resp->setContact(buildContact(std::string(invite->getToNumber())));
+	resp->setBody(buildMediaSdp(_localIp, _handsetRx[slot].localPort(),
+		/*sendrecv=*/true, invite->getTelephoneEventPayloadType()));
+	_outbox.emplace_back(invite->getSource(), std::move(resp));
+	queueLog("trunk: early media (183) relayed for " + handsetCallID);
 }
 
 void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
@@ -10653,43 +10711,15 @@ void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 		return;
 	}
 
-	// Where the carrier wants its audio. Without this the relay has nowhere to
-	// send and the call is one-way silence, so a failure here is fatal to the
-	// call rather than something to log and continue past.
-	std::string carrierIp;
-	uint16_t    carrierPort = 0;
-	if (!parseCallerRtp(ok, carrierIp, carrierPort))
+	// A failure here is fatal to the call rather than something to log and
+	// continue past: without the relay the call is one-way silence.
+	if (const int refuse = bringUpTrunkRelay(slot, ok); refuse != 0)
 	{
 		_sipTrunk.hangup(ev.trunkCallID);
-		refuseRingingTrunk(handsetCallID, 502);
+		refuseRingingTrunk(handsetCallID, refuse);
 		endCall(handsetCallID, invite->getFromNumber(), invite->getToNumber(),
-			"carrier answer carried no usable RTP destination");
-		return;
-	}
-
-	sockaddr_in carrierRtp{};
-	carrierRtp.sin_family = AF_INET;
-	carrierRtp.sin_addr.s_addr = inet_addr(carrierIp.c_str());
-	carrierRtp.sin_port = htons(carrierPort);
-	if (!_trunkRx[slot].setRawPeer(carrierRtp))
-	{
-		_sipTrunk.hangup(ev.trunkCallID);
-		refuseRingingTrunk(handsetCallID, 502);
-		endCall(handsetCallID, invite->getFromNumber(), invite->getToNumber(),
-			"carrier RTP address is unusable");
-		return;
-	}
-
-	// Bring up the handset-facing half and complete the cross-wiring. Started
-	// only now because its bound port is what the 200 OK advertises, and there
-	// was nothing to advertise it to until the call was answered.
-	_handsetRx[slot].setRawSink(&trunkRelayForward, &_trunkRx[slot]);
-	if (!_handsetRx[slot].start(0, nullptr))
-	{
-		_sipTrunk.hangup(ev.trunkCallID);
-		refuseRingingTrunk(handsetCallID, 500);
-		endCall(handsetCallID, invite->getFromNumber(), invite->getToNumber(),
-			"handset relay receiver failed to start");
+			refuse == 502 ? "carrier answer carried no usable RTP destination"
+			              : "handset relay receiver failed to start");
 		return;
 	}
 
