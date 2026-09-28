@@ -1015,7 +1015,7 @@ function renderBoard(d){
       +'<span class="label">'+esc(n)+'</span>'
       +'<span class="sublabel">'+esc(jackSublabel(e,state))+'</span></button>';
   });
-  if(!nums.length)html='<div class="note" style="text-align:center;padding:24px">'+(d.rosterVisible===false?esc(String(d.clientCount||0))+' phones registered. Log in to see them.':'No extensions seen yet. Register a phone to light a jack.')+'</div>';
+  if(!nums.length)html='<div class="note" style="text-align:center;padding:24px">'+(d.rosterVisible===false?esc(String(d.clientCount||0))+(d.clientCount===1?' phone':' phones')+' registered. Log in to see them.':'No extensions seen yet. Register a phone to light a jack.')+'</div>';
   board.innerHTML=html;
   if(keepExt){
     var refocus=board.querySelector('.jack[data-ext="'+cssEsc(keepExt)+'"]');

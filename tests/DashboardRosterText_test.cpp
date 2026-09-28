@@ -33,7 +33,8 @@ TEST(DashboardRosterText, LoggedOutTheBoardCountsPhonesAndTheCallLogAsksForLogin
 	const std::string board = functionBody(p, "function renderBoard(d){");
 	ASSERT_FALSE(board.empty());
 	EXPECT_NE(board.find("d.rosterVisible===false"), std::string::npos) << board;
-	EXPECT_NE(board.find("phones registered. Log in to see them."), std::string::npos);
+	EXPECT_NE(board.find("' registered. Log in to see them.'"), std::string::npos);
+	EXPECT_NE(board.find("d.clientCount===1?' phone'"), std::string::npos) << "1 phone, not 1 phones";
 
 	const std::string rail = functionBody(p, "function updateRail(d){");
 	ASSERT_FALSE(rail.empty());
