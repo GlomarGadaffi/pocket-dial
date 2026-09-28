@@ -659,8 +659,13 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 	}
 	if (!authorised)
 	{
-		_env.log("Trunk: BYE from " + addrToIpPort(src) + " refused -- this dialog's carrier is "
-			+ addrToIpPort(d->peer) + " and the tags do not match (" + d->destE164 + ")", true);
+		const uint32_t n = ++_dialogRefusedByes;   // #666: counted; logged at 1, 2, 4, 8, ...
+		if ((n & (n - 1)) == 0)
+		{
+			_env.log("Trunk: BYE from " + addrToIpPort(src) + " refused -- this dialog's carrier is "
+				+ addrToIpPort(d->peer) + " and the tags do not match (" + d->destE164 + "; "
+				+ std::to_string(n) + " refused so far)", true);
+		}
 		auto forbidden = _env.messageFromPool(data->toString(), src);
 		if (forbidden)
 		{

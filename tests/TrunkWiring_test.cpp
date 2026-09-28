@@ -1031,3 +1031,41 @@ TEST(TrunkWiring, StatusReportsForgedRegisterAndDialogResponseCounts)
 	EXPECT_NE(status.find("\"trunkForgedRegisterResponses\":2,"), std::string::npos) << status;
 	EXPECT_NE(status.find("\"trunkForgedDialogResponses\":3,"), std::string::npos) << status;
 }
+
+// Issue #666: BYEs refused by the #356 check show in /api/status too.
+TEST(TrunkWiring, StatusReportsRefusedDialogByes)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&b.handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	// Positive control: the field is there, at zero, before any BYE.
+	std::string status = statusBody(port);
+	EXPECT_NE(status.find("\"trunkRefusedDialogByes\":0,"), std::string::npos) << status;
+
+	CarrierView forger = carrier;
+	forger.toTag = "guessed";
+	b.sent.clear();
+	// Two distinct BYEs (own branch and CSeq): an identical resend is a
+	// retransmission, answered without reaching the #356 check again.
+	for (int i = 0; i < 2; ++i)
+	{
+		std::string bye = forger.bye();
+		bye.replace(bye.find("z9hG4bKcarrierbye"), 17, "z9hG4bKforgedbye" + std::to_string(i));
+		bye.replace(bye.find("CSeq: 2 BYE"), 11, "CSeq: " + std::to_string(2 + i) + " BYE");
+		b.handler.handle(RequestsHandler::getMessageFromPool(bye, addrFor(kForgerIp)));
+	}
+	ASSERT_EQ(b.countWithTo("403", kForgerIp), 2u);
+
+	status = statusBody(port);
+	EXPECT_NE(status.find("\"trunkRefusedDialogByes\":2,"), std::string::npos) << status;
+}
