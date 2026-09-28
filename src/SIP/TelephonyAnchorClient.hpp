@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"   // #43: WS event work queue
 #include "freertos/semphr.h"  // #43: worker-pool done semaphore (+ existing _rxDoneSem)
+#include "PsramTask.hpp"      // #479: pd::StaticTaskSlot (the slot's tel_media_rx stack + TCB)
 #endif
 
 #include "PoolConfig.hpp"     // #100: POCKETDIAL_MAX_ANCHOR_CALLS (per-call slot count)
@@ -179,6 +180,12 @@ private:
 		std::atomic<bool>        postLive{false};         // guarded by postMutex
 		esp_http_client_handle_t getClient  = nullptr;
 		TaskHandle_t             rxTaskHandle = nullptr;
+		// Issue #479: this slot's tel_media_rx stack + TCB, allocated once at construction.
+		// Invariant: a task is created on it only while rxTaskHandle is nullptr, and the
+		// handle is cleared only by reapParkedRxLocked() after the old task has PARKED
+		// (#553/#608). A detached or still-running rx keeps the handle, so the slot stays
+		// busy and allocSlotLocked()/startRxIfNeeded() refuse rather than reuse the memory.
+		pd::StaticTaskSlot       rxMem;
 		SemaphoreHandle_t        rxDoneSem    = nullptr;
 		std::atomic<bool>        tearingDown{false};      // single-entry gate for stopMediaStreams(slot)
 		// Issue #554: true from just before the rx task is created until it has given
