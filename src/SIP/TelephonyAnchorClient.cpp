@@ -176,6 +176,7 @@ TelephonyAnchorClient::TelephonyAnchorClient()
 	{
 		s.rxMem.alloc("tel_media_rx", pd::rtpslots::kAnchorRxStackBytes, PD_TASK_STACK_CAPS, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 		s.rxArg = RxTaskArg{this, &s};   // constant for the slot's life, so never rewritten
+		s.rxDoneSem = xSemaphoreCreateBinary();   // #479: once, never recreated per call
 	}
 }
 
@@ -2894,7 +2895,7 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 			case pd::RxStart::Restart:
 				// Issue #554 (a): the rx task gave up on its own (ring-time retry budget,
 				// transport failures, or the stream ended) and exited, leaving its handle
-				// behind. Its done-sem is taken, so it no longer touches the slot: replace it.
+				// behind. It has parked and been reaped, so it no longer touches the slot: replace it.
 				ESP_LOGW(TAG, "startRxIfNeeded: rx task for %s had exited -- restarting (#554)",
 				         participantId.c_str());
 				break;   // reapParkedRxLocked() already deleted it and cleared rxTaskHandle
@@ -2902,11 +2903,15 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 				break;
 		}
 	}
-	if (slot->rxDoneSem)
+	// #479: the slot's done-sem is created once at construction. Drain a give left by an rx
+	// task that exited with nobody joining it (stream ended, or detached), so the next stop
+	// joins THIS task, not that one. The old task has parked and been reaped by now.
+	if (slot->rxDoneSem == nullptr)
 	{
-		vSemaphoreDelete(slot->rxDoneSem);
+		ESP_LOGE(TAG, "startRxIfNeeded: no done-sem for %s's slot -- refusing", participantId.c_str());
+		return false;
 	}
-	slot->rxDoneSem = xSemaphoreCreateBinary();
+	(void)xSemaphoreTake(slot->rxDoneSem, 0);
 	// #479: the slot's own arg (set once at construction), so an rx start allocates nothing.
 	RxTaskArg* arg = &slot->rxArg;
 	// #100: stack in PSRAM (WithCaps) — N concurrent calls' GET-rx tasks would otherwise exhaust
@@ -2923,7 +2928,6 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 		slot->rxRunning.store(false, std::memory_order_release);
 		ESP_LOGE(TAG, "Failed to create Rx task for %s", participantId.c_str());
 		slot->rxTaskHandle = nullptr;
-		if (slot->rxDoneSem) { vSemaphoreDelete(slot->rxDoneSem); slot->rxDoneSem = nullptr; }
 		return false;
 	}
 	ESP_LOGI(TAG, "Rx stream task started for participant %s", participantId.c_str());
@@ -3078,9 +3082,8 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		rxTask = slot->rxTaskHandle;
-		// Capture the semaphore under the SAME lock: startRxIfNeeded deletes+recreates rxDoneSem,
-		// so re-reading the member after releasing the lock could race a fresh handle (UAF). Use
-		// the local 'doneSem' for the whole teardown below, never slot->rxDoneSem.
+		// Captured under the same lock. Since #479 rxDoneSem is created once and never replaced,
+		// so the local is the slot's one sem for the object's life.
 		doneSem = slot->rxDoneSem;
 	}
 
@@ -3175,12 +3178,12 @@ void TelephonyAnchorClient::rxTaskTrampoline(void* arg)
 	CallSlot* slot = a->slot;   // a is the slot's own rxArg (#479): nothing to free
 	self->runRxLoop(slot);
 	// Issue #554 (#575 review): clear rxRunning FIRST, then give. The give is the task's
-	// last touch of the slot, and startRxIfNeeded() restarts only after TAKING that sem
-	// (pd::rxRestartDecision), so a restart can never delete/recreate the sem, or start a
-	// second task, while this one still uses the slot.
+	// last touch of the slot before it parks, and startRxIfNeeded() restarts only after
+	// reaping the parked task (pd::rxRestartDecision), so a restart can never start a second
+	// task while this one still uses the slot.
 	slot->rxRunning.store(false, std::memory_order_release);
-	// Give THIS slot's done-sem so stopMediaStreams() can join. stop() holds off any realloc of
-	// the slot until it has taken this sem, so slot->rxDoneSem is still the one it waits on.
+	// Give the slot's done-sem (created once, #479) so stopMediaStreams() can join. A give
+	// nobody takes is drained by the next startRxIfNeeded().
 	if (slot->rxDoneSem)
 	{
 		xSemaphoreGive(slot->rxDoneSem);
