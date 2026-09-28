@@ -114,9 +114,11 @@ the **SIP trunk** whenever its configuration is valid, otherwise an **`AnchorCli
 
 What surprises people:
 
-- **The SIP trunk never registers and never answers a challenge.** `SipRegistrationClient`
-  is compiled but never instantiated, and `SipTrunk` has no `401`/`407` handling
-  (`SipTrunk.hpp:126-129`), so only an IP-authenticated carrier works. Server location is a
+- **The SIP trunk registers only when it has a password.** `SipTrunk` then REGISTERs at
+  boot, refreshes before Expires and answers a `401`/`407` to the REGISTER with digest
+  (#615); a `401`/`407` to its INVITE is answered with digest credentials once (#581). An
+  IP-authenticated trunk does not register. Outbound calls over a registered trunk are still
+  under investigation: the carrier does not answer the INVITE (#618). Server location is a
   plain A-record lookup (`TrunkResolver`): no SRV/NAPTR, UDP only.
 - **A dial-plan rule with `action=trunk` is the only way out for an ordinary number.** No
   hardcoded `9` prefix, no unregistered-destination fallback: with an empty dial plan every
