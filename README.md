@@ -237,11 +237,11 @@ The device is an appliance on a local link, so the defences are layered rather t
 perimeter-based. [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) is candid about what
 each one does and does not buy.
 
-**Read this first:** the registrar ships in **open** mode. A freshly flashed board
-accepts any `REGISTER` and any `INVITE` from anything that can reach it. SIP digest
-authentication is fully implemented and there are two stricter modes — `learn`
-(trust-on-first-use, then lock each extension to its MAC) and `secure` (digest
-required) — but you must turn one on. See [docs/LEARN_MODE.md](docs/LEARN_MODE.md).
+**Read this first:** the registrar ships in **learn** mode (trust-on-first-use, then
+lock each extension to its MAC; the open mode is retired, #502). A freshly flashed board
+adopts the first phone to `REGISTER` an unclaimed extension without verifying it. SIP
+digest authentication is fully implemented in the stricter `secure` mode (digest
+required), but you must turn it on. See [docs/LEARN_MODE.md](docs/LEARN_MODE.md).
 
 What is on by default:
 

@@ -68,9 +68,9 @@ To test VoIP signaling, connect two software SIP clients (such as **MicroSIP**, 
 2. Configure softphone accounts:
    * Domain / Registrar: `<device_ip>:5060` (e.g. `192.168.4.1:5060`)
    * Username / Extension: Set user 1 to `1001` and user 2 to `1002`.
-   * Password: leave blank; the registrar's **default** mode is open, so any
+   * Password: leave blank; the registrar's **default** mode is learn, so an unclaimed
      extension registers without a credential. (SIP digest authentication exists and is
-     runtime-selectable via the `open` / `learn` / `secure` registrar modes; in `secure`
+     runtime-selectable via the `learn` / `secure` registrar modes; in `secure`
      mode you must supply the extension's provisioned password here. See
      [LEARN_MODE.md](LEARN_MODE.md) and [THREAT_MODEL.md](THREAT_MODEL.md) §9.)
    * Protocol: set transport to **UDP**.

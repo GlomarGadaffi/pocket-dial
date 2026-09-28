@@ -1438,12 +1438,13 @@ curl -s -X POST "http://$DEV/api/ap-security" \
 ```
 
 ### `GET /api/cdr`
-Returns the in-memory Call Detail Record ring (most recent calls first). Read-only, ungated, same reachability posture as `/api/status`.
+Returns the in-memory Call Detail Record ring (most recent calls first). Read-only; requires an admin session (cookie, no CSRF) since #207, unlike `/api/status`.
 
-* Request Headers: None
+* Request Headers: `Cookie: pd_session=…`
 * Response Content-Type: `application/json`
 * Response Status Codes:
   * `200 OK`
+  * `401 Unauthorized` without a valid session
 * Response Payload JSON Example:
 ```json
 [
