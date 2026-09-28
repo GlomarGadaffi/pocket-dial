@@ -1,5 +1,229 @@
 # Changelog
 
+## Unreleased (on main since v1.5.0-beta.2) — 2026-09-28
+
+One line per change merged to `main` after beta.2, taken from its squash title.
+`(#PR; #issue)`: the first number is the pull request, the rest are the issues it
+cites. A change pushed without a PR cites its issue only. None of this is claimed
+bench-verified here.
+
+### Calls and E911
+
+- 911/933 are resolved before the dial plan; no route answers 503, not 404 (#166 part 1; #240).
+- Kari's Law: on-site notification when 911 is dialed (#166 part 2).
+- E.164 normalization: a DID matches however it is written (#165); follow-ups from #237's review.
+- `forceDisconnect()` BYEs a killed handset on 777/888/555 legs (#232).
+- Per-extension voicemail, deposit and retrieval MVP (#261; #246).
+- `sdp::isHold()` is wired into the three hold/resume sites (#266).
+- RFC 8866 SDP model behind `SipSdpMessage`, re2c parser, borrowed scratch (#255; #196 phase 2).
+- Explicit section selection for `parseCallerRtp` (#267; #253).
+- `onBusy()`'s call-forward-busy lookup keys off the busy callee, not the caller (#276; #256).
+- `isHoldOffer()` falls back to session level, not section 0 (#285).
+- Blind-transfer swap re-INVITE uses a real CSeq, not 100 (#291).
+- Attended-transfer splice re-INVITEs use a real CSeq, not 100 (#308; #257).
+- PCMA is rejected at admission for server-terminated legs (#311; #304).
+- A 911/933 PCMA-only offer gets 503, not #311's generic 488 (#317).
+- Grandstream, Polycom and Cisco SPA provisioning routes are wired into `HttpServer` (#313; #234).
+- `writeAudio()` failures propagate into anchor call teardown (#323).
+- Anchor: WebSocket reconnect rebuilds its stale Bearer token (#343).
+- The handset is notified on degraded-anchor teardown; #232's dialog-header gap fixed in two more places (#345; #279).
+- Anchor: token fields are atomic, not mutex-guarded (#348).
+- Anchor: a sent makecall with no response read is unknown state, not a failed call (#352; #349).
+- Anchor: the GET handle is rebuilt after a transport failure instead of reopened (#351; #350).
+- Anchor: reconcile retry retries only transport blips, not a definitive "no call" (#354; #349).
+- A recycled pooled session clears its voicemail state (#353).
+- `dispatchVoicemailMenuCommand`'s self-tail-call becomes a loop (#364; #361).
+- Anchor: the orphaned 3CX leg is dropped in every #379 window, exactly once (#380).
+- Park: the BYE to the parker goes above the retrieve re-INVITE's CSeq (#403; #389).
+- Transfer: server requests go above every CSeq the dialog carried (#407; #402).
+- The PBX stays in the dialog across target refreshes: hold no longer leaks a ghost call, session refresh no longer drops calls at ~30 min (#439; #425, #198).
+- Server BYEs and the declined NOTIFY go above every CSeq the dialog carried (#459; #422).
+- No receive-path discard goes uncounted; no truncated datagram is parsed (#468; #443, #444).
+- Never answer a response or an ACK, guarded at `drainOutbox()` (#472; #424).
+- A CR/LF-only datagram is a keep-alive, not a drop (#506; #430).
+- Conference: a quick 888 re-dial skips a leg still stopping instead of 486 (#526; #513).
+- A de-REGISTER is answered 200 at its source, not 404 (#527; #523).
+- The loopback simulator never answers an emergency call (#538; #521).
+- The register beep goes out after the REGISTER's 200 OK, not with it (#542; #408).
+- A CANCEL mid-ring answers the anchored INVITE 487 (#556; #548).
+- No extension, DID target or rule may be named like an emergency number (#564; #550).
+- Anchor: an ACK-deadline reap BYEs the handset; a slotless WS Remove still reports Dropped (#565; #533).
+- The media rx task parks and its owner reaps it (#572; #535).
+- The emergency route reads "trunk" only after the trunk has answered (#573; #546).
+- Anchor: an rx task that exited on its own is restarted; a dropped leg is never re-primed (#575; #554).
+- 422 Session Interval Too Small + Min-SE on a short Session-Expires (#591; part of #198).
+- A missed OPTIONS keepalive no longer silently kills a live call (#603; #533).
+- Anchor: cooperative cancellation for the rx task, no external `vTaskDelete` (#608; #553).
+- A re-INVITE for a dead dialog gets 481, not a new anchored call (#611; #379).
+- A relayed call whose RTP stops with no BYE is ended (#612; #604).
+- lwIP IPv4 reassembly is enabled: SIP/UDP over 1,472 B is no longer silently dropped (#509; #496).
+- Every fragment addressed to the mDNS group is dropped (#574; #559).
+- Reboot and factory reset are refused while a 911/933 is live (#655; #652).
+
+### Trunk
+
+- SIP trunk part 1: outbound ITSP dialog and the raw RTP relay it needs (#250; #164).
+- SIP trunk part 3: raw RTP egress, the missing half of `setRawSink()` (#260; #164).
+- SBC mode: one toggle routes every call to a trunk (#201).
+- A carrier SBC is resolved off the SIP thread, with its own cache (#258).
+- `resolve()` no longer reports Pending for work that has finished (#259).
+- Hold music plays on trunk-anchored calls (#218).
+- `SipTrunk` tells the engine when a dialog moves; `Session` gets a trunk flag and relay slot; `SipTrunk` is wired into the engine as a B2BUA; the engine now drives its clock and resolver; its test seams stay out of device firmware (#164).
+- Trunk configuration UI, API and persistence (#362; #164).
+- A handset hangup BYEs the carrier instead of being taken for one (#387; #386).
+- Only the carrier may answer or hang up a trunk call (#388; #356).
+- The default `:5060` is omitted from trunk URIs; any other port is kept (#532; #365).
+- An allocation-free digest client API (#541; part of #399).
+- A 401/407 on our INVITE is answered with digest credentials, once (#581; part of #399).
+- A carrier 183 is relayed as early media (#600; #400).
+- The trunk REGISTERs with the carrier, answering 401/407 with digest (#615; #399).
+- The trunk INVITE log names its destination, local port and From user (#620; #618).
+- Timer E retransmit for REGISTER; forged REGISTER responses are counted (#654; #617).
+- Power-of-two logging for forged trunk responses; counts in `/api/status` (#664; #663).
+
+### Memory and no-heap
+
+- `RtpReceiver::DtmfSink`/`RawSink` are allocation-free by construction (#293).
+- L2 TX frame-template primitive, host-tested (#297; #282 phase 1).
+- `SipMessage::toString()` budgets header bytes in its `reserve()` (#318).
+- CDR NVS persist moves off any PSRAM-stacked task (#309; #273, #277, #288).
+- `CdrRing`'s persist queue depth halves from 2 to 1 (#319; #315).
+- `CdrRing`'s persist queue storage moves to PSRAM (#322).
+- The remaining 4 named tasks are watchdog-subscribed (#321; #235).
+- Shared L2 hot-path DMA buffer pool for RTP TX (#330; #282, #329).
+- HTTP connection threads get 4096 B stacks, not the 8192 pthread default (#367; #366).
+- Concurrent HTTP connection threads are capped (#369; #368).
+- The pcap capture ring defaults to 16 slots, not 64 (#373; #278, #328).
+- Every `allocateVirtualPeer()` caller refuses cleanly when the pool is empty (#413; #412).
+- Fixed-size pcap capture ring, zero allocations per packet (#436; part of #416).
+- Static HTML pages stream from flash instead of being copied (#438; #410).
+- Every HTTP response is sent in place, one scatter-gather `sendmsg`, no copies (#448; #410 phase 2).
+- `CdrRing::clearAll()` resets the ring in place, no 2 KB temporary on the `http_conn` stack (#460; #458).
+- Per-request lookups allocate nothing (#471; #464, #284 batch C).
+- An idle tick allocates nothing; OPTIONS ping and header rewrites happen in place (#474; #463, #284 batch B).
+- Jitter rings to PSRAM, no allocation in `DmaFramePool`'s critical section, clips never spill into internal DRAM (#475; #466 PR A).
+- CDR ring persisted as an NVS blob, every return checked, writes refused during a reset (#476; #470, #473).
+- `rtp_media_rx` stacks to PSRAM, tx pinned internal for W5500 DMA, one PSRAM-task helper for every caller (#480; #466 PR B).
+- RTP datagrams over 512 B are dropped and counted, one shared truncation-aware receive (#485; #469).
+- The first admin login no longer takes `http_conn` to ~400 B of stack: one reused NVS read buffer (#494; #492).
+- `MixBus::tick`'s scratch leaves `conf_mix_tick`'s stack; 888 no longer panics the board (#499; #498).
+- The syslog host loads after `esp_netif_init()`; a saved host no longer boot-loops the board (#511; #508).
+- The HTTP server outlives its detached connection threads (#567; #540).
+- Parse, send and drain in place (#577; #462, #284 batch A).
+- A spent message or virtual-peer pool refuses, with no heap fallback (#583; #409).
+- RTP media tasks are created statically on per-slot stacks preallocated at boot (#598; #479).
+- `/api/status` builds its body in a fixed per-connection buffer, no heap per request (#599; #410).
+- CDR load failures are counted, a drain timeout WARNs, explicit seq_cst (#609; #594).
+- Reset journal: append-only slots (#610; #595).
+- Dynamic task creates since boot are counted on `/api/status` `memory.dynamicTaskCreates` (#628; #479).
+- `/metrics` makes no allocations per scrape (#633; #630).
+
+### Dashboard
+
+- Accessibility pass: 22 audit items plus a pre-existing focus bug (#269).
+- OTA: `/api/ota/status` emits an `inProgress` boolean and the dashboard panel is fixed (#312; #271).
+- Maintenance buttons send CSRF and report failures; server errors surface; Secure is hidden until it can work (#631).
+- Logged out, the dashboard shows the phone count and asks to log in for the call log (#637; #634).
+- The Factory Reset confirm lists everything it erases (#638; #635).
+- E911 notification settings get a form in PBX Settings (#646; #641).
+- Wi-Fi rows are buttons; status messages are live regions (#647; #642).
+- Learn mode does not lock an extension until it is secured (#648; #643).
+- A banner shows while the admin login is unset, and admin-status errors are shown (#649; #644).
+- Reboot with `confirm=1` does a plain reboot when no OTA image is staged (#650; #645).
+
+### Security
+
+- Factory reset via `*PIN#999#1` also wipes the SD CDR archive (#251).
+- `isValidMessage()` checks what SEC-02 always said it did (#272).
+- Eth builds leave the SAR ADC entropy source on, so `esp_random()` is a TRNG (#429; #420).
+- `IDGen` draws from the hardware CSPRNG, not a 31-bit LCG (#415; #385).
+- Factory reset erases every stored secret: `smtp_pass`, `gsa_key`, extension HA1s, the coredump (#437; #363).
+- A fresh board boots Learn, not an open registrar; existing boards keep open (#441; #397).
+- Factory reset erases call-forward targets and reports the admin-credential erase (#456; part of #450).
+- An incomplete factory reset is reported on the next boot (#481; #473 item 1).
+- Digest HA1s leave the box only inside the password-encrypted export (#484; #482).
+- The open registrar is retired: Learn is the floor (#502; #500).
+- A call must come from the address its caller registered from (#503; #497).
+- Learn mode digest-challenges INVITEs from Secured devices (#512; #505).
+- The login lockout is per client again: `req.clientIp` is set on every request (#530; #528).
+- One LAN host can no longer hold every HTTP slot: read deadline + per-source cap (#534; #529).
+- A credentialed INVITE cannot be replayed to another destination (#555; #549).
+- In-dialog relays never carry the INVITE credential (#562; #560).
+- Unauthenticated `/api/status` no longer shows who is calling whom (#563; #539).
+- Web-login buckets never evict the DTMF PIN's lockout bucket (#569; #561).
+- A replayed digest nonce/nc is re-challenged, not admitted (#570; #525).
+- Digest nonces are stamped with the monotonic clock, so a wall-clock step cannot strand phones (#584).
+- The Wi-Fi SoftAP passphrase is drawn with the SAR ADC entropy source on (#590; #588).
+
+### Docs
+
+- Removed AI-writing tells across `docs/`; the landing page and flasher lose their design tells and show v1.4.1 as current stable, pointing at the v1.5.0 beta; beta.2 firmware published for the browser flasher.
+- A real phone number replaced with a fictitious example.
+- `Supported: replaces` over-claim stated honestly (#229).
+- `SipSdpMessage`'s shared-scratch invariant stated correctly (#274; #264).
+- THREAT_MODEL: #246's no-PIN voicemail tradeoff depends on registrar mode, not LAN position (#283).
+- README no longer claims OPTIONS is the only place UPDATE is advertised (#305).
+- Stale `drainOutbox` comment on what `maybeTrack` tracks fixed (#306).
+- ARCHITECTURE.md §1.2 Transaction-Layer Scope brought up to date with #226 (#307).
+- Shared-clone/worktree convention documented (#325).
+- 3CX Call Control API + WebSocket reference for the anchor leg (no hold exists) (#332).
+- The real rule for keeping test accessors out of firmware (#358).
+- Test-harness spec + stale case-count fixes (#359).
+- Agent commits credited by crew nickname in Co-Authored-By (#501; #326).
+- FEATURE_ROADMAP, ARCHITECTURE and the RFC map re-checked against main (#520; part of #401).
+- The caveats Train B and C2 retired (#557; #520 follow-up).
+- OTA never changes the partition table; read `coredump.supported` (#568; #514).
+- `SipSecretStore` RNG comments name the eth SAR ADC source (#586; #420).
+- Every `/api/status` field documented (#619).
+- Registrar default, G.722 advice and `/api/cdr` gating match the code (#626).
+- Learn mode does not lock unsecured extensions (#653).
+
+### CI, tests, tools and diagnostics
+
+- CI runs on every branch, not just main/master; later push CI runs on main only, PRs through `pull_request` (#414).
+- clang-tidy pinned with a baseline that means something (#262; #254); cheap findings cleaned up (#290); baseline re-pinned to 106 and checked both ways (#298; #292).
+- Anchor measures the two resources #273 suspects (#275).
+- CallForwardBusy tests hardened against register-beep collision (#286; #256 follow-up).
+- glolab post-merge verify's concurrency group is per-commit (#287).
+- MSVC's string-literal cap is enforced on the Linux runners (#289; #270).
+- Current-free and largest-block DRAM gauges on the API (#295; #273).
+- Heap-trace profile + leak probe (#310; #273); HeapLeakProbe's later manual dump is real (#347; #331).
+- Stray `export_output.log` removed and gitignored (#320).
+- Committed post-checkout hook warns when the shared clone leaves main (#334); it no longer no-ops on a path with a space (#335).
+- PR-scoped Claude-Session trailer guard + commit-msg hook (#339; #326); guard SIGPIPE false-negative and missing `edited` trigger fixed (#342).
+- Reset reason repeated on Heartbeat; `/api/status`'s field host-tested (#340).
+- Interop records #185 heap/stack telemetry (#346; #235 item 3).
+- Anchor's "did the server answer?" test made host-testable (#357; #349, #350).
+- Unified test harness (`tests/run.py`) and HIL CI pipeline (#360).
+- L2 TX path health on `/api/status` (#371; #328).
+- Interop teardown checks match `Allow:` headers and RTCP BYE (#376).
+- The T-7 call-graph guard is its own blocking job (#391; #361).
+- Interop reads pjsua logs from the offset `mark()` recorded (#392; #378); `mixed_stack` runs against Debian's baresip (#393; #377).
+- Panics write a 128 KB flash coredump, readable over `/api/coredump` (#394; #382).
+- `/api/status` reads a boot-time coredump cache, never the flash (#435; #405); reports `supported:false` with no coredump partition (#531; #514).
+- The real host test count is printed and gated on a checked-in floor (#404; #390); the floor is a base plus one contribution file per PR (#478; #467).
+- glolab Pi host build runs nightly and on demand, not on every merge (#406).
+- The interop suite runs on every pull request (#417; #377).
+- One shared counting `operator new` with per-thread deltas and positive controls (#426).
+- The nightly host build runs on the bigdog Hyper-V runner (#431).
+- Superseded `pull_request` runs are cancelled, never main's or a PR's current head (#432; #423).
+- One shared cppcheck invocation for the PR gate and the nightly (#442).
+- `packetsDropped` split by reason + allocation-free ring of recent drops (#447; #430).
+- Firmware is stamped with the commit it was built from (#461; #411).
+- Staged remote OTA with stop rules and a rollback probe (#491; #395).
+- The ESP matrix fails when an app slot has less than 32 KB free (#510; #489).
+- Commit-hygiene guard gaps 3, 4 and 6 closed; the hook is executable (#516; #341).
+- Anchor logs the first refused GET's status, URL and body once per stream (#519; #518).
+- Soak tools: a 1 Hz `/api/status` logger and a PASS/FAIL verdict (#537; #401).
+- Tests adapted to train C2 (#552).
+- WebHardening binds OS-assigned ports; a taken port is an error, not a crash (#579; #540).
+- Per-task static stack depth gate vs configured stack (#585; #457).
+- Blocking clang-tidy safety subset with per-check ratchet (#592; #372).
+- The handset's ACK disarming the anchor ACK deadline is pinned by a test (#597; #533).
+- Harness `same_commit` compares commit hashes, not describe strings (#607; #593).
+- The timeout-fail seam fails only the option a test asks for (#623; #616).
+- Per-route allocation gate with a calibrated allowlist (#627; #410).
+
 ## v1.5.0-beta.2 — 2026-09-14
 
 Still a beta. Twelve pull requests landed in one evening on top of beta.1, every
