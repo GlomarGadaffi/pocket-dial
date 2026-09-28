@@ -166,7 +166,14 @@ static int64_t decodeJwtLifetimeUs(const std::string& jwt)
 	return lifetimeUs;
 }
 
-TelephonyAnchorClient::TelephonyAnchorClient() = default;
+TelephonyAnchorClient::TelephonyAnchorClient()
+{
+	// Issue #479: each call slot's tel_media_rx stack + TCB, once, at boot (this object is a
+	// RequestsHandler member), so a call allocates no task. PSRAM first (the #100 audit: the rx
+	// task writes no flash), internal where there is none; a failed slot refuses its calls.
+	for (auto& s : _calls)
+		s.rxMem.alloc("tel_media_rx", 6144, PD_TASK_STACK_CAPS, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
 
 TelephonyAnchorClient::~TelephonyAnchorClient()
 {
@@ -776,7 +783,9 @@ pd::ReapDecision TelephonyAnchorClient::reapParkedRxLocked(CallSlot& slot)
 		haveHandle && eTaskGetState(slot.rxTaskHandle) == eSuspended);
 	if (d == pd::ReapDecision::Reap)
 	{
-		pd::deleteTask(slot.rxTaskHandle);   // parked: touches nothing, holds no lock
+		// #479: a static task on slot.rxMem; plain vTaskDelete frees nothing (pd::deleteTask would
+		// free the slot's memory), so the slot can host the next call's rx at once.
+		vTaskDelete(slot.rxTaskHandle);   // parked: touches nothing, holds no lock
 		slot.rxTaskHandle = nullptr;
 		_leakedGetClients.fetch_add(pd::detachCountDeltaOnReap(slot.rxDetached), std::memory_order_relaxed);
 	}
@@ -2907,8 +2916,11 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 	// so a PSRAM stack is safe. The task parks on exit and the owner reaps it (#553).
 	slot->stopRequested.store(false, std::memory_order_release);   // #553: a fresh task's stop flag
 	slot->rxRunning.store(true, std::memory_order_release);   // #554: before the task can exit
-	BaseType_t rc = pd::createTaskPreferPsram(&TelephonyAnchorClient::rxTaskTrampoline, "tel_media_rx", 6144, arg, 6, &slot->rxTaskHandle, 1);
-	if (rc != pdPASS)
+	// #479: on this slot's boot-allocated stack + TCB; a slot whose allocation failed refuses.
+	slot->rxTaskHandle = (slot->rxMem.stack == nullptr) ? nullptr
+		: xTaskCreateStaticPinnedToCore(&TelephonyAnchorClient::rxTaskTrampoline, "tel_media_rx",
+			slot->rxMem.bytes, arg, 6, slot->rxMem.stack, slot->rxMem.tcb, 1);
+	if (slot->rxTaskHandle == nullptr)
 	{
 		slot->rxRunning.store(false, std::memory_order_release);
 		ESP_LOGE(TAG, "Failed to create Rx task for %s", participantId.c_str());
@@ -3178,8 +3190,8 @@ void TelephonyAnchorClient::rxTaskTrampoline(void* arg)
 		xSemaphoreGive(slot->rxDoneSem);
 	}
 	// Issue #553 / #535: park; never self-delete. The owner reaps this task with
-	// pd::deleteTask() once pd::reapDecision() sees it suspended: one deleter, and no
-	// allocation on the exit path (self-deleting a WithCaps task allocates a helper task).
+	// vTaskDelete() once pd::reapDecision() sees it suspended: one deleter, and no
+	// allocation on the exit path. #479: the stack + TCB are the slot's, reused next call.
 	for (;;)
 	{
 		vTaskSuspend(nullptr);
