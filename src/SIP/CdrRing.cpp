@@ -41,6 +41,13 @@ namespace
 		static std::atomic<uint32_t> n{0};
 		return n;
 	}
+	// #594: boot-time NVS read failures in load(). The ring then starts empty
+	// and the first persist overwrites whatever history was stored.
+	std::atomic<uint32_t>& loadFailures()
+	{
+		static std::atomic<uint32_t> n{0};
+		return n;
+	}
 	std::atomic<uint32_t>& persistSuppressed()
 	{
 		static std::atomic<uint32_t> n{0};
@@ -343,6 +350,7 @@ CdrRing::PersistAction CdrRing::persistAction(bool incomingIsErase, bool resetIn
 }
 
 uint32_t CdrRing::persistFailureCount()   { return persistFailures().load(); }
+uint32_t CdrRing::loadFailureCount()      { return loadFailures().load(); }
 uint32_t CdrRing::persistSuppressedCount() { return persistSuppressed().load(); }
 
 size_t CdrRing::loadFromText(std::string_view text)
@@ -480,8 +488,16 @@ void CdrRing::load()
 	ensureWriterTaskStarted();
 
 	nvs_handle_t h;
-	if (nvs_open(NVS_CDR_NS, NVS_READWRITE, &h) != ESP_OK)
+	// #594: every read failure is counted (/api/status) and WARNed; before,
+	// a failed read was silent and the first call wiped the stored history.
+	const auto loadFailed = [](const char* what, esp_err_t err) {
+		loadFailures().fetch_add(1);
+		ESP_LOGW("CdrRing", "load: %s failed (%s) -- CDR history not restored", what, esp_err_to_name(err));
+	};
+	esp_err_t e = nvs_open(NVS_CDR_NS, NVS_READWRITE, &h);
+	if (e != ESP_OK)
 	{
+		loadFailed("nvs_open", e);
 		return;
 	}
 	// Issue #470: the blob first. If there is none yet, fall back ONCE to the
@@ -490,24 +506,31 @@ void CdrRing::load()
 	std::string buf;
 	bool migrate = false;
 	size_t len = 0;
-	esp_err_t e = nvs_get_blob(h, kBlobKey, nullptr, &len);
+	e = nvs_get_blob(h, kBlobKey, nullptr, &len);
 	if (e == ESP_OK && len > 0)
 	{
 		buf.resize(len);
-		if (nvs_get_blob(h, kBlobKey, buf.data(), &len) == ESP_OK) buf.resize(len);
-		else buf.clear();
+		e = nvs_get_blob(h, kBlobKey, buf.data(), &len);
+		if (e == ESP_OK) buf.resize(len);
+		else { buf.clear(); loadFailed("nvs_get_blob", e); }
 	}
-	else if (e == ESP_ERR_NVS_NOT_FOUND &&
-		nvs_get_str(h, kLegacyKey, nullptr, &len) == ESP_OK && len > 0)
+	else if (e == ESP_ERR_NVS_NOT_FOUND)
 	{
-		buf.resize(len);
-		if (nvs_get_str(h, kLegacyKey, buf.data(), &len) == ESP_OK)
+		e = nvs_get_str(h, kLegacyKey, nullptr, &len);
+		if (e == ESP_OK && len > 0)
 		{
-			if (!buf.empty() && buf.back() == '\0') buf.pop_back();
-			migrate = true;
+			buf.resize(len);
+			e = nvs_get_str(h, kLegacyKey, buf.data(), &len);
+			if (e == ESP_OK)
+			{
+				if (!buf.empty() && buf.back() == '\0') buf.pop_back();
+				migrate = true;
+			}
+			else { buf.clear(); loadFailed("nvs_get_str (legacy)", e); }
 		}
-		else buf.clear();
+		else if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) loadFailed("nvs_get_str (legacy)", e);
 	}
+	else if (e != ESP_OK) loadFailed("nvs_get_blob", e);
 	nvs_close(h);
 
 	loadFromText(buf);

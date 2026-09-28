@@ -1974,6 +1974,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// is NOT surviving reboots; suppressed counts writes refused mid-reset (#473).
 	json.s("\"cdrPersistFailures\":").n(CdrRing::persistFailureCount()).s(",");
 	json.s("\"cdrPersistSuppressed\":").n(CdrRing::persistSuppressedCount()).s(",");
+	json.s("\"cdrLoadFailures\":").n(CdrRing::loadFailureCount()).s(",");   // #594: load() read failures
 	json.s("\"packetsProcessed\":").n(packets).s(",");
 	json.s("\"packetsDropped\":").n(dropped).s(",");
 	// Issue #409: draws refused by a spent pool (neither has a heap fallback).
@@ -4386,7 +4387,10 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		// #473: the guard begun above still refuses new NVS data writes; drain any
 		// write already in flight (the CDR persist writer) before the partition is
 		// erased under it, as the DTMF door does.
-		(void)resetguard::waitForWritersIdle(500);
+		if (!resetguard::waitForWritersIdle(500))
+		{
+			ESP_LOGW("factory_reset", "an NVS writer was still busy after 500 ms; erasing anyway (#594)");
+		}
 		const esp_err_t eraseErr = nvs_flash_erase();
 		if (eraseErr != ESP_OK)
 		{

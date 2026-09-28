@@ -132,6 +132,8 @@ public:
 	// progress (#473). Always 0 on host, which has no writer. For /api/status.
 	static uint32_t persistFailureCount();
 	static uint32_t persistSuppressedCount();
+	// #594: NVS read failures in load() (the ring then starts empty). For /api/status.
+	static uint32_t loadFailureCount();
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only (#458): every slot, live or not, so a test can pin that
 	// clearAll() leaves none of them holding a record.
