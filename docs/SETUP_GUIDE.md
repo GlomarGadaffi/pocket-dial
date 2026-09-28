@@ -354,6 +354,18 @@ registered extension** at once, injecting auto-answer headers; the first device 
 - [ ] Dialed **`999`**, other phones paged.
 - [ ] Placed a direct `1001 → 1002` call, two-way audio.
 
+## 7. Optional: E911 notification and a carrier trunk
+
+**E911 notification.** Open **PBX Settings** (the **PBX** button or F6) →
+**E911 Notification**. Set the extensions to notify on site when somebody dials 911,
+the callback number and the location, then **Save**. The fields refill with what the
+server kept. A factory reset clears these, so set them again after one (#646).
+
+**Carrier trunk.** Configure it at `/setup/trunk`. A trunk with a password now
+REGISTERs with the carrier and answers a 401/407 with digest; an IP-authenticated
+trunk does not register (#615). Outbound calls over the trunk are still under
+investigation: the carrier accepts the REGISTER but does not answer the INVITE (#618).
+
 Next: [PHONE_COMPATIBILITY.md](PHONE_COMPATIBILITY.md) ·
 [HARDWARE_SELECTION.md](HARDWARE_SELECTION.md) ·
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) · [SCALING.md](SCALING.md)
