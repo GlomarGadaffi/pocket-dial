@@ -196,11 +196,10 @@ header (else `403`):
   `GET /api/registrar`, `GET /api/telephony-config`, `GET /api/did-mapping`,
   `GET /api/pcap`, `GET /api/trace`, `GET /api/diagnostics/pcap`, `GET /api/moh`.
 * Ungated, readable before you log in: `GET /`, `GET /api/status`,
-  `GET /api/cdr`, `GET /metrics`, `GET /api/wifi/scan`, `GET /api/ota/status`,
+  `GET /metrics`, `GET /api/wifi/scan`, `GET /api/ota/status`,
   `GET /config/<mac>.cfg`, and `GET /api/admin/status` (which is how the dashboard
-  decides whether to show you the login form or the setup form). Note `/api/cdr`
-  hands over the recent call log and `/api/status` the extension roster with each
-  handset's IP:port, see [THREAT_MODEL.md](THREAT_MODEL.md) §4 E-2.
+  decides whether to show you the login form or the setup form). `GET /api/cdr` is
+  read-gated since #207; see [THREAT_MODEL.md](THREAT_MODEL.md) §4 E-2.
 
 The forced-setup refusal sits on top of all of that: while `admin`/`admin` is
 still in place, **every one of the gated routes above (the read-only `GET`s
@@ -280,7 +279,7 @@ Steps:
 1. Open your SIP client and create a new account/identity.
 2. Enter server `192.168.4.1`, port `5060`, transport **UDP**.
 3. Choose an extension (e.g. `1001`) as the username.
-4. Restrict the codec list to **G.711 µ-law and a-law** (disable Opus, G.722, G.729).
+4. Keep **G.711 µ-law and a-law** in the codec list (disable Opus, G.729; G.722 can stay on).
 5. Save. The client should show "registered".
 6. Confirm on the dashboard: the extension appears in the `clients` list of
    [`GET /api/status`](API.md#get-apistatus).
