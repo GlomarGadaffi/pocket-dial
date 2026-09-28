@@ -110,17 +110,35 @@ namespace
 		return journalPartition(off) ? Storage::Flash : Storage::Rtc;
 	}
 
+	// Flash backend primitives: slot i of the journal sector (see loadSlots()).
+	bool slotRead(size_t i, Record& out)
+	{
+		size_t off = 0;
+		const esp_partition_t* p = journalPartition(off);
+		return p && esp_partition_read(p, off + i * sizeof(Record), &out, sizeof(out)) == ESP_OK;
+	}
+	bool slotWrite(size_t i, const Record& r)
+	{
+		size_t off = 0;
+		const esp_partition_t* p = journalPartition(off);
+		return p && esp_partition_write(p, off + i * sizeof(Record), &r, sizeof(r)) == ESP_OK;
+	}
+	bool sectorErase()
+	{
+		size_t off = 0;
+		const esp_partition_t* p = journalPartition(off);
+		return p && esp_partition_erase_range(p, off, kSector) == ESP_OK;
+	}
+
+	Read loadSlots(Record& out);
+	bool storeSlots(const Record* r);
+
 	Read load(Record& out)
 	{
 		// #481 review: a flash op from a PSRAM-stacked task is the #273 panic,
 		// and #480 is moving tasks to PSRAM -- fail loudly here instead.
 		PD_ASSERT_NOT_PSRAM_STACK();
-		size_t off = 0;
-		if (const esp_partition_t* p = journalPartition(off))
-		{
-			if (esp_partition_read(p, off, &out, sizeof(out)) != ESP_OK) return Read::Garbage;
-			return decode(out);
-		}
+		if (backend() == Storage::Flash) return loadSlots(out);
 		out = s_rtcRecord;
 		// Uninitialised RTC memory after a power cycle is random: for this
 		// backend anything that does not validate is simply "no record".
@@ -131,13 +149,7 @@ namespace
 	bool store(const Record* r)   // nullptr = erase
 	{
 		PD_ASSERT_NOT_PSRAM_STACK();   // see load()
-		size_t off = 0;
-		if (const esp_partition_t* p = journalPartition(off))
-		{
-			// Raw partition discipline (partitions.csv): erase before write.
-			if (esp_partition_erase_range(p, off, kSector) != ESP_OK) return false;
-			return r == nullptr || esp_partition_write(p, off, r, sizeof(*r)) == ESP_OK;
-		}
+		if (backend() == Storage::Flash) return storeSlots(r);
 		if (r) s_rtcRecord = *r;
 		else std::memset(&s_rtcRecord, 0, sizeof(s_rtcRecord));
 		return true;
@@ -145,35 +157,87 @@ namespace
 
 	void warn(const char* msg) { ESP_LOGW(TAG, "%s", msg); }
 #else
-	Record s_hostRecord;
-	bool   s_hostHasRecord = false;
-	bool   s_hostFailNextStore = false;
+	// The host models the flash sector: kSlots records, 0xFF when erased.
+	Record s_hostSlots[0x1000 / sizeof(Record)];
+	bool   s_hostErased = false;   // lazily: static init order vs. first use
+	bool   s_hostFailNextWrite = false;
 
 	Storage backend() { return Storage::Flash; }   // host models the flash backend
 
-	Read load(Record& out)
+	bool sectorErase()
 	{
-		if (!s_hostHasRecord)
-		{
-			std::memset(&out, 0xFF, sizeof(out));
-			return Read::Absent;
-		}
-		out = s_hostRecord;
-		return decode(out);
-	}
-
-	bool store(const Record* r)
-	{
-		if (s_hostFailNextStore) { s_hostFailNextStore = false; return false; }
-		if (r) { s_hostRecord = *r; s_hostHasRecord = true; }
-		else   { s_hostHasRecord = false; }
+		std::memset(s_hostSlots, 0xFF, sizeof(s_hostSlots));
+		s_hostErased = true;
 		return true;
 	}
+	bool slotRead(size_t i, Record& out)
+	{
+		if (!s_hostErased) sectorErase();
+		out = s_hostSlots[i];
+		return true;
+	}
+	bool slotWrite(size_t i, const Record& r)
+	{
+		if (s_hostFailNextWrite) { s_hostFailNextWrite = false; return false; }
+		if (!s_hostErased) sectorErase();
+		s_hostSlots[i] = r;
+		return true;
+	}
+
+	Read loadSlots(Record& out);
+	bool storeSlots(const Record* r);
+	Read load(Record& out) { return loadSlots(out); }
+	bool store(const Record* r) { return storeSlots(r); }
 
 	void warn(const char* msg) { std::cerr << "[W] ResetJournal: " << msg << std::endl; }
 
 	void (*s_loadHook)() = nullptr;
 #endif
+
+	// #595 item 2: the flash journal is APPEND-ONLY within its sector. A write
+	// goes to the first erased 16-byte slot and the newest record is the last
+	// written slot, so a record is never erased before the one replacing it is
+	// on flash -- a crash mid-write leaves the previous record (or a torn,
+	// Unreadable one), never "clean". Only a clean finish() erases the sector.
+	constexpr size_t kSlots = 0x1000 / sizeof(Record);   // 256
+
+	// Index of the first erased slot (kSlots if the sector is full), or -1 on a
+	// read error.
+	long firstFreeSlot()
+	{
+		Record r{};
+		for (size_t i = 0; i < kSlots; ++i)
+		{
+			if (!slotRead(i, r)) return -1;
+			if (decode(r) == Read::Absent) return static_cast<long>(i);
+		}
+		return static_cast<long>(kSlots);
+	}
+
+	Read loadSlots(Record& out)
+	{
+		const long n = firstFreeSlot();
+		if (n < 0) return Read::Garbage;
+		if (n == 0) { std::memset(&out, 0xFF, sizeof(out)); return Read::Absent; }
+		if (!slotRead(static_cast<size_t>(n - 1), out)) return Read::Garbage;
+		return decode(out);
+	}
+
+	bool storeSlots(const Record* r)   // nullptr = erase
+	{
+		if (r == nullptr) return sectorErase();
+		long n = firstFreeSlot();
+		if (n < 0) return false;
+		if (n == static_cast<long>(kSlots))
+		{
+			// ponytail: the sector is full only after 256 records with no clean
+			// reset between them; then the old erase-then-write window returns
+			// for this one write. Upgrade path: a second sector, ping-ponged.
+			if (!sectorErase()) return false;
+			n = 0;
+		}
+		return slotWrite(static_cast<size_t>(n), *r);
+	}
 
 	struct Cache
 	{
@@ -201,7 +265,12 @@ namespace
 	class LoadLock
 	{
 	public:
-		LoadLock() { xSemaphoreTake(handle(), portMAX_DELAY); }
+		LoadLock()
+		{
+			const BaseType_t taken = xSemaphoreTake(handle(), portMAX_DELAY);
+			configASSERT(taken == pdTRUE);   // #595: portMAX_DELAY never times out; a failure is a bug
+			(void)taken;
+		}
 		~LoadLock() { xSemaphoreGive(handle()); }
 	private:
 		static SemaphoreHandle_t handle()
@@ -270,13 +339,21 @@ namespace
 		}
 		c.loaded = true;   // last: a racing caller waits on the mutex, never sees a half-loaded cache
 	}
+
+	// #595 item 4: the sequence number is bumped under the same lock as the load.
+	uint32_t nextSeq()
+	{
+		ensureLoaded();
+		LoadLock lock;
+		return ++cache().seq;
+	}
 }
 
 bool begin()
 {
 	ensureLoaded();   // capture what THIS boot found before overwriting it
 	ramMask().store(0);
-	const Record r = make(Stage::Begun, 0, ++cache().seq);
+	const Record r = make(Stage::Begun, 0, nextSeq());
 	if (store(&r)) return true;
 	// The reset still proceeds -- refusing to wipe secrets because the journal
 	// could not be written would be the worse failure. It is logged and counted.
@@ -303,7 +380,7 @@ void finish(uint8_t extraMask)
 		}
 		return;
 	}
-	const Record r = make(Stage::Failed, mask, ++cache().seq);
+	const Record r = make(Stage::Failed, mask, nextSeq());
 	if (!store(&r))
 	{
 		writeFailures().fetch_add(1);
@@ -358,14 +435,20 @@ void simulateRebootForTest()
 void resetForTest()
 {
 	simulateRebootForTest();
-	s_hostHasRecord = false;
-	s_hostFailNextStore = false;
+	sectorErase();
+	s_hostFailNextWrite = false;
 	writeFailures().store(0);
 }
 
 Stage storedStageForTest()
 {
-	return s_hostHasRecord ? static_cast<Stage>(s_hostRecord.stage) : Stage::None;
+	Record r{};
+	switch (loadSlots(r))
+	{
+		case Read::Valid:   return static_cast<Stage>(r.stage);
+		case Read::Garbage: return Stage::Unreadable;
+		default:            return Stage::None;
+	}
 }
 
 void setLoadHookForTest(void (*hook)())
@@ -375,13 +458,16 @@ void setLoadHookForTest(void (*hook)())
 
 void failNextWriteForTest()
 {
-	s_hostFailNextStore = true;
+	s_hostFailNextWrite = true;
 }
 
 void corruptRecordForTest()
 {
-	std::memset(&s_hostRecord, 0x5A, sizeof(s_hostRecord));
-	s_hostHasRecord = true;
+	// Over the newest record, or slot 0 on an empty sector.
+	const long n = firstFreeSlot();
+	Record junk;
+	std::memset(&junk, 0x5A, sizeof(junk));
+	slotWrite(n > 0 ? static_cast<size_t>(n - 1) : 0, junk);
 }
 #endif
 }

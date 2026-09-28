@@ -13,7 +13,12 @@
 //   noteFailure(m)   any step that fails ORs its bit into a RAM mask;
 //   finish(extra)    last thing before the restart: if nothing failed, the
 //                    record is ERASED (a clean board has no record at all);
-//                    otherwise it is rewritten as "reset failed" + the mask.
+//                    otherwise "reset failed" + the mask is written.
+// On flash every write APPENDS to the next erased 16-byte slot of the sector
+// and the newest slot wins (#595): a record is never erased before the one
+// that replaces it is written, so a crash between the two cannot read back as
+// "clean". Only a clean finish() erases the sector. (Once 256 records pile up
+// with no clean reset, the next write erases first -- see storeSlots().)
 // So on the next boot a record means either the reset was interrupted after
 // begin() (stage Begun: power cut, crash, a hung restart task) or it finished
 // with failures (stage Failed). It stays until the next reset that completes
@@ -86,7 +91,7 @@ namespace resetjournal
 	void resetForTest();
 	// Write raw bytes over the record (a torn or corrupt write).
 	void corruptRecordForTest();
-	// The next record write/erase fails, as a flash error would.
+	// The next record write fails, as a flash error would (an erase does not).
 	void failNextWriteForTest();
 	// Called inside the one-time boot-status load, before the record is read,
 	// so a test can make a second thread ask for bootStatus() mid-load (#481).

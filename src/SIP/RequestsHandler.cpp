@@ -11,6 +11,9 @@
 #include <algorithm>
 #include "SipMessageTypes.h"
 #include "SipSdpMessage.hpp"
+#if defined(ESP_PLATFORM)
+#include "esp_log.h"   // #533 diag: queueLog() prints to stdout, which syslog never sees
+#endif
 #include "IDGen.hpp"
 #include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include <cstdio>             // #463: snprintf for the OPTIONS ping and snapshot ip:port
@@ -165,6 +168,22 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// once here and never changed -- the listener is this object, which outlives
 	// the trunk it is handed to.
 	_sipTrunk.setListener(this);
+
+	// Issue #479: the conference room is built HERE, at boot, so its legs'
+	// RTP task slots (RtpSender/RtpReceiver stacks + TCBs) are allocated at
+	// init, never on the first 888 dial-in. Its mix-tick driver still starts
+	// on the first dial-in (onConferenceInvite), as before. POCKETDIAL_CONFERENCE=0
+	// (SIP_CONSTRAINED, no PSRAM) builds no room: 888 is refused.
+#if POCKETDIAL_CONFERENCE
+	_conference = std::make_unique<ConferenceRoom>();
+	// Issue #199 item 3: give every leg a way to hand an RFC 4733 key press
+	// back to the engine. Invoked on that leg's RTP receive task, so it goes
+	// to queueDtmfDigit(), which is the one entry point here built to be
+	// called without _mutex held.
+	_conference->setDigitSink([this](std::string_view legCallId, char digit) {
+		queueDtmfDigit(legCallId, digit);
+	});
+#endif
 
 	// Pre-allocate pools (Issue #53). Capacities are compile-time tunable via
 	// PoolConfig.hpp (-DPOCKETDIAL_MAX_* overrides); defaults preserve 32/8/32.
@@ -2617,6 +2636,14 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 			+ std::string(data->getFromNumber()), true);
 	};
 
+	// #479: no room on this build (POCKETDIAL_CONFERENCE=0, SIP_CONSTRAINED). 403, as
+	// the other feature-off answer here ("voicemail not enabled"); refuse() logs it.
+	if (!_conference)
+	{
+		refuse("SIP/2.0 403 Forbidden", "conference disabled on this build");
+		return;
+	}
+
 	// Issue #304: conference mixing only understands PCMU -- RtpReceiver.cpp
 	// only recognizes PAYLOAD_TYPE_PCMU as audio; anything else (PCMA
 	// included) falls through to the DTMF-event check and is dropped. Same
@@ -2637,23 +2664,19 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 
-	// The room (and its single mix-tick driver) is built on the first dial-in and then
-	// kept for the life of the process: standing the tick task up and down underneath
-	// legs whose RTP tasks may still be in flight is exactly the teardown race the bus's
-	// Draining state exists to avoid. Idle cost is the bus rings; see PoolConfig.hpp.
-	if (!_conference)
+	// The room is built at boot (constructor, #479); its single mix-tick driver starts
+	// on the first dial-in and is then kept for the life of the process: standing the
+	// tick task up and down underneath legs whose RTP tasks may still be in flight is
+	// exactly the teardown race the bus's Draining state exists to avoid. startDriver()
+	// is a no-op once running, so calling it on every dial-in also retries a failed start.
+	_conference->startDriver();
+	// #479 review: no driver means no tick, so no port ever leaves Draining and every
+	// leg would be dead air. Refuse before a leg or session is taken; the next 888
+	// retries the start.
+	if (!_conference->driverRunning())
 	{
-		_conference = std::make_unique<ConferenceRoom>();
-		// Issue #199 item 3: give every leg a way to hand an RFC 4733 key press
-		// back to the engine. Invoked on that leg's RTP receive task, so it goes
-		// to queueDtmfDigit(), which is the one entry point here built to be
-		// called without _mutex held.
-		_conference->setDigitSink([this](std::string_view legCallId, char digit) {
-			queueDtmfDigit(legCallId, digit);
-		});
-		_conference->startDriver();
-		queueLog("888 conference: room created (" + std::to_string(ConferenceRoom::MAX_LEGS)
-			+ " legs, " + std::to_string(ConferenceRoom::TICK_MS) + " ms mix tick)");
+		refuse("SIP/2.0 503 Service Unavailable", "conference mix tick could not be started");
+		return;
 	}
 
 	// Join first: a full room must not consume a session slot. The leg index is also
@@ -7168,6 +7191,15 @@ bool RequestsHandler::setCallState(std::string_view callID, Session::State state
 
 void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason)
 {
+#if defined(ESP_PLATFORM)
+	// #533 diag: every session teardown funnels through here, and its reason
+	// names the path (reap, audio write failure, session timer, BYE, CANCEL...).
+	// esp_log, not queueLog: queueLog goes to stdout, which syslog never carries.
+	// No numbers: dest can be a dialed PSTN number, which stays out of logs.
+	ESP_LOGW("pbx", "endCall %.*s reason=%.*s",
+		static_cast<int>(callID.size()), callID.data(),
+		static_cast<int>(reason.size()), reason.data());
+#endif
 	// DTMF accumulators are keyed by Call-ID and share the dialog lifecycle; drop
 	// this dialog's entry so DtmfFeatureCodes's _dtmfState can't grow unbounded
 	// across calls (Fix #4).
@@ -7469,6 +7501,27 @@ void RequestsHandler::sweepExpired()
 		bool keepAliveTimedOut = (now - client->getLastActiveTime() > std::chrono::seconds(15));
 		bool leaseExpired = client->isExpired(now);
 
+		// Issue #533: a phone mid-call that does not answer our OPTIONS pings (RTP
+		// does not count as activity) was pruned 15 s after its last SIP packet,
+		// and its sessions erased below with no endCall() and no BYE: the anchor
+		// leg dropped, the handset kept a dead call and its later BYE drew 404.
+		// A missed keepalive alone no longer prunes a client that is in a call;
+		// an expired lease still does.
+		if (keepAliveTimedOut && !leaseExpired)
+		{
+			bool inCall = false;
+			for (const auto& [cid, s] : _sessions)
+			{
+				if ((s->getSrc() && s->getSrc()->getNumber() == client->getNumber()) ||
+				    (s->getDest() && s->getDest()->getNumber() == client->getNumber()))
+				{
+					inCall = true;
+					break;
+				}
+			}
+			if (inCall) continue;
+		}
+
 		if (keepAliveTimedOut || leaseExpired)
 		{
 			if (keepAliveTimedOut)
@@ -7480,36 +7533,27 @@ void RequestsHandler::sweepExpired()
 				queueLog("Registration lease expired: " + client->getNumber());
 			}
 
-			// Clean up sessions involving this client
-			std::string extension = client->getNumber();
-			for (auto sit = _sessions.begin(); sit != _sessions.end(); )
+			// Issue #533 (#603 review): end this client's calls through endCall(),
+			// not a hand-rolled erase, so the far leg is hung up (trunk BYE), relays
+			// and bridges are released and the CDR is written -- the same teardown
+			// every other path gets. Call-IDs are collected first: endCall() erases
+			// from _sessions.
+			const std::string extension = client->getNumber();
+			std::vector<std::pair<std::string, std::string>> ending;   // {callID, other party}
+			for (const auto& [cid, s] : _sessions)
 			{
-				bool involved = false;
-				if (sit->second->getSrc() && sit->second->getSrc()->getNumber() == extension)
-					involved = true;
-				if (sit->second->getDest() && sit->second->getDest()->getNumber() == extension)
-					involved = true;
-				if (involved)
+				const bool isSrc = s->getSrc() && s->getSrc()->getNumber() == extension;
+				const bool isDest = s->getDest() && s->getDest()->getNumber() == extension;
+				if (isSrc || isDest)
 				{
-					std::string callID = sit->first;
-					// Media beachhead: if this dialog owned the live RTP tone stream,
-					// stop it so a caller whose lease expires mid-stream doesn't leak
-					// the socket/task. Idempotent no-op otherwise.
-					_rtpSender.stop(callID);
-					sit = _sessions.erase(sit);
-					for (auto& session : _sessionPool)
-					{
-						if (session->getCallID() == callID)
-						{
-							session->release();
-							break;
-						}
-					}
+					const auto& other = isSrc ? s->getDest() : s->getSrc();
+					ending.emplace_back(cid, other ? other->getNumber() : std::string());
 				}
-				else
-				{
-					++sit;
-				}
+			}
+			for (const auto& [cid, other] : ending)
+			{
+				endCall(cid, extension, other, leaseExpired ? "registration lease expired"
+				                                            : "missed OPTIONS keepalive pings");
 			}
 
 			client->release();

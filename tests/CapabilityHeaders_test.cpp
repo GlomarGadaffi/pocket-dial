@@ -317,6 +317,54 @@ TEST(CapabilityHeaders, AnAuthoredInviteAnswerCarriesAllowSoUpdateIsReachable)
 		<< "Content-Length must still match the body after the headers were added";
 }
 
+// #479 review: if the mix tick cannot start, no port ever leaves Draining, so a
+// leg answered 200 would be dead air. The 888 must be 503 and take no leg.
+TEST(CapabilityHeaders, ConferenceWithoutAMixTickIsRefused503AndTakesNoLeg)
+{
+	Outbox sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) {
+			sent.emplace_back(a, std::move(m));
+		});
+	ASSERT_NE(handler.conferenceForTest(), nullptr) << "the room is built at boot";
+	handler.conferenceForTest()->failDriverStartForTest(true);
+
+	const std::string ext(ConferenceRoom::EXT);
+	handler.handle(makeRegister("414", "192.168.41.14", "reg-414"));
+	sent.clear();
+	handler.handle(makeInvite("414", ext, "192.168.41.14", "conf-nodriver"));
+
+	EXPECT_FALSE(firstWithStartLine(sent, "SIP/2.0 503").empty());
+	EXPECT_TRUE(firstWithStartLine(sent, "SIP/2.0 200 OK").empty());
+	EXPECT_EQ(handler.conferenceForTest()->legCount(), 0);
+
+	// The next 888 retries the start and is answered.
+	handler.conferenceForTest()->failDriverStartForTest(false);
+	sent.clear();
+	handler.handle(makeInvite("414", ext, "192.168.41.14", "conf-retry"));
+	EXPECT_FALSE(firstWithStartLine(sent, "SIP/2.0 200 OK").empty());
+}
+
+// #479 (desmo): a SIP_CONSTRAINED build (POCKETDIAL_CONFERENCE=0) builds no room;
+// 888 is refused 403, like the other feature-off answer (voicemail not enabled).
+TEST(CapabilityHeaders, ConferenceOffOnThisBuildRefuses888With403)
+{
+	Outbox sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) {
+			sent.emplace_back(a, std::move(m));
+		});
+	handler.dropConferenceForTest();
+
+	const std::string ext(ConferenceRoom::EXT);
+	handler.handle(makeRegister("415", "192.168.41.15", "reg-415"));
+	sent.clear();
+	handler.handle(makeInvite("415", ext, "192.168.41.15", "conf-off"));
+
+	EXPECT_FALSE(firstWithStartLine(sent, "SIP/2.0 403").empty());
+	EXPECT_TRUE(firstWithStartLine(sent, "SIP/2.0 200 OK").empty());
+}
+
 // ── The boundary: never stamp our capabilities onto someone else's message ───
 
 TEST(CapabilityHeaders, ARelayedAnswerKeepsTheCalleesOwnCapabilities)

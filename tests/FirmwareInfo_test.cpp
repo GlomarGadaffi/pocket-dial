@@ -175,6 +175,15 @@ TEST_F(FirmwareStatusTest, StatusCarriesTheVersionToAnUnauthenticatedCaller)
 		<< "the ESP-IDF fallback must never reach /api/status";
 }
 
+// #594: a CDR load() read failure was silent. /api/status now counts it.
+TEST_F(FirmwareStatusTest, StatusCarriesTheCdrLoadFailureCount)
+{
+	const std::string body = bodyOf(httpGet(_port, "/api/status"));
+	EXPECT_NE(body.find("\"cdrPersistFailures\":0"), std::string::npos) << "control: sibling counter present: " << body;
+	EXPECT_NE(body.find("\"cdrLoadFailures\":0"), std::string::npos)
+		<< "cdrLoadFailures missing from /api/status: " << body;
+}
+
 TEST_F(FirmwareStatusTest, StatusDisclosesOnlyTheVersionString)
 {
 	// Public, so it carries the version and NOTHING else about the build: no
