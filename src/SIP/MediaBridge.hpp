@@ -159,6 +159,9 @@ public:
 	// tick() watches it for change to end a call whose handset went silent
 	// with no BYE. Wraps.
 	uint32_t handsetRtpPackets() const { return _handsetRtpPackets.load(std::memory_order_relaxed); }
+	// #604: anchor audio chunks feedRx() has taken for this bridge -- the
+	// anchor leg's side of the same watch. Wraps.
+	uint32_t anchorRxChunks() const { return _anchorRxChunks.load(std::memory_order_relaxed); }
 
 	// Issue #218: HoldMusic's tap target while held (ANCHOR mode only) —
 	// decodes one tick's worth of the shared clip and hands it to the anchor
@@ -290,6 +293,7 @@ private:
 	// atomically WITH anything else.
 	std::atomic<bool> _held{false};
 	std::atomic<uint32_t> _handsetRtpPackets{0};   // #604, see handsetRtpPackets()
+	std::atomic<uint32_t> _anchorRxChunks{0};      // #604, see anchorRxChunks()
 	// The tap id addTap() returned, or -1 when not tapped in. Only ever
 	// touched from setHeld(), which the SIP thread calls under _mutex
 	// (RequestsHandler's engine lock, not this class's own _mutex) — same

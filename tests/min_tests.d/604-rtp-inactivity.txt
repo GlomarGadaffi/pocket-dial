@@ -1,2 +1,2 @@
-# #604: TrunkWiring (2), AnchorRouting (1)
-3
+# #604: TrunkWiring (3), AnchorRouting (1)
+4

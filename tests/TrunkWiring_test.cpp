@@ -740,7 +740,7 @@ TEST(TrunkWiring, ACarrierRefusalAfterEarlyMediaRefusesTheHandsetAndFreesTheRela
 
 // ── Issue #604: RTP inactivity ends a call whose media stopped with no BYE ──
 
-TEST(TrunkWiring, ATrunkCallWhoseHandsetLegGoesSilentIsEndedAfterTheInactivityTimeout)
+TEST(TrunkWiring, ATrunkCallWhoseLegsBothGoSilentIsEndedAfterTheInactivityTimeout)
 {
 	Bench b;
 	b.handler.setTrunkConfig(trunkConfig());
@@ -764,9 +764,8 @@ TEST(TrunkWiring, ATrunkCallWhoseHandsetLegGoesSilentIsEndedAfterTheInactivityTi
 	ASSERT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "a call with media both ways is live";
 	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
 
-	// The phone loses power: the carrier keeps sending, the handset leg is dead.
+	// The phone loses power and the carrier goes quiet: both legs dead for 61 s.
 	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
-	ASSERT_TRUE(b.handler.trunkRtpForTest(id, /*fromCarrier=*/true));
 	b.handler.forceNextTickForTest();
 	b.sent.clear();
 	b.handler.tick();
@@ -775,6 +774,35 @@ TEST(TrunkWiring, ATrunkCallWhoseHandsetLegGoesSilentIsEndedAfterTheInactivityTi
 	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u) << "and the handset told, best effort";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and the relay pair released";
 	EXPECT_FALSE(b.handler.getSession(id).has_value());
+}
+
+TEST(TrunkWiring, ATrunkCallWithOneLegSilentAndTheOtherTalkingStaysUp)
+{
+	// CaveJay on #612: one silent leg is a healthy call (a VAD-silent listener,
+	// far-end hold, mute). Only BOTH legs silent ends it.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-604c"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+	const std::string id = "Call-ID: call-604c";
+	auto session = b.handler.getSession(id);
+	ASSERT_TRUE(session.has_value());
+	b.handler.tick();   // arms the watch
+
+	for (bool fromCarrier : {true, false})
+	{
+		session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+		ASSERT_TRUE(b.handler.trunkRtpForTest(id, fromCarrier));
+		b.handler.forceNextTickForTest();
+		b.sent.clear();
+		b.handler.tick();
+		ASSERT_TRUE(b.handler.getSession(id).has_value())
+			<< "only the " << (fromCarrier ? "carrier" : "handset") << " leg talked; the call stays up";
+		ASSERT_EQ(b.countWithTo("BYE", kSbcIp), 0u);
+	}
 }
 
 TEST(TrunkWiring, AnEmergencyCallIsNeverEndedForRtpSilence)

@@ -116,13 +116,14 @@ public:
 
 	// Issue #604: RTP inactivity watch. `legA`/`legB` are the received-packet
 	// counters of the call's two relayed legs (pass one counter twice for a
-	// one-leg bridge). The clock restarts whenever BOTH legs have received
-	// since the last restart, so one dead leg is enough to run it out. Returns
+	// one-leg bridge). The clock restarts whenever EITHER leg has received
+	// since the last restart, so only BOTH legs silent runs it out: one quiet
+	// leg (VAD-silent listener, far-end hold, mute) is a healthy call. Returns
 	// how long it has run. disarmRtpWatch() restarts it from the next call.
 	std::chrono::steady_clock::duration rtpSilence(uint32_t legA, uint32_t legB,
 		std::chrono::steady_clock::time_point now)
 	{
-		if (!_rtpWatchArmed || (legA != _rtpMarkA && legB != _rtpMarkB))
+		if (!_rtpWatchArmed || (legA != _rtpMarkA || legB != _rtpMarkB))
 		{
 			_rtpWatchArmed = true;
 			_rtpMarkA = legA;

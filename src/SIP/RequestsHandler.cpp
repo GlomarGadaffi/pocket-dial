@@ -8962,10 +8962,11 @@ void RequestsHandler::tick()
 		// Issue #604: RTP inactivity. A relayed call whose media stops with no
 		// SIP BYE (the phone lost power or left the LAN, the far end vanished)
 		// was held until the registration lease ran out -- up to an hour of a
-		// session, a relay pair and a billed carrier leg. End it once either
-		// relayed leg has received nothing for kRtpInactivityTimeout.
+		// session, a relay pair and a billed carrier leg. End it once BOTH
+		// relayed legs have received nothing for kRtpInactivityTimeout; one
+		// quiet leg (VAD-silent listener, far-end hold, mute) is a live call.
 		// Only legs the board relays can be watched: a trunk call's two
-		// receivers and an anchor bridge's handset leg. Exempt: Held calls
+		// receivers and an anchor bridge's handset RTP + anchor audio. Exempt: Held calls
 		// (a sendonly/inactive leg legitimately sends nothing; the watch
 		// restarts on resume) and 911/933 (see Session::isEmergency()).
 		std::vector<std::string> silentCallIds;
@@ -8993,7 +8994,8 @@ void RequestsHandler::tick()
 					if (mb.isForCallId(callID)) { b = &mb; break; }
 				}
 				if (!b || !b->isActive()) continue;
-				legA = legB = b->handsetRtpPackets();
+				legA = b->handsetRtpPackets();
+				legB = b->anchorRxChunks();
 			}
 			else
 			{

@@ -1262,6 +1262,15 @@ TEST(AnchorRouting, AnAnchorCallWhoseHandsetGoesSilentIsEndedButNeverWhileHeld)
 	handler.tick();
 	ASSERT_TRUE(handler.getSession(id).has_value()) << "a talking handset is live";
 
+	// CaveJay on #612: a silent handset whose anchor side still talks (a
+	// VAD-silent listener) is live too -- only both legs silent ends it.
+	const int16_t pcm[160] = {};
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	ASSERT_TRUE(bridge->feedRx(bridge->participantId(), pcm, 160));
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_TRUE(handler.getSession(id).has_value()) << "anchor audio alone keeps the call";
+
 	// The handset goes silent for 61 s: ended, bridge released, handset BYEd.
 	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
 	handler.forceNextTickForTest();
