@@ -1564,6 +1564,10 @@ void TelephonyAnchorClient::tick()
 			ESP_LOGE(TAG, "tick: failed to spawn anchor-restart worker");
 			_restartInFlight.store(false, std::memory_order_release);
 		}
+		else
+		{
+			psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
+		}
 	}
 
 	// ── #107: idle TLS re-warm heartbeat ─────────────────────────────────────────
@@ -1607,6 +1611,10 @@ void TelephonyAnchorClient::tick()
 			{
 				ESP_LOGE(TAG, "tick: failed to spawn TLS re-warm worker");
 				_rewarmInFlight.store(false, std::memory_order_release);
+			}
+			else
+			{
+				psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 			}
 		}
 	}
@@ -1654,6 +1662,10 @@ void TelephonyAnchorClient::tick()
 		// Rare error path (not the hot path): release the slot, else the watchdog wedges forever.
 		ESP_LOGE(TAG, "tick: failed to spawn reconcile worker");
 		_reconcileInFlight.store(false, std::memory_order_release);
+	}
+	else
+	{
+		psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 	}
 }
 
