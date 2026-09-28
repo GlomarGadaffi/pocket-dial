@@ -52,21 +52,31 @@ def host_env():
 _HEX_HASH = re.compile(r"^[0-9a-f]{7,40}$")
 
 
-def same_commit(board_ver, describe):
+def same_commit(board_ver, describe, rev_parse=None):
     """True only when the board's stamp names the checkout's commit (#461 review).
 
-    Exact match, or -- for cmake/FirmwareVersion.cmake's short-hash fallback past
-    the app descriptor's 31 chars -- a >= 7-char hash that is a prefix of the
-    describe's -g<hash> (or of a bare-hash describe). Never a substring either
-    way: "v1.6.0" is a different commit from "v1.6.0-7-gabc1234".
+    Compares COMMITS, not describe strings (#593): each side resolves to a hash --
+    its -g<hash> suffix, a bare >= 7-char hash (cmake/FirmwareVersion.cmake's
+    short-hash fallback past the app descriptor's 31 chars), or, for an exact
+    tag, rev_parse(tag) -- and the shorter must prefix the longer. So a board
+    stamped "v1.5.0-beta.2-104-g8d76d64" matches a checkout that now describes
+    as "v1.5.0-rc.1" on that same commit. Never a substring: "v1.6.0" is a
+    different commit from "v1.6.0-7-gabc1234" unless the tag resolves to it.
     """
     if board_ver == describe:
         return True
-    if not _HEX_HASH.match(board_ver):
-        return False
-    m = re.search(r"-g([0-9a-f]{7,40})$", describe)
-    dh = m.group(1) if m else (describe if _HEX_HASH.match(describe) else None)
-    return dh is not None and (dh.startswith(board_ver) or board_ver.startswith(dh))
+
+    def commit_of(ver):
+        if _HEX_HASH.match(ver):
+            return ver
+        m = re.search(r"-g([0-9a-f]{7,40})$", ver)
+        if m:
+            return m.group(1)
+        h = rev_parse(ver) if rev_parse else None
+        return h if h and _HEX_HASH.match(h) else None
+
+    bh, dh = commit_of(board_ver), commit_of(describe)
+    return bh is not None and dh is not None and (dh.startswith(bh) or bh.startswith(dh))
 
 class HarnessError(Exception):
     """Exit code 2: target unreachable, lock held, provenance mismatch, etc."""
@@ -131,6 +141,14 @@ class Harness:
         except Exception:
             describe = sha[:7]
         return sha, describe
+
+    def _rev_parse(self, name):
+        """Commit hash an exact tag names, or None (#593)."""
+        try:
+            return subprocess.check_output(["git", "rev-parse", "--verify", "-q", name + "^{commit}"],
+                                           cwd=self.root_dir, text=True, stderr=subprocess.DEVNULL).strip()
+        except Exception:
+            return None
 
     def _init_results_dir(self, custom_out):
         if custom_out:
@@ -466,7 +484,7 @@ class Harness:
         if commit_ver != board_ver:
             suite_log.append(f"board runs a dirty build of '{commit_ver}' (uncommitted changes)")
         if self.git_describe:
-            if not same_commit(commit_ver, self.git_describe):
+            if not same_commit(commit_ver, self.git_describe, self._rev_parse):
                 # WARN, not FAIL: hil-244 cannot flash yet (#338), so the board is
                 # expected to run an older build than the checkout. Becomes FAIL
                 # once board-flash runs before board-smoke.
