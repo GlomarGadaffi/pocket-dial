@@ -877,14 +877,36 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `httpReadDeadlineDrops` | Integer | HTTP connections dropped because the request (headers + buffered body) did not arrive within 10 s of the accept (#529), or whose receive timeout could not be set at all (#534; closed unread rather than left to block). A climbing count means a slow or hostile client. |
 | `httpPerSourceRefusals` | Integer | HTTP connections refused `503` because one source address already held 3 of the 4 connection slots (#529). |
 | `httpStatusRefusals` | Integer | `/api/status` responses refused `500` because the body did not fit its fixed per-connection buffer (24 KB x 4; 16 KB x 2 without PSRAM, where a third concurrent poll gets the `503`), or `503` because that buffer failed to allocate at boot (#410). Never truncated. |
-| `memory.dynamicTaskCreates` | Integer | (#479) Tasks created with a heap stack and TCB since boot: every `pd::createTaskPreferPsram()` task plus the media call path's `conf_mix_tick` and `moh_tx`. RTP media tasks run on boot-preallocated stacks and are not counted. Read it before and after a call; the difference is the call path's dynamic task creation (0 for an ordinary extension-to-extension call). |
+| `memory.dynamicTaskCreates` | Integer | (#479) Tasks created with a heap stack and TCB since boot: every `pd::createTaskPreferPsram()` task plus the media call path's `conf_mix_tick` and `moh_tx`. RTP media tasks run on boot-preallocated stacks and are not counted. Read it before and after a call; the difference is the call path's dynamic task creation (0 for an ordinary extension-to-extension call). Also counts the anchor client's one-shot `tel_restart`, `tel_rewarm` and `tel_reconcile` workers. |
+| `version` | String | (#411) The firmware build stamp (the `git describe` of the commit it was built from). No build host, path or timestamp. |
+| `wifiCapable` | Boolean | (#167) Whether this build has a radio at all. `false` on the Ethernet builds, so an empty Wi-Fi scan is not mistaken for "no networks found". |
 | `emergencyRoute` | String | (#521) Where a 911/933 dial would go right now: `"anchor"` (the boot-selected telephony provider places real calls; a configured SIP trunk is its fallback when it is down), `"trunk"` (no such provider, but a valid SIP trunk is configured **and has answered an INVITE with a 2xx since boot or since its configuration last changed**), `"trunk-unverified"` (#546: a valid trunk is configured but has not yet completed a call, so it is *configured*, not *proved*: the generic trunk cannot answer a 401/407 digest challenge yet (#399). The dashboard shows a banner asking for a 933 test call. Emergency calls are still tried on it), or `"none"` (only the loopback test provider is present, so the board **refuses** emergency calls with `503 Emergency Call Not Routable`; the loopback simulator never answers one). The dashboard shows a warning banner while this is `"none"`. Ungated like the rest of the block. **Absent** while no SIP engine is attached yet (the first seconds after boot), which a client should treat as unknown, not as `"none"`. |
 | `uptime` | Integer | Time in seconds since the HTTP server initialized. |
+| `cdrPersistFailures` | Integer | (#470) CDR ring writes to flash that failed. Non-zero means call history is not surviving reboots. |
+| `cdrPersistSuppressed` | Integer | (#473) CDR ring writes refused while a factory reset was in progress. |
+| `cdrLoadFailures` | Integer | (#594) Failures reading the stored CDR ring at boot. |
 | `ip4Guard` | Object | (#496, ESP builds only) What the IPv4 input guard dropped since boot: `padded` (frames padded past Ethernet's 46-byte minimum; no real stack sends these) and `tinyFragments` (non-final fragments under 256 B of payload), `mdnsFragments` (any fragment addressed to the mDNS group 224.0.0.251, #559: the mDNS receiver would parse a reassembled datagram in pieces). A climbing `padded` count means hostile or broken traffic on the LAN. `tinyFragments` usually means the same, but a datagram re-fragmented by a router onto a smaller-MTU link can also land there, and that datagram is lost. See ARCHITECTURE.md, "UDP Receive Memory". |
 | `packetsProcessed` | Integer | Total UDP signaling packets processed by the state machine. |
 | `packetsDropped` | Integer | Total UDP signaling packets dropped by rate-limiting or firewall rules. |
 | `msgPoolRefusals` | Integer | (#409) Draws the process-wide SIP message pool refused because every slot was in use. There is no heap fallback, so each one is a request dropped (the peer retransmits) or a response not sent. Non-zero means the pool is undersized for the load, or the board is being flooded. |
 | `vpeerPoolRefusals` | Integer | (#409) Virtual-peer pool refusals (777/440/888/555/voicemail/park stand-ins). Each one was answered `503` or its feature abandoned cleanly (#412). |
+| `e911Configured` | Boolean | (#450) `false` after a factory reset until the E911 notify list is set again; the dashboard shows a banner. Nothing is gated on it. |
+| `droppedInvalid` | Integer | (#430) The part of `packetsDropped` refused as malformed (null, or failing `isValidMessage()`). |
+| `droppedRate` | Integer | (#430) The part of `packetsDropped` refused by the allowlist or the per-IP rate limit. |
+| `keepalivesCrlf` | Integer | (#430) CR/LF-only SIP keep-alives received. Counted apart from drops. |
+| `droppedNoPool` | Integer | (#443) SIP datagrams discarded before parsing because the message pool was spent. Not part of `packetsDropped`. |
+| `droppedOversize` | Integer | (#444) SIP datagrams longer than the receive buffer, refused rather than parsed truncated. Not part of `packetsDropped`. |
+| `rtpRxOversize` | Integer | (#469) RTP datagrams over the receiver's maximum size, dropped rather than parsed cut. |
+| `rtpTxPoolRefused` | Integer | (#479) RTP transmit-task starts refused because the stack pool was full. |
+| `rtpTxPoolRetired` | Integer | (#479) RTP transmit stack-pool slots whose boot allocation failed; out of service until reboot. `0` on host builds. |
+| `recvErrors` | Integer | (#443) Failed SIP socket receives, excluding the receive timeout's idle wake. |
+| `lastRecvErrno` | Integer | (#443) `errno` of the most recent failed receive; `0` if none. |
+| `recentDrops` | Array | (#430) The most recent dropped datagrams, oldest first: `{seq, tsUs, reason, src, len, head}` (`reason` is `invalid`, `rate`, `no_pool` or `oversize`; `src` is `ip:port`; `head` is the first bytes, hex). **Empty without an admin session**; the counts above are not. |
+| `resetIncomplete` | Boolean | (#473) `true` if the last factory reset did not complete. Public, so an operator taking the board over sees it before logging in. |
+| `resetIncompleteStage` | String | (#473) The reset stage that did not complete. |
+| `resetFailedMask` | Integer | (#473) Bitmask of the stores whose erase failed during the last reset. |
+| `resetJournal` | String | (#473) Where the reset record lives: `"flash"` (survives a power cut), `"rtc"` (survives only a restart), or `"none"` (no journal record was found at boot). |
+| `resetJournalWriteFailures` | Integer | (#473) Failed writes of the reset journal since boot. |
 | `sd` | Object | microSD state. **Always present**, on every build and transport, so a client never has to distinguish "key missing" from "no card". |
 | `sd.present` | Boolean | Whether this *build* has a card slot wired, i.e. was compiled with `PD_ETH_HAS_SD`. True only for `eth` on `PD_ETH_BOARD=elite`; false on `wifi`, `lan8720`, `display`, the Waveshare `eth` board, and the host build. This is a build capability, not a runtime observation. |
 | `sd.mounted` | Boolean | Whether a card is actually mounted at `/sdcard` right now. Distinguishing this from `present` matters: `present:true, mounted:false` means the slot exists but the card is missing, unreadable, or **exFAT** (ESP-IDF's FatFs mounts FAT16/FAT32 only, and cards over 32 GB ship exFAT from the factory). |
@@ -892,6 +914,8 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `clients` | Array | Array of objects listing active VoIP extensions. |
 | `clients[].number` | String | SIP extension number (e.g., `"1001"`). |
 | `clients[].address` | String | Client's IP and port (e.g., `"192.168.4.12:5060"`). |
+| `clientCount` | Integer | (#207) Number of registered extensions. Always present, even without a session, so an empty `clients` array can be told apart from a withheld one. |
+| `rosterVisible` | Boolean | (#207) `true` when this response carries the roster (`clients`), i.e. the caller has an admin session. |
 | `sessions` | Array | Active calls: `{caller, callee, state, duration}`. **Empty without an admin session** (#539): who is calling whom is the live call log, gated like `/api/cdr` and the `clients` roster (#207). |
 | `sessions[].caller` | String | Extension that initiated the call. |
 | `sessions[].callee` | String | Target extension receiving the call. |
@@ -900,6 +924,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `sessionCount` | Integer | (#539) Number of active calls. Always present, authenticated or not. |
 | `oldestSessionSec` | Integer | (#539) Age in seconds of the oldest active call, 0 when none. Always present; the #401 soak reads it to find a stuck leg without a credential. |
 | `dnd` | Array | Extension numbers (**strings**, not objects) currently in Do-Not-Disturb. |
+| `voicemail` | Array | (#246) Extension numbers (**strings**, not objects) that currently have voicemail enabled. |
 | `forwards` | Array | Per-extension call-forward targets: `{extension, always, busy, noanswer}`. An unset trigger is an empty string, never `null` or a missing key. |
 | `groups` | Array | Ring/hunt groups: `{extension, mode, members}`, where `mode` is `ringall` or `hunt`. |
 | `groups[].members` | String | **A comma-joined string, not an array**, e.g. `"1001,1002,1003"` (`pbx::joinMembers`). Split it on `,` client-side. It round-trips: this is exactly the format [`POST /api/group`](#post-apigroup) accepts back. |
@@ -930,6 +955,8 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `l2Tx.poolAvailable` / `l2Tx.poolSize` | Integer | Buffers currently free, and the fixed pool size (`POCKETDIAL_DMA_FRAME_POOL_SIZE`, default 6). A persistently low `poolAvailable` with `poolExhaustions` climbing is the signature of contention between the concurrent transmit tasks. |
 | `l2Tx.mohL2Errors` | Integer or `null` | Hold-music frames where the L2 transmit was attempted and **failed** (`HoldMusic::_l2TxErrors`). Distinguishes "L2 was tried and broke" from "L2 was never ready and we quietly used the socket" — `poolAllocations` flat with this at 0 means the latter. `null` on builds with no pacing task. |
 | `l2Tx.mohSockErrors` | Integer or `null` | Hold-music `sendto()` calls that failed outright (`HoldMusic::_txErrors`). The board logs these only once per 250 failures, so this is the complete count. `null` on builds with no pacing task. |
+| `coredump` | Object | (#382) Stored panic coredump: `present` (a dump is stored), `size` (its bytes), `supported` (#514: `false` when the board has no coredump partition, so `present:false` does not mean "no crash"). Ungated; the dump itself stays behind `/api/coredump*`. |
+| `memory` | Object | (#466) Memory placement: `clipRefusals` (clip buffers refused for want of PSRAM or over the internal cap), `mohClipRefused` / `greetingRefused` (booleans: hold music plays silence, or deposits record without a greeting), `psramFallbacks` (PSRAM-preferred buffers internal DRAM had to hold; always `0` without PSRAM). |
 
 > **Task-Watchdog coverage (issue #185).** `sip_server_task` is subscribed to
 > the IDF Task Watchdog Timer (`esp_task_wdt_add()` + a per-tick
@@ -1412,12 +1439,13 @@ curl -s -X POST "http://$DEV/api/ap-security" \
 ```
 
 ### `GET /api/cdr`
-Returns the in-memory Call Detail Record ring (most recent calls first). Read-only, ungated, same reachability posture as `/api/status`.
+Returns the in-memory Call Detail Record ring (most recent calls first). Read-only; requires an admin session (cookie, no CSRF) since #207, unlike `/api/status`.
 
-* Request Headers: None
+* Request Headers: `Cookie: pd_session=…`
 * Response Content-Type: `application/json`
 * Response Status Codes:
   * `200 OK`
+  * `401 Unauthorized` without a valid session
 * Response Payload JSON Example:
 ```json
 [

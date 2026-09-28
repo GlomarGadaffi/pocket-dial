@@ -755,13 +755,31 @@ TelephonyAnchorClient::CallSlot* TelephonyAnchorClient::allocSlotLocked(const st
 	}
 	for (auto& s : _calls)
 	{
-		if (s.participantId.empty())
+		// Issue #553: a slot whose old rx task is still alive (detached on a join timeout,
+		// or not yet parked) is not free, whatever its participantId says.
+		const pd::ReapDecision reap = s.participantId.empty() ? reapParkedRxLocked(s) : pd::ReapDecision::Wait;
+		if (pd::rxSlotAllocatable(s.participantId.empty(), s.tearingDown.load(std::memory_order_acquire), reap))
 		{
 			s.participantId = participantId;
 			return &s;
 		}
 	}
 	return nullptr;   // all POCKETDIAL_MAX_ANCHOR_CALLS slots busy
+}
+
+pd::ReapDecision TelephonyAnchorClient::reapParkedRxLocked(CallSlot& slot)
+{
+	const bool haveHandle = slot.rxTaskHandle != nullptr;
+	const pd::ReapDecision d = pd::reapDecision(haveHandle,
+		slot.rxRunning.load(std::memory_order_acquire),
+		haveHandle && eTaskGetState(slot.rxTaskHandle) == eSuspended);
+	if (d == pd::ReapDecision::Reap)
+	{
+		pd::deleteTask(slot.rxTaskHandle);   // parked: touches nothing, holds no lock
+		slot.rxTaskHandle = nullptr;
+		_leakedGetClients.fetch_add(pd::detachCountDeltaOnReap(slot.rxDetached), std::memory_order_relaxed);
+	}
+	return d;
 }
 
 void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
@@ -1546,6 +1564,10 @@ void TelephonyAnchorClient::tick()
 			ESP_LOGE(TAG, "tick: failed to spawn anchor-restart worker");
 			_restartInFlight.store(false, std::memory_order_release);
 		}
+		else
+		{
+			psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
+		}
 	}
 
 	// ── #107: idle TLS re-warm heartbeat ─────────────────────────────────────────
@@ -1589,6 +1611,10 @@ void TelephonyAnchorClient::tick()
 			{
 				ESP_LOGE(TAG, "tick: failed to spawn TLS re-warm worker");
 				_rewarmInFlight.store(false, std::memory_order_release);
+			}
+			else
+			{
+				psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 			}
 		}
 	}
@@ -1636,6 +1662,10 @@ void TelephonyAnchorClient::tick()
 		// Rare error path (not the hot path): release the slot, else the watchdog wedges forever.
 		ESP_LOGE(TAG, "tick: failed to spawn reconcile worker");
 		_reconcileInFlight.store(false, std::memory_order_release);
+	}
+	else
+	{
+		psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 	}
 }
 
@@ -1877,15 +1907,15 @@ void TelephonyAnchorClient::prewarmAllSlots()
 
 // Issue #65 (L-1): one-shot worker that reclaims leaked GET sockets by cycling the
 // whole anchor. stop() tears down the WS + control + media clients and frees every
-// socket it still OWNS; the leaked _getClient handles cannot be closed (their mutex is
-// poisoned), but a full stop()/start() drops the anchor's live socket footprint to
+// socket it still OWNS; a detached rx task's socket (#553) is its own to close, but a
+// full stop()/start() drops the anchor's live socket footprint to
 // zero and rebuilds it clean, so the pool recovers headroom. Runs off the SIP task
 // because stop()/start() block on TLS teardown/handshake.
 void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 {
 	auto* self = static_cast<TelephonyAnchorClient*>(arg);
 
-	ESP_LOGW(TAG, "anchor restart: reclaiming socket pool after %d leaked GET handle(s)",
+	ESP_LOGW(TAG, "anchor restart: reclaiming socket pool after %d detached rx task(s)",
 	         self->_leakedGetClients.load(std::memory_order_relaxed));
 
 	// Clear the request BEFORE the cycle so a leak that happens during/after the
@@ -1909,6 +1939,10 @@ void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 	// previously-leaked handles are the OS's problem now and the fresh session starts
 	// from a clean count. (A still-poisoned mutex would re-leak and re-trip the gate.)
 	self->_leakedGetClients.store(0, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> lock(self->_mutex);
+		for (auto& s : self->_calls) s.rxDetached = false;   // #608: matches the reset count
+	}
 
 	// Re-install the callbacks before start() so the new WS session is wired up.
 	self->setEventCallback(savedEventCb);
@@ -2816,11 +2850,12 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 		const bool handleSet   = slot->rxTaskHandle != nullptr;
 		const bool rxRunning   = slot->rxRunning.load(std::memory_order_acquire);
 		const bool tearingDown = slot->tearingDown.load(std::memory_order_acquire);
-		// Take the done-sem ONLY for a handle that is neither running nor tearing down:
-		// the take is how we learn the old task has finished with the slot (#575 review).
-		const bool semTaken = handleSet && !rxRunning && !tearingDown && slot->rxDoneSem &&
-			xSemaphoreTake(slot->rxDoneSem, 0) == pdTRUE;
-		switch (pd::rxRestartDecision(handleSet, rxRunning, tearingDown, semTaken))
+		// Issue #553: the old task has finished with the slot only once it has PARKED; reaping
+		// it (which also clears rxTaskHandle) is the proof. This replaces the #575 done-sem take:
+		// an exited task now parks instead of deleting itself, so it must be reaped, not dropped.
+		const bool reaped = handleSet && !rxRunning && !tearingDown &&
+			reapParkedRxLocked(*slot) == pd::ReapDecision::Reap;
+		switch (pd::rxRestartDecision(handleSet, rxRunning, tearingDown, reaped))
 		{
 			case pd::RxStart::AlreadyPolling:
 				// Already polling (ring-time prime or a duplicate call) — nothing to do.
@@ -2837,8 +2872,7 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 				// behind. Its done-sem is taken, so it no longer touches the slot: replace it.
 				ESP_LOGW(TAG, "startRxIfNeeded: rx task for %s had exited -- restarting (#554)",
 				         participantId.c_str());
-				slot->rxTaskHandle = nullptr;
-				break;
+				break;   // reapParkedRxLocked() already deleted it and cleared rxTaskHandle
 			case pd::RxStart::Start:
 				break;
 		}
@@ -2858,7 +2892,8 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 	}
 	// #100: stack in PSRAM (WithCaps) — N concurrent calls' GET-rx tasks would otherwise exhaust
 	// internal RAM. The task does HTTPS GET reads + the audio rx callback only (no flash writes),
-	// so a PSRAM stack is safe. Force-kill + self-exit both use vTaskDeleteWithCaps.
+	// so a PSRAM stack is safe. The task parks on exit and the owner reaps it (#553).
+	slot->stopRequested.store(false, std::memory_order_release);   // #553: a fresh task's stop flag
 	slot->rxRunning.store(true, std::memory_order_release);   // #554: before the task can exit
 	BaseType_t rc = pd::createTaskPreferPsram(&TelephonyAnchorClient::rxTaskTrampoline, "tel_media_rx", 6144, arg, 6, &slot->rxTaskHandle, 1);
 	if (rc != pdPASS)
@@ -3017,63 +3052,64 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 		~ClearOnExit() { f.store(false, std::memory_order_release); }
 	} clearOnExit{slot->tearingDown};
 
-	TaskHandle_t taskToKill = nullptr;
+	TaskHandle_t rxTask = nullptr;
 	SemaphoreHandle_t doneSem = nullptr;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		taskToKill = slot->rxTaskHandle;
+		rxTask = slot->rxTaskHandle;
 		// Capture the semaphore under the SAME lock: startRxIfNeeded deletes+recreates rxDoneSem,
 		// so re-reading the member after releasing the lock could race a fresh handle (UAF). Use
 		// the local 'doneSem' for the whole teardown below, never slot->rxDoneSem.
 		doneSem = slot->rxDoneSem;
-		slot->rxTaskHandle = nullptr; // signal the rx task to exit
 	}
 
-	if (taskToKill)
+	if (rxTask)
 	{
+		// Issue #553: cooperative cancellation. Ask the task to stop, and shut down only the
+		// socket it published; never touch getClient, which the rx task alone owns. Its next
+		// socket call fails at once, and every blocking call is bounded by the client timeout.
+		slot->stopRequested.store(true, std::memory_order_release);
 		{
 			std::lock_guard<std::mutex> lock(slot->getMutex);
-			if (slot->getClient)
+			if (slot->getFd >= 0)
 			{
-				int fd = esp_http_client_get_socket(slot->getClient);
-				if (fd >= 0)
-				{
-					shutdown(fd, SHUT_RDWR);
-				}
+				shutdown(slot->getFd, SHUT_RDWR);
 			}
 		}
 
-		if (doneSem)
+		if (doneSem && xSemaphoreTake(doneSem, pdMS_TO_TICKS(2000)) == pdTRUE)
 		{
-			if (xSemaphoreTake(doneSem, pdMS_TO_TICKS(2000)) != pdTRUE)
+			// It gave the sem and is about to park: reap it (usually within a tick). If it is
+			// not suspended yet, allocSlotLocked() reaps it later; the slot stays unallocatable.
+			for (int i = 0; i < 10; ++i)
 			{
-				ESP_LOGE(TAG, "Rx task failed to exit in time! Forcing task deletion.");
-				pd::deleteTask(taskToKill);   // #100: rx task is WithCaps(PSRAM) — reclaim its stack
-				// try_lock: if the deleted task was holding getMutex when killed, the mutex is
-				// permanently poisoned and a blocking lock_guard would deadlock here.
-				if (slot->getMutex.try_lock())
 				{
-					if (slot->getClient)
-					{
-						esp_http_client_close(slot->getClient);
-						esp_http_client_cleanup(slot->getClient);
-						slot->getClient = nullptr;
-					}
-					slot->getMutex.unlock();
+					std::lock_guard<std::mutex> lock(_mutex);
+					if (reapParkedRxLocked(*slot) != pd::ReapDecision::Wait) break;
 				}
-				else
-				{
-					// Issue #65 (L-1): getClient (and its LWIP socket) is unrecoverable in place.
-					// Count it; once too many leak, request a full anchor restart so the next
-					// stop()/start() reclaims the whole socket pool (done off-SIP by tick()).
-					const int leaked = _leakedGetClients.fetch_add(1, std::memory_order_relaxed) + 1;
-					ESP_LOGE(TAG, "getMutex poisoned by killed task — leaking getClient to avoid deadlock (%d leaked)", leaked);
-					if (leaked >= kLeakRestartThreshold)
-					{
-						_restartRequested.store(true, std::memory_order_release);
-						ESP_LOGW(TAG, "Leaked GET sockets reached %d — requesting anchor restart to reclaim the pool", leaked);
-					}
-				}
+				vTaskDelay(1);
+			}
+		}
+		else
+		{
+			// Issue #553: never kill it (#421's force-kill could land inside getMutex, _mutex or
+			// IDF's global crypto locks). DETACH: it finishes its own bounded exit and parks,
+			// and its slot stays unallocatable until reaped. Count it; a task that never exits
+			// holds its socket, so past the threshold request the #65 anchor restart.
+			int detached;
+			{
+				// #608: flag and count under one _mutex hold, so a reap (also under _mutex)
+				// sees both or neither and can never leave the count stuck.
+				std::lock_guard<std::mutex> lock(_mutex);
+				slot->rxDetached = true;   // reapParkedRxLocked() takes it back out
+				detached = _leakedGetClients.fetch_add(1, std::memory_order_relaxed) + 1;
+			}
+			ESP_LOGE(TAG, "Rx task for %s did not exit in 2 s -- detached, slot held until it parks (%d detached)",
+			         participantId.c_str(), detached);
+			if (detached >= kLeakRestartThreshold)
+			{
+				_restartRequested.store(true, std::memory_order_release);
+				ESP_LOGW(TAG, "Detached rx tasks reached %d -- requesting anchor restart", detached);
 			}
 		}
 	}
@@ -3129,7 +3165,13 @@ void TelephonyAnchorClient::rxTaskTrampoline(void* arg)
 	{
 		xSemaphoreGive(slot->rxDoneSem);
 	}
-	pd::deleteTask(nullptr);   // #100: created WithCaps(PSRAM) — reclaim the PSRAM stack/TCB
+	// Issue #553 / #535: park; never self-delete. The owner reaps this task with
+	// pd::deleteTask() once pd::reapDecision() sees it suspended: one deleter, and no
+	// allocation on the exit path (self-deleting a WithCaps task allocates a helper task).
+	for (;;)
+	{
+		vTaskSuspend(nullptr);
+	}
 }
 
 void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
@@ -3140,7 +3182,9 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	// _baseUrl/_sourceDn/_accessToken and _mutex stay shared members (correct).
 	esp_http_client_handle_t& _getClient           = slot->getClient;
 	std::mutex&               _getMutex            = slot->getMutex;
-	TaskHandle_t&             _rxTaskHandle        = slot->rxTaskHandle;
+	// Issue #553: the stop signal is slot->stopRequested (set by stopMediaStreams()), no
+	// longer a nulled rxTaskHandle: the handle now stays until the owner reaps this task.
+	auto keepRunning = [slot]() { return !slot->stopRequested.load(std::memory_order_acquire); };
 	const std::string&        _activeParticipantId = slot->participantId;
 
 	std::string activePartId;
@@ -3156,13 +3200,12 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 
 	std::string getUrl = baseUrl + "/callcontrol/" + sourceDn + "/participants/" + activePartId + "/stream";
 
-	// _getClient lifecycle (init/close/cleanup) is serialized with
-	// stopMediaStreams() via _getMutex so the unblock-close and our teardown can
-	// never double-free the handle. The lock is NEVER held across the blocking
-	// open/fetch/read calls — stopMediaStreams() must be able to grab it to close
-	// the handle and unblock us.
-	auto teardownGetClient = [this, &_getClient, &_getMutex]() {
+	// Issue #553: this task alone owns _getClient (init/close/cleanup). _getMutex guards
+	// only the published socket fd (slot->getFd), which stopMediaStreams() shuts down to
+	// unblock us. The lock is NEVER held across the blocking open/fetch/read calls.
+	auto teardownGetClient = [this, slot, &_getClient, &_getMutex]() {
 		std::lock_guard<std::mutex> lock(_getMutex);
+		slot->getFd = -1;   // #553: unpublish before the socket number can be reused
 		if (_getClient)
 		{
 			esp_http_client_close(_getClient);
@@ -3186,7 +3229,7 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	// RINGING, so the loop must comfortably outlast a long unanswered ring (the
 	// old 40-attempt/~20s ceiling would expire mid-ring and the call would
 	// connect with no inbound audio). Teardown still exits it immediately via
-	// _rxTaskHandle/socket shutdown.
+	// stopRequested + socket shutdown (#553).
 	constexpr int        kMaxAttempts = 240;
 	// #350: consecutive TRANSPORT-level failures — no HTTP response parsed at all —
 	// as distinct from a real non-200, which is what the 240-attempt budget exists
@@ -3206,7 +3249,7 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 
 	{
 		std::lock_guard<std::mutex> lock(_getMutex);
-		if (_rxTaskHandle != nullptr)
+		if (keepRunning())
 		{
 			_getClient = makeAuthedClient(getUrl, HTTP_METHOD_GET, 1024, token);
 		}
@@ -3219,29 +3262,41 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	// whose tail guard the failed attempt had already corrupted (0xbaadbc76, not
 	// 0xbaad5678). Holding _getMutex across makeAuthedClient() matches the initial
 	// create above — esp_http_client_init() allocates, it does not connect, so this
-	// is not a blocking network call under the lock. Re-checks _rxTaskHandle under
+	// is not a blocking network call under the lock. Re-checks stopRequested under
 	// the lock so a teardown racing us cannot resurrect a handle stopMediaStreams()
 	// just closed.
 	auto recreateGetClient = [&]() -> bool {
 		std::lock_guard<std::mutex> lock(_getMutex);
+		slot->getFd = -1;   // #553
 		if (_getClient)
 		{
 			esp_http_client_close(_getClient);
 			esp_http_client_cleanup(_getClient);
 			_getClient = nullptr;
 		}
-		if (_rxTaskHandle == nullptr) return false;
+		if (!keepRunning()) return false;
 		_getClient = makeAuthedClient(getUrl, HTTP_METHOD_GET, 1024, token);
 		return _getClient != nullptr;
 	};
 
 	if (_getClient)
 	{
-		for (int attempt = 0; attempt < kMaxAttempts && _rxTaskHandle != nullptr; ++attempt)
+		for (int attempt = 0; attempt < kMaxAttempts && keepRunning(); ++attempt)
 		{
 			const int64_t openT0 = esp_timer_get_time();
 			esp_err_t err = esp_http_client_open(_getClient, 0);
 			bool transportFailed = false;
+			if (err == ESP_OK)
+			{
+				// Issue #553: publish the socket so stopMediaStreams() can shut it down without
+				// touching the handle, then re-check the flag: a stop that ran before this
+				// publish saw fd -1, so we must see its flag instead.
+				{
+					std::lock_guard<std::mutex> lock(_getMutex);
+					slot->getFd = esp_http_client_get_socket(_getClient);
+				}
+				if (!keepRunning()) break;
+			}
 			if (err == ESP_OK)
 			{
 				esp_http_client_fetch_headers(_getClient);
@@ -3326,7 +3381,7 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 				}
 			}
 
-			if (_rxTaskHandle != nullptr)
+			if (keepRunning())
 			{
 				vTaskDelay(delay);
 				delay = (delay * 2 > pdMS_TO_TICKS(500)) ? pdMS_TO_TICKS(500) : delay * 2;
@@ -3346,7 +3401,7 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	bool hasCarry = false;
 	char carryByte = 0;
 	int rxReads = 0;
-	while (_rxTaskHandle != nullptr)
+	while (keepRunning())
 	{
 		int bytesRead = 0;
 		if (hasCarry)

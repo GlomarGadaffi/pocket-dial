@@ -4,8 +4,8 @@ Date: 2026-09-13 | Version: 2.0 | Author: Security Engineering | Phase: 1 (produ
 
 This document is a STRIDE-structured threat model for the **pocket-dial** ESP32 SIP PBX
 and its HTTP dashboard. It focuses on the locally-reachable attack surface of a small
-appliance that, by default, **runs its own open WiFi access point** and an **open SIP
-registrar**. It complements the broader `docs/SECURITY_AUDIT.md` (which tracks
+appliance that, by default, **runs its own open WiFi access point** and a **trust-on-first-use
+(`learn`) SIP registrar**. It complements the broader `docs/SECURITY_AUDIT.md` (which tracks
 CVSS-scored findings) and records the authentication layer that closed the originally
 **unauthenticated admin** hole (audit finding SEC-04): every state-changing dashboard
 endpoint now requires a login session plus a per-session CSRF token, and the device
