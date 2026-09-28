@@ -4,6 +4,7 @@
 #include "AnchorClient.hpp"
 #include "RecentIdRing.hpp"   // Issue #554
 #include "ParkedTaskReap.hpp" // Issue #553: pd::ReapDecision
+#include "AnchorWedge.hpp"    // Issue #667: pd::anchorSlotLooksWedged
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -162,6 +163,9 @@ private:
 		std::string              participantId;          // "" = free (guarded by _mutex)
 		std::atomic<bool>        outboundActive{false};
 		std::atomic<bool>        outboundAnswered{false};
+		// #667: the PBX lists this outbound leg with a live, not-yet-Connected status
+		// (Dialing): the far end is ringing, so tick() must not count the slot as wedged.
+		std::atomic<bool>        ringing{false};
 		int64_t                  outboundActiveSetUs = 0; // guarded by _mutex
 		std::string              inboundSignaledPartId;   // Incoming fired once (guarded by _mutex)
 		std::string              farPartId;               // far-leg participant id — populated at Connected so Remove can match it (guarded by _mutex)

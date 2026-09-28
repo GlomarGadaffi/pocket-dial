@@ -503,6 +503,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 				{
 					slot->outboundActive.store(true, std::memory_order_release);
 					slot->outboundAnswered.store(false, std::memory_order_release);
+					slot->ringing.store(false, std::memory_order_release);
 					slot->outboundActiveSetUs = esp_timer_get_time();
 				}
 			}
@@ -789,6 +790,7 @@ void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 	slot.farPartId.clear();
 	slot.outboundActive.store(false, std::memory_order_release);
 	slot.outboundAnswered.store(false, std::memory_order_release);
+	slot.ringing.store(false, std::memory_order_release);
 	slot.outboundActiveSetUs = 0;
 	slot.upsetInFlight.store(false, std::memory_order_release);
 	slot.upsetPending.store(false, std::memory_order_release);
@@ -1623,7 +1625,8 @@ void TelephonyAnchorClient::tick()
 	// makecall was accepted but never produced a participant/media; the reconcile worker frees it so
 	// it stops occupying a concurrent-call slot. 15 s grace: a real outbound call yields its
 	// participant upset within ~1 RTT, so a flag still set this long after makecall is a wedge.
-	constexpr int64_t kWedgeGraceUs = 15LL * 1000000;
+	// #667: a leg the PBX already lists as Dialing is ringing, not wedged; it gets the longer
+	// ringing grace (pd::anchorSlotLooksWedged).
 	const int64_t nowUs = esp_timer_get_time();
 	bool anyWedged = false;
 	{
@@ -1631,9 +1634,10 @@ void TelephonyAnchorClient::tick()
 		for (auto& s : _calls)
 		{
 			if (s.participantId.empty()) continue;
-			if (!s.outboundActive.load(std::memory_order_acquire)) continue;
-			if (s.postLive.load(std::memory_order_acquire)) continue;
-			if (s.outboundActiveSetUs != 0 && nowUs - s.outboundActiveSetUs >= kWedgeGraceUs)
+			if (pd::anchorSlotLooksWedged(s.outboundActive.load(std::memory_order_acquire),
+			                              s.postLive.load(std::memory_order_acquire),
+			                              s.ringing.load(std::memory_order_acquire),
+			                              s.outboundActiveSetUs, nowUs))
 			{
 				anyWedged = true;
 				break;
@@ -2546,6 +2550,14 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 					// So the POST is opened in the Connected branch above, to the now-Connected leg.
 					// (Inbound differs: its route-point leg is already Connected during the local
 					// ring, so the inbound gate pre-warms BOTH streams there.)
+					// #667: a non-empty status means the PBX lists our leg (Dialing): it is
+					// ringing, not a #100 wedge. "" = GET failed or leg absent: no evidence.
+					if (!statusStr.empty())
+					{
+						std::lock_guard<std::mutex> lock(_mutex);
+						CallSlot* s = slotForLocked(controlLeg);
+						if (s) s->ringing.store(true, std::memory_order_release);
+					}
 					startRxIfNeeded(controlLeg);
 				}
 			}
