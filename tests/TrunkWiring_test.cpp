@@ -412,6 +412,25 @@ TEST(TrunkWiring, TheHandsetHangingUpByesTheCarrierAndReleasesTheRelay)
 		<< "endCall() is the one place the pair is released, on every path";
 }
 
+TEST(TrunkWiring, AnExpiredLeaseMidCallByesTheCarrierAndReleasesTheRelay)
+{
+	// #603 review: sweepExpired() erased an expired phone's sessions by hand --
+	// no endCall(), so the carrier leg kept billing and the relay pair leaked.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-lease"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+	b.sent.clear();
+
+	b.handler.expireLeaseAndSweepForTest("1001");
+
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the carrier leg must be hung up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and its relay pair released";
+}
+
 TEST(TrunkWiring, TheCarrierHangingUpByesTheHandsetAndReleasesTheRelay)
 {
 	Bench b;
