@@ -64,7 +64,9 @@
 // entry as it is flushed -- so the INVITE gets Timer A/B and the BYE gets Timer
 // E/F without this class knowing the transaction layer exists. Deliberately the
 // same arrangement RegisterBeeper uses. Do NOT add a retry schedule here; two
-// schedules on one request put two copies on the wire per loss.
+// schedules on one request put two copies on the wire per loss. The one
+// exception is REGISTER (#617): TransactionLayer does not track it, so
+// SipRegistrationClient's Timer E drives its retransmits.
 //
 // ── Bounded, no hot-path heap ────────────────────────────────────────────────
 //
@@ -406,6 +408,9 @@ public:
 	// claimed by handleResponse(), which sends a digest retry at once.
 	void tickRegistration(uint64_t nowMs, const sockaddr_in& sbc);
 	const SipRegistrationClient& registration() const { return _reg; }
+	// #617: REGISTER responses dropped because they came from an address other
+	// than the one the REGISTER went to.
+	uint32_t forgedRegisterResponses() const { return _regForgedResponses; }
 
 	// Test/diagnostic accessors. Cheap linear scans over a fixed array.
 	size_t activeDialogs() const;
@@ -475,6 +480,7 @@ private:
 	SipRegistrationClient::Request _regReq{};
 	sockaddr_in                    _regPeer{};
 	bool                           _regLive = false;
+	uint32_t                       _regForgedResponses = 0;
 
 	Listener* _listener = nullptr;
 	std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS> _dialogs{};
