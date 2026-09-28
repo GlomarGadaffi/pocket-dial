@@ -1582,3 +1582,65 @@ TEST(SipTrunkRegister, ARegisterResponseFromAnotherAddressIsConsumedAndIgnored)
 		"something a third party gets to ask for";
 	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registering);
 }
+
+// #617: Timer E. TransactionLayer::classify() excludes REGISTER, so before this
+// nothing resent an unanswered one: one lost datagram cost a full Timer F plus
+// backoff cycle. RFC 3261 §17.1.2.2: resend at T1, doubling, capped at T2.
+TEST(SipTrunkRegister, AnUnansweredRegisterIsResentOnTheTimerESchedule)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+	const uint64_t t0 = steadyMs();
+	trunk.tickRegistration(t0, sbcAddr());
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string first = env.sentRaw(0);
+
+	// T1=500 ms, then +1000, +2000, +4000, then capped at T2: +4000.
+	const uint64_t due[] = {500, 1500, 3500, 7500, 11500};
+	for (size_t i = 0; i < sizeof(due) / sizeof(due[0]); ++i)
+	{
+		trunk.tickRegistration(t0 + due[i] - 1, sbcAddr());
+		ASSERT_EQ(env.sent.size(), 1u + i) << "resent early, before " << due[i] << " ms";
+		trunk.tickRegistration(t0 + due[i], sbcAddr());
+		ASSERT_EQ(env.sent.size(), 2u + i) << "no Timer E retransmit at " << due[i] << " ms";
+		EXPECT_EQ(env.sentRaw(1 + i), first) << "a retransmit is the same request: same branch, same CSeq";
+		EXPECT_EQ(env.sent[1 + i].to.sin_addr.s_addr, sbcAddr().sin_addr.s_addr);
+	}
+	EXPECT_EQ(trunk.registration().cseq(), 1u) << "a retransmit consumes no CSeq";
+
+	// Any response ends the schedule.
+	ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(first,
+		"SIP/2.0 200 OK", "Expires: 3600\r\n"))));
+	ASSERT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registered);
+	const size_t sentAtAnswer = env.sent.size();
+	trunk.tickRegistration(t0 + 20000, sbcAddr());
+	EXPECT_EQ(env.sent.size(), sentAtAnswer) << "a REGISTER that was answered is not resent";
+}
+
+// #617: a REGISTER response from anywhere but the SBC was dropped with only a
+// log line. It is now counted, so spoofing shows up as a number.
+TEST(SipTrunkRegister, AForgedRegisterResponseIsCounted)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+	trunk.tickRegistration(steadyMs(), sbcAddr());
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string ok = regResponse(env.sentRaw(0), "SIP/2.0 200 OK", "Expires: 3600\r\n");
+
+	sockaddr_in forger = sbcAddr();
+	forger.sin_addr.s_addr = inet_addr("198.51.100.7");   // TEST-NET-2
+	EXPECT_EQ(trunk.forgedRegisterResponses(), 0u);
+	EXPECT_TRUE(trunk.handleResponse(std::make_shared<SipMessage>(ok, forger)));
+	EXPECT_EQ(trunk.forgedRegisterResponses(), 1u);
+	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registering)
+		<< "a forged 200 must not register us";
+
+	// Control: the same 200 from the SBC is not counted, and does register.
+	ASSERT_TRUE(trunk.handleResponse(responseFor(ok)));
+	EXPECT_EQ(trunk.forgedRegisterResponses(), 1u);
+	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registered);
+}
