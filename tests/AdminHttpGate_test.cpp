@@ -25,6 +25,8 @@
 #include "JsonReader.hpp"    // Issue #430: parse /api/status in the DropProbe tests
 #include "DmaFramePool.hpp"   // Issue #328: /api/status's l2Tx counters
 #include "SipSecretStore.hpp"
+#include "LoopbackAnchorClient.hpp"   // #652: the loopback emergency seam
+#include "ResetGuard.hpp"
 #include "index_html.h"
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -1348,6 +1350,67 @@ TEST(OtaReboot, NoStagedImageIsAPlainRestartNotA409)
 	EXPECT_EQ(statusOf(resp), 200) << resp;
 	EXPECT_NE(bodyOf(resp).find("\"staged\":false"), std::string::npos) << resp;
 
+	AdminAuth::clearCredential();
+}
+
+// #652: a reboot or factory reset drops every call, 911 included. While an
+// emergency session is live both refuse with 409. The 911 goes to the host's
+// loopback anchor posing as a real provider (the EmergencyRoute_test seam);
+// nothing leaves the process.
+TEST(OtaReboot, RebootAndFactoryResetAreRefusedDuringAnEmergencyCall)
+{
+	AdminAuth::clearCredential();
+	resetguard::resetForTest();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.setAnchorPlacesRealCallsForTest(true);
+
+	sockaddr_in hs{};
+	hs.sin_family = AF_INET;
+	hs.sin_addr.s_addr = inet_addr("192.168.4.11");
+	hs.sin_port = htons(5060);
+	handler.handle(RequestsHandler::getMessageFromPool(
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bK652r\r\n"
+		"From: <sip:101@server>;tag=r652\r\nTo: <sip:101@server>\r\n"
+		"Call-ID: reg-652\r\nCSeq: 1 REGISTER\r\n"
+		"Contact: <sip:101@192.168.4.11:5060>;expires=3600\r\nContent-Length: 0\r\n\r\n", hs));
+	const std::string sdp =
+		"v=0\r\no=- 0 0 IN IP4 192.168.4.11\r\ns=-\r\nc=IN IP4 192.168.4.11\r\nt=0 0\r\n"
+		"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(
+		"INVITE sip:911@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bK652i\r\n"
+		"From: <sip:101@server>;tag=i652\r\nTo: <sip:911@server>\r\n"
+		"Call-ID: e911-652\r\nCSeq: 1 INVITE\r\nMax-Forwards: 70\r\n"
+		"Contact: <sip:101@192.168.4.11:5060>\r\nContent-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp, hs));
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+	ASSERT_EQ(loop->lastMakeCallDestination(), "911") << "precondition: the 911 session is up";
+
+	HttpServer server("127.0.0.1", 0, nullptr);
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(port);
+
+	static int erases = 0;
+	erases = 0;
+	resetguard::beforeFirstEraseHookForTest() = [] { ++erases; };
+
+	const std::string reboot = httpPostRaw(port, "/api/ota/reboot", "confirm=1", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(reboot), 409) << reboot;
+	EXPECT_NE(bodyOf(reboot).find("emergency call in progress"), std::string::npos) << reboot;
+
+	const std::string reset = httpPostRaw(port, "/api/factory-reset", "confirm=ERASE", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(reset), 409) << reset;
+	EXPECT_EQ(erases, 0) << "nothing may be erased";
+	EXPECT_FALSE(resetguard::inProgress()) << "the reset must not even begin";
+	EXPECT_FALSE(AdminAuth::needsInitialSetup()) << "the admin credential survives";
+
+	resetguard::resetForTest();
 	AdminAuth::clearCredential();
 }
 

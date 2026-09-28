@@ -23,6 +23,7 @@
 #include "CoreDumpStore.hpp"
 #include "VoicemailArchive.hpp"
 #include "RequestsHandler.hpp"
+#include "LoopbackAnchorClient.hpp"   // #652: the loopback emergency seam
 #include "SipMessage.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -320,4 +321,37 @@ TEST_F(DtmfFactoryReset, ADrainTimeoutIsLoggedAndTheResetStillRuns)
 	err = testing::internal::GetCapturedStderr();
 	EXPECT_EQ(sink.wipes, 2) << "control: the second reset ran too";
 	EXPECT_EQ(err.find("NVS writer was still busy"), std::string::npos) << err;
+}
+
+// #652: a DTMF factory reset restarts the board, which would drop a 911 on
+// another handset. While one is live the reset is refused and nothing is
+// wiped. The 911 goes to the host loopback anchor posing as a real provider
+// (the EmergencyRoute_test seam); nothing leaves the process.
+TEST_F(DtmfFactoryReset, AResetIsRefusedWhileAnotherHandsetIsOnA911)
+{
+	handler->setAnchorPlacesRealCallsForTest(true);
+	sockaddr_in hs{}; hs.sin_family = AF_INET;
+	hs.sin_addr.s_addr = inet_addr("192.168.7.11");
+	hs.sin_port = htons(5060);
+	handler->handle(makeRegisterFor("101", "192.168.7.11", "reg-101-652"));
+	const std::string sdp =
+		"v=0\r\no=- 0 0 IN IP4 192.168.7.11\r\ns=-\r\nc=IN IP4 192.168.7.11\r\nt=0 0\r\n"
+		"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	handler->handle(RequestsHandler::getMessageFromPool(
+		"INVITE sip:911@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.7.11:5060;branch=z9hG4bK652d\r\n"
+		"From: <sip:101@server>;tag=d652\r\nTo: <sip:911@server>\r\n"
+		"Call-ID: e911-652-dtmf\r\nCSeq: 1 INVITE\r\nMax-Forwards: 70\r\n"
+		"Contact: <sip:101@192.168.7.11:5060>\r\nContent-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp, hs));
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler->anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+	ASSERT_EQ(loop->lastMakeCallDestination(), "911") << "precondition: the 911 session is up";
+
+	WipeSpySink sink;
+	ScopedSink installed(&sink);
+	sendDtmfSequence(*handler, "dtmf-652", std::string("*") + kPin + "#9991");
+
+	EXPECT_EQ(sink.wipes, 0) << "nothing may be wiped while a 911 is live";
+	EXPECT_FALSE(resetguard::inProgress()) << "the reset must not even begin";
 }
