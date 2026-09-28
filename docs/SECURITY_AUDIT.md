@@ -255,8 +255,8 @@ flash-encryption fix matter. See [THREAT_MODEL.md](THREAT_MODEL.md) §5 and §9.
 > INVITE is challenged with the same digest machinery as REGISTER, verified against the
 > `INVITE` method taken from the request line
 > ([RequestsHandler.cpp:1195-1206](../src/SIP/RequestsHandler.cpp#L1195-L1206)). Learn
-> mode keeps TOFU semantics and Open mode still never challenges, which, given that
-> Open is the shipped default, is the part that actually matters on a fresh board.
+> mode keeps TOFU semantics, which, given that Learn is the shipped default (#502), is
+> the part that actually matters on a fresh board.
 
 #### Original remediation guidance (historical)
 1. HTTP Authentication: Implement standard HTTP Basic Authentication or token-based session cookies for all web endpoints.

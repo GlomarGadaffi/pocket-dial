@@ -23,8 +23,8 @@ wired-LAN path is a config recipe, not code.** See [§1.1](#11-dhcp-option-66--o
 > **Read §0.1 before planning a deployment around this.** The endpoint only serves a MAC that
 > is already in the Learn-mode adopted-device registry, and a device can only enter that
 > registry by *successfully registering* while the board is in Learn mode. On a
-> factory-default board, which ships in **Open** mode, and Open mode never records devices,
-> every MAC is a structural `404`. This is **not** zero-touch bootstrap. It is
+> factory-default board, which ships in **Learn** mode (#502), a MAC is a structural `404`
+> until that phone has registered. This is **not** zero-touch bootstrap. It is
 > re-provisioning of phones you already brought up by hand.
 
 An earlier revision of this document was a forward-looking design spec headed *"Phase-1
@@ -65,8 +65,8 @@ The **only** code path that inserts into that registry is `Registrar::admitLearn
 successful REGISTER, in Learn mode, when ARP could resolve the source IP to a MAC
 (`Registrar.cpp:167-186`). Specifically:
 
-* Open mode never records devices: `markOnline()` documents this explicitly
-  (`Registrar.hpp:77-78`). Open is the shipped default (`RequestsHandler.hpp:536-537`).
+* Open mode, which never recorded devices, is retired (#500); Learn is the shipped
+  default (`Registrar.cpp:42`).
 * **Secure mode** requires a valid digest to admit a REGISTER at all, and `admitSecure()`
   does not adopt.
 * Even in Learn mode, a **first-packet ARP miss** accepts the REGISTER but defers the lock
@@ -303,7 +303,7 @@ Accept: */*
 Connection: close
 ```
 
-Response: MAC `805ec079c37f` adopted as extension `1001`, registrar in Open or Learn
+Response: MAC `805ec079c37f` adopted as extension `1001`, registrar in Learn
 mode (`authRequired = false`):
 
 ```http
@@ -475,8 +475,8 @@ change with the bigger payoff, and it ships today.
 
 ### 4.5 Not a security feature
 
-Auto-provisioning configures a phone. It does not authenticate one, and on a default (Open)
-board nothing authenticates one. Do not describe it as a security control.
+Auto-provisioning configures a phone. It does not authenticate one, and on a default (Learn)
+board nothing authenticates its first REGISTER. Do not describe it as a security control.
 
 ## 5. Sequence: boot → fetch cfg → REGISTER → call
 

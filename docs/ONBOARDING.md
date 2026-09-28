@@ -106,13 +106,11 @@ idf.py -D SIP_TRANSPORT=display build
 Before compiling, configure security settings according to your environment's posture:
 
 ### 1. Closed Mode vs. Open Mode Authentication (Issue #56)
-By default, the SIP engine starts in **Open Mode** for rapid bench-testing and hobbyist setups. If you are deploying the firmware in a production or shared corporate network environment, you must switch the system to **Closed Mode** to block unauthorized traffic.
+By default, the SIP engine starts in **Learn** mode (trust-on-first-use; Open Mode is retired, #502). If you are deploying the firmware in a production or shared corporate network environment, you must switch the system to **Closed Mode** to block unauthorized traffic.
 > [!CAUTION]
 > **This is not a build knob and editing that `#define` does nothing.** Earlier revisions
 > told you to comment out `POCKETDIAL_OPEN_REGISTRAR` in `src/SIP/RequestsHandler.hpp`. That
-> macro is **unconditional** and only seeds the boot *default*; the header's own comment at
-> `RequestsHandler.hpp:4-15` says in as many words: *"Do not document this as a build knob;
-> it is not one."*
+> macro is **gone** (#500); see the header's comment at `RequestsHandler.hpp:4-11`.
 
 * To enable Closed Mode: the registrar admission mode is a **runtime** setting,
   persisted in NVS as `reg_mode` in the `pbxcfg` namespace. Change it with
