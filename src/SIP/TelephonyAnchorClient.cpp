@@ -3084,11 +3084,14 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 			// IDF's global crypto locks). DETACH: it finishes its own bounded exit and parks,
 			// and its slot stays unallocatable until reaped. Count it; a task that never exits
 			// holds its socket, so past the threshold request the #65 anchor restart.
+			int detached;
 			{
+				// #608: flag and count under one _mutex hold, so a reap (also under _mutex)
+				// sees both or neither and can never leave the count stuck.
 				std::lock_guard<std::mutex> lock(_mutex);
-				slot->rxDetached = true;   // #608: reapParkedRxLocked() takes it back out
+				slot->rxDetached = true;   // reapParkedRxLocked() takes it back out
+				detached = _leakedGetClients.fetch_add(1, std::memory_order_relaxed) + 1;
 			}
-			const int detached = _leakedGetClients.fetch_add(1, std::memory_order_relaxed) + 1;
 			ESP_LOGE(TAG, "Rx task for %s did not exit in 2 s -- detached, slot held until it parks (%d detached)",
 			         participantId.c_str(), detached);
 			if (detached >= kLeakRestartThreshold)
