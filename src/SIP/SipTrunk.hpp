@@ -12,6 +12,7 @@
 #include "PoolConfig.hpp"
 #include "SipDigest.hpp"   // #399: answering 401/407
 #include "SipMessage.hpp"
+#include "SipRegistrationClient.hpp"   // #399: REGISTER to the carrier
 
 // ── Generic ITSP SIP trunk, outbound half (issue #164) ───────────────────────
 //
@@ -103,8 +104,8 @@ public:
 		// go to the box the carrier wants them to go to. Empty means "no proxy,
 		// send to `host`".
 		//
-		// Sized to SipRegistrationClient::kMaxHost so the value passes straight
-		// through if/when digest REGISTER is wired.
+		// Sized to SipRegistrationClient::kMaxHost. REGISTERs go here too (the
+		// caller hands tickRegistration() the resolved transport address).
 		char     proxyHost[64] = {};
 		uint16_t proxyPort     = 5060;
 
@@ -125,7 +126,7 @@ public:
 		// SipRegistrationClient's "digest username (often == aorUser)".
 		//
 		// Issue #399: the username a 401/407 on our INVITE is answered with
-		// (answerChallenge()). Digest REGISTER is still not wired.
+		// (answerChallenge()) and the REGISTER is signed with (tickRegistration()).
 		char authUser[64] = {};
 
 		bool enabled = false;
@@ -139,7 +140,9 @@ public:
 		uint16_t    transportPort() const { return proxyHost[0] ? proxyPort : port; }
 	};
 
-	void setConfig(const Config& cfg) { _cfg = cfg; }
+	// A new config is a new registration (new Call-ID): the next
+	// tickRegistration() reconfigures the client from scratch.
+	void setConfig(const Config& cfg) { _cfg = cfg; _regLive = false; _reg.stop(); }
 	const Config& config() const { return _cfg; }
 
 	// The digest password, held OUTSIDE Config on purpose. Config is handed
@@ -393,6 +396,17 @@ public:
 	// Time out dialogs that never reached a final response.
 	void sweep(std::chrono::steady_clock::time_point now);
 
+	// Issue #399: REGISTER with the carrier. Called from the engine's tick with
+	// the resolved transport address (proxy or host). SipRegistrationClient
+	// decides when a REGISTER is due -- the first call, a 401/407 retry, a
+	// refresh before Expires, a backed-off retry -- and this puts it on the
+	// wire. The refresh is also the only NAT keepalive the trunk gets.
+	// Registers only with a password: an IP-authenticated trunk has nothing
+	// to sign and does not register. Responses on the REGISTER Call-ID are
+	// claimed by handleResponse(), which sends a digest retry at once.
+	void tickRegistration(uint64_t nowMs, const sockaddr_in& sbc);
+	const SipRegistrationClient& registration() const { return _reg; }
+
 	// Test/diagnostic accessors. Cheap linear scans over a fixed array.
 	size_t activeDialogs() const;
 
@@ -452,6 +466,15 @@ private:
 	bool answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status);
 	SipDigest::BoundedChallenge _challenge{};
 	char _authLine[32 + SipDigest::kMaxAuthorizationValue] = {};
+
+	// Issue #399: the carrier registration. Fixed storage; the request buffer
+	// is a member for the same stack reason as _authLine above.
+	bool handleRegisterResponse(const std::shared_ptr<SipMessage>& data);
+	void sendRegisterIfDue(uint64_t nowMs);
+	SipRegistrationClient          _reg;
+	SipRegistrationClient::Request _regReq{};
+	sockaddr_in                    _regPeer{};
+	bool                           _regLive = false;
 
 	Listener* _listener = nullptr;
 	std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS> _dialogs{};

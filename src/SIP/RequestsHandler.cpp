@@ -8683,9 +8683,17 @@ void RequestsHandler::tick()
 		// all and only a dotted-quad trunk can place a call.
 		if (_sipTrunk.config().valid())
 		{
-			sockaddr_in unusedAddr{};
-			_trunkResolver.resolve(_sipTrunk.config().transportHost(),
-				_sipTrunk.config().transportPort(), unusedAddr, now);
+			sockaddr_in sbc{};
+			// Issue #399: and REGISTER once there is an address -- at boot, on
+			// a 401/407 retry, and to refresh before Expires. The carrier does
+			// not route to an unregistered trunk.
+			if (_trunkResolver.resolve(_sipTrunk.config().transportHost(),
+				_sipTrunk.config().transportPort(), sbc, now) == TrunkResolver::Status::Hit)
+			{
+				_sipTrunk.tickRegistration(static_cast<uint64_t>(
+					std::chrono::duration_cast<std::chrono::milliseconds>(
+						now.time_since_epoch()).count()), sbc);
+			}
 		}
 
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,

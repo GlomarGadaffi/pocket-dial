@@ -39,7 +39,7 @@ struct PbxEnv
 	// Draw a SipMessage from the fixed pool. Falls back to a BOUNDED number of
 	// heap allocations and then returns nullptr (Issue #101(A)) — check it before
 	// dereferencing. The contract on refusal is to drop: the peer retransmits.
-	virtual std::shared_ptr<SipMessage> messageFromPool(std::string raw, sockaddr_in src) = 0;
+	virtual std::shared_ptr<SipMessage> messageFromPool(std::string_view raw, sockaddr_in src) = 0;
 
 	// Release any client transaction still retransmitting for this Call-ID.
 	//

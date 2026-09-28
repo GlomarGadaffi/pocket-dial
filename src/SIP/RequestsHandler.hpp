@@ -840,9 +840,9 @@ private:
 		if (!msg) return;
 		_outbox.emplace_back(to, std::move(msg));
 	}
-	std::shared_ptr<SipMessage> messageFromPool(std::string raw, sockaddr_in src) override
+	std::shared_ptr<SipMessage> messageFromPool(std::string_view raw, sockaddr_in src) override
 	{
-		return getMessageFromPool(std::move(raw), src);
+		return getMessageFromPool(raw, src);
 	}
 	void freeTransactionsForCallId(std::string_view callId) override
 	{
