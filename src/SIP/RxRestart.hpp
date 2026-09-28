@@ -17,7 +17,8 @@ namespace pd
 		Start,           // no rx task on this slot: create one
 		AlreadyPolling,  // a live task (or a teardown in progress) owns the slot
 		Restart,         // the old task has provably finished with the slot: replace it
-		StillExiting,    // it cleared rxRunning but has not given its done-sem yet
+		StillExiting,    // it cleared rxRunning but has not given its done-sem yet, or (#682)
+		                 // a teardown with no rx task is still freeing the slot: refuse, retry
 	};
 
 	// handleSet:   slot->rxTaskHandle != nullptr
@@ -31,7 +32,9 @@ namespace pd
 	// second task on the same slot would follow.
 	inline RxStart rxRestartDecision(bool handleSet, bool rxRunning, bool tearingDown, bool semTaken)
 	{
-		if (!handleSet) return RxStart::Start;
+		// #682: a stop that found no rx task still closes getClient and frees the slot; a
+		// task started under it would lose both. Refuse until the teardown is done.
+		if (!handleSet) return tearingDown ? RxStart::StillExiting : RxStart::Start;
 		if (rxRunning || tearingDown) return RxStart::AlreadyPolling;
 		return semTaken ? RxStart::Restart : RxStart::StillExiting;
 	}
