@@ -12,6 +12,7 @@ public:
 	static constexpr auto REQUEST_TERMINATED = "SIP/2.0 487 Request Terminated";
 	static constexpr auto TRYING             = "SIP/2.0 100 Trying";
 	static constexpr auto RINGING            = "SIP/2.0 180 Ringing";
+	static constexpr auto SESSION_PROGRESS   = "SIP/2.0 183 Session Progress";
 	static constexpr auto BUSY               = "SIP/2.0 486 Busy Here";
 	static constexpr auto UNAVAILABLE        = "SIP/2.0 480 Temporarily Unavailable";
 	// 503. Every other status here had a constant and this one did not, so it
