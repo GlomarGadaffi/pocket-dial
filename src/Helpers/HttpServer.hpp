@@ -196,6 +196,12 @@ public:
 	// smaller buffer capacity (<= kStatusBufBytes) so the refusal path is testable.
 	void sendApiStatusForTest(int sock, bool authenticated) { sendApiStatus(sock, authenticated); }
 	void setStatusCapForTest(size_t cap) { _statusCap = cap; }
+	// #410 done-when 4 (route allocation gate): run one whole request ON THE
+	// CALLING THREAD, and call `mark` once the request is read and parsed, just
+	// before the route table. The gate counts route (dispatch + response)
+	// allocations from there; request reading is done-when 2's business.
+	void handleClientForTest(int sock) { handleClient(sock); }
+	static void setDispatchMarkForTest(void (*mark)());
 	void sendResponseForTest(int sock, int statusCode, std::string_view statusText,
 	                   std::string_view contentType, std::string_view body,
 	                   std::string_view extraHeader);
