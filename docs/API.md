@@ -323,7 +323,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
 | [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
-| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image. Simulated (`200`, no-op) on desktop. |
+| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts with `confirm=1` if none is staged (#645). Simulated (`200`, no-op) on desktop. |
 | [`/setup/email`](#get-setupemail) | `GET` | Low | None | Standalone SMTP-configuration page (own document, not part of the `/` SPA). Shell only, no data. |
 | [`/api/email`](#get-apiemail) | `GET` | Medium | Gated | Current SMTP configuration. Secrets redacted to `hasPassword`/`hasGsaKey` booleans. |
 | [`/api/email`](#post-apiemail) | `POST` | High | Gated (+ `X-CSRF`) | Saves SMTP host/port/mode/auth/credentials. Empty `pass`/`gsaKey`/`caPem` keeps the stored value. |
@@ -876,7 +876,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `httpPort` | Integer | The active TCP HTTP port (typically 80). |
 | `httpReadDeadlineDrops` | Integer | HTTP connections dropped because the request (headers + buffered body) did not arrive within 10 s of the accept (#529), or whose receive timeout could not be set at all (#534; closed unread rather than left to block). A climbing count means a slow or hostile client. |
 | `httpPerSourceRefusals` | Integer | HTTP connections refused `503` because one source address already held 3 of the 4 connection slots (#529). |
-| `httpStatusRefusals` | Integer | `/api/status` responses refused `500` because the body did not fit its fixed per-connection buffer (24 KB x 4; 16 KB x 2 without PSRAM, where a third concurrent poll gets the `503`), or `503` because that buffer failed to allocate at boot (#410). Never truncated. |
+| `httpStatusRefusals` | Integer | `/api/status` responses refused `500` because the body did not fit its fixed per-connection buffer (24 KB x 4; 16 KB x 2 without PSRAM, where a third concurrent poll gets the `503`), or `503` because that buffer failed to allocate at boot (#410). Since #630 `GET /metrics` leases the same buffers, so its refusals count here too. Never truncated. |
 | `memory.dynamicTaskCreates` | Integer | (#479) Tasks created with a heap stack and TCB since boot: every `pd::createTaskPreferPsram()` task plus the media call path's `conf_mix_tick` and `moh_tx`. RTP media tasks run on boot-preallocated stacks and are not counted. Read it before and after a call; the difference is the call path's dynamic task creation (0 for an ordinary extension-to-extension call). Also counts the anchor client's one-shot `tel_restart`, `tel_rewarm` and `tel_reconcile` workers. |
 | `version` | String | (#411) The firmware build stamp (the `git describe` of the commit it was built from). No build host, path or timestamp. |
 | `wifiCapable` | Boolean | (#167) Whether this build has a radio at all. `false` on the Ethernet builds, so an empty Wi-Fi scan is not mistaken for "no networks found". |
@@ -1282,10 +1282,10 @@ curl -s "http://$DEV/api/registrar" -b "pd_session=$SESSION"
 | `mode` | `learn` \| `secure` | Required. The admission policy. `open` is retired (#500) and answers `400`. |
 | `confirm` | `LOCKOUT` | Only consulted when switching to `secure`; see below. |
 
-* `learn`: trust-on-first-use, and the default. An unknown MAC registering an unclaimed
-  extension is adopted and locked to it, while already-secured devices stay
-  digest-enforced. Adopt phones on a trusted/WPA2 link; an extension nobody has adopted
-  yet can still be claimed by the first device to ask (#440).
+* `learn`: trust-on-first-use, and the default. An unknown MAC registering an extension
+  is adopted unverified, while already-secured devices stay digest-enforced and
+  MAC-locked. Adopt phones on a trusted/WPA2 link; an extension that is not secured can
+  still be claimed by any device that asks (#440).
 * `open` (retired, #500): used to accept every `REGISTER` with no credential. A board that
   had it stored boots `learn` and rewrites the setting; a config import that says `open`
   applies `learn` and lists it under `skipped`.
@@ -2487,22 +2487,24 @@ streams past the 16 KB buffered cap; a `413` there would mean the streaming bypa
 regressed) and TC-OTA-04 (`Content-Length: 0` → `411`).
 
 ### `POST /api/ota/reboot`
-Reboots into the image staged by a prior `/api/ota/upload`. ESP32: refuses if there is no pending image (the boot and running partitions already match). Desktop: always returns a simulated success without exiting the process, so the smoke-test harness keeps running.
+Reboots into the image staged by a prior `/api/ota/upload`, or, with nothing staged (the boot and running partitions already match), does a plain restart (#645; this used to be a `409`). Desktop: always returns a simulated success without exiting the process, so the smoke-test harness keeps running.
 
 * Requires Same-Origin Check: Yes
 * Requires `pd_session` cookie: Always (see §0)
 * Build: `ESP_PLATFORM`-guarded, so it is real on `eth`/`lan8720` and simulated only on the host build; see §4.2.
-* Request Headers: None. **No request parameters and no confirmation token**, unlike `/api/factory-reset`; an empty authenticated POST reboots the device. The `409` guard below is the only thing standing between a stray POST and a reboot.
+* Request Headers: None.
+* Request Body (`application/x-www-form-urlencoded`): `confirm=1`, required for a plain restart (no staged image), like `confirm=ERASE` on `/api/factory-reset`: a reboot drops live calls, 911 included. A reboot into a staged image needs no parameter.
 * Response Content-Type: `application/json`
 * Response Status Codes:
   * `200 OK`: Reboot scheduled ~1 s out (ESP) or simulated (desktop).
+  * `400 Bad Request`: `{"error":"reboot with no staged image requires confirm=1"}`, nothing staged and no `confirm=1`.
   * `401`/`403`: gates 1-4 as in §0.1.
-  * `409 Conflict` (ESP): `{"error":"no pending OTA image to boot into"}`, the boot partition already equals the running one, i.e. nothing was staged.
 
 #### Response Example (200 OK, ESP32)
 ```json
 {
   "status": "ok",
+  "staged": true,
   "message": "rebooting into the new image..."
 }
 ```
@@ -2511,6 +2513,7 @@ Reboots into the image staged by a prior `/api/ota/upload`. ESP32: refuses if th
 ```json
 {
   "status": "ok",
+  "staged": false,
   "simulated": true,
   "message": "reboot is a no-op on the desktop build"
 }
@@ -2518,14 +2521,15 @@ Reboots into the image staged by a prior `/api/ota/upload`. ESP32: refuses if th
 
 The `"simulated":true` key is present **only** on the desktop response; a real ESP
 reboot response omits it entirely. That is the one reliable way to tell the two apart.
+`staged` is `false` for a plain restart with no OTA image staged (`"message":"rebooting..."` on ESP).
 
 ```bash
 curl -s -X POST "http://$DEV/api/ota/reboot" \
-     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF"
+     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" -d "confirm=1"
 ```
 
-Covered by `test_api.sh` TC-OTA-05 (cross-origin → `403`), TC-OTA-06 (`200` or `409`
-same-origin) and TC-OTA-07 (the desktop stub must not exit the process).
+Covered by `test_api.sh` TC-OTA-05 (cross-origin → `403`), TC-OTA-06 (`200`
+same-origin), the host test `OtaReboot.NoStagedImageIsAPlainRestartNotA409` and TC-OTA-07 (the desktop stub must not exit the process).
 
 ### `GET /setup/email`
 

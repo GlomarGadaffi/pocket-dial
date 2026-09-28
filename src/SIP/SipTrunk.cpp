@@ -853,7 +853,10 @@ void SipTrunk::tickRegistration(uint64_t nowMs, const sockaddr_in& sbc)
 
 void SipTrunk::sendRegisterIfDue(uint64_t nowMs)
 {
-	if (!_reg.tick(nowMs, _regReq)) return;
+	// #617: Timer E resends the bytes still in _regReq -- same branch and CSeq.
+	// REGISTER is not tracked by TransactionLayer (classify() excludes it), so
+	// this is its only retransmit schedule.
+	if (!_reg.tick(nowMs, _regReq) && !_reg.retransmitDue(nowMs)) return;
 	_env.enqueue(_regPeer, _env.messageFromPool(
 		std::string_view(_regReq.bytes, _regReq.len), _regPeer));
 }
@@ -868,6 +871,7 @@ bool SipTrunk::handleRegisterResponse(const std::shared_ptr<SipMessage>& data)
 	// went to may answer it. Consumed either way.
 	if (data->getSource().sin_addr.s_addr != _regPeer.sin_addr.s_addr)
 	{
+		++_regForgedResponses;   // #617: spoofing is countable, not just a log line
 		_env.log("Trunk: REGISTER response from a non-carrier address dropped", true);
 		return true;
 	}

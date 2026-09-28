@@ -448,7 +448,21 @@ bool SipRegistrationClient::tick(uint64_t nowMs, Request& out)
 	_sendArmed = false;
 	_sentAtMs  = nowMs;
 	_state     = State::Registering;
+	_retransmitIntervalMs = kTimerET1Ms;
+	_retransmitAtMs       = nowMs + kTimerET1Ms;
 	if (_registerAttempts < 0xFFFFFFFFu) ++_registerAttempts;
+	return true;
+}
+
+bool SipRegistrationClient::retransmitDue(uint64_t nowMs)
+{
+	if (!_configured || _state != State::Registering || _sendArmed) return false;
+	if (nowMs < _retransmitAtMs) return false;
+	// §17.1.2.2: Timer E resets to MIN(2*interval, T2). Timed from now, not from
+	// the last deadline, so a late tick sends one copy rather than a burst.
+	_retransmitIntervalMs *= 2;
+	if (_retransmitIntervalMs > kTimerET2Ms) _retransmitIntervalMs = kTimerET2Ms;
+	_retransmitAtMs = nowMs + _retransmitIntervalMs;
 	return true;
 }
 
@@ -465,6 +479,7 @@ void SipRegistrationClient::onResponse(uint64_t nowMs, const ResponseView& r)
 	// It ends nothing (RFC 3261 §17.1.2) — keep waiting.
 	if (r.code >= 100 && r.code < 200)
 	{
+		_retransmitIntervalMs = kTimerET2Ms;   // §17.1.2.2 Proceeding: resend at T2
 		return;
 	}
 
