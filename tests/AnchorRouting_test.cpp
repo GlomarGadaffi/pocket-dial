@@ -1216,3 +1216,65 @@ TEST(AnchorRouting, TheHandsetsAckDisarmsTheAnchorAckDeadline)
 		EXPECT_NE(msg ? msg->toString().rfind("BYE ", 0) : 1u, 0u) << "no BYE on a healthy call";
 	}
 }
+
+TEST(AnchorRouting, AnAnchorCallWhoseHandsetGoesSilentIsEndedButNeverWhileHeld)
+{
+	// Issue #604: with no BYE and (after #603) no keepalive prune, a dead phone
+	// held its anchor leg until the lease ran out. Held is exempt: a sendonly or
+	// inactive leg legitimately sends nothing.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-604"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+	const std::string id = "Call-ID: anchor-604";
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest(id);
+	ASSERT_NE(bridge, nullptr);
+	auto session = handler.getSession(id);
+	ASSERT_TRUE(session.has_value());
+	handler.tick();   // arms the watch
+
+	// Held and silent well past the timeout: kept.
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-604", 2, "a=sendonly\r\n"));
+	ASSERT_EQ(session.value()->getState(), Session::State::Held);
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_TRUE(handler.getSession(id).has_value()) << "a held call is never ended for silence";
+
+	// Resumed: the watch starts over rather than firing at once.
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-604", 3, "a=sendrecv\r\n"));
+	ASSERT_EQ(session.value()->getState(), Session::State::Connected);
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_TRUE(handler.getSession(id).has_value()) << "resume restarts the clock";
+
+	// Control: handset audio still arriving 61 s on keeps the call.
+	const std::vector<uint8_t> frame(160, 0xFF);
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	bridge->onHandsetRtp(frame.data(), frame.size());
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_TRUE(handler.getSession(id).has_value()) << "a talking handset is live";
+
+	// The handset goes silent for 61 s: ended, bridge released, handset BYEd.
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	handler.forceNextTickForTest();
+	sent.clear();
+	handler.tick();
+	EXPECT_FALSE(handler.getSession(id).has_value());
+	EXPECT_FALSE(bridge->isActive());
+	size_t byes = 0;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg || addr.sin_addr.s_addr != addrFor("192.168.9.51").sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.rfind("BYE ", 0) == 0 && raw.find("Call-ID: anchor-604") != std::string::npos) ++byes;
+	}
+	EXPECT_EQ(byes, 1u);
+}

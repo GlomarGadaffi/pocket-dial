@@ -737,3 +737,78 @@ TEST(TrunkWiring, ACarrierRefusalAfterEarlyMediaRefusesTheHandsetAndFreesTheRela
 		<< "the refusal ends the early dialog the 183 opened";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
 }
+
+// ── Issue #604: RTP inactivity ends a call whose media stopped with no BYE ──
+
+TEST(TrunkWiring, ATrunkCallWhoseHandsetLegGoesSilentIsEndedAfterTheInactivityTimeout)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-604"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+	const std::string id = "Call-ID: call-604";
+	auto session = b.handler.getSession(id);
+	ASSERT_TRUE(session.has_value());
+	b.handler.tick();   // arms the watch
+
+	// Control: both legs still flowing 61 s on. The call stays up.
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	ASSERT_TRUE(b.handler.trunkRtpForTest(id, /*fromCarrier=*/true));
+	ASSERT_TRUE(b.handler.trunkRtpForTest(id, /*fromCarrier=*/false));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+	b.handler.tick();
+	ASSERT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "a call with media both ways is live";
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+
+	// The phone loses power: the carrier keeps sending, the handset leg is dead.
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	ASSERT_TRUE(b.handler.trunkRtpForTest(id, /*fromCarrier=*/true));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+	b.handler.tick();
+
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the billed carrier leg must be hung up";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u) << "and the handset told, best effort";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and the relay pair released";
+	EXPECT_FALSE(b.handler.getSession(id).has_value());
+}
+
+TEST(TrunkWiring, AnEmergencyCallIsNeverEndedForRtpSilence)
+{
+	// A 911 caller who cannot speak, on a phone with silence suppression, sends
+	// no RTP. Hanging up on them is worse than holding a leg. Positive control:
+	// an ordinary call equally silent beside it IS ended.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-911"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	b.sent.clear();
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-604b", 40002));
+	const auto plain = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		plain.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 2u) << "precondition: both calls are up";
+	auto s911 = b.handler.getSession("Call-ID: call-911");
+	auto sPlain = b.handler.getSession("Call-ID: call-604b");
+	ASSERT_TRUE(s911.has_value() && sPlain.has_value());
+	b.handler.tick();   // arms the watch
+
+	s911.value()->ageRtpWatchForTest(std::chrono::seconds(600));
+	sPlain.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+	b.handler.tick();
+
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-911").has_value()) << "911 is never reaped";
+	EXPECT_FALSE(b.handler.getSession("Call-ID: call-604b").has_value())
+		<< "control: the ordinary silent call is";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "exactly one carrier leg hung up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "the 911 relay pair is untouched";
+}

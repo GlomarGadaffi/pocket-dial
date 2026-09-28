@@ -442,6 +442,22 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #604: one RTP packet arriving on a trunk call's carrier or handset leg,
+	// through the same dispatchRaw() the receive task calls. False if not relayed.
+	bool trunkRtpForTest(const std::string& callID, bool fromCarrier)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		auto sit = _sessions.find(callID);
+		if (sit == _sessions.end() || !sit->second->isTrunk()) return false;
+		const int slot = sit->second->getTrunkRelaySlot();
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS)) return false;
+		static const uint8_t payload[160] = {};
+		RtpReceiver::RtpPacket pkt;
+		pkt.version = 2;
+		pkt.payload = payload;
+		pkt.payloadLen = sizeof(payload);
+		return (fromCarrier ? _trunkRx[slot] : _handsetRx[slot]).dispatchRaw(pkt);
+	}
 
 	// What the resolver currently knows about the configured SBC host. Refused
 	// means nothing is known and nothing is in flight; anything else means a
