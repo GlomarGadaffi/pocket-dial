@@ -1,0 +1,2 @@
+# RxRestart_test.cpp: 1 (#682: no rx task is started on a slot being torn down)
+1

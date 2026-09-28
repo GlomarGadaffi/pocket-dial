@@ -20,6 +20,17 @@ TEST(RxRestart, NoHandleStartsAndALiveOrTearingDownTaskIsLeftAlone)
 	EXPECT_EQ(rxRestartDecision(true, true, true, false), RxStart::AlreadyPolling);
 }
 
+TEST(RxRestart, NoTaskIsStartedOnASlotBeingTornDown)
+{
+	// #682: stopMediaStreams() with a null rx handle still closes the slot's
+	// getClient and frees the slot. A task started under it would have its
+	// client closed and its slot freed while it runs. Refuse; the next upsert
+	// or re-prime retries once the teardown has finished.
+	EXPECT_EQ(rxRestartDecision(false, false, /*tearingDown=*/true, false), RxStart::StillExiting);
+	// Positive control: the same free slot, not tearing down, starts.
+	EXPECT_EQ(rxRestartDecision(false, false, false, false), RxStart::Start);
+}
+
 TEST(RxRestart, AnExitedTaskIsReplacedOnlyOnceItsDoneSemIsTaken)
 {
 	// The #575 review's race: rxRunning is clear but the task has not given its
