@@ -2326,7 +2326,7 @@ default-credential/needs-initial-setup state, then reboots.
     every ESP build a reboot is scheduled ~1 s out. The `message` field differs by build
     (captive portal / dashboard / restart the process) but the status does not.
   * `400 Bad Request`: `{"error":"factory reset requires confirm=ERASE"}`. Checked **first**, before anything is touched, so a request without it is genuinely harmless.
-  * `409 Conflict`: `{"error":"emergency call in progress"}`, while a 911/933 call is live (#652). Checked right after `confirm`, also before anything is touched.
+  * `409 Conflict`: `{"error":"emergency call in progress"}`, while a 911/933 call is live (#652). Checked right after `confirm`, also before anything is touched. A 911/933 that starts after this check holds the ESP restart until it ends.
   * `403 Forbidden`: `{"error":"owner privilege required"}`. A sysop session, with an owner already provisioned.
   * `401`/`403`: gates 1-4 as in §0.1.
 

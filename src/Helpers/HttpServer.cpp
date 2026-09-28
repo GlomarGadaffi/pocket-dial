@@ -4464,7 +4464,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// 4096, not 2048 (#456 review): nvs_flash_erase()'s worst static chain is
 	// ~1,920 B and finish() writes a flash sector; an overflow here would panic
 	// mid-erase -- the half-reset state.
-	if (xTaskCreate([](void*) {
+	if (xTaskCreate([](void* h) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
 		// #473: the guard begun above still refuses new NVS data writes; drain any
 		// write already in flight (the CDR persist writer) before the partition is
@@ -4479,8 +4479,12 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 			ESP_LOGE("factory_reset", "nvs_flash_erase failed -- per-key erases stand, old NVS bytes may remain");
 		}
 		resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
+		// #652: a 911/933 placed after the 409 check above would be dropped by the
+		// restart; hold it until no emergency session is live, as the OTA reboot does.
+		while (h && static_cast<RequestsHandler*>(h)->hasLiveEmergencyCall())
+			vTaskDelay(pdMS_TO_TICKS(1000));
 		esp_restart();
-	}, "restart_task", 4096, NULL, 5, NULL) != pdPASS)
+	}, "restart_task", 4096, _handler.load(std::memory_order_acquire), 5, NULL) != pdPASS)
 	{
 		// The reply has gone out and the per-key erases are done; without the task
 		// there is no whole-partition erase, but the board must still restart
