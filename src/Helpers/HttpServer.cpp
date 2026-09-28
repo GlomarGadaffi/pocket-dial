@@ -1682,8 +1682,8 @@ namespace
 {
 	struct JsonOut
 	{
-		char* buf;
-		size_t cap;
+		char* buf = nullptr;
+		size_t cap = 0;
 		size_t len = 0;
 		bool full = false;
 
