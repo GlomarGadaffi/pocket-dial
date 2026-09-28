@@ -50,8 +50,8 @@ namespace resetguard
 		return w;
 	}
 
-	inline void begin() { flagRef().store(true); }
-	inline bool inProgress() { return flagRef().load(); }
+	inline void begin() { flagRef().store(true, std::memory_order_seq_cst); }
+	inline bool inProgress() { return flagRef().load(std::memory_order_seq_cst); }
 
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 	// Host-only seam (#476 review): runs INSIDE WriteScope's constructor, between
@@ -83,13 +83,13 @@ namespace resetguard
 			// Count first, THEN check. The reverse order lets a reset that
 			// begins between the two steps see zero writers and erase under a
 			// writer that has already decided it is allowed.
-			writersRef().fetch_add(1);
+			writersRef().fetch_add(1, std::memory_order_seq_cst);
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 			if (BetweenStepsHook h = betweenStepsHookForTest()) h();
 #endif
 			_allowed = !inProgress();
 		}
-		~WriteScope() { writersRef().fetch_sub(1); }
+		~WriteScope() { writersRef().fetch_sub(1, std::memory_order_seq_cst); }
 		WriteScope(const WriteScope&) = delete;
 		WriteScope& operator=(const WriteScope&) = delete;
 		bool allowed() const { return _allowed; }
@@ -102,7 +102,7 @@ namespace resetguard
 	// false on timeout, which the caller should log; the reset still proceeds.
 	inline bool waitForWritersIdle(uint32_t timeoutMs)
 	{
-		for (uint32_t waited = 0; writersRef().load() != 0; waited += 5)
+		for (uint32_t waited = 0; writersRef().load(std::memory_order_seq_cst) != 0; waited += 5)
 		{
 			if (waited >= timeoutMs) return false;
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
