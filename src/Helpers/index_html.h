@@ -402,7 +402,7 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
        and 911 still routes out. -->
   <div class="note" id="e911-banner" role="status" style="display:none;color:var(--warn)">&#9888;
     <b>E911 not configured.</b> A 911 call still routes out, but nobody on site is
-    notified. Set the notify list and location via <code>PUT /api/e911-config</code>.</div>
+    notified. Set the notify list and location in <a href="#" onclick="openPbxModal();return false">PBX Settings &rarr; E911 Notification</a>.</div>
 
   <!-- ══ PATCH BAY ══ -->
   <section class="patch-bay">
@@ -1621,6 +1621,24 @@ function saveRegistrarMode(){
   var mode=$("reg-mode").value;
   postRegistrarMode(mode,false);
 }
+/* ════ E911 NOTIFICATION (#641): form lives in #pbx-modal ════ */
+function fillE911(d){if(!d)return;$("e911-exts").value=d.notifyExts||"";$("e911-callback").value=d.callback||"";$("e911-location").value=d.location||"";}
+/* Save stays off until a load succeeds: saving blank fields would erase the notify list. */
+function fetchE911(){
+  fetch("/api/e911-config",{credentials:"same-origin"}).then(function(r){
+    if(r.status===401){handleAuthExpired();throw new Error("session expired");}
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(d){fillE911(d);$("e911-save").disabled=false;setMsg("e911-msg","","");})
+  .catch(function(e){$("e911-save").disabled=true;setMsg("e911-msg","Could not load E911 settings ("+e.message+"). Save is off; reopen to retry.","err");});
+}
+/* The server echoes what it kept (list truncated, bad field dropped), so show that. */
+function saveE911(){
+  if(!gateCheck())return;
+  put("/api/e911-config","notifyExts="+encodeURIComponent($("e911-exts").value.trim())+"&callback="+encodeURIComponent($("e911-callback").value.trim())+"&location="+encodeURIComponent($("e911-location").value.trim()))
+    .then(function(t){fillE911(parseJsonOr(t));setMsg("e911-msg","Saved. The fields show what was kept.","ok");fetchStatus();})
+    .catch(function(e){setMsg("e911-msg",e.message,"err");});
+}
 function postRegistrarMode(mode,confirmLockout){
   var body="mode="+encodeURIComponent(mode)+(confirmLockout?"&confirm=LOCKOUT":"");
   post("/api/registrar",body)
@@ -1928,7 +1946,7 @@ function removeDidMapping(did){
 
 /* ════ PBX SETTINGS / MUSIC ON HOLD ════ */
 var mohUploading=false;
-function openPbxModal(){if(!gateCheck())return;openModal("pbx-modal");fetchMohStatus();}
+function openPbxModal(){if(!gateCheck())return;openModal("pbx-modal");fetchMohStatus();fetchE911();}
 function fmtClock(s){s=Math.max(0,Math.round(s||0));var m=Math.floor(s/60);var r=s%60;return m+":"+(r<10?"0":"")+r;}
 function fetchMohStatus(){
   fetch("/api/moh",{credentials:"same-origin"}).then(function(r){
@@ -2087,6 +2105,15 @@ setInterval(function(){if($("pbx-modal").classList.contains("show"))fetchMohStat
         <button class="btn" id="moh-stop-btn" onclick="mohPreviewStop()">&#9632; Stop</button>
       </div>
       <div class="msg" id="moh-preview-msg"></div>
+
+      <hr class="hr">
+      <div class="subhead">E911 Notification</div>
+      <div class="note">Who is told on site when somebody dials 911. A factory reset clears these.</div>
+      <div class="field"><label for="e911-exts">Notify extensions (spaces or commas)</label><input type="text" id="e911-exts"></div>
+      <div class="field"><label for="e911-callback">Callback number</label><input type="text" id="e911-callback"></div>
+      <div class="field"><label for="e911-location">Location</label><input type="text" id="e911-location"></div>
+      <div class="row"><button class="btn primary" id="e911-save" disabled onclick="saveE911()">Save</button></div>
+      <div class="msg" id="e911-msg"></div>
 
     </div>
   </div>
