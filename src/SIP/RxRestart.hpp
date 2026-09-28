@@ -7,6 +7,7 @@
 
 #include <string_view>
 
+#include "ParkedTaskReap.hpp"
 #include "RecentIdRing.hpp"
 
 namespace pd
@@ -33,6 +34,26 @@ namespace pd
 		if (!handleSet) return RxStart::Start;
 		if (rxRunning || tearingDown) return RxStart::AlreadyPolling;
 		return semTaken ? RxStart::Restart : RxStart::StillExiting;
+	}
+
+	// Issue #553: may allocSlotLocked() hand this slot to a new participant?
+	// Only when it is free, not mid-teardown, and holds no rx task that is still
+	// alive. A task detached on a join timeout keeps running until its own bounded
+	// exit, and parks; until the owner reaps it (reap != Wait) the slot is off
+	// limits, so a new call can never share a slot with an old rx task.
+	inline bool rxSlotAllocatable(bool participantEmpty, bool tearingDown, ReapDecision reap)
+	{
+		return participantEmpty && !tearingDown && reap != ReapDecision::Wait;
+	}
+
+	// #608 review: a detached rx task counts toward the #65 restart only while it
+	// is still alive. Reaping it takes it back out, or benign detaches add up and
+	// the restart drops live calls. Returns the delta for the detach counter.
+	inline int detachCountDeltaOnReap(bool& slotDetached)
+	{
+		if (!slotDetached) return 0;
+		slotDetached = false;
+		return -1;
 	}
 
 	// Issue #554 (b): a leg we dropped never gets a fresh rx task (and its POST)
