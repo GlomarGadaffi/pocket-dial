@@ -63,6 +63,19 @@ class AnchorRxStaticSlot(unittest.TestCase):
         self.assertNotRegex(reap, r"\bpd::deleteTask\s*\(")
         self.assertRegex(reap, r"\bvTaskDelete\(slot\.rxTaskHandle\);")
 
+    def test_rx_task_arg_lives_in_the_slot(self):
+        # #479 A follow-up: an rx start allocates nothing; the arg is the slot's own,
+        # set once in the constructor (self/slot never change, so it is never rewritten).
+        cpp = code(CPP)
+        start = body_of(cpp, "bool TelephonyAnchorClient::startRxIfNeeded(")
+        self.assertEqual(len(rx_creates(start)), 1)   # positive control: the create site is here
+        self.assertNotRegex(cpp, r"\bnew\b[^;]*\bRxTaskArg\b")
+        self.assertNotRegex(cpp, r"\bdelete\s+(a|arg)\s*;")
+        self.assertRegex(start, r"RxTaskArg\*\s*arg\s*=\s*&slot->rxArg;")
+        self.assertRegex(code(HPP), r"RxTaskArg\s+rxArg\b")
+        ctor = body_of(cpp, "TelephonyAnchorClient::TelephonyAnchorClient()\n{")
+        self.assertRegex(ctor, r"s\.rxArg\s*=\s*RxTaskArg\{this,\s*&s\}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,9 @@ namespace pd
 
 		constexpr uint32_t kTxInternalBytes = kTxSlots * kTxStackBytes;
 		constexpr uint32_t kRxPsramBytes    = kRxSlots * kRxStackBytes;
+		// #479 A (#661): each anchor CallSlot's tel_media_rx stack is boot-allocated too.
+		constexpr uint32_t kAnchorRxStackBytes = 6144;
+		constexpr uint32_t kAnchorRxBytes      = POCKETDIAL_MAX_ANCHOR_CALLS * kAnchorRxStackBytes;
 	}
 }
 
@@ -48,12 +51,14 @@ namespace pd
 #if !defined(CONFIG_SPIRAM) || !CONFIG_SPIRAM
 // No PSRAM (esp32_constrained): rx stacks fall back to internal too, so every
 // slot is internal DRAM, fixed at boot. SIP_CONSTRAINED (no conference, tx
-// pool 3): 3 x 3 KB tx + 4 x 6 KB rx = 33 KB. No conference room here.
+// pool 3): 3 x 3 KB tx + 4 x 6 KB rx + 1 x 6 KB anchor tel_media_rx = 39 KB.
+// No conference room here.
 static_assert(!POCKETDIAL_CONFERENCE,
               "#479: no conference room on a no-PSRAM build (SIP_CONSTRAINED sets "
               "POCKETDIAL_CONFERENCE=0)");
-static_assert(pd::rtpslots::kTxInternalBytes + pd::rtpslots::kRxPsramBytes <= 72u * 1024u,
-              "#479: no-PSRAM build fixes too much internal DRAM in RTP task slots; "
+static_assert(pd::rtpslots::kTxInternalBytes + pd::rtpslots::kRxPsramBytes
+              + pd::rtpslots::kAnchorRxBytes <= 72u * 1024u,
+              "#479: no-PSRAM build fixes too much internal DRAM in RTP/anchor task slots; "
               "build with SIP_CONSTRAINED=1 or lower the POCKETDIAL_* call caps");
 #endif
 #endif

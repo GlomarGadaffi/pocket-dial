@@ -99,8 +99,20 @@ class RtpStaticSlots(unittest.TestCase):
         a, v, t, p = (int(caps[k]) for k in ("POCKETDIAL_MAX_ANCHOR_CALLS", "POCKETDIAL_MAX_VOICEMAIL_LEGS",
                                             "POCKETDIAL_MAX_TRUNK_CALLS", "POCKETDIAL_RTP_TX_POOL"))
         rx = a + v + 2 * t
-        # No PSRAM: every stack is internal, fixed at boot. Stated: 3 x 3 KB + 4 x 6 KB = 33 KB.
-        self.assertLessEqual(p * 3072 + rx * 6144, 72 * 1024)
+        # No PSRAM: every stack is internal, fixed at boot, including each anchor
+        # CallSlot's tel_media_rx (#479 A / #661): 3 x 3 KB + 4 x 6 KB + 1 x 6 KB = 39 KB.
+        total = p * 3072 + rx * 6144 + a * 6144
+        self.assertLessEqual(total, 72 * 1024)
+        # The stated total must be the real one (it said 33 KB and left out the anchor).
+        stated = int(re.search(r"rtpslots=\S*?=(\d+)KB-internal", cm).group(1))
+        self.assertEqual(stated * 1024, total)
+        # ... and the build-time static_assert counts the anchor slots too.
+        slots = "".join(code("src/SIP/RtpTaskSlots.hpp"))
+        self.assertRegex(slots, r"kAnchorRxBytes\s*=\s*POCKETDIAL_MAX_ANCHOR_CALLS \* kAnchorRxStackBytes;")
+        expr = slots[slots.index("static_assert(pd::rtpslots::kTxInternalBytes"):]
+        self.assertIn("pd::rtpslots::kAnchorRxBytes", expr[:expr.index("<=")])
+        anchor = "".join(code("src/SIP/TelephonyAnchorClient.cpp"))
+        self.assertRegex(anchor, r"rxMem\.alloc\(\"tel_media_rx\", pd::rtpslots::kAnchorRxStackBytes")
 
     def test_mix_ports_follow_the_conference_legs(self):
         text = "".join(code("src/SIP/MixBus.hpp"))

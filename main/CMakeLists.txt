@@ -273,8 +273,9 @@ if(SIP_CONSTRAINED)
         # Issue #479: every RTP media slot's 6 KB task stack is allocated at
         # boot, and with no PSRAM the rx stacks are internal too. No conference
         # room here (888 answers 403 "conference disabled on this build"), and
-        # these caps give 3 tx x 3 KB (shared pool) + 4 rx x 6 KB = 33 KB internal
-        # fixed at boot (RtpTaskSlots.hpp static_asserts <= 72 KB, no room).
+        # these caps give 3 tx x 3 KB (shared pool) + 4 rx x 6 KB + 1 anchor
+        # tel_media_rx x 6 KB = 39 KB internal fixed at boot (RtpTaskSlots.hpp
+        # static_asserts <= 72 KB, no room).
         POCKETDIAL_MAX_ANCHOR_CALLS=1
         POCKETDIAL_MAX_VOICEMAIL_LEGS=1
         POCKETDIAL_MAX_TRUNK_CALLS=1
@@ -288,7 +289,7 @@ if(SIP_CONSTRAINED)
     if(NOT DEFINED POCKETDIAL_PCAP_RING_SIZE)
         set(POCKETDIAL_PCAP_RING_SIZE 4)
     endif()
-    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 conference=off rtpslots=3x3KBtx+4x6KBrx=33KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
+    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 conference=off rtpslots=3x3KBtx+4x6KBrx+1x6KBanchor=39KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
 endif()
 
 # PcapCapture.hpp has always advertised itself as "compile-time tunable

@@ -159,6 +159,10 @@ private:
 	// by the slot's own postMutex/getMutex (same discipline as the old single _post/_getMutex).
 	// The persistent warm postClient is kept alive across calls on this slot for TLS-session
 	// resumption (handle!=null no longer means "streaming"; postLive does).
+	struct CallSlot;
+	// Arg handed to a slot's rx task so the static trampoline knows its slot. Lives in the
+	// slot (#479 follow-up) and is set once at construction: self/slot never change.
+	struct RxTaskArg { TelephonyAnchorClient* self; CallSlot* slot; };
 	struct CallSlot
 	{
 		std::string              participantId;          // "" = free (guarded by _mutex)
@@ -190,6 +194,7 @@ private:
 		// (#553/#608). A detached or still-running rx keeps the handle, so the slot stays
 		// busy and allocSlotLocked()/startRxIfNeeded() refuse rather than reuse the memory.
 		pd::StaticTaskSlot       rxMem;
+		RxTaskArg                rxArg{nullptr, nullptr};   // #479: the rx task's arg, no per-call new
 		SemaphoreHandle_t        rxDoneSem    = nullptr;
 		std::atomic<bool>        tearingDown{false};      // single-entry gate for stopMediaStreams(slot)
 		// Issue #554: true from just before the rx task is created until it has given
@@ -223,8 +228,6 @@ private:
 	// Issue #553: delete a slot's rx task only once it has parked (pd::reapDecision);
 	// clears rxTaskHandle on Reap. Caller holds _mutex.
 	pd::ReapDecision reapParkedRxLocked(CallSlot& slot);
-	// Heap arg handed to a slot's rx task so the static trampoline knows its slot.
-	struct RxTaskArg { TelephonyAnchorClient* self; CallSlot* slot; };
 
 	// Persistent control-plane HTTPS connection (makecall / participant drop).
 	// Kept open across requests so each command is one RTT instead of a fresh
@@ -320,7 +323,7 @@ private:
 	// getParticipantStatus() removed (chore #75): the specific-id GET 403s for a
 	// non-controlled leg (issue #40). Use getLegStatus() (list-based) instead.
 
-	static void rxTaskTrampoline(void* arg);   // arg is a heap RxTaskArg{self, slot}
+	static void rxTaskTrampoline(void* arg);   // arg is the slot's RxTaskArg{self, slot}
 	void runRxLoop(CallSlot* slot);
 
 	bool startMediaStreams(const std::string& participantId);
