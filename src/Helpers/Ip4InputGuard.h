@@ -65,10 +65,24 @@ static inline int pd_ip4_input_verdict(uint32_t totLen, uint32_t ipLen, uint32_t
 	return PD_IP4_PASS;
 }
 
+// Issue #559: the mDNS component's lwIP receiver (espressif/mdns
+// mdns_networking_lwip.c receive(), 1.11.x) walks a pbuf chain and treats
+// every pbuf as its own packet, parsing only pb->len -- so a REASSEMBLED
+// datagram (a chain) would be split and each piece parsed as an mDNS message.
+// mDNS has no business being fragmented, so every fragment (first, middle or
+// last: each carries the IP destination) addressed to the mDNS group
+// 224.0.0.251 is dropped, and the datagram never reassembles.
+// dstAddr is the IP destination in HOST byte order.
+#define PD_IP4_MDNS_GROUP 0xE00000FBu   // 224.0.0.251
+static inline int pd_ip4_is_mdns_fragment(uint32_t dstAddr, int moreFragments, uint32_t fragOffset)
+{
+	return (moreFragments || fragOffset != 0) && dstAddr == PD_IP4_MDNS_GROUP;
+}
+
 #if defined(ESP_PLATFORM)
-// Drops since boot: out[0] padded frames, out[1] tiny non-final fragments.
-// main/pd_lwip_hooks.c.
-void pd_ip4_guard_counts(uint32_t out[2]);
+// Drops since boot: out[0] padded frames, out[1] tiny non-final fragments,
+// out[2] mDNS fragments (#559). main/pd_lwip_hooks.c.
+void pd_ip4_guard_counts(uint32_t out[3]);
 #endif
 
 #ifdef __cplusplus

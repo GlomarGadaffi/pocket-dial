@@ -1977,9 +1977,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// Issue #496 / #509 review: frames and fragments the IPv4 input guard
 	// (Ip4InputGuard.h) dropped since boot.
 	{
-		uint32_t g[2] = {0, 0};
+		uint32_t g[3] = {0, 0, 0};
 		pd_ip4_guard_counts(g);
-		json.s("\"ip4Guard\":{\"padded\":").n(g[0]).s(",\"tinyFragments\":").n(g[1]).s("},");
+		json.s("\"ip4Guard\":{\"padded\":").n(g[0]).s(",\"tinyFragments\":").n(g[1])
+		    .s(",\"mdnsFragments\":").n(g[2]).s("},");
 	}
 #endif
 	// #470: CDR ring persist health. A non-zero failure count means call history
