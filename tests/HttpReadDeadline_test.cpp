@@ -234,7 +234,7 @@ TEST(HttpReadDeadline, ASocketWhoseTimeoutCannotBeSetIsClosedUnanswered)
 	// drops. The seam makes the failure deterministic.
 	struct ResetSeam
 	{
-		~ResetSeam() { HttpServer::setFailSocketTimeoutsForTest(false); }
+		~ResetSeam() { HttpServer::setFailSocketTimeoutsForTest(false, false); }
 	} resetSeam;
 
 	RequestsHandler handler("192.168.52.1", 5060,
@@ -244,7 +244,7 @@ TEST(HttpReadDeadline, ASocketWhoseTimeoutCannotBeSetIsClosedUnanswered)
 	server.start();
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-	HttpServer::setFailSocketTimeoutsForTest(true);
+	HttpServer::setFailSocketTimeoutsForTest(/*failRecv=*/true, /*failSend=*/false);
 	Sock s = connectFrom("127.0.0.1", 18252);
 	ASSERT_TRUE(valid(s));
 	ASSERT_TRUE(sendAll(s, "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"));
@@ -253,7 +253,7 @@ TEST(HttpReadDeadline, ASocketWhoseTimeoutCannotBeSetIsClosedUnanswered)
 
 	EXPECT_TRUE(resp.empty()) << "an unbounded socket must not be served: " << resp;
 	EXPECT_EQ(server.readDeadlineDrops(), 1u);
-	HttpServer::setFailSocketTimeoutsForTest(false);
+	HttpServer::setFailSocketTimeoutsForTest(false, false);
 	waitIdle(server);
 }
 
@@ -264,7 +264,7 @@ TEST(HttpReadDeadline, ARefusalWhoseSendTimeoutCannotBeSetClosesUnanswered)
 	// than risk a send() with no bound on the one thread every client needs.
 	struct ResetSeam
 	{
-		~ResetSeam() { HttpServer::setFailSocketTimeoutsForTest(false); }
+		~ResetSeam() { HttpServer::setFailSocketTimeoutsForTest(false, false); }
 	} resetSeam;
 
 	RequestsHandler handler("192.168.52.1", 5060,
@@ -296,13 +296,13 @@ TEST(HttpReadDeadline, ARefusalWhoseSendTimeoutCannotBeSetClosesUnanswered)
 	ASSERT_EQ(server.activeConnectionsForTest(), HttpServer::kMaxConnectionsPerSource);
 
 	// The holders' own timeouts are already set; only the refusal's fails.
-	HttpServer::setFailSocketTimeoutsForTest(true);
+	HttpServer::setFailSocketTimeoutsForTest(/*failRecv=*/false, /*failSend=*/true);
 	Sock extra = connectFrom("127.0.0.2", 18253);
 	ASSERT_TRUE(valid(extra));
 	sendAll(extra, "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
 	const std::string refused = recvAll(extra);
 	closeSock(extra);
-	HttpServer::setFailSocketTimeoutsForTest(false);
+	HttpServer::setFailSocketTimeoutsForTest(false, false);
 
 	EXPECT_TRUE(refused.empty()) << "no send without a send bound: " << refused;
 	EXPECT_EQ(server.perSourceRefusals(), 1u);
