@@ -892,6 +892,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `vpeerPoolRefusals` | Integer | (#409) Virtual-peer pool refusals (777/440/888/555/voicemail/park stand-ins). Each one was answered `503` or its feature abandoned cleanly (#412). |
 | `trunkForgedRegisterResponses` | Integer | (#617, #663) Responses to the trunk's REGISTER that came from an address other than the one the REGISTER went to. Each was dropped. The WARN log line is written only when this reaches 1, 2, 4, 8, …, so a flood does not flood the log. `0` with no trunk configured. |
 | `trunkForgedDialogResponses` | Integer | (#356, #663) Responses on a trunk call's Call-ID that came from an address other than the carrier the INVITE went to. Each was dropped. Logged at powers of two, like the field above. |
+| `trunkRefusedDialogByes` | Integer | (#356, #666) BYEs on a trunk call's Call-ID refused with `403` because they came neither from the carrier nor its Contact host and (for a Confirmed call) the dialog tags did not match. Logged at powers of two, like the fields above. |
 | `e911Configured` | Boolean | (#450) `false` after a factory reset until the E911 notify list is set again; the dashboard shows a banner. Nothing is gated on it. |
 | `droppedInvalid` | Integer | (#430) The part of `packetsDropped` refused as malformed (null, or failing `isValidMessage()`). |
 | `droppedRate` | Integer | (#430) The part of `packetsDropped` refused by the allowlist or the per-IP rate limit. |

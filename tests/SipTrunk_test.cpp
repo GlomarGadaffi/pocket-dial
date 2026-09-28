@@ -1673,6 +1673,31 @@ TEST(SipTrunkSource, ForgedDialogResponsesLogOnlyAtPowersOfTwo)
 	EXPECT_EQ(logsContaining(env, "; 5 dropped so far"), 0u);
 }
 
+// Issue #666: the #356 BYE refusal gets the same treatment. Five refused BYEs:
+// each answered 403, counted 5, logged at 1, 2 and 4.
+TEST(SipTrunkSource, RefusedByesAreCountedAndLogOnlyAtPowersOfTwo)
+{
+	Answered a;
+	for (int i = 0; i < 5; ++i)
+	{
+		a.env.sent.clear();
+		ASSERT_TRUE(a.trunk.handleBye(carrierByeFrom(a.dialog(), kForgerIp, "wrong", "wrong")));
+		ASSERT_EQ(a.env.sent.size(), 1u);
+		EXPECT_EQ(firstLine(a.env.sentRaw(0)), "SIP/2.0 403 Forbidden") << "BYE " << i + 1;
+	}
+	EXPECT_EQ(a.trunk.refusedDialogByes(), 5u);
+	EXPECT_EQ(logsContaining(a.env, "refused"), 3u) << "one line at 1, 2 and 4 each";
+	EXPECT_EQ(logsContaining(a.env, "; 4 refused so far"), 1u);
+	EXPECT_EQ(logsContaining(a.env, "; 3 refused so far"), 0u);
+	EXPECT_EQ(logsContaining(a.env, "; 5 refused so far"), 0u);
+
+	// Control: the carrier's own BYE is accepted and not counted.
+	a.env.sent.clear();
+	ASSERT_TRUE(a.trunk.handleBye(carrierByeFrom(a.dialog(), kSbcIp, "carrier-tag", a.ourTag)));
+	EXPECT_EQ(firstLine(a.env.sentRaw(0)), "SIP/2.0 200 OK");
+	EXPECT_EQ(a.trunk.refusedDialogByes(), 5u);
+}
+
 TEST(SipTrunkRegister, ForgedRegisterResponsesLogOnlyAtPowersOfTwo)
 {
 	FakePbxEnv env;

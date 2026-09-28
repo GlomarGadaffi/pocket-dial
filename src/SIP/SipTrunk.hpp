@@ -417,6 +417,8 @@ public:
 	// atomic; each drop logs only at a power-of-two count, so a flood cannot
 	// flood the log.
 	uint32_t forgedDialogResponses() const { return _dialogForgedResponses.load(std::memory_order_relaxed); }
+	// #666: BYEs refused with 403 by handleBye()'s #356 check. Same shape.
+	uint32_t refusedDialogByes() const { return _dialogRefusedByes.load(std::memory_order_relaxed); }
 
 	// Test/diagnostic accessors. Cheap linear scans over a fixed array.
 	size_t activeDialogs() const;
@@ -488,6 +490,7 @@ private:
 	bool                           _regLive = false;
 	std::atomic<uint32_t>          _regForgedResponses{0};
 	std::atomic<uint32_t>          _dialogForgedResponses{0};
+	std::atomic<uint32_t>          _dialogRefusedByes{0};
 
 	Listener* _listener = nullptr;
 	std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS> _dialogs{};
