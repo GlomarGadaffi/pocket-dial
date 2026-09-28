@@ -127,6 +127,31 @@ CONFIG_ESP_WOLFSSL_NO_STACK_SIZE_BUILD_WARNING=y
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
 
+# IPv4 reassembly (issue #496). IDF ships it OFF, so a UDP payload over 1,472 B
+# (a 1,500 B Ethernet MTU) arrives as IP fragments and lwIP drops the whole
+# datagram before any socket sees it -- silently, with no counter. Measured on
+# .244: a 3,091 B REGISTER got no reply and moved nothing. Real SIP crosses that
+# line (a big INVITE: many codecs, video, SRTP crypto lines, ICE candidates; a
+# large NOTIFY; carrier INVITEs), and phones rarely switch to TCP as RFC 3261
+# §18.1.1 suggests. Anything that reassembles to more than UdpServer's 2,048 B
+# buffer is then counted by #468's oversize path instead of vanishing. The
+# constrained profile inherits this.
+#
+# Memory is bounded at BOTH stages (#509 review):
+#  1. In flight: IDF's lwipopts.h frees an incomplete datagram after
+#     IP_REASS_MAXAGE = 3 s, and LWIP_IP_REASS_MAX_PBUFS (kept at its minimum,
+#     10) caps the fragments held at once: ~16 KB, global.
+#  2. Completed: a finished datagram (up to 10 fragment pbufs, ~14.8 KB) goes
+#     to the socket's recvmbox, which alone would allow 32 of them (~470 KB)
+#     per socket. CONFIG_LWIP_SO_RCVBUF=y plus a per-socket SO_RCVBUF
+#     (src/Helpers/UdpRcvBuf.hpp) caps the queued bytes instead: SIP 32 KB
+#     (16 KB on the constrained profile), each RTP receive leg 8 KB, and 0 on
+#     the bound-but-never-read RtpSender / HoldMusic sockets. lwIP's default
+#     cap is INT_MAX, so the setsockopt is what bounds it; UdpRcvBuf.hpp
+#     refuses to compile reassembly without SO_RCVBUF.
+CONFIG_LWIP_IP4_REASSEMBLY=y
+CONFIG_LWIP_SO_RCVBUF=y
+
 
 # ── Task-stack overflow: fail loud, immediately (docs/THREAT_MODEL.md T-7) ──
 # The lesson of the UNISOC T612 VoLTE RCE: on an RTOS a parser that spends the
