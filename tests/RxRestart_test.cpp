@@ -62,3 +62,36 @@ TEST(RxRestart, ABusyOrTearingDownSlotIsNeverAllocatable)
 	EXPECT_FALSE(pd::rxSlotAllocatable(false, false, pd::ReapDecision::Nothing)) << "owned by a participant";
 	EXPECT_FALSE(pd::rxSlotAllocatable(true, true, pd::ReapDecision::Nothing)) << "mid-teardown";
 }
+
+TEST(RxRestart, AReapedDetachedTaskIsTakenBackOutOfTheRestartCount)
+{
+	// #608 review: a join-timeout detach is counted toward the #65 anchor restart,
+	// but only while that task is alive. Reaping it must take it back out.
+	int detachedCount = 0;
+	bool slotDetached = false;
+
+	++detachedCount;           // stopMediaStreams(): join timed out, detach
+	slotDetached = true;
+	detachedCount += pd::detachCountDeltaOnReap(slotDetached);   // later reaped
+
+	EXPECT_EQ(detachedCount, 0);
+	EXPECT_FALSE(slotDetached);
+	EXPECT_EQ(pd::detachCountDeltaOnReap(slotDetached), 0) << "a slot is taken out once only";
+}
+
+TEST(RxRestart, ThreeBenignDetachesNeverRequestARestart)
+{
+	// The restart drops every live call, so three detaches that each ended in a
+	// clean reap must never reach the threshold (kLeakRestartThreshold = 3).
+	constexpr int kThreshold = 3;
+	int detachedCount = 0;
+	bool slotDetached = false;
+	for (int i = 0; i < kThreshold; ++i)
+	{
+		++detachedCount;
+		slotDetached = true;
+		EXPECT_LT(detachedCount, kThreshold) << "cycle " << i;
+		detachedCount += pd::detachCountDeltaOnReap(slotDetached);
+	}
+	EXPECT_EQ(detachedCount, 0);
+}

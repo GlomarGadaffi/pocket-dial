@@ -1,2 +1,2 @@
-# RxRestart_test.cpp: 2 (#553: a slot with a live rx task is not allocatable)
-2
+# RxRestart_test.cpp: 4 (#553: a slot with a live rx task is not allocatable; #608: a reaped detach leaves the restart count)
+4

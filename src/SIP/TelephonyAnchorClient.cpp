@@ -777,6 +777,7 @@ pd::ReapDecision TelephonyAnchorClient::reapParkedRxLocked(CallSlot& slot)
 	{
 		pd::deleteTask(slot.rxTaskHandle);   // parked: touches nothing, holds no lock
 		slot.rxTaskHandle = nullptr;
+		_leakedGetClients.fetch_add(pd::detachCountDeltaOnReap(slot.rxDetached), std::memory_order_relaxed);
 	}
 	return d;
 }
@@ -1926,6 +1927,10 @@ void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 	// previously-leaked handles are the OS's problem now and the fresh session starts
 	// from a clean count. (A still-poisoned mutex would re-leak and re-trip the gate.)
 	self->_leakedGetClients.store(0, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> lock(self->_mutex);
+		for (auto& s : self->_calls) s.rxDetached = false;   // #608: matches the reset count
+	}
 
 	// Re-install the callbacks before start() so the new WS session is wired up.
 	self->setEventCallback(savedEventCb);
@@ -3079,6 +3084,10 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 			// IDF's global crypto locks). DETACH: it finishes its own bounded exit and parks,
 			// and its slot stays unallocatable until reaped. Count it; a task that never exits
 			// holds its socket, so past the threshold request the #65 anchor restart.
+			{
+				std::lock_guard<std::mutex> lock(_mutex);
+				slot->rxDetached = true;   // #608: reapParkedRxLocked() takes it back out
+			}
 			const int detached = _leakedGetClients.fetch_add(1, std::memory_order_relaxed) + 1;
 			ESP_LOGE(TAG, "Rx task for %s did not exit in 2 s -- detached, slot held until it parks (%d detached)",
 			         participantId.c_str(), detached);

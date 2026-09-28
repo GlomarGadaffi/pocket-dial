@@ -190,6 +190,7 @@ private:
 		// has none). It never touches getClient: the rx task alone owns that handle.
 		std::atomic<bool>        stopRequested{false};
 		int                      getFd = -1;              // guarded by getMutex
+		bool                     rxDetached = false;      // #608: counted in _leakedGetClients; guarded by _mutex
 		mutable std::mutex       postMutex;               // guards postClient (writeAudio/stop)
 		std::mutex               getMutex;                // guards getClient (runRxLoop/stop)
 	};

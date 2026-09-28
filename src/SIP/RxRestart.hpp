@@ -46,6 +46,16 @@ namespace pd
 		return participantEmpty && !tearingDown && reap != ReapDecision::Wait;
 	}
 
+	// #608 review: a detached rx task counts toward the #65 restart only while it
+	// is still alive. Reaping it takes it back out, or benign detaches add up and
+	// the restart drops live calls. Returns the delta for the detach counter.
+	inline int detachCountDeltaOnReap(bool& slotDetached)
+	{
+		if (!slotDetached) return 0;
+		slotDetached = false;
+		return -1;
+	}
+
 	// Issue #554 (b): a leg we dropped never gets a fresh rx task (and its POST)
 	// from a late upsert. Bounded: the ring remembers the last N drops.
 	template <std::size_t N, std::size_t Len>
