@@ -3,6 +3,7 @@
 
 #include "AnchorClient.hpp"
 #include "RecentIdRing.hpp"   // Issue #554
+#include "ParkedTaskReap.hpp" // Issue #553: pd::ReapDecision
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -184,6 +185,11 @@ private:
 		// rxDoneSem on its way out. rxTaskHandle is never cleared by a task that exits on
 		// its own, so a set handle with this false means "exited", not "polling".
 		std::atomic<bool>        rxRunning{false};
+		// Issue #553 (cooperative cancellation): stopMediaStreams() sets stopRequested and
+		// shuts down only getFd, the socket the rx task published under getMutex (-1 when it
+		// has none). It never touches getClient: the rx task alone owns that handle.
+		std::atomic<bool>        stopRequested{false};
+		int                      getFd = -1;              // guarded by getMutex
 		mutable std::mutex       postMutex;               // guards postClient (writeAudio/stop)
 		std::mutex               getMutex;                // guards getClient (runRxLoop/stop)
 	};
@@ -202,6 +208,9 @@ private:
 	CallSlot* slotForLocked(std::string_view participantId);
 	CallSlot* allocSlotLocked(const std::string& participantId);
 	void      freeSlotLocked(CallSlot& slot);
+	// Issue #553: delete a slot's rx task only once it has parked (pd::reapDecision);
+	// clears rxTaskHandle on Reap. Caller holds _mutex.
+	pd::ReapDecision reapParkedRxLocked(CallSlot& slot);
 	// Heap arg handed to a slot's rx task so the static trampoline knows its slot.
 	struct RxTaskArg { TelephonyAnchorClient* self; CallSlot* slot; };
 
@@ -232,13 +241,12 @@ private:
 	// per-CallSlot (rxTaskHandle / rxDoneSem / tearingDown in the struct above) — one rx pump per
 	// concurrent call, each torn down independently.
 
-	// Issue #65 (L-1): on the rare 2 s join-timeout path stopMediaStreams() force-kills
-	// the rx task with vTaskDelete; if that task was holding the slot's getMutex it is permanently
-	// poisoned and we deliberately LEAK its getClient (closing it under a poisoned mutex
-	// could deadlock/double-free). Each leak burns one of the 16 LWIP sockets, so we
-	// count them and, once kLeakRestartThreshold accumulate, request a full anchor
-	// stop()/start() cycle to reclaim the socket pool. The restart runs OFF the SIP
-	// task (tick() only spawns the worker — it never blocks).
+	// Issue #65 / #553: on the rare 2 s join-timeout path stopMediaStreams() no longer kills
+	// the rx task (#553: no external vTaskDelete, ever). It DETACHES it: the task finishes
+	// its own bounded exit and parks, and its slot stays unallocatable until reaped. A task
+	// that never exits would hold its socket, so detaches are counted here and, once
+	// kLeakRestartThreshold accumulate, a full anchor stop()/start() cycle is requested.
+	// The restart runs OFF the SIP task (tick() only spawns the worker — it never blocks).
 	std::atomic<int>  _leakedGetClients{0};
 	std::atomic<bool> _restartRequested{false};
 	std::atomic<bool> _restartInFlight{false};

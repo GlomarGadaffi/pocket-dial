@@ -1,0 +1,2 @@
+# RxRestart_test.cpp: 2 (#553: a slot with a live rx task is not allocatable)
+2

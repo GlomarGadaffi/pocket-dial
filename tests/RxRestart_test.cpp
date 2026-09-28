@@ -42,3 +42,23 @@ TEST(RxRestart, ADroppedLegIsRefusedAnotherIsNot)
 	for (int i = 0; i < 8; ++i) dropped.add("newer-" + std::to_string(i));
 	EXPECT_TRUE(pd::rxStartAllowedFor(dropped, "leg-554"));
 }
+
+TEST(RxRestart, ASlotWithALiveRxTaskIsNotAllocatable)
+{
+	// Issue #553: a task detached on a join timeout (or not yet parked) still owns its
+	// slot. Handing that slot to a new call would put two rx tasks on one slot, the
+	// #370 crash. Only a free slot whose old task is gone (Nothing) or was just reaped
+	// (Reap) may be allocated.
+	EXPECT_FALSE(pd::rxSlotAllocatable(true, false, pd::ReapDecision::Wait))
+		<< "free by participantId but its old rx task is still alive";
+	EXPECT_TRUE(pd::rxSlotAllocatable(true, false, pd::ReapDecision::Nothing));
+	EXPECT_TRUE(pd::rxSlotAllocatable(true, false, pd::ReapDecision::Reap));
+}
+
+TEST(RxRestart, ABusyOrTearingDownSlotIsNeverAllocatable)
+{
+	// Positive control for the test above: the other two conditions still refuse
+	// on their own, whatever the reap says.
+	EXPECT_FALSE(pd::rxSlotAllocatable(false, false, pd::ReapDecision::Nothing)) << "owned by a participant";
+	EXPECT_FALSE(pd::rxSlotAllocatable(true, true, pd::ReapDecision::Nothing)) << "mid-teardown";
+}
