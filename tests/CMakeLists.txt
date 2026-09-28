@@ -267,6 +267,8 @@ add_executable(sip_parser_tests
     DashboardA11yText_test.cpp
     # #643 (dashboard review #9): the Learn-mode hint matches the registrar.
     DashboardLearnText_test.cpp
+    # #644 (dashboard review #8): needsSetup banner; admin-status errors shown.
+    DashboardSetupBanner_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is
