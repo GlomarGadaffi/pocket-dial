@@ -479,8 +479,10 @@ namespace
 				std::string(ev.handsetCallID), ev.localRtpPort, 0, false });
 		}
 
-		void onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia) override
+		void onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyMedia,
+			const std::shared_ptr<SipMessage>& progress) override
 		{
+			EXPECT_EQ(progress != nullptr, earlyMedia) << "a 183 hands over its response, a 180 does not";
 			record("ringing", ev);
 			events.back().earlyMedia = earlyMedia;
 		}

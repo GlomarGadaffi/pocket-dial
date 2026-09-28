@@ -315,11 +315,11 @@ public:
 	{
 		virtual ~Listener() = default;
 
-		// 180, or 183 with earlyMedia=true. Nothing is relayed yet either way:
-		// a 183's SDP is not read here (see the class note on staying
-		// SDP-ignorant), so the caller hears silence rather than the carrier's
-		// announcement until early media is wired as a follow-up.
-		virtual void onTrunkRinging(const TrunkEvent& ev, bool earlyMedia) = 0;
+		// 180, or 183 with earlyMedia=true. For a 183, `progress` is the
+		// carrier's response itself, so the listener can read its SDP and relay
+		// early media (#400); SipTrunk stays SDP-ignorant. nullptr for a 180.
+		virtual void onTrunkRinging(const TrunkEvent& ev, bool earlyMedia,
+			const std::shared_ptr<SipMessage>& progress) = 0;
 
 		// Fired AFTER the ACK is enqueued and the dialog reads Confirmed, so a
 		// listener that immediately hangs up produces ACK-then-BYE on the wire,
