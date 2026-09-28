@@ -42,6 +42,7 @@ TEST(DashboardRosterText, LoggedOutTheBoardCountsPhonesAndTheCallLogAsksForLogin
 
 	const std::string cdr = functionBody(p, "function fetchCdr(){");
 	ASSERT_FALSE(cdr.empty());
-	EXPECT_NE(cdr.find("r.ok"), std::string::npos) << cdr;
+	// #637 review: only a 401 means "log in"; a boot-time 503 must not say so.
+	EXPECT_NE(cdr.find("r.status===401"), std::string::npos) << cdr;
 	EXPECT_NE(cdr.find("Log in to view the call log"), std::string::npos) << cdr;
 }

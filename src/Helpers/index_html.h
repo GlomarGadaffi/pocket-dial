@@ -1428,7 +1428,7 @@ function applyWifiCapability(d){
 }
 function fetchCdr(){
   fetch("/api/cdr").then(function(r){
-    if(!r.ok){$("cdr-tbody").innerHTML='<tr class="empty-row"><td colspan="6">Log in to view the call log</td></tr>';return null;}
+    if(r.status===401){$("cdr-tbody").innerHTML='<tr class="empty-row"><td colspan="6">Log in to view the call log</td></tr>';return null;}if(!r.ok)return null;
     return r.json();
   }).then(function(recs){if(recs)renderCdr(recs);}).catch(function(){});
 }
