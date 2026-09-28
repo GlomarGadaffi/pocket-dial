@@ -25,6 +25,7 @@
 // eyeballed on hardware.
 #include "DmaFramePool.hpp"
 #include "RtpReceiver.hpp"     // Issue #469: rxOversizeDrops() on /api/status
+#include "RtpSender.hpp"       // Issue #479: txPoolRefusals() on /api/status
 #include "HoldMusic.hpp"       // Issue #466: clipRefusals() on /api/status
 #include "PsramAllocator.hpp"  // Issue #466: psram::internalFallbacks() on /api/status
 #include "index_html.h"
@@ -2001,6 +2002,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// Issue #469: the RTP side of the same check -- media datagrams over
 	// RtpReceiver::MAX_DATAGRAM_BYTES, dropped instead of parsed cut.
 	json.s("\"rtpRxOversize\":").n(RtpReceiver::rxOversizeDrops()).s(",");
+	// #479: tx stack pool starts refused (pool full) and slots retired at boot.
+	json.s("\"rtpTxPoolRefused\":").n(RtpSender::txPoolRefusals()).s(",");
+	json.s("\"rtpTxPoolRetired\":").n(RtpSender::txPoolRetired()).s(",");
 	json.s("\"recvErrors\":").n(recvErrors).s(",");
 	json.s("\"lastRecvErrno\":").n(lastRecvErrno).s(",");
 	json.s("\"recentDrops\":[");

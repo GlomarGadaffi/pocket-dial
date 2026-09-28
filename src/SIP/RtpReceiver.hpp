@@ -41,6 +41,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "PsramTask.hpp"   // Issue #479: pd::StaticTaskSlot
 #elif defined(__linux__)
 #include <netinet/in.h>
 #elif defined _WIN32 || defined _WIN64
@@ -395,10 +396,13 @@ private:
 	// Issue #535: the finished task PARKS (vTaskSuspend) instead of deleting
 	// itself -- vTaskDeleteWithCaps(NULL)'s self-delete allocates an internal
 	// helper task and abort()s when none fits. Its owner reaps it with
-	// pd::deleteTask(handle), which allocates nothing, on the next start() or in
-	// the destructor. Written only under _slotMutex (start) or by the
-	// destructor, never by the task.
+	// vTaskDelete(handle) (pd::reapParkedStaticTask), which allocates nothing,
+	// on the next start() or in the destructor. Written only under _slotMutex
+	// (start) or by the destructor, never by the task.
 	TaskHandle_t      _parkedTask = nullptr;
+	// Issue #479: this slot's stack (PSRAM) + TCB, allocated once in the
+	// constructor; every stream's task is created statically on it.
+	pd::StaticTaskSlot _taskMem;
 	// Deletes the parked task only when pd::reapDecision() says Reap (#572
 	// review); true when the slot is free. On Wait it counts in _reapDeferred.
 	bool reapParkedTaskLocked();
