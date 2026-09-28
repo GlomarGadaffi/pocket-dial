@@ -164,6 +164,20 @@ namespace
 				"Content-Length: 0\r\n\r\n";
 		}
 
+		// The carrier's session-refresh re-INVITE (RFC 4028): in-dialog, so tagged.
+		std::string reinvite(const std::string& id) const
+		{
+			return
+				"INVITE sip:15551230000@192.168.50.1:5060 SIP/2.0\r\n"
+				"Via: SIP/2.0/UDP " + std::string(kSbcIp) + ":5060;branch=z9hG4bKreinv" + id + "\r\n"
+				"From: <sip:+12025550123@" + kSbcIp + ":5060>;tag=" + toTag + "\r\n"
+				"To: <sip:15551230000@" + kSbcIp + ":5060>;tag=" + fromTag + "\r\n"
+				"Call-ID: " + id + "\r\n"
+				"CSeq: 2 INVITE\r\n"
+				"Contact: <sip:+12025550123@203.0.113.9:5060>\r\n"
+				"Content-Length: 0\r\n\r\n";
+		}
+
 		static std::string field(const std::string& m, const std::string& name)
 		{
 			const size_t p = m.find(name);
@@ -755,4 +769,30 @@ TEST(TrunkWiring, ACarrierRefusalAfterEarlyMediaRefusesTheHandsetAndFreesTheRela
 	EXPECT_EQ(CarrierView::between(busy, "\nTo: ", "\r\n"), earlyTo)
 		<< "the refusal ends the early dialog the 183 opened";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+TEST(TrunkWiring, ACarrierRefreshReinviteOnATrunkCallIsNotAnswered481)
+{
+	// #611 review: the trunk dialog has no Session, so #379's "tagged INVITE for
+	// an unknown dialog gets 481" answered the carrier's session refresh with a
+	// 481 -- which ends the call, 911 over the trunk included.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	ASSERT_FALSE(carrier.callID.empty());
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+
+	b.sent.clear();
+	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.reinvite(carrier.callID), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("481", kSbcIp), 0u) << "the carrier's refresh must not end the call";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+
+	// Positive control: the same tagged re-INVITE naming a dialog nobody owns
+	// IS answered 481, so the check above is not passing for want of a 481 path.
+	b.sent.clear();
+	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.reinvite("nobody-owns-this"), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("481", kSbcIp), 1u);
 }
