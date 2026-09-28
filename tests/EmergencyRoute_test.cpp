@@ -674,3 +674,42 @@ TEST(EmergencyRoute, The555OwnNumberDialCannotHandTheLoopbackAnEmergencyNumber)
 	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
 	EXPECT_EQ(b.count("SIP/2.0 200"), 0u) << b.dump();
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// D. #553/#608: a 911 dialed in the rx-cancel window is not refused.
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(EmergencyRoute, ANineOneOneDialedWhileTheLastAnchorLegIsCancellingIsPlaced)
+{
+	// The window: endCall() stops the MediaBridge and drops the leg, and on
+	// firmware dropCall() -> stopMediaStreams() then waits up to 2 s for the rx
+	// task to park, holding only TelephonyAnchorClient's own slot (#553). The
+	// engine's admission (allBridgesBusy) counts MediaBridges, never that slot,
+	// so a 911 right after the BYE must be placed, not given the busy 503.
+	// Loopback stands in for the real provider (as in section A's neighbours).
+	Bench b;
+	b.handler->setAnchorPlacesRealCallsForTest(true);
+
+	b.handler->handle(makeInvite("555", "er-win-1"));
+	ASSERT_EQ(b.count("SIP/2.0 200"), 1u) << "the first anchored call must connect:\n" << b.dump();
+
+	const std::string bye =
+		"BYE sip:555@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKerwinbye\r\n"
+		"From: <sip:101@server>;tag=efer-win-1\r\n"
+		"To: <sip:555@server>;tag=srv\r\n"
+		"Call-ID: er-win-1\r\n"
+		"CSeq: 2 BYE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	b.handler->handle(RequestsHandler::getMessageFromPool(bye, addrFor(kHandsetIp)));
+	ASSERT_EQ(b.loopback()->dropCallCount(), 1u) << "the leg's cancel must have started (the window opener)";
+
+	b.sent.clear();
+	b.handler->handle(makeInvite("911", "er-win-911"));
+
+	EXPECT_EQ(b.count("SIP/2.0 503"), 0u)
+		<< "911 in the rx-cancel window was refused:\n" << b.dump();
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
+		<< "the provider must be asked to dial 911, as outside the window";
+	EXPECT_EQ(b.count("SIP/2.0 200"), 1u) << b.dump();
+}
