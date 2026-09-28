@@ -284,8 +284,8 @@ R"html1(  align-items:flex-start;justify-content:center;padding:24px 14px;overfl
 .fwd-row label{font-size:11px;color:var(--brass);font-family:var(--mono)}
 .did-row{display:grid;grid-template-columns:1fr 110px auto;gap:8px;align-items:center;margin-top:8px}
 
-.wifi-net{display:flex;justify-content:space-between;align-items:center;padding:7px 9px;border:1px solid transparent;border-radius:4px;cursor:pointer}
-.wifi-net:hover{background:rgba(176,141,82,.08);border-color:var(--line-hi)}
+.wifi-net{display:flex;justify-content:space-between;align-items:center;padding:7px 9px;border:1px solid transparent;border-radius:4px;cursor:pointer;width:100%;background:none;color:inherit;font:inherit;text-align:left}
+.wifi-net:hover,.wifi-net:focus-visible{background:rgba(176,141,82,.08);border-color:var(--line-hi)}
 .wifi-ssid{color:var(--ink);font-family:var(--mono)}
 .wifi-meta{font-size:11px;color:var(--ink-dim);font-family:var(--mono)}
 
@@ -878,7 +878,7 @@ function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"
 function cssEsc(s){return String(s==null?"":s).replace(/["\\]/g,"\\$&");}
 function toast(msg,cls){var t=$("toast");t.textContent=msg;t.className=cls?("show "+cls):"show";clearTimeout(t._t);t._t=setTimeout(function(){t.className="";},2600);}
 function fmtUptime(sec){sec=Math.floor(sec||0);var h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;function p(n){return(n<10?"0":"")+n;}return p(h)+":"+p(m)+":"+p(s);}
-function setMsg(id,txt,cls){var e=$(id);if(e){e.textContent=txt||"";e.className="msg"+(cls?" "+cls:"");}}
+function setMsg(id,txt,cls){var e=$(id);if(e){e.setAttribute("role",cls==="err"?"alert":"status");e.textContent=txt||"";e.className="msg"+(cls?" "+cls:"");}}
 
 /* ── modals ── */
 /* One controller, replacing four separate gaps: two modals could be open at
@@ -1752,7 +1752,7 @@ function renderWifi(nets){
   nets.forEach(function(n){
     var ssid=String(n.ssid==null?"":n.ssid);var rssi=Number(n.rssi)||0;var enc=n.encryption||"OPEN";
     var bars=rssi>-50?"▂▄▆█":rssi>-65?"▂▄▆ ":rssi>-75?"▂▄  ":"▂   ";
-    var row=document.createElement("div");row.className="wifi-net";
+    var row=document.createElement("button");row.type="button";row.className="wifi-net";
     row.addEventListener("click",function(){selectWifi(ssid);});
     var s=document.createElement("span");s.className="wifi-ssid";s.textContent=ssid;
     var m=document.createElement("span");m.className="wifi-meta";m.textContent=bars+" "+rssi+"dBm ["+enc+"]";
@@ -2040,6 +2040,8 @@ document.addEventListener("keydown",function(e){
 (function(){var el=$("adm-changedtmfpin-val");if(el)el.addEventListener("keydown",function(e){if(e.key==="Enter")adminChangeDtmfPin();});})();
 
 /* ── init ── */
+/* Live regions must exist before their text changes, or screen readers miss the first message. */
+document.querySelectorAll(".msg[id]").forEach(function(e){e.setAttribute("role","status");});
 fetchStatus();fetchCdr();fetchAdminStatus();fetchOtaStatus();
 setInterval(fetchStatus,2000);
 setInterval(fetchCdr,5000);
