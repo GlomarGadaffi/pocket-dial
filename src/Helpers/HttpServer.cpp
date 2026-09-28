@@ -283,6 +283,8 @@ void HttpServer::setFailSocketTimeoutsForTest(bool failRecv, bool failSend)
 	s_failRecvTimeoutForTest.store(failRecv);
 	s_failSendTimeoutForTest.store(failSend);
 }
+static void (*s_dispatchMarkForTest)() = nullptr;   // #410 route gate
+void HttpServer::setDispatchMarkForTest(void (*mark)()) { s_dispatchMarkForTest = mark; }
 #endif
 
 // Issue #529: SO_RCVTIMEO / SO_SNDTIMEO in milliseconds (at least 1, so 0 never
@@ -762,6 +764,9 @@ void HttpServer::handleClient(int clientSock)
 	// Out-param for the two telephony-config routes below, whose slot index is
 	// a URL path segment rather than a form param (see parseTelephonyConfigSlotPath).
 	size_t telSlotIdx = 0;
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	if (s_dispatchMarkForTest) s_dispatchMarkForTest();   // #410: route allocations start here
+#endif
 
 #if defined(ESP_PLATFORM)
 	// Captive Portal Redirect: If the request is a GET, and the Host is not our IP or is a generic captive portal test domain,
