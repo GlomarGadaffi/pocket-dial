@@ -57,6 +57,8 @@ struct PbxEnv
 	// Issue #450: the DTMF factory-reset door wipes the SD voicemail archive, as
 	// the HTTP door does. Not pure: a test env with no archive has nothing to wipe.
 	virtual void wipeVoicemail() {}
+	// #652: true while any 911/933 session is live; the DTMF restart doors refuse then. Caller holds _mutex.
+	virtual bool emergencyCallLive() { return false; }
 
 	// The server's active local IP (resolved once at construction) and SIP port —
 	// the identity the machines stamp into Via/From/Contact headers they build.
