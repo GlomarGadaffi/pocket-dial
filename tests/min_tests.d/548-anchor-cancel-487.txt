@@ -1,0 +1,2 @@
+# AnchorRouting_test.cpp: 2 (#548: a CANCEL mid-ring answers the INVITE 487; not after the 200)
+2

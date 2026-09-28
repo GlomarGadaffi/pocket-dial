@@ -25,8 +25,9 @@ This document serves as the authoritative production-grade field operation and i
 > * The SoftAP may be **WPA2** (`GET /api/ap-security`, once logged in and set up), you
 >   may not be able to join at all (§7).
 > * The SIP registrar may be **`learn`/`secure`** (`GET /api/registrar`, same gate), 
->   phones may be refused by design (§4.3). The shipped default is `open`: no SIP
->   authentication at all.
+>   phones may be refused by design (§4.3). The shipped default is `learn` (#441): an
+>   unknown phone is adopted on its first REGISTER, and only Secured devices must prove a
+>   secret. `open` is retired (#502).
 
 
 ## Quick Reference Matrix
@@ -38,7 +39,7 @@ Use this matrix for rapid triage based on visible device indicators and active d
 | **Every API call rejected `403 setup_required`** | • `{"error":"setup_required"}`<br>• Even read-only routes refused<br>• `/api/admin/status` → `needsSetup:true` | • Board still on the shipped `admin`/`admin` default; forced first-use setup | • Log in `admin`/`admin`, then `POST /api/admin/set-credential` with a real username+password (§4.8) |
 | **API call rejected `403` CSRF** | • `{"error":"missing or invalid CSRF token"}`<br>• Script/`curl` that worked before | • Every mutating route requires the per-session `X-CSRF` header | • Capture `"csrf"` from the login response, resend with `-H "X-CSRF: …"` (§4.6) |
 | **Dashboard refuses connections** | • *Connection refused*, not `401`/timeout | • **A real fault**, the listener is unconditional; there is no window to reopen | • Verify the IP and that nothing local filters port 80 (§6). **Note `http_dashboard` is a FreeRTOS *task name*, not a log line**, and it is the name only on `eth`/`lan8720` (`esp_main_eth.cpp:601`); the `wifi` build calls it `http_server_task` (`esp_main.cpp:363`). Neither is printed at boot, so do not wait for it |
-| **Login returns `429`** | • `{"error":"too many failed attempts…"}`<br>• Correct password also refused | • Login lockout (5 fails) or aggregate backstop (20 fails), **escalating**. The lockout is **global, not per-client** (§4.7), so another host's guessing can lock you out | • Wait it out (cooldown doubles per trip, caps ~16 min; only a correct login clears it), or power-cycle, the counters are in-RAM (§4.7) |
+| **Login returns `429`** | • `{"error":"too many failed attempts…"}`<br>• Correct password also refused | • Login lockout (5 fails) or aggregate backstop (20 fails), **escalating**. The 5-fail lockout is per client since #530, but the 20-fail backstop is per principal, so another host's guessing can still lock you out (§4.7) | • Wait it out (cooldown doubles per trip, caps ~16 min; only a correct login clears it), or power-cycle, the counters are in-RAM (§4.7) |
 | **Port 5060 dead, port 80 alive, `wifi`/`eth`/`lan8720` board never configured** | • `[boot] device unprovisioned — SIP stack held dark…` in the serial log<br>• Board reboots every ~30 min | • Boot provisioning gate: SIP is not started until a credential exists (**not** on the `display` build) | • Complete setup over HTTP; watch for `[boot] credential set — unblocking SIP stack` (§8) |
 | **Whole fleet de-registers at once** | • Every handset "not registered"<br>• `GET /api/registrar` → `"mode":"secure"`, empty roster | • Registrar switched to `secure` before any extension was adopted/secured | • `POST /api/registrar mode=learn`, the light-touch fix, and the one to reach for. Factory reset also clears `reg_mode` since #188 (§4.3), but wipes far more. **Note: "re-adopt, secure, then re-switch" cannot currently be completed**, there is no way to set a per-extension secret, so no device can be marked Secured; see [LEARN_MODE.md](LEARN_MODE.md) Step 4 |
 | **Cannot join the SoftAP** | • Client prompts for a password<br>• Boot log `auth:WPA2-PSK` | • AP security enabled (dashboard or flash-time seed) | • Read the per-device passphrase from serial / LVGL / `GET /api/ap-security` (§7) |
@@ -142,7 +143,8 @@ The device uses Non-Volatile Storage (NVS) to save Wi-Fi SSID, passphrases, mode
 > | `cdrlog` | Call-detail ring | |
 >
 > An NVS erase therefore **re-opens the access point, returns the login to the
-> `admin`/`admin` default, returns the registrar to `open`, and re-arms the boot
+> `admin`/`admin` default, returns the registrar to `learn` (the default since #441; `open`
+> is retired, #502), and re-arms the boot
 > provisioning gate** (`provisioned` goes away, so SIP is held dark again until a credential
 > is committed). It does **not** change the HTTP listener, which is always open regardless.
 > That combination is what makes an NVS erase a real recovery tool, and also what makes it
@@ -460,13 +462,13 @@ re-login mints a **new** token, re-capture it, do not reuse the old one. `GET
 
 | Counter | Trips at | Cooldown |
 | :--- | :--- | :--- |
-| ~~**Per-client**, keyed on the HTTP peer address, 8 LRU buckets~~ **Effectively GLOBAL.** The bucket machinery is per-client, but the key is never supplied: `req.clientIp` is only ever assigned on the OTA path (`HttpServer.cpp:330`), never by `parseRequest()`, so `sendApiAdminLogin` passes `""` (`:2720`, `:2729`), the same unkeyed bucket the DTMF PIN uses | 5 consecutive failures (`kMaxFailedAttempts`) | 60 s (`kLockoutMs`), **doubling per successive trip**, capped ~16 min (`kMaxLockoutShift = 4`) |
-| **Aggregate backstop**, across all clients | 20 consecutive failures (`kMaxFailedAttemptsGlobal`) | Same doubling ladder, also up to ~16 min; locks out **everyone** |
+| **Per-client** (since #530), keyed on the HTTP peer address and principal, 8 LRU buckets | 5 consecutive failures (`kMaxFailedAttempts`) | 60 s (`kLockoutMs`), **doubling per successive trip**, capped ~16 min (`kMaxLockoutShift = 4`) |
+| **Aggregate backstop**, per principal (username), across all clients | 20 consecutive failures (`kMaxFailedAttemptsGlobal`) | Same doubling ladder, also up to ~16 min; locks out that principal from **every** client (the other principal is unaffected) |
 
 * **The trip count survives the cooldown.** The second lockout is 2 min, the third 4 min, and only a **correct login** clears either counter.
-* **The DTMF PIN shares the same bucket table.** `AdminAuth::verifyDtmfPin()` accounts against the unkeyed `""` bucket, so hammering the `*PIN#` menu can lock out the web login and vice versa.
+* **The DTMF PIN has its own bucket in the same table.** `AdminAuth::verifyDtmfPin()` accounts against the unkeyed `""` bucket, so PIN and web failures no longer lock each other out, but eight failed web logins from fresh addresses can evict it and clear a PIN lockout (#561).
 * Instant Recovery: wait, it always auto-clears and never permanently locks the device. Pre-existing sessions stay valid throughout; only `login` is throttled, so a browser still logged in elsewhere is your fastest route back in. Failing that, power-cycle: both counters live in a process-local static (`AuthState`), never in NVS, so a reboot clears every lockout without touching the credential. Hitting the aggregate counter without guessing means something on the link is hammering `/api/admin/login`, treat that as an incident in its own right.
-* Note: the per-client key *would be* for fairness, not trust, a source address is trivially spoofable on a shared link, which is why the aggregate backstop exists. In the shipped firmware the key is never supplied at all (see the table row above), so the aggregate backstop is the only counter actually doing anything.
+* Note: the per-client key *would be* for fairness, not trust, a source address is trivially spoofable on a shared link, which is why the aggregate backstop exists. Since #530 the key is supplied on every request; the aggregate backstop still counts across one address's cooldowns, so a single persistent guesser can trip it (THREAT_MODEL D-3).
 
 ### 4.8 🔐 Forced first-use setup, `403 setup_required` on everything
 

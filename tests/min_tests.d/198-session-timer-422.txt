@@ -1,0 +1,3 @@
+# SessionTimer_test.cpp (#198): 422 decision table, 422 on INVITE, compact x:,
+# 911/933 never 422'd, re-INVITE not 422'd, tick-driven expiry BYE
+6

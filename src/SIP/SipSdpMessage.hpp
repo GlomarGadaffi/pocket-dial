@@ -80,7 +80,7 @@ private:
 	// decision rather than a style one:
 	//
 	//   SipMessagePool constructs ALL POCKETDIAL_MSG_POOL slots as SipSdpMessage,
-	//   and the heap-fallback path does too. sizeof(sdp::Session) measures 3300
+	//   (#409 removed the heap fallback). sizeof(sdp::Session) measures 3300
 	//   bytes, so an in-object model would cost 52 x 3300 = ~168 KB on an
 	//   ESP32-S3. (The original estimate was ~70 KB, from a 12-byte Attribute and
 	//   a 16-attribute cap; raising the cap to 32 and Attribute padding to 20

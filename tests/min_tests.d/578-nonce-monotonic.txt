@@ -1,0 +1,2 @@
+# SipDigest_test.cpp: 2 (#578: nonce stamp is monotonic; a stamp ahead of now is refused)
+2
