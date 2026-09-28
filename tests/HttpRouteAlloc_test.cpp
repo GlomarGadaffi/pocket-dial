@@ -10,8 +10,8 @@
 // Each route is served twice and measured on the second pass, so first-use
 // statics count as init, not per request.
 //
-// The gate: a route NOT on kAllocatingRoutes must allocate zero. Routes on
-// the list still allocate today (#410 lands route by route); the test prints
+// The gate: a route NOT on kAllocCeiling must allocate zero, and a route on it
+// may not exceed its ceiling. Routes on the list still allocate today (#410 lands route by route); the test prints
 // every route's count, so a route that has reached zero can be taken off the
 // list, which is how the list shrinks to empty.
 //
@@ -34,7 +34,7 @@
 #include <cstdio>
 #include <iostream>
 #include <memory>
-#include <set>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -105,18 +105,24 @@ namespace
 		{"POST /api/kill",              "POST", "/api/kill", "callId=none", true},
 	};
 
-	// Routes that still allocate (see the file comment). Remove a route once its
-	// printed count is zero; the list shrinking to empty is #410 done.
-	const std::set<std::string> kAllocatingRoutes = {
-		"GET /", "GET /index.html", "GET /api/status", "GET /metrics",
-		"GET /api/syslog", "GET /setup/email", "GET /api/email", "GET /setup/trunk",
-		"GET /api/trunk", "GET /api/moh", "GET /api/cdr", "GET /api/pcap",
-		"GET /api/coredump/info", "GET /api/coredump", "GET /api/trace",
-		"GET /api/diagnostics/pcap", "GET /api/telephony-config", "GET /api/e911-config",
-		"GET /api/sbc-mode", "GET /api/did-mapping", "GET /api/config/export",
-		"GET /api/ap-security", "GET /api/registrar", "GET /api/admin/status",
-		"GET /api/ota/status", "POST /api/dnd", "POST /api/voicemail", "POST /api/forward",
-		"POST /api/group", "POST /api/dialplan", "POST /api/syslog", "POST /api/kill",
+	// Routes that still allocate (see the file comment), with the most each may
+	// allocate per request: BigDog2's first host run (#627). A ceiling may only
+	// go DOWN: lower it when the printed count drops, remove the route at zero.
+	// The list shrinking to empty is #410 done.
+	const std::map<std::string, long> kAllocCeiling = {
+		{"GET /api/status", 1},
+		{"GET /", 2}, {"GET /index.html", 2}, {"GET /setup/email", 2}, {"GET /setup/trunk", 2},
+		{"GET /api/cdr", 2}, {"GET /api/trace", 2}, {"GET /api/did-mapping", 2},
+		{"GET /api/pcap", 3}, {"GET /api/coredump", 3}, {"GET /api/diagnostics/pcap", 3},
+		{"GET /api/ota/status", 3}, {"POST /api/dnd", 3}, {"POST /api/voicemail", 3},
+		{"POST /api/forward", 3}, {"POST /api/group", 3}, {"POST /api/syslog", 3},
+		{"POST /api/kill", 3},
+		{"GET /api/syslog", 4}, {"GET /api/trunk", 4}, {"GET /api/moh", 4},
+		{"GET /api/coredump/info", 4}, {"GET /api/e911-config", 4}, {"GET /api/sbc-mode", 4},
+		{"GET /api/registrar", 4},
+		{"GET /metrics", 5}, {"GET /api/email", 5}, {"GET /api/admin/status", 5},
+		{"GET /api/ap-security", 6}, {"POST /api/dialplan", 9}, {"GET /api/config/export", 10},
+		{"GET /api/telephony-config", 14},
 	};
 
 	struct RouteBench
@@ -193,13 +199,19 @@ TEST(HttpRouteAlloc, EveryRouteOffTheAllowlistAllocatesNothing)
 		std::cout << "[route-alloc] " << r.name << ": " << allocs
 		          << " (" << resp.substr(0, resp.find("\r\n")) << ")\n";
 		ASSERT_GE(allocs, 0) << r.name << " never reached the route table";
-		if (kAllocatingRoutes.count(r.name) == 0)
+		const auto ceiling = kAllocCeiling.find(r.name);
+		if (ceiling == kAllocCeiling.end())
 		{
 			EXPECT_EQ(allocs, 0) << r.name << " allocates per request and is not on the allowlist";
 		}
-		else if (allocs == 0)
+		else
 		{
-			std::cout << "[route-alloc] " << r.name << " is now allocation-free: take it off the allowlist\n";
+			EXPECT_LE(allocs, ceiling->second) << r.name << " allocates more than its ceiling";
+			if (allocs == 0)
+				std::cout << "[route-alloc] " << r.name << " is now allocation-free: take it off the allowlist\n";
+			else if (allocs < ceiling->second)
+				std::cout << "[route-alloc] " << r.name << " is below its ceiling (" << ceiling->second
+				          << "): lower it to " << allocs << "\n";
 		}
 	}
 }
