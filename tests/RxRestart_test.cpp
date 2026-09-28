@@ -42,3 +42,56 @@ TEST(RxRestart, ADroppedLegIsRefusedAnotherIsNot)
 	for (int i = 0; i < 8; ++i) dropped.add("newer-" + std::to_string(i));
 	EXPECT_TRUE(pd::rxStartAllowedFor(dropped, "leg-554"));
 }
+
+TEST(RxRestart, ASlotWithALiveRxTaskIsNotAllocatable)
+{
+	// Issue #553: a task detached on a join timeout (or not yet parked) still owns its
+	// slot. Handing that slot to a new call would put two rx tasks on one slot, the
+	// #370 crash. Only a free slot whose old task is gone (Nothing) or was just reaped
+	// (Reap) may be allocated.
+	EXPECT_FALSE(pd::rxSlotAllocatable(true, false, pd::ReapDecision::Wait))
+		<< "free by participantId but its old rx task is still alive";
+	EXPECT_TRUE(pd::rxSlotAllocatable(true, false, pd::ReapDecision::Nothing));
+	EXPECT_TRUE(pd::rxSlotAllocatable(true, false, pd::ReapDecision::Reap));
+}
+
+TEST(RxRestart, ABusyOrTearingDownSlotIsNeverAllocatable)
+{
+	// Positive control for the test above: the other two conditions still refuse
+	// on their own, whatever the reap says.
+	EXPECT_FALSE(pd::rxSlotAllocatable(false, false, pd::ReapDecision::Nothing)) << "owned by a participant";
+	EXPECT_FALSE(pd::rxSlotAllocatable(true, true, pd::ReapDecision::Nothing)) << "mid-teardown";
+}
+
+TEST(RxRestart, AReapedDetachedTaskIsTakenBackOutOfTheRestartCount)
+{
+	// #608 review: a join-timeout detach is counted toward the #65 anchor restart,
+	// but only while that task is alive. Reaping it must take it back out.
+	int detachedCount = 0;
+	bool slotDetached = false;
+
+	++detachedCount;           // stopMediaStreams(): join timed out, detach
+	slotDetached = true;
+	detachedCount += pd::detachCountDeltaOnReap(slotDetached);   // later reaped
+
+	EXPECT_EQ(detachedCount, 0);
+	EXPECT_FALSE(slotDetached);
+	EXPECT_EQ(pd::detachCountDeltaOnReap(slotDetached), 0) << "a slot is taken out once only";
+}
+
+TEST(RxRestart, ThreeBenignDetachesNeverRequestARestart)
+{
+	// The restart drops every live call, so three detaches that each ended in a
+	// clean reap must never reach the threshold (kLeakRestartThreshold = 3).
+	constexpr int kThreshold = 3;
+	int detachedCount = 0;
+	bool slotDetached = false;
+	for (int i = 0; i < kThreshold; ++i)
+	{
+		++detachedCount;
+		slotDetached = true;
+		EXPECT_LT(detachedCount, kThreshold) << "cycle " << i;
+		detachedCount += pd::detachCountDeltaOnReap(slotDetached);
+	}
+	EXPECT_EQ(detachedCount, 0);
+}

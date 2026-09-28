@@ -274,8 +274,15 @@ void HttpServer::start()
 }
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
-static std::atomic<bool> s_failSocketTimeoutsForTest{false};
-void HttpServer::setFailSocketTimeoutsForTest(bool fail) { s_failSocketTimeoutsForTest.store(fail); }
+// #616: per option, so a test failing only the refusal's SO_SNDTIMEO does not
+// also kill the slot holders' SO_RCVTIMEO (set again on every body-loop recv).
+static std::atomic<bool> s_failRecvTimeoutForTest{false};
+static std::atomic<bool> s_failSendTimeoutForTest{false};
+void HttpServer::setFailSocketTimeoutsForTest(bool failRecv, bool failSend)
+{
+	s_failRecvTimeoutForTest.store(failRecv);
+	s_failSendTimeoutForTest.store(failSend);
+}
 static void (*s_dispatchMarkForTest)() = nullptr;   // #410 route gate
 void HttpServer::setDispatchMarkForTest(void (*mark)()) { s_dispatchMarkForTest = mark; }
 #endif
@@ -287,7 +294,8 @@ void HttpServer::setDispatchMarkForTest(void (*mark)()) { s_dispatchMarkForTest 
 static bool setSocketTimeoutMs(int sock, int opt, long ms)
 {
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
-	if (s_failSocketTimeoutsForTest.load()) return false;
+	if ((opt == SO_RCVTIMEO && s_failRecvTimeoutForTest.load()) ||
+		(opt == SO_SNDTIMEO && s_failSendTimeoutForTest.load())) return false;
 #endif
 	if (ms < 1) ms = 1;
 #if defined _WIN32 || defined _WIN64

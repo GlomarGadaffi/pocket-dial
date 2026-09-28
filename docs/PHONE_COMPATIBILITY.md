@@ -16,27 +16,26 @@ For the end-to-end first call, see [SETUP_GUIDE.md](SETUP_GUIDE.md). For board c
 | Port | `5060` |
 | Transport | **UDP only** (the engine does not speak TCP, TLS or SIPS) |
 | Username / Auth ID / extension | your choice, e.g. `1001` (see the reserved list below) |
-| Password | **depends on the registrar mode; see §1.1.** On a factory-default board (Open mode) any value or blank registers. |
+| Password | **depends on the registrar mode; see §1.1.** On a factory-default board (Learn mode) any value or blank registers an unclaimed extension. |
 | Audio codec | **G.711** µ-law (PCMU, `0`) / a-law (PCMA, `8`) always; **G.722** (`9`) between two phones that both offer it. DTMF telephone-event (any payload number, `101` by convention) passes through |
 | Registration expiry | ≤ `3600` s (`MAX_EXPIRES`, `RequestsHandler.cpp:48`; the registrar caps higher values to 3600 and floors anything under 30 s) |
 | NAT / STUN / ICE / rport | **off** (ordinary call media is peer-to-peer on one L2 segment; NAT traversal only adds latency and failure modes) |
 
-### 1.1 SIP passwords: digest auth ships, but the shipped default is Open
+### 1.1 SIP passwords: digest auth ships, but the shipped default is Learn
 
-The registrar has **three runtime modes** (`Registrar.hpp:26-31`), selected at runtime and
+The registrar has **two runtime modes** (`Registrar.hpp:33-37`; Open is retired, #500), selected at runtime and
 persisted in NVS as `reg_mode`; change it from the dashboard (`POST /api/registrar`) or at
 flash time via the `cfgseed` record. Full detail in [LEARN_MODE.md](LEARN_MODE.md).
 
 | Mode | What a REGISTER has to prove | Password on the phone |
 | :--- | :--- | :--- |
-| **Open** (*the shipped default*, `RequestsHandler.hpp:536-537`) | Nothing. Every REGISTER is accepted, every INVITE routed. | Any value, or blank. |
-| **Learn** | Trust-on-first-use: an unknown MAC is adopted and accepted unverified; a device you later promote to *Secured* must present a digest, and its extension is MAC-locked against spoofing (`Registrar.cpp:137-200`). | Blank until you promote the device; then the password you set. |
+| **Learn** (*the shipped default*, `Registrar.cpp:42`) | Trust-on-first-use: an unknown MAC is adopted and accepted unverified; a device you later promote to *Secured* must present a digest, and its extension is MAC-locked against spoofing (`Registrar.cpp:137-200`). | Blank until you promote the device; then the password you set. |
 | **Secure** | RFC 2617 digest auth for every provisioned extension (`Registrar::admitSecure`, `SipDigest.cpp`). | Required, must match. |
 
 > [!WARNING]
-> **A fresh board is wide open.** SIP digest authentication is fully implemented, but it is
-> **not on by default**. An out-of-the-box unit accepts any REGISTER from any device on the
-> link and routes any INVITE. Moving to Learn or Secure mode is a deliberate operator action.
+> **A fresh board trusts on first use.** SIP digest authentication is fully implemented, but it is
+> **not on by default**. An out-of-the-box unit adopts, unverified, the first device on the
+> link to REGISTER an unclaimed extension. Moving to Secure mode is a deliberate operator action.
 > See [THREAT_MODEL.md](THREAT_MODEL.md).
 
 > [!NOTE]

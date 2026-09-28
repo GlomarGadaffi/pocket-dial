@@ -117,9 +117,9 @@ public:
 	// Handler threads still alive, so a test can wait for them before the
 	// server (which they reference) is destroyed.
 	int activeConnectionsForTest() const { return _activeConnections.load(std::memory_order_acquire); }
-	// Test-only (#534 review): make every SO_RCVTIMEO/SO_SNDTIMEO set fail, so
-	// the "cannot bound this socket" paths can be driven deterministically.
-	static void setFailSocketTimeoutsForTest(bool fail);
+	// Test-only (#534 review, #616): make SO_RCVTIMEO and/or SO_SNDTIMEO sets
+	// fail, so the "cannot bound this socket" paths can be driven deterministically.
+	static void setFailSocketTimeoutsForTest(bool failRecv, bool failSend);
 #endif
 
 	HttpServer(const std::string& ip, int port, RequestsHandler* handler = nullptr);

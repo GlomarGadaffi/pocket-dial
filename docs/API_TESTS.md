@@ -60,7 +60,6 @@ From the dispatch (`HttpServer.cpp:433-711`):
 |---|---|
 | `GET /`, `GET /index.html` | The dashboard shell; the login form has to render |
 | `GET /api/status` | Read-only metrics snapshot |
-| `GET /api/cdr` | Read-only call-detail ring |
 | `GET /api/wifi/scan` | Onboarding needs it before a session exists |
 | `GET /api/admin/status` | Tells the page whether to show the login form |
 | `GET /api/ota/status` | Partition labels + pending flag; no secrets |
@@ -271,8 +270,8 @@ Fetches a read-only snapshot of the registrar, call sessions, and system metrics
   ```
 
 ### 3.3 GET `/api/cdr`
-Read-only Call Detail Records ring. **Ungated**, like `/api/status`, a test must not expect
-a `401` here.
+Read-only Call Detail Records ring. **Read-gated** since #207 (cookie, no CSRF); without a
+session a test must expect `401`.
 
 ### 3.4 POST `/api/kill`
 Administratively disconnects a registered extension and terminates its calls.
@@ -562,8 +561,8 @@ login preamble (including setup completion) to have run first.
   `101` are immediately swept.
 * TC-HP-04 (Scan WiFi): GET `/api/wifi/scan` → on a Wi-Fi build, switches to `APSTA`
   then `200 OK` with SSIDs; on `eth`/`lan8720`/host, `200 OK` with an empty list.
-* TC-HP-05 (Call log): GET `/api/cdr` with **no** headers → `200 OK`. Regression case
-  for the route being ungated like `/api/status`.
+* TC-HP-05 (Call log): GET `/api/cdr` with **no** headers → `401`; with the session
+  cookie → `200 OK`. Regression case for #207.
 
 ### Forced-Setup Tests (gate layer 4)
 * TC-SET-01 (Fresh device reports itself): GET `/api/admin/status` on a never-set-up
