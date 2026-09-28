@@ -1890,6 +1890,19 @@ void HttpServer::recordConnStackHwm()
 #endif
 }
 
+char* HttpServer::leaseStatusBuf(std::atomic<bool>*& busy)
+{
+	for (int i = 0; i < kStatusBufCount; ++i)
+	{
+		if (_statusBuf[i] != nullptr && !_statusBufBusy[i].exchange(true, std::memory_order_acquire))
+		{
+			busy = &_statusBufBusy[i];
+			return _statusBuf[i];
+		}
+	}
+	return nullptr;
+}
+
 void HttpServer::sendApiStatus(int sock, bool authenticated)
 {
 	// #410: polled every second by the dashboard, so no heap per request. The
@@ -1897,16 +1910,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// constructor) and sent from there; the snapshot tables are formatted in
 	// place under the snapshot lock instead of copied out. A body that does not
 	// fit is refused with a 500 and counted -- never truncated, never grown.
-	char* buf = nullptr;
 	std::atomic<bool>* busy = nullptr;
-	for (int i = 0; i < kStatusBufCount && buf == nullptr; ++i)
-	{
-		if (_statusBuf[i] != nullptr && !_statusBufBusy[i].exchange(true, std::memory_order_acquire))
-		{
-			buf = _statusBuf[i];
-			busy = &_statusBufBusy[i];
-		}
-	}
+	char* buf = leaseStatusBuf(busy);
 	if (buf == nullptr)   // all busy (fewer buffers than slots without PSRAM), or failed at boot
 	{
 		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
@@ -2516,16 +2521,34 @@ void HttpServer::sendApiMetrics(int sock)
 	// increase() only apply their counter-reset correction to a family typed
 	// counter, so mistyping one would make every reboot read as a large
 	// negative rate instead of a reset.
-	std::ostringstream out;
-	auto gauge = [&out](const char* name, const char* help, uint64_t value) {
-		out << "# HELP " << name << " " << help << "\n";
-		out << "# TYPE " << name << " gauge\n";
-		out << name << " " << value << "\n";
+	//
+	// #630: written into one of /api/status's fixed buffers (JsonOut is a plain
+	// bounded appender; nothing here is JSON), so a scrape allocates nothing.
+	// The body is ~3.5 KB, far under the smallest buffer (16 KB).
+	std::atomic<bool>* busy = nullptr;
+	char* buf = leaseStatusBuf(busy);
+	if (buf == nullptr)
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 503, "Service Unavailable", "text/plain; charset=utf-8", "no metrics buffer\n");
+		return;
+	}
+	struct Release
+	{
+		std::atomic<bool>* f;
+		~Release() { f->store(false, std::memory_order_release); }
+	} release{busy};   // held until the send below has finished reading buf
+	JsonOut out{buf, (std::min)(_statusCap, kStatusBufBytes)};
+	auto family = [&out](const char* name, const char* type, const char* help, uint64_t value) {
+		out.s("# HELP ").s(name).s(" ").s(help).s("\n")
+		   .s("# TYPE ").s(name).s(" ").s(type).s("\n")
+		   .s(name).s(" ").n(value).s("\n");
 	};
-	auto counter = [&out](const char* name, const char* help, uint64_t value) {
-		out << "# HELP " << name << " " << help << "\n";
-		out << "# TYPE " << name << " counter\n";
-		out << name << " " << value << "\n";
+	auto gauge = [&family](const char* name, const char* help, uint64_t value) {
+		family(name, "gauge", help, value);
+	};
+	auto counter = [&family](const char* name, const char* help, uint64_t value) {
+		family(name, "counter", help, value);
 	};
 
 	// Uptime is monotonic-since-boot but is a gauge by convention (and by
@@ -2590,7 +2613,13 @@ void HttpServer::sendApiMetrics(int sock)
 	// "text/plain; version=0.0.4" is THE exposition-format content type — the
 	// version parameter is how a scraper picks its parser, so it is not
 	// decorative. sendResponse passes the string through verbatim.
-	sendResponse(sock, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", out.str());
+	if (out.full)
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 500, "Internal Server Error", "text/plain; charset=utf-8", "metrics response too large\n");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", std::string_view(buf, out.len));
 }
 
 void HttpServer::sendApiKill(int sock, const std::string& body)
