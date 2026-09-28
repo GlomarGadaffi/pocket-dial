@@ -302,6 +302,10 @@ void ConferenceRoom::startDriver()
 	{
 		return;   // idempotent — never a second tick path
 	}
+	if (_failDriverStartForTest)
+	{
+		return;   // #479 seam: as a failed conf_mix_tick create leaves it
+	}
 	_stopRequested.store(false, std::memory_order_release);
 	_driverRunning.store(true, std::memory_order_release);
 	_driverThread = std::thread([this] { runDriver(); });
