@@ -269,8 +269,17 @@ private:
 	// pool is 16 and the anchor itself needs 3 persistent sockets + SIP/dashboard/SSH,
 	// so a handful of leaks is the safe ceiling before sockets start starving.
 	static constexpr int kLeakRestartThreshold = 3;
-	// One-shot worker that performs the full stop()/start() reclaim cycle off-SIP.
+	// The full stop()/start() reclaim cycle; runs on tel_maint, off-SIP.
 	static void restartTaskTrampoline(void* arg);
+	// #658: one persistent tel_maint task runs restart, re-warm and reconcile. tick() sets the
+	// job's in-flight gate and a notify bit; the task runs the body and clears the gate. Created
+	// once by the first start() and never deleted (restart runs stop()/start() on it).
+	static constexpr uint32_t kMaintRestart   = 1u << 0;
+	static constexpr uint32_t kMaintRewarm    = 1u << 1;
+	static constexpr uint32_t kMaintReconcile = 1u << 2;
+	std::atomic<TaskHandle_t> _maintHandle{nullptr};
+	static void maintTaskTrampoline(void* arg);
+	bool wakeMaint(uint32_t job);   // false: no tel_maint task; the caller releases its gate
 	// Issue #336: same _restartRequested mechanism as the leak-count path above,
 	// triggered instead by a disconnected/errored WS with an expiring/expired
 	// token -- see its own definition for why reconnect-in-place can't fix this.
@@ -387,9 +396,9 @@ private:
 	// Device-specific makecall transport.
 	std::string pickDeviceId(const std::string& body);   // parse a /devices array → a device_id
 	bool resolveDevice();                                 // GET /devices → pickDeviceId → _deviceId
-	// One-shot worker spawned by tick() to clear a wedged _outboundActive (see .cpp).
+	// Run on tel_maint (#658) when tick() sees a wedged _outboundActive (see .cpp).
 	static void reconcileTaskTrampoline(void* arg);
-	// #107: idle TLS re-warm — one-shot worker (spawned by tick() when idle) that reopens the
+	// #107: idle TLS re-warm — runs on tel_maint (#658) when tick() sees idle; reopens the
 	// persistent POST handle to perform a resumed handshake and refresh its session ticket.
 	static void rewarmTaskTrampoline(void* arg);
 	void rewarmPostSession();   // the blocking re-warm body; runs off the SIP task

@@ -183,6 +183,8 @@ TelephonyAnchorClient::TelephonyAnchorClient()
 TelephonyAnchorClient::~TelephonyAnchorClient()
 {
 	shutdownImpl();   // non-virtual: never dispatch a virtual call from a destructor
+	// #658: tel_maint holds `this`; it must not outlive the object.
+	if (TaskHandle_t h = _maintHandle.exchange(nullptr)) vTaskDelete(h);
 	// #100: free each slot's done-sem (a raw FreeRTOS handle — CallSlot's dtor won't reclaim it).
 	for (auto& s : _calls)
 	{
@@ -216,6 +218,23 @@ bool TelephonyAnchorClient::start()
 			return false;
 		}
 		_running = true;
+	}
+
+	// #658: the persistent tel_maint task, once. A restart runs this start() on it, so it is
+	// never recreated or deleted here. Internal stack: restart runs stop()/start() (#273 audit
+	// needed before PSRAM).
+	if (!_maintHandle.load(std::memory_order_acquire))
+	{
+		TaskHandle_t h = nullptr;
+		if (xTaskCreate(&TelephonyAnchorClient::maintTaskTrampoline, "tel_maint", 6144, this, 5, &h) != pdPASS)
+		{
+			ESP_LOGE(TAG, "start: failed to create tel_maint (no restart/re-warm/reconcile)");
+		}
+		else
+		{
+			psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
+			_maintHandle.store(h, std::memory_order_release);
+		}
 	}
 
 	// 1. Fetch OAuth token
@@ -1575,14 +1594,10 @@ void TelephonyAnchorClient::tick()
 	    !_restartInFlight.load(std::memory_order_acquire))
 	{
 		_restartInFlight.store(true, std::memory_order_release);
-		if (xTaskCreate(&TelephonyAnchorClient::restartTaskTrampoline, "tel_restart", 6144, this, 5, nullptr) != pdPASS)
+		if (!wakeMaint(kMaintRestart))
 		{
-			ESP_LOGE(TAG, "tick: failed to spawn anchor-restart worker");
+			ESP_LOGE(TAG, "tick: no maint task for the anchor restart");
 			_restartInFlight.store(false, std::memory_order_release);
-		}
-		else
-		{
-			psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 		}
 	}
 
@@ -1623,14 +1638,10 @@ void TelephonyAnchorClient::tick()
 			// Stamp BEFORE the spawn so the next-due math is correct even if the worker is slow.
 			_lastRewarmUs.store(now, std::memory_order_release);
 			_rewarmInFlight.store(true, std::memory_order_release);
-			if (xTaskCreate(&TelephonyAnchorClient::rewarmTaskTrampoline, "tel_rewarm", 6144, this, 5, nullptr) != pdPASS)
+			if (!wakeMaint(kMaintRewarm))
 			{
-				ESP_LOGE(TAG, "tick: failed to spawn TLS re-warm worker");
+				ESP_LOGE(TAG, "tick: no maint task for the TLS re-warm");
 				_rewarmInFlight.store(false, std::memory_order_release);
-			}
-			else
-			{
-				psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 			}
 		}
 	}
@@ -1675,15 +1686,33 @@ void TelephonyAnchorClient::tick()
 
 	// Claim the one-shot slot BEFORE the spawn so a second tick can't double-spawn the worker.
 	_reconcileInFlight.store(true, std::memory_order_release);
-	if (xTaskCreate(&TelephonyAnchorClient::reconcileTaskTrampoline, "tel_reconcile", 6144, this, 5, nullptr) != pdPASS)
+	if (!wakeMaint(kMaintReconcile))
 	{
 		// Rare error path (not the hot path): release the slot, else the watchdog wedges forever.
-		ESP_LOGE(TAG, "tick: failed to spawn reconcile worker");
+		ESP_LOGE(TAG, "tick: no maint task for the reconcile");
 		_reconcileInFlight.store(false, std::memory_order_release);
 	}
-	else
+}
+
+bool TelephonyAnchorClient::wakeMaint(uint32_t job)
+{
+	const TaskHandle_t h = _maintHandle.load(std::memory_order_acquire);
+	if (!h) return false;
+	xTaskNotify(h, job, eSetBits);   // eSetBits always returns pdPASS
+	return true;
+}
+
+// #658: the persistent maintenance task. Each job's body clears its own in-flight gate and
+// returns; a bit set while a body runs stays pending and runs on the next pass.
+void TelephonyAnchorClient::maintTaskTrampoline(void* arg)
+{
+	for (;;)
 	{
-		psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
+		uint32_t jobs = 0;
+		xTaskNotifyWait(0, UINT32_MAX, &jobs, portMAX_DELAY);
+		if (jobs & kMaintRestart)   restartTaskTrampoline(arg);
+		if (jobs & kMaintRewarm)    rewarmTaskTrampoline(arg);
+		if (jobs & kMaintReconcile) reconcileTaskTrampoline(arg);
 	}
 }
 
@@ -1756,14 +1785,11 @@ void TelephonyAnchorClient::reconcileTaskTrampoline(void* arg)
 		         ok ? 1 : 0, status);
 	}
 
-	// Single exit: clear the one-shot slot so tick() can re-arm, THEN self-delete. vTaskDelete()
-	// does not unwind the C++ stack, so this clear must be explicit here (not an RAII guard) — and
-	// the only cJSON RAII above is confined to an inner scope that has already run.
+	// Single exit: clear the one-shot slot so tick() can re-arm.
 	self->_reconcileInFlight.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
 }
 
-// #107: one-shot worker spawned by tick() when the anchor is idle. Reopens the persistent
+// #107: run on tel_maint (#658) when tick() sees the anchor idle. Reopens the persistent
 // POST handle so its cached TLS session RESUMES (abbreviated handshake) and Telephony issues a
 // fresh ticket — extending validity so the next real call's /stream open also resumes. Runs
 // off the SIP task because the open/close blocks on TLS I/O.
@@ -1771,9 +1797,8 @@ void TelephonyAnchorClient::rewarmTaskTrampoline(void* arg)
 {
 	auto* self = static_cast<TelephonyAnchorClient*>(arg);
 	self->rewarmPostSession();
-	// Single exit: release the one-shot slot so tick() can re-arm, then self-delete.
+	// Single exit: release the one-shot slot so tick() can re-arm.
 	self->_rewarmInFlight.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
 }
 
 void TelephonyAnchorClient::rewarmPostSession()
@@ -1923,7 +1948,7 @@ void TelephonyAnchorClient::prewarmAllSlots()
 	ESP_LOGI(TAG, "prewarm: %d/%d slots' POST TLS sessions primed (resumable)", warmed, POCKETDIAL_MAX_ANCHOR_CALLS);
 }
 
-// Issue #65 (L-1): one-shot worker that reclaims leaked GET sockets by cycling the
+// Issue #65 (L-1): run on tel_maint (#658); reclaims leaked GET sockets by cycling the
 // whole anchor. stop() tears down the WS + control + media clients and frees every
 // socket it still OWNS; a detached rx task's socket (#553) is its own to close, but a
 // full stop()/start() drops the anchor's live socket footprint to
@@ -1977,7 +2002,6 @@ void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 
 	// Clear the in-flight gate LAST so tick() can spawn a future restart if needed.
 	self->_restartInFlight.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
 }
 
 esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token)
