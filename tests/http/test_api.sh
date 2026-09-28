@@ -495,21 +495,21 @@ HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
 BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
 assert_status "TC-OTA-05: POST /api/ota/reboot (Cross-Origin rejected)" "403" "$HTTP_CODE" "$BODY_CONTENT"
 
-# TC-OTA-06: Same-origin, authenticated reboot -> 200 (host stub is a no-op and
-# must NOT exit) or 409 (real device, no staged image).
+# TC-OTA-06: Same-origin, authenticated reboot with confirm=1 -> 200 (host stub
+# is a no-op and must NOT exit). #645: no staged image is a plain restart, not 409.
 RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
   -H "Host: ${HOST_HDR}" \
   -H "Origin: ${ORIGIN_HDR}" \
   -H "Cookie: pd_session=${SESSION}" \
   -H "X-CSRF: ${CSRF}" \
-  "${BASE_URL}/api/ota/reboot")
+  -d "confirm=1" "${BASE_URL}/api/ota/reboot")
 HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
 BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
-if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "409" ]; then
+if [ "$HTTP_CODE" = "200" ]; then
     echo -e "  [${GREEN}PASS${RESET}] TC-OTA-06: POST /api/ota/reboot same-origin (Got ${HTTP_CODE})"
     ((PASSED_TESTS++))
 else
-    echo -e "  [${RED}FAIL${RESET}] TC-OTA-06: POST /api/ota/reboot same-origin (Got ${HTTP_CODE}, expected 200 or 409)"
+    echo -e "  [${RED}FAIL${RESET}] TC-OTA-06: POST /api/ota/reboot same-origin (Got ${HTTP_CODE}, expected 200)"
     echo -e "         Response Body: ${YELLOW}${BODY_CONTENT}${RESET}"
     ((FAILED_TESTS++))
 fi
