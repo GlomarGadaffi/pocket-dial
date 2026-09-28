@@ -1,0 +1,2 @@
+# AdminHttpGate_test.cpp: 1 (#540: a taken port throws, port 0 reads back)
+1

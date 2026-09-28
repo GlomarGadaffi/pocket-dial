@@ -190,6 +190,25 @@ bool HttpServer::openListenSocket()
 		return false;
 	}
 
+	// Issue #540: port 0 asks the OS for a free port. Read back the one it
+	// chose, so port() reports it -- host test suites no longer need fixed
+	// ports and can run in parallel.
+	if (_port == 0)
+	{
+		sockaddr_in bound{};
+#if defined _WIN32 || defined _WIN64
+		int boundLen = static_cast<int>(sizeof(bound));
+#else
+		socklen_t boundLen = sizeof(bound);
+#endif
+		if (getsockname(sock, reinterpret_cast<struct sockaddr*>(&bound), &boundLen) != 0)
+		{
+			closeSocket(sock);
+			return false;
+		}
+		_port = ntohs(bound.sin_port);
+	}
+
 	_listenSock = sock;
 	return true;
 }
