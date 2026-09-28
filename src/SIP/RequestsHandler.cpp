@@ -120,6 +120,11 @@ namespace
 	// branch): it answers synchronously and clears any timer immediately.
 	constexpr auto ANCHOR_ACK_TIMEOUT = std::chrono::seconds(15);
 
+	// Issue #604: how long a CONNECTED relayed leg may receive no RTP before
+	// tick() ends the call. Well past silence-suppression gaps; Held calls are
+	// exempt outright.
+	constexpr auto kRtpInactivityTimeout = std::chrono::seconds(60);
+
 	// How long an outbound anchor/trunk call may RING before tick() reaps it.
 	//
 	// Deliberately NOT pbx::kNoAnswerTimeout. That constant is documented as "how
@@ -3962,6 +3967,13 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// still possible); then the generic SIP trunk, whose refusals answer the
 	// INVITE themselves and so must come last; then the 503 below.
 	const EmergencyRoute route = emergencyRouteLocked();
+	// #604: flag the session the route just made, so tick()'s RTP-inactivity
+	// reap never hangs up a 911 (the dialed number alone misses a dial-plan
+	// transform such as "0" -> "911").
+	auto markEmergency = [&] {
+		auto s = _sessions.find(std::string(data->getCallID()));
+		if (s != _sessions.end() && s->second) s->second->setEmergency(true);
+	};
 	bool placed = false;
 	bool codecRejected = false;
 	if (route == EmergencyRoute::Anchor)
@@ -3974,6 +3986,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed,
 			&codecRejected))
 		{
+			markEmergency();   // #604
 			// The call leg is enqueued. NOW notify: 47 CFR 9.16(b)(2) wants the
 			// notification contemporaneous with the call and not delaying it, and
 			// both leave on the same drainOutbox() pass, so that holds literally
@@ -4010,6 +4023,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 			// Always owns the INVITE: every refusal on this path answers it, and
 			// logs which one it was ("trunk: <why> for <ext> -> 911").
 			(void)placeSipTrunkCall(data, caller, bare, &placed);
+			markEmergency();   // #604
 			notifyEmergency(emergency, from, dialed, /*routed=*/placed);
 			return;
 		}
@@ -9007,6 +9021,82 @@ void RequestsHandler::tick()
 				endCall(callID, handset ? handset->getNumber() : "", part,
 					"anchor audio write failure");
 			}
+		}
+
+		// Issue #604: RTP inactivity. A relayed call whose media stops with no
+		// SIP BYE (the phone lost power or left the LAN, the far end vanished)
+		// was held until the registration lease ran out -- up to an hour of a
+		// session, a relay pair and a billed carrier leg. End it once BOTH
+		// relayed legs have received nothing for kRtpInactivityTimeout; one
+		// quiet leg (VAD-silent listener, far-end hold, mute) is a live call.
+		// Only legs the board relays can be watched: a trunk call's two
+		// receivers and an anchor bridge's handset RTP + anchor audio. Exempt: Held calls
+		// (a sendonly/inactive leg legitimately sends nothing; the watch
+		// restarts on resume) and 911/933 (see Session::isEmergency()).
+		std::vector<std::string> silentCallIds;
+		for (const auto& [callID, session] : _sessions)
+		{
+			if (session->getState() != Session::State::Connected || session->isEmergency())
+			{
+				session->disarmRtpWatch();
+				continue;
+			}
+			uint32_t legA = 0, legB = 0;
+			if (session->isTrunk())
+			{
+				const int slot = session->getTrunkRelaySlot();
+				if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS) ||
+				    !_trunkRx[slot].isActive() || !_handsetRx[slot].isActive()) continue;
+				legA = _handsetRx[slot].rawRxPackets();
+				legB = _trunkRx[slot].rawRxPackets();
+			}
+			else if (session->isAnchor())
+			{
+				MediaBridge* b = nullptr;
+				for (auto& mb : _mediaBridges)
+				{
+					if (mb.isForCallId(callID)) { b = &mb; break; }
+				}
+				if (!b || !b->isActive()) continue;
+				legA = b->handsetRtpPackets();
+				legB = b->anchorRxChunks();
+			}
+			else
+			{
+				continue;   // peer-to-peer media never passes through the board
+			}
+			if (session->rtpSilence(legA, legB, now) >= kRtpInactivityTimeout)
+			{
+				silentCallIds.push_back(callID);
+			}
+		}
+		for (const auto& callID : silentCallIds)
+		{
+			auto sit = _sessions.find(callID);
+			if (sit == _sessions.end()) continue;
+			auto session = sit->second;
+			// The handset is src on both relayed shapes except an inbound anchor
+			// call, where it is dest. BYE it best effort, the same way each shape's
+			// own far-end hangup does (onTrunkRemoteBye, the #279 anchor teardown);
+			// endCall() then BYEs the carrier or drops the anchor leg and frees the
+			// relay or bridge.
+			const bool inbound = session->isAnchorInbound();
+			auto handset = inbound ? session->getDest() : session->getSrc();
+			const std::string& dFrom = session->getDialogFrom();
+			const std::string& dTo   = session->getDialogTo();
+			if (handset && !dFrom.empty() && !dTo.empty())
+			{
+				const bool fromIsUs = session->isTrunk() || inbound;
+				auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), callID,
+					fromIsUs ? dFrom : dTo, fromIsUs ? dTo : dFrom);
+				if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
+			}
+			queueLog("[media] no RTP for " + std::to_string(kRtpInactivityTimeout.count()) +
+				" s -- ending " + callID, true);
+			const std::string handsetNum = handset ? handset->getNumber() : std::string();
+			const std::string farNum = session->isAnchor() ? session->getAnchorParticipantId() : std::string();
+			if (inbound) endCall(callID, farNum, handsetNum, "rtp inactivity");
+			else         endCall(callID, handsetNum, farNum, "rtp inactivity");
 		}
 
 		// Reap ORPHANED media bridges — active but with NO owning anchor session.

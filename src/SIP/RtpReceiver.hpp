@@ -283,6 +283,10 @@ public:
 	// recvfrom() would otherwise be unreachable off-device.
 	bool dispatchRaw(const RtpPacket& pkt);
 
+	// Issue #604: packets the raw relay has taken since boot. tick() watches it
+	// for change to end a relayed call whose media stopped with no BYE. Wraps.
+	uint32_t rawRxPackets() const { return _rawRxPackets.load(std::memory_order_relaxed); }
+
 	// Point this receiver's socket at a peer, so sendRaw() can transmit from
 	// it. May be called before or after start().
 	//
@@ -431,6 +435,7 @@ private:
 	// _sink; the atomic flag lets the receive task skip the lock entirely on
 	// the common non-relay path -- one acquire-load per packet, not a mutex.
 	std::atomic<bool> _rawArmed{false};
+	std::atomic<uint32_t> _rawRxPackets{0};   // #604, see rawRxPackets()
 	RawSink           _rawSink = nullptr;
 	void*             _rawSinkCtx = nullptr;
 
