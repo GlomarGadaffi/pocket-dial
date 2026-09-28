@@ -1734,7 +1734,7 @@ function otaReboot(skip){
   if(!controlsUnlocked()){setMsg("ota-msg","Admin login required.","err");return;}
   if(!skip&&!confirm("Reboot the device now? Any active calls will drop."))return;
   setMsg("ota-msg","Rebooting device…","warn");
-  post("/api/ota/reboot","")
+  post("/api/ota/reboot","confirm=1")
     .then(function(){setMsg("ota-msg","Reboot signal sent. Restarting…","ok");})
     .catch(function(e){setMsg("ota-msg","Reboot failed: "+e.message,"err");});
 }
