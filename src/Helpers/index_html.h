@@ -673,8 +673,9 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <div class="subhead">&#9990; Extension Registration &amp; Onboarding</div>
       <div class="note">
         Controls what a phone must prove before it can register as an extension.
-        <strong>Learn</strong> adopts an unknown phone on first contact and locks
-        its extension to that device, so nobody else can take it over.
+        <strong>Learn</strong> adopts an unknown phone on first contact. The extension
+        is only locked to that device once an admin secures it; until then another
+        phone can register on the same extension.
         <strong>Secure</strong> digest-challenges every registration. There is no
         open mode: accepting any endpoint with no credential let anyone on the link
         register as any extension.
