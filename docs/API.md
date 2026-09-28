@@ -315,7 +315,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Gated (+ `X-CSRF`) | Saves Wi-Fi credentials to NVS and schedules a reboot into Station Mode. `501` on `eth`/`lan8720`/desktop (§4.2). |
 | [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Gated (+ `X-CSRF`) | Sets the device to Standalone Access Point Mode and schedules a reboot. No confirmation parameter. `501` on `eth`/`lan8720`/desktop (§4.2). |
 | [`/api/configuring`](#post-apiconfiguring) | `POST` | Low | Gated (+ `X-CSRF`) | Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. It mutates device state, so it takes the standard gate like every other mutating route; a logged-in, fully-set-up session is required, same as WiFi setup itself. |
-| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Requires `confirm=ERASE`. Wipes the login credential, the DTMF PIN, every session, AP security, the carrier-API credential table, the DID→extension table, the CDR ring, and (Wi-Fi builds only) Wi-Fi/mode NVS, then reboots on any ESP build. Answers `200` on every build. |
+| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Requires `confirm=ERASE`. Wipes the login credential, the DTMF PIN, every session, AP security, the carrier-API credential table, the DID→extension table, the CDR ring, and (Wi-Fi builds only) Wi-Fi/mode NVS, then reboots on any ESP build. Answers `200` on every build, or `409` `{"error":"emergency call in progress"}` while a 911/933 call is live (#652). |
 | [`/api/ap-security`](#get-apiap-security) | `GET` | Medium | Gated | Reports whether the SoftAP requires WPA2 and returns its passphrase. |
 | [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
 | [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster. |
@@ -323,7 +323,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
 | [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
-| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts with `confirm=1` if none is staged (#645). Simulated (`200`, no-op) on desktop. |
+| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts with `confirm=1` if none is staged (#645). Simulated (`200`, no-op) on desktop. While a 911/933 call is live a plain restart answers `409` `{"error":"emergency call in progress"}` and a staged-image reboot waits for the call to end (#652). |
 | [`/setup/email`](#get-setupemail) | `GET` | Low | None | Standalone SMTP-configuration page (own document, not part of the `/` SPA). Shell only, no data. |
 | [`/api/email`](#get-apiemail) | `GET` | Medium | Gated | Current SMTP configuration. Secrets redacted to `hasPassword`/`hasGsaKey` booleans. |
 | [`/api/email`](#post-apiemail) | `POST` | High | Gated (+ `X-CSRF`) | Saves SMTP host/port/mode/auth/credentials. Empty `pass`/`gsaKey`/`caPem` keeps the stored value. |
@@ -2326,6 +2326,7 @@ default-credential/needs-initial-setup state, then reboots.
     every ESP build a reboot is scheduled ~1 s out. The `message` field differs by build
     (captive portal / dashboard / restart the process) but the status does not.
   * `400 Bad Request`: `{"error":"factory reset requires confirm=ERASE"}`. Checked **first**, before anything is touched, so a request without it is genuinely harmless.
+  * `409 Conflict`: `{"error":"emergency call in progress"}`, while a 911/933 call is live (#652). Checked right after `confirm`, also before anything is touched.
   * `403 Forbidden`: `{"error":"owner privilege required"}`. A sysop session, with an owner already provisioned.
   * `401`/`403`: gates 1-4 as in §0.1.
 
@@ -2496,6 +2497,7 @@ Reboots into the image staged by a prior `/api/ota/upload`, or, with nothing sta
 * Response Content-Type: `application/json`
 * Response Status Codes:
   * `200 OK`: Reboot scheduled ~1 s out (ESP) or simulated (desktop).
+  * `409 Conflict`: `{"error":"emergency call in progress"}`, a plain restart while a 911/933 call is live (#652). A staged-image reboot is still `200`; its restart waits until the call ends.
   * `400 Bad Request`: `{"error":"reboot with no staged image requires confirm=1"}`, nothing staged and no `confirm=1`.
   * `401`/`403`: gates 1-4 as in §0.1.
 

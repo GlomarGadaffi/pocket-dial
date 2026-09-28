@@ -1,0 +1,2 @@
+# AdminHttpGate_test.cpp OtaReboot: 1 (emergency call blocks reboot/reset)
+1
