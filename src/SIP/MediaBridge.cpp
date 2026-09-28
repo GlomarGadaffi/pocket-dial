@@ -148,6 +148,7 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 	{
 		return;
 	}
+	_handsetRtpPackets.fetch_add(1, std::memory_order_relaxed);   // #604
 
 	// Issue #218: held ANCHOR-mode legs get their anchor-bound audio from
 	// feedMohTick() instead of the handset -- discard what the handset sends
@@ -355,6 +356,7 @@ bool MediaBridge::feedRx(std::string_view participantId, const int16_t* samples,
 	{
 		return false;
 	}
+	_anchorRxChunks.fetch_add(1, std::memory_order_relaxed);   // #604: the anchor leg is alive
 	// BUS mode: refuse rather than write into a buffer nothing reads. See the header's
 	// feedRx() comment — the anchor leg needs its OWN MixBus port, which is follow-up
 	// work; silently swallowing the chunk here would look like working audio.

@@ -48,6 +48,8 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_blindXferLeg = false;
 	_lastServerCSeq = 0;
 	_maxObservedCSeq = 0;
+	_isEmergency = false;     // #604
+	_rtpWatchArmed = false;   // #604
 
 	// Issue #353. These survived reset() and nothing else ever cleared them --
 	// there is no setVoicemail(false) anywhere in the tree -- so a pool slot

@@ -259,6 +259,7 @@ bool RtpReceiver::dispatchRaw(const RtpPacket& pkt)
 		// unclaimed rather than swallowing it, so the normal path still gets it.
 		return false;
 	}
+	_rawRxPackets.fetch_add(1, std::memory_order_relaxed);   // #604
 	sink(ctx, pkt);
 	return true;
 }
