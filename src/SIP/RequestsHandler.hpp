@@ -379,6 +379,20 @@ public:
 	// Takes _mutex, so it must NOT be called with _mutex already held.
 	enum class EmergencyRoute : uint8_t { None, Anchor, Trunk, TrunkUnverified };
 	EmergencyRoute emergencyRoute();
+	// #652: true while any 911/933 session is live (Session::isEmergency(), #604).
+	// A reboot or factory reset checks this first. Takes _mutex, like emergencyRoute().
+	bool hasLiveEmergencyCall()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		return emergencyCallLive();
+	}
+	// PbxEnv hook for the DTMF restart doors (#652). Caller holds _mutex.
+	bool emergencyCallLive() override
+	{
+		for (const auto& [cid, s] : _sessions)
+			if (s && s->isEmergency()) return true;
+		return false;
+	}
 	// "anchor", "trunk", "trunk-unverified" or "none": the /api/status spelling.
 	static const char* emergencyRouteName(EmergencyRoute r);
 

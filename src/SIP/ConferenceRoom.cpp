@@ -1,4 +1,5 @@
 #include "ConferenceRoom.hpp"
+#include "PsramAllocator.hpp"   // #479: psram::dynamicTaskCreates()
 
 #include <chrono>
 
@@ -280,6 +281,10 @@ void ConferenceRoom::startDriver()
 	{
 		_driverRunning.store(false, std::memory_order_release);
 		ESP_LOGE("ConferenceRoom", "mix tick task could not be created");
+	}
+	else
+	{
+		psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 	}
 }
 

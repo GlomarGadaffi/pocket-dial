@@ -2390,6 +2390,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	    .s(",\"mohClipRefused\":").b(handler && handler->holdMusicClipRefused())
 	    .s(",\"greetingRefused\":").b(handler && handler->voicemailGreetingRefused())
 	    .s(",\"psramFallbacks\":").n(psram::internalFallbacks().load(std::memory_order_relaxed))
+	    .s(",\"dynamicTaskCreates\":").n(psram::dynamicTaskCreates().load(std::memory_order_relaxed))   // #479
 	    .s("}");
 
 	json.s("}");
@@ -4197,6 +4198,11 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 		             "{\"error\":\"factory reset requires confirm=ERASE\"}");
 		return;
 	}
+	// #652: a reset restarts the board, which would drop a live 911/933.
+	if (RequestsHandler* h = _handler.load(std::memory_order_acquire); h && h->hasLiveEmergencyCall()) {
+		sendResponse(sock, 409, "Conflict", "application/json", "{\"error\":\"emergency call in progress\"}");
+		return;
+	}
 	// #473: from here on, NVS writers refuse new data (the CDR persist writer
 	// first), so nothing a background task writes can put PII back behind this
 	// reset. The board restarts at the end, which is what clears the flag.
@@ -4459,7 +4465,7 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// 4096, not 2048 (#456 review): nvs_flash_erase()'s worst static chain is
 	// ~1,920 B and finish() writes a flash sector; an overflow here would panic
 	// mid-erase -- the half-reset state.
-	if (xTaskCreate([](void*) {
+	if (xTaskCreate([](void* h) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
 		// #473: the guard begun above still refuses new NVS data writes; drain any
 		// write already in flight (the CDR persist writer) before the partition is
@@ -4474,8 +4480,12 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 			ESP_LOGE("factory_reset", "nvs_flash_erase failed -- per-key erases stand, old NVS bytes may remain");
 		}
 		resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
+		// #652: a 911/933 placed after the 409 check above would be dropped by the
+		// restart; hold it until no emergency session is live, as the OTA reboot does.
+		while (h && static_cast<RequestsHandler*>(h)->hasLiveEmergencyCall())
+			vTaskDelay(pdMS_TO_TICKS(1000));
 		esp_restart();
-	}, "restart_task", 4096, NULL, 5, NULL) != pdPASS)
+	}, "restart_task", 4096, _handler.load(std::memory_order_acquire), 5, NULL) != pdPASS)
 	{
 		// The reply has gone out and the per-key erases are done; without the task
 		// there is no whole-partition erase, but the board must still restart
@@ -6595,6 +6605,13 @@ void HttpServer::sendApiOtaReboot(int sock, const std::string& body)
 		             "{\"error\":\"reboot with no staged image requires confirm=1\"}");
 		return;
 	}
+	// #652: a manual reboot during a live 911/933 is refused; a staged-image
+	// reboot is accepted and waits in the restart task below for the call to end.
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (!staged && handler && handler->hasLiveEmergencyCall()) {
+		sendResponse(sock, 409, "Conflict", "application/json", "{\"error\":\"emergency call in progress\"}");
+		return;
+	}
 	std::string json = std::string("{\"status\":\"ok\",\"staged\":") + (staged ? "true" : "false");
 #if defined(ESP_PLATFORM)
 	json += staged ? ",\"message\":\"rebooting into the new image...\"}" : ",\"message\":\"rebooting...\"}";
@@ -6602,10 +6619,13 @@ void HttpServer::sendApiOtaReboot(int sock, const std::string& body)
 
 	// Defer the restart so the HTTP response flushes first (mirrors the WiFi
 	// connect/mode endpoints' delayed-restart pattern).
-	xTaskCreate([](void*) {
+	xTaskCreate([](void* h) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
+		// #652: hold the restart while any emergency call is live.
+		while (h && static_cast<RequestsHandler*>(h)->hasLiveEmergencyCall())
+			vTaskDelay(pdMS_TO_TICKS(1000));
 		esp_restart();
-	}, "ota_reboot", 2048, NULL, 5, NULL);
+	}, "ota_reboot", 2048, handler, 5, NULL);
 #else
 	// Host stub: never actually exit the process (the smoke-test harness keeps
 	// running). Report a simulated success.

@@ -4,6 +4,7 @@
 #include "EthAccess.hpp"
 #include "ArpLookup.hpp"
 #include "DmaFramePool.hpp"
+#include "PsramAllocator.hpp"   // #479: psram::dynamicTaskCreates()
 
 #include <cmath>
 #include <cstdio>
@@ -520,6 +521,7 @@ bool HoldMusic::start()
 		_sock = -1;
 		return false;
 	}
+	psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 	ESP_LOGI(TAG, "started on UDP port %d", localPort());
 	return true;
 }

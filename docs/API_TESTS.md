@@ -396,7 +396,7 @@ Sets the admission mode. Cookie **and** `X-CSRF`.
 | `confirm` | `LOCKOUT` | Only consulted when switching to `secure`. |
 
 `learn` is the default: trust-on-first-use, where an unknown device is adopted on its first
-`REGISTER` and locked to its extension. (`open`, which accepted every `REGISTER` and
+`REGISTER`; only a secured extension is locked to its MAC. (`open`, which accepted every `REGISTER` and
 `INVITE` with no credential, is retired, #500: `mode=open` answers `400`.) `secure` digest-challenges every `REGISTER` **and** every
 `INVITE` (`RequestsHandler::onInvite()` → `Registrar::admitSecure()`,
 `src/SIP/RequestsHandler.cpp:1195-1206`).

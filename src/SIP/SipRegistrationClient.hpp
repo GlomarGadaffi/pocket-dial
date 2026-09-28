@@ -87,6 +87,12 @@ public:
 	// Registering forever.
 	static constexpr uint64_t kTransactionTimeoutMs = 32000;
 
+	// #617: RFC 3261 Timer E (§17.1.2.2). Over UDP a REGISTER with no response is
+	// resent at T1, doubling, capped at T2, until a response or Timer F. Without
+	// it one lost datagram cost a whole Timer F + backoff cycle.
+	static constexpr uint64_t kTimerET1Ms = 500;
+	static constexpr uint64_t kTimerET2Ms = 4000;
+
 	// ── Backoff ───────────────────────────────────────────────────────────────
 	// Exponential from 2 s, doubling, capped at 5 minutes. The cap is the point:
 	// a carrier SBC that is refusing us (wrong password, account suspended,
@@ -217,6 +223,13 @@ public:
 	// level-driven, so a REGISTER is emitted once per decision, never per tick.
 	bool tick(uint64_t nowMs, Request& out);
 
+	// #617: Timer E. True when the REGISTER tick() last emitted must be resent
+	// now, byte for byte (same branch, same CSeq). The caller keeps those bytes;
+	// this class stores no second copy. Only while Registering with no new
+	// REGISTER armed, so a retransmit never consumes a nonce-count, a CSeq or an
+	// attempt.
+	bool retransmitDue(uint64_t nowMs);
+
 	// Feed the response to the REGISTER most recently emitted by tick().
 	// Responses arriving in any other state are ignored as stray.
 	void onResponse(uint64_t nowMs, const ResponseView& r);
@@ -279,6 +292,8 @@ private:
 	bool     _sendArmed            = false;
 	uint64_t _sendAtMs             = 0;
 	uint64_t _sentAtMs             = 0;
+	uint64_t _retransmitAtMs       = 0;   // #617: Timer E
+	uint64_t _retransmitIntervalMs = 0;
 	uint64_t _refreshAtMs          = 0;
 	uint64_t _bindingExpiresAtMs   = 0;
 	uint32_t _grantedExpiresSec    = 0;
