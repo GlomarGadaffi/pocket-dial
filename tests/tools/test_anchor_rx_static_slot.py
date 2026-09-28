@@ -76,6 +76,20 @@ class AnchorRxStaticSlot(unittest.TestCase):
         ctor = body_of(cpp, "TelephonyAnchorClient::TelephonyAnchorClient()\n{")
         self.assertRegex(ctor, r"s\.rxArg\s*=\s*RxTaskArg\{this,\s*&s\}")
 
+    def test_done_sem_is_created_once_and_drained_per_start(self):
+        # #479 follow-up: xSemaphoreCreateBinary() is a heap allocation, so the
+        # slot's done-sem is made once at construction and only drained per start.
+        cpp = code(CPP)
+        start = body_of(cpp, "bool TelephonyAnchorClient::startRxIfNeeded(")
+        self.assertEqual(len(rx_creates(start)), 1)   # positive control: the create site is here
+        self.assertNotIn("xSemaphoreCreate", start)
+        self.assertNotIn("vSemaphoreDelete", start)
+        drain = start.find("xSemaphoreTake(slot->rxDoneSem, 0)")
+        self.assertNotEqual(drain, -1, "a stale give is not drained before the new task")
+        self.assertLess(drain, start.find("xTaskCreateStaticPinnedToCore"))
+        ctor = body_of(cpp, "TelephonyAnchorClient::TelephonyAnchorClient()\n{")
+        self.assertRegex(ctor, r"s\.rxDoneSem\s*=\s*xSemaphoreCreateBinary\(\)")
+
 
 if __name__ == "__main__":
     unittest.main()
