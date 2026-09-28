@@ -1281,10 +1281,10 @@ curl -s "http://$DEV/api/registrar" -b "pd_session=$SESSION"
 | `mode` | `learn` \| `secure` | Required. The admission policy. `open` is retired (#500) and answers `400`. |
 | `confirm` | `LOCKOUT` | Only consulted when switching to `secure`; see below. |
 
-* `learn`: trust-on-first-use, and the default. An unknown MAC registering an unclaimed
-  extension is adopted and locked to it, while already-secured devices stay
-  digest-enforced. Adopt phones on a trusted/WPA2 link; an extension nobody has adopted
-  yet can still be claimed by the first device to ask (#440).
+* `learn`: trust-on-first-use, and the default. An unknown MAC registering an extension
+  is adopted unverified, while already-secured devices stay digest-enforced and
+  MAC-locked. Adopt phones on a trusted/WPA2 link; an extension that is not secured can
+  still be claimed by any device that asks (#440).
 * `open` (retired, #500): used to accept every `REGISTER` with no credential. A board that
   had it stored boots `learn` and rewrites the setting; a config import that says `open`
   applies `learn` and lists it under `skipped`.
