@@ -265,6 +265,8 @@ add_executable(sip_parser_tests
     DashboardE911Form_test.cpp
     # #642 (dashboard review #10): Wi-Fi rows are buttons, .msg are live regions.
     DashboardA11yText_test.cpp
+    # #643 (dashboard review #9): the Learn-mode hint matches the registrar.
+    DashboardLearnText_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is

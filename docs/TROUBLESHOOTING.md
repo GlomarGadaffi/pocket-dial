@@ -115,7 +115,7 @@ Symptom: The SIP client never reaches "registered", times out, or shows an error
 | Client pruned after registering | The registrar prunes a client after ~15 s of silence if it ignores the `OPTIONS` keepalive sent every 5 s (`RequestsHandler.cpp`). Enable the phone's keep-alive / answer-OPTIONS option. |
 | Rate-limited (packets dropped) | The SIP UDP path uses a per-source-IP token bucket (burst 40, 20 pkt/s sustained). A flooding or misconfigured client gets packets dropped; watch `packetsDropped` on `/api/status` ([ARCHITECTURE.md §5](ARCHITECTURE.md)). |
 | Registrar is in `secure` mode | Every `REGISTER` is digest-challenged and this phone has no secret, or its MAC does not match the one the extension is locked to. See [All phones stopped registering at once](#all-phones-stopped-registering-at-once). |
-| Registrar is in `learn` mode and the extension is already claimed | Learn mode locks an extension to the first MAC that claims it. A second phone on the same extension is refused. `POST /api/registrar/device` with `action=forget` releases the adoption so the new hardware can claim it ([API.md](API.md#post-apiregistrardevice)). |
+| Registrar is in `learn` mode and the extension is secured to another phone | Learn mode adopts any new MAC, but once an admin secures a device (`POST /api/registrar/device` with `action=secure`) its extension is locked to that MAC and a different phone on the same extension is refused (`Extension Locked To Another Device`). `action=forget` releases the device so the new hardware can claim it ([API.md](API.md#post-apiregistrardevice)). |
 
 > [!NOTE]
 > **What a `401` on REGISTER means depends on the registrar mode.** Check it first:
