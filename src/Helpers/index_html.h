@@ -1755,7 +1755,7 @@ function holdConfigMode(){
     .then(function(d){toast(d.message||"Setup mode held.","ok");}).catch(function(e){toast("Error: "+e.message,"err");});
 }
 function factoryReset(){
-  if(!confirm("Factory reset erases saved Wi-Fi config and reboots into captive-portal setup. Continue?"))return;
+  if(!confirm("Factory reset erases: the admin login and DTMF PIN, device settings (AP password, registrar mode), carrier trunk and Telephony API credentials, email and Google service secrets, every extension's SIP password, call forwards, the E911 notify list, DID mappings, call history (including the SD archive), voicemail, the stored crash dump and saved Wi-Fi. Settings from the install-time seed are re-applied. The board then reboots into setup. This cannot be undone. Continue?"))return;
   var st=$("wifi-status");st.textContent="Factory resetting…";st.style.color="var(--alert)";
   fetch("/api/factory-reset",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"confirm=ERASE"})
     .then(function(r){if(r.status===401){handleAuthExpired();throw new Error("session expired");}return r.json();})
