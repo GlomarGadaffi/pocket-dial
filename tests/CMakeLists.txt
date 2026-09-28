@@ -257,6 +257,8 @@ add_executable(sip_parser_tests
     # never answered by the loopback simulator -- plus the route report,
     # the boot WARN, /api/status's emergencyRoute and the dashboard banner.
     EmergencyRoute_test.cpp
+    # Dashboard review #5: logged-out roster count and call-log prompt.
+    DashboardRosterText_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter
     # (fixed vectors, so a CI timezone change cannot make it pass for the wrong
     # reason) and the UNSYNCED path, which is permanent on the host build and is
