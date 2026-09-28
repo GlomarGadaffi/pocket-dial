@@ -737,3 +737,40 @@ TEST(TrunkWiring, ACarrierRefusalAfterEarlyMediaRefusesTheHandsetAndFreesTheRela
 		<< "the refusal ends the early dialog the 183 opened";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
 }
+
+// ── Issue #399: the trunk REGISTERs, from tick(), and answers the 401 ───────
+//
+// SipTrunk_test.cpp pins the REGISTER itself. This pins the part #355 taught
+// us to check separately: that the engine actually calls it, and that a
+// response arriving through handle() reaches it.
+TEST(TrunkWiring, TickRegistersTheTrunkAndA401ThroughHandleIsAnswered)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	ASSERT_TRUE(b.handler.setTrunkCredentials("s3cret-reg"));
+
+	b.handler.tick();
+	ASSERT_EQ(b.countWithTo("REGISTER sip:", kSbcIp), 1u)
+		<< "tick() never registered the trunk: the carrier will not answer our INVITEs";
+
+	const std::string reg = b.firstWith("REGISTER sip:");
+	const std::string callId = CarrierView::field(reg, "Call-ID: ");
+	const std::string challenge =
+		"SIP/2.0 401 Unauthorized\r\n"
+		"Via: " + CarrierView::field(reg, "Via: ") + "\r\n"
+		"From: " + CarrierView::field(reg, "From: ") + "\r\n"
+		"To: " + CarrierView::field(reg, "To: ") + ";tag=reg-tag\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"WWW-Authenticate: Digest realm=\"carrier.example\", nonce=\"wiren0nce\", qop=\"auth\"\r\n"
+		"Content-Length: 0\r\n\r\n";
+	b.sent.clear();
+	b.handler.handle(RequestsHandler::getMessageFromPool(challenge, addrFor(kSbcIp)));
+
+	ASSERT_EQ(b.countWithTo("REGISTER sip:", kSbcIp), 1u) << "the 401 must be answered";
+	const std::string signedReg = b.firstWith("REGISTER sip:");
+	EXPECT_NE(signedReg.find("Call-ID: " + callId), std::string::npos);
+	EXPECT_NE(signedReg.find("\r\nAuthorization: Digest username=\"15551230000\""),
+		std::string::npos) << signedReg;
+	EXPECT_EQ(b.sent.size(), 1u) << "and nothing else answers the carrier's 401";
+}
