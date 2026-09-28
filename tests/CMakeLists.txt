@@ -93,6 +93,8 @@ add_executable(sip_parser_tests
     # sendmsg() (byte-identical, short writes resumed, zero allocation).
     HttpSendPath_test.cpp
     HttpStatusAlloc_test.cpp
+    # Issue #410 done-when 4: the per-route allocation gate.
+    HttpRouteAlloc_test.cpp
     # Issue #412: every allocateVirtualPeer() caller must survive an exhausted
     # pool -- refuse with 503 (or drop the anchor leg) and release what it had
     # claimed, never publish a session with a null peer.
@@ -255,6 +257,8 @@ add_executable(sip_parser_tests
     # never answered by the loopback simulator -- plus the route report,
     # the boot WARN, /api/status's emergencyRoute and the dashboard banner.
     EmergencyRoute_test.cpp
+    # Dashboard review #5: logged-out roster count and call-log prompt.
+    DashboardRosterText_test.cpp
     # Dashboard review #6: the Factory Reset confirm lists what it erases.
     DashboardResetText_test.cpp
     # The wall clock this firmware never had. Covers the pure RFC 3339 formatter

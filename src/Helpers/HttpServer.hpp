@@ -196,6 +196,12 @@ public:
 	// smaller buffer capacity (<= kStatusBufBytes) so the refusal path is testable.
 	void sendApiStatusForTest(int sock, bool authenticated) { sendApiStatus(sock, authenticated); }
 	void setStatusCapForTest(size_t cap) { _statusCap = cap; }
+	// #410 done-when 4 (route allocation gate): run one whole request ON THE
+	// CALLING THREAD, and call `mark` once the request is read and parsed, just
+	// before the route table. The gate counts route (dispatch + response)
+	// allocations from there; request reading is done-when 2's business.
+	void handleClientForTest(int sock) { handleClient(sock); }
+	static void setDispatchMarkForTest(void (*mark)());
 	void sendResponseForTest(int sock, int statusCode, std::string_view statusText,
 	                   std::string_view contentType, std::string_view body,
 	                   std::string_view extraHeader);
@@ -336,6 +342,9 @@ private:
 	// full reasoning, including why a gated scrape endpoint would be a dead one,
 	// is at sendApiMetrics's definition in the .cpp).
 	void sendApiMetrics(int sock);
+	// #410/#630: take a free /api/status output buffer (sets `busy`, which the
+	// caller must clear once the send has finished), or nullptr if none is free.
+	char* leaseStatusBuf(std::atomic<bool>*& busy);
 	// SoftAP security (docs/THREAT_MODEL.md §6 / FEATURE_ROADMAP P0): report and
 	// toggle WPA2 on the standalone AP, and show/rotate its passphrase. Turning
 	// it on is a breaking change for already-associated phones, so it is an

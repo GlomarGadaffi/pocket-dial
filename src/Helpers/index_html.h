@@ -684,9 +684,10 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
         <label for="reg-mode">Registration mode</label>
         <select id="reg-mode">
           <option value="learn">Learn: adopt new phones, lock each to its device</option>
-          <option value="secure">Secure: digest auth required</option>
+          <option value="secure" disabled>Secure: digest auth required</option>
         </select>
       </div>
+      <div class="note">Secure needs a SIP password (not yet supported).</div>
       <button class="btn primary" onclick="saveRegistrarMode()">Apply mode</button>
       <div class="msg" id="reg-msg"></div>
 
@@ -1014,7 +1015,7 @@ function renderBoard(d){
       +'<span class="label">'+esc(n)+'</span>'
       +'<span class="sublabel">'+esc(jackSublabel(e,state))+'</span></button>';
   });
-  if(!nums.length)html='<div class="note" style="text-align:center;padding:24px">No extensions seen yet. Register a phone to light a jack.</div>';
+  if(!nums.length)html='<div class="note" style="text-align:center;padding:24px">'+(d.rosterVisible===false?esc(String(d.clientCount||0))+' phones registered. Log in to see them.':'No extensions seen yet. Register a phone to light a jack.')+'</div>';
   board.innerHTML=html;
   if(keepExt){
     var refocus=board.querySelector('.jack[data-ext="'+cssEsc(keepExt)+'"]');
@@ -1373,9 +1374,11 @@ function httpMethod(method,url,body){
   return fetch(url,{method:method,credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF":PD_CSRF},body:body})
     .then(function(r){
       if(r.status===401){handleAuthExpired();throw new Error("session expired: log in again to continue");}
-      if(r.status===403){throw new Error("rejected (cross-origin or stale security token, reload the page)");}
-      if(!r.ok){throw new Error("HTTP "+r.status);}
-      return r.text();
+      if(r.ok)return r.text();
+      return r.text().then(function(t){
+        var d=parseJsonOr(t),e=new Error(d.error||d.message||(r.status===403?"rejected (cross-origin or stale security token, reload the page)":"HTTP "+r.status));
+        e.status=r.status;throw e;
+      });
     });
 }
 function post(url,body){return httpMethod("POST",url,body);}
@@ -1424,7 +1427,10 @@ function applyWifiCapability(d){
   }
 }
 function fetchCdr(){
-  fetch("/api/cdr").then(function(r){return r.json();}).then(renderCdr).catch(function(){});
+  fetch("/api/cdr").then(function(r){
+    if(!r.ok){$("cdr-tbody").innerHTML='<tr class="empty-row"><td colspan="6">Log in to view the call log</td></tr>';return null;}
+    return r.json();
+  }).then(function(recs){if(recs)renderCdr(recs);}).catch(function(){});
 }
 function setOnline(ok){
   var dot=$("dot"),txt=$("online-txt"),rec=$("recon");
@@ -1434,7 +1440,7 @@ function setOnline(ok){
 function updateRail(d){
   $("s-uptime").textContent=fmtUptime(d.uptime);
   $("s-ip").textContent=(d.ip||"0.0.0.0")+":"+(d.port||5060);
-  $("s-jacks").textContent=((d.clients||[]).length)+"/"+POOL;
+  $("s-jacks").textContent=(d.rosterVisible===false?(d.clientCount||0):(d.clients||[]).length)+"/"+POOL;
   $("s-calls").textContent=(typeof d.sessionCount==="number")?d.sessionCount:(d.sessions||[]).length;
   /* item 21: derived from the same payload fields the Calls stat reads,
      so it appears and disappears with real state. No invented number. */
@@ -1594,7 +1600,7 @@ static const char PD_HTML_6[] =
 R"html6(    var tdA=document.createElement("td");
     if(x.state!=="secured"){
       var b=document.createElement("button");
-      b.className="btn";b.textContent="Secure";
+      b.className="btn";b.textContent="Secure";b.disabled=true;b.title="needs a SIP password (not yet supported)";
       b.onclick=function(){registrarDevice("secure",x.mac);};
       tdA.appendChild(b);
     }
@@ -1623,7 +1629,7 @@ function postRegistrarMode(mode,confirmLockout){
       setMsg("reg-msg","Registration mode is now "+mode+".","ok");
     })
     .catch(function(e){
-      if(/HTTP 409/.test(e.message)){
+      if(e.status===409){
         if(confirm("No extensions are secured yet.\n\nSwitching to Secure now will reject EVERY phone until each one is adopted and secured.\n\nSwitch anyway?")){
           postRegistrarMode(mode,true);
         }else{
@@ -1704,9 +1710,9 @@ function otaReboot(skip){
   if(!controlsUnlocked()){setMsg("ota-msg","Admin login required.","err");return;}
   if(!skip&&!confirm("Reboot the device now? Any active calls will drop."))return;
   setMsg("ota-msg","Rebooting device…","warn");
-  fetch("/api/ota/reboot",{method:"POST",credentials:"same-origin"})
-    .then(function(r){if(r.status===401){handleAuthExpired();return;}setMsg("ota-msg","Reboot signal sent. Restarting…","ok");})
-    .catch(function(){setMsg("ota-msg","Reboot signal sent. Restarting…","ok");});
+  post("/api/ota/reboot","")
+    .then(function(){setMsg("ota-msg","Reboot signal sent. Restarting…","ok");})
+    .catch(function(e){setMsg("ota-msg","Reboot failed: "+e.message,"err");});
 }
 
 /* ════ WIFI ════ */
@@ -1745,21 +1751,19 @@ function connectWifi(){
 }
 function startApMode(){
   var st=$("wifi-status");st.textContent="Enabling AP Mode…";st.style.color="var(--ringing)";
-  fetch("/api/wifi/mode_ap",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"}})
-    .then(function(r){if(r.status===401){handleAuthExpired();throw new Error("session expired");}return r.json();})
+  post("/api/wifi/mode_ap","")
     .then(function(){st.textContent="AP mode set! Rebooting…";st.style.color="var(--idle)";})
     .catch(function(e){st.textContent="Failed: "+e.message;st.style.color="var(--alert)";});
 }
 function holdConfigMode(){
-  fetch("/api/configuring",{method:"POST"}).then(function(r){return r.json();})
-    .then(function(d){toast(d.message||"Setup mode held.","ok");}).catch(function(e){toast("Error: "+e.message,"err");});
+  post("/api/configuring","")
+    .then(function(t){toast(parseJsonOr(t).message||"Setup mode held.","ok");}).catch(function(e){toast("Error: "+e.message,"err");});
 }
 function factoryReset(){
   if(!confirm("Factory reset erases: the admin login and DTMF PIN, device settings (AP password, registrar mode), carrier trunk and Telephony API credentials, email and Google service secrets, every extension's SIP password, call forwards, the E911 notify list, DID mappings, call history (including the SD archive), voicemail, the stored crash dump and saved Wi-Fi. Settings from the install-time seed are re-applied. The board then reboots into setup. This cannot be undone. Continue?"))return;
   var st=$("wifi-status");st.textContent="Factory resetting…";st.style.color="var(--alert)";
-  fetch("/api/factory-reset",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"confirm=ERASE"})
-    .then(function(r){if(r.status===401){handleAuthExpired();throw new Error("session expired");}return r.json();})
-    .then(function(d){toast(d.message||"Rebooting…","warn");}).catch(function(e){toast("Error: "+e.message,"err");});
+  post("/api/factory-reset","confirm=ERASE")
+    .then(function(t){toast(parseJsonOr(t).message||"Rebooting…","warn");}).catch(function(e){toast("Error: "+e.message,"err");});
 }
 
 /* ════ TELEPHONE INTERCONNECT ════
