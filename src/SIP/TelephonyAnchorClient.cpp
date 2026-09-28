@@ -85,6 +85,7 @@ void TelephonyAnchorClient::setRewarmIntervalSec(uint32_t)
 #include "mbedtls/base64.h"
 #include "TelephonyAnchorLogic.hpp"   // host-tested entity-path tokenizer + URL builders (issue #49)
 #include "PsramTask.hpp"            // #100: PSRAM-backed task stacks (off the scarce internal-RAM heap)
+#include "RtpTaskSlots.hpp"         // #479: pd::rtpslots::kAnchorRxStackBytes (counted in the 72 KB budget)
 
 static const char* TAG = "TelephonyAnchor";
 
@@ -172,7 +173,10 @@ TelephonyAnchorClient::TelephonyAnchorClient()
 	// RequestsHandler member), so a call allocates no task. PSRAM first (the #100 audit: the rx
 	// task writes no flash), internal where there is none; a failed slot refuses its calls.
 	for (auto& s : _calls)
-		s.rxMem.alloc("tel_media_rx", 6144, PD_TASK_STACK_CAPS, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	{
+		s.rxMem.alloc("tel_media_rx", pd::rtpslots::kAnchorRxStackBytes, PD_TASK_STACK_CAPS, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+		s.rxArg = RxTaskArg{this, &s};   // constant for the slot's life, so never rewritten
+	}
 }
 
 TelephonyAnchorClient::~TelephonyAnchorClient()
@@ -2891,14 +2895,8 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 		vSemaphoreDelete(slot->rxDoneSem);
 	}
 	slot->rxDoneSem = xSemaphoreCreateBinary();
-	// Heap arg so the static trampoline knows its slot (one-time per call setup, off the hot
-	// path — same discipline as the heap WsWorkItem). Freed by the rx task on exit.
-	RxTaskArg* arg = new (std::nothrow) RxTaskArg{this, slot};
-	if (!arg)
-	{
-		if (slot->rxDoneSem) { vSemaphoreDelete(slot->rxDoneSem); slot->rxDoneSem = nullptr; }
-		return false;
-	}
+	// #479: the slot's own arg (set once at construction), so an rx start allocates nothing.
+	RxTaskArg* arg = &slot->rxArg;
 	// #100: stack in PSRAM (WithCaps) — N concurrent calls' GET-rx tasks would otherwise exhaust
 	// internal RAM. The task does HTTPS GET reads + the audio rx callback only (no flash writes),
 	// so a PSRAM stack is safe. The task parks on exit and the owner reaps it (#553).
@@ -2912,7 +2910,6 @@ bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 	{
 		slot->rxRunning.store(false, std::memory_order_release);
 		ESP_LOGE(TAG, "Failed to create Rx task for %s", participantId.c_str());
-		delete arg;
 		slot->rxTaskHandle = nullptr;
 		if (slot->rxDoneSem) { vSemaphoreDelete(slot->rxDoneSem); slot->rxDoneSem = nullptr; }
 		return false;
@@ -3163,8 +3160,7 @@ void TelephonyAnchorClient::rxTaskTrampoline(void* arg)
 {
 	auto* a = static_cast<RxTaskArg*>(arg);
 	TelephonyAnchorClient* self = a->self;
-	CallSlot* slot = a->slot;
-	delete a;                  // one-time per-call heap arg (see startRxIfNeeded)
+	CallSlot* slot = a->slot;   // a is the slot's own rxArg (#479): nothing to free
 	self->runRxLoop(slot);
 	// Issue #554 (#575 review): clear rxRunning FIRST, then give. The give is the task's
 	// last touch of the slot, and startRxIfNeeded() restarts only after TAKING that sem
