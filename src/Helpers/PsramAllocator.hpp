@@ -43,6 +43,17 @@ namespace psram
 		return n;
 	}
 
+	// Issue #479: tasks created dynamically (heap stack + TCB) since boot, via
+	// pd::createTaskPreferPsram() and the media call path's direct creates
+	// (conf_mix_tick, moh_tx). RTP media tasks use boot-preallocated stacks and
+	// are NOT counted. Read it before and after a call: the delta is what the
+	// call path allocated for tasks. Exported on /api/status memory.
+	inline std::atomic<uint32_t>& dynamicTaskCreates()
+	{
+		static std::atomic<uint32_t> n{0};
+		return n;
+	}
+
 	inline void* allocPreferPsram(std::size_t bytes)
 	{
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)

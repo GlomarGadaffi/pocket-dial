@@ -17,6 +17,7 @@
 
 #include "AllocCounter.hpp"
 #include "HttpServer.hpp"
+#include "PsramAllocator.hpp"   // #479: psram::dynamicTaskCreates()
 #include "RequestsHandler.hpp"
 
 #if !defined(_WIN32) && !defined(_WIN64)   // socketpair(): POSIX host only
@@ -142,6 +143,20 @@ TEST(HttpStatusAlloc, ABodyThatDoesNotFitIsRefusedAndCounted)
 
 	b.server.setStatusCapForTest(HttpServer::kStatusBufBytes);
 	EXPECT_NE(b.serve(false).find("\"httpStatusRefusals\":1,"), std::string::npos);
+}
+
+
+TEST(HttpStatusAlloc, TheDynamicTaskCreateCountIsOnStatus)
+{
+	// #479 done-when: an exported count of dynamic task creates, read before and
+	// after a call on .244 (the increments sit in ESP-only create paths).
+	StatusBench b;
+	const uint32_t before = psram::dynamicTaskCreates().load();
+	psram::dynamicTaskCreates().fetch_add(3);
+	const std::string resp = b.serve(false);
+	EXPECT_NE(resp.find("\"dynamicTaskCreates\":" + std::to_string(before + 3) + "}"), std::string::npos)
+		<< resp;
+	psram::dynamicTaskCreates().store(before);
 }
 
 #endif
