@@ -1760,7 +1760,7 @@ function holdConfigMode(){
     .then(function(t){toast(parseJsonOr(t).message||"Setup mode held.","ok");}).catch(function(e){toast("Error: "+e.message,"err");});
 }
 function factoryReset(){
-  if(!confirm("Factory reset erases saved Wi-Fi config and reboots into captive-portal setup. Continue?"))return;
+  if(!confirm("Factory reset erases: the admin login and DTMF PIN, device settings (AP password, registrar mode), carrier trunk and Telephony API credentials, email and Google service secrets, every extension's SIP password, call forwards, the E911 notify list, DID mappings, call history (including the SD archive), voicemail, the stored crash dump and saved Wi-Fi. Settings from the install-time seed are re-applied. The board then reboots into setup. This cannot be undone. Continue?"))return;
   var st=$("wifi-status");st.textContent="Factory resetting…";st.style.color="var(--alert)";
   post("/api/factory-reset","confirm=ERASE")
     .then(function(t){toast(parseJsonOr(t).message||"Rebooting…","warn");}).catch(function(e){toast("Error: "+e.message,"err");});
