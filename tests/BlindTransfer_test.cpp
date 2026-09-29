@@ -239,6 +239,16 @@ TEST(BlindTransfer, TransferorIsDroppedAndTheTransfereeIsMovedToTheTarget)
 	EXPECT_FALSE(findSentTo(sent, transferorAddr, "SIP/2.0 202 Accepted").empty())
 		<< "REFER must be accepted";
 
+	// #720, RFC 3261 §8.2.6.2: the REFER is in-dialog (To carries tag=btag), so
+	// the 202 must echo that one tag, not append a second.
+	{
+		const std::string to = extractHeaderLine(
+			findSentTo(sent, transferorAddr, "SIP/2.0 202 Accepted"), "To:");
+		EXPECT_NE(to.find(";tag=btag"), std::string::npos) << to;
+		EXPECT_EQ(to.find(";tag=", to.find(";tag=") + 1), std::string::npos)
+			<< "the 202 must carry exactly one To tag: " << to;
+	}
+
 	// The BYE goes to the TRANSFEROR. A asked to leave; A leaves.
 	std::string byeToA = findSentTo(sent, transferorAddr, "BYE sip:");
 	ASSERT_FALSE(byeToA.empty()) << "the transferor must be dropped off the call";

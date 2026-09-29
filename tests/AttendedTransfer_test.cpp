@@ -489,6 +489,16 @@ TEST(AttendedTransfer, SpliceSendsAcceptedAndCrossedReinvites)
 	EXPECT_FALSE(findSentTo(rig.sent, rig.aAddr, "SIP/2.0 202 Accepted").empty())
 		<< "REFER must be accepted";
 
+	// #720, RFC 3261 §8.2.6.2: the REFER is in-dialog (To carries tag=btag), so
+	// the 202 must echo that one tag, not append a second.
+	{
+		const std::string to = extractHeaderLine(
+			findSentTo(rig.sent, rig.aAddr, "SIP/2.0 202 Accepted"), "To:");
+		EXPECT_NE(to.find(";tag=btag"), std::string::npos) << to;
+		EXPECT_EQ(to.find(";tag=", to.find(";tag=") + 1), std::string::npos)
+			<< "the 202 must carry exactly one To tag: " << to;
+	}
+
 	// Issue #257. abCseq is the REFER's own CSeq (2, see sendAttendedRefer) + 1;
 	// acCseq is the consult INVITE's own CSeq (1, see setUpSplicedCalls) + 1.
 	// Computed independently from the fix's own stated logic, not copied from
