@@ -824,6 +824,7 @@ TEST(EmergencyRoute, ANineOneOnePreEmptsARingingInboundCallAndCancelsItsForks)
 	EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << b.dump();
 	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911");
 
+}
 // ═════════════════════════════════════════════════════════════════════════════
 // F. #659: a call to an extension that dialed 911/933 in the last 30 minutes is
 // a PSAP callback, and so an emergency call. The 911 goes to the loopback anchor
