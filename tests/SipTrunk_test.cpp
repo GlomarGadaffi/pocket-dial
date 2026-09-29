@@ -161,6 +161,20 @@ TEST(SipTrunkInvite, ContactPointsAtUsNotTheCarrier)
 		<< "Contact must not advertise the carrier's own address back at it";
 }
 
+// #753: "Supported: timer" would let the carrier choose itself as RFC 4028
+// refresher, and the trunk leg does not answer a refresh re-INVITE with a 2xx,
+// so the carrier would drop every call at the first session interval. No claim
+// without an implementation.
+TEST(SipTrunkInvite, DoesNotClaimSessionTimerSupport)
+{
+	const auto d = pinnedDialog();
+	const std::string inv = SipTrunk::buildInvite(d, "v=0\r\n");
+
+	EXPECT_EQ(inv.find("Supported:"), std::string::npos)
+		<< "the trunk leg answers no session refresh, so the INVITE must not offer one";
+	EXPECT_EQ(inv.find("timer"), std::string::npos);
+}
+
 TEST(SipTrunkInvite, ContentLengthMatchesTheBodyBytes)
 {
 	const auto d = pinnedDialog();
