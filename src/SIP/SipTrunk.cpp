@@ -733,6 +733,17 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 		// nothing leaks by exempting only this state.
 		if (d.state == State::Confirmed) continue;
 
+		// #712 (desmo, 2026-09-29): a 911/933 the carrier is working on (any 1xx
+		// seen, so Proceeding) gets no PBX-side no-answer bound; a PSAP may queue
+		// it past 60 s. A 911 that never drew a provisional (still Trying) keeps
+		// this deadline: Timer B only logs here, so this is what ends it.
+		// routeEmergencyCall() always hands the trunk the bare number (pstnUri).
+		if (d.state == State::Proceeding &&
+		    (d.destE164 == pbx::kEmergencyNumber || d.destE164 == pbx::kEmergencyTestNumber))
+		{
+			continue;
+		}
+
 		_env.log("Trunk: dialog timed out in state "
 			+ std::to_string(static_cast<int>(d.state)) + " (" + d.destE164 + ")", true);
 		_env.freeTransactionsForCallId(d.callID);

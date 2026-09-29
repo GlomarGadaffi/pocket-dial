@@ -147,7 +147,9 @@ namespace
 	// reconcile watchdog tears down only legs that have VANISHED from the DN, so
 	// a stuck-but-present leg would otherwise pin the single
 	// POCKETDIAL_MAX_ANCHOR_CALLS slot forever. 60 s clears carrier voicemail with
-	// margin while bounding that worst case; do not make it unbounded, and do not
+	// margin while bounding that worst case; do not make it unbounded (the one
+	// exception is a ringing 911/933, #712: desmo's decision, the caller's own
+	// CANCEL ends it), and do not
 	// re-arm it on provider progress events (the provider reports our own control
 	// leg's state, which sits at "Dialing" right through far-end alerting — there
 	// is no alerting signal to key off).
@@ -7573,16 +7575,22 @@ void RequestsHandler::sweepExpired()
 			// from _sessions.
 			const std::string extension = client->getNumber();
 			std::vector<std::pair<std::string, std::string>> ending;   // {callID, other party}
+			bool emergencyLive = false;
 			for (const auto& [cid, s] : _sessions)
 			{
 				const bool isSrc = s->getSrc() && s->getSrc()->getNumber() == extension;
 				const bool isDest = s->getDest() && s->getDest()->getNumber() == extension;
 				if (isSrc || isDest)
 				{
+					if (s->isEmergency()) emergencyLive = true;
 					const auto& other = isSrc ? s->getDest() : s->getSrc();
 					ending.emplace_back(cid, other ? other->getNumber() : std::string());
 				}
 			}
+			// #712 (desmo, 2026-09-29): a lapsed lease never ends a 911/933. Keep the
+			// client, and its calls, until the emergency call has ended; the next
+			// sweep after that prunes it as usual.
+			if (emergencyLive) continue;
 			for (const auto& [cid, other] : ending)
 			{
 				endCall(cid, extension, other, leaseExpired ? "registration lease expired"
@@ -8717,7 +8725,12 @@ void RequestsHandler::tick()
 			const bool connectedAbandonedAnchor =
 				session->getState() == Session::State::Connected &&
 				session->isAnchor() && !session->isAnchorInbound();
-			if (session->isRingExpired(now) &&
+			// #712 (desmo, 2026-09-29): a 911/933 that is still ringing gets no
+			// PBX-side no-answer bound; a PSAP may queue it past 60 s. The far
+			// end's own transaction timers bound a leg that never answers at all.
+			const bool ringingEmergency =
+				session->getState() == Session::State::Invited && session->isEmergency();
+			if (session->isRingExpired(now) && !ringingEmergency &&
 			    (session->getState() == Session::State::Invited || connectedAbandonedAnchor))
 			{
 				expiredCallIds.push_back(callID);
