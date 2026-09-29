@@ -1671,6 +1671,10 @@ private:
 	// Anchored calls currently up. Caller holds _mutex.
 	unsigned activeAnchorCalls() const;
 
+	// #624: when the anchor is full, end one non-emergency anchored call so a
+	// 911/933 can take its room. Caller holds _mutex.
+	void preemptAnchorCallForEmergency();
+
 	// True iff the currently-selected anchor provider is Loopback — the boundary
 	// between the two calling conventions this port has to support:
 	//   * Loopback: makeCall()/dropCall()/answerCall() are cheap, bounded
