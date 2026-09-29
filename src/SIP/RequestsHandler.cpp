@@ -9617,12 +9617,13 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// Virtual-extension legs (777 echo, 888 conference) have no real peer to
-	// relay the offer to — their "dest" is a stand-in SipClient carrying the
-	// CALLER's own address, so relaying would send the phone its own
-	// re-INVITE back. Decline instead, so the holding phone keeps the call on
-	// the original SDP.
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || (session && session->isTrunk()) || !src || !dest)
+	// Virtual-extension legs (777 echo, 888 conference, 440 tone, a park orbit
+	// 700-709) have no real peer to relay the offer to — their "dest" is a
+	// stand-in SipClient carrying the CALLER's own address, so relaying would
+	// send the phone its own re-INVITE back (#709). Decline instead, so the
+	// holding phone keeps the call on the original SDP.
+	if (destNum == "777" || destNum == ConferenceRoom::EXT || destNum == "440" ||
+	    pbx::isParkOrbitExt(destNum) || (session && session->isTrunk()) || !src || !dest)
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -9771,10 +9772,12 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// Same virtual-leg guard as onReinvite() above: 777/888 have no peer leg, and
-	// a trunk leg is terminated here too. A refresh is answered; an SDP change
-	// is declined so the phone keeps the original SDP.
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || (session && session->isTrunk()) || !src || !dest)
+	// Same virtual-leg guard as onReinvite() above: 777/888, the 440 tone leg and a
+	// park orbit (700-709, #709) have no peer leg, and a trunk leg is terminated
+	// here too. A refresh is answered; an SDP change is declined so the phone
+	// keeps the original SDP.
+	if (destNum == "777" || destNum == ConferenceRoom::EXT || destNum == "440" ||
+	    pbx::isParkOrbitExt(destNum) || (session && session->isTrunk()) || !src || !dest)
 	{
 		if (!data->hasSdp())
 		{
