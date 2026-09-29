@@ -112,6 +112,53 @@ TEST(MixBus, LateLegContributesSilenceNotStaleAudio) {
 	EXPECT_EQ(oa[0], 0);   // A hears mix-minus-self = (1000 + 0) - 1000 = 0
 }
 
+TEST(MixBus, ALegAt30msPtimeLosesNoSamples) {
+	// #170: a phone set to 30 ms PCMU sends 240-sample packets; the tick takes
+	// 160. With a tick landing between packets on an 80-sample residue, the old
+	// tick read those 80 real samples partially and then zeroed the frame,
+	// losing them. B only listens, so everything B hears is A's audio: the
+	// non-silent frames B receives must be A's ramp, contiguous, no gap.
+	MixBus bus;
+	const int A = bus.attach();
+	const int B = bus.attach();
+
+	std::vector<int16_t> sent;
+	std::vector<int16_t> heard;
+	int16_t next = 1;
+	auto write240 = [&] {
+		std::vector<int16_t> pkt(240);
+		for (auto& s : pkt) { s = next; next = static_cast<int16_t>(next % 5000 + 1); }
+		sent.insert(sent.end(), pkt.begin(), pkt.end());
+		ASSERT_TRUE(bus.inputFrame(A, pkt.data(), pkt.size()));
+	};
+	auto tickAndHear = [&] {
+		bus.tick();
+		int16_t ob[MixBus::FRAME];
+		ASSERT_TRUE(bus.outputFrame(B, ob, MixBus::FRAME));
+		bool silent = true;
+		for (int16_t s : ob) if (s != 0) silent = false;
+		if (!silent) heard.insert(heard.end(), ob, ob + MixBus::FRAME);
+	};
+
+	// 60 ms cycles: packets at t=0 and t=30, ticks at t=10, t=30 (just BEFORE
+	// the packet), t=50. The t=30 tick meets an 80-sample residue.
+	for (int cycle = 0; cycle < 6; ++cycle)
+	{
+		write240();
+		tickAndHear();
+		tickAndHear();
+		write240();
+		tickAndHear();
+	}
+
+	ASSERT_GE(heard.size(), 1600u) << "positive control: B heard A";
+	ASSERT_LE(heard.size(), sent.size());
+	for (size_t i = 0; i < heard.size(); ++i)
+	{
+		ASSERT_EQ(heard[i], sent[i]) << "sample " << i << " of A's stream was lost or reordered";
+	}
+}
+
 // ── Small-conference confirmed-ISA primitive ──────────────────────────────────
 
 TEST(MixBus, MixSum4S16AddsFourLegs) {

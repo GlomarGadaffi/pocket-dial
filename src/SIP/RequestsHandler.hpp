@@ -302,9 +302,6 @@ public:
 	std::tuple<std::string, std::string, std::string> getE911Config();
 	std::vector<std::tuple<std::string, std::string, std::string>> getRingGroups();
 
-	// Parked calls snapshot for the TUI: {orbit, parkedExt, parker, secondsParked}.
-	std::vector<std::tuple<std::string, std::string, std::string, int>> getParkedCalls();
-
 	// Paging zones (980–989). setPageZone replaces a zone's membership; an empty
 	// member list deletes the zone. Thread-safe and NVS-persisted. The getter
 	// returns {zoneExt, "m1,m2,..."} pairs for the dashboard.
@@ -412,6 +409,12 @@ public:
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_anchorPlacesRealCalls = real;
+	}
+	// Test-only (#659): move every 911/933 dial mark `d` into the past.
+	void ageEmergencyCallbacksForTest(std::chrono::steady_clock::duration d)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_emergencyCallbacks.ageForTest(d);
 	}
 #endif
 
@@ -686,6 +689,15 @@ public:
 		return bindOutboundParticipant(callId, ownLeg);
 	}
 
+	// Test-only (issue #379): what the anchor event callback does on
+	// CallEvent::MediaNeverOpened. The callback is wired only for a real anchor,
+	// never the host suite's Loopback. Not compiled into device firmware.
+	void anchorMediaNeverOpenedForTest(const std::string& participantId)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		anchorMediaNeverOpenedLocked(participantId);
+	}
+
 	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
 	// anchor's CallEvent::Incoming does, and return the new session's Call-ID
 	// line ("" if routing declined). Without this no host test can reach an
@@ -770,6 +782,8 @@ public:
 	// Forget a device entirely (drops the adoption record; a later REGISTER re-learns
 	// it in Learn mode). Accepts a MAC or an extension. Thread-safe + persisted.
 	bool forgetDevice(const std::string& macOrExt);
+	// #515: forget every Learned device at once; Secured ones stay. Thread-safe + persisted.
+	size_t forgetLearnedDevices();
 
 private:
 	void initHandlers();
@@ -1492,11 +1506,7 @@ public:
 		auto localOutbox = drainOutbox();
 		auto localLogs = std::move(_logQueue);
 		_logQueue.clear();
-		for (const auto& log : localLogs)
-		{
-			if (log.first) std::cerr << log.second << '\n';
-			else std::cout << log.second << '\n';
-		}
+		printLogs(localLogs);
 		for (auto& event : localOutbox)
 		{
 			_onHandled(event.first, std::move(event.second));
@@ -1595,6 +1605,16 @@ private:
 		const std::shared_ptr<SipClient>& caller,
 		const pbx::EmergencyDial& emergency, const std::string& dialed);
 
+	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
+	// pbx::kEmergencyCallbackWindow). Every path that creates a session for an
+	// inbound call to an extension asks this: onInvite's direct call and
+	// routeInboundAnchorCall today, the trunk's inbound (#398) when it lands.
+	// Caller holds _mutex.
+	bool isEmergencyCallback(std::string_view ext) const
+	{
+		return _emergencyCallbacks.open(ext, std::chrono::steady_clock::now());
+	}
+
 	// emergencyRoute() for a caller that already holds _mutex.
 	EmergencyRoute emergencyRouteLocked() const;
 
@@ -1653,6 +1673,10 @@ private:
 	// Anchored calls currently up. Caller holds _mutex.
 	unsigned activeAnchorCalls() const;
 
+	// #624: when the anchor is full, end one non-emergency anchored call so a
+	// 911/933 can take its room. Caller holds _mutex.
+	void preemptAnchorCallForEmergency();
+
 	// True iff the currently-selected anchor provider is Loopback — the boundary
 	// between the two calling conventions this port has to support:
 	//   * Loopback: makeCall()/dropCall()/answerCall() are cheap, bounded
@@ -1691,6 +1715,8 @@ private:
 		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox);
 	void asyncDropCall(const std::string& participantId);
 	void asyncAnswerCall(const std::string& participantId);
+	// Issue #379: CallEvent::MediaNeverOpened. Caller holds _mutex.
+	void anchorMediaNeverOpenedLocked(const std::string& participantId);
 
 	// Bind an outbound call's own leg (from asyncMakeCall's successful makeCall())
 	// to its session, so the CallEvent::Answered/Dropped callback can match this
@@ -1819,13 +1845,21 @@ private:
 	std::shared_ptr<SipClient> allocateClient(std::string number, sockaddr_in address, int expiresSeconds);
 	std::shared_ptr<Session> allocateSession(std::string callID, std::shared_ptr<SipClient> src);
 	// Draw a transient virtual-peer SipClient (777/440/park leg) from the fixed pool
-	// instead of make_shared'ing one in the packet handler. Falls back to heap on
-	// exhaustion (graceful, never a crash). Caller holds _mutex.
+	// instead of make_shared'ing one in the packet handler. Refuses (nullptr) on
+	// exhaustion, no heap fallback (#409); every caller answers 503 or abandons
+	// cleanly (#412). Caller holds _mutex.
 	std::shared_ptr<SipClient> allocateVirtualPeer(std::string number, sockaddr_in address, int expiresSeconds = 3600);
 
+	// Answer `req` with a bodiless final status: the request's own Via (received/
+	// rport) and a Contact for `contactExt`. False when the pool refused (#101A:
+	// drop, the peer retransmits), so the caller skips its log line too.
+	bool refuseInvite(const SipMessage& req, const char* statusLine, std::string_view contactExt);
 	// Build a 200 OK with an SDP body for an INVITE (used by 777, park, onReinvite).
+	// `grantSessionTimer` (#198): true only on a leg whose re-INVITE this PBX
+	// answers 200 itself (555/anchor: answerAnchorReinvite); see answerSessionTimer.
 	std::shared_ptr<SipMessage> buildOkWithSdp(const std::shared_ptr<SipMessage>& inviteMsg,
-		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody);
+		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody,
+		bool grantSessionTimer);
 	// Build a server-initiated in-dialog BYE. From/To must include tags because the
 	// dialog role differs per call path (beep = server UAC; park = server UAS).
 	// `cseq` must exceed every CSeq already used on this dialog, by either party or
@@ -2092,6 +2126,10 @@ private:
 	// simulator and must never be handed an emergency number. Written only
 	// there and by setAnchorPlacesRealCallsForTest(); read under _mutex.
 	bool _anchorPlacesRealCalls = false;
+	// #659: when each extension last dialed 911/933, for the PSAP callback
+	// window. Written by routeEmergencyCall(), read where an inbound call to an
+	// extension creates its session (isEmergencyCallback()); under _mutex.
+	pbx::EmergencyCallbacks _emergencyCallbacks;
 	// Issue #546: the SIP trunk has answered an INVITE with a 2xx since boot /
 	// since setTrunkConfig(). Set in onTrunkAnswered(), cleared by
 	// setTrunkConfig(); under _mutex.
@@ -2167,6 +2205,9 @@ private:
 	                     std::vector<std::pair<bool, std::string>>& logScratch);
 	void flushPass(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
 	               std::vector<std::pair<bool, std::string>>& logScratch);
+	// Print one drained log batch: errors to stderr, the rest to stdout. Used by
+	// flushPass() and by every config setter that drains _logQueue itself (#702).
+	static void printLogs(const std::vector<std::pair<bool, std::string>>& logs);
 
 	// The inbound message currently being handled, or nullptr outside a handle()
 	// pass (tick() drains with this unset). Used by drainOutbox() for exactly one
@@ -2261,7 +2302,6 @@ private:
 	int         _serverPort;
 
 	std::atomic<uint64_t> _packetsProcessed{0};
-	std::atomic<uint64_t> _packetsDropped{0};
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
@@ -2299,8 +2339,6 @@ private:
 		// Adopted devices (STAGE 2): {mac, ext, state, online}. Mirrored from the
 		// Registrar's registry under _mutex; copied out under _snapshotMutex.
 		std::vector<AdoptedDevice> devices;
-		uint64_t packetsProcessed = 0;
-		uint64_t packetsDropped = 0;
 	};
 	RegistrarSnapshot _snapshot;
 	// #463: tick() refills this in place and swaps its tables into _snapshot, so

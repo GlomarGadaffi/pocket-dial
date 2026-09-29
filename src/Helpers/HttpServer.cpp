@@ -1285,6 +1285,17 @@ void HttpServer::handleClient(int clientSock)
 			sendApiRegistrarDevice(clientSock, req.body);
 		}
 	}
+	else if (req.method == "POST" && req.path == "/api/registrar/forget-learned")
+	{
+		// #515: one action to clear a flood of Learned adoptions; Secured
+		// devices stay. Answers with the same device list as GET /api/registrar.
+		if (requireAdmin(clientSock, req, true))
+		{
+			RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+			if (handler) handler->forgetLearnedDevices();
+			sendApiRegistrar(clientSock);
+		}
+	}
 	else if (req.method == "GET" && req.path == "/api/admin/status")
 	{
 		// Read-only: tells the dashboard whether to show the login form.
@@ -2031,6 +2042,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// The message pool is process-global, so it reads even with no engine.
 	json.s("\"msgPoolRefusals\":").n(RequestsHandler::getMessagePoolRefusals()).s(",");
 	json.s("\"vpeerPoolRefusals\":").n(handler ? handler->getVirtualPeerRefusals() : 0).s(",");
+	// #702 item 19: two "should stay zero" counters that were test-only until now.
+	json.s("\"repliesRefused\":").n(handler ? handler->getRepliesRefused() : 0).s(",");   // #424
+	json.s("\"optionsPingTruncated\":").n(handler ? handler->getOptionsPingTruncated() : 0).s(",");   // #463
 	// Issue #663: trunk responses dropped as not from the carrier (#617, #356).
 	json.s("\"trunkForgedRegisterResponses\":").n(handler ? handler->getTrunkForgedRegisterResponses() : 0).s(",");
 	json.s("\"trunkForgedDialogResponses\":").n(handler ? handler->getTrunkForgedDialogResponses() : 0).s(",");
@@ -3074,14 +3088,6 @@ void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
 		return;
 	}
 	sendResponse(sock, 200, "OK", contentType, cfg);
-}
-
-void HttpServer::sendConfigCfg(int sock, const std::string& mac)
-{
-	HttpRequest req;
-	req.method = "GET";
-	req.path = "/config/" + mac + ".cfg";
-	sendProvisioningResponse(sock, req);
 }
 
 void HttpServer::sendApiVoicemail(int sock, const std::string& body)

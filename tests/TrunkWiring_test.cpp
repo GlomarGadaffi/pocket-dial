@@ -83,7 +83,8 @@ namespace
 	// A handset dialling a PSTN number. The 9 prefix is what the dial rule
 	// strips; 101 is the telephone-event payload type the answer must echo.
 	std::shared_ptr<SipMessage> makeTrunkDial(const std::string& fromExt,
-		const std::string& dialed, const std::string& callId, int rtpPort = 40000)
+		const std::string& dialed, const std::string& callId, int rtpPort = 40000,
+		const std::string& extraHeaders = "")
 	{
 		const std::string body =
 			"v=0\r\n"
@@ -103,7 +104,7 @@ namespace
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 1 INVITE\r\n"
 			"Max-Forwards: 70\r\n"
-			"Contact: <sip:" + fromExt + "@" + kHandsetIp + ":5060>\r\n"
+			"Contact: <sip:" + fromExt + "@" + kHandsetIp + ":5060>\r\n" + extraHeaders +
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
@@ -346,6 +347,33 @@ TEST(TrunkWiring, TheCarrierAnswerIsAckedAndTheHandsetGetsATwoWaySdpAnswer)
 		<< "both halves of the pair are live once the call is up";
 }
 
+// #198: the handset's 200 is the PBX's own answer, so RFC 4028 applies to it.
+// The PBX never refreshes, and onReinvite() answers a trunk-leg re-INVITE 488,
+// so a timer it granted here would end the call at expiry (§10: only a 2xx
+// extends the session) -- on a 911 call too. The answer carries no
+// Session-Expires and no Require at all instead (§7.2: no expiration).
+TEST(TrunkWiring, TheHandsetAnswerCarriesNoSessionTimer)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-se", 40000,
+		"Supported: timer\r\nSession-Expires: 1800\r\n"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+
+	const std::string ok = b.firstWith("200 OK");
+	ASSERT_FALSE(ok.empty()) << "the handset was never answered";
+	// Positive control: this is the handset's two-way SDP answer.
+	EXPECT_NE(ok.find("a=sendrecv"), std::string::npos) << ok;
+	EXPECT_EQ(ok.find("\r\nSession-Expires:"), std::string::npos)
+		<< "a timer the PBX cannot service (re-INVITE refresh: 488) ends the call at expiry\n" << ok;
+	EXPECT_EQ(ok.find("\r\nx:"), std::string::npos) << ok;
+	EXPECT_EQ(ok.find("\r\nRequire:"), std::string::npos) << ok;
+}
+
 TEST(TrunkWiring, AnAnswerWithNoUsableMediaHangsTheCarrierUpRatherThanConnectSilence)
 {
 	Bench b;
@@ -450,6 +478,72 @@ TEST(TrunkWiring, AnExpiredLeaseMidCallByesTheCarrierAndReleasesTheRelay)
 
 	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the carrier leg must be hung up";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and its relay pair released";
+}
+
+TEST(TrunkWiring, AnExpiredLeaseNeverEndsAnEmergencyCall)
+{
+	// #712 (desmo): a lapsed registration is bookkeeping; hanging up a 911 over
+	// it is not. The client is kept until the emergency call ends, then pruned
+	// by the next sweep as usual (the control half of this test).
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-712-lease"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the 911 is up";
+	b.sent.clear();
+
+	b.handler.expireLeaseAndSweepForTest("1001");
+
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the lease sweep hung up the PSAP";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "or the 911 caller";
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-712-lease").has_value()) << "the 911 session is kept";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "with its media";
+
+	// Control: once the 911 has ended, the same expired client is pruned.
+	b.handler.handle(RequestsHandler::getMessageFromPool(e911.bye(), addrFor(kSbcIp)));
+	ASSERT_FALSE(b.handler.getSession("Call-ID: call-712-lease").has_value()) << "precondition: the 911 ended";
+	b.handler.expireLeaseAndSweepForTest("1001");
+	b.handler.forceNextTickForTest();   // getActiveClients() reads the tick snapshot
+	b.handler.tick();
+	bool still1001 = false;
+	for (const auto& [number, address] : b.handler.getActiveClients())
+	{
+		(void)address;
+		if (number == "1001") still1001 = true;
+	}
+	EXPECT_FALSE(still1001) << "the expired client is pruned once no emergency call holds it";
+}
+
+TEST(TrunkWiring, ARingingEmergencyCallIsNeverTimedOutButASilentOneStillIs)
+{
+	// #712 (desmo): a 911/933 the carrier is working on (a 100 or 180 seen,
+	// Proceeding) gets no PBX-side no-answer bound; a PSAP may queue it past
+	// 60 s. One that never drew any provisional (Trying) keeps the 60 s
+	// deadline, because Timer B only logs: that half is the control, proving
+	// the sweep did run on this tick.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-712-ring"));
+	const auto ringing = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(ringing.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		ringing.response("SIP/2.0 180 Ringing", false), addrFor(kSbcIp)));
+	b.handler.handle(makeTrunkDial("1001", "933", "call-712-silent", 40002));
+	ASSERT_FALSE(b.firstWith("INVITE sip:933").empty()) << "precondition: 933 went to the trunk";
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 2u) << "precondition: both are placed";
+	b.sent.clear();
+
+	b.handler.expireTrunkDeadlinesForTest();
+	b.handler.tick();
+
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-712-ring").has_value())
+		<< "a ringing 911 was timed out by the PBX";
+	EXPECT_FALSE(b.handler.getSession("Call-ID: call-712-silent").has_value())
+		<< "control: a 933 that never drew a provisional still times out";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "only the silent leg's relay is released";
 }
 
 TEST(TrunkWiring, TheCarrierHangingUpByesTheHandsetAndReleasesTheRelay)

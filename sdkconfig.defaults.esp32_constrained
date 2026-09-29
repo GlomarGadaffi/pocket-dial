@@ -52,5 +52,12 @@ CONFIG_LWIP_UDP_RECVMBOX_SIZE=6
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
 CONFIG_LOG_DEFAULT_LEVEL=2
 
+# ── Code size: -Os (#689) ───────────────────────────────────────────────────
+# The 4 MB app slot (0x1E0000) was full at the IDF default -Og: ~1.5 KB free
+# on main against app_slot_margin.py's 32 KB floor. Only this profile changes;
+# the 16 MB builds stay at -Og. -Os moves frames and stack use, so re-check
+# stackHwm_* on hardware after this lands. STACK_CHECK_MODE_STRONG (T-7) stays.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
 # NOTE: PTHREAD_TASK_STACK_SIZE_DEFAULT (8192, set in base) is deliberately kept —
 # the HTTP dashboard's std::thread overflows a smaller stack. Do not shrink it.

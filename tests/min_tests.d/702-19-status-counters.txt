@@ -1,0 +1,2 @@
+# HttpStatusAlloc_test.cpp: 1 (#702 item 19: repliesRefused and optionsPingTruncated on /api/status; packetsDropped is their per-reason sum)
+1

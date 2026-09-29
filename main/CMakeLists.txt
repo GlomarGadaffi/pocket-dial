@@ -281,6 +281,9 @@ if(SIP_CONSTRAINED)
         POCKETDIAL_MAX_TRUNK_CALLS=1
         POCKETDIAL_RTP_TX_POOL=3
         POCKETDIAL_CONFERENCE=0
+        # #689: the 4 MB app slot is full at -Og, so the #618 trunk wire dump
+        # (full INVITE + REGISTER response) is compiled out here.
+        POCKETDIAL_TRUNK_WIRE_LOG=0
         # #483/#689: the 4 MB app slot is full at -Og, so the config backup's
         # trunk/SMTP/E911/admin_ext section is compiled out here; an import
         # that carries it says so under "skipped".

@@ -24,7 +24,7 @@
 #include "TimeSync.hpp"    // Issue #246: voicemail flush timestamp (endCall() hook)
 #include "PbxConfig.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: 911/933 classification, ahead of the dial plan
-#include "SessionTimer.hpp"   // Issue #198: RFC 4028 422 floor
+#include "SessionTimer.hpp"   // Issue #198: RFC 4028 422 floor, 2xx Session-Expires
 #include <charconv>
 #include "PbxPersist.hpp"
 #include "SipHeaderUtil.hpp"
@@ -111,6 +111,7 @@ namespace
 	// still refusing a pathological value outright rather than silently
 	// truncating it somewhere downstream.
 	constexpr size_t kMaxAorLen = 64;
+	static_assert(pbx::EmergencyCallbacks::kMaxExt >= kMaxAorLen, "#659");
 
 	// How long a CONNECTED outbound anchor call waits for the handset's ACK before
 	// tick() treats it as abandoned (handset gone, or its 200 OK arrived too late)
@@ -147,7 +148,9 @@ namespace
 	// reconcile watchdog tears down only legs that have VANISHED from the DN, so
 	// a stuck-but-present leg would otherwise pin the single
 	// POCKETDIAL_MAX_ANCHOR_CALLS slot forever. 60 s clears carrier voicemail with
-	// margin while bounding that worst case; do not make it unbounded, and do not
+	// margin while bounding that worst case; do not make it unbounded (the one
+	// exception is a ringing 911/933, #712: desmo's decision, the caller's own
+	// CANCEL ends it), and do not
 	// re-arm it on provider progress events (the provider reports our own control
 	// leg's state, which sits at "Dialing" right through far-end alerting — there
 	// is no alerting signal to key off).
@@ -461,7 +464,13 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 							{
 								const int rxPort = bridge->receiverPort();
 								const std::string sdpBody = buildMediaSdp(activeIp, rxPort, /*sendrecv=*/true);
-								auto ok = buildOkWithSdp(inviteMsg, activeIp, toTag, sdpBody);
+								// #198: no timer. The session's dest is the 555 virtual peer
+								// (originateAnchorCall's async branch), so a re-INVITE would
+								// reach answerAnchorReinvite() (200) exactly as on the
+								// synchronous branch -- but no host test can reach this
+								// branch (tests/VpeerExhaustion_vm_anchor_test.cpp:24-37), so
+								// the grant stays off until one proves the refresh (#739).
+								auto ok = buildOkWithSdp(inviteMsg, activeIp, toTag, sdpBody, /*grantSessionTimer=*/false);
 								if (ok)
 								{
 									// Runs on the anchor's own WS event task, NOT the SIP
@@ -576,6 +585,10 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 						        inviteMsg ? inviteMsg->getToNumber() : "", "anchor hangup");
 						break;
 					}
+				}
+				else if (ev.type == AnchorClient::CallEvent::MediaNeverOpened)
+				{
+					anchorMediaNeverOpenedLocked(ev.participantId);
 				}
 			});
 		}
@@ -842,7 +855,6 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	// Input validation: Drop null or structurally malformed packets instantly (SEC-02)
 	if (!request || !request->isValidMessage())
 	{
-		_packetsDropped.fetch_add(1, std::memory_order_relaxed);
 		// Issue #430: record the source and first bytes, so an idle drop rate can
 		// be traced to its sender (e.g. a CRLF keep-alive) without a LAN capture.
 		const sockaddr_in src = request ? request->getSource() : sockaddr_in{};
@@ -858,7 +870,6 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		std::lock_guard<std::mutex> rlock(_rateMutex);
 		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
 		{
-			_packetsDropped.fetch_add(1, std::memory_order_relaxed);
 			const sockaddr_in src = request->getSource();
 			_dropProbe.note(DropProbe::Reason::Rate, src.sin_addr.s_addr, src.sin_port, rawBytes);
 			return;
@@ -1170,15 +1181,20 @@ void RequestsHandler::drainPassLocked(
 	logScratch.swap(_logQueue);
 }
 
-void RequestsHandler::flushPass(
-	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
-	std::vector<std::pair<bool, std::string>>& logScratch)
+void RequestsHandler::printLogs(const std::vector<std::pair<bool, std::string>>& logs)
 {
-	for (const auto& log : logScratch)
+	for (const auto& log : logs)
 	{
 		if (log.first) std::cerr << log.second << '\n';
 		else std::cout << log.second << '\n';
 	}
+}
+
+void RequestsHandler::flushPass(
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	std::vector<std::pair<bool, std::string>>& logScratch)
+{
+	printLogs(logScratch);
 	for (auto& event : outScratch)
 	{
 		_onHandled(event.first, std::move(event.second));
@@ -1286,9 +1302,9 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			? _registrar.admitSecure(data, extStr, rejectReason)
 			: _registrar.admitLearn(data, extStr, rejectReason);
 
-		if (decision == Registrar::AuthDecision::Challenge)
+		if (decision == Registrar::AuthDecision::Challenge || decision == Registrar::AuthDecision::RetryLater)
 		{
-			// admitSecure already enqueued the 401 + WWW-Authenticate.
+			// The registrar already enqueued the 401 (or #515's 503 + Retry-After).
 			return;
 		}
 		if (decision == Registrar::AuthDecision::Reject)
@@ -1438,10 +1454,13 @@ namespace
 	// handled, because nothing in src/ reads that header. Kept per #229's
 	// scope call rather than withdrawn, since the REFER usage is real.
 	//
-	// NOT "timer": the RFC 4028 support is passive -- it honours a timer a phone
-	// requests but never requests one itself. Since #591 an initial INVITE whose
-	// Session-Expires is too small gets 422 + Min-SE (onInvite reads
-	// getMinSESecs()), but the rest of #198 is still open, so the tag stays off.
+	// NOT "timer" (#198). The 2xx this PBX writes itself now names the phone as
+	// refresher (pbx::answerSessionTimer), and a too-small interval draws 422 +
+	// Min-SE (#591), but a UAS that advertises timer must still do what this one
+	// cannot: be the refresher when the phone asks it to (refresher=uas, or no
+	// Supported: timer), since nothing here ever sends a refresh; accept a
+	// re-INVITE refresh on 777/888/trunk legs (answered 488 below); and answer an
+	// UPDATE refresh on park and 440 legs (relayed back to the caller, #709).
 	// NOT "100rel" (RFC 3262 needs PRACK), "norefersub", "path", "gruu" or
 	// "outbound" — none of them have any implementation in this codebase.
 	constexpr const char* kSupportedOptionTags = "replaces";
@@ -2082,6 +2101,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		okResponse->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		okResponse->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		okResponse->setContact(buildContact("777"));
+		pbx::answerSessionTimer(*okResponse, *data, /*grant=*/false);   // #198: re-INVITE gets 488
 		// The echo answer is the CALLER'S OWN offer handed back, so it must obey
 		// RFC 3264 §6.1: an answer reuses the offer's payload-type numbers and may
 		// only narrow the list. enforceG711() pinned the m= line to a literal
@@ -2313,6 +2333,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 	_sessions.emplace(data->getCallID(), newSession);
+	newSession->setEmergency(isEmergencyCallback(called.value()->getNumber()));   // #659
 
 	// Retain the original INVITE on every direct-call session — not only when
 	// the callee has a conditional forward (busy/no-answer) configured.
@@ -2649,13 +2670,7 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	const std::string confExt(ConferenceRoom::EXT);
 
 	auto refuse = [&](const char* statusLine, const char* why) {
-		auto msg = getMessageFromPool(*data);
-		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
-		msg->setHeader(statusLine);
-		msg->clearBody();
-		msg->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		msg->setContact(buildContact(confExt));
-		_outbox.emplace_back(data->getSource(), std::move(msg));
+		if (!refuseInvite(*data, statusLine, confExt)) return;
 		queueLog("888 conference: " + std::string(why) + " for "
 			+ std::string(data->getFromNumber()), true);
 	};
@@ -2745,7 +2760,7 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	// answer advertised PCMU alone so a phone had no negotiated way to send them.
 	const std::string sdpBody = buildMediaSdp(activeIp, _conference->rtpPortFor(callID),
 		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
-	auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
+	auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody, /*grantSessionTimer=*/false);   // #198: re-INVITE gets 488
 	if (!ok)
 	{
 		_conference->leave(callID);
@@ -2859,13 +2874,7 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 	const std::string callID(invite->getCallID());
 
 	auto refuse = [&](const char* statusLine, const char* why) {
-		auto msg = getMessageFromPool(*invite);
-		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
-		msg->setHeader(statusLine);
-		msg->clearBody();
-		msg->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
-		msg->setContact(buildContact(extension));
-		_outbox.emplace_back(invite->getSource(), std::move(msg));
+		if (!refuseInvite(*invite, statusLine, extension)) return;
 		queueLog("Voicemail: " + std::string(why) + " for " + std::string(src->getNumber())
 			+ " -> " + extension, true);
 	};
@@ -2993,7 +3002,9 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 	// follow-up for this leg too, not a regression introduced here.
 	const std::string sdpBody = buildMediaSdp(activeIp, _vmRtpReceivers[slot].localPort(),
 		/*sendrecv=*/true, invite->getTelephoneEventPayloadType());
-	auto ok = buildOkWithSdp(invite, activeIp, toTag, sdpBody);
+	// #198: a re-INVITE on this leg is relayed to dest, the caller's own
+	// address (onReinvite), never answered 200 here, so no timer is granted.
+	auto ok = buildOkWithSdp(invite, activeIp, toTag, sdpBody, /*grantSessionTimer=*/false);
 	if (!ok)
 	{
 		_vmRtpReceivers[slot].stop();
@@ -3094,13 +3105,7 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 	const std::string extension = src->getNumber();
 
 	auto refuse = [&](const char* statusLine, const char* why) {
-		auto msg = getMessageFromPool(*invite);
-		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
-		msg->setHeader(statusLine);
-		msg->clearBody();
-		msg->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
-		msg->setContact(buildContact(kVoicemailRetrievalExt));
-		_outbox.emplace_back(invite->getSource(), std::move(msg));
+		if (!refuseInvite(*invite, statusLine, kVoicemailRetrievalExt)) return;
 		queueLog("Voicemail retrieval: " + std::string(why) + " for " + extension, true);
 	};
 
@@ -3211,7 +3216,9 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 	// identical note on buildOkWithSdp()'s offer-awareness).
 	const std::string sdpBody = buildMediaSdp(activeIp, _vmRtpReceivers[slot].localPort(),
 		/*sendrecv=*/true, invite->getTelephoneEventPayloadType());
-	auto ok = buildOkWithSdp(invite, activeIp, toTag, sdpBody);
+	// #198: same as the deposit leg -- a re-INVITE is relayed back to the
+	// caller's own address, never answered 200 here, so no timer is granted.
+	auto ok = buildOkWithSdp(invite, activeIp, toTag, sdpBody, /*grantSessionTimer=*/false);
 	if (!ok)
 	{
 		_vmRtpReceivers[slot].stop();
@@ -3917,6 +3924,57 @@ bool RequestsHandler::allBridgesBusy() const
 	return activeAnchorCalls() >= anchorCallLimit();
 }
 
+void RequestsHandler::preemptAnchorCallForEmergency()
+{
+	// #624 (desmo's decision): a 911/933 that finds the anchor full ends one
+	// NON-emergency anchored call and takes its room. Full counts ringing legs
+	// too: one holds the provider's call slot but no bridge (#667's ringing
+	// grace). When the bridges are the blocker, the call taken must hold one.
+	// Another emergency call is never taken; the busy 503 stands instead.
+	const bool needBridge = allBridgesBusy();
+	unsigned legs = 0;
+	const std::shared_ptr<Session>* found = nullptr;   // valid until endCall() erases it
+	for (const auto& [id, s] : _sessions)
+	{
+		if (!s->isAnchor() || s->getState() == Session::State::Bye) continue;
+		++legs;
+		if (found || s->isEmergency()) continue;
+		bool hasBridge = false;
+		for (const auto& b : _mediaBridges) hasBridge = hasBridge || b.isForCallId(id);
+		if (!needBridge || hasBridge) found = &s;
+	}
+	if (!found || (!needBridge && legs < anchorCallLimit())) return;
+	const std::shared_ptr<Session>& victim = *found;
+
+	// Tell its caller the way each teardown path already does: a 503 or a
+	// CANCEL while it still rings, else a BYE (the #604 sweep's shape). endCall()
+	// then drops the anchor leg and frees the bridge; it also logs the reason.
+	const std::string callID = victim->getCallID();   // endCall() erases the map's copy
+	const bool inbound = victim->isAnchorInbound();
+	const auto handset = inbound ? victim->getDest() : victim->getSrc();
+	const std::string& dFrom = victim->getDialogFrom();
+	const std::string& dTo = victim->getDialogTo();
+	if (victim->getState() == Session::State::Invited)
+	{
+		if (!inbound) refuseRingingAnchor(callID, _outbox);
+		else for (const auto& t : victim->getPendingTargets())
+		{
+			if (auto c = buildInboundCancelTo(victim, t)) _outbox.emplace_back(t->getAddress(), std::move(c));
+		}
+	}
+	else if (handset && !dFrom.empty() && !dTo.empty())
+	{
+		const uint32_t cseq = victim->nextServerCSeq();
+		auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), callID,
+			inbound ? dFrom : dTo, inbound ? dTo : dFrom, cseq);
+		if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
+		victim->noteServerCSeq(cseq);
+	}
+	const std::string far = victim->getAnchorParticipantId();   // endCall()'s release() clears it
+	const std::string_view phone = handset ? std::string_view(handset->getNumber()) : std::string_view();
+	endCall(callID, inbound ? far : phone, inbound ? phone : far, "pre-empted by 911");
+}
+
 bool RequestsHandler::anchorIsSynchronous() const
 {
 	return _anchorBootType == TelephonyProviderType::Loopback;
@@ -3970,8 +4028,10 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// reap never hangs up a 911 (the dialed number alone misses a dial-plan
 	// transform such as "0" -> "911").
 	auto markEmergency = [&] {
-		auto s = _sessions.find(std::string(data->getCallID()));
+		auto s = _sessions.find(data->getCallID());   // std::less<> map: no copy on the 911 path
 		if (s != _sessions.end() && s->second) s->second->setEmergency(true);
+		// #659: opens this extension's PSAP callback window.
+		_emergencyCallbacks.note(caller->getNumber(), std::chrono::steady_clock::now());
 	};
 	bool placed = false;
 	bool codecRejected = false;
@@ -4176,7 +4236,8 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// rule-produced emergency number to routeEmergencyCall() (#538 review M2),
 	// and no client can be named like one (#550), so 555's own-number dial
 	// cannot produce one either. Pinned by a test that forces the #550 state.
-	if (!_anchorPlacesRealCalls && pbx::classifyEmergencyDial(destination).isEmergency)
+	const bool emergency = pbx::classifyEmergencyDial(destination).isEmergency;
+	if (!_anchorPlacesRealCalls && emergency)
 	{
 		refuse("SIP/2.0 503 Emergency Call Not Routable",
 			"loopback test provider refused an emergency number");
@@ -4240,6 +4301,8 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in INVITE");
 		return true;
 	}
+
+	if (emergency) preemptAnchorCallForEmergency();   // #624: no-op unless the anchor is full
 
 	if (anchorIsSynchronous())
 	{
@@ -4315,7 +4378,9 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		// this is the path a voicemail or IVR menu will be driven over.
 		const std::string sdpBody = buildMediaSdp(activeIp, bridge->receiverPort(),
 			/*sendrecv=*/true, data->getTelephoneEventPayloadType());
-		auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
+		// #198: dest is the 555 virtual peer, so a re-INVITE reaches
+		// answerAnchorReinvite() (200), never onReinvite()'s 488.
+		auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody, /*grantSessionTimer=*/true);
 		if (!ok)
 		{
 			bridge->stopBridge();
@@ -4603,6 +4668,32 @@ void RequestsHandler::asyncDropCall(const std::string& participantId)
 #endif
 }
 
+// Issue #379: the anchor's rx task spent its whole GET retry budget (3CX refused the
+// stream for ~2 min) with no teardown under way. Nothing else drops this leg, and with
+// its session gone nothing ever would: a live, billed 3CX leg with no local party. Drop
+// it once. A 911/933 is kept: the PSAP may still hear the caller, and no automated
+// teardown hangs up an emergency call (#604). The stopped bridge and the released flag
+// keep endCall() from dropping it again; 3CX's Remove BYEs the handset (Dropped branch).
+void RequestsHandler::anchorMediaNeverOpenedLocked(const std::string& participantId)
+{
+	if (participantId.empty()) return;
+	for (const auto& kv : _sessions)
+	{
+		const auto& s = kv.second;
+		if (!s->isAnchor() || s->getAnchorParticipantId() != participantId) continue;
+		if (s->isEmergency())
+		{
+			queueLog("[Telephony] no rx audio on 911 leg " + participantId + ", kept", true);
+			return;
+		}
+		s->setAnchorLegReleased();
+		break;
+	}
+	if (MediaBridge* b = bridgeForParticipant(participantId)) b->stopBridge();
+	queueLog("[Telephony] no rx audio, dropping leg " + participantId, true);
+	asyncDropCall(participantId);
+}
+
 void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 {
 	// Answer an inbound upstream participant off the SIP thread (the POST is a
@@ -4836,6 +4927,9 @@ void RequestsHandler::routeInboundAnchorCall(const std::string& participantId, c
 	}
 	session->setAnchor(true);
 	session->setAnchorInbound(true);
+	// #659: ring-all reaches every target, so any one in its window flags it.
+	session->setEmergency(std::any_of(targets.begin(), targets.end(),
+		[this](const auto& t) { return isEmergencyCallback(t->getNumber()); }));
 	session->setState(Session::State::Invited);
 	session->setLocalTag(fromTag);
 	session->setUacBranch(branch);
@@ -7557,6 +7651,23 @@ void RequestsHandler::sweepExpired()
 
 		if (keepAliveTimedOut || leaseExpired)
 		{
+			// #712 (desmo, 2026-09-29): a lapsed lease never ends a 911/933. Skip the
+			// client, before any log line or allocation (this runs at 1 Hz for the
+			// whole call), until its emergency call has ended; the next sweep after
+			// that prunes it as usual.
+			bool emergencyLive = false;
+			for (const auto& [cid, s] : _sessions)
+			{
+				if (s->isEmergency() &&
+				    ((s->getSrc() && s->getSrc()->getNumber() == client->getNumber()) ||
+				     (s->getDest() && s->getDest()->getNumber() == client->getNumber())))
+				{
+					emergencyLive = true;
+					break;
+				}
+			}
+			if (emergencyLive) continue;
+
 			if (keepAliveTimedOut)
 			{
 				queueLog("Pruning client due to missed OPTIONS keepalive pings: " + client->getNumber());
@@ -7793,11 +7904,7 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 uint64_t RequestsHandler::getPacketsProcessed() const
@@ -7890,7 +7997,10 @@ void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipM
 
 uint64_t RequestsHandler::getPacketsDropped() const
 {
-	return _packetsDropped.load(std::memory_order_relaxed);
+	// #702 item 19: derived, not a second counter. Every Invalid/Rate drop is
+	// noted in the probe (handle() and noteRxDiscard()), so the sum is exact by
+	// construction. Each reason wraps at 2^32 (DropProbe is 32-bit, Xtensa).
+	return static_cast<uint64_t>(_dropProbe.invalidCount()) + _dropProbe.rateCount();
 }
 
 uint64_t RequestsHandler::getDroppedInvalid() const
@@ -7916,8 +8026,6 @@ const DropProbe& RequestsHandler::getDropProbe() const
 void RequestsHandler::noteRxDiscard(DropProbe::Reason reason, const sockaddr_in& src,
                                     std::string_view bytes, size_t fullLen)
 {
-	if (reason == DropProbe::Reason::Invalid || reason == DropProbe::Reason::Rate)
-		_packetsDropped.fetch_add(1, std::memory_order_relaxed);   // keep #430's sum exact
 	_dropProbe.note(reason, src.sin_addr.s_addr, src.sin_port, bytes, fullLen);
 }
 
@@ -7994,11 +8102,7 @@ void RequestsHandler::setDnd(const std::string& extension, bool on)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::string> RequestsHandler::getDndExtensions()
@@ -8017,11 +8121,7 @@ void RequestsHandler::setVoicemail(const std::string& extension, bool on)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::string> RequestsHandler::getVoicemailExtensions()
@@ -8042,11 +8142,7 @@ void RequestsHandler::setForward(const std::string& extension, const std::string
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string, std::string>> RequestsHandler::getForwards()
@@ -8069,11 +8165,7 @@ void RequestsHandler::setE911Config(const std::string& exts, const std::string& 
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::tuple<std::string, std::string, std::string> RequestsHandler::getE911Config()
@@ -8093,11 +8185,7 @@ void RequestsHandler::setRingGroup(const std::string& groupExt, const std::strin
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string>> RequestsHandler::getRingGroups()
@@ -8147,11 +8235,7 @@ void RequestsHandler::setDialRule(const std::string& pattern, const std::string&
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getDialRules()
@@ -8284,11 +8368,7 @@ std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 	return err;
 }
 
@@ -8350,11 +8430,7 @@ void RequestsHandler::setRegistrarMode(RegistrarMode mode)
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 RequestsHandler::RegistrarMode RequestsHandler::getRegistrarMode() const
@@ -8417,11 +8493,7 @@ bool RequestsHandler::secureDevice(const std::string& macOrExt)
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 	return changed;
 }
 
@@ -8432,6 +8504,21 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		removed = _registrar.forget(macOrExt);
+		applyDeviceChange(_registrar.consumeDevicesChange());
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+	printLogs(localLogs);
+	return removed;
+}
+
+size_t RequestsHandler::forgetLearnedDevices()
+{
+	std::vector<std::pair<bool, std::string>> localLogs;
+	size_t removed = 0;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		removed = _registrar.forgetLearned();
 		applyDeviceChange(_registrar.consumeDevicesChange());
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -8717,7 +8804,12 @@ void RequestsHandler::tick()
 			const bool connectedAbandonedAnchor =
 				session->getState() == Session::State::Connected &&
 				session->isAnchor() && !session->isAnchorInbound();
-			if (session->isRingExpired(now) &&
+			// #712 (desmo, 2026-09-29): a 911/933 that is still ringing gets no
+			// PBX-side no-answer bound; a PSAP may queue it past 60 s. The far
+			// end's own transaction timers bound a leg that never answers at all.
+			const bool ringingEmergency =
+				session->getState() == Session::State::Invited && session->isEmergency();
+			if (session->isRingExpired(now) && !ringingEmergency &&
 			    (session->getState() == Session::State::Invited || connectedAbandonedAnchor))
 			{
 				expiredCallIds.push_back(callID);
@@ -9268,8 +9360,6 @@ void RequestsHandler::tick()
 			// exactly as they are. The old whole-struct move-assign preserved devices
 			// and pageZones by hand but not voicemail, so the dashboard's voicemail
 			// list was blanked one tick after every change (found in #463).
-			_snapshot.packetsProcessed = _packetsProcessed.load(std::memory_order_relaxed);
-			_snapshot.packetsDropped   = _packetsDropped.load(std::memory_order_relaxed);
 			std::swap(_snapshot.clients,     next.clients);
 			std::swap(_snapshot.sessions,    next.sessions);
 			std::swap(_snapshot.cdr,         next.cdr);
@@ -9554,6 +9644,7 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 	// buildOkWithSdp() mints a fresh tag for a first answer; calling it here
 	// would append a second tag onto the one already present.
 	addCapabilityHeaders(*ok);
+	pbx::answerSessionTimer(*ok, *data, /*grant=*/true);   // #198: this IS the re-INVITE's 200
 	const std::string sdpBody = buildMediaSdp(_localIp, bridge->receiverPort(),
 		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
 	ok->clearBody();
@@ -9749,6 +9840,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		resp->setHeader(SipMessageTypes::OK);
 		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		resp->setContact(buildContact(data->getToNumber()));
+		pbx::answerSessionTimer(*resp, *data, /*grant=*/true);   // #198: a local UPDATE answer
 		resp->clearBody();
 		resp->syncContentLength();
 		_outbox.emplace_back(data->getSource(), std::move(resp));
@@ -10142,11 +10234,7 @@ void RequestsHandler::setPageZone(const std::string& zoneExt, const std::string&
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::pair<std::string, std::string>> RequestsHandler::getPageZones()
@@ -10257,19 +10345,26 @@ void RequestsHandler::refreshParkSnapshot()
 	_snapshot.parkedCalls = std::move(rows);
 }
 
-std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getParkedCalls()
-{
-	std::lock_guard<std::mutex> lock(_snapshotMutex);
-	return _snapshot.parkedCalls;
-}
-
 // ── Build helpers ─────────────────────────────────────────────────────────────
+
+bool RequestsHandler::refuseInvite(const SipMessage& req, const char* statusLine, std::string_view contactExt)
+{
+	auto msg = getMessageFromPool(req);
+	if (!msg) return false;   // pool exhausted: drop, peer retransmits (#101A)
+	msg->setHeader(statusLine);
+	msg->clearBody();
+	msg->setVia(sipwire::viaWithReceived(req.getVia(), req.getSource()));
+	msg->setContact(buildContact(contactExt));
+	_outbox.emplace_back(req.getSource(), std::move(msg));
+	return true;
+}
 
 std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	const std::shared_ptr<SipMessage>& inviteMsg,
 	const std::string& /*activeIp*/,   // Via now carries the request's real source
 	const std::string& toTag,
-	const std::string& sdpBody)
+	const std::string& sdpBody,
+	bool grantSessionTimer)
 {
 	auto ok = getMessageFromPool(*inviteMsg);
 	if (!ok) return nullptr;   // pool exhausted: propagate, caller drops (#101A)
@@ -10286,6 +10381,11 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	// (RFC 3311 §5.1). Added BEFORE the body work below so the header block is
 	// final when Content-Type/Content-Length are recomputed off the raw string.
 	addCapabilityHeaders(*ok);
+	// #198: 888 (onReinvite: 488) and the voicemail legs (their re-INVITE is
+	// relayed back to the phone's own address, never answered 200 by this PBX)
+	// get no timer; only the synchronous 555 answer does (its re-INVITE is
+	// answered 200 by answerAnchorReinvite()).
+	pbx::answerSessionTimer(*ok, *inviteMsg, grantSessionTimer);
 	ok->clearBody();
 	{
 		std::string raw = ok->toString();
@@ -10914,6 +11014,7 @@ void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 	resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 	resp->setTo(std::string(invite->getTo()) + ";tag=" + session->getLocalTag());
 	resp->setContact(buildContact(std::string(invite->getToNumber())));
+	pbx::answerSessionTimer(*resp, *invite, /*grant=*/false);   // #198: trunk re-INVITE gets 488 (911 leg)
 	resp->setBody(sdpBody);   // resyncs Content-Length itself
 	_outbox.emplace_back(invite->getSource(), std::move(resp));
 
