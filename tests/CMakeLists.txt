@@ -532,6 +532,8 @@ add_executable(sip_parser_tests
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
     ProvisioningConfig_test.cpp
+    # Part of #199: every message the PBX sends, recorded for tests/conformance.
+    EmittedConformance_test.cpp
     # SIP digest-auth primitives + per-extension HA1 secret store. Both are
     # host-compilable: SipDigest vendors a portable MD5 (no mbedTLS) and
     # SipSecretStore uses an in-memory map under !ESP_PLATFORM (no NVS).
@@ -788,3 +790,24 @@ else()
 endif()
 
 add_test(NAME sip_parser_tests COMMAND sip_parser_tests)
+
+# Part of #199: every message the PBX sends, judged by pjsip's parser and an
+# RFC 3261 checklist against tests/conformance/emitted_allowlist.txt. The
+# EmittedConformance_test.cpp scenarios inside sip_parser_tests write the
+# transcript; the checker reads it. One run of the suite, not two: a second,
+# filtered run would overwrite the gtest JSON report the test-count floor reads.
+# Linux only (the pjsip oracle is built from a pjproject tree: $PJDIR, else
+# ~/pjproject). The checker fails closed without it unless
+# PD_CONFORMANCE_ALLOW_NO_PJSIP=1 is set, which the gate never does.
+if (NOT WIN32)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(EMITTED_TRANSCRIPT ${CMAKE_CURRENT_BINARY_DIR}/emitted_transcript.jsonl)
+    set_tests_properties(sip_parser_tests PROPERTIES
+        ENVIRONMENT "PD_EMITTED_TRANSCRIPT=${EMITTED_TRANSCRIPT}"
+        FIXTURES_SETUP emitted_transcript)
+    add_test(NAME emitted_conformance
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/conformance/emitted_conformance.py
+                ${EMITTED_TRANSCRIPT}
+                --pjsip-build ${CMAKE_CURRENT_BINARY_DIR}/pjsip_check_build)
+    set_tests_properties(emitted_conformance PROPERTIES FIXTURES_REQUIRED emitted_transcript)
+endif()

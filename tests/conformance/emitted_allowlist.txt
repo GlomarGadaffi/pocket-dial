@@ -1,0 +1,17 @@
+# Known violations in what the PBX sends, each tied to the issue that tracks it.
+# Read by emitted_conformance.py (Part of #199).
+#
+#   rule  scenario[,scenario...]  label[,label...]  #issue  note
+#
+# Scenario and label fields are fnmatch patterns; a label is
+# "<METHOD>-><party>" for a request and "<status>/<CSeq method>-><party>" for a
+# response. A violation not matched here fails the gate. So does any line, or
+# any pattern within a line, that no longer matches anything: fixing a bug
+# means deleting its entry, and the list only shrinks. MAX_ALLOWLIST in the
+# script is the ceiling; lower it when you remove a line.
+
+to-tag  *  400/INVITE->*,400/REGISTER->*,403/INVITE->*,404/INVITE->*,422/INVITE->*,480/INVITE->*,488/INVITE->*,489/SUBSCRIBE->*,503/INVITE->*  #702  item 11: stateless replies cloned from the request, no To tag
+cancel  ring_group  CANCEL->pc  #702  item 9: the broadcast-answer CANCEL keeps the INVITE's body and From/To
+dialog-orientation  park_pickup  ACK->pc  #453  pickup relays the caller's 2xx ACK to the cancelled target
+route  park_pickup  ACK->pc  #453  the same misrouted ACK
+route  attended_transfer,basic_call,blf,blind_transfer,callee_bye,early_media,glare,hold_update  ACK->pb,ACK->pc,re-INVITE->pb,UPDATE->pb  #754  relayed in-dialog requests keep the PBX's Request-URI
