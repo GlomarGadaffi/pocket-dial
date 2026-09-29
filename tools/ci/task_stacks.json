@@ -4,7 +4,7 @@
  "frame_ceiling_bytes": 1024,
  "_frame_allowlist": "substring of a function's name -> reason. It lifts only the per-frame checks (ceiling, dynamic frame, library callee with no frame); the frame still counts in every chain budget. Bytes are Xtensa, from the #457 run on #685 @ ebdc919.",
  "frame_allowlist": {
-  "sdp::parse(": "3488 B: `out = Session{}` (Sdp.re:287) builds a temporary sdp::Session on the stack to reset the output; a Session is ~3.3 KB (two are 0x19f0 B, Sdp.hpp)",
+  "sdp::parse(": "3488 B: `out = Session{}` (Sdp.re:287) builds a temporary sdp::Session on the stack to reset the output; sizeof(Session) is ~3.3 KB (the two static scratch Sessions are 0x19f0 B, Sdp.hpp:148)",
   "SmtpDialogue::run(": "3408 B: uint8_t chunk[3072] attachment read buffer (SmtpDialogue.cpp:720); runs on smtp_worker, 12288 B",
   "UdpServer::receiveLoop(": "2176 B: char buffer[BUFFER_SIZE] (2048 B) datagram buffer (UdpServer.cpp:182); runs on udp_receiver_task, 16384 B",
   "FatFsSource::listMessages(": "1888 B: char tombstoned[20][48] (960 B) + char line[512] + char idxPath[160] (VoicemailArchive.cpp:299-314)",
@@ -19,8 +19,8 @@
  "_library_defaults": "regex over a library callee's name -> bytes charged when the .ci has no frame for it. A reachable library callee with no frame, no match here and no frame_allowlist entry fails the gate.",
  "library_defaults": {"^v?(s|sn|f|as)?printf\\b": 2048},
  "tasks": [
-  {"name": "restart_task", "entry": "sendApiWifiConnect\\(.*<lambda", "bytes": 2048, "file": "src/Helpers/HttpServer.cpp", "line": 3925, "variants": ["main/esp_main.cpp", "main/esp_main_display.cpp"], "note": "#if POCKETDIAL_HAS_WIFI, defined for every transport but eth and lan8720 (main/CMakeLists.txt)"},
-  {"name": "restart_task", "entry": "sendApiWifiModeAp\\(.*<lambda", "bytes": 2048, "file": "src/Helpers/HttpServer.cpp", "line": 3951, "variants": ["main/esp_main.cpp", "main/esp_main_display.cpp"], "note": "#if POCKETDIAL_HAS_WIFI, defined for every transport but eth and lan8720 (main/CMakeLists.txt)"},
+  {"name": "restart_task", "entry": "sendApiWifiConnect\\(.*<lambda", "bytes": 2048, "file": "src/Helpers/HttpServer.cpp", "line": 4152, "variants": ["main/esp_main.cpp", "main/esp_main_display.cpp"], "note": "#if POCKETDIAL_HAS_WIFI, defined for every transport but eth and lan8720 (main/CMakeLists.txt)"},
+  {"name": "restart_task", "entry": "sendApiWifiModeAp\\(.*<lambda", "bytes": 2048, "file": "src/Helpers/HttpServer.cpp", "line": 4178, "variants": ["main/esp_main.cpp", "main/esp_main_display.cpp"], "note": "#if POCKETDIAL_HAS_WIFI, defined for every transport but eth and lan8720 (main/CMakeLists.txt)"},
   {"name": "restart_task", "entry": "sendApiFactoryReset\\(.*<lambda", "bytes": 4096, "file": "src/Helpers/HttpServer.cpp", "line": 4195},
   {"name": "ota_reboot", "entry": "sendApiOtaReboot\\(.*<lambda", "bytes": 4096, "file": "src/Helpers/HttpServer.cpp", "line": 6255},
   {"name": "http_conn", "entry": "HttpServer::acceptLoop\\(.*<lambda", "bytes": 4096, "file": "src/Helpers/HttpServer.cpp", "line": 415, "note": "std::thread per connection; stack set by esp_pthread_set_cfg(kHttpConnStackBytes) at HttpServer.cpp:305, value at HttpServer.hpp:49"},

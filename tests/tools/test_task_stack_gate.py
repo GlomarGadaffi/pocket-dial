@@ -178,6 +178,13 @@ class Gate(unittest.TestCase):
         rc, out = self.run_gate()
         self.assertIn("FAIL small: 900 B", out)
         self.assertEqual(rc, 1)
+        # Size and kind are each kept at their worst: a smaller dynamic frame in
+        # one TU neither lowers leaf's 300 B nor loses the dynamic flag.
+        open(os.path.join(self.ci, "a", "y.ci"), "w").write(
+            node("leaf", "void leaf()", 100).replace("(static)", "(dynamic)"))
+        rc, out = self.run_gate()
+        self.assertIn("ok   small: 500 B", out)
+        self.assertIn("FAIL frame: dynamic frame, no allowlist entry: void leaf()", out)
 
     def test_variant_only_row_is_skipped_on_other_images(self):
         open(os.path.join(self.tmp.name, "src", "SIP", "X.cpp"), "a").write(
