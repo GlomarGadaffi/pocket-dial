@@ -2649,13 +2649,7 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	const std::string confExt(ConferenceRoom::EXT);
 
 	auto refuse = [&](const char* statusLine, const char* why) {
-		auto msg = getMessageFromPool(*data);
-		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
-		msg->setHeader(statusLine);
-		msg->clearBody();
-		msg->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		msg->setContact(buildContact(confExt));
-		_outbox.emplace_back(data->getSource(), std::move(msg));
+		if (!refuseInvite(*data, statusLine, confExt)) return;
 		queueLog("888 conference: " + std::string(why) + " for "
 			+ std::string(data->getFromNumber()), true);
 	};
@@ -2859,13 +2853,7 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 	const std::string callID(invite->getCallID());
 
 	auto refuse = [&](const char* statusLine, const char* why) {
-		auto msg = getMessageFromPool(*invite);
-		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
-		msg->setHeader(statusLine);
-		msg->clearBody();
-		msg->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
-		msg->setContact(buildContact(extension));
-		_outbox.emplace_back(invite->getSource(), std::move(msg));
+		if (!refuseInvite(*invite, statusLine, extension)) return;
 		queueLog("Voicemail: " + std::string(why) + " for " + std::string(src->getNumber())
 			+ " -> " + extension, true);
 	};
@@ -3094,13 +3082,7 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 	const std::string extension = src->getNumber();
 
 	auto refuse = [&](const char* statusLine, const char* why) {
-		auto msg = getMessageFromPool(*invite);
-		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
-		msg->setHeader(statusLine);
-		msg->clearBody();
-		msg->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
-		msg->setContact(buildContact(kVoicemailRetrievalExt));
-		_outbox.emplace_back(invite->getSource(), std::move(msg));
+		if (!refuseInvite(*invite, statusLine, kVoicemailRetrievalExt)) return;
 		queueLog("Voicemail retrieval: " + std::string(why) + " for " + extension, true);
 	};
 
@@ -10256,6 +10238,18 @@ std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHand
 }
 
 // ── Build helpers ─────────────────────────────────────────────────────────────
+
+bool RequestsHandler::refuseInvite(const SipMessage& req, const char* statusLine, std::string_view contactExt)
+{
+	auto msg = getMessageFromPool(req);
+	if (!msg) return false;   // pool exhausted: drop, peer retransmits (#101A)
+	msg->setHeader(statusLine);
+	msg->clearBody();
+	msg->setVia(sipwire::viaWithReceived(req.getVia(), req.getSource()));
+	msg->setContact(buildContact(contactExt));
+	_outbox.emplace_back(req.getSource(), std::move(msg));
+	return true;
+}
 
 std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	const std::shared_ptr<SipMessage>& inviteMsg,
