@@ -207,3 +207,69 @@ TEST(BlfSubscriptions, SelfCallRingingReportsCalleeLegNotJustCaller)
 	EXPECT_NE(notify.find("<state>early</state>"), std::string::npos) << notify;
 	EXPECT_NE(notify.find("direction=\"recipient\""), std::string::npos) << notify;
 }
+
+// ── MWI (RFC 3842 message-summary) on the same subscription table ────────────
+
+// A registered phone subscribing to its OWN mailbox gets a 202 and an immediate
+// NOTIFY carrying the simple-message-summary body. Nothing deposited yet: "no".
+TEST(BlfSubscriptions, MwiSubscribeGetsAcceptedAndAnImmediateNotifyNo)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.60", 5060);
+	env.registered["201"] = std::make_shared<SipClient>("201", phoneAddr);
+
+	blf.onSubscribe(subscribe("201", "201", "mwi-1@192.168.1.60", "Event: message-summary",
+		3600, phoneAddr));
+
+	ASSERT_EQ(env.sent.size(), 2u) << env.sentRaw(0);
+	EXPECT_NE(env.sentRaw(0).find("202 Accepted"), std::string::npos) << env.sentRaw(0);
+	const std::string notify = env.sentRaw(1);
+	EXPECT_EQ(notify.rfind("NOTIFY sip:192.168.1.60:5060", 0), 0u) << notify;
+	EXPECT_NE(notify.find("Event: message-summary\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Content-Type: application/simple-message-summary\r\n"),
+		std::string::npos) << notify;
+	EXPECT_NE(notify.find("Messages-Waiting: no\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Message-Account: sip:201@"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 0/0 (0/0)\r\n"), std::string::npos) << notify;
+	EXPECT_EQ(notify.find("dialog-info"), std::string::npos) << notify;
+}
+
+// A mailbox is private: another extension's counts are not for this phone, and
+// an unregistered source gets nothing either. 403, no 202, no NOTIFY.
+TEST(BlfSubscriptions, MwiRefusesAnotherExtensionsMailboxAndUnregisteredPhones)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.60", 5060);
+	env.registered["201"] = std::make_shared<SipClient>("201", phoneAddr);
+
+	blf.onSubscribe(subscribe("201", "202", "mwi-2@192.168.1.60", "Event: message-summary",
+		3600, phoneAddr));
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_NE(env.sentRaw(0).find("403 Forbidden"), std::string::npos) << env.sentRaw(0);
+
+	env.sent.clear();
+	blf.onSubscribe(subscribe("203", "203", "mwi-3@192.168.1.60", "Event: message-summary",
+		3600, phoneAddr));
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_NE(env.sentRaw(0).find("403 Forbidden"), std::string::npos) << env.sentRaw(0);
+}
+
+// Positive control for the gate: an unknown package is still 489, and the
+// Allow-Events it advertises now names both packages this table serves.
+TEST(BlfSubscriptions, UnknownPackageStill489sAndAdvertisesMessageSummary)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.60", 5060);
+	env.registered["201"] = std::make_shared<SipClient>("201", phoneAddr);
+
+	blf.onSubscribe(subscribe("201", "201", "mwi-4@192.168.1.60", "Event: presence", 3600,
+		phoneAddr));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_NE(env.sentRaw(0).find("489 Bad Event"), std::string::npos) << env.sentRaw(0);
+	EXPECT_NE(env.sentRaw(0).find("Allow-Events: dialog, message-summary"), std::string::npos)
+		<< env.sentRaw(0);
+}
