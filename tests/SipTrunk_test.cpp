@@ -1721,3 +1721,115 @@ TEST(SipTrunkRegister, ForgedRegisterResponsesLogOnlyAtPowersOfTwo)
 	EXPECT_EQ(logsContaining(env, "(4 so far)"), 1u);
 	EXPECT_EQ(logsContaining(env, "(5 so far)"), 0u);
 }
+
+// ── #747: a handset hanging up while the carrier leg still rings ─────────────
+//
+// hangup() used to free an unanswered dialog without telling the carrier, so the
+// far end kept ringing (and could answer a call nobody was left to take). A
+// dialog that has had a provisional response now sends a CANCEL and waits out
+// the INVITE's own final response.
+
+TEST(SipTrunkCancel, BuildsTheCancelOfTheInviteItNames)
+{
+	auto d = pinnedDialog();
+	d.toTag = "carrier-tag";   // latched from a 180: must NOT reach the CANCEL's To
+
+	const std::string c = SipTrunk::buildCancel(d);
+
+	EXPECT_EQ(firstLine(c), "CANCEL sip:+15551234567@203.0.113.5 SIP/2.0");
+	EXPECT_TRUE(hasLine(c, "Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bKinvite01;rport"))
+		<< "RFC 3261 s9.1: the INVITE's own branch, not a fresh one";
+	EXPECT_TRUE(hasLine(c, "From: <sip:15551230000@203.0.113.5>;tag=ftag01"));
+	EXPECT_TRUE(hasLine(c, "To: <sip:+15551234567@203.0.113.5>"))
+		<< "the INVITE's To, which had no tag";
+	EXPECT_TRUE(hasLine(c, "Call-ID: abc123@192.168.1.10"));
+	EXPECT_TRUE(hasLine(c, "CSeq: 1 CANCEL")) << "the INVITE's CSeq number";
+}
+
+TEST(SipTrunkCancel, HangupOfARingingDialogSendsCancelAndTheCarrier487FreesIt)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	lis.events.clear();
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)).substr(0, 6), "CANCEL");
+	EXPECT_EQ(trunk.activeDialogs(), 1u) << "held until the INVITE's own final response";
+	EXPECT_TRUE(trunk.hangup("handset-1")) << "a second hangup finds the dialog";
+	EXPECT_EQ(trunk.activeDialogs(), 1u) << "and must not release it or send a second CANCEL";
+	EXPECT_EQ(env.sent.size(), 1u);
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 487 Request Terminated"))));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)).substr(0, 3), "ACK") << "s17.1.1.3: a non-2xx is ACKed";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+	EXPECT_TRUE(lis.events.empty()) << "the handset was answered when it cancelled; nothing to tell";
+}
+
+TEST(SipTrunkCancel, A2xxThatCrossesTheCancelIsAckedAndByed)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	ASSERT_TRUE(trunk.hangup("handset-1"));   // CANCEL out
+	lis.events.clear();
+	env.sent.clear();
+
+	// The carrier answered before the CANCEL reached it (s9.1).
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)).substr(0, 3), "ACK");
+	EXPECT_EQ(firstLine(env.sentRaw(1)).substr(0, 3), "BYE") << "the call is up at the carrier and billing";
+	EXPECT_TRUE(lis.events.empty()) << "the handset is gone: no answered event may bridge it";
+	EXPECT_EQ(d->state, SipTrunk::State::Terminating);
+}
+
+TEST(SipTrunkCancel, ADialogWithNoProvisionalYetIsReleasedNotCancelled)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+
+	EXPECT_TRUE(env.sent.empty()) << "RFC 3261 s9.1: no CANCEL before a provisional response";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+}
+
+TEST(SipTrunkCancel, ACancelledDialogThatNeverGetsAFinalResponseIsSweptQuietly)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	lis.events.clear();
+
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::seconds(33));
+
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+	EXPECT_TRUE(lis.events.empty()) << "the handset already ended the call; no second failure";
+}

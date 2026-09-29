@@ -175,7 +175,9 @@ public:
 	//               whereas 180 means generate local ringback.
 	// Confirmed   : 2xx received and ACKed -- the call is up.
 	// Terminating : BYE sent, waiting for its 200.
-	enum class State : uint8_t { Free, Trying, Proceeding, Confirmed, Terminating };
+	// Cancelling  : CANCEL sent for a ringing INVITE (#747), waiting for the
+	//               INVITE's own final response (487, or a 2xx that crossed it).
+	enum class State : uint8_t { Free, Trying, Proceeding, Confirmed, Terminating, Cancelling };
 
 	struct Dialog
 	{
@@ -290,6 +292,12 @@ public:
 	// well-formed in-dialog request without them, and emitting a half-formed BYE
 	// would earn a 481 while leaving the call up.
 	static std::string buildBye(const Dialog& d, std::string_view freshBranch);
+
+	// CANCEL for the INVITE still ringing (#747; RFC 3261 §9.1): the INVITE's own
+	// Request-URI, Via branch, From (with tag), To (no tag: the INVITE had none),
+	// Call-ID and CSeq number, method CANCEL. Not a new transaction, so no fresh
+	// branch -- the carrier matches it to the INVITE on the branch.
+	static std::string buildCancel(const Dialog& d);
 
 	// ── Listener: how the engine learns a trunk dialog moved ─────────────────
 	//

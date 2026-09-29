@@ -123,6 +123,23 @@ namespace
 		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
 	}
 
+	// The handset's CANCEL of its own INVITE: same Request-URI, Via branch, From
+	// tag and CSeq number, To without a tag (RFC 3261 s9.1).
+	std::shared_ptr<SipMessage> makeHandsetCancel(const std::string& fromExt,
+		const std::string& dialed, const std::string& callId)
+	{
+		const std::string raw =
+			"CANCEL sip:" + dialed + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKi" + callId + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + dialed + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 CANCEL\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
+	}
+
 	// Everything the SBC would send back, built off the INVITE the handler
 	// actually put on the wire so the dialog identifiers match for real rather
 	// than by construction.
@@ -1068,4 +1085,65 @@ TEST(TrunkWiring, StatusReportsRefusedDialogByes)
 
 	status = statusBody(port);
 	EXPECT_NE(status.find("\"trunkRefusedDialogByes\":2,"), std::string::npos) << status;
+}
+
+// ── #747: the handset hangs up while the carrier leg still rings ────────────
+//
+// onCancel() had no trunk branch, so the CANCEL fell through to a 404 for the
+// dialled PSTN number, the carrier kept ringing, and the handset's INVITE never
+// got its 487.
+
+TEST(TrunkWiring, AHandsetCancelWhileTheCarrierRingsCancelsTheCarrierLeg)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 180 Ringing", /*withSdp=*/false), addrFor(kSbcIp)));
+	b.sent.clear();
+
+	b.handler.handle(makeHandsetCancel("1001", "92025550123", "call-1"));
+
+	EXPECT_TRUE(b.firstWith("404").empty()) << "RFC 3261 s9.2: a CANCEL is answered 200 or 481, never 404";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 200", kHandsetIp), 1u) << "the CANCEL itself";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 487", kHandsetIp), 1u) << "the handset's INVITE";
+	ASSERT_EQ(b.countWithTo("CANCEL", kSbcIp), 1u) << "the carrier leg keeps ringing until told";
+	const std::string cancel = b.firstWith("CANCEL sip:+12025550123");
+	EXPECT_NE(cancel.find(";branch=" + carrier.branch), std::string::npos)
+		<< "on the carrier INVITE's own branch";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the call was never answered";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	b.sent.clear();
+
+	// The carrier's 200 to the CANCEL, then its 487 to the INVITE: the 487 is
+	// ACKed and nothing further reaches the handset.
+	std::string cancelOk = carrier.response("SIP/2.0 200 OK", /*withSdp=*/false);
+	cancelOk.replace(cancelOk.find("CSeq: 1 INVITE"), 14, "CSeq: 1 CANCEL");
+	b.handler.handle(RequestsHandler::getMessageFromPool(cancelOk, addrFor(kSbcIp)));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 487 Request Terminated", /*withSdp=*/false), addrFor(kSbcIp)));
+
+	EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 1u);
+	EXPECT_EQ(b.sent.size(), 1u) << "no stray 404 or second 487 at the handset";
+}
+
+TEST(TrunkWiring, ACarrierAnswerThatCrossesTheHandsetCancelIsByedAndNeverBridged)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 180 Ringing", /*withSdp=*/false), addrFor(kSbcIp)));
+	b.handler.handle(makeHandsetCancel("1001", "92025550123", "call-1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+
+	EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 1u);
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the carrier leg is up and billing";
+	EXPECT_EQ(b.sent.size(), 2u) << "nothing at the handset: it already has its 487";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
 }

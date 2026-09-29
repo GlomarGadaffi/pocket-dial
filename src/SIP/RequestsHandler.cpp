@@ -1549,8 +1549,15 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 	// a dialed PSTN number, answers 404, and never calls endCall() — leaking the
 	// MediaBridge and the live carrier leg. isAnchorInbound() sessions (ring-all
 	// from a real PSTN inbound call) are excluded: their teardown is unrelated.
+	//
+	// #747: a SipTrunk call (placeSipTrunkCall) has the same shape and the same
+	// bug -- its destNumber is the dialed PSTN string too, so it fell through to
+	// the 404 below and never reached the carrier. It takes this branch as well:
+	// 200 to the CANCEL, 487 to the INVITE, and endCall() -> SipTrunk::hangup(),
+	// which CANCELs the carrier leg.
 	if (destNumber == kAnchorCallExt ||
-		(cancelSess.has_value() && cancelSess.value()->isAnchor() && !cancelSess.value()->isAnchorInbound()))
+		(cancelSess.has_value() && cancelSess.value()->isAnchor() && !cancelSess.value()->isAnchorInbound()) ||
+		(cancelSess.has_value() && cancelSess.value()->isTrunk()))
 	{
 		// CANCEL of an anchor-bridge dial-in. For Loopback (answers synchronously,
 		// no ringing window) this is mostly defensive symmetry with 777/440/888 —
