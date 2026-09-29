@@ -1302,9 +1302,9 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			? _registrar.admitSecure(data, extStr, rejectReason)
 			: _registrar.admitLearn(data, extStr, rejectReason);
 
-		if (decision == Registrar::AuthDecision::Challenge)
+		if (decision == Registrar::AuthDecision::Challenge || decision == Registrar::AuthDecision::RetryLater)
 		{
-			// admitSecure already enqueued the 401 + WWW-Authenticate.
+			// The registrar already enqueued the 401 (or #515's 503 + Retry-After).
 			return;
 		}
 		if (decision == Registrar::AuthDecision::Reject)
@@ -8509,6 +8509,25 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 		_logQueue.clear();
 	}
 	printLogs(localLogs);
+	return removed;
+}
+
+size_t RequestsHandler::forgetLearnedDevices()
+{
+	std::vector<std::pair<bool, std::string>> localLogs;
+	size_t removed = 0;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		removed = _registrar.forgetLearned();
+		applyDeviceChange(_registrar.consumeDevicesChange());
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+	for (const auto& log : localLogs)
+	{
+		if (log.first) std::cerr << log.second << '\n';
+		else std::cout << log.second << '\n';
+	}
 	return removed;
 }
 
