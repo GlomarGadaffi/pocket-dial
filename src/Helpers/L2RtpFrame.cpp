@@ -135,7 +135,9 @@ bool EgressChannel::updateAddressing(const sockaddr_in& dest, uint16_t srcPort, 
 		return false;
 	}
 
-	if (!ready || (++resolveTicks % 250u) == 0u)
+	// The pinned helper decides the cadence (L2EgressChannel_test); `!ready ||`
+	// first keeps the counter frozen while unresolved, exactly as before.
+	if (!ready || shouldResolveArp(ready, ++resolveTicks))
 	{
 		uint32_t destIpHost = ntohl(dest.sin_addr.s_addr);
 		uint32_t nextHopHost = resolveNextHop(destIpHost, localIp, localGw, localNetmask);
