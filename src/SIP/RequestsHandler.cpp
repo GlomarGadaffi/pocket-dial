@@ -1481,9 +1481,9 @@ void RequestsHandler::addCapabilityHeaders(SipMessage& response) const
 	response.setHeaderOnce("Supported", kSupportedOptionTags);
 	response.setHeaderOnce("Accept", kAcceptedBodyTypes);
 	// RFC 6665 §4.4.1: a UA that accepts SUBSCRIBE advertises its packages.
-	// BlfSubscriptions::onSubscribe() implements exactly one, the RFC 4235
-	// "dialog" package, and 489s anything else (BlfSubscriptions.cpp:145-154).
-	response.setHeaderOnce("Allow-Events", "dialog");
+	// BlfSubscriptions::onSubscribe() implements RFC 4235 "dialog" and, when
+	// MWI is built in, RFC 3842 "message-summary"; it 489s anything else.
+	response.setHeaderOnce("Allow-Events", POCKETDIAL_MWI ? "dialog, message-summary" : "dialog");
 }
 
 void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
@@ -3063,6 +3063,7 @@ void RequestsHandler::enqueueVoicemailFlush(int slot)
 		// A dropped (queue-full) message has nothing left for the writer to
 		// drain, so nothing will ever clear this again if it were set here.
 		_vmFlushBusy[slot].store(true, std::memory_order_release);
+		_blf.mwiDeposit(ext);   // MWI: counts only; refresh() NOTIFYs
 	}
 	else
 	{
@@ -3293,6 +3294,8 @@ bool RequestsHandler::handleVoicemailSdJobDone(int slot, const std::string& call
 
 	if (wasListJob)
 	{
+		// MWI: the owner is hearing the mailbox now -- everything listed is old.
+		_blf.mwiListened(_vmSdJob[slot].extension, _vmMessageCounts[slot]);
 		r = _vmMenus[slot].start(_vmMessageCounts[slot]);
 	}
 	else if (wasReadJob)
@@ -3380,6 +3383,7 @@ bool RequestsHandler::dispatchVoicemailMenuCommand(int slot, const std::string& 
 		std::strncpy(job.deleteName, _vmMessageLists[slot][r.deleteIndex].name,
 			sizeof(job.deleteName) - 1);
 		needsJob = true;
+		_blf.mwiDeleted(job.extension);   // a played (so old) message
 	}
 
 	bool hangUp = (r.command == VoicemailMenu::Command::Hangup);
@@ -3525,6 +3529,11 @@ void RequestsHandler::sweepVoicemailLegs(std::chrono::steady_clock::time_point n
 		if (it == _sessions.end()) continue;
 		sendVoicemailBye(callID, it->second);
 	}
+
+	// MWI: deposit/listen/delete above (and a deposit from a forceDisconnect()
+	// since the last packet) only moved counts; NOTIFY the changed mailboxes on
+	// this tick's outbox rather than waiting for the next packet.
+	_blf.refresh();
 }
 
 void RequestsHandler::sendVoicemailBye(const std::string& callID, const std::shared_ptr<Session>& session)

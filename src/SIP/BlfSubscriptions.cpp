@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstring>
 #include <sstream>
 
 #include "IDGen.hpp"
@@ -11,6 +13,15 @@
 #include "SipHeaderUtil.hpp"
 #include "SipMessageTypes.h"
 #include "SipWireUtil.hpp"
+
+namespace
+{
+#if POCKETDIAL_MWI
+	constexpr const char* kAllowEvents = "dialog, message-summary";
+#else
+	constexpr const char* kAllowEvents = "dialog";
+#endif
+}
 
 std::string BlfSubscriptions::parseEventPackage(std::string_view eventHeader)
 {
@@ -101,8 +112,34 @@ std::shared_ptr<SipMessage> BlfSubscriptions::buildDialogNotify(DialogSubscripti
 	const std::string destIpPort = sipwire::addrToIpPort(sub.addr);
 	const std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
 
-	std::string entity = "sip:" + sub.targetAor + "@" + srcIpPort;
-	std::string body = buildDialogInfoXml(entity, sub.version, dialogId, state, direction);
+	std::string body;
+	const char* event = "dialog";
+	const char* contentType = "application/dialog-info+xml";
+#if POCKETDIAL_MWI
+	if (sub.mwi)
+	{
+		// RFC 3842 §5.2 simple-message-summary. Fixed form, bounded buffer:
+		// ext <= 32 (MwiBox::ext) and an IPv4 literal fit with room to spare.
+		unsigned newMsgs = 0, oldMsgs = 0;
+		if (const MwiBox* box = mwiBox(sub.targetAor, false))
+		{
+			newMsgs = box->newMsgs;
+			oldMsgs = box->oldMsgs;
+		}
+		char buf[192];
+		std::snprintf(buf, sizeof(buf),
+			"Messages-Waiting: %s\r\nMessage-Account: sip:%s@%s\r\nVoice-Message: %u/%u (0/0)\r\n",
+			newMsgs ? "yes" : "no", sub.targetAor.c_str(), activeIp.c_str(), newMsgs, oldMsgs);
+		body = buf;
+		event = "message-summary";
+		contentType = "application/simple-message-summary";
+	}
+	else
+#endif
+	{
+		std::string entity = "sip:" + sub.targetAor + "@" + srcIpPort;
+		body = buildDialogInfoXml(entity, sub.version, dialogId, state, direction);
+	}
 
 	int remaining = 0;
 	if (!terminated)
@@ -130,11 +167,11 @@ std::shared_ptr<SipMessage> BlfSubscriptions::buildDialogNotify(DialogSubscripti
 	   << "Call-ID: " << sub.callId << "\r\n"
 	   << "CSeq: " << sub.cseq++ << " NOTIFY\r\n"
 	   << "Max-Forwards: 70\r\n"
-	   << "Event: dialog\r\n"
+	   << "Event: " << event << "\r\n"
 	   << "Subscription-State: " << subState << "\r\n"
 	   << "Contact: <sip:" << sub.targetAor << "@" << srcIpPort << ">\r\n"
 	   << "User-Agent: pocket-dial\r\n"
-	   << "Content-Type: application/dialog-info+xml\r\n"
+	   << "Content-Type: " << contentType << "\r\n"
 	   << "Content-Length: " << body.size() << "\r\n\r\n"
 	   << body;
 
@@ -143,16 +180,18 @@ std::shared_ptr<SipMessage> BlfSubscriptions::buildDialogNotify(DialogSubscripti
 
 void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 {
-	// 1. Event-package gate: only the RFC 4235 "dialog" package is implemented.
+	// 1. Event-package gate: RFC 4235 "dialog", plus RFC 3842 "message-summary"
+	// when MWI is built in.
 	std::string pkg = parseEventPackage(data->getEvent());
-	if (pkg != "dialog")
+	const bool isMwi = POCKETDIAL_MWI && pkg == "message-summary";
+	if (pkg != "dialog" && !isMwi)
 	{
 		auto resp = _env.messageFromPool(data->toString(), data->getSource());
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader(SipMessageTypes::BAD_EVENT);
 		resp->clearBody();
 		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		resp->addHeader("Allow-Events", "dialog");
+		resp->addHeader("Allow-Events", kAllowEvents);
 		_env.enqueue(data->getSource(), std::move(resp));
 		return;
 	}
@@ -193,6 +232,26 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 		return;
 	}
 
+	// MWI: a mailbox's counts belong to its owner. Only a phone registered as
+	// that extension, from this source IP, may watch it -- 403 otherwise.
+	if (isMwi)
+	{
+		auto owner = _env.findRegistered(target);
+		if (data->getFromNumber() != target || !owner
+			|| owner->getAddress().sin_addr.s_addr != data->getSource().sin_addr.s_addr)
+		{
+			auto resp = _env.messageFromPool(data->toString(), data->getSource());
+			if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
+			resp->setHeader("SIP/2.0 403 Forbidden");
+			resp->clearBody();
+			resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			_env.enqueue(data->getSource(), std::move(resp));
+			_env.log("MWI: SUBSCRIBE to mailbox " + target + " refused for "
+				+ std::string(data->getFromNumber()), true);
+			return;
+		}
+	}
+
 	const int expires = _env.requestedExpires(data);
 	// Subscriptions are keyed by the bare Call-ID value (getCallID() hands back
 	// the whole header line). Same guarded helper as everywhere else.
@@ -228,6 +287,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 		sub->watcherFrom = std::string(data->getFrom());
 		sub->subTo       = std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9);
 		sub->targetAor   = target;
+		sub->mwi         = isMwi;
 		_env.log("BLF: new subscription, watcher " + std::string(data->getFromNumber())
 			+ " -> target " + target);
 	}
@@ -253,8 +313,8 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 	sub->deadline   = std::chrono::steady_clock::now() + std::chrono::seconds(expires);
 
 	// 5. Immediate NOTIFY (RFC 6665 §4.2.1.4).
-	std::string dir, dialogId;
-	std::string state = computeDialogState(target, dir, dialogId);
+	std::string state, dir, dialogId;
+	const std::string token = computeToken(*sub, state, dir, dialogId);
 	const bool terminating = (expires == 0);
 	auto notify = buildDialogNotify(*sub, state, dir, dialogId, terminating, "noresource");
 	// Same reasoning as refresh(): only bank lastState if the NOTIFY was actually
@@ -264,7 +324,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 	if (notify)
 	{
 		_env.enqueue(sub->addr, std::move(notify));
-		sub->lastState = state + "|" + dir + "|" + dialogId;
+		sub->lastState = token;
 		sub->version++;
 	}
 
@@ -280,9 +340,8 @@ void BlfSubscriptions::refresh()
 	for (auto& sub : _subscriptions)
 	{
 		if (!sub.used) continue;
-		std::string dir, dialogId;
-		std::string state = computeDialogState(sub.targetAor, dir, dialogId);
-		std::string token = state + "|" + dir + "|" + dialogId;
+		std::string state, dir, dialogId;
+		const std::string token = computeToken(sub, state, dir, dialogId);
 		if (token == sub.lastState) continue;
 		auto notify = buildDialogNotify(sub, state, dir, dialogId, false, "");
 		// Do NOT record lastState if the pool refused: the token is what suppresses
@@ -302,8 +361,8 @@ void BlfSubscriptions::sweepExpired()
 	for (auto& sub : _subscriptions)
 	{
 		if (!sub.used || now < sub.deadline) continue;
-		std::string dir, dialogId;
-		std::string state = computeDialogState(sub.targetAor, dir, dialogId);
+		std::string state, dir, dialogId;
+		computeToken(sub, state, dir, dialogId);
 		auto notify = buildDialogNotify(sub, state, dir, dialogId, true, "timeout");
 		if (!notify)
 		{
@@ -318,3 +377,59 @@ void BlfSubscriptions::sweepExpired()
 		sub = DialogSubscription{};
 	}
 }
+
+std::string BlfSubscriptions::computeToken(const DialogSubscription& sub,
+	std::string& outState, std::string& outDirection, std::string& outDialogId)
+{
+#if POCKETDIAL_MWI
+	if (sub.mwi)
+	{
+		const MwiBox* box = mwiBox(sub.targetAor, false);
+		return box ? std::to_string(box->newMsgs) + "/" + std::to_string(box->oldMsgs) : "0/0";
+	}
+#endif
+	outState = computeDialogState(sub.targetAor, outDirection, outDialogId);
+	return outState + "|" + outDirection + "|" + outDialogId;
+}
+
+#if POCKETDIAL_MWI
+BlfSubscriptions::MwiBox* BlfSubscriptions::mwiBox(std::string_view ext, bool create)
+{
+	if (ext.empty() || ext.size() >= sizeof(MwiBox::ext)) return nullptr;
+	MwiBox* spare = nullptr;
+	for (auto& b : _mwiBoxes)
+	{
+		if (ext == b.ext) return &b;
+		// A free box, or one whose counts are both zero, holds nothing worth keeping.
+		if (!spare && b.newMsgs == 0 && b.oldMsgs == 0) spare = &b;
+	}
+	if (!create) return nullptr;
+	if (!spare)
+	{
+		_env.log("MWI: mailbox table full, counts for " + std::string(ext) + " not kept", true);
+		return nullptr;
+	}
+	*spare = MwiBox{};
+	std::memcpy(spare->ext, ext.data(), ext.size());
+	return spare;
+}
+
+void BlfSubscriptions::mwiDeposit(std::string_view ext)
+{
+	if (MwiBox* b = mwiBox(ext, true); b && b->newMsgs < UINT16_MAX) b->newMsgs++;
+}
+
+void BlfSubscriptions::mwiListened(std::string_view ext, size_t listed)
+{
+	if (MwiBox* b = mwiBox(ext, listed > 0))
+	{
+		b->newMsgs = 0;
+		b->oldMsgs = static_cast<uint16_t>(listed < UINT16_MAX ? listed : UINT16_MAX);
+	}
+}
+
+void BlfSubscriptions::mwiDeleted(std::string_view ext)
+{
+	if (MwiBox* b = mwiBox(ext, false); b && b->oldMsgs > 0) b->oldMsgs--;
+}
+#endif

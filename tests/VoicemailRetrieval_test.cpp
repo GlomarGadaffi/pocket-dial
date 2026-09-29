@@ -494,6 +494,8 @@ namespace
 		const std::string& callId)
 	{
 		const std::string branch = "z9hG4bK" + callId;
+		// (Re-)register the caller: forceDisconnect() below releases its client.
+		handler.handle(makeRegister("811", "192.168.47.21", "reg-" + callId));
 		handler.handle(makeInvite("811", ext, "192.168.47.21", callId, branch));
 		handler.handle(makeBusyReply("811", ext, extIp, callId, branch));
 		auto session = handler.getSession("Call-ID: " + callId);
@@ -537,7 +539,6 @@ TEST(VoicemailMwi, DepositNotifiesYesWithTheNewCount)
 			sent.emplace_back(addr, std::move(msg));
 		});
 	handler.handle(makeRegister("807", "192.168.47.17", "reg-m2"));
-	handler.handle(makeRegister("811", "192.168.47.21", "reg-m2b"));
 	handler.setVoicemail("807", true);
 	handler.handle(makeMwiSubscribe("807", "192.168.47.17", "mwi-e2e-2", 3600));
 	const sockaddr_in phone = addrFor("192.168.47.17");
@@ -564,7 +565,6 @@ TEST(VoicemailMwi, ListeningNotifiesNoAndMovesTheCountToOld)
 			sent.emplace_back(addr, std::move(msg));
 		});
 	handler.handle(makeRegister("808", "192.168.47.18", "reg-m3"));
-	handler.handle(makeRegister("811", "192.168.47.21", "reg-m3b"));
 	handler.setVoicemail("808", true);
 	handler.handle(makeMwiSubscribe("808", "192.168.47.18", "mwi-e2e-3", 3600));
 	const sockaddr_in phone = addrFor("192.168.47.18");
@@ -595,7 +595,6 @@ TEST(VoicemailMwi, UnsubscribeStopsNotifies)
 			sent.emplace_back(addr, std::move(msg));
 		});
 	handler.handle(makeRegister("809", "192.168.47.19", "reg-m4"));
-	handler.handle(makeRegister("811", "192.168.47.21", "reg-m4b"));
 	handler.setVoicemail("809", true);
 	const sockaddr_in phone = addrFor("192.168.47.19");
 	handler.handle(makeMwiSubscribe("809", "192.168.47.19", "mwi-e2e-4", 3600));
