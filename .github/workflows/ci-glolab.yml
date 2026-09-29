@@ -63,6 +63,101 @@ jobs:
           echo "runner: $(uname -srm) as $(id -un)"
           [ "$fail" -eq 0 ] || { echo "::error::Runner isolation check failed; refusing to run repo code on this host."; exit 1; }
 
+      # NETWORK half of the boundary (#493, Phase 1). The checks above say
+      # nothing about reach: on Hyper-V's Default Switch this VM NATs onto the
+      # home LAN. Design target: an internal switch with no NAT, no default
+      # route, egress only through a host-initiated tunnel to a proxy on the
+      # VM's own loopback. Every probe below must FAIL to connect. Because a
+      # probe that cannot connect "passes" everything, a positive control
+      # first proves it CAN connect. Fail closed: a missing python3, an unset
+      # or malformed host address, or any unexpected error fails the job.
+      # Inline on purpose: like the step above it runs before checkout, so no
+      # repo code has run yet. Expect this to FAIL on a VM still on the Default
+      # Switch; that is the exposure it exists to expose.
+      - name: Verify runner network isolation (no LAN, no host, no route)
+        env:
+          # Space-separated host addresses on the runner's switch: the
+          # vEthernet IPv4 and the IPv6 link-local with its zone, e.g.
+          # "fe80::1%eth0". Repo variable; unset fails the job.
+          BIGDOG_HOST_ADDRS: ${{ vars.BIGDOG_HOST_ADDRS }}
+        run: |
+          python3 - <<'PYEOF'
+          import ipaddress, os, socket, sys
+          from concurrent.futures import ThreadPoolExecutor
+
+          LAN = ["192.168.12.1", "192.168.12.110", "192.168.12.145",
+                 "192.168.12.195", "192.168.12.244"]
+          LAN_PORTS = [80, 22, 5060]
+          HOST_PORTS = [22, 135, 139, 445, 3389, 5985, 3128, 8888]
+          DNS_LAN = "192.168.12.195"
+          TIMEOUT = 3.0
+          fail = 0
+
+          def report(ok, msg):
+              global fail
+              print(("ok   " if ok else "FAIL ") + msg)
+              if not ok:
+                  fail = 1
+
+          def connects(host, port):
+              # Refused, unreachable, timed out and unresolvable are all OSError:
+              # all mean "did not connect". Anything else propagates and fails.
+              try:
+                  with socket.create_connection((host, port), timeout=TIMEOUT):
+                      return True
+              except OSError:
+                  return False
+
+          def lines(path):
+              try:
+                  with open(path) as f:
+                      return f.read().splitlines()
+              except FileNotFoundError:
+                  return []
+
+          # Positive control: the probe must be able to connect at all.
+          srv = socket.socket()
+          srv.bind(("127.0.0.1", 0))
+          srv.listen(1)
+          report(connects("127.0.0.1", srv.getsockname()[1]),
+                 "probe control: connects to a local listener")
+          srv.close()
+
+          # No route anywhere: no default route, v4 or v6.
+          v4 = [l for l in lines("/proc/net/route")[1:]
+                if l.split()[1] == "00000000" and l.split()[7] == "00000000"]
+          report(not v4, "no IPv4 default route")
+          v6 = [l for l in lines("/proc/net/ipv6_route")
+                if l.split()[0] == "0" * 32 and l.split()[1] == "00"
+                and l.split()[9] != "lo"]
+          report(not v6, "no IPv6 default route")
+
+          # IPv6: only loopback (scope 10) and link-local (scope 20) addresses.
+          v6_addrs = [l for l in lines("/proc/net/if_inet6") if l.split()[3] not in ("10", "20")]
+          report(not v6_addrs, "no IPv6 address wider than link-local")
+
+          # DNS must not point at the household resolver.
+          for path in ("/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"):
+              hit = [l for l in lines(path) if l.split()[:1] == ["nameserver"] and DNS_LAN in l.split()]
+              report(not hit, path + " does not point at " + DNS_LAN)
+
+          # Reach: LAN devices and the host itself must all refuse or time out.
+          host_addrs = os.environ.get("BIGDOG_HOST_ADDRS", "").split()
+          report(bool(host_addrs), "BIGDOG_HOST_ADDRS is set (cannot prove the host unreachable without it)")
+          for a in host_addrs:
+              ipaddress.ip_address(a.split("%")[0])  # malformed -> ValueError -> job fails
+          targets = ([(h, p) for h in LAN for p in LAN_PORTS]
+                     + [(h, p) for h in host_addrs for p in HOST_PORTS])
+          with ThreadPoolExecutor(max_workers=16) as ex:
+              up = list(ex.map(lambda t: connects(*t), targets))
+          for (h, p), reached in zip(targets, up):
+              report(not reached, "cannot connect to %s:%d" % (h, p))
+
+          if fail:
+              print("::error::Runner network isolation check failed; refusing to run repo code on this host.")
+              sys.exit(1)
+          PYEOF
+
       - name: Checkout Repository
         uses: actions/checkout@v4
 
