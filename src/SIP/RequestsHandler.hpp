@@ -1759,6 +1759,11 @@ private:
 	// the server (UAC for this leg) must complete its own transaction.
 	void ackInboundFinal(const std::shared_ptr<Session>& session, const std::shared_ptr<SipMessage>& data);
 
+	// Issue #746: RFC 3261 §17.1.1.3: ACK a non-2xx final to an INVITE this PBX
+	// forked, hop-by-hop, built from the response itself (its Via is the forked
+	// INVITE's, its To carries the leg's tag). No-op for a non-INVITE CSeq.
+	void ackForwardedFinal(const std::shared_ptr<SipMessage>& data);
+
 	// The handset's 200 OK to one of routeInboundAnchorCall()'s forked INVITEs:
 	// learn its tag + RTP, bring up the media bridge, ACK with our SDP answer
 	// (delayed-offer model), answer the upstream leg, and CANCEL the losing forks.
