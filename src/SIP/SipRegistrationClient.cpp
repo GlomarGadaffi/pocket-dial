@@ -52,29 +52,44 @@ namespace
 		return true;
 	}
 
+	// Case-insensitive find: parameter names and UUID hex both fold case.
+	size_t ifind(std::string_view hay, std::string_view key)
+	{
+		for (size_t i = 0; i + key.size() <= hay.size(); ++i)
+		{
+			size_t j = 0;
+			while (j < key.size() && std::tolower(static_cast<unsigned char>(hay[i + j])) ==
+			                         std::tolower(static_cast<unsigned char>(key[j]))) ++j;
+			if (j == key.size()) return i;
+		}
+		return std::string_view::npos;
+	}
+
 	// Find ";expires=" (case-insensitive) inside one Contact entry and read it.
 	bool expiresParamOf(std::string_view entry, uint32_t& out)
 	{
-		static const std::string_view kKey = ";expires=";
-		for (size_t i = 0; i + kKey.size() <= entry.size(); ++i)
-		{
-			bool hit = true;
-			for (size_t j = 0; j < kKey.size(); ++j)
-			{
-				if (std::tolower(static_cast<unsigned char>(entry[i + j])) != kKey[j])
-				{
-					hit = false;
-					break;
-				}
-			}
-			if (!hit) continue;
+		constexpr std::string_view kKey = ";expires=";
+		const size_t i = ifind(entry, kKey);
+		if (i == std::string_view::npos) return false;
+		size_t v = i + kKey.size();
+		size_t e = v;
+		while (e < entry.size() && std::isdigit(static_cast<unsigned char>(entry[e]))) ++e;
+		return parseUint(entry.substr(v, e - v), SipRegistrationClient::kMaxExpiresSec, out);
+	}
 
-			size_t v = i + kKey.size();
-			size_t e = v;
-			while (e < entry.size() && std::isdigit(static_cast<unsigned char>(entry[e]))) ++e;
-			return parseUint(entry.substr(v, e - v), SipRegistrationClient::kMaxExpiresSec, out);
-		}
-		return false;
+	// #686: is this 2xx Contact entry OUR binding (RFC 3261 §10.2.4)? Its user
+	// part must be ours, and then either its host:port is the one we sent or,
+	// behind a NAT that rewrote host:port, it echoes our +sip.instance.
+	bool isOurBinding(std::string_view entry, std::string_view user,
+	                  std::string_view hostPort, std::string_view instance)
+	{
+		const size_t u = entry.find("sip:");
+		if (u == std::string_view::npos || entry.compare(u + 4, user.size(), user) != 0) return false;
+		const size_t at = u + 4 + user.size();
+		if (at >= entry.size() || entry[at] != '@') return false;
+		const size_t end = entry.find_first_of(";>", at);
+		return entry.compare(at + 1, end - at - 1, hostPort) == 0 ||
+		       ifind(entry, instance) != std::string_view::npos;
 	}
 
 	// Split a Contact header value on the commas that separate BINDINGS, honouring
@@ -155,6 +170,17 @@ bool SipRegistrationClient::configure(const Config& cfg, std::string_view passwo
 	// reconfigure is a new Call-ID rather than a resumed one).
 	// #399: CSPRNG hex into fixed buffers; IDGen would allocate.
 	char id[SipDigest::kCnonceLen + 1];
+	if (_instance[0] == '\0')
+	{
+		// #686: RFC 4122 §4.4 v4 UUID from CSPRNG hex: version nibble 4, variant
+		// 10xx. Drawn once, so a reconfigure keeps it (RFC 5626 §4.1: it names
+		// this UA, not one registration).
+		char hi[SipDigest::kCnonceLen + 1] = {0};
+		SipDigest::makeCnonce(hi);
+		SipDigest::makeCnonce(id);
+		(void)std::snprintf(_instance, sizeof(_instance), "%.8s-%.4s-4%.3s-%c%.3s-%.12s",
+		                    hi, hi + 8, hi + 12, "89ab"[id[15] & 3], id, id + 3);
+	}
 	SipDigest::makeCnonce(id);
 	copyBounded(_callId, sizeof(_callId), id);
 	SipDigest::makeCnonce(id);
@@ -377,7 +403,7 @@ bool SipRegistrationClient::composeRegister(Request& out)
 		"To: <sip:%s@%s>\r\n"
 		"Call-ID: %s\r\n"
 		"CSeq: %u REGISTER\r\n"
-		"Contact: <sip:%s@%s:%u>\r\n"
+		"Contact: <sip:%s@%s:%u>;+sip.instance=\"<urn:uuid:%s>\";reg-id=1\r\n"
 		"Expires: %u\r\n"
 		"%s%s%s%s"
 		"User-Agent: pocket-dial\r\n"
@@ -389,7 +415,7 @@ bool SipRegistrationClient::composeRegister(Request& out)
 		_cfg.aorUser, _cfg.domain,
 		_callId,
 		static_cast<unsigned>(cseq),
-		_cfg.aorUser, _cfg.localIp, static_cast<unsigned>(_cfg.localPort),
+		_cfg.aorUser, _cfg.localIp, static_cast<unsigned>(_cfg.localPort), _instance,
 		static_cast<unsigned>(_requestedExpiresSec),
 		authName ? authName : "", authName ? ": " : "",
 		authName ? _authValue : "", authName ? "\r\n" : "");
@@ -488,72 +514,37 @@ void SipRegistrationClient::onResponse(uint64_t nowMs, const ResponseView& r)
 	// ── 2xx ───────────────────────────────────────────────────────────────────
 	if (r.code >= 200 && r.code < 300)
 	{
-		// Honour what the SERVER granted, never what we asked for. Registrars
-		// routinely shorten the lease, and refreshing on the requested value
-		// means the binding lapses before we ever retry.
-		//
-		// Precedence is RFC 3261 §10.2.4/§10.3 step 8: the granted lease rides on
-		// the ;expires parameter of OUR binding in the Contact list. Only when
-		// there is no such parameter does the Expires header apply.
+		// #686: RFC 3261 §10.2.4 -- a 2xx lists the registrar's current bindings,
+		// and only OUR binding registers us. Engage answers a failed REGISTER
+		// "200 Authorization failure" listing only its own address, so the code
+		// proves nothing, and the reason phrase is never read (§21). Another
+		// binding for the same AOR is somebody else's, lease included.
+		char mine[kMaxIp + 16];
+		std::snprintf(mine, sizeof(mine), "%s:%u", _cfg.localIp,
+		              static_cast<unsigned>(_cfg.localPort));
 		uint32_t granted = 0;
+		bool ours = false;
 		bool haveGranted = false;
-
-		if (!r.contact.empty())
+		forEachContact(r.contact, [&](std::string_view entry) {
+			if (ours || !isOurBinding(entry, _cfg.aorUser, mine, _instance)) return;
+			ours = true;
+			haveGranted = expiresParamOf(entry, granted);
+		});
+		if (!ours)
 		{
-			// Match OUR contact first. An SBC that is holding a second binding for
-			// the same AOR returns both, and taking the first one's lease would
-			// arm our refresh timer off somebody else's registration.
-			char mine[kMaxIp + 16];
-			std::snprintf(mine, sizeof(mine), "%s:%u", _cfg.localIp,
-			              static_cast<unsigned>(_cfg.localPort));
-			const std::string_view mineSv(mine);
-
-			uint32_t firstAny = 0;
-			bool haveAny = false;
-			forEachContact(r.contact, [&](std::string_view entry) {
-				uint32_t v = 0;
-				if (!expiresParamOf(entry, v)) return;
-				if (!haveAny) { firstAny = v; haveAny = true; }
-				if (!haveGranted && entry.find(mineSv) != std::string_view::npos)
-				{
-					granted = v;
-					haveGranted = true;
-				}
-			});
-			if (!haveGranted && haveAny)
-			{
-				// No binding named our transport address (a NAT rewrite, or an SBC
-				// that rewrites Contact). One binding's lease is the best signal
-				// available and is still the SERVER's number, not ours.
-				granted = firstAny;
-				haveGranted = true;
-			}
+			failCycle(nowMs, r.code, "2xx without our binding");
+			return;
 		}
 
-		if (!haveGranted && !r.expires.empty())
+		// The lease is the SERVER's: our binding's ;expires, else the Expires
+		// header (§10.2.4). Never the one we asked for (§10.3 step 8 has the
+		// registrar state it), so a 2xx stating none is a failure.
+		if (!haveGranted && !parseUint(r.expires, kMaxExpiresSec, granted))
 		{
-			uint32_t v = 0;
-			if (parseUint(r.expires, kMaxExpiresSec, v))
-			{
-				granted = v;
-				haveGranted = true;
-			}
+			failCycle(nowMs, r.code, "2xx with no lease");
+			return;
 		}
-
-		if (!haveGranted)
-		{
-			// Neither form present. RFC 3261 §10.3 says the registrar MUST add the
-			// expires parameter, but real stacks omit it; the binding then holds
-			// for what we asked. Treated as granted-equals-requested, and named in
-			// lastError so an operator can see WHY the refresh timer is what it is
-			// without it being a failure.
-			granted = _requestedExpiresSec;
-			setError("registrar returned no Expires; assuming the requested lease");
-		}
-		else
-		{
-			_lastError[0] = '\0';
-		}
+		_lastError[0] = '\0';
 
 		if (granted == 0)
 		{
