@@ -2085,7 +2085,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		okResponse->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		okResponse->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		okResponse->setContact(buildContact("777"));
-		pbx::answerSessionTimer(*okResponse, *data);   // #198
+		pbx::answerSessionTimer(*okResponse, *data, /*grant=*/false);   // #198: re-INVITE gets 488
 		// The echo answer is the CALLER'S OWN offer handed back, so it must obey
 		// RFC 3264 §6.1: an answer reuses the offer's payload-type numbers and may
 		// only narrow the list. enforceG711() pinned the m= line to a literal
@@ -9550,7 +9550,7 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 	// buildOkWithSdp() mints a fresh tag for a first answer; calling it here
 	// would append a second tag onto the one already present.
 	addCapabilityHeaders(*ok);
-	pbx::answerSessionTimer(*ok, *data);   // #198
+	pbx::answerSessionTimer(*ok, *data, /*grant=*/true);   // #198: this IS the re-INVITE's 200
 	const std::string sdpBody = buildMediaSdp(_localIp, bridge->receiverPort(),
 		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
 	ok->clearBody();
@@ -9746,7 +9746,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		resp->setHeader(SipMessageTypes::OK);
 		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		resp->setContact(buildContact(data->getToNumber()));
-		pbx::answerSessionTimer(*resp, *data);   // #198
+		pbx::answerSessionTimer(*resp, *data, /*grant=*/true);   // #198: a local UPDATE answer
 		resp->clearBody();
 		resp->syncContentLength();
 		_outbox.emplace_back(data->getSource(), std::move(resp));
@@ -10284,7 +10284,8 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	// (RFC 3311 §5.1). Added BEFORE the body work below so the header block is
 	// final when Content-Type/Content-Length are recomputed off the raw string.
 	addCapabilityHeaders(*ok);
-	pbx::answerSessionTimer(*ok, *inviteMsg);   // #198
+	// #198: 888 has no re-INVITE answer (onReinvite: 488), so it gets no timer.
+	pbx::answerSessionTimer(*ok, *inviteMsg, /*grant=*/inviteMsg->getToNumber() != ConferenceRoom::EXT);
 	ok->clearBody();
 	{
 		std::string raw = ok->toString();
@@ -10913,7 +10914,7 @@ void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 	resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 	resp->setTo(std::string(invite->getTo()) + ";tag=" + session->getLocalTag());
 	resp->setContact(buildContact(std::string(invite->getToNumber())));
-	pbx::answerSessionTimer(*resp, *invite);   // #198
+	pbx::answerSessionTimer(*resp, *invite, /*grant=*/false);   // #198: trunk re-INVITE gets 488 (911 leg)
 	resp->setBody(sdpBody);   // resyncs Content-Length itself
 	_outbox.emplace_back(invite->getSource(), std::move(resp));
 

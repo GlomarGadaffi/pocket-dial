@@ -691,8 +691,13 @@ TEST(SessionTimer, ExpiryDrivenByTickByesEachLegExactlyOnce)
 // change it echoed the phone's own `Session-Expires: 1800` back with no
 // refresher parameter. RFC 4028 §9 requires one on any 2xx that carries the
 // header, and without it nobody is named to refresh. The PBX never sends a
-// refresh, so the only honest answer is refresher=uac (the phone refreshes,
-// and the PBX answers it), with the `Require: timer` §9 makes mandatory.
+// refresh, so the only timer it can grant is refresher=uac (the phone
+// refreshes, and the PBX answers it), with the `Require: timer` §9 makes
+// mandatory -- and only on a leg whose refresh the PBX answers with a 2xx:
+// 555 (answerAnchorReinvite) and a local UPDATE. On 777, 888, park and the
+// trunk handset leg the refresh draws 488 or 481, and §10 says only a 2xx
+// extends the session, so a granted timer there makes the phone BYE the call
+// at expiry (a 911 trunk call included). Those answers carry no timer (§7.2).
 
 namespace
 {
@@ -747,6 +752,17 @@ namespace
 			<< what << ": RFC 4028 §9 requires Require: timer with refresher=uac\n" << ok;
 	}
 
+	// No Session-Expires (full or compact) and no Require: RFC 4028 §7.2's "no
+	// session expiration". The caller checks the answer itself as positive control.
+	void expectNoTimer(const std::string& ok, const std::string& what)
+	{
+		ASSERT_FALSE(ok.empty()) << what << ": the PBX sent no 200 OK";
+		EXPECT_EQ(linesNamed(ok, "Session-Expires"), 0)
+			<< what << ": the PBX answers this leg's refresh with no 2xx, so a timer here ends the call (RFC 4028 §10)\n" << ok;
+		EXPECT_EQ(linesNamed(ok, "x"), 0) << what << ": the phone's own compact line must not survive\n" << ok;
+		EXPECT_EQ(linesNamed(ok, "Require"), 0) << what << ": no timer, so no Require: timer\n" << ok;
+	}
+
 	struct Rig
 	{
 		Sent sent;
@@ -756,20 +772,31 @@ namespace
 	};
 }
 
-TEST(SessionTimer, The777AnswerNamesThePhoneAsRefresher)
+// onReinvite() answers a 777 re-INVITE 488, so the 777 answer grants no timer.
+TEST(SessionTimer, The777AnswerCarriesNoTimerBecauseItsRefreshIsRefused)
 {
 	Rig r;
 	r.handler.handle(timerRequest("INVITE", "100", kCaller, "777", "se-777", kTimerOffer));
-	expectPhoneRefreshes(okTo(r.sent, kCaller, "1 INVITE"), "777 answer");
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(ok, "777 answer");
+	// Positive control: it is 777's own answer that was inspected.
+	EXPECT_NE(headerValue(ok, "Contact").find("sip:777@"), std::string::npos) << ok;
 }
 
-TEST(SessionTimer, TheConferenceAnswerNamesThePhoneAsRefresher)
+// Same for 888: buildOkWithSdp() must not grant on the conference leg, while
+// still granting on 555 (the anchor test below is the positive control).
+TEST(SessionTimer, TheConferenceAnswerCarriesNoTimerBecauseItsRefreshIsRefused)
 {
 	Rig r;
 	r.handler.handle(timerRequest("INVITE", "100", kCaller, "888", "se-888", kTimerOffer));
-	expectPhoneRefreshes(okTo(r.sent, kCaller, "1 INVITE"), "888 answer");
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(ok, "888 answer");
+	EXPECT_NE(headerValue(ok, "Contact").find("sip:888@"), std::string::npos) << ok;
 }
 
+// Positive control for the grant: 555 answers its own re-INVITE with a 200
+// (answerAnchorReinvite), so its answer, built by the same buildOkWithSdp()
+// as 888's, does name the phone as refresher.
 TEST(SessionTimer, TheAnchorAnswerAndItsReinviteAnswerNameThePhoneAsRefresher)
 {
 	Rig r;
@@ -783,16 +810,24 @@ TEST(SessionTimer, TheAnchorAnswerAndItsReinviteAnswerNameThePhoneAsRefresher)
 	expectPhoneRefreshes(okTo(r.sent, kCaller, "2 INVITE"), "555 re-INVITE answer");
 }
 
-TEST(SessionTimer, TheParkAndRetrieveAnswersNameThePhoneAsRefresher)
+// A park-leg UPDATE refresh is relayed back to the caller (#709) and draws
+// 481, so neither park answer grants a timer.
+TEST(SessionTimer, TheParkAndRetrieveAnswersCarryNoTimerBecauseTheirRefreshIsRefused)
 {
 	Rig r;
 	r.handler.handle(timerRequest("INVITE", "100", kCaller, "700", "se-park", kTimerOffer));
-	expectPhoneRefreshes(okTo(r.sent, kCaller, "1 INVITE"), "park answer");
+	const std::string parked = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(parked, "park answer");
+	EXPECT_NE(headerValue(parked, "Contact").find("sip:700@"), std::string::npos) << parked;
 
 	r.handler.handle(timerRequest("INVITE", "106", kOther, "700", "se-retrieve", kTimerOffer));
-	expectPhoneRefreshes(okTo(r.sent, kOther, "1 INVITE"), "retrieve answer");
+	const std::string retrieved = okTo(r.sent, kOther, "1 INVITE");
+	expectNoTimer(retrieved, "retrieve answer");
+	EXPECT_NE(headerValue(retrieved, "Contact").find("sip:700@"), std::string::npos) << retrieved;
 }
 
+// Positive control for the local UPDATE path: the PBX answers that UPDATE
+// itself with a 200, so it may name the phone as refresher.
 TEST(SessionTimer, TheLocalRefreshAnswerNamesThePhoneAsRefresher)
 {
 	Rig r;
@@ -809,7 +844,7 @@ TEST(SessionTimer, TheLocalRefreshAnswerNamesThePhoneAsRefresher)
 TEST(SessionTimer, ACompactSessionExpiresIsAnsweredOnceInFullForm)
 {
 	Rig r;
-	r.handler.handle(timerRequest("INVITE", "100", kCaller, "777", "se-compact", "k: timer\r\nx: 1800\r\n"));
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "555", "se-compact", "k: timer\r\nx: 1800\r\n"));
 	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
 	expectPhoneRefreshes(ok, "compact-form offer");
 	EXPECT_EQ(linesNamed(ok, "x"), 0) << "the phone's own compact line must not survive beside ours\n" << ok;

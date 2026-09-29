@@ -347,10 +347,12 @@ TEST(TrunkWiring, TheCarrierAnswerIsAckedAndTheHandsetGetsATwoWaySdpAnswer)
 		<< "both halves of the pair are live once the call is up";
 }
 
-// #198: the handset's 200 is the PBX's own answer, so RFC 4028 §9 applies to
-// it: a Session-Expires it carries must name the handset as refresher (the PBX
-// never refreshes, and answers the handset's refresh UPDATE itself).
-TEST(TrunkWiring, TheHandsetAnswerNamesTheHandsetAsSessionRefresher)
+// #198: the handset's 200 is the PBX's own answer, so RFC 4028 applies to it.
+// The PBX never refreshes, and onReinvite() answers a trunk-leg re-INVITE 488,
+// so a timer it granted here would end the call at expiry (§10: only a 2xx
+// extends the session) -- on a 911 call too. The answer carries no
+// Session-Expires and no Require at all instead (§7.2: no expiration).
+TEST(TrunkWiring, TheHandsetAnswerCarriesNoSessionTimer)
 {
 	Bench b;
 	b.handler.setTrunkConfig(trunkConfig());
@@ -364,8 +366,12 @@ TEST(TrunkWiring, TheHandsetAnswerNamesTheHandsetAsSessionRefresher)
 
 	const std::string ok = b.firstWith("200 OK");
 	ASSERT_FALSE(ok.empty()) << "the handset was never answered";
-	EXPECT_NE(ok.find("\r\nSession-Expires: 1800;refresher=uac\r\n"), std::string::npos) << ok;
-	EXPECT_NE(ok.find("\r\nRequire: timer\r\n"), std::string::npos) << ok;
+	// Positive control: this is the handset's two-way SDP answer.
+	EXPECT_NE(ok.find("a=sendrecv"), std::string::npos) << ok;
+	EXPECT_EQ(ok.find("\r\nSession-Expires:"), std::string::npos)
+		<< "a timer the PBX cannot service (re-INVITE refresh: 488) ends the call at expiry\n" << ok;
+	EXPECT_EQ(ok.find("\r\nx:"), std::string::npos) << ok;
+	EXPECT_EQ(ok.find("\r\nRequire:"), std::string::npos) << ok;
 }
 
 TEST(TrunkWiring, AnAnswerWithNoUsableMediaHangsTheCarrierUpRatherThanConnectSilence)
