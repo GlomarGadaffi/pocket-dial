@@ -207,7 +207,7 @@ TEST(CapabilityHeaders, RegisterOkAdvertisesWhatThisPbxActuallyHandles)
 		<< "RFC 3891 §4: without this a phone will not offer a Replaces-based "
 		   "attended transfer via REFER (not INVITE-Replaces / BLF pickup -- #229)";
 	EXPECT_NE(headerValue(ok, "Accept").find("application/sdp"), std::string::npos);
-	EXPECT_EQ(headerValue(ok, "Allow-Events"), "dialog");
+	EXPECT_EQ(headerValue(ok, "Allow-Events"), "dialog, message-summary");   // RFC 3842 MWI
 }
 
 TEST(CapabilityHeaders, TimerIsStillNotClaimedOnTheRegistrarPath)

@@ -287,7 +287,9 @@ if(SIP_CONSTRAINED)
         # #483/#689: the 4 MB app slot is full at -Og, so the config backup's
         # trunk/SMTP/E911/admin_ext section is compiled out here; an import
         # that carries it says so under "skipped".
-        POCKETDIAL_BACKUP_SECTION_C=0)
+        POCKETDIAL_BACKUP_SECTION_C=0
+        # MWI (RFC 3842) compiled out: the slot is tight; message-summary 489s.
+        POCKETDIAL_MWI=0)
     # #416: the pcap ring is fixed storage (ring x ~2.1 KB), and a constrained build
     # has no PSRAM (sdkconfig.defaults.esp32_constrained: CONFIG_SPIRAM=n), so all of
     # it is internal DRAM. 4 slots ~= 8.4 KB instead of 16 ~= 33.7 KB. Set as a CMake
@@ -296,7 +298,7 @@ if(SIP_CONSTRAINED)
     if(NOT DEFINED POCKETDIAL_PCAP_RING_SIZE)
         set(POCKETDIAL_PCAP_RING_SIZE 4)
     endif()
-    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 conference=off rtpslots=3x3KBtx+4x6KBrx+1x6KBanchor=39KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
+    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 conference=off mwi=off rtpslots=3x3KBtx+4x6KBrx+1x6KBanchor=39KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
 endif()
 
 # PcapCapture.hpp has always advertised itself as "compile-time tunable
