@@ -1,5 +1,5 @@
 {
- "_comment": "#457. One entry per task-creation site (xTaskCreate* incl. Static/WithCaps, pd::createTaskPreferPsram, std::thread/jthread) in src/ and main/; task_stack_gate.py fails when a file's site count differs from its entry count. 'entry' is a regex over the call-graph function name, and the worst match is budgeted. 'line' is a reference only. entry=null marks a site that is counted but not walked. 'variants' lists the esp_main files whose image links a row's code, when that is not every image; other images skip the row.",
+ "_comment": "#457. One entry per task-creation site (xTaskCreate* incl. Static/WithCaps, pd::createTaskPreferPsram, std::thread/jthread) in src/ and main/; task_stack_gate.py fails when a file's site count differs from its entry count. 'entry' is a regex over the call-graph function name, and the worst match is budgeted. 'line' is a reference only. entry=null marks a site that is counted but not walked. 'variants' lists the esp_main files whose image links a row's code, when that is not every image; other images skip the row. 'only' names a Kconfig build feature (heap_trace) the site is compiled in; the entry is walked only when the gate gets --with <feature>, and must then be found.",
  "margin_bytes": 512,
  "frame_ceiling_bytes": 1024,
  "_frame_allowlist": "substring of a function's name -> reason. It lifts only the per-frame checks (ceiling, dynamic frame, library callee with no frame); the frame still counts in every chain budget. Bytes are Xtensa, from the #457 run on #685 @ ebdc919.",
@@ -55,7 +55,7 @@
   {"name": "tel_wsw", "entry": "wsWorkerTrampoline\\(", "bytes": 12288, "file": "src/SIP/TelephonyAnchorClient.cpp", "line": 2215},
   {"name": "tel_media_rx", "entry": "TelephonyAnchorClient::rxTaskTrampoline\\(", "bytes": 6144, "file": "src/SIP/TelephonyAnchorClient.cpp", "line": 2897, "note": "#479: xTaskCreateStaticPinnedToCore on the call slot's boot-allocated PSRAM stack (CallSlot::rxMem)"},
   {"name": "trunk_dns", "entry": "TrunkResolver::workerEntry\\(", "bytes": 4096, "file": "src/SIP/TrunkResolver.cpp", "line": 297},
-  {"name": "heap_probe", "entry": "\\bheapProbeTask\\(", "bytes": 8192, "file": "main/HeapLeakProbe.cpp", "line": 843},
+  {"name": "heap_probe", "entry": "\\bheapProbeTask\\(", "bytes": 8192, "file": "main/HeapLeakProbe.cpp", "line": 843, "only": "heap_trace", "note": "#if CONFIG_HEAP_TRACING (HeapLeakProbe.cpp:56), set only by sdkconfig.defaults.heap_trace (main/CMakeLists.txt:96-98)"},
   {"name": "log_drain", "entry": "\\blog_drain_task\\(", "bytes": 3072, "file": "main/esp_main.cpp", "line": 414},
   {"name": "http_server_task", "entry": "\\bhttp_server_task\\(", "bytes": 8192, "file": "main/esp_main.cpp", "line": 493},
   {"name": "sip_server_task", "entry": "\\bsip_server_task\\(", "bytes": 8192, "file": "main/esp_main.cpp", "line": 527},

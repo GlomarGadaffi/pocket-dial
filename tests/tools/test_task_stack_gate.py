@@ -59,12 +59,12 @@ class Gate(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_gate(self, main="main/esp_main_eth.cpp"):
+    def run_gate(self, main="main/esp_main_eth.cpp", features=()):
         p = os.path.join(self.tmp.name, "t.json")
         json.dump(self.table, open(p, "w"))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = g.run(self.ci, p, self.tmp.name, main)
+            rc = g.run(self.ci, p, self.tmp.name, main, features)
         return rc, out.getvalue()
 
     def test_under_budget_passes_and_names_the_chain(self):
@@ -197,6 +197,22 @@ class Gate(unittest.TestCase):
         rc, out = self.run_gate(main="main/esp_main_display.cpp")   # walked on its own image
         self.assertEqual(rc, 1)
         self.assertIn("FAIL dns: entry '\\bdns_task\\(' not in call graph", out)
+
+    def test_only_entry_is_skipped_unless_its_build_feature_is_given(self):
+        # heapProbeTask exists only under CONFIG_HEAP_TRACING; a shipping .ci has no such node.
+        self.table["tasks"][1]["only"] = "heap_trace"
+        self.table["tasks"][1]["entry"] = r"\bheap_trace_only_task\("   # not in this graph
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("skip big: only in a 'heap_trace' build", out)
+        rc, out = self.run_gate(features=("heap_trace",))
+        self.assertEqual(rc, 1, "given --with heap_trace, the entry must be found (fails closed)")
+        self.assertIn("FAIL big: entry", out)
+
+    def test_checked_in_heap_probe_is_gated_on_heap_trace(self):
+        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        probe = [t for t in table["tasks"] if t["file"] == "main/HeapLeakProbe.cpp"]
+        self.assertEqual([t.get("only") for t in probe], ["heap_trace"])
 
     def test_checked_in_entries_match_gcc_labels(self):
         # A GCC .ci label starts with the return type, so ^name never matches.
