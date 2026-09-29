@@ -197,8 +197,10 @@ samples the 8 heap fields + 5 `stackHwm_*` fields from `/api/status`, optionally
 a test-dial call every M minutes, and writes a CSV. Verdict is a slope test on internal
 `free` and `largest` against an idle baseline. The #328 confirmation (largest
 27628 → 1132 in 13 idle minutes) was this by hand; it becomes a number the crew can
-quote. Profiles matter: `heap_trace` builds are for the #331 periodic dump, and only a
-`default` build is a valid target for the #328/#330 zero-alloc proof.
+quote. Profiles matter: `heap_trace` builds are for the #331 periodic dump (but no boot
+of that build has reached t=360 s yet, #374, so its 360/900 s and periodic dumps are
+unreachable today), and only a `default` build is a valid target for the #328/#330
+zero-alloc proof.
 
 ### 5.6 `anchor` (3CX Call Control, bench only)
 
