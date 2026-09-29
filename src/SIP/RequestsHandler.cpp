@@ -3917,6 +3917,58 @@ bool RequestsHandler::allBridgesBusy() const
 	return activeAnchorCalls() >= anchorCallLimit();
 }
 
+void RequestsHandler::preemptAnchorCallForEmergency()
+{
+	// #624 (desmo's decision): a 911/933 that finds the anchor full ends one
+	// NON-emergency anchored call and takes its room. Full counts ringing legs
+	// too: one holds the provider's call slot but no bridge (#667's ringing
+	// grace). When the bridges are the blocker, the call taken must hold one.
+	// Another emergency call is never taken; the busy 503 stands instead.
+	const bool needBridge = allBridgesBusy();
+	unsigned legs = 0;
+	std::string victimId;
+	for (const auto& [id, s] : _sessions)
+	{
+		if (!s->isAnchor() || s->getState() == Session::State::Bye) continue;
+		++legs;
+		if (!victimId.empty() || s->isEmergency()) continue;
+		bool hasBridge = false;
+		for (const auto& b : _mediaBridges) hasBridge = hasBridge || b.isForCallId(id);
+		if (!needBridge || hasBridge) victimId = id;
+	}
+	if (victimId.empty() || (!needBridge && legs < anchorCallLimit())) return;
+
+	// Tell its caller the way each teardown path already does: a 503 or a
+	// CANCEL while it still rings, else a BYE (the #604 sweep's shape). endCall()
+	// then drops the anchor leg and frees the bridge.
+	const auto victim = _sessions.find(victimId)->second;
+	const bool inbound = victim->isAnchorInbound();
+	const auto handset = inbound ? victim->getDest() : victim->getSrc();
+	const std::string& dFrom = victim->getDialogFrom();
+	const std::string& dTo = victim->getDialogTo();
+	if (victim->getState() == Session::State::Invited)
+	{
+		if (!inbound) refuseRingingAnchor(victimId, _outbox);
+		else for (const auto& t : victim->getPendingTargets())
+		{
+			if (auto c = buildInboundCancelTo(victim, t)) _outbox.emplace_back(t->getAddress(), std::move(c));
+		}
+	}
+	else if (handset && !dFrom.empty() && !dTo.empty())
+	{
+		const uint32_t cseq = victim->nextServerCSeq();
+		auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), victimId,
+			inbound ? dFrom : dTo, inbound ? dTo : dFrom, cseq);
+		if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
+		victim->noteServerCSeq(cseq);
+	}
+	queueLog("EMERGENCY: pre-empted anchored call " + victimId, true);
+	const std::string handsetNum = handset ? handset->getNumber() : std::string();
+	const std::string farNum = victim->getAnchorParticipantId();
+	if (inbound) endCall(victimId, farNum, handsetNum, "pre-empted by 911");
+	else         endCall(victimId, handsetNum, farNum, "pre-empted by 911");
+}
+
 bool RequestsHandler::anchorIsSynchronous() const
 {
 	return _anchorBootType == TelephonyProviderType::Loopback;
@@ -4176,7 +4228,8 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// rule-produced emergency number to routeEmergencyCall() (#538 review M2),
 	// and no client can be named like one (#550), so 555's own-number dial
 	// cannot produce one either. Pinned by a test that forces the #550 state.
-	if (!_anchorPlacesRealCalls && pbx::classifyEmergencyDial(destination).isEmergency)
+	const bool emergency = pbx::classifyEmergencyDial(destination).isEmergency;
+	if (!_anchorPlacesRealCalls && emergency)
 	{
 		refuse("SIP/2.0 503 Emergency Call Not Routable",
 			"loopback test provider refused an emergency number");
@@ -4240,6 +4293,8 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in INVITE");
 		return true;
 	}
+
+	if (emergency) preemptAnchorCallForEmergency();   // #624: no-op unless the anchor is full
 
 	if (anchorIsSynchronous())
 	{
