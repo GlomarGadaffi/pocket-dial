@@ -33,6 +33,9 @@ cycle was cut is never cached, so PYTHONHASHSEED can't change the report.
 
 Usage:
   python3 tools/ci/task_stack_gate.py --ci-dir DIR [--table FILE] [--src-root DIR]
+
+DIR is walked recursively. Point it at build/esp-idf, not build/, which also
+holds the bootloader's .ci files.
 """
 
 import argparse
@@ -145,7 +148,9 @@ def run(ci_dir, table_path, src_root, main_variant):
     memo, seen = {}, set()
     for t in sorted(tasks, key=lambda t: (t["name"], t["file"], t["line"])):
         # One image links one esp_main variant; the others' tasks aren't in it.
-        if t["entry"] is None or (MAIN_VARIANT_RE.match(t["file"]) and t["file"] != main_variant):
+        # "variants" names the images a row's code is linked into, when not all.
+        variants = t.get("variants") or ([t["file"]] if MAIN_VARIANT_RE.match(t["file"]) else None)
+        if t["entry"] is None or (variants and main_variant not in variants):
             continue
         hits = find_entry(nodes, t["entry"])
         if not hits:
@@ -176,7 +181,7 @@ def run(ci_dir, table_path, src_root, main_variant):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ci-dir", required=True, help="directory of .ci files from -fcallgraph-info=su")
+    ap.add_argument("--ci-dir", required=True, help="tree of .ci files from -fcallgraph-info=su, walked recursively (build/esp-idf)")
     ap.add_argument("--table", default=os.path.join(REPO, "tools", "ci", "task_stacks.json"))
     ap.add_argument("--src-root", default=REPO, help="tree whose src/ and main/ are scanned for task sites")
     ap.add_argument("--main", default="main/esp_main_eth.cpp",

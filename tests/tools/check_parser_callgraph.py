@@ -89,15 +89,21 @@ def compile_tus(tus, outdir):
 
 
 def load_graph(outdir):
+    """Every .ci under outdir, recursively (IDF nests them per component, #457).
+    A title with frames in several TUs (a header-defined function) is charged
+    its worst one, non-static first, so walk order can't lower a frame."""
     nodes, edges, frames = {}, collections.defaultdict(set), {}
-    for ci in glob.glob(os.path.join(outdir, "*.ci")):
+    for ci in sorted(glob.glob(os.path.join(outdir, "**", "*.ci"), recursive=True)):
         txt = open(ci, encoding="utf-8", errors="ignore").read()
         for m in NODE_RE.finditer(txt):
             title, label = m.group(1), m.group(2)
             nodes[title] = label
             s = SU_RE.search(label)
             if s:
-                frames[title] = (int(s.group(1)), s.group(2))
+                f = (int(s.group(1)), s.group(2))
+                old = frames.get(title, (-1, "static"))
+                if (f[1] != "static", f[0]) > (old[1] != "static", old[0]):
+                    frames[title] = f
         for m in EDGE_RE.finditer(txt):
             edges[m.group(1)].add(m.group(2))
     return nodes, edges, frames
