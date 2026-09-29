@@ -452,6 +452,72 @@ TEST(TrunkWiring, AnExpiredLeaseMidCallByesTheCarrierAndReleasesTheRelay)
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and its relay pair released";
 }
 
+TEST(TrunkWiring, AnExpiredLeaseNeverEndsAnEmergencyCall)
+{
+	// #712 (desmo): a lapsed registration is bookkeeping; hanging up a 911 over
+	// it is not. The client is kept until the emergency call ends, then pruned
+	// by the next sweep as usual (the control half of this test).
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-712-lease"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the 911 is up";
+	b.sent.clear();
+
+	b.handler.expireLeaseAndSweepForTest("1001");
+
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the lease sweep hung up the PSAP";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "or the 911 caller";
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-712-lease").has_value()) << "the 911 session is kept";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "with its media";
+
+	// Control: once the 911 has ended, the same expired client is pruned.
+	b.handler.handle(RequestsHandler::getMessageFromPool(e911.bye(), addrFor(kSbcIp)));
+	ASSERT_FALSE(b.handler.getSession("Call-ID: call-712-lease").has_value()) << "precondition: the 911 ended";
+	b.handler.expireLeaseAndSweepForTest("1001");
+	b.handler.forceNextTickForTest();   // getActiveClients() reads the tick snapshot
+	b.handler.tick();
+	bool still1001 = false;
+	for (const auto& [number, address] : b.handler.getActiveClients())
+	{
+		(void)address;
+		if (number == "1001") still1001 = true;
+	}
+	EXPECT_FALSE(still1001) << "the expired client is pruned once no emergency call holds it";
+}
+
+TEST(TrunkWiring, ARingingEmergencyCallIsNeverTimedOutButASilentOneStillIs)
+{
+	// #712 (desmo): a 911/933 the carrier is working on (a 100 or 180 seen,
+	// Proceeding) gets no PBX-side no-answer bound; a PSAP may queue it past
+	// 60 s. One that never drew any provisional (Trying) keeps the 60 s
+	// deadline, because Timer B only logs: that half is the control, proving
+	// the sweep did run on this tick.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-712-ring"));
+	const auto ringing = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(ringing.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		ringing.response("SIP/2.0 180 Ringing", false), addrFor(kSbcIp)));
+	b.handler.handle(makeTrunkDial("1001", "933", "call-712-silent", 40002));
+	ASSERT_FALSE(b.firstWith("INVITE sip:933").empty()) << "precondition: 933 went to the trunk";
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 2u) << "precondition: both are placed";
+	b.sent.clear();
+
+	b.handler.expireTrunkDeadlinesForTest();
+	b.handler.tick();
+
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-712-ring").has_value())
+		<< "a ringing 911 was timed out by the PBX";
+	EXPECT_FALSE(b.handler.getSession("Call-ID: call-712-silent").has_value())
+		<< "control: a 933 that never drew a provisional still times out";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "only the silent leg's relay is released";
+}
+
 TEST(TrunkWiring, TheCarrierHangingUpByesTheHandsetAndReleasesTheRelay)
 {
 	Bench b;

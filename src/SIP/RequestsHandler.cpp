@@ -147,7 +147,9 @@ namespace
 	// reconcile watchdog tears down only legs that have VANISHED from the DN, so
 	// a stuck-but-present leg would otherwise pin the single
 	// POCKETDIAL_MAX_ANCHOR_CALLS slot forever. 60 s clears carrier voicemail with
-	// margin while bounding that worst case; do not make it unbounded, and do not
+	// margin while bounding that worst case; do not make it unbounded (the one
+	// exception is a ringing 911/933, #712: desmo's decision, the caller's own
+	// CANCEL ends it), and do not
 	// re-arm it on provider progress events (the provider reports our own control
 	// leg's state, which sits at "Dialing" right through far-end alerting — there
 	// is no alerting signal to key off).
@@ -7542,6 +7544,23 @@ void RequestsHandler::sweepExpired()
 
 		if (keepAliveTimedOut || leaseExpired)
 		{
+			// #712 (desmo, 2026-09-29): a lapsed lease never ends a 911/933. Skip the
+			// client, before any log line or allocation (this runs at 1 Hz for the
+			// whole call), until its emergency call has ended; the next sweep after
+			// that prunes it as usual.
+			bool emergencyLive = false;
+			for (const auto& [cid, s] : _sessions)
+			{
+				if (s->isEmergency() &&
+				    ((s->getSrc() && s->getSrc()->getNumber() == client->getNumber()) ||
+				     (s->getDest() && s->getDest()->getNumber() == client->getNumber())))
+				{
+					emergencyLive = true;
+					break;
+				}
+			}
+			if (emergencyLive) continue;
+
 			if (keepAliveTimedOut)
 			{
 				queueLog("Pruning client due to missed OPTIONS keepalive pings: " + client->getNumber());
@@ -8659,7 +8678,12 @@ void RequestsHandler::tick()
 			const bool connectedAbandonedAnchor =
 				session->getState() == Session::State::Connected &&
 				session->isAnchor() && !session->isAnchorInbound();
-			if (session->isRingExpired(now) &&
+			// #712 (desmo, 2026-09-29): a 911/933 that is still ringing gets no
+			// PBX-side no-answer bound; a PSAP may queue it past 60 s. The far
+			// end's own transaction timers bound a leg that never answers at all.
+			const bool ringingEmergency =
+				session->getState() == Session::State::Invited && session->isEmergency();
+			if (session->isRingExpired(now) && !ringingEmergency &&
 			    (session->getState() == Session::State::Invited || connectedAbandonedAnchor))
 			{
 				expiredCallIds.push_back(callID);
