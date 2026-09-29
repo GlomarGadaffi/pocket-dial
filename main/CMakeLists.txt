@@ -287,6 +287,9 @@ if(SIP_CONSTRAINED)
         POCKETDIAL_BACKUP_SECTION_C=0)
         # MWI (RFC 3842) compiled out: the slot is tight; message-summary 489s.
         POCKETDIAL_MWI=0)
+        # #689: the 4 MB app slot is full at -Og, so the #618 trunk wire dump
+        # (full INVITE + REGISTER response) is compiled out here.
+        POCKETDIAL_TRUNK_WIRE_LOG=0)
     # #416: the pcap ring is fixed storage (ring x ~2.1 KB), and a constrained build
     # has no PSRAM (sdkconfig.defaults.esp32_constrained: CONFIG_SPIRAM=n), so all of
     # it is internal DRAM. 4 slots ~= 8.4 KB instead of 16 ~= 33.7 KB. Set as a CMake
