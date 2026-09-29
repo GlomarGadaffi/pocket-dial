@@ -2031,6 +2031,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// The message pool is process-global, so it reads even with no engine.
 	json.s("\"msgPoolRefusals\":").n(RequestsHandler::getMessagePoolRefusals()).s(",");
 	json.s("\"vpeerPoolRefusals\":").n(handler ? handler->getVirtualPeerRefusals() : 0).s(",");
+	// #702 item 19: two "should stay zero" counters that were test-only until now.
+	json.s("\"repliesRefused\":").n(handler ? handler->getRepliesRefused() : 0).s(",");   // #424
+	json.s("\"optionsPingTruncated\":").n(handler ? handler->getOptionsPingTruncated() : 0).s(",");   // #463
 	// Issue #663: trunk responses dropped as not from the carrier (#617, #356).
 	json.s("\"trunkForgedRegisterResponses\":").n(handler ? handler->getTrunkForgedRegisterResponses() : 0).s(",");
 	json.s("\"trunkForgedDialogResponses\":").n(handler ? handler->getTrunkForgedDialogResponses() : 0).s(",");
@@ -3074,14 +3077,6 @@ void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
 		return;
 	}
 	sendResponse(sock, 200, "OK", contentType, cfg);
-}
-
-void HttpServer::sendConfigCfg(int sock, const std::string& mac)
-{
-	HttpRequest req;
-	req.method = "GET";
-	req.path = "/config/" + mac + ".cfg";
-	sendProvisioningResponse(sock, req);
 }
 
 void HttpServer::sendApiVoicemail(int sock, const std::string& body)

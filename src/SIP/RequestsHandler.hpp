@@ -302,9 +302,6 @@ public:
 	std::tuple<std::string, std::string, std::string> getE911Config();
 	std::vector<std::tuple<std::string, std::string, std::string>> getRingGroups();
 
-	// Parked calls snapshot for the TUI: {orbit, parkedExt, parker, secondsParked}.
-	std::vector<std::tuple<std::string, std::string, std::string, int>> getParkedCalls();
-
 	// Paging zones (980–989). setPageZone replaces a zone's membership; an empty
 	// member list deletes the zone. Thread-safe and NVS-persisted. The getter
 	// returns {zoneExt, "m1,m2,..."} pairs for the dashboard.
@@ -1494,11 +1491,7 @@ public:
 		auto localOutbox = drainOutbox();
 		auto localLogs = std::move(_logQueue);
 		_logQueue.clear();
-		for (const auto& log : localLogs)
-		{
-			if (log.first) std::cerr << log.second << '\n';
-			else std::cout << log.second << '\n';
-		}
+		printLogs(localLogs);
 		for (auto& event : localOutbox)
 		{
 			_onHandled(event.first, std::move(event.second));
@@ -1821,10 +1814,15 @@ private:
 	std::shared_ptr<SipClient> allocateClient(std::string number, sockaddr_in address, int expiresSeconds);
 	std::shared_ptr<Session> allocateSession(std::string callID, std::shared_ptr<SipClient> src);
 	// Draw a transient virtual-peer SipClient (777/440/park leg) from the fixed pool
-	// instead of make_shared'ing one in the packet handler. Falls back to heap on
-	// exhaustion (graceful, never a crash). Caller holds _mutex.
+	// instead of make_shared'ing one in the packet handler. Refuses (nullptr) on
+	// exhaustion, no heap fallback (#409); every caller answers 503 or abandons
+	// cleanly (#412). Caller holds _mutex.
 	std::shared_ptr<SipClient> allocateVirtualPeer(std::string number, sockaddr_in address, int expiresSeconds = 3600);
 
+	// Answer `req` with a bodiless final status: the request's own Via (received/
+	// rport) and a Contact for `contactExt`. False when the pool refused (#101A:
+	// drop, the peer retransmits), so the caller skips its log line too.
+	bool refuseInvite(const SipMessage& req, const char* statusLine, std::string_view contactExt);
 	// Build a 200 OK with an SDP body for an INVITE (used by 777, park, onReinvite).
 	std::shared_ptr<SipMessage> buildOkWithSdp(const std::shared_ptr<SipMessage>& inviteMsg,
 		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody);
@@ -2169,6 +2167,9 @@ private:
 	                     std::vector<std::pair<bool, std::string>>& logScratch);
 	void flushPass(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
 	               std::vector<std::pair<bool, std::string>>& logScratch);
+	// Print one drained log batch: errors to stderr, the rest to stdout. Used by
+	// flushPass() and by every config setter that drains _logQueue itself (#702).
+	static void printLogs(const std::vector<std::pair<bool, std::string>>& logs);
 
 	// The inbound message currently being handled, or nullptr outside a handle()
 	// pass (tick() drains with this unset). Used by drainOutbox() for exactly one
@@ -2263,7 +2264,6 @@ private:
 	int         _serverPort;
 
 	std::atomic<uint64_t> _packetsProcessed{0};
-	std::atomic<uint64_t> _packetsDropped{0};
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
@@ -2301,8 +2301,6 @@ private:
 		// Adopted devices (STAGE 2): {mac, ext, state, online}. Mirrored from the
 		// Registrar's registry under _mutex; copied out under _snapshotMutex.
 		std::vector<AdoptedDevice> devices;
-		uint64_t packetsProcessed = 0;
-		uint64_t packetsDropped = 0;
 	};
 	RegistrarSnapshot _snapshot;
 	// #463: tick() refills this in place and swaps its tables into _snapshot, so

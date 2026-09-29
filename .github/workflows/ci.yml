@@ -704,10 +704,14 @@ jobs:
       - name: Build with COMPREHENSIVE heap poisoning
         run: |
           . $IDF_PATH/export.sh
-          idf.py set-target esp32s3
+          # The defaults go on the set-target line: set-target writes sdkconfig,
+          # and a later build keeps that file, so -DSDKCONFIG_DEFAULTS given only
+          # to `build` was ignored and this leg built the plain eth image.
           idf.py -D SIP_TRANSPORT=eth \
                  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_debug" \
-                 build
+                 set-target esp32s3 build
+          grep -q "define CONFIG_HEAP_POISONING_COMPREHENSIVE 1" build/config/sdkconfig.h \
+            || { echo "::error::heap_debug profile not applied"; exit 1; }
           echo "Heap-poisoning profile builds (esp32s3 / eth)."
 
   # Job 2b-ii: Heap-TRACE build (issue #273).
@@ -735,8 +739,12 @@ jobs:
       - name: Build with HEAP_TRACING_STANDALONE + HEAP_TASK_TRACKING
         run: |
           . $IDF_PATH/export.sh
-          idf.py set-target esp32s3
-          idf.py -D SIP_TRANSPORT=eth                  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_trace"                  build
+          # Defaults on the set-target line; see the heap-poisoning leg above.
+          idf.py -D SIP_TRANSPORT=eth \
+                 -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_trace" \
+                 set-target esp32s3 build
+          grep -q "define CONFIG_HEAP_TRACING_STANDALONE 1" build/config/sdkconfig.h \
+            || { echo "::error::heap_trace profile not applied"; exit 1; }
           echo "Heap-trace profile builds (esp32s3 / eth); HeapLeakProbe.cpp actually compiled."
 
       - name: Upload Heap Trace Firmware Bundle

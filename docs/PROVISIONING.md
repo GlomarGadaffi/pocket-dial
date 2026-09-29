@@ -57,7 +57,7 @@ fly from the extension that MAC last registered as.
 
 ### 0.1 The real limitation: a phone must register before it can be provisioned
 
-`sendConfigCfg()` calls `RequestsHandler::findProvisioningInfo(mac)`, which walks
+`sendProvisioningResponse()` calls `RequestsHandler::findProvisioningInfo(mac)`, which walks
 `Registrar::adoptedDevices()` and returns `std::nullopt`, a `404`, for any MAC that is not
 in it (`RequestsHandler.cpp:4406-4433`).
 
@@ -248,7 +248,7 @@ When requesting `{mac}.cfg`, `User-Agent` is used to detect vendor (Grandstream,
 
 ### 2.2 Request handling
 
-`sendConfigCfg(sock, mac)` (`HttpServer.cpp:1182-1206`):
+`sendProvisioningResponse(sock, req)` (`HttpServer.cpp:2972`):
 
 1. `findProvisioningInfo(mac)` walks the adopted-device registry under the engine `_mutex`.
    Miss → `404`.

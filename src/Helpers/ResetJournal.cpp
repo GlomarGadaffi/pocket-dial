@@ -465,7 +465,7 @@ void corruptRecordForTest()
 {
 	// Over the newest record, or slot 0 on an empty sector.
 	const long n = firstFreeSlot();
-	Record junk;
+	Record junk{};
 	std::memset(&junk, 0x5A, sizeof(junk));
 	slotWrite(n > 0 ? static_cast<size_t>(n - 1) : 0, junk);
 }

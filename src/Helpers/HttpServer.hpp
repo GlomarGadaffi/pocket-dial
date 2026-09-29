@@ -380,8 +380,6 @@ private:
 
 	// Issue #35, #234: Serves phone auto-provisioning config for supported vendors.
 	void sendProvisioningResponse(int sock, const HttpRequest& req);
-	// Backward-compatible wrapper for sendProvisioningResponse.
-	void sendConfigCfg(int sock, const std::string& mac);
 	// Phase 2: set per-extension Do Not Disturb. Mutating (same-origin + auth gated).
 	void sendApiDnd(int sock, const std::string& body);
 	// Issue #246: set per-extension voicemail-enabled, same shape and gate as
