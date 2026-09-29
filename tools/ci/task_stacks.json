@@ -38,7 +38,7 @@
   {"name": "udp_receiver_task", "entry": "UdpServer::startReceive\\(.*<lambda", "bytes": 16384, "file": "src/Helpers/UdpServer.cpp", "line": 139},
   {"name": "cdr_archive", "entry": "\\bwriterTaskBody\\(", "bytes": 6144, "file": "src/SIP/CdrArchive.cpp", "line": 420},
   {"name": "cdr_persist", "entry": "\\bcdrPersistWriterTask\\(", "bytes": 6144, "file": "src/SIP/CdrRing.cpp", "line": 187},
-  {"name": "conf_mix_tick", "entry": "ConferenceRoom::taskTrampoline\\(", "bytes": 3072, "file": "src/SIP/ConferenceRoom.cpp", "line": 277},
+  {"name": "conf_mix_tick", "entry": "ConferenceRoom::taskTrampoline\\(", "bytes": 3072, "file": "src/SIP/ConferenceRoom.cpp", "line": 308, "note": "#479: xTaskCreateStaticPinnedToCore on the room's boot-allocated internal stack; persistent, parked between conferences"},
   {"name": "moh_tx", "entry": "HoldMusic::taskTrampoline\\(", "bytes": 6144, "file": "src/SIP/HoldMusic.cpp", "line": 508, "note": "kTaskStackBytes, HoldMusic.hpp:92"},
   {"name": "(createTaskPreferPsram wrapper)", "entry": null, "bytes": 0, "file": "src/SIP/PsramTask.hpp", "line": 103, "note": "the wrapper's own fallback call; its callers are listed individually"},
   {"name": "tel_start", "entry": "RequestsHandler::RequestsHandler\\(.*<lambda\\(void\\*\\)", "bytes": 12288, "file": "src/SIP/RequestsHandler.cpp", "line": 612, "note": "matches both constructor lambdas; the worse is budgeted"},
