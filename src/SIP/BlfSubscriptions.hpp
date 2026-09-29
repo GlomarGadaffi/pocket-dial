@@ -3,6 +3,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -44,7 +45,7 @@ public:
 	// ponytail: counts are RAM-only. After a reboot every lamp reads "no" until
 	// the owner dials 796 and the listing resyncs old=<listed>. Upgrade path: a
 	// count-only listMessages() job per voicemail extension on the vm_archive
-	// task at boot.
+	// task at boot (#756).
 #if POCKETDIAL_MWI
 	void mwiDeposit(std::string_view ext);
 	void mwiListened(std::string_view ext, size_t listed);
