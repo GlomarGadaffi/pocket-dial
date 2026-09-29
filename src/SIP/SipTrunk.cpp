@@ -15,8 +15,16 @@
 
 using sipwire::addrToIpPort;
 
+// #618/#689: the full INVITE and REGISTER-response dump below is diagnostics
+// only. The constrained 4 MB image has no room for it (main/CMakeLists.txt sets
+// 0 there); the one-line "Trunk: INVITE ->" summary stays on every build.
+#ifndef POCKETDIAL_TRUNK_WIRE_LOG
+#define POCKETDIAL_TRUNK_WIRE_LOG 1
+#endif
+
 namespace
 {
+#if POCKETDIAL_TRUNK_WIRE_LOG
 	// #618: the whole outbound INVITE on the console, its lines " | "-joined
 	// into a few log lines under LogQueue's 256-byte line cap (its queue is only
 	// 16 deep, so one log line per SIP line would drop). The body is cut after
@@ -45,6 +53,9 @@ namespace
 		}
 		if (n) env.log(std::string(buf, n));
 	}
+#else
+	void logInvite(PbxEnv&, std::string_view) {}
+#endif
 
 	// The host of a SIP URI ("sip:+1555@203.0.113.9:5060;transport=udp"), as an
 	// address, when -- and only when -- it is a dotted quad. An FQDN yields false:
@@ -951,6 +962,7 @@ bool SipTrunk::handleRegisterResponse(const std::shared_ptr<SipMessage>& data)
 	// REGISTER "200 Authorization failure"), the lease, and the Via
 	// received/rport the carrier saw of us from behind CGNAT. Registration
 	// behaviour is unchanged; this only reports.
+#if POCKETDIAL_TRUNK_WIRE_LOG
 	if (v.code >= 200)
 	{
 		const std::string_view via = data->getVia();
@@ -975,6 +987,7 @@ bool SipTrunk::handleRegisterResponse(const std::shared_ptr<SipMessage>& data)
 			static_cast<int>(contact.size()), contact.data());
 		_env.log(line);
 	}
+#endif
 	if (after != before && after == SipRegistrationClient::State::Registered)
 		_env.log("Trunk: registered with the carrier");
 	else if (after != before && after == SipRegistrationClient::State::Failed)
