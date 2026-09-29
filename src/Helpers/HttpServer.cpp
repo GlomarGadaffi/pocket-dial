@@ -1285,6 +1285,17 @@ void HttpServer::handleClient(int clientSock)
 			sendApiRegistrarDevice(clientSock, req.body);
 		}
 	}
+	else if (req.method == "POST" && req.path == "/api/registrar/forget-learned")
+	{
+		// #515: one action to clear a flood of Learned adoptions; Secured
+		// devices stay. Answers with the same device list as GET /api/registrar.
+		if (requireAdmin(clientSock, req, true))
+		{
+			RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+			if (handler) handler->forgetLearnedDevices();
+			sendApiRegistrar(clientSock);
+		}
+	}
 	else if (req.method == "GET" && req.path == "/api/admin/status")
 	{
 		// Read-only: tells the dashboard whether to show the login form.
