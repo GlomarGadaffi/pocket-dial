@@ -23,11 +23,13 @@ public:
 		// via makeCall). Incoming is the inverse: an external system is delivering an
 		// inbound call to a DN this device monitors; ring a local extension, then call
 		// answerCall() to accept it. callerId carries the caller's number/name (best-effort).
+		// MediaNeverOpened (#379): the leg's inbound audio stream never opened in its
+		// whole retry budget; the engine decides whether to drop the leg.
 		// cppcheck flags `type` as uninitMemberVarNoCtor. False positive: every
 		// CallEvent is constructed at its call sites (LoopbackAnchorClient.cpp)
 		// with all four fields brace-initialised.
 		// cppcheck-suppress uninitMemberVarNoCtor
-		enum Type : uint8_t { Ringing, Answered, Dropped, Dtmf, Incoming } type;
+		enum Type : uint8_t { Ringing, Answered, Dropped, Dtmf, Incoming, MediaNeverOpened } type;
 		std::string participantId;
 		std::string dtmfDigit;
 		std::string callerId;

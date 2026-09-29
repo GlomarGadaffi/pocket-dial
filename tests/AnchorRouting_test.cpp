@@ -424,6 +424,88 @@ TEST(AnchorRouting, TeardownThatAlreadyDroppedTheLegDoesNotDropItAgain)
 		<< "the sweep dropped the leg, then endCall()'s fallback dropped it again";
 }
 
+TEST(AnchorRouting, LegWhoseStreamNeverOpenedIsDroppedOnce)
+{
+	// Issue #379: TelephonyAnchorClient::runRxLoop() reports MediaNeverOpened when
+	// 3CX refused the leg's GET stream for its whole retry budget. Nothing dropped
+	// that leg; on .244 one was still up at 3CX ~25 min later. The handler must
+	// drop it, and a later hangup must not drop it a second time. The event
+	// callback is wired only for a real anchor, so this drives its handler.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-379d"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-379d").has_value());
+	const std::string leg = handler.getSession("Call-ID: anchor-379d").value()->getAnchorParticipantId();
+	ASSERT_FALSE(leg.empty());
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+
+	const unsigned before = loop->dropCallCount();
+	handler.anchorMediaNeverOpenedForTest(leg);
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));   // host drop runs on a worker
+	EXPECT_EQ(loop->dropCallCount(), before + 1) << "a leg with no inbound audio must be dropped";
+
+	handler.handle(makeBye("501", "555", "192.168.9.51", "anchor-379d"));
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), before + 1) << "the hangup dropped the same leg again";
+}
+
+TEST(AnchorRouting, OrphanLegWhoseStreamNeverOpenedIsDropped)
+{
+	// Issue #379, the .244 case: the leg's session was already gone, so no
+	// teardown would ever drop it.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+
+	const unsigned before = loop->dropCallCount();
+	handler.anchorMediaNeverOpenedForTest("leg-orphan-379");
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), before + 1) << "an orphaned leg must be dropped";
+}
+
+TEST(AnchorRouting, EmergencyLegWhoseStreamNeverOpenedIsKept)
+{
+	// Issue #379 + #604: no automated teardown hangs up a 911/933. With no inbound
+	// audio the PSAP may still hear the caller. Absence-only, so the same leg
+	// without the flag is the positive control at the end.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-379e"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-379e").has_value());
+	auto session = handler.getSession("Call-ID: anchor-379e").value();
+	const std::string leg = session->getAnchorParticipantId();
+	ASSERT_FALSE(leg.empty());
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+
+	session->setEmergency(true);
+	const unsigned before = loop->dropCallCount();
+	handler.anchorMediaNeverOpenedForTest(leg);
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), before) << "a 911 leg was dropped for missing inbound audio";
+	EXPECT_FALSE(session->isAnchorLegReleased());
+	EXPECT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: anchor-379e"), nullptr)
+		<< "a 911 call's bridge must keep running";
+
+	session->setEmergency(false);   // positive control
+	handler.anchorMediaNeverOpenedForTest(leg);
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), before + 1) << "positive control: the same leg, not a 911, is dropped";
+}
+
 TEST(AnchorRouting, PcmaOnlyOfferGets488NotABridgeItCannotDecode)
 {
 	// Issue #304: MediaBridge::onHandsetRtp only mu-law-decodes, and
