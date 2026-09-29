@@ -83,7 +83,8 @@ namespace
 	// A handset dialling a PSTN number. The 9 prefix is what the dial rule
 	// strips; 101 is the telephone-event payload type the answer must echo.
 	std::shared_ptr<SipMessage> makeTrunkDial(const std::string& fromExt,
-		const std::string& dialed, const std::string& callId, int rtpPort = 40000)
+		const std::string& dialed, const std::string& callId, int rtpPort = 40000,
+		const std::string& extraHeaders = "")
 	{
 		const std::string body =
 			"v=0\r\n"
@@ -103,7 +104,7 @@ namespace
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 1 INVITE\r\n"
 			"Max-Forwards: 70\r\n"
-			"Contact: <sip:" + fromExt + "@" + kHandsetIp + ":5060>\r\n"
+			"Contact: <sip:" + fromExt + "@" + kHandsetIp + ":5060>\r\n" + extraHeaders +
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
@@ -344,6 +345,27 @@ TEST(TrunkWiring, TheCarrierAnswerIsAckedAndTheHandsetGetsATwoWaySdpAnswer)
 
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u)
 		<< "both halves of the pair are live once the call is up";
+}
+
+// #198: the handset's 200 is the PBX's own answer, so RFC 4028 §9 applies to
+// it: a Session-Expires it carries must name the handset as refresher (the PBX
+// never refreshes, and answers the handset's refresh UPDATE itself).
+TEST(TrunkWiring, TheHandsetAnswerNamesTheHandsetAsSessionRefresher)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-se", 40000,
+		"Supported: timer\r\nSession-Expires: 1800\r\n"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+
+	const std::string ok = b.firstWith("200 OK");
+	ASSERT_FALSE(ok.empty()) << "the handset was never answered";
+	EXPECT_NE(ok.find("\r\nSession-Expires: 1800;refresher=uac\r\n"), std::string::npos) << ok;
+	EXPECT_NE(ok.find("\r\nRequire: timer\r\n"), std::string::npos) << ok;
 }
 
 TEST(TrunkWiring, AnAnswerWithNoUsableMediaHangsTheCarrierUpRatherThanConnectSilence)

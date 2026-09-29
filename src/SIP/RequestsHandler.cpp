@@ -24,7 +24,7 @@
 #include "TimeSync.hpp"    // Issue #246: voicemail flush timestamp (endCall() hook)
 #include "PbxConfig.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: 911/933 classification, ahead of the dial plan
-#include "SessionTimer.hpp"   // Issue #198: RFC 4028 422 floor
+#include "SessionTimer.hpp"   // Issue #198: RFC 4028 422 floor, 2xx Session-Expires
 #include <charconv>
 #include "PbxPersist.hpp"
 #include "SipHeaderUtil.hpp"
@@ -1438,10 +1438,13 @@ namespace
 	// handled, because nothing in src/ reads that header. Kept per #229's
 	// scope call rather than withdrawn, since the REFER usage is real.
 	//
-	// NOT "timer": the RFC 4028 support is passive -- it honours a timer a phone
-	// requests but never requests one itself. Since #591 an initial INVITE whose
-	// Session-Expires is too small gets 422 + Min-SE (onInvite reads
-	// getMinSESecs()), but the rest of #198 is still open, so the tag stays off.
+	// NOT "timer" (#198). The 2xx this PBX writes itself now names the phone as
+	// refresher (pbx::answerSessionTimer), and a too-small interval draws 422 +
+	// Min-SE (#591), but a UAS that advertises timer must still do what this one
+	// cannot: be the refresher when the phone asks it to (refresher=uas, or no
+	// Supported: timer), since nothing here ever sends a refresh; accept a
+	// re-INVITE refresh on 777/888/trunk legs (answered 488 below); and answer an
+	// UPDATE refresh on park and 440 legs (relayed back to the caller, #709).
 	// NOT "100rel" (RFC 3262 needs PRACK), "norefersub", "path", "gruu" or
 	// "outbound" — none of them have any implementation in this codebase.
 	constexpr const char* kSupportedOptionTags = "replaces";
@@ -2082,6 +2085,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		okResponse->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		okResponse->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		okResponse->setContact(buildContact("777"));
+		pbx::answerSessionTimer(*okResponse, *data);   // #198
 		// The echo answer is the CALLER'S OWN offer handed back, so it must obey
 		// RFC 3264 §6.1: an answer reuses the offer's payload-type numbers and may
 		// only narrow the list. enforceG711() pinned the m= line to a literal
@@ -9546,6 +9550,7 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 	// buildOkWithSdp() mints a fresh tag for a first answer; calling it here
 	// would append a second tag onto the one already present.
 	addCapabilityHeaders(*ok);
+	pbx::answerSessionTimer(*ok, *data);   // #198
 	const std::string sdpBody = buildMediaSdp(_localIp, bridge->receiverPort(),
 		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
 	ok->clearBody();
@@ -9741,6 +9746,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		resp->setHeader(SipMessageTypes::OK);
 		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		resp->setContact(buildContact(data->getToNumber()));
+		pbx::answerSessionTimer(*resp, *data);   // #198
 		resp->clearBody();
 		resp->syncContentLength();
 		_outbox.emplace_back(data->getSource(), std::move(resp));
@@ -10278,6 +10284,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	// (RFC 3311 §5.1). Added BEFORE the body work below so the header block is
 	// final when Content-Type/Content-Length are recomputed off the raw string.
 	addCapabilityHeaders(*ok);
+	pbx::answerSessionTimer(*ok, *inviteMsg);   // #198
 	ok->clearBody();
 	{
 		std::string raw = ok->toString();
@@ -10906,6 +10913,7 @@ void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 	resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 	resp->setTo(std::string(invite->getTo()) + ";tag=" + session->getLocalTag());
 	resp->setContact(buildContact(std::string(invite->getToNumber())));
+	pbx::answerSessionTimer(*resp, *invite);   // #198
 	resp->setBody(sdpBody);   // resyncs Content-Length itself
 	_outbox.emplace_back(invite->getSource(), std::move(resp));
 
