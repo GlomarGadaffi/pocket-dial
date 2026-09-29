@@ -127,9 +127,16 @@ std::shared_ptr<SipMessage> BlfSubscriptions::buildDialogNotify(DialogSubscripti
 			oldMsgs = box->oldMsgs;
 		}
 		char buf[192];
-		std::snprintf(buf, sizeof(buf),
+		const int n = std::snprintf(buf, sizeof(buf),
 			"Messages-Waiting: %s\r\nMessage-Account: sip:%s@%s\r\nVoice-Message: %u/%u (0/0)\r\n",
 			newMsgs ? "yes" : "no", sub.targetAor.c_str(), activeIp.c_str(), newMsgs, oldMsgs);
+		// Never send a truncated summary. Unreachable at these bounds; a null
+		// NOTIFY is what every caller already treats as "retry next pass".
+		if (n < 0 || static_cast<size_t>(n) >= sizeof(buf))
+		{
+			_env.log("MWI: summary body for " + sub.targetAor + " does not fit, NOTIFY skipped", true);
+			return nullptr;
+		}
 		body = buf;
 		event = "message-summary";
 		contentType = "application/simple-message-summary";
@@ -232,9 +239,30 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 		return;
 	}
 
+	const int expires = _env.requestedExpires(data);
+	// Subscriptions are keyed by the bare Call-ID value (getCallID() hands back
+	// the whole header line). Same guarded helper as everywhere else.
+	const std::string callId = siphdr::stripHeaderName(data->getCallID());
+
+	// 3. Refresh / unsubscribe: match an existing subscription by Call-ID AND
+	// package -- a SUBSCRIBE for the other package reusing the Call-ID is a
+	// different subscription, never a way into this one.
+	DialogSubscription* sub = nullptr;
+	for (auto& s : _subscriptions)
+	{
+		if (s.used && s.callId == callId && s.mwi == isMwi) { sub = &s; break; }
+	}
+	// In-dialog: both tags match the dialog the 202 created (RFC 6665 §4.1.2.1).
+	const std::string toTag = siphdr::tagOf(data->getTo());
+	const bool inDialog = sub && !toTag.empty() && toTag == siphdr::tagOf(sub->subTo)
+		&& siphdr::tagOf(data->getFrom()) == siphdr::tagOf(sub->watcherFrom);
+
 	// MWI: a mailbox's counts belong to its owner. Only a phone registered as
-	// that extension, from this source IP, may watch it -- 403 otherwise.
-	if (isMwi)
+	// that extension, from this source IP, may start watching it -- 403
+	// otherwise. An in-dialog refresh/unsubscribe was authorised when the
+	// dialog was created, so it is honoured from wherever the phone is now
+	// (DHCP renewal, roaming) and moves the NOTIFY address with it.
+	if (isMwi && !inDialog)
 	{
 		auto owner = _env.findRegistered(target);
 		if (data->getFromNumber() != target || !owner
@@ -250,18 +278,6 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 				+ std::string(data->getFromNumber()), true);
 			return;
 		}
-	}
-
-	const int expires = _env.requestedExpires(data);
-	// Subscriptions are keyed by the bare Call-ID value (getCallID() hands back
-	// the whole header line). Same guarded helper as everywhere else.
-	const std::string callId = siphdr::stripHeaderName(data->getCallID());
-
-	// 3. Refresh / unsubscribe: match existing subscription by Call-ID.
-	DialogSubscription* sub = nullptr;
-	for (auto& s : _subscriptions)
-	{
-		if (s.used && s.callId == callId) { sub = &s; break; }
 	}
 
 	if (sub == nullptr && expires > 0)
