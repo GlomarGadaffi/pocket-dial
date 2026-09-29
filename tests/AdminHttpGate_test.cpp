@@ -1009,6 +1009,42 @@ TEST(Registrar, MutatingEndpointsRequireTheCsrfToken)
 	AdminAuth::clearCredential();
 }
 
+TEST(Registrar, ForgetLearnedNeedsCsrfAndKeepsSecuredDevices)
+{
+	// #515: one action forgets every Learned adoption (recovery from a flood of
+	// fake MACs). Threats: a stolen cookie alone must not wipe the roster
+	// (CSRF), and the bulk forget must never drop a Secured device, which would
+	// let the next REGISTER re-learn its extension.
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.adoptDeviceForTest("0200000005b1", "5201");
+	handler.adoptDeviceForTest("0200000005b2", "5202");
+	handler.adoptDeviceForTest("0200000005bb", "5210", Registrar::DeviceState::Secured);
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	AdminSession a = loginAndCompleteSetup(port);
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/registrar/forget-learned", "")), 401);
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/registrar/forget-learned", "",
+	                               "pd_session=" + a.cookie)), 403);
+	EXPECT_EQ(handler.getAdoptedDevices().size(), 3u) << "a refused request must change nothing";
+
+	const std::string r = httpPostRaw(port, "/api/registrar/forget-learned", "",
+	                                  "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(r), 200) << r;
+	const auto left = handler.getAdoptedDevices();
+	ASSERT_EQ(left.size(), 1u);
+	EXPECT_EQ(left[0].mac, "0200000005bb");
+	EXPECT_NE(r.find("\"mac\":\"0200000005bb\""), std::string::npos) << r;
+	EXPECT_EQ(r.find("0200000005b1"), std::string::npos) << r;
+
+	AdminAuth::clearCredential();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue #207 — two read endpoints disclosed more than the threat model
 // sanctioned. Both were found on the WIRE, not by reading the code: the code
