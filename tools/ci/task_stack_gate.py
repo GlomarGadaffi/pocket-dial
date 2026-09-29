@@ -32,7 +32,12 @@ Determinism: edges are walked in sorted order, and a result computed while a
 cycle was cut is never cached, so PYTHONHASHSEED can't change the report.
 
 Usage:
-  python3 tools/ci/task_stack_gate.py --ci-dir DIR [--table FILE] [--src-root DIR]
+  python3 tools/ci/task_stack_gate.py --ci-dir DIR [--table FILE] [--src-root DIR] [--with FEATURE ...]
+
+DIR is walked recursively. Point it at build/esp-idf/main (the project
+component's .ci files), not build/ or build/esp-idf: is_project() keys on
+/src/ in a frame's location, which also matches IDF's lwip/src and
+wpa_supplicant/src, and build/ holds the bootloader's .ci files too.
 """
 
 import argparse
@@ -99,7 +104,7 @@ def find_entry(nodes, pattern):
 MAIN_VARIANT_RE = re.compile(r"^main/esp_main[^/]*\.cpp$")
 
 
-def run(ci_dir, table_path, src_root, main_variant):
+def run(ci_dir, table_path, src_root, main_variant, features=()):
     table = json.load(open(table_path, encoding="utf-8"))
     margin = table["margin_bytes"]
     ceiling = table["frame_ceiling_bytes"]
@@ -145,7 +150,14 @@ def run(ci_dir, table_path, src_root, main_variant):
     memo, seen = {}, set()
     for t in sorted(tasks, key=lambda t: (t["name"], t["file"], t["line"])):
         # One image links one esp_main variant; the others' tasks aren't in it.
-        if t["entry"] is None or (MAIN_VARIANT_RE.match(t["file"]) and t["file"] != main_variant):
+        # "variants" names the images a row's code is linked into, when not all.
+        variants = t.get("variants") or ([t["file"]] if MAIN_VARIANT_RE.match(t["file"]) else None)
+        if t["entry"] is None or (variants and main_variant not in variants):
+            continue
+        # A site compiled only under a Kconfig overlay (heap_trace) is walked
+        # only when this image has that feature; given --with, it must be found.
+        if t.get("only") and t["only"] not in features:
+            print(f"skip {t['name']}: only in a '{t['only']}' build ({t['file']}:{t['line']}); pass --with {t['only']}")
             continue
         hits = find_entry(nodes, t["entry"])
         if not hits:
@@ -176,13 +188,15 @@ def run(ci_dir, table_path, src_root, main_variant):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ci-dir", required=True, help="directory of .ci files from -fcallgraph-info=su")
+    ap.add_argument("--ci-dir", required=True, help="tree of .ci files from -fcallgraph-info=su, walked recursively (build/esp-idf/main)")
     ap.add_argument("--table", default=os.path.join(REPO, "tools", "ci", "task_stacks.json"))
     ap.add_argument("--src-root", default=REPO, help="tree whose src/ and main/ are scanned for task sites")
     ap.add_argument("--main", default="main/esp_main_eth.cpp",
                     help="the esp_main variant linked into the image the .ci files came from")
+    ap.add_argument("--with", dest="features", action="append", default=[],
+                    help="a build feature this image has (heap_trace); repeatable")
     a = ap.parse_args()
-    return run(a.ci_dir, a.table, a.src_root, a.main)
+    return run(a.ci_dir, a.table, a.src_root, a.main, tuple(a.features))
 
 
 if __name__ == "__main__":
