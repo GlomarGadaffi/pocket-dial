@@ -47,6 +47,20 @@ bool MediaBridge::startBridge(const std::string& handsetIp, uint16_t handsetPort
 		return false;
 	}
 
+	// #734: ANCHOR mode hands the participant id to writeAudio() through a fixed
+	// kMohParticipantIdBufSize snapshot (onHandsetRtp, feedMohTick; #701), which
+	// refuses an id that does not fit rather than truncate it. Refuse such an id
+	// here, at setup, so the call fails loudly instead of carrying one-way audio
+	// with no counter. BUS mode never snapshots it.
+	if (!_bus && participantId.size() >= kMohParticipantIdBufSize)
+	{
+#if defined(ESP_PLATFORM)
+		ESP_LOGE("MediaBridge", "startBridge refused: participant id is %u B, limit %u (#734)",
+		         static_cast<unsigned>(participantId.size()), static_cast<unsigned>(kMohParticipantIdBufSize - 1));
+#endif
+		return false;
+	}
+
 	// BUS mode: claim a port before any socket is opened, so a full bus fails the
 	// start cleanly with nothing to unwind. The tick guarantees a Free slot has empty
 	// rings, so there is nothing to clear here.

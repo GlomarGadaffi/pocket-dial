@@ -679,3 +679,31 @@ TEST(MediaBridgeParticipantId, HandsetRtpRacingStopAndStartDeliversOnlyWholeIds)
 	EXPECT_GT(cyclesWithAWrite, 0);
 	EXPECT_EQ(anchor.badIds.load(), 0) << "a frame was written with a torn or stale participant id";
 }
+
+TEST(MediaBridgeParticipantId, AnIdTooLongForTheSnapshotIsRefusedAtStartNotDroppedPerFrame)
+{
+	// #734: after #701 an anchor-mode id that does not fit the fixed snapshot
+	// buffer would start, then drop every handset frame silently (one-way audio,
+	// no counter, isAudioDegraded() never trips). It is refused at setup instead,
+	// so the caller's existing failure path answers the call.
+	RtpReceiver receiver;
+	RtpSender sender;
+	IdRecordingAnchorClient anchor;
+	MediaBridge bridge;
+	bridge.init(&receiver, &sender, &anchor);
+	const auto tick = ulawTick(0xAA);
+
+	// 32 = MediaBridge::kMohParticipantIdBufSize (private); an id must be shorter.
+	const std::string tooLong(32, 'p');
+	EXPECT_FALSE(bridge.startBridge("127.0.0.1", 5004, "call-734", tooLong))
+		<< "a " << tooLong.size() << "-byte id started a bridge that cannot deliver its audio";
+	EXPECT_FALSE(bridge.isActive());
+
+	// Positive control: the longest id that fits starts and delivers.
+	const std::string longest(31, 'p');
+	ASSERT_TRUE(bridge.startBridge("127.0.0.1", 5004, "call-734", longest));
+	bridge.onHandsetRtp(tick.data(), tick.size());
+	EXPECT_EQ(anchor.writes.load(), 1);
+	EXPECT_EQ(anchor.lastId, longest);
+	bridge.stopBridge();
+}
