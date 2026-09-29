@@ -2312,6 +2312,17 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		endHandle(data->getFromNumber(), responseObj);
 		return;
 	}
+
+	// Issue #715: draw the relay BEFORE publishing the session. Published first, a
+	// pool refusal left an Invited session with no ring timer (no CFNA/voicemail on
+	// the callee) and no relay on the wire, and the caller's INVITE retransmit is
+	// dropped by the retransmission guard at the top of this function because that
+	// session exists: the slot leaked. Refused here, nothing is committed --
+	// allocateSession() already reset newSession but never published it, so the next
+	// allocateSession() reclaims the slot -- and the retransmit is a fresh INVITE.
+	auto response = getMessageFromPool(*data);
+	if (!response) return;   // pool exhausted: nothing committed, drop, peer retransmits (#101A)
+
 	_sessions.emplace(data->getCallID(), newSession);
 
 	// Retain the original INVITE on every direct-call session — not only when
@@ -2336,8 +2347,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
 	}
 
-	auto response = getMessageFromPool(*data);
-	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setContact(buildContact(caller.value()->getNumber()));
 	endHandle(data->getToNumber(), response);
 }
@@ -6714,16 +6723,18 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// 202 Accepted to the transferor (RFC 3515 §2.4.4).
-	{
-		auto accepted = getMessageFromPool(*data);
-		if (!accepted) return;   // pool exhausted: drop, peer retransmits (#101A)
-		accepted->setHeader(SipMessageTypes::ACCEPTED);
-		accepted->clearBody();
-		accepted->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
-		_outbox.emplace_back(data->getSource(), std::move(accepted));
-	}
+	// 202 Accepted to the transferor (RFC 3515 §2.4.4). Issue #715: drawn here but
+	// queued only once every other message the transfer needs is drawn. A 202 is the
+	// final response of the transferor's non-INVITE transaction (RFC 3261 §17.1.2.2),
+	// so once it is out a later pool refusal cannot be retried by a REFER retransmit
+	// and would leave the transferor with a 202 and a subscription that never ends.
+	// Nothing sent yet means a refusal can still be answered 503.
+	auto accepted = getMessageFromPool(*data);
+	if (!accepted) return;   // pool exhausted: drop, peer retransmits (#101A)
+	accepted->setHeader(SipMessageTypes::ACCEPTED);
+	accepted->clearBody();
+	accepted->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 
 	// Issue #203, unchanged in substance: an unresolvable target (a park orbit, a
 	// typo, an extension that just dropped its registration) declines the transfer
@@ -6731,6 +6742,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// be hung up on here is the one now being kept.
 	if (!targetClient.has_value())
 	{
+		// The 202 goes first: the decline is reported by NOTIFY on the subscription it opens.
+		_outbox.emplace_back(data->getSource(), std::move(accepted));
 		// Issue #422: above everything this dialog has carried, like the success
 		// NOTIFY (#402) -- not the builder's default 2.
 		//
@@ -6816,13 +6829,21 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 
 	if (!inviteToTarget || !byeToTransferor || !notify || !legSession)
 	{
-		// Nothing has been sent but the 202 and nothing has been mutated, so the
-		// transferor's REFER retransmit retries the whole transfer from scratch.
-		// An unpublished legSession is reclaimed by the next allocateSession()
-		// scan. Same answer as #203: refuse without destroying a working call.
+		// Nothing has been sent and nothing has been mutated. Issue #715: the REFER
+		// is answered 503 (the already-drawn `accepted` message, re-headed) rather
+		// than 202, because no retransmit can retry it once a 202 has ended the
+		// transferor's transaction. An unpublished legSession is reclaimed by the
+		// next allocateSession() scan. Same answer as #203: refuse without
+		// destroying a working call.
+		accepted->setHeader("SIP/2.0 503 Service Unavailable");
+		accepted->setTo(std::string(data->getTo()));
+		_outbox.emplace_back(data->getSource(), std::move(accepted));
 		queueLog("REFER: blind transfer to " + target + " not started — pool exhausted", true);
 		return;
 	}
+
+	// Every draw succeeded: the 202 can go out now.
+	_outbox.emplace_back(data->getSource(), std::move(accepted));
 
 	// The transferee's offer relayed peer-to-peer: keep its preference order, drop
 	// only payloads this PBX will not carry (the same treatment buildInviteFork
@@ -8835,12 +8856,18 @@ void RequestsHandler::tick()
 					auto invite = session->getInviteMessage();
 					if (invite && session->getSrc())
 					{
+						// Issue #715: the ring timer is already cleared (above and in
+						// huntRingNext), so nothing reaps this session again. A refused 480
+						// is dropped, but endCall() must still run or the Invited session
+						// leaks for good; the caller's own INVITE timer ends its side.
 						auto resp = getMessageFromPool(*invite);
-						if (!resp) continue;   // pool exhausted: skip this session's 480 (#101A)
-						resp->setHeader(SipMessageTypes::UNAVAILABLE);
-						resp->clearBody();
-						resp->setContact(buildContact(session->getGroupExt()));
-						_outbox.emplace_back(invite->getSource(), std::move(resp));
+						if (resp)   // pool exhausted: skip only this session's 480 (#101A)
+						{
+							resp->setHeader(SipMessageTypes::UNAVAILABLE);
+							resp->clearBody();
+							resp->setContact(buildContact(session->getGroupExt()));
+							_outbox.emplace_back(invite->getSource(), std::move(resp));
+						}
 						endCall(callID, session->getSrc()->getNumber(), session->getGroupExt(), "hunt group no answer");
 					}
 				}
