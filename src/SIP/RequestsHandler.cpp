@@ -1210,6 +1210,32 @@ std::optional<std::shared_ptr<Session>> RequestsHandler::getSession(std::string_
 	return {};
 }
 
+namespace
+{
+	// Issue #755 (RFC 3261 §10.3 step 8): the registrar's 200 lists the binding the
+	// phone registered, so the phone can find its own Contact in it and read the
+	// lease it was granted. Returns that binding as "<uri>" (display name and
+	// header parameters dropped), or "" when the REGISTER carried no usable
+	// Contact -- a bare query, or "*" (which only ever comes with Expires: 0).
+	std::string registeredBinding(std::string_view contactLine)
+	{
+		std::string_view v = siphdr::stripHeaderNameView(contactLine);
+		if (v.empty() || v.front() == '*') return {};
+		const size_t lt = v.find('<');
+		if (lt != std::string_view::npos)
+		{
+			const size_t gt = v.find('>', lt);
+			if (gt == std::string_view::npos) return {};
+			return std::string(v.substr(lt, gt - lt + 1));
+		}
+		// addr-spec form: "sip:ext@host:port;expires=N" -- the ';' params are the header's.
+		const size_t end = v.find_first_of(";, 	");
+		std::string_view uri = v.substr(0, end);
+		if (uri.size() < 4 || uri.substr(0, 4) != "sip:") return {};
+		return "<" + std::string(uri) + ">";
+	}
+}
+
 void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 {
 	auto fromNumber = data->getFromNumber();
@@ -1359,8 +1385,16 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	response->setHeader(SipMessageTypes::OK);
 	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
-	// Echo the granted lease back in the Contact so the client knows when to refresh.
-	response->setContact(buildContact(fromNumber) + ";expires=" + std::to_string(grantedExpires));
+	// Echo the phone's own binding with the granted lease, so the client knows when
+	// to refresh (#755). The response is cloned from the request, so drop the
+	// cloned Contact first: with no usable binding the 200 carries none.
+	response->removeHeaders("Contact");
+	response->removeHeaders("m");
+	const std::string binding = registeredBinding(data->getContact());
+	if (!binding.empty())
+	{
+		response->setContact("Contact: " + binding + ";expires=" + std::to_string(grantedExpires));
+	}
 	// The registrar's 200 OK is the one message EVERY phone sees, on every lease
 	// period, before it ever places a call — which makes it the discovery point
 	// that matters most in practice. OPTIONS only tells a phone that bothers to

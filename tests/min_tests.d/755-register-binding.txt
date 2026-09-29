@@ -1,0 +1,2 @@
+# RegisterBinding_test.cpp: 3 (#755)
+3
