@@ -171,6 +171,18 @@ void Registrar::sendForbidden(const std::shared_ptr<SipMessage>& data, const std
 	_env.enqueue(data->getSource(), std::move(response));
 }
 
+void Registrar::sendRetryLater(const std::shared_ptr<SipMessage>& data, int retryAfterSeconds)
+{
+	auto response = _env.messageFromPool(data->toString(), data->getSource());
+	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+	response->setHeader("SIP/2.0 503 Service Unavailable");
+	response->clearBody();
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	response->addHeader("Retry-After", std::to_string(retryAfterSeconds));
+	response->syncContentLength();
+	_env.enqueue(data->getSource(), std::move(response));
+}
+
 Registrar::AuthDecision Registrar::admitSecure(
 	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason)
 {
@@ -366,17 +378,12 @@ Registrar::AuthDecision Registrar::admitLearn(
 		{
 			// Retryable, unlike the 403s: the phone comes back when a token has.
 			const auto wait = std::chrono::ceil<std::chrono::seconds>(_adoptRefillAt + kAdoptRefill - now);
-			auto response = _env.messageFromPool(data->toString(), data->getSource());
-			if (response)   // pool exhausted: drop, peer retransmits (#101A)
+			sendRetryLater(data, static_cast<int>(wait.count()));
+			if (_adoptLimitLoggedAt != _adoptRefillAt)
 			{
-				response->setHeader("SIP/2.0 503 Service Unavailable");
-				response->clearBody();
-				response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-				response->addHeader("Retry-After", std::to_string(wait.count()));
-				response->syncContentLength();
-				_env.enqueue(data->getSource(), std::move(response));
+				_adoptLimitLoggedAt = _adoptRefillAt;
+				_env.log("Learn: adopt rate limit, 503 " + mac, true);
 			}
-			_env.log("Learn: adopt rate limit, 503 " + mac, true);
 			return AuthDecision::RetryLater;
 		}
 		--_adoptTokens;

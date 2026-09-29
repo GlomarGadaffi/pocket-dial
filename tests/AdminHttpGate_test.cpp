@@ -1028,6 +1028,7 @@ TEST(Registrar, ForgetLearnedNeedsCsrfAndKeepsSecuredDevices)
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
 	AdminSession a = loginAndCompleteSetup(port);
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/registrar/forget-learned", "")), 401);
 	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/registrar/forget-learned", "",
 	                               "pd_session=" + a.cookie)), 403);
 	EXPECT_EQ(handler.getAdoptedDevices().size(), 3u) << "a refused request must change nothing";

@@ -118,6 +118,9 @@ public:
 	void sendChallenge(const std::shared_ptr<SipMessage>& data, bool stale);
 	// Emit a 403 Forbidden with a reason phrase.
 	void sendForbidden(const std::shared_ptr<SipMessage>& data, const std::string& reason);
+	// Emit a 503 Service Unavailable with Retry-After (#515). Kept short: per
+	// RFC 3261 §21.5.4 the phone holds off the WHOLE server for that long.
+	void sendRetryLater(const std::shared_ptr<SipMessage>& data, int retryAfterSeconds);
 
 	// ── Adopted-device registry ───────────────────────────────────────────────
 	void loadDevices();   // boot-time NVS reload; runs single-threaded pre-dispatch
@@ -195,6 +198,9 @@ private:
 	// the table (and wear flash) in one burst. A full bucket banks nothing.
 	uint8_t _adoptTokens = kAdoptBurst;
 	std::chrono::steady_clock::time_point _adoptRefillAt{};
+	// The refusal path IS the flood path: log at most once per refill period
+	// (each log line allocates on the SIP task, #284).
+	std::chrono::steady_clock::time_point _adoptLimitLoggedAt{};
 
 	// Issue #525: digest replay limit. Nonces are stateless (HMAC-tagged, 5 min,
 	// SipDigest.hpp), so without this one captured Authorization could be sent
