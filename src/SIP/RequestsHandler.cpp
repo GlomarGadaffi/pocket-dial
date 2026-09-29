@@ -580,6 +580,10 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 						break;
 					}
 				}
+				else if (ev.type == AnchorClient::CallEvent::MediaNeverOpened)
+				{
+					anchorMediaNeverOpenedLocked(ev.participantId);
+				}
 			});
 		}
 
@@ -4646,6 +4650,32 @@ void RequestsHandler::asyncDropCall(const std::string& participantId)
 		_anchorClient->dropCall(participantId);
 	});
 #endif
+}
+
+// Issue #379: the anchor's rx task spent its whole GET retry budget (3CX refused the
+// stream for ~2 min) with no teardown under way. Nothing else drops this leg, and with
+// its session gone nothing ever would: a live, billed 3CX leg with no local party. Drop
+// it once. A 911/933 is kept: the PSAP may still hear the caller, and no automated
+// teardown hangs up an emergency call (#604). The stopped bridge and the released flag
+// keep endCall() from dropping it again; 3CX's Remove BYEs the handset (Dropped branch).
+void RequestsHandler::anchorMediaNeverOpenedLocked(const std::string& participantId)
+{
+	if (participantId.empty()) return;
+	for (const auto& kv : _sessions)
+	{
+		const auto& s = kv.second;
+		if (!s->isAnchor() || s->getAnchorParticipantId() != participantId) continue;
+		if (s->isEmergency())
+		{
+			queueLog("[Telephony] no rx audio on 911 leg " + participantId + ", kept", true);
+			return;
+		}
+		s->setAnchorLegReleased();
+		break;
+	}
+	if (MediaBridge* b = bridgeForParticipant(participantId)) b->stopBridge();
+	queueLog("[Telephony] no rx audio, dropping leg " + participantId, true);
+	asyncDropCall(participantId);
 }
 
 void RequestsHandler::asyncAnswerCall(const std::string& participantId)
