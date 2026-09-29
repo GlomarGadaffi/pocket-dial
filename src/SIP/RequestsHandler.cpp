@@ -9627,7 +9627,9 @@ void RequestsHandler::tick()
 			if (session->isEmergency())
 			{
 				_emergencyRtpReaps.fetch_add(1, std::memory_order_relaxed);   // #741
-				queueLog("[media] EMERGENCY call with no RTP on either leg for 4 h -- ending " + callID, true);
+				queueLog("[media] EMERGENCY call with no RTP on either leg for " +
+					std::to_string(std::chrono::duration_cast<std::chrono::hours>(kEmergencyRtpInactivityTimeout).count()) +
+					" h -- ending " + callID, true);
 			}
 			else
 			{
