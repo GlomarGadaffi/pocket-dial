@@ -8895,7 +8895,36 @@ void RequestsHandler::tick()
 						}
 						queueLog("CFNA: no answer, forwarding -> " + cfna);
 						endCall(callID, src->getNumber(), std::string(invite->getToNumber()), "no answer (CFNA)");
-						_forker.redirectInvite(invite, src, cfna);
+						if (!_forker.redirectInvite(invite, src, cfna))
+						{
+							// Issue #716: the forward target is not registered, so
+							// redirectInvite() sent nothing. Without this the caller
+							// gets no final response (the session is already gone) and
+							// the callee keeps ringing. `dest` is null on the plain
+							// INVITE path, so CANCEL via the retained INVITE's target.
+							std::string calleeExt(invite->getToNumber());
+							if (!dest)
+							{
+								auto callee = findClient(calleeExt);
+								if (callee.has_value())
+								{
+									auto cancel = _forker.buildCancel(invite, callee.value());
+									if (cancel) _outbox.emplace_back(callee.value()->getAddress(), std::move(cancel));
+								}
+							}
+							if (_cfg.isVoicemailEnabled(calleeExt))
+							{
+								answerVoicemailDeposit(invite, src, calleeExt);
+							}
+							else if (auto resp = getMessageFromPool(*invite))
+							{
+								resp->setHeader(SipMessageTypes::UNAVAILABLE);
+								resp->clearBody();
+								resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
+								resp->setContact(buildContact(src->getNumber()));
+								_outbox.emplace_back(invite->getSource(), std::move(resp));
+							}
+						}
 					}
 				}
 			}

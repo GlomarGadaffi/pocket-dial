@@ -280,6 +280,38 @@ TEST(VoicemailDivert, ExplicitCfnaTargetWinsOverVoicemailFallback)
 		<< "an explicit CFNA target must still be used, not overridden by the voicemail fallback";
 }
 
+// Issue #716: an explicit CFNA target that is not registered. redirectInvite()
+// sends nothing and returns false; the caller must still get a final response
+// and the still-ringing callee must be CANCELled.
+TEST(VoicemailDivert, CfnaToUnregisteredTargetAnswersCallerAndCancelsCallee)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.40.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in callerAddr = addrFor("192.168.40.26");
+	const sockaddr_in calleeAddr = addrFor("192.168.40.16");
+
+	handler.handle(makeRegister("330", "192.168.40.16", "reg-330-e"));
+	handler.handle(makeRegister("331", "192.168.40.26", "reg-331-e"));
+	handler.setForward("330", "noanswer", "332");   // 332 never registers
+
+	const std::string callId = "cfna-unreg-1";
+	handler.handle(makeInvite("331", "330", "192.168.40.26", callId, "z9hG4bKcfnaunreg"));
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	sent.clear();
+	handler.tick();
+
+	EXPECT_FALSE(findSentTo(sent, callerAddr, "SIP/2.0 480").empty())
+		<< "the caller must get a final response when the CFNA target is unregistered";
+	EXPECT_FALSE(findSentTo(sent, calleeAddr, "CANCEL sip:330@").empty())
+		<< "the ringing callee must be CANCELled, not left ringing";
+}
+
 // CFB fallback: the callee already sent a final 486, so there is nothing
 // ringing left to CANCEL -- unlike CFNA, this path answers straight away.
 TEST(VoicemailDivert, CfbFallsBackToVoicemailWithNoCancelNeeded)
