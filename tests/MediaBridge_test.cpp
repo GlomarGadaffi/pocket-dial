@@ -17,7 +17,10 @@
 #include "LoopbackAnchorClient.hpp"
 #include "HoldMusic.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <fstream>
+#include <thread>
 #include <vector>
 
 namespace
@@ -563,4 +566,99 @@ TEST(MediaBridgeWriteAudioFailure, StoppingAndRestartingClearsThePreviousCallsSt
 	f.anchor.writeSucceeds = false;
 	f.pumpHandsetFrames(25);
 	EXPECT_TRUE(f.bridge.isAudioDegraded());
+}
+
+// ── Issue #701: onHandsetRtp() hands writeAudio() a snapshot of the id ────────
+// The race itself (the SIP thread clearing/reassigning _participantId under
+// _mutex while the receive task reads it) cannot be forced on the host; the
+// source gate tests/tools/test_mediabridge_pid_snapshot.py pins the locking and
+// BigDog's TSAN run shows it. This pins the behaviour the snapshot must keep:
+// the id delivered is the bridge's own, whole, across a slot reuse with a longer
+// id, and nothing is written once the bridge has stopped.
+
+namespace
+{
+	class IdRecordingAnchorClient : public ControllableAnchorClient
+	{
+	public:
+		bool writeAudio(std::string_view id, const int16_t*, size_t) override
+		{
+			writes.fetch_add(1);
+			lastId.assign(id.data(), id.size());
+			// `allowed` is set before any writer thread starts and never changed
+			// after, so reading it here from the receive thread is race-free.
+			if (!allowed.empty() && std::find(allowed.begin(), allowed.end(), lastId) == allowed.end())
+			{
+				badIds.fetch_add(1);
+			}
+			return true;
+		}
+		std::atomic<int> writes{0};
+		std::atomic<int> badIds{0};
+		std::string lastId;
+		std::vector<std::string> allowed;
+	};
+}
+
+TEST(MediaBridgeParticipantId, WriteAudioGetsTheBridgesOwnIdAndNothingAfterStop)
+{
+	RtpReceiver receiver;
+	RtpSender sender;
+	IdRecordingAnchorClient anchor;
+	MediaBridge bridge;
+	bridge.init(&receiver, &sender, &anchor);
+	const auto tick = ulawTick(0xAA);
+
+	ASSERT_TRUE(bridge.startBridge("127.0.0.1", 5004, "call-701", "part-701"));
+	bridge.onHandsetRtp(tick.data(), tick.size());
+	ASSERT_EQ(anchor.writes, 1) << "positive control: a live bridge writes the frame";
+	EXPECT_EQ(anchor.lastId, "part-701");
+
+	bridge.stopBridge();
+	bridge.onHandsetRtp(tick.data(), tick.size());
+	EXPECT_EQ(anchor.writes, 1) << "a stopped bridge writes nothing";
+
+	// The slot is reused for a call with a LONGER id (the reassignment that made
+	// the unlocked read a dangling view): the id delivered is the new one, whole.
+	ASSERT_TRUE(bridge.startBridge("127.0.0.1", 5004, "call-701b", "participant-701-longer"));
+	bridge.onHandsetRtp(tick.data(), tick.size());
+	ASSERT_EQ(anchor.writes, 2);
+	EXPECT_EQ(anchor.lastId, "participant-701-longer");
+	bridge.stopBridge();
+}
+
+TEST(MediaBridgeParticipantId, HandsetRtpRacingStopAndStartDeliversOnlyWholeIds)
+{
+	// Two threads, as on the device: the receive task pumps frames while the
+	// SIP thread stops and restarts the bridge with ids of different lengths.
+	// Under -fsanitize=thread this is the red for #701 without the fix (a data
+	// race on _participantId between onHandsetRtp and stopBridge/startBridge);
+	// with or without TSAN, every id delivered must be one of the two whole ids,
+	// never a torn or stale one.
+	RtpReceiver receiver;
+	RtpSender sender;
+	IdRecordingAnchorClient anchor;
+	anchor.allowed = {"part-short", "participant-very-much-longer"};
+	MediaBridge bridge;
+	bridge.init(&receiver, &sender, &anchor);
+	const auto tick = ulawTick(0xAA);
+
+	std::atomic<bool> done{false};
+	std::thread rtpTask([&] {
+		while (!done.load(std::memory_order_acquire))
+		{
+			bridge.onHandsetRtp(tick.data(), tick.size());
+		}
+	});
+	bool started = true;
+	for (int i = 0; i < 2000 && started; ++i)
+	{
+		started = bridge.startBridge("127.0.0.1", 5004, "call-701r",
+			(i & 1) ? "participant-very-much-longer" : "part-short");
+		bridge.stopBridge();
+	}
+	done.store(true, std::memory_order_release);
+	rtpTask.join();
+	EXPECT_TRUE(started) << "startBridge failed mid-loop";
+	EXPECT_EQ(anchor.badIds.load(), 0) << "a frame was written with a torn or stale participant id";
 }

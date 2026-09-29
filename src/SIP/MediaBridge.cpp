@@ -186,7 +186,25 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 	// genuinely broken write path instead of pumping audio into it forever.
 	if (_anchor)
 	{
-		recordWriteAudioResult(_anchor->writeAudio(_participantId, decoded, decodedCount));
+		// #701: snapshot _participantId under _mutex, as feedMohTick() and
+		// dtmfSinkTrampoline() do. stopBridge() stores _active=false and then
+		// clears the string, and startBridge() reassigns it, both under this
+		// lock on the SIP thread; reading the std::string here unlocked, on the
+		// receive task, was a torn read, or a dangling view once the slot was
+		// reused for a longer id. Blocking here is safe: nothing holds _mutex
+		// while waiting on this task (RtpReceiver::stop() only flags and shuts
+		// the socket). Fixed buffer, no allocation, as in feedMohTick().
+		char participantIdBuf[kMohParticipantIdBufSize];
+		size_t participantIdLen = 0;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			if (!_active.load(std::memory_order_acquire)) return;
+			participantIdLen = _participantId.size();
+			if (participantIdLen >= sizeof(participantIdBuf)) return;   // refuse, never truncate
+			std::memcpy(participantIdBuf, _participantId.data(), participantIdLen);
+		}
+		recordWriteAudioResult(_anchor->writeAudio(
+			std::string_view(participantIdBuf, participantIdLen), decoded, decodedCount));
 	}
 }
 
