@@ -3302,9 +3302,10 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 		return _getClient != nullptr;
 	};
 
+	int attempt = 0;   // #379: read after the loop (a spent budget is reported)
 	if (_getClient)
 	{
-		for (int attempt = 0; attempt < kMaxAttempts && keepRunning(); ++attempt)
+		for (; attempt < kMaxAttempts && keepRunning(); ++attempt)
 		{
 			const int64_t openT0 = esp_timer_get_time();
 			esp_err_t err = esp_http_client_open(_getClient, 0);
@@ -3416,6 +3417,18 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	{
 		ESP_LOGW(TAG, "GET (Telephony->device) stream never opened — no inbound audio");
 		teardownGetClient();
+		// #379: refused for the whole budget and nobody is tearing the call down, so
+		// nothing else will drop this leg. Report it; RequestsHandler drops it unless it
+		// is a 911/933 (#604). Not dropCall(): its stopMediaStreams() joins this task.
+		if (attempt >= kMaxAttempts && keepRunning())
+		{
+			EventCallback evCb;
+			{
+				std::lock_guard<std::mutex> lock(_mutex);
+				evCb = _eventCb;
+			}
+			if (evCb) evCb(CallEvent{CallEvent::MediaNeverOpened, activePartId, "", ""});
+		}
 		return;
 	}
 	ESP_LOGI(TAG, "GET (Telephony->device) audio stream OPEN: %s", getUrl.c_str());

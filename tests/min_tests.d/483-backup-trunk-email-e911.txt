@@ -1,0 +1,4 @@
+# ConfigExportImport_test.cpp: trunk, SMTP, E911 and admin_ext round-trip through
+# export -> factory reset -> import, their secrets only inside secretsEnc; an
+# imported trunk pointed at this board is skipped, not stored (#483)
+2

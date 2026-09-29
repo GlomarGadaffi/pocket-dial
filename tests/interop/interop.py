@@ -343,7 +343,11 @@ class BaresipUA:
         ])
         with open(os.path.join(self.cfgdir, "config"), "w") as f:
             f.write(cfg)
-        acct = "<sip:%s@%s>;auth_pass=%s;outbound=\"sip:%s:%d\";regint=300;answermode=auto;audio_codecs=PCMU,PCMA\n" % (
+        # answermode=manual: BS only ever dials. Auto-answering the PBX's
+        # register-beep call put the PBX's BYE right on "Call established",
+        # and baresip 1.1.0's aufile teardown race then died ("auframe: init:
+        # unsupported sample format"), breaking mixed_stack's ctrl pipe.
+        acct = "<sip:%s@%s>;auth_pass=%s;outbound=\"sip:%s:%d\";regint=300;answermode=manual;audio_codecs=PCMU,PCMA\n" % (
             self.ext, PBX_IP, self.ext, PBX_IP, PBX_SIP_PORT)
         with open(os.path.join(self.cfgdir, "accounts"), "w") as f:
             f.write(acct)
