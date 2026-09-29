@@ -274,8 +274,9 @@ private:
 	// The anchor-side participant id this bridge serves. Written only on the SIP
 	// thread, under _mutex. Every reader on another task copies it into a fixed
 	// kMohParticipantIdBufSize buffer under a short, standalone _mutex hold and
-	// never reads it directly: feedMohTick() (HoldMusic's pacing task, #218),
-	// dtmfSinkTrampoline() and onHandsetRtp() (the RTP rx task, #284/#701).
+	// never reads it directly: feedMohTick() (HoldMusic's pacing task, #218) and
+	// onHandsetRtp() (the RTP rx task, #701). dtmfSinkTrampoline() snapshots
+	// _callID, not this, the same way (#284).
 	std::string       _participantId;
 
 	// Set once at wiring time, before any bridge starts, and never mutated after —
