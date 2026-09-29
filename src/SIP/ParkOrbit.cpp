@@ -348,6 +348,12 @@ bool ParkOrbit::handleOk(const std::shared_ptr<SipMessage>& data)
 					rb->setPeerCallID(slot.callID);
 					rb->setLocalTag(slot.rbFromTag);
 					rb->setParkUac(true);
+					// #718: onBye's peer branch only BYEs the parker when both dialog
+					// headers are set, and it sends (getDialogTo(), getDialogFrom()) as
+					// (From, To). We are the UAC here, so the capture is swapped: dialogTo
+					// is OUR From (our tag), dialogFrom is the parker's To (its tag), and
+					// the BYE goes out From=ours To=parker's.
+					rb->setDialogHeaders(std::string(data->getTo()), std::string(data->getFrom()));
 					rb->setInviteMessage(data);
 					_env.insertSession(slot.rbCallID, rb);
 					rb->setState(Session::State::Connected);
