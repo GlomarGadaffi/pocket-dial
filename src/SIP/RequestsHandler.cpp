@@ -111,6 +111,7 @@ namespace
 	// still refusing a pathological value outright rather than silently
 	// truncating it somewhere downstream.
 	constexpr size_t kMaxAorLen = 64;
+	static_assert(pbx::EmergencyCallbacks::kMaxExt >= kMaxAorLen, "#659");
 
 	// How long a CONNECTED outbound anchor call waits for the handset's ACK before
 	// tick() treats it as abandoned (handset gone, or its 200 OK arrived too late)
@@ -2332,6 +2333,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 	_sessions.emplace(data->getCallID(), newSession);
+	newSession->setEmergency(isEmergencyCallback(called.value()->getNumber()));   // #659
 
 	// Retain the original INVITE on every direct-call session — not only when
 	// the callee has a conditional forward (busy/no-answer) configured.
@@ -4037,6 +4039,8 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	auto markEmergency = [&] {
 		auto s = _sessions.find(data->getCallID());   // std::less<> map: no copy on the 911 path
 		if (s != _sessions.end() && s->second) s->second->setEmergency(true);
+		// #659: opens this extension's PSAP callback window.
+		_emergencyCallbacks.note(caller->getNumber(), std::chrono::steady_clock::now());
 	};
 	bool placed = false;
 	bool codecRejected = false;
@@ -4932,6 +4936,9 @@ void RequestsHandler::routeInboundAnchorCall(const std::string& participantId, c
 	}
 	session->setAnchor(true);
 	session->setAnchorInbound(true);
+	// #659: ring-all reaches every target, so any one in its window flags it.
+	session->setEmergency(std::any_of(targets.begin(), targets.end(),
+		[this](const auto& t) { return isEmergencyCallback(t->getNumber()); }));
 	session->setState(Session::State::Invited);
 	session->setLocalTag(fromTag);
 	session->setUacBranch(branch);

@@ -1450,6 +1450,61 @@ TEST(OtaReboot, RebootAndFactoryResetAreRefusedDuringAnEmergencyCall)
 	AdminAuth::clearCredential();
 }
 
+// #659: a PSAP callback after the 911 has ended is an emergency call too, so a
+// reboot is refused while it is up. Loopback anchor only, as in #652's test.
+TEST(OtaReboot, RebootIsRefusedDuringAPsapCallback)
+{
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.setAnchorPlacesRealCallsForTest(true);
+
+	sockaddr_in hs{};
+	hs.sin_family = AF_INET;
+	hs.sin_addr.s_addr = inet_addr("192.168.4.11");
+	hs.sin_port = htons(5060);
+	handler.handle(RequestsHandler::getMessageFromPool(
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bK659r\r\n"
+		"From: <sip:101@server>;tag=r659\r\nTo: <sip:101@server>\r\n"
+		"Call-ID: reg-659\r\nCSeq: 1 REGISTER\r\n"
+		"Contact: <sip:101@192.168.4.11:5060>;expires=3600\r\nContent-Length: 0\r\n\r\n", hs));
+	const std::string sdp =
+		"v=0\r\no=- 0 0 IN IP4 192.168.4.11\r\ns=-\r\nc=IN IP4 192.168.4.11\r\nt=0 0\r\n"
+		"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(
+		"INVITE sip:911@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bK659i\r\n"
+		"From: <sip:101@server>;tag=i659\r\nTo: <sip:911@server>\r\n"
+		"Call-ID: e911-659\r\nCSeq: 1 INVITE\r\nMax-Forwards: 70\r\n"
+		"Contact: <sip:101@192.168.4.11:5060>\r\nContent-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp, hs));
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+	ASSERT_EQ(loop->lastMakeCallDestination(), "911") << "precondition: the 911 was placed";
+	handler.handle(RequestsHandler::getMessageFromPool(
+		"BYE sip:911@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bK659b\r\n"
+		"From: <sip:101@server>;tag=i659\r\nTo: <sip:911@server>;tag=srv\r\n"
+		"Call-ID: e911-659\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n", hs));
+	ASSERT_FALSE(handler.hasLiveEmergencyCall()) << "precondition: the 911 has ended";
+	ASSERT_FALSE(handler.routeInboundAnchorCallForTest("800", "psap-659", "PSAP").empty())
+		<< "precondition: the callback rings 101";
+
+	HttpServer server("127.0.0.1", 0, nullptr);
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(port);
+
+	const std::string reboot = httpPostRaw(port, "/api/ota/reboot", "confirm=1", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(reboot), 409) << reboot;
+	EXPECT_NE(bodyOf(reboot).find("emergency call in progress"), std::string::npos) << reboot;
+
+	AdminAuth::clearCredential();
+}
+
 TEST(OtaUpdater, ProgressFlagTracksSessionLifecycle)
 {
 	EXPECT_FALSE(OtaUpdater::isUpdateInProgress());
