@@ -408,7 +408,8 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	// Strict, with no tag fallback, on purpose. A forged EARLY response is what
 	// SUPPLIES the peer's tag, so there is nothing to match it against. And a
 	// wrongly dropped response cannot strand a billing leg: Trying, Proceeding
-	// and Terminating are all swept, and nothing we send in Confirmed awaits
+	// (except a 911/933, #712, which the caller or the carrier ends) and
+	// Terminating are all swept, and nothing we send in Confirmed awaits
 	// an answer.
 	//
 	// Dropped AND consumed: returning false would hand a carrier-dialog
@@ -635,7 +636,7 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 	//      match. The carrier's tag (our toTag) is minted by the far end, not by
 	//      IDGen, so an off-path sender has to have seen the dialog to know it.
 	//      Confirmed only, because the no-reaper cost above is a Confirmed-only
-	//      cost: an early dialog is swept, and a 180 can latch toTag before any
+	//      cost: an early dialog is swept (a ringing 911/933 excepted, #712), and a 180 can latch toTag before any
 	//      answer. RFC 3261 s15 forbids the callee a BYE on an early dialog, so
 	//      this refuses nothing a real carrier sends; Terminating is left out
 	//      too, since our own BYE is already pending and sweep() reclaims it.

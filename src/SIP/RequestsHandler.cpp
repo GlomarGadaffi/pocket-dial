@@ -7559,6 +7559,23 @@ void RequestsHandler::sweepExpired()
 
 		if (keepAliveTimedOut || leaseExpired)
 		{
+			// #712 (desmo, 2026-09-29): a lapsed lease never ends a 911/933. Skip the
+			// client, before any log line or allocation (this runs at 1 Hz for the
+			// whole call), until its emergency call has ended; the next sweep after
+			// that prunes it as usual.
+			bool emergencyLive = false;
+			for (const auto& [cid, s] : _sessions)
+			{
+				if (s->isEmergency() &&
+				    ((s->getSrc() && s->getSrc()->getNumber() == client->getNumber()) ||
+				     (s->getDest() && s->getDest()->getNumber() == client->getNumber())))
+				{
+					emergencyLive = true;
+					break;
+				}
+			}
+			if (emergencyLive) continue;
+
 			if (keepAliveTimedOut)
 			{
 				queueLog("Pruning client due to missed OPTIONS keepalive pings: " + client->getNumber());
@@ -7575,22 +7592,16 @@ void RequestsHandler::sweepExpired()
 			// from _sessions.
 			const std::string extension = client->getNumber();
 			std::vector<std::pair<std::string, std::string>> ending;   // {callID, other party}
-			bool emergencyLive = false;
 			for (const auto& [cid, s] : _sessions)
 			{
 				const bool isSrc = s->getSrc() && s->getSrc()->getNumber() == extension;
 				const bool isDest = s->getDest() && s->getDest()->getNumber() == extension;
 				if (isSrc || isDest)
 				{
-					if (s->isEmergency()) emergencyLive = true;
 					const auto& other = isSrc ? s->getDest() : s->getSrc();
 					ending.emplace_back(cid, other ? other->getNumber() : std::string());
 				}
 			}
-			// #712 (desmo, 2026-09-29): a lapsed lease never ends a 911/933. Keep the
-			// client, and its calls, until the emergency call has ended; the next
-			// sweep after that prunes it as usual.
-			if (emergencyLive) continue;
 			for (const auto& [cid, other] : ending)
 			{
 				endCall(cid, extension, other, leaseExpired ? "registration lease expired"
