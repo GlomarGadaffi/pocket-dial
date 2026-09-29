@@ -48,7 +48,13 @@
 // nothing. Whatever was dialed, the BARE number is what gets routed: the trunk
 // is always handed "911", never "9911" and never "11".
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
 #include <string_view>
+
+#include "PoolConfig.hpp"
 
 namespace pbx
 {
@@ -120,6 +126,58 @@ inline EmergencyDial classifyEmergencyDial(std::string_view dialed)
 	out.hadTrunkPrefix = out.isEmergency && prefixed;
 	return out;
 }
+
+// ── PSAP callback window (#659) ──────────────────────────────────────────────
+//
+// A PSAP calling back is not recognised by caller ID, because callback numbers
+// vary. An inbound call to an extension that dialed 911 or 933 within this
+// window is an emergency session instead (Session::isEmergency()).
+inline constexpr std::chrono::minutes kEmergencyCallbackWindow{30};
+
+// When each extension last dialed 911/933. Fixed storage, no heap: one mark per
+// client slot, since only a registered extension can dial. More distinct dialers
+// than that overwrite the oldest mark.
+class EmergencyCallbacks
+{
+public:
+	static constexpr std::size_t kMaxExt = 64;   // RequestsHandler's kMaxAorLen
+
+	void note(std::string_view ext, std::chrono::steady_clock::time_point now)
+	{
+		if (ext.empty() || ext.size() > kMaxExt) return;
+		Mark* slot = &_marks[0];
+		for (Mark& m : _marks)
+		{
+			if (m.view() == ext) { slot = &m; break; }
+			if (m.at < slot->at) slot = &m;
+		}
+		std::copy(ext.begin(), ext.end(), slot->ext.begin());
+		slot->len = ext.size();
+		slot->at = now;
+	}
+
+	bool open(std::string_view ext, std::chrono::steady_clock::time_point now) const
+	{
+		for (const Mark& m : _marks)
+			if (m.len != 0 && m.view() == ext && now - m.at < kEmergencyCallbackWindow) return true;
+		return false;
+	}
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only: move every mark `d` into the past.
+	void ageForTest(std::chrono::steady_clock::duration d) { for (Mark& m : _marks) m.at -= d; }
+#endif
+
+private:
+	struct Mark
+	{
+		std::array<char, kMaxExt> ext{};
+		std::size_t len = 0;
+		std::chrono::steady_clock::time_point at{};
+		std::string_view view() const { return {ext.data(), len}; }
+	};
+	std::array<Mark, POCKETDIAL_MAX_CLIENTS> _marks{};
+};
 
 } // namespace pbx
 
