@@ -767,7 +767,7 @@ void heapProbeTask(void*)
 
 	probePrintf("HeapProbe: leak probe armed: %u records in PSRAM, HEAP_TRACE_LEAKS. "
 		"Aggregating by call site (table %u, cannot overflow). "
-		"Dumps at 120/240/360/900 s (#273 onset measured 218-276 s), then gauge "
+		"Dumps at 120/240/360/900 s (#374: 360 s+ never reached yet), then gauge "
 		"every %us and full dump every %us thereafter (#331).\n",
 		static_cast<unsigned>(kTraceRecords), static_cast<unsigned>(kMaxSites),
 		static_cast<unsigned>(kGaugeSec), static_cast<unsigned>(kPeriodicSec));
