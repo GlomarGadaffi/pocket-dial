@@ -650,15 +650,32 @@ TEST(MediaBridgeParticipantId, HandsetRtpRacingStopAndStartDeliversOnlyWholeIds)
 			bridge.onHandsetRtp(tick.data(), tick.size());
 		}
 	});
+	// Each cycle waits (bounded) until the pump has actually delivered a frame
+	// on the live bridge before stopping it, so the pump is mid-read while
+	// stopBridge() clears the id and startBridge() reassigns it -- the race the
+	// test exists for. Without the wait the pump could miss every live window
+	// and the test would pass on no writes at all. 150 cycles: each pays the
+	// host RtpSender::stop() join (~20 ms).
 	bool started = true;
-	for (int i = 0; i < 2000 && started; ++i)
+	int cyclesWithAWrite = 0;
+	for (int i = 0; i < 150 && started; ++i)
 	{
 		started = bridge.startBridge("127.0.0.1", 5004, "call-701r",
 			(i & 1) ? "participant-very-much-longer" : "part-short");
+		const int before = anchor.writes.load();
+		for (int spin = 0; spin < 100000 && anchor.writes.load() == before; ++spin)
+		{
+			std::this_thread::yield();
+		}
+		if (anchor.writes.load() != before) ++cyclesWithAWrite;
 		bridge.stopBridge();
 	}
 	done.store(true, std::memory_order_release);
 	rtpTask.join();
 	EXPECT_TRUE(started) << "startBridge failed mid-loop";
+	// Positive control: the pump really wrote on live bridges, so the id check
+	// below is not vacuous.
+	EXPECT_GT(anchor.writes.load(), 0) << "the pump never reached writeAudio()";
+	EXPECT_GT(cyclesWithAWrite, 0);
 	EXPECT_EQ(anchor.badIds.load(), 0) << "a frame was written with a torn or stale participant id";
 }

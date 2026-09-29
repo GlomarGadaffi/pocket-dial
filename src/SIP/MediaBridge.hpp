@@ -216,6 +216,8 @@ private:
 	// deliver a tick rather than silently truncate if this is ever exceeded —
 	// see its doc comment for why a truncated id is a correctness hazard
 	// (could collide with a different call's slot), not just a lost frame.
+	// Since #701 onHandsetRtp() uses the same buffer for the main handset-to-
+	// anchor audio path, so an id at or over this size is refused there too.
 	static constexpr size_t kMohParticipantIdBufSize = 32;
 
 	// Issue #284: fixed capacity for dtmfSinkTrampoline()'s on-stack Call-ID
@@ -269,13 +271,11 @@ private:
 	// because the media callbacks read it outside _mutex.
 	std::atomic<int>  _busPort{-1};
 	std::string       _callID;
-	// The anchor-side participant id this bridge serves. Read/written under
-	// _mutex almost everywhere already; feedMohTick() (issue #218) is the one
-	// caller that reads it from a different thread than the SIP thread that
-	// writes it (HoldMusic's pacing task, not RtpReceiver's rx task like
-	// onHandsetRtp()'s read below), so it copies this into a fixed buffer
-	// under a short, standalone _mutex hold rather than reading it directly —
-	// see feedMohTick()'s doc comment in the header and its .cpp body.
+	// The anchor-side participant id this bridge serves. Written only on the SIP
+	// thread, under _mutex. Every reader on another task copies it into a fixed
+	// kMohParticipantIdBufSize buffer under a short, standalone _mutex hold and
+	// never reads it directly: feedMohTick() (HoldMusic's pacing task, #218),
+	// dtmfSinkTrampoline() and onHandsetRtp() (the RTP rx task, #284/#701).
 	std::string       _participantId;
 
 	// Set once at wiring time, before any bridge starts, and never mutated after —
