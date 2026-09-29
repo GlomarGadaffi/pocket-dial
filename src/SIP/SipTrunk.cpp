@@ -977,7 +977,7 @@ bool SipTrunk::handleRegisterResponse(const std::shared_ptr<SipMessage>& data)
 		const std::string_view received = param(";received="), rport = param(";rport=");
 		const std::string_view expires = sv(v.expires), contact = sv(v.contact);
 		char line[200];   // under LogQueue's 256-byte cap; Contact is cut first
-		std::snprintf(line, sizeof(line),
+		const int len = std::snprintf(line, sizeof(line),
 			"Trunk: REGISTER <- %.*s; Expires %.*s, granted %us; Via received=%.*s rport=%.*s; Contact %.*s",
 			static_cast<int>(std::min<size_t>(status.size(), 64)), status.data(),
 			static_cast<int>(std::min<size_t>(expires.size(), 10)), expires.data(),
@@ -985,7 +985,7 @@ bool SipTrunk::handleRegisterResponse(const std::shared_ptr<SipMessage>& data)
 			static_cast<int>(std::min<size_t>(received.size(), 40)), received.data(),
 			static_cast<int>(std::min<size_t>(rport.size(), 6)), rport.data(),
 			static_cast<int>(contact.size()), contact.data());
-		_env.log(line);
+		if (len > 0) _env.log(line);   // a truncated line is still whole up to the cap
 	}
 #endif
 	if (after != before && after == SipRegistrationClient::State::Registered)
