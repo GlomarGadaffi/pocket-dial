@@ -1,11 +1,9 @@
 #pragma once
 
-#include <charconv>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
 #include <string_view>
 
-#include "SipHeaderUtil.hpp"
 #include "SipMessage.hpp"
 
 // RFC 4028 session timers (#198): the 422 floor onInvite() applies, and the
@@ -27,28 +25,6 @@ namespace pbx
 		return requestMinSE > kSessionTimerMinSE ? requestMinSE : kSessionTimerMinSE;
 	}
 
-	// True when the request's Supported list (full or compact `k:` form) carries
-	// the "timer" option tag. ponytail: reads the first Supported line only; a
-	// phone that splits its option tags over several lines reads as no timer,
-	// which only turns the timer off (see answerSessionTimer).
-	inline bool supportsTimer(const SipMessage& request)
-	{
-		std::string_view v = request.getHeaderLine("Supported");
-		if (v.empty()) v = request.getHeaderLine("k");
-		v = siphdr::stripHeaderNameView(v);
-		while (!v.empty())
-		{
-			const size_t comma = v.find(',');
-			std::string_view tag = v.substr(0, comma);
-			while (!tag.empty() && (tag.front() == ' ' || tag.front() == '\t')) tag.remove_prefix(1);
-			while (!tag.empty() && (tag.back() == ' ' || tag.back() == '\t')) tag.remove_suffix(1);
-			if (tag == "timer") return true;
-			if (comma == std::string_view::npos) break;
-			v.remove_prefix(comma + 1);
-		}
-		return false;
-	}
-
 	// RFC 4028 §9 for a 2xx to an INVITE, re-INVITE or UPDATE that this PBX
 	// answers as the UAS. `response` is a clone of `request`, so it arrives
 	// carrying the phone's own Session-Expires (with no refresher) and Require.
@@ -61,23 +37,24 @@ namespace pbx
 	// oblige the answer to keep). Otherwise the answer carries NO Session-Expires,
 	// which §7.2 defines as no session expiration: the phone then neither
 	// refreshes nor ends the call on a timer nobody services.
+	//
+	// ponytail: "timer" is a substring match on the first Supported (or compact
+	// `k:`) line, kept small for the 4 MB build (#689). No other registered
+	// option tag contains "timer"; tokenise the list if one ever does.
 	inline void answerSessionTimer(SipMessage& response, const SipMessage& request)
 	{
+		response.removeHeaders("Session-Expires");
 		response.removeHeaders("x");         // compact Session-Expires (RFC 4028 §4)
 		response.removeHeaders("Require");   // the phone's own, cloned in
+		std::string_view supported = request.getHeaderLine("Supported");
+		if (supported.empty()) supported = request.getHeaderLine("k");
 		const uint32_t secs = request.getSessionExpiresSecs();
-		if (secs == 0 || request.getSessionExpiresRefresher() == "uas" || !supportsTimer(request))
-		{
-			response.removeHeaders("Session-Expires");
-			return;
-		}
-		constexpr std::string_view kUac = ";refresher=uac";
-		char value[10 + kUac.size()]{};   // 10 = digits in UINT32_MAX
-		const auto conv = std::to_chars(value, value + 10, secs);
-		if (conv.ec != std::errc{}) return;   // unreachable: 10 digits always fit
-		std::memcpy(conv.ptr, kUac.data(), kUac.size());
-		response.setHeaderOnce("Session-Expires",
-			std::string_view(value, static_cast<size_t>(conv.ptr - value) + kUac.size()));
+		if (secs == 0 || request.getSessionExpiresRefresher() == "uas" ||
+		    supported.find("timer") == std::string_view::npos) return;
+		char value[32]{};   // 10 digits of UINT32_MAX + ";refresher=uac"
+		const int n = std::snprintf(value, sizeof(value), "%lu;refresher=uac", static_cast<unsigned long>(secs));
+		if (n <= 0 || static_cast<size_t>(n) >= sizeof(value)) return;   // unreachable: always fits
+		response.addHeader("Session-Expires", std::string_view(value, static_cast<size_t>(n)));
 		response.addHeader("Require", "timer");
 	}
 }
