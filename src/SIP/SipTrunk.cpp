@@ -425,7 +425,8 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	// Strict, with no tag fallback, on purpose. A forged EARLY response is what
 	// SUPPLIES the peer's tag, so there is nothing to match it against. And a
 	// wrongly dropped response cannot strand a billing leg: Trying, Proceeding
-	// and Terminating are all swept, and nothing we send in Confirmed awaits
+	// (except a 911/933, #712, which the caller or the carrier ends) and
+	// Terminating are all swept, and nothing we send in Confirmed awaits
 	// an answer.
 	//
 	// Dropped AND consumed: returning false would hand a carrier-dialog
@@ -673,7 +674,7 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 	//      match. The carrier's tag (our toTag) is minted by the far end, not by
 	//      IDGen, so an off-path sender has to have seen the dialog to know it.
 	//      Confirmed only, because the no-reaper cost above is a Confirmed-only
-	//      cost: an early dialog is swept, and a 180 can latch toTag before any
+	//      cost: an early dialog is swept (a ringing 911/933 excepted, #712), and a 180 can latch toTag before any
 	//      answer. RFC 3261 s15 forbids the callee a BYE on an early dialog, so
 	//      this refuses nothing a real carrier sends; Terminating is left out
 	//      too, since our own BYE is already pending and sweep() reclaims it.
@@ -770,6 +771,17 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 		// hangup(), which is what reclaims a slot whose BYE went unanswered, so
 		// nothing leaks by exempting only this state.
 		if (d.state == State::Confirmed) continue;
+
+		// #712 (desmo, 2026-09-29): a 911/933 the carrier is working on (any 1xx
+		// seen, so Proceeding) gets no PBX-side no-answer bound; a PSAP may queue
+		// it past 60 s. A 911 that never drew a provisional (still Trying) keeps
+		// this deadline: Timer B only logs here, so this is what ends it.
+		// routeEmergencyCall() always hands the trunk the bare number (pstnUri).
+		if (d.state == State::Proceeding &&
+		    (d.destE164 == pbx::kEmergencyNumber || d.destE164 == pbx::kEmergencyTestNumber))
+		{
+			continue;
+		}
 
 		_env.log("Trunk: dialog timed out in state "
 			+ std::to_string(static_cast<int>(d.state)) + " (" + d.destE164 + ")", true);

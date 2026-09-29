@@ -1321,3 +1321,52 @@ TEST(AnchorRouting, AnAnchorCallWhoseHandsetGoesSilentIsEndedButNeverWhileHeld)
 	}
 	EXPECT_EQ(byes, 1u);
 }
+
+TEST(AnchorRouting, ARingingEmergencyAnchorCallIsNeverReapedForNoAnswer)
+{
+	// #712 (desmo): a 911/933 still ringing on the anchor gets no PBX-side
+	// no-answer bound (ANCHOR_NO_ANSWER_TIMEOUT); a PSAP may queue it past
+	// 60 s, and the caller's own CANCEL still ends it. The host anchor is
+	// Loopback, which answers synchronously, so the ringing window is recreated
+	// on each session (back to Invited, ring timer expired), as in the #548
+	// test above. Control first: an ordinary anchored call in the same state IS
+	// reaped, so the reap really ran.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.setAnchorPlacesRealCallsForTest(true);   // loopback stands in for a real provider
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-712c"));
+	auto plain = handler.getSession("Call-ID: anchor-712c");
+	ASSERT_TRUE(plain.has_value());
+	ASSERT_FALSE(plain.value()->isEmergency());
+	plain.value()->setState(Session::State::Invited);
+	plain.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_FALSE(handler.getSession("Call-ID: anchor-712c").has_value())
+		<< "control: an ordinary ringing anchor call past its no-answer bound is reaped";
+
+	handler.handle(makeInvite("501", "911", "192.168.9.51", "anchor-712e"));
+	auto e911 = handler.getSession("Call-ID: anchor-712e");
+	ASSERT_TRUE(e911.has_value()) << "precondition: 911 was routed to the anchor";
+	ASSERT_TRUE(e911.value()->isEmergency()) << "precondition: routeEmergencyCall flagged it";
+	e911.value()->setState(Session::State::Invited);
+	e911.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+
+	EXPECT_TRUE(handler.getSession("Call-ID: anchor-712e").has_value())
+		<< "a ringing 911 was reaped for no answer";
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		const std::string raw = msg ? msg->toString() : std::string();
+		EXPECT_NE(raw.rfind("SIP/2.0 4", 0), 0u) << "the 911 caller got a failure:\n" << raw;
+		EXPECT_NE(raw.rfind("SIP/2.0 5", 0), 0u) << "the 911 caller got a failure:\n" << raw;
+	}
+}
