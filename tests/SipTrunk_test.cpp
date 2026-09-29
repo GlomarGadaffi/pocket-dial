@@ -2127,3 +2127,167 @@ TEST(SipTrunkByeAuth, A407ToOurByeIsAnsweredInProxyAuthorizationAsTheAuthUser)
 	EXPECT_EQ(f.trunk.activeDialogs(), 1u);
 	EXPECT_EQ(f.trunk.refusedByeRetries(), 0u);
 }
+
+// ── Record-Route (#748) ──────────────────────────────────────────────────────
+//
+// RFC 3261 s12.1.2: the UAC's route set is the 2xx's Record-Route, reversed.
+// s12.2.1.1: every in-dialog request carries it, and goes to its first hop.
+
+namespace
+{
+	// A 200 to the INVITE with `recordRoute` (complete header lines) added.
+	std::string okWithRecordRoute(const SipTrunk::Dialog& d, const std::string& recordRoute)
+	{
+		std::string ok = okFor(d);
+		ok.insert(ok.find("Contact:"), recordRoute);
+		return ok;
+	}
+
+	const std::string kRouteHeader = "Route: <sip:198.51.100.7:5070;lr>, <sip:198.51.100.8:5062;lr>";
+}
+
+TEST(SipTrunkRoute, AckAndByeCarryTheRouteSetOnlyWhenThereIsOne)
+{
+	auto d = pinnedDialog();
+	d.toTag        = "carrier-tag";
+	d.remoteTarget = "sip:+15551234567@203.0.113.99:5060";
+
+	EXPECT_EQ(SipTrunk::buildBye(d, "z9hG4bKbye77").find("Route:"), std::string::npos);
+	EXPECT_EQ(SipTrunk::buildAckFor2xx(d, "z9hG4bKack99").find("Route:"), std::string::npos);
+
+	d.routeSet = "<sip:198.51.100.7:5070;lr>, <sip:198.51.100.8:5062;lr>";
+	EXPECT_TRUE(hasLine(SipTrunk::buildBye(d, "z9hG4bKbye77"), kRouteHeader));
+	EXPECT_TRUE(hasLine(SipTrunk::buildAckFor2xx(d, "z9hG4bKack99"), kRouteHeader));
+	// Out of dialog, or in the INVITE's own transaction: no Route.
+	EXPECT_EQ(SipTrunk::buildInvite(d, "v=0\r\n").find("Route:"), std::string::npos);
+	EXPECT_EQ(SipTrunk::buildAckForFailure(d).find("Route:"), std::string::npos);
+}
+
+TEST(SipTrunkRoute, TwoXxRecordRouteIsReversedAndAckAndByeGoToTheFirstHop)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+
+	// As the carrier's UAS copied them: the hop nearest the carrier first.
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okWithRecordRoute(*d,
+		"Record-Route: <sip:198.51.100.8:5062;lr>\r\n"
+		"Record-Route: <sip:198.51.100.7:5070;lr>\r\n"))));
+	EXPECT_EQ(d->routeSet, "<sip:198.51.100.7:5070;lr>, <sip:198.51.100.8:5062;lr>");
+
+	const sockaddr_in hop = FakePbxEnv::addr("198.51.100.7", 5070);
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_EQ(env.sent[1].raw.substr(0, 3), "ACK");
+	EXPECT_TRUE(hasLine(env.sent[1].raw, kRouteHeader));
+	EXPECT_EQ(env.sent[1].to.sin_addr.s_addr, hop.sin_addr.s_addr);
+	EXPECT_EQ(env.sent[1].to.sin_port, hop.sin_port);
+
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	ASSERT_EQ(env.sent.size(), 3u);
+	EXPECT_EQ(env.sent[2].raw.substr(0, 3), "BYE");
+	EXPECT_TRUE(hasLine(env.sent[2].raw, kRouteHeader));
+	EXPECT_EQ(env.sent[2].to.sin_addr.s_addr, hop.sin_addr.s_addr);
+	EXPECT_EQ(env.sent[2].to.sin_port, hop.sin_port);
+
+	// The 200 to the BYE comes back from the hop. An unrelated address is still
+	// dropped as forged (#356), so the hop's is not a blanket allowance.
+	const std::string byeOk = okFor(*d);
+	ASSERT_TRUE(trunk.handleResponse(std::make_shared<SipMessage>(byeOk,
+		FakePbxEnv::addr("198.51.100.99", 5060))));
+	EXPECT_EQ(trunk.forgedDialogResponses(), 1u);
+	EXPECT_EQ(trunk.activeDialogs(), 1u);
+	ASSERT_TRUE(trunk.handleResponse(std::make_shared<SipMessage>(byeOk, hop)));
+	EXPECT_EQ(trunk.forgedDialogResponses(), 1u);
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+}
+
+TEST(SipTrunkRoute, OneRecordRouteLineWithSeveralEntriesIsSplitAndReversed)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okWithRecordRoute(*d,
+		"Record-Route: <sip:198.51.100.8:5062;lr>, <sip:198.51.100.7:5070;lr>\r\n"))));
+	EXPECT_EQ(d->routeSet, "<sip:198.51.100.7:5070;lr>, <sip:198.51.100.8:5062;lr>");
+}
+
+// No Record-Route, a strict-router first hop, or an FQDN hop: the ACK and BYE
+// still go to the peer, as they did before #748.
+TEST(SipTrunkRoute, NoUsableRouteSetLeavesAckAndByeOnThePeer)
+{
+	const char* cases[] = {
+		"",                                                        // none
+		"Record-Route: <sip:198.51.100.7:5070>\r\n",               // strict router
+	};
+	for (const char* rr : cases)
+	{
+		FakePbxEnv env;
+		SipTrunk trunk(env);
+		trunk.setConfig(workingConfig());
+		ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+		const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+		ASSERT_NE(d, nullptr);
+		ASSERT_TRUE(trunk.handleResponse(responseFor(okWithRecordRoute(*d, rr))));
+		ASSERT_TRUE(trunk.hangup("handset-1"));
+		ASSERT_EQ(env.sent.size(), 3u) << rr;
+		for (size_t i = 1; i < 3; ++i)
+		{
+			EXPECT_EQ(env.sent[i].raw.find("Route:"), std::string::npos) << rr;
+			EXPECT_EQ(env.sent[i].to.sin_addr.s_addr, sbcAddr().sin_addr.s_addr) << rr;
+		}
+	}
+
+	// An FQDN hop keeps its Route header (the carrier's proxy reads it) but
+	// cannot be resolved here, so the packet still goes to the peer.
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okWithRecordRoute(*d,
+		"Record-Route: <sip:sbc.carrier.example;lr>\r\n"))));
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_TRUE(hasLine(env.sent[1].raw, "Route: <sip:sbc.carrier.example;lr>"));
+	EXPECT_EQ(env.sent[1].to.sin_addr.s_addr, sbcAddr().sin_addr.s_addr);
+}
+
+// #775 review: the 407/401 retry of a BYE is an in-dialog request like the one it
+// answers, so it carries the same Route set and goes to the same first hop. Left
+// on d.peer it reached the carrier with a Route naming a proxy it had skipped.
+TEST(SipTrunkRoute, ByeChallengeRetryGoesToTheFirstHopWithTheRouteSet)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-775"));
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okWithRecordRoute(*d,
+		"Record-Route: <sip:198.51.100.8:5062;lr>\r\n"
+		"Record-Route: <sip:198.51.100.7:5070;lr>\r\n"))));
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	ASSERT_EQ(env.sent.size(), 3u) << "INVITE, its ACK, the BYE";
+	const sockaddr_in hop = FakePbxEnv::addr("198.51.100.7", 5070);
+	ASSERT_EQ(env.sent[2].to.sin_addr.s_addr, hop.sin_addr.s_addr) << "positive control: the first BYE goes to the hop";
+
+	// The challenge comes back from the hop that took the BYE.
+	ASSERT_TRUE(trunk.handleResponse(std::make_shared<SipMessage>(
+		byeResponseFor(*d, 407, "Proxy-Authenticate"), hop)));
+
+	ASSERT_EQ(env.sent.size(), 4u);
+	EXPECT_EQ(env.sent[3].raw.substr(0, 3), "BYE");
+	EXPECT_NE(env.sent[3].raw.find("\r\nProxy-Authorization: Digest"), std::string::npos);
+	EXPECT_TRUE(hasLine(env.sent[3].raw, kRouteHeader));
+	EXPECT_EQ(env.sent[3].to.sin_addr.s_addr, hop.sin_addr.s_addr)
+		<< "the retry follows the Route set to its first hop, not the carrier peer";
+	EXPECT_EQ(env.sent[3].to.sin_port, hop.sin_port);
+}

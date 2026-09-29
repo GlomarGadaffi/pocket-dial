@@ -229,6 +229,20 @@ public:
 		// leaving the call up and billing.
 		std::string remoteTarget;
 
+		// Issue #748, RFC 3261 s12.1.2: the route set, from the Record-Route
+		// headers of the 2xx, reversed, held as one Route header value
+		// ("<sip:a;lr>, <sip:b;lr>"). Empty means none. Written as `Route:` on the
+		// ACK for the 2xx and on the BYE (s12.2.1.1). Only a loose-router first hop
+		// is honoured; a strict-router set is dropped, as before.
+		std::string routeSet;
+
+		// Where in-dialog requests are addressed: the first route hop when it is a
+		// dotted quad (an FQDN would need getaddrinfo on the SIP thread), else
+		// `peer`. Set by placeCall() and again by the 2xx. Responses and BYEs from
+		// it are accepted alongside `peer` (#356): the 2xx that named it already
+		// passed the peer check.
+		sockaddr_in nextHop{};
+
 		// The handset leg this trunk call is bridged to, so a teardown on either
 		// side can find the other.
 		std::string handsetCallID;
