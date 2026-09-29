@@ -688,6 +688,15 @@ public:
 		return bindOutboundParticipant(callId, ownLeg);
 	}
 
+	// Test-only (issue #379): what the anchor event callback does on
+	// CallEvent::MediaNeverOpened. The callback is wired only for a real anchor,
+	// never the host suite's Loopback. Not compiled into device firmware.
+	void anchorMediaNeverOpenedForTest(const std::string& participantId)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		anchorMediaNeverOpenedLocked(participantId);
+	}
+
 	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
 	// anchor's CallEvent::Incoming does, and return the new session's Call-ID
 	// line ("" if routing declined). Without this no host test can reach an
@@ -1693,6 +1702,8 @@ private:
 		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox);
 	void asyncDropCall(const std::string& participantId);
 	void asyncAnswerCall(const std::string& participantId);
+	// Issue #379: CallEvent::MediaNeverOpened. Caller holds _mutex.
+	void anchorMediaNeverOpenedLocked(const std::string& participantId);
 
 	// Bind an outbound call's own leg (from asyncMakeCall's successful makeCall())
 	// to its session, so the CallEvent::Answered/Dropped callback can match this

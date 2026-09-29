@@ -1,0 +1,2 @@
+# AnchorRouting_test.cpp: 3 (#379: a leg whose GET stream never opened is dropped once; an orphan is dropped; a 911 is kept)
+3
