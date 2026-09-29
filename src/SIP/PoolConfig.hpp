@@ -269,6 +269,19 @@
 #define POCKETDIAL_MAX_TRUNK_CALLS 2
 #endif
 
+// Issue #731: which outside-line paths this build carries. The constrained build
+// (main/CMakeLists.txt, -D SIP_OUTSIDE_LINE=anchor|trunk) sets exactly one of these
+// to 1; every other build, host tests included, keeps both. Nothing reads them yet:
+// compiling the unchosen path out is the rest of #731.
+#ifndef POCKETDIAL_HAS_ANCHOR
+#define POCKETDIAL_HAS_ANCHOR 1
+#endif
+#ifndef POCKETDIAL_HAS_TRUNK
+#define POCKETDIAL_HAS_TRUNK 1
+#endif
+static_assert(POCKETDIAL_HAS_ANCHOR || POCKETDIAL_HAS_TRUNK,
+              "a build needs at least one outside-line path (#731)");
+
 // Number of concurrent voicemail legs (Issue #246, Stage 3 of #194) -- deposit
 // (recording a caller's message) or retrieval (playing one back), never more
 // than one call at a time per leg. Each leg owns its own RtpReceiver/RtpSender

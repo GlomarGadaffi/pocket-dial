@@ -82,7 +82,8 @@ idf.py -p /dev/ttyUSB0 -D SIP_TRANSPORT=eth flash monitor
 | `display` | Guition JC3248W535 (LVGL touch) | Wallboard with an on-screen UI |
 | `lan8720` | Classic ESP32 + LAN8720 | Older hardware |
 
-Low on RAM? `-D SIP_CONSTRAINED=1` trims features to fit a classic ESP32.
+Low on RAM? `-D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=anchor` (or `trunk`) trims features to fit a
+classic ESP32. The constrained build carries one outside-line path, the 3CX anchor or the SIP trunk.
 
 Full instructions: **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** ·
 **[docs/HARDWARE.md](docs/HARDWARE.md)** · **[docs/FLASHING.md](docs/FLASHING.md)**

@@ -5,11 +5,14 @@
 #
 # Build (target MUST be classic esp32):
 #   idf.py -B build_constrained -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 \
+#          -D SIP_OUTSIDE_LINE=anchor \
 #          -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
 #          set-target esp32 build
 #
 # Transport-agnostic: works with lan8720 / wifi / eth. NOT for the display build
 # (that targets the 16MB S3). Pair with SIP_CONSTRAINED=1 to shrink the SIP pools.
+# SIP_CONSTRAINED=1 also requires SIP_OUTSIDE_LINE=anchor|trunk (#731): one outside
+# line per constrained build, the 3CX anchor OR the SIP trunk.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── No PSRAM ────────────────────────────────────────────────────────────────

@@ -257,7 +257,7 @@ endif()
 # heaviest consumer (one std::string buffer per slot), so it gets cut the most.
 # These override the #ifndef defaults in src/SIP/PoolConfig.hpp (32/8/32).
 # Pair with sdkconfig.defaults.esp32_constrained + partitions_4mb.csv:
-#   idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 \
+#   idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=anchor \
 #          -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
 #          set-target esp32 build
 if(SIP_CONSTRAINED)
@@ -300,6 +300,36 @@ if(SIP_CONSTRAINED)
     endif()
     message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 conference=off mwi=off rtpslots=3x3KBtx+4x6KBrx+1x6KBanchor=39KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
 endif()
+
+# Issue #731: the constrained build carries exactly ONE outside-line path, chosen at
+# configure time -- the 3CX telephony anchor OR the SIP trunk, never both:
+#   -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=anchor|trunk
+# It is required with SIP_CONSTRAINED and refused without it, so the knob can never
+# silently do nothing (the failure the pcap plumbing below was written to avoid).
+# Every other build keeps both paths. The result reaches the source as two 0/1
+# defines read with #if (SIP_CONSTRAINED is a CMake variable only, so an #if on it
+# guards nothing); PoolConfig.hpp gives host builds the both-on default.
+set(_pd_has_anchor 1)
+set(_pd_has_trunk 1)
+if(SIP_CONSTRAINED)
+    if(NOT SIP_OUTSIDE_LINE)
+        message(FATAL_ERROR "SIP_CONSTRAINED=1 needs -D SIP_OUTSIDE_LINE=anchor or trunk: "
+                            "the constrained build carries exactly one outside-line path (#731)")
+    elseif(SIP_OUTSIDE_LINE STREQUAL "anchor")
+        set(_pd_has_trunk 0)
+    elseif(SIP_OUTSIDE_LINE STREQUAL "trunk")
+        set(_pd_has_anchor 0)
+    else()
+        message(FATAL_ERROR "SIP_OUTSIDE_LINE must be 'anchor' or 'trunk', got '${SIP_OUTSIDE_LINE}' (#731)")
+    endif()
+elseif(SIP_OUTSIDE_LINE)
+    message(FATAL_ERROR "SIP_OUTSIDE_LINE=${SIP_OUTSIDE_LINE} only applies with SIP_CONSTRAINED=1; "
+                        "other builds keep both outside-line paths (#731)")
+endif()
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    POCKETDIAL_HAS_ANCHOR=${_pd_has_anchor}
+    POCKETDIAL_HAS_TRUNK=${_pd_has_trunk})
+message(STATUS "SipServer outside line: anchor=${_pd_has_anchor} trunk=${_pd_has_trunk}")
 
 # PcapCapture.hpp has always advertised itself as "compile-time tunable
 # (-DPOCKETDIAL_PCAP_RING_SIZE=N)", but nothing translated that CMake variable
