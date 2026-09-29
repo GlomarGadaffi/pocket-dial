@@ -7735,6 +7735,10 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 				involved.push_back(callID);
 			}
 		}
+		// Issue #714: nothing here owns _outbox. Cleared so the move after the
+		// loop carries only what endCall() queued, never a leftover from a pass
+		// that returned early (handle()/tick() clear it first thing anyway).
+		_outbox.clear();
 		for (const auto& callID : involved)
 		{
 			auto it = _sessions.find(callID);
@@ -7775,6 +7779,15 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 			        dest ? dest->getNumber() : "",
 			        "extension " + extension + " was force-disconnected by admin");
 		}
+		// Issue #714: endCall()'s trunk branch calls _sipTrunk.hangup(), which
+		// hands the carrier BYE to PbxEnv::enqueue() -> _outbox. This is the HTTP
+		// task, so the next handle()/tick() would clear _outbox before draining
+		// it and the carrier would never be told (it kept the leg and billing;
+		// a 911 killed here left the PSAP on dead air). Same thread rule as the
+		// handset BYEs above: hand it to _asyncOutbox, which drainOutbox()
+		// merges on the SIP thread's next pass.
+		for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
+		_outbox.clear();
 		// Release the registration LAST. SipClient::release() clears the number,
 		// and the Session's src/dest point at this same pool object — releasing
 		// first (as this function used to) blanked the number before the
