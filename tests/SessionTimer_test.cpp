@@ -564,26 +564,37 @@ TEST(SessionTimer, TooSmallSessionExpiresOnInviteIsAnswered422WithMinSE)
 
 namespace
 {
+	// A `method` request from `from` at `ip` to `to` carrying the header lines
+	// `extra` verbatim. An INVITE carries an SDP offer; an UPDATE is bodiless
+	// (a session refresh).
+	std::shared_ptr<SipMessage> timerRequest(const std::string& method, const std::string& from,
+	                                         const std::string& ip, const std::string& to,
+	                                         const std::string& callId, const std::string& extra,
+	                                         const std::string& toTag = "", int cseq = 1)
+	{
+		const bool withSdp = method == "INVITE";
+		const std::string body = withSdp ? sdpBody(ip) : std::string();
+		const std::string raw =
+			method + " sip:" + to + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bK" + callId + method + std::to_string(cseq) + "\r\n"
+			"From: <sip:" + from + "@server>;tag=ctag" + callId + "\r\n"
+			"To: <sip:" + to + "@server>" + (toTag.empty() ? "" : ";tag=" + toTag) + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(cseq) + " " + method + "\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + from + "@" + ip + ":5060>\r\n" + extra +
+			(withSdp ? "Content-Type: application/sdp\r\n" : "") +
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
+	}
+
 	// An INVITE from 100 to `to` carrying `seLine` (e.g. "Session-Expires: 30").
 	std::shared_ptr<SipMessage> makeTimerInvite(const std::string& to, const std::string& callId,
 	                                            const std::string& seLine,
 	                                            const std::string& toTag = "", int cseq = 1)
 	{
-		const std::string ip = "192.168.40.10";
-		const std::string body = sdpBody(ip);
-		const std::string raw =
-			"INVITE sip:" + to + "@server SIP/2.0\r\n"
-			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bK" + callId + std::to_string(cseq) + "\r\n"
-			"From: <sip:100@server>;tag=ctag" + callId + "\r\n"
-			"To: <sip:" + to + "@server>" + (toTag.empty() ? "" : ";tag=" + toTag) + "\r\n"
-			"Call-ID: " + callId + "\r\n"
-			"CSeq: " + std::to_string(cseq) + " INVITE\r\n"
-			"Max-Forwards: 70\r\n"
-			"Contact: <sip:100@" + ip + ":5060>\r\n"
-			"Supported: timer\r\n" + seLine + "\r\n"
-			"Content-Type: application/sdp\r\n"
-			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
-		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
+		return timerRequest("INVITE", "100", "192.168.40.10", to, callId,
+			"Supported: timer\r\n" + seLine + "\r\n", toTag, cseq);
 	}
 }
 
@@ -672,4 +683,238 @@ TEST(SessionTimer, ExpiryDrivenByTickByesEachLegExactlyOnce)
 	handler.tick();
 	EXPECT_EQ(countByes("192.168.40.10"), 1) << "a second tick must not re-BYE";
 	EXPECT_EQ(countByes("192.168.40.20"), 1);
+}
+
+// ── Issue #198: the Session-Expires on a 2xx the PBX writes itself ───────────
+//
+// Every answer below is built by cloning the phone's request, so before this
+// change it echoed the phone's own `Session-Expires: 1800` back with no
+// refresher parameter. RFC 4028 §9 requires one on any 2xx that carries the
+// header, and without it nobody is named to refresh. The PBX never sends a
+// refresh, so the only timer it can grant is refresher=uac (the phone
+// refreshes, and the PBX answers it), with the `Require: timer` §9 makes
+// mandatory -- and only on a leg whose refresh the PBX answers with a 2xx:
+// 555 (answerAnchorReinvite) and a local UPDATE. On 777, 888, park and the
+// trunk handset leg the refresh draws 488 or 481, and §10 says only a 2xx
+// extends the session, so a granted timer there makes the phone BYE the call
+// at expiry (a 911 trunk call included). Those answers carry no timer (§7.2).
+
+namespace
+{
+	using Sent = std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>;
+
+	constexpr const char* kCaller = "192.168.40.10";   // 100
+	constexpr const char* kOther  = "192.168.40.20";   // 106
+
+	// What pjsua sends on an initial INVITE (tests/interop logs): the phone
+	// supports timer and asks for 1800 s without naming a refresher.
+	constexpr const char* kTimerOffer = "Supported: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\n";
+
+	// The last 200 OK sent to `ip` whose CSeq value is `cseq` (e.g. "1 INVITE").
+	std::string okTo(const Sent& sent, const std::string& ip, const std::string& cseq)
+	{
+		std::string found;
+		for (const auto& [addr, msg] : sent)
+		{
+			if (!msg || addr.sin_addr.s_addr != inet_addr(ip.c_str())) continue;
+			const std::string raw = msg->toString();
+			if (raw.rfind("SIP/2.0 200 OK", 0) == 0 && headerValue(raw, "CSeq") == cseq) found = raw;
+		}
+		return found;
+	}
+
+	std::string toTagOf(const std::string& ok)
+	{
+		const std::string to = headerValue(ok, "To");
+		const size_t p = to.find(";tag=");
+		return p == std::string::npos ? std::string{} : to.substr(p + 5);
+	}
+
+	// Header lines in `raw` whose name is exactly `name` (no compact-form folding).
+	int linesNamed(const std::string& raw, const std::string& name)
+	{
+		int n = 0;
+		for (size_t p = raw.find("\r\n" + name + ":"); p != std::string::npos;
+		     p = raw.find("\r\n" + name + ":", p + 2))
+		{
+			++n;
+		}
+		return n;
+	}
+
+	void expectPhoneRefreshes(const std::string& ok, const std::string& what)
+	{
+		ASSERT_FALSE(ok.empty()) << what << ": the PBX sent no 200 OK";
+		EXPECT_EQ(headerValue(ok, "Session-Expires"), "1800;refresher=uac")
+			<< what << ": RFC 4028 §9 needs a refresher, and the PBX never refreshes\n" << ok;
+		EXPECT_EQ(linesNamed(ok, "Session-Expires"), 1) << what << ": exactly one, ours\n" << ok;
+		EXPECT_EQ(headerValue(ok, "Require"), "timer")
+			<< what << ": RFC 4028 §9 requires Require: timer with refresher=uac\n" << ok;
+	}
+
+	// No Session-Expires (full or compact) and no Require: RFC 4028 §7.2's "no
+	// session expiration". The caller checks the answer itself as positive control.
+	void expectNoTimer(const std::string& ok, const std::string& what)
+	{
+		ASSERT_FALSE(ok.empty()) << what << ": the PBX sent no 200 OK";
+		EXPECT_EQ(linesNamed(ok, "Session-Expires"), 0)
+			<< what << ": the PBX answers this leg's refresh with no 2xx, so a timer here ends the call (RFC 4028 §10)\n" << ok;
+		EXPECT_EQ(linesNamed(ok, "x"), 0) << what << ": the phone's own compact line must not survive\n" << ok;
+		EXPECT_EQ(linesNamed(ok, "Require"), 0) << what << ": no timer, so no Require: timer\n" << ok;
+	}
+
+	struct Rig
+	{
+		Sent sent;
+		RequestsHandler handler{kServerIp, 5060,
+			[this](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); }};
+		Rig() { registerBothLegs(handler); }
+	};
+}
+
+// onReinvite() answers a 777 re-INVITE 488, so the 777 answer grants no timer.
+TEST(SessionTimer, The777AnswerCarriesNoTimerBecauseItsRefreshIsRefused)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "777", "se-777", kTimerOffer));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(ok, "777 answer");
+	// Positive control: it is 777's own answer that was inspected.
+	EXPECT_NE(headerValue(ok, "Contact").find("sip:777@"), std::string::npos) << ok;
+}
+
+// Same for 888: buildOkWithSdp() must not grant on the conference leg, while
+// still granting on 555 (the anchor test below is the positive control).
+TEST(SessionTimer, TheConferenceAnswerCarriesNoTimerBecauseItsRefreshIsRefused)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "888", "se-888", kTimerOffer));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(ok, "888 answer");
+	EXPECT_NE(headerValue(ok, "Contact").find("sip:888@"), std::string::npos) << ok;
+}
+
+// Positive control for the grant: 555 answers its own re-INVITE with a 200
+// (answerAnchorReinvite), so its answer, built by the same buildOkWithSdp()
+// as 888's, does name the phone as refresher.
+TEST(SessionTimer, TheAnchorAnswerAndItsReinviteAnswerNameThePhoneAsRefresher)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "555", "se-555", kTimerOffer));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectPhoneRefreshes(ok, "555 answer");
+
+	// The phone's refresh by re-INVITE, answered by answerAnchorReinvite().
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "555", "se-555",
+		"Supported: timer\r\nSession-Expires: 1800;refresher=uac\r\n", toTagOf(ok), 2));
+	expectPhoneRefreshes(okTo(r.sent, kCaller, "2 INVITE"), "555 re-INVITE answer");
+	// The refresh reached a 2xx, not onReinvite()'s 488 (RFC 4028 §10: only a
+	// 2xx extends the session), which is what makes the grant above honest.
+	int refused = 0;
+	for (const auto& [addr, msg] : r.sent)
+	{
+		if (msg && addr.sin_addr.s_addr == inet_addr(kCaller) &&
+		    msg->toString().rfind("SIP/2.0 488", 0) == 0) ++refused;
+	}
+	EXPECT_EQ(refused, 0) << "the 555 re-INVITE refresh must be answered, not refused";
+}
+
+// The voicemail legs (deposit on busy: dest is a "700" virtual peer; dial-in
+// retrieval: "796") pass onReinvite()'s guard, but their dest carries the
+// caller's OWN address, so a re-INVITE refresh is relayed back to the phone
+// and never answered 200 by the PBX. So they get no timer either.
+TEST(SessionTimer, TheVoicemailDepositAnswerCarriesNoTimer)
+{
+	Rig r;
+	r.handler.setVoicemail("106", true);
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "106", "se-vm-dep", kTimerOffer));
+	// 106 is busy: the same 486 shape as VoicemailDivert_test's makeBusy().
+	r.handler.handle(RequestsHandler::getMessageFromPool(
+		"SIP/2.0 486 Busy Here\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kOther) + ":5060;branch=z9hG4bKse-vm-depINVITE1\r\n"
+		"From: <sip:100@server>;tag=ftse-vm-dep\r\n"
+		"To: <sip:106@server>;tag=btse-vm-dep\r\n"
+		"Call-ID: se-vm-dep\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n", addrFor(kOther)));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(ok, "voicemail deposit answer");
+	// Positive control: the busy fell back to voicemail, answered by the PBX.
+	EXPECT_NE(ok.find("v=0"), std::string::npos) << ok;
+	auto session = r.handler.getSession("Call-ID: se-vm-dep");
+	ASSERT_TRUE(session.has_value());
+	EXPECT_TRUE(session.value()->isVoicemail()) << "precondition: this is the deposit leg";
+}
+
+TEST(SessionTimer, TheVoicemailRetrievalAnswerCarriesNoTimer)
+{
+	Rig r;
+	r.handler.setVoicemail("100", true);
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "796", "se-vm-ret", kTimerOffer));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(ok, "voicemail retrieval answer");
+	EXPECT_NE(headerValue(ok, "Contact").find("sip:796@"), std::string::npos) << ok;
+}
+
+// A park-leg UPDATE refresh is relayed back to the caller (#709) and draws
+// 481, so neither park answer grants a timer.
+TEST(SessionTimer, TheParkAndRetrieveAnswersCarryNoTimerBecauseTheirRefreshIsRefused)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "700", "se-park", kTimerOffer));
+	const std::string parked = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(parked, "park answer");
+	EXPECT_NE(headerValue(parked, "Contact").find("sip:700@"), std::string::npos) << parked;
+
+	r.handler.handle(timerRequest("INVITE", "106", kOther, "700", "se-retrieve", kTimerOffer));
+	const std::string retrieved = okTo(r.sent, kOther, "1 INVITE");
+	expectNoTimer(retrieved, "retrieve answer");
+	EXPECT_NE(headerValue(retrieved, "Contact").find("sip:700@"), std::string::npos) << retrieved;
+}
+
+// Positive control for the local UPDATE path: the PBX answers that UPDATE
+// itself with a 200, so it may name the phone as refresher.
+TEST(SessionTimer, TheLocalRefreshAnswerNamesThePhoneAsRefresher)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "777", "se-777-upd", kTimerOffer));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	ASSERT_FALSE(ok.empty()) << "precondition: 777 answers";
+
+	// The refresh UPDATE pjsua sends at half the interval, which answerRefreshLocally() answers.
+	r.handler.handle(timerRequest("UPDATE", "100", kCaller, "777", "se-777-upd",
+		"Supported: timer\r\nSession-Expires: 1800;refresher=uac\r\n", toTagOf(ok), 2));
+	expectPhoneRefreshes(okTo(r.sent, kCaller, "2 UPDATE"), "refresh UPDATE answer");
+}
+
+TEST(SessionTimer, ACompactSessionExpiresIsAnsweredOnceInFullForm)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "555", "se-compact", "k: timer\r\nx: 1800\r\n"));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectPhoneRefreshes(ok, "compact-form offer");
+	EXPECT_EQ(linesNamed(ok, "x"), 0) << "the phone's own compact line must not survive beside ours\n" << ok;
+}
+
+TEST(SessionTimer, AnAnswerCarriesNoTimerThePhoneCannotBeTheRefresherOf)
+{
+	struct Case { const char* callId; const char* headers; const char* why; };
+	const Case cases[] = {
+		{"se-nosup", "Session-Expires: 1800\r\nRequire: timer\r\n",
+		 "no Supported: timer, so refresher=uac is not the phone's to accept (RFC 4028 §9)"},
+		{"se-uas", "Supported: timer\r\nSession-Expires: 1800;refresher=uas\r\n",
+		 "refresher=uas names the PBX, which never sends a refresh"},
+	};
+	for (const Case& c : cases)
+	{
+		Rig r;
+		r.handler.handle(timerRequest("INVITE", "100", kCaller, "777", c.callId, c.headers));
+		const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+		// Positive control: the call is still answered, by 777.
+		ASSERT_FALSE(ok.empty()) << c.callId << ": the call must still be answered";
+		EXPECT_NE(headerValue(ok, "Contact").find("sip:777@"), std::string::npos) << c.callId << "\n" << ok;
+		// No Session-Expires is RFC 4028 §7.2's "no session expiration".
+		EXPECT_EQ(linesNamed(ok, "Session-Expires"), 0) << c.callId << ": " << c.why << "\n" << ok;
+		EXPECT_EQ(linesNamed(ok, "Require"), 0) << c.callId << ": no timer, so no Require: timer\n" << ok;
+	}
 }
