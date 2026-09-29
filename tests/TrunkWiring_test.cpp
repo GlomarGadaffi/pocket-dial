@@ -1177,6 +1177,41 @@ TEST(TrunkWiring, AnEmergencyCallIsNeverEndedForRtpSilence)
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "the 911 relay pair is untouched";
 }
 
+TEST(TrunkWiring, AnEmergencyCallWithBothLegsSilentEndsAtFourHoursAndNotBefore)
+{
+	// #741 (desmo): a 911 whose phone and far end both vanished (no BYE, no RTP
+	// on either leg) is ended after 4 h of silence, through endCall, and
+	// counted. A live 911 is never cut: the clock only runs while BOTH legs
+	// are silent. AnEmergencyCallIsNeverEndedForRtpSilence above keeps pinning
+	// that 10 minutes of silence ends nothing.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-741"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	auto s911 = b.handler.getSession("Call-ID: call-741");
+	ASSERT_TRUE(s911.has_value());
+	b.handler.tick();   // arms the watch
+
+	s911.value()->ageRtpWatchForTest(std::chrono::hours(4) - std::chrono::seconds(1));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+	b.handler.tick();
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-741").has_value()) << "ended before 4 h";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u);
+	EXPECT_EQ(b.handler.getEmergencyRtpReaps(), 0u);
+
+	s911.value()->ageRtpWatchForTest(std::chrono::seconds(1));
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+	EXPECT_FALSE(b.handler.getSession("Call-ID: call-741").has_value()) << "not ended at 4 h";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the carrier leg is hung up through endCall";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and its relay pair released";
+	EXPECT_EQ(b.handler.getEmergencyRtpReaps(), 1u) << "and counted";
+}
+
 // ── Issue #399: the trunk REGISTERs, from tick(), and answers the 401 ───────
 //
 // SipTrunk_test.cpp pins the REGISTER itself. This pins the part #355 taught
