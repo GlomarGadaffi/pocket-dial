@@ -3970,7 +3970,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// reap never hangs up a 911 (the dialed number alone misses a dial-plan
 	// transform such as "0" -> "911").
 	auto markEmergency = [&] {
-		auto s = _sessions.find(std::string(data->getCallID()));
+		auto s = _sessions.find(data->getCallID());   // std::less<> map: no copy on the 911 path
 		if (s != _sessions.end() && s->second) s->second->setEmergency(true);
 	};
 	bool placed = false;

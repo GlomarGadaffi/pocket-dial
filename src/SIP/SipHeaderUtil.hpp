@@ -73,7 +73,7 @@ namespace siphdr
 	// but a well-formed request always has SOME digits here).
 	inline uint32_t cseqNumber(std::string_view header)
 	{
-		std::string value = stripHeaderName(header);
+		const std::string_view value = stripHeaderNameView(header);   // no per-request copy
 		size_t i = 0;
 		while (i < value.size() && (value[i] == ' ' || value[i] == '\t')) ++i;
 		uint32_t n = 0;
