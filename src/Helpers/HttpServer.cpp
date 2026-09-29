@@ -3768,11 +3768,22 @@ void HttpServer::sendApiSbcModeGet(int sock)
 		std::tie(enabled, route) = handler->getSbcMode();
 	}
 
-	std::ostringstream json;
-	json << "{\"enabled\":" << (enabled ? "true" : "false")
-	     << ",\"route\":" << route
-	     << ",\"maxRoute\":" << TelephonyApiConfig::kSlots << "}";
-	sendResponse(sock, 200, "OK", "application/json", json.str());
+	// #410: no heap. The body is at most 78 bytes (both numbers at 20 digits), so
+	// a small stack buffer holds it; a body that did not fit would be refused
+	// with a 500, never truncated or grown.
+	char buf[96];
+	JsonOut json{buf, sizeof(buf)};
+	json.s("{\"enabled\":").b(enabled)
+	    .s(",\"route\":").n(route)
+	    .s(",\"maxRoute\":").n(TelephonyApiConfig::kSlots)
+	    .s("}");
+	if (json.full)
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"error\":\"sbc-mode response too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, json.len));
 }
 
 void HttpServer::sendApiSbcModeSet(int sock, const std::string& body)
