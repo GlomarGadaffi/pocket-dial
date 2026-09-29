@@ -231,6 +231,19 @@ namespace
 			return {};
 		}
 
+		// As firstWith(), but only messages ADDRESSED to `ip`.
+		std::string firstWithTo(const std::string& needle, const std::string& ip) const
+		{
+			const uint32_t want = inet_addr(ip.c_str());
+			for (const auto& [addr, msg] : sent)
+			{
+				if (!msg || addr.sin_addr.s_addr != want) continue;
+				const std::string raw = msg->toString();
+				if (raw.substr(0, raw.find("\r\n")).find(needle) != std::string::npos) return raw;
+			}
+			return {};
+		}
+
 		size_t countWith(const std::string& needle) const
 		{
 			size_t n = 0;
@@ -469,6 +482,50 @@ TEST(TrunkWiring, TheCarrierHangingUpByesTheHandsetAndReleasesTheRelay)
 	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u)
 		<< "the carrier hung up itself; BYEing it back would earn a 481";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+// #700: the BYE we originate to the handset is in the handset's dialog, where WE
+// are the UAS (it INVITEd us). RFC 3261 12.2.1.1: From = our URI and local tag
+// (the 200 OK's To), To = the handset's own From. A phone matches the BYE on
+// those tags and answers 481, staying off-hook, when they are swapped.
+namespace
+{
+	void expectHandsetByeIsFromUs(const std::string& ok, const std::string& bye,
+		const std::string& handsetTag)
+	{
+		const std::string localTag = CarrierView::between(ok, "To: ", "\r\n");
+		const std::string ourTag   = CarrierView::between(localTag, ";tag=", "\r\n");
+		ASSERT_FALSE(ourTag.empty()) << "precondition: the 200 OK carried our To tag";
+		const std::string from = CarrierView::field(bye, "From: ");
+		const std::string to   = CarrierView::field(bye, "To: ");
+		EXPECT_NE(from.find(";tag=" + ourTag), std::string::npos)
+			<< "BYE From must carry our local tag; got: " << from;
+		EXPECT_EQ(from.find(";tag=" + handsetTag), std::string::npos)
+			<< "BYE From must not carry the handset's own tag; got: " << from;
+		EXPECT_NE(to.find(";tag=" + handsetTag), std::string::npos)
+			<< "BYE To must carry the handset's tag; got: " << to;
+		EXPECT_EQ(to.find(";tag=" + ourTag), std::string::npos)
+			<< "BYE To must not carry our own tag; got: " << to;
+	}
+}
+
+TEST(TrunkWiring, TheByeToTheHandsetAfterACarrierHangupIsFromUsAndToTheHandset)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-700"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	const std::string ok = b.firstWithTo("SIP/2.0 200 OK", kHandsetIp);
+	ASSERT_FALSE(ok.empty()) << "precondition: the handset was answered";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.bye(), addrFor(kSbcIp)));
+
+	const std::string bye = b.firstWithTo("BYE", kHandsetIp);
+	ASSERT_FALSE(bye.empty());
+	expectHandsetByeIsFromUs(ok, bye, "ftcall-700");
 }
 
 // ── Forged carrier messages (#356) ──────────────────────────────────────────
@@ -840,6 +897,32 @@ TEST(TrunkWiring, ATrunkCallWhoseLegsBothGoSilentIsEndedAfterTheInactivityTimeou
 	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u) << "and the handset told, best effort";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and the relay pair released";
 	EXPECT_FALSE(b.handler.getSession(id).has_value());
+}
+
+TEST(TrunkWiring, TheInactivityReapByeToTheHandsetOfATrunkCallIsFromUsAndToTheHandset)
+{
+	// #700, the #604 reap: same orientation rule as the carrier-hangup BYE.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-700r"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	const std::string ok = b.firstWithTo("SIP/2.0 200 OK", kHandsetIp);
+	ASSERT_FALSE(ok.empty()) << "precondition: the handset was answered";
+	const std::string id = "Call-ID: call-700r";
+	auto session = b.handler.getSession(id);
+	ASSERT_TRUE(session.has_value());
+	b.handler.tick();   // arms the watch
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+
+	b.handler.tick();
+
+	const std::string bye = b.firstWithTo("BYE", kHandsetIp);
+	ASSERT_FALSE(bye.empty()) << "the silent trunk call must be ended with a BYE to the handset";
+	expectHandsetByeIsFromUs(ok, bye, "ftcall-700r");
 }
 
 TEST(TrunkWiring, ATrunkCallWithOneLegSilentAndTheOtherTalkingStaysUp)

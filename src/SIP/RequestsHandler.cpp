@@ -9093,7 +9093,10 @@ void RequestsHandler::tick()
 			const std::string& dTo   = session->getDialogTo();
 			if (handset && !dFrom.empty() && !dTo.empty())
 			{
-				const bool fromIsUs = session->isTrunk() || inbound;
+				// Only an inbound anchor call has the PBX as UAC; every other relayed
+				// shape (a trunk call included) is a handset INVITE the PBX answered, so
+				// (dTo, dFrom) is the BYE orientation (RFC 3261 12.2.1.1, #700).
+				const bool fromIsUs = inbound;
 				auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), callID,
 					fromIsUs ? dFrom : dTo, fromIsUs ? dTo : dFrom);
 				if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
@@ -10952,8 +10955,10 @@ void RequestsHandler::onTrunkRemoteBye(const SipTrunk::TrunkEvent& ev)
 	// when we answered it (#232), then tear the call down the ordinary way.
 	if (src && !session->getDialogFrom().empty() && !session->getDialogTo().empty())
 	{
+		// The handset INVITEd us, so we are the UAS originating this BYE: our
+		// own To becomes its From, the handset's From its To (RFC 3261 12.2.1.1, #700).
 		auto bye = buildServerBye(std::string(src->getNumber()), src->getAddress(),
-			handsetCallID, session->getDialogFrom(), session->getDialogTo());
+			handsetCallID, session->getDialogTo(), session->getDialogFrom());
 		if (bye) _outbox.emplace_back(src->getAddress(), std::move(bye));
 	}
 	endCall(handsetCallID, from, "", "carrier hung up");
