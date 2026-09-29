@@ -1494,11 +1494,7 @@ public:
 		auto localOutbox = drainOutbox();
 		auto localLogs = std::move(_logQueue);
 		_logQueue.clear();
-		for (const auto& log : localLogs)
-		{
-			if (log.first) std::cerr << log.second << '\n';
-			else std::cout << log.second << '\n';
-		}
+		printLogs(localLogs);
 		for (auto& event : localOutbox)
 		{
 			_onHandled(event.first, std::move(event.second));
@@ -2169,6 +2165,9 @@ private:
 	                     std::vector<std::pair<bool, std::string>>& logScratch);
 	void flushPass(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
 	               std::vector<std::pair<bool, std::string>>& logScratch);
+	// Print one drained log batch: errors to stderr, the rest to stdout. Used by
+	// flushPass() and by every config setter that drains _logQueue itself (#702).
+	static void printLogs(const std::vector<std::pair<bool, std::string>>& logs);
 
 	// The inbound message currently being handled, or nullptr outside a handle()
 	// pass (tick() drains with this unset). Used by drainOutbox() for exactly one
