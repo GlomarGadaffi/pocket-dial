@@ -1853,6 +1853,24 @@ TEST(SipTrunkByeAuth, ARetryRefusedAgainIsNotRetriedAndIsCounted)
 	EXPECT_FALSE(anySentOrLoggedContains(f.env, "wrong-password"));
 }
 
+TEST(SipTrunkByeAuth, ALateCopyOfTheFirstChallengeNeitherCountsNorEndsTheRetry)
+{
+	ByeSent f(workingConfig(), "s3cret-687");
+	const std::string first401 = byeResponseFor(f.dialog(), 401, "WWW-Authenticate");   // CSeq 2, the first BYE
+	ASSERT_TRUE(f.trunk.handleResponse(responseFor(first401)));
+	ASSERT_EQ(f.env.sent.size(), 4u) << "the one credentialed retry (CSeq 3)";
+
+	// The carrier's UDP retransmission of that first 401, landing after the retry went out.
+	EXPECT_TRUE(f.trunk.handleResponse(responseFor(first401)));
+	EXPECT_EQ(f.env.sent.size(), 4u) << "nothing is sent for it";
+	EXPECT_EQ(f.trunk.activeDialogs(), 1u) << "the retry's transaction is still live";
+	EXPECT_EQ(f.trunk.refusedByeRetries(), 0u) << "a stale copy is not a refused retry";
+	EXPECT_EQ(logsContaining(f.env, "credentialed BYE retry answered"), 0u) << "and no false WARN";
+
+	ASSERT_TRUE(f.trunk.handleResponse(responseFor(byeResponseFor(f.dialog(), 200))));
+	EXPECT_EQ(f.trunk.activeDialogs(), 0u) << "the retry's own 200 ends the dialog";
+}
+
 TEST(SipTrunkByeAuth, A407ToOurByeIsAnsweredInProxyAuthorizationAsTheAuthUser)
 {
 	SipTrunk::Config cfg = workingConfig();

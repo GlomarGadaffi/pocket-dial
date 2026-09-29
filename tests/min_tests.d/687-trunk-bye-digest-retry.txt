@@ -1,2 +1,2 @@
-# SipTrunk_test.cpp: 3 (#687: a 401/407 to our BYE answered once with digest credentials)
-3
+# SipTrunk_test.cpp: 4 (#687: a 401/407 to our BYE answered once with digest credentials; a late copy of the first challenge is absorbed)
+4

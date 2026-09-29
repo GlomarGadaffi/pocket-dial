@@ -15,6 +15,22 @@ using sipwire::addrToIpPort;
 
 namespace
 {
+	// The number in a CSeq header ("CSeq: 2 BYE" -> 2), 0 when there is none.
+	uint32_t cseqNumber(std::string_view cseqLine)
+	{
+		const size_t colon = cseqLine.find(':');
+		const std::string_view v = colon == std::string_view::npos ? cseqLine : cseqLine.substr(colon + 1);
+		uint32_t n = 0;
+		size_t i = 0;
+		while (i < v.size() && (v[i] == ' ' || v[i] == '\t')) ++i;
+		while (i < v.size() && v[i] >= '0' && v[i] <= '9')
+		{
+			n = n * 10u + static_cast<uint32_t>(v[i] - '0');
+			++i;
+		}
+		return n;
+	}
+
 	// The host of a SIP URI ("sip:+1555@203.0.113.9:5060;transport=udp"), as an
 	// address, when -- and only when -- it is a dotted quad. An FQDN yields false:
 	// resolving it would mean getaddrinfo on the SIP thread, which is the one
@@ -436,17 +452,7 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	// Completed state); a provisional one is simply absorbed.
 	if (d->authAttempted && d->state != State::Terminating)
 	{
-		const std::string_view cseqLine = data->getCSeq();
-		const size_t colon = cseqLine.find(':');
-		const std::string_view cseqValue = colon == std::string_view::npos ? cseqLine : cseqLine.substr(colon + 1);
-		uint32_t respCseq = 0;
-		size_t i = 0;
-		while (i < cseqValue.size() && (cseqValue[i] == ' ' || cseqValue[i] == '\t')) ++i;
-		while (i < cseqValue.size() && cseqValue[i] >= '0' && cseqValue[i] <= '9')
-		{
-			respCseq = respCseq * 10u + static_cast<uint32_t>(cseqValue[i] - '0');
-			++i;
-		}
+		const uint32_t respCseq = cseqNumber(data->getCSeq());
 		if (respCseq != d->cseq)
 		{
 			if (status >= 200 && respCseq == d->challengedCseq)
@@ -544,6 +550,14 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	// talked round, and holding the slot open would leak it.
 	if (d->state == State::Terminating)
 	{
+		// #687 review: once the challenged BYE has been answered, a late
+		// response to that FIRST BYE (a UDP retransmission of its 401/407)
+		// belongs to a finished transaction. The retry (CSeq d->cseq+1) is
+		// still live, so it must not be counted as refused or end the dialog.
+		if (d->byeAuthAttempted && cseqNumber(data->getCSeq()) != d->cseq + 1)
+		{
+			return true;
+		}
 		// Issue #687: except a 401/407, answered once with digest credentials
 		// the way the INVITE's is. Absorbing it left the carrier leg up and
 		// billing behind a call the handset had already ended.
