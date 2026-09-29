@@ -3076,14 +3076,6 @@ void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
 	sendResponse(sock, 200, "OK", contentType, cfg);
 }
 
-void HttpServer::sendConfigCfg(int sock, const std::string& mac)
-{
-	HttpRequest req;
-	req.method = "GET";
-	req.path = "/config/" + mac + ".cfg";
-	sendProvisioningResponse(sock, req);
-}
-
 void HttpServer::sendApiVoicemail(int sock, const std::string& body)
 {
 	std::string ext = getFormParam(body, "extension");

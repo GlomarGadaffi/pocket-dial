@@ -302,9 +302,6 @@ public:
 	std::tuple<std::string, std::string, std::string> getE911Config();
 	std::vector<std::tuple<std::string, std::string, std::string>> getRingGroups();
 
-	// Parked calls snapshot for the TUI: {orbit, parkedExt, parker, secondsParked}.
-	std::vector<std::tuple<std::string, std::string, std::string, int>> getParkedCalls();
-
 	// Paging zones (980–989). setPageZone replaces a zone's membership; an empty
 	// member list deletes the zone. Thread-safe and NVS-persisted. The getter
 	// returns {zoneExt, "m1,m2,..."} pairs for the dashboard.
@@ -1817,8 +1814,9 @@ private:
 	std::shared_ptr<SipClient> allocateClient(std::string number, sockaddr_in address, int expiresSeconds);
 	std::shared_ptr<Session> allocateSession(std::string callID, std::shared_ptr<SipClient> src);
 	// Draw a transient virtual-peer SipClient (777/440/park leg) from the fixed pool
-	// instead of make_shared'ing one in the packet handler. Falls back to heap on
-	// exhaustion (graceful, never a crash). Caller holds _mutex.
+	// instead of make_shared'ing one in the packet handler. Refuses (nullptr) on
+	// exhaustion, no heap fallback (#409); every caller answers 503 or abandons
+	// cleanly (#412). Caller holds _mutex.
 	std::shared_ptr<SipClient> allocateVirtualPeer(std::string number, sockaddr_in address, int expiresSeconds = 3600);
 
 	// Answer `req` with a bodiless final status: the request's own Via (received/
@@ -2304,8 +2302,6 @@ private:
 		// Adopted devices (STAGE 2): {mac, ext, state, online}. Mirrored from the
 		// Registrar's registry under _mutex; copied out under _snapshotMutex.
 		std::vector<AdoptedDevice> devices;
-		uint64_t packetsProcessed = 0;
-		uint64_t packetsDropped = 0;
 	};
 	RegistrarSnapshot _snapshot;
 	// #463: tick() refills this in place and swaps its tables into _snapshot, so
