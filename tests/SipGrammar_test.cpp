@@ -398,6 +398,19 @@ TEST(SipGrammar, TheBytesRefusedTo600AreRoutedTo911)
 			EXPECT_TRUE(b.routedTo911())
 				<< "an optional header must never cost a 911 call:\n" << b.dump();
 			EXPECT_EQ(b.count("SIP/2.0 4", kCallerIp), 0u) << b.dump();
+
+			// And the caller can still hang up: an in-dialog request on the live
+			// 911 carries the same Call-ID / Via / Require, and no R-URI of 911.
+			// Refusing it would leave an emergency call (never reaped, #604) up.
+			b.sent.clear();
+			Invite bye = e;
+			bye.method = "BYE";
+			bye.branch = e.branch.empty() ? "z9hG4bKbye" + std::to_string(e.callId.size()) : e.branch;
+			if (e.cseq == "1 INVITE") bye.cseq = "2 BYE";
+			bye.body.clear();
+			b.send(bye);
+			EXPECT_EQ(b.count("SIP/2.0 400", kCallerIp), 0u) << "BYE on a live 911:\n" << b.dump();
+			EXPECT_EQ(b.count("SIP/2.0 420", kCallerIp), 0u) << "BYE on a live 911:\n" << b.dump();
 		}
 	}
 }
