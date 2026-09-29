@@ -1,0 +1,2 @@
+# SipRegistrationClient_test.cpp (6), SipTrunk_test.cpp (2): #686 a REGISTER 2xx registers only when it lists our binding
+8

@@ -1508,6 +1508,12 @@ namespace
 			"Content-Length: 0\r\n\r\n";
 	}
 
+	// #686: a registrar's 2xx lists our binding: it echoes our Contact.
+	std::string echoContact(const std::string& reg)
+	{
+		return "Contact: " + headerValue(reg, "Contact") + "\r\n";
+	}
+
 	SipTrunk::Config regConfig()
 	{
 		SipTrunk::Config c = workingConfig();
@@ -1564,7 +1570,7 @@ TEST(SipTrunkRegister, A401IsAnsweredWithDigestAndThe200ArmsARefreshBeforeExpire
 	EXPECT_EQ(signedReg.find("s3cret-reg"), std::string::npos);
 
 	ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(signedReg,
-		"SIP/2.0 200 OK", "Expires: 120\r\n"))));
+		"SIP/2.0 200 OK", echoContact(signedReg) + "Expires: 120\r\n"))));
 	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registered);
 	EXPECT_EQ(env.sent.size(), 2u) << "a 200 needs no answer";
 
@@ -1644,6 +1650,50 @@ TEST(SipTrunkRegister, ARegisterResponseFromAnotherAddressIsConsumedAndIgnored)
 	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registering);
 }
 
+// #686: Engage answers a failed REGISTER "SIP/2.0 200 Authorization failure",
+// no Expires, its own address as the only Contact (#618's capture). The code
+// is 200; only the missing binding says it failed. Control: the same status
+// line listing our binding registers, so the reason phrase is never read.
+TEST(SipTrunkRegister, A200AuthorizationFailureListingOnlyTheCarriersContactIsNotARegistration)
+{
+	for (const bool echoOurs : {false, true})
+	{
+		FakePbxEnv env;
+		SipTrunk trunk(env);
+		trunk.setConfig(regConfig());
+		ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+		trunk.tickRegistration(steadyMs(), sbcAddr());
+		ASSERT_EQ(env.sent.size(), 1u);
+		const std::string reg = env.sentRaw(0);
+
+		ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(reg,
+			"SIP/2.0 200 Authorization failure",
+			echoOurs ? echoContact(reg) + "Expires: 3600\r\n"
+			         : std::string("Contact: <sip:203.0.113.5:5065>\r\n")))));
+		EXPECT_EQ(trunk.registration().state(), echoOurs
+			? SipRegistrationClient::State::Registered
+			: SipRegistrationClient::State::Failed) << (echoOurs ? "control" : "Engage's 200");
+	}
+}
+
+// #686: the binding now decides registration, so a registrar that lists it
+// under Contact's compact form "m:" (RFC 3261 §7.3.3) must still be read.
+TEST(SipTrunkRegister, OurBindingUnderTheCompactContactFormRegisters)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+	trunk.tickRegistration(steadyMs(), sbcAddr());
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string reg = env.sentRaw(0);
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(reg, "SIP/2.0 200 OK",
+		"m: " + headerValue(reg, "Contact") + ";expires=90\r\n"))));
+	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registered);
+	EXPECT_EQ(trunk.registration().status().grantedExpiresSec, 90u);
+}
+
 // #617: Timer E. TransactionLayer::classify() excludes REGISTER, so before this
 // nothing resent an unanswered one: one lost datagram cost a full Timer F plus
 // backoff cycle. RFC 3261 §17.1.2.2: resend at T1, doubling, capped at T2.
@@ -1673,7 +1723,7 @@ TEST(SipTrunkRegister, AnUnansweredRegisterIsResentOnTheTimerESchedule)
 
 	// Any response ends the schedule.
 	ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(first,
-		"SIP/2.0 200 OK", "Expires: 3600\r\n"))));
+		"SIP/2.0 200 OK", echoContact(first) + "Expires: 3600\r\n"))));
 	ASSERT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registered);
 	const size_t sentAtAnswer = env.sent.size();
 	trunk.tickRegistration(t0 + 20000, sbcAddr());
@@ -1690,7 +1740,8 @@ TEST(SipTrunkRegister, AForgedRegisterResponseIsCounted)
 	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
 	trunk.tickRegistration(steadyMs(), sbcAddr());
 	ASSERT_EQ(env.sent.size(), 1u);
-	const std::string ok = regResponse(env.sentRaw(0), "SIP/2.0 200 OK", "Expires: 3600\r\n");
+	const std::string ok = regResponse(env.sentRaw(0), "SIP/2.0 200 OK",
+		echoContact(env.sentRaw(0)) + "Expires: 3600\r\n");
 
 	sockaddr_in forger = sbcAddr();
 	forger.sin_addr.s_addr = inet_addr("198.51.100.7");   // TEST-NET-2
