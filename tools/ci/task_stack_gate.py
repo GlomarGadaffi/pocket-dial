@@ -32,7 +32,10 @@ Determinism: edges are walked in sorted order, and a result computed while a
 cycle was cut is never cached, so PYTHONHASHSEED can't change the report.
 
 Usage:
-  python3 tools/ci/task_stack_gate.py --ci-dir DIR [--table FILE] [--src-root DIR]
+  python3 tools/ci/task_stack_gate.py --ci-dir DIR [--table FILE] [--src-root DIR] [--with FEATURE ...]
+
+--ci-dir may be the ESP-IDF build directory itself: .ci files are found
+recursively.
 """
 
 import argparse
@@ -99,7 +102,7 @@ def find_entry(nodes, pattern):
 MAIN_VARIANT_RE = re.compile(r"^main/esp_main[^/]*\.cpp$")
 
 
-def run(ci_dir, table_path, src_root, main_variant):
+def run(ci_dir, table_path, src_root, main_variant, features=()):
     table = json.load(open(table_path, encoding="utf-8"))
     margin = table["margin_bytes"]
     ceiling = table["frame_ceiling_bytes"]
@@ -147,6 +150,11 @@ def run(ci_dir, table_path, src_root, main_variant):
         # One image links one esp_main variant; the others' tasks aren't in it.
         if t["entry"] is None or (MAIN_VARIANT_RE.match(t["file"]) and t["file"] != main_variant):
             continue
+        # A site compiled only into another build (wifi, heap_trace) is walked
+        # only when this image has that feature; given --with, it must be found.
+        if t.get("only") and t["only"] not in features:
+            print(f"skip {t['name']}: only in a '{t['only']}' build ({t['file']}:{t['line']}); pass --with {t['only']}")
+            continue
         hits = find_entry(nodes, t["entry"])
         if not hits:
             rc = 1
@@ -181,8 +189,10 @@ def main():
     ap.add_argument("--src-root", default=REPO, help="tree whose src/ and main/ are scanned for task sites")
     ap.add_argument("--main", default="main/esp_main_eth.cpp",
                     help="the esp_main variant linked into the image the .ci files came from")
+    ap.add_argument("--with", dest="features", action="append", default=[],
+                    help="a build feature this image has (wifi, heap_trace); repeatable")
     a = ap.parse_args()
-    return run(a.ci_dir, a.table, a.src_root, a.main)
+    return run(a.ci_dir, a.table, a.src_root, a.main, tuple(a.features))
 
 
 if __name__ == "__main__":

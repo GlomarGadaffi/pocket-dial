@@ -90,7 +90,9 @@ def compile_tus(tus, outdir):
 
 def load_graph(outdir):
     nodes, edges, frames = {}, collections.defaultdict(set), {}
-    for ci in glob.glob(os.path.join(outdir, "*.ci")):
+    # Recursive: an ESP-IDF build writes each component's .ci files under
+    # build/esp-idf/<component>/CMakeFiles/..., not in one flat directory (#457).
+    for ci in sorted(glob.glob(os.path.join(outdir, "**", "*.ci"), recursive=True)):
         txt = open(ci, encoding="utf-8", errors="ignore").read()
         for m in NODE_RE.finditer(txt):
             title, label = m.group(1), m.group(2)

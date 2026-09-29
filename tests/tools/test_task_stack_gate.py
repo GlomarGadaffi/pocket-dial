@@ -58,12 +58,12 @@ class Gate(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_gate(self):
+    def run_gate(self, features=()):
         p = os.path.join(self.tmp.name, "t.json")
         json.dump(self.table, open(p, "w"))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = g.run(self.ci, p, self.tmp.name, "main/esp_main_eth.cpp")
+            rc = g.run(self.ci, p, self.tmp.name, "main/esp_main_eth.cpp", features)
         return rc, out.getvalue()
 
     def test_under_budget_passes_and_names_the_chain(self):
@@ -151,6 +151,44 @@ class Gate(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             outs.add(r.stdout)
         self.assertEqual(len(outs), 1)
+
+    def test_ci_files_in_subdirectories_are_loaded(self):
+        # #457: an ESP-IDF build nests .ci files under esp-idf/<component>/CMakeFiles/.
+        nested = os.path.join(self.ci, "esp-idf", "main", "CMakeFiles")
+        os.makedirs(nested)
+        os.replace(os.path.join(self.ci, "x.ci"), os.path.join(nested, "x.ci"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   big: 1900 B", out)
+
+    def test_entry_matches_a_label_that_starts_with_the_return_type(self):
+        # #457: GCC's .ci label is "void f(void*)", so '^f\(' never matches it.
+        self.add_ci(node("drain_task", "void drain_task(void*)", 100))
+        open(os.path.join(self.tmp.name, "src", "SIP", "X.cpp"), "a").write(
+            'xTaskCreate(drain_task, "drain", 1024, 0, 1, 0);\n')
+        self.table["tasks"].append({"name": "drain", "entry": r"(^|\s)drain_task\(", "bytes": 1024,
+                                    "file": "src/SIP/X.cpp", "line": 4})
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   drain: 100 B", out)
+        self.table["tasks"][-1]["entry"] = r"^drain_task\("   # the old anchor, positive control
+        self.assertIn("not in call graph", self.run_gate()[1])
+
+    def test_only_entry_is_skipped_unless_its_build_feature_is_given(self):
+        self.table["tasks"][1]["only"] = "wifi"
+        self.table["tasks"][1]["entry"] = r"^wifi_only_task\("   # not in this graph
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("skip big: only in a 'wifi' build", out)
+        rc, out = self.run_gate(features=("wifi",))
+        self.assertEqual(rc, 1, "given --with wifi, the entry must be found (fails closed)")
+        self.assertIn("FAIL big: entry", out)
+
+    def test_checked_in_table_has_no_bare_caret_anchors(self):
+        # #457: a '^name\(' entry can never match a real GCC label ("void name(...)").
+        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        bad = [t["name"] for t in table["tasks"] if (t["entry"] or "").startswith("^")]
+        self.assertEqual(bad, [])
 
     def test_checked_in_table_matches_the_source_tree(self):
         # Fails closed on a new xTaskCreate/createTaskPreferPsram site nobody budgeted.
