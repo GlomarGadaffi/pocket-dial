@@ -1050,7 +1050,7 @@ bool SipTrunk::handleRegisterResponse(const std::shared_ptr<SipMessage>& data)
 	v.wwwAuthenticate   = value("WWW-Authenticate");
 	v.proxyAuthenticate = value("Proxy-Authenticate");
 	v.expires           = value("Expires");
-	v.contact           = value("Contact");
+	v.contact           = siphdr::stripHeaderNameView(data->getContact());   // #686: "m:" too
 	v.minExpires        = value("Min-Expires");
 	v.retryAfter        = value("Retry-After");
 

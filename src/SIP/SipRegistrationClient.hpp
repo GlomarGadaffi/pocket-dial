@@ -117,7 +117,7 @@ public:
 	{
 		Idle,        // not configured, or stopped
 		Registering, // a REGISTER is in flight (initial, authed, or a refresh)
-		Registered,  // 200 OK; binding live until bindingExpiresAtMs
+		Registered,  // a 2xx listing our binding (#686); live until bindingExpiresAtMs
 		Failed       // backing off; will retry at nextActionMs
 	};
 
@@ -264,6 +264,11 @@ private:
 	char     _callId[kMaxCallId] = {0};
 	char     _fromTag[kMaxTag]   = {0};
 	uint32_t _cseq               = 0;
+
+	// #686: RFC 5626 +sip.instance, a v4 UUID drawn at the first configure() and
+	// kept for this object's life (one per boot). Our binding is the 2xx Contact
+	// entry that echoes it, which survives a NAT rewriting our host:port.
+	char     _instance[37]       = {0};
 
 	// Cached challenge, as fixed storage. Kept after a SUCCESSFUL registration on
 	// purpose: the next refresh authenticates pre-emptively against the same
