@@ -465,8 +465,10 @@ void HttpServer::acceptLoop()
 		try
 		{
 			std::thread([this, clientSock, sourceAddr]() {
-				handleClient(clientSock);
-				recordConnStackHwm();
+				// #405: which route this thread served, for the stack minimum.
+				char route[kRouteLabelBytes] = "unparsed";
+				handleClient(clientSock, route);
+				recordConnStackHwm(route);
 				releaseSource(sourceAddr);
 				_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			}).detach();
@@ -525,7 +527,61 @@ void HttpServer::releaseSource(uint32_t addr)
 }
 
 
-void HttpServer::handleClient(int clientSock)
+void HttpServer::routeLabel(const std::string& method, const std::string& path,
+                            char* out, size_t cap)
+{
+	if (out == nullptr || cap == 0) return;
+	size_t n = 0;
+	const auto put = [&](std::string_view v) {
+		for (char c : v)
+		{
+			if (n + 1 >= cap) return;
+			out[n++] = c;
+		}
+	};
+
+	bool methodOk = !method.empty() && method.size() <= 7;
+	for (char c : method) methodOk = methodOk && c >= 'A' && c <= 'Z';
+	put(methodOk ? std::string_view(method) : std::string_view("?"));
+	put(" ");
+
+	if (path == "/" || path == "/index.html") put("/");
+	else if (path == "/metrics") put("/metrics");
+	else if (isProvisioningConfigPath(path)) put("provisioning");
+	else
+	{
+		// Under /api/ and /setup/ keep lower-case word segments; the first numeric
+		// or unknown one ends the label, so a slot index or an extension never
+		// appears. Anything else (a 404 probe, a scan) is just "other".
+		const std::string_view p(path);
+		const bool known = p.substr(0, 5) == "/api/" || p.substr(0, 7) == "/setup/";
+		size_t kept = 0;
+		size_t pos = 0;
+		while (known && pos < p.size() && p[pos] == '/')
+		{
+			size_t end = p.find('/', pos + 1);
+			if (end == std::string_view::npos) end = p.size();
+			const std::string_view seg = p.substr(pos + 1, end - pos - 1);
+			bool word = !seg.empty() && seg.size() <= 24;
+			bool digits = word;
+			for (char c : seg)
+			{
+				const bool d = c >= '0' && c <= '9';
+				word = word && (d || (c >= 'a' && c <= 'z') || c == '-' || c == '_');
+				digits = digits && d;
+			}
+			if (!word || digits) break;
+			put("/");
+			put(seg);
+			++kept;
+			pos = end;
+		}
+		if (kept == 0) put("other");
+	}
+	out[n] = '\0';
+}
+
+void HttpServer::handleClient(int clientSock, char* routeOut)
 {
 	// Issue #529: everything read before dispatch shares one deadline.
 	const auto readDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(_readDeadlineMs);
@@ -623,6 +679,7 @@ void HttpServer::handleClient(int clientSock)
 				// body) to get method/path/origin/host/cookie for the auth gate.
 				HttpRequest otaReq = parseRequest(raw.substr(0, hdrEnd + 4));
 				otaReq.clientIp = peerIp;
+				if (routeOut) routeLabel(otaReq.method, otaReq.path, routeOut, kRouteLabelBytes);
 
 				// Same gate as every other mutating endpoint, PLUS issue #173's
 				// owner-only floor for OTA upload specifically (MoH clip upload
@@ -761,6 +818,7 @@ void HttpServer::handleClient(int clientSock)
 	// the real admin out too, and Cisco SPA model-keyed provisioning never ran
 	// its ARP lookup.
 	req.clientIp = peerIp;
+	if (routeOut) routeLabel(req.method, req.path, routeOut, kRouteLabelBytes);   // #405
 	// Out-param for the two telephony-config routes below, whose slot index is
 	// a URL path segment rather than a form param (see parseTelephonyConfigSlotPath).
 	size_t telSlotIdx = 0;
@@ -1875,9 +1933,11 @@ static void pdAppendHwmField(JsonOut& json, const char* key, long bytes)
 }
 #endif // ESP_PLATFORM
 
-void HttpServer::recordConnStackHwm()
+void HttpServer::recordConnStackHwm(const char* route)
 {
-#if defined(ESP_PLATFORM)
+#if !defined(ESP_PLATFORM)
+	(void)route;
+#else
 	// uxTaskGetStackHighWaterMark returns the smallest amount of free stack this
 	// task has ever had, in WORDS on Xtensa -- multiply for the bytes every other
 	// stackHwm_* field reports. Called on the connection thread itself, right
@@ -1887,16 +1947,17 @@ void HttpServer::recordConnStackHwm()
 		static_cast<long>(uxTaskGetStackHighWaterMark(nullptr)) * sizeof(StackType_t);
 
 	// Keep the WORST (smallest-free) figure any connection has produced since
-	// boot: a compare-exchange loop rather than a plain store, because several
-	// connection threads can finish at once and the deepest one must win.
-	long prev = _httpConnStackHwmBytes.load(std::memory_order_relaxed);
-	while (prev < 0 || freeBytes < prev)
+	// boot, with the route that produced it (#405). Under a mutex rather than a
+	// compare-exchange loop: several connection threads can finish at once, the
+	// deepest one must win, and its route has to land with its figure. The
+	// figure stays atomic so /api/status's stackHwm_http_conn read is unchanged.
+	std::lock_guard<std::mutex> lk(_httpConnWorstMutex);
+	const long prev = _httpConnStackHwmBytes.load(std::memory_order_relaxed);
+	if (prev < 0 || freeBytes < prev)
 	{
-		if (_httpConnStackHwmBytes.compare_exchange_weak(prev, freeBytes,
-			std::memory_order_relaxed))
-		{
-			break;
-		}
+		_httpConnStackHwmBytes.store(freeBytes, std::memory_order_relaxed);
+		std::snprintf(_httpConnWorstRoute, sizeof(_httpConnWorstRoute), "%s",
+		              route != nullptr ? route : "");
 	}
 #endif
 }
@@ -2354,6 +2415,16 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	       "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
 	       "\"stackHwm_conf_mix_tick\":null,\"stackHwm_http_conn\":null");
 #endif
+	// Issue #405: the route class that produced the stackHwm_http_conn minimum
+	// (never the raw path, see routeLabel). null on the host build and until a
+	// connection has finished. Written straight into the buffer: no frame here,
+	// this is the route the issue suspects of being the deepest.
+	json.s(",\"httpConnWorstRoute\":");
+	{
+		std::lock_guard<std::mutex> lk(_httpConnWorstMutex);
+		if (_httpConnWorstRoute[0] != '\0') json.s("\"").e(_httpConnWorstRoute).s("\"");
+		else json.s("null");
+	}
 	// Issue #382: ungated for the same reason resetReason is -- "a dump exists,
 	// N bytes" is the fact a bench run needs to notice an unwatched panic, and it
 	// discloses nothing the reset reason above does not. The dump itself and its
