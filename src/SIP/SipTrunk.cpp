@@ -172,7 +172,7 @@ std::string SipTrunk::buildAckForFailure(const Dialog& d)
 	return ss.str();
 }
 
-std::string SipTrunk::buildBye(const Dialog& d, std::string_view freshBranch)
+std::string SipTrunk::buildBye(const Dialog& d, std::string_view freshBranch, std::string_view authLine)
 {
 	// An in-dialog request needs both tags and a route. Refusing to build a
 	// half-formed BYE is deliberate: emitting one earns a 481 from the carrier
@@ -192,6 +192,7 @@ std::string SipTrunk::buildBye(const Dialog& d, std::string_view freshBranch)
 	   // A new request in the dialog takes the NEXT sequence number (§12.2.1.1).
 	   << "CSeq: " << (d.cseq + 1) << " BYE\r\n";
 	commonRequestTail(ss);
+	if (!authLine.empty()) ss << authLine << "\r\n";   // #687: answering a 401/407
 	ss << "Content-Length: 0\r\n\r\n";
 	return ss.str();
 }
@@ -543,8 +544,31 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	// talked round, and holding the slot open would leak it.
 	if (d->state == State::Terminating)
 	{
-		_env.log("Trunk: BYE answered " + std::to_string(status)
-			+ " (" + d->destE164 + ") -- dialog released regardless", true);
+		// Issue #687: except a 401/407, answered once with digest credentials
+		// the way the INVITE's is. Absorbing it left the carrier leg up and
+		// billing behind a call the handset had already ended.
+		// answerByeChallenge() sends nothing and returns false when it cannot
+		// answer (no credentials, unanswerable, already retried once); the
+		// dialog is then released as before.
+		if ((status == 401 || status == 407) && answerByeChallenge(*d, data, status))
+		{
+			return true;
+		}
+		if (d->byeAuthAttempted)
+		{
+			// The credentialed retry was refused too. Counted, and logged once
+			// per dialog: this is the one outcome that may leave a carrier
+			// leg up, and there is nothing further to try.
+			const uint32_t n = ++_dialogRefusedByeRetries;
+			_env.log("Trunk: credentialed BYE retry answered " + std::to_string(status)
+				+ " (" + d->destE164 + ") -- dialog released regardless; the carrier leg may still be up ("
+				+ std::to_string(n) + " so far)", true);
+		}
+		else
+		{
+			_env.log("Trunk: BYE answered " + std::to_string(status)
+				+ " (" + d->destE164 + ") -- dialog released regardless", true);
+		}
 		*d = Dialog{};
 		return true;
 	}
@@ -765,31 +789,9 @@ bool SipTrunk::answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& cha
 {
 	if (d.authAttempted || !hasCredentials()) return false;
 
-	const bool proxy = (status == 407);
-	std::string_view hdr = challenge->getHeaderLine(proxy ? "proxy-authenticate" : "www-authenticate");
-	if (hdr.empty()) return false;
-	if (!SipDigest::parseChallenge(hdr, _challenge, proxy)) return false;
-
-	char cnonce[SipDigest::kCnonceLen + 1];
-	SipDigest::makeCnonce(cnonce);
-	const std::string_view user = _cfg.authUser[0] ? std::string_view(_cfg.authUser)
-	                                               : std::string_view(_cfg.fromUser);
-	const std::string uri = pstnUri(d.destE164, d.domain);   // the Request-URI, verbatim
-
-	const char* name = SipDigest::authorizationHeaderName(_challenge);
-	const size_t nameLen = std::strlen(name);
-	std::memcpy(_authLine, name, nameLen);
-	_authLine[nameLen] = ':';
-	_authLine[nameLen + 1] = ' ';
-	size_t valueLen = 0;
-	if (!SipDigest::buildAuthorization(_challenge, user, std::string_view(_secret), "INVITE", uri,
-		/*ncValue=*/1, std::string_view(cnonce, SipDigest::kCnonceLen),
-		_authLine + nameLen + 2, sizeof(_authLine) - nameLen - 2, valueLen))
-	{
-		_env.log("Trunk: " + std::to_string(status) + " challenge cannot be answered ("
-			+ d.destE164 + ")", true);
-		return false;
-	}
+	// The digest uri is the Request-URI, verbatim.
+	const size_t lineLen = credentialLine(d, challenge, status, "INVITE", pstnUri(d.destE164, d.domain));
+	if (lineLen == 0) return false;
 
 	// Draw BOTH messages before anything is sent or changed (#581 review B2),
 	// so a pool refusal returns false having sent nothing and left `d` as it
@@ -812,7 +814,7 @@ bool SipTrunk::answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& cha
 	d.toTag.clear();
 
 	auto invite = _env.messageFromPool(
-		buildInvite(d, d.offerSdp, std::string_view(_authLine, nameLen + 2 + valueLen)), d.peer);
+		buildInvite(d, d.offerSdp, std::string_view(_authLine, lineLen)), d.peer);
 	std::memset(_authLine, 0, sizeof(_authLine));
 	if (!invite)
 	{
@@ -833,6 +835,81 @@ bool SipTrunk::answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& cha
 	invite->syncContentLength();
 	_env.enqueue(d.peer, std::move(invite));
 	_env.log("Trunk: " + std::to_string(status) + " challenge answered (" + d.destE164 + ")");
+	return true;
+}
+
+// The credential header line answering `challenge` for `method` on `uri`,
+// built into _authLine: the one digest path, shared by the INVITE retry (#399)
+// and the BYE retry (#687) so the two cannot drift. Returns the line's length,
+// or 0 when the challenge cannot be answered -- no challenge header, one that
+// does not parse (silently, as #581 had it), or one SipDigest refuses (auth-int
+// only, an unknown algorithm; logged). The caller zeroes _authLine once the
+// line is copied into a message. Nothing here logs the nonce or the digest.
+size_t SipTrunk::credentialLine(const Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status,
+	std::string_view method, std::string_view uri)
+{
+	const bool proxy = (status == 407);
+	std::string_view hdr = challenge->getHeaderLine(proxy ? "proxy-authenticate" : "www-authenticate");
+	if (hdr.empty()) return 0;
+	if (!SipDigest::parseChallenge(hdr, _challenge, proxy)) return 0;
+
+	char cnonce[SipDigest::kCnonceLen + 1];
+	SipDigest::makeCnonce(cnonce);
+	const std::string_view user = _cfg.authUser[0] ? std::string_view(_cfg.authUser)
+	                                               : std::string_view(_cfg.fromUser);
+
+	const char* name = SipDigest::authorizationHeaderName(_challenge);
+	const size_t nameLen = std::strlen(name);
+	std::memcpy(_authLine, name, nameLen);
+	_authLine[nameLen] = ':';
+	_authLine[nameLen + 1] = ' ';
+	size_t valueLen = 0;
+	if (!SipDigest::buildAuthorization(_challenge, user, std::string_view(_secret), method, uri,
+		/*ncValue=*/1, std::string_view(cnonce, SipDigest::kCnonceLen),
+		_authLine + nameLen + 2, sizeof(_authLine) - nameLen - 2, valueLen))
+	{
+		_env.log("Trunk: " + std::to_string(status) + " challenge cannot be answered ("
+			+ d.destE164 + ")", true);
+		return 0;
+	}
+	return nameLen + 2 + valueLen;
+}
+
+// Issue #687: answer a 401/407 to our BYE, once, through credentialLine() --
+// for method BYE and the BYE's own Request-URI, the remote target. A BYE is a
+// non-INVITE transaction (RFC 3261 s17.1.2), so the challenge takes no ACK;
+// the retry is a new transaction in the same dialog: same Call-ID, tags and
+// route, CSeq+1, a fresh branch. The credential is never logged. Returns
+// false, having sent nothing and left `d` as it was, when it cannot answer --
+// no credentials, an unanswerable challenge, already retried -- and the caller
+// then releases the dialog exactly as it always has.
+bool SipTrunk::answerByeChallenge(Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status)
+{
+	// The last two are buildBye()'s own preconditions, so the string drawn
+	// below cannot come back empty.
+	if (d.byeAuthAttempted || !hasCredentials() || d.toTag.empty() || d.remoteTarget.empty()) return false;
+
+	const size_t lineLen = credentialLine(d, challenge, status, "BYE", d.remoteTarget);
+	if (lineLen == 0) return false;
+
+	// buildBye() stamps d.cseq+1 (s12.2.1.1), so the bump puts the retry one
+	// past the challenged BYE. In Terminating nothing reads d.cseq as the
+	// INVITE's any more: there is no ACK left to build, and the #581 B1 check
+	// in handleResponse() skips this state.
+	d.cseq += 1;
+	auto bye = _env.messageFromPool(
+		buildBye(d, "z9hG4bK" + IDGen::GenerateID(12), std::string_view(_authLine, lineLen)), d.peer);
+	std::memset(_authLine, 0, sizeof(_authLine));
+	if (!bye)
+	{
+		d.cseq -= 1;
+		_env.log("Trunk: BYE challenge answer dropped, message pool exhausted (" + d.destE164 + ")", true);
+		return false;
+	}
+	d.byeAuthAttempted = true;
+	bye->syncContentLength();
+	_env.enqueue(d.peer, std::move(bye));
+	_env.log("Trunk: " + std::to_string(status) + " to our BYE answered with credentials (" + d.destE164 + ")");
 	return true;
 }
 
