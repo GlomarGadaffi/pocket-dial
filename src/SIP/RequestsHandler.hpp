@@ -413,6 +413,12 @@ public:
 		std::lock_guard<std::mutex> lock(_mutex);
 		_anchorPlacesRealCalls = real;
 	}
+	// Test-only (#659): move every 911/933 dial mark `d` into the past.
+	void ageEmergencyCallbacksForTest(std::chrono::steady_clock::duration d)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_emergencyCallbacks.ageForTest(d);
+	}
 #endif
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
@@ -1597,6 +1603,16 @@ private:
 		const std::shared_ptr<SipClient>& caller,
 		const pbx::EmergencyDial& emergency, const std::string& dialed);
 
+	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
+	// pbx::kEmergencyCallbackWindow). Every path that creates a session for an
+	// inbound call to an extension asks this: onInvite's direct call and
+	// routeInboundAnchorCall today, the trunk's inbound (#398) when it lands.
+	// Caller holds _mutex.
+	bool isEmergencyCallback(std::string_view ext) const
+	{
+		return _emergencyCallbacks.open(ext, std::chrono::steady_clock::now());
+	}
+
 	// emergencyRoute() for a caller that already holds _mutex.
 	EmergencyRoute emergencyRouteLocked() const;
 
@@ -2094,6 +2110,10 @@ private:
 	// simulator and must never be handed an emergency number. Written only
 	// there and by setAnchorPlacesRealCallsForTest(); read under _mutex.
 	bool _anchorPlacesRealCalls = false;
+	// #659: when each extension last dialed 911/933, for the PSAP callback
+	// window. Written by routeEmergencyCall(), read where an inbound call to an
+	// extension creates its session (isEmergencyCallback()); under _mutex.
+	pbx::EmergencyCallbacks _emergencyCallbacks;
 	// Issue #546: the SIP trunk has answered an INVITE with a 2xx since boot /
 	// since setTrunkConfig(). Set in onTrunkAnswered(), cleared by
 	// setTrunkConfig(); under _mutex.

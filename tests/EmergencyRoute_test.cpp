@@ -713,3 +713,114 @@ TEST(EmergencyRoute, ANineOneOneDialedWhileTheLastAnchorLegIsCancellingIsPlaced)
 		<< "the provider must be asked to dial 911, as outside the window";
 	EXPECT_EQ(b.count("SIP/2.0 200"), 1u) << b.dump();
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// E. #659: a call to an extension that dialed 911/933 in the last 30 minutes is
+// a PSAP callback, and so an emergency call. The 911 goes to the loopback anchor
+// posing as a real provider; the callback is an inbound anchor event or an
+// internal call. Nothing leaves the process.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+	constexpr const char* kOtherIp = "192.168.79.12";
+	constexpr const char* kThirdIp = "192.168.79.13";
+
+	std::shared_ptr<SipMessage> makeCall(const std::string& from, const char* ip,
+		const std::string& to, const std::string& callId)
+	{
+		const std::string body =
+			"v=0\r\no=- 0 0 IN IP4 " + std::string(ip) + "\r\ns=-\r\n"
+			"c=IN IP4 " + std::string(ip) + "\r\nt=0 0\r\n"
+			"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+		const std::string raw =
+			"INVITE sip:" + to + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(ip) + ":5060;branch=z9hG4bK" + callId + "\r\n"
+			"From: <sip:" + from + "@server>;tag=f" + callId + "\r\n"
+			"To: <sip:" + to + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + from + "@" + std::string(ip) + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
+	}
+
+	// 101 dials 911, then hangs up: no emergency call is live afterwards.
+	void dial911AndHangUp(Bench& b)
+	{
+		b.handler->setAnchorPlacesRealCallsForTest(true);
+		b.handler->handle(makeInvite("911", "er-659"));
+		ASSERT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
+		b.handler->handle(RequestsHandler::getMessageFromPool(
+			"BYE sip:911@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKer659bye\r\n"
+			"From: <sip:101@server>;tag=efer-659\r\n"
+			"To: <sip:911@server>;tag=srv\r\n"
+			"Call-ID: er-659\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n", addrFor(kHandsetIp)));
+		ASSERT_FALSE(b.handler->hasLiveEmergencyCall()) << "precondition: the 911 has ended";
+	}
+}
+
+TEST(EmergencyCallback, AnAnchorCallbackWithinThirtyMinutesIsAnEmergencyCall)
+{
+	Bench b;
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	b.handler->ageEmergencyCallbacksForTest(std::chrono::minutes(29));
+
+	const std::string id = b.handler->routeInboundAnchorCallForTest("800", "psap-659", "PSAP");
+	const auto s = b.handler->getSession(id);
+	ASSERT_TRUE(s.has_value()) << "the callback must ring 101:\n" << b.dump();
+	EXPECT_TRUE(s.value()->isEmergency()) << "29 min after the 911, a call to 101 is a PSAP callback";
+}
+
+TEST(EmergencyCallback, AnInternalCallbackWithinThirtyMinutesIsAnEmergencyCall)
+{
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-659-in"));
+	const auto s = b.handler->getSession("Call-ID: er-659-in");
+	ASSERT_TRUE(s.has_value()) << b.dump();
+	EXPECT_TRUE(s.value()->isEmergency());
+}
+
+TEST(EmergencyCallback, ACallbackAfterThirtyMinutesIsNot)
+{
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+
+	b.handler->ageEmergencyCallbacksForTest(std::chrono::minutes(29));
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-659-29"));
+	const auto inside = b.handler->getSession("Call-ID: er-659-29");
+	ASSERT_TRUE(inside.has_value()) << b.dump();
+	ASSERT_TRUE(inside.value()->isEmergency()) << "control: flagged inside the window";
+
+	b.handler->ageEmergencyCallbacksForTest(std::chrono::minutes(2));
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-659-31"));
+	const auto after = b.handler->getSession("Call-ID: er-659-31");
+	ASSERT_TRUE(after.has_value()) << b.dump();
+	EXPECT_FALSE(after.value()->isEmergency()) << "31 min after the 911 the window has closed";
+}
+
+TEST(EmergencyCallback, ACallToAnotherExtensionIsNot)
+{
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	b.handler->handle(makeRegister("103", kThirdIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+
+	b.handler->handle(makeCall("103", kThirdIp, "102", "er-659-other"));
+	b.handler->handle(makeCall("101", kHandsetIp, "102", "er-659-out"));
+	b.handler->handle(makeCall("103", kThirdIp, "101", "er-659-ctl"));
+	const auto other = b.handler->getSession("Call-ID: er-659-other");
+	const auto out = b.handler->getSession("Call-ID: er-659-out");
+	const auto ctl = b.handler->getSession("Call-ID: er-659-ctl");
+	ASSERT_TRUE(other.has_value() && out.has_value() && ctl.has_value()) << b.dump();
+	EXPECT_FALSE(other.value()->isEmergency()) << "102 never dialed 911";
+	EXPECT_FALSE(out.value()->isEmergency()) << "a call FROM the 911 caller is not a callback";
+	EXPECT_TRUE(ctl.value()->isEmergency()) << "control: the same call to 101 is flagged";
+}
