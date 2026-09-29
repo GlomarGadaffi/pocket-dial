@@ -10128,7 +10128,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 		if (_optionsPingTruncated.fetch_add(1, std::memory_order_relaxed) == 0)
 		{
 			queueLog("OPTIONS ping to " + num + " refused: it does not fit the " +
-				std::to_string(sizeof(wire.bytes)) + " B buffer (#463/#744)", true);
+				std::to_string(sipb::kMaxOptionsBytes) + " B cap (#463/#744)", true);
 		}
 		return nullptr;
 	}

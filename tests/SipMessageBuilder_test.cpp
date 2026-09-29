@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 
+#include "IDGen.hpp"
 #include "SipMessageBuilder.hpp"
 #include "support/AllocCounter.hpp"
 
@@ -149,4 +150,22 @@ TEST(SipMessageBuilder, OptionsTruncationFailsSafely)
 
 	EXPECT_EQ(sipb::options(wire, hugeParams), sipb::Err::Truncated);
 	EXPECT_EQ(wire.len, 0u) << "truncated build must zero out len (never send partial)";
+}
+
+// B1: the random identifiers come from IDGen's CSPRNG path and nothing else
+// (#385). A local PRNG would ignore the injected byte source and fail this.
+TEST(SipMessageBuilder, OptionsIdsComeFromIdGen)
+{
+	IDGen::setByteSourceForTest([](uint8_t* buf, size_t len) {
+		for (size_t i = 0; i < len; ++i) buf[i] = 1;   // 0x01 -> alphabet[1] == '1'
+	});
+	sipb::Wire wire{};
+	const sipb::Err err = sipb::options(wire, "101", "192.168.1.50", 5060, "192.168.1.1", 5060);
+	IDGen::setByteSourceForTest(nullptr);
+
+	ASSERT_EQ(err, sipb::Err::Ok);
+	const std::string_view raw(wire.bytes, wire.len);
+	EXPECT_EQ(headerValue(raw, "Call-ID"), "111111111111111@192.168.1.1");
+	EXPECT_NE(raw.find(";branch=z9hG4bK111111111111\r\n"), std::string_view::npos) << raw;
+	EXPECT_NE(raw.find(";tag=111111111\r\n"), std::string_view::npos) << raw;
 }

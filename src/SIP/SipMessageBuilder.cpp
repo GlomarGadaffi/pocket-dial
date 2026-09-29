@@ -1,35 +1,11 @@
 #include "SipMessageBuilder.hpp"
 
 #include <cstdio>
-#include <random>
+
+#include "IDGen.hpp"
 
 namespace sipb
 {
-
-namespace
-{
-
-constexpr char kAlphanum[] =
-	"0123456789"
-	"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	"abcdefghijklmnopqrstuvwxyz";
-
-// Generate random alphanumeric characters directly into fixed-size buffer.
-// Zero heap allocations. Uses std::minstd_rand (small state, FreeRTOS-safe #74).
-void generateId(char* dst, size_t len)
-{
-	thread_local std::minstd_rand rng{std::random_device{}()};
-	thread_local std::uniform_int_distribution<int> dist{
-		0, static_cast<int>(sizeof(kAlphanum) - 2)};
-
-	for (size_t i = 0; i < len; ++i)
-	{
-		dst[i] = kAlphanum[dist(rng)];
-	}
-	dst[len] = '\0';
-}
-
-} // namespace
 
 Err options(Wire& out, const OptionsParams& params)
 {
@@ -44,9 +20,11 @@ Err options(Wire& out, const OptionsParams& params)
 	char branchRand[13]{};
 	char fromTagRand[10]{};
 
-	generateId(callIdRand, 15);
-	generateId(branchRand, 12);
-	generateId(fromTagRand, 9);
+	// IDGen, not a local PRNG: these are the identifiers that tell a real
+	// in-dialog message from a forged one (#385). Kept at the SSO-sized lengths.
+	IDGen::fill(callIdRand, 15);
+	IDGen::fill(branchRand, 12);
+	IDGen::fill(fromTagRand, 9);
 
 	const int targetLen = static_cast<int>(params.targetAor.size());
 	const int destIpLen = static_cast<int>(params.destIp.size());
