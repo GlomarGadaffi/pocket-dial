@@ -3926,29 +3926,30 @@ void RequestsHandler::preemptAnchorCallForEmergency()
 	// Another emergency call is never taken; the busy 503 stands instead.
 	const bool needBridge = allBridgesBusy();
 	unsigned legs = 0;
-	std::string victimId;
+	const std::shared_ptr<Session>* found = nullptr;   // valid until endCall() erases it
 	for (const auto& [id, s] : _sessions)
 	{
 		if (!s->isAnchor() || s->getState() == Session::State::Bye) continue;
 		++legs;
-		if (!victimId.empty() || s->isEmergency()) continue;
+		if (found || s->isEmergency()) continue;
 		bool hasBridge = false;
 		for (const auto& b : _mediaBridges) hasBridge = hasBridge || b.isForCallId(id);
-		if (!needBridge || hasBridge) victimId = id;
+		if (!needBridge || hasBridge) found = &s;
 	}
-	if (victimId.empty() || (!needBridge && legs < anchorCallLimit())) return;
+	if (!found || (!needBridge && legs < anchorCallLimit())) return;
+	const std::shared_ptr<Session>& victim = *found;
 
 	// Tell its caller the way each teardown path already does: a 503 or a
 	// CANCEL while it still rings, else a BYE (the #604 sweep's shape). endCall()
-	// then drops the anchor leg and frees the bridge.
-	const auto victim = _sessions.find(victimId)->second;
+	// then drops the anchor leg and frees the bridge; it also logs the reason.
+	const std::string callID = victim->getCallID();   // endCall() erases the map's copy
 	const bool inbound = victim->isAnchorInbound();
 	const auto handset = inbound ? victim->getDest() : victim->getSrc();
 	const std::string& dFrom = victim->getDialogFrom();
 	const std::string& dTo = victim->getDialogTo();
 	if (victim->getState() == Session::State::Invited)
 	{
-		if (!inbound) refuseRingingAnchor(victimId, _outbox);
+		if (!inbound) refuseRingingAnchor(callID, _outbox);
 		else for (const auto& t : victim->getPendingTargets())
 		{
 			if (auto c = buildInboundCancelTo(victim, t)) _outbox.emplace_back(t->getAddress(), std::move(c));
@@ -3957,16 +3958,14 @@ void RequestsHandler::preemptAnchorCallForEmergency()
 	else if (handset && !dFrom.empty() && !dTo.empty())
 	{
 		const uint32_t cseq = victim->nextServerCSeq();
-		auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), victimId,
+		auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), callID,
 			inbound ? dFrom : dTo, inbound ? dTo : dFrom, cseq);
 		if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
 		victim->noteServerCSeq(cseq);
 	}
-	queueLog("EMERGENCY: pre-empted anchored call " + victimId, true);
-	const std::string handsetNum = handset ? handset->getNumber() : std::string();
-	const std::string farNum = victim->getAnchorParticipantId();
-	if (inbound) endCall(victimId, farNum, handsetNum, "pre-empted by 911");
-	else         endCall(victimId, handsetNum, farNum, "pre-empted by 911");
+	const std::string far = victim->getAnchorParticipantId();   // endCall()'s release() clears it
+	const std::string_view phone = handset ? std::string_view(handset->getNumber()) : std::string_view();
+	endCall(callID, inbound ? far : phone, inbound ? phone : far, "pre-empted by 911");
 }
 
 bool RequestsHandler::anchorIsSynchronous() const
