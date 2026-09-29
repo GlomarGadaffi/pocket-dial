@@ -1821,6 +1821,10 @@ private:
 	// exhaustion (graceful, never a crash). Caller holds _mutex.
 	std::shared_ptr<SipClient> allocateVirtualPeer(std::string number, sockaddr_in address, int expiresSeconds = 3600);
 
+	// Answer `req` with a bodiless final status: the request's own Via (received/
+	// rport) and a Contact for `contactExt`. False when the pool refused (#101A:
+	// drop, the peer retransmits), so the caller skips its log line too.
+	bool refuseInvite(const SipMessage& req, const char* statusLine, std::string_view contactExt);
 	// Build a 200 OK with an SDP body for an INVITE (used by 777, park, onReinvite).
 	std::shared_ptr<SipMessage> buildOkWithSdp(const std::shared_ptr<SipMessage>& inviteMsg,
 		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody);
