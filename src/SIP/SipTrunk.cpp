@@ -844,13 +844,13 @@ void SipTrunk::tickRegistration(uint64_t nowMs, const sockaddr_in& sbc)
 	if (!_regLive)
 	{
 		SipRegistrationClient::Config rc;
-		std::snprintf(rc.registrarHost, sizeof(rc.registrarHost), "%s", _cfg.host);
+		if (std::snprintf(rc.registrarHost, sizeof(rc.registrarHost), "%s", _cfg.host) < 0) return;
 		rc.registrarPort = _cfg.port;
-		std::snprintf(rc.domain,   sizeof(rc.domain),   "%s", _cfg.host);
-		std::snprintf(rc.aorUser,  sizeof(rc.aorUser),  "%s", _cfg.fromUser);
-		std::snprintf(rc.authUser, sizeof(rc.authUser), "%s",
-			_cfg.authUser[0] ? _cfg.authUser : _cfg.fromUser);
-		std::snprintf(rc.localIp,  sizeof(rc.localIp),  "%s", _env.localIp().c_str());
+		if (std::snprintf(rc.domain,   sizeof(rc.domain),   "%s", _cfg.host) < 0) return;
+		if (std::snprintf(rc.aorUser,  sizeof(rc.aorUser),  "%s", _cfg.fromUser) < 0) return;
+		if (std::snprintf(rc.authUser, sizeof(rc.authUser), "%s",
+			_cfg.authUser[0] ? _cfg.authUser : _cfg.fromUser) < 0) return;
+		if (std::snprintf(rc.localIp,  sizeof(rc.localIp),  "%s", _env.localIp().c_str()) < 0) return;
 		rc.localPort = static_cast<uint16_t>(_env.serverPort());
 		if (!_reg.configure(rc, _secret)) return;
 		_reg.start(nowMs);
