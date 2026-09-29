@@ -1170,15 +1170,20 @@ void RequestsHandler::drainPassLocked(
 	logScratch.swap(_logQueue);
 }
 
-void RequestsHandler::flushPass(
-	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
-	std::vector<std::pair<bool, std::string>>& logScratch)
+void RequestsHandler::printLogs(const std::vector<std::pair<bool, std::string>>& logs)
 {
-	for (const auto& log : logScratch)
+	for (const auto& log : logs)
 	{
 		if (log.first) std::cerr << log.second << '\n';
 		else std::cout << log.second << '\n';
 	}
+}
+
+void RequestsHandler::flushPass(
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	std::vector<std::pair<bool, std::string>>& logScratch)
+{
+	printLogs(logScratch);
 	for (auto& event : outScratch)
 	{
 		_onHandled(event.first, std::move(event.second));
@@ -7793,11 +7798,7 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 uint64_t RequestsHandler::getPacketsProcessed() const
@@ -7994,11 +7995,7 @@ void RequestsHandler::setDnd(const std::string& extension, bool on)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::string> RequestsHandler::getDndExtensions()
@@ -8017,11 +8014,7 @@ void RequestsHandler::setVoicemail(const std::string& extension, bool on)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::string> RequestsHandler::getVoicemailExtensions()
@@ -8042,11 +8035,7 @@ void RequestsHandler::setForward(const std::string& extension, const std::string
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string, std::string>> RequestsHandler::getForwards()
@@ -8069,11 +8058,7 @@ void RequestsHandler::setE911Config(const std::string& exts, const std::string& 
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::tuple<std::string, std::string, std::string> RequestsHandler::getE911Config()
@@ -8093,11 +8078,7 @@ void RequestsHandler::setRingGroup(const std::string& groupExt, const std::strin
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string>> RequestsHandler::getRingGroups()
@@ -8147,11 +8128,7 @@ void RequestsHandler::setDialRule(const std::string& pattern, const std::string&
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getDialRules()
@@ -8284,11 +8261,7 @@ std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 	return err;
 }
 
@@ -8350,11 +8323,7 @@ void RequestsHandler::setRegistrarMode(RegistrarMode mode)
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 RequestsHandler::RegistrarMode RequestsHandler::getRegistrarMode() const
@@ -8417,11 +8386,7 @@ bool RequestsHandler::secureDevice(const std::string& macOrExt)
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 	return changed;
 }
 
@@ -8436,11 +8401,7 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 	return removed;
 }
 
@@ -10134,11 +10095,7 @@ void RequestsHandler::setPageZone(const std::string& zoneExt, const std::string&
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::pair<std::string, std::string>> RequestsHandler::getPageZones()
