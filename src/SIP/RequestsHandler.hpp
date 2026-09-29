@@ -1826,8 +1826,11 @@ private:
 	std::shared_ptr<SipClient> allocateVirtualPeer(std::string number, sockaddr_in address, int expiresSeconds = 3600);
 
 	// Build a 200 OK with an SDP body for an INVITE (used by 777, park, onReinvite).
+	// `grantSessionTimer` (#198): true only on a leg whose re-INVITE this PBX
+	// answers 200 itself (555/anchor: answerAnchorReinvite); see answerSessionTimer.
 	std::shared_ptr<SipMessage> buildOkWithSdp(const std::shared_ptr<SipMessage>& inviteMsg,
-		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody);
+		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody,
+		bool grantSessionTimer);
 	// Build a server-initiated in-dialog BYE. From/To must include tags because the
 	// dialog role differs per call path (beep = server UAC; park = server UAS).
 	// `cseq` must exceed every CSeq already used on this dialog, by either party or

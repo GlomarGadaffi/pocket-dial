@@ -808,6 +808,52 @@ TEST(SessionTimer, TheAnchorAnswerAndItsReinviteAnswerNameThePhoneAsRefresher)
 	r.handler.handle(timerRequest("INVITE", "100", kCaller, "555", "se-555",
 		"Supported: timer\r\nSession-Expires: 1800;refresher=uac\r\n", toTagOf(ok), 2));
 	expectPhoneRefreshes(okTo(r.sent, kCaller, "2 INVITE"), "555 re-INVITE answer");
+	// The refresh reached a 2xx, not onReinvite()'s 488 (RFC 4028 §10: only a
+	// 2xx extends the session), which is what makes the grant above honest.
+	int refused = 0;
+	for (const auto& [addr, msg] : r.sent)
+	{
+		if (msg && addr.sin_addr.s_addr == inet_addr(kCaller) &&
+		    msg->toString().rfind("SIP/2.0 488", 0) == 0) ++refused;
+	}
+	EXPECT_EQ(refused, 0) << "the 555 re-INVITE refresh must be answered, not refused";
+}
+
+// The voicemail legs (deposit on busy: dest is a "700" virtual peer; dial-in
+// retrieval: "796") pass onReinvite()'s guard, but their dest carries the
+// caller's OWN address, so a re-INVITE refresh is relayed back to the phone
+// and never answered 200 by the PBX. So they get no timer either.
+TEST(SessionTimer, TheVoicemailDepositAnswerCarriesNoTimer)
+{
+	Rig r;
+	r.handler.setVoicemail("106", true);
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "106", "se-vm-dep", kTimerOffer));
+	// 106 is busy: the same 486 shape as VoicemailDivert_test's makeBusy().
+	r.handler.handle(RequestsHandler::getMessageFromPool(
+		"SIP/2.0 486 Busy Here\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kOther) + ":5060;branch=z9hG4bKse-vm-depINVITE1\r\n"
+		"From: <sip:100@server>;tag=ftse-vm-dep\r\n"
+		"To: <sip:106@server>;tag=btse-vm-dep\r\n"
+		"Call-ID: se-vm-dep\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n", addrFor(kOther)));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(ok, "voicemail deposit answer");
+	// Positive control: the busy fell back to voicemail, answered by the PBX.
+	EXPECT_NE(ok.find("v=0"), std::string::npos) << ok;
+	auto session = r.handler.getSession("Call-ID: se-vm-dep");
+	ASSERT_TRUE(session.has_value());
+	EXPECT_TRUE(session.value()->isVoicemail()) << "precondition: this is the deposit leg";
+}
+
+TEST(SessionTimer, TheVoicemailRetrievalAnswerCarriesNoTimer)
+{
+	Rig r;
+	r.handler.setVoicemail("100", true);
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "796", "se-vm-ret", kTimerOffer));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(ok, "voicemail retrieval answer");
+	EXPECT_NE(headerValue(ok, "Contact").find("sip:796@"), std::string::npos) << ok;
 }
 
 // A park-leg UPDATE refresh is relayed back to the caller (#709) and draws
