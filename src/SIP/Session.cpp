@@ -18,6 +18,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_src = src;
 	_dest.reset();
 	_state = State::Invited;
+	_disposition = Disposition::None;   // #690: a recycled slot carries no old outcome
 	_startTime = std::chrono::steady_clock::now();
 	_isBroadcast = false;
 	_isAnchor = false;

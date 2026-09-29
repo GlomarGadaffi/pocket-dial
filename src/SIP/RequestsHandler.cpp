@@ -1742,6 +1742,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 	}
 
 	setCallState(data->getCallID(), Session::State::Cancel);
+	setCallDisposition(data->getCallID(), Session::Disposition::Cancel);
 	endHandle(data->getToNumber(), data);
 }
 
@@ -5789,6 +5790,7 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 	}
 
 	setCallState(data->getCallID(), Session::State::Busy);
+	setCallDisposition(data->getCallID(), Session::Disposition::Busy);
 	endHandle(data->getFromNumber(), data);
 }
 
@@ -5880,6 +5882,7 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 		return;
 	}
 	setCallState(data->getCallID(), Session::State::Unavailable);
+	setCallDisposition(data->getCallID(), Session::Disposition::Unavailable);
 	endHandle(data->getFromNumber(), data);
 }
 
@@ -6226,6 +6229,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	{
 		data->setHeader("BYE " + far.value()->getContactUri() + " SIP/2.0");
 	}
+	setCallDisposition(data->getCallID(), Session::Disposition::Bye);
 	endHandle(data->getToNumber(), data);
 }
 
@@ -7657,6 +7661,17 @@ bool RequestsHandler::setCallState(std::string_view callID, Session::State state
 	if (session)
 	{
 		session->get()->setState(state);
+		return true;
+	}
+	return false;
+}
+
+bool RequestsHandler::setCallDisposition(std::string_view callID, Session::Disposition disposition)
+{
+	auto session = getSession(callID);
+	if (session)
+	{
+		session->get()->setDisposition(disposition);
 		return true;
 	}
 	return false;

@@ -1140,6 +1140,8 @@ private:
 	void refreshParkSnapshot();
 
 	bool setCallState(std::string_view callID, Session::State state);
+	// #690: records how the call ended, next to (not instead of) setCallState().
+	bool setCallDisposition(std::string_view callID, Session::Disposition disposition);
 	void endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason = "");
 
 	// CDR ring buffer moved to CdrRing.hpp (see _cdr below); endCall() now calls
