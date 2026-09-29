@@ -8,6 +8,7 @@
 // every assertion is exact rather than "within a tolerance".
 
 #include <gtest/gtest.h>
+#include <cctype>
 #include <string>
 #include <string_view>
 
@@ -85,8 +86,21 @@ SipRegistrationClient::ResponseView challenge401(std::string_view hdr = kChallen
     return r;
 }
 
+// #686: a 2xx registers us only when it lists OUR binding, so the default 200
+// echoes the exact Contact URI makeConfig() registers.
+constexpr const char* kOurContact = "<sip:15551234567@192.0.2.10:5060>";
+
+// The instance UUID our REGISTER's Contact carries, as sent.
+std::string instanceOf(const std::string& msg)
+{
+    const std::string c = headerOf(msg, "Contact");
+    const size_t p = c.find("urn:uuid:");
+    if (p == std::string::npos) return {};
+    return c.substr(p + 9, c.find('>', p) - p - 9);
+}
+
 SipRegistrationClient::ResponseView ok200(std::string_view expires,
-                                          std::string_view contact = {})
+                                          std::string_view contact = kOurContact)
 {
     SipRegistrationClient::ResponseView r;
     r.code = 200;
@@ -133,7 +147,11 @@ TEST(SipRegistrationClient, FirstRegisterIsUnauthenticatedAndWellFormed)
     // RFC 3261 §10.2: the Request-URI names the REGISTRAR's domain, not a user.
     EXPECT_EQ(msg.rfind("REGISTER sip:sbc.carrier.example SIP/2.0\r\n", 0), 0u);
     EXPECT_EQ(headerOf(msg, "To"),      "<sip:15551234567@carrier.example>");
-    EXPECT_EQ(headerOf(msg, "Contact"), "<sip:15551234567@192.0.2.10:5060>");
+    // #686: our RFC 5626 instance and reg-id ride on the Contact.
+    const std::string contact = headerOf(msg, "Contact");
+    EXPECT_EQ(contact.rfind("<sip:15551234567@192.0.2.10:5060>;+sip.instance=\"<urn:uuid:", 0), 0u)
+        << contact;
+    EXPECT_EQ(contact.substr(contact.size() - 11), ">\";reg-id=1") << contact;
     EXPECT_EQ(headerOf(msg, "Expires"), "3600");
     EXPECT_EQ(headerOf(msg, "CSeq"),    "1 REGISTER");
     EXPECT_NE(msg.find(";branch=z9hG4bK"), std::string::npos);
@@ -361,6 +379,141 @@ TEST(SipRegistrationClient, AZeroSecondGrantIsAFailureNotASuccess)
 
     EXPECT_EQ(c.state(), State::Failed);
     EXPECT_NE(std::string(c.status().lastError).find("0 second"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// #686: a 2xx is a registration only when its Contact list holds OUR binding
+// (RFC 3261 §10.2.4). Engage answers a failed REGISTER "200 Authorization
+// failure" with no Expires and its own address as the only Contact.
+// ---------------------------------------------------------------------------
+
+TEST(SipRegistrationClient, A2xxListingOnlyTheCarriersOwnContactIsNotARegistration)
+{
+    SipRegistrationClient c;
+    ASSERT_TRUE(c.configure(makeConfig(), "hunter2"));
+
+    uint64_t now = 1000;
+    SipRegistrationClient::Request req;
+    c.start(now);
+    ASSERT_TRUE(c.tick(now, req));
+    c.onResponse(now, ok200(/*Expires*/ {}, "<sip:203.0.113.5:5065>"));
+
+    EXPECT_EQ(c.state(), State::Failed);
+    EXPECT_EQ(c.status().grantedExpiresSec, 0u);
+    EXPECT_EQ(c.status().consecutiveFailures, 1u);
+    EXPECT_NE(std::string(c.status().lastError).find("binding"), std::string::npos);
+    // Backed off and retried, like any other failure.
+    EXPECT_FALSE(c.tick(now + 1999, req));
+    EXPECT_TRUE(c.tick(now + 2000, req));
+}
+
+TEST(SipRegistrationClient, A2xxEchoingOurInstanceFromBehindNatIsARegistrationWithThatLease)
+{
+    SipRegistrationClient c;
+    ASSERT_TRUE(c.configure(makeConfig(), "hunter2"));
+
+    uint64_t now = 1000;
+    SipRegistrationClient::Request req;
+    c.start(now);
+    ASSERT_TRUE(c.tick(now, req));
+    std::string id = instanceOf(wire(req));
+    EXPECT_EQ(id.size(), 36u) << wire(req);
+
+    // The carrier saw us at the NAT's public address, not 192.0.2.10:5060, so
+    // only the echoed +sip.instance says which binding is ours. Another device
+    // on the same AOR is listed first with a shorter lease, and the registrar
+    // re-cased our UUID (RFC 4122: hex compares case-insensitively).
+    for (char& ch : id) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    const std::string contact =
+        "<sip:15551234567@198.51.100.9:5060>;expires=30, "
+        "<sip:15551234567@203.0.113.77:61234>;+sip.instance=\"<urn:uuid:" + id +
+        ">\";reg-id=1;expires=240";
+    c.onResponse(now, ok200("3600", contact));
+
+    EXPECT_EQ(c.state(), State::Registered);
+    EXPECT_EQ(c.status().grantedExpiresSec, 240u)
+        << "our binding's lease: not the other device's, not the Expires header";
+    EXPECT_EQ(c.status().bindingExpiresAtMs, now + 240u * 1000u);
+}
+
+TEST(SipRegistrationClient, OurInstanceUnderAnotherUserIsNotOurBinding)
+{
+    // The decision on #686: the instance AND the user part must match.
+    SipRegistrationClient c;
+    ASSERT_TRUE(c.configure(makeConfig(), "hunter2"));
+
+    uint64_t now = 1000;
+    SipRegistrationClient::Request req;
+    c.start(now);
+    ASSERT_TRUE(c.tick(now, req));
+    const std::string id = instanceOf(wire(req));
+    ASSERT_EQ(id.size(), 36u) << wire(req);
+    c.onResponse(now, ok200("3600", "<sip:15559999999@203.0.113.77:61234>;+sip.instance=\"<urn:uuid:"
+                                    + id + ">\";expires=240"));
+
+    EXPECT_EQ(c.state(), State::Failed);
+    EXPECT_EQ(c.status().grantedExpiresSec, 0u);
+}
+
+TEST(SipRegistrationClient, A2xxWithAnEmptyContactListIsNotARegistration)
+{
+    SipRegistrationClient c;
+    ASSERT_TRUE(c.configure(makeConfig(), "hunter2"));
+
+    uint64_t now = 1000;
+    SipRegistrationClient::Request req;
+    c.start(now);
+    ASSERT_TRUE(c.tick(now, req));
+    c.onResponse(now, ok200("3600", {}));
+
+    EXPECT_EQ(c.state(), State::Failed) << "no bindings listed means none is ours";
+    EXPECT_EQ(c.status().consecutiveFailures, 1u);
+}
+
+TEST(SipRegistrationClient, OurBindingWithNoLeaseAnywhereIsAFailureNotAnAssumedHour)
+{
+    // RFC 3261 §10.3 step 8: the registrar states the lease. When neither our
+    // binding's ;expires nor an Expires header does, we do not invent one.
+    SipRegistrationClient c;
+    ASSERT_TRUE(c.configure(makeConfig(), "hunter2"));
+
+    uint64_t now = 1000;
+    SipRegistrationClient::Request req;
+    c.start(now);
+    ASSERT_TRUE(c.tick(now, req));
+    c.onResponse(now, ok200(/*Expires*/ {}, kOurContact));
+
+    EXPECT_EQ(c.state(), State::Failed);
+    EXPECT_EQ(c.status().grantedExpiresSec, 0u);
+}
+
+TEST(SipRegistrationClient, OurInstanceIsAVersion4UuidKeptAcrossAReconfigure)
+{
+    SipRegistrationClient c;
+    ASSERT_TRUE(c.configure(makeConfig(), "hunter2"));
+
+    uint64_t now = 1000;
+    SipRegistrationClient::Request req;
+    c.start(now);
+    ASSERT_TRUE(c.tick(now, req));
+    const std::string id = instanceOf(wire(req));
+    ASSERT_EQ(id.size(), 36u) << wire(req);
+
+    // RFC 4122 §4.4: 8-4-4-4-12 hex, version nibble 4, variant 10xx.
+    for (size_t i = 0; i < id.size(); ++i)
+    {
+        if (i == 8 || i == 13 || i == 18 || i == 23) EXPECT_EQ(id[i], '-') << id;
+        else EXPECT_TRUE(std::isxdigit(static_cast<unsigned char>(id[i]))) << id;
+    }
+    EXPECT_EQ(id[14], '4') << id;
+    EXPECT_NE(std::string("89ab").find(id[19]), std::string::npos) << id;
+
+    // RFC 5626 §4.1: the instance names this UA, not one registration, so a
+    // reconfigure (new Call-ID) keeps it.
+    ASSERT_TRUE(c.configure(makeConfig(), "hunter2"));
+    c.start(now);
+    ASSERT_TRUE(c.tick(now, req));
+    EXPECT_EQ(instanceOf(wire(req)), id);
 }
 
 // ---------------------------------------------------------------------------
