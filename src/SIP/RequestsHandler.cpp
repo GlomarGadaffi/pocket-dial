@@ -842,7 +842,6 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	// Input validation: Drop null or structurally malformed packets instantly (SEC-02)
 	if (!request || !request->isValidMessage())
 	{
-		_packetsDropped.fetch_add(1, std::memory_order_relaxed);
 		// Issue #430: record the source and first bytes, so an idle drop rate can
 		// be traced to its sender (e.g. a CRLF keep-alive) without a LAN capture.
 		const sockaddr_in src = request ? request->getSource() : sockaddr_in{};
@@ -858,7 +857,6 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		std::lock_guard<std::mutex> rlock(_rateMutex);
 		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
 		{
-			_packetsDropped.fetch_add(1, std::memory_order_relaxed);
 			const sockaddr_in src = request->getSource();
 			_dropProbe.note(DropProbe::Reason::Rate, src.sin_addr.s_addr, src.sin_port, rawBytes);
 			return;
@@ -7890,7 +7888,10 @@ void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipM
 
 uint64_t RequestsHandler::getPacketsDropped() const
 {
-	return _packetsDropped.load(std::memory_order_relaxed);
+	// #702 item 19: derived, not a second counter. Every Invalid/Rate drop is
+	// noted in the probe (handle() and noteRxDiscard()), so the sum is exact by
+	// construction. Each reason wraps at 2^32 (DropProbe is 32-bit, Xtensa).
+	return static_cast<uint64_t>(_dropProbe.invalidCount()) + _dropProbe.rateCount();
 }
 
 uint64_t RequestsHandler::getDroppedInvalid() const
@@ -7916,8 +7917,6 @@ const DropProbe& RequestsHandler::getDropProbe() const
 void RequestsHandler::noteRxDiscard(DropProbe::Reason reason, const sockaddr_in& src,
                                     std::string_view bytes, size_t fullLen)
 {
-	if (reason == DropProbe::Reason::Invalid || reason == DropProbe::Reason::Rate)
-		_packetsDropped.fetch_add(1, std::memory_order_relaxed);   // keep #430's sum exact
 	_dropProbe.note(reason, src.sin_addr.s_addr, src.sin_port, bytes, fullLen);
 }
 
