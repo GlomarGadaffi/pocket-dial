@@ -7638,11 +7638,22 @@ std::shared_ptr<SipClient> RequestsHandler::findServicePeer(std::string_view num
 	return _servicePeers[static_cast<std::size_t>(idx)];
 }
 
+// #754: a request this PBX relays into a leg names that leg, not the PBX. The
+// sender addressed the PBX (the Contact the PBX presented, #425), so the
+// Request-URI it wrote is the PBX's; RFC 3261 §16.6 has the proxy retarget it to
+// the registered contact. Same URI every request the PBX authors to a phone
+// already carries (fork INVITE, CANCEL, BYE, ACK). No-op on a response.
+static void retargetRequest(SipMessage& msg, const SipClient& leg)
+{
+	msg.setRequestUri("sip:" + leg.getNumber() + "@" + sipwire::addrToIpPort(leg.getAddress()));
+}
+
 void RequestsHandler::endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message)
 {
 	auto destClient = findClient(destNumber);
 	if (destClient.has_value())
 	{
+		retargetRequest(*message, *destClient.value());
 		// #560: the caller's digest credential is for this PBX; never relay it.
 		message->removeHeaders("Authorization");
 		message->removeHeaders("Proxy-Authorization");
@@ -9664,6 +9675,7 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 		const auto& sender = (peer == dest) ? src : dest;
 		data->setContact(buildContact(sender->getNumber()));
 	}
+	retargetRequest(*data, *peer);   // #754
 	// #560: the caller's digest credential is for this PBX; never relay it.
 	data->removeHeaders("Authorization");
 	data->removeHeaders("Proxy-Authorization");
@@ -9835,6 +9847,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		const auto& sender = (peer == dest) ? src : dest;
 		data->setContact(buildContact(sender->getNumber()));
 	}
+	retargetRequest(*data, *peer);   // #754
 	// #560: the caller's digest credential is for this PBX; never relay it.
 	data->removeHeaders("Authorization");
 	data->removeHeaders("Proxy-Authorization");

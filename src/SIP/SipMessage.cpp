@@ -258,6 +258,17 @@ void SipMessage::setHeader(std::string value)
 	_startLine = std::move(value);
 }
 
+bool SipMessage::setRequestUri(std::string_view uri)
+{
+	const size_t sp1 = _startLine.find(' ');
+	if (sp1 == std::string::npos) return false;
+	if (std::string_view(_startLine).substr(0, sp1) == "SIP/2.0") return false;   // a response
+	const size_t sp2 = _startLine.find(' ', sp1 + 1);
+	if (sp2 == std::string::npos) return false;
+	_startLine.replace(sp1 + 1, sp2 - sp1 - 1, uri.data(), uri.size());
+	return true;
+}
+
 size_t SipMessage::findHeaderIndex(std::string_view fullName, std::string_view compactName) const
 {
 	for (size_t i = 0; i < _headerLines.size(); ++i)
