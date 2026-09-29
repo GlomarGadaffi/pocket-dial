@@ -62,6 +62,8 @@ public:
 	// The mix tick period — MUST equal the RTP ptime the legs run at, or the bus
 	// drains at a different rate than the wire delivers (§8 trap 5).
 	static constexpr int TICK_MS = RtpSender::PTIME_MS;
+	static_assert(MixBus::FRAME == RtpSender::SAMPLES_PER_PKT,
+		"#170: the mix frame must be the packet size the legs are sent at");
 
 	ConferenceRoom();
 	~ConferenceRoom();

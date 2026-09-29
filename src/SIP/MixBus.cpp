@@ -2,6 +2,9 @@
 #include "mix_kernels.h"
 #include <cstring>
 
+// #170: three independent pins of the same frame size must agree.
+static_assert(MixBus::FRAME == MIX_FRAME, "MixBus::FRAME must equal mix_kernels' MIX_FRAME");
+
 // ── Lifecycle (cold path) ───────────────────────────────────────────────────
 // Invariant maintained by the tick: a Free slot ALWAYS has empty rings (the tick
 // clears them on the Draining->Free transition). So attach() need only flip the
@@ -69,7 +72,13 @@ void MixBus::tick()
         }
 
         present[p] = (s == State::Active) ? 1 : 0;
-        if (present[p] && !_ports[p].in.read(_frame[p], FRAME))
+        // #170: take a frame only when a WHOLE one is buffered. A leg at another
+        // ptime (30 ms PCMU = 240 samples) leaves an 80-sample residue; reading it
+        // partially would consume those real samples and then zero the frame
+        // below, losing them. Left in the ring, they lead the next tick's frame.
+        // The ring only grows between this check and the read (single reader).
+        if (present[p] && (_ports[p].in.getLength() < static_cast<size_t>(FRAME) ||
+                           !_ports[p].in.read(_frame[p], FRAME)))
             std::memset(_frame[p], 0, sizeof _frame[p]);   // late leg -> silence this tick
     }
 
