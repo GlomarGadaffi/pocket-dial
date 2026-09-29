@@ -7746,6 +7746,7 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	// failed once with the object's *current* state instead of its state at
 	// the moment this dialog actually ended.
 	const bool endingWasAnchor = ending && ending->isAnchor();
+	const bool endingWasAnchorInbound = ending && ending->isAnchorInbound();  // #221
 	const std::string endingAnchorParticipantId = ending ? ending->getAnchorParticipantId() : std::string();
 	const bool endingAnchorLegReleased = ending && ending->isAnchorLegReleased();
 
@@ -7759,7 +7760,12 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 		// plus the two pieces of context only this call site has and previously
 		// discarded -- callID and `reason`. Non-blocking; see CdrArchive.hpp for
 		// why this is safe to call here, under _mutex, on the SIP thread.
-		cdrarchive::record(rec, callID, reason);
+		// Issue #221: direction comes from flags Session already carries. The
+		// anchor flags are read from the entry snapshot above because release()
+		// clears them; isTrunk() survives release() by design.
+		cdrarchive::record(rec, callID, reason,
+			cdrarchive::directionFor(endingWasAnchor,
+				endingWasAnchorInbound, ending && ending->isTrunk()));
 
 		std::ostringstream message;
 		message << "Session has been disconnected between " << srcNumber << " and " << destNumber;
