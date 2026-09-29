@@ -126,7 +126,7 @@ std::shared_ptr<SipMessage> BlfSubscriptions::buildDialogNotify(DialogSubscripti
 			newMsgs = box->newMsgs;
 			oldMsgs = box->oldMsgs;
 		}
-		char buf[192];
+		char buf[192] = {};
 		const int n = std::snprintf(buf, sizeof(buf),
 			"Messages-Waiting: %s\r\nMessage-Account: sip:%s@%s\r\nVoice-Message: %u/%u (0/0)\r\n",
 			newMsgs ? "yes" : "no", sub.targetAor.c_str(), activeIp.c_str(), newMsgs, oldMsgs);
