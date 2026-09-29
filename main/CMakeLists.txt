@@ -280,7 +280,11 @@ if(SIP_CONSTRAINED)
         POCKETDIAL_MAX_VOICEMAIL_LEGS=1
         POCKETDIAL_MAX_TRUNK_CALLS=1
         POCKETDIAL_RTP_TX_POOL=3
-        POCKETDIAL_CONFERENCE=0)
+        POCKETDIAL_CONFERENCE=0
+        # #483/#689: the 4 MB app slot is full at -Og, so the config backup's
+        # trunk/SMTP/E911/admin_ext section is compiled out here; an import
+        # that carries it says so under "skipped".
+        POCKETDIAL_BACKUP_SECTION_C=0)
     # #416: the pcap ring is fixed storage (ring x ~2.1 KB), and a constrained build
     # has no PSRAM (sdkconfig.defaults.esp32_constrained: CONFIG_SPIRAM=n), so all of
     # it is internal DRAM. 4 slots ~= 8.4 KB instead of 16 ~= 33.7 KB. Set as a CMake

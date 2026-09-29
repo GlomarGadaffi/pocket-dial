@@ -604,17 +604,15 @@ public:
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint
 	// (default "1001", NVS namespace "pbxcfg", key "admin_ext") now lives on
-	// DtmfFeatureCodes (see _dtmf below); this forwards to _dtmf.adminExt().
-	// cppcheck suggests returning `const std::string&` here (returnByReference).
-	// Deliberately not applied: DtmfFeatureCodes's _adminExt is mutated by its
-	// saveAdminExt()/load() from other call paths with no lock of its own
-	// (callers of this getter are not required to hold _mutex — dashboard/HTTP
-	// reads go through here off the SIP thread). Returning by value at least
-	// keeps the caller's copy independent once this call returns; a reference
-	// would additionally dangle/tear if a concurrent save reallocates the
-	// string while the caller still holds it.
+	// DtmfFeatureCodes (see _dtmf below); this forwards to _dtmf.adminExt()
+	// under _mutex. Returned by value: a reference would dangle once the lock
+	// is released and setAdminExt() reallocates the string.
 	// cppcheck-suppress returnByReference
-	std::string getAdminExt() const;
+	std::string getAdminExt();
+	// #483: config import restores it. False if `ext` is not a dial token of at
+	// most 31 characters (DtmfFeatureCodes::load() reads 32 bytes) or could not
+	// be persisted.
+	bool setAdminExt(const std::string& ext);
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only: redirect the Telephony-API / DID-mapping host-file stores to

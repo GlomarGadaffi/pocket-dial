@@ -3627,6 +3627,21 @@ void HttpServer::sendApiE911Get(int sock)
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 
+// The E911 route's charset gate, shared with the config import (#483).
+// nullptr when both fields pass, else the reason.
+static const char* e911ConfigError(const std::string& exts, const std::string& callback)
+{
+	for (const std::string& e : pbx::splitMembers(exts))
+	{
+		if (!pbx::isDialTokenSafe(e)) return "notifyExts may contain only extensions, separated by spaces or commas";
+	}
+	if (!callback.empty() && !pbx::isDialTokenSafe(callback))
+	{
+		return "callback may contain only digits, letters, '#' and '*'";
+	}
+	return nullptr;
+}
+
 void HttpServer::sendApiE911Set(int sock, const std::string& body)
 {
 	// Issue #166 (Kari's Law). Params: notifyExts (space/comma delimited),
@@ -3643,19 +3658,10 @@ void HttpServer::sendApiE911Set(int sock, const std::string& body)
 	const std::string callback = getFormParam(body, "callback");
 	const std::string location = getFormParam(body, "location");
 
-	for (const std::string& e : pbx::splitMembers(exts))
-	{
-		if (!pbx::isDialTokenSafe(e))
-		{
-			sendResponse(sock, 400, "Bad Request", "application/json",
-			             "{\"error\":\"notifyExts may contain only extensions, separated by spaces or commas\"}");
-			return;
-		}
-	}
-	if (!callback.empty() && !pbx::isDialTokenSafe(callback))
+	if (const char* err = e911ConfigError(exts, callback))
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
-		             "{\"error\":\"callback may contain only digits, letters, '#' and '*'\"}");
+		             std::string("{\"error\":\"") + err + "\"}");
 		return;
 	}
 
@@ -5022,6 +5028,21 @@ namespace
 // RequestsHandler/SipSecretStore, and a masked-secret round trip for
 // TelephonyApiConfig slots, would close gaps 1 and 2 without ever exposing a
 // plaintext secret over this API.
+//
+// #483 section C: the ITSP trunk, SMTP, E911 and admin_ext, through the
+// helpers their own routes use (defined with those routes below). The
+// constrained 4 MB image has no room for it (#689); main/CMakeLists.txt sets 0.
+#ifndef POCKETDIAL_BACKUP_SECTION_C
+#define POCKETDIAL_BACKUP_SECTION_C 1
+#endif
+static std::string trunkConfigError(const TrunkConfigStore::Config& cfg, const std::string& ip);
+#if POCKETDIAL_BACKUP_SECTION_C
+namespace
+{
+	bool isValidEmailMode(const std::string& s);
+	bool isValidEmailAuth(const std::string& s);
+}
+#endif
 void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::string& password)
 {
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
@@ -5211,6 +5232,46 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	}
 	pt << "],";
 
+#if POCKETDIAL_BACKUP_SECTION_C
+	// #483: the trunk and SMTP settings WITHOUT trunk_pass, smtp_pass and
+	// gsa_key -- those travel in the secretsEnc block below and nowhere else.
+	// Written straight into `pt`, not via trunkConfigJson()/emailConfigJson(),
+	// which would each add two allocations to this #410-gated route.
+	{
+		const TrunkConfigStore::Config t = TrunkConfigStore::load();
+		const EmailConfigStore::Config e = EmailConfigStore::load();
+		pt << "\"trunk\":{\"host\":\"" << jsonEscape(t.host)
+		   << "\",\"port\":" << t.port
+		   << ",\"proxyHost\":\"" << jsonEscape(t.proxyHost)
+		   << "\",\"proxyPort\":" << t.proxyPort
+		   << ",\"fromUser\":\"" << jsonEscape(t.fromUser)
+		   << "\",\"callerId\":\"" << jsonEscape(t.callerId)
+		   << "\",\"authUser\":\"" << jsonEscape(t.authUser)
+		   << "\",\"enabled\":" << (t.enabled ? "true" : "false")
+		   << "},\"email\":{\"host\":\"" << jsonEscape(e.host)
+		   << "\",\"port\":" << e.port
+		   // Validated enums, nothing to escape (and "starttls" + 8 would push
+		   // jsonEscape() out of the small-string buffer: one more allocation).
+		   << ",\"mode\":\"" << (isValidEmailMode(e.mode) ? e.mode.c_str() : "")
+		   << "\",\"auth\":\"" << (isValidEmailAuth(e.auth) ? e.auth.c_str() : "")
+		   << "\",\"user\":\"" << jsonEscape(e.user)
+		   << "\",\"from\":\"" << jsonEscape(e.from)
+		   << "\",\"to\":\"" << jsonEscape(e.to)
+		   << "\",\"gsaEmail\":\"" << jsonEscape(e.gsaEmail)
+		   << "\",\"insecure\":" << (e.insecureSkipVerify ? "true" : "false")
+		   << ",\"caPem\":\"" << jsonEscape(e.caPem) << "\"},";
+	}
+	if (handler)
+	{
+		std::string exts, callback, location;
+		std::tie(exts, callback, location) = handler->getE911Config();
+		pt << "\"e911\":{\"notifyExts\":\"" << jsonEscape(exts)
+		   << "\",\"callback\":\"" << jsonEscape(callback)
+		   << "\",\"location\":\"" << jsonEscape(location)
+		   << "\"},\"adminExt\":\"" << jsonEscape(handler->getAdminExt()) << "\",";
+	}
+#endif
+
 	pt << "\"wifiSsid\":\"" << jsonEscape(DeviceConfig::getWifiSsid()) << "\""
 	   << ",\"wifiMode\":" << static_cast<int>(DeviceConfig::getWifiMode())
 	   << ",\"apSecure\":" << (DeviceConfig::isApSecure() ? "true" : "false") << ",";
@@ -5268,7 +5329,17 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 				      << "\",\"ha1\":\"" << jsonEscape(*ha1) << "\"}";
 			}
 		}
-		gated << "]}";
+		gated << "]";
+#if POCKETDIAL_BACKUP_SECTION_C
+		// #483: the three secrets section C keeps out of the plaintext part.
+		{
+			const EmailConfigStore::Config email = EmailConfigStore::load();
+			gated << ",\"trunkPass\":\"" << jsonEscape(TrunkConfigStore::load().pass)
+			      << "\",\"smtpPass\":\"" << jsonEscape(email.pass)
+			      << "\",\"gsaKey\":\"" << jsonEscape(email.gsaKey) << "\"";
+		}
+#endif
+		gated << "}";
 		std::string gatedPlaintext = gated.str();
 
 		uint8_t salt[AdminAuth::kKdfSaltBytes];
@@ -5761,6 +5832,106 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 			"export -- re-export with a password, or re-set them)");
 	}
 
+#if POCKETDIAL_BACKUP_SECTION_C
+	// #483 section C, held to the checks of each setting's own route. A key the
+	// file lacks leaves that setting as it is. trunk_pass, smtp_pass and gsa_key
+	// come back only from the decrypted secretsEnc block; without it the stored
+	// ones are kept.
+	const JsonReader::Value* sec = haveSecrets ? &secretsValue : nullptr;
+	for (const char* key : { "trunk", "email", "e911", "adminExt" })
+	{
+		if (!pt->find(key)) skipped.push_back(std::string(key) + " (not in the file; left unchanged)");
+	}
+	if (!sec && (pt->find("trunk") || pt->find("email")))
+	{
+		skipped.push_back("trunk/SMTP passwords and gsaKey (only in the password-encrypted export; "
+			"the stored ones are kept)");
+	}
+	if (const JsonReader::Value* t = pt->find("trunk"); t && t->isObject())
+	{
+		TrunkConfigStore::Config c = TrunkConfigStore::load();
+		c.host      = t->stringOr("host");
+		c.proxyHost = t->stringOr("proxyHost");
+		c.fromUser  = t->stringOr("fromUser");
+		c.callerId  = t->stringOr("callerId");
+		c.authUser  = t->stringOr("authUser");
+		c.enabled   = t->boolOr("enabled");
+		if (sec) c.pass = sec->stringOr("trunkPass", c.pass);
+		const int port = t->intOr("port", 0), proxyPort = t->intOr("proxyPort", 0);
+		std::string err = "port must be 1-65535";
+		if (port >= 1 && port <= 65535 && proxyPort >= 1 && proxyPort <= 65535)
+		{
+			c.port = static_cast<uint16_t>(port);
+			c.proxyPort = static_cast<uint16_t>(proxyPort);
+			err = trunkConfigError(c, _ip);
+		}
+		if (err.empty() && !TrunkConfigStore::save(c)) err = "failed to persist";
+		if (!err.empty()) skipped.push_back("trunk (" + err + ")");
+		else
+		{
+			applied.push_back("trunk");
+			if (handler) handler->applyStoredTrunkConfig();   // as POST /api/trunk does
+		}
+	}
+	if (const JsonReader::Value* e = pt->find("email"); e && e->isObject())
+	{
+		EmailConfigStore::Config c = EmailConfigStore::load();
+		c.host     = e->stringOr("host");
+		c.mode     = e->stringOr("mode");
+		c.auth     = e->stringOr("auth");
+		c.user     = e->stringOr("user");
+		c.from     = e->stringOr("from");
+		c.to       = e->stringOr("to");
+		c.gsaEmail = e->stringOr("gsaEmail");
+		c.insecureSkipVerify = e->boolOr("insecure");
+		c.caPem    = e->stringOr("caPem");
+		if (sec)
+		{
+			c.pass   = sec->stringOr("smtpPass", c.pass);
+			c.gsaKey = sec->stringOr("gsaKey", c.gsaKey);
+		}
+		const int port = e->intOr("port", 0);
+		if (port < 1 || port > 65535 || !isValidEmailMode(c.mode) || !isValidEmailAuth(c.auth))
+		{
+			skipped.push_back("email (port, mode or auth invalid)");
+		}
+		else
+		{
+			c.port = static_cast<uint16_t>(port);
+			if (EmailConfigStore::save(c)) applied.push_back("email");
+			else skipped.push_back("email (failed to persist)");
+		}
+	}
+	if (handler)
+	{
+		if (const JsonReader::Value* e = pt->find("e911"); e && e->isObject())
+		{
+			const std::string exts = e->stringOr("notifyExts");
+			const std::string callback = e->stringOr("callback");
+			if (const char* err = e911ConfigError(exts, callback))
+			{
+				skipped.push_back(std::string("e911 (") + err + ")");
+			}
+			else
+			{
+				handler->setE911Config(exts, callback, e->stringOr("location"));
+				applied.push_back("e911");
+			}
+		}
+		if (pt->find("adminExt"))
+		{
+			if (handler->setAdminExt(pt->stringOr("adminExt"))) applied.push_back("adminExt");
+			else skipped.push_back("adminExt (not a dial token of 1-31 characters, or not persisted)");
+		}
+	}
+	else if (pt->find("e911") || pt->find("adminExt"))
+	{
+		skipped.push_back("e911/adminExt (SIP engine not attached yet)");
+	}
+#else
+	if (pt->find("trunk")) skipped.push_back("trunk/email/e911/adminExt (not on this build, #689)");
+#endif
+
 	std::ostringstream json;
 	json << "{\"status\":\"ok\",\"applied\":[";
 	for (size_t i = 0; i < applied.size(); ++i)
@@ -6211,54 +6382,11 @@ void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 	if (getFormParam(body, "clearPassword") == "1") cfg.pass.clear();
 	else if (!pass.empty())                          cfg.pass = pass;
 
-	struct { const char* name; const std::string& val; size_t cap; } limits[] = {
-		{ "host",      cfg.host,      kMaxTrunkHost },
-		{ "proxyHost", cfg.proxyHost, kMaxTrunkHost },
-		{ "fromUser",  cfg.fromUser,  kMaxTrunkFrom },
-		{ "callerId",  cfg.callerId,  kMaxTrunkCid  },
-		{ "authUser",  cfg.authUser,  kMaxTrunkAuth },
-		{ "pass",      cfg.pass,      kMaxTrunkPass },
-	};
-	for (const auto& l : limits)
+	const std::string err = trunkConfigError(cfg, _ip);
+	if (!err.empty())
 	{
-		if (l.val.size() > l.cap)
-		{
-			std::ostringstream err;
-			err << "{\"error\":\"" << l.name << " must be at most " << l.cap
-			    << " characters\"}";
-			sendResponse(sock, 400, "Bad Request", "application/json", err.str());
-			return;
-		}
-	}
-
-	// Enabling a trunk that cannot possibly place a call is a misconfiguration
-	// worth refusing at the door rather than discovering when someone dials 9.
-	// These are exactly SipTrunk::Config::valid()'s requirements; saving them
-	// inconsistent would leave the UI showing "enabled" beside a trunk the
-	// engine silently treats as invalid.
-	if (cfg.enabled && (cfg.host.empty() || cfg.fromUser.empty()))
-	{
-		sendResponse(sock, 400, "Bad Request", "application/json",
-		             "{\"error\":\"host and fromUser are required to enable the trunk\"}");
+		sendResponse(sock, 400, "Bad Request", "application/json", "{\"error\":\"" + err + "\"}");
 		return;
-	}
-
-	// Issue #546: a trunk pointed at this board itself -- loopback, or its own
-	// address -- can never reach a carrier, yet it would satisfy valid() and
-	// report an emergency route. Refuse it at the door, like the check above.
-	{
-		char ownIp[INET_ADDRSTRLEN] = {0};   // #573 review: fixed buffer, no std::string
-		if (_ip == "0.0.0.0") (void)getPrimaryLocalIPInto(ownIp, sizeof(ownIp));
-		else std::snprintf(ownIp, sizeof(ownIp), "%s", _ip.c_str());
-		for (const std::string* h : { &cfg.host, &cfg.proxyHost })
-		{
-			if (isSelfTrunkHost(*h, ownIp))
-			{
-				sendResponse(sock, 400, "Bad Request", "application/json",
-				             "{\"error\":\"the trunk host must be the carrier, not this board (loopback or its own address)\"}");
-				return;
-			}
-		}
 	}
 
 	if (!TrunkConfigStore::save(cfg))
@@ -6278,6 +6406,56 @@ void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"config\":" + trunkConfigJson(cfg) + "}");
+}
+
+// The trunk route's checks on a parsed config, shared with the config import
+// (#483). Empty when the config may be saved, else the reason.
+static std::string trunkConfigError(const TrunkConfigStore::Config& cfg, const std::string& ip)
+{
+	struct { const char* name; const std::string& val; size_t cap; } limits[] = {
+		{ "host",      cfg.host,      kMaxTrunkHost },
+		{ "proxyHost", cfg.proxyHost, kMaxTrunkHost },
+		{ "fromUser",  cfg.fromUser,  kMaxTrunkFrom },
+		{ "callerId",  cfg.callerId,  kMaxTrunkCid  },
+		{ "authUser",  cfg.authUser,  kMaxTrunkAuth },
+		{ "pass",      cfg.pass,      kMaxTrunkPass },
+	};
+	for (const auto& l : limits)
+	{
+		if (l.val.size() > l.cap)
+		{
+			std::ostringstream err;
+			err << l.name << " must be at most " << l.cap << " characters";
+			return err.str();
+		}
+	}
+
+	// Enabling a trunk that cannot possibly place a call is a misconfiguration
+	// worth refusing at the door rather than discovering when someone dials 9.
+	// These are exactly SipTrunk::Config::valid()'s requirements; saving them
+	// inconsistent would leave the UI showing "enabled" beside a trunk the
+	// engine silently treats as invalid.
+	if (cfg.enabled && (cfg.host.empty() || cfg.fromUser.empty()))
+	{
+		return "host and fromUser are required to enable the trunk";
+	}
+
+	// Issue #546: a trunk pointed at this board itself -- loopback, or its own
+	// address -- can never reach a carrier, yet it would satisfy valid() and
+	// report an emergency route. Refuse it at the door, like the check above.
+	{
+		char ownIp[INET_ADDRSTRLEN] = {0};   // #573 review: fixed buffer, no std::string
+		if (ip == "0.0.0.0") (void)getPrimaryLocalIPInto(ownIp, sizeof(ownIp));
+		else (void)std::snprintf(ownIp, sizeof(ownIp), "%s", ip.c_str());
+		for (const std::string* h : { &cfg.host, &cfg.proxyHost })
+		{
+			if (isSelfTrunkHost(*h, ownIp))
+			{
+				return "the trunk host must be the carrier, not this board (loopback or its own address)";
+			}
+		}
+	}
+	return {};
 }
 
 // The two standalone setup pages: one flash part each, streamed in place with

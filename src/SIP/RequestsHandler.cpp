@@ -9490,9 +9490,17 @@ void RequestsHandler::queueLog(std::string msg, bool isError)
 // ── Task 2B/2C: admin extension identity + DTMF digit-collection state machine
 // + CLASS service codes, now on DtmfFeatureCodes (see _dtmf) ──────────────────
 
-std::string RequestsHandler::getAdminExt() const
+std::string RequestsHandler::getAdminExt()
 {
+	std::lock_guard<std::mutex> lock(_mutex);
 	return _dtmf.adminExt();
+}
+
+bool RequestsHandler::setAdminExt(const std::string& ext)
+{
+	if (ext.size() > 31 || !pbx::isDialTokenSafe(ext)) return false;
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _dtmf.saveAdminExt(ext);
 }
 
 // ── File-scope static helpers ─────────────────────────────────────────────────

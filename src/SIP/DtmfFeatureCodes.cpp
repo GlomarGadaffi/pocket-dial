@@ -519,18 +519,17 @@ void DtmfFeatureCodes::load()
 #endif
 }
 
-void DtmfFeatureCodes::saveAdminExt(const std::string& ext)
+bool DtmfFeatureCodes::saveAdminExt(const std::string& ext)
 {
-	_adminExt = ext;
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	nvs_handle_t h;
-	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_str(h, "admin_ext", ext.c_str());
-		nvs_commit(h);
-		nvs_close(h);
-	}
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) return false;
+	const bool ok = nvs_set_str(h, "admin_ext", ext.c_str()) == ESP_OK && nvs_commit(h) == ESP_OK;
+	nvs_close(h);
+	if (!ok) return false;
 #endif
+	_adminExt = ext;
+	return true;
 }
 
 std::string DtmfFeatureCodes::adminExt() const
