@@ -24,7 +24,7 @@
 #include "TimeSync.hpp"    // Issue #246: voicemail flush timestamp (endCall() hook)
 #include "PbxConfig.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: 911/933 classification, ahead of the dial plan
-#include "SessionTimer.hpp"   // Issue #198: RFC 4028 422 floor
+#include "SessionTimer.hpp"   // Issue #198: RFC 4028 422 floor, 2xx Session-Expires
 #include <charconv>
 #include "PbxPersist.hpp"
 #include "SipHeaderUtil.hpp"
@@ -464,7 +464,13 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 							{
 								const int rxPort = bridge->receiverPort();
 								const std::string sdpBody = buildMediaSdp(activeIp, rxPort, /*sendrecv=*/true);
-								auto ok = buildOkWithSdp(inviteMsg, activeIp, toTag, sdpBody);
+								// #198: no timer. The session's dest is the 555 virtual peer
+								// (originateAnchorCall's async branch), so a re-INVITE would
+								// reach answerAnchorReinvite() (200) exactly as on the
+								// synchronous branch -- but no host test can reach this
+								// branch (tests/VpeerExhaustion_vm_anchor_test.cpp:24-37), so
+								// the grant stays off until one proves the refresh (#739).
+								auto ok = buildOkWithSdp(inviteMsg, activeIp, toTag, sdpBody, /*grantSessionTimer=*/false);
 								if (ok)
 								{
 									// Runs on the anchor's own WS event task, NOT the SIP
@@ -1448,10 +1454,13 @@ namespace
 	// handled, because nothing in src/ reads that header. Kept per #229's
 	// scope call rather than withdrawn, since the REFER usage is real.
 	//
-	// NOT "timer": the RFC 4028 support is passive -- it honours a timer a phone
-	// requests but never requests one itself. Since #591 an initial INVITE whose
-	// Session-Expires is too small gets 422 + Min-SE (onInvite reads
-	// getMinSESecs()), but the rest of #198 is still open, so the tag stays off.
+	// NOT "timer" (#198). The 2xx this PBX writes itself now names the phone as
+	// refresher (pbx::answerSessionTimer), and a too-small interval draws 422 +
+	// Min-SE (#591), but a UAS that advertises timer must still do what this one
+	// cannot: be the refresher when the phone asks it to (refresher=uas, or no
+	// Supported: timer), since nothing here ever sends a refresh; accept a
+	// re-INVITE refresh on 777/888/trunk legs (answered 488 below); and answer an
+	// UPDATE refresh on park and 440 legs (relayed back to the caller, #709).
 	// NOT "100rel" (RFC 3262 needs PRACK), "norefersub", "path", "gruu" or
 	// "outbound" — none of them have any implementation in this codebase.
 	constexpr const char* kSupportedOptionTags = "replaces";
@@ -2092,6 +2101,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		okResponse->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		okResponse->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		okResponse->setContact(buildContact("777"));
+		pbx::answerSessionTimer(*okResponse, *data, /*grant=*/false);   // #198: re-INVITE gets 488
 		// The echo answer is the CALLER'S OWN offer handed back, so it must obey
 		// RFC 3264 §6.1: an answer reuses the offer's payload-type numbers and may
 		// only narrow the list. enforceG711() pinned the m= line to a literal
@@ -2750,7 +2760,7 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	// answer advertised PCMU alone so a phone had no negotiated way to send them.
 	const std::string sdpBody = buildMediaSdp(activeIp, _conference->rtpPortFor(callID),
 		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
-	auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
+	auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody, /*grantSessionTimer=*/false);   // #198: re-INVITE gets 488
 	if (!ok)
 	{
 		_conference->leave(callID);
@@ -2992,7 +3002,9 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 	// follow-up for this leg too, not a regression introduced here.
 	const std::string sdpBody = buildMediaSdp(activeIp, _vmRtpReceivers[slot].localPort(),
 		/*sendrecv=*/true, invite->getTelephoneEventPayloadType());
-	auto ok = buildOkWithSdp(invite, activeIp, toTag, sdpBody);
+	// #198: a re-INVITE on this leg is relayed to dest, the caller's own
+	// address (onReinvite), never answered 200 here, so no timer is granted.
+	auto ok = buildOkWithSdp(invite, activeIp, toTag, sdpBody, /*grantSessionTimer=*/false);
 	if (!ok)
 	{
 		_vmRtpReceivers[slot].stop();
@@ -3204,7 +3216,9 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 	// identical note on buildOkWithSdp()'s offer-awareness).
 	const std::string sdpBody = buildMediaSdp(activeIp, _vmRtpReceivers[slot].localPort(),
 		/*sendrecv=*/true, invite->getTelephoneEventPayloadType());
-	auto ok = buildOkWithSdp(invite, activeIp, toTag, sdpBody);
+	// #198: same as the deposit leg -- a re-INVITE is relayed back to the
+	// caller's own address, never answered 200 here, so no timer is granted.
+	auto ok = buildOkWithSdp(invite, activeIp, toTag, sdpBody, /*grantSessionTimer=*/false);
 	if (!ok)
 	{
 		_vmRtpReceivers[slot].stop();
@@ -4364,7 +4378,9 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		// this is the path a voicemail or IVR menu will be driven over.
 		const std::string sdpBody = buildMediaSdp(activeIp, bridge->receiverPort(),
 			/*sendrecv=*/true, data->getTelephoneEventPayloadType());
-		auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
+		// #198: dest is the 555 virtual peer, so a re-INVITE reaches
+		// answerAnchorReinvite() (200), never onReinvite()'s 488.
+		auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody, /*grantSessionTimer=*/true);
 		if (!ok)
 		{
 			bridge->stopBridge();
@@ -9601,6 +9617,7 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 	// buildOkWithSdp() mints a fresh tag for a first answer; calling it here
 	// would append a second tag onto the one already present.
 	addCapabilityHeaders(*ok);
+	pbx::answerSessionTimer(*ok, *data, /*grant=*/true);   // #198: this IS the re-INVITE's 200
 	const std::string sdpBody = buildMediaSdp(_localIp, bridge->receiverPort(),
 		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
 	ok->clearBody();
@@ -9796,6 +9813,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		resp->setHeader(SipMessageTypes::OK);
 		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		resp->setContact(buildContact(data->getToNumber()));
+		pbx::answerSessionTimer(*resp, *data, /*grant=*/true);   // #198: a local UPDATE answer
 		resp->clearBody();
 		resp->syncContentLength();
 		_outbox.emplace_back(data->getSource(), std::move(resp));
@@ -10318,7 +10336,8 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	const std::shared_ptr<SipMessage>& inviteMsg,
 	const std::string& /*activeIp*/,   // Via now carries the request's real source
 	const std::string& toTag,
-	const std::string& sdpBody)
+	const std::string& sdpBody,
+	bool grantSessionTimer)
 {
 	auto ok = getMessageFromPool(*inviteMsg);
 	if (!ok) return nullptr;   // pool exhausted: propagate, caller drops (#101A)
@@ -10335,6 +10354,11 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	// (RFC 3311 §5.1). Added BEFORE the body work below so the header block is
 	// final when Content-Type/Content-Length are recomputed off the raw string.
 	addCapabilityHeaders(*ok);
+	// #198: 888 (onReinvite: 488) and the voicemail legs (their re-INVITE is
+	// relayed back to the phone's own address, never answered 200 by this PBX)
+	// get no timer; only the synchronous 555 answer does (its re-INVITE is
+	// answered 200 by answerAnchorReinvite()).
+	pbx::answerSessionTimer(*ok, *inviteMsg, grantSessionTimer);
 	ok->clearBody();
 	{
 		std::string raw = ok->toString();
@@ -10963,6 +10987,7 @@ void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 	resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 	resp->setTo(std::string(invite->getTo()) + ";tag=" + session->getLocalTag());
 	resp->setContact(buildContact(std::string(invite->getToNumber())));
+	pbx::answerSessionTimer(*resp, *invite, /*grant=*/false);   // #198: trunk re-INVITE gets 488 (911 leg)
 	resp->setBody(sdpBody);   // resyncs Content-Length itself
 	_outbox.emplace_back(invite->getSource(), std::move(resp));
 

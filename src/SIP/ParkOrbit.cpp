@@ -6,6 +6,7 @@
 #include "IDGen.hpp"
 #include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include "Session.hpp"
+#include "SessionTimer.hpp"
 #include "SipHeaderUtil.hpp"
 #include "SipMessageTypes.h"
 #include "SipWireUtil.hpp"
@@ -89,6 +90,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 		ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		ok->setContact(_env.contactFor(orbit));
+		pbx::answerSessionTimer(*ok, *data, /*grant=*/false);   // #198: a refresh here draws 481 (#709)
 		ok->setBody(holdSdp);
 		ok->syncContentLength();
 		_env.enqueue(data->getSource(), ok);
@@ -162,6 +164,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 	ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 	ok->setContact(_env.contactFor(orbit));
+	pbx::answerSessionTimer(*ok, *data, /*grant=*/false);   // #198: a refresh here draws 481 (#709)
 	if (!parkedSdp.empty()) ok->setBody(parkedSdp);
 	(void)ok->filterAudioCodecs(/*allowWideband=*/true);   // parked party's own SDP, relayed P2P
 	ok->syncContentLength();
