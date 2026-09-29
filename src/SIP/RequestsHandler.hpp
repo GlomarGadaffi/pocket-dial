@@ -185,6 +185,10 @@ public:
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
 	// drop (responses, ACK).
 	uint64_t getSdpRejected() const;
+	// #199: requests/responses refused by the header gate (400/420/415 or a
+	// drop), and emergency requests the gate let through despite a violation.
+	uint64_t getHeaderRejected() const { return _headerRejected.load(std::memory_order_relaxed); }
+	uint64_t getEmergencyHeaderYields() const { return _emergencyHeaderYields.load(std::memory_order_relaxed); }
 	// Issue #409: draws refused because a pool was spent -- there is no heap
 	// fallback behind either pool. The message pool is process-global.
 	uint64_t getVirtualPeerRefusals() const { return _vpeerRefusals.load(std::memory_order_relaxed); }
@@ -846,6 +850,11 @@ private:
 	// responses, which take none, are dropped. Either way the body never reaches
 	// a decoder or a peer phone. Called from handle() under _mutex.
 	void rejectSdp(const std::shared_ptr<SipMessage>& request, SipMessage::SdpVerdict verdict);
+	// #199 header admission failure, same shape as rejectSdp(): a request gets
+	// 400 (+Warning), 420 (+Unsupported: <tag>) or 415 (+Accept); ACK and
+	// responses are dropped. Called from handle() under _mutex.
+	void rejectHeaders(const std::shared_ptr<SipMessage>& request,
+		SipMessage::HeaderVerdict verdict, std::string_view unsupported);
 
 	// onSubscribe: thin dispatch-table shim into the BlfSubscriptions machine
 	// (see BlfSubscriptions.hpp). Called from handle() — caller holds _mutex.
@@ -2406,6 +2415,8 @@ private:
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	std::atomic<uint64_t> _headerRejected{0};         // #199 header admission refusals
+	std::atomic<uint64_t> _emergencyHeaderYields{0};  // #199 911 let through a violation
 	std::atomic<uint64_t> _vpeerRefusals{0};   // #409: allocateVirtualPeer() refusals
 	std::atomic<uint32_t> _emergencyRtpReaps{0};   // #741
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP

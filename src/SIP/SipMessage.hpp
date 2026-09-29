@@ -47,6 +47,36 @@ namespace SdpLimits
 	constexpr unsigned kMaxTokensPerLine = 40;   // SP-separated runs on one line
 	constexpr unsigned kMaxMediaFormats  = 32;   // <fmt> tokens on one m= line
 	constexpr size_t   kMaxAttrNameBytes = 32;   // a=<name>[:value]
+	// #199: the structured model's caps (sdp::Limits aliases these), enforced on
+	// the wire too so the gate and sdp::parse() can never disagree about a body.
+	constexpr unsigned kMaxMediaSections        = 4;
+	constexpr unsigned kMaxAttributesPerSection = 32;
+	constexpr unsigned kMaxSessionAttributes    = 16;
+	// One active (port != 0) m=audio per offer: every leg here carries one
+	// audio stream. A port-0 m=audio is a removed stream (RFC 3264 §8) and
+	// does not count.
+	constexpr unsigned kMaxActiveAudioStreams   = 1;
+}
+
+// ── SIP header limits (#199) ────────────────────────────────────────────────
+// SipMessage::checkHeaders() enforces these on every inbound message before
+// any handler copies a field. The first three ARE fixed buffers on main: a
+// longer field used to be silently truncated by the copy (storeField()), so two
+// different transactions could store the same key. Refused instead, before the
+// copy. Measured interop corpus maxima (pjsua, 614 messages) in the comments.
+namespace SipLimits
+{
+	constexpr size_t   kMaxCallIdLine   = 127;  // TransactionLayer/VmSdJob callId[128]; stores the whole line (corpus 41)
+	constexpr size_t   kMaxBranch       = 71;   // TransactionLayer viaBranch[72] (corpus 41)
+	constexpr size_t   kMaxCSeqMethod   = 11;   // TransactionLayer cseqMethod[12] (corpus 8)
+	constexpr size_t   kMaxCSeqDigits   = 10;   // RFC 3261 §8.1.1.5: < 2^31 (corpus 5)
+	constexpr size_t   kMaxMaxForwards  = 255;  // Max-Forwards {1,3} digits, <= 255 (corpus 70)
+	// Policy caps, not buffers: generous against real carrier paths.
+	constexpr unsigned kMaxHeaderLines  = 64;   // corpus 16
+	constexpr unsigned kMaxVia          = 10;   // corpus 1
+	constexpr unsigned kMaxRecordRoute  = 10;   // corpus 0
+	constexpr unsigned kMaxRoute        = 8;    // corpus 0
+	constexpr unsigned kMaxContact      = 4;    // corpus 1
 }
 
 class SipMessage
@@ -182,9 +212,47 @@ public:
 		TooManyMediaFormats,     // > SdpLimits::kMaxMediaFormats on one m= line
 		BadAttributeName,        // a= name empty, over-long or not a token
 		CapabilityNegotiation,   // RFC 5939 / 6871 / 7104 attribute: not implemented
+		TooManyMediaSections,    // > SdpLimits::kMaxMediaSections m= lines
+		TooManyAttributes,       // > kMaxAttributesPerSection / kMaxSessionAttributes a= lines
+		TooManyAudioStreams,     // > SdpLimits::kMaxActiveAudioStreams active m=audio
 	};
 	SdpVerdict checkSdp() const;
 	static const char* sdpVerdictText(SdpVerdict v);   // short reason for a Warning header / log
+
+	// ── Header admission (#199) ─────────────────────────────────────────────
+	// One flat, allocation-free pass over the header lines applying SipLimits
+	// and the option-tag / body-type subset. On EVERY message: the buffer bounds
+	// (Call-ID line, first Via branch, CSeq). On a request only: header-line
+	// count, Max-Forwards, Via/Route/Record-Route/Contact entry counts,
+	// Require/Proxy-Require option tags (not ACK/CANCEL), and the Content-Type
+	// of an INVITE/UPDATE body. A response is never refused for its routing
+	// headers: a carrier's 183 to our own 911 must not be dropped.
+	// `unsupported` receives the first unknown option tag (a view into this
+	// message) for a 420's Unsupported: header.
+	enum class HeaderVerdict : uint8_t
+	{
+		Ok = 0,
+		TooManyHeaders,          // 400
+		CallIdTooLong,           // 400
+		BranchTooLong,           // 400
+		BadCSeq,                 // 400
+		BadMaxForwards,          // 400
+		TooManyVia,              // 400
+		TooManyRoute,            // 400
+		TooManyRecordRoute,      // 400
+		TooManyContact,          // 400
+		UnsupportedOption,       // 420 + Unsupported:
+		UnsupportedMediaType,    // 415 + Accept:
+	};
+	HeaderVerdict checkHeaders(std::string_view& unsupported) const;
+	static const char* headerVerdictText(HeaderVerdict v);
+	// An INVITE to 911/933 or urn:service:sos (R-URI or To), or an RFC 7090
+	// Priority: psap-callback INVITE. The header gate yields for these (#199):
+	// every copy it guards is bounded anyway, and no optional header may cost
+	// an emergency call.
+	bool isEmergencyRequest() const;
+	// RFC 7090: Priority: psap-callback (#659 is the call-handling half).
+	bool isPsapCallback() const;
 	void clearBody();
 
 	// The message body — everything after the header/body separator (the SDP for
