@@ -6,6 +6,7 @@
 #include "SipMessageTypes.h"
 #include <cstring>
 #include <cctype>
+#include <cstdint>
 
 namespace
 {
@@ -36,6 +37,35 @@ namespace
 			if (std::tolower(static_cast<unsigned char>(a[i])) !=
 				std::tolower(static_cast<unsigned char>(b[i]))) return false;
 		return true;
+	}
+
+	// First case-insensitive occurrence of an ASCII-lowercase needle, or npos.
+	size_t ifindLower(std::string_view hay, std::string_view lowerNeedle)
+	{
+		if (lowerNeedle.empty() || hay.size() < lowerNeedle.size()) return std::string_view::npos;
+		for (size_t i = 0; i + lowerNeedle.size() <= hay.size(); ++i)
+		{
+			size_t k = 0;
+			while (k < lowerNeedle.size() &&
+				std::tolower(static_cast<unsigned char>(hay[i + k])) == lowerNeedle[k]) ++k;
+			if (k == lowerNeedle.size()) return i;
+		}
+		return std::string_view::npos;
+	}
+
+	// delta-seconds (RFC 4028 §3: Session-Expires, Min-SE), SATURATING at
+	// UINT32_MAX. A plain uint32_t accumulator wraps, so "4294967296" read as 0
+	// -- "no timer" -- and "4294967326" read as 30, which the 422 floor then
+	// answered as if the phone had asked for 30 s (#739).
+	uint32_t deltaSecondsOf(std::string_view v)
+	{
+		uint64_t val = 0;
+		for (size_t i = 0; i < v.size() && v[i] >= '0' && v[i] <= '9'; ++i)
+		{
+			val = val * 10 + static_cast<uint64_t>(v[i] - '0');
+			if (val > UINT32_MAX) return UINT32_MAX;
+		}
+		return static_cast<uint32_t>(val);
 	}
 
 	// Header name = text before the first ':', with surrounding whitespace
@@ -933,12 +963,7 @@ uint32_t SipMessage::getSessionExpiresSecs() const
 {
 	size_t idx = findHeaderIndex("session-expires", "x");
 	if (idx == std::string::npos) return 0;
-	std::string_view v = headerValueOf(_headerLines[idx]);
-	uint32_t val = 0;
-	size_t i = 0;
-	while (i < v.size() && v[i] >= '0' && v[i] <= '9')
-		val = val * 10 + static_cast<uint32_t>(v[i++] - '0');
-	return val;
+	return deltaSecondsOf(headerValueOf(_headerLines[idx]));
 }
 
 std::string_view SipMessage::getSessionExpiresRefresher() const
@@ -946,24 +971,27 @@ std::string_view SipMessage::getSessionExpiresRefresher() const
 	size_t idx = findHeaderIndex("session-expires", "x");
 	if (idx == std::string::npos) return {};
 	std::string_view line = _headerLines[idx];
-	size_t rp = line.find("refresher=");
+	// The parameter name and its uac/uas value are case-insensitive (RFC 3261
+	// §7.3.1, RFC 4028 §4 ABNF): "Refresher=UAS" names the PBX's peer as
+	// refresher just as "refresher=uas" does. The value is handed back as the
+	// lowercase literal so every caller's `== "uas"` compare holds (#739).
+	static constexpr std::string_view kParam = "refresher=";
+	size_t rp = ifindLower(line, kParam);
 	if (rp == std::string_view::npos) return {};
-	size_t vs = rp + 10;
+	size_t vs = rp + kParam.size();
 	size_t ve = line.find_first_of("; \t\r\n", vs);
 	if (ve == std::string_view::npos) ve = line.size();
-	return line.substr(vs, ve - vs);
+	std::string_view value = line.substr(vs, ve - vs);
+	if (iequal(value, "uac")) return "uac";
+	if (iequal(value, "uas")) return "uas";
+	return value;
 }
 
 uint32_t SipMessage::getMinSESecs() const
 {
 	size_t idx = findHeaderIndex("min-se");
 	if (idx == std::string::npos) return 0;
-	std::string_view v = headerValueOf(_headerLines[idx]);
-	uint32_t val = 0;
-	size_t i = 0;
-	while (i < v.size() && v[i] >= '0' && v[i] <= '9')
-		val = val * 10 + static_cast<uint32_t>(v[i++] - '0');
-	return val;
+	return deltaSecondsOf(headerValueOf(_headerLines[idx]));
 }
 
 std::string_view SipMessage::getContact() const
