@@ -620,14 +620,16 @@ TEST(E911Notify, ACallRefusedForCapacityIsNeverReportedAsRouted)
 	ASSERT_NE(b.loopback(), nullptr);
 	b.handler->setE911Config("200", "", "");
 
-	// Fill the anchor to its effective capacity via the anchor extension.
+	// Fill the anchor to its effective capacity with emergency calls: since
+	// #624 a 911 pre-empts an ordinary anchored call, and only another
+	// emergency call still leaves it refused for capacity.
 	const unsigned cap = std::min<unsigned>(
 		b.handler->anchorClientForTest()->maxConcurrentCalls(),
 		static_cast<unsigned>(POCKETDIAL_MAX_ANCHOR_CALLS));
 	ASSERT_GE(cap, 1u);
 	for (unsigned i = 0; i < cap; ++i)
 	{
-		b.handler->handle(enInvite("101", "555", "192.168.78.11",
+		b.handler->handle(enInvite("101", "911", "192.168.78.11",
 			"en-fill-" + std::to_string(i)));
 	}
 	b.wire.clear();
@@ -635,6 +637,7 @@ TEST(E911Notify, ACallRefusedForCapacityIsNeverReportedAsRouted)
 	// 911 from a DIFFERENT extension, so the dialer is not one of the fillers.
 	b.handler->handle(enInvite("200", "911", "192.168.78.20", "en-911-busy"));
 
+	ASSERT_NE(b.indexOf("SIP/2.0 503"), -1) << "precondition: refused for capacity:\n" << b.dump();
 	EXPECT_EQ(b.indexOf("ROUTED TO TRUNK"), -1)
 		<< "the anchor answered this INVITE with a 503 and still returned true; "
 		   "reporting it as routed tells the front desk a 911 call went through "
