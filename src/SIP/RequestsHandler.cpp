@@ -6413,10 +6413,14 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 				// later re-INVITE either, for the same reason noted below.
 				bClient = aIsSrcAB ? ab->getDest() : ab->getSrc();
 				cClient = aIsSrcAC ? ac->getDest() : ac->getSrc();
-				bSdp = aIsSrcAB ? ab->getRemoteSdp()
-					: (ab->getInviteMessage() ? std::string(ab->getInviteMessage()->getBody()) : std::string());
-				cSdp = aIsSrcAC ? ac->getRemoteSdp()
-					: (ac->getInviteMessage() ? std::string(ac->getInviteMessage()->getBody()) : std::string());
+				// #719: a phone holds the far party before consulting, so the stored
+				// SDP is often that party's hold ANSWER (a=recvonly/inactive). Sent as
+				// the other side's offer it makes them answer sendonly: one-way audio.
+				// The re-INVITE ends the hold, so offer sendrecv (as the blind swap does).
+				bSdp = sipwire::sdpAsSendrecv(aIsSrcAB ? ab->getRemoteSdp()
+					: (ab->getInviteMessage() ? std::string(ab->getInviteMessage()->getBody()) : std::string()));
+				cSdp = sipwire::sdpAsSendrecv(aIsSrcAC ? ac->getRemoteSdp()
+					: (ac->getInviteMessage() ? std::string(ac->getInviteMessage()->getBody()) : std::string()));
 				dFromAB = ab->getDialogFrom(); // AB dialog's caller (src) tag -- not necessarily A's
 				dToAB   = ab->getDialogTo();   // AB dialog's callee (dest) tag -- not necessarily B's
 				dFromAC = ac->getDialogFrom(); // AC dialog's caller (src) tag -- not necessarily A's
@@ -6425,11 +6429,9 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 					dFromAB.empty() || dToAB.empty() || dFromAC.empty() || dToAC.empty())
 				{
 					// SDP or dialog headers missing (call too new, or a leg never
-					// reached Connected) -- nothing coherent to splice. NOTE: a phone
-					// that put B on hold before consulting C has bSdp/cSdp holding B's
-					// HOLD answer (a=recvonly/inactive), not a resumed one -- this
-					// check doesn't (and can't, from here) catch that; it only catches
-					// SDP/headers never having been captured at all.
+					// reached Connected) -- nothing coherent to splice. A hold answer
+					// in bSdp/cSdp is not caught here; it is rewritten to sendrecv
+					// above (#719). This only catches SDP/headers never captured.
 					canSplice = false;
 				}
 			}
