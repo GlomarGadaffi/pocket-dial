@@ -145,14 +145,25 @@ profile), never built on the runner. Steps:
    `POST /api/config/export` to the results dir.
 4. `esptool --chip esp32s3 --port <by-id> --no-stub --after no_reset write_flash 0x20000 app.bin`.
    App-only by default; `--full` writes bootloader + partitions + app; `--nvs <img>`
-   writes a `gen_provision_nvs.py` image at 0x9000. glolab is esptool 4.7.0 (underscore
-   arg names, no S3 stub JSON, hence `--no-stub`).
+   writes a `gen_provision_nvs.py` image at 0x9000. glolab's working esptool is 5.4.0
+   (the venv at `~claude-agent/esptool-venv`, which ran the 2026-09-27 recovery in #338),
+   not 4.7.0. The underscore spellings and `--no-stub` above are what `tests/run.py`
+   sends; they date from Debian's packaged 4.7.0, which has no S3 stub JSON.
    **`--after no_reset` is mandatory.** Issue #338 (open) shows that esptool's hard,
    watchdog and RTS resets can park this board in ROM download mode until someone
-   power-cycles it. The reset after a flash must come from a remotely switchable power
-   path, which is a P0 hardware dependency (§8). Until it exists, `board-flash` is
-   dispatch-only with a human at the bench.
-5. Power-cycle, start capture, poll `/api/status` up to 60 s.
+   presses RST or power-cycles it. Switching power cannot do that remotely: `.244` is
+   PoE-fed, so a USB VBUS cycle leaves it running (tested 2026-09-24, uptime kept
+   climbing), and its PoE switch is unmanaged. The reset after a flash must come from a
+   GPIO relay or open-drain MOSFET from glolab on `.244`'s EN (reset) line, which is a
+   P0 hardware dependency (§8). Until it exists, `board-flash` is dispatch-only with a
+   human at the bench, and the physical RST button is the only guaranteed recovery.
+   **Safe reboot until then:** hold DTR false so GPIO0 stays high, then pulse RTS; the
+   ROM boots from flash instead of the download loader. `.smoke/capture.py` does exactly
+   this; the bench's `pd_serial.py --reset` on glolab holds DTR false the same way (#384).
+   One data point, not proof: on 2026-09-27 esptool 5.4.0
+   `--before no-reset --after hard-reset`, with DTR false, took `.244` out of the ROM
+   loader into the app (#338).
+5. Reset (EN low), start capture, poll `/api/status` up to 60 s.
 6. Run `board-provenance`. Mismatch = exit 2, board left as-is, lock released with a
    CHECK-IN stating what is on it.
 
@@ -197,8 +208,10 @@ samples the 8 heap fields + 5 `stackHwm_*` fields from `/api/status`, optionally
 a test-dial call every M minutes, and writes a CSV. Verdict is a slope test on internal
 `free` and `largest` against an idle baseline. The #328 confirmation (largest
 27628 → 1132 in 13 idle minutes) was this by hand; it becomes a number the crew can
-quote. Profiles matter: `heap_trace` builds are for the #331 periodic dump, and only a
-`default` build is a valid target for the #328/#330 zero-alloc proof.
+quote. Profiles matter: `heap_trace` builds are for the #331 periodic dump (but no boot
+of that build has reached t=360 s yet, #374, so its 360/900 s and periodic dumps are
+unreachable today), and only a `default` build is a valid target for the #328/#330
+zero-alloc proof.
 
 ### 5.6 `anchor` (3CX Call Control, bench only)
 
@@ -259,7 +272,7 @@ runner still never checks out PR code.
 
 | Phase | Deliverable | Why first |
 |---|---|---|
-| P0 | `tests/run.py` with `unit`, `api`, `callgraph`, `board-flash`, `board-provenance`, `board-smoke`; artifact uploads + `hil-244` job; lock + Discussion CHECK-OUT/IN; remote power-cycle for `.244` | ends hand-typed bench passes and "is it the latest build" questions |
+| P0 | `tests/run.py` with `unit`, `api`, `callgraph`, `board-flash`, `board-provenance`, `board-smoke`; artifact uploads + `hil-244` job; lock + Discussion CHECK-OUT/IN; remote EN-line reset for `.244` | ends hand-typed bench passes and "is it the latest build" questions |
 | P1 | remote-target `interop` and `sipp`; both in ci-glolab for host | real SIP stacks against the real board |
 | P2 | `board-soak`, `sanitize`, port-base plumbing (drop the host lock), `anchor` tier, `constrained` profile leg | measurement and hardening |
 
@@ -269,9 +282,10 @@ runner still never checks out PR code.
 2. `hil-244` on every `main` push, or dispatch-only until it has run clean ten times?
    Every-push mode also assumes `.244` is not doubling as a phone in use, since flash
    and reboot drop live calls.
-3. Remote power-cycle for `.244` (smart plug or relay reachable from glolab) is a P0
-   hardware dependency because of #338. Without it, unattended flashing is a job that
-   pages a human.
+3. A remote reset for `.244` (GPIO relay or open-drain MOSFET from glolab on its EN
+   line) is a P0 hardware dependency because of #338. A smart plug or USB power switch
+   will not do: the board is PoE-fed and its PoE switch is unmanaged (§5.2). Without the
+   EN line, unattended flashing is a job that pages a human.
 4. The 50% fragmentation tripwire in §5.4 step 7 is a placeholder until `board-soak`
    gives a baseline.
 5. A second board means a `--board <name>` registry (ip, by-id path, variant, phone
@@ -290,7 +304,7 @@ day one. Update this table as items land.
 | Board lock + hold file (§5.7) | done for every board suite; Discussion CHECK-OUT/IN posts not yet |
 | `board-provenance` | `/api/status` version vs `git describe` + `resetReason` only; no boot banner, no binary grep. A version mismatch is **WARN**, not FAIL, until `board-flash` runs before `board-smoke` (#338), so expect a green `hil-244` with a WARN verdict in the manifest |
 | `board-smoke` | provenance (recorded), `sip_probe`, `test_api.sh`, `office_smoke.py`, final heap snapshot; no serial capture, no Yealink/Timer B check |
-| `board-flash` | esptool `--after no_reset` + config export; no import, no power-cycle (#338), dispatch-only with a human present |
+| `board-flash` | esptool `--after no_reset` + config export; no import, no post-flash reset (#338), dispatch-only with a human present |
 | `board-soak` | fixed 1 min / 10 s sampler to CSV, no slope verdict |
 | `anchor` | credential presence check only |
 | CI | firmware bundles uploaded (eth, heap_trace); callgraph step blocking in both host workflows (its first run found #361, fixed in #364); `hil-244` is `workflow_dispatch`-only and runs `board-smoke` without flashing |

@@ -1,0 +1,2 @@
+# L2EgressChannel_test.cpp: 1 (#702 item 14: the netif lookup runs on re-resolve, not per frame; a lost IP is noticed at the next re-resolve)
+1

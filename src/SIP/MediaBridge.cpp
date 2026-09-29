@@ -47,6 +47,20 @@ bool MediaBridge::startBridge(const std::string& handsetIp, uint16_t handsetPort
 		return false;
 	}
 
+	// #734: ANCHOR mode hands the participant id to writeAudio() through a fixed
+	// kMohParticipantIdBufSize snapshot (onHandsetRtp, feedMohTick; #701), which
+	// refuses an id that does not fit rather than truncate it. Refuse such an id
+	// here, at setup, so the call fails loudly instead of carrying one-way audio
+	// with no counter. BUS mode never snapshots it.
+	if (!_bus && participantId.size() >= kMohParticipantIdBufSize)
+	{
+#if defined(ESP_PLATFORM)
+		ESP_LOGE("MediaBridge", "startBridge refused: participant id is %u B, limit %u (#734)",
+		         static_cast<unsigned>(participantId.size()), static_cast<unsigned>(kMohParticipantIdBufSize - 1));
+#endif
+		return false;
+	}
+
 	// BUS mode: claim a port before any socket is opened, so a full bus fails the
 	// start cleanly with nothing to unwind. The tick guarantees a Free slot has empty
 	// rings, so there is nothing to clear here.
@@ -186,7 +200,25 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 	// genuinely broken write path instead of pumping audio into it forever.
 	if (_anchor)
 	{
-		recordWriteAudioResult(_anchor->writeAudio(_participantId, decoded, decodedCount));
+		// #701: snapshot _participantId under _mutex, as feedMohTick() and
+		// dtmfSinkTrampoline() do. stopBridge() stores _active=false and then
+		// clears the string, and startBridge() reassigns it, both under this
+		// lock on the SIP thread; reading the std::string here unlocked, on the
+		// receive task, was a torn read, or a dangling view once the slot was
+		// reused for a longer id. Blocking here is safe: nothing holds _mutex
+		// while waiting on this task (RtpReceiver::stop() only flags and shuts
+		// the socket). Fixed buffer, no allocation, as in feedMohTick().
+		char participantIdBuf[kMohParticipantIdBufSize];
+		size_t participantIdLen = 0;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			if (!_active.load(std::memory_order_acquire)) return;
+			participantIdLen = _participantId.size();
+			if (participantIdLen >= sizeof(participantIdBuf)) return;   // refuse, never truncate
+			std::memcpy(participantIdBuf, _participantId.data(), participantIdLen);
+		}
+		recordWriteAudioResult(_anchor->writeAudio(
+			std::string_view(participantIdBuf, participantIdLen), decoded, decodedCount));
 	}
 }
 

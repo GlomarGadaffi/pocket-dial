@@ -280,10 +280,10 @@ void ParkOrbit::startRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& 
 
 bool ParkOrbit::handleOk(const std::shared_ptr<SipMessage>& data)
 {
-	const std::string cseq(data->getCSeq());
+	// Early-out on the view: this runs on every 200 OK, so the copy waits until
+	// the message is known to be an INVITE answer (#702).
+	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string_view::npos) return false;
 	const std::string callID(data->getCallID());
-	const bool isInviteOk = cseq.find(SipMessageTypes::INVITE) != std::string::npos;
-	if (!isInviteOk) return false;
 
 	// (a) 200 OK to a park re-INVITE sent to the parked party: ACK and free tracking entry.
 	if (auto it = std::find(_pendingAcks.begin(), _pendingAcks.end(), callID);

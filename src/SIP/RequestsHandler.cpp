@@ -148,7 +148,9 @@ namespace
 	// reconcile watchdog tears down only legs that have VANISHED from the DN, so
 	// a stuck-but-present leg would otherwise pin the single
 	// POCKETDIAL_MAX_ANCHOR_CALLS slot forever. 60 s clears carrier voicemail with
-	// margin while bounding that worst case; do not make it unbounded, and do not
+	// margin while bounding that worst case; do not make it unbounded (the one
+	// exception is a ringing 911/933, #712: desmo's decision, the caller's own
+	// CANCEL ends it), and do not
 	// re-arm it on provider progress events (the provider reports our own control
 	// leg's state, which sits at "Dialing" right through far-end alerting — there
 	// is no alerting signal to key off).
@@ -843,7 +845,6 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	// Input validation: Drop null or structurally malformed packets instantly (SEC-02)
 	if (!request || !request->isValidMessage())
 	{
-		_packetsDropped.fetch_add(1, std::memory_order_relaxed);
 		// Issue #430: record the source and first bytes, so an idle drop rate can
 		// be traced to its sender (e.g. a CRLF keep-alive) without a LAN capture.
 		const sockaddr_in src = request ? request->getSource() : sockaddr_in{};
@@ -859,7 +860,6 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		std::lock_guard<std::mutex> rlock(_rateMutex);
 		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
 		{
-			_packetsDropped.fetch_add(1, std::memory_order_relaxed);
 			const sockaddr_in src = request->getSource();
 			_dropProbe.note(DropProbe::Reason::Rate, src.sin_addr.s_addr, src.sin_port, rawBytes);
 			return;
@@ -1171,15 +1171,20 @@ void RequestsHandler::drainPassLocked(
 	logScratch.swap(_logQueue);
 }
 
-void RequestsHandler::flushPass(
-	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
-	std::vector<std::pair<bool, std::string>>& logScratch)
+void RequestsHandler::printLogs(const std::vector<std::pair<bool, std::string>>& logs)
 {
-	for (const auto& log : logScratch)
+	for (const auto& log : logs)
 	{
 		if (log.first) std::cerr << log.second << '\n';
 		else std::cout << log.second << '\n';
 	}
+}
+
+void RequestsHandler::flushPass(
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
+	std::vector<std::pair<bool, std::string>>& logScratch)
+{
+	printLogs(logScratch);
 	for (auto& event : outScratch)
 	{
 		_onHandled(event.first, std::move(event.second));
@@ -2651,13 +2656,7 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 	const std::string confExt(ConferenceRoom::EXT);
 
 	auto refuse = [&](const char* statusLine, const char* why) {
-		auto msg = getMessageFromPool(*data);
-		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
-		msg->setHeader(statusLine);
-		msg->clearBody();
-		msg->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		msg->setContact(buildContact(confExt));
-		_outbox.emplace_back(data->getSource(), std::move(msg));
+		if (!refuseInvite(*data, statusLine, confExt)) return;
 		queueLog("888 conference: " + std::string(why) + " for "
 			+ std::string(data->getFromNumber()), true);
 	};
@@ -2861,13 +2860,7 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 	const std::string callID(invite->getCallID());
 
 	auto refuse = [&](const char* statusLine, const char* why) {
-		auto msg = getMessageFromPool(*invite);
-		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
-		msg->setHeader(statusLine);
-		msg->clearBody();
-		msg->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
-		msg->setContact(buildContact(extension));
-		_outbox.emplace_back(invite->getSource(), std::move(msg));
+		if (!refuseInvite(*invite, statusLine, extension)) return;
 		queueLog("Voicemail: " + std::string(why) + " for " + std::string(src->getNumber())
 			+ " -> " + extension, true);
 	};
@@ -3096,13 +3089,7 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 	const std::string extension = src->getNumber();
 
 	auto refuse = [&](const char* statusLine, const char* why) {
-		auto msg = getMessageFromPool(*invite);
-		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
-		msg->setHeader(statusLine);
-		msg->clearBody();
-		msg->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
-		msg->setContact(buildContact(kVoicemailRetrievalExt));
-		_outbox.emplace_back(invite->getSource(), std::move(msg));
+		if (!refuseInvite(*invite, statusLine, kVoicemailRetrievalExt)) return;
 		queueLog("Voicemail retrieval: " + std::string(why) + " for " + extension, true);
 	};
 
@@ -4023,7 +4010,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// reap never hangs up a 911 (the dialed number alone misses a dial-plan
 	// transform such as "0" -> "911").
 	auto markEmergency = [&] {
-		auto s = _sessions.find(std::string(data->getCallID()));
+		auto s = _sessions.find(data->getCallID());   // std::less<> map: no copy on the 911 path
 		if (s != _sessions.end() && s->second) s->second->setEmergency(true);
 		// #659: opens this extension's PSAP callback window.
 		_emergencyCallbacks.note(caller->getNumber(), std::chrono::steady_clock::now());
@@ -7618,6 +7605,23 @@ void RequestsHandler::sweepExpired()
 
 		if (keepAliveTimedOut || leaseExpired)
 		{
+			// #712 (desmo, 2026-09-29): a lapsed lease never ends a 911/933. Skip the
+			// client, before any log line or allocation (this runs at 1 Hz for the
+			// whole call), until its emergency call has ended; the next sweep after
+			// that prunes it as usual.
+			bool emergencyLive = false;
+			for (const auto& [cid, s] : _sessions)
+			{
+				if (s->isEmergency() &&
+				    ((s->getSrc() && s->getSrc()->getNumber() == client->getNumber()) ||
+				     (s->getDest() && s->getDest()->getNumber() == client->getNumber())))
+				{
+					emergencyLive = true;
+					break;
+				}
+			}
+			if (emergencyLive) continue;
+
 			if (keepAliveTimedOut)
 			{
 				queueLog("Pruning client due to missed OPTIONS keepalive pings: " + client->getNumber());
@@ -7854,11 +7858,7 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 uint64_t RequestsHandler::getPacketsProcessed() const
@@ -7951,7 +7951,10 @@ void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipM
 
 uint64_t RequestsHandler::getPacketsDropped() const
 {
-	return _packetsDropped.load(std::memory_order_relaxed);
+	// #702 item 19: derived, not a second counter. Every Invalid/Rate drop is
+	// noted in the probe (handle() and noteRxDiscard()), so the sum is exact by
+	// construction. Each reason wraps at 2^32 (DropProbe is 32-bit, Xtensa).
+	return static_cast<uint64_t>(_dropProbe.invalidCount()) + _dropProbe.rateCount();
 }
 
 uint64_t RequestsHandler::getDroppedInvalid() const
@@ -7977,8 +7980,6 @@ const DropProbe& RequestsHandler::getDropProbe() const
 void RequestsHandler::noteRxDiscard(DropProbe::Reason reason, const sockaddr_in& src,
                                     std::string_view bytes, size_t fullLen)
 {
-	if (reason == DropProbe::Reason::Invalid || reason == DropProbe::Reason::Rate)
-		_packetsDropped.fetch_add(1, std::memory_order_relaxed);   // keep #430's sum exact
 	_dropProbe.note(reason, src.sin_addr.s_addr, src.sin_port, bytes, fullLen);
 }
 
@@ -8055,11 +8056,7 @@ void RequestsHandler::setDnd(const std::string& extension, bool on)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::string> RequestsHandler::getDndExtensions()
@@ -8078,11 +8075,7 @@ void RequestsHandler::setVoicemail(const std::string& extension, bool on)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::string> RequestsHandler::getVoicemailExtensions()
@@ -8103,11 +8096,7 @@ void RequestsHandler::setForward(const std::string& extension, const std::string
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string, std::string>> RequestsHandler::getForwards()
@@ -8130,11 +8119,7 @@ void RequestsHandler::setE911Config(const std::string& exts, const std::string& 
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::tuple<std::string, std::string, std::string> RequestsHandler::getE911Config()
@@ -8154,11 +8139,7 @@ void RequestsHandler::setRingGroup(const std::string& groupExt, const std::strin
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string>> RequestsHandler::getRingGroups()
@@ -8208,11 +8189,7 @@ void RequestsHandler::setDialRule(const std::string& pattern, const std::string&
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getDialRules()
@@ -8345,11 +8322,7 @@ std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 	return err;
 }
 
@@ -8411,11 +8384,7 @@ void RequestsHandler::setRegistrarMode(RegistrarMode mode)
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 RequestsHandler::RegistrarMode RequestsHandler::getRegistrarMode() const
@@ -8478,11 +8447,7 @@ bool RequestsHandler::secureDevice(const std::string& macOrExt)
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 	return changed;
 }
 
@@ -8497,11 +8462,7 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 	return removed;
 }
 
@@ -8778,7 +8739,12 @@ void RequestsHandler::tick()
 			const bool connectedAbandonedAnchor =
 				session->getState() == Session::State::Connected &&
 				session->isAnchor() && !session->isAnchorInbound();
-			if (session->isRingExpired(now) &&
+			// #712 (desmo, 2026-09-29): a 911/933 that is still ringing gets no
+			// PBX-side no-answer bound; a PSAP may queue it past 60 s. The far
+			// end's own transaction timers bound a leg that never answers at all.
+			const bool ringingEmergency =
+				session->getState() == Session::State::Invited && session->isEmergency();
+			if (session->isRingExpired(now) && !ringingEmergency &&
 			    (session->getState() == Session::State::Invited || connectedAbandonedAnchor))
 			{
 				expiredCallIds.push_back(callID);
@@ -9329,8 +9295,6 @@ void RequestsHandler::tick()
 			// exactly as they are. The old whole-struct move-assign preserved devices
 			// and pageZones by hand but not voicemail, so the dashboard's voicemail
 			// list was blanked one tick after every change (found in #463).
-			_snapshot.packetsProcessed = _packetsProcessed.load(std::memory_order_relaxed);
-			_snapshot.packetsDropped   = _packetsDropped.load(std::memory_order_relaxed);
 			std::swap(_snapshot.clients,     next.clients);
 			std::swap(_snapshot.sessions,    next.sessions);
 			std::swap(_snapshot.cdr,         next.cdr);
@@ -10195,11 +10159,7 @@ void RequestsHandler::setPageZone(const std::string& zoneExt, const std::string&
 		_logQueue.clear();
 	}
 
-	for (const auto& log : localLogs)
-	{
-		if (log.first) std::cerr << log.second << '\n';
-		else std::cout << log.second << '\n';
-	}
+	printLogs(localLogs);
 }
 
 std::vector<std::pair<std::string, std::string>> RequestsHandler::getPageZones()
@@ -10310,13 +10270,19 @@ void RequestsHandler::refreshParkSnapshot()
 	_snapshot.parkedCalls = std::move(rows);
 }
 
-std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getParkedCalls()
-{
-	std::lock_guard<std::mutex> lock(_snapshotMutex);
-	return _snapshot.parkedCalls;
-}
-
 // ── Build helpers ─────────────────────────────────────────────────────────────
+
+bool RequestsHandler::refuseInvite(const SipMessage& req, const char* statusLine, std::string_view contactExt)
+{
+	auto msg = getMessageFromPool(req);
+	if (!msg) return false;   // pool exhausted: drop, peer retransmits (#101A)
+	msg->setHeader(statusLine);
+	msg->clearBody();
+	msg->setVia(sipwire::viaWithReceived(req.getVia(), req.getSource()));
+	msg->setContact(buildContact(contactExt));
+	_outbox.emplace_back(req.getSource(), std::move(msg));
+	return true;
+}
 
 std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	const std::shared_ptr<SipMessage>& inviteMsg,
