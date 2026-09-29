@@ -9268,8 +9268,6 @@ void RequestsHandler::tick()
 			// exactly as they are. The old whole-struct move-assign preserved devices
 			// and pageZones by hand but not voicemail, so the dashboard's voicemail
 			// list was blanked one tick after every change (found in #463).
-			_snapshot.packetsProcessed = _packetsProcessed.load(std::memory_order_relaxed);
-			_snapshot.packetsDropped   = _packetsDropped.load(std::memory_order_relaxed);
 			std::swap(_snapshot.clients,     next.clients);
 			std::swap(_snapshot.sessions,    next.sessions);
 			std::swap(_snapshot.cdr,         next.cdr);
@@ -10247,12 +10245,6 @@ void RequestsHandler::refreshParkSnapshot()
 	auto rows = _park.snapshotRows(std::chrono::steady_clock::now(), /*onlyParked=*/false);
 	std::lock_guard<std::mutex> snapLock(_snapshotMutex);
 	_snapshot.parkedCalls = std::move(rows);
-}
-
-std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getParkedCalls()
-{
-	std::lock_guard<std::mutex> lock(_snapshotMutex);
-	return _snapshot.parkedCalls;
 }
 
 // ── Build helpers ─────────────────────────────────────────────────────────────
