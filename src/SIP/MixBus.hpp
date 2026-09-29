@@ -19,7 +19,8 @@
 class MixBus
 {
 public:
-    static constexpr int FRAME     = 160;  // samples/tick; MUST equal RTP ptime (20 ms @ 8 kHz)
+    static constexpr int FRAME     = 160;  // samples/tick = the ptime WE send (20 ms @ 8 kHz); a leg
+                                           // may send another ptime, its in-ring absorbs it (#170)
     // #479: one port per conference leg. Every port carries two rings, fixed with the
     // room at boot, so unused ports were pure internal DRAM on a no-PSRAM build.
     static constexpr int MAX_PORTS = POCKETDIAL_CONF_LEGS;
