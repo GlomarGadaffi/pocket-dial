@@ -784,6 +784,8 @@ public:
 	// Forget a device entirely (drops the adoption record; a later REGISTER re-learns
 	// it in Learn mode). Accepts a MAC or an extension. Thread-safe + persisted.
 	bool forgetDevice(const std::string& macOrExt);
+	// #515: forget every Learned device at once; Secured ones stay. Thread-safe + persisted.
+	size_t forgetLearnedDevices();
 
 private:
 	void initHandlers();

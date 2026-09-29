@@ -321,6 +321,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster. |
 | [`/api/registrar`](#post-apiregistrar) | `POST` | High | Gated (+ `X-CSRF`) | Sets the admission mode (`learn`/`secure`; `open` is retired, #500). |
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
+| [`/api/registrar/forget-learned`](#post-apiregistrarforget-learned) | `POST` | High | Gated (+ `X-CSRF`) | Forgets every `learned` device at once; `secured` ones stay (#515). |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
 | [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
 | [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts with `confirm=1` if none is staged (#645). Simulated (`200`, no-op) on desktop. While a 911/933 call is live a plain restart answers `409` `{"error":"emergency call in progress"}` and a staged-image reboot waits for the call to end (#652). |
@@ -1357,6 +1358,25 @@ curl -s -X POST "http://$DEV/api/registrar/device" \
 curl -s -X POST "http://$DEV/api/registrar/device" \
      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
      -d "action=forget&target=1001"
+```
+
+### `POST /api/registrar/forget-learned`
+
+Forgets every `learned` device in one action (one NVS write); `secured` devices are kept.
+This is the recovery for a flood of adoptions that filled the device table (#515). Real
+phones are re-adopted on their next registration, a few per minute (see below). No body.
+
+* Response Status Codes:
+  * `200 OK`: Body is the `GET`'s `{attached, mode, devices}` shape, after the forget.
+  * `401`/`403`: gates 1-4 as in §0.1.
+
+Learn mode adopts at most 4 new MACs at once, then one more every 15 s. A REGISTER from a
+new MAC past that budget is answered `503 Service Unavailable` with a `Retry-After`
+(seconds until the next slot); known MACs never count against it.
+
+```bash
+curl -s -X POST "http://$DEV/api/registrar/forget-learned" \
+     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF"
 ```
 
 > **The MAC lock is not a cryptographic boundary.** It is learned from the ARP table, and
