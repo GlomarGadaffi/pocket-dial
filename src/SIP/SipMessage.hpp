@@ -115,6 +115,10 @@ public:
 	// The user part of the Request-URI ("600" in "INVITE sip:600@host SIP/2.0");
 	// empty for a response, or a Request-URI with no sip: user part.
 	std::string_view getRequestUriUser() const { return extractNumber(_startLine); }
+	// Replace the Request-URI of a request in place, keeping its method and SIP
+	// version (#754). False, and nothing changed, on a response or a start line
+	// that is not "<METHOD> <uri> SIP/2.0".
+	bool setRequestUri(std::string_view uri);
 	// Pins the SDP payload list to "0 8 101".
 	//
 	// DEPRECATED, and as of ISSUES.md #139 called from NO production path -- only
