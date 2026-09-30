@@ -265,6 +265,11 @@ public:
 		// flag: the INVITE's challenge and the BYE's are separate transactions,
 		// and each gets exactly one credentialed retry.
 		bool        byeAuthAttempted = false;
+		// #794: hangup() ran while this INVITE was still in Trying. RFC 3261 §9.1
+		// forbids a CANCEL before a provisional response, so the slot is held and
+		// handleResponse() sends the CANCEL on the first 1xx; a 2xx or a failure
+		// arriving first is handled as if the CANCEL had crossed it.
+		bool        cancelPending = false;
 
 		sockaddr_in peer{};
 		std::chrono::steady_clock::time_point deadline{};
