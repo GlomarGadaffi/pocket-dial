@@ -62,6 +62,26 @@
 
 // File-scope static helpers defined later in this translation unit.
 static bool sameAddress(const sockaddr_in&, const sockaddr_in&);
+
+// The caller's in-dialog request on a broadcast (ring-group / page / hunt) call.
+// Its To is the dialled group or alias, which no phone owns, so dispatch keys on
+// the session and the sender, never on the To number (#802). The answering
+// member's own requests carry To = the caller and are not this.
+static bool isBroadcastCallerRequest(const std::shared_ptr<Session>& s, const SipMessage& m)
+{
+	const auto src = s->getSrc();
+	return s->isBroadcast() && src && m.getFromNumber() == src->getNumber();
+}
+
+// Request-URI toward a phone: its registered Contact with URI parameters intact
+// (a Snom answers 404/481 without its ;line=), the bare form only as a fallback.
+static std::string memberRequestUri(const SipClient& c)
+{
+	return c.getContactUri().empty()
+		? "sip:" + c.getNumber() + "@" + sipwire::addrToIpPort(c.getAddress())
+		: c.getContactUri();
+}
+
 static std::string stripHeaderName(std::string_view fullLine);
 
 namespace
@@ -1640,7 +1660,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	if (destNumber == "999" || _cfg.isPageZoneDialog(destNumber))
+	if (cancelSess.has_value() && isBroadcastCallerRequest(cancelSess.value(), *data))
 	{
 		auto session = getSession(data->getCallID());
 		if (session.has_value())
@@ -5915,7 +5935,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	if (destNumber == "999" || _cfg.isPageZoneDialog(destNumber))
+	if (session.has_value() && isBroadcastCallerRequest(session.value(), *data))
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -5938,9 +5958,8 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 				if (byeFork)
 				{
 				std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
-				std::string targetIpPort = sipwire::addrToIpPort(answeringClient->getAddress());
 
-				byeFork->setHeader("BYE sip:" + answeringClient->getNumber() + "@" + targetIpPort + " SIP/2.0");
+				byeFork->setHeader("BYE " + memberRequestUri(*answeringClient) + " SIP/2.0");
 
 				std::string originalTo(data->getTo());
 				std::string newTo = "To: <sip:" + answeringClient->getNumber() + "@" + serverIpPort + ">";
@@ -6449,7 +6468,7 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	if (destNumber == "999")
+	if (isBroadcastCallerRequest(session.value(), *data))
 	{
 		auto answeringClient = session.value()->getDest();
 		if (answeringClient)
@@ -6458,9 +6477,8 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 			if (!ackFork) return;   // pool exhausted: drop, peer retransmits (#101A)
 			std::string activeIp = _localIp;
 			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
-			std::string targetIpPort = sipwire::addrToIpPort(answeringClient->getAddress());
 
-			ackFork->setHeader("ACK sip:" + answeringClient->getNumber() + "@" + targetIpPort + " SIP/2.0");
+			ackFork->setHeader("ACK " + memberRequestUri(*answeringClient) + " SIP/2.0");
 
 			std::string originalTo(data->getTo());
 			std::string newTo = "To: <sip:" + answeringClient->getNumber() + "@" + serverIpPort + ">";

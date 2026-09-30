@@ -443,6 +443,9 @@ add_executable(sip_parser_tests
     # Issue #746: a callee's 415/420/488/603 (and a ring-group member's refusal or
     # loser's 487) reached onFinalFailure() and went nowhere: no relay, no ACK.
     FinalFailureRelay_test.cpp
+    # Issue #802: the caller's ACK/BYE/CANCEL on a ring-group / zone / alias call
+    # were dispatched on the To literal and 404'd; they reach the member now.
+    GroupInDialog_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header
