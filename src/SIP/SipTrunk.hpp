@@ -408,8 +408,11 @@ public:
 	bool handleBye(const std::shared_ptr<SipMessage>& data);
 
 	// Tear down the trunk leg for `callID` (either the trunk's own Call-ID or the
-	// handset leg's). Sends a BYE if the dialog is confirmed; frees it outright if
-	// it never got that far. Returns true if a dialog was found.
+	// handset leg's). Sends a BYE if the dialog is confirmed; CANCELs it if it is
+	// ringing (Proceeding, #747) and holds the slot for the INVITE's own final
+	// response; frees it outright only if it never drew a provisional (Trying).
+	// A second call on a Cancelling dialog changes nothing. Returns true if a
+	// dialog was found.
 	bool hangup(std::string_view callID);
 
 	// Time out dialogs that never reached a final response.

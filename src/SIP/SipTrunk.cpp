@@ -544,31 +544,19 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 
 	// #747: we CANCELled this INVITE and are waiting out its transaction. The
 	// handset was answered by the engine when it cancelled, so nothing here may
-	// reach the listener.
-	if (d->state == State::Cancelling)
+	// reach the listener. A 2xx that crossed the CANCEL (§9.1) is not caught
+	// here: it takes the ordinary 2xx path below -- the same ACK, and whatever
+	// else that path latches from the answer -- with hangup() in place of the
+	// listener.
+	const bool wasCancelling = (d->state == State::Cancelling);
+	if (wasCancelling && (status < 200 || data->getCSeqMethod() == "CANCEL"))
 	{
 		// A late 180/183, or the CANCEL's own final response (200, or 481 when the
 		// carrier no longer knows the INVITE): nothing to do, keep waiting.
-		if (status < 200 || data->getCSeq().find("CANCEL") != std::string_view::npos) return true;
-
-		if (status < 300)
-		{
-			// The 2xx crossed our CANCEL (§9.1): the call is up at the carrier. ACK
-			// it, then BYE it -- hangup() on a Confirmed dialog does the BYE.
-			const std::string contact = contactUri(data->getContact());
-			if (!contact.empty()) d->remoteTarget = contact;
-			auto ack = _env.messageFromPool(buildAckFor2xx(*d, "z9hG4bK" + IDGen::GenerateID(12)), d->peer);
-			if (ack)
-			{
-				ack->syncContentLength();
-				_env.enqueue(d->peer, std::move(ack));
-			}
-			d->state = State::Confirmed;
-			_env.log("Trunk: call answered after our CANCEL, hanging up (" + d->destE164 + ")", true);
-			hangup(d->callID);
-			return true;
-		}
-
+		return true;
+	}
+	if (wasCancelling && status >= 300)
+	{
 		// 487 (or any other 3xx-6xx): ACK it in the INVITE's own transaction and
 		// release. The handset is already gone, so there is nobody to tell.
 		auto ack = _env.messageFromPool(buildAckForFailure(*d), d->peer);
@@ -628,6 +616,16 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 			_env.enqueue(d->peer, std::move(ack));
 		}
 		d->state = State::Confirmed;
+		if (wasCancelling)
+		{
+			// #747: the 2xx crossed our CANCEL (§9.1). The call is up at the
+			// carrier and the handset is gone, so no listener event may bridge
+			// it; hangup() on the now Confirmed dialog emits the BYE, behind the
+			// ACK already on the outbox.
+			_env.log("Trunk: call answered after our CANCEL, hanging up (" + d->destE164 + ")", true);
+			hangup(d->callID);
+			return true;
+		}
 		_env.log("Trunk: call answered (" + d->destE164 + ")");
 		// Fired last, with the ACK already on the outbox and the state already
 		// Confirmed: a listener that finds the answer's SDP unusable calls
