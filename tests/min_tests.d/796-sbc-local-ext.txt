@@ -1,0 +1,2 @@
+# DialPlan_test.cpp (#796): SBC mode rings registered local extensions locally; unowned numbers still trunk; explicit rule still wins
+2

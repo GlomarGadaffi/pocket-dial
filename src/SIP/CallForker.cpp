@@ -374,6 +374,13 @@ bool CallForker::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 		{
 			return false;   // fallthrough — routing continues exactly as it did pre-#69
 		}
+		// #796: the fallback is for numbers this PBX does not own. A registered
+		// client is ours: fall through to CFU/DND/ordinary delivery instead of
+		// leaking an internal call out the billable trunk.
+		if (_env.findRegistered(destNumber))
+		{
+			return false;
+		}
 		sbcFallback.pattern = "*";
 		sbcFallback.action = pbx::DialActionType::Trunk;
 		rule = &sbcFallback;
