@@ -427,6 +427,47 @@ TEST(CallPickup, RacePickupFirst_LateAnswerFromCancelledTargetIsDropped)
 		<< "the late answer must not overwrite the pickup winner";
 }
 
+TEST(CallPickup, RacePickupFirst_CancelledTargets487IsAckedNotRelayedToTheCaller)
+{
+	// Issue #750: the caller's INVITE already got the pickup's 200. The cancelled
+	// target answers our CANCEL with a 487; relayed, that is a second final
+	// response on one INVITE transaction. The PBX must ACK it and drop it.
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+
+	handler.handle(makeRegister("200", "192.168.9.10", "reg-caller6"));
+	handler.handle(makeRegister("100", "192.168.9.20", "reg-target6"));
+	handler.handle(makeRegister("102", "192.168.9.30", "reg-picker6"));
+	handler.setRingGroup("603", "100,102", "ringall");
+
+	handler.handle(makeInvite("200", "100", "192.168.9.10", "call-6"));
+	handler.handle(makeInvite("102", "**100", "192.168.9.30", "pickup-6"));
+
+	const size_t callerMessagesBefore = countTo(sent, "192.168.9.10");
+
+	const std::string raw487 =
+		"SIP/2.0 487 Request Terminated\r\n"
+		"Via: SIP/2.0/UDP 192.168.9.10:5060;branch=z9hG4bKcall-6\r\n"
+		"From: <sip:200@server>;tag=fromcall-6\r\n"
+		"To: <sip:100@server>;tag=tocall-6\r\n"
+		"Call-ID: call-6\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(raw487, addrFor("192.168.9.20")));
+
+	EXPECT_EQ(countTo(sent, "192.168.9.10"), callerMessagesBefore)
+		<< "the cancelled target's 487 must not reach a caller already answered 200";
+	EXPECT_TRUE(anyTo(sent, "192.168.9.20", "ACK sip:100@"))
+		<< "the PBX must ACK the cancelled target's 487 itself";
+
+	auto stillPicker = handler.getSession(sessionKey("call-6"));
+	ASSERT_TRUE(stillPicker.has_value());
+	EXPECT_EQ(stillPicker.value()->getState(), Session::State::Connected);
+}
+
 // ── Bridge teardown ──────────────────────────────────────────────────────
 
 TEST(CallPickup, CallerHangupTearsDownBothBridgedDialogsViaPeerCallId)

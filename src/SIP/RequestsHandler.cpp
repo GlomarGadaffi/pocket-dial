@@ -1800,6 +1800,38 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 		ackInboundFinal(session.value(), data);
 		return;
 	}
+	// Issue #750: a pickup already answered the caller's INVITE with a 200 and
+	// CANCELled this target, so the session is connected to the picker. The
+	// target's 487 answers our CANCEL: relayed, it would be a second final
+	// response on the caller's INVITE transaction (RFC 3261 §17.2.1). ACK it
+	// ourselves (§17.1.1.3, same branch as the INVITE it saw) and drop it.
+	// A 487 from the connected peer itself is not this case and falls through.
+	if (session.has_value() &&
+		(session.value()->getState() == Session::State::Connected ||
+		 session.value()->getState() == Session::State::Held) &&
+		session.value()->getDest() &&
+		data->getToNumber() != session.value()->getDest()->getNumber())
+	{
+		if (auto invite = session.value()->getInviteMessage())
+		{
+			auto ack = getMessageFromPool(*invite);
+			if (ack)
+			{
+				const std::string ackDest = sipwire::addrToIpPort(data->getSource());
+				std::string cseq(invite->getCSeq());
+				const size_t invitePos = cseq.find("INVITE");
+				if (invitePos != std::string::npos) cseq.replace(invitePos, 6, "ACK");
+				ack->setHeader("ACK sip:" + std::string(data->getToNumber()) + "@" + ackDest + " SIP/2.0");
+				ack->setTo(std::string(data->getTo()));
+				ack->setCSeq(cseq);
+				ack->clearBody();
+				ack->removeHeaders("Authorization");
+				ack->removeHeaders("Proxy-Authorization");
+				_outbox.emplace_back(data->getSource(), std::move(ack));
+			}
+		}
+		return;
+	}
 	endHandle(data->getFromNumber(), data);
 }
 
