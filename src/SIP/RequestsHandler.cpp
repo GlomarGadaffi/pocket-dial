@@ -5874,6 +5874,21 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// A parked party hanging up (#804). Its To is the orbit, which no phone owns,
+	// and it has no peerCallID until a retrieve, so nothing below would answer it.
+	// Keyed on the orbit's own state, not on the To number. endCall() frees the
+	// orbit slot and stops the music on hold.
+	if (_park.holdsCall(data->getCallID()))
+	{
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader(SipMessageTypes::OK);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		endCall(data->getCallID(), data->getFromNumber(), destNumber, "parked party hung up");
+		return;
+	}
+
 	// See onCancel()'s matching comment: a Trunk-routed anchor call's BYE remote
 	// target is the dialed digits (buildOkWithSdp's Contact uses getToNumber()),
 	// not the literal 555 code, so recognize the session by isAnchor() too.

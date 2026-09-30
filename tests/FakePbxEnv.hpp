@@ -65,6 +65,9 @@ public:
 	// (#581 review: fail ONE specific draw, e.g. only a challenge retry's INVITE).
 	int messagePoolFailDrawIn = 0;
 
+	// Call-IDs passed to endSession(), in order; the session is dropped as endCall() would.
+	std::vector<std::string> endedCallIds;
+
 	// Call-IDs passed to freeTransactionsForCallId(), in order.
 	std::vector<std::string> freedTransactionCallIds;
 
@@ -112,6 +115,11 @@ public:
 	void freeTransactionsForCallId(std::string_view callId) override
 	{
 		freedTransactionCallIds.emplace_back(callId);
+	}
+	void endSession(std::string_view callId, std::string_view /*reason*/) override
+	{
+		endedCallIds.emplace_back(callId);
+		sessions.erase(std::string(callId));
 	}
 	void log(std::string msg, bool /*isError*/ = false) override
 	{

@@ -4,6 +4,9 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
+#include <vector>
+
 #include "FakePbxEnv.hpp"
 #include "ParkOrbit.hpp"
 
@@ -232,4 +235,113 @@ TEST(ParkOrbit, RetrieveWithExhaustedSessionPoolLeavesSlotParked)
 	ASSERT_EQ(rows.size(), 1u);
 	EXPECT_EQ(std::get<0>(rows[0]), "700");
 	EXPECT_EQ(std::get<1>(rows[0]), "101");
+}
+
+namespace
+{
+	// A minimal 8 kHz mono mu-law WAV, so HoldMusic can be loaded and started on
+	// the host (same shape HoldMusic_test.cpp and MediaBridge_test.cpp write).
+	std::string writeMohClip(const char* filename)
+	{
+		auto put32 = [](std::vector<uint8_t>& v, uint32_t x) {
+			for (int i = 0; i < 4; ++i) v.push_back(uint8_t(x >> (8 * i)));
+		};
+		auto put16 = [](std::vector<uint8_t>& v, uint16_t x) {
+			v.push_back(uint8_t(x)); v.push_back(uint8_t(x >> 8));
+		};
+		auto putTag = [](std::vector<uint8_t>& v, const char* t) { v.insert(v.end(), t, t + 4); };
+		const uint32_t dataBytes = HoldMusic::BYTES_PER_TICK * 4;
+		std::vector<uint8_t> body;
+		putTag(body, "WAVE");
+		putTag(body, "fmt "); put32(body, 18);
+		put16(body, 7); put16(body, 1); put32(body, 8000); put32(body, 8000);
+		put16(body, 1); put16(body, 8); put16(body, 0);
+		putTag(body, "fact"); put32(body, 4); put32(body, dataBytes);
+		putTag(body, "data"); put32(body, dataBytes);
+		body.insert(body.end(), dataBytes, 0xFF);
+		std::vector<uint8_t> file;
+		putTag(file, "RIFF"); put32(file, uint32_t(body.size()));
+		file.insert(file.end(), body.begin(), body.end());
+		const std::string path = std::string(::testing::TempDir()) + filename;
+		std::ofstream out(path, std::ios::binary | std::ios::trunc);
+		out.write(reinterpret_cast<const char*>(file.data()), std::streamsize(file.size()));
+		return path;
+	}
+}
+
+// #804: a park that times out with the parker gone BYEs the parked party and frees
+// the orbit, but never ended the Session inserted at park time: the session slot,
+// the virtual peer and the CDR leaked, and music on hold must not outlive it.
+TEST(ParkOrbit, TimeoutWithTheParkerGoneEndsTheParkedSessionAndStopsTheMusic)
+{
+	FakePbxEnv env;
+	ParkOrbit park(env);
+	HoldMusic moh;
+	ASSERT_TRUE(moh.loadClip(writeMohClip("pd_park_804_moh.wav")));
+	ASSERT_TRUE(moh.start());
+	park.setHoldMusic(&moh);
+
+	const sockaddr_in parkedAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+	// The parker is the parked party itself and is not registered in `env`, so the
+	// timeout finds nobody to ring back.
+	park.onInvite(inviteTo("700", "101", "park-804a@192.168.1.50", parkedAddr, "192.168.1.50"),
+		std::make_shared<SipClient>("101", parkedAddr), 0);
+	ASSERT_TRUE(env.findSession("Call-ID: park-804a@192.168.1.50")) << "precondition: parked";
+	ASSERT_EQ(moh.listenerCount(), 1u) << "precondition: music is playing to the parked phone";
+
+	park.sweep(std::chrono::steady_clock::now() + std::chrono::hours(1));
+
+	ASSERT_EQ(env.byeCalls.size(), 1u) << "the parked party is BYEd";
+	EXPECT_TRUE(park.snapshotRows(std::chrono::steady_clock::now(), /*onlyParked=*/false).empty())
+		<< "the orbit is freed";
+	EXPECT_EQ(moh.listenerCount(), 0u) << "no music left running";
+	ASSERT_EQ(env.endedCallIds.size(), 1u) << "the Session must be ended (CDR, pool slot)";
+	EXPECT_EQ(env.endedCallIds[0], "Call-ID: park-804a@192.168.1.50");
+	EXPECT_FALSE(env.findSession("Call-ID: park-804a@192.168.1.50"));
+}
+
+// The same leak on the other timeout: the parker was rung back and never answered.
+TEST(ParkOrbit, UnansweredRingbackEndsTheParkedSession)
+{
+	FakePbxEnv env;
+	ParkOrbit park(env);
+
+	const sockaddr_in parkedAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+	const sockaddr_in parkerAddr = FakePbxEnv::addr("192.168.1.52", 5060);
+	env.registered["102"] = std::make_shared<SipClient>("102", parkerAddr);
+
+	// 101 is parked by 102 (the parker rung back on timeout).
+	park.onInvite(inviteTo("700", "101", "park-804b@192.168.1.50", parkedAddr, "192.168.1.50"),
+		env.registered["102"], 0);
+	const auto t0 = std::chrono::steady_clock::now() + std::chrono::hours(1);
+
+	park.sweep(t0);   // parked -> ringing back
+	EXPECT_TRUE(env.endedCallIds.empty()) << "still ringing back: the parked dialog is alive";
+	ASSERT_TRUE(env.findSession("Call-ID: park-804b@192.168.1.50"));
+
+	park.sweep(t0 + std::chrono::seconds(31));   // the ring-back deadline passes
+
+	EXPECT_EQ(env.byeCalls.size(), 1u);
+	ASSERT_EQ(env.endedCallIds.size(), 1u) << "the Session must be ended";
+	EXPECT_EQ(env.endedCallIds[0], "Call-ID: park-804b@192.168.1.50");
+}
+
+// onBye asks this to recognise a parked party's BYE without looking at To.
+TEST(ParkOrbit, HoldsCallWhileParkedOnly)
+{
+	FakePbxEnv env;
+	ParkOrbit park(env);
+	const sockaddr_in parkedAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	EXPECT_FALSE(park.holdsCall("Call-ID: park-804c@192.168.1.50"));
+	park.onInvite(inviteTo("700", "101", "park-804c@192.168.1.50", parkedAddr, "192.168.1.50"),
+		std::make_shared<SipClient>("101", parkedAddr), 0);
+	EXPECT_TRUE(park.holdsCall("Call-ID: park-804c@192.168.1.50"));
+
+	const sockaddr_in retrieverAddr = FakePbxEnv::addr("192.168.1.51", 5060);
+	park.onInvite(inviteTo("700", "102", "retrieve-804c@192.168.1.51", retrieverAddr, "192.168.1.51"),
+		std::make_shared<SipClient>("102", retrieverAddr), 0);
+	EXPECT_FALSE(park.holdsCall("Call-ID: park-804c@192.168.1.50"))
+		<< "a retrieved leg is a bridged call: its BYE takes the peer-relay path";
+	EXPECT_FALSE(park.holdsCall("Call-ID: retrieve-804c@192.168.1.51"));
 }

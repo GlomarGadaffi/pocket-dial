@@ -52,6 +52,12 @@ struct PbxEnv
 	// Call-ID that owns no transaction: it is a no-op.
 	virtual void freeTransactionsForCallId(std::string_view callId) = 0;
 
+	// End the session under `callId` as a BYE or CANCEL would: CDR, pool slot, and
+	// every per-call resource. For a machine that times a dialog out itself (the park
+	// sweep, #804). Not pure, like wipeVoicemail(): an env with no session table
+	// has nothing to end.
+	virtual void endSession(std::string_view /*callId*/, std::string_view /*reason*/) {}
+
 	// Append to the deferred log queue (flushed off-lock).
 	virtual void log(std::string msg, bool isError = false) = 0;
 	// Issue #450: the DTMF factory-reset door wipes the SD voicemail archive, as
