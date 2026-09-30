@@ -1788,6 +1788,10 @@ private:
 	// INVITE's, its To carries the leg's tag). No-op for a non-INVITE CSeq.
 	void ackForwardedFinal(const std::shared_ptr<SipMessage>& data);
 
+	// Issue #746 (desmo): a refusing callee with CFNA or voicemail armed is diverted
+	// as the ring timer would after 20 s. True when it took the call.
+	bool divertRefusedCall(const std::shared_ptr<Session>& s, const std::shared_ptr<SipMessage>& data);
+
 	// The handset's 200 OK to one of routeInboundAnchorCall()'s forked INVITEs:
 	// learn its tag + RTP, bring up the media bridge, ACK with our SDP answer
 	// (delayed-offer model), answer the upstream leg, and CANCEL the losing forks.
