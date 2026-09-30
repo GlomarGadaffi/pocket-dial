@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (on main since v1.5.0-beta.2) — 2026-09-28
+## Unreleased (on main since v1.5.0-beta.2) — 2026-09-30
 
 One line per change merged to `main` after beta.2, taken from its squash title.
 `(#PR; #issue)`: the first number is the pull request, the rest are the issues it
@@ -59,6 +59,25 @@ bench-verified here.
 - lwIP IPv4 reassembly is enabled: SIP/UDP over 1,472 B is no longer silently dropped (#509; #496).
 - Every fragment addressed to the mDNS group is dropped (#574; #559).
 - Reboot and factory reset are refused while a 911/933 is live (#655; #652).
+- A BYE refused under #356 is counted, logged at powers of two and shown in `/api/status` (#675; #666).
+- A restart held for a live 911/933 logs once, not every poll (#678; #677).
+- Anchor: no rx task is started on a slot being torn down (#683; #682).
+- `onHandsetRtp` snapshots `_participantId` under `_mutex` before `writeAudio` (#722; #701).
+- An anchor participant id too long for the snapshot buffer is refused at `startBridge` (#736; #734).
+- The conference mix tick takes a frame only when a whole one is buffered (#737; #170).
+- A lapsed lease and the no-answer reaps never end a 911/933 (#725; #712).
+- A 911/933 on a full anchor pre-empts one non-emergency call (#740; #624).
+- A call to an extension that dialed 911/933 in the last 30 min is an emergency call (#721; #659).
+- Anchor: a leg whose GET stream never opened is dropped once, unless it is a 911 (#723; #379).
+- The PBX's own 2xx names the phone as session refresher (#724; part of #198).
+- Message-waiting indication, RFC 3842 (#757).
+- SBC mode rings a registered local extension locally instead of sending it out the trunk (#799; #796).
+- OPTIONS keepalives and relayed BYEs address the phone's registered Contact, URI parameters kept (#801; #797, #798).
+- A refused pool allocation no longer leaves a session half-done (#777; #715).
+- A callee's unnamed final failure is relayed or ACKed (#781; #746).
+- Ring-all, 999 and zone calls drop the pending member by To on all-busy (#805; #803).
+- A group call's caller ACK, BYE and CANCEL dispatch on session state, not the To number (#806; #802).
+- Park: a parked party's BYE ends the Session; a park timeout no longer leaks it (#807; #804).
 
 ### Trunk
 
@@ -80,6 +99,11 @@ bench-verified here.
 - The trunk INVITE log names its destination, local port and From user (#620; #618).
 - Timer E retransmit for REGISTER; forged REGISTER responses are counted (#654; #617).
 - Power-of-two logging for forged trunk responses; counts in `/api/status` (#664; #663).
+- A 401/407 to our BYE is answered once with digest credentials (#694; #687).
+- Every REGISTER final response and the full outbound INVITE are logged (#685; #618).
+- A REGISTER 2xx registers only when it lists our binding (#732; #686).
+- `/api/kill` on a trunk call sends the carrier BYE (#778; #714).
+- A handset CANCEL cancels a ringing carrier leg and answers the handset 487 (#779; #747).
 
 ### Memory and no-heap
 
@@ -117,6 +141,12 @@ bench-verified here.
 - Reset journal: append-only slots (#610; #595).
 - Dynamic task creates since boot are counted on `/api/status` `memory.dynamicTaskCreates` (#628; #479).
 - `/metrics` makes no allocations per scrape (#633; #630).
+- `tel_media_rx` runs on a per-call-slot static stack (#661; #479 part A); the slot is counted in the 72 KB budget and `RxTaskArg` lives in it (#673).
+- Each slot's `rxDoneSem` is created once and drained per rx start (#680; #679).
+- One `printLogs()` replaces 13 copies of the setter log-flush loop (#705; #702).
+- `refuseInvite()` replaces three copies of the INVITE refusal lambda (#706; #702).
+- Three per-message `std::string` copies become `string_view` lookups (#707; #702).
+- L2 queries the local IP only when the egress channel re-resolves, not per frame (#730; #702).
 
 ### Dashboard
 
@@ -130,6 +160,7 @@ bench-verified here.
 - Learn mode does not lock an extension until it is secured (#648; #643).
 - A banner shows while the admin login is unset, and admin-status errors are shown (#649; #644).
 - Reboot with `confirm=1` does a plain reboot when no OTA image is staged (#650; #645).
+- Config export and import carry the trunk, SMTP, E911 and `admin_ext` settings (#738; #483).
 
 ### Security
 
@@ -154,6 +185,7 @@ bench-verified here.
 - A replayed digest nonce/nc is re-challenged, not admitted (#570; #525).
 - Digest nonces are stamped with the monotonic clock, so a wall-clock step cannot strand phones (#584).
 - The Wi-Fi SoftAP passphrase is drawn with the SAR ADC entropy source on (#590; #588).
+- New Learn adoptions are rate-limited; one action forgets every Learned device (#727; #515).
 
 ### Docs
 
@@ -177,6 +209,9 @@ bench-verified here.
 - Every `/api/status` field documented (#619).
 - Registrar default, G.722 advice and `/api/cdr` gating match the code (#626).
 - Learn mode does not lock unsecured extensions (#653).
+- README matches main on `/api/cdr` gating, SIP trunk REGISTER and other drift (#674).
+- Harness notes: EN-line reset, esptool 5.4.0, DTR-false reboot (#703; #338).
+- heap_trace: the 360/900 s and periodic dumps are unreachable, stated as such (#704; #374).
 
 ### CI, tests, tools and diagnostics
 
@@ -223,6 +258,14 @@ bench-verified here.
 - Harness `same_commit` compares commit hashes, not describe strings (#607; #593).
 - The timeout-fail seam fails only the option a test asks for (#623; #616).
 - Per-route allocation gate with a calibrated allowlist (#627; #410).
+- The constrained 4 MB profile compiles at `-Os` (#728; #689).
+- The clang-tidy safety ratchet is back at baseline (#729; #697).
+- Interop: baresip answers calls manually (#696).
+- CI applies the heap profiles' sdkconfig defaults at set-target (#699).
+- The #457 stack gate reads real Xtensa `.ci` output (#708).
+- Dead code removed: `sendConfigCfg`, `getParkedCalls`, two unread snapshot fields; two stale comments fixed (#710; #702).
+- `repliesRefused` and `optionsPingTruncated` on `/api/status`; `packetsDropped` is derived (#735; #702).
+- `updateAddressing` test calls the `shouldResolveArp()` it pins (#711; #702).
 
 ## v1.5.0-beta.2 — 2026-09-14
 
