@@ -9458,7 +9458,11 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	const std::string& registeredUri = client->getContactUri();
 	if (registeredUri.empty())
 	{
-		std::snprintf(fallbackUri, sizeof(fallbackUri), "sip:%.*s@%s:%u", numLen, num.data(), destIp, destPort);
+		const int u = std::snprintf(fallbackUri, sizeof(fallbackUri), "sip:%.*s@%s:%u", numLen, num.data(), destIp, destPort);
+		if (u <= 0 || static_cast<size_t>(u) >= sizeof(fallbackUri))
+		{
+			return nullptr;   // unreachable with a <=64-char AOR; same "no ping this round" contract as below
+		}
 	}
 	const char* const requestUri = registeredUri.empty() ? fallbackUri : registeredUri.c_str();
 
