@@ -87,29 +87,29 @@ namespace
 	// `payloadType` 0 is PCMU, which every route accepts; 8 alone is the
 	// PCMA-only offer the anchor's codec gate rejects (issue #314).
 	std::shared_ptr<SipMessage> makeInvite(const std::string& dialed, const std::string& callId,
-		int payloadType = 0)
+		int payloadType = 0, const std::string& ext = "101", const std::string& ip = kHandsetIp)
 	{
 		const std::string rtpmap = payloadType == 8 ? "a=rtpmap:8 PCMA/8000\r\n"
 		                                            : "a=rtpmap:0 PCMU/8000\r\n";
 		const std::string body =
 			"v=0\r\n"
-			"o=- 0 0 IN IP4 " + std::string(kHandsetIp) + "\r\n"
+			"o=- 0 0 IN IP4 " + ip + "\r\n"
 			"s=-\r\n"
-			"c=IN IP4 " + std::string(kHandsetIp) + "\r\n"
+			"c=IN IP4 " + ip + "\r\n"
 			"t=0 0\r\n"
 			"m=audio 40000 RTP/AVP " + std::to_string(payloadType) + "\r\n" + rtpmap;
 		const std::string raw =
 			"INVITE sip:" + dialed + "@server SIP/2.0\r\n"
-			"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKei" + callId + "\r\n"
-			"From: <sip:101@server>;tag=ef" + callId + "\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKei" + callId + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=ef" + callId + "\r\n"
 			"To: <sip:" + dialed + "@server>\r\n"
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 1 INVITE\r\n"
 			"Max-Forwards: 70\r\n"
-			"Contact: <sip:101@" + std::string(kHandsetIp) + ":5060>\r\n"
+			"Contact: <sip:" + ext + "@" + ip + ":5060>\r\n"
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
-		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
 	}
 
 	// Ext 101 registered, every outbound message captured with its address.
@@ -712,4 +712,225 @@ TEST(EmergencyRoute, ANineOneOneDialedWhileTheLastAnchorLegIsCancellingIsPlaced)
 	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
 		<< "the provider must be asked to dial 911, as outside the window";
 	EXPECT_EQ(b.count("SIP/2.0 200"), 1u) << b.dump();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// E. #624: a 911 on a full anchor pre-empts one NON-emergency anchored leg.
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The host anchor is Loopback, so the anchor holds one call (anchorCallLimit()
+// is 1), the same as a SIP_CONSTRAINED board. Loopback stands in for the real
+// provider, as in section D. 102 on a second phone holds the slot; 101 dials.
+
+namespace
+{
+	constexpr const char* kOtherIp = "192.168.79.12";
+
+	// A Bench whose loopback counts as a real provider, with 102 registered.
+	void preemptBench(Bench& b)
+	{
+		b.handler->setAnchorPlacesRealCallsForTest(true);
+		b.handler->handle(makeRegister("102", kOtherIp));
+		b.sent.clear();
+	}
+}
+
+TEST(EmergencyRoute, ANineOneOneOnAFullAnchorPreEmptsANormalCall)
+{
+	Bench b;
+	preemptBench(b);
+	b.handler->handle(makeInvite("555", "er-pre-1", 0, "102", kOtherIp));
+	ASSERT_EQ(b.count("SIP/2.0 200", kOtherIp), 1u) << "102's call must hold the bridge:\n" << b.dump();
+	b.sent.clear();
+
+	b.handler->handle(makeInvite("911", "er-pre-911"));
+
+	EXPECT_EQ(b.count("SIP/2.0 503"), 0u) << "911 refused on a full anchor:\n" << b.dump();
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911");
+	EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("BYE sip:102@", kOtherIp), 1u) << "the pre-empted caller gets a BYE:\n" << b.dump();
+	EXPECT_EQ(b.loopback()->dropCallCount(), 1u) << "exactly one anchored leg is dropped";
+	EXPECT_FALSE(b.handler->getSession("Call-ID: er-pre-1").has_value());
+	auto s = b.handler->getSession("Call-ID: er-pre-911");
+	ASSERT_TRUE(s.has_value()) << b.dump();
+	EXPECT_TRUE(s.value()->isEmergency());
+	EXPECT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: er-pre-911"), nullptr);
+}
+
+TEST(EmergencyRoute, ANineOneOneNeverPreEmptsAnotherEmergencyCall)
+{
+	Bench b;
+	preemptBench(b);
+	b.handler->handle(makeInvite("911", "er-pre-e1", 0, "102", kOtherIp));
+	// Positive control: the first 911 is up, flagged, and holds the only bridge.
+	auto first = b.handler->getSession("Call-ID: er-pre-e1");
+	ASSERT_TRUE(first.has_value()) << b.dump();
+	ASSERT_TRUE(first.value()->isEmergency());
+	ASSERT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: er-pre-e1"), nullptr);
+	b.sent.clear();
+
+	b.handler->handle(makeInvite("911", "er-pre-e2"));
+
+	EXPECT_EQ(b.count("SIP/2.0 503", kHandsetIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("BYE"), 0u) << "an emergency call was pre-empted:\n" << b.dump();
+	EXPECT_EQ(b.loopback()->dropCallCount(), 0u);
+	EXPECT_TRUE(b.handler->getSession("Call-ID: er-pre-e1").has_value());
+	EXPECT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: er-pre-e1"), nullptr);
+}
+
+TEST(EmergencyRoute, ANineOneOnePreEmptsARingingLegHoldingTheOnlySlot)
+{
+	// #667: a ringing outbound leg holds the provider's slot but no bridge, and
+	// one that vanishes in its 120 s ringing grace keeps holding it. The async
+	// path's shape is recreated on the session (as AnchorRouting's #548 test
+	// does): Invited, bridge stopped, its INVITE stored for the final answer.
+	Bench b;
+	preemptBench(b);
+	b.handler->handle(makeInvite("555", "er-ring-1", 0, "102", kOtherIp));
+	auto ringing = b.handler->getSession("Call-ID: er-ring-1");
+	ASSERT_TRUE(ringing.has_value()) << b.dump();
+	ringing.value()->setState(Session::State::Invited);
+	ringing.value()->setInviteMessage(makeInvite("555", "er-ring-1", 0, "102", kOtherIp));
+	b.handler->anchorBridgeForCallIdForTest("Call-ID: er-ring-1")->stopBridge();
+	b.sent.clear();
+
+	b.handler->handle(makeInvite("911", "er-ring-911"));
+
+	EXPECT_EQ(b.loopback()->dropCallCount(), 1u) << "the ringing leg's slot must be freed";
+	EXPECT_FALSE(b.handler->getSession("Call-ID: er-ring-1").has_value());
+	EXPECT_EQ(b.count("SIP/2.0 503", kOtherIp), 1u) << "the ringing caller gets a final answer:\n" << b.dump();
+	EXPECT_EQ(b.count("BYE"), 0u) << "a call still ringing gets its 503, not a BYE:\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 503", kHandsetIp), 0u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << b.dump();
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911");
+}
+
+TEST(EmergencyRoute, ANineOneOnePreEmptsARingingInboundCallAndCancelsItsForks)
+{
+	// A PSTN call still ringing the extensions holds the only slot as well.
+	Bench b;
+	preemptBench(b);
+	const std::string inbound = b.handler->routeInboundAnchorCallForTest("106", "part-in-624", "5551234567");
+	ASSERT_FALSE(inbound.empty()) << "precondition: an inbound anchored call is ringing";
+	b.handler->tick();   // drainOutbox() sends the fork INVITEs from _asyncOutbox
+	ASSERT_EQ(b.count("INVITE sip:102@", kOtherIp), 1u) << "precondition: 102 is rung:\n" << b.dump();
+	b.sent.clear();
+
+	b.handler->handle(makeInvite("911", "er-in-911"));
+
+	EXPECT_EQ(b.count("CANCEL sip:102@", kOtherIp), 1u) << "102 must stop ringing:\n" << b.dump();
+	EXPECT_EQ(b.loopback()->dropCallCount(), 1u) << "the PSTN leg is dropped";
+	EXPECT_FALSE(b.handler->getSession(inbound).has_value());
+	EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << b.dump();
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911");
+
+}
+// ═════════════════════════════════════════════════════════════════════════════
+// F. #659: a call to an extension that dialed 911/933 in the last 30 minutes is
+// a PSAP callback, and so an emergency call. The 911 goes to the loopback anchor
+// posing as a real provider; the callback is an inbound anchor event or an
+// internal call. Nothing leaves the process.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+	constexpr const char* kThirdIp = "192.168.79.13";
+
+	std::shared_ptr<SipMessage> makeCall(const std::string& from, const char* ip,
+		const std::string& to, const std::string& callId)
+	{
+		const std::string body =
+			"v=0\r\no=- 0 0 IN IP4 " + std::string(ip) + "\r\ns=-\r\n"
+			"c=IN IP4 " + std::string(ip) + "\r\nt=0 0\r\n"
+			"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+		const std::string raw =
+			"INVITE sip:" + to + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(ip) + ":5060;branch=z9hG4bK" + callId + "\r\n"
+			"From: <sip:" + from + "@server>;tag=f" + callId + "\r\n"
+			"To: <sip:" + to + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + from + "@" + std::string(ip) + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
+	}
+
+	// 101 dials 911, then hangs up: no emergency call is live afterwards.
+	void dial911AndHangUp(Bench& b)
+	{
+		b.handler->setAnchorPlacesRealCallsForTest(true);
+		b.handler->handle(makeInvite("911", "er-659"));
+		ASSERT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
+		b.handler->handle(RequestsHandler::getMessageFromPool(
+			"BYE sip:911@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKer659bye\r\n"
+			"From: <sip:101@server>;tag=efer-659\r\n"
+			"To: <sip:911@server>;tag=srv\r\n"
+			"Call-ID: er-659\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n", addrFor(kHandsetIp)));
+		ASSERT_FALSE(b.handler->hasLiveEmergencyCall()) << "precondition: the 911 has ended";
+	}
+}
+
+TEST(EmergencyCallback, AnAnchorCallbackWithinThirtyMinutesIsAnEmergencyCall)
+{
+	Bench b;
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	b.handler->ageEmergencyCallbacksForTest(std::chrono::minutes(29));
+
+	const std::string id = b.handler->routeInboundAnchorCallForTest("800", "psap-659", "PSAP");
+	const auto s = b.handler->getSession(id);
+	ASSERT_TRUE(s.has_value()) << "the callback must ring 101:\n" << b.dump();
+	EXPECT_TRUE(s.value()->isEmergency()) << "29 min after the 911, a call to 101 is a PSAP callback";
+}
+
+TEST(EmergencyCallback, AnInternalCallbackWithinThirtyMinutesIsAnEmergencyCall)
+{
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-659-in"));
+	const auto s = b.handler->getSession("Call-ID: er-659-in");
+	ASSERT_TRUE(s.has_value()) << b.dump();
+	EXPECT_TRUE(s.value()->isEmergency());
+}
+
+TEST(EmergencyCallback, ACallbackAfterThirtyMinutesIsNot)
+{
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+
+	b.handler->ageEmergencyCallbacksForTest(std::chrono::minutes(29));
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-659-29"));
+	const auto inside = b.handler->getSession("Call-ID: er-659-29");
+	ASSERT_TRUE(inside.has_value()) << b.dump();
+	ASSERT_TRUE(inside.value()->isEmergency()) << "control: flagged inside the window";
+
+	b.handler->ageEmergencyCallbacksForTest(std::chrono::minutes(2));
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-659-31"));
+	const auto after = b.handler->getSession("Call-ID: er-659-31");
+	ASSERT_TRUE(after.has_value()) << b.dump();
+	EXPECT_FALSE(after.value()->isEmergency()) << "31 min after the 911 the window has closed";
+}
+
+TEST(EmergencyCallback, ACallToAnotherExtensionIsNot)
+{
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	b.handler->handle(makeRegister("103", kThirdIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+
+	b.handler->handle(makeCall("103", kThirdIp, "102", "er-659-other"));
+	b.handler->handle(makeCall("101", kHandsetIp, "102", "er-659-out"));
+	b.handler->handle(makeCall("103", kThirdIp, "101", "er-659-ctl"));
+	const auto other = b.handler->getSession("Call-ID: er-659-other");
+	const auto out = b.handler->getSession("Call-ID: er-659-out");
+	const auto ctl = b.handler->getSession("Call-ID: er-659-ctl");
+	ASSERT_TRUE(other.has_value() && out.has_value() && ctl.has_value()) << b.dump();
+	EXPECT_FALSE(other.value()->isEmergency()) << "102 never dialed 911";
+	EXPECT_FALSE(out.value()->isEmergency()) << "a call FROM the 911 caller is not a callback";
+	EXPECT_TRUE(ctl.value()->isEmergency()) << "control: the same call to 101 is flagged";
 }

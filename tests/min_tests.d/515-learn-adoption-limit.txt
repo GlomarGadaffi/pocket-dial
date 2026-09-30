@@ -1,0 +1,2 @@
+# LearnAdoptionLimit_test.cpp: 5 + AdminHttpGate Registrar.ForgetLearned...: 1 (#515 items 2 and 3)
+6

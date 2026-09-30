@@ -128,6 +128,17 @@ size_t patchTick(uint8_t* buf, bool marker, uint8_t payloadType,
 
 bool EgressChannel::updateAddressing(const sockaddr_in& dest, uint16_t srcPort, uint32_t ssrc)
 {
+	// The pinned helper decides the cadence (L2EgressChannel_test); the counter
+	// only advances while resolved, exactly as before. Between re-resolves the
+	// cached template stands, so the netif lookup below no longer runs per
+	// frame (50 Hz per stream). #702 item 14, accepted by desmo: an IP lost
+	// mid-stream is now noticed at the next re-resolve (<= 250 ticks, ~5 s);
+	// until then esp_eth_transmit failures fall back to the socket.
+	if (ready && !shouldResolveArp(ready, ++resolveTicks))
+	{
+		return true;
+	}
+
 	uint32_t localIp = 0, localGw = 0, localNetmask = 0;
 	if (!EthAccess::getLocalIpInfo(localIp, localGw, localNetmask))
 	{
@@ -135,7 +146,6 @@ bool EgressChannel::updateAddressing(const sockaddr_in& dest, uint16_t srcPort, 
 		return false;
 	}
 
-	if (!ready || (++resolveTicks % 250u) == 0u)
 	{
 		uint32_t destIpHost = ntohl(dest.sin_addr.s_addr);
 		uint32_t nextHopHost = resolveNextHop(destIpHost, localIp, localGw, localNetmask);

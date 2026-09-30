@@ -55,6 +55,17 @@
 #define POCKETDIAL_MAX_SUBSCRIPTIONS 16
 #endif
 
+// RFC 3842 message-waiting (MWI). Shares the BLF subscription table above; the
+// per-mailbox {new, old} counts live in a fixed table of POCKETDIAL_MWI_MAILBOXES
+// entries (~36 B each). 0 compiles MWI out (SIP_CONSTRAINED sets it): the
+// package is then refused 489 like any other.
+#ifndef POCKETDIAL_MWI
+#define POCKETDIAL_MWI 1
+#endif
+#ifndef POCKETDIAL_MWI_MAILBOXES
+#define POCKETDIAL_MWI_MAILBOXES 32
+#endif
+
 // Depth of the shared in-flight SipMessage scratch pool.
 //
 // The worst-case simultaneous draw happens when a 999 all-page builds one forked

@@ -1,0 +1,2 @@
+# SipTrunk_test.cpp: 2 (#618: REGISTER final-response log line; full INVITE log with Authorization redacted)
+2
