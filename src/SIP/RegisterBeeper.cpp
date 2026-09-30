@@ -150,7 +150,7 @@ bool RegisterBeeper::handleOk(const std::shared_ptr<SipMessage>& data)
 		cseq.find(SipMessageTypes::INVITE) != std::string::npos)
 	{
 		const bool racedCancel = (bd->state == BeepState::AwaitingCancelDone);
-		auto ack = buildAck(*bd, data);
+		auto ack = buildAck(*bd, data, true);   // 2xx ACK: fresh branch (#752)
 		if (ack) _env.enqueue(bd->addr, std::move(ack));
 		auto bye = buildBye(*bd, data);
 		if (!bye)
@@ -300,7 +300,7 @@ bool RegisterBeeper::handleInviteFailure(const std::shared_ptr<SipMessage>& data
 		// buildAck() already stamps the INVITE's Call-ID/branch/From-tag and takes
 		// the To tag off the response, which is exactly what §17.1.1.3 wants for a
 		// non-2xx ACK — it travels in the same transaction as the INVITE.
-		auto ack = buildAck(*bd, data);
+		auto ack = buildAck(*bd, data, false);
 		if (!ack)
 		{
 			// Pool exhausted. Stay in this state so the phone's retransmitted
@@ -319,17 +319,21 @@ bool RegisterBeeper::handleInviteFailure(const std::shared_ptr<SipMessage>& data
 }
 
 std::shared_ptr<SipMessage> RegisterBeeper::buildAck(const BeepDialog& bd,
-	const std::shared_ptr<SipMessage>& ok)
+	const std::shared_ptr<SipMessage>& ok, bool for2xx)
 {
-	// ACK the phone's 200 OK to our beep INVITE (RFC 3261 §13.2.2.4 / §17.1.1.3).
-	// Same Call-ID/branch/From-tag as the INVITE; To carries the phone's tag from the
-	// 200. CSeq stays "1 ACK" (matches the INVITE transaction). No body.
+	// ACK the phone's final response to our beep INVITE (RFC 3261 §13.2.2.4 / §17.1.1.3).
+	// Same Call-ID/From-tag as the INVITE; To carries the phone's tag from the
+	// response. CSeq stays "1 ACK". No body. Via branch: a non-2xx ACK is part of the
+	// INVITE transaction and reuses its branch; the ACK for a 2xx is a new transaction
+	// and needs a fresh one (#752), or a strict phone drops it as an INVITE
+	// retransmission and keeps re-sending its 200.
+	const std::string branch = for2xx ? "z9hG4bK" + IDGen::GenerateID(12) : bd.branch;
 	const std::string destIpPort = addrToIpPort(bd.addr);
 	const std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
 
 	std::ostringstream ss;
 	ss << "ACK sip:" << bd.ext << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd.branch << "\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
 	   << "From: \"PocketDial\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
 	   << "To: " << siphdr::stripHeaderName(ok->getTo()) << "\r\n"
 	   << "Call-ID: " << bd.callID << "\r\n"

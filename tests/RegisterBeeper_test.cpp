@@ -32,6 +32,15 @@ namespace
 		p += 9;
 		return raw.substr(p, raw.find("\r\n", p) - p);
 	}
+
+	// The Via branch value of a raw request.
+	std::string branchOf(const std::string& raw)
+	{
+		auto p = raw.find(";branch=");
+		if (p == std::string::npos) return {};
+		p += 8;
+		return raw.substr(p, raw.find_first_of(";\r\n", p) - p);
+	}
 }
 
 TEST(RegisterBeeper, AnsweredBeepAcksAndByesWithWellFormedHeaders)
@@ -329,4 +338,54 @@ TEST(RegisterBeeper, APendingBeepMatchesNoResponse)
 	EXPECT_FALSE(beeper.handleOk(okFor("", phoneAddr)));
 	EXPECT_FALSE(beeper.ownsCallID("Call-ID: "));
 	EXPECT_TRUE(env.sent.empty());
+}
+
+// Issue #752: the ACK for the phone's 200 is a new transaction (RFC 3261
+// §13.2.2.4, §17.1.1.3) and needs a fresh Via branch. Reusing the INVITE's lets
+// a strict phone take it for a retransmission of the terminated INVITE, drop it,
+// and keep re-sending its 200 until Timer H.
+TEST(RegisterBeeper, TheAckForA2xxCarriesAFreshViaBranch)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr));
+	const std::string inviteBranch = branchOf(env.sentRaw(0));
+	ASSERT_FALSE(inviteBranch.empty());
+
+	ASSERT_TRUE(beeper.handleOk(okFor(callIdOf(env.sentRaw(0)), phoneAddr)));
+	const std::string ack = env.sentRaw(1);
+	ASSERT_EQ(ack.rfind("ACK sip:101@", 0), 0u) << ack;
+	const std::string ackBranch = branchOf(ack);
+	EXPECT_NE(ackBranch, inviteBranch) << ack;
+	EXPECT_EQ(ackBranch.rfind("z9hG4bK", 0), 0u) << "RFC 3261 magic cookie: " << ack;
+}
+
+// Control: an ACK for a non-2xx belongs to the INVITE's own transaction and keeps
+// its branch (§17.1.1.3), so the #752 change must not touch this one.
+TEST(RegisterBeeper, TheAckForANon2xxKeepsTheInvitesViaBranch)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr));
+	const std::string inviteBranch = branchOf(env.sentRaw(0));
+	const std::string callId = callIdOf(env.sentRaw(0));
+	ASSERT_FALSE(inviteBranch.empty());
+
+	const std::string busy =
+		"SIP/2.0 486 Busy Here\r\n"
+		"Via: SIP/2.0/UDP 192.168.1.10:5060;branch=" + inviteBranch + "\r\n"
+		"From: \"PocketDial\" <sip:pbx@192.168.1.10:5060>;tag=servertag\r\n"
+		"To: <sip:101@192.168.1.10>;tag=phonetag\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	ASSERT_TRUE(beeper.handleInviteFailure(std::make_shared<SipMessage>(busy, phoneAddr)));
+	ASSERT_EQ(env.sent.size(), 2u);
+	const std::string ack = env.sentRaw(1);
+	ASSERT_EQ(ack.rfind("ACK sip:101@", 0), 0u) << ack;
+	EXPECT_EQ(branchOf(ack), inviteBranch) << ack;
 }

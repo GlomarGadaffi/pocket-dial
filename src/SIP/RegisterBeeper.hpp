@@ -148,7 +148,8 @@ private:
 	// buildAck/buildBye take the dialog handleOk() already located — they used to
 	// re-scan the table by Call-ID themselves, three linear passes over the same
 	// Call-ID per answered beep, all inside the _mutex-held 200-OK dispatch.
-	std::shared_ptr<SipMessage> buildAck(const BeepDialog& bd, const std::shared_ptr<SipMessage>& ok);
+	// for2xx: the ACK for a 2xx takes a fresh Via branch; a non-2xx ACK reuses the INVITE's (#752).
+	std::shared_ptr<SipMessage> buildAck(const BeepDialog& bd, const std::shared_ptr<SipMessage>& ok, bool for2xx);
 	std::shared_ptr<SipMessage> buildBye(const BeepDialog& bd, const std::shared_ptr<SipMessage>& ok);
 	std::shared_ptr<SipMessage> buildCancel(std::size_t slot);
 
