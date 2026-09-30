@@ -1002,6 +1002,7 @@ Disconnects a specified VoIP station, removing its registration and terminating 
 * Response Status Codes:
   * `200 OK`: Request accepted. See the note below on what this does *not* tell you.
   * `400 Bad Request`: `{"error":"missing extension parameter"}`, the body contains no `extension=`, or the value after it is empty.
+  * `409 Conflict`: `{"error":"extension is on an emergency call"}`. An admin kill never ends a 911/933 call (#714): nothing is disconnected and the extension stays registered.
   * `401`/`403`: gates 1-4 as in §0.1.
 
 > [!NOTE]
@@ -1019,8 +1020,8 @@ Disconnects a specified VoIP station, removing its registration and terminating 
 > [!NOTE]
 > **`200` means "the request was well-formed", not "an extension was disconnected".**
 > `RequestsHandler::forceDisconnect()` walks the client pool, releases the first
-> matching registration and returns nothing; an extension that is not registered is a
-> no-op. The response echoes back whatever string you sent either way. Read
+> matching registration and reports only whether it was refused (an emergency call,
+> `409`); an extension that is not registered is a no-op. The response echoes back whatever string you sent either way. Read
 > [`GET /api/status`](#get-apistatus)'s `clients[]` to confirm the registration is
 > actually gone.
 

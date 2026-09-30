@@ -7815,11 +7815,11 @@ std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHand
 	return _snapshot.sessions;
 }
 
-void RequestsHandler::forceDisconnect(const std::string& extension)
+bool RequestsHandler::forceDisconnect(const std::string& extension)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::unique_lock<std::mutex> lock(_mutex);
 		queueLog("Admin: force-disconnecting extension " + extension);
 		// Issue #228: tear down every dialog this extension is on the way every
 		// other server-initiated teardown does — BYE the phones, THEN endCall().
@@ -7855,10 +7855,24 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 				involved.push_back(callID);
 			}
 		}
-		// Issue #714: nothing here owns _outbox. Cleared so the move after the
-		// loop carries only what endCall() queued, never a leftover from a pass
-		// that returned early (handle()/tick() clear it first thing anyway).
-		_outbox.clear();
+		// Issue #714 (desmo): an admin kill never ends a 911/933 call, and it does not
+		// half-kill one either: releasing the registration below would blank the
+		// number the emergency call's BYE and CDR still read. The whole request is
+		// refused, changing nothing, and /api/kill answers 409.
+		for (const auto& callID : involved)
+		{
+			auto it = _sessions.find(callID);
+			if (it != _sessions.end() && it->second->isEmergency())
+			{
+				queueLog("Admin: refused to force-disconnect extension " + extension +
+				         ": it is on an emergency call", true);
+				localLogs = std::move(_logQueue);
+				_logQueue.clear();
+				lock.unlock();
+				printLogs(localLogs);
+				return false;
+			}
+		}
 		for (const auto& callID : involved)
 		{
 			auto it = _sessions.find(callID);
@@ -7927,6 +7941,7 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 	}
 
 	printLogs(localLogs);
+	return true;
 }
 
 uint64_t RequestsHandler::getPacketsProcessed() const
