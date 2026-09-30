@@ -2028,22 +2028,16 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 		}
 	}
 
-	// #798: a final answer to a BYE this PBX relayed ends the session whatever it
+	// #798: a final answer to the BYE this PBX sent ends the session whatever it
 	// says (RFC 3261 §15.1.2: a 481 in particular means the far phone already
 	// considers the dialog gone). Only a 200 used to free it, so a phone that
-	// refused the BYE left the slot allocated for good. The hanging-up phone is
-	// answered 200, as it would have been.
+	// refused the BYE left the slot allocated for good. The hanging-up phone has
+	// already been answered 200 by onBye() (#808).
 	if (data->getCSeqMethod() == SipMessageTypes::BYE)
 	{
 		auto session = getSession(data->getCallID());
 		if (session.has_value() && session.value()->getState() == Session::State::Bye)
 		{
-			if (auto ok = getMessageFromPool(*data))
-			{
-				ok->setHeader(SipMessageTypes::OK);
-				ok->clearBody();
-				endHandle(data->getFromNumber(), std::move(ok));
-			}
 			endCall(data->getCallID(), data->getToNumber(), data->getFromNumber());
 			return;
 		}
@@ -6265,6 +6259,62 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// An ordinary relayed call (#808). Relaying the sender's BYE untouched keeps
+	// only the sender's Via, so the far phone answers it to the sender's port on
+	// the PBX's IP (RFC 3261 §18.2.2) and neither the PBX nor the sender ever sees
+	// the 200: the sender retransmits until Timer F and the session leaks. This PBX
+	// is a B2BUA, so it answers the sender itself and originates its own BYE, whose
+	// Via and branch are the PBX's (§8.1.1.7) and whose Request-URI is the far
+	// phone's registered Contact (#798, §12.2.1.1). The far phone's answer ends the
+	// session (onOk, onFinalFailure); one that never comes ends it at Timer F
+	// (onByeTimedOut).
+	if (session.has_value())
+	{
+		const auto src  = session.value()->getSrc();
+		const auto dest = session.value()->getDest();
+		// Dispatch on the session, not on the To number (rule 2): the far leg is
+		// whichever one the sender is not.
+		std::shared_ptr<SipClient> far;
+		if (src && dest)
+		{
+			if (data->getFromNumber() == src->getNumber())       far = dest;
+			else if (data->getFromNumber() == dest->getNumber()) far = src;
+		}
+		if (far)
+		{
+			// A BYE already in flight for this dialog: a retransmit that got past the
+			// transaction layer, or both phones hanging up at once. Answer, originate
+			// nothing further.
+			const bool inFlight = session.value()->getState() == Session::State::Bye;
+			// Drawn before any state is committed (#715): on a refusal the sender
+			// retransmits and this runs again from scratch.
+			auto response = getMessageFromPool(*data);
+			if (!response) return;
+			std::shared_ptr<SipMessage> bye;
+			uint32_t byeCSeq = 0;
+			if (!inFlight)
+			{
+				byeCSeq = session.value()->nextServerCSeq();
+				// The sender's own From/To are the dialog as the far phone knows it.
+				bye = buildServerBye(far->getNumber(), far->getAddress(), std::string(data->getCallID()),
+					std::string(data->getFrom()), std::string(data->getTo()), byeCSeq);
+				if (!bye) return;
+			}
+			response->setHeader(SipMessageTypes::OK);
+			response->clearBody();
+			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			_outbox.emplace_back(data->getSource(), std::move(response));
+			if (bye)
+			{
+				session.value()->noteServerCSeq(byeCSeq);
+				setCallState(data->getCallID(), Session::State::Bye);
+				setCallDisposition(data->getCallID(), Session::Disposition::Bye);   // #690, same writer as the generic path below
+				_outbox.emplace_back(far->getAddress(), std::move(bye));
+			}
+			return;
+		}
+	}
+
 	setCallState(data->getCallID(), Session::State::Bye);
 	// #798: the sender addressed this BYE to the PBX. The far phone gets its own
 	// registered Contact, or a Snom answers 481 for want of its ;line= (RFC 3261
@@ -6574,7 +6624,8 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 
 		if (session.value()->getState() == Session::State::Bye)
 		{
-			endHandle(data->getFromNumber(), data);
+			// The 200 to the PBX's own BYE (#808). The hanging-up phone was answered
+			// when its BYE arrived; relaying this would hand it a second final.
 			endCall(data->getCallID(), data->getToNumber(), data->getFromNumber());
 		}
 	}

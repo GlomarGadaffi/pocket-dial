@@ -58,6 +58,12 @@ struct PbxEnv
 	// has nothing to end.
 	virtual void endSession(std::string_view /*callId*/, std::string_view /*reason*/) {}
 
+	// A BYE this PBX originated drew no final response in 32 s (Timer F, RFC 3261
+	// §17.1.2.2), so nothing will ever tell the session its far leg is gone. Called
+	// with that BYE's Call-ID; the env decides whether a session is waiting on it
+	// (#808). Not pure: an env with no session table has nothing to end.
+	virtual void onByeTimedOut(std::string_view /*callId*/) {}
+
 	// Append to the deferred log queue (flushed off-lock).
 	virtual void log(std::string msg, bool isError = false) = 0;
 	// Issue #450: the DTMF factory-reset door wipes the SD voicemail archive, as
