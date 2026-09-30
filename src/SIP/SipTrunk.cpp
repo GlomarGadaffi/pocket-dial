@@ -172,7 +172,11 @@ std::string SipTrunk::buildInvite(const Dialog& d, const std::string& sdp, std::
 	   // Advertise what we can actually be sent. Omitting Allow is legal but
 	   // invites a carrier to try a re-INVITE or UPDATE we would have to 405.
 	   << "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n"
-	   << "Supported: timer\r\n"
+	   // No "Supported: timer" (#753). It tells the carrier it may pick itself as
+	   // RFC 4028 refresher and send a session refresh, and the trunk leg does
+	   // not answer one with a 2xx; RFC 4028 section 10 then ends the call at
+	   // the first session interval. Claim it again only once the leg answers
+	   // refreshes.
 	   << "Content-Type: application/sdp\r\n"
 	   << "Content-Length: " << sdp.size() << "\r\n\r\n"
 	   << sdp;
