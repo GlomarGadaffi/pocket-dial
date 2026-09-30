@@ -35,6 +35,12 @@
 # whatever remains in the buffer at dump time is by construction what leaked,
 # with the call stack that allocated it. main/HeapLeakProbe.cpp arms it at boot
 # and dumps at 120/240/360/900 s, bracketing the measured onset.
+#
+# #374: in practice at most the 120/240 s dumps arrive. No boot of this build on
+# .244 has reached t=360 s (7 boots: 5 asserted in tasks.c:3642, one of them
+# before the 120 s dump; 2 ended early for other reasons), so the 360/900 s
+# dumps and the periodic phase are unreachable until #374 is fixed. Measured
+# before #373/#436 freed internal DRAM; not re-soaked since.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # The trace itself. STANDALONE keeps records in a buffer on the device

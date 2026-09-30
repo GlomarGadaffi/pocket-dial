@@ -247,6 +247,10 @@ public:
 		std::string challengedBranch;
 		std::string challengedToTag;
 		uint32_t    challengedCseq = 0;
+		// Issue #687: whether a 401/407 to our BYE has been answered. Its own
+		// flag: the INVITE's challenge and the BYE's are separate transactions,
+		// and each gets exactly one credentialed retry.
+		bool        byeAuthAttempted = false;
 
 		sockaddr_in peer{};
 		std::chrono::steady_clock::time_point deadline{};
@@ -291,7 +295,11 @@ public:
 	// dialog has no To-tag or no remote target -- there is no such thing as a
 	// well-formed in-dialog request without them, and emitting a half-formed BYE
 	// would earn a 481 while leaving the call up.
-	static std::string buildBye(const Dialog& d, std::string_view freshBranch);
+	// `authLine`, when non-empty, is a complete "Authorization: ..." or
+	// "Proxy-Authorization: ..." header line (no CRLF) answering a challenge
+	// to the previous BYE (#687); the BYE still takes d.cseq+1.
+	static std::string buildBye(const Dialog& d, std::string_view freshBranch,
+		std::string_view authLine = {});
 
 	// CANCEL for the INVITE still ringing (#747; RFC 3261 §9.1): the INVITE's own
 	// Request-URI, Via branch, From (with tag), To (no tag: the INVITE had none),
@@ -427,6 +435,11 @@ public:
 	uint32_t forgedDialogResponses() const { return _dialogForgedResponses.load(std::memory_order_relaxed); }
 	// #666: BYEs refused with 403 by handleBye()'s #356 check. Same shape.
 	uint32_t refusedDialogByes() const { return _dialogRefusedByes.load(std::memory_order_relaxed); }
+	// #687: our own BYEs whose credentialed retry, sent after a 401/407, was
+	// still answered non-2xx. The dialog is released regardless, so this is the
+	// one count that says a carrier leg may have been left up. Same shape;
+	// not yet surfaced by /api/status.
+	uint32_t refusedByeRetries() const { return _dialogRefusedByeRetries.load(std::memory_order_relaxed); }
 
 	// Test/diagnostic accessors. Cheap linear scans over a fixed array.
 	size_t activeDialogs() const;
@@ -485,6 +498,13 @@ private:
 	// locals (~1.1 KB on the SIP thread otherwise). Only touched under the
 	// engine's _mutex, like every other SipTrunk method.
 	bool answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status);
+	// Issue #687: the same, for a 401/407 to our BYE. Both go through
+	// credentialLine(), the one place a digest credential is built: it fills
+	// _authLine for `method` on `uri` and returns the line's length, or 0 when
+	// the challenge cannot be answered.
+	bool answerByeChallenge(Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status);
+	size_t credentialLine(const Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status,
+		std::string_view method, std::string_view uri);
 	SipDigest::BoundedChallenge _challenge{};
 	char _authLine[32 + SipDigest::kMaxAuthorizationValue] = {};
 
@@ -499,6 +519,7 @@ private:
 	std::atomic<uint32_t>          _regForgedResponses{0};
 	std::atomic<uint32_t>          _dialogForgedResponses{0};
 	std::atomic<uint32_t>          _dialogRefusedByes{0};
+	std::atomic<uint32_t>          _dialogRefusedByeRetries{0};   // #687
 
 	Listener* _listener = nullptr;
 	std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS> _dialogs{};

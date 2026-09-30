@@ -171,6 +171,18 @@ void Registrar::sendForbidden(const std::shared_ptr<SipMessage>& data, const std
 	_env.enqueue(data->getSource(), std::move(response));
 }
 
+void Registrar::sendRetryLater(const std::shared_ptr<SipMessage>& data, int retryAfterSeconds)
+{
+	auto response = _env.messageFromPool(data->toString(), data->getSource());
+	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+	response->setHeader("SIP/2.0 503 Service Unavailable");
+	response->clearBody();
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	response->addHeader("Retry-After", std::to_string(retryAfterSeconds));
+	response->syncContentLength();
+	_env.enqueue(data->getSource(), std::move(response));
+}
+
 Registrar::AuthDecision Registrar::admitSecure(
 	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason)
 {
@@ -307,7 +319,8 @@ bool Registrar::noteNonceUse(const std::string& nonce, uint32_t nc, std::chrono:
 }
 
 Registrar::AuthDecision Registrar::admitLearn(
-	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason)
+	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason,
+	std::chrono::steady_clock::time_point now)
 {
 	// Learn mode = TOFU + MAC-lock.
 	//   UNKNOWN mac            -> accept WITHOUT verifying, record {mac, ext, Learned}.
@@ -348,6 +361,32 @@ Registrar::AuthDecision Registrar::admitLearn(
 			_env.log("Learn REGISTER: device table full, rejecting " + mac, true);
 			return AuthDecision::Reject;
 		}
+		// #515: spend an adoption token. Credit whole periods since the last
+		// refill; a bucket that refills to full restarts its clock at `now`.
+		const auto earned = (now - _adoptRefillAt) / kAdoptRefill;
+		if (_adoptTokens + earned >= kAdoptBurst)
+		{
+			_adoptTokens = kAdoptBurst;
+			_adoptRefillAt = now;
+		}
+		else
+		{
+			_adoptTokens = static_cast<uint8_t>(_adoptTokens + earned);
+			_adoptRefillAt += earned * kAdoptRefill;
+		}
+		if (_adoptTokens == 0)
+		{
+			// Retryable, unlike the 403s: the phone comes back when a token has.
+			const auto wait = std::chrono::ceil<std::chrono::seconds>(_adoptRefillAt + kAdoptRefill - now);
+			sendRetryLater(data, static_cast<int>(wait.count()));
+			if (_adoptLimitLoggedAt != _adoptRefillAt)
+			{
+				_adoptLimitLoggedAt = _adoptRefillAt;
+				_env.log("Learn: adopt rate limit, 503 " + mac, true);
+			}
+			return AuthDecision::RetryLater;
+		}
+		--_adoptTokens;
 		DeviceRecord rec;
 		rec.extension = ext;
 		rec.state = DeviceState::Learned;
@@ -457,6 +496,21 @@ bool Registrar::forget(const std::string& macOrExt)
 	persistDevices();
 	noteChange(Change::Structural);
 	return true;
+}
+
+size_t Registrar::forgetLearned()
+{
+	size_t n = 0;
+	for (auto it = _devices.begin(); it != _devices.end();)
+	{
+		if (it->second.state == DeviceState::Learned) { it = _devices.erase(it); ++n; }
+		else ++it;
+	}
+	if (n == 0) return 0;
+	persistDevices();
+	noteChange(Change::Structural);
+	_env.log("Learn: forgot " + std::to_string(n) + " learned");
+	return n;
 }
 
 std::vector<Registrar::AdoptedDevice> Registrar::adoptedDevices() const

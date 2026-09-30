@@ -437,3 +437,177 @@ TEST(VoicemailRetrieval, SipInfoDigitsOnAVoicemailLegNeverReachTheStarCodeParser
 	EXPECT_FALSE(contains(handler.getDndExtensions(), "805"))
 		<< "a voicemail leg's SIP INFO digits must never reach the star-code parser";
 }
+
+// ── MWI (RFC 3842): the lamp follows deposit / listen / unsubscribe ──────────
+namespace
+{
+	std::shared_ptr<SipMessage> makeMwiSubscribe(const std::string& ext, const std::string& srcIp,
+		const std::string& callId, int expires)
+	{
+		std::string raw =
+			"SUBSCRIBE sip:" + ext + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKmwi" + callId
+				+ std::to_string(expires) + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=mw" + callId + "\r\n"
+			"To: <sip:" + ext + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(expires == 0 ? 2 : 1) + " SUBSCRIBE\r\n"
+			"Contact: <sip:" + ext + "@" + srcIp + ":5060>\r\n"
+			"Event: message-summary\r\n"
+			"Expires: " + std::to_string(expires) + "\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
+	}
+
+	std::shared_ptr<SipMessage> makeBusyReply(const std::string& fromExt, const std::string& toExt,
+		const std::string& srcIp, const std::string& callId, const std::string& branch)
+	{
+		std::string raw =
+			"SIP/2.0 486 Busy Here\r\n"
+			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=" + branch + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + toExt + "@server>;tag=bt" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
+	}
+
+	// The last message-summary NOTIFY to `addr`. Not findSentTo(): a response
+	// to the SUBSCRIBE echoes its "Event: message-summary" line too.
+	std::string findMwiNotify(const SentList& sent, const sockaddr_in& addr)
+	{
+		for (auto it = sent.rbegin(); it != sent.rend(); ++it)
+		{
+			if (it->first.sin_addr.s_addr != addr.sin_addr.s_addr || !it->second) continue;
+			std::string raw = it->second->toString();
+			if (raw.rfind("NOTIFY ", 0) == 0 && raw.find("Event: message-summary") != std::string::npos)
+				return raw;
+		}
+		return {};
+	}
+
+	// 811 calls `ext`, `ext` answers busy, the call falls to voicemail, 811 says
+	// something and is hung up. endCall() queues the flush -- the deposit.
+	// sweepVoicemailLegsForTest() stands in for the next tick().
+	void depositFrom811(RequestsHandler& handler, const std::string& ext, const std::string& extIp,
+		const std::string& callId)
+	{
+		const std::string branch = "z9hG4bK" + callId;
+		// (Re-)register the caller: forceDisconnect() below releases its client.
+		handler.handle(makeRegister("811", "192.168.47.21", "reg-" + callId));
+		handler.handle(makeInvite("811", ext, "192.168.47.21", callId, branch));
+		handler.handle(makeBusyReply("811", ext, extIp, callId, branch));
+		auto session = handler.getSession("Call-ID: " + callId);
+		ASSERT_TRUE(session.has_value());
+		const int slot = session.value()->getVoicemailLegSlot();
+		ASSERT_GE(slot, 0);
+		const uint8_t frame[] = {1, 2, 3, 4};
+		ASSERT_TRUE(handler.feedVoicemailAudioForTest(slot, frame, sizeof(frame)));
+		handler.forceDisconnect("811");
+		handler.sweepVoicemailLegsForTest();
+	}
+}
+
+TEST(VoicemailMwi, SubscribeGetsAcceptedAndAnImmediateNotifyNo)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.5", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("806", "192.168.47.16", "reg-m1"));
+	handler.setVoicemail("806", true);
+	sent.clear();
+
+	handler.handle(makeMwiSubscribe("806", "192.168.47.16", "mwi-e2e-1", 3600));
+
+	const sockaddr_in phone = addrFor("192.168.47.16");
+	EXPECT_FALSE(findSentTo(sent, phone, "SIP/2.0 202 Accepted").empty());
+	const std::string notify = findMwiNotify(sent, phone);
+	ASSERT_FALSE(notify.empty()) << "no immediate message-summary NOTIFY";
+	EXPECT_NE(notify.find("Messages-Waiting: no\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Message-Account: sip:806@192.168.47.5"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 0/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+TEST(VoicemailMwi, DepositNotifiesYesWithTheNewCount)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.6", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("807", "192.168.47.17", "reg-m2"));
+	handler.setVoicemail("807", true);
+	handler.handle(makeMwiSubscribe("807", "192.168.47.17", "mwi-e2e-2", 3600));
+	const sockaddr_in phone = addrFor("192.168.47.17");
+
+	sent.clear();
+	depositFrom811(handler, "807", "192.168.47.17", "mwi-dep-1");
+	std::string notify = findMwiNotify(sent, phone);
+	ASSERT_FALSE(notify.empty()) << "a deposit must NOTIFY the subscribed phone";
+	EXPECT_NE(notify.find("Messages-Waiting: yes\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 1/0 (0/0)\r\n"), std::string::npos) << notify;
+
+	sent.clear();
+	depositFrom811(handler, "807", "192.168.47.17", "mwi-dep-2");
+	notify = findMwiNotify(sent, phone);
+	ASSERT_FALSE(notify.empty()) << "the second deposit must NOTIFY again";
+	EXPECT_NE(notify.find("Voice-Message: 2/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+TEST(VoicemailMwi, ListeningNotifiesNoAndMovesTheCountToOld)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.7", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("808", "192.168.47.18", "reg-m3"));
+	handler.setVoicemail("808", true);
+	handler.handle(makeMwiSubscribe("808", "192.168.47.18", "mwi-e2e-3", 3600));
+	const sockaddr_in phone = addrFor("192.168.47.18");
+	depositFrom811(handler, "808", "192.168.47.18", "mwi-dep-3");
+	ASSERT_NE(findMwiNotify(sent, phone).find("Messages-Waiting: yes"), std::string::npos);
+
+	// What the SD card holds after that deposit's flush.
+	FakeSource source;
+	source.deposit("808", "3000", 3000, "mwi-dep-3", {1, 2, 3, 4});
+
+	// 808 dials its mailbox; the listing loads.
+	handler.handle(makeInvite("808", "796", "192.168.47.18", "mwi-listen", "z9hG4bKmwil"));
+	sent.clear();
+	handler.runVoicemailSdJobs(source);
+	handler.sweepVoicemailLegsForTest();
+
+	const std::string notify = findMwiNotify(sent, phone);
+	ASSERT_FALSE(notify.empty()) << "listening must NOTIFY the lamp off";
+	EXPECT_NE(notify.find("Messages-Waiting: no\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 0/1 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+TEST(VoicemailMwi, UnsubscribeStopsNotifies)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.8", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("809", "192.168.47.19", "reg-m4"));
+	handler.setVoicemail("809", true);
+	const sockaddr_in phone = addrFor("192.168.47.19");
+	handler.handle(makeMwiSubscribe("809", "192.168.47.19", "mwi-e2e-4", 3600));
+	ASSERT_FALSE(findMwiNotify(sent, phone).empty());
+
+	sent.clear();
+	handler.handle(makeMwiSubscribe("809", "192.168.47.19", "mwi-e2e-4", 0));
+	const std::string last = findMwiNotify(sent, phone);
+	ASSERT_FALSE(last.empty()) << "un-SUBSCRIBE gets one final NOTIFY";
+	EXPECT_NE(last.find("Subscription-State: terminated"), std::string::npos) << last;
+
+	sent.clear();
+	depositFrom811(handler, "809", "192.168.47.19", "mwi-dep-4");
+	EXPECT_TRUE(findMwiNotify(sent, phone).empty())
+		<< "no NOTIFY after the phone unsubscribed";
+}

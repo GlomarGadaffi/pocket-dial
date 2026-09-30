@@ -321,6 +321,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster. |
 | [`/api/registrar`](#post-apiregistrar) | `POST` | High | Gated (+ `X-CSRF`) | Sets the admission mode (`learn`/`secure`; `open` is retired, #500). |
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
+| [`/api/registrar/forget-learned`](#post-apiregistrarforget-learned) | `POST` | High | Gated (+ `X-CSRF`) | Forgets every `learned` device at once; `secured` ones stay (#515). |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
 | [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
 | [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts with `confirm=1` if none is staged (#645). Simulated (`200`, no-op) on desktop. While a 911/933 call is live a plain restart answers `409` `{"error":"emergency call in progress"}` and a staged-image reboot waits for the call to end (#652). |
@@ -887,9 +888,11 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `cdrLoadFailures` | Integer | (#594) Failures reading the stored CDR ring at boot. |
 | `ip4Guard` | Object | (#496, ESP builds only) What the IPv4 input guard dropped since boot: `padded` (frames padded past Ethernet's 46-byte minimum; no real stack sends these) and `tinyFragments` (non-final fragments under 256 B of payload), `mdnsFragments` (any fragment addressed to the mDNS group 224.0.0.251, #559: the mDNS receiver would parse a reassembled datagram in pieces). A climbing `padded` count means hostile or broken traffic on the LAN. `tinyFragments` usually means the same, but a datagram re-fragmented by a router onto a smaller-MTU link can also land there, and that datagram is lost. See ARCHITECTURE.md, "UDP Receive Memory". |
 | `packetsProcessed` | Integer | Total UDP signaling packets processed by the state machine. |
-| `packetsDropped` | Integer | Total UDP signaling packets dropped by rate-limiting or firewall rules. |
+| `packetsDropped` | Integer | Total UDP signaling packets dropped by rate-limiting or firewall rules. Exactly `droppedInvalid + droppedRate` (#702: derived from them, not counted separately); each part wraps at 2^32. |
 | `msgPoolRefusals` | Integer | (#409) Draws the process-wide SIP message pool refused because every slot was in use. There is no heap fallback, so each one is a request dropped (the peer retransmits) or a response not sent. Non-zero means the pool is undersized for the load, or the board is being flooded. |
 | `vpeerPoolRefusals` | Integer | (#409) Virtual-peer pool refusals (777/440/888/555/voicemail/park stand-ins). Each one was answered `503` or its feature abandoned cleanly (#412). |
+| `repliesRefused` | Integer | (#424, #702) Responses the PBX built and then refused to send because they answered a response or an ACK. Should stay `0`: any other value is a handler bug the guard caught. |
+| `optionsPingTruncated` | Integer | (#463, #702) OPTIONS keep-alive pings refused because they would not fit their fixed buffer. Should stay `0` with a real AOR and IPv4 address; counted so a clipped request never goes out silently. |
 | `trunkForgedRegisterResponses` | Integer | (#617, #663) Responses to the trunk's REGISTER that came from an address other than the one the REGISTER went to. Each was dropped. The WARN log line is written only when this reaches 1, 2, 4, 8, …, so a flood does not flood the log. `0` with no trunk configured. |
 | `trunkForgedDialogResponses` | Integer | (#356, #663) Responses on a trunk call's Call-ID that came from an address other than the carrier the INVITE went to. Each was dropped. Logged at powers of two, like the field above. |
 | `trunkRefusedDialogByes` | Integer | (#356, #666) BYEs on a trunk call's Call-ID refused with `403` because they came neither from the carrier nor its Contact host and (for a Confirmed call) the dialog tags did not match. Logged at powers of two, like the fields above. |
@@ -1355,6 +1358,25 @@ curl -s -X POST "http://$DEV/api/registrar/device" \
 curl -s -X POST "http://$DEV/api/registrar/device" \
      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
      -d "action=forget&target=1001"
+```
+
+### `POST /api/registrar/forget-learned`
+
+Forgets every `learned` device in one action (one NVS write); `secured` devices are kept.
+This is the recovery for a flood of adoptions that filled the device table (#515). Real
+phones are re-adopted on their next registration, a few per minute (see below). No body.
+
+* Response Status Codes:
+  * `200 OK`: Body is the `GET`'s `{attached, mode, devices}` shape, after the forget.
+  * `401`/`403`: gates 1-4 as in §0.1.
+
+Learn mode adopts at most 4 new MACs at once, then one more every 15 s. A REGISTER from a
+new MAC past that budget is answered `503 Service Unavailable` with a `Retry-After`
+(seconds until the next slot); known MACs never count against it.
+
+```bash
+curl -s -X POST "http://$DEV/api/registrar/forget-learned" \
+     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF"
 ```
 
 > **The MAC lock is not a cryptographic boundary.** It is learned from the ARP table, and
