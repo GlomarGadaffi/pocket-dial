@@ -57,13 +57,10 @@ TEST(DashboardE911Form, TheBannerNamesTheAnchorAsTheCarrierWhenTheRouteIsAnchor)
 
 	const size_t fn = p.find("function applyE911(d){");
 	ASSERT_NE(fn, std::string::npos);
-	const std::string body = p.substr(fn, p.find("
-}
-", fn) - fn);
+	const std::string body = p.substr(fn, p.find(";}\n", fn) - fn);   // one-line style: ends at ";}"
 	EXPECT_NE(body.find("$(\"e911-banner-text\")"), std::string::npos) << body;
 	EXPECT_NE(body.find("d.emergencyRoute===\"anchor\""), std::string::npos)
-		<< "the reword must key on the anchor route:
-" << body;
+		<< "the reword must key on the anchor route:\n" << body;
 	EXPECT_NE(body.find("3CX anchor"), std::string::npos) << body;
 }
 
