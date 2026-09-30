@@ -4004,26 +4004,35 @@ bool RequestsHandler::startHoldMusic(const std::string& clipPath)
 	// board whose card was pulled, or whose operator uploaded a 44.1 kHz stereo
 	// MP3-converted-wrong, must still park calls. Each failure logs and leaves
 	// park on its pre-#162 silent hold.
+	//
+	// Runs on the HTTP task (clip upload, boot), not the SIP thread, and
+	// _logQueue is swapped out under _mutex by the SIP thread (#717). So the
+	// log pushes take _mutex; loadClip()/start() read the SD card and must not
+	// run under it.
+	auto log = [this](std::string msg, bool isError = false) {
+		std::lock_guard<std::mutex> lock(_mutex);
+		queueLog(std::move(msg), isError);
+	};
 	if (!_holdMusic.loadClip(clipPath))
 	{
 		if (_holdMusic.lastLoadRefused())
 		{
-			queueLog("[WARN] MoH: clip at " + clipPath + " REFUSED -- PSRAM short, or over the " +
-			         std::to_string(POCKETDIAL_CLIP_INTERNAL_MAX_BYTES) +
-			         " B internal cap on a board without PSRAM (#466); parked callers will hear silence", true);
+			log("[WARN] MoH: clip at " + clipPath + " REFUSED -- PSRAM short, or over the " +
+			    std::to_string(POCKETDIAL_CLIP_INTERNAL_MAX_BYTES) +
+			    " B internal cap on a board without PSRAM (#466); parked callers will hear silence", true);
 			return false;
 		}
-		queueLog("MoH: no clip at " + clipPath +
-		         " (or not 8 kHz mono mu-law) — parked callers will hear silence", true);
+		log("MoH: no clip at " + clipPath +
+		    " (or not 8 kHz mono mu-law) — parked callers will hear silence", true);
 		return false;
 	}
 	if (!_holdMusic.start())
 	{
-		queueLog("MoH: clip loaded but the stream would not start — silent hold", true);
+		log("MoH: clip loaded but the stream would not start — silent hold", true);
 		return false;
 	}
-	queueLog("MoH: " + std::to_string(_holdMusic.clipSeconds()) + "s clip on UDP " +
-	         std::to_string(_holdMusic.localPort()));
+	log("MoH: " + std::to_string(_holdMusic.clipSeconds()) + "s clip on UDP " +
+	    std::to_string(_holdMusic.localPort()));
 	return true;
 }
 
