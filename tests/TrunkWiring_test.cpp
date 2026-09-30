@@ -547,6 +547,7 @@ TEST(TrunkWiring, AnAdminKillNeverEndsAnEmergencyCall)
 	EXPECT_TRUE(b.handler.getSession("Call-ID: call-714-911").has_value()) << "the 911 session is kept";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "with its media";
 	b.handler.forceNextTickForTest();   // getActiveClients() reads the tick snapshot
+	b.handler.tick();
 	bool registered = false;
 	for (const auto& [number, address] : b.handler.getActiveClients())
 	{
