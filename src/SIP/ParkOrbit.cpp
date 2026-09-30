@@ -242,10 +242,19 @@ void ParkOrbit::byeParkedParty(const ParkSlot& slot)
 	if (bye) _env.enqueue(slot.parkedAddr, std::move(bye));
 }
 
+void ParkOrbit::dropParked(ParkSlot& slot, std::string_view reason)
+{
+	// By value: freeForCallId() clears the slot this Call-ID would otherwise view.
+	const std::string callID = slot.callID;
+	byeParkedParty(slot);
+	freeForCallId(callID);
+	_env.endSession(callID, reason);
+}
+
 void ParkOrbit::startRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& parker,
 	std::chrono::steady_clock::time_point now)
 {
-	if (!parker) { byeParkedParty(slot); freeForCallId(slot.callID); return; }
+	if (!parker) { dropParked(slot, "park timeout, parker gone"); return; }
 	const std::string& activeIp = _env.localIp();
 	const std::string srcIpPort = activeIp + ":" + std::to_string(_env.serverPort());
 	const sockaddr_in& addr = parker->getAddress();
@@ -373,15 +382,13 @@ void ParkOrbit::sweep(std::chrono::steady_clock::time_point now)
 			{
 				_env.log("Park: timeout on " + slot.orbit + " — parker " + slot.parker +
 					" gone, tearing down");
-				byeParkedParty(slot);
-				freeForCallId(slot.callID);
+				dropParked(slot, "park timeout, parker gone");
 			}
 		}
 		else if (slot.state == ParkState::RingingBack && now >= slot.deadline)
 		{
 			_env.log("Park: ring-back on " + slot.orbit + " not answered — tearing down");
-			byeParkedParty(slot);
-			freeForCallId(slot.callID);
+			dropParked(slot, "park ring-back not answered");
 		}
 	}
 }
@@ -407,6 +414,13 @@ bool ParkOrbit::consumeParkChanged()
 	const bool changed = _parkChanged;
 	_parkChanged = false;
 	return changed;
+}
+
+bool ParkOrbit::holdsCall(std::string_view callID) const
+{
+	return std::any_of(_slots.begin(), _slots.end(), [&](const ParkSlot& slot) {
+		return slot.state != ParkState::Free && slot.callID == callID;
+	});
 }
 
 void ParkOrbit::freeForCallId(std::string_view callID)

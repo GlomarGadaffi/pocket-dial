@@ -52,6 +52,9 @@ public:
 	// ring-backs.
 	void sweep(std::chrono::steady_clock::time_point now);
 
+	// True while an orbit slot holds this Call-ID as a parked (or ringing-back) leg.
+	bool holdsCall(std::string_view callID) const;
+
 	// Free any orbit slot holding this call's parked leg (call teardown path).
 	void freeForCallId(std::string_view callID);
 
@@ -101,6 +104,9 @@ private:
 
 	void sendReinvite(ParkSlot& slot, const std::string& sdp);
 	void byeParkedParty(const ParkSlot& slot);
+	// A park that ends by timeout: BYE the parked party, free the orbit, and end
+	// the parked dialog's Session (#804) so its slot and CDR are not leaked.
+	void dropParked(ParkSlot& slot, std::string_view reason);
 	void startRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& parker,
 		std::chrono::steady_clock::time_point now);
 

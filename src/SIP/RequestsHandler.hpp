@@ -884,6 +884,17 @@ private:
 	{
 		_txLayer.freeForCallId(callId);
 	}
+	void endSession(std::string_view callId, std::string_view reason) override
+	{
+		// Numbers read before endCall() recycles the pooled Session.
+		std::string src, dest;
+		if (auto s = getSession(callId); s.has_value())
+		{
+			if (auto c = s.value()->getSrc()) src = c->getNumber();
+			if (auto c = s.value()->getDest()) dest = c->getNumber();
+		}
+		endCall(callId, src, dest, reason);
+	}
 	void log(std::string msg, bool isError = false) override
 	{
 		queueLog(std::move(msg), isError);

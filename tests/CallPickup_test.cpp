@@ -595,3 +595,37 @@ TEST(CallPickup, BodilessRefreshOnAPickedUpCallIsAnsweredLocallyNotRelayedAcross
 		EXPECT_EQ(s.value()->getState(), Session::State::Connected) << leg.callId;
 	}
 }
+
+// #804: a parked party that hangs up has To = the orbit and no peerCallID until a
+// retrieve, so its BYE fell through to the 404 path and nothing was torn down: the
+// orbit stayed Parked (music on hold streaming to a dead phone) and the Session
+// and its CDR leaked.
+TEST(CallPickup, ParkedPartyByeIsAnsweredAndFreesTheOrbitAndSession)
+{
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+
+	handler.handle(makeRegister("100", "192.168.9.50", "reg-parked-804"));
+	handler.handle(makeRegister("101", "192.168.9.51", "reg-other-804"));
+	handler.handle(makeInvite("100", "700", "192.168.9.50", "park-call-804"));
+	ASSERT_TRUE(handler.getSession(sessionKey("park-call-804")).has_value()) << "precondition: parked";
+
+	sent.clear();
+	handler.handle(makeBye("100", "700", "192.168.9.50", "park-call-804"));
+
+	EXPECT_TRUE(anyTo(sent, "192.168.9.50", "SIP/2.0 200 OK")) << "the parked party's BYE must be answered 200";
+	EXPECT_FALSE(anyTo(sent, "192.168.9.50", "404")) << "not 404";
+	EXPECT_FALSE(handler.getSession(sessionKey("park-call-804")).has_value())
+		<< "the parked session must be ended";
+
+	// The orbit is free again: the next INVITE to 700 parks instead of retrieving
+	// (a retrieve would re-INVITE the phone that just hung up).
+	sent.clear();
+	handler.handle(makeInvite("101", "700", "192.168.9.51", "park-call-804b"));
+	EXPECT_FALSE(anyTo(sent, "192.168.9.50", "INVITE sip:"))
+		<< "the orbit must be free: nothing may be retrieved from a party that hung up";
+	EXPECT_TRUE(handler.getSession(sessionKey("park-call-804b")).has_value());
+}
