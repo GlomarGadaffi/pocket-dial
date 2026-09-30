@@ -9,20 +9,6 @@ dial-plan rule and they can call the outside world. No router, no server, no clo
 The same C++17 engine compiles to a desktop binary, so you can run the whole PBX on
 your laptop before you own the hardware.
 
-```
-┌──────────┐        SIP signalling        ┌───────────────┐
-│ Yealink  │◄───────────────────────────►│  pocket-dial  │
-│   1001   │                              │   ESP32-S3    │
-└────┬─────┘                              └───────┬───────┘
-     │                                            │ (outside calls only)
-     │         RTP audio, peer-to-peer            ▼
-     └──────────────────────────────────►  ┌─────────────┐
-               ┌──────────┐                │   carrier   │
-               │ Grandstr │                └─────────────┘
-               │   1002   │
-               └──────────┘
-```
-
 For an ordinary extension-to-extension call the board brokers the setup and then
 gets out of the way — the phones stream audio directly to each other and the
 microcontroller never sees an RTP packet. That single design choice is why a
