@@ -2689,7 +2689,13 @@ void HttpServer::sendApiKill(int sock, const std::string& body)
 	// unit, so it is left for a follow-up rather than faked from this side.
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
-		handler->forceDisconnect(ext);
+		if (!handler->forceDisconnect(ext))
+		{
+			// #714 (desmo): an admin kill never ends an emergency call.
+			sendResponse(sock, 409, "Conflict", "application/json",
+			             "{\"error\":\"extension is on an emergency call\"}");
+			return;
+		}
 	}
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"disconnected\":\"" + jsonEscape(ext) + "\"}");

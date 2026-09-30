@@ -219,6 +219,22 @@ namespace
 			sent.clear();
 		}
 
+		// The SIP thread's next pass is what drains _asyncOutbox. A bare OPTIONS
+		// from an address on no dialog stands in for it (same as ForceDisconnect_test).
+		void flushAsyncOutbox()
+		{
+			const std::string raw =
+				"OPTIONS sip:server SIP/2.0\r\n"
+				"Via: SIP/2.0/UDP 192.168.50.99:5060;branch=z9hG4bKflush\r\n"
+				"From: <sip:probe@server>;tag=probetag\r\n"
+				"To: <sip:server@server>\r\n"
+				"Call-ID: flush-714\r\n"
+				"CSeq: 1 OPTIONS\r\n"
+				"Max-Forwards: 70\r\n"
+				"Content-Length: 0\r\n\r\n";
+			handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor("192.168.50.99")));
+		}
+
 		// Raw text of the first message sent whose first line contains `needle`.
 		std::string firstWith(const std::string& needle) const
 		{
@@ -478,6 +494,66 @@ TEST(TrunkWiring, AnExpiredLeaseMidCallByesTheCarrierAndReleasesTheRelay)
 
 	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the carrier leg must be hung up";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and its relay pair released";
+}
+
+TEST(TrunkWiring, AnAdminKillMidCallByesTheCarrierAsWellAsTheHandset)
+{
+	// #714: /api/kill reaches forceDisconnect() on the HTTP task. endCall()
+	// queued the carrier BYE in _outbox, which the next SIP pass cleared before
+	// draining, so only the handset BYE (via _asyncOutbox) ever left.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-kill"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+	b.sent.clear();
+
+	b.handler.forceDisconnect("1001");
+	b.flushAsyncOutbox();
+
+	// >= 1, not == 1: forceDisconnect() also sends the handset a second, reversed
+	// BYE for a trunk session (its dest is a virtual peer at the handset's own
+	// address, and destIsVirtual does not list it). Separate bug: #795.
+	EXPECT_GE(b.countWithTo("BYE", kHandsetIp), 1u)
+		<< "positive control: the killed handset is told";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u)
+		<< "the carrier leg keeps billing until it is hung up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and the relay pair is released";
+}
+
+TEST(TrunkWiring, AnAdminKillNeverEndsAnEmergencyCall)
+{
+	// #714 (desmo): an admin kill of a 911 trunk call is refused. Nothing is sent
+	// to the carrier or the handset, the session and its media stay, and the
+	// extension stays registered. The control half is the test above: the same
+	// kill on a non-emergency call hangs up the carrier.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-714-911"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the 911 is up";
+	b.sent.clear();
+
+	EXPECT_FALSE(b.handler.forceDisconnect("1001")) << "the kill must be refused";
+	b.flushAsyncOutbox();
+
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the kill hung up the PSAP";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "or the 911 caller";
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-714-911").has_value()) << "the 911 session is kept";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "with its media";
+	b.handler.forceNextTickForTest();   // getActiveClients() reads the tick snapshot
+	b.handler.tick();
+	bool registered = false;
+	for (const auto& [number, address] : b.handler.getActiveClients())
+	{
+		if (number == "1001") registered = true;
+	}
+	EXPECT_TRUE(registered) << "the extension stays registered";
 }
 
 TEST(TrunkWiring, AnExpiredLeaseNeverEndsAnEmergencyCall)
