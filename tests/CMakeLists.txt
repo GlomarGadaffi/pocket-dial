@@ -490,6 +490,9 @@ add_executable(sip_parser_tests
     # Issue #523: a de-REGISTER (Expires: 0) is answered 200 at its source, not
     # 404 through endHandle()'s by-number lookup of the client it just released.
     Deregistration_test.cpp
+    # Issue #755: the REGISTER 200 lists the phone's own binding (RFC 3261 §10.3
+    # step 8), not the PBX's URI.
+    RegisterBinding_test.cpp
     # Issue #229: `Supported: replaces` backs onRefer()'s REFER ?Replaces=
     # attended-transfer splice (#131) only -- RFC 3891 §3's OTHER use of the
     # same tag, an INVITE that itself carries a Replaces header (the BLF-key
