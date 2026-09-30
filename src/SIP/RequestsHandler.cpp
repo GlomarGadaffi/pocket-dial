@@ -1731,6 +1731,11 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
+		// Issue #746: a forked member's 487 to the CANCEL this PBX sent (ring
+		// group, page, hunt) is nobody's to relay -- the caller has its own
+		// answer -- but it is still a final to an INVITE we forked, so ACK it.
+		// Left unACKed the member retransmits it until Timer H (~32 s).
+		ackForwardedFinal(data);
 		return;
 	}
 	// Inbound anchor ring-all: a 487 is a forked loser's reply to the CANCEL sent
@@ -1784,6 +1789,103 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 	if (handleBlindXferFailure(data))
 	{
 		return;
+	}
+
+	// Issue #746: a callee's final failure this table has no name for (415, 420,
+	// 488, 603, 491 to a relayed re-INVITE, ...) used to end here: the caller got
+	// no final response and the callee's was never ACKed, so it retransmitted
+	// until Timer H. 480/486/487 are relayed by their own handlers; do the same
+	// for the rest. The caller's ACK is relayed back by onAck() (which also ends
+	// the call once the state below says it is over), completing the callee's
+	// transaction (RFC 3261 §17.1.1.3).
+	if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos)
+	{
+		if (auto sessionOpt = getSession(data->getCallID()); sessionOpt.has_value())
+		{
+			const std::shared_ptr<Session> s = sessionOpt.value();
+			const auto state = s->getState();
+			const auto src = s->getSrc();
+			const auto dest = s->getDest();
+			// A leg the PBX terminates itself (anchor, trunk) or owns as the UAC of a
+			// splice has no caller to relay to, and is not this change's business.
+			const bool relayable = !s->isAnchor() && !s->isTrunk();
+
+			if (s->isBroadcast() && (state == Session::State::Invited || state == Session::State::Cancel))
+			{
+				// Ring group / page / hunt member refusing: the PBX is the forker, so
+				// the ACK is ours. After a CANCEL nothing is left to advance.
+				ackForwardedFinal(data);
+				if (state != Session::State::Invited || !src) return;
+				const std::string member(data->getToNumber());
+				bool pending = false;
+				for (const auto& t : s->getPendingTargets())
+				{
+					if (t->getNumber() == member) { pending = true; break; }
+				}
+				if (!pending) return;   // a stale member (already timed out): its refusal changes nothing
+				if (s->isHunt())
+				{
+					// Next member, as onBusy() does; exhausted, the caller gets this final.
+					if (!_forker.huntRingNext(s))
+					{
+						endHandle(src->getNumber(), data);
+						endCall(data->getCallID(), src->getNumber(), s->getGroupExt(), "hunt group exhausted (refused)");
+					}
+					return;
+				}
+				s->removePendingTarget(member);
+				if (s->getPendingTargets().empty())
+				{
+					endHandle(src->getNumber(), data);
+					endCall(data->getCallID(), src->getNumber(), "999", "all targets refused");
+				}
+				return;
+			}
+			if ((state == Session::State::Invited || state == Session::State::Cancel) && relayable &&
+				findClient(data->getFromNumber()).has_value())
+			{
+				// The ordinary relayed call, as onBusy() does for 486. A callee with
+				// call-forward-no-answer or voicemail armed is diverted instead (desmo),
+				// the way the ring timer would have after 20 s.
+				if (state == Session::State::Invited && divertRefusedCall(s, data)) return;
+				setCallState(data->getCallID(), Session::State::Unavailable);
+				endHandle(data->getFromNumber(), data);
+				return;
+			}
+			if ((state == Session::State::Busy || state == Session::State::Unavailable) && relayable)
+			{
+				// A retransmitted final whose relay already went out: the caller's ACK
+				// never reached the callee (RFC 3261 §17.1.1.2 Completed). Repair it
+				// hop by hop; relaying the final to the caller a second time helps no one.
+				ackForwardedFinal(data);
+				return;
+			}
+			if ((state == Session::State::Connected || state == Session::State::Held) &&
+				relayable && src && dest)
+			{
+				if (s->isBroadcast() && data->getToNumber() != dest->getNumber())
+				{
+					// A ring-group member that lost the race, refusing after the win.
+					ackForwardedFinal(data);
+					return;
+				}
+				// A final to a relayed re-INVITE (491 glare, 488, ...): back to the
+				// sender, i.e. the leg the response did not come from. The dialog
+				// survives it, so no state change; a spliced/transfer dialog's
+				// re-INVITE is the PBX's own and stays out of this.
+				if (s->getPeerCallID().empty() && !s->isTransferBridge())
+				{
+					std::shared_ptr<SipClient> peer;
+					if (sameAddress(data->getSource(), src->getAddress())) peer = dest;
+					else if (sameAddress(data->getSource(), dest->getAddress())) peer = src;
+					if (peer)
+					{
+						endHandle(peer->getNumber(), data);
+						return;
+					}
+				}
+			}
+		}
 	}
 
 	// #798: a final answer to a BYE this PBX relayed ends the session whatever it
@@ -5091,6 +5193,60 @@ void RequestsHandler::ackInboundFinal(const std::shared_ptr<Session>& session, c
 	    << "Content-Length: 0\r\n\r\n";
 	auto msg = getMessageFromPool(ack.str(), data->getSource());
 	if (msg) _outbox.emplace_back(data->getSource(), std::move(msg));
+}
+
+void RequestsHandler::ackForwardedFinal(const std::shared_ptr<SipMessage>& data)
+{
+	// Issue #746: the PBX forwarded the INVITE this response answers (a ring-group
+	// or page fork), so its client transaction owes the ACK (RFC 3261 §17.1.1.3)
+	// and nobody else will send it. Same Via (so the same branch) as the forked
+	// INVITE, To from the response (the leg's tag), Request-URI = the leg's
+	// number at the address the response came from.
+	std::string cseq = stripHeaderName(data->getCSeq());
+	const size_t invitePos = cseq.find("INVITE");
+	if (invitePos == std::string::npos) return;
+	cseq.replace(invitePos, 6, "ACK");
+
+	std::ostringstream ack;
+	ack << "ACK sip:" << data->getToNumber() << "@" << sipwire::addrToIpPort(data->getSource()) << " SIP/2.0\r\n"
+	    << "Via: " << stripHeaderName(data->getVia()) << "\r\n"
+	    << "From: " << stripHeaderName(data->getFrom()) << "\r\n"
+	    << "To: " << stripHeaderName(data->getTo()) << "\r\n"
+	    << "Call-ID: " << stripHeaderName(data->getCallID()) << "\r\n"
+	    << "CSeq: " << cseq << "\r\n"
+	    << "Max-Forwards: 70\r\n"
+	    << "Content-Length: 0\r\n\r\n";
+	auto msg = getMessageFromPool(ack.str(), data->getSource());
+	if (msg) _outbox.emplace_back(data->getSource(), std::move(msg));
+}
+
+bool RequestsHandler::divertRefusedCall(const std::shared_ptr<Session>& s, const std::shared_ptr<SipMessage>& data)
+{
+	// Issue #746 (desmo): a callee that refuses is treated like one that does not
+	// answer, when it has somewhere to send the call: the same CFNA / voicemail
+	// divert the ring timer performs after 20 s (tick()), just immediately. Unlike
+	// the timer there is no leg to CANCEL: the callee's transaction is over, and
+	// its final is ACKed here. Nothing is relayed to the caller.
+	const auto invite = s->getInviteMessage();
+	const auto src = s->getSrc();
+	const std::string cfna = s->getNoAnswerTarget();
+	if (!invite || !src || cfna.empty()) return false;
+
+	ackForwardedFinal(data);
+	const std::string callID(data->getCallID());
+	const std::string callee(invite->getToNumber());
+	if (cfna == pbx::kVoicemailForwardSentinel)
+	{
+		endCall(callID, src->getNumber(), callee, "refused (voicemail)");
+		answerVoicemailDeposit(invite, src, callee);
+	}
+	else
+	{
+		queueLog("CFNA: callee refused, forwarding -> " + cfna);
+		endCall(callID, src->getNumber(), callee, "refused (CFNA)");
+		_forker.redirectInvite(invite, src, cfna);
+	}
+	return true;
 }
 
 void RequestsHandler::onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, const std::shared_ptr<Session>& session)

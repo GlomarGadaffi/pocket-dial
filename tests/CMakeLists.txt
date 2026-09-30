@@ -440,6 +440,9 @@ add_executable(sip_parser_tests
     # which for an ordinary proxied call's 486 (RFC 3261 mirrors the original
     # INVITE's From/To) names the caller, not the busy callee.
     CallForwardBusy_test.cpp
+    # Issue #746: a callee's 415/420/488/603 (and a ring-group member's refusal or
+    # loser's 487) reached onFinalFailure() and went nowhere: no relay, no ACK.
+    FinalFailureRelay_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header
