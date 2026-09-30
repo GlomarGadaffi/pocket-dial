@@ -511,3 +511,39 @@ TEST(FinalFailureRelay, ARefusingCalleeWithCfnaArmedIsForwardedToTheTarget)
 		<< "the call must be forwarded to the CFNA target";
 	EXPECT_TRUE(findSentTo(sent, callerAddr, "SIP/2.0 603").empty()) << "the refusal is not relayed";
 }
+
+// #803: a member's 486 / 480 carries From = the caller (the fork is a copy of the
+// caller's INVITE), so onBusy()/onUnavailable() must drop the pending target by To.
+TEST(FinalFailureRelay, RingAllFailsTheCallerWhenEveryMemberAnswersBusyOrUnavailable)
+{
+	for (const int code : { 486, 480 })
+	{
+		SCOPED_TRACE(code);
+		SentList sent;
+		RequestsHandler handler("192.168.50.1", 5060,
+			[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+				sent.emplace_back(addr, std::move(msg));
+			});
+		const sockaddr_in callerAddr = addrFor("192.168.50.20");
+		handler.handle(makeRegister("100", "192.168.50.20", "reg-100"));
+		handler.handle(makeRegister("101", "192.168.50.21", "reg-101"));
+		handler.handle(makeRegister("102", "192.168.50.22", "reg-102"));
+		handler.setRingGroup("600", "101,102", "ringall");
+		handler.handle(makeInvite("100", "600", "192.168.50.20", "ab-1", "z9hG4bKab1"));
+
+		sent.clear();
+		handler.handle(makeFinal(code, "100", "101", "192.168.50.20", "192.168.50.21",
+			"ab-1", "z9hG4bKab1"));
+		EXPECT_TRUE(findSentTo(sent, callerAddr, "SIP/2.0 " + std::to_string(code)).empty())
+			<< "102 is still ringing";
+		EXPECT_TRUE(handler.getSession("Call-ID: ab-1").has_value());
+
+		sent.clear();
+		handler.handle(makeFinal(code, "100", "102", "192.168.50.20", "192.168.50.22",
+			"ab-1", "z9hG4bKab1"));
+		EXPECT_FALSE(findSentTo(sent, callerAddr, "SIP/2.0 " + std::to_string(code)).empty())
+			<< "every member declined: the caller must get a final, not ring forever";
+		EXPECT_FALSE(handler.getSession("Call-ID: ab-1").has_value())
+			<< "and the session slot must be freed";
+	}
+}

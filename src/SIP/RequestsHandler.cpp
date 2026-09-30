@@ -5597,7 +5597,8 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 			return;
 		}
 
-		session.value()->removePendingTarget(std::string(data->getFromNumber()));
+		// A member's refusal mirrors the caller's INVITE: From is the caller, To is the member (#803).
+		session.value()->removePendingTarget(std::string(data->getToNumber()));
 		if (session.value()->getPendingTargets().empty() && session.value()->getState() == Session::State::Invited)
 		{
 			endHandle(session.value()->getSrc()->getNumber(), data);
@@ -5742,7 +5743,8 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 			return;
 		}
 
-		session.value()->removePendingTarget(std::string(data->getFromNumber()));
+		// A member's refusal mirrors the caller's INVITE: From is the caller, To is the member (#803).
+		session.value()->removePendingTarget(std::string(data->getToNumber()));
 		if (session.value()->getPendingTargets().empty() && session.value()->getState() == Session::State::Invited)
 		{
 			endHandle(session.value()->getSrc()->getNumber(), data);
