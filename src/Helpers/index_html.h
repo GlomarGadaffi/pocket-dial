@@ -403,8 +403,8 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
        (e.g. right after a factory reset). Informational: nothing is gated on it,
        and 911 still routes out. -->
   <div class="note" id="e911-banner" role="status" style="display:none;color:var(--warn)">&#9888;
-    <b>E911 not configured.</b> A 911 call still routes out, but nobody on site is
-    notified. Set the notify list and location in <a href="#" onclick="openPbxModal();return false">PBX Settings &rarr; E911 Notification</a>.</div>
+    <b>E911 not configured.</b> <span id="e911-banner-text">A 911 call still routes out, but nobody on site is
+    notified.</span> Set the notify list and location in <a href="#" onclick="openPbxModal();return false">PBX Settings &rarr; E911 Notification</a>.</div>
 
   <!-- ══ PATCH BAY ══ -->
   <section class="patch-bay">
@@ -1407,7 +1407,9 @@ function applyEmergencyRoute(d){
    nothing, same rule as wifiCapable below. Hidden while emergencyRoute is "none":
    its text says a 911 call "still routes out", which is false then, and #521's
    route banner already says 911 is refused. */
-function applyE911(d){var b=$("e911-banner");if(!b||!d||typeof d.e911Configured==="undefined")return;b.style.display=(d.e911Configured||d.emergencyRoute==="none")?"none":"";}
+function applyE911(d){var b=$("e911-banner");if(!b||!d||typeof d.e911Configured==="undefined")return;b.style.display=(d.e911Configured||d.emergencyRoute==="none")?"none":"";
+  /* #792: 3CX carries 911 here */
+  var t=$("e911-banner-text");if(t){if(t._def===undefined)t._def=t.textContent;t.textContent=d.emergencyRoute==="anchor"?"A 911 call goes out through the 3CX anchor, whose own E911 setup applies. This board's on-site notify list is empty.":t._def;}}
 /* #167: the board states whether it has a radio; the UI must not infer it from
    an empty scan. Older firmware predates the field, so an ABSENT wifiCapable is
    treated as capable -- the dashboard is served by the same board it manages, so
