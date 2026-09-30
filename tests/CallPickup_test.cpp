@@ -158,6 +158,21 @@ namespace
 	{
 		return "Call-ID: " + callId;
 	}
+
+	// First line of `raw` that starts with `prefix` (a method or a header name),
+	// without its CRLF; empty when there is none.
+	std::string lineStarting(const std::string& raw, const std::string& prefix)
+	{
+		size_t pos = 0;
+		while (pos < raw.size())
+		{
+			size_t eol = raw.find("\r\n", pos);
+			if (eol == std::string::npos) eol = raw.size();
+			if (raw.compare(pos, prefix.size(), prefix) == 0) return raw.substr(pos, eol - pos);
+			pos = eol + 2;
+		}
+		return {};
+	}
 }
 
 // ── Directed pickup ────────────────────────────────────────────────────────
@@ -224,6 +239,44 @@ TEST(CallPickup, DirectedPickupCancelsTargetAndBridgesCallerToPicker)
 	EXPECT_EQ(pickerSession.value()->getState(), Session::State::Connected);
 	ASSERT_NE(pickerSession.value()->getDest(), nullptr);
 	EXPECT_EQ(pickerSession.value()->getDest()->getNumber(), "200");
+}
+
+// Issue #749 / RFC 3261 §9.1: the CANCEL to the picked-up target carries the
+// Request-URI and To of the INVITE it cancels. A direct call relays the caller's
+// INVITE as received, so the CANCEL must not recompute either from the target's
+// address.
+TEST(CallPickup, PickupCancelCarriesTheRequestUriAndToOfTheInviteItCancels)
+{
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+
+	handler.handle(makeRegister("200", "192.168.9.10", "reg-caller749"));
+	handler.handle(makeRegister("100", "192.168.9.20", "reg-target749"));
+	handler.handle(makeRegister("102", "192.168.9.30", "reg-picker749"));
+	handler.setRingGroup("600", "100,102", "ringall");
+
+	handler.handle(makeInvite("200", "100", "192.168.9.10", "call-749"));
+	handler.handle(makeInvite("102", "**100", "192.168.9.30", "pickup-749"));
+
+	std::string invite, cancel;
+	for (const auto& s : sent)
+	{
+		if (s.destIp != "192.168.9.20") continue;
+		if (invite.empty() && s.raw.rfind("INVITE ", 0) == 0) invite = s.raw;
+		if (cancel.empty() && s.raw.rfind("CANCEL ", 0) == 0) cancel = s.raw;
+	}
+	ASSERT_FALSE(invite.empty()) << "the target must have been sent the caller's INVITE";
+	ASSERT_FALSE(cancel.empty()) << "the target must have been sent a CANCEL";
+
+	const std::string inviteLine = lineStarting(invite, "INVITE ");
+	const std::string cancelLine = lineStarting(cancel, "CANCEL ");
+	EXPECT_EQ(cancelLine.substr(cancelLine.find(' ')), inviteLine.substr(inviteLine.find(' ')))
+		<< "Request-URI must match the INVITE's";
+	EXPECT_EQ(lineStarting(cancel, "To:"), lineStarting(invite, "To:"))
+		<< "To must match the INVITE's";
 }
 
 TEST(CallPickup, DirectedPickupOfNonPeerExtensionGets486AndLeavesTargetRinging)
