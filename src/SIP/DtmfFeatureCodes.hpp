@@ -83,13 +83,9 @@ public:
 	size_t accumulatorCount() const { return _dtmfState.size(); }
 
 	// NVS-persisted admin extension identity (default "1001"). Returned by
-	// value, not `const&`: callers are not required to hold _mutex (dashboard/
-	// HTTP reads reach this off the SIP thread), and saveAdminExt() below
-	// mutates _adminExt from those other call paths with no lock of its own —
-	// a reference would dangle/tear if a concurrent save reallocates the
-	// string while the caller still holds it. See
-	// RequestsHandler::getAdminExt(), the public forwarder that keeps this
-	// contract.
+	// value, not `const&`: a reference would dangle/tear if a concurrent
+	// saveAdminExt() reallocates the string while the caller still holds it.
+	// Caller holds _mutex (RequestsHandler::getAdminExt() takes it).
 	// cppcheck-suppress returnByReference
 	std::string adminExt() const;
 
@@ -98,12 +94,12 @@ public:
 	// before this split.
 	void load();
 
-private:
-	// Currently uncalled from anywhere in the codebase (the *200 admin code
-	// is a stub that never reaches it either) — moved as-is per the plan's
-	// mechanical-move rule; deleting dead code is a separate later change.
-	void saveAdminExt(const std::string& ext);
+	// #483: config import restores the admin extension through
+	// RequestsHandler::setAdminExt(), which holds _mutex. False, with the
+	// current value kept, if it could not be persisted.
+	bool saveAdminExt(const std::string& ext);
 
+private:
 	PbxEnv& _env;
 	PbxFeatureConfig& _cfg;
 	CdrRing& _cdr;

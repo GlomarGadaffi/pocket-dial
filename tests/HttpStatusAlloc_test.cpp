@@ -159,4 +159,21 @@ TEST(HttpStatusAlloc, TheDynamicTaskCreateCountIsOnStatus)
 	psram::dynamicTaskCreates().store(before);
 }
 
+TEST(HttpStatusAlloc, TheHandlerBugCountersAreOnStatusAndPacketsDroppedIsTheirSum)
+{
+	// #702 item 19 (desmo): repliesRefused (#424) and optionsPingTruncated (#463)
+	// were readable only by tests; a board could never show them. Both are now
+	// on /api/status. packetsDropped is derived from the two per-reason counts,
+	// so it equals their sum exactly. One malformed datagram is the positive
+	// control that the fields carry live values, not constants.
+	StatusBench b;
+	b.handler->handle(RequestsHandler::getMessageFromPool("not sip at all\r\n\r\n", sockaddr_in{}));
+	const std::string resp = b.serve(false);
+	EXPECT_NE(resp.find("\"repliesRefused\":0,"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"optionsPingTruncated\":0,"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"packetsDropped\":1,"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"droppedInvalid\":1,"), std::string::npos) << resp;
+	EXPECT_EQ(b.handler->getPacketsDropped(), b.handler->getDroppedInvalid() + b.handler->getDroppedRate());
+}
+
 #endif

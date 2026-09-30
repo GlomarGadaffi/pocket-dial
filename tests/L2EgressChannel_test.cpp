@@ -338,6 +338,36 @@ TEST_F(L2EgressChannelTest, FallbackOnDriverTransmitFailure)
 	EXPECT_FALSE(ch.transmit(false, 0, 1, 160, payload, sizeof(payload)));
 }
 
+TEST_F(L2EgressChannelTest, AnIpLostMidStreamIsNoticedAtTheNextReResolveNotEveryFrame)
+{
+	// #702 item 14 (desmo): the netif lookup runs only when the channel
+	// re-resolves, not per frame. The accepted cost: an IP lost mid-stream is
+	// noticed at the next re-resolve (tick 250, ~5 s at 50 Hz), not the next
+	// frame. Before this change the very next frame dropped `ready`.
+	EthAccess::setMockIpInfo(true, ipToHost("192.168.12.244"), ipToHost("192.168.12.1"), ipToHost("255.255.255.0"));
+	const std::array<uint8_t, 6> localMac = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
+	EthAccess::setMockMac(true, localMac);
+	const sockaddr_in peer = makeAddr("192.168.12.50", 30000);
+	ArpLookup::setMockMac(peer, {0xAA, 0x00, 0x00, 0x00, 0x00, 0x01});
+
+	EgressChannel ch;
+	ASSERT_TRUE(ch.updateAddressing(peer, 5062, 0x11223344)) << "precondition: resolved";
+
+	EthAccess::setMockIpInfo(/*available=*/false);   // DHCP lease lost, link down
+	for (uint32_t tick = 1; tick < 250; ++tick)
+	{
+		ASSERT_TRUE(ch.updateAddressing(peer, 5062, 0x11223344))
+			<< "tick " << tick << ": the cached template stands between re-resolves";
+	}
+	// Positive control: the re-resolve at tick 250 does see the loss.
+	EXPECT_FALSE(ch.updateAddressing(peer, 5062, 0x11223344)) << "tick 250 must notice the lost IP";
+	EXPECT_FALSE(ch.ready);
+
+	// And while unresolved it retries every frame, recovering as soon as the IP is back.
+	EthAccess::setMockIpInfo(true, ipToHost("192.168.12.244"), ipToHost("192.168.12.1"), ipToHost("255.255.255.0"));
+	EXPECT_TRUE(ch.updateAddressing(peer, 5062, 0x11223344));
+}
+
 TEST_F(L2EgressChannelTest, FallbackOnLocalIpUnavailable)
 {
 	// Ethernet link down or not yet configured with DHCP
