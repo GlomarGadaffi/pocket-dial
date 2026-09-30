@@ -17,6 +17,7 @@ SipClient::SipClient(std::string number, sockaddr_in address, int expiresSeconds
 void SipClient::reset(std::string number, sockaddr_in address, int expiresSeconds)
 {
 	_number = std::move(number);
+	_contactUri.clear();
 	_address = address;
 	_expiresSeconds = expiresSeconds;
 	_expiresAt = std::chrono::steady_clock::now() + std::chrono::seconds(expiresSeconds);
@@ -27,6 +28,25 @@ void SipClient::reset(std::string number, sockaddr_in address, int expiresSecond
 void SipClient::release()
 {
 	_number.clear();
+	_contactUri.clear();
+}
+
+void SipClient::setContactUri(std::string_view uri)
+{
+	const bool scheme = uri.substr(0, 4) == "sip:" || uri.substr(0, 5) == "sips:";
+	bool clean = scheme && uri.size() <= kMaxContactUriLen;
+	for (size_t i = 0; clean && i < uri.size(); ++i)
+	{
+		const unsigned char c = static_cast<unsigned char>(uri[i]);
+		clean = c > ' ' && c < 0x7f && c != '<' && c != '>' && c != '"';
+	}
+	if (clean) _contactUri.assign(uri);
+	else _contactUri.clear();
+}
+
+const std::string& SipClient::getContactUri() const
+{
+	return _contactUri;
 }
 
 bool SipClient::isExpired(std::chrono::steady_clock::time_point now) const

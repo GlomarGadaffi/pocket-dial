@@ -12,6 +12,7 @@
 
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <chrono>
 
 class SipClient
@@ -27,6 +28,18 @@ public:
 
 	const std::string& getNumber() const;
 	const sockaddr_in& getAddress() const;
+
+	// ── Registered Contact URI (RFC 3261 §10.2.1) ────────────────────
+	// The URI the phone registered, URI parameters included (a Snom refuses a
+	// request without its ;line=). Requests the PBX sends to this phone are
+	// addressed to it. Empty when none was stored, and callers then fall back to
+	// sip:<number>@<ip>:<port>. Bounded by kMaxContactUriLen; one buffer per pool
+	// slot that keeps its capacity across re-REGISTERs (#284).
+	static constexpr size_t kMaxContactUriLen = 128;
+	// A URI that is not sip:/sips:, contains whitespace or angle brackets, or is
+	// over kMaxContactUriLen is refused: the stored URI is cleared, not truncated.
+	void setContactUri(std::string_view uri);
+	const std::string& getContactUri() const;
 
 	// ── Registration lease (RFC 3261 §10.2.1) ────────────────────────
 	// True once the lease deadline has passed.
@@ -49,6 +62,7 @@ public:
 
 private:
 	std::string _number;
+	std::string _contactUri;
 	sockaddr_in _address;
 	int _expiresSeconds;
 	std::chrono::steady_clock::time_point _expiresAt;

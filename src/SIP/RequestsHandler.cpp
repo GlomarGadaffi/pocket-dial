@@ -1340,6 +1340,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		auto newClient = allocateClient(std::string(data->getFromNumber()), data->getSource(), grantedExpires);
 		if (newClient)
 		{
+			newClient->setContactUri(siphdr::contactUriView(data->getContact()));
 			// allocateClient() has already placed the binding in the client pool;
 			// the registrar keeps no separate index, so there is nothing more to do
 			// here (this was previously a no-op registerClient() hook).
@@ -1776,6 +1777,27 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 	if (handleBlindXferFailure(data))
 	{
 		return;
+	}
+
+	// #798: a final answer to a BYE this PBX relayed ends the session whatever it
+	// says (RFC 3261 §15.1.2: a 481 in particular means the far phone already
+	// considers the dialog gone). Only a 200 used to free it, so a phone that
+	// refused the BYE left the slot allocated for good. The hanging-up phone is
+	// answered 200, as it would have been.
+	if (data->getCSeqMethod() == SipMessageTypes::BYE)
+	{
+		auto session = getSession(data->getCallID());
+		if (session.has_value() && session.value()->getState() == Session::State::Bye)
+		{
+			if (auto ok = getMessageFromPool(*data))
+			{
+				ok->setHeader(SipMessageTypes::OK);
+				ok->clearBody();
+				endHandle(data->getFromNumber(), std::move(ok));
+			}
+			endCall(data->getCallID(), data->getToNumber(), data->getFromNumber());
+			return;
+		}
 	}
 
 	// Nothing owns it: a failure on a relayed leg, already handled by the
@@ -5902,6 +5924,14 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	}
 
 	setCallState(data->getCallID(), Session::State::Bye);
+	// #798: the sender addressed this BYE to the PBX. The far phone gets its own
+	// registered Contact, or a Snom answers 481 for want of its ;line= (RFC 3261
+	// §12.2.1.1).
+	if (auto far = findClient(data->getToNumber());
+		far.has_value() && !far.value()->getContactUri().empty())
+	{
+		data->setHeader("BYE " + far.value()->getContactUri() + " SIP/2.0");
+	}
 	endHandle(data->getToNumber(), data);
 }
 
@@ -9422,9 +9452,23 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	const int numLen = static_cast<int>(num.size());
 	const int svcLen = static_cast<int>(pbx::kServiceServer.size());
 
+	// #797: the URI the phone registered, parameters included (a Snom answers 404
+	// without its ;line=). Without one, the address it registered from.
+	char fallbackUri[8 + 64 + INET_ADDRSTRLEN + 8];
+	const std::string& registeredUri = client->getContactUri();
+	if (registeredUri.empty())
+	{
+		const int u = std::snprintf(fallbackUri, sizeof(fallbackUri), "sip:%.*s@%s:%u", numLen, num.data(), destIp, destPort);
+		if (u <= 0 || static_cast<size_t>(u) >= sizeof(fallbackUri))
+		{
+			return nullptr;   // unreachable with a <=64-char AOR; same "no ping this round" contract as below
+		}
+	}
+	const char* const requestUri = registeredUri.empty() ? fallbackUri : registeredUri.c_str();
+
 	char buf[640];
 	const int n = std::snprintf(buf, sizeof(buf),
-		"OPTIONS sip:%.*s@%s:%u SIP/2.0\r\n"
+		"OPTIONS %s SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP %s:%d;branch=z9hG4bK%s\r\n"
 		"To: <sip:%.*s@%s:%u>\r\n"
 		"From: <sip:%.*s@%s:%d>;tag=%s\r\n"
@@ -9433,7 +9477,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 		"Max-Forwards: 70\r\n"
 		"User-Agent: pocket-dial\r\n"
 		"Content-Length: 0\r\n\r\n",
-		numLen, num.data(), destIp, destPort,
+		requestUri,
 		_localIp.c_str(), _serverPort, branch.c_str(),
 		numLen, num.data(), destIp, destPort,
 		svcLen, pbx::kServiceServer.data(), _localIp.c_str(), _serverPort, fromTag.c_str(),
@@ -9442,7 +9486,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	// nullptr as "no ping this round" and does not stamp the interval, so it is
 	// retried next tick. Counted, and logged the first time, rather than silent
 	// (Sonny-OG's review, same pattern as #438/#456). The worst case with a
-	// 64-character AOR (kMaxAorLen) and a dotted-quad local IP is ~450 B, so
+	// 64-character AOR (kMaxAorLen), a dotted-quad local IP and a full-length registered Contact is ~500 B, so
 	// this needs an input no real board has.
 	if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf))
 	{
@@ -10431,8 +10475,18 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 	std::string destIpPort = sipwire::addrToIpPort(destAddr);
 	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
 
+	// #798: the URI the phone registered, when this is that phone (a virtual peer
+	// or a moved binding falls back to the address form).
+	std::string requestUri = "sip:" + destExt + "@" + destIpPort;
+	if (auto phone = findClient(destExt);
+		phone.has_value() && !phone.value()->getContactUri().empty() &&
+		sameAddress(phone.value()->getAddress(), destAddr))
+	{
+		requestUri = phone.value()->getContactUri();
+	}
+
 	std::ostringstream ss;
-	ss << "BYE sip:" << destExt << "@" << destIpPort << " SIP/2.0\r\n"
+	ss << "BYE " << requestUri << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
 	   << "From: " << stripHeaderName(fromHeader) << "\r\n"
 	   << "To: " << stripHeaderName(toHeader) << "\r\n"
