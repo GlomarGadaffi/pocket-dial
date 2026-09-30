@@ -215,7 +215,7 @@ public:
 	std::string_view getCSeqMethod() const;  // method token extracted from CSeq header
 	// RFC 4028 session timer headers (0 / empty when header absent).
 	uint32_t         getSessionExpiresSecs() const;
-	std::string_view getSessionExpiresRefresher() const; // "uac", "uas", or empty
+	std::string_view getSessionExpiresRefresher() const; // lowercase "uac"/"uas" (any input case), other value as sent, or empty
 	uint32_t         getMinSESecs() const;
 	std::string_view getContact() const;
 	std::string_view getContactNumber() const;
