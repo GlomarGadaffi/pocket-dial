@@ -20,6 +20,8 @@
 #include "DeviceConfig.hpp"
 #include "UrlEncode.hpp"
 #include "SipSecretStore.hpp"   // #482
+#include "TrunkConfigStore.hpp"   // #483
+#include "EmailConfigStore.hpp"   // #483
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -188,6 +190,8 @@ namespace
 			_handler.reset();
 			AdminAuth::clearCredential();
 			DeviceConfig::clearAll();
+			TrunkConfigStore::resetForTest();   // #483: process-global on host
+			EmailConfigStore::resetForTest();
 			std::remove(_tapiPath.c_str());
 			std::remove(_didPath.c_str());
 		}
@@ -759,4 +763,94 @@ TEST_F(ConfigExportImportTest, EncryptedExport_WithAShortPassword_Is400)
 		"password=short", "pd_session=" + owner.cookie, owner.csrf);
 	EXPECT_EQ(statusOf(resp), 400) << resp;
 	EXPECT_EQ(bodyOf(resp).find("secretsEnc"), std::string::npos);
+}
+
+// #483 section C: the ITSP trunk, SMTP, E911 and the admin extension survive
+// export -> factory reset -> import, and their secrets travel only inside
+// secretsEnc.
+TEST_F(ConfigExportImportTest, EncryptedRoundTrip_RestoresTrunkEmailE911AdminExt)
+{
+	const std::string sysop = "pd_session=" + _sysop.cookie;
+	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/trunk",
+		"host=sip.carrier.example&port=5080&proxyHost=proxy.carrier.example&proxyPort=5090"
+		"&fromUser=pbxmain&callerId=frontdesk&authUser=auth-id-9876&pass=trunk-secret-483&enabled=1",
+		sysop, _sysop.csrf)), 200);
+	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/email",
+		"host=smtp.example&port=465&mode=tls&auth=login&user=mailer&pass=smtp-secret-483"
+		"&from=pbx%40example.com&to=ops%40example.com&gsaEmail=sa%40example.com&insecure=1"
+		"&gsaKey=" + urlEncode("-----BEGIN KEY-----\ngsa-secret-483\n") +
+		"&caPem=" + urlEncode("-----BEGIN CERTIFICATE-----\nca-483\n"),
+		sysop, _sysop.csrf)), 200);
+	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/e911-config",
+		"notifyExts=101,102&callback=100&location=" + urlEncode("Suite 5, Bldg A"),
+		sysop, _sysop.csrf)), 200);
+	ASSERT_TRUE(_handler->setAdminExt("1002"));
+	const TrunkConfigStore::Config trunk = TrunkConfigStore::load();
+	const EmailConfigStore::Config email = EmailConfigStore::load();
+	const auto e911 = _handler->getE911Config();
+	ASSERT_EQ(std::get<2>(e911), "Suite 5, Bldg A");
+
+	AdminSession owner = loginOwner();
+	std::string exportResp = httpRaw(_port, "POST", "/api/config/export",
+		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+	const std::string blob = bodyOf(exportResp);
+	EXPECT_NE(blob.find("\"sip.carrier.example\""), std::string::npos) << "trunk not exported:\n" << blob;
+	for (const char* secret : { "trunk-secret-483", "smtp-secret-483", "gsa-secret-483" })
+	{
+		EXPECT_EQ(blob.find(secret), std::string::npos) << secret << " in clear:\n" << blob;
+	}
+
+	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/factory-reset", "confirm=ERASE",
+		"pd_session=" + owner.cookie, owner.csrf)), 200);
+	ASSERT_TRUE(TrunkConfigStore::load().host.empty()) << "the reset must have wiped the trunk";
+	ASSERT_TRUE(EmailConfigStore::load().host.empty());
+	ASSERT_TRUE(std::get<2>(_handler->getE911Config()).empty());
+	ASSERT_TRUE(_handler->setAdminExt("1001"));   // the HTTP reset leaves admin_ext alone
+
+	_sysop = loginSysop(_port);
+	owner = loginOwner();
+	std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&password=exportpass123&confirm=REPLACE",
+		"pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+
+	const TrunkConfigStore::Config t = TrunkConfigStore::load();
+	EXPECT_EQ(t.host, trunk.host) << bodyOf(importResp);
+	EXPECT_EQ(t.port, trunk.port);
+	EXPECT_EQ(t.proxyHost, trunk.proxyHost);
+	EXPECT_EQ(t.proxyPort, trunk.proxyPort);
+	EXPECT_EQ(t.fromUser, trunk.fromUser);
+	EXPECT_EQ(t.callerId, trunk.callerId);
+	EXPECT_EQ(t.authUser, trunk.authUser);
+	EXPECT_EQ(t.pass, "trunk-secret-483");
+	EXPECT_TRUE(t.enabled);
+	const EmailConfigStore::Config e = EmailConfigStore::load();
+	EXPECT_EQ(e.host, email.host);
+	EXPECT_EQ(e.port, email.port);
+	EXPECT_EQ(e.mode, email.mode);
+	EXPECT_EQ(e.auth, email.auth);
+	EXPECT_EQ(e.user, email.user);
+	EXPECT_EQ(e.pass, "smtp-secret-483");
+	EXPECT_EQ(e.from, email.from);
+	EXPECT_EQ(e.to, email.to);
+	EXPECT_EQ(e.gsaEmail, email.gsaEmail);
+	EXPECT_EQ(e.gsaKey, email.gsaKey);
+	EXPECT_TRUE(e.insecureSkipVerify);
+	EXPECT_EQ(e.caPem, email.caPem);
+	EXPECT_EQ(_handler->getE911Config(), e911);
+	EXPECT_EQ(_handler->getAdminExt(), "1002");
+}
+
+// #483: the import holds the trunk to POST /api/trunk's checks. A file that
+// points it at this board (#546) is reported under "skipped", not stored.
+TEST_F(ConfigExportImportTest, Import_TrunkPointedAtThisBoard_IsSkippedNotStored)
+{
+	const std::string blob = "{\"exportVer\":1,\"plaintext\":{\"trunk\":{\"host\":\"127.0.0.1\","
+		"\"port\":5060,\"proxyPort\":5060,\"fromUser\":\"pbxmain\",\"enabled\":true}}}";
+	const std::string resp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&confirm=REPLACE", "pd_session=" + _sysop.cookie, _sysop.csrf);
+	ASSERT_EQ(statusOf(resp), 200) << resp;
+	EXPECT_NE(bodyOf(resp).find("trunk (the trunk host must be the carrier"), std::string::npos) << resp;
+	EXPECT_TRUE(TrunkConfigStore::load().host.empty());
 }

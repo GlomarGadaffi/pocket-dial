@@ -66,7 +66,8 @@ public:
 		bool online = false;     // currently has a live registration binding
 	};
 
-	enum class AuthDecision : uint8_t { Accept, Challenge, Reject };
+	// RetryLater (#515): admitLearn has already enqueued a 503 + Retry-After.
+	enum class AuthDecision : uint8_t { Accept, Challenge, Reject, RetryLater };
 
 	Registrar(PbxEnv& env, Mode defaultMode) : _env(env), _mode(defaultMode) {}
 
@@ -104,13 +105,22 @@ public:
 	// returns the digest decision. On a first-packet ARP miss returns Accept
 	// (deferring the lock to the next REGISTER). Records/updates the adoption
 	// entry — poll consumeDevicesChange() afterwards to mirror the snapshot.
+	// #515: adopting a NEW MAC spends a token (kAdoptBurst, one back per
+	// kAdoptRefill); with none left it answers 503 + Retry-After and returns
+	// RetryLater. Known MACs never spend one. `now` is a test seam.
+	static constexpr uint8_t kAdoptBurst = 4;
+	static constexpr std::chrono::seconds kAdoptRefill{15};   // 4 per minute
 	AuthDecision admitLearn(const std::shared_ptr<SipMessage>& data,
-		const std::string& ext, std::string& outRejectReason);
+		const std::string& ext, std::string& outRejectReason,
+		std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 	// Emit a 401 Unauthorized with a fresh WWW-Authenticate challenge. `stale`
 	// answers an expired-but-valid nonce.
 	void sendChallenge(const std::shared_ptr<SipMessage>& data, bool stale);
 	// Emit a 403 Forbidden with a reason phrase.
 	void sendForbidden(const std::shared_ptr<SipMessage>& data, const std::string& reason);
+	// Emit a 503 Service Unavailable with Retry-After (#515). Kept short: per
+	// RFC 3261 §21.5.4 the phone holds off the WHOLE server for that long.
+	void sendRetryLater(const std::shared_ptr<SipMessage>& data, int retryAfterSeconds);
 
 	// ── Adopted-device registry ───────────────────────────────────────────────
 	void loadDevices();   // boot-time NVS reload; runs single-threaded pre-dispatch
@@ -124,6 +134,9 @@ public:
 	// Forget a device entirely (a later REGISTER re-learns it in Learn mode).
 	// Accepts a MAC or an extension. Returns true if a record was removed.
 	bool forget(const std::string& macOrExt);
+	// #515: forget every Learned device in one step (one NVS write); Secured
+	// devices are kept. Returns how many were removed.
+	size_t forgetLearned();
 	// Current registry contents (MAC-sorted by map order) for the dashboard
 	// snapshot mirror.
 	std::vector<AdoptedDevice> adoptedDevices() const;
@@ -179,6 +192,15 @@ private:
 	// (namespace "pbxcfg", key "devices") minus the volatile online flags.
 	std::unordered_map<std::string, DeviceRecord> _devices;
 	Change _devicesChanged = Change::None;
+
+	// #515: token bucket on new adoptions. Each is one persistDevices() NVS
+	// write, and a host answering ARP for many fake MACs could otherwise fill
+	// the table (and wear flash) in one burst. A full bucket banks nothing.
+	uint8_t _adoptTokens = kAdoptBurst;
+	std::chrono::steady_clock::time_point _adoptRefillAt{};
+	// The refusal path IS the flood path: log at most once per refill period
+	// (each log line allocates on the SIP task, #284).
+	std::chrono::steady_clock::time_point _adoptLimitLoggedAt{};
 
 	// Issue #525: digest replay limit. Nonces are stateless (HMAC-tagged, 5 min,
 	// SipDigest.hpp), so without this one captured Authorization could be sent
