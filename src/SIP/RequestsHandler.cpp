@@ -1340,6 +1340,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		auto newClient = allocateClient(std::string(data->getFromNumber()), data->getSource(), grantedExpires);
 		if (newClient)
 		{
+			newClient->setContactUri(siphdr::contactUriView(data->getContact()));
 			// allocateClient() has already placed the binding in the client pool;
 			// the registrar keeps no separate index, so there is nothing more to do
 			// here (this was previously a no-op registerClient() hook).
@@ -1568,8 +1569,15 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 	// a dialed PSTN number, answers 404, and never calls endCall() — leaking the
 	// MediaBridge and the live carrier leg. isAnchorInbound() sessions (ring-all
 	// from a real PSTN inbound call) are excluded: their teardown is unrelated.
+	//
+	// #747: a SipTrunk call (placeSipTrunkCall) has the same shape and the same
+	// bug -- its destNumber is the dialed PSTN string too, so it fell through to
+	// the 404 below and never reached the carrier. It takes this branch as well:
+	// 200 to the CANCEL, 487 to the INVITE, and endCall() -> SipTrunk::hangup(),
+	// which CANCELs the carrier leg.
 	if (destNumber == kAnchorCallExt ||
-		(cancelSess.has_value() && cancelSess.value()->isAnchor() && !cancelSess.value()->isAnchorInbound()))
+		(cancelSess.has_value() && cancelSess.value()->isAnchor() && !cancelSess.value()->isAnchorInbound()) ||
+		(cancelSess.has_value() && cancelSess.value()->isTrunk()))
 	{
 		// CANCEL of an anchor-bridge dial-in. For Loopback (answers synchronously,
 		// no ringing window) this is mostly defensive symmetry with 777/440/888 —
@@ -1877,6 +1885,27 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 					}
 				}
 			}
+		}
+	}
+
+	// #798: a final answer to a BYE this PBX relayed ends the session whatever it
+	// says (RFC 3261 §15.1.2: a 481 in particular means the far phone already
+	// considers the dialog gone). Only a 200 used to free it, so a phone that
+	// refused the BYE left the slot allocated for good. The hanging-up phone is
+	// answered 200, as it would have been.
+	if (data->getCSeqMethod() == SipMessageTypes::BYE)
+	{
+		auto session = getSession(data->getCallID());
+		if (session.has_value() && session.value()->getState() == Session::State::Bye)
+		{
+			if (auto ok = getMessageFromPool(*data))
+			{
+				ok->setHeader(SipMessageTypes::OK);
+				ok->clearBody();
+				endHandle(data->getFromNumber(), std::move(ok));
+			}
+			endCall(data->getCallID(), data->getToNumber(), data->getFromNumber());
+			return;
 		}
 	}
 
@@ -2434,6 +2463,17 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		endHandle(data->getFromNumber(), responseObj);
 		return;
 	}
+
+	// Issue #715: draw the relay BEFORE publishing the session. Published first, a
+	// pool refusal left an Invited session with no ring timer (no CFNA/voicemail on
+	// the callee) and no relay on the wire, and the caller's INVITE retransmit is
+	// dropped by the retransmission guard at the top of this function because that
+	// session exists: the slot leaked. Refused here, nothing is committed --
+	// allocateSession() already reset newSession but never published it, so the next
+	// allocateSession() reclaims the slot -- and the retransmit is a fresh INVITE.
+	auto response = getMessageFromPool(*data);
+	if (!response) return;   // pool exhausted: nothing committed, drop, peer retransmits (#101A)
+
 	_sessions.emplace(data->getCallID(), newSession);
 	newSession->setEmergency(isEmergencyCallback(called.value()->getNumber()));   // #659
 
@@ -2459,8 +2499,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
 	}
 
-	auto response = getMessageFromPool(*data);
-	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setContact(buildContact(caller.value()->getNumber()));
 	endHandle(data->getToNumber(), response);
 }
@@ -6058,6 +6096,14 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	}
 
 	setCallState(data->getCallID(), Session::State::Bye);
+	// #798: the sender addressed this BYE to the PBX. The far phone gets its own
+	// registered Contact, or a Snom answers 481 for want of its ;line= (RFC 3261
+	// §12.2.1.1).
+	if (auto far = findClient(data->getToNumber());
+		far.has_value() && !far.value()->getContactUri().empty())
+	{
+		data->setHeader("BYE " + far.value()->getContactUri() + " SIP/2.0");
+	}
 	endHandle(data->getToNumber(), data);
 }
 
@@ -6973,16 +7019,18 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// 202 Accepted to the transferor (RFC 3515 §2.4.4).
-	{
-		auto accepted = getMessageFromPool(*data);
-		if (!accepted) return;   // pool exhausted: drop, peer retransmits (#101A)
-		accepted->setHeader(SipMessageTypes::ACCEPTED);
-		accepted->clearBody();
-		accepted->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
-		_outbox.emplace_back(data->getSource(), std::move(accepted));
-	}
+	// 202 Accepted to the transferor (RFC 3515 §2.4.4). Issue #715: drawn here but
+	// queued only once every other message the transfer needs is drawn. A 202 is the
+	// final response of the transferor's non-INVITE transaction (RFC 3261 §17.1.2.2),
+	// so once it is out a later pool refusal cannot be retried by a REFER retransmit
+	// and would leave the transferor with a 202 and a subscription that never ends.
+	// Nothing sent yet means a refusal can still be answered 503.
+	auto accepted = getMessageFromPool(*data);
+	if (!accepted) return;   // pool exhausted: drop, peer retransmits (#101A)
+	accepted->setHeader(SipMessageTypes::ACCEPTED);
+	accepted->clearBody();
+	accepted->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 
 	// Issue #203, unchanged in substance: an unresolvable target (a park orbit, a
 	// typo, an extension that just dropped its registration) declines the transfer
@@ -6990,6 +7038,8 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// be hung up on here is the one now being kept.
 	if (!targetClient.has_value())
 	{
+		// The 202 goes first: the decline is reported by NOTIFY on the subscription it opens.
+		_outbox.emplace_back(data->getSource(), std::move(accepted));
 		// Issue #422: above everything this dialog has carried, like the success
 		// NOTIFY (#402) -- not the builder's default 2.
 		//
@@ -7075,13 +7125,21 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 
 	if (!inviteToTarget || !byeToTransferor || !notify || !legSession)
 	{
-		// Nothing has been sent but the 202 and nothing has been mutated, so the
-		// transferor's REFER retransmit retries the whole transfer from scratch.
-		// An unpublished legSession is reclaimed by the next allocateSession()
-		// scan. Same answer as #203: refuse without destroying a working call.
+		// Nothing has been sent and nothing has been mutated. Issue #715: the REFER
+		// is answered 503 (the already-drawn `accepted` message, re-headed) rather
+		// than 202, because no retransmit can retry it once a 202 has ended the
+		// transferor's transaction. An unpublished legSession is reclaimed by the
+		// next allocateSession() scan. Same answer as #203: refuse without
+		// destroying a working call.
+		accepted->setHeader("SIP/2.0 503 Service Unavailable");
+		accepted->setTo(std::string(data->getTo()));
+		_outbox.emplace_back(data->getSource(), std::move(accepted));
 		queueLog("REFER: blind transfer to " + target + " not started — pool exhausted", true);
 		return;
 	}
+
+	// Every draw succeeded: the 202 can go out now.
+	_outbox.emplace_back(data->getSource(), std::move(accepted));
 
 	// The transferee's offer relayed peer-to-peer: keep its preference order, drop
 	// only payloads this PBX will not carry (the same treatment buildInviteFork
@@ -7971,11 +8029,11 @@ std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHand
 	return _snapshot.sessions;
 }
 
-void RequestsHandler::forceDisconnect(const std::string& extension)
+bool RequestsHandler::forceDisconnect(const std::string& extension)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::unique_lock<std::mutex> lock(_mutex);
 		queueLog("Admin: force-disconnecting extension " + extension);
 		// Issue #228: tear down every dialog this extension is on the way every
 		// other server-initiated teardown does — BYE the phones, THEN endCall().
@@ -8009,6 +8067,24 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 				(session->getDest() && session->getDest()->getNumber() == extension))
 			{
 				involved.push_back(callID);
+			}
+		}
+		// Issue #714 (desmo): an admin kill never ends a 911/933 call, and it does not
+		// half-kill one either: releasing the registration below would blank the
+		// number the emergency call's BYE and CDR still read. The whole request is
+		// refused, changing nothing, and /api/kill answers 409.
+		for (const auto& callID : involved)
+		{
+			auto it = _sessions.find(callID);
+			if (it != _sessions.end() && it->second->isEmergency())
+			{
+				queueLog("Admin: refused to force-disconnect extension " + extension +
+				         ": it is on an emergency call", true);
+				localLogs = std::move(_logQueue);
+				_logQueue.clear();
+				lock.unlock();
+				printLogs(localLogs);
+				return false;
 			}
 		}
 		for (const auto& callID : involved)
@@ -8051,6 +8127,15 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 			        dest ? dest->getNumber() : "",
 			        "extension " + extension + " was force-disconnected by admin");
 		}
+		// Issue #714: endCall()'s trunk branch calls _sipTrunk.hangup(), which
+		// hands the carrier BYE to PbxEnv::enqueue() -> _outbox. This is the HTTP
+		// task, so the next handle()/tick() would clear _outbox before draining
+		// it and the carrier would never be told (it kept the leg and billing;
+		// a 911 killed here left the PSAP on dead air). Same thread rule as the
+		// handset BYEs above: hand it to _asyncOutbox, which drainOutbox()
+		// merges on the SIP thread's next pass.
+		for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
+		_outbox.clear();
 		// Release the registration LAST. SipClient::release() clears the number,
 		// and the Session's src/dest point at this same pool object — releasing
 		// first (as this function used to) blanked the number before the
@@ -8070,6 +8155,7 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 	}
 
 	printLogs(localLogs);
+	return true;
 }
 
 uint64_t RequestsHandler::getPacketsProcessed() const
@@ -9092,12 +9178,18 @@ void RequestsHandler::tick()
 					auto invite = session->getInviteMessage();
 					if (invite && session->getSrc())
 					{
+						// Issue #715: the ring timer is already cleared (above and in
+						// huntRingNext), so nothing reaps this session again. A refused 480
+						// is dropped, but endCall() must still run or the Invited session
+						// leaks for good; the caller's own INVITE timer ends its side.
 						auto resp = getMessageFromPool(*invite);
-						if (!resp) continue;   // pool exhausted: skip this session's 480 (#101A)
-						resp->setHeader(SipMessageTypes::UNAVAILABLE);
-						resp->clearBody();
-						resp->setContact(buildContact(session->getGroupExt()));
-						_outbox.emplace_back(invite->getSource(), std::move(resp));
+						if (resp)   // pool exhausted: skip only this session's 480 (#101A)
+						{
+							resp->setHeader(SipMessageTypes::UNAVAILABLE);
+							resp->clearBody();
+							resp->setContact(buildContact(session->getGroupExt()));
+							_outbox.emplace_back(invite->getSource(), std::move(resp));
+						}
 						endCall(callID, session->getSrc()->getNumber(), session->getGroupExt(), "hunt group no answer");
 					}
 				}
@@ -9578,9 +9670,23 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	const int numLen = static_cast<int>(num.size());
 	const int svcLen = static_cast<int>(pbx::kServiceServer.size());
 
+	// #797: the URI the phone registered, parameters included (a Snom answers 404
+	// without its ;line=). Without one, the address it registered from.
+	char fallbackUri[8 + 64 + INET_ADDRSTRLEN + 8];
+	const std::string& registeredUri = client->getContactUri();
+	if (registeredUri.empty())
+	{
+		const int u = std::snprintf(fallbackUri, sizeof(fallbackUri), "sip:%.*s@%s:%u", numLen, num.data(), destIp, destPort);
+		if (u <= 0 || static_cast<size_t>(u) >= sizeof(fallbackUri))
+		{
+			return nullptr;   // unreachable with a <=64-char AOR; same "no ping this round" contract as below
+		}
+	}
+	const char* const requestUri = registeredUri.empty() ? fallbackUri : registeredUri.c_str();
+
 	char buf[640];
 	const int n = std::snprintf(buf, sizeof(buf),
-		"OPTIONS sip:%.*s@%s:%u SIP/2.0\r\n"
+		"OPTIONS %s SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP %s:%d;branch=z9hG4bK%s\r\n"
 		"To: <sip:%.*s@%s:%u>\r\n"
 		"From: <sip:%.*s@%s:%d>;tag=%s\r\n"
@@ -9589,7 +9695,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 		"Max-Forwards: 70\r\n"
 		"User-Agent: pocket-dial\r\n"
 		"Content-Length: 0\r\n\r\n",
-		numLen, num.data(), destIp, destPort,
+		requestUri,
 		_localIp.c_str(), _serverPort, branch.c_str(),
 		numLen, num.data(), destIp, destPort,
 		svcLen, pbx::kServiceServer.data(), _localIp.c_str(), _serverPort, fromTag.c_str(),
@@ -9598,7 +9704,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	// nullptr as "no ping this round" and does not stamp the interval, so it is
 	// retried next tick. Counted, and logged the first time, rather than silent
 	// (Sonny-OG's review, same pattern as #438/#456). The worst case with a
-	// 64-character AOR (kMaxAorLen) and a dotted-quad local IP is ~450 B, so
+	// 64-character AOR (kMaxAorLen), a dotted-quad local IP and a full-length registered Contact is ~500 B, so
 	// this needs an input no real board has.
 	if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf))
 	{
@@ -10587,8 +10693,18 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 	std::string destIpPort = sipwire::addrToIpPort(destAddr);
 	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
 
+	// #798: the URI the phone registered, when this is that phone (a virtual peer
+	// or a moved binding falls back to the address form).
+	std::string requestUri = "sip:" + destExt + "@" + destIpPort;
+	if (auto phone = findClient(destExt);
+		phone.has_value() && !phone.value()->getContactUri().empty() &&
+		sameAddress(phone.value()->getAddress(), destAddr))
+	{
+		requestUri = phone.value()->getContactUri();
+	}
+
 	std::ostringstream ss;
-	ss << "BYE sip:" << destExt << "@" << destIpPort << " SIP/2.0\r\n"
+	ss << "BYE " << requestUri << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
 	   << "From: " << stripHeaderName(fromHeader) << "\r\n"
 	   << "To: " << stripHeaderName(toHeader) << "\r\n"

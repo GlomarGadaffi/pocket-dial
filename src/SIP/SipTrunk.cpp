@@ -255,6 +255,24 @@ std::string SipTrunk::buildBye(const Dialog& d, std::string_view freshBranch, st
 	return ss.str();
 }
 
+std::string SipTrunk::buildCancel(const Dialog& d)
+{
+	// RFC 3261 §9.1: a CANCEL is matched to the INVITE it cancels, so it repeats
+	// the INVITE's Request-URI, Call-ID, From, To and CSeq number and carries the
+	// INVITE's Via branch. To has no tag: the INVITE was sent without one, and a
+	// tag latched from the 180 does not belong on a request naming that INVITE.
+	std::ostringstream ss;
+	ss << "CANCEL " << pstnUri(d.destE164, d.domain) << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << d.localIpPort << ";branch=" << d.branch << ";rport\r\n"
+	   << "From: <sip:" << d.fromUser << "@" << d.domain << ">;tag=" << d.fromTag << "\r\n"
+	   << "To: <" << pstnUri(d.destE164, d.domain) << ">\r\n"
+	   << "Call-ID: " << d.callID << "\r\n"
+	   << "CSeq: " << d.cseq << " CANCEL\r\n";
+	commonRequestTail(ss);
+	ss << "Content-Length: 0\r\n\r\n";
+	return ss.str();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Slot management
 // ─────────────────────────────────────────────────────────────────────────────
@@ -524,6 +542,34 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	const std::string toTag = siphdr::tagOf(data->getTo());
 	if (!toTag.empty() && d->toTag.empty()) d->toTag = toTag;
 
+	// #747: we CANCELled this INVITE and are waiting out its transaction. The
+	// handset was answered by the engine when it cancelled, so nothing here may
+	// reach the listener. A 2xx that crossed the CANCEL (§9.1) is not caught
+	// here: it takes the ordinary 2xx path below -- the same ACK, and whatever
+	// else that path latches from the answer -- with hangup() in place of the
+	// listener.
+	const bool wasCancelling = (d->state == State::Cancelling);
+	if (wasCancelling && (status < 200 || data->getCSeqMethod() == "CANCEL"))
+	{
+		// A late 180/183, or the CANCEL's own final response (200, or 481 when the
+		// carrier no longer knows the INVITE): nothing to do, keep waiting.
+		return true;
+	}
+	if (wasCancelling && status >= 300)
+	{
+		// 487 (or any other 3xx-6xx): ACK it in the INVITE's own transaction and
+		// release. The handset is already gone, so there is nobody to tell.
+		auto ack = _env.messageFromPool(buildAckForFailure(*d), d->peer);
+		if (ack)
+		{
+			ack->syncContentLength();
+			_env.enqueue(d->peer, std::move(ack));
+		}
+		_env.freeTransactionsForCallId(d->callID);
+		*d = Dialog{};
+		return true;
+	}
+
 	if (status >= 100 && status < 200)
 	{
 		if (d->state == State::Trying) d->state = State::Proceeding;
@@ -570,6 +616,16 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 			_env.enqueue(d->peer, std::move(ack));
 		}
 		d->state = State::Confirmed;
+		if (wasCancelling)
+		{
+			// #747: the 2xx crossed our CANCEL (§9.1). The call is up at the
+			// carrier and the handset is gone, so no listener event may bridge
+			// it; hangup() on the now Confirmed dialog emits the BYE, behind the
+			// ACK already on the outbox.
+			_env.log("Trunk: call answered after our CANCEL, hanging up (" + d->destE164 + ")", true);
+			hangup(d->callID);
+			return true;
+		}
 		_env.log("Trunk: call answered (" + d->destE164 + ")");
 		// Fired last, with the ACK already on the outbox and the state already
 		// Confirmed: a listener that finds the answer's SDP unusable calls
@@ -686,11 +742,31 @@ bool SipTrunk::hangup(std::string_view callID)
 		return true;
 	}
 
-	// Not yet answered. A CANCEL would be the strictly correct move for a dialog
-	// in Proceeding; it is deliberately left to the follow-up that adds inbound
-	// and re-INVITE handling, because a CANCEL raced against a 200 needs the
-	// ACK+BYE recovery path RegisterBeeper had to grow, and half of that is worse
-	// than none. Releasing the slot stops us placing a duplicate call.
+	// The CANCEL is already out; the slot is held until the INVITE's final
+	// response (or the deadline) and must not be released by a second hangup.
+	if (d->state == State::Cancelling) return true;
+
+	// #747: a dialog that has had a provisional response is CANCELled, so the
+	// carrier stops ringing the far end. A 2xx that crosses the CANCEL is acked
+	// and BYEd in handleResponse(). The INVITE's own transaction is left alone so
+	// the 487 matches it; the CANCEL is tracked as its own non-INVITE transaction.
+	// A dialog still in Trying has had no provisional, and RFC 3261 §9.1 forbids
+	// a CANCEL then, so it falls through to the release below as before.
+	if (d->state == State::Proceeding)
+	{
+		auto msg = _env.messageFromPool(buildCancel(*d), d->peer);
+		if (msg)
+		{
+			msg->syncContentLength();
+			_env.enqueue(d->peer, std::move(msg));
+			d->state    = State::Cancelling;
+			d->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(32);   // Timer B
+			return true;
+		}
+	}
+
+	// Nothing to CANCEL (Trying, or the pool is exhausted): release the slot,
+	// which stops us placing a duplicate call.
 	_env.freeTransactionsForCallId(d->callID);
 	*d = Dialog{};
 	return true;
@@ -835,7 +911,7 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 		// The listener tore the handset down when it asked for that BYE, so
 		// reclaiming the slot is all that is left -- notifying again would be a
 		// second teardown of a leg that is already gone.
-		const bool notify = (d.state != State::Terminating);
+		const bool notify = (d.state != State::Terminating && d.state != State::Cancelling);
 
 		// Same move-then-free-then-fire order as the failure path above: an
 		// INVITE that never got a final response must release the handset, and

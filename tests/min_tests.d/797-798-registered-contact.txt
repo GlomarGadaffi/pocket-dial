@@ -1,0 +1,2 @@
+# RegisteredContact_test.cpp: 5 (#797 OPTIONS R-URI + fallback, #798 relayed BYE R-URI, 481 frees session, server BYE R-URI)
+5

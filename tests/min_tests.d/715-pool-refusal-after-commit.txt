@@ -1,0 +1,2 @@
+# BlindTransfer_test.cpp: 3 (#715: a pool refusal leaves no session half-done: INVITE relay, exhausted hunt, blind REFER)
+3

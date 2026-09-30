@@ -1078,12 +1078,11 @@ TEST(DialPlanRouting, SbcModeNeverShadowsAnExplicitDialPlanRule)
 	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-explicit-wins"), nullptr);
 }
 
-TEST(DialPlanRouting, SbcModeSendsExtensionToExtensionCallsOutTheTrunkToo)
+TEST(DialPlanRouting, SbcModeRingsARegisteredLocalExtensionLocally)
 {
-	// The issue's own flagged decision point: SBC mode means EVERY call,
-	// including one registered extension dialing another — the local registrar
-	// becomes decorative once this is on. That is a real SBC's behavior and is
-	// what "one toggle that routes every call" has to mean if it means anything.
+	// #796: a number this PBX owns (a registered client) must ring locally, not
+	// go out the billable trunk. Only numbers the PBX does not own take the
+	// SBC fallback.
 	WireLog wire;
 	RequestsHandler handler("192.168.9.1", 5060,
 		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
@@ -1096,11 +1095,57 @@ TEST(DialPlanRouting, SbcModeSendsExtensionToExtensionCallsOutTheTrunkToo)
 	wire.clear();
 	handler.handle(makeInvite("500", "600", "192.168.9.50", "sbc-ext-to-ext"));
 
-	EXPECT_FALSE(wire.sawInviteTo("600"))
-		<< "600 must NOT ring locally once SBC mode claims every unmatched call";
+	EXPECT_TRUE(wire.sawInviteTo("600"))
+		<< "600 is registered here, so it must ring locally in SBC mode";
+	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-ext-to-ext"), nullptr)
+		<< "a local extension call must never be placed through the trunk";
+}
+
+TEST(DialPlanRouting, SbcModeStillTrunksANumberThatIsNotARegisteredExtension)
+{
+	// The other half of #796: with registered phones present, a number nobody
+	// here owns still takes the SBC route, digits unmodified.
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	isolateTapiStoreForTest(handler);
+	registerThreePhones(handler);
+	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+
+	wire.clear();
+	handler.handle(makeInvite("500", "602", "192.168.9.50", "sbc-unowned"));
+
+	EXPECT_EQ(wire.inviteCount(), 0u);
+	ASSERT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-unowned"), nullptr);
 	auto* loopback = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
 	ASSERT_NE(loopback, nullptr);
-	EXPECT_EQ(loopback->lastMakeCallDestination(), "600");
+	EXPECT_EQ(loopback->lastMakeCallDestination(), "602");
+}
+
+TEST(DialPlanRouting, SbcModeExplicitRuleStillBeatsARegisteredLocalExtension)
+{
+	// An operator's explicit rule is deliberate and keeps precedence even over
+	// a registered extension: 600 is registered, but the rule sends it to a
+	// ring group, so 601 rings too.
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	isolateTapiStoreForTest(handler);
+	registerThreePhones(handler);
+	handler.setRingGroup("610", "600,601", "ringall");
+	handler.setDialRule("600", "group", "610");
+	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+
+	wire.clear();
+	handler.handle(makeInvite("500", "600", "192.168.9.50", "sbc-rule-over-local"));
+
+	EXPECT_TRUE(wire.sawInviteTo("600"));
+	EXPECT_TRUE(wire.sawInviteTo("601"))
+		<< "the explicit rule for 600 must still win over local-extension delivery";
 }
 
 TEST(DialPlanRouting, SbcModeNeverReachesReservedExtensions)

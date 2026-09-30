@@ -156,7 +156,10 @@ public:
 	}
 	std::vector<std::pair<std::string, std::string>> getActiveClients();
 	std::vector<std::tuple<std::string, std::string, std::string, int>> getActiveSessions();
-	void forceDisconnect(const std::string& extension);
+	// Ends every call the extension is on and de-registers it. Returns false, having
+	// changed nothing, when the extension is on an emergency (911/933) call: an admin
+	// kill never ends one (#714, desmo).
+	bool forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
 	// Issue #430: packetsDropped split by reason (their sum), and the probe

@@ -1,0 +1,2 @@
+# TrunkWiring_test.cpp: 2 (#714: an admin kill BYEs the carrier; an admin kill never ends an emergency call)
+2

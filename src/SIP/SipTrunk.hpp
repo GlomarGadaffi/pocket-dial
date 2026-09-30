@@ -175,7 +175,9 @@ public:
 	//               whereas 180 means generate local ringback.
 	// Confirmed   : 2xx received and ACKed -- the call is up.
 	// Terminating : BYE sent, waiting for its 200.
-	enum class State : uint8_t { Free, Trying, Proceeding, Confirmed, Terminating };
+	// Cancelling  : CANCEL sent for a ringing INVITE (#747), waiting for the
+	//               INVITE's own final response (487, or a 2xx that crossed it).
+	enum class State : uint8_t { Free, Trying, Proceeding, Confirmed, Terminating, Cancelling };
 
 	struct Dialog
 	{
@@ -299,6 +301,12 @@ public:
 	static std::string buildBye(const Dialog& d, std::string_view freshBranch,
 		std::string_view authLine = {});
 
+	// CANCEL for the INVITE still ringing (#747; RFC 3261 §9.1): the INVITE's own
+	// Request-URI, Via branch, From (with tag), To (no tag: the INVITE had none),
+	// Call-ID and CSeq number, method CANCEL. Not a new transaction, so no fresh
+	// branch -- the carrier matches it to the INVITE on the branch.
+	static std::string buildCancel(const Dialog& d);
+
 	// ── Listener: how the engine learns a trunk dialog moved ─────────────────
 	//
 	// Every callback fires on the SIP thread, synchronously, from inside the
@@ -400,8 +408,11 @@ public:
 	bool handleBye(const std::shared_ptr<SipMessage>& data);
 
 	// Tear down the trunk leg for `callID` (either the trunk's own Call-ID or the
-	// handset leg's). Sends a BYE if the dialog is confirmed; frees it outright if
-	// it never got that far. Returns true if a dialog was found.
+	// handset leg's). Sends a BYE if the dialog is confirmed; CANCELs it if it is
+	// ringing (Proceeding, #747) and holds the slot for the INVITE's own final
+	// response; frees it outright only if it never drew a provisional (Trying).
+	// A second call on a Cancelling dialog changes nothing. Returns true if a
+	// dialog was found.
 	bool hangup(std::string_view callID);
 
 	// Time out dialogs that never reached a final response.
