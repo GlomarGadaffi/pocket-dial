@@ -78,6 +78,15 @@ bench-verified here.
 - Ring-all, 999 and zone calls drop the pending member by To on all-busy (#805; #803).
 - A group call's caller ACK, BYE and CANCEL dispatch on session state, not the To number (#806; #802).
 - Park: a parked party's BYE ends the Session; a park timeout no longer leaks it (#807; #804).
+- The Session-Expires refresher match is case-insensitive; delta-seconds saturate (#783; #739).
+- A refresh on a park-orbit or 440 leg is answered, never relayed back to its sender (#782; #709).
+- The attended splice offers `sendrecv`, not the far party's hold answer (#774; #719).
+- `startHoldMusic()` logs under `_mutex` (#772; #717).
+- CFNA to an unregistered target answers the caller and cancels the callee (#771; #716).
+- A CANCEL to a directly relayed leg carries the INVITE's Request-URI and To (#770; #749).
+- The REGISTER 200 lists the phone's binding, not the PBX URI (#767; #755).
+- The register beep's ACK for the phone's 200 gets a fresh Via branch (#766; #752).
+- The cancelled pickup target's 487 is ACKed and dropped, not relayed to an answered caller (#765; #750).
 
 ### Trunk
 
@@ -104,6 +113,8 @@ bench-verified here.
 - A REGISTER 2xx registers only when it lists our binding (#732; #686).
 - `/api/kill` on a trunk call sends the carrier BYE (#778; #714).
 - A handset CANCEL cancels a ringing carrier leg and answers the handset 487 (#779; #747).
+- The BYE to the handset after a carrier hangup or RTP reap has From and To the right way round (#780; #700).
+- The trunk INVITE no longer claims `Supported: timer` (#764; #753).
 
 ### Memory and no-heap
 
