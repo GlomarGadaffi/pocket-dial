@@ -463,6 +463,9 @@ add_executable(sip_parser_tests
     # asserted at the wire level.
     CallPickup_test.cpp
     NoReplyToResponse_test.cpp
+    # Issue #453: in-dialog requests across a B2BUA splice (pickup, park,
+    # transfer) are rebuilt in the peer dialog, never relayed verbatim.
+    SpliceInDialog_test.cpp
     RegisterBeeper_test.cpp
     # Issue #148: the duplicate-tracking feedback loop between sweep()'s Timer-A
     # retransmit and drainOutbox()'s maybeTrack() scan, driven directly so the

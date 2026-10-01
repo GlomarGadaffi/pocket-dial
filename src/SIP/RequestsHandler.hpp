@@ -470,6 +470,12 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #589 review: age the in-flight splice transactions so a test can reach the 64*T1 sweep.
+	void ageSpliceTxnsForTest(std::chrono::steady_clock::duration d)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (auto& t : _spliceTxns) t.since -= d;
+	}
 	// #479: the boot-built conference room, so a test can make its driver fail.
 	ConferenceRoom* conferenceForTest() { return _conference.get(); }
 	// #479: as a POCKETDIAL_CONFERENCE=0 build, which never builds the room.
@@ -1891,6 +1897,74 @@ private:
 	// dialog role differs per call path (beep = server UAC; park = server UAS).
 	// `cseq` must exceed every CSeq already used on this dialog, by either party or
 	// the server (Session::nextServerCSeq(), #389/#402); 2 is right only when none is known.
+	// ── #453: in-dialog requests across a B2BUA splice ────────────────────────
+	// A splice (call pickup, park retrieve/ring-back, attended/blind transfer)
+	// joins two dialogs with DIFFERENT Call-IDs, linked only by peerCallID. An
+	// in-dialog request from one phone must be REBUILT in the other dialog --
+	// that dialog's Call-ID, tags, a CSeq above everything the PBX sent on it
+	// (#402) and the PBX's own Contact (#425) -- never forwarded as it came.
+	// The far phone's answer comes back onto the originator's own transaction
+	// through a fixed, bounded table (no allocation), and the PBX ACKs the far
+	// leg itself.
+	struct PeerDialog
+	{
+		std::shared_ptr<Session>   peer;
+		std::shared_ptr<SipClient> target;          // the phone on the peer dialog
+		const std::string*         fromHdr = nullptr; // the PBX's side of the peer dialog
+		const std::string*         toHdr   = nullptr; // the target's own URI and tag
+	};
+	// The peer dialog of a spliced session: who to send to and as whom. BYE's
+	// two bridge branches and the in-dialog relay all resolve it the same way.
+	bool resolvePeerDialog(const std::shared_ptr<Session>& s, PeerDialog& out);
+	// The phone that owns a spliced session's dialog (its src, or on a
+	// transfer bridge whichever side the dropped transferor was not).
+	std::shared_ptr<SipClient> ownPartyOf(const std::shared_ptr<Session>& s) const;
+	void relayIntoPeerDialog(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<Session>& session);
+	// A far-leg response to a request relayIntoPeerDialog() sent: answers the
+	// originator and ACKs the far leg. False if it is not one of ours.
+	bool handleSpliceResponse(const std::shared_ptr<SipMessage>& data);
+	// The originator's ACK to the 2xx we answered it with: absorbed, never relayed.
+	bool absorbSpliceAck(const std::shared_ptr<SipMessage>& data);
+	void sweepSpliceTxns(std::chrono::steady_clock::time_point now);
+	void answerSpliceLocally(const std::shared_ptr<SipMessage>& data, const char* statusLine);
+
+	// #589 review (CaveJay B2): the originator's request is NOT held. A pooled
+	// SipMessage stays unreusable while referenced, so eight in-flight splices
+	// pinned eight message-pool slots for up to 32 s, against the pool's +4
+	// headroom (#409/#583 removed the heap fallback behind it). Only the fields
+	// an answer needs are kept, in fixed buffers.
+	// B1: after a final response the slot lingers (AwaitingOriginAck, then
+	// Completed) for 64*T1 so a RETRANSMITTED far-leg final can be re-ACKed with
+	// the same ACK; losing that ACK otherwise makes the far phone BYE the call.
+	struct SpliceTxn
+	{
+		enum class State : uint8_t { Free, AwaitingPeer, AwaitingOriginAck, Completed };
+		State state = State::Free;
+		bool isInvite = false;
+		bool holdOffer = false;               // the offer holds; applied on the peer's 2xx
+		sockaddr_in originSrc{};              // the originator's transaction
+		uint32_t originCSeq = 0;
+		char originVia[256] = {};             // full "Via: ..." line of the originator's request
+		char originFrom[192] = {};            // full header lines
+		char originTo[192] = {};
+		char originCallId[128] = {};          // full "Call-ID: ..." line
+		char originToNumber[48] = {};
+		std::shared_ptr<Session> peer;        // the dialog it was rebuilt into
+		uint32_t peerCSeq = 0;
+		char branch[32] = {};                 // our Via branch toward the peer (non-2xx ACK)
+		char ackBranch[32] = {};              // the branch our ACK for the peer's final used
+		std::chrono::steady_clock::time_point since{};
+	};
+	// Answers the originator's transaction from a slot's stored fields.
+	void answerSpliceOrigin(const SpliceTxn& t, std::string_view statusLine, std::string_view sdpBody);
+	// Builds and sends our ACK for the peer's final response `resp`.
+	void sendSpliceAck(const SpliceTxn& t, const std::shared_ptr<SipMessage>& resp);
+	// One in-flight splice request per slot. Two directions per spliced pair can
+	// be in flight at once; 8 covers several concurrent splices. A full table
+	// answers 500 + Retry-After rather than ever relaying untranslated.
+	static constexpr size_t kSpliceTxns = 8;
+	std::array<SpliceTxn, kSpliceTxns> _spliceTxns{};
+
 	std::shared_ptr<SipMessage> buildServerBye(const std::string& destExt,
 		const sockaddr_in& destAddr, const std::string& callId,
 		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2);

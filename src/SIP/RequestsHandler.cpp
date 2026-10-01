@@ -1752,6 +1752,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 {
+	if (handleSpliceResponse(data)) return;   // #453: a far-leg answer to a relayed request
 	// A 487 to our own register-beep INVITE — the phone's answer to the CANCEL
 	// sweep() sent when it never auto-answered (drawbridge #90/#178). Claim it
 	// here exactly as onFinalFailure() does: 487 has its own handlerKey in
@@ -1854,6 +1855,7 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 {
+	if (handleSpliceResponse(data)) return;   // #453: a far-leg answer to a relayed request
 	// Server-originated UAC dialogs have no Session -- they are owned by the
 	// machine that minted them and found by Call-ID, the same intercept order
 	// onOk() uses. Whoever claims it is responsible for the ACK (RFC 3261
@@ -5551,6 +5553,7 @@ void RequestsHandler::onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, c
 
 void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 {
+	if (handleSpliceResponse(data)) return;   // #453: a far-leg answer to a relayed request
 	// Our own MoH preview INVITE's 100 Trying. Same claim the beep makes in
 	// onRinging: this is a provisional to US, the preview is a server-originated
 	// UAC with no Session, and its From ("moh") resolves to no registered
@@ -5586,6 +5589,7 @@ void RequestsHandler::onSessionProgress(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 {
+	if (handleSpliceResponse(data)) return;   // #453: a far-leg answer to a relayed request
 	// A 180 to our own register-beep INVITE (drawbridge #178). Recognise it and
 	// stop — nothing more. Unlike the 480/486/487 claims in onBusy() /
 	// onUnavailable() / onReqTerminated(), this deliberately does NOT call
@@ -5645,6 +5649,7 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 {
+	if (handleSpliceResponse(data)) return;   // #453: a far-leg answer to a relayed request
 	// The phone declined our register-beep INVITE with 486 (drawbridge #178).
 	// Same claim onFinalFailure() makes, for the same reason: 486 has its own
 	// handlerKey in handle()'s dispatch switch and so never reaches that
@@ -5800,6 +5805,7 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 {
+	if (handleSpliceResponse(data)) return;   // #453: a far-leg answer to a relayed request
 	// The phone answered our register-beep INVITE with 480 — DND, or simply not
 	// willing to auto-answer right now (drawbridge #178). Identical treatment to
 	// the 486 path in onBusy(): ACK it inside the INVITE transaction (RFC 3261
@@ -6258,6 +6264,8 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	if (handleSpliceResponse(data)) return;   // #453: a far-leg answer to a relayed request
+
 	// Park dialogs (server-originated re-INVITE ACKs + ring-back answers). The
 	// snapshot mirror is driven by _park.consumeParkChanged() in handle(), so a
 	// state-neutral ACK confirmation no longer pays a rebuild.
@@ -6539,6 +6547,7 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 {
+	if (absorbSpliceAck(data)) return;   // #453: ends OUR answer to a spliced re-INVITE
 	auto session = getSession(data->getCallID());
 	if (!session.has_value())
 	{
@@ -9122,6 +9131,10 @@ void RequestsHandler::tick()
 		_passThroughMsg = nullptr;
 		_noReplyInbound.reset();   // #424: same reason; a tick answers nothing
 
+		// #453: under _mutex and after the clear above, so the 408 it queues is flushed
+		// by this pass and the sweep cannot race handle() on _spliceTxns.
+		sweepSpliceTxns(now);
+
 		// The only drain a conference gets when nobody is signalling: an 888 leg
 		// carries RTP but no SIP, so feature codes pressed mid-conference arrive
 		// on this path alone.
@@ -10216,8 +10229,13 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	// stand-in SipClient carrying the CALLER's own address, so relaying would
 	// send the phone its own re-INVITE back (#709). Decline instead, so the
 	// holding phone keeps the call on the original SDP.
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || destNum == "440" ||
-	    pbx::isParkOrbitExt(destNum) || (session && session->isTrunk()) || !src || !dest)
+	// #453: a retrieved park keeps its orbit number as destNum but now has a real peer
+	// (a splice): relayIntoPeerDialog() below owns it. Only a leg with no peer is a
+	// park-orbit or 440 stand-in to answer locally.
+	const bool splicedLeg = session && !session->getPeerCallID().empty();
+	if (destNum == "777" || destNum == ConferenceRoom::EXT ||
+	    (!splicedLeg && (destNum == "440" || pbx::isParkOrbitExt(destNum))) ||
+	    (session && session->isTrunk()) || !src || !dest)
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -10226,6 +10244,16 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 		std::string activeIp = _localIp;
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
+		return;
+	}
+
+	// #453: a spliced dialog's peer is ANOTHER dialog (different Call-ID), so the
+	// request is rebuilt there. src/dest on a splice point across Call-IDs (and
+	// on a parked leg at the parked party's own address), so the raw relay below
+	// must never see one.
+	if (!session->getPeerCallID().empty())
+	{
+		relayIntoPeerDialog(data, session);
 		return;
 	}
 
@@ -10389,8 +10417,13 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	// park orbit (700-709, #709) have no peer leg, and a trunk leg is terminated
 	// here too. A refresh is answered; an SDP change is declined so the phone
 	// keeps the original SDP.
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || destNum == "440" ||
-	    pbx::isParkOrbitExt(destNum) || (session && session->isTrunk()) || !src || !dest)
+	// #453: a retrieved park keeps its orbit number as destNum but now has a real peer
+	// (a splice): relayIntoPeerDialog() below owns it. Only a leg with no peer is a
+	// park-orbit or 440 stand-in to answer locally.
+	const bool splicedLeg = session && !session->getPeerCallID().empty();
+	if (destNum == "777" || destNum == ConferenceRoom::EXT ||
+	    (!splicedLeg && (destNum == "440" || pbx::isParkOrbitExt(destNum))) ||
+	    (session && session->isTrunk()) || !src || !dest)
 	{
 		if (!data->hasSdp())
 		{
@@ -10411,10 +10444,18 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	// refresh arriving under a Call-ID and tags the far phone has never seen
 	// draws a 481, which ends the session (RFC 4028 §10). Review catch on #439
 	// (Globox, #453 audit). Until #453 translates in-dialog requests across the
-	// splice, the refresh is answered here, as it was before #439.
+	// splice, the refresh is answered here, as it was before #439. #453 keeps it
+	// that way on purpose: the PBX is the UAS in EACH dialog of a splice, so each
+	// dialog's session timer is refreshed on its own; nothing needs to cross.
 	if (!session->getPeerCallID().empty() && !data->hasSdp())
 	{
 		answerRefreshLocally();
+		return;
+	}
+	// #453: an SDP-bearing UPDATE on a splice is rebuilt in the peer dialog.
+	if (!session->getPeerCallID().empty())
+	{
+		relayIntoPeerDialog(data, session);
 		return;
 	}
 
@@ -10946,6 +10987,366 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 	   << "Content-Length: 0\r\n\r\n";
 
 	return getMessageFromPool(ss.str(), destAddr);
+}
+
+// ── #453: in-dialog requests across a B2BUA splice ────────────────────────────
+
+namespace
+{
+	// "CSeq: 5 INVITE" -> 5 (0 if malformed).
+	uint32_t cseqNumberOf(std::string_view cseqLine)
+	{
+		const auto colon = cseqLine.find(':');
+		size_t i = (colon == std::string_view::npos) ? 0 : colon + 1;
+		while (i < cseqLine.size() && cseqLine[i] == ' ') ++i;
+		uint32_t n = 0;
+		bool any = false;
+		for (; i < cseqLine.size() && cseqLine[i] >= '0' && cseqLine[i] <= '9'; ++i)
+		{
+			n = n * 10 + static_cast<uint32_t>(cseqLine[i] - '0');
+			any = true;
+		}
+		return any ? n : 0;
+	}
+
+	// The user part of the first sip: URI in a From/To header: the identity the
+	// far phone knows the PBX's side of its dialog by.
+	std::string uriUserOf(const std::string& header)
+	{
+		const auto sip = header.find("sip:");
+		if (sip == std::string::npos) return {};
+		const auto at = header.find('@', sip + 4);
+		if (at == std::string::npos) return {};
+		return header.substr(sip + 4, at - (sip + 4));
+	}
+}
+
+std::shared_ptr<SipClient> RequestsHandler::ownPartyOf(const std::shared_ptr<Session>& s) const
+{
+	if (!s) return nullptr;
+	if (s->isTransferBridge()) return s->wasTransferorSrc() ? s->getDest() : s->getSrc();
+	return s->getSrc();
+}
+
+bool RequestsHandler::resolvePeerDialog(const std::shared_ptr<Session>& s, PeerDialog& out)
+{
+	if (!s || s->getPeerCallID().empty()) return false;
+	auto peerOpt = getSession(s->getPeerCallID());
+	if (!peerOpt.has_value()) return false;
+	auto peer = peerOpt.value();
+	if (peer->getDialogFrom().empty() || peer->getDialogTo().empty()) return false;
+	out.peer = peer;
+	if (s->isTransferBridge())
+	{
+		// The PBX impersonates the dropped transferor (A) in the peer dialog: A's
+		// own From/To tags are what the surviving phone's dialog expects.
+		const bool peerAIsSrc = peer->wasTransferorSrc();
+		out.target  = peerAIsSrc ? peer->getDest() : peer->getSrc();
+		out.fromHdr = peerAIsSrc ? &peer->getDialogFrom() : &peer->getDialogTo();
+		out.toHdr   = peerAIsSrc ? &peer->getDialogTo()   : &peer->getDialogFrom();
+	}
+	else
+	{
+		// Pickup / park: the peer session's src is its phone, and its dialog
+		// headers were captured from that phone's side (From = the phone).
+		out.target  = peer->getSrc();
+		out.fromHdr = &peer->getDialogTo();
+		out.toHdr   = &peer->getDialogFrom();
+	}
+	return out.target != nullptr;
+}
+
+void RequestsHandler::answerSpliceLocally(const std::shared_ptr<SipMessage>& data, const char* statusLine)
+{
+	auto resp = getMessageFromPool(*data);
+	if (!resp) return;   // pool exhausted: drop, the phone retransmits (#101A)
+	resp->setHeader(statusLine);
+	resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	resp->setContact(buildContact(data->getToNumber()));
+	resp->clearBody();
+	resp->syncContentLength();
+	_outbox.emplace_back(data->getSource(), std::move(resp));
+}
+
+// #589 review: copy a header line into a SpliceTxn's fixed buffer. Callers check
+// fitsIn() for every field BEFORE sending anything, so nothing is ever cut.
+template <size_t N>
+static bool fitsIn(const char (&)[N], std::string_view src) { return src.size() < N; }
+
+template <size_t N>
+static void copyInto(char (&dst)[N], std::string_view src)
+{
+	const size_t n = src.size() < N - 1 ? src.size() : N - 1;
+	std::memcpy(dst, src.data(), n);
+	dst[n] = 0;
+}
+
+void RequestsHandler::relayIntoPeerDialog(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<Session>& session)
+{
+	// Only the phone that owns this dialog may drive it. On a transfer bridge
+	// that excludes the dropped transferor, whose leg is gone.
+	auto own = ownPartyOf(session);
+	if (!own || !sameAddress(data->getSource(), own->getAddress())) return;
+
+	const bool isInvite = data->getCSeqMethod() == SipMessageTypes::INVITE;
+	const uint32_t originCSeq = cseqNumberOf(data->getCSeq());
+
+	// A retransmission of a request already in flight: the answer will come.
+	// An INVITE's retransmit gets its 100 Trying again (RFC 3261 §17.2.1).
+	for (const auto& t : _spliceTxns)
+	{
+		if (t.state != SpliceTxn::State::Free && t.isInvite == isInvite &&
+			data->getCallID() == std::string_view(t.originCallId) && t.originCSeq == originCSeq)
+		{
+			if (isInvite) answerSpliceLocally(data, "SIP/2.0 100 Trying");
+			return;
+		}
+	}
+
+	// An offerless re-INVITE needs the originator's ACK to carry the answer on
+	// to the peer, which this relay does not do. Hold, resume and codec changes
+	// all carry SDP; refuse the rest cleanly rather than half-relay it.
+	if (!data->hasSdp())
+	{
+		answerSpliceLocally(data, "SIP/2.0 488 Not Acceptable Here");
+		return;
+	}
+
+	PeerDialog pd;
+	if (!resolvePeerDialog(session, pd))
+	{
+		answerSpliceLocally(data, "SIP/2.0 500 Server Internal Error");
+		return;
+	}
+
+	SpliceTxn* slot = nullptr;
+	for (auto& t : _spliceTxns)
+	{
+		if (t.state == SpliceTxn::State::Free) { slot = &t; break; }
+	}
+	if (!slot)
+	{
+		// Only a Completed slot may be reclaimed early: it is merely remembering
+		// the ACK for a retransmitted far-leg final, which is best effort.
+		for (auto& t : _spliceTxns)
+		{
+			if (t.state == SpliceTxn::State::Completed && (!slot || t.since < slot->since)) slot = &t;
+		}
+	}
+	if (!slot)
+	{
+		// RFC 3261 §21.5.1: the originator may retry after Retry-After.
+		auto resp = getMessageFromPool(*data);
+		if (!resp) return;
+		resp->setHeader("SIP/2.0 500 Server Internal Error");
+		resp->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		resp->setHeaderOnce("Retry-After", "1");
+		resp->clearBody();
+		resp->syncContentLength();
+		_outbox.emplace_back(data->getSource(), std::move(resp));
+		return;
+	}
+
+	// A field too long for its buffer could never be matched or answered
+	// correctly later; refuse now, before anything is sent to the peer.
+	if (!fitsIn(slot->originVia, data->getVia()) || !fitsIn(slot->originFrom, data->getFrom()) ||
+		!fitsIn(slot->originTo, data->getTo()) || !fitsIn(slot->originCallId, data->getCallID()) ||
+		!fitsIn(slot->originToNumber, data->getToNumber()))
+	{
+		answerSpliceLocally(data, "SIP/2.0 500 Server Internal Error");
+		return;
+	}
+
+	const std::string method = isInvite ? SipMessageTypes::INVITE : SipMessageTypes::UPDATE;
+	const uint32_t cseq = pd.peer->nextServerCSeq();
+	const std::string srcIpPort = _localIp + ":" + std::to_string(_serverPort);
+	const std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
+	// #425: present the PBX's side of the peer dialog under the identity that
+	// dialog already knows it by (the user of its PBX-side URI), so the far
+	// phone's remote target keeps pointing at this PBX.
+	const std::string pbxUser = uriUserOf(*pd.fromHdr);
+	const std::string_view body = data->getBody();
+
+	std::ostringstream ss;
+	ss << method << " sip:" << pd.target->getNumber() << "@" << sipwire::addrToIpPort(pd.target->getAddress()) << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
+	   << "From: " << stripHeaderName(*pd.fromHdr) << "\r\n"
+	   << "To: " << stripHeaderName(*pd.toHdr) << "\r\n"
+	   << "Call-ID: " << stripHeaderName(pd.peer->getCallID()) << "\r\n"
+	   << "CSeq: " << cseq << " " << method << "\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Contact: <sip:" << (pbxUser.empty() ? std::string("pbx") : pbxUser) << "@" << srcIpPort << ";transport=UDP>\r\n"
+	   << "Content-Type: application/sdp\r\n"
+	   << "Content-Length: " << body.size() << "\r\n\r\n"
+	   << body;
+	auto out = getMessageFromPool(ss.str(), pd.target->getAddress());
+	if (!out)
+	{
+		answerSpliceLocally(data, "SIP/2.0 500 Server Internal Error");
+		return;
+	}
+	_outbox.emplace_back(pd.target->getAddress(), std::move(out));
+	pd.peer->noteServerCSeq(cseq);
+
+	*slot = SpliceTxn{};
+	slot->state      = SpliceTxn::State::AwaitingPeer;
+	slot->isInvite   = isInvite;
+	slot->originSrc  = data->getSource();
+	slot->originCSeq = originCSeq;
+	copyInto(slot->originVia, data->getVia());
+	copyInto(slot->originFrom, data->getFrom());
+	copyInto(slot->originTo, data->getTo());
+	copyInto(slot->originCallId, data->getCallID());
+	copyInto(slot->originToNumber, data->getToNumber());
+	slot->peer     = pd.peer;
+	slot->peerCSeq = cseq;
+	(void)std::snprintf(slot->branch, sizeof(slot->branch), "%s", branch.c_str());
+	slot->since    = std::chrono::steady_clock::now();
+
+	// RFC 3261 §17.2.1: a 100 stops the originator retransmitting the re-INVITE
+	// while the far leg thinks it over (#589 review).
+	if (isInvite) answerSpliceLocally(data, "SIP/2.0 100 Trying");
+
+	// The same per-dialog bookkeeping the plain relay does.
+	if (session->getSessionExpiresSeconds() > 0)
+	{
+		session->armSessionTimer(session->getSessionExpiresSeconds(), session->isRefresher(),
+			std::chrono::steady_clock::now());
+	}
+	// Held/Connected is applied when the peer ACCEPTS the offer (a 2xx), not on
+	// send: a 488 or 491 must not leave a hold showing that never happened.
+	SipSdpMessage* sdpMsg = static_cast<SipSdpMessage*>(data.get());
+	const auto dir = data->getSdpDirection();
+	slot->holdOffer = sdpMsg->isHoldOffer() || dir == SipMessage::SdpDirection::RecvOnly;
+}
+
+bool RequestsHandler::handleSpliceResponse(const std::shared_ptr<SipMessage>& data)
+{
+	const auto status = data->getStatusInfo();
+	if (!status.has_value()) return false;
+	const uint32_t cseq = cseqNumberOf(data->getCSeq());
+	for (auto& t : _spliceTxns)
+	{
+		if (t.state == SpliceTxn::State::Free || !t.peer || t.peerCSeq != cseq) continue;
+		if (t.peer->getCallID() != data->getCallID()) continue;
+		if (data->getCSeqMethod() != (t.isInvite ? SipMessageTypes::INVITE : SipMessageTypes::UPDATE)) continue;
+
+		if (t.state != SpliceTxn::State::AwaitingPeer)
+		{
+			// #589 review B1: a RETRANSMITTED final. The originator already has its
+			// answer; the far phone did not get our ACK, so send the same one again.
+			// Anything else (a late 1xx) is ours to drop.
+			if (t.isInvite && status->code >= 200) sendSpliceAck(t, data);
+			return true;
+		}
+
+		if (status->code < 200) return true;   // provisional: the originator gets only the final
+
+		const bool ok2xx = status->code < 300;
+		if (t.isInvite)
+		{
+			// RFC 3261 §13.2.2.4 / §17.1.1.3: the PBX is the UAC on this leg, so it
+			// ACKs it -- a 2xx with a fresh branch, a non-2xx on the INVITE's own.
+			if (ok2xx)
+				(void)std::snprintf(t.ackBranch, sizeof(t.ackBranch), "z9hG4bK%s", IDGen::GenerateID(12).c_str());
+			else
+				(void)std::snprintf(t.ackBranch, sizeof(t.ackBranch), "%s", t.branch);
+			sendSpliceAck(t, data);
+		}
+
+		// The originator's own transaction gets the peer's verdict and SDP answer.
+		answerSpliceOrigin(t, data->getHeader(),
+			(ok2xx && data->hasSdp()) ? data->getBody() : std::string_view{});
+
+		// The offer took effect only now, on the peer's 2xx (#589 review).
+		if (ok2xx)
+		{
+			if (auto own = getSession(std::string_view(t.originCallId)); own.has_value())
+				own.value()->setState(t.holdOffer ? Session::State::Held : Session::State::Connected);
+		}
+
+		t.since = std::chrono::steady_clock::now();
+		if (!t.isInvite)  t = SpliceTxn{};                              // UPDATE: nothing to ACK
+		else if (ok2xx)   t.state = SpliceTxn::State::AwaitingOriginAck; // absorb the originator's ACK
+		else              t.state = SpliceTxn::State::Completed;        // remember the ACK for retransmits
+		return true;
+	}
+	return false;
+}
+
+void RequestsHandler::sendSpliceAck(const SpliceTxn& t, const std::shared_ptr<SipMessage>& resp)
+{
+	const std::string srcIpPort = _localIp + ":" + std::to_string(_serverPort);
+	std::ostringstream ack;
+	ack << "ACK sip:" << resp->getToNumber() << "@" << sipwire::addrToIpPort(resp->getSource()) << " SIP/2.0\r\n"
+	    << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << t.ackBranch << "\r\n"
+	    << "From: " << stripHeaderName(resp->getFrom()) << "\r\n"
+	    << "To: " << stripHeaderName(resp->getTo()) << "\r\n"
+	    << "Call-ID: " << stripHeaderName(resp->getCallID()) << "\r\n"
+	    << "CSeq: " << t.peerCSeq << " ACK\r\n"
+	    << "Max-Forwards: 70\r\n"
+	    << "Content-Length: 0\r\n\r\n";
+	if (auto a = getMessageFromPool(ack.str(), resp->getSource()))
+		_outbox.emplace_back(resp->getSource(), std::move(a));
+}
+
+void RequestsHandler::answerSpliceOrigin(const SpliceTxn& t, std::string_view statusLine,
+	std::string_view sdpBody)
+{
+	const std::string via = sipwire::viaWithReceived(std::string_view(t.originVia), t.originSrc);
+	std::ostringstream r;
+	r << statusLine << "\r\n"
+	  << via << "\r\n"
+	  << t.originFrom << "\r\n"
+	  << t.originTo << "\r\n"
+	  << t.originCallId << "\r\n"
+	  << "CSeq: " << t.originCSeq << " " << (t.isInvite ? SipMessageTypes::INVITE : SipMessageTypes::UPDATE) << "\r\n"
+	  << buildContact(std::string(t.originToNumber)) << "\r\n";   // #425
+	if (!sdpBody.empty())
+		r << "Content-Type: application/sdp\r\nContent-Length: " << sdpBody.size() << "\r\n\r\n" << sdpBody;
+	else
+		r << "Content-Length: 0\r\n\r\n";
+	auto resp = getMessageFromPool(r.str(), t.originSrc);
+	if (!resp) return;   // pool exhausted: the originator retransmits (#101A)
+	// #424/#472: a response built while handling a response. It carries the
+	// ORIGINATOR's Call-ID, so the no-reply guard would not match it anyway,
+	// but it is a translated relay: say so, the same as endHandle().
+	markRelay(resp.get());
+	_outbox.emplace_back(t.originSrc, std::move(resp));
+}
+
+bool RequestsHandler::absorbSpliceAck(const std::shared_ptr<SipMessage>& data)
+{
+	const uint32_t cseq = cseqNumberOf(data->getCSeq());
+	for (auto& t : _spliceTxns)
+	{
+		if (t.state == SpliceTxn::State::AwaitingOriginAck && t.originCSeq == cseq &&
+			data->getCallID() == std::string_view(t.originCallId))
+		{
+			// Keep the slot for the rest of 64*T1 so a retransmitted far-leg 2xx
+			// can still be re-ACKed (#589 review B1).
+			t.state = SpliceTxn::State::Completed;
+			return true;
+		}
+	}
+	return false;
+}
+
+void RequestsHandler::sweepSpliceTxns(std::chrono::steady_clock::time_point now)
+{
+	// 64*T1 (RFC 3261 Timer B/F): past it the far leg is not going to answer,
+	// and a final it sent is not going to be retransmitted any more.
+	constexpr auto kTimeout = std::chrono::seconds(32);
+	for (auto& t : _spliceTxns)
+	{
+		if (t.state == SpliceTxn::State::Free || now - t.since < kTimeout) continue;
+		if (t.state == SpliceTxn::State::AwaitingPeer)
+		{
+			answerSpliceOrigin(t, "SIP/2.0 408 Request Timeout", {});
+		}
+		t = SpliceTxn{};
+	}
 }
 
 std::shared_ptr<SipClient> RequestsHandler::allocateVirtualPeer(std::string number, sockaddr_in address, int expiresSeconds)
