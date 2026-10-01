@@ -419,6 +419,25 @@ public:
 		std::lock_guard<std::mutex> lock(_mutex);
 		_anchorPlacesRealCalls = real;
 	}
+	// Test-only (#713). The host build boots the loopback anchor, which is
+	// synchronous, so originateAnchorCall()'s ASYNC branch (a real anchor's
+	// 180 Ringing + asyncMakeCall()) never runs in a host test. This flips the
+	// calling convention over the loopback client so that branch can be
+	// driven. The CallEvent callback stays unwired (see the constructor), so
+	// no worker event ever completes such a call: it ends by CANCEL, by the
+	// ring reap, or by the spawn-failure path below.
+	void forceAsyncAnchorForTest(bool on)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_anchorBootType = on ? TelephonyProviderType::Telephony : TelephonyProviderType::Loopback;
+	}
+	// Test-only (#713): the next asyncMakeCall() behaves as if its worker could
+	// not be created (the ESP build's createTaskPreferPsram() failure).
+	void failNextAnchorWorkerSpawnForTest()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_failNextAnchorWorkerSpawn = true;
+	}
 	// Test-only (#659): move every 911/933 dial mark `d` into the past.
 	void ageEmergencyCallbacksForTest(std::chrono::steady_clock::duration d)
 	{
@@ -1755,7 +1774,9 @@ private:
 	// spawnAnchorWorker(), reaped in tick()/the destructor) that calls the real
 	// method off the SIP thread, then re-takes _mutex only to log/react. Never
 	// called for a synchronous (Loopback) anchor — see anchorIsSynchronous().
-	void asyncMakeCall(const std::string& destination, const std::string& callId, const std::string& callerNumber);
+	// #713: false when the worker could not be created. The call is then already
+	// answered 503 and ended here; the caller must not report it as placed.
+	bool asyncMakeCall(const std::string& destination, const std::string& callId, const std::string& callerNumber);
 	// 503 a still-ringing outbound anchor call off its stored INVITE (endCall()
 	// sends no response itself). Caller holds _mutex; outbox is _outbox on the
 	// SIP thread or _asyncOutbox from a worker.
@@ -1800,6 +1821,7 @@ private:
 	void reapAnchorWorkers(bool drainAll = false);
 	std::mutex _anchorWorkMutex;
 	std::vector<AnchorWorker> _anchorWorkThreads;
+	bool _failNextAnchorWorkerSpawn = false;   // #713 test seam; under _mutex
 #endif
 
 	// ── Inbound anchor call dispatch (Stage B) ────────────────────────────────────

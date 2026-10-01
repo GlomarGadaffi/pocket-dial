@@ -4806,7 +4806,16 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// synchronous branch's comment above. Dispatched off the SIP thread; the
 	// 200 OK follows later from the CallEvent::Answered callback once the far
 	// leg actually connects.
-	asyncMakeCall(destination, callID, caller->getNumber());
+	if (!asyncMakeCall(destination, callID, caller->getNumber()))
+	{
+		// #713: no worker, so nothing will ever place this call. asyncMakeCall()
+		// has answered 503 and ended the session: the INVITE is owned (true),
+		// but the call was not placed, and the emergency notification must say
+		// NOT ROUTED rather than the routed lie this flag's optimistic default
+		// would tell.
+		if (placedOut) *placedOut = false;
+		return true;
+	}
 	queueLog("anchor(" + remoteExt + "): " + std::string(caller->getNumber()) + " ringing (async makeCall dispatched)");
 	return true;
 }
@@ -4852,10 +4861,11 @@ void RequestsHandler::refuseRingingAnchor(const std::string& callId,
 	outbox.emplace_back(invite->getSource(), std::move(resp));
 }
 
-void RequestsHandler::asyncMakeCall(const std::string& destination, const std::string& callId,
+bool RequestsHandler::asyncMakeCall(const std::string& destination, const std::string& callId,
 	const std::string& callerNumber)
 {
-	if (!_anchorClient) return;
+	if (!_anchorClient) return false;   // unreachable: originateAnchorCall() returns first with no client
+	bool spawned = false;
 #if defined(ESP_PLATFORM) || defined(ESP32)
 	struct MakeCallArg
 	{
@@ -4920,21 +4930,16 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 		pd::deleteTask(NULL);   // created WithCaps(PSRAM)
 	}, "tel_makecall", 12288, arg, 5, NULL) != pdPASS)
 	{
-		queueLog("[Telephony] asyncMakeCall: outbound worker xTaskCreate FAILED (heap exhausted) — call NOT placed", true);
 		delete arg;
-		// onAnchorInvite() already allocated the session and sent 180 Ringing; with
-		// no worker nobody will ever answer or fail it, so without this the handset
-		// rings until tick()'s no-answer reap fires ~20 s later. Do what that reap
-		// does for a still-ringing anchor call right now: 503 the caller off the
-		// stored INVITE (endCall() itself sends no SIP response), then tear the
-		// session down. Runs on the SIP thread under _mutex (handler dispatch),
-		// same as the synchronous anchor branch's direct endCall() call, so
-		// _outbox (not _asyncOutbox) is the right queue.
-		refuseRingingAnchor(callId, _outbox);
-		endCall(callId, callerNumber, destination, "anchor worker spawn fail");
+	}
+	else
+	{
+		spawned = true;
 	}
 #else
-	spawnAnchorWorker([this, destination, callId, callerNumber]() {
+	spawned = !_failNextAnchorWorkerSpawn;   // #713 test seam: one refused spawn
+	_failNextAnchorWorkerSpawn = false;
+	if (spawned) spawnAnchorWorker([this, destination, callId, callerNumber]() {
 		std::string ownLeg;
 		if (!_anchorClient->makeCall(destination, &ownLeg))
 		{
@@ -4963,6 +4968,22 @@ void RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 		}
 	});
 #endif
+	if (!spawned)
+	{
+		queueLog("[Telephony] asyncMakeCall: outbound worker xTaskCreate FAILED (heap exhausted) — call NOT placed", true);
+		// onAnchorInvite() already allocated the session and sent 180 Ringing; with
+		// no worker nobody will ever answer or fail it, so without this the handset
+		// rings until tick()'s no-answer reap fires ~20 s later. Do what that reap
+		// does for a still-ringing anchor call right now: 503 the caller off the
+		// stored INVITE (endCall() itself sends no SIP response), then tear the
+		// session down. Runs on the SIP thread under _mutex (handler dispatch),
+		// same as the synchronous anchor branch's direct endCall() call, so
+		// _outbox (not _asyncOutbox) is the right queue.
+		refuseRingingAnchor(callId, _outbox);
+		endCall(callId, callerNumber, destination, "anchor worker spawn fail");
+		return false;
+	}
+	return true;
 }
 
 void RequestsHandler::asyncDropCall(const std::string& participantId)
