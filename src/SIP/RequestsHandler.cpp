@@ -11201,7 +11201,7 @@ void RequestsHandler::relayIntoPeerDialog(const std::shared_ptr<SipMessage>& dat
 	copyInto(slot->originToNumber, data->getToNumber());
 	slot->peer     = pd.peer;
 	slot->peerCSeq = cseq;
-	std::snprintf(slot->branch, sizeof(slot->branch), "%s", branch.c_str());
+	(void)std::snprintf(slot->branch, sizeof(slot->branch), "%s", branch.c_str());
 	slot->since    = std::chrono::steady_clock::now();
 
 	// RFC 3261 §17.2.1: a 100 stops the originator retransmitting the re-INVITE
@@ -11249,9 +11249,9 @@ bool RequestsHandler::handleSpliceResponse(const std::shared_ptr<SipMessage>& da
 			// RFC 3261 §13.2.2.4 / §17.1.1.3: the PBX is the UAC on this leg, so it
 			// ACKs it -- a 2xx with a fresh branch, a non-2xx on the INVITE's own.
 			if (ok2xx)
-				std::snprintf(t.ackBranch, sizeof(t.ackBranch), "z9hG4bK%s", IDGen::GenerateID(12).c_str());
+				(void)std::snprintf(t.ackBranch, sizeof(t.ackBranch), "z9hG4bK%s", IDGen::GenerateID(12).c_str());
 			else
-				std::snprintf(t.ackBranch, sizeof(t.ackBranch), "%s", t.branch);
+				(void)std::snprintf(t.ackBranch, sizeof(t.ackBranch), "%s", t.branch);
 			sendSpliceAck(t, data);
 		}
 
