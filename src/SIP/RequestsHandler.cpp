@@ -175,6 +175,18 @@ namespace
 	// leg's state, which sits at "Dialing" right through far-end alerting — there
 	// is no alerting signal to key off).
 	constexpr auto ANCHOR_NO_ANSWER_TIMEOUT = std::chrono::seconds(60);
+
+	// Issue #720, RFC 3261 §8.2.6.2: a response to a request that already carries a
+	// To tag must echo that tag. Append a fresh one only when the To has none.
+	std::string toWithTag(std::string_view to)
+	{
+		std::string out(to);
+		if (out.find(";tag=") == std::string::npos)
+		{
+			out += ";tag=" + IDGen::GenerateID(9);
+		}
+		return out;
+	}
 }
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
@@ -6955,7 +6967,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		accepted->setHeader(SipMessageTypes::ACCEPTED);
 		accepted->clearBody();
 		accepted->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
+		accepted->setTo(toWithTag(data->getTo()));
 		_outbox.emplace_back(data->getSource(), std::move(accepted));
 
 		_outbox.emplace_back(transferor->getAddress(), std::move(byeAfromAB));
@@ -7100,7 +7112,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		if (isRetransmit)
 		{
-			response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
+			response->setTo(toWithTag(data->getTo()));
 		}
 		else
 		{
@@ -7141,7 +7153,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	accepted->setHeader(SipMessageTypes::ACCEPTED);
 	accepted->clearBody();
 	accepted->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-	accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
+	accepted->setTo(toWithTag(data->getTo()));
 
 	// Issue #203, unchanged in substance: an unresolvable target (a park orbit, a
 	// typo, an extension that just dropped its registration) declines the transfer
