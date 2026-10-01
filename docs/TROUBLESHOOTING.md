@@ -33,10 +33,11 @@ Quick references: [SETUP_GUIDE.md](SETUP_GUIDE.md) ·
 >   deliberately has no such gate and starts SIP unconditionally
 >   (`main/esp_main_display.cpp:799-806`).
 > * The registrar ships in `learn` mode (#441; `open` is retired, #502): a new phone is
->   adopted on its first REGISTER with no SIP authentication, and its INVITEs are admitted
->   unchallenged. Digest auth (RFC 2617) applies once an admin promotes the device to
->   Secured, or to every extension in `secure` mode, minus open gaps (#507: an ARP miss
->   skips it; #560: in-dialog relays still carry the credential; #525: nonce reuse).
+>   adopted on its first REGISTER with no SIP authentication (its second locks the
+>   extension to its MAC, #440), and its INVITEs are admitted unchallenged. Digest auth
+>   (RFC 2617) applies once an admin promotes the device to Secured, or to every extension
+>   in `secure` mode, minus open gaps (#560: in-dialog relays still carry the credential;
+>   #525: nonce reuse).
 > * The SoftAP is **open** by default, the dashboard is **plain HTTP**, and OTA images are
 >   **unsigned**. All three are deliberate defaults, not oversights.
 
@@ -115,7 +116,8 @@ Symptom: The SIP client never reaches "registered", times out, or shows an error
 | Client pruned after registering | The registrar prunes a client after ~15 s of silence if it ignores the `OPTIONS` keepalive sent every 5 s (`RequestsHandler.cpp`). Enable the phone's keep-alive / answer-OPTIONS option. |
 | Rate-limited (packets dropped) | The SIP UDP path uses a per-source-IP token bucket (burst 40, 20 pkt/s sustained). A flooding or misconfigured client gets packets dropped; watch `packetsDropped` on `/api/status` ([ARCHITECTURE.md §5](ARCHITECTURE.md)). |
 | Registrar is in `secure` mode | Every `REGISTER` is digest-challenged and this phone has no secret, or its MAC does not match the one the extension is locked to. See [All phones stopped registering at once](#all-phones-stopped-registering-at-once). |
-| Registrar is in `learn` mode and the extension is secured to another phone | Learn mode adopts any new MAC, but once an admin secures a device (`POST /api/registrar/device` with `action=secure`) its extension is locked to that MAC and a different phone on the same extension is refused (`Extension Locked To Another Device`). `action=forget` releases the device so the new hardware can claim it ([API.md](API.md#post-apiregistrardevice)). |
+| Registrar is in `learn` mode and the extension is locked or secured to another phone | Learn mode adopts a new MAC, and that phone's second registration locks its extension to the MAC (#440); an admin can also secure a device (`POST /api/registrar/device` with `action=secure`). Either way a different phone on the same extension is refused (`Extension Locked To Another Device`). `action=forget` releases the device so the new hardware can claim it ([API.md](API.md#post-apiregistrardevice)). |
+| `503` with `Retry-After: 5` in `learn` mode | The extension is locked (#440) and this REGISTER's source did not resolve in the ARP table. An on-link phone succeeds on the retry (the board ARPs it while answering); one that keeps getting it now reaches the board through a router, so `forget` its device ([LEARN_MODE.md](LEARN_MODE.md) §8). |
 
 > [!NOTE]
 > **What a `401` on REGISTER means depends on the registrar mode.** Check it first:
