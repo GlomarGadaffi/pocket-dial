@@ -345,3 +345,65 @@ TEST(ParkOrbit, HoldsCallWhileParkedOnly)
 		<< "a retrieved leg is a bridged call: its BYE takes the peer-relay path";
 	EXPECT_FALSE(park.holdsCall("Call-ID: retrieve-804c@192.168.1.51"));
 }
+
+// Issue #718: the ring-back session (the PBX is the UAC toward the parker) had
+// no dialog headers, so onBye's peer branch skipped the parker's BYE and the
+// parker's phone stayed in a live call with dead air. onBye sends
+// (getDialogTo(), getDialogFrom()) as the BYE's (From, To), so the UAC-role
+// capture is swapped: dialogTo is OUR From (our tag), dialogFrom is the
+// parker's To (its tag). The BYE then goes out From=ours, To=parker's.
+TEST(ParkOrbit, RingbackAnswerCapturesSwappedDialogHeadersForTheParkersBye)
+{
+	FakePbxEnv env;
+	ParkOrbit park(env);
+	const sockaddr_in parkedAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+	auto parker = std::make_shared<SipClient>("101", parkedAddr);
+	env.registered["101"] = parker;
+
+	park.onInvite(inviteTo("700", "101", "parked-call-718@192.168.1.50", parkedAddr, "192.168.1.50"),
+		parker, 0);
+	env.sent.clear();
+
+	// Past the park timeout: the sweep rings the parker back.
+	park.sweep(std::chrono::steady_clock::now() + std::chrono::hours(1));
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string ringback = env.sentRaw(0);
+	ASSERT_EQ(ringback.rfind("INVITE sip:101@", 0), 0u) << ringback;
+
+	auto lineOf = [](const std::string& raw, const std::string& name) {
+		const auto at = raw.find("\r\n" + name);
+		if (at == std::string::npos) return std::string{};
+		const auto end = raw.find("\r\n", at + 2);
+		return raw.substr(at + 2, end - at - 2);
+	};
+	const std::string rbFrom   = lineOf(ringback, "From: ");
+	const std::string rbCallID = lineOf(ringback, "Call-ID: ");
+	ASSERT_FALSE(rbFrom.empty());
+	ASSERT_FALSE(rbCallID.empty());
+	const auto tagAt = rbFrom.find(";tag=");
+	ASSERT_NE(tagAt, std::string::npos) << rbFrom;
+	const std::string ourTag = rbFrom.substr(tagAt + 5);
+
+	// The parker answers, echoing our From and adding its own To tag.
+	const std::string body = "v=0\r\no=- 1 1 IN IP4 192.168.1.50\r\ns=call\r\nc=IN IP4 192.168.1.50\r\n"
+		"t=0 0\r\nm=audio 4000 RTP/AVP 0\r\n";
+	const std::string okRaw =
+		"SIP/2.0 200 OK\r\n"
+		"Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bKrb718\r\n" +
+		rbFrom + "\r\n"
+		"To: <sip:101@192.168.1.10>;tag=parkertag718\r\n" +
+		rbCallID + "\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Contact: <sip:101@192.168.1.50:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	ASSERT_TRUE(park.handleOk(std::make_shared<SipMessage>(okRaw, parkedAddr)));
+
+	auto rb = env.findSession(rbCallID);
+	ASSERT_TRUE(rb);
+	ASSERT_TRUE(rb->isParkUac());
+	EXPECT_NE(rb->getDialogTo().find("tag=" + ourTag), std::string::npos)
+		<< "BYE From (getDialogTo) must carry OUR tag: " << rb->getDialogTo();
+	EXPECT_NE(rb->getDialogFrom().find("tag=parkertag718"), std::string::npos)
+		<< "BYE To (getDialogFrom) must carry the PARKER's tag: " << rb->getDialogFrom();
+}

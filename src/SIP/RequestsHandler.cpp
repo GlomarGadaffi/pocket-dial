@@ -6176,11 +6176,10 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			// malformed and phones drop it. CallPickup::complete() and
 			// ParkOrbit's park+retrieve paths always capture both via
 			// setDialogHeaders() (see ParkOrbit::onInvite). ParkOrbit's
-			// ring-back-timeout leg (isParkUac()) is the one path that still
-			// doesn't — it's a server-initiated (UAC-role) dialog, so its
-			// From/To would need swapped capture, not just the same call —
-			// left as-is: a ring-back leg still gets the endCall() cleanup
-			// below, just not a peer-phone BYE, rather than a malformed one.
+			// ring-back-timeout leg (isParkUac()) is a server-initiated
+			// (UAC-role) dialog, so ParkOrbit::handleOk captures it swapped
+			// (dialogTo = our From, dialogFrom = the parker's To, #718) and the
+			// (getDialogTo(), getDialogFrom()) order below is right for it too.
 			if (auto notify = peer->getSrc();
 				notify && !peer->getDialogFrom().empty() && !peer->getDialogTo().empty())
 			{
