@@ -70,8 +70,8 @@ Two consequences you must plan around:
   adopted-without-MAC and resolve on the next registration cycle. **Corrected: that state
   cannot occur.** On an ARP miss `admitLearn()` adopts *nothing*: it accepts the REGISTER,
   unless the extension is already locked or secured. A locked extension is accepted only
-  from its registered IP and port (the owner's own refresh; the ARP table holds 10
-  entries by default and is often smaller than the phone count); any other source gets
+  from its registered IP and port (the owner's own refresh; ARP entries age out, and the
+  table holds 40 on the full builds, 10 on the 8-phone constrained one); any other source gets
   `503` with `Retry-After: 5` (sending it makes the box ARP the phone, so the retry can
   resolve). A secured one is digest-challenged (#507). The
   MAC is the device map's key (`Registrar.hpp:126`), so a

@@ -388,9 +388,10 @@ Registrar::AuthDecision Registrar::admitLearn(
 		{
 			if (fromRegisteredAddress)
 			{
-				// #487 review: the owner's own refresh. lwIP's ARP table (10
-				// entries) is smaller than the client pool and every phone is
-				// OPTIONS-pinged, so a locked phone often misses. The binding at
+				// #487 review: the owner's own refresh. lwIP's ARP entries age
+				// out, and churn when the table is near the phone count (10 by
+				// default; see the top-level CMakeLists.txt), so a locked phone
+				// can miss. The binding at
 				// this exact IP:port was made by a REGISTER the lock admitted, so
 				// this admits no more than an ARP hit on the owner's IP would.
 				// Nothing is recorded and the lock is unchanged; a Secured

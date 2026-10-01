@@ -34,6 +34,17 @@ if(DEFINED ENV{IDF_PATH})
         COMMENT "Issue #496: checking lwIP calls the IPv4 input guard"
         VERBATIM)
 
+    # #487 review: lwIP's ARP table defaults to 10 entries (lwip/opt.h; IDF's
+    # lwipopts.h does not set it), fewer than the 32-phone client pool, and
+    # every registered phone is OPTIONS-pinged every 5 s, so entries churn:
+    # sends re-ARP, and a Learn-locked phone's REGISTER misses and is answered
+    # 503 (after a reboot, every locked phone). 40 holds the pool plus the
+    # gateway and a few other peers, at 24 B an entry (+720 B internal .bss).
+    # Only etharp.c reads it. SIP_CONSTRAINED keeps the default: 8 phones.
+    if(NOT SIP_CONSTRAINED)
+        target_compile_definitions(${pd_lwip_lib} PRIVATE "ARP_TABLE_SIZE=40")
+    endif()
+
     # Issue #420: the Ethernet transports leave the SAR ADC entropy source on
     # for their whole uptime (esp_main_eth*.cpp). Fail the build if the linked
     # image ever gains an ADC / RF (or, on lan8720's classic ESP32, I2S) driver
