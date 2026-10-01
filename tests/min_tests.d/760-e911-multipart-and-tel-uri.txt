@@ -1,2 +1,2 @@
-# EmergencyRoute_test.cpp: 5 (#760: a multipart 911/933 INVITE with PIDF-LO is routed over the trunk and the anchor, not 488; tel:911, tel:933 and urn:service:test.sos are routed, not 400, and a tel:911 CANCEL still ends the call; non-emergency multipart and tel: are still refused)
-5
+# EmergencyRoute_test.cpp: 14 (#760: a multipart 911/933 INVITE with PIDF-LO is routed over the trunk and the anchor, not 488; tel:911, tel:933 and urn:service:test.sos are routed, not 400, and a tel:911 CANCEL still ends the call; non-emergency multipart and tel: are still refused. Review follow-up, +9: the unwrap keys on the To user, so a 911 Request-URI over To 102 is still refused; only the To URI is read, never a display name or parameter; tel:9911 and tel:9933 are emergencies; six hostile multipart shapes are refused untouched or unwrapped clean)
+14

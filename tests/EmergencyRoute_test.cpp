@@ -941,16 +941,17 @@ TEST(EmergencyCallback, ACallToAnotherExtensionIsNot)
 
 namespace
 {
-	// An INVITE from 101 with a caller-chosen Request-URI, To URI and body.
-	std::shared_ptr<SipMessage> makeShapedInvite(const std::string& requestUri,
-		const std::string& toUri, const std::string& contentType,
+	// An INVITE from 101 with a caller-chosen Request-URI, To value and body.
+	// `toValue` is used verbatim: a display name, parameters or a bare URI.
+	std::shared_ptr<SipMessage> makeInviteWithToValue(const std::string& requestUri,
+		const std::string& toValue, const std::string& contentType,
 		const std::string& extraHeaders, const std::string& body, const std::string& callId)
 	{
 		const std::string raw =
 			"INVITE " + requestUri + " SIP/2.0\r\n"
 			"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKei" + callId + "\r\n"
 			"From: <sip:101@server>;tag=ef" + callId + "\r\n"
-			"To: <" + toUri + ">\r\n"
+			"To: " + toValue + "\r\n"
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 1 INVITE\r\n"
 			"Max-Forwards: 70\r\n"
@@ -959,6 +960,14 @@ namespace
 			"Content-Type: " + contentType + "\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
+	}
+
+	// The same INVITE with To: <toUri>.
+	std::shared_ptr<SipMessage> makeShapedInvite(const std::string& requestUri,
+		const std::string& toUri, const std::string& contentType,
+		const std::string& extraHeaders, const std::string& body, const std::string& callId)
+	{
+		return makeInviteWithToValue(requestUri, "<" + toUri + ">", contentType, extraHeaders, body, callId);
 	}
 
 	const std::string kSdpOffer =
@@ -1174,4 +1183,305 @@ TEST(EmergencyRoute, ANonEmergencyMultipartOrTelInviteIsStillRefusedAsToday)
 		"application/sdp", "", kSdpOffer, "er-tel-plain"));
 	EXPECT_EQ(b.count("SIP/2.0 400"), 1u) << b.dump();
 	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #760 review: the unwrap keys on the number onInvite routes on, and only the
+// URI of a tel: To is read, with the same emergency numbers as a sip: URI
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(EmergencyRoute, AMultipartInviteToAnExtensionIsRefusedEvenWithA911RequestUri)
+{
+	// onInvite routes on the To user. The unwrap also took a 911 Request-URI,
+	// so INVITE sip:911@ with To 102 had its multipart body unwrapped and was
+	// then relayed to 102 past the SDP gate: an ordinary call let in on an
+	// emergency exemption. It is refused, as it was before #760.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->handle(makeRegister("102", "192.168.79.12"));
+	b.sent.clear();
+
+	b.handler->handle(makeShapedInvite("sip:911@server", "sip:102@server",
+		"multipart/mixed; boundary=pdloc4", "", multipartWithLocation("pdloc4"), "er-mp-ruri911"));
+
+	EXPECT_EQ(b.count("SIP/2.0 488", kHandsetIp) + b.count("SIP/2.0 415", kHandsetIp), 1u)
+		<< "refused (488 from the SDP gate, 415 once #759's header gate lands):\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE", "192.168.79.12"), 0u) << "102 must not be rung:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 180"), 0u) << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: er-mp-ruri911").has_value());
+}
+
+TEST(EmergencyRoute, ATelUriInADisplayNameOrAParameterIsNotAnEmergency)
+{
+	// The tel: and urn:service:test.sos readers took the first match anywhere
+	// in the To line, so a display name such as "Hotel:911 lobby" read as 911
+	// and an ordinary call went to the PSAP. Only the URI counts. Each of these
+	// is a call to tel:+15551230100, which reads as no user (400), as before.
+	for (const char* to : {
+			"\"Hotel:911 lobby\" <tel:+15551230100>",
+			"Hotel:911 <tel:+15551230100>",
+			"\"Lobby <tel:911>\" <tel:+15551230100>",
+			"\"Desk \\\" <tel:911>\" <tel:+15551230100>",   // an escaped quote keeps the name open
+			"\"tel:911\" <tel:+15551230100>",
+			"<tel:+15551230100>;x=tel:911",
+			"\"urn:service:test.sos drill\" <tel:+15551230100>"})
+	{
+		SCOPED_TRACE(to);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		auto invite = makeInviteWithToValue("tel:+15551230100", to, "application/sdp", "", kSdpOffer, "er-dn");
+		EXPECT_EQ(invite->getToNumber(), "");
+		b.handler->handle(invite);
+
+		EXPECT_EQ(b.count("SIP/2.0 400", kHandsetIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << "nothing may reach the PSAP:\n" << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 180"), 0u) << b.dump();
+	}
+
+	// The real thing still reads as 911, whatever surrounds its URI.
+	for (const char* to : {"\"Front Desk\" <tel:911>", "<TEL:911>", "tel:911",
+	                       "\"a<b\" <tel:911;phone-context=+1>"})
+	{
+		SCOPED_TRACE(to);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		auto invite = makeInviteWithToValue("tel:911", to, "application/sdp", "", kSdpOffer, "er-dn-911");
+		EXPECT_EQ(invite->getToNumber(), "911");
+		b.handler->handle(invite);
+
+		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+	}
+
+	// The Request-URI goes through the same reader, from a start line.
+	auto withParams = makeShapedInvite("tel:911;phone-context=+1", "tel:911", "application/sdp", "",
+		kSdpOffer, "er-ruri-params");
+	EXPECT_EQ(withParams->getRequestUriUser(), "911");
+}
+
+TEST(EmergencyRoute, ATrunkPrefixedTelUriIsAnEmergencyAsItsSipUriIs)
+{
+	// The tel: reader accepted exactly 911 and 933, so tel:9911 (a trunk-access
+	// 9 dialed out of habit) was a 400 while sip:9911@ is 911. Both now ask
+	// classifyEmergencyDial(), and the carrier gets the bare number.
+	struct Shape { const char* uri; const char* bare; };
+	for (const Shape s : {Shape{"tel:9911", "911"}, Shape{"tel:9933", "933"}})
+	{
+		SCOPED_TRACE(s.uri);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		auto invite = makeShapedInvite(s.uri, s.uri, "application/sdp", "", kSdpOffer, "er-tel-prefixed");
+		EXPECT_EQ(invite->getToNumber(), std::string(s.uri).substr(4));
+		EXPECT_EQ(invite->getRequestUriUser(), std::string(s.uri).substr(4));
+		b.handler->handle(invite);
+
+		EXPECT_EQ(b.count("SIP/2.0 400"), 0u) << "the emergency URI was refused:\n" << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:" + std::string(s.bare) + "@" + kSbcIp, kSbcIp), 1u)
+			<< "the carrier gets exactly one INVITE for the bare number:\n" << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u) << b.dump();
+	}
+
+	// Control: one trunk digit only, and only before 911 or 933.
+	for (const char* uri : {"tel:99911", "tel:9411"})
+	{
+		SCOPED_TRACE(uri);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->handle(makeShapedInvite(uri, uri, "application/sdp", "", kSdpOffer, "er-tel-notem"));
+		EXPECT_EQ(b.count("SIP/2.0 400", kHandsetIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+	}
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #760 review: hostile multipart bodies on a 911 INVITE. Each is checked twice:
+// what unwrapMultipartSdp() alone makes of the message, then what the handler
+// sends. A body the unwrap cannot read is left byte-for-byte as it came and
+// the SDP gate refuses it (488); nothing reaches the carrier. A body it can
+// read yields exactly the SDP part, and no MIME text reaches the carrier.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+	struct Unwrapped { bool ok = false; std::string body; std::string wire; };
+
+	Unwrapped unwrapAlone(const std::string& contentType, const std::string& body)
+	{
+		auto m = makeShapedInvite("sip:911@server", "sip:911@server", contentType, "", body, "er-unwrap");
+		Unwrapped u;
+		u.ok = m->unwrapMultipartSdp();
+		u.body = std::string(m->getBody());
+		u.wire = m->toString();
+		return u;
+	}
+
+	void expectRefusedUntouched(const std::string& contentType, const std::string& body,
+		const std::string& callId)
+	{
+		const Unwrapped u = unwrapAlone(contentType, body);
+		EXPECT_FALSE(u.ok);
+		EXPECT_EQ(u.body, body) << "the body must be left as it came";
+		EXPECT_NE(u.wire.find("\r\nContent-Type: " + contentType + "\r\n"), std::string::npos) << u.wire;
+		EXPECT_NE(u.wire.find("\r\nContent-Length: " + std::to_string(body.size()) + "\r\n"),
+			std::string::npos) << u.wire;
+
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->handle(makeShapedInvite("sip:911@server", "sip:911@server", contentType, "", body, callId));
+		EXPECT_EQ(b.count("SIP/2.0 488", kHandsetIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 180"), 0u) << b.dump();
+		EXPECT_FALSE(b.handler->getSession("Call-ID: " + callId).has_value());
+	}
+
+	void expectRoutedClean(const std::string& contentType, const std::string& body,
+		const std::string& boundary, const std::string& callId)
+	{
+		const Unwrapped u = unwrapAlone(contentType, body);
+		EXPECT_TRUE(u.ok);
+		// RFC 2046 s5.1.1: the CRLF before a delimiter belongs to the delimiter.
+		EXPECT_EQ(u.body, kSdpOffer.substr(0, kSdpOffer.size() - 2)) << "exactly the SDP part";
+		EXPECT_NE(u.wire.find("\r\nContent-Type: application/sdp\r\n"), std::string::npos) << u.wire;
+		EXPECT_NE(u.wire.find("\r\nContent-Length: " + std::to_string(u.body.size()) + "\r\n"),
+			std::string::npos) << u.wire;
+		EXPECT_EQ(u.wire.find("--" + boundary), std::string::npos) << u.wire;
+		EXPECT_EQ(u.wire.find("ns:pidf"), std::string::npos) << "the location part is dropped";
+
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->handle(makeShapedInvite("sip:911@server", "sip:911@server", contentType, "", body, callId));
+		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 5"), 0u) << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u) << b.dump();
+		EXPECT_FALSE(b.saw(boundary)) << "the MIME boundary must not reach the carrier";
+		EXPECT_FALSE(b.saw("ns:pidf")) << "nor the location part";
+	}
+
+	const std::string kLocationPart =
+		"Content-Type: application/pidf+xml\r\n"
+		"\r\n"
+		"<presence xmlns=\"urn:ietf:params:xml:ns:pidf\" entity=\"pres:101@pd.example\"/>\r\n";
+}
+
+TEST(EmergencyRoute, AHostileQuotedMultipartBoundaryIsUnwrappedOnlyWhenItMatches)
+{
+	{
+		SCOPED_TRACE("empty quoted boundary");
+		expectRefusedUntouched("multipart/mixed; boundary=\"\"", multipartWithLocation("pdq"), "er-hq-empty");
+	}
+	{
+		SCOPED_TRACE("quoted boundary naming another boundary than the body's");
+		expectRefusedUntouched("multipart/mixed; boundary=\"pdA\"", multipartWithLocation("pdB"), "er-hq-other");
+	}
+	{
+		// A space and a colon are legal boundary characters (RFC 2046 s5.1.1)
+		// once quoted; a token parse would cut at the space.
+		SCOPED_TRACE("quoted boundary holding a space and a colon");
+		expectRoutedClean("multipart/mixed; boundary=\"pd q:1\"", multipartWithLocation("pd q:1"), "pd q:1",
+			"er-hq-space");
+	}
+}
+
+TEST(EmergencyRoute, AnUnterminatedMultipartBoundaryNeverReachesTheCarrier)
+{
+	{
+		// The quote runs to the end of Content-Type, so the boundary is the rest
+		// of the value. Lenient on purpose: it is a 911, and the part it yields
+		// still has to pass the SDP gate.
+		SCOPED_TRACE("quoted boundary missing its closing quote");
+		expectRoutedClean("multipart/mixed; boundary=\"pdunterm7", multipartWithLocation("pdunterm7"), "pdunterm7", "er-hu-open");
+	}
+	{
+		SCOPED_TRACE("missing closing quote, more parameters after it");
+		expectRefusedUntouched("multipart/mixed; boundary=\"pdunterm7; charset=utf-8",
+			multipartWithLocation("pdunterm7"), "er-hu-params");
+	}
+	{
+		SCOPED_TRACE("the delimiter after the SDP part is cut short");
+		expectRefusedUntouched("multipart/mixed; boundary=pdtrunc",
+			"--pdtrunc\r\nContent-Type: application/sdp\r\n\r\n" + kSdpOffer + "--pdtr", "er-hu-cut");
+	}
+}
+
+TEST(EmergencyRoute, AMultipartBoundaryLongerThanTheBodyIsRefusedNotOverRead)
+{
+	const std::string b70(70, 'x');
+	const std::string b71(71, 'x');
+	{
+		// Every line is shorter than "--" + boundary, so none can be a delimiter.
+		SCOPED_TRACE("70-byte boundary, 52-byte body");
+		const std::string body =
+			"--" + b70.substr(0, 10) + "\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n";
+		ASSERT_LT(body.size(), b70.size());
+		expectRefusedUntouched("multipart/mixed; boundary=" + b70, body, "er-hl-short");
+	}
+	{
+		SCOPED_TRACE("71-byte boundary, over RFC 2046's 70");
+		expectRefusedUntouched("multipart/mixed; boundary=" + b71, multipartWithLocation(b71), "er-hl-71");
+	}
+	{
+		SCOPED_TRACE("control: 70 bytes is still a boundary");
+		expectRoutedClean("multipart/mixed; boundary=" + b70, multipartWithLocation(b70), b70, "er-hl-70");
+	}
+}
+
+TEST(EmergencyRoute, AMultipartPartWithNoBlankLineAfterItsHeadersIsRefused)
+{
+	{
+		// The SDP lines read as more part headers, so the part has no body.
+		SCOPED_TRACE("SDP part without its blank line");
+		expectRefusedUntouched("multipart/mixed; boundary=pdnoblank7",
+			"--pdnoblank7\r\nContent-Type: application/sdp\r\n" + kSdpOffer +
+			"--pdnoblank7\r\n" + kLocationPart + "--pdnoblank7--\r\n", "er-hb-sdp");
+	}
+	{
+		SCOPED_TRACE("no part has a blank line");
+		expectRefusedUntouched("multipart/mixed; boundary=pdnoblank7",
+			"--pdnoblank7\r\nContent-Type: application/pidf+xml\r\n<presence/>\r\n"
+			"--pdnoblank7\r\nContent-Type: application/sdp\r\n" + kSdpOffer + "--pdnoblank7--\r\n", "er-hb-none");
+	}
+}
+
+TEST(EmergencyRoute, ANestedMultipartEmergencyInviteIsNotUnwrappedIntoTheInnerPart)
+{
+	// One level only: a part's own multipart body is never descended into, so
+	// an SDP that exists only inside a nested multipart is not found.
+	const std::string inner =
+		"--pdinner7\r\nContent-Type: application/sdp\r\n\r\n" + kSdpOffer + "--pdinner7--\r\n";
+	{
+		SCOPED_TRACE("the only SDP is nested");
+		expectRefusedUntouched("multipart/mixed; boundary=pdouter7",
+			"--pdouter7\r\nContent-Type: multipart/alternative; boundary=pdinner7\r\n\r\n" + inner +
+			"--pdouter7\r\n" + kLocationPart + "--pdouter7--\r\n", "er-hn-only");
+	}
+	{
+		// The outer SDP part is taken; the nested part (here a second offer on
+		// another port) is dropped with the location.
+		SCOPED_TRACE("an outer SDP part beside a nested one");
+		std::string other = inner;
+		other.replace(other.find("40000"), 5, "41000");
+		expectRoutedClean("multipart/mixed; boundary=pdouter7",
+			"--pdouter7\r\nContent-Type: application/sdp\r\n\r\n" + kSdpOffer +
+			"--pdouter7\r\nContent-Type: multipart/mixed; boundary=pdinner7\r\n\r\n" + other +
+			"--pdouter7\r\n" + kLocationPart + "--pdouter7--\r\n", "pdouter7", "er-hn-outer");
+	}
+}
+
+TEST(EmergencyRoute, AMultipartEmergencyInviteMissingItsClosingDelimiterIsUnwrappedOnlyWhenTheSdpPartEnded)
+{
+	{
+		// Nothing ends the SDP part: it is not taken to the end of the body.
+		SCOPED_TRACE("SDP part last, no closing delimiter");
+		expectRefusedUntouched("multipart/mixed; boundary=pdmiss7",
+			"--pdmiss7\r\n" + kLocationPart + "--pdmiss7\r\nContent-Type: application/sdp\r\n\r\n" + kSdpOffer,
+			"er-hm-sdp-last");
+	}
+	{
+		SCOPED_TRACE("SDP part first, ended by the next delimiter; the last part is open");
+		expectRoutedClean("multipart/mixed; boundary=pdmiss7",
+			"--pdmiss7\r\nContent-Type: application/sdp\r\n\r\n" + kSdpOffer + "--pdmiss7\r\n" + kLocationPart,
+			"pdmiss7", "er-hm-sdp-first");
+	}
 }
