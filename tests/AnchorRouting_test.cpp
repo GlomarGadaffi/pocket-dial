@@ -770,6 +770,43 @@ TEST(AnchorRouting, ResumingTheAnchorLegClearsHeldStateAndRestoresTheHandsetPath
 	EXPECT_EQ(session.value()->getState(), Session::State::Connected);
 }
 
+// Issue #751: the hold answer mirrors the offer's direction (RFC 3264 s6.1).
+// It used to be sendrecv for every offer, which a strict phone rejects when
+// the offer was sendonly/recvonly/inactive. Resume (sendrecv) stays sendrecv.
+TEST(AnchorRouting, HoldAnswerOnTheAnchorLegMirrorsTheOfferedDirection)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	auto answerDirection = [](const std::shared_ptr<SipMessage>& m) {
+		const std::string raw = m ? m->toString() : std::string{};
+		for (const char* d : { "a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive" })
+			if (raw.find(std::string("\r\n") + d + "\r\n") != std::string::npos) return std::string(d);
+		return std::string{};
+	};
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-751"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+
+	struct Case { const char* offer; const char* expect; };
+	int cseq = 2;
+	for (const Case& c : { Case{ "a=sendonly", "a=recvonly" }, Case{ "a=inactive", "a=inactive" },
+	                       Case{ "a=recvonly", "a=sendonly" }, Case{ "a=sendrecv", "a=sendrecv" } })
+	{
+		sent.clear();
+		handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-751",
+			cseq++, std::string(c.offer) + "\r\n"));
+		ASSERT_FALSE(sent.empty()) << "no answer to an offer of " << c.offer;
+		EXPECT_EQ(answerDirection(sent.front().second), c.expect)
+			<< "#751: the answer to " << c.offer << " must be " << c.expect;
+	}
+}
+
 // Issue #263: sdp::isHold() had zero production callers, so the legacy RFC
 // 2543 hold shape (session-level a=sendrecv, the AUDIO section's OWN
 // connection blackholed) was never detected on the anchor leg either --

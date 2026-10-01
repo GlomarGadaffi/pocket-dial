@@ -10071,8 +10071,25 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 	// would append a second tag onto the one already present.
 	addCapabilityHeaders(*ok);
 	pbx::answerSessionTimer(*ok, *data, /*grant=*/true);   // #198: this IS the re-INVITE's 200
-	const std::string sdpBody = buildMediaSdp(_localIp, bridge->receiverPort(),
+	std::string sdpBody = buildMediaSdp(_localIp, bridge->receiverPort(),
 		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
+	// Issue #751: RFC 3264 s6.1 -- the answer's direction mirrors the offer's
+	// (sendonly -> recvonly, recvonly -> sendonly, inactive -> inactive). A
+	// sendrecv answer to a hold offer is one a strict phone rejects or plays
+	// wrong. buildMediaSdp() only emits sendrecv/sendonly, so swap its last line.
+	{
+		const char* mirror = nullptr;
+		switch (data->getSdpDirection())
+		{
+			case SipMessage::SdpDirection::SendOnly: mirror = "a=recvonly\r\n"; break;
+			case SipMessage::SdpDirection::RecvOnly: mirror = "a=sendonly\r\n"; break;
+			case SipMessage::SdpDirection::Inactive: mirror = "a=inactive\r\n"; break;
+			default: break;
+		}
+		constexpr std::string_view kSendrecv = "a=sendrecv\r\n";
+		if (mirror && sdpBody.size() >= kSendrecv.size())
+			sdpBody.replace(sdpBody.size() - kSendrecv.size(), kSendrecv.size(), mirror);
+	}
 	ok->clearBody();
 	{
 		std::string raw = ok->toString();
