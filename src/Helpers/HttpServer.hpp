@@ -159,13 +159,14 @@ public:
 		PolycomPhone,     // /config/<12 hex>-phone.cfg
 		PolycomMaster,    // /config/000000000000.cfg
 		CiscoSpaMac,      // /config/spa<12 hex>.cfg
-		CiscoSpaModel     // /config/spa<model>.cfg
+		CiscoSpaModel,    // /config/spa<model>.cfg
+		Snom              // /config/snom<12 hex>.xml, either case (Issue #826)
 	};
 
 	// Issue #35, #234: true iff `path` has a recognized phone auto-provisioning
 	// shape: /config/<12 hex>.cfg (Yealink/default), /config/cfg<12 hex>.xml (Grandstream),
 	// /config/<12 hex>-phone.cfg (Polycom per-phone), /config/000000000000.cfg (Polycom master),
-	// /config/spa<12 hex>.cfg or /config/spa<model>.cfg (Cisco SPA).
+	// /config/spa<12 hex>.cfg or /config/spa<model>.cfg (Cisco SPA), /config/snom<12 hex>.xml (snom).
 	// Pure string-shape check; public/static so it's host-testable on its own.
 	static bool isProvisioningConfigPath(const std::string& path);
 	static ProvisioningPathType parseProvisioningPath(const std::string& path, std::string& outKey);
@@ -374,6 +375,9 @@ private:
 	void sendApiRegistrar(int sock);
 	void sendApiRegistrarSet(int sock, const std::string& body);
 	void sendApiRegistrarDevice(int sock, const std::string& body);
+	// Issue #826: SIP PnP mode (off/discover/provision) and the phones heard.
+	void sendApiPnp(int sock);
+	void sendApiPnpSet(int sock, const std::string& body);
 	void sendApiKill(int sock, const std::string& body);
 	// Phase 2: read-only Call Detail Records (newest first). Ungated like /api/status.
 	void sendApiCdr(int sock);

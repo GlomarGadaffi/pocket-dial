@@ -552,6 +552,8 @@ add_executable(sip_parser_tests
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
     ProvisioningConfig_test.cpp
+    # Issue #826: SIP PnP discovery (ua-profile SUBSCRIBE -> 200 + NOTIFY).
+    PnpProfile_test.cpp
     # Part of #199: every message the PBX sends, recorded for tests/conformance.
     EmittedConformance_test.cpp
     # SIP digest-auth primitives + per-extension HA1 secret store. Both are
@@ -729,6 +731,9 @@ add_executable(sip_parser_tests
     ../src/SIP/SipMessageFactory.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp
+    # Issue #826: SIP PnP wire format + responder policy (pure, host-tested).
+    ../src/SIP/PnpProfile.cpp
+    ../src/SIP/PnpResponder.cpp
     ../src/SIP/RegisterBeeper.cpp
     ../src/SIP/SipTrunk.cpp
     ../src/SIP/TrunkResolver.cpp

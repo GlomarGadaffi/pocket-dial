@@ -230,6 +230,51 @@ fork, no firmware-stack changes. Combined with §0.1, the installer is typing th
 phone they have *already* configured by hand, so the marginal effort saved is real but
 modest: it is the codec/NAT/expiry/line block that gets standardized, not the bootstrap.
 
+### 1.4 SIP Plug-and-Play (Issue #826): discovery shipped, answering limited to adopted phones
+
+A factory-fresh phone with PnP on multicasts a `SUBSCRIBE` to `224.0.1.75:5060` with
+`Event: ua-profile;profile-type="device";vendor=…;model=…;version=…` and its MAC in the
+From user (`MAC%3a0004132E08B4`). A server answers `200 OK`, then a `NOTIFY` with
+`Content-Type: application/url` whose body is the URL the phone stores and fetches. Unlike
+Option 66 (§1.1), this needs no DHCP server change: only a socket.
+
+**What ships:**
+
+* `PnpProfile` (`src/SIP/PnpProfile.{hpp,cpp}`) parses the request and writes the 200 and
+  the NOTIFY. Pure; host-tested (`tests/PnpProfile_test.cpp`).
+* `PnpResponder` (`src/SIP/PnpResponder.{hpp,cpp}`) holds the policy and a 16-slot table
+  of phones heard. `SipServer::pollPnp()` feeds it from the board's 1 s SIP loop: a
+  non-blocking socket bound to the **group address** (never `0.0.0.0`, which could take
+  the main SIP socket's unicast traffic in lwIP) and joined with `IP_ADD_MEMBERSHIP`.
+  Replies go out through the main SIP socket. No task of its own; no allocation per
+  datagram (`PnpResponder.DatagramPathAllocatesNothing`).
+* **Mode**, persisted as NVS `pbxcfg`/`pnp_mode`, set with `POST /api/pnp`:
+
+| Mode | Socket | Records phones | Answers |
+| :--- | :--- | :--- | :--- |
+| `off` (default) | closed | no | no |
+| `discover` | open | yes | no |
+| `provision` | open | yes | only a MAC this board can serve: today, an **adopted** device (§0.1) |
+
+  Off by default because the first answer wins: an always-on responder would capture any
+  PnP phone on a LAN shared with another PBX. A phone this board cannot serve gets
+  silence, so another server can still answer it.
+* Only sources on the board's own subnet are recorded or answered; the NOTIFY goes to the
+  datagram's source address only; replies are token-bucketed (4, one back every 2 s); a
+  phone gets at most one NOTIFY per 30 s, though a retransmitted SUBSCRIBE still gets its
+  200 (same To tag, derived from the Call-ID).
+* **URL handed out:** snom: `http://<ip>/config/snom<mac>.xml` (snom fetches it as given);
+  every other vendor: `http://<ip>/config/` (the phone appends its own file name, e.g.
+  Yealink's `<mac>.cfg`). The MAC is lowercased, so it passes §0.2's shape check.
+
+**Not yet:** zero-touch assignment of an extension to a phone that has never registered
+(Issue #826 part B). Until then `provision` re-provisions known phones (factory-reset
+recovery), and `discover` shows what is on the network.
+
+**Unverified on hardware:** the board receiving `224.0.1.75` traffic. mDNS proves the
+multicast receive path for `224.0.0.251`, but the W5500 boards' MAC filter for a second
+group has not been observed.
+
 ## 2. The endpoint
 
 ### 2.1 URL scheme
@@ -241,6 +286,7 @@ GET /config/{mac}-phone.cfg      # Polycom per-phone XML
 GET /config/000000000000.cfg     # Polycom master/generic XML
 GET /config/spa{mac}.cfg         # Cisco SPA macro-expanded flat-profile XML ($MA)
 GET /config/spa{model}.cfg       # Cisco SPA model-keyed (Profile_Rule bootstrap)
+GET /config/snom{mac}.xml        # snom XML (Issue #826); {mac} may be upper or lower case
 ```
 
 `{mac}` is 12 **lowercase** hex digits, no separators (§0.2).

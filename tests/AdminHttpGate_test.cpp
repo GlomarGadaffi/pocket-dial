@@ -827,6 +827,43 @@ TEST(Registrar, ModeRoundTripsThroughTheDashboard)
 	AdminAuth::clearCredential();
 }
 
+TEST(Pnp, ModeIsAdminGatedAndRoundTrips)
+{
+	// #826: /api/pnp is gated like /api/registrar. Off is the default; a bad
+	// mode is refused and changes nothing; a good one is applied and read back.
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18261, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	EXPECT_EQ(statusOf(httpGetRaw(18261, "/api/pnp", "")), 401);
+
+	AdminSession a = loginAndCompleteSetup(18261);
+	ASSERT_FALSE(a.cookie.empty());
+	std::string get = httpGetRaw(18261, "/api/pnp", "pd_session=" + a.cookie);
+	EXPECT_EQ(statusOf(get), 200);
+	EXPECT_NE(get.find("\"mode\":\"off\""), std::string::npos) << get;
+	EXPECT_NE(get.find("\"devices\":[]"), std::string::npos) << get;
+
+	EXPECT_EQ(statusOf(httpPostRaw(18261, "/api/pnp", "mode=discover", "pd_session=" + a.cookie, "")), 403)
+		<< "a POST without the CSRF token must be refused";
+	EXPECT_EQ(handler.pnp().mode(), PnpResponder::Mode::Off);
+
+	std::string set = httpPostRaw(18261, "/api/pnp", "mode=on", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(set), 400) << set;
+	EXPECT_EQ(handler.pnp().mode(), PnpResponder::Mode::Off);
+
+	set = httpPostRaw(18261, "/api/pnp", "mode=discover", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(set), 200) << set;
+	EXPECT_NE(set.find("\"mode\":\"discover\""), std::string::npos) << set;
+	EXPECT_EQ(handler.pnp().mode(), PnpResponder::Mode::Discover);
+
+	AdminAuth::clearCredential();
+}
+
 TEST(Registrar, OpenIsNotAModeAnyMore)
 {
 	// #500 (desmo, 2026-09-27): the open registrar is retired. The live setter

@@ -162,6 +162,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/RequestsHandler.cpp"
                             "../src/SIP/TransactionLayer.cpp"
                             "../src/SIP/Registrar.cpp"
+                            "../src/SIP/PnpProfile.cpp"
+                            "../src/SIP/PnpResponder.cpp"
                             # The other direction: the board as a REGISTER client
                             # (issue #164 groundwork). Not wired into any call
                             # path yet -- the generic SIP trunk that will drive it
