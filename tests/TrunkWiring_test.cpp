@@ -1430,6 +1430,19 @@ TEST(TrunkWiring, AHandsetCancelWhileTheCarrierRingsCancelsTheCarrierLeg)
 	EXPECT_EQ(b.countWithTo("SIP/2.0 200", kHandsetIp), 1u) << "the CANCEL itself";
 	EXPECT_EQ(b.countWithTo("SIP/2.0 487", kHandsetIp), 1u) << "the handset's INVITE";
 	ASSERT_EQ(b.countWithTo("CANCEL", kSbcIp), 1u) << "the carrier leg keeps ringing until told";
+	// RFC 3261 s8.2.6.2 and s9.2: the CANCEL's own 200 is a dialog-forming response, so it
+	// carries a To tag, and it is the same tag the 487 to the INVITE carries.
+	const auto toTag = [](const std::string& m) {
+		const size_t at = m.find("\r\nTo: ");
+		if (at == std::string::npos) return std::string();
+		const std::string line = m.substr(at + 2, m.find("\r\n", at + 2) - at - 2);
+		const size_t t = line.find(";tag=");
+		return t == std::string::npos ? std::string() : line.substr(t + 5);
+	};
+	const std::string cancelOkToHandset = b.firstWith("SIP/2.0 200");
+	const std::string inviteFinal = b.firstWith("SIP/2.0 487");
+	EXPECT_FALSE(toTag(cancelOkToHandset).empty()) << "the 200 to the CANCEL has no To tag:\n" << cancelOkToHandset;
+	EXPECT_EQ(toTag(cancelOkToHandset), toTag(inviteFinal)) << "one tag for the CANCEL's 200 and the INVITE's 487";
 	const std::string cancel = b.firstWith("CANCEL sip:+12025550123");
 	EXPECT_NE(cancel.find(";branch=" + carrier.branch), std::string::npos)
 		<< "on the carrier INVITE's own branch";

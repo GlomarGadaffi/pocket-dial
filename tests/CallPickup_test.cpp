@@ -460,8 +460,8 @@ TEST(CallPickup, RacePickupFirst_CancelledTargets487IsAckedNotRelayedToTheCaller
 
 	EXPECT_EQ(countTo(sent, "192.168.9.10"), callerMessagesBefore)
 		<< "the cancelled target's 487 must not reach a caller already answered 200";
-	EXPECT_TRUE(anyTo(sent, "192.168.9.20", "ACK sip:100@"))
-		<< "the PBX must ACK the cancelled target's 487 itself";
+	EXPECT_TRUE(anyTo(sent, "192.168.9.20", "ACK sip:100@server SIP/2.0"))
+		<< "the PBX must ACK the cancelled target's 487 itself, on the Request-URI of the INVITE the target saw (RFC 3261 s17.1.1.3), not one it made up";
 
 	auto stillPicker = handler.getSession(sessionKey("call-6"));
 	ASSERT_TRUE(stillPicker.has_value());
