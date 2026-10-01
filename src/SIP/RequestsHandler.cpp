@@ -1699,6 +1699,15 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 			response->setHeader(SipMessageTypes::OK);
 			response->clearBody();
 			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			// RFC 3261 s8.2.6.2: a 2xx carries a To tag. The CANCEL cloned here has none, so
+			// use the tag the 180 carried, the same one the 487 below uses.
+			std::string to(data->getTo());
+			if (to.find(";tag=") == std::string::npos)
+			{
+				const std::string tag = cancelSess.has_value() ? cancelSess.value()->getLocalTag() : std::string();
+				to += ";tag=" + (tag.empty() ? IDGen::GenerateID(9) : tag);
+			}
+			response->setTo(std::move(to));
 			_outbox.emplace_back(data->getSource(), std::move(response));
 		}
 		// Issue #548: RFC 3261 §9.2 -- the INVITE itself is then answered 487. The
@@ -1874,7 +1883,21 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 				std::string cseq(invite->getCSeq());
 				const size_t invitePos = cseq.find("INVITE");
 				if (invitePos != std::string::npos) cseq.replace(invitePos, 6, "ACK");
-				ack->setHeader("ACK sip:" + std::string(data->getToNumber()) + "@" + ackDest + " SIP/2.0");
+				// RFC 3261 s17.1.1.3: the ACK carries the Request-URI of the INVITE it answers.
+				// A leg that went out as the caller's own INVITE keeps it (the test
+				// CallForker::buildCancel uses, #749); only a server-built fork names the
+				// target by address, and that one is rebuilt here.
+				const std::string_view inviteLine = invite->getHeader();
+				constexpr std::string_view kInviteMethod = "INVITE";
+				if (invite->getToNumber() == data->getToNumber() &&
+				    inviteLine.substr(0, kInviteMethod.size()) == kInviteMethod)
+				{
+					ack->setHeader("ACK" + std::string(inviteLine.substr(kInviteMethod.size())));
+				}
+				else
+				{
+					ack->setHeader("ACK sip:" + std::string(data->getToNumber()) + "@" + ackDest + " SIP/2.0");
+				}
 				ack->setTo(std::string(data->getTo()));
 				ack->setCSeq(cseq);
 				ack->clearBody();
