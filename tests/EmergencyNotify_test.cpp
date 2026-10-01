@@ -644,6 +644,77 @@ TEST(E911Notify, ACallRefusedForCapacityIsNeverReportedAsRouted)
 		   "when it did not:\n" << b.dump();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #713: a worker that cannot start is not a routed call
+//
+// On a real anchor, originateAnchorCall() publishes the session, sends 180 and
+// hands makeCall() to a worker task. When that task cannot be created (heap
+// pressure during an active call) asyncMakeCall() answers 503 and ends the
+// session -- but `placed` stayed true, so the front desk was told ROUTED. The
+// host build drives the same async branch over the loopback client through
+// forceAsyncAnchorForTest(); failNextAnchorWorkerSpawnForTest() is the ESP
+// spawn failure.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(E911Notify, AWorkerThatCannotStartIsNeverReportedAsRouted)
+{
+	NBench b;
+	ASSERT_NE(b.loopback(), nullptr);
+	b.handler->setE911Config("200", "", "");
+	b.handler->forceAsyncAnchorForTest(true);
+	b.handler->failNextAnchorWorkerSpawnForTest();
+	b.wire.clear();
+
+	b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-911-nospawn"));
+
+	ASSERT_NE(b.indexOf("SIP/2.0 503"), -1)
+		<< "precondition: the spawn failure answered the caller 503:\n" << b.dump();
+	ASSERT_FALSE(b.handler->getSession("Call-ID: en-911-nospawn").has_value())
+		<< "precondition: and ended the session";
+	ASSERT_NE(b.indexOf("MESSAGE sip:200@"), -1) << b.dump();
+	EXPECT_NE(b.indexOf("NOT ROUTED"), -1)
+		<< "no worker means no call; the notification must say so:\n" << b.dump();
+	EXPECT_EQ(b.indexOf("ROUTED TO TRUNK"), -1)
+		<< "a 911 refused because its worker could not start was reported as routed:\n" << b.dump();
+}
+
+TEST(E911Notify, AWorkerThatStartsIsReportedAsRouted)
+{
+	// Control for the test above: the same async branch with a worker that does
+	// start is a placed call (180 Ringing, no 503), notified as routed.
+	NBench b;
+	ASSERT_NE(b.loopback(), nullptr);
+	b.handler->setE911Config("200", "", "");
+	b.handler->forceAsyncAnchorForTest(true);
+	b.wire.clear();
+
+	b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-911-spawn"));
+
+	EXPECT_NE(b.indexOf("SIP/2.0 180"), -1) << b.dump();
+	EXPECT_EQ(b.indexOf("SIP/2.0 503"), -1) << b.dump();
+	EXPECT_NE(b.indexOf("ROUTED TO TRUNK"), -1) << b.dump();
+	EXPECT_EQ(b.indexOf("NOT ROUTED"), -1) << b.dump();
+}
+
+TEST(E911Notify, AnOrdinaryAnchoredCallWhoseWorkerCannotStartIsRefusedOnceAndNotNotified)
+{
+	// The negative case: the same spawn failure on a plain 555 dial is exactly
+	// one 503, no session left behind, and no emergency notification.
+	NBench b;
+	ASSERT_NE(b.loopback(), nullptr);
+	b.handler->setE911Config("200", "", "");
+	b.handler->forceAsyncAnchorForTest(true);
+	b.handler->failNextAnchorWorkerSpawnForTest();
+	b.wire.clear();
+
+	b.handler->handle(enInvite("101", "555", "192.168.78.11", "en-555-nospawn"));
+
+	EXPECT_EQ(b.countOf("SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(b.countOf("SIP/2.0 200 OK"), 0) << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-555-nospawn").has_value());
+	EXPECT_EQ(b.indexOf("MESSAGE sip:200@"), -1) << "a 555 dial is not an emergency:\n" << b.dump();
+}
+
 TEST(E911Format, TruncationLandsOnAUtf8BoundaryNotMidCodepoint)
 {
 	// `location` is operator free text and may be non-ASCII. Cutting at byte 512
