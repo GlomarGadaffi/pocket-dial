@@ -616,12 +616,47 @@ TEST(SpliceInDialog, AnInFlightSpliceDoesNotPinTheOriginatorsPooledMessage)
 	ASSERT_TRUE(own.has_value());
 	auto request = inDialog("INVITE", own.value(), "192.168.9.30", 5, sdpBody("192.168.9.30", "sendonly"));
 	ASSERT_TRUE(request);
+	// The pool itself holds one reference to every pooled message, so the baseline is
+	// whatever it is before the request is handled, not a literal 1.
+	const long heldBefore = request.use_count();
 	h.sent.clear();
 	h.handler.handle(request);
 	size_t n = 0;
 	(void)onlyOne(h.sent, "192.168.9.10", "INVITE ", n);
 	ASSERT_EQ(n, 1u) << "precondition: the splice is in flight, awaiting the peer";
-	EXPECT_EQ(request.use_count(), 1) << "the splice table must not keep the request alive";
+	EXPECT_EQ(request.use_count(), heldBefore) << "the splice table must not keep the request alive";
+}
+
+TEST(SpliceInDialog, AFarLegThatNeverAnswersGetsTheOriginatorA408FromTick)
+{
+	// #589 review: tick() ran sweepSpliceTxns() before taking _mutex and before the
+	// pass's _outbox.clear(), so the sweep raced handle() on _spliceTxns and the
+	// 408 it queued was wiped before it was flushed. The originator then sat on an
+	// open transaction until its own timer fired.
+	Harness h;
+	setUpPickup(h);
+	auto own = h.handler.getSession(sessionKey("pickup-P"));
+	ASSERT_TRUE(own.has_value());
+	h.sent.clear();
+	h.handler.handle(inDialog("INVITE", own.value(), "192.168.9.30", 5, sdpBody("192.168.9.30", "sendonly")));
+	size_t n = 0;
+	(void)onlyOne(h.sent, "192.168.9.10", "INVITE ", n);
+	ASSERT_EQ(n, 1u) << "precondition: the splice is in flight, awaiting the far phone";
+
+	h.handler.ageSpliceTxnsForTest(std::chrono::seconds(40));   // past 64*T1
+	h.sent.clear();
+	h.handler.forceNextTickForTest();
+	h.handler.tick();
+
+	const Sent* timeout = onlyOne(h.sent, "192.168.9.30", "SIP/2.0 408", n);
+	ASSERT_EQ(n, 1u) << "the originator is told, once, that the far leg timed out";
+	EXPECT_EQ(headerValue(timeout->raw, "CSeq"), "5 INVITE") << timeout->raw;
+
+	h.sent.clear();
+	h.handler.forceNextTickForTest();
+	h.handler.tick();
+	(void)onlyOne(h.sent, "192.168.9.30", "SIP/2.0 408", n);
+	EXPECT_EQ(n, 0u) << "the slot was freed: a second tick answers nothing";
 }
 
 TEST(SpliceInDialog, AFieldTooLongToStoreIsRefusedBeforeAnythingIsSent)

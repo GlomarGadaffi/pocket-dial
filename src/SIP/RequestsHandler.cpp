@@ -9113,7 +9113,6 @@ size_t RequestsHandler::getServerTransactionCount()
 
 void RequestsHandler::tick()
 {
-	sweepSpliceTxns(std::chrono::steady_clock::now());   // #453
 	auto now = std::chrono::steady_clock::now();
 	if (now - _lastTick < std::chrono::seconds(1))
 	{
@@ -9131,6 +9130,10 @@ void RequestsHandler::tick()
 		// whatever pooled SipMessage next lands on that address.
 		_passThroughMsg = nullptr;
 		_noReplyInbound.reset();   // #424: same reason; a tick answers nothing
+
+		// #453: under _mutex and after the clear above, so the 408 it queues is flushed
+		// by this pass and the sweep cannot race handle() on _spliceTxns.
+		sweepSpliceTxns(now);
 
 		// The only drain a conference gets when nobody is signalling: an 888 leg
 		// carries RTP but no SIP, so feature codes pressed mid-conference arrive
@@ -10226,8 +10229,13 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	// stand-in SipClient carrying the CALLER's own address, so relaying would
 	// send the phone its own re-INVITE back (#709). Decline instead, so the
 	// holding phone keeps the call on the original SDP.
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || destNum == "440" ||
-	    pbx::isParkOrbitExt(destNum) || (session && session->isTrunk()) || !src || !dest)
+	// #453: a retrieved park keeps its orbit number as destNum but now has a real peer
+	// (a splice): relayIntoPeerDialog() below owns it. Only a leg with no peer is a
+	// park-orbit or 440 stand-in to answer locally.
+	const bool splicedLeg = session && !session->getPeerCallID().empty();
+	if (destNum == "777" || destNum == ConferenceRoom::EXT ||
+	    (!splicedLeg && (destNum == "440" || pbx::isParkOrbitExt(destNum))) ||
+	    (session && session->isTrunk()) || !src || !dest)
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -10409,8 +10417,13 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	// park orbit (700-709, #709) have no peer leg, and a trunk leg is terminated
 	// here too. A refresh is answered; an SDP change is declined so the phone
 	// keeps the original SDP.
-	if (destNum == "777" || destNum == ConferenceRoom::EXT || destNum == "440" ||
-	    pbx::isParkOrbitExt(destNum) || (session && session->isTrunk()) || !src || !dest)
+	// #453: a retrieved park keeps its orbit number as destNum but now has a real peer
+	// (a splice): relayIntoPeerDialog() below owns it. Only a leg with no peer is a
+	// park-orbit or 440 stand-in to answer locally.
+	const bool splicedLeg = session && !session->getPeerCallID().empty();
+	if (destNum == "777" || destNum == ConferenceRoom::EXT ||
+	    (!splicedLeg && (destNum == "440" || pbx::isParkOrbitExt(destNum))) ||
+	    (session && session->isTrunk()) || !src || !dest)
 	{
 		if (!data->hasSdp())
 		{

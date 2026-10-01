@@ -470,6 +470,12 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #589 review: age the in-flight splice transactions so a test can reach the 64*T1 sweep.
+	void ageSpliceTxnsForTest(std::chrono::steady_clock::duration d)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (auto& t : _spliceTxns) t.since -= d;
+	}
 	// #479: the boot-built conference room, so a test can make its driver fail.
 	ConferenceRoom* conferenceForTest() { return _conference.get(); }
 	// #479: as a POCKETDIAL_CONFERENCE=0 build, which never builds the room.
