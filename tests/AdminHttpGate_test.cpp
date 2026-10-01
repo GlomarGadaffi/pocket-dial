@@ -1151,8 +1151,42 @@ TEST(CdrDisclosure, ClientCountStaysVisibleSoEmptyIsNotAmbiguous)
 	// the other stackHwm_* fields on this branch.
 	EXPECT_NE(body.find("\"stackHwm_http_conn\":null"), std::string::npos)
 		<< "host build must report stackHwm_http_conn, not omit the key:\n" << body;
+	// Issue #405: the route beside that minimum. Host has no minimum, so null.
+	EXPECT_NE(body.find("\"httpConnWorstRoute\":null"), std::string::npos)
+		<< "host build must report httpConnWorstRoute, not omit the key:\n" << body;
 
 	AdminAuth::clearCredential();
+}
+
+// Issue #405: the label stored beside stackHwm_http_conn is a route CLASS. It is
+// served unauthenticated, and a provisioning fetch carries a phone's MAC in its
+// path, so the raw path must never reach it.
+TEST(HttpConnRouteLabel, IsARouteClassAndNeverTheRawPath)
+{
+	const auto label = [](const char* method, const char* path) {
+		char out[HttpServer::kRouteLabelBytes];
+		HttpServer::routeLabel(method, path, out, sizeof(out));
+		return std::string(out);
+	};
+	EXPECT_EQ(label("GET", "/api/status"), "GET /api/status");
+	EXPECT_EQ(label("GET", "/"), "GET /");
+	EXPECT_EQ(label("GET", "/index.html"), "GET /");
+	EXPECT_EQ(label("GET", "/metrics"), "GET /metrics");
+	EXPECT_EQ(label("GET", "/api/coredump"), "GET /api/coredump");
+	EXPECT_EQ(label("POST", "/api/coredump/erase"), "POST /api/coredump/erase");
+	// A phone's config fetch: the MAC is not in the label.
+	EXPECT_EQ(label("GET", "/config/aabbccddeeff.cfg"), "GET provisioning");
+	// A numeric segment ends the label.
+	EXPECT_EQ(label("POST", "/api/telephony-config/3/activate"), "POST /api/telephony-config");
+	// Unknown shapes, a scan probe, an odd method, a segment that is not a word.
+	EXPECT_EQ(label("GET", "/no-such-page"), "GET other");
+	EXPECT_EQ(label("GET", "/api/"), "GET /api");
+	EXPECT_EQ(label("get", "/api/status"), "? /api/status");
+	EXPECT_EQ(label("GET", "/api/Status;x"), "GET /api");
+	// Truncated to the buffer, always NUL-terminated.
+	char tiny[8];
+	HttpServer::routeLabel("DELETE", "/api/telephony-config", tiny, sizeof(tiny));
+	EXPECT_EQ(std::string(tiny), "DELETE ");
 }
 
 // Issue #328. The MoH proof run could show hold music streaming at exactly
