@@ -992,12 +992,12 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			// #760: a 911/933 INVITE may carry its SDP inside multipart/mixed next
 			// to a PIDF-LO location (RFC 6442). This gate screens SDP, so the offer
 			// is unwrapped first; the location part is dropped, never parsed.
-			// Emergency INVITEs only (the Request-URI or To user, the test #759's
-			// isEmergencyRequest() uses): every other multipart body is refused
-			// as before.
+			// Emergency INVITEs only, by the To user: the number onInvite routes
+			// on. Not the Request-URI too, or INVITE sip:911@ with To 102 would be
+			// relayed to 102 past this gate. Every other multipart body is
+			// refused as before.
 			if (request->getType() == SipMessageTypes::INVITE &&
-				(pbx::classifyEmergencyDial(request->getToNumber()).isEmergency ||
-				 pbx::classifyEmergencyDial(request->getRequestUriUser()).isEmergency))
+				pbx::classifyEmergencyDial(request->getToNumber()).isEmergency)
 			{
 				request->unwrapMultipartSdp();
 			}

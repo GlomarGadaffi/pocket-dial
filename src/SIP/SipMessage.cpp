@@ -1315,35 +1315,79 @@ std::string_view SipMessage::getEvent() const
 
 namespace
 {
+	// #760 review: the URI a To/From/Contact line or a request line carries,
+	// and nothing around it. A name-addr's URI is inside <...>; a '<' within
+	// the quoted display name does not count (RFC 3261 s25.1 quoted-string,
+	// \-escapes included). Without brackets it is the bare URI: a request
+	// line's Request-URI, the token after the method, or a header's value up
+	// to its first ';' (RFC 3261 s20.10). Empty when a quote is left open.
+	std::string_view uriPartOf(std::string_view line)
+	{
+		bool quoted = false;
+		for (size_t i = 0; i < line.size(); ++i)
+		{
+			const char c = line[i];
+			if (quoted)
+			{
+				if (c == '\\') ++i;
+				else if (c == '"') quoted = false;
+			}
+			else if (c == '"')
+			{
+				quoted = true;
+			}
+			else if (c == '<')
+			{
+				std::string_view uri = line.substr(i + 1);
+				uri = uri.substr(0, uri.find('>'));
+				while (!uri.empty() && (uri.front() == ' ' || uri.front() == '\t')) uri.remove_prefix(1);
+				while (!uri.empty() && (uri.back() == ' ' || uri.back() == '\t')) uri.remove_suffix(1);
+				return uri;
+			}
+		}
+		if (quoted) return {};
+		const size_t colon = line.find(':');
+		if (colon == std::string_view::npos) return {};
+		size_t nameStart = 0;
+		size_t nameEnd = colon;
+		while (nameStart < nameEnd && (line[nameStart] == ' ' || line[nameStart] == '\t')) ++nameStart;
+		while (nameEnd > nameStart && (line[nameEnd - 1] == ' ' || line[nameEnd - 1] == '\t')) --nameEnd;
+		// A header name holds no space, so "INVITE tel" before the first ':'
+		// is a request line, and its URI begins after the method.
+		const size_t sp = line.substr(nameStart, nameEnd - nameStart).find_first_of(" \t");
+		std::string_view uri = line.substr(sp == std::string_view::npos ? colon + 1 : nameStart + sp);
+		while (!uri.empty() && (uri.front() == ' ' || uri.front() == '\t')) uri.remove_prefix(1);
+		return uri.substr(0, uri.find_first_of(" \t;\r\n"));
+	}
+
 	// #760: the two non-sip: forms a phone may legitimately dial for help. An
 	// RFC 3966 tel:911 / tel:933 has no host and no '@', and RFC 5031's
 	// urn:service:test.sos is the E911 test service (933 here). Only an
 	// emergency number is mapped: every other tel: or urn: URI still reads as
 	// no user, so nothing else changes. urn:service:sos itself is #199's.
+	// #760 review: only the URI's own scheme is matched, never a display name
+	// or a parameter ("Hotel:911 lobby" is not 911), and a tel: number counts
+	// exactly when a sip: user would, so tel:9911 is 911 as sip:9911@ is.
 	std::string_view emergencyUserOf(std::string_view header)
 	{
 		static constexpr std::string_view kTel = "tel:";
 		static constexpr std::string_view kTestSos = "urn:service:test.sos";
-		auto delimited = [&header](size_t end) {
-			return end == header.size() || header[end] == '>' || header[end] == ';' ||
-				header[end] == '?' || header[end] == ' ' || header[end] == '\t';
+		const std::string_view uri = uriPartOf(header);
+		auto delimited = [&uri](size_t end) {
+			return end == uri.size() || uri[end] == ';' || uri[end] == '?';
 		};
-		if (const size_t at = ifindLower(header, kTel); at != std::string_view::npos)
+		if (iequalLower(uri.substr(0, kTel.size()), kTel))
 		{
-			const size_t start = at + kTel.size();
-			size_t end = start;
-			while (end < header.size() && std::isdigit(static_cast<unsigned char>(header[end]))) ++end;
-			const std::string_view digits = header.substr(start, end - start);
-			if (delimited(end) && (digits == pbx::kEmergencyNumber || digits == pbx::kEmergencyTestNumber))
-			{
-				return digits;
-			}
+			size_t end = kTel.size();
+			while (end < uri.size() && std::isdigit(static_cast<unsigned char>(uri[end]))) ++end;
+			const std::string_view digits = uri.substr(kTel.size(), end - kTel.size());
+			if (delimited(end) && pbx::classifyEmergencyDial(digits).isEmergency) return digits;
 		}
-		if (const size_t at = ifindLower(header, kTestSos); at != std::string_view::npos)
+		if (iequalLower(uri.substr(0, kTestSos.size()), kTestSos))
 		{
 			// RFC 5031 s4.2: test.sos.<sub> is the same test service.
-			const size_t end = at + kTestSos.size();
-			if (delimited(end) || header[end] == '.') return pbx::kEmergencyTestNumber;
+			const size_t end = kTestSos.size();
+			if (delimited(end) || uri[end] == '.') return pbx::kEmergencyTestNumber;
 		}
 		return {};
 	}
