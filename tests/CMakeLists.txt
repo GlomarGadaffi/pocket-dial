@@ -446,6 +446,9 @@ add_executable(sip_parser_tests
     # Issue #802: the caller's ACK/BYE/CANCEL on a ring-group / zone / alias call
     # were dispatched on the To literal and 404'd; they reach the member now.
     GroupInDialog_test.cpp
+    # Issue #690 (slice 1): Session::Disposition is written once by the four outcome
+    # writers (486, 480, CANCEL, BYE) and cleared by reset().
+    SessionDisposition_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header
