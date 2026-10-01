@@ -955,10 +955,45 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// Set when the §17.2 server transaction answered this packet from its
 		// stored response, which means the TU must not see it at all.
 		bool absorbed   = false;
-		if (request->hasSdp() && !request->getBody().empty())
+
+		// ── Header admission gate (#199) ─────────────────────────────────────
+		// Ahead of the SDP gate: field bounds that match the fixed buffers the
+		// transaction layer copies into, entry caps, and the option-tag / body-
+		// type subset (SipMessage::checkHeaders). One flat, allocation-free pass.
+		// EMERGENCY YIELDS: an INVITE to 911/933 or urn:service:sos, a PSAP
+		// callback, or anything on a live 911 dialog is counted and let through,
+		// never refused for an optional header -- every copy the gate guards is
+		// bounded anyway (storeField truncates), so letting it through is safe.
+		auto isEmergencyTraffic = [this, &request]() {
+			if (request->isEmergencyRequest()) return true;
+			const auto s = getSession(request->getCallID());
+			return s.has_value() && s.value() && s.value()->isEmergency();
+		};
+		bool headerRefused = false;
+		std::string_view unsupportedTag;
+		if (const auto hv = request->checkHeaders(unsupportedTag); hv != SipMessage::HeaderVerdict::Ok)
+		{
+			if (isEmergencyTraffic())
+			{
+				_emergencyHeaderYields.fetch_add(1, std::memory_order_relaxed);
+				queueLog("[SIP] EMERGENCY: header gate yielded (" +
+					std::string(SipMessage::headerVerdictText(hv)) + ") for " +
+					std::string(request->getHeader()), true);
+			}
+			else
+			{
+				rejectHeaders(request, hv, unsupportedTag);
+				headerRefused = true;
+			}
+		}
+
+		if (!headerRefused && request->hasSdp() && !request->getBody().empty())
 		{
 			const auto verdict = request->checkSdp();
-			if (verdict != SipMessage::SdpVerdict::Ok)
+			// #199: a second active audio stream is policy, not safety -- the
+			// decoders use the first m=audio -- so it yields for 911 like a header.
+			if (verdict != SipMessage::SdpVerdict::Ok &&
+				!(verdict == SipMessage::SdpVerdict::TooManyAudioStreams && isEmergencyTraffic()))
 			{
 				rejectSdp(request, verdict);
 				sdpRefused = true;
@@ -985,7 +1020,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// entirely: a poison 200 OK must not "accept" an INVITE transaction any
 		// more than it may be relayed. The pool slot is released with the shared_ptr
 		// like any other unhandled packet.
-		if (!sdpRefused)
+		if (!sdpRefused && !headerRefused)
 		{
 		// RFC 3261 §17 transaction layer, CLIENT half: advance the state machine
 		// for any tracked client transaction before the TU handler runs. A 1xx
@@ -1031,7 +1066,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			_noReplyInbound.reset();
 		clearRelayMarks();
 
-		if (!sdpRefused && !absorbed)
+		if (!sdpRefused && !headerRefused && !absorbed)
 		{
 
 		// Route responses by parsed numeric status code so dispatch is immune to
@@ -8401,6 +8436,50 @@ void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipM
 	_outbox.emplace_back(request->getSource(), std::move(response));
 	queueLog("[SIP] SDP refused (" + std::string(why) + "), 488 to " +
 		std::string(request->getFromNumber()) + " for " + std::string(request->getHeader()), true);
+}
+
+void RequestsHandler::rejectHeaders(const std::shared_ptr<SipMessage>& request,
+	SipMessage::HeaderVerdict verdict, std::string_view unsupported)
+{
+	_headerRejected.fetch_add(1, std::memory_order_relaxed);
+	const char* why = SipMessage::headerVerdictText(verdict);
+
+	// Same rule as rejectSdp(): only a request other than ACK takes a response.
+	const bool isResponse = request->getStatusInfo().has_value();
+	if (isResponse || request->getType() == SipMessageTypes::ACK)
+	{
+		queueLog("[SIP] headers refused (" + std::string(why) + "), dropped: " +
+			std::string(request->getHeader()), true);
+		return;
+	}
+
+	auto response = getMessageFromPool(*request);
+	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+	response->clearBody();
+	if (verdict == SipMessage::HeaderVerdict::UnsupportedOption)
+	{
+		// RFC 3261 §8.2.2.3: 420 names the option tag that was not understood.
+		response->setHeader("SIP/2.0 420 Bad Extension");
+		// The clone carries the request's Require lines; a 420 must not echo them.
+		response->removeHeaders("Require");
+		response->removeHeaders("Proxy-Require");
+		response->setHeaderOnce("Unsupported", unsupported);
+	}
+	else if (verdict == SipMessage::HeaderVerdict::UnsupportedMediaType)
+	{
+		// RFC 3261 §21.4.13: 415 lists what we accept.
+		response->setHeader("SIP/2.0 415 Unsupported Media Type");
+		response->setHeaderOnce("Accept", "application/sdp");
+	}
+	else
+	{
+		response->setHeader("SIP/2.0 400 Bad Request");
+		response->addHeader("Warning", "399 " + _localIp + " \"" + why + "\"");
+	}
+	response->setVia(sipwire::viaWithReceived(request->getVia(), request->getSource()));
+	_outbox.emplace_back(request->getSource(), std::move(response));
+	queueLog("[SIP] headers refused (" + std::string(why) + ") for " +
+		std::string(request->getHeader()), true);
 }
 
 uint64_t RequestsHandler::getPacketsDropped() const

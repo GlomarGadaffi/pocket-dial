@@ -4,6 +4,7 @@
 #include <vector>
 #include <cctype>
 #include "SipMessageTypes.h"
+#include "EmergencyCall.hpp"   // #199: urn:service:sos, isEmergencyRequest()
 #include <cstring>
 #include <cctype>
 #include <cstdint>
@@ -676,6 +677,10 @@ SipMessage::SdpVerdict SipMessage::checkSdp() const
 	if (body.size() > kMaxBodyBytes) return SdpVerdict::BodyTooLarge;
 
 	unsigned lines = 0;
+	// #199: the model's caps. Recorded, not returned, until the walk ends, so
+	// every body refused before keeps exactly the verdict it had.
+	unsigned sections = 0, attrs = 0, activeAudio = 0;
+	SdpVerdict modelVerdict = SdpVerdict::Ok;
 	size_t pos = 0;
 	while (pos < body.size())
 	{
@@ -726,8 +731,30 @@ SipMessage::SdpVerdict SipMessage::checkSdp() const
 		}
 		// m=<media> <port> <proto> <fmt>...: everything past the third token is a format.
 		if (line[0] == 'm' && tokens > 3 + kMaxMediaFormats) return SdpVerdict::TooManyMediaFormats;
+
+		// #199: the same section / attribute caps sdp::parse() fails closed on,
+		// so a body this gate admits is one the model can hold. Counted only.
+		if (modelVerdict != SdpVerdict::Ok) continue;
+		if (line[0] == 'm')
+		{
+			attrs = 0;
+			if (++sections > kMaxMediaSections) modelVerdict = SdpVerdict::TooManyMediaSections;
+			// m=audio <port>...: a port of 0 is a removed stream, not an active one.
+			else if (line.rfind("m=audio ", 0) == 0)
+			{
+				size_t p = 8;
+				while (p < line.size() && line[p] == '0') ++p;
+				const bool zeroPort = p > 8 && (p == line.size() || line[p] == ' ' || line[p] == '/');
+				if (!zeroPort && ++activeAudio > kMaxActiveAudioStreams) modelVerdict = SdpVerdict::TooManyAudioStreams;
+			}
+		}
+		else if (line[0] == 'a' &&
+			++attrs > (sections == 0 ? kMaxSessionAttributes : kMaxAttributesPerSection))
+		{
+			modelVerdict = SdpVerdict::TooManyAttributes;
+		}
 	}
-	return SdpVerdict::Ok;
+	return modelVerdict;
 }
 
 const char* SipMessage::sdpVerdictText(SdpVerdict v)
@@ -743,8 +770,188 @@ const char* SipMessage::sdpVerdictText(SdpVerdict v)
 		case SdpVerdict::TooManyMediaFormats:   return "too many media formats";
 		case SdpVerdict::BadAttributeName:      return "bad attribute name";
 		case SdpVerdict::CapabilityNegotiation: return "capability negotiation (RFC 5939) not supported";
+		case SdpVerdict::TooManyMediaSections:  return "too many media sections";
+		case SdpVerdict::TooManyAttributes:     return "too many attributes";
+		case SdpVerdict::TooManyAudioStreams:   return "more than one audio stream";
 	}
 	return "rejected";
+}
+
+namespace
+{
+	// Entries in one header value: 1 + commas outside "quoted" and <angle> parts.
+	unsigned countEntries(std::string_view v)
+	{
+		unsigned n = 1;
+		bool quoted = false;
+		int angle = 0;
+		for (char c : v)
+		{
+			if (c == '"') quoted = !quoted;
+			else if (quoted) continue;
+			else if (c == '<') ++angle;
+			else if (c == '>') { if (angle > 0) --angle; }
+			else if (c == ',' && angle == 0) ++n;
+		}
+		return n;
+	}
+
+	std::string_view trimWs(std::string_view s)
+	{
+		while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+		while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.remove_suffix(1);
+		return s;
+	}
+
+	// {1,maxDigits} decimal digits, value <= maxValue, nothing else.
+	bool boundedNumber(std::string_view s, size_t maxDigits, uint64_t maxValue)
+	{
+		if (s.empty() || s.size() > maxDigits) return false;
+		uint64_t v = 0;
+		for (char c : s)
+		{
+			if (c < '0' || c > '9') return false;
+			v = v * 10 + static_cast<uint64_t>(c - '0');
+		}
+		return v <= maxValue;
+	}
+
+	// Option tags this PBX honours in Require (RFC 3261 §8.2.2.3). "timer":
+	// RFC 4028 is honoured passively (pjsua sends Require: timer on every
+	// INVITE). "replaces": RFC 3891, see kSupportedOptionTags in
+	// RequestsHandler.cpp. Everything else -- 100rel (no PRACK), path, gruu,
+	// outbound, sec-agree -- is a 420.
+	bool isKnownOptionTag(std::string_view tag)
+	{
+		return iequalLower(tag, "timer") || iequalLower(tag, "replaces");
+	}
+}
+
+SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported) const
+{
+	using namespace SipLimits;
+	unsupported = {};
+	const bool isRequest = !getStatusInfo().has_value();
+	const std::string_view method = getType();
+
+	// Buffer bounds: every message, since responses reach the same slots.
+	if (getCallID().size() > kMaxCallIdLine) return HeaderVerdict::CallIdTooLong;
+	if (getViaBranch().size() > kMaxBranch) return HeaderVerdict::BranchTooLong;
+	{
+		// CSeq: 1*10DIGIT LWS Method (RFC 3261 §20.16), number < 2^31.
+		const std::string_view v = trimWs(headerValueOf(getCSeq()));
+		const size_t sp = v.find_first_of(" \t");
+		if (sp == std::string_view::npos) return HeaderVerdict::BadCSeq;
+		const std::string_view m = trimWs(v.substr(sp));
+		if (!boundedNumber(v.substr(0, sp), kMaxCSeqDigits, 0x7FFFFFFFu) ||
+			m.empty() || m.size() > kMaxCSeqMethod || m.find_first_of(" \t") != std::string_view::npos)
+		{
+			return HeaderVerdict::BadCSeq;
+		}
+	}
+	if (!isRequest) return HeaderVerdict::Ok;
+
+	if (_headerLines.size() > kMaxHeaderLines) return HeaderVerdict::TooManyHeaders;
+
+	const bool checkRequire = method != SipMessageTypes::ACK && method != SipMessageTypes::CANCEL;
+	const bool checkBody = !_body.empty() &&
+		(method == SipMessageTypes::INVITE || method == SipMessageTypes::UPDATE);
+	unsigned via = 0, route = 0, recordRoute = 0, contact = 0;
+	bool sdpBody = false;
+	for (const std::string& line : _headerLines)
+	{
+		const std::string_view name = headerNameOf(line);
+		const std::string_view value = headerValueOf(line);
+		if (iequal(name, "via") || iequal(name, "v"))
+		{
+			via += countEntries(value);
+			if (via > kMaxVia) return HeaderVerdict::TooManyVia;
+		}
+		else if (iequal(name, "route"))
+		{
+			route += countEntries(value);
+			if (route > kMaxRoute) return HeaderVerdict::TooManyRoute;
+		}
+		else if (iequal(name, "record-route"))
+		{
+			recordRoute += countEntries(value);
+			if (recordRoute > kMaxRecordRoute) return HeaderVerdict::TooManyRecordRoute;
+		}
+		else if (iequal(name, "contact") || iequal(name, "m"))
+		{
+			contact += countEntries(value);
+			if (contact > kMaxContact) return HeaderVerdict::TooManyContact;
+		}
+		else if (iequal(name, "max-forwards"))
+		{
+			if (!boundedNumber(trimWs(value), 3, kMaxMaxForwards)) return HeaderVerdict::BadMaxForwards;
+		}
+		else if (checkRequire && (iequal(name, "require") || iequal(name, "proxy-require")))
+		{
+			std::string_view rest = value;
+			while (!rest.empty())
+			{
+				const size_t comma = rest.find(',');
+				const std::string_view tag = trimWs(rest.substr(0, comma));
+				rest = (comma == std::string_view::npos) ? std::string_view{} : rest.substr(comma + 1);
+				if (!tag.empty() && !isKnownOptionTag(tag))
+				{
+					unsupported = tag;
+					return HeaderVerdict::UnsupportedOption;
+				}
+			}
+		}
+		else if (iequal(name, "content-type") || iequal(name, "c"))
+		{
+			// Media type only: parameters after ';' do not change what we parse.
+			sdpBody = iequalLower(trimWs(value.substr(0, value.find(';'))), "application/sdp");
+		}
+	}
+	// RFC 3261 §21.4.13: a body we do not parse, or one with no Content-Type.
+	if (checkBody && !sdpBody) return HeaderVerdict::UnsupportedMediaType;
+	return HeaderVerdict::Ok;
+}
+
+const char* SipMessage::headerVerdictText(HeaderVerdict v)
+{
+	switch (v)
+	{
+		case HeaderVerdict::Ok:                   return "ok";
+		case HeaderVerdict::TooManyHeaders:       return "too many header lines";
+		case HeaderVerdict::CallIdTooLong:        return "Call-ID too long";
+		case HeaderVerdict::BranchTooLong:        return "Via branch too long";
+		case HeaderVerdict::BadCSeq:              return "malformed CSeq";
+		case HeaderVerdict::BadMaxForwards:       return "malformed Max-Forwards";
+		case HeaderVerdict::TooManyVia:           return "too many Via entries";
+		case HeaderVerdict::TooManyRoute:         return "too many Route entries";
+		case HeaderVerdict::TooManyRecordRoute:   return "too many Record-Route entries";
+		case HeaderVerdict::TooManyContact:       return "too many Contact entries";
+		case HeaderVerdict::UnsupportedOption:    return "unsupported option tag";
+		case HeaderVerdict::UnsupportedMediaType: return "unsupported body type";
+	}
+	return "rejected";
+}
+
+bool SipMessage::isPsapCallback() const
+{
+	for (const std::string& line : _headerLines)
+	{
+		if (iequal(headerNameOf(line), "priority") &&
+			iequalLower(trimWs(headerValueOf(line)), "psap-callback"))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool SipMessage::isEmergencyRequest() const
+{
+	if (getStatusInfo().has_value()) return false;
+	if (getType() != SipMessageTypes::INVITE) return false;
+	return pbx::classifyEmergencyDial(getRequestUriUser()).isEmergency ||
+		pbx::classifyEmergencyDial(getToNumber()).isEmergency ||
+		isPsapCallback();
 }
 
 void SipMessage::syncContentLength()
@@ -1038,7 +1245,23 @@ std::string_view SipMessage::extractNumber(std::string_view header) const
 {
 	auto sipPos = header.find("sip:");
 	if (sipPos == std::string_view::npos)
+	{
+		// #199, RFC 5031 / 6881: urn:service:sos[.<sub>] IS an emergency call.
+		// It has no sip: user part, so it used to read as empty and the INVITE
+		// was answered 400. It is routed exactly as a dialed 911.
+		static constexpr std::string_view kSos = "urn:service:sos";
+		for (size_t i = 0; i + kSos.size() <= header.size(); ++i)
+		{
+			if (!iequalLower(header.substr(i, kSos.size()), kSos)) continue;
+			const size_t end = i + kSos.size();
+			if (end == header.size() || header[end] == '.' || header[end] == '>' ||
+				header[end] == ';' || header[end] == ' ')
+			{
+				return pbx::kEmergencyNumber;
+			}
+		}
 		return {};
+	}
 
 	auto start = sipPos + 4;
 	auto atPos = header.find('@', start);

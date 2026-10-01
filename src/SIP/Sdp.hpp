@@ -62,7 +62,7 @@ namespace sdp
 		// NUMBER of m= sections as the offer, and a re-offer may only ADD, so a
 		// section must be preserved even when rejected with port 0. 4 gives one
 		// section of slack over the worst realistic case.
-		constexpr unsigned kMaxMediaSections = 4;
+		constexpr unsigned kMaxMediaSections = SdpLimits::kMaxMediaSections;   // 4; wire-enforced too (#199)
 
 		// 32, not the 16 first proposed. A bare `pjsua --null-audio` with no codec
 		// restriction -- which is exactly what tests/interop launches -- offers
@@ -70,10 +70,10 @@ namespace sdp
 		// audio section. A cap of 16 would fail-closed on our OWN interop harness.
 		// The real number is measured and recorded in the PR rather than left as
 		// an estimate. With borrowed scratch there is no per-message cost to 32.
-		constexpr unsigned kMaxAttributesPerSection = 32;
+		constexpr unsigned kMaxAttributesPerSection = SdpLimits::kMaxAttributesPerSection;   // 32
 
 		// Hardphones emit 0-3 session-level attributes; pjsua emits several more.
-		constexpr unsigned kMaxSessionAttributes = 16;
+		constexpr unsigned kMaxSessionAttributes = SdpLimits::kMaxSessionAttributes;   // 16
 
 		// Shares the wire cap: a body with more <fmt> tokens than this was already
 		// refused by checkSdp(), so the model never has to represent one.

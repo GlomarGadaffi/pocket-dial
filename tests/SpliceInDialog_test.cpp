@@ -669,7 +669,7 @@ TEST(SpliceInDialog, AFieldTooLongToStoreIsRefusedBeforeAnythingIsSent)
 	ASSERT_TRUE(own.has_value());
 	auto request = inDialog("INVITE", own.value(), "192.168.9.30", 5, sdpBody("192.168.9.30", "sendonly"));
 	ASSERT_TRUE(request);
-	request->setVia("Via: SIP/2.0/UDP 192.168.9.30:5060;branch=z9hG4bK" + std::string(300, 'a'));
+	request->setVia("Via: SIP/2.0/UDP 192.168.9.30:5060;branch=z9hG4bKsplice589;x=" + std::string(300, 'a'));
 	h.sent.clear();
 	h.handler.handle(request);
 	size_t toPeer = 0;
