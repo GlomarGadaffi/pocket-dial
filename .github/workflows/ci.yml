@@ -367,6 +367,11 @@ jobs:
           # gtest writes one JSON report per test binary into this directory
           # (#390). The count check below reads it; the tests run once.
           GTEST_OUTPUT: json:${{ github.workspace }}/build/gtest-reports/
+          # #199 emitted-message conformance: this runner has no pjproject, so
+          # the ctest `emitted_conformance` runs its RFC 3261 checklist only and
+          # says "pjsip stage SKIPPED". The pjsip stage runs in BigDog's gate,
+          # which has the pjproject tree the interop suite builds pjsua from.
+          PD_CONFORMANCE_ALLOW_NO_PJSIP: "1"
         run: |
           # The sip_parser_tests target is registered with CTest in
           # tests/CMakeLists.txt. Because the root CMakeLists.txt enables testing
