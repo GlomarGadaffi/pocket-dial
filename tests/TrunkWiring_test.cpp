@@ -543,11 +543,8 @@ TEST(TrunkWiring, AnAdminKillMidCallByesTheCarrierAsWellAsTheHandset)
 	b.handler.forceDisconnect("1001");
 	b.flushAsyncOutbox();
 
-	// >= 1, not == 1: forceDisconnect() also sends the handset a second, reversed
-	// BYE for a trunk session (its dest is a virtual peer at the handset's own
-	// address, and destIsVirtual does not list it). Separate bug: #795.
-	EXPECT_GE(b.countWithTo("BYE", kHandsetIp), 1u)
-		<< "positive control: the killed handset is told";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u)
+		<< "positive control: the killed handset is told, once (#795)";
 	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u)
 		<< "the carrier leg keeps billing until it is hung up";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and the relay pair is released";
@@ -713,6 +710,31 @@ TEST(TrunkWiring, TheByeToTheHandsetAfterACarrierHangupIsFromUsAndToTheHandset)
 	const std::string bye = b.firstWithTo("BYE", kHandsetIp);
 	ASSERT_FALSE(bye.empty());
 	expectHandsetByeIsFromUs(ok, bye, "ftcall-700");
+}
+
+// #795: an admin kill BYEs both legs of the session, but a trunk session's
+// "dest" is a stand-in peer at the HANDSET's own address, so the handset got a
+// second BYE with the tags reversed and answered it 481.
+TEST(TrunkWiring, AnAdminKillOfATrunkCallByesTheHandsetExactlyOnceAndFromUs)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-795"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	const std::string ok = b.firstWithTo("SIP/2.0 200 OK", kHandsetIp);
+	ASSERT_FALSE(ok.empty()) << "precondition: the handset was answered";
+	b.sent.clear();
+
+	b.handler.forceDisconnect("1001");
+	b.flushAsyncOutbox();
+
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u)
+		<< "one BYE to the killed handset; a second, reversed one draws a 481";
+	const std::string bye = b.firstWithTo("BYE", kHandsetIp);
+	ASSERT_FALSE(bye.empty());
+	expectHandsetByeIsFromUs(ok, bye, "ftcall-795");
 }
 
 // ── Forged carrier messages (#356) ──────────────────────────────────────────

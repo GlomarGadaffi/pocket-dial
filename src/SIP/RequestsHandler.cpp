@@ -8389,14 +8389,15 @@ bool RequestsHandler::forceDisconnect(const std::string& extension)
 				auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom, byeCSeq);
 				if (b) _asyncOutbox.emplace_back(src->getAddress(), std::move(b));
 			}
-			// A virtual-extension leg (777 echo, 888 conference, 555 anchor) has no
-			// second phone: its "dest" is a stand-in SipClient carrying the
-			// CALLER's own address (see onReinvite()'s note), so a BYE to it would
-			// reach the caller a second time with the tags reversed. The PBX is
-			// the UAS on that leg, and the src BYE above already ends it.
+			// A virtual-extension leg (777 echo, 888 conference, 555 anchor, or a
+			// trunk call's stand-in "trunk" peer, #795) has no second phone: its
+			// "dest" is a stand-in SipClient carrying the CALLER's own address (see
+			// onReinvite()'s note), so a BYE to it would reach the caller a second
+			// time with the tags reversed. The PBX is the UAS on that leg, and the
+			// src BYE above already ends it; the carrier leg is endCall()'s.
 			const std::string destNum = dest ? dest->getNumber() : "";
 			const bool destIsVirtual = destNum == "777" || destNum == ConferenceRoom::EXT ||
-			                           destNum == kAnchorCallExt;
+			                           destNum == kAnchorCallExt || session->isTrunk();
 			if (dest && !destIsVirtual && !dFrom.empty() && !dTo.empty())
 			{
 				auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo, byeCSeq);
