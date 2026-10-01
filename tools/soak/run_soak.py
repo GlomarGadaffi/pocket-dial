@@ -16,10 +16,15 @@ The run, in order:
               lease is not held by --holder (rig_checkout.sh status); the #428
               CHECK-OUT link is malformed or its expiry does not cover the run; without
               --ota, the board does not already run the stamp.
-  preflight   raw read_flash of nvs and coredump, each read twice and the sha256s
-              compared; then --boot-cmd and a wait for /api/status. The board must
-              report coredump supported and empty, a benign resetReason and
-              pendingVerify false. Any failure is INVALID and blocks the OTA.
+  preflight   The board must report coredump supported and empty, a benign
+              resetReason and pendingVerify false. Any failure is INVALID and blocks
+              the OTA. The OTA path (--ota, or a board already on the candidate) NEVER
+              opens the serial port: remote_ota.sh's own checks and the proven
+              bootloader rollback are its safety net, and the skipped backup is
+              recorded as a waiver. Only the full-flash path (--full-flash) reads nvs
+              and coredump over serial first (each twice, sha256s compared), then
+              leaves the ROM loader with --boot-cmd (default: esptool --after
+              hard_reset chip_id), always on the stable by-id port RIG_SERIAL.
   ota         (--ota) tools/ota/remote_ota.sh stage 3; credentials only through the
               inherited environment (PD_OTA_USER / PD_OTA_PASS), never an argv.
   version     /api/status version must equal the stamp (INVALID otherwise). The heap
@@ -28,10 +33,13 @@ The run, in order:
   load        tests/load/sip_stress.py --profile rc1, for --duration plus its quiesce.
   watch       the logger's own JSONL is tailed (no second poller, #534): an uptime
               regression or a resetReason change stops the load first, captures
-              status, stops the logger, reads the coredump partition: FAIL. 30 s with
-              no good sample does the same once the board answers again; 5 min with
-              none gets ONE uhubctl cycle of the pinned port, then NEEDS-HUMAN. No
-              retries. A dead or stalled logger is INVALID (a harness fault).
+              /api/status (with its coredump present/size), stops the logger: FAIL.
+              The raw dump is owner-gated (GET /api/coredump) and serial is never
+              opened here, so it is marked unavailable for a human to fetch. 30 s
+              with no good sample does the same once the board answers again; 5 min
+              with none gets ONE /usr/sbin/uhubctl cycle of the pinned port (it needs
+              root and may fail), then NEEDS-HUMAN. No retries. A dead or stalled
+              logger is INVALID (a harness fault).
   post-roll   the logger keeps running >= 60 s after the load stops.
   verdict     the version is rechecked, then soak_verdict.py judges the log.
   evidence    soak-<ts>/ and soak-<ts>.tar.gz: manifest (stamp, commit, tree, dirty
@@ -66,6 +74,12 @@ import check_app_version as gate  # noqa: E402
 
 EXIT = {"PASS": 0, "FAIL": 1, "INVALID": 3, "ABORTED": 4, "NEEDS-HUMAN": 5}
 REFUSED = 2
+# The rig's serial port, by its stable by-id name (never /dev/ttyACMn, which
+# moves between boots). Opening it resets the board. The other board on glolab,
+# the LilyGO DNS box (E0:72:A1:CC:1C:04), is never touched.
+RIG_SERIAL = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:84:85:4A:24:68-if00"
+NEVER_SERIAL = ("E0:72:A1:CC:1C:04",)
+UHUBCTL = "/usr/sbin/uhubctl"     # not on claude-agent's PATH; needs root, so a cycle may fail
 BENIGN_RESETS = {"POWERON", "SW_RESTART", "USB", "EXT_PIN"}
 LOAD_PROFILE = "rc1"
 LOAD_QUIESCE_S = 210          # tests/load/load_profile.py's rc1 quiesce_s
@@ -76,12 +90,9 @@ NVS = ("nvs", 0x9000, 0x6000)
 COREDUMP = ("coredump", 0xC20000, 0x20000)
 
 PROFILES = {
-    "post-ota": {"duration_s": 600, "min_hours": None, "warmup_s": 60, "preroll_s": 30,
-                 "postroll_s": 90, "flash_backup": False},
-    "smoke": {"duration_s": 3600, "min_hours": 1.0, "warmup_s": 900, "preroll_s": 60,
-              "postroll_s": 90, "flash_backup": True},
-    "soak": {"duration_s": 16200, "min_hours": 4.0, "warmup_s": 900, "preroll_s": 60,
-             "postroll_s": 90, "flash_backup": True},
+    "post-ota": {"duration_s": 600, "min_hours": None, "warmup_s": 60, "preroll_s": 30, "postroll_s": 90},
+    "smoke": {"duration_s": 3600, "min_hours": 1.0, "warmup_s": 900, "preroll_s": 60, "postroll_s": 90},
+    "soak": {"duration_s": 16200, "min_hours": 4.0, "warmup_s": 900, "preroll_s": 60, "postroll_s": 90},
 }
 SILENCE_S = 30
 UNREACHABLE_S = 300
@@ -231,7 +242,7 @@ class Run:
         else:
             self.min_hours = self.prof["min_hours"]
             self.warmup = self.prof["warmup_s"]
-        self.flash_backup = self.prof["flash_backup"] and not args.skip_flash_backup
+        self.flash_backup = args.full_flash and not args.skip_flash_backup
         self.repo = os.path.abspath(args.repo)
         self.tools = {
             "logger": os.environ.get("PD_SOAK_LOGGER", os.path.join(TOOLS_ROOT, "tools/soak/status_logger.sh")),
@@ -240,7 +251,7 @@ class Run:
             "ota": os.environ.get("PD_SOAK_OTA", os.path.join(TOOLS_ROOT, "tools/ota/remote_ota.sh")),
             "rig": os.environ.get("PD_SOAK_RIG_CHECKOUT", os.path.join(TOOLS_ROOT, "tools/soak/rig_checkout.sh")),
             "esptool": os.environ.get("PD_SOAK_ESPTOOL", "esptool.py"),
-            "uhubctl": os.environ.get("PD_SOAK_UHUBCTL", "uhubctl"),
+            "uhubctl": os.environ.get("PD_SOAK_UHUBCTL", UHUBCTL),
         }
         self.ts = datetime.datetime.fromtimestamp(clock.wall(), datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.dir = os.path.join(os.path.abspath(args.out), "soak-" + self.ts)
@@ -286,8 +297,13 @@ class Run:
         return c + (["--allow-no-coredump"] if self.a.allow_no_coredump else [])
 
     def cmd_read_flash(self, part, offset, size, out):
-        return [self.tools["esptool"], "--port", self.a.serial_port or "<serial-port>", "--after", "no_reset",
+        return [self.tools["esptool"], "--port", self.a.serial_port, "--after", "no_reset",
                 "read_flash", hex(offset), hex(size), out]
+
+    def cmd_boot(self):
+        if self.a.boot_cmd:
+            return shlex.split(self.a.boot_cmd)
+        return [self.tools["esptool"], "--port", self.a.serial_port, "--after", "hard_reset", "chip_id"]
 
     def cmd_ota(self):
         return [self.tools["ota"], "--host", self.a.host, "--stage", "3", "--image", self.a.image or "<image>",
@@ -329,7 +345,9 @@ class Run:
     # -- phases ------------------------------------------------------------
     def flash_backups(self):
         if not self.flash_backup:
-            why = "--skip-flash-backup" if self.a.skip_flash_backup else "the %s profile" % self.a.profile
+            why = ("--skip-flash-backup" if self.a.full_flash else
+                   "the OTA path never opens serial; remote_ota.sh's checks and the bootloader "
+                   "rollback are its safety net")
             self.manifest["waivers"].append("no raw nvs/coredump backup (%s)" % why)
             self.say("flash backup waived (%s)" % why)
             return
@@ -346,8 +364,9 @@ class Run:
                 raise Abort("INVALID", "preflight: two reads of %s differ: OTA blocked" % name)
             out[name] = {"offset": hex(off), "size": hex(size), "sha256": shas[0]}
         self.manifest["flash_backup"] = out
-        if self.a.boot_cmd:
-            self.runc(shlex.split(self.a.boot_cmd), out_name="boot.log", timeout=120)
+        rc = self.runc(self.cmd_boot(), out_name="boot.log", timeout=120)   # leave the ROM loader
+        if rc != 0:
+            self.manifest["notes"].append("the boot command after the backup returned %s" % rc)
 
     def preflight(self):
         st = self.wait_status(BOOT_WAIT_S, "preflight")
@@ -410,14 +429,18 @@ class Run:
         self.stop_proc(self.logger, 5)
 
     def capture_after_abort(self):
+        """Status (with its coredump present/size), then stop the logger. Never serial:
+        the raw dump is owner-gated (GET /api/coredump), so it is marked unavailable."""
         st = self.status()
         if st is not None:
             with open(self.p("abort-status.json"), "w", encoding="utf-8") as f:
                 json.dump(st, f, indent=1)
-        self.stop_logger()               # before esptool: its reset must not land in the log
-        if self.a.serial_port:
-            self.runc(self.cmd_read_flash(*COREDUMP, self.p("coredump-after-abort.bin")),
-                      out_name="esptool.log", timeout=900)
+        cd = (st or {}).get("coredump")
+        self.manifest["coredump_after_abort"] = {
+            "status": cd if isinstance(cd, dict) else None,
+            "raw": "unavailable: GET /api/coredump needs an owner login and this run never opens "
+                   "serial; fetch it by hand"}
+        self.stop_logger()
         return st
 
     def wait_good_sample(self, watch, limit_s):
@@ -441,9 +464,12 @@ class Run:
                 if self.a.uhubctl_loc and self.a.uhubctl_port:
                     self.manifest["uhubctl_cycles"].append(self.clock.wall())
                     self.say("unreachable for %d s: ONE power cycle of the pinned port" % UNREACHABLE_S)
-                    self.runc(self.cmd_uhubctl(), out_name="uhubctl.log", timeout=60)
-                    came = self.wait_good_sample(watch, AFTER_CYCLE_S) is not None
-                    note = "came back after the cycle" if came else "did not come back after the cycle"
+                    rc = self.runc(self.cmd_uhubctl(), out_name="uhubctl.log", timeout=60)
+                    if rc != 0:
+                        note = "the uhubctl cycle failed (rc %s; it needs root)" % rc
+                    else:
+                        came = self.wait_good_sample(watch, AFTER_CYCLE_S) is not None
+                        note = "came back after the cycle" if came else "did not come back after the cycle"
                 else:
                     note = "no pinned uhubctl port configured, so no cycle"
                 self.capture_after_abort()
@@ -585,9 +611,13 @@ def refusals(args, run, now_wall):
             gate.check(args.image, repo=run.repo)
         except gate.GateFailure as e:
             problems.append("the image does not carry this checkout's stamp: %s" % e)
-    if run.flash_backup and not args.serial_port:
-        problems.append("the %s profile backs up nvs and coredump first: pass --serial-port "
-                        "(or --skip-flash-backup, recorded as a waiver)" % args.profile)
+    port = args.serial_port or ""
+    if not port.startswith("/dev/serial/by-id/"):
+        problems.append("--serial-port must be a stable /dev/serial/by-id/ path, never /dev/ttyACM*")
+    if any(mac in port for mac in NEVER_SERIAL):
+        problems.append("--serial-port names the LilyGO DNS board: never touched")
+    if args.full_flash and args.ota:
+        problems.append("--full-flash and --ota are different install paths: pick one")
     if args.uhubctl_loc and not args.uhubctl_port or args.uhubctl_port and not args.uhubctl_loc:
         problems.append("--uhubctl-loc and --uhubctl-port go together (one pinned port)")
     if not args.checkout_url or not CHECKOUT_URL_RX.match(args.checkout_url):
@@ -630,10 +660,9 @@ def dry_run(run, out):
         for name, off, size in (NVS, COREDUMP):
             for n in (1, 2):
                 steps.append(("preflight", run.cmd_read_flash(name, off, size, run.p("%s-%d.bin" % (name, n)))))
-        if a.boot_cmd:
-            steps.append(("preflight", shlex.split(a.boot_cmd)))
+        steps.append(("preflight", run.cmd_boot()))
     else:
-        steps.append(("preflight", ["# flash backup waived"]))
+        steps.append(("preflight", ["# no serial: flash backup waived"]))
     steps += [("preflight", ["GET", run.url("/api/status"), "(coredump empty, benign resetReason)"]),
               ("preflight", ["GET", run.url("/api/ota/status"), "(pendingVerify false)"])]
     if a.ota:
@@ -641,7 +670,6 @@ def dry_run(run, out):
     steps += [("version", ["GET", run.url("/api/status"), "(version == <stamp>; heap baseline)"]),
               ("logger", run.cmd_logger() + ["&"]),
               ("load", run.cmd_load() + ["&"]),
-              ("abort only", run.cmd_read_flash(*COREDUMP, run.p("coredump-after-abort.bin"))),
               ("abort only", run.cmd_uhubctl()),
               ("verdict", run.cmd_verdict()),
               ("check-in", run.cmd_release("<verdict>", run.dir + ".tar.gz", "<reason>"))]
@@ -666,9 +694,12 @@ def build_parser():
     ap.add_argument("--checkout-expiry", default=None)
     ap.add_argument("--exts", default="", help="the 4 test UAs (passed to the load)")
     ap.add_argument("--owner-ext", default="", help="the owner's extensions (passed to the load)")
-    ap.add_argument("--serial-port", default=None, help="for the nvs/coredump backups and the abort read")
+    ap.add_argument("--full-flash", action="store_true",
+                    help="the full-flash (non-OTA) path: back up nvs and coredump over serial first")
+    ap.add_argument("--serial-port", default=RIG_SERIAL, help="by-id path only (default: the rig's)")
     ap.add_argument("--skip-flash-backup", action="store_true", help="recorded as a waiver")
-    ap.add_argument("--boot-cmd", default=None, help="brings the board out of the ROM loader after the backup")
+    ap.add_argument("--boot-cmd", default=None,
+                    help="leaves the ROM loader after the backup (default: esptool --after hard_reset chip_id)")
     ap.add_argument("--uhubctl-loc", default=None)
     ap.add_argument("--uhubctl-port", default=None)
     ap.add_argument("--allow-no-coredump", action="store_true")

@@ -191,6 +191,7 @@ class World:
         self.logger_dies_at = None
         self.load_rc = 0
         self.differ_second_nvs_read = False
+        self.uhubctl_rc = 0
         self.lease_holder = "BigDog"
         self.clock.listeners.append(self.tick)
 
@@ -207,13 +208,16 @@ class World:
                 return subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT).returncode
         self.events.append(("run", base, self.clock.wall()))
         if base.startswith("esptool"):
-            out = argv[-1]
-            body = os.path.basename(out).rsplit("-", 1)[0].encode()    # "nvs", "coredump"
-            if self.differ_second_nvs_read and out.endswith("nvs-2.bin"):
-                body += b"!"
-            with open(out, "wb") as f:
-                f.write(body)
+            if "read_flash" in argv:
+                out = argv[-1]
+                body = os.path.basename(out).rsplit("-", 1)[0].encode()    # "nvs", "coredump"
+                if self.differ_second_nvs_read and out.endswith("nvs-2.bin"):
+                    body += b"!"
+                with open(out, "wb") as f:
+                    f.write(body)
             return 0
+        if base == "uhubctl":
+            return self.uhubctl_rc
         if base == "remote_ota.sh":
             self.board.version = argv[argv.index("--expect-version") + 1]
             self.board.reboot("SW_RESTART", core=False)
@@ -247,6 +251,10 @@ class World:
 
     def names(self):
         return [os.path.basename(c[1] if c[0] == "python3" else c[0]) for c in self.calls]
+
+    def touched_serial(self):
+        return [c for c in self.calls if any("/dev/" in x for x in c) or
+                os.path.basename(c[0]).startswith("esptool")]
 
     def released(self):
         return [e[1] for e in self.events if e[0] == "release"]
@@ -344,33 +352,39 @@ class RunSoakTest(unittest.TestCase):
         self.assertGreaterEqual(ev[("terminate", "logger")] - ev[("load-done", "load")], 60)
 
     def test_a_shortened_smoke_keeps_the_rc1_gate_and_fails_on_duration(self):
-        rc, out = self.go(self.argv("smoke", "300", "--skip-flash-backup"))
-        self.assertEqual(rc, 1, out)
+        rc, out = self.go(self.argv("smoke", "300"))
         tar, d = self.bundle()
         m = self.manifest(d)
         self.assertEqual(m["verdict_min_hours"], 1.0)
         with open(os.path.join(d, "verdict.json"), encoding="utf-8") as f:
             failed = {c["name"] for c in json.load(f)["checks"] if not c["ok"]}
         self.assertIn("duration", failed)
-        self.assertIn("no raw nvs/coredump backup (--skip-flash-backup)", m["waivers"])
-        self.assertEqual(self.world.released(), ["FAIL"])
+        own = subprocess.run(["python3", VERDICT, os.path.join(d, "status.jsonl"), "--min-hours", "1.0",
+                              "--warmup-s", "900"], capture_output=True, text=True)
+        self.assertNotEqual(own.returncode, 0)
+        # FAIL today; INVALID (3) once soak_verdict.py grows a three-way verdict (#401 item 0.4)
+        self.assertEqual(rc, {1: 1}.get(own.returncode, 3), out)
+        self.assertNotEqual(self.world.released(), ["PASS"])
+        self.assertTrue(any("never opens serial" in w for w in m["waivers"]))
 
     def test_an_injected_reboot_yields_a_fail_bundle(self):
         self.world.clock.listeners.append(
             lambda: self.world.board.reboot("PANIC")
             if self.world.procs.get("load") and int(self.world.clock.wall() - self.world.procs["load"].start) == 200
             else None)
-        rc, out = self.go(self.argv("post-ota", "300", "--serial-port", "/dev/ttyACM0"))
+        rc, out = self.go(self.argv("post-ota", "300"))
         self.assertEqual(rc, 1, out)
         tar, d = self.bundle()
         m = self.manifest(d)
         self.assertEqual(m["verdict"], "FAIL")
         self.assertIn("uptime went", m["reason"])
-        self.assertTrue(os.path.exists(os.path.join(d, "abort-status.json")))
-        self.assertTrue(os.path.exists(os.path.join(d, "coredump-after-abort.bin")))
+        with open(os.path.join(d, "abort-status.json"), encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["coredump"]["present"])
+        self.assertEqual(m["coredump_after_abort"]["status"]["size"], 47264)
+        self.assertIn("unavailable", m["coredump_after_abort"]["raw"])
         order = [(k, n) for k, n, _ in self.world.events if k in ("terminate", "run")]
-        self.assertEqual(order[:3], [("terminate", "load"), ("terminate", "logger"), ("run", "esptool.py")],
-                         "the load stops first, the logger before esptool resets the board")
+        self.assertEqual(order[:2], [("terminate", "load"), ("terminate", "logger")], "the load stops first")
+        self.assertEqual(self.world.touched_serial(), [], "the abort path never opens serial")
         self.assertEqual(self.world.released(), ["FAIL"])
 
     def test_a_sigterm_mid_run_still_checks_in(self):
@@ -412,6 +426,18 @@ class RunSoakTest(unittest.TestCase):
         self.assertEqual(len(self.manifest(d)["uhubctl_cycles"]), 1)
         self.assertEqual(self.world.released(), ["NEEDS-HUMAN"])
 
+    def test_a_failed_uhubctl_cycle_by_full_path_still_needs_a_human(self):
+        os.environ.pop("PD_SOAK_UHUBCTL", None)
+        self.world.uhubctl_rc = 1               # no root: the cycle fails
+        self.board_down(150, 10 ** 6)
+        rc, out = self.go(self.argv("post-ota", "300", "--uhubctl-loc", "1-1", "--uhubctl-port", "2"))
+        self.assertEqual(rc, 5, out)
+        (cycle,) = [c for c in self.world.calls if os.path.basename(c[0]) == "uhubctl"]
+        self.assertEqual(cycle[0], "/usr/sbin/uhubctl")
+        tar, d = self.bundle()
+        self.assertIn("uhubctl cycle failed (rc 1", self.manifest(d)["reason"])
+        self.assertEqual(self.world.released(), ["NEEDS-HUMAN"])
+
     def test_a_board_silent_for_30_s_that_comes_back_fails_without_a_cycle(self):
         self.board_down(150, 45)
         rc, out = self.go(self.argv("post-ota", "300", "--uhubctl-loc", "1-1", "--uhubctl-port", "2"))
@@ -431,28 +457,51 @@ class RunSoakTest(unittest.TestCase):
             ("coredump", lambda w: w.board.coredump.update(present=True, size=4096), "coredump is already present"),
             ("pending", lambda w: setattr(w.board, "pending", True), "pendingVerify"),
             ("reset", lambda w: setattr(w.board, "reason", "TASK_WDT"), "not benign"),
-            ("reads", lambda w: setattr(w, "differ_second_nvs_read", True), "two reads of nvs differ"),
         ]
         for name, breaker, want in cases:
             with self.subTest(name):
                 shutil.rmtree(self.out, ignore_errors=True)
                 self.world = World("v0.0.1-old")
                 breaker(self.world)
-                rc, out = self.go(self.argv("smoke", "300", "--ota", "--serial-port", "/dev/ttyACM0"))
+                rc, out = self.go(self.argv("smoke", "300", "--ota"))
                 self.assertEqual(rc, 3, out)
                 self.assertIn(want, out)
                 self.assertNotIn("remote_ota.sh", self.world.names(), "the OTA was blocked")
                 self.assertNotIn("status_logger.sh", self.world.names())
+                self.assertEqual(self.world.touched_serial(), [])
                 self.assertEqual(self.world.released(), ["INVALID"])
 
-    def test_the_backups_are_read_twice_and_their_sha256s_recorded(self):
-        rc, out = self.go(self.argv("smoke", "300", "--serial-port", "/dev/ttyACM0"))
-        reads = [c for c in self.world.calls if os.path.basename(c[0]).startswith("esptool")]
-        self.assertEqual(len(reads), 4)
+    def test_the_ota_profiles_never_open_serial(self):
+        for profile in ("post-ota", "smoke", "soak"):
+            with self.subTest(profile):
+                shutil.rmtree(self.out, ignore_errors=True)
+                self.world = World("v0.0.1-old")
+                self.go(self.argv(profile, "300", "--ota"))
+                self.assertEqual(self.world.touched_serial(), [])
+                tar, d = self.bundle()
+                self.assertTrue(any("never opens serial" in w for w in self.manifest(d)["waivers"]))
+                shutil.rmtree(os.path.join(self.tmp, "x"), ignore_errors=True)
+
+    def test_the_full_flash_path_keeps_the_backup_on_the_by_id_port(self):
+        rc, out = self.go(self.argv("smoke", "300", "--full-flash"))
+        esp = [c for c in self.world.calls if os.path.basename(c[0]).startswith("esptool")]
+        reads, boot = esp[:4], esp[4]
         for c in reads:
             self.assertEqual(c[c.index("--after") + 1], "no_reset")
+            self.assertEqual(c[c.index("--port") + 1], rs.RIG_SERIAL)
+        self.assertEqual(boot, ["/fake/esptool.py", "--port", rs.RIG_SERIAL, "--after", "hard_reset", "chip_id"],
+                         "a harmless op with --after hard_reset leaves the ROM loader")
+        self.assertEqual(len(esp), 5, "and nothing else opens serial")
         tar, d = self.bundle()
         self.assertEqual(set(self.manifest(d)["flash_backup"]), {"nvs", "coredump"})
+
+    def test_backup_reads_that_differ_are_invalid(self):
+        self.world.differ_second_nvs_read = True
+        rc, out = self.go(self.argv("smoke", "300", "--full-flash"))
+        self.assertEqual(rc, 3, out)
+        self.assertIn("two reads of nvs differ", out)
+        self.assertNotIn("status_logger.sh", self.world.names())
+        self.assertEqual(self.world.released(), ["INVALID"])
 
     def test_ota_installs_the_candidate_and_no_credential_reaches_an_argv(self):
         os.environ["PD_OTA_PASS"] = FAKE_SECRET
@@ -511,24 +560,41 @@ class RunSoakTest(unittest.TestCase):
         a[a.index("--checkout-url") + 1] = "https://github.com/GlomarGadaffi/pocket-dial/discussions/294"
         self.assertRefused(a, "#428 CHECK-OUT comment link")
 
-    def test_a_flash_backup_needs_a_serial_port(self):
-        self.assertRefused(self.argv("smoke", "300"), "pass --serial-port")
+    def test_serial_is_the_stable_by_id_path_only(self):
+        self.assertEqual(rs.RIG_SERIAL,
+                         "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:84:85:4A:24:68-if00")
+        self.assertRefused(self.argv("smoke", "300", "--full-flash", "--serial-port", "/dev/ttyACM0"),
+                           "never /dev/ttyACM*")
+        self.assertRefused(self.argv("smoke", "300", "--full-flash", "--serial-port",
+                                     "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_"
+                                     "E0:72:A1:CC:1C:04-if00"), "LilyGO DNS board")
+        self.assertRefused(self.argv("smoke", "300", "--full-flash", "--ota"), "pick one")
 
     # ---- dry run --------------------------------------------------------------
     def test_dry_run_prints_every_command_and_executes_none(self):
-        rc, out = self.go(self.argv("smoke", "3600", "--ota", "--serial-port", "/dev/ttyACM0",
-                                    "--uhubctl-loc", "1-1", "--uhubctl-port", "2", "--dry-run"))
+        os.environ.pop("PD_SOAK_UHUBCTL", None)
+        rc, out = self.go(self.argv("smoke", "3600", "--ota", "--uhubctl-loc", "1-1", "--uhubctl-port", "2",
+                                    "--dry-run"))
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.world.calls, [])
         self.assertEqual(self.world.board.hits, 0)
         self.assertFalse(os.path.exists(self.out))
-        for want in ("describe --tags --always --dirty", "read_flash 0x9000 0x6000",
-                     "read_flash 0xc20000 0x20000", "remote_ota.sh --host 192.0.2.10 --stage 3",
+        for want in ("describe --tags --always --dirty", "remote_ota.sh --host 192.0.2.10 --stage 3",
                      "status_logger.sh 192.0.2.10", "sip_stress.py --profile rc1",
-                     "soak_verdict.py", "--min-hours 1.0", "uhubctl -l 1-1 -p 2 -a cycle",
-                     "rig_checkout.sh release --holder BigDog"):
+                     "soak_verdict.py", "--min-hours 1.0", "/usr/sbin/uhubctl -l 1-1 -p 2 -a cycle",
+                     "rig_checkout.sh release --holder BigDog", "no serial: flash backup waived"):
             self.assertIn(want, out)
-        self.assertEqual(out.count("read_flash"), 5, "4 backup reads + the abort read")
+        self.assertNotIn("read_flash", out)
+        self.assertNotIn("/dev/", out, "the OTA path names no serial port at all")
+
+    def test_dry_run_of_the_full_flash_path_shows_the_backup(self):
+        rc, out = self.go(self.argv("smoke", "3600", "--full-flash", "--dry-run"))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.world.calls, [])
+        self.assertEqual(out.count("read_flash"), 4)
+        self.assertIn("read_flash 0x9000 0x6000", out)
+        self.assertIn("read_flash 0xc20000 0x20000", out)
+        self.assertIn("--port %s --after hard_reset chip_id" % rs.RIG_SERIAL, out)
 
 
 class HttpTest(unittest.TestCase):
