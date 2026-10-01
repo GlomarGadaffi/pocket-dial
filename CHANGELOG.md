@@ -97,6 +97,9 @@ bench-verified here.
 - The SIP and SDP grammars are constrained to our RFC subset and invariants (#759).
 - A relayed call's BYE is answered locally and the PBX sends its own BYE to the far leg (#809; #808).
 - The 487 ACK of a cancelled pickup target and the 200 to a trunk CANCEL are conformant (#823).
+- A 911 whose anchor worker cannot start is notified NOT ROUTED, not routed (#815; #713).
+- An emergency `makeCall` waits out a call slot that is still tearing down (#816; #743).
+- A multipart 911 INVITE is routed and `tel:911` reads as 911; the unwrap keys on the To user, and only a URI's own number counts (#817; #760).
 
 ### Trunk
 
@@ -126,6 +129,8 @@ bench-verified here.
 - The BYE to the handset after a carrier hangup or RTP reap has From and To the right way round (#780; #700).
 - The trunk INVITE no longer claims `Supported: timer` (#764; #753).
 - ACK and BYE carry the carrier's Record-Route as a Route set (#775; #748).
+- `hangup()` in Trying holds the slot and CANCELs on the first 1xx (#811; #794).
+- An admin kill of a trunk call BYEs the handset once, not twice (#813; #795).
 
 ### Memory and no-heap
 
@@ -213,6 +218,7 @@ bench-verified here.
 - Digest nonces are stamped with the monotonic clock, so a wall-clock step cannot strand phones (#584).
 - The Wi-Fi SoftAP passphrase is drawn with the SAR ADC entropy source on (#590; #588).
 - New Learn adoptions are rate-limited; one action forgets every Learned device (#727; #515).
+- Learn locks adopted extensions and never admits a Secured extension unauthenticated; an ARP miss on a locked extension is a retryable 503, not an admission (#487; #440, #507).
 
 ### Docs
 
