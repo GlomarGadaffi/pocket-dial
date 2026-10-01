@@ -110,7 +110,7 @@ namespace
 	// go DOWN: lower it when the printed count drops, remove the route at zero.
 	// The list shrinking to empty is #410 done.
 	const std::map<std::string, long> kAllocCeiling = {
-		{"GET /api/status", 1},
+		{"GET /api/status", 1}, {"GET /api/sbc-mode", 2},
 		{"GET /", 2}, {"GET /index.html", 2}, {"GET /setup/email", 2}, {"GET /setup/trunk", 2},
 		{"GET /api/cdr", 2}, {"GET /api/trace", 2}, {"GET /api/did-mapping", 2},
 		{"GET /api/pcap", 3}, {"GET /api/coredump", 3}, {"GET /api/diagnostics/pcap", 3},
@@ -118,7 +118,7 @@ namespace
 		{"POST /api/forward", 3}, {"POST /api/group", 3}, {"POST /api/syslog", 3},
 		{"POST /api/kill", 3},
 		{"GET /api/syslog", 4}, {"GET /api/trunk", 4}, {"GET /api/moh", 4},
-		{"GET /api/coredump/info", 4}, {"GET /api/e911-config", 4}, {"GET /api/sbc-mode", 4},
+		{"GET /api/coredump/info", 4}, {"GET /api/e911-config", 4},
 		{"GET /api/registrar", 4},
 		{"GET /api/email", 5}, {"GET /api/admin/status", 5},
 		{"GET /api/ap-security", 6}, {"POST /api/dialplan", 9}, {"GET /api/config/export", 10},
