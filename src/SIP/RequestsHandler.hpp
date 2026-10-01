@@ -480,6 +480,13 @@ public:
 		std::lock_guard<std::mutex> lock(_mutex);
 		for (auto& t : _spliceTxns) t.since -= d;
 	}
+	// #808: run the transaction layer's timers as of `now`, so a test can carry a
+	// BYE past Timer F (32 s) without waiting for it.
+	void sweepTransactionsForTest(std::chrono::steady_clock::time_point now)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_txLayer.sweep(now);
+	}
 	// #479: the boot-built conference room, so a test can make its driver fail.
 	ConferenceRoom* conferenceForTest() { return _conference.get(); }
 	// #479: as a POCKETDIAL_CONFERENCE=0 build, which never builds the room.
@@ -911,6 +918,13 @@ private:
 			if (auto c = s.value()->getDest()) dest = c->getNumber();
 		}
 		endCall(callId, src, dest, reason);
+	}
+	void onByeTimedOut(std::string_view callId) override
+	{
+		// Only a session waiting on this BYE (#808): a server BYE on a dialog that is
+		// being torn down anyway, or to a transferor whose bridge lives on, ends nothing.
+		if (auto s = getSession(callId); s.has_value() && s.value()->getState() == Session::State::Bye)
+			endSession(callId, "BYE unanswered (Timer F)");
 	}
 	void log(std::string msg, bool isError = false) override
 	{

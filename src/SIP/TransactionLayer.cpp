@@ -569,6 +569,7 @@ void TransactionLayer::sweepOne(SipTransaction& tx, std::chrono::steady_clock::t
 	// non-2xx), and the §13.3.1.4 64*T1 ceiling on 2xx retransmission.
 	if (armed(tx.transactionTimeout) && now >= tx.transactionTimeout)
 	{
+		bool byeTimedOut = false;
 		switch (tx.type)
 		{
 			case SipTransaction::Type::InviteClient:
@@ -580,6 +581,7 @@ void TransactionLayer::sweepOne(SipTransaction& tx, std::chrono::steady_clock::t
 			case SipTransaction::Type::NonInviteClient:
 				_env.log(std::string("[tx] Timer F expired — ") + tx.cseqMethod
 					+ " for " + tx.callId + " got no response after 32 s", true);
+				byeTimedOut = std::string_view(tx.cseqMethod) == "BYE";
 				break;
 			case SipTransaction::Type::InviteServer:
 				if (tx.state == SipTransaction::State::Accepted)
@@ -602,6 +604,14 @@ void TransactionLayer::sweepOne(SipTransaction& tx, std::chrono::steady_clock::t
 				break;
 		}
 		tx.type = SipTransaction::Type::None;
+		// After the slot is released, and from a copy of its Call-ID: the env may end
+		// the session, which walks these pools.
+		if (byeTimedOut)
+		{
+			char callId[sizeof(tx.callId)];
+			std::memcpy(callId, tx.callId, sizeof(callId));
+			_env.onByeTimedOut(callId);
+		}
 		return;
 	}
 
