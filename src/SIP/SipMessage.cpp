@@ -949,9 +949,9 @@ bool SipMessage::isEmergencyRequest() const
 {
 	if (getStatusInfo().has_value()) return false;
 	if (getType() != SipMessageTypes::INVITE) return false;
-	return pbx::classifyEmergencyDial(getRequestUriUser()).isEmergency ||
-		pbx::classifyEmergencyDial(getToNumber()).isEmergency ||
-		isPsapCallback();
+	// #824: by the To user alone, the number onInvite routes on. A 911
+	// Request-URI over To 102 is a call to 102 and gets no emergency yield.
+	return pbx::classifyEmergencyDial(getToNumber()).isEmergency || isPsapCallback();
 }
 
 void SipMessage::syncContentLength()
@@ -1395,30 +1395,29 @@ namespace
 
 std::string_view SipMessage::extractNumber(std::string_view header) const
 {
-	auto sipPos = header.find("sip:");
-	if (sipPos == std::string_view::npos)
+	// #824: only the URI is read, and its own scheme must start it. A display
+	// name or a parameter never counts, either way: To: "sip:911@lobby"
+	// <tel:+15551230100> is not a call to 911, and "sip:102@lobby" <sip:911@x>
+	// is not a call to 102.
+	const std::string_view uri = uriPartOf(header);
+	if (uri.substr(0, 4) != "sip:")
 	{
 		// #199, RFC 5031 / 6881: urn:service:sos[.<sub>] IS an emergency call.
 		// It has no sip: user part, so it used to read as empty and the INVITE
 		// was answered 400. It is routed exactly as a dialed 911.
 		static constexpr std::string_view kSos = "urn:service:sos";
-		for (size_t i = 0; i + kSos.size() <= header.size(); ++i)
+		const size_t end = kSos.size();
+		if (iequalLower(uri.substr(0, end), kSos) &&
+			(end == uri.size() || uri[end] == '.' || uri[end] == ';'))
 		{
-			if (!iequalLower(header.substr(i, kSos.size()), kSos)) continue;
-			const size_t end = i + kSos.size();
-			if (end == header.size() || header[end] == '.' || header[end] == '>' ||
-				header[end] == ';' || header[end] == ' ')
-			{
-				return pbx::kEmergencyNumber;
-			}
+			return pbx::kEmergencyNumber;
 		}
 		return emergencyUserOf(header);   // #760: tel:911 and urn:service:test.sos
 	}
 
-	auto start = sipPos + 4;
-	auto atPos = header.find('@', start);
+	const size_t atPos = uri.find('@', 4);
 	if (atPos == std::string_view::npos)
 		return {};
 
-	return header.substr(start, atPos - start);
+	return uri.substr(4, atPos - 4);
 }
