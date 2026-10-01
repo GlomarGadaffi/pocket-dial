@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <sstream>
+#include <vector>
 
 #include "EmergencyCall.hpp"
 #include "IDGen.hpp"
@@ -146,6 +148,134 @@ namespace
 		ss << "Max-Forwards: 70\r\n"
 		   << "User-Agent: pocket-dial\r\n";
 	}
+
+	// #748: the `Route:` line of an in-dialog request, or nothing.
+	std::string routeLine(const SipTrunk::Dialog& d)
+	{
+		return d.routeSet.empty() ? std::string() : "Route: " + d.routeSet + "\r\n";
+	}
+
+	// A larger Record-Route than this is dropped rather than risking a request
+	// the message pool truncates.
+	constexpr size_t kMaxRouteSet = 512;
+
+	std::string_view trimWs(std::string_view s)
+	{
+		while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+		while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.remove_suffix(1);
+		return s;
+	}
+
+	// RFC 3261 s12.1.2: a UAC's route set is the 2xx's Record-Route entries in
+	// REVERSE order. Each Record-Route line may carry several comma-separated
+	// entries; commas inside <> or "" belong to the entry. Returned ready to
+	// follow "Route: ", empty when the response has none.
+	std::string routeSetOf(const SipMessage& resp)
+	{
+		std::vector<std::string> entries;
+		const std::string raw = resp.toString();
+		std::string_view rest = raw;
+		while (!rest.empty())
+		{
+			const size_t eol = rest.find("\r\n");
+			const std::string_view line = rest.substr(0, eol);
+			rest = eol == std::string_view::npos ? std::string_view{} : rest.substr(eol + 2);
+			if (line.empty()) break;   // end of the headers
+
+			const size_t colon = line.find(':');
+			if (colon == std::string_view::npos) continue;
+			const std::string_view name = trimWs(line.substr(0, colon));
+			static constexpr std::string_view kName = "record-route";
+			if (name.size() != kName.size()) continue;
+			bool match = true;
+			for (size_t i = 0; i < name.size() && match; ++i)
+				match = std::tolower(static_cast<unsigned char>(name[i])) == kName[i];
+			if (!match) continue;
+
+			const std::string_view value = line.substr(colon + 1);
+			size_t start = 0;
+			bool angle = false, quote = false;
+			for (size_t i = 0; i <= value.size(); ++i)
+			{
+				const char c = i < value.size() ? value[i] : ',';
+				if (c == '"') quote = !quote;
+				else if (!quote && c == '<') angle = true;
+				else if (!quote && c == '>') angle = false;
+				else if (c == ',' && !angle && !quote)
+				{
+					const std::string_view entry = trimWs(value.substr(start, i - start));
+					if (!entry.empty()) entries.emplace_back(entry);
+					start = i + 1;
+				}
+			}
+		}
+
+		std::string out;
+		for (size_t i = entries.size(); i-- > 0;)
+		{
+			if (!out.empty()) out += ", ";
+			out += entries[i];
+		}
+		return out;
+	}
+
+	// The URI inside the first <...> of a route set.
+	std::string_view firstRouteUri(std::string_view routeSet)
+	{
+		const size_t lt = routeSet.find('<');
+		if (lt == std::string_view::npos) return {};
+		const size_t gt = routeSet.find('>', lt + 1);
+		if (gt == std::string_view::npos) return {};
+		return routeSet.substr(lt + 1, gt - lt - 1);
+	}
+
+	// RFC 3261 s19.1.1: a loose router carries the `lr` URI parameter.
+	bool isLooseRouter(std::string_view uri)
+	{
+		std::string low(uri);
+		for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		for (size_t at = low.find(";lr"); at != std::string::npos; at = low.find(";lr", at + 1))
+		{
+			const size_t next = at + 3;
+			if (next >= low.size() || low[next] == ';' || low[next] == '=') return true;
+		}
+		return false;
+	}
+
+	// The transport address of a route hop, when its host is a dotted quad.
+	// Port defaults to 5060.
+	bool routeHopAddr(std::string_view uri, sockaddr_in& out)
+	{
+		uint32_t ip = 0;
+		if (!uriHostIpv4(uri, ip)) return false;
+
+		std::string_view rest = uri.substr(uri.find(':') + 1);
+		const size_t at = rest.find('@');
+		if (at != std::string_view::npos) rest = rest.substr(at + 1);
+		rest = rest.substr(0, rest.find_first_of(";>?"));
+
+		unsigned port = 5060;
+		const size_t colon = rest.find(':');
+		if (colon != std::string_view::npos)
+		{
+			port = 0;
+			const std::string_view digits = rest.substr(colon + 1);
+			if (digits.empty()) return false;
+			for (const char c : digits)
+			{
+				if (c < '0' || c > '9') return false;
+				port = port * 10u + static_cast<unsigned>(c - '0');
+				if (port > 65535u) return false;
+			}
+			if (port == 0) return false;
+		}
+
+		out = sockaddr_in{};
+		out.sin_family = AF_INET;
+		out.sin_addr.s_addr = ip;
+		out.sin_port = htons(static_cast<uint16_t>(port));
+		return true;
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -201,6 +331,7 @@ std::string SipTrunk::buildAckFor2xx(const Dialog& d, std::string_view freshBran
 	std::ostringstream ss;
 	ss << "ACK " << (d.remoteTarget.empty() ? pstnUri(d.destE164, target) : target) << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << d.localIpPort << ";branch=" << freshBranch << ";rport\r\n"
+	   << routeLine(d)   // #748: RFC 3261 s12.2.1.1
 	   << "From: <sip:" << d.fromUser << "@" << d.domain << ">;tag=" << d.fromTag << "\r\n"
 	   << "To: <" << pstnUri(d.destE164, d.domain) << ">";
 	if (!d.toTag.empty()) ss << ";tag=" << d.toTag;
@@ -248,6 +379,7 @@ std::string SipTrunk::buildBye(const Dialog& d, std::string_view freshBranch, st
 	std::ostringstream ss;
 	ss << "BYE " << d.remoteTarget << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << d.localIpPort << ";branch=" << freshBranch << ";rport\r\n"
+	   << routeLine(d)   // #748: RFC 3261 s12.2.1.1
 	   << "From: <sip:" << d.fromUser << "@" << d.domain << ">;tag=" << d.fromTag << "\r\n"
 	   << "To: <" << pstnUri(d.destE164, d.domain) << ">;tag=" << d.toTag << "\r\n"
 	   << "Call-ID: " << d.callID << "\r\n"
@@ -428,6 +560,7 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 	d->handsetCallID.assign(handsetCallID);
 	d->localRtpPort  = localRtpPort;
 	d->peer          = sbc;
+	d->nextHop       = sbc;   // #748: until a 2xx names a route set
 	d->fromUser      = _cfg.callerId[0] ? _cfg.callerId : _cfg.fromUser;
 	// Generous by internal-extension standards and deliberately so: a PSTN leg
 	// routinely rings past 20 s before carrier voicemail answers. The anchor path
@@ -497,7 +630,10 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	//
 	// Dropped AND consumed: returning false would hand a carrier-dialog
 	// response to the handset-side paths.
-	if (data->getSource().sin_addr.s_addr != d->peer.sin_addr.s_addr)
+	// #748: or from the route set's first hop, which the 2xx (itself checked
+	// against the peer) named; `nextHop` is the peer until then.
+	if (data->getSource().sin_addr.s_addr != d->peer.sin_addr.s_addr
+		&& data->getSource().sin_addr.s_addr != d->nextHop.sin_addr.s_addr)
 	{
 		const uint32_t n = ++_dialogForgedResponses;   // #663: counted; logged at 1, 2, 4, 8, ...
 		if ((n & (n - 1)) == 0)
@@ -612,12 +748,33 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 		const std::string contact = contactUri(data->getContact());
 		if (!contact.empty()) d->remoteTarget = contact;
 
+		// #748, RFC 3261 s12.1.2: the route set is this 2xx's Record-Route,
+		// reversed, and every in-dialog request carries it and goes to its first
+		// hop (s12.2.1.1, s16.4). Only a loose-router hop is supported; anything
+		// else falls back to the old behaviour (no Route, sent to the peer).
+		d->routeSet = routeSetOf(*data);
+		d->nextHop = d->peer;
+		if (!d->routeSet.empty())
+		{
+			const std::string_view hop = firstRouteUri(d->routeSet);
+			if (d->routeSet.size() > kMaxRouteSet || !isLooseRouter(hop))
+			{
+				_env.log("Trunk: Record-Route not used (strict router or over "
+					+ std::to_string(kMaxRouteSet) + " bytes) (" + d->destE164 + ")", true);
+				d->routeSet.clear();
+			}
+			else
+			{
+				routeHopAddr(hop, d->nextHop);   // leaves the peer for an FQDN hop
+			}
+		}
+
 		auto ack = _env.messageFromPool(buildAckFor2xx(*d, "z9hG4bK" + IDGen::GenerateID(12)),
-			d->peer);
+			d->nextHop);
 		if (ack)
 		{
 			ack->syncContentLength();
-			_env.enqueue(d->peer, std::move(ack));
+			_env.enqueue(d->nextHop, std::move(ack));
 		}
 		d->state = State::Confirmed;
 		if (wasCancelling)
@@ -733,11 +890,11 @@ bool SipTrunk::hangup(std::string_view callID)
 		const std::string bye = buildBye(*d, "z9hG4bK" + IDGen::GenerateID(12));
 		if (!bye.empty())
 		{
-			auto msg = _env.messageFromPool(bye, d->peer);
+			auto msg = _env.messageFromPool(bye, d->nextHop);
 			if (msg)
 			{
 				msg->syncContentLength();
-				_env.enqueue(d->peer, std::move(msg));
+				_env.enqueue(d->nextHop, std::move(msg));
 			}
 		}
 		d->state    = State::Terminating;
@@ -806,7 +963,8 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 	//      land in, and the log is what tells whoever brings one up which
 	//      address to expect (#164).
 	const sockaddr_in& src = data->getSource();
-	bool authorised = src.sin_addr.s_addr == d->peer.sin_addr.s_addr;
+	bool authorised = src.sin_addr.s_addr == d->peer.sin_addr.s_addr
+		|| src.sin_addr.s_addr == d->nextHop.sin_addr.s_addr;   // #748: the route set's first hop
 	if (!authorised)
 	{
 		uint32_t target = 0;
@@ -1052,7 +1210,7 @@ bool SipTrunk::answerByeChallenge(Dialog& d, const std::shared_ptr<SipMessage>& 
 	// in handleResponse() skips this state.
 	d.cseq += 1;
 	auto bye = _env.messageFromPool(
-		buildBye(d, "z9hG4bK" + IDGen::GenerateID(12), std::string_view(_authLine, lineLen)), d.peer);
+		buildBye(d, "z9hG4bK" + IDGen::GenerateID(12), std::string_view(_authLine, lineLen)), d.nextHop);
 	std::memset(_authLine, 0, sizeof(_authLine));
 	if (!bye)
 	{
@@ -1062,7 +1220,7 @@ bool SipTrunk::answerByeChallenge(Dialog& d, const std::shared_ptr<SipMessage>& 
 	}
 	d.byeAuthAttempted = true;
 	bye->syncContentLength();
-	_env.enqueue(d.peer, std::move(bye));
+	_env.enqueue(d.nextHop, std::move(bye));
 	_env.log("Trunk: " + std::to_string(status) + " to our BYE answered with credentials (" + d.destE164 + ")");
 	return true;
 }
