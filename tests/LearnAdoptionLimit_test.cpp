@@ -2,8 +2,11 @@
 //
 // Learn mode adopts any MAC it has not seen, and every adoption is one NVS write.
 // An on-link host that answers ARP for many fake MACs could fill the device table
-// (POCKETDIAL_MAX_CLIENTS) in one burst, and that survives reboot: every new phone
-// then gets "Device Table Full" until an admin forgets the entries one by one.
+// (POCKETDIAL_MAX_CLIENTS) in one burst, and that survived reboot: every new phone
+// then got "Device Table Full" until an admin forgot the entries one by one. Since
+// #440 a full table evicts its oldest unlocked entry instead, so the burst would
+// push out real, not-yet-locked phones; "Device Table Full" is left for a table of
+// locked or Secured devices only.
 //
 //   item 2: a token bucket on NEW adoptions (Registrar::kAdoptBurst, one more per
 //           kAdoptRefill). Past it a new MAC gets a retryable 503 + Retry-After.

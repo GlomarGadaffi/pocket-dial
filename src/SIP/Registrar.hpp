@@ -107,13 +107,16 @@ public:
 	// returns the digest decision. Records/updates the adoption entry -- poll
 	// consumeDevicesChange() afterwards to mirror the snapshot. Issue #440:
 	//   - an extension is LOCKED to a MAC on its second REGISTER from that same
-	//     resolved MAC (never the first, never on an ARP miss);
+	//     resolved MAC (never the first, never on an ARP miss), and only if no
+	//     earlier-adopted device row holds the extension (first claim wins);
 	//   - another MAC registering a locked (or Secured) extension -> Reject;
-	//   - an ARP miss for a locked extension -> a 503 + Retry-After is enqueued
-	//     here and RetryLater ("response already sent") is returned: retryable,
-	//     never a lockout, and sending it makes lwIP ARP the source;
-	//   - a MAC that registers a second extension is marked shared (the
-	//     signature of phones behind one NAT router) and never locks;
+	//   - an ARP miss for a locked extension -> Accept if `fromRegisteredAddress`
+	//     (the source IP:port is the extension's live binding: the owner's own
+	//     refresh), else a 503 + Retry-After is enqueued here and RetryLater
+	//     ("response already sent") is returned: retryable, never a lockout,
+	//     and sending it makes lwIP ARP the source;
+	//   - an UNLOCKED MAC that registers a second extension is marked shared
+	//     (the signature of phones behind one NAT router) and never locks;
 	//   - a first-packet ARP miss for an unlocked extension still Accepts;
 	//   - #507: a Secured extension or device is always digest-checked
 	//     (admitSecure), on an ARP miss too, and its record never moves.
@@ -124,7 +127,8 @@ public:
 	static constexpr std::chrono::seconds kAdoptRefill{15};   // 4 per minute
 	AuthDecision admitLearn(const std::shared_ptr<SipMessage>& data,
 		const std::string& ext, std::string& outRejectReason,
-		std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+		std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now(),
+		bool fromRegisteredAddress = false);
 	// Emit a 401 Unauthorized with a fresh WWW-Authenticate challenge. `stale`
 	// answers an expired-but-valid nonce.
 	void sendChallenge(const std::shared_ptr<SipMessage>& data, bool stale);

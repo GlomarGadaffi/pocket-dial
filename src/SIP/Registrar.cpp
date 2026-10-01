@@ -340,16 +340,19 @@ bool Registrar::noteNonceUse(const std::string& nonce, uint32_t nc, std::chrono:
 
 Registrar::AuthDecision Registrar::admitLearn(
 	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason,
-	std::chrono::steady_clock::time_point now)
+	std::chrono::steady_clock::time_point now, bool fromRegisteredAddress)
 {
 	// Learn mode = TOFU + MAC-lock (issue #440 made the lock real).
 	//   ext Secured, or Learn-LOCKED, to a DIFFERENT mac -> reject (anti-spoof).
-	//   ARP miss, ext Learn-locked somewhere -> 503 + Retry-After (retryable;
-	//                            we cannot tell the owner from an impostor yet).
+	//   ARP miss, ext Learn-locked somewhere -> accept from the extension's
+	//                            registered IP:port (the owner's refresh), else
+	//                            503 + Retry-After (retryable; we cannot tell
+	//                            the owner from an impostor yet).
 	//   ARP miss otherwise     -> accept + defer, as before (never brick the first
 	//                            registration).
 	//   UNKNOWN mac            -> accept, record {mac, ext, Learned}, unlocked.
-	//   KNOWN mac, same ext    -> the second sighting: LOCK ext to this mac.
+	//   KNOWN mac, same ext    -> the second sighting: LOCK ext to this mac, unless
+	//                            an earlier-adopted row holds ext (first claim wins).
 	//   KNOWN mac, other ext   -> mark shared (phones behind one NAT router all
 	//                            resolve to the router's MAC); a shared MAC never
 	//                            locks. A re-provisioned phone looks the same and
@@ -383,6 +386,17 @@ Registrar::AuthDecision Registrar::admitLearn(
 		}
 		if (const std::string* owner = lockedElsewhere(std::string()))
 		{
+			if (fromRegisteredAddress)
+			{
+				// #487 review: the owner's own refresh. lwIP's ARP table (10
+				// entries) is smaller than the client pool and every phone is
+				// OPTIONS-pinged, so a locked phone often misses. The binding at
+				// this exact IP:port was made by a REGISTER the lock admitted, so
+				// this admits no more than an ARP hit on the owner's IP would.
+				// Nothing is recorded and the lock is unchanged; a Secured
+				// extension never gets here (admitSecure above).
+				return AuthDecision::Accept;
+			}
 			// The owner's ARP entry may simply have aged out. A 403 here would lock
 			// the real phone out; accepting would let anyone off-link take the
 			// extension. Ask for a retry instead: transmitting this response makes
@@ -519,6 +533,15 @@ Registrar::AuthDecision Registrar::admitLearn(
 	// (A Secured record returned above, before the record could be touched.)
 	if (!rec.locked && !rec.shared)
 	{
+		// #487 review: the lock goes to the extension's FIRST claim, not to the
+		// first device to register twice. While an earlier-adopted row still
+		// holds ext, this one stays plain TOFU (fail open): otherwise a device
+		// that registered after the real phone's first REGISTER could lock it out
+		// with two packets of its own (an expires=0 counts).
+		for (const auto& [m, other] : _devices)
+		{
+			if (m != mac && other.extension == ext && other.seq < rec.seq) return AuthDecision::Accept;
+		}
 		// Second sighting of this MAC for this extension: bind it.
 		rec.locked = true;
 		persistDevices();
@@ -538,9 +561,22 @@ Registrar::findDevice(const std::string& macOrExt)
 	auto it = _devices.find(macOrExt);
 	if (it == _devices.end())
 	{
+		// Several rows can hold one extension (#440: the owner's lock beside a
+		// later claim that never locked). Act on the one that holds it: Secured,
+		// then Learn-locked, then the first claim (lowest seq). Map order would
+		// let "secure 201" promote a stray row and lock the owner out.
+		auto rank = [](const DeviceRecord& r) {
+			if (r.state == DeviceState::Secured) return 0;
+			return (r.locked && !r.shared) ? 1 : 2;
+		};
 		for (auto cand = _devices.begin(); cand != _devices.end(); ++cand)
 		{
-			if (cand->second.extension == macOrExt) { it = cand; break; }
+			if (cand->second.extension != macOrExt) continue;
+			if (it == _devices.end() || rank(cand->second) < rank(it->second) ||
+				(rank(cand->second) == rank(it->second) && cand->second.seq < it->second.seq))
+			{
+				it = cand;
+			}
 		}
 	}
 	return it;
@@ -694,8 +730,9 @@ void Registrar::loadDevices()
 			if (!buf.empty() && buf.back() == '\0') buf.pop_back();
 			// Record: mac \t extension \t state(int) [\t flags(int) \t seq(u32)]
 			// The last two fields are #440's (flags: bit0 locked, bit1 shared). A
-			// pre-#440 blob has three fields and loads unlocked; pre-#440 firmware
-			// reads only the first three of a new blob, so both directions work.
+			// pre-#440 blob has three fields and loads unlocked. Pre-#440 firmware
+			// reads only the first three of a new blob, so a downgrade boots, but
+			// its next write drops both fields: a downgrade releases every lock.
 			for (const auto& rec : pbxpersist::deserializeBlob(buf))
 			{
 				if (rec.size() < 3 || rec[0].empty()) continue;
@@ -710,9 +747,12 @@ void Registrar::loadDevices()
 					const int flags = atoi(rec[3].c_str());
 					r.locked = (flags & 1) != 0;
 					r.shared = (flags & 2) != 0;
-					r.seq = static_cast<uint32_t>(strtoul(rec[4].c_str(), nullptr, 10));
+					// Clamped: a saved UINT32_MAX would wrap _nextSeq to 0 below, and
+					// every later adoption would then sort as the oldest (evicted first).
+					const unsigned long saved = strtoul(rec[4].c_str(), nullptr, 10);
+					r.seq = (saved < 0x80000000UL) ? static_cast<uint32_t>(saved) : 0;
 				}
-				if (r.seq == 0) r.seq = _nextSeq;   // pre-#440 row: order as loaded
+				if (r.seq == 0) r.seq = _nextSeq;   // pre-#440 (or out-of-range) row: order as loaded
 				if (r.seq >= _nextSeq) _nextSeq = r.seq + 1;
 				_devices[rec[0]] = std::move(r);
 			}
