@@ -42,6 +42,11 @@ Usage:
       --source-ip-base 127.0.0. --source-ip-count 40 --hold-ms 300
   # Or an explicit list (real interface IPs / netns addresses for a real run):
   python sip_stress.py --host 10.0.0.1 --clients 4 --source-ips 10.0.1.1,10.0.1.2
+
+Issue #401: `--profile <name>` runs a scheduled multi-scenario load instead
+(registrations, 777 bursts, extension calls, 888, park + MoH) from the table in
+load_profile.py; `--profile rc1 --dry-run ...` prints the plan and sends nothing.
+See load_profile.py for its options and its safety refusals.
 """
 import argparse, socket, threading, time, random, re, statistics, sys, json
 import urllib.request
@@ -198,7 +203,13 @@ def api_status(host):
     except Exception as e:
         return {"_error": str(e)}
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if any(a == "--profile" or a.startswith("--profile=") for a in argv):
+        # #401: a scheduled, multi-scenario load (load_profile.py). The legacy
+        # options below are not used on that path.
+        import load_profile
+        return load_profile.main(argv)
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="192.168.12.159")
     ap.add_argument("--port", type=int, default=5060)
@@ -223,7 +234,7 @@ def main():
                      help="Hold each echo call open this long between ACK and BYE, so "
                           "concurrent calls actually overlap in the Session pool instead of "
                           "each completing before the next INVITE lands (Issue #79).")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     default_lip = local_ip_for(args.host, args.port)
     source_ips = resolve_source_ips(args, default_lip)
@@ -275,4 +286,4 @@ def main():
     for ua in uas: ua.close()
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
