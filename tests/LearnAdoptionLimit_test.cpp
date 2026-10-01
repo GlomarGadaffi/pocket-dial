@@ -24,6 +24,7 @@
 
 #include "ArpLookup.hpp"
 #include "FakePbxEnv.hpp"
+#include "PoolConfig.hpp"
 #include "Registrar.hpp"
 #include "RequestsHandler.hpp"
 
@@ -128,6 +129,34 @@ TEST_F(LearnAdoptionLimit, KnownMacsNeverSpendTheBudget)
 	// Positive control: the budget really is spent, so the Accepts above were
 	// not just a bucket with tokens left.
 	EXPECT_EQ(admit(reg, Registrar::kAdoptBurst + 1, t0), Decision::RetryLater);
+}
+
+TEST_F(LearnAdoptionLimit, AnOverBudgetNewMacOnAFullTableEvictsNothing)
+{
+	// Threat (#440 meets this budget): a full table makes room by evicting its
+	// oldest unlocked device. If that ran before the token check, every new MAC
+	// past the budget would still erase one device and then be 503'd, so a flood
+	// could empty the table one refusal at a time.
+	FakePbxEnv env;
+	Registrar reg(env, Registrar::Mode::Learn);
+	const Clock::time_point t0{};
+	auto seeded = [](int i) { return ArpLookup::toHex12({0x02, 0x00, 0x00, 0x00, 0x06, static_cast<uint8_t>(i)}); };
+	for (int i = 0; i < POCKETDIAL_MAX_CLIENTS; ++i) reg.adoptDeviceForTest(seeded(i), std::to_string(5200 + i));
+
+	for (int n = 1; n <= Registrar::kAdoptBurst; ++n)
+	{
+		ASSERT_EQ(admit(reg, n, t0), Decision::Accept) << "phone " << n << " is within the budget";
+		reg.markOnline(ArpLookup::toHex12({0x02, 0x00, 0x00, 0x00, 0x05, static_cast<uint8_t>(n)}), true);   // as onRegister() does
+	}
+	ASSERT_EQ(reg.adoptedDevices().size(), static_cast<size_t>(POCKETDIAL_MAX_CLIENTS)) << "each adoption evicted one";
+
+	EXPECT_EQ(admit(reg, Registrar::kAdoptBurst + 1, t0), Decision::RetryLater);
+	const auto left = reg.adoptedDevices();
+	EXPECT_EQ(left.size(), static_cast<size_t>(POCKETDIAL_MAX_CLIENTS)) << "a refused adoption evicted a device";
+	size_t seededLeft = 0;
+	for (const auto& d : left)
+		if (d.mac.rfind("0200000006", 0) == 0) ++seededLeft;
+	EXPECT_EQ(seededLeft, static_cast<size_t>(POCKETDIAL_MAX_CLIENTS - Registrar::kAdoptBurst));
 }
 
 TEST_F(LearnAdoptionLimit, ForgetLearnedDropsEveryLearnedDeviceAndKeepsTheSecuredOne)
