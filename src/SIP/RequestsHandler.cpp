@@ -989,6 +989,18 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 
 		if (!headerRefused && request->hasSdp() && !request->getBody().empty())
 		{
+			// #760: a 911/933 INVITE may carry its SDP inside multipart/mixed next
+			// to a PIDF-LO location (RFC 6442). This gate screens SDP, so the offer
+			// is unwrapped first; the location part is dropped, never parsed.
+			// Emergency INVITEs only, by the To user: the number onInvite routes
+			// on. Not the Request-URI too, or INVITE sip:911@ with To 102 would be
+			// relayed to 102 past this gate. Every other multipart body is
+			// refused as before.
+			if (request->getType() == SipMessageTypes::INVITE &&
+				pbx::classifyEmergencyDial(request->getToNumber()).isEmergency)
+			{
+				request->unwrapMultipartSdp();
+			}
 			const auto verdict = request->checkSdp();
 			// #199: a second active audio stream is policy, not safety -- the
 			// decoders use the first m=audio -- so it yields for 911 like a header.

@@ -4,7 +4,7 @@
 #include <vector>
 #include <cctype>
 #include "SipMessageTypes.h"
-#include "EmergencyCall.hpp"   // #199: urn:service:sos, isEmergencyRequest()
+#include "EmergencyCall.hpp"   // #199: urn:service:sos, isEmergencyRequest(); #760: tel:911, urn:service:test.sos
 #include <cstring>
 #include <cctype>
 #include <cstdint>
@@ -1008,6 +1008,78 @@ void SipMessage::setBody(const std::string& body)
 	syncContentLength();   // keep Content-Length honest (the 777-bug class)
 }
 
+bool SipMessage::unwrapMultipartSdp()
+{
+	const size_t ctIdx = findHeaderIndex("content-type", "c");
+	if (ctIdx == std::string::npos) return false;
+	const std::string_view ct = headerValueOf(_headerLines[ctIdx]);
+	if (ifindLower(ct, "multipart/") != 0) return false;
+	// RFC 2046 §5.1.1: boundary=<token> or boundary="<quoted>", 1 to 70 bytes.
+	const size_t bpos = ifindLower(ct, "boundary=");
+	if (bpos == std::string_view::npos) return false;
+	std::string_view boundary = ct.substr(bpos + 9);
+	if (!boundary.empty() && boundary.front() == '"')
+	{
+		boundary.remove_prefix(1);
+		boundary = boundary.substr(0, boundary.find('"'));
+	}
+	else
+	{
+		boundary = boundary.substr(0, boundary.find_first_of("; \t\r"));
+	}
+	if (boundary.empty() || boundary.size() > 70) return false;
+
+	// One flat walk, the same loop checkSdp() uses. A delimiter line is "--"
+	// + boundary (the closing one adds "--"). A part's header lines run to its
+	// first empty line; its body then runs to the CRLF before the next
+	// delimiter, which RFC 2046 §5.1.1 gives to the delimiter, not the part.
+	const std::string_view body(_body);
+	size_t pos = 0;
+	bool inHeaders = false;
+	bool sdpPart = false;
+	size_t sdpStart = std::string_view::npos;
+	size_t sdpEnd = std::string_view::npos;
+	while (pos < body.size())
+	{
+		const size_t lineStart = pos;
+		const std::string_view line = nextSdpLine(body, pos);
+		if (line.size() >= boundary.size() + 2 && line[0] == '-' && line[1] == '-' &&
+			line.substr(2, boundary.size()) == boundary)
+		{
+			if (sdpStart != std::string_view::npos)
+			{
+				sdpEnd = lineStart;
+				if (sdpEnd > sdpStart && body[sdpEnd - 1] == '\n') --sdpEnd;
+				if (sdpEnd > sdpStart && body[sdpEnd - 1] == '\r') --sdpEnd;
+				break;
+			}
+			inHeaders = true;
+			sdpPart = false;
+			continue;
+		}
+		if (!inHeaders) continue;   // the preamble, or a part that is not kept
+		if (line.empty())
+		{
+			inHeaders = false;
+			if (sdpPart) sdpStart = pos;
+			continue;
+		}
+		if (iequal(headerNameOf(line), "content-type") &&
+			ifindLower(headerValueOf(line), "application/sdp") == 0)
+		{
+			sdpPart = true;
+		}
+	}
+	if (sdpStart == std::string_view::npos || sdpEnd == std::string_view::npos) return false;
+
+	_body.erase(0, sdpStart);        // shifts in place: no new allocation
+	_body.resize(sdpEnd - sdpStart);
+	++_bodyGen;
+	composeHeaderLine(_headerLines[ctIdx], "Content-Type", "application/sdp");
+	syncContentLength();
+	return true;
+}
+
 std::string SipMessage::toString() const
 {
 	std::string out;
@@ -1241,6 +1313,86 @@ std::string_view SipMessage::getEvent() const
 	return idx == std::string::npos ? std::string_view{} : std::string_view(_headerLines[idx]);
 }
 
+namespace
+{
+	// #760 review: the URI a To/From/Contact line or a request line carries,
+	// and nothing around it. A name-addr's URI is inside <...>; a '<' within
+	// the quoted display name does not count (RFC 3261 s25.1 quoted-string,
+	// \-escapes included). Without brackets it is the bare URI: a request
+	// line's Request-URI, the token after the method, or a header's value up
+	// to its first ';' (RFC 3261 s20.10). Empty when a quote is left open.
+	std::string_view uriPartOf(std::string_view line)
+	{
+		bool quoted = false;
+		for (size_t i = 0; i < line.size(); ++i)
+		{
+			const char c = line[i];
+			if (quoted)
+			{
+				if (c == '\\') ++i;
+				else if (c == '"') quoted = false;
+			}
+			else if (c == '"')
+			{
+				quoted = true;
+			}
+			else if (c == '<')
+			{
+				std::string_view uri = line.substr(i + 1);
+				uri = uri.substr(0, uri.find('>'));
+				while (!uri.empty() && (uri.front() == ' ' || uri.front() == '\t')) uri.remove_prefix(1);
+				while (!uri.empty() && (uri.back() == ' ' || uri.back() == '\t')) uri.remove_suffix(1);
+				return uri;
+			}
+		}
+		if (quoted) return {};
+		const size_t colon = line.find(':');
+		if (colon == std::string_view::npos) return {};
+		size_t nameStart = 0;
+		size_t nameEnd = colon;
+		while (nameStart < nameEnd && (line[nameStart] == ' ' || line[nameStart] == '\t')) ++nameStart;
+		while (nameEnd > nameStart && (line[nameEnd - 1] == ' ' || line[nameEnd - 1] == '\t')) --nameEnd;
+		// A header name holds no space, so "INVITE tel" before the first ':'
+		// is a request line, and its URI begins after the method.
+		const size_t sp = line.substr(nameStart, nameEnd - nameStart).find_first_of(" \t");
+		std::string_view uri = line.substr(sp == std::string_view::npos ? colon + 1 : nameStart + sp);
+		while (!uri.empty() && (uri.front() == ' ' || uri.front() == '\t')) uri.remove_prefix(1);
+		return uri.substr(0, uri.find_first_of(" \t;\r\n"));
+	}
+
+	// #760: the two non-sip: forms a phone may legitimately dial for help. An
+	// RFC 3966 tel:911 / tel:933 has no host and no '@', and RFC 5031's
+	// urn:service:test.sos is the E911 test service (933 here). Only an
+	// emergency number is mapped: every other tel: or urn: URI still reads as
+	// no user, so nothing else changes. urn:service:sos itself is #199's.
+	// #760 review: only the URI's own scheme is matched, never a display name
+	// or a parameter ("Hotel:911 lobby" is not 911), and a tel: number counts
+	// exactly when a sip: user would, so tel:9911 is 911 as sip:9911@ is.
+	std::string_view emergencyUserOf(std::string_view header)
+	{
+		static constexpr std::string_view kTel = "tel:";
+		static constexpr std::string_view kTestSos = "urn:service:test.sos";
+		const std::string_view uri = uriPartOf(header);
+		auto delimited = [&uri](size_t end) {
+			return end == uri.size() || uri[end] == ';' || uri[end] == '?';
+		};
+		if (iequalLower(uri.substr(0, kTel.size()), kTel))
+		{
+			size_t end = kTel.size();
+			while (end < uri.size() && std::isdigit(static_cast<unsigned char>(uri[end]))) ++end;
+			const std::string_view digits = uri.substr(kTel.size(), end - kTel.size());
+			if (delimited(end) && pbx::classifyEmergencyDial(digits).isEmergency) return digits;
+		}
+		if (iequalLower(uri.substr(0, kTestSos.size()), kTestSos))
+		{
+			// RFC 5031 s4.2: test.sos.<sub> is the same test service.
+			const size_t end = kTestSos.size();
+			if (delimited(end) || uri[end] == '.') return pbx::kEmergencyTestNumber;
+		}
+		return {};
+	}
+}
+
 std::string_view SipMessage::extractNumber(std::string_view header) const
 {
 	auto sipPos = header.find("sip:");
@@ -1260,7 +1412,7 @@ std::string_view SipMessage::extractNumber(std::string_view header) const
 				return pbx::kEmergencyNumber;
 			}
 		}
-		return {};
+		return emergencyUserOf(header);   // #760: tel:911 and urn:service:test.sos
 	}
 
 	auto start = sipPos + 4;
