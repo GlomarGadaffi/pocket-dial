@@ -75,11 +75,11 @@ CallDetailRecord makeRecord(std::string caller, std::string callee,
 
 // ── csvHeader() ──────────────────────────────────────────────────────────────
 
-TEST(CdrArchive, HeaderHasSevenFieldsMatchingFormatLineOrder)
+TEST(CdrArchive, HeaderHasEightFieldsMatchingFormatLineOrder)
 {
 	const std::string h = cdrarchive::csvHeader();
-	EXPECT_EQ(h, "timestamp,call_id,caller,callee,duration_sec,result,reason");
-	EXPECT_EQ(std::count(h.begin(), h.end(), ','), 6);
+	EXPECT_EQ(h, "timestamp,call_id,caller,callee,duration_sec,result,reason,direction");
+	EXPECT_EQ(std::count(h.begin(), h.end(), ','), 7);
 }
 
 // ── formatLine(): the wall-clock derivation ───────────────────────────────────
@@ -145,14 +145,45 @@ TEST(CdrArchive, FormatLineDropsTheRecordWhenNeverSynced)
 
 // ── formatLine(): field content, escaping, truncation ─────────────────────────
 
-TEST(CdrArchive, FormatLineIncludesAllSevenFieldsInOrder)
+TEST(CdrArchive, FormatLineIncludesAllEightFieldsInOrder)
 {
 	auto rec = makeRecord("1001", "2002", 0, 90, CdrResult::Busy);
 	cdrarchive::QueuedLine line;
 	ASSERT_TRUE(cdrarchive::formatLine(rec, "call-xyz", "peer busy", 1700000000, 0, line));
 
 	EXPECT_EQ(std::string(line.line),
-		"2023-11-14T22:13:20Z,call-xyz,1001,2002,90,busy,peer busy");
+		"2023-11-14T22:13:20Z,call-xyz,1001,2002,90,busy,peer busy,internal");
+}
+
+// Issue #221: direction is the LAST column, so an empty reason still leaves the
+// direction in field 8 and each direction renders its own word.
+TEST(CdrArchive, FormatLineWritesTheDirectionLastEvenWithAnEmptyReason)
+{
+	auto rec = makeRecord("PSTN", "1001", 0, 5, CdrResult::Answered);
+	cdrarchive::QueuedLine in, out, internal;
+	ASSERT_TRUE(cdrarchive::formatLine(rec, "c", "", 1700000000, 0, in,
+		cdrarchive::Direction::Inbound));
+	ASSERT_TRUE(cdrarchive::formatLine(rec, "c", "", 1700000000, 0, out,
+		cdrarchive::Direction::Outbound));
+	ASSERT_TRUE(cdrarchive::formatLine(rec, "c", "", 1700000000, 0, internal,
+		cdrarchive::Direction::Internal));
+
+	EXPECT_EQ(std::string(in.line), "2023-11-14T22:13:20Z,c,PSTN,1001,5,answered,,inbound");
+	EXPECT_EQ(std::string(out.line), "2023-11-14T22:13:20Z,c,PSTN,1001,5,answered,,outbound");
+	EXPECT_EQ(std::string(internal.line), "2023-11-14T22:13:20Z,c,PSTN,1001,5,answered,,internal");
+}
+
+// Issue #221: an inbound anchor session has BOTH anchor flags set, so the
+// inbound flag must win; trunk and outbound-anchor calls are outbound; a plain
+// extension-to-extension call (no flag) is internal.
+TEST(CdrArchive, DirectionForReadsTheSessionFlags)
+{
+	using cdrarchive::Direction;
+	using cdrarchive::directionFor;
+	EXPECT_EQ(directionFor(/*anchor=*/true, /*anchorInbound=*/true, /*trunk=*/false), Direction::Inbound);
+	EXPECT_EQ(directionFor(true, false, false), Direction::Outbound);
+	EXPECT_EQ(directionFor(false, false, true), Direction::Outbound);
+	EXPECT_EQ(directionFor(false, false, false), Direction::Internal);
 }
 
 TEST(CdrArchive, FormatLineEscapesACommaInReason)
@@ -181,7 +212,7 @@ TEST(CdrArchive, FormatLineTruncatesAnOversizedCallId)
 	cdrarchive::QueuedLine line;
 	ASSERT_TRUE(cdrarchive::formatLine(rec, longCallId, "", 1700000000, 0, line));
 
-	// call_id is the 2nd of 7 comma-separated fields (none of which need
+	// call_id is the 2nd of 8 comma-separated fields (none of which need
 	// quoting here, since 'x' triggers no escaping).
 	const std::string s(line.line);
 	const size_t f1 = s.find(',');
@@ -315,7 +346,7 @@ TEST(CdrArchiveSingleton, RecordWithNoSinkInstalledIsAHarmlessNoOp)
 {
 	ScopedSink guard(nullptr);   // explicit "no archive installed" state
 	auto rec = makeRecord("1001", "1002", 0, 1, CdrResult::Answered);
-	cdrarchive::record(rec, "call-1", "test");
+	cdrarchive::record(rec, "call-1", "test", cdrarchive::Direction::Internal);
 	EXPECT_EQ(cdrarchive::pendingForTest(), 0u);
 }
 
@@ -329,7 +360,7 @@ TEST(CdrArchiveSingleton, RecordNeverQueuesOnAnUnsyncedHostClock)
 	FakeSink sink;
 	ScopedSink guard(&sink);
 	auto rec = makeRecord("1001", "1002", 0, 1, CdrResult::Answered);
-	cdrarchive::record(rec, "call-1", "test");
+	cdrarchive::record(rec, "call-1", "test", cdrarchive::Direction::Internal);
 	EXPECT_EQ(cdrarchive::pendingForTest(), 0u);
 	EXPECT_TRUE(sink.appended.empty());
 }
