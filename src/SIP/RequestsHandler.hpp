@@ -195,6 +195,8 @@ public:
 	uint32_t getTrunkForgedDialogResponses() const { return _sipTrunk.forgedDialogResponses(); }
 	// Issue #666: trunk BYEs refused with 403 by the #356 check.
 	uint32_t getTrunkRefusedDialogByes() const { return _sipTrunk.refusedDialogByes(); }
+	// #741: emergency calls ended after 4 h with no RTP on either leg.
+	uint32_t getEmergencyRtpReaps() const { return _emergencyRtpReaps.load(std::memory_order_relaxed); }
 	// Issue #497: INVITEs refused because they did not come from the caller's
 	// registered address (the 403 "Caller Not Registered From This Address").
 	uint64_t getUnboundCallerRefusals() const { return _unboundCallerRefusals.load(std::memory_order_relaxed); }
@@ -2331,6 +2333,7 @@ private:
 	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
 	std::atomic<uint64_t> _vpeerRefusals{0};   // #409: allocateVirtualPeer() refusals
+	std::atomic<uint32_t> _emergencyRtpReaps{0};   // #741
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
 	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped

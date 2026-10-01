@@ -1141,7 +1141,7 @@ TEST(TrunkWiring, ATrunkCallWithOneLegSilentAndTheOtherTalkingStaysUp)
 	}
 }
 
-TEST(TrunkWiring, AnEmergencyCallIsNeverEndedForRtpSilence)
+TEST(TrunkWiring, AnEmergencyCallIsNotEndedForTenMinutesOfRtpSilence)
 {
 	// A 911 caller who cannot speak, on a phone with silence suppression, sends
 	// no RTP. Hanging up on them is worse than holding a leg. Positive control:
@@ -1170,11 +1170,79 @@ TEST(TrunkWiring, AnEmergencyCallIsNeverEndedForRtpSilence)
 	b.sent.clear();
 	b.handler.tick();
 
-	EXPECT_TRUE(b.handler.getSession("Call-ID: call-911").has_value()) << "911 is never reaped";
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-911").has_value()) << "911 is not reaped at 10 min (its bound is 4 h, #741)";
 	EXPECT_FALSE(b.handler.getSession("Call-ID: call-604b").has_value())
 		<< "control: the ordinary silent call is";
 	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "exactly one carrier leg hung up";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "the 911 relay pair is untouched";
+}
+
+TEST(TrunkWiring, AnEmergencyCallWithBothLegsSilentEndsAtFourHoursAndNotBefore)
+{
+	// #741 (desmo): a 911 whose phone and far end both vanished (no BYE, no RTP
+	// on either leg) is ended after 4 h of silence, through endCall, and
+	// counted. A live 911 is never cut: the clock only runs while BOTH legs
+	// are silent. AnEmergencyCallIsNotEndedForTenMinutesOfRtpSilence above keeps pinning
+	// that 10 minutes of silence ends nothing.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-741"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	auto s911 = b.handler.getSession("Call-ID: call-741");
+	ASSERT_TRUE(s911.has_value());
+	b.handler.tick();   // arms the watch
+
+	s911.value()->ageRtpWatchForTest(std::chrono::hours(4) - std::chrono::seconds(1));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+	b.handler.tick();
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-741").has_value()) << "ended before 4 h";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u);
+	EXPECT_EQ(b.handler.getEmergencyRtpReaps(), 0u);
+
+	s911.value()->ageRtpWatchForTest(std::chrono::seconds(1));
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+	EXPECT_FALSE(b.handler.getSession("Call-ID: call-741").has_value()) << "not ended at 4 h";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the carrier leg is hung up through endCall";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and its relay pair released";
+	EXPECT_EQ(b.handler.getEmergencyRtpReaps(), 1u) << "and counted";
+}
+
+TEST(TrunkWiring, AnEmergencyCallWithOneWayAudioIsNeverEndedPastFourHours)
+{
+	// #741 review: the 4 h clock runs only while BOTH legs are silent. A 911
+	// where one side talks (a caller who cannot speak, a PSAP on hold music) is
+	// a live call: each leg's audio restarts the clock, so it outlives 4 h.
+	// Mirrors ATrunkCallWithOneLegSilentAndTheOtherTalkingStaysUp. Positive
+	// control: the test above ends the same call shape at 4 h when silent.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-741o"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	const std::string id = "Call-ID: call-741o";
+	auto s911 = b.handler.getSession(id);
+	ASSERT_TRUE(s911.has_value());
+	b.handler.tick();   // arms the watch
+
+	for (bool fromCarrier : {true, false})
+	{
+		s911.value()->ageRtpWatchForTest(std::chrono::hours(4) + std::chrono::seconds(1));
+		ASSERT_TRUE(b.handler.trunkRtpForTest(id, fromCarrier));
+		b.handler.forceNextTickForTest();
+		b.sent.clear();
+		b.handler.tick();
+		ASSERT_TRUE(b.handler.getSession(id).has_value())
+			<< "only the " << (fromCarrier ? "carrier" : "handset") << " leg talked; the 911 stays up";
+		ASSERT_EQ(b.countWithTo("BYE", kSbcIp), 0u);
+	}
+	EXPECT_EQ(b.handler.getEmergencyRtpReaps(), 0u);
 }
 
 // ── Issue #399: the trunk REGISTERs, from tick(), and answers the 401 ───────

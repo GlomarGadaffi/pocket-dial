@@ -145,6 +145,10 @@ namespace
 	// tick() ends the call. Well past silence-suppression gaps; Held calls are
 	// exempt outright.
 	constexpr auto kRtpInactivityTimeout = std::chrono::seconds(60);
+	// #741 (desmo, 2026-09-29): a 911/933 whose BOTH legs have been silent this
+	// long is ended. A live emergency call, one with RTP on either leg, is
+	// never cut; this only reclaims a call whose phone and far end both vanished.
+	constexpr auto kEmergencyRtpInactivityTimeout = std::chrono::hours(4);
 
 	// How long an outbound anchor/trunk call may RING before tick() reaps it.
 	//
@@ -9555,11 +9559,12 @@ void RequestsHandler::tick()
 		// Only legs the board relays can be watched: a trunk call's two
 		// receivers and an anchor bridge's handset RTP + anchor audio. Exempt: Held calls
 		// (a sendonly/inactive leg legitimately sends nothing; the watch
-		// restarts on resume) and 911/933 (see Session::isEmergency()).
+		// restarts on resume). A 911/933 (Session::isEmergency()) gets the 4 h
+		// bound instead (#741): never cut while either leg carries audio.
 		std::vector<std::string> silentCallIds;
 		for (const auto& [callID, session] : _sessions)
 		{
-			if (session->getState() != Session::State::Connected || session->isEmergency())
+			if (session->getState() != Session::State::Connected)
 			{
 				session->disarmRtpWatch();
 				continue;
@@ -9588,7 +9593,9 @@ void RequestsHandler::tick()
 			{
 				continue;   // peer-to-peer media never passes through the board
 			}
-			if (session->rtpSilence(legA, legB, now) >= kRtpInactivityTimeout)
+			const auto limit = session->isEmergency() ? std::chrono::steady_clock::duration(kEmergencyRtpInactivityTimeout)
+			                                           : std::chrono::steady_clock::duration(kRtpInactivityTimeout);
+			if (session->rtpSilence(legA, legB, now) >= limit)
 			{
 				silentCallIds.push_back(callID);
 			}
@@ -9617,8 +9624,18 @@ void RequestsHandler::tick()
 					fromIsUs ? dFrom : dTo, fromIsUs ? dTo : dFrom);
 				if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
 			}
-			queueLog("[media] no RTP for " + std::to_string(kRtpInactivityTimeout.count()) +
-				" s -- ending " + callID, true);
+			if (session->isEmergency())
+			{
+				_emergencyRtpReaps.fetch_add(1, std::memory_order_relaxed);   // #741
+				queueLog("[media] EMERGENCY call with no RTP on either leg for " +
+					std::to_string(std::chrono::duration_cast<std::chrono::hours>(kEmergencyRtpInactivityTimeout).count()) +
+					" h -- ending " + callID, true);
+			}
+			else
+			{
+				queueLog("[media] no RTP for " + std::to_string(kRtpInactivityTimeout.count()) +
+					" s -- ending " + callID, true);
+			}
 			const std::string handsetNum = handset ? handset->getNumber() : std::string();
 			const std::string farNum = session->isAnchor() ? session->getAnchorParticipantId() : std::string();
 			if (inbound) endCall(callID, farNum, handsetNum, "rtp inactivity");
