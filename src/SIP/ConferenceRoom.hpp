@@ -182,6 +182,14 @@ private:
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	static void taskTrampoline(void* arg);
+	// Issue #479: conf_mix_tick's stack + TCB, allocated ONCE in the constructor
+	// (boot, internal RAM), and its handle. The task is created statically on that
+	// memory by the first startDriver() and is then persistent: between
+	// conferences it parks in ulTaskNotifyTake() and each startDriver() wakes it.
+	// It never deletes itself, so no restart can race the idle task's cleanup of a
+	// deleted static task, and no dial-in allocates a task.
+	pd::StaticTaskSlot _driverMem;
+	TaskHandle_t       _driverTask = nullptr;
 #else
 	std::thread _driverThread;
 	bool        _failDriverStartForTest = false;
