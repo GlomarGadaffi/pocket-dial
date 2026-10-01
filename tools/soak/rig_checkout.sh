@@ -21,6 +21,14 @@
 # release frees the leases of that holder and ALWAYS writes the CHECK-IN post
 # with the verdict, even when there was nothing left to free.
 #
+# Leases and glolab's reboot. On glolab /var/lock is /run/lock, a tmpfs, so a
+# lease vanishes at every reboot: claim then finds no lease and says so (the
+# #428 post is the social lock; read it). On a persistent PD_RIG_LOCK_DIR a lease
+# written before glolab's last boot is STALE, not live: claim takes over and
+# says so. The boot time is now - uptime, from /proc/uptime here, or from
+# glolab's /proc/uptime through the ssh wrapper when PD_RIG_BOOT_VIA_SSH=1. When
+# it cannot be read, a live lease still refuses (fail closed).
+#
 # Nothing here talks to GitHub except `post --confirm`. That step is separate and
 # explicit, the tests never run it, and it scans the post for secrets first. gh
 # reads its own token (`gh auth`): no token is ever on an argv, and the body goes
@@ -33,12 +41,15 @@
 #
 # Environment (defaults in brackets):
 #   PD_RIG_LOCK_DIR [/var/lock]  PD_RIG_POST_DIR [$HOME/rig-posts]
-#   PD_RIG_RESOURCES [pd195,glolab]  PD_GLOLAB_TZ [this host's zone]
+#   PD_RIG_RESOURCES [pd195,glolab]
+#   PD_GLOLAB_TZ [America/New_York]: glolab's zone, which sets the 03:30 window
+#     wherever this runs (on glolab or off it, e.g. from BigDog)
 #   PD_GLOLAB [claude-agent@192.168.12.110]  PD_GLOLAB_KEY [~/.ssh/id_ed25519_bigdog]
 #   PD_SECRETS_FILE [none]: literal secrets to mask and scan for, one per line
 #   PD_RIG_LOG [none]: every wrapped ssh command is appended here, redacted
 #   PD_RIG_DISCUSSION_ID [discussion #428's node id]
-#   PD_RIG_NOW: test hook, "now" in epoch seconds
+#   PD_RIG_BOOT_VIA_SSH [0]: 1 = read glolab's boot time over the ssh wrapper
+#   PD_RIG_PROC_UPTIME [/proc/uptime]  PD_RIG_NOW: test hooks ("now" in epoch s)
 #
 # Exit status: 0 done, 1 refused, 2 usage.
 set -u
@@ -51,8 +62,7 @@ GLOLAB=${PD_GLOLAB:-claude-agent@192.168.12.110}
 KEY=${PD_GLOLAB_KEY:-$HOME/.ssh/id_ed25519_bigdog}
 DISCUSSION_ID=${PD_RIG_DISCUSSION_ID:-D_kwDOSATDcc4Apfdt}
 SECRETS=${PD_SECRETS_FILE:-}
-TZARG=()
-[ -n "${PD_GLOLAB_TZ:-}" ] && TZARG=(--tz "$PD_GLOLAB_TZ")
+TZARG=(--tz "${PD_GLOLAB_TZ:-America/New_York}")
 SECARG=()
 [ -n "$SECRETS" ] && SECARG=(--secrets-file "$SECRETS")
 
@@ -60,6 +70,17 @@ die()   { echo "rig_checkout: REFUSED: $*" >&2; exit 1; }
 usage() { sed -n '2,13p' "$0" >&2; exit 2; }
 now()   { if [ -n "${PD_RIG_NOW:-}" ]; then echo "$PD_RIG_NOW"; else date -u +%s; fi; }
 field() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -n 1; }
+
+boot_epoch() {   # glolab's last boot, epoch seconds; prints nothing when unknown
+  local up=""
+  if [ "${PD_RIG_BOOT_VIA_SSH:-0}" = 1 ]; then
+    up=$(bash "$0" ssh -- cat /proc/uptime 2>/dev/null | awk 'NR==1{print $1}')
+  else
+    up=$(awk 'NR==1{print $1}' "${PD_RIG_PROC_UPTIME:-/proc/uptime}" 2>/dev/null)
+  fi
+  [[ $up =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 0
+  echo $(( $(now) - ${up%%.*} ))
+}
 
 with_claims_lock() {   # serialises claim/release read-modify-write of the leases
   exec 9>"$LOCK_DIR/pd-rig-claims.lock" || die "cannot open $LOCK_DIR/pd-rig-claims.lock"
@@ -102,19 +123,29 @@ claim() {
     [ -e "$LOCK_DIR/$r.hold" ] && die "$r has a human hold ($LOCK_DIR/$r.hold): never overridden"
   done
   with_claims_lock
+  local boot; boot=$(boot_epoch)
   for r in "${res[@]}"; do
     exec 8>"$LOCK_DIR/$r.lock" || die "cannot open $LOCK_DIR/$r.lock"
     flock -n 8 || die "$r is busy: a running command holds $LOCK_DIR/$r.lock"
     flock -u 8
     local lease="$LOCK_DIR/$r.lease"
     if [ -f "$lease" ]; then
-      local h e p
+      local h e p s
       h=$(field holder "$lease"); e=$(field expires "$lease"); p=$(field purpose "$lease")
-      if [ "${e:-0}" -gt "$start" ]; then
-        die "$r is checked out by $h until $(date -u -d "@$e" +%Y-%m-%dT%H:%MZ) ($p)"
+      s=$(field start "$lease")
+      if [ -n "$boot" ] && [ "${s:-0}" -lt "$boot" ]; then
+        echo "$r: STALE lease of $h ($p) was written before glolab's last boot" \
+             "($(date -u -d "@$boot" +%Y-%m-%dT%H:%MZ)): expired by the reboot, taken over"
+      elif [ "${e:-0}" -gt "$start" ]; then
+        local unknown=""
+        [ -n "$boot" ] || unknown="; glolab's boot time is unknown, so a lease from before a reboot cannot be told apart"
+        die "$r is checked out by $h until $(date -u -d "@$e" +%Y-%m-%dT%H:%MZ) ($p)$unknown"
       elif [ "$brk" = 0 ]; then
         die "$r has an EXPIRED check-out by $h ($p): ask them, then pass --break-expired"
       fi
+    else
+      echo "$r: no lease on record (a lease on tmpfs does not survive glolab's reboot):" \
+           "the #428 post is the social lock, so read it before going on"
     fi
   done
   for r in "${res[@]}"; do
@@ -174,15 +205,18 @@ release() {
 }
 
 status() {
-  local r IFS_OLD=$IFS; IFS=, read -r -a res <<< "$RESOURCES"; IFS=$IFS_OLD
+  local r boot IFS_OLD=$IFS; IFS=, read -r -a res <<< "$RESOURCES"; IFS=$IFS_OLD
+  boot=$(boot_epoch)
   for r in "${res[@]}"; do
     if [ -e "$LOCK_DIR/$r.hold" ]; then echo "$r: HUMAN HOLD ($LOCK_DIR/$r.hold)"; fi
     if [ -f "$LOCK_DIR/$r.lease" ]; then
-      echo "$r: checked out by $(field holder "$LOCK_DIR/$r.lease") until" \
+      local stale=""
+      [ -n "$boot" ] && [ "$(field start "$LOCK_DIR/$r.lease")" -lt "$boot" ] && stale="STALE (before glolab's last boot): "
+      echo "$r: ${stale}checked out by $(field holder "$LOCK_DIR/$r.lease") until" \
            "$(date -u -d "@$(field expires "$LOCK_DIR/$r.lease")" +%Y-%m-%dT%H:%MZ)" \
            "($(field purpose "$LOCK_DIR/$r.lease"))"
     else
-      echo "$r: free"
+      echo "$r: no lease on record (check the #428 post too: a tmpfs lease does not survive a reboot)"
     fi
   done
 }

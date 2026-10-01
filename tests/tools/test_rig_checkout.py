@@ -55,8 +55,13 @@ class RigCheckoutTest(unittest.TestCase):
         for tool in ("ssh", "gh", "esptool", "esptool.py", "uhubctl"):
             path = os.path.join(self.bin, tool)
             with open(path, "w") as f:
-                f.write('#!/bin/sh\necho "%s $*" >> "%s"\nexit 0\n' % (tool, self.calls))
+                f.write('#!/bin/sh\necho "%s $*" >> "%s"\n' % (tool, self.calls))
+                if tool == "ssh":    # answers `cat /proc/uptime` when a test sets it
+                    f.write('[ -n "${STUB_SSH_OUT:-}" ] && echo "$STUB_SSH_OUT"\n')
+                f.write("exit 0\n")
             os.chmod(path, 0o755)
+        self.uptime = os.path.join(self.tmp, "uptime")
+        self.set_uptime(864000)        # glolab booted 10 days before any test's "now"
         self.key = os.path.join(self.tmp, "id_test")
         with open(self.key, "w") as f:
             f.write("not a key\n")
@@ -66,8 +71,13 @@ class RigCheckoutTest(unittest.TestCase):
         self.env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ.get("PATH", ""),
                         HOME=self.tmp, PD_RIG_LOCK_DIR=self.lock, PD_RIG_POST_DIR=self.posts,
                         PD_GLOLAB_TZ="UTC", PD_GLOLAB_KEY=self.key, PD_SECRETS_FILE=self.secrets,
-                        PD_RIG_NOW=str(at("2026-10-02T12:00")))
-        self.env.pop("PD_GLOLAB", None)
+                        PD_RIG_NOW=str(at("2026-10-02T12:00")), PD_RIG_PROC_UPTIME=self.uptime)
+        for k in ("PD_GLOLAB", "PD_RIG_BOOT_VIA_SSH", "STUB_SSH_OUT"):
+            self.env.pop(k, None)
+
+    def set_uptime(self, seconds):
+        with open(self.uptime, "w") as f:
+            f.write("%.2f 12345.67\n" % seconds)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -158,6 +168,65 @@ class RigCheckoutTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("EXPIRED check-out by BigDog", out)
         rc, out = self.claim("Stray", "30", "--break-expired", now="2026-10-02T12:00")
+        self.assertEqual(rc, 0, out)
+
+    # ---- glolab's reboot: tmpfs leases vanish, persistent ones go stale ----
+    def test_a_lease_wiped_by_a_reboot_lets_the_claim_through_and_says_so(self):
+        self.assertEqual(self.claim("BigDog", "600")[0], 0)
+        for name in os.listdir(self.lock):            # /run/lock is tmpfs: the reboot empties it
+            os.remove(os.path.join(self.lock, name))
+        rc, out = self.claim("Stray", "60", now="2026-10-02T14:00")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("no lease on record", out)
+        self.assertIn("#428 post is the social lock", out)
+
+    def test_a_lease_from_before_the_last_boot_is_stale_not_live(self):
+        self.assertEqual(self.claim("BigDog", "600")[0], 0)          # 12:00, until 22:00
+        self.set_uptime(3600)                                         # rebooted at 13:00
+        rc, out = self.claim("Stray", "60", now="2026-10-02T14:00")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("STALE lease of BigDog", out)
+        self.assertIn("2026-10-02T13:00Z", out)
+        rc, out = self.rig("status", now="2026-10-02T14:00")
+        self.assertIn("checked out by Stray", out)
+
+    def test_a_lease_taken_after_the_last_boot_is_still_live(self):
+        self.set_uptime(3600)                                         # booted 13:00 (now 14:00)
+        self.assertEqual(self.claim("BigDog", "600", now="2026-10-02T13:30")[0], 0)
+        rc, out = self.claim("Stray", "60", now="2026-10-02T14:00")
+        self.assertEqual(rc, 1)
+        self.assertIn("checked out by BigDog", out)
+
+    def test_glolabs_boot_time_can_come_over_the_ssh_wrapper(self):
+        self.assertEqual(self.claim("BigDog", "600")[0], 0)          # 12:00
+        rc, out = self.rig("claim", "--holder", "Stray", "--purpose", "x", "--minutes", "30",
+                           now="2026-10-02T12:10", PD_RIG_BOOT_VIA_SSH="1",
+                           STUB_SSH_OUT="60.50 10.00", PD_RIG_PROC_UPTIME="/nonexistent")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("STALE lease of BigDog", out)
+        (call,) = self.calls_made()
+        self.assertIn("claude-agent@192.168.12.110 -- cat /proc/uptime", call)
+
+    def test_an_unknown_boot_time_fails_closed(self):
+        self.assertEqual(self.claim("BigDog", "600")[0], 0)
+        rc, out = self.rig("claim", "--holder", "Stray", "--purpose", "x", "--minutes", "30",
+                           now="2026-10-02T14:00", PD_RIG_PROC_UPTIME="/nonexistent")
+        self.assertEqual(rc, 1)
+        self.assertIn("boot time is unknown", out)
+
+    @unittest.skipUnless(ZONES, "needs the tz database")
+    def test_glolab_time_is_new_york_by_default(self):
+        env = {k: v for k, v in self.env.items() if k != "PD_GLOLAB_TZ"}
+        def claim_at(now, minutes):
+            e = dict(env, PD_RIG_NOW=str(at(now)))
+            p = subprocess.run(["bash", SCRIPT, "claim", "--holder", "BigDog", "--purpose", "x",
+                                "--minutes", minutes], env=e, capture_output=True, text=True,
+                               timeout=60)
+            return p.returncode, p.stdout + p.stderr
+        rc, out = claim_at("2026-10-02T07:00", "60")      # 03:00-04:00 EDT
+        self.assertEqual(rc, 1)
+        self.assertIn("03:30 auto-reboot", out)
+        rc, out = claim_at("2026-10-02T03:00", "60")      # 23:00-00:00 EDT: clear
         self.assertEqual(rc, 0, out)
 
     def test_a_checkout_always_has_an_expiry(self):
