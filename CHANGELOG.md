@@ -87,6 +87,16 @@ bench-verified here.
 - The REGISTER 200 lists the phone's binding, not the PBX URI (#767; #755).
 - The register beep's ACK for the phone's 200 gets a fresh Via branch (#766; #752).
 - The cancelled pickup target's 487 is ACKed and dropped, not relayed to an answered caller (#765; #750).
+- Park ring-back: the ring-back session records its dialog headers, so the parked party's BYE reaches the parker (#776; #718).
+- The 202 to an in-dialog REFER echoes the To tag instead of appending a second (#769; #720).
+- Anchor: the hold answer mirrors the offer's SDP direction (#768; #751).
+- `Session` records a write-once call `Disposition` next to `State` (#791; #690).
+- A 911 whose both legs are silent for 4 h is ended and counted (#742; #741).
+- A handset's hold on an inbound anchored call is answered (#449; #445).
+- In-dialog requests across a B2BUA splice are rebuilt in the peer dialog (#589; part of #453).
+- The SIP and SDP grammars are constrained to our RFC subset and invariants (#759).
+- A relayed call's BYE is answered locally and the PBX sends its own BYE to the far leg (#809; #808).
+- The 487 ACK of a cancelled pickup target and the 200 to a trunk CANCEL are conformant (#823).
 
 ### Trunk
 
@@ -115,6 +125,7 @@ bench-verified here.
 - A handset CANCEL cancels a ringing carrier leg and answers the handset 487 (#779; #747).
 - The BYE to the handset after a carrier hangup or RTP reap has From and To the right way round (#780; #700).
 - The trunk INVITE no longer claims `Supported: timer` (#764; #753).
+- ACK and BYE carry the carrier's Record-Route as a Route set (#775; #748).
 
 ### Memory and no-heap
 
@@ -158,6 +169,9 @@ bench-verified here.
 - `refuseInvite()` replaces three copies of the INVITE refusal lambda (#706; #702).
 - Three per-message `std::string` copies become `string_view` lookups (#707; #702).
 - L2 queries the local IP only when the egress channel re-resolves, not per frame (#730; #702).
+- Anchor restart, rewarm and reconcile run on one persistent `tel_maint` task (#688; #658).
+- `GET /api/sbc-mode` writes into a fixed buffer, no heap (#786; part of #410).
+- `conf_mix_tick` runs on a boot-allocated static stack, created once and parked (#790; #479).
 
 ### Dashboard
 
@@ -172,6 +186,8 @@ bench-verified here.
 - A banner shows while the admin login is unset, and admin-status errors are shown (#649; #644).
 - Reboot with `confirm=1` does a plain reboot when no OTA image is staged (#650; #645).
 - Config export and import carry the trunk, SMTP, E911 and `admin_ext` settings (#738; #483).
+- The E911 banner names the 3CX anchor as the carrier on the anchor route (#793; part of #792).
+- SD archive CDR rows carry a direction column (#788; part of #221).
 
 ### Security
 
@@ -277,6 +293,11 @@ bench-verified here.
 - Dead code removed: `sendConfigCfg`, `getParkedCalls`, two unread snapshot fields; two stale comments fixed (#710; #702).
 - `repliesRefused` and `optionsPingTruncated` on `/api/status`; `packetsDropped` is derived (#735; #702).
 - `updateAddressing` test calls the `shouldResolveArp()` it pins (#711; #702).
+- `/api/status` reports the route that set `stackHwm_http_conn`'s minimum (#789; #405).
+- `run_cppcheck.sh` falls back to the WSL image's `~/cppcheck-root` (#787; #372).
+- Nightly: fail-closed network probes in the runner isolation step (#784; #493).
+- `SIP_OUTSIDE_LINE=anchor|trunk` selects the constrained build's one outside line (#785; part of #731).
+- Conformance test: every message the PBX sends passes pjsip's parser and an RFC 3261 checklist (#758).
 
 ## v1.5.0-beta.2 — 2026-09-14
 
