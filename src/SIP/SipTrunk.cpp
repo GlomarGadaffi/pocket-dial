@@ -682,13 +682,26 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	const std::string toTag = siphdr::tagOf(data->getTo());
 	if (!toTag.empty() && d->toTag.empty()) d->toTag = toTag;
 
+	// #794: hangup() ran before any provisional response, when §9.1 forbade a
+	// CANCEL. This is the first one, so the CANCEL goes out now -- hangup() on
+	// the now Proceeding dialog -- and the handset, already gone, hears nothing.
+	if (d->cancelPending && status >= 100 && status < 200)
+	{
+		d->cancelPending = false;
+		d->state = State::Proceeding;
+		hangup(d->callID);
+		return true;
+	}
+
 	// #747: we CANCELled this INVITE and are waiting out its transaction. The
 	// handset was answered by the engine when it cancelled, so nothing here may
 	// reach the listener. A 2xx that crossed the CANCEL (§9.1) is not caught
 	// here: it takes the ordinary 2xx path below -- the same ACK, and whatever
 	// else that path latches from the answer -- with hangup() in place of the
-	// listener.
-	const bool wasCancelling = (d->state == State::Cancelling);
+	// listener. A #794 hangup still waiting for its first provisional is the
+	// same case: a 2xx or a failure (a 401/407 included: nobody is left to
+	// retry for) arriving first is treated as having crossed the CANCEL.
+	const bool wasCancelling = (d->state == State::Cancelling || d->cancelPending);
 	if (wasCancelling && (status < 200 || data->getCSeqMethod() == "CANCEL"))
 	{
 		// A late 180/183, or the CANCEL's own final response (200, or 481 when the
@@ -783,6 +796,7 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 			// carrier and the handset is gone, so no listener event may bridge
 			// it; hangup() on the now Confirmed dialog emits the BYE, behind the
 			// ACK already on the outbox.
+			d->cancelPending = false;
 			_env.log("Trunk: call answered after our CANCEL, hanging up (" + d->destE164 + ")", true);
 			hangup(d->callID);
 			return true;
@@ -907,12 +921,27 @@ bool SipTrunk::hangup(std::string_view callID)
 	// response (or the deadline) and must not be released by a second hangup.
 	if (d->state == State::Cancelling) return true;
 
+	// #794: a dialog still in Trying has had no provisional, and RFC 3261 §9.1
+	// forbids a CANCEL then. Releasing the slot here left the INVITE live at
+	// the carrier with nobody to answer its 1xx (the far end rang on) or its
+	// 2xx (un-ACKed, and the leg stayed up). Hold the slot instead:
+	// handleResponse() sends the CANCEL on the first provisional, or takes the
+	// crossed-CANCEL paths for a 2xx or a failure. Timer B bounds the wait, as
+	// it does for Cancelling; sweep() then frees the slot quietly.
+	if (d->state == State::Trying)
+	{
+		if (!d->cancelPending)
+		{
+			d->cancelPending = true;
+			d->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(32);   // Timer B
+		}
+		return true;
+	}
+
 	// #747: a dialog that has had a provisional response is CANCELled, so the
 	// carrier stops ringing the far end. A 2xx that crosses the CANCEL is acked
 	// and BYEd in handleResponse(). The INVITE's own transaction is left alone so
 	// the 487 matches it; the CANCEL is tracked as its own non-INVITE transaction.
-	// A dialog still in Trying has had no provisional, and RFC 3261 §9.1 forbids
-	// a CANCEL then, so it falls through to the release below as before.
 	if (d->state == State::Proceeding)
 	{
 		auto msg = _env.messageFromPool(buildCancel(*d), d->peer);
@@ -926,8 +955,8 @@ bool SipTrunk::hangup(std::string_view callID)
 		}
 	}
 
-	// Nothing to CANCEL (Trying, or the pool is exhausted): release the slot,
-	// which stops us placing a duplicate call.
+	// Nothing to CANCEL (the pool is exhausted): release the slot, which stops
+	// us placing a duplicate call.
 	_env.freeTransactionsForCallId(d->callID);
 	*d = Dialog{};
 	return true;
@@ -1073,7 +1102,8 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 		// The listener tore the handset down when it asked for that BYE, so
 		// reclaiming the slot is all that is left -- notifying again would be a
 		// second teardown of a leg that is already gone.
-		const bool notify = (d.state != State::Terminating && d.state != State::Cancelling);
+		const bool notify = (d.state != State::Terminating && d.state != State::Cancelling &&
+		                     !d.cancelPending);
 
 		// Same move-then-free-then-fire order as the failure path above: an
 		// INVITE that never got a final response must release the handset, and

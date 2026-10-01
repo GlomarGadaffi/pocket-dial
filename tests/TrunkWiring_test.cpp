@@ -1481,3 +1481,39 @@ TEST(TrunkWiring, ACarrierAnswerThatCrossesTheHandsetCancelIsByedAndNeverBridged
 	EXPECT_EQ(b.sent.size(), 2u) << "nothing at the handset: it already has its 487";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
 }
+
+// #794: the handset gives up before the carrier has sent ANY provisional. RFC
+// 3261 s9.1 forbids a CANCEL then, and hangup() used to free the trunk slot
+// instead, so the carrier's later 180 found no dialog and the far end rang on.
+TEST(TrunkWiring, AHandsetCancelBeforeAnyCarrierProvisionalCancelsTheCarrierLegOnItsFirst1xx)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-794"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(makeHandsetCancel("1001", "92025550123", "call-794"));
+
+	EXPECT_EQ(b.countWithTo("SIP/2.0 200", kHandsetIp), 1u) << "the CANCEL itself";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 487", kHandsetIp), 1u) << "the handset's INVITE";
+	EXPECT_EQ(b.countWithTo("CANCEL", kSbcIp), 0u) << "RFC 3261 s9.1: no CANCEL before a provisional";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	b.sent.clear();
+
+	// The carrier's first provisional lands after the handset is gone.
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 180 Ringing", /*withSdp=*/false), addrFor(kSbcIp)));
+
+	ASSERT_EQ(b.countWithTo("CANCEL", kSbcIp), 1u) << "the far end keeps ringing until the carrier is told";
+	EXPECT_NE(b.firstWith("CANCEL sip:+12025550123").find(";branch=" + carrier.branch), std::string::npos)
+		<< "on the carrier INVITE's own branch";
+	EXPECT_EQ(b.sent.size(), 1u) << "nothing at the handset: it already has its 487";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 487 Request Terminated", /*withSdp=*/false), addrFor(kSbcIp)));
+
+	EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 1u);
+	EXPECT_EQ(b.sent.size(), 1u) << "no stray 404 or second 487 at the handset";
+}

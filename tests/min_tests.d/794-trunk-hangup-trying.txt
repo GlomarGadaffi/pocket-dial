@@ -1,0 +1,2 @@
+# SipTrunk_test.cpp: 3 net (one #747 Trying test rewritten, three added) + TrunkWiring_test.cpp: 1 (#794: hangup in Trying holds the slot; CANCEL on the first 1xx, crossed 2xx ACKed and BYEd, failure ACKed, Timer B sweep)
+4
