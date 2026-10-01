@@ -254,18 +254,19 @@ Option 66 (§1.1), this needs no DHCP server change: only a socket.
 | :--- | :--- | :--- | :--- |
 | `off` (default) | closed | no | no |
 | `discover` | open | yes | no |
-| `provision` | open | yes | only a MAC this board can serve: today, an **adopted** device (§0.1) |
+| `provision` | open | yes | only a **snom or Yealink** whose MAC is **adopted** (§0.1) with an extension that passes the same AOR/identity gates as `findProvisioningInfo()` |
 
   Off by default because the first answer wins: an always-on responder would capture any
   PnP phone on a LAN shared with another PBX. A phone this board cannot serve gets
-  silence, so another server can still answer it.
+  silence, so another server can still answer it: a phone handed a URL that 404s stores
+  it anyway and stops looking.
 * Only sources on the board's own subnet are recorded or answered; the NOTIFY goes to the
   datagram's source address only; replies are token-bucketed (4, one back every 2 s); a
   phone gets at most one NOTIFY per 30 s, though a retransmitted SUBSCRIBE still gets its
   200 (same To tag, derived from the Call-ID).
 * **URL handed out:** snom: `http://<ip>/config/snom<mac>.xml` (snom fetches it as given);
-  every other vendor: `http://<ip>/config/` (the phone appends its own file name, e.g.
-  Yealink's `<mac>.cfg`). The MAC is lowercased, so it passes §0.2's shape check.
+  Yealink: `http://<ip>/config/` (the phone appends its own `<mac>.cfg`). The MAC is
+  lowercased, so it passes §0.2's shape check. Other vendors are listed but not answered.
 
 **Not yet:** zero-touch assignment of an extension to a phone that has never registered
 (Issue #826 part B). Until then `provision` re-provisions known phones (factory-reset

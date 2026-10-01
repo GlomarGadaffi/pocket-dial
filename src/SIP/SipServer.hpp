@@ -76,7 +76,10 @@ private:
 	uint32_t _localIp = 0;           // network byte order
 	int _pnpSock = -1;
 	uint32_t _pnpRetryAt = 0;
-	std::array<char, UdpServer::BUFFER_SIZE> _pnpRx{};
+	// A ua-profile SUBSCRIBE is ~500 B. A longer datagram is cut here, and the
+	// parser refuses one whose headers never end (PnpProfile.hpp).
+	static constexpr size_t kPnpRxBytes = 1024;
+	std::array<char, kPnpRxBytes> _pnpRx{};
 
 #if !defined(ESP_PLATFORM) && !defined(ARDUINO)
 	std::thread _tickThread;

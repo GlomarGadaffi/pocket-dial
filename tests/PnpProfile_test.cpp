@@ -31,7 +31,9 @@
 
 namespace
 {
-	// Shape of what a snom370 (8.7.5.48) sends; see PnpProfile.hpp.
+	// SYNTHETIC: written from the PnP spec's message shape with this bench's
+	// snom370 identity, not captured off the wire. Replace with a real capture
+	// (the snom's SIP trace after a reboot) once the bench is free.
 	const std::string kSnomSubscribe =
 		"SUBSCRIBE sip:MAC%3a0004132E08B4@224.0.1.75 SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP 192.168.12.155:5060;branch=z9hG4bK-snom-1;rport\r\n"
@@ -163,6 +165,30 @@ TEST(PnpProfile, RejectsWhatIsNotADiscoveryRequest)
 	EXPECT_FALSE(pnp::parseSubscribe("", s));
 }
 
+TEST(PnpProfile, RefusesADatagramCutBeforeItsHeadersEnd)
+{
+	pnp::Subscribe s;
+	const std::string cut = kSnomSubscribe.substr(0, kSnomSubscribe.find("Accept:"));
+	EXPECT_FALSE(pnp::parseSubscribe(cut, s));
+	EXPECT_TRUE(pnp::parseSubscribe(kSnomSubscribe, s));
+}
+
+TEST(PnpProfile, OkNeverGrantsLongerThanAsked)
+{
+	std::array<char, 1400> buf{};
+	auto expiresIn = [&buf](const std::string& raw) {
+		pnp::Subscribe s;
+		if (!pnp::parseSubscribe(raw, s)) return std::string("parse failed");
+		const size_t n = pnp::writeOk(s, "t", "192.168.12.195", 5060, buf.data(), buf.size());
+		const std::string ok(buf.data(), n);
+		const size_t at = ok.find("Expires: ");
+		return ok.substr(at + 9, ok.find("\r\n", at) - at - 9);
+	};
+	EXPECT_EQ(expiresIn(kSnomSubscribe), "0");
+	EXPECT_EQ(expiresIn(replace(kSnomSubscribe, "Expires: 0", "Expires: 3600")), "30");
+	EXPECT_EQ(expiresIn(replace(kSnomSubscribe, "Expires: 0\r\n", "")), "30");
+}
+
 TEST(PnpProfile, SanitizesAndTruncatesWhatThePhoneSaysAboutItself)
 {
 	const std::string raw = replace(kSnomSubscribe, "model=\"snom370\"",
@@ -267,6 +293,16 @@ TEST(PnpResponder, ProvisionAnswersOnlyPhonesThisBoardCanServe)
 	ASSERT_FALSE(r.notify.empty());
 	EXPECT_NE(std::string(r.notify).find("NOTIFY sip:192.168.12.155:5060 SIP/2.0"), std::string::npos);
 	EXPECT_NE(std::string(r.notify).find("http://192.168.12.195/config/snom0004132e08b4.xml"), std::string::npos);
+}
+
+TEST(PnpResponder, AVendorWithNoUrlShapeGetsSilence)
+{
+	// A URL that 404s is worse than no answer: the phone stores it anyway.
+	Bench b(PnpResponder::Mode::Provision);
+	const auto r = b.feed(replace(kSnomSubscribe, "vendor=\"snom\"", "vendor=\"Acme\""), "192.168.12.155", 100);
+	EXPECT_TRUE(r.ok.empty());
+	EXPECT_TRUE(r.notify.empty());
+	EXPECT_EQ(b.count(), 1u);   // still listed
 }
 
 TEST(PnpResponder, IgnoresSourcesOffTheBoardsSubnet)

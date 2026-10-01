@@ -300,10 +300,12 @@ public:
 
 	// Issue #826: SIP PnP. The responder lives here so both the SIP task (which
 	// feeds it) and the HTTP task (/api/pnp) can reach it; it guards its own
-	// state. isAdoptedMac() is its "does this board have a config for you"
-	// check: allocation-free, takes _mutex.
+	// state. canProvisionMac() is its "does this board have a config for you"
+	// check: the MAC is adopted AND its extension passes the same gates
+	// findProvisioningInfo() applies, so a phone pointed here is never handed a
+	// URL that will 404. Allocation-free; takes _mutex.
 	PnpResponder& pnp() { return _pnp; }
-	bool isAdoptedMac(std::string_view mac);
+	bool canProvisionMac(std::string_view mac);
 
 	// Do Not Disturb (DND): set/query a per-extension flag. setDnd is the mutating
 	// path behind POST /api/dnd (thread-safe; takes _mutex). getDndExtensions

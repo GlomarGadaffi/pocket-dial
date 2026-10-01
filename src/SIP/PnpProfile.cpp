@@ -142,7 +142,7 @@ namespace
 		return true;
 	}
 
-	enum class Hdr : uint8_t { Other, Via, From, To, CallId, CSeq, Event };
+	enum class Hdr : uint8_t { Other, Via, From, To, CallId, CSeq, Event, Expires };
 
 	// Full and RFC 3261 §7.3.3 compact names.
 	Hdr classify(std::string_view name)
@@ -153,6 +153,7 @@ namespace
 		if (iequals(name, "Call-ID") || iequals(name, "i")) return Hdr::CallId;
 		if (iequals(name, "CSeq")) return Hdr::CSeq;
 		if (iequals(name, "Event") || iequals(name, "o")) return Hdr::Event;
+		if (iequals(name, "Expires")) return Hdr::Expires;
 		return Hdr::Other;
 	}
 
@@ -160,7 +161,21 @@ namespace
 	{
 		Subscribe sub;
 		bool event = false;
+		bool complete = false;   // saw the blank line that ends the headers
 	};
+
+	// Up to 9 digits; anything else keeps the default.
+	uint32_t parseSeconds(std::string_view v, uint32_t fallback)
+	{
+		if (v.empty() || v.size() > 9) return fallback;
+		uint32_t n = 0;
+		for (std::size_t i = 0; i < v.size(); ++i)
+		{
+			if (v[i] < '0' || v[i] > '9') return fallback;
+			n = n * 10U + static_cast<uint32_t>(v[i] - '0');
+		}
+		return n;
+	}
 
 	void takeHeader(Hdr h, std::string_view value, Scan& s)
 	{
@@ -174,6 +189,7 @@ namespace
 			case Hdr::CallId: s.sub.callId = value; break;
 			case Hdr::CSeq:   s.sub.cseq = value; break;
 			case Hdr::Event:  s.event = parseEvent(value, s.sub.id); break;
+			case Hdr::Expires: s.sub.expires = parseSeconds(value, kMaxExpires); break;
 			case Hdr::Other:
 			default:
 				break;
@@ -222,12 +238,12 @@ bool parseSubscribe(std::string_view raw, Subscribe& out)
 		const std::size_t nl = raw.find('\n', pos);
 		const std::string_view line = trim(raw.substr(pos, (nl == kNpos ? raw.size() : nl) - pos));
 		pos = (nl == kNpos) ? raw.size() : nl + 1;
-		if (line.empty()) break;   // end of headers
+		if (line.empty()) { s.complete = true; break; }   // end of headers
 		const std::size_t colon = line.find(':');
 		if (colon == kNpos) continue;
 		takeHeader(classify(trim(line.substr(0, colon))), trim(line.substr(colon + 1)), s);
 	}
-	if (!s.event || s.sub.viaCount == 0 || s.sub.from.empty() || s.sub.to.empty() ||
+	if (!s.complete || !s.event || s.sub.viaCount == 0 || s.sub.from.empty() || s.sub.to.empty() ||
 	    s.sub.callId.empty() || s.sub.cseq.empty()) return false;
 	if (ifind(s.sub.to, ";tag=") != kNpos) return false;   // in-dialog: not a discovery request
 	if (!extractMac(s.sub.from, s.sub.id.mac) && !extractMac(s.sub.to, s.sub.id.mac)) return false;
@@ -267,7 +283,7 @@ std::size_t writeOk(const Subscribe& sub, std::string_view toTag,
 	w.put("Call-ID: ").put(sub.callId).put("\r\n");
 	w.put("CSeq: ").put(sub.cseq).put("\r\n");
 	w.put("Contact: <sip:").put(localIp).put(":").putU(localPort).put(">\r\n");
-	w.put("Expires: 30\r\n");
+	w.put("Expires: ").putU(sub.expires < kMaxExpires ? sub.expires : kMaxExpires).put("\r\n");
 	w.put("Content-Length: 0\r\n\r\n");
 	return w.done();
 }

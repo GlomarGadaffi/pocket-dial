@@ -720,11 +720,15 @@ bool Registrar::isExtensionSecured(std::string_view ext) const
 	return false;
 }
 
-bool Registrar::hasDevice(std::string_view mac) const
+bool Registrar::extensionOf(std::string_view mac, std::string_view& ext) const
 {
 	for (const auto& entry : _devices)
 	{
-		if (entry.first == mac) return true;
+		if (entry.first == mac)
+		{
+			ext = entry.second.extension;
+			return true;
+		}
 	}
 	return false;
 }
