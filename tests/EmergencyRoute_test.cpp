@@ -991,6 +991,23 @@ namespace
 			"--" + boundary + "--\r\n";
 	}
 
+	// The same two parts with the location first: nothing obliges a phone to
+	// lead with its SDP.
+	std::string multipartLocationFirst(const std::string& boundary)
+	{
+		return
+			"--" + boundary + "\r\n"
+			"Content-Type: application/pidf+xml\r\n"
+			"Content-ID: <target101@pd.example>\r\n"
+			"\r\n"
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+			"<presence xmlns=\"urn:ietf:params:xml:ns:pidf\" entity=\"pres:101@pd.example\"/>\r\n"
+			"--" + boundary + "\r\n"
+			"Content-Type: application/sdp\r\n"
+			"\r\n" + kSdpOffer +
+			"--" + boundary + "--\r\n";
+	}
+
 	// The carrier's 180 to the trunk INVITE it was sent for `number`, so the
 	// dialog is Proceeding and a CANCEL may follow (RFC 3261 s9.1).
 	std::shared_ptr<SipMessage> carrierRinging(const Bench& b, const std::string& number)
@@ -1041,6 +1058,23 @@ TEST(EmergencyRoute, AMultipartEmergencyInviteCarryingLocationIsRoutedNotRefused
 			<< "the carrier gets exactly one INVITE for the bare number:\n" << b.dump();
 		EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u) << b.dump();
 		EXPECT_FALSE(b.saw("pdloc1")) << "the MIME boundary must not reach the carrier's offer";
+	}
+
+	// Two more shapes phones send: a quoted boundary (RFC 2046 s5.1.1), and the
+	// location part ahead of the SDP.
+	struct Shape { const char* contentType; std::string body; const char* boundary; const char* callId; };
+	for (const Shape& s : {Shape{"multipart/mixed; boundary=\"pdloc-q\"", multipartWithLocation("pdloc-q"), "pdloc-q", "er-mp-quoted"},
+	                       Shape{"multipart/mixed;boundary=pdloc-r", multipartLocationFirst("pdloc-r"), "pdloc-r", "er-mp-sdp-last"}})
+	{
+		SCOPED_TRACE(s.callId);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->handle(makeShapedInvite("sip:911@server", "sip:911@server", s.contentType, "", s.body, s.callId));
+
+		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 5"), 0u) << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+		EXPECT_FALSE(b.saw(s.boundary)) << "the MIME boundary must not reach the carrier's offer";
 	}
 }
 
