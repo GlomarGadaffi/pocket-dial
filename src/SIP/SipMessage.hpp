@@ -253,6 +253,13 @@ public:
 	bool isEmergencyRequest() const;
 	// RFC 7090: Priority: psap-callback (#659 is the call-handling half).
 	bool isPsapCallback() const;
+	// #760: a 911/933 INVITE may carry its SDP inside multipart/mixed next to
+	// a PIDF-LO location (RFC 6442, RFC 4119). Keeps only the application/sdp
+	// part, in place within the body already held (no allocation), and makes
+	// Content-Type application/sdp so every consumer sees a plain offer. The
+	// location part is dropped, never parsed. False, message untouched, when
+	// the body is not multipart or has no SDP part.
+	bool unwrapMultipartSdp();
 	void clearBody();
 
 	// The message body — everything after the header/body separator (the SDP for

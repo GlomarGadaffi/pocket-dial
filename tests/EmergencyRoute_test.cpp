@@ -934,3 +934,210 @@ TEST(EmergencyCallback, ACallToAnotherExtensionIsNot)
 	EXPECT_FALSE(out.value()->isEmergency()) << "a call FROM the 911 caller is not a callback";
 	EXPECT_TRUE(ctl.value()->isEmergency()) << "control: the same call to 101 is flagged";
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #760: the two emergency INVITE shapes a phone may legitimately send
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+	// An INVITE from 101 with a caller-chosen Request-URI, To URI and body.
+	std::shared_ptr<SipMessage> makeShapedInvite(const std::string& requestUri,
+		const std::string& toUri, const std::string& contentType,
+		const std::string& extraHeaders, const std::string& body, const std::string& callId)
+	{
+		const std::string raw =
+			"INVITE " + requestUri + " SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKei" + callId + "\r\n"
+			"From: <sip:101@server>;tag=ef" + callId + "\r\n"
+			"To: <" + toUri + ">\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:101@" + std::string(kHandsetIp) + ":5060>\r\n" +
+			extraHeaders +
+			"Content-Type: " + contentType + "\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
+	}
+
+	const std::string kSdpOffer =
+		"v=0\r\n"
+		"o=- 0 0 IN IP4 192.168.79.11\r\n"
+		"s=-\r\n"
+		"c=IN IP4 192.168.79.11\r\n"
+		"t=0 0\r\n"
+		"m=audio 40000 RTP/AVP 0\r\n"
+		"a=rtpmap:0 PCMU/8000\r\n";
+
+	// RFC 6442's shape: the SDP offer, then a PIDF-LO (RFC 4119) civic location.
+	std::string multipartWithLocation(const std::string& boundary)
+	{
+		return
+			"--" + boundary + "\r\n"
+			"Content-Type: application/sdp\r\n"
+			"\r\n" + kSdpOffer +
+			"--" + boundary + "\r\n"
+			"Content-Type: application/pidf+xml\r\n"
+			"Content-ID: <target101@pd.example>\r\n"
+			"\r\n"
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+			"<presence xmlns=\"urn:ietf:params:xml:ns:pidf\" entity=\"pres:101@pd.example\">\r\n"
+			"<tuple id=\"t1\"><status><gp:geopriv xmlns:gp=\"urn:ietf:params:xml:ns:pidf:geopriv10\">"
+			"<gp:location-info><ca:civicAddress xmlns:ca=\"urn:ietf:params:xml:ns:pidf:geopriv10:civicAddr\">"
+			"<ca:country>US</ca:country><ca:A1>NY</ca:A1><ca:FLR>2</ca:FLR></ca:civicAddress>"
+			"</gp:location-info></gp:geopriv></status></tuple>\r\n"
+			"</presence>\r\n"
+			"--" + boundary + "--\r\n";
+	}
+
+	// The carrier's 180 to the trunk INVITE it was sent for `number`, so the
+	// dialog is Proceeding and a CANCEL may follow (RFC 3261 s9.1).
+	std::shared_ptr<SipMessage> carrierRinging(const Bench& b, const std::string& number)
+	{
+		std::string invite;
+		for (const auto& p : b.sent)
+		{
+			if (p.second.rfind("INVITE sip:" + number + "@", 0) == 0) { invite = p.second; break; }
+		}
+		auto between = [&invite](const std::string& open) {
+			const size_t s = invite.find(open);
+			if (s == std::string::npos) return std::string();
+			const size_t from = s + open.size();
+			return invite.substr(from, invite.find("\r\n", from) - from);
+		};
+		const std::string raw =
+			"SIP/2.0 180 Ringing\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kServerIp) + ":5060;branch=" + between(";branch=") + "\r\n"
+			"From: <sip:15551230000@" + std::string(kSbcIp) + ":5060>;tag=" + between(";tag=") + "\r\n"
+			"To: <sip:" + number + "@" + std::string(kSbcIp) + ":5060>;tag=psap\r\n"
+			"Call-ID: " + between("Call-ID: ") + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(kSbcIp));
+	}
+}
+
+TEST(EmergencyRoute, AMultipartEmergencyInviteCarryingLocationIsRoutedNotRefused)
+{
+	// RFC 6442 (RAY BAUM'S Act dispatchable location): the phone puts its SDP
+	// and a PIDF-LO in one multipart/mixed body. The T-7 SDP gate read the MIME
+	// boundary as a malformed SDP line and answered a 911 with 488.
+	for (const char* dialed : {"911", "933"})
+	{
+		SCOPED_TRACE(dialed);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		const std::string number(dialed);
+		b.handler->handle(makeShapedInvite("sip:" + number + "@server", "sip:" + number + "@server",
+			"multipart/mixed; boundary=pdloc1",
+			"Geolocation: <cid:target101@pd.example>\r\nGeolocation-Routing: no\r\n",
+			multipartWithLocation("pdloc1"), "er-mp-" + number));
+
+		EXPECT_EQ(b.count("SIP/2.0 488"), 0u) << "the emergency offer was refused:\n" << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 5"), 0u) << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:" + number + "@" + kSbcIp, kSbcIp), 1u)
+			<< "the carrier gets exactly one INVITE for the bare number:\n" << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u) << b.dump();
+		EXPECT_FALSE(b.saw("pdloc1")) << "the MIME boundary must not reach the carrier's offer";
+	}
+}
+
+TEST(EmergencyRoute, AMultipartEmergencyInviteIsRoutedOverTheAnchorToo)
+{
+	// The offer is unwrapped in handle(), before any route reads the body, so
+	// the anchor route (no trunk) gets the plain SDP as well: its codec gate
+	// and RTP parse see the offer, not the MIME wrapper.
+	Bench b;
+	b.handler->setAnchorPlacesRealCallsForTest(true);
+	b.handler->handle(makeShapedInvite("sip:911@server", "sip:911@server",
+		"multipart/mixed; boundary=pdloc3", "Geolocation: <cid:target101@pd.example>\r\n",
+		multipartWithLocation("pdloc3"), "er-mp-anchor"));
+
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 5"), 0u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << "the (synchronous) anchor answered:\n" << b.dump();
+	EXPECT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: er-mp-anchor"), nullptr)
+		<< "with a media bridge to the SDP part's c=/m= address";
+}
+
+TEST(EmergencyRoute, ATelUriOrTestServiceUrnEmergencyInviteIsRoutedNotRefused)
+{
+	// RFC 3966 tel:911 has no host and no @, so it read as no user at all and
+	// was answered 400 Bad Request. RFC 5031's urn:service:test.sos is the
+	// E911 test service, 933 here.
+	struct Shape { const char* uri; const char* bare; };
+	for (const Shape s : {Shape{"tel:911", "911"}, Shape{"tel:933", "933"},
+	                      Shape{"urn:service:test.sos", "933"},
+	                      Shape{"urn:service:test.sos.fire", "933"}})
+	{
+		SCOPED_TRACE(s.uri);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->handle(makeShapedInvite(s.uri, s.uri, "application/sdp", "", kSdpOffer,
+			std::string("er-uri-") + s.bare + std::to_string(std::string(s.uri).size())));
+
+		EXPECT_EQ(b.count("SIP/2.0 400"), 0u) << "the emergency URI was refused:\n" << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:" + std::string(s.bare) + "@" + kSbcIp, kSbcIp), 1u)
+			<< "the carrier gets exactly one INVITE for the bare number:\n" << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u) << b.dump();
+	}
+}
+
+TEST(EmergencyRoute, ATelUriEmergencyCallIsStillEndedByItsCancel)
+{
+	// tel:911 now reads as 911 for every request on the dialog. The handset's
+	// CANCEL (same Request-URI and To as its INVITE, RFC 3261 s9.1) still ends
+	// the call exactly once: 200 to the CANCEL, 487 to the INVITE, a CANCEL to
+	// the carrier, and no session left.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->handle(makeShapedInvite("tel:911", "tel:911", "application/sdp", "", kSdpOffer,
+		"er-tel-cancel"));
+	ASSERT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+	b.handler->handle(carrierRinging(b, "911"));
+	b.sent.clear();
+
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"CANCEL tel:911 SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKeier-tel-cancel\r\n"
+		"From: <sip:101@server>;tag=efer-tel-cancel\r\n"
+		"To: <tel:911>\r\n"
+		"Call-ID: er-tel-cancel\r\n"
+		"CSeq: 1 CANCEL\r\n"
+		"Max-Forwards: 70\r\n"
+		"Content-Length: 0\r\n\r\n", addrFor(kHandsetIp)));
+
+	EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << "the CANCEL itself:\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 487", kHandsetIp), 1u) << "the handset's INVITE:\n" << b.dump();
+	EXPECT_EQ(b.count("CANCEL sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+		<< "the carrier leg is cancelled:\n" << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: er-tel-cancel").has_value());
+}
+
+TEST(EmergencyRoute, ANonEmergencyMultipartOrTelInviteIsStillRefusedAsToday)
+{
+	// Positive control for the two tests above: the gate and the URI reader
+	// yield for an emergency call only. A multipart body to an extension is
+	// still refused (488 or 415), and a non-emergency tel: URI
+	// still reads as no user (400). Nothing reaches the carrier.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->handle(makeRegister("102", "192.168.79.12"));
+	b.sent.clear();
+
+	b.handler->handle(makeShapedInvite("sip:102@server", "sip:102@server",
+		"multipart/mixed; boundary=pdloc2", "", multipartWithLocation("pdloc2"), "er-mp-102"));
+	EXPECT_EQ(b.count("SIP/2.0 488") + b.count("SIP/2.0 415"), 1u)
+		<< "refused (488 from the SDP gate today, 415 from #759's header gate):\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 180"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+	b.sent.clear();
+
+	b.handler->handle(makeShapedInvite("tel:+15551230100", "tel:+15551230100",
+		"application/sdp", "", kSdpOffer, "er-tel-plain"));
+	EXPECT_EQ(b.count("SIP/2.0 400"), 1u) << b.dump();
+	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+}
