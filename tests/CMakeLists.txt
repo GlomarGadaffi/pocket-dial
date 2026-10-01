@@ -407,6 +407,8 @@ add_executable(sip_parser_tests
     # Issue #515: Learn's new-adoption token bucket (503 + Retry-After) and the
     # one-step forget of every Learned device.
     LearnAdoptionLimit_test.cpp
+    # Issue #440: Learn locks an adopted extension to its device.
+    RegistrarLearnLock_test.cpp
     # Issue #363: every secret-bearing store is empty after a factory reset.
     FactoryResetSecrets_test.cpp
     # Issue #385: the brute-force state-recovery attack on IDGen, run for real

@@ -183,6 +183,26 @@ void Registrar::sendRetryLater(const std::shared_ptr<SipMessage>& data, int retr
 	_env.enqueue(data->getSource(), std::move(response));
 }
 
+std::unordered_map<std::string, Registrar::DeviceRecord>::iterator Registrar::oldestEvictable()
+{
+	// Oldest plain Learned entry, offline before online. Locked and Secured
+	// entries are never candidates: evicting one would release its extension to
+	// whoever registers next.
+	auto victim = _devices.end();
+	for (auto it = _devices.begin(); it != _devices.end(); ++it)
+	{
+		const DeviceRecord& r = it->second;
+		if (r.state != DeviceState::Learned || r.locked) continue;
+		if (victim == _devices.end() ||
+			(victim->second.online && !r.online) ||
+			(victim->second.online == r.online && r.seq < victim->second.seq))
+		{
+			victim = it;
+		}
+	}
+	return victim;
+}
+
 Registrar::AuthDecision Registrar::admitSecure(
 	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason)
 {
@@ -320,46 +340,105 @@ bool Registrar::noteNonceUse(const std::string& nonce, uint32_t nc, std::chrono:
 
 Registrar::AuthDecision Registrar::admitLearn(
 	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason,
-	std::chrono::steady_clock::time_point now)
+	std::chrono::steady_clock::time_point now, bool fromRegisteredAddress)
 {
-	// Learn mode = TOFU + MAC-lock.
-	//   UNKNOWN mac            -> accept WITHOUT verifying, record {mac, ext, Learned}.
-	//   KNOWN + Secured mac    -> enforce digest (same path as secure mode).
-	//   ext Secured to a DIFFERENT mac -> reject (anti-spoof lock).
-	//   first-packet ARP miss  -> accept + defer the lock to the next REGISTER.
+	// Learn mode = TOFU + MAC-lock (issue #440 made the lock real).
+	//   ext Secured, or Learn-LOCKED, to a DIFFERENT mac -> reject (anti-spoof).
+	//   ARP miss, ext Learn-locked somewhere -> accept from the extension's
+	//                            registered IP:port (the owner's refresh), else
+	//                            503 + Retry-After (retryable; we cannot tell
+	//                            the owner from an impostor yet).
+	//   ARP miss otherwise     -> accept + defer, as before (never brick the first
+	//                            registration).
+	//   UNKNOWN mac            -> accept, record {mac, ext, Learned}, unlocked.
+	//   KNOWN mac, same ext    -> the second sighting: LOCK ext to this mac, unless
+	//                            an earlier-adopted row holds ext (first claim wins).
+	//   KNOWN mac, other ext   -> mark shared (phones behind one NAT router all
+	//                            resolve to the router's MAC); a shared MAC never
+	//                            locks. A re-provisioned phone looks the same and
+	//                            is also left unlocked -- fail open, not locked out.
+	//   KNOWN + Secured mac    -> enforce digest (same path as secure mode), and
+	//                            never touch its record first (#507).
+	//   ARP miss, ext Secured  -> enforce digest; never accept on a miss (#507).
+	// A routed off-subnet phone's IP is never in the ARP table, so it always
+	// misses: it is never locked, and Learn cannot protect it (use Secure).
+	auto lockedElsewhere = [&](const std::string& selfMac) -> const std::string* {
+		for (const auto& [m, rec] : _devices)
+		{
+			if (rec.extension != ext || m == selfMac) continue;
+			if (rec.state == DeviceState::Secured || (rec.locked && !rec.shared)) return &m;
+		}
+		return nullptr;
+	};
+
 	auto macOpt = ArpLookup::pdLookupMac(data->getSource());
 	if (!macOpt.has_value())
 	{
+		// #507 finding 1: a Secured extension is AUTHENTICATED, never waved
+		// through on a miss. etharp only knows on-link hosts, so an off-subnet or
+		// never-ARP'd source always misses (and the host build's lookup always
+		// does). The real phone has its credentials, so this breaks nothing that
+		// works -- and unlike the retry below, it lets an off-subnet Secured phone
+		// register at all.
+		if (isExtensionSecured(ext))
+		{
+			return admitSecure(data, ext, outRejectReason);
+		}
+		if (const std::string* owner = lockedElsewhere(std::string()))
+		{
+			if (fromRegisteredAddress)
+			{
+				// #487 review: the owner's own refresh. lwIP's ARP entries age
+				// out, and churn when the table is near the phone count (10 by
+				// default; see the top-level CMakeLists.txt), so a locked phone
+				// can miss. The binding at
+				// this exact IP:port was made by a REGISTER the lock admitted, so
+				// this admits no more than an ARP hit on the owner's IP would.
+				// Nothing is recorded and the lock is unchanged; a Secured
+				// extension never gets here (admitSecure above).
+				return AuthDecision::Accept;
+			}
+			// The owner's ARP entry may simply have aged out. A 403 here would lock
+			// the real phone out; accepting would let anyone off-link take the
+			// extension. Ask for a retry instead: transmitting this response makes
+			// lwIP ARP the source, so an on-link owner resolves next time.
+			_env.log("Learn REGISTER ext " + ext + ": ARP miss on an extension locked to " +
+				*owner + ", asking for a retry");
+			sendRetryLater(data, kLockedArpMissRetrySeconds);
+			return AuthDecision::RetryLater;   // response already enqueued
+		}
 		// Cache miss (or host). Accept now; the server's 200 OK + beep + OPTIONS
-		// populates the ARP cache so the NEXT REGISTER resolves and locks. Do NOT
-		// hard-fail — that would brick the very first registration.
+		// populates the ARP cache so the NEXT REGISTER resolves. Do NOT hard-fail --
+		// that would brick the very first registration.
 		_env.log("Learn REGISTER ext " + ext + ": ARP miss, deferring MAC-lock");
 		return AuthDecision::Accept;
 	}
 	const std::string mac = ArpLookup::toHex12(*macOpt);
 
-	// Anti-spoof: if this extension is already Secured to a DIFFERENT mac, reject.
-	for (const auto& [m, rec] : _devices)
+	if (const std::string* owner = lockedElsewhere(mac))
 	{
-		if (rec.extension == ext && rec.state == DeviceState::Secured && m != mac)
-		{
-			outRejectReason = "Extension Locked To Another Device";
-			_env.log("Learn REGISTER ext " + ext + " from " + mac +
-				" rejected: locked to " + m, true);
-			return AuthDecision::Reject;
-		}
+		outRejectReason = "Extension Locked To Another Device";
+		_env.log("Learn REGISTER ext " + ext + " from " + mac +
+			" rejected: locked to " + *owner, true);
+		return AuthDecision::Reject;
 	}
 
 	auto it = _devices.find(mac);
 	if (it == _devices.end())
 	{
-		// First time we've seen this MAC: trust-on-first-use. Bound the table like
-		// _dnd/_forwards — a flood of distinct MACs can't grow the heap unbounded.
+		// First time we've seen this MAC: trust-on-first-use, not yet locked. Bound
+		// the table like _dnd/_forwards; when full, evict the oldest plain Learned
+		// entry rather than refuse every new phone forever (#440).
+		auto victim = _devices.end();
 		if (_devices.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
 		{
-			outRejectReason = "Device Table Full";
-			_env.log("Learn REGISTER: device table full, rejecting " + mac, true);
-			return AuthDecision::Reject;
+			victim = oldestEvictable();
+			if (victim == _devices.end())
+			{
+				outRejectReason = "Device Table Full";
+				_env.log("Learn REGISTER: device table full of locked devices, rejecting " + mac, true);
+				return AuthDecision::Reject;
+			}
 		}
 		// #515: spend an adoption token. Credit whole periods since the last
 		// refill; a bucket that refills to full restarts its clock at `now`.
@@ -387,9 +466,18 @@ Registrar::AuthDecision Registrar::admitLearn(
 			return AuthDecision::RetryLater;
 		}
 		--_adoptTokens;
+		// Evict only once the adoption is certain: a rate-limited flood of new
+		// MACs must not erase one unlocked device per REGISTER and still be 503'd.
+		if (victim != _devices.end())
+		{
+			_env.log("Learn: device table full, evicting oldest unlocked device " + victim->first +
+				" (ext " + victim->second.extension + ")");
+			_devices.erase(victim);
+		}
 		DeviceRecord rec;
 		rec.extension = ext;
 		rec.state = DeviceState::Learned;
+		rec.seq = _nextSeq++;
 		_devices.emplace(mac, std::move(rec));
 		persistDevices();
 		noteChange(Change::Structural);
@@ -397,21 +485,70 @@ Registrar::AuthDecision Registrar::admitLearn(
 		return AuthDecision::Accept;
 	}
 
-	// Known MAC. Keep its extension in sync if the phone re-provisioned to a new AOR.
-	if (it->second.extension != ext)
+	DeviceRecord& rec = it->second;
+	if (rec.state == DeviceState::Secured)
 	{
-		it->second.extension = ext;
+		// #507 finding 2: a Secured device's record never moves on a REGISTER.
+		// Checked BEFORE anything below touches the record: a single REGISTER for
+		// another extension, sent with the source IP forged to this phone's (so
+		// ARP returns its real MAC), used to rewrite the record away from its
+		// Secured extension -- stripping the lock -- before any digest was checked.
+		// The device authenticates for whatever extension it asks for, exactly as
+		// secure mode does, and its record stays as it is.
+		return admitSecure(data, ext, outRejectReason);
+	}
+
+	if (rec.extension != ext && rec.locked && !rec.shared)
+	{
+		// Crew's #487 review: a LOCKED record never moves on an unauthenticated
+		// REGISTER -- the same rule #507 applies to Secured records. One REGISTER
+		// for another extension with the locked phone's source IP forged used to
+		// release the lock, mark the MAC shared (persisted, so it could never lock
+		// again) and let the attacker take the extension. Admit the other
+		// extension as TOFU and leave this device's record exactly as it is.
+		// Phones behind NAT keep working: the router's MAC stays locked to its
+		// first extension, the others register as plain TOFU.
+		_env.log("Learn: locked device " + mac + " (ext " + rec.extension + ") registered ext " +
+			ext + "; admitted as TOFU, the lock stays");
+		return AuthDecision::Accept;
+	}
+
+	if (rec.extension != ext)
+	{
+		// One MAC, a second extension, while still UNLOCKED: phones behind a NAT
+		// router, or a phone re-provisioned to a new AOR. Either way this MAC can no
+		// longer vouch for one extension, so it stops locking. Keep the extension in
+		// sync as before.
+		if (!rec.shared)
+		{
+			rec.shared = true;
+			_env.log("Learn: device " + mac + " registered ext " + ext + " after ext " +
+				rec.extension + " -- shared MAC (NAT?), its extensions stay unlocked", true);
+		}
+		rec.locked = false;
+		rec.extension = ext;
 		persistDevices();
 		noteChange(Change::Structural);
 	}
 
-	if (it->second.state == DeviceState::Secured)
+	// (A Secured record returned above, before the record could be touched.)
+	if (!rec.locked && !rec.shared)
 	{
-		// Promoted device: enforce digest exactly as secure mode does.
-		return admitSecure(data, ext, outRejectReason);
+		// #487 review: the lock goes to the extension's FIRST claim, not to the
+		// first device to register twice. While an earlier-adopted row still
+		// holds ext, this one stays plain TOFU (fail open): otherwise a device
+		// that registered after the real phone's first REGISTER could lock it out
+		// with two packets of its own (an expires=0 counts).
+		for (const auto& [m, other] : _devices)
+		{
+			if (m != mac && other.extension == ext && other.seq < rec.seq) return AuthDecision::Accept;
+		}
+		// Second sighting of this MAC for this extension: bind it.
+		rec.locked = true;
+		persistDevices();
+		noteChange(Change::Structural);
+		_env.log("Learn: locked ext " + ext + " to device " + mac);
 	}
-
-	// Known + still Learned → accept (TOFU continues until an admin secures it).
 	return AuthDecision::Accept;
 }
 
@@ -425,9 +562,22 @@ Registrar::findDevice(const std::string& macOrExt)
 	auto it = _devices.find(macOrExt);
 	if (it == _devices.end())
 	{
+		// Several rows can hold one extension (#440: the owner's lock beside a
+		// later claim that never locked). Act on the one that holds it: Secured,
+		// then Learn-locked, then the first claim (lowest seq). Map order would
+		// let "secure 201" promote a stray row and lock the owner out.
+		auto rank = [](const DeviceRecord& r) {
+			if (r.state == DeviceState::Secured) return 0;
+			return (r.locked && !r.shared) ? 1 : 2;
+		};
 		for (auto cand = _devices.begin(); cand != _devices.end(); ++cand)
 		{
-			if (cand->second.extension == macOrExt) { it = cand; break; }
+			if (cand->second.extension != macOrExt) continue;
+			if (it == _devices.end() || rank(cand->second) < rank(it->second) ||
+				(rank(cand->second) == rank(it->second) && cand->second.seq < it->second.seq))
+			{
+				it = cand;
+			}
 		}
 	}
 	return it;
@@ -524,6 +674,8 @@ std::vector<Registrar::AdoptedDevice> Registrar::adoptedDevices() const
 		d.extension = rec.extension;
 		d.state = rec.state;
 		d.online = rec.online;
+		d.locked = rec.locked;
+		d.shared = rec.shared;
 		out.push_back(std::move(d));
 	}
 	return out;
@@ -577,7 +729,11 @@ void Registrar::loadDevices()
 		if (nvs_get_str(h, "devices", buf.data(), &len) == ESP_OK)
 		{
 			if (!buf.empty() && buf.back() == '\0') buf.pop_back();
-			// Record: mac \t extension \t state(int)
+			// Record: mac \t extension \t state(int) [\t flags(int) \t seq(u32)]
+			// The last two fields are #440's (flags: bit0 locked, bit1 shared). A
+			// pre-#440 blob has three fields and loads unlocked. Pre-#440 firmware
+			// reads only the first three of a new blob, so a downgrade boots, but
+			// its next write drops both fields: a downgrade releases every lock.
 			for (const auto& rec : pbxpersist::deserializeBlob(buf))
 			{
 				if (rec.size() < 3 || rec[0].empty()) continue;
@@ -587,6 +743,18 @@ void Registrar::loadDevices()
 				int si = atoi(rec[2].c_str());
 				r.state = (si == static_cast<int>(DeviceState::Secured))
 					? DeviceState::Secured : DeviceState::Learned;
+				if (rec.size() >= 5)
+				{
+					const int flags = atoi(rec[3].c_str());
+					r.locked = (flags & 1) != 0;
+					r.shared = (flags & 2) != 0;
+					// Clamped: a saved UINT32_MAX would wrap _nextSeq to 0 below, and
+					// every later adoption would then sort as the oldest (evicted first).
+					const unsigned long saved = strtoul(rec[4].c_str(), nullptr, 10);
+					r.seq = (saved < 0x80000000UL) ? static_cast<uint32_t>(saved) : 0;
+				}
+				if (r.seq == 0) r.seq = _nextSeq;   // pre-#440 (or out-of-range) row: order as loaded
+				if (r.seq >= _nextSeq) _nextSeq = r.seq + 1;
 				_devices[rec[0]] = std::move(r);
 			}
 		}
@@ -596,10 +764,11 @@ void Registrar::loadDevices()
 #endif
 }
 
-void Registrar::persistDevices()
+bool Registrar::persistDevices()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	// mac \t extension \t state(int). Bounded by POCKETDIAL_MAX_CLIENTS, so the blob
+	// mac \t extension \t state(int) \t flags(int) \t seq(u32); the last two are
+	// #440's (see loadDevices()). Bounded by POCKETDIAL_MAX_CLIENTS, so the blob
 	// is fixed-footprint. Write-through after each adoption / secure / forget. Caller
 	// holds _mutex; online state is NOT persisted (it is volatile registration state).
 	std::string blob;
@@ -607,14 +776,32 @@ void Registrar::persistDevices()
 	{
 		blob += mac; blob += '\t';
 		blob += rec.extension; blob += '\t';
-		blob += std::to_string(static_cast<int>(rec.state)); blob += '\n';
+		blob += std::to_string(static_cast<int>(rec.state)); blob += '\t';
+		blob += std::to_string((rec.locked ? 1 : 0) | (rec.shared ? 2 : 0)); blob += '\t';
+		blob += std::to_string(rec.seq); blob += '\n';
 	}
+	// Every NVS return is checked (Crew's #487 review): the lock and shared flags
+	// live only here, so a silently failed write would revert locks on the next
+	// reboot. Logged at error; callers carry on (the in-RAM table is still right).
 	nvs_handle_t h;
-	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
+	const esp_err_t openErr = nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h);
+	if (openErr != ESP_OK)
 	{
-		nvs_set_str(h, "devices", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
+		_env.log(std::string("Registrar: persisting the device table failed at open (") +
+			esp_err_to_name(openErr) + ")", true);
+		return false;
 	}
+	const esp_err_t setErr = nvs_set_str(h, "devices", blob.c_str());
+	const esp_err_t commitErr = (setErr == ESP_OK) ? nvs_commit(h) : setErr;
+	nvs_close(h);
+	if (setErr != ESP_OK || commitErr != ESP_OK)
+	{
+		_env.log(std::string("Registrar: persisting the device table FAILED (") +
+			esp_err_to_name(setErr != ESP_OK ? setErr : commitErr) + ")", true);
+		return false;
+	}
+	return true;
+#else
+	return true;
 #endif
 }

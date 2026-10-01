@@ -456,7 +456,8 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
             open mode any more: accepting any endpoint with no credential let anyone on the link register as any extension,
             and firmware that finds it stored switches the board to learn.
             <br><strong>Learn:</strong> trust-on-first-use. An unknown device is adopted unverified; its extension is locked to it
-            only once an admin secures it, while devices already secured are digest-enforced as usual. Your phones register with
+            when it registers a second time (never for a phone on another subnet, or one sharing a router's MAC), while
+            devices already secured are digest-enforced as usual. Your phones register with
             nothing to configure.
             <br><strong>Secure:</strong> every REGISTER is digest-challenged, so an extension can only be claimed by
             something that knows its secret. An extension with no secret stored yet cannot register at all &mdash; the
@@ -466,7 +467,7 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
 
         <div class="notice warn hidden" id="seed-reg-learn-warn">
           <p style="margin-bottom:0"><strong>Learn trusts first contact.</strong>
-            <span class="muted">Anything that can reach the PBX can claim any extension that has not been secured.
+            <span class="muted">Anything that can reach the PBX can claim any extension that is not yet locked or secured.
             Adopt your phones on a trusted or WPA2 link; for
             the strongest setting, secure them and switch to <em>Secure</em> from the dashboard.</span></p>
         </div>

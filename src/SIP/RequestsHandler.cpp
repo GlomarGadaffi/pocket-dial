@@ -1395,13 +1395,28 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	const std::string extStr(fromNumber);
 	{
 		std::string rejectReason;
-		const Registrar::AuthDecision decision = (_registrar.getMode() == RegistrarMode::Secure)
-			? _registrar.admitSecure(data, extStr, rejectReason)
-			: _registrar.admitLearn(data, extStr, rejectReason);
+		Registrar::AuthDecision decision = Registrar::AuthDecision::Reject;
+		if (_registrar.getMode() == RegistrarMode::Secure)
+		{
+			decision = _registrar.admitSecure(data, extStr, rejectReason);
+		}
+		else
+		{
+			// #487 review: Learn recognises a locked phone's own refresh on an ARP
+			// miss by the extension's live binding (same IP and port).
+			const auto now = std::chrono::steady_clock::now();
+			const auto bound = findClient(fromNumber);
+			const sockaddr_in& src = data->getSource();
+			const bool fromBinding = bound.has_value() && !bound.value()->isExpired(now) &&
+				bound.value()->getAddress().sin_addr.s_addr == src.sin_addr.s_addr &&
+				bound.value()->getAddress().sin_port == src.sin_port;
+			decision = _registrar.admitLearn(data, extStr, rejectReason, now, fromBinding);
+		}
 
 		if (decision == Registrar::AuthDecision::Challenge || decision == Registrar::AuthDecision::RetryLater)
 		{
-			// The registrar already enqueued the 401 (or #515's 503 + Retry-After).
+			// The registrar already enqueued the 401 (or a 503 + Retry-After: #515's
+			// adoption limit, #440's ARP miss on a locked extension).
 			return;
 		}
 		if (decision == Registrar::AuthDecision::Reject)

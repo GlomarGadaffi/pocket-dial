@@ -43,7 +43,7 @@ on a network you can reach:
 
 | Mode | What it does | When to use it |
 |------|--------------|----------------|
-| **Learn** (`1`, TOFU adoption) | Adopts unknown phones on first REGISTER **without verifying** (trust-on-first-use), records `{MAC, extension}`, and keeps them alive on their *current* credentials. Already-secured devices are still digest-challenged. A different MAC claiming a secured extension is rejected. | **The default and the floor.** Phones work with nothing to configure; an extension that is not secured can still be claimed by any device (#440), so adopt on a trusted link. |
+| **Learn** (`1`, TOFU adoption) | Adopts unknown phones on first REGISTER **without verifying** (trust-on-first-use), records `{MAC, extension}`, and keeps them alive on their *current* credentials. The phone's second REGISTER from the same MAC **locks** the extension to that MAC (#440). Already-secured devices are still digest-challenged. A different MAC claiming a locked or secured extension is rejected. | **The default and the floor.** Phones work with nothing to configure. Until its phone registers a second time, an extension can still be claimed by any device, and a phone on another subnet or sharing a NAT router's MAC is never locked (§5), so adopt on a trusted link. |
 | **Secure** (`2`, closed) | Every REGISTER is digest-challenged (RFC 2617, MD5). Only extensions whose secret you have set/rotated can register, and each is locked to its adopted MAC. | **Steady-state production.** The target you flip to once the fleet is adopted and secrets are issued. |
 
 There is no open mode (`0`) any more (#500): the API answers `400` for it, and a board or
@@ -62,14 +62,19 @@ Two consequences you must plan around:
 
 - **LAN-only.** ARP resolution works only for devices on the same L2 segment as
   pocket-dial. A phone reaching the registrar through a router (different subnet) has no
-  ARP entry here and **cannot be MAC-adopted**. Keep the phones and the box on one flat
+  ARP entry here and **cannot be MAC-adopted or locked**. Keep the phones and the box on one flat
   segment during cutover.
 - **First-packet timing caveat.** The ARP entry for a phone may not exist yet on its
   *very first* packet. pocket-dial resolves the MAC a beat later (after the initial
   exchange / keepalive `OPTIONS`) and retries; a phone can therefore show up momentarily as
   adopted-without-MAC and resolve on the next registration cycle. **Corrected: that state
-  cannot occur.** On an ARP miss `admitLearn()` accepts the REGISTER but adopts *nothing*
-  (`Registrar.cpp:145-153`), and the MAC is the device map's key (`Registrar.hpp:126`), so a
+  cannot occur.** On an ARP miss `admitLearn()` adopts *nothing*: it accepts the REGISTER,
+  unless the extension is already locked or secured. A locked extension is accepted only
+  from its registered IP and port (the owner's own refresh; ARP entries age out, and the
+  table holds 40 on the full builds, 10 on the 8-phone constrained one); any other source gets
+  `503` with `Retry-After: 5` (sending it makes the box ARP the phone, so the retry can
+  resolve). A secured one is digest-challenged (#507). The
+  MAC is the device map's key (`Registrar.hpp:126`), so a
   row with a blank MAC cannot exist; the phone is simply **absent** from the roster until a
   cycle where ARP resolves. Wait one registration interval and re-check; look for a missing
   row, not a blank one.
@@ -245,14 +250,29 @@ ASCII fallback:
 
 ## 5. The TOFU window discipline
 
-Learn is the default and the floor (the open registrar is retired, #500). Adopting a phone
-does not lock its extension; only a Secured extension is locked to its MAC
-(`Registrar.cpp:331`). Its exposure is every extension **not yet secured**: any device
-that REGISTERs it is adopted **without verification** (#440 tracks closing that).
-So:
+Learn is the default and the floor (the open registrar is retired, #500). Since #440 a
+phone's second REGISTER from the same MAC locks its extension to that MAC, and a different
+MAC is then refused (`403 Extension Locked To Another Device`). Only REGISTERs whose source
+resolves in the box's ARP table count, and the lock goes to the extension's **first
+claim**: while an earlier-adopted device's row still holds the extension, a later device
+stays plain TOFU however often it registers. Its exposure is every extension **not yet
+locked**: one whose phone has not yet registered a second time, one whose phone is on
+another subnet (no ARP entry, so never locked), one whose phone shares a NAT router's MAC
+with other phones (an unlocked MAC that registers a second extension is marked shared and
+never locks), and one whose first claim came from a device that has gone (forget its row
+to let the replacement lock). Any device that REGISTERs such an extension is adopted
+**without verification**. So:
 
 - **Adopt what you own, promptly.** Let every phone register once on a trusted link, check
-  the roster, and **forget** anything you don't recognise.
+  the roster, and **forget** anything you don't recognise. The first device to claim an
+  extension is the one that locks it, so a rogue that won the race keeps the extension
+  until you forget it.
+- **Firmware changes.** After an upgrade from pre-#440 firmware every adopted device loads
+  unlocked and locks on its phone's next resolved REGISTER. Where two rows already hold
+  one extension, the first claim is the row that loaded first, which is storage order, not
+  necessarily the older claim: check the roster for duplicate extensions right after the
+  upgrade. A downgrade to pre-#440 firmware keeps the devices but drops every lock (and
+  the shared marks) at its next write of the device table.
 - **Default on every board.** A fresh install, a factory reset and (since #500) any board
   that used to run the retired open mode all boot in Learn, because the alternatives are
   worse out of the box: open accepted anyone, and Secure refuses every phone until secrets
@@ -274,7 +294,7 @@ not buy you cryptographic device identity.
 
 ### A phone whose MAC changes
 The lock is keyed on MAC. If a handset's MAC changes (NIC swap, hardware replacement,
-some phones randomize, or a dock/adapter changes the L2 address), a secured extension will
+some phones randomize, or a dock/adapter changes the L2 address), a secured or locked extension will
 **reject** the new MAC (that is the lock doing its job). To recover:
 
 1. Confirm the change is legitimate (you actually replaced/moved hardware).
@@ -304,7 +324,7 @@ extension, so re-adoption is a deliberate admin action, by design.
 | Runtime registrar mode (Learn/Secure) | **M1 (now)** | NVS-backed; chosen at onboarding. Open retired (#500). |
 | Digest auth on REGISTER (challenge/verify) | **M1 (now)** | RFC 2617 (MD5). Secure mode also digest-challenges INVITE (drawbridge #125); binding a call to its caller's registered address is #497. |
 | Learn-mode TOFU adoption keyed by MAC | **M1 (now)** | Unknown MAC adopted; recorded `{MAC, ext}`. |
-| Extension ↔ MAC lock (anti-spoof) | **M1 (now)** | Different MAC for a secured ext → reject. |
+| Extension ↔ MAC lock (anti-spoof) | **M1 (now)** | Different MAC for a secured ext, or (#440) a Learn-locked one → reject. |
 | Set / rotate per-extension secret in config panel | **NOT BUILT** | Listed as "M1 (now)" in earlier revisions; there is no route, no UI field and no console for it; `SipSecretStore::setSecret()` has no production caller. This is the gap that blocks Steps 4-5. |
 | **Auto-reprovision** (push new creds to the phone) | **M2 (later)** | Zero-touch cutover via the provisioning HTTP path + `check-sync`. The route shipped as **`GET /config/<mac>.cfg`** (`HttpServer.cpp:461-469`); the `/provision/{mac}.cfg` form named in earlier revisions never existed; see [PROVISIONING.md](PROVISIONING.md). Note it still serves a blank password field, so it cannot complete a credential cutover on its own. |
 
@@ -320,6 +340,7 @@ to deliver the new secret.
 | Adopted but **MAC is blank** | First-packet ARP miss (§2) | Wait one registration interval; the MAC resolves on the next cycle. Don't secure it until the MAC reads. |
 | Phone drops to `401`/`403` after you secured it | New secret not yet on the handset, or typed wrong | Re-enter the secret on the phone; confirm it matches the one you set (rotate again if unsure). |
 | A **different MAC** is rejected for an extension | The extension↔MAC **lock** working as designed | If the MAC change is legitimate, **forget** then re-adopt (§6). If not, you have a rogue device. Investigate. |
+| `503` with `Retry-After: 5` on REGISTER in Learn | The extension is locked, this REGISTER's source did not resolve in ARP (an aged-out entry, or a sender that is not on this subnet), and it is not the extension's registered IP and port (a refresh from there is accepted) | Nothing for an on-link phone: the box ARPs it while answering and the retry succeeds. A locked phone that keeps getting it now sits behind a router (§2): forget its device. |
 | Unexpected device appears on the roster during the window | Someone associated and claimed an unclaimed extension (TOFU) | Forget it; tighten the link (WPA2), shorten the window, re-run (§5). |
 | New phone won't register after you flipped to **Secure** | Secure mode challenges everything; an un-adopted phone has no secret | Briefly return to **Learn** to adopt it (or set its secret + adopt MAC), then return to **Secure**. |
 | Phones work but you suspect eavesdropping during cutover | Open AP: TOFU window and creds observable on the link | Enable **WPA2 on the SoftAP** (the fix with the biggest payoff; [THREAT_MODEL.md](THREAT_MODEL.md) §6) and re-run the window. |
