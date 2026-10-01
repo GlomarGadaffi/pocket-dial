@@ -1485,3 +1485,163 @@ TEST(EmergencyRoute, AMultipartEmergencyInviteMissingItsClosingDelimiterIsUnwrap
 			"pdmiss7", "er-hm-sdp-first");
 	}
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #824: every number reader looks at the URI alone, and the 911 yield keys on
+// the To user, the number onInvite routes on
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(EmergencyRoute, ASipUriInADisplayNameOrAParameterIsNotAnEmergency)
+{
+	// extractNumber() took the first "sip:" anywhere in the To line, so a
+	// display name of "sip:911@lobby" sent a call to +1 555 123 0100 to the
+	// PSAP. Only the URI counts, and its own scheme must start it. Each of
+	// these is a call to tel:+15551230100, which reads as no user (400).
+	for (const char* to : {
+			"\"sip:911@lobby\" <tel:+15551230100>",
+			"\"sip:933@lobby\" <tel:+15551230100>",
+			"<tel:+15551230100>;x=sip:911@h",
+			"<tel:+15551230100;x=sip:911@h>",
+			// A display name whose quote never closes has no URI to read (RFC
+			// 3261 s25.1). It is a 400, not a guess at what was meant.
+			"\"Lobby <sip:911@x>"})
+	{
+		SCOPED_TRACE(to);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		auto invite = makeInviteWithToValue("tel:+15551230100", to, "application/sdp", "", kSdpOffer, "er-824-sip");
+		EXPECT_EQ(invite->getToNumber(), "");
+		b.handler->handle(invite);
+
+		EXPECT_EQ(b.count("SIP/2.0 400", kHandsetIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << "nothing may reach the PSAP:\n" << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 180"), 0u) << b.dump();
+	}
+
+	// A display name naming 911 over an extension's URI is a call to that
+	// extension, rung as one.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->handle(makeRegister("102", "192.168.79.12"));
+	b.sent.clear();
+	auto invite = makeInviteWithToValue("sip:102@server", "\"sip:911@lobby\" <sip:102@server>",
+		"application/sdp", "", kSdpOffer, "er-824-ext");
+	EXPECT_EQ(invite->getToNumber(), "102");
+	b.handler->handle(invite);
+	EXPECT_EQ(b.count("INVITE sip:102@", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+}
+
+TEST(EmergencyRoute, AnEmergencyUriIsRoutedWhateverItsDisplayNameSays)
+{
+	// The other direction, and the worse one: a "sip:" in the display name of a
+	// real emergency call was read in place of its URI, so the 911 went to 102
+	// or, with no '@' after it, read as no user and drew a 400.
+	struct Shape { const char* ruri; const char* to; const char* user; const char* bare; };
+	for (const Shape s : {
+			Shape{"sip:911@server", "\"sip:102@lobby\" <sip:911@server>", "911", "911"},
+			Shape{"tel:911", "\"sip:front desk\" <tel:911>", "911", "911"},
+			Shape{"tel:911", "\"sip:x@y\" <tel:911>", "911", "911"},
+			Shape{"urn:service:sos", "\"sip:102@lobby\" <urn:service:sos>", "911", "911"},
+			// Positive controls: these routed before #824 and still do.
+			Shape{"sip:911@x", "\"Front Desk\" <sip:911@x>", "911", "911"},
+			Shape{"sip:911@x", "sip:911@x", "911", "911"},
+			Shape{"tel:911", "<TEL:911>", "911", "911"},
+			Shape{"tel:9911", "<tel:9911>", "9911", "911"},
+			Shape{"tel:9933", "<tel:9933>", "9933", "933"}})
+	{
+		SCOPED_TRACE(s.to);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		auto invite = makeInviteWithToValue(s.ruri, s.to, "application/sdp", "", kSdpOffer, "er-824-real");
+		EXPECT_EQ(invite->getToNumber(), s.user);
+		b.handler->handle(invite);
+
+		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << "the emergency call was refused:\n" << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:" + std::string(s.bare) + "@" + kSbcIp, kSbcIp), 1u)
+			<< "the carrier gets exactly one INVITE for the bare number:\n" << b.dump();
+	}
+}
+
+TEST(EmergencyRoute, AnSosUrnInADisplayNameOrAParameterIsNotAnEmergency)
+{
+	// #199's urn:service:sos reader scanned the whole To line, so a display name
+	// or a parameter naming the service sent an ordinary call to the PSAP. Each
+	// of these is a call to tel:+15551230100 (400).
+	for (const char* to : {
+			"\"urn:service:sos drill\" <tel:+15551230100>",
+			"<tel:+15551230100>;x=urn:service:sos",
+			"<tel:+15551230100;x=urn:service:sos>"})
+	{
+		SCOPED_TRACE(to);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		auto invite = makeInviteWithToValue("tel:+15551230100", to, "application/sdp", "", kSdpOffer, "er-824-urn");
+		EXPECT_EQ(invite->getToNumber(), "");
+		b.handler->handle(invite);
+
+		EXPECT_EQ(b.count("SIP/2.0 400", kHandsetIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << "nothing may reach the PSAP:\n" << b.dump();
+	}
+
+	// Positive controls: the service URN itself, however it is written.
+	for (const char* to : {"<urn:service:sos>", "urn:service:sos", "\"Help\" <URN:Service:SOS.fire>",
+	                       "<urn:service:sos;x=1>"})
+	{
+		SCOPED_TRACE(to);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		auto invite = makeInviteWithToValue("urn:service:sos", to, "application/sdp", "", kSdpOffer, "er-824-sos");
+		EXPECT_EQ(invite->getToNumber(), "911");
+		EXPECT_EQ(invite->getRequestUriUser(), "911");
+		b.handler->handle(invite);
+
+		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+	}
+}
+
+TEST(EmergencyRoute, A911RequestUriOverAnExtensionToGetsNoEmergencyYield)
+{
+	// onInvite routes on the To user, but isEmergencyRequest() also took a 911
+	// Request-URI. So the header and SDP gates yielded for a call they then
+	// relayed to 102. Each shape is refused exactly as it is to 102 itself.
+	struct Shape { const char* what; std::string contentType; std::string extra; std::string body; const char* status; };
+	const std::string twoAudio = kSdpOffer + "m=audio 40002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	for (const Shape& s : {
+			// No "application/sdp" anywhere, so the SDP gate never ran, and the
+			// header gate's 415 yielded: the body passed both gates.
+			Shape{"multipart body with no SDP part", "multipart/mixed; boundary=pdloc9", "",
+			      "--pdloc9\r\n" + kLocationPart + "--pdloc9--\r\n", "SIP/2.0 415"},
+			Shape{"two active audio streams", "application/sdp", "", twoAudio, "SIP/2.0 488"},
+			Shape{"an option tag this PBX does not support", "application/sdp", "Require: 100rel\r\n",
+			      kSdpOffer, "SIP/2.0 420"}})
+	{
+		SCOPED_TRACE(s.what);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->handle(makeRegister("102", "192.168.79.12"));
+		b.sent.clear();
+
+		auto invite = makeShapedInvite("sip:911@server", "sip:102@server", s.contentType, s.extra, s.body,
+			"er-824-ruri");
+		EXPECT_FALSE(invite->isEmergencyRequest()) << "a call to 102 is not an emergency request";
+		b.handler->handle(invite);
+
+		EXPECT_EQ(b.count(s.status, kHandsetIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("INVITE", "192.168.79.12"), 0u) << "102 must not be rung:\n" << b.dump();
+		EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+		EXPECT_FALSE(b.handler->getSession("Call-ID: er-824-ruri").has_value());
+	}
+
+	// Control: a To of 911 is the call onInvite routes to the PSAP, so it keeps
+	// the yield whatever the Request-URI says.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	auto invite = makeShapedInvite("sip:102@server", "sip:911@server", "application/sdp", "Require: 100rel\r\n",
+		kSdpOffer, "er-824-to911");
+	EXPECT_TRUE(invite->isEmergencyRequest());
+	b.handler->handle(invite);
+	EXPECT_EQ(b.count("SIP/2.0 420"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+}
