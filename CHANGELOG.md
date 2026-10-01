@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (on main since v1.5.0-beta.2) — 2026-09-30
+## v1.5.0-rc.1 — 2026-10-02
 
 One line per change merged to `main` after beta.2, taken from its squash title.
 `(#PR; #issue)`: the first number is the pull request, the rest are the issues it
@@ -304,6 +304,18 @@ bench-verified here.
 - Nightly: fail-closed network probes in the runner isolation step (#784; #493).
 - `SIP_OUTSIDE_LINE=anchor|trunk` selects the constrained build's one outside line (#785; part of #731).
 - Conformance test: every message the PBX sends passes pjsip's parser and an RFC 3261 checklist (#758).
+
+### Known gaps
+
+Open at this cut. None of the changes above is claimed bench-verified.
+
+- Emergency routing: the #759 header gate misses trunk-dialog Call-IDs and PSAP callbacks (#818); `ROUTED` is reported before a later `makeCall` failure, and a 911 slot-wait timeout is not refused (#821); a display name or URI parameter can still route a call to the PSAP on the `sip:` and `urn:service:sos` paths (#824).
+- An inbound-anchor handset BYE goes to 0.0.0.0 and the carrier leg lingers until Timer F (#819).
+- Learn lock follow-ups: an unlocked row can be rewritten by a forged REGISTER, plus an ambiguity guard and test gaps (#820).
+- SIP trunk is experimental: after a good digest REGISTER some carriers never answer the INVITE (#618), and inbound carrier calls are not built (#398).
+- 3CX anchor: the media GET stream is unproven on a live tenant (#518).
+- The 4 MB constrained build keeps about 9% of its app slot free.
+- Hardware evidence is one handset model, one board and one carrier; on-device RTP has no automated coverage.
 
 ## v1.5.0-beta.2 — 2026-09-14
 
