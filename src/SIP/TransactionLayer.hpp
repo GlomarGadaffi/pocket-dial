@@ -129,6 +129,25 @@ public:
 	size_t activeClientTransactions() const;
 	size_t activeServerTransactions() const;
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test-only (#726): move every armed client give-up timer (Timer B/F) into
+	// the past, so the next sweep() fires it without a 32 s wait. Inline and
+	// called by nothing in firmware, so it is never emitted into the image (see
+	// RequestsHandler.hpp's note on test accessors).
+	void expireClientTimeoutsForTest()
+	{
+		const auto past = std::chrono::steady_clock::now() - std::chrono::hours(1);
+		for (auto& tx : _clientPool)
+		{
+			if (tx.type != SipTransaction::Type::None &&
+			    tx.transactionTimeout != std::chrono::steady_clock::time_point{})
+			{
+				tx.transactionTimeout = past;
+			}
+		}
+	}
+#endif
+
 private:
 	struct SipTransaction
 	{

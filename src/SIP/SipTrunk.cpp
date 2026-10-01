@@ -1085,9 +1085,10 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 
 		// #712 (desmo, 2026-09-29): a 911/933 the carrier is working on (any 1xx
 		// seen, so Proceeding) gets no PBX-side no-answer bound; a PSAP may queue
-		// it past 60 s. A 911 that never drew a provisional (still Trying) keeps
-		// this deadline: Timer B only logs here, so this is what ends it.
-		// routeEmergencyCall() always hands the trunk the bare number (pstnUri).
+		// it past 60 s. A 911 that never drew a provisional (still Trying) is
+		// ended by Timer B at 32 s (handleInviteTimeout(), #726); this deadline
+		// is its backstop. routeEmergencyCall() always hands the trunk the bare
+		// number (pstnUri).
 		if (d.state == State::Proceeding &&
 		    (d.destE164 == pbx::kEmergencyNumber || d.destE164 == pbx::kEmergencyTestNumber))
 		{
@@ -1096,25 +1097,42 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 
 		_env.log("Trunk: dialog timed out in state "
 			+ std::to_string(static_cast<int>(d.state)) + " (" + d.destE164 + ")", true);
-		_env.freeTransactionsForCallId(d.callID);
-
-		// A dialog that reached Terminating is our own BYE going unanswered.
-		// The listener tore the handset down when it asked for that BYE, so
-		// reclaiming the slot is all that is left -- notifying again would be a
-		// second teardown of a leg that is already gone.
-		const bool notify = (d.state != State::Terminating && d.state != State::Cancelling &&
-		                     !d.cancelPending);
-
-		// Same move-then-free-then-fire order as the failure path above: an
-		// INVITE that never got a final response must release the handset, and
-		// the listener may immediately reuse this slot.
-		const Dialog finished = std::move(d);
-		d = Dialog{};
-		// 408, not 0: a request that got no final response inside its deadline
-		// is a timeout in the RFC 3261 sense, and giving the listener a real
-		// status means its failure mapping needs no special case for "0".
-		if (notify && _listener) _listener->onTrunkFailed(eventFor(finished), 408);
+		releaseAsTimeout(d);
 	}
+}
+
+void SipTrunk::releaseAsTimeout(Dialog& d)
+{
+	_env.freeTransactionsForCallId(d.callID);
+
+	// A dialog that reached Terminating is our own BYE going unanswered.
+	// The listener tore the handset down when it asked for that BYE, so
+	// reclaiming the slot is all that is left -- notifying again would be a
+	// second teardown of a leg that is already gone. The same holds for a
+	// dialog hung up in Trying and held for its first provisional (#794),
+	// whether Timer B or the held slot's own deadline gets here first.
+	const bool notify = (d.state != State::Terminating && d.state != State::Cancelling &&
+	                     !d.cancelPending);
+
+	// Same move-then-free-then-fire order as handleResponse()'s failure path:
+	// an INVITE that never got a final response must release the handset, and
+	// the listener may immediately reuse this slot.
+	const Dialog finished = std::move(d);
+	d = Dialog{};
+	// 408, not 0: a request that got no final response inside its deadline
+	// is a timeout in the RFC 3261 sense, and giving the listener a real
+	// status means its failure mapping needs no special case for "0".
+	if (notify && _listener) _listener->onTrunkFailed(eventFor(finished), 408);
+}
+
+bool SipTrunk::handleInviteTimeout(std::string_view trunkCallID)
+{
+	Dialog* d = findMutableByTrunkCallID(trunkCallID);
+	if (!d || d->state != State::Trying) return false;
+	// No number in this line: the destination can be a dialled PSTN number.
+	_env.log("Trunk: INVITE drew no response inside Timer B -- dialog released", true);
+	releaseAsTimeout(*d);
+	return true;
 }
 
 // Issue #399: answer a 401/407 to our INVITE, once. RFC 3261 s22.2: ACK the

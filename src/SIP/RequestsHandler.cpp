@@ -6338,7 +6338,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	// Via and branch are the PBX's (§8.1.1.7) and whose Request-URI is the far
 	// phone's registered Contact (#798, §12.2.1.1). The far phone's answer ends the
 	// session (onOk, onFinalFailure); one that never comes ends it at Timer F
-	// (onByeTimedOut).
+	// (onClientTransactionTimeout).
 	if (session.has_value())
 	{
 		const auto src  = session.value()->getSrc();
@@ -12190,4 +12190,39 @@ void RequestsHandler::onTrunkRemoteBye(const SipTrunk::TrunkEvent& ev)
 		if (bye) _outbox.emplace_back(src->getAddress(), std::move(bye));
 	}
 	endCall(handsetCallID, from, "", "carrier hung up");
+}
+
+// #726: RFC 3261 §17.1.1.2 / §17.1.2.2 -- a client transaction this PBX opened
+// gave up, and §8.1.3.1 has the TU treat that as a 408. Called from
+// TransactionLayer::sweep() inside tick(), with _mutex held.
+void RequestsHandler::onClientTransactionTimeout(std::string_view callId, std::string_view cseqMethod)
+{
+	// Our INVITE to the carrier drew nothing at all in 64*T1: SipTrunk ends the
+	// dialog through the same 408 path its 60 s deadline uses (onTrunkFailed
+	// refuses the handset and releases the relay), 28 s sooner than before.
+	if (cseqMethod == "INVITE" && _sipTrunk.handleInviteTimeout(callId)) return;
+
+	// A BYE this PBX originated drew no final response (#808), so nothing will
+	// ever tell the session its far leg is gone. Only a session waiting on this
+	// BYE is ended: a server BYE on a dialog that is being torn down anyway, or
+	// to a transferor whose bridge lives on, ends nothing. The layer has logged
+	// the Timer F already.
+	if (cseqMethod == "BYE")
+	{
+		if (auto s = getSession(callId); s.has_value() && s.value()->getState() == Session::State::Bye)
+			endSession(callId, "BYE unanswered (Timer F)");
+		return;
+	}
+
+	// Everything else keeps its own, shorter bound and is only logged here. A
+	// forked INVITE (ring group, page, hunt, inbound anchor) shares the caller's
+	// Call-ID across every member, so a dead member's Timer B cannot be told
+	// apart from the winner's dialog by Call-ID, and the fork's 20 s ring timer
+	// reaps the session first anyway; beep, park and transfer legs are timed
+	// out by their own machines; a CANCEL (Timer F) belongs to a session that
+	// is already gone; and a plain extension-to-extension INVITE is relayed as
+	// a pass-through, which never opens a client transaction.
+	queueLog("[tx] " + std::string(cseqMethod) + " transaction timed out for "
+		+ std::string(callId) + (getSession(callId).has_value()
+			? " -- session left to its own timers" : " -- no session"), true);
 }

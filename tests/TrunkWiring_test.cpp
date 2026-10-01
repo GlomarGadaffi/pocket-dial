@@ -625,8 +625,9 @@ TEST(TrunkWiring, ARingingEmergencyCallIsNeverTimedOutButASilentOneStillIs)
 	// #712 (desmo): a 911/933 the carrier is working on (a 100 or 180 seen,
 	// Proceeding) gets no PBX-side no-answer bound; a PSAP may queue it past
 	// 60 s. One that never drew any provisional (Trying) keeps the 60 s
-	// deadline, because Timer B only logs: that half is the control, proving
-	// the sweep did run on this tick.
+	// deadline as a backstop (Timer B ends it at 32 s since #726; only the
+	// trunk deadlines are aged here, so it is the sweep that fires): that half
+	// is the control, proving the sweep did run on this tick.
 	Bench b;
 	b.handler.setTrunkConfig(trunkConfig());
 	b.handler.handle(makeTrunkDial("1001", "911", "call-712-ring"));
@@ -1538,4 +1539,57 @@ TEST(TrunkWiring, AHandsetCancelBeforeAnyCarrierProvisionalCancelsTheCarrierLegO
 
 	EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 1u);
 	EXPECT_EQ(b.sent.size(), 1u) << "no stray 404 or second 487 at the handset";
+}
+
+// ── Transaction timeout (#726) ──────────────────────────────────────────────
+
+TEST(TrunkWiring, TimerBOnTheCarrierInviteRefusesTheHandsetBeforeTheSixtySecondSweep)
+{
+	// #726: RFC 3261 §17.1.1.2. A carrier that never answers our INVITE at all
+	// (no 100, nothing, through seven retransmits) is a dead trunk. The
+	// transaction layer gives up at 64*T1 = 32 s and must tell the TU, which
+	// ends the dialog the way its 60 s deadline would (408, so 503 to the
+	// handset, relay released) -- 28 s sooner, and without leaning on the
+	// sweep. Only the transaction timers are aged here; the trunk's own
+	// deadline is untouched, so whatever happens is Timer B's doing.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-726"));
+	ASSERT_FALSE(b.firstWith("INVITE sip:+1").empty()) << "precondition: the INVITE went to the carrier";
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	b.sent.clear();
+
+	b.handler.expireTransactionTimersForTest();
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+
+	EXPECT_FALSE(b.firstWithTo("503", kHandsetIp).empty())
+		<< "the handset gets a final (408 maps to 503, as the sweep's timeout does)";
+	EXPECT_FALSE(b.handler.getSession("Call-ID: call-726").has_value())
+		<< "the handset session is ended";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and the relay pair released";
+}
+
+TEST(TrunkWiring, ACarrierProvisionalKeepsTheCallPastTimerB)
+{
+	// Control for the test above: a provisional moves the INVITE transaction to
+	// Proceeding, where §17.1.1.2 has no Timer B. The call must survive the
+	// same aged timers -- a PSTN leg routinely rings past 32 s, and a ringing
+	// 911 has no PBX-side bound at all (#712).
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-726-ctl"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	ASSERT_FALSE(carrier.callID.empty());
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 180 Ringing", /*withSdp=*/false), addrFor(kSbcIp)));
+	b.sent.clear();
+
+	b.handler.expireTransactionTimersForTest();
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+
+	EXPECT_TRUE(b.firstWithTo("503", kHandsetIp).empty()) << "nothing refused the handset";
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-726-ctl").has_value()) << "the call is still up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
 }
