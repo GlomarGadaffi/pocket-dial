@@ -181,19 +181,20 @@ PnpResponder::Reply PnpResponder::answer(const pnp::Subscribe& sub, const sockad
 	const std::string_view branch = hexToken("z9hG4bKpnp", h, branchBuf);
 	const std::string_view self(_ipText.data(), std::strlen(_ipText.data()));
 
+	// One buffer: the 200 at the front, the NOTIFY right behind it.
 	Reply r;
-	const std::size_t okLen = pnp::writeOk(sub, tag, self, _port, _okBuf.data(), _okBuf.size());
+	const std::size_t okLen = pnp::writeOk(sub, tag, self, _port, _tx.data(), _tx.size());
 	if (okLen == 0) return r;
-	r.ok = std::string_view(_okBuf.data(), okLen);
+	r.ok = std::string_view(_tx.data(), okLen);
 
 	std::lock_guard<std::mutex> lock(_mu);
 	if (dev.notified && now - dev.lastNotify < kNotifyCooldownSeconds) return r;
 	const std::size_t urlLen = pnp::writeUrl(sub.id, self, urlBuf.data(), urlBuf.size());
 	const std::string_view dest = dotted(src.sin_addr.s_addr, destBuf);
 	const std::size_t nLen = (urlLen == 0) ? 0 : pnp::writeNotify(sub, tag, branch, self, _port, dest,
-		ntohs(src.sin_port), std::string_view(urlBuf.data(), urlLen), _notifyBuf.data(), _notifyBuf.size());
+		ntohs(src.sin_port), std::string_view(urlBuf.data(), urlLen), _tx.data() + okLen, _tx.size() - okLen);
 	if (nLen == 0) return r;
-	r.notify = std::string_view(_notifyBuf.data(), nLen);
+	r.notify = std::string_view(_tx.data() + okLen, nLen);
 	dev.notified = true;
 	dev.lastNotify = now;
 	return r;
@@ -209,6 +210,9 @@ PnpResponder::Reply PnpResponder::onDatagram(std::string_view raw, const sockadd
 	if (!pnp::parseSubscribe(raw, sub)) return {};
 	Device& dev = record(sub.id, src.sin_addr.s_addr, nowSeconds);
 	if (m != Mode::Provision) return {};
+	// A vendor this board has no PnP URL shape for gets silence, not a URL
+	// that 404s: the phone would store it and stop looking for another server.
+	if (pnp::vendorOf(sub.id) == pnp::Vendor::Generic) return {};
 	if (!canServe(macView(sub.id))) return {};
 	if (!takeToken(nowSeconds)) return {};
 	return answer(sub, src, dev, nowSeconds);

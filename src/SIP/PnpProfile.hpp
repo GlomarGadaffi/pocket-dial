@@ -32,6 +32,7 @@ namespace pnp
 	constexpr std::size_t kMaxVias = 4;        // Via header lines echoed in the 200
 	constexpr std::size_t kFieldCap = 24;      // vendor / model / version, incl. NUL
 	constexpr std::size_t kMacCap = 13;        // 12 lowercase hex + NUL
+	constexpr uint32_t kMaxExpires = 30;       // seconds granted in the 200 (RFC 6665: never more than asked)
 
 	enum class Vendor : uint8_t { Generic, Snom, Yealink };
 
@@ -54,10 +55,13 @@ namespace pnp
 		std::string_view to;
 		std::string_view callId;
 		std::string_view cseq;
+		uint32_t expires = kMaxExpires;   // the request's Expires, if it sent one
 		DeviceId id;
 	};
 
-	// True iff `raw` is an initial (no To tag) SUBSCRIBE for
+	// True iff `raw` is a complete (headers end with a blank line, so a
+	// datagram cut short by the receive buffer is refused) initial (no To tag)
+	// SUBSCRIBE for
 	// Event: ua-profile;profile-type="device" whose From (or To) user is a MAC
 	// ("MAC%3a<12 hex>" or "MAC:<12 hex>", any case). Fills `out` only then.
 	bool parseSubscribe(std::string_view raw, Subscribe& out);

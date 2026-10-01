@@ -247,7 +247,7 @@ void SipServer::pollPnp()
 	}
 	const uint32_t now = uptimeSeconds();
 	if (_pnpSock < 0 && !openPnpSocket(now)) return;
-	auto canServe = [this](std::string_view mac) { return _handler.isAdoptedMac(mac); };
+	auto canServe = [this](std::string_view mac) { return _handler.canProvisionMac(mac); };
 	for (int i = 0; i < kPnpDrainPerPoll; ++i)
 	{
 		sockaddr_in src{};

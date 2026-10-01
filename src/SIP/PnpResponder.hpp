@@ -13,9 +13,10 @@
 //     wins on a PnP LAN, so an always-on answer would capture phones meant for
 //     another PBX on the same network; the admin turns this on.
 //   - Mode Discover: phones are recorded in a fixed table, never answered.
-//   - Mode Provision: also answered, but only when `canServe(mac)` says this
-//     board has a config for that MAC. Otherwise silence, so another server
-//     can still answer.
+//   - Mode Provision: also answered, but only a snom or Yealink (the vendors
+//     this board has a URL shape for) for which `canServe(mac)` says this
+//     board has a config. Otherwise silence, so another server can still
+//     answer: a phone handed a URL that 404s stores it anyway.
 //   - Only sources on the board's own subnet are recorded or answered.
 //   - Replies spend a token (kBurst, one back every kRefillSeconds); a phone
 //     gets at most one NOTIFY per kNotifyCooldownSeconds. A retransmitted
@@ -50,7 +51,7 @@ public:
 	enum class Mode : uint8_t { Off = 0, Discover = 1, Provision = 2 };
 
 	static constexpr std::size_t kMaxDevices = 16;
-	static constexpr std::size_t kTxCap = 1400;           // one 200 or NOTIFY
+	static constexpr std::size_t kTxCap = 1536;           // the 200 and the NOTIFY together
 	static constexpr uint8_t kBurst = 4;
 	static constexpr uint32_t kRefillSeconds = 2;
 	static constexpr uint32_t kNotifyCooldownSeconds = 30;
@@ -115,8 +116,7 @@ private:
 	uint8_t _tokens = kBurst;
 	uint32_t _refillAt = 0;
 
-	std::array<char, kTxCap> _okBuf{};
-	std::array<char, kTxCap> _notifyBuf{};
+	std::array<char, kTxCap> _tx{};   // the 200, then the NOTIFY behind it
 };
 
 #endif

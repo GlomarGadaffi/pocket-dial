@@ -8744,10 +8744,12 @@ std::optional<RequestsHandler::ProvisioningInfo> RequestsHandler::findProvisioni
 	return std::nullopt;
 }
 
-bool RequestsHandler::isAdoptedMac(std::string_view mac)
+bool RequestsHandler::canProvisionMac(std::string_view mac)
 {
 	std::lock_guard<std::mutex> lock(_mutex);
-	return _registrar.hasDevice(mac);
+	std::string_view ext;
+	if (!_registrar.extensionOf(mac, ext)) return false;
+	return isValidAor(ext) && !pbx::isReservedOrPstnAor(ext);
 }
 
 void RequestsHandler::setDnd(const std::string& extension, bool on)
