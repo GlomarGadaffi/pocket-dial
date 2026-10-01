@@ -86,6 +86,7 @@ void TelephonyAnchorClient::setRewarmIntervalSec(uint32_t)
 #include "TelephonyAnchorLogic.hpp"   // host-tested entity-path tokenizer + URL builders (issue #49)
 #include "PsramTask.hpp"            // #100: PSRAM-backed task stacks (off the scarce internal-RAM heap)
 #include "RtpTaskSlots.hpp"         // #479: pd::rtpslots::kAnchorRxStackBytes (counted in the 72 KB budget)
+#include "EmergencyCall.hpp"        // #743: an emergency makeCall() waits out a tearing-down slot
 
 static const char* TAG = "TelephonyAnchor";
 
@@ -526,7 +527,21 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			// Alloc THIS call's slot (startRxIfNeeded find-or-claims it for ownLeg) + prime the GET
 			// loop, then mark the slot outbound-in-flight so the WS upsets for ownLeg classify as
 			// ours and the tick() watchdog can detect a makecall that never produced media.
-			if (startRxIfNeeded(ownLeg))
+			bool primed = startRxIfNeeded(ownLeg);
+			// #743: a 911/933 waits out a slot that is still tearing down (RxRestart.hpp). Off
+			// _mutex: startRxIfNeeded() takes it, and so does the teardown that frees the slot.
+			// _outboundPending is still held, so an upsert for this leg meanwhile is ignored,
+			// not read as a new inbound call; the re-check below replaces it.
+			const bool emergency = pbx::classifyEmergencyDial(destination).isEmergency;
+			const int64_t waitStartUs = esp_timer_get_time();
+			int64_t waitedUs = 0;
+			while (pd::emergencySlotRetryContinues(emergency, primed, waitedUs))
+			{
+				vTaskDelay(pdMS_TO_TICKS(pd::kEmergencySlotPollMs));
+				primed = startRxIfNeeded(ownLeg);
+				waitedUs = esp_timer_get_time() - waitStartUs;
+			}
+			if (primed)
 			{
 				std::lock_guard<std::mutex> lock(_mutex);
 				CallSlot* slot = slotForLocked(ownLeg);
@@ -541,6 +556,44 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			else
 			{
 				ESP_LOGW(TAG, "makeCall: all %d call slots busy — no slot for %s", POCKETDIAL_MAX_ANCHOR_CALLS, ownLeg.c_str());
+			}
+			if (primed && waitedUs > 0)
+			{
+				// #743: an upsert for this leg that landed during the wait was ignored, and
+				// Telephony does not repeat a Connected one. Re-check the leg once, with the
+				// same single-flight claim handleWsEvent() makes.
+				bool claimed = false;
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					if (CallSlot* s = slotForLocked(ownLeg))
+					{
+						if (s->upsetInFlight.exchange(true, std::memory_order_acq_rel))
+							s->upsetPending.store(true, std::memory_order_release);
+						else
+							claimed = true;
+					}
+				}
+				if (claimed)
+				{
+					// placement new(nothrow) returns an initialized pointer; cppcheck misparses it.
+					// cppcheck-suppress legacyUninitvar
+					auto* item = new (std::nothrow) WsWorkItem{};
+					if (item)
+					{
+						item->kind       = WsWork::Upset;
+						item->controlLeg = ownLeg;
+						item->partId     = ownLeg;
+					}
+					if (!enqueueWsWork(item))   // frees the item when it is not queued
+					{
+						std::lock_guard<std::mutex> lock(_mutex);
+						if (CallSlot* s = slotForLocked(ownLeg))
+						{
+							s->upsetInFlight.store(false, std::memory_order_release);
+							s->upsetPending.store(false, std::memory_order_release);
+						}
+					}
+				}
 			}
 			ESP_LOGI(TAG, "Successfully initiated call to %s (own leg %s)", destination.c_str(), ownLeg.c_str());
 		}
