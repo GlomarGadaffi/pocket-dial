@@ -8744,6 +8744,12 @@ std::optional<RequestsHandler::ProvisioningInfo> RequestsHandler::findProvisioni
 	return std::nullopt;
 }
 
+bool RequestsHandler::isAdoptedMac(std::string_view mac)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _registrar.hasDevice(mac);
+}
+
 void RequestsHandler::setDnd(const std::string& extension, bool on)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;

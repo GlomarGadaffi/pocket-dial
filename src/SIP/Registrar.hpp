@@ -160,6 +160,9 @@ public:
 	// True if any adopted device holding `ext` has been promoted to Secured
 	// (issue #505: Learn mode then authenticates that extension's calls too).
 	bool isExtensionSecured(std::string_view ext) const;   // no allocation on the INVITE path
+	// True if `mac` (12 lowercase hex) is an adopted device. No allocation:
+	// the PnP responder asks this per discovery datagram (#826).
+	bool hasDevice(std::string_view mac) const;
 
 	// Test-only seam: directly adopt a device without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, DeviceState state = DeviceState::Learned,
