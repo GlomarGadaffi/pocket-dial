@@ -29,7 +29,7 @@ class AnchorWedgeWiringTest(unittest.TestCase):
 
     def test_tick_uses_the_predicate(self):
         tick = body_of(self.src, "void TelephonyAnchorClient::tick(")
-        self.assertIn("tel_reconcile", tick, "positive control: tick() spawns the reconcile worker")
+        self.assertIn("kMaintReconcile", tick, "positive control: tick() wakes the reconcile job")
         self.assertIn("pd::anchorSlotLooksWedged(", tick)
         self.assertIn("ringing.load(", tick)
         self.assertNotRegex(tick, r"nowUs\s*-\s*s\.outboundActiveSetUs\s*>=",
