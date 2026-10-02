@@ -552,6 +552,8 @@ add_executable(sip_parser_tests
     ProvisioningConfig_test.cpp
     # Issue #826: SIP PnP discovery (ua-profile SUBSCRIBE -> 200 + NOTIFY).
     PnpProfile_test.cpp
+    # Issue #826 part B: zero-touch extension assignment.
+    ZeroTouchAssign_test.cpp
     # Part of #199: every message the PBX sends, recorded for tests/conformance.
     EmittedConformance_test.cpp
     # SIP digest-auth primitives + per-extension HA1 secret store. Both are
