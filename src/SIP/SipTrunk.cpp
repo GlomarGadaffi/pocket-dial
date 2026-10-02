@@ -316,24 +316,30 @@ namespace
 		}
 		return out;
 	}
-
-	const char* reasonPhrase(int status)
-	{
-		switch (status)
-		{
-			case 100: return "Trying";
-			case 180: return "Ringing";
-			case 183: return "Session Progress";
-			case 200: return "OK";
-			case 480: return "Temporarily Unavailable";
-			case 486: return "Busy Here";
-			case 487: return "Request Terminated";
-			case 488: return "Not Acceptable Here";
-			default:  return status < 300 ? "OK" : "Call Failed";
-		}
-	}
 #endif
 }
+
+#if POCKETDIAL_TRUNK_INBOUND
+const char* SipTrunk::reasonPhrase(int status)
+{
+	switch (status)
+	{
+		case 100: return "Trying";
+		case 180: return "Ringing";
+		case 183: return "Session Progress";
+		case 200: return "OK";
+		case 400: return "Bad Request";
+		case 404: return "Not Found";
+		case 480: return "Temporarily Unavailable";
+		case 482: return "Loop Detected";
+		case 486: return "Busy Here";
+		case 487: return "Request Terminated";
+		case 488: return "Not Acceptable Here";
+		case 503: return "Service Unavailable";
+		default:  return status < 300 ? "OK" : "Call Failed";
+	}
+}
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Pure builders
@@ -758,6 +764,18 @@ bool SipTrunk::respondTo(Dialog& d, int status, std::string_view sdp)
 	_env.enqueue(d.peer, std::move(msg));
 	if (status >= 200 && status < 300) d.state = State::Confirmed;
 	else if (status > 100 && status < 200) d.state = State::Proceeding;
+	return true;
+}
+
+bool SipTrunk::handleAck(const SipMessage& ack)
+{
+	Dialog* d = findMutableByTrunkCallID(ack.getCallID());
+	if (!d || d->role != Role::Inbound || d->state != State::Confirmed ||
+		siphdr::tagOf(ack.getTo()) != d->toTag)
+	{
+		return false;
+	}
+	d->ackSeen = true;
 	return true;
 }
 #endif

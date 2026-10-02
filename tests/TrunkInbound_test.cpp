@@ -4,8 +4,8 @@
 // Before this, every carrier call was answered 403 by onInvite's findClient(From)
 // check, because a carrier's From names a PSTN caller, never one of our phones.
 // Part B recognises the carrier by its source address alone (#356), looks the DID
-// up, and gives a final answer the carrier can ACK. The fork to the handset is
-// part C, so even a routable call is answered 480 for now.
+// up, and gives a final answer the carrier can ACK. Part C forks a routable call
+// to the DID's extension and answers the carrier when the handset does.
 //
 // Extensions here are 2xxx on purpose. Numbers are the fictional 555-01xx range;
 // addresses are RFC 5737 TEST-NETs. The 911/933 INVITEs are synthetic host
@@ -92,9 +92,11 @@ namespace
 	// is the trunk's own; an IP-authenticated trunk puts the DID there instead.
 	std::shared_ptr<SipMessage> makeInvite(const std::string& ruriUser, const std::string& toUser,
 		const std::string& callId, const std::string& srcIp = kSbcIp, bool pcmu = true,
-		const std::string& fromUser = "+12025550177")
+		const std::string& fromUser = "+12025550177", int dtmfPt = 101)
 	{
-		const std::string body = pcmu ? offer(srcIp, "0 101", kPcmuRtpmap) : offer(srcIp, "8 101", kPcmaRtpmap);
+		const std::string pt = std::to_string(dtmfPt);
+		const std::string body = !pcmu ? offer(srcIp, "8 101", kPcmaRtpmap)
+			: offer(srcIp, "0 " + pt, "a=rtpmap:0 PCMU/8000\r\na=rtpmap:" + pt + " telephone-event/8000\r\n");
 		const std::string raw =
 			"INVITE sip:" + ruriUser + "@" + kServerIp + ":5060 SIP/2.0\r\n"
 			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKc" + callId + "\r\n"
@@ -267,15 +269,15 @@ TEST(TrunkInbound, ACarrierInviteToAMappedDidIsNotRefusedForItsSource)
 
 	b.handler.handle(makeInvite(kDid, kDid, "in-mapped"));
 
-	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable")
-		<< "mapped, registered, PCMU, relay free: 480 until the fork (part C) lands, "
-		   "and never the 403 an unregistered caller gets";
-	const std::string answer = b.firstTo("480", kSbcIp);
-	EXPECT_NE(field(answer, "To: ").find(";tag="), std::string::npos)
-		<< "a final the carrier can ACK carries our To tag (RFC 3261 s8.2.6.2)";
-	EXPECT_EQ(b.countTo(kPhoneIp), 0u) << "nothing is forked to the handset in part B";
-	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and no relay pair is claimed";
-	EXPECT_FALSE(b.handler.getSession("Call-ID: in-mapped").has_value());
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 100 Trying")
+		<< "mapped, registered, PCMU, relay free: the call is taken (part C), "
+		   "never the 403 an unregistered caller gets";
+	EXPECT_NE(field(b.firstTo("100", kSbcIp), "To: ").find(";tag="), std::string::npos)
+		<< "every response to the INVITE carries our one To tag (RFC 3261 s8.2.6.2)";
+	EXPECT_FALSE(b.firstTo("INVITE sip:2001@", kPhoneIp).empty()) << "the extension rings";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "on a relay pair of its own";
+	EXPECT_FALSE(b.handler.getSession("Call-ID: in-mapped").has_value())
+		<< "the fork has a Call-ID of its own, never the carrier's (the #386 trap)";
 }
 
 TEST(TrunkInbound, AnInviteFromAnyOtherAddressIsStillRefusedAsBefore)
@@ -402,7 +404,7 @@ TEST(TrunkInbound, TheDidIsFoundInToWhenTheRequestUriNamesTheTrunk)
 
 	b.handler.handle(makeInvite(kTrunkUser, kDid, "in-to"));
 
-	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable")
+	EXPECT_FALSE(b.firstTo("INVITE sip:2001@", kPhoneIp).empty())
 		<< "a registered trunk is called at its own Contact; the DID is the To user (decision 1)";
 }
 
@@ -413,7 +415,7 @@ TEST(TrunkInbound, TheDidIsFoundInTheRequestUriWhenToDoesNotMap)
 
 	b.handler.handle(makeInvite(kDid, kTrunkUser, "in-ruri"));
 
-	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable")
+	EXPECT_FALSE(b.firstTo("INVITE sip:2001@", kPhoneIp).empty())
 		<< "an IP-authenticated trunk puts the DID in the Request-URI (decision 1)";
 }
 
@@ -424,7 +426,7 @@ TEST(TrunkInbound, ADidMatchesHoweverTheCarrierSpellsIt)
 
 	b.handler.handle(makeInvite(kDid, kDid, "in-e164"));
 
-	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable")
+	EXPECT_FALSE(b.firstTo("INVITE sip:2001@", kPhoneIp).empty())
 		<< "the operator's spelling and the carrier's E.164 are the same line (#165)";
 }
 
@@ -486,7 +488,7 @@ TEST(TrunkInbound, ARetransmittedCarrierInviteGetsTheSameAnswerAndIsNotRoutedAga
 	ASSERT_NE(toTag.find(";tag="), std::string::npos);
 
 	// Mapped between the INVITE and its retransmission: re-routing would now
-	// answer 480, under a fresh To tag.
+	// ring the extension.
 	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
 	b.sent.clear();
 	b.handler.handle(makeInvite(kDid, kDid, "in-rtx"));
@@ -494,11 +496,11 @@ TEST(TrunkInbound, ARetransmittedCarrierInviteGetsTheSameAnswerAndIsNotRoutedAga
 	const std::string again = b.firstTo("404", kSbcIp);
 	ASSERT_FALSE(again.empty()) << "a retransmission is answered from the server transaction (RFC 3261 s17.2.1)";
 	EXPECT_EQ(field(again, "To: "), toTag) << "the same response, not a second run of the routing";
-	EXPECT_TRUE(b.firstTo("480", kSbcIp).empty());
+	EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty());
 
 	b.sent.clear();
 	b.handler.handle(makeInvite(kDid, kDid, "in-fresh"));
-	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable") << "a new call sees the new mapping";
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 100 Trying") << "a new call sees the new mapping";
 }
 
 TEST(TrunkInbound, TheCarriersAckForTheRefusalIsAbsorbed)
@@ -514,4 +516,154 @@ TEST(TrunkInbound, TheCarriersAckForTheRefusalIsAbsorbed)
 	EXPECT_TRUE(b.sent.empty()) << "the ACK ends our transaction; nothing is relayed or answered";
 	EXPECT_FALSE(b.handler.getSession("Call-ID: in-ack").has_value());
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+// ── Part C: the fork to the extension, and the answer ─────────────────────────
+
+namespace
+{
+	// The handset's reply to the fork: its Via, From, Call-ID and CSeq echoed,
+	// To with the handset's tag.
+	std::shared_ptr<SipMessage> handsetReply(const std::string& fork, const std::string& statusLine,
+		const std::string& sdp = "")
+	{
+		std::string raw = statusLine + "\r\n"
+			"Via: " + field(fork, "Via: ") + "\r\n"
+			"From: " + field(fork, "From: ") + "\r\n"
+			"To: " + field(fork, "To: ") + ";tag=hs1\r\n"
+			"Call-ID: " + field(fork, "Call-ID: ") + "\r\n"
+			"CSeq: " + field(fork, "CSeq: ") + "\r\n"
+			"Contact: <sip:2001@" + std::string(kPhoneIp) + ":5060>\r\n";
+		if (!sdp.empty()) raw += "Content-Type: application/sdp\r\n";
+		raw += "Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(kPhoneIp));
+	}
+
+	// The carrier calls kDid, mapped to 2001, offering telephone-event as PT 100;
+	// returns the INVITE forked to the handset.
+	std::string ringFork(Bench& b, const std::string& callId)
+	{
+		EXPECT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+		b.handler.handle(makeInvite(kDid, kDid, callId, kSbcIp, true, "+12025550177", 100));
+		return b.firstTo("INVITE sip:2001@", kPhoneIp);
+	}
+
+	const std::string kHandsetAnswer =
+		"v=0\r\no=- 0 0 IN IP4 192.168.50.21\r\ns=-\r\nc=IN IP4 192.168.50.21\r\nt=0 0\r\n"
+		"m=audio 42000 RTP/AVP 0 100\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:100 telephone-event/8000\r\n";
+}
+
+TEST(TrunkInbound, AMappedDidRingsItsExtensionAndItsAnswerIsRelayedBothWays)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "in-answer");
+	ASSERT_FALSE(fork.empty()) << "the extension rings";
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 100 Trying");
+	EXPECT_NE(fork.find("\r\nFrom: \"+12025550177\" <sip:2001@"), std::string::npos) << "the handset shows the caller";
+	EXPECT_NE(fork.find("\r\nc=IN IP4 192.168.50.1\r\n"), std::string::npos) << "our offer, not the carrier's";
+	EXPECT_NE(fork.find(" RTP/AVP 0 100\r\n"), std::string::npos)
+		<< "PCMU only, and the carrier's own telephone-event number, so the relay copies DTMF unchanged";
+	const std::string forkId = "Call-ID: " + field(fork, "Call-ID: ");
+	EXPECT_EQ(forkId.find("in-answer"), std::string::npos) << "a Call-ID of its own (the #386 trap)";
+
+	b.sent.clear();
+	b.handler.handle(handsetReply(fork, "SIP/2.0 100 Trying"));
+	EXPECT_TRUE(b.sent.empty()) << "the handset's 100 is ours alone";
+	b.handler.handle(handsetReply(fork, "SIP/2.0 180 Ringing"));
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 180 Ringing");
+
+	b.sent.clear();
+	b.handler.handle(handsetReply(fork, "SIP/2.0 200 OK", kHandsetAnswer));
+	const std::string ack = b.firstTo("ACK sip:2001@", kPhoneIp);
+	ASSERT_FALSE(ack.empty()) << "the handset's 2xx is ACKed";
+	EXPECT_NE(field(ack, "Via: "), field(fork, "Via: ")) << "as a new transaction (RFC 3261 s13.2.2.4)";
+	const std::string ok = b.firstTo("SIP/2.0 200 OK", kSbcIp);
+	ASSERT_FALSE(ok.empty()) << "the carrier is answered";
+	EXPECT_NE(ok.find("\r\nc=IN IP4 192.168.50.1\r\n"), std::string::npos);
+	EXPECT_NE(ok.find(" RTP/AVP 0 100\r\n"), std::string::npos) << "the answer reuses the carrier's numbering";
+	EXPECT_EQ(field(ok, "Call-ID: "), "in-answer");
+	EXPECT_TRUE(b.handler.trunkRtpForTest(forkId, /*fromCarrier=*/true)) << "carrier to handset";
+	EXPECT_TRUE(b.handler.trunkRtpForTest(forkId, /*fromCarrier=*/false)) << "handset to carrier";
+	const auto session = b.handler.getSession(forkId);
+	ASSERT_TRUE(session.has_value());
+	EXPECT_EQ(session.value()->getState(), Session::State::Connected);
+
+	b.sent.clear();
+	b.handler.handle(makeCarrierAck(kDid, field(ok, "To: "), "in-answer"));
+	EXPECT_TRUE(b.sent.empty()) << "the carrier's ACK is taken, not relayed";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+}
+
+TEST(TrunkInbound, AHandsetBusyGivesTheCarrier486AndFreesTheRelay)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "in-busy486");
+	ASSERT_FALSE(fork.empty());
+	b.sent.clear();
+
+	b.handler.handle(handsetReply(fork, "SIP/2.0 486 Busy Here"));
+
+	const std::string ack = b.firstTo("ACK sip:2001@", kPhoneIp);
+	ASSERT_FALSE(ack.empty()) << "its final is ACKed (RFC 3261 s17.1.1.3)";
+	EXPECT_EQ(ack.substr(4, ack.find(' ', 4) - 4), fork.substr(7, fork.find(' ', 7) - 7))
+		<< "in the INVITE's own transaction: its Request-URI";
+	EXPECT_EQ(field(ack, "Via: "), field(fork, "Via: ")) << "and its branch";
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 486 Busy Here");
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	EXPECT_FALSE(b.handler.getSession("Call-ID: " + field(fork, "Call-ID: ")).has_value());
+}
+
+TEST(TrunkInbound, AHandsetThatIsUnavailableOrDeclinesGivesTheCarrier480)
+{
+	for (const char* reply : { "SIP/2.0 480 Temporarily Unavailable", "SIP/2.0 603 Decline" })
+	{
+		Bench b;
+		const std::string fork = ringFork(b, "in-unavail");
+		ASSERT_FALSE(fork.empty());
+		b.sent.clear();
+
+		b.handler.handle(handsetReply(fork, reply));
+
+		EXPECT_FALSE(b.firstTo("ACK sip:2001@", kPhoneIp).empty()) << reply;
+		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable") << reply;
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << reply;
+	}
+}
+
+TEST(TrunkInbound, ARetransmittedCarrierInviteNeverForksTwice)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "in-twice");
+	ASSERT_FALSE(fork.empty());
+
+	b.sent.clear();
+	b.handler.handle(makeInvite(kDid, kDid, "in-twice", kSbcIp, true, "+12025550177", 100));
+	EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty()) << "while ringing: no second fork";
+
+	// After our 200 the INVITE's server transaction is no longer absorbed
+	// (TransactionLayer: Accepted), so this retransmission reaches onInvite.
+	b.handler.handle(handsetReply(fork, "SIP/2.0 200 OK", kHandsetAnswer));
+	b.sent.clear();
+	b.handler.handle(makeInvite(kDid, kDid, "in-twice", kSbcIp, true, "+12025550177", 100));
+
+	EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty()) << "after the answer: no second fork";
+	EXPECT_TRUE(b.firstTo("482", kSbcIp).empty()) << "nor a 482, which would end the answered call";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+}
+
+TEST(TrunkInbound, AHandsetAnswerTheRelayCannotCarryIsRefusedCleanly)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "in-pcma-answer");
+	ASSERT_FALSE(fork.empty());
+	b.sent.clear();
+
+	b.handler.handle(handsetReply(fork, "SIP/2.0 200 OK", offer(kPhoneIp, "8 101", kPcmaRtpmap)));
+
+	EXPECT_FALSE(b.firstTo("ACK sip:2001@", kPhoneIp).empty()) << "its 2xx is still ACKed";
+	EXPECT_FALSE(b.firstTo("BYE sip:2001@", kPhoneIp).empty()) << "and then hung up";
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here")
+		<< "the relay copies packets: a PCMA leg against a PCMU leg is silence (decision 4)";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	EXPECT_FALSE(b.handler.getSession("Call-ID: " + field(fork, "Call-ID: ")).has_value());
 }

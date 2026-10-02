@@ -1716,9 +1716,20 @@ private:
 	// #398: is `src` the trunk's SBC? The configured transport address from the
 	// resolver's cache (never a blocking resolve), IP only, as #356 compares.
 	bool isTrunkSbcSource(const sockaddr_in& src);
-	// #398 part B: a new INVITE from the SBC, answered with a final here. The
-	// fork to the DID's extension is part C. Caller holds _mutex.
+	// #398: a new INVITE from the SBC: refused with a final (part B), or forked
+	// to the DID's extension (part C). Caller holds _mutex.
 	void routeInboundTrunkCall(const std::shared_ptr<SipMessage>& data);
+	// #398 part C: take the carrier's INVITE (SipTrunk::acceptCall), claim a
+	// relay pair and fork an INVITE with our offer to `handset` on a Call-ID of
+	// its own. 0 when it is ringing; otherwise the final to refuse it with.
+	int forkInboundTrunkCall(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<SipClient>& handset);
+	// A response from the handset to that fork, from any response handler:
+	// relayed to the carrier as 180, an answer, or a refusal. True if claimed.
+	bool handleTrunkInboundReply(const std::shared_ptr<SipMessage>& data);
+	// ACK the handset's final to the fork: a failure's in the INVITE's own
+	// transaction (RFC 3261 s17.1.1.3), a 2xx's as a new one (s13.2.2.4).
+	void ackTrunkInboundFork(const std::shared_ptr<Session>& s, const std::shared_ptr<SipMessage>& resp);
+	bool isTrunkInbound(const Session& s) const;
 #endif
 
 	// `placedOut` (optional, Issue #166): true only when a call was actually
@@ -2486,6 +2497,11 @@ private:
 	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
 #if POCKETDIAL_TRUNK_INBOUND
 	std::chrono::steady_clock::time_point _lastTrunkInboundLog{};   // #398 log rate limit; under _mutex
+	// #398 part C, per relay pair: whether it carries a carrier's call to us, and
+	// the carrier's telephone-event payload type (-1: none), which both legs use
+	// so the relay copies DTMF unchanged. Reset by releaseTrunkRelay().
+	struct TrunkInboundPair { bool inbound = false; int dtmfPt = -1; };
+	std::array<TrunkInboundPair, POCKETDIAL_MAX_TRUNK_CALLS> _trunkInbound{};
 #endif
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
 	std::atomic<uint32_t> _optionsPingTruncated{0};   // #463: see getOptionsPingTruncated()
