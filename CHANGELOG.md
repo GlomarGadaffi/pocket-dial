@@ -100,6 +100,9 @@ bench-verified here.
 - A 911 whose anchor worker cannot start is notified NOT ROUTED, not routed (#815; #713).
 - An emergency `makeCall` waits out a call slot that is still tearing down (#816; #743).
 - A multipart 911 INVITE is routed and `tel:911` reads as 911; the unwrap keys on the To user, and only a URI's own number counts (#817; #760).
+- Timer B and Timer F expiry tell the transaction user; a Trying trunk INVITE ends at 32 s, and the BYE Timer F hook folds into the same callback (#814; #726).
+- A handset hangup on an answered inbound anchored call ends it at once: no BYE to the zero-address PSTN stand-in, the anchor leg and bridge released, one CDR; a BYE on a still-ringing call is left alone (#831; #819).
+- An emergency number is read only inside the URI, never from a display name or parameter: `"sip:911@lobby" <tel:…>` is an ordinary call and `"sip:102@lobby" <sip:911@x>` is a 911; the 911 yield keys on the To user; an odd quote falls back to the last `<…>`; `SIP:` and `sips:` are read like `sip:` (#832; #824).
 
 ### Trunk
 
@@ -177,6 +180,7 @@ bench-verified here.
 - Anchor restart, rewarm and reconcile run on one persistent `tel_maint` task (#688; #658).
 - `GET /api/sbc-mode` writes into a fixed buffer, no heap (#786; part of #410).
 - `conf_mix_tick` runs on a boot-allocated static stack, created once and parked (#790; #479).
+- A pooled message reuses a parked header-line buffer when it gains a header, instead of growing one string per inserted header on every reuse: free internal heap no longer drains per call (about 390 B per call, driven by REGISTER 200s and the 888 conference answer; present since #462 and in b84d9cf) (#837).
 
 ### Dashboard
 
@@ -304,13 +308,16 @@ bench-verified here.
 - Nightly: fail-closed network probes in the runner isolation step (#784; #493).
 - `SIP_OUTSIDE_LINE=anchor|trunk` selects the constrained build's one outside line (#785; part of #731).
 - Conformance test: every message the PBX sends passes pjsip's parser and an RFC 3261 checklist (#758).
+- `sip_stress.py --profile rc1`: the rc.1 smoke/soak load profile (4 UAs, 777 burst, ext-to-ext, 888, park+MoH, idle gaps), refusing owner-phone, 911/933 and 3CX targets (#825; Part of #401).
+- `rig_checkout.sh`: leases the test rig and glolab together, writes the #428 CHECK-OUT/CHECK-IN, ssh allowlist, secret redaction, reboot-safe leases (#827; Part of #401).
+- `run_soak.sh`: smoke, soak and post-OTA orchestrator with preflight, abort path and an evidence bundle (#828; Part of #401).
+- `soak_verdict.py` says PASS, FAIL or INVALID with margins, a heap trend interval and an idle-quiesce leak gate (#830; Part of #401).
 
 ### Known gaps
 
 Open at this cut. None of the changes above is claimed bench-verified.
 
-- Emergency routing: the #759 header gate misses trunk-dialog Call-IDs and PSAP callbacks (#818); `ROUTED` is reported before a later `makeCall` failure, and a 911 slot-wait timeout is not refused (#821); a display name or URI parameter can still route a call to the PSAP on the `sip:` and `urn:service:sos` paths (#824).
-- An inbound-anchor handset BYE goes to 0.0.0.0 and the carrier leg lingers until Timer F (#819).
+- Emergency routing: the #759 header gate misses trunk-dialog Call-IDs and PSAP callbacks (#818); `ROUTED` is reported before a later `makeCall` failure, and a 911 slot-wait timeout is not refused (#821); a 911 produced by a dial-plan rule never gets the header-gate yield (#834); more URI-parsing follow-ups from the #832 review (#835).
 - Learn lock follow-ups: an unlocked row can be rewritten by a forged REGISTER, plus an ambiguity guard and test gaps (#820).
 - SIP trunk is experimental: after a good digest REGISTER some carriers never answer the INVITE (#618), and inbound carrier calls are not built (#398).
 - 3CX anchor: the media GET stream is unproven on a live tenant (#518).
