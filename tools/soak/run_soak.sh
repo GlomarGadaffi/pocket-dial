@@ -12,7 +12,8 @@
 # Runs on the rig host (glolab), next to the logger and the load. The OTA path
 # never opens serial; only --full-flash backs up nvs and coredump over serial.
 # Claim the rig first (tools/soak/rig_checkout.sh claim) and post the CHECK-OUT;
-# this run always releases it with the verdict, also on SIGINT/SIGTERM.
+# this run always releases it with the verdict, also on SIGINT/SIGTERM and on the
+# SIGHUP of a dropped ssh session (a `setsid nohup` start keeps SIGHUP ignored).
 # Exit: 0 PASS, 1 FAIL, 2 refused, 3 INVALID, 4 ABORTED, 5 NEEDS-HUMAN.
 # Everything else is in run_soak.py.
 exec python3 "$(cd "$(dirname "$0")" && pwd)/run_soak.py" "$@"

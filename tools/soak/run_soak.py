@@ -46,7 +46,7 @@ The run, in order:
               flag, image sha256s, versions at start and end, tool versions and
               script sha256s), preflight, backups, load JSON, status log, verdict,
               SHA256SUMS.
-  check-in    ALWAYS (also on SIGINT/SIGTERM): rig_checkout.sh release --verdict ...
+  check-in    ALWAYS (also on SIGINT/SIGTERM/SIGHUP): rig_checkout.sh release --verdict ...
               writes the CHECK-IN post; posting it stays a separate explicit step.
 
 Exit status: 0 PASS, 1 FAIL, 2 refused before anything ran, 3 INVALID (the run
@@ -264,6 +264,7 @@ class Run:
         self.load = None
         self.stop_requested = False
         self.log_lines = []
+        self.expected_regs = None
 
     # -- output / commands -------------------------------------------------
     def say(self, text):
@@ -291,9 +292,13 @@ class Run:
                 "--report", self.p("load.json"), "--checkout-url", self.a.checkout_url,
                 "--checkout-expiry", self.a.checkout_expiry]
 
-    def cmd_verdict(self):
+    def cmd_verdict(self, regs=None):
         c = ["python3", self.tools["verdict"], self.p("status.jsonl"), "--min-hours", str(self.min_hours),
-             "--warmup-s", str(self.warmup), "--json"]
+             "--warmup-s", str(self.warmup), "--load-report", self.p("load.json")]
+        regs = regs if regs is not None else self.expected_regs
+        if regs is not None:
+            c += ["--expect-registrations", str(regs)]
+        c.append("--json")
         return c + (["--allow-no-coredump"] if self.a.allow_no_coredump else [])
 
     def cmd_read_flash(self, part, offset, size, out):
@@ -401,6 +406,21 @@ class Run:
                                      "parkedCount", "msgPool", "stackHwm_"))}
         self.say("baseline after the last reset: uptime %s s, freeHeapInternal %s"
                  % (st.get("uptime"), st.get("freeHeapInternal")))
+        # Phones already registered on the rig stay registered through the quiesce,
+        # so the leak gate expects them plus the load's test UAs. A device that
+        # registers or drops DURING the run still changes the count and fails it:
+        # that is a rig-isolation fault, and it stays visible.
+        uas = len([e for e in self.a.exts.split(",") if e.strip()])
+        before = st.get("clientCount")
+        if isinstance(before, int) and not isinstance(before, bool):
+            self.expected_regs = before + uas
+            self.manifest["expected_registrations"] = self.expected_regs
+            self.manifest["expected_registrations_from"] = {"on_rig_before_load": before, "test_uas": uas}
+            self.say("expected registrations at quiesce: %d (%d on the rig before the load + %d test UAs)"
+                     % (self.expected_regs, before, uas))
+        else:
+            self.manifest["notes"].append("preflight /api/status had no clientCount: the verdict expects "
+                                          "the load report's test UAs at quiesce")
 
     def start_logger(self):
         self.manifest["commands"].append(self.cmd_logger())
@@ -671,7 +691,7 @@ def dry_run(run, out):
               ("logger", run.cmd_logger() + ["&"]),
               ("load", run.cmd_load() + ["&"]),
               ("abort only", run.cmd_uhubctl()),
-              ("verdict", run.cmd_verdict()),
+              ("verdict", run.cmd_verdict(regs="<clientCount-before-the-load+test-UAs>")),
               ("check-in", run.cmd_release("<verdict>", run.dir + ".tar.gz", "<reason>"))]
     for phase, argv in steps:
         out("  %-10s %s" % (phase, " ".join(shlex.quote(x) if not x.startswith("<") else x for x in argv)))
@@ -723,7 +743,13 @@ def main(argv=None, runner=None, clock=None, http_get=None, out=print):
     def on_signal(signum, frame):
         run.stop_requested = True
     old = {}
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    # SIGHUP is a dropped ssh session (a run started over rig_checkout.sh ssh): handled
+    # exactly like SIGTERM. A SIGHUP that arrives already ignored (`setsid nohup ...`)
+    # stays ignored, so that start keeps working as it does.
+    hup = getattr(signal, "SIGHUP", None)
+    for sig in (signal.SIGINT, signal.SIGTERM, hup):
+        if sig is None or (sig == hup and signal.getsignal(sig) == signal.SIG_IGN):
+            continue
         try:
             old[sig] = signal.signal(sig, on_signal)
         except ValueError:

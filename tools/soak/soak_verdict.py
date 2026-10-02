@@ -42,6 +42,7 @@ import statistics
 import sys
 
 VERDICT_EXIT = {"PASS": 0, "FAIL": 1, "INVALID": 3}
+DEFAULT_REGISTRATIONS = 4         # the load's test UAs when neither a flag nor a report says
 POOL_LINE = re.compile(r"(?i)\bpool (exhausted|full)\b")
 REQUIRED = ("uptime", "resetReason", "freeHeapInternal", "minFreeHeapInternal",
             "largestFreeBlockInternal", "coredump", "recvErrors")
@@ -77,7 +78,9 @@ class Config:
         self.min_busy_frac = 0.05         # without a load report: an idle board must not pass
         self.max_stack_drop_b = 128       # vs the previous release's lowest free, per task
         self.quiesce_after_s = 200        # the quiesce sample comes this long after the last call
-        self.expect_registrations = 4     # the load's test UAs, exactly
+        # Registrations at quiesce, exactly. None: the load report's test UAs (else 4).
+        # An explicit value always wins: phones already on the rig count too.
+        self.expect_registrations = None
         self.ci_z = 1.96                  # 95 % interval for the heap trend
 
 
@@ -452,7 +455,9 @@ def assess(samples, bad, cfg, codes=None, load_report=None, baseline=None, syslo
             tq, sq = before[-1]
             after = None if last_end is None else tq - last_end
             base = samples[0][1]
-            want_regs = len(load_report.get("exts") or []) or cfg.expect_registrations
+            want_regs = cfg.expect_registrations
+            if want_regs is None:
+                want_regs = len(load_report.get("exts") or []) or DEFAULT_REGISTRATIONS
             if after is not None and after < cfg.quiesce_after_s:
                 add("idle-quiesce", False,
                     f"the quiesce sample is {after:.0f} s after the last call (need {cfg.quiesce_after_s} s, "
@@ -535,7 +540,8 @@ def main(argv=None):
     ap.add_argument("--baseline", default=None, help="the previous release's --json verdict")
     ap.add_argument("--syslog", default=None, help="the board's syslog for the run")
     ap.add_argument("--expect-registrations", type=int, default=None,
-                    help="registrations at quiesce (default: the report's test UAs, else 4)")
+                    help="registrations at quiesce, exactly; always wins over the report "
+                         "(default: the report's test UAs, else 4)")
     ap.add_argument("--min-busy-frac", type=float, default=None)
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
     args = ap.parse_args(argv)
@@ -562,8 +568,6 @@ def main(argv=None):
         print(f"SOAK VERDICT: INVALID (cannot read an input: {e})")
         return VERDICT_EXIT["INVALID"]
 
-    if load_report and args.expect_registrations is None and load_report.get("exts"):
-        cfg.expect_registrations = len(load_report["exts"])
     results = assess(samples, bad, cfg, codes=codes, load_report=load_report, baseline=baseline,
                      syslog_lines=syslog)
     v = overall(results)
