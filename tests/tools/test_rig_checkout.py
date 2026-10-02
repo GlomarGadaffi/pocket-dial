@@ -323,6 +323,28 @@ class RigCheckoutTest(unittest.TestCase):
         with open(log) as f:
             self.assertIn("status_logger.sh", f.read())
 
+    def test_run_soak_can_be_started_through_the_wrapper(self):
+        rc, out = self.ssh(*RUN_SOAK)
+        self.assertEqual(rc, 0, out)
+        (call,) = self.calls_made()
+        self.assertIn("claude-agent@192.168.12.110 -- bash stray-smoke/pd/tools/soak/run_soak.sh --profile smoke",
+                      call)
+
+    def test_url_credentials_on_an_argv_are_refused_without_a_secrets_file(self):
+        rc, out = self.ssh("curl", "-s", "http://admin:pw123@192.168.12.195/api/status",
+                           PD_SECRETS_FILE="")
+        self.assertEqual(rc, 1)
+        self.assertIn("holds a secret", out)
+        self.assertNotIn("pw123", out)
+        self.assertEqual(self.calls_made(), [])
+
+    def test_an_injected_run_soak_argument_never_reaches_ssh(self):
+        rc, out = self.ssh(*with_arg(RUN_SOAK, "--holder", "BigDog; reboot"))
+        self.assertEqual(rc, 1)
+        self.assertIn("run_soak.sh --holder", out)
+        self.assertNotIn("reboot", out, "the refusal does not echo the value")
+        self.assertEqual(self.calls_made(), [])
+
     # ---- redaction and the secret grep ----------------------------------
     def test_redact_masks_every_kind(self):
         dirty = "\n".join([
@@ -363,6 +385,88 @@ class RigCheckoutTest(unittest.TestCase):
         self.assertEqual(rc, 2, "an unreadable secrets file is a failure, not 'no secrets'")
         rc, out = self.rig("scan", os.path.join(self.tmp, "no-such-file"))
         self.assertEqual(rc, 2)
+
+
+RUN_SOAK = ("bash", "stray-smoke/pd/tools/soak/run_soak.sh", "--profile", "smoke",
+            "--host", "192.168.12.195", "--holder", "BigDog", "--repo", "stray-smoke/pd",
+            "--image", "ota/pocket-dial-eth.bin", "--image-sha256", "ab" * 32, "--ota",
+            "--checkout-url", "https://github.com/GlomarGadaffi/pocket-dial/discussions/428#discussioncomment-1",
+            "--checkout-expiry", "2026-10-02T06:00Z", "--exts", "6101,6102,6103,6104",
+            "--owner-ext", "4242", "--out", "stray-smoke/evidence", "--duration", "3600",
+            "--uhubctl-loc", "1-1", "--uhubctl-port", "2", "--sip-port", "5060",
+            "--allow-no-coredump", "--skip-flash-backup", "--dry-run")
+
+
+def with_arg(argv, flag, value=None):
+    """argv with FLAG's value replaced (or FLAG [VALUE] appended)."""
+    argv = list(argv)
+    if flag in argv and value is not None:
+        argv[argv.index(flag) + 1] = value
+    else:
+        argv += [flag] + ([value] if value is not None else [])
+    return argv
+
+
+class RunSoakAllowlistTest(unittest.TestCase):
+    """`bash <checkout>/tools/soak/run_soak.sh ...` over the ssh wrapper: every
+    argument is a known flag or the value of one, checked against its shape."""
+
+    def refused(self, argv, want):
+        problems = " | ".join(rp.ssh_problems(list(argv)))
+        self.assertIn(want, problems, argv)
+
+    def test_the_real_shapes_are_accepted(self):
+        self.assertEqual(rp.ssh_problems(list(RUN_SOAK)), [])
+        post = ["bash", "tools/soak/run_soak.sh", "--profile", "post-ota", "--host", "192.168.12.195:80",
+                "--holder", "Stray", "--image", "ota/a.bin", "--image-sha256", "0f" * 32,
+                "--checkout-url", RUN_SOAK[RUN_SOAK.index("--checkout-url") + 1],
+                "--checkout-expiry", "2026-10-02T06:00:00+00:00", "--exts", "6101,6102,6103,6104",
+                "--owner-ext", "none"]
+        self.assertEqual(rp.ssh_problems(post), [])
+
+    def test_a_digest_is_not_read_as_a_dial_target(self):
+        sha = "a911b" + "c" * 59                     # "911" between letters: a hash, not a number
+        self.assertEqual(rp.ssh_problems(with_arg(RUN_SOAK, "--image-sha256", sha)), [])
+        self.refused(with_arg(RUN_SOAK, "--exts", "6101,6102,6103,6911"), "emergency number")
+
+    def test_injected_or_malformed_arguments_are_refused(self):
+        cases = [
+            (with_arg(RUN_SOAK, "--holder", "BigDog; reboot"), "run_soak.sh --holder"),
+            (with_arg(RUN_SOAK, "--out", "$(reboot)"), "run_soak.sh --out"),
+            (with_arg(RUN_SOAK, "--image", "../../etc/passwd"), "run_soak.sh --image"),
+            (with_arg(RUN_SOAK, "--image", "/home/claude-agent/ota/a.bin"), "run_soak.sh --image"),
+            (with_arg(RUN_SOAK, "--repo", "~/pd"), "run_soak.sh --repo"),
+            (with_arg(RUN_SOAK, "--host", "glolab"), "run_soak.sh --host"),
+            (with_arg(RUN_SOAK, "--profile", "smoke --ota"), "run_soak.sh --profile"),
+            (with_arg(RUN_SOAK, "--image-sha256", "0" * 63), "run_soak.sh --image-sha256"),
+            (with_arg(RUN_SOAK, "--checkout-url", "https://example.invalid/428"), "run_soak.sh --checkout-url"),
+            (with_arg(RUN_SOAK, "--checkout-expiry", "tomorrow"), "run_soak.sh --checkout-expiry"),
+            (with_arg(RUN_SOAK, "--exts", "6101,sip:x@y"), "run_soak.sh --exts"),
+            (with_arg(RUN_SOAK, "--duration", "-1"), "run_soak.sh --duration"),
+            (with_arg(RUN_SOAK, "--evil"), "'--evil' is not on the allowlist"),
+            (with_arg(RUN_SOAK, "--profile=soak"), "'--profile=soak' is not on the allowlist"),
+            (list(RUN_SOAK) + ["--holder"], "--holder needs a value"),
+            (with_arg(RUN_SOAK, "--boot-cmd", "true"), "--boot-cmd"),
+            (with_arg(RUN_SOAK, "--full-flash"), "--full-flash"),
+            (with_arg(RUN_SOAK, "--serial-port",
+                      "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:84:85:4A:24:68-if00"),
+             "serial port"),
+        ]
+        for argv, want in cases:
+            with self.subTest(want):
+                self.refused(argv, want)
+
+    def test_only_the_checkout_layout_runs_under_bash(self):
+        for script in ("/tmp/tools/soak/run_soak.sh", "evil/run_soak.sh", "../pd/tools/soak/run_soak.sh",
+                       "tools/soak/status_logger.sh", "-c"):
+            with self.subTest(script):
+                self.refused(["bash", script] + list(RUN_SOAK[2:]), "bash runs only")
+        self.refused(["/tmp/bash"] + list(RUN_SOAK[1:]), "not on the glolab allowlist")
+
+    def test_no_secret_rides_on_a_run_soak_argv(self):
+        url = "https://admin:pw123@github.com/GlomarGadaffi/pocket-dial/discussions/428#discussioncomment-1"
+        self.assertNotEqual(rp.ssh_problems(with_arg(RUN_SOAK, "--checkout-url", url)), [])
+        self.assertTrue(rp.find_secrets("\n".join(with_arg(RUN_SOAK, "--checkout-url", url))))
 
 
 class RigPolicyTest(unittest.TestCase):

@@ -44,6 +44,80 @@ CURL_WRITES = {"-X", "--request", "-d", "--data", "--data-binary", "--data-raw",
 EMERGENCY = ("911", "933", "112")
 IPV4 = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 
+# run_soak.sh over the wrapper (#401): `bash <checkout>/tools/soak/run_soak.sh ARGS`, so
+# a run can be started from BigDog. bash runs nothing else. Every argument is a known
+# flag or the value of one, and each value must match its own shape: no shell
+# metacharacters, and paths relative to the ssh login directory (never absolute, never
+# "~", never ".."). The serial and free-form parts of run_soak stay bench steps.
+BASH = ("bash", "/bin/bash", "/usr/bin/bash")
+RUN_SOAK_SCRIPT = re.compile(r"^(?:[A-Za-z0-9_+-][A-Za-z0-9._+-]*/)*tools/soak/run_soak\.sh$")
+_REL_PATH = re.compile(r"^[A-Za-z0-9_+][A-Za-z0-9._+-]*(?:/[A-Za-z0-9._+-]+)*/?$")
+_EXT_LIST = re.compile(r"^[0-9]{2,6}(?:,[0-9]{2,6})*$")
+
+
+def _rel_path(v):
+    return bool(_REL_PATH.match(v)) and not any(p in (".", "..") for p in v.split("/"))
+
+
+def _int_in(lo, hi):
+    return lambda v: v.isdigit() and lo <= int(v) <= hi
+
+
+RUN_SOAK_VALUES = {
+    "--profile": lambda v: v in ("post-ota", "smoke", "soak"),
+    "--host": lambda v: bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?", v)),
+    "--sip-port": _int_in(1, 65535),
+    "--holder": lambda v: bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", v)),
+    "--duration": _int_in(1, 86400),
+    "--repo": _rel_path,
+    "--image": _rel_path,
+    "--out": _rel_path,
+    "--image-sha256": lambda v: bool(re.fullmatch(r"[0-9a-f]{64}", v)),
+    "--checkout-url": lambda v: bool(re.fullmatch(
+        r"https://github\.com/GlomarGadaffi/pocket-dial/discussions/428#discussioncomment-[0-9]+", v)),
+    "--checkout-expiry": lambda v: bool(re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})", v)),
+    "--exts": lambda v: bool(_EXT_LIST.match(v)),
+    "--owner-ext": lambda v: v == "none" or bool(_EXT_LIST.match(v)),
+    "--uhubctl-loc": lambda v: bool(re.fullmatch(r"[0-9]+(?:-[0-9]+(?:\.[0-9]+)*)?", v)),
+    "--uhubctl-port": _int_in(1, 99),
+}
+RUN_SOAK_FLAGS = {"--ota", "--skip-flash-backup", "--allow-no-coredump", "--dry-run"}
+RUN_SOAK_BENCH_ONLY = {   # flag -> (takes a value, why it never goes through the wrapper)
+    "--full-flash": (False, "the full-flash path opens serial: a bench step, not a wrapped run"),
+    "--serial-port": (True, "the full-flash path opens serial: a bench step, not a wrapped run"),
+    "--boot-cmd": (True, "a free-form command never rides through the wrapper"),
+}
+
+
+def run_soak_problems(args):
+    """Every reason ARGS (after the script) may not go to run_soak.sh, and the
+    indexes of --image-sha256 values (a 64-hex digest is not a dial target)."""
+    problems, digests = [], set()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in RUN_SOAK_BENCH_ONLY:
+            takes, why = RUN_SOAK_BENCH_ONLY[a]
+            problems.append("run_soak.sh %s: %s" % (a, why))
+            i += 2 if takes else 1
+        elif a in RUN_SOAK_FLAGS:
+            i += 1
+        elif a in RUN_SOAK_VALUES:
+            if i + 1 >= len(args):
+                problems.append("run_soak.sh %s needs a value" % a)
+                break
+            if not RUN_SOAK_VALUES[a](args[i + 1]):
+                problems.append("run_soak.sh %s: the value is not an accepted shape" % a)
+            elif a == "--image-sha256":
+                digests.add(i + 1)
+            i += 2
+        else:
+            problems.append("run_soak.sh argument %r is not on the allowlist"
+                            % (a if a.startswith("--") and len(a) <= 40 else "<value>"))
+            i += 1
+    return problems, digests
+
 SECRET_PATTERNS = [
     ("auth header", re.compile(r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie|x-csrf)"
                                r"(\s*:\s*)[^\r\n]*"), lambda m: m.group(1) + m.group(2) + "***"),
@@ -125,11 +199,20 @@ def ssh_problems(argv, flash_step=False, abort_path=False):
     problems = []
     prog = argv[0]
     base = os.path.basename(prog)
+    not_dialled = set()                 # argv indexes the emergency scan may skip
     if base in ("python3", "python"):
         script = os.path.basename(argv[1]) if len(argv) > 1 else ""
         if script not in ALLOWED_PY_SCRIPTS:
             problems.append("python3 %s is not on the allowlist (%s)"
                             % (script or "<nothing>", ", ".join(sorted(ALLOWED_PY_SCRIPTS))))
+    elif prog in BASH:
+        script = argv[1] if len(argv) > 1 else ""
+        if not RUN_SOAK_SCRIPT.match(script) or ".." in script.split("/"):
+            problems.append("bash runs only <checkout>/tools/soak/run_soak.sh, by a relative path")
+        else:
+            more, digests = run_soak_problems(argv[2:])
+            problems += more
+            not_dialled = {i + 2 for i in digests}
     elif base not in ALLOWED_PROGRAMS:
         problems.append("%s is not on the glolab allowlist" % prog)
     esptool = base.startswith("esptool")
@@ -151,7 +234,7 @@ def ssh_problems(argv, flash_step=False, abort_path=False):
         problems.append("--abort-path is for uhubctl only")
     if base == "curl" and any(a in CURL_WRITES or a.startswith("--data") for a in argv[1:]):
         problems.append("curl through the wrapper is read-only (no -X, -d, -F, -T)")
-    if any(_emergency_in(a) for a in argv):
+    if any(_emergency_in(a) for i, a in enumerate(argv) if i not in not_dialled):
         problems.append("an argument names an emergency number (911/933/112): refused")
     return problems
 
@@ -181,10 +264,12 @@ def find_secrets(text, literals=()):
         for lit in literals:
             if lit in line:
                 found.append((n, "a literal from the secrets file"))
-        for kind, rx, _ in SECRET_PATTERNS:
-            for m in rx.finditer(line):
-                if redact(m.group(0)) != m.group(0):      # an already-masked value is not a hit
-                    found.append((n, kind))
+        for kind, rx, sub in SECRET_PATTERNS:
+            # Judged on the whole line: a pattern with context (the URL-credential
+            # lookbehind) cannot be re-checked on the bare match. A masked value
+            # substitutes to itself, so it is not a hit.
+            if rx.sub(sub, line) != line:
+                found.append((n, kind))
     return found
 
 
