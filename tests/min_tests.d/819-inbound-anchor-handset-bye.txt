@@ -1,2 +1,2 @@
-# InboundAnchorReinvite_test.cpp: 1 (#819: a handset hangup on an inbound anchored call ends it at once, nothing goes to the zero-address PSTN stand-in)
-1
+# InboundAnchorReinvite_test.cpp: 3 (#819: a handset hangup on an ANSWERED inbound anchored call ends it at once with one CDR; a BYE on a RINGING one, from the handset or a stranger, does not end it)
+3

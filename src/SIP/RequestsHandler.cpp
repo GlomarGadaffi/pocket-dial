@@ -6071,7 +6071,17 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	// is the PSTN participant, not a number this function should compare. CDR
 	// order is the inbound one used by the other teardowns: the anchor participant
 	// as src and the answering handset as dest.
-	if (session.has_value() && session.value()->isAnchorInbound())
+	//
+	// Only once the call is ANSWERED (dest is the handset, state Connected or
+	// Held). While it still rings (Invited) the session has no dest, so
+	// isDialogSourceAuthorized() above fails open: a BYE from any source naming
+	// the Call-ID would end the call and drop the PSTN leg, with nothing
+	// CANCELling the forked phones, which would ring on. A ringing call is ended
+	// by its own paths (the CANCEL, the no-answer reap, the anchor's Dropped
+	// event), so such a BYE falls through to the code below as before.
+	if (session.has_value() && session.value()->isAnchorInbound() && session.value()->getDest() &&
+		(session.value()->getState() == Session::State::Connected ||
+		 session.value()->getState() == Session::State::Held))
 	{
 		if (auto response = getMessageFromPool(*data))
 		{
@@ -6084,6 +6094,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		// until a final response, so skipping endCall() here would leak the call
 		// until Timer F (#101A).
 		const auto handset = session.value()->getDest();
+		setCallDisposition(data->getCallID(), Session::Disposition::Bye);   // #690, same writer as the paths below
 		endCall(data->getCallID(), session.value()->getAnchorParticipantId(),
 			handset ? handset->getNumber() : "", "handset hung up");
 		return;
