@@ -703,6 +703,9 @@ TEST(SipTrunkInbound, ACarrierCancelWhileRingingIsAnswered200And487)
 	ASSERT_EQ(in.env.sent.size(), 2u);
 	EXPECT_EQ(firstLine(in.env.sentRaw(0)), "SIP/2.0 200 OK");
 	EXPECT_EQ(lineStarting(in.env.sentRaw(0), "CSeq: "), "CSeq: 101 CANCEL") << "the CANCEL's own 200 (s9.2)";
+	EXPECT_EQ(lineStarting(in.env.sentRaw(0), "Via: "),
+		"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKsbc1;rport=5062;received=203.0.113.5")
+		<< "its top Via stamped like every response to the carrier (RFC 3581 s4)";
 	EXPECT_EQ(firstLine(in.env.sentRaw(1)), "SIP/2.0 487 Request Terminated");
 	EXPECT_EQ(lineStarting(in.env.sentRaw(1), "CSeq: "), "CSeq: 101 INVITE") << "and the INVITE's 487";
 	EXPECT_EQ(in.lis.events, std::vector<std::string>{"failed 487"}) << "the engine cancels the fork";

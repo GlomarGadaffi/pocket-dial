@@ -793,6 +793,7 @@ bool SipTrunk::handleCancel(const std::shared_ptr<SipMessage>& data)
 	{
 		ok->setHeader(SipMessageTypes::OK);
 		ok->clearBody();
+		ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));   // RFC 3581 s4
 		if (std::string_view(data->getTo()).find("tag=") == std::string_view::npos)
 			ok->setTo(std::string(data->getTo()) + ";tag=" + d->toTag);
 		ok->syncContentLength();
