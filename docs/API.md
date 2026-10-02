@@ -1410,10 +1410,15 @@ curl -b cookies.txt -H "X-CSRF: $CSRF" -X POST http://192.168.4.1/api/pnp -d "mo
 The zero-touch assignment window (#826 part B, [PROVISIONING.md §3.1](PROVISIONING.md)).
 
 ```json
-{ "attached": true, "open": true, "lo": 2001, "hi": 2099, "secondsLeft": 1740, "unclaimed": 1, "learnOnly": true }
+{ "attached": true, "open": true, "lo": 2001, "hi": 2099, "secondsLeft": 1740, "unclaimed": 1,
+  "free": 97, "lastRefusal": "unverified", "refusals": 2, "learnOnly": true }
 ```
 
-`unclaimed`: rows assigned to a MAC that has not registered yet (at most 4).
+`unclaimed`: rows assigned in this window to a MAC that has not registered yet (at most 4).
+`free`: extensions in the range assignable right now. `lastRefusal`/`refusals`: why the last
+fetch got a 404 while a window was open, and how many have (`unverified`: the fetching host's
+ARP MAC is not the MAC in the URL; `notLearn`, `noWindow`, `unclaimedCap`, `noFreeExtension`,
+`tableFull`, `rateLimited`).
 
 ### `POST /api/zero-touch`
 
