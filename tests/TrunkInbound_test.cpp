@@ -185,14 +185,15 @@ namespace
 			return n;
 		}
 
-		// The one answer the carrier got, its status line only.
+		// The status line of the first response sent to the carrier. Responses
+		// only: a live outbound trunk call may put a retransmitted INVITE there too.
 		std::string carrierStatus() const
 		{
 			for (const auto& [addr, msg] : sent)
 			{
 				if (!msg || addr.sin_addr.s_addr != inet_addr(kSbcIp)) continue;
 				const std::string raw = msg->toString();
-				return raw.substr(0, raw.find("\r\n"));
+				if (raw.rfind("SIP/2.0 ", 0) == 0) return raw.substr(0, raw.find("\r\n"));
 			}
 			return {};
 		}
