@@ -1,0 +1,3 @@
+# #401 item 0.4: Python unittest cases in tests/tools/test_soak_verdict.py
+# (soak_verdict.py hardening). No gtest cases.
+0
