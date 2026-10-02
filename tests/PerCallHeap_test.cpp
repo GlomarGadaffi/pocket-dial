@@ -53,7 +53,8 @@ namespace
 	constexpr int kWarmup = 2 * kPhones;
 	constexpr int kMeasured = 2 * kPhones;
 	// Live bytes may end above the baseline by this much (one-off growth of a
-	// line buffer). The leak cost ~100 B per inserted header per call on host.
+	// line buffer). The leak cost ~48 B per inserted header per call on host,
+	// plus the parked-line vector doubling now and then.
 	constexpr std::size_t kByteSlack = 512;
 
 	sockaddr_in addrFor(const std::string& ip)
