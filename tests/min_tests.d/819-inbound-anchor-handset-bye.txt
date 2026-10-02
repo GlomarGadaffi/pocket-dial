@@ -1,0 +1,2 @@
+# InboundAnchorReinvite_test.cpp: 1 (#819: a handset hangup on an inbound anchored call ends it at once, nothing goes to the zero-address PSTN stand-in)
+1
