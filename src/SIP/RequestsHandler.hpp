@@ -803,6 +803,12 @@ public:
 		_registrar.adoptDeviceForTest(mac, ext, state, locked);
 		refreshDeviceSnapshot();
 	}
+	// Test-only (#515): Learn's minimum lock age; fixtures that REGISTER on the real clock set 0.
+	void setLearnLockMinAgeForTest(std::chrono::seconds age)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_registrar.setLockMinAgeForTest(age);
+	}
 	// Test-only (#550): bind a client WITHOUT onRegister's identity guard, so a
 	// test can stand up the state the guard now forbids (a client named like an
 	// emergency number) and pin the defence-in-depth checks behind it.

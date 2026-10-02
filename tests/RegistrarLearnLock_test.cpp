@@ -33,6 +33,7 @@
 #include <arpa/inet.h>
 #endif
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <utility>
@@ -89,6 +90,8 @@ namespace
 					_wire.sent.emplace_back(a, std::move(m));
 				});
 			_handler->setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+			// These REGISTERs run on the real clock, microseconds apart; the 30 s age is LearnLockMinAge_test's.
+			_handler->setLearnLockMinAgeForTest(std::chrono::seconds(0));
 		}
 		void TearDown() override
 		{
