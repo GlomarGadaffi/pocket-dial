@@ -12132,8 +12132,20 @@ int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& dat
 		return refused;
 	}
 	// The carrier's telephone-event number is offered to the handset too, so
-	// both legs number DTMF alike and the relay copies it unchanged.
-	const int dtmfPt = data->getTelephoneEventPayloadType();
+	// both legs number DTMF alike and the relay copies it unchanged. Only at the
+	// 8000 Hz clock buildMediaSdp() states; at any other, neither leg gets it.
+	int dtmfPt = data->getTelephoneEventPayloadType();
+	if (dtmfPt >= 0)
+	{
+		const std::string_view body = data->getBody();
+		const size_t map = body.find("a=rtpmap:" + std::to_string(dtmfPt) + " ");
+		const size_t slash = map == std::string_view::npos ? map : body.find('/', map);
+		if (slash == std::string_view::npos || body.substr(slash + 1, 4) != "8000" ||
+			(slash + 5 < body.size() && std::isdigit(static_cast<unsigned char>(body[slash + 5]))))
+		{
+			dtmfPt = -1;
+		}
+	}
 	_trunkInbound[slot] = { true, dtmfPt };
 	session->setDest(handset);
 	session->setTrunk(true);   // endCall() then ends the carrier leg and frees the relay

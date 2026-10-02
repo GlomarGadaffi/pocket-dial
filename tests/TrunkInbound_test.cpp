@@ -939,6 +939,23 @@ TEST(TrunkInbound, AnRtpAddressThatIsNotAUnicastDottedQuadIsNeverARelayPeer)
 	}
 }
 
+TEST(TrunkInbound, ATelephoneEventOffNot8000HzIsNotOfferedOnAsIf8000)
+{
+	// C review: buildMediaSdp() states /8000, so a carrier's telephone-event at
+	// another clock would have been echoed at the wrong rate. Both legs then go
+	// without RFC 4733 rather than disagree. (Same-length substitution.)
+	Bench b;
+	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+	std::string raw = makeInvite(kDid, kDid, "in-dtmf16", kSbcIp, true, "+12025550177", 100)->toString();
+	raw.replace(raw.find("telephone-event/8000"), 20, "telephone-event/1600");
+	b.handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kSbcIp)));
+
+	const std::string fork = b.firstTo("INVITE sip:2001@", kPhoneIp);
+	ASSERT_FALSE(fork.empty()) << "the call still rings";
+	EXPECT_NE(fork.find(" RTP/AVP 0\r\n"), std::string::npos) << "PCMU alone";
+	EXPECT_EQ(fork.find("telephone-event"), std::string::npos);
+}
+
 TEST(TrunkInbound, ASilentInboundCallByesTheHandsetNotTheCallersStandIn)
 {
 	Bench b;
