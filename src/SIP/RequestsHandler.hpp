@@ -73,6 +73,7 @@
 #include "ParkOrbit.hpp"
 #include "BlfSubscriptions.hpp"
 #include "ConferenceRoom.hpp"
+#include "MulticastPager.hpp"   // Issue #800: multicast paging (997)
 
 // SipTrunk::Listener is a PRIVATE base for the same reason PbxEnv is: these
 // are inward-facing contracts the engine implements for its own machines, not
@@ -125,8 +126,10 @@ public:
 	// `dtmfPt` echoes the caller's RFC 4733 telephone-event payload type (from
 	// SipMessage::getTelephoneEventPayloadType()) so DTMF can reach a
 	// server-terminated leg at all; -1 keeps the answer PCMU-only as before.
+	// `recvonly` (#800, the 997 multicast page) overrides `sendrecv`: the server only
+	// listens on that leg.
 	static std::string buildMediaSdp(const std::string& serverIp, int rtpPort,
-		bool sendrecv = false, int dtmfPt = -1);
+		bool sendrecv = false, int dtmfPt = -1, bool recvonly = false);
 
 	// Parse the caller's RTP destination from an INVITE: the SDP c= line IP (falling
 	// back to the INVITE source IP) + the m=audio port via getRtpPort(). Returns false
@@ -510,6 +513,36 @@ public:
 	ConferenceRoom* conferenceForTest() { return _conference.get(); }
 	// #479: as a POCKETDIAL_CONFERENCE=0 build, which never builds the room.
 	void dropConferenceForTest() { _conference.reset(); }
+#if POCKETDIAL_MULTICAST_PAGING
+	// #800: the multicast page's socket seam, its state, one RTP packet through the
+	// receiver's dispatchRaw() (as the receive task delivers it), and the silence
+	// sweep as of `now`.
+	void setMulticastTxForTest(McastTx* tx)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_mcastPager.setTxForTest(tx);
+	}
+	bool multicastPageActiveForTest() const { return _mcastPager.isActive(); }
+	bool multicastRtpForTest(const RtpReceiver::RtpPacket& pkt) { return _mcastRx.dispatchRaw(pkt); }
+	// Flushes what the sweep queued, as sweepVoicemailLegsForTest() does.
+	void sweepMulticastPageForTest(std::chrono::steady_clock::time_point now)
+	{
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
+		std::vector<std::pair<bool, std::string>> localLogs;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			sweepMulticastPage(now);
+			localOutbox = drainOutbox();
+			localLogs = std::move(_logQueue);
+			_logQueue.clear();
+		}
+		printLogs(localLogs);
+		for (auto& event : localOutbox)
+		{
+			_onHandled(event.first, std::move(event.second));
+		}
+	}
+#endif
 	// #604: one RTP packet arriving on a trunk call's carrier or handset leg,
 	// through the same dispatchRaw() the receive task calls. False if not relayed.
 	bool trunkRtpForTest(const std::string& callID, bool fromCarrier)
@@ -593,6 +626,14 @@ public:
 	// active slot: some other feature (the 555 anchor extension, a manual
 	// Trunk dial-plan rule) may still depend on it.
 	std::string setSbcMode(bool enabled, size_t route);
+
+#if POCKETDIAL_MULTICAST_PAGING
+	// ── Multicast paging (Issue #800) ─────────────────────────────────────────
+	// "" on success, else why the config was refused (it is then unchanged). A
+	// change applies to the next page; a live page keeps the group it started on.
+	pbx::MulticastPagingConfig getMulticastPaging();
+	std::string setMulticastPaging(const pbx::MulticastPagingConfig& cfg);
+#endif
 
 	// Connectivity probe for the dashboard's "Test Dial" action (not a real
 	// bridged call — no SIP session, no MediaBridge, no caller): self-dials
@@ -1304,6 +1345,18 @@ private:
 	// holds _mutex.
 	void onConferenceInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
 
+	// ── Multicast paging: virtual extension 997 (Issue #800) ─────────────────────
+	// The server answers recvonly (PCMU) and re-sends the caller's audio to the
+	// configured multicast group. One page at a time: a second caller gets 486.
+	// 403 when the feature is off or not built. Caller holds _mutex.
+	void onMulticastPageInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
+	// True when `callID` is the live page's dialog. False on a build without the
+	// feature. The in-dialog dispatch keys on this, never on the To number.
+	bool isMulticastPageCall(std::string_view callID) const;
+	// BYE the caller and end the page once no RTP has arrived for
+	// pbx::kMulticastPageSilence. Caller holds _mutex.
+	void sweepMulticastPage(std::chrono::steady_clock::time_point now);
+
 	// ── Voicemail deposit: answer locally as voicemail (Issue #246) ──────────────
 	// Called from the CFNA sweep (tick()) and onBusy()'s CFB path when the
 	// diverting extension has no explicit forward target but has voicemail
@@ -1623,6 +1676,17 @@ private:
 	// its per-leg rings are ~50 KB, too much to pay at boot on a node that may never
 	// hold a conference. Null until then. Caller holds _mutex.
 	std::unique_ptr<ConferenceRoom> _conference;
+
+#if POCKETDIAL_MULTICAST_PAGING
+	// Issue #800: the one multicast page. Declared in this order so the receiver
+	// (whose raw sink is the pager) is destroyed first. _mcastRx is a boot-time RTP
+	// slot (RtpTaskSlots.hpp kRxSlots). The silence clock is SIP-thread state.
+	UdpMcastTx     _mcastUdp;
+	MulticastPager _mcastPager{_mcastUdp};
+	RtpReceiver    _mcastRx;
+	uint32_t       _mcastRxSeen = 0;
+	std::chrono::steady_clock::time_point _mcastRxSeenAt{};
+#endif
 
 	// ── Anchored media: virtual extension 555 (bridge to an AnchorClient) ────────
 	// onInvite() routes a dial of 555 here — the docs/FEATURE_ROADMAP.md "Anchored

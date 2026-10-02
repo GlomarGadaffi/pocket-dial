@@ -385,6 +385,9 @@ add_executable(sip_parser_tests
     # Issue #513: a quick 888 re-dial skips a leg whose RTP tasks are still
     # stopping instead of failing the join (486).
     ConferenceRejoin_test.cpp
+    # Issue #800: multicast paging (997): the RTP re-sender, the 997 dial, the
+    # reserved-number refusals and the /api/multicast-paging config route.
+    MulticastPaging_test.cpp
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp
@@ -656,6 +659,8 @@ add_executable(sip_parser_tests
     # driver. Host-compilable — the driver is a std::thread off-device and the
     # tests step the clock with tickOnce() instead of starting it.
     ../src/SIP/ConferenceRoom.cpp
+    # Issue #800: multicast paging's RTP re-sender and its socket seam.
+    ../src/SIP/MulticastPager.cpp
     # Issue #53/#101(A)/#101(E): the static SipMessage pool, extracted out of
     # RequestsHandler into its own translation unit.
     ../src/SIP/SipMessagePool.cpp

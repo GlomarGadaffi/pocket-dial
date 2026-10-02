@@ -36,6 +36,38 @@ namespace pbx
 	// it lives here rather than file-local to either translation unit.
 	inline constexpr std::chrono::seconds kNoAnswerTimeout{20};
 
+	// Issue #800: multicast paging (dial 997). Off by default. The group is held
+	// in host byte order; the default is 239.0.1.75:50000 (desmo, #800).
+	struct MulticastPagingConfig
+	{
+		bool     enabled = false;
+		uint32_t group   = (239u << 24) | (0u << 16) | (1u << 8) | 75u;
+		uint16_t port    = 50000;
+	};
+	// A page ends after this long with no RTP from the caller.
+	inline constexpr std::chrono::seconds kMulticastPageSilence{5};
+	// An IPv4 multicast group (224.0.0.0/4) outside 224.0.0.0/24, the local
+	// network control block (mDNS 224.0.0.251 is there). Host byte order.
+	inline bool isUsableMulticastGroup(uint32_t groupHost)
+	{
+		return (groupHost >> 28) == 0xEu && (groupHost >> 8) != 0xE00000u;
+	}
+	// "a.b.c.d" for a host-order IPv4 address, NUL-terminated. Returns the length.
+	inline size_t formatIpv4(uint32_t host, char (&out)[16])
+	{
+		size_t n = 0;
+		for (int shift = 24; shift >= 0; shift -= 8)
+		{
+			const unsigned v = (host >> shift) & 0xFFu;
+			if (v >= 100) out[n++] = static_cast<char>('0' + v / 100);
+			if (v >= 10) out[n++] = static_cast<char>('0' + (v / 10) % 10);
+			out[n++] = static_cast<char>('0' + v % 10);
+			if (shift != 0) out[n++] = '.';
+		}
+		out[n] = '\0';
+		return n;
+	}
+
 	// Issue #246 (voicemail, Stage 3 of #194): the CFNA/CFB no-answer-target
 	// sentinel meaning "no explicit forward target is configured, but this
 	// extension has voicemail enabled -- answer locally instead of failing."
@@ -248,11 +280,13 @@ namespace pbx
 	// notification. Every validator that calls this helper (REGISTER via
 	// isReservedOrPstnAor, forwards, ring groups, dial rules, voicemail, DID map)
 	// now refuses them too.
+	// Issue #800: "997" is the multicast paging dial code. Clear of the park
+	// orbits and the page zones.
 	inline bool isReservedExtension(std::string_view ext)
 	{
 		return ext == "777" || ext == "999" || ext == "888" || ext == "555" ||
 			ext == "440" || ext == "911" || ext == "933" || ext == "796" ||
-			classifyEmergencyDial(ext).isEmergency;
+			ext == "997" || classifyEmergencyDial(ext).isEmergency;
 	}
 
 	// True iff `aor` "looks like a direct PSTN number" rather than an internal

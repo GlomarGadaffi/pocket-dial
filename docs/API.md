@@ -2275,6 +2275,38 @@ curl -s -X DELETE "http://$DEV/api/did-mapping" \
 `-d`) is what makes this work, and `curl` sets the `Content-Type` and `Content-Length`
 for you.
 
+### `GET /api/multicast-paging`
+
+Multicast paging (issue #800): what dialing `997` does. Not built on a
+`SIP_CONSTRAINED` image, where this route does not exist and `997` answers `403`.
+
+```json
+{"enabled":false,"group":"239.0.1.75","port":50000}
+```
+
+* Auth: gated read (same-origin, session and completed setup), **no** `X-CSRF`.
+* Response Status Codes:
+  * `200 OK`: Always. The defaults above when the SIP engine is not attached.
+  * `401`/`403`: gates 1, 2 and 4 as in §0.1.
+
+### `PUT /api/multicast-paging`
+
+Form-encoded. Every parameter is optional; one that is absent keeps its current value.
+A change applies to the next page; a live page keeps the group it started on.
+
+* Request Parameters:
+  * `enabled`: `1`, `true` or `on` turns paging on; anything else turns it off. Off by default.
+  * `group`: a dotted-quad IPv4 multicast address (`224.0.0.0/4`) outside `224.0.0.0/24`, the local network control block (mDNS is there).
+  * `port`: `1`-`65535`.
+* Response Status Codes:
+  * `200 OK`: the stored config, as `GET` returns it.
+  * `400 Bad Request`: `{"error":"group must be a dotted-quad IPv4 address"}`, `{"error":"port must be 1-65535"}`, or `{"error":"group must be an IPv4 multicast address outside 224.0.0.0/24"}`. Nothing is changed.
+  * `401`/`403`: gates 1-4 as in §0.1.
+
+```bash
+curl -s -X PUT "http://$DEV/api/multicast-paging"      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF"      -d "enabled=1&group=239.0.1.75&port=50000"
+```
+
 ### `POST /api/configuring`
 Tells the device a user is actively working through setup, pausing the captive-portal watchdog that would otherwise auto-switch the device back to Standalone AP mode. It mutates device state, so it takes the standard gate (same-origin, a `pd_session` cookie and an `X-CSRF` token), like every other mutating route (`HttpServer.cpp:606`).
 

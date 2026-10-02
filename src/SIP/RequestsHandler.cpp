@@ -121,6 +121,9 @@ namespace
 	// park-orbit range instead.
 	constexpr const char* kVoicemailRetrievalExt = "796";
 
+	// Issue #800: multicast paging. Matches pbx::isReservedExtension()'s "997".
+	constexpr const char* kMulticastPageExt = "997";
+
 	// Issue #194 audit: isValidAor() had a header comment (CallDetailRecord.hpp)
 	// claiming it bounded caller/callee length. It never did -- charset only,
 	// no size check -- which let an unbounded AOR heap-allocate inside every
@@ -1691,6 +1694,14 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	if (isMulticastPageCall(data->getCallID()))
+	{
+		// CANCEL of a 997 page (#800), keyed on the page's own dialog. endCall()
+		// stops the page.
+		endCall(data->getCallID(), data->getFromNumber(), kMulticastPageExt);
+		return;
+	}
+
 	// A dial-plan Trunk rule (Issue #165) originates an anchor call under
 	// whatever digits the caller actually dialed (e.g. "92025550123"), not the
 	// literal 555 feature code — CANCEL must match the original INVITE's
@@ -2491,6 +2502,14 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	if (destNumber == kMulticastPageExt)
+	{
+		// Multicast paging (997, #800): the server answers and re-sends this
+		// caller's audio to the configured LAN multicast group.
+		onMulticastPageInvite(data, caller.value());
+		return;
+	}
+
 	if (destNumber == kAnchorCallExt)
 	{
 		// Anchored media (555): the server answers and bridges this caller's RTP to
@@ -2687,7 +2706,8 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	endHandle(data->getToNumber(), response);
 }
 
-std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpPort, bool sendrecv, int dtmfPt)
+std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpPort, bool sendrecv, int dtmfPt,
+	bool recvonly)
 {
 	// The server's OWN SDP offer/answer for a server-media call. PCMU (PT 0) only —
 	// matches enforceG711()/the codec the rest of the PBX speaks. Sendonly (the 440
@@ -2728,7 +2748,7 @@ std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpP
 		// receiver maps only 0-15 to a key and would drop the rest anyway.
 		s += "a=fmtp:" + std::to_string(dtmfPt) + " 0-15\r\n";
 	}
-	s += sendrecv ? "a=sendrecv\r\n" : "a=sendonly\r\n";
+	s += recvonly ? "a=recvonly\r\n" : sendrecv ? "a=sendrecv\r\n" : "a=sendonly\r\n";
 	return s;
 }
 
@@ -3110,6 +3130,195 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		+ std::to_string(ConferenceRoom::MAX_LEGS) + "), media to "
 		+ destIp + ":" + std::to_string(destPort));
 }
+
+// ── Multicast paging (virtual extension 997, Issue #800) ─────────────────────
+// Same ordering discipline as onConferenceInvite() above: start the media, take
+// the session and the stand-in peer, draw the 200 OK, and only then publish.
+// Every failure before the publish unwinds what it started, so the caller's
+// INVITE retransmit finds a clean slate.
+void RequestsHandler::onMulticastPageInvite(std::shared_ptr<SipMessage> data,
+	const std::shared_ptr<SipClient>& caller)
+{
+	auto refuse = [&](const char* statusLine, const char* why) {
+		if (!refuseInvite(*data, statusLine, kMulticastPageExt)) return;
+		queueLog("997 multicast page: " + std::string(why) + " for "
+			+ std::string(data->getFromNumber()), true);
+	};
+#if !POCKETDIAL_MULTICAST_PAGING
+	(void)caller;
+	refuse("SIP/2.0 403 Forbidden", "multicast paging is not built into this firmware");
+#else
+	const pbx::MulticastPagingConfig cfg = _cfg.multicastPaging();
+	if (!cfg.enabled)
+	{
+		refuse("SIP/2.0 403 Forbidden", "multicast paging is disabled");
+		return;
+	}
+	// #304: the page is re-sent as PCMU, so only a PCMU offer is taken.
+	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+	{
+		refuse("SIP/2.0 488 Not Acceptable Here", "no PCMU offered");
+		return;
+	}
+	if (_mcastPager.isActive() || !_mcastRx.canStart())
+	{
+		refuse("SIP/2.0 486 Busy Here", "a page is already live");
+		return;
+	}
+	std::string callerIp;
+	uint16_t callerPort = 0;
+	if (!parseCallerRtp(data, callerIp, callerPort))
+	{
+		refuse(SipMessageTypes::BAD_REQUEST, "no usable SDP offer in INVITE");
+		return;
+	}
+
+	const std::string callID(data->getCallID());
+	if (!_mcastPager.start(callID, cfg.group, cfg.port, MulticastPager::random32(),
+		static_cast<uint16_t>(MulticastPager::random32()), MulticastPager::random32()))
+	{
+		refuse("SIP/2.0 503 Service Unavailable", "multicast socket could not be opened");
+		return;
+	}
+	auto unwind = [&] {
+		_mcastRx.stop();
+		_mcastPager.stopFor(callID);
+	};
+	// Raw mode: every packet reaches the pager untouched and no DTMF is decoded.
+	// stop() clears the sink, so it is armed again for each page.
+	_mcastRx.setRawSink(&MulticastPager::rawSink, &_mcastPager);
+	if (!_mcastRx.start(0, nullptr))
+	{
+		unwind();
+		refuse("SIP/2.0 503 Service Unavailable", "RTP receiver could not be started");
+		return;
+	}
+
+	auto newSession = allocateSession(callID, caller);
+	if (!newSession)
+	{
+		unwind();
+		refuse("SIP/2.0 503 Service Unavailable", "session pool full");
+		return;
+	}
+	auto dummyPage = allocateVirtualPeer(kMulticastPageExt, data->getSource());
+	if (!dummyPage)
+	{
+		unwind();
+		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
+		return;
+	}
+
+	const std::string toTag = IDGen::GenerateID(9);
+	const std::string sdpBody = buildMediaSdp(_localIp, _mcastRx.localPort(),
+		/*sendrecv=*/false, /*dtmfPt=*/-1, /*recvonly=*/true);
+	auto ok = buildOkWithSdp(data, _localIp, toTag, sdpBody, /*grantSessionTimer=*/false);   // #198: re-INVITE gets 488
+	if (!ok)
+	{
+		unwind();
+		queueLog("997 multicast page: message pool exhausted, page unwound", true);
+		return;
+	}
+
+	newSession->setDest(dummyPage);
+	// Issue #232, as the 888 leg: nothing else records this leg's To-tag.
+	newSession->setLocalTag(toTag);
+	newSession->setDialogHeaders(std::string(data->getFrom()),
+		std::string(data->getTo()) + ";tag=" + toTag);
+	_sessions.emplace(callID, newSession);
+	newSession->setState(Session::State::Connected);
+	_mcastRxSeen = _mcastPager.rxPackets();
+	_mcastRxSeenAt = std::chrono::steady_clock::now();
+
+	_outbox.emplace_back(data->getSource(), std::move(ok));
+
+	char group[16];
+	pbx::formatIpv4(cfg.group, group);
+	queueLog("997 multicast page: " + std::string(caller->getNumber()) + " paging "
+		+ group + ":" + std::to_string(cfg.port));
+#endif
+}
+
+bool RequestsHandler::isMulticastPageCall(std::string_view callID) const
+{
+#if POCKETDIAL_MULTICAST_PAGING
+	return _mcastPager.holds(callID);
+#else
+	(void)callID;
+	return false;
+#endif
+}
+
+void RequestsHandler::sweepMulticastPage(std::chrono::steady_clock::time_point now)
+{
+#if POCKETDIAL_MULTICAST_PAGING
+	if (!_mcastPager.isActive()) return;
+	const uint32_t rx = _mcastPager.rxPackets();
+	if (rx != _mcastRxSeen)
+	{
+		_mcastRxSeen = rx;
+		_mcastRxSeenAt = now;
+		return;
+	}
+	if (now - _mcastRxSeenAt < pbx::kMulticastPageSilence) return;
+
+	// A copy: endCall() below clears the pager's own.
+	const std::string callID = _mcastPager.callId();
+	auto it = _sessions.find(callID);
+	if (it == _sessions.end())
+	{
+		_mcastRx.stop();
+		_mcastPager.stopFor(callID);
+		return;
+	}
+	// The server is the UAS here and originates the BYE: our To is its From
+	// (sendVoicemailBye()'s shape), on our own CSeq space.
+	auto session = it->second;
+	auto src = session->getSrc();
+	const std::string& dFrom = session->getDialogFrom();
+	const std::string& dTo = session->getDialogTo();
+	const uint32_t byeCSeq = session->nextServerCSeq();
+	if (src && !dFrom.empty() && !dTo.empty())
+	{
+		auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom, byeCSeq);
+		if (b) _outbox.emplace_back(src->getAddress(), std::move(b));
+	}
+	session->noteServerCSeq(byeCSeq);
+	endCall(callID, src ? src->getNumber() : "", kMulticastPageExt,
+		"multicast page: no RTP from the caller");
+#else
+	(void)now;
+#endif
+}
+
+#if POCKETDIAL_MULTICAST_PAGING
+pbx::MulticastPagingConfig RequestsHandler::getMulticastPaging()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _cfg.multicastPaging();
+}
+
+std::string RequestsHandler::setMulticastPaging(const pbx::MulticastPagingConfig& cfg)
+{
+	if (!pbx::isUsableMulticastGroup(cfg.group))
+	{
+		return "group must be an IPv4 multicast address outside 224.0.0.0/24";
+	}
+	if (cfg.port == 0)
+	{
+		return "port must be 1-65535";
+	}
+	std::vector<std::pair<bool, std::string>> localLogs;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_cfg.setMulticastPaging(cfg);
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+	printLogs(localLogs);
+	return "";
+}
+#endif
 
 void RequestsHandler::loadVoicemailGreeting()
 {
@@ -6096,6 +6305,19 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// The 997 caller hanging up (#800). Keyed on the page's own dialog, not the To.
+	// endCall() stops the page.
+	if (isMulticastPageCall(data->getCallID()))
+	{
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader(SipMessageTypes::OK);
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		endCall(data->getCallID(), data->getFromNumber(), kMulticastPageExt, "page caller hung up");
+		return;
+	}
+
 	// A parked party hanging up (#804). Its To is the orbit, which no phone owns,
 	// and it has no peerCallID until a retrieve, so nothing below would answer it.
 	// Keyed on the orbit's own state, not on the To number. endCall() frees the
@@ -6722,6 +6944,12 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 		// The server is the UAS on a conference leg (as with 777): the ACK completes
 		// our own 200 OK and there is no second leg to relay it to. Media is already
 		// flowing — the leg joined the bus when the INVITE was answered.
+		return;
+	}
+
+	if (isMulticastPageCall(data->getCallID()))
+	{
+		// #800: the same for a 997 page, which the server answered itself.
 		return;
 	}
 
@@ -7882,6 +8110,14 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	{
 		_conference->leave(std::string(callID));
 	}
+#if POCKETDIAL_MULTICAST_PAGING
+	// Issue #800: the one release point for a 997 page, for the same reason as the
+	// conference leg above. A no-op for every other Call-ID.
+	if (_mcastPager.stopFor(callID))
+	{
+		_mcastRx.stop();
+	}
+#endif
 
 	// Capture the session (for CDR start time / final state) BEFORE we erase it.
 	std::shared_ptr<Session> ending;
@@ -8429,8 +8665,10 @@ bool RequestsHandler::forceDisconnect(const std::string& extension)
 			// time with the tags reversed. The PBX is the UAS on that leg, and the
 			// src BYE above already ends it; the carrier leg is endCall()'s.
 			const std::string destNum = dest ? dest->getNumber() : "";
+			// #800: a 997 page is one too, recognised by its own dialog.
 			const bool destIsVirtual = destNum == "777" || destNum == ConferenceRoom::EXT ||
-			                           destNum == kAnchorCallExt || session->isTrunk();
+			                           destNum == kAnchorCallExt || session->isTrunk() ||
+			                           isMulticastPageCall(callID);
 			if (dest && !destIsVirtual && !dFrom.empty() && !dTo.empty())
 			{
 				auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo, byeCSeq);
@@ -9403,6 +9641,9 @@ void RequestsHandler::tick()
 		// Issue #246: advance Deposit voicemail legs (greeting -> recording)
 		// and enforce the wall-clock recording deadline.
 		sweepVoicemailLegs(now);
+
+		// Issue #800: end a 997 page whose caller has stopped sending RTP.
+		sweepMulticastPage(now);
 
 		// No-answer timers (CFNA + hunt-group progression, plus the anchor
 		// no-answer/ACK-deadline reap below). Poll the armed sessions and act on
@@ -10439,11 +10680,11 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	// holding phone keeps the call on the original SDP.
 	// #453: a retrieved park keeps its orbit number as destNum but now has a real peer
 	// (a splice): relayIntoPeerDialog() below owns it. Only a leg with no peer is a
-	// park-orbit or 440 stand-in to answer locally.
+	// park-orbit or 440 stand-in to answer locally. #800: a 997 page likewise.
 	const bool splicedLeg = session && !session->getPeerCallID().empty();
 	if (destNum == "777" || destNum == ConferenceRoom::EXT ||
 	    (!splicedLeg && (destNum == "440" || pbx::isParkOrbitExt(destNum))) ||
-	    (session && session->isTrunk()) || !src || !dest)
+	    (session && session->isTrunk()) || isMulticastPageCall(data->getCallID()) || !src || !dest)
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -10627,11 +10868,11 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	// keeps the original SDP.
 	// #453: a retrieved park keeps its orbit number as destNum but now has a real peer
 	// (a splice): relayIntoPeerDialog() below owns it. Only a leg with no peer is a
-	// park-orbit or 440 stand-in to answer locally.
+	// park-orbit or 440 stand-in to answer locally. #800: a 997 page likewise.
 	const bool splicedLeg = session && !session->getPeerCallID().empty();
 	if (destNum == "777" || destNum == ConferenceRoom::EXT ||
 	    (!splicedLeg && (destNum == "440" || pbx::isParkOrbitExt(destNum))) ||
-	    (session && session->isTrunk()) || !src || !dest)
+	    (session && session->isTrunk()) || isMulticastPageCall(data->getCallID()) || !src || !dest)
 	{
 		if (!data->hasSdp())
 		{
@@ -10872,9 +11113,10 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 		// matches the isTrunk() guard added to onReinvite()/onUpdate(). A relay
 		// leg has no local UA to answer a refresh, so without this the sweep
 		// BYEs a perfectly healthy PSTN call partway through.
+		// #800: a 997 page is in onReinvite()/onUpdate()'s 488 set, so it is here.
 		if (!sweepSrc || !sweepDest || session->isTrunk() ||
 			sweepDestNum == "777" || sweepDestNum == ConferenceRoom::EXT ||
-			sweepDestNum == kAnchorCallExt)
+			sweepDestNum == kAnchorCallExt || isMulticastPageCall(callID))
 		{
 			continue;
 		}
