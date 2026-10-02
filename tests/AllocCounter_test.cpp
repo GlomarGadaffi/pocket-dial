@@ -97,3 +97,53 @@ TEST(AllocCounter, AnotherThreadsAllocationIsInvisibleToThisThreadsGuard)
 	EXPECT_EQ(mine, 0u) << "the other thread's new leaked into this thread's count";
 	EXPECT_GE(globalDelta, 1u) << "the process-wide counter missed the other thread";
 }
+
+// The live totals the per-call heap tests (PerCallHeap_test.cpp) assert are
+// flat. Without these, a counter that never moved would pass those vacuously.
+TEST(AllocCounter, ALiveBlockIsCountedUntilItIsDeleted)
+{
+	if (!heapLiveTracked()) GTEST_SKIP() << "this C library cannot report block sizes";
+	const std::size_t blocks0 = heapLiveBlocks();
+	const std::size_t bytes0 = heapLiveBytes();
+	char* p = new char[100];
+	g_sink = p;
+	const std::size_t blocks1 = heapLiveBlocks();
+	const std::size_t bytes1 = heapLiveBytes();
+	delete[] p;
+	const std::size_t blocks2 = heapLiveBlocks();
+	const std::size_t bytes2 = heapLiveBytes();
+
+	EXPECT_EQ(blocks1, blocks0 + 1);
+	EXPECT_GE(bytes1, bytes0 + 100);
+	EXPECT_EQ(blocks2, blocks0);
+	EXPECT_EQ(bytes2, bytes0);
+}
+
+TEST(AllocCounter, AlignedAndCrossThreadDeletesBalanceTheLiveTotals)
+{
+	if (!heapLiveTracked()) GTEST_SKIP() << "this C library cannot report block sizes";
+	struct alignas(64) Wide { char c[64]; };
+
+	const std::size_t blocks0 = heapLiveBlocks();
+	const std::size_t bytes0 = heapLiveBytes();
+	Wide* w = new Wide;
+	g_sink = w;
+	const std::size_t alignedHeld = heapLiveBlocks();
+	delete w;
+
+	long* q = nullptr;
+	std::thread t([&q] {
+		q = new long(5);
+		g_sink = q;
+	});
+	t.join();
+	const std::size_t crossHeld = heapLiveBlocks();
+	delete q;   // freed on this thread, allocated on the other
+	const std::size_t blocks1 = heapLiveBlocks();
+	const std::size_t bytes1 = heapLiveBytes();
+
+	EXPECT_EQ(alignedHeld, blocks0 + 1);
+	EXPECT_EQ(crossHeld, blocks0 + 1);
+	EXPECT_EQ(blocks1, blocks0);
+	EXPECT_EQ(bytes1, bytes0);
+}

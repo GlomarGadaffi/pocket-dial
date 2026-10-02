@@ -302,6 +302,17 @@ size_t SipMessage::findHeaderIndex(std::string_view fullName, std::string_view c
 
 void SipMessage::insertHeaderLine(std::string value)
 {
+	// A new line takes a parked buffer when there is one. Adopting `value`'s
+	// instead, while every reset() parks the surplus line, grew a pooled message
+	// by one string per inserted header each time it was reused: the per-call
+	// heap leak (888 answers, REGISTER 200s). Total line buffers now stay at the
+	// most this message has held at once.
+	if (!_spareHeaderLines.empty())
+	{
+		_spareHeaderLines.back().assign(value);
+		value.swap(_spareHeaderLines.back());
+		_spareHeaderLines.pop_back();
+	}
 	size_t clIdx = findHeaderIndex("content-length", "l");
 	if (clIdx != std::string::npos)
 	{
