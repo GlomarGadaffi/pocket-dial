@@ -18,9 +18,12 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "LoopbackAnchorClient.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
 
@@ -169,6 +172,23 @@ namespace
 		return callIdLine;
 	}
 
+	// A BYE as the handset would send it for an inbound anchored call: From the
+	// handset (tag hs106), To the From of the fork INVITE the board sent it (#819).
+	std::shared_ptr<SipMessage> inboundByeFrom(const std::string& callIdLine, const std::string& forkFrom,
+	                                          const char* sourceIp)
+	{
+		const std::string raw =
+			"BYE sip:" + std::string(kPbxIp) + ":5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(sourceIp) + ":5060;branch=z9hG4bK819bye\r\n"
+			"From: <sip:106@" + std::string(kPbxIp) + ">;tag=hs106\r\n"
+			"To:" + forkFrom.substr(5) + "\r\n" +
+			callIdLine + "\r\n"
+			"CSeq: 2 BYE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(sourceIp));
+	}
+
 	// An in-dialog request from the handset: re-INVITE or UPDATE, with an offer.
 	std::shared_ptr<SipMessage> handsetOffer(const std::string& method, const std::string& callIdLine,
 	                                         const char* direction)
@@ -227,4 +247,124 @@ TEST(InboundAnchorReinvite, HandsetSdpUpdateOnAnInboundAnchoredCallIsAnsweredNot
 
 	handler.handle(handsetOffer("UPDATE", callIdLine, "sendonly"));
 	expectAnsweredByTheBoard(handler, sent, callIdLine, "CSeq: 2 UPDATE");
+}
+
+// Issue #819: the handset hanging up an answered inbound anchored call. The
+// session's src is the zero-address PSTN stand-in and the handset's BYE carries
+// the handset as From, so the generic relay block picked the stand-in as the far
+// party: a BYE went to 0.0.0.0:0, the session sat in Bye, and the anchor leg and
+// media bridge lived until Timer F (32 s). The board is the handset's UAS here
+// (like #445's re-INVITE): answer the BYE and end the call at once.
+TEST(InboundAnchorBye, HandsetHangupOnAnInboundAnchoredCallEndsItAtOnceAndNeverReachesThePstnPeer)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const std::string callIdLine = answeredInboundCall(handler, sent);
+
+	// The dialog the handset was offered: its BYE is addressed From the handset
+	// To the From of the fork INVITE the board sent it.
+	const std::string fork = findSentTo(sent, addrFor(kHandsetIp), "INVITE sip:106@");
+	ASSERT_FALSE(fork.empty());
+	const std::string forkFrom = headerLine(fork, "From:");
+	ASSERT_FALSE(forkFrom.empty());
+
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr) << "host suite is expected to boot the Loopback anchor";
+	const unsigned dropsBefore = loop->dropCallCount();
+	sent.clear();
+
+	handler.handle(inboundByeFrom(callIdLine, forkFrom, kHandsetIp));
+	handler.tick();   // drainOutbox() merges _asyncOutbox, so nothing queued can hide
+
+	size_t toZeroedPeer819 = 0;
+	size_t byeRequestsToHandset = 0;
+	for (const auto& [a, msg] : sent)
+	{
+		if (!msg) continue;
+		if (a.sin_addr.s_addr == 0) ++toZeroedPeer819;
+		if (a.sin_addr.s_addr == addrFor(kHandsetIp).sin_addr.s_addr &&
+			msg->toString().compare(0, 4, "BYE ") == 0)
+		{
+			++byeRequestsToHandset;
+		}
+	}
+	EXPECT_EQ(toZeroedPeer819, 0u) << "#819: nothing may be sent to the zero-address PSTN stand-in";
+	EXPECT_EQ(byeRequestsToHandset, 0u) << "the board must not BYE the handset that just hung up";
+	EXPECT_EQ(responsesTo(sent, addrFor(kHandsetIp), "CSeq: 2 BYE"), 1u)
+		<< "exactly one answer to the handset's BYE";
+	const std::string ans = findSentTo(sent, addrFor(kHandsetIp), "CSeq: 2 BYE");
+	ASSERT_FALSE(ans.empty());
+	EXPECT_EQ(ans.compare(0, 15, "SIP/2.0 200 OK\r"), 0) << "the board is the UAS: it answers 200";
+
+	EXPECT_FALSE(handler.getSession(callIdLine).has_value())
+		<< "#819: the call ends at once, not at Timer F";
+	EXPECT_EQ(handler.anchorBridgeForCallIdForTest(callIdLine), nullptr)
+		<< "the media bridge is released with the call";
+
+	// The anchor drop runs on a host anchor worker thread; give it time to land.
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), dropsBefore + 1) << "the carrier leg is dropped exactly once";
+
+	// One CDR record, in the inbound order (anchor participant -> handset), Answered.
+	const auto cdr = handler.cdrSnapshotForTest();
+	ASSERT_EQ(cdr.size(), 1u) << "exactly one CDR record for the call";
+	EXPECT_EQ(cdr[0].caller, "part-445");
+	EXPECT_EQ(cdr[0].callee, "106");
+	EXPECT_EQ(cdr[0].result, CdrResult::Answered);
+}
+
+// Review of #831: while the inbound anchored call is still RINGING its session has no
+// dest, so isDialogSourceAuthorized() fails open. A BYE naming the Call-ID, from the
+// handset's address or from a stranger, must NOT end the call or drop the PSTN leg
+// (the forked phones would ring on, with nothing CANCELling them). Only an ANSWERED
+// call is ended by the handset's BYE.
+namespace
+{
+	void expectRingingInboundCallSurvivesABye(const char* byeSourceIp)
+	{
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+
+		handler.handle(makeRegister("106", kHandsetIp));
+		const std::string callIdLine =
+			handler.routeInboundAnchorCallForTest("106", "part-445", "5551234567");
+		ASSERT_FALSE(callIdLine.empty()) << "precondition: an inbound anchored session exists";
+		handler.tick();   // the fork INVITE waits in _asyncOutbox
+		const std::string fork = findSentTo(sent, addrFor(kHandsetIp), "INVITE sip:106@");
+		ASSERT_FALSE(fork.empty()) << "precondition: the call is forked to the handset and still rings";
+		const std::string forkFrom = headerLine(fork, "From:");
+		ASSERT_FALSE(forkFrom.empty());
+		{
+			auto sess = handler.getSession(callIdLine);
+			ASSERT_TRUE(sess.has_value());
+			ASSERT_NE(sess.value()->getState(), Session::State::Connected) << "precondition: not answered";
+		}
+
+		auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+		ASSERT_NE(loop, nullptr) << "host suite is expected to boot the Loopback anchor";
+		const unsigned dropsBefore = loop->dropCallCount();
+		sent.clear();
+
+		handler.handle(inboundByeFrom(callIdLine, forkFrom, byeSourceIp));
+		handler.tick();
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+		EXPECT_TRUE(handler.getSession(callIdLine).has_value())
+			<< "a BYE on a RINGING inbound call (from " << byeSourceIp << ") must not end it";
+		EXPECT_EQ(loop->dropCallCount(), dropsBefore)
+			<< "and must not drop the PSTN leg from under the ringing phones";
+		EXPECT_TRUE(handler.cdrSnapshotForTest().empty()) << "no CDR: the call has not ended";
+	}
+}
+
+TEST(InboundAnchorBye, AByeFromTheHandsetAddressOnARingingInboundCallDoesNotEndIt)
+{
+	expectRingingInboundCallSurvivesABye(kHandsetIp);
+}
+
+TEST(InboundAnchorBye, AByeFromAStrangerOnARingingInboundCallDoesNotEndIt)
+{
+	expectRingingInboundCallSurvivesABye("192.168.40.99");
 }
