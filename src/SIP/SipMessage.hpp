@@ -72,11 +72,17 @@ namespace SipLimits
 	constexpr size_t   kMaxCSeqDigits   = 10;   // RFC 3261 §8.1.1.5: < 2^31 (corpus 5)
 	constexpr size_t   kMaxMaxForwards  = 255;  // Max-Forwards {1,3} digits, <= 255 (corpus 70)
 	// Policy caps, not buffers: generous against real carrier paths.
+	// kMaxHeaderLines is also the most lines a message keeps from the wire (#838).
 	constexpr unsigned kMaxHeaderLines  = 64;   // corpus 16
 	constexpr unsigned kMaxVia          = 10;   // corpus 1
 	constexpr unsigned kMaxRecordRoute  = 10;   // corpus 0
 	constexpr unsigned kMaxRoute        = 8;    // corpus 0
 	constexpr unsigned kMaxContact      = 4;    // corpus 1
+	// #838: header-line buffer bytes a pooled message keeps between messages.
+	// A datagram is at most 2048 B (UdpServer::BUFFER_SIZE), its lines can take
+	// twice that after string growth, and #462 keeps one message's buffers
+	// parked while another's are in use: four datagrams' worth.
+	constexpr size_t   kMaxKeptLineBytes = 8192;
 }
 
 class SipMessage
@@ -226,7 +232,9 @@ public:
 	// count, Max-Forwards, Via/Route/Record-Route/Contact entry counts,
 	// Require/Proxy-Require option tags (not ACK/CANCEL), and the Content-Type
 	// of an INVITE/UPDATE body. A response is never refused for its routing
-	// headers: a carrier's 183 to our own 911 must not be dropped.
+	// headers: a carrier's 183 to our own 911 must not be dropped. Nor for its
+	// header-line count (#838): past kMaxHeaderLines it is acted on with the
+	// lines splitMessage() kept.
 	// `unsupported` receives the first unknown option tag (a view into this
 	// message) for a 420's Unsupported: header.
 	enum class HeaderVerdict : uint8_t
@@ -377,8 +385,14 @@ private:
 	// this (pooled) object, or a header inserted into it, reuses them rather
 	// than allocating. NOT message state: nothing reads it except the parse/copy
 	// paths and insertHeaderLine() in SipMessage.cpp, and its contents are
-	// meaningless leftovers. Only its capacity matters.
+	// meaningless leftovers. Only its capacity matters. #838: at most
+	// SipLimits::kMaxHeaderLines strings; after a parse or copy, it and
+	// _headerLines hold at most SipLimits::kMaxKeptLineBytes of buffer, or just
+	// what the current lines need if that is more.
 	std::vector<std::string> _spareHeaderLines;
+	// #838: the wire message had more header lines than
+	// SipLimits::kMaxHeaderLines; only the first kMaxHeaderLines were kept.
+	bool                     _tooManyHeaderLines = false;
 	std::string              _body;
 	// Bumped by every _body mutation — see bodyGeneration().
 	//
