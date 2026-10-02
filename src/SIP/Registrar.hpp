@@ -106,9 +106,10 @@ public:
 	// Learn-mode admission: resolves the source MAC, applies TOFU + MAC-lock and
 	// returns the digest decision. Records/updates the adoption entry -- poll
 	// consumeDevicesChange() afterwards to mirror the snapshot. Issue #440:
-	//   - an extension is LOCKED to a MAC on its second REGISTER from that same
-	//     resolved MAC (never the first, never on an ARP miss), and only if no
-	//     earlier-adopted device row holds the extension (first claim wins);
+	//   - an extension is LOCKED to a MAC on a later REGISTER from that same
+	//     resolved MAC at least kLockMinAge after its first (#515; never the
+	//     first, never on an ARP miss), and only if no earlier-adopted device row
+	//     holds the extension (first claim wins);
 	//   - another MAC registering a locked (or Secured) extension -> Reject;
 	//   - an ARP miss for a locked extension -> Accept if `fromRegisteredAddress`
 	//     (the source IP:port is the extension's live binding: the owner's own
@@ -125,6 +126,12 @@ public:
 	// RetryLater. Known MACs never spend one. `now` is a test seam.
 	static constexpr uint8_t kAdoptBurst = 4;
 	static constexpr std::chrono::seconds kAdoptRefill{15};   // 4 per minute
+	// #515: the locking sighting comes at least this long after the MAC's first
+	// sighting for its extension. A real phone's refresh is later than that; a
+	// host answering ARP for fake MACs and sending two REGISTERs each is not, so
+	// a burst cannot squat (lock) extensions or spend an NVS write per lock. A
+	// younger sighting is still admitted as TOFU and does not restart the age.
+	static constexpr std::chrono::seconds kLockMinAge{30};
 	AuthDecision admitLearn(const std::shared_ptr<SipMessage>& data,
 		const std::string& ext, std::string& outRejectReason,
 		std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now(),
@@ -173,6 +180,8 @@ public:
 		r.seq = _nextSeq++;
 		_devices[mac] = r;
 	}
+	// Test-only seam (#515): fixtures that send REGISTERs on the real clock set 0.
+	void setLockMinAgeForTest(std::chrono::seconds age) { _lockMinAge = age; }
 
 	// What moved in the registry since the last consume. Online is by far the
 	// most frequent (every registration and every lease expiry flips it, and a
@@ -201,6 +210,11 @@ private:
 		bool locked = false;   // #440: extension bound to this MAC (persisted)
 		bool shared = false;   // #440: MAC seen with >1 extension; never locks (persisted)
 		uint32_t seq = 0;      // #440: adoption order, for eviction (persisted)
+		// #515: when this MAC first registered its current extension. Volatile, not
+		// persisted: a row loaded from NVS has none and counts as old enough, so an
+		// upgraded board's phones lock at their next REGISTER as before.
+		std::chrono::steady_clock::time_point firstSeen{};
+		bool firstSeenKnown = false;
 	};
 
 	bool persistMode();   // false (and logged at ERROR) if any NVS step failed
@@ -229,6 +243,7 @@ private:
 	// The refusal path IS the flood path: log at most once per refill period
 	// (each log line allocates on the SIP task, #284).
 	std::chrono::steady_clock::time_point _adoptLimitLoggedAt{};
+	std::chrono::seconds _lockMinAge = kLockMinAge;   // setLockMinAgeForTest()
 
 	// Issue #525: digest replay limit. Nonces are stateless (HMAC-tagged, 5 min,
 	// SipDigest.hpp), so without this one captured Authorization could be sent

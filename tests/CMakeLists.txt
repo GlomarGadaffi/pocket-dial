@@ -412,6 +412,8 @@ add_executable(sip_parser_tests
     LearnAdoptionLimit_test.cpp
     # Issue #440: Learn locks an adopted extension to its device.
     RegistrarLearnLock_test.cpp
+    # Issue #515 item 1: the locking sighting comes at least 30 s after the first.
+    LearnLockMinAge_test.cpp
     # Issue #363: every secret-bearing store is empty after a factory reset.
     FactoryResetSecrets_test.cpp
     # Issue #385: the brute-force state-recovery attack on IDGen, run for real

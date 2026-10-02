@@ -43,7 +43,7 @@ on a network you can reach:
 
 | Mode | What it does | When to use it |
 |------|--------------|----------------|
-| **Learn** (`1`, TOFU adoption) | Adopts unknown phones on first REGISTER **without verifying** (trust-on-first-use), records `{MAC, extension}`, and keeps them alive on their *current* credentials. The phone's second REGISTER from the same MAC **locks** the extension to that MAC (#440). Already-secured devices are still digest-challenged. A different MAC claiming a locked or secured extension is rejected. | **The default and the floor.** Phones work with nothing to configure. Until its phone registers a second time, an extension can still be claimed by any device, and a phone on another subnet or sharing a NAT router's MAC is never locked (§5), so adopt on a trusted link. |
+| **Learn** (`1`, TOFU adoption) | Adopts unknown phones on first REGISTER **without verifying** (trust-on-first-use), records `{MAC, extension}`, and keeps them alive on their *current* credentials. The phone's next REGISTER from the same MAC, at least 30 s after its first, **locks** the extension to that MAC (#440, #515). Already-secured devices are still digest-challenged. A different MAC claiming a locked or secured extension is rejected. | **The default and the floor.** Phones work with nothing to configure. Until its phone registers again 30 s or more after its first REGISTER, an extension can still be claimed by any device, and a phone on another subnet or sharing a NAT router's MAC is never locked (§5), so adopt on a trusted link. |
 | **Secure** (`2`, closed) | Every REGISTER is digest-challenged (RFC 2617, MD5). Only extensions whose secret you have set/rotated can register, and each is locked to its adopted MAC. | **Steady-state production.** The target you flip to once the fleet is adopted and secrets are issued. |
 
 There is no open mode (`0`) any more (#500): the API answers `400` for it, and a board or
@@ -251,12 +251,13 @@ ASCII fallback:
 ## 5. The TOFU window discipline
 
 Learn is the default and the floor (the open registrar is retired, #500). Since #440 a
-phone's second REGISTER from the same MAC locks its extension to that MAC, and a different
+phone's next REGISTER from the same MAC locks its extension to that MAC, and a different
 MAC is then refused (`403 Extension Locked To Another Device`). Only REGISTERs whose source
-resolves in the box's ARP table count, and the lock goes to the extension's **first
-claim**: while an earlier-adopted device's row still holds the extension, a later device
+resolves in the box's ARP table count, the locking one must come at least 30 s after the
+phone's first (#515: a burst of two REGISTERs per MAC never locks), and the lock goes to
+the extension's **first claim**: while an earlier-adopted device's row still holds the extension, a later device
 stays plain TOFU however often it registers. Its exposure is every extension **not yet
-locked**: one whose phone has not yet registered a second time, one whose phone is on
+locked**: one whose phone has not yet registered again 30 s after its first, one whose phone is on
 another subnet (no ARP entry, so never locked), one whose phone shares a NAT router's MAC
 with other phones (an unlocked MAC that registers a second extension is marked shared and
 never locks), and one whose first claim came from a device that has gone (forget its row
