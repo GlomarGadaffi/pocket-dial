@@ -467,6 +467,58 @@ class RunSoakTest(unittest.TestCase):
         self.assertIn(("terminate", "load"), [(k, n) for k, n, _ in self.world.events])
         self.assertIs(signal.getsignal(signal.SIGTERM), before)
 
+    def test_a_sighup_mid_run_is_handled_like_sigterm(self):
+        # A run started over `rig_checkout.sh ssh` gets SIGHUP when the connection drops.
+        if not hasattr(signal, "SIGHUP") or os.name != "posix":
+            self.skipTest("POSIX signals")
+        unhandled = []
+        sent = []
+
+        def hup():
+            load = self.world.procs.get("load")
+            if load and not sent and self.world.clock.wall() - load.start >= 100:
+                sent.append(1)
+                os.kill(os.getpid(), signal.SIGHUP)
+                time.sleep(0.05)
+        self.world.clock.listeners.append(hup)
+        # A sentinel, so an unhandled SIGHUP fails this test instead of killing the runner.
+        outer = signal.signal(signal.SIGHUP, lambda *a: unhandled.append(1))
+        try:
+            rc, out = self.go(self.argv())
+            self.assertEqual(unhandled, [], "run_soak left SIGHUP to its default (the run dies unchecked-in)")
+            self.assertEqual(rc, 4, out)
+            self.assertEqual(self.world.released(), ["ABORTED"])
+            tar, d = self.bundle()
+            self.assertEqual(self.manifest(d)["verdict"], "ABORTED")
+            events = [(k, n) for k, n, _ in self.world.events]
+            self.assertLess(events.index(("terminate", "load")), events.index(("terminate", "logger")),
+                            "the load stops first")
+            self.assertIsNot(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
+        finally:
+            signal.signal(signal.SIGHUP, outer)
+
+    def test_a_setsid_nohup_start_keeps_ignoring_sighup(self):
+        if not hasattr(signal, "SIGHUP") or os.name != "posix":
+            self.skipTest("POSIX signals")
+        sent = []
+
+        def hup():
+            load = self.world.procs.get("load")
+            if load and not sent and self.world.clock.wall() - load.start >= 100:
+                sent.append(1)
+                os.kill(os.getpid(), signal.SIGHUP)
+                time.sleep(0.05)
+        self.world.clock.listeners.append(hup)
+        outer = signal.signal(signal.SIGHUP, signal.SIG_IGN)      # what nohup hands over
+        try:
+            rc, out = self.go(self.argv())
+            self.assertEqual(sent, [1])
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(self.world.released(), ["PASS"])
+            self.assertIs(signal.getsignal(signal.SIGHUP), signal.SIG_IGN, "left as nohup set it")
+        finally:
+            signal.signal(signal.SIGHUP, outer)
+
     # ---- the abort path ----------------------------------------------------
     def board_down(self, after_s, for_s):
         def arm():

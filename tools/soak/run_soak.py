@@ -46,7 +46,7 @@ The run, in order:
               flag, image sha256s, versions at start and end, tool versions and
               script sha256s), preflight, backups, load JSON, status log, verdict,
               SHA256SUMS.
-  check-in    ALWAYS (also on SIGINT/SIGTERM): rig_checkout.sh release --verdict ...
+  check-in    ALWAYS (also on SIGINT/SIGTERM/SIGHUP): rig_checkout.sh release --verdict ...
               writes the CHECK-IN post; posting it stays a separate explicit step.
 
 Exit status: 0 PASS, 1 FAIL, 2 refused before anything ran, 3 INVALID (the run
@@ -743,7 +743,13 @@ def main(argv=None, runner=None, clock=None, http_get=None, out=print):
     def on_signal(signum, frame):
         run.stop_requested = True
     old = {}
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    # SIGHUP is a dropped ssh session (a run started over rig_checkout.sh ssh): handled
+    # exactly like SIGTERM. A SIGHUP that arrives already ignored (`setsid nohup ...`)
+    # stays ignored, so that start keeps working as it does.
+    hup = getattr(signal, "SIGHUP", None)
+    for sig in (signal.SIGINT, signal.SIGTERM, hup):
+        if sig is None or (sig == hup and signal.getsignal(sig) == signal.SIG_IGN):
+            continue
         try:
             old[sig] = signal.signal(sig, on_signal)
         except ValueError:
