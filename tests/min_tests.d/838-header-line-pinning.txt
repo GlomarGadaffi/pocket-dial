@@ -1,0 +1,2 @@
+# HeaderLinePinning_test.cpp: 13 (#838: a 2 KB many-line request or response, longer lines, six pool slots at once and a long line at each position leave a pooled message at its baseline, also through handle(); a 64-line message is carried whole and a 65-line request is still 400, also after the pool's copy; a response past the cap is acted on with its first 64 lines; a 911 INVITE and a carrier's answer to a 911 past the cap still connect)
+13
