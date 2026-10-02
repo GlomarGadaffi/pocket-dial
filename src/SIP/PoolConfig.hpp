@@ -81,6 +81,21 @@
 #define POCKETDIAL_MSG_POOL (POCKETDIAL_MAX_CLIENTS + POCKETDIAL_MAX_SUBSCRIPTIONS + 4)
 #endif
 
+// #838: header-line buffer bytes one pooled SipMessage keeps between messages
+// (SipLimits::kMaxKeptLineBytes). It bounds the line buffers only: the two
+// string arrays behind them add up to 64 parked and ~128 in-use entries (24 B
+// each on the ESP32, ~4.5 KB), and the start line and body are not covered.
+// Pool-wide that is POCKETDIAL_MSG_POOL x ~12.5 KB at most: 52 x 12.5 KB ~= 650 KB
+// on the S3 defaults if every slot were filled at once, mostly internal DRAM
+// (allocations under 16 KB go there first). 8 KB is four 2 KB datagrams' worth:
+// one message's lines in use and one parked, each up to twice its size after
+// string growth, so legitimate traffic never trims. SIP_CONSTRAINED sets 4 KB
+// (8 slots, ~68 KB): there a near-maximum message can trim, freeing parked
+// buffers that a later long message allocates again.
+#ifndef POCKETDIAL_KEPT_LINE_BYTES
+#define POCKETDIAL_KEPT_LINE_BYTES 8192
+#endif
+
 // Issue #409: neither pool has a heap fallback any more (#101A's
 // POCKETDIAL_MSG_HEAP_FALLBACK_MAX / POCKETDIAL_VPEER_HEAP_FALLBACK_MAX are gone,
 // so it cannot be switched back on by config). A drained message pool makes the

@@ -180,13 +180,13 @@ namespace
 	// (see nextLine()/parkSurplus() above), so parsing into a warmed pooled
 	// message allocates nothing.
 	//
-	// #838: keeps at most SipLimits::kMaxHeaderLines header lines and returns
-	// true when there were more. Storing every line and counting afterwards let
+	// #838: keeps at most `maxLines` header lines and returns true when there
+	// were more. Storing every line of a datagram and counting afterwards let
 	// one 2 KB datagram of short lines leave ~1000 line buffers in a pooled
 	// message for good, refused or not.
 	bool splitMessage(std::string_view raw, std::string& startLine,
 		std::vector<std::string>& headerLines, std::vector<std::string>& spare,
-		std::string& body)
+		std::string& body, size_t maxLines)
 	{
 		startLine.clear();
 		body.clear();
@@ -265,7 +265,7 @@ namespace
 
 			if (!line.empty())
 			{
-				if (n == SipLimits::kMaxHeaderLines)
+				if (n == maxLines)
 				{
 					tooMany = true;
 					break;
@@ -277,12 +277,15 @@ namespace
 		capKeptLineBytes(headerLines, spare);
 		return tooMany;
 	}
+
+	// A message the PBX built keeps every line (#838).
+	constexpr size_t kEveryLine = static_cast<size_t>(-1);
 }
 
 SipMessage::SipMessage(const std::string& message, sockaddr_in src) : _src(src)
 {
 	_hasSdp = mentionsSdpContentType(message);
-	_tooManyHeaderLines = splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body);
+	_headerLinesTruncated = splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body, kEveryLine);
 }
 
 // Member-wise copy of everything EXCEPT _bodyGen, which advances instead — see
@@ -309,7 +312,7 @@ SipMessage& SipMessage::operator=(const SipMessage& other)
 	}
 	parkSurplus(_headerLines, _spareHeaderLines, n);
 	capKeptLineBytes(_headerLines, _spareHeaderLines);
-	_tooManyHeaderLines = other._tooManyHeaderLines;
+	_headerLinesTruncated = other._headerLinesTruncated;
 	_body        = other._body;
 	_src         = other._src;
 	++_bodyGen;
@@ -318,11 +321,22 @@ SipMessage& SipMessage::operator=(const SipMessage& other)
 
 void SipMessage::reset(std::string_view message, sockaddr_in src)
 {
+	resetWithin(message, src, kEveryLine);
+}
+
+void SipMessage::resetFromWire(std::string_view message, sockaddr_in src)
+{
+	resetWithin(message, src, SipLimits::kMaxHeaderLines);
+}
+
+void SipMessage::resetWithin(std::string_view message, sockaddr_in src, size_t maxHeaderLines)
+{
 	_src = src;
 	_hasSdp = mentionsSdpContentType(message);
 	// splitMessage() clear()s _headerLines rather than reassigning it, so a
 	// pooled message's vector capacity survives across reset() calls.
-	_tooManyHeaderLines = splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body);
+	_headerLinesTruncated = splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body,
+		maxHeaderLines);
 	++_bodyGen;   // this is the pool-recycle path — see bodyGeneration()
 }
 
@@ -881,6 +895,13 @@ namespace
 	// INVITE). "replaces": RFC 3891, see kSupportedOptionTags in
 	// RequestsHandler.cpp. Everything else -- 100rel (no PRACK), path, gruu,
 	// outbound, sec-agree -- is a 420.
+	// A Content-Type value naming SDP. Media type only: parameters after ';' do
+	// not change what we parse.
+	bool isSdpMediaType(std::string_view contentTypeValue)
+	{
+		return iequalLower(trimWs(contentTypeValue.substr(0, contentTypeValue.find(';'))), "application/sdp");
+	}
+
 	bool isKnownOptionTag(std::string_view tag)
 	{
 		return iequalLower(tag, "timer") || iequalLower(tag, "replaces");
@@ -911,7 +932,7 @@ SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported
 	}
 	if (!isRequest) return HeaderVerdict::Ok;
 
-	if (_tooManyHeaderLines || _headerLines.size() > kMaxHeaderLines) return HeaderVerdict::TooManyHeaders;
+	if (_headerLinesTruncated || _headerLines.size() > kMaxHeaderLines) return HeaderVerdict::TooManyHeaders;
 
 	const bool checkRequire = method != SipMessageTypes::ACK && method != SipMessageTypes::CANCEL;
 	const bool checkBody = !_body.empty() &&
@@ -963,13 +984,22 @@ SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported
 		}
 		else if (iequal(name, "content-type") || iequal(name, "c"))
 		{
-			// Media type only: parameters after ';' do not change what we parse.
-			sdpBody = iequalLower(trimWs(value.substr(0, value.find(';'))), "application/sdp");
+			sdpBody = isSdpMediaType(value);
 		}
 	}
 	// RFC 3261 §21.4.13: a body we do not parse, or one with no Content-Type.
 	if (checkBody && !sdpBody) return HeaderVerdict::UnsupportedMediaType;
 	return HeaderVerdict::Ok;
+}
+
+bool SipMessage::hasSdpContentType() const
+{
+	for (const std::string& line : _headerLines)
+	{
+		const std::string_view name = headerNameOf(line);
+		if ((iequal(name, "content-type") || iequal(name, "c")) && isSdpMediaType(headerValueOf(line))) return true;
+	}
+	return false;
 }
 
 const char* SipMessage::headerVerdictText(HeaderVerdict v)

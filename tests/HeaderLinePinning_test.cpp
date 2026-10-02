@@ -151,8 +151,8 @@ namespace
 		return r;
 	}
 
-	// One message reset() in place, which is all a pool slot is
-	// (SipMessagePool.cpp: getMessageFromPool), warmed with a legitimate maximum
+	// One message resetFromWire() in place, which is all a pool slot is for a
+	// datagram (SipMessagePool.cpp: getMessageFromWire), warmed with a legitimate maximum
 	// message and then a normal one. Its own object, not a slot of the
 	// process-global pool: on unfixed code an earlier test may already have
 	// grown every slot, and a baseline taken after that proves nothing.
@@ -161,8 +161,8 @@ namespace
 		auto msg = std::make_unique<SipMessage>(std::string(), src);
 		for (int i = 0; i < 2; ++i)
 		{
-			msg->reset(legitimateMaximum(), src);
-			msg->reset(kNormal, src);
+			msg->resetFromWire(legitimateMaximum(), src);
+			msg->resetFromWire(kNormal, src);
 		}
 		return msg;
 	}
@@ -179,9 +179,9 @@ namespace
 		PinResult r;
 		auto msg = warmedMessage(src);
 		r.before = live();
-		msg->reset(hostile, src);
+		msg->resetFromWire(hostile, src);
 		r.afterHostile = live();
-		msg->reset(kNormal, src);
+		msg->resetFromWire(kNormal, src);
 		r.afterReuse = live();
 		return r;
 	}
@@ -715,10 +715,10 @@ TEST(HeaderLinePinning, ALongLineAtEachPositionDoesNotKeepALargeBufferPerPositio
 	auto msg = warmedMessage(src);
 	const Live before = live();
 
-	for (const std::string& raw : attack) msg->reset(raw, src);
+	for (const std::string& raw : attack) msg->resetFromWire(raw, src);
 	// Every position in use at once, then normal reuse.
-	msg->reset(allPositions, src);
-	msg->reset(kNormal, src);
+	msg->resetFromWire(allPositions, src);
+	msg->resetFromWire(kNormal, src);
 	const Live after = live();
 
 	// Allocator rounding on up to ~130 blocks is the slack.
@@ -1020,4 +1020,15 @@ TEST(HeaderLinePinning, ACarrierAnswerCutThroughItsRecordRouteLeavesNoPartialRou
 	const std::string ack = b.first("ACK", kSbcIp);
 	ASSERT_FALSE(ack.empty()) << "the ACK must go to the carrier, not a hop the cut left first:\n" << b.dump();
 	EXPECT_EQ(ack.find("\r\nRoute:"), std::string::npos) << "a route set missing its first hop:\n" << ack;
+}
+
+// D1's companion: every datagram cut at the cap is counted, and nothing else.
+TEST(HeaderLinePinning, ADatagramCutAtTheCapIsCounted)
+{
+	Rig r;
+	r.send(invite("500", kCallerIp, "600", "pin-count-64", kMaxLines), kCallerIp);
+	EXPECT_EQ(r.handler.getHeaderLineCuts(), 0u) << "64 lines are not cut";
+	r.send(invite("500", kCallerIp, "600", "pin-count-65", kMaxLines + 1), kCallerIp);
+	r.send(hostileResponse("pin-count-resp"), kCalleeIp);
+	EXPECT_EQ(r.handler.getHeaderLineCuts(), 2u) << "one request and one response past the cap";
 }

@@ -115,6 +115,8 @@ public:
 	// of the same empty pool).
 	static std::shared_ptr<SipMessage> getMessageFromPool(std::string_view message, sockaddr_in src);
 	static std::shared_ptr<SipMessage> getMessageFromPool(const SipMessage& source);
+	// #838: a datagram off the socket; see sipmsgpool::getMessageFromWire.
+	static std::shared_ptr<SipMessage> getMessageFromWire(std::string_view message, sockaddr_in src);
 
 	// ── Media beachhead static helpers (pure; host-unit-tested) ──────────────────
 	// Build the server's own SDP body for the 440 answer (server media: PCMU on the
@@ -189,6 +191,9 @@ public:
 	// drop), and emergency requests the gate let through despite a violation.
 	uint64_t getHeaderRejected() const { return _headerRejected.load(std::memory_order_relaxed); }
 	uint64_t getEmergencyHeaderYields() const { return _emergencyHeaderYields.load(std::memory_order_relaxed); }
+	// #838: datagrams that reached the header gate cut at
+	// SipLimits::kMaxHeaderLines. Not on /api/status.
+	uint64_t getHeaderLineCuts() const { return _headerLineCuts.load(std::memory_order_relaxed); }
 	// Issue #409: draws refused because a pool was spent -- there is no heap
 	// fallback behind either pool. The message pool is process-global.
 	uint64_t getVirtualPeerRefusals() const { return _vpeerRefusals.load(std::memory_order_relaxed); }
@@ -2459,6 +2464,7 @@ private:
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
 	std::atomic<uint64_t> _headerRejected{0};         // #199 header admission refusals
 	std::atomic<uint64_t> _emergencyHeaderYields{0};  // #199 911 let through a violation
+	std::atomic<uint64_t> _headerLineCuts{0};         // #838 datagrams cut at 64 header lines
 	std::atomic<uint64_t> _vpeerRefusals{0};   // #409: allocateVirtualPeer() refusals
 	std::atomic<uint32_t> _emergencyRtpReaps{0};   // #741
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP

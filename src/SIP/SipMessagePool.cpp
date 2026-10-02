@@ -118,6 +118,14 @@ namespace sipmsgpool
 		return msg;
 	}
 
+	std::shared_ptr<SipMessage> getMessageFromWire(std::string_view message, sockaddr_in src)
+	{
+		std::shared_ptr<SipMessage> msg = acquirePooledMessage();
+		if (!msg) return nullptr;   // acquirePooledMessage() already logged the pressure
+		msg->resetFromWire(message, src);
+		return msg;
+	}
+
 	std::shared_ptr<SipMessage> getMessageFromPool(const SipMessage& source)
 	{
 		std::shared_ptr<SipMessage> msg = acquirePooledMessage();

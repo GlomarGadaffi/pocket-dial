@@ -19,6 +19,7 @@
 #include <cstdint>
 
 #include "SipStatus.hpp"
+#include "PoolConfig.hpp"   // #838: POCKETDIAL_KEPT_LINE_BYTES
 
 // ── SDP structural limits ───────────────────────────────────────────────────
 // Hard caps SipMessage::checkSdp() enforces on every SDP body BEFORE any decoder
@@ -72,17 +73,15 @@ namespace SipLimits
 	constexpr size_t   kMaxCSeqDigits   = 10;   // RFC 3261 §8.1.1.5: < 2^31 (corpus 5)
 	constexpr size_t   kMaxMaxForwards  = 255;  // Max-Forwards {1,3} digits, <= 255 (corpus 70)
 	// Policy caps, not buffers: generous against real carrier paths.
-	// kMaxHeaderLines is also the most lines a message keeps from the wire (#838).
+	// kMaxHeaderLines is also the most lines resetFromWire() keeps (#838).
 	constexpr unsigned kMaxHeaderLines  = 64;   // corpus 16
 	constexpr unsigned kMaxVia          = 10;   // corpus 1
 	constexpr unsigned kMaxRecordRoute  = 10;   // corpus 0
 	constexpr unsigned kMaxRoute        = 8;    // corpus 0
 	constexpr unsigned kMaxContact      = 4;    // corpus 1
-	// #838: header-line buffer bytes a pooled message keeps between messages.
-	// A datagram is at most 2048 B (UdpServer::BUFFER_SIZE), its lines can take
-	// twice that after string growth, and #462 keeps one message's buffers
-	// parked while another's are in use: four datagrams' worth.
-	constexpr size_t   kMaxKeptLineBytes = 8192;
+	// #838: header-line buffer bytes a pooled message keeps between messages;
+	// see POCKETDIAL_KEPT_LINE_BYTES in PoolConfig.hpp for the sizing.
+	constexpr size_t   kMaxKeptLineBytes = POCKETDIAL_KEPT_LINE_BYTES;
 }
 
 class SipMessage
@@ -98,7 +97,19 @@ public:
 	// splitMessage() below copies what it needs (substr into owned _startLine /
 	// _headerLines / _body) synchronously before this returns, so nothing here
 	// retains the view past the call.
+	//
+	// #838: reset() keeps every header line. The PBX re-parses messages it built
+	// itself (an answer serialised with its own lines added, every stored
+	// retransmission), and those may legitimately run past 64 lines.
 	void reset(std::string_view message, sockaddr_in src);
+	// #838: reset() for a datagram off the socket (SipMessageFactory, i.e.
+	// SipServer::onNewMessage). Keeps at most SipLimits::kMaxHeaderLines header
+	// lines, so a 2 KB datagram of short lines cannot grow a pooled message,
+	// and notes when there were more: checkHeaders() refuses such a request.
+	void resetFromWire(std::string_view message, sockaddr_in src);
+	// True when the datagram this was parsed from had more header lines than
+	// SipLimits::kMaxHeaderLines; only the first kMaxHeaderLines are held.
+	bool headerLinesTruncated() const { return _headerLinesTruncated; }
 
 	// No shared buffer means no string_view to fix up after a copy — plain
 	// member-wise copy of the owned start line / header lines / body is already
@@ -234,7 +245,7 @@ public:
 	// of an INVITE/UPDATE body. A response is never refused for its routing
 	// headers: a carrier's 183 to our own 911 must not be dropped. Nor for its
 	// header-line count (#838): past kMaxHeaderLines it is acted on with the
-	// lines splitMessage() kept.
+	// lines resetFromWire() kept.
 	// `unsupported` receives the first unknown option tag (a view into this
 	// message) for a 420's Unsupported: header.
 	enum class HeaderVerdict : uint8_t
@@ -304,6 +315,10 @@ public:
 	std::string_view getContact() const;
 	std::string_view getContactNumber() const;
 	std::string_view getContentLength() const;
+	// #838: a Content-Type (or compact c:) line whose media type is
+	// application/sdp, ignoring case and parameters. Unlike hasSdp(), which
+	// scans the raw datagram, an Accept line or a body part does not count.
+	bool hasSdpContentType() const;
 	// Full `Authorization:` request-header line (or empty if absent). The value
 	// is fed to SipDigest::parseAuthorization, which tolerates the header name.
 	std::string_view getAuthorization() const;
@@ -390,9 +405,8 @@ private:
 	// _headerLines hold at most SipLimits::kMaxKeptLineBytes of buffer, or just
 	// what the current lines need if that is more.
 	std::vector<std::string> _spareHeaderLines;
-	// #838: the wire message had more header lines than
-	// SipLimits::kMaxHeaderLines; only the first kMaxHeaderLines were kept.
-	bool                     _tooManyHeaderLines = false;
+	// #838: see headerLinesTruncated(). Copied by operator=.
+	bool                     _headerLinesTruncated = false;
 	std::string              _body;
 	// Bumped by every _body mutation — see bodyGeneration().
 	//
@@ -422,6 +436,8 @@ private:
 
 	sockaddr_in _src{};
 
+	// reset() and resetFromWire(): keeps at most `maxHeaderLines` header lines.
+	void resetWithin(std::string_view message, sockaddr_in src, size_t maxHeaderLines);
 	size_t findHeaderIndex(std::string_view fullName, std::string_view compactName = {}) const;
 	// Inserts a new header line just before Content-Length (matching the wire
 	// position addHeader() has always used), or at the end of the header block

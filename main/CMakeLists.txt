@@ -265,6 +265,8 @@ if(SIP_CONSTRAINED)
         POCKETDIAL_MAX_CLIENTS=8
         POCKETDIAL_MAX_SESSIONS=4
         POCKETDIAL_MSG_POOL=8
+        # #838: 4 KB of header-line buffer per pooled message (PoolConfig.hpp).
+        POCKETDIAL_KEPT_LINE_BYTES=4096
         # Issue #466: no PSRAM on this profile, so a MoH clip or voicemail
         # greeting can only live in internal DRAM -- capped at 16 KB (2 s of
         # 8 kHz mu-law), loaded at boot/admin upload only, refused and counted
