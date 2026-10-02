@@ -503,21 +503,29 @@ MAC still gets the extension it last registered as.
 * fewer than **4 unclaimed** rows exist, and the table has room or an evictable row;
 * a free extension exists in `lo`-`hi`.
 
-Every refusal is the same `404` as an unknown MAC (§4.3). PnP's `provision` mode (§1.4)
+Every refusal is the same `404` as an unknown MAC (§4.3). `GET /api/zero-touch` says why
+instead: `free` (extensions assignable right now; a dial-plan pattern that swallows the range
+shows as 0), `lastRefusal` and `refusals`. PnP's `provision` mode (§1.4)
 answers an unknown MAC only when the same checks pass at that moment, so a phone is never
 pointed at a URL that 404s.
 
 **Which extension.** The lowest number in the range that no device row holds, nothing is
 registered as, and nothing routes elsewhere: reserved, emergency and PSTN-shaped numbers, page
 zones (980-989), park orbits (700-709), ring-group pilots, and anything the dial plan matches
-(`RequestsHandler::isRoutedElsewhere()`). `lo` and `hi` are 3-6 digits, no leading zero,
+(`RequestsHandler::isRoutedElsewhere()`); and nothing that already **belongs to someone**:
+voicemail or DND on, a forward set, a DID mapped to it, or a stored SIP secret
+(`hasExtensionState()`). `lo` and `hi` are 3-6 digits, no leading zero,
 `lo <= hi`, fewer than 500 apart.
 
 **The row.** An assignment is an ordinary Learned row, created **locked**, so another MAC
 registering that extension is refused (`Extension Locked To Another Device`), and
 **assigned** (unclaimed) until its MAC first registers. An unclaimed row is evicted before
 any other row, so unauthenticated fetches can never fill the table with rows nothing may
-evict. The same MAC always gets the same extension. `/api/registrar` shows
+evict. The cap counts only rows from the **current** window, and opening a new window drops
+every row an earlier one left unclaimed: phones that fetched and never registered cannot hold
+zero-touch shut. (A late one is not lost: its extension is free again, so its REGISTER is
+adopted by ordinary Learn.) A row is claimed only when its phone registers **that**
+extension. The same MAC always gets the same extension. `/api/registrar` shows
 `"assigned": true` until the phone registers. "Forget learned" clears unclaimed rows too.
 The flag is bit 2 of the persisted row flags; firmware older than #826 reads it as a plain
 locked row.
