@@ -323,6 +323,8 @@ Open at this cut. None of the changes above is claimed bench-verified.
 - 3CX anchor: the media GET stream is unproven on a live tenant (#518).
 - The 4 MB constrained build keeps about 9% of its app slot free.
 - Hardware evidence is one handset model, one board and one carrier; on-device RTP has no automated coverage.
+- Header-line buffers: one 2 KB datagram of about a thousand short lines can pin about 48 KB of heap in a message-pool slot, because the header-count limit is applied after the split and only to requests (#838; present since #462).
+- The rc.1 smoke (1 h on the test rig, main b8b4f0b) passed every check except two. Heap-stable: the idle heap took a one-time step of about 1.5 KB at 25-35 min and stayed flat afterwards (the leak is gone: it was -55.8 KB/h before #837). Idle-quiesce: two real phones registered on the rig during the run. It is not a mechanical PASS.
 
 ## v1.5.0-beta.2 — 2026-09-14
 
