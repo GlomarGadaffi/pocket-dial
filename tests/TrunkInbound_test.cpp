@@ -551,6 +551,20 @@ namespace
 	const std::string kHandsetAnswer =
 		"v=0\r\no=- 0 0 IN IP4 192.168.50.21\r\ns=-\r\nc=IN IP4 192.168.50.21\r\nt=0 0\r\n"
 		"m=audio 42000 RTP/AVP 0 100\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:100 telephone-event/8000\r\n";
+
+	// INVITEs sent to the handset on any Call-ID but `fork`'s: a second fork. A
+	// Timer A retransmission of the first one keeps its Call-ID.
+	size_t otherForks(const Bench& b, const std::string& fork)
+	{
+		size_t n = 0;
+		for (const auto& [addr, msg] : b.sent)
+		{
+			if (!msg || addr.sin_addr.s_addr != inet_addr(kPhoneIp)) continue;
+			const std::string raw = msg->toString();
+			if (raw.rfind("INVITE ", 0) == 0 && field(raw, "Call-ID: ") != field(fork, "Call-ID: ")) ++n;
+		}
+		return n;
+	}
 }
 
 TEST(TrunkInbound, AMappedDidRingsItsExtensionAndItsAnswerIsRelayedBothWays)
@@ -568,7 +582,7 @@ TEST(TrunkInbound, AMappedDidRingsItsExtensionAndItsAnswerIsRelayedBothWays)
 
 	b.sent.clear();
 	b.handler.handle(handsetReply(fork, "SIP/2.0 100 Trying"));
-	EXPECT_TRUE(b.sent.empty()) << "the handset's 100 is ours alone";
+	EXPECT_EQ(b.countTo(kSbcIp), 0u) << "the handset's 100 is ours alone";
 	b.handler.handle(handsetReply(fork, "SIP/2.0 180 Ringing"));
 	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 180 Ringing");
 
@@ -590,7 +604,8 @@ TEST(TrunkInbound, AMappedDidRingsItsExtensionAndItsAnswerIsRelayedBothWays)
 
 	b.sent.clear();
 	b.handler.handle(makeCarrierAck(kDid, field(ok, "To: "), "in-answer"));
-	EXPECT_TRUE(b.sent.empty()) << "the carrier's ACK is taken, not relayed";
+	EXPECT_EQ(b.countTo(kPhoneIp), 0u) << "the carrier's ACK is taken, not relayed to the handset";
+	EXPECT_TRUE(b.firstTo("ACK", kSbcIp).empty()) << "nor echoed back";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
 }
 
@@ -638,7 +653,7 @@ TEST(TrunkInbound, ARetransmittedCarrierInviteNeverForksTwice)
 
 	b.sent.clear();
 	b.handler.handle(makeInvite(kDid, kDid, "in-twice", kSbcIp, true, "+12025550177", 100));
-	EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty()) << "while ringing: no second fork";
+	EXPECT_EQ(otherForks(b, fork), 0u) << "while ringing: no second fork";
 
 	// After our 200 the INVITE's server transaction is no longer absorbed
 	// (TransactionLayer: Accepted), so this retransmission reaches onInvite.
@@ -646,9 +661,31 @@ TEST(TrunkInbound, ARetransmittedCarrierInviteNeverForksTwice)
 	b.sent.clear();
 	b.handler.handle(makeInvite(kDid, kDid, "in-twice", kSbcIp, true, "+12025550177", 100));
 
-	EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty()) << "after the answer: no second fork";
+	EXPECT_EQ(otherForks(b, fork), 0u) << "after the answer: no second fork";
 	EXPECT_TRUE(b.firstTo("482", kSbcIp).empty()) << "nor a 482, which would end the answered call";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+}
+
+TEST(TrunkInbound, AForkThatDrawsNoResponseIsEndedAtTimerB)
+{
+	// RFC 3261 s17.1.1.2: a handset that answers the fork with nothing at all
+	// (off since it registered) is given up at 64*T1. The carrier gets its final
+	// then, not at SipTrunk's 60 s backstop, and the relay is released. Only the
+	// transaction timers are aged, so this is Timer B's doing.
+	Bench b;
+	const std::string fork = ringFork(b, "in-silent");
+	ASSERT_FALSE(fork.empty());
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	b.sent.clear();
+
+	b.handler.expireTransactionTimersForTest();
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable");
+	EXPECT_FALSE(b.handler.getSession("Call-ID: " + field(fork, "Call-ID: ")).has_value());
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	EXPECT_EQ(b.countTo("0.0.0.0"), 0u) << "nothing goes to the stand-in caller's zero address";
 }
 
 TEST(TrunkInbound, AHandsetAnswerTheRelayCannotCarryIsRefusedCleanly)

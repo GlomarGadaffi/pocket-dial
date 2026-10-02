@@ -12513,6 +12513,21 @@ void RequestsHandler::onClientTransactionTimeout(std::string_view callId, std::s
 	// refuses the handset and releases the relay), 28 s sooner than before.
 	if (cseqMethod == "INVITE" && _sipTrunk.handleInviteTimeout(callId)) return;
 
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: the extension never answered a carrier call's fork at all (the layer
+	// reports Timer B only before any provisional). endCall() answers the carrier
+	// 480 through SipTrunk::hangup() and frees the relay, 28 s before SipTrunk's
+	// own backstop would.
+	if (const auto s = cseqMethod == "INVITE" ? getSession(callId) : std::nullopt;
+		s.has_value() && isTrunkInbound(*s.value()) && s.value()->getState() == Session::State::Invited)
+	{
+		endCall(callId, s.value()->getSrc() ? s.value()->getSrc()->getNumber() : std::string(),
+			s.value()->getDest() ? s.value()->getDest()->getNumber() : std::string(),
+			"the extension never answered the fork (Timer B)");
+		return;
+	}
+#endif
+
 	// A BYE this PBX originated drew no final response (#808), so nothing will
 	// ever tell the session its far leg is gone. Only a session waiting on this
 	// BYE is ended: a server BYE on a dialog that is being torn down anyway, or
