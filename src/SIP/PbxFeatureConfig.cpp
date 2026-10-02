@@ -665,6 +665,9 @@ void PbxFeatureConfig::loadPbxConfig()
 	loadE911();
 	// Issue #201: same story as loadE911() just above.
 	loadSbcMode();
+#if POCKETDIAL_MULTICAST_PAGING
+	loadMulticastPaging();   // Issue #800, the same again
+#endif
 #endif
 }
 
@@ -960,6 +963,83 @@ void PbxFeatureConfig::loadSbcMode()
 	nvs_close(h);
 #endif
 }
+
+#if POCKETDIAL_MULTICAST_PAGING
+// ── Multicast paging (Issue #800) ────────────────────────────────────────────
+
+void PbxFeatureConfig::setMulticastPaging(const pbx::MulticastPagingConfig& cfg)
+{
+	_mcastPaging = cfg;
+	char group[16];
+	pbx::formatIpv4(cfg.group, group);
+	_env.log(std::string("Multicast paging ") + (cfg.enabled ? "enabled" : "disabled") +
+		", group " + group + ":" + std::to_string(cfg.port));
+	persistMulticastPaging();
+	// No _onChanged(): not mirrored into the dashboard snapshot, as SBC mode.
+}
+
+void PbxFeatureConfig::persistMulticastPaging()
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Three lines: enabled, group (host order, decimal), port.
+	std::string blob;
+	blob += (_mcastPaging.enabled ? "1" : "0"); blob += '\n';
+	blob += std::to_string(_mcastPaging.group); blob += '\n';
+	blob += std::to_string(_mcastPaging.port); blob += '\n';
+	nvs_handle_t h;
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
+	{
+		nvs_set_str(h, "mcastpage", blob.c_str());
+		nvs_commit(h);
+		nvs_close(h);
+	}
+#endif
+}
+
+void PbxFeatureConfig::loadMulticastPaging()
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	nvs_handle_t h;
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READONLY, &h) != ESP_OK)
+	{
+		return;
+	}
+	size_t len = 0;
+	if (nvs_get_str(h, "mcastpage", nullptr, &len) == ESP_OK && len > 0 && len < 64)
+	{
+		std::string blob(len, '\0');
+		if (nvs_get_str(h, "mcastpage", &blob[0], &len) == ESP_OK)
+		{
+			std::string fields[3];
+			size_t start = 0;
+			for (int i = 0; i < 3 && start < blob.size(); ++i)
+			{
+				const size_t nl = blob.find('\n', start);
+				fields[i] = blob.substr(start, (nl == std::string::npos) ? std::string::npos : nl - start);
+				if (nl == std::string::npos) break;
+				start = nl + 1;
+			}
+			// A field that does not parse, or a group/port the PUT would refuse,
+			// keeps its default rather than paging somewhere nobody configured.
+			pbx::MulticastPagingConfig cfg;
+			cfg.enabled = (fields[0] == "1");
+			const unsigned long long group = std::strtoull(fields[1].c_str(), nullptr, 10);
+			const unsigned long port = std::strtoul(fields[2].c_str(), nullptr, 10);
+			if (group <= 0xFFFFFFFFull && pbx::isUsableMulticastGroup(static_cast<uint32_t>(group)))
+			{
+				cfg.group = static_cast<uint32_t>(group);
+			}
+			if (port >= 1 && port <= 65535)
+			{
+				cfg.port = static_cast<uint16_t>(port);
+			}
+			_mcastPaging = cfg;
+		}
+	}
+	nvs_close(h);
+#endif
+}
+#endif
 
 void PbxFeatureConfig::persistDialPlan()
 {

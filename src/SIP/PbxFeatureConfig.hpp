@@ -155,6 +155,14 @@ public:
 	bool sbcEnabled() const { return _sbcEnabled; }
 	size_t sbcRoute() const { return _sbcRoute; }
 
+#if POCKETDIAL_MULTICAST_PAGING
+	// ── Multicast paging (Issue #800) ────────────────────────────────────────
+	// Stores and persists. Validation is the caller's
+	// (RequestsHandler::setMulticastPaging()).
+	void setMulticastPaging(const pbx::MulticastPagingConfig& cfg);
+	const pbx::MulticastPagingConfig& multicastPaging() const { return _mcastPaging; }
+#endif
+
 	// ── Directed / group call pickup (Issue #68) ──────────────────────────────
 	// Every OTHER extension co-membered with `ext` in any configured ring
 	// group, deduped and order-preserving. Empty if `ext` is in no group. Pure
@@ -185,6 +193,11 @@ private:
 	// means for an operator who turned this on.
 	void persistSbcMode();
 	void loadSbcMode();
+#if POCKETDIAL_MULTICAST_PAGING
+	// Issue #800: its own NVS key, as sbcmode.
+	void persistMulticastPaging();
+	void loadMulticastPaging();
+#endif
 
 	PbxEnv& _env;
 	OnChanged _onChanged;
@@ -226,6 +239,10 @@ private:
 	// meaningful once enabled -- see setSbcMode()'s doc comment above).
 	bool _sbcEnabled = false;
 	size_t _sbcRoute = 0;
+
+#if POCKETDIAL_MULTICAST_PAGING
+	pbx::MulticastPagingConfig _mcastPaging;   // Issue #800: off by default
+#endif
 
 	bool _pbxConfigLoaded = false;
 };

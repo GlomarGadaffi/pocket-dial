@@ -206,6 +206,9 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/MixBus.cpp"
                             "../src/SIP/mix_kernels_scalar.cpp"
                             "../src/SIP/ConferenceRoom.cpp"
+                            # Issue #800: multicast paging (997). Compiles to nothing when
+                            # POCKETDIAL_MULTICAST_PAGING=0 (SIP_CONSTRAINED).
+                            "../src/SIP/MulticastPager.cpp"
                     INCLUDE_DIRS "../src/Helpers" "../src/SIP" "drivers" "ui" "wifi"
                     REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns app_update esp_app_format esp_driver_ledc console esp_timer esp_websocket_client esp_http_client cjson mbedtls esp-tls ${EXTRA_REQUIRES}
                     # Issue #366: HttpServer.cpp calls esp_pthread_set_cfg() to size the
@@ -281,6 +284,9 @@ if(SIP_CONSTRAINED)
         POCKETDIAL_MAX_TRUNK_CALLS=1
         POCKETDIAL_RTP_TX_POOL=3
         POCKETDIAL_CONFERENCE=0
+        # Issue #800: no multicast paging (no rx slot, no re-sender, no route);
+        # 997 answers 403 here.
+        POCKETDIAL_MULTICAST_PAGING=0
         # #689: the 4 MB app slot is full at -Og, so the #618 trunk wire dump
         # (full INVITE + REGISTER response) is compiled out here.
         POCKETDIAL_TRUNK_WIRE_LOG=0
@@ -298,7 +304,7 @@ if(SIP_CONSTRAINED)
     if(NOT DEFINED POCKETDIAL_PCAP_RING_SIZE)
         set(POCKETDIAL_PCAP_RING_SIZE 4)
     endif()
-    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 conference=off mwi=off rtpslots=3x3KBtx+4x6KBrx+1x6KBanchor=39KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
+    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 conference=off mcastpage=off mwi=off rtpslots=3x3KBtx+4x6KBrx+1x6KBanchor=39KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
 endif()
 
 # Issue #731: the constrained build carries exactly ONE outside-line path, chosen at

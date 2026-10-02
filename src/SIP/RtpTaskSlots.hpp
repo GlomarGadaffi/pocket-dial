@@ -12,6 +12,8 @@
 //                 kRxStackBytes, one per receiver.
 // The conference room (POCKETDIAL_CONFERENCE) is built in the RequestsHandler
 // constructor, so its legs' slots are boot-time too; with it off there are none.
+// The multicast pager's receiver (POCKETDIAL_MULTICAST_PAGING) is a RequestsHandler
+// member, so its slot is boot-time as well.
 // tests/tools/test_rtp_static_slots.py gates all this.
 
 #include <cstdint>
@@ -29,14 +31,17 @@ namespace pd
 		constexpr uint32_t kTxStackBytes = 3072;
 		constexpr uint32_t kRxStackBytes = 6144;
 		constexpr uint32_t kConfSlots  = POCKETDIAL_CONFERENCE ? POCKETDIAL_CONF_LEGS : 0;
+		// #800: the multicast pager's one receiver (RequestsHandler::_mcastRx).
+		constexpr uint32_t kMcastPageSlots = POCKETDIAL_MULTICAST_PAGING ? 1 : 0;
 
 		// Option D (desmo): tx stacks are one shared pool sized to the concurrent
 		// media streams, not one per RtpSender object; a full pool refuses (counted).
 		constexpr uint32_t kTxSlots = POCKETDIAL_RTP_TX_POOL;
 		// Receivers keep one slot each (PSRAM): _anchorRtpReceivers + _vmRtpReceivers
-		// + _trunkRx + _handsetRx + conference legs.
+		// + _trunkRx + _handsetRx + conference legs + the multicast pager.
 		constexpr uint32_t kRxSlots = POCKETDIAL_MAX_ANCHOR_CALLS
-			+ POCKETDIAL_MAX_VOICEMAIL_LEGS + 2 * POCKETDIAL_MAX_TRUNK_CALLS + kConfSlots;
+			+ POCKETDIAL_MAX_VOICEMAIL_LEGS + 2 * POCKETDIAL_MAX_TRUNK_CALLS + kConfSlots
+			+ kMcastPageSlots;
 
 		constexpr uint32_t kTxInternalBytes = kTxSlots * kTxStackBytes;
 		constexpr uint32_t kRxPsramBytes    = kRxSlots * kRxStackBytes;
