@@ -112,11 +112,11 @@ CSPRNG `esp_random()`. The trust boundaries below describe the **device**.
 > MAC on its first REGISTER of an unclaimed extension without any credential (S-4), and
 > admits an INVITE from a Learned (unsecured) extension without a challenge; only a device
 > an admin has promoted to Secured proves a secret on REGISTER and on INVITE (#505/#512),
-> and even that has two open bypasses: #507 (an ARP miss admits a Secured extension without
-> digest; a known MAC's extension is rewritten before the check) and the residuals of
-> credential replay: #549 is fixed by #555 (the digest uri must equal the Request-URI,
-> To must match it, and the INVITE's credential is stripped before any fork), but
-> #560 (the relayed ACK and re-INVITE/UPDATE still carry the INVITE's credential; fix #562 open) and #525 (a nonce/`nc` can be reused within its 5-minute life).
+> and the bypasses found in review are fixed: #507 by #487 (an ARP miss no longer admits a
+> Secured extension without digest, and a known MAC's record no longer moves before the
+> check), and credential replay by #555 (#549: the digest uri must equal the Request-URI,
+> To must match it, and the INVITE's credential is stripped before any fork), #562 (#560:
+> the relayed ACK and re-INVITE/UPDATE no longer carry it) and #570 (#525: a reused nonce/`nc` is re-challenged).
 > So any peer that can reach UDP/5060, over the open AP *or* over a wired LAN, where TB-1
 > does not apply at all, can still claim an unclaimed extension and call as an unsecured
 > one, from the address it registered from (#503 refuses an INVITE from any other). The HTTP
@@ -484,7 +484,7 @@ trusted-LAN assumption and the registrar mode (§9) carry the whole load.
   (digest auth, Learn mode, the extension↔MAC lock, a dashboard panel, `GET`/`POST
   /api/registrar`, and the flash-time `cfgseed` route for headless boards). What is left is
   operator work: promote devices to Secured (or run `secure`) so their REGISTER and INVITE
-  prove a secret (#505/#512; open residuals #507, #560 and #525; #549 fixed by #555); an INVITE
+  prove a secret (#505/#512; the review gaps #507, #560, #525 and #549 are fixed by #487, #562, #570 and #555); an INVITE
   is bound to its caller's registered address (#503). See §9 and the operator runbook [LEARN_MODE.md](LEARN_MODE.md). *Narrows
   S-3/D-2, which nothing else in this list does: WPA2 gates who joins the link, but a
   legitimately-joined peer is still unauthenticated at the SIP layer until its device is
@@ -514,9 +514,9 @@ trusted-LAN assumption and the registrar mode (§9) carry the whole load.
 - **SIP digest authentication. DONE.** Challenges REGISTER, and INVITE too (`401`, the
   same stateless nonce): every INVITE in `secure` mode, and a Secured device's INVITE in
   `learn` mode (#512; `RequestsHandler.cpp:1833-1834`). It protects the extensions that have
-  a secret, i.e. devices promoted to Secured or a `secure` deployment, except through two
-  open gaps: #507 (an ARP miss skips it) and #560 (the relayed ACK and re-INVITE/UPDATE still carry the INVITE's credential; fix #562 open) and #525 (a nonce/`nc` can be reused within its 5-minute life). #549 (uri/To binding,
-  credential stripped before a fork) is fixed by #555. A Learned extension proves nothing (P0 above).
+  a secret, i.e. devices promoted to Secured or a `secure` deployment, and its review
+  gaps are fixed: #507 by #487 (an ARP miss no longer skips it), #560 by #562 (the relayed ACK and re-INVITE/UPDATE no longer carry the INVITE's credential), #525 by #570 (a reused nonce/`nc` is re-challenged) and #549 (uri/To binding,
+  credential stripped before a fork) by #555. A Learned extension proves nothing (P0 above).
 - **Per-client brute-force tracking for `login`. DONE, wired since #530** (replaces the global counter
   and stops the cooldown from resetting the
   failure budget; an aggregate backstop bounds address-spoofing). D-3 is **not** retired: one
@@ -633,7 +633,7 @@ single biggest residual risk on a fresh board. What follows is the machinery tha
 an operator switches modes**, it is shipped and reachable, not automatic. SIP **digest
 authentication** (RFC 2617, MD5 / `qop=auth`) challenges **REGISTER**, 
 and **INVITE** too: every INVITE in `secure`, and a Secured device's INVITE in `learn` (#512),
-with #507, #560 and #525 still open (#549 is fixed by #555). The registrar mode is **runtime-selectable**
+and the review gaps #507, #560, #525 and #549 are fixed (#487, #562, #570, #555). The registrar mode is **runtime-selectable**
 (`learn` / `secure`; `open` is retired, #502);
 **Learn mode** adopts an existing fleet trust-on-first-use, keyed by **device MAC** (resolved
 from the REGISTER's source IP via the LAN ARP table, phones do not carry MAC in SIP), then

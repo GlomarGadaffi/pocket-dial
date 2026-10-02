@@ -33,11 +33,11 @@ Quick references: [SETUP_GUIDE.md](SETUP_GUIDE.md) ·
 >   deliberately has no such gate and starts SIP unconditionally
 >   (`main/esp_main_display.cpp:799-806`).
 > * The registrar ships in `learn` mode (#441; `open` is retired, #502): a new phone is
->   adopted on its first REGISTER with no SIP authentication (its second locks the
->   extension to its MAC, #440), and its INVITEs are admitted unchallenged. Digest auth
+>   adopted on its first REGISTER with no SIP authentication (a later one, at least 30 s
+>   after the first, locks the extension to its resolved MAC if no other device claimed it
+>   first, #440/#515), and its INVITEs are admitted unchallenged. Digest auth
 >   (RFC 2617) applies once an admin promotes the device to Secured, or to every extension
->   in `secure` mode, minus open gaps (#560: in-dialog relays still carry the credential;
->   #525: nonce reuse).
+>   in `secure` mode (its review gaps #560 and #525 are fixed by #562 and #570).
 > * The SoftAP is **open** by default, the dashboard is **plain HTTP**, and OTA images are
 >   **unsigned**. All three are deliberate defaults, not oversights.
 

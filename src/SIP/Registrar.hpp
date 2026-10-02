@@ -117,7 +117,8 @@ public:
 	//     ("response already sent") is returned: retryable, never a lockout,
 	//     and sending it makes lwIP ARP the source;
 	//   - an UNLOCKED MAC that registers a second extension is marked shared
-	//     (the signature of phones behind one NAT router) and never locks;
+	//     (the signature of phones behind one NAT router) and never locks; its
+	//     record keeps the extension it holds (#820), locked or not;
 	//   - a first-packet ARP miss for an unlocked extension still Accepts;
 	//   - #507: a Secured extension or device is always digest-checked
 	//     (admitSecure), on an ARP miss too, and its record never moves.

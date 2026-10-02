@@ -360,6 +360,8 @@ Registrar::AuthDecision Registrar::admitLearn(
 	//                            resolve to the router's MAC); a shared MAC never
 	//                            locks. A re-provisioned phone looks the same and
 	//                            is also left unlocked -- fail open, not locked out.
+	//                            The record keeps its extension, locked or not
+	//                            (#820); the other extension is plain TOFU.
 	//   KNOWN + Secured mac    -> enforce digest (same path as secure mode), and
 	//                            never touch its record first (#507).
 	//   ARP miss, ext Secured  -> enforce digest; never accept on a miss (#507).
@@ -522,20 +524,20 @@ Registrar::AuthDecision Registrar::admitLearn(
 	{
 		// One MAC, a second extension, while still UNLOCKED: phones behind a NAT
 		// router, or a phone re-provisioned to a new AOR. Either way this MAC can no
-		// longer vouch for one extension, so it stops locking. Keep the extension in
-		// sync as before.
+		// longer vouch for one extension, so it stops locking. #820: and, like a
+		// locked record above, it keeps its extension. Moving it left that extension
+		// with no earlier claim, so after one REGISTER with the phone's source IP
+		// forged, a device that registered the phone's extension twice locked the
+		// phone out. The other extension is admitted as TOFU.
 		if (!rec.shared)
 		{
 			rec.shared = true;
 			_env.log("Learn: device " + mac + " registered ext " + ext + " after ext " +
 				rec.extension + " -- shared MAC (NAT?), its extensions stay unlocked", true);
+			persistDevices();
+			noteChange(Change::Structural);
 		}
-		rec.locked = false;
-		rec.extension = ext;
-		rec.firstSeen = now;
-		rec.firstSeenKnown = true;
-		persistDevices();
-		noteChange(Change::Structural);
+		return AuthDecision::Accept;
 	}
 
 	// (A Secured record returned above, before the record could be touched.)
