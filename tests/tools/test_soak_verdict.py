@@ -348,6 +348,55 @@ class VerdictHardeningTest(unittest.TestCase):
         self.assertFalse(by_name(results(quiesce_run()))["idle-quiesce"]["judged"])
 
 
+class ExpectRegistrationsTest(unittest.TestCase):
+    """An explicit --expect-registrations always wins over the load report's UA
+    count (the rc.1 smoke: 2 real phones + 4 test UAs on the rig)."""
+
+    def cli(self, samples, rep, *extra):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "log.jsonl")
+            with open(log, "w", encoding="utf-8") as f:
+                for t, st in samples:
+                    f.write(json.dumps({"t": t, "s": st}) + "\n")
+            rp = os.path.join(d, "load.json")
+            with open(rp, "w", encoding="utf-8") as f:
+                json.dump(rep, f)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = sv.main([log, "--min-hours", str(3000 / 3600), "--warmup-s", "300",
+                              "--load-report", rp, "--json", *extra])
+        return rc, by_name(json.loads(buf.getvalue())["checks"])["idle-quiesce"]
+
+    def test_the_flag_wins_over_the_reports_ua_count(self):
+        rc, q = self.cli(quiesce_run(regs_at_quiesce=6), report(), "--expect-registrations", "6")
+        self.assertTrue(q["ok"], q["detail"])
+        self.assertIn("registrations 6 (want exactly 6)", q["detail"])
+        self.assertEqual(rc, 0)
+
+    def test_without_the_flag_the_reports_ua_count_is_the_default(self):
+        rc, q = self.cli(quiesce_run(regs_at_quiesce=6), report())
+        self.assertFalse(q["ok"])
+        self.assertIn("registrations 6 (want exactly 4)", q["detail"])
+        self.assertEqual(rc, 1)
+        rc, q = self.cli(quiesce_run(), report())
+        self.assertTrue(q["ok"], q["detail"])
+        self.assertEqual(rc, 0)
+
+    def test_a_flag_that_does_not_match_the_log_fails(self):
+        rc, q = self.cli(quiesce_run(regs_at_quiesce=6), report(), "--expect-registrations", "5")
+        self.assertFalse(q["ok"])
+        self.assertIn("registrations 6 (want exactly 5)", q["detail"])
+        self.assertEqual(rc, 1)
+
+    def test_an_explicit_config_value_wins_in_assess_too(self):
+        c = cfg()
+        c.expect_registrations = 6
+        res = by_name(sv.assess(quiesce_run(regs_at_quiesce=6), 0, c, load_report=report()))
+        self.assertTrue(res["idle-quiesce"]["ok"], res["idle-quiesce"]["detail"])
+
+
 class FixtureLogTest(unittest.TestCase):
     """Done-when: each fixture log, through the CLI, trips exactly its criterion."""
 

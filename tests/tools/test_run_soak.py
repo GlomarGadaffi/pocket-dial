@@ -85,6 +85,8 @@ class FakeBoard:
         self.down = []            # [(from_wall, until_wall)]
         self.busy = False
         self.hits = 0
+        self.phones = 0           # devices registered on the rig before the load
+        self.test_uas = 0         # the load's own registrations
 
     def up(self):
         w = self.clock.wall()
@@ -96,7 +98,8 @@ class FakeBoard:
         busy = self.busy
         return {"version": self.version, "uptime": int(self.clock.wall() - self.boot_wall),
                 "resetReason": self.reason, "freeHeapInternal": 120000, "minFreeHeapInternal": 60000,
-                "largestFreeBlockInternal": 40000, "clientCount": 4, "recvErrors": 0, "sessions": [],
+                "largestFreeBlockInternal": 40000, "clientCount": self.phones + self.test_uas,
+                "recvErrors": 0, "sessions": [],
                 "sessionCount": 1 if busy else 0, "oldestSessionSec": 5 if busy else 0,
                 "parkedCount": 0, "parkedCalls": [], "stackHwm_sip_server_task": 1500,
                 "coredump": dict(self.coredump)}
@@ -156,27 +159,51 @@ class FakeLogger(FakeProc):
 
 
 class FakeLoad(FakeProc):
+    """Registers its test UAs, calls 20 s of every 60 s for --duration, holds the
+    registrations through the quiesce, then writes a report shaped like
+    sip_stress.py --profile's and de-registers."""
+
     def __init__(self, world, argv):
         super().__init__(world, "load")
         self.start = world.clock.wall()
         self.duration = int(argv[argv.index("--duration") + 1])
         self.report = argv[argv.index("--report") + 1]
+        self.exts = argv[argv.index("--exts") + 1].split(",")
+        self.calls = 0
+        self.last_call_end = None
+        world.board.test_uas = len(self.exts)
 
     def tick(self):
         if self.returncode is not None:
             self.world.board.busy = False
             return
         el = self.world.clock.wall() - self.start
+        if self.world.registers_mid_run_at is not None and int(el) == self.world.registers_mid_run_at:
+            self.world.board.phones += 1           # someone's phone joins the rig mid-run
+        was = self.world.board.busy
         self.world.board.busy = el < self.duration and (el % 60) < 20
+        if self.world.board.busy and not was:
+            self.calls += 1
+        if was and not self.world.board.busy:
+            self.last_call_end = self.world.clock.wall()
         if el >= self.duration + rs.LOAD_QUIESCE_S:
+            n = self.calls
             with open(self.report, "w", encoding="utf-8") as f:
-                json.dump({"pass": self.world.load_rc == 0, "scenarios": {}}, f)
+                json.dump({"profile": "rc1", "pass": self.world.load_rc == 0, "dry_run": False,
+                           "exts": self.exts,
+                           "scenarios": {"echo777": {"planned": n, "attempted": n, "ok": n, "failed": 0}},
+                           "registrations": {"planned": 4, "attempted": 4, "ok": 4, "failed": 0},
+                           "started_at": self.start, "load_end_at": self.start + self.duration,
+                           "last_call_end_at": self.last_call_end,
+                           "quiesce_check_at": self.start + self.duration + rs.LOAD_QUIESCE_S - 1}, f)
             self.world.events.append(("load-done", "load", self.world.clock.wall()))
+            self.world.board.test_uas = 0          # de-registered
             self.returncode = self.world.load_rc
 
     def terminate(self):
         super().terminate()
         self.world.board.busy = False
+        self.world.board.test_uas = 0
 
 
 class World:
@@ -189,6 +216,7 @@ class World:
         self.events = []
         self.procs = {}
         self.logger_dies_at = None
+        self.registers_mid_run_at = None
         self.load_rc = 0
         self.differ_second_nvs_read = False
         self.uhubctl_rc = 0
@@ -343,6 +371,38 @@ class RunSoakTest(unittest.TestCase):
                               str(m["verdict_warmup_s"])], capture_output=True, text=True)
         self.assertEqual(own.returncode, rc, own.stdout)
         self.assertEqual(self.world.released(), ["PASS"])
+
+    def verdict_argv(self):
+        (v,) = [c for c in self.world.calls if len(c) > 1 and c[1].endswith("soak_verdict.py")]
+        return v
+
+    def test_phones_already_on_the_rig_are_expected_at_quiesce(self):
+        self.world.board.phones = 2                # two real phones registered before the load
+        rc, out = self.go(self.argv())
+        self.assertEqual(rc, 0, out)
+        v = self.verdict_argv()
+        self.assertEqual(v[v.index("--expect-registrations") + 1], "6")
+        self.assertTrue(v[v.index("--load-report") + 1].endswith("load.json"))
+        self.assertIn("expected registrations at quiesce: 6 (2 on the rig before the load + 4 test UAs)", out)
+        tar, d = self.bundle()
+        m = self.manifest(d)
+        self.assertEqual(m["expected_registrations"], 6)
+        self.assertEqual(m["expected_registrations_from"], {"on_rig_before_load": 2, "test_uas": 4})
+        with open(os.path.join(d, "verdict.json"), encoding="utf-8") as f:
+            q = {c["name"]: c for c in json.load(f)["checks"]}["idle-quiesce"]
+        self.assertTrue(q["judged"] and q["ok"], q["detail"])
+
+    def test_a_phone_registering_mid_run_still_fails_naming_the_count(self):
+        self.world.board.phones = 2
+        self.world.registers_mid_run_at = 100      # a rig-isolation fault: it must stay visible
+        rc, out = self.go(self.argv())
+        self.assertEqual(rc, 1, out)
+        tar, d = self.bundle()
+        with open(os.path.join(d, "verdict.json"), encoding="utf-8") as f:
+            q = {c["name"]: c for c in json.load(f)["checks"]}["idle-quiesce"]
+        self.assertFalse(q["ok"])
+        self.assertIn("registrations 7 (want exactly 6)", q["detail"])
+        self.assertEqual(self.world.released(), ["FAIL"])
 
     def test_the_logger_starts_before_the_load_and_stops_60_s_after_it(self):
         rc, out = self.go(self.argv())
