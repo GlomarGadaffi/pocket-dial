@@ -297,6 +297,19 @@ public:
 	// matches, or a name already registered or served (findRegistered). Caller
 	// holds _mutex.
 	bool isRoutedElsewhere(const std::string& ext);
+	// An extension that belongs to someone even with no phone on it: voicemail
+	// or DND on, a forward set, a DID mapped to it, or a stored SIP secret
+	// (`secured`, SipSecretStore::securedExtensions(), read once per call by
+	// the caller). Handing it to a new phone would hand over that state. Caller
+	// holds _mutex.
+	bool hasExtensionState(const std::string& ext, const std::vector<std::string>& secured);
+	bool isUnassignable(const std::string& ext, const std::vector<std::string>& secured);
+	// Why the last zero-touch fetch (while a window was open) got no extension.
+	enum class ZeroTouchRefusal : uint8_t
+	{
+		None, Unverified, NotLearn, NoWindow, Cap, NoFreeExtension, TableFull, NoToken
+	};
+	static const char* zeroTouchRefusalName(ZeroTouchRefusal r);
 	struct AutoAssignState
 	{
 		bool open = false;
@@ -304,6 +317,9 @@ public:
 		uint32_t hi = 0;
 		uint32_t secondsLeft = 0;
 		std::size_t unclaimed = 0;
+		std::size_t free = 0;            // extensions in range assignable right now
+		ZeroTouchRefusal lastRefusal = ZeroTouchRefusal::None;
+		uint32_t refusals = 0;           // since boot, while a window was open
 	};
 	// Opens (or reopens) the window for `minutes`. False, nothing changed, when
 	// the range is invalid (Registrar::openAssignWindow) or minutes is 0 or
@@ -1111,6 +1127,10 @@ private:
 
 	// Issue #826: SIP PnP policy + discovered-device table. Own mutex; not _mutex.
 	PnpResponder _pnp;
+	// Issue #826 part B: the last zero-touch refusal, for /api/zero-touch. Guarded by _mutex.
+	ZeroTouchRefusal _ztLastRefusal = ZeroTouchRefusal::None;
+	uint32_t _ztRefusals = 0;
+	void noteZeroTouchRefusal(ZeroTouchRefusal r);
 
 	// RFC 4028 session timer helpers. Caller holds _mutex.
 	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);

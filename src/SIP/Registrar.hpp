@@ -145,7 +145,9 @@ public:
 	// Mark a device online/offline after a (de)registration. Online state is
 	// volatile registration state — never persisted. No-op if the MAC isn't
 	// adopted (e.g. a Learn REGISTER whose ARP lookup missed never records).
-	void markOnline(const std::string& mac, bool online);
+	// #826: `ext` is the AOR just registered; a zero-touch row is claimed only
+	// when its own phone registers its own extension (empty: never claims).
+	void markOnline(const std::string& mac, bool online, std::string_view ext = {});
 	// Promote a device to Secured (MAC-locked + digest-enforced). Accepts a
 	// 12-hex MAC or an extension. Returns true if a record actually changed.
 	bool secure(const std::string& macOrExt);
@@ -186,23 +188,37 @@ public:
 		std::chrono::steady_clock::time_point until{};
 	};
 	// False (window unchanged) unless lo <= hi and hi - lo < kMaxAssignSpan.
-	bool openAssignWindow(uint32_t lo, uint32_t hi, std::chrono::steady_clock::time_point until);
+	// Opening a NEW window (none was open at `now`) drops every unclaimed row
+	// left from an earlier one, so phones that fetched but never registered
+	// cannot hold the cap forever; reopening an open window only changes its
+	// range and end. Rows loaded from NVS belong to no window.
+	bool openAssignWindow(uint32_t lo, uint32_t hi, std::chrono::steady_clock::time_point now,
+		std::chrono::steady_clock::time_point until);
 	void closeAssignWindow() { _assign = AssignWindow{}; }
 	// The window as of `now`: reported closed once `now` reaches its end.
 	AssignWindow assignWindow(std::chrono::steady_clock::time_point now) const;
+	// Unclaimed rows assigned in the current window (what the cap counts).
 	std::size_t unclaimedCount() const;
+	// Why the last assignNext() refused, for /api/zero-touch: every refusal is
+	// the same 404 on the wire, so the admin needs another way to see it.
+	enum class AssignRefusal : uint8_t { None, NoWindow, Cap, NoFreeExtension, TableFull, NoToken };
 	// `mac` already has a row: its extension, true, nothing spent. Otherwise,
 	// with the window open, fewer than kMaxUnclaimed unclaimed rows, room in
 	// the table (or an evictable row), an adoption token and a free extension:
-	// a new assigned row, true. Otherwise false and nothing changed -- in
-	// particular a refusal for want of a token evicts nothing (#487 order:
-	// the victim is chosen first, erased only once the token is spent).
-	// `unusable(ext)` reports an extension taken outside the table (a live
-	// registration, or routing that would shadow it).
+	// a new assigned row, true. Otherwise false, `why` set, and nothing
+	// changed -- in particular a refusal for want of a token evicts nothing
+	// (#487 order: the victim is chosen first, erased only once the token is
+	// spent). `unusable(ext)` reports an extension taken outside the table (a
+	// live registration, routing that would shadow it, per-extension state).
 	bool assignNext(const std::string& mac, std::chrono::steady_clock::time_point now,
-		FunctionRef<bool(const std::string&)> unusable, std::string& outExt);
+		FunctionRef<bool(const std::string&)> unusable, std::string& outExt, AssignRefusal& why);
 	// Would assignNext() give `mac` an extension right now? No side effects.
 	bool canAssign(const std::string& mac, std::chrono::steady_clock::time_point now,
+		FunctionRef<bool(const std::string&)> unusable) const;
+	// How many extensions in the open window's range are free right now
+	// (0 when closed). A broad dial-plan pattern that swallows the whole
+	// range shows up here as 0.
+	std::size_t freeExtensionCount(std::chrono::steady_clock::time_point now,
 		FunctionRef<bool(const std::string&)> unusable) const;
 
 	// Persisted row flags, the 4th field of the "devices" blob: bit 0 locked,
@@ -259,6 +275,7 @@ private:
 		bool shared = false;   // #440: MAC seen with >1 extension; never locks (persisted)
 		uint32_t seq = 0;      // #440: adoption order, for eviction (persisted)
 		bool assigned = false; // #826: zero-touch row, not yet registered by its MAC (persisted)
+		uint32_t window = 0;   // #826: the window an unclaimed row came from (volatile; 0 = none)
 	};
 
 	bool persistMode();   // false (and logged at ERROR) if any NVS step failed
@@ -276,6 +293,7 @@ private:
 	bool pickFreeExtension(std::chrono::steady_clock::time_point now,
 		FunctionRef<bool(const std::string&)> unusable, std::string& out) const;
 	AssignWindow _assign;
+	uint32_t _windowId = 0;   // bumped each time a new window opens
 	uint32_t _nextSeq = 1;
 	// Find a record by MAC key or, failing that, by adopted extension.
 	std::unordered_map<std::string, DeviceRecord>::iterator findDevice(const std::string& macOrExt);

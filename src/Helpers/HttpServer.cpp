@@ -4901,11 +4901,14 @@ void HttpServer::sendApiZeroTouch(int sock)
 		return;
 	}
 	const RequestsHandler::AutoAssignState s = handler->autoAssignState();
-	std::array<char, 160> buf{};
+	std::array<char, 256> buf{};
 	const int n = std::snprintf(buf.data(), buf.size(),
-		"{\"attached\":true,\"open\":%s,\"lo\":%u,\"hi\":%u,\"secondsLeft\":%u,\"unclaimed\":%u,\"learnOnly\":true}",
+		"{\"attached\":true,\"open\":%s,\"lo\":%u,\"hi\":%u,\"secondsLeft\":%u,\"unclaimed\":%u,"
+		"\"free\":%u,\"lastRefusal\":\"%s\",\"refusals\":%u,\"learnOnly\":true}",
 		s.open ? "true" : "false", static_cast<unsigned>(s.lo), static_cast<unsigned>(s.hi),
-		static_cast<unsigned>(s.secondsLeft), static_cast<unsigned>(s.unclaimed));
+		static_cast<unsigned>(s.secondsLeft), static_cast<unsigned>(s.unclaimed),
+		static_cast<unsigned>(s.free), RequestsHandler::zeroTouchRefusalName(s.lastRefusal),
+		static_cast<unsigned>(s.refusals));
 	if (n <= 0 || static_cast<size_t>(n) >= buf.size())
 	{
 		sendResponse(sock, 500, "Internal Server Error", "application/json", "{\"error\":\"too large\"}");
