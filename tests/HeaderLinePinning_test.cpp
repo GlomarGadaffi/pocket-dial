@@ -16,16 +16,19 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
+#include "SipMessageFactory.hpp"
 #include "SipMessagePool.hpp"
 #include "UdpServer.hpp"
 #include "support/AllocCounter.hpp"
@@ -57,6 +60,19 @@ namespace
 		a.sin_addr.s_addr = inet_addr(ip.c_str());
 		a.sin_port = htons(5060);
 		return a;
+	}
+
+	// A datagram off the socket, parsed the way SipServer::onNewMessage() does.
+	std::shared_ptr<SipMessage> fromWire(const std::string& raw, const sockaddr_in& src)
+	{
+		SipMessageFactory factory;
+		auto m = factory.createMessage(raw, src);
+		return m ? *m : nullptr;
+	}
+
+	std::shared_ptr<SipMessage> fromWire(const std::string& raw, const std::string& ip)
+	{
+		return fromWire(raw, addrFor(ip));
 	}
 
 	struct Live
@@ -342,8 +358,9 @@ namespace
 		LeanPoolOnExit& operator=(const LeanPoolOnExit&) = delete;
 		~LeanPoolOnExit()
 		{
+			// Twice the wire cap: a message the PBX built can hold more than 64.
 			std::string raw = "OPTIONS sip:lean@server SIP/2.0\r\n";
-			for (int i = 0; i < kMaxLines; ++i) raw += "X-Lean: " + std::to_string(i) + "\r\n";
+			for (int i = 0; i < 2 * kMaxLines; ++i) raw += "X-Lean: " + std::to_string(i) + "\r\n";
 			raw += "\r\n";
 			std::vector<std::shared_ptr<SipMessage>> held;
 			held.reserve(POCKETDIAL_MSG_POOL);
@@ -404,7 +421,7 @@ namespace
 					"Call-ID: " + headerValue(raw, "Call-ID") + "\r\n"
 					"CSeq: " + headerValue(raw, "CSeq") + "\r\n"
 					"Content-Length: 0\r\n\r\n";
-				handler.handle(RequestsHandler::getMessageFromPool(busy, addr));
+				handler.handle(fromWire(busy, addr));
 			}
 		}
 
@@ -420,7 +437,7 @@ namespace
 
 		void send(const std::string& raw, const char* ip)
 		{
-			handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(ip)));
+			handler.handle(fromWire(raw, ip));
 		}
 
 		// Text of the first message sent to `ip` whose first line has `needle`.
@@ -531,6 +548,78 @@ namespace
 			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
 		return r;
 	}
+
+	// The carrier's answer with four Record-Route lines across the cut: header
+	// lines 62 to 65, the last of which is the route set's first hop
+	// (RFC 3261 §12.1.2 reverses them).
+	std::string carrierAnswerWithRecordRoute(const std::string& carrierInvite)
+	{
+		const std::string sdp =
+			"v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\n"
+			"t=0 0\r\nm=audio 41000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n"
+			"a=rtpmap:101 telephone-event/8000\r\n";
+		std::string r = "SIP/2.0 200 OK\r\n"
+			"Via: " + headerValue(carrierInvite, "Via") + "\r\n"
+			"From: " + headerValue(carrierInvite, "From") + "\r\n"
+			"To: " + headerValue(carrierInvite, "To") + ";tag=carrier-rr\r\n"
+			"Call-ID: " + headerValue(carrierInvite, "Call-ID") + "\r\n"
+			"CSeq: " + headerValue(carrierInvite, "CSeq") + "\r\n"
+			"Contact: <sip:far@203.0.113.9:5060>\r\n";
+		for (int i = 0; i < 55; ++i) r += padLine("X-P: %02d\r\n", i);
+		for (int hop = 62; hop <= 65; ++hop) r += "Record-Route: <sip:10.9.9." + std::to_string(hop) + ";lr>\r\n";
+		r += "Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+		return r;
+	}
+
+	// An INVITE from 500 to `to` carrying the session-timer headers a
+	// pjsua-style UA sends, `lines` header lines in all (at least 12). The short
+	// pad lines go before Content-Type and Content-Length, so on the PBX's own
+	// answer the lines it adds land past line 64.
+	std::string timerInvite(const std::string& to, const std::string& callId, int lines)
+	{
+		std::string r =
+			"INVITE sip:" + to + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bK" + callId + "\r\n"
+			"From: <sip:500@server>;tag=f" + callId + "\r\n"
+			"To: <sip:" + to + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:500@" + std::string(kCallerIp) + ":5060>\r\n"
+			"Supported: replaces, timer\r\n"
+			"Session-Expires: 1800;refresher=uac\r\n"
+			"Require: timer\r\n";
+		for (int i = 0; i < lines - 12; ++i) r += padLine("X-P: %02d\r\n", i);
+		const std::string offer = offerFrom(kCallerIp);
+		r += "Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(offer.size()) + "\r\n\r\n" + offer;
+		return r;
+	}
+
+	// The header names of a message, sorted, without the X-P pad lines.
+	std::vector<std::string> headerNames(const std::string& raw)
+	{
+		std::vector<std::string> names;
+		size_t pos = raw.find("\r\n");
+		while (pos != std::string::npos)
+		{
+			pos += 2;
+			const size_t eol = raw.find("\r\n", pos);
+			if (eol == std::string::npos || eol == pos) break;
+			const std::string name = raw.substr(pos, raw.find(':', pos) - pos);
+			if (name != "X-P") names.push_back(name);
+			pos = eol;
+		}
+		std::sort(names.begin(), names.end());
+		return names;
+	}
+
+	std::string bodyOf(const std::string& raw)
+	{
+		const size_t sep = raw.find("\r\n\r\n");
+		return sep == std::string::npos ? std::string() : raw.substr(sep + 4);
+	}
 }
 
 // ── The done-when: a 2 KB many-line request and response ────────────────────
@@ -572,12 +661,11 @@ TEST(HeaderLinePinning, ManyLineDatagramsAcrossSeveralPoolSlotsDoNotGrowTheHeap)
 	const LeanPoolOnExit lean;
 	constexpr int kSlots = 6;
 	static_assert(kSlots <= POCKETDIAL_MSG_POOL, "the pool must have the slots this test holds");
-	const sockaddr_in src = addrFor(kPinIp);
 	std::vector<std::shared_ptr<SipMessage>> held;
 	held.reserve(kSlots);
 	// Holds kSlots messages at once, so each lands in its own slot.
 	auto drawAll = [&](const std::string& raw) {
-		for (int i = 0; i < kSlots; ++i) held.push_back(RequestsHandler::getMessageFromPool(raw, src));
+		for (int i = 0; i < kSlots; ++i) held.push_back(fromWire(raw, kPinIp));
 		size_t got = 0;
 		for (const auto& m : held) if (m) ++got;
 		held.clear();
@@ -658,11 +746,9 @@ TEST(HeaderLinePinning, ASixtyFiveLineRequestIsStillTooManyHeadersAfterACopy)
 {
 	sipmsgpool::ensureInitialized();
 	const LeanPoolOnExit lean;
-	const sockaddr_in src = addrFor(kPinIp);
 	std::string_view unsupported;
 
-	auto over = RequestsHandler::getMessageFromPool(
-		withHeaderLines("OPTIONS sip:pin@server SIP/2.0", kMaxLines + 1, "edge-65"), src);
+	auto over = fromWire(withHeaderLines("OPTIONS sip:pin@server SIP/2.0", kMaxLines + 1, "edge-65"), kPinIp);
 	ASSERT_TRUE(over);
 	EXPECT_EQ(over->checkHeaders(unsupported), SipMessage::HeaderVerdict::TooManyHeaders);
 
@@ -674,8 +760,7 @@ TEST(HeaderLinePinning, ASixtyFiveLineRequestIsStillTooManyHeadersAfterACopy)
 	// ...and a slot that held it, reused for a 64-line message, is not.
 	const SipMessage* slot = over.get();
 	over.reset();
-	auto reused = RequestsHandler::getMessageFromPool(
-		withHeaderLines("OPTIONS sip:pin@server SIP/2.0", kMaxLines, "edge-64r"), src);
+	auto reused = fromWire(withHeaderLines("OPTIONS sip:pin@server SIP/2.0", kMaxLines, "edge-64r"), kPinIp);
 	ASSERT_EQ(reused.get(), slot) << "precondition: the same slot";
 	EXPECT_EQ(reused->checkHeaders(unsupported), SipMessage::HeaderVerdict::Ok);
 	copy.reset();
@@ -785,8 +870,7 @@ TEST(HeaderLinePinning, AResponsePastTheCapIsActedOnWithItsFirstSixtyFourLines)
 TEST(HeaderLinePinning, AnEmergencyInvitePastTheCapIsStillRoutedToTheCarrier)
 {
 	TrunkRig b;
-	b.handler.handle(RequestsHandler::getMessageFromPool(
-		invite("1001", kHandsetIp, "911", "pin-911-invite", kMaxLines + 6), addrFor(kHandsetIp)));
+	b.handler.handle(fromWire(invite("1001", kHandsetIp, "911", "pin-911-invite", kMaxLines + 6), kHandsetIp));
 	EXPECT_FALSE(b.first("INVITE sip:911@", kSbcIp).empty())
 		<< "a header-line count must never cost a 911 call:\n" << b.dump();
 	EXPECT_TRUE(b.first("SIP/2.0 4", kHandsetIp).empty()) << b.dump();
@@ -795,17 +879,145 @@ TEST(HeaderLinePinning, AnEmergencyInvitePastTheCapIsStillRoutedToTheCarrier)
 TEST(HeaderLinePinning, ACarrierAnswerPastTheCapStillConnectsAnEmergencyCall)
 {
 	TrunkRig b;
-	b.handler.handle(RequestsHandler::getMessageFromPool(
-		invite("1001", kHandsetIp, "911", "pin-911-answer", 12), addrFor(kHandsetIp)));
+	b.handler.handle(fromWire(invite("1001", kHandsetIp, "911", "pin-911-answer", 12), kHandsetIp));
 	const std::string carrierInvite = b.first("INVITE sip:911@", kSbcIp);
 	ASSERT_FALSE(carrierInvite.empty()) << "precondition: 911 went to the trunk:\n" << b.dump();
 	b.sent.clear();
 
-	b.handler.handle(RequestsHandler::getMessageFromPool(
-		carrierAnswer(carrierInvite, kMaxLines + 6), addrFor(kSbcIp)));
+	b.handler.handle(fromWire(carrierAnswer(carrierInvite, kMaxLines + 6), kSbcIp));
 
 	EXPECT_FALSE(b.first("ACK", kSbcIp).empty()) << "the carrier's 2xx must be ACKed:\n" << b.dump();
 	EXPECT_FALSE(b.first("SIP/2.0 200 OK", kHandsetIp).empty())
 		<< "the 911 caller must be connected:\n" << b.dump();
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "the 911's media relay is up";
+}
+
+// ── #838 review: the PBX's own re-parses keep every line ────────────────────
+//
+// The cut is for datagrams off the socket. The PBX also re-parses messages it
+// built itself: an answer serialised with its own headers added and then
+// reset() (buildOkWithSdp, the 440 and 555 re-INVITE answers), and every stored
+// retransmission (TransactionLayer::resend). A legal 64-line INVITE makes such
+// an answer longer than 64 lines, and none of it may be lost.
+
+TEST(HeaderLinePinning, TheAnswerToASixtyFourLineInviteKeepsEveryHeaderTheShortOneGets)
+{
+	for (const char* to : {"777", "888", "555"})
+	{
+		SCOPED_TRACE(to);
+		std::string shortAnswer, longAnswer;
+		{
+			Rig r;
+			r.send(timerInvite(to, std::string("pin-short-") + to, 12), kCallerIp);
+			shortAnswer = r.first("SIP/2.0 200", kCallerIp);
+		}
+		{
+			Rig r;
+			const std::string raw = timerInvite(to, std::string("pin-long-") + to, kMaxLines);
+			ASSERT_LE(raw.size(), kDatagram);
+			r.send(raw, kCallerIp);
+			longAnswer = r.first("SIP/2.0 200", kCallerIp);
+		}
+		ASSERT_FALSE(shortAnswer.empty()) << "precondition: " << to << " answers a short INVITE";
+		ASSERT_FALSE(longAnswer.empty()) << "a 64-line INVITE to " << to << " was not answered";
+		EXPECT_EQ(headerNames(longAnswer), headerNames(shortAnswer))
+			<< "the answer to the 64-line INVITE lost lines:\n" << longAnswer;
+		const std::string body = bodyOf(longAnswer);
+		EXPECT_FALSE(body.empty()) << longAnswer;
+		EXPECT_NE(longAnswer.find("\r\nContent-Type: application/sdp\r\n"), std::string::npos) << longAnswer;
+		EXPECT_EQ(headerValue(longAnswer, "Content-Length"), std::to_string(body.size())) << longAnswer;
+		if (std::string(to) == "555")
+		{
+			EXPECT_NE(longAnswer.find("\r\nRequire: timer\r\n"), std::string::npos)
+				<< "555 grants the session timer (RFC 4028 §9):\n" << longAnswer;
+		}
+	}
+}
+
+// The 400 to a 65-line INVITE is the 64 lines kept plus the PBX's Warning: 65
+// lines, built by copy (no re-parse) and stored by the transaction layer.
+TEST(HeaderLinePinning, AStoredResponseOfMoreThanSixtyFourLinesIsRetransmittedByteForByte)
+{
+	Rig r;
+	r.send(invite("500", kCallerIp, "600", "pin-retx", kMaxLines + 1), kCallerIp);
+	const std::string first = r.first("SIP/2.0 400", kCallerIp);
+	ASSERT_NE(first.find("too many header lines"), std::string::npos) << r.dump();
+	ASSERT_LT(first.size(), static_cast<size_t>(POCKETDIAL_TX_MSG_BYTES))
+		<< "precondition: the transaction layer stores the response whole";
+	r.sent.clear();
+
+	// No ACK: Timer G (RFC 3261 §17.2.1) sends it again from the stored bytes
+	// once T1 (500 ms) has passed, through tick() -> TransactionLayer::sweep()
+	// -> resend(), the path the SIP task runs.
+	std::this_thread::sleep_for(std::chrono::milliseconds(700));
+	r.handler.forceNextTickForTest();
+	r.handler.tick();
+	const std::string again = r.first("SIP/2.0 400", kCallerIp);
+	ASSERT_FALSE(again.empty()) << "precondition: Timer G fired:\n" << r.dump();
+	EXPECT_EQ(again, first);
+}
+
+TEST(HeaderLinePinning, AnEmergencyInviteCutOnTheWireIsAnsweredOverTheAnchorWithItsContentType)
+{
+	Rig r;
+	r.handler.setAnchorPlacesRealCallsForTest(true);
+	// Its own Content-Type and Content-Length are lines 69 and 70: cut on the wire.
+	r.send(invite("500", kCallerIp, "911", "pin-911-anchor", kMaxLines + 6), kCallerIp);
+	const std::string ok = r.first("SIP/2.0 200", kCallerIp);
+	ASSERT_FALSE(ok.empty()) << "the 911 caller must be answered:\n" << r.dump();
+	const std::string body = bodyOf(ok);
+	ASSERT_FALSE(body.empty()) << ok;
+	EXPECT_NE(ok.find("\r\nContent-Type: application/sdp\r\n"), std::string::npos)
+		<< "an SDP answer without the Content-Type the PBX spliced in:\n" << ok;
+	const std::string length = headerValue(ok, "Content-Length");
+	if (!length.empty()) EXPECT_EQ(length, std::to_string(body.size())) << ok;
+}
+
+TEST(HeaderLinePinning, AMessageThePbxBuiltIsReparsedWholeWhateverItsLength)
+{
+	// 100 lines of 100+ characters: past both the line cap and the 8 KB budget,
+	// which may free spare capacity but never a byte of content.
+	std::string raw = "SIP/2.0 200 OK\r\n";
+	for (int i = 0; i < 100; ++i) raw += "X-Built-" + std::to_string(i) + ": " + std::string(100, 'b') + "\r\n";
+	raw += "Content-Length: 0\r\n\r\n";
+	const sockaddr_in src = addrFor(kPinIp);
+
+	SipMessage m(std::string(), src);
+	for (int i = 0; i < 2; ++i)
+	{
+		m.reset(raw, src);
+		EXPECT_EQ(m.toString(), raw);
+	}
+	SipMessage copy(std::string(), src);
+	copy = m;
+	EXPECT_EQ(copy.toString(), raw);
+
+	// Shorter lines into the same buffers: each in-use line now holds spare
+	// capacity while the total is still past the budget, so the budget gives
+	// lines exact-size buffers. Content must come through untouched.
+	std::string shorter = "SIP/2.0 200 OK\r\n";
+	for (int i = 0; i < 100; ++i) shorter += "X-Built-" + std::to_string(i) + ": " + std::string(90, 's') + "\r\n";
+	shorter += "Content-Length: 0\r\n\r\n";
+	m.reset(shorter, src);
+	EXPECT_EQ(m.toString(), shorter);
+	m.reset(raw, src);
+	EXPECT_EQ(m.toString(), raw);
+}
+
+// D1: a 2xx whose Record-Route runs past the cut has lost the hop nearest this
+// PBX, the route set's FIRST hop once reversed. A partial route set sends every
+// in-dialog request to the wrong proxy, so it is not used at all: the ACK goes
+// to the carrier, as with no Record-Route.
+TEST(HeaderLinePinning, ACarrierAnswerCutThroughItsRecordRouteLeavesNoPartialRouteSet)
+{
+	TrunkRig b;
+	b.handler.handle(fromWire(invite("1001", kHandsetIp, "92025550123", "pin-rr", 12), kHandsetIp));
+	const std::string carrierInvite = b.first("INVITE sip:+1", kSbcIp);
+	ASSERT_FALSE(carrierInvite.empty()) << "precondition: the call went to the trunk:\n" << b.dump();
+	b.sent.clear();
+
+	b.handler.handle(fromWire(carrierAnswerWithRecordRoute(carrierInvite), kSbcIp));
+	const std::string ack = b.first("ACK", kSbcIp);
+	ASSERT_FALSE(ack.empty()) << "the ACK must go to the carrier, not a hop the cut left first:\n" << b.dump();
+	EXPECT_EQ(ack.find("\r\nRoute:"), std::string::npos) << "a route set missing its first hop:\n" << ack;
 }
