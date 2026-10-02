@@ -61,7 +61,7 @@ public:
 	struct AdoptedDevice
 	{
 		std::string mac;         // 12 lowercase hex chars
-		std::string extension;   // the AOR it last registered as
+		std::string extension;   // the AOR it was adopted as (#820: a REGISTER never moves it)
 		DeviceState state = DeviceState::Learned;
 		bool online = false;     // currently has a live registration binding
 		bool locked = false;     // #440: Learn has bound its extension to this MAC
