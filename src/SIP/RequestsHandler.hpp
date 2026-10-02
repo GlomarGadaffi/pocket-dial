@@ -444,6 +444,15 @@ public:
 		std::lock_guard<std::mutex> lock(_mutex);
 		_emergencyCallbacks.ageForTest(d);
 	}
+	// Test-only (#726): move every armed client give-up timer (Timer B/F) into
+	// the past, so the next tick() fires it. The trunk's own deadline is left
+	// alone -- expireTrunkDeadlinesForTest() is that -- so a test can tell
+	// which of the two ended a call.
+	void expireTransactionTimersForTest()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_txLayer.expireClientTimeoutsForTest();
+	}
 #endif
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
@@ -939,13 +948,9 @@ private:
 		}
 		endCall(callId, src, dest, reason);
 	}
-	void onByeTimedOut(std::string_view callId) override
-	{
-		// Only a session waiting on this BYE (#808): a server BYE on a dialog that is
-		// being torn down anyway, or to a transferor whose bridge lives on, ends nothing.
-		if (auto s = getSession(callId); s.has_value() && s.value()->getState() == Session::State::Bye)
-			endSession(callId, "BYE unanswered (Timer F)");
-	}
+	// #726: a client transaction gave up (Timer B/F). Routed by Call-ID; the
+	// definition says which legs act on it and why the rest only log.
+	void onClientTransactionTimeout(std::string_view callId, std::string_view cseqMethod) override;
 	void log(std::string msg, bool isError = false) override
 	{
 		queueLog(std::move(msg), isError);

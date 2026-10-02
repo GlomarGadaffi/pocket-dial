@@ -569,7 +569,17 @@ void TransactionLayer::sweepOne(SipTransaction& tx, std::chrono::steady_clock::t
 	// non-2xx), and the §13.3.1.4 64*T1 ceiling on 2xx retransmission.
 	if (armed(tx.transactionTimeout) && now >= tx.transactionTimeout)
 	{
-		bool byeTimedOut = false;
+		// Which give-ups the TU hears about (#726). §17.1.1.2: Timer B belongs to
+		// the Calling state. A slot that drew a provisional is Proceeding, where
+		// the INVITE waits for its final under the TU's own no-answer bound, so
+		// it is released below as before but the TU is NOT told -- telling it
+		// would end a call that is ringing (#712's Proceeding 911 among them).
+		// §17.1.2.2: Timer F informs the TU from Trying and Proceeding alike.
+		const bool informTu =
+			(tx.type == SipTransaction::Type::InviteClient &&
+			 tx.state == SipTransaction::State::Calling) ||
+			tx.type == SipTransaction::Type::NonInviteClient;
+
 		switch (tx.type)
 		{
 			case SipTransaction::Type::InviteClient:
@@ -581,7 +591,6 @@ void TransactionLayer::sweepOne(SipTransaction& tx, std::chrono::steady_clock::t
 			case SipTransaction::Type::NonInviteClient:
 				_env.log(std::string("[tx] Timer F expired — ") + tx.cseqMethod
 					+ " for " + tx.callId + " got no response after 32 s", true);
-				byeTimedOut = std::string_view(tx.cseqMethod) == "BYE";
 				break;
 			case SipTransaction::Type::InviteServer:
 				if (tx.state == SipTransaction::State::Accepted)
@@ -604,13 +613,18 @@ void TransactionLayer::sweepOne(SipTransaction& tx, std::chrono::steady_clock::t
 				break;
 		}
 		tx.type = SipTransaction::Type::None;
-		// After the slot is released, and from a copy of its Call-ID: the env may end
-		// the session, which walks these pools.
-		if (byeTimedOut)
+		// Released first, then reported (§17.1.1.2 terminates, then informs): a
+		// TU that answers by placing a fresh call finds the slot free, and its
+		// freeTransactionsForCallId() has nothing left to double-free. From
+		// copies of the slot's Call-ID and method (#808): the TU may end a
+		// session, which walks these pools.
+		if (informTu)
 		{
 			char callId[sizeof(tx.callId)];
+			char method[sizeof(tx.cseqMethod)];
 			std::memcpy(callId, tx.callId, sizeof(callId));
-			_env.onByeTimedOut(callId);
+			std::memcpy(method, tx.cseqMethod, sizeof(method));
+			_env.onClientTransactionTimeout(callId, method);
 		}
 		return;
 	}

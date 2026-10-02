@@ -2376,3 +2376,90 @@ TEST(SipTrunkRoute, ByeChallengeRetryGoesToTheFirstHopWithTheRouteSet)
 		<< "the retry follows the Route set to its first hop, not the carrier peer";
 	EXPECT_EQ(env.sent[3].to.sin_port, hop.sin_port);
 }
+
+// ── Timer B on our INVITE (#726) ─────────────────────────────────────────────
+
+TEST(SipTrunkListener, InviteTimerBFailsATryingDialogAsFourOhEight)
+{
+	// RFC 3261 §17.1.1.2: the INVITE client transaction gave up (no response at
+	// all in 64*T1). The dialog ends the way sweep()'s deadline ends it -- 408
+	// to the listener, slot released first -- without waiting for the deadline.
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	lis.trunk = &trunk;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	// The layer hands over SipMessage::getCallID()'s form, the full header line.
+	const std::string trunkCallId = "Call-ID: " + d->callID;
+
+	EXPECT_FALSE(trunk.handleInviteTimeout("Call-ID: not-a-trunk-dialog@x"))
+		<< "an unknown Call-ID is not ours";
+	ASSERT_TRUE(trunk.handleInviteTimeout(trunkCallId));
+
+	ASSERT_EQ(lis.events.size(), 1u);
+	EXPECT_EQ(lis.events[0].kind, "failed");
+	EXPECT_EQ(lis.events[0].status, 408) << "a give-up is a timeout in the RFC 3261 sense";
+	EXPECT_EQ(lis.events[0].handsetCallID, "handset-1");
+	EXPECT_EQ(lis.dialogsSeenDuringFailure, 0u) << "the slot is free before the listener hears of it";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+	EXPECT_FALSE(trunk.handleInviteTimeout(trunkCallId)) << "a second report finds nothing";
+}
+
+TEST(SipTrunkListener, InviteTimerBIsIgnoredOnceTheCarrierHasAnswered1xx)
+{
+	// §17.1.1.2: Timer B is a Calling-state timer, so a report on a dialog that
+	// has drawn a provisional is stale. It is refused, and the dialog keeps
+	// ringing under sweep()'s deadline (or none, for a Proceeding 911, #712).
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string trunkCallId = "Call-ID: " + d->callID;
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	lis.events.clear();
+
+	EXPECT_FALSE(trunk.handleInviteTimeout(trunkCallId));
+
+	EXPECT_TRUE(lis.events.empty()) << "nothing was failed";
+	EXPECT_EQ(trunk.activeDialogs(), 1u) << "the ringing dialog is kept";
+}
+
+TEST(SipTrunkListener, InviteTimerBReleasesADialogHungUpInTryingWithNoSecondEvent)
+{
+	// #794 holds the slot of a dialog hung up before any provisional (RFC 3261
+	// §9.1: no CANCEL yet), and Timer B ends a Trying dialog. The handset was
+	// answered when it hung up, so Timer B frees the held slot without a 408
+	// to the listener: one teardown, not two.
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string trunkCallId = "Call-ID: " + d->callID;
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	ASSERT_EQ(trunk.activeDialogs(), 1u) << "precondition: #794 holds the slot";
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.handleInviteTimeout(trunkCallId));
+
+	EXPECT_TRUE(lis.events.empty()) << "the handset already hung up: no 408 to relay";
+	EXPECT_EQ(trunk.activeDialogs(), 0u) << "the held slot is released";
+	EXPECT_TRUE(env.sent.empty()) << "no provisional came, so still no CANCEL";
+
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::seconds(33));
+	EXPECT_TRUE(lis.events.empty()) << "and #794's own Timer B deadline finds nothing left";
+}

@@ -368,9 +368,9 @@ public:
 		virtual void onTrunkAnswered(const TrunkEvent& ev,
 			const std::shared_ptr<SipMessage>& ok) = 0;
 
-		// A 3xx-6xx final to our INVITE, or a sweep timeout (status 408). Fired
-		// AFTER the slot has been released, so the listener may place a fresh
-		// call from inside it.
+		// A 3xx-6xx final to our INVITE, or a timeout (status 408: Timer B on the
+		// INVITE, #726, or sweep()'s deadline). Fired AFTER the slot has been
+		// released, so the listener may place a fresh call from inside it.
 		virtual void onTrunkFailed(const TrunkEvent& ev, int status) = 0;
 
 		// The carrier hung up first. Fired after the 200 is enqueued and the
@@ -433,6 +433,16 @@ public:
 	// A second call on a Cancelling dialog changes nothing. Returns true if a
 	// dialog was found.
 	bool hangup(std::string_view callID);
+
+	// RFC 3261 §17.1.1.2 Timer B on our INVITE (#726): 64*T1 with no response
+	// at all. Ends a Trying dialog exactly as sweep()'s deadline would (408 to
+	// the listener, slot released first) and returns true; a dialog already
+	// hung up in Trying (#794) is released with no 408, since its handset was
+	// answered when it hung up. False when
+	// `trunkCallID` is not a live trunk dialog or the dialog has left Trying: a
+	// provisional stops Timer B, and from Proceeding on the carrier's final or
+	// the deadline ends it.
+	bool handleInviteTimeout(std::string_view trunkCallID);
 
 	// Time out dialogs that never reached a final response.
 	void sweep(std::chrono::steady_clock::time_point now);
@@ -498,6 +508,11 @@ private:
 	// carrier (#386).
 	Dialog* findMutableByTrunkCallID(std::string_view callID);
 	Dialog* allocDialog();
+
+	// Release `d` as a timeout and tell the listener (408), unless the dialog
+	// was already ending on our own BYE/CANCEL. The one copy of the
+	// free-then-fire order, shared by sweep() and handleInviteTimeout().
+	void releaseAsTimeout(Dialog& d);
 
 	// Fill a TrunkEvent from a dialog. Views borrow that dialog's storage, so
 	// the result must not outlive it -- see the Listener note.
