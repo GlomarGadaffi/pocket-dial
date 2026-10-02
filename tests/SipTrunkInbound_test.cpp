@@ -214,6 +214,19 @@ namespace
 		return msg.substr(p + 2, msg.find("\r\n", p + 2) - p - 2);
 	}
 
+	// The carrier's ACK for our 200, carrying our To tag.
+	std::shared_ptr<SipMessage> ackForOurOk(const std::string& ok)
+	{
+		return fromSbc(
+			"ACK sip:15551230000@192.168.1.10:5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKack2\r\n"
+			"From: \"Caller\" <sip:+12025550177@203.0.113.5>;tag=carrier-ftag\r\n"
+			"To: " + lineStarting(ok, "To: ").substr(4) + "\r\n"
+			"Call-ID: carrier-call-1@203.0.113.5\r\n"
+			"CSeq: 101 ACK\r\n"
+			"Content-Length: 0\r\n\r\n");
+	}
+
 	struct Recorder : SipTrunk::Listener
 	{
 		std::vector<std::string> events;
@@ -460,6 +473,7 @@ TEST(SipTrunkInbound, HangingUpAnAnsweredCallByesTheCarrierInTheUasForm)
 {
 	Inbound in;
 	ASSERT_TRUE(in.trunk.respond(kFork, 200, "v=0\r\n"));
+	ASSERT_TRUE(in.trunk.handleAck(*ackForOurOk(in.env.sentRaw(0))));   // part D: RFC 3261 s15
 	in.env.sent.clear();
 
 	ASSERT_TRUE(in.trunk.hangup(kFork));
@@ -483,6 +497,7 @@ TEST(SipTrunkInbound, AChallengedByeRetriesWithOurNextCseq)
 	Inbound in;
 	ASSERT_TRUE(in.trunk.setCredentials("s3cret-pw"));
 	ASSERT_TRUE(in.trunk.respond(kFork, 200, "v=0\r\n"));
+	ASSERT_TRUE(in.trunk.handleAck(*ackForOurOk(in.env.sentRaw(0))));   // part D: RFC 3261 s15
 	ASSERT_TRUE(in.trunk.hangup(kFork));
 	ASSERT_EQ(in.env.sent.size(), 2u);
 	const std::string bye = in.env.sentRaw(1);
@@ -618,4 +633,102 @@ TEST(SipTrunkInbound, TheCarriersAckForOurOkIsRecorded)
 	EXPECT_TRUE(in.trunk.handleAck(*ackWithTo(lineStarting(ok, "To: ").substr(4))));
 	EXPECT_TRUE(in.dialog()->ackSeen) << "from here a BYE may go to the carrier (part D)";
 	EXPECT_TRUE(in.env.sent.size() == 1u) << "an ACK is never answered";
+}
+
+// ── Part D: teardown ──────────────────────────────────────────────────────────
+
+namespace
+{
+	// The carrier cancelling its INVITE (RFC 3261 s9.1): its Request-URI, top
+	// Via, From, To without a tag, Call-ID and CSeq number.
+	std::shared_ptr<SipMessage> carrierCancel(const char* ip = kSbcIp)
+	{
+		return std::make_shared<SipMessage>(
+			"CANCEL sip:15551230000@192.168.1.10:5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKsbc1;rport\r\n"
+			"From: \"Caller\" <sip:+12025550177@203.0.113.5>;tag=carrier-ftag\r\n"
+			"To: <sip:+12025550188@192.168.1.10>\r\n"
+			"Call-ID: carrier-call-1@203.0.113.5\r\n"
+			"CSeq: 101 CANCEL\r\n"
+			"Content-Length: 0\r\n\r\n", FakePbxEnv::addr(ip, 5062));
+	}
+}
+
+TEST(SipTrunkInbound, OurByeWaitsForTheCarriersAck)
+{
+	// RFC 3261 s15: the callee MUST NOT BYE before the ACK for its 2xx.
+	Inbound in;
+	ASSERT_TRUE(in.trunk.respond(kFork, 200, "v=0\r\n"));
+	const std::string ok = in.env.sentRaw(0);
+	in.env.sent.clear();
+
+	ASSERT_TRUE(in.trunk.hangup(kFork));
+	EXPECT_TRUE(in.env.sent.empty()) << "no BYE before the ACK";
+	ASSERT_NE(in.dialog(), nullptr);
+	EXPECT_EQ(in.dialog()->state, SipTrunk::State::Confirmed);
+
+	ASSERT_TRUE(in.trunk.handleAck(*ackForOurOk(ok)));
+	ASSERT_EQ(in.env.sent.size(), 1u) << "the ACK releases the held BYE";
+	EXPECT_EQ(firstLine(in.env.sentRaw(0)), "BYE sip:+12025550177@203.0.113.9:5060 SIP/2.0");
+	ASSERT_NE(in.dialog(), nullptr);
+	EXPECT_EQ(in.dialog()->state, SipTrunk::State::Terminating);
+}
+
+TEST(SipTrunkInbound, AHeldByeGoesOutWhenTheOksRetransmissionsEnd)
+{
+	// s15's other release: the 2xx's retransmissions time out (64*T1, 32 s).
+	Inbound in;
+	ASSERT_TRUE(in.trunk.respond(kFork, 200, "v=0\r\n"));
+	in.env.sent.clear();
+	ASSERT_TRUE(in.trunk.hangup(kFork));
+	in.trunk.sweep(std::chrono::steady_clock::now() + std::chrono::seconds(20));
+	EXPECT_TRUE(in.env.sent.empty()) << "not before 64*T1";
+
+	in.trunk.sweep(std::chrono::steady_clock::now() + std::chrono::seconds(33));
+
+	ASSERT_EQ(in.env.sent.size(), 1u);
+	EXPECT_EQ(firstLine(in.env.sentRaw(0)).substr(0, 4), "BYE ");
+	ASSERT_NE(in.dialog(), nullptr);
+	EXPECT_EQ(in.dialog()->state, SipTrunk::State::Terminating);
+}
+
+TEST(SipTrunkInbound, ACarrierCancelWhileRingingIsAnswered200And487)
+{
+	Inbound in;
+	ASSERT_TRUE(in.trunk.respond(kFork, 180));
+	in.env.sent.clear();
+
+	ASSERT_TRUE(in.trunk.handleCancel(carrierCancel()));
+
+	ASSERT_EQ(in.env.sent.size(), 2u);
+	EXPECT_EQ(firstLine(in.env.sentRaw(0)), "SIP/2.0 200 OK");
+	EXPECT_EQ(lineStarting(in.env.sentRaw(0), "CSeq: "), "CSeq: 101 CANCEL") << "the CANCEL's own 200 (s9.2)";
+	EXPECT_EQ(firstLine(in.env.sentRaw(1)), "SIP/2.0 487 Request Terminated");
+	EXPECT_EQ(lineStarting(in.env.sentRaw(1), "CSeq: "), "CSeq: 101 INVITE") << "and the INVITE's 487";
+	EXPECT_EQ(in.lis.events, std::vector<std::string>{"failed 487"}) << "the engine cancels the fork";
+	EXPECT_EQ(in.trunk.activeDialogs(), 0u);
+}
+
+TEST(SipTrunkInbound, ACancelAfterOurOkOrFromElsewhereChangesNothing)
+{
+	{
+		Inbound in;
+		ASSERT_TRUE(in.trunk.respond(kFork, 200, "v=0\r\n"));
+		in.env.sent.clear();
+		ASSERT_TRUE(in.trunk.handleCancel(carrierCancel()));
+		ASSERT_EQ(in.env.sent.size(), 1u) << "s9.2: answered 200, no effect on an answered INVITE";
+		EXPECT_EQ(firstLine(in.env.sentRaw(0)), "SIP/2.0 200 OK");
+		EXPECT_TRUE(in.lis.events.empty());
+		ASSERT_NE(in.dialog(), nullptr);
+		EXPECT_EQ(in.dialog()->state, SipTrunk::State::Confirmed);
+	}
+	{
+		Inbound in;
+		ASSERT_TRUE(in.trunk.respond(kFork, 180));
+		in.env.sent.clear();
+		EXPECT_FALSE(in.trunk.handleCancel(carrierCancel("198.51.100.66"))) << "only the carrier's address (#356)";
+		EXPECT_TRUE(in.env.sent.empty());
+		ASSERT_NE(in.dialog(), nullptr);
+		EXPECT_EQ(in.dialog()->state, SipTrunk::State::Proceeding);
+	}
 }

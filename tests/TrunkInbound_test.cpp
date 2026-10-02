@@ -704,3 +704,218 @@ TEST(TrunkInbound, AHandsetAnswerTheRelayCannotCarryIsRefusedCleanly)
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
 	EXPECT_FALSE(b.handler.getSession("Call-ID: " + field(fork, "Call-ID: ")).has_value());
 }
+
+// ── Part D: teardown in both directions ───────────────────────────────────────
+
+namespace
+{
+	struct Answered { std::string fork, forkId, ok; };
+
+	// 2001 answers the carrier's call; the carrier ACKs our 200 unless `ackIt` is false.
+	Answered answer(Bench& b, const std::string& callId, bool ackIt = true)
+	{
+		Answered a;
+		a.fork = ringFork(b, callId);
+		a.forkId = "Call-ID: " + field(a.fork, "Call-ID: ");
+		b.handler.handle(handsetReply(a.fork, "SIP/2.0 200 OK", kHandsetAnswer));
+		a.ok = b.firstTo("SIP/2.0 200 OK", kSbcIp);
+		if (ackIt) b.handler.handle(makeCarrierAck(kDid, field(a.ok, "To: "), callId));
+		b.sent.clear();
+		return a;
+	}
+
+	// A request from the carrier in the call `callId` made. A CANCEL reuses the
+	// INVITE's branch (RFC 3261 s9.1); a BYE is a new transaction.
+	std::shared_ptr<SipMessage> carrierRequest(const std::string& method, const std::string& callId,
+		const std::string& toLine, int cseq)
+	{
+		const std::string branch = method == "CANCEL" ? "z9hG4bKc" + callId : "z9hG4bK" + method + callId;
+		const std::string raw =
+			method + " sip:" + std::string(kDid) + "@" + kServerIp + ":5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kSbcIp) + ":5060;branch=" + branch + "\r\n"
+			"From: <sip:+12025550177@" + kSbcIp + ">;tag=cf" + callId + "\r\n"
+			"To: " + toLine + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(cseq) + " " + method + "\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(kSbcIp));
+	}
+
+	// The handset hanging up its side of the fork: its To (with its tag) as From.
+	std::shared_ptr<SipMessage> handsetBye(const std::string& fork)
+	{
+		const std::string raw =
+			"BYE sip:2001@" + std::string(kServerIp) + ":5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kPhoneIp) + ":5060;branch=z9hG4bKhbye\r\n"
+			"From: " + field(fork, "To: ") + ";tag=hs1\r\n"
+			"To: " + field(fork, "From: ") + "\r\n"
+			"Call-ID: " + field(fork, "Call-ID: ") + "\r\n"
+			"CSeq: 2 BYE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(kPhoneIp));
+	}
+
+	std::string requestUri(const std::string& m) { return m.substr(m.find(' ') + 1, m.find(" SIP/2.0") - m.find(' ') - 1); }
+
+	// The SIP thread's next pass drains what an HTTP-task path put on _asyncOutbox.
+	void flushAsync(Bench& b)
+	{
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			"OPTIONS sip:server SIP/2.0\r\nVia: SIP/2.0/UDP 192.168.50.99:5060;branch=z9hG4bKflush\r\n"
+			"From: <sip:probe@server>;tag=p\r\nTo: <sip:server@server>\r\nCall-ID: flush-398d\r\n"
+			"CSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n", addrFor("192.168.50.99")));
+	}
+
+	void expectAllReleased(Bench& b, const std::string& forkId)
+	{
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "the relay pair is released";
+		EXPECT_FALSE(b.handler.getSession(forkId).has_value()) << "and the session ended";
+		EXPECT_EQ(b.countTo("0.0.0.0"), 0u) << "nothing to the stand-in caller's zero address (#819)";
+	}
+}
+
+TEST(TrunkInbound, ACarrierByeHangsUpTheHandsetAtItsRealAddress)
+{
+	Bench b;
+	const Answered a = answer(b, "in-cbye");
+
+	b.handler.handle(carrierRequest("BYE", "in-cbye", field(a.ok, "To: "), 2));
+
+	EXPECT_FALSE(b.firstTo("SIP/2.0 200 OK", kSbcIp).empty()) << "the carrier's BYE is answered";
+	const std::string bye = b.firstTo("BYE ", kPhoneIp);
+	ASSERT_FALSE(bye.empty()) << "the handset is told, at its own address";
+	EXPECT_EQ(field(bye, "From: "), field(a.fork, "From: ")) << "From: our side of the fork (s12.2.1.1)";
+	EXPECT_EQ(field(bye, "To: "), field(a.fork, "To: ") + ";tag=hs1") << "To: the handset, with its tag";
+	expectAllReleased(b, a.forkId);
+}
+
+TEST(TrunkInbound, AHandsetByeHangsUpTheCarrierOnlyOnceItHasAckedOurOk)
+{
+	Bench b;
+	const Answered a = answer(b, "in-hbye", /*ackIt=*/false);
+
+	b.handler.handle(handsetBye(a.fork));
+
+	EXPECT_FALSE(b.firstTo("SIP/2.0 200 OK", kPhoneIp).empty()) << "the handset's BYE is answered";
+	EXPECT_TRUE(b.firstTo("BYE", kSbcIp).empty()) << "RFC 3261 s15: no BYE to the carrier before its ACK";
+	expectAllReleased(b, a.forkId);
+
+	b.handler.handle(makeCarrierAck(kDid, field(a.ok, "To: "), "in-hbye"));
+
+	const std::string bye = b.firstTo("BYE ", kSbcIp);
+	ASSERT_FALSE(bye.empty()) << "the ACK releases the carrier's BYE";
+	EXPECT_EQ(field(bye, "To: "), "<sip:+12025550177@203.0.113.5>;tag=cfin-hbye") << "the carrier's From, with its tag";
+	EXPECT_EQ(field(bye, "CSeq: "), "1 BYE") << "our own CSeq, not the INVITE's";
+}
+
+TEST(TrunkInbound, ACarrierCancelWhileRingingEndsBothLegs)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "in-cancel");
+	ASSERT_FALSE(fork.empty());
+	b.handler.handle(handsetReply(fork, "SIP/2.0 180 Ringing"));
+	b.sent.clear();
+
+	b.handler.handle(carrierRequest("CANCEL", "in-cancel", "<sip:" + std::string(kDid) + "@" + kServerIp + ">", 1));
+
+	EXPECT_EQ(field(b.firstTo("SIP/2.0 200", kSbcIp), "CSeq: "), "1 CANCEL") << "the CANCEL is answered 200";
+	EXPECT_EQ(field(b.firstTo("SIP/2.0 487", kSbcIp), "CSeq: "), "1 INVITE") << "and the INVITE 487 (s9.2)";
+	const std::string cancel = b.firstTo("CANCEL ", kPhoneIp);
+	ASSERT_FALSE(cancel.empty()) << "the fork is cancelled";
+	EXPECT_EQ(requestUri(cancel), requestUri(fork)) << "s9.1: the INVITE's Request-URI";
+	EXPECT_EQ(field(cancel, "Via: "), field(fork, "Via: ")) << "and its branch";
+	EXPECT_EQ(field(cancel, "CSeq: "), "1 CANCEL");
+
+	b.sent.clear();
+	b.handler.handle(handsetReply(fork, "SIP/2.0 487 Request Terminated"));
+	EXPECT_FALSE(b.firstTo("ACK ", kPhoneIp).empty()) << "the handset's 487 is ACKed";
+	EXPECT_EQ(b.countTo(kSbcIp), 0u) << "and absorbed: the carrier already has its 487";
+	expectAllReleased(b, "Call-ID: " + field(fork, "Call-ID: "));
+}
+
+TEST(TrunkInbound, NoAnswerInTwentySecondsGivesTheCarrier480AndCancelsTheFork)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "in-noanswer");
+	ASSERT_FALSE(fork.empty());
+	b.handler.handle(handsetReply(fork, "SIP/2.0 180 Ringing"));
+	const std::string forkId = "Call-ID: " + field(fork, "Call-ID: ");
+	auto s = b.handler.getSession(forkId);
+	ASSERT_TRUE(s.has_value());
+	const auto now = std::chrono::steady_clock::now();
+	EXPECT_FALSE(s.value()->isRingExpired(now + std::chrono::seconds(19))) << "decision 5: 20 s";
+	EXPECT_TRUE(s.value()->isRingExpired(now + std::chrono::seconds(21)));
+
+	s.value()->armRingTimer(now - std::chrono::seconds(1));
+	b.sent.clear();
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable");
+	EXPECT_FALSE(b.firstTo("CANCEL ", kPhoneIp).empty()) << "the handset stops ringing";
+	b.handler.handle(handsetReply(fork, "SIP/2.0 487 Request Terminated"));
+	EXPECT_FALSE(b.firstTo("ACK ", kPhoneIp).empty());
+	expectAllReleased(b, forkId);
+}
+
+TEST(TrunkInbound, TheSixtySecondBackstopAlsoCancelsARingingHandset)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "in-backstop");
+	ASSERT_FALSE(fork.empty());
+	b.handler.handle(handsetReply(fork, "SIP/2.0 180 Ringing"));
+	b.sent.clear();
+
+	b.handler.expireTrunkDeadlinesForTest();
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable");
+	EXPECT_FALSE(b.firstTo("CANCEL ", kPhoneIp).empty()) << "the handset stops ringing too";
+	b.handler.handle(handsetReply(fork, "SIP/2.0 487 Request Terminated"));
+	expectAllReleased(b, "Call-ID: " + field(fork, "Call-ID: "));
+}
+
+TEST(TrunkInbound, AnAdminKillByesTheHandsetAndTheCarrier)
+{
+	Bench b;
+	const Answered a = answer(b, "in-kill");
+
+	ASSERT_TRUE(b.handler.forceDisconnect(kExt));
+	flushAsync(b);
+
+	EXPECT_FALSE(b.firstTo("BYE ", kPhoneIp).empty()) << "the handset";
+	EXPECT_FALSE(b.firstTo("BYE ", kSbcIp).empty()) << "and the carrier";
+	expectAllReleased(b, a.forkId);
+}
+
+TEST(TrunkInbound, AnExpiredLeaseByesTheHandsetAndTheCarrier)
+{
+	Bench b;
+	const Answered a = answer(b, "in-lease");
+
+	b.handler.expireLeaseAndSweepForTest(kExt);
+
+	EXPECT_FALSE(b.firstTo("BYE ", kPhoneIp).empty()) << "the handset, best effort";
+	EXPECT_FALSE(b.firstTo("BYE ", kSbcIp).empty()) << "and the billed carrier leg";
+	expectAllReleased(b, a.forkId);
+}
+
+TEST(TrunkInbound, ASilentInboundCallByesTheHandsetNotTheCallersStandIn)
+{
+	Bench b;
+	const Answered a = answer(b, "in-quiet");
+	auto s = b.handler.getSession(a.forkId);
+	ASSERT_TRUE(s.has_value());
+	b.handler.tick();   // arms the RTP watch
+
+	s.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+	b.handler.tick();
+
+	EXPECT_FALSE(b.firstTo("BYE ", kPhoneIp).empty()) << "the handset is dest on an inbound call";
+	EXPECT_FALSE(b.firstTo("BYE ", kSbcIp).empty()) << "and the carrier is hung up";
+	expectAllReleased(b, a.forkId);
+}
