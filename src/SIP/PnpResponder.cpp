@@ -222,8 +222,10 @@ PnpResponder::Reply PnpResponder::onDatagram(std::string_view raw, const sockadd
 	// A vendor this board has no PnP URL shape for gets silence, not a URL
 	// that 404s: the phone would store it and stop looking for another server.
 	if (pnp::vendorOf(sub.id) == pnp::Vendor::Generic) return {};
-	if (!canServe(macView(sub.id))) return {};
+	// The token first: canServe() can scan a zero-touch range (#826 part B)
+	// under the engine mutex, so a datagram flood must not reach it unmetered.
 	if (!takeToken(nowSeconds)) return {};
+	if (!canServe(macView(sub.id))) return {};
 	const Reply r = answer(sub, src, dev, nowSeconds);
 	if (!r.ok.empty()) _answered.fetch_add(1, std::memory_order_relaxed);
 	return r;

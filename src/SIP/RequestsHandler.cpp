@@ -1555,7 +1555,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			{
 				_beeper.sendBeep(newClient, RegisterBeeper::kAfterRegisterDelay);
 			}
-			if (deviceMac.has_value()) _registrar.markOnline(*deviceMac, true);
+			if (deviceMac.has_value()) _registrar.markOnline(*deviceMac, true, fromNumber);   // #826: claims
 		}
 		else
 		{
@@ -9051,7 +9051,8 @@ bool RequestsHandler::canProvisionMac(std::string_view mac)
 	// extension right now; a phone told about a URL that then 404s stores it
 	// anyway. `mac` is 12 chars, inside std::string's small buffer: no heap.
 	if (_registrar.getMode() != Registrar::Mode::Learn) return false;
-	auto unusable = [this](const std::string& c) { return isRoutedElsewhere(c); };
+	const std::vector<std::string> secured = SipSecretStore::securedExtensions();
+	auto unusable = [this, &secured](const std::string& c) { return isUnassignable(c, secured); };
 	return _registrar.canAssign(std::string(mac), std::chrono::steady_clock::now(), unusable);
 }
 
@@ -9064,20 +9065,90 @@ bool RequestsHandler::isRoutedElsewhere(const std::string& ext)
 	return findRegistered(ext) != nullptr;
 }
 
+bool RequestsHandler::hasExtensionState(const std::string& ext, const std::vector<std::string>& secured)
+{
+	if (_cfg.isVoicemailEnabled(ext) || _cfg.isDndEnabled(ext)) return true;
+	if (!_cfg.getForwardTarget(ext, "always").empty() || !_cfg.getForwardTarget(ext, "busy").empty() ||
+	    !_cfg.getForwardTarget(ext, "noanswer").empty()) return true;
+	if (_didMapping.isTarget(ext)) return true;
+	for (const auto& s : secured)
+	{
+		if (s == ext) return true;
+	}
+	return false;
+}
+
+bool RequestsHandler::isUnassignable(const std::string& ext, const std::vector<std::string>& secured)
+{
+	return isRoutedElsewhere(ext) || hasExtensionState(ext, secured);
+}
+
+const char* RequestsHandler::zeroTouchRefusalName(ZeroTouchRefusal r)
+{
+	switch (r)
+	{
+		case ZeroTouchRefusal::Unverified:      return "unverified";      // peer's ARP MAC is not the MAC asked for
+		case ZeroTouchRefusal::NotLearn:        return "notLearn";
+		case ZeroTouchRefusal::NoWindow:        return "noWindow";
+		case ZeroTouchRefusal::Cap:             return "unclaimedCap";
+		case ZeroTouchRefusal::NoFreeExtension: return "noFreeExtension";
+		case ZeroTouchRefusal::TableFull:       return "tableFull";
+		case ZeroTouchRefusal::NoToken:         return "rateLimited";
+		case ZeroTouchRefusal::None:
+		default:                                return "none";
+	}
+}
+
+void RequestsHandler::noteZeroTouchRefusal(ZeroTouchRefusal r)
+{
+	_ztLastRefusal = r;
+	if (_ztRefusals < UINT32_MAX) ++_ztRefusals;
+}
+
 bool RequestsHandler::autoAssign(const std::string& mac, bool peerMacVerified, std::string& outExt)
 {
-	if (!peerMacVerified) return false;
+	const std::vector<std::string> secured = SipSecretStore::securedExtensions();   // its own lock, taken first
 	std::lock_guard<std::mutex> lock(_mutex);
-	if (_registrar.getMode() != Registrar::Mode::Learn) return false;
-	auto unusable = [this](const std::string& c) { return isRoutedElsewhere(c); };
-	return _registrar.assignNext(mac, std::chrono::steady_clock::now(), unusable, outExt);
+	// Only count refusals while a window is open: an unknown MAC fetching with
+	// zero-touch off is the ordinary 404, not something to explain.
+	const bool windowOpen = _registrar.assignWindow(std::chrono::steady_clock::now()).open;
+	if (!peerMacVerified)
+	{
+		if (windowOpen) noteZeroTouchRefusal(ZeroTouchRefusal::Unverified);
+		return false;
+	}
+	if (_registrar.getMode() != Registrar::Mode::Learn)
+	{
+		if (windowOpen) noteZeroTouchRefusal(ZeroTouchRefusal::NotLearn);
+		return false;
+	}
+	auto unusable = [this, &secured](const std::string& c) { return isUnassignable(c, secured); };
+	Registrar::AssignRefusal why = Registrar::AssignRefusal::None;
+	if (_registrar.assignNext(mac, std::chrono::steady_clock::now(), unusable, outExt, why)) return true;
+	if (windowOpen)
+	{
+		ZeroTouchRefusal r = ZeroTouchRefusal::None;
+		switch (why)
+		{
+			case Registrar::AssignRefusal::NoWindow:        r = ZeroTouchRefusal::NoWindow; break;
+			case Registrar::AssignRefusal::Cap:             r = ZeroTouchRefusal::Cap; break;
+			case Registrar::AssignRefusal::NoFreeExtension: r = ZeroTouchRefusal::NoFreeExtension; break;
+			case Registrar::AssignRefusal::TableFull:       r = ZeroTouchRefusal::TableFull; break;
+			case Registrar::AssignRefusal::NoToken:         r = ZeroTouchRefusal::NoToken; break;
+			case Registrar::AssignRefusal::None:
+			default:                                        break;
+		}
+		noteZeroTouchRefusal(r);
+	}
+	return false;
 }
 
 bool RequestsHandler::openAutoAssign(uint32_t lo, uint32_t hi, uint32_t minutes)
 {
 	if (minutes == 0 || minutes > kMaxAssignMinutes) return false;
 	std::lock_guard<std::mutex> lock(_mutex);
-	return _registrar.openAssignWindow(lo, hi, std::chrono::steady_clock::now() + std::chrono::minutes(minutes));
+	const auto now = std::chrono::steady_clock::now();
+	return _registrar.openAssignWindow(lo, hi, now, now + std::chrono::minutes(minutes));
 }
 
 void RequestsHandler::closeAutoAssign()
@@ -9098,6 +9169,14 @@ RequestsHandler::AutoAssignState RequestsHandler::autoAssignState()
 	s.secondsLeft = w.open ? static_cast<uint32_t>(
 		std::chrono::duration_cast<std::chrono::seconds>(w.until - now).count()) : 0;
 	s.unclaimed = _registrar.unclaimedCount();
+	if (w.open)
+	{
+		const std::vector<std::string> secured = SipSecretStore::securedExtensions();
+		auto unusable = [this, &secured](const std::string& c) { return isUnassignable(c, secured); };
+		s.free = _registrar.freeExtensionCount(now, unusable);
+	}
+	s.lastRefusal = _ztLastRefusal;
+	s.refusals = _ztRefusals;
 	return s;
 }
 

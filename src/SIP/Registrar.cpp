@@ -631,18 +631,20 @@ Registrar::findDevice(const std::string& macOrExt)
 	return it;
 }
 
-void Registrar::markOnline(const std::string& mac, bool online)
+void Registrar::markOnline(const std::string& mac, bool online, std::string_view ext)
 {
 	auto it = _devices.find(mac);
 	if (it == _devices.end())
 	{
 		return;
 	}
-	if (online && it->second.assigned)
+	if (online && it->second.assigned && !ext.empty() && ext == it->second.extension)
 	{
-		// #826: the phone a zero-touch row was made for has registered: claimed.
-		// From here it is an ordinary locked row, never evicted.
+		// #826: the phone a zero-touch row was made for has registered the
+		// extension it was given: claimed. From here it is an ordinary locked
+		// row, never evicted. (A REGISTER for some other AOR does not claim it.)
 		it->second.assigned = false;
+		it->second.window = 0;
 		it->second.online = true;
 		persistDevices();
 		noteChange(Change::Structural);
@@ -779,9 +781,31 @@ Registrar::RowFlags Registrar::decodeRowFlags(int flags)
 	return f;
 }
 
-bool Registrar::openAssignWindow(uint32_t lo, uint32_t hi, std::chrono::steady_clock::time_point until)
+bool Registrar::openAssignWindow(uint32_t lo, uint32_t hi, std::chrono::steady_clock::time_point now,
+	std::chrono::steady_clock::time_point until)
 {
-	if (lo > hi || hi - lo >= kMaxAssignSpan) return false;
+	if (lo > hi || hi - lo >= kMaxAssignSpan || until <= now) return false;
+	if (!assignWindow(now).open)
+	{
+		// A new window: rows still unclaimed from an earlier one (or loaded from
+		// NVS) are phones that fetched and never registered. Drop them, so they
+		// can neither hold the cap nor keep their extensions reserved. A late
+		// phone is not lost: its extension is free again, so its REGISTER is
+		// adopted through ordinary Learn TOFU.
+		std::size_t dropped = 0;
+		for (auto it = _devices.begin(); it != _devices.end();)
+		{
+			if (it->second.assigned) { it = _devices.erase(it); ++dropped; }
+			else ++it;
+		}
+		if (dropped > 0)
+		{
+			persistDevices();
+			noteChange(Change::Structural);
+			_env.log("Learn: zero-touch window opened; dropped " + std::to_string(dropped) + " unclaimed row(s)");
+		}
+		++_windowId;
+	}
 	_assign = AssignWindow{true, lo, hi, until};
 	return true;
 }
@@ -797,7 +821,26 @@ std::size_t Registrar::unclaimedCount() const
 	std::size_t n = 0;
 	for (const auto& entry : _devices)
 	{
-		if (entry.second.assigned) ++n;
+		if (entry.second.assigned && entry.second.window == _windowId && _windowId != 0) ++n;
+	}
+	return n;
+}
+
+std::size_t Registrar::freeExtensionCount(std::chrono::steady_clock::time_point now,
+	FunctionRef<bool(const std::string&)> unusable) const
+{
+	const AssignWindow w = assignWindow(now);
+	if (!w.open) return 0;
+	std::size_t n = 0;
+	for (uint32_t i = 0; i < kMaxAssignSpan && w.lo + i <= w.hi; ++i)
+	{
+		const std::string cand = std::to_string(w.lo + i);
+		bool held = false;
+		for (const auto& entry : _devices)
+		{
+			if (entry.second.extension == cand) { held = true; break; }
+		}
+		if (!held && !unusable(cand)) ++n;
 	}
 	return n;
 }
@@ -861,26 +904,28 @@ bool Registrar::canAssign(const std::string& mac, std::chrono::steady_clock::tim
 }
 
 bool Registrar::assignNext(const std::string& mac, std::chrono::steady_clock::time_point now,
-	FunctionRef<bool(const std::string&)> unusable, std::string& outExt)
+	FunctionRef<bool(const std::string&)> unusable, std::string& outExt, AssignRefusal& why)
 {
+	why = AssignRefusal::None;
 	auto it = _devices.find(mac);
 	if (it != _devices.end())
 	{
 		outExt = it->second.extension;   // same MAC, same extension; nothing spent
 		return true;
 	}
-	if (!assignWindow(now).open || unclaimedCount() >= kMaxUnclaimed) return false;
+	if (!assignWindow(now).open) { why = AssignRefusal::NoWindow; return false; }
+	if (unclaimedCount() >= kMaxUnclaimed) { why = AssignRefusal::Cap; return false; }
 	std::string ext;
-	if (!pickFreeExtension(now, unusable, ext)) return false;
+	if (!pickFreeExtension(now, unusable, ext)) { why = AssignRefusal::NoFreeExtension; return false; }
 	// #487 order: choose the victim, spend the token, and only then erase. A
 	// refusal for want of a token leaves the table exactly as it was.
 	auto victim = _devices.end();
 	if (_devices.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
 	{
 		victim = oldestEvictable();
-		if (victim == _devices.end()) return false;
+		if (victim == _devices.end()) { why = AssignRefusal::TableFull; return false; }
 	}
-	if (!takeAdoptToken(now)) return false;
+	if (!takeAdoptToken(now)) { why = AssignRefusal::NoToken; return false; }
 	if (victim != _devices.end())
 	{
 		_env.log("Learn: device table full, evicting " + victim->first + " (ext " +
@@ -892,6 +937,7 @@ bool Registrar::assignNext(const std::string& mac, std::chrono::steady_clock::ti
 	rec.state = DeviceState::Learned;
 	rec.locked = true;
 	rec.assigned = true;
+	rec.window = _windowId;
 	rec.seq = _nextSeq++;
 	_devices.emplace(mac, std::move(rec));
 	persistDevices();

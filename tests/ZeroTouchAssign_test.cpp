@@ -16,6 +16,7 @@
 #include <string>
 
 #include "ArpLookup.hpp"
+#include "DidMapping.hpp"
 #include "FakePbxEnv.hpp"
 #include "PoolConfig.hpp"
 #include "Registrar.hpp"
@@ -58,12 +59,13 @@ namespace
 
 		void TearDown() override { ArpLookup::clearMockMacs(); }
 
-		void open(uint32_t lo, uint32_t hi) { ASSERT_TRUE(reg.openAssignWindow(lo, hi, t0 + std::chrono::minutes(30))); }
+		void open(uint32_t lo, uint32_t hi) { ASSERT_TRUE(reg.openAssignWindow(lo, hi, t0, t0 + std::chrono::minutes(30))); }
 
 		std::string assign(int n, Clock::time_point when)
 		{
 			std::string ext;
-			return reg.assignNext(macFor(n), when, noneUnusable, ext) ? ext : std::string();
+			Registrar::AssignRefusal why = Registrar::AssignRefusal::None;
+			return reg.assignNext(macFor(n), when, noneUnusable, ext, why) ? ext : std::string();
 		}
 
 		// A REGISTER for `ext` from phone n (source 10.82.6.n, MAC macFor(n)).
@@ -106,14 +108,15 @@ TEST_F(ZeroTouch, SkipsExtensionsHeldByARowOrUnusable)
 	reg.adoptDeviceForTest("aa0000000001", "2001");
 	auto unusable = [](const std::string& e) { return e == "2002"; };
 	std::string ext;
-	ASSERT_TRUE(reg.assignNext(macFor(1), t0, unusable, ext));
+	Registrar::AssignRefusal why = Registrar::AssignRefusal::None;
+	ASSERT_TRUE(reg.assignNext(macFor(1), t0, unusable, ext, why));
 	EXPECT_EQ(ext, "2003");
 }
 
 TEST_F(ZeroTouch, NothingIsAssignedOutsideAnOpenWindow)
 {
 	EXPECT_EQ(assign(1, t0), "");                     // never opened
-	ASSERT_TRUE(reg.openAssignWindow(2001, 2010, t0 + std::chrono::minutes(1)));
+	ASSERT_TRUE(reg.openAssignWindow(2001, 2010, t0, t0 + std::chrono::minutes(1)));
 	EXPECT_EQ(assign(1, t0 + std::chrono::minutes(2)), "");   // expired
 	EXPECT_FALSE(reg.assignWindow(t0 + std::chrono::minutes(2)).open);
 	EXPECT_EQ(assign(1, t0), "2001");
@@ -124,11 +127,11 @@ TEST_F(ZeroTouch, NothingIsAssignedOutsideAnOpenWindow)
 
 TEST_F(ZeroTouch, RangeIsValidatedAndBounded)
 {
-	EXPECT_FALSE(reg.openAssignWindow(2010, 2001, t0 + std::chrono::minutes(5)));
-	EXPECT_FALSE(reg.openAssignWindow(1000, 1000 + Registrar::kMaxAssignSpan, t0 + std::chrono::minutes(5)));
-	EXPECT_TRUE(reg.openAssignWindow(1000, 1000 + Registrar::kMaxAssignSpan - 1, t0 + std::chrono::minutes(5)));
+	EXPECT_FALSE(reg.openAssignWindow(2010, 2001, t0, t0 + std::chrono::minutes(5)));
+	EXPECT_FALSE(reg.openAssignWindow(1000, 1000 + Registrar::kMaxAssignSpan, t0, t0 + std::chrono::minutes(5)));
+	EXPECT_TRUE(reg.openAssignWindow(1000, 1000 + Registrar::kMaxAssignSpan - 1, t0, t0 + std::chrono::minutes(5)));
 	reg.adoptDeviceForTest("aa0000000001", "3000");
-	ASSERT_TRUE(reg.openAssignWindow(3000, 3000, t0 + std::chrono::minutes(5)));
+	ASSERT_TRUE(reg.openAssignWindow(3000, 3000, t0, t0 + std::chrono::minutes(5)));
 	EXPECT_EQ(assign(1, t0), "");   // the only extension is taken
 }
 
@@ -138,7 +141,7 @@ TEST_F(ZeroTouch, AtMostKMaxUnclaimedAndRegisteringClaims)
 	for (int n = 1; n <= static_cast<int>(Registrar::kMaxUnclaimed); ++n) EXPECT_NE(assign(n, t0), "");
 	const auto later = t0 + std::chrono::minutes(5);   // tokens are back
 	EXPECT_EQ(assign(99, later), "") << "the unclaimed cap, not the token bucket, refuses this";
-	reg.markOnline(macFor(1), true);                    // phone 1 registered
+	reg.markOnline(macFor(1), true, "2001");            // phone 1 registered its extension
 	EXPECT_EQ(reg.unclaimedCount(), Registrar::kMaxUnclaimed - 1);
 	EXPECT_NE(assign(99, later), "");
 }
@@ -187,8 +190,9 @@ TEST_F(ZeroTouch, ARefusalForWantOfATokenEvictsNothing)
 	// what refuses below.
 	for (int n = 1; n <= Registrar::kAdoptBurst; ++n)
 	{
-		ASSERT_NE(assign(n, t0), "");
-		reg.markOnline(macFor(n), true);
+		const std::string e = assign(n, t0);
+		ASSERT_NE(e, "");
+		reg.markOnline(macFor(n), true, e);
 	}
 	const int max = POCKETDIAL_MAX_CLIENTS;
 	for (int n = 0; static_cast<int>(reg.adoptedDevices().size()) < max; ++n)
@@ -238,6 +242,7 @@ TEST(ZeroTouchHandler, NeedsAVerifiedMacLearnModeAndAnOpenWindow)
 	RequestsHandler h("10.82.6.1", 5060, [](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
 	std::string ext;
 	EXPECT_FALSE(h.autoAssign("0282060000aa", true, ext)) << "no window";
+	EXPECT_EQ(h.autoAssignState().refusals, 0u) << "with no window open, nothing to explain";
 	ASSERT_TRUE(h.openAutoAssign(2001, 2010, 10));
 	EXPECT_FALSE(h.autoAssign("0282060000aa", false, ext)) << "unverified MAC";
 	h.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
@@ -269,4 +274,98 @@ TEST(ZeroTouchHandler, NeverAssignsAnExtensionRoutingWouldShadow)
 	std::string ext;
 	ASSERT_TRUE(h.autoAssign("0282060000ab", true, ext));
 	EXPECT_EQ(ext, "601");
+}
+
+TEST_F(ZeroTouch, ARegisterForAnotherExtensionDoesNotClaim)
+{
+	open(2001, 2010);
+	ASSERT_EQ(assign(1, t0), "2001");
+	reg.markOnline(macFor(1), true, "2999");
+	EXPECT_EQ(reg.unclaimedCount(), 1u);
+	reg.markOnline(macFor(1), true, "2001");
+	EXPECT_EQ(reg.unclaimedCount(), 0u);
+}
+
+TEST_F(ZeroTouch, ANewWindowDropsRowsLeftUnclaimedByTheLastOne)
+{
+	// Four phones fetch and never register: without this the cap would hold
+	// zero-touch shut for good.
+	open(2001, 2050);
+	for (int n = 1; n <= static_cast<int>(Registrar::kMaxUnclaimed); ++n) ASSERT_NE(assign(n, t0), "");
+	ASSERT_EQ(assign(9, t0 + std::chrono::minutes(5)), "");   // capped
+	reg.closeAssignWindow();
+	const auto t1 = t0 + std::chrono::minutes(10);
+	ASSERT_TRUE(reg.openAssignWindow(2001, 2050, t1, t1 + std::chrono::minutes(30)));
+	EXPECT_EQ(reg.unclaimedCount(), 0u);
+	EXPECT_FALSE(hasRow(macFor(1)));
+	EXPECT_EQ(assign(9, t1), "2001");
+	// Reopening an OPEN window only moves its end; this window's row stays.
+	ASSERT_TRUE(reg.openAssignWindow(2001, 2050, t1, t1 + std::chrono::minutes(60)));
+	EXPECT_TRUE(hasRow(macFor(9)));
+}
+
+TEST_F(ZeroTouch, RefusalsSayWhy)
+{
+	std::string ext;
+	Registrar::AssignRefusal why = Registrar::AssignRefusal::None;
+	EXPECT_FALSE(reg.assignNext(macFor(1), t0, noneUnusable, ext, why));
+	EXPECT_EQ(why, Registrar::AssignRefusal::NoWindow);
+	open(2001, 2001);
+	auto all = [](const std::string&) { return true; };
+	EXPECT_FALSE(reg.assignNext(macFor(1), t0, all, ext, why));
+	EXPECT_EQ(why, Registrar::AssignRefusal::NoFreeExtension);
+	EXPECT_EQ(reg.freeExtensionCount(t0, all), 0u);
+	EXPECT_EQ(reg.freeExtensionCount(t0, noneUnusable), 1u);
+}
+
+TEST(ZeroTouchHandler, ARealRegisterThroughTheEngineClaimsTheRow)
+{
+	RequestsHandler h("10.82.6.1", 5060, [](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	ASSERT_TRUE(h.openAutoAssign(2001, 2010, 10));
+	std::string ext;
+	ASSERT_TRUE(h.autoAssign(macFor(7), true, ext));
+	ASSERT_EQ(ext, "2001");
+	const sockaddr_in a = FakePbxEnv::addr(ipFor(7).c_str(), 5060);
+	ArpLookup::setMockMac(a, {0x02, 0x82, 0x06, 0x00, 0x00, 0x07});
+	h.handle(RequestsHandler::getMessageFromPool(registerRaw("2001", ipFor(7)), a));
+	bool found = false;
+	for (const auto& d : h.getAdoptedDevices())
+	{
+		if (d.mac != macFor(7)) continue;
+		found = true;
+		EXPECT_EQ(d.extension, "2001");
+		EXPECT_TRUE(d.locked);
+		EXPECT_FALSE(d.assigned) << "registering its own extension claims the row";
+	}
+	EXPECT_TRUE(found);
+	EXPECT_EQ(h.autoAssignState().unclaimed, 0u);
+	ArpLookup::clearMockMacs();
+}
+
+TEST(ZeroTouchHandler, AnExtensionWithStateIsNeverAssigned)
+{
+	// Voicemail, DND, a forward: each belongs to someone already. (DID
+	// targets: DidMapping.isTarget below; a handler mapping persists to disk.)
+	RequestsHandler h("10.82.6.1", 5060, [](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	h.setVoicemail("2001", true);
+	h.setDnd("2002", true);
+	h.setForward("2003", "always", "2001");
+	ASSERT_TRUE(h.openAutoAssign(2001, 2010, 10));
+	EXPECT_EQ(h.autoAssignState().free, 7u);
+	std::string ext;
+	ASSERT_TRUE(h.autoAssign(macFor(8), true, ext));
+	EXPECT_EQ(ext, "2004");
+	EXPECT_FALSE(h.autoAssign(macFor(9), false, ext));
+	EXPECT_EQ(h.autoAssignState().lastRefusal, RequestsHandler::ZeroTouchRefusal::Unverified);
+	EXPECT_STREQ(RequestsHandler::zeroTouchRefusalName(h.autoAssignState().lastRefusal), "unverified");
+}
+
+TEST(ZeroTouchDid, ADidTargetIsVisibleWithoutAHeapScanOfTheStore)
+{
+	DidMapping m;
+	m.setStorePath(::testing::TempDir() + "zt826_didmap.cfg");
+	ASSERT_TRUE(m.setMapping("+15551234567", "2001").empty());
+	EXPECT_TRUE(m.isTarget("2001"));
+	EXPECT_FALSE(m.isTarget("2002"));
+	m.clearAll();
 }
