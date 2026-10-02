@@ -254,7 +254,7 @@ Option 66 (§1.1), this needs no DHCP server change: only a socket.
 | :--- | :--- | :--- | :--- |
 | `off` (default) | closed | no | no |
 | `discover` | open | yes | no |
-| `provision` | open | yes | only a **snom or Yealink** whose MAC is **adopted** (§0.1) with an extension that passes the same AOR/identity gates as `findProvisioningInfo()` |
+| `provision` | open | yes | only a **snom or Yealink** whose MAC is **adopted** (§0.1) with an extension that passes the same AOR/identity gates as `findProvisioningInfo()`, or (zero-touch window open, §3.1) one that would be assigned an extension right now |
 
   Off by default because the first answer wins: an always-on responder would capture any
   PnP phone on a LAN shared with another PBX. A phone this board cannot serve gets
@@ -483,6 +483,47 @@ Consequences:
   bypass.
 * **`forget` re-arms adoption.** `POST /api/registrar/device` with `action=forget` removes the
   record; a later REGISTER in Learn mode re-learns it (`Registrar.hpp:83-85`).
+
+### 3.1 Zero-touch assignment (Issue #826 part B)
+
+An admin opens a window with `POST /api/zero-touch` (`open=1&lo=2001&hi=2099&minutes=30`).
+While it is open, a config fetch for an **unknown** MAC is handed the next free extension in
+the range, and the phone registers as it. Everything else on this page is unchanged: a known
+MAC still gets the extension it last registered as.
+
+**Who gets one.** A fetch on any MAC-keyed path (`<mac>.cfg`, `cfg<mac>.xml`,
+`<mac>-phone.cfg`, `spa<mac>.cfg`, `snom<mac>.xml`) assigns only when **all** of these hold:
+
+* the window is open (it closes itself after `minutes`, 1-120; a reboot closes it too, since
+  it is never persisted);
+* the registrar is in **Learn** mode (Secure needs a password the board cannot provision, §4.1);
+* the TCP peer's **ARP entry is the requested MAC**, so a fetch can only claim the fetching
+  host's own MAC (an ARP miss refuses);
+* the #515 adoption token bucket has a token (4, one back every 15 s, shared with Learn);
+* fewer than **4 unclaimed** rows exist, and the table has room or an evictable row;
+* a free extension exists in `lo`-`hi`.
+
+Every refusal is the same `404` as an unknown MAC (§4.3). PnP's `provision` mode (§1.4)
+answers an unknown MAC only when the same checks pass at that moment, so a phone is never
+pointed at a URL that 404s.
+
+**Which extension.** The lowest number in the range that no device row holds, nothing is
+registered as, and nothing routes elsewhere: reserved, emergency and PSTN-shaped numbers, page
+zones (980-989), park orbits (700-709), ring-group pilots, and anything the dial plan matches
+(`RequestsHandler::isRoutedElsewhere()`). `lo` and `hi` are 3-6 digits, no leading zero,
+`lo <= hi`, fewer than 500 apart.
+
+**The row.** An assignment is an ordinary Learned row, created **locked**, so another MAC
+registering that extension is refused (`Extension Locked To Another Device`), and
+**assigned** (unclaimed) until its MAC first registers. An unclaimed row is evicted before
+any other row, so unauthenticated fetches can never fill the table with rows nothing may
+evict. The same MAC always gets the same extension. `/api/registrar` shows
+`"assigned": true` until the phone registers. "Forget learned" clears unclaimed rows too.
+The flag is bit 2 of the persisted row flags; firmware older than #826 reads it as a plain
+locked row.
+
+**Not allocation-free.** An assignment adds a map node and rewrites the NVS device blob, like
+any Learn adoption. It happens once per phone, on the HTTP task.
 
 ## 4. Security: what the config actually exposes
 

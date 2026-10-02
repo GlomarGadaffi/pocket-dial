@@ -322,6 +322,8 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/registrar`](#post-apiregistrar) | `POST` | High | Gated (+ `X-CSRF`) | Sets the admission mode (`learn`/`secure`; `open` is retired, #500). |
 | [`/api/pnp`](#get-apipnp) | `GET` | Low | Gated | SIP PnP mode and the phones heard on 224.0.1.75 (#826). |
 | [`/api/pnp`](#post-apipnp) | `POST` | Medium | Gated (+ `X-CSRF`) | Sets the PnP mode: `off`/`discover`/`provision` (#826). |
+| [`/api/zero-touch`](#get-apizero-touch) | `GET` | Low | Gated | The zero-touch extension assignment window (#826). |
+| [`/api/zero-touch`](#post-apizero-touch) | `POST` | High | Gated (+ `X-CSRF`) | Opens or closes the zero-touch window (#826). |
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/registrar/forget-learned`](#post-apiregistrarforget-learned) | `POST` | High | Gated (+ `X-CSRF`) | Forgets every `learned` device at once; `secured` ones stay (#515). |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
@@ -1375,6 +1377,22 @@ Persisted. Returns the same body as `GET`.
 ```bash
 curl -b cookies.txt -H "X-CSRF: $CSRF" -X POST http://192.168.4.1/api/pnp -d "mode=discover"
 ```
+
+### `GET /api/zero-touch`
+
+The zero-touch assignment window (#826 part B, [PROVISIONING.md §3.1](PROVISIONING.md)).
+
+```json
+{ "attached": true, "open": true, "lo": 2001, "hi": 2099, "secondsLeft": 1740, "unclaimed": 1, "learnOnly": true }
+```
+
+`unclaimed`: rows assigned to a MAC that has not registered yet (at most 4).
+
+### `POST /api/zero-touch`
+
+`open=1&lo=2001&hi=2099&minutes=30` opens (or reopens) the window. `lo`/`hi` are 3-6 digits
+with no leading zero, `lo <= hi`, fewer than 500 apart. `minutes` is 1-120. `open=0`
+closes it. The window is never persisted. Returns the `GET` body, or `400` for invalid input.
 
 ### `POST /api/registrar/device`
 

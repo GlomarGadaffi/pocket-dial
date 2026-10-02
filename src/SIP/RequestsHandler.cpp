@@ -8748,8 +8748,59 @@ bool RequestsHandler::canProvisionMac(std::string_view mac)
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 	std::string_view ext;
-	if (!_registrar.extensionOf(mac, ext)) return false;
-	return isValidAor(ext) && !pbx::isReservedOrPstnAor(ext);
+	if (_registrar.extensionOf(mac, ext)) return isValidAor(ext) && !pbx::isReservedOrPstnAor(ext);
+	// #826 part B: not adopted. Answer only if a zero-touch fetch would get an
+	// extension right now; a phone told about a URL that then 404s stores it
+	// anyway. `mac` is 12 chars, inside std::string's small buffer: no heap.
+	if (_registrar.getMode() != Registrar::Mode::Learn) return false;
+	auto unusable = [this](const std::string& c) { return isRoutedElsewhere(c); };
+	return _registrar.canAssign(std::string(mac), std::chrono::steady_clock::now(), unusable);
+}
+
+bool RequestsHandler::isRoutedElsewhere(const std::string& ext)
+{
+	if (pbx::isReservedOrPstnAor(ext) || pbx::isPageZoneExt(ext)) return true;
+	if (_park.orbitIndex(ext) >= 0) return true;
+	if (_cfg.findRingGroup(ext) != nullptr) return true;
+	if (!_cfg.dialPlan().empty() && _cfg.dialPlan().match(ext) != nullptr) return true;
+	return findRegistered(ext) != nullptr;
+}
+
+bool RequestsHandler::autoAssign(const std::string& mac, bool peerMacVerified, std::string& outExt)
+{
+	if (!peerMacVerified) return false;
+	std::lock_guard<std::mutex> lock(_mutex);
+	if (_registrar.getMode() != Registrar::Mode::Learn) return false;
+	auto unusable = [this](const std::string& c) { return isRoutedElsewhere(c); };
+	return _registrar.assignNext(mac, std::chrono::steady_clock::now(), unusable, outExt);
+}
+
+bool RequestsHandler::openAutoAssign(uint32_t lo, uint32_t hi, uint32_t minutes)
+{
+	if (minutes == 0 || minutes > kMaxAssignMinutes) return false;
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _registrar.openAssignWindow(lo, hi, std::chrono::steady_clock::now() + std::chrono::minutes(minutes));
+}
+
+void RequestsHandler::closeAutoAssign()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	_registrar.closeAssignWindow();
+}
+
+RequestsHandler::AutoAssignState RequestsHandler::autoAssignState()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	const auto now = std::chrono::steady_clock::now();
+	const Registrar::AssignWindow w = _registrar.assignWindow(now);
+	AutoAssignState s;
+	s.open = w.open;
+	s.lo = w.lo;
+	s.hi = w.hi;
+	s.secondsLeft = w.open ? static_cast<uint32_t>(
+		std::chrono::duration_cast<std::chrono::seconds>(w.until - now).count()) : 0;
+	s.unclaimed = _registrar.unclaimedCount();
+	return s;
 }
 
 void RequestsHandler::setDnd(const std::string& extension, bool on)

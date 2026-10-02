@@ -66,6 +66,7 @@ public:
 		bool online = false;     // currently has a live registration binding
 		bool locked = false;     // #440: Learn has bound its extension to this MAC
 		bool shared = false;     // #440: this MAC registered >1 extension (NAT) -- never locked
+		bool assigned = false;   // #826: zero-touch row its MAC has not registered yet
 	};
 
 	// RetryLater (#515, #440): admitLearn has already enqueued a 503 + Retry-After.
@@ -166,6 +167,57 @@ public:
 	// this per discovery datagram (#826).
 	bool extensionOf(std::string_view mac, std::string_view& ext) const;
 
+	// ── Zero-touch assignment (#826 part B) ───────────────────────────────────
+	// An admin opens a window (memory only: a reboot closes it) over a range of
+	// extensions. While it is open, a config fetch from an unknown MAC may be
+	// handed the next free extension in the range. The new row is LOCKED, so
+	// lockedElsewhere() reserves the extension for that MAC, and ASSIGNED
+	// (unclaimed) until the MAC first registers (markOnline). An unclaimed row
+	// is evictable, ahead of every other row, and at most kMaxUnclaimed exist:
+	// unauthenticated fetches cannot fill the table with rows nothing may evict.
+	// The adoption token bucket (#515) is shared with admitLearn().
+	static constexpr uint32_t kMaxAssignSpan = 500;               // hi - lo, exclusive
+	static constexpr std::size_t kMaxUnclaimed = kAdoptBurst;
+	struct AssignWindow
+	{
+		bool open = false;
+		uint32_t lo = 0;
+		uint32_t hi = 0;
+		std::chrono::steady_clock::time_point until{};
+	};
+	// False (window unchanged) unless lo <= hi and hi - lo < kMaxAssignSpan.
+	bool openAssignWindow(uint32_t lo, uint32_t hi, std::chrono::steady_clock::time_point until);
+	void closeAssignWindow() { _assign = AssignWindow{}; }
+	// The window as of `now`: reported closed once `now` reaches its end.
+	AssignWindow assignWindow(std::chrono::steady_clock::time_point now) const;
+	std::size_t unclaimedCount() const;
+	// `mac` already has a row: its extension, true, nothing spent. Otherwise,
+	// with the window open, fewer than kMaxUnclaimed unclaimed rows, room in
+	// the table (or an evictable row), an adoption token and a free extension:
+	// a new assigned row, true. Otherwise false and nothing changed -- in
+	// particular a refusal for want of a token evicts nothing (#487 order:
+	// the victim is chosen first, erased only once the token is spent).
+	// `unusable(ext)` reports an extension taken outside the table (a live
+	// registration, or routing that would shadow it).
+	bool assignNext(const std::string& mac, std::chrono::steady_clock::time_point now,
+		FunctionRef<bool(const std::string&)> unusable, std::string& outExt);
+	// Would assignNext() give `mac` an extension right now? No side effects.
+	bool canAssign(const std::string& mac, std::chrono::steady_clock::time_point now,
+		FunctionRef<bool(const std::string&)> unusable) const;
+
+	// Persisted row flags, the 4th field of the "devices" blob: bit 0 locked,
+	// bit 1 shared, bit 2 assigned (#826). Pure, so the layout is host-tested.
+	// Firmware older than #826 reads bits 0-1 only: a downgrade keeps an
+	// unclaimed row as a plain locked one.
+	struct RowFlags
+	{
+		bool locked = false;
+		bool shared = false;
+		bool assigned = false;
+	};
+	static int encodeRowFlags(const RowFlags& f);
+	static RowFlags decodeRowFlags(int flags);
+
 	// Test-only seam: directly adopt a device without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, DeviceState state = DeviceState::Learned,
 		bool locked = false)
@@ -206,14 +258,24 @@ private:
 		bool locked = false;   // #440: extension bound to this MAC (persisted)
 		bool shared = false;   // #440: MAC seen with >1 extension; never locks (persisted)
 		uint32_t seq = 0;      // #440: adoption order, for eviction (persisted)
+		bool assigned = false; // #826: zero-touch row, not yet registered by its MAC (persisted)
 	};
 
 	bool persistMode();   // false (and logged at ERROR) if any NVS step failed
 	bool persistDevices();   // false (and logged at error) if any NVS step failed
 	// #440: the entry to forget when a new MAC needs room at POCKETDIAL_MAX_CLIENTS:
-	// the OLDEST plain Learned entry (offline ones first). Never a locked or
-	// Secured device; end() when every entry is locked/Secured.
+	// an unclaimed zero-touch row first (#826), else the OLDEST plain Learned
+	// entry (offline ones first). Never a claimed locked or a Secured device;
+	// end() when there is none.
 	std::unordered_map<std::string, DeviceRecord>::iterator oldestEvictable();
+	bool hasEvictable() const;
+	// #826: the #515 bucket, for assignNext() (admitLearn() keeps its own
+	// inline copy of the same arithmetic).
+	uint8_t adoptTokensAt(std::chrono::steady_clock::time_point now) const;
+	bool takeAdoptToken(std::chrono::steady_clock::time_point now);
+	bool pickFreeExtension(std::chrono::steady_clock::time_point now,
+		FunctionRef<bool(const std::string&)> unusable, std::string& out) const;
+	AssignWindow _assign;
 	uint32_t _nextSeq = 1;
 	// Find a record by MAC key or, failing that, by adopted extension.
 	std::unordered_map<std::string, DeviceRecord>::iterator findDevice(const std::string& macOrExt);
