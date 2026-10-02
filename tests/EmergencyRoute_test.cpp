@@ -1742,13 +1742,16 @@ TEST(EmergencyRoute, AnUppercaseOrSipsSchemeIsReadAsSip)
 		EXPECT_EQ(b.count("INVITE sip:" + std::string(s.user) + "@" + kSbcIp, kSbcIp), 1u) << b.dump();
 	}
 
-	// Control: an extension so written is still that extension.
+	// Control: an extension so written is still that extension. The relayed
+	// INVITE keeps the caller's Request-URI (a pass-through), so it is counted
+	// by method and address alone.
 	Bench b;
 	b.handler->setTrunkConfig(trunkConfig());
 	b.handler->handle(makeRegister("102", "192.168.79.12"));
 	b.sent.clear();
 	b.handler->handle(makeShapedInvite("SIP:102@server", "SIP:102@server", "application/sdp", "", kSdpOffer,
 		"er-scheme-102"));
-	EXPECT_EQ(b.count("INVITE sip:102@", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
 	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
 }
