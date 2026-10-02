@@ -737,6 +737,16 @@ void Registrar::copyOnlineFlagsInto(std::vector<AdoptedDevice>& rows) const
 	}
 }
 
+uint32_t Registrar::loadedSeq(const char* saved, uint32_t& nextSeq)
+{
+	// 0 (missing or unparseable) and anything from 2^31 up take the load order.
+	const unsigned long v = (saved != nullptr) ? strtoul(saved, nullptr, 10) : 0UL;
+	uint32_t seq = (v < 0x80000000UL) ? static_cast<uint32_t>(v) : 0;
+	if (seq == 0) seq = nextSeq;
+	if (seq >= nextSeq) nextSeq = seq + 1;
+	return seq;
+}
+
 void Registrar::loadDevices()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
@@ -766,6 +776,7 @@ void Registrar::loadDevices()
 				int si = atoi(rec[2].c_str());
 				r.state = (si == static_cast<int>(DeviceState::Secured))
 					? DeviceState::Secured : DeviceState::Learned;
+				const char* savedSeq = nullptr;
 				if (rec.size() >= 5)
 				{
 					const int flags = atoi(rec[3].c_str());
@@ -773,11 +784,9 @@ void Registrar::loadDevices()
 					r.shared = (flags & 2) != 0;
 					// Clamped: a saved UINT32_MAX would wrap _nextSeq to 0 below, and
 					// every later adoption would then sort as the oldest (evicted first).
-					const unsigned long saved = strtoul(rec[4].c_str(), nullptr, 10);
-					r.seq = (saved < 0x80000000UL) ? static_cast<uint32_t>(saved) : 0;
+					savedSeq = rec[4].c_str();
 				}
-				if (r.seq == 0) r.seq = _nextSeq;   // pre-#440 (or out-of-range) row: order as loaded
-				if (r.seq >= _nextSeq) _nextSeq = r.seq + 1;
+				r.seq = loadedSeq(savedSeq, _nextSeq);
 				_devices[rec[0]] = std::move(r);
 			}
 		}

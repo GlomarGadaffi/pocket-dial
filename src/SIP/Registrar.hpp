@@ -150,6 +150,10 @@ public:
 
 	// ── Adopted-device registry ───────────────────────────────────────────────
 	void loadDevices();   // boot-time NVS reload; runs single-threaded pre-dispatch
+	// The seq a row loaded from NVS gets (#820: loadDevices() is ESP-only, this is
+	// not). `saved` is the row's seq field, nullptr for a pre-#440 row; `nextSeq`
+	// is advanced past the result.
+	static uint32_t loadedSeq(const char* saved, uint32_t& nextSeq);
 	// Mark a device online/offline after a (de)registration. Online state is
 	// volatile registration state — never persisted. No-op if the MAC isn't
 	// adopted (e.g. a Learn REGISTER whose ARP lookup missed never records).
