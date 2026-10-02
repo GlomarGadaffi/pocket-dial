@@ -12078,18 +12078,31 @@ bool RequestsHandler::isTrunkInbound(const Session& s) const
 		_trunkInbound[slot].inbound;
 }
 
+bool RequestsHandler::trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out)
+{
+	// Not inet_addr(): "999.0.0.1" comes back as 255.255.255.255 (C review).
+	std::string ip;
+	uint16_t    port = 0;
+	uint32_t    addr = 0;
+	if (!parseCallerRtp(m, ip, port) || !TrunkResolver::parseDottedQuad(ip, addr) ||
+		addr == 0 || addr == 0xFFFFFFFFu)
+	{
+		return false;
+	}
+	out = sockaddr_in{};
+	out.sin_family = AF_INET;
+	out.sin_addr.s_addr = addr;
+	out.sin_port = htons(port);
+	return true;
+}
+
 int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& data,
 	const std::shared_ptr<SipClient>& handset)
 {
 	// Where the carrier wants its audio. An INVITE without an offer would need
 	// its answer in our 200 and the carrier's in its ACK; not handled yet.
-	std::string carrierIp;
-	uint16_t    carrierPort = 0;
-	if (!parseCallerRtp(data, carrierIp, carrierPort)) return 488;
 	sockaddr_in carrierRtp{};
-	carrierRtp.sin_family = AF_INET;
-	carrierRtp.sin_addr.s_addr = inet_addr(carrierIp.c_str());
-	carrierRtp.sin_port = htons(carrierPort);
+	if (!trunkInboundRtp(data, carrierRtp)) return 488;
 
 	// The fork's own Call-ID, never the carrier's: SipTrunk owns that one, and a
 	// handset BYE on it would be taken for the carrier's (#386). A zeroed peer
@@ -12194,18 +12207,10 @@ bool RequestsHandler::handleTrunkInboundReply(const std::shared_ptr<SipMessage>&
 
 	// The handset answered: its RTP address completes the relay, and the carrier
 	// gets our 200 with the carrier-facing port, on the carrier's own numbering.
-	std::string ip;
-	uint16_t    port = 0;
-	bool relayable = data->hasSdp() &&
-		data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false) && parseCallerRtp(data, ip, port);
-	if (relayable)
-	{
-		sockaddr_in rtp{};
-		rtp.sin_family = AF_INET;
-		rtp.sin_addr.s_addr = inet_addr(ip.c_str());
-		rtp.sin_port = htons(port);
-		relayable = _handsetRx[slot].setRawPeer(rtp);
-	}
+	sockaddr_in rtp{};
+	const bool relayable = data->hasSdp() &&
+		data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false) &&
+		trunkInboundRtp(data, rtp) && _handsetRx[slot].setRawPeer(rtp);
 	if (!relayable || !_sipTrunk.respond(callId, 200,
 		buildMediaSdp(_localIp, _trunkRx[slot].localPort(), /*sendrecv=*/true, _trunkInbound[slot].dtmfPt)))
 	{

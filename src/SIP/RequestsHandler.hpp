@@ -1730,6 +1730,9 @@ private:
 	// transaction (RFC 3261 s17.1.1.3), a 2xx's as a new one (s13.2.2.4).
 	void ackTrunkInboundFork(const std::shared_ptr<Session>& s, const std::shared_ptr<SipMessage>& resp);
 	bool isTrunkInbound(const Session& s) const;
+	// The RTP address an offer or answer names, only when its c= is a dotted
+	// quad that is neither 0.0.0.0 nor broadcast: a relay is never aimed at one.
+	bool trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out);
 	// #398 part D. A request in the fork's own INVITE transaction (the INVITE,
 	// or its CANCEL, RFC 3261 s9.1): one Request-URI, Via branch, From and To.
 	std::shared_ptr<SipMessage> trunkForkRequest(const Session& s, const SipClient& handset,

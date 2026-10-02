@@ -902,6 +902,39 @@ TEST(TrunkInbound, AnExpiredLeaseByesTheHandsetAndTheCarrier)
 	expectAllReleased(b, a.forkId);
 }
 
+TEST(TrunkInbound, AnRtpAddressThatIsNotAUnicastDottedQuadIsNeverARelayPeer)
+{
+	// C review: inet_addr("999.0.113.5") is 255.255.255.255, which setRawPeer()
+	// took, aiming the relay at broadcast. Same length as 203.0.113.5, so the
+	// Content-Length still holds.
+	{
+		Bench b;
+		ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+		std::string raw = makeInvite(kDid, kDid, "in-badc", kSbcIp, true, "+12025550177", 100)->toString();
+		raw.replace(raw.find("c=IN IP4 203.0.113.5"), 20, "c=IN IP4 999.0.113.5");
+		b.handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kSbcIp)));
+
+		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here") << "the carrier's offer";
+		EXPECT_EQ(b.countTo(kSbcIp), 1u);
+		EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty());
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	}
+	{
+		Bench b;
+		const std::string fork = ringFork(b, "in-badanswer");
+		ASSERT_FALSE(fork.empty());
+		std::string answer = kHandsetAnswer;
+		answer.replace(answer.find("c=IN IP4 192.168.50.21"), 22, "c=IN IP4 999.168.50.21");
+		b.sent.clear();
+		b.handler.handle(handsetReply(fork, "SIP/2.0 200 OK", answer));
+
+		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here") << "the handset's answer";
+		EXPECT_EQ(b.countTo(kSbcIp), 1u);
+		EXPECT_FALSE(b.firstTo("BYE ", kPhoneIp).empty());
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	}
+}
+
 TEST(TrunkInbound, ASilentInboundCallByesTheHandsetNotTheCallersStandIn)
 {
 	Bench b;
