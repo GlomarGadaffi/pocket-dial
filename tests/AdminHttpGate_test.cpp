@@ -22,6 +22,7 @@
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
 #include "AdminAuth.hpp"
+#include "ArpLookup.hpp"     // Issue #826: the fetching host's MAC, for zero-touch
 #include "JsonReader.hpp"    // Issue #430: parse /api/status in the DropProbe tests
 #include "DmaFramePool.hpp"   // Issue #328: /api/status's l2Tx counters
 #include "SipSecretStore.hpp"
@@ -860,6 +861,55 @@ TEST(Pnp, ModeIsAdminGatedAndRoundTrips)
 	EXPECT_NE(set.find("\"mode\":\"discover\""), std::string::npos) << set;
 	EXPECT_EQ(handler.pnp().mode(), PnpResponder::Mode::Discover);
 
+	AdminAuth::clearCredential();
+}
+
+TEST(ZeroTouchHttp, AFetchByTheMacItselfGetsTheNextExtensionEndToEnd)
+{
+	// #826 part B over HTTP: open a window, then fetch /config/<mac>.cfg from a
+	// host whose ARP entry IS that MAC (127.0.0.1 here, by the host stub). An
+	// extension is assigned and served. A fetch for a MAC the peer is not gets
+	// the same 404 as before, and nothing is assigned.
+	AdminAuth::clearCredential();
+	ArpLookup::clearMockMacs();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18262, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(18262);
+	ASSERT_FALSE(a.cookie.empty());
+
+	sockaddr_in self{};
+	self.sin_family = AF_INET;
+	inet_pton(AF_INET, "127.0.0.1", &self.sin_addr);
+	ArpLookup::setMockMac(self, {0x02, 0x82, 0x60, 0x00, 0x00, 0x01});
+
+	EXPECT_EQ(statusOf(httpGetRaw(18262, "/config/028260000001.cfg")), 404) << "no window yet";
+
+	EXPECT_EQ(statusOf(httpPostRaw(18262, "/api/zero-touch", "open=1&lo=0201&hi=0299&minutes=10",
+		"pd_session=" + a.cookie, a.csrf)), 400) << "a leading zero is refused";
+	EXPECT_EQ(statusOf(httpPostRaw(18262, "/api/zero-touch", "open=1&lo=2001&hi=2600&minutes=10",
+		"pd_session=" + a.cookie, a.csrf)), 400) << "wider than kMaxAssignSpan";
+	std::string set = httpPostRaw(18262, "/api/zero-touch", "open=1&lo=2001&hi=2099&minutes=10",
+		"pd_session=" + a.cookie, a.csrf);
+	ASSERT_EQ(statusOf(set), 200) << set;
+	EXPECT_NE(set.find("\"open\":true"), std::string::npos) << set;
+
+	EXPECT_EQ(statusOf(httpGetRaw(18262, "/config/028260000002.cfg")), 404)
+		<< "the peer is not that MAC";
+	std::string cfg = httpGetRaw(18262, "/config/028260000001.cfg");
+	ASSERT_EQ(statusOf(cfg), 200) << cfg;
+	EXPECT_NE(cfg.find("account.1.user_name = 2001"), std::string::npos) << cfg;
+	EXPECT_EQ(handler.autoAssignState().unclaimed, 1u);
+	bool other = false;
+	for (const auto& d : handler.getAdoptedDevices()) other = other || d.mac == "028260000002";
+	EXPECT_FALSE(other);
+
+	set = httpPostRaw(18262, "/api/zero-touch", "open=0", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_NE(set.find("\"open\":false"), std::string::npos) << set;
+	ArpLookup::clearMockMacs();
 	AdminAuth::clearCredential();
 }
 

@@ -187,20 +187,38 @@ std::unordered_map<std::string, Registrar::DeviceRecord>::iterator Registrar::ol
 {
 	// Oldest plain Learned entry, offline before online. Locked and Secured
 	// entries are never candidates: evicting one would release its extension to
-	// whoever registers next.
+	// whoever registers next. #826: except an unclaimed zero-touch row -- locked
+	// to reserve its extension, but no phone has registered it -- which goes
+	// first, so unauthenticated config fetches can never pin the table.
 	auto victim = _devices.end();
 	for (auto it = _devices.begin(); it != _devices.end(); ++it)
 	{
 		const DeviceRecord& r = it->second;
-		if (r.state != DeviceState::Learned || r.locked) continue;
-		if (victim == _devices.end() ||
-			(victim->second.online && !r.online) ||
-			(victim->second.online == r.online && r.seq < victim->second.seq))
+		if (r.state != DeviceState::Learned || (r.locked && !r.assigned)) continue;
+		if (victim == _devices.end())
+		{
+			victim = it;
+			continue;
+		}
+		const DeviceRecord& v = victim->second;
+		const bool better = (r.assigned != v.assigned) ? r.assigned
+			: ((v.online != r.online) ? !r.online : (r.seq < v.seq));
+		if (better)
 		{
 			victim = it;
 		}
 	}
 	return victim;
+}
+
+bool Registrar::hasEvictable() const
+{
+	for (const auto& entry : _devices)
+	{
+		const DeviceRecord& r = entry.second;
+		if (r.state == DeviceState::Learned && (!r.locked || r.assigned)) return true;
+	}
+	return false;
 }
 
 Registrar::AuthDecision Registrar::admitSecure(
@@ -583,11 +601,24 @@ Registrar::findDevice(const std::string& macOrExt)
 	return it;
 }
 
-void Registrar::markOnline(const std::string& mac, bool online)
+void Registrar::markOnline(const std::string& mac, bool online, std::string_view ext)
 {
 	auto it = _devices.find(mac);
 	if (it == _devices.end())
 	{
+		return;
+	}
+	if (online && it->second.assigned && !ext.empty() && ext == it->second.extension)
+	{
+		// #826: the phone a zero-touch row was made for has registered the
+		// extension it was given: claimed. From here it is an ordinary locked
+		// row, never evicted. (A REGISTER for some other AOR does not claim it.)
+		it->second.assigned = false;
+		it->second.window = 0;
+		it->second.online = true;
+		persistDevices();
+		noteChange(Change::Structural);
+		_env.log("Learn: zero-touch device " + mac + " claimed ext " + it->second.extension);
 		return;
 	}
 	if (it->second.online != online)
@@ -676,6 +707,7 @@ std::vector<Registrar::AdoptedDevice> Registrar::adoptedDevices() const
 		d.online = rec.online;
 		d.locked = rec.locked;
 		d.shared = rec.shared;
+		d.assigned = rec.assigned;
 		out.push_back(std::move(d));
 	}
 	return out;
@@ -701,6 +733,188 @@ bool Registrar::extensionOf(std::string_view mac, std::string_view& ext) const
 		}
 	}
 	return false;
+}
+
+// ── Zero-touch assignment (#826 part B) ───────────────────────────────────────
+
+int Registrar::encodeRowFlags(const RowFlags& f)
+{
+	return (f.locked ? 1 : 0) | (f.shared ? 2 : 0) | (f.assigned ? 4 : 0);
+}
+
+Registrar::RowFlags Registrar::decodeRowFlags(int flags)
+{
+	RowFlags f;
+	f.locked = (flags & 1) != 0;
+	f.shared = (flags & 2) != 0;
+	f.assigned = (flags & 4) != 0;
+	return f;
+}
+
+bool Registrar::openAssignWindow(uint32_t lo, uint32_t hi, std::chrono::steady_clock::time_point now,
+	std::chrono::steady_clock::time_point until)
+{
+	if (lo > hi || hi - lo >= kMaxAssignSpan || until <= now) return false;
+	if (!assignWindow(now).open)
+	{
+		// A new window: rows still unclaimed from an earlier one (or loaded from
+		// NVS) are phones that fetched and never registered. Drop them, so they
+		// can neither hold the cap nor keep their extensions reserved. A late
+		// phone is not lost: its extension is free again, so its REGISTER is
+		// adopted through ordinary Learn TOFU.
+		std::size_t dropped = 0;
+		for (auto it = _devices.begin(); it != _devices.end();)
+		{
+			if (it->second.assigned) { it = _devices.erase(it); ++dropped; }
+			else ++it;
+		}
+		if (dropped > 0)
+		{
+			persistDevices();
+			noteChange(Change::Structural);
+			_env.log("Learn: zero-touch window opened; dropped " + std::to_string(dropped) + " unclaimed row(s)");
+		}
+		++_windowId;
+	}
+	_assign = AssignWindow{true, lo, hi, until};
+	return true;
+}
+
+Registrar::AssignWindow Registrar::assignWindow(std::chrono::steady_clock::time_point now) const
+{
+	if (_assign.open && now < _assign.until) return _assign;
+	return AssignWindow{};
+}
+
+std::size_t Registrar::unclaimedCount() const
+{
+	std::size_t n = 0;
+	for (const auto& entry : _devices)
+	{
+		if (entry.second.assigned && entry.second.window == _windowId && _windowId != 0) ++n;
+	}
+	return n;
+}
+
+std::size_t Registrar::freeExtensionCount(std::chrono::steady_clock::time_point now,
+	FunctionRef<bool(const std::string&)> unusable) const
+{
+	const AssignWindow w = assignWindow(now);
+	if (!w.open) return 0;
+	std::size_t n = 0;
+	for (uint32_t i = 0; i < kMaxAssignSpan && w.lo + i <= w.hi; ++i)
+	{
+		const std::string cand = std::to_string(w.lo + i);
+		bool held = false;
+		for (const auto& entry : _devices)
+		{
+			if (entry.second.extension == cand) { held = true; break; }
+		}
+		if (!held && !unusable(cand)) ++n;
+	}
+	return n;
+}
+
+uint8_t Registrar::adoptTokensAt(std::chrono::steady_clock::time_point now) const
+{
+	if (now <= _adoptRefillAt) return _adoptTokens;
+	const auto earned = (now - _adoptRefillAt) / kAdoptRefill;
+	const auto total = static_cast<long long>(_adoptTokens) + static_cast<long long>(earned);
+	return (total >= kAdoptBurst) ? kAdoptBurst : static_cast<uint8_t>(total);
+}
+
+// The same arithmetic as admitLearn()'s inline #515 bucket, on the same state.
+bool Registrar::takeAdoptToken(std::chrono::steady_clock::time_point now)
+{
+	const auto earned = (now > _adoptRefillAt) ? (now - _adoptRefillAt) / kAdoptRefill : 0;
+	if (_adoptTokens + earned >= kAdoptBurst)
+	{
+		_adoptTokens = kAdoptBurst;
+		_adoptRefillAt = now;
+	}
+	else
+	{
+		_adoptTokens = static_cast<uint8_t>(_adoptTokens + earned);
+		_adoptRefillAt += earned * kAdoptRefill;
+	}
+	if (_adoptTokens == 0) return false;
+	--_adoptTokens;
+	return true;
+}
+
+bool Registrar::pickFreeExtension(std::chrono::steady_clock::time_point now,
+	FunctionRef<bool(const std::string&)> unusable, std::string& out) const
+{
+	const AssignWindow w = assignWindow(now);
+	if (!w.open) return false;
+	for (uint32_t i = 0; i < kMaxAssignSpan && w.lo + i <= w.hi; ++i)
+	{
+		std::string cand = std::to_string(w.lo + i);
+		bool held = false;
+		for (const auto& entry : _devices)
+		{
+			if (entry.second.extension == cand) { held = true; break; }
+		}
+		if (held || unusable(cand)) continue;
+		out = std::move(cand);
+		return true;
+	}
+	return false;
+}
+
+bool Registrar::canAssign(const std::string& mac, std::chrono::steady_clock::time_point now,
+	FunctionRef<bool(const std::string&)> unusable) const
+{
+	if (_devices.count(mac) != 0) return true;
+	if (!assignWindow(now).open || unclaimedCount() >= kMaxUnclaimed) return false;
+	if (_devices.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS) && !hasEvictable()) return false;
+	if (adoptTokensAt(now) == 0) return false;
+	std::string ext;
+	return pickFreeExtension(now, unusable, ext);
+}
+
+bool Registrar::assignNext(const std::string& mac, std::chrono::steady_clock::time_point now,
+	FunctionRef<bool(const std::string&)> unusable, std::string& outExt, AssignRefusal& why)
+{
+	why = AssignRefusal::None;
+	auto it = _devices.find(mac);
+	if (it != _devices.end())
+	{
+		outExt = it->second.extension;   // same MAC, same extension; nothing spent
+		return true;
+	}
+	if (!assignWindow(now).open) { why = AssignRefusal::NoWindow; return false; }
+	if (unclaimedCount() >= kMaxUnclaimed) { why = AssignRefusal::Cap; return false; }
+	std::string ext;
+	if (!pickFreeExtension(now, unusable, ext)) { why = AssignRefusal::NoFreeExtension; return false; }
+	// #487 order: choose the victim, spend the token, and only then erase. A
+	// refusal for want of a token leaves the table exactly as it was.
+	auto victim = _devices.end();
+	if (_devices.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
+	{
+		victim = oldestEvictable();
+		if (victim == _devices.end()) { why = AssignRefusal::TableFull; return false; }
+	}
+	if (!takeAdoptToken(now)) { why = AssignRefusal::NoToken; return false; }
+	if (victim != _devices.end())
+	{
+		_env.log("Learn: device table full, evicting " + victim->first + " (ext " +
+			victim->second.extension + ") for a zero-touch assignment");
+		_devices.erase(victim);
+	}
+	DeviceRecord rec;
+	rec.extension = ext;
+	rec.state = DeviceState::Learned;
+	rec.locked = true;
+	rec.assigned = true;
+	rec.window = _windowId;
+	rec.seq = _nextSeq++;
+	_devices.emplace(mac, std::move(rec));
+	persistDevices();
+	noteChange(Change::Structural);
+	_env.log("Learn: zero-touch assigned ext " + ext + " to device " + mac);
+	outExt = ext;
+	return true;
 }
 
 void Registrar::noteChange(Change kind)
@@ -758,9 +972,10 @@ void Registrar::loadDevices()
 					? DeviceState::Secured : DeviceState::Learned;
 				if (rec.size() >= 5)
 				{
-					const int flags = atoi(rec[3].c_str());
-					r.locked = (flags & 1) != 0;
-					r.shared = (flags & 2) != 0;
+					const RowFlags flags = decodeRowFlags(atoi(rec[3].c_str()));
+					r.locked = flags.locked;
+					r.shared = flags.shared;
+					r.assigned = flags.assigned;
 					// Clamped: a saved UINT32_MAX would wrap _nextSeq to 0 below, and
 					// every later adoption would then sort as the oldest (evicted first).
 					const unsigned long saved = strtoul(rec[4].c_str(), nullptr, 10);
@@ -790,7 +1005,7 @@ bool Registrar::persistDevices()
 		blob += mac; blob += '\t';
 		blob += rec.extension; blob += '\t';
 		blob += std::to_string(static_cast<int>(rec.state)); blob += '\t';
-		blob += std::to_string((rec.locked ? 1 : 0) | (rec.shared ? 2 : 0)); blob += '\t';
+		blob += std::to_string(encodeRowFlags(RowFlags{rec.locked, rec.shared, rec.assigned})); blob += '\t';
 		blob += std::to_string(rec.seq); blob += '\n';
 	}
 	// Every NVS return is checked (Crew's #487 review): the lock and shared flags

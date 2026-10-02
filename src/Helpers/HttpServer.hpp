@@ -378,6 +378,12 @@ private:
 	// Issue #826: SIP PnP mode (off/discover/provision) and the phones heard.
 	void sendApiPnp(int sock);
 	void sendApiPnpSet(int sock, const std::string& body);
+	// Issue #826 part B: the zero-touch assignment window.
+	void sendApiZeroTouch(int sock);
+	void sendApiZeroTouchSet(int sock, const std::string& body);
+	// "1001" -> 1001: 3 to (POCKETDIAL_MIN_PSTN_AOR_DIGITS - 1) digits, nothing
+	// else. Pure; public for the host suite.
+	static bool parseExtensionNumber(const std::string& s, uint32_t& out);
 	void sendApiKill(int sock, const std::string& body);
 	// Phase 2: read-only Call Detail Records (newest first). Ungated like /api/status.
 	void sendApiCdr(int sock);

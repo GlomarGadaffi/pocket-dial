@@ -280,9 +280,54 @@ public:
 	// state. canProvisionMac() is its "does this board have a config for you"
 	// check: the MAC is adopted AND its extension passes the same gates
 	// findProvisioningInfo() applies, so a phone pointed here is never handed a
-	// URL that will 404. Allocation-free; takes _mutex.
+	// URL that will 404. Takes _mutex. Allocation-free for an adopted MAC; with a
+	// zero-touch window open, an unadopted MAC also counts when assignment would
+	// succeed right now (the conservative check: token, room, a free extension).
 	PnpResponder& pnp() { return _pnp; }
 	bool canProvisionMac(std::string_view mac);
+
+	// Issue #826 part B: zero-touch extension assignment, at config-fetch time.
+	// `peerMacVerified`: the fetching host's ARP MAC equals `mac` (the caller
+	// resolves it). Assigns only in Learn mode, inside an open window; see
+	// Registrar::assignNext() for the rest. Takes _mutex. Not allocation-free:
+	// a new row is a map node and an NVS blob, like any adoption.
+	bool autoAssign(const std::string& mac, bool peerMacVerified, std::string& outExt);
+	// An extension that is not a plain phone line: reserved/emergency/PSTN-shaped,
+	// a page zone, a park orbit, a ring-group pilot, anything the dial plan
+	// matches, or a name already registered or served (findRegistered). Caller
+	// holds _mutex.
+	bool isRoutedElsewhere(const std::string& ext);
+	// An extension that belongs to someone even with no phone on it: voicemail
+	// or DND on, a forward set, a DID mapped to it, or a stored SIP secret
+	// (`secured`, SipSecretStore::securedExtensions(), read once per call by
+	// the caller). Handing it to a new phone would hand over that state. Caller
+	// holds _mutex.
+	bool hasExtensionState(const std::string& ext, const std::vector<std::string>& secured);
+	bool isUnassignable(const std::string& ext, const std::vector<std::string>& secured);
+	// Why the last zero-touch fetch (while a window was open) got no extension.
+	enum class ZeroTouchRefusal : uint8_t
+	{
+		None, Unverified, NotLearn, NoWindow, Cap, NoFreeExtension, TableFull, NoToken
+	};
+	static const char* zeroTouchRefusalName(ZeroTouchRefusal r);
+	struct AutoAssignState
+	{
+		bool open = false;
+		uint32_t lo = 0;
+		uint32_t hi = 0;
+		uint32_t secondsLeft = 0;
+		std::size_t unclaimed = 0;
+		std::size_t free = 0;            // extensions in range assignable right now
+		ZeroTouchRefusal lastRefusal = ZeroTouchRefusal::None;
+		uint32_t refusals = 0;           // since boot, while a window was open
+	};
+	// Opens (or reopens) the window for `minutes`. False, nothing changed, when
+	// the range is invalid (Registrar::openAssignWindow) or minutes is 0 or
+	// above kMaxAssignMinutes.
+	static constexpr uint32_t kMaxAssignMinutes = 120;
+	bool openAutoAssign(uint32_t lo, uint32_t hi, uint32_t minutes);
+	void closeAutoAssign();
+	AutoAssignState autoAssignState();
 
 	// Do Not Disturb (DND): set/query a per-extension flag. setDnd is the mutating
 	// path behind POST /api/dnd (thread-safe; takes _mutex). getDndExtensions
@@ -1082,6 +1127,10 @@ private:
 
 	// Issue #826: SIP PnP policy + discovered-device table. Own mutex; not _mutex.
 	PnpResponder _pnp;
+	// Issue #826 part B: the last zero-touch refusal, for /api/zero-touch. Guarded by _mutex.
+	ZeroTouchRefusal _ztLastRefusal = ZeroTouchRefusal::None;
+	uint32_t _ztRefusals = 0;
+	void noteZeroTouchRefusal(ZeroTouchRefusal r);
 
 	// RFC 4028 session timer helpers. Caller holds _mutex.
 	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);

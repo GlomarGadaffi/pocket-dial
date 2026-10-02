@@ -1357,6 +1357,20 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 			sendApiPnpSet(clientSock, req.body);
 		}
 	}
+	else if (req.method == "GET" && req.path == "/api/zero-touch")
+	{
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiZeroTouch(clientSock);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/zero-touch")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiZeroTouchSet(clientSock, req.body);
+		}
+	}
 	else if (req.method == "POST" && req.path == "/api/registrar/forget-learned")
 	{
 		// #515: one action to clear a flood of Learned adoptions; Secured
@@ -3154,8 +3168,29 @@ void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
 		return;
 	}
 
-	// 3. MAC-keyed provisioning paths (Yealink, Grandstream, PolycomPhone, CiscoSpaMac)
+	// 3. MAC-keyed provisioning paths (Yealink, Grandstream, PolycomPhone, CiscoSpaMac, Snom)
 	auto info = handler ? handler->findProvisioningInfo(key) : std::nullopt;
+	if (!info && handler != nullptr)
+	{
+		// Issue #826 part B: zero-touch. An unknown MAC may be assigned the next
+		// free extension, but only for the host that IS that MAC: the TCP peer's
+		// ARP entry must name it, so a fetch can never claim someone else's.
+		// Every refusal (no window, wrong MAC, ARP miss, no token, no room, no
+		// free extension) is the same 404 as an unknown MAC (THREAT_MODEL 4.3).
+		bool verified = false;
+		sockaddr_in peer{};
+		peer.sin_family = AF_INET;
+		if (!req.clientIp.empty() && inet_pton(AF_INET, req.clientIp.c_str(), &peer.sin_addr) == 1)
+		{
+			const auto peerMac = ArpLookup::pdLookupMac(peer);
+			verified = peerMac.has_value() && ArpLookup::toHex12(*peerMac) == key;
+		}
+		std::string assigned;
+		if (handler->autoAssign(key, verified, assigned))
+		{
+			info = handler->findProvisioningInfo(key);
+		}
+	}
 	if (!info)
 	{
 		send404(sock);
@@ -4701,6 +4736,7 @@ void HttpServer::sendApiRegistrar(int sock)
 		     << "\",\"state\":\""
 		     << ((d.state == RequestsHandler::DeviceState::Secured) ? "secured" : "learned")
 		     << "\",\"online\":" << (d.online ? "true" : "false")
+		     << ",\"assigned\":" << (d.assigned ? "true" : "false")   // #826: zero-touch, unclaimed
 		     << "}";
 	}
 	json << "]}";
@@ -4839,6 +4875,80 @@ void HttpServer::sendApiPnpSet(int sock, const std::string& body)
 	}
 	handler->pnp().setMode(mode);
 	sendApiPnp(sock);
+}
+
+bool HttpServer::parseExtensionNumber(const std::string& s, uint32_t& out)
+{
+	if (s.size() < 3 || s.size() >= static_cast<size_t>(POCKETDIAL_MIN_PSTN_AOR_DIGITS)) return false;
+	uint32_t n = 0;
+	for (char c : s)
+	{
+		if (c < '0' || c > '9') return false;
+		n = n * 10U + static_cast<uint32_t>(c - '0');
+	}
+	if (s[0] == '0') return false;   // "0123" would assign "123": refuse the ambiguity
+	out = n;
+	return true;
+}
+
+// Issue #826 part B. A small fixed body: no heap.
+void HttpServer::sendApiZeroTouch(int sock)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 200, "OK", "application/json", "{\"attached\":false,\"open\":false}");
+		return;
+	}
+	const RequestsHandler::AutoAssignState s = handler->autoAssignState();
+	std::array<char, 256> buf{};
+	const int n = std::snprintf(buf.data(), buf.size(),
+		"{\"attached\":true,\"open\":%s,\"lo\":%u,\"hi\":%u,\"secondsLeft\":%u,\"unclaimed\":%u,"
+		"\"free\":%u,\"lastRefusal\":\"%s\",\"refusals\":%u,\"learnOnly\":true}",
+		s.open ? "true" : "false", static_cast<unsigned>(s.lo), static_cast<unsigned>(s.hi),
+		static_cast<unsigned>(s.secondsLeft), static_cast<unsigned>(s.unclaimed),
+		static_cast<unsigned>(s.free), RequestsHandler::zeroTouchRefusalName(s.lastRefusal),
+		static_cast<unsigned>(s.refusals));
+	if (n <= 0 || static_cast<size_t>(n) >= buf.size())
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json", "{\"error\":\"too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf.data(), static_cast<size_t>(n)));
+}
+
+void HttpServer::sendApiZeroTouchSet(int sock, const std::string& body)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+		             "{\"error\":\"SIP engine not attached yet\"}");
+		return;
+	}
+	const std::string open = getFormParam(body, "open");
+	if (open == "0")
+	{
+		handler->closeAutoAssign();
+		sendApiZeroTouch(sock);
+		return;
+	}
+	uint32_t lo = 0;
+	uint32_t hi = 0;
+	uint32_t minutes = 0;
+	const std::string minutesText = getFormParam(body, "minutes");
+	bool ok = open == "1" && parseExtensionNumber(getFormParam(body, "lo"), lo) &&
+		parseExtensionNumber(getFormParam(body, "hi"), hi) && !minutesText.empty() && minutesText.size() <= 3;
+	for (char c : minutesText) ok = ok && c >= '0' && c <= '9';
+	if (ok) minutes = static_cast<uint32_t>(std::strtoul(minutesText.c_str(), nullptr, 10));
+	if (!ok || !handler->openAutoAssign(lo, hi, minutes))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"open=1 needs lo and hi (3-6 digits, lo <= hi, fewer than 500 apart) "
+		             "and minutes (1-120); open=0 closes\"}");
+		return;
+	}
+	sendApiZeroTouch(sock);
 }
 
 void HttpServer::sendApiRegistrarDevice(int sock, const std::string& body)
