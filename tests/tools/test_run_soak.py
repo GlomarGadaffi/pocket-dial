@@ -96,7 +96,7 @@ class FakeBoard:
         busy = self.busy
         return {"version": self.version, "uptime": int(self.clock.wall() - self.boot_wall),
                 "resetReason": self.reason, "freeHeapInternal": 120000, "minFreeHeapInternal": 60000,
-                "largestFreeBlockInternal": 40000, "clientCount": 4, "sessions": [],
+                "largestFreeBlockInternal": 40000, "clientCount": 4, "recvErrors": 0, "sessions": [],
                 "sessionCount": 1 if busy else 0, "oldestSessionSec": 5 if busy else 0,
                 "parkedCount": 0, "parkedCalls": [], "stackHwm_sip_server_task": 1500,
                 "coredump": dict(self.coredump)}
