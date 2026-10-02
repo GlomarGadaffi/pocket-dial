@@ -765,15 +765,18 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 		// reversed, and every in-dialog request carries it and goes to its first
 		// hop (s12.2.1.1, s16.4). Only a loose-router hop is supported; anything
 		// else falls back to the old behaviour (no Route, sent to the peer).
+		// #838: so does a 2xx cut at 64 header lines. The cut takes the last
+		// Record-Route lines, which reversed are the FIRST hops.
 		d->routeSet = routeSetOf(*data);
 		d->nextHop = d->peer;
 		if (!d->routeSet.empty())
 		{
 			const std::string_view hop = firstRouteUri(d->routeSet);
-			if (d->routeSet.size() > kMaxRouteSet || !isLooseRouter(hop))
+			if (data->headerLinesTruncated() || d->routeSet.size() > kMaxRouteSet || !isLooseRouter(hop))
 			{
-				_env.log("Trunk: Record-Route not used (strict router or over "
-					+ std::to_string(kMaxRouteSet) + " bytes) (" + d->destE164 + ")", true);
+				_env.log("Trunk: Record-Route not used (strict router, over "
+					+ std::to_string(kMaxRouteSet) + " bytes, or a 2xx cut at 64 header lines) ("
+					+ d->destE164 + ")", true);
 				d->routeSet.clear();
 			}
 			else

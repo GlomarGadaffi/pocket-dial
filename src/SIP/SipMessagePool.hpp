@@ -58,6 +58,12 @@ namespace sipmsgpool
 	// behalf of SipServer::onNewMessage) keeps them intact after this returns.
 	std::shared_ptr<SipMessage> getMessageFromPool(std::string_view message, sockaddr_in src);
 
+	// #838: as above for a datagram off the socket (SipMessageFactory): the slot
+	// is filled with SipMessage::resetFromWire(), which keeps at most
+	// SipLimits::kMaxHeaderLines header lines. Everything the PBX builds and
+	// re-parses itself goes through getMessageFromPool(), which keeps them all.
+	std::shared_ptr<SipMessage> getMessageFromWire(std::string_view message, sockaddr_in src);
+
 	// Clones an already-parsed message into a free pool slot via a direct field
 	// copy (SipMessage's copy assignment is a plain owned-string/vector copy —
 	// no shared buffer to fix up). Used by every response-building call site that

@@ -848,6 +848,11 @@ std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(const SipMessage
 	return sipmsgpool::getMessageFromPool(source);
 }
 
+std::shared_ptr<SipMessage> RequestsHandler::getMessageFromWire(std::string_view message, sockaddr_in src)
+{
+	return sipmsgpool::getMessageFromWire(message, src);
+}
+
 void RequestsHandler::initHandlers()
 {
 	_handlers.emplace(SipMessageTypes::REGISTER,          std::bind(&RequestsHandler::onRegister,       this, std::placeholders::_1));
@@ -969,6 +974,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			const auto s = getSession(request->getCallID());
 			return s.has_value() && s.value() && s.value()->isEmergency();
 		};
+		if (request->headerLinesTruncated()) _headerLineCuts.fetch_add(1, std::memory_order_relaxed);
 		bool headerRefused = false;
 		std::string_view unsupportedTag;
 		if (const auto hv = request->checkHeaders(unsupportedTag); hv != SipMessage::HeaderVerdict::Ok)
@@ -2951,8 +2957,10 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		size_t sep = raw.find("\r\n\r\n");
 		if (sep != std::string::npos)
 		{
-			std::string_view headerView(raw.data(), sep);
-			if (headerView.find("application/sdp") == std::string_view::npos)
+			// #838: the Content-Type line itself. "application/sdp" anywhere in the
+			// header block also matched the Accept line addCapabilityHeaders()
+			// adds, so an INVITE that arrived without one was answered without one.
+			if (!ok->hasSdpContentType())
 			{
 				// No SDP Content-Type yet: splice one in just before the blank line.
 				raw.insert(sep, "\r\nContent-Type: application/sdp");
@@ -10400,8 +10408,10 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 		size_t sep = raw.find("\r\n\r\n");
 		if (sep != std::string::npos)
 		{
-			std::string_view headerView(raw.data(), sep);
-			if (headerView.find("application/sdp") == std::string_view::npos)
+			// #838: the Content-Type line itself. "application/sdp" anywhere in the
+			// header block also matched the Accept line addCapabilityHeaders()
+			// adds, so an INVITE that arrived without one was answered without one.
+			if (!ok->hasSdpContentType())
 			{
 				raw.insert(sep, "\r\nContent-Type: application/sdp");
 				sep = raw.find("\r\n\r\n");
@@ -11186,8 +11196,10 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 		size_t sep = raw.find("\r\n\r\n");
 		if (sep != std::string::npos)
 		{
-			std::string_view headerView(raw.data(), sep);
-			if (headerView.find("application/sdp") == std::string_view::npos)
+			// #838: the Content-Type line itself. "application/sdp" anywhere in the
+			// header block also matched the Accept line addCapabilityHeaders()
+			// adds, so an INVITE that arrived without one was answered without one.
+			if (!ok->hasSdpContentType())
 			{
 				raw.insert(sep, "\r\nContent-Type: application/sdp");
 				sep = raw.find("\r\n\r\n");

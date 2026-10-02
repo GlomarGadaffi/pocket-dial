@@ -126,13 +126,47 @@ namespace
 		return lines[n++];
 	}
 
-	// Park everything past the first `n` lines, buffers intact.
+	// Park everything past the first `n` lines, buffers intact, up to
+	// SipLimits::kMaxHeaderLines of them (#838); a line past that is freed.
 	void parkSurplus(std::vector<std::string>& lines, std::vector<std::string>& spare, size_t n)
 	{
 		while (lines.size() > n)
 		{
-			spare.push_back(std::move(lines.back()));
+			if (spare.size() < SipLimits::kMaxHeaderLines) spare.push_back(std::move(lines.back()));
 			lines.pop_back();
+		}
+	}
+
+	size_t heapBytesOf(const std::string& s, size_t inlineCapacity)
+	{
+		return s.capacity() > inlineCapacity ? s.capacity() : 0;
+	}
+
+	// #838: lines are reused in place by position, so a long line at a
+	// different position in each datagram would leave every position holding a
+	// large buffer. Past SipLimits::kMaxKeptLineBytes, parked buffers are freed
+	// first (no allocation), then a line holding more than it needs is given an
+	// exact-size buffer. Legitimate traffic stays under the budget, so only a
+	// run of oversized lines ever pays for an allocation here.
+	void capKeptLineBytes(std::vector<std::string>& lines, std::vector<std::string>& spare)
+	{
+		const size_t inlineCapacity = std::string().capacity();
+		size_t kept = 0;
+		for (const std::string& s : lines) kept += heapBytesOf(s, inlineCapacity);
+		for (const std::string& s : spare) kept += heapBytesOf(s, inlineCapacity);
+		for (std::string& s : spare)
+		{
+			if (kept <= SipLimits::kMaxKeptLineBytes) return;
+			kept -= heapBytesOf(s, inlineCapacity);
+			std::string().swap(s);
+		}
+		for (std::string& s : lines)
+		{
+			if (kept <= SipLimits::kMaxKeptLineBytes) return;
+			const size_t before = heapBytesOf(s, inlineCapacity);
+			if (before == 0 || s.capacity() == s.size()) continue;
+			std::string(s).swap(s);
+			kept = kept - before + heapBytesOf(s, inlineCapacity);
 		}
 	}
 
@@ -145,9 +179,14 @@ namespace
 	// Every output is written with assign() into storage that survives the call
 	// (see nextLine()/parkSurplus() above), so parsing into a warmed pooled
 	// message allocates nothing.
-	void splitMessage(std::string_view raw, std::string& startLine,
+	//
+	// #838: keeps at most `maxLines` header lines and returns true when there
+	// were more. Storing every line of a datagram and counting afterwards let
+	// one 2 KB datagram of short lines leave ~1000 line buffers in a pooled
+	// message for good, refused or not.
+	bool splitMessage(std::string_view raw, std::string& startLine,
 		std::vector<std::string>& headerLines, std::vector<std::string>& spare,
-		std::string& body)
+		std::string& body, size_t maxLines)
 	{
 		startLine.clear();
 		body.clear();
@@ -178,7 +217,7 @@ namespace
 		if (headerBlock.empty())
 		{
 			parkSurplus(headerLines, spare, 0);
-			return;
+			return false;
 		}
 
 		size_t pos_start = 0;
@@ -194,13 +233,14 @@ namespace
 		{
 			startLine.assign(headerBlock);
 			parkSurplus(headerLines, spare, 0);
-			return;
+			return false;
 		}
 
 		// assign(), not `= std::string(...)`: the temporary always allocated.
 		startLine.assign(headerBlock.substr(pos_start, pos_end - pos_start));
 		pos_start = pos_end + lineDelimLen;
 
+		bool tooMany = false;
 		while (pos_start < headerBlock.size())
 		{
 			pos_end = headerBlock.find("\r\n", pos_start);
@@ -225,17 +265,27 @@ namespace
 
 			if (!line.empty())
 			{
+				if (n == maxLines)
+				{
+					tooMany = true;
+					break;
+				}
 				nextLine(headerLines, spare, n).assign(line);
 			}
 		}
 		parkSurplus(headerLines, spare, n);
+		capKeptLineBytes(headerLines, spare);
+		return tooMany;
 	}
+
+	// A message the PBX built keeps every line (#838).
+	constexpr size_t kEveryLine = static_cast<size_t>(-1);
 }
 
 SipMessage::SipMessage(const std::string& message, sockaddr_in src) : _src(src)
 {
 	_hasSdp = mentionsSdpContentType(message);
-	splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body);
+	_headerLinesTruncated = splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body, kEveryLine);
 }
 
 // Member-wise copy of everything EXCEPT _bodyGen, which advances instead — see
@@ -261,6 +311,8 @@ SipMessage& SipMessage::operator=(const SipMessage& other)
 		nextLine(_headerLines, _spareHeaderLines, n).assign(line);
 	}
 	parkSurplus(_headerLines, _spareHeaderLines, n);
+	capKeptLineBytes(_headerLines, _spareHeaderLines);
+	_headerLinesTruncated = other._headerLinesTruncated;
 	_body        = other._body;
 	_src         = other._src;
 	++_bodyGen;
@@ -269,11 +321,22 @@ SipMessage& SipMessage::operator=(const SipMessage& other)
 
 void SipMessage::reset(std::string_view message, sockaddr_in src)
 {
+	resetWithin(message, src, kEveryLine);
+}
+
+void SipMessage::resetFromWire(std::string_view message, sockaddr_in src)
+{
+	resetWithin(message, src, SipLimits::kMaxHeaderLines);
+}
+
+void SipMessage::resetWithin(std::string_view message, sockaddr_in src, size_t maxHeaderLines)
+{
 	_src = src;
 	_hasSdp = mentionsSdpContentType(message);
 	// splitMessage() clear()s _headerLines rather than reassigning it, so a
 	// pooled message's vector capacity survives across reset() calls.
-	splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body);
+	_headerLinesTruncated = splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body,
+		maxHeaderLines);
 	++_bodyGen;   // this is the pool-recycle path — see bodyGeneration()
 }
 
@@ -832,6 +895,13 @@ namespace
 	// INVITE). "replaces": RFC 3891, see kSupportedOptionTags in
 	// RequestsHandler.cpp. Everything else -- 100rel (no PRACK), path, gruu,
 	// outbound, sec-agree -- is a 420.
+	// A Content-Type value naming SDP. Media type only: parameters after ';' do
+	// not change what we parse.
+	bool isSdpMediaType(std::string_view contentTypeValue)
+	{
+		return iequalLower(trimWs(contentTypeValue.substr(0, contentTypeValue.find(';'))), "application/sdp");
+	}
+
 	bool isKnownOptionTag(std::string_view tag)
 	{
 		return iequalLower(tag, "timer") || iequalLower(tag, "replaces");
@@ -862,7 +932,7 @@ SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported
 	}
 	if (!isRequest) return HeaderVerdict::Ok;
 
-	if (_headerLines.size() > kMaxHeaderLines) return HeaderVerdict::TooManyHeaders;
+	if (_headerLinesTruncated || _headerLines.size() > kMaxHeaderLines) return HeaderVerdict::TooManyHeaders;
 
 	const bool checkRequire = method != SipMessageTypes::ACK && method != SipMessageTypes::CANCEL;
 	const bool checkBody = !_body.empty() &&
@@ -914,13 +984,22 @@ SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported
 		}
 		else if (iequal(name, "content-type") || iequal(name, "c"))
 		{
-			// Media type only: parameters after ';' do not change what we parse.
-			sdpBody = iequalLower(trimWs(value.substr(0, value.find(';'))), "application/sdp");
+			sdpBody = isSdpMediaType(value);
 		}
 	}
 	// RFC 3261 §21.4.13: a body we do not parse, or one with no Content-Type.
 	if (checkBody && !sdpBody) return HeaderVerdict::UnsupportedMediaType;
 	return HeaderVerdict::Ok;
+}
+
+bool SipMessage::hasSdpContentType() const
+{
+	for (const std::string& line : _headerLines)
+	{
+		const std::string_view name = headerNameOf(line);
+		if ((iequal(name, "content-type") || iequal(name, "c")) && isSdpMediaType(headerValueOf(line))) return true;
+	}
+	return false;
 }
 
 const char* SipMessage::headerVerdictText(HeaderVerdict v)
