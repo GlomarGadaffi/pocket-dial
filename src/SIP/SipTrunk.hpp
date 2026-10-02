@@ -467,10 +467,12 @@ public:
 
 #if POCKETDIAL_TRUNK_INBOUND
 	// #398: take a carrier's INVITE into a free slot (Trying); `handsetCallID`
-	// is the fork's own Call-ID. Sends nothing. False when the trunk is not
-	// configured, no slot is free, the Call-ID is already a trunk dialog's, or
-	// the INVITE is in-dialog (To tag) or has no Contact to send a BYE to.
-	bool acceptCall(const SipMessage& invite, std::string_view handsetCallID, uint16_t localRtpPort);
+	// is the fork's own Call-ID. Sends nothing. Returns 0 when taken; otherwise
+	// the final the caller answers the carrier with, nothing claimed: 503 trunk
+	// not configured, 481 a To tag, 482 a Call-ID already ours (s8.2.2.2; a
+	// retransmission is the caller's to catch first, with ownsCallID()), 400 no
+	// From tag or no sip:/sips: Contact to BYE, 486 no free slot.
+	int acceptCall(const SipMessage& invite, std::string_view handsetCallID, uint16_t localRtpPort);
 
 	// Answer that INVITE: a 1xx (a 18x makes it Proceeding), a 2xx with `sdp`
 	// (Confirmed), or a failure, which releases the slot. False when `callID`

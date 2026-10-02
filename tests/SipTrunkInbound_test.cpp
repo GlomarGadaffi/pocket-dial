@@ -137,27 +137,48 @@ namespace
 		return c;
 	}
 
-	// As a Record-Routing SBC sends it: two Vias, a display name in From.
-	std::shared_ptr<SipMessage> carrierInvite(const std::string& callId = kCallId,
-		const std::string& toParams = "", bool withContact = true)
+	// As a Record-Routing SBC sends it: two Vias (the top asking for rport), a
+	// display name in From. `padLines` extra headers before Max-Forwards push
+	// the message past the 64-line cap (#838).
+	std::string carrierInviteText(const std::string& callId = kCallId,
+		const std::string& toParams = "", bool withContact = true, int padLines = 0)
 	{
 		const std::string sdp =
 			"v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\n"
 			"t=0 0\r\nm=audio 41000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n";
-		const std::string raw =
+		std::string pad;
+		for (int i = 0; i < padLines; ++i) pad += "X-Pad-" + std::to_string(i) + ": x\r\n";
+		return
 			"INVITE sip:15551230000@192.168.1.10:5060 SIP/2.0\r\n"
-			"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKsbc1\r\n"
+			"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKsbc1;rport\r\n"
 			"Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bKcore1;received=10.0.0.9\r\n"
 			"Record-Route: <sip:203.0.113.5;lr>\r\n"
 			"From: \"Caller\" <sip:+12025550177@203.0.113.5>;tag=carrier-ftag\r\n"
 			"To: <sip:+12025550188@192.168.1.10>" + toParams + "\r\n"
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 101 INVITE\r\n" +
-			std::string(withContact ? "Contact: <sip:+12025550177@203.0.113.9:5060>\r\n" : "") +
+			std::string(withContact ? "Contact: <sip:+12025550177@203.0.113.9:5060>\r\n" : "") + pad +
 			"Max-Forwards: 69\r\n"
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
-		return std::make_shared<SipMessage>(raw, FakePbxEnv::addr(kSbcIp, 5060));
+	}
+
+	// From the SBC's address, but source port 5062: what the top Via's rport learns.
+	std::shared_ptr<SipMessage> fromSbc(const std::string& raw)
+	{
+		return std::make_shared<SipMessage>(raw, FakePbxEnv::addr(kSbcIp, 5062));
+	}
+
+	std::shared_ptr<SipMessage> carrierInvite(const std::string& callId = kCallId,
+		const std::string& toParams = "", bool withContact = true)
+	{
+		return fromSbc(carrierInviteText(callId, toParams, withContact));
+	}
+
+	std::string replaced(std::string s, const std::string& from, const std::string& to)
+	{
+		s.replace(s.find(from), from.size(), to);
+		return s;
 	}
 
 	// The carrier hanging up, from `ip`, with the given From and To tags.
@@ -216,7 +237,7 @@ namespace
 		{
 			trunk.setConfig(workingConfig());
 			trunk.setListener(&lis);
-			EXPECT_TRUE(trunk.acceptCall(*carrierInvite(), kFork, 40000));
+			EXPECT_EQ(trunk.acceptCall(*carrierInvite(), kFork, 40000), 0);
 		}
 		const SipTrunk::Dialog* dialog() const { return trunk.findByCallID(kFork); }
 		bool sentTo(size_t i, const char* ip) const
@@ -226,7 +247,11 @@ namespace
 	};
 
 	const std::string kVias =
-		"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKsbc1\r\n"
+		"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKsbc1;rport\r\n"
+		"Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bKcore1;received=10.0.0.9\r\n";
+	// As a response carries them: the top one stamped (RFC 3261 s18.2.1, RFC 3581 s4).
+	const std::string kEchoedVias =
+		"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKsbc1;rport=5062;received=203.0.113.5\r\n"
 		"Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bKcore1;received=10.0.0.9\r\n";
 	const std::string kEchoed =
 		"From: \"Caller\" <sip:+12025550177@203.0.113.5>;tag=carrier-ftag\r\n"
@@ -253,20 +278,30 @@ TEST(SipTrunkInbound, ADialogFromTheInviteTakesTheCarriersIdentifiers)
 	EXPECT_EQ(d.remoteTarget, "sip:+12025550177@203.0.113.9:5060") << "in-dialog requests go to its Contact";
 	EXPECT_EQ(d.remoteCseq, 101u);
 	EXPECT_EQ(d.cseq, 0u) << "our own sequence number is empty until our first request (s12.1.1)";
-	EXPECT_EQ(d.inviteVias, kVias) << "every Via, in order";
+	EXPECT_EQ(d.inviteVias, kEchoedVias) << "every Via, in order, the top one stamped";
+}
+
+TEST(SipTrunkInbound, TheTopViaComesBackWithReceivedAndItsRportFilled)
+{
+	const std::string trying = SipTrunk::buildResponse(pinnedInbound(), 100);
+	EXPECT_EQ(lineStarting(trying, "Via: "),
+		"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKsbc1;rport=5062;received=203.0.113.5")
+		<< "RFC 3581 s4: the source port the INVITE came from, and received";
+	EXPECT_NE(trying.find("\r\nVia: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bKcore1;received=10.0.0.9\r\n"),
+		std::string::npos) << "only the top Via is ours to stamp";
 }
 
 TEST(SipTrunkInbound, TheTryingEchoesEveryViaAndCarriesOurTag)
 {
 	EXPECT_EQ(SipTrunk::buildResponse(pinnedInbound(), 100),
-		"SIP/2.0 100 Trying\r\n" + kVias + kEchoed +
+		"SIP/2.0 100 Trying\r\n" + kEchoedVias + kEchoed +
 		"Content-Length: 0\r\n\r\n");
 }
 
 TEST(SipTrunkInbound, TheRingingAddsRecordRouteAndOurContact)
 {
 	EXPECT_EQ(SipTrunk::buildResponse(pinnedInbound(), 180),
-		"SIP/2.0 180 Ringing\r\n" + kVias +
+		"SIP/2.0 180 Ringing\r\n" + kEchoedVias +
 		"Record-Route: <sip:203.0.113.5;lr>\r\n" + kEchoed +
 		"Contact: <sip:15551230000@192.168.1.10:5060;transport=udp>\r\n"
 		"Content-Length: 0\r\n\r\n");
@@ -275,7 +310,7 @@ TEST(SipTrunkInbound, TheRingingAddsRecordRouteAndOurContact)
 TEST(SipTrunkInbound, TheOkCarriesTheSdpAnswer)
 {
 	EXPECT_EQ(SipTrunk::buildResponse(pinnedInbound(), 200, "v=0\r\n"),
-		"SIP/2.0 200 OK\r\n" + kVias +
+		"SIP/2.0 200 OK\r\n" + kEchoedVias +
 		"Record-Route: <sip:203.0.113.5;lr>\r\n" + kEchoed +
 		"Contact: <sip:15551230000@192.168.1.10:5060;transport=udp>\r\n"
 		"Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n"
@@ -315,23 +350,75 @@ TEST(SipTrunkInbound, AcceptingHoldsOneSlotUnderBothCallIdsAndSendsNothing)
 
 TEST(SipTrunkInbound, AcceptingRefusesWhatItCouldNotAnswerOrEnd)
 {
+	// Each refusal names the final the caller answers the carrier with; nothing is claimed.
 	FakePbxEnv env;
 	SipTrunk trunk(env);
-	EXPECT_FALSE(trunk.acceptCall(*carrierInvite(), kFork, 40000)) << "an unconfigured trunk";
+	EXPECT_EQ(trunk.acceptCall(*carrierInvite(), kFork, 40000), 503) << "an unconfigured trunk";
 
 	trunk.setConfig(workingConfig());
-	EXPECT_FALSE(trunk.acceptCall(*carrierInvite("c-tagged", ";tag=x"), "f1", 40000)) << "a To tag: in-dialog";
-	EXPECT_FALSE(trunk.acceptCall(*carrierInvite("c-nocontact", "", false), "f2", 40000))
+	EXPECT_EQ(trunk.acceptCall(*carrierInvite("c-tagged", ";tag=x"), "f1", 40000), 481)
+		<< "a To tag: a dialog we do not have";
+	EXPECT_EQ(trunk.acceptCall(*carrierInvite("c-nocontact", "", false), "f2", 40000), 400)
 		<< "no Contact: the call could never be BYEd";
-	ASSERT_TRUE(trunk.acceptCall(*carrierInvite(), kFork, 40000));
-	EXPECT_FALSE(trunk.acceptCall(*carrierInvite(), "f3", 40000)) << "the same Call-ID twice";
+	ASSERT_EQ(trunk.acceptCall(*carrierInvite(), kFork, 40000), 0);
+	EXPECT_EQ(trunk.acceptCall(*carrierInvite(), "f3", 40000), 482)
+		<< "the same Call-ID twice: a merged request (s8.2.2.2)";
 	for (int i = 1; i < static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS); ++i)
 	{
-		ASSERT_TRUE(trunk.acceptCall(*carrierInvite("c-" + std::to_string(i)), "g" + std::to_string(i), 40000));
+		ASSERT_EQ(trunk.acceptCall(*carrierInvite("c-" + std::to_string(i)), "g" + std::to_string(i), 40000), 0);
 	}
-	EXPECT_FALSE(trunk.acceptCall(*carrierInvite("c-over"), "f4", 40000)) << "no free slot";
+	EXPECT_EQ(trunk.acceptCall(*carrierInvite("c-over"), "f4", 40000), 486) << "no free slot";
 	EXPECT_EQ(trunk.activeDialogs(), static_cast<size_t>(POCKETDIAL_MAX_TRUNK_CALLS));
 	EXPECT_TRUE(env.sent.empty());
+}
+
+TEST(SipTrunkInbound, AFromWithoutATagIsABadRequest)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+
+	EXPECT_EQ(trunk.acceptCall(*fromSbc(replaced(carrierInviteText(), ";tag=carrier-ftag", "")), kFork, 40000), 400)
+		<< "RFC 3261 s8.1.1.3: without it our BYE would carry an empty To tag";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+}
+
+TEST(SipTrunkInbound, AContactThatIsNotASipUriIsABadRequest)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	const std::string contact = "Contact: <sip:+12025550177@203.0.113.9:5060>";
+
+	for (const char* bad : { "Contact: *", "Contact: <tel:+12025550177>", "Contact: <>" })
+	{
+		EXPECT_EQ(trunk.acceptCall(*fromSbc(replaced(carrierInviteText(), contact, bad)), kFork, 40000), 400)
+			<< bad << ": our BYE's Request-URI would be it";
+	}
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+	EXPECT_EQ(trunk.acceptCall(*fromSbc(replaced(carrierInviteText(), contact,
+		"Contact: <SIPS:+12025550177@203.0.113.9:5061>")), kFork, 40000), 0) << "sips:, in any case, is a SIP URI";
+}
+
+TEST(SipTrunkInbound, AnInviteCutAtTheLineCapEchoesNoRecordRoute)
+{
+	Inbound in;
+	const auto cut = fromSbc("");
+	cut->resetFromWire(carrierInviteText("c-cut", "", true, 70), FakePbxEnv::addr(kSbcIp, 5062));   // as off the socket
+	ASSERT_TRUE(cut->headerLinesTruncated()) << "precondition: past the 64-line cap (#838)";
+	ASSERT_EQ(in.trunk.acceptCall(*cut, "fork-cut", 40000), 0) << "still answered: it may be a PSAP callback";
+	in.env.sent.clear();
+
+	ASSERT_TRUE(in.trunk.respond("fork-cut", 180));
+
+	ASSERT_EQ(in.env.sent.size(), 1u);
+	EXPECT_EQ(in.env.sentRaw(0).find("Record-Route"), std::string::npos)
+		<< "RFC 3261 s12.1.1: a partial Record-Route is a wrong route set; none is safer";
+	EXPECT_NE(in.env.sentRaw(0).find("\r\nVia: SIP/2.0/UDP 10.0.0.9"), std::string::npos)
+		<< "the Vias, ahead of the cut, are all still echoed";
+	bool logged = false;
+	for (const auto& l : in.env.logs) logged = logged || l.find("Record-Route") != std::string::npos;
+	EXPECT_TRUE(logged) << "the drop is visible to whoever brings the carrier up";
 }
 
 TEST(SipTrunkInbound, RespondingWalksTheDialogToConfirmedUnderOneTag)

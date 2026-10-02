@@ -278,16 +278,28 @@ namespace
 	}
 
 #if POCKETDIAL_TRUNK_INBOUND
-	// #398: every header line of `m` named `name` or `compact`, verbatim and in
+	// #398: `a` equals the lowercase `lower`, ignoring case; never when empty.
+	bool sameLower(std::string_view a, std::string_view lower)
+	{
+		if (a.empty() || a.size() != lower.size()) return false;
+		for (size_t i = 0; i < a.size(); ++i)
+			if (std::tolower(static_cast<unsigned char>(a[i])) != lower[i]) return false;
+		return true;
+	}
+
+	// A sip: or sips: URI with something after the scheme (case-insensitive,
+	// RFC 3261 s19.1.4). Not "*", not tel:, not empty.
+	bool isSipUri(std::string_view uri)
+	{
+		const size_t colon = uri.find(':');
+		return colon != std::string_view::npos && colon + 1 < uri.size() &&
+			(sameLower(uri.substr(0, colon), "sip") || sameLower(uri.substr(0, colon), "sips"));
+	}
+
+	// Every header line of `m` named `name` or `compact`, verbatim and in
 	// order, each ending CRLF.
 	std::string headerLines(const SipMessage& m, std::string_view name, std::string_view compact)
 	{
-		auto same = [](std::string_view a, std::string_view b) {
-			if (a.empty() || a.size() != b.size()) return false;
-			for (size_t i = 0; i < a.size(); ++i)
-				if (std::tolower(static_cast<unsigned char>(a[i])) != b[i]) return false;
-			return true;
-		};
 		std::string out;
 		const std::string raw = m.toString();
 		std::string_view rest = raw;
@@ -300,7 +312,7 @@ namespace
 			rest = eol == std::string_view::npos ? std::string_view{} : rest.substr(eol + 2);
 			if (line.empty()) break;   // end of the headers
 			const std::string_view n = trimWs(line.substr(0, line.find(':')));
-			if (same(n, name) || same(n, compact)) out.append(line).append("\r\n");
+			if (sameLower(n, name) || sameLower(n, compact)) out.append(line).append("\r\n");
 		}
 		return out;
 	}
@@ -422,29 +434,20 @@ std::string SipTrunk::buildBye(const Dialog& d, std::string_view freshBranch, st
 	}
 
 	std::ostringstream ss;
-#if POCKETDIAL_TRUNK_INBOUND
-	if (d.role == Role::Inbound)
-	{
-		// #398, s12.2.1.1 as the UAS: From is the INVITE's To URI with our tag, To
-		// is its From URI with the carrier's, and the CSeq is our own counter.
-		ss << "BYE " << d.remoteTarget << " SIP/2.0\r\n"
-		   << "Via: SIP/2.0/UDP " << d.localIpPort << ";branch=" << freshBranch << ";rport\r\n"
-		   << routeLine(d)
-		   << "From: <" << contactUri(d.inviteTo) << ">;tag=" << d.toTag << "\r\n"
-		   << "To: <" << contactUri(d.inviteFrom) << ">;tag=" << d.fromTag << "\r\n"
-		   << "Call-ID: " << d.callID << "\r\n"
-		   << "CSeq: " << (d.cseq + 1) << " BYE\r\n";
-		commonRequestTail(ss);
-		if (!authLine.empty()) ss << authLine << "\r\n";
-		ss << "Content-Length: 0\r\n\r\n";
-		return ss.str();
-	}
-#endif
 	ss << "BYE " << d.remoteTarget << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << d.localIpPort << ";branch=" << freshBranch << ";rport\r\n"
 	   << routeLine(d)   // #748: RFC 3261 s12.2.1.1
+#if POCKETDIAL_TRUNK_INBOUND
+	   // #398, s12.2.1.1 as the UAS: From is the INVITE's To URI with our tag
+	   // (toTag), To its From URI with the carrier's (fromTag).
+	   << "From: <" << (d.role == Role::Inbound ? contactUri(d.inviteTo) : "sip:" + d.fromUser + "@" + d.domain)
+	   << ">;tag=" << (d.role == Role::Inbound ? d.toTag : d.fromTag) << "\r\n"
+	   << "To: <" << (d.role == Role::Inbound ? contactUri(d.inviteFrom) : pstnUri(d.destE164, d.domain))
+	   << ">;tag=" << (d.role == Role::Inbound ? d.fromTag : d.toTag) << "\r\n"
+#else
 	   << "From: <sip:" << d.fromUser << "@" << d.domain << ">;tag=" << d.fromTag << "\r\n"
 	   << "To: <" << pstnUri(d.destE164, d.domain) << ">;tag=" << d.toTag << "\r\n"
+#endif
 	   << "Call-ID: " << d.callID << "\r\n"
 	   // A new request in the dialog takes the NEXT sequence number (§12.2.1.1).
 	   << "CSeq: " << (d.cseq + 1) << " BYE\r\n";
@@ -489,7 +492,14 @@ SipTrunk::Dialog SipTrunk::dialogFromInvite(const SipMessage& invite, std::strin
 	d.inviteFrom.assign(invite.getFrom());
 	d.inviteTo.assign(invite.getTo());
 	d.inviteVias        = headerLines(invite, "via", "v");
-	d.inviteRecordRoute = headerLines(invite, "record-route", "");
+	// RFC 3261 s18.2.1, RFC 3581 s4: the top Via goes back with received, and
+	// a bare rport filled in.
+	if (const size_t top = d.inviteVias.find("\r\n"); top != std::string::npos)
+		d.inviteVias.replace(0, top, sipwire::viaWithReceived(std::string_view(d.inviteVias).substr(0, top),
+			invite.getSource()));
+	// s12.1.1: a Record-Route cut at the 64-line cap (#838) is a wrong route
+	// set; echoing none is safer, as the outbound 2xx path does.
+	if (!invite.headerLinesTruncated()) d.inviteRecordRoute = headerLines(invite, "record-route", "");
 	return d;
 }
 
@@ -699,26 +709,26 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 }
 
 #if POCKETDIAL_TRUNK_INBOUND
-bool SipTrunk::acceptCall(const SipMessage& invite, std::string_view handsetCallID, uint16_t localRtpPort)
+int SipTrunk::acceptCall(const SipMessage& invite, std::string_view handsetCallID, uint16_t localRtpPort)
 {
-	if (!_cfg.valid() || invite.getTo().find("tag=") != std::string_view::npos ||
-		findMutableByTrunkCallID(invite.getCallID()))
-	{
-		return false;
-	}
+	if (!_cfg.valid()) return 503;
+	if (invite.getTo().find("tag=") != std::string_view::npos) return 481;
+	if (findMutableByTrunkCallID(invite.getCallID())) return 482;
 	Dialog* d = allocDialog();
 	if (!d)
 	{
 		_env.log("Trunk: inbound call refused, no free dialog slot", true);
-		return false;
+		return 486;
 	}
 	*d = dialogFromInvite(invite, IDGen::GenerateID(9),
 		_env.localIp() + ":" + std::to_string(_env.serverPort()), _cfg.fromUser);
-	if (d->remoteTarget.empty())
+	if (d->fromTag.empty() || !isSipUri(d->remoteTarget))
 	{
-		*d = Dialog{};   // no Contact: nowhere to send our BYE
-		return false;
+		*d = Dialog{};   // our BYE would carry no To tag, or go nowhere (s8.1.1.3, s8.1.1.8)
+		return 400;
 	}
+	if (invite.headerLinesTruncated())
+		_env.log("Trunk: inbound INVITE cut at 64 header lines; its Record-Route is not echoed", true);
 	d->state        = State::Trying;
 	d->handsetCallID.assign(handsetCallID);
 	d->localRtpPort = localRtpPort;
@@ -726,7 +736,7 @@ bool SipTrunk::acceptCall(const SipMessage& invite, std::string_view handsetCall
 	d->nextHop      = d->peer;
 	// A backstop only: sweep() answers the carrier 480 when it passes.
 	d->deadline     = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-	return true;
+	return 0;
 }
 
 bool SipTrunk::respond(std::string_view callID, int status, std::string_view sdp)
