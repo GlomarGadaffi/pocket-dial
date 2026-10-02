@@ -7,8 +7,9 @@
 // up, and gives a final answer the carrier can ACK. The fork to the handset is
 // part C, so even a routable call is answered 480 for now.
 //
-// Extensions here are 2xxx on purpose, and no test dials an emergency number.
-// Numbers are the fictional 555-01xx range; addresses are RFC 5737 TEST-NETs.
+// Extensions here are 2xxx on purpose. Numbers are the fictional 555-01xx range;
+// addresses are RFC 5737 TEST-NETs. The 911/933 INVITEs are synthetic host
+// messages captured in `sent`; nothing reaches a network.
 
 #include <gtest/gtest.h>
 
@@ -246,7 +247,7 @@ TEST(TrunkInbound, WithTheTrunkDisabledTheSbcAddressIsRefusedAsBefore)
 TEST(TrunkInbound, APhoneRegisteredFromTheSbcAddressStillCallsAsAPhone)
 {
 	// An FXS port on the carrier's own gateway is a phone, and its calls keep
-	// the phone path: emergency routing included, which this test cannot dial.
+	// the phone path.
 	Bench b;
 	b.handler.handle(makeRegister("2002", kSbcIp));
 	b.sent.clear();
@@ -256,6 +257,34 @@ TEST(TrunkInbound, APhoneRegisteredFromTheSbcAddressStillCallsAsAPhone)
 	EXPECT_FALSE(b.firstTo("INVITE", kPhoneIp).empty()) << "2002 rings 2001 as any phone would";
 	EXPECT_TRUE(b.firstTo("404", kSbcIp).empty());
 	EXPECT_TRUE(b.firstTo("480", kSbcIp).empty());
+}
+
+namespace
+{
+	// From names 2001, registered from kPhoneIp, so the phone exclusion does not
+	// apply: only the 911/933 exclusion keeps this off the trunk-inbound path.
+	// Today's path for it is the emergency branch, which runs before #497
+	// (#454) and places the call on the trunk.
+	void expectEmergencyFromSbcKeepsTodaysPath(const std::string& number)
+	{
+		Bench b;
+		b.handler.handle(makeInvite(number, number, "in-" + number, kSbcIp, true, kExt));
+
+		EXPECT_FALSE(b.firstTo("INVITE sip:" + number, kSbcIp).empty())
+			<< number << " reached the emergency branch and went out on the trunk, as before #398";
+		EXPECT_TRUE(b.firstTo("404", kSbcIp).empty()) << "not refused as an unmapped DID";
+		EXPECT_TRUE(b.firstTo("480", kSbcIp).empty());
+	}
+}
+
+TEST(TrunkInbound, A911FromTheSbcAddressIsNotCaughtAndKeepsTheEmergencyPath)
+{
+	expectEmergencyFromSbcKeepsTodaysPath("911");
+}
+
+TEST(TrunkInbound, A933FromTheSbcAddressIsNotCaughtAndKeepsTheEmergencyPath)
+{
+	expectEmergencyFromSbcKeepsTodaysPath("933");
 }
 
 // ── The DID ───────────────────────────────────────────────────────────────────
