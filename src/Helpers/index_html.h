@@ -676,7 +676,8 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <div class="note">
         Controls what a phone must prove before it can register as an extension.
         <strong>Learn</strong> adopts an unknown phone on first contact and
-        locks the extension to that device on its next registration. Until then,
+        locks the extension to that device on its next registration,
+        if no other phone claimed it first. Until then,
         or if the phone is on another subnet or shares a router's MAC with other
         phones, another phone can register on the same extension.
         <strong>Secure</strong> digest-challenges every registration. There is no

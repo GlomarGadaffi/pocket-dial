@@ -456,7 +456,8 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
             open mode any more: accepting any endpoint with no credential let anyone on the link register as any extension,
             and firmware that finds it stored switches the board to learn.
             <br><strong>Learn:</strong> trust-on-first-use. An unknown device is adopted unverified; its extension is locked to it
-            when it registers a second time (never for a phone on another subnet, or one sharing a router's MAC), while
+            when it registers again at least 30 s later, if no other device claimed that extension first (never for a
+            phone on another subnet, or one sharing a router's MAC), while
             devices already secured are digest-enforced as usual. Your phones register with
             nothing to configure.
             <br><strong>Secure:</strong> every REGISTER is digest-challenged, so an extension can only be claimed by

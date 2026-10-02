@@ -1303,9 +1303,10 @@ curl -s "http://$DEV/api/registrar" -b "pd_session=$SESSION"
 
 * `learn`: trust-on-first-use, and the default. An unknown MAC registering an extension
   is adopted unverified, while already-secured devices stay digest-enforced and
-  MAC-locked. Since #440 the phone's next registration from the same MAC, at least 30 s
-  after its first (#515), also locks
-  its extension to that MAC (another MAC gets `403`); until then, and for a phone on
+  MAC-locked. Since #440 the phone's next registration from the same MAC (the MAC its
+  source IP resolves to in the board's ARP table), at least 30 s after its first (#515),
+  also locks its extension to that MAC, if no earlier-adopted device holds the extension
+  (the first claim wins); another MAC then gets `403`. Until then, and for a phone on
   another subnet or sharing a NAT router's MAC, any device that asks can claim it. Adopt
   phones on a trusted/WPA2 link.
 * `open` (retired, #500): used to accept every `REGISTER` with no credential. A board that
@@ -1351,7 +1352,7 @@ curl -s -X POST "http://$DEV/api/registrar" \
 | Param | Values | Effect |
 | :--- | :--- | :--- |
 | `action` | `secure` \| `forget` | Required. |
-| `target` | 12-hex MAC, or an extension | Required. An extension resolves to the device currently bound to it. |
+| `target` | 12-hex MAC, or an extension | Required. An extension resolves to the one device that holds it. Two rows can hold one extension (a lock holder beside a later claim, or a stale row); then send the MAC (#820). |
 
 `secure` promotes a `learned` device to `secured`. `forget` drops the adoption record
 entirely; in `learn` mode the phone is re-adopted on its next registration, which is the
@@ -1364,6 +1365,8 @@ way to re-home an extension to different hardware.
   * `400 Bad Request`: `{"error":"action must be one of: secure, forget"}`
   * `401`/`403`: gates 1-4 as in §0.1.
   * `404 Not Found`: `{"error":"no adopted device matches that MAC or extension"}`, JSON, unlike the plain-text fallback `404` in §1.
+  * `409 Conflict`: `{"error":"more than one device holds that extension; send its MAC"}`. Nothing is changed (#820).
+  * `409 Conflict`: `{"error":"no SIP secret for ext <ext>"}`, for `secure` only: securing it would lock the phone out.
   * `503 Service Unavailable`: `{"error":"SIP engine not attached yet"}`
 
 ```bash

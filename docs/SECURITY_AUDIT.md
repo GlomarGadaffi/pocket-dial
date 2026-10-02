@@ -38,9 +38,9 @@ Status: Complete, Post-Refactor Review & Threat Evaluation
 >    (#502). A fresh board adopts an unknown MAC on its first REGISTER of an unclaimed
 >    extension, and admits an INVITE from a Learned (unsecured) extension without a
 >    challenge; digest is enforced for devices promoted to Secured (REGISTER and, since
->    #512, INVITE) and for every extension in `secure` mode, with two open bypasses:
->    #507 (an ARP miss admits a Secured extension without digest) and
->    #560 (the relayed ACK and re-INVITE/UPDATE still carry the INVITE's credential; fix #562 open) and #525 (a nonce/`nc` can be reused within its 5-minute life). #549 (replay to another destination) is fixed by #555.
+>    #512, INVITE) and for every extension in `secure` mode. The bypasses found in review are
+>    fixed: #507 by #487 (an ARP miss no longer admits a Secured extension without digest),
+>    #560 by #562 (the relayed ACK and re-INVITE/UPDATE no longer carry the INVITE's credential), #525 by #570 (a reused nonce/`nc` is re-challenged) and #549 (replay to another destination) by #555.
 >
 > Line numbers quoted throughout this document predate the decomposition of
 > `RequestsHandler` into `CallForker` / `CallPickup` / `ParkOrbit` / `BlfSubscriptions` /
@@ -244,8 +244,8 @@ Residual risk, stated plainly *(as amended 2026-09-13)*: the **first-run window 
 open by design**: a factory-fresh device ships `admin`/`admin` with a forced change on
 first use, so onboarding stays possible (THREAT_MODEL §5.1); the registrar's **default
 mode is `learn`** (#441; `open` is retired, #502), so the digest control protects only
-devices promoted to Secured, or every extension in a `secure` deployment, and even
-that has open gaps (#507, #560, #525; #549 fixed by #555);
+devices promoted to Secured, or every extension in a `secure` deployment (its review
+gaps #507, #560, #525 and #549 are fixed by #487, #562, #570 and #555);
 and the stored HA1 is a bearer credential at rest, which is what makes SEC-03's
 flash-encryption fix matter. See [THREAT_MODEL.md](THREAT_MODEL.md) §5 and §9.
 

@@ -261,8 +261,11 @@ stays plain TOFU however often it registers. Its exposure is every extension **n
 locked**: one whose phone has not yet registered again 30 s after its first, one whose phone is on
 another subnet (no ARP entry, so never locked), one whose phone shares a NAT router's MAC
 with other phones (an unlocked MAC that registers a second extension is marked shared and
-never locks), and one whose first claim came from a device that has gone (forget its row
-to let the replacement lock). Any device that REGISTERs such an extension is adopted
+never locks; its row keeps the extension it registered first, #820), and one whose first
+claim is a row that will never lock: a device that has gone, or a shared row, including
+the old row of a phone re-provisioned to another extension (forget that row to let the
+right phone lock). These fail open: the extension stays unlocked for everyone rather than
+locking its phone out. Any device that REGISTERs such an extension is adopted
 **without verification**. So:
 
 - **Adopt what you own, promptly.** Let every phone register once on a trusted link, check
@@ -310,7 +313,9 @@ extension, so re-adoption is a deliberate admin action, by design.
 ### Rollback / forget
 - Forget one device: removes its `{MAC, ext}` entry from the device registry
   (`Registrar::forget()`, `Registrar.cpp:275-288`). The extension is then unclaimed and can
-  be re-adopted (in Learn) or left unregistered. **It does not remove the HA1.** The digest
+  be re-adopted (in Learn) or left unregistered. `POST /api/registrar/device` accepts an
+  extension only while one row holds it; with two it answers `409` and changes nothing, so
+  forget by MAC, as the dashboard does (#820). **It does not remove the HA1.** The digest
   credential lives in a separate NVS namespace (`sipauth`, `SipSecretStore.cpp:25`) and
   survives a forget, so "forget" is not a credential revocation.
 - ~~Rotate instead of forget~~: **not available.** There is no rotate path, for the
