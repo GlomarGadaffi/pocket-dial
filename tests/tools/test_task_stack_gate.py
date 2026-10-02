@@ -1,6 +1,9 @@
 """Self-test for tools/ci/task_stack_gate.py (#457) on fixture .ci inputs.
 
-The fixture graph is Xtensa-shaped by hand; no compiler runs here.
+The fixture graph is Xtensa-shaped by hand; no compiler runs here. Project
+locations are written under @ROOT@, which setUp replaces with the fixture
+checkout, because the gate tells project code from IDF/toolchain code by that
+path (GCC writes the absolute source path into every label).
 """
 import contextlib
 import io
@@ -16,9 +19,14 @@ sys.path.insert(0, os.path.dirname(GATE))
 import task_stack_gate as g  # noqa: E402
 
 
-def node(title, name, size):
-    return (f'node: {{ title: "{title}" label: "{name}\\n/w/src/SIP/X.cpp:1:1\\n'
-            f'{size} bytes (static)\\n0 dynamic objects" }}\n')
+def node(title, name, size, loc="@ROOT@/src/SIP/X.cpp:1:1", kind="static"):
+    return (f'node: {{ title: "{title}" label: "{name}\\n{loc}\\n'
+            f'{size} bytes ({kind})\\n0 dynamic objects" }}\n')
+
+
+def bare(title, name, loc="@ROOT@/src/SIP/X.cpp:7:1"):
+    """A node GCC wrote with no stack-usage line: a declaration, or an alias."""
+    return f'node: {{ title: "{title}" label: "{name}\\n{loc}" }}\n'
 
 
 def edge(a, b):
@@ -37,6 +45,12 @@ CI = (node("small_task", "void small_task(void*)", 200) + node("leaf", "void lea
       + edge("small_task", "leaf") + edge("big_task", "mid") + edge("mid", "helper")
       + edge("helper", "mid") + edge("mid", "_ZN15RequestsHandler16buildOptionsPingEv"))
 
+# Where IDF and the toolchain keep their sources. lwip's headers sit under .../lwip/src/,
+# which the old "/src/ in the path" test took for this repo's src/ (#457).
+LWIP_H = "/idf/components/lwip/lwip/src/include/lwip/sockets.h:1:1"
+LWIP_C = "/idf/components/lwip/lwip/src/api/sockets.c:1:1"
+STL_VECTOR_H = "/tc/include/c++/15.2.0/bits/stl_vector.h:1:1"
+
 
 class Gate(unittest.TestCase):
     def setUp(self):
@@ -44,7 +58,7 @@ class Gate(unittest.TestCase):
         d = self.tmp.name
         self.ci = os.path.join(d, "ci")
         os.makedirs(self.ci)
-        open(os.path.join(self.ci, "x.ci"), "w").write(CI)
+        self.put(os.path.join(self.ci, "x.ci"), CI)
         os.makedirs(os.path.join(d, "src", "SIP"))
         os.makedirs(os.path.join(d, "main"))
         open(os.path.join(d, "src", "SIP", "X.cpp"), "w").write(
@@ -58,6 +72,10 @@ class Gate(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def put(self, path, text, mode="w"):
+        with open(path, mode) as f:
+            f.write(text.replace("@ROOT@", self.tmp.name))
 
     def run_gate(self, main="main/esp_main_eth.cpp", features=()):
         p = os.path.join(self.tmp.name, "t.json")
@@ -101,7 +119,7 @@ class Gate(unittest.TestCase):
         self.assertEqual(self.run_gate()[0], 0)
 
     def add_ci(self, text):
-        open(os.path.join(self.ci, "x.ci"), "a").write(text)
+        self.put(os.path.join(self.ci, "x.ci"), text, "a")
 
     def test_std_thread_site_without_a_row_fails(self):
         open(os.path.join(self.tmp.name, "src", "SIP", "X.cpp"), "a").write(
@@ -113,8 +131,7 @@ class Gate(unittest.TestCase):
 
     def test_project_node_without_frame_data_fails(self):
         # A partial --ci-dir: leaf's TU is missing, only the call edge remains.
-        self.add_ci('node: { title: "orphan" label: "orphan()\\n/w/src/SIP/Y.cpp:1:1" }\n'
-                    + edge("leaf", "orphan"))
+        self.add_ci(bare("orphan", "orphan()", "@ROOT@/src/SIP/Y.cpp:1:1") + edge("leaf", "orphan"))
         rc, out = self.run_gate()
         self.assertEqual(rc, 1)
         self.assertIn("FAIL frame: project function with no frame data", out)
@@ -132,8 +149,7 @@ class Gate(unittest.TestCase):
         self.assertEqual(self.run_gate()[0], 0)
 
     def test_dynamic_frame_fails_unless_allowlisted(self):
-        self.add_ci('node: { title: "vla" label: "vla()\\n/w/src/SIP/X.cpp:9:1\\n'
-                    '64 bytes (dynamic)" }\n' + edge("leaf", "vla"))
+        self.add_ci(node("vla", "vla()", 64, "@ROOT@/src/SIP/X.cpp:9:1", "dynamic") + edge("leaf", "vla"))
         rc, out = self.run_gate()
         self.assertEqual(rc, 1)
         self.assertIn("FAIL frame: dynamic frame, no allowlist entry: vla()", out)
@@ -174,14 +190,13 @@ class Gate(unittest.TestCase):
         # A header-defined function has a frame in each TU that emits it. a/y.ci
         # sorts before x.ci, so last-wins would charge leaf 300 B, not 700 B.
         os.makedirs(os.path.join(self.ci, "a"))
-        open(os.path.join(self.ci, "a", "y.ci"), "w").write(node("leaf", "void leaf()", 700))
+        self.put(os.path.join(self.ci, "a", "y.ci"), node("leaf", "void leaf()", 700))
         rc, out = self.run_gate()
         self.assertIn("FAIL small: 900 B", out)
         self.assertEqual(rc, 1)
         # Size and kind are each kept at their worst: a smaller dynamic frame in
         # one TU neither lowers leaf's 300 B nor loses the dynamic flag.
-        open(os.path.join(self.ci, "a", "y.ci"), "w").write(
-            node("leaf", "void leaf()", 100).replace("(static)", "(dynamic)"))
+        self.put(os.path.join(self.ci, "a", "y.ci"), node("leaf", "void leaf()", 100, kind="dynamic"))
         rc, out = self.run_gate()
         self.assertIn("ok   small: 500 B", out)
         self.assertIn("FAIL frame: dynamic frame, no allowlist entry: void leaf()", out)
@@ -241,7 +256,7 @@ class Gate(unittest.TestCase):
                ("virtual bool TelephonyAnchorClient::writeAudio(std::string_view, const int16_t*, size_t)", 1120),
                ("bool HoldMusic::loadClip(const std::string&)", 1088),
                ("void RequestsHandler::onRefer(std::shared_ptr<SipMessage>)", 1056)]
-        open(os.path.join(self.ci, "x.ci"), "w").write("".join(node(f"f{i}", n, b) for i, (n, b) in enumerate(big)))
+        self.put(os.path.join(self.ci, "x.ci"), "".join(node(f"f{i}", n, b) for i, (n, b) in enumerate(big)))
         open(os.path.join(self.tmp.name, "src", "SIP", "X.cpp"), "w").write("")
         self.table = {"margin_bytes": 512, "frame_ceiling_bytes": table["frame_ceiling_bytes"],
                       "frame_allowlist": table["frame_allowlist"], "tasks": []}
@@ -251,6 +266,119 @@ class Gate(unittest.TestCase):
         self.table["frame_allowlist"] = {}                  # positive control
         rc, out = self.run_gate()
         self.assertEqual(out.count("FAIL frame:"), len(big), out)
+
+    # --- GCC's C1/C2 and D1/D2 aliases (#457) -------------------------------------------
+    # GCC emits one body for the complete- and base-object constructor (C1/C2) or
+    # destructor (D1/D2) and reports the C1/D1 name as a node with no stack-usage line
+    # and an edge to the body. On main's real Xtensa run, 409 of the 854 callees the
+    # gate called "no frame data" were these.
+
+    def test_ctor_alias_is_a_pass_through_to_its_body(self):
+        self.add_ci(bare("_ZN3FooC1Ev", "Foo::Foo()") + node("_ZN3FooC2Ev", "Foo::Foo()", 600)
+                    + edge("leaf", "_ZN3FooC1Ev") + edge("_ZN3FooC1Ev", "_ZN3FooC2Ev"))
+        self.table["tasks"][0]["bytes"] = 4096
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("FAIL frame", out)
+        # 200 + 300 + alias 0 + body 600: the body is counted, once, not zeroed with its alias.
+        self.assertIn("ok   small: 1100 B", out)
+        self.assertIn("600  Foo::Foo()", out)
+
+    def test_dtor_alias_in_a_library_and_under_a_file_local_title(self):
+        # A local-linkage title carries "<source path>:" before the mangled name, and a
+        # library alias (a path outside this repo) is a pass-through just the same.
+        local = "@ROOT@/src/SIP/X.cpp:"
+        vec = "_ZNSt6vectorIiSaIiEED"
+        self.add_ci(bare(local + vec + "1Ev", "std::vector<int>::~vector()", STL_VECTOR_H)
+                    + node(local + vec + "2Ev", "std::vector<int>::~vector()", 64, STL_VECTOR_H)
+                    + bare("_ZN3FooD1Ev", "Foo::~Foo()") + node("_ZN3FooD2Ev", "Foo::~Foo()", 80)
+                    + edge("leaf", local + vec + "1Ev") + edge(local + vec + "1Ev", local + vec + "2Ev")
+                    + edge("leaf", "_ZN3FooD1Ev") + edge("_ZN3FooD1Ev", "_ZN3FooD2Ev"))
+        self.table["tasks"][0]["bytes"] = 4096
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   small: 580 B", out)             # 200 + 300 + the worse body, 80
+
+    def test_a_frameless_ctor_still_fails_unless_it_calls_its_own_body(self):
+        body = node("_ZN3FooC2Ev", "Foo::Foo()", 600)
+        cases = {
+            # an external function, or a graph that lost the alias's edge: unknown, not zero
+            "no edge to the C2 body": bare("_ZN3FooC1Ev", "Foo::Foo()") + body
+            + edge("leaf", "_ZN3FooC1Ev"),
+            # the body it calls has no frame either
+            "body without a frame": bare("_ZN3FooC1Ev", "Foo::Foo()") + bare("_ZN3FooC2Ev", "Foo::Foo()")
+            + edge("leaf", "_ZN3FooC1Ev") + edge("_ZN3FooC1Ev", "_ZN3FooC2Ev"),
+            # D0, the deleting destructor, is its own function and not an alias of D2
+            "D0 is not an alias": bare("_ZN3FooD0Ev", "Foo::~Foo()") + node("_ZN3FooD2Ev", "Foo::~Foo()", 80)
+            + edge("leaf", "_ZN3FooD0Ev") + edge("_ZN3FooD0Ev", "_ZN3FooD2Ev"),
+        }
+        for why, text in cases.items():
+            with self.subTest(why):
+                self.put(os.path.join(self.ci, "x.ci"), CI)
+                self.add_ci(text)
+                self.table["tasks"][0]["bytes"] = 4096
+                rc, out = self.run_gate()
+                self.assertEqual(rc, 1, out)
+                self.assertIn("FAIL frame: project function with no frame data (partial --ci-dir?): Foo::", out)
+                self.assertNotIn("FAIL small", out)    # the chain is within budget; only the frame is unknown
+
+    # --- which functions are this repo's (#457) -----------------------------------------
+    # The ceiling and "no frame data" checks are for src/ and main/. The gate used to take
+    # any "/src/" in a label's path for ours, which also matches IDF's lwip/src.
+
+    def test_idf_component_sources_are_not_project_code(self):
+        self.add_ci(node("lwip_big", "int lwip_big(int)", 2000, LWIP_C)
+                    + bare("lwip_socket", "int lwip_socket(int, int, int)", LWIP_H)
+                    + edge("leaf", "lwip_big") + edge("leaf", "lwip_socket"))
+        self.table["tasks"][0]["bytes"] = 8192
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL frame: library callee with no frame data, no library_defaults match: "
+                      "int lwip_socket", out)
+        self.assertNotIn("project function with no frame data", out)
+        self.assertNotIn("B ceiling", out)           # lwip's 2000 B frame is not ours to cap...
+        self.assertIn("ok   small: 2500 B", out)     # ...but it is in the chain: 200 + 300 + 2000
+        self.table["library_defaults"] = {r"\blwip_socket\(": 400}   # now a default can apply to it
+        self.assertEqual(self.run_gate()[0], 0)
+
+    def test_main_dir_is_project_code(self):
+        # main/esp_main_*.cpp holds the task entry points; its frames are capped like src/'s.
+        self.add_ci(node("big_main", "void big_main()", 1500, "@ROOT@/main/esp_main_eth.cpp:1:1")
+                    + edge("leaf", "big_main"))
+        self.table["tasks"][0]["bytes"] = 8192
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL frame: 1500 B > 1024 B ceiling, no allowlist entry: void big_main()", out)
+
+    def test_a_runtime_hook_labelled_by_its_call_site_takes_a_library_default(self):
+        # GCC labels a callee it never saw defined (an ellipse node) with the location of a
+        # use, so __cxa_guard_acquire reads as ours when the last .ci to mention it is ours.
+        # A library_defaults row has to be able to claim it, or no table edit can clear it.
+        self.add_ci(bare("__cxa_guard_acquire", "int __cxa_guard_acquire(long long int*)",
+                         "@ROOT@/src/SIP/X.cpp:12:3") + edge("leaf", "__cxa_guard_acquire"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("project function with no frame data (partial --ci-dir?): int __cxa_guard_acquire", out)
+        self.table["library_defaults"] = {r"\b__cxa_guard_acquire\(": 64}
+        self.table["tasks"][0]["bytes"] = 4096
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   small: 564 B", out)      # 200 + 300 + 64
+
+    def test_a_graph_compiled_elsewhere_fails_closed_until_given_its_project_root(self):
+        # .ci files built in another checkout: nothing in them is under --src-root. Reading
+        # that as "no project code, so nothing to cap" would pass any frame.
+        self.put(os.path.join(self.ci, "x.ci"), CI.replace("@ROOT@", "/elsewhere/ck"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL project root: no function with frame data is under", out)
+        p = os.path.join(self.tmp.name, "t.json")
+        json.dump(self.table, open(p, "w"))
+        r = subprocess.run([sys.executable, GATE, "--ci-dir", self.ci, "--table", p,
+                            "--src-root", self.tmp.name, "--project-root", "/elsewhere/ck"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ok   big: 1900 B", r.stdout)
 
 
 if __name__ == "__main__":

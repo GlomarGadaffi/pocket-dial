@@ -16,7 +16,8 @@ Fails (exit 1) when, for any task,
   * a reachable function has a dynamic/VLA frame without an allowlist entry, or
   * a reachable project function has no frame data (a partial --ci-dir), or
   * a reachable library callee has no frame data, no library_defaults
-    match and no allowlist entry;
+    match and no allowlist entry, or
+  * no function in the graph is under the project root (fails closed);
 and when the number of task-creation sites (xTaskCreate*, including Static
 and WithCaps, pd::createTaskPreferPsram, std::thread/jthread) in a
 source file differs from the number of table entries for that file (a new
@@ -32,12 +33,29 @@ Determinism: edges are walked in sorted order, and a result computed while a
 cycle was cut is never cached, so PYTHONHASHSEED can't change the report.
 
 Usage:
-  python3 tools/ci/task_stack_gate.py --ci-dir DIR [--table FILE] [--src-root DIR] [--with FEATURE ...]
+  python3 tools/ci/task_stack_gate.py --ci-dir DIR [--table FILE] [--src-root DIR] [--project-root DIR] [--with FEATURE ...]
 
-DIR is walked recursively. Point it at build/esp-idf/main (the project
-component's .ci files), not build/ or build/esp-idf: is_project() keys on
-/src/ in a frame's location, which also matches IDF's lwip/src and
-wpa_supplicant/src, and build/ holds the bootloader's .ci files too.
+DIR is walked recursively. build/esp-idf/main holds the project component's
+.ci files and build/esp-idf every component's (a library callee compiled in
+that build then has its real frame; the prebuilt libc/libgcc ones still have
+none). Not build/: it also holds the bootloader's .ci files, which are not in
+the app image.
+
+Project code is what GCC compiled from <project-root>/src or
+<project-root>/main: it writes the absolute source path into every label.
+Everything else (IDF, the toolchain's libstdc++) is a library callee, so the
+frame ceiling is for ours only. The project root defaults to --src-root; pass
+--project-root when the .ci files came from another checkout. A graph with no
+project function at all fails closed, since "nothing of ours to cap" would pass
+any frame. A callee GCC never saw defined is labelled with the location of one
+of its uses, which may be in a file of ours, so a frameless node's project test
+only picks the message: library_defaults rows apply to it either way.
+
+An alias is not a missing frame: GCC emits one body for the complete- and
+base-object constructor (C1/C2) and destructor (D1/D2) and reports the C1/D1
+name as a node with no frame and an edge to the body. Such a node is a 0 B
+pass-through, but only when it calls a C2/D2 title that has a frame; any other
+frameless node is still unknown, not zero.
 """
 
 import argparse
@@ -49,7 +67,7 @@ import sys
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "tests", "tools"))
-from check_parser_callgraph import load_graph, pretty, is_project  # noqa: E402
+from check_parser_callgraph import load_graph, pretty  # noqa: E402
 
 CREATE_RE = re.compile(r"\b(?:xTaskCreate\w*|pd::createTaskPreferPsram)\s*\("
                        r"|\bstd::j?thread\s*(?:\w+\s*)?[({]")
@@ -69,6 +87,34 @@ def count_sites(src_root):
                 if n:
                     out[os.path.relpath(p, src_root).replace(os.sep, "/")] = n
     return out
+
+
+def project_prefixes(root):
+    """Path prefixes of this repo's own sources: <root>/src/ and <root>/main/."""
+    roots = {os.path.abspath(root), os.path.realpath(root)}
+    return tuple(sorted(r.replace(os.sep, "/").rstrip("/") + "/" + d + "/"
+                        for r in roots for d in ("src", "main")))
+
+
+def is_project(label, prefixes):
+    """True when a node's location line (GCC's absolute source path) is under a
+    project prefix. Edge-only nodes have no location and are never project."""
+    parts = re.split(r"\\+n", label)
+    return len(parts) > 1 and os.path.normpath(parts[1]).replace(os.sep, "/").startswith(prefixes)
+
+
+ALIAS_RE = re.compile(r"([CD])1E")   # Itanium C1/D1 right before the nested name's end
+
+
+def alias_body(title, edges, frames):
+    """The C2/D2 title that this C1/D1 title is an alias of, or None. Only when the
+    alias calls it and it has a frame, so an unknown function never reads as 0 B.
+    D0 (the deleting destructor) is a function of its own and never matches."""
+    for m in ALIAS_RE.finditer(title):
+        body = title[:m.start()] + m.group(1) + "2E" + title[m.end():]
+        if body in frames and body in edges.get(title, ()):
+            return body
+    return None
 
 
 def worst_chain(v, edges, size, memo, path, seen):
@@ -104,13 +150,18 @@ def find_entry(nodes, pattern):
 MAIN_VARIANT_RE = re.compile(r"^main/esp_main[^/]*\.cpp$")
 
 
-def run(ci_dir, table_path, src_root, main_variant, features=()):
+def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=None):
     table = json.load(open(table_path, encoding="utf-8"))
     margin = table["margin_bytes"]
     ceiling = table["frame_ceiling_bytes"]
     allow = table.get("frame_allowlist", {})
     tasks = table["tasks"]
     nodes, edges, frames = load_graph(ci_dir)
+    prefixes = project_prefixes(project_root or src_root)
+
+    def ours(label):
+        return is_project(label, prefixes)
+
     for vs in list(edges.values()):
         for w in vs:
             nodes.setdefault(w, w)   # a callee seen only as an edge target
@@ -126,18 +177,29 @@ def run(ci_dir, table_path, src_root, main_variant, features=()):
             size[v] = frames[v][0]
             if frames[v][1] != "static" and not allowed(v):
                 problem[v] = f"{frames[v][1]} frame, no allowlist entry"
-        elif is_project(nodes[v]):
-            size[v] = 0
-            problem[v] = "project function with no frame data (partial --ci-dir?)"
+        elif alias_body(v, edges, frames):
+            size[v] = 0     # a pass-through: the walk goes on into the body, which has the frame
         else:
+            # A callee GCC never saw defined carries the location of a use, which may be a
+            # file of ours, so a library_defaults row is tried before the project test.
             size[v] = next((b for rx, b in lib if rx.search(label)), None)
             if size[v] is None:
                 size[v] = 0
-                if not allowed(v):
+                if ours(nodes[v]):
+                    problem[v] = "project function with no frame data (partial --ci-dir?)"
+                elif not allowed(v):
                     problem[v] = "library callee with no frame data, no library_defaults match"
     print(f"call graph: {len(nodes)} functions, {len(frames)} frames with stack data; "
           f"margin {margin} B, frame ceiling {ceiling} B")
     rc = 0
+
+    # .ci files compiled in another checkout have none of our paths in them, and
+    # "nothing of ours to cap" would then pass any frame: fail closed.
+    if not any(ours(nodes[x]) for x in frames):
+        rc = 1
+        root = os.path.abspath(project_root or src_root).replace(os.sep, "/")
+        print(f"FAIL project root: no function with frame data is under {root}/src/ or {root}/main/ "
+              f"(--project-root: the checkout the .ci files were compiled from)")
 
     want = collections.Counter(t["file"] for t in tasks)
     have = count_sites(src_root)
@@ -180,7 +242,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=()):
     for x in sorted(frames):
         b = frames[x][0]
         label = pretty(nodes.get(x, x))
-        if b > ceiling and is_project(nodes.get(x, "")) and not allowed(x):
+        if b > ceiling and ours(nodes.get(x, "")) and not allowed(x):
             rc = 1
             print(f"FAIL frame: {b} B > {ceiling} B ceiling, no allowlist entry: {label[:100]}")
     return rc
@@ -191,12 +253,15 @@ def main():
     ap.add_argument("--ci-dir", required=True, help="tree of .ci files from -fcallgraph-info=su, walked recursively (build/esp-idf/main)")
     ap.add_argument("--table", default=os.path.join(REPO, "tools", "ci", "task_stacks.json"))
     ap.add_argument("--src-root", default=REPO, help="tree whose src/ and main/ are scanned for task sites")
+    ap.add_argument("--project-root", default=None,
+                    help="the checkout the .ci files were compiled from: project code is what was "
+                         "compiled from its src/ and main/ (default: --src-root)")
     ap.add_argument("--main", default="main/esp_main_eth.cpp",
                     help="the esp_main variant linked into the image the .ci files came from")
     ap.add_argument("--with", dest="features", action="append", default=[],
                     help="a build feature this image has (heap_trace); repeatable")
     a = ap.parse_args()
-    return run(a.ci_dir, a.table, a.src_root, a.main, tuple(a.features))
+    return run(a.ci_dir, a.table, a.src_root, a.main, tuple(a.features), a.project_root)
 
 
 if __name__ == "__main__":
