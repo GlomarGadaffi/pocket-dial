@@ -90,6 +90,7 @@ namespace
 		{"GET /api/telephony-config",   "GET", "/api/telephony-config", "", true},
 		{"GET /api/e911-config",        "GET", "/api/e911-config", "", true},
 		{"GET /api/sbc-mode",           "GET", "/api/sbc-mode", "", true},
+		{"GET /api/multicast-paging",   "GET", "/api/multicast-paging", "", true},
 		{"GET /api/did-mapping",        "GET", "/api/did-mapping", "", true},
 		{"GET /api/config/export",      "GET", "/api/config/export", "", true},
 		{"GET /api/ap-security",        "GET", "/api/ap-security", "", true},
@@ -112,7 +113,7 @@ namespace
 	// go DOWN: lower it when the printed count drops, remove the route at zero.
 	// The list shrinking to empty is #410 done.
 	const std::map<std::string, long> kAllocCeiling = {
-		{"GET /api/status", 1}, {"GET /api/sbc-mode", 2},
+		{"GET /api/status", 1}, {"GET /api/sbc-mode", 2}, {"GET /api/multicast-paging", 2},
 		{"GET /", 2}, {"GET /index.html", 2}, {"GET /setup/email", 2}, {"GET /setup/trunk", 2},
 		{"GET /api/cdr", 2}, {"GET /api/trace", 2}, {"GET /api/did-mapping", 2},
 		{"GET /api/pcap", 3}, {"GET /api/coredump", 3}, {"GET /api/diagnostics/pcap", 3},

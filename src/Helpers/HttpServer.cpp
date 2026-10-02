@@ -1254,6 +1254,24 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 			sendApiSbcModeSet(clientSock, req.body);
 		}
 	}
+#if POCKETDIAL_MULTICAST_PAGING
+	else if (req.method == "GET" && req.path == "/api/multicast-paging")
+	{
+		// Read gate matches the other config surfaces: nothing here is secret.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiMulticastPagingGet(clientSock);
+		}
+	}
+	else if (req.method == "PUT" && req.path == "/api/multicast-paging")
+	{
+		// Mutating, same gate as /api/sbc-mode (#800).
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiMulticastPagingSet(clientSock, req.body);
+		}
+	}
+#endif
 	else if (req.method == "GET" && req.path == "/api/did-mapping")
 	{
 		// Same read gate as /api/telephony-config above.
@@ -3970,6 +3988,87 @@ void HttpServer::sendApiSbcModeSet(int sock, const std::string& body)
 	// Echo the stored result, mirroring sendApiE911Set's pattern above.
 	sendApiSbcModeGet(sock);
 }
+
+#if POCKETDIAL_MULTICAST_PAGING
+void HttpServer::sendApiMulticastPagingGet(int sock)
+{
+	pbx::MulticastPagingConfig cfg;
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		cfg = handler->getMulticastPaging();
+	}
+	char group[16];
+	pbx::formatIpv4(cfg.group, group);
+
+	// #410: no heap. At most 60 bytes.
+	char buf[96];
+	JsonOut json{buf, sizeof(buf)};
+	json.s("{\"enabled\":").b(cfg.enabled)
+	    .s(",\"group\":\"").s(group).s("\"")
+	    .s(",\"port\":").n(cfg.port)
+	    .s("}");
+	if (json.full)
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"error\":\"multicast-paging response too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, json.len));
+}
+
+void HttpServer::sendApiMulticastPagingSet(int sock, const std::string& body)
+{
+	// Issue #800. Params, each optional (absent keeps the current value):
+	// enabled ("1"/"true"/"on"), group (dotted quad), port (1-65535).
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	pbx::MulticastPagingConfig cfg;
+	if (handler) cfg = handler->getMulticastPaging();
+
+	const std::string enabledParam = getFormParam(body, "enabled");
+	if (!enabledParam.empty())
+	{
+		cfg.enabled = (enabledParam == "1" || enabledParam == "true" || enabledParam == "on");
+	}
+	const std::string groupParam = getFormParam(body, "group");
+	if (!groupParam.empty())
+	{
+		uint32_t net = 0;
+		if (!TrunkResolver::parseDottedQuad(groupParam, net))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"group must be a dotted-quad IPv4 address\"}");
+			return;
+		}
+		cfg.group = ntohl(net);
+	}
+	const std::string portParam = getFormParam(body, "port");
+	if (!portParam.empty())
+	{
+		char* endp = nullptr;
+		const unsigned long port = (portParam[0] >= '0' && portParam[0] <= '9')
+			? std::strtoul(portParam.c_str(), &endp, 10) : 0;
+		if (endp == nullptr || *endp != '\0' || port == 0 || port > 65535)
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"port must be 1-65535\"}");
+			return;
+		}
+		cfg.port = static_cast<uint16_t>(port);
+	}
+
+	if (handler)
+	{
+		const std::string err = handler->setMulticastPaging(cfg);
+		if (!err.empty())
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"" + jsonEscape(err) + "\"}");
+			return;
+		}
+	}
+	sendApiMulticastPagingGet(sock);
+}
+#endif
 
 void HttpServer::sendApiDidMappingList(int sock)
 {
