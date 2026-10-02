@@ -2948,24 +2948,15 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 	ok->setContact(buildContact("440"));
 	ok->clearBody();
+	// The cloned INVITE's Content-Type need not name SDP, or exist (#838, #845).
+	ok->setSdpContentType();
 	// Append our SDP body after the header/body separator. We rebuild the raw string
-	// because clearBody() emptied the body and zeroed length. The cloned INVITE
-	// already carries "Content-Type: application/sdp" (which clearBody() does NOT
-	// strip), so only add the header if it is somehow absent — never duplicate it.
+	// because clearBody() emptied the body and zeroed length.
 	{
 		std::string raw = ok->toString();
 		size_t sep = raw.find("\r\n\r\n");
 		if (sep != std::string::npos)
 		{
-			// #838: the Content-Type line itself. "application/sdp" anywhere in the
-			// header block also matched the Accept line addCapabilityHeaders()
-			// adds, so an INVITE that arrived without one was answered without one.
-			if (!ok->hasSdpContentType())
-			{
-				// No SDP Content-Type yet: splice one in just before the blank line.
-				raw.insert(sep, "\r\nContent-Type: application/sdp");
-				sep = raw.find("\r\n\r\n");   // separator moved by the inserted bytes
-			}
 			raw.erase(sep + 4);          // drop anything stale after the separator
 			raw += sdpBody;              // append our SDP body
 		}
@@ -10403,19 +10394,12 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 			sdpBody.replace(sdpBody.size() - kSendrecv.size(), kSendrecv.size(), mirror);
 	}
 	ok->clearBody();
+	ok->setSdpContentType();   // #838, #845: the re-INVITE's own may not name SDP
 	{
 		std::string raw = ok->toString();
 		size_t sep = raw.find("\r\n\r\n");
 		if (sep != std::string::npos)
 		{
-			// #838: the Content-Type line itself. "application/sdp" anywhere in the
-			// header block also matched the Accept line addCapabilityHeaders()
-			// adds, so an INVITE that arrived without one was answered without one.
-			if (!ok->hasSdpContentType())
-			{
-				raw.insert(sep, "\r\nContent-Type: application/sdp");
-				sep = raw.find("\r\n\r\n");
-			}
 			raw.erase(sep + 4);
 			raw += sdpBody;
 		}
@@ -11191,19 +11175,12 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	// answered 200 by answerAnchorReinvite()).
 	pbx::answerSessionTimer(*ok, *inviteMsg, grantSessionTimer);
 	ok->clearBody();
+	ok->setSdpContentType();   // #838, #845: the INVITE's own may not name SDP
 	{
 		std::string raw = ok->toString();
 		size_t sep = raw.find("\r\n\r\n");
 		if (sep != std::string::npos)
 		{
-			// #838: the Content-Type line itself. "application/sdp" anywhere in the
-			// header block also matched the Accept line addCapabilityHeaders()
-			// adds, so an INVITE that arrived without one was answered without one.
-			if (!ok->hasSdpContentType())
-			{
-				raw.insert(sep, "\r\nContent-Type: application/sdp");
-				sep = raw.find("\r\n\r\n");
-			}
 			raw.erase(sep + 4);
 			raw += sdpBody;
 		}
@@ -12127,6 +12104,7 @@ void RequestsHandler::onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyM
 	resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 	resp->setTo(std::string(invite->getTo()) + ";tag=" + session->getLocalTag());
 	resp->setContact(buildContact(std::string(invite->getToNumber())));
+	resp->setSdpContentType();   // #845: the INVITE's own may not name SDP
 	resp->setBody(buildMediaSdp(_localIp, _handsetRx[slot].localPort(),
 		/*sendrecv=*/true, invite->getTelephoneEventPayloadType()));
 	_outbox.emplace_back(invite->getSource(), std::move(resp));
@@ -12191,6 +12169,7 @@ void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 	resp->setTo(std::string(invite->getTo()) + ";tag=" + session->getLocalTag());
 	resp->setContact(buildContact(std::string(invite->getToNumber())));
 	pbx::answerSessionTimer(*resp, *invite, /*grant=*/false);   // #198: trunk re-INVITE gets 488 (911 leg)
+	resp->setSdpContentType();   // #845: the INVITE's own may not name SDP
 	resp->setBody(sdpBody);   // resyncs Content-Length itself
 	_outbox.emplace_back(invite->getSource(), std::move(resp));
 

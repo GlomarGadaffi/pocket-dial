@@ -86,6 +86,8 @@ add_executable(sip_parser_tests
     PerCallHeap_test.cpp
     # #838: a hostile many-line or long-line datagram must not grow a pool slot.
     HeaderLinePinning_test.cpp
+    # #845: an SDP answer built from a copy of the INVITE has one Content-Type.
+    SingleContentType_test.cpp
     # Issue #101(A)/(E): message-pool backpressure (refuse when spent; no heap
     # fallback since #409) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
