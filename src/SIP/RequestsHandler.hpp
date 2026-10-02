@@ -795,6 +795,14 @@ public:
 		}
 		for (auto& event : localOutbox) _onHandled(event.first, std::move(event.second));
 	}
+	// Test-only (#820): lapse `ext`'s lease but keep the binding in the pool, as
+	// between its expiry and the next sweep; the next handle() does not sweep.
+	void expireLeaseUnsweptForTest(const std::string& ext)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
+		_lastSweep = std::chrono::steady_clock::now();
+	}
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned,
 		bool locked = false)

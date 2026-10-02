@@ -938,6 +938,53 @@ TEST(Registrar, SecuringAnExtensionWithNoSipSecretIs409NotANotFound)
 	AdminAuth::clearCredential();
 }
 
+TEST(Registrar, SecureOrForgetByAnExtensionTwoDevicesHoldIs409AndChangesNothing)
+{
+	// #820 item 3: two rows can hold one extension (the lock holder beside a later
+	// claim that never locked, or a stale row). By extension the route acted on
+	// whichever row the registrar ranked first; it now refuses and asks for the
+	// MAC, which is what the dashboard sends.
+	struct Cleanup
+	{
+		~Cleanup() { SipSecretStore::clearSecret("1002"); AdminAuth::clearCredential(); }
+	} cleanup;   // also on a failed ASSERT
+	AdminAuth::clearCredential();
+	ASSERT_TRUE(SipSecretStore::setSecret("1002", "s3cret-1002"));   // secure is not refused for a missing secret
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.adoptDeviceForTest("0200000000b1", "1002", RequestsHandler::DeviceState::Learned, /*locked=*/true);
+	handler.adoptDeviceForTest("0200000000b2", "1002");
+	HttpServer server("127.0.0.1", 0, nullptr);
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	AdminSession a = loginAndCompleteSetup(port);
+	for (const char* action : {"secure", "forget"})
+	{
+		const std::string r = httpPostRaw(port, "/api/registrar/device",
+			std::string("action=") + action + "&target=1002", "pd_session=" + a.cookie, a.csrf);
+		EXPECT_EQ(statusOf(r), 409) << action << "\n" << r;
+		EXPECT_NE(r.find("send its MAC"), std::string::npos) << r;
+	}
+	auto rows = handler.getAdoptedDevices();
+	ASSERT_EQ(rows.size(), 2u) << "forget by an ambiguous extension removed a row";
+	for (const auto& d : rows)
+		EXPECT_EQ(d.state, RequestsHandler::DeviceState::Learned) << "secure by an ambiguous extension promoted " << d.mac;
+
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/registrar/device", "action=forget&target=0200000000b2",
+		"pd_session=" + a.cookie, a.csrf)), 200) << "by MAC the route acts on that row";
+	rows = handler.getAdoptedDevices();
+	ASSERT_EQ(rows.size(), 1u);
+	EXPECT_EQ(rows[0].mac, "0200000000b1");
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/registrar/device", "action=secure&target=1002",
+		"pd_session=" + a.cookie, a.csrf)), 200) << "one row holds 1002 now, so the extension is enough";
+	rows = handler.getAdoptedDevices();
+	ASSERT_EQ(rows.size(), 1u);
+	EXPECT_EQ(rows[0].state, RequestsHandler::DeviceState::Secured);
+}
+
 namespace
 {
 	std::string indexPage()
