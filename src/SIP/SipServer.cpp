@@ -204,6 +204,7 @@ bool SipServer::openPnpSocket(uint32_t now)
 	if (s < 0)
 	{
 		ESP_LOGW("PnP", "socket() failed (errno %d)", errno);
+		_handler.pnp().setSocketState(false, errno);
 		return false;
 	}
 	int one = 1;
@@ -221,10 +222,12 @@ bool SipServer::openPnpSocket(uint32_t now)
 	{
 		ESP_LOGW("PnP", "cannot join %s:%u (errno %d); retrying in %u s",
 			pnp::kGroup, static_cast<unsigned>(pnp::kPort), errno, static_cast<unsigned>(kPnpRetrySeconds));
+		_handler.pnp().setSocketState(false, errno);
 		close(s);
 		return false;
 	}
 	_pnpSock = s;
+	_handler.pnp().setSocketState(true, 0);
 	ESP_LOGI("PnP", "listening on %s:%u", pnp::kGroup, static_cast<unsigned>(pnp::kPort));
 	return true;
 }
@@ -234,6 +237,7 @@ void SipServer::closePnpSocket()
 	if (_pnpSock < 0) return;
 	close(_pnpSock);   // also leaves the group
 	_pnpSock = -1;
+	_handler.pnp().setSocketState(false, 0);
 	_pnpRetryAt = 0;
 }
 

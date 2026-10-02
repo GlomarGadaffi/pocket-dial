@@ -98,6 +98,24 @@ public:
 	// "off" / "discover" / "provision" -> true + `out`; anything else -> false.
 	static bool parseMode(std::string_view s, Mode& out);
 
+	// Observability for /api/pnp: without these a board that hears nothing
+	// cannot say whether its socket failed, its filter dropped everything, or
+	// nothing arrived. Relaxed atomics: counters, read by the HTTP task.
+	struct Counters
+	{
+		uint32_t datagrams;    // everything the group socket delivered
+		uint32_t offSubnet;    // dropped by the same-subnet rule
+		uint32_t notPnp;       // not a ua-profile SUBSCRIBE (parse refused)
+		uint32_t answered;     // a 200 was produced
+	};
+	Counters counters() const;
+	// SipServer reports the group socket: open or not, and the errno of the
+	// last failed open/join (0 when none).
+	void setSocketState(bool listening, int lastErrno);
+	bool listening() const { return _listening.load(std::memory_order_relaxed); }
+	int socketErrno() const { return _sockErrno.load(std::memory_order_relaxed); }
+	uint32_t netmask() const { return _mask; }
+
 private:
 	bool sameSubnet(uint32_t ip) const;
 	bool takeToken(uint32_t now);
@@ -117,6 +135,13 @@ private:
 	uint32_t _refillAt = 0;
 
 	std::array<char, kTxCap> _tx{};   // the 200, then the NOTIFY behind it
+
+	std::atomic<uint32_t> _datagrams{0};
+	std::atomic<uint32_t> _offSubnet{0};
+	std::atomic<uint32_t> _notPnp{0};
+	std::atomic<uint32_t> _answered{0};
+	std::atomic<bool> _listening{false};
+	std::atomic<int> _sockErrno{0};
 };
 
 #endif

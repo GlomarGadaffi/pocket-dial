@@ -365,6 +365,23 @@ TEST(PnpResponder, TableIsBoundedAndForgetsTheLeastRecentlySeen)
 	EXPECT_FALSE(oldestKept);
 }
 
+TEST(PnpResponder, CountersSayWhyNothingWasHeard)
+{
+	Bench b(PnpResponder::Mode::Provision);
+	b.feed(kSnomSubscribe, "10.9.9.9", 100);                       // off subnet
+	b.feed("OPTIONS sip:x SIP/2.0\r\n\r\n", "192.168.12.155", 100);  // not PnP
+	b.feed(kSnomSubscribe, "192.168.12.155", 100);                 // answered
+	const PnpResponder::Counters c = b.r.counters();
+	EXPECT_EQ(c.datagrams, 3u);
+	EXPECT_EQ(c.offSubnet, 1u);
+	EXPECT_EQ(c.notPnp, 1u);
+	EXPECT_EQ(c.answered, 1u);
+	EXPECT_FALSE(b.r.listening());
+	b.r.setSocketState(false, 98);
+	EXPECT_EQ(b.r.socketErrno(), 98);
+	EXPECT_EQ(b.r.netmask(), ipOf("255.255.255.0"));
+}
+
 TEST(PnpResponder, ModeNamesRoundTripAndStoredBytesDecodeSafely)
 {
 	for (auto m : {PnpResponder::Mode::Off, PnpResponder::Mode::Discover, PnpResponder::Mode::Provision})
