@@ -4814,7 +4814,7 @@ void HttpServer::sendApiPnp(int sock)
 		std::array<char, 16> mask{};
 		in_addr m{};
 		m.s_addr = pnp.netmask();
-		if (inet_ntop(AF_INET, &m, mask.data(), mask.size()) == nullptr) mask[0] = ' ';
+		if (inet_ntop(AF_INET, &m, mask.data(), mask.size()) == nullptr) mask[0] = '\0';
 		out.s(",\"listening\":").b(pnp.listening()).s(",\"socketErrno\":").n(pnp.socketErrno());
 		out.s(",\"netmask\":\"").s(mask.data()).s("\",\"rx\":{\"datagrams\":").n(c.datagrams);
 		out.s(",\"offSubnet\":").n(c.offSubnet).s(",\"notPnp\":").n(c.notPnp);
