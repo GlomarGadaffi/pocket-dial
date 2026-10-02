@@ -264,6 +264,7 @@ TEST(RegisteredContact, AQuotedDisplayNameDoesNotHideTheRegisteredContactUri)
 	// was the display name's text, or nothing, and the ping lost its ;line=.
 	for (const char* name : {"\"Lobby <1>\" ", "\"Desk <sip:100@192.168.31.10:1037>\" ",
 	                         "\"Desk \\\" <x>\" ",   // an escaped quote keeps the name open
+	                         "\"Lobby 55\" TV\" ",   // #832 review: a quote left open, last <...> wins
 	                         "\"Snom 370\" "})        // control: no '<' in the name
 	{
 		SCOPED_TRACE(name);

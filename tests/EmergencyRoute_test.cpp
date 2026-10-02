@@ -1502,9 +1502,8 @@ TEST(EmergencyRoute, ASipUriInADisplayNameOrAParameterIsNotAnEmergency)
 			"\"sip:933@lobby\" <tel:+15551230100>",
 			"<tel:+15551230100>;x=sip:911@h",
 			"<tel:+15551230100;x=sip:911@h>",
-			// A display name whose quote never closes has no URI to read (RFC
-			// 3261 s25.1). It is a 400, not a guess at what was meant.
-			"\"Lobby <sip:911@x>"})
+			// A quote left open falls back to the last <...>: still this call.
+			"\"sip:911@lobby <tel:+15551230100>"})
 	{
 		SCOPED_TRACE(to);
 		Bench b;
@@ -1644,4 +1643,112 @@ TEST(EmergencyRoute, A911RequestUriOverAnExtensionToGetsNoEmergencyYield)
 	b.handler->handle(invite);
 	EXPECT_EQ(b.count("SIP/2.0 420"), 0u) << b.dump();
 	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+}
+
+TEST(EmergencyRoute, AnUnbalancedQuoteInTheCallersDisplayNameStillIdentifiesTheCaller)
+{
+	// #832 review: extractNumber() reads From too. An unescaped inch mark in a
+	// display name ("Lobby 55" TV") leaves a quote open. Reading that From as no
+	// user made REGISTER and every INVITE a 400, ahead of the 911 branch: a
+	// phone that could reach 911 before could not after. A quote left open
+	// falls back to the last <...> on the line.
+	const std::string ip105 = "192.168.79.15";
+	const std::string from = "From: \"Lobby 55\" TV\" <sip:105@server>;tag=odd105\r\n";
+	auto oddInvite = [&](const std::string& dialed, const std::string& callId) {
+		const std::string raw =
+			"INVITE sip:" + dialed + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip105 + ":5060;branch=z9hG4bKodd" + callId + "\r\n" +
+			from +
+			"To: <sip:" + dialed + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:105@" + ip105 + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(kSdpOffer.size()) + "\r\n\r\n" + kSdpOffer;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip105));
+	};
+
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->handle(makeRegister("200", "192.168.79.20"));   // front desk
+	b.handler->setE911Config("200", "", "");
+	b.sent.clear();
+
+	auto reg = RequestsHandler::getMessageFromPool(
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + ip105 + ":5060;branch=z9hG4bKoddreg\r\n" +
+		from +
+		"To: \"Lobby 55\" TV\" <sip:105@server>\r\n"
+		"Call-ID: er-odd-reg\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"Contact: <sip:105@" + ip105 + ":5060>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n", addrFor(ip105));
+	EXPECT_EQ(reg->getFromNumber(), "105");
+	b.handler->handle(reg);
+	EXPECT_EQ(b.count("SIP/2.0 200", ip105.c_str()), 1u) << "the REGISTER is accepted:\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	b.sent.clear();
+
+	b.handler->handle(oddInvite("101", "er-odd-101"));
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:101@", kHandsetIp), 1u) << "101 is rung:\n" << b.dump();
+	b.sent.clear();
+
+	b.handler->handle(oddInvite("911", "er-odd-911"));
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+		<< "the 911 reaches the carrier:\n" << b.dump();
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 1u) << "Kari's Law: the front desk is told:\n" << b.dump();
+}
+
+TEST(EmergencyRoute, AnUnbalancedQuoteInTheToDisplayNameFallsBackToTheLastUri)
+{
+	// The same open quote in To: the last <...> is the URI. Both of these are
+	// a 911. The second is harmless as a 911: its sender could have written
+	// <sip:911@x> outright, and the caller checks run first either way.
+	for (const char* to : {"\"x\" y\" <sip:911@x>", "\"Lobby <sip:911@x>"})
+	{
+		SCOPED_TRACE(to);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		auto invite = makeInviteWithToValue("sip:911@x", to, "application/sdp", "", kSdpOffer, "er-odd-to");
+		EXPECT_EQ(invite->getToNumber(), "911");
+		b.handler->handle(invite);
+
+		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+	}
+}
+
+TEST(EmergencyRoute, AnUppercaseOrSipsSchemeIsReadAsSip)
+{
+	// RFC 3261 s19.1.4: a URI scheme is case-insensitive, and a sips: URI
+	// (s19.1) names its user the same way. Read as no user, a 911 so written
+	// drew a 400.
+	struct Shape { const char* uri; const char* user; };
+	for (const Shape s : {Shape{"SIP:911@server", "911"}, Shape{"Sip:933@server", "933"},
+	                      Shape{"sips:911@server", "911"}, Shape{"SIPS:911@server", "911"}})
+	{
+		SCOPED_TRACE(s.uri);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		auto invite = makeShapedInvite(s.uri, s.uri, "application/sdp", "", kSdpOffer, "er-scheme");
+		EXPECT_EQ(invite->getToNumber(), s.user);
+		EXPECT_EQ(invite->getRequestUriUser(), s.user);
+		b.handler->handle(invite);
+
+		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:" + std::string(s.user) + "@" + kSbcIp, kSbcIp), 1u) << b.dump();
+	}
+
+	// Control: an extension so written is still that extension.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->handle(makeRegister("102", "192.168.79.12"));
+	b.sent.clear();
+	b.handler->handle(makeShapedInvite("SIP:102@server", "SIP:102@server", "application/sdp", "", kSdpOffer,
+		"er-scheme-102"));
+	EXPECT_EQ(b.count("INVITE sip:102@", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
 }

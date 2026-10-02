@@ -1,2 +1,2 @@
-# EmergencyRoute_test.cpp: 4 + RegisteredContact_test.cpp: 1 (#824: a sip:, tel: or urn:service:sos in a display name or parameter is not an emergency, and one in a real emergency call's display name no longer hides its URI; a 911 Request-URI over a To of 102 gets no header/SDP-gate yield; a '<' in a quoted Contact display name keeps the registered Contact)
-5
+# EmergencyRoute_test.cpp: 7 + RegisteredContact_test.cpp: 1 (#824: a sip:, tel: or urn:service:sos in a display name or parameter is not an emergency, and one in a real emergency call's display name no longer hides its URI; a 911 Request-URI over a To of 102 gets no header/SDP-gate yield; a '<' in a quoted Contact display name keeps the registered Contact. #832 review: an unbalanced quote in From or To falls back to the last <...>, so REGISTER, INVITE and 911 still work; SIP: and sips: are read as sip:)
+8
