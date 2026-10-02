@@ -180,6 +180,7 @@ bench-verified here.
 - Anchor restart, rewarm and reconcile run on one persistent `tel_maint` task (#688; #658).
 - `GET /api/sbc-mode` writes into a fixed buffer, no heap (#786; part of #410).
 - `conf_mix_tick` runs on a boot-allocated static stack, created once and parked (#790; #479).
+- A pooled message reuses a parked header-line buffer when it gains a header, instead of growing one string per inserted header on every reuse: free internal heap no longer drains per call (about 390 B per call, driven by REGISTER 200s and the 888 conference answer; present since #462 and in b84d9cf) (#837).
 
 ### Dashboard
 
@@ -316,7 +317,6 @@ bench-verified here.
 
 Open at this cut. None of the changes above is claimed bench-verified.
 
-- Internal-heap loss per call under conference (888) load, about 390 B per call: pre-existing (present in b84d9cf, before this cycle), idle is flat and the 777 echo path is clean; fix in progress.
 - Emergency routing: the #759 header gate misses trunk-dialog Call-IDs and PSAP callbacks (#818); `ROUTED` is reported before a later `makeCall` failure, and a 911 slot-wait timeout is not refused (#821); a 911 produced by a dial-plan rule never gets the header-gate yield (#834); more URI-parsing follow-ups from the #832 review (#835).
 - Learn lock follow-ups: an unlocked row can be rewritten by a forged REGISTER, plus an ambiguity guard and test gaps (#820).
 - SIP trunk is experimental: after a good digest REGISTER some carriers never answer the INVITE (#618), and inbound carrier calls are not built (#398).
