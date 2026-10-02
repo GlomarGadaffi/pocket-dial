@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.5.0 — 2026-10-02
+
+The same commit as `v1.5.0-rc.1` (`b8b4f0b`): no code changed between the release
+candidate and this release (release path A, #401). Its changes and known gaps are
+the v1.5.0-rc.1 section below.
+
+### Release soak
+
+- 4.6 h on the test rig running `b8b4f0b`, load from `sip_stress.py --profile rc1 --duration 16200`, judged by `soak_verdict.py --min-hours 4 --expect-registrations 7`: SOAK VERDICT PASS, LOAD VERDICT PASS.
+- Load: 167 echo calls to 777, 54 extension-to-extension calls, 18 conferences on 888, 14 park/MoH retrievals and 1096 REGISTERs; none failed.
+- Idle internal heap: -292 B/h (floor -1024 B/h). It took a one-time step of about 1 KB in the first two hours and stayed flat afterwards. Lowest free internal heap 110 KB; smallest idle largest free block 53 KB.
+- 0 reboots, no coredump, 0 receive errors, 0 HTTP 503s, 0 pool refusals. 219 s after the last call the rig was back to 0 calls, 0 parks and exactly the 7 expected registrations (3 real phones plus the 4 test extensions).
+
 ## v1.5.0-rc.1 — 2026-10-02
 
 One line per change merged to `main` after beta.2, taken from its squash title.
