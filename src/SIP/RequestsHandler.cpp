@@ -2172,9 +2172,13 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// below and #497 would refuse every one. Recognised by source address alone
 	// (#356), never by From. Not caught, so on exactly the path they had: a phone
 	// registered from that same address (an FXS port on the carrier's gateway),
-	// and a 911/933 To. Everything caught here was refused before #398.
+	// a 911/933 To, and any tagged INVITE -- the 481 check above lets the
+	// carrier's session refresh on a live trunk call through, and a 404 to it
+	// would end that call (RFC 5057 §5.1). Everything caught here was refused
+	// before #398.
 	if (!(caller.has_value() &&
 	      caller.value()->getAddress().sin_addr.s_addr == data->getSource().sin_addr.s_addr) &&
+		std::string_view(data->getTo()).find("tag=") == std::string_view::npos &&
 		isTrunkSbcSource(data->getSource()) &&
 		!pbx::classifyEmergencyDial(data->getToNumber()).isEmergency)
 	{
@@ -11917,9 +11921,11 @@ bool RequestsHandler::isTrunkSbcSource(const sockaddr_in& src)
 {
 	if (!_sipTrunk.config().valid()) return false;
 	sockaddr_in sbc{};
+	// A host of "0.0.0.0" resolves as a literal; it names no carrier, and would
+	// match a datagram forged from 0.0.0.0.
 	return _trunkResolver.lookup(_sipTrunk.config().transportHost(), _sipTrunk.config().transportPort(),
 			sbc, std::chrono::steady_clock::now()) == TrunkResolver::Status::Hit &&
-		sbc.sin_addr.s_addr == src.sin_addr.s_addr;
+		sbc.sin_addr.s_addr != 0 && sbc.sin_addr.s_addr == src.sin_addr.s_addr;
 }
 
 void RequestsHandler::routeInboundTrunkCall(const std::shared_ptr<SipMessage>& data)

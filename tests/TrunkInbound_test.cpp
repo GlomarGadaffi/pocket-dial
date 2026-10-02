@@ -49,10 +49,10 @@ namespace
 		return s;
 	}
 
-	SipTrunk::Config trunkConfig(bool enabled = true)
+	SipTrunk::Config trunkConfig(bool enabled = true, const char* host = kSbcIp)
 	{
 		SipTrunk::Config c;
-		std::snprintf(c.host, sizeof(c.host), "%s", kSbcIp);
+		std::snprintf(c.host, sizeof(c.host), "%s", host);
 		c.port = 5060;
 		std::snprintf(c.fromUser, sizeof(c.fromUser), "%s", kTrunkUser);
 		c.enabled = enabled;
@@ -134,6 +134,63 @@ namespace
 		return m.substr(s, m.find("\r\n", s) - s);
 	}
 
+	std::string between(const std::string& m, const std::string& a, const std::string& b)
+	{
+		const size_t p = m.find(a);
+		if (p == std::string::npos) return {};
+		const size_t s = p + a.size();
+		return m.substr(s, m.find(b, s) - s);
+	}
+
+	// An outbound trunk dialog as the carrier sees it, read off the INVITE the
+	// PBX sent, so the carrier's messages below match it for real.
+	struct CarrierLeg
+	{
+		std::string callID, branch, fromTag;
+
+		static CarrierLeg from(const std::string& invite)
+		{
+			CarrierLeg c;
+			c.callID  = field(invite, "Call-ID: ");
+			c.branch  = between(invite, ";branch=", "\r\n");
+			c.fromTag = between(invite, ";tag=", "\r\n");
+			return c;
+		}
+
+		std::string ok() const
+		{
+			const std::string sdp =
+				"v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\n"
+				"t=0 0\r\nm=audio 41000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n"
+				"a=rtpmap:101 telephone-event/8000\r\n";
+			return
+				"SIP/2.0 200 OK\r\n"
+				"Via: SIP/2.0/UDP " + std::string(kServerIp) + ":5060;branch=" + branch + "\r\n"
+				"From: <sip:" + kTrunkUser + "@" + kSbcIp + ":5060>;tag=" + fromTag + "\r\n"
+				"To: <sip:+12025550123@" + kSbcIp + ":5060>;tag=carrier-tag\r\n"
+				"Call-ID: " + callID + "\r\n"
+				"CSeq: 1 INVITE\r\n"
+				"Contact: <sip:+12025550123@203.0.113.9:5060>\r\n"
+				"Content-Type: application/sdp\r\n"
+				"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+		}
+
+		// The carrier's RFC 4028 session refresh: in-dialog, so To carries our
+		// tag, and its To user is the trunk's own identity.
+		std::string refresh() const
+		{
+			return
+				"INVITE sip:" + std::string(kTrunkUser) + "@" + kServerIp + ":5060 SIP/2.0\r\n"
+				"Via: SIP/2.0/UDP " + std::string(kSbcIp) + ":5060;branch=z9hG4bKrefresh\r\n"
+				"From: <sip:+12025550123@" + kSbcIp + ":5060>;tag=carrier-tag\r\n"
+				"To: <sip:" + kTrunkUser + "@" + kSbcIp + ":5060>;tag=" + fromTag + "\r\n"
+				"Call-ID: " + callID + "\r\n"
+				"CSeq: 2 INVITE\r\n"
+				"Contact: <sip:+12025550123@203.0.113.9:5060>\r\n"
+				"Content-Length: 0\r\n\r\n";
+		}
+	};
+
 	// A trunk pointed at kSbcIp, an isolated DID table, and kExt registered.
 	struct Bench
 	{
@@ -141,7 +198,7 @@ namespace
 		RequestsHandler handler;
 		std::string tapiPath, didPath;
 
-		explicit Bench(bool trunkEnabled = true) : handler(kServerIp, 5060,
+		explicit Bench(bool trunkEnabled = true, const char* sbcHost = kSbcIp) : handler(kServerIp, 5060,
 			[this](const sockaddr_in& a, std::shared_ptr<SipMessage> m) {
 				sent.emplace_back(a, std::move(m));
 			})
@@ -152,7 +209,7 @@ namespace
 			std::remove(tapiPath.c_str());
 			std::remove(didPath.c_str());
 			handler.setTelephonyStorePathsForTest(tapiPath, didPath);
-			handler.setTrunkConfig(trunkConfig(trunkEnabled));
+			handler.setTrunkConfig(trunkConfig(trunkEnabled, sbcHost));
 			handler.handle(makeRegister(kExt, kPhoneIp));
 			sent.clear();
 		}
@@ -242,6 +299,43 @@ TEST(TrunkInbound, WithTheTrunkDisabledTheSbcAddressIsRefusedAsBefore)
 	b.handler.handle(makeInvite(kDid, kDid, "in-off"));
 
 	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 403 Forbidden");
+}
+
+TEST(TrunkInbound, ACarrierRefreshOnALiveOutboundTrunkCallIsNotCaught)
+{
+	// Review of #847: the 481 check lets a tagged INVITE on a trunk-owned Call-ID
+	// through (#611), so the catch must take only a dialog-initial INVITE. A 404
+	// to this refresh would end the call (RFC 5057 s5.1); main answers it 403,
+	// which ends only the transaction.
+	Bench b;
+	b.handler.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
+	b.handler.handle(makeInvite("92025550123", "92025550123", "out-refresh", kPhoneIp, true, kExt));
+	const CarrierLeg leg = CarrierLeg::from(b.firstTo("INVITE sip:+1", kSbcIp));
+	ASSERT_FALSE(leg.callID.empty()) << "precondition: the call went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(leg.ok(), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(leg.refresh(), addrFor(kSbcIp)));
+
+	for (const char* code : {"404", "480", "486", "488", "481"})
+	{
+		EXPECT_TRUE(b.firstTo(code, kSbcIp).empty()) << "the carrier's refresh was answered " << code;
+	}
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "the call stays up";
+}
+
+TEST(TrunkInbound, ATrunkHostOfTheAnyAddressMatchesNoSource)
+{
+	// Review of #847: "0.0.0.0" resolves as a literal, and must not make a
+	// datagram forged from 0.0.0.0 the carrier.
+	Bench b(/*trunkEnabled=*/true, "0.0.0.0");
+	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+
+	b.handler.handle(makeInvite(kDid, kDid, "in-any", "0.0.0.0"));
+
+	EXPECT_FALSE(b.firstTo("403", "0.0.0.0").empty()) << "refused as any unregistered caller, as before #398";
+	EXPECT_TRUE(b.firstTo("480", "0.0.0.0").empty());
 }
 
 TEST(TrunkInbound, APhoneRegisteredFromTheSbcAddressStillCallsAsAPhone)
