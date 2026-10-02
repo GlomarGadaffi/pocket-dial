@@ -1,0 +1,2 @@
+# SipTrunkInbound_test.cpp: 17 (#398 part A: outbound INVITE/ACK x2/BYE/CANCEL pinned byte for byte; the UAS dialog from a carrier INVITE, the 100/180/200 builders echoing every Via and Record-Route, the UAS-form BYE on our own CSeq and its challenged retry; accept, respond, refusal, hangup before and after answer, the reversed BYE tag rule, a BYE before answer (487), a stray response, and the sweep's 480)
+17

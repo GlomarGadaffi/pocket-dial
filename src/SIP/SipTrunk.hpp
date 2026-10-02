@@ -178,6 +178,12 @@ public:
 	// Cancelling  : CANCEL sent for a ringing INVITE (#747), waiting for the
 	//               INVITE's own final response (487, or a 2xx that crossed it).
 	enum class State : uint8_t { Free, Trying, Proceeding, Confirmed, Terminating, Cancelling };
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: Outbound is a call we placed (UAC); Inbound one the carrier placed
+	// to us (UAS). For Inbound, Trying means its INVITE is not yet answered,
+	// Proceeding that we sent a 18x, Confirmed that we sent the 2xx.
+	enum class Role : uint8_t { Outbound, Inbound };
+#endif
 
 	struct Dialog
 	{
@@ -273,6 +279,17 @@ public:
 
 		sockaddr_in peer{};
 		std::chrono::steady_clock::time_point deadline{};
+#if POCKETDIAL_TRUNK_INBOUND
+		// #398: fromTag and toTag keep their meaning in the INVITE that made the
+		// dialog, so for Inbound the carrier's tag is fromTag and ours is toTag.
+		// `cseq` is always OUR sequence number: 0 for Inbound (RFC 3261 s12.1.1:
+		// empty) until our first request. The carrier's INVITE's is remoteCseq.
+		Role        role = Role::Outbound;
+		uint32_t    remoteCseq = 0;
+		std::string inviteFrom, inviteTo;   // the INVITE's From and To lines, verbatim
+		std::string inviteVias;             // its Via lines, in order, each ending CRLF
+		std::string inviteRecordRoute;      // its Record-Route lines, likewise
+#endif
 	};
 
 	// ── Pure builders ────────────────────────────────────────────────────────
@@ -325,6 +342,19 @@ public:
 	// Call-ID and CSeq number, method CANCEL. Not a new transaction, so no fresh
 	// branch -- the carrier matches it to the INVITE on the branch.
 	static std::string buildCancel(const Dialog& d);
+
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: the dialog a carrier's INVITE makes with us as UAS (RFC 3261
+	// s12.1.1): its bare Call-ID, its From tag as the remote tag, `localTag` as
+	// ours, its Contact as the remote target, its CSeq as remoteCseq.
+	static Dialog dialogFromInvite(const SipMessage& invite, std::string_view localTag,
+		std::string_view localIpPort, std::string_view localUser);
+
+	// A response to that INVITE: every Via, From, Call-ID and CSeq echoed, To
+	// with our tag (s8.2.6.2). A 18x or 2xx also echoes Record-Route and carries
+	// our Contact (s12.1.1); `sdp`, when given, is the body.
+	static std::string buildResponse(const Dialog& d, int status, std::string_view sdp = {});
+#endif
 
 	// ── Listener: how the engine learns a trunk dialog moved ─────────────────
 	//
@@ -431,8 +461,22 @@ public:
 	// ringing (Proceeding, #747) and holds the slot for the INVITE's own final
 	// response; frees it outright only if it never drew a provisional (Trying).
 	// A second call on a Cancelling dialog changes nothing. Returns true if a
-	// dialog was found.
+	// dialog was found. An inbound dialog not yet answered gets a 480 instead
+	// (#398): a UAS never CANCELs.
 	bool hangup(std::string_view callID);
+
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: take a carrier's INVITE into a free slot (Trying); `handsetCallID`
+	// is the fork's own Call-ID. Sends nothing. False when the trunk is not
+	// configured, no slot is free, the Call-ID is already a trunk dialog's, or
+	// the INVITE is in-dialog (To tag) or has no Contact to send a BYE to.
+	bool acceptCall(const SipMessage& invite, std::string_view handsetCallID, uint16_t localRtpPort);
+
+	// Answer that INVITE: a 1xx (a 18x makes it Proceeding), a 2xx with `sdp`
+	// (Confirmed), or a failure, which releases the slot. False when `callID`
+	// names no unanswered inbound dialog or the message pool is exhausted.
+	bool respond(std::string_view callID, int status, std::string_view sdp = {});
+#endif
 
 	// RFC 3261 §17.1.1.2 Timer B on our INVITE (#726): 64*T1 with no response
 	// at all. Ends a Trying dialog exactly as sweep()'s deadline would (408 to
@@ -508,6 +552,10 @@ private:
 	// carrier (#386).
 	Dialog* findMutableByTrunkCallID(std::string_view callID);
 	Dialog* allocDialog();
+#if POCKETDIAL_TRUNK_INBOUND
+	// Send buildResponse() to the carrier and move the state; never releases.
+	bool respondTo(Dialog& d, int status, std::string_view sdp = {});
+#endif
 
 	// Release `d` as a timeout and tell the listener (408), unless the dialog
 	// was already ending on our own BYE/CANCEL. The one copy of the
