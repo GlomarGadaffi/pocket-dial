@@ -4808,7 +4808,19 @@ void HttpServer::sendApiPnp(int sock)
 	} release{busy};
 	JsonOut out{buf, (std::min)(_statusCap, kStatusBufBytes)};
 	PnpResponder& pnp = handler->pnp();
-	out.s("{\"attached\":true,\"mode\":\"").s(PnpResponder::modeName(pnp.mode())).s("\",\"devices\":[");
+	out.s("{\"attached\":true,\"mode\":\"").s(PnpResponder::modeName(pnp.mode())).s("\"");
+	{
+		const PnpResponder::Counters c = pnp.counters();
+		std::array<char, 16> mask{};
+		in_addr m{};
+		m.s_addr = pnp.netmask();
+		if (inet_ntop(AF_INET, &m, mask.data(), mask.size()) == nullptr) mask[0] = ' ';
+		out.s(",\"listening\":").b(pnp.listening()).s(",\"socketErrno\":").n(pnp.socketErrno());
+		out.s(",\"netmask\":\"").s(mask.data()).s("\",\"rx\":{\"datagrams\":").n(c.datagrams);
+		out.s(",\"offSubnet\":").n(c.offSubnet).s(",\"notPnp\":").n(c.notPnp);
+		out.s(",\"answered\":").n(c.answered).s("}");
+	}
+	out.s(",\"devices\":[");
 	bool first = true;
 	auto field = [](const std::array<char, pnp::kFieldCap>& a) {
 		return std::string_view(a.data(), ::strnlen(a.data(), a.size()));

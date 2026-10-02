@@ -205,9 +205,18 @@ PnpResponder::Reply PnpResponder::onDatagram(std::string_view raw, const sockadd
 {
 	const Mode m = mode();
 	if (m == Mode::Off || src.sin_family != AF_INET) return {};
-	if (!sameSubnet(src.sin_addr.s_addr)) return {};
+	_datagrams.fetch_add(1, std::memory_order_relaxed);
+	if (!sameSubnet(src.sin_addr.s_addr))
+	{
+		_offSubnet.fetch_add(1, std::memory_order_relaxed);
+		return {};
+	}
 	pnp::Subscribe sub;
-	if (!pnp::parseSubscribe(raw, sub)) return {};
+	if (!pnp::parseSubscribe(raw, sub))
+	{
+		_notPnp.fetch_add(1, std::memory_order_relaxed);
+		return {};
+	}
 	Device& dev = record(sub.id, src.sin_addr.s_addr, nowSeconds);
 	if (m != Mode::Provision) return {};
 	// A vendor this board has no PnP URL shape for gets silence, not a URL
@@ -215,7 +224,21 @@ PnpResponder::Reply PnpResponder::onDatagram(std::string_view raw, const sockadd
 	if (pnp::vendorOf(sub.id) == pnp::Vendor::Generic) return {};
 	if (!canServe(macView(sub.id))) return {};
 	if (!takeToken(nowSeconds)) return {};
-	return answer(sub, src, dev, nowSeconds);
+	const Reply r = answer(sub, src, dev, nowSeconds);
+	if (!r.ok.empty()) _answered.fetch_add(1, std::memory_order_relaxed);
+	return r;
+}
+
+PnpResponder::Counters PnpResponder::counters() const
+{
+	return Counters{_datagrams.load(std::memory_order_relaxed), _offSubnet.load(std::memory_order_relaxed),
+		_notPnp.load(std::memory_order_relaxed), _answered.load(std::memory_order_relaxed)};
+}
+
+void PnpResponder::setSocketState(bool listening, int lastErrno)
+{
+	_listening.store(listening, std::memory_order_relaxed);
+	_sockErrno.store(lastErrno, std::memory_order_relaxed);
 }
 
 std::size_t PnpResponder::forEachDevice(FunctionRef<void(const Device&)> visit) const
