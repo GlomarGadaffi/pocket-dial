@@ -444,7 +444,8 @@ Not nothing. A successful fetch tells the requester:
 
 * that this MAC is an adopted device on this board,
 * which extension it is: useful for targeting an INVITE, or for registering as that extension yourself: under
-  Learn an extension is locked only from its phone's second registration (#440), and the
+  Learn an extension is locked only from its phone's next registration at least 30 s after
+  its first (#440, #515), and the
   lock is checked against the ARP entry for the REGISTER's source address, so spoofing the
   phone's MAC or its source IP on the same LAN passes it; a Secured one also needs its SIP
   password,

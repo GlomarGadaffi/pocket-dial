@@ -350,9 +350,12 @@ Registrar::AuthDecision Registrar::admitLearn(
 	//                            the owner from an impostor yet).
 	//   ARP miss otherwise     -> accept + defer, as before (never brick the first
 	//                            registration).
-	//   UNKNOWN mac            -> accept, record {mac, ext, Learned}, unlocked.
-	//   KNOWN mac, same ext    -> the second sighting: LOCK ext to this mac, unless
-	//                            an earlier-adopted row holds ext (first claim wins).
+	//   UNKNOWN mac            -> accept, record {mac, ext, Learned}, unlocked,
+	//                            first seen now.
+	//   KNOWN mac, same ext    -> a sighting kLockMinAge or more after the first
+	//                            (#515): LOCK ext to this mac, unless an
+	//                            earlier-adopted row holds ext (first claim wins).
+	//                            A younger one is accepted, unlocked.
 	//   KNOWN mac, other ext   -> mark shared (phones behind one NAT router all
 	//                            resolve to the router's MAC); a shared MAC never
 	//                            locks. A re-provisioned phone looks the same and
@@ -478,6 +481,8 @@ Registrar::AuthDecision Registrar::admitLearn(
 		rec.extension = ext;
 		rec.state = DeviceState::Learned;
 		rec.seq = _nextSeq++;
+		rec.firstSeen = now;
+		rec.firstSeenKnown = true;
 		_devices.emplace(mac, std::move(rec));
 		persistDevices();
 		noteChange(Change::Structural);
@@ -527,6 +532,8 @@ Registrar::AuthDecision Registrar::admitLearn(
 		}
 		rec.locked = false;
 		rec.extension = ext;
+		rec.firstSeen = now;
+		rec.firstSeenKnown = true;
 		persistDevices();
 		noteChange(Change::Structural);
 	}
@@ -543,7 +550,9 @@ Registrar::AuthDecision Registrar::admitLearn(
 		{
 			if (m != mac && other.extension == ext && other.seq < rec.seq) return AuthDecision::Accept;
 		}
-		// Second sighting of this MAC for this extension: bind it.
+		// #515: two REGISTERs in a burst must not lock, so a younger sighting stays TOFU.
+		if (rec.firstSeenKnown && now - rec.firstSeen < _lockMinAge) return AuthDecision::Accept;
+		// A later sighting of this MAC for this extension, old enough: bind it.
 		rec.locked = true;
 		persistDevices();
 		noteChange(Change::Structural);

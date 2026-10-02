@@ -1294,7 +1294,8 @@ curl -s "http://$DEV/api/registrar" -b "pd_session=$SESSION"
 
 * `learn`: trust-on-first-use, and the default. An unknown MAC registering an extension
   is adopted unverified, while already-secured devices stay digest-enforced and
-  MAC-locked. Since #440 the phone's second registration from the same MAC also locks
+  MAC-locked. Since #440 the phone's next registration from the same MAC, at least 30 s
+  after its first (#515), also locks
   its extension to that MAC (another MAC gets `403`); until then, and for a phone on
   another subnet or sharing a NAT router's MAC, any device that asks can claim it. Adopt
   phones on a trusted/WPA2 link.
