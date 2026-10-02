@@ -1,9 +1,11 @@
 // DashboardLearnText_test.cpp -- #643 (dashboard review #9), updated for #440.
 // The Learn-mode hint once said Learn locks an extension to the first phone, so
 // nobody else can take it over. Since #440 Registrar::admitLearn locks an adopted
-// extension to its MAC on that MAC's second REGISTER, but never for a phone it
-// cannot resolve (another subnet) or a MAC that registered two extensions (phones
-// behind one NAT router). The page's JS is not host-executable; this pins the text.
+// extension to its MAC on a later REGISTER from that MAC (at least 30 s after its
+// first, #515), only if it was the extension's first claim (#487 review), never for
+// a phone it cannot resolve (another subnet) or a MAC that registered two
+// extensions (phones behind one NAT router). The page's JS is not
+// host-executable; this pins the text.
 
 #include <gtest/gtest.h>
 
@@ -26,4 +28,7 @@ TEST(DashboardLearnText, LearnHintSaysTheLockComesWithTheNextRegistration)
 		<< "the pre-#440 wording is back: Learn now locks without an admin";
 	EXPECT_NE(hint.find("locks the extension to that device on its next registration"), std::string::npos) << hint;
 	EXPECT_NE(hint.find("another subnet"), std::string::npos) << hint;
+	// #820 item 6: the lock goes to the extension's first claim, not to whichever
+	// device registers it twice.
+	EXPECT_NE(hint.find("if no other phone claimed it first"), std::string::npos) << hint;
 }
