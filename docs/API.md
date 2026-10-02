@@ -1375,6 +1375,8 @@ dropped first). Volatile: the list is not persisted.
 {
   "attached": true,
   "mode": "discover",
+  "listening": true, "socketErrno": 0, "netmask": "255.255.255.0",
+  "rx": { "datagrams": 4, "offSubnet": 0, "notPnp": 3, "answered": 1 },
   "devices": [
     { "mac": "0004132e08b4", "vendor": "snom", "model": "snom370", "version": "8.7.5.48",
       "ip": "192.168.12.155", "seen": 3, "lastSeen": 5120, "notified": false }
@@ -1383,6 +1385,11 @@ dropped first). Volatile: the list is not persisted.
 ```
 
 * `lastSeen`: seconds since boot. `notified`: this board has sent it a NOTIFY.
+* `listening` / `socketErrno`: the group socket is open; else the errno of its last failed
+  open or join. `netmask`: what the same-subnet rule compares against.
+* `rx`: datagrams the group socket delivered, and why each was not answered (`offSubnet`,
+  `notPnp`) or that it was (`answered`). `datagrams` at 0 while phones boot means nothing
+  reaches the board: look at the network path (IGMP snooping), not the board.
 * `vendor`, `model`, `version` are what the phone claimed, with anything outside
   `[A-Za-z0-9 ._+/-]` removed.
 

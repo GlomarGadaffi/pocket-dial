@@ -272,9 +272,26 @@ Option 66 (§1.1), this needs no DHCP server change: only a socket.
 (Issue #826 part B). Until then `provision` re-provisions known phones (factory-reset
 recovery), and `discover` shows what is on the network.
 
-**Unverified on hardware:** the board receiving `224.0.1.75` traffic. mDNS proves the
-multicast receive path for `224.0.0.251`, but the W5500 boards' MAC filter for a second
-group has not been observed.
+**Bench, 2026-10-02 on `.195` (Waveshare W5500), snom370 8.7.5.48 at `.155`:**
+
+* **Board receive: works.** `/api/pnp` showed the group socket open (`listening`, no errno,
+  netmask `255.255.255.0`), and datagrams sent to `224.0.1.75:5060` from another LAN host
+  were counted. The W5500 blocks IPv4 multicast by default (`W5500_SMR_MAC_BLOCK_MCAST`),
+  but lwIP's IGMP join reaches it through esp-netif's MAC-filter callback and unblocks it.
+* **Answer path: works.** A replay of the snom's real SUBSCRIBE was parsed, listed and
+  answered (200 + NOTIFY), and `/config/snom<mac>.xml` served the 1001 config.
+* **The snom accepts the file.** Pointed at that URL, it logged `code: 200`, "found xml
+  style settings" and "last prov successful:1"; line 1 stayed registered. It also asks for
+  `<url-stem>-<MAC>.xml` (snom's per-MAC companion file) and a firmware page under the
+  same directory; both 404 here, harmlessly.
+* **What a snom actually sends** (its own SIP trace): source port **1053**, not 5060; a Via
+  with `rport` and no `branch`; Request-URI host `lan`. Five SUBSCRIBEs 0.5 s apart, then
+  it gives up and moves to its next setting server, so an answer must come within ~2.5 s.
+  The 1 s poll fits, but not by much. `tests/PnpProfile_test.cpp` carries the capture.
+* **Not yet seen end to end:** the snom's own multicast never reached the board on this
+  LAN, though another host's did. Something on the path between the phone and the board
+  (a switch with IGMP snooping, or a bridge) drops it. Check the network before blaming
+  the board: `/api/pnp`'s `rx.datagrams` stays 0 when nothing arrives.
 
 ## 2. The endpoint
 

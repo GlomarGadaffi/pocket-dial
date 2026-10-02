@@ -32,8 +32,8 @@
 namespace
 {
 	// SYNTHETIC: written from the PnP spec's message shape with this bench's
-	// snom370 identity, not captured off the wire. Replace with a real capture
-	// (the snom's SIP trace after a reboot) once the bench is free.
+	// snom370 identity, so the edge-case tests below can patch it. The real
+	// wire capture is kSnomCaptured, right after it.
 	const std::string kSnomSubscribe =
 		"SUBSCRIBE sip:MAC%3a0004132E08B4@224.0.1.75 SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP 192.168.12.155:5060;branch=z9hG4bK-snom-1;rport\r\n"
@@ -46,6 +46,25 @@ namespace
 		"Expires: 0\r\n"
 		"Accept: application/url\r\n"
 		"Contact: <sip:192.168.12.155:5060>\r\n"
+		"Content-Length: 0\r\n"
+		"\r\n";
+
+	// CAPTURED: the snom370 (8.7.5.48) on the bench, its own SIP trace,
+	// "Sent to udp:224.0.1.75:5060 at Oct 2 01:15:53.729 (442 bytes)". Note
+	// what the synthetic one got wrong: source port 1053 (not 5060), a Via
+	// with rport and NO branch, and a Request-URI host of "lan".
+	const std::string kSnomCaptured =
+		"SUBSCRIBE sip:MAC%3a0004132E08B4@lan SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.12.155:1053;rport\r\n"
+		"From: <sip:MAC%3a0004132E08B4@lan>;tag=668717252\r\n"
+		"To: <sip:MAC%3a0004132E08B4@lan>\r\n"
+		"Call-ID: 949137397@192.168.12.155\r\n"
+		"CSeq: 1 SUBSCRIBE\r\n"
+		"Event: ua-profile;profile-type=\"device\";vendor=\"snom\";model=\"snom370\";version=\"8.7.5.48\"\r\n"
+		"Expires: 0\r\n"
+		"Accept: application/url\r\n"
+		"Contact: <sip:192.168.12.155:1053>\r\n"
+		"User-Agent: snom370/8.7.5.48\r\n"
 		"Content-Length: 0\r\n"
 		"\r\n";
 
@@ -110,6 +129,23 @@ TEST(PnpProfile, ParsesSnomSubscribe)
 	EXPECT_EQ(s.callId, "3c26700857f2-pnp@192.168.12.155");
 	EXPECT_EQ(s.cseq, "1 SUBSCRIBE");
 	EXPECT_EQ(pnp::vendorOf(s.id), pnp::Vendor::Snom);
+}
+
+TEST(PnpProfile, ParsesARealSnom370CaptureAndAnswersItsSourcePort)
+{
+	pnp::Subscribe s;
+	ASSERT_TRUE(pnp::parseSubscribe(kSnomCaptured, s));
+	EXPECT_EQ(str(s.id.mac), "0004132e08b4");
+	EXPECT_EQ(str(s.id.model), "snom370");
+	EXPECT_EQ(s.vias[0], "SIP/2.0/UDP 192.168.12.155:1053;rport");
+	EXPECT_EQ(s.expires, 0u);
+
+	Bench b(PnpResponder::Mode::Provision);
+	auto yes = [](std::string_view) { return true; };
+	const auto r = b.r.onDatagram(kSnomCaptured, addr("192.168.12.155", 1053), 100, yes);
+	ASSERT_FALSE(r.notify.empty());
+	EXPECT_EQ(std::string(r.notify).rfind("NOTIFY sip:192.168.12.155:1053 SIP/2.0\r\n", 0), 0u);
+	EXPECT_NE(std::string(r.ok).find("Expires: 0\r\n"), std::string::npos);
 }
 
 TEST(PnpProfile, AcceptsCompactHeadersAndMacColonForm)
