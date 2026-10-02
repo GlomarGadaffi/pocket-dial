@@ -624,6 +624,7 @@ TEST(TrunkInbound, AHandsetBusyGivesTheCarrier486AndFreesTheRelay)
 		<< "in the INVITE's own transaction: its Request-URI";
 	EXPECT_EQ(field(ack, "Via: "), field(fork, "Via: ")) << "and its branch";
 	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 486 Busy Here");
+	EXPECT_EQ(b.countTo(kSbcIp), 1u) << "exactly one final to the carrier";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
 	EXPECT_FALSE(b.handler.getSession("Call-ID: " + field(fork, "Call-ID: ")).has_value());
 }
@@ -641,6 +642,7 @@ TEST(TrunkInbound, AHandsetThatIsUnavailableOrDeclinesGivesTheCarrier480)
 
 		EXPECT_FALSE(b.firstTo("ACK sip:2001@", kPhoneIp).empty()) << reply;
 		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable") << reply;
+		EXPECT_EQ(b.countTo(kSbcIp), 1u) << reply << ": exactly one final to the carrier";
 		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << reply;
 	}
 }
@@ -683,6 +685,7 @@ TEST(TrunkInbound, AForkThatDrawsNoResponseIsEndedAtTimerB)
 	b.handler.tick();
 
 	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 480 Temporarily Unavailable");
+	EXPECT_EQ(b.countTo(kSbcIp), 1u) << "exactly one final to the carrier";
 	EXPECT_FALSE(b.handler.getSession("Call-ID: " + field(fork, "Call-ID: ")).has_value());
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
 	EXPECT_EQ(b.countTo("0.0.0.0"), 0u) << "nothing goes to the stand-in caller's zero address";
@@ -701,6 +704,7 @@ TEST(TrunkInbound, AHandsetAnswerTheRelayCannotCarryIsRefusedCleanly)
 	EXPECT_FALSE(b.firstTo("BYE sip:2001@", kPhoneIp).empty()) << "and then hung up";
 	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here")
 		<< "the relay copies packets: a PCMA leg against a PCMU leg is silence (decision 4)";
+	EXPECT_EQ(b.countTo(kSbcIp), 1u) << "exactly one final to the carrier";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
 	EXPECT_FALSE(b.handler.getSession("Call-ID: " + field(fork, "Call-ID: ")).has_value());
 }
