@@ -1,0 +1,3 @@
+# ZeroTouchAssign_test.cpp: ZeroTouch 10 + ZeroTouchFlags 1 + ZeroTouchHandler 2
+# AdminHttpGate_test.cpp: ZeroTouchHttp.AFetchByTheMacItselfGetsTheNextExtensionEndToEnd 1
+14
