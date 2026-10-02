@@ -2166,6 +2166,23 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 
 	// Check if the caller is registered
 	auto caller = findClient(data->getFromNumber());
+
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: a new call from the carrier. Its From names a PSTN caller, so the 403
+	// below and #497 would refuse every one. Recognised by source address alone
+	// (#356), never by From. Not caught, so on exactly the path they had: a phone
+	// registered from that same address (an FXS port on the carrier's gateway),
+	// and a 911/933 To. Everything caught here was refused before #398.
+	if (!(caller.has_value() &&
+	      caller.value()->getAddress().sin_addr.s_addr == data->getSource().sin_addr.s_addr) &&
+		isTrunkSbcSource(data->getSource()) &&
+		!pbx::classifyEmergencyDial(data->getToNumber()).isEmergency)
+	{
+		routeInboundTrunkCall(data);
+		return;
+	}
+#endif
+
 	if (!caller.has_value())
 	{
 		auto response = getMessageFromPool(*data);
@@ -11894,6 +11911,62 @@ bool RequestsHandler::routeTrunkCall(const std::shared_ptr<SipMessage>& data,
 	}
 	return placeSipTrunkCall(data, caller, destination, /*placedOut=*/nullptr);
 }
+
+#if POCKETDIAL_TRUNK_INBOUND
+bool RequestsHandler::isTrunkSbcSource(const sockaddr_in& src)
+{
+	if (!_sipTrunk.config().valid()) return false;
+	sockaddr_in sbc{};
+	return _trunkResolver.lookup(_sipTrunk.config().transportHost(), _sipTrunk.config().transportPort(),
+			sbc, std::chrono::steady_clock::now()) == TrunkResolver::Status::Hit &&
+		sbc.sin_addr.s_addr == src.sin_addr.s_addr;
+}
+
+void RequestsHandler::routeInboundTrunkCall(const std::shared_ptr<SipMessage>& data)
+{
+	// The DID: the To user first, because a registered trunk (#399) is called at
+	// the Contact it registered, whose user is the trunk's own; then the
+	// Request-URI user, where an IP-authenticated trunk puts it.
+	std::string ext = _didMapping.extensionForDid(std::string(data->getToNumber()));
+	if (ext.empty()) ext = _didMapping.extensionForDid(std::string(data->getRequestUriUser()));
+
+	// 480 for a mapped extension that is not registered, and for now for a call
+	// that could be put through: the fork to the handset is #398 part C.
+	const char* status = "SIP/2.0 480 Temporarily Unavailable";
+	if (ext.empty())
+		status = "SIP/2.0 404 Not Found";
+	else if (findClient(ext).has_value())
+	{
+		if (findFreeTrunkRelay() < 0)
+			status = "SIP/2.0 486 Busy Here";
+		// The relay copies packets, so the carrier leg must be PCMU like the handset's.
+		else if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+			status = "SIP/2.0 488 Not Acceptable Here";
+	}
+
+	// Nothing is claimed, so a pool refusal leaves nothing behind. The §17.2
+	// server transaction keeps this answer, so a retransmitted INVITE is answered
+	// from it and never routed again.
+	auto response = getMessageFromPool(*data);
+	if (!response) return;   // pool exhausted: drop, the carrier retransmits (#101A)
+	response->setHeader(status);
+	response->clearBody();
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	response->setTo(toWithTag(data->getTo()));   // RFC 3261 §8.2.6.2: the carrier ACKs this
+	_outbox.emplace_back(data->getSource(), std::move(response));
+
+	// No numbers: a DID and the caller's number stay out of the log. At most one
+	// line per 10 s, since anyone can forge the SBC's source address.
+	const auto now = std::chrono::steady_clock::now();
+	if (now - _lastTrunkInboundLog >= std::chrono::seconds(10))
+	{
+		_lastTrunkInboundLog = now;
+		queueLog("trunk: inbound call " + (ext.empty() ? std::string("to an unmapped DID") : "for ext " + ext) +
+			" answered " + std::string(std::string_view(status).substr(8)) +
+			" (further ones within 10 s not logged)", false);
+	}
+}
+#endif
 
 bool RequestsHandler::placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
 	const std::shared_ptr<SipClient>& caller, const std::string& destination,

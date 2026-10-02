@@ -324,6 +324,9 @@ add_executable(sip_parser_tests
     # remote target), which is the easiest thing in a trunk to get wrong.
     SipTrunk_test.cpp
     TrunkWiring_test.cpp
+    # Issue #398 part B: a new INVITE from the SBC address is caught before the
+    # registered-caller checks, its DID looked up, and refused with a clean final.
+    TrunkInbound_test.cpp
     # Issue #164: carrier SBC resolution off the SIP thread. The blocking
     # getaddrinfo is ESP-only and untestable here; what IS tested is the part
     # that decides whether a configured host is an ADDRESS or a NAME (getting

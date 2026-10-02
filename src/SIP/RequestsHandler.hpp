@@ -1712,6 +1712,15 @@ private:
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
 		bool* placedOut);
 
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: is `src` the trunk's SBC? The configured transport address from the
+	// resolver's cache (never a blocking resolve), IP only, as #356 compares.
+	bool isTrunkSbcSource(const sockaddr_in& src);
+	// #398 part B: a new INVITE from the SBC, answered with a final here. The
+	// fork to the DID's extension is part C. Caller holds _mutex.
+	void routeInboundTrunkCall(const std::shared_ptr<SipMessage>& data);
+#endif
+
 	// `placedOut` (optional, Issue #166): true only when a call was actually
 	// dispatched. The bool RETURN means "took ownership of the INVITE" and is
 	// true for every refuse() path too, so a caller that must report what really
@@ -2475,6 +2484,9 @@ private:
 	std::atomic<uint32_t> _emergencyRtpReaps{0};   // #741
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
 	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
+#if POCKETDIAL_TRUNK_INBOUND
+	std::chrono::steady_clock::time_point _lastTrunkInboundLog{};   // #398 log rate limit; under _mutex
+#endif
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
 	std::atomic<uint32_t> _optionsPingTruncated{0};   // #463: see getOptionsPingTruncated()
 	// Requests answered from a §17.2 server transaction's stored response rather
