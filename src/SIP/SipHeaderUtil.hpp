@@ -68,14 +68,38 @@ namespace siphdr
 	// The bare URI of a Contact header line, parameters of the URI kept ("sip:1001@h:5060;line=x"
 	// out of "Contact: <sip:1001@h:5060;line=x>;reg-id=1"). A bare, unbracketed URI is cut at the
 	// first ';' (header parameters, RFC 3261 §20.10). A view into `header`; empty when none.
+	// #824: a '<' inside the quoted display name is not the URI's (RFC 3261 §25.1
+	// quoted-string, \-escapes included). A quote left open (an unescaped '"' in the name)
+	// falls back to the last <...> on the line; empty when there is none.
 	inline std::string_view contactUriView(std::string_view header)
 	{
 		std::string_view v = stripHeaderNameView(header);
-		const size_t lt = v.find('<');
-		if (lt != std::string_view::npos)
-		{
+		auto bracketed = [v](size_t lt) {
 			const size_t gt = v.find('>', lt + 1);
 			return gt == std::string_view::npos ? std::string_view{} : v.substr(lt + 1, gt - lt - 1);
+		};
+		bool quoted = false;
+		for (size_t lt = 0; lt < v.size(); ++lt)
+		{
+			const char c = v[lt];
+			if (quoted)
+			{
+				if (c == '\\') ++lt;
+				else if (c == '"') quoted = false;
+			}
+			else if (c == '"')
+			{
+				quoted = true;
+			}
+			else if (c == '<')
+			{
+				return bracketed(lt);
+			}
+		}
+		if (quoted)
+		{
+			const size_t lt = v.rfind('<');
+			return lt == std::string_view::npos ? std::string_view{} : bracketed(lt);
 		}
 		const size_t semi = v.find(';');
 		if (semi != std::string_view::npos) v = v.substr(0, semi);

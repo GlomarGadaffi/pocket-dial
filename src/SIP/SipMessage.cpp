@@ -949,9 +949,9 @@ bool SipMessage::isEmergencyRequest() const
 {
 	if (getStatusInfo().has_value()) return false;
 	if (getType() != SipMessageTypes::INVITE) return false;
-	return pbx::classifyEmergencyDial(getRequestUriUser()).isEmergency ||
-		pbx::classifyEmergencyDial(getToNumber()).isEmergency ||
-		isPsapCallback();
+	// #824: by the To user alone, the number onInvite routes on. A 911
+	// Request-URI over To 102 is a call to 102 and gets no emergency yield.
+	return pbx::classifyEmergencyDial(getToNumber()).isEmergency || isPsapCallback();
 }
 
 void SipMessage::syncContentLength()
@@ -1320,9 +1320,18 @@ namespace
 	// the quoted display name does not count (RFC 3261 s25.1 quoted-string,
 	// \-escapes included). Without brackets it is the bare URI: a request
 	// line's Request-URI, the token after the method, or a header's value up
-	// to its first ';' (RFC 3261 s20.10). Empty when a quote is left open.
+	// to its first ';' (RFC 3261 s20.10). #832 review: a quote left open (an
+	// unescaped '"' in the name, "Lobby 55" TV") falls back to the last <...>
+	// on the line, where a name-addr's URI sits; empty when there is none.
 	std::string_view uriPartOf(std::string_view line)
 	{
+		auto bracketed = [line](size_t lt) {
+			std::string_view uri = line.substr(lt + 1);
+			uri = uri.substr(0, uri.find('>'));
+			while (!uri.empty() && (uri.front() == ' ' || uri.front() == '\t')) uri.remove_prefix(1);
+			while (!uri.empty() && (uri.back() == ' ' || uri.back() == '\t')) uri.remove_suffix(1);
+			return uri;
+		};
 		bool quoted = false;
 		for (size_t i = 0; i < line.size(); ++i)
 		{
@@ -1338,14 +1347,14 @@ namespace
 			}
 			else if (c == '<')
 			{
-				std::string_view uri = line.substr(i + 1);
-				uri = uri.substr(0, uri.find('>'));
-				while (!uri.empty() && (uri.front() == ' ' || uri.front() == '\t')) uri.remove_prefix(1);
-				while (!uri.empty() && (uri.back() == ' ' || uri.back() == '\t')) uri.remove_suffix(1);
-				return uri;
+				return bracketed(i);
 			}
 		}
-		if (quoted) return {};
+		if (quoted)
+		{
+			const size_t lt = line.rfind('<');
+			return lt == std::string_view::npos ? std::string_view{} : bracketed(lt);
+		}
 		const size_t colon = line.find(':');
 		if (colon == std::string_view::npos) return {};
 		size_t nameStart = 0;
@@ -1395,30 +1404,33 @@ namespace
 
 std::string_view SipMessage::extractNumber(std::string_view header) const
 {
-	auto sipPos = header.find("sip:");
-	if (sipPos == std::string_view::npos)
+	// #824: only the URI is read, and its own scheme must start it. A display
+	// name or a parameter never counts, either way: To: "sip:911@lobby"
+	// <tel:+15551230100> is not a call to 911, and "sip:102@lobby" <sip:911@x>
+	// is not a call to 102.
+	const std::string_view uri = uriPartOf(header);
+	// RFC 3261 s19.1.4: the scheme is case-insensitive, and a sips: URI (s19.1)
+	// names its user the same way.
+	const size_t scheme = iequalLower(uri.substr(0, 4), "sip:") ? 4
+		: iequalLower(uri.substr(0, 5), "sips:") ? 5 : 0;
+	if (scheme == 0)
 	{
 		// #199, RFC 5031 / 6881: urn:service:sos[.<sub>] IS an emergency call.
 		// It has no sip: user part, so it used to read as empty and the INVITE
 		// was answered 400. It is routed exactly as a dialed 911.
 		static constexpr std::string_view kSos = "urn:service:sos";
-		for (size_t i = 0; i + kSos.size() <= header.size(); ++i)
+		const size_t end = kSos.size();
+		if (iequalLower(uri.substr(0, end), kSos) &&
+			(end == uri.size() || uri[end] == '.' || uri[end] == ';'))
 		{
-			if (!iequalLower(header.substr(i, kSos.size()), kSos)) continue;
-			const size_t end = i + kSos.size();
-			if (end == header.size() || header[end] == '.' || header[end] == '>' ||
-				header[end] == ';' || header[end] == ' ')
-			{
-				return pbx::kEmergencyNumber;
-			}
+			return pbx::kEmergencyNumber;
 		}
 		return emergencyUserOf(header);   // #760: tel:911 and urn:service:test.sos
 	}
 
-	auto start = sipPos + 4;
-	auto atPos = header.find('@', start);
+	const size_t atPos = uri.find('@', scheme);
 	if (atPos == std::string_view::npos)
 		return {};
 
-	return header.substr(start, atPos - start);
+	return uri.substr(scheme, atPos - scheme);
 }

@@ -246,7 +246,8 @@ public:
 	};
 	HeaderVerdict checkHeaders(std::string_view& unsupported) const;
 	static const char* headerVerdictText(HeaderVerdict v);
-	// An INVITE to 911/933 or urn:service:sos (R-URI or To), or an RFC 7090
+	// An INVITE whose To is 911/933 or urn:service:sos (the number onInvite
+	// routes on; a 911 Request-URI alone does not count, #824), or an RFC 7090
 	// Priority: psap-callback INVITE. The header gate yields for these (#199):
 	// every copy it guards is bounded anyway, and no optional header may cost
 	// an emergency call.

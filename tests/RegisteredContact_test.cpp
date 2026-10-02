@@ -257,6 +257,31 @@ TEST(RegisteredContact, OptionsPingFallsBackToTheObservedAddressWhenNoContactWas
 		<< "no stored Contact: the pre-#797 form is kept";
 }
 
+TEST(RegisteredContact, AQuotedDisplayNameDoesNotHideTheRegisteredContactUri)
+{
+	// #824 (same class): contactUriView() took the first '<' on the line, even
+	// one inside the quoted display name (RFC 3261 s25.1), so the stored Contact
+	// was the display name's text, or nothing, and the ping lost its ;line=.
+	for (const char* name : {"\"Lobby <1>\" ", "\"Desk <sip:100@192.168.31.10:1037>\" ",
+	                         "\"Desk \\\" <x>\" ",   // an escaped quote keeps the name open
+	                         "\"Lobby 55\" TV\" ",   // #832 review: a quote left open, last <...> wins
+	                         "\"Snom 370\" "})        // control: no '<' in the name
+	{
+		SCOPED_TRACE(name);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		handler.handle(makeRegister("100", kSnomIp, 1037,
+			std::string("Contact: ") + name + "<" + kSnomContactUri + ">;reg-id=1\r\n"));
+
+		handler.tick();
+
+		const std::string ping = findSentTo(sent, addrFor(kSnomIp, 1037), "OPTIONS ");
+		ASSERT_FALSE(ping.empty());
+		EXPECT_EQ(requestLineOf(ping), std::string("OPTIONS ") + kSnomContactUri + " SIP/2.0");
+	}
+}
+
 TEST(RegisteredContact, RelayedByeIsAddressedToTheCallersRegisteredContact)
 {
 	Sent sent;
