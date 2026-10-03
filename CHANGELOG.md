@@ -2,7 +2,7 @@
 
 ## v1.5.1 — 2026-10-03
 
-Two firmware changes on top of `v1.5.0` (`b8b4f0b`), from the v1.5.0 release reviews. The date is the planned tag date; set it to the real one at tag time. Nothing here is claimed bench-verified until the release smoke on this commit is recorded.
+Two firmware changes on top of `v1.5.0` (`b8b4f0b`), from the v1.5.0 release reviews. None of the changes below is claimed bench-verified one by one.
 
 ### Memory and security
 
@@ -16,7 +16,7 @@ Two firmware changes on top of `v1.5.0` (`b8b4f0b`), from the v1.5.0 release rev
 
 ### Known gaps
 
-- Emergency routing: the #759 header gate misses trunk-dialog Call-IDs and PSAP callbacks (#818); `ROUTED` is reported before a later `makeCall` failure (#821); a 911 produced by a dial-plan rule never gets the header-gate yield (#834); a 911 marked `text/plain` whose datagram never contains `application/sdp` is refused with a 400 (#834).
+- Emergency routing: the #759 header gate misses trunk-dialog Call-IDs and PSAP callbacks (#818); `ROUTED` is reported before a later `makeCall` failure (#821); a 911 produced by a dial-plan rule never gets the header-gate yield (#834); a 911 marked `text/plain` whose datagram never contains `application/sdp` is refused with a 400 (#834); a 911 INVITE that arrives with `Content-Type: text/plain` gets two Content-Type lines in the PBX's answer (#845).
 - The carrier-facing trunk is experimental: inbound carrier calls and the live-carrier proofs are still open (#398, #399, #618).
 - Hardware evidence is one handset model, one board and one carrier; on-device RTP has no automated coverage.
 
