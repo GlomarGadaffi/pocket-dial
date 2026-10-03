@@ -1890,6 +1890,80 @@ TEST(EmergencyRoute, AnUppercaseOrSipsSchemeIsReadAsSip)
 	b.handler->handle(makeShapedInvite("SIP:102@server", "SIP:102@server", "application/sdp", "", kSdpOffer,
 		"er-scheme-102"));
 	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-	EXPECT_EQ(b.count("INVITE", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE SIP:102@", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
 	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+}
+
+TEST(EmergencyRoute, AStrayQuoteBeforeASecondBracketStillIdentifiesTheCaller)
+{
+	// #835: a display name with a stray quote AND a <...> of its own before it.
+	// The scan took the first '<' outside quotes, here "<A>", so the From had
+	// no user: REGISTER and every INVITE, 911 included, drew a 400. Before #832
+	// it read 105.
+	const std::string ip105 = "192.168.79.15";
+	const std::string from = "From: \"Lobby 55\" <A> TV\" <sip:105@server>;tag=odd105b\r\n";
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.sent.clear();
+
+	auto reg = RequestsHandler::getMessageFromPool(
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + ip105 + ":5060;branch=z9hG4bKoddregb\r\n" +
+		from +
+		"To: \"Lobby 55\" <A> TV\" <sip:105@server>\r\n"
+		"Call-ID: er-odd-reg-b\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"Contact: <sip:105@" + ip105 + ":5060>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n", addrFor(ip105));
+	EXPECT_EQ(reg->getFromNumber(), "105");
+	b.handler->handle(reg);
+	EXPECT_EQ(b.count("SIP/2.0 200", ip105.c_str()), 1u) << "the REGISTER is accepted:\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	b.sent.clear();
+
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"INVITE sip:911@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + ip105 + ":5060;branch=z9hG4bKoddb911\r\n" +
+		from +
+		"To: <sip:911@server>\r\n"
+		"Call-ID: er-odd-911-b\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:105@" + ip105 + ":5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(kSdpOffer.size()) + "\r\n\r\n" + kSdpOffer, addrFor(ip105)));
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+		<< "the 911 reaches the carrier:\n" << b.dump();
+}
+
+TEST(EmergencyRoute, AQuotedParameterBehindAnOpenQuoteIsNotTheUri)
+{
+	// #835: the open quote's mate is in a parameter, so the parameter's <...>
+	// sat outside quotes and was read as the URI: this call to 102 went to the
+	// PSAP. The URI is the <...> after the display name.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->handle(makeRegister("102", "192.168.79.12"));
+	b.sent.clear();
+	auto invite = makeInviteWithToValue("sip:102@server", "\"55\" TV\" <sip:102@server>;x=\"<sip:911@h>\"",
+		"application/sdp", "", kSdpOffer, "er-835-param");
+	EXPECT_EQ(invite->getToNumber(), "102");
+	b.handler->handle(invite);
+	EXPECT_EQ(b.count("INVITE sip:102@", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << "nothing may reach the PSAP:\n" << b.dump();
+}
+
+TEST(EmergencyRoute, AStrayQuoteAfterTheUriKeepsTheFirstUri)
+{
+	// #835 control: the open quote is in a parameter after the URI. The first
+	// <...>, followed only by parameters, stays the URI: this 911 routes.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	auto invite = makeInviteWithToValue("sip:911@server", "<sip:911@server>;x=\"<sip:102@h>",
+		"application/sdp", "", kSdpOffer, "er-835-after");
+	EXPECT_EQ(invite->getToNumber(), "911");
+	b.handler->handle(invite);
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
 }

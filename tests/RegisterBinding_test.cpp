@@ -125,3 +125,50 @@ TEST(RegisterBinding, AContactStarDeregisterIsAnswered200WithNoContactAtAll)
 	EXPECT_TRUE(ok->getContact().empty())
 		<< "\"*\" is not a binding and the PBX's URI never is: " << ok->getContact();
 }
+
+TEST(RegisterBinding, TheBindingIsTheContactUriWhateverTheDisplayNameHolds)
+{
+	// #835 (the #824 class): the binding was cut at the first '<' on the line,
+	// even one in the display name, so the 200 listed "<1>" or "<A>" and the
+	// phone could not find its own Contact (RFC 3261 s10.2.4). It is the URI
+	// the registrar stores (contactUriView).
+	for (const char* name : {"\"Lobby <1>\" ", "\"Lobby 55\" <A> TV\" ", "\"Lobby 55\" TV\" ", "\"Desk 454\" "})
+	{
+		SCOPED_TRACE(name);
+		Outbox sent;
+		RequestsHandler handler(kServerIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) {
+				sent.emplace_back(a, std::move(m));
+			});
+
+		handler.handle(makeRegister("454", "192.168.52.54", "bind-454",
+			std::string("Contact: ") + name + "<sip:454@192.168.52.54:5060;line=k3>;reg-id=1;"
+			"+sip.instance=\"<urn:uuid:0>\"\r\nExpires: 3600\r\n"));
+
+		auto ok = theOk(sent);
+		ASSERT_NE(ok, nullptr);
+		EXPECT_EQ(std::string(ok->getContact()), "Contact: <sip:454@192.168.52.54:5060;line=k3>;expires=3600");
+	}
+}
+
+TEST(RegisterBinding, AnUppercaseSchemeBareContactIsEchoedAsTheBinding)
+{
+	// #835 nit, the same here: RFC 3261 s19.1.4, the scheme is case-insensitive,
+	// and the registrar stores a sips: Contact as it does a sip: one.
+	for (const char* uri : {"SIP:455@192.168.52.55:5060", "sips:455@192.168.52.55:5060"})
+	{
+		SCOPED_TRACE(uri);
+		Outbox sent;
+		RequestsHandler handler(kServerIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) {
+				sent.emplace_back(a, std::move(m));
+			});
+
+		handler.handle(makeRegister("455", "192.168.52.55", "bind-455",
+			std::string("Contact: ") + uri + ";expires=600\r\n"));
+
+		auto ok = theOk(sent);
+		ASSERT_NE(ok, nullptr);
+		EXPECT_EQ(std::string(ok->getContact()), std::string("Contact: <") + uri + ">;expires=600");
+	}
+}
