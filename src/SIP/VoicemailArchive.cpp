@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "ResetGuard.hpp"   // #450: nothing is written to the card once a reset began
+
 #if defined(PD_ETH_HAS_SD)
 #include <dirent.h>     // wipe(): opendir/readdir (#450)
 #include <sys/stat.h>
@@ -107,11 +109,15 @@ void WriterQueue::clear()
 void drainAll(WriterQueue& queue, Sink& sink, uint8_t* const* stagingBufs,
 	const std::function<void(const QueuedRecording&)>& afterWrite)
 {
+	// #450: once a factory reset has begun, nothing more reaches the card; same
+	// rule and reasoning as cdrarchive::drainAll(). A dropped recording still gets
+	// afterWrite, so its staging slot comes free while a 911 call holds the restart.
+	const bool resetting = resetguard::inProgress();
 	QueuedRecording rec;
 	while (queue.pop(rec))
 	{
 		if (rec.stagingSlot < 0) continue;   // defensive: never a valid job
-		sink.write(rec, stagingBufs[rec.stagingSlot]);
+		if (!resetting) sink.write(rec, stagingBufs[rec.stagingSlot]);
 		if (afterWrite) afterWrite(rec);
 	}
 }
