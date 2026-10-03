@@ -297,6 +297,13 @@
 static_assert(POCKETDIAL_HAS_ANCHOR || POCKETDIAL_HAS_TRUNK,
               "a build needs at least one outside-line path (#731)");
 
+// Issue #398: calls the carrier sends in over the SIP trunk. 0 (SIP_CONSTRAINED,
+// whose 4 MB app slot has ~1.5 KB left after #689) keeps onInvite as it was: an
+// INVITE from the SBC is refused 403 like any other unregistered caller.
+#ifndef POCKETDIAL_TRUNK_INBOUND
+#define POCKETDIAL_TRUNK_INBOUND 1
+#endif
+
 // Number of concurrent voicemail legs (Issue #246, Stage 3 of #194) -- deposit
 // (recording a caller's message) or retrieval (playing one back), never more
 // than one call at a time per leg. Each leg owns its own RtpReceiver/RtpSender

@@ -291,6 +291,9 @@ if(SIP_CONSTRAINED)
         # trunk/SMTP/E911/admin_ext section is compiled out here; an import
         # that carries it says so under "skipped".
         POCKETDIAL_BACKUP_SECTION_C=0
+        # #398: no inbound carrier calls here; the slot is full. An INVITE from
+        # the SBC is refused 403 as before.
+        POCKETDIAL_TRUNK_INBOUND=0
         # MWI (RFC 3842) compiled out: the slot is tight; message-summary 489s.
         POCKETDIAL_MWI=0)
     # #416: the pcap ring is fixed storage (ring x ~2.1 KB), and a constrained build
