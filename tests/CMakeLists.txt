@@ -345,6 +345,9 @@ add_executable(sip_parser_tests
     # second real implementation, TelephonyAnchorClient, exists but isn't
     # exercised by this host suite — see its own test files below).
     AnchorRouting_test.cpp
+    # #657: a real anchor's makeCall/answerCall/dropCall run on boot-created
+    # workers behind bounded queues; drops and 911/933 never wait behind setup.
+    TelCtlPool_test.cpp
     # Issue #379: an INVITE for a dead dialog gets 481, never a new call.
     DeadDialogReinvite_test.cpp
     # The bounded Telephony-API credential slot table ported from drawbridge,
