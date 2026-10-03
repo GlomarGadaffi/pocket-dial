@@ -1,0 +1,3 @@
+# PnpProfile_test.cpp: PnpProfile 11 + PnpResponder 12 + SnomProvisioning 4
+# AdminHttpGate_test.cpp: Pnp.ModeIsAdminGatedAndRoundTrips 1
+28

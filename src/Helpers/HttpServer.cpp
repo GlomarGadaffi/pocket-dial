@@ -1343,6 +1343,20 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 			sendApiRegistrarDevice(clientSock, req.body);
 		}
 	}
+	else if (req.method == "GET" && req.path == "/api/pnp")
+	{
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiPnp(clientSock);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/pnp")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiPnpSet(clientSock, req.body);
+		}
+	}
 	else if (req.method == "POST" && req.path == "/api/registrar/forget-learned")
 	{
 		// #515: one action to clear a flood of Learned adoptions; Secured
@@ -3033,6 +3047,19 @@ HttpServer::ProvisioningPathType HttpServer::parseProvisioningPath(
 		if (is12LowerHex(mac)) { outKey = mac; return ProvisioningPathType::CiscoSpaMac; }
 	}
 
+	// 4a. snom: snom<12 hex>.xml (20 chars, Issue #826). The PnP NOTIFY hands a
+	// snom this URL with the MAC already lowercased, but a snom's own {mac}
+	// template expands to UPPERCASE, so an admin-typed setting_server URL arrives
+	// that way: accept either case here and key the lookup on the lowercase form.
+	if (filename.size() == 20 && filename.compare(0, 4, "snom") == 0 &&
+	    filename.compare(16, 4, ".xml") == 0)
+	{
+		std::string mac = filename.substr(4, 12);
+		std::transform(mac.begin(), mac.end(), mac.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (is12LowerHex(mac)) { outKey = mac; return ProvisioningPathType::Snom; }
+	}
+
 	// 5. Cisco SPA model-keyed: spa<model>.cfg (e.g. spa504g.cfg)
 	if (filename.size() > 7 && filename.compare(0, 3, "spa") == 0 &&
 	    filename.compare(filename.size() - 4, 4, ".cfg") == 0)
@@ -3149,6 +3176,10 @@ void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
 	else if (type == ProvisioningPathType::CiscoSpaMac)
 	{
 		cfg = provisioning::ciscoSpaConfigFor(info->extension, activeIp, 5060, info->authRequired);
+	}
+	else if (type == ProvisioningPathType::Snom)
+	{
+		cfg = provisioning::snomConfigFor(info->extension, activeIp, 5060, info->authRequired);
 	}
 	else // ProvisioningPathType::Yealink (/config/<mac>.cfg)
 	{
@@ -4723,6 +4754,91 @@ void HttpServer::sendApiRegistrarSet(int sock, const std::string& body)
 
 	handler->setRegistrarMode(mode);
 	sendApiRegistrar(sock);
+}
+
+// Issue #826. Written into a leased /api/status buffer with JsonOut: no heap,
+// and the device table is visited in place rather than copied to this stack.
+void HttpServer::sendApiPnp(int sock)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 200, "OK", "application/json",
+		             "{\"attached\":false,\"mode\":\"unknown\",\"devices\":[]}");
+		return;
+	}
+	std::atomic<bool>* busy = nullptr;
+	char* buf = leaseStatusBuf(busy);
+	if (buf == nullptr)
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 503, "Service Unavailable", "application/json", "{\"error\":\"busy\"}");
+		return;
+	}
+	struct Release
+	{
+		std::atomic<bool>* f;
+		~Release() { f->store(false, std::memory_order_release); }
+	} release{busy};
+	JsonOut out{buf, (std::min)(_statusCap, kStatusBufBytes)};
+	PnpResponder& pnp = handler->pnp();
+	out.s("{\"attached\":true,\"mode\":\"").s(PnpResponder::modeName(pnp.mode())).s("\"");
+	{
+		const PnpResponder::Counters c = pnp.counters();
+		std::array<char, 16> mask{};
+		in_addr m{};
+		m.s_addr = pnp.netmask();
+		if (inet_ntop(AF_INET, &m, mask.data(), mask.size()) == nullptr) mask[0] = '\0';
+		out.s(",\"listening\":").b(pnp.listening()).s(",\"socketErrno\":").n(pnp.socketErrno());
+		out.s(",\"netmask\":\"").s(mask.data()).s("\",\"rx\":{\"datagrams\":").n(c.datagrams);
+		out.s(",\"offSubnet\":").n(c.offSubnet).s(",\"notPnp\":").n(c.notPnp);
+		out.s(",\"answered\":").n(c.answered).s("}");
+	}
+	out.s(",\"devices\":[");
+	bool first = true;
+	auto field = [](const std::array<char, pnp::kFieldCap>& a) {
+		return std::string_view(a.data(), ::strnlen(a.data(), a.size()));
+	};
+	pnp.forEachDevice([&](const PnpResponder::Device& d) {
+		std::array<char, 16> ip{};
+		in_addr a{};
+		a.s_addr = d.ip;
+		if (inet_ntop(AF_INET, &a, ip.data(), ip.size()) == nullptr) ip[0] = '\0';
+		out.s(first ? "{" : ",{");
+		first = false;
+		out.s("\"mac\":\"").s(std::string_view(d.id.mac.data(), pnp::kMacCap - 1));
+		out.s("\",\"vendor\":\"").e(field(d.id.vendor)).s("\",\"model\":\"").e(field(d.id.model));
+		out.s("\",\"version\":\"").e(field(d.id.version)).s("\",\"ip\":\"").s(ip.data());
+		out.s("\",\"seen\":").n(d.seen).s(",\"lastSeen\":").n(d.lastSeen);
+		out.s(",\"notified\":").b(d.notified).s("}");
+	});
+	out.s("]}");
+	if (out.full)
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json", "{\"error\":\"too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, out.len));
+}
+
+void HttpServer::sendApiPnpSet(int sock, const std::string& body)
+{
+	PnpResponder::Mode mode = PnpResponder::Mode::Off;
+	if (!PnpResponder::parseMode(getFormParam(body, "mode"), mode))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"mode must be one of: off, discover, provision\"}");
+		return;
+	}
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+		             "{\"error\":\"SIP engine not attached yet\"}");
+		return;
+	}
+	handler->pnp().setMode(mode);
+	sendApiPnp(sock);
 }
 
 void HttpServer::sendApiRegistrarDevice(int sock, const std::string& body)

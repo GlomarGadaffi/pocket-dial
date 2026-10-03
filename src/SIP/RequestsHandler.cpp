@@ -8752,6 +8752,14 @@ std::optional<RequestsHandler::ProvisioningInfo> RequestsHandler::findProvisioni
 	return std::nullopt;
 }
 
+bool RequestsHandler::canProvisionMac(std::string_view mac)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	std::string_view ext;
+	if (!_registrar.extensionOf(mac, ext)) return false;
+	return isValidAor(ext) && !pbx::isReservedOrPstnAor(ext);
+}
+
 void RequestsHandler::setDnd(const std::string& extension, bool on)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;

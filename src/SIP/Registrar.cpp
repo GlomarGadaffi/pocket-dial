@@ -699,6 +699,19 @@ bool Registrar::isExtensionSecured(std::string_view ext) const
 	return false;
 }
 
+bool Registrar::extensionOf(std::string_view mac, std::string_view& ext) const
+{
+	for (const auto& entry : _devices)
+	{
+		if (entry.first == mac)
+		{
+			ext = entry.second.extension;
+			return true;
+		}
+	}
+	return false;
+}
+
 void Registrar::noteChange(Change kind)
 {
 	// The enum is ordered None < OnlineOnly < Structural, so taking the max keeps

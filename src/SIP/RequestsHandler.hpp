@@ -69,6 +69,7 @@
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
 #include "Registrar.hpp"
+#include "PnpResponder.hpp"
 #include "RegisterBeeper.hpp"
 #include "ParkOrbit.hpp"
 #include "BlfSubscriptions.hpp"
@@ -278,6 +279,15 @@ public:
 		bool authRequired;
 	};
 	std::optional<ProvisioningInfo> findProvisioningInfo(const std::string& mac);
+
+	// Issue #826: SIP PnP. The responder lives here so both the SIP task (which
+	// feeds it) and the HTTP task (/api/pnp) can reach it; it guards its own
+	// state. canProvisionMac() is its "does this board have a config for you"
+	// check: the MAC is adopted AND its extension passes the same gates
+	// findProvisioningInfo() applies, so a phone pointed here is never handed a
+	// URL that will 404. Allocation-free; takes _mutex.
+	PnpResponder& pnp() { return _pnp; }
+	bool canProvisionMac(std::string_view mac);
 
 	// Do Not Disturb (DND): set/query a per-extension flag. setDnd is the mutating
 	// path behind POST /api/dnd (thread-safe; takes _mutex). getDndExtensions
@@ -1080,6 +1090,9 @@ private:
 	// mode or chooseBootMode()'s decision (#397). The host has no NVS, so the
 	// host suite runs Open -- its REGISTERs carry no credentials.
 	Registrar _registrar{*this, Registrar::Mode::Learn};   // loadMode() decides on the board (#397, #500)
+
+	// Issue #826: SIP PnP policy + discovered-device table. Own mutex; not _mutex.
+	PnpResponder _pnp;
 
 	// RFC 4028 session timer helpers. Caller holds _mutex.
 	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);

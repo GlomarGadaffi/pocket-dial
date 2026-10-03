@@ -272,6 +272,13 @@ int UdpServer::send(const struct sockaddr_in& address, const std::string& buffer
 		0, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address));
 }
 
+int UdpServer::sendBytes(const struct sockaddr_in& address, const char* data, size_t len)
+{
+	if (data == nullptr || len == 0) return -1;
+	return sendto(_sockfd, data, static_cast<int>(len),
+		0, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address));
+}
+
 void UdpServer::closeServer()
 {
 	_keepRunning = false;

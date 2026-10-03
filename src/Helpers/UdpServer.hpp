@@ -72,6 +72,8 @@ public:
 
 	void startReceive();
 	int send(const struct sockaddr_in& address, const std::string& buffer);
+	// Issue #826: send from a fixed buffer without building a std::string.
+	int sendBytes(const struct sockaddr_in& address, const char* data, size_t len);
 
 private:
 	void closeServer();
