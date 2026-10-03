@@ -70,6 +70,14 @@ SERVICE = ("777", "888", "796", "999", "555") + tuple(str(z) for z in range(980,
 CHECKOUT_URL_RX = re.compile(
     r"^https://github\.com/GlomarGadaffi/pocket-dial/discussions/428#discussioncomment-[0-9]+$")
 END_MARGIN_S = 120        # the CHECK-OUT must outlive the planned end by this much
+# After the quiesce wait the test UAs stay registered this long before the final de-REGISTER.
+# soak_verdict.py's idle-quiesce gate judges the last status sample stamped <= quiesce_check_at,
+# and status_logger.sh stamps whole seconds BEFORE a curl that may take 2 s, so such a sample can
+# reach the board up to a few seconds AFTER quiesce_check_at. A de-REGISTER sent at that moment
+# made the 1 h Elite run read "registrations 0 (want exactly 4)". Keep it below
+# register.expires - register.refresh_s (60 s in rc1) so the last refresh is still live when
+# it ends. An interrupted run skips it and de-registers at once.
+DEREG_GRACE_S = 30
 KINDS = ("echo", "ext", "conf", "park")
 
 PROFILES = {
@@ -677,6 +685,11 @@ def execute(prof, plan, agents, clock, rep, status_fn, log=print):
                 workers.append(th)
         if not rep.data["interrupted"] and not clock.wait_until(t0 + plan["duration_s"] + plan["quiesce_s"]):
             rep.data["interrupted"] = True
+        if not rep.data["interrupted"]:
+            # The plan and quiesce_check_at are done: hold the registrations so a sample stamped at
+            # or just after quiesce_check_at still sees them. A stop in this wait ends it and falls
+            # through to the de-REGISTER at once; it does not mark the plan interrupted.
+            clock.wait_until(t0 + plan["duration_s"] + plan["quiesce_s"] + DEREG_GRACE_S)
     finally:
         for th in _join(workers, grace):
             rep.data.setdefault("overruns", []).append(th.name)
@@ -715,7 +728,8 @@ def build_parser():
                          "(default $PD_OWNER_EXTS; 'none' asserts there are none)")
     ap.add_argument("--duration", type=int, default=None, help="load window in seconds")
     ap.add_argument("--quiesce-s", type=int, default=None,
-                    help="after the load: registrations only, before de-registering")
+                    help="after the load: registrations only, then DEREG_GRACE_S more held "
+                         "registered, then de-register")
     ap.add_argument("--report", default=None, help="write the JSON report here")
     ap.add_argument("--dry-run", action="store_true", help="print the plan; send nothing")
     ap.add_argument("--checkout-url", default=None, help="the discussion #428 CHECK-OUT comment link")
@@ -757,7 +771,7 @@ def main(argv=None, clock=None, agent_factory=None, status_fn=None, out=print):
     plan = make_plan(prof, duration, quiesce) if not validate_profile(prof) else None
     if plan is not None:
         problems += plan_problems(plan)
-    needed = duration + quiesce + END_MARGIN_S
+    needed = duration + quiesce + DEREG_GRACE_S + END_MARGIN_S
     co_problems = checkout_problems(args.checkout_url, args.checkout_expiry, time.time(), needed)
 
     out("sip_stress.py --profile %s%s" % (args.profile, "  (DRY RUN: nothing is sent)" if args.dry_run else ""))
@@ -767,7 +781,8 @@ def main(argv=None, clock=None, agent_factory=None, status_fn=None, out=print):
     out("  table     sha256 %s  (%s)" % (table_sha256(prof)[:16], prof["about"]))
     out("  CHECK-OUT %s until %s  [%s]" % (args.checkout_url or "<none>", args.checkout_expiry or "<none>",
         "ok" if not co_problems else "a real run refuses: " + "; ".join(co_problems)))
-    out("  load      %d s, then %d s of registrations only, then de-register" % (duration, quiesce))
+    out("  load      %d s, then %d s of registrations only, then %d s held registered, then de-register"
+        % (duration, quiesce, DEREG_GRACE_S))
     if plan is not None:
         out("  plan      %d bursts, idle >= %d s between them (%.0f%% idle); %s; %d REGISTERs"
             % (len(plan["bursts"]), prof["idle_gap_s"], 100 * plan["idle_fraction"],
