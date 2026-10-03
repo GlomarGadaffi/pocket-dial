@@ -346,6 +346,8 @@ the S1 pin, which is checked against the board:
   never from argv. It is refused if it holds 911 or 933 anywhere, or is 112, 113, 999, an owner
   extension (1001, 1002, 1003, 113, plus `PD_OWNER_EXTS`), a test UA or a PBX service number;
 - the board is `.195` or `.244`, and the admin PIN comes from `PD_BOARD_ADMIN_PIN`;
+- `--expect-version` names the image (the provenance the closure rule needs); the board's
+  `/api/status` version must match it, or the run is INVALID before the first call;
 - the test UAs are 6101-6104 only, and 6104 is the phantom detector;
 - the S1 pin: a DID row maps the active anchor slot's route DN to 6104, and the authenticated
   roster shows 6104 at this run's own address. It is checked before the first call, between

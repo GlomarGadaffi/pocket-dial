@@ -427,6 +427,11 @@ class RefusalTest(unittest.TestCase):
                 os.chmod(path, 0o600)
                 self.assertEqual(an.load_far_end(env), (FAR, "file"))
 
+    def test_a_real_run_needs_an_expected_version(self):
+        self.refused(cli(), base_env(), "no --expect-version")
+        rc, out = run_main(cli("--dry-run"), base_env(), http=NoNetwork())
+        self.assertEqual(rc, 0, out)
+
     def test_the_admin_pin_comes_from_the_environment(self):
         self.refused(cli(), base_env(PD_BOARD_ADMIN_PIN=None), "PD_BOARD_ADMIN_PIN")
         out = self.refused(cli("--pin", PIN), base_env(), "holds a secret")
@@ -745,7 +750,8 @@ class RunTest(unittest.TestCase):
             self.loggers.append(lg)
             return lg
         argv = cli("--port", str(self.board.port), "--http-port", str(self.http_port), "--local-ip", "127.0.0.1",
-                   "--syslog-port", "0", "--set-syslog", "--pin-check-s", "0.05", "--out", self.tmp.name, *extra)
+                   "--syslog-port", "0", "--set-syslog", "--pin-check-s", "0.05", "--out", self.tmp.name,
+                   "--expect-version", "v1.5.0-fake", *extra)
         rc, out = run_main(argv, env or base_env(), start_logger=start_logger,
                            overrides=dict(FAST, **(overrides or {})), run_defaults=FAST_RUN)
         dirs = [d for d in os.listdir(self.tmp.name) if os.path.isdir(os.path.join(self.tmp.name, d))]
@@ -883,7 +889,7 @@ class RunTest(unittest.TestCase):
         def start_logger(argv, out_path):
             return FakeLogger(self.board, argv, out_path)
         argv = cli("--port", str(self.board.port), "--http-port", str(self.http_port), "--local-ip", "127.0.0.1",
-                   "--syslog-port", "0", "--out", self.tmp.name)
+                   "--syslog-port", "0", "--out", self.tmp.name, "--expect-version", "v1.5.0-fake")
         rc, out = run_main(argv, base_env(), start_logger=start_logger, overrides=FAST, run_defaults=FAST_RUN)
         self.assertEqual(rc, 3, out)
         self.assertIn("does not send syslog", out)

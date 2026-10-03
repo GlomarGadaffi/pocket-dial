@@ -958,7 +958,8 @@ def build_parser():
     ap.add_argument("--checkout-expiry", default=None, help="its expiry, ISO-8601 with a zone")
     ap.add_argument("--owner-ext", default=None, help="owner extensions beyond %s (or PD_OWNER_EXTS)"
                     % ",".join(OWNER_EXTS))
-    ap.add_argument("--expect-version", default=None, help="the /api/status version the run must see")
+    ap.add_argument("--expect-version", default=None,
+                    help="the /api/status version the run must see (required for a real run)")
     ap.add_argument("--pin-check-s", type=float, default=5.0)
     ap.add_argument("--out", default="anchor-evidence")
     ap.add_argument("--dry-run", action="store_true", help="print the plan; contact nothing")
@@ -1014,6 +1015,9 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
     problems += scenario_problems(sc) + host_problems(args.host) + approval_problems(args.approval_url)
     if far is not None:
         problems += far_end_problems(far, owner)
+    if not args.dry_run and not args.expect_version:
+        problems.append("no --expect-version: the closure rule needs a provenance-checked image "
+                        "(the release stamp, or that commit's -probe stamp)")
     if not env.get(PIN_ENV):
         problems.append("no %s in the environment: the S1 pin cannot be checked without an admin "
                         "session" % PIN_ENV)
