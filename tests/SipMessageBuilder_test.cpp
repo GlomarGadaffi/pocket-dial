@@ -55,7 +55,7 @@ std::string headerValue(std::string_view raw, std::string_view name)
 // CSeq 1 OPTIONS, Content-Length 0, and Max-Forwards 70.
 TEST(SipMessageBuilder, OptionsEmitsValidRfc3261Request)
 {
-	sipb::Wire wire{};
+	sipb::OptionsWire wire{};
 	sipb::OptionsParams params{};
 	params.targetAor = "101";
 	params.destIp = "192.168.1.50";
@@ -108,15 +108,18 @@ TEST(SipMessageBuilder, OptionsEmitsValidRfc3261Request)
 // B1: options() performs ZERO heap allocations post-init.
 TEST(SipMessageBuilder, OptionsAllocatesZeroHeap)
 {
-	// Positive control: verify that AllocGuard is active and increments on new
+	// Positive control: the counter moves on a new (same shape as AllocBaseline).
 	{
+		static void* volatile sink = nullptr;
 		AllocGuard positiveControl;
-		volatile auto* p = new int(1234);
-		EXPECT_GT(positiveControl.delta(), 0u);
+		int* p = new int(1234);
+		sink = p;
+		const size_t n = positiveControl.delta();
 		delete p;
+		EXPECT_GT(n, 0u);
 	}
 
-	sipb::Wire wire{};
+	sipb::OptionsWire wire{};
 	sipb::OptionsParams params{};
 	params.targetAor = "102";
 	params.destIp = "192.168.12.244";
@@ -135,7 +138,7 @@ TEST(SipMessageBuilder, OptionsAllocatesZeroHeap)
 // B1: An oversized input or bad field fails safely with len = 0 and Err.
 TEST(SipMessageBuilder, OptionsTruncationFailsSafely)
 {
-	sipb::Wire wire{};
+	sipb::OptionsWire wire{};
 	sipb::OptionsParams badParams{};
 	// Empty targetAor
 	EXPECT_EQ(sipb::options(wire, badParams), sipb::Err::BadField);
@@ -152,6 +155,57 @@ TEST(SipMessageBuilder, OptionsTruncationFailsSafely)
 	EXPECT_EQ(wire.len, 0u) << "truncated build must zero out len (never send partial)";
 }
 
+// The 640 B cap itself: the longest message that fits is 639 B; one more byte
+// is Truncated with len = 0. The IDs are fixed-length, so the size is a
+// function of requestUri alone.
+TEST(SipMessageBuilder, OptionsCapBoundaryIs639Bytes)
+{
+	sipb::OptionsWire wire{};
+	sipb::OptionsParams params{};
+	params.targetAor = "100";
+	params.destIp = "192.168.31.10";
+	params.destPort = 1037;
+	params.localIp = "192.168.1.1";
+	params.localPort = 5060;
+
+	std::string uri = "sip:a";
+	params.requestUri = uri;
+	ASSERT_EQ(sipb::options(wire, params), sipb::Err::Ok);
+	const size_t base = wire.len;
+	ASSERT_LT(base, sizeof(wire.bytes) - 1);
+
+	uri.append(sizeof(wire.bytes) - 1 - base, 'x');
+	params.requestUri = uri;
+	ASSERT_EQ(sipb::options(wire, params), sipb::Err::Ok);
+	EXPECT_EQ(wire.len, sizeof(wire.bytes) - 1) << "639 B must fit";
+
+	uri.push_back('x');
+	params.requestUri = uri;
+	EXPECT_EQ(sipb::options(wire, params), sipb::Err::Truncated);
+	EXPECT_EQ(wire.len, 0u) << "640 B must not fit, and len must be 0";
+}
+
+// Defense in depth behind SipClient::setContactUri: a request line can't carry
+// a byte that would split or end the message.
+TEST(SipMessageBuilder, OptionsRefusesControlBytesInTheRequestUri)
+{
+	sipb::OptionsWire wire{};
+	sipb::OptionsParams params{};
+	params.targetAor = "100";
+	params.destIp = "192.168.31.10";
+	params.destPort = 1037;
+	params.localIp = "192.168.1.1";
+	params.localPort = 5060;
+
+	for (const std::string bad : {std::string("sip:a\r\nVia: x"), std::string("sip:a b"),
+	                              std::string("sip:a\0b", 7), std::string("sip:a\x7f")})
+	{
+		params.requestUri = bad;
+		EXPECT_EQ(sipb::options(wire, params), sipb::Err::BadField);
+		EXPECT_EQ(wire.len, 0u);
+	}
+}
+
 // B1: the random identifiers come from IDGen's CSPRNG path and nothing else
 // (#385). A local PRNG would ignore the injected byte source and fail this.
 TEST(SipMessageBuilder, OptionsIdsComeFromIdGen)
@@ -159,7 +213,7 @@ TEST(SipMessageBuilder, OptionsIdsComeFromIdGen)
 	IDGen::setByteSourceForTest([](uint8_t* buf, size_t len) {
 		for (size_t i = 0; i < len; ++i) buf[i] = 1;   // 0x01 -> alphabet[1] == '1'
 	});
-	sipb::Wire wire{};
+	sipb::OptionsWire wire{};
 	const sipb::Err err = sipb::options(wire, "101", "192.168.1.50", 5060, "192.168.1.1", 5060);
 	IDGen::setByteSourceForTest(nullptr);
 
@@ -174,7 +228,7 @@ TEST(SipMessageBuilder, OptionsIdsComeFromIdGen)
 // all; To stays the composed AOR.
 TEST(SipMessageBuilder, OptionsRequestUriIsTheRegisteredContactVerbatim)
 {
-	sipb::Wire wire{};
+	sipb::OptionsWire wire{};
 	sipb::OptionsParams params{};
 	params.targetAor = "100";
 	params.destIp = "192.168.31.10";
@@ -193,7 +247,7 @@ TEST(SipMessageBuilder, OptionsRequestUriIsTheRegisteredContactVerbatim)
 // observed address, byte for byte what the pre-builder ping sent.
 TEST(SipMessageBuilder, OptionsRequestUriFallsBackToTheObservedAddress)
 {
-	sipb::Wire wire{};
+	sipb::OptionsWire wire{};
 	sipb::OptionsParams params{};
 	params.targetAor = "100";
 	params.destIp = "192.168.31.10";

@@ -10128,7 +10128,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	p.fromUser = pbx::kServiceServer;
 	p.requestUri = client->getContactUri();
 
-	sipb::Wire wire{};
+	sipb::OptionsWire wire{};
 	const sipb::Err err = sipb::options(wire, p);
 
 	if (err != sipb::Err::Ok)

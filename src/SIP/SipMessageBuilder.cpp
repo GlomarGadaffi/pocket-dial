@@ -7,13 +7,20 @@
 namespace sipb
 {
 
-Err options(Wire& out, const OptionsParams& params)
+Err options(OptionsWire& out, const OptionsParams& params)
 {
 	out.len = 0;
 
 	if (params.targetAor.empty() || params.destIp.empty() || params.localIp.empty())
 	{
 		return Err::BadField;
+	}
+	// Defense in depth: SipClient::setContactUri already refuses these, but a
+	// CR, LF, NUL or space in the request line would split or end the message.
+	for (const char ch : params.requestUri)
+	{
+		const unsigned char c = static_cast<unsigned char>(ch);
+		if (c <= ' ' || c >= 0x7f) return Err::BadField;
 	}
 
 	char callIdRand[16]{};
@@ -46,11 +53,9 @@ Err options(Wire& out, const OptionsParams& params)
 	}
 	const int requestUriLen = static_cast<int>(requestUri.size());
 
-	// Cap options ping at kMaxOptionsBytes (640 B, #463): worst-case valid ping
-	// is ~450 B, so anything larger is rejected and counted before transmission.
-	constexpr size_t kMaxOptionsCap = kMaxOptionsBytes < sizeof(out.bytes)
-		? kMaxOptionsBytes
-		: sizeof(out.bytes);
+	// The buffer is the cap (640 B, #463). A legitimate ping with a 64-char AOR,
+	// a dotted-quad local IP and a 128-byte registered Contact is ~490 B.
+	constexpr size_t kMaxOptionsCap = sizeof(out.bytes);
 
 	const int n = std::snprintf(out.bytes, kMaxOptionsCap,
 		"OPTIONS %.*s SIP/2.0\r\n"
@@ -78,7 +83,7 @@ Err options(Wire& out, const OptionsParams& params)
 	return Err::Ok;
 }
 
-Err options(Wire& out,
+Err options(OptionsWire& out,
             std::string_view targetAor,
             std::string_view destIp,
             uint16_t destPort,
