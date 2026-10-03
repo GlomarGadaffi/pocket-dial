@@ -6485,13 +6485,18 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			if (!response) return;
 			std::shared_ptr<SipMessage> bye;
 			uint32_t byeCSeq = 0;
+			bool refused = false;
 			if (!inFlight)
 			{
 				byeCSeq = session.value()->nextServerCSeq();
 				// The sender's own From/To are the dialog as the far phone knows it.
 				bye = buildServerBye(far->getNumber(), far->getAddress(), std::string(data->getCallID()),
-					std::string(data->getFrom()), std::string(data->getTo()), byeCSeq);
-				if (!bye) return;
+					std::string(data->getFrom()), std::string(data->getTo()), byeCSeq, &refused);
+				// A refused pool draw commits nothing and the retransmit tries again
+				// (#715). A BYE the builder refused is refused again on every
+				// retransmit, so the sender is answered anyway and the far leg's BYE
+				// is dropped.
+				if (!bye && !refused) return;
 			}
 			response->setHeader(SipMessageTypes::OK);
 			response->clearBody();
@@ -6503,6 +6508,13 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 				setCallState(data->getCallID(), Session::State::Bye);
 				setCallDisposition(data->getCallID(), Session::Disposition::Bye);   // #690, same writer as the generic path below
 				_outbox.emplace_back(far->getAddress(), std::move(bye));
+			}
+			else if (refused)
+			{
+				// No BYE goes out whose answer would end the session, so it ends here
+				// (logged by buildServerBye).
+				setCallDisposition(data->getCallID(), Session::Disposition::Bye);
+				endCall(data->getCallID(), src->getNumber(), dest->getNumber(), "BYE to the far leg not sent (#744)");
 			}
 			return;
 		}
@@ -11339,7 +11351,8 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 	const std::string& callId,
 	const std::string& fromHeader,
 	const std::string& toHeader,
-	uint32_t cseq)
+	uint32_t cseq,
+	bool* refused)
 {
 	char destIp[INET_ADDRSTRLEN]{};
 	inet_ntop(AF_INET, &destAddr.sin_addr, destIp, sizeof(destIp));
@@ -11367,6 +11380,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 
 	sipb::Err err = sipb::Err::Ok;
 	auto bye = byeFromPool(p, destAddr, err);
+	if (refused) *refused = err != sipb::Err::Ok;
 	if (err != sipb::Err::Ok)
 	{
 		// Told apart because the fixes differ: a dialog too long for the cap, or
