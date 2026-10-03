@@ -22,6 +22,7 @@
 #include "SipSecretStore.hpp"   // #482
 #include "TrunkConfigStore.hpp"   // #483
 #include "EmailConfigStore.hpp"   // #483
+#include "ResetGuard.hpp"     // #450: a reset leaves the guard up on host
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -192,6 +193,7 @@ namespace
 			DeviceConfig::clearAll();
 			TrunkConfigStore::resetForTest();   // #483: process-global on host
 			EmailConfigStore::resetForTest();
+			resetguard::resetForTest();   // the host reset door leaves the guard up (no restart)
 			std::remove(_tapiPath.c_str());
 			std::remove(_didPath.c_str());
 		}
