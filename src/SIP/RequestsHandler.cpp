@@ -1848,6 +1848,9 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 	// branches could not claim it anyway. Same intercept position as the
 	// beeper's, for the same reason.
 	if (_sipTrunk.handleResponse(data)) return;
+#if POCKETDIAL_TRUNK_INBOUND
+	if (handleTrunkInboundReply(data)) return;   // #398: the handset answering a carrier's call
+#endif
 
 	if (_beeper.handleInviteFailure(data))
 	{
@@ -1958,6 +1961,9 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 	// branches could not claim it anyway. Same intercept position as the
 	// beeper's, for the same reason.
 	if (_sipTrunk.handleResponse(data)) return;
+#if POCKETDIAL_TRUNK_INBOUND
+	if (handleTrunkInboundReply(data)) return;   // #398: the handset answering a carrier's call
+#endif
 
 	if (_beeper.handleInviteFailure(data))
 	{
@@ -5694,6 +5700,9 @@ void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+#if POCKETDIAL_TRUNK_INBOUND
+	if (handleTrunkInboundReply(data)) return;   // #398: the handset answering a carrier's call
+#endif
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
@@ -5714,6 +5723,9 @@ void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 // own dialog is claimed here; any other 183 is still dropped, as before.
 void RequestsHandler::onSessionProgress(std::shared_ptr<SipMessage> data)
 {
+#if POCKETDIAL_TRUNK_INBOUND
+	if (handleTrunkInboundReply(data)) return;   // #398: the handset answering a carrier's call
+#endif
 	(void)_sipTrunk.handleResponse(data);
 }
 
@@ -5736,6 +5748,9 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 	// branches could not claim it anyway. Same intercept position as the
 	// beeper's, for the same reason.
 	if (_sipTrunk.handleResponse(data)) return;
+#if POCKETDIAL_TRUNK_INBOUND
+	if (handleTrunkInboundReply(data)) return;   // #398: the handset answering a carrier's call
+#endif
 
 	if (_beeper.ownsCallID(data->getCallID()))
 	{
@@ -5798,6 +5813,9 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 	// branches could not claim it anyway. Same intercept position as the
 	// beeper's, for the same reason.
 	if (_sipTrunk.handleResponse(data)) return;
+#if POCKETDIAL_TRUNK_INBOUND
+	if (handleTrunkInboundReply(data)) return;   // #398: the handset answering a carrier's call
+#endif
 
 	if (_beeper.handleInviteFailure(data))
 	{
@@ -5947,6 +5965,9 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 	// branches could not claim it anyway. Same intercept position as the
 	// beeper's, for the same reason.
 	if (_sipTrunk.handleResponse(data)) return;
+#if POCKETDIAL_TRUNK_INBOUND
+	if (handleTrunkInboundReply(data)) return;   // #398: the handset answering a carrier's call
+#endif
 
 	if (_beeper.handleInviteFailure(data))
 	{
@@ -6486,6 +6507,9 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 	// branches could not claim it anyway. Same intercept position as the
 	// beeper's, for the same reason.
 	if (_sipTrunk.handleResponse(data)) return;
+#if POCKETDIAL_TRUNK_INBOUND
+	if (handleTrunkInboundReply(data)) return;   // #398: the handset answering a carrier's call
+#endif
 
 	if (_beeper.handleOk(data))
 	{
@@ -6777,6 +6801,9 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 {
 	if (absorbSpliceAck(data)) return;   // #453: ends OUR answer to a spliced re-INVITE
+#if POCKETDIAL_TRUNK_INBOUND
+	if (_sipTrunk.handleAck(*data)) return;   // #398: the carrier ACKing our 200 (RFC 3261 s15)
+#endif
 	auto session = getSession(data->getCallID());
 	if (!session.has_value())
 	{
@@ -11847,6 +11874,9 @@ void RequestsHandler::releaseTrunkRelay(int slot)
 	_handsetRx[slot].setRawSink(nullptr, nullptr);
 	_trunkRx[slot].stop();
 	_handsetRx[slot].stop();
+#if POCKETDIAL_TRUNK_INBOUND
+	_trunkInbound[slot] = {};
+#endif
 }
 
 void RequestsHandler::refuseRingingTrunk(const std::string& callId, int carrierStatus)
@@ -11930,32 +11960,41 @@ bool RequestsHandler::isTrunkSbcSource(const sockaddr_in& src)
 
 void RequestsHandler::routeInboundTrunkCall(const std::shared_ptr<SipMessage>& data)
 {
+	// A retransmission of a call already taken. While it rings the server
+	// transaction answers it from our 100/180; once we have sent the 200 it is not
+	// absorbed (TransactionLayer: Accepted), and routing it again would answer the
+	// live call 482 (part C).
+	if (_sipTrunk.ownsCallID(data->getCallID())) return;
+
 	// The DID: the To user first, because a registered trunk (#399) is called at
 	// the Contact it registered, whose user is the trunk's own; then the
 	// Request-URI user, where an IP-authenticated trunk puts it.
 	std::string ext = _didMapping.extensionForDid(std::string(data->getToNumber()));
 	if (ext.empty()) ext = _didMapping.extensionForDid(std::string(data->getRequestUriUser()));
 
-	// 480 for a mapped extension that is not registered, and for now for a call
-	// that could be put through: the fork to the handset is #398 part C.
-	const char* status = "SIP/2.0 480 Temporarily Unavailable";
+	int status = 480;   // a mapped extension that is not registered
+	std::optional<std::shared_ptr<SipClient>> handset;
+	if (!ext.empty()) handset = findClient(ext);
 	if (ext.empty())
-		status = "SIP/2.0 404 Not Found";
-	else if (findClient(ext).has_value())
+		status = 404;
+	else if (handset.has_value())
 	{
 		if (findFreeTrunkRelay() < 0)
-			status = "SIP/2.0 486 Busy Here";
+			status = 486;
 		// The relay copies packets, so the carrier leg must be PCMU like the handset's.
 		else if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
-			status = "SIP/2.0 488 Not Acceptable Here";
+			status = 488;
+		else
+			status = forkInboundTrunkCall(data, handset.value());
 	}
+	if (status == 0) return;   // ringing
 
 	// Nothing is claimed, so a pool refusal leaves nothing behind. The §17.2
 	// server transaction keeps this answer, so a retransmitted INVITE is answered
 	// from it and never routed again.
 	auto response = getMessageFromPool(*data);
 	if (!response) return;   // pool exhausted: drop, the carrier retransmits (#101A)
-	response->setHeader(status);
+	response->setHeader("SIP/2.0 " + std::to_string(status) + " " + SipTrunk::reasonPhrase(status));
 	response->clearBody();
 	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	response->setTo(toWithTag(data->getTo()));   // RFC 3261 §8.2.6.2: the carrier ACKs this
@@ -11968,9 +12007,181 @@ void RequestsHandler::routeInboundTrunkCall(const std::shared_ptr<SipMessage>& d
 	{
 		_lastTrunkInboundLog = now;
 		queueLog("trunk: inbound call " + (ext.empty() ? std::string("to an unmapped DID") : "for ext " + ext) +
-			" answered " + std::string(std::string_view(status).substr(8)) +
-			" (further ones within 10 s not logged)", false);
+			" answered " + std::to_string(status) + " (further ones within 10 s not logged)", false);
 	}
+}
+
+bool RequestsHandler::isTrunkInbound(const Session& s) const
+{
+	const int slot = s.getTrunkRelaySlot();
+	return s.isTrunk() && slot >= 0 && slot < static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS) &&
+		_trunkInbound[slot].inbound;
+}
+
+int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<SipClient>& handset)
+{
+	// Where the carrier wants its audio. An INVITE without an offer would need
+	// its answer in our 200 and the carrier's in its ACK; not handled yet.
+	std::string carrierIp;
+	uint16_t    carrierPort = 0;
+	if (!parseCallerRtp(data, carrierIp, carrierPort)) return 488;
+	sockaddr_in carrierRtp{};
+	carrierRtp.sin_family = AF_INET;
+	carrierRtp.sin_addr.s_addr = inet_addr(carrierIp.c_str());
+	carrierRtp.sin_port = htons(carrierPort);
+
+	// The fork's own Call-ID, never the carrier's: SipTrunk owns that one, and a
+	// handset BYE on it would be taken for the carrier's (#386). A zeroed peer
+	// stands for the caller, as on an inbound anchor call.
+	const std::string callId = "Call-ID: " + IDGen::GenerateID(16) + "@" + _localIp;
+	const std::string caller = data->getFromNumber().empty() ? std::string("PSTN") : std::string(data->getFromNumber());
+	sockaddr_in nowhere{};
+	nowhere.sin_family = AF_INET;
+	auto pstn = allocateVirtualPeer(caller, nowhere);
+	auto session = pstn ? allocateSession(callId, pstn) : nullptr;
+	const int slot = findFreeTrunkRelay();
+	if (!session || slot < 0) return 503;
+
+	// Both halves at once: the carrier's address is known from its offer, and each
+	// bound port is what one side's SDP advertises.
+	_trunkRx[slot].setRawSink(&trunkRelayForward, &_handsetRx[slot]);
+	_handsetRx[slot].setRawSink(&trunkRelayForward, &_trunkRx[slot]);
+	if (!_trunkRx[slot].setRawPeer(carrierRtp) || !_trunkRx[slot].start(0, nullptr) ||
+		!_handsetRx[slot].start(0, nullptr))
+	{
+		releaseTrunkRelay(slot);
+		return 503;
+	}
+	if (const int refused = _sipTrunk.acceptCall(*data, callId, static_cast<uint16_t>(_trunkRx[slot].localPort())))
+	{
+		releaseTrunkRelay(slot);
+		return refused;
+	}
+	// The carrier's telephone-event number is offered to the handset too, so
+	// both legs number DTMF alike and the relay copies it unchanged.
+	const int dtmfPt = data->getTelephoneEventPayloadType();
+	_trunkInbound[slot] = { true, dtmfPt };
+	session->setDest(handset);
+	session->setTrunk(true);   // endCall() then ends the carrier leg and frees the relay
+	session->setTrunkRelaySlot(slot);
+	session->setState(Session::State::Invited);
+	session->setLocalTag(IDGen::GenerateID(9));
+	session->setUacBranch("z9hG4bK" + IDGen::GenerateID(12));
+	session->setEmergency(isEmergencyCallback(handset->getNumber()));   // #659: a PSAP calling back
+	_sessions.emplace(callId, session);
+	(void)_sipTrunk.respond(callId, 100);
+
+	// buildInboundInviteFork()'s INVITE with an offer, at the phone's registered
+	// Contact (#797). Its Via branch, From and To are the ones ackInboundFinal()
+	// and buildInboundCancelTo() use, so they still match this transaction.
+	const std::string srcIpPort = _localIp + ":" + std::to_string(_serverPort);
+	const std::string dn = handset->getNumber();
+	const std::string sdp = buildMediaSdp(_localIp, _handsetRx[slot].localPort(), /*sendrecv=*/true, dtmfPt);
+	std::ostringstream ss;
+	ss << "INVITE " << memberRequestUri(*handset) << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << session->getUacBranch() << "\r\n"
+	   << "From: \"" << caller << "\" <sip:" << dn << "@" << srcIpPort << ">;tag=" << session->getLocalTag() << "\r\n"
+	   << "To: <sip:" << dn << "@" << _localIp << ">\r\n"
+	   << "Call-ID: " << stripHeaderName(callId) << "\r\n"
+	   << "CSeq: 1 INVITE\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Contact: <sip:" << dn << "@" << srcIpPort << ";transport=UDP>\r\n"
+	   << "Content-Type: application/sdp\r\n"
+	   << "Content-Length: " << sdp.size() << "\r\n\r\n" << sdp;
+	auto invite = getMessageFromPool(ss.str(), handset->getAddress());
+	if (!invite)
+	{
+		// endCall() answers the carrier 480 (SipTrunk::hangup) and frees the relay.
+		endCall(callId, caller, dn, "message pool exhausted forking a carrier call");
+		return 0;
+	}
+	_outbox.emplace_back(handset->getAddress(), std::move(invite));
+	queueLog("trunk: inbound call ringing ext " + dn + " (relay pair " + std::to_string(slot) + ")");
+	return 0;
+}
+
+bool RequestsHandler::handleTrunkInboundReply(const std::shared_ptr<SipMessage>& data)
+{
+	const auto si = data->getStatusInfo();
+	if (!si.has_value() || data->getCSeqMethod() != SipMessageTypes::INVITE) return false;
+	const auto found = getSession(data->getCallID());
+	if (!found.has_value() || !isTrunkInbound(*found.value())) return false;
+	const std::shared_ptr<Session> s = found.value();
+	const std::string callId(s->getCallID());
+	const int status = static_cast<int>(si->code);
+	const int slot = s->getTrunkRelaySlot();
+
+	if (status < 200)
+	{
+		if (status == 180 || status == 183) (void)_sipTrunk.respond(callId, 180);
+		return true;
+	}
+	ackTrunkInboundFork(s, data);
+	if (s->getState() != Session::State::Invited) return true;   // a retransmitted final, ACKed again
+
+	const std::string caller = s->getSrc() ? s->getSrc()->getNumber() : std::string();
+	const std::string dn = s->getDest() ? s->getDest()->getNumber() : std::string();
+	if (status >= 300)
+	{
+		(void)_sipTrunk.respond(callId, (status == 486 || status == 600) ? 486 : 480);
+		endCall(callId, caller, dn, "the extension refused a carrier call (" + std::to_string(status) + ")");
+		return true;
+	}
+
+	// The handset answered: its RTP address completes the relay, and the carrier
+	// gets our 200 with the carrier-facing port, on the carrier's own numbering.
+	std::string ip;
+	uint16_t    port = 0;
+	bool relayable = data->hasSdp() &&
+		data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false) && parseCallerRtp(data, ip, port);
+	if (relayable)
+	{
+		sockaddr_in rtp{};
+		rtp.sin_family = AF_INET;
+		rtp.sin_addr.s_addr = inet_addr(ip.c_str());
+		rtp.sin_port = htons(port);
+		relayable = _handsetRx[slot].setRawPeer(rtp);
+	}
+	if (!relayable || !_sipTrunk.respond(callId, 200,
+		buildMediaSdp(_localIp, _trunkRx[slot].localPort(), /*sendrecv=*/true, _trunkInbound[slot].dtmfPt)))
+	{
+		// Decision 4: a leg the relay cannot carry is never connected to silence.
+		// Hang the handset up; the carrier gets 488, or 480 from endCall() when the
+		// 200 itself could not be drawn.
+		auto dest = s->getDest();
+		if (auto bye = dest ? buildServerBye(dn, dest->getAddress(), callId,
+			std::string(data->getFrom()), std::string(data->getTo())) : nullptr)
+		{
+			_outbox.emplace_back(dest->getAddress(), std::move(bye));
+		}
+		if (!relayable) (void)_sipTrunk.respond(callId, 488);
+		endCall(callId, caller, dn, "the extension's answer cannot be relayed");
+		return true;
+	}
+	s->setDialogHeaders(std::string(data->getFrom()), std::string(data->getTo()));
+	s->setState(Session::State::Connected);
+	queueLog("trunk: inbound call answered by ext " + dn + " (relay pair " + std::to_string(slot) + ")");
+	return true;
+}
+
+void RequestsHandler::ackTrunkInboundFork(const std::shared_ptr<Session>& s, const std::shared_ptr<SipMessage>& resp)
+{
+	const auto dest = s->getDest();
+	if (!dest) return;
+	const bool ok = resp->getStatusInfo()->code < 300;
+	const std::string target = ok ? std::string(siphdr::contactUriView(resp->getContact())) : std::string();
+	std::ostringstream ack;
+	ack << "ACK " << (target.empty() ? memberRequestUri(*dest) : target) << " SIP/2.0\r\n"
+	    << "Via: SIP/2.0/UDP " << _localIp << ":" << _serverPort << ";branch="
+	    << (ok ? "z9hG4bK" + IDGen::GenerateID(12) : s->getUacBranch()) << "\r\n"
+	    << "From: " << stripHeaderName(resp->getFrom()) << "\r\n"
+	    << "To: " << stripHeaderName(resp->getTo()) << "\r\n"
+	    << "Call-ID: " << stripHeaderName(s->getCallID()) << "\r\n"
+	    << "CSeq: 1 ACK\r\n"
+	    << "Max-Forwards: 70\r\n"
+	    << "Content-Length: 0\r\n\r\n";
+	if (auto msg = getMessageFromPool(ack.str(), dest->getAddress())) _outbox.emplace_back(dest->getAddress(), std::move(msg));
 }
 #endif
 
@@ -12301,6 +12512,21 @@ void RequestsHandler::onClientTransactionTimeout(std::string_view callId, std::s
 	// dialog through the same 408 path its 60 s deadline uses (onTrunkFailed
 	// refuses the handset and releases the relay), 28 s sooner than before.
 	if (cseqMethod == "INVITE" && _sipTrunk.handleInviteTimeout(callId)) return;
+
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: the extension never answered a carrier call's fork at all (the layer
+	// reports Timer B only before any provisional). endCall() answers the carrier
+	// 480 through SipTrunk::hangup() and frees the relay, 28 s before SipTrunk's
+	// own backstop would.
+	if (const auto s = cseqMethod == "INVITE" ? getSession(callId) : std::nullopt;
+		s.has_value() && isTrunkInbound(*s.value()) && s.value()->getState() == Session::State::Invited)
+	{
+		endCall(callId, s.value()->getSrc() ? s.value()->getSrc()->getNumber() : std::string(),
+			s.value()->getDest() ? s.value()->getDest()->getNumber() : std::string(),
+			"the extension never answered the fork (Timer B)");
+		return;
+	}
+#endif
 
 	// A BYE this PBX originated drew no final response (#808), so nothing will
 	// ever tell the session its far leg is gone. Only a session waiting on this

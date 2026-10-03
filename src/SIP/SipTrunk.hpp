@@ -289,6 +289,8 @@ public:
 		std::string inviteFrom, inviteTo;   // the INVITE's From and To lines, verbatim
 		std::string inviteVias;             // its Via lines, in order, each ending CRLF
 		std::string inviteRecordRoute;      // its Record-Route lines, likewise
+		// RFC 3261 s15: the carrier ACKed our 2xx, so a BYE may now be sent.
+		bool        ackSeen = false;
 #endif
 	};
 
@@ -354,6 +356,10 @@ public:
 	// with our tag (s8.2.6.2). A 18x or 2xx also echoes Record-Route and carries
 	// our Contact (s12.1.1); `sdp`, when given, is the body.
 	static std::string buildResponse(const Dialog& d, int status, std::string_view sdp = {});
+
+	// The reason phrase this trunk sends with `status` (#398 part C: the engine's
+	// own refusals of a carrier INVITE use it too).
+	static const char* reasonPhrase(int status);
 #endif
 
 	// ── Listener: how the engine learns a trunk dialog moved ─────────────────
@@ -478,6 +484,10 @@ public:
 	// (Confirmed), or a failure, which releases the slot. False when `callID`
 	// names no unanswered inbound dialog or the message pool is exhausted.
 	bool respond(std::string_view callID, int status, std::string_view sdp = {});
+
+	// The carrier's ACK for our 2xx on an inbound dialog: recorded as ackSeen and
+	// consumed. False for any other ACK. Matched on the trunk Call-ID and our To tag.
+	bool handleAck(const SipMessage& ack);
 #endif
 
 	// RFC 3261 §17.1.1.2 Timer B on our INVITE (#726): 64*T1 with no response

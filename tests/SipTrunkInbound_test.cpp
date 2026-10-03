@@ -592,3 +592,30 @@ TEST(SipTrunkInbound, TheSweepAnswersTheCarrierBeforeReleasing)
 	EXPECT_EQ(in.lis.events, std::vector<std::string>{"failed 408"});
 	EXPECT_EQ(in.trunk.activeDialogs(), 0u);
 }
+
+// #398 part C: RFC 3261 s15, the callee may not BYE before the ACK for its 2xx.
+TEST(SipTrunkInbound, TheCarriersAckForOurOkIsRecorded)
+{
+	Inbound in;
+	ASSERT_TRUE(in.trunk.respond(kFork, 200, "v=0\r\n"));
+	const std::string ok = in.env.sentRaw(0);
+	EXPECT_FALSE(in.dialog()->ackSeen);
+
+	auto ackWithTo = [](const std::string& toLine) {
+		return fromSbc(
+			"ACK sip:15551230000@192.168.1.10:5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKack1\r\n"
+			"From: \"Caller\" <sip:+12025550177@203.0.113.5>;tag=carrier-ftag\r\n"
+			"To: " + toLine + "\r\n"
+			"Call-ID: carrier-call-1@203.0.113.5\r\n"
+			"CSeq: 101 ACK\r\n"
+			"Content-Length: 0\r\n\r\n");
+	};
+	EXPECT_FALSE(in.trunk.handleAck(*ackWithTo("<sip:+12025550188@192.168.1.10>;tag=wrong")))
+		<< "an ACK that does not carry our To tag is not for our 2xx";
+	EXPECT_FALSE(in.dialog()->ackSeen);
+
+	EXPECT_TRUE(in.trunk.handleAck(*ackWithTo(lineStarting(ok, "To: ").substr(4))));
+	EXPECT_TRUE(in.dialog()->ackSeen) << "from here a BYE may go to the carrier (part D)";
+	EXPECT_TRUE(in.env.sent.size() == 1u) << "an ACK is never answered";
+}
