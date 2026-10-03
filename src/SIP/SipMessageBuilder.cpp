@@ -1,11 +1,91 @@
 #include "SipMessageBuilder.hpp"
 
 #include <cstdio>
+#include <cstring>
 
 #include "IDGen.hpp"
+#include "SipHeaderUtil.hpp"
 
 namespace sipb
 {
+
+namespace
+{
+
+// A Request-URI, host or Call-ID: printable ASCII with no space (RFC 3261 §25.1).
+bool isToken(std::string_view v)
+{
+	if (v.empty()) return false;
+	for (const char ch : v)
+	{
+		const unsigned char c = static_cast<unsigned char>(ch);
+		if (c <= ' ' || c >= 0x7f) return false;
+	}
+	return true;
+}
+
+// A From or To value: a quoted display name may carry SP, HTAB and UTF-8, but a
+// CR or LF would end the header and start one the phone never sent.
+bool isHeaderText(std::string_view v)
+{
+	if (v.empty()) return false;
+	for (const char ch : v)
+	{
+		const unsigned char c = static_cast<unsigned char>(ch);
+		if ((c < ' ' && c != '\t') || c == 0x7f) return false;
+	}
+	return true;
+}
+
+// Appends to a fixed buffer, keeping one byte for the NUL. No printf: the BYE is
+// also built on the 4 KB http_conn stack (/api/kill), and the stack gate charges
+// any *printf 2048 B there.
+struct Appender
+{
+	char* at;
+	size_t room;   // bytes left, the NUL's included
+	bool full;
+
+	void put(std::string_view s)
+	{
+		if (full || s.size() >= room)
+		{
+			full = true;
+			return;
+		}
+		std::memcpy(at, s.data(), s.size());
+		at += s.size();
+		room -= s.size();
+	}
+
+	void putUint(uint32_t v)
+	{
+		char digits[10];
+		size_t i = sizeof(digits);
+		do
+		{
+			digits[--i] = static_cast<char>('0' + v % 10);
+			v /= 10;
+		} while (v != 0);
+		put(std::string_view(digits + i, sizeof(digits) - i));
+	}
+
+	// IDGen, not a local PRNG: the branch is what tells a real response to this
+	// BYE from a forged one (#385).
+	void putRandom(size_t n)
+	{
+		if (full || n >= room)
+		{
+			full = true;
+			return;
+		}
+		IDGen::fill(at, n);
+		at += n;
+		room -= n;
+	}
+};
+
+} // namespace
 
 Err options(OptionsWire& out, const OptionsParams& params)
 {
@@ -28,7 +108,8 @@ Err options(OptionsWire& out, const OptionsParams& params)
 	char fromTagRand[10]{};
 
 	// IDGen, not a local PRNG: these are the identifiers that tell a real
-	// in-dialog message from a forged one (#385). Kept at the SSO-sized lengths.
+	// in-dialog message from a forged one (#385). The lengths are the ones the
+	// ping had before the builder (#463), so its bytes on the wire are unchanged.
 	IDGen::fill(callIdRand, 15);
 	IDGen::fill(branchRand, 12);
 	IDGen::fill(fromTagRand, 9);
@@ -83,22 +164,61 @@ Err options(OptionsWire& out, const OptionsParams& params)
 	return Err::Ok;
 }
 
-Err options(OptionsWire& out,
-            std::string_view targetAor,
-            std::string_view destIp,
-            uint16_t destPort,
-            std::string_view localIp,
-            uint16_t localPort,
-            std::string_view fromUser)
+Err bye(ByeWire& out, const ByeParams& params)
 {
-	OptionsParams p{};
-	p.targetAor = targetAor;
-	p.destIp = destIp;
-	p.destPort = destPort;
-	p.localIp = localIp;
-	p.localPort = localPort;
-	p.fromUser = fromUser;
-	return options(out, p);
+	out.len = 0;
+
+	// The same stripping main's buildServerBye() did, so a whole header line
+	// and a bare value give the same bytes; validated after it.
+	const std::string_view from = siphdr::stripHeaderNameView(params.from);
+	const std::string_view to = siphdr::stripHeaderNameView(params.to);
+	const std::string_view callId = siphdr::stripHeaderNameView(params.callId);
+	const bool composed = params.requestUri.empty();
+	const bool uriOk = composed ? isToken(params.targetUser) && isToken(params.destIp)
+	                            : isToken(params.requestUri);
+	if (!uriOk || !isToken(params.localIp) || !isToken(callId) ||
+	    !isHeaderText(from) || !isHeaderText(to))
+	{
+		return Err::BadField;
+	}
+
+	Appender w{out.bytes, sizeof(out.bytes), false};
+	w.put("BYE ");
+	if (composed)
+	{
+		w.put("sip:");
+		w.put(params.targetUser);
+		w.put("@");
+		w.put(params.destIp);
+		w.put(":");
+		w.putUint(params.destPort);
+	}
+	else
+	{
+		w.put(params.requestUri);
+	}
+	w.put(" SIP/2.0\r\nVia: SIP/2.0/UDP ");
+	w.put(params.localIp);
+	w.put(":");
+	w.putUint(params.localPort);
+	w.put(";branch=z9hG4bK");
+	w.putRandom(12);
+	w.put("\r\nFrom: ");
+	w.put(from);
+	w.put("\r\nTo: ");
+	w.put(to);
+	w.put("\r\nCall-ID: ");
+	w.put(callId);
+	w.put("\r\nCSeq: ");
+	w.putUint(params.cseq);
+	w.put(" BYE\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n");
+	if (w.full)
+	{
+		return Err::Truncated;
+	}
+	*w.at = '\0';
+	out.len = sizeof(out.bytes) - w.room;
+	return Err::Ok;
 }
 
 } // namespace sipb

@@ -1,0 +1,2 @@
+# #744 B2a sipb::bye(): SipMessageBuilder_test.cpp 7 + RegisteredContact_test.cpp 2
+9
