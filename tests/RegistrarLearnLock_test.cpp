@@ -329,30 +329,48 @@ TEST_F(LearnLockTest, AnOnLinkSourceThatNeverAnswersArpIsNeverAdmitted)
 	EXPECT_TRUE(device(hexOf(0x21))->locked);
 }
 
+namespace
+{
+	constexpr int kArpCap = static_cast<int>(RequestsHandler::kArpRequestsPerWindow);
+	constexpr int kForged = kArpCap + 4;
+}
+
 // #864 review (Stray): forged on-link sources cost at most kArpRequestsPerWindow
-// broadcasts per window however many there are, and a real phone still gets its
-// request once the window has passed.
+// broadcasts per window, however many there are.
 TEST_F(LearnLockTest, ArpRequestsForUnansweredRegistersAreCapped)
 {
 	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Learned, /*locked=*/true);
-	constexpr int kForged = 12;
 	for (int k = 0; k < kForged; ++k)
 	{
 		const std::string ip = "192.168.60." + std::to_string(100 + k);
 		ArpLookup::setMockOnLink(addrFor(ip), std::nullopt);
 		EXPECT_EQ(registerFrom("201", ip), "") << ip;
 	}
-	const int cap = static_cast<int>(RequestsHandler::kArpRequestsPerWindow);
-	EXPECT_EQ(ArpLookup::mockArpRequestCount(), cap) << "the cap holds across distinct sources";
-	EXPECT_EQ(_handler->getLearnArpRequestsLimited(), static_cast<uint32_t>(kForged - cap));
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), kArpCap) << "the cap holds across distinct sources";
+	EXPECT_EQ(_handler->getLearnArpRequestsLimited(), static_cast<uint32_t>(kForged - kArpCap));
+}
 
+// #864 review (Stray): the owner gets through a flood of 16+ forged sources in
+// one second because the cap's window resets: its Timer E copies (0.5, 1.5,
+// 3.5 s ...) find a fresh window once the flood thins. No owner lane: nothing
+// stored survives a reboot to recognise the owner's address by. The residual: a
+// flood sustained above the cap rate holds the owner back for as long as it lasts.
+TEST_F(LearnLockTest, TheOwnerGetsThroughOnceAFloodWindowPasses)
+{
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Learned, /*locked=*/true);
+	for (int k = 0; k < kForged; ++k)
+	{
+		const std::string ip = "192.168.60." + std::to_string(100 + k);
+		ArpLookup::setMockOnLink(addrFor(ip), std::nullopt);
+		registerFrom("201", ip);
+	}
 	ArpLookup::setMockOnLink(addrFor("192.168.60.21"), macOf(0x21));
 	EXPECT_EQ(registerFrom("201", "192.168.60.21"), "");
-	EXPECT_EQ(ArpLookup::mockArpRequestCount(), cap) << "inside the window the owner waits too";
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), kArpCap) << "inside the flood's window the owner waits too";
 
 	_handler->ageArpRequestsForTest(RequestsHandler::kArpRequestWindow);
 	EXPECT_EQ(retransmit(), "");
-	EXPECT_EQ(ArpLookup::mockArpRequestCount(), cap + 1) << "after the window the owner's copy is ARPed";
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), kArpCap + 1) << "in the next window the owner's copy is ARPed";
 	EXPECT_EQ(retransmit().substr(0, 11), "SIP/2.0 200") << "and its next copy is admitted";
 	EXPECT_EQ(boundAddress("201"), "192.168.60.21:5060");
 }

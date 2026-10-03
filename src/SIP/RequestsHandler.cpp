@@ -1291,16 +1291,21 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 
 bool RequestsHandler::allowArpRequest(uint32_t ip, std::chrono::steady_clock::time_point now)
 {
-	ArpRequestSlot* expired = nullptr;
+	ArpRequestSlot* oldest = &_arpRequestSlots[0];
 	for (auto& s : _arpRequestSlots)
 	{
-		const bool live = s.ip != 0 && now - s.at < kArpRequestWindow;
-		if (live && s.ip == ip) return false;   // asked within the window
-		if (!live && expired == nullptr) expired = &s;
+		if (s.ip != 0 && s.ip == ip && now - s.at < kArpRequestWindow) return false;   // asked within the window
+		if (s.at < oldest->at) oldest = &s;
 	}
-	if (expired == nullptr) return false;       // the window's requests are spent
-	expired->ip = ip;
-	expired->at = now;
+	if (now - _arpWindowStart >= kArpRequestWindow)
+	{
+		_arpWindowStart = now;
+		_arpWindowCount = 0;
+	}
+	if (_arpWindowCount >= kArpRequestsPerWindow) return false;   // this window's requests are spent
+	++_arpWindowCount;
+	oldest->ip = ip;
+	oldest->at = now;
 	return true;
 }
 
