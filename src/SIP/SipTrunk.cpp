@@ -276,6 +276,63 @@ namespace
 		out.sin_port = htons(static_cast<uint16_t>(port));
 		return true;
 	}
+
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: `a` equals the lowercase `lower`, ignoring case; never when empty.
+	bool sameLower(std::string_view a, std::string_view lower)
+	{
+		if (a.empty() || a.size() != lower.size()) return false;
+		for (size_t i = 0; i < a.size(); ++i)
+			if (std::tolower(static_cast<unsigned char>(a[i])) != lower[i]) return false;
+		return true;
+	}
+
+	// A sip: or sips: URI with something after the scheme (case-insensitive,
+	// RFC 3261 s19.1.4). Not "*", not tel:, not empty.
+	bool isSipUri(std::string_view uri)
+	{
+		const size_t colon = uri.find(':');
+		return colon != std::string_view::npos && colon + 1 < uri.size() &&
+			(sameLower(uri.substr(0, colon), "sip") || sameLower(uri.substr(0, colon), "sips"));
+	}
+
+	// Every header line of `m` named `name` or `compact`, verbatim and in
+	// order, each ending CRLF.
+	std::string headerLines(const SipMessage& m, std::string_view name, std::string_view compact)
+	{
+		std::string out;
+		const std::string raw = m.toString();
+		std::string_view rest = raw;
+		const size_t startLine = rest.find("\r\n");
+		rest = startLine == std::string_view::npos ? std::string_view{} : rest.substr(startLine + 2);
+		while (!rest.empty())
+		{
+			const size_t eol = rest.find("\r\n");
+			const std::string_view line = rest.substr(0, eol);
+			rest = eol == std::string_view::npos ? std::string_view{} : rest.substr(eol + 2);
+			if (line.empty()) break;   // end of the headers
+			const std::string_view n = trimWs(line.substr(0, line.find(':')));
+			if (sameLower(n, name) || sameLower(n, compact)) out.append(line).append("\r\n");
+		}
+		return out;
+	}
+
+	const char* reasonPhrase(int status)
+	{
+		switch (status)
+		{
+			case 100: return "Trying";
+			case 180: return "Ringing";
+			case 183: return "Session Progress";
+			case 200: return "OK";
+			case 480: return "Temporarily Unavailable";
+			case 486: return "Busy Here";
+			case 487: return "Request Terminated";
+			case 488: return "Not Acceptable Here";
+			default:  return status < 300 ? "OK" : "Call Failed";
+		}
+	}
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -380,8 +437,17 @@ std::string SipTrunk::buildBye(const Dialog& d, std::string_view freshBranch, st
 	ss << "BYE " << d.remoteTarget << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << d.localIpPort << ";branch=" << freshBranch << ";rport\r\n"
 	   << routeLine(d)   // #748: RFC 3261 s12.2.1.1
+#if POCKETDIAL_TRUNK_INBOUND
+	   // #398, s12.2.1.1 as the UAS: From is the INVITE's To URI with our tag
+	   // (toTag), To its From URI with the carrier's (fromTag).
+	   << "From: <" << (d.role == Role::Inbound ? contactUri(d.inviteTo) : "sip:" + d.fromUser + "@" + d.domain)
+	   << ">;tag=" << (d.role == Role::Inbound ? d.toTag : d.fromTag) << "\r\n"
+	   << "To: <" << (d.role == Role::Inbound ? contactUri(d.inviteFrom) : pstnUri(d.destE164, d.domain))
+	   << ">;tag=" << (d.role == Role::Inbound ? d.fromTag : d.toTag) << "\r\n"
+#else
 	   << "From: <sip:" << d.fromUser << "@" << d.domain << ">;tag=" << d.fromTag << "\r\n"
 	   << "To: <" << pstnUri(d.destE164, d.domain) << ">;tag=" << d.toTag << "\r\n"
+#endif
 	   << "Call-ID: " << d.callID << "\r\n"
 	   // A new request in the dialog takes the NEXT sequence number (§12.2.1.1).
 	   << "CSeq: " << (d.cseq + 1) << " BYE\r\n";
@@ -408,6 +474,52 @@ std::string SipTrunk::buildCancel(const Dialog& d)
 	ss << "Content-Length: 0\r\n\r\n";
 	return ss.str();
 }
+
+#if POCKETDIAL_TRUNK_INBOUND
+SipTrunk::Dialog SipTrunk::dialogFromInvite(const SipMessage& invite, std::string_view localTag,
+	std::string_view localIpPort, std::string_view localUser)
+{
+	Dialog d;
+	d.role         = Role::Inbound;
+	d.callID       = std::string(siphdr::stripHeaderNameView(invite.getCallID()));
+	d.fromTag      = siphdr::tagOf(invite.getFrom());
+	d.toTag.assign(localTag);
+	d.cseq         = 0;
+	d.remoteCseq   = cseqNumber(invite.getCSeq());
+	d.remoteTarget = contactUri(invite.getContact());
+	d.localIpPort.assign(localIpPort);
+	d.fromUser.assign(localUser);
+	d.inviteFrom.assign(invite.getFrom());
+	d.inviteTo.assign(invite.getTo());
+	d.inviteVias        = headerLines(invite, "via", "v");
+	// RFC 3261 s18.2.1, RFC 3581 s4: the top Via goes back with received, and
+	// a bare rport filled in.
+	if (const size_t top = d.inviteVias.find("\r\n"); top != std::string::npos)
+		d.inviteVias.replace(0, top, sipwire::viaWithReceived(std::string_view(d.inviteVias).substr(0, top),
+			invite.getSource()));
+	// s12.1.1: a Record-Route cut at the 64-line cap (#838) is a wrong route
+	// set; echoing none is safer, as the outbound 2xx path does.
+	if (!invite.headerLinesTruncated()) d.inviteRecordRoute = headerLines(invite, "record-route", "");
+	return d;
+}
+
+std::string SipTrunk::buildResponse(const Dialog& d, int status, std::string_view sdp)
+{
+	const bool dialogForming = status > 100 && status < 300;
+	std::ostringstream ss;
+	ss << "SIP/2.0 " << status << ' ' << reasonPhrase(status) << "\r\n" << d.inviteVias;
+	if (dialogForming) ss << d.inviteRecordRoute;
+	ss << d.inviteFrom << "\r\n"
+	   << d.inviteTo << ";tag=" << d.toTag << "\r\n"
+	   << "Call-ID: " << d.callID << "\r\n"
+	   << "CSeq: " << d.remoteCseq << " INVITE\r\n";
+	if (dialogForming) ss << "Contact: <sip:" << d.fromUser << "@" << d.localIpPort << ";transport=udp>\r\n";
+	if (status >= 200 && status < 300) ss << "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n";
+	if (!sdp.empty()) ss << "Content-Type: application/sdp\r\n";
+	ss << "Content-Length: " << sdp.size() << "\r\n\r\n" << sdp;
+	return ss.str();
+}
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Slot management
@@ -596,6 +708,60 @@ bool SipTrunk::placeCall(std::string_view e164, std::string_view handsetCallID,
 	return true;
 }
 
+#if POCKETDIAL_TRUNK_INBOUND
+int SipTrunk::acceptCall(const SipMessage& invite, std::string_view handsetCallID, uint16_t localRtpPort)
+{
+	if (!_cfg.valid()) return 503;
+	if (invite.getTo().find("tag=") != std::string_view::npos) return 481;
+	if (findMutableByTrunkCallID(invite.getCallID())) return 482;
+	Dialog* d = allocDialog();
+	if (!d)
+	{
+		_env.log("Trunk: inbound call refused, no free dialog slot", true);
+		return 486;
+	}
+	*d = dialogFromInvite(invite, IDGen::GenerateID(9),
+		_env.localIp() + ":" + std::to_string(_env.serverPort()), _cfg.fromUser);
+	if (d->fromTag.empty() || !isSipUri(d->remoteTarget))
+	{
+		*d = Dialog{};   // our BYE would carry no To tag, or go nowhere (s8.1.1.3, s8.1.1.8)
+		return 400;
+	}
+	if (invite.headerLinesTruncated())
+		_env.log("Trunk: inbound INVITE cut at 64 header lines; its Record-Route is not echoed", true);
+	d->state        = State::Trying;
+	d->handsetCallID.assign(handsetCallID);
+	d->localRtpPort = localRtpPort;
+	d->peer         = invite.getSource();
+	d->nextHop      = d->peer;
+	// A backstop only: sweep() answers the carrier 480 when it passes.
+	d->deadline     = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+	return 0;
+}
+
+bool SipTrunk::respond(std::string_view callID, int status, std::string_view sdp)
+{
+	Dialog* d = findMutableByCallID(callID);
+	if (!d || d->role != Role::Inbound || (d->state != State::Trying && d->state != State::Proceeding)) return false;
+	if (!respondTo(*d, status, sdp)) return false;
+	if (status >= 300) *d = Dialog{};   // no dialog; the carrier ACKs the failure in its own transaction
+	return true;
+}
+
+bool SipTrunk::respondTo(Dialog& d, int status, std::string_view sdp)
+{
+	// Drawn and enqueued for the same address, so the engine counts it as ours:
+	// a 2xx is retransmitted until the ACK, a failure until its ACK (s17.2.1).
+	auto msg = _env.messageFromPool(buildResponse(d, status, sdp), d.peer);
+	if (!msg) return false;
+	msg->syncContentLength();
+	_env.enqueue(d.peer, std::move(msg));
+	if (status >= 200 && status < 300) d.state = State::Confirmed;
+	else if (status > 100 && status < 200) d.state = State::Proceeding;
+	return true;
+}
+#endif
+
 bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 {
 	if (!data) return false;
@@ -644,6 +810,11 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 		}
 		return true;
 	}
+
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: an inbound dialog's only request of ours is the BYE.
+	if (d->role == Role::Inbound && d->state != State::Terminating) return true;
+#endif
 
 	// #581 review B1: once a challenge has been answered this dialog has two
 	// INVITE transactions. A response for the FIRST (challenged) one -- the
@@ -920,6 +1091,17 @@ bool SipTrunk::hangup(std::string_view callID)
 		return true;
 	}
 
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: a UAS never CANCELs (RFC 3261 s9.1); an unanswered INVITE from the
+	// carrier is ended with a final response instead.
+	if (d->role == Role::Inbound)
+	{
+		if (d->state != State::Terminating) respondTo(*d, 480);
+		*d = Dialog{};
+		return true;
+	}
+#endif
+
 	// The CANCEL is already out; the slot is held until the INVITE's final
 	// response (or the deadline) and must not be released by a second hangup.
 	if (d->state == State::Cancelling) return true;
@@ -1002,9 +1184,19 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 		uint32_t target = 0;
 		authorised = uriHostIpv4(d->remoteTarget, target) && target == src.sin_addr.s_addr;
 	}
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: on an inbound dialog the carrier's tag is fromTag and ours toTag.
+	const bool inbound = d->role == Role::Inbound;
+	const std::string& carrierTag = inbound ? d->fromTag : d->toTag;
+	const std::string& ourTag     = inbound ? d->toTag : d->fromTag;
+	if (!authorised && d->state == State::Confirmed && !carrierTag.empty()
+		&& siphdr::tagOf(data->getFrom()) == carrierTag
+		&& siphdr::tagOf(data->getTo()) == ourTag)
+#else
 	if (!authorised && d->state == State::Confirmed && !d->toTag.empty()
 		&& siphdr::tagOf(data->getFrom()) == d->toTag
 		&& siphdr::tagOf(data->getTo()) == d->fromTag)
+#endif
 	{
 		_env.log("Trunk: BYE from " + addrToIpPort(src) + " accepted on dialog tags -- not the carrier "
 			+ addrToIpPort(d->peer) + " or its Contact (" + d->destE164 + ")", true);
@@ -1044,6 +1236,10 @@ bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>& data)
 		ok->syncContentLength();
 		_env.enqueue(data->getSource(), std::move(ok));
 	}
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398, RFC 3261 s15.1.2: a BYE before our answer also ends the INVITE, 487.
+	if (inbound && (d->state == State::Trying || d->state == State::Proceeding)) respondTo(*d, 487);
+#endif
 
 	// Same move-then-free-then-notify order the failure path uses, and for the
 	// same reason: the listener tears the handset leg down and may place a new
@@ -1100,6 +1296,10 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 
 		_env.log("Trunk: dialog timed out in state "
 			+ std::to_string(static_cast<int>(d.state)) + " (" + d.destE164 + ")", true);
+#if POCKETDIAL_TRUNK_INBOUND
+		// #398: an unanswered carrier INVITE gets its final before the slot goes.
+		if (d.role == Role::Inbound && d.state != State::Terminating) respondTo(d, 480);
+#endif
 		releaseAsTimeout(d);
 	}
 }

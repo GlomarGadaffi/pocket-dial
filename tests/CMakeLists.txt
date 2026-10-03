@@ -334,6 +334,10 @@ add_executable(sip_parser_tests
     # stops a bad name re-queueing a ~21 s lookup per call attempt, and the
     # bounded-cache/in-flight state machine.
     TrunkResolver_test.cpp
+    # Issue #398 part A: SipTrunk as the UAS of a carrier's call -- the dialog
+    # from its INVITE, the 100/180/200 builders, the role-aware BYE, hangup and
+    # BYE tag rule -- and the outbound builders pinned byte for byte.
+    SipTrunkInbound_test.cpp
     PlayoutBuffer_test.cpp
     # Issue #466: clip placement policy, DmaFramePool's lock-free publish, the
     # PSRAM-preferring allocator behind PlayoutBuffer.
