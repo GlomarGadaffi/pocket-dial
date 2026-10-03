@@ -1743,8 +1743,8 @@ TEST(EmergencyRoute, AnUppercaseOrSipsSchemeIsReadAsSip)
 	}
 
 	// Control: an extension so written is still that extension. The relayed
-	// INVITE keeps the caller's Request-URI (a pass-through), so it is counted
-	// by method and address alone.
+	// INVITE keeps the caller's Request-URI (a pass-through, not 102's
+	// registered Contact), so it is matched on that, SIP:102@, at 102's address.
 	Bench b;
 	b.handler->setTrunkConfig(trunkConfig());
 	b.handler->handle(makeRegister("102", "192.168.79.12"));
