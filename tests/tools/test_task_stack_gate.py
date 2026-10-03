@@ -387,6 +387,60 @@ class Gate(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("ok   big: 1900 B", r.stdout)
 
+    # --- the local gate's relative labels (#457) ----------------------------------------
+    # ~/gate/env.sh exports CCACHE_BASEDIR, so ccache hands GCC a build-dir-relative path
+    # and every label of ours reads ../src/... or ../main/...; IDF and toolchain labels
+    # stay absolute. REAL_CI is two nodes verbatim from the e73c3b1 gate's
+    # RequestsHandler.cpp.ci.
+    REAL_CI = (
+        'node: { title: "../src/SIP/RequestsHandler.cpp:_ZN15RequestsHandler9TelCtlJobD2Ev" label: '
+        '"constexpr RequestsHandler::TelCtlJob::~TelCtlJob()\\n../src/SIP/RequestsHandler.hpp:1862:9\\n'
+        '32 bytes (static)" }\n'
+        'node: { title: "_ZN15RequestsHandler10postTelCtlEPNS_9TelCtlJobENS_7TelLaneE" label: '
+        '"bool RequestsHandler::postTelCtl(TelCtlJob*, TelLane)\\n../src/SIP/RequestsHandler.cpp:5054:6\\n'
+        '48 bytes (static)" }\n')
+
+    def test_relative_labels_from_the_local_gate_are_project_code(self):
+        for f in ("RequestsHandler.cpp", "RequestsHandler.hpp"):
+            open(os.path.join(self.tmp.name, "src", "SIP", f), "w").close()
+        self.put(os.path.join(self.ci, "x.ci"), CI.replace("@ROOT@/", "../") + self.REAL_CI)
+        rc, out = self.run_gate()
+        self.assertNotIn("FAIL project root", out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   big: 1900 B", out)
+        self.table["frame_ceiling_bytes"] = 800      # the ceiling caps project frames only
+        rc, out = self.run_gate()
+        self.assertIn("FAIL frame: 900 B > 800 B", out)
+
+    def test_which_locations_are_project_code(self):
+        root = self.tmp.name
+        open(os.path.join(root, "main", "esp_main_eth.cpp"), "w").close()
+        roots = g.project_roots(root)
+        cases = {
+            "../src/SIP/X.cpp:1:1": True,
+            "../main/esp_main_eth.cpp:3:5": True,
+            root + "/src/SIP/X.cpp:1:1": True,
+            "../src/SIP/Missing.cpp:1:1": False,       # not in this checkout: a wrong root
+            "../../other/src/SIP/X.cpp:1:1": False,    # outside the checkout
+            "esp-idf/main/generated.c:1:1": False,     # under build/, not src/ or main/
+            "/opt/esp/esp-idf/components/lwip/lwip/src/core/ipv4/etharp.c:12:1": False,
+            STL_VECTOR_H: False,
+        }
+        for loc, want in cases.items():
+            with self.subTest(loc):
+                self.assertEqual(g.is_project("f()\\n" + loc + "\\n8 bytes (static)", roots), want)
+
+    def test_relative_labels_under_a_wrong_root_still_fail_closed(self):
+        self.put(os.path.join(self.ci, "x.ci"), CI.replace("@ROOT@/", "../"))
+        p = os.path.join(self.tmp.name, "t.json")
+        json.dump(self.table, open(p, "w"))
+        with tempfile.TemporaryDirectory() as empty:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = g.run(self.ci, p, self.tmp.name, "main/esp_main_eth.cpp", project_root=empty)
+        self.assertEqual(rc, 1, out.getvalue())
+        self.assertIn("FAIL project root: no function with frame data is under", out.getvalue())
+
     # --- recursion (#457, desmo 2026-10-02) ---------------------------------------------
     # Any cycle reachable from a walked task fails unless recursion_allowlist names it with a
     # bound ("depth": at most that many live activations of each member) and a reason. The

@@ -58,8 +58,12 @@ that build then has its real frame; the prebuilt libc/libgcc ones still have
 none). Not build/: it also holds the bootloader's .ci files, which are not in
 the app image.
 
-Project code is what GCC compiled from <project-root>/src or
-<project-root>/main: it writes the absolute source path into every label.
+Project code is what GCC compiled from <project-root>/src, /main or
+/components. GCC writes each label's path as the compile line gave it:
+absolute in CI, but `../src/...` (relative to <project-root>/build) on the
+local gate, whose ccache rewrites paths under CCACHE_BASEDIR (~/gate/env.sh).
+A relative path counts only when the file exists in the checkout; an absolute
+one only under the root, so IDF's own components/ and src/ stay library.
 Everything else (IDF, the toolchain's libstdc++) is a library callee, so the
 frame ceiling is for ours only. The project root defaults to --src-root; pass
 --project-root when the .ci files came from another checkout. A graph with no
@@ -77,8 +81,10 @@ frameless node is still unknown, not zero.
 
 import argparse
 import collections
+import functools
 import json
 import os
+import posixpath
 import re
 import sys
 
@@ -106,18 +112,38 @@ def count_sites(src_root):
     return out
 
 
-def project_prefixes(root):
-    """Path prefixes of this repo's own sources: <root>/src/ and <root>/main/."""
-    roots = {os.path.abspath(root), os.path.realpath(root)}
-    return tuple(sorted(r.replace(os.sep, "/").rstrip("/") + "/" + d + "/"
-                        for r in roots for d in ("src", "main")))
+PROJECT_DIRS = ("src", "main", "components")
 
 
-def is_project(label, prefixes):
-    """True when a node's location line (GCC's absolute source path) is under a
-    project prefix. Edge-only nodes have no location and are never project."""
+def project_roots(root):
+    """The checkout's root as given and with links resolved, as POSIX paths."""
+    return tuple(sorted({posixpath.normpath(r.replace(os.sep, "/"))
+                         for r in (os.path.abspath(root), os.path.realpath(root))}))
+
+
+@functools.lru_cache(maxsize=None)
+def _is_file(path):
+    return os.path.isfile(path)
+
+
+def is_project(label, roots):
+    """True when a node's location is this repo's src/, main/ or components/.
+    GCC writes the path the compile line gave it: absolute in CI, relative to
+    the build directory (<root>/build) on the local gate (`../src/SIP/X.cpp`).
+    A relative one counts only when that file is in this checkout, so a wrong
+    root still fails closed; an absolute one only under the root, so IDF's own
+    components/ and src/ trees stay library. Edge-only nodes have no location
+    and are never project."""
     parts = re.split(r"\\+n", label)
-    return len(parts) > 1 and os.path.normpath(parts[1]).replace(os.sep, "/").startswith(prefixes)
+    if len(parts) < 2:
+        return False
+    path = re.sub(r"(:\d+)+$", "", parts[1].replace(os.sep, "/"))
+    for root in roots:
+        full = posixpath.normpath(path if posixpath.isabs(path) else posixpath.join(root, "build", path))
+        rel = posixpath.relpath(full, root)
+        if rel.split("/")[0] in PROJECT_DIRS and (posixpath.isabs(path) or _is_file(full)):
+            return True
+    return False
 
 
 ALIAS_RE = re.compile(r"([CD])1E")   # Itanium C1/D1 right before the nested name's end
@@ -210,10 +236,10 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     allow = table.get("frame_allowlist", {})
     tasks = table["tasks"]
     nodes, edges, frames = load_graph(ci_dir)
-    prefixes = project_prefixes(project_root or src_root)
+    roots = project_roots(project_root or src_root)
 
     def ours(label):
-        return is_project(label, prefixes)
+        return is_project(label, roots)
 
     for vs in list(edges.values()):
         for w in vs:
@@ -252,7 +278,8 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
         rc = 1
         root = os.path.abspath(project_root or src_root).replace(os.sep, "/")
         print(f"FAIL project root: no function with frame data is under {root}/src/ or {root}/main/ "
-              f"(--project-root: the checkout the .ci files were compiled from)")
+              f"(absolute, or relative to {root}/build; --project-root: the checkout the .ci "
+              f"files were compiled from)")
 
     want = collections.Counter(t["file"] for t in tasks)
     have = count_sites(src_root)
