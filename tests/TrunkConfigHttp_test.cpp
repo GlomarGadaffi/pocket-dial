@@ -18,6 +18,7 @@
 #include "HttpServer.hpp"
 #include "AdminAuth.hpp"
 #include "TrunkConfigStore.hpp"
+#include "ResetGuard.hpp"     // #450: a reset leaves the guard up on host
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -164,6 +165,7 @@ namespace
 			_server.reset();
 			AdminAuth::clearCredential();
 			TrunkConfigStore::resetForTest();
+			resetguard::resetForTest();   // the host reset door leaves the guard up (no restart)
 		}
 
 		int _port = 0;
