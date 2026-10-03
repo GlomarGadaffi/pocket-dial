@@ -22,6 +22,12 @@
 // running. Erasures are deliberately NOT gated: removing data during a reset
 // is the point.
 //
+// #450: the SD CDR and voicemail archives' drains check inProgress() too, so
+// no CDR line or recording reaches the card after the reset's SD wipe. They need
+// no WriteScope: each wipe takes the lock its drain runs under, which already
+// orders them. Other SD writes are not gated: a voicemail-index tombstone and an
+// admin's hold-music upload, neither of them PII.
+//
 // There is no end(): the reset always restarts the board, and a fresh boot
 // starts with the flag clear.
 

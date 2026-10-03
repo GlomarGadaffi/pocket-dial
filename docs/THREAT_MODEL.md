@@ -250,15 +250,22 @@ Two boot-time behaviours interact with this:
   than spinning forever. So on those builds a never-claimed board is not a working PBX, 
   it is a dashboard waiting to be claimed, which bounds what an attacker gains by winning
   the race.
-  **But the gate is effectively first-boot-only.** It is skipped whenever the NVS
-  `provisioned` flag is set, and that flag is written once, on the first successful
-  claim, and is **not** cleared by `POST /api/factory-reset`, neither
-  `AdminAuth::clearCredential()` nor `DeviceConfig::clearAll()` touches it. So an
-  HTTP factory reset on a wifi/eth/lan8720 board leaves it back on `admin`/`admin`
-  **with the SIP stack running**, i.e. in the `display` build's posture, not a virgin
-  board's. Only a full NVS erase re-arms the gate, which is what the DTMF `999` factory
-  reset does (`nvs_flash_erase()`), and what reflashing does. Treat "I factory-reset it"
-  as "the credential is back to the default", not "the board is dark again".
+  **The gate is re-armed only by a reset that completes.** It is skipped whenever the
+  NVS `provisioned` flag (namespace `storage`) is set, and that flag is written once, on
+  the first successful claim. Neither `AdminAuth::clearCredential()` nor
+  `DeviceConfig::clearAll()` touches it, but since #456 both reset doors (`POST
+  /api/factory-reset` and the DTMF `999`) end with `nvs_flash_erase()` of the whole NVS
+  partition, which takes it with everything else; so does reflashing. If that erase
+  fails, the reset journal says so on the next boot (`/api/status` `resetIncomplete`)
+  and the board comes back on `admin`/`admin` **with the SIP stack running**, the
+  `display` build's posture: run the reset again.
+  **Flash-dump recovery after a reset (#450).** `nvs_erase_key()` only marks an entry
+  erased, so its bytes stay readable in a flash dump until page GC;
+  `nvs_flash_erase()` erases every sector of the partition, so a completed reset leaves
+  none of the old NVS to dump. Outside NVS, both doors erase the coredump partition and
+  wipe the SD CDR and voicemail archives, and no CDR line or recording is written to the card after that
+  wipe. The `cfgseed` partition is kept by design: a reset returns the board to how it
+  was flashed, so re-flash the seed to forget what it carries.
 - **The `display` build is deliberately NOT held dark** ("up usable, secure later"): the
   touchscreen onboarding assumes a person standing in front of the device, so SIP comes up
   regardless. On that build the claim race is the only control.

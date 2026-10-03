@@ -24,6 +24,7 @@
 
 #include <gtest/gtest.h>
 #include "AdminAuth.hpp"
+#include "CdrArchive.hpp"
 #include "CoreDumpStore.hpp"
 #include "EmailConfigStore.hpp"
 #include "FactoryReset.hpp"
@@ -203,6 +204,7 @@ namespace
 			_server.reset();
 			_handler.reset();
 			clearEverything();
+			resetguard::resetForTest();   // the host door leaves the guard up (no restart)
 			std::remove(_tapiPath.c_str());
 			std::remove(_didPath.c_str());
 		}
@@ -462,6 +464,28 @@ TEST_F(FactoryResetSecretsTest, TheSdVoicemailArchiveIsWiped)
 
 	EXPECT_EQ(spy.wipes, 1) << "the HTTP factory reset must wipe the SD voicemail archive";
 	_handler->setVoicemailSinkForTest(nullptr);
+}
+
+TEST_F(FactoryResetSecretsTest, TheSdCdrArchiveIsWiped)
+{
+	// #450: the HTTP door wipes the SD CDR archive, as the keypad door does
+	// (DtmfFactoryReset.ConfirmedResetWipesSdArchive pins that side).
+	struct CdrWipeSpy : cdrarchive::Sink
+	{
+		int wipes = 0;
+		void append(const cdrarchive::QueuedLine&) override {}
+		void wipe() override { ++wipes; }
+	} spy;
+	struct Restore
+	{
+		cdrarchive::Sink* prev;
+		~Restore() { cdrarchive::setSinkForTest(prev); }
+	} restore{cdrarchive::setSinkForTest(&spy)};   // also on a failed ASSERT
+	const AdminSession s = bypassLogin();
+
+	ASSERT_EQ(statusOf(httpPost(_port, "/api/factory-reset", "confirm=ERASE", s.cookie, s.csrf)), 200);
+
+	EXPECT_EQ(spy.wipes, 1) << "the HTTP factory reset must wipe the SD CDR archive";
 }
 
 TEST_F(FactoryResetSecretsTest, StatusReportsWhetherE911IsConfiguredAndNothingIsGated)

@@ -230,7 +230,9 @@ void record(const CallDetailRecord& rec, std::string_view callId, std::string_vi
 // written out after the wipe -- and does so under the same lock the writer
 // task's drain loop holds, so "drain everything pending" and "clear + wipe"
 // are mutually exclusive as whole operations, not just individually
-// thread-safe (see CdrArchive.cpp's drainWipeMutex()).
+// thread-safe (see CdrArchive.cpp's drainWipeMutex()). A line queued AFTER the
+// wipe is not written either: drainAll() writes nothing once a factory reset
+// has raised resetguard (#450), and both reset doors raise it before wiping.
 void wipeAll();
 
 // Test-only seam: installs `sink` as the active Sink (nullptr restores the

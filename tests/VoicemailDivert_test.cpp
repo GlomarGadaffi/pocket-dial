@@ -13,6 +13,7 @@
 
 #include "RequestsHandler.hpp"
 #include "VoicemailArchive.hpp"
+#include "ResetGuard.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -572,6 +573,72 @@ TEST(VoicemailDivert, RecordedAudioReachesTheFlushQueueAfterBye)
 	EXPECT_STREQ(sink.calls[0].rec.callId, ("Call-ID: " + callId).c_str());
 	EXPECT_EQ(sink.calls[0].rec.length, 6u);
 	EXPECT_EQ(sink.calls[0].mulaw, std::vector<uint8_t>({10, 20, 30, 40, 50, 60}));
+}
+
+// #450: both reset doors raise resetguard, then wipe the SD voicemail archive,
+// and the board runs on until its restart: at least a second, and the whole of
+// a 911 call that holds it (#652). A message finished in that window must not
+// be written to the card after the wipe, and its staging slot must still come
+// free, so a held restart does not cost the board its voicemail legs.
+TEST(VoicemailDivert, AMessageLeftAfterAFactoryResetWipeNeverReachesTheCard)
+{
+	struct ClearGuard { ~ClearGuard() { resetguard::resetForTest(); } } clearGuard;   // also on a failed ASSERT
+	FakeSink sink;
+	SentList sent;
+	RequestsHandler handler("192.168.44.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.setVoicemailSinkForTest(&sink);
+
+	handler.handle(makeRegister("621", "192.168.44.11", "reg-621"));
+	handler.handle(makeRegister("622", "192.168.44.12", "reg-622"));
+	handler.handle(makeRegister("631", "192.168.44.21", "reg-631"));
+	handler.handle(makeRegister("632", "192.168.44.22", "reg-632"));
+	handler.handle(makeRegister("633", "192.168.44.23", "reg-633"));   // forceDisconnect releases 631/632's registrations
+	handler.handle(makeRegister("634", "192.168.44.24", "reg-634"));
+	handler.setVoicemail("621", true);
+	handler.setVoicemail("622", true);
+
+	// Two deposits in progress, one on each voicemail leg.
+	handler.handle(makeInvite("631", "621", "192.168.44.21", "vm-rst-1", "z9hG4bKvmrst1"));
+	handler.handle(makeBusy("631", "621", "192.168.44.11", "vm-rst-1", "z9hG4bKvmrst1"));
+	handler.handle(makeInvite("632", "622", "192.168.44.22", "vm-rst-2", "z9hG4bKvmrst2"));
+	handler.handle(makeBusy("632", "622", "192.168.44.12", "vm-rst-2", "z9hG4bKvmrst2"));
+	auto s1 = handler.getSession("Call-ID: vm-rst-1");
+	auto s2 = handler.getSession("Call-ID: vm-rst-2");
+	ASSERT_TRUE(s1.has_value() && s2.has_value());
+	const int slot1 = s1.value()->getVoicemailLegSlot();
+	const int slot2 = s2.value()->getVoicemailLegSlot();
+	ASSERT_GE(slot1, 0);
+	ASSERT_GE(slot2, 0);
+
+	resetguard::begin();          // what both doors do first ...
+	handler.wipeAllVoicemail();   // ... then the SD voicemail wipe
+	ASSERT_EQ(sink.wipes, 1);
+
+	const uint8_t frame[] = {1, 2, 3, 4};
+	ASSERT_TRUE(handler.feedVoicemailAudioForTest(slot1, frame, sizeof(frame)));
+	ASSERT_TRUE(handler.feedVoicemailAudioForTest(slot2, frame, sizeof(frame)));
+	handler.forceDisconnect("631");
+	handler.forceDisconnect("632");
+	ASSERT_EQ(handler.voicemailFlushQueueDepthForTest(), 2u) << "precondition: both messages were queued";
+
+	handler.drainVoicemailFlush(sink);
+	EXPECT_TRUE(sink.calls.empty()) << "a voicemail reached the card after the factory-reset wipe";
+	EXPECT_EQ(handler.voicemailFlushQueueDepthForTest(), 0u);
+
+	// Both staging slots are free again: two new deposits are both answered.
+	sent.clear();
+	handler.handle(makeInvite("633", "621", "192.168.44.23", "vm-rst-3", "z9hG4bKvmrst3"));
+	handler.handle(makeBusy("633", "621", "192.168.44.11", "vm-rst-3", "z9hG4bKvmrst3"));
+	handler.handle(makeInvite("634", "622", "192.168.44.24", "vm-rst-4", "z9hG4bKvmrst4"));
+	handler.handle(makeBusy("634", "622", "192.168.44.12", "vm-rst-4", "z9hG4bKvmrst4"));
+	EXPECT_NE(findSentTo(sent, addrFor("192.168.44.23"), "SIP/2.0 200 OK").find("v=0"), std::string::npos)
+		<< "a dropped message left its staging slot busy";
+	EXPECT_NE(findSentTo(sent, addrFor("192.168.44.24"), "SIP/2.0 200 OK").find("v=0"), std::string::npos)
+		<< "a dropped message left its staging slot busy";
+	handler.setVoicemailSinkForTest(nullptr);
 }
 
 // A caller who hangs up without saying anything must not produce a flushed
