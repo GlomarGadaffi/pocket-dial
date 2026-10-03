@@ -674,6 +674,11 @@ jobs:
           . $IDF_PATH/export.sh > /dev/null
           python3 tools/ci/app_slot_margin.py build
 
+      # Issue #384 (H1): the bench probe image (docs/BENCH_PROBE.md) must cost a
+      # release build nothing: no probe tag or route in the image, option off.
+      - name: No bench probe in the image (#384)
+        run: python3 tools/ci/check_no_bench_probe.py build
+
       - name: Upload ESP32-S3 Ethernet Firmware Bundle
         if: matrix.target-chip == 'esp32s3' && matrix.sip-transport == 'eth'
         uses: actions/upload-artifact@v4

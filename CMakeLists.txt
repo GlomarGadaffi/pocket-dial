@@ -3,7 +3,13 @@ cmake_minimum_required (VERSION 3.16)
 # Issue #411: decide the firmware version once, for every build flavour. See
 # cmake/FirmwareVersion.cmake for why ESP-IDF's own fallback always said "1".
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/FirmwareVersion.cmake)
-pocketdial_firmware_version(POCKETDIAL_RESOLVED_FW_VERSION)
+# Issue #384 (H1): the bench probe image (main/CMakeLists.txt) stamps -probe, so
+# no check that wants this checkout's release stamp can ever accept it.
+if(POCKETDIAL_ANCHOR_BENCH_PROBE)
+    pocketdial_firmware_version(POCKETDIAL_RESOLVED_FW_VERSION "-probe")
+else()
+    pocketdial_firmware_version(POCKETDIAL_RESOLVED_FW_VERSION)
+endif()
 
 if(DEFINED ENV{IDF_PATH})
     # Must be set BEFORE project(): that is where ESP-IDF reads PROJECT_VER into

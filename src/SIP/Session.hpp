@@ -9,6 +9,9 @@
 
 class SipMessage;
 #include "SipClient.hpp"
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+#include "BenchProbe.hpp"   // #384 H1: setEmergency() shuts the bench probe's gate
+#endif
 
 class Session
 {
@@ -131,7 +134,15 @@ public:
 	// a caller who cannot speak on a phone with silence suppression sends no
 	// RTP, and hanging up on them is the one failure this PBX must not have.
 	bool isEmergency() const { return _isEmergency; }
-	void setEmergency(bool val) { _isEmergency = val; }
+	void setEmergency(bool val)
+	{
+		_isEmergency = val;
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+		// #384 H1 (rule 5): one hook for every caller (911/933 route, PSAP callbacks):
+		// the bench probe disarms and drops its ballast the moment a session is flagged.
+		if (val) pd::benchprobe::onEmergency();
+#endif
+	}
 
 	// Issue #604: RTP inactivity watch. `legA`/`legB` are the received-packet
 	// counters of the call's two relayed legs (pass one counter twice for a
