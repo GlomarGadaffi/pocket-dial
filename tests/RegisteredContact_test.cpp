@@ -19,6 +19,7 @@
 #include "IDGen.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
+#include "SipHeaderUtil.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -311,6 +312,8 @@ TEST(RegisteredContact, AQuotedSipInstanceDoesNotHideTheRegisteredContactUri)
 		ASSERT_FALSE(ping.empty());
 		EXPECT_EQ(requestLineOf(ping), std::string("OPTIONS ") + kSnomContactUri + " SIP/2.0");
 	}
+	// An open quote with no <...> at all names no URI, as before.
+	EXPECT_TRUE(siphdr::contactUriView("Contact: \"Lobby sip:100@192.168.31.10:1037").empty());
 }
 
 TEST(RegisteredContact, AnUppercaseSchemeContactIsKept)
