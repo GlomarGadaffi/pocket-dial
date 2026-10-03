@@ -216,12 +216,14 @@ public:
 	// buffer (#463). Not reachable with a real AOR and IPv4 address; counted so
 	// a clipped request can never go out silently.
 	uint32_t getOptionsPingTruncated() const { return _optionsPingTruncated.load(std::memory_order_relaxed); }
-	// #864: ARP requests for unanswered Learn REGISTERs (AuthDecision::Drop). A
-	// source is asked at most once per kArpRequestWindow, and at most
-	// kArpRequestsPerWindow are sent per window in all, so a flood of forged
-	// on-link sources costs at most that many broadcasts. The count is of
-	// requests held back by either limit.
-	static constexpr size_t kArpRequestsPerWindow = 4;
+	// #864: ARP requests for unanswered Learn REGISTERs (AuthDecision::Drop). One
+	// of the last kArpRequestSources sources is asked again only after
+	// kArpRequestWindow, and at most kArpRequestsPerWindow go out per window in
+	// all. Hygiene, not a security boundary: a request makes no table entry, a
+	// forged source never replies, and an on-link attacker can ARP-spoof anyway.
+	// The count is of requests held back by either limit.
+	static constexpr size_t kArpRequestsPerWindow = 16;
+	static constexpr size_t kArpRequestSources = 4;
 	static constexpr std::chrono::milliseconds kArpRequestWindow{1000};
 	uint32_t getLearnArpRequestsLimited() const { return _learnArpRequestsLimited.load(std::memory_order_relaxed); }
 	size_t getClientCount();
@@ -822,6 +824,7 @@ public:
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		for (auto& s : _arpRequestSlots) s.at -= d;
+		_arpWindowStart -= d;
 	}
 	// Test-only (#550): bind a client WITHOUT onRegister's identity guard, so a
 	// test can stand up the state the guard now forbids (a client named like an
@@ -2409,17 +2412,20 @@ private:
 	// #864: the source of a REGISTER onRegister() dropped (AuthDecision::Drop),
 	// which handle() ARPs once _mutex is released. Guarded by _mutex.
 	sockaddr_in _rxArpRequest{};
-	// #864: the last kArpRequestsPerWindow ARP requests (see
-	// getLearnArpRequestsLimited()). Guarded by _mutex; fixed, no allocation.
+	// #864: the sources of the last kArpRequestSources ARP requests, and this
+	// window's count (see getLearnArpRequestsLimited()). Guarded by _mutex;
+	// fixed, no allocation.
 	struct ArpRequestSlot
 	{
 		uint32_t ip = 0;
 		std::chrono::steady_clock::time_point at{};
 	};
-	std::array<ArpRequestSlot, kArpRequestsPerWindow> _arpRequestSlots{};
+	std::array<ArpRequestSlot, kArpRequestSources> _arpRequestSlots{};
+	std::chrono::steady_clock::time_point _arpWindowStart{};
+	size_t _arpWindowCount = 0;
 	std::atomic<uint32_t> _learnArpRequestsLimited{0};
-	// Records and allows an ARP request for `ip` unless one went to it, or
-	// kArpRequestsPerWindow went out in all, within the last kArpRequestWindow.
+	// Records and allows an ARP request for `ip` unless a recorded one went to it
+	// within kArpRequestWindow, or this window's kArpRequestsPerWindow are spent.
 	bool allowArpRequest(uint32_t ip, std::chrono::steady_clock::time_point now);
 
 	// The end of every handle()/tick() pass, in two halves around the lock:
