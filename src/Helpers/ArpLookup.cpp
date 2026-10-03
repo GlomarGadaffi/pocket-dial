@@ -134,8 +134,8 @@ namespace ArpLookup
 
 		struct ArpRequest
 		{
-			ip4_addr_t ip;
-			bool sent;
+			ip4_addr_t ip{};
+			bool sent = false;
 		};
 
 		// On lwIP's tcpip thread (esp_netif_tcpip_exec): core locking is off on
