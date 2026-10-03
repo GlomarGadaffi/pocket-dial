@@ -372,6 +372,28 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("ok   small: 564 B", out)      # 200 + 300 + 64
 
+    def test_checked_in_runtime_hook_rows_claim_only_their_own_names(self):
+        # The checked-in rows for errno's TLS init hook and the IDF __cxa_guard_* functions,
+        # each labelled with a use site of ours as on the real .ci. The guard is charged.
+        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        self.table["library_defaults"] = table["library_defaults"]
+        self.table["tasks"][0]["bytes"] = 4096
+        for name, label in (("_ZTH5errno", "void _ZTH5errno()"),
+                            ("__cxa_guard_acquire", "int __cxa_guard_acquire(long long int*)")):
+            self.add_ci(bare(name, label, "@ROOT@/src/SIP/X.cpp:12:3") + edge("leaf", name))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("FAIL frame", out)
+        self.assertIn("ok   small: 1876 B", out)     # 200 + 300 + the guard's 1376
+        self.add_ci(bare("__cxa_guard_foo_project", "int __cxa_guard_foo_project(long long int*)",
+                         "@ROOT@/src/SIP/X.cpp:13:3") + edge("leaf", "__cxa_guard_foo_project"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("project function with no frame data (partial --ci-dir?): int __cxa_guard_foo_project", out)
+        for row in ("^void _ZTH5errno\\(\\)$", "^int __cxa_guard_acquire\\(long long int\\*\\)$",
+                    "^void __cxa_guard_(release|abort)\\(long long int\\*\\)$"):
+            self.assertTrue(table["_library_defaults_reasons"].get(row, "").strip(), row + " states no reason")
+
     def test_a_graph_compiled_elsewhere_fails_closed_until_given_its_project_root(self):
         # .ci files built in another checkout: nothing in them is under --src-root. Reading
         # that as "no project code, so nothing to cap" would pass any frame.
