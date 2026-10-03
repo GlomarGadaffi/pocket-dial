@@ -1,2 +1,2 @@
-# SipMessageBuilder track B1 (options ping): 4 tests
-4
+# SipMessageBuilder track B1 (options ping): 6 tests
+6

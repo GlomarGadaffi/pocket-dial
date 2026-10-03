@@ -10119,9 +10119,17 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	const unsigned destPort = ntohs(client->getAddress().sin_port);
 	const std::string& num = client->getNumber();
 
+	sipb::OptionsParams p{};
+	p.targetAor = num;
+	p.destIp = destIp;
+	p.destPort = static_cast<uint16_t>(destPort);
+	p.localIp = _localIp;
+	p.localPort = static_cast<uint16_t>(_serverPort);
+	p.fromUser = pbx::kServiceServer;
+	p.requestUri = client->getContactUri();
+
 	sipb::Wire wire{};
-	const sipb::Err err = sipb::options(
-		wire, num, destIp, destPort, _localIp, _serverPort, pbx::kServiceServer);
+	const sipb::Err err = sipb::options(wire, p);
 
 	if (err != sipb::Err::Ok)
 	{

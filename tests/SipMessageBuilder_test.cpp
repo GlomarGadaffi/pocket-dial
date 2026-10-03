@@ -169,3 +169,39 @@ TEST(SipMessageBuilder, OptionsIdsComeFromIdGen)
 	EXPECT_NE(raw.find(";branch=z9hG4bK111111111111\r\n"), std::string_view::npos) << raw;
 	EXPECT_NE(raw.find(";tag=111111111\r\n"), std::string_view::npos) << raw;
 }
+
+// #797: the Request-URI is the Contact the phone registered, parameters and
+// all; To stays the composed AOR.
+TEST(SipMessageBuilder, OptionsRequestUriIsTheRegisteredContactVerbatim)
+{
+	sipb::Wire wire{};
+	sipb::OptionsParams params{};
+	params.targetAor = "100";
+	params.destIp = "192.168.31.10";
+	params.destPort = 1037;
+	params.localIp = "192.168.1.1";
+	params.localPort = 5060;
+	params.requestUri = "sip:100@192.168.31.10:1037;line=h2k6k1ih";
+
+	ASSERT_EQ(sipb::options(wire, params), sipb::Err::Ok);
+	const std::string_view raw(wire.bytes, wire.len);
+	EXPECT_TRUE(startsWith(raw, "OPTIONS sip:100@192.168.31.10:1037;line=h2k6k1ih SIP/2.0\r\n")) << raw;
+	EXPECT_EQ(headerValue(raw, "To"), "<sip:100@192.168.31.10:1037>");
+}
+
+// #797: with no registered Contact the Request-URI is composed from the
+// observed address, byte for byte what the pre-builder ping sent.
+TEST(SipMessageBuilder, OptionsRequestUriFallsBackToTheObservedAddress)
+{
+	sipb::Wire wire{};
+	sipb::OptionsParams params{};
+	params.targetAor = "100";
+	params.destIp = "192.168.31.10";
+	params.destPort = 1037;
+	params.localIp = "192.168.1.1";
+	params.localPort = 5060;
+
+	ASSERT_EQ(sipb::options(wire, params), sipb::Err::Ok);
+	const std::string_view raw(wire.bytes, wire.len);
+	EXPECT_TRUE(startsWith(raw, "OPTIONS sip:100@192.168.31.10:1037 SIP/2.0\r\n")) << raw;
+}

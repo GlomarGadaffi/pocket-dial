@@ -31,6 +31,21 @@ Err options(Wire& out, const OptionsParams& params)
 	const int localIpLen = static_cast<int>(params.localIp.size());
 	const int fromUserLen = static_cast<int>(params.fromUser.size());
 
+	// "sip:" + a 64-char AOR + "@" + dotted quad + ":" + port fits in 96.
+	char fallbackUri[96]{};
+	std::string_view requestUri = params.requestUri;
+	if (requestUri.empty())
+	{
+		const int u = std::snprintf(fallbackUri, sizeof(fallbackUri), "sip:%.*s@%.*s:%u",
+			targetLen, params.targetAor.data(), destIpLen, params.destIp.data(), params.destPort);
+		if (u <= 0 || static_cast<size_t>(u) >= sizeof(fallbackUri))
+		{
+			return Err::Truncated;
+		}
+		requestUri = std::string_view(fallbackUri, static_cast<size_t>(u));
+	}
+	const int requestUriLen = static_cast<int>(requestUri.size());
+
 	// Cap options ping at kMaxOptionsBytes (640 B, #463): worst-case valid ping
 	// is ~450 B, so anything larger is rejected and counted before transmission.
 	constexpr size_t kMaxOptionsCap = kMaxOptionsBytes < sizeof(out.bytes)
@@ -38,7 +53,7 @@ Err options(Wire& out, const OptionsParams& params)
 		: sizeof(out.bytes);
 
 	const int n = std::snprintf(out.bytes, kMaxOptionsCap,
-		"OPTIONS sip:%.*s@%.*s:%u SIP/2.0\r\n"
+		"OPTIONS %.*s SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP %.*s:%u;branch=z9hG4bK%s\r\n"
 		"To: <sip:%.*s@%.*s:%u>\r\n"
 		"From: <sip:%.*s@%.*s:%u>;tag=%s\r\n"
@@ -47,7 +62,7 @@ Err options(Wire& out, const OptionsParams& params)
 		"Max-Forwards: 70\r\n"
 		"User-Agent: pocket-dial\r\n"
 		"Content-Length: 0\r\n\r\n",
-		targetLen, params.targetAor.data(), destIpLen, params.destIp.data(), params.destPort,
+		requestUriLen, requestUri.data(),
 		localIpLen, params.localIp.data(), params.localPort, branchRand,
 		targetLen, params.targetAor.data(), destIpLen, params.destIp.data(), params.destPort,
 		fromUserLen, params.fromUser.data(), localIpLen, params.localIp.data(), params.localPort, fromTagRand,

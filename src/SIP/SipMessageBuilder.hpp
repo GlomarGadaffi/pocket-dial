@@ -36,6 +36,9 @@ struct OptionsParams
 	std::string_view localIp{};
 	uint16_t localPort{5060};
 	std::string_view fromUser{"server"};
+	// Request-URI as registered (#797: a Snom answers 404 without its ;line=).
+	// Empty composes sip:<targetAor>@<destIp>:<destPort>.
+	std::string_view requestUri{};
 };
 
 // Builds a well-formed RFC 3261 OPTIONS keepalive ping into `out`.
