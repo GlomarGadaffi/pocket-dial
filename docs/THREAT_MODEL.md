@@ -263,7 +263,7 @@ Two boot-time behaviours interact with this:
   erased, so its bytes stay readable in a flash dump until page GC;
   `nvs_flash_erase()` erases every sector of the partition, so a completed reset leaves
   none of the old NVS to dump. Outside NVS, both doors erase the coredump partition and
-  wipe the SD CDR and voicemail archives, and nothing is written to the card after that
+  wipe the SD CDR and voicemail archives, and no CDR line or recording is written to the card after that
   wipe. The `cfgseed` partition is kept by design: a reset returns the board to how it
   was flashed, so re-flash the seed to forget what it carries.
 - **The `display` build is deliberately NOT held dark** ("up usable, secure later"): the
