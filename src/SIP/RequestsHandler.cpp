@@ -6512,7 +6512,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			else if (refused)
 			{
 				// No BYE goes out whose answer would end the session, so it ends here
-				// (logged by buildServerBye).
+				// (counted and logged by buildServerBye).
 				setCallDisposition(data->getCallID(), Session::Disposition::Bye);
 				endCall(data->getCallID(), src->getNumber(), dest->getNumber(), "BYE to the far leg not sent (#744)");
 			}
@@ -11381,11 +11381,12 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 	sipb::Err err = sipb::Err::Ok;
 	auto bye = byeFromPool(p, destAddr, err);
 	if (refused) *refused = err != sipb::Err::Ok;
-	if (err != sipb::Err::Ok)
+	// Counted, and logged the first time, as the OPTIONS ping is (#463). The log
+	// tells the two apart because the fixes differ: a dialog too long for the
+	// cap, or a field that is empty or carries a control byte. A refused pool
+	// draw is counted and logged by the pool.
+	if (err != sipb::Err::Ok && _byeTruncated.fetch_add(1, std::memory_order_relaxed) == 0)
 	{
-		// Told apart because the fixes differ: a dialog too long for the cap, or
-		// a field that is empty or carries a control byte. A refused pool draw is
-		// logged by the pool.
 		queueLog("BYE to " + destExt + (err == sipb::Err::Truncated
 			? " not sent: longer than sipb::kMaxByeBytes (#744)"
 			: " not sent: a field is empty or carries a control byte (#744)"), true);
