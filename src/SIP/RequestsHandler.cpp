@@ -5027,6 +5027,9 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 void RequestsHandler::startTelCtl()
 {
 	static constexpr const char* kName[kTelLanes] = { "tel_ctl", "tel_drop", "tel_sos" };
+	// One name per worker: /api/status finds each stack watermark by name.
+	static constexpr const char* kCtlName[] = { "tel_ctl0", "tel_ctl1" };
+	static_assert(kTelCtlWorkers <= 2, "name every tel_ctl worker");
 	for (const TelLane l : kTelLaneOrder)
 	{
 		TelCtlQueue& lane = _telCtl[l];
@@ -5039,7 +5042,8 @@ void RequestsHandler::startTelCtl()
 			// 12288: makeCall is a TLS HTTPS round trip (4096 bootlooped, see
 			// tel_start). PSRAM is safe: TLS I/O only, and endCall()'s CDR write
 			// is handed to the cdr_persist task (PsramTask.hpp, #273).
-			if (pd::createTaskPreferPsram(&RequestsHandler::telCtlTask, kName[l], 12288, &lane, 5, nullptr) == pdPASS) ++up;
+			const char* name = l == kLaneCtl ? kCtlName[i] : kName[l];
+			if (pd::createTaskPreferPsram(&RequestsHandler::telCtlTask, name, 12288, &lane, 5, nullptr) == pdPASS) ++up;
 		}
 		if (up == 0)
 		{
