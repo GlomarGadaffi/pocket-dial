@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "AllocCounter.hpp"
+#include "ArpLookup.hpp"
 #include "HttpServer.hpp"
 #include "PsramAllocator.hpp"   // #479: psram::dynamicTaskCreates()
 #include "RequestsHandler.hpp"
@@ -174,6 +175,27 @@ TEST(HttpStatusAlloc, TheHandlerBugCountersAreOnStatusAndPacketsDroppedIsTheirSu
 	EXPECT_NE(resp.find("\"packetsDropped\":1,"), std::string::npos) << resp;
 	EXPECT_NE(resp.find("\"droppedInvalid\":1,"), std::string::npos) << resp;
 	EXPECT_EQ(b.handler->getPacketsDropped(), b.handler->getDroppedInvalid() + b.handler->getDroppedRate());
+}
+
+TEST(HttpStatusAlloc, LearnArpRequestsLimitedIsOnStatus)
+{
+	// #864 review (Stray): the ARP requests held back for unanswered Learn
+	// REGISTERs are visible on a board. Two copies of a REGISTER for a locked
+	// extension from an on-link source that never answers ARP: the second
+	// copy's request is held back.
+	struct ClearMocks { ~ClearMocks() { ArpLookup::clearMockMacs(); } } clearMocks;
+	StatusBench b;
+	EXPECT_NE(b.serve(false).find("\"learnArpRequestsLimited\":0,"), std::string::npos);
+	b.handler->setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+	b.handler->adoptDeviceForTest("020000000021", "201", Registrar::DeviceState::Learned, /*locked=*/true);
+	sockaddr_in src{};
+	src.sin_family = AF_INET;
+	inet_pton(AF_INET, "10.0.0.50", &src.sin_addr);
+	ArpLookup::setMockOnLink(src, std::nullopt);
+	b.handler->handle(makeRegister("201"));
+	b.handler->handle(makeRegister("201"));
+	const std::string resp = b.serve(false);
+	EXPECT_NE(resp.find("\"learnArpRequestsLimited\":1,"), std::string::npos) << resp;
 }
 
 #endif
