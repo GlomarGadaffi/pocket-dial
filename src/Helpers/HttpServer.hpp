@@ -524,6 +524,10 @@ private:
 	void sendApiOtaStatus(int sock);
 	// Reboots into a staged image (device) or simulates it (host).
 	void sendApiOtaReboot(int sock, const std::string& body);
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1: GET/POST /api/bench/fault, the bench probe image only (docs/BENCH_PROBE.md).
+	void sendApiBenchFault(int sock, const HttpRequest& req);
+#endif
 
 	// Streaming helper for the OTA upload: drains exactly `contentLength` bytes
 	// from `sock`, feeding `chunkSink(ptr, len)` for each chunk. `prefix`/

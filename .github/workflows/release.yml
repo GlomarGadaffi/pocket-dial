@@ -94,6 +94,10 @@ jobs:
           idf.py -D SIP_TRANSPORT=${{ matrix.sip-transport }} build
           echo "Built ${{ matrix.target-chip }} (transport: ${{ matrix.sip-transport }})"
 
+      # Issue #384 (H1): a release never carries the bench probe (docs/BENCH_PROBE.md).
+      - name: No bench probe in the image (#384)
+        run: python3 tools/ci/check_no_bench_probe.py build
+
       - name: Stage Firmware Artifacts
         run: |
           TAG="${{ matrix.target-chip }}-${{ matrix.sip-transport }}"
