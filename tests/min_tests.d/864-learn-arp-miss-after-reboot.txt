@@ -1,2 +1,2 @@
-# RegistrarLearnLock_test.cpp: 5 (a locked phone's ARP miss after a reboot, #864)
-5
+# RegistrarLearnLock_test.cpp: 7, HttpStatusAlloc_test.cpp: 1 (a locked phone's ARP miss after a reboot, and the ARP request limits, #864)
+8

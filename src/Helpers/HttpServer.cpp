@@ -2112,6 +2112,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json.s("\"trunkRefusedDialogByes\":").n(handler ? handler->getTrunkRefusedDialogByes() : 0).s(",");
 	// #741: 911/933 calls ended after 4 h with both legs silent.
 	json.s("\"emergencyRtpReaps\":").n(handler ? handler->getEmergencyRtpReaps() : 0).s(",");
+	// #864: ARP requests held back for unanswered Learn REGISTERs.
+	json.s("\"learnArpRequestsLimited\":").n(handler ? handler->getLearnArpRequestsLimited() : 0).s(",");
 	// #450 / poll #454: false after a factory reset until the E911 notify list is
 	// set again. The dashboard shows a banner; nothing is gated on it.
 	json.s("\"e911Configured\":").b(e911Configured).s(",");

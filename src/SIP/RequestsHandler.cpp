@@ -1285,8 +1285,23 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 
 	// Issue #24: logs are printed and the UDP sendto runs outside the lock.
 	flushPass(_rxOutboxScratch, _rxLogScratch);
-	// #864: the next retransmission asks again if this one fails.
+	// #864: if this one fails, a retransmission after kArpRequestWindow asks again.
 	if (arpRequest.sin_family == AF_INET) (void)ArpLookup::pdSendArpRequest(arpRequest);
+}
+
+bool RequestsHandler::allowArpRequest(uint32_t ip, std::chrono::steady_clock::time_point now)
+{
+	ArpRequestSlot* expired = nullptr;
+	for (auto& s : _arpRequestSlots)
+	{
+		const bool live = s.ip != 0 && now - s.at < kArpRequestWindow;
+		if (live && s.ip == ip) return false;   // asked within the window
+		if (!live && expired == nullptr) expired = &s;
+	}
+	if (expired == nullptr) return false;       // the window's requests are spent
+	expired->ip = ip;
+	expired->at = now;
+	return true;
 }
 
 void RequestsHandler::drainPassLocked(
@@ -1471,8 +1486,12 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		}
 		if (decision == Registrar::AuthDecision::Drop)
 		{
-			// #864: no response; handle() ARPs the source after the pass.
-			_rxArpRequest = data->getSource();
+			// #864: no response; handle() ARPs the source after the pass, within
+			// the limits allowArpRequest() keeps.
+			if (allowArpRequest(data->getSource().sin_addr.s_addr, std::chrono::steady_clock::now()))
+				_rxArpRequest = data->getSource();
+			else
+				_learnArpRequestsLimited.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
 		if (decision == Registrar::AuthDecision::Reject)

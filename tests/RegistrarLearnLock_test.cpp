@@ -318,10 +318,60 @@ TEST_F(LearnLockTest, AnOnLinkSourceThatNeverAnswersArpIsNeverAdmitted)
 	EXPECT_EQ(registerFrom("201", "192.168.60.77", 0), "");
 	for (int i = 0; i < 10; ++i)   // Timer E's copies until Timer F (RFC 3261 §17.1.2.2)
 		EXPECT_EQ(retransmit(), "") << "retransmission " << i;
-	EXPECT_EQ(ArpLookup::mockArpRequestCount(), 11) << "each copy is ARPed again";
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), 1) << "a source is ARPed at most once per window";
+	EXPECT_EQ(_handler->getLearnArpRequestsLimited(), 10u);
+
+	_handler->ageArpRequestsForTest(RequestsHandler::kArpRequestWindow);
+	EXPECT_EQ(retransmit(), "");
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), 2) << "a copy after the window is ARPed again";
 	EXPECT_EQ(boundAddress("201"), "192.168.60.21:5060") << "an unanswered expires=0 unregistered the owner";
 	ASSERT_NE(device(hexOf(0x21)), nullptr);
 	EXPECT_TRUE(device(hexOf(0x21))->locked);
+}
+
+// #864 review (Stray): forged on-link sources cost at most kArpRequestsPerWindow
+// broadcasts per window however many there are, and a real phone still gets its
+// request once the window has passed.
+TEST_F(LearnLockTest, ArpRequestsForUnansweredRegistersAreCapped)
+{
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Learned, /*locked=*/true);
+	constexpr int kForged = 12;
+	for (int k = 0; k < kForged; ++k)
+	{
+		const std::string ip = "192.168.60." + std::to_string(100 + k);
+		ArpLookup::setMockOnLink(addrFor(ip), std::nullopt);
+		EXPECT_EQ(registerFrom("201", ip), "") << ip;
+	}
+	const int cap = static_cast<int>(RequestsHandler::kArpRequestsPerWindow);
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), cap) << "the cap holds across distinct sources";
+	EXPECT_EQ(_handler->getLearnArpRequestsLimited(), static_cast<uint32_t>(kForged - cap));
+
+	ArpLookup::setMockOnLink(addrFor("192.168.60.21"), macOf(0x21));
+	EXPECT_EQ(registerFrom("201", "192.168.60.21"), "");
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), cap) << "inside the window the owner waits too";
+
+	_handler->ageArpRequestsForTest(RequestsHandler::kArpRequestWindow);
+	EXPECT_EQ(retransmit(), "");
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), cap + 1) << "after the window the owner's copy is ARPed";
+	EXPECT_EQ(retransmit().substr(0, 11), "SIP/2.0 200") << "and its next copy is admitted";
+	EXPECT_EQ(boundAddress("201"), "192.168.60.21:5060");
+}
+
+// #864 review (Stray): nothing on the REGISTER path remembers a request it did
+// not answer. REGISTER gets no server transaction (TransactionLayer::classify()
+// keeps them for INVITE, BYE, CANCEL, REFER and UPDATE only) and onRegister()
+// keeps no branch or Call-ID+CSeq cache, so every copy is processed fresh.
+TEST_F(LearnLockTest, TheSameRegisterIsProcessedFreshOnceTheTableIsWarm)
+{
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Learned, /*locked=*/true);
+	ArpLookup::setMockOnLink(addrFor("192.168.60.21"), macOf(0x21));
+	ASSERT_EQ(registerFrom("201", "192.168.60.21"), "") << "dropped; its ARP reply warms the table";
+	const std::string first = _lastRaw;
+
+	EXPECT_EQ(retransmit().substr(0, 11), "SIP/2.0 200") << "the same Call-ID, CSeq and branch, admitted";
+	EXPECT_EQ(retransmit().substr(0, 11), "SIP/2.0 200") << "and a later copy is not swallowed either";
+	EXPECT_EQ(_lastRaw, first);
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), 1);
 }
 
 // #507 on the same miss: a Secured extension is digest-checked before anything
