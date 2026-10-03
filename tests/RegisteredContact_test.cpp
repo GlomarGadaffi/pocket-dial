@@ -541,3 +541,34 @@ TEST(ByeLocalAnswer, ARefusedPoolDrawCommitsNothingAndTheRetransmitSucceeds)
 	EXPECT_EQ(countSentTo(sent, yealink, "CSeq: 7 BYE"), 1);
 	EXPECT_EQ(countSentTo(sent, snom, "BYE "), 1);
 }
+
+// #744 B2a: unlike a refused pool draw (#715, above), a BYE sipb::bye() refuses is
+// refused again on every retransmit, so it must not keep the sender unanswered.
+// Here the sender's own From, which the far leg's BYE carries, is too long for
+// sipb::kMaxByeBytes.
+TEST(ByeLocalAnswer, AByeTheBuilderRefusesStillAnswersTheSenderAndEndsTheSession)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const std::string callId = connectCall(handler, sent, "bye744-long");
+	const sockaddr_in yealink = addrFor(kYealinkIp, 5062);
+	const sockaddr_in snom = addrFor(kSnomIp, 1037);
+
+	const std::string raw =
+		"BYE sip:100@" + std::string(kPbxIp) + ":5060;transport=UDP SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kYealinkIp) + ":5062;branch=z9hG4bKbye" + callId + "\r\n"
+		"From: \"" + std::string(700, 'x') + "\" <sip:106@server>;tag=ans106\r\n"
+		"To: <sip:100@server>;tag=ft" + callId + "\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 7 BYE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Content-Length: 0\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(raw, yealink));
+
+	const std::string ok = findSentTo(sent, yealink, "CSeq: 7 BYE");
+	EXPECT_EQ(ok.rfind("SIP/2.0 200", 0), 0u) << "the sender's BYE is answered 200: " << requestLineOf(ok);
+	EXPECT_EQ(countSentTo(sent, snom, "BYE "), 0) << "nothing partial goes to the far leg";
+	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value())
+		<< "no BYE is out whose answer would end the session, so it ends here";
+}

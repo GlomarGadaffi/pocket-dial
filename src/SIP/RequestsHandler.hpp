@@ -2078,9 +2078,13 @@ private:
 	static constexpr size_t kSpliceTxns = 8;
 	std::array<SpliceTxn, kSpliceTxns> _spliceTxns{};
 
+	// nullptr when the pool or the builder refuses. `refused` is set for the
+	// builder's refusal (#744: a field it will not send), which, unlike a pool
+	// draw, fails the same way on every retransmit.
 	std::shared_ptr<SipMessage> buildServerBye(const std::string& destExt,
 		const sockaddr_in& destAddr, const std::string& callId,
-		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2);
+		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2,
+		bool* refused = nullptr);
 
 	// Issue #402: record a request's CSeq on its dialog's session, if it has one
 	// and `source` is a party on it. Returns the session found (or nullptr).
