@@ -111,11 +111,77 @@ namespace ArpLookup
 		return std::nullopt;   // cache miss → caller defers/retries (do NOT block)
 	}
 
+	namespace
+	{
+		// pdLookupMac()'s interfaces, in its order.
+		constexpr const char* kIfkeys[] = {"WIFI_AP_DEF", "WIFI_STA_DEF", "ETH_DEF"};
+
+		struct netif* netifOf(const char* ifkey)
+		{
+			esp_netif_t* netif = esp_netif_get_handle_from_ifkey(ifkey);
+			return (netif == nullptr) ? nullptr : static_cast<struct netif*>(esp_netif_get_netif_impl(netif));
+		}
+
+		// A unicast host on `n`'s subnet: an ARP request on `n` can reach it.
+		bool onLinkOf(const struct netif* n, const ip4_addr_t& ip)
+		{
+			return n != nullptr && netif_is_up(n) && netif_is_link_up(n) &&
+				(n->flags & NETIF_FLAG_ETHARP) != 0 &&
+				!ip4_addr_isany_val(*netif_ip4_addr(n)) &&
+				ip4_addr_net_eq(&ip, netif_ip4_addr(n), netif_ip4_netmask(n)) &&
+				!ip4_addr_isbroadcast(&ip, n);
+		}
+
+		struct ArpRequest
+		{
+			ip4_addr_t ip{};
+			bool sent = false;
+		};
+
+		// On lwIP's tcpip thread (esp_netif_tcpip_exec): core locking is off on
+		// these builds, so etharp_request() cannot run on the caller's task.
+		// etharp_request(), not etharp_query(): a host that never answers takes no
+		// table slot.
+		esp_err_t sendArpRequestInTcpip(void* arg)
+		{
+			auto* req = static_cast<ArpRequest*>(arg);
+			for (const char* key : kIfkeys)
+			{
+				struct netif* n = netifOf(key);
+				if (onLinkOf(n, req->ip) && etharp_request(n, &req->ip) == ERR_OK) req->sent = true;
+			}
+			return ESP_OK;
+		}
+	}
+
+	bool pdIsOnLink(const struct sockaddr_in& src)
+	{
+		if (src.sin_family != AF_INET) return false;
+		ip4_addr_t ip;
+		ip.addr = src.sin_addr.s_addr;
+		for (const char* key : kIfkeys)
+		{
+			if (onLinkOf(netifOf(key), ip)) return true;
+		}
+		return false;
+	}
+
+	bool pdSendArpRequest(const struct sockaddr_in& src)
+	{
+		if (src.sin_family != AF_INET) return false;
+		ArpRequest req{};
+		req.ip.addr = src.sin_addr.s_addr;
+		return esp_netif_tcpip_exec(&sendArpRequestInTcpip, &req) == ESP_OK && req.sent;
+	}
+
 #else  // ── Host stub: no ARP table on the desktop/CI build ──────────────────
 
 	namespace
 	{
 		std::map<uint32_t, Mac> s_mockArpTable;
+		// #864: hosts on this subnet, each with what it answers to an ARP request.
+		std::map<uint32_t, std::optional<Mac>> s_mockOnLink;
+		int s_mockArpRequests = 0;
 	}
 
 	std::optional<Mac> pdLookupMac(const struct sockaddr_in& src)
@@ -135,14 +201,40 @@ namespace ArpLookup
 		return std::nullopt;
 	}
 
+	bool pdIsOnLink(const struct sockaddr_in& src)
+	{
+		return src.sin_family == AF_INET && s_mockOnLink.count(src.sin_addr.s_addr) != 0;
+	}
+
+	bool pdSendArpRequest(const struct sockaddr_in& src)
+	{
+		if (!pdIsOnLink(src)) return false;
+		++s_mockArpRequests;
+		const std::optional<Mac>& reply = s_mockOnLink[src.sin_addr.s_addr];
+		if (reply.has_value()) s_mockArpTable[src.sin_addr.s_addr] = *reply;   // the reply lands
+		return true;
+	}
+
 	void setMockMac(const struct sockaddr_in& src, const Mac& mac)
 	{
 		s_mockArpTable[src.sin_addr.s_addr] = mac;
 	}
 
+	void setMockOnLink(const struct sockaddr_in& src, std::optional<Mac> reply)
+	{
+		s_mockOnLink[src.sin_addr.s_addr] = reply;
+	}
+
+	int mockArpRequestCount()
+	{
+		return s_mockArpRequests;
+	}
+
 	void clearMockMacs()
 	{
 		s_mockArpTable.clear();
+		s_mockOnLink.clear();
+		s_mockArpRequests = 0;
 	}
 
 #endif

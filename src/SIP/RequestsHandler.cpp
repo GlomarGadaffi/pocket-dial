@@ -944,6 +944,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		}
 	}
 
+	sockaddr_in arpRequest{};
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 
@@ -1278,10 +1279,34 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		drainPassLocked(_rxOutboxScratch, _rxLogScratch);
 		_passThroughMsg = nullptr;
 		_noReplyInbound.reset();
+		arpRequest = _rxArpRequest;
+		_rxArpRequest = sockaddr_in{};
 	}
 
 	// Issue #24: logs are printed and the UDP sendto runs outside the lock.
 	flushPass(_rxOutboxScratch, _rxLogScratch);
+	// #864: if this one fails, a retransmission after kArpRequestWindow asks again.
+	if (arpRequest.sin_family == AF_INET) (void)ArpLookup::pdSendArpRequest(arpRequest);
+}
+
+bool RequestsHandler::allowArpRequest(uint32_t ip, std::chrono::steady_clock::time_point now)
+{
+	ArpRequestSlot* oldest = &_arpRequestSlots[0];
+	for (auto& s : _arpRequestSlots)
+	{
+		if (s.ip != 0 && s.ip == ip && now - s.at < kArpRequestWindow) return false;   // asked within the window
+		if (s.at < oldest->at) oldest = &s;
+	}
+	if (now - _arpWindowStart >= kArpRequestWindow)
+	{
+		_arpWindowStart = now;
+		_arpWindowCount = 0;
+	}
+	if (_arpWindowCount >= kArpRequestsPerWindow) return false;   // this window's requests are spent
+	++_arpWindowCount;
+	oldest->ip = ip;
+	oldest->at = now;
+	return true;
 }
 
 void RequestsHandler::drainPassLocked(
@@ -1462,6 +1487,16 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		{
 			// The registrar already enqueued the 401 (or a 503 + Retry-After: #515's
 			// adoption limit, #440's ARP miss on a locked extension).
+			return;
+		}
+		if (decision == Registrar::AuthDecision::Drop)
+		{
+			// #864: no response; handle() ARPs the source after the pass, within
+			// the limits allowArpRequest() keeps.
+			if (allowArpRequest(data->getSource().sin_addr.s_addr, std::chrono::steady_clock::now()))
+				_rxArpRequest = data->getSource();
+			else
+				_learnArpRequestsLimited.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
 		if (decision == Registrar::AuthDecision::Reject)
