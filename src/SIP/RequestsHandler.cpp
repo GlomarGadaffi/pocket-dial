@@ -1326,7 +1326,8 @@ namespace
 	{
 		std::string_view v = siphdr::stripHeaderNameView(contactLine);
 		if (v.empty() || v.front() == '*') return {};
-		const size_t lt = v.find('<');
+		bool open = false;
+		const size_t lt = siphdr::nameAddrOpen(v, open);   // #835: the <...> contactUriView() stores
 		if (lt != std::string_view::npos)
 		{
 			const size_t gt = v.find('>', lt);
@@ -1336,7 +1337,7 @@ namespace
 		// addr-spec form: "sip:ext@host:port;expires=N" -- the ';' params are the header's.
 		const size_t end = v.find_first_of(";, 	");
 		std::string_view uri = v.substr(0, end);
-		if (uri.size() < 4 || uri.substr(0, 4) != "sip:") return {};
+		if (!siphdr::hasSipScheme(uri)) return {};
 		return "<" + std::string(uri) + ">";
 	}
 }

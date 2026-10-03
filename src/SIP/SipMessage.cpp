@@ -5,6 +5,7 @@
 #include <cctype>
 #include "SipMessageTypes.h"
 #include "EmergencyCall.hpp"   // #199: urn:service:sos, isEmergencyRequest(); #760: tel:911, urn:service:test.sos
+#include "SipHeaderUtil.hpp"   // #835: siphdr::nameAddrOpen(), shared with contactUriView()
 #include <cstring>
 #include <cctype>
 #include <cstdint>
@@ -1406,45 +1407,25 @@ std::string_view SipMessage::getEvent() const
 namespace
 {
 	// #760 review: the URI a To/From/Contact line or a request line carries,
-	// and nothing around it. A name-addr's URI is inside <...>; a '<' within
-	// the quoted display name does not count (RFC 3261 s25.1 quoted-string,
-	// \-escapes included). Without brackets it is the bare URI: a request
-	// line's Request-URI, the token after the method, or a header's value up
-	// to its first ';' (RFC 3261 s20.10). #832 review: a quote left open (an
-	// unescaped '"' in the name, "Lobby 55" TV") falls back to the last <...>
-	// on the line, where a name-addr's URI sits; empty when there is none.
+	// and nothing around it. A name-addr's URI is inside <...>, the one
+	// siphdr::nameAddrOpen() picks (#824, #832, #835: quoted display names and
+	// parameters, and a quote left open). Without brackets it is the bare URI:
+	// a request line's Request-URI, the token after the method, or a header's
+	// value up to its first ';' (RFC 3261 s20.10). A quote left open with no
+	// '<' gives empty.
 	std::string_view uriPartOf(std::string_view line)
 	{
-		auto bracketed = [line](size_t lt) {
+		bool open = false;
+		const size_t lt = siphdr::nameAddrOpen(line, open);
+		if (lt != std::string_view::npos)
+		{
 			std::string_view uri = line.substr(lt + 1);
 			uri = uri.substr(0, uri.find('>'));
 			while (!uri.empty() && (uri.front() == ' ' || uri.front() == '\t')) uri.remove_prefix(1);
 			while (!uri.empty() && (uri.back() == ' ' || uri.back() == '\t')) uri.remove_suffix(1);
 			return uri;
-		};
-		bool quoted = false;
-		for (size_t i = 0; i < line.size(); ++i)
-		{
-			const char c = line[i];
-			if (quoted)
-			{
-				if (c == '\\') ++i;
-				else if (c == '"') quoted = false;
-			}
-			else if (c == '"')
-			{
-				quoted = true;
-			}
-			else if (c == '<')
-			{
-				return bracketed(i);
-			}
 		}
-		if (quoted)
-		{
-			const size_t lt = line.rfind('<');
-			return lt == std::string_view::npos ? std::string_view{} : bracketed(lt);
-		}
+		if (open) return {};
 		const size_t colon = line.find(':');
 		if (colon == std::string_view::npos) return {};
 		size_t nameStart = 0;

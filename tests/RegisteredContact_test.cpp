@@ -18,6 +18,7 @@
 
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
+#include "SipHeaderUtil.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -279,6 +280,59 @@ TEST(RegisteredContact, AQuotedDisplayNameDoesNotHideTheRegisteredContactUri)
 		const std::string ping = findSentTo(sent, addrFor(kSnomIp, 1037), "OPTIONS ");
 		ASSERT_FALSE(ping.empty());
 		EXPECT_EQ(requestLineOf(ping), std::string("OPTIONS ") + kSnomContactUri + " SIP/2.0");
+	}
+}
+
+TEST(RegisteredContact, AQuotedSipInstanceDoesNotHideTheRegisteredContactUri)
+{
+	// #835: with a quote left open in the display name, the quote that opens
+	// +sip.instance's value (RFC 5626) closed it, so "<urn:uuid:...>" sat
+	// outside quotes and was read as the URI. The stored Contact was lost and
+	// the ping went out without ;line=, which a Snom answers 404.
+	const std::string instance = ";reg-id=1;+sip.instance=\"<urn:uuid:00000000-0000-1000-8000-000413a1b2c3>\"";
+	for (const std::string& contact : {
+			"\"Lobby 55\" TV\" <" + std::string(kSnomContactUri) + ">" + instance,
+			// Controls: a balanced display name, and an open quote in the
+			// parameter itself, after the URI.
+			"\"Snom 370\" <" + std::string(kSnomContactUri) + ">" + instance,
+			"<" + std::string(kSnomContactUri) + ">;reg-id=1;+sip.instance=\"<urn:uuid:0>"})
+	{
+		SCOPED_TRACE(contact);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		auto reg = makeRegister("100", kSnomIp, 1037, "Contact: " + contact + "\r\n");
+		EXPECT_EQ(reg->getContactNumber(), "100");
+		handler.handle(reg);
+
+		handler.tick();
+
+		const std::string ping = findSentTo(sent, addrFor(kSnomIp, 1037), "OPTIONS ");
+		ASSERT_FALSE(ping.empty());
+		EXPECT_EQ(requestLineOf(ping), std::string("OPTIONS ") + kSnomContactUri + " SIP/2.0");
+	}
+	// An open quote with no <...> at all names no URI, as before.
+	EXPECT_TRUE(siphdr::contactUriView("Contact: \"Lobby sip:100@192.168.31.10:1037").empty());
+}
+
+TEST(RegisteredContact, AnUppercaseSchemeContactIsKept)
+{
+	// #835 nit: RFC 3261 s19.1.4, the scheme is case-insensitive. The stored
+	// Contact took only "sip:" and "sips:", so this one was dropped and the
+	// ping lost its ;line=. It is used as the phone registered it.
+	for (const char* uri : {"SIP:100@192.168.31.10:1037;line=h2k6k1ih", "Sip:100@192.168.31.10:1037;line=h2k6k1ih"})
+	{
+		SCOPED_TRACE(uri);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		handler.handle(makeRegister("100", kSnomIp, 1037, std::string("Contact: <") + uri + ">;reg-id=1\r\n"));
+
+		handler.tick();
+
+		const std::string ping = findSentTo(sent, addrFor(kSnomIp, 1037), "OPTIONS ");
+		ASSERT_FALSE(ping.empty());
+		EXPECT_EQ(requestLineOf(ping), std::string("OPTIONS ") + uri + " SIP/2.0");
 	}
 }
 
