@@ -1,3 +1,0 @@
-# #401: Python unittest cases in tests/tools/test_load_profile.py (the rc1 load profile:
-# registrations held past quiesce_check_at before the final de-REGISTER). No gtest cases.
-0
