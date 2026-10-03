@@ -50,6 +50,17 @@ namespace ArpLookup
 	// Non-blocking: a single table probe, no waiting, no I/O.
 	std::optional<Mac> pdLookupMac(const struct sockaddr_in& src);
 
+	// #864: true if `src`'s IPv4 address is a host on the subnet of an up
+	// interface (the ones pdLookupMac() probes), so an ARP request can reach it.
+	// An off-link source never resolves. Reads the netifs; no I/O.
+	bool pdIsOnLink(const struct sockaddr_in& src);
+
+	// #864: broadcast an ARP request for `src`'s IPv4 address on each up interface
+	// whose subnet holds it; the reply fills the table for the sender's next
+	// packet. True if one went out. Waits for lwIP's tcpip thread to send it, as
+	// sendto() does, never for the reply: call it outside the engine lock.
+	bool pdSendArpRequest(const struct sockaddr_in& src);
+
 	// Format a Mac as 12 lowercase hex chars (no separators), e.g. "a1b2c3d4e5f6".
 	// This is the canonical key form used by the device registry. Pure helper.
 	std::string toHex12(const Mac& mac);

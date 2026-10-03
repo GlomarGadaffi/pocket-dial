@@ -69,7 +69,9 @@ public:
 	};
 
 	// RetryLater (#515, #440): admitLearn has already enqueued a 503 + Retry-After.
-	enum class AuthDecision : uint8_t { Accept, Challenge, Reject, RetryLater };
+	// Drop (#864): nothing is sent; the caller ARPs the source once _mutex is
+	// released, and the phone's UDP retransmission is the retry.
+	enum class AuthDecision : uint8_t { Accept, Challenge, Reject, RetryLater, Drop };
 
 	Registrar(PbxEnv& env, Mode defaultMode) : _env(env), _mode(defaultMode) {}
 
@@ -113,9 +115,9 @@ public:
 	//   - another MAC registering a locked (or Secured) extension -> Reject;
 	//   - an ARP miss for a locked extension -> Accept if `fromRegisteredAddress`
 	//     (the source IP:port is the extension's live binding: the owner's own
-	//     refresh), else a 503 + Retry-After is enqueued here and RetryLater
-	//     ("response already sent") is returned: retryable, never a lockout,
-	//     and sending it makes lwIP ARP the source;
+	//     refresh); else, from a source on this subnet, Drop (#864: nothing
+	//     sent, the caller ARPs it); else a 503 + Retry-After is enqueued here
+	//     and RetryLater ("response already sent") is returned. Never a lockout;
 	//   - an UNLOCKED MAC that registers a second extension is marked shared
 	//     (the signature of phones behind one NAT router) and never locks;
 	//   - a first-packet ARP miss for an unlocked extension still Accepts;

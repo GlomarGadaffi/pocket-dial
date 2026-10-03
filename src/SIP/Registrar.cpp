@@ -345,7 +345,9 @@ Registrar::AuthDecision Registrar::admitLearn(
 	// Learn mode = TOFU + MAC-lock (issue #440 made the lock real).
 	//   ext Secured, or Learn-LOCKED, to a DIFFERENT mac -> reject (anti-spoof).
 	//   ARP miss, ext Learn-locked somewhere -> accept from the extension's
-	//                            registered IP:port (the owner's refresh), else
+	//                            registered IP:port (the owner's refresh); else,
+	//                            from this subnet, Drop: ARP the source and let
+	//                            the phone's retransmission resolve (#864); else
 	//                            503 + Retry-After (retryable; we cannot tell
 	//                            the owner from an impostor yet).
 	//   ARP miss otherwise     -> accept + defer, as before (never brick the first
@@ -401,10 +403,22 @@ Registrar::AuthDecision Registrar::admitLearn(
 				// extension never gets here (admitSecure above).
 				return AuthDecision::Accept;
 			}
-			// The owner's ARP entry may simply have aged out. A 403 here would lock
-			// the real phone out; accepting would let anyone off-link take the
-			// extension. Ask for a retry instead: transmitting this response makes
-			// lwIP ARP the source, so an on-link owner resolves next time.
+			// #864: on this subnet the owner's ARP entry may simply have aged out:
+			// lwIP keeps an unused one 300 s, and after a reboot nothing refreshes
+			// it. A 503 ends the phone's transaction, and a phone that ignores
+			// Retry-After came back after the entry had aged out again, for hours.
+			// So answer nothing: the caller ARPs the source once _mutex is released,
+			// and the phone's UDP retransmission of this REGISTER (RFC 3261
+			// §17.1.2.2, from T1 = 500 ms) resolves and is checked like any other.
+			if (ArpLookup::pdIsOnLink(data->getSource()))
+			{
+				_env.log("Learn REGISTER ext " + ext + ": ARP miss on an extension locked to " +
+					*owner + ", ARPing the source for its retransmission");
+				return AuthDecision::Drop;   // nothing sent
+			}
+			// Off this subnet no ARP reply can come. A 403 here would lock the real
+			// phone out; accepting would let anyone off-link take the extension. Ask
+			// for a retry instead.
 			_env.log("Learn REGISTER ext " + ext + ": ARP miss on an extension locked to " +
 				*owner + ", asking for a retry");
 			sendRetryLater(data, kLockedArpMissRetrySeconds);
