@@ -1,2 +1,2 @@
-# TelCtlPool_test.cpp: 4 (#657: a call past a full tel_ctl queue is refused 503 after its 180; a drop and a 911/933 makeCall run while every tel_ctl worker is busy; every #379 orphan drop from a tel_ctl worker runs)
-4
+# TelCtlPool_test.cpp: 7 (#657: a call past a full tel_ctl queue is refused 503 after its 180; a drop and a 911/933 makeCall run while every tel_ctl worker is busy; every #379 orphan drop from a tel_ctl worker runs; a 911 or a drop whose worker failed at boot still runs, on tel_ctl; a 911 with no worker anywhere gets the #713 503)
+7

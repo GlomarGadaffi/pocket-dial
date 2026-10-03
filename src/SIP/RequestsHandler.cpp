@@ -5122,7 +5122,7 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 void RequestsHandler::startTelCtl()
 {
 	static constexpr const char* kName[kTelLanes] = { "tel_ctl", "tel_drop", "tel_sos" };
-	for (int l = 0; l < kTelLanes; ++l)
+	for (const TelLane l : kTelLaneOrder)
 	{
 		TelCtlQueue& lane = _telCtl[l];
 		if (lane.q) continue;
@@ -5140,13 +5140,15 @@ void RequestsHandler::startTelCtl()
 		{
 			if (lane.q) vQueueDelete(lane.q);
 			lane.q = nullptr;
-			queueLog(std::string("[Telephony] ") + kName[l] + ": no worker (no memory at boot) — its jobs will be refused", true);
+			queueLog(std::string("[Telephony] ") + kName[l] + ": no worker (no memory at boot) — " +
+				(l == kLaneCtl ? "anchor calls will be refused" : "its jobs go to tel_ctl"), true);
 		}
 	}
 }
 
 bool RequestsHandler::postTelCtl(TelCtlJob* job, TelLane lane)
 {
+	if (!_telCtl[lane].q) lane = kLaneCtl;   // no worker since boot: late beats refused
 	if (job && _telCtl[lane].q && xQueueSend(_telCtl[lane].q, &job, 0) == pdTRUE) return true;
 	delete job;
 	return false;
@@ -5169,10 +5171,13 @@ void RequestsHandler::startTelCtl()
 	std::lock_guard<std::mutex> lock(_telCtlMutex);
 	if (_telCtlUp) return;
 	_telCtlUp = true;
-	for (int i = 0; i < kTelCtlWorkers + 2; ++i)
+	int t = 0;
+	for (const TelLane lane : kTelLaneOrder)
 	{
-		const TelLane lane = i < kTelCtlWorkers ? kLaneCtl : (i == kTelCtlWorkers ? kLaneDrop : kLaneSos);
-		_telCtlThreads[i] = std::thread([this, lane] { serveTelCtl(lane); });
+		if (_telCtlNoWorker & (1u << lane)) continue;
+		for (int i = 0; i < (lane == kLaneCtl ? kTelCtlWorkers : 1); ++i, ++t)
+			_telCtlThreads[t] = std::thread([this, lane] { serveTelCtl(lane); });
+		_telLaneUp[lane] = true;
 	}
 }
 
@@ -5181,8 +5186,9 @@ bool RequestsHandler::postTelCtl(TelCtlJob* job, TelLane lane)
 	bool queued = false;
 	{
 		std::lock_guard<std::mutex> lock(_telCtlMutex);
+		if (!_telLaneUp[lane]) lane = kLaneCtl;   // as on the device
 		auto& jobs = _telCtlJobs[lane];
-		if (job && _telCtlUp && !_telCtlStop && jobs.size() < static_cast<size_t>(kTelLaneDepth[lane]))
+		if (job && _telLaneUp[lane] && !_telCtlStop && jobs.size() < static_cast<size_t>(kTelLaneDepth[lane]))
 		{
 			jobs.push_back(job);
 			queued = true;

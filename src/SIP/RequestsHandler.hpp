@@ -435,6 +435,7 @@ public:
 	// answerCall share these workers; past kTelCtlDepth waiting, a call is refused.
 	static constexpr int kTelCtlWorkers = POCKETDIAL_MAX_ANCHOR_CALLS < 2 ? POCKETDIAL_MAX_ANCHOR_CALLS : 2;
 	static constexpr int kTelCtlDepth = POCKETDIAL_MAX_ANCHOR_CALLS;
+	enum TelLane : uint8_t { kLaneCtl, kLaneDrop, kLaneSos, kTelLanes };
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only (Issue #521). Every host test boots the loopback anchor, which
@@ -482,6 +483,13 @@ public:
 	{
 		std::lock_guard<std::mutex> lock(_telCtlMutex);
 		return _telCtlParked;
+	}
+	// Test-only (#657): startTelCtl() gets no worker for `lane`, as when its
+	// 12 KB stack cannot be allocated at boot. Call before the pool starts.
+	void failTelCtlLaneForTest(TelLane lane)
+	{
+		std::lock_guard<std::mutex> lock(_telCtlMutex);
+		_telCtlNoWorker |= 1u << lane;
 	}
 	// Test-only (#659): move every 911/933 dial mark `d` into the past.
 	void ageEmergencyCallbacksForTest(std::chrono::steady_clock::duration d)
@@ -1915,16 +1923,19 @@ private:
 		std::string callerNumber;
 		std::string partId;
 	};
-	enum TelLane : uint8_t { kLaneCtl, kLaneDrop, kLaneSos, kTelLanes };
 	static constexpr int kTelSosDepth = POCKETDIAL_MAX_SESSIONS;   // every session a ringing 911
 	// Every session's leg, plus every makeCall in flight on ctl or sos: each can
 	// orphan one (#379).
 	static constexpr int kTelDropDepth =
 		POCKETDIAL_MAX_SESSIONS + kTelCtlWorkers + kTelCtlDepth + 1 + kTelSosDepth;
 	static constexpr int kTelLaneDepth[kTelLanes] = { kTelCtlDepth, kTelDropDepth, kTelSosDepth };
+	// Creation order: when boot memory runs short, 911/933 and drops get their
+	// workers before call setup does.
+	static constexpr TelLane kTelLaneOrder[kTelLanes] = { kLaneSos, kLaneDrop, kLaneCtl };
 	// Idempotent. On the device only the constructor calls it, for a real anchor.
 	void startTelCtl();
-	// Takes ownership. False (job deleted) when the lane is full or has no worker.
+	// Takes ownership. A lane left without a worker at boot posts to tel_ctl
+	// instead. False (job deleted) when that lane is full or has none either.
 	bool postTelCtl(TelCtlJob* job, TelLane lane);
 	void runTelCtl(const TelCtlJob& job);
 #if defined(ESP_PLATFORM) || defined(ESP32)
@@ -1945,6 +1956,8 @@ private:
 	std::deque<TelCtlJob*> _telCtlJobs[kTelLanes];
 	std::thread _telCtlThreads[kTelCtlWorkers + 2];
 	bool _telCtlUp = false;
+	bool _telLaneUp[kTelLanes] = {};   // got a worker (the device keeps a lane's queue only then)
+	unsigned _telCtlNoWorker = 0;   // failTelCtlLaneForTest()
 	bool _telCtlStop = false;
 	bool _telCtlHeld = false;   // holdTelCtlForTest()
 	int _telCtlParked = 0;

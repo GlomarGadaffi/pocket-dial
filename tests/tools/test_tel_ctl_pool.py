@@ -2,12 +2,15 @@
 tel_ctl pool, created once at boot. asyncMakeCall/asyncAnswerCall/asyncDropCall
 must post a job and create no task or thread, the pool's workers are created
 only in startTelCtl() (called from the constructor), and a worker never deletes
-itself. The device path never runs on the host, so this pins the wiring."""
+itself. The sos and drop lanes get their workers first, and a lane left without
+one posts to tel_ctl. The device path never runs on the host, so this pins the
+wiring."""
 import os
 import re
 import unittest
 
 SRC = os.path.join(os.path.dirname(__file__), "..", "..", "src", "SIP", "RequestsHandler.cpp")
+HDR = os.path.join(os.path.dirname(SRC), "RequestsHandler.hpp")
 CREATE = re.compile(r"\bxTaskCreate\w*\s*\(|\bcreateTaskPreferPsram\s*\(|\bstd::j?thread\b|\bspawnAnchorWorker\s*\(")
 
 
@@ -60,6 +63,24 @@ class TelCtlPoolTest(unittest.TestCase):
         ctor = body_of(self.src, "RequestsHandler::RequestsHandler(")
         self.assertTrue("startTelCtl();" in ctor, "the constructor starts the pool")
         self.assertEqual(self.src.count("startTelCtl();"), 1, "the constructor is the only caller")
+
+    def test_911_and_drops_get_workers_first_and_fall_back_to_ctl(self):
+        # The device copies never run on the host; TelCtlPool_test.cpp drives
+        # the host ones.
+        with open(HDR, encoding="utf-8") as f:
+            hdr = code_only(f.read())
+        self.assertTrue(re.search(r"kTelLaneOrder\[kTelLanes\]\s*=\s*\{\s*kLaneSos,\s*kLaneDrop,\s*kLaneCtl\s*\}", hdr),
+                        "lanes must be created sos, drop, ctl")
+        for sig, needle in (("void RequestsHandler::startTelCtl(", "kTelLaneOrder"),
+                            ("bool RequestsHandler::postTelCtl(", "lane = kLaneCtl;")):
+            bodies = []
+            at = self.src.find(sig)
+            while at >= 0:
+                bodies.append(body_of(self.src[at:], sig))
+                at = self.src.find(sig, at + 1)
+            self.assertEqual(len(bodies), 2, sig + ": one device and one host definition")
+            for body in bodies:
+                self.assertTrue(needle in body, "%s lacks %s" % (sig, needle))
 
     def test_a_worker_never_deletes_itself(self):
         task = body_of(self.src, "void RequestsHandler::telCtlTask(")
