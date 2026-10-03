@@ -688,6 +688,8 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 		}
 		else
 		{
+			// #657: the call-control workers exist from boot, so no call creates one.
+			startTelCtl();
 			// Spawn off this constructor's call stack exactly like drawbridge's
 			// constructor does — an ESP task with real stack headroom (12288:
 			// 4096 bootlooped on real hardware, fetchToken's TLS handshake
@@ -819,10 +821,10 @@ RequestsHandler::~RequestsHandler()
 		_anchorStartThread.join();
 	}
 	// Stage B: drain every outstanding asyncMakeCall/asyncDropCall/asyncAnswerCall
-	// host worker BEFORE the anchor client is stopped and this object starts
-	// tearing down — a still-running worker captured `this` and calls back into
-	// _mutex/queueLog/endCall on completion, all of which need a live handler.
-	reapAnchorWorkers(/*drainAll=*/true);
+	// job BEFORE the anchor client is stopped and this object starts tearing
+	// down — a tel_ctl worker calls back into _mutex/queueLog/endCall on
+	// completion, all of which need a live handler.
+	stopTelCtl();
 #endif
 	// Stop the anchor BEFORE member destruction begins: LoopbackAnchorClient's
 	// simulation threads call back into this handler (locking _mutex, touching
@@ -4921,7 +4923,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// synchronous branch's comment above. Dispatched off the SIP thread; the
 	// 200 OK follows later from the CallEvent::Answered callback once the far
 	// leg actually connects.
-	if (!asyncMakeCall(destination, callID, caller->getNumber()))
+	if (!asyncMakeCall(destination, callID, caller->getNumber(), emergency))
 	{
 		// #713: no worker, so nothing will ever place this call. asyncMakeCall()
 		// has answered 503 and ended the session: the INVITE is owned (true),
@@ -4977,161 +4979,45 @@ void RequestsHandler::refuseRingingAnchor(const std::string& callId,
 }
 
 bool RequestsHandler::asyncMakeCall(const std::string& destination, const std::string& callId,
-	const std::string& callerNumber)
+	const std::string& callerNumber, bool emergency)
 {
 	if (!_anchorClient) return false;   // unreachable: originateAnchorCall() returns first with no client
-	bool spawned = false;
-#if defined(ESP_PLATFORM) || defined(ESP32)
-	struct MakeCallArg
+	auto* job = new TelCtlJob{ TelCtlJob::Make, destination, callId, callerNumber, {} };
+#if !defined(ESP_PLATFORM) && !defined(ESP32)
+	if (_failNextAnchorWorkerSpawn)   // #713 test seam: one refused job
 	{
-		// Default-initialized so cppcheck's uninitMemberVarNoCtor cannot fire on
-		// the raw pointers. Every member is still aggregate-initialized at the
-		// single call site below (C++17 keeps this an aggregate despite the
-		// default member initializers), so behaviour is unchanged.
-		AnchorClient* anchor = nullptr;
-		std::string dest;
-		std::string callId;
-		std::string callerNumber;
-		RequestsHandler* handler = nullptr;
-	};
-	auto* arg = new MakeCallArg{ _anchorClient, destination, callId, callerNumber, this };
-	// 12288: makeCall is a TLS HTTPS round trip — same overflow as tel_start's
-	// fetchToken (4096 bootlooped on real hardware).
-	// CHECK the spawn: under heap pressure during an active call the 12 KB PSRAM
-	// stack can fail to allocate; the outbound worker then never runs and the
-	// call is silently never placed. Surface that (and free the arg) instead of
-	// a silent, phantom non-call — mirrors asyncDropCall's check exactly.
-	if (pd::createTaskPreferPsram([](void* p) {
-		auto* mca = static_cast<MakeCallArg*>(p);
-		std::string ownLeg;
-		if (!mca->anchor->makeCall(mca->dest, &ownLeg))
-		{
-			std::lock_guard<std::mutex> lock(mca->handler->_mutex);
-			mca->handler->queueLog("[Telephony] Failed to initiate outbound call to " + mca->dest, true);
-			// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
-			mca->handler->refuseRingingAnchor(mca->callId, mca->handler->_asyncOutbox);
-			mca->handler->endCall(mca->callId, mca->callerNumber, mca->dest, "anchor call fail");
-		}
-		else
-		{
-			// Bind this origination's own leg to its session NOW (locks _mutex
-			// internally) so a later Answered/Dropped maps to the right call when
-			// several are in flight.
-			const bool bound = mca->handler->bindOutboundParticipant(mca->callId, ownLeg);
-			std::lock_guard<std::mutex> lock(mca->handler->_mutex);
-			if (!bound && !ownLeg.empty())
-			{
-				// Issue #379: the handset hung up while makeCall() was still on
-				// the wire (a ~0.8 s TLS round trip), so the CANCEL path's
-				// endCall() already destroyed the session this leg belongs to.
-				// makeCall() nonetheless SUCCEEDED, so 3CX now has a Dialing leg
-				// that will ring the far party, be answerable and bill, with no
-				// local party and nothing that will ever map an event back to
-				// it. Drop it now. asyncDropCall() spawns its own worker, so it
-				// is safe from this task and under _mutex (endCall() calls it
-				// the same way). An empty ownLeg means makeCall() produced no
-				// leg id at all -- nothing on the anchor to drop, so fall through
-				// to the ordinary log exactly as before.
-				mca->handler->queueLog("[Telephony] Outbound call to " + mca->dest +
-					" was cancelled during makeCall — dropping orphaned leg " + ownLeg + " (#379)", true);
-				mca->handler->asyncDropCall(ownLeg);
-			}
-			else
-			{
-				mca->handler->queueLog("[Telephony] Initiating outbound call to " + mca->dest);
-			}
-		}
-		delete mca;
-		pd::deleteTask(NULL);   // created WithCaps(PSRAM)
-	}, "tel_makecall", 12288, arg, 5, NULL) != pdPASS)
-	{
-		delete arg;
+		_failNextAnchorWorkerSpawn = false;
+		delete job;
+		job = nullptr;
 	}
-	else
-	{
-		spawned = true;
-	}
-#else
-	spawned = !_failNextAnchorWorkerSpawn;   // #713 test seam: one refused spawn
-	_failNextAnchorWorkerSpawn = false;
-	if (spawned) spawnAnchorWorker([this, destination, callId, callerNumber]() {
-		std::string ownLeg;
-		if (!_anchorClient->makeCall(destination, &ownLeg))
-		{
-			std::lock_guard<std::mutex> lock(_mutex);
-			queueLog("[Telephony] Failed to initiate outbound call to " + destination, true);
-			// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
-			refuseRingingAnchor(callId, _asyncOutbox);
-			endCall(callId, callerNumber, destination, "anchor call fail");
-		}
-		else
-		{
-			const bool bound = bindOutboundParticipant(callId, ownLeg);   // locks _mutex itself
-			std::lock_guard<std::mutex> lock(_mutex);
-			if (!bound && !ownLeg.empty())
-			{
-				// Issue #379: see the ESP branch above -- session already torn
-				// down by a handset CANCEL mid-makeCall; drop the orphaned leg.
-				queueLog("[Telephony] Outbound call to " + destination +
-					" was cancelled during makeCall — dropping orphaned leg " + ownLeg + " (#379)", true);
-				asyncDropCall(ownLeg);
-			}
-			else
-			{
-				queueLog("[Telephony] Initiating outbound call to " + destination);
-			}
-		}
-	});
 #endif
-	if (!spawned)
-	{
-		queueLog("[Telephony] asyncMakeCall: outbound worker xTaskCreate FAILED (heap exhausted) — call NOT placed", true);
-		// onAnchorInvite() already allocated the session and sent 180 Ringing; with
-		// no worker nobody will ever answer or fail it, so without this the handset
-		// rings until tick()'s no-answer reap fires ~20 s later. Do what that reap
-		// does for a still-ringing anchor call right now: 503 the caller off the
-		// stored INVITE (endCall() itself sends no SIP response), then tear the
-		// session down. Runs on the SIP thread under _mutex (handler dispatch),
-		// same as the synchronous anchor branch's direct endCall() call, so
-		// _outbox (not _asyncOutbox) is the right queue.
-		refuseRingingAnchor(callId, _outbox);
-		endCall(callId, callerNumber, destination, "anchor worker spawn fail");
-		return false;
-	}
-	return true;
+	if (postTelCtl(job, emergency ? kLaneSos : kLaneCtl)) return true;
+	queueLog("[Telephony] asyncMakeCall: tel_ctl queue full — call NOT placed", true);
+	// onAnchorInvite() already allocated the session and sent 180 Ringing; with
+	// no worker nobody will ever answer or fail it, so without this the handset
+	// rings until tick()'s no-answer reap fires ~20 s later. Do what that reap
+	// does for a still-ringing anchor call right now: 503 the caller off the
+	// stored INVITE (endCall() itself sends no SIP response), then tear the
+	// session down. Runs on the SIP thread under _mutex (handler dispatch),
+	// same as the synchronous anchor branch's direct endCall() call, so
+	// _outbox (not _asyncOutbox) is the right queue.
+	refuseRingingAnchor(callId, _outbox);
+	endCall(callId, callerNumber, destination, "anchor worker queue full");
+	return false;
 }
 
 void RequestsHandler::asyncDropCall(const std::string& participantId)
 {
 	if (!_anchorClient) return;
-#if defined(ESP_PLATFORM) || defined(ESP32)
-	struct DropCallArg
+	if (anchorIsSynchronous())
 	{
-		// See MakeCallArg: default-initialized for cppcheck, still an aggregate.
-		AnchorClient* anchor = nullptr;
-		std::string partId;
-		RequestsHandler* handler = nullptr;
-	};
-	auto* arg = new DropCallArg{ _anchorClient, participantId, this };
-	// CHECK the spawn: under heap pressure during an active call the 12 KB PSRAM
-	// stack can fail to allocate; the drop worker then never runs and the far leg
-	// never tears down. Surface that (and free the arg) instead of a silent,
-	// phantom non-drop.
-	if (pd::createTaskPreferPsram([](void* p) {
-		auto* dca = static_cast<DropCallArg*>(p);
-		dca->anchor->dropCall(dca->partId);
-		delete dca;
-		pd::deleteTask(NULL);
-	}, "tel_dropcall", 12288, arg, 5, NULL) != pdPASS)
-	{
-		queueLog("[Telephony] asyncDropCall: drop worker xTaskCreate FAILED (heap exhausted) — leg NOT dropped", true);
-		delete arg;
-	}
-#else
-	spawnAnchorWorker([this, participantId]() {
 		_anchorClient->dropCall(participantId);
-	});
-#endif
+		return;
+	}
+	if (!postTelCtl(new TelCtlJob{ TelCtlJob::Drop, {}, {}, {}, participantId }, kLaneDrop))
+	{
+		queueLog("[Telephony] asyncDropCall: tel_drop queue full — leg " + participantId + " NOT dropped", true);
+	}
 }
 
 // Issue #379: the anchor's rx task spent its whole GET retry budget (3CX refused the
@@ -5163,103 +5049,188 @@ void RequestsHandler::anchorMediaNeverOpenedLocked(const std::string& participan
 void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 {
 	// Answer an inbound upstream participant off the SIP thread (the POST is a
-	// TLS round trip). Mirrors asyncDropCall's threading/lifetime rules exactly.
+	// TLS round trip). Mirrors asyncDropCall's threading rules exactly.
 	if (!_anchorClient) return;
-#if defined(ESP_PLATFORM) || defined(ESP32)
-	struct AnswerCallArg
+	if (anchorIsSynchronous())
 	{
-		// See MakeCallArg: default-initialized for cppcheck, still an aggregate.
-		AnchorClient* anchor = nullptr;
-		std::string partId;
-		RequestsHandler* handler = nullptr;
-	};
-	auto* arg = new AnswerCallArg{ _anchorClient, participantId, this };
-	// CHECK the spawn: same heap-pressure hazard asyncDropCall's own comment
-	// describes -- without this check a failed allocation leaks `arg` and
-	// silently never answers the call.
-	if (pd::createTaskPreferPsram([](void* p) {
-		auto* aca = static_cast<AnswerCallArg*>(p);
-		if (!aca->anchor->answerCall(aca->partId))
-		{
-			std::lock_guard<std::mutex> lock(aca->handler->_mutex);
-			aca->handler->queueLog("[Telephony] Failed to answer inbound participant " + aca->partId, true);
-		}
-		delete aca;
-		pd::deleteTask(NULL);
-	}, "tel_answer", 12288, arg, 5, NULL) != pdPASS)
-	{
-		queueLog("[Telephony] asyncAnswerCall: answer worker xTaskCreate FAILED (heap exhausted) — participant NOT answered", true);
-		delete arg;
-	}
-#else
-	spawnAnchorWorker([this, participantId]() {
 		if (!_anchorClient->answerCall(participantId))
 		{
-			std::lock_guard<std::mutex> lock(_mutex);
 			queueLog("[Telephony] Failed to answer inbound participant " + participantId, true);
 		}
-	});
-#endif
-}
-
-#if !defined(ESP_PLATFORM) && !defined(ESP32)
-// Spawn a host anchor worker that runs `job` then flips its done-flag. The flag
-// lets reapAnchorWorkers() join+erase finished threads in tick(), so the live
-// thread count tracks in-flight calls rather than growing without bound. Also
-// reaped opportunistically here, so a steady call rate never lets the vector grow.
-void RequestsHandler::spawnAnchorWorker(std::function<void()> job)
-{
-	auto done = std::make_shared<std::atomic<bool>>(false);
-	std::thread worker([job = std::move(job), done]() {
-		job();
-		done->store(true, std::memory_order_release);
-	});
-	std::lock_guard<std::mutex> lock(_anchorWorkMutex);
-	reapFinishedLocked();   // reap already-finished siblings before appending
-	_anchorWorkThreads.push_back(AnchorWorker{ std::move(worker), std::move(done) });
-}
-
-// Caller MUST hold _anchorWorkMutex. Join + erase every worker whose done-flag
-// is set.
-void RequestsHandler::reapFinishedLocked()
-{
-	for (auto it = _anchorWorkThreads.begin(); it != _anchorWorkThreads.end(); )
+		return;
+	}
+	if (!postTelCtl(new TelCtlJob{ TelCtlJob::Answer, {}, {}, {}, participantId }, kLaneCtl))
 	{
-		if (it->done && it->done->load(std::memory_order_acquire))
+		queueLog("[Telephony] asyncAnswerCall: tel_ctl queue full — participant " + participantId + " NOT answered", true);
+	}
+}
+
+void RequestsHandler::runTelCtl(const TelCtlJob& job)
+{
+	if (job.kind == TelCtlJob::Drop)
+	{
+		_anchorClient->dropCall(job.partId);
+		return;
+	}
+	if (job.kind == TelCtlJob::Answer)
+	{
+		if (!_anchorClient->answerCall(job.partId))
 		{
-			if (it->thread.joinable()) it->thread.join();
-			it = _anchorWorkThreads.erase(it);
+			std::lock_guard<std::mutex> lock(_mutex);
+			queueLog("[Telephony] Failed to answer inbound participant " + job.partId, true);
 		}
-		else
+		return;
+	}
+	std::string ownLeg;
+	if (!_anchorClient->makeCall(job.dest, &ownLeg))
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		queueLog("[Telephony] Failed to initiate outbound call to " + job.dest, true);
+		// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
+		refuseRingingAnchor(job.callId, _asyncOutbox);
+		endCall(job.callId, job.callerNumber, job.dest, "anchor call fail");
+		return;
+	}
+	// Bind this origination's own leg to its session NOW (locks _mutex
+	// internally) so a later Answered/Dropped maps to the right call when
+	// several are in flight.
+	const bool bound = bindOutboundParticipant(job.callId, ownLeg);
+	std::lock_guard<std::mutex> lock(_mutex);
+	if (!bound && !ownLeg.empty())
+	{
+		// Issue #379: the handset hung up while makeCall() was still on the
+		// wire (a ~0.8 s TLS round trip), so the CANCEL path's endCall()
+		// already destroyed the session this leg belongs to. makeCall()
+		// nonetheless SUCCEEDED, so 3CX now has a Dialing leg that will ring
+		// the far party, be answerable and bill, with no local party and
+		// nothing that will ever map an event back to it. Drop it now. The drop
+		// goes to tel_drop, never this worker's own lane, and postTelCtl() does
+		// not block, so posting it under _mutex cannot wait on a busy pool. An
+		// empty ownLeg means makeCall() produced no leg id at all -- nothing on
+		// the anchor to drop, so fall through to the ordinary log.
+		queueLog("[Telephony] Outbound call to " + job.dest +
+			" was cancelled during makeCall — dropping orphaned leg " + ownLeg + " (#379)", true);
+		asyncDropCall(ownLeg);
+	}
+	else
+	{
+		queueLog("[Telephony] Initiating outbound call to " + job.dest);
+	}
+}
+
+#if defined(ESP_PLATFORM) || defined(ESP32)
+void RequestsHandler::startTelCtl()
+{
+	static constexpr const char* kName[kTelLanes] = { "tel_ctl", "tel_drop", "tel_sos" };
+	for (int l = 0; l < kTelLanes; ++l)
+	{
+		TelCtlQueue& lane = _telCtl[l];
+		if (lane.q) continue;
+		lane.self = this;
+		lane.q = xQueueCreate(kTelLaneDepth[l], sizeof(TelCtlJob*));
+		int up = 0;
+		for (int i = 0; lane.q && i < (l == kLaneCtl ? kTelCtlWorkers : 1); ++i)
 		{
-			++it;
+			// 12288: makeCall is a TLS HTTPS round trip (4096 bootlooped, see
+			// tel_start). PSRAM is safe: TLS I/O only, and endCall()'s CDR write
+			// is handed to the cdr_persist task (PsramTask.hpp, #273).
+			if (pd::createTaskPreferPsram(&RequestsHandler::telCtlTask, kName[l], 12288, &lane, 5, nullptr) == pdPASS) ++up;
+		}
+		if (up == 0)
+		{
+			if (lane.q) vQueueDelete(lane.q);
+			lane.q = nullptr;
+			queueLog(std::string("[Telephony] ") + kName[l] + ": no worker (no memory at boot) — its jobs will be refused", true);
 		}
 	}
 }
 
-// Called from tick(): reap finished anchor workers. drainAll blocks until every
-// worker has finished (the destructor's belt-and-suspenders join).
-void RequestsHandler::reapAnchorWorkers(bool drainAll)
+bool RequestsHandler::postTelCtl(TelCtlJob* job, TelLane lane)
 {
-	std::vector<AnchorWorker> toJoin;
+	if (job && _telCtl[lane].q && xQueueSend(_telCtl[lane].q, &job, 0) == pdTRUE) return true;
+	delete job;
+	return false;
+}
+
+void RequestsHandler::telCtlTask(void* arg)
+{
+	auto* lane = static_cast<TelCtlQueue*>(arg);
+	for (;;)
 	{
-		std::lock_guard<std::mutex> lock(_anchorWorkMutex);
-		if (drainAll)
+		TelCtlJob* job = nullptr;
+		if (xQueueReceive(lane->q, &job, portMAX_DELAY) != pdTRUE || !job) continue;
+		lane->self->runTelCtl(*job);
+		delete job;
+	}
+}
+#else
+void RequestsHandler::startTelCtl()
+{
+	std::lock_guard<std::mutex> lock(_telCtlMutex);
+	if (_telCtlUp) return;
+	_telCtlUp = true;
+	for (int i = 0; i < kTelCtlWorkers + 2; ++i)
+	{
+		const TelLane lane = i < kTelCtlWorkers ? kLaneCtl : (i == kTelCtlWorkers ? kLaneDrop : kLaneSos);
+		_telCtlThreads[i] = std::thread([this, lane] { serveTelCtl(lane); });
+	}
+}
+
+bool RequestsHandler::postTelCtl(TelCtlJob* job, TelLane lane)
+{
+	bool queued = false;
+	{
+		std::lock_guard<std::mutex> lock(_telCtlMutex);
+		auto& jobs = _telCtlJobs[lane];
+		if (job && _telCtlUp && !_telCtlStop && jobs.size() < static_cast<size_t>(kTelLaneDepth[lane]))
 		{
-			toJoin = std::move(_anchorWorkThreads);
-			_anchorWorkThreads.clear();
-		}
-		else
-		{
-			reapFinishedLocked();
-			return;
+			jobs.push_back(job);
+			queued = true;
 		}
 	}
-	// drainAll: join OUTSIDE the lock, so a still-running worker that ever needed
-	// _anchorWorkMutex (it doesn't today, but be safe) can't deadlock us.
-	for (auto& w : toJoin)
+	if (!queued)
 	{
-		if (w.thread.joinable()) w.thread.join();
+		delete job;
+		return false;
+	}
+	_telCtlCv.notify_all();
+	return true;
+}
+
+void RequestsHandler::serveTelCtl(TelLane lane)
+{
+	std::unique_lock<std::mutex> lock(_telCtlMutex);
+	auto& jobs = _telCtlJobs[lane];
+	for (;;)
+	{
+		_telCtlCv.wait(lock, [&] { return _telCtlStop || !jobs.empty(); });
+		if (jobs.empty()) return;   // stopping, and nothing left to run
+		TelCtlJob* job = jobs.front();
+		jobs.pop_front();
+		if (lane == kLaneCtl && _telCtlHeld)
+		{
+			++_telCtlParked;
+			_telCtlCv.wait(lock, [this] { return !_telCtlHeld; });
+			--_telCtlParked;
+		}
+		lock.unlock();
+		runTelCtl(*job);
+		delete job;
+		lock.lock();
+	}
+}
+
+void RequestsHandler::stopTelCtl()
+{
+	{
+		std::lock_guard<std::mutex> lock(_telCtlMutex);
+		_telCtlStop = true;
+		_telCtlHeld = false;
+	}
+	_telCtlCv.notify_all();
+	for (auto& t : _telCtlThreads)
+	{
+		if (t.joinable()) t.join();
 	}
 }
 #endif
@@ -10140,13 +10111,6 @@ void RequestsHandler::tick()
 				queueLog("[Telephony] reaped orphaned media bridge (no session) leg " + bpart);
 			}
 		}
-
-#if !defined(ESP_PLATFORM) && !defined(ESP32)
-		// Join+erase any asyncMakeCall/asyncDropCall/asyncAnswerCall host worker
-		// that has finished, so the vector tracks in-flight calls rather than
-		// growing without bound over the object's life.
-		reapAnchorWorkers();
-#endif
 
 		// Sweep rate-limit buckets older than 60 seconds (Issue #58). The bucket map
 		// now lives under _rateMutex (so per-packet admission never serializes on the

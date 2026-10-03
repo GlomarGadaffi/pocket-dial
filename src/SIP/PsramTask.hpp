@@ -3,7 +3,7 @@
 
 // #100: place selected FreeRTOS task stacks + TCBs in PSRAM (8 MB) instead of the scarce ~290 KB
 // internal-RAM heap. The per-call anchor media tasks (RtpReceiver / RtpSender / GET-stream rx) and
-// the transient TLS workers (makecall / answer / dropcall) each take 6–12 KB of stack; with N
+// the anchor's TLS workers (tel_ctl / tel_drop / tel_sos, #657) each take 6–12 KB of stack; with N
 // concurrent calls those stacks exhaust internal RAM and xTaskCreate starts failing — the measured
 // concurrent-call ceiling (the freeHeap telemetry hides it because that counts PSRAM). Moving these
 // stacks to PSRAM lifts the ceiling toward the per-call socket/CPU limits instead.

@@ -14,6 +14,7 @@
 #include <lwip/sockets.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 #elif defined(__linux__)
 #include <netinet/in.h>
 #elif defined _WIN32 || defined _WIN64
@@ -35,6 +36,8 @@
 #include <chrono>
 #include <array>
 #include <thread>   // host-build async anchor-start worker (_anchorStartThread below)
+#include <condition_variable>   // host-build tel_ctl pool (#657)
+#include <deque>
 #include "SipMessage.hpp"
 #include "SipClient.hpp"
 #include "Session.hpp"
@@ -428,6 +431,11 @@ public:
 	// "anchor", "trunk", "trunk-unverified" or "none": the /api/status spelling.
 	static const char* emergencyRouteName(EmergencyRoute r);
 
+	// #657: the anchor's call-control pool (see startTelCtl()). makeCall and
+	// answerCall share these workers; past kTelCtlDepth waiting, a call is refused.
+	static constexpr int kTelCtlWorkers = POCKETDIAL_MAX_ANCHOR_CALLS < 2 ? POCKETDIAL_MAX_ANCHOR_CALLS : 2;
+	static constexpr int kTelCtlDepth = POCKETDIAL_MAX_ANCHOR_CALLS;
+
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only (Issue #521). Every host test boots the loopback anchor, which
 	// can never carry an emergency call. This lets it stand in for a real
@@ -445,18 +453,35 @@ public:
 	// calling convention over the loopback client so that branch can be
 	// driven. The CallEvent callback stays unwired (see the constructor), so
 	// no worker event ever completes such a call: it ends by CANCEL, by the
-	// ring reap, or by the spawn-failure path below.
+	// ring reap, or by the refusal path below. Starts the tel_ctl pool, as a
+	// real anchor's boot does.
 	void forceAsyncAnchorForTest(bool on)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_anchorBootType = on ? TelephonyProviderType::Telephony : TelephonyProviderType::Loopback;
+		if (on) startTelCtl();
 	}
-	// Test-only (#713): the next asyncMakeCall() behaves as if its worker could
-	// not be created (the ESP build's createTaskPreferPsram() failure).
+	// Test-only (#713): the next asyncMakeCall() is refused as if the tel_ctl
+	// queue were full.
 	void failNextAnchorWorkerSpawnForTest()
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_failNextAnchorWorkerSpawn = true;
+	}
+	// Test-only (#657): each tel_ctl worker parks after taking a job, as one
+	// stuck in makeCall's TLS round trip would. tel_drop and tel_sos run on.
+	void holdTelCtlForTest(bool on)
+	{
+		{
+			std::lock_guard<std::mutex> lock(_telCtlMutex);
+			_telCtlHeld = on;
+		}
+		_telCtlCv.notify_all();
+	}
+	int telCtlParkedForTest()
+	{
+		std::lock_guard<std::mutex> lock(_telCtlMutex);
+		return _telCtlParked;
 	}
 	// Test-only (#659): move every 911/933 dial mark `d` into the past.
 	void ageEmergencyCallbacksForTest(std::chrono::steady_clock::duration d)
@@ -1840,15 +1865,15 @@ private:
 	// makeCall()/dropCall()/answerCall() on a real anchor are blocking TLS HTTP
 	// round trips — calling them under _mutex would stall the whole SIP thread for
 	// the length of that HTTP call (this codebase's "no blocking I/O under the
-	// registrar lock" invariant). Each wrapper spawns a PSRAM-stack worker task
-	// (ESP: xTaskCreateWithCaps, 12288 bytes — 4096 bootlooped on real hardware,
-	// the TLS handshake needs the headroom) or a host worker thread (via
-	// spawnAnchorWorker(), reaped in tick()/the destructor) that calls the real
-	// method off the SIP thread, then re-takes _mutex only to log/react. Never
-	// called for a synchronous (Loopback) anchor — see anchorIsSynchronous().
-	// #713: false when the worker could not be created. The call is then already
-	// answered 503 and ended here; the caller must not report it as placed.
-	bool asyncMakeCall(const std::string& destination, const std::string& callId, const std::string& callerNumber);
+	// registrar lock" invariant). Each wrapper posts a job to the tel_ctl pool
+	// (#657, below), whose worker calls the real method off the SIP thread, then
+	// re-takes _mutex only to log/react. A synchronous (Loopback) anchor has no
+	// pool: asyncDropCall()/asyncAnswerCall() call it inline, as endCall() does.
+	// #713: false when the job was refused. The call is then already answered
+	// 503 and ended here; the caller must not report it as placed. `emergency`
+	// (a 911/933) takes the sos lane, which ordinary setup never fills.
+	bool asyncMakeCall(const std::string& destination, const std::string& callId, const std::string& callerNumber,
+		bool emergency);
 	// 503 a still-ringing outbound anchor call off its stored INVITE (endCall()
 	// sends no response itself). Caller holds _mutex; outbox is _outbox on the
 	// SIP thread or _asyncOutbox from a worker.
@@ -1870,29 +1895,59 @@ private:
 	// party.
 	bool bindOutboundParticipant(const std::string& callId, const std::string& ownLeg);
 
-#if !defined(ESP_PLATFORM) && !defined(ESP32)
-	// Host-only worker-thread pool backing the async wrappers above (mirrors
-	// drawbridge's own spawnAnchorWorker/reapAnchorWorkers exactly — ESP has no
-	// equivalent because xTaskCreateWithCaps tasks self-delete). A detached
-	// std::thread here would capture `this` and could outlive the handler in the
-	// unit-test process (the exact hazard _anchorStartThread above already guards
-	// against for the one-time start() call) — these run per CALL instead of once,
-	// so they need their own pool, joined opportunistically here and drained in
-	// ~RequestsHandler().
-	struct AnchorWorker
+	// ── #657: the tel_ctl pool ───────────────────────────────────────────────────
+	// Workers created once, at boot, behind bounded queues: a call creates no
+	// task (it used to create a 12 KB one per makeCall, answerCall and dropCall,
+	// with no bound), and a burst is refused rather than met with more stacks.
+	// Three lanes, so neither a drop (#379: an undropped leg bills) nor a 911/933
+	// ever waits behind ordinary call setup:
+	//   ctl   kTelCtlWorkers workers: makeCall, answerCall
+	//   drop  one worker: dropCall
+	//   sos   one worker: a 911/933 makeCall
+	// A job is heap-allocated and its pointer queued, as tel_wsw does (a FreeRTOS
+	// queue copies items bytewise). postTelCtl() never blocks, so a worker may
+	// post under _mutex (runTelCtl()'s #379 orphan drop).
+	struct TelCtlJob
 	{
-		std::thread thread;
-		std::shared_ptr<std::atomic<bool>> done;
+		enum Kind : uint8_t { Make, Answer, Drop } kind = Drop;
+		std::string dest;
+		std::string callId;
+		std::string callerNumber;
+		std::string partId;
 	};
-	void spawnAnchorWorker(std::function<void()> job);
-	// Join + erase every worker whose done-flag is set. Caller MUST hold
-	// _anchorWorkMutex.
-	void reapFinishedLocked();
-	// Called from tick(): reap finished anchor workers. drainAll blocks until
-	// every worker has finished (the destructor's belt-and-suspenders join).
-	void reapAnchorWorkers(bool drainAll = false);
-	std::mutex _anchorWorkMutex;
-	std::vector<AnchorWorker> _anchorWorkThreads;
+	enum TelLane : uint8_t { kLaneCtl, kLaneDrop, kLaneSos, kTelLanes };
+	static constexpr int kTelSosDepth = POCKETDIAL_MAX_SESSIONS;   // every session a ringing 911
+	// Every session's leg, plus every makeCall in flight on ctl or sos: each can
+	// orphan one (#379).
+	static constexpr int kTelDropDepth =
+		POCKETDIAL_MAX_SESSIONS + kTelCtlWorkers + kTelCtlDepth + 1 + kTelSosDepth;
+	static constexpr int kTelLaneDepth[kTelLanes] = { kTelCtlDepth, kTelDropDepth, kTelSosDepth };
+	// Idempotent. On the device only the constructor calls it, for a real anchor.
+	void startTelCtl();
+	// Takes ownership. False (job deleted) when the lane is full or has no worker.
+	bool postTelCtl(TelCtlJob* job, TelLane lane);
+	void runTelCtl(const TelCtlJob& job);
+#if defined(ESP_PLATFORM) || defined(ESP32)
+	struct TelCtlQueue
+	{
+		RequestsHandler* self = nullptr;
+		QueueHandle_t q = nullptr;
+	};
+	TelCtlQueue _telCtl[kTelLanes];
+	// Never returns: the handler lives as long as the device.
+	static void telCtlTask(void* lane);
+#else
+	void serveTelCtl(TelLane lane);
+	// Runs every queued job, then joins. Outside _mutex: a job takes it.
+	void stopTelCtl();
+	std::mutex _telCtlMutex;   // taken after _mutex, never before it
+	std::condition_variable _telCtlCv;
+	std::deque<TelCtlJob*> _telCtlJobs[kTelLanes];
+	std::thread _telCtlThreads[kTelCtlWorkers + 2];
+	bool _telCtlUp = false;
+	bool _telCtlStop = false;
+	bool _telCtlHeld = false;   // holdTelCtlForTest()
+	int _telCtlParked = 0;
 	bool _failNextAnchorWorkerSpawn = false;   // #713 test seam; under _mutex
 #endif
 
