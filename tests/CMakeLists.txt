@@ -43,6 +43,7 @@ include_directories(${CMAKE_BINARY_DIR}/generated)
 
 add_executable(sip_parser_tests
     SipMessage_test.cpp
+    SipMessageBuilder_test.cpp
     # RFC regressions found by tests/interop/ (real pjsip stack): SDP answers
     # that invented payload types, Via received/rport naming the server instead
     # of the request source, and a non-2xx final response to a PBX-originated
@@ -550,6 +551,7 @@ add_executable(sip_parser_tests
     # touches a socket by design (see its header: the caller owns the _outbox vs
     # _asyncOutbox choice), so it links into the host suite with no stub arm.
     ../src/SIP/SipRegistrationClient.cpp
+    ../src/SIP/SipMessageBuilder.cpp
     # ArpLookup compiles to a host stub (returns nullopt — no ARP table off-device)
     # under !ESP_PLATFORM, so it links cleanly into the host test binary and lets
     # RequestsHandler's Learn-mode path build on the desktop.

@@ -168,6 +168,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # needs carrier credentials. Built here so the
                             # firmware and the host suite compile the same code.
                             "../src/SIP/SipRegistrationClient.cpp"
+                            "../src/SIP/SipMessageBuilder.cpp"
                             "../src/SIP/RegisterBeeper.cpp"
                             "../src/SIP/SipTrunk.cpp"
                             "../src/SIP/TrunkResolver.cpp"

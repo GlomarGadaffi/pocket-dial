@@ -1,5 +1,6 @@
 // RequestsHandler.cpp: Issues #24 and #28 resolved.
 #include "RequestsHandler.hpp"
+#include "SipMessageBuilder.hpp"
 #include "SipMessagePool.hpp"
 #include <cassert>
 #include <atomic>
@@ -10111,69 +10112,35 @@ std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClientByAddress(c
 
 std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_ptr<SipClient>& client)
 {
-	// Issue #463 (#284 rank 3): the dominant allocator on an idle board -- one of
-	// these per registered phone every 5 s. It used to be an ostringstream (512 B
-	// on its first overflow) plus a str() copy plus seven std::string temporaries.
-	// Now it is formatted into a stack buffer. Every random ID is kept at or under
-	// the 15-character SSO bound, so IDGen allocates nothing either: the Call-ID's
-	// random part is 15 characters (~89 bits) rather than 16, and the branch's
-	// "z9hG4bK" magic cookie is written by the format, not concatenated.
+	// Issue #744 (strangler plan: builder track B1): migrated to sipb::options.
+	// Builds directly into a bounded sipb::Wire buffer with zero heap allocations.
 	char destIp[INET_ADDRSTRLEN]{};
 	inet_ntop(AF_INET, &client->getAddress().sin_addr, destIp, sizeof(destIp));
 	const unsigned destPort = ntohs(client->getAddress().sin_port);
-	const std::string callId  = IDGen::GenerateID(15);
-	const std::string branch  = IDGen::GenerateID(12);
-	const std::string fromTag = IDGen::GenerateID(9);
 	const std::string& num = client->getNumber();
-	const int numLen = static_cast<int>(num.size());
-	const int svcLen = static_cast<int>(pbx::kServiceServer.size());
 
-	// #797: the URI the phone registered, parameters included (a Snom answers 404
-	// without its ;line=). Without one, the address it registered from.
-	char fallbackUri[8 + 64 + INET_ADDRSTRLEN + 8];
-	const std::string& registeredUri = client->getContactUri();
-	if (registeredUri.empty())
-	{
-		const int u = std::snprintf(fallbackUri, sizeof(fallbackUri), "sip:%.*s@%s:%u", numLen, num.data(), destIp, destPort);
-		if (u <= 0 || static_cast<size_t>(u) >= sizeof(fallbackUri))
-		{
-			return nullptr;   // unreachable with a <=64-char AOR; same "no ping this round" contract as below
-		}
-	}
-	const char* const requestUri = registeredUri.empty() ? fallbackUri : registeredUri.c_str();
+	sipb::OptionsParams p{};
+	p.targetAor = num;
+	p.destIp = destIp;
+	p.destPort = static_cast<uint16_t>(destPort);
+	p.localIp = _localIp;
+	p.localPort = static_cast<uint16_t>(_serverPort);
+	p.fromUser = pbx::kServiceServer;
+	p.requestUri = client->getContactUri();
 
-	char buf[640];
-	const int n = std::snprintf(buf, sizeof(buf),
-		"OPTIONS %s SIP/2.0\r\n"
-		"Via: SIP/2.0/UDP %s:%d;branch=z9hG4bK%s\r\n"
-		"To: <sip:%.*s@%s:%u>\r\n"
-		"From: <sip:%.*s@%s:%d>;tag=%s\r\n"
-		"Call-ID: %s@%s\r\n"
-		"CSeq: 1 OPTIONS\r\n"
-		"Max-Forwards: 70\r\n"
-		"User-Agent: pocket-dial\r\n"
-		"Content-Length: 0\r\n\r\n",
-		requestUri,
-		_localIp.c_str(), _serverPort, branch.c_str(),
-		numLen, num.data(), destIp, destPort,
-		svcLen, pbx::kServiceServer.data(), _localIp.c_str(), _serverPort, fromTag.c_str(),
-		callId.c_str(), _localIp.c_str());
-	// A truncated ping would be a malformed request; the caller already treats
-	// nullptr as "no ping this round" and does not stamp the interval, so it is
-	// retried next tick. Counted, and logged the first time, rather than silent
-	// (Sonny-OG's review, same pattern as #438/#456). The worst case with a
-	// 64-character AOR (kMaxAorLen), a dotted-quad local IP and a full-length registered Contact is ~500 B, so
-	// this needs an input no real board has.
-	if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf))
+	sipb::OptionsWire wire{};
+	const sipb::Err err = sipb::options(wire, p);
+
+	if (err != sipb::Err::Ok)
 	{
 		if (_optionsPingTruncated.fetch_add(1, std::memory_order_relaxed) == 0)
 		{
 			queueLog("OPTIONS ping to " + num + " refused: it does not fit the " +
-				std::to_string(sizeof(buf)) + " B buffer (#463)", true);
+				std::to_string(sipb::kMaxOptionsBytes) + " B cap (#463/#744)", true);
 		}
 		return nullptr;
 	}
-	return getMessageFromPool(std::string_view(buf, static_cast<size_t>(n)), client->getAddress());
+	return getMessageFromPool(std::string_view(wire.bytes, wire.len), client->getAddress());
 }
 
 std::shared_ptr<SipClient> RequestsHandler::allocateClient(std::string number, sockaddr_in address, int expiresSeconds)
