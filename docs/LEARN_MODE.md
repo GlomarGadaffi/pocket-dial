@@ -71,9 +71,10 @@ Two consequences you must plan around:
   cannot occur.** On an ARP miss `admitLearn()` adopts *nothing*: it accepts the REGISTER,
   unless the extension is already locked or secured. A locked extension is accepted only
   from its registered IP and port (the owner's own refresh; ARP entries age out, and the
-  table holds 40 on the full builds, 10 on the 8-phone constrained one); any other source gets
-  `503` with `Retry-After: 5` (sending it makes the box ARP the phone, so the retry can
-  resolve). A secured one is digest-challenged (#507). The
+  table holds 40 on the full builds, 10 on the 8-phone constrained one). Any other source on
+  the box's subnet gets no answer while the box ARPs it, and the phone's retransmission of the
+  same REGISTER is checked against the lock as usual (#864); a source on another subnet gets
+  `503` with `Retry-After: 5`. A secured one is digest-challenged (#507). The
   MAC is the device map's key (`Registrar.hpp:126`), so a
   row with a blank MAC cannot exist; the phone is simply **absent** from the roster until a
   cycle where ARP resolves. Wait one registration interval and re-check; look for a missing
@@ -341,7 +342,7 @@ to deliver the new secret.
 | Adopted but **MAC is blank** | First-packet ARP miss (§2) | Wait one registration interval; the MAC resolves on the next cycle. Don't secure it until the MAC reads. |
 | Phone drops to `401`/`403` after you secured it | New secret not yet on the handset, or typed wrong | Re-enter the secret on the phone; confirm it matches the one you set (rotate again if unsure). |
 | A **different MAC** is rejected for an extension | The extension↔MAC **lock** working as designed | If the MAC change is legitimate, **forget** then re-adopt (§6). If not, you have a rogue device. Investigate. |
-| `503` with `Retry-After: 5` on REGISTER in Learn | The extension is locked, this REGISTER's source did not resolve in ARP (an aged-out entry, or a sender that is not on this subnet), and it is not the extension's registered IP and port (a refresh from there is accepted) | Nothing for an on-link phone: the box ARPs it while answering and the retry succeeds. A locked phone that keeps getting it now sits behind a router (§2): forget its device. |
+| `503` with `Retry-After: 5` on REGISTER in Learn | The extension is locked, this REGISTER's source is not on the box's subnet (so ARP cannot resolve it), and it is not the extension's registered IP and port (a refresh from there is accepted). An on-link source never sees it: the box ARPs it without answering and checks its retransmission (#864) | A locked phone that keeps getting it sits behind a router (§2): forget its device. |
 | Unexpected device appears on the roster during the window | Someone associated and claimed an unclaimed extension (TOFU) | Forget it; tighten the link (WPA2), shorten the window, re-run (§5). |
 | New phone won't register after you flipped to **Secure** | Secure mode challenges everything; an un-adopted phone has no secret | Briefly return to **Learn** to adopt it (or set its secret + adopt MAC), then return to **Secure**. |
 | Phones work but you suspect eavesdropping during cutover | Open AP: TOFU window and creds observable on the link | Enable **WPA2 on the SoftAP** (the fix with the biggest payoff; [THREAT_MODEL.md](THREAT_MODEL.md) §6) and re-run the window. |

@@ -944,6 +944,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		}
 	}
 
+	sockaddr_in arpRequest{};
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 
@@ -1278,10 +1279,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		drainPassLocked(_rxOutboxScratch, _rxLogScratch);
 		_passThroughMsg = nullptr;
 		_noReplyInbound.reset();
+		arpRequest = _rxArpRequest;
+		_rxArpRequest = sockaddr_in{};
 	}
 
 	// Issue #24: logs are printed and the UDP sendto runs outside the lock.
 	flushPass(_rxOutboxScratch, _rxLogScratch);
+	// #864: the next retransmission asks again if this one fails.
+	if (arpRequest.sin_family == AF_INET) (void)ArpLookup::pdSendArpRequest(arpRequest);
 }
 
 void RequestsHandler::drainPassLocked(
@@ -1462,6 +1467,12 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		{
 			// The registrar already enqueued the 401 (or a 503 + Retry-After: #515's
 			// adoption limit, #440's ARP miss on a locked extension).
+			return;
+		}
+		if (decision == Registrar::AuthDecision::Drop)
+		{
+			// #864: no response; handle() ARPs the source after the pass.
+			_rxArpRequest = data->getSource();
 			return;
 		}
 		if (decision == Registrar::AuthDecision::Reject)

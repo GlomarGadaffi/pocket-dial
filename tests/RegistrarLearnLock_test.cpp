@@ -13,7 +13,9 @@
 //   another MAC for a locked extension -> 403;
 //   an ARP miss for a locked extension -> accepted from the extension's
 //   registered IP:port (the owner's refresh; lwIP's ARP table is smaller than
-//   the client pool), else 503 + Retry-After, never 403;
+//   the client pool); else, from this subnet, unanswered while the source is
+//   ARPed, so its retransmission is checked (#864); else 503 + Retry-After;
+//   never 403;
 //   one MAC registering two extensions -> shared, never locked (NAT router);
 //   a full table evicts an unlocked entry (offline first, then the oldest),
 //   never a locked one.
@@ -213,9 +215,10 @@ TEST_F(LearnLockTest, AnArpMissOnALockedExtensionIsRetryableNotALockout)
 {
 	ASSERT_NO_FATAL_FAILURE(lockOwner());
 
-	// A source that neither resolves nor is the registered binding: the owner
-	// from a new address whose ARP entry is not there yet, or an off-link
-	// impostor. The PBX cannot tell which, so it asks for a retry.
+	// A source that neither resolves nor is the registered binding, and is on no
+	// subnet of the board's (no setMockOnLink; an on-link one is ARPed, #864): the
+	// owner behind a router, or an off-link impostor. The PBX cannot tell which,
+	// so it asks for a retry.
 	ArpLookup::clearMockMacs();
 	EXPECT_EQ(registerFrom("201", "192.168.60.77").substr(0, 11), "SIP/2.0 503")
 		<< "unverifiable on a locked extension: ask for a retry, never 403 the owner";

@@ -2392,6 +2392,9 @@ private:
 	std::vector<std::pair<bool, std::string>>                        _rxLogScratch;
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _tickOutboxScratch;
 	std::vector<std::pair<bool, std::string>>                        _tickLogScratch;
+	// #864: the source of a REGISTER onRegister() dropped (AuthDecision::Drop),
+	// which handle() ARPs once _mutex is released. Guarded by _mutex.
+	sockaddr_in _rxArpRequest{};
 
 	// The end of every handle()/tick() pass, in two halves around the lock:
 	// drainPassLocked() under _mutex (take this pass's outbox and log queue into
