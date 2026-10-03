@@ -16,6 +16,7 @@
 #include <ws2tcpip.h>   // inet_ntop / INET_ADDRSTRLEN live here, not in WinSock2.h
 #endif
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -68,6 +69,19 @@ namespace sipwire
 		out += ";received=";
 		out += ipBuf;
 		return out;
+	}
+
+	// #398 D review: whether a relay may send RTP to `addr`, the address an SDP
+	// c= named. Never "this network" (0/8), loopback (127/8), multicast (224/4),
+	// reserved or broadcast (240/4), this host, or this host's subnet broadcast
+	// (only when the netmask is known, 0 meaning not, and not a /31 or /32,
+	// which have none). Host byte order throughout.
+	inline bool isUsableRtpPeer(uint32_t addr, uint32_t ownAddr, uint32_t ownMask)
+	{
+		const uint32_t top = addr >> 24;
+		if (top == 0 || top == 127 || top >= 224 || addr == ownAddr) return false;
+		return ownMask == 0 || ~ownMask <= 1u ||
+			(addr & ownMask) != (ownAddr & ownMask) || (addr & ~ownMask) != ~ownMask;
 	}
 
 	// Minimal, well-formed a=inactive offer: the server sources no RTP, so the

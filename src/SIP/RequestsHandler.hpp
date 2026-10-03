@@ -1730,6 +1730,20 @@ private:
 	// transaction (RFC 3261 s17.1.1.3), a 2xx's as a new one (s13.2.2.4).
 	void ackTrunkInboundFork(const std::shared_ptr<Session>& s, const std::shared_ptr<SipMessage>& resp);
 	bool isTrunkInbound(const Session& s) const;
+	// The RTP address an offer or answer names, only when its c= is a dotted
+	// quad that is neither 0.0.0.0 nor broadcast: a relay is never aimed at one.
+	bool trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out);
+	// #398 part D. A request in the fork's own INVITE transaction (the INVITE,
+	// or its CANCEL, RFC 3261 s9.1): one Request-URI, Via branch, From and To.
+	std::shared_ptr<SipMessage> trunkForkRequest(const Session& s, const SipClient& handset,
+		std::string_view method, const std::string& sdp = {});
+	// CANCEL a still-ringing fork; its 487 (or the re-armed timer) ends the call.
+	void cancelTrunkInboundFork(const std::shared_ptr<Session>& s);
+	// End a carrier's call to us from a PBX-side reason: BYE the handset (it is
+	// dest; src is the caller's stand-in) or CANCEL its fork, onto `out`, then
+	// endCall(), which ends the carrier leg (SipTrunk::hangup()) and the relay.
+	void endTrunkInboundCall(const std::string& callID, const std::shared_ptr<Session>& s,
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& out, const std::string& reason);
 #endif
 
 	// `placedOut` (optional, Issue #166): true only when a call was actually

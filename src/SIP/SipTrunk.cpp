@@ -771,11 +771,43 @@ bool SipTrunk::handleAck(const SipMessage& ack)
 {
 	Dialog* d = findMutableByTrunkCallID(ack.getCallID());
 	if (!d || d->role != Role::Inbound || d->state != State::Confirmed ||
-		siphdr::tagOf(ack.getTo()) != d->toTag)
+		siphdr::tagOf(ack.getTo()) != d->toTag ||
+		ack.getSource().sin_addr.s_addr != d->peer.sin_addr.s_addr)   // #356, as handleCancel()
 	{
 		return false;
 	}
 	d->ackSeen = true;
+	if (d->byeAfterAck) hangup(d->callID);   // #398 part D: the BYE s15 held for this ACK
+	return true;
+}
+
+bool SipTrunk::handleCancel(const std::shared_ptr<SipMessage>& data)
+{
+	Dialog* d = data ? findMutableByTrunkCallID(data->getCallID()) : nullptr;
+	if (!d || d->role != Role::Inbound || data->getSource().sin_addr.s_addr != d->peer.sin_addr.s_addr)
+	{
+		return false;
+	}
+	// RFC 3261 s9.2: the CANCEL gets its own 200 (our To tag, as on the INVITE's
+	// responses), whatever happens to the INVITE.
+	if (auto ok = _env.messageFromPool(data->toString(), data->getSource()))
+	{
+		ok->setHeader(SipMessageTypes::OK);
+		ok->clearBody();
+		ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));   // RFC 3581 s4
+		if (std::string_view(data->getTo()).find("tag=") == std::string_view::npos)
+			ok->setTo(std::string(data->getTo()) + ";tag=" + d->toTag);
+		ok->syncContentLength();
+		_env.enqueue(data->getSource(), std::move(ok));
+	}
+	if (d->state != State::Trying && d->state != State::Proceeding) return true;   // answered: no effect
+
+	// Its 487 keeps its server transaction (Timer G until the carrier ACKs), so
+	// the transactions for this Call-ID are not freed.
+	respondTo(*d, 487);
+	const Dialog finished = std::move(*d);
+	*d = Dialog{};
+	if (_listener) _listener->onTrunkFailed(eventFor(finished), 487);
 	return true;
 }
 #endif
@@ -1093,6 +1125,17 @@ bool SipTrunk::hangup(std::string_view callID)
 
 	if (d->state == State::Confirmed)
 	{
+#if POCKETDIAL_TRUNK_INBOUND
+		// #398, RFC 3261 s15: the callee sends no BYE before the ACK for its 2xx,
+		// or before that 2xx's retransmissions time out (64*T1). handleAck() or
+		// sweep() sends it then.
+		if (d->role == Role::Inbound && !d->ackSeen)
+		{
+			d->byeAfterAck = true;
+			d->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(32);
+			return true;
+		}
+#endif
 		const std::string bye = buildBye(*d, "z9hG4bK" + IDGen::GenerateID(12));
 		if (!bye.empty())
 		{
@@ -1298,6 +1341,16 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 		// than one that does not. Terminating gets its own short deadline from
 		// hangup(), which is what reclaims a slot whose BYE went unanswered, so
 		// nothing leaks by exempting only this state.
+#if POCKETDIAL_TRUNK_INBOUND
+		// #398: except a BYE held for an ACK that never came (s15): the 2xx's
+		// retransmission window is over, so it goes out now.
+		if (d.state == State::Confirmed && d.byeAfterAck)
+		{
+			d.ackSeen = true;
+			hangup(d.callID);
+			continue;
+		}
+#endif
 		if (d.state == State::Confirmed) continue;
 
 		// #712 (desmo, 2026-09-29): a 911/933 the carrier is working on (any 1xx

@@ -291,6 +291,9 @@ public:
 		std::string inviteRecordRoute;      // its Record-Route lines, likewise
 		// RFC 3261 s15: the carrier ACKed our 2xx, so a BYE may now be sent.
 		bool        ackSeen = false;
+		// #398 part D: hangup() came before that ACK; the BYE goes out when it
+		// arrives or when the 2xx's retransmissions time out (sweep()).
+		bool        byeAfterAck = false;
 #endif
 	};
 
@@ -486,8 +489,15 @@ public:
 	bool respond(std::string_view callID, int status, std::string_view sdp = {});
 
 	// The carrier's ACK for our 2xx on an inbound dialog: recorded as ackSeen and
-	// consumed. False for any other ACK. Matched on the trunk Call-ID and our To tag.
+	// consumed (and a BYE hangup() held for it goes out). False for any other ACK.
+	// Matched on the trunk Call-ID and our To tag.
 	bool handleAck(const SipMessage& ack);
+
+	// #398 part D: the carrier's CANCEL of its INVITE (RFC 3261 s9.2). From the
+	// INVITE's source only (#356); false for anything else. Answered 200; if the
+	// INVITE is still unanswered it also gets 487, the slot is released and the
+	// listener hears onTrunkFailed(487), which cancels the fork.
+	bool handleCancel(const std::shared_ptr<SipMessage>& data);
 #endif
 
 	// RFC 3261 §17.1.1.2 Timer B on our INVITE (#726): 64*T1 with no response
