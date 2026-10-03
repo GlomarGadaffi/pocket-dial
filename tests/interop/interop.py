@@ -749,10 +749,10 @@ def sc_mixed_stack(env):
 # heap/stack telemetry (#235 item 3)
 # --------------------------------------------------------------------------
 # HttpServer::sendApiStatus() (src/Helpers/HttpServer.cpp) emits an additive
-# JSON block for Issue #185: 8 heap counters, resetReason, and 5 per-task
+# JSON block for Issue #185: 8 heap counters, resetReason, and 9 per-task
 # stackHwm_* fields. Everything in it is #if defined(ESP_PLATFORM); the #else
 # arm emits the same key set with every reading replaced by 0 (the 8 numeric
-# fields) or JSON null (the 5 stackHwm_* fields) -- see that file's own
+# fields) or JSON null (the 9 stackHwm_* fields) -- see that file's own
 # comment and docs/API.md, which documents "0 on the host build" / "null on
 # the host build" for each field. #225/#321 (Issue #185, #235) wired real,
 # non-zero readings for these keys on-device; nothing exercised that wiring
@@ -797,12 +797,13 @@ TELEMETRY_NUMERIC_FIELDS = (
     "freeHeapInternal", "largestFreeBlockInternal",
     "freeHeapDma", "largestFreeBlockDma",
 )
-# The 5 per-task fields: int on-device (when that task exists / has run),
+# The 9 per-task fields: int on-device (when that task exists / has run),
 # JSON null (-> Python None) otherwise -- always PRESENT as a key, on both
 # platforms, per docs/API.md.
 TELEMETRY_HWM_FIELDS = (
     "stackHwm_sip_server_task", "stackHwm_udp_receiver_task",
     "stackHwm_rtp_media_tx", "stackHwm_rtp_media_rx", "stackHwm_conf_mix_tick",
+    "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos",
 )
 
 
@@ -839,7 +840,7 @@ def telemetry_check(status):
             return False, ("host build must report 0/null (docs/API.md), got "
                            "numeric=%s hwm=%s" % (bad_numeric, bad_hwm)), snapshot
         return True, ("host build: shape verified (8 numeric fields=0, "
-                      "5 stackHwm_*=null, by construction)"), snapshot
+                      "9 stackHwm_*=null, by construction)"), snapshot
 
     # Not reachable from this harness today (see the module comment above),
     # kept honest anyway: a real device reading must be an actual int, not

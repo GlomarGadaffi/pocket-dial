@@ -2413,6 +2413,12 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	pdAppendHwmField(json, "stackHwm_rtp_media_tx", pdStackHwmBytes("rtp_media_tx"));
 	pdAppendHwmField(json, "stackHwm_rtp_media_rx", pdStackHwmBytes("rtp_media_rx"));
 	pdAppendHwmField(json, "stackHwm_conf_mix_tick", pdStackHwmBytes("conf_mix_tick"));
+	// #657: 12 KB each by precedent, not measurement; these readings are what a
+	// smaller stack would need. null unless the boot anchor is a real one.
+	pdAppendHwmField(json, "stackHwm_tel_ctl0", pdStackHwmBytes("tel_ctl0"));
+	pdAppendHwmField(json, "stackHwm_tel_ctl1", pdStackHwmBytes("tel_ctl1"));
+	pdAppendHwmField(json, "stackHwm_tel_drop", pdStackHwmBytes("tel_drop"));
+	pdAppendHwmField(json, "stackHwm_tel_sos", pdStackHwmBytes("tel_sos"));
 	// Issue #366: not a live-task lookup like the others -- a connection thread is
 	// gone by the time anyone reads this -- but the worst figure recorded by any
 	// of them since boot. null until the first request has completed, which in
@@ -2430,7 +2436,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	       ",\"freeHeapDma\":0,\"largestFreeBlockDma\":0,\"resetReason\":\"n/a\"");
 	json.s(",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
 	       "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
-	       "\"stackHwm_conf_mix_tick\":null,\"stackHwm_http_conn\":null");
+	       "\"stackHwm_conf_mix_tick\":null,\"stackHwm_tel_ctl0\":null,\"stackHwm_tel_ctl1\":null,"
+	       "\"stackHwm_tel_drop\":null,\"stackHwm_tel_sos\":null,\"stackHwm_http_conn\":null");
 #endif
 	// Issue #405: the route class that produced the stackHwm_http_conn minimum
 	// (never the raw path, see routeLabel). null on the host build and until a
