@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <thread>
@@ -117,7 +118,8 @@ namespace
 		std::vector<std::string> wire;   // written only from handle(), on this thread
 		std::unique_ptr<RequestsHandler> handler;
 
-		Bench()
+		// `noWorker`: lanes whose worker could not be created at boot.
+		explicit Bench(std::initializer_list<RequestsHandler::TelLane> noWorker = {})
 		{
 			handler = std::make_unique<RequestsHandler>("192.168.79.1", 5060,
 				[this](const sockaddr_in&, std::shared_ptr<SipMessage> m) { wire.push_back(m->toString()); });
@@ -125,6 +127,7 @@ namespace
 			handler->handle(registerOf("200", "192.168.79.200"));
 			handler->setAnchorPlacesRealCallsForTest(true);
 			handler->setE911Config("200", "", "");
+			for (const auto lane : noWorker) handler->failTelCtlLaneForTest(lane);
 			handler->forceAsyncAnchorForTest(true);
 			wire.clear();
 		}
@@ -238,4 +241,46 @@ TEST(TelCtlPool, AnEmergencyCallIsNotQueuedBehindOrdinaryCallSetup)
 	EXPECT_FALSE(b.sent("NOT ROUTED"));
 	EXPECT_TRUE(waitFor([&] { return b.loopback()->lastMakeCallDestination() == "911"; }))
 		<< "the 911 makeCall waited behind parked ordinary ones";
+}
+
+// A lane whose 12 KB worker could not be created at boot posts to tel_ctl: a
+// late 911 or drop beats every one refused until reboot.
+
+TEST(TelCtlPool, A911WhoseWorkerFailedAtBootStillRoutes)
+{
+	Bench b({ RequestsHandler::kLaneSos });
+	const int sos = kWorkers + kDepth;
+
+	b.dial(sos, "911");
+
+	EXPECT_EQ(b.answers("SIP/2.0 180", callId(sos)), 1);
+	EXPECT_EQ(b.answers("SIP/2.0 503", callId(sos)), 0) << "tel_sos had no worker, so every 911 was refused";
+	EXPECT_TRUE(b.sent("ROUTED TO TRUNK"));
+	EXPECT_FALSE(b.sent("NOT ROUTED"));
+	EXPECT_TRUE(waitFor([&] { return b.loopback()->lastMakeCallDestination() == "911"; }));
+}
+
+TEST(TelCtlPool, ADropWhoseWorkerFailedAtBootStillRuns)
+{
+	Bench b({ RequestsHandler::kLaneDrop });
+	const unsigned before = b.loopback()->dropCallCount();
+
+	b.handler->anchorMediaNeverOpenedForTest("leg-657");
+
+	EXPECT_TRUE(waitFor([&] { return b.loopback()->dropCallCount() == before + 1; }))
+		<< "tel_drop had no worker, so every drop was refused: orphaned legs stay up and bill";
+}
+
+TEST(TelCtlPool, A911WithNoWorkerAnywhereIsRefused503)
+{
+	// The fallback has no worker either: the #713 refusal, never a 911 queued
+	// where nothing will run it.
+	Bench b({ RequestsHandler::kLaneSos, RequestsHandler::kLaneCtl });
+	const int sos = kWorkers + kDepth;
+
+	b.dial(sos, "911");
+
+	EXPECT_EQ(b.answers("SIP/2.0 503", callId(sos)), 1);
+	EXPECT_FALSE(b.handler->getSession("Call-ID: " + callId(sos)).has_value());
+	EXPECT_TRUE(b.sent("NOT ROUTED"));
 }
