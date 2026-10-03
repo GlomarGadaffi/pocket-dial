@@ -2332,7 +2332,7 @@ ESP build, erases the **whole NVS partition** (`nvs_flash_erase()`, #456) and re
 > the board boots as a fresh install (registrar `learn`). The per-key erases listed
 > above are what the response reports on; the whole-partition erase is what removes the
 > old bytes from flash (`nvs_erase_key()` leaves them readable until page GC). The keypad
-> door, `*<PIN>#999#1`, ends the same way. Nothing reaches the SD card after its wipe,
+> door, `*<PIN>#999#1`, ends the same way. No CDR line or voicemail recording reaches the SD card after its wipe,
 > even while a 911/933 call holds the restart (#450).
 >
 > **What survives:** the `cfgseed` partition (the browser flasher's install-time seed),

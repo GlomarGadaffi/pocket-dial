@@ -6,7 +6,7 @@
 #include <cstring>
 #include <mutex>
 
-#include "ResetGuard.hpp"   // #450: nothing is written to the card once a reset began
+#include "ResetGuard.hpp"   // #450: no CDR line reaches the card once a reset began
 #include "TimeSync.hpp"
 
 #if defined(PD_ETH_HAS_SD)
@@ -173,7 +173,7 @@ void WriterQueue::clear()
 
 void drainAll(WriterQueue& queue, Sink& sink)
 {
-	// #450: once a factory reset has begun, nothing more reaches the card. The
+	// #450: once a factory reset has begun, no CDR line reaches the card. The
 	// board runs on until its restart (a 911 call can hold it, #652), and a call
 	// that ends in that window would put its CDR back after wipeAll(). Both doors
 	// raise the guard before their wipe, and wipeAll() takes the lock the writer
