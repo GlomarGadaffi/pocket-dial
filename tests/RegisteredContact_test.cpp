@@ -569,6 +569,7 @@ TEST(ByeLocalAnswer, AByeTheBuilderRefusesStillAnswersTheSenderAndEndsTheSession
 	const std::string ok = findSentTo(sent, yealink, "CSeq: 7 BYE");
 	EXPECT_EQ(ok.rfind("SIP/2.0 200", 0), 0u) << "the sender's BYE is answered 200: " << requestLineOf(ok);
 	EXPECT_EQ(countSentTo(sent, snom, "BYE "), 0) << "nothing partial goes to the far leg";
+	EXPECT_EQ(handler.getByeTruncated(), 1u) << "and the refusal is counted for /api/status";
 	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value())
 		<< "no BYE is out whose answer would end the session, so it ends here";
 }

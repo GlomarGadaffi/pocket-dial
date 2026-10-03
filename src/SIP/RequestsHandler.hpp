@@ -226,6 +226,11 @@ public:
 	static constexpr size_t kArpRequestSources = 4;
 	static constexpr std::chrono::milliseconds kArpRequestWindow{1000};
 	uint32_t getLearnArpRequestsLimited() const { return _learnArpRequestsLimited.load(std::memory_order_relaxed); }
+	// Server BYEs sipb::bye() refused (#744): too long for sipb::kMaxByeBytes, or
+	// a field empty or carrying a control byte. The far leg got no BYE and stays
+	// up until it hangs up or the session sweep; a dialog's From and To are not
+	// bounded on ingress (#870).
+	uint32_t getByeTruncated() const { return _byeTruncated.load(std::memory_order_relaxed); }
 	size_t getClientCount();
 	size_t getSessionCount();
 	// Legs currently mixed on the meet-me conference (virtual extension 888); 0 while
@@ -2558,6 +2563,7 @@ private:
 #endif
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
 	std::atomic<uint32_t> _optionsPingTruncated{0};   // #463: see getOptionsPingTruncated()
+	std::atomic<uint32_t> _byeTruncated{0};           // #744: see getByeTruncated()
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
 	// count is the packet-loss signal this layer exists to absorb, so it is worth

@@ -172,6 +172,7 @@ TEST(HttpStatusAlloc, TheHandlerBugCountersAreOnStatusAndPacketsDroppedIsTheirSu
 	const std::string resp = b.serve(false);
 	EXPECT_NE(resp.find("\"repliesRefused\":0,"), std::string::npos) << resp;
 	EXPECT_NE(resp.find("\"optionsPingTruncated\":0,"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"byeTruncated\":0,"), std::string::npos) << resp;   // #744
 	EXPECT_NE(resp.find("\"packetsDropped\":1,"), std::string::npos) << resp;
 	EXPECT_NE(resp.find("\"droppedInvalid\":1,"), std::string::npos) << resp;
 	EXPECT_EQ(b.handler->getPacketsDropped(), b.handler->getDroppedInvalid() + b.handler->getDroppedRate());
