@@ -10246,8 +10246,8 @@ std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClientByAddress(c
 
 std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_ptr<SipClient>& client)
 {
-	// Issue #744 (strangler plan: builder track B1): migrated to sipb::options.
-	// Builds directly into a bounded sipb::Wire buffer with zero heap allocations.
+	// Issue #744 (builder track B1): sipb::options formats the ping on this stack,
+	// in a buffer the size of the #463 cap, without touching the heap.
 	char destIp[INET_ADDRSTRLEN]{};
 	inet_ntop(AF_INET, &client->getAddress().sin_addr, destIp, sizeof(destIp));
 	const unsigned destPort = ntohs(client->getAddress().sin_port);
@@ -11316,6 +11316,23 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
 	return ok;
 }
 
+namespace
+{
+	// The ByeWire gets a frame of its own: beside buildServerBye's ByeParams and
+	// locals it would pass the 1024 B frame ceiling (#457). GCC inlines a static
+	// function with one caller, which would put it back, hence noinline.
+#if defined(__GNUC__)
+	__attribute__((noinline))
+#endif
+	std::shared_ptr<SipMessage> byeFromPool(const sipb::ByeParams& p, const sockaddr_in& to, sipb::Err& err)
+	{
+		sipb::ByeWire wire;
+		err = sipb::bye(wire, p);
+		if (err != sipb::Err::Ok) return nullptr;
+		return RequestsHandler::getMessageFromPool(std::string_view(wire.bytes, wire.len), to);
+	}
+}
+
 std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 	const std::string& destExt,
 	const sockaddr_in& destAddr,
@@ -11324,32 +11341,42 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 	const std::string& toHeader,
 	uint32_t cseq)
 {
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-	std::string destIpPort = sipwire::addrToIpPort(destAddr);
-	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
+	char destIp[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &destAddr.sin_addr, destIp, sizeof(destIp));
+
+	sipb::ByeParams p{};
+	p.targetUser = destExt;
+	p.destIp = destIp;
+	p.destPort = ntohs(destAddr.sin_port);
+	p.localIp = _localIp;
+	p.localPort = static_cast<uint16_t>(_serverPort);
+	p.from = fromHeader;
+	p.to = toHeader;
+	p.callId = callId;
+	p.cseq = cseq;
 
 	// #798: the URI the phone registered, when this is that phone (a virtual peer
-	// or a moved binding falls back to the address form).
-	std::string requestUri = "sip:" + destExt + "@" + destIpPort;
-	if (auto phone = findClient(destExt);
-		phone.has_value() && !phone.value()->getContactUri().empty() &&
+	// or a moved binding falls back to the address form). `phone` holds the
+	// client whose Contact p.requestUri views until the BYE is built.
+	const auto phone = findClient(destExt);
+	if (phone.has_value() && !phone.value()->getContactUri().empty() &&
 		sameAddress(phone.value()->getAddress(), destAddr))
 	{
-		requestUri = phone.value()->getContactUri();
+		p.requestUri = phone.value()->getContactUri();
 	}
 
-	std::ostringstream ss;
-	ss << "BYE " << requestUri << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From: " << stripHeaderName(fromHeader) << "\r\n"
-	   << "To: " << stripHeaderName(toHeader) << "\r\n"
-	   << "Call-ID: " << stripHeaderName(callId) << "\r\n"
-	   << "CSeq: " << cseq << " BYE\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-
-	return getMessageFromPool(ss.str(), destAddr);
+	sipb::Err err = sipb::Err::Ok;
+	auto bye = byeFromPool(p, destAddr, err);
+	if (err != sipb::Err::Ok)
+	{
+		// Told apart because the fixes differ: a dialog too long for the cap, or
+		// a field that is empty or carries a control byte. A refused pool draw is
+		// logged by the pool.
+		queueLog("BYE to " + destExt + (err == sipb::Err::Truncated
+			? " not sent: longer than sipb::kMaxByeBytes (#744)"
+			: " not sent: a field is empty or carries a control byte (#744)"), true);
+	}
+	return bye;
 }
 
 // ── #453: in-dialog requests across a B2BUA splice ────────────────────────────

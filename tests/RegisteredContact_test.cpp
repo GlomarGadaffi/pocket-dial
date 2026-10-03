@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "IDGen.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
 
@@ -104,11 +105,11 @@ namespace
 	}
 
 	// Snom (100) calls Yealink (106), Yealink answers. Returns the Call-ID.
-	std::string connectCall(RequestsHandler& handler, Sent& sent, const std::string& callId)
+	std::string connectCall(RequestsHandler& handler, Sent& sent, const std::string& callId,
+	                        const std::string& yealinkContactLine = "Contact: <sip:106@192.168.31.20:5062>\r\n")
 	{
 		handler.handle(makeRegister("100", kSnomIp, 1037, snomContactLine()));
-		handler.handle(makeRegister("106", kYealinkIp, 5062,
-			"Contact: <sip:106@192.168.31.20:5062>\r\n"));
+		handler.handle(makeRegister("106", kYealinkIp, 5062, yealinkContactLine));
 
 		std::string body = sdpBody();
 		std::string invite =
@@ -334,6 +335,69 @@ TEST(RegisteredContact, ServerOriginatedByeIsAddressedToTheRegisteredContact)
 	ASSERT_FALSE(atCaller.empty()) << "the admin kill must BYE the caller";
 	EXPECT_EQ(requestLineOf(atCaller), std::string("BYE ") + kSnomContactUri + " SIP/2.0")
 		<< "a BYE the PBX authors itself needs the registered Contact too";
+}
+
+// ── #744 B2a: the server BYE's bytes are main's ──────────────────────────────────
+//
+// buildServerBye() moved from an ostringstream onto sipb::bye(). With IDGen's bytes
+// pinned, an admin kill puts on the wire byte for byte what main 20a4722 sent, for
+// both Request-URI forms #798 picks between: the Contact the Snom registered, and
+// the observed address of a phone that registered none.
+namespace
+{
+	uint8_t g_nextIdByte = 0;
+
+	// Counts up, so every identifier differs and an ID drawn twice, or drawn in a
+	// different order, shows in the bytes. The destructor puts the real source back
+	// even when an ASSERT ends the test early.
+	struct CountingIds
+	{
+		CountingIds()
+		{
+			g_nextIdByte = 0;
+			IDGen::setByteSourceForTest([](uint8_t* buf, size_t len) {
+				for (size_t i = 0; i < len; ++i) buf[i] = g_nextIdByte++;
+			});
+		}
+		~CountingIds() { IDGen::setByteSourceForTest(nullptr); }
+		CountingIds(const CountingIds&) = delete;
+		CountingIds& operator=(const CountingIds&) = delete;
+	};
+}
+
+TEST(RegisteredContact, ServerByeBytesAreMainsForBothRequestUriForms)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	connectCall(handler, sent, "rc-bye-bytes", "");   // 106 registers no Contact
+	{
+		CountingIds ids;
+		ASSERT_TRUE(handler.forceDisconnect("106"));
+	}
+	handler.tick();   // drainOutbox() merges _asyncOutbox
+
+	// The same two strings are SipMessageBuilder.ByeIsMainsBytesFor*'s goldens.
+	EXPECT_EQ(findSentTo(sent, addrFor(kSnomIp, 1037), "BYE "),
+		"BYE sip:100@192.168.31.10:1037;line=h2k6k1ih SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.31.1:5060;branch=z9hG4bK0123456789AB\r\n"
+		"From: <sip:106@server>;tag=ans106\r\n"
+		"To: <sip:100@server>;tag=ftrc-bye-bytes\r\n"
+		"Call-ID: rc-bye-bytes\r\n"
+		"CSeq: 2 BYE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Content-Length: 0\r\n"
+		"\r\n");
+	EXPECT_EQ(findSentTo(sent, addrFor(kYealinkIp, 5062), "BYE "),
+		"BYE sip:106@192.168.31.20:5062 SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.31.1:5060;branch=z9hG4bKGHIJKLMNOPQR\r\n"
+		"From: <sip:100@server>;tag=ftrc-bye-bytes\r\n"
+		"To: <sip:106@server>;tag=ans106\r\n"
+		"Call-ID: rc-bye-bytes\r\n"
+		"CSeq: 2 BYE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Content-Length: 0\r\n"
+		"\r\n");
 }
 
 // ── #808: an ordinary relayed call's BYE is answered locally ─────────────────────
