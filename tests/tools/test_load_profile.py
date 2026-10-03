@@ -62,6 +62,38 @@ def burst_gaps(plan):
     return [nxt["t"] - prev["end"] for prev, nxt in zip(b, b[1:])]
 
 
+class SampledClock(lp.FakeClock):
+    """A fake clock that records how many UAs the (fake) board has registered.
+
+    Every wait_until() first takes an entry (fake time, clientCount) and records its
+    target; snap() adds the final one. registered_at(T) is the last entry with time <= T:
+    the board's count AFTER everything the harness did at fake instant T. That is the worst
+    case for a status poll stamped the same second as a de-REGISTER, and the soak logger
+    produces it: tools/soak/status_logger.sh stamps whole seconds (date -u +%s) BEFORE a
+    curl that may take 2 s, so a poll up to about a second after quiesce_check_at is still
+    stamped t <= quiesce_check_at, which is what soak_verdict.py's idle-quiesce gate keeps.
+    stop_at: set the stop event (a SIGTERM) when a wait reaches that fake time.
+    """
+
+    def __init__(self, pbx, stop_at=None):
+        super().__init__()
+        self.pbx, self.stop_at = pbx, stop_at
+        self.states, self.targets = [], []
+
+    def snap(self):
+        self.states.append((self.t, self.pbx.status()["clientCount"]))
+
+    def wait_until(self, t):
+        self.snap()
+        self.targets.append(t)
+        if self.stop_at is not None and t >= self.stop_at:
+            self.stop.set()
+        return super().wait_until(t)
+
+    def registered_at(self, instant):
+        return [n for s, n in self.states if s <= instant][-1]
+
+
 @mock.patch.dict(os.environ, {"PD_OWNER_EXTS": ""})
 class PlanTest(unittest.TestCase):
     def check_shape(self, plan, duration):
@@ -226,6 +258,22 @@ class CheckoutTest(unittest.TestCase):
         for url, exp, want in cases:
             self.assertIn(want, " ".join(lp.checkout_problems(url, exp, now, 1000)), (url, exp))
 
+    def test_the_checkout_must_outlive_the_dereg_grace_too(self):
+        # The planned end is load + quiesce + the held-registered grace; END_MARGIN_S is slack
+        # PAST it. An expiry that clears the old end + margin by 10 s but not the grace is refused.
+        quiesce = lp.PROFILES["rc1"]["quiesce_s"]
+        short = expiry(600 + quiesce + lp.END_MARGIN_S + 10)
+        rc, out = run(args(5060, "--dry-run", "--checkout-url", CHECKOUT, "--checkout-expiry", short,
+                           checkout=False))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("before this run would end", out)
+        rc, out = run(args(5060, "--dry-run", "--checkout-url", CHECKOUT,
+                           "--checkout-expiry", expiry(7200), checkout=False))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("[ok]", out)
+        self.assertRegex(out, r"then \d+ s of registrations only, then \d+ s held registered, "
+                              r"then de-register", "the plan print names the grace")
+
     def test_dry_run_needs_no_checkout_and_sends_nothing(self):
         pbx = FakePbx().start()
         try:
@@ -329,6 +377,40 @@ class RunTest(unittest.TestCase):
         self.assertEqual(rep["registrations"]["deregistered"], 4)
         self.assertEqual(self.pbx.bindings, {})
         self.assertEqual(self.pbx.sessions, {})
+
+    def test_the_test_uas_are_still_registered_at_quiesce_check_at(self):
+        # The 1 h Elite run's only FAIL: the UAs de-registered at +3901 s, the quiesce sample
+        # (+3900 s) saw registrations 0 (want exactly 4). Every sample stamped <= quiesce_check_at
+        # must see them: a second before it, at it, and up to a second after it.
+        clock = SampledClock(self.pbx)
+        rc, out, rep = self.go(clock=clock)
+        clock.snap()
+        q = rep["quiesce_check_at"] - clock.base
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(q, 600 + lp.PROFILES["rc1"]["quiesce_s"], "quiesce_check_at is unchanged")
+        for dt in (-1, 0, 0.9):
+            n = clock.registered_at(q + dt)
+            self.assertEqual(n, len(EXTS),
+                             "the board counted %d registrations at quiesce_check_at %+.1f s (want %d): "
+                             "the final de-REGISTER came too soon" % (n, dt, len(EXTS)))
+        self.assertEqual(rep["registrations"]["deregistered"], len(EXTS))
+        self.assertEqual(self.pbx.bindings, {}, "and they are all gone at the end")
+
+    def test_an_interrupted_run_deregisters_at_once_and_never_waits_out_the_grace(self):
+        q = 600 + lp.PROFILES["rc1"]["quiesce_s"]
+        # mid-run; in the quiesce wait; in the held-registered wait after it (the plan and the
+        # quiesce sample are done by then, so that stop is not an interruption of the plan)
+        for stop_at, interrupted, last_wait in ((300, True, q), (q, True, q), (q + 1, False, None)):
+            with self.subTest(stop_at=stop_at):
+                clock = SampledClock(self.pbx, stop_at=stop_at)
+                rc, out, rep = self.go(clock=clock)
+                self.assertEqual(rep["interrupted"], interrupted)
+                self.assertLessEqual(clock.t, q, "the clock never sat through the grace")
+                if last_wait is not None:       # a stop before the grace wait must not even start one
+                    self.assertLessEqual(max(clock.targets), last_wait, clock.targets[-3:])
+                self.assertEqual(rep["registrations"]["deregistered"], len(EXTS))
+                self.assertEqual(self.pbx.bindings, {})
+                self.assertEqual(self.pbx.sessions, {})
 
     @unittest.skipUnless(hasattr(signal, "SIGTERM") and os.name == "posix", "POSIX signals")
     def test_sigterm_mid_run_still_cleans_up(self):
