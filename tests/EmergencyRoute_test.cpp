@@ -1828,4 +1828,8 @@ TEST(EmergencyRoute, AStrayQuoteAfterTheUriKeepsTheFirstUri)
 	b.handler->handle(invite);
 	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
 	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+
+	// And an open quote with no <...> at all names no URI, as before.
+	EXPECT_EQ(makeInviteWithToValue("sip:911@server", "\"sip:911@lobby", "application/sdp", "", kSdpOffer,
+		"er-835-nouri")->getToNumber(), "");
 }
