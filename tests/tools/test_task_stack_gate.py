@@ -8,7 +8,9 @@ path (GCC writes the absolute source path into every label).
 import contextlib
 import io
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -35,15 +37,18 @@ def edge(a, b):
 
 # Labels start with the return type, as GCC writes them ("void f(void*)", #457).
 # small_task -> leaf (200 + 300 = 500 B).
-# big_task -> mid -> GenerateID (400 + 600 + 900 = 1900 B), with a mid <-> helper
-# cycle whose cut must not be cached. The mangled title is the RequestsHandler
-# shape #457 names; matching goes by the demangled label.
+# big_task -> mid -> GenerateID (400 + 600 + 900 = 1900 B), with a mid -> helper
+# leaf beside it. The mangled title is the RequestsHandler shape #457 names;
+# matching goes by the demangled label. The tests that need a cycle add the
+# helper -> mid back edge (CYCLE below).
 CI = (node("small_task", "void small_task(void*)", 200) + node("leaf", "void leaf()", 300)
       + node("big_task", "void big_task(void*)", 400) + node("mid", "void mid()", 600)
       + node("helper", "void helper()", 100)
       + node("_ZN15RequestsHandler16buildOptionsPingEv", "void RequestsHandler::buildOptionsPing()", 900)
       + edge("small_task", "leaf") + edge("big_task", "mid") + edge("mid", "helper")
-      + edge("helper", "mid") + edge("mid", "_ZN15RequestsHandler16buildOptionsPingEv"))
+      + edge("mid", "_ZN15RequestsHandler16buildOptionsPingEv"))
+CYCLE = edge("helper", "mid")            # mid <-> helper: 600 + 100 B a round
+BOUND = {"depth": 3, "reason": "fixture: bounded by the test"}
 
 # Where IDF and the toolchain keep their sources. lwip's headers sit under .../lwip/src/,
 # which the old "/src/ in the path" test took for this repo's src/ (#457).
@@ -88,7 +93,7 @@ class Gate(unittest.TestCase):
     def test_under_budget_passes_and_names_the_chain(self):
         rc, out = self.run_gate()
         self.assertEqual(rc, 0, out)
-        self.assertIn("ok   big: 1900 B", out)          # cycle cut, not double-counted
+        self.assertIn("ok   big: 1900 B", out)
         self.assertIn("RequestsHandler::buildOptionsPing()", out)
         self.assertIn("ok   small: 500 B", out)
 
@@ -158,6 +163,8 @@ class Gate(unittest.TestCase):
         self.assertEqual(self.run_gate()[0], 0)
 
     def test_report_is_identical_across_hash_seeds(self):
+        self.add_ci(CYCLE)                               # a bounded cycle, so SCC order is exercised too
+        self.table["recursion_allowlist"] = {"void mid()": BOUND}
         p = os.path.join(self.tmp.name, "t.json")
         json.dump(self.table, open(p, "w"))
         outs = set()
@@ -379,6 +386,154 @@ class Gate(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("ok   big: 1900 B", r.stdout)
+
+    # --- recursion (#457, desmo 2026-10-02) ---------------------------------------------
+    # Any cycle reachable from a walked task fails unless recursion_allowlist names it with a
+    # bound ("depth": at most that many live activations of each member) and a reason. The
+    # bound is charged: depth x the sum of the cycle's frames, once, in the chain total.
+
+    def test_a_reachable_cycle_without_a_row_fails_and_is_named(self):
+        self.add_ci(CYCLE)
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        lines = [ln for ln in out.splitlines() if ln.startswith("FAIL recursion")]
+        self.assertEqual(len(lines), 1, out)
+        for want in ("void mid()", "void helper()", "big", "recursion_allowlist"):
+            self.assertIn(want, lines[0])
+
+    def test_a_bounded_cycle_passes_and_the_bound_is_charged(self):
+        self.add_ci(CYCLE)
+        self.table["recursion_allowlist"] = {"void mid()": dict(BOUND)}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        # big_task 400 + the cycle 3 x (mid 600 + helper 100) + buildOptionsPing 900
+        self.assertIn("ok   big: 3400 B", out)
+        self.table["recursion_allowlist"]["void mid()"]["depth"] = 5     # the bound is not ignored
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: 4800 B + 512 margin > 4096 B", out)
+
+    def test_self_recursion_is_a_cycle_too(self):
+        self.add_ci(node("rec", "void rec(int)", 64) + edge("leaf", "rec") + edge("rec", "rec"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL recursion", out)
+        self.assertIn("void rec(int)", out)
+        self.table["recursion_allowlist"] = {"void rec(int)": {"depth": 4, "reason": "fixture"}}
+        self.table["tasks"][0]["bytes"] = 4096
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   small: 756 B", out)             # 200 + 300 + 4 x 64
+
+    def test_a_cycle_through_ctor_dtor_aliases_is_charged_by_its_real_frames(self):
+        # The shape of JsonReader::Value::~Value on the real graph: each D1 is a frameless alias
+        # with an edge to its D2 body, and the four of them close a loop.
+        v, w = "_ZN3ValD", "_ZNSt6vectorI3ValSaIS0_EED"
+        self.add_ci(bare(v + "1Ev", "Val::~Val()") + node(v + "2Ev", "Val::~Val()", 32)
+                    + bare(w + "1Ev", "std::vector<Val>::~vector()")
+                    + node(w + "2Ev", "std::vector<Val>::~vector()", 32)
+                    + edge(v + "1Ev", v + "2Ev") + edge(v + "2Ev", w + "1Ev")
+                    + edge(w + "1Ev", w + "2Ev") + edge(w + "2Ev", v + "1Ev") + edge("leaf", v + "1Ev"))
+        self.table["tasks"][0]["bytes"] = 4096
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL recursion", out)
+        self.assertNotIn("no frame data", out)              # the aliases are not the complaint
+        self.table["recursion_allowlist"] = {"Val::~Val()": {"depth": 9, "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   small: 1076 B", out)            # 200 + 300 + 9 x (32 + 32)
+
+    def test_a_level_costs_the_heaviest_trip_round_the_cycle_not_every_member(self):
+        # The shape of the JSON parser: a -> (b | c) -> a. A level goes through a and ONE of b, c,
+        # so 4 levels cost 4 x (a 32 + c 144) = 704, not 4 x (32 + 112 + 144).
+        self.add_ci(node("a", "void a()", 32) + node("b", "void b()", 112) + node("c", "void c()", 144)
+                    + edge("leaf", "a") + edge("a", "b") + edge("a", "c") + edge("b", "a") + edge("c", "a"))
+        self.table["recursion_allowlist"] = {"void a()": {"depth": 4, "reason": "fixture"}}
+        self.table["tasks"][0]["bytes"] = 4096
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   small: 1204 B", out)            # 200 + 300 + 704
+
+    def test_a_cycle_no_walked_task_reaches_does_not_fail(self):
+        self.add_ci(node("u1", "void u1()", 50) + node("u2", "void u2()", 50)
+                    + edge("u1", "u2") + edge("u2", "u1"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("recursion", out)
+
+    def test_a_cycle_only_a_skipped_task_reaches_is_not_walked(self):
+        # dns_task is linked into the display image only, so its loop is not in the eth image.
+        open(os.path.join(self.tmp.name, "src", "SIP", "X.cpp"), "a").write(
+            'xTaskCreate(dns_task, "dns", 4096, 0, 1, 0);\n')
+        self.table["tasks"].append({"name": "dns", "entry": r"\bdns_task\(", "bytes": 4096,
+                                    "file": "src/SIP/X.cpp", "line": 3,
+                                    "variants": ["main/esp_main_display.cpp"]})
+        self.add_ci(node("dns_task", "void dns_task(void*)", 50) + node("d1", "void d1()", 50)
+                    + node("d2", "void d2()", 50) + edge("dns_task", "d1")
+                    + edge("d1", "d2") + edge("d2", "d1"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_gate(main="main/esp_main_display.cpp")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL recursion", out)
+        self.assertIn("dns", out)
+
+    def test_a_row_must_state_a_bound_and_a_reason(self):
+        self.add_ci(CYCLE)
+        bad = {"no depth": {"reason": "r"}, "zero depth": {"depth": 0, "reason": "r"},
+               "fractional depth": {"depth": 2.5, "reason": "r"}, "bool depth": {"depth": True, "reason": "r"},
+               "no reason": {"depth": 2}, "blank reason": {"depth": 2, "reason": "  "},
+               "a bare number": 3}
+        for why, row in bad.items():
+            with self.subTest(why):
+                self.table["recursion_allowlist"] = {"void mid()": row}
+                rc, out = self.run_gate()
+                self.assertEqual(rc, 1, out)
+                self.assertIn("FAIL recursion_allowlist row 'void mid()'", out)
+
+    def test_two_rows_for_one_cycle_are_ambiguous(self):
+        self.add_ci(CYCLE)
+        self.table["recursion_allowlist"] = {"void mid()": dict(BOUND), "void helper()": dict(BOUND, depth=2)}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ambiguous", out)
+
+    def test_checked_in_recursion_rows_state_a_bound_and_a_reason(self):
+        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        rows = table["recursion_allowlist"]
+        self.assertTrue(rows)
+        for key, row in rows.items():
+            self.assertIsInstance(row["depth"], int, key)
+            self.assertGreaterEqual(row["depth"], 1, key)
+            self.assertTrue(row["reason"].strip(), key)
+
+    def test_checked_in_recursion_bounds_follow_the_code(self):
+        # Each depth is derived from a constant in the source; raise the constant and this
+        # fails, so the row is re-derived instead of going stale.
+        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        rows = {k: r["depth"] for k, r in table["recursion_allowlist"].items()}
+
+        def const(path, pattern):
+            return int(re.search(pattern, open(os.path.join(g.REPO, path)).read()).group(1), 0)
+
+        def row(fragment):
+            hit = [d for k, d in rows.items() if fragment in k]
+            self.assertEqual(len(hit), 1, f"{fragment}: one row expected, got {hit}")
+            return hit[0]
+
+        max_depth = const("src/Helpers/JsonReader.hpp", r"kMaxDepth\s*=\s*(\d+)")
+        max_bytes = const("src/Helpers/JsonReader.hpp", r"kMaxBytes\s*=\s*(\d+)")
+        sessions = const("src/SIP/PoolConfig.hpp", r"#define POCKETDIAL_MAX_SESSIONS\s+(\d+)")
+        nvs_bytes = const("partitions.csv", r"nvs,\s*data,\s*nvs,\s*0x9000,\s*(0x[0-9a-fA-F]+)")
+        # A red-black tree of n nodes is at most 2*log2(n+1) tall, and _M_erase recurses once per level.
+        rb = lambda n: math.floor(2 * math.log2(n + 1))
+        self.assertGreaterEqual(row("Parser::parseObject("), max_depth + 1)   # kMaxDepth levels + the refused one
+        self.assertGreaterEqual(row("JsonReader::Value::~Value()"), max_depth + 1)
+        self.assertGreaterEqual(row("_KeyOfValue = std::_Identity"), rb(max_bytes // 4))   # 4 B least per entry
+        self.assertGreaterEqual(row("std::shared_ptr<Session>"), rb(sessions))
+        self.assertGreaterEqual(row("basic_string<char>, std::__cxx11::basic_string<char> >"),
+                                rb(nvs_bytes // 32))     # one 32 B NVS entry at least per cached HA1
 
 
 if __name__ == "__main__":
