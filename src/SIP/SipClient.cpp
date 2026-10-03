@@ -1,4 +1,5 @@
 #include "SipClient.hpp"
+#include "SipHeaderUtil.hpp"
 
 SipClient::SipClient()
 	: _address{}, _expiresSeconds(0)
@@ -33,8 +34,7 @@ void SipClient::release()
 
 void SipClient::setContactUri(std::string_view uri)
 {
-	const bool scheme = uri.substr(0, 4) == "sip:" || uri.substr(0, 5) == "sips:";
-	bool clean = scheme && uri.size() <= kMaxContactUriLen;
+	bool clean = siphdr::hasSipScheme(uri) && uri.size() <= kMaxContactUriLen;   // #835: any case
 	for (size_t i = 0; clean && i < uri.size(); ++i)
 	{
 		const unsigned char c = static_cast<unsigned char>(uri[i]);
