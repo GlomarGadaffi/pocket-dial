@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.5.1 — 2026-10-03
+
+Two firmware changes on top of `v1.5.0` (`b8b4f0b`), from the v1.5.0 release reviews. None of the changes below is claimed bench-verified one by one.
+
+### Memory and security
+
+- A pooled message keeps at most 64 header lines and 8 KB of line buffer (4 KB on the constrained build): one 2 KB datagram of about a thousand short lines can no longer pin about 48 KB of heap in a pool slot, for requests and responses. The cut applies only to datagrams off the socket, so PBX-built messages and retransmits are never truncated. A carrier 2xx that was cut ignores its Record-Route (#844; #838).
+- Learn mode locks an extension only on a sighting at least 30 s after the device's first one, so a burst of two REGISTERs per fake MAC no longer locks anything. Rows loaded from flash behave as before (#840; #515).
+
+### Tools and docs
+
+- The soak verdict honours an explicit `--expect-registrations` and the orchestrator expects the phones already on the rig plus the test UAs; `run_soak.sh` can be started over the rig ssh wrapper (#842, #843; Part of #401).
+- CHANGELOG: the v1.5.0 section with the release soak result, and #838 and the smoke result in the rc.1 known gaps (#846, #841).
+
+### Known gaps
+
+- Emergency routing: the #759 header gate misses trunk-dialog Call-IDs and PSAP callbacks (#818); `ROUTED` is reported before a later `makeCall` failure (#821); a 911 produced by a dial-plan rule never gets the header-gate yield (#834); a 911 marked `text/plain` whose datagram never contains `application/sdp` is refused with a 400 (#834); a 911 INVITE that arrives with `Content-Type: text/plain` gets two Content-Type lines in the PBX's answer (#845).
+- The carrier-facing trunk is experimental: inbound carrier calls and the live-carrier proofs are still open (#398, #399, #618).
+- Hardware evidence is one handset model, one board and one carrier; on-device RTP has no automated coverage.
+
 ## v1.5.0 — 2026-10-02
 
 The same commit as `v1.5.0-rc.1` (`b8b4f0b`): no code changed between the release
