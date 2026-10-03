@@ -57,7 +57,13 @@ namespace ArpLookup
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 	// ── Host test injection helpers ──────────────────────────────────────────
 	void setMockMac(const struct sockaddr_in& src, const Mac& mac);
-	void clearMockMacs();
+	// #864: `src`'s IP is a host on this subnet that answers an ARP request with
+	// `reply` (std::nullopt: it never answers). An ARP request for it lands the
+	// reply in the table above, as lwIP's etharp_input() would.
+	void setMockOnLink(const struct sockaddr_in& src, std::optional<Mac> reply);
+	// ARP requests sent since the last clearMockMacs().
+	int mockArpRequestCount();
+	void clearMockMacs();   // also forgets the on-link hosts and the request count
 #endif
 }
 

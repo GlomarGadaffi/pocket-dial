@@ -116,6 +116,9 @@ namespace ArpLookup
 	namespace
 	{
 		std::map<uint32_t, Mac> s_mockArpTable;
+		// #864: hosts on this subnet, each with what it answers to an ARP request.
+		std::map<uint32_t, std::optional<Mac>> s_mockOnLink;
+		int s_mockArpRequests = 0;
 	}
 
 	std::optional<Mac> pdLookupMac(const struct sockaddr_in& src)
@@ -140,9 +143,21 @@ namespace ArpLookup
 		s_mockArpTable[src.sin_addr.s_addr] = mac;
 	}
 
+	void setMockOnLink(const struct sockaddr_in& src, std::optional<Mac> reply)
+	{
+		s_mockOnLink[src.sin_addr.s_addr] = reply;
+	}
+
+	int mockArpRequestCount()
+	{
+		return s_mockArpRequests;
+	}
+
 	void clearMockMacs()
 	{
 		s_mockArpTable.clear();
+		s_mockOnLink.clear();
+		s_mockArpRequests = 0;
 	}
 
 #endif
