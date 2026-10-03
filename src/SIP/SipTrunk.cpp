@@ -771,7 +771,8 @@ bool SipTrunk::handleAck(const SipMessage& ack)
 {
 	Dialog* d = findMutableByTrunkCallID(ack.getCallID());
 	if (!d || d->role != Role::Inbound || d->state != State::Confirmed ||
-		siphdr::tagOf(ack.getTo()) != d->toTag)
+		siphdr::tagOf(ack.getTo()) != d->toTag ||
+		ack.getSource().sin_addr.s_addr != d->peer.sin_addr.s_addr)   // #356, as handleCancel()
 	{
 		return false;
 	}

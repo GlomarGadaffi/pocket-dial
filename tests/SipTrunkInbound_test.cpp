@@ -735,3 +735,25 @@ TEST(SipTrunkInbound, ACancelAfterOurOkOrFromElsewhereChangesNothing)
 		EXPECT_EQ(in.dialog()->state, SipTrunk::State::Proceeding);
 	}
 }
+
+TEST(SipTrunkInbound, AnAckFromElsewhereReleasesNoHeldBye)
+{
+	// D review nit: #356 for the ACK too, so a forged one cannot release the
+	// BYE s15 holds before the carrier has really ACKed.
+	Inbound in;
+	ASSERT_TRUE(in.trunk.respond(kFork, 200, "v=0\r\n"));
+	const std::string ok = in.env.sentRaw(0);
+	ASSERT_TRUE(in.trunk.hangup(kFork));
+	in.env.sent.clear();
+
+	const auto forged = std::make_shared<SipMessage>(ackForOurOk(ok)->toString(),
+		FakePbxEnv::addr("198.51.100.66", 5060));
+	EXPECT_FALSE(in.trunk.handleAck(*forged)) << "only from the carrier's address";
+	EXPECT_TRUE(in.env.sent.empty()) << "the BYE stays held";
+	ASSERT_NE(in.dialog(), nullptr);
+	EXPECT_FALSE(in.dialog()->ackSeen);
+
+	EXPECT_TRUE(in.trunk.handleAck(*ackForOurOk(ok)));
+	ASSERT_EQ(in.env.sent.size(), 1u) << "the carrier's own ACK releases it";
+	EXPECT_EQ(firstLine(in.env.sentRaw(0)), "BYE sip:+12025550177@203.0.113.9:5060 SIP/2.0");
+}

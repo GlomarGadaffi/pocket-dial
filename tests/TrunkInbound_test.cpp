@@ -26,7 +26,9 @@
 #include <sys/socket.h>
 #endif
 
+#include "EthAccess.hpp"
 #include "RequestsHandler.hpp"
+#include "SipWireUtil.hpp"
 
 namespace
 {
@@ -972,4 +974,93 @@ TEST(TrunkInbound, ASilentInboundCallByesTheHandsetNotTheCallersStandIn)
 	EXPECT_FALSE(b.firstTo("BYE ", kPhoneIp).empty()) << "the handset is dest on an inbound call";
 	EXPECT_FALSE(b.firstTo("BYE ", kSbcIp).empty()) << "and the carrier is hung up";
 	expectAllReleased(b, a.forkId);
+}
+
+// ── D review fixes ────────────────────────────────────────────────────────────
+
+namespace
+{
+	// `raw` with its SDP c= address replaced and Content-Length recomputed.
+	std::string withConnection(std::string raw, const std::string& ip)
+	{
+		const size_t c = raw.find("c=IN IP4 ") + 9;
+		raw.replace(c, raw.find("\r\n", c) - c, ip);
+		const size_t body = raw.find("\r\n\r\n") + 4;
+		const size_t cl = raw.find("Content-Length: ") + 16;
+		raw.replace(cl, raw.find("\r\n", cl) - cl, std::to_string(raw.size() - body));
+		return raw;
+	}
+
+	// 192.168.50.1/24, as EthAccess would report the board's interface.
+	struct MockedInterface
+	{
+		MockedInterface() { EthAccess::setMockIpInfo(true, 0xC0A83201u, 0xC0A832FEu, 0xFFFFFF00u); }
+		~MockedInterface() { EthAccess::resetMocks(); }
+	};
+}
+
+TEST(TrunkInbound, OnlyAUnicastAddressThatIsNotOursIsAnRtpPeer)
+{
+	const uint32_t own = 0xC0A83201u;   // 192.168.50.1, host order
+	struct Case { uint32_t addr; uint32_t mask; bool usable; const char* what; };
+	for (const Case c : {
+		Case{ 0x00000000u, 0xFFFFFF00u, false, "0.0.0.0" },
+		Case{ 0x00010203u, 0xFFFFFF00u, false, "0/8" },
+		Case{ 0x7F000001u, 0xFFFFFF00u, false, "loopback" },
+		Case{ 0xE0000001u, 0xFFFFFF00u, false, "multicast" },
+		Case{ 0xEFFFFFFAu, 0xFFFFFF00u, false, "multicast (SSDP)" },
+		Case{ 0xF0000001u, 0xFFFFFF00u, false, "240/4" },
+		Case{ 0xFFFFFFFFu, 0xFFFFFF00u, false, "broadcast" },
+		Case{ own,         0xFFFFFF00u, false, "this host" },
+		Case{ 0xC0A832FFu, 0xFFFFFF00u, false, "our /24's broadcast" },
+		Case{ 0xC0A8FFFFu, 0xFFFF0000u, false, "our /16's broadcast" },
+		Case{ 0xC0A801FFu, 0xFFFF0000u, true,  "x.x.1.255: a host inside our /16" },
+		Case{ 0xC0A832FFu, 0x00000000u, true,  "x.x.x.255 with the netmask unknown" },
+		Case{ 0xCB007109u, 0xFFFFFF00u, true,  "a carrier" },
+		Case{ 0xC0A83215u, 0xFFFFFF00u, true,  "a phone on our subnet" },
+		Case{ 0xC0A83200u, 0xFFFFFFFEu, true,  "the other end of our /31" } })
+	{
+		EXPECT_EQ(sipwire::isUsableRtpPeer(c.addr, own, c.mask), c.usable) << c.what;
+	}
+}
+
+TEST(TrunkInbound, ACarrierOfferAimedAtLoopbackMulticastOrUsIsRefused)
+{
+	// D review: c=127.0.0.1 with m=audio 5060 in a forged-SBC INVITE would have
+	// aimed the answered audio at our own SIP port.
+	const MockedInterface net;
+	for (const char* ip : { "127.0.0.1", "224.0.0.1", "240.0.0.1", "192.168.50.1", "192.168.50.255" })
+	{
+		Bench b;
+		ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			withConnection(makeInvite(kDid, kDid, "in-badpeer", kSbcIp, true, "+12025550177", 100)->toString(), ip),
+			addrFor(kSbcIp)));
+
+		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here") << ip;
+		EXPECT_EQ(b.countTo(kSbcIp), 1u) << ip;
+		EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty()) << ip;
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << ip;
+	}
+}
+
+TEST(TrunkInbound, TheHandsetsOkToOurCancelIsAbsorbed)
+{
+	// D review nit: the 200 to our CANCEL (CSeq CANCEL) is ours, not onOk()'s.
+	Bench b;
+	const std::string fork = ringFork(b, "in-cancel200");
+	ASSERT_FALSE(fork.empty());
+	b.handler.handle(handsetReply(fork, "SIP/2.0 180 Ringing"));
+	b.handler.handle(carrierRequest("CANCEL", "in-cancel200", "<sip:" + std::string(kDid) + "@" + kServerIp + ">", 1));
+	const std::string cancel = b.firstTo("CANCEL ", kPhoneIp);
+	ASSERT_FALSE(cancel.empty());
+	b.sent.clear();
+
+	b.handler.handle(handsetReply(cancel, "SIP/2.0 200 OK"));
+
+	EXPECT_EQ(b.countTo(kPhoneIp), 0u) << "nothing back to the handset";
+	EXPECT_EQ(b.countTo(kSbcIp), 0u) << "nor to the carrier, which has its 487";
+	EXPECT_EQ(b.countTo("0.0.0.0"), 0u);
+	EXPECT_TRUE(b.handler.getSession("Call-ID: " + field(fork, "Call-ID: ")).has_value())
+		<< "the call ends on the INVITE's 487, not on the CANCEL's 200";
 }

@@ -30,6 +30,9 @@
 #include "PbxPersist.hpp"
 #include "SipHeaderUtil.hpp"
 #include "SipWireUtil.hpp"
+#if POCKETDIAL_TRUNK_INBOUND
+#include "EthAccess.hpp"      // #398 D review: the interface netmask, for rtpPeerFrom()
+#endif
 #include "AdminAuth.hpp"
 #include "SipDigest.hpp"
 #include "SipSecretStore.hpp"
@@ -192,6 +195,29 @@ namespace
 		}
 		return out;
 	}
+
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398 D review: an SDP's c= address and m= port as a relay peer, only when
+	// it is a dotted quad (inet_addr() turns "999.0.0.1" into broadcast) that
+	// sipwire::isUsableRtpPeer() allows: not loopback, multicast, reserved, this
+	// host, or this host's subnet broadcast. Inbound trunk relay only; the
+	// outbound relay (bringUpTrunkRelay) still uses inet_addr, see the follow-up.
+	bool rtpPeerFrom(const std::string& ip, uint16_t port, const std::string& localIp, sockaddr_in& out)
+	{
+		uint32_t addr = 0;
+		uint32_t own = 0;
+		uint32_t ifIp = 0, ifGw = 0, ifMask = 0;
+		if (!TrunkResolver::parseDottedQuad(ip, addr)) return false;
+		if (!TrunkResolver::parseDottedQuad(localIp, own)) own = 0;
+		if (!EthAccess::getLocalIpInfo(ifIp, ifGw, ifMask)) ifMask = 0;   // host byte order
+		if (!sipwire::isUsableRtpPeer(ntohl(addr), ntohl(own), ifMask)) return false;
+		out = sockaddr_in{};
+		out.sin_family = AF_INET;
+		out.sin_addr.s_addr = addr;
+		out.sin_port = htons(port);
+		return true;
+	}
+#endif
 }
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
@@ -12080,20 +12106,9 @@ bool RequestsHandler::isTrunkInbound(const Session& s) const
 
 bool RequestsHandler::trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out)
 {
-	// Not inet_addr(): "999.0.0.1" comes back as 255.255.255.255 (C review).
 	std::string ip;
 	uint16_t    port = 0;
-	uint32_t    addr = 0;
-	if (!parseCallerRtp(m, ip, port) || !TrunkResolver::parseDottedQuad(ip, addr) ||
-		addr == 0 || addr == 0xFFFFFFFFu)
-	{
-		return false;
-	}
-	out = sockaddr_in{};
-	out.sin_family = AF_INET;
-	out.sin_addr.s_addr = addr;
-	out.sin_port = htons(port);
-	return true;
+	return parseCallerRtp(m, ip, port) && rtpPeerFrom(ip, port, _localIp, out);
 }
 
 int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& data,
@@ -12176,9 +12191,11 @@ int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& dat
 bool RequestsHandler::handleTrunkInboundReply(const std::shared_ptr<SipMessage>& data)
 {
 	const auto si = data->getStatusInfo();
-	if (!si.has_value() || data->getCSeqMethod() != SipMessageTypes::INVITE) return false;
+	const bool toCancel = data->getCSeqMethod() == SipMessageTypes::CANCEL;
+	if (!si.has_value() || (!toCancel && data->getCSeqMethod() != SipMessageTypes::INVITE)) return false;
 	const auto found = getSession(data->getCallID());
 	if (!found.has_value() || !isTrunkInbound(*found.value())) return false;
+	if (toCancel) return true;   // RFC 3261 s9.1: our CANCEL's own; the INVITE's 487 ends the fork
 	const std::shared_ptr<Session> s = found.value();
 	const std::string callId(s->getCallID());
 	const int status = static_cast<int>(si->code);
