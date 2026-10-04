@@ -1337,6 +1337,28 @@ TEST(TrunkWiring, ACarrierByeThatFailsTheHeaderGateStillEndsA911ButNotAnOrdinary
 	}
 }
 
+TEST(TrunkWiring, AForgedByeThatFailsTheHeaderGateOnALive911IsStillRefusedByTheTrunk)
+{
+	// The #818 yield only lets a message past the header gate; the trunk's #356
+	// source check still decides who may end the call. A forger who knows the
+	// 911's carrier Call-ID, from neither the SBC nor its Contact, gets 403.
+	Bench b;
+	const auto carrier = connectTrunkCall(b, "911", "call-818-forged");
+	ASSERT_FALSE(carrier.callID.empty()) << "precondition: the 911 went to the trunk";
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the 911 is up";
+
+	CarrierView forger = carrier;
+	forger.toTag = "guessed";
+	b.handler.handle(RequestsHandler::getMessageFromPool(replaced(forger.bye(), "branch=z9hG4bKcarrierbye\r\n",
+		"branch=z9hG4bK" + std::string(80, 'b') + "\r\n"), addrFor(kForgerIp)));
+
+	EXPECT_EQ(b.countWithTo("403", kForgerIp), 1u) << "past the gate, the trunk refuses the forger";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 200", kForgerIp), 0u);
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "the 911 caller is not hung up";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "nor is the PSAP";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "and the 911's media keeps flowing";
+}
+
 // ── Issue #604: RTP inactivity ends a call whose media stopped with no BYE ──
 
 TEST(TrunkWiring, ATrunkCallWhoseLegsBothGoSilentIsEndedAfterTheInactivityTimeout)
