@@ -780,11 +780,13 @@ TEST(E911Notify, A911WhoseAnchorLegNeverComesUpIsReportedNotRoutedAfterItsFiveOh
 
 	ASSERT_NO_FATAL_FAILURE(dialAndFailTheWorkersMakeCall(b, "911", "en-911-mkfail"));
 
-	ASSERT_NE(b.indexOf("ROUTED TO TRUNK"), -1) << "precondition: the dispatch was notified ROUTED:\n" << b.dump();
+	const int routed = b.indexOf("ROUTED TO TRUNK");
+	ASSERT_NE(routed, -1) << "precondition: the dispatch was notified ROUTED:\n" << b.dump();
 	EXPECT_EQ(b.countOf("SIP/2.0 503"), 1) << b.dump();
 	EXPECT_FALSE(b.handler->getSession("Call-ID: en-911-mkfail").has_value());
 	const int notRouted = b.indexOf("NOT ROUTED");
-	EXPECT_NE(notRouted, -1) << "the 911 never came up and the notify list still reads ROUTED:\n" << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << "the 911 never came up; the notify list is told so exactly once:\n" << b.dump();
+	EXPECT_GT(notRouted, routed) << "NOT ROUTED corrects the earlier ROUTED, so it comes after it";
 	EXPECT_GT(notRouted, b.indexOf("SIP/2.0 503")) << "the caller's 503 first, then the notification";
 }
 
