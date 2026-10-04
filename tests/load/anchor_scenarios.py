@@ -32,6 +32,19 @@ Safety, checked against the board before the first call and through the run
     the register beep (From user "pbx") is a phantom inbound: FAIL.
   * the far end must not be registered on the board (it would ring locally).
 
+Probe scenarios (x349_unread_makecall, x379_never_opened, x518_403_clean_giveup,
+x279_degraded_bye) drive the bench probe image (docs/BENCH_PROBE.md, #384 H1):
+they need --expect-version with a -probe stamp, read /api/bench/fault's counters
+before and after, arm only their pre-registered faults (never for an emergency far
+end, never while the probe reports an emergency), and always disarm every fault and
+release the ballast in a finally block. The counters must show nothing armed at the
+end, and every pre-registered fault must show fired >= 1, or the run is INVALID.
+
+Syslog carries esp_log lines only. RequestsHandler's queueLog() lines (e.g. "anchor
+call torn down: ...", "no rx audio, dropping leg") go to stdout and never reach it
+(#533/#603), so the scenarios count the esp_log witnesses instead: "pbx: endCall
+<Call-ID> reason=...", "MediaBridge: stopBridge ..." and TelephonyAnchorClient's lines.
+
 Evidence (--out): run.log, manifest.json, calls.json, syslog.log, status.jsonl
 (tools/soak/status_logger.sh), pcap/*.pcap (pulled after every call: the ring
 holds 16 messages), SHA256SUMS and a .tar.gz. Every text line goes through
@@ -54,6 +67,7 @@ import re
 import signal
 import socket
 import stat
+import struct
 import sys
 import tarfile
 import threading
@@ -121,8 +135,34 @@ LOG_COUNTERS = {
     "anchor_refused": r"anchor\(\S+\): (?:every anchor bridge slot busy|session pool full"
                       r"|virtual-peer pool exhausted)",
     "panic": r"Guru Meditation|CORRUPT HEAP|abort\(\) was called",
+    # The bench probe (BenchProbe.cpp): one line per firing, and the rule-5 stops.
+    "bench_fired": r"BENCHFAULT (\S+) fired",
+    "bench_makecall_read_fail": r"BENCHFAULT makecall_read_fail fired",
+    "bench_emergency": r"BENCHFAULT (?:every fault disarmed: emergency call|ballast released \(emergency\))",
+    # makeCall() (#349): the unread response reconciled to our own leg, or not.
+    "adopted_349": r"but 3CX has our leg (\S+) .*adopting the call instead of failing it \(#349\)",
+    "orphaned_349": r"a call may be ORPHANED on 3CX \(#349/#328\)",
+    # runRxLoop()'s GET stream (#379, #518). A spent budget is attempt N/N.
+    "get_refused": r"GET stream refused \(HTTP (\d+)\) for ",
+    "get_refused_403": r"GET stream refused \(HTTP 403\) for \S*/participants/([^/\s]+)/stream",
+    "get_budget_spent": r"GET stream (?:not ready \(HTTP -?\d+\)|transport failure \(no HTTP response, "
+                        r"status=-?\d+\)|open failed \([^)]*\)), attempt (\d+)/\1(?!\d)",
+    "get_transport_giveup": r"GET stream: \d+ consecutive transport failures",
+    "get_rebuild_giveup": r"GET stream: could not rebuild client after transport failure",
+    "get_never_opened": r"GET \(Telephony->device\) stream never opened",
+    "post_open": r"POST \(device->Telephony\) audio stream OPEN: \S*/participants/([^/\s]+)/stream",
+    # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
+    "endcall": r"endCall (\S+) reason=",
+    "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",
+    "stop_bridge": r"stopBridge call=(\S*) part=",
+    # queueLog() lines: stdout only, so seen only if a console capture is merged in.
+    "rh_never_opened_drop": r"no rx audio, dropping leg (\S+)",
+    "rh_degraded": r"anchor call torn down: audio write repeatedly failed",
 }
 _RX = {k: re.compile(v) for k, v in LOG_COUNTERS.items()}
+_ATTEMPT = re.compile(r"GET stream (?:not ready \(HTTP -?\d+\)|transport failure \(no HTTP response, "
+                      r"status=-?\d+\)|open failed \([^)]*\)), attempt (\d+)/(\d+)")
+_ENDCALL = re.compile(r"endCall (\S+) reason=(.*?)\s*$")
 
 
 class Refused(Exception):
@@ -201,6 +241,14 @@ def owner_set(arg, env):
     return set(OWNER_EXTS) | extra
 
 
+def is_never_dial(far):
+    """911/933 anywhere in it, or 112, 113, 999 (with one trunk-access digit, EmergencyCall.hpp)."""
+    d = (far or "").lstrip("+")
+    bare = d[1:] if len(d) == 4 and d[0] == "9" else d
+    return any(e in d for e in lp.EMERGENCY_SUBSTRINGS) or d in NEVER_EXACT or bare in NEVER_EXACT \
+        or d in lp.EMERGENCY_EXACT
+
+
 def far_end_problems(far, owner):
     """Every reason `far` may not be dialled, or []. Never echoes the number."""
     if not re.fullmatch(r"\+?[0-9]{3,15}", far or ""):
@@ -208,9 +256,7 @@ def far_end_problems(far, owner):
                 "could route anywhere"]
     problems = []
     d = far.lstrip("+")
-    bare = d[1:] if len(d) == 4 and d[0] == "9" else d      # one trunk-access digit (EmergencyCall.hpp)
-    if any(e in d for e in lp.EMERGENCY_SUBSTRINGS) or d in NEVER_EXACT or bare in NEVER_EXACT \
-            or d in lp.EMERGENCY_EXACT:
+    if is_never_dial(far):
         problems.append("the far end is an emergency or never-dial number (911/933 anywhere in it, "
                         "112, 113, 999): refused")
     if d in owner:
@@ -290,6 +336,51 @@ def host_problems(host):
             % (host, ", ".join(RIG_HOSTS))]
 
 
+# ---------------------------------------------------------------- the bench probe's numbers
+PROBE_FAULTS = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age")
+BENCH_PATH = "/api/bench/fault"
+PROBE_IMAGE = "anchor-bench-probe"
+GET_MAX_ATTEMPTS = 240               # BenchProbeLogic.hpp kGetMaxAttempts; get_max_attempts only shrinks it
+# runRxLoop()'s backoff after each attempt: 50 ms, doubling, capped at 500 ms.
+GET_BACKOFF_MS = (50, 100, 200, 400)
+GET_BACKOFF_CAP_MS = 500
+# Worst case per attempt once the far end has answered: a forced refusal closes the real
+# 200 unread (docs/BENCH_PROBE.md), so the next open pays a full TLS handshake, measured
+# at 751-1311 ms on .244 (#379, #370's run; X1 logged 1072 ms).
+GET_RECONNECT_WORST_S = 1.311
+MAKECALL_WORST_S = 1.5               # makeCall()'s POST round trip before the rx task starts
+GIVEUP_TO_BYE_S = 3.0                # the drop POST, 3CX's Remove event and the handset BYE
+HANGUP_MARGIN_S = 2.0                # the harness's own BYE must also finish inside the cap
+
+
+def get_giveup_worst_s(n):
+    """Seconds from the INVITE to the handset BYE, worst case, with a GET budget of n."""
+    sleeps = sum(GET_BACKOFF_MS[:n]) + GET_BACKOFF_CAP_MS * max(0, n - len(GET_BACKOFF_MS))
+    return MAKECALL_WORST_S + n * GET_RECONNECT_WORST_S + sleeps / 1000.0 + GIVEUP_TO_BYE_S
+
+
+def probe_problems(sc):
+    n = sc.get("name", "<unnamed>")
+    faults = sc.get("faults") or ()
+    problems = [] if faults else ["%s: a probe scenario pre-registers the faults it arms" % n]
+    for f in faults:
+        if f not in PROBE_FAULTS:
+            problems.append("%s: %s is not a bench probe fault (%s)" % (n, f, ", ".join(PROBE_FAULTS)))
+    if "get_status" in faults and not 400 <= sc.get("get_status", 0) <= 599:
+        problems.append("%s: get_status must be 400-599" % n)
+    if "get_max_attempts" in faults:
+        m = sc.get("get_max_attempts", 0)
+        cap = sc.get("call_cap_s", 0) - HANGUP_MARGIN_S
+        if not 1 <= m <= GET_MAX_ATTEMPTS:
+            problems.append("%s: get_max_attempts must be 1-%d" % (n, GET_MAX_ATTEMPTS))
+        elif get_giveup_worst_s(m) > cap:
+            problems.append("%s: get_max_attempts=%d reaches the handset BYE after up to %.1f s (worst "
+                            "case), past the %.0f s the call cap leaves" % (n, m, get_giveup_worst_s(m), cap))
+    if sc.get("hold_s", 0) > sc.get("call_cap_s", 0) - HANGUP_MARGIN_S:
+        problems.append("%s: hold_s leaves no room for the hangup inside the call cap" % n)
+    return problems
+
+
 # ---------------------------------------------------------------- scenario registry
 SCENARIOS = {}
 
@@ -314,6 +405,8 @@ def scenario_problems(sc):
         problems.append("%s: call_cap_s must be 1-%d (each call <= ~30 s)" % (n, MAX_CALL_S))
     if not callable(sc.get("run")) or not callable(sc.get("judge")):
         problems.append("%s: needs a run and a judge" % n)
+    if sc.get("probe"):
+        problems += probe_problems(sc)
     return problems
 
 
@@ -372,6 +465,125 @@ def rx_task_problems(lines):
             for leg, n in sorted(started.items()) if n > 1 + restarts[leg]]
 
 
+def matches(entries, counter, key=None):
+    """[(t, match)] for one counter, optionally only where group 1 == key."""
+    rx = _RX[counter]
+    out = []
+    for t, line in entries:
+        m = rx.search(line)
+        if m and (key is None or m.group(1) == key):
+            out.append((t, m))
+    return out
+
+
+def endcalls(entries, call_id):
+    """[(t, reason)] of endCall()'s #603 lines for one Call-ID."""
+    out = []
+    for t, line in entries:
+        m = _ENDCALL.search(line)
+        if m and m.group(1) == call_id:
+            out.append((t, m.group(2)))
+    return out
+
+
+def started_legs(entries):
+    return [m.group(1) for _, m in matches(entries, "initiated")]
+
+
+# ---------------------------------------------------------------- /api/pcap (second witness)
+def pcap_sip(data):
+    """[{"ts_us", "src", "dst", "msg"}] from /api/pcap: a classic little-endian pcap,
+    LINKTYPE_ETHERNET, one synthesized Ethernet+IPv4+UDP frame per SIP message
+    (src/SIP/PcapCapture.hpp). Anything else is skipped, never guessed at."""
+    out = []
+    if len(data or b"") < 24 or data[:4] != b"\xd4\xc3\xb2\xa1" or struct.unpack_from("<I", data, 20)[0] != 1:
+        return out
+    off = 24
+    while off + 16 <= len(data):
+        sec, usec, incl, _ = struct.unpack_from("<IIII", data, off)
+        off += 16
+        frame, off = data[off:off + incl], off + incl
+        if len(frame) < 42 or frame[12:14] != b"\x08\x00" or frame[23] != 17:
+            continue
+        udp = 14 + (frame[14] & 0x0F) * 4
+        if len(frame) < udp + 8:
+            continue
+        sport, dport = struct.unpack_from("!HH", frame, udp)
+        try:
+            msg = sip_agent.SipMsg.parse(frame[udp + 8:])
+        except Exception:  # noqa: BLE001 -- a truncated slot is skipped
+            continue
+        out.append({"ts_us": sec * 1000000 + usec, "src": (socket.inet_ntoa(frame[26:30]), sport),
+                    "dst": (socket.inet_ntoa(frame[30:34]), dport), "msg": msg})
+    return out
+
+
+def ruri_keeps_contact(ruri, contact):
+    """Rule 1 (#797/#798): the Request-URI toward a phone is its registered Contact with
+    its URI parameters intact. Looser than RFC 3261 s19.1.4 on purpose: s19.1.4 ignores a
+    parameter present in only one URI, and a Snom 370 answers 404/481 without its ;line=."""
+    def parts(u):
+        m = re.match(r"(?i)^(sips?):(?:([^@;]*)@)?([^;?>]+)((?:;[^?>]*)?)", u or "")
+        if not m:
+            return None
+        host, _, port = m.group(3).partition(":")
+        params = {}
+        for p in m.group(4).split(";")[1:]:
+            if p:
+                k, _, v = p.partition("=")
+                params[k.lower()] = v
+        return m.group(1).lower(), m.group(2) or "", host.lower(), port, params
+    r, c = parts(ruri), parts(contact)
+    if r is None or c is None or r[:4] != c[:4]:
+        return False
+    return all(k in r[4] and r[4][k] == v for k, v in c[4].items())
+
+
+def bye_record(dlg, agent):
+    """The BYEs the PBX sent into one dialog, as the UA saw them (first witness)."""
+    log = list(dlg.bye_log)
+    contact = sip_agent.uri_of(agent.contact)
+    return {"pbx_byes": dlg.byes, "bye_tag_mismatches": dlg.bye_mismatches,
+            "bye_481": sum(1 for b in list(agent.bye_481) if b["call_id"] == dlg.call_id),
+            "bye_answers": [b["status"] for b in log],
+            "bye_ruri_keeps_contact": [ruri_keeps_contact(b["ruri"], contact) for b in log],
+            "contact_params": contact.partition(";")[2] or None}
+
+
+def bye_problems(c, who, count=True):
+    """FAIL reasons for "exactly one BYE, matching Call-ID and tags, answered 200"."""
+    out = []
+    if count and c.get("pbx_byes") != 1:
+        out.append("%s got %s BYE(s) from the PBX in the dialog, not exactly 1" % (who, c.get("pbx_byes")))
+    if c.get("bye_tag_mismatches"):
+        out.append("%s got %d BYE(s) with this Call-ID but the wrong tags (answered 481)"
+                   % (who, c["bye_tag_mismatches"]))
+    if c.get("bye_481"):
+        out.append("%s answered %d BYE(s) for this call with 481" % (who, c["bye_481"]))
+    return out
+
+
+def ruri_problems(c, who):
+    keeps = c.get("bye_ruri_keeps_contact") or [False]
+    if keeps[0]:
+        return []
+    return ["the BYE's Request-URI is not %s's registered Contact with its parameters (%s): rule 1, #797/#798; "
+            "a Snom answers such a BYE 404/481 and stays on the call" % (who, c.get("contact_params"))]
+
+
+def session_problems(c, ext):
+    """(fails, invalid) for "sessionCount is back to its baseline after the call"."""
+    s = c.get("sessions") or {}
+    if s.get("test_ua_sessions"):
+        return ["a session of %s is still up after the call ended: a leg that was never torn down" % ext], []
+    if s.get("baseline") is None or s.get("after") is None:
+        return [], ["sessionCount could not be read before and after the call"]
+    if s["after"] > s["baseline"]:
+        return [], ["sessionCount is %d after the call, baseline %d, and no session involves %s: another "
+                    "call is up on the rig, so the count cannot be compared" % (s["after"], s["baseline"], ext)]
+    return [], []
+
+
 # ---------------------------------------------------------------- syslog collector
 class SyslogListener:
     """A UDP syslog (RFC 5424 / 3164) collector. Each line is kept in memory as
@@ -413,8 +625,12 @@ class SyslogListener:
                 self._f.flush()
 
     def lines(self, since=None, until=None):
+        return [ln for _, ln in self.entries(since, until)]
+
+    def entries(self, since=None, until=None):
+        """[(monotonic arrival time, line)]: for ordering lines against the harness's own acts."""
         with self._lock:
-            return [ln for t, ln in self._lines
+            return [(t, ln) for t, ln in self._lines
                     if (since is None or t >= since) and (until is None or t < until)]
 
     def stop(self):
@@ -508,10 +724,102 @@ class BoardHttp:
         st, body = self._authed("POST", path, fields, csrf=True)
         return self._json(st, body)
 
+    def request_json(self, method, path, fields=None):
+        """-> (HTTP status or None, a JSON object or None), whatever the status: the bench
+        probe answers 400/409/503 with a reason the caller must tell apart."""
+        st, body = self._authed(method, path, fields, csrf=method == "POST")
+        try:
+            v = json.loads(body.decode("utf-8", "replace")) if body else None
+        except ValueError:
+            v = None
+        return st, v if isinstance(v, dict) else None
+
     def logout(self):
         if self.cookie:
             self._req("POST", "/api/admin/logout", {}, auth=True, csrf=True)
             self.cookie = self.csrf = None
+
+
+class BenchProbe:
+    """GET/POST /api/bench/fault on the probe image (docs/BENCH_PROBE.md): owner-gated,
+    CSRF-checked, form-encoded, one fault per POST. Every failure is an INVALID Abort
+    that says why; a 409 (an emergency is live, rule 5) is never retried."""
+
+    def __init__(self, http, tries=3, pause_s=0.2):
+        self.http, self.tries, self.pause_s = http, tries, pause_s
+
+    def _call(self, method, fields=None):
+        st, body = None, None
+        for i in range(self.tries):
+            st, body = self.http.request_json(method, BENCH_PATH, fields)
+            if st != 503 or i + 1 == self.tries:   # 503: "counters busy", another reader holds them
+                break
+            time.sleep(self.pause_s)
+        return st, body
+
+    @staticmethod
+    def _counters(st, body, what):
+        if st == 200 and isinstance(body, dict) and body.get("image") == PROBE_IMAGE \
+                and isinstance(body.get("faults"), dict):
+            return body
+        why = {404: "404: the board is not running the probe image (POCKETDIAL_ANCHOR_BENCH_PROBE)",
+               403: "403: the probe is owner-gated (or the CSRF token was refused); once an owner "
+                    "credential exists, PD_BOARD_ADMIN_USER must name the owner login",
+               409: "409: the probe refused (an emergency call is live, rule 5, or a ballast is held)",
+               400: "400: the probe refused the request as malformed",
+               None: "no answer"}.get(st, "HTTP %s" % st)
+        if st == 200:
+            why = "200 without the probe's counters (no image %r)" % PROBE_IMAGE
+        raise run_soak.Abort("INVALID", "%s: %s" % (what, why))
+
+    def counters(self):
+        return self._counters(*self._call("GET"), what="GET %s" % BENCH_PATH)
+
+    def arm(self, name, value=None):
+        fields = {"fault": name}
+        if value is not None:
+            fields["value"] = str(int(value))
+        body = self._counters(*self._call("POST", fields), what="arming %s" % name)
+        f = body["faults"].get(name)
+        if not isinstance(f, dict) or f.get("armed") is not True or \
+                (value is not None and f.get("value") != int(value)):
+            raise run_soak.Abort("INVALID", "arming %s: the counters do not show it armed%s"
+                                 % (name, "" if value is None else " with value %d" % int(value)))
+        return body
+
+    def disarm_all(self):
+        """POST fault=disarm, POST ballast=release, then GET. -> (counters or None, [problems])."""
+        problems = []
+        for fields in ({"fault": "disarm"}, {"ballast": "release"}):
+            st, _ = self._call("POST", fields)
+            if st != 200:
+                problems.append("POST %s answered %s" % (urllib.parse.urlencode(fields), st))
+        try:
+            after = self.counters()
+        except run_soak.Abort as e:
+            return None, problems + [e.reason]
+        armed = sorted(n for n, f in after["faults"].items() if isinstance(f, dict) and f.get("armed"))
+        if armed:
+            problems.append("still armed: %s" % ", ".join(armed))
+        if (after.get("ballast") or {}).get("held"):
+            problems.append("a ballast is still held")
+        return after, problems
+
+
+def moh_problems(http):
+    """The Held variant of x279 needs a hold clip. Without one an outbound anchor hold falls
+    back to the silent a=inactive hold, no writeAudio() runs, and post_stream_fail could
+    never fire (docs/FEATURE_ROADMAP.md, music on hold). GET /api/moh (sysop-gated)
+    answers {"supported", "loaded", "seconds", ...}."""
+    st = http.get_json("/api/moh")
+    if st is None:
+        return ["GET /api/moh failed"]
+    if st.get("supported") is not True:
+        return ["this build has no SD card, so it can hold no clip (/api/moh supported=false)"]
+    if st.get("loaded") is not True:
+        return ["no hold clip is loaded (/api/moh loaded=false): a held anchor call is silent and "
+                "never writes audio"]
+    return []
 
 
 # ---------------------------------------------------------------- the run
@@ -530,6 +838,11 @@ class AnchorRun:
         self.baseline = {}
         self.last_reg = 0.0
         self.aborted = False
+        self.rtp_pump = None
+        self.pcap_reqs = {}              # every SIP request /api/pcap showed, deduplicated
+        self.probe = self.probe_before = self.probe_after = None
+        self.probe_clean = False
+        self.probe_end_problems = []
         self.manifest = {"scenario": sc["name"], "issues": list(sc.get("issues", ())),
                          "about": sc.get("about"), "host": args.host, "approval": args.approval_url,
                          "checkout": {"url": args.checkout_url, "expiry": args.checkout_expiry},
@@ -664,6 +977,134 @@ class AnchorRun:
         return [(role, ua.ext, r["from_user"]) for role, ua in sorted(self.agents.items())
                 for r in list(ua.rejected) if r["from_user"] != BEEP_USER]
 
+    def watch_call(self, until, stop_when=None, step=0.05):
+        """Wait until `until` (monotonic) or stop_when(). A phantom inbound stops the run at
+        once (FAIL, so the call is hung up in teardown); the S1 pin and the board are
+        re-checked every pin_check_s. -> True if stop_when() came true."""
+        next_check = time.monotonic() + self.a.pin_check_s
+        while True:
+            if stop_when is not None and stop_when():
+                return True
+            if self.phantoms():
+                raise run_soak.Abort("FAIL", "a phantom inbound reached a test UA during the call: the run stops")
+            now = time.monotonic()
+            if now >= until or self.stop.wait(min(step, until - now)):
+                return stop_when is not None and stop_when()
+            if time.monotonic() >= next_check:
+                self.checkpoint()
+                next_check = time.monotonic() + self.a.pin_check_s
+
+    def wait_line(self, counter, since, timeout, key=None):
+        """The first (t, match) of a syslog counter after `since`, watching for phantoms meanwhile."""
+        found = []
+
+        def seen():
+            found[:] = matches(self.syslog.entries(since), counter, key)[:1]
+            return bool(found)
+        self.watch_call(time.monotonic() + timeout, stop_when=seen)
+        return found[0] if found else (None, None)
+
+    def session_count(self):
+        n = (self.http.status() or {}).get("sessionCount")
+        return n if isinstance(n, int) else None
+
+    def sessions_settle(self, baseline, ext, wait_s):
+        """sessionCount once it is back at `baseline` (or wait_s passed), and how many
+        sessions in the authenticated list still involve `ext`. Counts only: the list
+        also names the far end."""
+        deadline = time.monotonic() + wait_s
+        while True:
+            after = self.session_count()
+            if (baseline is not None and after is not None and after <= baseline) \
+                    or time.monotonic() >= deadline or self.stop.wait(0.2):
+                break
+        st = self.http.get_json("/api/status") or {}
+        mine = [s for s in st.get("sessions") or [] if isinstance(s, dict)
+                and ext in (str(s.get("caller")), str(s.get("callee")))]
+        return {"baseline": baseline, "after": after, "test_ua_sessions": len(mine)}
+
+    # -- the bench probe -------------------------------------------------------
+    def probe_preflight(self):
+        """Before any SIP: the probe image answers, no emergency is live, nothing is armed."""
+        probe = BenchProbe(self.http)
+        before = probe.counters()        # a 404/403 ends the run here: nothing armed, nothing to disarm
+        self.probe, self.probe_before = probe, before
+        self.manifest["probe"] = {"before": before, "faults": list(self.sc["faults"])}
+        problems = []
+        if before.get("emergencyLive") is not False:
+            problems.append("the probe reports an emergency call live (rule 5): nothing is armed")
+        stale = sorted(n for n, f in before["faults"].items() if isinstance(f, dict) and f.get("armed"))
+        if stale:
+            problems.append("%s already armed before this run (an earlier run's leftover?): this run "
+                            "arms nothing and disarms it at the end" % ", ".join(stale))
+        if (before.get("ballast") or {}).get("held"):
+            problems.append("a ballast is already held: this run releases it at the end")
+        missing = [f for f in self.sc["faults"] if f not in before["faults"]]
+        if missing:
+            problems.append("the probe image has no %s fault" % ", ".join(missing))
+        if problems:
+            raise run_soak.Abort("INVALID", "probe preflight: " + "; ".join(problems))
+        self.say("probe image answers: nothing armed, no ballast, no emergency live")
+
+    def arm(self, name, value=None):
+        """Arm one pre-registered fault. Never for an emergency or never-dial far end (the
+        probe would refuse to fire anyway, rule 5)."""
+        if name not in self.sc.get("faults", ()):
+            raise run_soak.Abort("INVALID", "%s arms %s, which it did not pre-register" % (self.sc["name"], name))
+        if is_never_dial(self.far_end):
+            raise run_soak.Abort("INVALID", "refusing to arm %s: the far end is an emergency or never-dial "
+                                 "number (rule 5)" % name)
+        self.probe.arm(name, value)
+        self.manifest["probe"].setdefault("armed", []).append({"fault": name, "value": value})
+        self.say("armed %s%s" % (name, "" if value is None else "=%d" % value))
+
+    def probe_finish(self):
+        """Disarm every fault and release the ballast, then read the counters back. Runs in
+        the scenario's finally and again at the top of teardown until it verifies clean."""
+        if self.probe is None or self.probe_clean:
+            return
+        after, problems = self.probe.disarm_all()
+        if after is not None:
+            self.probe_after = after
+            self.manifest.setdefault("probe", {})["after"] = after
+        self.probe_end_problems, self.probe_clean = problems, not problems
+        self.say("probe: every fault disarmed and the ballast released (read back)" if not problems else
+                 "probe NOT verified clean (%s): disarm it by hand, POST %s fault=disarm and ballast=release"
+                 % ("; ".join(problems), BENCH_PATH))
+
+    def probe_verdict(self):
+        """INVALID reasons from the probe: not clean at the end, a fault that never fired,
+        or an emergency that touched the probe (rule 5 stopped it; the run proves nothing)."""
+        out = []
+        if not self.probe_clean:
+            out.append("the probe was not verified disarmed at the end (%s): disarm it by hand"
+                       % "; ".join(self.probe_end_problems or ["never read back"]))
+        b, a = self.probe_before, self.probe_after
+        if b is None or a is None:
+            return out
+        fired, skips = {}, 0
+        for name in self.sc["faults"]:
+            fb, fa = b["faults"].get(name) or {}, a["faults"].get(name) or {}
+            fired[name] = fa.get("fired", 0) - fb.get("fired", 0)
+            skips += fa.get("emergencySkips", 0) - fb.get("emergencySkips", 0)
+        self.manifest["probe"]["fired"] = fired
+        lines = self.syslog.lines() if self.syslog else []
+        logged = per_leg(lines, "bench_fired")
+        self.manifest["probe"]["fired_lines"] = {n: logged[n] for n in self.sc["faults"]}
+        stopped = count_lines(lines)["bench_emergency"]
+        if self.calls:
+            for name, n in sorted(fired.items()):
+                if n < 1:
+                    out.append("the fault %s fired %d times: its path was not driven (INVALID, never PASS)"
+                               % (name, n))
+        refused = a.get("refusedArms", 0) - b.get("refusedArms", 0)
+        disarms = a.get("emergencyDisarms", 0) - b.get("emergencyDisarms", 0)
+        if refused or disarms or skips or stopped or a.get("emergencyLive"):
+            out.append("an emergency call touched the probe during the run (refusedArms +%d, emergencyDisarms "
+                       "+%d, emergencySkips +%d, %d BENCHFAULT emergency line(s)): rule 5 stopped it, so this "
+                       "run proves nothing" % (refused, disarms, skips, stopped))
+        return out
+
     def watch_board(self):
         if self.logger is not None and self.logger.poll() is not None:
             raise run_soak.Abort("INVALID", "the status logger exited during the run")
@@ -680,8 +1121,24 @@ class AnchorRun:
         if data is None:
             self.manifest["notes"].append("the /api/pcap pull %s failed" % name)
             return
+        for rec in pcap_sip(data):            # parsed before masking; only these fields are kept
+            m = rec["msg"]
+            if m.is_response:
+                continue
+            key = (m.method, m.call_id(), m.branch(), rec["dst"])
+            self.pcap_reqs.setdefault(key, {"method": m.method, "call_id": m.call_id(), "dst": rec["dst"],
+                                            "from_user": sip_agent.user_of(sip_agent.uri_of(m.get("from"))),
+                                            "to_tag": sip_agent.tag_of(m.get("to"))})
         with open(self.p("pcap", name + ".pcap"), "wb") as f:
             f.write(self.red.same_length(data))
+
+    def pcap_count(self, method, agent, call_id=None, phantom=False):
+        """Distinct `method` transactions /api/pcap shows the board sending to `agent`."""
+        dst = (agent.lip, agent.lport)
+        return sum(1 for r in self.pcap_reqs.values()
+                   if r["method"] == method and r["dst"] == dst
+                   and (call_id is None or r["call_id"] == call_id)
+                   and (not phantom or (r["from_user"] != BEEP_USER and not r["to_tag"])))
 
     def coredump_problems(self, end_status):
         problems, base = [], self.baseline.get("coredump") or {}
@@ -713,12 +1170,18 @@ class AnchorRun:
         self.syslog = SyslogListener(self.a.local_ip, self.a.syslog_port, self.p("syslog.log"), self.red.text)
         self.preflight()
         self.setup_syslog()
+        if self.sc.get("probe"):
+            self.probe_preflight()
         self.logger = self.start_logger([LOGGER, self.http.base[len("http://"):], self.p("status.jsonl")],
                                         self.p("logger.log"))
         self.logger_started = time.time()
         self.watch = run_soak.Watch(self.p("status.jsonl"))
         for role, ext in sorted(self.sc["uas"].items()):
-            self.agents[role] = self.agent_factory(ext)
+            opts = dict((self.sc.get("agent_opts") or {}).get(role) or {})
+            if opts.pop("rtp", False):
+                self.rtp_pump = self.rtp_pump or sip_agent.RtpPump()
+                opts["rtp_pump"] = self.rtp_pump
+            self.agents[role] = self.agent_factory(ext, **opts) if opts else self.agent_factory(ext)
         why = self.register_all(self.a.register_expires)
         if why:
             raise run_soak.Abort("INVALID", "preflight: " + why)
@@ -740,6 +1203,10 @@ class AnchorRun:
         self.checkpoint()
 
     def teardown(self):
+        try:
+            self.probe_finish()          # the backstop: before any BYE, before the logout
+        except Exception as e:  # noqa: BLE001 -- teardown continues; probe_verdict reports it
+            self.probe_end_problems = ["the disarm raised %r" % (e,)]
         for ua in self.agents.values():
             for dlg in ua.live_dialogs():
                 if dlg.ok and not dlg.ended.is_set():
@@ -766,6 +1233,8 @@ class AnchorRun:
                 self.syslog.stop()
             for ua in self.agents.values():
                 ua.close()
+            if self.rtp_pump is not None:
+                self.rtp_pump.stop()
         return end
 
     def judge(self, end_status):
@@ -786,6 +1255,8 @@ class AnchorRun:
         if self.calls and counts[self.sc["path_counter"]] == 0:
             invalid.append("the pre-registered counter %s is 0: the path was not shown to run "
                            "(INVALID, never PASS; #384 S3)" % self.sc["path_counter"])
+        if self.sc.get("probe"):
+            invalid += self.probe_verdict()
         if self.calls or not self.aborted:
             more_fails, more_invalid, summary = self.sc["judge"](self, self.sc, lines)
             fails += more_fails
@@ -796,8 +1267,9 @@ class AnchorRun:
 
     def bundle(self, verdict, reason):
         os.makedirs(self.dir, exist_ok=True)
-        with open(self.p("calls.json"), "w", encoding="utf-8") as f:
-            f.write(self.red.text(json.dumps(self.calls, indent=1)))
+        public = [{k: v for k, v in c.items() if not k.startswith("_")} for c in self.calls]
+        with open(self.p("calls.json"), "w", encoding="utf-8") as f:   # "_" keys: Call-IDs (LAN addresses)
+            f.write(self.red.text(json.dumps(public, indent=1)))
         withheld = self.scan()
         if withheld and verdict == "PASS":
             verdict, reason = "INVALID", "the secret scan withheld %s" % ", ".join(withheld)
@@ -935,6 +1407,381 @@ scenario(name="x4_cancel_ringing", issues=("#370", "#681", "#379"),
          judge=x4_judge)(x4_run)
 
 
+# ---------------------------------------------------------------- probe scenarios (H1)
+def probe_run(body):
+    """A probe scenario's body runs in try/finally: every fault is disarmed and the ballast
+    released the moment it returns or raises, before the tail and before teardown."""
+    def run(r, sc):
+        try:
+            body(r, sc)
+        finally:
+            r.probe_finish()
+    run.__name__ = body.__name__
+    return run
+
+
+def ms_since(t0, t):
+    return None if t is None or t0 is None else int(round((t - t0) * 1000))
+
+
+def start_call(run, sc, caller):
+    """One INVITE to the far end. The record goes on run.calls first, so an abort keeps it."""
+    t0 = time.monotonic()
+    rec = {"call": 1, "t_start": t0, "final": None}
+    run.calls.append(rec)
+    dlg = caller.invite(run.far_end)
+    rec.update(_call_id=dlg.call_id, final=dlg.final_status,
+               provisional=[s for _, s in dlg.responses if s < 200])
+    return dlg, rec
+
+
+def hang_up(dlg, rec):
+    """The harness's own BYE, once, if the dialog is still up (also on an abort)."""
+    if dlg.ok and not dlg.ended.is_set() and "_t_hangup" not in rec:
+        rec["_t_hangup"] = time.monotonic()
+        rec["hangup_ms"] = ms_since(rec["t_start"], rec["_t_hangup"])
+        rec["hangup_bye"] = dlg.bye()
+
+
+def finish_call(caller, dlg, rec):
+    hang_up(dlg, rec)
+    rec.update(bye_record(dlg, caller))
+    dlg.close()
+    rec["duration_s"] = round(time.monotonic() - rec["t_start"], 3)
+
+
+def after_call(run, sc, caller, rec, base):
+    run.pull_pcap("call-01")             # the ring holds 16 messages: right after the call
+    rec["pcap_byes"] = run.pcap_count("BYE", caller, rec.get("_call_id"))
+    rec["sessions"] = run.sessions_settle(base, caller.ext, sc["settle_s"])
+
+
+def answered(c):
+    return c.get("final") is not None and 200 <= c["final"] < 300
+
+
+def common_problems(run, lines):
+    """(fails, invalid) every probe judge starts from."""
+    fails = ["a panic line reached the syslog"] if count_lines(lines)["panic"] else []
+    if not run.calls:
+        return fails, ["the call never started"]
+    return fails, []
+
+
+def pcap_bye_problems(c, who):
+    if c.get("pcap_byes", 0) > max(1, c.get("pbx_byes") or 0):
+        return ["/api/pcap shows %d BYE transactions sent to %s for the call, the UA counted %s (second "
+                "witness)" % (c["pcap_byes"], who, c.get("pbx_byes"))]
+    return []
+
+
+# -- x349_unread_makecall ------------------------------------------------------
+def x349_run(run, sc):
+    caller = run.agents["caller"]
+    run.say("1 call %s -> far end with makecall_read_fail armed (#349), hung up %.0f s after the INVITE; "
+            "an INVITE at %s or %s stops the run" % (caller.ext, sc["hold_s"], PIN_UA, caller.ext))
+    run.checkpoint()
+    base = run.session_count()
+    run.arm("makecall_read_fail")
+    dlg, rec = start_call(run, sc, caller)
+    try:
+        if dlg.ok:
+            if run.watch_call(rec["t_start"] + sc["hold_s"], stop_when=dlg.ended.is_set):
+                rec["pbx_hung_up_ms"] = ms_since(rec["t_start"], dlg.bye_log[0]["t"] if dlg.bye_log else None)
+        else:
+            run.watch_call(time.monotonic() + sc["phantom_watch_s"])   # the #349 phantom comes ~750 ms later
+    finally:
+        finish_call(caller, dlg, rec)
+    after_call(run, sc, caller, rec, base)
+    run.say("call 1: final %s, %s" % (rec["final"], "hung up after %s ms (BYE %s)" % (rec.get("hangup_ms"),
+                                                                                     rec.get("hangup_bye"))
+                                      if "hangup_ms" in rec else "not hung up by the harness"))
+
+
+def x349_judge(run, sc, lines):
+    fails, invalid = common_problems(run, lines)
+    if not run.calls:
+        return fails, invalid, {}
+    c = run.calls[0]
+    caller = run.agents["caller"]
+    ents = run.syslog.entries(c["t_start"]) if run.syslog else []
+    legs = started_legs(ents)
+    adopted, orphan = matches(ents, "adopted_349"), matches(ents, "orphaned_349")
+    failed = matches(ents, "makecall_status")
+    fail_end = [r for _, r in endcalls(ents, c.get("_call_id")) if r == "anchor call fail"]
+    phantom_pcap = sum(run.pcap_count("INVITE", ua, phantom=True) for ua in run.agents.values())
+    c["log"] = {"legs": len(legs), "adopted": len(adopted), "orphaned": len(orphan),
+                "makecall_failed": len(failed) + len(fail_end), "pcap_phantom_invites": phantom_pcap}
+    summary = dict(c["log"], drop_witness="syslog only (S2): the 3CX participant list is not readable here")
+    if orphan:
+        fails.append("makeCall logged a possible ORPHAN (#349/#328): a billable leg may be live on the 3CX "
+                     "route point; check the tenant and drop it by hand")
+        run.manifest["notes"].append("ORPHAN WARNING: check the 3CX route point for a live leg and drop it")
+    if failed or fail_end:
+        fails.append("the unread makecall response was treated as a failure (makeCall request failed / "
+                     "endCall reason=anchor call fail): the #349 bug")
+    if phantom_pcap:
+        fails.append("/api/pcap shows %d INVITE(s) sent to a test UA that were not the register beep: a "
+                     "phantom inbound (second witness)" % phantom_pcap)
+    if len(adopted) > 1:
+        fails.append("makeCall adopted %d times for one call" % len(adopted))
+    if fails:
+        return fails, invalid, summary
+    if not adopted:
+        invalid.append("the fault fired but no adopt line (#349) reached the syslog: a lost line cannot be told "
+                       "from a missing path (S2)")
+    if not answered(c):
+        invalid.append("the far end did not answer (final %s): the adopted call could not proceed" % c["final"])
+        return fails, invalid, summary
+    if c.get("pbx_hung_up_ms") is not None:
+        invalid.append("the call ended from the far side after %s ms, before the planned hangup: the drop at "
+                       "hangup was not exercised" % c["pbx_hung_up_ms"])
+        return fails, invalid, summary
+    if len(legs) != 1:
+        invalid.append("%d anchored legs started during the call, not 1" % len(legs))
+        return fails, invalid, summary
+    if c.get("hangup_bye") != 200:
+        fails.append("the harness's BYE got %s, not 200" % c.get("hangup_bye"))
+    fails += drop_problems(lines)
+    sf, si = session_problems(c, caller.ext)
+    return fails + sf, invalid + si, summary
+
+
+scenario(name="x349_unread_makecall", issues=("#349",), probe=True, faults=("makecall_read_fail",),
+         about="test UA 6101 -> the designated far end with makecall_read_fail armed: makeCall must adopt "
+               "its own leg (#349), no phantom inbound may reach 6104, one drop at hangup",
+         uas={"caller": "6101", "detector": PIN_UA}, calls=1, call_cap_s=20, hold_s=10.0,
+         phantom_watch_s=5.0, settle_s=5.0, path_counter="bench_makecall_read_fail", ring_required=True,
+         judge=x349_judge)(probe_run(x349_run))
+
+
+# -- x379_never_opened / x518_403_clean_giveup -------------------------------------
+def never_opened_run(run, sc):
+    caller = run.agents["caller"]
+    n, code = sc["get_max_attempts"], sc["get_status"]
+    run.say("1 call %s -> far end with get_status=%d and get_max_attempts=%d armed: the GET budget is "
+            "spent and the handset BYE due within %.0f s (worst case), cap %d s"
+            % (caller.ext, code, n, get_giveup_worst_s(n), sc["call_cap_s"]))
+    run.checkpoint()
+    base = run.session_count()
+    run.arm("get_status", code)
+    run.arm("get_max_attempts", n)
+    dlg, rec = start_call(run, sc, caller)
+    rec.update(get_status=code, get_max_attempts=n)
+    try:
+        if dlg.ok and run.watch_call(rec["t_start"] + sc["call_cap_s"] - HANGUP_MARGIN_S,
+                                     stop_when=dlg.ended.is_set):
+            rec["pbx_bye_ms"] = ms_since(rec["t_start"], dlg.bye_log[0]["t"] if dlg.bye_log else None)
+            run.watch_call(time.monotonic() + sc["dup_wait_s"])          # a second BYE lands here
+    finally:
+        finish_call(caller, dlg, rec)
+    after_call(run, sc, caller, rec, base)
+    run.say("call 1: final %s, PBX BYE at %s ms%s" % (rec["final"], rec.get("pbx_bye_ms"),
+                                                      ", the harness hung up" if "hangup_ms" in rec else ""))
+
+
+def never_opened_judge(run, sc, lines):
+    fails, invalid = common_problems(run, lines)
+    if not run.calls:
+        return fails, invalid, {}
+    c = run.calls[0]
+    caller = run.agents["caller"]
+    ents = run.syslog.entries(c["t_start"]) if run.syslog else []
+    n = sc["get_max_attempts"]
+    legs = started_legs(ents)
+    ev = {"legs": len(legs)}
+    c["log"] = ev
+    if not answered(c):
+        invalid.append("the far end did not answer (final %s): a give-up would have no dialog to BYE" % c["final"])
+        return fails, invalid, ev
+    if len(legs) != 1:
+        invalid.append("%d anchored legs started during the call, not 1" % len(legs))
+        return fails, invalid, ev
+    leg = legs[0]
+    attempts = [(int(m.group(1)), int(m.group(2))) for _, line in ents for m in [_ATTEMPT.search(line)] if m]
+    spent = matches(ents, "get_budget_spent")
+    transport, rebuild = matches(ents, "get_transport_giveup"), matches(ents, "get_rebuild_giveup")
+    drops, drop_failed = matches(ents, "dropped", leg), matches(ents, "drop_failed", leg)
+    ends = endcalls(ents, c.get("_call_id"))
+    branch = "transport" if transport else "rebuild" if rebuild else "budget" if spent else "none"
+    t_hang, t_spent = c.get("_t_hangup"), (spent[0][0] if spent else None)
+    # MediaNeverOpened's witness on syslog (its own "no rx audio, dropping leg" line is
+    # queueLog, stdout only): after the spent budget the board stops this call's bridge
+    # (logged synchronously, before its drop is queued) or drops leg L, before any endCall
+    # of the call and before any harness hangup. A teardown logs endCall first. The drop
+    # line alone is not ordered against endCall: the tel_drop worker logs it after the
+    # POST's answer, and 3CX's Remove (endCall "anchor hangup") can come first.
+    stops = [t for t, _ in matches(ents, "stop_bridge", c.get("_call_id"))] + [t for t, _ in drops]
+    t_first = min((t for t in stops if t_spent is None or t >= t_spent), default=None)
+    on_its_own = t_first is not None and (t_hang is None or t_first < t_hang) \
+        and not any(t <= t_first for t, _ in ends)
+    ev.update(attempts=len(attempts), budgets=sorted({b for _, b in attempts}),
+              max_attempt=max((a for a, _ in attempts), default=0),
+              refused=dict(collections.Counter(m.group(1) for _, m in matches(ents, "get_refused"))),
+              refused_403_this_leg=len(matches(ents, "get_refused_403", leg)), branch=branch,
+              never_opened_lines=len(matches(ents, "get_never_opened")), drops=len(drops),
+              drop_failed=len(drop_failed), endcall_reasons=[r for _, r in ends],
+              dropped_by_the_board_on_its_own=on_its_own and branch == "budget",
+              rh_never_opened_line=len(matches(ents, "rh_never_opened_drop", leg)),
+              harness_hung_up=t_hang is not None, pcap_byes=c.get("pcap_byes"),
+              drop_witness="syslog only (S2): 3CX is HTTPS and its participant list is not readable here")
+    if ev["budgets"] and ev["budgets"] != [n]:
+        invalid.append("the attempt lines count to /%s, not /%d: get_max_attempts did not reach this leg"
+                       % ("/".join(str(b) for b in ev["budgets"]), n))
+    if sc.get("require_refused") and not ev["refused_403_this_leg"]:
+        invalid.append("no 'GET stream refused (HTTP 403)' line for leg %s reached the syslog (#518)" % leg)
+    # S6: exactly one drop in every branch.
+    if not drops:
+        fails.append("leg %s was never dropped (syslog is the only witness, S2): a live billable leg on 3CX?"
+                     % leg)
+    elif len(drops) > 1:
+        fails.append("leg %s was dropped %d times" % (leg, len(drops)))
+    if drop_failed:
+        fails.append("the drop of leg %s failed %d time(s)" % (leg, len(drop_failed)))
+    if branch in ("transport", "rebuild"):
+        invalid.append("S6: the GET loop gave up by the %s branch, not a spent budget, so MediaNeverOpened is "
+                       "not raised by design; leg %s was dropped %d time(s), %s" % (
+                           branch, leg, len(drops), "never" if not drops else
+                           "by the board before any hangup" if on_its_own else "only after the harness hung up"))
+        return fails, invalid, ev
+    if branch == "none":
+        invalid.append("the GET budget was not spent within the call (highest attempt %d/%d)"
+                       % (ev["max_attempt"], n))
+        return fails, invalid, ev
+    if drops and not on_its_own:
+        fails.append("the GET budget was spent but leg %s was dropped only by a teardown or the harness's "
+                      "hangup, not by the board on its own (MediaNeverOpened, #379)" % leg)
+    if t_hang is not None:
+        fails.append("no BYE reached %s within the %d s cap after the give-up: the harness hung up"
+                     % (caller.ext, sc["call_cap_s"]))
+    fails += bye_problems(c, caller.ext, count=t_hang is None)
+    if t_hang is None:
+        fails += ruri_problems(c, caller.ext)
+    fails += pcap_bye_problems(c, caller.ext)
+    sf, si = session_problems(c, caller.ext)
+    return fails + sf, invalid + si, ev
+
+
+NEVER_OPENED = dict(probe=True, faults=("get_status", "get_max_attempts"), get_status=403,
+                    get_max_attempts=12, uas={"caller": "6101", "detector": PIN_UA},
+                    agent_opts={"caller": {"contact_params": ";line=pd6101"}}, calls=1,
+                    call_cap_s=30, dup_wait_s=3.0, settle_s=5.0, ring_required=True,
+                    judge=never_opened_judge)
+scenario(name="x379_never_opened", issues=("#379",),
+         about="test UA 6101 (Contact ;line=pd6101) -> the designated far end; every GET stream answer reads "
+               "403 and the budget is 12: the board must drop the leg once on its own (MediaNeverOpened) and "
+               "BYE 6101 once, at its registered Contact",
+         path_counter="get_budget_spent", **NEVER_OPENED)(probe_run(never_opened_run))
+scenario(name="x518_403_clean_giveup", issues=("#518", "#379"), require_refused=True,
+         about="x379_never_opened plus the 'GET stream refused (HTTP 403)' line (#519): a 403 for the "
+               "whole budget gives up cleanly; one run serves both issues",
+         path_counter="get_refused_403", **NEVER_OPENED)(probe_run(never_opened_run))
+
+
+# -- x279_degraded_bye (Connected; the Held variant is not registered) ----------------
+def x279_run(run, sc):
+    caller = run.agents["caller"]
+    run.say("1 call %s -> far end with handset RTP; post_stream_fail armed %g s after the POST stream "
+            "opens; the BYE is due within %g s" % (caller.ext, sc["write_settle_s"], sc["bye_wait_s"]))
+    run.checkpoint()
+    base = run.session_count()
+    dlg, rec = start_call(run, sc, caller)
+    rec["variant"] = "connected"
+
+    def drive():
+        if not dlg.ok:
+            return
+        _, m = run.wait_line("initiated", rec["t_start"], sc["post_open_wait_s"])
+        t_open, m = run.wait_line("post_open", rec["t_start"], sc["post_open_wait_s"],
+                                  key=m.group(1)) if m else (None, None)
+        if m is None:
+            return
+        rec.update(leg=m.group(1), post_open_ms=ms_since(rec["t_start"], t_open))
+        if run.watch_call(time.monotonic() + sc["write_settle_s"], stop_when=dlg.ended.is_set):
+            rec["ended_before_arm"] = True
+            return
+        rec["rtp_sent_before_arm"] = dlg.media_counts()[0]
+        if not rec["rtp_sent_before_arm"]:
+            return
+        run.arm("post_stream_fail")
+        rec["_t_armed"] = time.monotonic()
+        if run.watch_call(rec["_t_armed"] + sc["bye_wait_s"], stop_when=dlg.ended.is_set):
+            rec["bye_after_arm_ms"] = ms_since(rec["_t_armed"], dlg.bye_log[0]["t"] if dlg.bye_log else None)
+            run.watch_call(time.monotonic() + sc["dup_wait_s"])          # a second BYE lands here
+            rec["reinvite"] = dlg.reinvite("sendonly")                   # the dead dialog: 481 (#611)
+    try:
+        drive()
+    finally:
+        finish_call(caller, dlg, rec)
+    after_call(run, sc, caller, rec, base)
+    run.say("call 1: final %s, BYE %s ms after the fault, re-INVITE %s" % (
+        rec["final"], rec.get("bye_after_arm_ms"), rec.get("reinvite")))
+
+
+def x279_judge(run, sc, lines):
+    fails, invalid = common_problems(run, lines)
+    if not run.calls:
+        return fails, invalid, {}
+    c = run.calls[0]
+    caller = run.agents["caller"]
+    ents = run.syslog.entries(c["t_start"]) if run.syslog else []
+    ev = {}
+    c["log"] = ev
+    if not answered(c):
+        invalid.append("the far end did not answer (final %s)" % c["final"])
+    elif not c.get("leg"):
+        invalid.append("no POST stream OPEN line for the call's leg within %g s: the fault had no stream to break"
+                       % sc["post_open_wait_s"])
+    elif c.get("ended_before_arm"):
+        invalid.append("the call ended before the fault was armed")
+    elif not c.get("rtp_sent_before_arm"):
+        invalid.append("no handset RTP before the fault: writeAudio() never ran, so there was no good write "
+                       "for the bridge to degrade from (MediaBridge::isAudioDegraded)")
+    if invalid:
+        return fails, invalid, ev
+    leg, cid = c["leg"], c.get("_call_id")
+    degraded = matches(ents, "degraded_endcall", cid)
+    drops, drop_failed = matches(ents, "dropped", leg), matches(ents, "drop_failed", leg)
+    ev.update(degraded_endcalls=len(degraded), endcall_reasons=[r for _, r in endcalls(ents, cid)],
+              drops=len(drops), drop_failed=len(drop_failed), rh_teardown_line=len(matches(ents, "rh_degraded")),
+              pcap_byes=c.get("pcap_byes"),
+              drop_witness="syslog only (S2): 3CX is HTTPS and its participant list is not readable here")
+    if not degraded:
+        invalid.append("no 'endCall <this call> reason=anchor audio write failure' line: the degraded teardown "
+                       "was not shown to run (its 'anchor call torn down' line is queueLog, never on syslog)")
+        return fails, invalid, ev
+    if len(degraded) > 1:
+        fails.append("the degraded teardown ran %d times for one call" % len(degraded))
+    fails += bye_problems(c, caller.ext, count=c.get("_t_hangup") is None)
+    if c.get("_t_hangup") is not None:
+        fails.append("no BYE reached %s within %g s of the fault: the harness hung up (#279)"
+                     % (caller.ext, sc["bye_wait_s"]))
+    else:
+        fails += ruri_problems(c, caller.ext)
+        if c.get("reinvite") != 481:
+            fails.append("a re-INVITE on the torn-down dialog got %s, not 481" % c.get("reinvite"))
+    if not drops:
+        fails.append("leg %s was never dropped (syslog is the only witness, S2)" % leg)
+    elif len(drops) > 1:
+        fails.append("leg %s was dropped %d times" % (leg, len(drops)))
+    if drop_failed:
+        fails.append("the drop of leg %s failed %d time(s)" % (leg, len(drop_failed)))
+    fails += pcap_bye_problems(c, caller.ext)
+    sf, si = session_problems(c, caller.ext)
+    return fails + sf, invalid + si, ev
+
+
+scenario(name="x279_degraded_bye", issues=("#279",), probe=True, faults=("post_stream_fail",),
+         about="test UA 6101 (Contact ;line=pd6101, sending RTP) -> the designated far end, answered; "
+               "post_stream_fail breaks the POST stream: one BYE to 6101 at its registered Contact, one "
+               "drop, sessionCount back to baseline, a re-INVITE on the dead dialog gets 481",
+         uas={"caller": "6101", "detector": PIN_UA},
+         agent_opts={"caller": {"rtp": True, "contact_params": ";line=pd6101"}},
+         calls=1, call_cap_s=30, post_open_wait_s=8.0, write_settle_s=1.5, bye_wait_s=3.0, dup_wait_s=1.5,
+         settle_s=5.0, path_counter="degraded_endcall", ring_required=True,
+         judge=x279_judge)(probe_run(x279_run))
+
+
 # ---------------------------------------------------------------- CLI
 class _Parser(argparse.ArgumentParser):
     def error(self, message):
@@ -1018,6 +1865,9 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
     if not args.dry_run and not args.expect_version:
         problems.append("no --expect-version: the closure rule needs a provenance-checked image "
                         "(the release stamp, or that commit's -probe stamp)")
+    if sc.get("probe") and args.expect_version and "-probe" not in args.expect_version:
+        problems.append("--expect-version is not a -probe stamp: %s drives the bench probe image "
+                        "(docs/BENCH_PROBE.md), which a release image does not carry" % sc["name"])
     if not env.get(PIN_ENV):
         problems.append("no %s in the environment: the S1 pin cannot be checked without an admin "
                         "session" % PIN_ENV)
@@ -1036,6 +1886,11 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
                                                                      sc["path_counter"]))
     emit("  approval  %s" % (args.approval_url or "<none>"))
     emit("  CHECK-OUT %s until %s" % (args.checkout_url or "<none>", args.checkout_expiry or "<none>"))
+    if sc.get("probe"):
+        emit("  probe     arms %s (each one-shot), disarms every fault and releases the ballast in a "
+             "finally, then reads the counters back" % ", ".join(
+                 "%s=%s" % (f, sc[f]) if f in sc else f for f in sc["faults"]))
+        emit("  PROBE IMAGE: never leave it on a rig; CHECK-IN (#428) puts a release image back")
     if sc.get("ring_required"):
         emit("  " + RING_REQUIRED)
     if problems:
@@ -1048,8 +1903,8 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
 
     http = http or BoardHttp(args.host, args.http_port, red, env)
     http.redactor = red
-    factory = agent_factory or (lambda ext: sip_agent.Agent(
-        ext, args.host, args.port, local_ip=args.local_ip, strict_dialogs=True, reject_invites=486))
+    factory = agent_factory or (lambda ext, **kw: sip_agent.Agent(
+        ext, args.host, args.port, local_ip=args.local_ip, strict_dialogs=True, reject_invites=486, **kw))
     starter = start_logger or run_soak.RealRunner().start
     run = AnchorRun(args, sc, far, red, http, factory, starter, out)
     old = {}
