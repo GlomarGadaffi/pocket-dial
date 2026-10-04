@@ -1604,13 +1604,17 @@ def never_opened_judge(run, sc, lines):
     drops, drop_failed = matches(ents, "dropped", leg), matches(ents, "drop_failed", leg)
     ends = endcalls(ents, c.get("_call_id"))
     branch = "transport" if transport else "rebuild" if rebuild else "budget" if spent else "none"
-    t_hang, first_drop = c.get("_t_hangup"), (drops[0][0] if drops else None)
-    # MediaNeverOpened's witness on syslog: the board dropped the leg after the spent
-    # budget, before any teardown of this call (endCall) and before any harness hangup.
-    # Its own "no rx audio, dropping leg" line is queueLog (stdout), never on syslog.
-    t_spent = spent[0][0] if spent else None
-    on_its_own = first_drop is not None and (t_hang is None or first_drop < t_hang) \
-        and (t_spent is None or first_drop >= t_spent) and not any(t < first_drop for t, _ in ends)
+    t_hang, t_spent = c.get("_t_hangup"), (spent[0][0] if spent else None)
+    # MediaNeverOpened's witness on syslog (its own "no rx audio, dropping leg" line is
+    # queueLog, stdout only): after the spent budget the board stops this call's bridge
+    # (logged synchronously, before its drop is queued) or drops leg L, before any endCall
+    # of the call and before any harness hangup. A teardown logs endCall first. The drop
+    # line alone is not ordered against endCall: the tel_drop worker logs it after the
+    # POST's answer, and 3CX's Remove (endCall "anchor hangup") can come first.
+    stops = [t for t, _ in matches(ents, "stop_bridge", c.get("_call_id"))] + [t for t, _ in drops]
+    t_first = min((t for t in stops if t_spent is None or t >= t_spent), default=None)
+    on_its_own = t_first is not None and (t_hang is None or t_first < t_hang) \
+        and not any(t <= t_first for t, _ in ends)
     ev.update(attempts=len(attempts), budgets=sorted({b for _, b in attempts}),
               max_attempt=max((a for a, _ in attempts), default=0),
               refused=dict(collections.Counter(m.group(1) for _, m in matches(ents, "get_refused"))),
