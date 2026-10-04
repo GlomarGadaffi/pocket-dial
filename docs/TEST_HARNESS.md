@@ -335,6 +335,24 @@ syslog. A run whose counter is 0 is INVALID, never PASS.
 | Scenario | For | Run | Counter | PASS also needs |
 |---|---|---|---|---|
 | `x4_cancel_ringing` | #370 (a), #681, #379 (row X4) | 30 calls, 6101 → the designated far end, CANCEL swept 0.6-1.4 s after the INVITE, each ≤ 30 s | `rx554_window`: `startRxIfNeeded: rx task for <leg> still exiting -- not restarting yet (#554)` or `… had exited -- restarting (#554)` | every call ends 487 (#548), or is a legal 2xx-before-CANCEL race (RFC 3261 §9.1: ACKed, BYEd, counted apart); each initiated leg dropped exactly once; no second rx task on a leg without a #554 restart; no INVITE at 6101 or 6104 except the register beep; no reboot, reset-reason change or coredump change |
+| `x349_unread_makecall` | #349 | 1 call, 6101 → the far end with `makecall_read_fail` armed, hung up 10 s after the INVITE (≤ 20 s) | `bench_makecall_read_fail`: `BENCHFAULT makecall_read_fail fired` | the probe's `fired` ≥ 1; one `… adopting the call instead of failing it (#349)` line; no INVITE at 6101 or 6104 but the register beep (UA and `/api/pcap`), which also stops the run; no `ORPHANED` and no `makeCall request failed` line; the leg dropped once at hangup (syslog only); sessionCount back to baseline |
+| `x379_never_opened` | #379 (PR1) | 1 call, 6101 (Contact `;line=pd6101`) → the far end with `get_status=403` and `get_max_attempts=12`, ≤ 30 s | `get_budget_spent`: `GET stream … attempt 12/12` | both faults' `fired` ≥ 1; attempt lines count to `/12`; the board drops the leg once on its own after the spent budget, before any `endCall` of the call (MediaNeverOpened); exactly one BYE at 6101, matching Call-ID and tags, at its registered Contact, answered 200 (UA and `/api/pcap`). A give-up by the transport or rebuild branch is INVALID, with its drop count recorded (#384 S6) |
+| `x518_403_clean_giveup` | #518, #379 | the same run | `get_refused_403`: `GET stream refused (HTTP 403) for …/participants/<leg>/stream` | everything `x379_never_opened` needs |
+| `x279_degraded_bye` | #279 (Connected variant) | 1 answered call, 6101 sends RTP (Contact `;line=pd6101`); `post_stream_fail` armed 1.5 s after its POST stream opens; the BYE due within 3 s | `degraded_endcall`: `endCall <Call-ID> reason=anchor audio write failure` | `fired` ≥ 1; exactly one BYE at 6101, matching Call-ID and tags, Request-URI = its registered Contact with its parameters, answered 200; the leg dropped once (syslog only); sessionCount back to baseline; a re-INVITE on the dead dialog gets 481 |
+
+**Probe scenarios** (`x349`, `x379`, `x518`, `x279`) drive the bench probe image
+([BENCH_PROBE.md](BENCH_PROBE.md)). On top of the preconditions below, `--expect-version` must be
+a `-probe` stamp, and the admin login must be the owner when an owner credential exists
+(`PD_BOARD_ADMIN_USER`). Each run reads `/api/bench/fault` before and after, and arms only its
+pre-registered faults: never for an emergency far end, and never while the probe reports an
+emergency. It disarms every fault and releases the ballast in a `finally`, then reads the counters
+back. If anything is still armed or held, if a fault shows `fired: 0`, or if an emergency touched the
+probe, the run is INVALID. Syslog carries `esp_log` lines only. RequestsHandler's `queueLog()`
+lines go to stdout (#533/#603), so the counters use the `endCall … reason=` and anchor-client lines.
+`get_max_attempts=12` puts the worst-case handset BYE at about 25 s. That is 50-400 ms of backoff,
+then 500 ms per attempt, plus a TLS reconnect of up to 1.3 s per attempt once the forced 403 closes
+a real 200, so it fits the 30 s call cap. The Held variant of `x279` and `x350`/`x336` are not
+registered.
 
 **Safety preconditions.** Each one is refused before anything is sent (exit 2), except
 the S1 pin, which is checked against the board:

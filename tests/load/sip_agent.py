@@ -25,6 +25,7 @@ keeps the behaviour above:
   * Dialog.hold() / resume(): a re-INVITE offering sendonly / sendrecv (s14.1);
   * contact_params: URI parameters on the Contact (e.g. ";line=pd6101");
   * strict_dialogs: a BYE must match Call-ID AND both tags (s12.2.2), else 481;
+  * Dialog.bye_log: each BYE that reached the dialog, with its Request-URI (rule 1);
   * reject_invites=<code>: every new incoming INVITE is refused and recorded.
 
 stdlib only.
@@ -277,6 +278,7 @@ class Dialog:
         self.reinvites = 0
         self.byes = 0                # BYE transactions that matched this dialog
         self.bye_mismatches = 0      # strict_dialogs: same Call-ID, wrong tags -> 481
+        self.bye_log = []            # every BYE with this Call-ID: {"t", "ruri", "status"}
         self.responses = []          # uac: (monotonic time, status) of every INVITE response
         self.invite_sent_at = None
         self.cancel_sent_at = None   # cancel_after_ms: when the CANCEL actually went
@@ -690,9 +692,11 @@ class Agent:
                 if why:
                     self._reply(req, addr, 481, "Call/Transaction Does Not Exist")
                     self._note_bye_481(req, why)
+                    dlg.bye_log.append({"t": time.monotonic(), "ruri": req.ruri, "status": 481})
                     return
             dlg.byes += 1
             self._reply(req, addr, 200, "OK")
+            dlg.bye_log.append({"t": time.monotonic(), "ruri": req.ruri, "status": 200})
             dlg.ended.set()
         elif method == "CANCEL":
             self._reply(req, addr, 200, "OK")
