@@ -1,2 +1,2 @@
-# TrunkWiring_test.cpp: 3 (the carrier answer's RTP address on outbound trunk calls, 911 exempt, #861)
-3
+# TrunkWiring_test.cpp: 8 (the carrier answer's RTP address on outbound trunk calls, 911 exempt, and later answers on a connected call, #861)
+8
