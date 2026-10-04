@@ -1772,6 +1772,17 @@ private:
 		return _emergencyCallbacks.open(ext, std::chrono::steady_clock::now());
 	}
 
+	// #759's emergency yield: the one decision handle()'s header gate and its
+	// second-audio-stream cap both ask, and only when one would refuse. True for
+	// an INVITE to 911/933/sos or marked Priority: psap-callback; for anything on
+	// a live emergency session, by the handset's Call-ID or by its trunk
+	// dialog's own (#818); and for a dialog-initial INVITE that is a PSAP
+	// callback by #659's window (#818) or a 911 a dial-plan rule produces (#834).
+	// Caller holds _mutex.
+	bool isEmergencyTraffic(const SipMessage& m);
+	// #834: a dial-plan Trunk rule turns `dialed` into 911/933 in onInvite.
+	bool dialRuleMakesEmergency(const std::string& dialed) const;
+
 	// emergencyRoute() for a caller that already holds _mutex.
 	EmergencyRoute emergencyRouteLocked() const;
 
@@ -1790,6 +1801,8 @@ private:
 	// #398: is `src` the trunk's SBC? The configured transport address from the
 	// resolver's cache (never a blocking resolve), IP only, as #356 compares.
 	bool isTrunkSbcSource(const sockaddr_in& src);
+	// #398: the extension a carrier INVITE's DID is mapped to, or empty.
+	std::string trunkDidExtension(const SipMessage& m) const;
 	// #398: a new INVITE from the SBC: refused with a final (part B), or forked
 	// to the DID's extension (part C). Caller holds _mutex.
 	void routeInboundTrunkCall(const std::shared_ptr<SipMessage>& data);
