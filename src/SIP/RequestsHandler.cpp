@@ -4417,9 +4417,9 @@ void RequestsHandler::preemptAnchorCallForEmergency()
 		if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
 		victim->noteServerCSeq(cseq);
 	}
-	const std::string far = victim->getAnchorParticipantId();   // endCall()'s release() clears it
+	const std::string farLeg = victim->getAnchorParticipantId();   // endCall()'s release() clears it
 	const std::string_view phone = handset ? std::string_view(handset->getNumber()) : std::string_view();
-	endCall(callID, inbound ? far : phone, inbound ? phone : far, "pre-empted by 911");
+	endCall(callID, inbound ? farLeg : phone, inbound ? phone : farLeg, "pre-empted by 911");
 }
 
 bool RequestsHandler::anchorIsSynchronous() const
@@ -6486,13 +6486,13 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		const auto dest = session.value()->getDest();
 		// Dispatch on the session, not on the To number (rule 2): the far leg is
 		// whichever one the sender is not.
-		std::shared_ptr<SipClient> far;
+		std::shared_ptr<SipClient> farLeg;
 		if (src && dest)
 		{
-			if (data->getFromNumber() == src->getNumber())       far = dest;
-			else if (data->getFromNumber() == dest->getNumber()) far = src;
+			if (data->getFromNumber() == src->getNumber())       farLeg = dest;
+			else if (data->getFromNumber() == dest->getNumber()) farLeg = src;
 		}
-		if (far)
+		if (farLeg)
 		{
 			// A BYE already in flight for this dialog: a retransmit that got past the
 			// transaction layer, or both phones hanging up at once. Answer, originate
@@ -6509,7 +6509,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			{
 				byeCSeq = session.value()->nextServerCSeq();
 				// The sender's own From/To are the dialog as the far phone knows it.
-				bye = buildServerBye(far->getNumber(), far->getAddress(), std::string(data->getCallID()),
+				bye = buildServerBye(farLeg->getNumber(), farLeg->getAddress(), std::string(data->getCallID()),
 					std::string(data->getFrom()), std::string(data->getTo()), byeCSeq, &refused);
 				// A refused pool draw commits nothing and the retransmit tries again
 				// (#715). A BYE the builder refused is refused again on every
@@ -6526,7 +6526,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 				session.value()->noteServerCSeq(byeCSeq);
 				setCallState(data->getCallID(), Session::State::Bye);
 				setCallDisposition(data->getCallID(), Session::Disposition::Bye);   // #690, same writer as the generic path below
-				_outbox.emplace_back(far->getAddress(), std::move(bye));
+				_outbox.emplace_back(farLeg->getAddress(), std::move(bye));
 			}
 			else if (refused)
 			{
@@ -6543,10 +6543,10 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	// #798: the sender addressed this BYE to the PBX. The far phone gets its own
 	// registered Contact, or a Snom answers 481 for want of its ;line= (RFC 3261
 	// §12.2.1.1).
-	if (auto far = findClient(data->getToNumber());
-		far.has_value() && !far.value()->getContactUri().empty())
+	if (auto farLeg = findClient(data->getToNumber());
+		farLeg.has_value() && !farLeg.value()->getContactUri().empty())
 	{
-		data->setHeader("BYE " + far.value()->getContactUri() + " SIP/2.0");
+		data->setHeader("BYE " + farLeg.value()->getContactUri() + " SIP/2.0");
 	}
 	setCallDisposition(data->getCallID(), Session::Disposition::Bye);
 	endHandle(data->getToNumber(), data);
