@@ -588,6 +588,16 @@ public:
 		pkt.payloadLen = sizeof(payload);
 		return (fromCarrier ? _trunkRx[slot] : _handsetRx[slot]).dispatchRaw(pkt);
 	}
+	// #861: where a trunk call's relay sends the handset's audio toward the carrier.
+	bool trunkCarrierPeerForTest(const std::string& callID, sockaddr_in& out)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		auto sit = _sessions.find(callID);
+		if (sit == _sessions.end() || !sit->second->isTrunk()) return false;
+		const int slot = sit->second->getTrunkRelaySlot();
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS)) return false;
+		return _trunkRx[slot].rawPeerForTest(out);
+	}
 
 	// What the resolver currently knows about the configured SBC host. Refused
 	// means nothing is known and nothing is in flight; anything else means a

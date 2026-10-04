@@ -306,6 +306,14 @@ public:
 	//      never interleave with forwarded packets on one stream. That hazard is
 	//      removed by construction rather than by a documented convention.
 	bool setRawPeer(const sockaddr_in& peer);
+	// #861: the peer setRawPeer() last took; false if none was set.
+	bool rawPeerForTest(sockaddr_in& out)
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		if (!_rawPeerSet.load(std::memory_order_acquire)) return false;
+		out = _rawPeer;
+		return true;
+	}
 
 	// Forward one packet VERBATIM: original marker, payload type, sequence,
 	// timestamp and SSRC, payload bytes untouched. This is the egress half of

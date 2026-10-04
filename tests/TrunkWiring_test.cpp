@@ -157,10 +157,12 @@ namespace
 			return v;
 		}
 
-		std::string response(const std::string& statusLine, bool withSdp) const
+		// `rtpIp` is the SDP's c= address: where the carrier wants its audio.
+		std::string response(const std::string& statusLine, bool withSdp,
+			const std::string& rtpIp = "203.0.113.9") const
 		{
 			const std::string sdp = withSdp
-				? "v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\n"
+				? "v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 " + rtpIp + "\r\n"
 				  "t=0 0\r\nm=audio 41000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n"
 				  "a=rtpmap:101 telephone-event/8000\r\n"
 				: std::string();
@@ -440,6 +442,78 @@ TEST(TrunkWiring, AnAnswerWithNoUsableMediaHangsTheCarrierUpRatherThanConnectSil
 		<< "the carrier leg is answered and billing; it has to be hung up";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u)
 		<< "and the relay pair released";
+}
+
+// #861: the carrier's answer says where its audio goes, and a forged or broken
+// one must not aim the relay at this host, at loopback, at broadcast or at a
+// multicast group. The same check as an inbound call (#850): the handset is
+// refused 502 and the answered carrier leg is hung up. inet_addr() turned
+// "999.0.113.9" into 255.255.255.255. (c=0.0.0.0 is not here: parseCallerRtp()
+// reads it as "use the sender's address", which is the SBC.)
+TEST(TrunkWiring, AnAnswerNamingAnUnusableRtpAddressIsRefusedRatherThanRelayed)
+{
+	for (const char* ip : { "127.0.0.1", "224.0.0.1", "255.255.255.255", "999.0.113.9", kServerIp })
+	{
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861"));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		b.sent.clear();
+
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, ip), addrFor(kSbcIp)));
+
+		EXPECT_TRUE(b.firstWithTo("200 OK", kHandsetIp).empty()) << ip << ": the handset must not be answered";
+		EXPECT_FALSE(b.firstWithTo("502", kHandsetIp).empty()) << ip << ": it is refused 502";
+		EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << ip << ": the answered carrier leg is hung up";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << ip << ": and the relay pair released";
+	}
+}
+
+// #861 (desmo, 2026-10-04): a 911/933 is never refused over the carrier's RTP
+// address. Its relay goes wherever the answer says, as before the check; the
+// test above, which refuses the same answer on an ordinary call, is the control.
+TEST(TrunkWiring, AnEmergencyCallIsRelayedToWhateverAddressTheCarrierNames)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-861-911"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", /*withSdp=*/true, "127.0.0.1"), addrFor(kSbcIp)));
+
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the 911 caller is connected";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the PSAP leg is not hung up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-911", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("127.0.0.1")) << "the address the carrier named";
+	EXPECT_EQ(ntohs(peer.sin_port), 41000);
+}
+
+// #861: early media is best effort, so a 183 naming an unusable address leaves
+// local ringback and the call alone; a usable 200 still connects it.
+TEST(TrunkWiring, A183NamingAnUnusableRtpAddressLeavesLocalRingback)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-em"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 183 Session Progress", /*withSdp=*/true, "127.0.0.1"), addrFor(kSbcIp)));
+	EXPECT_TRUE(b.firstWith("183 Session Progress").empty()) << "loopback early media is not relayed";
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the call still connects";
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-em", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9"));
 }
 
 // ── Failure ─────────────────────────────────────────────────────────────────
