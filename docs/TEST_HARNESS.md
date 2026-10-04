@@ -318,3 +318,48 @@ owes the CHECK-OUT broadcast; the harness does not post to the Discussion yet.
 Prerequisite before the first `hil-244` dispatch: the repo secret `PD_BOARD_ADMIN_PIN`
 (the `.244` dashboard password for user `admin`) must exist, or every run fails at
 TC-AUTH-04 and cascades.
+
+## 10. Anchor scenarios (`sip_stress.py --scenario <name>`, #384)
+
+`tests/load/anchor_scenarios.py` runs one named scenario against a rig's anchored outside
+line and computes its own verdict. Its self-test is `tests/tools/test_anchor_scenarios.py`
+(fakes on loopback only). No scenario here has run against a board yet.
+
+**Closure rule** (desmo's approval, [#384](https://github.com/GlomarGadaffi/pocket-dial/issues/384#issuecomment-5966736679), verbatim):
+
+> The closure rule: a milestone-4 issue closes only when a named scenario in the repo runs on a provenance-checked image (the release stamp, or that commit's `-probe` stamp), its pre-registered path-exercised counter is >= 1 (else the run is INVALID), the script, not a person, computes PASS, and the redacted manifest and log are posted on the issue. A human decision (a re-scope, an approval) is linked as a comment and is never itself the reason to close.
+
+**Scenarios and their pre-registered counters.** A counter is a regex over the board's
+syslog. A run whose counter is 0 is INVALID, never PASS.
+
+| Scenario | For | Run | Counter | PASS also needs |
+|---|---|---|---|---|
+| `x4_cancel_ringing` | #370 (a), #681, #379 (row X4) | 30 calls, 6101 → the designated far end, CANCEL swept 0.6-1.4 s after the INVITE, each ≤ 30 s | `rx554_window`: `startRxIfNeeded: rx task for <leg> still exiting -- not restarting yet (#554)` or `… had exited -- restarting (#554)` | every call ends 487 (#548), or is a legal 2xx-before-CANCEL race (RFC 3261 §9.1: ACKed, BYEd, counted apart); each initiated leg dropped exactly once; no second rx task on a leg without a #554 restart; no INVITE at 6101 or 6104 except the register beep; no reboot, reset-reason change or coredump change |
+
+**Safety preconditions.** Each one is refused before anything is sent (exit 2), except
+the S1 pin, which is checked against the board:
+
+- a discussion #428 CHECK-OUT link whose expiry covers the run;
+- `--approval-url` is one of the recorded approvals (`APPROVALS`: the #384 comment above and
+  discussions/451 18621141) or `EXTRA_APPROVALS`;
+- the far end comes from a 0600 file (`PD_ANCHOR_FAR_END_FILE`) or from `PD_ANCHOR_FAR_END`,
+  never from argv. It is refused if it holds 911 or 933 anywhere, or is 112, 113, 999, an owner
+  extension (1001, 1002, 1003, 113, plus `PD_OWNER_EXTS`), a test UA or a PBX service number;
+- the board is `.195` or `.244`, and the admin PIN comes from `PD_BOARD_ADMIN_PIN`;
+- `--expect-version` names the image (the provenance the closure rule needs); the board's
+  `/api/status` version must match it, or the run is INVALID before the first call;
+- the test UAs are 6101-6104 only, and 6104 is the phantom detector;
+- the S1 pin: a DID row maps the active anchor slot's route DN to 6104, and the authenticated
+  roster shows 6104 at this run's own address. It is checked before the first call, between
+  calls and while idle. A lapse stops the run as INVALID, because a lapsed pin falls back to
+  ring-all.
+- **RING-REQUIRED**: until the far end is confirmed automated, a run against real 3CX needs
+  desmo's OK for that run. The script prints this but does not enforce it.
+
+**Evidence.** With `--set-syslog`, the board's syslog points at the run's UDP listener
+(default port 5514), and the old setting is restored afterwards. `/api/pcap` is pulled after
+every call, because the ring holds 16 messages. Every text output is redacted, including the
+far end, the PIN, the session and the tenant host. The pcap is masked at the same length and
+still holds LAN addresses, so never post it.
+
+Exit codes match `run_soak.py`: 0 PASS, 1 FAIL, 2 refused, 3 INVALID, 4 ABORTED.

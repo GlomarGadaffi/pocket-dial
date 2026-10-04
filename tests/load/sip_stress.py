@@ -47,6 +47,9 @@ Issue #401: `--profile <name>` runs a scheduled multi-scenario load instead
 (registrations, 777 bursts, extension calls, 888, park + MoH) from the table in
 load_profile.py; `--profile rc1 --dry-run ...` prints the plan and sends nothing.
 See load_profile.py for its options and its safety refusals.
+
+Issue #384: `--scenario <name>` runs one named anchor scenario (e.g.
+x4_cancel_ringing) from anchor_scenarios.py, which holds its refusals.
 """
 import argparse, socket, threading, time, random, re, statistics, sys, json
 import urllib.request
@@ -210,6 +213,10 @@ def main(argv=None):
         # options below are not used on that path.
         import load_profile
         return load_profile.main(argv)
+    if any(a == "--scenario" or a.startswith("--scenario=") for a in argv):
+        # #384: a named anchor scenario (anchor_scenarios.py), with its own refusals.
+        import anchor_scenarios
+        return anchor_scenarios.main(argv)
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="192.168.12.159")
     ap.add_argument("--port", type=int, default=5060)

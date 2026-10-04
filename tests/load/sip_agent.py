@@ -18,6 +18,15 @@ Wire choices, each deliberate (see the PR):
     reproduce an RFC-strict phone on that path.
   * No digest authentication. A 401 or 407 is recorded as a failure.
 
+Opt-in additions for the anchor scenarios (anchor_scenarios.py); every default
+keeps the behaviour above:
+  * invite(..., cancel_after_ms=N) CANCELs N ms after the INVITE was sent, never
+    before a provisional response (s9.1), and records when it went;
+  * Dialog.hold() / resume(): a re-INVITE offering sendonly / sendrecv (s14.1);
+  * contact_params: URI parameters on the Contact (e.g. ";line=pd6101");
+  * strict_dialogs: a BYE must match Call-ID AND both tags (s12.2.2), else 481;
+  * reject_invites=<code>: every new incoming INVITE is refused and recorded.
+
 stdlib only.
 """
 import random
@@ -233,8 +242,10 @@ class _Txn:
         self.provisional = threading.Event()
         self.final = threading.Event()
         self.final_msg = None
+        self.responses = []          # (monotonic time, status), 1xx included
 
     def add(self, msg):
+        self.responses.append((time.monotonic(), msg.status))
         if msg.status >= 200:
             if not self.final.is_set():
                 self.final_msg = msg
@@ -264,6 +275,13 @@ class Dialog:
         self.ended = threading.Event()       # the far side sent BYE
         self.reinvited = threading.Event()   # an in-dialog INVITE arrived
         self.reinvites = 0
+        self.byes = 0                # BYE transactions that matched this dialog
+        self.bye_mismatches = 0      # strict_dialogs: same Call-ID, wrong tags -> 481
+        self.responses = []          # uac: (monotonic time, status) of every INVITE response
+        self.invite_sent_at = None
+        self.cancel_sent_at = None   # cancel_after_ms: when the CANCEL actually went
+        self.cancel_status = None
+        self.cancel_answered_at = None
         self.rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rtp_sock.bind((agent.lip, 0))
         self.rtp_port = self.rtp_sock.getsockname()[1]
@@ -303,6 +321,37 @@ class Dialog:
         final = self.agent._transaction(msg, (self.call_id, cseq, "BYE"), invite=False)
         return final.status if final else None
 
+    def reinvite(self, direction):
+        """Re-INVITE this dialog offering a=<direction> (s14.1). Returns the final status, or None."""
+        agent = self.agent
+        self.local_cseq += 1
+        cseq = self.local_cseq
+        target = self.remote_target or self.remote_uri
+        branch = "z9hG4bK" + rand_hex(12)
+        text = agent._request("INVITE", target, self, cseq, branch, body=agent.sdp(self, direction))
+        final = agent._transaction(text, (self.call_id, cseq, "INVITE"), invite=True)
+        if final is None:
+            return None
+        if not 200 <= final.status < 300:
+            agent._send(agent._request("ACK", target, self, cseq, branch, cseq_method="ACK"))
+            return final.status
+        if final.body:
+            self.remote_media = parse_sdp(final.body)
+        ack = agent._request("ACK", target, self, cseq, "z9hG4bK" + rand_hex(12), cseq_method="ACK")
+        with agent._lock:
+            agent._acks.pop((self.call_id, self.invite_cseq), None)
+            agent._acks[(self.call_id, cseq)] = ack
+        self.invite_cseq = cseq
+        agent._send(ack)
+        self.start_media()
+        return final.status
+
+    def hold(self):
+        return self.reinvite("sendonly")
+
+    def resume(self):
+        return self.reinvite("sendrecv")
+
     def close(self):
         if self._closed:
             return
@@ -320,7 +369,8 @@ class Agent:
     """One virtual phone: a REGISTER binding, outgoing calls, and an auto-answer UAS."""
 
     def __init__(self, ext, host, port, local_ip=None, rtp_pump=None,
-                 timeout=8.0, invite_timeout=16.0, ack_wait=8.0):
+                 timeout=8.0, invite_timeout=16.0, ack_wait=8.0,
+                 contact_params="", strict_dialogs=False, reject_invites=None):
         self.ext = str(ext)
         self.host = host
         self.port = int(port)
@@ -334,7 +384,11 @@ class Agent:
         self.sock.bind((self.lip, 0))
         self.sock.settimeout(0.2)
         self.lport = self.sock.getsockname()[1]
-        self.contact = "<sip:%s@%s:%d>" % (self.ext, self.lip, self.lport)
+        self.contact = "<sip:%s@%s:%d%s>" % (self.ext, self.lip, self.lport, contact_params)
+        self.strict_dialogs = strict_dialogs
+        self.reject_invites = reject_invites
+        self.rejected = []          # reject_invites: {"t", "call_id", "from_user"} per refused INVITE
+        self.bye_481 = []           # strict_dialogs: every BYE answered 481, and why
         self.reg_call_id = "%s@%s" % (rand_hex(16), self.lip)
         self.reg_tag = rand_hex(8)
         self.reg_cseq = 0
@@ -404,9 +458,9 @@ class Agent:
                 "a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\na=ptime:20\r\na=%s\r\n"
                 % (self.ext, sess, sess, self.lip, self.lip, dlg.rtp_port, direction))
 
-    def _transaction(self, text, key, invite):
+    def _transaction(self, text, key, invite, txn=None):
         """Send a request, retransmit per RFC 3261 s17.1, return the final response or None."""
-        txn = _Txn()
+        txn = txn or _Txn()
         with self._lock:
             self._waiters[key] = txn
         self._send(text)
@@ -456,10 +510,14 @@ class Agent:
             self.registered = False
         return status
 
-    def invite(self, target_user):
+    def invite(self, target_user, cancel_after_ms=None):
         """INVITE sip:<target_user>@<pbx>. Returns the Dialog; dialog.ok says
         whether it was answered (2xx, then ACKed). A non-2xx final is ACKed by
-        the transaction (s17.1.1.3); no final at all is CANCELled if it rang."""
+        the transaction (s17.1.1.3); no final at all is CANCELled if it rang.
+
+        cancel_after_ms: CANCEL that many ms after the INVITE went, or at the
+        first provisional response if none had arrived by then (s9.1); not at
+        all if a final response came first. dialog.cancel_sent_at says when."""
         dlg = Dialog(self, "uac", "%s@%s" % (rand_hex(16), self.lip), rand_hex(8))
         dlg.remote_uri = "sip:%s@%s" % (target_user, self.host)
         dlg.invite_cseq = dlg.local_cseq
@@ -469,11 +527,23 @@ class Agent:
         ruri = dlg.remote_uri
         offer = self.sdp(dlg)
         text = self._request("INVITE", ruri, dlg, dlg.local_cseq, branch, body=offer)
-        final = self._transaction(text, (dlg.call_id, dlg.local_cseq, "INVITE"), invite=True)
+        txn = _Txn()
+        dlg.responses = txn.responses
+        dlg.invite_sent_at = time.monotonic()
+        canceller = None
+        if cancel_after_ms is not None:
+            canceller = threading.Thread(target=self._cancel_at, daemon=True,
+                                         args=(dlg, ruri, branch, txn,
+                                               dlg.invite_sent_at + cancel_after_ms / 1000.0))
+            canceller.start()
+        final = self._transaction(text, (dlg.call_id, dlg.local_cseq, "INVITE"), invite=True, txn=txn)
+        if canceller is not None:
+            canceller.join(self.timeout + 1.0)
         if final is None:
             dlg.final_status = None
-            cancel = self._request("CANCEL", ruri, dlg, dlg.local_cseq, branch)
-            self._transaction(cancel, (dlg.call_id, dlg.local_cseq, "CANCEL"), invite=False)
+            if dlg.cancel_sent_at is None:
+                cancel = self._request("CANCEL", ruri, dlg, dlg.local_cseq, branch)
+                self._transaction(cancel, (dlg.call_id, dlg.local_cseq, "CANCEL"), invite=False)
             return dlg
         dlg.final_status = final.status
         dlg.remote_tag = tag_of(final.get("to"))
@@ -491,6 +561,23 @@ class Agent:
         self._send(ack)
         dlg.start_media()
         return dlg
+
+    def _cancel_at(self, dlg, ruri, branch, txn, at):
+        """cancel_after_ms: CANCEL the pending INVITE at `at` (monotonic), but never
+        before a provisional response (s9.1) and never once a final one arrived."""
+        left = at - time.monotonic()
+        if left > 0 and txn.final.wait(left):
+            return
+        while not txn.provisional.is_set():
+            if txn.final.wait(0.01) or self._closed.is_set():
+                return
+        if txn.final.is_set():
+            return
+        cancel = self._request("CANCEL", ruri, dlg, dlg.local_cseq, branch)
+        dlg.cancel_sent_at = time.monotonic()
+        final = self._transaction(cancel, (dlg.call_id, dlg.local_cseq, "CANCEL"), invite=False)
+        dlg.cancel_status = final.status if final else None
+        dlg.cancel_answered_at = time.monotonic() if final else None
 
     def wait_incoming(self, since, timeout):
         """The first incoming dialog after `since` earlier ones, or None."""
@@ -557,6 +644,12 @@ class Agent:
         self._send(text, addr)
         return text
 
+    def _note_bye_481(self, req, why):
+        with self._lock:
+            self.bye_481.append({"t": time.monotonic(), "call_id": req.call_id(),
+                                 "from_tag": tag_of(req.get("from")), "to_tag": tag_of(req.get("to")),
+                                 "why": why})
+
     def _resend_until_ack(self, text, addr, event):
         interval = T1
         deadline = time.monotonic() + self.ack_wait
@@ -583,7 +676,22 @@ class Agent:
         elif method == "BYE":
             if dlg is None:
                 self._reply(req, addr, 481, "Call/Transaction Does Not Exist")
+                if self.strict_dialogs:
+                    self._note_bye_481(req, "no dialog with this Call-ID")
                 return
+            if self.strict_dialogs:
+                why = None
+                if (tag_of(req.get("from")), tag_of(req.get("to"))) != (dlg.remote_tag, dlg.local_tag):
+                    dlg.bye_mismatches += 1
+                    why = "Call-ID matches but the tags do not (s12.2.2)"
+                elif dlg.ended.is_set():
+                    dlg.byes += 1
+                    why = "a second BYE on an ended dialog"
+                if why:
+                    self._reply(req, addr, 481, "Call/Transaction Does Not Exist")
+                    self._note_bye_481(req, why)
+                    return
+            dlg.byes += 1
             self._reply(req, addr, 200, "OK")
             dlg.ended.set()
         elif method == "CANCEL":
@@ -608,6 +716,13 @@ class Agent:
             return
         if to_tag:
             self._reply(req, addr, 481, "Call/Transaction Does Not Exist")
+            return
+        if self.reject_invites:
+            with self._lock:
+                self.rejected.append({"t": time.monotonic(), "call_id": req.call_id(),
+                                      "from_user": user_of(uri_of(req.get("from")))})
+            self._reply(req, addr, self.reject_invites, "Busy Here" if self.reject_invites == 486
+                        else "Rejected", to_tag=rand_hex(8))
             return
         dlg = Dialog(self, "uas", req.call_id(), rand_hex(8))
         dlg.remote_tag = tag_of(req.get("from"))
