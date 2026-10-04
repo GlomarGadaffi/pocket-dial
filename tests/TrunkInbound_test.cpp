@@ -94,7 +94,7 @@ namespace
 	// is the trunk's own; an IP-authenticated trunk puts the DID there instead.
 	std::shared_ptr<SipMessage> makeInvite(const std::string& ruriUser, const std::string& toUser,
 		const std::string& callId, const std::string& srcIp = kSbcIp, bool pcmu = true,
-		const std::string& fromUser = "+12025550177", int dtmfPt = 101)
+		const std::string& fromUser = "+12025550177", int dtmfPt = 101, const std::string& extra = "")
 	{
 		const std::string pt = std::to_string(dtmfPt);
 		const std::string body = !pcmu ? offer(srcIp, "8 101", kPcmaRtpmap)
@@ -107,7 +107,7 @@ namespace
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 1 INVITE\r\n"
 			"Max-Forwards: 70\r\n"
-			"Contact: <sip:" + fromUser + "@" + srcIp + ":5060>\r\n"
+			"Contact: <sip:" + fromUser + "@" + srcIp + ":5060>\r\n" + extra +
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
@@ -430,6 +430,31 @@ TEST(TrunkInbound, ADidMatchesHoweverTheCarrierSpellsIt)
 
 	EXPECT_FALSE(b.firstTo("INVITE sip:2001@", kPhoneIp).empty())
 		<< "the operator's spelling and the carrier's E.164 are the same line (#165)";
+}
+
+TEST(TrunkInbound, APsapCallbackToTheDidOfA911CallerIsNotRefusedForAnOptionTag)
+{
+	// #818 gap 2: a PSAP calls back through the carrier, to the DID, often with
+	// no Priority: psap-callback. #659's window on the DID's extension makes it
+	// one, and #759's header gate yields to it as to one that says so.
+	Bench b;
+	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+	b.handler.handle(makeRegister("2002", "192.168.50.22"));
+	ASSERT_EQ(b.handler.setDidMapping("+12025550189", "2002"), "");
+	b.handler.handle(makeInvite("911", "911", "in-818-911", kPhoneIp, true, kExt));
+	ASSERT_FALSE(b.firstTo("INVITE sip:911@", kSbcIp).empty()) << "precondition: 2001 dialed 911";
+	b.sent.clear();
+
+	b.handler.handle(makeInvite(kDid, kDid, "in-818-cb", kSbcIp, true, "+12025550177", 101, "Require: 100rel\r\n"));
+	EXPECT_TRUE(b.firstTo("420", kSbcIp).empty()) << "the PSAP's callback was refused for an option tag";
+	EXPECT_FALSE(b.firstTo("INVITE sip:2001@", kPhoneIp).empty()) << "2001 must ring";
+
+	// Negative: the same INVITE to the DID of an extension that never dialed 911.
+	b.sent.clear();
+	b.handler.handle(makeInvite("+12025550189", "+12025550189", "in-818-other", kSbcIp, true, "+12025550177",
+		101, "Require: 100rel\r\n"));
+	EXPECT_FALSE(b.firstTo("420", kSbcIp).empty()) << "the yield is the callback window's alone";
+	EXPECT_EQ(b.countTo("192.168.50.22"), 0u);
 }
 
 // ── The answers ───────────────────────────────────────────────────────────────

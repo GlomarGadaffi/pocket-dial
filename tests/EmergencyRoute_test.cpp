@@ -295,6 +295,74 @@ TEST(EmergencyRoute, ADialRuleThatProducesAnEmergencyNumberTakesTheEmergencyPath
 	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "");
 }
 
+namespace
+{
+	// 101's INVITE to `dialed` with `extra` header lines and, when `secondAudio`,
+	// a second active m=audio: two shapes #759's gates refuse on an ordinary call.
+	std::shared_ptr<SipMessage> makeGatedInvite(const std::string& dialed, const std::string& callId,
+		const std::string& extra, bool secondAudio)
+	{
+		std::string body =
+			"v=0\r\no=- 0 0 IN IP4 " + std::string(kHandsetIp) + "\r\ns=-\r\n"
+			"c=IN IP4 " + std::string(kHandsetIp) + "\r\nt=0 0\r\n"
+			"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+		if (secondAudio) body += "m=audio 40002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+		const std::string raw =
+			"INVITE sip:" + dialed + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKeg" + callId + "\r\n"
+			"From: <sip:101@server>;tag=eg" + callId + "\r\n"
+			"To: <sip:" + dialed + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:101@" + std::string(kHandsetIp) + ":5060>\r\n" + extra +
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
+	}
+}
+
+TEST(EmergencyRoute, ARuleProducedEmergencyCallGetsTheHeaderGateYieldAndAnOrdinaryRuleDoesNot)
+{
+	// #834: a rule that turns 0 into 911 places the emergency path's 911 (#538
+	// M2), so #759's header gate and stream cap yield to it as to a dialed 911.
+	struct Shape { const char* what; const char* extra; bool secondAudio; const char* refusal; };
+	for (const Shape& s : {Shape{"Require: 100rel", "Require: 100rel\r\n", false, "SIP/2.0 420"},
+	                       Shape{"two active audio streams", "", true, "SIP/2.0 488"}})
+	{
+		SCOPED_TRACE(s.what);
+		{
+			Bench b;
+			b.handler->setTrunkConfig(trunkConfig());
+			b.handler->setDialRule("0", "trunk", "911", 1);
+			b.handler->handle(makeGatedInvite("0", "er-834-911", s.extra, s.secondAudio));
+			EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+				<< "a rule-produced 911 must reach the carrier:\n" << b.dump();
+			EXPECT_EQ(b.count(s.refusal), 0u) << b.dump();
+		}
+		{
+			// Negative: an ordinary trunk rule is refused exactly as before.
+			Bench b;
+			b.handler->setTrunkConfig(trunkConfig());
+			b.handler->setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
+			b.handler->handle(makeGatedInvite("92025550123", "er-834-pstn", s.extra, s.secondAudio));
+			EXPECT_EQ(b.count(s.refusal, kHandsetIp), 1u) << b.dump();
+			EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+		}
+		{
+			// Negative: a rule never fires for a number onInvite routes before the
+			// dial plan, so a rule that would make 911 of 777 yields nothing to it.
+			Bench b;
+			b.handler->setTrunkConfig(trunkConfig());
+			b.handler->setDialRule("7*", "trunk", "911", 3);
+			ASSERT_EQ(b.handler->getDialRules().size(), 1u) << "precondition: the rule is stored";
+			b.handler->handle(makeGatedInvite("777", "er-834-777", s.extra, s.secondAudio));
+			EXPECT_EQ(b.count(s.refusal, kHandsetIp), 1u) << "777 is the echo test, not a 911:\n" << b.dump();
+			EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+		}
+	}
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // B. What #521 added.
 // ═════════════════════════════════════════════════════════════════════════════
@@ -837,7 +905,7 @@ namespace
 	constexpr const char* kThirdIp = "192.168.79.13";
 
 	std::shared_ptr<SipMessage> makeCall(const std::string& from, const char* ip,
-		const std::string& to, const std::string& callId)
+		const std::string& to, const std::string& callId, const std::string& extra = "")
 	{
 		const std::string body =
 			"v=0\r\no=- 0 0 IN IP4 " + std::string(ip) + "\r\ns=-\r\n"
@@ -851,7 +919,7 @@ namespace
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 1 INVITE\r\n"
 			"Max-Forwards: 70\r\n"
-			"Contact: <sip:" + from + "@" + std::string(ip) + ":5060>\r\n"
+			"Contact: <sip:" + from + "@" + std::string(ip) + ":5060>\r\n" + extra +
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
@@ -933,6 +1001,34 @@ TEST(EmergencyCallback, ACallToAnotherExtensionIsNot)
 	EXPECT_FALSE(other.value()->isEmergency()) << "102 never dialed 911";
 	EXPECT_FALSE(out.value()->isEmergency()) << "a call FROM the 911 caller is not a callback";
 	EXPECT_TRUE(ctl.value()->isEmergency()) << "control: the same call to 101 is flagged";
+}
+
+TEST(EmergencyCallback, TheHeaderGateYieldsToACallbackThatCarriesNoPriorityHeader)
+{
+	// #818 gap 2: #659's window, not RFC 7090's Priority header, is what makes a
+	// call a PSAP callback, so the header gate yields to it the same way.
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	b.handler->handle(makeRegister("103", kThirdIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	b.sent.clear();
+
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-818-cb", "Require: 100rel\r\n"));
+	EXPECT_EQ(b.count("SIP/2.0 420", kOtherIp), 0u) << "a PSAP callback was refused for an option tag:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:101@", kHandsetIp), 1u) << "101 must ring:\n" << b.dump();
+	const auto cb = b.handler->getSession("Call-ID: er-818-cb");
+	ASSERT_TRUE(cb.has_value()) << b.dump();
+	EXPECT_TRUE(cb.value()->isEmergency());
+
+	// Negative: a call to an extension that never dialed 911 is refused as before.
+	b.handler->handle(makeCall("103", kThirdIp, "102", "er-818-other", "Require: 100rel\r\n"));
+	EXPECT_EQ(b.count("SIP/2.0 420", kThirdIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:102@", kOtherIp), 0u) << b.dump();
+
+	// Negative: so is a call to 101 once its 30-minute window has closed.
+	b.handler->ageEmergencyCallbacksForTest(std::chrono::minutes(31));
+	b.handler->handle(makeCall("103", kThirdIp, "101", "er-818-late", "Require: 100rel\r\n"));
+	EXPECT_EQ(b.count("SIP/2.0 420", kThirdIp), 2u) << b.dump();
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

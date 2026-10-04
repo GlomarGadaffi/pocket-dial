@@ -1266,6 +1266,77 @@ TEST(TrunkWiring, ACarrierRefreshReinviteOnATrunkCallIsNotAnswered481)
 	EXPECT_EQ(b.countWithTo("481", kSbcIp), 1u);
 }
 
+// ── Issue #818: the header gate's emergency yield covers the carrier's dialog ──
+//
+// The carrier speaks on the trunk dialog's own Call-ID, which _sessions is not
+// keyed on, so a carrier request on a live 911 that fails a #759 bound was
+// refused 400 and the call stayed up. Each case runs on a 911 and, as the
+// negative, on an ordinary trunk call that must still get its 400.
+
+namespace
+{
+	std::string replaced(std::string s, const std::string& from, const std::string& to)
+	{
+		const size_t p = s.find(from);
+		if (p != std::string::npos) s.replace(p, from.size(), to);
+		return s;
+	}
+
+	// A connected trunk call to `dialed`; the carrier's view of its dialog.
+	CarrierView connectTrunkCall(Bench& b, const std::string& dialed, const std::string& callId)
+	{
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", dialed, callId));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:"));
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+		b.sent.clear();
+		return carrier;
+	}
+}
+
+TEST(TrunkWiring, ACarrierByeThatFailsTheHeaderGateStillEndsA911ButNotAnOrdinaryCall)
+{
+	std::string hops;
+	for (int i = 0; i < 10; ++i)
+		hops += "Via: SIP/2.0/UDP 10.9.0." + std::to_string(i + 1) + ":5060;branch=z9hG4bKhop" +
+			std::to_string(i) + "\r\n";
+	const std::string ours = "branch=z9hG4bKcarrierbye\r\n";
+	const std::vector<std::pair<const char*, std::string>> shapes = {
+		{"an 80-byte Via branch (the slot holds 71)", "branch=z9hG4bK" + std::string(80, 'b') + "\r\n"},
+		{"11 Via entries (the cap is 10)", ours + hops},
+	};
+	for (const auto& [what, via] : shapes)
+	{
+		for (const bool emergency : {true, false})
+		{
+			SCOPED_TRACE(std::string(what) + (emergency ? ", 911" : ", ordinary call"));
+			Bench b;
+			const auto carrier = connectTrunkCall(b, emergency ? "911" : "92025550123",
+				emergency ? "call-818-911" : "call-818-pstn");
+			ASSERT_FALSE(carrier.callID.empty()) << "precondition: the call went to the trunk";
+			ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+
+			b.handler.handle(RequestsHandler::getMessageFromPool(
+				replaced(carrier.bye(), ours, via), addrFor(kSbcIp)));
+
+			if (emergency)
+			{
+				EXPECT_EQ(b.countWithTo("SIP/2.0 400", kSbcIp), 0u) << "the PSAP's BYE on a live 911 was refused";
+				EXPECT_EQ(b.countWithTo("SIP/2.0 200", kSbcIp), 1u) << "the PSAP's BYE must be answered";
+				EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u) << "and the 911 caller hung up";
+				EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+			}
+			else
+			{
+				EXPECT_EQ(b.countWithTo("SIP/2.0 400", kSbcIp), 1u) << "the yield is the 911's alone";
+				EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u);
+				EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+			}
+		}
+	}
+}
+
 // ── Issue #604: RTP inactivity ends a call whose media stopped with no BYE ──
 
 TEST(TrunkWiring, ATrunkCallWhoseLegsBothGoSilentIsEndedAfterTheInactivityTimeout)
