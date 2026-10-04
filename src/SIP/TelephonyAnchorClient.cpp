@@ -390,7 +390,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	}
 
 	// Prefer the device-specific makecall endpoint (the recommended Telephony transport) over the legacy
-	// /callcontrol/{dn}/makecall. Resolve the device_id lazily — makeCall runs on the tel_makecall
+	// /callcontrol/{dn}/makecall. Resolve the device_id lazily — makeCall runs on a tel_ctl
 	// worker, so the blocking GET is fine here.
 	if (deviceId.empty() && resolveDevice())
 	{
@@ -671,7 +671,7 @@ bool TelephonyAnchorClient::dropCall(const std::string& participantId)
 	// call holds 2 TLS sockets (GET + POST) over the W5500-MACRAW LWIP pool; freeing them gives
 	// the drop POST room (else it fails with sock<0 / mbedtls alloc-fail and the PSTN leg lingers).
 	// stopMediaStreams(partId) frees this participant's slot; its per-slot _tearingDown gate makes
-	// it idempotent if the WS 'Dropped' event races us. Runs on the off-SIP tel_dropcall worker.
+	// it idempotent if the WS 'Dropped' event races us. Runs on the off-SIP tel_drop worker.
 	// Issue #554 (b): tombstone the leg FIRST, so an upsert racing this teardown cannot
 	// re-prime it once stopMediaStreams() has freed the slot.
 	{
@@ -748,7 +748,7 @@ bool TelephonyAnchorClient::answerCall(const std::string& participantId)
 	// local ring so audio cuts through at pickup. This is the FALLBACK — open them now only if
 	// that pre-open hasn't taken (e.g. Telephony rejected a pre-answer stream and only accepts it now,
 	// post-/answer). The startMediaStreams re-check makes a concurrent pre-warm safe. Runs on
-	// the tel_answer worker (12 KB stack, TLS-capable).
+	// a tel_ctl worker (12 KB stack, TLS-capable).
 	// Open the streams only if THIS slot isn't already live (the inbound classifier pre-warms both
 	// during the local ring; startMediaStreams re-checks under the slot lock, so a concurrent
 	// pre-warm is safe).

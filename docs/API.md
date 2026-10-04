@@ -850,6 +850,10 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
   "stackHwm_rtp_media_tx": null,
   "stackHwm_rtp_media_rx": null,
   "stackHwm_conf_mix_tick": null,
+  "stackHwm_tel_ctl0": null,
+  "stackHwm_tel_ctl1": null,
+  "stackHwm_tel_drop": null,
+  "stackHwm_tel_sos": null,
   "stackHwm_http_conn": 1364,
   "httpConnWorstRoute": "GET /api/status",
   "l2Tx": {
@@ -958,6 +962,9 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `stackHwm_rtp_media_tx` | Integer or `null` | Same, for `rtp_media_tx` (`src/SIP/RtpSender.cpp`). **`null` most of the time by design**; every `RtpSender` instance's task shares this one literal name, and the task exists only while ONE of them is actively sending: the 440/555/888/park internal media, or a WAN-anchor-bridged call the board terminates through `MediaBridge`/`TelephonyAnchorClient`. Never for an ordinary ext-to-ext call (peer-to-peer; the board never touches that media) and not between calls. Distinguish `null` from a `0` reading, which would mean the task is running with **no stack headroom left**, the near-overflow condition this field exists to catch. |
 | `stackHwm_rtp_media_rx` | Integer or `null` | Same, for `rtp_media_rx` (`src/SIP/RtpReceiver.cpp`), same shared-task-name and "any call the board terminates media for" caveat as `stackHwm_rtp_media_tx`. |
 | `stackHwm_conf_mix_tick` | Integer or `null` | Same, for `conf_mix_tick` (`src/SIP/ConferenceRoom.cpp`), the task the #185 mixer survey flagged: `MixBus::tick()` puts roughly 2.9 KB of locals on this task's 3072 byte stack, so a low reading here (as opposed to `null`, meaning no conference is active) is the number that says whether that margin is real. `null` whenever no conference is running. |
+| `stackHwm_tel_ctl0` / `stackHwm_tel_ctl1` | Integer or `null` | Same, for the anchor's two call-control workers (#657, `RequestsHandler::startTelCtl()`), which run makeCall and answerCall. Each has a 12 KB stack kept by precedent, not measurement: makeCall's TLS handshake runs on it, and the static stack gate cannot see that chain. A cold-handshake makeCall reading here is the evidence a smaller stack needs. `null` unless the boot anchor is a real one; `tel_ctl1` is also `null` on a build with `POCKETDIAL_MAX_ANCHOR_CALLS` 1, which has one worker. |
+| `stackHwm_tel_drop` | Integer or `null` | Same, for the worker that runs every anchor dropCall (#657). |
+| `stackHwm_tel_sos` | Integer or `null` | Same, for the worker that runs a 911/933 makeCall (#657). |
 | `stackHwm_http_conn` | Integer or `null` | The **worst** (smallest-free) stack figure any HTTP connection thread has reported since boot, in bytes — not a live-task lookup like the rows above, since a connection thread is gone by the time anyone reads this. It is what keeps `HttpServer::kHttpConnStackBytes` (#366) an evidence-backed number rather than an estimate: measured usage on `.244` is ~2752 bytes of the 4096 reserved. `null` until the first request has completed. |
 | `httpConnWorstRoute` | String or `null` | (#405) The route class that produced the `stackHwm_http_conn` minimum: method plus a path cut to its lower-case word segments (`GET /api/status`, `POST /api/coredump`), `provisioning` for a phone config fetch, `other` for anything else, `unparsed` when the connection ended before a request line was read. Never the raw path, so a MAC or extension in a URL is not disclosed. `null` on the host build and until the first request has completed. A numeric segment ends the label, so a slot activate and a slot test both read `POST /api/telephony-config`. |
 | `l2Tx` | Object | L2 transmit-path health (#328). See below. |

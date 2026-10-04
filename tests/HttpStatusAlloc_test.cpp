@@ -160,6 +160,19 @@ TEST(HttpStatusAlloc, TheDynamicTaskCreateCountIsOnStatus)
 	psram::dynamicTaskCreates().store(before);
 }
 
+TEST(HttpStatusAlloc, TheTelCtlWorkerStackWatermarksAreOnStatus)
+{
+	// #657: the anchor's call-control workers keep 12 KB stacks by precedent (a
+	// TLS handshake runs on them); their high-water marks are the evidence any
+	// smaller size needs. null on the host build, like every stackHwm_* field.
+	StatusBench b;
+	const std::string resp = b.serve(false);
+	for (const char* key : { "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos" })
+	{
+		EXPECT_NE(resp.find(std::string("\"") + key + "\":null"), std::string::npos) << key << " missing from /api/status";
+	}
+}
+
 TEST(HttpStatusAlloc, TheHandlerBugCountersAreOnStatusAndPacketsDroppedIsTheirSum)
 {
 	// #702 item 19 (desmo): repliesRefused (#424) and optionsPingTruncated (#463)
