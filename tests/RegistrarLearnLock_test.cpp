@@ -13,7 +13,9 @@
 //   another MAC for a locked extension -> 403;
 //   an ARP miss for a locked extension -> accepted from the extension's
 //   registered IP:port (the owner's refresh; lwIP's ARP table is smaller than
-//   the client pool), else 503 + Retry-After, never 403;
+//   the client pool); else, from this subnet, unanswered while the source is
+//   ARPed, so its retransmission is checked (#864); else 503 + Retry-After;
+//   never 403;
 //   one MAC registering two extensions -> shared, never locked (NAT router);
 //   a full table evicts an unlocked entry (offline first, then the oldest),
 //   never a locked one.
@@ -104,9 +106,17 @@ namespace
 		// REGISTER `ext` from `ip`:`port`; returns the status line of the response.
 		std::string registerFrom(const std::string& ext, const std::string& ip, int expires = 3600, int port = 5060)
 		{
-			const std::string raw = registerRaw(ext, ip, port, expires, ++_seq);
+			_lastRaw = registerRaw(ext, ip, port, expires, ++_seq);
+			_lastSrc = addrFor(ip, port);
+			return retransmit();
+		}
+
+		// Send the last REGISTER again, byte for byte, as a phone's UDP
+		// retransmission does (RFC 3261 §17.1.2.2). "" if nothing answers it.
+		std::string retransmit()
+		{
 			_wire.sent.clear();
-			_handler->handle(RequestsHandler::getMessageFromPool(raw, addrFor(ip, port)));
+			_handler->handle(RequestsHandler::getMessageFromPool(_lastRaw, _lastSrc));
 			for (const auto& [a, m] : _wire.sent)
 			{
 				if (!m) continue;
@@ -156,6 +166,8 @@ namespace
 		std::unique_ptr<RequestsHandler> _handler;
 		std::vector<Registrar::AdoptedDevice> _devices;
 		int _seq = 0;
+		std::string _lastRaw;
+		sockaddr_in _lastSrc{};
 	};
 }
 
@@ -203,9 +215,10 @@ TEST_F(LearnLockTest, AnArpMissOnALockedExtensionIsRetryableNotALockout)
 {
 	ASSERT_NO_FATAL_FAILURE(lockOwner());
 
-	// A source that neither resolves nor is the registered binding: the owner
-	// from a new address whose ARP entry is not there yet, or an off-link
-	// impostor. The PBX cannot tell which, so it asks for a retry.
+	// A source that neither resolves nor is the registered binding, and is on no
+	// subnet of the board's (no setMockOnLink; an on-link one is ARPed, #864): the
+	// owner behind a router, or an off-link impostor. The PBX cannot tell which,
+	// so it asks for a retry.
 	ArpLookup::clearMockMacs();
 	EXPECT_EQ(registerFrom("201", "192.168.60.77").substr(0, 11), "SIP/2.0 503")
 		<< "unverifiable on a locked extension: ask for a retry, never 403 the owner";
@@ -254,6 +267,152 @@ TEST_F(LearnLockTest, ARefusedDeregisterLeavesTheLockedOwnerRegistered)
 
 	EXPECT_EQ(registerFrom("201", "192.168.60.77", 0).substr(0, 11), "SIP/2.0 503");
 	EXPECT_EQ(boundAddress("201"), "192.168.60.21:5060") << "an ARP-miss expires=0 unregistered the owner";
+}
+
+// #864: after a reboot the lock rows are back from NVS, but no phone holds a
+// binding and lwIP's ARP table is empty. lwIP keeps an entry 300 s, and the 503
+// that answered this REGISTER was the only thing that ARPed the phone, so a phone
+// that ignores Retry-After and retries every ~301 s (the owner's Snom 370 on ext
+// 1001) found the entry gone every time, for ~6 h. Now the board ARPs the source
+// without answering, and the phone's own retransmission resolves.
+TEST_F(LearnLockTest, AfterARebootALockedPhoneIsAdmittedOnItsRetransmission)
+{
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Learned, /*locked=*/true);
+	ArpLookup::setMockOnLink(addrFor("192.168.60.21"), macOf(0x21));
+
+	EXPECT_EQ(registerFrom("201", "192.168.60.21"), "")
+		<< "a final response ends the phone's transaction; its next try can come after the entry ages out";
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), 1) << "the board must ARP the source itself";
+	EXPECT_EQ(boundAddress("201"), "") << "an unanswered REGISTER binds nothing";
+
+	EXPECT_EQ(retransmit().substr(0, 11), "SIP/2.0 200") << "the retransmission resolves to the lock's MAC";
+	EXPECT_EQ(boundAddress("201"), "192.168.60.21:5060");
+	ASSERT_NE(device(hexOf(0x21)), nullptr);
+	EXPECT_TRUE(device(hexOf(0x21))->locked);
+}
+
+// The lock is no weaker for it: another device on this subnet is ARPed the same
+// way, resolves to its own MAC, and is refused.
+TEST_F(LearnLockTest, AfterARebootAnotherDeviceIsStillRefusedOnItsRetransmission)
+{
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Learned, /*locked=*/true);
+	ArpLookup::setMockOnLink(addrFor("192.168.60.66"), macOf(0x66));
+
+	EXPECT_EQ(registerFrom("201", "192.168.60.66"), "");
+	EXPECT_EQ(retransmit().substr(0, 11), "SIP/2.0 403") << "a resolved impostor is refused, as on any REGISTER";
+	EXPECT_EQ(device(hexOf(0x66)), nullptr) << "and not adopted";
+	ASSERT_NE(device(hexOf(0x21)), nullptr);
+	EXPECT_TRUE(device(hexOf(0x21))->locked);
+	EXPECT_EQ(boundAddress("201"), "");
+}
+
+// A source on this subnet that never answers ARP (a forged address, or a phone
+// that has gone) is never admitted. Its unanswered REGISTER is not an Accept
+// either: an expires=0 from it leaves the owner registered.
+TEST_F(LearnLockTest, AnOnLinkSourceThatNeverAnswersArpIsNeverAdmitted)
+{
+	ASSERT_NO_FATAL_FAILURE(lockOwner());
+	ArpLookup::clearMockMacs();
+	ArpLookup::setMockOnLink(addrFor("192.168.60.77"), std::nullopt);
+
+	EXPECT_EQ(registerFrom("201", "192.168.60.77", 0), "");
+	for (int i = 0; i < 10; ++i)   // Timer E's copies until Timer F (RFC 3261 §17.1.2.2)
+		EXPECT_EQ(retransmit(), "") << "retransmission " << i;
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), 1) << "a source is ARPed at most once per window";
+	EXPECT_EQ(_handler->getLearnArpRequestsLimited(), 10u);
+
+	_handler->ageArpRequestsForTest(RequestsHandler::kArpRequestWindow);
+	EXPECT_EQ(retransmit(), "");
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), 2) << "a copy after the window is ARPed again";
+	EXPECT_EQ(boundAddress("201"), "192.168.60.21:5060") << "an unanswered expires=0 unregistered the owner";
+	ASSERT_NE(device(hexOf(0x21)), nullptr);
+	EXPECT_TRUE(device(hexOf(0x21))->locked);
+}
+
+namespace
+{
+	constexpr int kArpCap = static_cast<int>(RequestsHandler::kArpRequestsPerWindow);
+	constexpr int kForged = kArpCap + 4;
+}
+
+// #864 review (Stray): forged on-link sources cost at most kArpRequestsPerWindow
+// broadcasts per window, however many there are.
+TEST_F(LearnLockTest, ArpRequestsForUnansweredRegistersAreCapped)
+{
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Learned, /*locked=*/true);
+	for (int k = 0; k < kForged; ++k)
+	{
+		const std::string ip = "192.168.60." + std::to_string(100 + k);
+		ArpLookup::setMockOnLink(addrFor(ip), std::nullopt);
+		EXPECT_EQ(registerFrom("201", ip), "") << ip;
+	}
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), kArpCap) << "the cap holds across distinct sources";
+	EXPECT_EQ(_handler->getLearnArpRequestsLimited(), static_cast<uint32_t>(kForged - kArpCap));
+}
+
+// #864 review (Stray): the owner gets through a flood of 16+ forged sources in
+// one second because the cap's window resets: its Timer E copies (0.5, 1.5,
+// 3.5 s ...) find a fresh window once the flood thins. No owner lane: nothing
+// stored survives a reboot to recognise the owner's address by. The residual: a
+// flood sustained above the cap rate holds the owner back for as long as it lasts.
+TEST_F(LearnLockTest, TheOwnerGetsThroughOnceAFloodWindowPasses)
+{
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Learned, /*locked=*/true);
+	for (int k = 0; k < kForged; ++k)
+	{
+		const std::string ip = "192.168.60." + std::to_string(100 + k);
+		ArpLookup::setMockOnLink(addrFor(ip), std::nullopt);
+		registerFrom("201", ip);
+	}
+	ArpLookup::setMockOnLink(addrFor("192.168.60.21"), macOf(0x21));
+	EXPECT_EQ(registerFrom("201", "192.168.60.21"), "");
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), kArpCap) << "inside the flood's window the owner waits too";
+
+	_handler->ageArpRequestsForTest(RequestsHandler::kArpRequestWindow);
+	EXPECT_EQ(retransmit(), "");
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), kArpCap + 1) << "in the next window the owner's copy is ARPed";
+	EXPECT_EQ(retransmit().substr(0, 11), "SIP/2.0 200") << "and its next copy is admitted";
+	EXPECT_EQ(boundAddress("201"), "192.168.60.21:5060");
+}
+
+// #864 review (Stray): nothing on the REGISTER path remembers a request it did
+// not answer. REGISTER gets no server transaction (TransactionLayer::classify()
+// keeps them for INVITE, BYE, CANCEL, REFER and UPDATE only) and onRegister()
+// keeps no branch or Call-ID+CSeq cache, so every copy is processed fresh.
+TEST_F(LearnLockTest, TheSameRegisterIsProcessedFreshOnceTheTableIsWarm)
+{
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Learned, /*locked=*/true);
+	ArpLookup::setMockOnLink(addrFor("192.168.60.21"), macOf(0x21));
+	ASSERT_EQ(registerFrom("201", "192.168.60.21"), "") << "dropped; its ARP reply warms the table";
+	const std::string first = _lastRaw;
+
+	EXPECT_EQ(retransmit().substr(0, 11), "SIP/2.0 200") << "the same Call-ID, CSeq and branch, admitted";
+	EXPECT_EQ(retransmit().substr(0, 11), "SIP/2.0 200") << "and a later copy is not swallowed either";
+	EXPECT_EQ(_lastRaw, first);
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), 1);
+}
+
+// #507 on the same miss: a Secured extension is digest-checked before anything
+// is ARPed.
+TEST_F(LearnLockTest, ASecuredExtensionIsChallengedOnAMissWithoutAnArpRequest)
+{
+	ASSERT_TRUE(SipSecretStore::setSecret("201", "s3cret-201"));
+	_handler->adoptDeviceForTest(hexOf(0x21), "201", Registrar::DeviceState::Secured);
+	ArpLookup::setMockOnLink(addrFor("192.168.60.21"), macOf(0x21));
+
+	EXPECT_EQ(registerFrom("201", "192.168.60.21").substr(0, 11), "SIP/2.0 401")
+		<< "a Secured extension is authenticated on a miss, never waved through";
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), 0);
+}
+
+// A first-time (unlocked) extension keeps its accept-and-defer on a miss.
+TEST_F(LearnLockTest, AnUnlockedExtensionsMissIsStillAcceptedWithoutAnArpRequest)
+{
+	ArpLookup::setMockOnLink(addrFor("192.168.60.40"), macOf(0x40));
+
+	EXPECT_EQ(registerFrom("203", "192.168.60.40").substr(0, 11), "SIP/2.0 200");
+	EXPECT_EQ(ArpLookup::mockArpRequestCount(), 0);
+	EXPECT_TRUE(_handler->getAdoptedDevices().empty()) << "nothing is adopted without a resolved MAC";
 }
 
 TEST_F(LearnLockTest, OneMacWithTwoExtensionsIsSharedAndNeverLocks)

@@ -37,8 +37,8 @@ if(DEFINED ENV{IDF_PATH})
     # #487 review: lwIP's ARP table defaults to 10 entries (lwip/opt.h; IDF's
     # lwipopts.h does not set it), fewer than the 32-phone client pool, and
     # every registered phone is OPTIONS-pinged every 5 s, so entries churn:
-    # sends re-ARP, and a Learn-locked phone's REGISTER misses and is answered
-    # 503 (after a reboot, every locked phone). 40 holds the pool plus the
+    # sends re-ARP, and a Learn-locked phone's REGISTER misses and waits for
+    # its retransmission while the board ARPs it (#864). 40 holds the pool plus the
     # gateway and a few other peers, at 24 B an entry (+720 B internal .bss).
     # Only etharp.c reads it. SIP_CONSTRAINED keeps the default: 8 phones.
     if(NOT SIP_CONSTRAINED)
