@@ -1120,7 +1120,8 @@ private:
 	// Issue #400: point relay pair `slot` at the carrier's SDP in `carrier` and
 	// start its handset-facing half if not already up. 0 on success, else the
 	// status to refuse the handset with (502 unusable carrier RTP, 500 local).
-	int bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessage>& carrier);
+	// #861: `emergency` (a 911/933) skips the usable-address check.
+	int bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessage>& carrier, bool emergency);
 	void onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 		const std::shared_ptr<SipMessage>& ok) override;
 	void onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status) override;

@@ -33,9 +33,7 @@
 #include "PbxPersist.hpp"
 #include "SipHeaderUtil.hpp"
 #include "SipWireUtil.hpp"
-#if POCKETDIAL_TRUNK_INBOUND
 #include "EthAccess.hpp"      // #398 D review: the interface netmask, for rtpPeerFrom()
-#endif
 #include "AdminAuth.hpp"
 #include "SipDigest.hpp"
 #include "SipSecretStore.hpp"
@@ -199,12 +197,11 @@ namespace
 		return out;
 	}
 
-#if POCKETDIAL_TRUNK_INBOUND
 	// #398 D review: an SDP's c= address and m= port as a relay peer, only when
 	// it is a dotted quad (inet_addr() turns "999.0.0.1" into broadcast) that
 	// sipwire::isUsableRtpPeer() allows: not loopback, multicast, reserved, this
-	// host, or this host's subnet broadcast. Inbound trunk relay only; the
-	// outbound relay (bringUpTrunkRelay) still uses inet_addr, see the follow-up.
+	// host, or this host's subnet broadcast. Both trunk relays (#861); an
+	// emergency call's outbound relay skips it (bringUpTrunkRelay).
 	bool rtpPeerFrom(const std::string& ip, uint16_t port, const std::string& localIp, sockaddr_in& out)
 	{
 		uint32_t addr = 0;
@@ -220,7 +217,6 @@ namespace
 		out.sin_port = htons(port);
 		return true;
 	}
-#endif
 }
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
@@ -12544,7 +12540,7 @@ bool RequestsHandler::placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
 
 // ── SipTrunk::Listener ───────────────────────────────────────────────────────
 
-int RequestsHandler::bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessage>& carrier)
+int RequestsHandler::bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessage>& carrier, bool emergency)
 {
 	// Where the carrier wants its audio. Without this the relay has nowhere to
 	// send and the call is one-way silence.
@@ -12552,10 +12548,18 @@ int RequestsHandler::bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessag
 	uint16_t    carrierPort = 0;
 	if (!parseCallerRtp(carrier, carrierIp, carrierPort)) return 502;
 
+	// #861: an address no relay may send to (loopback, multicast, this host, a
+	// malformed one) fails an ordinary call. A 911/933 relays wherever the
+	// carrier says, unchecked, as before (desmo, 2026-10-04): refusing the
+	// answer would drop the emergency call.
 	sockaddr_in carrierRtp{};
-	carrierRtp.sin_family = AF_INET;
-	carrierRtp.sin_addr.s_addr = inet_addr(carrierIp.c_str());
-	carrierRtp.sin_port = htons(carrierPort);
+	if (emergency)
+	{
+		carrierRtp.sin_family = AF_INET;
+		carrierRtp.sin_addr.s_addr = inet_addr(carrierIp.c_str());
+		carrierRtp.sin_port = htons(carrierPort);
+	}
+	else if (!rtpPeerFrom(carrierIp, carrierPort, _localIp, carrierRtp)) return 502;
 	if (!_trunkRx[slot].setRawPeer(carrierRtp)) return 502;
 
 	// Bring up the handset-facing half and complete the cross-wiring. Its bound
@@ -12588,7 +12592,7 @@ void RequestsHandler::onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyM
 
 	// Early media is best effort: on any failure the caller keeps local
 	// ringback and the call itself is untouched.
-	if (bringUpTrunkRelay(slot, progress) != 0)
+	if (bringUpTrunkRelay(slot, progress, session->isEmergency()) != 0)
 	{
 		queueLog("trunk: early media (183) could not be relayed; local ringback for " + handsetCallID);
 		return;
@@ -12630,7 +12634,7 @@ void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 
 	// A failure here is fatal to the call rather than something to log and
 	// continue past: without the relay the call is one-way silence.
-	if (const int refuse = bringUpTrunkRelay(slot, ok); refuse != 0)
+	if (const int refuse = bringUpTrunkRelay(slot, ok, session->isEmergency()); refuse != 0)
 	{
 		_sipTrunk.hangup(ev.trunkCallID);
 		refuseRingingTrunk(handsetCallID, refuse);
