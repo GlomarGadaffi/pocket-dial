@@ -583,6 +583,16 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			else
 			{
 				ESP_LOGW(TAG, "makeCall: all %d call slots busy — no slot for %s", POCKETDIAL_MAX_ANCHOR_CALLS, ownLeg.c_str());
+				if (emergency)
+				{
+					// #821: a 911/933 leg with no slot after the wait never comes up, and a
+					// ringing 911 is never reaped (#712). Drop it while _outboundPending
+					// still hides its upserts, and fail the call: the engine answers the
+					// caller 503 and tells the notify list NOT ROUTED.
+					dropCall(ownLeg);
+					if (ownLegOut) ownLegOut->clear();
+					return false;
+				}
 			}
 			if (primed && waitedUs > 0)
 			{

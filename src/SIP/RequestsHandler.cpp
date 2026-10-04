@@ -5157,6 +5157,16 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 		// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
 		refuseRingingAnchor(job.callId, _asyncOutbox);
 		endCall(job.callId, job.callerNumber, job.dest, "anchor call fail");
+		// #821: routeEmergencyCall() told the notify list ROUTED when it queued
+		// this job, and the call never came up. notifyEmergency() enqueues on
+		// _outbox, which the SIP thread's next pass clears: hand it to
+		// _asyncOutbox, as forceDisconnect() does (#714).
+		if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(job.dest); em.isEmergency)
+		{
+			notifyEmergency(em, job.callerNumber, job.dest, /*routed=*/false);
+			for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
+			_outbox.clear();
+		}
 		return;
 	}
 	// Bind this origination's own leg to its session NOW (locks _mutex
