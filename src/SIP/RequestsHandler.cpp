@@ -12550,7 +12550,7 @@ int RequestsHandler::bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessag
 
 	// #861: an address no relay may send to (loopback, multicast, this host, a
 	// malformed one) fails an ordinary call. A 911/933 relays wherever the
-	// carrier says, unchecked, as before (desmo, 2026-10-04): refusing the
+	// carrier says, unchecked, as before (desmo, 2026-10-03): refusing the
 	// answer would drop the emergency call.
 	sockaddr_in carrierRtp{};
 	if (emergency)
@@ -12559,7 +12559,11 @@ int RequestsHandler::bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessag
 		carrierRtp.sin_addr.s_addr = inet_addr(carrierIp.c_str());
 		carrierRtp.sin_port = htons(carrierPort);
 	}
-	else if (!rtpPeerFrom(carrierIp, carrierPort, _localIp, carrierRtp)) return 502;
+	else if (!rtpPeerFrom(carrierIp, carrierPort, _localIp, carrierRtp))
+	{
+		queueLog("trunk: carrier RTP address " + carrierIp + ":" + std::to_string(carrierPort) + " is not usable (#861)");
+		return 502;
+	}
 	if (!_trunkRx[slot].setRawPeer(carrierRtp)) return 502;
 
 	// Bring up the handset-facing half and complete the cross-wiring. Its bound
@@ -12589,6 +12593,9 @@ void RequestsHandler::onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyM
 	const int slot = session->getTrunkRelaySlot();
 	auto invite = session->getInviteMessage();
 	if (slot < 0 || !invite) return;
+	// #861 review: a 183 after the handset leg stopped ringing moves no audio;
+	// a 911/933 still follows it, as before.
+	if (session->getState() != Session::State::Invited && !session->isEmergency()) return;
 
 	// Early media is best effort: on any failure the caller keeps local
 	// ringback and the call itself is untouched.
@@ -12622,6 +12629,11 @@ void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 	auto session = sit->second;
 	const int slot = session->getTrunkRelaySlot();
 	if (slot < 0) return;
+	// #861 review: a later 2xx once the handset leg is past ringing (a
+	// retransmission, a second forked 2xx) re-fires this after SipTrunk has
+	// ACKed it. It neither re-points the relay nor ends a call that is up. A
+	// 911/933 still follows it, unchecked, as before (desmo, 2026-10-03).
+	if (session->getState() != Session::State::Invited && !session->isEmergency()) return;
 
 	auto invite = session->getInviteMessage();
 	if (!invite)
