@@ -16,10 +16,12 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "EmergencyCall.hpp"
@@ -712,6 +714,90 @@ TEST(E911Notify, AnOrdinaryAnchoredCallWhoseWorkerCannotStartIsRefusedOnceAndNot
 	EXPECT_EQ(b.countOf("SIP/2.0 503"), 1) << b.dump();
 	EXPECT_EQ(b.countOf("SIP/2.0 200 OK"), 0) << b.dump();
 	EXPECT_FALSE(b.handler->getSession("Call-ID: en-555-nospawn").has_value());
+	EXPECT_EQ(b.indexOf("MESSAGE sip:200@"), -1) << "a 555 dial is not an emergency:\n" << b.dump();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #821: ROUTED goes out when the 911 is handed to its worker. When that
+// worker's makeCall() then fails -- the anchor declines, or (TelephonyAnchor-
+// Client, ESP only) the 911's leg still has no call slot after the #743 wait
+// and is dropped -- the caller gets its 503 and the notify list must be told
+// NOT ROUTED. The worker is parked while the loopback stops, so its makeCall()
+// returns false. tel_sos has no worker here, so the 911 runs on tel_ctl (#863),
+// the lane holdTelCtlForTest() parks.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+	bool waitUntil(const std::function<bool()>& done)
+	{
+		const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+		while (!done())
+		{
+			if (std::chrono::steady_clock::now() > until) return false;
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		return true;
+	}
+
+	// The SIP thread's next pass drains _asyncOutbox. An OPTIONS from an address
+	// on no dialog stands in for it (as TrunkWiring_test does).
+	void flushAsyncOutbox(NBench& b)
+	{
+		b.handler->handle(RequestsHandler::getMessageFromPool(
+			"OPTIONS sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 192.168.78.99:5060;branch=z9hG4bKflush821\r\n"
+			"From: <sip:probe@server>;tag=probe821\r\n"
+			"To: <sip:server@server>\r\n"
+			"Call-ID: flush-821\r\n"
+			"CSeq: 1 OPTIONS\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n", enAddr("192.168.78.99")));
+	}
+
+	void dialAndFailTheWorkersMakeCall(NBench& b, const std::string& to, const std::string& callId)
+	{
+		b.handler->failTelCtlLaneForTest(RequestsHandler::kLaneSos);
+		b.handler->forceAsyncAnchorForTest(true);
+		b.handler->holdTelCtlForTest(true);
+		b.handler->handle(enInvite("101", to, "192.168.78.11", callId));
+		ASSERT_NE(b.indexOf("SIP/2.0 180"), -1) << "precondition: the call was dispatched:\n" << b.dump();
+		ASSERT_TRUE(waitUntil([&] { return b.handler->telCtlParkedForTest() == 1; }))
+			<< "precondition: the worker took the makeCall";
+		b.loopback()->stop();
+		b.handler->holdTelCtlForTest(false);
+		ASSERT_TRUE(waitUntil([&] { flushAsyncOutbox(b); return b.indexOf("SIP/2.0 503") != -1; }))
+			<< "precondition: the failed makeCall answered the caller 503:\n" << b.dump();
+	}
+}
+
+TEST(E911Notify, A911WhoseAnchorLegNeverComesUpIsReportedNotRoutedAfterItsFiveOhThree)
+{
+	NBench b;
+	ASSERT_NE(b.loopback(), nullptr);
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+
+	ASSERT_NO_FATAL_FAILURE(dialAndFailTheWorkersMakeCall(b, "911", "en-911-mkfail"));
+
+	ASSERT_NE(b.indexOf("ROUTED TO TRUNK"), -1) << "precondition: the dispatch was notified ROUTED:\n" << b.dump();
+	EXPECT_EQ(b.countOf("SIP/2.0 503"), 1) << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-911-mkfail").has_value());
+	const int notRouted = b.indexOf("NOT ROUTED");
+	EXPECT_NE(notRouted, -1) << "the 911 never came up and the notify list still reads ROUTED:\n" << b.dump();
+	EXPECT_GT(notRouted, b.indexOf("SIP/2.0 503")) << "the caller's 503 first, then the notification";
+}
+
+TEST(E911Notify, AnOrdinaryCallWhoseAnchorLegNeverComesUpIsRefusedOnceAndNotNotified)
+{
+	NBench b;
+	ASSERT_NE(b.loopback(), nullptr);
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+
+	ASSERT_NO_FATAL_FAILURE(dialAndFailTheWorkersMakeCall(b, "555", "en-555-mkfail"));
+
+	EXPECT_EQ(b.countOf("SIP/2.0 503"), 1) << b.dump();
 	EXPECT_EQ(b.indexOf("MESSAGE sip:200@"), -1) << "a 555 dial is not an emergency:\n" << b.dump();
 }
 

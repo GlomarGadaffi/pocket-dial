@@ -1,0 +1,2 @@
+# EmergencyNotify_test.cpp: 2 (#821: a 911 whose worker makeCall() fails after ROUTED was sent is answered 503 and then notified NOT ROUTED; an ordinary 555 dial with the same failure gets one 503 and no notification)
+2
