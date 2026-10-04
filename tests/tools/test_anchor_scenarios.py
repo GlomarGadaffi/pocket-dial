@@ -1145,6 +1145,7 @@ class FakeProbeBoard(FakeBoard):
         c["state"] = "ended"
         self.endcall(c, "handset hung up")
         if not c.get("released"):
+            self.log("MediaBridge: stopBridge call=%s part=%s" % (req.call_id(), c["leg"]))
             self.drop(c)
 
     def phantom(self):
@@ -1225,12 +1226,15 @@ class FakeProbeBoard(FakeBoard):
             # its "no rx audio, dropping leg" line is queueLog, so it is not sent here.
             c["released"] = True
             self.log("MediaBridge: stopBridge call=%s part=%s" % (cid, leg))
-            self.drop(c)
+            if not k.get("remove_first"):
+                self.drop(c)                            # the tel_drop worker, after the POST's answer
             if k.get("no_bye"):
                 return
             self.bye_handset(c)                         # 3CX's Remove: the Dropped branch
             self.endcall(c, "anchor hangup")
             c["state"] = "ended"
+            if k.get("remove_first"):
+                self.drop(c)
 
     # #279: post_stream_fail on an answered call with handset RTP
     def _call_x279(self, c):
@@ -1537,6 +1541,14 @@ class NeverOpenedTest(ProbeRunCase):
         self.assertEqual(self.calls[0]["bye_ruri_keeps_contact"], [True])
         self.assertNotIn("hangup_ms", self.calls[0])
         self.assert_clean_probe(out)
+
+    def test_x379_pass_when_3cx_removes_the_leg_before_the_drop_answers(self):
+        self.board.knobs["remove_first"] = True     # stopBridge, endCall, BYE, then the drop line
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        ev = self.calls[0]["log"]
+        self.assertEqual((ev["drops"], ev["endcall_reasons"]), (1, ["anchor hangup"]))
+        self.assertTrue(ev["dropped_by_the_board_on_its_own"])
 
     def test_x518_pass_needs_the_403_line(self):
         rc, out = self.go(scenario="x518_403_clean_giveup")
