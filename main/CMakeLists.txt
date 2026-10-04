@@ -193,6 +193,9 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/PlayoutBuffer.cpp"
                             "../src/SIP/LoopbackAnchorClient.cpp"
                             "../src/SIP/TelephonyAnchorClient.cpp"
+                            # Issue #384 (H1): the bench probe's glue. Compiles to NOTHING
+                            # unless the bench probe option below is on.
+                            "../src/SIP/BenchProbe.cpp"
                             "../src/SIP/MediaBridge.cpp"
                             # Issue #246 (voicemail, Stage 3 of #194): the 1:1 record/playback leg.
                             "../src/SIP/VoicemailLeg.cpp"
@@ -369,6 +372,19 @@ endif()
 if(POCKETDIAL_RESET_INTERRUPT_PROBE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_RESET_INTERRUPT_PROBE=1)
     message(WARNING "SipServer: RESET INTERRUPT PROBE image -- bench only, a factory reset restarts before erasing (#473)")
+endif()
+
+# Issue #384 (H1): BENCH-ONLY anchor probe image (docs/BENCH_PROBE.md): one-shot anchor
+# faults, DRAM ballast and fired counters on an owner-gated /api/bench/fault. Its stamp
+# ends in -probe (top-level CMakeLists.txt). Never ship it, never leave it on a rig.
+# Refused off eth and on SIP_CONSTRAINED: no rig runs those, and the 4 MB slot has no room.
+if(POCKETDIAL_ANCHOR_BENCH_PROBE)
+    if(NOT SIP_TRANSPORT STREQUAL "eth" OR SIP_CONSTRAINED)
+        message(FATAL_ERROR "POCKETDIAL_ANCHOR_BENCH_PROBE needs SIP_TRANSPORT=eth without SIP_CONSTRAINED; "
+                            "got SIP_TRANSPORT='${SIP_TRANSPORT}' SIP_CONSTRAINED='${SIP_CONSTRAINED}' (#384)")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_ANCHOR_BENCH_PROBE=1)
+    message(WARNING "SipServer: ANCHOR BENCH PROBE image -- bench only, faults and DRAM ballast on /api/bench/fault (#384)")
 endif()
 
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)

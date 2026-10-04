@@ -1,6 +1,9 @@
 // HttpServer.cpp: Issues #23 and #28 resolved.
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+#include "BenchProbe.hpp"        // #384 H1: /api/bench/fault (docs/BENCH_PROBE.md)
+#endif
 #include "DialPlan.hpp"          // Issue #69: dial-rule validation shared with setDialRule
 #include "ServiceExtensions.hpp" // Issue #202: reserved engine-owned pseudo-AORs
 #include "TelephonyApiConfig.hpp"
@@ -1406,6 +1409,17 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 			sendApiOtaReboot(clientSock, req.body);
 		}
 	}
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	else if ((req.method == "GET" || req.method == "POST") && req.path == "/api/bench/fault")
+	{
+		// #384 H1: the bench probe image only (docs/BENCH_PROBE.md). Owner-gated like
+		// /api/coredump; a POST changes call behaviour, so it is CSRF-checked too.
+		if (requireAdmin(clientSock, req, req.method == "POST", AdminAuth::Role::Owner))
+		{
+			sendApiBenchFault(clientSock, req);
+		}
+	}
+#endif
 	// NOTE: POST /api/ota/upload is handled earlier in handleClient() via the
 	// streaming interception (it must bypass the 16 KB buffered body path), so
 	// it deliberately does NOT appear in this route table.
@@ -6875,6 +6889,61 @@ void HttpServer::sendApiOtaStatus(int sock)
 	json << "}";
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
+
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+// #384 H1: arm one fault, or hold or release the DRAM ballast, then answer with
+// every counter; a GET only reads them. Reached only through requireAdmin(...,
+// Owner). The body goes through one static buffer: http_conn stacks are tight
+// (#405, #457).
+void HttpServer::sendApiBenchFault(int sock, const HttpRequest& req)
+{
+	namespace bp = pd::benchprobe;
+	bp::Verdict v = bp::Verdict::Ok;
+	if (req.method == "POST")
+	{
+		RequestsHandler* h = _handler.load(std::memory_order_acquire);
+		const bool emergency = h && h->hasLiveEmergencyCall();
+		const std::string fault = getFormParam(req.body, "fault");
+		const std::string ballast = getFormParam(req.body, "ballast");
+		if (!fault.empty() && ballast.empty())
+			v = bp::armFault(fault, getFormParam(req.body, "value"), emergency);
+		else if (fault.empty() && ballast == "release")
+			bp::releaseBallast();
+		else if (fault.empty() && !ballast.empty())
+			v = bp::armBallast(ballast, getFormParam(req.body, "deadman"), emergency);
+		else
+			v = bp::Verdict::BadRequest;
+	}
+	switch (v)
+	{
+		case bp::Verdict::Ok:
+			break;
+		case bp::Verdict::BadRequest:
+			sendResponse(sock, 400, "Bad Request", "application/json",
+				"{\"error\":\"fault[,value] or ballast[,deadman] or ballast=release (docs/BENCH_PROBE.md)\"}");
+			return;
+		case bp::Verdict::EmergencyLive:
+			sendResponse(sock, 409, "Conflict", "application/json", "{\"error\":\"emergency call in progress\"}");
+			return;
+		case bp::Verdict::Busy:
+			sendResponse(sock, 409, "Conflict", "application/json", "{\"error\":\"ballast already held\"}");
+			return;
+		case bp::Verdict::NoMemory:
+			sendResponse(sock, 503, "Service Unavailable", "application/json", "{\"error\":\"no dead-man timer\"}");
+			return;
+	}
+	static char s_body[1024];
+	static std::mutex s_bodyMutex;
+	std::unique_lock<std::mutex> lock(s_bodyMutex, std::try_to_lock);
+	const size_t n = lock.owns_lock() ? bp::renderStatus(s_body, sizeof(s_body)) : 0;
+	if (n == 0)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json", "{\"error\":\"counters busy\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(s_body, n));
+}
+#endif
 
 void HttpServer::sendApiOtaReboot(int sock, const std::string& body)
 {

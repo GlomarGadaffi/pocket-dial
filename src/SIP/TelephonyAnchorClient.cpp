@@ -87,6 +87,9 @@ void TelephonyAnchorClient::setRewarmIntervalSec(uint32_t)
 #include "PsramTask.hpp"            // #100: PSRAM-backed task stacks (off the scarce internal-RAM heap)
 #include "RtpTaskSlots.hpp"         // #479: pd::rtpslots::kAnchorRxStackBytes (counted in the 72 KB budget)
 #include "EmergencyCall.hpp"        // #743: an emergency makeCall() waits out a tearing-down slot
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+#include "BenchProbe.hpp"           // #384 H1: bench-only anchor faults (docs/BENCH_PROBE.md)
+#endif
 
 static const char* TAG = "TelephonyAnchor";
 
@@ -366,6 +369,14 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		~PendingDec() { c.fetch_sub(1, std::memory_order_acq_rel); }
 	} pendingDec{_outboundPending};
 
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1 (rule 5): a 911/933 shuts the probe's gate before any I/O: every fault
+	// disarmed, the ballast released, a token_age undone so ensureToken() below
+	// does not refetch ahead of it.
+	const bool benchEmergency = pbx::classifyEmergencyDial(destination).isEmergency;
+	pd::benchprobe::EmergencyDialScope benchEmergencyScope(benchEmergency);
+#endif
+
 	// Refresh the OAuth token if it's near expiry. Safe here: no media streams are
 	// open at call-origination time, so a re-issue can't kill a live stream.
 	ensureToken();
@@ -440,6 +451,18 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			success = httpPostBody(legacyUrl, "application/json", postData, respBody, &status, &requestSent);
 		}
 	}
+
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1 makecall_read_fail (#349's trigger): the POST reached 3CX; hand the code
+	// below exactly what an unread response leaves (httpPostBody: status -1, no body).
+	if (success && requestSent && pd::benchprobe::armedHint(pd::benchprobe::Fault::MakecallReadFail) &&
+	    pd::benchprobe::fire(pd::benchprobe::Fault::MakecallReadFail, benchEmergency))
+	{
+		success = false;
+		status = -1;
+		respBody.clear();
+	}
+#endif
 
 	// Select the leg WE control: makecall result.id, else the direct_control leg in the live
 	// participant list (audit #76 — NOT a destination digit-suffix match, which selects the
@@ -527,6 +550,10 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			// Alloc THIS call's slot (startRxIfNeeded find-or-claims it for ownLeg) + prime the GET
 			// loop, then mark the slot outbound-in-flight so the WS upsets for ownLeg classify as
 			// ours and the tick() watchdog can detect a makecall that never produced media.
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+			// #384 H1: get_status / get_max_attempts apply to this outbound leg's GET loop only.
+			pd::benchprobe::claimGetFaults(ownLeg, benchEmergency);
+#endif
 			bool primed = startRxIfNeeded(ownLeg);
 			// #743: a 911/933 waits out a slot that is still tearing down (RxRestart.hpp). Off
 			// _mutex: startRxIfNeeded() takes it, and so does the teardown that frees the slot.
@@ -772,6 +799,16 @@ bool TelephonyAnchorClient::writeAudio(std::string_view participantId, const int
 	{
 		return false;
 	}
+
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1 post_stream_fail (#279): shut this stream's socket, so this write and
+	// every later one on it fails until the bridge gives up on the call.
+	if (pd::benchprobe::armedHint(pd::benchprobe::Fault::PostStreamFail) &&
+	    pd::benchprobe::fire(pd::benchprobe::Fault::PostStreamFail))
+	{
+		shutdown(esp_http_client_get_socket(slot->postClient), SHUT_RDWR);
+	}
+#endif
 
 	// esp_http_client_open(-1) sets the Transfer-Encoding: chunked header, but
 	// esp_http_client_write() is a RAW passthrough to esp_transport_write() — IDF
@@ -1638,6 +1675,20 @@ void TelephonyAnchorClient::tick()
 {
 	// Runs inline on the SIP task at ≤1 Hz — MUST be non-blocking: only atomic reads, one timer
 	// read, and (rarely) a worker spawn. No logging or allocation on the common path.
+
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1 token_age (#336): age the held token so tokenExpiringSoon() reads true.
+	// The aged stamp is stored before it is registered, so an emergency can always undo it.
+	if (pd::benchprobe::armedHint(pd::benchprobe::Fault::TokenAge) &&
+	    pd::benchprobe::tokenAgeApplies(_tokenObtainedUs.load(), _tokenLifetimeUs.load()) &&
+	    pd::benchprobe::fire(pd::benchprobe::Fault::TokenAge))
+	{
+		const int64_t real = _tokenObtainedUs.load();
+		const int64_t aged = pd::benchprobe::agedTokenObtainedUs(esp_timer_get_time(), _tokenLifetimeUs.load());
+		_tokenObtainedUs.store(aged);
+		pd::benchprobe::noteTokenAged(&_tokenObtainedUs, aged, real);
+	}
+#endif
 
 	// Issue #65 (L-1): too many leaked GET sockets — spawn a one-shot worker to do a full
 	// stop()/start() reclaim OFF this task (stop()/start() block on TLS I/O). _restartInFlight
@@ -3330,7 +3381,14 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	// old 40-attempt/~20s ceiling would expire mid-ring and the call would
 	// connect with no inbound audio). Teardown still exits it immediately via
 	// stopRequested + socket shutdown (#553).
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1 get_status / get_max_attempts: only for the leg makeCall() claimed (an
+	// outbound, never a 911/933). Not constexpr here, so every use below takes the override.
+	const pd::benchprobe::GetLoopFaults benchGet = pd::benchprobe::takeGetFaults(activePartId);
+	const int            kMaxAttempts = benchGet.maxAttempts;
+#else
 	constexpr int        kMaxAttempts = 240;
+#endif
 	// #350: consecutive TRANSPORT-level failures — no HTTP response parsed at all —
 	// as distinct from a real non-200, which is what the 240-attempt budget exists
 	// for. A transport that is actually dead does not heal by being reopened 240
@@ -3402,6 +3460,19 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 			{
 				esp_http_client_fetch_headers(_getClient);
 				int status = esp_http_client_get_status_code(_getClient);
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+				// #384 H1 get_status: a real answer reads as the forced refusal. A real 200's
+				// body is the live audio stream and never drains, so it is closed unread.
+				const pd::benchprobe::GetStatusOverride benchStatus =
+					pd::benchprobe::overrideGetStatus(status, benchGet.forcedStatus);
+				if (benchStatus.closeUnread)
+				{
+					std::lock_guard<std::mutex> lock(_getMutex);
+					slot->getFd = -1;   // #553: unpublish before the socket is closed
+					esp_http_client_close(_getClient);
+				}
+				status = benchStatus.status;
+#endif
 				if (status == 200)
 				{
 					// #100: surface the GET handshake cost — a warm/pre-warmed handle RESUMES (well
@@ -3421,7 +3492,12 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					// Drain the error body completely so the persistent connection can
 					// carry the next attempt (an unread body poisons handle reuse).
 					char drainBuf[256];
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+					// #384 H1: a 200 closed unread above has no connection left to read.
+					int firstChunk = benchStatus.closeUnread ? 0 : esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf));
+#else
 					int firstChunk = esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf));
+#endif
 					bool seen = false;
 					for (int i = 0; i < loggedRefusalCount; ++i) seen = seen || (loggedRefusals[i] == status);
 					if (!seen && loggedRefusalCount < 4)

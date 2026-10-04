@@ -25,6 +25,9 @@
 #include "TimeSync.hpp"    // Issue #246: voicemail flush timestamp (endCall() hook)
 #include "PbxConfig.hpp"
 #include "EmergencyCall.hpp"  // Issue #166: 911/933 classification, ahead of the dial plan
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+#include "BenchProbe.hpp"     // #384 H1: the bench probe's emergency gate (docs/BENCH_PROBE.md)
+#endif
 #include "SessionTimer.hpp"   // Issue #198: RFC 4028 422 floor, 2xx Session-Expires
 #include <charconv>
 #include "PbxPersist.hpp"
@@ -9552,6 +9555,11 @@ void RequestsHandler::tick()
 		// AnchorClient::tick(): "periodic, non-blocking maintenance pump ... (<=1 Hz)"
 		// per its doc comment. Loopback's is a no-op; a real anchor uses this for
 		// TLS re-warm / reconnect bookkeeping without blocking the SIP thread.
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+		// #384 H1 (rule 5): the probe's emergency level, read before the anchor's own
+		// tick can fire token_age; also the ballast dead-man's backstop.
+		pd::benchprobe::tick(emergencyCallLive());
+#endif
 		if (_anchorClient)
 		{
 			_anchorClient->tick();
