@@ -1276,11 +1276,11 @@ class ProbeRunCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def go(self, scenario=None, overrides=None, env=None, version=PROBE_VERSION, fast_cap=None):
+    def go(self, scenario=None, overrides=None, env=None, version=PROBE_VERSION, fast_cap=None, pin_check="0.05"):
         def start_logger(argv, out_path):
             return FakeLogger(self.board, argv, out_path)
         argv = cli("--port", str(self.board.port), "--http-port", str(self.http_port), "--local-ip", "127.0.0.1",
-                   "--syslog-port", "0", "--set-syslog", "--pin-check-s", "0.05", "--out", self.tmp.name,
+                   "--syslog-port", "0", "--set-syslog", "--pin-check-s", pin_check, "--out", self.tmp.name,
                    "--expect-version", version, scenario=scenario or self.SCENARIO)
         ov = dict(self.FAST, **(overrides or {}))
         with contextlib.ExitStack() as stack:
@@ -1420,7 +1420,8 @@ class ProbeRefusalTest(unittest.TestCase):
             self.assertIn(needle, cm.exception.reason)
         p, http = probe((503, None), (200, ok))
         self.assertEqual(p.arm("get_status", 403), ok)
-        self.assertEqual(http.request_json.call_args[0], ("POST", an.BENCH_PATH, {"fault": "get_status", "value": "403"}))
+        self.assertEqual(http.request_json.call_args[0],
+                         ("POST", an.BENCH_PATH, {"fault": "get_status", "value": "403"}))
         p, http = probe((409, None), (200, ok))
         with self.assertRaises(an.run_soak.Abort):
             p.arm("get_status", 403)
@@ -1481,9 +1482,9 @@ class X349Test(ProbeRunCase):
 
     def test_fail_on_a_phantom_inbound_at_6104_and_the_call_is_stopped(self):
         self.board.knobs["phantom"] = True
-        rc, out = self.go(overrides={"hold_s": 8.0})
+        rc, out = self.go(overrides={"hold_s": 8.0}, pin_check="6")   # only the call's own watch can stop it
         self.assertEqual(rc, 1, out)
-        self.assertIn("phantom inbound", out)
+        self.assertIn("a phantom inbound reached a test UA during the call: the run stops", out)
         self.assertLess(self.calls[0]["duration_s"], 4.0, "the call was hung up at the phantom, not held")
         self.assertEqual(self.calls[0].get("hangup_bye"), 200)
         self.assert_clean_probe(out)
