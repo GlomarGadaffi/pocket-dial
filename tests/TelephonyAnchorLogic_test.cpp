@@ -294,76 +294,119 @@ TEST(TelephonyLogic, HttpResponseParsedTrueForAnyRealStatus)
 // ── #379/#681: a leg this PBX created is never announced as an inbound call ────
 // The x4 re-run on .244 (main 1fcd6d4b, #379 issuecomment-5985911668), on its
 // syslog clock in µs. The handset CANCELled at 422.512 and the session ended.
-constexpr int64_t kNamed  = 2'477'423'517'000;   // resolveOutboundLeg: result.id=38
-constexpr int64_t kFreed  = 2'477'423'600'000;   // the drop freed its slot (between 423.539 and 423.608)
-constexpr int64_t kUpsert = 2'477'423'930'000;   // "Inbound call on DN ***: participant 38"
-constexpr int64_t kRemove = 2'477'424'724'000;   // "Participant Remove 38"
+// The WS event numbers are the order the anchor client received them in.
+constexpr int64_t  kNamed     = 2'477'423'517'000;   // resolveOutboundLeg: result.id=38
+constexpr int64_t  kFreed     = 2'477'423'600'000;   // the drop freed its slot (between 423.539 and 423.608)
+constexpr int64_t  kUpsert    = 2'477'423'930'000;   // "Inbound call on DN ***: participant 38"
+constexpr int64_t  kRemove    = 2'477'424'724'000;   // "Participant Remove 38"
+constexpr uint64_t kSeqUpsert = 41;                  // the upsert for 38
+constexpr uint64_t kSeqRemove = 42;                  // 3CX's Remove of 38
 
 TEST(OwnLegs, AnOwnLegUpsertWhileItsDropStallsIsNotAnnounced)
 {
 	AnchorOwnLegs own;
-	own.note("38", kNamed);   // makeCall(): the makecall response named it
-	own.note("38", kFreed);   // freeSlotLocked(): its outbound slot was freed
-	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kUpsert))
+	own.noteNamed("38", kNamed);   // makeCall(): the makecall response named it
+	own.note("38", kFreed);        // freeSlotLocked(): its outbound slot was freed
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kUpsert, kSeqUpsert))
 		<< "our own leg 38 was announced as an inbound call while its drop reconnected";
 }
 
-TEST(OwnLegs, AnUpsertAfterTheRemoveIsNotAnnounced)
+TEST(OwnLegs, AnUpsertAfterTheRemoveIsANewCall)
 {
+	// 3CX removed 38, so an upsert it sends for 38 afterwards names a new participant.
 	AnchorOwnLegs own;
-	own.note("38", kNamed);
+	own.noteNamed("38", kNamed);
 	own.note("38", kFreed);
-	EXPECT_TRUE(own.refresh("38", kRemove)) << "3CX's Remove of a held leg holds it for the grace";
-	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kRemove + 300'000));
-	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kRemove + kOwnLegGraceUs - 1))
-		<< "held for the grace after the Remove, not after the slot was freed";
+	own.release("38", kSeqRemove);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kRemove + 300'000, kSeqRemove + 1))
+		<< "a call that reuses 38 after its Remove was held back";
+}
+
+TEST(OwnLegs, AFreedSlotOrADropAfterTheRemoveDoesNotHoldItAgain)
+{
+	// The Remove's own worker frees the slot after the Remove arrived; a drop may refresh it.
+	AnchorOwnLegs own;
+	own.noteNamed("38", kNamed);
+	own.release("38", kSeqRemove);
+	own.note("38", kRemove + 50'000);
+	own.refresh("38", kRemove + 60'000);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kRemove + 300'000, kSeqRemove + 1));
+}
+
+TEST(OwnLegs, OnlyAnIdThreeCxNamedAsOursIsHeld)
+{
+	// The list fallback's first controllable leg with no slot can be a genuine inbound
+	// call that rang while the makecall was pending (it gets no slot then).
+	EXPECT_TRUE(ownLegMayBeHeld(OwnLegSource::MakecallResult));
+	EXPECT_TRUE(ownLegMayBeHeld(OwnLegSource::OwnPartyDn));
+	EXPECT_FALSE(ownLegMayBeHeld(OwnLegSource::FirstControllable)) << "a guessed leg was held";
 }
 
 TEST(OwnLegs, ALegIsOursFromTheMomentTheMakecallResponseNamesIt)
 {
 	// Named but not keyed onto a call slot yet (or never: every slot busy).
 	AnchorOwnLegs own;
-	own.note("38", kNamed);
-	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kNamed + 22'000));
+	own.noteNamed("38", kNamed);
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kNamed + 22'000, kSeqUpsert));
 }
 
 TEST(OwnLegs, TheHoldLapsesTheGraceAfterTheLastEvent)
 {
 	AnchorOwnLegs own;
 	own.note("38", kFreed);
-	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kFreed + 5'000'000));
-	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kFreed + kOwnLegGraceUs - 1));
-	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kFreed + kOwnLegGraceUs))
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kFreed + 5'000'000, kSeqUpsert));
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kFreed + kOwnLegGraceUs - 1, kSeqUpsert));
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kFreed + kOwnLegGraceUs, kSeqUpsert))
 		<< "a check at +5 s must not extend the hold";
-	EXPECT_FALSE(own.refresh("38", kFreed + kOwnLegGraceUs)) << "a Remove does not revive a lapsed leg";
+	EXPECT_FALSE(own.refresh("38", kFreed + kOwnLegGraceUs)) << "a drop does not revive a lapsed leg";
 }
 
 TEST(OwnLegs, AFullTableOverwritesTheLeastRecentlySeenLeg)
 {
-	static_assert(sizeof(OwnLegs<4, 32>) == 4 * (32 + sizeof(int64_t)), "fixed storage only");
+	static_assert(sizeof(OwnLegs<4, 32>) == 4 * sizeof(OwnLegs<1, 32>), "fixed storage only");
+	static_assert(sizeof(AnchorOwnLegs) == 8 * sizeof(OwnLegs<1, 32>), "fixed storage only");
 	OwnLegs<4, 32> own;
 	for (int i = 0; i < 4; ++i) own.note(std::to_string(10 + i), kNamed + i);
 	own.note("10", kNamed + 10);
 	own.note("20", kNamed + 20);
-	EXPECT_TRUE(inboundAnnounceAllowed(own, "11", kNamed + 21)) << "11 was the least recently seen";
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "11", kNamed + 21, kSeqUpsert)) << "11 was the least recently seen";
 	for (const char* id : { "10", "12", "13", "20" })
 	{
-		EXPECT_FALSE(inboundAnnounceAllowed(own, id, kNamed + 21)) << id;
+		EXPECT_FALSE(inboundAnnounceAllowed(own, id, kNamed + 21, kSeqUpsert)) << id;
 	}
 }
 
-// Guards: these pass with nothing held, and must keep passing.
+// Guards: these pass on the unfixed code too, and must keep passing.
+
+TEST(OwnLegs, WorkQueuedBeforeTheRemoveIsStillOurs)
+{
+	// The trace's order: the upsert for 38 was received before 3CX's Remove, and a
+	// worker may reach it only after the Remove.
+	AnchorOwnLegs own;
+	own.noteNamed("38", kNamed);
+	own.note("38", kFreed);
+	own.release("38", kSeqRemove);
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kRemove + 300'000, kSeqUpsert));
+}
+
+TEST(OwnLegs, ANameAfterARemoveHoldsTheLegAgain)
+{
+	// 3CX names our next outbound leg with an id it removed before: that leg is ours.
+	AnchorOwnLegs own;
+	own.noteNamed("38", kNamed);
+	own.release("38", kSeqRemove);
+	own.noteNamed("38", kRemove + 1'000'000);
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kRemove + 1'100'000, kSeqRemove + 5));
+}
 
 TEST(OwnLegs, ANewParticipantIdIsAnnounced)
 {
 	AnchorOwnLegs own;
-	own.note("38", kNamed);
+	own.noteNamed("38", kNamed);
 	own.note("38", kFreed);
-	own.refresh("38", kRemove);
-	EXPECT_TRUE(inboundAnnounceAllowed(own, "39", kUpsert));
-	EXPECT_TRUE(inboundAnnounceAllowed(own, "39", kRemove + 300'000));
-	EXPECT_TRUE(inboundAnnounceAllowed(own, "3", kUpsert)) << "a prefix of a held id is another participant";
-	EXPECT_TRUE(inboundAnnounceAllowed(own, "380", kUpsert));
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "39", kUpsert, kSeqUpsert));
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "3", kUpsert, kSeqUpsert)) << "a prefix of a held id is another participant";
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "380", kUpsert, kSeqUpsert));
 }
 
 TEST(OwnLegs, APsapCallbackAfterADroppedEmergencyLegIsAnnounced)
@@ -371,10 +414,10 @@ TEST(OwnLegs, APsapCallbackAfterADroppedEmergencyLegIsAnnounced)
 	// The caller abandoned a 911: its own leg was named, freed and dropped. 3CX
 	// offers the PSAP's callback as a new participant on the route DN.
 	AnchorOwnLegs own;
-	own.note("40", kNamed);
+	own.noteNamed("40", kNamed);
 	own.note("40", kFreed);
-	own.refresh("40", kRemove);
-	EXPECT_TRUE(inboundAnnounceAllowed(own, "41", kRemove + 300'000));
+	own.refresh("40", kFreed + 10'000);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "41", kUpsert, kSeqUpsert));
 }
 
 TEST(OwnLegs, AnInboundLegThePbxRefusedAndDroppedIsStillAnnounced)
@@ -384,18 +427,19 @@ TEST(OwnLegs, AnInboundLegThePbxRefusedAndDroppedIsStillAnnounced)
 	// upsert announces it again, as before.
 	AnchorOwnLegs own;
 	EXPECT_FALSE(own.refresh("50", kUpsert));
-	EXPECT_TRUE(inboundAnnounceAllowed(own, "50", kUpsert + 750'000));
+	own.release("50", kSeqRemove);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "50", kUpsert + 750'000, kSeqUpsert));
 }
 
 TEST(OwnLegs, AnIdThatDoesNotFitIsNeverHeld)
 {
 	AnchorOwnLegs own;
 	const std::string longId(40, '7');
-	own.note(longId, kNamed);
+	own.noteNamed(longId, kNamed);
 	own.note("", kNamed);
-	EXPECT_TRUE(inboundAnnounceAllowed(own, longId, kNamed + 1));
-	EXPECT_TRUE(inboundAnnounceAllowed(own, longId.substr(0, 31), kNamed + 1)) << "never truncated into a match";
-	EXPECT_TRUE(inboundAnnounceAllowed(own, "", kNamed + 1));
+	EXPECT_TRUE(inboundAnnounceAllowed(own, longId, kNamed + 1, kSeqUpsert));
+	EXPECT_TRUE(inboundAnnounceAllowed(own, longId.substr(0, 31), kNamed + 1, kSeqUpsert)) << "never truncated into a match";
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "", kNamed + 1, kSeqUpsert));
 }
 
 }  // namespace

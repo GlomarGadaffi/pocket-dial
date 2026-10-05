@@ -47,13 +47,16 @@ class AnchorOwnLegNotInboundTest(unittest.TestCase):
         self.free = body_of(tac, "void TelephonyAnchorClient::freeSlotLocked(")
         self.work = body_of(tac, "void TelephonyAnchorClient::processWsWork(")
         self.ws = body_of(tac, "void TelephonyAnchorClient::handleWsEvent(")
+        self.resolve = body_of(tac, "std::string TelephonyAnchorClient::resolveOutboundLeg(")
 
     def test_the_makecall_response_makes_the_leg_ours_before_it_is_keyed(self):
         keyed = self.make.find("startRxIfNeeded(ownLeg)")
         self.assertNotEqual(keyed, -1, "positive control: makeCall keys its own leg")
-        named = self.make.find("_ownLegs.note(ownLeg, ")
+        named = self.make.find("_ownLegs.noteNamed(ownLeg, ")
         self.assertNotEqual(named, -1, "makeCall must note the leg the makecall response named")
         self.assertLess(named, keyed, "noted before the slot is keyed, so no window is uncovered")
+        self.assertIn("telephony::ownLegMayBeHeld(ownLegSource)", self.make[:named],
+                      "only a leg 3CX named as ours is held, never the list fallback's guess")
 
     def test_a_freed_outbound_slot_hands_its_leg_to_the_table(self):
         cleared = self.free.find("slot.participantId.clear()")
@@ -61,7 +64,7 @@ class AnchorOwnLegNotInboundTest(unittest.TestCase):
         noted = self.free.find("_ownLegs.note(slot.participantId, ")
         self.assertNotEqual(noted, -1, "freeSlotLocked must note an outbound slot's leg")
         self.assertLess(noted, cleared, "noted before the id is cleared")
-        self.assertIn("slot.outboundActive.load(", self.free[:noted], "only an outbound slot's leg is ours")
+        self.assertIn("slot.ownLegHeld", self.free[:noted], "only a slot whose leg 3CX named as ours")
         self.assertNotIn("farPartId", self.free[:noted], "a far-leg id can be a genuine inbound call's")
 
     def test_a_drop_never_makes_a_leg_ours(self):
@@ -70,11 +73,33 @@ class AnchorOwnLegNotInboundTest(unittest.TestCase):
         self.assertNotIn("_ownLegs.note(", self.drop,
                          "dropCall also drops refused inbound legs; noting them would hold back a PSAP callback")
 
-    def test_a_remove_refreshes_a_held_leg(self):
+    def test_the_list_fallback_reports_where_the_leg_came_from(self):
+        for src in ("OwnLegSource::MakecallResult", "OwnLegSource::OwnPartyDn",
+                    "OwnLegSource::FirstControllable"):
+            self.assertIn(src, self.resolve, "resolveOutboundLeg must report " + src)
+        self.assertIn("ownLegHeld = ", self.make, "makeCall marks a slot whose leg 3CX named as ours")
+
+    def test_a_remove_releases_the_leg_in_ws_order(self):
+        start = self.ws.find("else if (evTypeNum == TEL_EV_REMOVE)")
+        end = self.ws.find("else if (evTypeNum == TEL_EV_DTMF)")
+        self.assertTrue(0 <= start < end, "positive control: the Remove branch")
+        branch = self.ws[start:end]
+        released = branch.find("_ownLegs.release(partId, ++_wsSeq);")
+        self.assertNotEqual(released, -1, "3CX's Remove must release the id at receipt, in WS order")
+        self.assertLess(released, branch.find("enqueueWsWork(item)"))
         start = self.work.find("if (w.kind == WsWork::Remove)")
         end = self.work.find("std::string controlLeg = w.controlLeg;")
         self.assertTrue(0 <= start < end, "positive control: the Remove branch precedes the Upset body")
-        self.assertIn("_ownLegs.refresh(w.partId, ", self.work[start:end])
+        self.assertNotIn("_ownLegs.", self.work[start:end], "a Remove must not hold the id again")
+
+    def test_queued_work_carries_its_ws_order(self):
+        seq = self.ws.find("const uint64_t seq = ++_wsSeq;")
+        self.assertNotEqual(seq, -1, "each upsert takes its WS sequence number under the classifier's lock")
+        self.assertLess(seq, self.ws.find(GATE + "partId, "))
+        self.assertIn(GATE + "partId, esp_timer_get_time(), seq)", self.ws)
+        self.assertRegex(self.ws, r"item->seq\s*=\s*seq;", "a queued upsert carries its WS sequence number")
+        self.assertIn(GATE + "controlLeg, esp_timer_get_time(), w.seq)", self.work,
+                      "the worker judges an item by when it was received, not when it runs")
 
     def test_the_worker_checks_before_it_claims_a_slot_or_announces(self):
         claim = self.work.find("allocSlotLocked(controlLeg)")

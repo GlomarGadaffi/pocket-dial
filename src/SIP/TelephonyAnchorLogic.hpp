@@ -343,6 +343,12 @@ public:
 		return false;
 	}
 
+	// RED (#883 review): the API of the Remove release, with the head's behaviour:
+	// a Remove releases nothing.
+	void noteNamed(std::string_view id, int64_t nowUs) { note(id, nowUs); }
+	void release(std::string_view, uint64_t) {}
+	bool holds(std::string_view id, int64_t nowUs, uint64_t) const { return holds(id, nowUs); }
+
 private:
 	struct Entry
 	{
@@ -362,6 +368,23 @@ inline bool inboundAnnounceAllowed(const OwnLegs<N, Len>& own, std::string_view 
 {
 	return !own.holds(partId, nowUs);
 }
+
+template <std::size_t N, std::size_t Len>
+inline bool inboundAnnounceAllowed(const OwnLegs<N, Len>& own, std::string_view partId, int64_t nowUs,
+                                   uint64_t wsSeq)
+{
+	return !own.holds(partId, nowUs, wsSeq);
+}
+
+// RED (#883 review): where makeCall() got its own leg's id; the head holds every one.
+enum class OwnLegSource : uint8_t
+{
+	MakecallResult,
+	OwnPartyDn,
+	FirstControllable,
+};
+
+inline bool ownLegMayBeHeld(OwnLegSource) { return true; }
 
 }  // namespace telephony
 
