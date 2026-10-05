@@ -1026,9 +1026,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			// Emergency INVITEs only, by the To user: the number onInvite routes
 			// on. Not the Request-URI too, or INVITE sip:911@ with To 102 would be
 			// relayed to 102 past this gate. Every other multipart body is
-			// refused as before.
+			// refused as before. desmo, #877 ("the same as dialed"): a 911 a
+			// dial-plan rule produces and a PSAP callback are unwrapped too; those
+			// lookups run only for a body that is not plain SDP.
+			const std::string_view to = request->getToNumber();
 			if (request->getType() == SipMessageTypes::INVITE &&
-				pbx::classifyEmergencyDial(request->getToNumber()).isEmergency)
+				(pbx::classifyEmergencyDial(to).isEmergency ||
+				 (!request->hasSdpContentType() &&
+				  (isPsapCallbackTo(*request) || dialRuleMakesEmergency(std::string(to))))))
 			{
 				request->unwrapMultipartSdp();
 			}
@@ -2301,6 +2306,17 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		emergency.isEmergency)
 	{
 		routeEmergencyCall(data, caller.value(), emergency, destNumber);
+		return;
+	}
+	// #834 (desmo: "the same as dialed"): a 911/933 that a dial-plan rule
+	// produces takes this early path too, so #497, the secure-mode challenge
+	// and the 422 floor below never stand in front of it. routeTrunkCall()
+	// still diverts one that reaches it (#538 M2), as a backstop.
+	if (std::string ruled; dialRuleMakesEmergency(destNumber, &ruled))
+	{
+		queueLog("EMERGENCY: a dial-plan rule turned " + destNumber + " into " + ruled +
+			"; routing it as an emergency call", true);
+		routeEmergencyCall(data, caller.value(), pbx::classifyEmergencyDial(ruled), ruled);
 		return;
 	}
 
@@ -4646,17 +4662,22 @@ bool RequestsHandler::isEmergencyTraffic(const SipMessage& m)
 	{
 		return false;
 	}
-	// #818: a PSAP callback need not say Priority: psap-callback. #659's window
-	// on the extension makes it one, called directly or through a DID.
-	const std::string dialed(m.getToNumber());
-	if (isEmergencyCallback(dialed)) return true;
-#if POCKETDIAL_TRUNK_INBOUND
-	if (isTrunkSbcSource(m.getSource()) && isEmergencyCallback(trunkDidExtension(m))) return true;
-#endif
-	return dialRuleMakesEmergency(dialed);
+	return isPsapCallbackTo(m) || dialRuleMakesEmergency(std::string(m.getToNumber()));
 }
 
-bool RequestsHandler::dialRuleMakesEmergency(const std::string& dialed) const
+bool RequestsHandler::isPsapCallbackTo(const SipMessage& m)
+{
+	// #818: a PSAP callback need not say Priority: psap-callback. #659's window
+	// on the extension makes it one, called directly or through a DID.
+	if (isEmergencyCallback(m.getToNumber())) return true;
+#if POCKETDIAL_TRUNK_INBOUND
+	return isTrunkSbcSource(m.getSource()) && isEmergencyCallback(trunkDidExtension(m));
+#else
+	return false;
+#endif
+}
+
+bool RequestsHandler::dialRuleMakesEmergency(const std::string& dialed, std::string* emergencyOut) const
 {
 	// Only a number that reaches the dial plan: onInvite routes the reserved
 	// extensions, a configured page zone, a park orbit, the pickup codes and a
@@ -4672,9 +4693,14 @@ bool RequestsHandler::dialRuleMakesEmergency(const std::string& dialed) const
 	// then routes an emergency result as an emergency call (#538 M2).
 	const pbx::DialRule* rule = _cfg.dialPlan().match(dialed);
 	std::string transformed;
-	return rule && rule->action == pbx::DialActionType::Trunk &&
-		pbx::applyTrunkTransform(dialed, rule->stripDigits, rule->target, transformed) &&
-		pbx::classifyEmergencyDial(transformed).isEmergency;
+	if (!rule || rule->action != pbx::DialActionType::Trunk ||
+		!pbx::applyTrunkTransform(dialed, rule->stripDigits, rule->target, transformed) ||
+		!pbx::classifyEmergencyDial(transformed).isEmergency)
+	{
+		return false;
+	}
+	if (emergencyOut) *emergencyOut = std::move(transformed);
+	return true;
 }
 
 bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,

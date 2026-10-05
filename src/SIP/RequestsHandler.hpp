@@ -1780,8 +1780,12 @@ private:
 	// callback by #659's window (#818) or a 911 a dial-plan rule produces (#834).
 	// Caller holds _mutex.
 	bool isEmergencyTraffic(const SipMessage& m);
-	// #834: a dial-plan Trunk rule turns `dialed` into 911/933 in onInvite.
-	bool dialRuleMakesEmergency(const std::string& dialed) const;
+	// #818: an INVITE's callee is inside #659's callback window: the To user,
+	// or for a carrier INVITE the extension its DID maps to. Caller holds _mutex.
+	bool isPsapCallbackTo(const SipMessage& m);
+	// #834: a dial-plan Trunk rule turns `dialed` into 911/933 in onInvite;
+	// `emergencyOut`, when non-null, gets that number.
+	bool dialRuleMakesEmergency(const std::string& dialed, std::string* emergencyOut = nullptr) const;
 
 	// emergencyRoute() for a caller that already holds _mutex.
 	EmergencyRoute emergencyRouteLocked() const;
