@@ -900,8 +900,13 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 
 	// Latch the To-tag from the first response that carries one. Everything
 	// in-dialog afterwards -- the ACK, the BYE -- is malformed without it.
+	// #889: only from a 180, 183 or final, the responses that reached it before
+	// every 1xx did. A 100 forms no dialog (RFC 3261 §8.2.6.2, §12.1), a 199
+	// names one already gone (RFC 6228), and a 181 or 182 may be a hop's own:
+	// their tag on the 2xx's ACK and BYE would match no dialog at the callee.
 	const std::string toTag = siphdr::tagOf(data->getTo());
-	if (!toTag.empty() && d->toTag.empty()) d->toTag = toTag;
+	const bool dialogTag = status == 180 || status == 183 || status >= 200;
+	if (!toTag.empty() && d->toTag.empty() && dialogTag) d->toTag = toTag;
 
 	// #794: hangup() ran before any provisional response, when §9.1 forbade a
 	// CANCEL. This is the first one, so the CANCEL goes out now -- hangup() on
