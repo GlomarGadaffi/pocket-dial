@@ -1396,6 +1396,55 @@ TEST(E911Notify, ACarrierFinalAfterItsTwoHundredLeavesThe911Up)
 	}
 }
 
+// #890 review S3: the same through handle(), with trunk credentials set, for
+// the finals with handlers of their own: a 407 or 401 (onFinalFailure; main
+// answered it as a challenge with a second, credentialed INVITE, a possible
+// second PSAP call), a 480 (onUnavailable) and a 487 (onReqTerminated).
+TEST(E911Notify, ALateFinalWithTrunkCredentialsSetNeverSendsASecondInvite)
+{
+	struct Case { const char* status; const char* challenge; };
+	const Case cases[] = {
+		{ "SIP/2.0 407 Proxy Authentication Required", "Proxy-Authenticate" },
+		{ "SIP/2.0 401 Unauthorized", "WWW-Authenticate" },
+		{ "SIP/2.0 480 Temporarily Unavailable", nullptr },
+		{ "SIP/2.0 487 Request Terminated", nullptr },
+	};
+	for (const Case& c : cases)
+	{
+		SCOPED_TRACE(c.status);
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setAnchorPlacesRealCallsForTest(false);
+		b.handler->setTrunkConfig(dottedQuadTrunk());
+		ASSERT_TRUE(b.handler->setTrunkCredentials("s3cret-890b"));
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-890-auth"));
+		ASSERT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 1) << b.dump();
+		b.handler->handle(carrierResponse(b, "SIP/2.0 200 OK", /*withSdp=*/true));
+		ASSERT_EQ(countStarting(b, "SIP/2.0 200 OK"), 1) << "precondition: the PSAP answered:\n" << b.dump();
+		const size_t before = b.wire.size();
+
+		std::string raw = carrierResponse(b, c.status)->toString();
+		if (c.challenge)
+		{
+			raw.insert(raw.find("Content-Length"), std::string(c.challenge) +
+				": Digest realm=\"carrier.example\", nonce=\"n0nce890\", qop=\"auth\"\r\n");
+		}
+		for (int i = 0; i < 2; ++i)   // and its retransmission
+		{
+			b.handler->handle(RequestsHandler::getMessageFromPool(raw, enAddr("203.0.113.5")));
+		}
+
+		EXPECT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 1) << "no second INVITE to the PSAP:\n" << b.dump();
+		EXPECT_EQ(b.wire.size(), before) << "no ACK, and nothing to the caller:\n" << b.dump();
+		const auto s = b.handler->getSession("Call-ID: en-890-auth");
+		EXPECT_TRUE(s.has_value() && s.value()->getState() == Session::State::Connected) << b.dump();
+		EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 1u) << "the relay is held";
+		EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << b.dump();
+		EXPECT_EQ(b.countOf("s3cret-890b"), 0) << "the password never reaches the wire";
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // #878 review S-C4: what the trunk correction says, and when it is not sent.
 // ─────────────────────────────────────────────────────────────────────────────
