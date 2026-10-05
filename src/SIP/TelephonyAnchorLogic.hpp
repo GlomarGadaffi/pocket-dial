@@ -293,23 +293,31 @@ inline bool httpResponseParsed(int status)
 // bridge is busy must be announced again on 3CX's next upsert if its drop fails. A
 // genuine inbound call, a PSAP callback among them, is a new participant id.
 //
-// Until 3CX's Remove the id names a live participant of ours, so no other call can
-// carry it. The Remove releases it at once: an upsert received after the Remove may be
-// a new call reusing the id, and is announced as before. Only work received before the
-// Remove stays ours, told apart by the WS event number it was queued with. A Remove
-// received after our makecall went out but before its response named the leg is that
-// leg's own, and releases it too. A held-back new call could be lost, not merely
-// delayed: a route point's first upsert is already Connected, and the client's model is
-// that 3CX does not repeat a Connected upsert.
+// Until 3CX's Remove the id names a live participant of ours. The Remove releases it at
+// once: an upsert received after the Remove may be a new call reusing the id, and is
+// announced as before. Only work received before the Remove stays ours, told apart by
+// the WS event number it was queued with. A Remove of the id received after our
+// makecall went out but before its response named the leg is taken as that leg's own,
+// and releases it too. A held-back new call could be lost, not merely delayed: a route
+// point's first upsert is already Connected, and the client's model is that 3CX does
+// not repeat a Connected upsert.
 //
-// Without a Remove (a WS outage lost it, or 3CX removed only the far leg, or more than
-// N Removes came between a makecall and its response) the hold lapses kOwnLegGraceUs
-// after the last event noted, never extended by the upserts it suppresses. It spans the
-// slot being freed to 3CX's Remove across a stalled drop: performCtrl() makes two
-// attempts with socket operations of up to 2 s each (timeout_ms bounds each operation,
-// not the request) and one cold TLS handshake, about 5-7 s; the trace took 1.1 s. Fixed
-// size: a full table overwrites its least recently seen entry, and an id that does not
-// fit is not recorded; both forget a leg, which errs toward announcing. Not synchronised.
+// If 3CX reuses participant ids, the rule can misfire both ways. Held: with no Remove
+// numbered after the makecall went out (a WS outage lost it, 3CX removed only the far
+// leg, or N later Removes pushed it out of the ring before the naming), a reused id is
+// held for up to kOwnLegGraceUs after the slot is freed. Released early: an earlier
+// participant's Remove of the same id received after our makecall went out, before or
+// after the naming, is taken as this leg's own, and the leg is then announced as on
+// main, phantom included. The early release is the chosen trade; ids allocated from a
+// counter retire both directions.
+//
+// Without a Remove the hold lapses kOwnLegGraceUs after the last event noted, never
+// extended by the upserts it suppresses. It spans the slot being freed to 3CX's Remove
+// across a stalled drop: performCtrl() makes two attempts with socket operations of up
+// to 2 s each (timeout_ms bounds each operation, not the request) and one cold TLS
+// handshake, about 5-7 s; the trace took 1.1 s. Fixed size: a full table overwrites its
+// least recently seen entry, and an id that does not fit is not recorded; both forget a
+// leg, which errs toward announcing. Not synchronised.
 inline constexpr int64_t kOwnLegGraceUs = 10'000'000;
 
 template <std::size_t N, std::size_t Len>
@@ -318,7 +326,8 @@ class OwnLegs
 public:
 	// The makecall response named this leg: ours, even if 3CX removed an earlier
 	// participant with the same id before the makecall went out (postSeq is the WS event
-	// number then). A Remove of the id since then was this leg's own.
+	// number then). A Remove of the id since then is taken as this leg's own; under id
+	// reuse it may be an earlier participant's, which releases the leg early.
 	void noteNamed(std::string_view id, int64_t nowUs, uint64_t postSeq)
 	{
 		uint64_t removedSeq = 0;

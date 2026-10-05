@@ -357,6 +357,77 @@ TEST(OwnLegs, ALegRemovedBeforeItIsNamedIsNotHeld)
 		<< "the removed leg's own upsert, received before the Remove, is still ours";
 }
 
+// The ring of recent Removes: the last 8, oldest overwritten (#883 review S2).
+
+// The leg's own Remove at kSeqRemove, then `others` Removes of other participants.
+AnchorOwnLegs removedThenOthers(int others)
+{
+	AnchorOwnLegs own;
+	own.release("38", kSeqRemove);
+	for (int i = 0; i < others; ++i) own.release(std::to_string(100 + i), kSeqRemove + 1 + i);
+	own.noteNamed("38", kNamed, kSeqPost);
+	return own;
+}
+
+TEST(OwnLegs, EightLaterRemovesPushTheLegsOwnOutOfTheRing)
+{
+	const AnchorOwnLegs own = removedThenOthers(8);
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kNamed + 300'000, kSeqRemove + 9))
+		<< "the leg's Remove was the oldest of 9, so the ring forgot it and the leg is held";
+}
+
+TEST(OwnLegs, SevenLaterRemovesKeepTheLegsOwnInTheRing)
+{
+	const AnchorOwnLegs own = removedThenOthers(7);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kNamed + 300'000, kSeqRemove + 8))
+		<< "the leg's Remove was still among the last 8, so the leg is released";
+}
+
+TEST(OwnLegs, ARemoveNumberedAtTheMakecallIsNotCounted)
+{
+	// postSeq is the last number taken before the makecall went out, so a Remove that
+	// carries it was received before the makecall: an earlier participant's.
+	AnchorOwnLegs own;
+	own.release("38", kSeqPost);
+	own.noteNamed("38", kNamed, kSeqPost);
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kNamed + 300'000, kSeqPost + 1));
+}
+
+TEST(OwnLegs, OfTwoRemovesOfOneIdTheLaterCounts)
+{
+	AnchorOwnLegs own;
+	own.release("38", kSeqPost - 1);   // an earlier participant's, before the makecall
+	own.release("38", kSeqRemove);     // the leg's own
+	own.noteNamed("38", kNamed, kSeqPost);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kNamed + 300'000, kSeqRemove + 1));
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kNamed + 300'000, kSeqUpsert))
+		<< "released at the leg's own Remove, not before it";
+}
+
+TEST(OwnLegs, AnIdThatDoesNotFitTakesNoPlaceInTheRing)
+{
+	// The leg's Remove is the oldest of 8; an id of 32 characters must not evict it.
+	AnchorOwnLegs own;
+	own.release("38", kSeqRemove);
+	for (int i = 0; i < 7; ++i) own.release(std::to_string(100 + i), kSeqRemove + 1 + i);
+	own.release(std::string(32, '7'), kSeqRemove + 8);
+	own.noteNamed("38", kNamed, kSeqPost);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kNamed + 300'000, kSeqRemove + 9));
+}
+
+TEST(OwnLegs, UnderIdReuseAnEarlierParticipantsRemoveReleasesTheNewLegEarly)
+{
+	// Accepted behaviour (case d'): an earlier participant 38 was still live when our
+	// makecall went out; its Remove came after, and 3CX then gave 38 to our leg. The
+	// table takes that Remove as our leg's own, so our leg is announced after it, as on
+	// main, phantom included. Counter-allocated ids (accepted 2026-10-05) rule it out.
+	AnchorOwnLegs own;
+	own.release("38", kSeqRemove);
+	own.noteNamed("38", kNamed, kSeqPost);
+	own.note("38", kFreed);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kUpsert, kSeqRemove + 1));
+}
+
 TEST(OwnLegs, ALegIsOursFromTheMomentTheMakecallResponseNamesIt)
 {
 	// Named but not keyed onto a call slot yet (or never: every slot busy).
@@ -380,6 +451,7 @@ TEST(OwnLegs, AFullTableOverwritesTheLeastRecentlySeenLeg)
 {
 	static_assert(sizeof(OwnLegs<4, 32>) == 4 * sizeof(OwnLegs<1, 32>), "fixed storage only");
 	static_assert(sizeof(AnchorOwnLegs) == 8 * sizeof(OwnLegs<1, 32>), "fixed storage only");
+	static_assert(sizeof(AnchorOwnLegs) == 704, "8 held legs of 48 B and 8 Removes of 40 B");
 	OwnLegs<4, 32> own;
 	for (int i = 0; i < 4; ++i) own.note(std::to_string(10 + i), kNamed + i);
 	own.note("10", kNamed + 10);
