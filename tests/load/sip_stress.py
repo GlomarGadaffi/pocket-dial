@@ -61,7 +61,7 @@ def local_ip_for(host, port):
     try:
         s.connect((host, port)); return s.getsockname()[0]
     except Exception:
-        return '0.0.0.0'
+        return '127.0.0.1'   # no route: never the wildcard (binds every interface); matches sip_agent
     finally:
         s.close()
 
@@ -88,7 +88,7 @@ class UA:
     def __init__(self, ext, host, port, local_ip, timeout=4.0):
         self.ext, self.host, self.port, self.lip = ext, host, port, local_ip
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.s.bind((local_ip if local_ip != '0.0.0.0' else '', 0))
+        self.s.bind((local_ip, 0))
         self.s.settimeout(timeout)
         self.lport = self.s.getsockname()[1]
         self.callid = f"{_hex(16)}@{local_ip}"

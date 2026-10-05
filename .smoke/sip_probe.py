@@ -55,7 +55,10 @@ def local_ip_for(target_ip):
         s.connect((target_ip, 5060))
         return s.getsockname()[0]
     except OSError:
-        return "0.0.0.0"
+        # No route: never fall back to the wildcard address (it would bind every
+        # interface). Loopback keeps the probe running; the send then fails and
+        # is reported as a socket error, same as any unreachable target.
+        return "127.0.0.1"
     finally:
         s.close()
 
@@ -68,7 +71,7 @@ def probe(target_ip, port):
         try:
             sock.bind((local_ip, 5061))
         except OSError:
-            sock.bind(("0.0.0.0", 0))
+            sock.bind((local_ip, 0))   # 5061 busy: same interface, any free port
         msg = builder(local_ip, target_ip, port) if name == "REGISTER" \
             else build_options(local_ip, target_ip, port)
         try:
