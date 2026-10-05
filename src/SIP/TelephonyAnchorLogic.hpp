@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -281,28 +282,81 @@ inline bool httpResponseParsed(int status)
 	return status > 0;
 }
 
-// RED (#379): the API only; nothing is held yet.
+// Issues #379/#681: the participant ids this PBX itself created. On .244 a handset
+// CANCELled before 3CX's makecall response named the PBX's own leg; the drop freed
+// the leg's call slot, then stalled reconnecting, and an upsert for the leg that
+// matched no slot was announced as a new inbound call (#379 issuecomment-5985911668).
+//
+// Only legs the makecall response named, or that an outbound slot held, are noted,
+// never a leg the PBX merely dropped: dropCall() also drops refused inbound legs, and
+// a PSAP callback refused while a bridge is busy must be announced again on 3CX's
+// next upsert if its drop fails. A PSAP callback or any other genuine inbound call
+// is a new participant id, which this table never holds.
+//
+// The hold is bounded: kOwnLegGraceUs after the last event noted for the leg, never
+// extended by the upserts it suppresses, so an id 3CX might reuse is at worst
+// announced one grace late. The window it has to span runs from the slot being freed
+// to 3CX's Remove across a stalled drop: performCtrl() makes two attempts with
+// socket operations of up to 2 s each (timeout_ms bounds each operation, not the
+// request) and one cold TLS handshake, about 5-7 s; the trace took 1.1 s. Fixed size:
+// a full table overwrites its least recently seen entry, and an id that does not fit
+// is not recorded; both forget a leg, which errs toward announcing. Not synchronised.
 inline constexpr int64_t kOwnLegGraceUs = 10'000'000;
 
 template <std::size_t N, std::size_t Len>
 class OwnLegs
 {
 public:
-	void note(std::string_view, int64_t) {}
-	bool refresh(std::string_view, int64_t) { return false; }
-	bool holds(std::string_view, int64_t) const { return false; }
+	void note(std::string_view id, int64_t nowUs)
+	{
+		if (id.empty() || id.size() >= Len) return;
+		Entry* victim = &_e[0];
+		for (Entry& e : _e)
+		{
+			if (id == e.id)
+			{
+				e.seenUs = nowUs;
+				return;
+			}
+			if (age(e) < age(*victim)) victim = &e;
+		}
+		std::memcpy(victim->id, id.data(), id.size());
+		victim->id[id.size()] = '\0';
+		victim->seenUs = nowUs;
+	}
+
+	// A later time for a leg still held; a leg not held is not added.
+	bool refresh(std::string_view id, int64_t nowUs)
+	{
+		if (!holds(id, nowUs)) return false;
+		note(id, nowUs);
+		return true;
+	}
+
+	bool holds(std::string_view id, int64_t nowUs) const
+	{
+		if (id.empty()) return false;
+		for (const Entry& e : _e)
+		{
+			if (id == e.id) return nowUs - e.seenUs < kOwnLegGraceUs;
+		}
+		return false;
+	}
 
 private:
 	struct Entry
 	{
-		char    id[Len];
-		int64_t seenUs;
+		char    id[Len] = {};
+		int64_t seenUs  = 0;
 	};
+	static int64_t age(const Entry& e) { return e.id[0] != '\0' ? e.seenUs : std::numeric_limits<int64_t>::min(); }
 	Entry _e[N] = {};
 };
 
 using AnchorOwnLegs = OwnLegs<8, 32>;
 
+// May an upset for partId, which no call slot holds as an outbound call, be announced
+// as a new inbound call? Every id the table does not hold is announced as before.
 template <std::size_t N, std::size_t Len>
 inline bool inboundAnnounceAllowed(const OwnLegs<N, Len>& own, std::string_view partId, int64_t nowUs)
 {

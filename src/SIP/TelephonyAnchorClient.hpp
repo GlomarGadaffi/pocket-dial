@@ -19,6 +19,7 @@
 #include "freertos/queue.h"   // #43: WS event work queue
 #include "freertos/semphr.h"  // #43: worker-pool done semaphore (+ existing _rxDoneSem)
 #include "PsramTask.hpp"      // #479: pd::StaticTaskSlot (the slot's tel_media_rx stack + TCB)
+#include "TelephonyAnchorLogic.hpp"   // #379: telephony::AnchorOwnLegs
 #endif
 
 #include "PoolConfig.hpp"     // #100: POCKETDIAL_MAX_ANCHOR_CALLS (per-call slot count)
@@ -214,6 +215,9 @@ private:
 	// Issue #554 (b): legs we dropped recently. An upsert for one of them must not
 	// claim a slot and start rx/POST again. Guarded by _mutex.
 	RecentIdRing<8, 64> _droppedLegs;
+	// Issue #379: legs this PBX created. An upsert for one that no outbound slot holds is
+	// never announced as an inbound call (telephony::inboundAnnounceAllowed). Guarded by _mutex.
+	telephony::AnchorOwnLegs _ownLegs;
 	// Slot lookup/alloc (caller holds _mutex). slotForLocked returns the slot whose
 	// participantId matches (nullptr if none); allocSlotLocked claims a free slot for a new
 	// participant (nullptr if all busy). freeSlotLocked clears a slot back to free.
