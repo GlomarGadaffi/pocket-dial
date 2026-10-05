@@ -639,11 +639,12 @@ TEST(EmergencyDialing, ARuleProducedNineOneOneGetsEveryExemptionADialedOneGets)
 // #877 review S-A4: dialRuleMakesEmergency() now decides routing, so its
 // precedence mirror is pinned. onInvite routes a configured ring group, a park
 // orbit, a configured page zone and the pickup codes before the dial plan, so a
-// rule that would make 911 of their number never fires for them. An extension
-// is different: #69 puts the dial plan BEFORE the extension lookup, so a rule
-// does capture an extension's number, here as on main (#538 M2). That case is
-// pinned as it is, not changed. Characterization tests: these pass before and
-// after the fix; a slip in the mirror turns them red.
+// rule that would make 911 of their number never fires for them. Those cases
+// are characterization tests: they pass before and after the fix, and a slip
+// in the mirror turns them red. A registered extension's number is not made a
+// 911 by a wildcard rule either (desmo, #877: "Only wildcard rules yield").
+// Before that decision the rule did capture it, as on main: #69 puts the dial
+// plan before the extension lookup, and #538 M2 routed the result as 911.
 // ─────────────────────────────────────────────────────────────────────────────
 
 TEST(EmergencyDialing, ARuleThatMakesNineOneOneNeverCapturesWhatOnInviteRoutesFirst)
@@ -693,14 +694,127 @@ TEST(EmergencyDialing, ARuleThatMakesNineOneOneNeverCapturesWhatOnInviteRoutesFi
 		}
 	}
 	{
-		SCOPED_TRACE("a registered extension: captured by the rule, as on main (#69 order)");
+		SCOPED_TRACE("a registered extension: a wildcard rule yields to it (desmo, #877)");
 		Bench b;
 		b.handler->handle(emRegister("102", "192.168.77.12", "em-reg-102"));
 		b.handler->setDialRule("1XX", "trunk", "911", 3);
 		b.wire.clear();
 		b.handler->handle(emInvite("101", "102", "192.168.77.11", "em-s-a4-ext"));
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "")
+			<< "102 is a registered extension; the wildcard rule must not make it a 911:\n" << b.wire.dump();
+		EXPECT_TRUE(b.wire.saw("INVITE sip:102@")) << "102 rings:\n" << b.wire.dump();
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// desmo, #877: "Only wildcard rules yield". A WILDCARD dial-plan rule ('X', or a
+// trailing '*') whose transform makes a number 911/933 steps aside for a
+// REGISTERED extension, as if the rule did not exist. A LITERAL rule (0 -> 911,
+// 112 -> 911) always fires, so a phone that registers its number in Learn mode
+// cannot take the operator's emergency rule over. Every other rule keeps #69's
+// order, and a dialed 911/933 never reaches the dial plan.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(EmergencyDialing, OnlyAWildcardRuleThatMakesNineOneOneYieldsToARegisteredExtension)
+{
+	{
+		SCOPED_TRACE("control: the wildcard rule still makes 911 of a number in its range that is not registered");
+		Bench b;
+		b.handler->handle(emRegister("102", "192.168.77.12", "em-reg-102"));
+		b.handler->setDialRule("1XX", "trunk", "911", 3);
+		b.wire.clear();
+		b.handler->handle(emInvite("101", "199", "192.168.77.11", "em-877-199"));
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.wire.dump();
+	}
+	struct Rogue { const char* number; int strip; };
+	for (const Rogue& r : {Rogue{"0", 1}, Rogue{"112", 3}})
+	{
+		SCOPED_TRACE(std::string("a literal rule ") + r.number + " -> 911 fires although a phone registered " + r.number);
+		Bench b;
+		b.handler->handle(emRegister(r.number, "192.168.77.13", std::string("em-reg-rogue-") + r.number));
+		ASSERT_TRUE(b.wire.saw("SIP/2.0 200 OK")) << "precondition: " << r.number << " registered:\n" << b.wire.dump();
+		b.handler->setDialRule(r.number, "trunk", "911", r.strip);
+		ASSERT_EQ(b.handler->getDialRules().size(), 1u) << "precondition: the rule is stored";
+		b.wire.clear();
+		b.handler->handle(emInvite("101", r.number, "192.168.77.11", std::string("em-877-rogue-") + r.number));
 		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
-			<< "the dial plan precedes the extension lookup; main routes this to 911 too:\n" << b.wire.dump();
+			<< "the operator's literal emergency rule must not yield to a registration:\n" << b.wire.dump();
+		EXPECT_FALSE(b.wire.saw(std::string("INVITE sip:") + r.number + "@")) << b.wire.dump();
+	}
+	{
+		SCOPED_TRACE("an ordinary rule still captures an extension's number (#69 order unchanged)");
+		Bench b;
+		b.handler->handle(emRegister("102", "192.168.77.12", "em-reg-102"));
+		b.handler->setDialRule("1XX", "trunk", "", 0);
+		b.wire.clear();
+		b.handler->handle(emInvite("101", "102", "192.168.77.11", "em-877-ordinary"));
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "102") << b.wire.dump();
 		EXPECT_FALSE(b.wire.saw("INVITE sip:102@")) << b.wire.dump();
+	}
+	{
+		SCOPED_TRACE("as if the wildcard 911 rule did not exist: a later ordinary rule still applies");
+		Bench b;
+		b.handler->handle(emRegister("102", "192.168.77.12", "em-reg-102"));
+		b.handler->setDialRule("1XX", "trunk", "911", 3);
+		b.handler->setDialRule("10X", "trunk", "", 0);
+		ASSERT_EQ(b.handler->getDialRules().size(), 2u) << "precondition: both rules are stored";
+		b.wire.clear();
+		b.handler->handle(emInvite("101", "102", "192.168.77.11", "em-877-later"));
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "102") << b.wire.dump();
+	}
+	{
+		SCOPED_TRACE("the known limit: an extension the registrar knows but that is not registered is not protected");
+		Bench b;
+		b.handler->adoptDeviceForTest("0200000000dd", "103");
+		b.handler->setDialRule("1XX", "trunk", "911", 3);
+		b.wire.clear();
+		b.handler->handle(emInvite("101", "103", "192.168.77.11", "em-877-offline"));
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
+			<< "the test is registration, as for a call no rule matches:\n" << b.wire.dump();
+	}
+}
+
+// The mirror (dialRuleMakesEmergency(), which the #759 gate and the #760 unwrap
+// ask) agrees with the router: a wildcard rule's 911 for registered 102 is no
+// 911 to either, so the gate refuses what it refuses on any call to 102; the
+// same rule's 911 for 199, and a literal rule's 911 for a registered 112, are
+// 911s to both, so the gate yields.
+TEST(EmergencyDialing, TheHeaderGateAgreesWithTheRouterOnWhichRuleNumbersAreNineOneOne)
+{
+	struct Shape { const char* what; const char* extra; bool multipart; const char* refusal; };
+	int n = 0;
+	for (const Shape& s : {Shape{"Require: 100rel", "Require: 100rel\r\n", false, "SIP/2.0 420"},
+	                       Shape{"a multipart body with a PIDF-LO", "", true, "SIP/2.0 415"}})
+	{
+		SCOPED_TRACE(s.what);
+		++n;
+		{
+			Bench b;
+			b.handler->handle(emRegister("102", "192.168.77.12", "em-reg-102"));
+			b.handler->setDialRule("1XX", "trunk", "911", 3);
+			b.wire.clear();
+			b.handler->handle(emShapedInvite("102", "192.168.77.11", "em-877-gate-102-" + std::to_string(n), s.extra, s.multipart));
+			EXPECT_TRUE(b.wire.saw(s.refusal)) << "102 is not a 911, so the gate does not yield:\n" << b.wire.dump();
+			EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "") << b.wire.dump();
+		}
+		{
+			Bench b;
+			b.handler->handle(emRegister("102", "192.168.77.12", "em-reg-102"));
+			b.handler->setDialRule("1XX", "trunk", "911", 3);
+			b.wire.clear();
+			b.handler->handle(emShapedInvite("199", "192.168.77.11", "em-877-gate-199-" + std::to_string(n), s.extra, s.multipart));
+			EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.wire.dump();
+			EXPECT_FALSE(b.wire.saw("SIP/2.0 4")) << b.wire.dump();
+		}
+		{
+			Bench b;
+			b.handler->handle(emRegister("112", "192.168.77.13", "em-reg-rogue-112"));
+			ASSERT_TRUE(b.wire.saw("SIP/2.0 200 OK")) << "precondition: 112 registered:\n" << b.wire.dump();
+			b.handler->setDialRule("112", "trunk", "911", 3);
+			b.wire.clear();
+			b.handler->handle(emShapedInvite("112", "192.168.77.11", "em-877-gate-112-" + std::to_string(n), s.extra, s.multipart));
+			EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.wire.dump();
+			EXPECT_FALSE(b.wire.saw("SIP/2.0 4")) << b.wire.dump();
+		}
 	}
 }
