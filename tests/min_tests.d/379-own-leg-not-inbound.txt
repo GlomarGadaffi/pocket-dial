@@ -1,0 +1,2 @@
+# TelephonyAnchorLogic_test.cpp: 20 (OwnLegs), TelCtlPool_test.cpp: 1 (a leg this PBX created is never announced as inbound, #379)
+21

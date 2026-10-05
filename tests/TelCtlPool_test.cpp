@@ -227,6 +227,32 @@ TEST(TelCtlPool, OrphanDropsFromCallWorkersAllRunWhenTheQueueWasFull)
 		<< "dropped " << b.loopback()->dropCallCount() - before << " of " << kWorkers + kDepth << " orphaned legs";
 }
 
+TEST(TelCtlPool, AGenuineInboundCallAfterAnOrphanDropStillRings)
+{
+	// #379's hardware order: the CANCEL ends the session while makeCall() is on the
+	// wire, makeCall() then names the leg and the worker drops it. The anchor-side
+	// rule that never announces that leg is ESP-only (TelephonyAnchorLogic_test.cpp,
+	// tests/tools/test_anchor_own_leg_not_inbound.py). A genuine inbound call is a
+	// new participant id, and it must still ring.
+	Bench b;
+	b.handler->holdTelCtlForTest(true);
+	b.dial(0, "555");
+	ASSERT_TRUE(waitFor([&] { return b.handler->telCtlParkedForTest() == 1; }));
+	b.handler->handle(cancelOf(ext(0), "555", ip(0), callId(0)));
+	ASSERT_FALSE(b.handler->getSession("Call-ID: " + callId(0)).has_value()) << "precondition: the CANCEL ended it";
+	const unsigned before = b.loopback()->dropCallCount();
+
+	b.handler->holdTelCtlForTest(false);
+	ASSERT_TRUE(waitFor([&] { return b.loopback()->dropCallCount() == before + 1; }))
+		<< "the leg makeCall() named after the CANCEL was not dropped";
+	b.handler->handle(registerOf(ext(0), ip(0)));   // takes _mutex: the worker has let go of it
+
+	const std::string id = b.handler->routeInboundAnchorCallForTest("800", "part-in-379", "5551234567");
+	const auto s = b.handler->getSession(id);
+	ASSERT_TRUE(s.has_value()) << "a genuine inbound call after the orphan drop was not routed";
+	EXPECT_FALSE(s.value()->getPendingTargets().empty()) << "and it rings no phone";
+}
+
 TEST(TelCtlPool, AnEmergencyCallIsNotQueuedBehindOrdinaryCallSetup)
 {
 	Bench b;

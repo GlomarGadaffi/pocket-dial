@@ -19,6 +19,7 @@
 #include "freertos/queue.h"   // #43: WS event work queue
 #include "freertos/semphr.h"  // #43: worker-pool done semaphore (+ existing _rxDoneSem)
 #include "PsramTask.hpp"      // #479: pd::StaticTaskSlot (the slot's tel_media_rx stack + TCB)
+#include "TelephonyAnchorLogic.hpp"   // #379: telephony::AnchorOwnLegs
 #endif
 
 #include "PoolConfig.hpp"     // #100: POCKETDIAL_MAX_ANCHOR_CALLS (per-call slot count)
@@ -207,13 +208,20 @@ private:
 		std::atomic<bool>        stopRequested{false};
 		int                      getFd = -1;              // guarded by getMutex
 		bool                     rxDetached = false;      // #608: counted in _leakedGetClients; guarded by _mutex
-		mutable std::mutex       postMutex;               // guards postClient (writeAudio/stop)
+		bool                     ownLegHeld = false;      // #379: 3CX named this outbound leg as ours; guarded by _mutex
+		mutable std::mutex       postMutex;              // guards postClient (writeAudio/stop)
 		std::mutex               getMutex;                // guards getClient (runRxLoop/stop)
 	};
 	CallSlot _calls[POCKETDIAL_MAX_ANCHOR_CALLS];
 	// Issue #554 (b): legs we dropped recently. An upsert for one of them must not
 	// claim a slot and start rx/POST again. Guarded by _mutex.
 	RecentIdRing<8, 64> _droppedLegs;
+	// Issue #379: legs this PBX created. An upsert for one that no outbound slot holds is
+	// never announced as an inbound call (telephony::inboundAnnounceAllowed). Guarded by _mutex.
+	telephony::AnchorOwnLegs _ownLegs;
+	// Issue #379: the number of the last Upset/Remove the WS task took, in arrival order;
+	// queued work carries its own, so a Remove releases only later upserts. Guarded by _mutex.
+	uint64_t _wsSeq = 0;
 	// Slot lookup/alloc (caller holds _mutex). slotForLocked returns the slot whose
 	// participantId matches (nullptr if none); allocSlotLocked claims a free slot for a new
 	// participant (nullptr if all busy). freeSlotLocked clears a slot back to free.
@@ -304,6 +312,7 @@ private:
 		std::string controlLeg;   // the leg WE control (own outbound leg, or inbound partId)
 		std::string partId;       // the participant Telephony surfaced in the event entity path
 		std::string callerId;     // inbound From display name (best-effort)
+		uint64_t    seq = 0;      // #379: _wsSeq of the event that queued it (0: makeCall's own leg)
 	};
 	static constexpr int kWsWorkers    = POCKETDIAL_MAX_ANCHOR_CALLS; // one worker per concurrent call slot
 	static constexpr int kWsQueueDepth = 16;
@@ -385,7 +394,8 @@ private:
 	// actively harmful: see makeCall). 0 means the list was never consulted (result.id
 	// came straight from the makecall response, so the caller already has its answer).
 	std::string resolveOutboundLeg(const std::string& makecallRespBody, const std::string& destination,
-	                               int* listStatusOut = nullptr);
+	                               int* listStatusOut = nullptr,
+	                               telephony::OwnLegSource* sourceOut = nullptr);   // #379
 	// Status of a specific leg read from the LIST (GET /participants -> find id). Replaces
 	// getParticipantStatus(id), which 403s for a leg this DN cannot directly control (issue #40).
 	std::string getLegStatus(const std::string& legId);
