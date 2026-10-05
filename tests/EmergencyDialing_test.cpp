@@ -634,3 +634,73 @@ TEST(EmergencyDialing, ARuleProducedNineOneOneGetsEveryExemptionADialedOneGets)
 		}
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #877 review S-A4: dialRuleMakesEmergency() now decides routing, so its
+// precedence mirror is pinned. onInvite routes a configured ring group, a park
+// orbit, a configured page zone and the pickup codes before the dial plan, so a
+// rule that would make 911 of their number never fires for them. An extension
+// is different: #69 puts the dial plan BEFORE the extension lookup, so a rule
+// does capture an extension's number, here as on main (#538 M2). That case is
+// pinned as it is, not changed. Characterization tests: these pass before and
+// after the fix; a slip in the mirror turns them red.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(EmergencyDialing, ARuleThatMakesNineOneOneNeverCapturesWhatOnInviteRoutesFirst)
+{
+	struct Case
+	{
+		const char* what;
+		const char* pattern;
+		int strip;
+		const char* shadowed;   // routed before the dial plan: never a 911
+		const char* control;    // the same rule's 911, or "" when the rule has no other number
+	};
+	const Case cases[] = {
+		{"a configured ring group",  "6XX",   3, "600",   "601"},
+		{"a park orbit",             "7XX",   3, "700",   "750"},
+		{"a configured page zone",   "98X",   3, "980",   "981"},   // 981 is not configured
+		{"the group pickup code",    "*8",    2, "*8",    ""},
+		{"a directed pickup code",   "**1XX", 5, "**102", ""},
+	};
+	int n = 0;
+	for (const Case& c : cases)
+	{
+		SCOPED_TRACE(c.what);
+		++n;
+		{
+			Bench b;
+			b.handler->handle(emRegister("102", "192.168.77.12", "em-reg-102"));
+			b.handler->setRingGroup("600", "102", "ringall");
+			b.handler->setPageZone("980", "102");
+			b.handler->setDialRule(c.pattern, "trunk", "911", c.strip);
+			ASSERT_EQ(b.handler->getDialRules().size(), 1u) << "precondition: the rule is stored";
+			b.wire.clear();
+			b.handler->handle(emInvite("101", c.shadowed, "192.168.77.11", "em-s-a4-" + std::to_string(n)));
+			EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "")
+				<< c.shadowed << " is routed before the dial plan; the rule must not make it a 911:\n" << b.wire.dump();
+			EXPECT_FALSE(b.wire.saw("Emergency Call Not Routable")) << b.wire.dump();
+		}
+		if (c.control[0] != '\0')
+		{
+			// Control: the same rule does make a 911 of a number it is not shadowed for.
+			Bench b;
+			b.handler->setRingGroup("600", "102", "ringall");
+			b.handler->setPageZone("980", "102");
+			b.handler->setDialRule(c.pattern, "trunk", "911", c.strip);
+			b.handler->handle(emInvite("101", c.control, "192.168.77.11", "em-s-a4-ctl-" + std::to_string(n)));
+			EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.wire.dump();
+		}
+	}
+	{
+		SCOPED_TRACE("a registered extension: captured by the rule, as on main (#69 order)");
+		Bench b;
+		b.handler->handle(emRegister("102", "192.168.77.12", "em-reg-102"));
+		b.handler->setDialRule("1XX", "trunk", "911", 3);
+		b.wire.clear();
+		b.handler->handle(emInvite("101", "102", "192.168.77.11", "em-s-a4-ext"));
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
+			<< "the dial plan precedes the extension lookup; main routes this to 911 too:\n" << b.wire.dump();
+		EXPECT_FALSE(b.wire.saw("INVITE sip:102@")) << b.wire.dump();
+	}
+}
