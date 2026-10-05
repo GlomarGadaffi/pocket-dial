@@ -65,42 +65,98 @@ namespace siphdr
 		return std::string(stripHeaderNameView(h));
 	}
 
-	// The bare URI of a Contact header line, parameters of the URI kept ("sip:1001@h:5060;line=x"
-	// out of "Contact: <sip:1001@h:5060;line=x>;reg-id=1"). A bare, unbracketed URI is cut at the
-	// first ';' (header parameters, RFC 3261 §20.10). A view into `header`; empty when none.
-	// #824: a '<' inside the quoted display name is not the URI's (RFC 3261 §25.1
-	// quoted-string, \-escapes included). A quote left open (an unescaped '"' in the name)
-	// falls back to the last <...> on the line; empty when there is none.
-	inline std::string_view contactUriView(std::string_view header)
+	// A "sip:" or "sips:" URI, the scheme in any case (RFC 3261 §19.1.4).
+	inline bool hasSipScheme(std::string_view uri)
 	{
-		std::string_view v = stripHeaderNameView(header);
-		auto bracketed = [v](size_t lt) {
-			const size_t gt = v.find('>', lt + 1);
-			return gt == std::string_view::npos ? std::string_view{} : v.substr(lt + 1, gt - lt - 1);
+		auto startsWith = [uri](std::string_view scheme) {
+			if (uri.size() < scheme.size()) return false;
+			for (size_t i = 0; i < scheme.size(); ++i)
+			{
+				if (std::tolower(static_cast<unsigned char>(uri[i])) != scheme[i]) return false;
+			}
+			return true;
 		};
+		return startsWith("sip:") || startsWith("sips:");
+	}
+
+	// The '<' that opens a name-addr's URI in a From/To/Contact line or value, or npos
+	// (an addr-spec, or nothing). #824: a '<' inside a quoted string is not the URI's
+	// (RFC 3261 §25.1 quoted-string, \-escapes included), so with balanced quotes it is
+	// the first '<' outside them. `open` is set when a quote is left open (an unescaped
+	// '"' in a display name, "Lobby 55" TV"). #832, #835: then it is the first '<'
+	// outside quotes if no '"' comes before it (no quote can cover it), or if only
+	// header parameters follow its '>'; else the last '<'
+	// outside quotes counted from the right, where a parameter's quoted value
+	// (+sip.instance="<urn:...>") pairs up whatever the display name left open; else
+	// the last '<' on the line. Open or not is quote parity: an even number of stray
+	// quotes reads as balanced.
+	inline size_t nameAddrOpen(std::string_view v, bool& open)
+	{
+		size_t first = std::string_view::npos;
 		bool quoted = false;
-		for (size_t lt = 0; lt < v.size(); ++lt)
+		for (size_t i = 0; i < v.size(); ++i)
 		{
-			const char c = v[lt];
+			const char c = v[i];
 			if (quoted)
 			{
-				if (c == '\\') ++lt;
+				if (c == '\\') ++i;
 				else if (c == '"') quoted = false;
 			}
 			else if (c == '"')
 			{
 				quoted = true;
 			}
-			else if (c == '<')
+			else if (c == '<' && first == std::string_view::npos)
 			{
-				return bracketed(lt);
+				first = i;
 			}
 		}
-		if (quoted)
+		open = quoted;
+		if (!quoted) return first;
+		if (first != std::string_view::npos && v.find('"') > first) return first;
+		if (first != std::string_view::npos)
 		{
-			const size_t lt = v.rfind('<');
-			return lt == std::string_view::npos ? std::string_view{} : bracketed(lt);
+			size_t after = v.find('>', first + 1);
+			if (after != std::string_view::npos)
+			{
+				++after;
+				while (after < v.size() && (v[after] == ' ' || v[after] == '\t' || v[after] == '\r' || v[after] == '\n')) ++after;
+				if (after == v.size() || v[after] == ';' || v[after] == ',') return first;
+			}
 		}
+		bool rquoted = false;
+		for (size_t i = v.size(); i-- > 0;)
+		{
+			const char c = v[i];
+			if (c == '"')
+			{
+				size_t slashes = 0;
+				while (slashes < i && v[i - 1 - slashes] == '\\') ++slashes;
+				if (!rquoted || slashes % 2 == 0) rquoted = !rquoted;
+			}
+			else if (c == '<' && !rquoted)
+			{
+				return i;
+			}
+		}
+		return v.rfind('<');
+	}
+
+	// The bare URI of a Contact header line, parameters of the URI kept ("sip:1001@h:5060;line=x"
+	// out of "Contact: <sip:1001@h:5060;line=x>;reg-id=1"). A bare, unbracketed URI is cut at the
+	// first ';' (header parameters, RFC 3261 §20.10). A view into `header`; empty when none.
+	// Which <...> is the URI: nameAddrOpen(). A quote left open with no '<' gives empty.
+	inline std::string_view contactUriView(std::string_view header)
+	{
+		std::string_view v = stripHeaderNameView(header);
+		bool open = false;
+		const size_t lt = nameAddrOpen(v, open);
+		if (lt != std::string_view::npos)
+		{
+			const size_t gt = v.find('>', lt + 1);
+			return gt == std::string_view::npos ? std::string_view{} : v.substr(lt + 1, gt - lt - 1);
+		}
+		if (open) return {};
 		const size_t semi = v.find(';');
 		if (semi != std::string_view::npos) v = v.substr(0, semi);
 		while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.remove_prefix(1);

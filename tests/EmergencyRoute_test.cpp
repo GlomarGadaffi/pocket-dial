@@ -1881,8 +1881,8 @@ TEST(EmergencyRoute, AnUppercaseOrSipsSchemeIsReadAsSip)
 	}
 
 	// Control: an extension so written is still that extension. The relayed
-	// INVITE keeps the caller's Request-URI (a pass-through), so it is counted
-	// by method and address alone.
+	// INVITE keeps the caller's Request-URI (a pass-through, not 102's
+	// registered Contact), so it is matched on that, SIP:102@, at 102's address.
 	Bench b;
 	b.handler->setTrunkConfig(trunkConfig());
 	b.handler->handle(makeRegister("102", "192.168.79.12"));
@@ -1890,6 +1890,215 @@ TEST(EmergencyRoute, AnUppercaseOrSipsSchemeIsReadAsSip)
 	b.handler->handle(makeShapedInvite("SIP:102@server", "SIP:102@server", "application/sdp", "", kSdpOffer,
 		"er-scheme-102"));
 	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-	EXPECT_EQ(b.count("INVITE", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE SIP:102@", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
 	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
+}
+
+TEST(EmergencyRoute, AStrayQuoteBeforeASecondBracketStillIdentifiesTheCaller)
+{
+	// #835: a display name with a stray quote AND a <...> of its own before it.
+	// The scan took the first '<' outside quotes, here "<A>", so the From had
+	// no user: REGISTER and every INVITE, 911 included, drew a 400. Before #832
+	// it read 105.
+	const std::string ip105 = "192.168.79.15";
+	const std::string from = "From: \"Lobby 55\" <A> TV\" <sip:105@server>;tag=odd105b\r\n";
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.sent.clear();
+
+	auto reg = RequestsHandler::getMessageFromPool(
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + ip105 + ":5060;branch=z9hG4bKoddregb\r\n" +
+		from +
+		"To: \"Lobby 55\" <A> TV\" <sip:105@server>\r\n"
+		"Call-ID: er-odd-reg-b\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"Contact: <sip:105@" + ip105 + ":5060>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n", addrFor(ip105));
+	EXPECT_EQ(reg->getFromNumber(), "105");
+	b.handler->handle(reg);
+	EXPECT_EQ(b.count("SIP/2.0 200", ip105.c_str()), 1u) << "the REGISTER is accepted:\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	b.sent.clear();
+
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"INVITE sip:911@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + ip105 + ":5060;branch=z9hG4bKoddb911\r\n" +
+		from +
+		"To: <sip:911@server>\r\n"
+		"Call-ID: er-odd-911-b\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:105@" + ip105 + ":5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(kSdpOffer.size()) + "\r\n\r\n" + kSdpOffer, addrFor(ip105)));
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+		<< "the 911 reaches the carrier:\n" << b.dump();
+}
+
+TEST(EmergencyRoute, AQuotedParameterBehindAnOpenQuoteIsNotTheUri)
+{
+	// #835: the open quote's mate is in a parameter, so the parameter's <...>
+	// sat outside quotes and was read as the URI: this call to 102 went to the
+	// PSAP. The URI is the <...> after the display name.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->handle(makeRegister("102", "192.168.79.12"));
+	b.sent.clear();
+	auto invite = makeInviteWithToValue("sip:102@server", "\"55\" TV\" <sip:102@server>;x=\"<sip:911@h>\"",
+		"application/sdp", "", kSdpOffer, "er-835-param");
+	EXPECT_EQ(invite->getToNumber(), "102");
+	b.handler->handle(invite);
+	EXPECT_EQ(b.count("INVITE sip:102@", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << "nothing may reach the PSAP:\n" << b.dump();
+}
+
+TEST(EmergencyRoute, AStrayQuoteAfterTheUriKeepsTheFirstUri)
+{
+	// #835 control: the open quote is in a parameter after the URI. The first
+	// <...>, followed only by parameters, stays the URI: this 911 routes.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	auto invite = makeInviteWithToValue("sip:911@server", "<sip:911@server>;x=\"<sip:102@h>",
+		"application/sdp", "", kSdpOffer, "er-835-after");
+	EXPECT_EQ(invite->getToNumber(), "911");
+	b.handler->handle(invite);
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+
+	// And an open quote with no <...> at all names no URI, as before.
+	EXPECT_EQ(makeInviteWithToValue("sip:911@server", "\"sip:911@lobby", "application/sdp", "", kSdpOffer,
+		"er-835-nouri")->getToNumber(), "");
+}
+
+TEST(EmergencyRoute, AStrayQuoteAfterTheToUriKeepsTheEmergencyNumber)
+{
+	// #857 review S1: text after the URI's '>' with a quote left open. The scan
+	// from the right took a later <...> over the first, which no quote precedes
+	// and so must open the URI. These 911s drew a 400, went to the trunk as
+	// 15551234567, or rang 102; main read 911. The last row is a control.
+	// Each through the header gate (an unsupported option tag) and the
+	// multipart unwrap too: both decide on the same To user.
+	struct Variant { const char* what; std::string contentType; std::string extra; std::string body; };
+	const std::vector<Variant> variants{
+		{"plain", "application/sdp", "", kSdpOffer},
+		{"Require: 100rel", "application/sdp", "Require: 100rel\r\n", kSdpOffer},
+		{"multipart", "multipart/mixed; boundary=pdloc835",
+		 "Geolocation: <cid:target101@pd.example>\r\n", multipartWithLocation("pdloc835")}};
+	for (const char* to : {"<sip:911@server> \"<x>", "<sip:911@server> y\" <sip:15551234567@h>",
+	                       "Emergency <sip:911@server> svc\" <sip:102@h>", "<sip:911@server> \"x"})
+	{
+		for (const Variant& v : variants)
+		{
+			SCOPED_TRACE(std::string(to) + " / " + v.what);
+			Bench b;
+			b.handler->setTrunkConfig(trunkConfig());
+			b.handler->handle(makeRegister("102", "192.168.79.12"));
+			b.sent.clear();
+
+			auto invite = makeInviteWithToValue("sip:911@server", to, v.contentType, v.extra, v.body, "er-835-s1");
+			EXPECT_EQ(invite->getToNumber(), "911");
+			EXPECT_TRUE(invite->isEmergencyRequest());
+			b.handler->handle(invite);
+
+			EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+			EXPECT_EQ(b.count("SIP/2.0 5"), 0u) << b.dump();
+			EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+				<< "the 911 reaches the carrier:\n" << b.dump();
+			EXPECT_EQ(b.count("INVITE sip:15551234567@"), 0u) << b.dump();
+			EXPECT_EQ(b.count("INVITE", "192.168.79.12"), 0u) << "102 must not be rung:\n" << b.dump();
+			EXPECT_FALSE(b.saw("pdloc835")) << "the MIME boundary must not reach the carrier's offer";
+		}
+	}
+}
+
+TEST(EmergencyRoute, AStrayQuoteAfterTheFromUriStillIdentifiesTheCaller)
+{
+	// #857 review S1, in From: the scan from the right read "<y>", no user, so
+	// REGISTER and every INVITE, 911 included, drew a 400. Main read 105.
+	const std::string ip105 = "192.168.79.15";
+	const std::string from = "From: <sip:105@server> x\"<y>;tag=s1from\r\n";
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	b.sent.clear();
+
+	auto reg = RequestsHandler::getMessageFromPool(
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + ip105 + ":5060;branch=z9hG4bKs1reg\r\n" +
+		from +
+		"To: <sip:105@server> x\"<y>\r\n"
+		"Call-ID: er-s1-reg\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"Contact: <sip:105@" + ip105 + ":5060>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n", addrFor(ip105));
+	EXPECT_EQ(reg->getFromNumber(), "105");
+	b.handler->handle(reg);
+	EXPECT_EQ(b.count("SIP/2.0 200", ip105.c_str()), 1u) << "the REGISTER is accepted:\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	b.sent.clear();
+
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"INVITE sip:911@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + ip105 + ":5060;branch=z9hG4bKs1911\r\n" +
+		from +
+		"To: <sip:911@server>\r\n"
+		"Call-ID: er-s1-911\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:105@" + ip105 + ":5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(kSdpOffer.size()) + "\r\n\r\n" + kSdpOffer, addrFor(ip105)));
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+		<< "the 911 reaches the carrier:\n" << b.dump();
+}
+
+TEST(EmergencyRoute, AnOpenQuoteAfterAQuotedNameFallsBackToTheLastUri)
+{
+	// #857 review S2: a quote precedes the first '<' and the scan from the
+	// right finds every '<' inside quotes, so the last '<' on the line is the
+	// URI (#832's rule). Without that step this 911 reads no user: a 400.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	auto invite = makeInviteWithToValue("sip:911@server", "\"Lobby\" <sip:911@server> \"x", "application/sdp", "",
+		kSdpOffer, "er-835-step3");
+	EXPECT_EQ(invite->getToNumber(), "911");
+	b.handler->handle(invite);
+	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+}
+
+TEST(EmergencyRoute, AnEscapedQuoteIsNotAQuoteInTheScanFromTheRight)
+{
+	// #857 review S2: \" is an escaped quote (RFC 3261 s25.1 quoted-pair), so
+	// it neither opens nor closes a quoted string in the scan from the right.
+	// Read as a quote, the first line is a call to 102, and the second, a call
+	// to 102, goes to the PSAP. Main reads both as below.
+	{
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->handle(makeRegister("102", "192.168.79.12"));
+		b.sent.clear();
+		auto invite = makeInviteWithToValue("sip:911@server", "\"Desk <sip:102@h> \\\"B <sip:911@server> \\\"B",
+			"application/sdp", "", kSdpOffer, "er-835-esc911");
+		EXPECT_EQ(invite->getToNumber(), "911");
+		b.handler->handle(invite);
+		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
+		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("INVITE", "192.168.79.12"), 0u) << "102 must not be rung:\n" << b.dump();
+	}
+	{
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->handle(makeRegister("102", "192.168.79.12"));
+		b.sent.clear();
+		auto invite = makeInviteWithToValue("sip:102@server", "\"Desk <sip:911@h> \\\"B <sip:102@server> \\\"B",
+			"application/sdp", "", kSdpOffer, "er-835-esc102");
+		EXPECT_EQ(invite->getToNumber(), "102");
+		EXPECT_FALSE(invite->isEmergencyRequest());
+		b.handler->handle(invite);
+		EXPECT_EQ(b.count("INVITE sip:102@", "192.168.79.12"), 1u) << "102 is rung:\n" << b.dump();
+		EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << "nothing may reach the PSAP:\n" << b.dump();
+	}
 }

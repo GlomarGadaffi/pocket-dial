@@ -19,6 +19,7 @@
 #include "IDGen.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
+#include "SipHeaderUtil.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -281,6 +282,102 @@ TEST(RegisteredContact, AQuotedDisplayNameDoesNotHideTheRegisteredContactUri)
 		ASSERT_FALSE(ping.empty());
 		EXPECT_EQ(requestLineOf(ping), std::string("OPTIONS ") + kSnomContactUri + " SIP/2.0");
 	}
+}
+
+TEST(RegisteredContact, AQuotedSipInstanceDoesNotHideTheRegisteredContactUri)
+{
+	// #835: with a quote left open in the display name, the quote that opens
+	// +sip.instance's value (RFC 5626) closed it, so "<urn:uuid:...>" sat
+	// outside quotes and was read as the URI. The stored Contact was lost and
+	// the ping went out without ;line=, which a Snom answers 404.
+	const std::string instance = ";reg-id=1;+sip.instance=\"<urn:uuid:00000000-0000-1000-8000-000413a1b2c3>\"";
+	for (const std::string& contact : {
+			"\"Lobby 55\" TV\" <" + std::string(kSnomContactUri) + ">" + instance,
+			// Controls: a balanced display name, and an open quote in the
+			// parameter itself, after the URI.
+			"\"Snom 370\" <" + std::string(kSnomContactUri) + ">" + instance,
+			"<" + std::string(kSnomContactUri) + ">;reg-id=1;+sip.instance=\"<urn:uuid:0>"})
+	{
+		SCOPED_TRACE(contact);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		auto reg = makeRegister("100", kSnomIp, 1037, "Contact: " + contact + "\r\n");
+		EXPECT_EQ(reg->getContactNumber(), "100");
+		handler.handle(reg);
+
+		handler.tick();
+
+		const std::string ping = findSentTo(sent, addrFor(kSnomIp, 1037), "OPTIONS ");
+		ASSERT_FALSE(ping.empty());
+		EXPECT_EQ(requestLineOf(ping), std::string("OPTIONS ") + kSnomContactUri + " SIP/2.0");
+	}
+	// An open quote with no <...> at all names no URI, as before.
+	EXPECT_TRUE(siphdr::contactUriView("Contact: \"Lobby sip:100@192.168.31.10:1037").empty());
+}
+
+TEST(RegisteredContact, AnUppercaseSchemeContactIsKept)
+{
+	// #835 nit: RFC 3261 s19.1.4, the scheme is case-insensitive. The stored
+	// Contact took only "sip:" and "sips:", so this one was dropped and the
+	// ping lost its ;line=. It is used as the phone registered it.
+	for (const char* uri : {"SIP:100@192.168.31.10:1037;line=h2k6k1ih", "Sip:100@192.168.31.10:1037;line=h2k6k1ih"})
+	{
+		SCOPED_TRACE(uri);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		handler.handle(makeRegister("100", kSnomIp, 1037, std::string("Contact: <") + uri + ">;reg-id=1\r\n"));
+
+		handler.tick();
+
+		const std::string ping = findSentTo(sent, addrFor(kSnomIp, 1037), "OPTIONS ");
+		ASSERT_FALSE(ping.empty());
+		EXPECT_EQ(requestLineOf(ping), std::string("OPTIONS ") + uri + " SIP/2.0");
+	}
+}
+
+TEST(RegisteredContact, TheUriScanPicksABracketOrNothingOnEveryShortLine)
+{
+	// #857 review S2: every line of up to 8 of '"', '\', '<', '>', ';', 'a'.
+	// The URI's '<' is npos or a '<'. With balanced quotes it is the first '<'
+	// outside them; with one left open, a first '<' that no quote precedes
+	// (S1). The stored Contact is a view inside the line.
+	constexpr size_t npos = std::string_view::npos;
+	const char alphabet[] = {'"', '\\', '<', '>', ';', 'a'};
+	char buf[8] = {};
+	size_t lines = 0;
+	size_t bad = 0;
+	std::string firstBad;
+	for (size_t len = 0; len <= sizeof(buf); ++len)
+	{
+		size_t total = 1;
+		for (size_t i = 0; i < len; ++i) total *= sizeof(alphabet);
+		for (size_t n = 0; n < total; ++n, ++lines)
+		{
+			size_t k = n;
+			for (size_t i = 0; i < len; ++i, k /= sizeof(alphabet)) buf[i] = alphabet[k % sizeof(alphabet)];
+			const std::string_view v(buf, len);
+
+			bool quoted = false;
+			size_t first = npos;
+			for (size_t i = 0; i < len; ++i)
+			{
+				if (quoted) { if (v[i] == '\\') ++i; else if (v[i] == '"') quoted = false; }
+				else if (v[i] == '"') quoted = true;
+				else if (v[i] == '<' && first == npos) first = i;
+			}
+			bool open = false;
+			const size_t lt = siphdr::nameAddrOpen(v, open);
+			const std::string_view c = siphdr::contactUriView(v);
+			const bool ok = (lt == npos || v[lt] == '<') && open == quoted && (open || lt == first) &&
+				!(open && first != npos && v.substr(0, first).find('"') == npos && lt != first) &&
+				(c.empty() || (c.data() >= v.data() && c.data() + c.size() <= v.data() + v.size()));
+			if (!ok && bad++ == 0) firstBad = std::string(v);
+		}
+	}
+	EXPECT_EQ(lines, 2015539u);
+	EXPECT_EQ(bad, 0u) << "first: " << firstBad;
 }
 
 TEST(RegisteredContact, RelayedByeIsAddressedToTheCallersRegisteredContact)
