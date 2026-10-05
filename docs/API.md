@@ -320,6 +320,8 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
 | [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster, each row with its `locked` and `shared` flags. |
 | [`/api/registrar`](#post-apiregistrar) | `POST` | High | Gated (+ `X-CSRF`) | Sets the admission mode (`learn`/`secure`; `open` is retired, #500). |
+| [`/api/pnp`](#get-apipnp) | `GET` | Low | Gated | SIP PnP mode and the phones heard on 224.0.1.75 (#826). |
+| [`/api/pnp`](#post-apipnp) | `POST` | Medium | Gated (+ `X-CSRF`) | Sets the PnP mode: `off`/`discover`/`provision` (#826). |
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/registrar/forget-learned`](#post-apiregistrarforget-learned) | `POST` | High | Gated (+ `X-CSRF`) | Forgets every `learned` device at once; `secured` ones stay (#515). |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
@@ -1361,6 +1363,44 @@ curl -s -X POST "http://$DEV/api/registrar" \
 curl -s -X POST "http://$DEV/api/registrar" \
      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
      -d "mode=secure"
+```
+
+### `GET /api/pnp`
+
+SIP Plug-and-Play (Issue #826, [PROVISIONING.md §1.4](PROVISIONING.md)): the mode and the
+phones heard on `224.0.1.75:5060` since boot (16 at most; the least recently seen is
+dropped first). Volatile: the list is not persisted.
+
+```json
+{
+  "attached": true,
+  "mode": "discover",
+  "listening": true, "socketErrno": 0, "netmask": "255.255.255.0",
+  "rx": { "datagrams": 4, "offSubnet": 0, "notPnp": 3, "answered": 1 },
+  "devices": [
+    { "mac": "0004132e08b4", "vendor": "snom", "model": "snom370", "version": "8.7.5.48",
+      "ip": "192.168.12.155", "seen": 3, "lastSeen": 5120, "notified": false }
+  ]
+}
+```
+
+* `lastSeen`: seconds since boot. `notified`: this board has sent it a NOTIFY.
+* `listening` / `socketErrno`: the group socket is open; else the errno of its last failed
+  open or join. `netmask`: what the same-subnet rule compares against.
+* `rx`: datagrams the group socket delivered, and why each was not answered (`offSubnet`,
+  `notPnp`) or that it was (`answered`). `datagrams` at 0 while phones boot means nothing
+  reaches the board: look at the network path (IGMP snooping), not the board.
+* `vendor`, `model`, `version` are what the phone claimed, with anything outside
+  `[A-Za-z0-9 ._+/-]` removed.
+
+### `POST /api/pnp`
+
+Sets the mode: `mode=off` (default; the group socket is closed), `mode=discover` (listen
+and record, never answer) or `mode=provision` (also answer phones this board can serve).
+Persisted. Returns the same body as `GET`.
+
+```bash
+curl -b cookies.txt -H "X-CSRF: $CSRF" -X POST http://192.168.4.1/api/pnp -d "mode=discover"
 ```
 
 ### `POST /api/registrar/device`

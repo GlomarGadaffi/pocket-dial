@@ -6,8 +6,11 @@
 #include "Session.hpp"
 #include "SipMessageFactory.hpp"
 
+#include <array>
+#include <cstdint>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 #if !defined(ESP_PLATFORM) && !defined(ARDUINO)
 #include <thread>
@@ -22,6 +25,12 @@ public:
 
 	// Dashboard access to the SIP engine state
 	RequestsHandler& getHandler() { return _handler; }
+
+	// Issue #826: SIP PnP. Called from the board's 1 s SIP loop (next to
+	// tick()). Opens the 224.0.1.75:5060 socket while PnP is on, closes it
+	// while off, and answers what the responder says to. Non-blocking, no task
+	// of its own, no allocation. A no-op off the board.
+	void pollPnp();
 
 private:
 	// Issue #81: `data` is a zero-copy view into UdpServer::receiveLoop()'s stack
@@ -56,6 +65,21 @@ private:
 	UdpServer _socket;
 	RequestsHandler _handler;
 	SipMessageFactory _messagesFactory;
+
+	// Issue #826: the PnP group socket and its receive buffer (fixed, here
+	// rather than on the SIP task's stack). Only the SIP task touches them.
+	static constexpr int kPnpDrainPerPoll = 8;
+	static constexpr uint32_t kPnpRetrySeconds = 30;
+	bool openPnpSocket(uint32_t now);
+	void closePnpSocket();
+	void sendPnp(const sockaddr_in& dest, std::string_view msg);
+	uint32_t _localIp = 0;           // network byte order
+	int _pnpSock = -1;
+	uint32_t _pnpRetryAt = 0;
+	// A ua-profile SUBSCRIBE is ~500 B. A longer datagram is cut here, and the
+	// parser refuses one whose headers never end (PnpProfile.hpp).
+	static constexpr size_t kPnpRxBytes = 1024;
+	std::array<char, kPnpRxBytes> _pnpRx{};
 
 #if !defined(ESP_PLATFORM) && !defined(ARDUINO)
 	std::thread _tickThread;
