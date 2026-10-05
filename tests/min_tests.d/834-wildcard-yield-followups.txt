@@ -1,0 +1,2 @@
+# EmergencyDialing_test.cpp: 1 (#877 follow-up, Part of #818 and #834: one INVITE is judged against one registration snapshot)
+1

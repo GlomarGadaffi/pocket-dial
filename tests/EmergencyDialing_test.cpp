@@ -818,3 +818,46 @@ TEST(EmergencyDialing, TheHeaderGateAgreesWithTheRouterOnWhichRuleNumbersAreNine
 		}
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #877 follow-up (S1): one INVITE, one registration snapshot. The admission
+// gates ask dialRuleMakesEmergency(), which reads registration (a wildcard 911
+// rule yields to a registered extension), and onInvite() asks it again. The
+// client sweep ran between the two, so a lease that lapsed and was swept in the
+// same pass made the gate judge 102 an extension and refuse a call onInvite
+// would have routed to 911.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(EmergencyDialing, OneInviteIsJudgedAgainstOneRegistrationSnapshot)
+{
+	struct Shape { const char* what; const char* extra; bool multipart; const char* refusal; };
+	int n = 0;
+	for (const Shape& s : {Shape{"Require: 100rel", "Require: 100rel\r\n", false, "SIP/2.0 420"},
+	                       Shape{"a multipart body with a PIDF-LO", "", true, "SIP/2.0 415"}})
+	{
+		SCOPED_TRACE(s.what);
+		++n;
+		{
+			SCOPED_TRACE("102's lease lapsed, and this INVITE's pass sweeps it");
+			Bench b;
+			b.handler->handle(emRegister("102", "192.168.77.12", "em-reg-102"));
+			b.handler->setDialRule("1XX", "trunk", "911", 3);
+			b.handler->expireLeaseForNextSweepForTest("102");
+			b.wire.clear();
+			b.handler->handle(emShapedInvite("102", "192.168.77.11", "em-s1-lapsed-" + std::to_string(n), s.extra, s.multipart));
+			EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
+				<< "102 is no longer registered, so the rule makes this a 911, for the gate as for onInvite:\n" << b.wire.dump();
+			EXPECT_FALSE(b.wire.saw(s.refusal)) << b.wire.dump();
+		}
+		{
+			SCOPED_TRACE("control: 102 is still registered, so both reads see an extension");
+			Bench b;
+			b.handler->handle(emRegister("102", "192.168.77.12", "em-reg-102"));
+			b.handler->setDialRule("1XX", "trunk", "911", 3);
+			b.wire.clear();
+			b.handler->handle(emShapedInvite("102", "192.168.77.11", "em-s1-live-" + std::to_string(n), s.extra, s.multipart));
+			EXPECT_TRUE(b.wire.saw(s.refusal)) << b.wire.dump();
+			EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "") << b.wire.dump();
+		}
+	}
+}
