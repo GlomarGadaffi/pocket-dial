@@ -470,9 +470,10 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	// participant id Telephony later surfaces over the WS — that can be the far leg, on which a
 	// specific-id GET/drop returns 403 (issue #40). Drop/media key off this owned id.
 	std::string ownLeg;
+	telephony::OwnLegSource ownLegSource = telephony::OwnLegSource::FirstControllable;   // #379
 	if (success)
 	{
-		ownLeg = resolveOutboundLeg(respBody, destination);
+		ownLeg = resolveOutboundLeg(respBody, destination, nullptr, &ownLegSource);
 	}
 	else if (requestSent && !telephony::httpResponseParsed(status))
 	{
@@ -519,7 +520,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		{
 			if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(kReconcileDelayMs));
 			int listStatus = 0;
-			ownLeg = resolveOutboundLeg(std::string(), destination, &listStatus);
+			ownLeg = resolveOutboundLeg(std::string(), destination, &listStatus, &ownLegSource);
 			// Stop on a leg, or on any real verdict from 3CX — only an unparsed
 			// response (telephony::httpResponseParsed false) is worth retrying.
 			if (!ownLeg.empty() || telephony::httpResponseParsed(listStatus)) break;
@@ -547,11 +548,13 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		if (ownLegOut) *ownLegOut = ownLeg;   // #100: let the engine bind this call's session now
 		if (!ownLeg.empty())
 		{
+			// #379: the CANCEL may already have ended this leg's session; an upsert for
+			// it that finds no outbound slot is still ours, never an inbound call.
+			const bool ownLegHeld = telephony::ownLegMayBeHeld(ownLegSource);
+			if (ownLegHeld)
 			{
-				// #379: the CANCEL may already have ended this leg's session; an upsert for
-				// it that finds no outbound slot is still ours, never an inbound call.
 				std::lock_guard<std::mutex> lock(_mutex);
-				_ownLegs.note(ownLeg, esp_timer_get_time());
+				_ownLegs.noteNamed(ownLeg, esp_timer_get_time());
 			}
 			// Alloc THIS call's slot (startRxIfNeeded find-or-claims it for ownLeg) + prime the GET
 			// loop, then mark the slot outbound-in-flight so the WS upsets for ownLeg classify as
@@ -584,6 +587,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 					slot->outboundAnswered.store(false, std::memory_order_release);
 					slot->ringing.store(false, std::memory_order_release);
 					slot->outboundActiveSetUs = esp_timer_get_time();
+					slot->ownLegHeld = ownLegHeld;
 				}
 			}
 			else
@@ -926,8 +930,9 @@ pd::ReapDecision TelephonyAnchorClient::reapParkedRxLocked(CallSlot& slot)
 void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 {
 	// #379: 3CX can still upsert our outbound leg once its slot is gone.
-	if (slot.outboundActive.load(std::memory_order_acquire))
+	if (slot.ownLegHeld)
 		_ownLegs.note(slot.participantId, esp_timer_get_time());
+	slot.ownLegHeld = false;
 	slot.participantId.clear();
 	slot.inboundSignaledPartId.clear();
 	slot.farPartId.clear();
@@ -1527,10 +1532,11 @@ static std::string legIdOf(cJSON* elem)
 // re-trigger the wrong-leg 403. If no controllable leg is found we FAIL CLOSED (return "") and
 // let the reconcile/watchdog teardown handle it, rather than drop a guessed id.
 std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecallRespBody, const std::string& /*destination*/,
-                                                       int* listStatusOut)
+                                                       int* listStatusOut, telephony::OwnLegSource* sourceOut)
 {
 	// 0 = the live list was never consulted (result.id answered it, below).
 	if (listStatusOut) *listStatusOut = 0;
+	if (sourceOut) *sourceOut = telephony::OwnLegSource::FirstControllable;   // #379: a guess unless 3CX named it
 
 	// 1) result.id from the makecall response.
 	if (!makecallRespBody.empty())
@@ -1546,6 +1552,7 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 				if (!rid.empty())
 				{
 					ESP_LOGI(TAG, "resolveOutboundLeg: result.id=%s (from makecall response)", rid.c_str());
+					if (sourceOut) *sourceOut = telephony::OwnLegSource::MakecallResult;
 					return rid;
 				}
 			}
@@ -1609,7 +1616,11 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 			{
 				std::string pd;
 				for (const char* p = pdn->valuestring; *p; ++p) if (*p >= '0' && *p <= '9') pd.push_back(*p);
-				if (pd == srcDigits) return id;   // exact own-leg match
+				if (pd == srcDigits)   // exact own-leg match
+				{
+					if (sourceOut) *sourceOut = telephony::OwnLegSource::OwnPartyDn;
+					return id;
+				}
 			}
 		}
 	}
@@ -2519,7 +2530,6 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 		std::string dropLeg;
 		{
 			std::lock_guard<std::mutex> lock(_mutex);
-			_ownLegs.refresh(w.partId, esp_timer_get_time());   // #379: held for the grace after 3CX's Remove
 			CallSlot* s = slotForLocked(w.partId);
 			if (!s)
 			{
@@ -2610,7 +2620,7 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 				std::lock_guard<std::mutex> lock(_mutex);
 				// #379: a leg this PBX created that no outbound slot holds (freed by its drop, or
 				// keyed but not yet marked outbound) is never a new inbound call.
-				ownLeg = !telephony::inboundAnnounceAllowed(_ownLegs, controlLeg, esp_timer_get_time());
+				ownLeg = !telephony::inboundAnnounceAllowed(_ownLegs, controlLeg, esp_timer_get_time(), w.seq);
 				// Find-or-claim the inbound slot so the announce-once flag lives on it (keyed by the
 				// surfaced leg). All slots busy => no slot => no announce (graceful at capacity).
 				CallSlot* s = ownLeg ? nullptr : allocSlotLocked(controlLeg);
@@ -2858,14 +2868,16 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 									std::string controlLegs[POCKETDIAL_MAX_ANCHOR_CALLS];
 									int nLegs = 0;
 									bool ownLeg = false;
+									uint64_t seq = 0;
 									{
 										std::lock_guard<std::mutex> lock(_mutex);
+										seq = ++_wsSeq;   // #379: received after any Remove already taken
 										CallSlot* s = slotForLocked(partId);
 										if (s)
 										{
 											controlLegs[nLegs++] = partId;
 										}
-										else if (!telephony::inboundAnnounceAllowed(_ownLegs, partId, esp_timer_get_time()))
+										else if (!telephony::inboundAnnounceAllowed(_ownLegs, partId, esp_timer_get_time(), seq))
 										{
 											// #379: our own leg with no outbound slot: neither a new inbound
 											// call nor the far leg of another call.
@@ -2965,6 +2977,7 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 											item->controlLeg = controlLeg;
 											item->partId     = partId;
 											item->callerId   = callerId;   // same caller for all (only inbound uses it)
+											item->seq        = seq;
 											handedOff = enqueueWsWork(item);
 										}
 										if (!handedOff)
@@ -2986,6 +2999,15 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 								else if (evTypeNum == TEL_EV_REMOVE)
 								{
 									ESP_LOGI(TAG, "Call control event: Participant Remove %s", partId.c_str());
+									{
+										// #379: 3CX removed the participant, so an upsert received from now on
+										// may be a new call reusing its id. Upserts already queued stay ours.
+										// A live slot's leg is noted first, in case its entry has lapsed.
+										std::lock_guard<std::mutex> lock(_mutex);
+										const CallSlot* s = slotForLocked(partId);
+										if (s && s->ownLegHeld) _ownLegs.note(partId, esp_timer_get_time());
+										_ownLegs.release(partId, ++_wsSeq);
+									}
 									// #43: stopMediaStreams() has a <=2 s rx-join — off the WS task.
 									// placement new(nothrow) returns an initialized pointer; cppcheck misparses it.
 									// cppcheck-suppress legacyUninitvar

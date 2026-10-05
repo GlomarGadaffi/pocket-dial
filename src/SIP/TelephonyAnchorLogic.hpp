@@ -287,88 +287,112 @@ inline bool httpResponseParsed(int status)
 // the leg's call slot, then stalled reconnecting, and an upsert for the leg that
 // matched no slot was announced as a new inbound call (#379 issuecomment-5985911668).
 //
-// Only legs the makecall response named, or that an outbound slot held, are noted,
-// never a leg the PBX merely dropped: dropCall() also drops refused inbound legs, and
-// a PSAP callback refused while a bridge is busy must be announced again on 3CX's
-// next upsert if its drop fails. A PSAP callback or any other genuine inbound call
-// is a new participant id, which this table never holds.
+// Only an id 3CX named as ours is noted (ownLegMayBeHeld below), when the makecall
+// response names it and when its outbound slot is freed; never a leg the PBX merely
+// dropped: dropCall() also drops refused inbound legs, and a PSAP callback refused
+// while a bridge is busy must be announced again on 3CX's next upsert if its drop
+// fails. A genuine inbound call, a PSAP callback among them, is a new participant id.
 //
-// The hold is bounded: kOwnLegGraceUs after the last event noted for the leg, never
-// extended by the upserts it suppresses, so an id 3CX might reuse is at worst
-// announced one grace late. The window it has to span runs from the slot being freed
-// to 3CX's Remove across a stalled drop: performCtrl() makes two attempts with
-// socket operations of up to 2 s each (timeout_ms bounds each operation, not the
-// request) and one cold TLS handshake, about 5-7 s; the trace took 1.1 s. Fixed size:
-// a full table overwrites its least recently seen entry, and an id that does not fit
-// is not recorded; both forget a leg, which errs toward announcing. Not synchronised.
+// Until 3CX's Remove the id names a live participant of ours, so no other call can
+// carry it. The Remove releases it at once: an upsert received after the Remove may be
+// a new call reusing the id, and is announced as before. Only work received before the
+// Remove stays ours, told apart by the WS event number it was queued with. A held-back
+// new call could be lost, not merely delayed: a route point's first upsert is already
+// Connected, and the client's model is that 3CX does not repeat a Connected upsert.
+//
+// Without a Remove the hold lapses kOwnLegGraceUs after the last event noted, never
+// extended by the upserts it suppresses. It spans the slot being freed to 3CX's Remove
+// across a stalled drop: performCtrl() makes two attempts with socket operations of up
+// to 2 s each (timeout_ms bounds each operation, not the request) and one cold TLS
+// handshake, about 5-7 s; the trace took 1.1 s. Fixed size: a full table overwrites its
+// least recently seen entry, and an id that does not fit is not recorded; both forget
+// a leg, which errs toward announcing. Not synchronised.
 inline constexpr int64_t kOwnLegGraceUs = 10'000'000;
 
 template <std::size_t N, std::size_t Len>
 class OwnLegs
 {
 public:
-	void note(std::string_view id, int64_t nowUs)
+	// The makecall response named this leg: ours, even if 3CX removed an earlier
+	// participant with the same id.
+	void noteNamed(std::string_view id, int64_t nowUs)
 	{
-		if (id.empty() || id.size() >= Len) return;
-		Entry* victim = &_e[0];
-		for (Entry& e : _e)
-		{
-			if (id == e.id)
-			{
-				e.seenUs = nowUs;
-				return;
-			}
-			if (age(e) < age(*victim)) victim = &e;
-		}
-		std::memcpy(victim->id, id.data(), id.size());
-		victim->id[id.size()] = '\0';
-		victim->seenUs = nowUs;
+		if (Entry* e = put(id, nowUs)) e->removedSeq = 0;
 	}
 
-	// A later time for a leg still held; a leg not held is not added.
+	// Held from nowUs (our outbound slot was freed); a Remove already seen stands.
+	void note(std::string_view id, int64_t nowUs) { put(id, nowUs); }
+
+	// A later time for a leg still held (its drop has begun); a leg not held is not added.
 	bool refresh(std::string_view id, int64_t nowUs)
 	{
-		if (!holds(id, nowUs)) return false;
-		note(id, nowUs);
+		const std::size_t i = indexOf(id);
+		if (i == N || nowUs - _e[i].seenUs >= kOwnLegGraceUs) return false;
+		_e[i].seenUs = nowUs;
 		return true;
 	}
 
-	bool holds(std::string_view id, int64_t nowUs) const
+	// 3CX removed the participant; wsSeq is that event's number.
+	void release(std::string_view id, uint64_t wsSeq)
 	{
-		if (id.empty()) return false;
-		for (const Entry& e : _e)
-		{
-			if (id == e.id) return nowUs - e.seenUs < kOwnLegGraceUs;
-		}
-		return false;
+		const std::size_t i = indexOf(id);
+		if (i != N && _e[i].removedSeq == 0) _e[i].removedSeq = wsSeq;
 	}
 
-	// RED (#883 review): the API of the Remove release, with the head's behaviour:
-	// a Remove releases nothing.
-	void noteNamed(std::string_view id, int64_t nowUs) { note(id, nowUs); }
-	void release(std::string_view, uint64_t) {}
-	bool holds(std::string_view id, int64_t nowUs, uint64_t) const { return holds(id, nowUs); }
+	// Is an upset received as WS event wsSeq still ours?
+	bool holds(std::string_view id, int64_t nowUs, uint64_t wsSeq) const
+	{
+		const std::size_t i = indexOf(id);
+		return i != N && nowUs - _e[i].seenUs < kOwnLegGraceUs &&
+		       (_e[i].removedSeq == 0 || wsSeq < _e[i].removedSeq);
+	}
 
 private:
 	struct Entry
 	{
-		char    id[Len] = {};
-		int64_t seenUs  = 0;
+		char     id[Len]    = {};
+		int64_t  seenUs     = 0;
+		uint64_t removedSeq = 0;   // the WS event of 3CX's Remove; 0 = none seen
 	};
+
+	std::size_t indexOf(std::string_view id) const   // N when absent
+	{
+		if (id.empty()) return N;
+		for (std::size_t i = 0; i < N; ++i)
+		{
+			if (id == _e[i].id) return i;
+		}
+		return N;
+	}
+
+	Entry* put(std::string_view id, int64_t nowUs)
+	{
+		if (id.empty() || id.size() >= Len) return nullptr;
+		std::size_t i = indexOf(id);
+		if (i == N)
+		{
+			i = 0;
+			for (std::size_t j = 1; j < N; ++j)
+			{
+				if (age(_e[j]) < age(_e[i])) i = j;
+			}
+			std::memcpy(_e[i].id, id.data(), id.size());
+			_e[i].id[id.size()] = '\0';
+			_e[i].removedSeq = 0;
+		}
+		_e[i].seenUs = nowUs;
+		return &_e[i];
+	}
+
 	static int64_t age(const Entry& e) { return e.id[0] != '\0' ? e.seenUs : std::numeric_limits<int64_t>::min(); }
 	Entry _e[N] = {};
 };
 
 using AnchorOwnLegs = OwnLegs<8, 32>;
 
-// May an upset for partId, which no call slot holds as an outbound call, be announced
-// as a new inbound call? Every id the table does not hold is announced as before.
-template <std::size_t N, std::size_t Len>
-inline bool inboundAnnounceAllowed(const OwnLegs<N, Len>& own, std::string_view partId, int64_t nowUs)
-{
-	return !own.holds(partId, nowUs);
-}
-
+// May an upset for partId, received as WS event wsSeq, which no call slot holds as an
+// outbound call, be announced as a new inbound call? Every id the table does not hold is
+// announced as before.
 template <std::size_t N, std::size_t Len>
 inline bool inboundAnnounceAllowed(const OwnLegs<N, Len>& own, std::string_view partId, int64_t nowUs,
                                    uint64_t wsSeq)
@@ -376,15 +400,17 @@ inline bool inboundAnnounceAllowed(const OwnLegs<N, Len>& own, std::string_view 
 	return !own.holds(partId, nowUs, wsSeq);
 }
 
-// RED (#883 review): where makeCall() got its own leg's id; the head holds every one.
+// Where makeCall() got its own leg's id (resolveOutboundLeg).
 enum class OwnLegSource : uint8_t
 {
-	MakecallResult,
-	OwnPartyDn,
-	FirstControllable,
+	MakecallResult,      // result.id in the makecall response
+	OwnPartyDn,          // the controllable leg whose party_dn is our source DN
+	FirstControllable,   // the first controllable leg with no slot: a guess
 };
 
-inline bool ownLegMayBeHeld(OwnLegSource) { return true; }
+// Only an id 3CX named as ours is held. The guess can be a genuine inbound leg that
+// rang while the makecall was pending, since such a leg gets no slot then.
+inline bool ownLegMayBeHeld(OwnLegSource s) { return s != OwnLegSource::FirstControllable; }
 
 }  // namespace telephony
 

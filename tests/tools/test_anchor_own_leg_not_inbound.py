@@ -93,7 +93,7 @@ class AnchorOwnLegNotInboundTest(unittest.TestCase):
         self.assertNotIn("_ownLegs.", self.work[start:end], "a Remove must not hold the id again")
 
     def test_queued_work_carries_its_ws_order(self):
-        seq = self.ws.find("const uint64_t seq = ++_wsSeq;")
+        seq = self.ws.find("seq = ++_wsSeq;")
         self.assertNotEqual(seq, -1, "each upsert takes its WS sequence number under the classifier's lock")
         self.assertLess(seq, self.ws.find(GATE + "partId, "))
         self.assertIn(GATE + "partId, esp_timer_get_time(), seq)", self.ws)
