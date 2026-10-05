@@ -1863,10 +1863,11 @@ private:
 	// the original behaviour unchanged.
 	//
 	// `refusedBeforeDispatchOut` (optional, #878 Phase A): when non-null, a
-	// capacity refusal before anything has left for the anchor (every bridge
-	// busy, the session or virtual-peer pool spent, a 911's worker queue full)
-	// answers nothing: it sets *refusedBeforeDispatchOut and returns false, so
-	// routeEmergencyCall() can still try the trunk.
+	// refusal before anything has left for the anchor (no anchor connected,
+	// every bridge busy, the session or virtual-peer pool spent, a 911's worker
+	// queue full) answers nothing: it sets *refusedBeforeDispatchOut and returns
+	// false, so routeEmergencyCall() can still try the trunk. routeEmergencyCall()
+	// tries it only when the flag is set.
 	bool originateAnchorCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
 		bool respondIfDisconnected, bool* placedOut = nullptr,

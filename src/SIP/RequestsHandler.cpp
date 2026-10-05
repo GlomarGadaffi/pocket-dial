@@ -4512,11 +4512,15 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		// function owns what happens next and the handset never receives two
 		// final responses to one INVITE. NOT std::move: originateAnchorCall
 		// takes its shared_ptr by value, and `data` is still needed below.
-		// #878 Phase A: a refusal before dispatch comes back here (false, nothing
-		// sent), like an anchor that is not connected, and the trunk below takes it.
+		// #878 Phase A: only a refusal that sent nothing (the anchor not
+		// connected, or a capacity refusal before dispatch) sets the flag, and
+		// only then may the trunk below take the call. Any other false return is
+		// the anchor's own answer: never a second route (review S-B3).
 		bool refusedBeforeDispatch = false;
-		if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed,
-			&codecRejected, &refusedBeforeDispatch))
+		const bool owned = originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false,
+			&placed, &codecRejected, &refusedBeforeDispatch);
+		if (!owned && !refusedBeforeDispatch && !codecRejected) placed = false;
+		if (owned || (!refusedBeforeDispatch && !codecRejected))
 		{
 			markEmergency();   // #604
 			// The call leg is enqueued. NOW notify: 47 CFR 9.16(b)(2) wants the
@@ -4820,6 +4824,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		{
 			queueLog("anchor(" + remoteExt + "): trunk call to " + destination +
 				" refused, no anchor client connected", true);
+			if (refusedBeforeDispatchOut) *refusedBeforeDispatchOut = true;   // nothing was sent
 		}
 		return false;
 	}

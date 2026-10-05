@@ -657,7 +657,10 @@ TEST(E911Notify, ACallRefusedForCapacityIsNeverReportedAsRouted)
 // session -- but `placed` stayed true, so the front desk was told ROUTED. The
 // host build drives the same async branch over the loopback client through
 // forceAsyncAnchorForTest(); failNextAnchorWorkerSpawnForTest() is the ESP
-// spawn failure.
+// spawn failure. Since #878 Phase A a 911's job is queued before its session is
+// published or its 180 sent, so its refusal is a refusal before dispatch and
+// goes to the trunk if there is one (none here). An ordinary call still gets
+// 180, then 503.
 // ─────────────────────────────────────────────────────────────────────────────
 
 TEST(E911Notify, AWorkerThatCannotStartIsNeverReportedAsRouted)
