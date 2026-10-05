@@ -32,3 +32,30 @@ TEST(DashboardLearnText, LearnHintSaysTheLockComesWithTheNextRegistration)
 	// device registers it twice.
 	EXPECT_NE(hint.find("if no other phone claimed it first"), std::string::npos) << hint;
 }
+
+// #882: the docs tell the operator to forget a shared or stale row, so the roster
+// must show which row is locked, which is shared and which is plain TOFU. The
+// state cell reads GET /api/registrar's `locked` and `shared`; a Secured row says
+// "secured" and nothing more, since its state already means MAC-locked + digest.
+TEST(DashboardLearnText, RosterShowsWhichRowIsLockedSharedOrPlainTofu)
+{
+	std::string p;
+	for (const auto& part : CGA_INDEX_HTML_PARTS) p.append(part.data, part.size);
+
+	const size_t at = p.find("function renderRegistrar(");
+	ASSERT_NE(at, std::string::npos);
+	const std::string render = p.substr(at, p.find("\n}\n", at) - at);
+
+	EXPECT_NE(render.find("x.locked"), std::string::npos) << "the roster never reads the row's locked flag";
+	EXPECT_NE(render.find("x.shared"), std::string::npos) << "the roster never reads the row's shared flag";
+	for (const char* word : {"locked", "shared", "unlocked"})
+		EXPECT_NE(render.find(std::string("\\u00b7 ") + word), std::string::npos)
+			<< "the state cell never says '" << word << "'";
+
+	const size_t note = p.find("id=\"reg-roster-note\"");
+	ASSERT_NE(note, std::string::npos);
+	const std::string hint = p.substr(note, p.find("</div>", note) - note);
+	EXPECT_NE(hint.find("<strong>locked</strong>"), std::string::npos) << hint;
+	EXPECT_NE(hint.find("<strong>shared</strong>"), std::string::npos) << hint;
+	EXPECT_NE(hint.find("a NAT router, or a phone moved while unlocked"), std::string::npos) << hint;
+}

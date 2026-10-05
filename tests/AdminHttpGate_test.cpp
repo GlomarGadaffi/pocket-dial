@@ -25,6 +25,7 @@
 #include "JsonReader.hpp"    // Issue #430: parse /api/status in the DropProbe tests
 #include "DmaFramePool.hpp"   // Issue #328: /api/status's l2Tx counters
 #include "SipSecretStore.hpp"
+#include "ArpLookup.hpp"      // #882: host ARP stub, to build locked and shared Learn rows
 #include "LoopbackAnchorClient.hpp"   // #652: the loopback emergency seam
 #include "ResetGuard.hpp"
 #include "index_html.h"
@@ -983,6 +984,97 @@ TEST(Registrar, SecureOrForgetByAnExtensionTwoDevicesHoldIs409AndChangesNothing)
 	rows = handler.getAdoptedDevices();
 	ASSERT_EQ(rows.size(), 1u);
 	EXPECT_EQ(rows[0].state, RequestsHandler::DeviceState::Secured);
+}
+
+TEST(Registrar, EachDeviceRowSaysWhetherItIsLockedOrShared)
+{
+	// #882 (S3 of the #852 review): the docs tell the operator to forget a shared
+	// or stale row, and the roster did not say which row that is. Every row of
+	// GET /api/registrar now carries the registrar's own `locked` and `shared`
+	// flags, verbatim. The rows are built by real Learn REGISTERs (host ARP stub),
+	// so the snapshot the endpoint reads is the one admitLearn() refreshed.
+	struct Cleanup
+	{
+		~Cleanup() { ArpLookup::clearMockMacs(); AdminAuth::clearCredential(); }
+	} cleanup;   // also on a failed ASSERT
+	AdminAuth::clearCredential();
+	ArpLookup::clearMockMacs();
+	RequestsHandler handler("192.168.88.254", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+	handler.setLearnLockMinAgeForTest(std::chrono::seconds(0));   // these REGISTERs are microseconds apart
+
+	int seq = 0;
+	auto registerExt = [&](const std::string& ext, const std::string& ip, uint8_t macLast) {
+		sockaddr_in src{};
+		src.sin_family = AF_INET;
+		src.sin_addr.s_addr = inet_addr(ip.c_str());
+		src.sin_port = htons(5060);
+		ArpLookup::setMockMac(src, ArpLookup::Mac{0x02, 0x00, 0x00, 0x00, 0x88, macLast});
+		const std::string id = "r882-" + std::to_string(++seq);
+		handler.handle(RequestsHandler::getMessageFromPool(
+			"REGISTER sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bK" + id + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=" + id + "\r\nTo: <sip:" + ext + "@server>\r\n"
+			"Call-ID: " + id + "\r\nCSeq: " + std::to_string(seq) + " REGISTER\r\n"
+			"Contact: <sip:" + ext + "@" + ip + ":5060>;expires=3600\r\nContent-Length: 0\r\n\r\n", src));
+	};
+	auto macOf = [](uint8_t macLast) {
+		return ArpLookup::toHex12(ArpLookup::Mac{0x02, 0x00, 0x00, 0x00, 0x88, macLast});
+	};
+
+	registerExt("5801", "192.168.88.1", 0x01);   // plain TOFU: seen once
+	registerExt("5802", "192.168.88.2", 0x02);   // locked: the phone's own refresh
+	registerExt("5802", "192.168.88.2", 0x02);
+	registerExt("5803", "192.168.88.3", 0x03);   // shared: one MAC, two extensions
+	registerExt("5804", "192.168.88.3", 0x03);
+	// Secured. secure() leaves the flags as they were, and a Secured row is
+	// MAC-locked and digest-enforced by its state whatever they say.
+	handler.adoptDeviceForTest(macOf(0x04), "5805", RequestsHandler::DeviceState::Secured);
+	handler.adoptDeviceForTest(macOf(0x05), "5806", RequestsHandler::DeviceState::Secured, /*locked=*/true);
+
+	HttpServer server("127.0.0.1", 0, nullptr);
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(port);
+
+	const std::string resp = httpGetRaw(port, "/api/registrar", "pd_session=" + a.cookie);
+	ASSERT_EQ(statusOf(resp), 200) << resp;
+	JsonReader::Value root;
+	std::string err;
+	ASSERT_TRUE(JsonReader::parse(bodyOf(resp), root, err)) << err << "\n" << resp;
+	const auto& rows = root.arrayOr("devices");
+	ASSERT_EQ(rows.size(), 5u) << resp;   // the shared MAC's second extension gets no row (#820)
+
+	// 0 or 1; -1: the key is missing or is not a JSON boolean; -2: no such row.
+	auto flag = [&](const std::string& mac, const char* key) {
+		for (const auto& row : rows)
+		{
+			if (row.stringOr("mac") != mac) continue;
+			const JsonReader::Value* v = row.find(key);
+			return (v && v->type == JsonReader::Value::Type::Bool) ? (v->boolVal ? 1 : 0) : -1;
+		}
+		return -2;
+	};
+	struct Want { uint8_t mac; const char* what; int locked; int shared; };
+	for (const Want& w : {Want{0x01, "plain TOFU", 0, 0}, Want{0x02, "locked", 1, 0},
+	                      Want{0x03, "shared", 0, 1}, Want{0x04, "Secured, never locked", 0, 0},
+	                      Want{0x05, "Secured, locked first", 1, 0}})
+	{
+		EXPECT_EQ(flag(macOf(w.mac), "locked"), w.locked) << w.what << "\n" << resp;
+		EXPECT_EQ(flag(macOf(w.mac), "shared"), w.shared) << w.what << "\n" << resp;
+	}
+
+	// The other fields are as they were.
+	for (const auto& row : rows)
+	{
+		if (row.stringOr("mac") != macOf(0x03)) continue;
+		EXPECT_EQ(row.stringOr("extension"), "5803") << "a shared row keeps the extension it registered first";
+		EXPECT_EQ(row.stringOr("state"), "learned");
+		EXPECT_TRUE(row.boolOr("online"));
+	}
 }
 
 namespace
