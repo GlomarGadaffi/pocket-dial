@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -801,6 +802,122 @@ TEST(E911Notify, AnOrdinaryCallWhoseAnchorLegNeverComesUpIsRefusedOnceAndNotNoti
 
 	EXPECT_EQ(b.countOf("SIP/2.0 503"), 1) << b.dump();
 	EXPECT_EQ(b.indexOf("MESSAGE sip:200@"), -1) << "a 555 dial is not an emergency:\n" << b.dump();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// desmo, #878: a NOT ROUTED notification names the route that failed. "no
+// trunk available" was wrong whenever it was the anchor that failed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+	// A trunk whose SBC is a name nothing has resolved: placeSipTrunkCall()
+	// reads the resolver cache only, so it refuses the call with a 503.
+	SipTrunk::Config unresolvedTrunk()
+	{
+		SipTrunk::Config c;
+		std::snprintf(c.host, sizeof(c.host), "%s", "sbc.carrier.example");
+		c.port = 5060;
+		std::snprintf(c.fromUser, sizeof(c.fromUser), "%s", "trunkuser");
+		c.enabled = true;
+		return c;
+	}
+
+	std::shared_ptr<SipMessage> enInvitePcma(const std::string& fromExt, const std::string& toExt,
+		const std::string& ip, const std::string& callId)
+	{
+		const std::string body =
+			"v=0\r\no=- 0 0 IN IP4 " + ip + "\r\ns=-\r\nc=IN IP4 " + ip + "\r\nt=0 0\r\n"
+			"m=audio 10000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n";
+		const std::string raw =
+			"INVITE sip:" + toExt + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKp" + callId + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=fp" + callId + "\r\n"
+			"To: <sip:" + toExt + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + fromExt + "@" + ip + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, enAddr(ip));
+	}
+
+	void expectOneNotRouted(const NBench& b, const std::string& reason)
+	{
+		EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
+		EXPECT_NE(b.indexOf("NOT ROUTED (" + reason + ")"), -1) << "the notification must name what failed:\n" << b.dump();
+		EXPECT_EQ(b.indexOf("no trunk available"), -1) << b.dump();
+	}
+}
+
+TEST(E911Notify, ANotRoutedNotificationNamesTheRouteThatFailed)
+{
+	const std::string anchor = "the 3CX anchor could not place the call";
+	{
+		SCOPED_TRACE("the anchor worker's makeCall() fails");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.wire.clear();
+		ASSERT_NO_FATAL_FAILURE(dialAndFailTheWorkersMakeCall(b, "911", "en-q5-worker"));
+		expectOneNotRouted(b, anchor);
+	}
+	{
+		SCOPED_TRACE("the anchor's worker queue refuses it");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->forceAsyncAnchorForTest(true);
+		b.handler->failNextAnchorWorkerSpawnForTest();
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-q5-queue"));
+		expectOneNotRouted(b, anchor);
+	}
+	{
+		SCOPED_TRACE("the anchor is down and the trunk refuses it");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->anchorClientForTest()->stop();
+		b.handler->setTrunkConfig(unresolvedTrunk());
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-q5-both"));
+		expectOneNotRouted(b, anchor + "; the trunk refused it");
+	}
+	{
+		SCOPED_TRACE("the anchor is down and there is no trunk");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->anchorClientForTest()->stop();
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-q5-notrunk"));
+		expectOneNotRouted(b, anchor + "; no trunk is configured");
+	}
+	{
+		SCOPED_TRACE("the trunk is the only route and refuses it");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setAnchorPlacesRealCallsForTest(false);
+		b.handler->setTrunkConfig(unresolvedTrunk());
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-q5-trunk"));
+		expectOneNotRouted(b, "the trunk refused it");
+	}
+	{
+		SCOPED_TRACE("no route at all");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setAnchorPlacesRealCallsForTest(false);
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-q5-none"));
+		expectOneNotRouted(b, "no emergency route configured");
+	}
+	{
+		SCOPED_TRACE("no G.711 codec offered");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.wire.clear();
+		b.handler->handle(enInvitePcma("101", "911", "192.168.78.11", "en-q5-codec"));
+		expectOneNotRouted(b, "no G.711 codec offered");
+	}
 }
 
 TEST(E911Format, TruncationLandsOnAUtf8BoundaryNotMidCodepoint)
