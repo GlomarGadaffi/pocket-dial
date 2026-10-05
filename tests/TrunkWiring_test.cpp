@@ -157,10 +157,12 @@ namespace
 			return v;
 		}
 
-		std::string response(const std::string& statusLine, bool withSdp) const
+		// `rtpIp` is the SDP's c= address: where the carrier wants its audio.
+		std::string response(const std::string& statusLine, bool withSdp,
+			const std::string& rtpIp = "203.0.113.9") const
 		{
 			const std::string sdp = withSdp
-				? "v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\n"
+				? "v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 " + rtpIp + "\r\n"
 				  "t=0 0\r\nm=audio 41000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n"
 				  "a=rtpmap:101 telephone-event/8000\r\n"
 				: std::string();
@@ -440,6 +442,199 @@ TEST(TrunkWiring, AnAnswerWithNoUsableMediaHangsTheCarrierUpRatherThanConnectSil
 		<< "the carrier leg is answered and billing; it has to be hung up";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u)
 		<< "and the relay pair released";
+}
+
+// #861: the carrier's answer says where its audio goes, and a forged or broken
+// one must not aim the relay at this host, at loopback, at broadcast or at a
+// multicast group. The same check as an inbound call (#850): the handset is
+// refused 502 and the answered carrier leg is hung up. inet_addr() turned
+// "999.0.113.9" into 255.255.255.255. (c=0.0.0.0 is not here: parseCallerRtp()
+// reads it as "use the sender's address", which is the SBC.)
+TEST(TrunkWiring, AnAnswerNamingAnUnusableRtpAddressIsRefusedRatherThanRelayed)
+{
+	for (const char* ip : { "127.0.0.1", "224.0.0.1", "255.255.255.255", "999.0.113.9", kServerIp })
+	{
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861"));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		b.sent.clear();
+
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, ip), addrFor(kSbcIp)));
+
+		EXPECT_TRUE(b.firstWithTo("200 OK", kHandsetIp).empty()) << ip << ": the handset must not be answered";
+		EXPECT_FALSE(b.firstWithTo("502", kHandsetIp).empty()) << ip << ": it is refused 502";
+		EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << ip << ": the answered carrier leg is hung up";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << ip << ": and the relay pair released";
+	}
+}
+
+// #861 (desmo, 2026-10-03): a 911/933 is never refused over the carrier's RTP
+// address. Its relay goes wherever the answer says, as before the check; the
+// test above, which refuses the same answer on an ordinary call, is the control.
+TEST(TrunkWiring, AnEmergencyCallIsRelayedToWhateverAddressTheCarrierNames)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-861-911"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", /*withSdp=*/true, "127.0.0.1"), addrFor(kSbcIp)));
+
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the 911 caller is connected";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the PSAP leg is not hung up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-911", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("127.0.0.1")) << "the address the carrier named";
+	EXPECT_EQ(ntohs(peer.sin_port), 41000);
+}
+
+// #861: early media is best effort, so a 183 naming an unusable address leaves
+// local ringback and the call alone; a usable 200 still connects it.
+TEST(TrunkWiring, A183NamingAnUnusableRtpAddressLeavesLocalRingback)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-em"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 183 Session Progress", /*withSdp=*/true, "127.0.0.1"), addrFor(kSbcIp)));
+	EXPECT_TRUE(b.firstWith("183 Session Progress").empty()) << "loopback early media is not relayed";
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the call still connects";
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-em", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9"));
+}
+
+// #861 review: the refusal after early media is the same single teardown.
+TEST(TrunkWiring, AGood183ThenAnUnusable200IsRefusedOnce)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-e2"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 183 Session Progress", /*withSdp=*/true), addrFor(kSbcIp)));
+	ASSERT_FALSE(b.firstWithTo("183 Session Progress", kHandsetIp).empty()) << "precondition: early media";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, "127.0.0.1"), addrFor(kSbcIp)));
+
+	EXPECT_EQ(b.countWithTo("502", kHandsetIp), 1u);
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+// #861 review: a carrier on a private network is a usable peer (only this
+// host, loopback, multicast and the like are not).
+TEST(TrunkWiring, APrivateCarrierRtpAddressIsStillRelayed)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-pv"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, "10.0.0.9"), addrFor(kSbcIp)));
+
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty());
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-pv", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("10.0.0.9"));
+}
+
+// #861 review: a second 2xx on a call that is up (a retransmission, a second
+// forked 2xx) is ACKed by SipTrunk and otherwise ignored. It neither moves the
+// audio nor, naming an unusable address, hangs up a call already talking.
+TEST(TrunkWiring, ALaterAnswerToAConnectedCallNeitherMovesItsAudioNorEndsIt)
+{
+	for (const char* ip : { "203.0.113.77", "127.0.0.1" })
+	{
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-2x"));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+		ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+		b.sent.clear();
+
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, ip), addrFor(kSbcIp)));
+
+		EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << ip << ": the carrier leg is not hung up";
+		EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << ip;
+		EXPECT_TRUE(b.firstWithTo("200 OK", kHandsetIp).empty()) << ip << ": the handset is not answered twice";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << ip;
+		sockaddr_in peer{};
+		ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-2x", peer));
+		EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9")) << ip << ": the first answer's address";
+	}
+}
+
+// #861 review: a 183 after the 200 is not early media for anything.
+TEST(TrunkWiring, A183AfterTheAnswerDoesNotMoveTheAudio)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-late"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 183 Session Progress", /*withSdp=*/true, "203.0.113.77"), addrFor(kSbcIp)));
+
+	EXPECT_TRUE(b.firstWith("183 Session Progress").empty()) << "no 183 to the handset after its 200";
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-late", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9"));
+}
+
+// #861 (desmo, 2026-10-03): a 911/933 follows the address in every carrier
+// answer, unchecked, as before: early media, the answer, and a later 2xx.
+TEST(TrunkWiring, AnEmergencyCallFollowsEveryCarrierAnswerUnchecked)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-861-911b"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.sent.clear();
+	sockaddr_in peer{};
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 183 Session Progress", /*withSdp=*/true, "127.0.0.1"), addrFor(kSbcIp)));
+	EXPECT_FALSE(b.firstWithTo("183 Session Progress", kHandsetIp).empty()) << "the early media is relayed";
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-911b", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("127.0.0.1"));
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the 911 caller is connected";
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-911b", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9"));
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", /*withSdp=*/true, "224.0.0.1"), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the PSAP leg is never hung up over an address";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "nor the 911 caller";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-911b", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("224.0.0.1")) << "a later answer is followed, as before #861";
 }
 
 // ── Failure ─────────────────────────────────────────────────────────────────
