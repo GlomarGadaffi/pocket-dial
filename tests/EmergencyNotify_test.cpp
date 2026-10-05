@@ -1073,7 +1073,8 @@ namespace
 {
 	// The carrier's final response to the trunk INVITE the handler sent to the
 	// SBC: that INVITE's own Via, From, Call-ID and CSeq, its To with a tag.
-	std::shared_ptr<SipMessage> carrierResponse(const NBench& b, const std::string& statusLine)
+	std::shared_ptr<SipMessage> carrierResponse(const NBench& b, const std::string& statusLine,
+		bool withSdp = false)
 	{
 		std::string invite;
 		for (const auto& s : b.wire)
@@ -1085,9 +1086,14 @@ namespace
 			if (p == std::string::npos) return std::string();
 			return invite.substr(p + 2, invite.find("\r\n", p + 2) - p - 2);
 		};
+		const std::string sdp = withSdp
+			? "v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\n"
+			  "t=0 0\r\nm=audio 41000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+			: "";
 		const std::string raw = statusLine + "\r\n" + line("Via: ") + "\r\n" + line("From: ") + "\r\n" +
-			line("To: ") + ";tag=carrier879\r\n" + line("Call-ID: ") + "\r\n" + line("CSeq: ") + "\r\n"
-			"Content-Length: 0\r\n\r\n";
+			line("To: ") + ";tag=carrier879\r\n" + line("Call-ID: ") + "\r\n" + line("CSeq: ") + "\r\n" +
+			(withSdp ? "Contact: <sip:911@203.0.113.9:5060>\r\nContent-Type: application/sdp\r\n" : "") +
+			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
 		return RequestsHandler::getMessageFromPool(raw, enAddr("203.0.113.5"));
 	}
 
@@ -1222,4 +1228,45 @@ TEST(E911Notify, A911TheAnchorRefusesForBusyBridgesFallsBackToTheTrunk)
 	EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << b.dump();
 	EXPECT_TRUE(b.handler->anchorBridgeForCallIdForTest("Call-ID: en-sb4-first") != nullptr)
 		<< "the first 911 keeps its bridge";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #878 review S-C2: a final from the carrier after its own 2xx (a stateless
+// forking hop or a broken SBC; RFC 3261 §16.7 forbids it) refuses no 911 still
+// ringing: the PSAP answered it. ROUTED stands and no NOT ROUTED follows. The
+// teardown of the live call that final still causes is #890, not changed here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(E911Notify, ACarrierFinalAfterItsTwoHundredIsNeverReportedNotRouted)
+{
+	{
+		SCOPED_TRACE("a 486 after the carrier's 200");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setAnchorPlacesRealCallsForTest(false);
+		b.handler->setTrunkConfig(dottedQuadTrunk());
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-sc2"));
+		ASSERT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 1) << b.dump();
+		b.handler->handle(carrierResponse(b, "SIP/2.0 200 OK", /*withSdp=*/true));
+		const auto s = b.handler->getSession("Call-ID: en-sc2");
+		ASSERT_TRUE(s.has_value() && s.value()->getState() == Session::State::Connected)
+			<< "precondition: the PSAP answered the 911:\n" << b.dump();
+		b.handler->handle(carrierResponse(b, "SIP/2.0 486 Busy Here"));
+		EXPECT_EQ(b.countOf("ROUTED TO TRUNK"), 1) << b.dump();
+		EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << "the PSAP answered this 911; it was not refused:\n" << b.dump();
+	}
+	{
+		SCOPED_TRACE("negative: a 486 before any 2xx is still told, once");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setAnchorPlacesRealCallsForTest(false);
+		b.handler->setTrunkConfig(dottedQuadTrunk());
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-sc2-neg"));
+		ASSERT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 1) << b.dump();
+		b.handler->handle(carrierResponse(b, "SIP/2.0 486 Busy Here"));
+		EXPECT_EQ(countStarting(b, "SIP/2.0 486"), 1) << b.dump();
+		expectNotRoutedAfterRouted(b, "the trunk refused it (486)");
+	}
 }
