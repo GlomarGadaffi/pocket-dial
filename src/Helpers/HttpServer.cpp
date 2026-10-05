@@ -4694,6 +4694,8 @@ void HttpServer::sendApiRegistrar(int sock)
 		     << "\",\"state\":\""
 		     << ((d.state == RequestsHandler::DeviceState::Secured) ? "secured" : "learned")
 		     << "\",\"online\":" << (d.online ? "true" : "false")
+		     << ",\"locked\":" << (d.locked ? "true" : "false")
+		     << ",\"shared\":" << (d.shared ? "true" : "false")
 		     << "}";
 	}
 	json << "]}";

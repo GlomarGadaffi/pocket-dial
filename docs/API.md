@@ -318,7 +318,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Requires `confirm=ERASE`. Wipes the login credential, the DTMF PIN, every session, AP security, the carrier-API credential table, the DID→extension table, the CDR ring, and (Wi-Fi builds only) Wi-Fi/mode NVS, then reboots on any ESP build. Answers `200` on every build, or `409` `{"error":"emergency call in progress"}` while a 911/933 call is live (#652). |
 | [`/api/ap-security`](#get-apiap-security) | `GET` | Medium | Gated | Reports whether the SoftAP requires WPA2 and returns its passphrase. |
 | [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
-| [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster. |
+| [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster, each row with its `locked` and `shared` flags. |
 | [`/api/registrar`](#post-apiregistrar) | `POST` | High | Gated (+ `X-CSRF`) | Sets the admission mode (`learn`/`secure`; `open` is retired, #500). |
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/registrar/forget-learned`](#post-apiregistrarforget-learned) | `POST` | High | Gated (+ `X-CSRF`) | Forgets every `learned` device at once; `secured` ones stay (#515). |
@@ -1256,8 +1256,10 @@ Reports how a `REGISTER` is admitted, and which phones have been adopted.
   "attached": true,
   "mode": "learn",
   "devices": [
-    { "mac": "805ec079c37f", "extension": "1001", "state": "secured", "online": true },
-    { "mac": "805ec079c380", "extension": "1002", "state": "learned",  "online": false }
+    { "mac": "805ec079c37f", "extension": "1001", "state": "secured", "online": true,  "locked": true,  "shared": false },
+    { "mac": "805ec079c380", "extension": "1002", "state": "learned",  "online": false, "locked": true,  "shared": false },
+    { "mac": "805ec079c381", "extension": "1003", "state": "learned",  "online": true,  "locked": false, "shared": true  },
+    { "mac": "805ec079c382", "extension": "1004", "state": "learned",  "online": true,  "locked": false, "shared": false }
   ]
 }
 ```
@@ -1278,6 +1280,20 @@ Reports how a `REGISTER` is admitted, and which phones have been adopted.
 * `state`: `learned` (adopted on first contact, not yet enforced) or `secured`
   (MAC-locked and digest-enforced for its extension).
 * `online`: volatile registration state; never persisted.
+* `locked`, `shared` (#882): JSON booleans on every row, the registrar's own stored Learn
+  flags (#440), so an operator can tell which row to forget. Read-only: they change no
+  admission decision and are the same on every response that returns the roster.
+  * `locked`: Learn has bound `extension` to this MAC, and another MAC that registers it
+    is refused (`403`). Set by the phone's own later registration, at least 30 s after its
+    first (#515).
+  * `shared`: this MAC registered a second extension while it was unlocked, as phones
+    behind one NAT router do, or as a phone moved to another extension by hand does (#820).
+    The row keeps the extension it was adopted as and never locks; only forgetting the row
+    clears the flag. This is the row to forget when a phone was moved, or when its
+    extension should lock to a different device.
+  * Both `false` on a `learned` row: plain trust-on-first-use, seen but not locked yet.
+  * A `secured` row reports the flags it had when it was secured: `secure` does not change
+    them. It is MAC-locked and digest-enforced by its `state`, whatever `locked` says.
 
 > **Why this endpoint exists.** SIP digest authentication has been implemented and tested
 > for some time, but `setRegistrarMode()` was called from **unit tests only**; nothing in

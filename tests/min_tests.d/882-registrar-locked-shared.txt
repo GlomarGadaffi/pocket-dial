@@ -1,0 +1,2 @@
+# AdminHttpGate_test.cpp + DashboardLearnText_test.cpp: GET /api/registrar rows carry locked and shared, and the roster shows them (#882)
+2

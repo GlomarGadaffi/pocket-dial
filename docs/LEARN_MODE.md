@@ -269,8 +269,9 @@ on whether the phone's own row is the extension's first claim:
   or never will: its phone has not yet registered again 30 s after its first, its device
   has gone, or it is a shared row (a NAT router's first extension, or the old extension of
   a phone re-provisioned while unlocked). Anyone can still register the extension as TOFU,
-  but nobody can lock its phone out. Forget a gone or shared row to let the right phone
-  lock, and forget any other row on that extension you do not recognise, because the
+  but nobody can lock its phone out. Forget a gone or shared row (the roster's State column
+  reads `locked`, `shared` or `unlocked` for each row, and `GET /api/registrar` has the
+  `locked` and `shared` booleans, #882) to let the right phone lock, and forget any other row on that extension you do not recognise, because the
   oldest remaining row becomes the first claim. This holds only while the row stays in the
   device table: a full table (`POCKETDIAL_MAX_CLIENTS`, 32 by default) evicts the oldest
   unlocked row, offline first, to adopt a new MAC, and a row that never locks is one of
@@ -327,8 +328,8 @@ still the first claim, but that extension never locks, so any device on the link
 taking its binding as TOFU. A locked or Secured row is not affected. Before #820 the same
 packet moved the row and let the sender lock the phone out. The answer is Secure. Until it
 can be deployed, the cure is to forget the phone's row (and any row on that extension you
-do not recognise) and let the phone register again; the roster does not show `locked` or
-`shared` yet (#882), so you cannot see which rows this has hit.
+do not recognise) and let the phone register again. The roster shows the rows this has hit:
+they read `shared` (`"shared": true` in `GET /api/registrar`, #882).
 
 ## 6. Edge cases, rollback, and forget
 
@@ -358,13 +359,17 @@ you move a phone, do these together:
 2. **Forget its row, by MAC.** Use the **Forget** button on that row of the dashboard
    roster (it sends the MAC), or `POST /api/registrar/device` with
    `action=forget&target=<MAC>`. By extension the route answers `409` while two rows hold
-   it. The row to forget has the phone's MAC and still shows the old extension.
+   it. The row to forget has the phone's MAC and still shows the old extension. It reads
+   `shared` if the phone was unlocked when you moved it, `locked` if it was locked.
 3. Reboot the phone, or make it re-register. It is adopted afresh on the new extension,
    and its next REGISTER at least 30 s later locks it, if no other row holds that
    extension first. If another MAC already holds the new extension in the roster, find out
    what it is and forget that row too, or it stays the first claim.
 
-The roster does not show `locked` or `shared` yet (#882), so go by MAC and extension.
+The roster's State column (`learned · shared`, `learned · locked`, `learned · unlocked`,
+`secured`) and the `locked` and `shared` booleans of `GET /api/registrar` (#882) tell the
+rows apart: `unlocked` is plain TOFU, `shared` never locks, and a `secured` row is enforced
+by its state. Go by MAC and extension when you forget.
 
 ### Rollback / forget
 - Forget one device: removes its `{MAC, ext}` entry from the device registry
