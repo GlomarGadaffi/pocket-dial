@@ -1,2 +1,2 @@
-# RegistrarLearnLock_test.cpp + AdminHttpGate_test.cpp: Learn-lock follow-ups (#820): a row never moves on an unauthenticated REGISTER, the API refuses an ambiguous extension, the expired-binding, expires=0 and saved-seq pins
-5
+# RegistrarLearnLock_test.cpp + AdminHttpGate_test.cpp: Learn-lock follow-ups (#820): a row never moves on an unauthenticated REGISTER, the API refuses an ambiguous extension, the expired-binding, expires=0 and saved-seq pins, and the moved-phone residual accepted in #852
+6

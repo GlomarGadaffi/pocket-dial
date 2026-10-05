@@ -150,7 +150,7 @@ TEST_F(LearnLockMinAge, ARowLoadedFromNvsLocksAtItsFirstSightingAfterBoot)
 	EXPECT_EQ(admit(2, "5301", t0 + seconds(1)), Decision::Reject);
 }
 
-TEST_F(LearnLockMinAge, AReExtensionedRecordDoesNotLockItsNewExtensionEarly)
+TEST_F(LearnLockMinAge, AMacsOldAgeNeverLocksItsSecondExtension)
 {
 	// Guard. Since #820 a record never takes a second extension (it keeps its
 	// first and is marked shared), and a shared MAC never locks. This fails if

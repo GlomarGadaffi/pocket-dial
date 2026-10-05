@@ -647,7 +647,7 @@ TEST_F(LearnLockTest, AnUnauthenticatedRegisterCannotMoveASecuredDevicesExtensio
 // 201 twice locked P out of its own extension. A row now keeps its extension,
 // locked or not: the MAC is marked shared (it vouched for two extensions) and
 // its row still holds 201's first claim.
-TEST_F(LearnLockTest, AForgedRegisterCannotMoveAnUnlockedRowSoAnotherDeviceCanLockIt)
+TEST_F(LearnLockTest, AForgedRegisterNeverMovesAnUnlockedRowOrLetsAnotherDeviceLockIt)
 {
 	ArpLookup::setMockMac(addrFor("192.168.60.21"), macOf(0x21));
 	ArpLookup::setMockMac(addrFor("192.168.60.66"), macOf(0x66));
@@ -669,9 +669,80 @@ TEST_F(LearnLockTest, AForgedRegisterCannotMoveAnUnlockedRowSoAnotherDeviceCanLo
 	EXPECT_EQ(registerFrom("201", "192.168.60.21").substr(0, 11), "SIP/2.0 200") << "P is locked out of 201";
 }
 
+// #820/#852: the moved-phone residual, accepted by desmo on 2026-10-04 ("852 is
+// a", the #852 review's B1). A phone re-provisioned to another extension while
+// its row was still unlocked keeps that row on its old extension, marked shared,
+// and holds no claim on the new one. So another device, with its own MAC and
+// nothing forged, that registers the new extension twice 30 s apart locks it,
+// and the moved phone is refused there (onRegister answers this Reject with a
+// 403; the lock is saved, so it survives a reboot). Before #820 the row followed
+// the phone, and this took one forged packet first. Secure is the protection;
+// the operator's step is to forget the phone's row when moving it (LEARN_MODE.md
+// §6). This pins today's behaviour on both extensions: if it fails, the residual
+// has changed, and so must the docs that describe it.
+TEST(LearnLockResidual, TheMovedPhoneResidualDesmoAccepted)
+{
+	struct ClearMocks { ~ClearMocks() { ArpLookup::clearMockMacs(); } } clearMocks;   // also on a failed ASSERT
+	using std::chrono::seconds;
+	using Decision = Registrar::AuthDecision;
+	FakePbxEnv env;
+	Registrar reg(env, Registrar::Mode::Learn);
+	const std::chrono::steady_clock::time_point t0{};
+	const auto macOfDevice = [](uint8_t n) { return ArpLookup::Mac{0x02, 0x00, 0x00, 0x00, 0x20, n}; };
+	std::string reason;
+	int cseq = 0;
+	// Device n: source 10.51.20.n, MAC 02:00:00:00:20:n. The LearnLockTest fixture
+	// cannot wait 30 s (real clock), so this drives admitLearn with time points.
+	const auto admit = [&](uint8_t n, const std::string& ext, seconds at) {
+		const std::string ip = "10.51.20." + std::to_string(n);
+		const sockaddr_in src = FakePbxEnv::addr(ip.c_str(), 5060);
+		ArpLookup::setMockMac(src, macOfDevice(n));
+		reason.clear();
+		return reg.admitLearn(std::make_shared<SipMessage>(registerRaw(ext, ip, 5060, 3600, ++cseq), src),
+			ext, reason, t0 + at);
+	};
+	std::vector<Registrar::AdoptedDevice> rows;
+	const auto row = [&](uint8_t n) -> const Registrar::AdoptedDevice* {
+		rows = reg.adoptedDevices();
+		for (const auto& d : rows)
+			if (d.mac == ArpLookup::toHex12(macOfDevice(n))) return &d;
+		return nullptr;
+	};
+	constexpr uint8_t P = 1, X = 2, N = 3;
+
+	// P is adopted on 201, then moved to 202 before it locked 201.
+	ASSERT_EQ(admit(P, "201", seconds(0)), Decision::Accept);
+	ASSERT_EQ(admit(P, "202", seconds(10)), Decision::Accept) << "P's new extension is admitted (TOFU)";
+	const auto* p = row(P);
+	ASSERT_NE(p, nullptr);
+	EXPECT_EQ(p->extension, "201") << "P's row stays on its old extension";
+	EXPECT_TRUE(p->shared);
+	EXPECT_FALSE(p->locked);
+
+	// 201 fails open: P's shared row is its first claim and never locks.
+	EXPECT_EQ(admit(P, "201", seconds(60)), Decision::Accept);
+	ASSERT_NE(row(P), nullptr);
+	EXPECT_FALSE(row(P)->locked) << "a shared row never locks";
+	ASSERT_EQ(admit(X, "201", seconds(61)), Decision::Accept);
+	EXPECT_EQ(admit(X, "201", seconds(100)), Decision::Accept);
+	ASSERT_NE(row(X), nullptr);
+	EXPECT_FALSE(row(X)->locked) << "P's row holds 201's first claim: no device can lock 201";
+
+	// 202 has no claim: N registers it twice, 31 s apart, and locks it.
+	ASSERT_EQ(admit(N, "202", seconds(110)), Decision::Accept);
+	ASSERT_EQ(admit(N, "202", seconds(141)), Decision::Accept);
+	ASSERT_NE(row(N), nullptr);
+	EXPECT_TRUE(row(N)->locked) << "N locked P's new extension: the accepted residual";
+
+	EXPECT_EQ(admit(P, "202", seconds(150)), Decision::Reject) << "P can no longer register its new extension";
+	EXPECT_EQ(reason, "Extension Locked To Another Device") << "the 403's reason phrase";
+	EXPECT_EQ(admit(P, "201", seconds(151)), Decision::Accept) << "P is not locked out of its old extension";
+}
+
 // #820 item 4: the registered address vouches for an ARP miss only while its
 // binding is live. A lease that has lapsed but is not swept yet is no longer the
-// owner's binding, so the miss is asked to retry.
+// owner's binding, so this miss, from an off-link source (the test sets no
+// on-link mock), is asked to retry like anyone else's.
 TEST_F(LearnLockTest, AnExpiredBindingDoesNotVouchForAnArpMiss)
 {
 	ASSERT_NO_FATAL_FAILURE(lockOwner());
@@ -699,7 +770,7 @@ TEST_F(LearnLockTest, TheOwnersDeregisterOnAnArpMissUnbindsAndKeepsTheLock)
 	EXPECT_FALSE(d->shared);
 
 	EXPECT_EQ(registerFrom("201", "192.168.60.21").substr(0, 11), "SIP/2.0 503")
-		<< "with no binding left, a miss from that address is no longer the owner's";
+		<< "with no binding left, an off-link miss from that address is no longer the owner's";
 	ArpLookup::setMockMac(addrFor("192.168.60.66"), macOf(0x66));
 	EXPECT_EQ(registerFrom("201", "192.168.60.66").substr(0, 11), "SIP/2.0 403") << "the lock still holds";
 }
