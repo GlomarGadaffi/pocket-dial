@@ -575,6 +575,12 @@ def per_leg(lines, counter):
     return c
 
 
+def undropped_legs(lines):
+    """Legs with an own-leg line and no drop line yet."""
+    legs, drops = per_leg(lines, "initiated"), per_leg(lines, "dropped")
+    return sorted(leg for leg in legs if not drops[leg])
+
+
 def drop_problems(lines):
     """Every initiated leg is dropped exactly once; no drop failed (syslog is the only witness, S2)."""
     problems = []
@@ -1585,6 +1591,10 @@ def x4_run(run, sc):
         run.pull_pcap("call-%02d" % (i + 1))
         misses = misses + 1 if rec["ref_timeout"] else 0
         if misses >= MAX_NO_REF:
+            # #892: the last leg's drop line follows its stream stop by ~0.2-0.5 s; the abort closes
+            # the syslog capture, so wait the drop window first. A leg still undropped then FAILs.
+            run.watch_call(time.monotonic() + sc["drop_wait_s"],
+                           stop_when=lambda: not undropped_legs(run.syslog.lines()))
             raise run_soak.Abort("INVALID", "%d calls in a row had no ringing reference within %g s (%s): the "
                                  "run stops rather than ring the far end for nothing"
                                  % (misses, sc["ref_timeout_s"], rec["ref_stage"]))
@@ -1628,7 +1638,7 @@ scenario(name="x4_cancel_ringing", issues=("#370", "#681", "#379"),
                "after 3CX lists the far leg as ringing (the 'Upset ... status' syslog line, not the INVITE: "
                "makecall takes seconds); 6104 holds the S1 pin and detects phantoms",
          uas={"caller": "6101", "detector": PIN_UA}, calls=30, cancel_ms=(600, 1400), ref_timeout_s=8.0,
-         call_cap_s=30, gap_s=12.0, path_counter="rx554_window", ring_required=True,
+         call_cap_s=30, gap_s=12.0, drop_wait_s=5.0, path_counter="rx554_window", ring_required=True,
          judge=x4_judge)(x4_run)
 
 

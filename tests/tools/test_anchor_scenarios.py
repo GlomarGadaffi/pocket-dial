@@ -754,6 +754,7 @@ class FakeBoard(FakePbx):
         self.no_upset_calls = set()       # call indexes that never log an Upset line
         self.no_leg_calls = set()         # call indexes whose makecall response never comes (no own-leg line)
         self.drop_delay_s = 0.0           # a CANCEL that beat the leg: its drop follows the leg by this long
+        self.cancel_drop_delay_s = 0.0    # #892: a CANCEL of a live leg: its drop follows the CANCEL by this long
         self.drop_counts = {}             # call index -> number of drop lines (default 1)
         self.drop_failed_calls = set()    # call indexes whose drop also logs a failure line
         self.inbound_calls = set()        # call indexes whose leg is announced "Inbound call on DN" after its drop
@@ -878,7 +879,10 @@ class FakeBoard(FakePbx):
         c["cancelled"] = True
         self._send(self._resp(c["req"], 487, "Request Terminated", to_tag=c["tag"]), c["addr"])
         if c.get("leg_up"):
-            self._drop(c)
+            if self.cancel_drop_delay_s > 0:
+                threading.Timer(self.cancel_drop_delay_s, self._drop_later, (c,)).start()
+            else:
+                self._drop(c)
         if self.reboot_after_call == c["i"]:
             self.uptime_base = -10**6
 
@@ -1208,6 +1212,25 @@ class RunTest(unittest.TestCase):
         self.assertEqual(len(self.calls()), 2, "the third call is never placed")
         self.assertEqual(len(self.board.invite_users), 2)
         self.assertIn("2 calls in a row had no ringing reference", out)
+
+    def test_x4_the_no_reference_stop_waits_for_the_last_legs_late_drop(self):
+        # #892: the stop fell on the last call and its drop line came ~0.3 s later
+        self.board.upset_status = None
+        self.board.cancel_drop_delay_s = 0.3
+        rc, out = self.go(overrides={"ref_timeout_s": 0.5, "calls": 3, "drop_wait_s": 2.0})
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(len(self.calls()), 2)
+        self.assertNotIn("never dropped", out)
+        self.assertEqual(self.manifest["fail_reasons"], [])
+        self.assertEqual(self.manifest["log_counters"]["dropped"], 2)
+
+    def test_x4_the_no_reference_stop_still_fails_a_leg_never_dropped(self):
+        self.board.upset_status = None
+        self.board.cancel_drop_delay_s = 0.3
+        self.board.undropped_calls = {1}
+        rc, out = self.go(overrides={"ref_timeout_s": 0.5, "calls": 3, "drop_wait_s": 1.0})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("leg 42 was initiated but never dropped", out)
 
     def test_x4_a_miss_between_hits_does_not_stop_the_run(self):
         self.board.no_upset_calls = {0, 2}
