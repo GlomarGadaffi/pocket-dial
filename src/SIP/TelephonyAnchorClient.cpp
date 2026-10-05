@@ -2841,15 +2841,18 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 			         data->data_len, data->payload_offset, data->payload_len);
 			if (data->op_code == 0x01 && data->data_ptr != nullptr && data->data_len > 0)
 			{
-				std::string rawDump(data->data_ptr, data->data_len);
-				ESP_LOGD(TAG, "WS payload: %s", rawDump.c_str());   // #100: ESP_LOGD — full-JSON dump flooded UART at multi-call scale
+				// #465: printed straight from the frame buffer. This used to copy the payload into a
+				// std::string on EVERY text frame just to feed this ESP_LOGD, which the release log
+				// level compiles out -- the copy (0.2-1 KB of internal DRAM) happened anyway.
+				// (#100: ESP_LOGD, not LOGI -- a full-JSON dump flooded UART at multi-call scale.)
+				ESP_LOGD(TAG, "WS payload: %.*s", data->data_len, data->data_ptr);
 			}
 
 			if (data->op_code == 0x01 && data->data_ptr != nullptr && data->data_len > 0)
 			{
-				// Received text data from WSS
-				std::string payload(data->data_ptr, data->data_len);
-				cJSON* root = cJSON_Parse(payload.c_str());
+				// Received text data from WSS. #465: parsed in place -- the frame buffer is not
+				// NUL-terminated, which was the only reason a std::string copy preceded this.
+				cJSON* root = cJSON_ParseWithLength(data->data_ptr, static_cast<size_t>(data->data_len));
 				if (!root) break;
 				CJsonDeleter deleter{root};
 
