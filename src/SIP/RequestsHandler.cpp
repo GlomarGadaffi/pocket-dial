@@ -975,6 +975,20 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				[&request](char* buf, std::size_t cap) { return request->serializeInto(buf, cap); });
 		}
 
+		// #877 follow-up (S1): the client sweep runs BEFORE the admission gates.
+		// They ask dialRuleMakesEmergency(), which reads registration (a wildcard
+		// 911 rule yields to a registered extension), and onInvite() asks it
+		// again; with the sweep between them one INVITE could be judged against
+		// two snapshots. The sender is still marked active first, so the packet
+		// that shows it alive never gets it pruned.
+		auto client = findClientByAddress(request->getSource());
+		if (client.has_value())
+		{
+			client.value()->markActive();
+		}
+
+		maybeSweep();
+
 		// ── SDP admission gate (docs/THREAT_MODEL.md T-7) ──────────────────────
 		// Every SDP body is structurally checked HERE, once, before any handler
 		// decodes it and before it can be relayed to a peer phone -- initial
@@ -1047,14 +1061,6 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				sdpRefused = true;
 			}
 		}
-
-		auto client = findClientByAddress(request->getSource());
-		if (client.has_value())
-		{
-			client.value()->markActive();
-		}
-
-		maybeSweep();
 
 		// RFC 4733 key presses captured on the media tasks since the last pass.
 		// Drained HERE as well as in tick() for two reasons: whenever any SIP
