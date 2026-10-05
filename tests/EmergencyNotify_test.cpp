@@ -871,7 +871,8 @@ TEST(E911Notify, ANotRoutedNotificationNamesTheRouteThatFailed)
 		b.handler->failNextAnchorWorkerSpawnForTest();
 		b.wire.clear();
 		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-q5-queue"));
-		expectOneNotRouted(b, anchor);
+		// #878 Phase A: a refusal before dispatch now tries the trunk; there is none.
+		expectOneNotRouted(b, anchor + "; no trunk is configured");
 	}
 	{
 		SCOPED_TRACE("the anchor is down and the trunk refuses it");
@@ -953,4 +954,105 @@ TEST(E911Format, TruncationLandsOnAUtf8BoundaryNotMidCodepoint)
 		}
 		i += need + 1;
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #878 Phase A (desmo: "YES, fall back to the trunk"; the coordinator scoped it
+// to refusals before dispatch). An anchor refusal before anything has left for
+// 3CX, with nothing answered yet, hands the 911 to the trunk, as an anchor that
+// is not connected already does. Driven by the worker-queue refusal on the async
+// anchor. A failure after dispatch (Phase B) is not retried.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+	SipTrunk::Config dottedQuadTrunk()
+	{
+		SipTrunk::Config c;
+		std::snprintf(c.host, sizeof(c.host), "%s", "203.0.113.5");   // RFC 5737 TEST-NET-3
+		c.port = 5060;
+		std::snprintf(c.fromUser, sizeof(c.fromUser), "%s", "trunkuser");
+		c.enabled = true;
+		return c;
+	}
+
+	// Wire entries whose first line starts with `start`.
+	int countStarting(const NBench& b, const std::string& start)
+	{
+		int n = 0;
+		for (const auto& s : b.wire)
+			if (s.rfind(start, 0) == 0) ++n;
+		return n;
+	}
+
+	// A 911 (or `to`) from 101 on the async anchor whose worker queue refuses it.
+	void dialRefusedBeforeDispatch(NBench& b, const std::string& to, const std::string& callId)
+	{
+		b.handler->forceAsyncAnchorForTest(true);
+		b.handler->failNextAnchorWorkerSpawnForTest();
+		b.wire.clear();
+		b.handler->handle(enInvite("101", to, "192.168.78.11", callId));
+	}
+}
+
+TEST(E911Notify, A911TheAnchorRefusesBeforeDispatchFallsBackToTheTrunk)
+{
+	{
+		SCOPED_TRACE("the trunk takes it");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setTrunkConfig(dottedQuadTrunk());
+		dialRefusedBeforeDispatch(b, "911", "en-pa-ok");
+		EXPECT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 1) << "the trunk must carry it:\n" << b.dump();
+		EXPECT_EQ(countStarting(b, "SIP/2.0 180"), 1) << "one 180 and one dialog: the anchor answered nothing:\n" << b.dump();
+		EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 0) << b.dump();
+		EXPECT_EQ(countStarting(b, "MESSAGE sip:200@"), 1) << "exactly one notification:\n" << b.dump();
+		EXPECT_EQ(b.countOf("ROUTED TO TRUNK (the 3CX anchor could not place the call)"), 1) << b.dump();
+		EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << b.dump();
+		const auto s = b.handler->getSession("Call-ID: en-pa-ok");
+		EXPECT_TRUE(s.has_value()) << "one session, the trunk's";
+		if (s.has_value())
+		{
+			EXPECT_TRUE(s.value()->isTrunk());
+			EXPECT_FALSE(s.value()->isAnchor());
+			EXPECT_TRUE(s.value()->isEmergency()) << "the trunk path a dialed 911 takes flags it";
+		}
+		EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 1u);
+	}
+	{
+		SCOPED_TRACE("no trunk is configured");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		dialRefusedBeforeDispatch(b, "911", "en-pa-none");
+		EXPECT_EQ(countStarting(b, "SIP/2.0 180"), 0) << "refused before dispatch: nothing rang:\n" << b.dump();
+		EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 1) << b.dump();
+		expectOneNotRouted(b, "the 3CX anchor could not place the call; no trunk is configured");
+		EXPECT_FALSE(b.handler->getSession("Call-ID: en-pa-none").has_value());
+	}
+	{
+		SCOPED_TRACE("the trunk refuses it too");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setTrunkConfig(unresolvedTrunk());
+		dialRefusedBeforeDispatch(b, "911", "en-pa-both");
+		EXPECT_EQ(countStarting(b, "SIP/2.0 180"), 0) << b.dump();
+		EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 1) << b.dump();
+		expectOneNotRouted(b, "the 3CX anchor could not place the call; the trunk refused it");
+		EXPECT_FALSE(b.handler->getSession("Call-ID: en-pa-both").has_value());
+		EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 0u);
+	}
+}
+
+TEST(E911Notify, AnOrdinaryCallTheAnchorRefusesBeforeDispatchIsNotRetriedOnTheTrunk)
+{
+	// Negative: a 555 dial with the same refusal and a trunk configured is
+	// answered as before (180, then 503) and never reaches the carrier.
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.handler->setTrunkConfig(dottedQuadTrunk());
+	dialRefusedBeforeDispatch(b, "555", "en-pa-555");
+	EXPECT_EQ(countStarting(b, "SIP/2.0 180"), 1) << b.dump();
+	EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(countStarting(b, "INVITE sip:"), 0) << "no trunk retry for an ordinary call:\n" << b.dump();
+	EXPECT_EQ(countStarting(b, "MESSAGE sip:200@"), 0) << b.dump();
 }
