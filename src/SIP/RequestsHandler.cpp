@@ -12864,8 +12864,10 @@ void RequestsHandler::onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status)
 		: (inv ? std::string(inv->getFromNumber()) : std::string());
 	const std::string to   = inv ? std::string(inv->getToNumber()) : std::string();
 
-	// #879: read before endCall() releases the session.
+	// #879: read before endCall() releases the session, as is the state: a
+	// final after the carrier's 2xx refuses no 911 still ringing (S-C2).
 	const std::string_view emergencyNumber = sit->second->getEmergencyNumber();
+	const bool stillRinging = sit->second->getState() == Session::State::Invited;
 
 	// Answer the still-ringing handset BEFORE tearing down: endCall() sends no
 	// final response, so skipping this leaves the phone ringing at a call that
@@ -12876,11 +12878,14 @@ void RequestsHandler::onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status)
 
 	// #879 (#878 review B-BLK-1): a 911/933 the trunk took was notified ROUTED
 	// when it was placed, so its failure is told too, once: this fires once per
-	// dialog, and a handset that hung up first has no session here. A ringing
-	// 911 is never timed out (#712), so a 408 is a carrier that never answered
-	// the INVITE at all, or its own 408. With a real anchor configured, the
-	// trunk only ever carries a 911 the anchor could not place.
-	if (!emergencyNumber.empty())
+	// dialog, and a handset that hung up first has no session here. Only a 911
+	// that drew a 180 or 183 is exempt from the trunk's timeout (#712), so a
+	// 408 is the carrier's own, or a 911 that drew no provisional, or only a
+	// 100, 181 or 182 (those never reach SipTrunk, #889). A final after the
+	// carrier's 2xx tells nothing: the PSAP answered (its teardown is #890).
+	// With a real anchor configured, the trunk only ever carries a 911 the
+	// anchor could not place.
+	if (!emergencyNumber.empty() && stillRinging)
 	{
 		pbx::EmergencyDial em = pbx::classifyEmergencyDial(to);
 		std::string dialed = to;
