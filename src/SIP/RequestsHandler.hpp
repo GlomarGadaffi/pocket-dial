@@ -1867,7 +1867,9 @@ private:
 	// every bridge busy, the session or virtual-peer pool spent, a 911's worker
 	// queue full) answers nothing: it sets *refusedBeforeDispatchOut and returns
 	// false, so routeEmergencyCall() can still try the trunk. routeEmergencyCall()
-	// tries it only when the flag is set.
+	// tries it only when the flag is set. So every false return must either
+	// answer the INVITE or set the flag: one that does neither leaves the caller
+	// with no final response, and each retransmission re-routes and re-notifies.
 	bool originateAnchorCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
 		bool respondIfDisconnected, bool* placedOut = nullptr,
