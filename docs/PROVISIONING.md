@@ -384,16 +384,18 @@ None of the four has been tested against a real handset of any vendor.
 
 ## 3. Extension assignment
 
-There is one mode, and it is not configurable: **the extension is whatever that MAC last
-successfully registered as.** `admitLearn()` adopts `{mac, ext, Learned}` on first sight and
-keeps the extension in sync if the phone later re-registers under a different AOR
-(`Registrar.cpp:188-194`).
+There is one mode, and it is not configurable: **the extension is the one that MAC was
+adopted as.** `admitLearn()` adopts `{mac, ext, Learned}` on first sight, and a later
+REGISTER under a different AOR never changes it (#820; see the re-sync bullet below).
 
 Consequences:
 
 * **There is no way to pre-assign an extension to a MAC.** No admin endpoint accepts a
-  MAC→extension pair (§0). To move a phone to a different extension you change it on the
-  phone and let it re-register; the registry follows.
+  MAC→extension pair (§0). To move a phone to a different extension, change it on the
+  phone, **forget its row** by MAC (the **Forget** button on its row of the dashboard
+  roster, or `POST /api/registrar/device` with `action=forget&target=<MAC>`), then let it
+  re-register: it is adopted afresh on the new extension. The registry does not follow on
+  its own; see the re-sync bullet below and [LEARN_MODE.md](LEARN_MODE.md) §6.
 * The registry is bounded by `POCKETDIAL_MAX_CLIENTS` (32 by default): `admitLearn()`
   refuses a new MAC with "Device Table Full" past that, so a flood of distinct MACs cannot
   grow the heap without limit (`Registrar.cpp:171-178`). Because the registry is bounded by
@@ -412,10 +414,14 @@ Consequences:
   Do not assign any of the above.
 * **No re-sync branch any more (#820).** A MAC already adopted under one extension that
   REGISTERs under a different AOR keeps its stored extension: the other AOR is admitted as
-  TOFU and the MAC is marked shared. Before #820 `admitLearn()` rewrote the stored extension,
-  so one REGISTER with a phone's source IP forged also changed the extension this endpoint
-  served to that phone. Now a phone moved to another extension by hand gets its old one back
-  from its `.cfg` until its row is forgotten (it is not locked out: its own row never blocks it).
+  TOFU, and an unlocked MAC is marked shared. Before #820 `admitLearn()` rewrote the stored
+  extension, so one REGISTER with a phone's source IP forged also changed the extension this
+  endpoint served to that phone. Now a phone moved to another extension by hand, without its
+  row being forgotten, gets its old extension back from its `.cfg`, and it holds no claim on
+  the new one: another device that registers the new extension twice, at least 30 s apart,
+  locks it, and the phone then gets `403` there. desmo accepted this residual on 2026-10-04
+  (#852). **Forget the phone's row when you move it** (above). The roster does not show
+  `locked` or `shared` yet (#882).
 * **`forget` re-arms adoption.** `POST /api/registrar/device` with `action=forget` removes the
   record; a later REGISTER in Learn mode re-learns it (`Registrar.hpp:83-85`).
 

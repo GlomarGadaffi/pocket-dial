@@ -360,10 +360,15 @@ Registrar::AuthDecision Registrar::admitLearn(
 	//                            A younger one is accepted, unlocked.
 	//   KNOWN mac, other ext   -> mark shared (phones behind one NAT router all
 	//                            resolve to the router's MAC); a shared MAC never
-	//                            locks. A re-provisioned phone looks the same and
-	//                            is also left unlocked -- fail open, not locked out.
-	//                            The record keeps its extension, locked or not
-	//                            (#820); the other extension is plain TOFU.
+	//                            locks. The record keeps its extension, locked or
+	//                            not (#820); the other extension is plain TOFU,
+	//                            with no row. So a phone re-provisioned while
+	//                            unlocked keeps its old row (shared) and holds no
+	//                            claim on its new extension: another device that
+	//                            registers that one twice, 30 s apart, locks it,
+	//                            and the phone then gets 403. Accepted (desmo,
+	//                            2026-10-04, #852); Secure is the protection, and
+	//                            the operator forgets the old row on a move.
 	//   KNOWN + Secured mac    -> enforce digest (same path as secure mode), and
 	//                            never touch its record first (#507).
 	//   ARP miss, ext Secured  -> enforce digest; never accept on a miss (#507).
@@ -784,8 +789,8 @@ void Registrar::loadDevices()
 					const int flags = atoi(rec[3].c_str());
 					r.locked = (flags & 1) != 0;
 					r.shared = (flags & 2) != 0;
-					// Clamped: a saved UINT32_MAX would wrap _nextSeq to 0 below, and
-					// every later adoption would then sort as the oldest (evicted first).
+					// loadedSeq() clamps it: a saved UINT32_MAX would wrap _nextSeq to 0,
+					// and every later adoption would then sort as the oldest (evicted first).
 					savedSeq = rec[4].c_str();
 				}
 				r.seq = loadedSeq(savedSeq, _nextSeq);
