@@ -191,6 +191,20 @@ namespace
 
 		void send(const std::string& raw, const char* ip) { handler.handle(fromWire(raw, ip)); }
 
+		void reg(const std::string& ext, const char* ip)
+		{
+			send(
+				"REGISTER sip:server SIP/2.0\r\n"
+				"Via: SIP/2.0/UDP " + std::string(ip) + ":5060;branch=z9hG4bKct845r" + ext + "\r\n"
+				"From: <sip:" + ext + "@server>;tag=ct845r" + ext + "\r\n"
+				"To: <sip:" + ext + "@server>\r\n"
+				"Call-ID: ct845-reg-" + ext + "\r\n"
+				"CSeq: 1 REGISTER\r\n"
+				"Contact: <sip:" + ext + "@" + std::string(ip) + ":5060>;expires=3600\r\n"
+				"Content-Length: 0\r\n\r\n", ip);
+			sent.clear();
+		}
+
 		// The first message sent to `ip` whose first line contains `needle`.
 		std::string first(const std::string& needle, const char* ip) const
 		{
@@ -382,5 +396,196 @@ TEST(SingleContentType, AnInviteWithNoContentTypeGetsExactlyOneOnEveryPath)
 	{
 		SCOPED_TRACE("trunk 200");
 		expectOwnSdpUnder(ok, kSdpType);
+	}
+}
+
+// ── Answers that carry another party's SDP, or the hold SDP ──────────────────
+//
+// Park, retrieve, pickup and the 777 echo copy the request and put an SDP into
+// the copy, so the answer kept the request's Content-Type lines. Two shapes
+// reach them with no emergency yield: a delayed offer (no body, so no
+// Content-Type), answered with SDP and no Content-Type (RFC 3261 §20.15); and
+// text/plain then application/sdp, which the gate reads by its last line.
+
+namespace
+{
+	constexpr const char* kTargetIp = "192.168.84.60";   // ext 100
+	constexpr const char* kOtherIp  = "192.168.84.51";   // ext 501
+	constexpr const char* kPickerIp = "192.168.84.52";   // ext 102
+
+	struct Shape
+	{
+		const char* name;
+		const char* typeLines;
+		bool offer;
+	};
+	const Shape kShapes[] = {
+		{"delayed offer", "", false},
+		{"text/plain then application/sdp", "Content-Type: text/plain\r\nContent-Type: application/sdp\r\n", true},
+	};
+
+	// An INVITE from `ext` at `ip`, with `typeLines` and an SDP offer or none.
+	std::string inviteAs(const std::string& ext, const char* ip, const std::string& to,
+		const std::string& callId, const std::string& typeLines, bool offer)
+	{
+		const std::string body = offer ? offerFrom(ip) : std::string();
+		return
+			"INVITE sip:" + to + "@" + std::string(kServerIp) + " SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(ip) + ":5060;branch=z9hG4bK" + callId + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=f" + callId + "\r\n"
+			"To: <sip:" + to + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + ext + "@" + std::string(ip) + ":5060>\r\n"
+			"Accept: application/sdp\r\n" + typeLines +
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	}
+
+	// An SDP whose connection line is `cLine`, whole, under exactly one
+	// Content-Type: application/sdp.
+	void expectSdpUnderOneSdpType(const std::string& answer, const std::string& cLine)
+	{
+		EXPECT_EQ(contentTypeLines(answer), std::vector<std::string>{kSdpType}) << answer;
+		const std::string body = bodyOf(answer);
+		EXPECT_EQ(body.rfind("v=0\r\n", 0), 0u) << answer;
+		EXPECT_NE(body.find("\r\n" + cLine + "\r\n"), std::string::npos) << answer;
+		EXPECT_EQ(headerValue(answer, "Content-Length"), std::to_string(body.size())) << answer;
+	}
+
+	std::string cLineOf(const char* ip) { return "c=IN IP4 " + std::string(ip); }
+
+	// Ext 500 calls 100; 102 shares 100's pickup group.
+	void ringOneHundred(Rig& r, const std::string& typeLines, bool offer)
+	{
+		r.reg("100", kTargetIp);
+		r.reg("102", kPickerIp);
+		r.handler.setRingGroup("600", "100,102", "ringall");
+		r.send(inviteAs("500", kCallerIp, "100", "ct845-ring", typeLines, offer), kCallerIp);
+		r.sent.clear();
+	}
+}
+
+TEST(SingleContentType, AParkIsAnsweredWithItsHoldSdpUnderOneSdpContentType)
+{
+	for (const Shape& s : kShapes)
+	{
+		SCOPED_TRACE(s.name);
+		Rig r;
+		r.send(inviteAs("500", kCallerIp, "700", "ct845-park", s.typeLines, s.offer), kCallerIp);
+		const std::string ok = answerOrReport(r, "SIP/2.0 200");
+		ASSERT_FALSE(ok.empty());
+		expectSdpUnderOneSdpType(ok, cLineOf(kServerIp));
+	}
+}
+
+TEST(SingleContentType, ARetrieveIsAnsweredWithTheParkedSdpUnderOneSdpContentType)
+{
+	for (const Shape& s : kShapes)
+	{
+		SCOPED_TRACE(s.name);
+		Rig r;
+		r.reg("501", kOtherIp);
+		r.send(inviteAs("501", kOtherIp, "700", "ct845-parked", "Content-Type: application/sdp\r\n", true), kOtherIp);
+		r.reg("102", kPickerIp);
+		r.send(inviteAs("102", kPickerIp, "700", "ct845-retrieve", s.typeLines, s.offer), kPickerIp);
+		const std::string ok = r.first("SIP/2.0 200", kPickerIp);
+		ASSERT_FALSE(ok.empty()) << "no 200 to the retriever:\n" << r.dump();
+		expectSdpUnderOneSdpType(ok, cLineOf(kOtherIp));
+	}
+}
+
+TEST(SingleContentType, APickedUpCallerIsAnsweredWithThePickersSdpUnderOneSdpContentType)
+{
+	for (const Shape& s : kShapes)
+	{
+		SCOPED_TRACE(s.name);
+		Rig r;
+		ringOneHundred(r, s.typeLines, s.offer);
+		r.send(inviteAs("102", kPickerIp, "**100", "ct845-pick", "Content-Type: application/sdp\r\n", true), kPickerIp);
+		const std::string ok = answerOrReport(r, "SIP/2.0 200");
+		ASSERT_FALSE(ok.empty());
+		expectSdpUnderOneSdpType(ok, cLineOf(kPickerIp));
+	}
+}
+
+TEST(SingleContentType, APickerIsAnsweredWithTheCallersSdpUnderOneSdpContentType)
+{
+	for (const Shape& s : kShapes)
+	{
+		SCOPED_TRACE(s.name);
+		Rig r;
+		ringOneHundred(r, "Content-Type: application/sdp\r\n", true);
+		r.send(inviteAs("102", kPickerIp, "**100", "ct845-pick", s.typeLines, s.offer), kPickerIp);
+		const std::string ok = r.first("SIP/2.0 200", kPickerIp);
+		ASSERT_FALSE(ok.empty()) << "no 200 to the picker:\n" << r.dump();
+		expectSdpUnderOneSdpType(ok, cLineOf(kCallerIp));
+	}
+}
+
+// The echo hands back the caller's own offer. A delayed offer has none to echo,
+// so only the two-line shape applies here.
+TEST(SingleContentType, TheEchoTestAnswersUnderOneSdpContentType)
+{
+	Rig r;
+	r.send(inviteAs("500", kCallerIp, "777", "ct845-echo", kShapes[1].typeLines, true), kCallerIp);
+	const std::string ok = answerOrReport(r, "SIP/2.0 200");
+	ASSERT_FALSE(ok.empty());
+	expectSdpUnderOneSdpType(ok, cLineOf(kCallerIp));
+}
+
+// When a ring-all member answers, the CANCEL to every other member is a copy
+// of the stored INVITE, so it carried the caller's SDP. CallForker's
+// buildCancel() already clears it.
+TEST(SingleContentType, ARingAllAnswerCancelsTheOtherMembersWithNoBody)
+{
+	Rig r;
+	r.reg("100", kTargetIp);
+	r.reg("102", kPickerIp);
+	r.handler.setRingGroup("600", "100,102", "ringall");
+	r.send(inviteAs("500", kCallerIp, "600", "ct845-group", "Content-Type: application/sdp\r\n", true), kCallerIp);
+	const std::string fork = r.first("INVITE ", kTargetIp);
+	ASSERT_FALSE(fork.empty()) << r.dump();
+	r.send(carrierResponse(fork, "SIP/2.0 200 OK"), kTargetIp);
+	const std::string cancel = r.first("CANCEL ", kPickerIp);
+	ASSERT_FALSE(cancel.empty()) << r.dump();
+	EXPECT_EQ(bodyOf(cancel), "") << cancel;
+	EXPECT_EQ(headerValue(cancel, "Content-Length"), "0") << cancel;
+}
+
+// ── setSdpContentType() on its own ───────────────────────────────────────────
+
+TEST(SingleContentType, SetSdpContentTypeLeavesOneSdpLineAndEveryOtherLine)
+{
+	struct Case
+	{
+		const char* in;
+		const char* out;
+	};
+	const Case cases[] = {
+		{"Content-Type: text/plain; charset=utf-8\r\n", "Content-Type: application/sdp\r\n"},
+		{"content-type: Application/SDP;version=2\r\n", "content-type: Application/SDP;version=2\r\n"},
+		{"content-type: text/plain\r\n", "Content-Type: application/sdp\r\n"},
+		{"CONTENT-TYPE: text/plain\r\n", "Content-Type: application/sdp\r\n"},
+		{"C: text/plain\r\n", "Content-Type: application/sdp\r\n"},
+		{"Content-Type: application/sdp\r\nContent-Type: text/plain\r\n", "Content-Type: application/sdp\r\n"},
+		{"Content-Type: text/plain\r\nContent-Disposition: session\r\nContent-Type: application/sdp\r\n",
+		 "Content-Type: application/sdp\r\nContent-Disposition: session\r\n"},
+	};
+	const auto request = [](const std::string& typeLines) {
+		return
+			"INVITE sip:555@" + std::string(kServerIp) + " SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bKct845set\r\n"
+			"Call-ID: ct845-set\r\n" + typeLines +
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+	};
+	for (const Case& c : cases)
+	{
+		SCOPED_TRACE(c.in);
+		auto m = fromWire(request(c.in), kCallerIp);
+		ASSERT_NE(m, nullptr);
+		m->setSdpContentType();
+		EXPECT_EQ(m->toString(), request(c.out));
 	}
 }
