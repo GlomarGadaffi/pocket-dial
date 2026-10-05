@@ -1144,11 +1144,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				// fall through to the full status line, match nothing, and be
 				// dropped -- leaving a server-originated INVITE unACKed (RFC 3261
 				// §17.1.1.3) and its dialog pinned until a timeout that then sent
-				// an illegal post-final CANCEL. Provisional (1xx) and other 2xx
-				// codes keep the old behaviour.
+				// an illegal post-final CANCEL. #889: any other 1xx (181, 182,
+				// 199, ...) takes the 183 key, as RFC 3261 §8.1.3.2 has a UAC
+				// treat a provisional it does not recognise, so the trunk sees
+				// every provisional to its INVITE. Other 2xx codes keep the old
+				// behaviour.
 				default:
-					handlerKey = (status->code >= 300)
-						? SipMessageTypes::FINAL_FAILURE
+					handlerKey = (status->code >= 300) ? SipMessageTypes::FINAL_FAILURE
+						: (status->code < 200) ? SipMessageTypes::SESSION_PROGRESS
 						: std::string(request->getType());
 					break;
 			}
@@ -5885,6 +5888,9 @@ void RequestsHandler::onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, c
 void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 {
 	if (handleSpliceResponse(data)) return;   // #453: a far-leg answer to a relayed request
+	// #889: the carrier's 100 to our trunk INVITE is SipTrunk's, as its 180 is
+	// (onRinging): a provisional, so the dialog is Proceeding (#712, #794).
+	if (_sipTrunk.handleResponse(data)) return;
 	// Our own MoH preview INVITE's 100 Trying. Same claim the beep makes in
 	// onRinging: this is a provisional to US, the preview is a server-originated
 	// UAC with no Session, and its From ("moh") resolves to no registered
@@ -5915,7 +5921,8 @@ void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 
 // #400: a 183 matched no handler key, so it was dropped before SipTrunk ever saw
 // it and the carrier's early media never reached the handset. Only the trunk's
-// own dialog is claimed here; any other 183 is still dropped, as before.
+// own dialog is claimed here; any other 183 is still dropped, as before. #889:
+// so is every other 1xx but 100 and 180 (handle() gives them this key).
 void RequestsHandler::onSessionProgress(std::shared_ptr<SipMessage> data)
 {
 #if POCKETDIAL_TRUNK_INBOUND
@@ -12884,10 +12891,10 @@ void RequestsHandler::onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status)
 
 	// #879 (#878 review B-BLK-1): a 911/933 the trunk took was notified ROUTED
 	// when it was placed, so its failure is told too, once: this fires once per
-	// dialog, and a handset that hung up first has no session here. Only a 911
-	// that drew a 180 or 183 is exempt from the trunk's timeout (#712), so a
-	// 408 is the carrier's own, or a 911 that drew no provisional, or only a
-	// 100, 181 or 182 (those never reach SipTrunk, #889). A final after the
+	// dialog, and a handset that hung up first has no session here. A 911 that
+	// drew any provisional is exempt from the trunk's timeout (#712, #889), so
+	// a 408 is the carrier's own, or a 911 that drew no provisional at all
+	// (Timer B, #726, or the 60 s deadline as its backstop). A final after the
 	// carrier's 2xx tells nothing: the PSAP answered (its teardown is #890).
 	// With a real anchor configured, the trunk only ever carries a 911 the
 	// anchor could not place.
