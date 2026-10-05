@@ -514,23 +514,27 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		const int64_t readsStartUs = esp_timer_get_time();
 		int reads = 0;
 		int listStatus = 0;
+		telephony::ListLegCounts counts;
 		for (;;)
 		{
-			listStatus = 0;
-			ownLeg = resolveOutboundLeg(std::string(), destination, &listStatus, &ownLegSource);
+			ownLeg = resolveOutboundLeg(std::string(), destination, &listStatus, &ownLegSource, &counts, /*skipOurs=*/true);
 			++reads;
 			const telephony::UnreadMakecallStep step =
 				telephony::unreadMakecallStep(!ownLeg.empty(), esp_timer_get_time() - readsStartUs);
 			if (step != telephony::UnreadMakecallStep::ReadAgain || !_running.load(std::memory_order_acquire)) break;
-			ESP_LOGW(TAG, "makeCall: no leg listed yet (list status=%d, read %d) — reading again (#349)",
-				listStatus, reads);
+			ESP_LOGW(TAG, "makeCall: no leg listed yet (list status=%d, read %d: %d listed, %d direct_control, "
+				"%d slot-claimed, %d an earlier call's; direct_control false %d, absent %d, not a bool %d) "
+				"— reading again (#349)", listStatus, reads, counts.listed, counts.controllable, counts.claimed,
+				counts.oursAlready, counts.dcFalse, counts.dcAbsent, counts.dcNotBool);
 			vTaskDelay(pdMS_TO_TICKS(telephony::kUnreadAdoptPollMs));
 		}
 
 		if (!ownLeg.empty())
 		{
+			// More than one candidate on that read: the pick may be an unrelated inbound leg.
 			ESP_LOGW(TAG, "makeCall: no response read (status=%d) but 3CX has our leg %s — "
-				"adopting the call instead of failing it (#349)", status, ownLeg.c_str());
+				"adopting the call instead of failing it (#349); %d candidate leg(s) on read %d",
+				status, ownLeg.c_str(), counts.candidates, reads);
 			ownLegSource = telephony::OwnLegSource::AdoptedAfterUnreadResponse;
 			adopted = true;
 			success = true;
@@ -541,8 +545,10 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			// control, and the next repeat upset for it can still surface as a
 			// phantom inbound. The allocation failures behind this are #328's.
 			ESP_LOGE(TAG, "makeCall: request reached 3CX but no response and no reconcilable "
-				"leg after %d attempts (last list status=%d) — a call may be ORPHANED on 3CX (#349/#328)",
-				reads, listStatus);
+				"leg after %d attempts (last list status=%d: %d listed, %d direct_control, %d slot-claimed, "
+				"%d an earlier call's; direct_control false %d, absent %d, not a bool %d) — "
+				"a call may be ORPHANED on 3CX (#349/#328)", reads, listStatus, counts.listed, counts.controllable, counts.claimed,
+				counts.oursAlready, counts.dcFalse, counts.dcAbsent, counts.dcNotBool);
 		}
 	}
 
@@ -1536,10 +1542,12 @@ static std::string legIdOf(cJSON* elem)
 // re-trigger the wrong-leg 403. If no controllable leg is found we FAIL CLOSED (return "") and
 // let the reconcile/watchdog teardown handle it, rather than drop a guessed id.
 std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecallRespBody, const std::string& /*destination*/,
-                                                       int* listStatusOut, telephony::OwnLegSource* sourceOut)
+                                                       int* listStatusOut, telephony::OwnLegSource* sourceOut,
+                                                       telephony::ListLegCounts* countsOut, bool skipOurs)
 {
 	// 0 = the live list was never consulted (result.id answered it, below).
 	if (listStatusOut) *listStatusOut = 0;
+	if (countsOut) *countsOut = telephony::ListLegCounts{};
 	if (sourceOut) *sourceOut = telephony::OwnLegSource::FirstControllable;   // #379: a guess unless 3CX named it
 
 	// 1) result.id from the makecall response.
@@ -1592,49 +1600,65 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 	if (!cJSON_IsArray(root)) return "";
 
 	std::string firstControllable;   // any direct_control:true leg (own-leg fallback)
-	int listed = 0;
+	std::string ownPartyDnLeg;       // the first of them whose party_dn is our source DN
+	telephony::ListLegCounts counts;   // #349: what this read held, for the log lines
 	cJSON* elem = nullptr;
 	cJSON_ArrayForEach(elem, root)
 	{
 		if (!cJSON_IsObject(elem)) continue;
-		++listed;
-		cJSON* dc = cJSON_GetObjectItem(elem, "direct_control");
 		// Only consider legs Telephony authorizes us to control. A missing field is treated as
 		// NOT controllable — fail closed rather than guess (audit #76).
-		if (!cJSON_IsBool(dc) || !cJSON_IsTrue(dc)) continue;
-
-		std::string id = legIdOf(elem);
-		if (id.empty()) continue;
+		cJSON* dc = cJSON_GetObjectItem(elem, "direct_control");
+		const telephony::DirectControlField dcField =
+			!dc ? telephony::DirectControlField::Absent
+			    : !cJSON_IsBool(dc) ? telephony::DirectControlField::NotBool
+			    : cJSON_IsTrue(dc) ? telephony::DirectControlField::True
+			    : telephony::DirectControlField::False;
+		const std::string id = dcField == telephony::DirectControlField::True ? legIdOf(elem) : std::string();
 		// #100: skip a leg already claimed by another concurrent call's slot. Without this, two
 		// simultaneous originations (whose makecall responses lacked a distinct result.id) both
 		// pick the SAME first-controllable leg here and collide — only one call ever bridges.
+		// #349: the adopt reads also skip a leg an earlier call left listed (dropped, or held
+		// by #883's table until 3CX's Remove).
+		bool claimed = false;
+		bool oursAlready = false;
+		if (!id.empty())
 		{
 			std::lock_guard<std::mutex> lock(_mutex);
-			if (slotForLocked(id)) continue;
+			claimed = slotForLocked(id) != nullptr;
+			oursAlready = skipOurs && (_droppedLegs.contains(id) || _ownLegs.holds(id, esp_timer_get_time(), _wsSeq));
 		}
+		const telephony::ListLegVerdict verdict = telephony::classifyListLeg(dcField, !id.empty(), claimed, oursAlready);
+		counts.add(dcField, verdict);
+		if (verdict != telephony::ListLegVerdict::Candidate) continue;
 		if (firstControllable.empty()) firstControllable = id;
 
 		// Prefer the controllable leg whose party_dn IS our source DN — the initiator (own) leg.
-		if (!srcDigits.empty())
+		if (ownPartyDnLeg.empty() && !srcDigits.empty())
 		{
 			cJSON* pdn = cJSON_GetObjectItem(elem, "party_dn");
 			if (cJSON_IsString(pdn) && pdn->valuestring)
 			{
 				std::string pd;
 				for (const char* p = pdn->valuestring; *p; ++p) if (*p >= '0' && *p <= '9') pd.push_back(*p);
-				if (pd == srcDigits)   // exact own-leg match
-				{
-					if (sourceOut) *sourceOut = telephony::OwnLegSource::OwnPartyDn;
-					return id;
-				}
+				if (pd == srcDigits) ownPartyDnLeg = id;   // exact own-leg match
 			}
 		}
 	}
+	if (countsOut) *countsOut = counts;
 
+	if (!ownPartyDnLeg.empty())
+	{
+		if (sourceOut) *sourceOut = telephony::OwnLegSource::OwnPartyDn;
+		return ownPartyDnLeg;
+	}
 	if (firstControllable.empty())
 	{
-		ESP_LOGW(TAG, "resolveOutboundLeg: no direct_control leg on DN (%d listed) — failing closed (reconcile/watchdog will tear down)",
-		         listed);
+		ESP_LOGW(TAG, "resolveOutboundLeg: no usable leg on DN (%d listed: %d direct_control, %d slot-claimed, "
+		         "%d an earlier call's, %d no id; direct_control false %d, absent %d, not a bool %d) — "
+		         "failing closed (reconcile/watchdog will tear down)",
+		         counts.listed, counts.controllable, counts.claimed, counts.oursAlready, counts.noId,
+		         counts.dcFalse, counts.dcAbsent, counts.dcNotBool);
 	}
 	return firstControllable;   // controllable leg (or "" → fail closed)
 }

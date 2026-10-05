@@ -395,7 +395,9 @@ private:
 	// came straight from the makecall response, so the caller already has its answer).
 	std::string resolveOutboundLeg(const std::string& makecallRespBody, const std::string& destination,
 	                               int* listStatusOut = nullptr,
-	                               telephony::OwnLegSource* sourceOut = nullptr);   // #379
+	                               telephony::OwnLegSource* sourceOut = nullptr,   // #379
+	                               telephony::ListLegCounts* countsOut = nullptr,   // #349: what the list held
+	                               bool skipOurs = false);   // #349: skip a leg an earlier call left listed
 	// Status of a specific leg read from the LIST (GET /participants -> find id). Replaces
 	// getParticipantStatus(id), which 403s for a leg this DN cannot directly control (issue #40).
 	std::string getLegStatus(const std::string& legId);
