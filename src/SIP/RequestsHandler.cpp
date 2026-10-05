@@ -2552,6 +2552,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		// PCMA-ONLY offer; a dual-codec PCMU+PCMA offer passes it fine, and
 		// without this the echoed answer would still list PT8, leaving the peer
 		// free to pick it and send audio nothing on this leg can decode.
+		if (!data->getBody().empty()) okResponse->setSdpContentType();   // #845: one Content-Type, naming SDP
 		okResponse->filterAudioCodecs(/*allowWideband=*/false, /*allowPcma=*/false);
 		_outbox.emplace_back(data->getSource(), std::move(okResponse));
 		return;
@@ -3050,15 +3051,15 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 
 	// Build the 200 OK carrying the SERVER's own SDP. We rebuild the message body
 	// directly (there is no generic body setter): take the INVITE clone, strip its
-	// body, then append our SDP and the SDP Content-Type, and resync Content-Length
-	// via enforceG711()/syncContentLength() so the answer isn't dropped on UDP (the
+	// body, set one SDP Content-Type, append our SDP, and resync Content-Length
+	// with syncContentLength() so the answer isn't dropped on UDP (the
 	// 777-bug class — see tests/SipMessage_test.cpp).
 	std::string toTag = IDGen::GenerateID(9);
 	std::string sdpBody = buildMediaSdp(activeIp, _rtpSender.serverRtpPort());
 
 	// Assemble the OK from the INVITE's headers + our body. clearBody() leaves the
-	// header/blank-line boundary intact; we then append Content-Type + the SDP and
-	// let syncContentLength() (invoked by enforceG711) fix the length.
+	// header/blank-line boundary intact; we then append the SDP and let
+	// syncContentLength() fix the length.
 	ok->setHeader(SipMessageTypes::OK);
 	ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
@@ -6930,6 +6931,7 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 							{
 								auto cancelMsg = getMessageFromPool(*inviteMsg);
 								if (!cancelMsg) continue;   // pool exhausted: skip this target (#101A)
+								cancelMsg->clearBody();
 								std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
 
 								cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");

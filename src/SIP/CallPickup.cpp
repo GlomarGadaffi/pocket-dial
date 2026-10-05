@@ -94,6 +94,7 @@ void CallPickup::complete(const std::shared_ptr<SipMessage>& data,
 	okToCaller->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 	okToCaller->setTo(callerTo);
 	okToCaller->setContact(_env.contactFor(picker->getNumber()));
+	if (!data->getBody().empty()) okToCaller->setSdpContentType();   // #845: the INVITE's own may be absent or not SDP
 	okToCaller->setBody(std::string(data->getBody()));
 	(void)okToCaller->filterAudioCodecs(/*allowWideband=*/true);
 	okToCaller->syncContentLength();
@@ -107,6 +108,7 @@ void CallPickup::complete(const std::shared_ptr<SipMessage>& data,
 	okToPicker->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	okToPicker->setTo(toForPicker);
 	okToPicker->setContact(_env.contactFor(ringingExt));
+	if (!invite->getBody().empty()) okToPicker->setSdpContentType();   // #845: the INVITE's own may be absent or not SDP
 	okToPicker->setBody(std::string(invite->getBody()));
 	(void)okToPicker->filterAudioCodecs(/*allowWideband=*/true);
 	okToPicker->syncContentLength();

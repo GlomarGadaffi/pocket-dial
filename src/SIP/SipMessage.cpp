@@ -993,6 +993,16 @@ SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported
 	return HeaderVerdict::Ok;
 }
 
+bool SipMessage::hasSdpContentType() const
+{
+	for (const std::string& line : _headerLines)
+	{
+		const std::string_view name = headerNameOf(line);
+		if ((iequal(name, "content-type") || iequal(name, "c")) && isSdpMediaType(headerValueOf(line))) return true;
+	}
+	return false;
+}
+
 void SipMessage::setSdpContentType()
 {
 	size_t first = std::string::npos;
@@ -1009,6 +1019,7 @@ void SipMessage::setSdpContentType()
 		}
 		else
 		{
+			if (_spareHeaderLines.size() < SipLimits::kMaxHeaderLines) _spareHeaderLines.push_back(std::move(_headerLines[i]));
 			_headerLines.erase(_headerLines.begin() + static_cast<long>(i));
 		}
 	}

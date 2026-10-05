@@ -315,12 +315,16 @@ public:
 	std::string_view getContact() const;
 	std::string_view getContactNumber() const;
 	std::string_view getContentLength() const;
+	// #838: a Content-Type (or compact c:) line whose media type is
+	// application/sdp, ignoring case and parameters. Unlike hasSdp(), which
+	// scans the raw datagram, an Accept line or a body part does not count.
+	bool hasSdpContentType() const;
 	// #838, #845: leaves exactly one Content-Type, naming SDP (RFC 3261 §20.15),
-	// on a copied INVITE that is about to carry the PBX's own SDP. The first
+	// on a copied request that is about to carry an SDP. The first
 	// Content-Type (or c:) line is kept if its media type is application/sdp
 	// (any case, any parameters) and rewritten in place if not; any later one
-	// is dropped; with none, one is added. Only these lines count: an Accept
-	// line or a body part naming SDP does not, unlike hasSdp().
+	// is dropped; with none, one is added. Only these lines count, as in
+	// hasSdpContentType().
 	void setSdpContentType();
 	// Full `Authorization:` request-header line (or empty if absent). The value
 	// is fed to SipDigest::parseAuthorization, which tolerates the header name.
