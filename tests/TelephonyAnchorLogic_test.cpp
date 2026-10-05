@@ -299,13 +299,14 @@ constexpr int64_t  kNamed     = 2'477'423'517'000;   // resolveOutboundLeg: resu
 constexpr int64_t  kFreed     = 2'477'423'600'000;   // the drop freed its slot (between 423.539 and 423.608)
 constexpr int64_t  kUpsert    = 2'477'423'930'000;   // "Inbound call on DN ***: participant 38"
 constexpr int64_t  kRemove    = 2'477'424'724'000;   // "Participant Remove 38"
+constexpr uint64_t kSeqPost   = 40;                  // _wsSeq when makeCall() sent the makecall
 constexpr uint64_t kSeqUpsert = 41;                  // the upsert for 38
 constexpr uint64_t kSeqRemove = 42;                  // 3CX's Remove of 38
 
 TEST(OwnLegs, AnOwnLegUpsertWhileItsDropStallsIsNotAnnounced)
 {
 	AnchorOwnLegs own;
-	own.noteNamed("38", kNamed);   // makeCall(): the makecall response named it
+	own.noteNamed("38", kNamed, kSeqPost);   // makeCall(): the makecall response named it
 	own.note("38", kFreed);        // freeSlotLocked(): its outbound slot was freed
 	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kUpsert, kSeqUpsert))
 		<< "our own leg 38 was announced as an inbound call while its drop reconnected";
@@ -315,7 +316,7 @@ TEST(OwnLegs, AnUpsertAfterTheRemoveIsANewCall)
 {
 	// 3CX removed 38, so an upsert it sends for 38 afterwards names a new participant.
 	AnchorOwnLegs own;
-	own.noteNamed("38", kNamed);
+	own.noteNamed("38", kNamed, kSeqPost);
 	own.note("38", kFreed);
 	own.release("38", kSeqRemove);
 	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kRemove + 300'000, kSeqRemove + 1))
@@ -326,27 +327,41 @@ TEST(OwnLegs, AFreedSlotOrADropAfterTheRemoveDoesNotHoldItAgain)
 {
 	// The Remove's own worker frees the slot after the Remove arrived; a drop may refresh it.
 	AnchorOwnLegs own;
-	own.noteNamed("38", kNamed);
+	own.noteNamed("38", kNamed, kSeqPost);
 	own.release("38", kSeqRemove);
 	own.note("38", kRemove + 50'000);
 	own.refresh("38", kRemove + 60'000);
 	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kRemove + 300'000, kSeqRemove + 1));
 }
 
-TEST(OwnLegs, OnlyAnIdThreeCxNamedAsOursIsHeld)
+TEST(OwnLegs, OnlyAnIdFromTheMakecallResponseIsHeld)
 {
-	// The list fallback's first controllable leg with no slot can be a genuine inbound
-	// call that rang while the makecall was pending (it gets no slot then).
+	// The list fallback's picks can be a genuine inbound call that rang while the
+	// makecall was pending (it gets no slot then). Nothing in the repo defines
+	// party_dn, so a party_dn match is no better than the first controllable leg.
 	EXPECT_TRUE(ownLegMayBeHeld(OwnLegSource::MakecallResult));
-	EXPECT_TRUE(ownLegMayBeHeld(OwnLegSource::OwnPartyDn));
+	EXPECT_FALSE(ownLegMayBeHeld(OwnLegSource::OwnPartyDn)) << "a party_dn pick was held";
 	EXPECT_FALSE(ownLegMayBeHeld(OwnLegSource::FirstControllable)) << "a guessed leg was held";
+}
+
+TEST(OwnLegs, ALegRemovedBeforeItIsNamedIsNotHeld)
+{
+	// 3CX removed the leg after our makecall went out but before its response named
+	// it: nothing will upsert that leg again, so an upsert after the Remove is not ours.
+	AnchorOwnLegs own;
+	own.release("38", kSeqRemove);
+	own.noteNamed("38", kNamed, kSeqPost);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kNamed + 300'000, kSeqRemove + 1))
+		<< "a call that reuses 38 after its leg's Remove was held back";
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kNamed + 300'000, kSeqUpsert))
+		<< "the removed leg's own upsert, received before the Remove, is still ours";
 }
 
 TEST(OwnLegs, ALegIsOursFromTheMomentTheMakecallResponseNamesIt)
 {
 	// Named but not keyed onto a call slot yet (or never: every slot busy).
 	AnchorOwnLegs own;
-	own.noteNamed("38", kNamed);
+	own.noteNamed("38", kNamed, kSeqPost);
 	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kNamed + 22'000, kSeqUpsert));
 }
 
@@ -383,7 +398,7 @@ TEST(OwnLegs, WorkQueuedBeforeTheRemoveIsStillOurs)
 	// The trace's order: the upsert for 38 was received before 3CX's Remove, and a
 	// worker may reach it only after the Remove.
 	AnchorOwnLegs own;
-	own.noteNamed("38", kNamed);
+	own.noteNamed("38", kNamed, kSeqPost);
 	own.note("38", kFreed);
 	own.release("38", kSeqRemove);
 	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kRemove + 300'000, kSeqUpsert));
@@ -393,16 +408,16 @@ TEST(OwnLegs, ANameAfterARemoveHoldsTheLegAgain)
 {
 	// 3CX names our next outbound leg with an id it removed before: that leg is ours.
 	AnchorOwnLegs own;
-	own.noteNamed("38", kNamed);
+	own.noteNamed("38", kNamed, kSeqPost);
 	own.release("38", kSeqRemove);
-	own.noteNamed("38", kRemove + 1'000'000);
+	own.noteNamed("38", kRemove + 1'000'000, kSeqRemove + 3);   // its makecall went out after the Remove
 	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kRemove + 1'100'000, kSeqRemove + 5));
 }
 
 TEST(OwnLegs, ANewParticipantIdIsAnnounced)
 {
 	AnchorOwnLegs own;
-	own.noteNamed("38", kNamed);
+	own.noteNamed("38", kNamed, kSeqPost);
 	own.note("38", kFreed);
 	EXPECT_TRUE(inboundAnnounceAllowed(own, "39", kUpsert, kSeqUpsert));
 	EXPECT_TRUE(inboundAnnounceAllowed(own, "3", kUpsert, kSeqUpsert)) << "a prefix of a held id is another participant";
@@ -414,7 +429,7 @@ TEST(OwnLegs, APsapCallbackAfterADroppedEmergencyLegIsAnnounced)
 	// The caller abandoned a 911: its own leg was named, freed and dropped. 3CX
 	// offers the PSAP's callback as a new participant on the route DN.
 	AnchorOwnLegs own;
-	own.noteNamed("40", kNamed);
+	own.noteNamed("40", kNamed, kSeqPost);
 	own.note("40", kFreed);
 	own.refresh("40", kFreed + 10'000);
 	EXPECT_TRUE(inboundAnnounceAllowed(own, "41", kUpsert, kSeqUpsert));
@@ -435,7 +450,7 @@ TEST(OwnLegs, AnIdThatDoesNotFitIsNeverHeld)
 {
 	AnchorOwnLegs own;
 	const std::string longId(40, '7');
-	own.noteNamed(longId, kNamed);
+	own.noteNamed(longId, kNamed, kSeqPost);
 	own.note("", kNamed);
 	EXPECT_TRUE(inboundAnnounceAllowed(own, longId, kNamed + 1, kSeqUpsert));
 	EXPECT_TRUE(inboundAnnounceAllowed(own, longId.substr(0, 31), kNamed + 1, kSeqUpsert)) << "never truncated into a match";

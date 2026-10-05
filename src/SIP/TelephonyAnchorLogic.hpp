@@ -315,7 +315,8 @@ class OwnLegs
 public:
 	// The makecall response named this leg: ours, even if 3CX removed an earlier
 	// participant with the same id.
-	void noteNamed(std::string_view id, int64_t nowUs)
+	// RED (#883 re-review): postSeq is not used yet.
+	void noteNamed(std::string_view id, int64_t nowUs, uint64_t /*postSeq*/ = 0)
 	{
 		if (Entry* e = put(id, nowUs)) e->removedSeq = 0;
 	}
