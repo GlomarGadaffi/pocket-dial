@@ -1092,6 +1092,17 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 		return true;
 	}
 
+	// #890: the 2xx ended the INVITE's client transaction (RFC 3261 §17.1.1.2)
+	// and the call is up; only a BYE ends it (§15). A final after the 2xx (a
+	// broken SBC; §16.7 forbids a proxy one) is dropped here: not ACKed, not
+	// answered as a challenge (a second INVITE), and never a failure that
+	// tears down a talking call, a connected 911 included.
+	if (d->state == State::Confirmed)
+	{
+		_env.log("Trunk: " + std::to_string(status) + " after the call was answered ignored", true);
+		return true;
+	}
+
 	// Issue #399: a 401/407 to our INVITE, answered once with digest
 	// credentials. answerChallenge() ACKs the challenge itself; if it cannot
 	// answer (no credentials, an unanswerable challenge, already tried once) it
