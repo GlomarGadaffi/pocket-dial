@@ -1,2 +1,2 @@
-# EmergencyRoute_test.cpp: 1 (#834: a 911 a dial-plan rule produces gets the #759 header-gate and stream-cap yield; an ordinary trunk rule, and a rule shadowed by a number onInvite routes first, do not)
-1
+# EmergencyRoute_test.cpp: 1 + EmergencyDialing_test.cpp: 1 (#834: a 911 a dial-plan rule produces gets the #759 header-gate and stream-cap yield, and every exemption a dialed 911 gets (#497, the secure-mode challenge, the 422 floor, the #760 multipart unwrap); an ordinary trunk rule, and a rule shadowed by a number onInvite routes first, get none)
+2

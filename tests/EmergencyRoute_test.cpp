@@ -1202,6 +1202,48 @@ TEST(EmergencyRoute, AMultipartEmergencyInviteIsRoutedOverTheAnchorToo)
 		<< "with a media bridge to the SDP part's c=/m= address";
 }
 
+namespace
+{
+	// `from` at `ip` calls `to` with a multipart body: the offer and a PIDF-LO.
+	std::shared_ptr<SipMessage> makeMultipartCall(const std::string& from, const char* ip,
+		const std::string& to, const std::string& callId)
+	{
+		const std::string body = multipartWithLocation("pdcb");
+		const std::string raw =
+			"INVITE sip:" + to + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(ip) + ":5060;branch=z9hG4bKmp" + callId + "\r\n"
+			"From: <sip:" + from + "@server>;tag=mp" + callId + "\r\n"
+			"To: <sip:" + to + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + from + "@" + std::string(ip) + ":5060>\r\n"
+			"Content-Type: multipart/mixed; boundary=pdcb\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
+	}
+}
+
+TEST(EmergencyCallback, AMultipartCallbackCarryingLocationIsUnwrappedAndRings)
+{
+	// desmo (#877): a PSAP callback is treated "the same as dialed", so #760's
+	// unwrap covers it too. #659's window makes the call one.
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	b.handler->handle(makeRegister("103", kThirdIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	b.sent.clear();
+
+	b.handler->handle(makeMultipartCall("102", kOtherIp, "101", "er-cb-mp"));
+	EXPECT_EQ(b.count("SIP/2.0 4", kOtherIp), 0u) << "a PSAP callback carrying a location was refused:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:101@", kHandsetIp), 1u) << "101 must ring:\n" << b.dump();
+
+	// Negative: the same INVITE to an extension with no open window is refused.
+	b.handler->handle(makeMultipartCall("103", kThirdIp, "102", "er-cb-mp-other"));
+	EXPECT_EQ(b.count("SIP/2.0 415", kThirdIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:102@", kOtherIp), 0u) << b.dump();
+}
+
 TEST(EmergencyRoute, ATelUriOrTestServiceUrnEmergencyInviteIsRoutedNotRefused)
 {
 	// RFC 3966 tel:911 has no host and no @, so it read as no user at all and

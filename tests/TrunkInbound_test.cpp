@@ -457,6 +457,49 @@ TEST(TrunkInbound, APsapCallbackToTheDidOfA911CallerIsNotRefusedForAnOptionTag)
 	EXPECT_EQ(b.countTo("192.168.50.22"), 0u);
 }
 
+TEST(TrunkInbound, APsapCallbackToTheDidCarryingLocationIsUnwrappedAndForked)
+{
+	// desmo (#877): a PSAP callback is treated "the same as dialed", so #760's
+	// unwrap covers one that reaches the 911 caller through its DID.
+	auto multipartFromCarrier = [](const std::string& did, const std::string& callId) {
+		const std::string body =
+			"--loc\r\nContent-Type: application/sdp\r\n\r\n" +
+			offer(kSbcIp, "0 101", "a=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n") +
+			"--loc\r\nContent-Type: application/pidf+xml\r\n\r\n"
+			"<presence xmlns=\"urn:ietf:params:xml:ns:pidf\" entity=\"pres:psap@pd.example\"/>\r\n"
+			"--loc--\r\n";
+		const std::string raw =
+			"INVITE sip:" + did + "@" + kServerIp + ":5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kSbcIp) + ":5060;branch=z9hG4bKc" + callId + "\r\n"
+			"From: <sip:+12025550177@" + kSbcIp + ">;tag=cf" + callId + "\r\n"
+			"To: <sip:" + did + "@" + kServerIp + ">\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:+12025550177@" + kSbcIp + ":5060>\r\n"
+			"Content-Type: multipart/mixed;boundary=loc\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(kSbcIp));
+	};
+	Bench b;
+	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+	b.handler.handle(makeRegister("2002", "192.168.50.22"));
+	ASSERT_EQ(b.handler.setDidMapping("+12025550189", "2002"), "");
+	b.handler.handle(makeInvite("911", "911", "in-818-mp-911", kPhoneIp, true, kExt));
+	ASSERT_FALSE(b.firstTo("INVITE sip:911@", kSbcIp).empty()) << "precondition: 2001 dialed 911";
+	b.sent.clear();
+
+	b.handler.handle(multipartFromCarrier(kDid, "in-818-mp-cb"));
+	EXPECT_TRUE(b.firstTo("SIP/2.0 4", kSbcIp).empty()) << "the PSAP's callback carrying a location was refused";
+	EXPECT_FALSE(b.firstTo("INVITE sip:2001@", kPhoneIp).empty()) << "2001 must ring";
+
+	// Negative: the same INVITE to the DID of an extension that never dialed 911.
+	b.sent.clear();
+	b.handler.handle(multipartFromCarrier("+12025550189", "in-818-mp-other"));
+	EXPECT_FALSE(b.firstTo("415", kSbcIp).empty()) << "the unwrap is the callback window's alone";
+	EXPECT_EQ(b.countTo("192.168.50.22"), 0u);
+}
+
 // ── The answers ───────────────────────────────────────────────────────────────
 
 TEST(TrunkInbound, AMappedExtensionThatIsNotRegisteredIsUnavailable)

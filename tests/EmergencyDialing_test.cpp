@@ -529,3 +529,108 @@ TEST(EmergencyDialing, ReservedExtensionRefusalIsNowOneSharedListNotThreeDrifted
 			<< "reserved extension accepted as a dial-rule pattern: " << std::get<0>(r);
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #834 (desmo: "YES, same as dialed"): a 911 that a dial-plan rule produces
+// gets every exemption a dialed 911 gets, and an ordinary rule number none
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+	std::string emOffer(const std::string& ip)
+	{
+		return
+			"v=0\r\n"
+			"o=- 0 0 IN IP4 " + ip + "\r\n"
+			"s=-\r\n"
+			"c=IN IP4 " + ip + "\r\n"
+			"t=0 0\r\n"
+			"m=audio 10000 RTP/AVP 0\r\n"
+			"a=rtpmap:0 PCMU/8000\r\n";
+	}
+
+	// 101's INVITE to `to` from `ip`, with `extra` header lines and, when
+	// `multipart`, the offer beside a PIDF-LO location (RFC 6442's shape).
+	std::shared_ptr<SipMessage> emShapedInvite(const std::string& to, const std::string& ip,
+		const std::string& callId, const std::string& extra, bool multipart)
+	{
+		const std::string body = !multipart ? emOffer(ip) :
+			"--loc\r\nContent-Type: application/sdp\r\n\r\n" + emOffer(ip) +
+			"--loc\r\nContent-Type: application/pidf+xml\r\n\r\n"
+			"<presence xmlns=\"urn:ietf:params:xml:ns:pidf\" entity=\"pres:101@pd.example\"/>\r\n"
+			"--loc--\r\n";
+		std::string raw =
+			"INVITE sip:" + to + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKs" + callId + "\r\n"
+			"From: <sip:101@server>;tag=fs" + callId + "\r\n"
+			"To: <sip:" + to + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:101@" + ip + ":5060>\r\n" + extra +
+			"Content-Type: " + std::string(multipart ? "multipart/mixed;boundary=loc" : "application/sdp") + "\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, emAddr(ip));
+	}
+}
+
+TEST(EmergencyDialing, ARuleProducedNineOneOneGetsEveryExemptionADialedOneGets)
+{
+	struct Shape
+	{
+		const char* what;
+		int policy;               // 1: Secure registrar mode; 2: Learn mode, 101 adopted as Secured (#505)
+		const char* ip;           // 101 registered from .11
+		const char* extra;
+		bool multipart;
+		const char* refusal;      // what an ordinary rule number still gets
+	};
+	const Shape shapes[] = {
+		{"secure mode, no credential",         1, "192.168.77.11", "",                       false, "SIP/2.0 403 Extension Not Provisioned"},
+		{"a Secured device in Learn mode",     2, "192.168.77.11", "",                       false, "SIP/2.0 403 Extension Not Provisioned"},
+		{"an address #497 refuses",            0, "192.168.77.99", "",                       false, "Caller Not Registered From This Address"},
+		{"a Session-Expires under the floor",  0, "192.168.77.11", "Session-Expires: 30\r\n", false, "SIP/2.0 422"},
+		{"a multipart body with a PIDF-LO",    0, "192.168.77.11", "",                       true,  "SIP/2.0 415"},
+	};
+	{
+		// Control: with none of the shapes, the ordinary rule reaches the provider.
+		Bench b;
+		b.handler->setDialRule("45X", "trunk", "", 0);
+		b.handler->handle(emShapedInvite("455", "192.168.77.11", "em-834-control", "", false));
+		ASSERT_EQ(b.loopback()->lastMakeCallDestination(), "455") << b.wire.dump();
+	}
+	auto applyPolicy = [](Bench& b, int policy) {
+		if (policy == 1) b.handler->setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+		if (policy == 2)
+		{
+			b.handler->setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+			b.handler->adoptDeviceForTest("0200000000cc", "101", Registrar::DeviceState::Secured);
+		}
+	};
+	int n = 0;
+	for (const Shape& s : shapes)
+	{
+		SCOPED_TRACE(s.what);
+		++n;
+		{
+			Bench b;
+			applyPolicy(b, s.policy);
+			b.handler->setDialRule("0", "trunk", "911", 1);
+			b.wire.clear();
+			b.handler->handle(emShapedInvite("0", s.ip, "em-834-911-" + std::to_string(n), s.extra, s.multipart));
+			EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
+				<< "a rule-produced 911 must reach the provider as a dialed one does:\n" << b.wire.dump();
+			EXPECT_FALSE(b.wire.saw("SIP/2.0 4")) << b.wire.dump();
+		}
+		{
+			// Negative: an ordinary rule number keeps the check.
+			Bench b;
+			applyPolicy(b, s.policy);
+			b.handler->setDialRule("45X", "trunk", "", 0);
+			b.wire.clear();
+			b.handler->handle(emShapedInvite("455", s.ip, "em-834-rule-" + std::to_string(n), s.extra, s.multipart));
+			EXPECT_TRUE(b.wire.saw(s.refusal)) << b.wire.dump();
+			EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "") << "the ordinary rule never fired";
+		}
+	}
+}
