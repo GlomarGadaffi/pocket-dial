@@ -479,6 +479,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	// specific-id GET/drop returns 403 (issue #40). Drop/media key off this owned id.
 	std::string ownLeg;
 	telephony::OwnLegSource ownLegSource = telephony::OwnLegSource::FirstControllable;   // #379
+	bool adopted = false;   // #349
 	if (success)
 	{
 		ownLeg = resolveOutboundLeg(respBody, destination, nullptr, &ownLegSource);
@@ -507,37 +508,31 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		// resolveOutboundLeg("") skips straight to its live-participant-list fallback:
 		// 3CX's own state is the authority on whether the call exists, and that path
 		// is already audit-#76 safe (direct_control only) and #100 safe (skips legs
-		// another slot claimed). Retried a bounded number of times because the same
-		// allocation pressure that ate the response can eat the first reconcile too,
-		// and one blip should not drop us straight back into the phantom-ring path.
-		//
-		// RETRY ONLY WHAT IS WORTH RETRYING. An empty return from resolveOutboundLeg
-		// is ambiguous on its own: the list GET failed (transient — retrying is the
-		// whole point) or the list ANSWERED and 3CX has no controllable leg
-		// (definitive "no call" — retrying cannot change it). listStatusOut splits
-		// those apart: <= 0 means 3CX never answered, > 0 means it did.
-		//
-		// Retrying a definitive "no" would not merely waste ~800ms. _outboundPending
-		// stays > 0 for the whole window (the RAII dec is at return), which suppresses
-		// classification of any GENUINE inbound upset arriving meanwhile — so the
-		// window is held open only while there is still reason to hope, and a 200
-		// carrying no controllable leg ends it immediately.
-		constexpr int kReconcileAttempts = 3;
-		constexpr int kReconcileDelayMs  = 400;
-		for (int attempt = 0; attempt < kReconcileAttempts; ++attempt)
+		// another slot claimed). A read that shows no leg is read again until the
+		// window closes (telephony::unreadMakecallStep): on .244 3CX had placed the
+		// call and one such read was taken as "no call".
+		const int64_t readsStartUs = esp_timer_get_time();
+		int reads = 0;
+		int listStatus = 0;
+		for (;;)
 		{
-			if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(kReconcileDelayMs));
-			int listStatus = 0;
+			listStatus = 0;
 			ownLeg = resolveOutboundLeg(std::string(), destination, &listStatus, &ownLegSource);
-			// Stop on a leg, or on any real verdict from 3CX — only an unparsed
-			// response (telephony::httpResponseParsed false) is worth retrying.
-			if (!ownLeg.empty() || telephony::httpResponseParsed(listStatus)) break;
+			++reads;
+			const telephony::UnreadMakecallStep step =
+				telephony::unreadMakecallStep(!ownLeg.empty(), esp_timer_get_time() - readsStartUs);
+			if (step != telephony::UnreadMakecallStep::ReadAgain || !_running.load(std::memory_order_acquire)) break;
+			ESP_LOGW(TAG, "makeCall: no leg listed yet (list status=%d, read %d) — reading again (#349)",
+				listStatus, reads);
+			vTaskDelay(pdMS_TO_TICKS(telephony::kUnreadAdoptPollMs));
 		}
 
 		if (!ownLeg.empty())
 		{
 			ESP_LOGW(TAG, "makeCall: no response read (status=%d) but 3CX has our leg %s — "
 				"adopting the call instead of failing it (#349)", status, ownLeg.c_str());
+			ownLegSource = telephony::OwnLegSource::AdoptedAfterUnreadResponse;
+			adopted = true;
 			success = true;
 		}
 		else
@@ -546,8 +541,8 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			// control, and the next repeat upset for it can still surface as a
 			// phantom inbound. The allocation failures behind this are #328's.
 			ESP_LOGE(TAG, "makeCall: request reached 3CX but no response and no reconcilable "
-				"leg after %d attempts — a call may be ORPHANED on 3CX (#349/#328)",
-				kReconcileAttempts);
+				"leg after %d attempts (last list status=%d) — a call may be ORPHANED on 3CX (#349/#328)",
+				reads, listStatus);
 		}
 	}
 
@@ -612,11 +607,12 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 					return false;
 				}
 			}
-			if (primed && waitedUs > 0)
+			if (primed && (waitedUs > 0 || adopted))
 			{
 				// #743: an upsert for this leg that landed during the wait was ignored, and
 				// Telephony does not repeat a Connected one. Re-check the leg once, with the
-				// same single-flight claim handleWsEvent() makes.
+				// same single-flight claim handleWsEvent() makes. #349: so were the upserts
+				// during the list reads before the adopt.
 				bool claimed = false;
 				{
 					std::lock_guard<std::mutex> lock(_mutex);
@@ -1596,10 +1592,12 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 	if (!cJSON_IsArray(root)) return "";
 
 	std::string firstControllable;   // any direct_control:true leg (own-leg fallback)
+	int listed = 0;
 	cJSON* elem = nullptr;
 	cJSON_ArrayForEach(elem, root)
 	{
 		if (!cJSON_IsObject(elem)) continue;
+		++listed;
 		cJSON* dc = cJSON_GetObjectItem(elem, "direct_control");
 		// Only consider legs Telephony authorizes us to control. A missing field is treated as
 		// NOT controllable — fail closed rather than guess (audit #76).
@@ -1635,7 +1633,8 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 
 	if (firstControllable.empty())
 	{
-		ESP_LOGW(TAG, "resolveOutboundLeg: no direct_control leg on DN — failing closed (reconcile/watchdog will tear down)");
+		ESP_LOGW(TAG, "resolveOutboundLeg: no direct_control leg on DN (%d listed) — failing closed (reconcile/watchdog will tear down)",
+		         listed);
 	}
 	return firstControllable;   // controllable leg (or "" → fail closed)
 }
