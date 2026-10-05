@@ -1,2 +1,2 @@
-# RxRestart_test.cpp: 2 (#743: an emergency makeCall keeps asking for a tearing-down slot for 2 s; an ordinary call still gets one ask). tests/tools/test_anchor_emergency_slot_wait.py (unittest, 0 to the gtest floor) pins makeCall()'s wiring.
+# RxRestart_test.cpp: 2 (#743: an emergency makeCall keeps asking for a tearing-down slot for 4 s, 2 s before #878; an ordinary call still gets one ask). tests/tools/test_anchor_emergency_slot_wait.py (unittest, 0 to the gtest floor) pins makeCall()'s wiring.
 2

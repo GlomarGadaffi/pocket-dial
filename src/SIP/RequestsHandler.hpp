@@ -469,6 +469,15 @@ public:
 		std::lock_guard<std::mutex> lock(_mutex);
 		_failNextAnchorWorkerSpawn = true;
 	}
+	// Test-only (#878 review S-B3): the next originateAnchorCall() on a
+	// connected anchor answers the INVITE 503 and returns false WITHOUT setting
+	// refusedBeforeDispatchOut, the shape a future path that answers could
+	// take. No fallback may follow it.
+	void answerThenFailNextAnchorCallForTest()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_answerThenFailNextAnchorCall = true;
+	}
 	// Test-only (#657): each tel_ctl worker parks after taking a job, as one
 	// stuck in makeCall's TLS round trip would. tel_drop and tel_sos run on.
 	void holdTelCtlForTest(bool on)
@@ -1755,8 +1764,11 @@ private:
 	// Issue #166 part 2: fire the Kari's Law notification. Called ONLY after
 	// the emergency call leg (or its 503) has already been enqueued, so a
 	// notification can never delay or displace the call. Caller holds _mutex.
+	// `note` names what failed (desmo, #878): the route when `routed` is
+	// false, or the anchor a trunk call stood in for.
 	void notifyEmergency(const pbx::EmergencyDial& emergency,
-		const std::string& fromExt, const std::string& dialed, bool routed);
+		const std::string& fromExt, const std::string& dialed, bool routed,
+		std::string_view note = {});
 
 	void routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller,
@@ -1849,10 +1861,19 @@ private:
 	// #166) would otherwise race the generic 488 this gate already sent, giving
 	// one INVITE two final responses. Every other caller passes nullptr and gets
 	// the original behaviour unchanged.
+	//
+	// `refusedBeforeDispatchOut` (optional, #878 Phase A): when non-null, a
+	// refusal before anything has left for the anchor (no anchor connected,
+	// every bridge busy, the session or virtual-peer pool spent, a 911's worker
+	// queue full) answers nothing: it sets *refusedBeforeDispatchOut and returns
+	// false, so routeEmergencyCall() can still try the trunk. routeEmergencyCall()
+	// tries it only when the flag is set. So every false return must either
+	// answer the INVITE or set the flag: one that does neither leaves the caller
+	// with no final response, and each retransmission re-routes and re-notifies.
 	bool originateAnchorCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
 		bool respondIfDisconnected, bool* placedOut = nullptr,
-		bool* codecRejectedOut = nullptr);
+		bool* codecRejectedOut = nullptr, bool* refusedBeforeDispatchOut = nullptr);
 
 	// First anchor media bridge with no active call, or nullptr if every slot is
 	// busy (onAnchorInvite() then answers 503 Service Unavailable, mirroring the
@@ -1916,8 +1937,10 @@ private:
 	// #713: false when the job was refused. The call is then already answered
 	// 503 and ended here; the caller must not report it as placed. `emergency`
 	// (a 911/933) takes the sos lane, which ordinary setup never fills.
+	// #878 Phase A: `published` false queues the job before the call's session
+	// is published or answered; a refusal then answers and ends nothing.
 	bool asyncMakeCall(const std::string& destination, const std::string& callId, const std::string& callerNumber,
-		bool emergency);
+		bool emergency, bool published = true);
 	// 503 a still-ringing outbound anchor call off its stored INVITE (endCall()
 	// sends no response itself). Caller holds _mutex; outbox is _outbox on the
 	// SIP thread or _asyncOutbox from a worker.
@@ -1998,6 +2021,7 @@ private:
 	bool _telCtlHeld = false;   // holdTelCtlForTest()
 	int _telCtlParked = 0;
 	bool _failNextAnchorWorkerSpawn = false;   // #713 test seam; under _mutex
+	bool _answerThenFailNextAnchorCall = false;   // #878 S-B3 test seam; under _mutex
 #endif
 
 	// ── Inbound anchor call dispatch (Stage B) ────────────────────────────────────

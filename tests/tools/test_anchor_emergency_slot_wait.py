@@ -69,6 +69,21 @@ class AnchorEmergencySlotWaitTest(unittest.TestCase):
         self.assertRegex(recheck, r"upsetInFlight\.store\(false",
                          "a refused enqueue must release the claim, or the leg's upserts wedge")
 
+    def test_a_911_leg_still_without_a_slot_is_dropped_and_the_call_failed(self):
+        # #821: a leg left unkeyed after the wait never comes up (no rx pump, and its
+        # next upsert reads as a new inbound call), so the 911 handset rang on after
+        # ROUTED was sent. makeCall() drops the leg while _outboundPending still hides
+        # its upserts, and fails: the engine answers 503 and reports NOT ROUTED.
+        tail = self.make_call[self.make_call.index("all %d call slots busy"):]
+        branch = tail[:tail.index("if (primed && waitedUs > 0)")]
+        self.assertRegex(branch, r"if \(emergency\)\s*\{", "an unprimed 911/933 must take a branch of its own")
+        self.assertIn("dropCall(ownLeg);", branch,
+                      "the 3CX leg must be dropped, or it reaches the PSAP with nobody on it")
+        self.assertIn("ownLegOut->clear()", branch, "a failed call names no leg for the engine to bind")
+        self.assertIn("return false;", branch, "the call must fail, so the engine refuses it and reports NOT ROUTED")
+        self.assertLess(branch.index("dropCall(ownLeg);"), branch.index("return false;"),
+                        "the drop runs before the return releases _outboundPending")
+
 
 if __name__ == "__main__":
     unittest.main()

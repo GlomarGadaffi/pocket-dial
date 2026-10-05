@@ -4447,6 +4447,17 @@ void RequestsHandler::onAnchorInvite(std::shared_ptr<SipMessage> data,
 		/*respondIfDisconnected=*/true);
 }
 
+namespace
+{
+	// desmo, #878: what a NOT ROUTED notification says failed.
+	constexpr std::string_view kAnchorNotPlaced = "the 3CX anchor could not place the call";
+	constexpr std::string_view kAnchorThenTrunkRefused =
+		"the 3CX anchor could not place the call; the trunk refused it";
+	constexpr std::string_view kAnchorNoTrunk =
+		"the 3CX anchor could not place the call; no trunk is configured";
+	constexpr std::string_view kTrunkRefused = "the trunk refused it";
+}
+
 // ── Emergency call routing (Issue #166) ──────────────────────────────────────
 //
 // Reached only from onInvite's emergency intercept, which runs before every
@@ -4484,7 +4495,11 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// transform such as "0" -> "911").
 	auto markEmergency = [&] {
 		auto s = _sessions.find(data->getCallID());   // std::less<> map: no copy on the 911 path
-		if (s != _sessions.end() && s->second) s->second->setEmergency(true);
+		if (s != _sessions.end() && s->second)
+		{
+			s->second->setEmergency(true);
+			s->second->setEmergencyNumber(emergency.number);   // #879
+		}
 		// #659: opens this extension's PSAP callback window.
 		_emergencyCallbacks.note(caller->getNumber(), std::chrono::steady_clock::now());
 	};
@@ -4497,8 +4512,15 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		// function owns what happens next and the handset never receives two
 		// final responses to one INVITE. NOT std::move: originateAnchorCall
 		// takes its shared_ptr by value, and `data` is still needed below.
-		if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed,
-			&codecRejected))
+		// #878 Phase A: only a refusal that sent nothing (the anchor not
+		// connected, or a capacity refusal before dispatch) sets the flag, and
+		// only then may the trunk below take the call. Any other false return is
+		// the anchor's own answer: never a second route (review S-B3).
+		bool refusedBeforeDispatch = false;
+		const bool owned = originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false,
+			&placed, &codecRejected, &refusedBeforeDispatch);
+		if (!owned && !refusedBeforeDispatch && !codecRejected) placed = false;
+		if (owned || (!refusedBeforeDispatch && !codecRejected))
 		{
 			markEmergency();   // #604
 			// The call leg is enqueued. NOW notify: 47 CFR 9.16(b)(2) wants the
@@ -4510,7 +4532,8 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 			// bridge slot busy, session pool full, makeCall declined) and still
 			// returned true. Telling the front desk a 911 call went through when
 			// it was refused for capacity is the worst error this feature could make.
-			notifyEmergency(emergency, from, dialed, /*routed=*/placed);
+			notifyEmergency(emergency, from, dialed, /*routed=*/placed,
+				placed ? std::string_view() : kAnchorNotPlaced);
 			return;
 		}
 	}
@@ -4538,7 +4561,10 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 			// logs which one it was ("trunk: <why> for <ext> -> 911").
 			(void)placeSipTrunkCall(data, caller, bare, &placed);
 			markEmergency();   // #604
-			notifyEmergency(emergency, from, dialed, /*routed=*/placed);
+			const std::string_view note = route == EmergencyRoute::Anchor
+				? (placed ? kAnchorNotPlaced : kAnchorThenTrunkRefused)
+				: (placed ? std::string_view() : kTrunkRefused);
+			notifyEmergency(emergency, from, dialed, /*routed=*/placed, note);
 			return;
 		}
 	}
@@ -4568,19 +4594,6 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// header field, if present" -- making a handset back off the PBX after a
 	// failed 911 attempt is the last thing anyone wants. Without it the UA
 	// treats this as a plain failure and may immediately try again.
-	auto response = getMessageFromPool(*data);
-	if (!response)
-	{
-		// Pool exhausted: drop and let the peer retransmit (#101A). The log line
-		// above already recorded the attempt, which is the part that matters.
-		queueLog("EMERGENCY: " + kind + " from " + from +
-			" NOT ROUTED and no message available to answer with", true);
-		// Still notify. A 911 attempt that produced neither a call nor even a
-		// failure response is the single most important thing to put in front of
-		// a human, and the notification path has its own pooled messages.
-		notifyEmergency(emergency, from, dialed, /*routed=*/false);
-		return;
-	}
 	// A free-text reason phrase (RFC 3261 §7.2) that many handsets display.
 	// "Service Unavailable" is true but says nothing; this says what happened.
 	// Issue #314: same 503 either way, but the Warning text must say what
@@ -4592,6 +4605,23 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		: (route == EmergencyRoute::None
 			? "no emergency route configured"   // Issue #521: loopback only
 			: "no outbound trunk connected");
+	// Only the anchor route reaches here with neither a codec nor a missing
+	// route to blame: its anchor took nothing and no trunk is configured.
+	const std::string_view notRouted = (!codecRejected && route == EmergencyRoute::Anchor)
+		? kAnchorNoTrunk : std::string_view(warningDetail);
+	auto response = getMessageFromPool(*data);
+	if (!response)
+	{
+		// Pool exhausted: drop and let the peer retransmit (#101A). The log line
+		// above already recorded the attempt, which is the part that matters.
+		queueLog("EMERGENCY: " + kind + " from " + from +
+			" NOT ROUTED and no message available to answer with", true);
+		// Still notify. A 911 attempt that produced neither a call nor even a
+		// failure response is the single most important thing to put in front of
+		// a human, and the notification path has its own pooled messages.
+		notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted);
+		return;
+	}
 	response->setHeader("SIP/2.0 503 Emergency Call Not Routable");
 	response->clearBody();
 	response->addHeader("Warning", "399 " + _localIp +
@@ -4603,19 +4633,20 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		warningDetail + ") - answered 503", true);
 
 	// 503 is enqueued; notify after it, same ordering rule as the routed path.
-	notifyEmergency(emergency, from, dialed, /*routed=*/false);
+	notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted);
 }
 
 // Issue #166 part 2. Kept to this one small function so the compliance-relevant
 // ordering is visible in one place: every caller has already enqueued its
 // response before reaching here, and nothing below can fail back into the call.
 void RequestsHandler::notifyEmergency(const pbx::EmergencyDial& emergency,
-	const std::string& fromExt, const std::string& dialed, bool routed)
+	const std::string& fromExt, const std::string& dialed, bool routed,
+	std::string_view notRoutedReason)
 {
 	const pbx::E911Config& cfg = _cfg.e911Config();
 
 	_e911Notifier.notify(cfg, emergency.isTest, fromExt, dialed,
-		emergency.hadTrunkPrefix, routed);
+		emergency.hadTrunkPrefix, routed, notRoutedReason);
 
 	// Make the notified phones audibly alert, on top of the MESSAGE text. The
 	// beep is the existing register-beep INVITE (auto-answer headers, no RTP),
@@ -4707,7 +4738,7 @@ bool RequestsHandler::dialRuleMakesEmergency(const std::string& dialed, std::str
 
 bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller, const std::string& destination,
-	bool respondIfDisconnected, bool* placedOut, bool* codecRejectedOut)
+	bool respondIfDisconnected, bool* placedOut, bool* codecRejectedOut, bool* refusedBeforeDispatchOut)
 {
 	// Issue #166: this function's bool return means "took ownership of the
 	// INVITE", NOT "the call was placed" -- eight refuse() paths answer 4xx/5xx
@@ -4717,6 +4748,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// answering.
 	if (placedOut) *placedOut = true;
 	if (codecRejectedOut) *codecRejectedOut = false;
+	if (refusedBeforeDispatchOut) *refusedBeforeDispatchOut = false;
 	const std::string activeIp = _localIp;
 	const std::string callID(data->getCallID());
 	// The remote target both this response's Contact and every later in-dialog
@@ -4740,6 +4772,21 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		_outbox.emplace_back(data->getSource(), std::move(msg));
 		queueLog("anchor(" + remoteExt + "): " + std::string(why) + " for "
 			+ std::string(data->getFromNumber()), true);
+	};
+	// #878 Phase A: a refusal before anything has left for the anchor and before
+	// any answer. A caller that can still route the call elsewhere gets it back
+	// unanswered (returns false); every other caller gets refuse()'s answer.
+	auto refuseBeforeDispatch = [&](const char* statusLine, const char* why) {
+		if (!refusedBeforeDispatchOut)
+		{
+			refuse(statusLine, why);
+			return true;
+		}
+		*refusedBeforeDispatchOut = true;
+		if (placedOut) *placedOut = false;
+		queueLog("anchor(" + remoteExt + "): " + std::string(why) + " for "
+			+ std::string(data->getFromNumber()) + ", before dispatch: nothing sent", true);
+		return false;
 	};
 
 	// Issue #521: the loopback simulator never takes an emergency number, by
@@ -4777,9 +4824,18 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		{
 			queueLog("anchor(" + remoteExt + "): trunk call to " + destination +
 				" refused, no anchor client connected", true);
+			if (refusedBeforeDispatchOut) *refusedBeforeDispatchOut = true;   // nothing was sent
 		}
 		return false;
 	}
+#if !defined(ESP_PLATFORM) && !defined(ESP32)
+	if (_answerThenFailNextAnchorCall)   // #878 S-B3 test seam
+	{
+		_answerThenFailNextAnchorCall = false;
+		refuse("SIP/2.0 503 Service Unavailable", "test seam: answered, then returned false");
+		return false;
+	}
+#endif
 
 	// Anchor-bridge media is SERVER-terminated and speaks G.711 only (buildMediaSdp
 	// below hardcodes PCMU; MediaBridge::onHandsetRtp only µ-law-decodes) — narrower
@@ -4941,15 +4997,13 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// participant id and the handset's RTP destination is still worth honoring.
 	if (allBridgesBusy())
 	{
-		refuse("SIP/2.0 503 Service Unavailable", "every anchor bridge slot busy");
-		return true;
+		return refuseBeforeDispatch("SIP/2.0 503 Service Unavailable", "every anchor bridge slot busy");
 	}
 
 	auto newSession = allocateSession(callID, caller);
 	if (!newSession)
 	{
-		refuse("SIP/2.0 503 Service Unavailable", "session pool full");
-		return true;
+		return refuseBeforeDispatch("SIP/2.0 503 Service Unavailable", "session pool full");
 	}
 
 	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
@@ -4961,8 +5015,16 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	{
 		// Nothing claimed yet beyond the unpublished session, which the pool
 		// reclaims when newSession goes out of scope (#412).
-		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
-		return true;
+		return refuseBeforeDispatch("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
+	}
+	// #878 Phase A: a 911/933's makeCall is queued before its session is
+	// published or its 180 sent, so a refused job is a refusal before dispatch
+	// and the trunk can still take the call. This thread holds _mutex until the
+	// session is published, and the worker takes _mutex before it touches it.
+	// The vpeer is not attached yet, so a refusal releases it.
+	if (emergency && !asyncMakeCall(destination, callID, caller->getNumber(), emergency, /*published=*/false))
+	{
+		return refuseBeforeDispatch("SIP/2.0 503 Service Unavailable", "anchor worker queue full");
 	}
 	newSession->setDest(dummyAnchor);
 	newSession->setInviteMessage(data);
@@ -4991,7 +5053,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// synchronous branch's comment above. Dispatched off the SIP thread; the
 	// 200 OK follows later from the CallEvent::Answered callback once the far
 	// leg actually connects.
-	if (!asyncMakeCall(destination, callID, caller->getNumber(), emergency))
+	if (!emergency && !asyncMakeCall(destination, callID, caller->getNumber(), emergency))
 	{
 		// #713: no worker, so nothing will ever place this call. asyncMakeCall()
 		// has answered 503 and ended the session: the INVITE is owned (true),
@@ -5047,7 +5109,7 @@ void RequestsHandler::refuseRingingAnchor(const std::string& callId,
 }
 
 bool RequestsHandler::asyncMakeCall(const std::string& destination, const std::string& callId,
-	const std::string& callerNumber, bool emergency)
+	const std::string& callerNumber, bool emergency, bool published)
 {
 	if (!_anchorClient) return false;   // unreachable: originateAnchorCall() returns first with no client
 	auto* job = new TelCtlJob{ TelCtlJob::Make, destination, callId, callerNumber, {} };
@@ -5061,6 +5123,7 @@ bool RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 #endif
 	if (postTelCtl(job, emergency ? kLaneSos : kLaneCtl)) return true;
 	queueLog("[Telephony] asyncMakeCall: tel_ctl queue full — call NOT placed", true);
+	if (!published) return false;   // #878 Phase A: nothing answered or published yet
 	// onAnchorInvite() already allocated the session and sent 180 Ringing; with
 	// no worker nobody will ever answer or fail it, so without this the handset
 	// rings until tick()'s no-answer reap fires ~20 s later. Do what that reap
@@ -5157,6 +5220,16 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 		// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
 		refuseRingingAnchor(job.callId, _asyncOutbox);
 		endCall(job.callId, job.callerNumber, job.dest, "anchor call fail");
+		// #821: routeEmergencyCall() told the notify list ROUTED when it queued
+		// this job, and the call never came up. notifyEmergency() enqueues on
+		// _outbox, which the SIP thread's next pass clears: hand it to
+		// _asyncOutbox, as forceDisconnect() does (#714).
+		if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(job.dest); em.isEmergency)
+		{
+			notifyEmergency(em, job.callerNumber, job.dest, /*routed=*/false, kAnchorNotPlaced);
+			for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
+			_outbox.clear();
+		}
 		return;
 	}
 	// Bind this origination's own leg to its session NOW (locks _mutex
@@ -12791,12 +12864,42 @@ void RequestsHandler::onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status)
 		: (inv ? std::string(inv->getFromNumber()) : std::string());
 	const std::string to   = inv ? std::string(inv->getToNumber()) : std::string();
 
+	// #879: read before endCall() releases the session, as is the state: a
+	// final after the carrier's 2xx refuses no 911 still ringing (S-C2).
+	const std::string_view emergencyNumber = sit->second->getEmergencyNumber();
+	const bool stillRinging = sit->second->getState() == Session::State::Invited;
+
 	// Answer the still-ringing handset BEFORE tearing down: endCall() sends no
 	// final response, so skipping this leaves the phone ringing at a call that
 	// is already gone.
 	refuseRingingTrunk(handsetCallID, status);
 	endCall(handsetCallID, from, to,
 		"trunk call failed (" + std::to_string(status) + ")");
+
+	// #879 (#878 review B-BLK-1): a 911/933 the trunk took was notified ROUTED
+	// when it was placed, so its failure is told too, once: this fires once per
+	// dialog, and a handset that hung up first has no session here. Only a 911
+	// that drew a 180 or 183 is exempt from the trunk's timeout (#712), so a
+	// 408 is the carrier's own, or a 911 that drew no provisional, or only a
+	// 100, 181 or 182 (those never reach SipTrunk, #889). A final after the
+	// carrier's 2xx tells nothing: the PSAP answered (its teardown is #890).
+	// With a real anchor configured, the trunk only ever carries a 911 the
+	// anchor could not place.
+	if (!emergencyNumber.empty() && stillRinging)
+	{
+		pbx::EmergencyDial em = pbx::classifyEmergencyDial(to);
+		std::string dialed = to;
+		if (!em.isEmergency)   // a dial-plan rule produced it
+		{
+			em = pbx::classifyEmergencyDial(emergencyNumber);
+			dialed = std::string(emergencyNumber);
+		}
+		std::string note = emergencyRouteLocked() == EmergencyRoute::Anchor
+			? std::string(kAnchorNotPlaced) + "; " : std::string();
+		note += status == 408 ? std::string("the trunk timed out (408)")
+			: "the trunk refused it (" + std::to_string(status) + ")";
+		notifyEmergency(em, from, dialed, /*routed=*/false, note);
+	}
 }
 
 void RequestsHandler::onTrunkRemoteBye(const SipTrunk::TrunkEvent& ev)

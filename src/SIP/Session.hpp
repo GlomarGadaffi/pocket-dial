@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <chrono>
+#include <string_view>
 #include <vector>
 
 class SipMessage;
@@ -134,6 +135,11 @@ public:
 	// a caller who cannot speak on a phone with silence suppression sends no
 	// RTP, and hanging up on them is the one failure this PBX must not have.
 	bool isEmergency() const { return _isEmergency; }
+	// #879: the bare number ("911"/"933") a 911/933 session was routed as, so a
+	// failure after routing can be reported against it. Views a static constant
+	// (pbx::kEmergencyNumber / kEmergencyTestNumber); empty on any other session.
+	std::string_view getEmergencyNumber() const { return _emergencyNumber; }
+	void setEmergencyNumber(std::string_view number) { _emergencyNumber = number; }
 	void setEmergency(bool val)
 	{
 		_isEmergency = val;
@@ -400,6 +406,7 @@ private:
 	bool _isTrunk = false;
 	int  _trunkRelaySlot = -1;
 	bool _isEmergency = false;                          // #604
+	std::string_view _emergencyNumber;                  // #879
 	bool _rtpWatchArmed = false;                        // #604
 	uint32_t _rtpMarkA = 0;                             // #604
 	uint32_t _rtpMarkB = 0;                             // #604
