@@ -136,8 +136,12 @@ function(pocketdial_firmware_version out_var)
         set(version "unknown")
         set(source "no git")
         if(GIT_FOUND)
+            # #872: --abbrev=12, pinned. git's default abbreviation grows with
+            # the object count, so a stamp taken early and a check run later
+            # (tools/ci/check_app_version.py, ABBREV there) could differ in
+            # length for the same commit. 12 + "v1.5.1-123-g" + "-dirty" is 30.
             execute_process(
-                COMMAND ${git_cmd} describe --tags --always --dirty
+                COMMAND ${git_cmd} describe --tags --always --dirty --abbrev=12
                 OUTPUT_VARIABLE full
                 ERROR_VARIABLE err
                 RESULT_VARIABLE rc
@@ -156,10 +160,10 @@ function(pocketdial_firmware_version out_var)
                     # --abbrev=7, NOT longer, on purpose. tests/run.py's
                     # same_commit() accepts a bare hash only as a PREFIX of its
                     # own describe's -g<hash> (exact otherwise, #461 review), and
-                    # describe's -g<hash> uses git's default abbreviation (7,
-                    # auto-extended for uniqueness). --abbrev is a MINIMUM that
-                    # git also extends for uniqueness, so this hash is a prefix
-                    # of describe's; a 12-char one would not be.
+                    # an unpinned describe's -g<hash> uses git's default
+                    # abbreviation (7, auto-extended for uniqueness). --abbrev is
+                    # a MINIMUM that git also extends for uniqueness, so this hash
+                    # is a prefix of any describe's; a 12-char one would not be.
                     execute_process(
                         COMMAND ${git_cmd} describe --always --dirty --abbrev=7 "--exclude=*"
                         OUTPUT_VARIABLE short

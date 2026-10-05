@@ -88,6 +88,15 @@ class FirmwareVersionCmakeTest(unittest.TestCase):
         self.assertNotEqual(stamp, "v9.9.9", "the override must not survive a commit")
         self.assertTrue(stamp.startswith(head), f"header {stamp!r} does not name HEAD {head}")
 
+    def test_the_describe_hash_is_pinned_to_twelve_hex(self):
+        # #872: git's default abbreviation follows the object count (and
+        # core.abbrev); the stamp must not.
+        self.git("config", "core.abbrev", "8")
+        self.git("tag", "v1.5.0")
+        self.commit("second")
+        self.cmake()
+        self.assertRegex(self.header(), r"^v1\.5\.0-1-g[0-9a-f]{12}$")
+
     def test_a_stamp_that_is_not_json_safe_fails_the_configure(self):
         for bad in ('v1"x', "v1 x", "v1\\x", "v1<x>"):
             with self.subTest(stamp=bad):
