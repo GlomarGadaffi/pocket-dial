@@ -700,7 +700,10 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <div class="note" id="reg-roster-note">
         Phones seen while in Learn mode. <strong>Secure</strong> locks one to its
         extension and starts enforcing digest auth for it; <strong>Forget</strong> drops
-        the record so the phone is re-adopted on its next registration.
+        the record so the phone is re-adopted on its next registration. A
+        <strong>locked</strong> row is bound to its phone's MAC. A
+        <strong>shared</strong> row (a NAT router, or a phone moved while unlocked)
+        never locks: Forget it so the right phone can lock.
       </div>
       <table id="reg-roster">
         <thead><tr><th>Extension</th><th>MAC</th><th>State</th><th></th></tr></thead>
@@ -1606,7 +1609,8 @@ R"html6(    var tr=document.createElement("tr");
     var tdE=document.createElement("td");tdE.textContent=x.extension||"\u2014";
     var tdM=document.createElement("td");tdM.textContent=x.mac||"\u2014";
     var tdS=document.createElement("td");
-    tdS.textContent=(x.state==="secured"?"secured":"learned")+(x.online?" \u00b7 online":"");
+    var sec=x.state==="secured";
+    tdS.textContent=(sec?"secured":"learned")+(sec?"":x.shared?" \u00b7 shared":x.locked?" \u00b7 locked":" \u00b7 unlocked")+(x.online?" \u00b7 online":"");
     var tdA=document.createElement("td");
     if(x.state!=="secured"){
       var b=document.createElement("button");

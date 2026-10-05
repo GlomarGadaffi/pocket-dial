@@ -370,8 +370,10 @@ Reports the SIP registrar admission mode and the adopted-extension roster. Gated
   "attached": true,
   "mode": "learn",
   "devices": [
-    { "mac": "805ec079c37f", "extension": "1001", "state": "secured", "online": true },
-    { "mac": "805ec079c380", "extension": "1002", "state": "learned",  "online": false }
+    { "mac": "805ec079c37f", "extension": "1001", "state": "secured", "online": true,  "locked": true,  "shared": false },
+    { "mac": "805ec079c380", "extension": "1002", "state": "learned",  "online": false, "locked": true,  "shared": false },
+    { "mac": "805ec079c381", "extension": "1003", "state": "learned",  "online": true,  "locked": false, "shared": true  },
+    { "mac": "805ec079c382", "extension": "1004", "state": "learned",  "online": true,  "locked": false, "shared": false }
   ]
 }
 ```
@@ -386,6 +388,12 @@ Reports the SIP registrar admission mode and the adopted-extension roster. Gated
 * `state`, `learned` (adopted on first contact, not yet enforced) or `secured`
   (MAC-locked and digest-enforced for its extension).
 * `online`, volatile registration state; never persisted.
+* `locked`, `shared` (#882), JSON booleans on every row, the registrar's stored Learn flags.
+  `locked`: Learn bound the extension to this MAC. `shared`: this MAC registered a second
+  extension while unlocked (a NAT router, or a phone moved by hand); the row never locks and
+  is the one to forget. Both `false` on a `learned` row is plain TOFU. A `secured` row
+  reports the flags it had when secured and is enforced by its `state` regardless. Assert on
+  the key and its JSON type, so that a missing key does not pass as `false`.
 
 ### 3.13 POST `/api/registrar`
 Sets the admission mode. Cookie **and** `X-CSRF`.

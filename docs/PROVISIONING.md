@@ -420,8 +420,8 @@ Consequences:
   row being forgotten, gets its old extension back from its `.cfg`, and it holds no claim on
   the new one: another device that registers the new extension twice, at least 30 s apart,
   locks it, and the phone then gets `403` there. desmo accepted this residual on 2026-10-04
-  (#852). **Forget the phone's row when you move it** (above). The roster does not show
-  `locked` or `shared` yet (#882).
+  (#852). **Forget the phone's row when you move it** (above). The roster's State column
+  and `GET /api/registrar` show that row as `shared` (it was unlocked) or `locked` (#882).
 * **`forget` re-arms adoption.** `POST /api/registrar/device` with `action=forget` removes the
   record; a later REGISTER in Learn mode re-learns it (`Registrar.hpp:83-85`).
 
