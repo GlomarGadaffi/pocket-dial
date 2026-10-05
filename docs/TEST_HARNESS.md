@@ -323,7 +323,8 @@ TC-AUTH-04 and cascades.
 
 `tests/load/anchor_scenarios.py` runs one named scenario against a rig's anchored outside
 line and computes its own verdict. Its self-test is `tests/tools/test_anchor_scenarios.py`
-(fakes on loopback only). No scenario here has run against a board yet.
+(fakes on loopback only). Hardware results are posted on the issues; the first `x4_cancel_ringing`
+run (#379) is why its timing, below, changed.
 
 **Closure rule** (desmo's approval, [#384](https://github.com/GlomarGadaffi/pocket-dial/issues/384#issuecomment-5966736679), verbatim):
 
@@ -334,11 +335,24 @@ syslog. A run whose counter is 0 is INVALID, never PASS.
 
 | Scenario | For | Run | Counter | PASS also needs |
 |---|---|---|---|---|
-| `x4_cancel_ringing` | #370 (a), #681, #379 (row X4) | 30 calls, 6101 → the designated far end, CANCEL swept 0.6-1.4 s after the INVITE, each ≤ 30 s | `rx554_window`: `startRxIfNeeded: rx task for <leg> still exiting -- not restarting yet (#554)` or `… had exited -- restarting (#554)` | every call ends 487 (#548), or is a legal 2xx-before-CANCEL race (RFC 3261 §9.1: ACKed, BYEd, counted apart); each initiated leg dropped exactly once; no second rx task on a leg without a #554 restart; no INVITE at 6101 or 6104 except the register beep; no reboot, reset-reason change or coredump change |
+| `x4_cancel_ringing` | #370 (a), #681, #379 (row X4) | 30 calls, 6101 → the designated far end, CANCEL swept 0.6-1.4 s after the ringing reference (see CANCEL timing below), each ≤ 30 s (worst case 25.4 s) | `rx554_window`: `startRxIfNeeded: rx task for <leg> still exiting -- not restarting yet (#554)` or `… had exited -- restarting (#554)` | every call ends 487 (#548), or is a legal 2xx-before-CANCEL race (RFC 3261 §9.1: ACKed, BYEd, counted apart); each initiated leg dropped exactly once; no second rx task on a leg without a #554 restart; no INVITE at 6101 or 6104 except the register beep; no reboot, reset-reason change or coredump change. A call with no ringing reference within 8 s is CANCELled at the timeout and is INVALID (counted); two in a row stop the run |
+| `x379_cancel_before_leg` | #379, #681 | up to 10 calls, 6101 → the designated far end, CANCEL 0.3-0.8 s after the INVITE (before the makecall response, so before the 3CX leg exists), each ≤ 30 s (worst case 23.8 s) | `initiated`: `Successfully initiated call to … (own leg <leg>)` | every call ends 487; the leg is dropped exactly once after its own-leg line (`Successfully dropped participant <leg>`), and no drop fails; no `Inbound call on DN …: participant <leg>` line for that leg; no INVITE at 6101 or 6104 except the register beep (UA and `/api/pcap`); no reboot, reset-reason change or coredump change. A call whose own-leg line came before its CANCEL, or never came, is INVALID (the race was not run). No probe needed |
 | `x349_unread_makecall` | #349 | 1 call, 6101 → the far end with `makecall_read_fail` armed, hung up 10 s after the INVITE (≤ 20 s) | `bench_makecall_read_fail`: `BENCHFAULT makecall_read_fail fired` | the probe's `fired` ≥ 1; one `… adopting the call instead of failing it (#349)` line; no INVITE at 6101 or 6104 but the register beep (UA and `/api/pcap`), which also stops the run; no `ORPHANED` and no `makeCall request failed` line; the leg dropped once at hangup (syslog only); sessionCount back to baseline |
 | `x379_never_opened` | #379 (PR1) | 1 call, 6101 (Contact `;line=pd6101`) → the far end with `get_status=403` and `get_max_attempts=12`, ≤ 30 s | `get_budget_spent`: `GET stream … attempt 12/12` | both faults' `fired` ≥ 1; attempt lines count to `/12`; the board drops the leg once on its own after the spent budget, before any `endCall` of the call (MediaNeverOpened); exactly one BYE at 6101, matching Call-ID and tags, at its registered Contact, answered 200 (UA and `/api/pcap`). A give-up by the transport or rebuild branch is INVALID, with its drop count recorded (#384 S6) |
 | `x518_403_clean_giveup` | #518, #379 | the same run | `get_refused_403`: `GET stream refused (HTTP 403) for …/participants/<leg>/stream` | everything `x379_never_opened` needs |
 | `x279_degraded_bye` | #279 (Connected variant) | 1 answered call, 6101 sends RTP (Contact `;line=pd6101`); `post_stream_fail` armed 1.5 s after its POST stream opens; the BYE due within 3 s | `degraded_endcall`: `endCall <Call-ID> reason=anchor audio write failure` | `fired` ≥ 1; exactly one BYE at 6101, matching Call-ID and tags, Request-URI = its registered Contact with its parameters, answered 200; the leg dropped once (syslog only); sessionCount back to baseline; a re-INVITE on the dead dialog gets 481 |
+
+**CANCEL timing.** 3CX's makecall response took 1.8-3.2 s on a real tenant (Stray's corrections on
+[#379](https://github.com/GlomarGadaffi/pocket-dial/issues/379#issuecomment-5985894096) and
+[#681](https://github.com/GlomarGadaffi/pocket-dial/issues/681#issuecomment-5985894278) withdraw the rest of
+that first report), so a CANCEL timed from the INVITE always lands before the 3CX leg exists.
+`x4_cancel_ringing` times it from a ringing reference instead. The PBX's 180 is local ringback sent at
+INVITE time, before the 3CX call is requested (`RequestsHandler.cpp`, `originateAnchorCall`), and no 183 or
+early RTP follows, so no SIP message says the far leg rings. The reference is the first syslog line
+`Upset <leg> -> control leg <leg> status '<not Connected>'` for a leg this INVITE started: 3CX lists our leg
+and it is not yet Connected, which the firmware itself calls ringing (#667). It does not prove the far phone
+is alerting. No reference within 8 s: the call is CANCELled at the timeout and is INVALID; a refusal first (a
+503) is still a FAIL. `x379_cancel_before_leg` keeps the old timing on purpose.
 
 **Probe scenarios** (`x349`, `x379`, `x518`, `x279`) drive the bench probe image
 ([BENCH_PROBE.md](BENCH_PROBE.md)). On top of the preconditions below, `--expect-version` must be
@@ -355,7 +369,7 @@ a real 200, so it fits the 30 s call cap. The Held variant of `x279` and `x350`/
 registered.
 
 **Safety preconditions.** Each one is refused before anything is sent (exit 2), except
-the S1 pin, which is checked against the board:
+the S1 pin and the far-end check, which are made against the board:
 
 - a discussion #428 CHECK-OUT link whose expiry covers the run;
 - `--approval-url` is one of the recorded approvals (`APPROVALS`: the #384 comment above and
@@ -371,6 +385,12 @@ the S1 pin, which is checked against the board:
   roster shows 6104 at this run's own address. It is checked before the first call, between
   calls and while idle. A lapse stops the run as INVALID, because a lapsed pin falls back to
   ring-all.
+- the far end must not route back into this board: a far end equal to the active slot's route DN, or to
+  the DID or the extension of any `/api/did-mapping` row (compared as numbers, E.164-equivalent), is
+  INVALID before the first packet and again if a row appears between calls. The board exposes its route
+  DN and its DID rows, not the tenant's own inbound numbers, so a far end that is one of those cannot be
+  caught here, and every phantom verdict says it is a firmware finding only if the far end cannot route
+  back. Confirm the far end first.
 - **RING-REQUIRED**: until the far end is confirmed automated, a run against real 3CX needs
   desmo's OK for that run. The script prints this but does not enforce it.
 

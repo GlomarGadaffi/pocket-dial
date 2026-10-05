@@ -231,6 +231,78 @@ class CancelAfterTest(AgentCase):
         self.assertEqual(p.all("CANCEL"), [])
 
 
+class CancelWhenTest(AgentCase):
+    """invite(cancel_when=fn, cancel_when_timeout_s=N): the CANCEL goes when the caller's own
+    signal says so (fn(invite_sent_at) -> the monotonic time it is due, or None), not N ms
+    after the INVITE. The anchor scenarios use it to time a CANCEL from a log line."""
+
+    def test_the_cancel_goes_at_the_time_the_signal_gives_not_at_the_invite(self):
+        p = self.peer(ringing_then_487)                  # rings at once
+        sig, seen = {}, []
+
+        def when(since):
+            seen.append(since)
+            return sig.get("t")                          # None until the signal is known
+
+        def signal():
+            time.sleep(0.6)
+            sig["t"] = time.monotonic() + 0.3            # due 0.3 s after the signal
+        threading.Thread(target=signal, daemon=True).start()
+        dlg = self.agent(p).invite(FAR, cancel_when=when, cancel_when_timeout_s=3.0)
+        self.assertEqual((dlg.final_status, dlg.cancel_status), (487, 200))
+        self.assertFalse(dlg.cancel_when_expired)
+        self.assertEqual(seen[0], dlg.invite_sent_at, "fn is told when the INVITE went")
+        self.assertAlmostEqual(dlg.cancel_sent_at - dlg.invite_sent_at, 0.9, delta=0.15)
+        t_inv, _ = p.first("INVITE")
+        t_can, _ = p.first("CANCEL")
+        self.assertGreaterEqual(t_can - t_inv, 0.88, "the CANCEL went before the signal's time")
+
+    def test_a_signal_that_never_comes_cancels_at_the_timeout_and_says_so(self):
+        p = self.peer(ringing_then_487)
+        dlg = self.agent(p).invite(FAR, cancel_when=lambda since: None, cancel_when_timeout_s=0.7)
+        self.assertTrue(dlg.cancel_when_expired)
+        self.assertEqual(dlg.final_status, 487, "the handset is never left ringing")
+        self.assertAlmostEqual(dlg.cancel_sent_at - dlg.invite_sent_at, 0.7, delta=0.15)
+        self.assertEqual(len(p.all("CANCEL")), 1)
+
+    def test_a_signal_function_that_raises_cancels_at_once_and_says_so(self):
+        def boom(since):
+            raise RuntimeError("harness bug")
+        p = self.peer(ringing_then_487)
+        dlg = self.agent(p).invite(FAR, cancel_when=boom, cancel_when_timeout_s=3.0)
+        self.assertTrue(dlg.cancel_when_expired)
+        self.assertIn("harness bug", dlg.cancel_when_error)
+        self.assertEqual(dlg.final_status, 487)
+        self.assertLess(dlg.cancel_sent_at - dlg.invite_sent_at, 0.5)
+
+    def test_no_cancel_before_a_provisional_even_when_the_signal_is_due(self):
+        p = self.peer(lambda peer, m, a: ringing_then_487(peer, m, a, provisional_after=0.6))
+        dlg = self.agent(p).invite(FAR, cancel_when=lambda since: time.monotonic(), cancel_when_timeout_s=3.0)
+        t_inv, _ = p.first("INVITE")
+        t_can, _ = p.first("CANCEL")
+        self.assertEqual(dlg.final_status, 487)
+        self.assertGreaterEqual(t_can - t_inv, 0.6, "s9.1: a CANCEL went before any provisional response")
+
+    def test_a_final_before_the_signal_sends_no_cancel_and_is_not_expired(self):
+        def busy(peer, msg, addr):
+            if msg.method == "INVITE" and not msg.is_response:
+                peer.reply(msg, 503, "Service Unavailable", addr, to_tag="b1")
+        p = self.peer(busy)
+        dlg = self.agent(p).invite(FAR, cancel_when=lambda since: None, cancel_when_timeout_s=3.0)
+        time.sleep(0.3)
+        self.assertEqual(dlg.final_status, 503)
+        self.assertIsNone(dlg.cancel_sent_at)
+        self.assertFalse(dlg.cancel_when_expired)
+        self.assertEqual(p.all("CANCEL"), [])
+
+    def test_the_wait_is_always_bounded_and_the_two_timings_exclude_each_other(self):
+        a = self.agent(self.peer(lambda *x: None))
+        with self.assertRaises(ValueError):
+            a.invite(FAR, cancel_when=lambda since: None)
+        with self.assertRaises(ValueError):
+            a.invite(FAR, cancel_after_ms=100, cancel_when=lambda since: None, cancel_when_timeout_s=1.0)
+
+
 class DialogTest(AgentCase):
     def test_hold_and_resume_are_in_dialog_reinvites(self):
         def answer(peer, msg, addr):
@@ -468,9 +540,10 @@ class RefusalTest(unittest.TestCase):
             an.scenario(name="x_none", uas={"caller": "6101", "detector": "6104"}, calls=1,
                         call_cap_s=10, judge=lambda *a: ([], [], {}))(lambda run, sc: None)
         self.assertNotIn("x_none", an.SCENARIOS)
+        # x379_cancel_before_leg joined the registry with this change (the CANCEL-before-the-leg race)
         self.assertEqual(sorted(an.SCENARIOS), ["x279_degraded_bye", "x349_unread_makecall",
-                                                "x379_never_opened", "x4_cancel_ringing",
-                                                "x518_403_clean_giveup"])
+                                                "x379_cancel_before_leg", "x379_never_opened",
+                                                "x4_cancel_ringing", "x518_403_clean_giveup"])
 
     def test_dry_run_prints_the_plan_and_the_ring_required_banner(self):
         rc, out = run_main(cli("--dry-run"), base_env(), http=NoNetwork())
@@ -527,6 +600,125 @@ class CounterTest(unittest.TestCase):
         self.assertIn("no 180 before it", an.x4_classify(dict(base, final=503, provisional=[[100, 5]]))[1])
         self.assertIn("#548", an.x4_classify(dict(base, final=None))[1])
 
+    def test_classify_a_call_with_no_ringing_reference(self):
+        base = {"final": 487, "cancel_status": 200, "cancel_sent_ms": 8000, "cancel_answered_ms": 8004,
+                "final_ms": 8010, "provisional": [[100, 5], [180, 6]], "bye": None, "ref_timeout": True}
+        self.assertEqual(an.x4_classify(base), ("no_ringing_ref", None),
+                         "a CANCEL sent at the timeout is not a CANCEL while ringing: counted apart")
+        self.assertEqual(an.x4_classify(dict(base, ref_timeout=False)), ("cancelled", None))
+        # a real fault on that call is still a FAIL: the CANCEL got a 503, or no final came at all
+        self.assertEqual(an.x4_classify(dict(base, final=503))[0], "refused")
+        self.assertIn("final 503", an.x4_classify(dict(base, final=503))[1])
+        self.assertEqual(an.x4_classify(dict(base, final=None))[0], "no_final")
+
+    def test_the_ringing_and_inbound_counters(self):
+        c = an.count_lines([
+            "I (1) TelephonyAnchor: Upset 38 -> control leg 38 status 'Dialing'",
+            "I (2) TelephonyAnchor: Upset 38 -> control leg 38 status 'Ringing'",
+            "I (3) TelephonyAnchor: Upset 38 -> control leg 38 status 'Connected'",
+            "I (4) TelephonyAnchor: Upset 38 -> control leg 38 status ''",
+            "I (5) TelephonyAnchor: Inbound call on DN rcv2: participant 38 caller ''",
+            "I (6) TelephonyAnchor: Inbound call on DN : participant 39 caller '5551234'",
+        ])
+        self.assertEqual(c["leg_listed"], 2, "'Connected' and an empty status are not ringing (#667)")
+        self.assertEqual(c["inbound_call"], 2, "an empty DN still counts")
+        self.assertEqual(list(an.per_leg(["Inbound call on DN rcv2: participant 38 caller ''"], "inbound_call")),
+                         ["38"])
+        self.assertEqual(list(an.per_leg(["Upset 7 -> control leg 38 status 'Dialing'"], "leg_listed")), ["38"],
+                         "keyed by the CONTROL leg, the one the slot owns")
+
+    def test_the_x4_per_call_budget_arithmetic(self):
+        sc = an.SCENARIOS["x4_cancel_ringing"]
+        self.assertEqual((an.AGENT_TXN_TIMEOUT_S, an.AGENT_INVITE_TIMEOUT_S), (8.0, 16.0),
+                         "the sip_agent defaults the scenarios run with")
+        self.assertEqual((sc["ref_timeout_s"], sc["cancel_ms"], sc["call_cap_s"], sc["calls"]),
+                         (8.0, (600, 1400), 30, 30))
+        # the CANCEL leaves by 8 + 1.4 s; its own transaction and a BYE after a crossed 2xx may each take 8 s
+        self.assertAlmostEqual(an.ref_call_worst_s(sc), 8.0 + 1.4 + 8.0 + 8.0)
+        self.assertLessEqual(an.ref_call_worst_s(sc), sc["call_cap_s"])
+        self.assertEqual(an.scenario_problems(sc), [])
+        self.assertGreaterEqual(sc["ref_timeout_s"], 2 * an.MAKECALL_OBSERVED_MAX_S)
+        # 12.6 s is the longest wait that fits: 12.6 + 1.4 + 16 = 30.0 s. 12 s still fits (29.4 s).
+        self.assertEqual(an.scenario_problems(dict(sc, ref_timeout_s=12)), [])
+        for t in (13, 20, 60):
+            self.assertTrue(any("past the" in p for p in an.scenario_problems(dict(sc, ref_timeout_s=t))), t)
+        # the INVITE transaction (16 s) must outlive the CANCEL and the PBX's 487
+        self.assertTrue(any("INVITE" in p for p in an.scenario_problems(dict(sc, ref_timeout_s=14))))
+        # shorter than twice the slowest makecall response seen on a board (3.2 s)
+        self.assertTrue(any("makecall" in p for p in an.scenario_problems(dict(sc, ref_timeout_s=5))))
+        self.assertTrue(an.scenario_problems(dict(sc, cancel_ms=(1400, 600))))
+
+    def test_the_x379_per_call_budget_arithmetic(self):
+        sc = an.SCENARIOS["x379_cancel_before_leg"]
+        self.assertEqual((sc["calls"], sc["cancel_ms"], sc["path_counter"], sc["call_cap_s"]),
+                         (10, (300, 800), "initiated", 30))
+        # the agent part (0.8 s sweep + CANCEL and BYE transactions) or the wait for the leg, whichever
+        # is longer, then the drop wait and the settle
+        want = max(0.8 + 2 * 8.0, sc["leg_wait_s"]) + sc["drop_wait_s"] + sc["settle_s"]
+        self.assertAlmostEqual(an.x379_call_worst_s(sc), want)
+        self.assertLessEqual(an.x379_call_worst_s(sc), sc["call_cap_s"])
+        self.assertEqual(an.scenario_problems(sc), [])
+        self.assertGreaterEqual(sc["leg_wait_s"], 2 * an.MAKECALL_OBSERVED_MAX_S)
+        self.assertTrue(any("past the" in p for p in an.scenario_problems(dict(sc, leg_wait_s=30))))
+        self.assertTrue(any("past the" in p for p in an.scenario_problems(dict(sc, drop_wait_s=12))))
+        self.assertTrue(any("makecall" in p for p in an.scenario_problems(dict(sc, leg_wait_s=4))))
+        # the CANCEL must still precede the FASTEST makecall response seen on a board (1.8 s)
+        self.assertLess(sc["cancel_ms"][1] / 1000.0, an.MAKECALL_OBSERVED_MIN_S)
+        self.assertTrue(any("makecall" in p for p in an.scenario_problems(dict(sc, cancel_ms=(300, 2000)))))
+
+    def test_a_scenario_may_cap_its_own_calls(self):
+        sc = an.SCENARIOS["x379_cancel_before_leg"]
+        self.assertTrue(any("calls must be 1-10" in p for p in an.scenario_problems(dict(sc, calls=11))))
+        self.assertEqual(an.scenario_problems(dict(sc, calls=10)), [])
+        x4 = an.SCENARIOS["x4_cancel_ringing"]
+        self.assertTrue(any("calls must be 1-30" in p for p in an.scenario_problems(dict(x4, calls=31))))
+        self.assertEqual(an.scenario_problems(dict(x4, calls=30)), [])
+        self.assertEqual(an.MAX_CALLS, 30)
+
+
+class LoopbackFarEndTest(unittest.TestCase):
+    """A far end that routes straight back to this board's own route DN makes every call arrive
+    as an inbound call on that DN. The board exposes the route DN and the DID rows, not the
+    tenant's own numbers, so only those can be checked."""
+
+    ROWS = [{"did": "rcv2", "extension": "6104"}, {"did": "+15550101111", "extension": "1003"}]
+
+    def test_same_number(self):
+        for a, b in (("15550104242", "15550104242"), ("+15550104242", "5550104242"),
+                     ("15550104242", "+1 (555) 010-4242"), ("5550104242", "15550104242"),
+                     ("4242", "4242")):
+            self.assertTrue(an.same_number(a, b), (a, b))
+        for a, b in (("15550104242", "15550104243"), ("4242", "14242"), ("555", "5550104242"),
+                     ("rcv2", "2"), ("", "4242"), (None, None)):
+            self.assertFalse(an.same_number(a, b), (a, b))
+
+    def test_the_route_dn_a_did_row_and_an_extension_are_each_refused(self):
+        far = "15550104242"
+        self.assertEqual(an.far_end_loopback_problems(far, "rcv2", self.ROWS), [])
+        self.assertEqual(an.far_end_loopback_problems(far, "+15550101234", self.ROWS), [])
+        cases = ((far, "+1 555 010 4242", self.ROWS, "route DN"),
+                 ("5550104242", "+15550104242", self.ROWS, "route DN"),
+                 (far, "rcv2", self.ROWS + [{"did": "+1 (555) 010-4242", "extension": "1001"}], "DID row"),
+                 (far, "rcv2", self.ROWS + [{"did": "5550104242", "extension": "1001"}], "DID row"),
+                 ("4242", "rcv2", self.ROWS + [{"did": "rcv9", "extension": "4242"}], "extension"))
+        for f, dn, rows, needle in cases:
+            problems = an.far_end_loopback_problems(f, dn, rows)
+            self.assertEqual(len(problems), 1, (f, dn, rows))
+            self.assertIn(needle, problems[0])
+            for secret in (f, f.lstrip("+"), dn):
+                self.assertNotIn(secret, problems[0], "the number is never echoed")
+
+    def test_a_non_numeric_route_dn_never_matches_by_its_digits(self):
+        # "rcv2" has the digit 2 in it; a far end ending in 2 is not "rcv2"
+        self.assertEqual(an.far_end_loopback_problems("15550104242", "rcv2", self.ROWS), [])
+        self.assertEqual(an.far_end_loopback_problems("102", "r102", [{"did": "r102", "extension": "6104"}]), [])
+
+    def test_a_malformed_row_is_skipped_not_fatal(self):
+        rows = ["x", None, {"did": None, "extension": None}, {"did": 5550104242, "extension": "1"}]
+        problems = an.far_end_loopback_problems("15550104242", "rcv2", rows)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("DID row", problems[0])
+
 
 # ---------------------------------------------------------------- the fake board
 class FakeBoard(FakePbx):
@@ -554,6 +746,21 @@ class FakeBoard(FakePbx):
         self.n_calls = 0
         self.leg = 40
         self.cancels = []
+        # the real board's order for an outbound anchored call: the 180 is local ringback at INVITE time,
+        # the 3CX leg exists only once the makecall response is in, and 3CX lists it a little later
+        self.leg_delay_s = 0.0            # makecall latency: the own-leg lines come this long after the INVITE
+        self.upset_status = "Dialing"     # the status 3CX's participant list gives our leg; None: no Upset line
+        self.upset_delay_s = 0.0          # the Upset line comes this long after the own-leg line
+        self.no_upset_calls = set()       # call indexes that never log an Upset line
+        self.no_leg_calls = set()         # call indexes whose makecall response never comes (no own-leg line)
+        self.drop_delay_s = 0.0           # a CANCEL that beat the leg: its drop follows the leg by this long
+        self.drop_counts = {}             # call index -> number of drop lines (default 1)
+        self.drop_failed_calls = set()    # call indexes whose drop also logs a failure line
+        self.inbound_calls = set()        # call indexes whose leg is announced "Inbound call on DN" after its drop
+        self.upset_times = {}             # call index -> monotonic time its Upset line was sent
+        self.leg_times = {}               # call index -> monotonic time its own-leg line was sent
+        self.did_reads = 0
+        self.late_mappings, self.late_after = [], None   # DID rows that appear after N did-mapping reads
         self.log_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def stop(self):
@@ -584,15 +791,39 @@ class FakeBoard(FakePbx):
         i, self.n_calls = self.n_calls, self.n_calls + 1
         self.leg += 1
         leg, tag = str(self.leg), rand_hex(6)
-        self.calls[req.call_id()] = {"req": req, "addr": addr, "leg": leg, "tag": tag, "i": i}
+        c = {"req": req, "addr": addr, "leg": leg, "tag": tag, "i": i, "cancelled": False, "leg_up": False}
+        self.calls[req.call_id()] = c
         self._reply(req, addr, 100, "Trying")
         self.log("anchor(6101): 6101 ringing (async makeCall dispatched)")
         if i in self.refuse_calls:
             self._reply(req, addr, 180, "Ringing", to_tag=tag)
             self.log("[Telephony] Failed to initiate outbound call to %s" % FAR)
-            self.calls[req.call_id()]["done"] = True
+            c["done"] = True
             self._reply(req, addr, 503, "Service Unavailable", to_tag=tag)
             return
+        if self.leg_delay_s > 0:
+            self._reply(req, addr, 180, "Ringing", to_tag=tag)
+            threading.Timer(self.leg_delay_s, self._leg_up_later, (c,)).start()
+        else:
+            self._leg_up(c)                       # before the 180, as the first version of this fake did
+            self._reply(req, addr, 180, "Ringing", to_tag=tag)
+        if i in self.phantom_calls and "6104" in self.bindings:
+            b = self.bindings["6104"]
+            self._request("INVITE", "sip:%s@%s:%d" % (self.route_dn, b["addr"][0], b["addr"][1]),
+                          '"%s" <sip:%s@%s:%d>;tag=ph' % (FAR, self.route_dn, self.host, self.port),
+                          "<sip:%s@%s>" % (self.route_dn, self.host), "ph-" + rand_hex(6), 1, b["addr"],
+                          on_response=lambda r: None)
+
+    def _leg_up_later(self, c):
+        with self.lock:
+            self._leg_up(c)
+
+    def _leg_up(self, c):
+        """The makecall response is in: the own-leg lines, then 3CX lists the leg (the Upset line)."""
+        i, leg = c["i"], c["leg"]
+        if i in self.no_leg_calls:
+            return
+        self.leg_times[i] = time.monotonic()
         self.log("TelephonyAnchor: Successfully initiated call to %s (own leg %s)" % (FAR, leg))
         self.log("TelephonyAnchor: POST (device->Telephony) audio stream OPEN: https://%s/callcontrol/%s/"
                  "participants/%s/stream" % (TENANT, self.route_dn, leg))
@@ -601,13 +832,41 @@ class FakeBoard(FakePbx):
         if i in self.window_calls:
             self.log("TelephonyAnchor: startRxIfNeeded: rx task for %s still exiting -- not restarting "
                      "yet (#554)" % leg)
-        self._reply(req, addr, 180, "Ringing", to_tag=tag)
-        if i in self.phantom_calls and "6104" in self.bindings:
-            b = self.bindings["6104"]
-            self._request("INVITE", "sip:%s@%s:%d" % (self.route_dn, b["addr"][0], b["addr"][1]),
-                          '"%s" <sip:%s@%s:%d>;tag=ph' % (FAR, self.route_dn, self.host, self.port),
-                          "<sip:%s@%s>" % (self.route_dn, self.host), "ph-" + rand_hex(6), 1, b["addr"],
-                          on_response=lambda r: None)
+        c["leg_up"] = True
+        if self.upset_status is not None and i not in self.no_upset_calls:
+            if self.upset_delay_s > 0:
+                threading.Timer(self.upset_delay_s, self._upset_later, (c,)).start()
+            else:
+                self._upset(c)
+        if c["cancelled"]:                        # the CANCEL beat the makecall response: drop it now
+            if self.drop_delay_s > 0:
+                threading.Timer(self.drop_delay_s, self._drop_later, (c,)).start()
+            else:
+                self._drop(c)
+
+    def _upset_later(self, c):
+        with self.lock:
+            self._upset(c)
+
+    def _upset(self, c):
+        if c["cancelled"]:
+            return
+        self.upset_times[c["i"]] = time.monotonic()
+        self.log("TelephonyAnchor: Upset %s -> control leg %s status '%s'" % (c["leg"], c["leg"],
+                                                                              self.upset_status))
+
+    def _drop_later(self, c):
+        with self.lock:
+            self._drop(c)
+
+    def _drop(self, c):
+        i, leg = c["i"], c["leg"]
+        for _ in range(0 if i in self.undropped_calls else self.drop_counts.get(i, 1)):
+            self.log("TelephonyAnchor: Successfully dropped participant %s" % leg)
+        if i in self.drop_failed_calls:
+            self.log("TelephonyAnchor: dropCall request failed for participant %s (status=403)" % leg)
+        if i in self.inbound_calls:
+            self.log("TelephonyAnchor: Inbound call on DN %s: participant %s caller ''" % (self.route_dn, leg))
 
     def _on_cancel(self, req, addr):
         self._reply(req, addr, 200, "OK")
@@ -616,9 +875,10 @@ class FakeBoard(FakePbx):
         if c is None or c.get("done"):
             return
         c["done"] = True
+        c["cancelled"] = True
         self._send(self._resp(c["req"], 487, "Request Terminated", to_tag=c["tag"]), c["addr"])
-        if c["i"] not in self.undropped_calls:
-            self.log("TelephonyAnchor: Successfully dropped participant %s" % c["leg"])
+        if c.get("leg_up"):
+            self._drop(c)
         if self.reboot_after_call == c["i"]:
             self.uptime_base = -10**6
 
@@ -681,7 +941,9 @@ class FakeBoard(FakePbx):
                     if not self._session(False):
                         return self._send(401, {"error": "authentication required"})
                     if path == "/api/did-mapping":
-                        return self._send(200, {"mappings": board.mappings})
+                        board.did_reads += 1
+                        late = board.late_after is not None and board.did_reads > board.late_after
+                        return self._send(200, {"mappings": board.mappings + (board.late_mappings if late else [])})
                     if path == "/api/telephony-config":
                         return self._send(200, {"slots": [{"index": 0, "type": "3cx", "enabled": True,
                                                            "implemented": True, "active": True,
@@ -762,16 +1024,19 @@ class RunTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.loggers = []
 
-    def go(self, *extra, overrides=None, env=None):
+    def go(self, *extra, overrides=None, env=None, scenario="x4_cancel_ringing", fast=None, pin_check="0.05"):
         def start_logger(argv, out_path):
             lg = FakeLogger(self.board, argv, out_path)
             self.loggers.append(lg)
             return lg
         argv = cli("--port", str(self.board.port), "--http-port", str(self.http_port), "--local-ip", "127.0.0.1",
-                   "--syslog-port", "0", "--set-syslog", "--pin-check-s", "0.05", "--out", self.tmp.name,
-                   "--expect-version", "v1.5.0-fake", *extra)
-        rc, out = run_main(argv, env or base_env(), start_logger=start_logger,
-                           overrides=dict(FAST, **(overrides or {})), run_defaults=FAST_RUN)
+                   "--syslog-port", "0", "--set-syslog", "--pin-check-s", pin_check, "--out", self.tmp.name,
+                   "--expect-version", "v1.5.0-fake", *extra, scenario=scenario)
+        # the fast fakes shrink every wait to a fraction of a second, below the floor a real run keeps
+        # above the slowest makecall response seen on a board (CounterTest pins that floor itself)
+        with mock.patch.object(an, "MAKECALL_OBSERVED_MAX_S", 0.0):
+            rc, out = run_main(argv, env or base_env(), start_logger=start_logger,
+                               overrides=dict(fast or FAST, **(overrides or {})), run_defaults=FAST_RUN)
         dirs = [d for d in os.listdir(self.tmp.name) if os.path.isdir(os.path.join(self.tmp.name, d))]
         self.assertEqual(len(dirs), 1, out)
         self.res = os.path.join(self.tmp.name, dirs[0])
@@ -809,6 +1074,13 @@ class RunTest(unittest.TestCase):
         sent = [c["cancel_sent_ms"] for c in self.calls()]
         for got, want in zip(sent, (100, 200, 300)):
             self.assertAlmostEqual(got, want, delta=120)
+        # every CANCEL is timed from the ringing reference, and went after it, never before
+        for c in self.calls():
+            self.assertIsNotNone(c["ring_ref_ms"])
+            self.assertFalse(c["ref_timeout"])
+            self.assertGreater(c["cancel_sent_ms"], c["ring_ref_ms"])
+            self.assertAlmostEqual(c["cancel_after_ref_ms"], c["cancel_planned_ms"], delta=100)
+        self.assertEqual(self.manifest["summary"]["buckets"], {"cancelled": 3})
         pcaps = sorted(os.listdir(os.path.join(self.res, "pcap")))
         self.assertEqual(pcaps, ["call-01.pcap", "call-02.pcap", "call-03.pcap", "end.pcap"])
         with open(os.path.join(self.res, "pcap", "call-01.pcap"), "rb") as f:
@@ -843,6 +1115,10 @@ class RunTest(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("call 2: final 503 instead of 487 (a 180 before it", out)
         self.assertEqual([c["final"] for c in self.calls()], [487, 503, 487])
+        # a refusal that beats the ringing reference is the #681 finding, a FAIL, not "no reference"
+        self.assertEqual(self.calls()[1]["bucket"], "refused")
+        self.assertFalse(self.calls()[1]["ref_timeout"])
+        self.assertNotIn("no ringing reference", out)
 
     def test_fail_on_a_phantom_inbound_at_6104(self):
         self.board.phantom_calls = {0}
@@ -851,6 +1127,113 @@ class RunTest(unittest.TestCase):
         self.assertIn("a phantom inbound (S1)", out)
         self.assertEqual(len(self.calls()), 1, "no call after the first phantom")
         self.assert_no_secret_anywhere(out)
+
+    def test_the_phantom_verdict_says_when_it_is_not_a_firmware_finding(self):
+        self.board.phantom_calls = {0}
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn(an.LOOPBACK_CAVEAT, out)
+
+    # -- x4: the CANCEL is timed from the ringing signal, not the INVITE
+    def test_x4_the_cancel_is_timed_from_the_ringing_signal_not_the_invite(self):
+        self.board.leg_delay_s, self.board.upset_delay_s = 0.4, 0.3     # leg at +0.4 s, listed at +0.7 s
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        calls = self.calls()
+        self.assertEqual([c["final"] for c in calls], [487, 487, 487])
+        for i, c in enumerate(calls):
+            self.assertAlmostEqual(c["ring_ref_ms"], 700, delta=250)
+            self.assertGreater(c["cancel_sent_ms"], c["ring_ref_ms"])
+            self.assertAlmostEqual(c["cancel_after_ref_ms"], c["cancel_planned_ms"], delta=100)
+            # what the board saw: the CANCEL after ITS OWN Upset line plus the swept delay, never before
+            self.assertGreaterEqual(self.board.cancels[i] - self.board.upset_times[i],
+                                    c["cancel_planned_ms"] / 1000.0 - 0.01, "call %d" % (i + 1))
+
+    def test_x4_the_own_leg_line_alone_does_not_start_the_clock(self):
+        # the leg exists at +0.2 s but 3CX lists it only at +0.8 s: ringing is the listing, not the leg
+        self.board.leg_delay_s, self.board.upset_delay_s = 0.2, 0.6
+        rc, out = self.go(overrides={"calls": 2})
+        self.assertEqual(rc, 0, out)
+        for i, c in enumerate(self.calls()):
+            self.assertAlmostEqual(c["ring_ref_ms"], 800, delta=250)
+            self.assertGreaterEqual(self.board.cancels[i] - self.board.upset_times[i],
+                                    c["cancel_planned_ms"] / 1000.0 - 0.01)
+            self.assertGreater(self.board.cancels[i] - self.board.leg_times[i], 0.6)
+
+    def test_x4_a_connected_status_is_not_ringing(self):
+        self.board.upset_status = "Connected"
+        rc, out = self.go(overrides={"ref_timeout_s": 0.5})
+        self.assertEqual(rc, 3, out)
+        self.assertEqual({c["bucket"] for c in self.calls()}, {"no_ringing_ref"})
+        self.assertTrue(all(c["ref_timeout"] for c in self.calls()))
+
+    def test_x4_an_empty_status_is_not_ringing(self):
+        self.board.upset_status = ""
+        rc, out = self.go(overrides={"ref_timeout_s": 0.5})
+        self.assertEqual(rc, 3, out)
+        self.assertEqual({c["bucket"] for c in self.calls()}, {"no_ringing_ref"})
+
+    def test_x4_a_call_with_no_ringing_reference_is_invalid_and_counted(self):
+        self.board.no_upset_calls = {1}
+        rc, out = self.go(overrides={"ref_timeout_s": 0.6})
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(self.manifest["verdict"], "INVALID")
+        calls = self.calls()
+        self.assertEqual(len(calls), 3, "one miss does not stop the run")
+        self.assertEqual(self.manifest["summary"]["buckets"], {"cancelled": 2, "no_ringing_ref": 1})
+        miss = calls[1]
+        self.assertTrue(miss["ref_timeout"])
+        self.assertIsNone(miss["ring_ref_ms"])
+        self.assertEqual(miss["final"], 487, "the handset is CANCELled at the timeout, never left ringing")
+        self.assertAlmostEqual(miss["cancel_sent_ms"], 600, delta=150)
+        self.assertEqual(miss["ref_stage"], "the leg was never listed as ringing")
+        self.assertTrue(any("1 of 3 calls had no ringing reference" in r and "call 2" in r
+                            for r in self.manifest["invalid_reasons"]), self.manifest["invalid_reasons"])
+        self.assertEqual(self.manifest["fail_reasons"], [])
+
+    def test_x4_no_ringing_reference_says_whether_the_leg_was_seen(self):
+        self.board.no_leg_calls = {0}
+        self.board.no_upset_calls = {1}
+        rc, out = self.go(overrides={"ref_timeout_s": 0.6, "calls": 2})
+        self.assertEqual(rc, 3, out)
+        self.assertEqual([c["ref_stage"] for c in self.calls()],
+                         ["no own-leg line: the makecall response never came",
+                          "the leg was never listed as ringing"])
+
+    def test_x4_two_calls_in_a_row_without_a_reference_stop_the_run(self):
+        self.board.upset_status = None
+        rc, out = self.go(overrides={"ref_timeout_s": 0.5, "calls": 3})
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(an.MAX_NO_REF, 2)
+        self.assertEqual(len(self.calls()), 2, "the third call is never placed")
+        self.assertEqual(len(self.board.invite_users), 2)
+        self.assertIn("2 calls in a row had no ringing reference", out)
+
+    def test_x4_a_miss_between_hits_does_not_stop_the_run(self):
+        self.board.no_upset_calls = {0, 2}
+        rc, out = self.go(overrides={"ref_timeout_s": 0.5, "calls": 4})
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(len(self.calls()), 4)
+        self.assertEqual(self.manifest["summary"]["buckets"], {"no_ringing_ref": 2, "cancelled": 2})
+
+    def test_x4_a_phantom_during_the_reference_wait_cancels_at_once_and_stops_the_run(self):
+        self.board.upset_status = None                  # the reference will never come
+        self.board.phantom_calls = {0}
+        rc, out = self.go(overrides={"ref_timeout_s": 5.0})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a phantom inbound (S1)", out)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        self.assertLess(calls[0]["cancel_sent_ms"], 1500, "the wait ended at the phantom, not at the 5 s timeout")
+        self.assertFalse(calls[0]["ref_timeout"])
+        self.assertEqual(calls[0]["final"], 487)
+
+    def test_x4_every_call_stays_inside_the_cap_even_with_a_slow_makecall(self):
+        self.board.leg_delay_s, self.board.upset_delay_s = 0.8, 0.5
+        rc, out = self.go(overrides={"calls": 2, "ref_timeout_s": 3.0})
+        self.assertEqual(rc, 0, out)
+        for c in self.calls():
+            self.assertLess(c["duration_s"], an.SCENARIOS["x4_cancel_ringing"]["call_cap_s"])
 
     def test_a_did_shaped_route_dn_is_never_written(self):
         did = "+15550109999"
@@ -926,6 +1309,382 @@ class RunTest(unittest.TestCase):
         self.assertEqual(rc, 3, out)
         self.assertIn("status.jsonl", self.manifest["withheld"])
         self.assert_no_secret_anywhere(out)
+
+
+# ---------------------------------------------------------------- x379_cancel_before_leg
+X379 = "x379_cancel_before_leg"
+X379_FAST = {"calls": 2, "cancel_ms": (50, 150), "gap_s": 0.1, "leg_wait_s": 3.0, "drop_wait_s": 1.5,
+             "settle_s": 0.3}
+
+
+class X379CancelBeforeLegTest(unittest.TestCase):
+    """The CANCEL goes 0.3-0.8 s after the INVITE: before the makecall response, so before the
+    3CX leg exists. PASS: 487, the leg dropped exactly once once it does, no inbound-call line
+    for it, no INVITE at 6104, no reboot, no coredump change."""
+
+    setUp = RunTest.setUp
+    go = RunTest.go
+    calls = RunTest.calls
+    assert_no_secret_anywhere = RunTest.assert_no_secret_anywhere
+
+    def run379(self, **kw):
+        self.board.leg_delay_s = kw.pop("leg_delay_s", 0.3)    # makecall latency, past the CANCEL
+        self.board.drop_delay_s = kw.pop("drop_delay_s", 0.1)
+        return self.go(scenario=X379, fast=X379_FAST, **kw)
+
+    def test_the_scenario_is_registered_as_specified(self):
+        sc = an.SCENARIOS[X379]
+        self.assertEqual((sc["issues"], sc["path_counter"], sc["cancel_ms"], sc["calls"], sc["call_cap_s"]),
+                         (("#379", "#681"), "initiated", (300, 800), 10, 30))
+        self.assertEqual(sc["uas"], {"caller": "6101", "detector": "6104"})
+        self.assertTrue(sc["ring_required"])
+        self.assertFalse(sc.get("probe"), "it needs no probe")
+        self.assertEqual(an.scenario_problems(sc), [])
+        self.assertIn("initiated", an.LOG_COUNTERS)
+
+    def test_pass(self):
+        rc, out = self.run379(overrides={"calls": 3})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["verdict"], "PASS")
+        calls = self.calls()
+        self.assertEqual([c["final"] for c in calls], [487, 487, 487])
+        self.assertEqual([c["bucket"] for c in calls], ["cancelled"] * 3)
+        for c, want in zip(calls, (50, 100, 150)):
+            self.assertAlmostEqual(c["cancel_sent_ms"], want, delta=120)    # from the INVITE, no reference
+            self.assertNotIn("ring_ref_ms", c)
+            self.assertTrue(c["cancel_before_leg"])
+            self.assertGreater(c["leg_ms"], c["cancel_sent_ms"])
+            self.assertIsNotNone(c["drop_ms"])
+        lc = self.manifest["log_counters"]
+        self.assertEqual((lc["initiated"], lc["dropped"], lc["inbound_call"], lc["drop_failed"]), (3, 3, 0, 0))
+        self.assertEqual(self.board.invite_users, [FAR] * 3)
+        self.assertEqual(self.manifest["path_counter"]["name"], "initiated")
+        self.assertEqual(self.manifest["summary"]["race_exercised"], 3)
+        self.assertEqual(self.board.bindings, {}, "both test UAs de-registered")
+        self.assertIn("RING-REQUIRED", out)
+        self.assert_no_secret_anywhere(out)
+
+    def test_fail_on_an_inbound_call_line_for_the_dropped_leg(self):
+        self.board.inbound_calls = {1}
+        rc, out = self.run379()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("call 2", out)
+        self.assertIn("Inbound call on DN", out)
+        self.assertIn(an.LOOPBACK_CAVEAT, out)            # a finding only if the far end cannot route back
+        self.assertEqual(self.manifest["log_counters"]["inbound_call"], 1)
+        self.assert_no_secret_anywhere(out)
+
+    def test_an_inbound_call_line_for_another_participant_is_not_this_calls_leg(self):
+        orig = self.board._drop
+
+        def drop_and_announce_someone_else(c):
+            orig(c)
+            self.board.log("TelephonyAnchor: Inbound call on DN %s: participant 9999 caller ''" % ROUTE_DN)
+        self.board._drop = drop_and_announce_someone_else
+        rc, out = self.run379()
+        self.assertEqual(rc, 0, out)
+
+    def test_fail_on_an_invite_at_6104(self):
+        self.board.phantom_calls = {0}
+        rc, out = self.run379()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a phantom inbound (S1)", out)
+        self.assertEqual(len(self.calls()), 1, "the first phantom stops the run")
+        self.assert_no_secret_anywhere(out)
+
+    def test_a_phantom_ends_the_wait_without_waiting_for_the_next_pin_check(self):
+        # a real run checks the pin every 5 s: the wait itself must notice an INVITE at 6104
+        self.board.phantom_calls = {0}
+        rc, out = self.run379(pin_check="30")
+        self.assertEqual(rc, 1, out)
+        self.assertIsNone(self.calls()[0]["leg"], "the wait ended at the phantom, before the leg came up")
+
+    def test_fail_on_an_invite_at_6104_after_the_leg_is_dropped(self):
+        orig = self.board._drop
+
+        def drop_then_phantom(c):
+            orig(c)
+            b = self.board.bindings.get("6104")
+            if b and c["i"] == 1:
+                self.board._request("INVITE", "sip:%s@%s:%d" % (ROUTE_DN, b["addr"][0], b["addr"][1]),
+                                    '"x" <sip:%s@%s:%d>;tag=ph' % (ROUTE_DN, self.board.host, self.board.port),
+                                    "<sip:%s@%s>" % (ROUTE_DN, self.board.host), "ph-" + rand_hex(6), 1,
+                                    b["addr"], on_response=lambda r: None)
+        self.board._drop = drop_then_phantom
+        rc, out = self.run379(drop_delay_s=0.05)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a phantom inbound (S1)", out)
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_invalid_when_a_call_has_no_own_leg_line(self):
+        self.board.no_leg_calls = {1}
+        rc, out = self.run379()
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(self.manifest["verdict"], "INVALID")
+        self.assertTrue(any("call 2" in r and "never came up" in r for r in self.manifest["invalid_reasons"]),
+                        self.manifest["invalid_reasons"])
+        self.assertEqual(self.manifest["fail_reasons"], [])
+        self.assertEqual(self.manifest["summary"]["race_exercised"], 1)
+
+    def test_invalid_when_no_call_ever_gets_a_leg(self):
+        self.board.no_leg_calls = {0, 1}
+        rc, out = self.run379()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("initiated is 0", out)
+        self.assertEqual(self.manifest["log_counters"]["initiated"], 0)
+
+    def test_invalid_when_the_makecall_response_beat_the_cancel(self):
+        # no makecall latency: the own-leg line is logged before the CANCEL goes, so the race is not run
+        rc, out = self.run379(leg_delay_s=0.0)
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(self.manifest["fail_reasons"], [])
+        self.assertTrue(any("before the CANCEL" in r for r in self.manifest["invalid_reasons"]),
+                        self.manifest["invalid_reasons"])
+        self.assertEqual(self.manifest["summary"]["race_exercised"], 0)
+        self.assertFalse(any(c["cancel_before_leg"] for c in self.calls()))
+
+    def test_fail_when_the_leg_is_never_dropped(self):
+        self.board.undropped_calls = {1}
+        rc, out = self.run379()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("never dropped", out)
+        self.assertIn("call 2", out)
+
+    def test_fail_when_the_leg_is_dropped_twice(self):
+        self.board.drop_counts = {1: 2}
+        rc, out = self.run379()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("dropped 2 times", out)
+
+    def test_fail_when_the_drop_fails(self):
+        self.board.drop_failed_calls = {0}
+        rc, out = self.run379()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("failed", out)
+
+    def test_fail_when_the_call_does_not_end_487(self):
+        self.board.refuse_calls = {1}
+        rc, out = self.run379()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("call 2: final 503 instead of 487", out)
+
+    def test_fail_on_a_reboot(self):
+        self.board.reboot_after_call = 0
+        rc, out = self.run379()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("uptime went", out)
+
+    def test_fail_on_a_new_coredump(self):
+        orig = self.board._on_cancel
+
+        def cancel_then_dump(req, addr):
+            orig(req, addr)
+            self.board.coredump = {"present": True, "size": 47264, "supported": True}
+        self.board._on_cancel = cancel_then_dump
+        rc, out = self.run379()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the coredump changed", out)
+
+    def test_fail_on_a_panic_line(self):
+        orig = self.board._drop
+
+        def drop_then_panic(c):
+            orig(c)
+            self.board.log("Guru Meditation Error: Core 1 panic'ed")
+        self.board._drop = drop_then_panic
+        rc, out = self.run379()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a panic line", out)
+
+    def test_the_6104_pin_lapsing_stops_the_run_as_invalid(self):
+        self.board.lapse_after = 4
+        rc, out = self.run379()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the S1 pin lapsed", out)
+        self.assertLess(len(self.calls()), 2)
+
+
+class X379JudgeUnitTest(unittest.TestCase):
+    """x379_judge on hand-made records and log entries: what no fake board flow reaches."""
+
+    SC = an.SCENARIOS[X379]
+
+    @staticmethod
+    def run_of(calls, entries, pcap_phantoms=0):
+        return mock.Mock(calls=calls, agents={"detector": object()}, pcap_count=lambda *a, **k: pcap_phantoms,
+                         syslog=mock.Mock(entries=lambda since=None, until=None: list(entries)))
+
+    def judge(self, calls, entries=(), pcap_phantoms=0):
+        return an.x379_judge(self.run_of(calls, entries, pcap_phantoms), self.SC, [ln for _, ln in entries])
+
+    @staticmethod
+    def rec(**kw):
+        c = {"call": 1, "t_start": 0.0, "final": 487, "bucket": "cancelled", "problem": None, "leg": "7",
+             "cancel_before_leg": True, "duration_s": 3.0, "_leg_t": 5.0}
+        c.update(kw)
+        return c
+
+    LEG = (5.0, "I TelephonyAnchor: Successfully initiated call to x (own leg 7)")
+    DROP = (6.0, "I TelephonyAnchor: Successfully dropped participant 7")
+
+    def test_a_clean_call_passes(self):
+        fails, invalid, summary = self.judge([self.rec()], [self.LEG, self.DROP])
+        self.assertEqual(fails, [])
+        self.assertEqual(invalid, ["only 1 of 10 calls ran"], "the only thing missing is the other calls")
+        self.assertEqual(summary["race_exercised"], 1)
+
+    def test_a_call_that_was_answered_is_a_fail_even_with_no_problem_recorded(self):
+        fails, _, _ = self.judge([self.rec(final=200, bucket="answered_before_cancel")], [self.LEG, self.DROP])
+        self.assertTrue(any("call 1 ended 200, not 487" in f for f in fails), fails)
+
+    def test_a_call_over_the_cap_is_a_fail(self):
+        fails, _, _ = self.judge([self.rec(duration_s=31.0)], [self.LEG, self.DROP])
+        self.assertTrue(any("call 1 took 31.0 s (cap 30 s)" in f for f in fails), fails)
+
+    def test_a_drop_logged_before_its_own_leg_line_is_a_fail(self):
+        fails, _, _ = self.judge([self.rec()], [(4.0, self.DROP[1]), self.LEG])
+        self.assertTrue(any("before its own-leg line" in f for f in fails), fails)
+
+    def test_a_phantom_invite_in_the_pcap_is_a_fail_with_the_caveat(self):
+        fails, _, summary = self.judge([self.rec()], [self.LEG, self.DROP], pcap_phantoms=2)
+        self.assertTrue(any("/api/pcap shows 2 INVITE(s)" in f and an.LOOPBACK_CAVEAT in f for f in fails), fails)
+        self.assertEqual(summary["pcap_phantom_invites"], 2)
+
+    def test_a_second_own_leg_line_in_one_call_is_invalid(self):
+        two = (5.5, "I TelephonyAnchor: Successfully initiated call to x (own leg 8)")
+        _, invalid, _ = self.judge([self.rec()], [self.LEG, two, self.DROP])
+        self.assertTrue(any("more than one own-leg line during call 1" in r for r in invalid), invalid)
+
+
+class FarEndLoopbackRunTest(unittest.TestCase):
+    """The far end is checked against what the board exposes before the first INVITE, and
+    again between calls: its route DN and its DID rows."""
+
+    setUp = RunTest.setUp
+    go = RunTest.go
+    calls = RunTest.calls
+    assert_no_secret_anywhere = RunTest.assert_no_secret_anywhere
+    LOOP = "15550109999"
+
+    def nothing_placed(self):
+        self.assertEqual(self.board.invite_users, [], "no INVITE before the far end is checked")
+        self.assertEqual((self.board.packets, self.board.counts), (0, {}),
+                         "not even a REGISTER: the check is in the preflight, before any SIP")
+        self.assertEqual(self.board.syslog_cfg["enabled"], False, "the board's syslog setting was not touched")
+
+    def check(self, name, needle):
+        rc, out = self.go(scenario=name, fast=X379_FAST if name == X379 else None,
+                          env=base_env(PD_ANCHOR_FAR_END=self.LOOP))
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(self.manifest["verdict"], "INVALID")
+        self.assertIn("preflight", out)
+        self.assertIn(needle, out)
+        self.assertNotIn(self.LOOP, out)
+        self.assertNotIn(self.LOOP[-10:], out)
+        self.nothing_placed()
+
+    def test_a_far_end_equal_to_the_route_dn_is_invalid_before_any_call(self):
+        self.board.route_dn = "+1 555 010 9999"
+        self.board.mappings = [{"did": self.board.route_dn, "extension": "6104"}]
+        self.check("x4_cancel_ringing", "route DN")
+
+    def test_the_same_for_x379(self):
+        self.board.route_dn = "+15550109999"
+        self.board.mappings = [{"did": self.board.route_dn, "extension": "6104"}]
+        self.check(X379, "route DN")
+
+    def test_a_far_end_equal_to_a_did_row_is_invalid_before_any_call(self):
+        self.board.mappings = [{"did": ROUTE_DN, "extension": "6104"}, {"did": "(555) 010-9999", "extension": "1001"}]
+        self.check("x4_cancel_ringing", "DID row")
+
+    def test_a_national_form_of_a_did_row_is_the_same_number(self):
+        self.board.mappings = [{"did": ROUTE_DN, "extension": "6104"}, {"did": "+" + self.LOOP, "extension": "1001"}]
+        self.check(X379, "DID row")
+
+    def test_a_far_end_no_row_names_is_not_refused(self):
+        self.board.mappings = [{"did": ROUTE_DN, "extension": "6104"}, {"did": "+15550101111", "extension": "1001"}]
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.board.invite_users), 3)
+
+    def test_a_did_row_that_appears_mid_run_stops_the_run_as_invalid(self):
+        self.board.late_mappings = [{"did": "+" + FAR, "extension": "1001"}]
+        self.board.late_after = 8                       # after a few pin checks
+        rc, out = self.go(overrides={"calls": 3, "gap_s": 0.6})
+        self.assertEqual(rc, 3, out)
+        self.assertIn("DID row", out)
+        self.assertLess(len(self.calls()), 3)
+        self.assert_no_secret_anywhere(out)
+
+
+class X379RefusalTest(unittest.TestCase):
+    """x379_cancel_before_leg inherits every refusal x4 has, offline, before a packet."""
+
+    VER = ("--expect-version", "v1.5.0-fake")
+
+    def refused(self, argv, env, needle, **kw):
+        rc, out = run_main(argv, env, http=NoNetwork(), **kw)
+        self.assertEqual(rc, an.REFUSED, out)
+        self.assertIn(needle, out)
+        self.assertNotIn(FAR, out)
+        return out
+
+    def test_every_inherited_refusal(self):
+        s = X379
+        self.refused(cli(*self.VER, scenario=s, checkout=None), base_env(), "no CHECK-OUT")
+        self.refused(cli(*self.VER, scenario=s, exp=expiry(60)), base_env(), "before this run would end")
+        self.refused(cli(*self.VER, scenario=s, approval=None), base_env(), "no --approval-url")
+        self.refused(cli(*self.VER, scenario=s, approval=an.APPROVALS[0] + "x"), base_env(), "not a recorded approval")
+        self.refused(cli("--far-end", FAR, *self.VER, scenario=s), base_env(), "never goes on an argv")
+        self.refused(cli(*self.VER, scenario=s), base_env(PD_ANCHOR_FAR_END=None), "no far end")
+        for num in ("911", "933", "9911", "112", "113", "999", "15559110000", "+19335551234"):
+            self.refused(cli(*self.VER, scenario=s), base_env(PD_ANCHOR_FAR_END=num), "emergency or never-dial")
+        for num in ("1001", "1002", "1003"):
+            self.refused(cli(*self.VER, scenario=s), base_env(PD_ANCHOR_FAR_END=num), "owner extension")
+        for num in ("6101", "6104", "555", "777", "985", "705"):
+            self.refused(cli(*self.VER, scenario=s), base_env(PD_ANCHOR_FAR_END=num), "this PBX owns")
+        self.refused(cli(*self.VER, scenario=s), base_env(PD_ANCHOR_FAR_END="sip:x@y"), "not 3-15 digits")
+        self.refused(cli(*self.VER, scenario=s), base_env(PD_BOARD_ADMIN_PIN=None), "PD_BOARD_ADMIN_PIN")
+        self.refused(cli("--pin", PIN, *self.VER, scenario=s), base_env(), "holds a secret")
+        self.refused(cli(*self.VER, scenario=s, host="192.168.12.110"), base_env(), "not an approved rig")
+        self.refused(cli(scenario=s), base_env(), "no --expect-version")
+        self.refused(cli(*self.VER, scenario=s), base_env(), "not a test UA",
+                     overrides={"uas": {"caller": "1001", "detector": "6104"}})
+        self.refused(cli(*self.VER, scenario=s), base_env(), "must be 6104",
+                     overrides={"uas": {"caller": "6101", "detector": "6103"}})
+        self.refused(cli(*self.VER, scenario=s), base_env(), "two roles",
+                     overrides={"uas": {"caller": "6104", "detector": "6104"}})
+        self.refused(cli(*self.VER, scenario=s), base_env(), "call_cap_s must be 1-30",
+                     overrides={"call_cap_s": 31})
+
+    def test_it_is_capped_at_ten_calls_and_x4_at_thirty(self):
+        self.refused(cli(*self.VER, scenario=X379), base_env(), "calls must be 1-10", overrides={"calls": 11})
+        self.refused(cli(*self.VER, scenario="x4_cancel_ringing"), base_env(), "calls must be 1-30",
+                     overrides={"calls": 31})
+        for calls in (10, 1):
+            rc, out = run_main(cli("--dry-run", scenario=X379), base_env(), http=NoNetwork(),
+                               overrides={"calls": calls})
+            self.assertEqual(rc, 0, out)
+
+    def test_a_wait_that_does_not_fit_the_call_cap_is_refused(self):
+        self.refused(cli(*self.VER, scenario=X379), base_env(), "past the", overrides={"leg_wait_s": 30})
+        self.refused(cli(*self.VER, scenario="x4_cancel_ringing"), base_env(), "past the",
+                     overrides={"ref_timeout_s": 20})
+
+    def test_dry_run_prints_the_plan_the_counter_and_the_ring_required_banner(self):
+        rc, out = run_main(cli("--dry-run", scenario=X379), base_env(), http=NoNetwork())
+        self.assertEqual(rc, 0, out)
+        self.assertIn(X379, out)
+        self.assertIn("RING-REQUIRED", out)
+        self.assertIn("counter initiated", out)
+        self.assertNotIn("PROBE IMAGE", out)
+        self.assertNotIn(FAR, out)
+        with mock.patch.dict(os.environ, base_env(), clear=False):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = sip_stress.main(cli("--dry-run", scenario=X379))
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertIn(X379, buf.getvalue())
 
 
 # ---------------------------------------------------------------- the probe scenarios (#384 H1)

@@ -22,6 +22,11 @@ Opt-in additions for the anchor scenarios (anchor_scenarios.py); every default
 keeps the behaviour above:
   * invite(..., cancel_after_ms=N) CANCELs N ms after the INVITE was sent, never
     before a provisional response (s9.1), and records when it went;
+  * invite(..., cancel_when=fn, cancel_when_timeout_s=T) CANCELs when the caller's own
+    signal says so: fn(invite_sent_at) returns the monotonic time the CANCEL is due, or
+    None while that is unknown. The wait is always bounded: at T s, or if fn raises, the
+    CANCEL goes at once and the dialog says so (cancel_when_expired), so a phone is never
+    left ringing. Used to time a CANCEL from a syslog line instead of from the INVITE;
   * Dialog.hold() / resume(): a re-INVITE offering sendonly / sendrecv (s14.1);
   * contact_params: URI parameters on the Contact (e.g. ";line=pd6101");
   * strict_dialogs: a BYE must match Call-ID AND both tags (s12.2.2), else 481;
@@ -284,6 +289,8 @@ class Dialog:
         self.cancel_sent_at = None   # cancel_after_ms: when the CANCEL actually went
         self.cancel_status = None
         self.cancel_answered_at = None
+        self.cancel_when_expired = False   # cancel_when: no answer by its timeout, or it raised
+        self.cancel_when_error = None      # ... and what it raised
         self.rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rtp_sock.bind((agent.lip, 0))
         self.rtp_port = self.rtp_sock.getsockname()[1]
@@ -512,14 +519,27 @@ class Agent:
             self.registered = False
         return status
 
-    def invite(self, target_user, cancel_after_ms=None):
+    def invite(self, target_user, cancel_after_ms=None, cancel_when=None, cancel_when_timeout_s=None):
         """INVITE sip:<target_user>@<pbx>. Returns the Dialog; dialog.ok says
         whether it was answered (2xx, then ACKed). A non-2xx final is ACKed by
         the transaction (s17.1.1.3); no final at all is CANCELled if it rang.
 
         cancel_after_ms: CANCEL that many ms after the INVITE went, or at the
         first provisional response if none had arrived by then (s9.1); not at
-        all if a final response came first. dialog.cancel_sent_at says when."""
+        all if a final response came first. dialog.cancel_sent_at says when.
+
+        cancel_when: instead, CANCEL when fn(invite_sent_at) says (it returns the
+        monotonic time the CANCEL is due, or None while unknown; polled every 10 ms),
+        never before a provisional response and not at all if a final one came first.
+        cancel_when_timeout_s (required with it) bounds the wait: at that many seconds
+        after the INVITE, or at once if fn raises, the CANCEL goes and
+        dialog.cancel_when_expired is set (cancel_when_error says what fn raised).
+        The two ways of timing a CANCEL exclude each other."""
+        if cancel_when is not None:
+            if cancel_after_ms is not None:
+                raise ValueError("cancel_after_ms and cancel_when are two ways to time the CANCEL: use one")
+            if not cancel_when_timeout_s or cancel_when_timeout_s <= 0:
+                raise ValueError("cancel_when needs a positive cancel_when_timeout_s: the wait is always bounded")
         dlg = Dialog(self, "uac", "%s@%s" % (rand_hex(16), self.lip), rand_hex(8))
         dlg.remote_uri = "sip:%s@%s" % (target_user, self.host)
         dlg.invite_cseq = dlg.local_cseq
@@ -537,6 +557,11 @@ class Agent:
             canceller = threading.Thread(target=self._cancel_at, daemon=True,
                                          args=(dlg, ruri, branch, txn,
                                                dlg.invite_sent_at + cancel_after_ms / 1000.0))
+            canceller.start()
+        elif cancel_when is not None:
+            canceller = threading.Thread(target=self._cancel_at, daemon=True,
+                                         args=(dlg, ruri, branch, txn, None, cancel_when,
+                                               dlg.invite_sent_at + cancel_when_timeout_s))
             canceller.start()
         final = self._transaction(text, (dlg.call_id, dlg.local_cseq, "INVITE"), invite=True, txn=txn)
         if canceller is not None:
@@ -564,9 +589,34 @@ class Agent:
         dlg.start_media()
         return dlg
 
-    def _cancel_at(self, dlg, ruri, branch, txn, at):
-        """cancel_after_ms: CANCEL the pending INVITE at `at` (monotonic), but never
-        before a provisional response (s9.1) and never once a final one arrived."""
+    def _cancel_time(self, dlg, txn, when, deadline):
+        """cancel_when: poll when(invite_sent_at) for the monotonic time the CANCEL is due. At
+        `deadline`, or if `when` raises, it is due now and the dialog says so: a caller's bug
+        must not leave a phone ringing. None: a final response came first, or the agent closed."""
+        while True:
+            if txn.final.is_set() or self._closed.is_set():
+                return None
+            try:
+                at = when(dlg.invite_sent_at)
+            except Exception as e:  # noqa: BLE001 -- cancel now, say why, never leave the handset ringing
+                dlg.cancel_when_error = repr(e)
+                dlg.cancel_when_expired = True
+                return time.monotonic()
+            if at is not None:
+                return at
+            if time.monotonic() >= deadline:
+                dlg.cancel_when_expired = True
+                return time.monotonic()
+            txn.final.wait(0.01)
+
+    def _cancel_at(self, dlg, ruri, branch, txn, at, when=None, deadline=None):
+        """cancel_after_ms / cancel_when: CANCEL the pending INVITE at `at` (monotonic; or
+        when `when` gives it), but never before a provisional response (s9.1) and never
+        once a final one arrived."""
+        if when is not None:
+            at = self._cancel_time(dlg, txn, when, deadline)
+            if at is None:
+                return
         left = at - time.monotonic()
         if left > 0 and txn.final.wait(left):
             return
