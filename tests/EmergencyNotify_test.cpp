@@ -1173,3 +1173,50 @@ TEST(E911Notify, AnOrdinaryTrunkCallTheCarrierRefusesIsNotNotified)
 	EXPECT_EQ(countStarting(b, "SIP/2.0 502"), 1) << b.dump();
 	EXPECT_EQ(countStarting(b, "MESSAGE sip:200@"), 0) << b.dump();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #878 review S-B3 and S-B4: only a refusal that sent nothing may go to the
+// trunk, and the bridges-busy refusal, the case where Phase A actually wins
+// because the trunk has relays of its own, is driven on the host.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(E911Notify, AnAnchorPathThatAnswersAndReturnsFalseIsNeverRetriedOnTheTrunk)
+{
+	// A false return WITHOUT refusedBeforeDispatchOut is the anchor's own
+	// answer. A second route after it would be a second final response, and
+	// after dispatch a possible second PSAP call.
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.handler->setTrunkConfig(dottedQuadTrunk());
+	b.handler->answerThenFailNextAnchorCallForTest();
+	b.wire.clear();
+	b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-sb3"));
+	EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 0) << "no second route:\n" << b.dump();
+	EXPECT_EQ(countStarting(b, "SIP/2.0 180"), 0) << b.dump();
+	expectOneNotRouted(b, "the 3CX anchor could not place the call");
+}
+
+TEST(E911Notify, A911TheAnchorRefusesForBusyBridgesFallsBackToTheTrunk)
+{
+	// The loopback anchor has one bridge. A 911 answered on the synchronous
+	// branch holds it, and an emergency call is never pre-empted (#624). The
+	// next 911, on the async branch, then finds every bridge busy before
+	// dispatch, and the trunk, on its own relay pair, takes it.
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.handler->setTrunkConfig(dottedQuadTrunk());
+	b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-sb4-first"));
+	ASSERT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: en-sb4-first"), nullptr)
+		<< "precondition: the first 911 holds the anchor's only bridge:\n" << b.dump();
+	b.handler->forceAsyncAnchorForTest(true);
+	b.wire.clear();
+	b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-sb4"));
+	EXPECT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 1) << "the trunk must carry it:\n" << b.dump();
+	EXPECT_EQ(countStarting(b, "SIP/2.0 180"), 1) << b.dump();
+	EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 0) << b.dump();
+	EXPECT_EQ(b.countOf("ROUTED TO TRUNK (the 3CX anchor could not place the call)"), 1) << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << b.dump();
+	EXPECT_TRUE(b.handler->anchorBridgeForCallIdForTest("Call-ID: en-sb4-first") != nullptr)
+		<< "the first 911 keeps its bridge";
+}

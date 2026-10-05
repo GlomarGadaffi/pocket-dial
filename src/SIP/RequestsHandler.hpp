@@ -469,6 +469,15 @@ public:
 		std::lock_guard<std::mutex> lock(_mutex);
 		_failNextAnchorWorkerSpawn = true;
 	}
+	// Test-only (#878 review S-B3): the next originateAnchorCall() on a
+	// connected anchor answers the INVITE 503 and returns false WITHOUT setting
+	// refusedBeforeDispatchOut, the shape a future path that answers could
+	// take. No fallback may follow it.
+	void answerThenFailNextAnchorCallForTest()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_answerThenFailNextAnchorCall = true;
+	}
 	// Test-only (#657): each tel_ctl worker parks after taking a job, as one
 	// stuck in makeCall's TLS round trip would. tel_drop and tel_sos run on.
 	void holdTelCtlForTest(bool on)
@@ -2009,6 +2018,7 @@ private:
 	bool _telCtlHeld = false;   // holdTelCtlForTest()
 	int _telCtlParked = 0;
 	bool _failNextAnchorWorkerSpawn = false;   // #713 test seam; under _mutex
+	bool _answerThenFailNextAnchorCall = false;   // #878 S-B3 test seam; under _mutex
 #endif
 
 	// ── Inbound anchor call dispatch (Stage B) ────────────────────────────────────

@@ -4823,6 +4823,14 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		}
 		return false;
 	}
+#if !defined(ESP_PLATFORM) && !defined(ESP32)
+	if (_answerThenFailNextAnchorCall)   // #878 S-B3 test seam
+	{
+		_answerThenFailNextAnchorCall = false;
+		refuse("SIP/2.0 503 Service Unavailable", "test seam: answered, then returned false");
+		return false;
+	}
+#endif
 
 	// Anchor-bridge media is SERVER-terminated and speaks G.711 only (buildMediaSdp
 	// below hardcodes PCMU; MediaBridge::onHandsetRtp only µ-law-decodes) — narrower
