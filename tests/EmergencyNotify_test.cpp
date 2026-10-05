@@ -1056,3 +1056,120 @@ TEST(E911Notify, AnOrdinaryCallTheAnchorRefusesBeforeDispatchIsNotRetriedOnTheTr
 	EXPECT_EQ(countStarting(b, "INVITE sip:"), 0) << "no trunk retry for an ordinary call:\n" << b.dump();
 	EXPECT_EQ(countStarting(b, "MESSAGE sip:200@"), 0) << b.dump();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #879 (#878 review B-BLK-1): a 911/933 the trunk took was notified ROUTED when
+// it was placed. When the carrier then refuses it, or the trunk times it out,
+// onTrunkFailed() answers the handset as before, and the notify list now hears
+// exactly one NOT ROUTED after that ROUTED, naming the carrier's status. A
+// ringing 911 on the trunk is never timed out by the PBX (#712; desmo confirmed
+// "YES, exempt"), so a timeout only ends one that drew no provisional at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+	// The carrier's final response to the trunk INVITE the handler sent to the
+	// SBC: that INVITE's own Via, From, Call-ID and CSeq, its To with a tag.
+	std::shared_ptr<SipMessage> carrierResponse(const NBench& b, const std::string& statusLine)
+	{
+		std::string invite;
+		for (const auto& s : b.wire)
+		{
+			if (s.rfind("INVITE sip:", 0) == 0 && s.find("@203.0.113.5") < s.find("\r\n")) { invite = s; break; }
+		}
+		auto line = [&invite](const std::string& name) {
+			const size_t p = invite.find("\r\n" + name);
+			if (p == std::string::npos) return std::string();
+			return invite.substr(p + 2, invite.find("\r\n", p + 2) - p - 2);
+		};
+		const std::string raw = statusLine + "\r\n" + line("Via: ") + "\r\n" + line("From: ") + "\r\n" +
+			line("To: ") + ";tag=carrier879\r\n" + line("Call-ID: ") + "\r\n" + line("CSeq: ") + "\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, enAddr("203.0.113.5"));
+	}
+
+	void expectNotRoutedAfterRouted(const NBench& b, const std::string& reason)
+	{
+		const int routed = b.indexOf("ROUTED TO TRUNK");
+		EXPECT_NE(routed, -1) << "precondition: the trunk call was notified ROUTED:\n" << b.dump();
+		EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << "the failure must be told exactly once:\n" << b.dump();
+		EXPECT_NE(b.indexOf("NOT ROUTED (" + reason + ")"), -1) << b.dump();
+		EXPECT_GT(b.indexOf("NOT ROUTED"), routed) << "the correction follows the ROUTED it corrects";
+	}
+}
+
+TEST(E911Notify, A911TheCarrierRefusesAfterTheTrunkTookItIsReportedNotRouted)
+{
+	{
+		SCOPED_TRACE("the trunk stood in for the anchor (Phase A), the carrier answers 403");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setTrunkConfig(dottedQuadTrunk());
+		dialRefusedBeforeDispatch(b, "911", "en-879-pa");
+		ASSERT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 1) << b.dump();
+		b.handler->handle(carrierResponse(b, "SIP/2.0 403 Forbidden"));
+		EXPECT_EQ(countStarting(b, "SIP/2.0 502"), 1) << "the handset's answer is unchanged:\n" << b.dump();
+		expectNotRoutedAfterRouted(b, "the 3CX anchor could not place the call; the trunk refused it (403)");
+		EXPECT_FALSE(b.handler->getSession("Call-ID: en-879-pa").has_value());
+	}
+	{
+		SCOPED_TRACE("the trunk is the only route, the carrier answers 503");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setAnchorPlacesRealCallsForTest(false);
+		b.handler->setTrunkConfig(dottedQuadTrunk());
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-879-trunk"));
+		ASSERT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 1) << b.dump();
+		b.handler->handle(carrierResponse(b, "SIP/2.0 503 Service Unavailable"));
+		EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 1) << b.dump();
+		expectNotRoutedAfterRouted(b, "the trunk refused it (503)");
+	}
+	{
+		SCOPED_TRACE("the carrier never answers the INVITE at all: the trunk times it out");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setAnchorPlacesRealCallsForTest(false);
+		b.handler->setTrunkConfig(dottedQuadTrunk());
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-879-silent"));
+		ASSERT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 1) << b.dump();
+		b.handler->expireTrunkDeadlinesForTest();
+		b.handler->forceNextTickForTest();
+		b.handler->tick();
+		EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 1) << b.dump();
+		expectNotRoutedAfterRouted(b, "the trunk timed out (408)");
+	}
+	{
+		SCOPED_TRACE("control: a ringing 911 is never timed out, so nothing is reported");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setAnchorPlacesRealCallsForTest(false);
+		b.handler->setTrunkConfig(dottedQuadTrunk());
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-879-ring"));
+		b.handler->handle(carrierResponse(b, "SIP/2.0 180 Ringing"));
+		b.handler->expireTrunkDeadlinesForTest();
+		b.handler->forceNextTickForTest();
+		b.handler->tick();
+		EXPECT_TRUE(b.handler->getSession("Call-ID: en-879-ring").has_value()) << "#712: a ringing 911 survives:\n" << b.dump();
+		EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << b.dump();
+		EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 0) << b.dump();
+	}
+}
+
+TEST(E911Notify, AnOrdinaryTrunkCallTheCarrierRefusesIsNotNotified)
+{
+	// Negative: the same carrier refusal on a non-emergency trunk call answers
+	// the handset as before and notifies nobody.
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.handler->setTrunkConfig(dottedQuadTrunk());
+	b.handler->setDialRule("45X", "trunk", "", 0);
+	b.wire.clear();
+	b.handler->handle(enInvite("101", "455", "192.168.78.11", "en-879-pstn"));
+	ASSERT_EQ(countStarting(b, "INVITE sip:+455@203.0.113.5"), 1) << b.dump();
+	b.handler->handle(carrierResponse(b, "SIP/2.0 403 Forbidden"));
+	EXPECT_EQ(countStarting(b, "SIP/2.0 502"), 1) << b.dump();
+	EXPECT_EQ(countStarting(b, "MESSAGE sip:200@"), 0) << b.dump();
+}
