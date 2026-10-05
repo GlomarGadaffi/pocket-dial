@@ -1,2 +1,2 @@
-# EmergencyNotify_test.cpp: 1 + TrunkWiring_test.cpp: 4 + SipTrunk_test.cpp: 1
-6
+# EmergencyNotify_test.cpp: 1 + TrunkWiring_test.cpp: 5 + SipTrunk_test.cpp: 1
+7

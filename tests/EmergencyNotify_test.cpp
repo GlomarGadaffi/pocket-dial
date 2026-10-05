@@ -1435,4 +1435,38 @@ TEST(E911Notify, AHandsetCancelBeforeTheCarriersFinalIsNeverReportedNotRouted)
 		EXPECT_EQ(b.countOf("ROUTED TO TRUNK"), 1) << b.dump();
 		EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << "the caller hung up; nothing was refused:\n" << b.dump();
 	}
+	// #889 review S1: a 100 is a provisional, so the CANCEL goes to the PSAP at
+	// once (RFC 3261 §9.1); main held it for an 18x (#794) while the PSAP rang on.
+	for (const std::string number : { "911", "933" })
+	{
+		SCOPED_TRACE(number + ": only a carrier 100 (Proceeding), then the caller's CANCEL");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setAnchorPlacesRealCallsForTest(false);
+		b.handler->setTrunkConfig(dottedQuadTrunk());
+		b.wire.clear();
+		const std::string callId = "en-sc4b-100-" + number;
+		const std::string psap = "INVITE sip:" + number + "@203.0.113.5";
+		b.handler->handle(enInvite("101", number, "192.168.78.11", callId));
+		ASSERT_EQ(countStarting(b, psap), 1) << b.dump();
+		std::string branch;
+		for (const auto& w : b.wire)
+		{
+			const size_t p = w.rfind(psap, 0) == 0 ? w.find(";branch=") : std::string::npos;
+			if (p != std::string::npos) branch = w.substr(p + 8, w.find_first_of(";\r", p + 8) - p - 8);
+		}
+		b.handler->handle(carrierResponse(b, "SIP/2.0 100 Trying"));
+		b.handler->handle(enCancel("101", number, "192.168.78.11", callId));
+		const std::string cancel = "CANCEL sip:" + number + "@203.0.113.5";
+		EXPECT_EQ(countStarting(b, cancel), 1) << "the PSAP leg is cancelled at once:\n" << b.dump();
+		const int at = b.indexOf(cancel);
+		EXPECT_TRUE(at >= 0 && !branch.empty() && b.wire[static_cast<size_t>(at)].find(";branch=" + branch) != std::string::npos)
+			<< "on the INVITE's branch " << branch << ":\n" << b.dump();
+		EXPECT_EQ(countStarting(b, "SIP/2.0 487"), 1) << "the caller's INVITE:\n" << b.dump();
+		EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 0u);
+		EXPECT_FALSE(b.handler->getSession("Call-ID: " + callId).has_value());
+		b.handler->handle(carrierResponse(b, "SIP/2.0 487 Request Terminated"));
+		EXPECT_EQ(b.countOf("ROUTED TO TRUNK"), 1) << b.dump();
+		EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << "the caller hung up; nothing was refused:\n" << b.dump();
+	}
 }

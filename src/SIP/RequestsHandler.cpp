@@ -1145,10 +1145,11 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				// dropped -- leaving a server-originated INVITE unACKed (RFC 3261
 				// §17.1.1.3) and its dialog pinned until a timeout that then sent
 				// an illegal post-final CANCEL. #889: any other 1xx (181, 182,
-				// 199, ...) takes the 183 key, as RFC 3261 §8.1.3.2 has a UAC
-				// treat a provisional it does not recognise, so the trunk sees
-				// every provisional to its INVITE. Other 2xx codes keep the old
-				// behaviour.
+				// 199, ...) takes the 183 key only so that a handler sees it:
+				// onSessionProgress() hands the trunk's to SipTrunk, which counts
+				// it as a provisional (the dialog is Proceeding) and nothing more:
+				// no early media and no ringing event. Any other is dropped, as
+				// before. Other 2xx codes keep the old behaviour.
 				default:
 					handlerKey = (status->code >= 300) ? SipMessageTypes::FINAL_FAILURE
 						: (status->code < 200) ? SipMessageTypes::SESSION_PROGRESS
@@ -12895,7 +12896,7 @@ void RequestsHandler::onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status)
 	// drew any provisional is exempt from the trunk's timeout (#712, #889), so
 	// a 408 is the carrier's own, or a 911 that drew no provisional at all
 	// (Timer B, #726, or the 60 s deadline as its backstop). A final after the
-	// carrier's 2xx tells nothing: the PSAP answered (its teardown is #890).
+	// carrier's 2xx tells nothing: the PSAP answered (#890).
 	// With a real anchor configured, the trunk only ever carries a 911 the
 	// anchor could not place.
 	if (!emergencyNumber.empty() && stillRinging)

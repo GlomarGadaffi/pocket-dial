@@ -957,6 +957,38 @@ TEST(TrunkWiring, AnEmergencyCallsDialogTagIsThePsapsAnswerNotAProvisionals)
 	}
 }
 
+// #889 review S2: SipTrunk counts a 181, 182 or 199 as a provisional and
+// nothing more. It does not treat one as a 183: even with SDP it opens no
+// early-media relay and sends the caller nothing, so the caller keeps the
+// local ringback of the 180 it got when the call was placed. The dialog is
+// Proceeding, so the 911 is not timed out (#712), and the PSAP's 200 still
+// connects it.
+TEST(TrunkWiring, AnEmergencyCalls182WithSdpIsOnlyAProvisional)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-889-182sdp"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(e911.response("SIP/2.0 182 Queued", /*withSdp=*/true), addrFor(kSbcIp)));
+	EXPECT_TRUE(b.sent.empty()) << "nothing to the caller or the PSAP: " << b.sent.size();
+	sockaddr_in peer{};
+	EXPECT_FALSE(b.handler.trunkCarrierPeerForTest("Call-ID: call-889-182sdp", peer)) << "no early-media relay";
+
+	b.handler.expireTrunkDeadlinesForTest();
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-889-182sdp").has_value()) << "Proceeding: not timed out (#712)";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 503", kHandsetIp), 0u);
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the PSAP's answer still connects the caller";
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-889-182sdp", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9")) << "the relay goes where the 200 says";
+}
+
 // #889: a provisional after the call's outcome changes nothing. After the 200
 // the call stays up and the handset hears nothing; after a refusal the dialog
 // is gone and the handset has its one final.
