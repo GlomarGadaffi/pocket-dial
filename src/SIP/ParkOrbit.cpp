@@ -91,6 +91,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 		ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		ok->setContact(_env.contactFor(orbit));
 		pbx::answerSessionTimer(*ok, *data, /*grant=*/false);   // #198: a refresh here draws 481 (#709)
+		ok->setSdpContentType();   // #845: the INVITE's own may be absent or not SDP
 		ok->setBody(holdSdp);
 		ok->syncContentLength();
 		_env.enqueue(data->getSource(), ok);
@@ -165,7 +166,11 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 	ok->setContact(_env.contactFor(orbit));
 	pbx::answerSessionTimer(*ok, *data, /*grant=*/false);   // #198: a refresh here draws 481 (#709)
-	if (!parkedSdp.empty()) ok->setBody(parkedSdp);
+	if (!parkedSdp.empty())
+	{
+		ok->setSdpContentType();   // #845: the INVITE's own may be absent or not SDP
+		ok->setBody(parkedSdp);
+	}
 	(void)ok->filterAudioCodecs(/*allowWideband=*/true);   // parked party's own SDP, relayed P2P
 	ok->syncContentLength();
 	_env.enqueue(data->getSource(), ok);
