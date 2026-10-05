@@ -67,6 +67,7 @@
 
 // File-scope static helpers defined later in this translation unit.
 static bool sameAddress(const sockaddr_in&, const sockaddr_in&);
+static void retargetRequest(SipMessage& msg, const SipClient& leg);
 
 // The caller's in-dialog request on a broadcast (ring-group / page / hunt) call.
 // Its To is the dialled group or alias, which no phone owns, so dispatch keys on
@@ -2789,6 +2790,9 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// onBusy()/tick() already relied on this for CFB/CFNA; it's now also how
 	// isSessionRingingExt() finds "who's ringing" for call pickup (Issue #68)
 	// without needing to pre-populate Session::dest before an answer exists.
+	// #754: kept with the Request-URI endHandle() gives the relay below, because
+	// CallForker::buildCancel() and the 487 ACK copy it (RFC 3261 §9.1, §17.1.1.3).
+	retargetRequest(*data, *called.value());
 	newSession->setInviteMessage(data);
 	std::string cfna = _cfg.getForwardTarget(destNumber, "noanswer");
 	if (!cfna.empty() && cfna != destNumber)
@@ -8613,11 +8617,11 @@ std::shared_ptr<SipClient> RequestsHandler::findServicePeer(std::string_view num
 // #754: a request this PBX relays into a leg names that leg, not the PBX. The
 // sender addressed the PBX (the Contact the PBX presented, #425), so the
 // Request-URI it wrote is the PBX's; RFC 3261 §16.6 has the proxy retarget it to
-// the registered contact. Same URI every request the PBX authors to a phone
-// already carries (fork INVITE, CANCEL, BYE, ACK). No-op on a response.
+// the registered contact, URI parameters kept (#798). Idempotent, so a request a
+// handler already addressed to the leg (onBye) is unchanged. No-op on a response.
 static void retargetRequest(SipMessage& msg, const SipClient& leg)
 {
-	msg.setRequestUri("sip:" + leg.getNumber() + "@" + sipwire::addrToIpPort(leg.getAddress()));
+	msg.setRequestUri(memberRequestUri(leg));
 }
 
 void RequestsHandler::endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message)

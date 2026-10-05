@@ -210,9 +210,10 @@ std::shared_ptr<SipMessage> CallForker::buildCancel(const std::shared_ptr<SipMes
 	// RFC 3261 §9.1: the CANCEL's Request-URI and To must equal those of the INVITE
 	// it cancels (#749). buildInviteFork() rewrites both to the target, and that is
 	// rebuilt below. A leg that went out as `invite` itself keeps them untouched: an
-	// ordinary direct call relays the caller's INVITE as received, and a server-built
-	// leg (blind transfer) stores the INVITE as sent. Both name the target in To, so
-	// that is the test. `cancelMsg` is a copy of `invite` and already carries its To.
+	// ordinary direct call keeps the caller's INVITE with the Request-URI it was
+	// relayed with (#754), and a server-built leg (blind transfer) stores the INVITE
+	// as sent. Both name the target in To, so that is the test. `cancelMsg` is a
+	// copy of `invite` and already carries its To.
 	const std::string_view inviteLine = invite->getHeader();
 	constexpr std::string_view kInviteMethod = "INVITE";
 	if (invite->getToNumber() == target->getNumber() &&
