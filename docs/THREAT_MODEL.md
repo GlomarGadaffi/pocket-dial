@@ -256,9 +256,13 @@ Two boot-time behaviours interact with this:
   `DeviceConfig::clearAll()` touches it, but since #456 both reset doors (`POST
   /api/factory-reset` and the DTMF `999`) end with `nvs_flash_erase()` of the whole NVS
   partition, which takes it with everything else; so does reflashing. If that erase
-  fails, the reset journal says so on the next boot (`/api/status` `resetIncomplete`)
-  and the board comes back on `admin`/`admin` **with the SIP stack running**, the
-  `display` build's posture: run the reset again.
+  fails, the reset journal says so on the next boot (`/api/status` `resetIncomplete`),
+  and what survives depends on the door. On the HTTP door the per-key erases already
+  ran, so the board comes back on `admin`/`admin` **with the SIP stack running**, the
+  `display` build's posture. The keypad door has no per-key erases (the whole-partition
+  erase is its only NVS step), so after a failed erase nothing in NVS was erased at all:
+  the old credential, PIN, trunk password and every other store are intact. On either
+  door: run the reset again.
   **Flash-dump recovery after a reset (#450).** `nvs_erase_key()` only marks an entry
   erased, so its bytes stay readable in a flash dump until page GC;
   `nvs_flash_erase()` erases every sector of the partition, so a completed reset leaves
