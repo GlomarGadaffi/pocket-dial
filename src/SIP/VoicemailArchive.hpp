@@ -126,6 +126,10 @@ private:
 // corrupt) a staging buffer the write to SD hadn't actually finished
 // reading from yet. This module stays ignorant of what that bookkeeping
 // is -- it only promises the callback fires after the read, never before.
+//
+// #450: while a factory reset is in progress (resetguard) nothing is written;
+// each record is dropped and `afterWrite` still fires for it, since nothing
+// reads its staging buffer any more.
 void drainAll(WriterQueue& queue, Sink& sink, uint8_t* const* stagingBufs,
 	const std::function<void(const QueuedRecording&)>& afterWrite = nullptr);
 

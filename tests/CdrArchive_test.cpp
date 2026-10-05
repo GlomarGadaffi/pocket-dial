@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "CdrArchive.hpp"
 #include "CallDetailRecord.hpp"
+#include "ResetGuard.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -337,6 +338,32 @@ TEST(CdrArchive, DrainAllOnAnEmptyQueueAppendsNothing)
 	FakeSink sink;
 	cdrarchive::drainAll(q, sink);
 	EXPECT_TRUE(sink.appended.empty());
+}
+
+// #450: a factory reset wipes the SD archive, but the board runs on until its
+// restart: at least a second, and the whole of a 911 call that holds the restart
+// (#652). A call that ends in that window must not put its CDR back on the card.
+// Both reset doors raise resetguard before their wipe.
+TEST(CdrArchive, OnceAFactoryResetHasBegunDrainAllWritesNothing)
+{
+	struct ClearGuard { ~ClearGuard() { resetguard::resetForTest(); } } clearGuard;   // also on a failed ASSERT
+	cdrarchive::WriterQueue q(4);
+	cdrarchive::QueuedLine l;
+	std::strcpy(l.line, "after-the-wipe");
+	std::strcpy(l.date, "2026-10-02");
+	ASSERT_TRUE(q.push(l));
+
+	resetguard::begin();
+	FakeSink sink;
+	cdrarchive::drainAll(q, sink);
+	EXPECT_TRUE(sink.appended.empty()) << "a CDR reached the card after the factory reset began";
+	EXPECT_EQ(q.size(), 0u) << "the dropped line must not wait in the queue either";
+
+	// Positive control: with no reset in progress the same line is written.
+	resetguard::resetForTest();
+	ASSERT_TRUE(q.push(l));
+	cdrarchive::drainAll(q, sink);
+	EXPECT_EQ(sink.appended.size(), 1u);
 }
 
 // ── Singleton entry points: the host-REACHABLE contract only ──────────────────

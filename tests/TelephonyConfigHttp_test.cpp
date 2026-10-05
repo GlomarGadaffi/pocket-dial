@@ -26,6 +26,7 @@
 #include "LoopbackAnchorClient.hpp"
 #include "RequestsHandler.hpp"
 #include "AdminAuth.hpp"
+#include "ResetGuard.hpp"     // #450: a reset leaves the guard up on host
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -198,6 +199,7 @@ namespace
 			_server.reset();
 			_handler.reset();
 			AdminAuth::clearCredential();
+			resetguard::resetForTest();   // the host reset door leaves the guard up (no restart)
 			std::remove(_tapiPath.c_str());
 			std::remove(_didPath.c_str());
 		}

@@ -315,7 +315,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Gated (+ `X-CSRF`) | Saves Wi-Fi credentials to NVS and schedules a reboot into Station Mode. `501` on `eth`/`lan8720`/desktop (§4.2). |
 | [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Gated (+ `X-CSRF`) | Sets the device to Standalone Access Point Mode and schedules a reboot. No confirmation parameter. `501` on `eth`/`lan8720`/desktop (§4.2). |
 | [`/api/configuring`](#post-apiconfiguring) | `POST` | Low | Gated (+ `X-CSRF`) | Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. It mutates device state, so it takes the standard gate like every other mutating route; a logged-in, fully-set-up session is required, same as WiFi setup itself. |
-| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Requires `confirm=ERASE`. Wipes the login credential, the DTMF PIN, every session, AP security, the carrier-API credential table, the DID→extension table, the CDR ring, and (Wi-Fi builds only) Wi-Fi/mode NVS, then reboots on any ESP build. Answers `200` on every build, or `409` `{"error":"emergency call in progress"}` while a 911/933 call is live (#652). |
+| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Requires `confirm=ERASE`. Wipes the login credential, the DTMF PIN, every session, AP security, every stored secret, the carrier-API credential table, the DID→extension table, the CDR ring, call forwards, E911 and (Wi-Fi builds only) Wi-Fi/mode NVS, plus the SD CDR and voicemail archives; then, on any ESP build, erases the whole NVS partition and reboots. Answers `200` on every build, `500` `{"status":"error","failed":{...}}` if a per-key erase failed (the whole-NVS erase and reboot still follow), or `409` `{"error":"emergency call in progress"}` while a 911/933 call is live (#652). |
 | [`/api/ap-security`](#get-apiap-security) | `GET` | Medium | Gated | Reports whether the SoftAP requires WPA2 and returns its passphrase. |
 | [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
 | [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster, each row with its `locked` and `shared` flags. |
@@ -2358,31 +2358,27 @@ curl -s -X POST "http://$DEV/api/configuring" \
 
 ### `POST /api/factory-reset`
 Clears the login credential, the DTMF PIN, **all live sessions**, the AP security
-settings (`ap_secure`/`ap_psk`/`cfgseed_gen`), the carrier-API credential table
+settings (`ap_secure`/`ap_psk`/`cfgseed_gen`), the trunk, SMTP and Google credentials,
+every extension's digest secret, the last coredump, the carrier-API credential table
 (`tapicfg`), the DID→extension table (`didmap`), the CDR call-history ring (`cdrlog`),
-and, on Wi-Fi builds, the Wi-Fi/mode NVS state, returning the device to its
-default-credential/needs-initial-setup state, then reboots.
+the call-forward targets and the E911 settings (#450), and, on Wi-Fi builds, the
+Wi-Fi/mode NVS state; wipes the SD CDR and voicemail archives; answers; then, on every
+ESP build, erases the **whole NVS partition** (`nvs_flash_erase()`, #456) and reboots.
 
 > [!IMPORTANT]
-> **What a "factory reset" does *not* clear.** The wipe list above is the complete one;
-> the PBX feature configuration survives it untouched. Specifically, everything you can
-> see in [`GET /api/status`](#get-apistatus)'s `dnd[]`, `forwards[]`, `groups[]` and
-> `dialplan[]`, and the **adopted-device registry** that
-> [`GET /api/registrar`](#get-apiregistrar)'s `devices[]` lists and that
-> [`GET /config/<mac>.cfg`](#get-configmaccfg) serves from, lives in the `pbxcfg` NVS
-> namespace under its own keys, and nothing in this handler erases them. A reset board
-> comes back up asking for initial setup with its whole dial plan, ring groups,
-> forwards and phone roster intact.
+> **The whole-partition erase takes everything else in NVS too:** the dial plan, ring
+> groups, page zones, DND, the **adopted-device registry** and the registrar mode, so
+> the board boots as a fresh install (registrar `learn`). The per-key erases listed
+> above are what the response reports on; the whole-partition erase is what removes the
+> old bytes from flash (`nvs_erase_key()` leaves them readable until page GC). The keypad
+> door, `*<PIN>#999#1`, ends the same way. No CDR line or voicemail recording reaches the SD card after its wipe,
+> even while a 911/933 call holds the restart (#450).
 >
-> The registrar *admission mode* (`pbxcfg` key `reg_mode`) **is** cleared, by
-> `DeviceConfig::clearAll()`, deliberately and specifically, because a board switched
-> to `secure` before any extension was secured rejects every `REGISTER` and locks the
-> operator out, and this is the documented rescue (Issue #188; `DeviceConfig.cpp:697`).
-> So the mode resets while the roster it applies to does not.
->
-> The source comment at `HttpServer.cpp:2110-2117` refers to `"storage"/"pbxcfg"`
-> erases "above"/"below" that do not exist in the handler; read the code, not the
-> comment.
+> **What survives:** the `cfgseed` partition (the browser flasher's install-time seed),
+> by design: the next boot re-applies it, so the board returns to how it was flashed.
+> If the whole-partition erase fails, or its task cannot start, the per-key erases still
+> stand and the next boot reports the reset as incomplete (`/api/status`
+> `resetIncomplete`): run it again.
 
 * Requires Same-Origin Check: Yes
 * Requires `pd_session` cookie: Always (see §0), plus, as of Issue #173, an **owner**
@@ -2397,6 +2393,7 @@ default-credential/needs-initial-setup state, then reboots.
   * `200 OK`: Everything cleared. On Wi-Fi builds the Wi-Fi NVS keys are erased too; on
     every ESP build a reboot is scheduled ~1 s out. The `message` field differs by build
     (captive portal / dashboard / restart the process) but the status does not.
+  * `500 Internal Server Error`: `{"status":"error","failed":{...},"message":"Factory reset INCOMPLETE: ..."}`. One or more per-key erases failed; `failed` names each store (`admin`, `trunk`, `secrets`, `forwards`, `e911`, `tapi`, `didmap`, `wifi`, `device`). The board still erases NVS and reboots.
   * `400 Bad Request`: `{"error":"factory reset requires confirm=ERASE"}`. Checked **first**, before anything is touched, so a request without it is genuinely harmless.
   * `409 Conflict`: `{"error":"emergency call in progress"}`, while a 911/933 call is live (#652). Checked right after `confirm`, also before anything is touched. A 911/933 that starts after this check holds the ESP restart until it ends.
   * `403 Forbidden`: `{"error":"owner privilege required"}`. A sysop session, with an owner already provisioned.
