@@ -5,6 +5,7 @@
 #include <chrono>
 
 #include "DialPlan.hpp"
+#include "EmergencyCall.hpp"
 #include "IDGen.hpp"
 #include "Session.hpp"
 #include "SipClient.hpp"
@@ -355,6 +356,25 @@ void CallForker::routeRingGroup(const std::shared_ptr<SipMessage>& data,
 	huntRingNext(newSession);   // ring the first member, arm its timeout
 }
 
+const pbx::DialRule* CallForker::matchDialRule(const std::string& dialed) const
+{
+	int registered = -1;   // asked only once a wildcard rule would make a 911 of `dialed`
+	for (const pbx::DialRule& r : _cfg.dialPlan().rules())
+	{
+		if (!pbx::dialPatternMatches(r.pattern, dialed)) continue;
+		std::string transformed;
+		if (r.action == pbx::DialActionType::Trunk && pbx::dialPatternHasWildcard(r.pattern) &&
+			pbx::applyTrunkTransform(dialed, r.stripDigits, r.target, transformed) &&
+			pbx::classifyEmergencyDial(transformed).isEmergency)
+		{
+			if (registered < 0) registered = _env.findRegistered(dialed) ? 1 : 0;
+			if (registered == 1) continue;
+		}
+		return &r;
+	}
+	return nullptr;
+}
+
 bool CallForker::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 	const std::shared_ptr<SipClient>& caller,
 	const std::string& destNumber)
@@ -366,7 +386,7 @@ bool CallForker::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 
 	if (!_cfg.dialPlan().empty())
 	{
-		rule = _cfg.dialPlan().match(destNumber);
+		rule = matchDialRule(destNumber);
 	}
 
 	if (!rule)

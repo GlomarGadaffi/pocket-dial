@@ -151,6 +151,15 @@ namespace pbx
 		return true;
 	}
 
+	// True when `pattern` can match more than one dialed number: it has an 'X'
+	// or 'x', or ends in '*' (the grammar above). Any other pattern is literal.
+	// #877 (desmo): only a wildcard rule yields to a registered extension.
+	inline bool dialPatternHasWildcard(const std::string& pattern)
+	{
+		return (!pattern.empty() && pattern.back() == '*') ||
+			pattern.find_first_of("Xx") != std::string::npos;
+	}
+
 	// Trunk-access digit transform (Issue #165): strip `stripDigits` leading
 	// characters off `dialed` and prepend `prepend`. Returns false (leaving
 	// `out` untouched) if `stripDigits` exceeds `dialed`'s length — a stale

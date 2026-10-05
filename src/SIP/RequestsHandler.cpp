@@ -4689,9 +4689,11 @@ bool RequestsHandler::dialRuleMakesEmergency(const std::string& dialed, std::str
 	{
 		return false;
 	}
-	// The match and transform CallForker::routeDialPlan() makes; routeTrunkCall()
-	// then routes an emergency result as an emergency call (#538 M2).
-	const pbx::DialRule* rule = _cfg.dialPlan().match(dialed);
+	// The rule CallForker::routeDialPlan() applies, and its transform;
+	// routeTrunkCall() then routes an emergency result as an emergency call
+	// (#538 M2). matchDialRule() lets a registered extension win over a
+	// wildcard rule that would make it 911 (#877), so this mirror cannot drift.
+	const pbx::DialRule* rule = _forker.matchDialRule(dialed);
 	std::string transformed;
 	if (!rule || rule->action != pbx::DialActionType::Trunk ||
 		!pbx::applyTrunkTransform(dialed, rule->stripDigits, rule->target, transformed) ||

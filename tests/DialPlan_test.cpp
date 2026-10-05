@@ -1514,3 +1514,17 @@ TEST(DialPlanHttp, PostApiDialPlanRejectsBadParametersWith400)
 	EXPECT_TRUE(handler.getDialRules().empty())
 		<< "no rejected request may have reached the rule table";
 }
+
+// #877 (desmo: "Only wildcard rules yield"): a pattern is a wildcard when it can
+// match more than one number, under the grammar at the top of DialPlan.hpp.
+TEST(DialPlanPattern, OnlyAnXOrATrailingStarMakesAPatternAWildcard)
+{
+	for (const char* p : {"6XX", "6xx", "1X1", "6*", "*", "X", "**1XX"})
+	{
+		EXPECT_TRUE(pbx::dialPatternHasWildcard(p)) << p;
+	}
+	for (const char* p : {"601", "0", "112", "*8", "*8#", "9100"})
+	{
+		EXPECT_FALSE(pbx::dialPatternHasWildcard(p)) << p;
+	}
+}
