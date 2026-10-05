@@ -424,6 +424,88 @@ TEST(AnchorRouting, TeardownThatAlreadyDroppedTheLegDoesNotDropItAgain)
 		<< "the sweep dropped the leg, then endCall()'s fallback dropped it again";
 }
 
+TEST(AnchorRouting, LegWhoseStreamNeverOpenedIsDroppedOnce)
+{
+	// Issue #379: TelephonyAnchorClient::runRxLoop() reports MediaNeverOpened when
+	// 3CX refused the leg's GET stream for its whole retry budget. Nothing dropped
+	// that leg; on .244 one was still up at 3CX ~25 min later. The handler must
+	// drop it, and a later hangup must not drop it a second time. The event
+	// callback is wired only for a real anchor, so this drives its handler.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-379d"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-379d").has_value());
+	const std::string leg = handler.getSession("Call-ID: anchor-379d").value()->getAnchorParticipantId();
+	ASSERT_FALSE(leg.empty());
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+
+	const unsigned before = loop->dropCallCount();
+	handler.anchorMediaNeverOpenedForTest(leg);
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));   // host drop runs on a worker
+	EXPECT_EQ(loop->dropCallCount(), before + 1) << "a leg with no inbound audio must be dropped";
+
+	handler.handle(makeBye("501", "555", "192.168.9.51", "anchor-379d"));
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), before + 1) << "the hangup dropped the same leg again";
+}
+
+TEST(AnchorRouting, OrphanLegWhoseStreamNeverOpenedIsDropped)
+{
+	// Issue #379, the .244 case: the leg's session was already gone, so no
+	// teardown would ever drop it.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+
+	const unsigned before = loop->dropCallCount();
+	handler.anchorMediaNeverOpenedForTest("leg-orphan-379");
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), before + 1) << "an orphaned leg must be dropped";
+}
+
+TEST(AnchorRouting, EmergencyLegWhoseStreamNeverOpenedIsKept)
+{
+	// Issue #379 + #604: no automated teardown hangs up a 911/933. With no inbound
+	// audio the PSAP may still hear the caller. Absence-only, so the same leg
+	// without the flag is the positive control at the end.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-379e"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-379e").has_value());
+	auto session = handler.getSession("Call-ID: anchor-379e").value();
+	const std::string leg = session->getAnchorParticipantId();
+	ASSERT_FALSE(leg.empty());
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+
+	session->setEmergency(true);
+	const unsigned before = loop->dropCallCount();
+	handler.anchorMediaNeverOpenedForTest(leg);
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), before) << "a 911 leg was dropped for missing inbound audio";
+	EXPECT_FALSE(session->isAnchorLegReleased());
+	EXPECT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: anchor-379e"), nullptr)
+		<< "a 911 call's bridge must keep running";
+
+	session->setEmergency(false);   // positive control
+	handler.anchorMediaNeverOpenedForTest(leg);
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(loop->dropCallCount(), before + 1) << "positive control: the same leg, not a 911, is dropped";
+}
+
 TEST(AnchorRouting, PcmaOnlyOfferGets488NotABridgeItCannotDecode)
 {
 	// Issue #304: MediaBridge::onHandsetRtp only mu-law-decodes, and
@@ -651,6 +733,47 @@ TEST(AnchorRouting, HoldOnTheAnchorLegIsAnsweredNotRefused)
 	EXPECT_EQ(session.value()->getState(), Session::State::Held);
 }
 
+// Issue #445 (the #425 rule): the hold answer is a 2xx to a target-refresh
+// request, so its Contact becomes the phone's new remote target.
+// answerAnchorReinvite() built it by cloning the request, which carried the
+// PHONE's own Contact: after one hold the phone targeted itself and its BYE
+// looped back to its own socket. It must present the board exactly as the
+// setup 200 did.
+TEST(AnchorRouting, HoldAnswerOnTheAnchorLegPresentsTheBoardNotThePhone)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	auto contactOf = [](const std::shared_ptr<SipMessage>& m) {
+		const std::string raw = m ? m->toString() : std::string{};
+		const size_t at = raw.find("\r\nContact:");
+		if (at == std::string::npos) return std::string{};
+		const size_t eol = raw.find("\r\n", at + 2);
+		return raw.substr(at + 2, eol - (at + 2));
+	};
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-contact"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+	const std::string setupContact = contactOf(sent.front().second);
+	ASSERT_NE(setupContact.find("192.168.9.1:5060"), std::string::npos)
+		<< "precondition: the setup 200 presents the board, got: " << setupContact;
+
+	sent.clear();
+	handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-contact",
+		/*cseq=*/2, "a=sendonly\r\n"));
+	ASSERT_FALSE(sent.empty());
+	const std::string holdContact = contactOf(sent.front().second);
+	EXPECT_EQ(holdContact, setupContact)
+		<< "#445: the hold answer must present the board with the setup identity";
+	EXPECT_EQ(holdContact.find("192.168.9.51"), std::string::npos)
+		<< "#445: echoing the phone's own Contact repoints the phone's dialog at itself";
+}
+
 TEST(AnchorRouting, ResumingTheAnchorLegClearsHeldStateAndRestoresTheHandsetPath)
 {
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
@@ -686,6 +809,43 @@ TEST(AnchorRouting, ResumingTheAnchorLegClearsHeldStateAndRestoresTheHandsetPath
 	auto session = handler.getSession("Call-ID: anchor-resume");
 	ASSERT_TRUE(session.has_value());
 	EXPECT_EQ(session.value()->getState(), Session::State::Connected);
+}
+
+// Issue #751: the hold answer mirrors the offer's direction (RFC 3264 s6.1).
+// It used to be sendrecv for every offer, which a strict phone rejects when
+// the offer was sendonly/recvonly/inactive. Resume (sendrecv) stays sendrecv.
+TEST(AnchorRouting, HoldAnswerOnTheAnchorLegMirrorsTheOfferedDirection)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	auto answerDirection = [](const std::shared_ptr<SipMessage>& m) {
+		const std::string raw = m ? m->toString() : std::string{};
+		for (const char* d : { "a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive" })
+			if (raw.find(std::string("\r\n") + d + "\r\n") != std::string::npos) return std::string(d);
+		return std::string{};
+	};
+
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-751"));
+	ASSERT_FALSE(sent.empty());
+	const std::string toLine = toHeaderOf(sent.front().second);
+
+	struct Case { const char* offer; const char* expect; };
+	int cseq = 2;
+	for (const Case& c : { Case{ "a=sendonly", "a=recvonly" }, Case{ "a=inactive", "a=inactive" },
+	                       Case{ "a=recvonly", "a=sendonly" }, Case{ "a=sendrecv", "a=sendrecv" } })
+	{
+		sent.clear();
+		handler.handle(makeHoldReinvite("501", toLine, "192.168.9.51", "anchor-751",
+			cseq++, std::string(c.offer) + "\r\n"));
+		ASSERT_FALSE(sent.empty()) << "no answer to an offer of " << c.offer;
+		EXPECT_EQ(answerDirection(sent.front().second), c.expect)
+			<< "#751: the answer to " << c.offer << " must be " << c.expect;
+	}
 }
 
 // Issue #263: sdp::isHold() had zero production callers, so the legacy RFC
@@ -1320,4 +1480,53 @@ TEST(AnchorRouting, AnAnchorCallWhoseHandsetGoesSilentIsEndedButNeverWhileHeld)
 		if (raw.rfind("BYE ", 0) == 0 && raw.find("Call-ID: anchor-604") != std::string::npos) ++byes;
 	}
 	EXPECT_EQ(byes, 1u);
+}
+
+TEST(AnchorRouting, ARingingEmergencyAnchorCallIsNeverReapedForNoAnswer)
+{
+	// #712 (desmo): a 911/933 still ringing on the anchor gets no PBX-side
+	// no-answer bound (ANCHOR_NO_ANSWER_TIMEOUT); a PSAP may queue it past
+	// 60 s, and the caller's own CANCEL still ends it. The host anchor is
+	// Loopback, which answers synchronously, so the ringing window is recreated
+	// on each session (back to Invited, ring timer expired), as in the #548
+	// test above. Control first: an ordinary anchored call in the same state IS
+	// reaped, so the reap really ran.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.setAnchorPlacesRealCallsForTest(true);   // loopback stands in for a real provider
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-712c"));
+	auto plain = handler.getSession("Call-ID: anchor-712c");
+	ASSERT_TRUE(plain.has_value());
+	ASSERT_FALSE(plain.value()->isEmergency());
+	plain.value()->setState(Session::State::Invited);
+	plain.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_FALSE(handler.getSession("Call-ID: anchor-712c").has_value())
+		<< "control: an ordinary ringing anchor call past its no-answer bound is reaped";
+
+	handler.handle(makeInvite("501", "911", "192.168.9.51", "anchor-712e"));
+	auto e911 = handler.getSession("Call-ID: anchor-712e");
+	ASSERT_TRUE(e911.has_value()) << "precondition: 911 was routed to the anchor";
+	ASSERT_TRUE(e911.value()->isEmergency()) << "precondition: routeEmergencyCall flagged it";
+	e911.value()->setState(Session::State::Invited);
+	e911.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+
+	EXPECT_TRUE(handler.getSession("Call-ID: anchor-712e").has_value())
+		<< "a ringing 911 was reaped for no answer";
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		const std::string raw = msg ? msg->toString() : std::string();
+		EXPECT_NE(raw.rfind("SIP/2.0 4", 0), 0u) << "the 911 caller got a failure:\n" << raw;
+		EXPECT_NE(raw.rfind("SIP/2.0 5", 0), 0u) << "the 911 caller got a failure:\n" << raw;
+	}
 }

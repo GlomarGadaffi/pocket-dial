@@ -1,6 +1,9 @@
 // HttpServer.cpp: Issues #23 and #28 resolved.
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+#include "BenchProbe.hpp"        // #384 H1: /api/bench/fault (docs/BENCH_PROBE.md)
+#endif
 #include "DialPlan.hpp"          // Issue #69: dial-rule validation shared with setDialRule
 #include "ServiceExtensions.hpp" // Issue #202: reserved engine-owned pseudo-AORs
 #include "TelephonyApiConfig.hpp"
@@ -465,8 +468,10 @@ void HttpServer::acceptLoop()
 		try
 		{
 			std::thread([this, clientSock, sourceAddr]() {
-				handleClient(clientSock);
-				recordConnStackHwm();
+				// #405: which route this thread served, for the stack minimum.
+				char route[kRouteLabelBytes] = "unparsed";
+				handleClient(clientSock, route);
+				recordConnStackHwm(route);
 				releaseSource(sourceAddr);
 				_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			}).detach();
@@ -525,7 +530,61 @@ void HttpServer::releaseSource(uint32_t addr)
 }
 
 
-void HttpServer::handleClient(int clientSock)
+void HttpServer::routeLabel(const std::string& method, const std::string& path,
+                            char* out, size_t cap)
+{
+	if (out == nullptr || cap == 0) return;
+	size_t n = 0;
+	const auto put = [&](std::string_view v) {
+		for (char c : v)
+		{
+			if (n + 1 >= cap) return;
+			out[n++] = c;
+		}
+	};
+
+	bool methodOk = !method.empty() && method.size() <= 7;
+	for (char c : method) methodOk = methodOk && c >= 'A' && c <= 'Z';
+	put(methodOk ? std::string_view(method) : std::string_view("?"));
+	put(" ");
+
+	if (path == "/" || path == "/index.html") put("/");
+	else if (path == "/metrics") put("/metrics");
+	else if (isProvisioningConfigPath(path)) put("provisioning");
+	else
+	{
+		// Under /api/ and /setup/ keep lower-case word segments; the first numeric
+		// or unknown one ends the label, so a slot index or an extension never
+		// appears. Anything else (a 404 probe, a scan) is just "other".
+		const std::string_view p(path);
+		const bool known = p.substr(0, 5) == "/api/" || p.substr(0, 7) == "/setup/";
+		size_t kept = 0;
+		size_t pos = 0;
+		while (known && pos < p.size() && p[pos] == '/')
+		{
+			size_t end = p.find('/', pos + 1);
+			if (end == std::string_view::npos) end = p.size();
+			const std::string_view seg = p.substr(pos + 1, end - pos - 1);
+			bool word = !seg.empty() && seg.size() <= 24;
+			bool digits = word;
+			for (char c : seg)
+			{
+				const bool d = c >= '0' && c <= '9';
+				word = word && (d || (c >= 'a' && c <= 'z') || c == '-' || c == '_');
+				digits = digits && d;
+			}
+			if (!word || digits) break;
+			put("/");
+			put(seg);
+			++kept;
+			pos = end;
+		}
+		if (kept == 0) put("other");
+	}
+	out[n] = '\0';
+}
+
+void HttpServer::handleClient(int clientSock, char* routeOut)
 {
 	// Issue #529: everything read before dispatch shares one deadline.
 	const auto readDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(_readDeadlineMs);
@@ -623,6 +682,7 @@ void HttpServer::handleClient(int clientSock)
 				// body) to get method/path/origin/host/cookie for the auth gate.
 				HttpRequest otaReq = parseRequest(raw.substr(0, hdrEnd + 4));
 				otaReq.clientIp = peerIp;
+				if (routeOut) routeLabel(otaReq.method, otaReq.path, routeOut, kRouteLabelBytes);
 
 				// Same gate as every other mutating endpoint, PLUS issue #173's
 				// owner-only floor for OTA upload specifically (MoH clip upload
@@ -761,6 +821,7 @@ void HttpServer::handleClient(int clientSock)
 	// the real admin out too, and Cisco SPA model-keyed provisioning never ran
 	// its ARP lookup.
 	req.clientIp = peerIp;
+	if (routeOut) routeLabel(req.method, req.path, routeOut, kRouteLabelBytes);   // #405
 	// Out-param for the two telephony-config routes below, whose slot index is
 	// a URL path segment rather than a form param (see parseTelephonyConfigSlotPath).
 	size_t telSlotIdx = 0;
@@ -1285,6 +1346,17 @@ void HttpServer::handleClient(int clientSock)
 			sendApiRegistrarDevice(clientSock, req.body);
 		}
 	}
+	else if (req.method == "POST" && req.path == "/api/registrar/forget-learned")
+	{
+		// #515: one action to clear a flood of Learned adoptions; Secured
+		// devices stay. Answers with the same device list as GET /api/registrar.
+		if (requireAdmin(clientSock, req, true))
+		{
+			RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+			if (handler) handler->forgetLearnedDevices();
+			sendApiRegistrar(clientSock);
+		}
+	}
 	else if (req.method == "GET" && req.path == "/api/admin/status")
 	{
 		// Read-only: tells the dashboard whether to show the login form.
@@ -1337,6 +1409,17 @@ void HttpServer::handleClient(int clientSock)
 			sendApiOtaReboot(clientSock, req.body);
 		}
 	}
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	else if ((req.method == "GET" || req.method == "POST") && req.path == "/api/bench/fault")
+	{
+		// #384 H1: the bench probe image only (docs/BENCH_PROBE.md). Owner-gated like
+		// /api/coredump; a POST changes call behaviour, so it is CSRF-checked too.
+		if (requireAdmin(clientSock, req, req.method == "POST", AdminAuth::Role::Owner))
+		{
+			sendApiBenchFault(clientSock, req);
+		}
+	}
+#endif
 	// NOTE: POST /api/ota/upload is handled earlier in handleClient() via the
 	// streaming interception (it must bypass the 16 KB buffered body path), so
 	// it deliberately does NOT appear in this route table.
@@ -1864,9 +1947,11 @@ static void pdAppendHwmField(JsonOut& json, const char* key, long bytes)
 }
 #endif // ESP_PLATFORM
 
-void HttpServer::recordConnStackHwm()
+void HttpServer::recordConnStackHwm(const char* route)
 {
-#if defined(ESP_PLATFORM)
+#if !defined(ESP_PLATFORM)
+	(void)route;
+#else
 	// uxTaskGetStackHighWaterMark returns the smallest amount of free stack this
 	// task has ever had, in WORDS on Xtensa -- multiply for the bytes every other
 	// stackHwm_* field reports. Called on the connection thread itself, right
@@ -1876,16 +1961,17 @@ void HttpServer::recordConnStackHwm()
 		static_cast<long>(uxTaskGetStackHighWaterMark(nullptr)) * sizeof(StackType_t);
 
 	// Keep the WORST (smallest-free) figure any connection has produced since
-	// boot: a compare-exchange loop rather than a plain store, because several
-	// connection threads can finish at once and the deepest one must win.
-	long prev = _httpConnStackHwmBytes.load(std::memory_order_relaxed);
-	while (prev < 0 || freeBytes < prev)
+	// boot, with the route that produced it (#405). Under a mutex rather than a
+	// compare-exchange loop: several connection threads can finish at once, the
+	// deepest one must win, and its route has to land with its figure. The
+	// figure stays atomic so /api/status's stackHwm_http_conn read is unchanged.
+	std::lock_guard<std::mutex> lk(_httpConnWorstMutex);
+	const long prev = _httpConnStackHwmBytes.load(std::memory_order_relaxed);
+	if (prev < 0 || freeBytes < prev)
 	{
-		if (_httpConnStackHwmBytes.compare_exchange_weak(prev, freeBytes,
-			std::memory_order_relaxed))
-		{
-			break;
-		}
+		_httpConnStackHwmBytes.store(freeBytes, std::memory_order_relaxed);
+		std::snprintf(_httpConnWorstRoute, sizeof(_httpConnWorstRoute), "%s",
+		              route != nullptr ? route : "");
 	}
 #endif
 }
@@ -2031,10 +2117,18 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// The message pool is process-global, so it reads even with no engine.
 	json.s("\"msgPoolRefusals\":").n(RequestsHandler::getMessagePoolRefusals()).s(",");
 	json.s("\"vpeerPoolRefusals\":").n(handler ? handler->getVirtualPeerRefusals() : 0).s(",");
+	// #702 item 19: two "should stay zero" counters that were test-only until now.
+	json.s("\"repliesRefused\":").n(handler ? handler->getRepliesRefused() : 0).s(",");   // #424
+	json.s("\"optionsPingTruncated\":").n(handler ? handler->getOptionsPingTruncated() : 0).s(",");   // #463
+	json.s("\"byeTruncated\":").n(handler ? handler->getByeTruncated() : 0).s(",");   // #744
 	// Issue #663: trunk responses dropped as not from the carrier (#617, #356).
 	json.s("\"trunkForgedRegisterResponses\":").n(handler ? handler->getTrunkForgedRegisterResponses() : 0).s(",");
 	json.s("\"trunkForgedDialogResponses\":").n(handler ? handler->getTrunkForgedDialogResponses() : 0).s(",");
 	json.s("\"trunkRefusedDialogByes\":").n(handler ? handler->getTrunkRefusedDialogByes() : 0).s(",");
+	// #741: 911/933 calls ended after 4 h with both legs silent.
+	json.s("\"emergencyRtpReaps\":").n(handler ? handler->getEmergencyRtpReaps() : 0).s(",");
+	// #864: ARP requests held back for unanswered Learn REGISTERs.
+	json.s("\"learnArpRequestsLimited\":").n(handler ? handler->getLearnArpRequestsLimited() : 0).s(",");
 	// #450 / poll #454: false after a factory reset until the E911 notify list is
 	// set again. The dashboard shows a banner; nothing is gated on it.
 	json.s("\"e911Configured\":").b(e911Configured).s(",");
@@ -2319,6 +2413,12 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	pdAppendHwmField(json, "stackHwm_rtp_media_tx", pdStackHwmBytes("rtp_media_tx"));
 	pdAppendHwmField(json, "stackHwm_rtp_media_rx", pdStackHwmBytes("rtp_media_rx"));
 	pdAppendHwmField(json, "stackHwm_conf_mix_tick", pdStackHwmBytes("conf_mix_tick"));
+	// #657: 12 KB each by precedent, not measurement; these readings are what a
+	// smaller stack would need. null unless the boot anchor is a real one.
+	pdAppendHwmField(json, "stackHwm_tel_ctl0", pdStackHwmBytes("tel_ctl0"));
+	pdAppendHwmField(json, "stackHwm_tel_ctl1", pdStackHwmBytes("tel_ctl1"));
+	pdAppendHwmField(json, "stackHwm_tel_drop", pdStackHwmBytes("tel_drop"));
+	pdAppendHwmField(json, "stackHwm_tel_sos", pdStackHwmBytes("tel_sos"));
 	// Issue #366: not a live-task lookup like the others -- a connection thread is
 	// gone by the time anyone reads this -- but the worst figure recorded by any
 	// of them since boot. null until the first request has completed, which in
@@ -2336,8 +2436,19 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	       ",\"freeHeapDma\":0,\"largestFreeBlockDma\":0,\"resetReason\":\"n/a\"");
 	json.s(",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
 	       "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
-	       "\"stackHwm_conf_mix_tick\":null,\"stackHwm_http_conn\":null");
+	       "\"stackHwm_conf_mix_tick\":null,\"stackHwm_tel_ctl0\":null,\"stackHwm_tel_ctl1\":null,"
+	       "\"stackHwm_tel_drop\":null,\"stackHwm_tel_sos\":null,\"stackHwm_http_conn\":null");
 #endif
+	// Issue #405: the route class that produced the stackHwm_http_conn minimum
+	// (never the raw path, see routeLabel). null on the host build and until a
+	// connection has finished. Written straight into the buffer: no frame here,
+	// this is the route the issue suspects of being the deepest.
+	json.s(",\"httpConnWorstRoute\":");
+	{
+		std::lock_guard<std::mutex> lk(_httpConnWorstMutex);
+		if (_httpConnWorstRoute[0] != '\0') json.s("\"").e(_httpConnWorstRoute).s("\"");
+		else json.s("null");
+	}
 	// Issue #382: ungated for the same reason resetReason is -- "a dump exists,
 	// N bytes" is the fact a bench run needs to notice an unwatched panic, and it
 	// discloses nothing the reset reason above does not. The dump itself and its
@@ -2675,7 +2786,13 @@ void HttpServer::sendApiKill(int sock, const std::string& body)
 	// unit, so it is left for a follow-up rather than faked from this side.
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
-		handler->forceDisconnect(ext);
+		if (!handler->forceDisconnect(ext))
+		{
+			// #714 (desmo): an admin kill never ends an emergency call.
+			sendResponse(sock, 409, "Conflict", "application/json",
+			             "{\"error\":\"extension is on an emergency call\"}");
+			return;
+		}
 	}
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"disconnected\":\"" + jsonEscape(ext) + "\"}");
@@ -3074,14 +3191,6 @@ void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
 		return;
 	}
 	sendResponse(sock, 200, "OK", contentType, cfg);
-}
-
-void HttpServer::sendConfigCfg(int sock, const std::string& mac)
-{
-	HttpRequest req;
-	req.method = "GET";
-	req.path = "/config/" + mac + ".cfg";
-	sendProvisioningResponse(sock, req);
 }
 
 void HttpServer::sendApiVoicemail(int sock, const std::string& body)
@@ -3627,6 +3736,21 @@ void HttpServer::sendApiE911Get(int sock)
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 
+// The E911 route's charset gate, shared with the config import (#483).
+// nullptr when both fields pass, else the reason.
+static const char* e911ConfigError(const std::string& exts, const std::string& callback)
+{
+	for (const std::string& e : pbx::splitMembers(exts))
+	{
+		if (!pbx::isDialTokenSafe(e)) return "notifyExts may contain only extensions, separated by spaces or commas";
+	}
+	if (!callback.empty() && !pbx::isDialTokenSafe(callback))
+	{
+		return "callback may contain only digits, letters, '#' and '*'";
+	}
+	return nullptr;
+}
+
 void HttpServer::sendApiE911Set(int sock, const std::string& body)
 {
 	// Issue #166 (Kari's Law). Params: notifyExts (space/comma delimited),
@@ -3643,19 +3767,10 @@ void HttpServer::sendApiE911Set(int sock, const std::string& body)
 	const std::string callback = getFormParam(body, "callback");
 	const std::string location = getFormParam(body, "location");
 
-	for (const std::string& e : pbx::splitMembers(exts))
-	{
-		if (!pbx::isDialTokenSafe(e))
-		{
-			sendResponse(sock, 400, "Bad Request", "application/json",
-			             "{\"error\":\"notifyExts may contain only extensions, separated by spaces or commas\"}");
-			return;
-		}
-	}
-	if (!callback.empty() && !pbx::isDialTokenSafe(callback))
+	if (const char* err = e911ConfigError(exts, callback))
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
-		             "{\"error\":\"callback may contain only digits, letters, '#' and '*'\"}");
+		             std::string("{\"error\":\"") + err + "\"}");
 		return;
 	}
 
@@ -3677,11 +3792,22 @@ void HttpServer::sendApiSbcModeGet(int sock)
 		std::tie(enabled, route) = handler->getSbcMode();
 	}
 
-	std::ostringstream json;
-	json << "{\"enabled\":" << (enabled ? "true" : "false")
-	     << ",\"route\":" << route
-	     << ",\"maxRoute\":" << TelephonyApiConfig::kSlots << "}";
-	sendResponse(sock, 200, "OK", "application/json", json.str());
+	// #410: no heap. The body is at most 78 bytes (both numbers at 20 digits), so
+	// a small stack buffer holds it; a body that did not fit would be refused
+	// with a 500, never truncated or grown.
+	char buf[96];
+	JsonOut json{buf, sizeof(buf)};
+	json.s("{\"enabled\":").b(enabled)
+	    .s(",\"route\":").n(route)
+	    .s(",\"maxRoute\":").n(TelephonyApiConfig::kSlots)
+	    .s("}");
+	if (json.full)
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"error\":\"sbc-mode response too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, json.len));
 }
 
 void HttpServer::sendApiSbcModeSet(int sock, const std::string& body)
@@ -4568,6 +4694,8 @@ void HttpServer::sendApiRegistrar(int sock)
 		     << "\",\"state\":\""
 		     << ((d.state == RequestsHandler::DeviceState::Secured) ? "secured" : "learned")
 		     << "\",\"online\":" << (d.online ? "true" : "false")
+		     << ",\"locked\":" << (d.locked ? "true" : "false")
+		     << ",\"shared\":" << (d.shared ? "true" : "false")
 		     << "}";
 	}
 	json << "]}";
@@ -4643,21 +4771,32 @@ void HttpServer::sendApiRegistrarDevice(int sock, const std::string& body)
 		return;
 	}
 
-	bool ok = false;
-	if (action == "secure")
-	{
-		ok = handler->secureDevice(target);
-	}
-	else if (action == "forget")
-	{
-		ok = handler->forgetDevice(target);
-	}
-	else
+	if (action != "secure" && action != "forget")
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"action must be one of: secure, forget\"}");
 		return;
 	}
+
+	// #820: two rows can hold one extension (a lock holder beside a later claim,
+	// or a stale row). By extension, act only when exactly one does; otherwise
+	// ask for the MAC, which is what the dashboard sends.
+	{
+		size_t holders = 0;
+		for (const auto& d : handler->getAdoptedDevices())
+		{
+			if (d.mac == target) { holders = 0; break; }
+			if (d.extension == target) ++holders;
+		}
+		if (holders > 1)
+		{
+			sendResponse(sock, 409, "Conflict", "application/json",
+			             "{\"error\":\"more than one device holds that extension; send its MAC\"}");
+			return;
+		}
+	}
+
+	const bool ok = (action == "secure") ? handler->secureDevice(target) : handler->forgetDevice(target);
 
 	if (!ok && action == "secure")
 	{
@@ -5022,6 +5161,21 @@ namespace
 // RequestsHandler/SipSecretStore, and a masked-secret round trip for
 // TelephonyApiConfig slots, would close gaps 1 and 2 without ever exposing a
 // plaintext secret over this API.
+//
+// #483 section C: the ITSP trunk, SMTP, E911 and admin_ext, through the
+// helpers their own routes use (defined with those routes below). The
+// constrained 4 MB image has no room for it (#689); main/CMakeLists.txt sets 0.
+#ifndef POCKETDIAL_BACKUP_SECTION_C
+#define POCKETDIAL_BACKUP_SECTION_C 1
+#endif
+static std::string trunkConfigError(const TrunkConfigStore::Config& cfg, const std::string& ip);
+#if POCKETDIAL_BACKUP_SECTION_C
+namespace
+{
+	bool isValidEmailMode(const std::string& s);
+	bool isValidEmailAuth(const std::string& s);
+}
+#endif
 void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::string& password)
 {
 	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
@@ -5211,6 +5365,46 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	}
 	pt << "],";
 
+#if POCKETDIAL_BACKUP_SECTION_C
+	// #483: the trunk and SMTP settings WITHOUT trunk_pass, smtp_pass and
+	// gsa_key -- those travel in the secretsEnc block below and nowhere else.
+	// Written straight into `pt`, not via trunkConfigJson()/emailConfigJson(),
+	// which would each add two allocations to this #410-gated route.
+	{
+		const TrunkConfigStore::Config t = TrunkConfigStore::load();
+		const EmailConfigStore::Config e = EmailConfigStore::load();
+		pt << "\"trunk\":{\"host\":\"" << jsonEscape(t.host)
+		   << "\",\"port\":" << t.port
+		   << ",\"proxyHost\":\"" << jsonEscape(t.proxyHost)
+		   << "\",\"proxyPort\":" << t.proxyPort
+		   << ",\"fromUser\":\"" << jsonEscape(t.fromUser)
+		   << "\",\"callerId\":\"" << jsonEscape(t.callerId)
+		   << "\",\"authUser\":\"" << jsonEscape(t.authUser)
+		   << "\",\"enabled\":" << (t.enabled ? "true" : "false")
+		   << "},\"email\":{\"host\":\"" << jsonEscape(e.host)
+		   << "\",\"port\":" << e.port
+		   // Validated enums, nothing to escape (and "starttls" + 8 would push
+		   // jsonEscape() out of the small-string buffer: one more allocation).
+		   << ",\"mode\":\"" << (isValidEmailMode(e.mode) ? e.mode.c_str() : "")
+		   << "\",\"auth\":\"" << (isValidEmailAuth(e.auth) ? e.auth.c_str() : "")
+		   << "\",\"user\":\"" << jsonEscape(e.user)
+		   << "\",\"from\":\"" << jsonEscape(e.from)
+		   << "\",\"to\":\"" << jsonEscape(e.to)
+		   << "\",\"gsaEmail\":\"" << jsonEscape(e.gsaEmail)
+		   << "\",\"insecure\":" << (e.insecureSkipVerify ? "true" : "false")
+		   << ",\"caPem\":\"" << jsonEscape(e.caPem) << "\"},";
+	}
+	if (handler)
+	{
+		std::string exts, callback, location;
+		std::tie(exts, callback, location) = handler->getE911Config();
+		pt << "\"e911\":{\"notifyExts\":\"" << jsonEscape(exts)
+		   << "\",\"callback\":\"" << jsonEscape(callback)
+		   << "\",\"location\":\"" << jsonEscape(location)
+		   << "\"},\"adminExt\":\"" << jsonEscape(handler->getAdminExt()) << "\",";
+	}
+#endif
+
 	pt << "\"wifiSsid\":\"" << jsonEscape(DeviceConfig::getWifiSsid()) << "\""
 	   << ",\"wifiMode\":" << static_cast<int>(DeviceConfig::getWifiMode())
 	   << ",\"apSecure\":" << (DeviceConfig::isApSecure() ? "true" : "false") << ",";
@@ -5268,7 +5462,17 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 				      << "\",\"ha1\":\"" << jsonEscape(*ha1) << "\"}";
 			}
 		}
-		gated << "]}";
+		gated << "]";
+#if POCKETDIAL_BACKUP_SECTION_C
+		// #483: the three secrets section C keeps out of the plaintext part.
+		{
+			const EmailConfigStore::Config email = EmailConfigStore::load();
+			gated << ",\"trunkPass\":\"" << jsonEscape(TrunkConfigStore::load().pass)
+			      << "\",\"smtpPass\":\"" << jsonEscape(email.pass)
+			      << "\",\"gsaKey\":\"" << jsonEscape(email.gsaKey) << "\"";
+		}
+#endif
+		gated << "}";
 		std::string gatedPlaintext = gated.str();
 
 		uint8_t salt[AdminAuth::kKdfSaltBytes];
@@ -5761,6 +5965,106 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 			"export -- re-export with a password, or re-set them)");
 	}
 
+#if POCKETDIAL_BACKUP_SECTION_C
+	// #483 section C, held to the checks of each setting's own route. A key the
+	// file lacks leaves that setting as it is. trunk_pass, smtp_pass and gsa_key
+	// come back only from the decrypted secretsEnc block; without it the stored
+	// ones are kept.
+	const JsonReader::Value* sec = haveSecrets ? &secretsValue : nullptr;
+	for (const char* key : { "trunk", "email", "e911", "adminExt" })
+	{
+		if (!pt->find(key)) skipped.push_back(std::string(key) + " (not in the file; left unchanged)");
+	}
+	if (!sec && (pt->find("trunk") || pt->find("email")))
+	{
+		skipped.push_back("trunk/SMTP passwords and gsaKey (only in the password-encrypted export; "
+			"the stored ones are kept)");
+	}
+	if (const JsonReader::Value* t = pt->find("trunk"); t && t->isObject())
+	{
+		TrunkConfigStore::Config c = TrunkConfigStore::load();
+		c.host      = t->stringOr("host");
+		c.proxyHost = t->stringOr("proxyHost");
+		c.fromUser  = t->stringOr("fromUser");
+		c.callerId  = t->stringOr("callerId");
+		c.authUser  = t->stringOr("authUser");
+		c.enabled   = t->boolOr("enabled");
+		if (sec) c.pass = sec->stringOr("trunkPass", c.pass);
+		const int port = t->intOr("port", 0), proxyPort = t->intOr("proxyPort", 0);
+		std::string err = "port must be 1-65535";
+		if (port >= 1 && port <= 65535 && proxyPort >= 1 && proxyPort <= 65535)
+		{
+			c.port = static_cast<uint16_t>(port);
+			c.proxyPort = static_cast<uint16_t>(proxyPort);
+			err = trunkConfigError(c, _ip);
+		}
+		if (err.empty() && !TrunkConfigStore::save(c)) err = "failed to persist";
+		if (!err.empty()) skipped.push_back("trunk (" + err + ")");
+		else
+		{
+			applied.push_back("trunk");
+			if (handler) handler->applyStoredTrunkConfig();   // as POST /api/trunk does
+		}
+	}
+	if (const JsonReader::Value* e = pt->find("email"); e && e->isObject())
+	{
+		EmailConfigStore::Config c = EmailConfigStore::load();
+		c.host     = e->stringOr("host");
+		c.mode     = e->stringOr("mode");
+		c.auth     = e->stringOr("auth");
+		c.user     = e->stringOr("user");
+		c.from     = e->stringOr("from");
+		c.to       = e->stringOr("to");
+		c.gsaEmail = e->stringOr("gsaEmail");
+		c.insecureSkipVerify = e->boolOr("insecure");
+		c.caPem    = e->stringOr("caPem");
+		if (sec)
+		{
+			c.pass   = sec->stringOr("smtpPass", c.pass);
+			c.gsaKey = sec->stringOr("gsaKey", c.gsaKey);
+		}
+		const int port = e->intOr("port", 0);
+		if (port < 1 || port > 65535 || !isValidEmailMode(c.mode) || !isValidEmailAuth(c.auth))
+		{
+			skipped.push_back("email (port, mode or auth invalid)");
+		}
+		else
+		{
+			c.port = static_cast<uint16_t>(port);
+			if (EmailConfigStore::save(c)) applied.push_back("email");
+			else skipped.push_back("email (failed to persist)");
+		}
+	}
+	if (handler)
+	{
+		if (const JsonReader::Value* e = pt->find("e911"); e && e->isObject())
+		{
+			const std::string exts = e->stringOr("notifyExts");
+			const std::string callback = e->stringOr("callback");
+			if (const char* err = e911ConfigError(exts, callback))
+			{
+				skipped.push_back(std::string("e911 (") + err + ")");
+			}
+			else
+			{
+				handler->setE911Config(exts, callback, e->stringOr("location"));
+				applied.push_back("e911");
+			}
+		}
+		if (pt->find("adminExt"))
+		{
+			if (handler->setAdminExt(pt->stringOr("adminExt"))) applied.push_back("adminExt");
+			else skipped.push_back("adminExt (not a dial token of 1-31 characters, or not persisted)");
+		}
+	}
+	else if (pt->find("e911") || pt->find("adminExt"))
+	{
+		skipped.push_back("e911/adminExt (SIP engine not attached yet)");
+	}
+#else
+	if (pt->find("trunk")) skipped.push_back("trunk/email/e911/adminExt (not on this build, #689)");
+#endif
+
 	std::ostringstream json;
 	json << "{\"status\":\"ok\",\"applied\":[";
 	for (size_t i = 0; i < applied.size(); ++i)
@@ -6211,54 +6515,11 @@ void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 	if (getFormParam(body, "clearPassword") == "1") cfg.pass.clear();
 	else if (!pass.empty())                          cfg.pass = pass;
 
-	struct { const char* name; const std::string& val; size_t cap; } limits[] = {
-		{ "host",      cfg.host,      kMaxTrunkHost },
-		{ "proxyHost", cfg.proxyHost, kMaxTrunkHost },
-		{ "fromUser",  cfg.fromUser,  kMaxTrunkFrom },
-		{ "callerId",  cfg.callerId,  kMaxTrunkCid  },
-		{ "authUser",  cfg.authUser,  kMaxTrunkAuth },
-		{ "pass",      cfg.pass,      kMaxTrunkPass },
-	};
-	for (const auto& l : limits)
+	const std::string err = trunkConfigError(cfg, _ip);
+	if (!err.empty())
 	{
-		if (l.val.size() > l.cap)
-		{
-			std::ostringstream err;
-			err << "{\"error\":\"" << l.name << " must be at most " << l.cap
-			    << " characters\"}";
-			sendResponse(sock, 400, "Bad Request", "application/json", err.str());
-			return;
-		}
-	}
-
-	// Enabling a trunk that cannot possibly place a call is a misconfiguration
-	// worth refusing at the door rather than discovering when someone dials 9.
-	// These are exactly SipTrunk::Config::valid()'s requirements; saving them
-	// inconsistent would leave the UI showing "enabled" beside a trunk the
-	// engine silently treats as invalid.
-	if (cfg.enabled && (cfg.host.empty() || cfg.fromUser.empty()))
-	{
-		sendResponse(sock, 400, "Bad Request", "application/json",
-		             "{\"error\":\"host and fromUser are required to enable the trunk\"}");
+		sendResponse(sock, 400, "Bad Request", "application/json", "{\"error\":\"" + err + "\"}");
 		return;
-	}
-
-	// Issue #546: a trunk pointed at this board itself -- loopback, or its own
-	// address -- can never reach a carrier, yet it would satisfy valid() and
-	// report an emergency route. Refuse it at the door, like the check above.
-	{
-		char ownIp[INET_ADDRSTRLEN] = {0};   // #573 review: fixed buffer, no std::string
-		if (_ip == "0.0.0.0") (void)getPrimaryLocalIPInto(ownIp, sizeof(ownIp));
-		else std::snprintf(ownIp, sizeof(ownIp), "%s", _ip.c_str());
-		for (const std::string* h : { &cfg.host, &cfg.proxyHost })
-		{
-			if (isSelfTrunkHost(*h, ownIp))
-			{
-				sendResponse(sock, 400, "Bad Request", "application/json",
-				             "{\"error\":\"the trunk host must be the carrier, not this board (loopback or its own address)\"}");
-				return;
-			}
-		}
 	}
 
 	if (!TrunkConfigStore::save(cfg))
@@ -6278,6 +6539,56 @@ void HttpServer::sendApiTrunkConfigSet(int sock, const std::string& body)
 
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"config\":" + trunkConfigJson(cfg) + "}");
+}
+
+// The trunk route's checks on a parsed config, shared with the config import
+// (#483). Empty when the config may be saved, else the reason.
+static std::string trunkConfigError(const TrunkConfigStore::Config& cfg, const std::string& ip)
+{
+	struct { const char* name; const std::string& val; size_t cap; } limits[] = {
+		{ "host",      cfg.host,      kMaxTrunkHost },
+		{ "proxyHost", cfg.proxyHost, kMaxTrunkHost },
+		{ "fromUser",  cfg.fromUser,  kMaxTrunkFrom },
+		{ "callerId",  cfg.callerId,  kMaxTrunkCid  },
+		{ "authUser",  cfg.authUser,  kMaxTrunkAuth },
+		{ "pass",      cfg.pass,      kMaxTrunkPass },
+	};
+	for (const auto& l : limits)
+	{
+		if (l.val.size() > l.cap)
+		{
+			std::ostringstream err;
+			err << l.name << " must be at most " << l.cap << " characters";
+			return err.str();
+		}
+	}
+
+	// Enabling a trunk that cannot possibly place a call is a misconfiguration
+	// worth refusing at the door rather than discovering when someone dials 9.
+	// These are exactly SipTrunk::Config::valid()'s requirements; saving them
+	// inconsistent would leave the UI showing "enabled" beside a trunk the
+	// engine silently treats as invalid.
+	if (cfg.enabled && (cfg.host.empty() || cfg.fromUser.empty()))
+	{
+		return "host and fromUser are required to enable the trunk";
+	}
+
+	// Issue #546: a trunk pointed at this board itself -- loopback, or its own
+	// address -- can never reach a carrier, yet it would satisfy valid() and
+	// report an emergency route. Refuse it at the door, like the check above.
+	{
+		char ownIp[INET_ADDRSTRLEN] = {0};   // #573 review: fixed buffer, no std::string
+		if (ip == "0.0.0.0") (void)getPrimaryLocalIPInto(ownIp, sizeof(ownIp));
+		else (void)std::snprintf(ownIp, sizeof(ownIp), "%s", ip.c_str());
+		for (const std::string* h : { &cfg.host, &cfg.proxyHost })
+		{
+			if (isSelfTrunkHost(*h, ownIp))
+			{
+				return "the trunk host must be the carrier, not this board (loopback or its own address)";
+			}
+		}
+	}
+	return {};
 }
 
 // The two standalone setup pages: one flash part each, streamed in place with
@@ -6598,6 +6909,61 @@ void HttpServer::sendApiOtaStatus(int sock)
 	json << "}";
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
+
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+// #384 H1: arm one fault, or hold or release the DRAM ballast, then answer with
+// every counter; a GET only reads them. Reached only through requireAdmin(...,
+// Owner). The body goes through one static buffer: http_conn stacks are tight
+// (#405, #457).
+void HttpServer::sendApiBenchFault(int sock, const HttpRequest& req)
+{
+	namespace bp = pd::benchprobe;
+	bp::Verdict v = bp::Verdict::Ok;
+	if (req.method == "POST")
+	{
+		RequestsHandler* h = _handler.load(std::memory_order_acquire);
+		const bool emergency = h && h->hasLiveEmergencyCall();
+		const std::string fault = getFormParam(req.body, "fault");
+		const std::string ballast = getFormParam(req.body, "ballast");
+		if (!fault.empty() && ballast.empty())
+			v = bp::armFault(fault, getFormParam(req.body, "value"), emergency);
+		else if (fault.empty() && ballast == "release")
+			bp::releaseBallast();
+		else if (fault.empty() && !ballast.empty())
+			v = bp::armBallast(ballast, getFormParam(req.body, "deadman"), emergency);
+		else
+			v = bp::Verdict::BadRequest;
+	}
+	switch (v)
+	{
+		case bp::Verdict::Ok:
+			break;
+		case bp::Verdict::BadRequest:
+			sendResponse(sock, 400, "Bad Request", "application/json",
+				"{\"error\":\"fault[,value] or ballast[,deadman] or ballast=release (docs/BENCH_PROBE.md)\"}");
+			return;
+		case bp::Verdict::EmergencyLive:
+			sendResponse(sock, 409, "Conflict", "application/json", "{\"error\":\"emergency call in progress\"}");
+			return;
+		case bp::Verdict::Busy:
+			sendResponse(sock, 409, "Conflict", "application/json", "{\"error\":\"ballast already held\"}");
+			return;
+		case bp::Verdict::NoMemory:
+			sendResponse(sock, 503, "Service Unavailable", "application/json", "{\"error\":\"no dead-man timer\"}");
+			return;
+	}
+	static char s_body[1024];
+	static std::mutex s_bodyMutex;
+	std::unique_lock<std::mutex> lock(s_bodyMutex, std::try_to_lock);
+	const size_t n = lock.owns_lock() ? bp::renderStatus(s_body, sizeof(s_body)) : 0;
+	if (n == 0)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json", "{\"error\":\"counters busy\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(s_body, n));
+}
+#endif
 
 void HttpServer::sendApiOtaReboot(int sock, const std::string& body)
 {

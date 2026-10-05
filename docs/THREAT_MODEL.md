@@ -112,11 +112,11 @@ CSPRNG `esp_random()`. The trust boundaries below describe the **device**.
 > MAC on its first REGISTER of an unclaimed extension without any credential (S-4), and
 > admits an INVITE from a Learned (unsecured) extension without a challenge; only a device
 > an admin has promoted to Secured proves a secret on REGISTER and on INVITE (#505/#512),
-> and even that has two open bypasses: #507 (an ARP miss admits a Secured extension without
-> digest; a known MAC's extension is rewritten before the check) and the residuals of
-> credential replay: #549 is fixed by #555 (the digest uri must equal the Request-URI,
-> To must match it, and the INVITE's credential is stripped before any fork), but
-> #560 (the relayed ACK and re-INVITE/UPDATE still carry the INVITE's credential; fix #562 open) and #525 (a nonce/`nc` can be reused within its 5-minute life).
+> and the bypasses found in review are fixed: #507 by #487 (an ARP miss no longer admits a
+> Secured extension without digest, and a known MAC's record no longer moves before the
+> check), and credential replay by #555 (#549: the digest uri must equal the Request-URI,
+> To must match it, and the INVITE's credential is stripped before any fork), #562 (#560:
+> the relayed ACK and re-INVITE/UPDATE no longer carry it) and #570 (#525: a reused nonce/`nc` is re-challenged).
 > So any peer that can reach UDP/5060, over the open AP *or* over a wired LAN, where TB-1
 > does not apply at all, can still claim an unclaimed extension and call as an unsecured
 > one, from the address it registered from (#503 refuses an INVITE from any other). The HTTP
@@ -484,7 +484,7 @@ trusted-LAN assumption and the registrar mode (§9) carry the whole load.
   (digest auth, Learn mode, the extension↔MAC lock, a dashboard panel, `GET`/`POST
   /api/registrar`, and the flash-time `cfgseed` route for headless boards). What is left is
   operator work: promote devices to Secured (or run `secure`) so their REGISTER and INVITE
-  prove a secret (#505/#512; open residuals #507, #560 and #525; #549 fixed by #555); an INVITE
+  prove a secret (#505/#512; the review gaps #507, #560, #525 and #549 are fixed by #487, #562, #570 and #555); an INVITE
   is bound to its caller's registered address (#503). See §9 and the operator runbook [LEARN_MODE.md](LEARN_MODE.md). *Narrows
   S-3/D-2, which nothing else in this list does: WPA2 gates who joins the link, but a
   legitimately-joined peer is still unauthenticated at the SIP layer until its device is
@@ -514,9 +514,9 @@ trusted-LAN assumption and the registrar mode (§9) carry the whole load.
 - **SIP digest authentication. DONE.** Challenges REGISTER, and INVITE too (`401`, the
   same stateless nonce): every INVITE in `secure` mode, and a Secured device's INVITE in
   `learn` mode (#512; `RequestsHandler.cpp:1833-1834`). It protects the extensions that have
-  a secret, i.e. devices promoted to Secured or a `secure` deployment, except through two
-  open gaps: #507 (an ARP miss skips it) and #560 (the relayed ACK and re-INVITE/UPDATE still carry the INVITE's credential; fix #562 open) and #525 (a nonce/`nc` can be reused within its 5-minute life). #549 (uri/To binding,
-  credential stripped before a fork) is fixed by #555. A Learned extension proves nothing (P0 above).
+  a secret, i.e. devices promoted to Secured or a `secure` deployment, and its review
+  gaps are fixed: #507 by #487 (an ARP miss no longer skips it), #560 by #562 (the relayed ACK and re-INVITE/UPDATE no longer carry the INVITE's credential), #525 by #570 (a reused nonce/`nc` is re-challenged) and #549 (uri/To binding,
+  credential stripped before a fork) by #555. A Learned extension proves nothing (P0 above).
 - **Per-client brute-force tracking for `login`. DONE, wired since #530** (replaces the global counter
   and stops the cooldown from resetting the
   failure budget; an aggregate backstop bounds address-spoofing). D-3 is **not** retired: one
@@ -633,7 +633,7 @@ single biggest residual risk on a fresh board. What follows is the machinery tha
 an operator switches modes**, it is shipped and reachable, not automatic. SIP **digest
 authentication** (RFC 2617, MD5 / `qop=auth`) challenges **REGISTER**, 
 and **INVITE** too: every INVITE in `secure`, and a Secured device's INVITE in `learn` (#512),
-with #507, #560 and #525 still open (#549 is fixed by #555). The registrar mode is **runtime-selectable**
+and the review gaps #507, #560, #525 and #549 are fixed (#487, #562, #570, #555). The registrar mode is **runtime-selectable**
 (`learn` / `secure`; `open` is retired, #502);
 **Learn mode** adopts an existing fleet trust-on-first-use, keyed by **device MAC** (resolved
 from the REGISTER's source IP via the LAN ARP table, phones do not carry MAC in SIP), then
@@ -651,8 +651,8 @@ MD5 is the wire algorithm, matching the installed-phone fleet. SHA-256 is a hard
 
 | ID | Threat | Mitigation | Residual risk |
 |----|--------|-----------|---------------|
-| S-4 | **Learn-mode TOFU adoption window**, while the registrar is in `learn`, an **unknown MAC** that REGISTERs an unclaimed extension is adopted **without verifying** any credential (trust-on-first-use). A stranger on the segment can race to claim an unclaimed extension before the legitimate phone does. | **Since #441/#502 `learn` is the shipped default and the floor, so this window is open on every fresh board until an admin secures its devices (or switches to `secure`).** The operator verifies the adopted roster (MAC · ext · state) before securing (see [LEARN_MODE.md](LEARN_MODE.md) §5). Already-secured devices are digest-enforced even during the window. TOFU applies only to *unknown* MACs. The intended posture is to run the window on a **trusted/WPA2 link**. | **If the window is left open, this is functionally an open registrar for any unclaimed extension.** On an open AP a proximate attacker can both observe the cutover and race a claim. The control is procedural (bound the window, watch the roster, prefer an encrypted link), not cryptographic. Honest framing: this is now the fresh-board posture, not a temporary cutover mode, so securing devices (P0, §7) is the mitigation, and #440/#487 (locking adopted extensions to their MAC) narrows it. |
-| E-3 | **MAC-based extension↔MAC lock is trust-the-LAN, not cryptographic**, once an extension is secured, a different MAC claiming it is rejected (`403`/`401`). The MAC is learned from the **ARP table**, and ARP/MAC are spoofable on a hostile L2. | The lock defeats accidental collisions, duplicate-extension misconfig, and casual impersonation on a trusted segment. It composes with digest (a rogue must *also* present a valid digest for a secured extension), so it is defense-in-depth, not the sole gate. | **The lock raises the bar but is not a security boundary on a hostile L2**, an attacker who can spoof a MAC and who knows the secret defeats it. **The real boundary is WPA2 / a trusted LAN** (gating association). State this plainly to operators: MAC-lock ≠ cryptographic device identity. ARP first-packet misses (§Learn-mode timing) also mean the lock binds a beat after first contact, not instantaneously. |
+| S-4 | **Learn-mode TOFU adoption window**, while the registrar is in `learn`, an **unknown MAC** that REGISTERs an unclaimed extension is adopted **without verifying** any credential (trust-on-first-use). A stranger on the segment can race to claim an unclaimed extension before the legitimate phone does. | **Since #441/#502 `learn` is the shipped default and the floor, so this window is open on every fresh board until an admin secures its devices (or switches to `secure`).** The operator verifies the adopted roster (MAC · ext · state) before securing (see [LEARN_MODE.md](LEARN_MODE.md) §5). Already-secured devices are digest-enforced even during the window. TOFU applies only to *unknown* MACs. The intended posture is to run the window on a **trusted/WPA2 link**. | **If the window is left open, this is functionally an open registrar for any unclaimed extension.** On an open AP a proximate attacker can both observe the cutover and race a claim. The control is procedural (bound the window, watch the roster, prefer an encrypted link), not cryptographic. Honest framing: this is now the fresh-board posture, not a temporary cutover mode, so securing devices (P0, §7) is the mitigation, and #440 narrows it: Learn now locks an adopted extension to its phone's MAC on that phone's next REGISTER at least 30 s after its first (#515: a burst of two REGISTERs per fake MAC does not lock), leaving open only extensions not yet locked (registered only once or only within the last 30 s, a phone on another subnet, or a MAC shared by phones behind one NAT router). **Two #820 residuals, accepted by desmo on 2026-10-04 (#852):** one REGISTER for another extension, forged with an unlocked phone's source IP, marks that phone's MAC shared, and its extension then never locks until an admin forgets the row (anyone on the link can keep taking its binding, but nobody can lock it); and a phone moved to another extension while its row was unlocked keeps that row on the old extension, so it holds no claim on the new one, and any other on-link device that registers the new extension twice, 30 s apart, locks the phone out of it (`403`). A NAT router's second phone (`403`) and a phone on another subnet (`503` loop) can be locked out the same way. The fix is Secure; until then the operator forgets a moved phone's row ([LEARN_MODE.md](LEARN_MODE.md) §5, §6). |
+| E-3 | **MAC-based extension↔MAC lock is trust-the-LAN, not cryptographic**, once an extension is secured (or, since #440, Learn-locked), a different MAC claiming it is rejected (`403`/`401`). The MAC is learned from the **ARP table**, and ARP/MAC are spoofable on a hostile L2. | The lock defeats accidental collisions, duplicate-extension misconfig, and casual impersonation on a trusted segment. It composes with digest (a rogue must *also* present a valid digest for a secured extension), so it is defense-in-depth, not the sole gate. | **The lock raises the bar but is not a security boundary on a hostile L2**, an attacker who can spoof a MAC and who knows the secret defeats it. **The real boundary is WPA2 / a trusted LAN** (gating association). State this plainly to operators: MAC-lock ≠ cryptographic device identity. ARP first-packet misses (§Learn-mode timing) also mean the lock binds a beat after first contact, not instantaneously. |
 
 ### 9.3 Secret-at-rest (the digest credential store)
 

@@ -6,6 +6,7 @@
 #include "IDGen.hpp"
 #include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include "Session.hpp"
+#include "SessionTimer.hpp"
 #include "SipHeaderUtil.hpp"
 #include "SipMessageTypes.h"
 #include "SipWireUtil.hpp"
@@ -89,6 +90,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 		ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		ok->setContact(_env.contactFor(orbit));
+		pbx::answerSessionTimer(*ok, *data, /*grant=*/false);   // #198: a refresh here draws 481 (#709)
 		ok->setBody(holdSdp);
 		ok->syncContentLength();
 		_env.enqueue(data->getSource(), ok);
@@ -162,6 +164,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 	ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 	ok->setContact(_env.contactFor(orbit));
+	pbx::answerSessionTimer(*ok, *data, /*grant=*/false);   // #198: a refresh here draws 481 (#709)
 	if (!parkedSdp.empty()) ok->setBody(parkedSdp);
 	(void)ok->filterAudioCodecs(/*allowWideband=*/true);   // parked party's own SDP, relayed P2P
 	ok->syncContentLength();
@@ -239,10 +242,19 @@ void ParkOrbit::byeParkedParty(const ParkSlot& slot)
 	if (bye) _env.enqueue(slot.parkedAddr, std::move(bye));
 }
 
+void ParkOrbit::dropParked(ParkSlot& slot, std::string_view reason)
+{
+	// By value: freeForCallId() clears the slot this Call-ID would otherwise view.
+	const std::string callID = slot.callID;
+	byeParkedParty(slot);
+	freeForCallId(callID);
+	_env.endSession(callID, reason);
+}
+
 void ParkOrbit::startRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& parker,
 	std::chrono::steady_clock::time_point now)
 {
-	if (!parker) { byeParkedParty(slot); freeForCallId(slot.callID); return; }
+	if (!parker) { dropParked(slot, "park timeout, parker gone"); return; }
 	const std::string& activeIp = _env.localIp();
 	const std::string srcIpPort = activeIp + ":" + std::to_string(_env.serverPort());
 	const sockaddr_in& addr = parker->getAddress();
@@ -280,10 +292,10 @@ void ParkOrbit::startRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& 
 
 bool ParkOrbit::handleOk(const std::shared_ptr<SipMessage>& data)
 {
-	const std::string cseq(data->getCSeq());
+	// Early-out on the view: this runs on every 200 OK, so the copy waits until
+	// the message is known to be an INVITE answer (#702).
+	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string_view::npos) return false;
 	const std::string callID(data->getCallID());
-	const bool isInviteOk = cseq.find(SipMessageTypes::INVITE) != std::string::npos;
-	if (!isInviteOk) return false;
 
 	// (a) 200 OK to a park re-INVITE sent to the parked party: ACK and free tracking entry.
 	if (auto it = std::find(_pendingAcks.begin(), _pendingAcks.end(), callID);
@@ -336,6 +348,12 @@ bool ParkOrbit::handleOk(const std::shared_ptr<SipMessage>& data)
 					rb->setPeerCallID(slot.callID);
 					rb->setLocalTag(slot.rbFromTag);
 					rb->setParkUac(true);
+					// #718: onBye's peer branch only BYEs the parker when both dialog
+					// headers are set, and it sends (getDialogTo(), getDialogFrom()) as
+					// (From, To). We are the UAC here, so the capture is swapped: dialogTo
+					// is OUR From (our tag), dialogFrom is the parker's To (its tag), and
+					// the BYE goes out From=ours To=parker's.
+					rb->setDialogHeaders(std::string(data->getTo()), std::string(data->getFrom()));
 					rb->setInviteMessage(data);
 					_env.insertSession(slot.rbCallID, rb);
 					rb->setState(Session::State::Connected);
@@ -370,15 +388,13 @@ void ParkOrbit::sweep(std::chrono::steady_clock::time_point now)
 			{
 				_env.log("Park: timeout on " + slot.orbit + " — parker " + slot.parker +
 					" gone, tearing down");
-				byeParkedParty(slot);
-				freeForCallId(slot.callID);
+				dropParked(slot, "park timeout, parker gone");
 			}
 		}
 		else if (slot.state == ParkState::RingingBack && now >= slot.deadline)
 		{
 			_env.log("Park: ring-back on " + slot.orbit + " not answered — tearing down");
-			byeParkedParty(slot);
-			freeForCallId(slot.callID);
+			dropParked(slot, "park ring-back not answered");
 		}
 	}
 }
@@ -404,6 +420,13 @@ bool ParkOrbit::consumeParkChanged()
 	const bool changed = _parkChanged;
 	_parkChanged = false;
 	return changed;
+}
+
+bool ParkOrbit::holdsCall(std::string_view callID) const
+{
+	return std::any_of(_slots.begin(), _slots.end(), [&](const ParkSlot& slot) {
+		return slot.state != ParkState::Free && slot.callID == callID;
+	});
 }
 
 void ParkOrbit::freeForCallId(std::string_view callID)

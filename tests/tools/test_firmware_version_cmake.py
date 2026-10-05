@@ -95,6 +95,35 @@ class FirmwareVersionCmakeTest(unittest.TestCase):
                 r = self.cmake("-DPOCKETDIAL_FW_VERSION=" + bad, check=False)
                 self.assertNotEqual(r.returncode, 0, f"{bad!r} was accepted:\n{r.stdout}{r.stderr}")
 
+    # #384 (H1): the bench probe image passes a "-probe" suffix (top-level
+    # CMakeLists.txt), so its stamp never equals this checkout's release stamp.
+    def use_suffix(self, suffix):
+        with open(os.path.join(self.src, "CMakeLists.txt"), "w") as fh:
+            fh.write(PROJECT.replace("pocketdial_firmware_version(V)",
+                                     f'pocketdial_firmware_version(V "{suffix}")'))
+        self.git("add", "-A")
+        self.commit("suffix")
+
+    def test_a_probe_suffix_is_stamped_ahead_of_dirty(self):
+        self.use_suffix("-probe")
+        self.git("tag", "v1.5.0")
+        self.cmake()
+        self.assertEqual(self.header(), "v1.5.0-probe")
+        with open(os.path.join(self.src, "CMakeLists.txt"), "a") as fh:
+            fh.write("# dirty\n")
+        shutil.rmtree(self.build, ignore_errors=True)
+        self.cmake()
+        self.assertEqual(self.header(), "v1.5.0-probe-dirty",
+                         "-dirty stays last, where every dirty check looks for it")
+
+    def test_a_probe_suffix_that_would_overflow_falls_back_to_the_hash(self):
+        self.use_suffix("-probe")
+        tag = "v1.5.0-beta.22-" + "x" * 13   # 28 chars: fits alone, not with -probe
+        self.git("tag", tag)
+        head = self.git("rev-parse", "--short=7", "HEAD")
+        self.cmake()
+        self.assertEqual(self.header(), head + "-probe")
+
 
 class NoDirectoryWideDefineTest(unittest.TestCase):
     # #461 fix 3: the stamp reaches host code only through the generated

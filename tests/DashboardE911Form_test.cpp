@@ -41,3 +41,44 @@ TEST(DashboardE911Form, AFailedLoadDisablesSaveSoBlanksCannotOverwriteTheConfig)
 	EXPECT_NE(fail.find("$(\"e911-save\").disabled=true"), std::string::npos) << "a failed load must disable Save:\n" << fail;
 	EXPECT_NE(fail.find("setMsg(\"e911-msg\""), std::string::npos) << "a failed load must say so:\n" << fail;
 }
+
+// #792: with the 3CX anchor placing real calls (emergencyRoute "anchor"), 3CX
+// carries the 911 call, so "nobody on site is notified" misleads. The banner
+// text is its own element and applyE911() rewords it for that route only.
+TEST(DashboardE911Form, TheBannerNamesTheAnchorAsTheCarrierWhenTheRouteIsAnchor)
+{
+	std::string p;
+	for (const auto& part : CGA_INDEX_HTML_PARTS) p.append(part.data, part.size);
+
+	// Positive control: the default sentence is still there for every other route.
+	EXPECT_NE(p.find("A 911 call still routes out, but nobody on site is"), std::string::npos)
+		<< "the default banner text must remain";
+	EXPECT_NE(p.find("<span id=\"e911-banner-text\">"), std::string::npos) << "the banner text needs its own element";
+
+	const size_t fn = p.find("function applyE911(d){");
+	ASSERT_NE(fn, std::string::npos);
+	const std::string body = p.substr(fn, p.find(";}\n", fn) - fn);   // one-line style: ends at ";}"
+	EXPECT_NE(body.find("$(\"e911-banner-text\")"), std::string::npos) << body;
+	EXPECT_NE(body.find("d.emergencyRoute===\"anchor\""), std::string::npos)
+		<< "the reword must key on the anchor route:\n" << body;
+	EXPECT_NE(body.find("3CX anchor"), std::string::npos) << body;
+}
+
+// #793 review: the anchor wording must not outlive the anchor route. The banner
+// is one element on a page that stays open across a route change (anchor ->
+// trunk fallback), so applyE911() has to put the original sentence back.
+TEST(DashboardE911Form, TheBannerRestoresItsDefaultTextWhenTheRouteIsNotAnchor)
+{
+	std::string p;
+	for (const auto& part : CGA_INDEX_HTML_PARTS) p.append(part.data, part.size);
+
+	const size_t fn = p.find("function applyE911(d){");
+	ASSERT_NE(fn, std::string::npos);
+	const size_t end = p.find("/* #167", fn);
+	ASSERT_NE(end, std::string::npos);
+	const std::string body = p.substr(fn, end - fn);
+	EXPECT_NE(body.find("t._def===undefined"), std::string::npos)
+		<< "the default sentence must be remembered before it is overwritten:\n" << body;
+	EXPECT_NE(body.find(":t._def"), std::string::npos)
+		<< "every route but anchor must put the remembered sentence back:\n" << body;
+}

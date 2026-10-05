@@ -18,6 +18,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_src = src;
 	_dest.reset();
 	_state = State::Invited;
+	_disposition = Disposition::None;   // #690: a recycled slot carries no old outcome
 	_startTime = std::chrono::steady_clock::now();
 	_isBroadcast = false;
 	_isAnchor = false;
@@ -49,6 +50,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_lastServerCSeq = 0;
 	_maxObservedCSeq = 0;
 	_isEmergency = false;     // #604
+	_emergencyNumber = {};    // #879
 	_rtpWatchArmed = false;   // #604
 
 	// Issue #353. These survived reset() and nothing else ever cleared them --

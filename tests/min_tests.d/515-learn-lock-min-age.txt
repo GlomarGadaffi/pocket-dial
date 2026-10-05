@@ -1,0 +1,2 @@
+# LearnLockMinAge_test.cpp: the Learn locking sighting comes at least 30 s after the first (#515 item 1)
+7

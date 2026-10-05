@@ -1,0 +1,2 @@
+# MediaBridge_test.cpp: 1 (#734: an anchor-mode participant id that does not fit the snapshot buffer is refused at startBridge)
+1

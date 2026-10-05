@@ -159,4 +159,73 @@ TEST(TransactionLayer, FreeForCallIdStopsRetransmittingImmediately)
 	EXPECT_EQ(env.sent.size(), 1u) << "a freed transaction must not retransmit";
 	EXPECT_EQ(countLogsContaining(env, "Timer B expired"), 0)
 		<< "a freed transaction must not later report a timeout";
+	EXPECT_TRUE(env.transactionTimeouts.empty())
+		<< "nor tell the TU about one (#726)";
+}
+
+TEST(TransactionLayer, TimerBTellsTheTuOnceTheSlotIsFree)
+{
+	// #726: RFC 3261 §17.1.1.2 -- "if timer B fires while in the Calling state,
+	// the client transaction SHOULD inform the TU that a timeout has occurred."
+	// The layer used to log and stop, so an INVITE the far end never answered
+	// at all was ended by whatever deadline the path happened to have (60 s
+	// for a trunk call) or by nothing.
+	struct SamplingEnv : FakePbxEnv
+	{
+		const TransactionLayer* layer = nullptr;
+		size_t activeAtCallback = SIZE_MAX;
+		void onClientTransactionTimeout(std::string_view callId, std::string_view method) override
+		{
+			// Sampled INSIDE the callback: §17.1.1.2 terminates the transaction
+			// and then informs, and a TU that answers by placing a fresh call
+			// needs the slot back.
+			activeAtCallback = layer->activeClientTransactions();
+			FakePbxEnv::onClientTransactionTimeout(callId, method);
+		}
+	};
+	SamplingEnv env;
+	TransactionLayer tx(env);
+	env.layer = &tx;
+	const sockaddr_in phone = FakePbxEnv::addr("192.168.1.50", 5060);
+	auto inv = beepInvite(phone);
+	tx.maybeTrack(phone, inv);
+
+	const auto t0 = std::chrono::steady_clock::now();
+	tx.sweep(t0 + std::chrono::seconds(20));
+	EXPECT_TRUE(env.transactionTimeouts.empty()) << "Timer B is 64*T1 = 32 s, not sooner";
+
+	tx.sweep(t0 + std::chrono::seconds(40));
+	ASSERT_EQ(env.transactionTimeouts.size(), 1u)
+		<< "one unanswered INVITE, one timeout reported to the TU";
+	EXPECT_EQ(env.transactionTimeouts[0].first, std::string(inv->getCallID()));
+	EXPECT_EQ(env.transactionTimeouts[0].second, "INVITE");
+	EXPECT_EQ(env.activeAtCallback, 0u) << "the slot is released before the TU is told";
+	EXPECT_EQ(countLogsContaining(env, "Timer B expired"), 1) << "the #148 log line is kept";
+}
+
+TEST(TransactionLayer, AProvisionalTakesTimerBOffTheTable)
+{
+	// §17.1.1.2: Timer B belongs to the Calling state. Once a 1xx has moved the
+	// transaction to Proceeding, the INVITE waits for its final under the TU's
+	// own no-answer bound, so the TU must NOT be told at 32 s -- that would cut
+	// off a call that is ringing (a 911 the carrier is working on, #712).
+	FakePbxEnv env;
+	TransactionLayer tx(env);
+	const sockaddr_in phone = FakePbxEnv::addr("192.168.1.50", 5060);
+	tx.maybeTrack(phone, beepInvite(phone));
+
+	const std::string trying =
+		"SIP/2.0 100 Trying\r\n"
+		"Via: SIP/2.0/UDP 192.168.1.10:5060;branch=" + std::string(kBranch) + "\r\n"
+		"From: \"PocketDial\" <sip:pbx@192.168.1.10:5060>;tag=servertag\r\n"
+		"To: <sip:101@192.168.1.10>\r\n"
+		"Call-ID: beep-call-id@192.168.1.10\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	ASSERT_TRUE(tx.matchAndAdvance(std::make_shared<SipMessage>(trying, phone)));
+
+	const auto t0 = std::chrono::steady_clock::now();
+	tx.sweep(t0 + std::chrono::seconds(40));
+	EXPECT_TRUE(env.transactionTimeouts.empty())
+		<< "a provisional stops Timer B; the TU keeps its own no-answer bound";
 }

@@ -175,7 +175,15 @@ public:
 	//               whereas 180 means generate local ringback.
 	// Confirmed   : 2xx received and ACKed -- the call is up.
 	// Terminating : BYE sent, waiting for its 200.
-	enum class State : uint8_t { Free, Trying, Proceeding, Confirmed, Terminating };
+	// Cancelling  : CANCEL sent for a ringing INVITE (#747), waiting for the
+	//               INVITE's own final response (487, or a 2xx that crossed it).
+	enum class State : uint8_t { Free, Trying, Proceeding, Confirmed, Terminating, Cancelling };
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: Outbound is a call we placed (UAC); Inbound one the carrier placed
+	// to us (UAS). For Inbound, Trying means its INVITE is not yet answered,
+	// Proceeding that we sent a 18x, Confirmed that we sent the 2xx.
+	enum class Role : uint8_t { Outbound, Inbound };
+#endif
 
 	struct Dialog
 	{
@@ -227,6 +235,20 @@ public:
 		// leaving the call up and billing.
 		std::string remoteTarget;
 
+		// Issue #748, RFC 3261 s12.1.2: the route set, from the Record-Route
+		// headers of the 2xx, reversed, held as one Route header value
+		// ("<sip:a;lr>, <sip:b;lr>"). Empty means none. Written as `Route:` on the
+		// ACK for the 2xx and on the BYE (s12.2.1.1). Only a loose-router first hop
+		// is honoured; a strict-router set is dropped, as before.
+		std::string routeSet;
+
+		// Where in-dialog requests are addressed: the first route hop when it is a
+		// dotted quad (an FQDN would need getaddrinfo on the SIP thread), else
+		// `peer`. Set by placeCall() and again by the 2xx. Responses and BYEs from
+		// it are accepted alongside `peer` (#356): the 2xx that named it already
+		// passed the peer check.
+		sockaddr_in nextHop{};
+
 		// The handset leg this trunk call is bridged to, so a teardown on either
 		// side can find the other.
 		std::string handsetCallID;
@@ -245,9 +267,34 @@ public:
 		std::string challengedBranch;
 		std::string challengedToTag;
 		uint32_t    challengedCseq = 0;
+		// Issue #687: whether a 401/407 to our BYE has been answered. Its own
+		// flag: the INVITE's challenge and the BYE's are separate transactions,
+		// and each gets exactly one credentialed retry.
+		bool        byeAuthAttempted = false;
+		// #794: hangup() ran while this INVITE was still in Trying. RFC 3261 §9.1
+		// forbids a CANCEL before a provisional response, so the slot is held and
+		// handleResponse() sends the CANCEL on the first 1xx; a 2xx or a failure
+		// arriving first is handled as if the CANCEL had crossed it.
+		bool        cancelPending = false;
 
 		sockaddr_in peer{};
 		std::chrono::steady_clock::time_point deadline{};
+#if POCKETDIAL_TRUNK_INBOUND
+		// #398: fromTag and toTag keep their meaning in the INVITE that made the
+		// dialog, so for Inbound the carrier's tag is fromTag and ours is toTag.
+		// `cseq` is always OUR sequence number: 0 for Inbound (RFC 3261 s12.1.1:
+		// empty) until our first request. The carrier's INVITE's is remoteCseq.
+		Role        role = Role::Outbound;
+		uint32_t    remoteCseq = 0;
+		std::string inviteFrom, inviteTo;   // the INVITE's From and To lines, verbatim
+		std::string inviteVias;             // its Via lines, in order, each ending CRLF
+		std::string inviteRecordRoute;      // its Record-Route lines, likewise
+		// RFC 3261 s15: the carrier ACKed our 2xx, so a BYE may now be sent.
+		bool        ackSeen = false;
+		// #398 part D: hangup() came before that ACK; the BYE goes out when it
+		// arrives or when the 2xx's retransmissions time out (sweep()).
+		bool        byeAfterAck = false;
+#endif
 	};
 
 	// ── Pure builders ────────────────────────────────────────────────────────
@@ -289,7 +336,34 @@ public:
 	// dialog has no To-tag or no remote target -- there is no such thing as a
 	// well-formed in-dialog request without them, and emitting a half-formed BYE
 	// would earn a 481 while leaving the call up.
-	static std::string buildBye(const Dialog& d, std::string_view freshBranch);
+	// `authLine`, when non-empty, is a complete "Authorization: ..." or
+	// "Proxy-Authorization: ..." header line (no CRLF) answering a challenge
+	// to the previous BYE (#687); the BYE still takes d.cseq+1.
+	static std::string buildBye(const Dialog& d, std::string_view freshBranch,
+		std::string_view authLine = {});
+
+	// CANCEL for the INVITE still ringing (#747; RFC 3261 §9.1): the INVITE's own
+	// Request-URI, Via branch, From (with tag), To (no tag: the INVITE had none),
+	// Call-ID and CSeq number, method CANCEL. Not a new transaction, so no fresh
+	// branch -- the carrier matches it to the INVITE on the branch.
+	static std::string buildCancel(const Dialog& d);
+
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: the dialog a carrier's INVITE makes with us as UAS (RFC 3261
+	// s12.1.1): its bare Call-ID, its From tag as the remote tag, `localTag` as
+	// ours, its Contact as the remote target, its CSeq as remoteCseq.
+	static Dialog dialogFromInvite(const SipMessage& invite, std::string_view localTag,
+		std::string_view localIpPort, std::string_view localUser);
+
+	// A response to that INVITE: every Via, From, Call-ID and CSeq echoed, To
+	// with our tag (s8.2.6.2). A 18x or 2xx also echoes Record-Route and carries
+	// our Contact (s12.1.1); `sdp`, when given, is the body.
+	static std::string buildResponse(const Dialog& d, int status, std::string_view sdp = {});
+
+	// The reason phrase this trunk sends with `status` (#398 part C: the engine's
+	// own refusals of a carrier INVITE use it too).
+	static const char* reasonPhrase(int status);
+#endif
 
 	// ── Listener: how the engine learns a trunk dialog moved ─────────────────
 	//
@@ -333,9 +407,9 @@ public:
 		virtual void onTrunkAnswered(const TrunkEvent& ev,
 			const std::shared_ptr<SipMessage>& ok) = 0;
 
-		// A 3xx-6xx final to our INVITE, or a sweep timeout (status 408). Fired
-		// AFTER the slot has been released, so the listener may place a fresh
-		// call from inside it.
+		// A 3xx-6xx final to our INVITE, or a timeout (status 408: Timer B on the
+		// INVITE, #726, or sweep()'s deadline). Fired AFTER the slot has been
+		// released, so the listener may place a fresh call from inside it.
 		virtual void onTrunkFailed(const TrunkEvent& ev, int status) = 0;
 
 		// The carrier hung up first. Fired after the 200 is enqueued and the
@@ -392,9 +466,49 @@ public:
 	bool handleBye(const std::shared_ptr<SipMessage>& data);
 
 	// Tear down the trunk leg for `callID` (either the trunk's own Call-ID or the
-	// handset leg's). Sends a BYE if the dialog is confirmed; frees it outright if
-	// it never got that far. Returns true if a dialog was found.
+	// handset leg's). Sends a BYE if the dialog is confirmed; CANCELs it if it is
+	// ringing (Proceeding, #747) and holds the slot for the INVITE's own final
+	// response; frees it outright only if it never drew a provisional (Trying).
+	// A second call on a Cancelling dialog changes nothing. Returns true if a
+	// dialog was found. An inbound dialog not yet answered gets a 480 instead
+	// (#398): a UAS never CANCELs.
 	bool hangup(std::string_view callID);
+
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: take a carrier's INVITE into a free slot (Trying); `handsetCallID`
+	// is the fork's own Call-ID. Sends nothing. Returns 0 when taken; otherwise
+	// the final the caller answers the carrier with, nothing claimed: 503 trunk
+	// not configured, 481 a To tag, 482 a Call-ID already ours (s8.2.2.2; a
+	// retransmission is the caller's to catch first, with ownsCallID()), 400 no
+	// From tag or no sip:/sips: Contact to BYE, 486 no free slot.
+	int acceptCall(const SipMessage& invite, std::string_view handsetCallID, uint16_t localRtpPort);
+
+	// Answer that INVITE: a 1xx (a 18x makes it Proceeding), a 2xx with `sdp`
+	// (Confirmed), or a failure, which releases the slot. False when `callID`
+	// names no unanswered inbound dialog or the message pool is exhausted.
+	bool respond(std::string_view callID, int status, std::string_view sdp = {});
+
+	// The carrier's ACK for our 2xx on an inbound dialog: recorded as ackSeen and
+	// consumed (and a BYE hangup() held for it goes out). False for any other ACK.
+	// Matched on the trunk Call-ID and our To tag.
+	bool handleAck(const SipMessage& ack);
+
+	// #398 part D: the carrier's CANCEL of its INVITE (RFC 3261 s9.2). From the
+	// INVITE's source only (#356); false for anything else. Answered 200; if the
+	// INVITE is still unanswered it also gets 487, the slot is released and the
+	// listener hears onTrunkFailed(487), which cancels the fork.
+	bool handleCancel(const std::shared_ptr<SipMessage>& data);
+#endif
+
+	// RFC 3261 §17.1.1.2 Timer B on our INVITE (#726): 64*T1 with no response
+	// at all. Ends a Trying dialog exactly as sweep()'s deadline would (408 to
+	// the listener, slot released first) and returns true; a dialog already
+	// hung up in Trying (#794) is released with no 408, since its handset was
+	// answered when it hung up. False when
+	// `trunkCallID` is not a live trunk dialog or the dialog has left Trying: a
+	// provisional stops Timer B, and from Proceeding on the carrier's final or
+	// the deadline ends it.
+	bool handleInviteTimeout(std::string_view trunkCallID);
 
 	// Time out dialogs that never reached a final response.
 	void sweep(std::chrono::steady_clock::time_point now);
@@ -419,6 +533,11 @@ public:
 	uint32_t forgedDialogResponses() const { return _dialogForgedResponses.load(std::memory_order_relaxed); }
 	// #666: BYEs refused with 403 by handleBye()'s #356 check. Same shape.
 	uint32_t refusedDialogByes() const { return _dialogRefusedByes.load(std::memory_order_relaxed); }
+	// #687: our own BYEs whose credentialed retry, sent after a 401/407, was
+	// still answered non-2xx. The dialog is released regardless, so this is the
+	// one count that says a carrier leg may have been left up. Same shape;
+	// not yet surfaced by /api/status.
+	uint32_t refusedByeRetries() const { return _dialogRefusedByeRetries.load(std::memory_order_relaxed); }
 
 	// Test/diagnostic accessors. Cheap linear scans over a fixed array.
 	size_t activeDialogs() const;
@@ -455,6 +574,15 @@ private:
 	// carrier (#386).
 	Dialog* findMutableByTrunkCallID(std::string_view callID);
 	Dialog* allocDialog();
+#if POCKETDIAL_TRUNK_INBOUND
+	// Send buildResponse() to the carrier and move the state; never releases.
+	bool respondTo(Dialog& d, int status, std::string_view sdp = {});
+#endif
+
+	// Release `d` as a timeout and tell the listener (408), unless the dialog
+	// was already ending on our own BYE/CANCEL. The one copy of the
+	// free-then-fire order, shared by sweep() and handleInviteTimeout().
+	void releaseAsTimeout(Dialog& d);
 
 	// Fill a TrunkEvent from a dialog. Views borrow that dialog's storage, so
 	// the result must not outlive it -- see the Listener note.
@@ -477,6 +605,13 @@ private:
 	// locals (~1.1 KB on the SIP thread otherwise). Only touched under the
 	// engine's _mutex, like every other SipTrunk method.
 	bool answerChallenge(Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status);
+	// Issue #687: the same, for a 401/407 to our BYE. Both go through
+	// credentialLine(), the one place a digest credential is built: it fills
+	// _authLine for `method` on `uri` and returns the line's length, or 0 when
+	// the challenge cannot be answered.
+	bool answerByeChallenge(Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status);
+	size_t credentialLine(const Dialog& d, const std::shared_ptr<SipMessage>& challenge, int status,
+		std::string_view method, std::string_view uri);
 	SipDigest::BoundedChallenge _challenge{};
 	char _authLine[32 + SipDigest::kMaxAuthorizationValue] = {};
 
@@ -491,6 +626,7 @@ private:
 	std::atomic<uint32_t>          _regForgedResponses{0};
 	std::atomic<uint32_t>          _dialogForgedResponses{0};
 	std::atomic<uint32_t>          _dialogRefusedByes{0};
+	std::atomic<uint32_t>          _dialogRefusedByeRetries{0};   // #687
 
 	Listener* _listener = nullptr;
 	std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS> _dialogs{};

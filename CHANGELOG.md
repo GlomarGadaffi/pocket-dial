@@ -1,6 +1,39 @@
 # Changelog
 
-## Unreleased (on main since v1.5.0-beta.2) — 2026-09-28
+## v1.5.1 — 2026-10-03
+
+Two firmware changes on top of `v1.5.0` (`b8b4f0b`), from the v1.5.0 release reviews. None of the changes below is claimed bench-verified one by one.
+
+### Memory and security
+
+- A pooled message keeps at most 64 header lines and 8 KB of line buffer (4 KB on the constrained build): one 2 KB datagram of about a thousand short lines can no longer pin about 48 KB of heap in a pool slot, for requests and responses. The cut applies only to datagrams off the socket, so PBX-built messages and retransmits are never truncated. A carrier 2xx that was cut ignores its Record-Route (#844; #838).
+- Learn mode locks an extension only on a sighting at least 30 s after the device's first one, so a burst of two REGISTERs per fake MAC no longer locks anything. Rows loaded from flash behave as before (#840; #515).
+
+### Tools and docs
+
+- The soak verdict honours an explicit `--expect-registrations` and the orchestrator expects the phones already on the rig plus the test UAs; `run_soak.sh` can be started over the rig ssh wrapper (#842, #843; Part of #401).
+- CHANGELOG: the v1.5.0 section with the release soak result, and #838 and the smoke result in the rc.1 known gaps (#846, #841).
+
+### Known gaps
+
+- Emergency routing: the #759 header gate misses trunk-dialog Call-IDs and PSAP callbacks (#818); `ROUTED` is reported before a later `makeCall` failure (#821); a 911 produced by a dial-plan rule never gets the header-gate yield (#834); a 911 marked `text/plain` whose datagram never contains `application/sdp` is refused with a 400 (#834); a 911 INVITE that arrives with `Content-Type: text/plain` gets two Content-Type lines in the PBX's answer (#845).
+- The carrier-facing trunk is experimental: inbound carrier calls and the live-carrier proofs are still open (#398, #399, #618).
+- Hardware evidence is one handset model, one board and one carrier; on-device RTP has no automated coverage.
+
+## v1.5.0 — 2026-10-02
+
+The same commit as `v1.5.0-rc.1` (`b8b4f0b`): no code changed between the release
+candidate and this release (release path A, #401). Its changes and known gaps are
+the v1.5.0-rc.1 section below.
+
+### Release soak
+
+- 4.6 h on the test rig running `b8b4f0b`, load from `sip_stress.py --profile rc1 --duration 16200`, judged by `soak_verdict.py --min-hours 4 --expect-registrations 7`: SOAK VERDICT PASS, LOAD VERDICT PASS.
+- Load: 167 echo calls to 777, 54 extension-to-extension calls, 18 conferences on 888, 14 park/MoH retrievals and 1096 REGISTERs; none failed.
+- Idle internal heap: -292 B/h (floor -1024 B/h). It took a one-time step of about 1 KB in the first two hours and stayed flat afterwards. Lowest free internal heap 110 KB; smallest idle largest free block 53 KB.
+- 0 reboots, no coredump, 0 receive errors, 0 HTTP 503s, 0 pool refusals. 219 s after the last call the rig was back to 0 calls, 0 parks and exactly the 7 expected registrations (3 real phones plus the 4 test extensions).
+
+## v1.5.0-rc.1 — 2026-10-02
 
 One line per change merged to `main` after beta.2, taken from its squash title.
 `(#PR; #issue)`: the first number is the pull request, the rest are the issues it
@@ -59,6 +92,50 @@ bench-verified here.
 - lwIP IPv4 reassembly is enabled: SIP/UDP over 1,472 B is no longer silently dropped (#509; #496).
 - Every fragment addressed to the mDNS group is dropped (#574; #559).
 - Reboot and factory reset are refused while a 911/933 is live (#655; #652).
+- A BYE refused under #356 is counted, logged at powers of two and shown in `/api/status` (#675; #666).
+- A restart held for a live 911/933 logs once, not every poll (#678; #677).
+- Anchor: no rx task is started on a slot being torn down (#683; #682).
+- `onHandsetRtp` snapshots `_participantId` under `_mutex` before `writeAudio` (#722; #701).
+- An anchor participant id too long for the snapshot buffer is refused at `startBridge` (#736; #734).
+- The conference mix tick takes a frame only when a whole one is buffered (#737; #170).
+- A lapsed lease and the no-answer reaps never end a 911/933 (#725; #712).
+- A 911/933 on a full anchor pre-empts one non-emergency call (#740; #624).
+- A call to an extension that dialed 911/933 in the last 30 min is an emergency call (#721; #659).
+- Anchor: a leg whose GET stream never opened is dropped once, unless it is a 911 (#723; #379).
+- The PBX's own 2xx names the phone as session refresher (#724; part of #198).
+- Message-waiting indication, RFC 3842 (#757).
+- SBC mode rings a registered local extension locally instead of sending it out the trunk (#799; #796).
+- OPTIONS keepalives and relayed BYEs address the phone's registered Contact, URI parameters kept (#801; #797, #798).
+- A refused pool allocation no longer leaves a session half-done (#777; #715).
+- A callee's unnamed final failure is relayed or ACKed (#781; #746).
+- Ring-all, 999 and zone calls drop the pending member by To on all-busy (#805; #803).
+- A group call's caller ACK, BYE and CANCEL dispatch on session state, not the To number (#806; #802).
+- Park: a parked party's BYE ends the Session; a park timeout no longer leaks it (#807; #804).
+- The Session-Expires refresher match is case-insensitive; delta-seconds saturate (#783; #739).
+- A refresh on a park-orbit or 440 leg is answered, never relayed back to its sender (#782; #709).
+- The attended splice offers `sendrecv`, not the far party's hold answer (#774; #719).
+- `startHoldMusic()` logs under `_mutex` (#772; #717).
+- CFNA to an unregistered target answers the caller and cancels the callee (#771; #716).
+- A CANCEL to a directly relayed leg carries the INVITE's Request-URI and To (#770; #749).
+- The REGISTER 200 lists the phone's binding, not the PBX URI (#767; #755).
+- The register beep's ACK for the phone's 200 gets a fresh Via branch (#766; #752).
+- The cancelled pickup target's 487 is ACKed and dropped, not relayed to an answered caller (#765; #750).
+- Park ring-back: the ring-back session records its dialog headers, so the parked party's BYE reaches the parker (#776; #718).
+- The 202 to an in-dialog REFER echoes the To tag instead of appending a second (#769; #720).
+- Anchor: the hold answer mirrors the offer's SDP direction (#768; #751).
+- `Session` records a write-once call `Disposition` next to `State` (#791; #690).
+- A 911 whose both legs are silent for 4 h is ended and counted (#742; #741).
+- A handset's hold on an inbound anchored call is answered (#449; #445).
+- In-dialog requests across a B2BUA splice are rebuilt in the peer dialog (#589; part of #453).
+- The SIP and SDP grammars are constrained to our RFC subset and invariants (#759).
+- A relayed call's BYE is answered locally and the PBX sends its own BYE to the far leg (#809; #808).
+- The 487 ACK of a cancelled pickup target and the 200 to a trunk CANCEL are conformant (#823).
+- A 911 whose anchor worker cannot start is notified NOT ROUTED, not routed (#815; #713).
+- An emergency `makeCall` waits out a call slot that is still tearing down (#816; #743).
+- A multipart 911 INVITE is routed and `tel:911` reads as 911; the unwrap keys on the To user, and only a URI's own number counts (#817; #760).
+- Timer B and Timer F expiry tell the transaction user; a Trying trunk INVITE ends at 32 s, and the BYE Timer F hook folds into the same callback (#814; #726).
+- A handset hangup on an answered inbound anchored call ends it at once: no BYE to the zero-address PSTN stand-in, the anchor leg and bridge released, one CDR; a BYE on a still-ringing call is left alone (#831; #819).
+- An emergency number is read only inside the URI, never from a display name or parameter: `"sip:911@lobby" <tel:…>` is an ordinary call and `"sip:102@lobby" <sip:911@x>` is a 911; the 911 yield keys on the To user; an odd quote falls back to the last `<…>`; `SIP:` and `sips:` are read like `sip:` (#832; #824).
 
 ### Trunk
 
@@ -80,6 +157,16 @@ bench-verified here.
 - The trunk INVITE log names its destination, local port and From user (#620; #618).
 - Timer E retransmit for REGISTER; forged REGISTER responses are counted (#654; #617).
 - Power-of-two logging for forged trunk responses; counts in `/api/status` (#664; #663).
+- A 401/407 to our BYE is answered once with digest credentials (#694; #687).
+- Every REGISTER final response and the full outbound INVITE are logged (#685; #618).
+- A REGISTER 2xx registers only when it lists our binding (#732; #686).
+- `/api/kill` on a trunk call sends the carrier BYE (#778; #714).
+- A handset CANCEL cancels a ringing carrier leg and answers the handset 487 (#779; #747).
+- The BYE to the handset after a carrier hangup or RTP reap has From and To the right way round (#780; #700).
+- The trunk INVITE no longer claims `Supported: timer` (#764; #753).
+- ACK and BYE carry the carrier's Record-Route as a Route set (#775; #748).
+- `hangup()` in Trying holds the slot and CANCELs on the first 1xx (#811; #794).
+- An admin kill of a trunk call BYEs the handset once, not twice (#813; #795).
 
 ### Memory and no-heap
 
@@ -117,6 +204,16 @@ bench-verified here.
 - Reset journal: append-only slots (#610; #595).
 - Dynamic task creates since boot are counted on `/api/status` `memory.dynamicTaskCreates` (#628; #479).
 - `/metrics` makes no allocations per scrape (#633; #630).
+- `tel_media_rx` runs on a per-call-slot static stack (#661; #479 part A); the slot is counted in the 72 KB budget and `RxTaskArg` lives in it (#673).
+- Each slot's `rxDoneSem` is created once and drained per rx start (#680; #679).
+- One `printLogs()` replaces 13 copies of the setter log-flush loop (#705; #702).
+- `refuseInvite()` replaces three copies of the INVITE refusal lambda (#706; #702).
+- Three per-message `std::string` copies become `string_view` lookups (#707; #702).
+- L2 queries the local IP only when the egress channel re-resolves, not per frame (#730; #702).
+- Anchor restart, rewarm and reconcile run on one persistent `tel_maint` task (#688; #658).
+- `GET /api/sbc-mode` writes into a fixed buffer, no heap (#786; part of #410).
+- `conf_mix_tick` runs on a boot-allocated static stack, created once and parked (#790; #479).
+- A pooled message reuses a parked header-line buffer when it gains a header, instead of growing one string per inserted header on every reuse: free internal heap no longer drains per call (about 390 B per call, driven by REGISTER 200s and the 888 conference answer; present since #462 and in b84d9cf) (#837).
 
 ### Dashboard
 
@@ -130,6 +227,9 @@ bench-verified here.
 - Learn mode does not lock an extension until it is secured (#648; #643).
 - A banner shows while the admin login is unset, and admin-status errors are shown (#649; #644).
 - Reboot with `confirm=1` does a plain reboot when no OTA image is staged (#650; #645).
+- Config export and import carry the trunk, SMTP, E911 and `admin_ext` settings (#738; #483).
+- The E911 banner names the 3CX anchor as the carrier on the anchor route (#793; part of #792).
+- SD archive CDR rows carry a direction column (#788; part of #221).
 
 ### Security
 
@@ -154,6 +254,8 @@ bench-verified here.
 - A replayed digest nonce/nc is re-challenged, not admitted (#570; #525).
 - Digest nonces are stamped with the monotonic clock, so a wall-clock step cannot strand phones (#584).
 - The Wi-Fi SoftAP passphrase is drawn with the SAR ADC entropy source on (#590; #588).
+- New Learn adoptions are rate-limited; one action forgets every Learned device (#727; #515).
+- Learn locks adopted extensions and never admits a Secured extension unauthenticated; an ARP miss on a locked extension is a retryable 503, not an admission (#487; #440, #507).
 
 ### Docs
 
@@ -177,6 +279,9 @@ bench-verified here.
 - Every `/api/status` field documented (#619).
 - Registrar default, G.722 advice and `/api/cdr` gating match the code (#626).
 - Learn mode does not lock unsecured extensions (#653).
+- README matches main on `/api/cdr` gating, SIP trunk REGISTER and other drift (#674).
+- Harness notes: EN-line reset, esptool 5.4.0, DTR-false reboot (#703; #338).
+- heap_trace: the 360/900 s and periodic dumps are unreachable, stated as such (#704; #374).
 
 ### CI, tests, tools and diagnostics
 
@@ -223,6 +328,36 @@ bench-verified here.
 - Harness `same_commit` compares commit hashes, not describe strings (#607; #593).
 - The timeout-fail seam fails only the option a test asks for (#623; #616).
 - Per-route allocation gate with a calibrated allowlist (#627; #410).
+- The constrained 4 MB profile compiles at `-Os` (#728; #689).
+- The clang-tidy safety ratchet is back at baseline (#729; #697).
+- Interop: baresip answers calls manually (#696).
+- CI applies the heap profiles' sdkconfig defaults at set-target (#699).
+- The #457 stack gate reads real Xtensa `.ci` output (#708).
+- Dead code removed: `sendConfigCfg`, `getParkedCalls`, two unread snapshot fields; two stale comments fixed (#710; #702).
+- `repliesRefused` and `optionsPingTruncated` on `/api/status`; `packetsDropped` is derived (#735; #702).
+- `updateAddressing` test calls the `shouldResolveArp()` it pins (#711; #702).
+- `/api/status` reports the route that set `stackHwm_http_conn`'s minimum (#789; #405).
+- `run_cppcheck.sh` falls back to the WSL image's `~/cppcheck-root` (#787; #372).
+- Nightly: fail-closed network probes in the runner isolation step (#784; #493).
+- `SIP_OUTSIDE_LINE=anchor|trunk` selects the constrained build's one outside line (#785; part of #731).
+- Conformance test: every message the PBX sends passes pjsip's parser and an RFC 3261 checklist (#758).
+- `sip_stress.py --profile rc1`: the rc.1 smoke/soak load profile (4 UAs, 777 burst, ext-to-ext, 888, park+MoH, idle gaps), refusing owner-phone, 911/933 and 3CX targets (#825; Part of #401).
+- `rig_checkout.sh`: leases the test rig and glolab together, writes the #428 CHECK-OUT/CHECK-IN, ssh allowlist, secret redaction, reboot-safe leases (#827; Part of #401).
+- `run_soak.sh`: smoke, soak and post-OTA orchestrator with preflight, abort path and an evidence bundle (#828; Part of #401).
+- `soak_verdict.py` says PASS, FAIL or INVALID with margins, a heap trend interval and an idle-quiesce leak gate (#830; Part of #401).
+
+### Known gaps
+
+Open at this cut. None of the changes above is claimed bench-verified.
+
+- Emergency routing: the #759 header gate misses trunk-dialog Call-IDs and PSAP callbacks (#818); `ROUTED` is reported before a later `makeCall` failure, and a 911 slot-wait timeout is not refused (#821); a 911 produced by a dial-plan rule never gets the header-gate yield (#834); more URI-parsing follow-ups from the #832 review (#835).
+- Learn lock follow-ups: an unlocked row can be rewritten by a forged REGISTER, plus an ambiguity guard and test gaps (#820).
+- SIP trunk is experimental: after a good digest REGISTER some carriers never answer the INVITE (#618), and inbound carrier calls are not built (#398).
+- 3CX anchor: the media GET stream is unproven on a live tenant (#518).
+- The 4 MB constrained build keeps about 9% of its app slot free.
+- Hardware evidence is one handset model, one board and one carrier; on-device RTP has no automated coverage.
+- Header-line buffers: one 2 KB datagram of about a thousand short lines can pin about 48 KB of heap in a message-pool slot, because the header-count limit is applied after the split and only to requests (#838; present since #462).
+- The rc.1 smoke (1 h on the test rig, main b8b4f0b) passed every check except two. Heap-stable: the idle heap took a one-time step of about 1.5 KB at 25-35 min and stayed flat afterwards (the leak is gone: it was -55.8 KB/h before #837). Idle-quiesce: two real phones registered on the rig during the run. It is not a mechanical PASS.
 
 ## v1.5.0-beta.2 — 2026-09-14
 

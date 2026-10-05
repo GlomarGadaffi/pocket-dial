@@ -83,7 +83,8 @@ namespace
 	// A handset dialling a PSTN number. The 9 prefix is what the dial rule
 	// strips; 101 is the telephone-event payload type the answer must echo.
 	std::shared_ptr<SipMessage> makeTrunkDial(const std::string& fromExt,
-		const std::string& dialed, const std::string& callId, int rtpPort = 40000)
+		const std::string& dialed, const std::string& callId, int rtpPort = 40000,
+		const std::string& extraHeaders = "")
 	{
 		const std::string body =
 			"v=0\r\n"
@@ -103,7 +104,7 @@ namespace
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 1 INVITE\r\n"
 			"Max-Forwards: 70\r\n"
-			"Contact: <sip:" + fromExt + "@" + kHandsetIp + ":5060>\r\n"
+			"Contact: <sip:" + fromExt + "@" + kHandsetIp + ":5060>\r\n" + extraHeaders +
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
@@ -119,6 +120,23 @@ namespace
 			"To: <sip:" + dialed + "@server>;tag=" + toTag + "\r\n"
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 2 BYE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
+	}
+
+	// The handset's CANCEL of its own INVITE: same Request-URI, Via branch, From
+	// tag and CSeq number, To without a tag (RFC 3261 s9.1).
+	std::shared_ptr<SipMessage> makeHandsetCancel(const std::string& fromExt,
+		const std::string& dialed, const std::string& callId)
+	{
+		const std::string raw =
+			"CANCEL sip:" + dialed + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kHandsetIp) + ":5060;branch=z9hG4bKi" + callId + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + dialed + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 CANCEL\r\n"
+			"Max-Forwards: 70\r\n"
 			"Content-Length: 0\r\n\r\n";
 		return RequestsHandler::getMessageFromPool(raw, addrFor(kHandsetIp));
 	}
@@ -139,10 +157,12 @@ namespace
 			return v;
 		}
 
-		std::string response(const std::string& statusLine, bool withSdp) const
+		// `rtpIp` is the SDP's c= address: where the carrier wants its audio.
+		std::string response(const std::string& statusLine, bool withSdp,
+			const std::string& rtpIp = "203.0.113.9") const
 		{
 			const std::string sdp = withSdp
-				? "v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\n"
+				? "v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 " + rtpIp + "\r\n"
 				  "t=0 0\r\nm=audio 41000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n"
 				  "a=rtpmap:101 telephone-event/8000\r\n"
 				: std::string();
@@ -218,6 +238,22 @@ namespace
 			sent.clear();
 		}
 
+		// The SIP thread's next pass is what drains _asyncOutbox. A bare OPTIONS
+		// from an address on no dialog stands in for it (same as ForceDisconnect_test).
+		void flushAsyncOutbox()
+		{
+			const std::string raw =
+				"OPTIONS sip:server SIP/2.0\r\n"
+				"Via: SIP/2.0/UDP 192.168.50.99:5060;branch=z9hG4bKflush\r\n"
+				"From: <sip:probe@server>;tag=probetag\r\n"
+				"To: <sip:server@server>\r\n"
+				"Call-ID: flush-714\r\n"
+				"CSeq: 1 OPTIONS\r\n"
+				"Max-Forwards: 70\r\n"
+				"Content-Length: 0\r\n\r\n";
+			handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor("192.168.50.99")));
+		}
+
 		// Raw text of the first message sent whose first line contains `needle`.
 		std::string firstWith(const std::string& needle) const
 		{
@@ -225,6 +261,19 @@ namespace
 			{
 				(void)addr;
 				if (!msg) continue;
+				const std::string raw = msg->toString();
+				if (raw.substr(0, raw.find("\r\n")).find(needle) != std::string::npos) return raw;
+			}
+			return {};
+		}
+
+		// As firstWith(), but only messages ADDRESSED to `ip`.
+		std::string firstWithTo(const std::string& needle, const std::string& ip) const
+		{
+			const uint32_t want = inet_addr(ip.c_str());
+			for (const auto& [addr, msg] : sent)
+			{
+				if (!msg || addr.sin_addr.s_addr != want) continue;
 				const std::string raw = msg->toString();
 				if (raw.substr(0, raw.find("\r\n")).find(needle) != std::string::npos) return raw;
 			}
@@ -346,6 +395,33 @@ TEST(TrunkWiring, TheCarrierAnswerIsAckedAndTheHandsetGetsATwoWaySdpAnswer)
 		<< "both halves of the pair are live once the call is up";
 }
 
+// #198: the handset's 200 is the PBX's own answer, so RFC 4028 applies to it.
+// The PBX never refreshes, and onReinvite() answers a trunk-leg re-INVITE 488,
+// so a timer it granted here would end the call at expiry (§10: only a 2xx
+// extends the session) -- on a 911 call too. The answer carries no
+// Session-Expires and no Require at all instead (§7.2: no expiration).
+TEST(TrunkWiring, TheHandsetAnswerCarriesNoSessionTimer)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-se", 40000,
+		"Supported: timer\r\nSession-Expires: 1800\r\n"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+
+	const std::string ok = b.firstWith("200 OK");
+	ASSERT_FALSE(ok.empty()) << "the handset was never answered";
+	// Positive control: this is the handset's two-way SDP answer.
+	EXPECT_NE(ok.find("a=sendrecv"), std::string::npos) << ok;
+	EXPECT_EQ(ok.find("\r\nSession-Expires:"), std::string::npos)
+		<< "a timer the PBX cannot service (re-INVITE refresh: 488) ends the call at expiry\n" << ok;
+	EXPECT_EQ(ok.find("\r\nx:"), std::string::npos) << ok;
+	EXPECT_EQ(ok.find("\r\nRequire:"), std::string::npos) << ok;
+}
+
 TEST(TrunkWiring, AnAnswerWithNoUsableMediaHangsTheCarrierUpRatherThanConnectSilence)
 {
 	Bench b;
@@ -366,6 +442,257 @@ TEST(TrunkWiring, AnAnswerWithNoUsableMediaHangsTheCarrierUpRatherThanConnectSil
 		<< "the carrier leg is answered and billing; it has to be hung up";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u)
 		<< "and the relay pair released";
+}
+
+// #861: the carrier's answer says where its audio goes, and a forged or broken
+// one must not aim the relay at this host, at loopback, at broadcast or at a
+// multicast group. The same check as an inbound call (#850): the handset is
+// refused 502 and the answered carrier leg is hung up. inet_addr() turned
+// "999.0.113.9" into 255.255.255.255. (c=0.0.0.0 is not here: parseCallerRtp()
+// reads it as "use the sender's address", which is the SBC.)
+TEST(TrunkWiring, AnAnswerNamingAnUnusableRtpAddressIsRefusedRatherThanRelayed)
+{
+	for (const char* ip : { "127.0.0.1", "224.0.0.1", "255.255.255.255", "999.0.113.9", kServerIp })
+	{
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861"));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		b.sent.clear();
+
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, ip), addrFor(kSbcIp)));
+
+		EXPECT_TRUE(b.firstWithTo("200 OK", kHandsetIp).empty()) << ip << ": the handset must not be answered";
+		EXPECT_FALSE(b.firstWithTo("502", kHandsetIp).empty()) << ip << ": it is refused 502";
+		EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << ip << ": the answered carrier leg is hung up";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << ip << ": and the relay pair released";
+	}
+}
+
+// #861 (desmo, 2026-10-03): a 911/933 is never refused over the carrier's RTP
+// address. Its relay goes wherever the answer says, as before the check; the
+// test above, which refuses the same answer on an ordinary call, is the control.
+TEST(TrunkWiring, AnEmergencyCallIsRelayedToWhateverAddressTheCarrierNames)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-861-911"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", /*withSdp=*/true, "127.0.0.1"), addrFor(kSbcIp)));
+
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the 911 caller is connected";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the PSAP leg is not hung up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-911", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("127.0.0.1")) << "the address the carrier named";
+	EXPECT_EQ(ntohs(peer.sin_port), 41000);
+}
+
+// #861: early media is best effort, so a 183 naming an unusable address leaves
+// local ringback and the call alone; a usable 200 still connects it.
+TEST(TrunkWiring, A183NamingAnUnusableRtpAddressLeavesLocalRingback)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-em"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 183 Session Progress", /*withSdp=*/true, "127.0.0.1"), addrFor(kSbcIp)));
+	EXPECT_TRUE(b.firstWith("183 Session Progress").empty()) << "loopback early media is not relayed";
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the call still connects";
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-em", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9"));
+}
+
+// #861 review: the refusal after early media is the same single teardown.
+TEST(TrunkWiring, AGood183ThenAnUnusable200IsRefusedOnce)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-e2"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 183 Session Progress", /*withSdp=*/true), addrFor(kSbcIp)));
+	ASSERT_FALSE(b.firstWithTo("183 Session Progress", kHandsetIp).empty()) << "precondition: early media";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, "127.0.0.1"), addrFor(kSbcIp)));
+
+	EXPECT_EQ(b.countWithTo("502", kHandsetIp), 1u);
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+// #861 review: a carrier on a private network is a usable peer (only this
+// host, loopback, multicast and the like are not).
+TEST(TrunkWiring, APrivateCarrierRtpAddressIsStillRelayed)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-pv"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, "10.0.0.9"), addrFor(kSbcIp)));
+
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty());
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-pv", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("10.0.0.9"));
+}
+
+// #861 review: a second 2xx on a call that is up (a retransmission, a second
+// forked 2xx) is ACKed by SipTrunk and otherwise ignored. It neither moves the
+// audio nor, naming an unusable address, hangs up a call already talking.
+TEST(TrunkWiring, ALaterAnswerToAConnectedCallNeitherMovesItsAudioNorEndsIt)
+{
+	for (const char* ip : { "203.0.113.77", "127.0.0.1" })
+	{
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-2x"));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+		ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+		b.sent.clear();
+
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, ip), addrFor(kSbcIp)));
+
+		EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << ip << ": the carrier leg is not hung up";
+		EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << ip;
+		EXPECT_TRUE(b.firstWithTo("200 OK", kHandsetIp).empty()) << ip << ": the handset is not answered twice";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << ip;
+		sockaddr_in peer{};
+		ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-2x", peer));
+		EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9")) << ip << ": the first answer's address";
+	}
+}
+
+// #861 review: a 183 after the 200 is not early media for anything.
+TEST(TrunkWiring, A183AfterTheAnswerDoesNotMoveTheAudio)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-861-late"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 183 Session Progress", /*withSdp=*/true, "203.0.113.77"), addrFor(kSbcIp)));
+
+	EXPECT_TRUE(b.firstWith("183 Session Progress").empty()) << "no 183 to the handset after its 200";
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-late", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9"));
+}
+
+// #890: a final after the carrier's 2xx (a broken SBC, or a stray fork with a
+// tag of its own) answers nothing: the call is up and only a BYE ends it (RFC
+// 3261 §15). It used to run the failure path, which freed the carrier dialog
+// with no BYE and ended the handset's session with none either, so both ends
+// kept a call whose relay was gone: for a 911, a connected PSAP call cut. The
+// same holds for an ordinary call. A BYE from either side still ends it.
+TEST(TrunkWiring, ACarrierFinalAfterTheAnswerLeavesTheCallUp)
+{
+	struct Case { const char* what; const char* dialed; const char* status; const char* tag; bool carrierByes; };
+	const Case cases[] = {
+		{ "911: a 486 on the answer's dialog, then the PSAP hangs up", "911", "SIP/2.0 486 Busy Here", "carrier-tag", true },
+		{ "911: a 503 from another fork, then the caller hangs up", "911", "SIP/2.0 503 Service Unavailable", "other-fork", false },
+		{ "ordinary: a 486, then the far end hangs up", "92025550123", "SIP/2.0 486 Busy Here", "carrier-tag", true },
+		{ "ordinary: a 404, then the handset hangs up", "92025550123", "SIP/2.0 404 Not Found", "carrier-tag", false },
+	};
+	for (const Case& c : cases)
+	{
+		SCOPED_TRACE(c.what);
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", c.dialed, "call-890"));
+		const auto carrier = CarrierView::from(b.firstWithTo("INVITE sip:", kSbcIp));
+		ASSERT_FALSE(carrier.callID.empty()) << "precondition: the call went to the trunk";
+		b.handler.handle(RequestsHandler::getMessageFromPool(carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+		const std::string ok = b.firstWithTo("200 OK", kHandsetIp);
+		ASSERT_FALSE(ok.empty()) << "precondition: the call is up";
+		ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+		b.sent.clear();
+
+		auto stray = carrier;
+		stray.toTag = c.tag;
+		for (int i = 0; i < 2; ++i)   // and its retransmission
+		{
+			b.handler.handle(RequestsHandler::getMessageFromPool(stray.response(c.status, false), addrFor(kSbcIp)));
+		}
+
+		EXPECT_EQ(b.countWithTo("", kHandsetIp), 0u) << "nothing to the handset";
+		EXPECT_EQ(b.countWithTo("", kSbcIp), 0u) << "no ACK, BYE or INVITE to the carrier";
+		const auto s = b.handler.getSession("Call-ID: call-890");
+		EXPECT_TRUE(s.has_value() && s.value()->getState() == Session::State::Connected) << "the call stays up";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "with its relay";
+
+		if (c.carrierByes)
+		{
+			b.handler.handle(RequestsHandler::getMessageFromPool(carrier.bye(), addrFor(kSbcIp)));
+			EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u) << "the handset is told";
+		}
+		else
+		{
+			b.handler.handle(makeHandsetBye("1001", c.dialed, "call-890", CarrierView::between(ok, ";tag=", "\r\n")));
+			const std::string bye = b.firstWithTo("BYE", kSbcIp);
+			EXPECT_NE(bye.find(";tag=carrier-tag"), std::string::npos) << "the carrier is told, on the answer's dialog:\n" << bye;
+		}
+		EXPECT_FALSE(b.handler.getSession("Call-ID: call-890").has_value());
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	}
+}
+
+// #861 (desmo, 2026-10-03): a 911/933 follows the address in every carrier
+// answer, unchecked, as before: early media, the answer, and a later 2xx.
+TEST(TrunkWiring, AnEmergencyCallFollowsEveryCarrierAnswerUnchecked)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-861-911b"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.sent.clear();
+	sockaddr_in peer{};
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 183 Session Progress", /*withSdp=*/true, "127.0.0.1"), addrFor(kSbcIp)));
+	EXPECT_FALSE(b.firstWithTo("183 Session Progress", kHandsetIp).empty()) << "the early media is relayed";
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-911b", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("127.0.0.1"));
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the 911 caller is connected";
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-911b", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9"));
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", /*withSdp=*/true, "224.0.0.1"), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the PSAP leg is never hung up over an address";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "nor the 911 caller";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-911b", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("224.0.0.1")) << "a later answer is followed, as before #861";
 }
 
 // ── Failure ─────────────────────────────────────────────────────────────────
@@ -452,6 +779,307 @@ TEST(TrunkWiring, AnExpiredLeaseMidCallByesTheCarrierAndReleasesTheRelay)
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and its relay pair released";
 }
 
+TEST(TrunkWiring, AnAdminKillMidCallByesTheCarrierAsWellAsTheHandset)
+{
+	// #714: /api/kill reaches forceDisconnect() on the HTTP task. endCall()
+	// queued the carrier BYE in _outbox, which the next SIP pass cleared before
+	// draining, so only the handset BYE (via _asyncOutbox) ever left.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-kill"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+	b.sent.clear();
+
+	b.handler.forceDisconnect("1001");
+	b.flushAsyncOutbox();
+
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u)
+		<< "positive control: the killed handset is told, once (#795)";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u)
+		<< "the carrier leg keeps billing until it is hung up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and the relay pair is released";
+}
+
+TEST(TrunkWiring, AnAdminKillNeverEndsAnEmergencyCall)
+{
+	// #714 (desmo): an admin kill of a 911 trunk call is refused. Nothing is sent
+	// to the carrier or the handset, the session and its media stay, and the
+	// extension stays registered. The control half is the test above: the same
+	// kill on a non-emergency call hangs up the carrier.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-714-911"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the 911 is up";
+	b.sent.clear();
+
+	EXPECT_FALSE(b.handler.forceDisconnect("1001")) << "the kill must be refused";
+	b.flushAsyncOutbox();
+
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the kill hung up the PSAP";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "or the 911 caller";
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-714-911").has_value()) << "the 911 session is kept";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "with its media";
+	b.handler.forceNextTickForTest();   // getActiveClients() reads the tick snapshot
+	b.handler.tick();
+	bool registered = false;
+	for (const auto& [number, address] : b.handler.getActiveClients())
+	{
+		if (number == "1001") registered = true;
+	}
+	EXPECT_TRUE(registered) << "the extension stays registered";
+}
+
+TEST(TrunkWiring, AnExpiredLeaseNeverEndsAnEmergencyCall)
+{
+	// #712 (desmo): a lapsed registration is bookkeeping; hanging up a 911 over
+	// it is not. The client is kept until the emergency call ends, then pruned
+	// by the next sweep as usual (the control half of this test).
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-712-lease"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the 911 is up";
+	b.sent.clear();
+
+	b.handler.expireLeaseAndSweepForTest("1001");
+
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the lease sweep hung up the PSAP";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "or the 911 caller";
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-712-lease").has_value()) << "the 911 session is kept";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "with its media";
+
+	// Control: once the 911 has ended, the same expired client is pruned.
+	b.handler.handle(RequestsHandler::getMessageFromPool(e911.bye(), addrFor(kSbcIp)));
+	ASSERT_FALSE(b.handler.getSession("Call-ID: call-712-lease").has_value()) << "precondition: the 911 ended";
+	b.handler.expireLeaseAndSweepForTest("1001");
+	b.handler.forceNextTickForTest();   // getActiveClients() reads the tick snapshot
+	b.handler.tick();
+	bool still1001 = false;
+	for (const auto& [number, address] : b.handler.getActiveClients())
+	{
+		(void)address;
+		if (number == "1001") still1001 = true;
+	}
+	EXPECT_FALSE(still1001) << "the expired client is pruned once no emergency call holds it";
+}
+
+TEST(TrunkWiring, ARingingEmergencyCallIsNeverTimedOutButASilentOneStillIs)
+{
+	// #712 (desmo): a 911/933 the carrier is working on (a 100 or 180 seen,
+	// Proceeding) gets no PBX-side no-answer bound; a PSAP may queue it past
+	// 60 s. One that never drew any provisional (Trying) keeps the 60 s
+	// deadline as a backstop (Timer B ends it at 32 s since #726; only the
+	// trunk deadlines are aged here, so it is the sweep that fires): that half
+	// is the control, proving the sweep did run on this tick.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-712-ring"));
+	const auto ringing = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(ringing.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		ringing.response("SIP/2.0 180 Ringing", false), addrFor(kSbcIp)));
+	b.handler.handle(makeTrunkDial("1001", "933", "call-712-silent", 40002));
+	ASSERT_FALSE(b.firstWith("INVITE sip:933").empty()) << "precondition: 933 went to the trunk";
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 2u) << "precondition: both are placed";
+	b.sent.clear();
+
+	b.handler.expireTrunkDeadlinesForTest();
+	b.handler.tick();
+
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-712-ring").has_value())
+		<< "a ringing 911 was timed out by the PBX";
+	EXPECT_FALSE(b.handler.getSession("Call-ID: call-712-silent").has_value())
+		<< "control: a 933 that never drew a provisional still times out";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "only the silent leg's relay is released";
+}
+
+// #889: a carrier 100, 182 (or 181, 199) now reaches SipTrunk, so it moves an
+// ORDINARY trunk call's dialog to Proceeding too. The #712 exemption is for
+// 911/933 only, so the 60 s no-answer bound ends that call exactly as it ends
+// one that drew nothing: the same messages to the same parties.
+TEST(TrunkWiring, AnOrdinaryCallThatDrewOnlyA100Or182StillTimesOutAsBefore)
+{
+	using Seen = std::vector<std::pair<uint32_t, std::string>>;
+	auto timedOut = [](const char* provisional) {
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-889-pstn"));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		EXPECT_FALSE(carrier.callID.empty()) << "precondition: the INVITE went to the carrier";
+		b.sent.clear();
+		if (*provisional)
+		{
+			b.handler.handle(RequestsHandler::getMessageFromPool(
+				carrier.response(provisional, /*withSdp=*/false), addrFor(kSbcIp)));
+		}
+		EXPECT_TRUE(b.sent.empty()) << provisional << " put something on the wire: " << b.sent.size();
+		b.sent.clear();
+		b.handler.expireTrunkDeadlinesForTest();
+		b.handler.forceNextTickForTest();
+		b.handler.tick();
+		EXPECT_FALSE(b.handler.getSession("Call-ID: call-889-pstn").has_value()) << provisional;
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << provisional;
+		Seen seen;
+		for (const auto& [addr, msg] : b.sent)
+		{
+			if (!msg) continue;
+			const std::string raw = msg->toString();
+			seen.emplace_back(addr.sin_addr.s_addr, raw.substr(0, raw.find("\r\n")));
+		}
+		return seen;
+	};
+	const Seen none = timedOut("");
+	size_t finals = 0;
+	for (const auto& [ip, line] : none)
+	{
+		// A response to the handset; the tick's own requests are compared below.
+		if (ip != inet_addr(kHandsetIp) || line.rfind("SIP/2.0 ", 0) != 0) continue;
+		++finals;
+		EXPECT_EQ(line, "SIP/2.0 503 Service Unavailable");
+	}
+	ASSERT_EQ(finals, 1u) << "precondition: the handset's one final, a 503";
+	EXPECT_EQ(timedOut("SIP/2.0 100 Trying"), none);
+	EXPECT_EQ(timedOut("SIP/2.0 182 Queued"), none);
+}
+
+// #889, RFC 3261 §9.1: a CANCEL may follow any provisional, a 100 included. The
+// 100 used to miss SipTrunk, so a handset that gave up after it had its CANCEL
+// held for a 180 that might never come (#794) while the far end rang on.
+TEST(TrunkWiring, AHandsetCancelAfterACarrier100CancelsTheCarrierLeg)
+{
+	for (const bool cancelFirst : { false, true })
+	{
+		SCOPED_TRACE(cancelFirst ? "the handset's CANCEL, then the carrier's 100" : "the 100, then the CANCEL");
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-889-cancel"));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		ASSERT_FALSE(carrier.callID.empty());
+		const auto trying = [&] {
+			b.handler.handle(RequestsHandler::getMessageFromPool(
+				carrier.response("SIP/2.0 100 Trying", /*withSdp=*/false), addrFor(kSbcIp)));
+		};
+		if (!cancelFirst) trying();
+		b.handler.handle(makeHandsetCancel("1001", "92025550123", "call-889-cancel"));
+		if (cancelFirst) trying();
+
+		EXPECT_EQ(b.countWithTo("SIP/2.0 487", kHandsetIp), 1u) << "the handset's INVITE";
+		EXPECT_EQ(b.countWithTo("CANCEL", kSbcIp), 1u) << "the far end rings on until the carrier is told";
+		EXPECT_NE(b.firstWith("CANCEL sip:+12025550123").find(";branch=" + carrier.branch), std::string::npos)
+			<< "on the carrier INVITE's own branch";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	}
+}
+
+// #889, Rule 5: a 100, 181, 182 or 199 now reaches SipTrunk, and a hop may tag
+// it. The PSAP's 200 still names the dialog, so the ACK that stops its 2xx
+// retransmissions, and the caller's BYE, carry the 200's tag (RFC 3261 §12.1,
+// §13.2.2.4). A wrong tag there leaves the 200 unACKed and the PSAP may hang
+// up a connected 911 at 64*T1.
+TEST(TrunkWiring, AnEmergencyCallsDialogTagIsThePsapsAnswerNotAProvisionals)
+{
+	for (const char* provisional : { "SIP/2.0 100 Trying", "SIP/2.0 181 Call Is Being Forwarded",
+		"SIP/2.0 182 Queued", "SIP/2.0 199 Early Dialog Terminated" })
+	{
+		SCOPED_TRACE(provisional);
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "911", "call-889-tag"));
+		const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+		ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+		auto hop = e911;
+		hop.toTag = "hop-tag-1xx";
+		b.handler.handle(RequestsHandler::getMessageFromPool(hop.response(provisional, false), addrFor(kSbcIp)));
+		b.handler.handle(RequestsHandler::getMessageFromPool(e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+		const std::string ok = b.firstWithTo("200 OK", kHandsetIp);
+		ASSERT_FALSE(ok.empty()) << "precondition: the 911 caller is connected";
+		const std::string ack = b.firstWithTo("ACK", kSbcIp);
+		EXPECT_NE(ack.find(";tag=carrier-tag"), std::string::npos) << ack;
+		EXPECT_EQ(ack.find("hop-tag-1xx"), std::string::npos) << ack;
+
+		b.handler.handle(makeHandsetBye("1001", "911", "call-889-tag", CarrierView::between(ok, ";tag=", "\r\n")));
+		const std::string bye = b.firstWithTo("BYE", kSbcIp);
+		ASSERT_FALSE(bye.empty()) << "the caller's hangup reaches the PSAP";
+		EXPECT_NE(bye.find(";tag=carrier-tag"), std::string::npos) << bye;
+		EXPECT_EQ(bye.find("hop-tag-1xx"), std::string::npos) << bye;
+	}
+}
+
+// #889 review S2: SipTrunk counts a 181, 182 or 199 as a provisional and
+// nothing more. It does not treat one as a 183: even with SDP it opens no
+// early-media relay and sends the caller nothing, so the caller keeps the
+// local ringback of the 180 it got when the call was placed. The dialog is
+// Proceeding, so the 911 is not timed out (#712), and the PSAP's 200 still
+// connects it.
+TEST(TrunkWiring, AnEmergencyCalls182WithSdpIsOnlyAProvisional)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-889-182sdp"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(e911.response("SIP/2.0 182 Queued", /*withSdp=*/true), addrFor(kSbcIp)));
+	EXPECT_TRUE(b.sent.empty()) << "nothing to the caller or the PSAP: " << b.sent.size();
+	sockaddr_in peer{};
+	EXPECT_FALSE(b.handler.trunkCarrierPeerForTest("Call-ID: call-889-182sdp", peer)) << "no early-media relay";
+
+	b.handler.expireTrunkDeadlinesForTest();
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-889-182sdp").has_value()) << "Proceeding: not timed out (#712)";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 503", kHandsetIp), 0u);
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the PSAP's answer still connects the caller";
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-889-182sdp", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9")) << "the relay goes where the 200 says";
+}
+
+// #889: a provisional after the call's outcome changes nothing. After the 200
+// the call stays up and the handset hears nothing; after a refusal the dialog
+// is gone and the handset has its one final.
+TEST(TrunkWiring, ACarrierProvisionalAfterTheOutcomeChangesNothing)
+{
+	for (const char* outcome : { "SIP/2.0 200 OK", "SIP/2.0 486 Busy Here" })
+	{
+		SCOPED_TRACE(outcome);
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-889-late"));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		ASSERT_FALSE(carrier.callID.empty());
+		const bool answered = outcome[8] == '2';
+		b.handler.handle(RequestsHandler::getMessageFromPool(carrier.response(outcome, answered), addrFor(kSbcIp)));
+		ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), answered ? 1u : 0u) << "precondition";
+		b.sent.clear();
+
+		for (const char* late : { "SIP/2.0 100 Trying", "SIP/2.0 182 Queued", "SIP/2.0 180 Ringing" })
+		{
+			b.handler.handle(RequestsHandler::getMessageFromPool(carrier.response(late, false), addrFor(kSbcIp)));
+		}
+
+		EXPECT_EQ(b.countWithTo("SIP/2.0", kHandsetIp), 0u) << "no second answer to the handset";
+		EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u);
+		EXPECT_EQ(b.countWithTo("CANCEL", kSbcIp), 0u);
+		EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u);
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), answered ? 1u : 0u);
+		const auto s = b.handler.getSession("Call-ID: call-889-late");
+		EXPECT_EQ(s.has_value() && s.value()->getState() == Session::State::Connected, answered);
+	}
+}
+
 TEST(TrunkWiring, TheCarrierHangingUpByesTheHandsetAndReleasesTheRelay)
 {
 	Bench b;
@@ -469,6 +1097,75 @@ TEST(TrunkWiring, TheCarrierHangingUpByesTheHandsetAndReleasesTheRelay)
 	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u)
 		<< "the carrier hung up itself; BYEing it back would earn a 481";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+// #700: the BYE we originate to the handset is in the handset's dialog, where WE
+// are the UAS (it INVITEd us). RFC 3261 12.2.1.1: From = our URI and local tag
+// (the 200 OK's To), To = the handset's own From. A phone matches the BYE on
+// those tags and answers 481, staying off-hook, when they are swapped.
+namespace
+{
+	void expectHandsetByeIsFromUs(const std::string& ok, const std::string& bye,
+		const std::string& handsetTag)
+	{
+		const std::string localTag = CarrierView::between(ok, "To: ", "\r\n");
+		const std::string ourTag   = CarrierView::between(localTag, ";tag=", "\r\n");
+		ASSERT_FALSE(ourTag.empty()) << "precondition: the 200 OK carried our To tag";
+		const std::string from = CarrierView::field(bye, "From: ");
+		const std::string to   = CarrierView::field(bye, "To: ");
+		EXPECT_NE(from.find(";tag=" + ourTag), std::string::npos)
+			<< "BYE From must carry our local tag; got: " << from;
+		EXPECT_EQ(from.find(";tag=" + handsetTag), std::string::npos)
+			<< "BYE From must not carry the handset's own tag; got: " << from;
+		EXPECT_NE(to.find(";tag=" + handsetTag), std::string::npos)
+			<< "BYE To must carry the handset's tag; got: " << to;
+		EXPECT_EQ(to.find(";tag=" + ourTag), std::string::npos)
+			<< "BYE To must not carry our own tag; got: " << to;
+	}
+}
+
+TEST(TrunkWiring, TheByeToTheHandsetAfterACarrierHangupIsFromUsAndToTheHandset)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-700"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	const std::string ok = b.firstWithTo("SIP/2.0 200 OK", kHandsetIp);
+	ASSERT_FALSE(ok.empty()) << "precondition: the handset was answered";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.bye(), addrFor(kSbcIp)));
+
+	const std::string bye = b.firstWithTo("BYE", kHandsetIp);
+	ASSERT_FALSE(bye.empty());
+	expectHandsetByeIsFromUs(ok, bye, "ftcall-700");
+}
+
+// #795: an admin kill BYEs both legs of the session, but a trunk session's
+// "dest" is a stand-in peer at the HANDSET's own address, so the handset got a
+// second BYE with the tags reversed and answered it 481.
+TEST(TrunkWiring, AnAdminKillOfATrunkCallByesTheHandsetExactlyOnceAndFromUs)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-795"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	const std::string ok = b.firstWithTo("SIP/2.0 200 OK", kHandsetIp);
+	ASSERT_FALSE(ok.empty()) << "precondition: the handset was answered";
+	b.sent.clear();
+
+	b.handler.forceDisconnect("1001");
+	b.flushAsyncOutbox();
+
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u)
+		<< "one BYE to the killed handset; a second, reversed one draws a 481";
+	const std::string bye = b.firstWithTo("BYE", kHandsetIp);
+	ASSERT_FALSE(bye.empty());
+	expectHandsetByeIsFromUs(ok, bye, "ftcall-795");
 }
 
 // ── Forged carrier messages (#356) ──────────────────────────────────────────
@@ -804,6 +1501,99 @@ TEST(TrunkWiring, ACarrierRefreshReinviteOnATrunkCallIsNotAnswered481)
 	EXPECT_EQ(b.countWithTo("481", kSbcIp), 1u);
 }
 
+// ── Issue #818: the header gate's emergency yield covers the carrier's dialog ──
+//
+// The carrier speaks on the trunk dialog's own Call-ID, which _sessions is not
+// keyed on, so a carrier request on a live 911 that fails a #759 bound was
+// refused 400 and the call stayed up. Each case runs on a 911 and, as the
+// negative, on an ordinary trunk call that must still get its 400.
+
+namespace
+{
+	std::string replaced(std::string s, const std::string& from, const std::string& to)
+	{
+		const size_t p = s.find(from);
+		if (p != std::string::npos) s.replace(p, from.size(), to);
+		return s;
+	}
+
+	// A connected trunk call to `dialed`; the carrier's view of its dialog.
+	CarrierView connectTrunkCall(Bench& b, const std::string& dialed, const std::string& callId)
+	{
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", dialed, callId));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:"));
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+		b.sent.clear();
+		return carrier;
+	}
+}
+
+TEST(TrunkWiring, ACarrierByeThatFailsTheHeaderGateStillEndsA911ButNotAnOrdinaryCall)
+{
+	std::string hops;
+	for (int i = 0; i < 10; ++i)
+		hops += "Via: SIP/2.0/UDP 10.9.0." + std::to_string(i + 1) + ":5060;branch=z9hG4bKhop" +
+			std::to_string(i) + "\r\n";
+	const std::string ours = "branch=z9hG4bKcarrierbye\r\n";
+	const std::vector<std::pair<const char*, std::string>> shapes = {
+		{"an 80-byte Via branch (the slot holds 71)", "branch=z9hG4bK" + std::string(80, 'b') + "\r\n"},
+		{"11 Via entries (the cap is 10)", ours + hops},
+	};
+	for (const auto& [what, via] : shapes)
+	{
+		for (const bool emergency : {true, false})
+		{
+			SCOPED_TRACE(std::string(what) + (emergency ? ", 911" : ", ordinary call"));
+			Bench b;
+			const auto carrier = connectTrunkCall(b, emergency ? "911" : "92025550123",
+				emergency ? "call-818-911" : "call-818-pstn");
+			ASSERT_FALSE(carrier.callID.empty()) << "precondition: the call went to the trunk";
+			ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the call is up";
+
+			b.handler.handle(RequestsHandler::getMessageFromPool(
+				replaced(carrier.bye(), ours, via), addrFor(kSbcIp)));
+
+			if (emergency)
+			{
+				EXPECT_EQ(b.countWithTo("SIP/2.0 400", kSbcIp), 0u) << "the PSAP's BYE on a live 911 was refused";
+				EXPECT_EQ(b.countWithTo("SIP/2.0 200", kSbcIp), 1u) << "the PSAP's BYE must be answered";
+				EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u) << "and the 911 caller hung up";
+				EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+			}
+			else
+			{
+				EXPECT_EQ(b.countWithTo("SIP/2.0 400", kSbcIp), 1u) << "the yield is the 911's alone";
+				EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u);
+				EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+			}
+		}
+	}
+}
+
+TEST(TrunkWiring, AForgedByeThatFailsTheHeaderGateOnALive911IsStillRefusedByTheTrunk)
+{
+	// The #818 yield only lets a message past the header gate; the trunk's #356
+	// source check still decides who may end the call. A forger who knows the
+	// 911's carrier Call-ID, from neither the SBC nor its Contact, gets 403.
+	Bench b;
+	const auto carrier = connectTrunkCall(b, "911", "call-818-forged");
+	ASSERT_FALSE(carrier.callID.empty()) << "precondition: the 911 went to the trunk";
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "precondition: the 911 is up";
+
+	CarrierView forger = carrier;
+	forger.toTag = "guessed";
+	b.handler.handle(RequestsHandler::getMessageFromPool(replaced(forger.bye(), "branch=z9hG4bKcarrierbye\r\n",
+		"branch=z9hG4bK" + std::string(80, 'b') + "\r\n"), addrFor(kForgerIp)));
+
+	EXPECT_EQ(b.countWithTo("403", kForgerIp), 1u) << "past the gate, the trunk refuses the forger";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 200", kForgerIp), 0u);
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 0u) << "the 911 caller is not hung up";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "nor is the PSAP";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "and the 911's media keeps flowing";
+}
+
 // ── Issue #604: RTP inactivity ends a call whose media stopped with no BYE ──
 
 TEST(TrunkWiring, ATrunkCallWhoseLegsBothGoSilentIsEndedAfterTheInactivityTimeout)
@@ -842,6 +1632,32 @@ TEST(TrunkWiring, ATrunkCallWhoseLegsBothGoSilentIsEndedAfterTheInactivityTimeou
 	EXPECT_FALSE(b.handler.getSession(id).has_value());
 }
 
+TEST(TrunkWiring, TheInactivityReapByeToTheHandsetOfATrunkCallIsFromUsAndToTheHandset)
+{
+	// #700, the #604 reap: same orientation rule as the carrier-hangup BYE.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-700r"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	const std::string ok = b.firstWithTo("SIP/2.0 200 OK", kHandsetIp);
+	ASSERT_FALSE(ok.empty()) << "precondition: the handset was answered";
+	const std::string id = "Call-ID: call-700r";
+	auto session = b.handler.getSession(id);
+	ASSERT_TRUE(session.has_value());
+	b.handler.tick();   // arms the watch
+	session.value()->ageRtpWatchForTest(std::chrono::seconds(61));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+
+	b.handler.tick();
+
+	const std::string bye = b.firstWithTo("BYE", kHandsetIp);
+	ASSERT_FALSE(bye.empty()) << "the silent trunk call must be ended with a BYE to the handset";
+	expectHandsetByeIsFromUs(ok, bye, "ftcall-700r");
+}
+
 TEST(TrunkWiring, ATrunkCallWithOneLegSilentAndTheOtherTalkingStaysUp)
 {
 	// CaveJay on #612: one silent leg is a healthy call (a VAD-silent listener,
@@ -871,7 +1687,7 @@ TEST(TrunkWiring, ATrunkCallWithOneLegSilentAndTheOtherTalkingStaysUp)
 	}
 }
 
-TEST(TrunkWiring, AnEmergencyCallIsNeverEndedForRtpSilence)
+TEST(TrunkWiring, AnEmergencyCallIsNotEndedForTenMinutesOfRtpSilence)
 {
 	// A 911 caller who cannot speak, on a phone with silence suppression, sends
 	// no RTP. Hanging up on them is worse than holding a leg. Positive control:
@@ -900,11 +1716,79 @@ TEST(TrunkWiring, AnEmergencyCallIsNeverEndedForRtpSilence)
 	b.sent.clear();
 	b.handler.tick();
 
-	EXPECT_TRUE(b.handler.getSession("Call-ID: call-911").has_value()) << "911 is never reaped";
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-911").has_value()) << "911 is not reaped at 10 min (its bound is 4 h, #741)";
 	EXPECT_FALSE(b.handler.getSession("Call-ID: call-604b").has_value())
 		<< "control: the ordinary silent call is";
 	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "exactly one carrier leg hung up";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "the 911 relay pair is untouched";
+}
+
+TEST(TrunkWiring, AnEmergencyCallWithBothLegsSilentEndsAtFourHoursAndNotBefore)
+{
+	// #741 (desmo): a 911 whose phone and far end both vanished (no BYE, no RTP
+	// on either leg) is ended after 4 h of silence, through endCall, and
+	// counted. A live 911 is never cut: the clock only runs while BOTH legs
+	// are silent. AnEmergencyCallIsNotEndedForTenMinutesOfRtpSilence above keeps pinning
+	// that 10 minutes of silence ends nothing.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-741"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	auto s911 = b.handler.getSession("Call-ID: call-741");
+	ASSERT_TRUE(s911.has_value());
+	b.handler.tick();   // arms the watch
+
+	s911.value()->ageRtpWatchForTest(std::chrono::hours(4) - std::chrono::seconds(1));
+	b.handler.forceNextTickForTest();
+	b.sent.clear();
+	b.handler.tick();
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-741").has_value()) << "ended before 4 h";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u);
+	EXPECT_EQ(b.handler.getEmergencyRtpReaps(), 0u);
+
+	s911.value()->ageRtpWatchForTest(std::chrono::seconds(1));
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+	EXPECT_FALSE(b.handler.getSession("Call-ID: call-741").has_value()) << "not ended at 4 h";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the carrier leg is hung up through endCall";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and its relay pair released";
+	EXPECT_EQ(b.handler.getEmergencyRtpReaps(), 1u) << "and counted";
+}
+
+TEST(TrunkWiring, AnEmergencyCallWithOneWayAudioIsNeverEndedPastFourHours)
+{
+	// #741 review: the 4 h clock runs only while BOTH legs are silent. A 911
+	// where one side talks (a caller who cannot speak, a PSAP on hold music) is
+	// a live call: each leg's audio restarts the clock, so it outlives 4 h.
+	// Mirrors ATrunkCallWithOneLegSilentAndTheOtherTalkingStaysUp. Positive
+	// control: the test above ends the same call shape at 4 h when silent.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-741o"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	const std::string id = "Call-ID: call-741o";
+	auto s911 = b.handler.getSession(id);
+	ASSERT_TRUE(s911.has_value());
+	b.handler.tick();   // arms the watch
+
+	for (bool fromCarrier : {true, false})
+	{
+		s911.value()->ageRtpWatchForTest(std::chrono::hours(4) + std::chrono::seconds(1));
+		ASSERT_TRUE(b.handler.trunkRtpForTest(id, fromCarrier));
+		b.handler.forceNextTickForTest();
+		b.sent.clear();
+		b.handler.tick();
+		ASSERT_TRUE(b.handler.getSession(id).has_value())
+			<< "only the " << (fromCarrier ? "carrier" : "handset") << " leg talked; the 911 stays up";
+		ASSERT_EQ(b.countWithTo("BYE", kSbcIp), 0u);
+	}
+	EXPECT_EQ(b.handler.getEmergencyRtpReaps(), 0u);
 }
 
 // ── Issue #399: the trunk REGISTERs, from tick(), and answers the 401 ───────
@@ -1068,4 +1952,167 @@ TEST(TrunkWiring, StatusReportsRefusedDialogByes)
 
 	status = statusBody(port);
 	EXPECT_NE(status.find("\"trunkRefusedDialogByes\":2,"), std::string::npos) << status;
+}
+
+// ── #747: the handset hangs up while the carrier leg still rings ────────────
+//
+// onCancel() had no trunk branch, so the CANCEL fell through to a 404 for the
+// dialled PSTN number, the carrier kept ringing, and the handset's INVITE never
+// got its 487.
+
+TEST(TrunkWiring, AHandsetCancelWhileTheCarrierRingsCancelsTheCarrierLeg)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 180 Ringing", /*withSdp=*/false), addrFor(kSbcIp)));
+	b.sent.clear();
+
+	b.handler.handle(makeHandsetCancel("1001", "92025550123", "call-1"));
+
+	EXPECT_TRUE(b.firstWith("404").empty()) << "RFC 3261 s9.2: a CANCEL is answered 200 or 481, never 404";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 200", kHandsetIp), 1u) << "the CANCEL itself";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 487", kHandsetIp), 1u) << "the handset's INVITE";
+	ASSERT_EQ(b.countWithTo("CANCEL", kSbcIp), 1u) << "the carrier leg keeps ringing until told";
+	// RFC 3261 s8.2.6.2 and s9.2: the CANCEL's own 200 is a dialog-forming response, so it
+	// carries a To tag, and it is the same tag the 487 to the INVITE carries.
+	const auto toTag = [](const std::string& m) {
+		const size_t at = m.find("\r\nTo: ");
+		if (at == std::string::npos) return std::string();
+		const std::string line = m.substr(at + 2, m.find("\r\n", at + 2) - at - 2);
+		const size_t t = line.find(";tag=");
+		return t == std::string::npos ? std::string() : line.substr(t + 5);
+	};
+	const std::string cancelOkToHandset = b.firstWith("SIP/2.0 200");
+	const std::string inviteFinal = b.firstWith("SIP/2.0 487");
+	EXPECT_FALSE(toTag(cancelOkToHandset).empty()) << "the 200 to the CANCEL has no To tag:\n" << cancelOkToHandset;
+	EXPECT_EQ(toTag(cancelOkToHandset), toTag(inviteFinal)) << "one tag for the CANCEL's 200 and the INVITE's 487";
+	const std::string cancel = b.firstWith("CANCEL sip:+12025550123");
+	EXPECT_NE(cancel.find(";branch=" + carrier.branch), std::string::npos)
+		<< "on the carrier INVITE's own branch";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the call was never answered";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	b.sent.clear();
+
+	// The carrier's 200 to the CANCEL, then its 487 to the INVITE: the 487 is
+	// ACKed and nothing further reaches the handset.
+	std::string cancelOk = carrier.response("SIP/2.0 200 OK", /*withSdp=*/false);
+	cancelOk.replace(cancelOk.find("CSeq: 1 INVITE"), 14, "CSeq: 1 CANCEL");
+	b.handler.handle(RequestsHandler::getMessageFromPool(cancelOk, addrFor(kSbcIp)));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 487 Request Terminated", /*withSdp=*/false), addrFor(kSbcIp)));
+
+	EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 1u);
+	EXPECT_EQ(b.sent.size(), 1u) << "no stray 404 or second 487 at the handset";
+}
+
+TEST(TrunkWiring, ACarrierAnswerThatCrossesTheHandsetCancelIsByedAndNeverBridged)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 180 Ringing", /*withSdp=*/false), addrFor(kSbcIp)));
+	b.handler.handle(makeHandsetCancel("1001", "92025550123", "call-1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+
+	EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 1u);
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "the carrier leg is up and billing";
+	EXPECT_EQ(b.sent.size(), 2u) << "nothing at the handset: it already has its 487";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+}
+
+// #794: the handset gives up before the carrier has sent ANY provisional. RFC
+// 3261 s9.1 forbids a CANCEL then, and hangup() used to free the trunk slot
+// instead, so the carrier's later 180 found no dialog and the far end rang on.
+TEST(TrunkWiring, AHandsetCancelBeforeAnyCarrierProvisionalCancelsTheCarrierLegOnItsFirst1xx)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-794"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(makeHandsetCancel("1001", "92025550123", "call-794"));
+
+	EXPECT_EQ(b.countWithTo("SIP/2.0 200", kHandsetIp), 1u) << "the CANCEL itself";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 487", kHandsetIp), 1u) << "the handset's INVITE";
+	EXPECT_EQ(b.countWithTo("CANCEL", kSbcIp), 0u) << "RFC 3261 s9.1: no CANCEL before a provisional";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	b.sent.clear();
+
+	// The carrier's first provisional lands after the handset is gone.
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 180 Ringing", /*withSdp=*/false), addrFor(kSbcIp)));
+
+	ASSERT_EQ(b.countWithTo("CANCEL", kSbcIp), 1u) << "the far end keeps ringing until the carrier is told";
+	EXPECT_NE(b.firstWith("CANCEL sip:+12025550123").find(";branch=" + carrier.branch), std::string::npos)
+		<< "on the carrier INVITE's own branch";
+	EXPECT_EQ(b.sent.size(), 1u) << "nothing at the handset: it already has its 487";
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 487 Request Terminated", /*withSdp=*/false), addrFor(kSbcIp)));
+
+	EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 1u);
+	EXPECT_EQ(b.sent.size(), 1u) << "no stray 404 or second 487 at the handset";
+}
+
+// ── Transaction timeout (#726) ──────────────────────────────────────────────
+
+TEST(TrunkWiring, TimerBOnTheCarrierInviteRefusesTheHandsetBeforeTheSixtySecondSweep)
+{
+	// #726: RFC 3261 §17.1.1.2. A carrier that never answers our INVITE at all
+	// (no 100, nothing, through seven retransmits) is a dead trunk. The
+	// transaction layer gives up at 64*T1 = 32 s and must tell the TU, which
+	// ends the dialog the way its 60 s deadline would (408, so 503 to the
+	// handset, relay released) -- 28 s sooner, and without leaning on the
+	// sweep. Only the transaction timers are aged here; the trunk's own
+	// deadline is untouched, so whatever happens is Timer B's doing.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-726"));
+	ASSERT_FALSE(b.firstWith("INVITE sip:+1").empty()) << "precondition: the INVITE went to the carrier";
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	b.sent.clear();
+
+	b.handler.expireTransactionTimersForTest();
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+
+	EXPECT_FALSE(b.firstWithTo("503", kHandsetIp).empty())
+		<< "the handset gets a final (408 maps to 503, as the sweep's timeout does)";
+	EXPECT_FALSE(b.handler.getSession("Call-ID: call-726").has_value())
+		<< "the handset session is ended";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << "and the relay pair released";
+}
+
+TEST(TrunkWiring, ACarrierProvisionalKeepsTheCallPastTimerB)
+{
+	// Control for the test above: a provisional moves the INVITE transaction to
+	// Proceeding, where §17.1.1.2 has no Timer B. The call must survive the
+	// same aged timers -- a PSTN leg routinely rings past 32 s, and a ringing
+	// 911 has no PBX-side bound at all (#712).
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-726-ctl"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	ASSERT_FALSE(carrier.callID.empty());
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 180 Ringing", /*withSdp=*/false), addrFor(kSbcIp)));
+	b.sent.clear();
+
+	b.handler.expireTransactionTimersForTest();
+	b.handler.forceNextTickForTest();
+	b.handler.tick();
+
+	EXPECT_TRUE(b.firstWithTo("503", kHandsetIp).empty()) << "nothing refused the handset";
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-726-ctl").has_value()) << "the call is still up";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
 }

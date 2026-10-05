@@ -33,6 +33,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -237,6 +238,16 @@ TEST(BlindTransfer, TransferorIsDroppedAndTheTransfereeIsMovedToTheTarget)
 
 	EXPECT_FALSE(findSentTo(sent, transferorAddr, "SIP/2.0 202 Accepted").empty())
 		<< "REFER must be accepted";
+
+	// #720, RFC 3261 §8.2.6.2: the REFER is in-dialog (To carries tag=btag), so
+	// the 202 must echo that one tag, not append a second.
+	{
+		const std::string to = extractHeaderLine(
+			findSentTo(sent, transferorAddr, "SIP/2.0 202 Accepted"), "To:");
+		EXPECT_NE(to.find(";tag=btag"), std::string::npos) << to;
+		EXPECT_EQ(to.find(";tag=", to.find(";tag=") + 1), std::string::npos)
+			<< "the 202 must carry exactly one To tag: " << to;
+	}
 
 	// The BYE goes to the TRANSFEROR. A asked to leave; A leaves.
 	std::string byeToA = findSentTo(sent, transferorAddr, "BYE sip:");
@@ -1169,4 +1180,164 @@ TEST(BlindTransfer, ForgedInDialogCSeqsCannotPoisonTheServersNextCSeq)
 	EXPECT_LT(notifyCSeq, 1000000) << "a non-party's CSeq must not move the dialog's floor";
 	EXPECT_GT(byeCSeq, notifyCSeq);
 	EXPECT_LT(byeCSeq, limit) << "never 2^31 or more (RFC 3261 s8.1.1.5), and in particular never wrapped";
+}
+
+// ── #715: a pool refusal must not leave a session half-done ────────────────────
+// The message pool is a fixed static array (no heap fallback since #409), so
+// holding slots is how these tests starve exactly the draw they target. Each
+// test releases what it holds before it ends: the pool is shared process-wide.
+namespace
+{
+	// Take every free pool slot except `spare`, and return what was taken.
+	std::vector<std::shared_ptr<SipMessage>> holdAllButSpare(size_t spare)
+	{
+		std::vector<std::shared_ptr<SipMessage>> held;
+		for (size_t i = 0;; ++i)
+		{
+			auto m = makeRegister("199", "192.168.30.99", "hold715-" + std::to_string(i));
+			if (!m) break;
+			held.push_back(std::move(m));
+		}
+		for (size_t i = 0; i < spare && !held.empty(); ++i) held.pop_back();
+		return held;
+	}
+
+	std::string inviteRaw(const std::string& callId, const std::string& fromExt, const std::string& fromIp,
+		const std::string& toExt)
+	{
+		const std::string sdp = sdpBodyFor(fromIp, 10001);
+		return
+			"INVITE sip:" + toExt + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + fromIp + ":5060;branch=z9hG4bKi" + callId + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + toExt + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + fromExt + "@" + fromIp + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+	}
+}
+
+// onInvite drew the relay message AFTER publishing the session, so a refused
+// draw left an Invited session with no ring timer and nothing on the wire, and
+// the caller's retransmit was then dropped as a duplicate of that session.
+TEST(PoolRefusalAfterCommit, AnInviteWhoseRelayCannotBeDrawnPublishesNoSession)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.30.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.30.10");
+	const sockaddr_in calleeAddr = addrFor("192.168.30.20");
+	handler.handle(makeRegister("100", "192.168.30.10", "reg-100"));
+	handler.handle(makeRegister("106", "192.168.30.20", "reg-106"));
+
+	const std::string callId = "pool715-invite";
+	const std::string raw = inviteRaw(callId, "100", "192.168.30.10", "106");
+	{
+		auto held = holdAllButSpare(1);   // one slot left: the INVITE datagram itself
+		auto invite = RequestsHandler::getMessageFromPool(raw, callerAddr);
+		ASSERT_NE(invite, nullptr) << "the datagram takes the last free slot";
+		handler.handle(invite);
+		EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value())
+			<< "a refused relay draw must publish no session";
+		EXPECT_TRUE(findSentTo(sent, calleeAddr, "Call-ID: " + callId).empty())
+			<< "and nothing reaches the callee";
+	}
+
+	// Positive control, and the point of the fix: the caller's retransmit is a
+	// fresh INVITE, not a duplicate of a leaked session.
+	handler.handle(RequestsHandler::getMessageFromPool(raw, callerAddr));
+	EXPECT_TRUE(handler.getSession("Call-ID: " + callId).has_value())
+		<< "with capacity back, the retransmit creates the session";
+	EXPECT_FALSE(findSentTo(sent, calleeAddr, "Call-ID: " + callId).empty())
+		<< "and is relayed to the callee";
+}
+
+// tick() skipped endCall() when the hunt's 480 could not be drawn. The ring timer
+// is already cleared by then, so nothing reaped the Invited session again.
+TEST(PoolRefusalAfterCommit, ExhaustedHuntEndsTheSessionEvenWhenTheFinalCannotBeDrawn)
+{
+	auto run = [](bool starve, const std::string& callId, bool& gone, bool& got480) {
+		SentList sent;
+		RequestsHandler handler("192.168.30.1", 5060,
+			[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+				sent.emplace_back(addr, std::move(msg));
+			});
+		const sockaddr_in callerAddr = addrFor("192.168.30.10");
+		handler.handle(makeRegister("100", "192.168.30.10", "reg-100"));
+		handler.handle(makeRegister("106", "192.168.30.20", "reg-106"));
+		handler.setRingGroup("620", "106", "hunt");
+
+		handler.handle(RequestsHandler::getMessageFromPool(
+			inviteRaw(callId, "100", "192.168.30.10", "620"), callerAddr));
+		ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value()) << "the hunt must start";
+		handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+			std::chrono::steady_clock::now() - std::chrono::seconds(1));
+		{
+			std::vector<std::shared_ptr<SipMessage>> held;
+			if (starve) held = holdAllButSpare(0);
+			handler.tick();
+		}
+		gone = !handler.getSession("Call-ID: " + callId).has_value();
+		got480 = !findSentTo(sent, callerAddr, "SIP/2.0 480").empty();
+	};
+
+	bool gone = false, got480 = false;
+	run(/*starve=*/true, "pool715-hunt-starved", gone, got480);
+	EXPECT_TRUE(gone) << "the exhausted hunt's session must end even though its 480 was refused";
+	EXPECT_FALSE(got480) << "no 480 was drawn, so none was sent";
+
+	// Positive control: with a free pool the same flow answers 480 and ends the session.
+	run(/*starve=*/false, "pool715-hunt-free", gone, got480);
+	EXPECT_TRUE(gone);
+	EXPECT_TRUE(got480) << "with capacity, the caller gets its 480";
+}
+
+// onRefer queued the 202 before drawing the messages the transfer needs. A 202
+// ends the transferor's non-INVITE transaction, so a later refusal could not be
+// retried by a REFER retransmit. Now the refusal is answered 503 instead.
+TEST(PoolRefusalAfterCommit, ABlindReferWhoseTransferCannotBeDrawnAnswers503Not202)
+{
+	auto run = [](size_t spare, const std::string& callId, bool& got202, bool& got503,
+		bool& stillConnected, bool& isBridge) {
+		SentList sent;
+		RequestsHandler handler("192.168.30.1", 5060,
+			[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+				sent.emplace_back(addr, std::move(msg));
+			});
+		const sockaddr_in transferorAddr = addrFor("192.168.30.10");
+		const sockaddr_in transfereeAddr = addrFor("192.168.30.20");
+		handler.handle(makeRegister("100", "192.168.30.10", "reg-100"));
+		handler.handle(makeRegister("106", "192.168.30.20", "reg-106"));
+		handler.handle(makeRegister("107", "192.168.30.30", "reg-107"));
+		connectCall(handler, sent, callId,
+			"100", transferorAddr, "atag", sdpBodyFor("10.1.1.1", 10001),
+			"106", transfereeAddr, "btag", sdpBodyFor("10.2.2.2", 20002));
+		{
+			auto held = holdAllButSpare(spare);
+			handler.handle(makeRefer(callId, "100", transferorAddr, "atag", "106", "btag", "107"));
+		}
+		got202 = !findSentTo(sent, transferorAddr, "SIP/2.0 202 Accepted").empty();
+		got503 = !findSentTo(sent, transferorAddr, "SIP/2.0 503").empty();
+		auto s = handler.getSession("Call-ID: " + callId);
+		stillConnected = s.has_value();
+		isBridge = s.has_value() && s.value()->isTransferBridge();
+	};
+
+	bool got202 = false, got503 = false, connected = false, bridge = false;
+	run(/*spare=*/2, "pool715-refer-starved", got202, got503, connected, bridge);   // the datagram + the 202's slot
+	EXPECT_FALSE(got202) << "a REFER whose transfer cannot be built must not be answered 202";
+	EXPECT_TRUE(got503) << "it is refused with a 503 the transferor can act on";
+	EXPECT_TRUE(connected) << "the call it tried to transfer is untouched";
+	EXPECT_FALSE(bridge) << "and was not turned into a transfer bridge";
+
+	// Positive control: with capacity the same REFER is accepted and the transfer starts.
+	run(/*spare=*/1000, "pool715-refer-free", got202, got503, connected, bridge);
+	EXPECT_TRUE(got202);
+	EXPECT_FALSE(got503);
+	EXPECT_TRUE(bridge);
 }

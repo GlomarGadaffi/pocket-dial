@@ -5,10 +5,14 @@
 #include <cstdint>
 #include <memory>
 #include <chrono>
+#include <string_view>
 #include <vector>
 
 class SipMessage;
 #include "SipClient.hpp"
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+#include "BenchProbe.hpp"   // #384 H1: setEmergency() shuts the bench probe's gate
+#endif
 
 class Session
 {
@@ -27,6 +31,19 @@ public:
 		Held,
 	};
 
+	// How the call ended (#690). Kept apart from State so an outcome does not
+	// overwrite the dialog state it ended in. Written once; a later write is
+	// ignored. Slice 1: State still carries Busy/Unavailable/Cancel/Bye and
+	// every reader still reads State; the readers move in the next slice.
+	enum class Disposition : uint8_t
+	{
+		None,
+		Busy,
+		Unavailable,
+		Cancel,
+		Bye,
+	};
+
 
 	Session();
 	Session(std::string callID, std::shared_ptr<SipClient> src);
@@ -40,6 +57,12 @@ public:
 	std::shared_ptr<SipClient> getSrc() const;
 	std::shared_ptr<SipClient> getDest() const;
 	State getState() const;
+	Disposition getDisposition() const { return _disposition; }
+	// First outcome wins. None never overwrites and nothing overwrites a recorded one.
+	void setDisposition(Disposition d)
+	{
+		if (_disposition == Disposition::None) _disposition = d;
+	}
 	std::chrono::steady_clock::time_point getStartTime() const;
 
 	// The To-tag this UAS generated for the dialog. RFC 3261: the tag is created
@@ -112,7 +135,20 @@ public:
 	// a caller who cannot speak on a phone with silence suppression sends no
 	// RTP, and hanging up on them is the one failure this PBX must not have.
 	bool isEmergency() const { return _isEmergency; }
-	void setEmergency(bool val) { _isEmergency = val; }
+	// #879: the bare number ("911"/"933") a 911/933 session was routed as, so a
+	// failure after routing can be reported against it. Views a static constant
+	// (pbx::kEmergencyNumber / kEmergencyTestNumber); empty on any other session.
+	std::string_view getEmergencyNumber() const { return _emergencyNumber; }
+	void setEmergencyNumber(std::string_view number) { _emergencyNumber = number; }
+	void setEmergency(bool val)
+	{
+		_isEmergency = val;
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+		// #384 H1 (rule 5): one hook for every caller (911/933 route, PSAP callbacks):
+		// the bench probe disarms and drops its ballast the moment a session is flagged.
+		if (val) pd::benchprobe::onEmergency();
+#endif
+	}
 
 	// Issue #604: RTP inactivity watch. `legA`/`legB` are the received-packet
 	// counters of the call's two relayed legs (pass one counter twice for a
@@ -358,6 +394,7 @@ private:
 	std::shared_ptr<SipClient> _src;
 	std::shared_ptr<SipClient> _dest;
 	State _state;
+	Disposition _disposition = Disposition::None;
 	std::chrono::steady_clock::time_point _startTime;
 
 	std::string _localTag; // UAS-generated To-tag, shared across 180 + 200 OK
@@ -369,6 +406,7 @@ private:
 	bool _isTrunk = false;
 	int  _trunkRelaySlot = -1;
 	bool _isEmergency = false;                          // #604
+	std::string_view _emergencyNumber;                  // #879
 	bool _rtpWatchArmed = false;                        // #604
 	uint32_t _rtpMarkA = 0;                             // #604
 	uint32_t _rtpMarkB = 0;                             // #604

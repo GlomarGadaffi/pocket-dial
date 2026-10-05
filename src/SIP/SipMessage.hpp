@@ -19,6 +19,7 @@
 #include <cstdint>
 
 #include "SipStatus.hpp"
+#include "PoolConfig.hpp"   // #838: POCKETDIAL_KEPT_LINE_BYTES
 
 // ── SDP structural limits ───────────────────────────────────────────────────
 // Hard caps SipMessage::checkSdp() enforces on every SDP body BEFORE any decoder
@@ -47,6 +48,40 @@ namespace SdpLimits
 	constexpr unsigned kMaxTokensPerLine = 40;   // SP-separated runs on one line
 	constexpr unsigned kMaxMediaFormats  = 32;   // <fmt> tokens on one m= line
 	constexpr size_t   kMaxAttrNameBytes = 32;   // a=<name>[:value]
+	// #199: the structured model's caps (sdp::Limits aliases these), enforced on
+	// the wire too so the gate and sdp::parse() can never disagree about a body.
+	constexpr unsigned kMaxMediaSections        = 4;
+	constexpr unsigned kMaxAttributesPerSection = 32;
+	constexpr unsigned kMaxSessionAttributes    = 16;
+	// One active (port != 0) m=audio per offer: every leg here carries one
+	// audio stream. A port-0 m=audio is a removed stream (RFC 3264 §8) and
+	// does not count.
+	constexpr unsigned kMaxActiveAudioStreams   = 1;
+}
+
+// ── SIP header limits (#199) ────────────────────────────────────────────────
+// SipMessage::checkHeaders() enforces these on every inbound message before
+// any handler copies a field. The first three ARE fixed buffers on main: a
+// longer field used to be silently truncated by the copy (storeField()), so two
+// different transactions could store the same key. Refused instead, before the
+// copy. Measured interop corpus maxima (pjsua, 614 messages) in the comments.
+namespace SipLimits
+{
+	constexpr size_t   kMaxCallIdLine   = 127;  // TransactionLayer/VmSdJob callId[128]; stores the whole line (corpus 41)
+	constexpr size_t   kMaxBranch       = 71;   // TransactionLayer viaBranch[72] (corpus 41)
+	constexpr size_t   kMaxCSeqMethod   = 11;   // TransactionLayer cseqMethod[12] (corpus 8)
+	constexpr size_t   kMaxCSeqDigits   = 10;   // RFC 3261 §8.1.1.5: < 2^31 (corpus 5)
+	constexpr size_t   kMaxMaxForwards  = 255;  // Max-Forwards {1,3} digits, <= 255 (corpus 70)
+	// Policy caps, not buffers: generous against real carrier paths.
+	// kMaxHeaderLines is also the most lines resetFromWire() keeps (#838).
+	constexpr unsigned kMaxHeaderLines  = 64;   // corpus 16
+	constexpr unsigned kMaxVia          = 10;   // corpus 1
+	constexpr unsigned kMaxRecordRoute  = 10;   // corpus 0
+	constexpr unsigned kMaxRoute        = 8;    // corpus 0
+	constexpr unsigned kMaxContact      = 4;    // corpus 1
+	// #838: header-line buffer bytes a pooled message keeps between messages;
+	// see POCKETDIAL_KEPT_LINE_BYTES in PoolConfig.hpp for the sizing.
+	constexpr size_t   kMaxKeptLineBytes = POCKETDIAL_KEPT_LINE_BYTES;
 }
 
 class SipMessage
@@ -62,7 +97,19 @@ public:
 	// splitMessage() below copies what it needs (substr into owned _startLine /
 	// _headerLines / _body) synchronously before this returns, so nothing here
 	// retains the view past the call.
+	//
+	// #838: reset() keeps every header line. The PBX re-parses messages it built
+	// itself (an answer serialised with its own lines added, every stored
+	// retransmission), and those may legitimately run past 64 lines.
 	void reset(std::string_view message, sockaddr_in src);
+	// #838: reset() for a datagram off the socket (SipMessageFactory, i.e.
+	// SipServer::onNewMessage). Keeps at most SipLimits::kMaxHeaderLines header
+	// lines, so a 2 KB datagram of short lines cannot grow a pooled message,
+	// and notes when there were more: checkHeaders() refuses such a request.
+	void resetFromWire(std::string_view message, sockaddr_in src);
+	// True when the datagram this was parsed from had more header lines than
+	// SipLimits::kMaxHeaderLines; only the first kMaxHeaderLines are held.
+	bool headerLinesTruncated() const { return _headerLinesTruncated; }
 
 	// No shared buffer means no string_view to fix up after a copy — plain
 	// member-wise copy of the owned start line / header lines / body is already
@@ -186,9 +233,57 @@ public:
 		TooManyMediaFormats,     // > SdpLimits::kMaxMediaFormats on one m= line
 		BadAttributeName,        // a= name empty, over-long or not a token
 		CapabilityNegotiation,   // RFC 5939 / 6871 / 7104 attribute: not implemented
+		TooManyMediaSections,    // > SdpLimits::kMaxMediaSections m= lines
+		TooManyAttributes,       // > kMaxAttributesPerSection / kMaxSessionAttributes a= lines
+		TooManyAudioStreams,     // > SdpLimits::kMaxActiveAudioStreams active m=audio
 	};
 	SdpVerdict checkSdp() const;
 	static const char* sdpVerdictText(SdpVerdict v);   // short reason for a Warning header / log
+
+	// ── Header admission (#199) ─────────────────────────────────────────────
+	// One flat, allocation-free pass over the header lines applying SipLimits
+	// and the option-tag / body-type subset. On EVERY message: the buffer bounds
+	// (Call-ID line, first Via branch, CSeq). On a request only: header-line
+	// count, Max-Forwards, Via/Route/Record-Route/Contact entry counts,
+	// Require/Proxy-Require option tags (not ACK/CANCEL), and the Content-Type
+	// of an INVITE/UPDATE body. A response is never refused for its routing
+	// headers: a carrier's 183 to our own 911 must not be dropped. Nor for its
+	// header-line count (#838): past kMaxHeaderLines it is acted on with the
+	// lines resetFromWire() kept.
+	// `unsupported` receives the first unknown option tag (a view into this
+	// message) for a 420's Unsupported: header.
+	enum class HeaderVerdict : uint8_t
+	{
+		Ok = 0,
+		TooManyHeaders,          // 400
+		CallIdTooLong,           // 400
+		BranchTooLong,           // 400
+		BadCSeq,                 // 400
+		BadMaxForwards,          // 400
+		TooManyVia,              // 400
+		TooManyRoute,            // 400
+		TooManyRecordRoute,      // 400
+		TooManyContact,          // 400
+		UnsupportedOption,       // 420 + Unsupported:
+		UnsupportedMediaType,    // 415 + Accept:
+	};
+	HeaderVerdict checkHeaders(std::string_view& unsupported) const;
+	static const char* headerVerdictText(HeaderVerdict v);
+	// An INVITE whose To is 911/933 or urn:service:sos (the number onInvite
+	// routes on; a 911 Request-URI alone does not count, #824), or an RFC 7090
+	// Priority: psap-callback INVITE. The header gate yields for these (#199):
+	// every copy it guards is bounded anyway, and no optional header may cost
+	// an emergency call.
+	bool isEmergencyRequest() const;
+	// RFC 7090: Priority: psap-callback (#659 is the call-handling half).
+	bool isPsapCallback() const;
+	// #760: a 911/933 INVITE may carry its SDP inside multipart/mixed next to
+	// a PIDF-LO location (RFC 6442, RFC 4119). Keeps only the application/sdp
+	// part, in place within the body already held (no allocation), and makes
+	// Content-Type application/sdp so every consumer sees a plain offer. The
+	// location part is dropped, never parsed. False, message untouched, when
+	// the body is not multipart or has no SDP part.
+	bool unwrapMultipartSdp();
 	void clearBody();
 
 	// The message body — everything after the header/body separator (the SDP for
@@ -219,11 +314,15 @@ public:
 	std::string_view getCSeqMethod() const;  // method token extracted from CSeq header
 	// RFC 4028 session timer headers (0 / empty when header absent).
 	uint32_t         getSessionExpiresSecs() const;
-	std::string_view getSessionExpiresRefresher() const; // "uac", "uas", or empty
+	std::string_view getSessionExpiresRefresher() const; // lowercase "uac"/"uas" (any input case), other value as sent, or empty
 	uint32_t         getMinSESecs() const;
 	std::string_view getContact() const;
 	std::string_view getContactNumber() const;
 	std::string_view getContentLength() const;
+	// #838: a Content-Type (or compact c:) line whose media type is
+	// application/sdp, ignoring case and parameters. Unlike hasSdp(), which
+	// scans the raw datagram, an Accept line or a body part does not count.
+	bool hasSdpContentType() const;
 	// Full `Authorization:` request-header line (or empty if absent). The value
 	// is fed to SipDigest::parseAuthorization, which tolerates the header name.
 	std::string_view getAuthorization() const;
@@ -302,10 +401,16 @@ private:
 	std::vector<std::string> _headerLines;
 	// #462: header-line strings a shorter message did not need, kept with their
 	// buffers instead of being destroyed, so the next longer message parsed into
-	// this (pooled) object reuses them rather than allocating. NOT message
-	// state: nothing reads it except the parse/copy paths in SipMessage.cpp,
-	// and its contents are meaningless leftovers. Only its capacity matters.
+	// this (pooled) object, or a header inserted into it, reuses them rather
+	// than allocating. NOT message state: nothing reads it except the parse/copy
+	// paths and insertHeaderLine() in SipMessage.cpp, and its contents are
+	// meaningless leftovers. Only its capacity matters. #838: at most
+	// SipLimits::kMaxHeaderLines strings; after a parse or copy, it and
+	// _headerLines hold at most SipLimits::kMaxKeptLineBytes of buffer, or just
+	// what the current lines need if that is more.
 	std::vector<std::string> _spareHeaderLines;
+	// #838: see headerLinesTruncated(). Copied by operator=.
+	bool                     _headerLinesTruncated = false;
 	std::string              _body;
 	// Bumped by every _body mutation — see bodyGeneration().
 	//
@@ -335,6 +440,8 @@ private:
 
 	sockaddr_in _src{};
 
+	// reset() and resetFromWire(): keeps at most `maxHeaderLines` header lines.
+	void resetWithin(std::string_view message, sockaddr_in src, size_t maxHeaderLines);
 	size_t findHeaderIndex(std::string_view fullName, std::string_view compactName = {}) const;
 	// Inserts a new header line just before Content-Length (matching the wire
 	// position addHeader() has always used), or at the end of the header block

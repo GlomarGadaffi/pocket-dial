@@ -161,6 +161,20 @@ TEST(SipTrunkInvite, ContactPointsAtUsNotTheCarrier)
 		<< "Contact must not advertise the carrier's own address back at it";
 }
 
+// #753: "Supported: timer" would let the carrier choose itself as RFC 4028
+// refresher, and the trunk leg does not answer a refresh re-INVITE with a 2xx,
+// so the carrier would drop every call at the first session interval. No claim
+// without an implementation.
+TEST(SipTrunkInvite, DoesNotClaimSessionTimerSupport)
+{
+	const auto d = pinnedDialog();
+	const std::string inv = SipTrunk::buildInvite(d, "v=0\r\n");
+
+	EXPECT_EQ(inv.find("Supported:"), std::string::npos)
+		<< "the trunk leg answers no session refresh, so the INVITE must not offer one";
+	EXPECT_EQ(inv.find("timer"), std::string::npos);
+}
+
 TEST(SipTrunkInvite, ContentLengthMatchesTheBodyBytes)
 {
 	const auto d = pinnedDialog();
@@ -566,6 +580,41 @@ TEST(SipTrunkListener, RingingReportsEarlyMediaOnlyForOneEightyThree)
 	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(base, "SIP/2.0 183 Session Progress"))));
 	ASSERT_EQ(lis.events.size(), 2u);
 	EXPECT_TRUE(lis.events[1].earlyMedia) << "183 is the carrier already sending audio";
+}
+
+// #889: the engine now hands SipTrunk the carrier's 100, 181, 182 and 199 as
+// well. None of their tags may become the dialog's: a 100 forms no dialog
+// (RFC 3261 §12.1), a 199 names one already gone (RFC 6228), and a 181 or 182
+// may be a hop's. The ACK for the 2xx and the BYE carry the 2xx's tag.
+TEST(SipTrunkDialog, AProvisionalsToTagNeverReplacesTheAnswers)
+{
+	for (const char* provisional : { "SIP/2.0 100 Trying", "SIP/2.0 181 Call Is Being Forwarded",
+		"SIP/2.0 182 Queued", "SIP/2.0 199 Early Dialog Terminated" })
+	{
+		SCOPED_TRACE(provisional);
+		FakePbxEnv env;
+		SipTrunk trunk(env);
+		trunk.setConfig(workingConfig());
+		ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+		const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+		ASSERT_NE(d, nullptr);
+		const std::string ok = okFor(*d);
+		std::string early = withStatus(ok, provisional);
+		early.replace(early.find("tag=carrier-tag"), 15, "tag=hop-tag-1xx");
+
+		ASSERT_TRUE(trunk.handleResponse(responseFor(early)));
+		EXPECT_EQ(trunk.findByCallID("handset-1")->state, SipTrunk::State::Proceeding) << "a provisional";
+		ASSERT_TRUE(trunk.handleResponse(responseFor(ok)));
+		ASSERT_TRUE(trunk.hangup("handset-1"));
+
+		ASSERT_EQ(env.sent.size(), 3u) << "INVITE, the 2xx's ACK, the BYE";
+		for (size_t i : { size_t{1}, size_t{2} })
+		{
+			const std::string m = env.sentRaw(i);
+			EXPECT_NE(m.find(";tag=carrier-tag"), std::string::npos) << m;
+			EXPECT_EQ(m.find("hop-tag-1xx"), std::string::npos) << m;
+		}
+	}
 }
 
 TEST(SipTrunkListener, AnsweredFiresAfterTheAckIsOnTheWire)
@@ -1321,6 +1370,37 @@ TEST(SipTrunkAuth, A401IsAckedAndTheInviteResentOnceWithCredentials)
 	EXPECT_FALSE(anySentOrLoggedContains(env, "s3cret-399")) << "the password never leaves the box";
 }
 
+// #618: both INVITEs are on the console in full, and the credentialed one's
+// Authorization value (the digest response) is not.
+TEST(SipTrunkAuth, TheFullInviteIsLoggedWithAuthorizationRedacted)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-399"));
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 401, "WWW-Authenticate"))));
+
+	std::string all;
+	for (const auto& l : env.logs)
+	{
+		EXPECT_LE(l.size(), 200u) << "over LogQueue's line cap: " << l;
+		if (l.rfind("Trunk: INVITE> ", 0) == 0) all += l + "\n";
+	}
+	EXPECT_NE(all.find("Trunk: INVITE> INVITE sip:+15551234567@203.0.113.5 SIP/2.0 | Via: "),
+		std::string::npos) << all;
+	EXPECT_NE(all.find("CSeq: 1 INVITE"), std::string::npos) << all;
+	EXPECT_NE(all.find("CSeq: 2 INVITE"), std::string::npos) << "the retry too: " << all;
+	EXPECT_NE(all.find("Contact: "), std::string::npos) << all;
+	EXPECT_NE(all.find("c=IN IP4 "), std::string::npos) << "the SDP too: " << all;
+	EXPECT_NE(all.find("Authorization: <redacted>"), std::string::npos) << all;
+	EXPECT_EQ(all.find("response="), std::string::npos) << all;
+	EXPECT_EQ(all.find("nonce="), std::string::npos) << all;
+	EXPECT_FALSE(anySentOrLoggedContains(env, "s3cret-399"));
+}
+
 TEST(SipTrunkAuth, A407IsAnsweredWithProxyAuthorizationAndTheAuthUser)
 {
 	FakePbxEnv env;
@@ -1441,6 +1521,47 @@ TEST(SipTrunkAuth, APoolRefusalOnTheRetryAcksTheChallengeOnceFromTheUntouchedTra
 	EXPECT_EQ(trunk.activeDialogs(), 0u) << "unanswerable for now: an ordinary failure";
 }
 
+// #890: the 2xx ended the INVITE's transaction, so a final after it is neither
+// a challenge to answer nor the call's failure. Answering a 401/407 sent a
+// second, credentialed INVITE for a call that was up (on a 911, a second PSAP
+// call), set the dialog back to Trying and dropped the answer's tag. A 486 ran
+// the failure path: an ACK, the dialog freed with no BYE, and the listener told
+// the call failed.
+TEST(SipTrunkAuth, AFinalAfterTheAnswerIsNeitherAnsweredNorAFailure)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.setCredentials("s3cret-890"));
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+	ASSERT_EQ(env.sent.size(), 2u) << "precondition: the INVITE and the 2xx's ACK";
+	lis.events.clear();
+
+	EXPECT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 407, "Proxy-Authenticate"))));
+	EXPECT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 401, "WWW-Authenticate"))));
+	EXPECT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 486 Busy Here"))));
+
+	std::string sentAfter;
+	for (std::size_t i = 2; i < env.sent.size(); ++i) sentAfter += firstLine(env.sentRaw(i)) + "\n";
+	EXPECT_EQ(env.sent.size(), 2u) << "no ACK and no second INVITE; sent:\n" << sentAfter;
+	EXPECT_TRUE(lis.events.empty()) << "and no failure reported: " << (lis.events.empty() ? 0 : lis.events[0].status);
+	ASSERT_NE(trunk.findByCallID("handset-1"), nullptr) << "the call is still up";
+	EXPECT_EQ(trunk.findByCallID("handset-1")->state, SipTrunk::State::Confirmed);
+	EXPECT_FALSE(anySentOrLoggedContains(env, "s3cret-890"));
+
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	ASSERT_EQ(env.sent.size(), 3u);
+	const std::string bye = env.sentRaw(2);
+	EXPECT_EQ(firstLine(bye), "BYE sip:+15551234567@203.0.113.99:5060 SIP/2.0");
+	EXPECT_NE(bye.find(";tag=carrier-tag"), std::string::npos) << "on the answer's dialog:\n" << bye;
+	EXPECT_NE(bye.find("CSeq: 2 BYE"), std::string::npos) << "the INVITE's CSeq is still 1:\n" << bye;
+}
+
 // ── #399: REGISTER with the carrier, digest-signed ──────────────────────────
 //
 // Engage's SBC never answered .244's INVITEs because the trunk never
@@ -1475,6 +1596,12 @@ namespace
 			"CSeq: " + headerValue(reg, "CSeq") + "\r\n"
 			+ extraHeaders +
 			"Content-Length: 0\r\n\r\n";
+	}
+
+	// #686: a registrar's 2xx lists our binding: it echoes our Contact.
+	std::string echoContact(const std::string& reg)
+	{
+		return "Contact: " + headerValue(reg, "Contact") + "\r\n";
 	}
 
 	SipTrunk::Config regConfig()
@@ -1533,7 +1660,7 @@ TEST(SipTrunkRegister, A401IsAnsweredWithDigestAndThe200ArmsARefreshBeforeExpire
 	EXPECT_EQ(signedReg.find("s3cret-reg"), std::string::npos);
 
 	ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(signedReg,
-		"SIP/2.0 200 OK", "Expires: 120\r\n"))));
+		"SIP/2.0 200 OK", echoContact(signedReg) + "Expires: 120\r\n"))));
 	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registered);
 	EXPECT_EQ(env.sent.size(), 2u) << "a 200 needs no answer";
 
@@ -1544,6 +1671,35 @@ TEST(SipTrunkRegister, A401IsAnsweredWithDigestAndThe200ArmsARefreshBeforeExpire
 	ASSERT_EQ(env.sent.size(), 3u) << "the binding must be refreshed before it lapses at 120 s";
 	EXPECT_NE(env.sentRaw(2).find("nc=00000002"), std::string::npos)
 		<< "the refresh re-signs against the cached nonce: " << env.sentRaw(2);
+}
+
+// #618: Engage answers a FAILED REGISTER with "200 Authorization failure", and
+// .244 sits behind CGNAT. The console must show the reason phrase and what the
+// carrier saw of us (Via received/rport), or "registered" cannot be trusted.
+TEST(SipTrunkRegister, AFinalRegisterResponseLogsItsStatusLineAndViaReceived)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+	trunk.tickRegistration(steadyMs(), sbcAddr());
+	ASSERT_EQ(env.sent.size(), 1u);
+
+	std::string resp = regResponse(env.sentRaw(0), "SIP/2.0 200 Authorization failure",
+		"Contact: <sip:198.51.100.14:5065>\r\n");
+	const size_t rp = resp.find(";rport");
+	ASSERT_NE(rp, std::string::npos) << resp;
+	resp.replace(rp, 6, ";rport=40123;received=198.51.100.7");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(resp)));
+
+	std::string line;
+	for (const auto& l : env.logs)
+		if (l.find("Trunk: REGISTER <-") != std::string::npos) line = l;
+	std::printf("[#618] %s\n", line.c_str());
+	EXPECT_NE(line.find("SIP/2.0 200 Authorization failure"), std::string::npos) << line;
+	EXPECT_NE(line.find("received=198.51.100.7"), std::string::npos) << line;
+	EXPECT_NE(line.find("rport=40123"), std::string::npos) << line;
+	EXPECT_NE(line.find("Contact <sip:198.51.100.14:5065>"), std::string::npos) << line;
 }
 
 TEST(SipTrunkRegister, A407IsAnsweredInProxyAuthorization)
@@ -1584,6 +1740,50 @@ TEST(SipTrunkRegister, ARegisterResponseFromAnotherAddressIsConsumedAndIgnored)
 	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registering);
 }
 
+// #686: Engage answers a failed REGISTER "SIP/2.0 200 Authorization failure",
+// no Expires, its own address as the only Contact (#618's capture). The code
+// is 200; only the missing binding says it failed. Control: the same status
+// line listing our binding registers, so the reason phrase is never read.
+TEST(SipTrunkRegister, A200AuthorizationFailureListingOnlyTheCarriersContactIsNotARegistration)
+{
+	for (const bool echoOurs : {false, true})
+	{
+		FakePbxEnv env;
+		SipTrunk trunk(env);
+		trunk.setConfig(regConfig());
+		ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+		trunk.tickRegistration(steadyMs(), sbcAddr());
+		ASSERT_EQ(env.sent.size(), 1u);
+		const std::string reg = env.sentRaw(0);
+
+		ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(reg,
+			"SIP/2.0 200 Authorization failure",
+			echoOurs ? echoContact(reg) + "Expires: 3600\r\n"
+			         : std::string("Contact: <sip:203.0.113.5:5065>\r\n")))));
+		EXPECT_EQ(trunk.registration().state(), echoOurs
+			? SipRegistrationClient::State::Registered
+			: SipRegistrationClient::State::Failed) << (echoOurs ? "control" : "Engage's 200");
+	}
+}
+
+// #686: the binding now decides registration, so a registrar that lists it
+// under Contact's compact form "m:" (RFC 3261 §7.3.3) must still be read.
+TEST(SipTrunkRegister, OurBindingUnderTheCompactContactFormRegisters)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(regConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
+	trunk.tickRegistration(steadyMs(), sbcAddr());
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string reg = env.sentRaw(0);
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(reg, "SIP/2.0 200 OK",
+		"m: " + headerValue(reg, "Contact") + ";expires=90\r\n"))));
+	EXPECT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registered);
+	EXPECT_EQ(trunk.registration().status().grantedExpiresSec, 90u);
+}
+
 // #617: Timer E. TransactionLayer::classify() excludes REGISTER, so before this
 // nothing resent an unanswered one: one lost datagram cost a full Timer F plus
 // backoff cycle. RFC 3261 §17.1.2.2: resend at T1, doubling, capped at T2.
@@ -1613,7 +1813,7 @@ TEST(SipTrunkRegister, AnUnansweredRegisterIsResentOnTheTimerESchedule)
 
 	// Any response ends the schedule.
 	ASSERT_TRUE(trunk.handleResponse(responseFor(regResponse(first,
-		"SIP/2.0 200 OK", "Expires: 3600\r\n"))));
+		"SIP/2.0 200 OK", echoContact(first) + "Expires: 3600\r\n"))));
 	ASSERT_EQ(trunk.registration().state(), SipRegistrationClient::State::Registered);
 	const size_t sentAtAnswer = env.sent.size();
 	trunk.tickRegistration(t0 + 20000, sbcAddr());
@@ -1630,7 +1830,8 @@ TEST(SipTrunkRegister, AForgedRegisterResponseIsCounted)
 	ASSERT_TRUE(trunk.setCredentials("s3cret-reg"));
 	trunk.tickRegistration(steadyMs(), sbcAddr());
 	ASSERT_EQ(env.sent.size(), 1u);
-	const std::string ok = regResponse(env.sentRaw(0), "SIP/2.0 200 OK", "Expires: 3600\r\n");
+	const std::string ok = regResponse(env.sentRaw(0), "SIP/2.0 200 OK",
+		echoContact(env.sentRaw(0)) + "Expires: 3600\r\n");
 
 	sockaddr_in forger = sbcAddr();
 	forger.sin_addr.s_addr = inet_addr("198.51.100.7");   // TEST-NET-2
@@ -1720,4 +1921,621 @@ TEST(SipTrunkRegister, ForgedRegisterResponsesLogOnlyAtPowersOfTwo)
 		<< "one line at 1, 2 and 4 each";
 	EXPECT_EQ(logsContaining(env, "(4 so far)"), 1u);
 	EXPECT_EQ(logsContaining(env, "(5 so far)"), 0u);
+}
+
+// ── #747: a handset hanging up while the carrier leg still rings ─────────────
+//
+// hangup() used to free an unanswered dialog without telling the carrier, so the
+// far end kept ringing (and could answer a call nobody was left to take). A
+// dialog that has had a provisional response now sends a CANCEL and waits out
+// the INVITE's own final response.
+
+TEST(SipTrunkCancel, BuildsTheCancelOfTheInviteItNames)
+{
+	auto d = pinnedDialog();
+	d.toTag = "carrier-tag";   // latched from a 180: must NOT reach the CANCEL's To
+
+	const std::string c = SipTrunk::buildCancel(d);
+
+	EXPECT_EQ(firstLine(c), "CANCEL sip:+15551234567@203.0.113.5 SIP/2.0");
+	EXPECT_TRUE(hasLine(c, "Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bKinvite01;rport"))
+		<< "RFC 3261 s9.1: the INVITE's own branch, not a fresh one";
+	EXPECT_TRUE(hasLine(c, "From: <sip:15551230000@203.0.113.5>;tag=ftag01"));
+	EXPECT_TRUE(hasLine(c, "To: <sip:+15551234567@203.0.113.5>"))
+		<< "the INVITE's To, which had no tag";
+	EXPECT_TRUE(hasLine(c, "Call-ID: abc123@192.168.1.10"));
+	EXPECT_TRUE(hasLine(c, "CSeq: 1 CANCEL")) << "the INVITE's CSeq number";
+}
+
+TEST(SipTrunkCancel, HangupOfARingingDialogSendsCancelAndTheCarrier487FreesIt)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	lis.events.clear();
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)).substr(0, 6), "CANCEL");
+	EXPECT_EQ(trunk.activeDialogs(), 1u) << "held until the INVITE's own final response";
+	EXPECT_TRUE(trunk.hangup("handset-1")) << "a second hangup finds the dialog";
+	EXPECT_EQ(trunk.activeDialogs(), 1u) << "and must not release it or send a second CANCEL";
+	EXPECT_EQ(env.sent.size(), 1u);
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 487 Request Terminated"))));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)).substr(0, 3), "ACK") << "s17.1.1.3: a non-2xx is ACKed";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+	EXPECT_TRUE(lis.events.empty()) << "the handset was answered when it cancelled; nothing to tell";
+}
+
+TEST(SipTrunkCancel, A2xxThatCrossesTheCancelIsAckedAndByed)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	ASSERT_TRUE(trunk.hangup("handset-1"));   // CANCEL out
+	lis.events.clear();
+	env.sent.clear();
+
+	// The carrier answered before the CANCEL reached it (s9.1).
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)).substr(0, 3), "ACK");
+	EXPECT_EQ(firstLine(env.sentRaw(1)).substr(0, 3), "BYE") << "the call is up at the carrier and billing";
+	EXPECT_TRUE(lis.events.empty()) << "the handset is gone: no answered event may bridge it";
+	EXPECT_EQ(d->state, SipTrunk::State::Terminating);
+}
+
+// #794: hangup() before any provisional response used to free the slot, so the
+// INVITE stayed live at the carrier with nobody to answer its 1xx or 2xx. The
+// slot is now held; the CANCEL s9.1 forbade goes out on the first provisional.
+TEST(SipTrunkCancel, HangupBeforeAnyProvisionalHoldsTheSlotAndTheFirst1xxSendsTheCancel)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+
+	EXPECT_TRUE(env.sent.empty()) << "RFC 3261 s9.1: no CANCEL before a provisional response";
+	ASSERT_EQ(trunk.activeDialogs(), 1u) << "the INVITE is live at the carrier; the slot must wait for its answer";
+	EXPECT_TRUE(trunk.hangup("handset-1")) << "a second hangup finds the dialog";
+	EXPECT_TRUE(env.sent.empty()) << "and sends nothing either";
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+
+	ASSERT_EQ(env.sent.size(), 1u) << "exactly one CANCEL on the first provisional";
+	EXPECT_EQ(firstLine(env.sentRaw(0)).substr(0, 6), "CANCEL");
+	EXPECT_EQ(d->state, SipTrunk::State::Cancelling);
+	EXPECT_TRUE(lis.events.empty()) << "the handset already hung up: no ringing event";
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 487 Request Terminated"))));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)).substr(0, 3), "ACK");
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+	EXPECT_TRUE(lis.events.empty());
+}
+
+TEST(SipTrunkCancel, A2xxAsTheFirstResponseAfterAHangupInTryingIsAckedAndByedWithNoListenerEvent)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	env.sent.clear();
+
+	// The carrier answered without ever sending a provisional.
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)).substr(0, 3), "ACK");
+	EXPECT_EQ(firstLine(env.sentRaw(1)).substr(0, 3), "BYE") << "the call is up at the carrier and billing";
+	EXPECT_TRUE(lis.events.empty()) << "the handset is gone: no answered event may bridge it";
+	EXPECT_EQ(d->state, SipTrunk::State::Terminating);
+}
+
+TEST(SipTrunkCancel, AFailureAsTheFirstResponseAfterAHangupInTryingIsAckedAndFreedQuietly)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 486 Busy Here"))));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(firstLine(env.sentRaw(0)).substr(0, 3), "ACK") << "s17.1.1.3: a non-2xx is ACKed";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+	EXPECT_TRUE(lis.events.empty()) << "the handset already ended the call; no failure to relay";
+}
+
+TEST(SipTrunkCancel, AHangupInTryingThatNeverGetsAResponseIsSweptQuietlyAtTimerB)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	ASSERT_EQ(trunk.activeDialogs(), 1u);
+
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::seconds(31));
+	EXPECT_EQ(trunk.activeDialogs(), 1u) << "held for the INVITE's Timer B (32 s)";
+
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::seconds(33));
+
+	EXPECT_EQ(trunk.activeDialogs(), 0u) << "a carrier that never answers cannot pin the slot";
+	EXPECT_TRUE(lis.events.empty()) << "the handset already ended the call; no second failure";
+}
+
+TEST(SipTrunkCancel, ACancelledDialogThatNeverGetsAFinalResponseIsSweptQuietly)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	lis.events.clear();
+
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::seconds(33));
+
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+	EXPECT_TRUE(lis.events.empty()) << "the handset already ended the call; no second failure";
+}
+
+// ── #687: answering a 401/407 on our BYE ────────────────────────────────────
+//
+// A carrier that challenges the BYE and gets no answer keeps the leg up and
+// billing after the handset has hung up. The retry goes through the same
+// digest path as the INVITE's (SipTrunkAuth.* above); same fixtures too:
+// TEST-NET-3 through FakePbxEnv's capture, no real number dialled.
+namespace
+{
+	// The Via branch of a request ("...;branch=X;rport").
+	std::string branchOf(const std::string& msg)
+	{
+		const size_t b = msg.find(";branch=");
+		if (b == std::string::npos) return {};
+		const size_t v = b + 8;
+		return msg.substr(v, msg.find_first_of(";\r", v) - v);
+	}
+
+	// The value of a quoted digest parameter (`response="..."`) in a message.
+	std::string digestParam(const std::string& msg, const std::string& name)
+	{
+		const size_t p = msg.find(name + "=\"");
+		if (p == std::string::npos) return {};
+		const size_t v = p + name.size() + 2;
+		return msg.substr(v, msg.find('"', v) - v);
+	}
+
+	// The carrier's answer to the BYE hangup() just sent -- CSeq d.cseq+1, as
+	// buildBye() stamps it. `authenticate` names the challenge header for a
+	// 401/407 ("WWW-Authenticate" / "Proxy-Authenticate"); a 200 carries none.
+	std::string byeResponseFor(const SipTrunk::Dialog& d, int code, const char* authenticate = nullptr)
+	{
+		std::string r = okFor(d);
+		if (code == 401) r.replace(0, r.find("\r\n"), "SIP/2.0 401 Unauthorized");
+		if (code == 407) r.replace(0, r.find("\r\n"), "SIP/2.0 407 Proxy Authentication Required");
+		const std::string cseqLine = "CSeq: " + std::to_string(d.cseq + 1) + " BYE";
+		r.replace(r.find("CSeq: 1 INVITE"), std::string("CSeq: 1 INVITE").size(), cseqLine);
+		if (authenticate)
+		{
+			r.insert(r.find("Content-Length"), std::string(authenticate)
+				+ ": Digest realm=\"carrier.example\", nonce=\"n0nce687\", qop=\"auth\"\r\n");
+		}
+		return r;
+	}
+
+	// A call answered by the carrier and hung up by us: INVITE, its ACK and
+	// the BYE are sent[0..2]. Checks the positive control here, once for every
+	// test below -- the first BYE carries no credential, so a credential on
+	// the retry is the change under test and not something every BYE has.
+	struct ByeSent
+	{
+		FakePbxEnv  env;
+		SipTrunk    trunk{env};
+		std::string callId, fromTag, byeBranch;
+
+		ByeSent(const SipTrunk::Config& cfg, const char* password)
+		{
+			trunk.setConfig(cfg);
+			EXPECT_TRUE(trunk.setCredentials(password));
+			EXPECT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+			const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+			EXPECT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));   // answered
+			EXPECT_TRUE(trunk.hangup("handset-1"));                      // BYE sent
+			callId  = d->callID;
+			fromTag = d->fromTag;
+			EXPECT_EQ(env.sent.size(), 3u) << "INVITE, its ACK, the BYE";
+			const std::string bye = env.sentRaw(2);
+			EXPECT_EQ(firstLine(bye), "BYE sip:+15551234567@203.0.113.99:5060 SIP/2.0");
+			EXPECT_TRUE(hasLine(bye, "CSeq: 2 BYE"));
+			EXPECT_EQ(bye.find("Authorization"), std::string::npos)
+				<< "positive control: the first BYE goes out uncredentialed";
+			byeBranch = branchOf(bye);
+			EXPECT_FALSE(byeBranch.empty());
+		}
+		// Only valid while the dialog is live.
+		const SipTrunk::Dialog& dialog() const { return *trunk.findByCallID("handset-1"); }
+	};
+}
+
+TEST(SipTrunkByeAuth, A401ToOurByeIsAnsweredOnceWithCredentialsAndNothingElse)
+{
+	ByeSent f(workingConfig(), "s3cret-687");
+	ASSERT_EQ(f.env.sent.size(), 3u);
+
+	ASSERT_TRUE(f.trunk.handleResponse(responseFor(byeResponseFor(f.dialog(), 401, "WWW-Authenticate"))));
+
+	ASSERT_EQ(f.env.sent.size(), 4u)
+		<< "exactly one credentialed BYE retry, and no ACK: a BYE is a non-INVITE transaction";
+	const std::string retry = f.env.sentRaw(3);
+	EXPECT_EQ(firstLine(retry), "BYE sip:+15551234567@203.0.113.99:5060 SIP/2.0") << "the same route";
+	EXPECT_TRUE(hasLine(retry, "CSeq: 3 BYE")) << "CSeq+1 on the challenged BYE:\n" << retry;
+	EXPECT_TRUE(hasLine(retry, "Call-ID: " + f.callId)) << "the same dialog";
+	EXPECT_NE(retry.find(";tag=" + f.fromTag), std::string::npos) << "the same From-tag";
+	EXPECT_NE(retry.find(";tag=carrier-tag"), std::string::npos) << "the same To-tag";
+	EXPECT_NE(branchOf(retry), f.byeBranch) << "a fresh branch";
+	EXPECT_NE(retry.find("\r\nAuthorization: Digest username=\"15551230000\""), std::string::npos) << retry;
+	EXPECT_NE(retry.find("uri=\"sip:+15551234567@203.0.113.99:5060\""), std::string::npos)
+		<< "the digest uri is the BYE's Request-URI, not the INVITE's:\n" << retry;
+	EXPECT_NE(retry.find("nonce=\"n0nce687\""), std::string::npos) << "the BYE challenge's nonce, not a reused one";
+	const std::string digest = digestParam(retry, "response");
+	EXPECT_EQ(digest.size(), 32u) << retry;
+	EXPECT_EQ(f.trunk.activeDialogs(), 1u) << "still Terminating, waiting on the retry's answer";
+	EXPECT_EQ(f.trunk.refusedByeRetries(), 0u);
+
+	// Nothing secret reaches the log: not the password, the nonce or the digest.
+	EXPECT_FALSE(anySentOrLoggedContains(f.env, "s3cret-687"));
+	EXPECT_EQ(logsContaining(f.env, "n0nce687"), 0u);
+	EXPECT_EQ(logsContaining(f.env, digest), 0u);
+
+	// The carrier accepts the retry: the dialog is over and nothing follows.
+	ASSERT_TRUE(f.trunk.handleResponse(responseFor(byeResponseFor(f.dialog(), 200))));
+	EXPECT_EQ(f.env.sent.size(), 4u) << "nothing follows the 200";
+	EXPECT_EQ(f.trunk.activeDialogs(), 0u);
+	EXPECT_EQ(f.trunk.refusedByeRetries(), 0u) << "an accepted retry is not a refused one";
+}
+
+TEST(SipTrunkByeAuth, ARetryRefusedAgainIsNotRetriedAndIsCounted)
+{
+	ByeSent f(workingConfig(), "wrong-password");
+	ASSERT_TRUE(f.trunk.handleResponse(responseFor(byeResponseFor(f.dialog(), 401, "WWW-Authenticate"))));
+	ASSERT_EQ(f.env.sent.size(), 4u) << "the one credentialed retry";
+	ASSERT_EQ(f.trunk.activeDialogs(), 1u);
+
+	ASSERT_TRUE(f.trunk.handleResponse(responseFor(byeResponseFor(f.dialog(), 401, "WWW-Authenticate"))));
+
+	EXPECT_EQ(f.env.sent.size(), 4u) << "no third BYE, and no ACK -- never a loop";
+	EXPECT_EQ(f.trunk.activeDialogs(), 0u) << "released regardless, as before #687";
+	EXPECT_EQ(f.trunk.refusedByeRetries(), 1u);
+	EXPECT_EQ(logsContaining(f.env, "credentialed BYE retry answered 401"), 1u) << "one WARN";
+	EXPECT_FALSE(anySentOrLoggedContains(f.env, "wrong-password"));
+}
+
+TEST(SipTrunkByeAuth, ALateCopyOfTheFirstChallengeNeitherCountsNorEndsTheRetry)
+{
+	ByeSent f(workingConfig(), "s3cret-687");
+	const std::string first401 = byeResponseFor(f.dialog(), 401, "WWW-Authenticate");   // CSeq 2, the first BYE
+	ASSERT_TRUE(f.trunk.handleResponse(responseFor(first401)));
+	ASSERT_EQ(f.env.sent.size(), 4u) << "the one credentialed retry (CSeq 3)";
+
+	// The carrier's UDP retransmission of that first 401, landing after the retry went out.
+	EXPECT_TRUE(f.trunk.handleResponse(responseFor(first401)));
+	EXPECT_EQ(f.env.sent.size(), 4u) << "nothing is sent for it";
+	EXPECT_EQ(f.trunk.activeDialogs(), 1u) << "the retry's transaction is still live";
+	EXPECT_EQ(f.trunk.refusedByeRetries(), 0u) << "a stale copy is not a refused retry";
+	EXPECT_EQ(logsContaining(f.env, "credentialed BYE retry answered"), 0u) << "and no false WARN";
+
+	ASSERT_TRUE(f.trunk.handleResponse(responseFor(byeResponseFor(f.dialog(), 200))));
+	EXPECT_EQ(f.trunk.activeDialogs(), 0u) << "the retry's own 200 ends the dialog";
+}
+
+TEST(SipTrunkByeAuth, A407ToOurByeIsAnsweredInProxyAuthorizationAsTheAuthUser)
+{
+	SipTrunk::Config cfg = workingConfig();
+	std::snprintf(cfg.authUser, sizeof(cfg.authUser), "%s", "auth-id-687");
+	ByeSent f(cfg, "s3cret-687");
+
+	ASSERT_TRUE(f.trunk.handleResponse(responseFor(byeResponseFor(f.dialog(), 407, "Proxy-Authenticate"))));
+
+	ASSERT_EQ(f.env.sent.size(), 4u);
+	const std::string retry = f.env.sentRaw(3);
+	EXPECT_EQ(firstLine(retry), "BYE sip:+15551234567@203.0.113.99:5060 SIP/2.0");
+	EXPECT_TRUE(hasLine(retry, "CSeq: 3 BYE"));
+	EXPECT_NE(retry.find("\r\nProxy-Authorization: Digest username=\"auth-id-687\""), std::string::npos)
+		<< "a 407 is answered in Proxy-Authorization, as the configured auth ID:\n" << retry;
+	EXPECT_EQ(retry.find("\r\nAuthorization:"), std::string::npos);
+	EXPECT_NE(retry.find("uri=\"sip:+15551234567@203.0.113.99:5060\""), std::string::npos);
+	EXPECT_EQ(f.trunk.activeDialogs(), 1u);
+	EXPECT_EQ(f.trunk.refusedByeRetries(), 0u);
+}
+
+// ── Record-Route (#748) ──────────────────────────────────────────────────────
+//
+// RFC 3261 s12.1.2: the UAC's route set is the 2xx's Record-Route, reversed.
+// s12.2.1.1: every in-dialog request carries it, and goes to its first hop.
+
+namespace
+{
+	// A 200 to the INVITE with `recordRoute` (complete header lines) added.
+	std::string okWithRecordRoute(const SipTrunk::Dialog& d, const std::string& recordRoute)
+	{
+		std::string ok = okFor(d);
+		ok.insert(ok.find("Contact:"), recordRoute);
+		return ok;
+	}
+
+	const std::string kRouteHeader = "Route: <sip:198.51.100.7:5070;lr>, <sip:198.51.100.8:5062;lr>";
+}
+
+TEST(SipTrunkRoute, AckAndByeCarryTheRouteSetOnlyWhenThereIsOne)
+{
+	auto d = pinnedDialog();
+	d.toTag        = "carrier-tag";
+	d.remoteTarget = "sip:+15551234567@203.0.113.99:5060";
+
+	EXPECT_EQ(SipTrunk::buildBye(d, "z9hG4bKbye77").find("Route:"), std::string::npos);
+	EXPECT_EQ(SipTrunk::buildAckFor2xx(d, "z9hG4bKack99").find("Route:"), std::string::npos);
+
+	d.routeSet = "<sip:198.51.100.7:5070;lr>, <sip:198.51.100.8:5062;lr>";
+	EXPECT_TRUE(hasLine(SipTrunk::buildBye(d, "z9hG4bKbye77"), kRouteHeader));
+	EXPECT_TRUE(hasLine(SipTrunk::buildAckFor2xx(d, "z9hG4bKack99"), kRouteHeader));
+	// Out of dialog, or in the INVITE's own transaction: no Route.
+	EXPECT_EQ(SipTrunk::buildInvite(d, "v=0\r\n").find("Route:"), std::string::npos);
+	EXPECT_EQ(SipTrunk::buildAckForFailure(d).find("Route:"), std::string::npos);
+}
+
+TEST(SipTrunkRoute, TwoXxRecordRouteIsReversedAndAckAndByeGoToTheFirstHop)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+
+	// As the carrier's UAS copied them: the hop nearest the carrier first.
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okWithRecordRoute(*d,
+		"Record-Route: <sip:198.51.100.8:5062;lr>\r\n"
+		"Record-Route: <sip:198.51.100.7:5070;lr>\r\n"))));
+	EXPECT_EQ(d->routeSet, "<sip:198.51.100.7:5070;lr>, <sip:198.51.100.8:5062;lr>");
+
+	const sockaddr_in hop = FakePbxEnv::addr("198.51.100.7", 5070);
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_EQ(env.sent[1].raw.substr(0, 3), "ACK");
+	EXPECT_TRUE(hasLine(env.sent[1].raw, kRouteHeader));
+	EXPECT_EQ(env.sent[1].to.sin_addr.s_addr, hop.sin_addr.s_addr);
+	EXPECT_EQ(env.sent[1].to.sin_port, hop.sin_port);
+
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	ASSERT_EQ(env.sent.size(), 3u);
+	EXPECT_EQ(env.sent[2].raw.substr(0, 3), "BYE");
+	EXPECT_TRUE(hasLine(env.sent[2].raw, kRouteHeader));
+	EXPECT_EQ(env.sent[2].to.sin_addr.s_addr, hop.sin_addr.s_addr);
+	EXPECT_EQ(env.sent[2].to.sin_port, hop.sin_port);
+
+	// The 200 to the BYE comes back from the hop. An unrelated address is still
+	// dropped as forged (#356), so the hop's is not a blanket allowance.
+	const std::string byeOk = okFor(*d);
+	ASSERT_TRUE(trunk.handleResponse(std::make_shared<SipMessage>(byeOk,
+		FakePbxEnv::addr("198.51.100.99", 5060))));
+	EXPECT_EQ(trunk.forgedDialogResponses(), 1u);
+	EXPECT_EQ(trunk.activeDialogs(), 1u);
+	ASSERT_TRUE(trunk.handleResponse(std::make_shared<SipMessage>(byeOk, hop)));
+	EXPECT_EQ(trunk.forgedDialogResponses(), 1u);
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+}
+
+TEST(SipTrunkRoute, OneRecordRouteLineWithSeveralEntriesIsSplitAndReversed)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okWithRecordRoute(*d,
+		"Record-Route: <sip:198.51.100.8:5062;lr>, <sip:198.51.100.7:5070;lr>\r\n"))));
+	EXPECT_EQ(d->routeSet, "<sip:198.51.100.7:5070;lr>, <sip:198.51.100.8:5062;lr>");
+}
+
+// No Record-Route, a strict-router first hop, or an FQDN hop: the ACK and BYE
+// still go to the peer, as they did before #748.
+TEST(SipTrunkRoute, NoUsableRouteSetLeavesAckAndByeOnThePeer)
+{
+	const char* cases[] = {
+		"",                                                        // none
+		"Record-Route: <sip:198.51.100.7:5070>\r\n",               // strict router
+	};
+	for (const char* rr : cases)
+	{
+		FakePbxEnv env;
+		SipTrunk trunk(env);
+		trunk.setConfig(workingConfig());
+		ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+		const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+		ASSERT_NE(d, nullptr);
+		ASSERT_TRUE(trunk.handleResponse(responseFor(okWithRecordRoute(*d, rr))));
+		ASSERT_TRUE(trunk.hangup("handset-1"));
+		ASSERT_EQ(env.sent.size(), 3u) << rr;
+		for (size_t i = 1; i < 3; ++i)
+		{
+			EXPECT_EQ(env.sent[i].raw.find("Route:"), std::string::npos) << rr;
+			EXPECT_EQ(env.sent[i].to.sin_addr.s_addr, sbcAddr().sin_addr.s_addr) << rr;
+		}
+	}
+
+	// An FQDN hop keeps its Route header (the carrier's proxy reads it) but
+	// cannot be resolved here, so the packet still goes to the peer.
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okWithRecordRoute(*d,
+		"Record-Route: <sip:sbc.carrier.example;lr>\r\n"))));
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_TRUE(hasLine(env.sent[1].raw, "Route: <sip:sbc.carrier.example;lr>"));
+	EXPECT_EQ(env.sent[1].to.sin_addr.s_addr, sbcAddr().sin_addr.s_addr);
+}
+
+// #775 review: the 407/401 retry of a BYE is an in-dialog request like the one it
+// answers, so it carries the same Route set and goes to the same first hop. Left
+// on d.peer it reached the carrier with a Route naming a proxy it had skipped.
+TEST(SipTrunkRoute, ByeChallengeRetryGoesToTheFirstHopWithTheRouteSet)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.setCredentials("s3cret-775"));
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okWithRecordRoute(*d,
+		"Record-Route: <sip:198.51.100.8:5062;lr>\r\n"
+		"Record-Route: <sip:198.51.100.7:5070;lr>\r\n"))));
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	ASSERT_EQ(env.sent.size(), 3u) << "INVITE, its ACK, the BYE";
+	const sockaddr_in hop = FakePbxEnv::addr("198.51.100.7", 5070);
+	ASSERT_EQ(env.sent[2].to.sin_addr.s_addr, hop.sin_addr.s_addr) << "positive control: the first BYE goes to the hop";
+
+	// The challenge comes back from the hop that took the BYE.
+	ASSERT_TRUE(trunk.handleResponse(std::make_shared<SipMessage>(
+		byeResponseFor(*d, 407, "Proxy-Authenticate"), hop)));
+
+	ASSERT_EQ(env.sent.size(), 4u);
+	EXPECT_EQ(env.sent[3].raw.substr(0, 3), "BYE");
+	EXPECT_NE(env.sent[3].raw.find("\r\nProxy-Authorization: Digest"), std::string::npos);
+	EXPECT_TRUE(hasLine(env.sent[3].raw, kRouteHeader));
+	EXPECT_EQ(env.sent[3].to.sin_addr.s_addr, hop.sin_addr.s_addr)
+		<< "the retry follows the Route set to its first hop, not the carrier peer";
+	EXPECT_EQ(env.sent[3].to.sin_port, hop.sin_port);
+}
+
+// ── Timer B on our INVITE (#726) ─────────────────────────────────────────────
+
+TEST(SipTrunkListener, InviteTimerBFailsATryingDialogAsFourOhEight)
+{
+	// RFC 3261 §17.1.1.2: the INVITE client transaction gave up (no response at
+	// all in 64*T1). The dialog ends the way sweep()'s deadline ends it -- 408
+	// to the listener, slot released first -- without waiting for the deadline.
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	lis.trunk = &trunk;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	// The layer hands over SipMessage::getCallID()'s form, the full header line.
+	const std::string trunkCallId = "Call-ID: " + d->callID;
+
+	EXPECT_FALSE(trunk.handleInviteTimeout("Call-ID: not-a-trunk-dialog@x"))
+		<< "an unknown Call-ID is not ours";
+	ASSERT_TRUE(trunk.handleInviteTimeout(trunkCallId));
+
+	ASSERT_EQ(lis.events.size(), 1u);
+	EXPECT_EQ(lis.events[0].kind, "failed");
+	EXPECT_EQ(lis.events[0].status, 408) << "a give-up is a timeout in the RFC 3261 sense";
+	EXPECT_EQ(lis.events[0].handsetCallID, "handset-1");
+	EXPECT_EQ(lis.dialogsSeenDuringFailure, 0u) << "the slot is free before the listener hears of it";
+	EXPECT_EQ(trunk.activeDialogs(), 0u);
+	EXPECT_FALSE(trunk.handleInviteTimeout(trunkCallId)) << "a second report finds nothing";
+}
+
+TEST(SipTrunkListener, InviteTimerBIsIgnoredOnceTheCarrierHasAnswered1xx)
+{
+	// §17.1.1.2: Timer B is a Calling-state timer, so a report on a dialog that
+	// has drawn a provisional is stale. It is refused, and the dialog keeps
+	// ringing under sweep()'s deadline (or none, for a Proceeding 911, #712).
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string trunkCallId = "Call-ID: " + d->callID;
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 180 Ringing"))));
+	lis.events.clear();
+
+	EXPECT_FALSE(trunk.handleInviteTimeout(trunkCallId));
+
+	EXPECT_TRUE(lis.events.empty()) << "nothing was failed";
+	EXPECT_EQ(trunk.activeDialogs(), 1u) << "the ringing dialog is kept";
+}
+
+TEST(SipTrunkListener, InviteTimerBReleasesADialogHungUpInTryingWithNoSecondEvent)
+{
+	// #794 holds the slot of a dialog hung up before any provisional (RFC 3261
+	// §9.1: no CANCEL yet), and Timer B ends a Trying dialog. The handset was
+	// answered when it hung up, so Timer B frees the held slot without a 408
+	// to the listener: one teardown, not two.
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string trunkCallId = "Call-ID: " + d->callID;
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	ASSERT_EQ(trunk.activeDialogs(), 1u) << "precondition: #794 holds the slot";
+	env.sent.clear();
+
+	ASSERT_TRUE(trunk.handleInviteTimeout(trunkCallId));
+
+	EXPECT_TRUE(lis.events.empty()) << "the handset already hung up: no 408 to relay";
+	EXPECT_EQ(trunk.activeDialogs(), 0u) << "the held slot is released";
+	EXPECT_TRUE(env.sent.empty()) << "no provisional came, so still no CANCEL";
+
+	trunk.sweep(std::chrono::steady_clock::now() + std::chrono::seconds(33));
+	EXPECT_TRUE(lis.events.empty()) << "and #794's own Timer B deadline finds nothing left";
 }

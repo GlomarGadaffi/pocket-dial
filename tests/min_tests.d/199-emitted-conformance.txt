@@ -1,0 +1,2 @@
+# EmittedConformance_test.cpp: 25 scenarios (Part of #199: every message the PBX sends, recorded for tests/conformance)
+25

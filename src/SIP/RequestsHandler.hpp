@@ -14,6 +14,7 @@
 #include <lwip/sockets.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 #elif defined(__linux__)
 #include <netinet/in.h>
 #elif defined _WIN32 || defined _WIN64
@@ -35,6 +36,8 @@
 #include <chrono>
 #include <array>
 #include <thread>   // host-build async anchor-start worker (_anchorStartThread below)
+#include <condition_variable>   // host-build tel_ctl pool (#657)
+#include <deque>
 #include "SipMessage.hpp"
 #include "SipClient.hpp"
 #include "Session.hpp"
@@ -115,6 +118,8 @@ public:
 	// of the same empty pool).
 	static std::shared_ptr<SipMessage> getMessageFromPool(std::string_view message, sockaddr_in src);
 	static std::shared_ptr<SipMessage> getMessageFromPool(const SipMessage& source);
+	// #838: a datagram off the socket; see sipmsgpool::getMessageFromWire.
+	static std::shared_ptr<SipMessage> getMessageFromWire(std::string_view message, sockaddr_in src);
 
 	// ── Media beachhead static helpers (pure; host-unit-tested) ──────────────────
 	// Build the server's own SDP body for the 440 answer (server media: PCMU on the
@@ -156,7 +161,10 @@ public:
 	}
 	std::vector<std::pair<std::string, std::string>> getActiveClients();
 	std::vector<std::tuple<std::string, std::string, std::string, int>> getActiveSessions();
-	void forceDisconnect(const std::string& extension);
+	// Ends every call the extension is on and de-registers it. Returns false, having
+	// changed nothing, when the extension is on an emergency (911/933) call: an admin
+	// kill never ends one (#714, desmo).
+	bool forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
 	// Issue #430: packetsDropped split by reason (their sum), and the probe
@@ -182,6 +190,13 @@ public:
 	// Counted whether the refusal went out as a 488 (requests) or as a silent
 	// drop (responses, ACK).
 	uint64_t getSdpRejected() const;
+	// #199: requests/responses refused by the header gate (400/420/415 or a
+	// drop), and emergency requests the gate let through despite a violation.
+	uint64_t getHeaderRejected() const { return _headerRejected.load(std::memory_order_relaxed); }
+	uint64_t getEmergencyHeaderYields() const { return _emergencyHeaderYields.load(std::memory_order_relaxed); }
+	// #838: datagrams that reached the header gate cut at
+	// SipLimits::kMaxHeaderLines. Not on /api/status.
+	uint64_t getHeaderLineCuts() const { return _headerLineCuts.load(std::memory_order_relaxed); }
 	// Issue #409: draws refused because a pool was spent -- there is no heap
 	// fallback behind either pool. The message pool is process-global.
 	uint64_t getVirtualPeerRefusals() const { return _vpeerRefusals.load(std::memory_order_relaxed); }
@@ -192,6 +207,8 @@ public:
 	uint32_t getTrunkForgedDialogResponses() const { return _sipTrunk.forgedDialogResponses(); }
 	// Issue #666: trunk BYEs refused with 403 by the #356 check.
 	uint32_t getTrunkRefusedDialogByes() const { return _sipTrunk.refusedDialogByes(); }
+	// #741: emergency calls ended after 4 h with no RTP on either leg.
+	uint32_t getEmergencyRtpReaps() const { return _emergencyRtpReaps.load(std::memory_order_relaxed); }
 	// Issue #497: INVITEs refused because they did not come from the caller's
 	// registered address (the 403 "Caller Not Registered From This Address").
 	uint64_t getUnboundCallerRefusals() const { return _unboundCallerRefusals.load(std::memory_order_relaxed); }
@@ -202,6 +219,21 @@ public:
 	// buffer (#463). Not reachable with a real AOR and IPv4 address; counted so
 	// a clipped request can never go out silently.
 	uint32_t getOptionsPingTruncated() const { return _optionsPingTruncated.load(std::memory_order_relaxed); }
+	// #864: ARP requests for unanswered Learn REGISTERs (AuthDecision::Drop). One
+	// of the last kArpRequestSources sources is asked again only after
+	// kArpRequestWindow, and at most kArpRequestsPerWindow go out per window in
+	// all. Hygiene, not a security boundary: a request makes no table entry, a
+	// forged source never replies, and an on-link attacker can ARP-spoof anyway.
+	// The count is of requests held back by either limit.
+	static constexpr size_t kArpRequestsPerWindow = 16;
+	static constexpr size_t kArpRequestSources = 4;
+	static constexpr std::chrono::milliseconds kArpRequestWindow{1000};
+	uint32_t getLearnArpRequestsLimited() const { return _learnArpRequestsLimited.load(std::memory_order_relaxed); }
+	// Server BYEs sipb::bye() refused (#744): too long for sipb::kMaxByeBytes, or
+	// a field empty or carrying a control byte. The far leg got no BYE and stays
+	// up until it hangs up or the session sweep; a dialog's From and To are not
+	// bounded on ingress (#870).
+	uint32_t getByeTruncated() const { return _byeTruncated.load(std::memory_order_relaxed); }
 	size_t getClientCount();
 	size_t getSessionCount();
 	// Legs currently mixed on the meet-me conference (virtual extension 888); 0 while
@@ -302,9 +334,6 @@ public:
 	std::tuple<std::string, std::string, std::string> getE911Config();
 	std::vector<std::tuple<std::string, std::string, std::string>> getRingGroups();
 
-	// Parked calls snapshot for the TUI: {orbit, parkedExt, parker, secondsParked}.
-	std::vector<std::tuple<std::string, std::string, std::string, int>> getParkedCalls();
-
 	// Paging zones (980–989). setPageZone replaces a zone's membership; an empty
 	// member list deletes the zone. Thread-safe and NVS-persisted. The getter
 	// returns {zoneExt, "m1,m2,..."} pairs for the dashboard.
@@ -402,6 +431,12 @@ public:
 	// "anchor", "trunk", "trunk-unverified" or "none": the /api/status spelling.
 	static const char* emergencyRouteName(EmergencyRoute r);
 
+	// #657: the anchor's call-control pool (see startTelCtl()). makeCall and
+	// answerCall share these workers; past kTelCtlDepth waiting, a call is refused.
+	static constexpr int kTelCtlWorkers = POCKETDIAL_MAX_ANCHOR_CALLS < 2 ? POCKETDIAL_MAX_ANCHOR_CALLS : 2;
+	static constexpr int kTelCtlDepth = POCKETDIAL_MAX_ANCHOR_CALLS;
+	enum TelLane : uint8_t { kLaneCtl, kLaneDrop, kLaneSos, kTelLanes };
+
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only (Issue #521). Every host test boots the loopback anchor, which
 	// can never carry an emergency call. This lets it stand in for a real
@@ -412,6 +447,73 @@ public:
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_anchorPlacesRealCalls = real;
+	}
+	// Test-only (#713). The host build boots the loopback anchor, which is
+	// synchronous, so originateAnchorCall()'s ASYNC branch (a real anchor's
+	// 180 Ringing + asyncMakeCall()) never runs in a host test. This flips the
+	// calling convention over the loopback client so that branch can be
+	// driven. The CallEvent callback stays unwired (see the constructor), so
+	// no worker event ever completes such a call: it ends by CANCEL, by the
+	// ring reap, or by the refusal path below. Starts the tel_ctl pool, as a
+	// real anchor's boot does.
+	void forceAsyncAnchorForTest(bool on)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_anchorBootType = on ? TelephonyProviderType::Telephony : TelephonyProviderType::Loopback;
+		if (on) startTelCtl();
+	}
+	// Test-only (#713): the next asyncMakeCall() is refused as if the tel_ctl
+	// queue were full.
+	void failNextAnchorWorkerSpawnForTest()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_failNextAnchorWorkerSpawn = true;
+	}
+	// Test-only (#878 review S-B3): the next originateAnchorCall() on a
+	// connected anchor answers the INVITE 503 and returns false WITHOUT setting
+	// refusedBeforeDispatchOut, the shape a future path that answers could
+	// take. No fallback may follow it.
+	void answerThenFailNextAnchorCallForTest()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_answerThenFailNextAnchorCall = true;
+	}
+	// Test-only (#657): each tel_ctl worker parks after taking a job, as one
+	// stuck in makeCall's TLS round trip would. tel_drop and tel_sos run on.
+	void holdTelCtlForTest(bool on)
+	{
+		{
+			std::lock_guard<std::mutex> lock(_telCtlMutex);
+			_telCtlHeld = on;
+		}
+		_telCtlCv.notify_all();
+	}
+	int telCtlParkedForTest()
+	{
+		std::lock_guard<std::mutex> lock(_telCtlMutex);
+		return _telCtlParked;
+	}
+	// Test-only (#657): startTelCtl() gets no worker for `lane`, as when its
+	// 12 KB stack cannot be allocated at boot. Call before the pool starts.
+	void failTelCtlLaneForTest(TelLane lane)
+	{
+		std::lock_guard<std::mutex> lock(_telCtlMutex);
+		_telCtlNoWorker |= 1u << lane;
+	}
+	// Test-only (#659): move every 911/933 dial mark `d` into the past.
+	void ageEmergencyCallbacksForTest(std::chrono::steady_clock::duration d)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_emergencyCallbacks.ageForTest(d);
+	}
+	// Test-only (#726): move every armed client give-up timer (Timer B/F) into
+	// the past, so the next tick() fires it. The trunk's own deadline is left
+	// alone -- expireTrunkDeadlinesForTest() is that -- so a test can tell
+	// which of the two ended a call.
+	void expireTransactionTimersForTest()
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_txLayer.expireClientTimeoutsForTest();
 	}
 #endif
 
@@ -462,6 +564,19 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #589 review: age the in-flight splice transactions so a test can reach the 64*T1 sweep.
+	void ageSpliceTxnsForTest(std::chrono::steady_clock::duration d)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (auto& t : _spliceTxns) t.since -= d;
+	}
+	// #808: run the transaction layer's timers as of `now`, so a test can carry a
+	// BYE past Timer F (32 s) without waiting for it.
+	void sweepTransactionsForTest(std::chrono::steady_clock::time_point now)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_txLayer.sweep(now);
+	}
 	// #479: the boot-built conference room, so a test can make its driver fail.
 	ConferenceRoom* conferenceForTest() { return _conference.get(); }
 	// #479: as a POCKETDIAL_CONFERENCE=0 build, which never builds the room.
@@ -481,6 +596,16 @@ public:
 		pkt.payload = payload;
 		pkt.payloadLen = sizeof(payload);
 		return (fromCarrier ? _trunkRx[slot] : _handsetRx[slot]).dispatchRaw(pkt);
+	}
+	// #861: where a trunk call's relay sends the handset's audio toward the carrier.
+	bool trunkCarrierPeerForTest(const std::string& callID, sockaddr_in& out)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		auto sit = _sessions.find(callID);
+		if (sit == _sessions.end() || !sit->second->isTrunk()) return false;
+		const int slot = sit->second->getTrunkRelaySlot();
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS)) return false;
+		return _trunkRx[slot].rawPeerForTest(out);
 	}
 
 	// What the resolver currently knows about the configured SBC host. Refused
@@ -604,17 +729,15 @@ public:
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint
 	// (default "1001", NVS namespace "pbxcfg", key "admin_ext") now lives on
-	// DtmfFeatureCodes (see _dtmf below); this forwards to _dtmf.adminExt().
-	// cppcheck suggests returning `const std::string&` here (returnByReference).
-	// Deliberately not applied: DtmfFeatureCodes's _adminExt is mutated by its
-	// saveAdminExt()/load() from other call paths with no lock of its own
-	// (callers of this getter are not required to hold _mutex — dashboard/HTTP
-	// reads go through here off the SIP thread). Returning by value at least
-	// keeps the caller's copy independent once this call returns; a reference
-	// would additionally dangle/tear if a concurrent save reallocates the
-	// string while the caller still holds it.
+	// DtmfFeatureCodes (see _dtmf below); this forwards to _dtmf.adminExt()
+	// under _mutex. Returned by value: a reference would dangle once the lock
+	// is released and setAdminExt() reallocates the string.
 	// cppcheck-suppress returnByReference
-	std::string getAdminExt() const;
+	std::string getAdminExt();
+	// #483: config import restores it. False if `ext` is not a dial token of at
+	// most 31 characters (DtmfFeatureCodes::load() reads 32 bytes) or could not
+	// be persisted.
+	bool setAdminExt(const std::string& ext);
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only: redirect the Telephony-API / DID-mapping host-file stores to
@@ -688,6 +811,15 @@ public:
 		return bindOutboundParticipant(callId, ownLeg);
 	}
 
+	// Test-only (issue #379): what the anchor event callback does on
+	// CallEvent::MediaNeverOpened. The callback is wired only for a real anchor,
+	// never the host suite's Loopback. Not compiled into device firmware.
+	void anchorMediaNeverOpenedForTest(const std::string& participantId)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		anchorMediaNeverOpenedLocked(participantId);
+	}
+
 	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
 	// anchor's CallEvent::Incoming does, and return the new session's Call-ID
 	// line ("" if routing declined). Without this no host test can reach an
@@ -730,12 +862,42 @@ public:
 		}
 		for (auto& event : localOutbox) _onHandled(event.first, std::move(event.second));
 	}
-	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
-	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned)
+	// Test-only (#820): lapse `ext`'s lease but keep the binding in the pool, as
+	// between its expiry and the next sweep; the next handle() does not sweep.
+	void expireLeaseUnsweptForTest(const std::string& ext)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		_registrar.adoptDeviceForTest(mac, ext, state);
+		if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
+		_lastSweep = std::chrono::steady_clock::now();
+	}
+	// Test-only (#877 follow-up S1): lapse `ext`'s lease and let the next
+	// handle() sweep, so one pass both reads the binding and prunes it.
+	void expireLeaseForNextSweepForTest(const std::string& ext)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
+		_lastSweep = std::chrono::steady_clock::time_point{};
+	}
+	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
+	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned,
+		bool locked = false)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_registrar.adoptDeviceForTest(mac, ext, state, locked);
 		refreshDeviceSnapshot();
+	}
+	// Test-only (#515): Learn's minimum lock age; fixtures that REGISTER on the real clock set 0.
+	void setLearnLockMinAgeForTest(std::chrono::seconds age)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_registrar.setLockMinAgeForTest(age);
+	}
+	// Test-only (#864): make every recorded ARP request `d` older.
+	void ageArpRequestsForTest(std::chrono::steady_clock::duration d)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (auto& s : _arpRequestSlots) s.at -= d;
+		_arpWindowStart -= d;
 	}
 	// Test-only (#550): bind a client WITHOUT onRegister's identity guard, so a
 	// test can stand up the state the guard now forbids (a client named like an
@@ -772,6 +934,8 @@ public:
 	// Forget a device entirely (drops the adoption record; a later REGISTER re-learns
 	// it in Learn mode). Accepts a MAC or an extension. Thread-safe + persisted.
 	bool forgetDevice(const std::string& macOrExt);
+	// #515: forget every Learned device at once; Secured ones stay. Thread-safe + persisted.
+	size_t forgetLearnedDevices();
 
 private:
 	void initHandlers();
@@ -823,6 +987,11 @@ private:
 	// responses, which take none, are dropped. Either way the body never reaches
 	// a decoder or a peer phone. Called from handle() under _mutex.
 	void rejectSdp(const std::shared_ptr<SipMessage>& request, SipMessage::SdpVerdict verdict);
+	// #199 header admission failure, same shape as rejectSdp(): a request gets
+	// 400 (+Warning), 420 (+Unsupported: <tag>) or 415 (+Accept); ACK and
+	// responses are dropped. Called from handle() under _mutex.
+	void rejectHeaders(const std::shared_ptr<SipMessage>& request,
+		SipMessage::HeaderVerdict verdict, std::string_view unsupported);
 
 	// onSubscribe: thin dispatch-table shim into the BlfSubscriptions machine
 	// (see BlfSubscriptions.hpp). Called from handle() — caller holds _mutex.
@@ -869,6 +1038,20 @@ private:
 	{
 		_txLayer.freeForCallId(callId);
 	}
+	void endSession(std::string_view callId, std::string_view reason) override
+	{
+		// Numbers read before endCall() recycles the pooled Session.
+		std::string src, dest;
+		if (auto s = getSession(callId); s.has_value())
+		{
+			if (auto c = s.value()->getSrc()) src = c->getNumber();
+			if (auto c = s.value()->getDest()) dest = c->getNumber();
+		}
+		endCall(callId, src, dest, reason);
+	}
+	// #726: a client transaction gave up (Timer B/F). Routed by Call-ID; the
+	// definition says which legs act on it and why the rest only log.
+	void onClientTransactionTimeout(std::string_view callId, std::string_view cseqMethod) override;
 	void log(std::string msg, bool isError = false) override
 	{
 		queueLog(std::move(msg), isError);
@@ -954,7 +1137,8 @@ private:
 	// Issue #400: point relay pair `slot` at the carrier's SDP in `carrier` and
 	// start its handset-facing half if not already up. 0 on success, else the
 	// status to refuse the handset with (502 unusable carrier RTP, 500 local).
-	int bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessage>& carrier);
+	// #861: `emergency` (a 911/933) skips the usable-address check.
+	int bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessage>& carrier, bool emergency);
 	void onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 		const std::shared_ptr<SipMessage>& ok) override;
 	void onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status) override;
@@ -1114,6 +1298,8 @@ private:
 	void refreshParkSnapshot();
 
 	bool setCallState(std::string_view callID, Session::State state);
+	// #690: records how the call ended, next to (not instead of) setCallState().
+	bool setCallDisposition(std::string_view callID, Session::Disposition disposition);
 	void endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason = "");
 
 	// CDR ring buffer moved to CdrRing.hpp (see _cdr below); endCall() now calls
@@ -1494,11 +1680,7 @@ public:
 		auto localOutbox = drainOutbox();
 		auto localLogs = std::move(_logQueue);
 		_logQueue.clear();
-		for (const auto& log : localLogs)
-		{
-			if (log.first) std::cerr << log.second << '\n';
-			else std::cout << log.second << '\n';
-		}
+		printLogs(localLogs);
 		for (auto& event : localOutbox)
 		{
 			_onHandled(event.first, std::move(event.second));
@@ -1590,12 +1772,40 @@ private:
 	// Issue #166 part 2: fire the Kari's Law notification. Called ONLY after
 	// the emergency call leg (or its 503) has already been enqueued, so a
 	// notification can never delay or displace the call. Caller holds _mutex.
+	// `note` names what failed (desmo, #878): the route when `routed` is
+	// false, or the anchor a trunk call stood in for.
 	void notifyEmergency(const pbx::EmergencyDial& emergency,
-		const std::string& fromExt, const std::string& dialed, bool routed);
+		const std::string& fromExt, const std::string& dialed, bool routed,
+		std::string_view note = {});
 
 	void routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller,
 		const pbx::EmergencyDial& emergency, const std::string& dialed);
+
+	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
+	// pbx::kEmergencyCallbackWindow). Every path that creates a session for an
+	// inbound call to an extension asks this: onInvite's direct call and
+	// routeInboundAnchorCall today, the trunk's inbound (#398) when it lands.
+	// Caller holds _mutex.
+	bool isEmergencyCallback(std::string_view ext) const
+	{
+		return _emergencyCallbacks.open(ext, std::chrono::steady_clock::now());
+	}
+
+	// #759's emergency yield: the one decision handle()'s header gate and its
+	// second-audio-stream cap both ask, and only when one would refuse. True for
+	// an INVITE to 911/933/sos or marked Priority: psap-callback; for anything on
+	// a live emergency session, by the handset's Call-ID or by its trunk
+	// dialog's own (#818); and for a dialog-initial INVITE that is a PSAP
+	// callback by #659's window (#818) or a 911 a dial-plan rule produces (#834).
+	// Caller holds _mutex.
+	bool isEmergencyTraffic(const SipMessage& m);
+	// #818: an INVITE's callee is inside #659's callback window: the To user,
+	// or for a carrier INVITE the extension its DID maps to. Caller holds _mutex.
+	bool isPsapCallbackTo(const SipMessage& m);
+	// #834: a dial-plan Trunk rule turns `dialed` into 911/933 in onInvite;
+	// `emergencyOut`, when non-null, gets that number.
+	bool dialRuleMakesEmergency(const std::string& dialed, std::string* emergencyOut = nullptr) const;
 
 	// emergencyRoute() for a caller that already holds _mutex.
 	EmergencyRoute emergencyRouteLocked() const;
@@ -1611,6 +1821,42 @@ private:
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
 		bool* placedOut);
 
+#if POCKETDIAL_TRUNK_INBOUND
+	// #398: is `src` the trunk's SBC? The configured transport address from the
+	// resolver's cache (never a blocking resolve), IP only, as #356 compares.
+	bool isTrunkSbcSource(const sockaddr_in& src);
+	// #398: the extension a carrier INVITE's DID is mapped to, or empty.
+	std::string trunkDidExtension(const SipMessage& m) const;
+	// #398: a new INVITE from the SBC: refused with a final (part B), or forked
+	// to the DID's extension (part C). Caller holds _mutex.
+	void routeInboundTrunkCall(const std::shared_ptr<SipMessage>& data);
+	// #398 part C: take the carrier's INVITE (SipTrunk::acceptCall), claim a
+	// relay pair and fork an INVITE with our offer to `handset` on a Call-ID of
+	// its own. 0 when it is ringing; otherwise the final to refuse it with.
+	int forkInboundTrunkCall(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<SipClient>& handset);
+	// A response from the handset to that fork, from any response handler:
+	// relayed to the carrier as 180, an answer, or a refusal. True if claimed.
+	bool handleTrunkInboundReply(const std::shared_ptr<SipMessage>& data);
+	// ACK the handset's final to the fork: a failure's in the INVITE's own
+	// transaction (RFC 3261 s17.1.1.3), a 2xx's as a new one (s13.2.2.4).
+	void ackTrunkInboundFork(const std::shared_ptr<Session>& s, const std::shared_ptr<SipMessage>& resp);
+	bool isTrunkInbound(const Session& s) const;
+	// The RTP address an offer or answer names, only when its c= is a dotted
+	// quad that is neither 0.0.0.0 nor broadcast: a relay is never aimed at one.
+	bool trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out);
+	// #398 part D. A request in the fork's own INVITE transaction (the INVITE,
+	// or its CANCEL, RFC 3261 s9.1): one Request-URI, Via branch, From and To.
+	std::shared_ptr<SipMessage> trunkForkRequest(const Session& s, const SipClient& handset,
+		std::string_view method, const std::string& sdp = {});
+	// CANCEL a still-ringing fork; its 487 (or the re-armed timer) ends the call.
+	void cancelTrunkInboundFork(const std::shared_ptr<Session>& s);
+	// End a carrier's call to us from a PBX-side reason: BYE the handset (it is
+	// dest; src is the caller's stand-in) or CANCEL its fork, onto `out`, then
+	// endCall(), which ends the carrier leg (SipTrunk::hangup()) and the relay.
+	void endTrunkInboundCall(const std::string& callID, const std::shared_ptr<Session>& s,
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& out, const std::string& reason);
+#endif
+
 	// `placedOut` (optional, Issue #166): true only when a call was actually
 	// dispatched. The bool RETURN means "took ownership of the INVITE" and is
 	// true for every refuse() path too, so a caller that must report what really
@@ -1623,10 +1869,19 @@ private:
 	// #166) would otherwise race the generic 488 this gate already sent, giving
 	// one INVITE two final responses. Every other caller passes nullptr and gets
 	// the original behaviour unchanged.
+	//
+	// `refusedBeforeDispatchOut` (optional, #878 Phase A): when non-null, a
+	// refusal before anything has left for the anchor (no anchor connected,
+	// every bridge busy, the session or virtual-peer pool spent, a 911's worker
+	// queue full) answers nothing: it sets *refusedBeforeDispatchOut and returns
+	// false, so routeEmergencyCall() can still try the trunk. routeEmergencyCall()
+	// tries it only when the flag is set. So every false return must either
+	// answer the INVITE or set the flag: one that does neither leaves the caller
+	// with no final response, and each retransmission re-routes and re-notifies.
 	bool originateAnchorCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
 		bool respondIfDisconnected, bool* placedOut = nullptr,
-		bool* codecRejectedOut = nullptr);
+		bool* codecRejectedOut = nullptr, bool* refusedBeforeDispatchOut = nullptr);
 
 	// First anchor media bridge with no active call, or nullptr if every slot is
 	// busy (onAnchorInvite() then answers 503 Service Unavailable, mirroring the
@@ -1655,6 +1910,10 @@ private:
 	// Anchored calls currently up. Caller holds _mutex.
 	unsigned activeAnchorCalls() const;
 
+	// #624: when the anchor is full, end one non-emergency anchored call so a
+	// 911/933 can take its room. Caller holds _mutex.
+	void preemptAnchorCallForEmergency();
+
 	// True iff the currently-selected anchor provider is Loopback — the boundary
 	// between the two calling conventions this port has to support:
 	//   * Loopback: makeCall()/dropCall()/answerCall() are cheap, bounded
@@ -1679,13 +1938,17 @@ private:
 	// makeCall()/dropCall()/answerCall() on a real anchor are blocking TLS HTTP
 	// round trips — calling them under _mutex would stall the whole SIP thread for
 	// the length of that HTTP call (this codebase's "no blocking I/O under the
-	// registrar lock" invariant). Each wrapper spawns a PSRAM-stack worker task
-	// (ESP: xTaskCreateWithCaps, 12288 bytes — 4096 bootlooped on real hardware,
-	// the TLS handshake needs the headroom) or a host worker thread (via
-	// spawnAnchorWorker(), reaped in tick()/the destructor) that calls the real
-	// method off the SIP thread, then re-takes _mutex only to log/react. Never
-	// called for a synchronous (Loopback) anchor — see anchorIsSynchronous().
-	void asyncMakeCall(const std::string& destination, const std::string& callId, const std::string& callerNumber);
+	// registrar lock" invariant). Each wrapper posts a job to the tel_ctl pool
+	// (#657, below), whose worker calls the real method off the SIP thread, then
+	// re-takes _mutex only to log/react. A synchronous (Loopback) anchor has no
+	// pool: asyncDropCall()/asyncAnswerCall() call it inline, as endCall() does.
+	// #713: false when the job was refused. The call is then already answered
+	// 503 and ended here; the caller must not report it as placed. `emergency`
+	// (a 911/933) takes the sos lane, which ordinary setup never fills.
+	// #878 Phase A: `published` false queues the job before the call's session
+	// is published or answered; a refusal then answers and ends nothing.
+	bool asyncMakeCall(const std::string& destination, const std::string& callId, const std::string& callerNumber,
+		bool emergency, bool published = true);
 	// 503 a still-ringing outbound anchor call off its stored INVITE (endCall()
 	// sends no response itself). Caller holds _mutex; outbox is _outbox on the
 	// SIP thread or _asyncOutbox from a worker.
@@ -1693,6 +1956,8 @@ private:
 		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox);
 	void asyncDropCall(const std::string& participantId);
 	void asyncAnswerCall(const std::string& participantId);
+	// Issue #379: CallEvent::MediaNeverOpened. Caller holds _mutex.
+	void anchorMediaNeverOpenedLocked(const std::string& participantId);
 
 	// Bind an outbound call's own leg (from asyncMakeCall's successful makeCall())
 	// to its session, so the CallEvent::Answered/Dropped callback can match this
@@ -1705,29 +1970,66 @@ private:
 	// party.
 	bool bindOutboundParticipant(const std::string& callId, const std::string& ownLeg);
 
-#if !defined(ESP_PLATFORM) && !defined(ESP32)
-	// Host-only worker-thread pool backing the async wrappers above (mirrors
-	// drawbridge's own spawnAnchorWorker/reapAnchorWorkers exactly — ESP has no
-	// equivalent because xTaskCreateWithCaps tasks self-delete). A detached
-	// std::thread here would capture `this` and could outlive the handler in the
-	// unit-test process (the exact hazard _anchorStartThread above already guards
-	// against for the one-time start() call) — these run per CALL instead of once,
-	// so they need their own pool, joined opportunistically here and drained in
-	// ~RequestsHandler().
-	struct AnchorWorker
+	// ── #657: the tel_ctl pool ───────────────────────────────────────────────────
+	// Workers created once, at boot, behind bounded queues: a call creates no
+	// task (it used to create a 12 KB one per makeCall, answerCall and dropCall,
+	// with no bound), and a burst is refused rather than met with more stacks.
+	// Three lanes, so neither a drop (#379: an undropped leg bills) nor a 911/933
+	// ever waits behind ordinary call setup:
+	//   ctl   kTelCtlWorkers workers: makeCall, answerCall
+	//   drop  one worker: dropCall
+	//   sos   one worker: a 911/933 makeCall
+	// A job is heap-allocated and its pointer queued, as tel_wsw does (a FreeRTOS
+	// queue copies items bytewise). postTelCtl() never blocks, so a worker may
+	// post under _mutex (runTelCtl()'s #379 orphan drop).
+	struct TelCtlJob
 	{
-		std::thread thread;
-		std::shared_ptr<std::atomic<bool>> done;
+		enum Kind : uint8_t { Make, Answer, Drop } kind = Drop;
+		std::string dest;
+		std::string callId;
+		std::string callerNumber;
+		std::string partId;
 	};
-	void spawnAnchorWorker(std::function<void()> job);
-	// Join + erase every worker whose done-flag is set. Caller MUST hold
-	// _anchorWorkMutex.
-	void reapFinishedLocked();
-	// Called from tick(): reap finished anchor workers. drainAll blocks until
-	// every worker has finished (the destructor's belt-and-suspenders join).
-	void reapAnchorWorkers(bool drainAll = false);
-	std::mutex _anchorWorkMutex;
-	std::vector<AnchorWorker> _anchorWorkThreads;
+	static constexpr int kTelSosDepth = POCKETDIAL_MAX_SESSIONS;   // every session a ringing 911
+	// Every session's leg, plus every makeCall in flight on ctl or sos: each can
+	// orphan one (#379).
+	static constexpr int kTelDropDepth =
+		POCKETDIAL_MAX_SESSIONS + kTelCtlWorkers + kTelCtlDepth + 1 + kTelSosDepth;
+	static constexpr int kTelLaneDepth[kTelLanes] = { kTelCtlDepth, kTelDropDepth, kTelSosDepth };
+	// Creation order: when boot memory runs short, 911/933 and drops get their
+	// workers before call setup does.
+	static constexpr TelLane kTelLaneOrder[kTelLanes] = { kLaneSos, kLaneDrop, kLaneCtl };
+	// Idempotent. On the device only the constructor calls it, for a real anchor.
+	void startTelCtl();
+	// Takes ownership. A lane left without a worker at boot posts to tel_ctl
+	// instead. False (job deleted) when that lane is full or has none either.
+	bool postTelCtl(TelCtlJob* job, TelLane lane);
+	void runTelCtl(const TelCtlJob& job);
+#if defined(ESP_PLATFORM) || defined(ESP32)
+	struct TelCtlQueue
+	{
+		RequestsHandler* self = nullptr;
+		QueueHandle_t q = nullptr;
+	};
+	TelCtlQueue _telCtl[kTelLanes];
+	// Never returns: the handler lives as long as the device.
+	static void telCtlTask(void* lane);
+#else
+	void serveTelCtl(TelLane lane);
+	// Runs every queued job, then joins. Outside _mutex: a job takes it.
+	void stopTelCtl();
+	std::mutex _telCtlMutex;   // taken after _mutex, never before it
+	std::condition_variable _telCtlCv;
+	std::deque<TelCtlJob*> _telCtlJobs[kTelLanes];
+	std::thread _telCtlThreads[kTelCtlWorkers + 2];
+	bool _telCtlUp = false;
+	bool _telLaneUp[kTelLanes] = {};   // got a worker (the device keeps a lane's queue only then)
+	unsigned _telCtlNoWorker = 0;   // failTelCtlLaneForTest()
+	bool _telCtlStop = false;
+	bool _telCtlHeld = false;   // holdTelCtlForTest()
+	int _telCtlParked = 0;
+	bool _failNextAnchorWorkerSpawn = false;   // #713 test seam; under _mutex
+	bool _answerThenFailNextAnchorCall = false;   // #878 S-B3 test seam; under _mutex
 #endif
 
 	// ── Inbound anchor call dispatch (Stage B) ────────────────────────────────────
@@ -1758,6 +2060,15 @@ private:
 	// inbound-anchor INVITE transaction — there is no caller to relay it to, so
 	// the server (UAC for this leg) must complete its own transaction.
 	void ackInboundFinal(const std::shared_ptr<Session>& session, const std::shared_ptr<SipMessage>& data);
+
+	// Issue #746: RFC 3261 §17.1.1.3: ACK a non-2xx final to an INVITE this PBX
+	// forked, hop-by-hop, built from the response itself (its Via is the forked
+	// INVITE's, its To carries the leg's tag). No-op for a non-INVITE CSeq.
+	void ackForwardedFinal(const std::shared_ptr<SipMessage>& data);
+
+	// Issue #746 (desmo): a refusing callee with CFNA or voicemail armed is diverted
+	// as the ring timer would after 20 s. True when it took the call.
+	bool divertRefusedCall(const std::shared_ptr<Session>& s, const std::shared_ptr<SipMessage>& data);
 
 	// The handset's 200 OK to one of routeInboundAnchorCall()'s forked INVITEs:
 	// learn its tag + RTP, bring up the media bridge, ACK with our SDP answer
@@ -1821,20 +2132,100 @@ private:
 	std::shared_ptr<SipClient> allocateClient(std::string number, sockaddr_in address, int expiresSeconds);
 	std::shared_ptr<Session> allocateSession(std::string callID, std::shared_ptr<SipClient> src);
 	// Draw a transient virtual-peer SipClient (777/440/park leg) from the fixed pool
-	// instead of make_shared'ing one in the packet handler. Falls back to heap on
-	// exhaustion (graceful, never a crash). Caller holds _mutex.
+	// instead of make_shared'ing one in the packet handler. Refuses (nullptr) on
+	// exhaustion, no heap fallback (#409); every caller answers 503 or abandons
+	// cleanly (#412). Caller holds _mutex.
 	std::shared_ptr<SipClient> allocateVirtualPeer(std::string number, sockaddr_in address, int expiresSeconds = 3600);
 
+	// Answer `req` with a bodiless final status: the request's own Via (received/
+	// rport) and a Contact for `contactExt`. False when the pool refused (#101A:
+	// drop, the peer retransmits), so the caller skips its log line too.
+	bool refuseInvite(const SipMessage& req, const char* statusLine, std::string_view contactExt);
 	// Build a 200 OK with an SDP body for an INVITE (used by 777, park, onReinvite).
+	// `grantSessionTimer` (#198): true only on a leg whose re-INVITE this PBX
+	// answers 200 itself (555/anchor: answerAnchorReinvite); see answerSessionTimer.
 	std::shared_ptr<SipMessage> buildOkWithSdp(const std::shared_ptr<SipMessage>& inviteMsg,
-		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody);
+		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody,
+		bool grantSessionTimer);
 	// Build a server-initiated in-dialog BYE. From/To must include tags because the
 	// dialog role differs per call path (beep = server UAC; park = server UAS).
 	// `cseq` must exceed every CSeq already used on this dialog, by either party or
 	// the server (Session::nextServerCSeq(), #389/#402); 2 is right only when none is known.
+	// ── #453: in-dialog requests across a B2BUA splice ────────────────────────
+	// A splice (call pickup, park retrieve/ring-back, attended/blind transfer)
+	// joins two dialogs with DIFFERENT Call-IDs, linked only by peerCallID. An
+	// in-dialog request from one phone must be REBUILT in the other dialog --
+	// that dialog's Call-ID, tags, a CSeq above everything the PBX sent on it
+	// (#402) and the PBX's own Contact (#425) -- never forwarded as it came.
+	// The far phone's answer comes back onto the originator's own transaction
+	// through a fixed, bounded table (no allocation), and the PBX ACKs the far
+	// leg itself.
+	struct PeerDialog
+	{
+		std::shared_ptr<Session>   peer;
+		std::shared_ptr<SipClient> target;          // the phone on the peer dialog
+		const std::string*         fromHdr = nullptr; // the PBX's side of the peer dialog
+		const std::string*         toHdr   = nullptr; // the target's own URI and tag
+	};
+	// The peer dialog of a spliced session: who to send to and as whom. BYE's
+	// two bridge branches and the in-dialog relay all resolve it the same way.
+	bool resolvePeerDialog(const std::shared_ptr<Session>& s, PeerDialog& out);
+	// The phone that owns a spliced session's dialog (its src, or on a
+	// transfer bridge whichever side the dropped transferor was not).
+	std::shared_ptr<SipClient> ownPartyOf(const std::shared_ptr<Session>& s) const;
+	void relayIntoPeerDialog(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<Session>& session);
+	// A far-leg response to a request relayIntoPeerDialog() sent: answers the
+	// originator and ACKs the far leg. False if it is not one of ours.
+	bool handleSpliceResponse(const std::shared_ptr<SipMessage>& data);
+	// The originator's ACK to the 2xx we answered it with: absorbed, never relayed.
+	bool absorbSpliceAck(const std::shared_ptr<SipMessage>& data);
+	void sweepSpliceTxns(std::chrono::steady_clock::time_point now);
+	void answerSpliceLocally(const std::shared_ptr<SipMessage>& data, const char* statusLine);
+
+	// #589 review (CaveJay B2): the originator's request is NOT held. A pooled
+	// SipMessage stays unreusable while referenced, so eight in-flight splices
+	// pinned eight message-pool slots for up to 32 s, against the pool's +4
+	// headroom (#409/#583 removed the heap fallback behind it). Only the fields
+	// an answer needs are kept, in fixed buffers.
+	// B1: after a final response the slot lingers (AwaitingOriginAck, then
+	// Completed) for 64*T1 so a RETRANSMITTED far-leg final can be re-ACKed with
+	// the same ACK; losing that ACK otherwise makes the far phone BYE the call.
+	struct SpliceTxn
+	{
+		enum class State : uint8_t { Free, AwaitingPeer, AwaitingOriginAck, Completed };
+		State state = State::Free;
+		bool isInvite = false;
+		bool holdOffer = false;               // the offer holds; applied on the peer's 2xx
+		sockaddr_in originSrc{};              // the originator's transaction
+		uint32_t originCSeq = 0;
+		char originVia[256] = {};             // full "Via: ..." line of the originator's request
+		char originFrom[192] = {};            // full header lines
+		char originTo[192] = {};
+		char originCallId[128] = {};          // full "Call-ID: ..." line
+		char originToNumber[48] = {};
+		std::shared_ptr<Session> peer;        // the dialog it was rebuilt into
+		uint32_t peerCSeq = 0;
+		char branch[32] = {};                 // our Via branch toward the peer (non-2xx ACK)
+		char ackBranch[32] = {};              // the branch our ACK for the peer's final used
+		std::chrono::steady_clock::time_point since{};
+	};
+	// Answers the originator's transaction from a slot's stored fields.
+	void answerSpliceOrigin(const SpliceTxn& t, std::string_view statusLine, std::string_view sdpBody);
+	// Builds and sends our ACK for the peer's final response `resp`.
+	void sendSpliceAck(const SpliceTxn& t, const std::shared_ptr<SipMessage>& resp);
+	// One in-flight splice request per slot. Two directions per spliced pair can
+	// be in flight at once; 8 covers several concurrent splices. A full table
+	// answers 500 + Retry-After rather than ever relaying untranslated.
+	static constexpr size_t kSpliceTxns = 8;
+	std::array<SpliceTxn, kSpliceTxns> _spliceTxns{};
+
+	// nullptr when the pool or the builder refuses. `refused` is set for the
+	// builder's refusal (#744: a field it will not send), which, unlike a pool
+	// draw, fails the same way on every retransmit.
 	std::shared_ptr<SipMessage> buildServerBye(const std::string& destExt,
 		const sockaddr_in& destAddr, const std::string& callId,
-		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2);
+		const std::string& fromHeader, const std::string& toHeader, uint32_t cseq = 2,
+		bool* refused = nullptr);
 
 	// Issue #402: record a request's CSeq on its dialog's session, if it has one
 	// and `source` is a party on it. Returns the session found (or nullptr).
@@ -2094,6 +2485,10 @@ private:
 	// simulator and must never be handed an emergency number. Written only
 	// there and by setAnchorPlacesRealCallsForTest(); read under _mutex.
 	bool _anchorPlacesRealCalls = false;
+	// #659: when each extension last dialed 911/933, for the PSAP callback
+	// window. Written by routeEmergencyCall(), read where an inbound call to an
+	// extension creates its session (isEmergencyCallback()); under _mutex.
+	pbx::EmergencyCallbacks _emergencyCallbacks;
 	// Issue #546: the SIP trunk has answered an INVITE with a 2xx since boot /
 	// since setTrunkConfig(). Set in onTrunkAnswered(), cleared by
 	// setTrunkConfig(); under _mutex.
@@ -2159,6 +2554,24 @@ private:
 	std::vector<std::pair<bool, std::string>>                        _rxLogScratch;
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _tickOutboxScratch;
 	std::vector<std::pair<bool, std::string>>                        _tickLogScratch;
+	// #864: the source of a REGISTER onRegister() dropped (AuthDecision::Drop),
+	// which handle() ARPs once _mutex is released. Guarded by _mutex.
+	sockaddr_in _rxArpRequest{};
+	// #864: the sources of the last kArpRequestSources ARP requests, and this
+	// window's count (see getLearnArpRequestsLimited()). Guarded by _mutex;
+	// fixed, no allocation.
+	struct ArpRequestSlot
+	{
+		uint32_t ip = 0;
+		std::chrono::steady_clock::time_point at{};
+	};
+	std::array<ArpRequestSlot, kArpRequestSources> _arpRequestSlots{};
+	std::chrono::steady_clock::time_point _arpWindowStart{};
+	size_t _arpWindowCount = 0;
+	std::atomic<uint32_t> _learnArpRequestsLimited{0};
+	// Records and allows an ARP request for `ip` unless a recorded one went to it
+	// within kArpRequestWindow, or this window's kArpRequestsPerWindow are spent.
+	bool allowArpRequest(uint32_t ip, std::chrono::steady_clock::time_point now);
 
 	// The end of every handle()/tick() pass, in two halves around the lock:
 	// drainPassLocked() under _mutex (take this pass's outbox and log queue into
@@ -2169,6 +2582,9 @@ private:
 	                     std::vector<std::pair<bool, std::string>>& logScratch);
 	void flushPass(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
 	               std::vector<std::pair<bool, std::string>>& logScratch);
+	// Print one drained log batch: errors to stderr, the rest to stdout. Used by
+	// flushPass() and by every config setter that drains _logQueue itself (#702).
+	static void printLogs(const std::vector<std::pair<bool, std::string>>& logs);
 
 	// The inbound message currently being handled, or nullptr outside a handle()
 	// pass (tick() drains with this unset). Used by drainOutbox() for exactly one
@@ -2263,15 +2679,27 @@ private:
 	int         _serverPort;
 
 	std::atomic<uint64_t> _packetsProcessed{0};
-	std::atomic<uint64_t> _packetsDropped{0};
 	DropProbe _dropProbe;   // Issue #430: why each of those was dropped
 	std::atomic<uint64_t> _keepalivesCrlf{0};   // Issue #430: CR/LF-only keep-alives, not drops
 	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
+	std::atomic<uint64_t> _headerRejected{0};         // #199 header admission refusals
+	std::atomic<uint64_t> _emergencyHeaderYields{0};  // #199 911 let through a violation
+	std::atomic<uint64_t> _headerLineCuts{0};         // #838 datagrams cut at 64 header lines
 	std::atomic<uint64_t> _vpeerRefusals{0};   // #409: allocateVirtualPeer() refusals
+	std::atomic<uint32_t> _emergencyRtpReaps{0};   // #741
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
 	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
+#if POCKETDIAL_TRUNK_INBOUND
+	std::chrono::steady_clock::time_point _lastTrunkInboundLog{};   // #398 log rate limit; under _mutex
+	// #398 part C, per relay pair: whether it carries a carrier's call to us, and
+	// the carrier's telephone-event payload type (-1: none), which both legs use
+	// so the relay copies DTMF unchanged. Reset by releaseTrunkRelay().
+	struct TrunkInboundPair { bool inbound = false; int dtmfPt = -1; };
+	std::array<TrunkInboundPair, POCKETDIAL_MAX_TRUNK_CALLS> _trunkInbound{};
+#endif
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
 	std::atomic<uint32_t> _optionsPingTruncated{0};   // #463: see getOptionsPingTruncated()
+	std::atomic<uint32_t> _byeTruncated{0};           // #744: see getByeTruncated()
 	// Requests answered from a §17.2 server transaction's stored response rather
 	// than re-run through the TU. A healthy LAN should sit near zero; a climbing
 	// count is the packet-loss signal this layer exists to absorb, so it is worth
@@ -2301,8 +2729,6 @@ private:
 		// Adopted devices (STAGE 2): {mac, ext, state, online}. Mirrored from the
 		// Registrar's registry under _mutex; copied out under _snapshotMutex.
 		std::vector<AdoptedDevice> devices;
-		uint64_t packetsProcessed = 0;
-		uint64_t packetsDropped = 0;
 	};
 	RegistrarSnapshot _snapshot;
 	// #463: tick() refills this in place and swaps its tables into _snapshot, so

@@ -510,3 +510,94 @@ TEST(TargetRefreshContact, BodilessRefreshUpdateOn777IsAnsweredWithThePbxsOwnCon
 	EXPECT_EQ(atCaller.find(std::string(kCallerIp) + ":5060>"), std::string::npos)
 		<< "#198: echoing the caller's own Contact repoints the caller's dialog at itself";
 }
+
+// ── #709: session-refresh on a parked (700-709) or 440 leg ──────────────────
+// Their "dest" is a stand-in SipClient carrying the CALLER's own address, so a
+// relay sent the phone its own UPDATE back and the PBX never answered it. Same
+// class as the 777 test above.
+
+namespace
+{
+	// INVITE from 100 to a leg the PBX terminates itself (`ext`); returns the To
+	// line (with the PBX's tag) the caller echoes on every in-dialog request.
+	std::string connectLocalLeg(RequestsHandler& handler, Sent& sent, const std::string& ext,
+	                            const std::string& callId)
+	{
+		handler.handle(makeRegister("100", kCallerIp));
+		std::string body = sdpBody("sendrecv");
+		std::string invite =
+			"INVITE sip:" + ext + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bKinv" + callId + "\r\n"
+			"From: <sip:100@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + ext + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:100@" + std::string(kCallerIp) + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		handler.handle(RequestsHandler::getMessageFromPool(invite, addrFor(kCallerIp)));
+
+		std::string setupOk = findSentTo(sent, addrFor(kCallerIp), "CSeq: 1 INVITE");
+		EXPECT_NE(setupOk.find("SIP/2.0 200 OK"), std::string::npos) << "precondition: " << ext << " answers";
+		EXPECT_EQ(headerLine(setupOk, "Contact:"), pbxContactFor(ext))
+			<< "precondition: the setup 200 presents the PBX as " << ext;
+		return headerLine(setupOk, "To:");
+	}
+
+	void expectRefreshAnsweredLocally(const Sent& sent, const std::string& ext)
+	{
+		std::string atCaller = findSentTo(sent, addrFor(kCallerIp), "CSeq: 2 UPDATE");
+		ASSERT_FALSE(atCaller.empty()) << ext << " has no peer: the PBX must answer the refresh itself";
+		EXPECT_EQ(atCaller.compare(0, 14, "SIP/2.0 200 OK"), 0)
+			<< "#709: the first thing sent back must be the 200, not an UPDATE";
+		EXPECT_EQ(headerLine(atCaller, "Contact:"), pbxContactFor(ext))
+			<< "#709: the 200 carries the PBX's Contact, the same identity as the setup 200";
+		EXPECT_EQ(countSentTo(sent, addrFor(kCallerIp), "UPDATE sip:"), 0u)
+			<< "#709: the caller's own UPDATE must never be relayed back to it";
+	}
+}
+
+TEST(TargetRefreshContact, BodilessRefreshUpdateOnAParkedCallIsAnsweredNotRelayedBack)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const std::string callId = "trc-upd-park";
+	const std::string dialogTo = connectLocalLeg(handler, sent, "701", callId);
+
+	handler.handle(callerInDialog("UPDATE", "701", callId, dialogTo, 2, "z9hG4bKupdpark", nullptr));
+
+	expectRefreshAnsweredLocally(sent, "701");
+}
+
+TEST(TargetRefreshContact, BodilessRefreshUpdateOn440IsAnsweredNotRelayedBack)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const std::string callId = "trc-upd-440";
+	const std::string dialogTo = connectLocalLeg(handler, sent, "440", callId);
+
+	handler.handle(callerInDialog("UPDATE", "440", callId, dialogTo, 2, "z9hG4bKupd440", nullptr));
+
+	expectRefreshAnsweredLocally(sent, "440");
+}
+
+TEST(TargetRefreshContact, ReinviteOnAParkedCallIsDeclinedNotRelayedBack)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const std::string callId = "trc-inv-park";
+	const std::string dialogTo = connectLocalLeg(handler, sent, "701", callId);
+
+	handler.handle(callerInDialog("INVITE", "701", callId, dialogTo, 2, "z9hG4bKinvpark", "sendrecv"));
+
+	std::string atCaller = findSentTo(sent, addrFor(kCallerIp), "CSeq: 2 INVITE");
+	ASSERT_FALSE(atCaller.empty()) << "the PBX must answer the re-INVITE";
+	EXPECT_EQ(atCaller.compare(0, 11, "SIP/2.0 488"), 0)
+		<< "#709: a parked leg has no peer; the offer is declined, as on 777/888";
+	EXPECT_EQ(countSentTo(sent, addrFor(kCallerIp), "INVITE sip:"), 0u)
+		<< "#709: the caller's own re-INVITE must never be relayed back to it";
+}

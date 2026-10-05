@@ -86,6 +86,10 @@ void TelephonyAnchorClient::setRewarmIntervalSec(uint32_t)
 #include "TelephonyAnchorLogic.hpp"   // host-tested entity-path tokenizer + URL builders (issue #49)
 #include "PsramTask.hpp"            // #100: PSRAM-backed task stacks (off the scarce internal-RAM heap)
 #include "RtpTaskSlots.hpp"         // #479: pd::rtpslots::kAnchorRxStackBytes (counted in the 72 KB budget)
+#include "EmergencyCall.hpp"        // #743: an emergency makeCall() waits out a tearing-down slot
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+#include "BenchProbe.hpp"           // #384 H1: bench-only anchor faults (docs/BENCH_PROBE.md)
+#endif
 
 static const char* TAG = "TelephonyAnchor";
 
@@ -183,6 +187,8 @@ TelephonyAnchorClient::TelephonyAnchorClient()
 TelephonyAnchorClient::~TelephonyAnchorClient()
 {
 	shutdownImpl();   // non-virtual: never dispatch a virtual call from a destructor
+	// #658: tel_maint holds `this`; it must not outlive the object.
+	if (TaskHandle_t h = _maintHandle.exchange(nullptr)) vTaskDelete(h);
 	// #100: free each slot's done-sem (a raw FreeRTOS handle — CallSlot's dtor won't reclaim it).
 	for (auto& s : _calls)
 	{
@@ -216,6 +222,23 @@ bool TelephonyAnchorClient::start()
 			return false;
 		}
 		_running = true;
+	}
+
+	// #658: the persistent tel_maint task, once. A restart runs this start() on it, so it is
+	// never recreated or deleted here. Internal stack: restart runs stop()/start() (#273 audit
+	// needed before PSRAM).
+	if (!_maintHandle.load(std::memory_order_acquire))
+	{
+		TaskHandle_t h = nullptr;
+		if (xTaskCreate(&TelephonyAnchorClient::maintTaskTrampoline, "tel_maint", 6144, this, 5, &h) != pdPASS)
+		{
+			ESP_LOGE(TAG, "start: failed to create tel_maint (no restart/re-warm/reconcile)");
+		}
+		else
+		{
+			psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
+			_maintHandle.store(h, std::memory_order_release);
+		}
 	}
 
 	// 1. Fetch OAuth token
@@ -346,6 +369,14 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		~PendingDec() { c.fetch_sub(1, std::memory_order_acq_rel); }
 	} pendingDec{_outboundPending};
 
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1 (rule 5): a 911/933 shuts the probe's gate before any I/O: every fault
+	// disarmed, the ballast released, a token_age undone so ensureToken() below
+	// does not refetch ahead of it.
+	const bool benchEmergency = pbx::classifyEmergencyDial(destination).isEmergency;
+	pd::benchprobe::EmergencyDialScope benchEmergencyScope(benchEmergency);
+#endif
+
 	// Refresh the OAuth token if it's near expiry. Safe here: no media streams are
 	// open at call-origination time, so a re-issue can't kill a live stream.
 	ensureToken();
@@ -359,7 +390,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	}
 
 	// Prefer the device-specific makecall endpoint (the recommended Telephony transport) over the legacy
-	// /callcontrol/{dn}/makecall. Resolve the device_id lazily — makeCall runs on the tel_makecall
+	// /callcontrol/{dn}/makecall. Resolve the device_id lazily — makeCall runs on a tel_ctl
 	// worker, so the blocking GET is fine here.
 	if (deviceId.empty() && resolveDevice())
 	{
@@ -391,6 +422,12 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	int status = 0;
 	std::string respBody;
 	bool requestSent = false;   // #349: did the POST body actually reach 3CX?
+	// #379: a Remove received after the POST whose response names the leg may be that leg's.
+	auto readPostSeq = [this] {
+		std::lock_guard<std::mutex> lock(_mutex);
+		return _wsSeq;
+	};
+	uint64_t postSeq = readPostSeq();
 	bool success = httpPostBody(makeCallUrl, "application/json", postData, respBody, &status, &requestSent);
 
 	// A device-path 404 means the cached device_id went stale (registration flap). Re-resolve once
@@ -411,15 +448,29 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		if (!freshId.empty())
 		{
 			status = 0; respBody.clear(); requestSent = false;
+			postSeq = readPostSeq();
 			success = httpPostBody(deviceUrl(freshId), "application/json", postData, respBody, &status, &requestSent);
 		}
 		if (!success)
 		{
 			ESP_LOGW(TAG, "makeCall: falling back to legacy makecall endpoint");
 			status = 0; respBody.clear(); requestSent = false;
+			postSeq = readPostSeq();
 			success = httpPostBody(legacyUrl, "application/json", postData, respBody, &status, &requestSent);
 		}
 	}
+
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1 makecall_read_fail (#349's trigger): the POST reached 3CX; hand the code
+	// below exactly what an unread response leaves (httpPostBody: status -1, no body).
+	if (success && requestSent && pd::benchprobe::armedHint(pd::benchprobe::Fault::MakecallReadFail) &&
+	    pd::benchprobe::fire(pd::benchprobe::Fault::MakecallReadFail, benchEmergency))
+	{
+		success = false;
+		status = -1;
+		respBody.clear();
+	}
+#endif
 
 	// Select the leg WE control: makecall result.id, else the direct_control leg in the live
 	// participant list (audit #76 — NOT a destination digit-suffix match, which selects the
@@ -427,9 +478,10 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	// participant id Telephony later surfaces over the WS — that can be the far leg, on which a
 	// specific-id GET/drop returns 403 (issue #40). Drop/media key off this owned id.
 	std::string ownLeg;
+	telephony::OwnLegSource ownLegSource = telephony::OwnLegSource::FirstControllable;   // #379
 	if (success)
 	{
-		ownLeg = resolveOutboundLeg(respBody, destination);
+		ownLeg = resolveOutboundLeg(respBody, destination, nullptr, &ownLegSource);
 	}
 	else if (requestSent && !telephony::httpResponseParsed(status))
 	{
@@ -476,7 +528,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		{
 			if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(kReconcileDelayMs));
 			int listStatus = 0;
-			ownLeg = resolveOutboundLeg(std::string(), destination, &listStatus);
+			ownLeg = resolveOutboundLeg(std::string(), destination, &listStatus, &ownLegSource);
 			// Stop on a leg, or on any real verdict from 3CX — only an unparsed
 			// response (telephony::httpResponseParsed false) is worth retrying.
 			if (!ownLeg.empty() || telephony::httpResponseParsed(listStatus)) break;
@@ -504,10 +556,36 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		if (ownLegOut) *ownLegOut = ownLeg;   // #100: let the engine bind this call's session now
 		if (!ownLeg.empty())
 		{
+			// #379: the CANCEL may already have ended this leg's session; an upsert for
+			// it that finds no outbound slot is still ours, never an inbound call.
+			const bool ownLegHeld = telephony::ownLegMayBeHeld(ownLegSource);
+			if (ownLegHeld)
+			{
+				std::lock_guard<std::mutex> lock(_mutex);
+				_ownLegs.noteNamed(ownLeg, esp_timer_get_time(), postSeq);
+			}
 			// Alloc THIS call's slot (startRxIfNeeded find-or-claims it for ownLeg) + prime the GET
 			// loop, then mark the slot outbound-in-flight so the WS upsets for ownLeg classify as
 			// ours and the tick() watchdog can detect a makecall that never produced media.
-			if (startRxIfNeeded(ownLeg))
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+			// #384 H1: get_status / get_max_attempts apply to this outbound leg's GET loop only.
+			pd::benchprobe::claimGetFaults(ownLeg, benchEmergency);
+#endif
+			bool primed = startRxIfNeeded(ownLeg);
+			// #743: a 911/933 waits out a slot that is still tearing down (RxRestart.hpp). Off
+			// _mutex: startRxIfNeeded() takes it, and so does the teardown that frees the slot.
+			// _outboundPending is still held, so an upsert for this leg meanwhile is ignored,
+			// not read as a new inbound call; the re-check below replaces it.
+			const bool emergency = pbx::classifyEmergencyDial(destination).isEmergency;
+			const int64_t waitStartUs = esp_timer_get_time();
+			int64_t waitedUs = 0;
+			while (pd::emergencySlotRetryContinues(emergency, primed, waitedUs))
+			{
+				vTaskDelay(pdMS_TO_TICKS(pd::kEmergencySlotPollMs));
+				primed = startRxIfNeeded(ownLeg);
+				waitedUs = esp_timer_get_time() - waitStartUs;
+			}
+			if (primed)
 			{
 				std::lock_guard<std::mutex> lock(_mutex);
 				CallSlot* slot = slotForLocked(ownLeg);
@@ -517,11 +595,60 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 					slot->outboundAnswered.store(false, std::memory_order_release);
 					slot->ringing.store(false, std::memory_order_release);
 					slot->outboundActiveSetUs = esp_timer_get_time();
+					slot->ownLegHeld = ownLegHeld;
 				}
 			}
 			else
 			{
 				ESP_LOGW(TAG, "makeCall: all %d call slots busy — no slot for %s", POCKETDIAL_MAX_ANCHOR_CALLS, ownLeg.c_str());
+				if (emergency)
+				{
+					// #821: a 911/933 leg with no slot after the wait never comes up, and a
+					// ringing 911 is never reaped (#712). Drop it while _outboundPending
+					// still hides its upserts, and fail the call: the engine answers the
+					// caller 503 and tells the notify list NOT ROUTED.
+					dropCall(ownLeg);
+					if (ownLegOut) ownLegOut->clear();
+					return false;
+				}
+			}
+			if (primed && waitedUs > 0)
+			{
+				// #743: an upsert for this leg that landed during the wait was ignored, and
+				// Telephony does not repeat a Connected one. Re-check the leg once, with the
+				// same single-flight claim handleWsEvent() makes.
+				bool claimed = false;
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					if (CallSlot* s = slotForLocked(ownLeg))
+					{
+						if (s->upsetInFlight.exchange(true, std::memory_order_acq_rel))
+							s->upsetPending.store(true, std::memory_order_release);
+						else
+							claimed = true;
+					}
+				}
+				if (claimed)
+				{
+					// placement new(nothrow) returns an initialized pointer; cppcheck misparses it.
+					// cppcheck-suppress legacyUninitvar
+					auto* item = new (std::nothrow) WsWorkItem{};
+					if (item)
+					{
+						item->kind       = WsWork::Upset;
+						item->controlLeg = ownLeg;
+						item->partId     = ownLeg;
+					}
+					if (!enqueueWsWork(item))   // frees the item when it is not queued
+					{
+						std::lock_guard<std::mutex> lock(_mutex);
+						if (CallSlot* s = slotForLocked(ownLeg))
+						{
+							s->upsetInFlight.store(false, std::memory_order_release);
+							s->upsetPending.store(false, std::memory_order_release);
+						}
+					}
+				}
 			}
 			ESP_LOGI(TAG, "Successfully initiated call to %s (own leg %s)", destination.c_str(), ownLeg.c_str());
 		}
@@ -572,12 +699,13 @@ bool TelephonyAnchorClient::dropCall(const std::string& participantId)
 	// call holds 2 TLS sockets (GET + POST) over the W5500-MACRAW LWIP pool; freeing them gives
 	// the drop POST room (else it fails with sock<0 / mbedtls alloc-fail and the PSTN leg lingers).
 	// stopMediaStreams(partId) frees this participant's slot; its per-slot _tearingDown gate makes
-	// it idempotent if the WS 'Dropped' event races us. Runs on the off-SIP tel_dropcall worker.
+	// it idempotent if the WS 'Dropped' event races us. Runs on the off-SIP tel_drop worker.
 	// Issue #554 (b): tombstone the leg FIRST, so an upsert racing this teardown cannot
 	// re-prime it once stopMediaStreams() has freed the slot.
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_droppedLegs.add(partId);
+		_ownLegs.refresh(partId, esp_timer_get_time());   // #379: only a leg already ours
 	}
 	stopMediaStreams(partId);
 
@@ -649,7 +777,7 @@ bool TelephonyAnchorClient::answerCall(const std::string& participantId)
 	// local ring so audio cuts through at pickup. This is the FALLBACK — open them now only if
 	// that pre-open hasn't taken (e.g. Telephony rejected a pre-answer stream and only accepts it now,
 	// post-/answer). The startMediaStreams re-check makes a concurrent pre-warm safe. Runs on
-	// the tel_answer worker (12 KB stack, TLS-capable).
+	// a tel_ctl worker (12 KB stack, TLS-capable).
 	// Open the streams only if THIS slot isn't already live (the inbound classifier pre-warms both
 	// during the local ring; startMediaStreams re-checks under the slot lock, so a concurrent
 	// pre-warm is safe).
@@ -700,6 +828,16 @@ bool TelephonyAnchorClient::writeAudio(std::string_view participantId, const int
 	{
 		return false;
 	}
+
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1 post_stream_fail (#279): shut this stream's socket, so this write and
+	// every later one on it fails until the bridge gives up on the call.
+	if (pd::benchprobe::armedHint(pd::benchprobe::Fault::PostStreamFail) &&
+	    pd::benchprobe::fire(pd::benchprobe::Fault::PostStreamFail))
+	{
+		shutdown(esp_http_client_get_socket(slot->postClient), SHUT_RDWR);
+	}
+#endif
 
 	// esp_http_client_open(-1) sets the Transfer-Encoding: chunked header, but
 	// esp_http_client_write() is a RAW passthrough to esp_transport_write() — IDF
@@ -799,6 +937,10 @@ pd::ReapDecision TelephonyAnchorClient::reapParkedRxLocked(CallSlot& slot)
 
 void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 {
+	// #379: 3CX can still upsert our outbound leg once its slot is gone.
+	if (slot.ownLegHeld)
+		_ownLegs.note(slot.participantId, esp_timer_get_time());
+	slot.ownLegHeld = false;
 	slot.participantId.clear();
 	slot.inboundSignaledPartId.clear();
 	slot.farPartId.clear();
@@ -1398,10 +1540,11 @@ static std::string legIdOf(cJSON* elem)
 // re-trigger the wrong-leg 403. If no controllable leg is found we FAIL CLOSED (return "") and
 // let the reconcile/watchdog teardown handle it, rather than drop a guessed id.
 std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecallRespBody, const std::string& /*destination*/,
-                                                       int* listStatusOut)
+                                                       int* listStatusOut, telephony::OwnLegSource* sourceOut)
 {
 	// 0 = the live list was never consulted (result.id answered it, below).
 	if (listStatusOut) *listStatusOut = 0;
+	if (sourceOut) *sourceOut = telephony::OwnLegSource::FirstControllable;   // #379: a guess unless 3CX named it
 
 	// 1) result.id from the makecall response.
 	if (!makecallRespBody.empty())
@@ -1417,6 +1560,7 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 				if (!rid.empty())
 				{
 					ESP_LOGI(TAG, "resolveOutboundLeg: result.id=%s (from makecall response)", rid.c_str());
+					if (sourceOut) *sourceOut = telephony::OwnLegSource::MakecallResult;
 					return rid;
 				}
 			}
@@ -1480,7 +1624,11 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 			{
 				std::string pd;
 				for (const char* p = pdn->valuestring; *p; ++p) if (*p >= '0' && *p <= '9') pd.push_back(*p);
-				if (pd == srcDigits) return id;   // exact own-leg match
+				if (pd == srcDigits)   // exact own-leg match
+				{
+					if (sourceOut) *sourceOut = telephony::OwnLegSource::OwnPartyDn;
+					return id;
+				}
 			}
 		}
 	}
@@ -1567,6 +1715,20 @@ void TelephonyAnchorClient::tick()
 	// Runs inline on the SIP task at ≤1 Hz — MUST be non-blocking: only atomic reads, one timer
 	// read, and (rarely) a worker spawn. No logging or allocation on the common path.
 
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1 token_age (#336): age the held token so tokenExpiringSoon() reads true.
+	// The aged stamp is stored before it is registered, so an emergency can always undo it.
+	if (pd::benchprobe::armedHint(pd::benchprobe::Fault::TokenAge) &&
+	    pd::benchprobe::tokenAgeApplies(_tokenObtainedUs.load(), _tokenLifetimeUs.load()) &&
+	    pd::benchprobe::fire(pd::benchprobe::Fault::TokenAge))
+	{
+		const int64_t real = _tokenObtainedUs.load();
+		const int64_t aged = pd::benchprobe::agedTokenObtainedUs(esp_timer_get_time(), _tokenLifetimeUs.load());
+		_tokenObtainedUs.store(aged);
+		pd::benchprobe::noteTokenAged(&_tokenObtainedUs, aged, real);
+	}
+#endif
+
 	// Issue #65 (L-1): too many leaked GET sockets — spawn a one-shot worker to do a full
 	// stop()/start() reclaim OFF this task (stop()/start() block on TLS I/O). _restartInFlight
 	// is a one-shot gate so repeated ticks can't stack restart workers. Checked before the
@@ -1575,14 +1737,10 @@ void TelephonyAnchorClient::tick()
 	    !_restartInFlight.load(std::memory_order_acquire))
 	{
 		_restartInFlight.store(true, std::memory_order_release);
-		if (xTaskCreate(&TelephonyAnchorClient::restartTaskTrampoline, "tel_restart", 6144, this, 5, nullptr) != pdPASS)
+		if (!wakeMaint(kMaintRestart))
 		{
-			ESP_LOGE(TAG, "tick: failed to spawn anchor-restart worker");
+			ESP_LOGE(TAG, "tick: no maint task for the anchor restart");
 			_restartInFlight.store(false, std::memory_order_release);
-		}
-		else
-		{
-			psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 		}
 	}
 
@@ -1623,14 +1781,10 @@ void TelephonyAnchorClient::tick()
 			// Stamp BEFORE the spawn so the next-due math is correct even if the worker is slow.
 			_lastRewarmUs.store(now, std::memory_order_release);
 			_rewarmInFlight.store(true, std::memory_order_release);
-			if (xTaskCreate(&TelephonyAnchorClient::rewarmTaskTrampoline, "tel_rewarm", 6144, this, 5, nullptr) != pdPASS)
+			if (!wakeMaint(kMaintRewarm))
 			{
-				ESP_LOGE(TAG, "tick: failed to spawn TLS re-warm worker");
+				ESP_LOGE(TAG, "tick: no maint task for the TLS re-warm");
 				_rewarmInFlight.store(false, std::memory_order_release);
-			}
-			else
-			{
-				psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 			}
 		}
 	}
@@ -1675,15 +1829,33 @@ void TelephonyAnchorClient::tick()
 
 	// Claim the one-shot slot BEFORE the spawn so a second tick can't double-spawn the worker.
 	_reconcileInFlight.store(true, std::memory_order_release);
-	if (xTaskCreate(&TelephonyAnchorClient::reconcileTaskTrampoline, "tel_reconcile", 6144, this, 5, nullptr) != pdPASS)
+	if (!wakeMaint(kMaintReconcile))
 	{
 		// Rare error path (not the hot path): release the slot, else the watchdog wedges forever.
-		ESP_LOGE(TAG, "tick: failed to spawn reconcile worker");
+		ESP_LOGE(TAG, "tick: no maint task for the reconcile");
 		_reconcileInFlight.store(false, std::memory_order_release);
 	}
-	else
+}
+
+bool TelephonyAnchorClient::wakeMaint(uint32_t job)
+{
+	const TaskHandle_t h = _maintHandle.load(std::memory_order_acquire);
+	if (!h) return false;
+	xTaskNotify(h, job, eSetBits);   // eSetBits always returns pdPASS
+	return true;
+}
+
+// #658: the persistent maintenance task. Each job's body clears its own in-flight gate and
+// returns; a bit set while a body runs stays pending and runs on the next pass.
+void TelephonyAnchorClient::maintTaskTrampoline(void* arg)
+{
+	for (;;)
 	{
-		psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
+		uint32_t jobs = 0;
+		xTaskNotifyWait(0, UINT32_MAX, &jobs, portMAX_DELAY);
+		if (jobs & kMaintRestart)   restartTaskTrampoline(arg);
+		if (jobs & kMaintRewarm)    rewarmTaskTrampoline(arg);
+		if (jobs & kMaintReconcile) reconcileTaskTrampoline(arg);
 	}
 }
 
@@ -1756,14 +1928,11 @@ void TelephonyAnchorClient::reconcileTaskTrampoline(void* arg)
 		         ok ? 1 : 0, status);
 	}
 
-	// Single exit: clear the one-shot slot so tick() can re-arm, THEN self-delete. vTaskDelete()
-	// does not unwind the C++ stack, so this clear must be explicit here (not an RAII guard) — and
-	// the only cJSON RAII above is confined to an inner scope that has already run.
+	// Single exit: clear the one-shot slot so tick() can re-arm.
 	self->_reconcileInFlight.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
 }
 
-// #107: one-shot worker spawned by tick() when the anchor is idle. Reopens the persistent
+// #107: run on tel_maint (#658) when tick() sees the anchor idle. Reopens the persistent
 // POST handle so its cached TLS session RESUMES (abbreviated handshake) and Telephony issues a
 // fresh ticket — extending validity so the next real call's /stream open also resumes. Runs
 // off the SIP task because the open/close blocks on TLS I/O.
@@ -1771,9 +1940,8 @@ void TelephonyAnchorClient::rewarmTaskTrampoline(void* arg)
 {
 	auto* self = static_cast<TelephonyAnchorClient*>(arg);
 	self->rewarmPostSession();
-	// Single exit: release the one-shot slot so tick() can re-arm, then self-delete.
+	// Single exit: release the one-shot slot so tick() can re-arm.
 	self->_rewarmInFlight.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
 }
 
 void TelephonyAnchorClient::rewarmPostSession()
@@ -1923,7 +2091,7 @@ void TelephonyAnchorClient::prewarmAllSlots()
 	ESP_LOGI(TAG, "prewarm: %d/%d slots' POST TLS sessions primed (resumable)", warmed, POCKETDIAL_MAX_ANCHOR_CALLS);
 }
 
-// Issue #65 (L-1): one-shot worker that reclaims leaked GET sockets by cycling the
+// Issue #65 (L-1): run on tel_maint (#658); reclaims leaked GET sockets by cycling the
 // whole anchor. stop() tears down the WS + control + media clients and frees every
 // socket it still OWNS; a detached rx task's socket (#553) is its own to close, but a
 // full stop()/start() drops the anchor's live socket footprint to
@@ -1977,7 +2145,6 @@ void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 
 	// Clear the in-flight gate LAST so tick() can spawn a future restart if needed.
 	self->_restartInFlight.store(false, std::memory_order_release);
-	vTaskDelete(nullptr);
 }
 
 esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token)
@@ -2456,11 +2623,15 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 			// (MediaBridge), so Telephony just sees an idle stream meanwhile. answerCall() opens media when a
 			// local handset answers, so there is exactly one inbound media starter and no race here.
 			bool announce = false;
+			bool ownLeg = false;
 			{
 				std::lock_guard<std::mutex> lock(_mutex);
+				// #379: a leg this PBX created that no outbound slot holds (freed by its drop, or
+				// keyed but not yet marked outbound) is never a new inbound call.
+				ownLeg = !telephony::inboundAnnounceAllowed(_ownLegs, controlLeg, esp_timer_get_time(), w.seq);
 				// Find-or-claim the inbound slot so the announce-once flag lives on it (keyed by the
 				// surfaced leg). All slots busy => no slot => no announce (graceful at capacity).
-				CallSlot* s = allocSlotLocked(controlLeg);
+				CallSlot* s = ownLeg ? nullptr : allocSlotLocked(controlLeg);
 				if (s)
 				{
 					announce = (s->inboundSignaledPartId != controlLeg);
@@ -2482,7 +2653,14 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 					evCb(ev);
 				}
 			}
-			startMediaStreams(controlLeg);
+			if (ownLeg)
+			{
+				ESP_LOGI(TAG, "Upset for own leg %s, no outbound slot: not an inbound call (#379)", controlLeg.c_str());
+			}
+			else
+			{
+				startMediaStreams(controlLeg);
+			}
 		}
 		else
 		{
@@ -2688,6 +2866,7 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 									// (result.id) or, for outbound, the FAR leg — on which a specific-id
 									// GET/drop 403s (issue #40). Mapping rules:
 									//   • partId matches a slot          -> that slot's own leg (in/outbound)
+									//   • no match, a leg we created     -> ignored (#379, _ownLegs)
 									//   • no match, 0 outbound in flight -> INBOUND; control leg = partId
 									//   • no match, 1 outbound in flight -> that call's own leg (its far leg)
 									//   • no match, >=2 in flight        -> ambiguous; re-check each (self-correcting)
@@ -2696,12 +2875,21 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 									// upset drives it once the slot is keyed, so an early upset can't false-ring.
 									std::string controlLegs[POCKETDIAL_MAX_ANCHOR_CALLS];
 									int nLegs = 0;
+									bool ownLeg = false;
+									uint64_t seq = 0;
 									{
 										std::lock_guard<std::mutex> lock(_mutex);
+										seq = ++_wsSeq;   // #379: received after any Remove already taken
 										CallSlot* s = slotForLocked(partId);
 										if (s)
 										{
 											controlLegs[nLegs++] = partId;
+										}
+										else if (!telephony::inboundAnnounceAllowed(_ownLegs, partId, esp_timer_get_time(), seq))
+										{
+											// #379: our own leg with no outbound slot: neither a new inbound
+											// call nor the far leg of another call.
+											ownLeg = true;
 										}
 										else
 										{
@@ -2734,6 +2922,7 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 											}
 										}
 									}
+									if (ownLeg) ESP_LOGI(TAG, "Upset for own leg %s, no outbound slot: not an inbound call (#379)", partId.c_str());
 									if (nLegs == 0) break;   // ignored (pending far leg / all-busy)
 
 									// Best-effort caller id (cheap, JSON-only) for an inbound ring's From display.
@@ -2796,6 +2985,7 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 											item->controlLeg = controlLeg;
 											item->partId     = partId;
 											item->callerId   = callerId;   // same caller for all (only inbound uses it)
+											item->seq        = seq;
 											handedOff = enqueueWsWork(item);
 										}
 										if (!handedOff)
@@ -2817,6 +3007,15 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 								else if (evTypeNum == TEL_EV_REMOVE)
 								{
 									ESP_LOGI(TAG, "Call control event: Participant Remove %s", partId.c_str());
+									{
+										// #379: 3CX removed the participant, so an upsert received from now on
+										// may be a new call reusing its id. Upserts already queued stay ours.
+										// A live slot's leg is noted first, in case its entry has lapsed.
+										std::lock_guard<std::mutex> lock(_mutex);
+										const CallSlot* s = slotForLocked(partId);
+										if (s && s->ownLegHeld) _ownLegs.note(partId, esp_timer_get_time());
+										_ownLegs.release(partId, ++_wsSeq);
+									}
 									// #43: stopMediaStreams() has a <=2 s rx-join — off the WS task.
 									// placement new(nothrow) returns an initialized pointer; cppcheck misparses it.
 									// cppcheck-suppress legacyUninitvar
@@ -3253,7 +3452,14 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	// old 40-attempt/~20s ceiling would expire mid-ring and the call would
 	// connect with no inbound audio). Teardown still exits it immediately via
 	// stopRequested + socket shutdown (#553).
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1 get_status / get_max_attempts: only for the leg makeCall() claimed (an
+	// outbound, never a 911/933). Not constexpr here, so every use below takes the override.
+	const pd::benchprobe::GetLoopFaults benchGet = pd::benchprobe::takeGetFaults(activePartId);
+	const int            kMaxAttempts = benchGet.maxAttempts;
+#else
 	constexpr int        kMaxAttempts = 240;
+#endif
 	// #350: consecutive TRANSPORT-level failures — no HTTP response parsed at all —
 	// as distinct from a real non-200, which is what the 240-attempt budget exists
 	// for. A transport that is actually dead does not heal by being reopened 240
@@ -3302,9 +3508,10 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 		return _getClient != nullptr;
 	};
 
+	int attempt = 0;   // #379: read after the loop (a spent budget is reported)
 	if (_getClient)
 	{
-		for (int attempt = 0; attempt < kMaxAttempts && keepRunning(); ++attempt)
+		for (; attempt < kMaxAttempts && keepRunning(); ++attempt)
 		{
 			const int64_t openT0 = esp_timer_get_time();
 			esp_err_t err = esp_http_client_open(_getClient, 0);
@@ -3324,6 +3531,19 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 			{
 				esp_http_client_fetch_headers(_getClient);
 				int status = esp_http_client_get_status_code(_getClient);
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+				// #384 H1 get_status: a real answer reads as the forced refusal. A real 200's
+				// body is the live audio stream and never drains, so it is closed unread.
+				const pd::benchprobe::GetStatusOverride benchStatus =
+					pd::benchprobe::overrideGetStatus(status, benchGet.forcedStatus);
+				if (benchStatus.closeUnread)
+				{
+					std::lock_guard<std::mutex> lock(_getMutex);
+					slot->getFd = -1;   // #553: unpublish before the socket is closed
+					esp_http_client_close(_getClient);
+				}
+				status = benchStatus.status;
+#endif
 				if (status == 200)
 				{
 					// #100: surface the GET handshake cost — a warm/pre-warmed handle RESUMES (well
@@ -3343,7 +3563,12 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					// Drain the error body completely so the persistent connection can
 					// carry the next attempt (an unread body poisons handle reuse).
 					char drainBuf[256];
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+					// #384 H1: a 200 closed unread above has no connection left to read.
+					int firstChunk = benchStatus.closeUnread ? 0 : esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf));
+#else
 					int firstChunk = esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf));
+#endif
 					bool seen = false;
 					for (int i = 0; i < loggedRefusalCount; ++i) seen = seen || (loggedRefusals[i] == status);
 					if (!seen && loggedRefusalCount < 4)
@@ -3416,6 +3641,18 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	{
 		ESP_LOGW(TAG, "GET (Telephony->device) stream never opened — no inbound audio");
 		teardownGetClient();
+		// #379: refused for the whole budget and nobody is tearing the call down, so
+		// nothing else will drop this leg. Report it; RequestsHandler drops it unless it
+		// is a 911/933 (#604). Not dropCall(): its stopMediaStreams() joins this task.
+		if (attempt >= kMaxAttempts && keepRunning())
+		{
+			EventCallback evCb;
+			{
+				std::lock_guard<std::mutex> lock(_mutex);
+				evCb = _eventCb;
+			}
+			if (evCb) evCb(CallEvent{CallEvent::MediaNeverOpened, activePartId, "", ""});
+		}
 		return;
 	}
 	ESP_LOGI(TAG, "GET (Telephony->device) audio stream OPEN: %s", getUrl.c_str());

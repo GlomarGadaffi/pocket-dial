@@ -59,7 +59,7 @@ namespace
 		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
 	}
 
-	std::string sdpBody(const std::string& mediaIp, int port)
+	std::string sdpBody(const std::string& mediaIp, int port, const std::string& dirLine = std::string())
 	{
 		return
 			"v=0\r\n"
@@ -68,7 +68,7 @@ namespace
 			"c=IN IP4 " + mediaIp + "\r\n"
 			"t=0 0\r\n"
 			"m=audio " + std::to_string(port) + " RTP/AVP 0\r\n"
-			"a=rtpmap:0 PCMU/8000\r\n";
+			"a=rtpmap:0 PCMU/8000\r\n" + dirLine;
 	}
 
 	std::string findSentTo(const std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& sent,
@@ -147,7 +147,7 @@ namespace
 	// captures &rig, so rig must never move/relocate after construction — a
 	// by-value return would risk exactly that (NRVO is compiler best-effort in
 	// this shape, not guaranteed the way a prvalue return is).
-	void setUpSplicedCalls(Rig& rig)
+	void setUpSplicedCalls(Rig& rig, const std::string& bAnswerDir = std::string())
 	{
 		rig.aAddr = addrFor("192.168.40.10");
 		rig.bAddr = addrFor("192.168.40.20");
@@ -186,7 +186,7 @@ namespace
 		{
 			std::string fromLine = extractHeaderLine(forkToB, "From:");
 			std::string via = extractHeaderLine(forkToB, "Via:");
-			std::string body = sdpBody("192.168.40.20", 20000);
+			std::string body = sdpBody("192.168.40.20", 20000, bAnswerDir);
 			std::string raw =
 				"SIP/2.0 200 OK\r\n" + via + "\r\n" + fromLine + "\r\n"
 				"To: <sip:106@server>;tag=btag\r\n"
@@ -489,6 +489,16 @@ TEST(AttendedTransfer, SpliceSendsAcceptedAndCrossedReinvites)
 	EXPECT_FALSE(findSentTo(rig.sent, rig.aAddr, "SIP/2.0 202 Accepted").empty())
 		<< "REFER must be accepted";
 
+	// #720, RFC 3261 §8.2.6.2: the REFER is in-dialog (To carries tag=btag), so
+	// the 202 must echo that one tag, not append a second.
+	{
+		const std::string to = extractHeaderLine(
+			findSentTo(rig.sent, rig.aAddr, "SIP/2.0 202 Accepted"), "To:");
+		EXPECT_NE(to.find(";tag=btag"), std::string::npos) << to;
+		EXPECT_EQ(to.find(";tag=", to.find(";tag=") + 1), std::string::npos)
+			<< "the 202 must carry exactly one To tag: " << to;
+	}
+
 	// Issue #257. abCseq is the REFER's own CSeq (2, see sendAttendedRefer) + 1;
 	// acCseq is the consult INVITE's own CSeq (1, see setUpSplicedCalls) + 1.
 	// Computed independently from the fix's own stated logic, not copied from
@@ -506,6 +516,25 @@ TEST(AttendedTransfer, SpliceSendsAcceptedAndCrossedReinvites)
 	EXPECT_NE(invToC.find("Call-ID: " + rig.acCallId), std::string::npos) << invToC;
 	EXPECT_NE(invToC.find("c=IN IP4 192.168.40.20"), std::string::npos)
 		<< "C's re-INVITE must carry B's SDP:\n" << invToC;
+}
+
+// Issue #719: A held B before consulting C, so the SDP stored for B is B's hold
+// answer (a=recvonly). The splice re-INVITE to C is an OFFER built from it; it
+// must not carry the hold direction or C answers sendonly (one-way audio).
+TEST(AttendedTransfer, SpliceOfferToCDoesNotCarryBsHoldAnswerDirection)
+{
+	Rig rig;
+	setUpSplicedCalls(rig, "a=recvonly\r\n");
+	sendAttendedRefer(rig);
+
+	std::string invToC = findSentTo(rig.sent, rig.cAddr, "CSeq: 2 INVITE");
+	ASSERT_FALSE(invToC.empty()) << "C must get the splice re-INVITE";
+	EXPECT_NE(invToC.find("c=IN IP4 192.168.40.20"), std::string::npos)
+		<< "C's re-INVITE must still carry B's media address:\n" << invToC;
+	EXPECT_EQ(invToC.find("a=recvonly"), std::string::npos)
+		<< "B's hold answer must not be relayed as C's offer:\n" << invToC;
+	EXPECT_NE(invToC.find("a=sendrecv"), std::string::npos)
+		<< "the splice offer must re-open the media:\n" << invToC;
 }
 
 // (b) B's 200 OK to the splice re-INVITE gets ACKed and does NOT reach A —

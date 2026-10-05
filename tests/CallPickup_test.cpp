@@ -158,6 +158,21 @@ namespace
 	{
 		return "Call-ID: " + callId;
 	}
+
+	// First line of `raw` that starts with `prefix` (a method or a header name),
+	// without its CRLF; empty when there is none.
+	std::string lineStarting(const std::string& raw, const std::string& prefix)
+	{
+		size_t pos = 0;
+		while (pos < raw.size())
+		{
+			size_t eol = raw.find("\r\n", pos);
+			if (eol == std::string::npos) eol = raw.size();
+			if (raw.compare(pos, prefix.size(), prefix) == 0) return raw.substr(pos, eol - pos);
+			pos = eol + 2;
+		}
+		return {};
+	}
 }
 
 // ── Directed pickup ────────────────────────────────────────────────────────
@@ -224,6 +239,44 @@ TEST(CallPickup, DirectedPickupCancelsTargetAndBridgesCallerToPicker)
 	EXPECT_EQ(pickerSession.value()->getState(), Session::State::Connected);
 	ASSERT_NE(pickerSession.value()->getDest(), nullptr);
 	EXPECT_EQ(pickerSession.value()->getDest()->getNumber(), "200");
+}
+
+// Issue #749 / RFC 3261 §9.1: the CANCEL to the picked-up target carries the
+// Request-URI and To of the INVITE it cancels. A direct call relays the caller's
+// INVITE as received, so the CANCEL must not recompute either from the target's
+// address.
+TEST(CallPickup, PickupCancelCarriesTheRequestUriAndToOfTheInviteItCancels)
+{
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+
+	handler.handle(makeRegister("200", "192.168.9.10", "reg-caller749"));
+	handler.handle(makeRegister("100", "192.168.9.20", "reg-target749"));
+	handler.handle(makeRegister("102", "192.168.9.30", "reg-picker749"));
+	handler.setRingGroup("600", "100,102", "ringall");
+
+	handler.handle(makeInvite("200", "100", "192.168.9.10", "call-749"));
+	handler.handle(makeInvite("102", "**100", "192.168.9.30", "pickup-749"));
+
+	std::string invite, cancel;
+	for (const auto& s : sent)
+	{
+		if (s.destIp != "192.168.9.20") continue;
+		if (invite.empty() && s.raw.rfind("INVITE ", 0) == 0) invite = s.raw;
+		if (cancel.empty() && s.raw.rfind("CANCEL ", 0) == 0) cancel = s.raw;
+	}
+	ASSERT_FALSE(invite.empty()) << "the target must have been sent the caller's INVITE";
+	ASSERT_FALSE(cancel.empty()) << "the target must have been sent a CANCEL";
+
+	const std::string inviteLine = lineStarting(invite, "INVITE ");
+	const std::string cancelLine = lineStarting(cancel, "CANCEL ");
+	EXPECT_EQ(cancelLine.substr(cancelLine.find(' ')), inviteLine.substr(inviteLine.find(' ')))
+		<< "Request-URI must match the INVITE's";
+	EXPECT_EQ(lineStarting(cancel, "To:"), lineStarting(invite, "To:"))
+		<< "To must match the INVITE's";
 }
 
 TEST(CallPickup, DirectedPickupOfNonPeerExtensionGets486AndLeavesTargetRinging)
@@ -372,6 +425,47 @@ TEST(CallPickup, RacePickupFirst_LateAnswerFromCancelledTargetIsDropped)
 	ASSERT_NE(stillPicker.value()->getDest(), nullptr);
 	EXPECT_EQ(stillPicker.value()->getDest()->getNumber(), "102")
 		<< "the late answer must not overwrite the pickup winner";
+}
+
+TEST(CallPickup, RacePickupFirst_CancelledTargets487IsAckedNotRelayedToTheCaller)
+{
+	// Issue #750: the caller's INVITE already got the pickup's 200. The cancelled
+	// target answers our CANCEL with a 487; relayed, that is a second final
+	// response on one INVITE transaction. The PBX must ACK it and drop it.
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+
+	handler.handle(makeRegister("200", "192.168.9.10", "reg-caller6"));
+	handler.handle(makeRegister("100", "192.168.9.20", "reg-target6"));
+	handler.handle(makeRegister("102", "192.168.9.30", "reg-picker6"));
+	handler.setRingGroup("603", "100,102", "ringall");
+
+	handler.handle(makeInvite("200", "100", "192.168.9.10", "call-6"));
+	handler.handle(makeInvite("102", "**100", "192.168.9.30", "pickup-6"));
+
+	const size_t callerMessagesBefore = countTo(sent, "192.168.9.10");
+
+	const std::string raw487 =
+		"SIP/2.0 487 Request Terminated\r\n"
+		"Via: SIP/2.0/UDP 192.168.9.10:5060;branch=z9hG4bKcall-6\r\n"
+		"From: <sip:200@server>;tag=fromcall-6\r\n"
+		"To: <sip:100@server>;tag=tocall-6\r\n"
+		"Call-ID: call-6\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(raw487, addrFor("192.168.9.20")));
+
+	EXPECT_EQ(countTo(sent, "192.168.9.10"), callerMessagesBefore)
+		<< "the cancelled target's 487 must not reach a caller already answered 200";
+	EXPECT_TRUE(anyTo(sent, "192.168.9.20", "ACK sip:100@server SIP/2.0"))
+		<< "the PBX must ACK the cancelled target's 487 itself, on the Request-URI of the INVITE the target saw (RFC 3261 s17.1.1.3), not one it made up";
+
+	auto stillPicker = handler.getSession(sessionKey("call-6"));
+	ASSERT_TRUE(stillPicker.has_value());
+	EXPECT_EQ(stillPicker.value()->getState(), Session::State::Connected);
 }
 
 // ── Bridge teardown ──────────────────────────────────────────────────────
@@ -594,4 +688,38 @@ TEST(CallPickup, BodilessRefreshOnAPickedUpCallIsAnsweredLocallyNotRelayedAcross
 		ASSERT_TRUE(s.has_value());
 		EXPECT_EQ(s.value()->getState(), Session::State::Connected) << leg.callId;
 	}
+}
+
+// #804: a parked party that hangs up has To = the orbit and no peerCallID until a
+// retrieve, so its BYE fell through to the 404 path and nothing was torn down: the
+// orbit stayed Parked (music on hold streaming to a dead phone) and the Session
+// and its CDR leaked.
+TEST(CallPickup, ParkedPartyByeIsAnsweredAndFreesTheOrbitAndSession)
+{
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+
+	handler.handle(makeRegister("100", "192.168.9.50", "reg-parked-804"));
+	handler.handle(makeRegister("101", "192.168.9.51", "reg-other-804"));
+	handler.handle(makeInvite("100", "700", "192.168.9.50", "park-call-804"));
+	ASSERT_TRUE(handler.getSession(sessionKey("park-call-804")).has_value()) << "precondition: parked";
+
+	sent.clear();
+	handler.handle(makeBye("100", "700", "192.168.9.50", "park-call-804"));
+
+	EXPECT_TRUE(anyTo(sent, "192.168.9.50", "SIP/2.0 200 OK")) << "the parked party's BYE must be answered 200";
+	EXPECT_FALSE(anyTo(sent, "192.168.9.50", "404")) << "not 404";
+	EXPECT_FALSE(handler.getSession(sessionKey("park-call-804")).has_value())
+		<< "the parked session must be ended";
+
+	// The orbit is free again: the next INVITE to 700 parks instead of retrieving
+	// (a retrieve would re-INVITE the phone that just hung up).
+	sent.clear();
+	handler.handle(makeInvite("101", "700", "192.168.9.51", "park-call-804b"));
+	EXPECT_FALSE(anyTo(sent, "192.168.9.50", "INVITE sip:"))
+		<< "the orbit must be free: nothing may be retrieved from a party that hung up";
+	EXPECT_TRUE(handler.getSession(sessionKey("park-call-804b")).has_value());
 }

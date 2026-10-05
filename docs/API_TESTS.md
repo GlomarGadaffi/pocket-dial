@@ -370,8 +370,10 @@ Reports the SIP registrar admission mode and the adopted-extension roster. Gated
   "attached": true,
   "mode": "learn",
   "devices": [
-    { "mac": "805ec079c37f", "extension": "1001", "state": "secured", "online": true },
-    { "mac": "805ec079c380", "extension": "1002", "state": "learned",  "online": false }
+    { "mac": "805ec079c37f", "extension": "1001", "state": "secured", "online": true,  "locked": true,  "shared": false },
+    { "mac": "805ec079c380", "extension": "1002", "state": "learned",  "online": false, "locked": true,  "shared": false },
+    { "mac": "805ec079c381", "extension": "1003", "state": "learned",  "online": true,  "locked": false, "shared": true  },
+    { "mac": "805ec079c382", "extension": "1004", "state": "learned",  "online": true,  "locked": false, "shared": false }
   ]
 }
 ```
@@ -386,6 +388,12 @@ Reports the SIP registrar admission mode and the adopted-extension roster. Gated
 * `state`, `learned` (adopted on first contact, not yet enforced) or `secured`
   (MAC-locked and digest-enforced for its extension).
 * `online`, volatile registration state; never persisted.
+* `locked`, `shared` (#882), JSON booleans on every row, the registrar's stored Learn flags.
+  `locked`: Learn bound the extension to this MAC. `shared`: this MAC registered a second
+  extension while unlocked (a NAT router, or a phone moved by hand); the row never locks and
+  is the one to forget. Both `false` on a `learned` row is plain TOFU. A `secured` row
+  reports the flags it had when secured and is enforced by its `state` regardless. Assert on
+  the key and its JSON type, so that a missing key does not pass as `false`.
 
 ### 3.13 POST `/api/registrar`
 Sets the admission mode. Cookie **and** `X-CSRF`.
@@ -427,11 +435,12 @@ Secures or forgets one adopted device. Cookie **and** `X-CSRF`.
 | Param | Values | Effect |
 |---|---|---|
 | `action` | `secure` \| `forget` | Required. |
-| `target` | 12-hex MAC, or an extension | Required. An extension resolves to the device currently bound to it. |
+| `target` | 12-hex MAC, or an extension | Required. An extension resolves to the one device that holds it. |
 
 `secure` promotes a `learned` device to `secured`. `forget` drops the adoption record, 
 in `learn` mode the phone is re-adopted on its next registration, which is how you re-home
-an extension to different hardware. `404` if no adopted device matches. Responds with the
+an extension to different hardware. `404` if no adopted device matches; `409` and no change
+if more than one device holds the extension given (#820: send the MAC). Responds with the
 same body as the `GET`.
 
 > The MAC lock is **not** a cryptographic boundary, it is learned from the ARP table, and

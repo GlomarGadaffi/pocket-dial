@@ -61,12 +61,17 @@ public:
 	struct AdoptedDevice
 	{
 		std::string mac;         // 12 lowercase hex chars
-		std::string extension;   // the AOR it last registered as
+		std::string extension;   // the AOR it was adopted as (#820: a REGISTER never moves it)
 		DeviceState state = DeviceState::Learned;
 		bool online = false;     // currently has a live registration binding
+		bool locked = false;     // #440: Learn has bound its extension to this MAC
+		bool shared = false;     // #440: this MAC registered >1 extension (NAT) -- never locked
 	};
 
-	enum class AuthDecision : uint8_t { Accept, Challenge, Reject };
+	// RetryLater (#515, #440): admitLearn has already enqueued a 503 + Retry-After.
+	// Drop (#864): nothing is sent; the caller ARPs the source once _mutex is
+	// released, and the phone's UDP retransmission is the retry.
+	enum class AuthDecision : uint8_t { Accept, Challenge, Reject, RetryLater, Drop };
 
 	Registrar(PbxEnv& env, Mode defaultMode) : _env(env), _mode(defaultMode) {}
 
@@ -101,19 +106,55 @@ public:
 	AuthDecision admitSecure(const std::shared_ptr<SipMessage>& data,
 		const std::string& ext, std::string& outRejectReason);
 	// Learn-mode admission: resolves the source MAC, applies TOFU + MAC-lock and
-	// returns the digest decision. On a first-packet ARP miss returns Accept
-	// (deferring the lock to the next REGISTER). Records/updates the adoption
-	// entry — poll consumeDevicesChange() afterwards to mirror the snapshot.
+	// returns the digest decision. Records/updates the adoption entry -- poll
+	// consumeDevicesChange() afterwards to mirror the snapshot. Issue #440:
+	//   - an extension is LOCKED to a MAC on a later REGISTER from that same
+	//     resolved MAC at least kLockMinAge after its first (#515; never the
+	//     first, never on an ARP miss), and only if no earlier-adopted device row
+	//     holds the extension (first claim wins);
+	//   - another MAC registering a locked (or Secured) extension -> Reject;
+	//   - an ARP miss for a locked extension -> Accept if `fromRegisteredAddress`
+	//     (the source IP:port is the extension's live binding: the owner's own
+	//     refresh); else, from a source on this subnet, Drop (#864: nothing
+	//     sent, the caller ARPs it); else a 503 + Retry-After is enqueued here
+	//     and RetryLater ("response already sent") is returned. Never a lockout;
+	//   - an UNLOCKED MAC that registers a second extension is marked shared
+	//     (the signature of phones behind one NAT router) and never locks; its
+	//     record keeps the extension it holds (#820), locked or not;
+	//   - a first-packet ARP miss for an unlocked extension still Accepts;
+	//   - #507: a Secured extension or device is always digest-checked
+	//     (admitSecure), on an ARP miss too, and its record never moves.
+	// #515: adopting a NEW MAC spends a token (kAdoptBurst, one back per
+	// kAdoptRefill); with none left it answers 503 + Retry-After and returns
+	// RetryLater. Known MACs never spend one. `now` is a test seam.
+	static constexpr uint8_t kAdoptBurst = 4;
+	static constexpr std::chrono::seconds kAdoptRefill{15};   // 4 per minute
+	// #515: the locking sighting comes at least this long after the MAC's first
+	// sighting for its extension. A real phone's refresh is later than that; a
+	// host answering ARP for fake MACs and sending two REGISTERs each is not, so
+	// a burst cannot squat (lock) extensions or spend an NVS write per lock. A
+	// younger sighting is still admitted as TOFU and does not restart the age.
+	static constexpr std::chrono::seconds kLockMinAge{30};
 	AuthDecision admitLearn(const std::shared_ptr<SipMessage>& data,
-		const std::string& ext, std::string& outRejectReason);
+		const std::string& ext, std::string& outRejectReason,
+		std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now(),
+		bool fromRegisteredAddress = false);
 	// Emit a 401 Unauthorized with a fresh WWW-Authenticate challenge. `stale`
 	// answers an expired-but-valid nonce.
 	void sendChallenge(const std::shared_ptr<SipMessage>& data, bool stale);
 	// Emit a 403 Forbidden with a reason phrase.
 	void sendForbidden(const std::shared_ptr<SipMessage>& data, const std::string& reason);
+	// Emit a 503 Service Unavailable with Retry-After (#515, #440). Kept short: per
+	// RFC 3261 §21.5.4 the phone holds off the WHOLE server for that long.
+	void sendRetryLater(const std::shared_ptr<SipMessage>& data, int retryAfterSeconds);
+	static constexpr int kLockedArpMissRetrySeconds = 5;
 
 	// ── Adopted-device registry ───────────────────────────────────────────────
 	void loadDevices();   // boot-time NVS reload; runs single-threaded pre-dispatch
+	// The seq a row loaded from NVS gets (#820: loadDevices() is ESP-only, this is
+	// not). `saved` is the row's seq field, nullptr for a pre-#440 row; `nextSeq`
+	// is advanced past the result.
+	static uint32_t loadedSeq(const char* saved, uint32_t& nextSeq);
 	// Mark a device online/offline after a (de)registration. Online state is
 	// volatile registration state — never persisted. No-op if the MAC isn't
 	// adopted (e.g. a Learn REGISTER whose ARP lookup missed never records).
@@ -124,6 +165,9 @@ public:
 	// Forget a device entirely (a later REGISTER re-learns it in Learn mode).
 	// Accepts a MAC or an extension. Returns true if a record was removed.
 	bool forget(const std::string& macOrExt);
+	// #515: forget every Learned device in one step (one NVS write); Secured
+	// devices are kept. Returns how many were removed.
+	size_t forgetLearned();
 	// Current registry contents (MAC-sorted by map order) for the dashboard
 	// snapshot mirror.
 	std::vector<AdoptedDevice> adoptedDevices() const;
@@ -132,14 +176,19 @@ public:
 	bool isExtensionSecured(std::string_view ext) const;   // no allocation on the INVITE path
 
 	// Test-only seam: directly adopt a device without an ARP lookup.
-	void adoptDeviceForTest(const std::string& mac, const std::string& ext, DeviceState state = DeviceState::Learned)
+	void adoptDeviceForTest(const std::string& mac, const std::string& ext, DeviceState state = DeviceState::Learned,
+		bool locked = false)
 	{
 		DeviceRecord r;
 		r.extension = ext;
 		r.state = state;
 		r.online = true;
+		r.locked = locked;
+		r.seq = _nextSeq++;
 		_devices[mac] = r;
 	}
+	// Test-only seam (#515): fixtures that send REGISTERs on the real clock set 0.
+	void setLockMinAgeForTest(std::chrono::seconds age) { _lockMinAge = age; }
 
 	// What moved in the registry since the last consume. Online is by far the
 	// most frequent (every registration and every lease expiry flips it, and a
@@ -165,10 +214,23 @@ private:
 		std::string extension;
 		DeviceState state = DeviceState::Learned;
 		bool online = false;   // volatile; not persisted
+		bool locked = false;   // #440: extension bound to this MAC (persisted)
+		bool shared = false;   // #440: MAC seen with >1 extension; never locks (persisted)
+		uint32_t seq = 0;      // #440: adoption order, for eviction (persisted)
+		// #515: when this MAC first registered its current extension. Volatile, not
+		// persisted: a row loaded from NVS has none and counts as old enough, so an
+		// upgraded board's phones lock at their next REGISTER as before.
+		std::chrono::steady_clock::time_point firstSeen{};
+		bool firstSeenKnown = false;
 	};
 
 	bool persistMode();   // false (and logged at ERROR) if any NVS step failed
-	void persistDevices();
+	bool persistDevices();   // false (and logged at error) if any NVS step failed
+	// #440: the entry to forget when a new MAC needs room at POCKETDIAL_MAX_CLIENTS:
+	// the OLDEST plain Learned entry (offline ones first). Never a locked or
+	// Secured device; end() when every entry is locked/Secured.
+	std::unordered_map<std::string, DeviceRecord>::iterator oldestEvictable();
+	uint32_t _nextSeq = 1;
 	// Find a record by MAC key or, failing that, by adopted extension.
 	std::unordered_map<std::string, DeviceRecord>::iterator findDevice(const std::string& macOrExt);
 
@@ -179,6 +241,16 @@ private:
 	// (namespace "pbxcfg", key "devices") minus the volatile online flags.
 	std::unordered_map<std::string, DeviceRecord> _devices;
 	Change _devicesChanged = Change::None;
+
+	// #515: token bucket on new adoptions. Each is one persistDevices() NVS
+	// write, and a host answering ARP for many fake MACs could otherwise fill
+	// the table (and wear flash) in one burst. A full bucket banks nothing.
+	uint8_t _adoptTokens = kAdoptBurst;
+	std::chrono::steady_clock::time_point _adoptRefillAt{};
+	// The refusal path IS the flood path: log at most once per refill period
+	// (each log line allocates on the SIP task, #284).
+	std::chrono::steady_clock::time_point _adoptLimitLoggedAt{};
+	std::chrono::seconds _lockMinAge = kLockMinAge;   // setLockMinAgeForTest()
 
 	// Issue #525: digest replay limit. Nonces are stateless (HMAC-tagged, 5 min,
 	// SipDigest.hpp), so without this one captured Authorization could be sent

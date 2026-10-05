@@ -403,8 +403,8 @@ footer{padding:1rem 1.5rem 2rem;color:var(--paper-dim);font-size:.65rem;font-fam
        (e.g. right after a factory reset). Informational: nothing is gated on it,
        and 911 still routes out. -->
   <div class="note" id="e911-banner" role="status" style="display:none;color:var(--warn)">&#9888;
-    <b>E911 not configured.</b> A 911 call still routes out, but nobody on site is
-    notified. Set the notify list and location in <a href="#" onclick="openPbxModal();return false">PBX Settings &rarr; E911 Notification</a>.</div>
+    <b>E911 not configured.</b> <span id="e911-banner-text">A 911 call still routes out, but nobody on site is
+    notified.</span> Set the notify list and location in <a href="#" onclick="openPbxModal();return false">PBX Settings &rarr; E911 Notification</a>.</div>
 
   <!-- ══ PATCH BAY ══ -->
   <section class="patch-bay">
@@ -675,9 +675,11 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <div class="subhead">&#9990; Extension Registration &amp; Onboarding</div>
       <div class="note">
         Controls what a phone must prove before it can register as an extension.
-        <strong>Learn</strong> adopts an unknown phone on first contact. The extension
-        is only locked to that device once an admin secures it; until then another
-        phone can register on the same extension.
+        <strong>Learn</strong> adopts an unknown phone on first contact and
+        locks the extension to that device on its next registration,
+        if no other phone claimed it first. Until then,
+        or if the phone is on another subnet or shares a router's MAC with other
+        phones, another phone can register on the same extension.
         <strong>Secure</strong> digest-challenges every registration. There is no
         open mode: accepting any endpoint with no credential let anyone on the link
         register as any extension.
@@ -698,7 +700,10 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <div class="note" id="reg-roster-note">
         Phones seen while in Learn mode. <strong>Secure</strong> locks one to its
         extension and starts enforcing digest auth for it; <strong>Forget</strong> drops
-        the record so the phone is re-adopted on its next registration.
+        the record so the phone is re-adopted on its next registration. A
+        <strong>locked</strong> row is bound to its phone's MAC. A
+        <strong>shared</strong> row (a NAT router, or a phone moved while unlocked)
+        never locks: Forget it so the right phone can lock.
       </div>
       <table id="reg-roster">
         <thead><tr><th>Extension</th><th>MAC</th><th>State</th><th></th></tr></thead>
@@ -1407,7 +1412,9 @@ function applyEmergencyRoute(d){
    nothing, same rule as wifiCapable below. Hidden while emergencyRoute is "none":
    its text says a 911 call "still routes out", which is false then, and #521's
    route banner already says 911 is refused. */
-function applyE911(d){var b=$("e911-banner");if(!b||!d||typeof d.e911Configured==="undefined")return;b.style.display=(d.e911Configured||d.emergencyRoute==="none")?"none":"";}
+function applyE911(d){var b=$("e911-banner");if(!b||!d||typeof d.e911Configured==="undefined")return;b.style.display=(d.e911Configured||d.emergencyRoute==="none")?"none":"";
+  /* #792: 3CX carries 911 here */
+  var t=$("e911-banner-text");if(t){if(t._def===undefined)t._def=t.textContent;t.textContent=d.emergencyRoute==="anchor"?"A 911 call goes out through the 3CX anchor, whose own E911 setup applies. This board's on-site notify list is empty.":t._def;}}
 /* #167: the board states whether it has a radio; the UI must not infer it from
    an empty scan. Older firmware predates the field, so an ABSENT wifiCapable is
    treated as capable -- the dashboard is served by the same board it manages, so
@@ -1602,7 +1609,8 @@ R"html6(    var tr=document.createElement("tr");
     var tdE=document.createElement("td");tdE.textContent=x.extension||"\u2014";
     var tdM=document.createElement("td");tdM.textContent=x.mac||"\u2014";
     var tdS=document.createElement("td");
-    tdS.textContent=(x.state==="secured"?"secured":"learned")+(x.online?" \u00b7 online":"");
+    var sec=x.state==="secured";
+    tdS.textContent=(sec?"secured":"learned")+(sec?"":x.shared?" \u00b7 shared":x.locked?" \u00b7 locked":" \u00b7 unlocked")+(x.online?" \u00b7 online":"");
     var tdA=document.createElement("td");
     if(x.state!=="secured"){
       var b=document.createElement("button");

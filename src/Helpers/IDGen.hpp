@@ -40,10 +40,21 @@ public:
 	static std::string GenerateID(int len)
 	{
 		std::string id;
-		id.reserve(len > 0 ? static_cast<size_t>(len) : 0);
+		if (len <= 0) return id;
+		id.resize(static_cast<size_t>(len));
+		fill(id.data(), id.size());
+		return id;
+	}
+
+	// Allocation-free form of GenerateID for the fixed-buffer builder
+	// (sipb::, #744): writes `len` unguessable alphanumeric characters to
+	// dst[0..len). Does NOT write a terminator.
+	static void fill(char* dst, size_t len)
+	{
 		uint8_t block[16];
 		size_t pos = sizeof(block);
-		while (static_cast<int>(id.size()) < len)
+		size_t n = 0;
+		while (n < len)
 		{
 			if (pos == sizeof(block))
 			{
@@ -55,9 +66,8 @@ public:
 			// would favour the first symbols -- small, but this is the one
 			// generator whose whole job is to be unguessable.
 			const uint8_t v = block[pos++] & 0x3F;
-			if (v < kAlphabetSize) id += alphanum[v];
+			if (v < kAlphabetSize) dst[n++] = alphanum[v];
 		}
-		return id;
 	}
 
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))

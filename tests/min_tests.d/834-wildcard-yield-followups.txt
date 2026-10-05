@@ -1,0 +1,2 @@
+# EmergencyDialing_test.cpp: 7 (#877 follow-up, Part of #818 and #834: one INVITE is judged against one registration snapshot; a registered extension under a wildcard 911 rule keeps #497's check and the stream cap, a trailing-star rule yields too, a wildcard 933 is a test call with every exemption, a literal 911 rule after a yielded wildcard still fires, and the documented 11X / 112 alias example holds)
+7

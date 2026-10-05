@@ -25,6 +25,7 @@
 #include "JsonReader.hpp"    // Issue #430: parse /api/status in the DropProbe tests
 #include "DmaFramePool.hpp"   // Issue #328: /api/status's l2Tx counters
 #include "SipSecretStore.hpp"
+#include "ArpLookup.hpp"      // #882: host ARP stub, to build locked and shared Learn rows
 #include "LoopbackAnchorClient.hpp"   // #652: the loopback emergency seam
 #include "ResetGuard.hpp"
 #include "index_html.h"
@@ -938,6 +939,144 @@ TEST(Registrar, SecuringAnExtensionWithNoSipSecretIs409NotANotFound)
 	AdminAuth::clearCredential();
 }
 
+TEST(Registrar, SecureOrForgetByAnExtensionTwoDevicesHoldIs409AndChangesNothing)
+{
+	// #820 item 3: two rows can hold one extension (the lock holder beside a later
+	// claim that never locked, or a stale row). By extension the route acted on
+	// whichever row the registrar ranked first; it now refuses and asks for the
+	// MAC, which is what the dashboard sends.
+	struct Cleanup
+	{
+		~Cleanup() { SipSecretStore::clearSecret("1002"); AdminAuth::clearCredential(); }
+	} cleanup;   // also on a failed ASSERT
+	AdminAuth::clearCredential();
+	ASSERT_TRUE(SipSecretStore::setSecret("1002", "s3cret-1002"));   // secure is not refused for a missing secret
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.adoptDeviceForTest("0200000000b1", "1002", RequestsHandler::DeviceState::Learned, /*locked=*/true);
+	handler.adoptDeviceForTest("0200000000b2", "1002");
+	HttpServer server("127.0.0.1", 0, nullptr);
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	AdminSession a = loginAndCompleteSetup(port);
+	for (const char* action : {"secure", "forget"})
+	{
+		const std::string r = httpPostRaw(port, "/api/registrar/device",
+			std::string("action=") + action + "&target=1002", "pd_session=" + a.cookie, a.csrf);
+		EXPECT_EQ(statusOf(r), 409) << action << "\n" << r;
+		EXPECT_NE(r.find("send its MAC"), std::string::npos) << r;
+	}
+	auto rows = handler.getAdoptedDevices();
+	ASSERT_EQ(rows.size(), 2u) << "forget by an ambiguous extension removed a row";
+	for (const auto& d : rows)
+		EXPECT_EQ(d.state, RequestsHandler::DeviceState::Learned) << "secure by an ambiguous extension promoted " << d.mac;
+
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/registrar/device", "action=forget&target=0200000000b2",
+		"pd_session=" + a.cookie, a.csrf)), 200) << "by MAC the route acts on that row";
+	rows = handler.getAdoptedDevices();
+	ASSERT_EQ(rows.size(), 1u);
+	EXPECT_EQ(rows[0].mac, "0200000000b1");
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/registrar/device", "action=secure&target=1002",
+		"pd_session=" + a.cookie, a.csrf)), 200) << "one row holds 1002 now, so the extension is enough";
+	rows = handler.getAdoptedDevices();
+	ASSERT_EQ(rows.size(), 1u);
+	EXPECT_EQ(rows[0].state, RequestsHandler::DeviceState::Secured);
+}
+
+TEST(Registrar, EachDeviceRowSaysWhetherItIsLockedOrShared)
+{
+	// #882 (S3 of the #852 review): the docs tell the operator to forget a shared
+	// or stale row, and the roster did not say which row that is. Every row of
+	// GET /api/registrar now carries the registrar's own `locked` and `shared`
+	// flags, verbatim. The rows are built by real Learn REGISTERs (host ARP stub),
+	// so the snapshot the endpoint reads is the one admitLearn() refreshed.
+	struct Cleanup
+	{
+		~Cleanup() { ArpLookup::clearMockMacs(); AdminAuth::clearCredential(); }
+	} cleanup;   // also on a failed ASSERT
+	AdminAuth::clearCredential();
+	ArpLookup::clearMockMacs();
+	RequestsHandler handler("192.168.88.254", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+	handler.setLearnLockMinAgeForTest(std::chrono::seconds(0));   // these REGISTERs are microseconds apart
+
+	int seq = 0;
+	auto registerExt = [&](const std::string& ext, const std::string& ip, uint8_t macLast) {
+		sockaddr_in src{};
+		src.sin_family = AF_INET;
+		src.sin_addr.s_addr = inet_addr(ip.c_str());
+		src.sin_port = htons(5060);
+		ArpLookup::setMockMac(src, ArpLookup::Mac{0x02, 0x00, 0x00, 0x00, 0x88, macLast});
+		const std::string id = "r882-" + std::to_string(++seq);
+		handler.handle(RequestsHandler::getMessageFromPool(
+			"REGISTER sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bK" + id + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=" + id + "\r\nTo: <sip:" + ext + "@server>\r\n"
+			"Call-ID: " + id + "\r\nCSeq: " + std::to_string(seq) + " REGISTER\r\n"
+			"Contact: <sip:" + ext + "@" + ip + ":5060>;expires=3600\r\nContent-Length: 0\r\n\r\n", src));
+	};
+	auto macOf = [](uint8_t macLast) {
+		return ArpLookup::toHex12(ArpLookup::Mac{0x02, 0x00, 0x00, 0x00, 0x88, macLast});
+	};
+
+	registerExt("5801", "192.168.88.1", 0x01);   // plain TOFU: seen once
+	registerExt("5802", "192.168.88.2", 0x02);   // locked: the phone's own refresh
+	registerExt("5802", "192.168.88.2", 0x02);
+	registerExt("5803", "192.168.88.3", 0x03);   // shared: one MAC, two extensions
+	registerExt("5804", "192.168.88.3", 0x03);
+	// Secured. secure() leaves the flags as they were, and a Secured row is
+	// MAC-locked and digest-enforced by its state whatever they say.
+	handler.adoptDeviceForTest(macOf(0x04), "5805", RequestsHandler::DeviceState::Secured);
+	handler.adoptDeviceForTest(macOf(0x05), "5806", RequestsHandler::DeviceState::Secured, /*locked=*/true);
+
+	HttpServer server("127.0.0.1", 0, nullptr);
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(port);
+
+	const std::string resp = httpGetRaw(port, "/api/registrar", "pd_session=" + a.cookie);
+	ASSERT_EQ(statusOf(resp), 200) << resp;
+	JsonReader::Value root;
+	std::string err;
+	ASSERT_TRUE(JsonReader::parse(bodyOf(resp), root, err)) << err << "\n" << resp;
+	const auto& rows = root.arrayOr("devices");
+	ASSERT_EQ(rows.size(), 5u) << resp;   // the shared MAC's second extension gets no row (#820)
+
+	// 0 or 1; -1: the key is missing or is not a JSON boolean; -2: no such row.
+	auto flag = [&](const std::string& mac, const char* key) {
+		for (const auto& row : rows)
+		{
+			if (row.stringOr("mac") != mac) continue;
+			const JsonReader::Value* v = row.find(key);
+			return (v && v->type == JsonReader::Value::Type::Bool) ? (v->boolVal ? 1 : 0) : -1;
+		}
+		return -2;
+	};
+	struct Want { uint8_t mac; const char* what; int locked; int shared; };
+	for (const Want& w : {Want{0x01, "plain TOFU", 0, 0}, Want{0x02, "locked", 1, 0},
+	                      Want{0x03, "shared", 0, 1}, Want{0x04, "Secured, never locked", 0, 0},
+	                      Want{0x05, "Secured, locked first", 1, 0}})
+	{
+		EXPECT_EQ(flag(macOf(w.mac), "locked"), w.locked) << w.what << "\n" << resp;
+		EXPECT_EQ(flag(macOf(w.mac), "shared"), w.shared) << w.what << "\n" << resp;
+	}
+
+	// The other fields are as they were.
+	for (const auto& row : rows)
+	{
+		if (row.stringOr("mac") != macOf(0x03)) continue;
+		EXPECT_EQ(row.stringOr("extension"), "5803") << "a shared row keeps the extension it registered first";
+		EXPECT_EQ(row.stringOr("state"), "learned");
+		EXPECT_TRUE(row.boolOr("online"));
+	}
+}
+
 namespace
 {
 	std::string indexPage()
@@ -1005,6 +1144,42 @@ TEST(Registrar, MutatingEndpointsRequireTheCsrfToken)
 	EXPECT_EQ(statusOf(httpPostRaw(18103, "/api/registrar/device",
 	                               "action=forget&target=1001",
 	                               "pd_session=" + a.cookie)), 403);
+
+	AdminAuth::clearCredential();
+}
+
+TEST(Registrar, ForgetLearnedNeedsCsrfAndKeepsSecuredDevices)
+{
+	// #515: one action forgets every Learned adoption (recovery from a flood of
+	// fake MACs). Threats: a stolen cookie alone must not wipe the roster
+	// (CSRF), and the bulk forget must never drop a Secured device, which would
+	// let the next REGISTER re-learn its extension.
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.adoptDeviceForTest("0200000005b1", "5201");
+	handler.adoptDeviceForTest("0200000005b2", "5202");
+	handler.adoptDeviceForTest("0200000005bb", "5210", Registrar::DeviceState::Secured);
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	AdminSession a = loginAndCompleteSetup(port);
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/registrar/forget-learned", "")), 401);
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/registrar/forget-learned", "",
+	                               "pd_session=" + a.cookie)), 403);
+	EXPECT_EQ(handler.getAdoptedDevices().size(), 3u) << "a refused request must change nothing";
+
+	const std::string r = httpPostRaw(port, "/api/registrar/forget-learned", "",
+	                                  "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(r), 200) << r;
+	const auto left = handler.getAdoptedDevices();
+	ASSERT_EQ(left.size(), 1u);
+	EXPECT_EQ(left[0].mac, "0200000005bb");
+	EXPECT_NE(r.find("\"mac\":\"0200000005bb\""), std::string::npos) << r;
+	EXPECT_EQ(r.find("0200000005b1"), std::string::npos) << r;
 
 	AdminAuth::clearCredential();
 }
@@ -1115,8 +1290,42 @@ TEST(CdrDisclosure, ClientCountStaysVisibleSoEmptyIsNotAmbiguous)
 	// the other stackHwm_* fields on this branch.
 	EXPECT_NE(body.find("\"stackHwm_http_conn\":null"), std::string::npos)
 		<< "host build must report stackHwm_http_conn, not omit the key:\n" << body;
+	// Issue #405: the route beside that minimum. Host has no minimum, so null.
+	EXPECT_NE(body.find("\"httpConnWorstRoute\":null"), std::string::npos)
+		<< "host build must report httpConnWorstRoute, not omit the key:\n" << body;
 
 	AdminAuth::clearCredential();
+}
+
+// Issue #405: the label stored beside stackHwm_http_conn is a route CLASS. It is
+// served unauthenticated, and a provisioning fetch carries a phone's MAC in its
+// path, so the raw path must never reach it.
+TEST(HttpConnRouteLabel, IsARouteClassAndNeverTheRawPath)
+{
+	const auto label = [](const char* method, const char* path) {
+		char out[HttpServer::kRouteLabelBytes];
+		HttpServer::routeLabel(method, path, out, sizeof(out));
+		return std::string(out);
+	};
+	EXPECT_EQ(label("GET", "/api/status"), "GET /api/status");
+	EXPECT_EQ(label("GET", "/"), "GET /");
+	EXPECT_EQ(label("GET", "/index.html"), "GET /");
+	EXPECT_EQ(label("GET", "/metrics"), "GET /metrics");
+	EXPECT_EQ(label("GET", "/api/coredump"), "GET /api/coredump");
+	EXPECT_EQ(label("POST", "/api/coredump/erase"), "POST /api/coredump/erase");
+	// A phone's config fetch: the MAC is not in the label.
+	EXPECT_EQ(label("GET", "/config/aabbccddeeff.cfg"), "GET provisioning");
+	// A numeric segment ends the label.
+	EXPECT_EQ(label("POST", "/api/telephony-config/3/activate"), "POST /api/telephony-config");
+	// Unknown shapes, a scan probe, an odd method, a segment that is not a word.
+	EXPECT_EQ(label("GET", "/no-such-page"), "GET other");
+	EXPECT_EQ(label("GET", "/api/"), "GET /api");
+	EXPECT_EQ(label("get", "/api/status"), "? /api/status");
+	EXPECT_EQ(label("GET", "/api/Status;x"), "GET /api");
+	// Truncated to the buffer, always NUL-terminated.
+	char tiny[8];
+	HttpServer::routeLabel("DELETE", "/api/telephony-config", tiny, sizeof(tiny));
+	EXPECT_EQ(std::string(tiny), "DELETE ");
 }
 
 // Issue #328. The MoH proof run could show hold music streaming at exactly
@@ -1411,6 +1620,61 @@ TEST(OtaReboot, RebootAndFactoryResetAreRefusedDuringAnEmergencyCall)
 	EXPECT_FALSE(AdminAuth::needsInitialSetup()) << "the admin credential survives";
 
 	resetguard::resetForTest();
+	AdminAuth::clearCredential();
+}
+
+// #659: a PSAP callback after the 911 has ended is an emergency call too, so a
+// reboot is refused while it is up. Loopback anchor only, as in #652's test.
+TEST(OtaReboot, RebootIsRefusedDuringAPsapCallback)
+{
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.setAnchorPlacesRealCallsForTest(true);
+
+	sockaddr_in hs{};
+	hs.sin_family = AF_INET;
+	hs.sin_addr.s_addr = inet_addr("192.168.4.11");
+	hs.sin_port = htons(5060);
+	handler.handle(RequestsHandler::getMessageFromPool(
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bK659r\r\n"
+		"From: <sip:101@server>;tag=r659\r\nTo: <sip:101@server>\r\n"
+		"Call-ID: reg-659\r\nCSeq: 1 REGISTER\r\n"
+		"Contact: <sip:101@192.168.4.11:5060>;expires=3600\r\nContent-Length: 0\r\n\r\n", hs));
+	const std::string sdp =
+		"v=0\r\no=- 0 0 IN IP4 192.168.4.11\r\ns=-\r\nc=IN IP4 192.168.4.11\r\nt=0 0\r\n"
+		"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(
+		"INVITE sip:911@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bK659i\r\n"
+		"From: <sip:101@server>;tag=i659\r\nTo: <sip:911@server>\r\n"
+		"Call-ID: e911-659\r\nCSeq: 1 INVITE\r\nMax-Forwards: 70\r\n"
+		"Contact: <sip:101@192.168.4.11:5060>\r\nContent-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp, hs));
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+	ASSERT_EQ(loop->lastMakeCallDestination(), "911") << "precondition: the 911 was placed";
+	handler.handle(RequestsHandler::getMessageFromPool(
+		"BYE sip:911@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bK659b\r\n"
+		"From: <sip:101@server>;tag=i659\r\nTo: <sip:911@server>;tag=srv\r\n"
+		"Call-ID: e911-659\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n", hs));
+	ASSERT_FALSE(handler.hasLiveEmergencyCall()) << "precondition: the 911 has ended";
+	ASSERT_FALSE(handler.routeInboundAnchorCallForTest("800", "psap-659", "PSAP").empty())
+		<< "precondition: the callback rings 101";
+
+	HttpServer server("127.0.0.1", 0, nullptr);
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(port);
+
+	const std::string reboot = httpPostRaw(port, "/api/ota/reboot", "confirm=1", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(reboot), 409) << reboot;
+	EXPECT_NE(bodyOf(reboot).find("emergency call in progress"), std::string::npos) << reboot;
+
 	AdminAuth::clearCredential();
 }
 

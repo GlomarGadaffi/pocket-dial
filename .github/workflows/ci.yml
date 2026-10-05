@@ -367,6 +367,11 @@ jobs:
           # gtest writes one JSON report per test binary into this directory
           # (#390). The count check below reads it; the tests run once.
           GTEST_OUTPUT: json:${{ github.workspace }}/build/gtest-reports/
+          # #199 emitted-message conformance: this runner has no pjproject, so
+          # the ctest `emitted_conformance` runs its RFC 3261 checklist only and
+          # says "pjsip stage SKIPPED". The pjsip stage runs in BigDog's gate,
+          # which has the pjproject tree the interop suite builds pjsua from.
+          PD_CONFORMANCE_ALLOW_NO_PJSIP: "1"
         run: |
           # The sip_parser_tests target is registered with CTest in
           # tests/CMakeLists.txt. Because the root CMakeLists.txt enables testing
@@ -669,6 +674,11 @@ jobs:
           . $IDF_PATH/export.sh > /dev/null
           python3 tools/ci/app_slot_margin.py build
 
+      # Issue #384 (H1): the bench probe image (docs/BENCH_PROBE.md) must cost a
+      # release build nothing: no probe tag or route in the image, option off.
+      - name: No bench probe in the image (#384)
+        run: python3 tools/ci/check_no_bench_probe.py build
+
       - name: Upload ESP32-S3 Ethernet Firmware Bundle
         if: matrix.target-chip == 'esp32s3' && matrix.sip-transport == 'eth'
         uses: actions/upload-artifact@v4
@@ -704,10 +714,14 @@ jobs:
       - name: Build with COMPREHENSIVE heap poisoning
         run: |
           . $IDF_PATH/export.sh
-          idf.py set-target esp32s3
+          # The defaults go on the set-target line: set-target writes sdkconfig,
+          # and a later build keeps that file, so -DSDKCONFIG_DEFAULTS given only
+          # to `build` was ignored and this leg built the plain eth image.
           idf.py -D SIP_TRANSPORT=eth \
                  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_debug" \
-                 build
+                 set-target esp32s3 build
+          grep -q "define CONFIG_HEAP_POISONING_COMPREHENSIVE 1" build/config/sdkconfig.h \
+            || { echo "::error::heap_debug profile not applied"; exit 1; }
           echo "Heap-poisoning profile builds (esp32s3 / eth)."
 
   # Job 2b-ii: Heap-TRACE build (issue #273).
@@ -735,8 +749,12 @@ jobs:
       - name: Build with HEAP_TRACING_STANDALONE + HEAP_TASK_TRACKING
         run: |
           . $IDF_PATH/export.sh
-          idf.py set-target esp32s3
-          idf.py -D SIP_TRANSPORT=eth                  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_trace"                  build
+          # Defaults on the set-target line; see the heap-poisoning leg above.
+          idf.py -D SIP_TRANSPORT=eth \
+                 -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_trace" \
+                 set-target esp32s3 build
+          grep -q "define CONFIG_HEAP_TRACING_STANDALONE 1" build/config/sdkconfig.h \
+            || { echo "::error::heap_trace profile not applied"; exit 1; }
           echo "Heap-trace profile builds (esp32s3 / eth); HeapLeakProbe.cpp actually compiled."
 
       - name: Upload Heap Trace Firmware Bundle
@@ -792,7 +810,8 @@ jobs:
   # partitions_4mb.csv with 0x1E0000 app slots). No other job builds it -- the
   # matrix's lan8720 leg uses the 16 MB defaults -- and it is the one layout near
   # its limit, so it is built here and its app-slot margin checked. The recipe
-  # is main/CMakeLists.txt's SIP_CONSTRAINED comment.
+  # is main/CMakeLists.txt's SIP_CONSTRAINED comment. Issue #731: the constrained build
+  # carries exactly one outside line, so it is built once per choice (anchor, trunk).
   build-constrained:
     name: Build Firmware (esp32 / lan8720 / SIP_CONSTRAINED, 4 MB) + app-slot margin
     runs-on: ubuntu-latest
@@ -802,10 +821,31 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Build the constrained profile
+      - name: Build the constrained profile (SIP_OUTSIDE_LINE=anchor)
         run: |
           . $IDF_PATH/export.sh
-          idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 \
+          idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=anchor \
+                 -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
+                 set-target esp32 build
+
+      - name: App slot margin (issue #489)
+        run: |
+          . $IDF_PATH/export.sh > /dev/null
+          python3 tools/ci/app_slot_margin.py build
+
+  build-constrained-trunk:
+    name: Build Firmware (esp32 / lan8720 / SIP_CONSTRAINED trunk, 4 MB) + app-slot margin
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build the constrained profile (SIP_OUTSIDE_LINE=trunk)
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=trunk \
                  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
                  set-target esp32 build
 

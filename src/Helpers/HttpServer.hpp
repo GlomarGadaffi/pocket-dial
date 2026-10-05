@@ -70,6 +70,16 @@ public:
 	// stackHwm_http_conn on /api/status reports the measured high-water mark so
 	// this number stays evidence-backed rather than an estimate.
 	static constexpr unsigned kHttpConnStackBytes = 4096;
+	// Issue #405: the route that produced the stackHwm_http_conn minimum is
+	// reported beside it as httpConnWorstRoute. Each connection thread keeps its
+	// label in a buffer this big on its own stack (about 40 of the 4096 bytes).
+	static constexpr size_t kRouteLabelBytes = 40;
+	// Writes a route CLASS ("GET /api/status", "POST /api/coredump", "provisioning",
+	// "other") into out[cap], NUL-terminated and truncated to fit. Never the raw
+	// path: the label is served unauthenticated and a provisioning fetch carries a
+	// phone's MAC. Public/static so it is host-testable on its own.
+	static void routeLabel(const std::string& method, const std::string& path,
+	                       char* out, size_t cap);
 	// Issue #368: ceiling on simultaneously-running connection handler threads.
 	//
 	// Each handler costs a task stack + TCB + socket buffers out of INTERNAL
@@ -220,12 +230,16 @@ private:
 	                                             // accept() during teardown.
 
 	void acceptLoop();
-	void handleClient(int clientSock);
+	// routeOut (optional, kRouteLabelBytes) receives the request's route label
+	// once it is parsed (#405).
+	void handleClient(int clientSock, char* routeOut = nullptr);
 	// Issue #366: called on the connection thread once handleClient() has
 	// returned, from the thread body rather than inside handleClient itself --
 	// that function has many early returns and this way none of them can be
-	// missed. No-op on the host build (no FreeRTOS).
-	void recordConnStackHwm();
+	// missed. `route` is the label handleClient() left (#405); it is stored with
+	// the figure only when that figure is a new minimum. No-op on the host build
+	// (no FreeRTOS).
+	void recordConnStackHwm(const char* route);
 
 	// HTTP request parsing
 	struct HttpRequest {
@@ -380,8 +394,6 @@ private:
 
 	// Issue #35, #234: Serves phone auto-provisioning config for supported vendors.
 	void sendProvisioningResponse(int sock, const HttpRequest& req);
-	// Backward-compatible wrapper for sendProvisioningResponse.
-	void sendConfigCfg(int sock, const std::string& mac);
 	// Phase 2: set per-extension Do Not Disturb. Mutating (same-origin + auth gated).
 	void sendApiDnd(int sock, const std::string& body);
 	// Issue #246: set per-extension voicemail-enabled, same shape and gate as
@@ -512,6 +524,10 @@ private:
 	void sendApiOtaStatus(int sock);
 	// Reboots into a staged image (device) or simulates it (host).
 	void sendApiOtaReboot(int sock, const std::string& body);
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #384 H1: GET/POST /api/bench/fault, the bench probe image only (docs/BENCH_PROBE.md).
+	void sendApiBenchFault(int sock, const HttpRequest& req);
+#endif
 
 	// Streaming helper for the OTA upload: drains exactly `contentLength` bytes
 	// from `sock`, feeding `chunkSink(ptr, len)` for each chunk. `prefix`/
@@ -552,6 +568,11 @@ private:
 	// rather than a last-value because the interesting case is the deepest
 	// request the board has ever served, not the most recent one.
 	std::atomic<long> _httpConnStackHwmBytes{-1};
+	// Issue #405: the route that set that minimum. Guarded with the figure by
+	// _httpConnWorstMutex so a reader never sees one connection's number with
+	// another's route. Empty until a connection has finished.
+	std::mutex _httpConnWorstMutex;
+	char _httpConnWorstRoute[kRouteLabelBytes] = {0};
 	// Issue #368: handler threads currently alive. Claimed by acceptLoop() before
 	// the thread is created and released by the thread itself on exit, so a burst
 	// arriving faster than threads can start cannot overshoot the cap.

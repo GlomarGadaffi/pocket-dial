@@ -1,0 +1,2 @@
+# RegistrarLearnLock_test.cpp: #440 Learn locks + #507 (Secured on ARP miss, Secured record never moved) + a locked record never moves + #487 review (owner's refresh on an ARP miss, first claim wins, secure/forget by extension, refused de-REGISTERs, eviction order) (16); LearnAdoptionLimit_test.cpp: a refused new MAC evicts nothing (1)
+17

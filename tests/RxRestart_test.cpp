@@ -106,3 +106,31 @@ TEST(RxRestart, ThreeBenignDetachesNeverRequestARestart)
 	}
 	EXPECT_EQ(detachedCount, 0);
 }
+
+TEST(RxRestart, AnEmergencyMakeCallKeepsAskingForASlotStillTearingDownForFourSeconds)
+{
+	// #743: a 911 dialed while the only slot is tearing down (the victim of a
+	// #624 pre-emption, or a call that ended a moment ago) finds no slot on
+	// its first ask. stopMediaStreams() joins the old rx task for up to 2 s
+	// before it frees the slot, and a task that outlives the join parks within
+	// one more 2 s client timeout. So makeCall() keeps asking for 4 s (desmo,
+	// #878) and the 911 gets its rx pump inside that bound instead of waiting
+	// on the next upsert. tests/tools/test_anchor_emergency_slot_wait.py pins
+	// that makeCall() (ESP-only) is wired to this.
+	EXPECT_TRUE(pd::emergencySlotRetryContinues(/*emergency=*/true, /*primed=*/false, 0))
+		<< "the first refusal is retried";
+	EXPECT_TRUE(pd::emergencySlotRetryContinues(true, false, pd::kEmergencySlotWaitUs - 1));
+	EXPECT_FALSE(pd::emergencySlotRetryContinues(true, false, pd::kEmergencySlotWaitUs))
+		<< "bounded: a slot held past the join and one client timeout is not waited on forever";
+	EXPECT_FALSE(pd::emergencySlotRetryContinues(true, true, 0)) << "a primed slot ends the wait";
+	EXPECT_EQ(pd::kEmergencySlotWaitUs, 4'000'000) << "the 2 s rx join plus one 2 s client timeout";
+	EXPECT_LT(pd::kEmergencySlotPollMs, 500) << "and the slot is re-asked well inside it";
+}
+
+TEST(RxRestart, AnOrdinaryMakeCallStillGetsOneAskForASlot)
+{
+	// The negative case: a non-emergency call never waits. It logs "all slots
+	// busy" after its one ask, exactly as before #743.
+	EXPECT_FALSE(pd::emergencySlotRetryContinues(/*emergency=*/false, /*primed=*/false, 0));
+	EXPECT_FALSE(pd::emergencySlotRetryContinues(false, true, 0));
+}

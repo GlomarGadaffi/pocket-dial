@@ -3,7 +3,13 @@ cmake_minimum_required (VERSION 3.16)
 # Issue #411: decide the firmware version once, for every build flavour. See
 # cmake/FirmwareVersion.cmake for why ESP-IDF's own fallback always said "1".
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/FirmwareVersion.cmake)
-pocketdial_firmware_version(POCKETDIAL_RESOLVED_FW_VERSION)
+# Issue #384 (H1): the bench probe image (main/CMakeLists.txt) stamps -probe, so
+# no check that wants this checkout's release stamp can ever accept it.
+if(POCKETDIAL_ANCHOR_BENCH_PROBE)
+    pocketdial_firmware_version(POCKETDIAL_RESOLVED_FW_VERSION "-probe")
+else()
+    pocketdial_firmware_version(POCKETDIAL_RESOLVED_FW_VERSION)
+endif()
 
 if(DEFINED ENV{IDF_PATH})
     # Must be set BEFORE project(): that is where ESP-IDF reads PROJECT_VER into
@@ -33,6 +39,17 @@ if(DEFINED ENV{IDF_PATH})
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_lwip_ip4_hook.cmake
         COMMENT "Issue #496: checking lwIP calls the IPv4 input guard"
         VERBATIM)
+
+    # #487 review: lwIP's ARP table defaults to 10 entries (lwip/opt.h; IDF's
+    # lwipopts.h does not set it), fewer than the 32-phone client pool, and
+    # every registered phone is OPTIONS-pinged every 5 s, so entries churn:
+    # sends re-ARP, and a Learn-locked phone's REGISTER misses and waits for
+    # its retransmission while the board ARPs it (#864). 40 holds the pool plus the
+    # gateway and a few other peers, at 24 B an entry (+720 B internal .bss).
+    # Only etharp.c reads it. SIP_CONSTRAINED keeps the default: 8 phones.
+    if(NOT SIP_CONSTRAINED)
+        target_compile_definitions(${pd_lwip_lib} PRIVATE "ARP_TABLE_SIZE=40")
+    endif()
 
     # Issue #420: the Ethernet transports leave the SAR ADC entropy source on
     # for their whole uptime (esp_main_eth*.cpp). Fail the build if the linked

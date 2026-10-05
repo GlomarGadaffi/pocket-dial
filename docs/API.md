@@ -318,9 +318,10 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Requires `confirm=ERASE`. Wipes the login credential, the DTMF PIN, every session, AP security, the carrier-API credential table, the DID→extension table, the CDR ring, and (Wi-Fi builds only) Wi-Fi/mode NVS, then reboots on any ESP build. Answers `200` on every build, or `409` `{"error":"emergency call in progress"}` while a 911/933 call is live (#652). |
 | [`/api/ap-security`](#get-apiap-security) | `GET` | Medium | Gated | Reports whether the SoftAP requires WPA2 and returns its passphrase. |
 | [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
-| [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster. |
+| [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster, each row with its `locked` and `shared` flags. |
 | [`/api/registrar`](#post-apiregistrar) | `POST` | High | Gated (+ `X-CSRF`) | Sets the admission mode (`learn`/`secure`; `open` is retired, #500). |
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
+| [`/api/registrar/forget-learned`](#post-apiregistrarforget-learned) | `POST` | High | Gated (+ `X-CSRF`) | Forgets every `learned` device at once; `secured` ones stay (#515). |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
 | [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
 | [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts with `confirm=1` if none is staged (#645). Simulated (`200`, no-op) on desktop. While a 911/933 call is live a plain restart answers `409` `{"error":"emergency call in progress"}` and a staged-image reboot waits for the call to end (#652). |
@@ -849,7 +850,12 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
   "stackHwm_rtp_media_tx": null,
   "stackHwm_rtp_media_rx": null,
   "stackHwm_conf_mix_tick": null,
+  "stackHwm_tel_ctl0": null,
+  "stackHwm_tel_ctl1": null,
+  "stackHwm_tel_drop": null,
+  "stackHwm_tel_sos": null,
   "stackHwm_http_conn": 1364,
+  "httpConnWorstRoute": "GET /api/status",
   "l2Tx": {
     "poolAllocations": 184302,
     "poolExhaustions": 0,
@@ -877,7 +883,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `httpReadDeadlineDrops` | Integer | HTTP connections dropped because the request (headers + buffered body) did not arrive within 10 s of the accept (#529), or whose receive timeout could not be set at all (#534; closed unread rather than left to block). A climbing count means a slow or hostile client. |
 | `httpPerSourceRefusals` | Integer | HTTP connections refused `503` because one source address already held 3 of the 4 connection slots (#529). |
 | `httpStatusRefusals` | Integer | `/api/status` responses refused `500` because the body did not fit its fixed per-connection buffer (24 KB x 4; 16 KB x 2 without PSRAM, where a third concurrent poll gets the `503`), or `503` because that buffer failed to allocate at boot (#410). Since #630 `GET /metrics` leases the same buffers, so its refusals count here too. Never truncated. |
-| `memory.dynamicTaskCreates` | Integer | (#479) Tasks created with a heap stack and TCB since boot: every `pd::createTaskPreferPsram()` task plus the media call path's `conf_mix_tick` and `moh_tx`. RTP media tasks run on boot-preallocated stacks and are not counted. Read it before and after a call; the difference is the call path's dynamic task creation (0 for an ordinary extension-to-extension call). Also counts the anchor client's one-shot `tel_restart`, `tel_rewarm` and `tel_reconcile` workers. |
+| `memory.dynamicTaskCreates` | Integer | (#479) Tasks created with a heap stack and TCB since boot: every `pd::createTaskPreferPsram()` task plus the media call path's `moh_tx`. RTP media tasks and `conf_mix_tick` run on boot-preallocated stacks and are not counted. Read it before and after a call; the difference is the call path's dynamic task creation (0 for an ordinary extension-to-extension call). Also counts the anchor client's persistent `tel_maint` task (#658), created once by its first `start()`; restart, TLS re-warm and reconcile run on it and create nothing. |
 | `version` | String | (#411) The firmware build stamp (the `git describe` of the commit it was built from). No build host, path or timestamp. |
 | `wifiCapable` | Boolean | (#167) Whether this build has a radio at all. `false` on the Ethernet builds, so an empty Wi-Fi scan is not mistaken for "no networks found". |
 | `emergencyRoute` | String | (#521) Where a 911/933 dial would go right now: `"anchor"` (the boot-selected telephony provider places real calls; a configured SIP trunk is its fallback when it is down), `"trunk"` (no such provider, but a valid SIP trunk is configured **and has answered an INVITE with a 2xx since boot or since its configuration last changed**), `"trunk-unverified"` (#546: a valid trunk is configured but has not yet completed a call, so it is *configured*, not *proved*: the generic trunk cannot answer a 401/407 digest challenge yet (#399). The dashboard shows a banner asking for a 933 test call. Emergency calls are still tried on it), or `"none"` (only the loopback test provider is present, so the board **refuses** emergency calls with `503 Emergency Call Not Routable`; the loopback simulator never answers one). The dashboard shows a warning banner while this is `"none"`. Ungated like the rest of the block. **Absent** while no SIP engine is attached yet (the first seconds after boot), which a client should treat as unknown, not as `"none"`. |
@@ -887,12 +893,17 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `cdrLoadFailures` | Integer | (#594) Failures reading the stored CDR ring at boot. |
 | `ip4Guard` | Object | (#496, ESP builds only) What the IPv4 input guard dropped since boot: `padded` (frames padded past Ethernet's 46-byte minimum; no real stack sends these) and `tinyFragments` (non-final fragments under 256 B of payload), `mdnsFragments` (any fragment addressed to the mDNS group 224.0.0.251, #559: the mDNS receiver would parse a reassembled datagram in pieces). A climbing `padded` count means hostile or broken traffic on the LAN. `tinyFragments` usually means the same, but a datagram re-fragmented by a router onto a smaller-MTU link can also land there, and that datagram is lost. See ARCHITECTURE.md, "UDP Receive Memory". |
 | `packetsProcessed` | Integer | Total UDP signaling packets processed by the state machine. |
-| `packetsDropped` | Integer | Total UDP signaling packets dropped by rate-limiting or firewall rules. |
+| `packetsDropped` | Integer | Total UDP signaling packets dropped by rate-limiting or firewall rules. Exactly `droppedInvalid + droppedRate` (#702: derived from them, not counted separately); each part wraps at 2^32. |
 | `msgPoolRefusals` | Integer | (#409) Draws the process-wide SIP message pool refused because every slot was in use. There is no heap fallback, so each one is a request dropped (the peer retransmits) or a response not sent. Non-zero means the pool is undersized for the load, or the board is being flooded. |
 | `vpeerPoolRefusals` | Integer | (#409) Virtual-peer pool refusals (777/440/888/555/voicemail/park stand-ins). Each one was answered `503` or its feature abandoned cleanly (#412). |
+| `repliesRefused` | Integer | (#424, #702) Responses the PBX built and then refused to send because they answered a response or an ACK. Should stay `0`: any other value is a handler bug the guard caught. |
+| `optionsPingTruncated` | Integer | (#463, #702) OPTIONS keep-alive pings refused because they would not fit their fixed buffer. Should stay `0` with a real AOR and IPv4 address; counted so a clipped request never goes out silently. |
+| `byeTruncated` | Integer | (#744) BYEs the PBX built for a leg and refused to send: longer than the 832 B cap (a dialog with very long From/To lines; they are not bounded on ingress, #870), or a field that was empty or carried a CR, LF or other control byte. That leg got no BYE and stays up until it hangs up or the session sweep ends it; the hanging-up phone is still answered `200`. Should stay `0`. Logged the first time only, like `optionsPingTruncated`. |
 | `trunkForgedRegisterResponses` | Integer | (#617, #663) Responses to the trunk's REGISTER that came from an address other than the one the REGISTER went to. Each was dropped. The WARN log line is written only when this reaches 1, 2, 4, 8, …, so a flood does not flood the log. `0` with no trunk configured. |
 | `trunkForgedDialogResponses` | Integer | (#356, #663) Responses on a trunk call's Call-ID that came from an address other than the carrier the INVITE went to. Each was dropped. Logged at powers of two, like the field above. |
 | `trunkRefusedDialogByes` | Integer | (#356, #666) BYEs on a trunk call's Call-ID refused with `403` because they came neither from the carrier nor its Contact host and (for a Confirmed call) the dialog tags did not match. Logged at powers of two, like the fields above. |
+| `emergencyRtpReaps` | Integer | (#741) 911/933 calls the PBX ended because **both** legs had carried no RTP for 4 hours (the phone and the far end both vanished without a BYE). A live emergency call is never cut; non-zero means an emergency session was reclaimed and is worth a look in the log. |
+| `learnArpRequestsLimited` | Integer | (#864) In Learn mode, a REGISTER for a locked extension that misses in ARP and comes from the board's subnet gets no answer. The board ARPs its source instead, and checks the phone's retransmission against the lock. This counts the ARP requests held back: a recent source is asked at most once a second, and at most 16 requests go out per second in all. A real phone's retransmissions make it climb slowly. A fast climb means REGISTERs from many forged on-link sources. `0` with no engine attached. |
 | `e911Configured` | Boolean | (#450) `false` after a factory reset until the E911 notify list is set again; the dashboard shows a banner. Nothing is gated on it. |
 | `droppedInvalid` | Integer | (#430) The part of `packetsDropped` refused as malformed (null, or failing `isValidMessage()`). |
 | `droppedRate` | Integer | (#430) The part of `packetsDropped` refused by the allowlist or the per-IP rate limit. |
@@ -951,7 +962,11 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `stackHwm_rtp_media_tx` | Integer or `null` | Same, for `rtp_media_tx` (`src/SIP/RtpSender.cpp`). **`null` most of the time by design**; every `RtpSender` instance's task shares this one literal name, and the task exists only while ONE of them is actively sending: the 440/555/888/park internal media, or a WAN-anchor-bridged call the board terminates through `MediaBridge`/`TelephonyAnchorClient`. Never for an ordinary ext-to-ext call (peer-to-peer; the board never touches that media) and not between calls. Distinguish `null` from a `0` reading, which would mean the task is running with **no stack headroom left**, the near-overflow condition this field exists to catch. |
 | `stackHwm_rtp_media_rx` | Integer or `null` | Same, for `rtp_media_rx` (`src/SIP/RtpReceiver.cpp`), same shared-task-name and "any call the board terminates media for" caveat as `stackHwm_rtp_media_tx`. |
 | `stackHwm_conf_mix_tick` | Integer or `null` | Same, for `conf_mix_tick` (`src/SIP/ConferenceRoom.cpp`), the task the #185 mixer survey flagged: `MixBus::tick()` puts roughly 2.9 KB of locals on this task's 3072 byte stack, so a low reading here (as opposed to `null`, meaning no conference is active) is the number that says whether that margin is real. `null` whenever no conference is running. |
+| `stackHwm_tel_ctl0` / `stackHwm_tel_ctl1` | Integer or `null` | Same, for the anchor's two call-control workers (#657, `RequestsHandler::startTelCtl()`), which run makeCall and answerCall. Each has a 12 KB stack kept by precedent, not measurement: makeCall's TLS handshake runs on it, and the static stack gate cannot see that chain. A cold-handshake makeCall reading here is the evidence a smaller stack needs. `null` unless the boot anchor is a real one; `tel_ctl1` is also `null` on a build with `POCKETDIAL_MAX_ANCHOR_CALLS` 1, which has one worker. |
+| `stackHwm_tel_drop` | Integer or `null` | Same, for the worker that runs every anchor dropCall (#657). |
+| `stackHwm_tel_sos` | Integer or `null` | Same, for the worker that runs a 911/933 makeCall (#657). |
 | `stackHwm_http_conn` | Integer or `null` | The **worst** (smallest-free) stack figure any HTTP connection thread has reported since boot, in bytes — not a live-task lookup like the rows above, since a connection thread is gone by the time anyone reads this. It is what keeps `HttpServer::kHttpConnStackBytes` (#366) an evidence-backed number rather than an estimate: measured usage on `.244` is ~2752 bytes of the 4096 reserved. `null` until the first request has completed. |
+| `httpConnWorstRoute` | String or `null` | (#405) The route class that produced the `stackHwm_http_conn` minimum: method plus a path cut to its lower-case word segments (`GET /api/status`, `POST /api/coredump`), `provisioning` for a phone config fetch, `other` for anything else, `unparsed` when the connection ended before a request line was read. Never the raw path, so a MAC or extension in a URL is not disclosed. `null` on the host build and until the first request has completed. A numeric segment ends the label, so a slot activate and a slot test both read `POST /api/telephony-config`. |
 | `l2Tx` | Object | L2 transmit-path health (#328). See below. |
 | `l2Tx.poolAllocations` | Integer | Frames borrowed from the shared `DmaFramePool` (#330) since boot. **This is the field that says whether the L2 bypass is actually carrying media.** `HoldMusic::runLoop()` and `RtpSender::runLoop()` try the pooled L2 path first and fall back to `sendto()` *silently* when L2 addressing is not ready — nothing is logged unless the `sendto()` itself errors. During an active hold or call this should climb at the packet rate (50/s at 20 ms ptime); if it is flat while audio is flowing, the traffic is going out the socket path the pool exists to avoid, and any conclusion drawn about #328 from heap figures alone is unsound. Live on the host build too. |
 | `l2Tx.poolExhaustions` | Integer | Times `acquire()` found the pool empty and returned null, so the caller dropped that 20 ms frame and fell back. Non-zero means the pool is undersized for the concurrent transmit load, which is a different failure from "L2 addressing never became ready" — the two are indistinguishable from `poolAllocations` alone. |
@@ -999,6 +1014,7 @@ Disconnects a specified VoIP station, removing its registration and terminating 
 * Response Status Codes:
   * `200 OK`: Request accepted. See the note below on what this does *not* tell you.
   * `400 Bad Request`: `{"error":"missing extension parameter"}`, the body contains no `extension=`, or the value after it is empty.
+  * `409 Conflict`: `{"error":"extension is on an emergency call"}`. An admin kill never ends a 911/933 call (#714): nothing is disconnected and the extension stays registered.
   * `401`/`403`: gates 1-4 as in §0.1.
 
 > [!NOTE]
@@ -1016,8 +1032,8 @@ Disconnects a specified VoIP station, removing its registration and terminating 
 > [!NOTE]
 > **`200` means "the request was well-formed", not "an extension was disconnected".**
 > `RequestsHandler::forceDisconnect()` walks the client pool, releases the first
-> matching registration and returns nothing; an extension that is not registered is a
-> no-op. The response echoes back whatever string you sent either way. Read
+> matching registration and reports only whether it was refused (an emergency call,
+> `409`); an extension that is not registered is a no-op. The response echoes back whatever string you sent either way. Read
 > [`GET /api/status`](#get-apistatus)'s `clients[]` to confirm the registration is
 > actually gone.
 
@@ -1240,8 +1256,10 @@ Reports how a `REGISTER` is admitted, and which phones have been adopted.
   "attached": true,
   "mode": "learn",
   "devices": [
-    { "mac": "805ec079c37f", "extension": "1001", "state": "secured", "online": true },
-    { "mac": "805ec079c380", "extension": "1002", "state": "learned",  "online": false }
+    { "mac": "805ec079c37f", "extension": "1001", "state": "secured", "online": true,  "locked": true,  "shared": false },
+    { "mac": "805ec079c380", "extension": "1002", "state": "learned",  "online": false, "locked": true,  "shared": false },
+    { "mac": "805ec079c381", "extension": "1003", "state": "learned",  "online": true,  "locked": false, "shared": true  },
+    { "mac": "805ec079c382", "extension": "1004", "state": "learned",  "online": true,  "locked": false, "shared": false }
   ]
 }
 ```
@@ -1262,6 +1280,20 @@ Reports how a `REGISTER` is admitted, and which phones have been adopted.
 * `state`: `learned` (adopted on first contact, not yet enforced) or `secured`
   (MAC-locked and digest-enforced for its extension).
 * `online`: volatile registration state; never persisted.
+* `locked`, `shared` (#882): JSON booleans on every row, the registrar's own stored Learn
+  flags (#440), so an operator can tell which row to forget. Read-only: they change no
+  admission decision and are the same on every response that returns the roster.
+  * `locked`: Learn has bound `extension` to this MAC, and another MAC that registers it
+    is refused (`403`). Set by the phone's own later registration, at least 30 s after its
+    first (#515).
+  * `shared`: this MAC registered a second extension while it was unlocked, as phones
+    behind one NAT router do, or as a phone moved to another extension by hand does (#820).
+    The row keeps the extension it was adopted as and never locks; only forgetting the row
+    clears the flag. This is the row to forget when a phone was moved, or when its
+    extension should lock to a different device.
+  * Both `false` on a `learned` row: plain trust-on-first-use, seen but not locked yet.
+  * A `secured` row reports the flags it had when it was secured: `secure` does not change
+    them. It is MAC-locked and digest-enforced by its `state`, whatever `locked` says.
 
 > **Why this endpoint exists.** SIP digest authentication has been implemented and tested
 > for some time, but `setRegistrarMode()` was called from **unit tests only**; nothing in
@@ -1287,8 +1319,12 @@ curl -s "http://$DEV/api/registrar" -b "pd_session=$SESSION"
 
 * `learn`: trust-on-first-use, and the default. An unknown MAC registering an extension
   is adopted unverified, while already-secured devices stay digest-enforced and
-  MAC-locked. Adopt phones on a trusted/WPA2 link; an extension that is not secured can
-  still be claimed by any device that asks (#440).
+  MAC-locked. Since #440 the phone's next registration from the same MAC (the MAC its
+  source IP resolves to in the board's ARP table), at least 30 s after its first (#515),
+  also locks its extension to that MAC, if no earlier-adopted device holds the extension
+  (the first claim wins); another MAC then gets `403`. Until then, and for a phone on
+  another subnet or sharing a NAT router's MAC, any device that asks can claim it. Adopt
+  phones on a trusted/WPA2 link.
 * `open` (retired, #500): used to accept every `REGISTER` with no credential. A board that
   had it stored boots `learn` and rewrites the setting; a config import that says `open`
   applies `learn` and lists it under `skipped`.
@@ -1332,7 +1368,7 @@ curl -s -X POST "http://$DEV/api/registrar" \
 | Param | Values | Effect |
 | :--- | :--- | :--- |
 | `action` | `secure` \| `forget` | Required. |
-| `target` | 12-hex MAC, or an extension | Required. An extension resolves to the device currently bound to it. |
+| `target` | 12-hex MAC, or an extension | Required. An extension resolves to the one device that holds it. Two rows can hold one extension (a lock holder beside a later claim, or a stale row); then send the MAC (#820). |
 
 `secure` promotes a `learned` device to `secured`. `forget` drops the adoption record
 entirely; in `learn` mode the phone is re-adopted on its next registration, which is the
@@ -1345,6 +1381,8 @@ way to re-home an extension to different hardware.
   * `400 Bad Request`: `{"error":"action must be one of: secure, forget"}`
   * `401`/`403`: gates 1-4 as in §0.1.
   * `404 Not Found`: `{"error":"no adopted device matches that MAC or extension"}`, JSON, unlike the plain-text fallback `404` in §1.
+  * `409 Conflict`: `{"error":"more than one device holds that extension; send its MAC"}`. Nothing is changed (#820).
+  * `409 Conflict`: `{"error":"no SIP secret for ext <ext>"}`, for `secure` only: securing it would lock the phone out.
   * `503 Service Unavailable`: `{"error":"SIP engine not attached yet"}`
 
 ```bash
@@ -1355,6 +1393,25 @@ curl -s -X POST "http://$DEV/api/registrar/device" \
 curl -s -X POST "http://$DEV/api/registrar/device" \
      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
      -d "action=forget&target=1001"
+```
+
+### `POST /api/registrar/forget-learned`
+
+Forgets every `learned` device in one action (one NVS write); `secured` devices are kept.
+This is the recovery for a flood of adoptions that filled the device table (#515). Real
+phones are re-adopted on their next registration, a few per minute (see below). No body.
+
+* Response Status Codes:
+  * `200 OK`: Body is the `GET`'s `{attached, mode, devices}` shape, after the forget.
+  * `401`/`403`: gates 1-4 as in §0.1.
+
+Learn mode adopts at most 4 new MACs at once, then one more every 15 s. A REGISTER from a
+new MAC past that budget is answered `503 Service Unavailable` with a `Retry-After`
+(seconds until the next slot); known MACs never count against it.
+
+```bash
+curl -s -X POST "http://$DEV/api/registrar/forget-learned" \
+     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF"
 ```
 
 > **The MAC lock is not a cryptographic boundary.** It is learned from the ARP table, and
@@ -1824,6 +1881,17 @@ otherwise have reached the ordinary extension lookup; no rule, not even a catch-
 `*`, can shadow the echo test, a park retrieval, or a configured group extension.
 **A dialed number that matches no rule routes exactly as it did before the dial plan
 existed.**
+
+**Emergency aliases: write them as literals.** A `trunk` rule whose transform produces
+an emergency number (`911`, `933`, `9911` or `9933`) places an emergency call, with every
+exemption a dialed `911` gets. A **wildcard** rule of that kind (one with an `X`, or a
+trailing `*`) yields to a **registered** extension: under `11X` -> `911`, a call to a
+registered `112` rings `112`, as if the rule were not there. A **literal** rule never
+yields: `112` -> `911` places the emergency call even when a phone has registered as
+`112`. In Learn mode any device can register any free number, so a wildcard alias would
+let a device that registers as 112 capture 112. Write emergency aliases as literals.
+The yield follows registration only: an extension whose phone is offline is not
+protected from a wildcard rule. A dialed `911`/`933` never reaches the dial plan.
 
 **Pattern grammar** (deliberately tiny, no regex):
 

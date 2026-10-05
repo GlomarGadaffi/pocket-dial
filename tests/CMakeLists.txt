@@ -43,6 +43,7 @@ include_directories(${CMAKE_BINARY_DIR}/generated)
 
 add_executable(sip_parser_tests
     SipMessage_test.cpp
+    SipMessageBuilder_test.cpp
     # RFC regressions found by tests/interop/ (real pjsip stack): SDP answers
     # that invented payload types, Via received/rport naming the server instead
     # of the request source, and a non-2xx final response to a PBX-originated
@@ -74,12 +75,18 @@ add_executable(sip_parser_tests
     # applies them to every SDP-bearing message before any decode or relay.
     # Also pins the decode paths as zero-heap via a counting operator new.
     SdpAdmission_test.cpp
+    # Issue #199: the SIP/SDP wire grammar held to our RFC subset -- field
+    # bounds = the fixed buffers, 420/415/488, entry caps, and 911 never refused.
+    SipGrammar_test.cpp
     AllocBaseline_test.cpp
     # #462 (#284 batch A): parse, send and drain allocate nothing in steady state.
     HotPathInPlace_test.cpp
     # The binary's one counting operator new, plus its own positive controls.
     support/AllocCounter.cpp
     AllocCounter_test.cpp
+    PerCallHeap_test.cpp
+    # #838: a hostile many-line or long-line datagram must not grow a pool slot.
+    HeaderLinePinning_test.cpp
     # Issue #101(A)/(E): message-pool backpressure (refuse when spent; no heap
     # fallback since #409) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
@@ -183,6 +190,9 @@ add_executable(sip_parser_tests
     # 999 broadcast call through connect -> hold -> resume via handle().
     BroadcastHoldResume_test.cpp
     TargetRefreshContact_test.cpp
+    # Issues #797 / #798: address requests to the Contact the phone registered.
+    RegisteredContact_test.cpp
+    InboundAnchorReinvite_test.cpp
     # Issue #263: sdp::isHold() (#255) had zero production callers -- the two
     # non-anchor hold/resume sites (onReinvite, onUpdate) called the older
     # direction-only getSdpDirection() instead, missing the legacy RFC 2543
@@ -314,6 +324,9 @@ add_executable(sip_parser_tests
     # remote target), which is the easiest thing in a trunk to get wrong.
     SipTrunk_test.cpp
     TrunkWiring_test.cpp
+    # Issue #398 part B: a new INVITE from the SBC address is caught before the
+    # registered-caller checks, its DID looked up, and refused with a clean final.
+    TrunkInbound_test.cpp
     # Issue #164: carrier SBC resolution off the SIP thread. The blocking
     # getaddrinfo is ESP-only and untestable here; what IS tested is the part
     # that decides whether a configured host is an ADDRESS or a NAME (getting
@@ -321,6 +334,10 @@ add_executable(sip_parser_tests
     # stops a bad name re-queueing a ~21 s lookup per call attempt, and the
     # bounded-cache/in-flight state machine.
     TrunkResolver_test.cpp
+    # Issue #398 part A: SipTrunk as the UAS of a carrier's call -- the dialog
+    # from its INVITE, the 100/180/200 builders, the role-aware BYE, hangup and
+    # BYE tag rule -- and the outbound builders pinned byte for byte.
+    SipTrunkInbound_test.cpp
     PlayoutBuffer_test.cpp
     # Issue #466: clip placement policy, DmaFramePool's lock-free publish, the
     # PSRAM-preferring allocator behind PlayoutBuffer.
@@ -336,6 +353,9 @@ add_executable(sip_parser_tests
     # second real implementation, TelephonyAnchorClient, exists but isn't
     # exercised by this host suite — see its own test files below).
     AnchorRouting_test.cpp
+    # #657: a real anchor's makeCall/answerCall/dropCall run on boot-created
+    # workers behind bounded queues; drops and 911/933 never wait behind setup.
+    TelCtlPool_test.cpp
     # Issue #379: an INVITE for a dead dialog gets 481, never a new call.
     DeadDialogReinvite_test.cpp
     # The bounded Telephony-API credential slot table ported from drawbridge,
@@ -398,6 +418,13 @@ add_executable(sip_parser_tests
     CoreDumpHttp_test.cpp
     # Issue #397: the boot-time registrar default (fresh -> learn; existing -> learn too since #500).
     RegistrarBootMode_test.cpp
+    # Issue #515: Learn's new-adoption token bucket (503 + Retry-After) and the
+    # one-step forget of every Learned device.
+    LearnAdoptionLimit_test.cpp
+    # Issue #440: Learn locks an adopted extension to its device.
+    RegistrarLearnLock_test.cpp
+    # Issue #515 item 1: the locking sighting comes at least 30 s after the first.
+    LearnLockMinAge_test.cpp
     # Issue #363: every secret-bearing store is empty after a factory reset.
     FactoryResetSecrets_test.cpp
     # Issue #385: the brute-force state-recovery attack on IDGen, run for real
@@ -435,6 +462,15 @@ add_executable(sip_parser_tests
     # which for an ordinary proxied call's 486 (RFC 3261 mirrors the original
     # INVITE's From/To) names the caller, not the busy callee.
     CallForwardBusy_test.cpp
+    # Issue #746: a callee's 415/420/488/603 (and a ring-group member's refusal or
+    # loser's 487) reached onFinalFailure() and went nowhere: no relay, no ACK.
+    FinalFailureRelay_test.cpp
+    # Issue #802: the caller's ACK/BYE/CANCEL on a ring-group / zone / alias call
+    # were dispatched on the To literal and 404'd; they reach the member now.
+    GroupInDialog_test.cpp
+    # Issue #690 (slice 1): Session::Disposition is written once by the four outcome
+    # writers (486, 480, CANCEL, BYE) and cleared by reset().
+    SessionDisposition_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header
@@ -448,6 +484,9 @@ add_executable(sip_parser_tests
     # asserted at the wire level.
     CallPickup_test.cpp
     NoReplyToResponse_test.cpp
+    # Issue #453: in-dialog requests across a B2BUA splice (pickup, park,
+    # transfer) are rebuilt in the peer dialog, never relayed verbatim.
+    SpliceInDialog_test.cpp
     RegisterBeeper_test.cpp
     # Issue #148: the duplicate-tracking feedback loop between sweep()'s Timer-A
     # retransmit and drainOutbox()'s maybeTrack() scan, driven directly so the
@@ -479,6 +518,9 @@ add_executable(sip_parser_tests
     # Issue #523: a de-REGISTER (Expires: 0) is answered 200 at its source, not
     # 404 through endHandle()'s by-number lookup of the client it just released.
     Deregistration_test.cpp
+    # Issue #755: the REGISTER 200 lists the phone's own binding (RFC 3261 §10.3
+    # step 8), not the PBX's URI.
+    RegisterBinding_test.cpp
     # Issue #229: `Supported: replaces` backs onRefer()'s REFER ?Replaces=
     # attended-transfer splice (#131) only -- RFC 3891 §3's OTHER use of the
     # same tag, an INVITE that itself carries a Replaces header (the BLF-key
@@ -508,6 +550,8 @@ add_executable(sip_parser_tests
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
     ProvisioningConfig_test.cpp
+    # Part of #199: every message the PBX sends, recorded for tests/conformance.
+    EmittedConformance_test.cpp
     # SIP digest-auth primitives + per-extension HA1 secret store. Both are
     # host-compilable: SipDigest vendors a portable MD5 (no mbedTLS) and
     # SipSecretStore uses an in-memory map under !ESP_PLATFORM (no NVS).
@@ -517,6 +561,7 @@ add_executable(sip_parser_tests
     # touches a socket by design (see its header: the caller owns the _outbox vs
     # _asyncOutbox choice), so it links into the host suite with no stub arm.
     ../src/SIP/SipRegistrationClient.cpp
+    ../src/SIP/SipMessageBuilder.cpp
     # ArpLookup compiles to a host stub (returns nullopt — no ARP table off-device)
     # under !ESP_PLATFORM, so it links cleanly into the host test binary and lets
     # RequestsHandler's Learn-mode path build on the desktop.
@@ -663,6 +708,8 @@ add_executable(sip_parser_tests
     RecentIdRing_test.cpp
     # Issue #554 (#575 review): rx restart decision + tombstone refusal.
     RxRestart_test.cpp
+    # Issue #384 (H1): the bench probe image's pure decisions (BenchProbeLogic.hpp).
+    BenchProbeLogic_test.cpp
     # The DTMF digit-collection state machine + CLASS/admin codes, extracted
     # out of RequestsHandler into its own translation unit.
     ../src/SIP/DtmfFeatureCodes.cpp
@@ -764,3 +811,24 @@ else()
 endif()
 
 add_test(NAME sip_parser_tests COMMAND sip_parser_tests)
+
+# Part of #199: every message the PBX sends, judged by pjsip's parser and an
+# RFC 3261 checklist against tests/conformance/emitted_allowlist.txt. The
+# EmittedConformance_test.cpp scenarios inside sip_parser_tests write the
+# transcript; the checker reads it. One run of the suite, not two: a second,
+# filtered run would overwrite the gtest JSON report the test-count floor reads.
+# Linux only (the pjsip oracle is built from a pjproject tree: $PJDIR, else
+# ~/pjproject). The checker fails closed without it unless
+# PD_CONFORMANCE_ALLOW_NO_PJSIP=1 is set, which the gate never does.
+if (NOT WIN32)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(EMITTED_TRANSCRIPT ${CMAKE_CURRENT_BINARY_DIR}/emitted_transcript.jsonl)
+    set_tests_properties(sip_parser_tests PROPERTIES
+        ENVIRONMENT "PD_EMITTED_TRANSCRIPT=${EMITTED_TRANSCRIPT}"
+        FIXTURES_SETUP emitted_transcript)
+    add_test(NAME emitted_conformance
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/conformance/emitted_conformance.py
+                ${EMITTED_TRANSCRIPT}
+                --pjsip-build ${CMAKE_CURRENT_BINARY_DIR}/pjsip_check_build)
+    set_tests_properties(emitted_conformance PROPERTIES FIXTURES_REQUIRED emitted_transcript)
+endif()

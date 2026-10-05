@@ -343,7 +343,11 @@ class BaresipUA:
         ])
         with open(os.path.join(self.cfgdir, "config"), "w") as f:
             f.write(cfg)
-        acct = "<sip:%s@%s>;auth_pass=%s;outbound=\"sip:%s:%d\";regint=300;answermode=auto;audio_codecs=PCMU,PCMA\n" % (
+        # answermode=manual: BS only ever dials. Auto-answering the PBX's
+        # register-beep call put the PBX's BYE right on "Call established",
+        # and baresip 1.1.0's aufile teardown race then died ("auframe: init:
+        # unsupported sample format"), breaking mixed_stack's ctrl pipe.
+        acct = "<sip:%s@%s>;auth_pass=%s;outbound=\"sip:%s:%d\";regint=300;answermode=manual;audio_codecs=PCMU,PCMA\n" % (
             self.ext, PBX_IP, self.ext, PBX_IP, PBX_SIP_PORT)
         with open(os.path.join(self.cfgdir, "accounts"), "w") as f:
             f.write(acct)
@@ -745,10 +749,10 @@ def sc_mixed_stack(env):
 # heap/stack telemetry (#235 item 3)
 # --------------------------------------------------------------------------
 # HttpServer::sendApiStatus() (src/Helpers/HttpServer.cpp) emits an additive
-# JSON block for Issue #185: 8 heap counters, resetReason, and 5 per-task
+# JSON block for Issue #185: 8 heap counters, resetReason, and 9 per-task
 # stackHwm_* fields. Everything in it is #if defined(ESP_PLATFORM); the #else
 # arm emits the same key set with every reading replaced by 0 (the 8 numeric
-# fields) or JSON null (the 5 stackHwm_* fields) -- see that file's own
+# fields) or JSON null (the 9 stackHwm_* fields) -- see that file's own
 # comment and docs/API.md, which documents "0 on the host build" / "null on
 # the host build" for each field. #225/#321 (Issue #185, #235) wired real,
 # non-zero readings for these keys on-device; nothing exercised that wiring
@@ -793,12 +797,13 @@ TELEMETRY_NUMERIC_FIELDS = (
     "freeHeapInternal", "largestFreeBlockInternal",
     "freeHeapDma", "largestFreeBlockDma",
 )
-# The 5 per-task fields: int on-device (when that task exists / has run),
+# The 9 per-task fields: int on-device (when that task exists / has run),
 # JSON null (-> Python None) otherwise -- always PRESENT as a key, on both
 # platforms, per docs/API.md.
 TELEMETRY_HWM_FIELDS = (
     "stackHwm_sip_server_task", "stackHwm_udp_receiver_task",
     "stackHwm_rtp_media_tx", "stackHwm_rtp_media_rx", "stackHwm_conf_mix_tick",
+    "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos",
 )
 
 
@@ -835,7 +840,7 @@ def telemetry_check(status):
             return False, ("host build must report 0/null (docs/API.md), got "
                            "numeric=%s hwm=%s" % (bad_numeric, bad_hwm)), snapshot
         return True, ("host build: shape verified (8 numeric fields=0, "
-                      "5 stackHwm_*=null, by construction)"), snapshot
+                      "9 stackHwm_*=null, by construction)"), snapshot
 
     # Not reachable from this harness today (see the module comment above),
     # kept honest anyway: a real device reading must be an actual int, not
@@ -1005,6 +1010,23 @@ def sc_session_refresh(env):
                   "Session-Expires=%s; %s" % (b_got, contact_ok, survived, bye_detail))
 
 
+def sc_mwi(env):
+    """#745: pjsua --mwi SUBSCRIBEs to message-summary after it registers. The PBX
+    must 202 it and send a NOTIFY with a simple-message-summary body (empty
+    mailbox: Messages-Waiting: no) that pjsua accepts with a 200."""
+    m = env["M"]
+    if not m.registered():
+        return report("mwi", "FAIL", "M never registered")
+    got = m.wait_log(r"RX \d+ bytes Request msg NOTIFY[^\n]*\n(?:.*\n){0,30}?Messages-Waiting: no", 10)
+    log = m.log_since(0)
+    accepted = re.search(r"Response msg 202/SUBSCRIBE", log) is not None
+    acked = re.search(r"TX \d+ bytes Response msg 200/NOTIFY", log) is not None
+    ok = bool(got) and accepted and acked
+    return report("mwi", "OK" if ok else "FAIL",
+                  "SUBSCRIBE 202=%s, NOTIFY Messages-Waiting: no=%s, pjsua 200 to NOTIFY=%s"
+                  % (accepted, bool(got), acked))
+
+
 SCENARIOS = [
     ("register", sc_register),
     ("echo777_rtp", sc_echo777_rtp),
@@ -1020,6 +1042,7 @@ SCENARIOS = [
     ("session_refresh", sc_session_refresh),
     ("mixed_stack", sc_mixed_stack),
     ("heap_telemetry", sc_heap_telemetry),
+    ("mwi", sc_mwi),
 ]
 
 
@@ -1078,6 +1101,11 @@ def main():
         # scenario's calls run with a 90 s timer.
         PjsuaUA("T", "606", 16, 5176, 6600, 2316,
                 extra=["--timer-se=90", "--timer-min-se=90"]),
+        # M subscribes to its own mailbox (RFC 3842 message-summary, #745). The
+        # SUBSCRIBE targets the AOR (--id has no port, so 5060); the proxy routes
+        # it to the PBX's test port instead.
+        PjsuaUA("M", "607", 17, 5177, 6700, 2317,
+                extra=["--mwi", "--proxy=sip:%s:%d;lr" % (PBX_IP, PBX_SIP_PORT)]),
     ]
     for ua in uas:
         env[ua.name] = ua.start(pjsua)

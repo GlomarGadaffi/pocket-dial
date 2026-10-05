@@ -168,6 +168,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # needs carrier credentials. Built here so the
                             # firmware and the host suite compile the same code.
                             "../src/SIP/SipRegistrationClient.cpp"
+                            "../src/SIP/SipMessageBuilder.cpp"
                             "../src/SIP/RegisterBeeper.cpp"
                             "../src/SIP/SipTrunk.cpp"
                             "../src/SIP/TrunkResolver.cpp"
@@ -192,6 +193,9 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/PlayoutBuffer.cpp"
                             "../src/SIP/LoopbackAnchorClient.cpp"
                             "../src/SIP/TelephonyAnchorClient.cpp"
+                            # Issue #384 (H1): the bench probe's glue. Compiles to NOTHING
+                            # unless the bench probe option below is on.
+                            "../src/SIP/BenchProbe.cpp"
                             "../src/SIP/MediaBridge.cpp"
                             # Issue #246 (voicemail, Stage 3 of #194): the 1:1 record/playback leg.
                             "../src/SIP/VoicemailLeg.cpp"
@@ -257,7 +261,7 @@ endif()
 # heaviest consumer (one std::string buffer per slot), so it gets cut the most.
 # These override the #ifndef defaults in src/SIP/PoolConfig.hpp (32/8/32).
 # Pair with sdkconfig.defaults.esp32_constrained + partitions_4mb.csv:
-#   idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 \
+#   idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=anchor \
 #          -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
 #          set-target esp32 build
 if(SIP_CONSTRAINED)
@@ -265,6 +269,8 @@ if(SIP_CONSTRAINED)
         POCKETDIAL_MAX_CLIENTS=8
         POCKETDIAL_MAX_SESSIONS=4
         POCKETDIAL_MSG_POOL=8
+        # #838: 4 KB of header-line buffer per pooled message (PoolConfig.hpp).
+        POCKETDIAL_KEPT_LINE_BYTES=4096
         # Issue #466: no PSRAM on this profile, so a MoH clip or voicemail
         # greeting can only live in internal DRAM -- capped at 16 KB (2 s of
         # 8 kHz mu-law), loaded at boot/admin upload only, refused and counted
@@ -280,7 +286,19 @@ if(SIP_CONSTRAINED)
         POCKETDIAL_MAX_VOICEMAIL_LEGS=1
         POCKETDIAL_MAX_TRUNK_CALLS=1
         POCKETDIAL_RTP_TX_POOL=3
-        POCKETDIAL_CONFERENCE=0)
+        POCKETDIAL_CONFERENCE=0
+        # #689: the 4 MB app slot is full at -Og, so the #618 trunk wire dump
+        # (full INVITE + REGISTER response) is compiled out here.
+        POCKETDIAL_TRUNK_WIRE_LOG=0
+        # #483/#689: the 4 MB app slot is full at -Og, so the config backup's
+        # trunk/SMTP/E911/admin_ext section is compiled out here; an import
+        # that carries it says so under "skipped".
+        POCKETDIAL_BACKUP_SECTION_C=0
+        # #398: no inbound carrier calls here; the slot is full. An INVITE from
+        # the SBC is refused 403 as before.
+        POCKETDIAL_TRUNK_INBOUND=0
+        # MWI (RFC 3842) compiled out: the slot is tight; message-summary 489s.
+        POCKETDIAL_MWI=0)
     # #416: the pcap ring is fixed storage (ring x ~2.1 KB), and a constrained build
     # has no PSRAM (sdkconfig.defaults.esp32_constrained: CONFIG_SPIRAM=n), so all of
     # it is internal DRAM. 4 slots ~= 8.4 KB instead of 16 ~= 33.7 KB. Set as a CMake
@@ -289,8 +307,38 @@ if(SIP_CONSTRAINED)
     if(NOT DEFINED POCKETDIAL_PCAP_RING_SIZE)
         set(POCKETDIAL_PCAP_RING_SIZE 4)
     endif()
-    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 conference=off rtpslots=3x3KBtx+4x6KBrx+1x6KBanchor=39KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
+    message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 conference=off mwi=off rtpslots=3x3KBtx+4x6KBrx+1x6KBanchor=39KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
 endif()
+
+# Issue #731: the constrained build carries exactly ONE outside-line path, chosen at
+# configure time -- the 3CX telephony anchor OR the SIP trunk, never both:
+#   -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=anchor|trunk
+# It is required with SIP_CONSTRAINED and refused without it, so the knob can never
+# silently do nothing (the failure the pcap plumbing below was written to avoid).
+# Every other build keeps both paths. The result reaches the source as two 0/1
+# defines read with #if (SIP_CONSTRAINED is a CMake variable only, so an #if on it
+# guards nothing); PoolConfig.hpp gives host builds the both-on default.
+set(_pd_has_anchor 1)
+set(_pd_has_trunk 1)
+if(SIP_CONSTRAINED)
+    if(NOT SIP_OUTSIDE_LINE)
+        message(FATAL_ERROR "SIP_CONSTRAINED=1 needs -D SIP_OUTSIDE_LINE=anchor or trunk: "
+                            "the constrained build carries exactly one outside-line path (#731)")
+    elseif(SIP_OUTSIDE_LINE STREQUAL "anchor")
+        set(_pd_has_trunk 0)
+    elseif(SIP_OUTSIDE_LINE STREQUAL "trunk")
+        set(_pd_has_anchor 0)
+    else()
+        message(FATAL_ERROR "SIP_OUTSIDE_LINE must be 'anchor' or 'trunk', got '${SIP_OUTSIDE_LINE}' (#731)")
+    endif()
+elseif(SIP_OUTSIDE_LINE)
+    message(FATAL_ERROR "SIP_OUTSIDE_LINE=${SIP_OUTSIDE_LINE} only applies with SIP_CONSTRAINED=1; "
+                        "other builds keep both outside-line paths (#731)")
+endif()
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    POCKETDIAL_HAS_ANCHOR=${_pd_has_anchor}
+    POCKETDIAL_HAS_TRUNK=${_pd_has_trunk})
+message(STATUS "SipServer outside line: anchor=${_pd_has_anchor} trunk=${_pd_has_trunk}")
 
 # PcapCapture.hpp has always advertised itself as "compile-time tunable
 # (-DPOCKETDIAL_PCAP_RING_SIZE=N)", but nothing translated that CMake variable
@@ -324,6 +372,19 @@ endif()
 if(POCKETDIAL_RESET_INTERRUPT_PROBE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_RESET_INTERRUPT_PROBE=1)
     message(WARNING "SipServer: RESET INTERRUPT PROBE image -- bench only, a factory reset restarts before erasing (#473)")
+endif()
+
+# Issue #384 (H1): BENCH-ONLY anchor probe image (docs/BENCH_PROBE.md): one-shot anchor
+# faults, DRAM ballast and fired counters on an owner-gated /api/bench/fault. Its stamp
+# ends in -probe (top-level CMakeLists.txt). Never ship it, never leave it on a rig.
+# Refused off eth and on SIP_CONSTRAINED: no rig runs those, and the 4 MB slot has no room.
+if(POCKETDIAL_ANCHOR_BENCH_PROBE)
+    if(NOT SIP_TRANSPORT STREQUAL "eth" OR SIP_CONSTRAINED)
+        message(FATAL_ERROR "POCKETDIAL_ANCHOR_BENCH_PROBE needs SIP_TRANSPORT=eth without SIP_CONSTRAINED; "
+                            "got SIP_TRANSPORT='${SIP_TRANSPORT}' SIP_CONSTRAINED='${SIP_CONSTRAINED}' (#384)")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_ANCHOR_BENCH_PROBE=1)
+    message(WARNING "SipServer: ANCHOR BENCH PROBE image -- bench only, faults and DRAM ballast on /api/bench/fault (#384)")
 endif()
 
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)

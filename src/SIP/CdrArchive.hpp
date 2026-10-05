@@ -20,12 +20,13 @@
 // pieces of context it already has locally and previously discarded -- the
 // Call-ID and the disposition `reason` string -- ALONGSIDE the CallDetailRecord
 // CdrRing::record() just wrote (reusing its already-derived startMs/duration/
-// result rather than re-deriving them). Direction, trunk/DID attribution and
-// codec (also named in the epic) are NOT included: nothing on the call path
-// available at endCall() cheaply carries them today (Session has no trunk/DID/
-// codec field), and threading them through would touch call-routing code well
-// beyond this stage's "minimal hook into endCall()" boundary -- filed as
-// issue #221 rather than attempted here.
+// result rather than re-deriving them). Trunk/DID attribution and codec (also
+// named in the epic) are NOT included: nothing on the call path available at
+// endCall() cheaply carries them today (Session has no DID/codec field), and
+// threading them through would touch call-routing code well beyond this
+// stage's "minimal hook into endCall()" boundary -- tracked in issue #221.
+// Direction IS included, as the last column (issue #221): endCall() can derive
+// it from flags Session already carries -- see directionFor().
 //
 // SD WRITE DISCIPLINE (issue #194 prereq 1b, non-negotiable). `sdspi`'s
 // poll_busy() is a hard busy-spin and routine card GC stalls 100-250 ms --
@@ -92,6 +93,32 @@ struct QueuedLine
 	char line[600] = {};
 };
 
+// Which way a call went, as far as the PBX can tell from the Session's flags
+// (issue #221). "internal" is every call that never touched the anchor or the
+// trunk: extension to extension, plus the service legs (777/440/888/park/
+// voicemail). There is no inbound trunk path today (SipTrunk is outbound-only),
+// so "inbound" is the anchor's ring-all inbound call.
+enum class Direction : uint8_t { Internal, Inbound, Outbound };
+
+inline const char* directionToString(Direction d)
+{
+	switch (d)
+	{
+		case Direction::Inbound:  return "inbound";
+		case Direction::Outbound: return "outbound";
+		default:                  return "internal";
+	}
+}
+
+// Pure. `anchorInbound` wins over `anchor` because an inbound anchor session
+// has both flags set (Session::setAnchor + setAnchorInbound).
+inline Direction directionFor(bool anchor, bool anchorInbound, bool trunk)
+{
+	if (anchorInbound) return Direction::Inbound;
+	if (anchor || trunk) return Direction::Outbound;
+	return Direction::Internal;
+}
+
 // The CSV header row a fresh daily file gets before its first data row.
 const char* csvHeader();
 
@@ -113,7 +140,7 @@ const char* csvHeader();
 // -- since there is no honest date to file the row under.
 bool formatLine(const CallDetailRecord& rec, std::string_view callId,
 	std::string_view reason, uint64_t nowEpochSeconds, uint64_t nowSteadyMs,
-	QueuedLine& out);
+	QueuedLine& out, Direction direction = Direction::Internal);
 
 // ── Sink: what actually persists a formatted line ───────────────────────────
 // Production implementation (CdrArchive.cpp, PD_ETH_HAS_SD only) appends to
@@ -185,7 +212,8 @@ void init();
 // RequestsHandler::_mutex (see endCall()). No-op when no Sink is installed
 // (no card, non-eth-SD build, or init() not yet called) or the wall clock has
 // never synced (see formatLine()'s doc comment).
-void record(const CallDetailRecord& rec, std::string_view callId, std::string_view reason);
+void record(const CallDetailRecord& rec, std::string_view callId, std::string_view reason,
+	Direction direction);
 
 // Synchronous directory wipe. NOT SIP-thread-safe by the rules above --
 // deletes files, so call it only from a non-realtime context that does not

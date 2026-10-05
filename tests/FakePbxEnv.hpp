@@ -65,8 +65,15 @@ public:
 	// (#581 review: fail ONE specific draw, e.g. only a challenge retry's INVITE).
 	int messagePoolFailDrawIn = 0;
 
+	// Call-IDs passed to endSession(), in order; the session is dropped as endCall() would.
+	std::vector<std::string> endedCallIds;
+
 	// Call-IDs passed to freeTransactionsForCallId(), in order.
 	std::vector<std::string> freedTransactionCallIds;
+
+	// {Call-ID, CSeq method} of every client transaction the layer gave up on
+	// and reported through onClientTransactionTimeout() (#726), in order.
+	std::vector<std::pair<std::string, std::string>> transactionTimeouts;
 
 	static sockaddr_in addr(const char* ip, uint16_t port)
 	{
@@ -112,6 +119,15 @@ public:
 	void freeTransactionsForCallId(std::string_view callId) override
 	{
 		freedTransactionCallIds.emplace_back(callId);
+	}
+	void endSession(std::string_view callId, std::string_view /*reason*/) override
+	{
+		endedCallIds.emplace_back(callId);
+		sessions.erase(std::string(callId));
+	}
+	void onClientTransactionTimeout(std::string_view callId, std::string_view cseqMethod) override
+	{
+		transactionTimeouts.emplace_back(std::string(callId), std::string(cseqMethod));
 	}
 	void log(std::string msg, bool /*isError*/ = false) override
 	{

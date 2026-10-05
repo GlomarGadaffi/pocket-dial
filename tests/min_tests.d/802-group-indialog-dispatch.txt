@@ -1,0 +1,2 @@
+# GroupInDialog_test.cpp: 6 (#802: caller ACK/BYE/CANCEL on ring-group, zone and dial-rule alias calls; member BYE direction guard)
+6

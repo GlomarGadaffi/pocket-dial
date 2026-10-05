@@ -5,6 +5,7 @@
 // startRxIfNeeded() makes about a call slot's rx task, pulled out so the host
 // suite can pin them (the anchor client itself is ESP-only).
 
+#include <cstdint>
 #include <string_view>
 
 #include "ParkedTaskReap.hpp"
@@ -65,6 +66,22 @@ namespace pd
 	inline bool rxStartAllowedFor(const RecentIdRing<N, Len>& droppedLegs, std::string_view participantId)
 	{
 		return !droppedLegs.contains(participantId);
+	}
+
+	// #743: a 911/933 placed while a call slot is still tearing down (the
+	// victim of a #624 pre-emption on the async anchor, or a call that ended a
+	// moment before) finds no slot on makeCall()'s first ask: stopMediaStreams()
+	// joins the old rx task for up to 2 s before it frees the slot, and a task
+	// that outlives the join parks within one more 2 s client timeout. A leg
+	// left unkeyed gets no rx pump, and its next upsert reads as a new inbound
+	// call. So an emergency makeCall() keeps asking for 4 s (desmo, #878); an
+	// ordinary call gets its one ask, as before. Bounded: a slot still held
+	// after that is not waited on, and the 911 is refused (#821).
+	inline constexpr int64_t kEmergencySlotWaitUs = 4'000'000;
+	inline constexpr int     kEmergencySlotPollMs = 100;
+	inline bool emergencySlotRetryContinues(bool emergency, bool primed, int64_t waitedUs)
+	{
+		return emergency && !primed && waitedUs < kEmergencySlotWaitUs;
 	}
 }
 

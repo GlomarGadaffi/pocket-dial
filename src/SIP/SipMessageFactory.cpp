@@ -3,7 +3,7 @@
 
 std::optional<std::shared_ptr<SipMessage>> SipMessageFactory::createMessage(std::string_view message, sockaddr_in src)
 {
-	auto msg = RequestsHandler::getMessageFromPool(message, src);
+	auto msg = RequestsHandler::getMessageFromWire(message, src);   // #838: a datagram keeps 64 lines
 	if (!msg)
 	{
 		return std::nullopt;

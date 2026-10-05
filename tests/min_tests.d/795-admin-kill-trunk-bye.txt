@@ -1,0 +1,2 @@
+# TrunkWiring_test.cpp: 1 (#795: an admin kill of a trunk call BYEs the handset exactly once, From us)
+1

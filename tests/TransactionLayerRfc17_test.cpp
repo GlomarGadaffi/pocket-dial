@@ -173,6 +173,39 @@ TEST(TxNonInviteClient, TimerFGivesUpAndNamesTheMethod)
 	EXPECT_EQ(tx.activeClientTransactions(), 0u);
 }
 
+TEST(TxNonInviteClient, TimerFTellsTheTuFromTryingAndFromProceeding)
+{
+	// #726: §17.1.2.2 informs the TU on Timer F from BOTH states. Unlike Timer
+	// B, a provisional does not take the give-up timer off the table for a
+	// non-INVITE: a 100 to our BYE followed by nothing is still a lost BYE.
+	FakePbxEnv env;
+	TransactionLayer tx(env);
+	const auto trying     = request("BYE", kPhone, "z9hG4bK-bye-trying", "call-trying@pbx");
+	const auto proceeding = request("BYE", kPhone, "z9hG4bK-bye-proc", "call-proceeding@pbx");
+	tx.maybeTrack(kPhone, trying);
+	tx.maybeTrack(kPhone, proceeding);
+	ASSERT_TRUE(tx.matchAndAdvance(
+		response("100 Trying", "BYE", kPhone, "z9hG4bK-bye-proc", "call-proceeding@pbx")));
+
+	const auto t0 = std::chrono::steady_clock::now();
+	tx.sweep(t0 + std::chrono::seconds(40));
+
+	// The TU is handed SipMessage::getCallID()'s form (the full header line,
+	// the key the engine's session map uses), so the expectation is read off
+	// the message rather than restated.
+	auto told = [&](std::string_view callId) {
+		for (const auto& [id, method] : env.transactionTimeouts)
+		{
+			if (id == callId && method == "BYE") return true;
+		}
+		return false;
+	};
+	EXPECT_EQ(env.transactionTimeouts.size(), 2u);
+	EXPECT_TRUE(told(trying->getCallID())) << "Trying: no response at all";
+	EXPECT_TRUE(told(proceeding->getCallID())) << "Proceeding: a 100, then nothing";
+	EXPECT_EQ(tx.activeClientTransactions(), 0u);
+}
+
 TEST(TxNonInviteClient, AckAndKeepalivePingsAndRegisterAreNeverTracked)
 {
 	FakePbxEnv env;

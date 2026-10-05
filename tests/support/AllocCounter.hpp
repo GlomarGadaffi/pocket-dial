@@ -7,7 +7,8 @@
 // binary. There can only be one replacement per binary, so any test that wants
 // to assert "this path touches no heap" includes this header rather than
 // defining its own. Memory still comes from malloc/free; counting is the only
-// behavioural change. Deallocations are not counted.
+// behavioural change. The allocation counts below never go down; the live
+// totals further on do, on every operator delete.
 //
 // COUNTED: every C++ operator new / new[], including the over-aligned
 // (std::align_val_t) and nothrow forms.
@@ -31,6 +32,15 @@ std::size_t heapAllocCount();
 // this block" assertions: other threads in the binary (RtpSender's pacer, the
 // conference tick driver) allocate concurrently and would add noise.
 std::size_t threadHeapAllocCount();
+
+// Blocks, and their usable bytes, currently held through operator new, across
+// every thread. Unlike the counts above these go down on operator delete, so
+// they measure retention: a path that frees all it took leaves them unchanged,
+// whichever thread does the freeing. heapLiveTracked() is false where the C
+// library cannot report a block's size; both then stay 0.
+std::size_t heapLiveBlocks();
+std::size_t heapLiveBytes();
+bool heapLiveTracked();
 
 // Counts the calling thread's allocations between construction and delta().
 class AllocGuard

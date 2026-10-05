@@ -43,6 +43,10 @@ namespace pd
 		// #479 A (#661): each anchor CallSlot's tel_media_rx stack is boot-allocated too.
 		constexpr uint32_t kAnchorRxStackBytes = 6144;
 		constexpr uint32_t kAnchorRxBytes      = POCKETDIAL_MAX_ANCHOR_CALLS * kAnchorRxStackBytes;
+		// #479: the conference room's one mix-tick task (conf_mix_tick) is a boot
+		// allocation too: 3 KB internal (+ its TCB), only when a room is built.
+		// Not in the no-PSRAM 72 KB budget above, which builds no room.
+		constexpr uint32_t kConfMixStackBytes  = 3072;
 	}
 }
 

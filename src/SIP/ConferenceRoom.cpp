@@ -1,5 +1,5 @@
 #include "ConferenceRoom.hpp"
-#include "PsramAllocator.hpp"   // #479: psram::dynamicTaskCreates()
+#include "RtpTaskSlots.hpp"     // #479: pd::rtpslots::kConfMixStackBytes
 
 #include <chrono>
 
@@ -30,12 +30,28 @@ ConferenceRoom::ConferenceRoom()
 		ESP_LOGE("ConferenceRoom", "mix bus at %p is not %u-byte aligned -- every join is refused",
 			static_cast<void*>(&_bus), static_cast<unsigned>(alignof(MixBus)));
 	}
+	// Issue #479: conf_mix_tick's stack + TCB are boot allocations (internal RAM,
+	// as the task always used); a room whose allocation failed refuses startDriver().
+	_driverMem.alloc("conf_mix_tick", pd::rtpslots::kConfMixStackBytes,
+	                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #endif
 }
 
 ConferenceRoom::~ConferenceRoom()
 {
 	stopDriver();
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Issue #479: the parked task's one deleter. Its stack + TCB (_driverMem) are
+	// deliberately never freed: the idle task may still be reading a deleted
+	// static task's TCB, and the room lives for the life of the process anyway.
+	// A driver that did not stop in time is left alone (deleting a task that is
+	// inside MixBus::tick() would be worse than leaking its handle).
+	if (_driverTask != nullptr && !_driverRunning.load(std::memory_order_acquire))
+	{
+		vTaskDelete(_driverTask);
+		_driverTask = nullptr;
+	}
+#endif
 	std::lock_guard<std::mutex> lock(_mutex);
 	for (auto& leg : _legs)
 	{
@@ -210,10 +226,11 @@ void ConferenceRoom::runDriver()
 	// THIS task (conf_mix_tick) only -- see main/esp_main*.cpp's sip_server_task
 	// comment for why esp_task_wdt_reset() cannot be called on another task's
 	// behalf. Unlike sip_server_task (subscribed once at boot, never
-	// unsubscribed), this task is created and destroyed with every conference
-	// (startDriver()/stopDriver()), so it MUST unsubscribe before exiting below
-	// -- a subscribed handle that is deleted without esp_task_wdt_delete() keeps
-	// the TWDT waiting for a reset that can never come, turning a clean,
+	// unsubscribed), this task runs one session per conference
+	// (startDriver()/stopDriver()) and PARKS between them (#479), so it MUST
+	// unsubscribe before returning below -- a subscribed task that parks without
+	// esp_task_wdt_delete() keeps the TWDT waiting for a reset that can never
+	// come, turning a clean,
 	// unremarkable conference teardown into a guaranteed watchdog panic on the
 	// next timeout, not a missing safety net but an actively worse one.
 	esp_err_t wdtErr = esp_task_wdt_add(NULL);
@@ -259,8 +276,17 @@ void ConferenceRoom::runDriver()
 
 void ConferenceRoom::taskTrampoline(void* arg)
 {
-	static_cast<ConferenceRoom*>(arg)->runDriver();
-	vTaskDelete(nullptr);
+	// Issue #479: never returns and never deletes itself. Parked between
+	// conferences; startDriver() gives the notification that starts the next
+	// session (a give that lands before this take is not lost). runDriver()
+	// unsubscribes from the TWDT before it returns, so a parked task is not
+	// watched.
+	ConferenceRoom* room = static_cast<ConferenceRoom*>(arg);
+	for (;;)
+	{
+		(void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		room->runDriver();
+	}
 }
 
 void ConferenceRoom::startDriver()
@@ -275,17 +301,21 @@ void ConferenceRoom::startDriver()
 	// Core 0 alongside the SIP engine and the RTP media tasks (Issue #49: the display
 	// build reserves Core 1 for LVGL). Priority 6 matches RtpSender's media task so the
 	// mix tick is not starved by signaling bursts — it IS the master clock.
-	BaseType_t ok = xTaskCreatePinnedToCore(
-		&ConferenceRoom::taskTrampoline, "conf_mix_tick", 3072, this, 6, nullptr, 0);
-	if (ok != pdPASS)
+	// Issue #479: created once, on the boot-allocated _driverMem (no heap on the
+	// dial-in path); every later start just wakes the parked task.
+	if (_driverTask == nullptr && _driverMem.stack != nullptr)
+	{
+		_driverTask = xTaskCreateStaticPinnedToCore(
+			&ConferenceRoom::taskTrampoline, "conf_mix_tick", _driverMem.bytes, this, 6,
+			_driverMem.stack, _driverMem.tcb, 0);
+	}
+	if (_driverTask == nullptr)
 	{
 		_driverRunning.store(false, std::memory_order_release);
 		ESP_LOGE("ConferenceRoom", "mix tick task could not be created");
+		return;
 	}
-	else
-	{
-		psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
-	}
+	xTaskNotifyGive(_driverTask);
 }
 
 void ConferenceRoom::stopDriver()

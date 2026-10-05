@@ -5,6 +5,7 @@
 #include <chrono>
 
 #include "DialPlan.hpp"
+#include "EmergencyCall.hpp"
 #include "IDGen.hpp"
 #include "Session.hpp"
 #include "SipClient.hpp"
@@ -206,10 +207,26 @@ std::shared_ptr<SipMessage> CallForker::buildCancel(const std::shared_ptr<SipMes
 	auto cancelMsg = sipmsgpool::getMessageFromPool(*invite);
 	if (!cancelMsg) return nullptr;   // pool exhausted: propagate, caller drops (#101A)
 
-	std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
+	// RFC 3261 §9.1: the CANCEL's Request-URI and To must equal those of the INVITE
+	// it cancels (#749). buildInviteFork() rewrites both to the target, and that is
+	// rebuilt below. A leg that went out as `invite` itself keeps them untouched: an
+	// ordinary direct call relays the caller's INVITE as received, and a server-built
+	// leg (blind transfer) stores the INVITE as sent. Both name the target in To, so
+	// that is the test. `cancelMsg` is a copy of `invite` and already carries its To.
+	const std::string_view inviteLine = invite->getHeader();
+	constexpr std::string_view kInviteMethod = "INVITE";
+	if (invite->getToNumber() == target->getNumber() &&
+		inviteLine.substr(0, kInviteMethod.size()) == kInviteMethod)
+	{
+		cancelMsg->setHeader("CANCEL" + std::string(inviteLine.substr(kInviteMethod.size())));
+	}
+	else
+	{
+		std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
 
-	cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
-	cancelMsg->setTo("To: <sip:" + target->getNumber() + "@" + serverIpPort + ">");
+		cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
+		cancelMsg->setTo("To: <sip:" + target->getNumber() + "@" + serverIpPort + ">");
+	}
 
 	std::string cseq(invite->getCSeq());
 	size_t invitePos = cseq.find("INVITE");
@@ -339,6 +356,25 @@ void CallForker::routeRingGroup(const std::shared_ptr<SipMessage>& data,
 	huntRingNext(newSession);   // ring the first member, arm its timeout
 }
 
+const pbx::DialRule* CallForker::matchDialRule(const std::string& dialed) const
+{
+	int registered = -1;   // asked only once a wildcard rule would make a 911 of `dialed`
+	for (const pbx::DialRule& r : _cfg.dialPlan().rules())
+	{
+		if (!pbx::dialPatternMatches(r.pattern, dialed)) continue;
+		std::string transformed;
+		if (r.action == pbx::DialActionType::Trunk && pbx::dialPatternHasWildcard(r.pattern) &&
+			pbx::applyTrunkTransform(dialed, r.stripDigits, r.target, transformed) &&
+			pbx::classifyEmergencyDial(transformed).isEmergency)
+		{
+			if (registered < 0) registered = _env.findRegistered(dialed) ? 1 : 0;
+			if (registered == 1) continue;
+		}
+		return &r;
+	}
+	return nullptr;
+}
+
 bool CallForker::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 	const std::shared_ptr<SipClient>& caller,
 	const std::string& destNumber)
@@ -350,7 +386,7 @@ bool CallForker::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 
 	if (!_cfg.dialPlan().empty())
 	{
-		rule = _cfg.dialPlan().match(destNumber);
+		rule = matchDialRule(destNumber);
 	}
 
 	if (!rule)
@@ -373,6 +409,13 @@ bool CallForker::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 		if (!_cfg.sbcEnabled())
 		{
 			return false;   // fallthrough — routing continues exactly as it did pre-#69
+		}
+		// #796: the fallback is for numbers this PBX does not own. A registered
+		// client is ours: fall through to CFU/DND/ordinary delivery instead of
+		// leaking an internal call out the billable trunk.
+		if (_env.findRegistered(destNumber))
+		{
+			return false;
 		}
 		sbcFallback.pattern = "*";
 		sbcFallback.action = pbx::DialActionType::Trunk;

@@ -31,8 +31,8 @@ namespace
 	// added) still fits QueuedLine::line with room to spare:
 	//   timestamp(20) + ',' + callId(2*64+2=130) + ',' + caller(2*48+2=98) +
 	//   ',' + callee(98) + ',' + duration(10) + ',' + result(11) + ',' +
-	//   reason(2*48+2=98) + 6 commas = 20+130+98+98+10+11+98+6 = 471,
-	// against a 600-byte buffer.
+	//   reason(2*48+2=98) + ',' + direction(8) + 7 commas =
+	//   20+130+98+98+10+11+98+8+7 = 480, against a 600-byte buffer.
 	constexpr size_t kMaxCallIdRaw = 64;
 	constexpr size_t kMaxAorRaw    = 48;  // caller/callee -- see CallDetailRecord.hpp's
 	                                      // updated comment: anchor-sourced values
@@ -79,12 +79,12 @@ namespace
 
 const char* csvHeader()
 {
-	return "timestamp,call_id,caller,callee,duration_sec,result,reason";
+	return "timestamp,call_id,caller,callee,duration_sec,result,reason,direction";
 }
 
 bool formatLine(const CallDetailRecord& rec, std::string_view callId,
 	std::string_view reason, uint64_t nowEpochSeconds, uint64_t nowSteadyMs,
-	QueuedLine& out)
+	QueuedLine& out, Direction direction)
 {
 	out = QueuedLine{};
 
@@ -125,7 +125,10 @@ bool formatLine(const CallDetailRecord& rec, std::string_view callId,
 	const char* resultStr = cdrResultToString(rec.result);
 	appendCsvField(out.line, sizeof(out.line), used, resultStr, std::strlen(resultStr), ',');
 
-	appendCsvField(out.line, sizeof(out.line), used, reason, kMaxReasonRaw, '\0');
+	appendCsvField(out.line, sizeof(out.line), used, reason, kMaxReasonRaw, ',');
+
+	const char* directionStr = directionToString(direction);
+	appendCsvField(out.line, sizeof(out.line), used, directionStr, std::strlen(directionStr), '\0');
 
 	return true;
 }
@@ -241,7 +244,8 @@ size_t pendingForTest()
 	return queue().size();
 }
 
-void record(const CallDetailRecord& rec, std::string_view callId, std::string_view reason)
+void record(const CallDetailRecord& rec, std::string_view callId, std::string_view reason,
+	Direction direction)
 {
 	Sink* sink;
 	{
@@ -258,7 +262,7 @@ void record(const CallDetailRecord& rec, std::string_view callId, std::string_vi
 			std::chrono::steady_clock::now().time_since_epoch()).count());
 
 	QueuedLine line;
-	if (!formatLine(rec, callId, reason, nowEpoch, nowSteadyMs, line)) return;
+	if (!formatLine(rec, callId, reason, nowEpoch, nowSteadyMs, line, direction)) return;
 
 	queue().push(line);  // non-blocking; silently dropped if the queue is full
 }

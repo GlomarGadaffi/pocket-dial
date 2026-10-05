@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "AllocCounter.hpp"
+#include "ArpLookup.hpp"
 #include "HttpServer.hpp"
 #include "PsramAllocator.hpp"   // #479: psram::dynamicTaskCreates()
 #include "RequestsHandler.hpp"
@@ -157,6 +158,58 @@ TEST(HttpStatusAlloc, TheDynamicTaskCreateCountIsOnStatus)
 	EXPECT_NE(resp.find("\"dynamicTaskCreates\":" + std::to_string(before + 3) + "}"), std::string::npos)
 		<< resp;
 	psram::dynamicTaskCreates().store(before);
+}
+
+TEST(HttpStatusAlloc, TheTelCtlWorkerStackWatermarksAreOnStatus)
+{
+	// #657: the anchor's call-control workers keep 12 KB stacks by precedent (a
+	// TLS handshake runs on them); their high-water marks are the evidence any
+	// smaller size needs. null on the host build, like every stackHwm_* field.
+	StatusBench b;
+	const std::string resp = b.serve(false);
+	for (const char* key : { "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos" })
+	{
+		EXPECT_NE(resp.find(std::string("\"") + key + "\":null"), std::string::npos) << key << " missing from /api/status";
+	}
+}
+
+TEST(HttpStatusAlloc, TheHandlerBugCountersAreOnStatusAndPacketsDroppedIsTheirSum)
+{
+	// #702 item 19 (desmo): repliesRefused (#424) and optionsPingTruncated (#463)
+	// were readable only by tests; a board could never show them. Both are now
+	// on /api/status. packetsDropped is derived from the two per-reason counts,
+	// so it equals their sum exactly. One malformed datagram is the positive
+	// control that the fields carry live values, not constants.
+	StatusBench b;
+	b.handler->handle(RequestsHandler::getMessageFromPool("not sip at all\r\n\r\n", sockaddr_in{}));
+	const std::string resp = b.serve(false);
+	EXPECT_NE(resp.find("\"repliesRefused\":0,"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"optionsPingTruncated\":0,"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"byeTruncated\":0,"), std::string::npos) << resp;   // #744
+	EXPECT_NE(resp.find("\"packetsDropped\":1,"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"droppedInvalid\":1,"), std::string::npos) << resp;
+	EXPECT_EQ(b.handler->getPacketsDropped(), b.handler->getDroppedInvalid() + b.handler->getDroppedRate());
+}
+
+TEST(HttpStatusAlloc, LearnArpRequestsLimitedIsOnStatus)
+{
+	// #864 review (Stray): the ARP requests held back for unanswered Learn
+	// REGISTERs are visible on a board. Two copies of a REGISTER for a locked
+	// extension from an on-link source that never answers ARP: the second
+	// copy's request is held back.
+	struct ClearMocks { ~ClearMocks() { ArpLookup::clearMockMacs(); } } clearMocks;
+	StatusBench b;
+	EXPECT_NE(b.serve(false).find("\"learnArpRequestsLimited\":0,"), std::string::npos);
+	b.handler->setRegistrarMode(RequestsHandler::RegistrarMode::Learn);
+	b.handler->adoptDeviceForTest("020000000021", "201", Registrar::DeviceState::Learned, /*locked=*/true);
+	sockaddr_in src{};
+	src.sin_family = AF_INET;
+	inet_pton(AF_INET, "10.0.0.50", &src.sin_addr);
+	ArpLookup::setMockOnLink(src, std::nullopt);
+	b.handler->handle(makeRegister("201"));
+	b.handler->handle(makeRegister("201"));
+	const std::string resp = b.serve(false);
+	EXPECT_NE(resp.find("\"learnArpRequestsLimited\":1,"), std::string::npos) << resp;
 }
 
 #endif

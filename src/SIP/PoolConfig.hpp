@@ -55,6 +55,17 @@
 #define POCKETDIAL_MAX_SUBSCRIPTIONS 16
 #endif
 
+// RFC 3842 message-waiting (MWI). Shares the BLF subscription table above; the
+// per-mailbox {new, old} counts live in a fixed table of POCKETDIAL_MWI_MAILBOXES
+// entries (~36 B each). 0 compiles MWI out (SIP_CONSTRAINED sets it): the
+// package is then refused 489 like any other.
+#ifndef POCKETDIAL_MWI
+#define POCKETDIAL_MWI 1
+#endif
+#ifndef POCKETDIAL_MWI_MAILBOXES
+#define POCKETDIAL_MWI_MAILBOXES 32
+#endif
+
 // Depth of the shared in-flight SipMessage scratch pool.
 //
 // The worst-case simultaneous draw happens when a 999 all-page builds one forked
@@ -68,6 +79,21 @@
 // ceiling on in-flight messages. Override to claw back RAM on a constrained node.
 #ifndef POCKETDIAL_MSG_POOL
 #define POCKETDIAL_MSG_POOL (POCKETDIAL_MAX_CLIENTS + POCKETDIAL_MAX_SUBSCRIPTIONS + 4)
+#endif
+
+// #838: header-line buffer bytes one pooled SipMessage keeps between messages
+// (SipLimits::kMaxKeptLineBytes). It bounds the line buffers only: the two
+// string arrays behind them add up to 64 parked and ~128 in-use entries (24 B
+// each on the ESP32, ~4.5 KB), and the start line and body are not covered.
+// Pool-wide that is POCKETDIAL_MSG_POOL x ~12.5 KB at most: 52 x 12.5 KB ~= 650 KB
+// on the S3 defaults if every slot were filled at once, mostly internal DRAM
+// (allocations under 16 KB go there first). 8 KB is four 2 KB datagrams' worth:
+// one message's lines in use and one parked, each up to twice its size after
+// string growth, so legitimate traffic never trims. SIP_CONSTRAINED sets 4 KB
+// (8 slots, ~68 KB): there a near-maximum message can trim, freeing parked
+// buffers that a later long message allocates again.
+#ifndef POCKETDIAL_KEPT_LINE_BYTES
+#define POCKETDIAL_KEPT_LINE_BYTES 8192
 #endif
 
 // Issue #409: neither pool has a heap fallback any more (#101A's
@@ -256,6 +282,26 @@
 // nest one inside another.
 #ifndef POCKETDIAL_MAX_TRUNK_CALLS
 #define POCKETDIAL_MAX_TRUNK_CALLS 2
+#endif
+
+// Issue #731: which outside-line paths this build carries. The constrained build
+// (main/CMakeLists.txt, -D SIP_OUTSIDE_LINE=anchor|trunk) sets exactly one of these
+// to 1; every other build, host tests included, keeps both. Nothing reads them yet:
+// compiling the unchosen path out is the rest of #731.
+#ifndef POCKETDIAL_HAS_ANCHOR
+#define POCKETDIAL_HAS_ANCHOR 1
+#endif
+#ifndef POCKETDIAL_HAS_TRUNK
+#define POCKETDIAL_HAS_TRUNK 1
+#endif
+static_assert(POCKETDIAL_HAS_ANCHOR || POCKETDIAL_HAS_TRUNK,
+              "a build needs at least one outside-line path (#731)");
+
+// Issue #398: calls the carrier sends in over the SIP trunk. 0 (SIP_CONSTRAINED,
+// whose 4 MB app slot has ~1.5 KB left after #689) keeps onInvite as it was: an
+// INVITE from the SBC is refused 403 like any other unregistered caller.
+#ifndef POCKETDIAL_TRUNK_INBOUND
+#define POCKETDIAL_TRUNK_INBOUND 1
 #endif
 
 // Number of concurrent voicemail legs (Issue #246, Stage 3 of #194) -- deposit

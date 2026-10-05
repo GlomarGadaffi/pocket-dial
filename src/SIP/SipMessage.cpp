@@ -4,8 +4,10 @@
 #include <vector>
 #include <cctype>
 #include "SipMessageTypes.h"
+#include "EmergencyCall.hpp"   // #199: urn:service:sos, isEmergencyRequest(); #760: tel:911, urn:service:test.sos
 #include <cstring>
 #include <cctype>
+#include <cstdint>
 
 namespace
 {
@@ -36,6 +38,35 @@ namespace
 			if (std::tolower(static_cast<unsigned char>(a[i])) !=
 				std::tolower(static_cast<unsigned char>(b[i]))) return false;
 		return true;
+	}
+
+	// First case-insensitive occurrence of an ASCII-lowercase needle, or npos.
+	size_t ifindLower(std::string_view hay, std::string_view lowerNeedle)
+	{
+		if (lowerNeedle.empty() || hay.size() < lowerNeedle.size()) return std::string_view::npos;
+		for (size_t i = 0; i + lowerNeedle.size() <= hay.size(); ++i)
+		{
+			size_t k = 0;
+			while (k < lowerNeedle.size() &&
+				std::tolower(static_cast<unsigned char>(hay[i + k])) == lowerNeedle[k]) ++k;
+			if (k == lowerNeedle.size()) return i;
+		}
+		return std::string_view::npos;
+	}
+
+	// delta-seconds (RFC 4028 §3: Session-Expires, Min-SE), SATURATING at
+	// UINT32_MAX. A plain uint32_t accumulator wraps, so "4294967296" read as 0
+	// -- "no timer" -- and "4294967326" read as 30, which the 422 floor then
+	// answered as if the phone had asked for 30 s (#739).
+	uint32_t deltaSecondsOf(std::string_view v)
+	{
+		uint64_t val = 0;
+		for (size_t i = 0; i < v.size() && v[i] >= '0' && v[i] <= '9'; ++i)
+		{
+			val = val * 10 + static_cast<uint64_t>(v[i] - '0');
+			if (val > UINT32_MAX) return UINT32_MAX;
+		}
+		return static_cast<uint32_t>(val);
 	}
 
 	// Header name = text before the first ':', with surrounding whitespace
@@ -95,13 +126,47 @@ namespace
 		return lines[n++];
 	}
 
-	// Park everything past the first `n` lines, buffers intact.
+	// Park everything past the first `n` lines, buffers intact, up to
+	// SipLimits::kMaxHeaderLines of them (#838); a line past that is freed.
 	void parkSurplus(std::vector<std::string>& lines, std::vector<std::string>& spare, size_t n)
 	{
 		while (lines.size() > n)
 		{
-			spare.push_back(std::move(lines.back()));
+			if (spare.size() < SipLimits::kMaxHeaderLines) spare.push_back(std::move(lines.back()));
 			lines.pop_back();
+		}
+	}
+
+	size_t heapBytesOf(const std::string& s, size_t inlineCapacity)
+	{
+		return s.capacity() > inlineCapacity ? s.capacity() : 0;
+	}
+
+	// #838: lines are reused in place by position, so a long line at a
+	// different position in each datagram would leave every position holding a
+	// large buffer. Past SipLimits::kMaxKeptLineBytes, parked buffers are freed
+	// first (no allocation), then a line holding more than it needs is given an
+	// exact-size buffer. Legitimate traffic stays under the budget, so only a
+	// run of oversized lines ever pays for an allocation here.
+	void capKeptLineBytes(std::vector<std::string>& lines, std::vector<std::string>& spare)
+	{
+		const size_t inlineCapacity = std::string().capacity();
+		size_t kept = 0;
+		for (const std::string& s : lines) kept += heapBytesOf(s, inlineCapacity);
+		for (const std::string& s : spare) kept += heapBytesOf(s, inlineCapacity);
+		for (std::string& s : spare)
+		{
+			if (kept <= SipLimits::kMaxKeptLineBytes) return;
+			kept -= heapBytesOf(s, inlineCapacity);
+			std::string().swap(s);
+		}
+		for (std::string& s : lines)
+		{
+			if (kept <= SipLimits::kMaxKeptLineBytes) return;
+			const size_t before = heapBytesOf(s, inlineCapacity);
+			if (before == 0 || s.capacity() == s.size()) continue;
+			std::string(s).swap(s);
+			kept = kept - before + heapBytesOf(s, inlineCapacity);
 		}
 	}
 
@@ -114,9 +179,14 @@ namespace
 	// Every output is written with assign() into storage that survives the call
 	// (see nextLine()/parkSurplus() above), so parsing into a warmed pooled
 	// message allocates nothing.
-	void splitMessage(std::string_view raw, std::string& startLine,
+	//
+	// #838: keeps at most `maxLines` header lines and returns true when there
+	// were more. Storing every line of a datagram and counting afterwards let
+	// one 2 KB datagram of short lines leave ~1000 line buffers in a pooled
+	// message for good, refused or not.
+	bool splitMessage(std::string_view raw, std::string& startLine,
 		std::vector<std::string>& headerLines, std::vector<std::string>& spare,
-		std::string& body)
+		std::string& body, size_t maxLines)
 	{
 		startLine.clear();
 		body.clear();
@@ -147,7 +217,7 @@ namespace
 		if (headerBlock.empty())
 		{
 			parkSurplus(headerLines, spare, 0);
-			return;
+			return false;
 		}
 
 		size_t pos_start = 0;
@@ -163,13 +233,14 @@ namespace
 		{
 			startLine.assign(headerBlock);
 			parkSurplus(headerLines, spare, 0);
-			return;
+			return false;
 		}
 
 		// assign(), not `= std::string(...)`: the temporary always allocated.
 		startLine.assign(headerBlock.substr(pos_start, pos_end - pos_start));
 		pos_start = pos_end + lineDelimLen;
 
+		bool tooMany = false;
 		while (pos_start < headerBlock.size())
 		{
 			pos_end = headerBlock.find("\r\n", pos_start);
@@ -194,17 +265,27 @@ namespace
 
 			if (!line.empty())
 			{
+				if (n == maxLines)
+				{
+					tooMany = true;
+					break;
+				}
 				nextLine(headerLines, spare, n).assign(line);
 			}
 		}
 		parkSurplus(headerLines, spare, n);
+		capKeptLineBytes(headerLines, spare);
+		return tooMany;
 	}
+
+	// A message the PBX built keeps every line (#838).
+	constexpr size_t kEveryLine = static_cast<size_t>(-1);
 }
 
 SipMessage::SipMessage(const std::string& message, sockaddr_in src) : _src(src)
 {
 	_hasSdp = mentionsSdpContentType(message);
-	splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body);
+	_headerLinesTruncated = splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body, kEveryLine);
 }
 
 // Member-wise copy of everything EXCEPT _bodyGen, which advances instead — see
@@ -230,6 +311,8 @@ SipMessage& SipMessage::operator=(const SipMessage& other)
 		nextLine(_headerLines, _spareHeaderLines, n).assign(line);
 	}
 	parkSurplus(_headerLines, _spareHeaderLines, n);
+	capKeptLineBytes(_headerLines, _spareHeaderLines);
+	_headerLinesTruncated = other._headerLinesTruncated;
 	_body        = other._body;
 	_src         = other._src;
 	++_bodyGen;
@@ -238,11 +321,22 @@ SipMessage& SipMessage::operator=(const SipMessage& other)
 
 void SipMessage::reset(std::string_view message, sockaddr_in src)
 {
+	resetWithin(message, src, kEveryLine);
+}
+
+void SipMessage::resetFromWire(std::string_view message, sockaddr_in src)
+{
+	resetWithin(message, src, SipLimits::kMaxHeaderLines);
+}
+
+void SipMessage::resetWithin(std::string_view message, sockaddr_in src, size_t maxHeaderLines)
+{
 	_src = src;
 	_hasSdp = mentionsSdpContentType(message);
 	// splitMessage() clear()s _headerLines rather than reassigning it, so a
 	// pooled message's vector capacity survives across reset() calls.
-	splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body);
+	_headerLinesTruncated = splitMessage(message, _startLine, _headerLines, _spareHeaderLines, _body,
+		maxHeaderLines);
 	++_bodyGen;   // this is the pool-recycle path — see bodyGeneration()
 }
 
@@ -282,6 +376,17 @@ size_t SipMessage::findHeaderIndex(std::string_view fullName, std::string_view c
 
 void SipMessage::insertHeaderLine(std::string value)
 {
+	// A new line takes a parked buffer when there is one. Adopting `value`'s
+	// instead, while every reset() parks the surplus line, grew a pooled message
+	// by one string per inserted header each time it was reused: the per-call
+	// heap leak (888 answers, REGISTER 200s). Total line buffers now stay at the
+	// most this message has held at once.
+	if (!_spareHeaderLines.empty())
+	{
+		_spareHeaderLines.back().assign(value);
+		value.swap(_spareHeaderLines.back());
+		_spareHeaderLines.pop_back();
+	}
 	size_t clIdx = findHeaderIndex("content-length", "l");
 	if (clIdx != std::string::npos)
 	{
@@ -657,6 +762,10 @@ SipMessage::SdpVerdict SipMessage::checkSdp() const
 	if (body.size() > kMaxBodyBytes) return SdpVerdict::BodyTooLarge;
 
 	unsigned lines = 0;
+	// #199: the model's caps. Recorded, not returned, until the walk ends, so
+	// every body refused before keeps exactly the verdict it had.
+	unsigned sections = 0, attrs = 0, activeAudio = 0;
+	SdpVerdict modelVerdict = SdpVerdict::Ok;
 	size_t pos = 0;
 	while (pos < body.size())
 	{
@@ -707,8 +816,30 @@ SipMessage::SdpVerdict SipMessage::checkSdp() const
 		}
 		// m=<media> <port> <proto> <fmt>...: everything past the third token is a format.
 		if (line[0] == 'm' && tokens > 3 + kMaxMediaFormats) return SdpVerdict::TooManyMediaFormats;
+
+		// #199: the same section / attribute caps sdp::parse() fails closed on,
+		// so a body this gate admits is one the model can hold. Counted only.
+		if (modelVerdict != SdpVerdict::Ok) continue;
+		if (line[0] == 'm')
+		{
+			attrs = 0;
+			if (++sections > kMaxMediaSections) modelVerdict = SdpVerdict::TooManyMediaSections;
+			// m=audio <port>...: a port of 0 is a removed stream, not an active one.
+			else if (line.rfind("m=audio ", 0) == 0)
+			{
+				size_t p = 8;
+				while (p < line.size() && line[p] == '0') ++p;
+				const bool zeroPort = p > 8 && (p == line.size() || line[p] == ' ' || line[p] == '/');
+				if (!zeroPort && ++activeAudio > kMaxActiveAudioStreams) modelVerdict = SdpVerdict::TooManyAudioStreams;
+			}
+		}
+		else if (line[0] == 'a' &&
+			++attrs > (sections == 0 ? kMaxSessionAttributes : kMaxAttributesPerSection))
+		{
+			modelVerdict = SdpVerdict::TooManyAttributes;
+		}
 	}
-	return SdpVerdict::Ok;
+	return modelVerdict;
 }
 
 const char* SipMessage::sdpVerdictText(SdpVerdict v)
@@ -724,8 +855,204 @@ const char* SipMessage::sdpVerdictText(SdpVerdict v)
 		case SdpVerdict::TooManyMediaFormats:   return "too many media formats";
 		case SdpVerdict::BadAttributeName:      return "bad attribute name";
 		case SdpVerdict::CapabilityNegotiation: return "capability negotiation (RFC 5939) not supported";
+		case SdpVerdict::TooManyMediaSections:  return "too many media sections";
+		case SdpVerdict::TooManyAttributes:     return "too many attributes";
+		case SdpVerdict::TooManyAudioStreams:   return "more than one audio stream";
 	}
 	return "rejected";
+}
+
+namespace
+{
+	// Entries in one header value: 1 + commas outside "quoted" and <angle> parts.
+	unsigned countEntries(std::string_view v)
+	{
+		unsigned n = 1;
+		bool quoted = false;
+		int angle = 0;
+		for (char c : v)
+		{
+			if (c == '"') quoted = !quoted;
+			else if (quoted) continue;
+			else if (c == '<') ++angle;
+			else if (c == '>') { if (angle > 0) --angle; }
+			else if (c == ',' && angle == 0) ++n;
+		}
+		return n;
+	}
+
+	std::string_view trimWs(std::string_view s)
+	{
+		while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+		while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.remove_suffix(1);
+		return s;
+	}
+
+	// {1,maxDigits} decimal digits, value <= maxValue, nothing else.
+	bool boundedNumber(std::string_view s, size_t maxDigits, uint64_t maxValue)
+	{
+		if (s.empty() || s.size() > maxDigits) return false;
+		uint64_t v = 0;
+		for (char c : s)
+		{
+			if (c < '0' || c > '9') return false;
+			v = v * 10 + static_cast<uint64_t>(c - '0');
+		}
+		return v <= maxValue;
+	}
+
+	// Option tags this PBX honours in Require (RFC 3261 §8.2.2.3). "timer":
+	// RFC 4028 is honoured passively (pjsua sends Require: timer on every
+	// INVITE). "replaces": RFC 3891, see kSupportedOptionTags in
+	// RequestsHandler.cpp. Everything else -- 100rel (no PRACK), path, gruu,
+	// outbound, sec-agree -- is a 420.
+	// A Content-Type value naming SDP. Media type only: parameters after ';' do
+	// not change what we parse.
+	bool isSdpMediaType(std::string_view contentTypeValue)
+	{
+		return iequalLower(trimWs(contentTypeValue.substr(0, contentTypeValue.find(';'))), "application/sdp");
+	}
+
+	bool isKnownOptionTag(std::string_view tag)
+	{
+		return iequalLower(tag, "timer") || iequalLower(tag, "replaces");
+	}
+}
+
+SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported) const
+{
+	using namespace SipLimits;
+	unsupported = {};
+	const bool isRequest = !getStatusInfo().has_value();
+	const std::string_view method = getType();
+
+	// Buffer bounds: every message, since responses reach the same slots.
+	if (getCallID().size() > kMaxCallIdLine) return HeaderVerdict::CallIdTooLong;
+	if (getViaBranch().size() > kMaxBranch) return HeaderVerdict::BranchTooLong;
+	{
+		// CSeq: 1*10DIGIT LWS Method (RFC 3261 §20.16), number < 2^31.
+		const std::string_view v = trimWs(headerValueOf(getCSeq()));
+		const size_t sp = v.find_first_of(" \t");
+		if (sp == std::string_view::npos) return HeaderVerdict::BadCSeq;
+		const std::string_view m = trimWs(v.substr(sp));
+		if (!boundedNumber(v.substr(0, sp), kMaxCSeqDigits, 0x7FFFFFFFu) ||
+			m.empty() || m.size() > kMaxCSeqMethod || m.find_first_of(" \t") != std::string_view::npos)
+		{
+			return HeaderVerdict::BadCSeq;
+		}
+	}
+	if (!isRequest) return HeaderVerdict::Ok;
+
+	if (_headerLinesTruncated || _headerLines.size() > kMaxHeaderLines) return HeaderVerdict::TooManyHeaders;
+
+	const bool checkRequire = method != SipMessageTypes::ACK && method != SipMessageTypes::CANCEL;
+	const bool checkBody = !_body.empty() &&
+		(method == SipMessageTypes::INVITE || method == SipMessageTypes::UPDATE);
+	unsigned via = 0, route = 0, recordRoute = 0, contact = 0;
+	bool sdpBody = false;
+	for (const std::string& line : _headerLines)
+	{
+		const std::string_view name = headerNameOf(line);
+		const std::string_view value = headerValueOf(line);
+		if (iequal(name, "via") || iequal(name, "v"))
+		{
+			via += countEntries(value);
+			if (via > kMaxVia) return HeaderVerdict::TooManyVia;
+		}
+		else if (iequal(name, "route"))
+		{
+			route += countEntries(value);
+			if (route > kMaxRoute) return HeaderVerdict::TooManyRoute;
+		}
+		else if (iequal(name, "record-route"))
+		{
+			recordRoute += countEntries(value);
+			if (recordRoute > kMaxRecordRoute) return HeaderVerdict::TooManyRecordRoute;
+		}
+		else if (iequal(name, "contact") || iequal(name, "m"))
+		{
+			contact += countEntries(value);
+			if (contact > kMaxContact) return HeaderVerdict::TooManyContact;
+		}
+		else if (iequal(name, "max-forwards"))
+		{
+			if (!boundedNumber(trimWs(value), 3, kMaxMaxForwards)) return HeaderVerdict::BadMaxForwards;
+		}
+		else if (checkRequire && (iequal(name, "require") || iequal(name, "proxy-require")))
+		{
+			std::string_view rest = value;
+			while (!rest.empty())
+			{
+				const size_t comma = rest.find(',');
+				const std::string_view tag = trimWs(rest.substr(0, comma));
+				rest = (comma == std::string_view::npos) ? std::string_view{} : rest.substr(comma + 1);
+				if (!tag.empty() && !isKnownOptionTag(tag))
+				{
+					unsupported = tag;
+					return HeaderVerdict::UnsupportedOption;
+				}
+			}
+		}
+		else if (iequal(name, "content-type") || iequal(name, "c"))
+		{
+			sdpBody = isSdpMediaType(value);
+		}
+	}
+	// RFC 3261 §21.4.13: a body we do not parse, or one with no Content-Type.
+	if (checkBody && !sdpBody) return HeaderVerdict::UnsupportedMediaType;
+	return HeaderVerdict::Ok;
+}
+
+bool SipMessage::hasSdpContentType() const
+{
+	for (const std::string& line : _headerLines)
+	{
+		const std::string_view name = headerNameOf(line);
+		if ((iequal(name, "content-type") || iequal(name, "c")) && isSdpMediaType(headerValueOf(line))) return true;
+	}
+	return false;
+}
+
+const char* SipMessage::headerVerdictText(HeaderVerdict v)
+{
+	switch (v)
+	{
+		case HeaderVerdict::Ok:                   return "ok";
+		case HeaderVerdict::TooManyHeaders:       return "too many header lines";
+		case HeaderVerdict::CallIdTooLong:        return "Call-ID too long";
+		case HeaderVerdict::BranchTooLong:        return "Via branch too long";
+		case HeaderVerdict::BadCSeq:              return "malformed CSeq";
+		case HeaderVerdict::BadMaxForwards:       return "malformed Max-Forwards";
+		case HeaderVerdict::TooManyVia:           return "too many Via entries";
+		case HeaderVerdict::TooManyRoute:         return "too many Route entries";
+		case HeaderVerdict::TooManyRecordRoute:   return "too many Record-Route entries";
+		case HeaderVerdict::TooManyContact:       return "too many Contact entries";
+		case HeaderVerdict::UnsupportedOption:    return "unsupported option tag";
+		case HeaderVerdict::UnsupportedMediaType: return "unsupported body type";
+	}
+	return "rejected";
+}
+
+bool SipMessage::isPsapCallback() const
+{
+	for (const std::string& line : _headerLines)
+	{
+		if (iequal(headerNameOf(line), "priority") &&
+			iequalLower(trimWs(headerValueOf(line)), "psap-callback"))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool SipMessage::isEmergencyRequest() const
+{
+	if (getStatusInfo().has_value()) return false;
+	if (getType() != SipMessageTypes::INVITE) return false;
+	// #824: by the To user alone, the number onInvite routes on. A 911
+	// Request-URI over To 102 is a call to 102 and gets no emergency yield.
+	return pbx::classifyEmergencyDial(getToNumber()).isEmergency || isPsapCallback();
 }
 
 void SipMessage::syncContentLength()
@@ -780,6 +1107,78 @@ void SipMessage::setBody(const std::string& body)
 	_body = body;
 	++_bodyGen;
 	syncContentLength();   // keep Content-Length honest (the 777-bug class)
+}
+
+bool SipMessage::unwrapMultipartSdp()
+{
+	const size_t ctIdx = findHeaderIndex("content-type", "c");
+	if (ctIdx == std::string::npos) return false;
+	const std::string_view ct = headerValueOf(_headerLines[ctIdx]);
+	if (ifindLower(ct, "multipart/") != 0) return false;
+	// RFC 2046 §5.1.1: boundary=<token> or boundary="<quoted>", 1 to 70 bytes.
+	const size_t bpos = ifindLower(ct, "boundary=");
+	if (bpos == std::string_view::npos) return false;
+	std::string_view boundary = ct.substr(bpos + 9);
+	if (!boundary.empty() && boundary.front() == '"')
+	{
+		boundary.remove_prefix(1);
+		boundary = boundary.substr(0, boundary.find('"'));
+	}
+	else
+	{
+		boundary = boundary.substr(0, boundary.find_first_of("; \t\r"));
+	}
+	if (boundary.empty() || boundary.size() > 70) return false;
+
+	// One flat walk, the same loop checkSdp() uses. A delimiter line is "--"
+	// + boundary (the closing one adds "--"). A part's header lines run to its
+	// first empty line; its body then runs to the CRLF before the next
+	// delimiter, which RFC 2046 §5.1.1 gives to the delimiter, not the part.
+	const std::string_view body(_body);
+	size_t pos = 0;
+	bool inHeaders = false;
+	bool sdpPart = false;
+	size_t sdpStart = std::string_view::npos;
+	size_t sdpEnd = std::string_view::npos;
+	while (pos < body.size())
+	{
+		const size_t lineStart = pos;
+		const std::string_view line = nextSdpLine(body, pos);
+		if (line.size() >= boundary.size() + 2 && line[0] == '-' && line[1] == '-' &&
+			line.substr(2, boundary.size()) == boundary)
+		{
+			if (sdpStart != std::string_view::npos)
+			{
+				sdpEnd = lineStart;
+				if (sdpEnd > sdpStart && body[sdpEnd - 1] == '\n') --sdpEnd;
+				if (sdpEnd > sdpStart && body[sdpEnd - 1] == '\r') --sdpEnd;
+				break;
+			}
+			inHeaders = true;
+			sdpPart = false;
+			continue;
+		}
+		if (!inHeaders) continue;   // the preamble, or a part that is not kept
+		if (line.empty())
+		{
+			inHeaders = false;
+			if (sdpPart) sdpStart = pos;
+			continue;
+		}
+		if (iequal(headerNameOf(line), "content-type") &&
+			ifindLower(headerValueOf(line), "application/sdp") == 0)
+		{
+			sdpPart = true;
+		}
+	}
+	if (sdpStart == std::string_view::npos || sdpEnd == std::string_view::npos) return false;
+
+	_body.erase(0, sdpStart);        // shifts in place: no new allocation
+	_body.resize(sdpEnd - sdpStart);
+	++_bodyGen;
+	composeHeaderLine(_headerLines[ctIdx], "Content-Type", "application/sdp");
+	syncContentLength();
+	return true;
 }
 
 std::string SipMessage::toString() const
@@ -944,12 +1343,7 @@ uint32_t SipMessage::getSessionExpiresSecs() const
 {
 	size_t idx = findHeaderIndex("session-expires", "x");
 	if (idx == std::string::npos) return 0;
-	std::string_view v = headerValueOf(_headerLines[idx]);
-	uint32_t val = 0;
-	size_t i = 0;
-	while (i < v.size() && v[i] >= '0' && v[i] <= '9')
-		val = val * 10 + static_cast<uint32_t>(v[i++] - '0');
-	return val;
+	return deltaSecondsOf(headerValueOf(_headerLines[idx]));
 }
 
 std::string_view SipMessage::getSessionExpiresRefresher() const
@@ -957,24 +1351,27 @@ std::string_view SipMessage::getSessionExpiresRefresher() const
 	size_t idx = findHeaderIndex("session-expires", "x");
 	if (idx == std::string::npos) return {};
 	std::string_view line = _headerLines[idx];
-	size_t rp = line.find("refresher=");
+	// The parameter name and its uac/uas value are case-insensitive (RFC 3261
+	// §7.3.1, RFC 4028 §4 ABNF): "Refresher=UAS" names the PBX's peer as
+	// refresher just as "refresher=uas" does. The value is handed back as the
+	// lowercase literal so every caller's `== "uas"` compare holds (#739).
+	static constexpr std::string_view kParam = "refresher=";
+	size_t rp = ifindLower(line, kParam);
 	if (rp == std::string_view::npos) return {};
-	size_t vs = rp + 10;
+	size_t vs = rp + kParam.size();
 	size_t ve = line.find_first_of("; \t\r\n", vs);
 	if (ve == std::string_view::npos) ve = line.size();
-	return line.substr(vs, ve - vs);
+	std::string_view value = line.substr(vs, ve - vs);
+	if (iequal(value, "uac")) return "uac";
+	if (iequal(value, "uas")) return "uas";
+	return value;
 }
 
 uint32_t SipMessage::getMinSESecs() const
 {
 	size_t idx = findHeaderIndex("min-se");
 	if (idx == std::string::npos) return 0;
-	std::string_view v = headerValueOf(_headerLines[idx]);
-	uint32_t val = 0;
-	size_t i = 0;
-	while (i < v.size() && v[i] >= '0' && v[i] <= '9')
-		val = val * 10 + static_cast<uint32_t>(v[i++] - '0');
-	return val;
+	return deltaSecondsOf(headerValueOf(_headerLines[idx]));
 }
 
 std::string_view SipMessage::getContact() const
@@ -1017,16 +1414,124 @@ std::string_view SipMessage::getEvent() const
 	return idx == std::string::npos ? std::string_view{} : std::string_view(_headerLines[idx]);
 }
 
+namespace
+{
+	// #760 review: the URI a To/From/Contact line or a request line carries,
+	// and nothing around it. A name-addr's URI is inside <...>; a '<' within
+	// the quoted display name does not count (RFC 3261 s25.1 quoted-string,
+	// \-escapes included). Without brackets it is the bare URI: a request
+	// line's Request-URI, the token after the method, or a header's value up
+	// to its first ';' (RFC 3261 s20.10). #832 review: a quote left open (an
+	// unescaped '"' in the name, "Lobby 55" TV") falls back to the last <...>
+	// on the line, where a name-addr's URI sits; empty when there is none.
+	std::string_view uriPartOf(std::string_view line)
+	{
+		auto bracketed = [line](size_t lt) {
+			std::string_view uri = line.substr(lt + 1);
+			uri = uri.substr(0, uri.find('>'));
+			while (!uri.empty() && (uri.front() == ' ' || uri.front() == '\t')) uri.remove_prefix(1);
+			while (!uri.empty() && (uri.back() == ' ' || uri.back() == '\t')) uri.remove_suffix(1);
+			return uri;
+		};
+		bool quoted = false;
+		for (size_t i = 0; i < line.size(); ++i)
+		{
+			const char c = line[i];
+			if (quoted)
+			{
+				if (c == '\\') ++i;
+				else if (c == '"') quoted = false;
+			}
+			else if (c == '"')
+			{
+				quoted = true;
+			}
+			else if (c == '<')
+			{
+				return bracketed(i);
+			}
+		}
+		if (quoted)
+		{
+			const size_t lt = line.rfind('<');
+			return lt == std::string_view::npos ? std::string_view{} : bracketed(lt);
+		}
+		const size_t colon = line.find(':');
+		if (colon == std::string_view::npos) return {};
+		size_t nameStart = 0;
+		size_t nameEnd = colon;
+		while (nameStart < nameEnd && (line[nameStart] == ' ' || line[nameStart] == '\t')) ++nameStart;
+		while (nameEnd > nameStart && (line[nameEnd - 1] == ' ' || line[nameEnd - 1] == '\t')) --nameEnd;
+		// A header name holds no space, so "INVITE tel" before the first ':'
+		// is a request line, and its URI begins after the method.
+		const size_t sp = line.substr(nameStart, nameEnd - nameStart).find_first_of(" \t");
+		std::string_view uri = line.substr(sp == std::string_view::npos ? colon + 1 : nameStart + sp);
+		while (!uri.empty() && (uri.front() == ' ' || uri.front() == '\t')) uri.remove_prefix(1);
+		return uri.substr(0, uri.find_first_of(" \t;\r\n"));
+	}
+
+	// #760: the two non-sip: forms a phone may legitimately dial for help. An
+	// RFC 3966 tel:911 / tel:933 has no host and no '@', and RFC 5031's
+	// urn:service:test.sos is the E911 test service (933 here). Only an
+	// emergency number is mapped: every other tel: or urn: URI still reads as
+	// no user, so nothing else changes. urn:service:sos itself is #199's.
+	// #760 review: only the URI's own scheme is matched, never a display name
+	// or a parameter ("Hotel:911 lobby" is not 911), and a tel: number counts
+	// exactly when a sip: user would, so tel:9911 is 911 as sip:9911@ is.
+	std::string_view emergencyUserOf(std::string_view header)
+	{
+		static constexpr std::string_view kTel = "tel:";
+		static constexpr std::string_view kTestSos = "urn:service:test.sos";
+		const std::string_view uri = uriPartOf(header);
+		auto delimited = [&uri](size_t end) {
+			return end == uri.size() || uri[end] == ';' || uri[end] == '?';
+		};
+		if (iequalLower(uri.substr(0, kTel.size()), kTel))
+		{
+			size_t end = kTel.size();
+			while (end < uri.size() && std::isdigit(static_cast<unsigned char>(uri[end]))) ++end;
+			const std::string_view digits = uri.substr(kTel.size(), end - kTel.size());
+			if (delimited(end) && pbx::classifyEmergencyDial(digits).isEmergency) return digits;
+		}
+		if (iequalLower(uri.substr(0, kTestSos.size()), kTestSos))
+		{
+			// RFC 5031 s4.2: test.sos.<sub> is the same test service.
+			const size_t end = kTestSos.size();
+			if (delimited(end) || uri[end] == '.') return pbx::kEmergencyTestNumber;
+		}
+		return {};
+	}
+}
+
 std::string_view SipMessage::extractNumber(std::string_view header) const
 {
-	auto sipPos = header.find("sip:");
-	if (sipPos == std::string_view::npos)
-		return {};
+	// #824: only the URI is read, and its own scheme must start it. A display
+	// name or a parameter never counts, either way: To: "sip:911@lobby"
+	// <tel:+15551230100> is not a call to 911, and "sip:102@lobby" <sip:911@x>
+	// is not a call to 102.
+	const std::string_view uri = uriPartOf(header);
+	// RFC 3261 s19.1.4: the scheme is case-insensitive, and a sips: URI (s19.1)
+	// names its user the same way.
+	const size_t scheme = iequalLower(uri.substr(0, 4), "sip:") ? 4
+		: iequalLower(uri.substr(0, 5), "sips:") ? 5 : 0;
+	if (scheme == 0)
+	{
+		// #199, RFC 5031 / 6881: urn:service:sos[.<sub>] IS an emergency call.
+		// It has no sip: user part, so it used to read as empty and the INVITE
+		// was answered 400. It is routed exactly as a dialed 911.
+		static constexpr std::string_view kSos = "urn:service:sos";
+		const size_t end = kSos.size();
+		if (iequalLower(uri.substr(0, end), kSos) &&
+			(end == uri.size() || uri[end] == '.' || uri[end] == ';'))
+		{
+			return pbx::kEmergencyNumber;
+		}
+		return emergencyUserOf(header);   // #760: tel:911 and urn:service:test.sos
+	}
 
-	auto start = sipPos + 4;
-	auto atPos = header.find('@', start);
+	const size_t atPos = uri.find('@', scheme);
 	if (atPos == std::string_view::npos)
 		return {};
 
-	return header.substr(start, atPos - start);
+	return uri.substr(scheme, atPos - scheme);
 }

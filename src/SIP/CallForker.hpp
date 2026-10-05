@@ -99,6 +99,15 @@ public:
 		const std::shared_ptr<SipClient>& caller,
 		const std::string& destNumber);
 
+	// The rule routeDialPlan() applies to `dialed`: DialPlan::match(), except
+	// that a WILDCARD Trunk rule whose transform makes an emergency number of
+	// `dialed` does not match a number findRegistered() resolves. desmo, #877:
+	// "Only wildcard rules yield": a literal rule (0 -> 911) always fires, so a
+	// phone that registers 0 cannot take it over; every other rule keeps #69's
+	// order. RequestsHandler::dialRuleMakesEmergency() asks this too, so its
+	// mirror and this router agree. Caller holds _mutex.
+	const pbx::DialRule* matchDialRule(const std::string& dialed) const;
+
 private:
 	PbxEnv& _env;
 	PbxFeatureConfig& _cfg;
