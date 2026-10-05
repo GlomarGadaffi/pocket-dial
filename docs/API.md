@@ -1882,6 +1882,17 @@ otherwise have reached the ordinary extension lookup; no rule, not even a catch-
 **A dialed number that matches no rule routes exactly as it did before the dial plan
 existed.**
 
+**Emergency aliases: write them as literals.** A `trunk` rule whose transform produces
+an emergency number (`911`, `933`, `9911` or `9933`) places an emergency call, with every
+exemption a dialed `911` gets. A **wildcard** rule of that kind (one with an `X`, or a
+trailing `*`) yields to a **registered** extension: under `11X` -> `911`, a call to a
+registered `112` rings `112`, as if the rule were not there. A **literal** rule never
+yields: `112` -> `911` places the emergency call even when a phone has registered as
+`112`. In Learn mode any device can register any free number, so a wildcard alias would
+let a device that registers as 112 capture 112. Write emergency aliases as literals.
+The yield follows registration only: an extension whose phone is offline is not
+protected from a wildcard rule. A dialed `911`/`933` never reaches the dial plan.
+
 **Pattern grammar** (deliberately tiny, no regex):
 
 | Token | Meaning |

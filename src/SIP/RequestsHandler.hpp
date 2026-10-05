@@ -870,6 +870,14 @@ public:
 		if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
 		_lastSweep = std::chrono::steady_clock::now();
 	}
+	// Test-only (#877 follow-up S1): lapse `ext`'s lease and let the next
+	// handle() sweep, so one pass both reads the binding and prunes it.
+	void expireLeaseForNextSweepForTest(const std::string& ext)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
+		_lastSweep = std::chrono::steady_clock::time_point{};
+	}
 	// Test-only: directly inject an adopted device into the registrar without an ARP lookup.
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned,
 		bool locked = false)
