@@ -84,10 +84,12 @@ namespace siphdr
 	// (RFC 3261 §25.1 quoted-string, \-escapes included), so with balanced quotes it is
 	// the first '<' outside them. `open` is set when a quote is left open (an unescaped
 	// '"' in a display name, "Lobby 55" TV"). #832, #835: then it is the first '<'
-	// outside quotes if only header parameters follow its '>'; else the last '<'
+	// outside quotes if no '"' comes before it (no quote can cover it), or if only
+	// header parameters follow its '>'; else the last '<'
 	// outside quotes counted from the right, where a parameter's quoted value
 	// (+sip.instance="<urn:...>") pairs up whatever the display name left open; else
-	// the last '<' on the line.
+	// the last '<' on the line. Open or not is quote parity: an even number of stray
+	// quotes reads as balanced.
 	inline size_t nameAddrOpen(std::string_view v, bool& open)
 	{
 		size_t first = std::string_view::npos;
@@ -111,6 +113,7 @@ namespace siphdr
 		}
 		open = quoted;
 		if (!quoted) return first;
+		if (first != std::string_view::npos && v.find('"') > first) return first;
 		if (first != std::string_view::npos)
 		{
 			size_t after = v.find('>', first + 1);
