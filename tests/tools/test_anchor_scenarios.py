@@ -1024,13 +1024,13 @@ class RunTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.loggers = []
 
-    def go(self, *extra, overrides=None, env=None, scenario="x4_cancel_ringing", fast=None):
+    def go(self, *extra, overrides=None, env=None, scenario="x4_cancel_ringing", fast=None, pin_check="0.05"):
         def start_logger(argv, out_path):
             lg = FakeLogger(self.board, argv, out_path)
             self.loggers.append(lg)
             return lg
         argv = cli("--port", str(self.board.port), "--http-port", str(self.http_port), "--local-ip", "127.0.0.1",
-                   "--syslog-port", "0", "--set-syslog", "--pin-check-s", "0.05", "--out", self.tmp.name,
+                   "--syslog-port", "0", "--set-syslog", "--pin-check-s", pin_check, "--out", self.tmp.name,
                    "--expect-version", "v1.5.0-fake", *extra, scenario=scenario)
         # the fast fakes shrink every wait to a fraction of a second, below the floor a real run keeps
         # above the slowest makecall response seen on a board (CounterTest pins that floor itself)
@@ -1391,6 +1391,13 @@ class X379CancelBeforeLegTest(unittest.TestCase):
         self.assertIn("a phantom inbound (S1)", out)
         self.assertEqual(len(self.calls()), 1, "the first phantom stops the run")
         self.assert_no_secret_anywhere(out)
+
+    def test_a_phantom_ends_the_wait_without_waiting_for_the_next_pin_check(self):
+        # a real run checks the pin every 5 s: the wait itself must notice an INVITE at 6104
+        self.board.phantom_calls = {0}
+        rc, out = self.run379(pin_check="30")
+        self.assertEqual(rc, 1, out)
+        self.assertIsNone(self.calls()[0]["leg"], "the wait ended at the phantom, before the leg came up")
 
     def test_fail_on_an_invite_at_6104_after_the_leg_is_dropped(self):
         orig = self.board._drop

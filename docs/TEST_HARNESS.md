@@ -344,20 +344,15 @@ syslog. A run whose counter is 0 is INVALID, never PASS.
 
 **CANCEL timing.** 3CX's makecall response took 1.8-3.2 s on a real tenant (Stray's corrections on
 [#379](https://github.com/GlomarGadaffi/pocket-dial/issues/379#issuecomment-5985894096) and
-[#681](https://github.com/GlomarGadaffi/pocket-dial/issues/681#issuecomment-5985894278), which withdraw the
-rest of that first report). A CANCEL timed from the INVITE therefore always lands before the 3CX leg
-exists, so it tests #379's race, not a CANCEL while the far end is ringing. `x4_cancel_ringing` times it
-from a ringing reference instead. The PBX's 180 is local ringback, sent at INVITE time before the 3CX
-call is requested (`RequestsHandler.cpp`, `originateAnchorCall`), and the anchor path sends no 183 and no
-early RTP, so no SIP message says the far leg rings. The reference is a syslog line: the first
-`Upset <leg> -> control leg <leg> status '<not Connected>'` for a leg this INVITE started. 3CX lists our
-leg and it is not yet Connected, the state the firmware itself treats as ringing (#667). That is the
-closest witness there is; it does not prove the far phone is audibly alerting. The reference lags the
-board's own log by the LAN and syslog delay. If none arrives within 8 s (more than twice the slowest
-makecall response seen), the call is CANCELled at the timeout and counted INVALID; a refusal that comes
-first (a 503) is still a FAIL. `x379_cancel_before_leg` keeps the other timing on purpose: its CANCEL goes
-before the makecall response, and the run then waits up to 10 s for the leg, 5 s for its drop and 2 s more
-for anything that follows.
+[#681](https://github.com/GlomarGadaffi/pocket-dial/issues/681#issuecomment-5985894278) withdraw the rest of
+that first report), so a CANCEL timed from the INVITE always lands before the 3CX leg exists.
+`x4_cancel_ringing` times it from a ringing reference instead. The PBX's 180 is local ringback sent at
+INVITE time, before the 3CX call is requested (`RequestsHandler.cpp`, `originateAnchorCall`), and no 183 or
+early RTP follows, so no SIP message says the far leg rings. The reference is the first syslog line
+`Upset <leg> -> control leg <leg> status '<not Connected>'` for a leg this INVITE started: 3CX lists our leg
+and it is not yet Connected, which the firmware itself calls ringing (#667). It does not prove the far phone
+is alerting. No reference within 8 s: the call is CANCELled at the timeout and is INVALID; a refusal first (a
+503) is still a FAIL. `x379_cancel_before_leg` keeps the old timing on purpose.
 
 **Probe scenarios** (`x349`, `x379`, `x518`, `x279`) drive the bench probe image
 ([BENCH_PROBE.md](BENCH_PROBE.md)). On top of the preconditions below, `--expect-version` must be
