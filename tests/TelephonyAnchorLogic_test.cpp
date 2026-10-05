@@ -291,4 +291,111 @@ TEST(TelephonyLogic, HttpResponseParsedTrueForAnyRealStatus)
 	EXPECT_TRUE(httpResponseParsed(500));
 }
 
+// ── #379/#681: a leg this PBX created is never announced as an inbound call ────
+// The x4 re-run on .244 (main 1fcd6d4b, #379 issuecomment-5985911668), on its
+// syslog clock in µs. The handset CANCELled at 422.512 and the session ended.
+constexpr int64_t kNamed  = 2'477'423'517'000;   // resolveOutboundLeg: result.id=38
+constexpr int64_t kFreed  = 2'477'423'600'000;   // the drop freed its slot (between 423.539 and 423.608)
+constexpr int64_t kUpsert = 2'477'423'930'000;   // "Inbound call on DN ***: participant 38"
+constexpr int64_t kRemove = 2'477'424'724'000;   // "Participant Remove 38"
+
+TEST(OwnLegs, AnOwnLegUpsertWhileItsDropStallsIsNotAnnounced)
+{
+	AnchorOwnLegs own;
+	own.note("38", kNamed);   // makeCall(): the makecall response named it
+	own.note("38", kFreed);   // freeSlotLocked(): its outbound slot was freed
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kUpsert))
+		<< "our own leg 38 was announced as an inbound call while its drop reconnected";
+}
+
+TEST(OwnLegs, AnUpsertAfterTheRemoveIsNotAnnounced)
+{
+	AnchorOwnLegs own;
+	own.note("38", kNamed);
+	own.note("38", kFreed);
+	EXPECT_TRUE(own.refresh("38", kRemove)) << "3CX's Remove of a held leg holds it for the grace";
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kRemove + 300'000));
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kRemove + kOwnLegGraceUs - 1))
+		<< "held for the grace after the Remove, not after the slot was freed";
+}
+
+TEST(OwnLegs, ALegIsOursFromTheMomentTheMakecallResponseNamesIt)
+{
+	// Named but not keyed onto a call slot yet (or never: every slot busy).
+	AnchorOwnLegs own;
+	own.note("38", kNamed);
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kNamed + 22'000));
+}
+
+TEST(OwnLegs, TheHoldLapsesTheGraceAfterTheLastEvent)
+{
+	AnchorOwnLegs own;
+	own.note("38", kFreed);
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kFreed + 5'000'000));
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "38", kFreed + kOwnLegGraceUs - 1));
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "38", kFreed + kOwnLegGraceUs))
+		<< "a check at +5 s must not extend the hold";
+	EXPECT_FALSE(own.refresh("38", kFreed + kOwnLegGraceUs)) << "a Remove does not revive a lapsed leg";
+}
+
+TEST(OwnLegs, AFullTableOverwritesTheLeastRecentlySeenLeg)
+{
+	static_assert(sizeof(OwnLegs<4, 32>) == 4 * (32 + sizeof(int64_t)), "fixed storage only");
+	OwnLegs<4, 32> own;
+	for (int i = 0; i < 4; ++i) own.note(std::to_string(10 + i), kNamed + i);
+	own.note("10", kNamed + 10);
+	own.note("20", kNamed + 20);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "11", kNamed + 21)) << "11 was the least recently seen";
+	for (const char* id : { "10", "12", "13", "20" })
+	{
+		EXPECT_FALSE(inboundAnnounceAllowed(own, id, kNamed + 21)) << id;
+	}
+}
+
+// Guards: these pass with nothing held, and must keep passing.
+
+TEST(OwnLegs, ANewParticipantIdIsAnnounced)
+{
+	AnchorOwnLegs own;
+	own.note("38", kNamed);
+	own.note("38", kFreed);
+	own.refresh("38", kRemove);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "39", kUpsert));
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "39", kRemove + 300'000));
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "3", kUpsert)) << "a prefix of a held id is another participant";
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "380", kUpsert));
+}
+
+TEST(OwnLegs, APsapCallbackAfterADroppedEmergencyLegIsAnnounced)
+{
+	// The caller abandoned a 911: its own leg was named, freed and dropped. 3CX
+	// offers the PSAP's callback as a new participant on the route DN.
+	AnchorOwnLegs own;
+	own.note("40", kNamed);
+	own.note("40", kFreed);
+	own.refresh("40", kRemove);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "41", kRemove + 300'000));
+}
+
+TEST(OwnLegs, AnInboundLegThePbxRefusedAndDroppedIsStillAnnounced)
+{
+	// dropCall() refreshes only a leg already held. A refused inbound leg (say every
+	// bridge busy while a 911 is up) is not ours: if its drop fails, 3CX's next
+	// upsert announces it again, as before.
+	AnchorOwnLegs own;
+	EXPECT_FALSE(own.refresh("50", kUpsert));
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "50", kUpsert + 750'000));
+}
+
+TEST(OwnLegs, AnIdThatDoesNotFitIsNeverHeld)
+{
+	AnchorOwnLegs own;
+	const std::string longId(40, '7');
+	own.note(longId, kNamed);
+	own.note("", kNamed);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, longId, kNamed + 1));
+	EXPECT_TRUE(inboundAnnounceAllowed(own, longId.substr(0, 31), kNamed + 1)) << "never truncated into a match";
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "", kNamed + 1));
+}
+
 }  // namespace

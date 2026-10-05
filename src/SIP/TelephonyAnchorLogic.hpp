@@ -19,8 +19,11 @@
 // input maps to a documented, safe return value (the fallback lifetime / empty
 // string / "no match"), never UB.
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace telephony
@@ -276,6 +279,34 @@ inline bool tokenIsExpiringSoon(int64_t nowUs, int64_t obtainedUs, int64_t lifet
 inline bool httpResponseParsed(int status)
 {
 	return status > 0;
+}
+
+// RED (#379): the API only; nothing is held yet.
+inline constexpr int64_t kOwnLegGraceUs = 10'000'000;
+
+template <std::size_t N, std::size_t Len>
+class OwnLegs
+{
+public:
+	void note(std::string_view, int64_t) {}
+	bool refresh(std::string_view, int64_t) { return false; }
+	bool holds(std::string_view, int64_t) const { return false; }
+
+private:
+	struct Entry
+	{
+		char    id[Len];
+		int64_t seenUs;
+	};
+	Entry _e[N] = {};
+};
+
+using AnchorOwnLegs = OwnLegs<8, 32>;
+
+template <std::size_t N, std::size_t Len>
+inline bool inboundAnnounceAllowed(const OwnLegs<N, Len>& own, std::string_view partId, int64_t nowUs)
+{
+	return !own.holds(partId, nowUs);
 }
 
 }  // namespace telephony
