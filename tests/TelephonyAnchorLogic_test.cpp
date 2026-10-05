@@ -529,4 +529,46 @@ TEST(OwnLegs, AnIdThatDoesNotFitIsNeverHeld)
 	EXPECT_TRUE(inboundAnnounceAllowed(own, "", kNamed + 1, kSeqUpsert));
 }
 
+// ── #349: the makecall POST reached 3CX and its response was never read ──────
+// The x349_unread_makecall run on .244 (main 61132ada, #349 issuecomment-6004433436):
+// 3CX had already named the leg (the probe threw result.id away), the list read
+// found no leg, makeCall() gave up, and 3CX's leg 509 rang the far end, was
+// answered, and came back as a phantom inbound call.
+
+TEST(UnreadMakecall, ALegTheListShowsIsAdopted)
+{
+	EXPECT_EQ(unreadMakecallStep(/*legListed=*/true, 0), UnreadMakecallStep::Adopt);
+	EXPECT_EQ(unreadMakecallStep(true, kUnreadAdoptWindowUs), UnreadMakecallStep::Adopt)
+		<< "a leg on the last read is still ours";
+}
+
+TEST(UnreadMakecall, AListWithNoLegYetIsReadAgain)
+{
+	// One read that shows no leg is not "no call": 3CX had placed it on .244.
+	EXPECT_EQ(unreadMakecallStep(false, 0), UnreadMakecallStep::ReadAgain)
+		<< "the first list read with no leg ended the reconcile: the .244 orphan";
+	EXPECT_EQ(unreadMakecallStep(false, 2'000'000), UnreadMakecallStep::ReadAgain);
+}
+
+TEST(UnreadMakecall, TheReadsStopWithinTheWindow)
+{
+	// While makeCall() reads, an unmatched upsert is ignored (#888), so the window is bounded.
+	static_assert(kUnreadAdoptWindowUs <= 5'000'000, "#888: a longer window hides an inbound upsert longer");
+	const int64_t lastRead = kUnreadAdoptWindowUs - int64_t{kUnreadAdoptPollMs} * 1000;
+	EXPECT_EQ(unreadMakecallStep(false, lastRead - 1), UnreadMakecallStep::ReadAgain);
+	EXPECT_EQ(unreadMakecallStep(false, lastRead), UnreadMakecallStep::GiveUp)
+		<< "a read after the window closes";
+	EXPECT_EQ(unreadMakecallStep(false, kUnreadAdoptWindowUs * 10), UnreadMakecallStep::GiveUp);
+}
+
+TEST(OwnLegs, ALegAdoptedAfterAnUnreadResponseIsHeld)
+{
+	// Once adopted the leg is ours: freed at hangup, its upserts before 3CX's
+	// Remove must not ring the route DN. The list fallback alone stays unheld.
+	EXPECT_TRUE(ownLegMayBeHeld(OwnLegSource::AdoptedAfterUnreadResponse))
+		<< "an adopted leg's late upsert can still be announced as inbound";
+	EXPECT_FALSE(ownLegMayBeHeld(OwnLegSource::OwnPartyDn));
+	EXPECT_FALSE(ownLegMayBeHeld(OwnLegSource::FirstControllable));
+}
+
 }  // namespace
