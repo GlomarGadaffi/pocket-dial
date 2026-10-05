@@ -208,7 +208,7 @@ private:
 		std::atomic<bool>        stopRequested{false};
 		int                      getFd = -1;              // guarded by getMutex
 		bool                     rxDetached = false;      // #608: counted in _leakedGetClients; guarded by _mutex
-		bool                     ownLegHeld = false;      // #379: 3CX named this outbound leg as ours; guarded by _mutex
+		bool                     ownLegHeld = false;      // #379: 3CX named this outbound leg as ours (or #349 adopted it); guarded by _mutex
 		mutable std::mutex       postMutex;              // guards postClient (writeAudio/stop)
 		std::mutex               getMutex;                // guards getClient (runRxLoop/stop)
 	};
