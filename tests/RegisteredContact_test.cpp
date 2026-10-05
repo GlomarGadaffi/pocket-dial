@@ -337,6 +337,49 @@ TEST(RegisteredContact, AnUppercaseSchemeContactIsKept)
 	}
 }
 
+TEST(RegisteredContact, TheUriScanPicksABracketOrNothingOnEveryShortLine)
+{
+	// #857 review S2: every line of up to 8 of '"', '\', '<', '>', ';', 'a'.
+	// The URI's '<' is npos or a '<'. With balanced quotes it is the first '<'
+	// outside them; with one left open, a first '<' that no quote precedes
+	// (S1). The stored Contact is a view inside the line.
+	constexpr size_t npos = std::string_view::npos;
+	const char alphabet[] = {'"', '\\', '<', '>', ';', 'a'};
+	char buf[8] = {};
+	size_t lines = 0;
+	size_t bad = 0;
+	std::string firstBad;
+	for (size_t len = 0; len <= sizeof(buf); ++len)
+	{
+		size_t total = 1;
+		for (size_t i = 0; i < len; ++i) total *= sizeof(alphabet);
+		for (size_t n = 0; n < total; ++n, ++lines)
+		{
+			size_t k = n;
+			for (size_t i = 0; i < len; ++i, k /= sizeof(alphabet)) buf[i] = alphabet[k % sizeof(alphabet)];
+			const std::string_view v(buf, len);
+
+			bool quoted = false;
+			size_t first = npos;
+			for (size_t i = 0; i < len; ++i)
+			{
+				if (quoted) { if (v[i] == '\\') ++i; else if (v[i] == '"') quoted = false; }
+				else if (v[i] == '"') quoted = true;
+				else if (v[i] == '<' && first == npos) first = i;
+			}
+			bool open = false;
+			const size_t lt = siphdr::nameAddrOpen(v, open);
+			const std::string_view c = siphdr::contactUriView(v);
+			const bool ok = (lt == npos || v[lt] == '<') && open == quoted && (open || lt == first) &&
+				!(open && first != npos && v.substr(0, first).find('"') == npos && lt != first) &&
+				(c.empty() || (c.data() >= v.data() && c.data() + c.size() <= v.data() + v.size()));
+			if (!ok && bad++ == 0) firstBad = std::string(v);
+		}
+	}
+	EXPECT_EQ(lines, 2015539u);
+	EXPECT_EQ(bad, 0u) << "first: " << firstBad;
+}
+
 TEST(RegisteredContact, RelayedByeIsAddressedToTheCallersRegisteredContact)
 {
 	Sent sent;
