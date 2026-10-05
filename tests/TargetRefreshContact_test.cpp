@@ -388,11 +388,12 @@ TEST(TargetRefreshContact, RelayedAckAndByeRequestUrisNameTheFarPhoneInBothDirec
 	EXPECT_EQ(requestLine(ackAtCallee), "ACK sip:106@" + std::string(kCalleeIp) + ":5060 SIP/2.0")
 		<< "#754: the ACK's Request-URI must be the callee's own address, not the PBX's";
 
-	// The callee hangs up: its BYE (To = the caller, From = itself) is relayed to the caller.
+	// The callee hangs up: the PBX answers its BYE and sends the caller its own
+	// (#808), with the PBX's CSeq, not the callee's.
 	handler.handle(bodilessInDialog("BYE", "100", "From: <sip:106@server>;tag=ans106",
 		"To: <sip:100@server>;tag=ft" + callId, callId, 1, "z9hG4bKruribye", kCalleeIp));
-	std::string byeAtCaller = findSentTo(sent, addrFor(kCallerIp), "CSeq: 1 BYE");
-	ASSERT_FALSE(byeAtCaller.empty()) << "the callee's BYE must be relayed to the caller";
+	std::string byeAtCaller = findSentTo(sent, addrFor(kCallerIp), "BYE sip:");
+	ASSERT_FALSE(byeAtCaller.empty()) << "the callee's hang-up must reach the caller";
 	EXPECT_EQ(requestLine(byeAtCaller), "BYE sip:100@" + std::string(kCallerIp) + ":5060 SIP/2.0")
 		<< "#754: the BYE's Request-URI must be the caller's own address, not the PBX's";
 }

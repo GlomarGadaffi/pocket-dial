@@ -9,6 +9,8 @@
 //   #798  the callee's BYE was relayed to the caller with the Request-URI the
 //         callee had addressed to the PBX, and the caller's 481 was not treated
 //         as the session being over (RFC 3261 §15.1.2), so the slot leaked.
+//   #754  every other request relayed to a phone kept the Request-URI its sender
+//         had addressed to the PBX.
 
 #include <gtest/gtest.h>
 
@@ -572,4 +574,361 @@ TEST(ByeLocalAnswer, AByeTheBuilderRefusesStillAnswersTheSenderAndEndsTheSession
 	EXPECT_EQ(handler.getByeTruncated(), 1u) << "and the refusal is counted for /api/status";
 	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value())
 		<< "no BYE is out whose answer would end the session, so it ends here";
+}
+
+// ── #754: a request relayed to a phone is addressed to the Contact it registered ──
+//
+// A phone addresses the PBX (the Contact the PBX presented, #425), so the
+// Request-URI it writes names the PBX. Every request the PBX passes on to a phone
+// must name that phone the way #797/#798 do: the URI it registered, URI parameters
+// intact, and sip:<ext>@<ip>:<port> only when it registered none. The Snom
+// registers a Contact with a ;line= parameter, the Yealink one without; each test
+// runs with the Snom on the receiving end and again with the Yealink.
+namespace
+{
+	struct Phone
+	{
+		std::string ext;
+		std::string ip;
+		uint16_t port;
+		std::string contactUri;   // the URI it registers
+	};
+
+	Phone snomPhone() { return {"100", kSnomIp, 1037, kSnomContactUri}; }
+	Phone yealinkPhone() { return {"106", kYealinkIp, 5062, "sip:106@192.168.31.20:5062"}; }
+
+	sockaddr_in addrOf(const Phone& p) { return addrFor(p.ip, p.port); }
+
+	void registerPhone(RequestsHandler& handler, const Phone& p)
+	{
+		handler.handle(makeRegister(p.ext, p.ip, p.port, "Contact: <" + p.contactUri + ">;reg-id=1\r\n"));
+	}
+
+	std::string viaOf(const Phone& p, const std::string& branch)
+	{
+		return "Via: SIP/2.0/UDP " + p.ip + ":" + std::to_string(p.port) + ";branch=" + branch + "\r\n";
+	}
+
+	// `from` dials `dialed`, addressing the PBX as a phone does.
+	std::shared_ptr<SipMessage> dial(const Phone& from, const std::string& dialed, const std::string& callId)
+	{
+		const std::string body = sdpBody();
+		const std::string raw =
+			"INVITE sip:" + dialed + "@" + kPbxIp + ":5060 SIP/2.0\r\n" +
+			viaOf(from, "z9hG4bKdial" + callId) +
+			"From: <sip:" + from.ext + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + dialed + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <" + from.contactUri + ">\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrOf(from));
+	}
+
+	// The CANCEL of dial(from, to.ext, callId): its branch, Request-URI, From and To (RFC 3261 §9.1).
+	std::shared_ptr<SipMessage> cancelDial(const Phone& from, const Phone& to, const std::string& callId)
+	{
+		const std::string raw =
+			"CANCEL sip:" + to.ext + "@" + kPbxIp + ":5060 SIP/2.0\r\n" +
+			viaOf(from, "z9hG4bKdial" + callId) +
+			"From: <sip:" + from.ext + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + to.ext + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 CANCEL\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrOf(from));
+	}
+
+	// A request in the call's dialog from `from` to `to`, addressed to the PBX's
+	// Contact for `to` (#425).
+	std::shared_ptr<SipMessage> inDialog(const std::string& method, const Phone& from, const std::string& fromTag,
+	                                     const Phone& to, const std::string& toTag, const std::string& callId,
+	                                     int cseq, bool withSdp)
+	{
+		const std::string body = withSdp ? sdpBody() : std::string();
+		const std::string raw =
+			method + " sip:" + to.ext + "@" + kPbxIp + ":5060;transport=UDP SIP/2.0\r\n" +
+			viaOf(from, "z9hG4bK" + method + std::to_string(cseq) + callId) +
+			"From: <sip:" + from.ext + "@server>;tag=" + fromTag + "\r\n"
+			"To: <sip:" + to.ext + "@server>;tag=" + toTag + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(cseq) + " " + method + "\r\n"
+			"Max-Forwards: 70\r\n" +
+			(method == "ACK" || method == "BYE" ? std::string() : "Contact: <" + from.contactUri + ">\r\n") +
+			(withSdp ? "Content-Type: application/sdp\r\n" : "") +
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrOf(from));
+	}
+
+	// `phone`'s answer to the request `relayed` it received (RFC 3261 §8.2.6.2), with
+	// its own To tag when the request had none.
+	std::shared_ptr<SipMessage> answer(const std::string& relayed, const std::string& status, const Phone& phone,
+	                                   const std::string& toTag, bool withSdp)
+	{
+		std::string to = headerLine(relayed, "To:");
+		if (to.find(";tag=") == std::string::npos) to += ";tag=" + toTag;
+		const std::string body = withSdp ? sdpBody() : std::string();
+		const std::string raw =
+			"SIP/2.0 " + status + "\r\n" +
+			headerLine(relayed, "Via:") + "\r\n" +
+			headerLine(relayed, "From:") + "\r\n" +
+			to + "\r\n" +
+			headerLine(relayed, "Call-ID:") + "\r\n" +
+			headerLine(relayed, "CSeq:") + "\r\n"
+			"Contact: <" + phone.contactUri + ">\r\n" +
+			(withSdp ? "Content-Type: application/sdp\r\n" : "") +
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrOf(phone));
+	}
+
+	std::string requestUriOf(const std::string& raw)
+	{
+		const std::string line = requestLineOf(raw);
+		const size_t sp1 = line.find(' ');
+		const size_t sp2 = line.find(' ', sp1 + 1);
+		return sp1 == std::string::npos || sp2 == std::string::npos ? std::string() : line.substr(sp1 + 1, sp2 - sp1 - 1);
+	}
+
+	struct Pairing
+	{
+		Phone caller;
+		Phone callee;
+	};
+
+	// The Snom answering the Yealink, then the Yealink answering the Snom.
+	std::vector<Pairing> bothWays() { return {{yealinkPhone(), snomPhone()}, {snomPhone(), yealinkPhone()}}; }
+}
+
+// The caller's INVITE, the ACK for the 2xx, a re-INVITE with its ACK, and an UPDATE
+// reach the callee at the URI it registered. The responses relayed back to the
+// caller keep their status lines.
+TEST(RelayedRequestUri, EveryRequestTowardTheCalleeCarriesItsRegisteredContact)
+{
+	for (const auto& [caller, callee] : bothWays())
+	{
+		SCOPED_TRACE("callee registered " + callee.contactUri);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		registerPhone(handler, caller);
+		registerPhone(handler, callee);
+		const std::string callId = "ruri-to-callee-" + callee.ext;
+		const std::string callerTag = "ft" + callId;
+		const std::string calleeTag = "ans" + callee.ext;
+
+		handler.handle(dial(caller, callee.ext, callId));
+		const std::string invite = findSentTo(sent, addrOf(callee), "CSeq: 1 INVITE");
+		ASSERT_FALSE(invite.empty()) << "the call must reach the callee";
+		EXPECT_EQ(requestLineOf(invite), "INVITE " + callee.contactUri + " SIP/2.0");
+
+		handler.handle(answer(invite, "180 Ringing", callee, calleeTag, false));
+		EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(caller), "CSeq: 1 INVITE")), "SIP/2.0 180 Ringing")
+			<< "a relayed response keeps its status line";
+		handler.handle(answer(invite, "200 OK", callee, calleeTag, true));
+		EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(caller), "CSeq: 1 INVITE")), "SIP/2.0 200 OK")
+			<< "a relayed response keeps its status line";
+
+		handler.handle(inDialog("ACK", caller, callerTag, callee, calleeTag, callId, 1, false));
+		EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(callee), "CSeq: 1 ACK")),
+			"ACK " + callee.contactUri + " SIP/2.0");
+
+		handler.handle(inDialog("INVITE", caller, callerTag, callee, calleeTag, callId, 2, true));
+		const std::string reinvite = findSentTo(sent, addrOf(callee), "CSeq: 2 INVITE");
+		ASSERT_FALSE(reinvite.empty()) << "the re-INVITE must reach the callee";
+		EXPECT_EQ(requestLineOf(reinvite), "INVITE " + callee.contactUri + " SIP/2.0");
+		handler.handle(answer(reinvite, "200 OK", callee, calleeTag, true));
+		EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(caller), "CSeq: 2 INVITE")), "SIP/2.0 200 OK");
+		handler.handle(inDialog("ACK", caller, callerTag, callee, calleeTag, callId, 2, false));
+		EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(callee), "CSeq: 2 ACK")),
+			"ACK " + callee.contactUri + " SIP/2.0");
+
+		handler.handle(inDialog("UPDATE", caller, callerTag, callee, calleeTag, callId, 3, false));
+		EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(callee), "CSeq: 3 UPDATE")),
+			"UPDATE " + callee.contactUri + " SIP/2.0");
+	}
+}
+
+// The other direction: the callee's re-INVITE, its ACK and an UPDATE reach the
+// caller at the URI the caller registered.
+TEST(RelayedRequestUri, EveryRequestTowardTheCallerCarriesItsRegisteredContact)
+{
+	for (const auto& [caller, callee] : bothWays())
+	{
+		SCOPED_TRACE("caller registered " + caller.contactUri);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		registerPhone(handler, caller);
+		registerPhone(handler, callee);
+		const std::string callId = "ruri-to-caller-" + caller.ext;
+		const std::string callerTag = "ft" + callId;
+		const std::string calleeTag = "ans" + callee.ext;
+
+		handler.handle(dial(caller, callee.ext, callId));
+		const std::string invite = findSentTo(sent, addrOf(callee), "CSeq: 1 INVITE");
+		ASSERT_FALSE(invite.empty()) << "the call must reach the callee";
+		handler.handle(answer(invite, "200 OK", callee, calleeTag, true));
+		handler.handle(inDialog("ACK", caller, callerTag, callee, calleeTag, callId, 1, false));
+
+		handler.handle(inDialog("INVITE", callee, calleeTag, caller, callerTag, callId, 11, true));
+		const std::string reinvite = findSentTo(sent, addrOf(caller), "CSeq: 11 INVITE");
+		ASSERT_FALSE(reinvite.empty()) << "the callee's re-INVITE must reach the caller";
+		EXPECT_EQ(requestLineOf(reinvite), "INVITE " + caller.contactUri + " SIP/2.0");
+		handler.handle(answer(reinvite, "200 OK", caller, callerTag, true));
+		EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(callee), "CSeq: 11 INVITE")), "SIP/2.0 200 OK")
+			<< "a relayed response keeps its status line";
+		handler.handle(inDialog("ACK", callee, calleeTag, caller, callerTag, callId, 11, false));
+		EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(caller), "CSeq: 11 ACK")),
+			"ACK " + caller.contactUri + " SIP/2.0");
+
+		handler.handle(inDialog("UPDATE", callee, calleeTag, caller, callerTag, callId, 12, false));
+		EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(caller), "CSeq: 12 UPDATE")),
+			"UPDATE " + caller.contactUri + " SIP/2.0");
+	}
+}
+
+// RFC 3261 §9.1: a CANCEL carries the Request-URI of the INVITE it cancels, so the
+// relayed CANCEL names the callee exactly as the relayed INVITE did.
+TEST(RelayedRequestUri, ACancelReachesTheRingingCalleeAtTheUriItsInviteCarried)
+{
+	for (const auto& [caller, callee] : bothWays())
+	{
+		SCOPED_TRACE("callee registered " + callee.contactUri);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		registerPhone(handler, caller);
+		registerPhone(handler, callee);
+		const std::string callId = "ruri-cancel-" + callee.ext;
+
+		handler.handle(dial(caller, callee.ext, callId));
+		const std::string invite = findSentTo(sent, addrOf(callee), "CSeq: 1 INVITE");
+		ASSERT_FALSE(invite.empty()) << "the call must reach the callee";
+		handler.handle(answer(invite, "180 Ringing", callee, "ans" + callee.ext, false));
+
+		handler.handle(cancelDial(caller, callee, callId));
+		const std::string cancel = findSentTo(sent, addrOf(callee), "CSeq: 1 CANCEL");
+		ASSERT_FALSE(cancel.empty()) << "the CANCEL must reach the callee";
+		EXPECT_EQ(requestLineOf(cancel), "CANCEL " + callee.contactUri + " SIP/2.0");
+		EXPECT_EQ(requestUriOf(cancel), requestUriOf(invite)) << "RFC 3261 §9.1";
+	}
+}
+
+// RFC 3261 §15: a caller may BYE an early dialog. With no answer yet the session has
+// no far leg, so onBye() relays the caller's own BYE after naming the callee's
+// registered Contact on it (#798). The relay must not rewrite that again.
+TEST(RelayedRequestUri, AnEarlyDialogByeKeepsTheCalleesRegisteredContact)
+{
+	for (const auto& [caller, callee] : bothWays())
+	{
+		SCOPED_TRACE("callee registered " + callee.contactUri);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		registerPhone(handler, caller);
+		registerPhone(handler, callee);
+		const std::string callId = "ruri-early-bye-" + callee.ext;
+		const std::string calleeTag = "ans" + callee.ext;
+
+		handler.handle(dial(caller, callee.ext, callId));
+		const std::string invite = findSentTo(sent, addrOf(callee), "CSeq: 1 INVITE");
+		ASSERT_FALSE(invite.empty()) << "the call must reach the callee";
+		handler.handle(answer(invite, "180 Ringing", callee, calleeTag, false));
+
+		handler.handle(inDialog("BYE", caller, "ft" + callId, callee, calleeTag, callId, 2, false));
+		const std::string bye = findSentTo(sent, addrOf(callee), "CSeq: 2 BYE");
+		ASSERT_FALSE(bye.empty()) << "the early-dialog BYE must reach the callee";
+		EXPECT_EQ(requestLineOf(bye), "BYE " + callee.contactUri + " SIP/2.0");
+	}
+}
+
+// A pickup CANCELs the ringing target with a copy of the INVITE the session kept,
+// and ACKs the target's 487 the same way (#749, #750). Both must carry the
+// Request-URI the target's INVITE carried (RFC 3261 §9.1, §17.1.1.3).
+TEST(RelayedRequestUri, APickupCancelAndThe487AckCarryTheUriOfTheInviteTheTargetGot)
+{
+	for (const auto& [caller, target] : bothWays())
+	{
+		SCOPED_TRACE("target registered " + target.contactUri);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		const Phone picker{"102", "192.168.31.30", 5060, "sip:102@192.168.31.30:5060"};
+		registerPhone(handler, caller);
+		registerPhone(handler, target);
+		registerPhone(handler, picker);
+		handler.setRingGroup("600", target.ext + "," + picker.ext, "ringall");
+		const std::string callId = "ruri-pickup-" + target.ext;
+
+		handler.handle(dial(caller, target.ext, callId));
+		const std::string invite = findSentTo(sent, addrOf(target), "CSeq: 1 INVITE");
+		ASSERT_FALSE(invite.empty()) << "the call must reach the target";
+		EXPECT_EQ(requestUriOf(invite), target.contactUri);
+
+		handler.handle(dial(picker, "**" + target.ext, "ruri-picker-" + target.ext));
+		const std::string cancel = findSentTo(sent, addrOf(target), "CANCEL ");
+		ASSERT_FALSE(cancel.empty()) << "the pickup must CANCEL the ringing target";
+		EXPECT_EQ(requestUriOf(cancel), requestUriOf(invite)) << "RFC 3261 §9.1";
+
+		handler.handle(answer(invite, "487 Request Terminated", target, "ans" + target.ext, false));
+		const std::string ack = findSentTo(sent, addrOf(target), "CSeq: 1 ACK");
+		ASSERT_FALSE(ack.empty()) << "the PBX ACKs the target's 487 (#750)";
+		EXPECT_EQ(requestUriOf(ack), requestUriOf(invite)) << "RFC 3261 §17.1.1.3";
+	}
+}
+
+// A request whose To is no registered phone is not relayed: the sender is answered
+// 404 and the request itself is left as it came.
+TEST(RelayedRequestUri, ARequestForAnUnregisteredExtensionIsAnsweredNotRetargeted)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const Phone snom = snomPhone();
+	const Phone nobody{"107", "192.168.31.40", 5060, "sip:107@192.168.31.40:5060"};
+	registerPhone(handler, snom);
+
+	auto bye = inDialog("BYE", snom, "ftx", nobody, "tox", "ruri-nobody", 5, false);
+	ASSERT_NE(bye, nullptr);
+	const std::string before = requestLineOf(bye->toString());
+	handler.handle(bye);
+
+	EXPECT_EQ(requestLineOf(bye->toString()), before) << "nothing to retarget it to";
+	EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(snom), "CSeq: 5 BYE")), "SIP/2.0 404 Not Found");
+	EXPECT_EQ(countSentTo(sent, addrOf(nobody), "BYE"), 0);
+}
+
+// SipClient keeps a registered Contact of up to kMaxContactUriLen bytes; the
+// Request-URI carries all of it. A longer one is not stored, and the request still
+// goes out, addressed to the phone's observed address.
+TEST(RelayedRequestUri, AFullLengthContactIsCarriedWholeAndAnOverlongOneFallsBack)
+{
+	const std::string prefix = "sip:106@192.168.31.20:5062;line=";
+	for (const size_t len : {SipClient::kMaxContactUriLen, SipClient::kMaxContactUriLen + 1})
+	{
+		SCOPED_TRACE("Contact URI of " + std::to_string(len) + " bytes");
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		Phone callee = yealinkPhone();
+		callee.contactUri = prefix + std::string(len - prefix.size(), 'x');
+		const Phone caller = snomPhone();
+		registerPhone(handler, caller);
+		registerPhone(handler, callee);
+		const std::string expected = len <= SipClient::kMaxContactUriLen ? callee.contactUri
+		                                                                 : "sip:106@192.168.31.20:5062";
+		const std::string callId = "ruri-long-" + std::to_string(len);
+
+		handler.handle(dial(caller, callee.ext, callId));
+		const std::string invite = findSentTo(sent, addrOf(callee), "CSeq: 1 INVITE");
+		ASSERT_FALSE(invite.empty()) << "the INVITE must still go out";
+		EXPECT_EQ(requestLineOf(invite), "INVITE " + expected + " SIP/2.0");
+
+		handler.handle(answer(invite, "200 OK", callee, "ans106", true));
+		handler.handle(inDialog("INVITE", caller, "ft" + callId, callee, "ans106", callId, 2, true));
+		EXPECT_EQ(requestLineOf(findSentTo(sent, addrOf(callee), "CSeq: 2 INVITE")), "INVITE " + expected + " SIP/2.0");
+	}
 }
