@@ -998,17 +998,13 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// callback, or anything on a live 911 dialog is counted and let through,
 		// never refused for an optional header -- every copy the gate guards is
 		// bounded anyway (storeField truncates), so letting it through is safe.
-		auto isEmergencyTraffic = [this, &request]() {
-			if (request->isEmergencyRequest()) return true;
-			const auto s = getSession(request->getCallID());
-			return s.has_value() && s.value() && s.value()->isEmergency();
-		};
+		// isEmergencyTraffic() is the one decision for both gates.
 		if (request->headerLinesTruncated()) _headerLineCuts.fetch_add(1, std::memory_order_relaxed);
 		bool headerRefused = false;
 		std::string_view unsupportedTag;
 		if (const auto hv = request->checkHeaders(unsupportedTag); hv != SipMessage::HeaderVerdict::Ok)
 		{
-			if (isEmergencyTraffic())
+			if (isEmergencyTraffic(*request))
 			{
 				_emergencyHeaderYields.fetch_add(1, std::memory_order_relaxed);
 				queueLog("[SIP] EMERGENCY: header gate yielded (" +
@@ -1030,9 +1026,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			// Emergency INVITEs only, by the To user: the number onInvite routes
 			// on. Not the Request-URI too, or INVITE sip:911@ with To 102 would be
 			// relayed to 102 past this gate. Every other multipart body is
-			// refused as before.
+			// refused as before. desmo, #877 ("the same as dialed"): a 911 a
+			// dial-plan rule produces and a PSAP callback are unwrapped too; those
+			// lookups run only for a body that is not plain SDP.
+			const std::string_view to = request->getToNumber();
 			if (request->getType() == SipMessageTypes::INVITE &&
-				pbx::classifyEmergencyDial(request->getToNumber()).isEmergency)
+				(pbx::classifyEmergencyDial(to).isEmergency ||
+				 (!request->hasSdpContentType() &&
+				  (isPsapCallbackTo(*request) || dialRuleMakesEmergency(std::string(to))))))
 			{
 				request->unwrapMultipartSdp();
 			}
@@ -1040,7 +1041,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			// #199: a second active audio stream is policy, not safety -- the
 			// decoders use the first m=audio -- so it yields for 911 like a header.
 			if (verdict != SipMessage::SdpVerdict::Ok &&
-				!(verdict == SipMessage::SdpVerdict::TooManyAudioStreams && isEmergencyTraffic()))
+				!(verdict == SipMessage::SdpVerdict::TooManyAudioStreams && isEmergencyTraffic(*request)))
 			{
 				rejectSdp(request, verdict);
 				sdpRefused = true;
@@ -2305,6 +2306,17 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		emergency.isEmergency)
 	{
 		routeEmergencyCall(data, caller.value(), emergency, destNumber);
+		return;
+	}
+	// #834 (desmo: "the same as dialed"): a 911/933 that a dial-plan rule
+	// produces takes this early path too, so #497, the secure-mode challenge
+	// and the 422 floor below never stand in front of it. routeTrunkCall()
+	// still diverts one that reaches it (#538 M2), as a backstop.
+	if (std::string ruled; dialRuleMakesEmergency(destNumber, &ruled))
+	{
+		queueLog("EMERGENCY: a dial-plan rule turned " + destNumber + " into " + ruled +
+			"; routing it as an emergency call", true);
+		routeEmergencyCall(data, caller.value(), pbx::classifyEmergencyDial(ruled), ruled);
 		return;
 	}
 
@@ -4631,6 +4643,66 @@ void RequestsHandler::notifyEmergency(const pbx::EmergencyDial& emergency,
 			_beeper.sendBeep(phone.value());
 		}
 	}
+}
+
+bool RequestsHandler::isEmergencyTraffic(const SipMessage& m)
+{
+	if (m.isEmergencyRequest()) return true;
+	auto liveEmergency = [this](std::string_view callId) {
+		const auto s = getSession(callId);
+		return s.has_value() && s.value() && s.value()->isEmergency();
+	};
+	if (liveEmergency(m.getCallID())) return true;
+	// #818: the carrier speaks on the trunk dialog's own Call-ID, and _sessions
+	// is keyed on the handset leg's.
+	if (const SipTrunk::Dialog* d = _sipTrunk.findByCallID(m.getCallID()); d && liveEmergency(d->handsetCallID))
+		return true;
+	if (m.getStatusInfo().has_value() || m.getType() != SipMessageTypes::INVITE ||
+		std::string_view(m.getTo()).find("tag=") != std::string_view::npos)
+	{
+		return false;
+	}
+	return isPsapCallbackTo(m) || dialRuleMakesEmergency(std::string(m.getToNumber()));
+}
+
+bool RequestsHandler::isPsapCallbackTo(const SipMessage& m)
+{
+	// #818: a PSAP callback need not say Priority: psap-callback. #659's window
+	// on the extension makes it one, called directly or through a DID.
+	if (isEmergencyCallback(m.getToNumber())) return true;
+#if POCKETDIAL_TRUNK_INBOUND
+	return isTrunkSbcSource(m.getSource()) && isEmergencyCallback(trunkDidExtension(m));
+#else
+	return false;
+#endif
+}
+
+bool RequestsHandler::dialRuleMakesEmergency(const std::string& dialed, std::string* emergencyOut) const
+{
+	// Only a number that reaches the dial plan: onInvite routes the reserved
+	// extensions, a configured page zone, a park orbit, the pickup codes and a
+	// ring group before it.
+	if (_cfg.dialPlan().empty() || pbx::isReservedExtension(dialed) ||
+		(pbx::isPageZoneExt(dialed) && _cfg.findPageZone(dialed)) || _park.orbitIndex(dialed) >= 0 ||
+		pbx::isGroupPickupCode(dialed) || !pbx::directedPickupTarget(dialed).empty() ||
+		_cfg.findRingGroup(dialed))
+	{
+		return false;
+	}
+	// The rule CallForker::routeDialPlan() applies, and its transform;
+	// routeTrunkCall() then routes an emergency result as an emergency call
+	// (#538 M2). matchDialRule() lets a registered extension win over a
+	// wildcard rule that would make it 911 (#877), so this mirror cannot drift.
+	const pbx::DialRule* rule = _forker.matchDialRule(dialed);
+	std::string transformed;
+	if (!rule || rule->action != pbx::DialActionType::Trunk ||
+		!pbx::applyTrunkTransform(dialed, rule->stripDigits, rule->target, transformed) ||
+		!pbx::classifyEmergencyDial(transformed).isEmergency)
+	{
+		return false;
+	}
+	if (emergencyOut) *emergencyOut = std::move(transformed);
+	return true;
 }
 
 bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
@@ -12099,6 +12171,16 @@ bool RequestsHandler::isTrunkSbcSource(const sockaddr_in& src)
 		sbc.sin_addr.s_addr != 0 && sbc.sin_addr.s_addr == src.sin_addr.s_addr;
 }
 
+std::string RequestsHandler::trunkDidExtension(const SipMessage& m) const
+{
+	// The To user first, because a registered trunk (#399) is called at the
+	// Contact it registered, whose user is the trunk's own; then the
+	// Request-URI user, where an IP-authenticated trunk puts it.
+	std::string ext = _didMapping.extensionForDid(std::string(m.getToNumber()));
+	if (ext.empty()) ext = _didMapping.extensionForDid(std::string(m.getRequestUriUser()));
+	return ext;
+}
+
 void RequestsHandler::routeInboundTrunkCall(const std::shared_ptr<SipMessage>& data)
 {
 	// A retransmission of a call already taken. While it rings the server
@@ -12107,11 +12189,7 @@ void RequestsHandler::routeInboundTrunkCall(const std::shared_ptr<SipMessage>& d
 	// live call 482 (part C).
 	if (_sipTrunk.ownsCallID(data->getCallID())) return;
 
-	// The DID: the To user first, because a registered trunk (#399) is called at
-	// the Contact it registered, whose user is the trunk's own; then the
-	// Request-URI user, where an IP-authenticated trunk puts it.
-	std::string ext = _didMapping.extensionForDid(std::string(data->getToNumber()));
-	if (ext.empty()) ext = _didMapping.extensionForDid(std::string(data->getRequestUriUser()));
+	const std::string ext = trunkDidExtension(*data);
 
 	int status = 480;   // a mapped extension that is not registered
 	std::optional<std::shared_ptr<SipClient>> handset;

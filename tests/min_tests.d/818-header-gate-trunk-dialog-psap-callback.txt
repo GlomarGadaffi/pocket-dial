@@ -1,0 +1,2 @@
+# TrunkWiring_test.cpp: 2 + EmergencyRoute_test.cpp: 2 + TrunkInbound_test.cpp: 2 (#818: a carrier BYE on a live 911 trunk dialog that fails the #759 header gate still ends the call, an ordinary trunk call's still gets 400, and a forged one past the gate is still refused 403 by the trunk; a PSAP callback with no Priority header, to the extension or through the trunk to its DID, gets the header-gate yield and the #760 multipart unwrap inside #659's window and not outside it)
+6
