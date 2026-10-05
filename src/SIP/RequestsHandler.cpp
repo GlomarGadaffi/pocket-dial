@@ -4508,8 +4508,11 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		// function owns what happens next and the handset never receives two
 		// final responses to one INVITE. NOT std::move: originateAnchorCall
 		// takes its shared_ptr by value, and `data` is still needed below.
+		// #878 Phase A: a refusal before dispatch comes back here (false, nothing
+		// sent), like an anchor that is not connected, and the trunk below takes it.
+		bool refusedBeforeDispatch = false;
 		if (originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false, &placed,
-			&codecRejected))
+			&codecRejected, &refusedBeforeDispatch))
 		{
 			markEmergency();   // #604
 			// The call leg is enqueued. NOW notify: 47 CFR 9.16(b)(2) wants the
@@ -4521,7 +4524,8 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 			// bridge slot busy, session pool full, makeCall declined) and still
 			// returned true. Telling the front desk a 911 call went through when
 			// it was refused for capacity is the worst error this feature could make.
-			notifyEmergency(emergency, from, dialed, /*routed=*/placed, kAnchorNotPlaced);
+			notifyEmergency(emergency, from, dialed, /*routed=*/placed,
+				placed ? std::string_view() : kAnchorNotPlaced);
 			return;
 		}
 	}
@@ -4549,8 +4553,10 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 			// logs which one it was ("trunk: <why> for <ext> -> 911").
 			(void)placeSipTrunkCall(data, caller, bare, &placed);
 			markEmergency();   // #604
-			notifyEmergency(emergency, from, dialed, /*routed=*/placed,
-				route == EmergencyRoute::Anchor ? kAnchorThenTrunkRefused : kTrunkRefused);
+			const std::string_view note = route == EmergencyRoute::Anchor
+				? (placed ? kAnchorNotPlaced : kAnchorThenTrunkRefused)
+				: (placed ? std::string_view() : kTrunkRefused);
+			notifyEmergency(emergency, from, dialed, /*routed=*/placed, note);
 			return;
 		}
 	}
@@ -4724,7 +4730,7 @@ bool RequestsHandler::dialRuleMakesEmergency(const std::string& dialed, std::str
 
 bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller, const std::string& destination,
-	bool respondIfDisconnected, bool* placedOut, bool* codecRejectedOut)
+	bool respondIfDisconnected, bool* placedOut, bool* codecRejectedOut, bool* refusedBeforeDispatchOut)
 {
 	// Issue #166: this function's bool return means "took ownership of the
 	// INVITE", NOT "the call was placed" -- eight refuse() paths answer 4xx/5xx
@@ -4734,6 +4740,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// answering.
 	if (placedOut) *placedOut = true;
 	if (codecRejectedOut) *codecRejectedOut = false;
+	if (refusedBeforeDispatchOut) *refusedBeforeDispatchOut = false;
 	const std::string activeIp = _localIp;
 	const std::string callID(data->getCallID());
 	// The remote target both this response's Contact and every later in-dialog
@@ -4757,6 +4764,21 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		_outbox.emplace_back(data->getSource(), std::move(msg));
 		queueLog("anchor(" + remoteExt + "): " + std::string(why) + " for "
 			+ std::string(data->getFromNumber()), true);
+	};
+	// #878 Phase A: a refusal before anything has left for the anchor and before
+	// any answer. A caller that can still route the call elsewhere gets it back
+	// unanswered (returns false); every other caller gets refuse()'s answer.
+	auto refuseBeforeDispatch = [&](const char* statusLine, const char* why) {
+		if (!refusedBeforeDispatchOut)
+		{
+			refuse(statusLine, why);
+			return true;
+		}
+		*refusedBeforeDispatchOut = true;
+		if (placedOut) *placedOut = false;
+		queueLog("anchor(" + remoteExt + "): " + std::string(why) + " for "
+			+ std::string(data->getFromNumber()) + ", before dispatch: nothing sent", true);
+		return false;
 	};
 
 	// Issue #521: the loopback simulator never takes an emergency number, by
@@ -4958,15 +4980,13 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// participant id and the handset's RTP destination is still worth honoring.
 	if (allBridgesBusy())
 	{
-		refuse("SIP/2.0 503 Service Unavailable", "every anchor bridge slot busy");
-		return true;
+		return refuseBeforeDispatch("SIP/2.0 503 Service Unavailable", "every anchor bridge slot busy");
 	}
 
 	auto newSession = allocateSession(callID, caller);
 	if (!newSession)
 	{
-		refuse("SIP/2.0 503 Service Unavailable", "session pool full");
-		return true;
+		return refuseBeforeDispatch("SIP/2.0 503 Service Unavailable", "session pool full");
 	}
 
 	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888/555
@@ -4978,8 +4998,16 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	{
 		// Nothing claimed yet beyond the unpublished session, which the pool
 		// reclaims when newSession goes out of scope (#412).
-		refuse("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
-		return true;
+		return refuseBeforeDispatch("SIP/2.0 503 Service Unavailable", "virtual-peer pool exhausted");
+	}
+	// #878 Phase A: a 911/933's makeCall is queued before its session is
+	// published or its 180 sent, so a refused job is a refusal before dispatch
+	// and the trunk can still take the call. This thread holds _mutex until the
+	// session is published, and the worker takes _mutex before it touches it.
+	// The vpeer is not attached yet, so a refusal releases it.
+	if (emergency && !asyncMakeCall(destination, callID, caller->getNumber(), emergency, /*published=*/false))
+	{
+		return refuseBeforeDispatch("SIP/2.0 503 Service Unavailable", "anchor worker queue full");
 	}
 	newSession->setDest(dummyAnchor);
 	newSession->setInviteMessage(data);
@@ -5008,7 +5036,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 	// synchronous branch's comment above. Dispatched off the SIP thread; the
 	// 200 OK follows later from the CallEvent::Answered callback once the far
 	// leg actually connects.
-	if (!asyncMakeCall(destination, callID, caller->getNumber(), emergency))
+	if (!emergency && !asyncMakeCall(destination, callID, caller->getNumber(), emergency))
 	{
 		// #713: no worker, so nothing will ever place this call. asyncMakeCall()
 		// has answered 503 and ended the session: the INVITE is owned (true),
@@ -5064,7 +5092,7 @@ void RequestsHandler::refuseRingingAnchor(const std::string& callId,
 }
 
 bool RequestsHandler::asyncMakeCall(const std::string& destination, const std::string& callId,
-	const std::string& callerNumber, bool emergency)
+	const std::string& callerNumber, bool emergency, bool published)
 {
 	if (!_anchorClient) return false;   // unreachable: originateAnchorCall() returns first with no client
 	auto* job = new TelCtlJob{ TelCtlJob::Make, destination, callId, callerNumber, {} };
@@ -5078,6 +5106,7 @@ bool RequestsHandler::asyncMakeCall(const std::string& destination, const std::s
 #endif
 	if (postTelCtl(job, emergency ? kLaneSos : kLaneCtl)) return true;
 	queueLog("[Telephony] asyncMakeCall: tel_ctl queue full — call NOT placed", true);
+	if (!published) return false;   // #878 Phase A: nothing answered or published yet
 	// onAnchorInvite() already allocated the session and sent 180 Ringing; with
 	// no worker nobody will ever answer or fail it, so without this the handset
 	// rings until tick()'s no-answer reap fires ~20 s later. Do what that reap

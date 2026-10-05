@@ -105,11 +105,12 @@ struct E911Config
 //   TEST: 933 dialed by ext 101 - NOT ROUTED (the trunk refused it) - callback not configured
 //
 // `routed` false produces the NOT ROUTED wording, which is the case that most
-// needs a human. A test asserts the two are never confusable. `notRoutedReason`
-// names the route that failed (desmo, #878); empty keeps "no trunk available".
+// needs a human. A test asserts the two are never confusable. `note` names
+// what failed (desmo, #878): the route for NOT ROUTED, where empty keeps "no
+// trunk available"; on ROUTED, the anchor a trunk call stood in for.
 std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	std::string_view dialed, bool hadTrunkPrefix, bool routed,
-	const E911Config& cfg, std::string_view notRoutedReason = {});
+	const E911Config& cfg, std::string_view note = {});
 
 } // namespace pbx
 
@@ -139,7 +140,7 @@ public:
 	// log line — NOT as a success/failure signal.
 	std::size_t notify(const pbx::E911Config& cfg, bool isTest,
 		std::string_view fromExt, std::string_view dialed,
-		bool hadTrunkPrefix, bool routed, std::string_view notRoutedReason = {});
+		bool hadTrunkPrefix, bool routed, std::string_view note = {});
 
 private:
 	// One MESSAGE to `ext`, or nullptr when the extension is not registered or
