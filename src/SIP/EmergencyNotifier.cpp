@@ -14,7 +14,7 @@ namespace pbx
 
 std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	std::string_view dialed, bool hadTrunkPrefix, bool routed,
-	const E911Config& cfg)
+	const E911Config& cfg, std::string_view notRoutedReason)
 {
 	std::string out;
 	out.reserve(200);
@@ -36,11 +36,18 @@ std::string formatE911Notification(bool isTest, std::string_view fromExt,
 		out += ")";
 	}
 
-	// "no trunk available" rather than "no trunk connected": this fires both
-	// when no anchor is connected AND when one is connected but refused the
-	// call (every bridge slot busy, session pool full, makeCall declined).
-	// Naming only the first cause would be a confident, wrong diagnosis.
-	out += routed ? " - ROUTED TO TRUNK" : " - NOT ROUTED (no trunk available)";
+	// desmo, #878: NOT ROUTED names the route that failed. The caller knows
+	// which one it was; "no trunk available" is only the fallback wording.
+	if (routed)
+	{
+		out += " - ROUTED TO TRUNK";
+	}
+	else
+	{
+		out += " - NOT ROUTED (";
+		out += notRoutedReason.empty() ? std::string_view("no trunk available") : notRoutedReason;
+		out += ")";
+	}
 
 	// An absent callback is stated rather than omitted: a blank field reads as
 	// "nothing to report", and here it means the opposite.
@@ -120,10 +127,10 @@ std::shared_ptr<SipMessage> EmergencyNotifier::buildNotifyMessage(const std::str
 
 std::size_t EmergencyNotifier::notify(const pbx::E911Config& cfg, bool isTest,
 	std::string_view fromExt, std::string_view dialed,
-	bool hadTrunkPrefix, bool routed)
+	bool hadTrunkPrefix, bool routed, std::string_view notRoutedReason)
 {
 	const std::string text =
-		pbx::formatE911Notification(isTest, fromExt, dialed, hadTrunkPrefix, routed, cfg);
+		pbx::formatE911Notification(isTest, fromExt, dialed, hadTrunkPrefix, routed, cfg, notRoutedReason);
 
 	// 1. The record. Unconditional and unconfigurable: an operator can leave
 	//    notifyExts empty, but they cannot turn off the fact that a 911 dial is

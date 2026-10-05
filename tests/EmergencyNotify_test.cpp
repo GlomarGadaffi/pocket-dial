@@ -487,7 +487,8 @@ TEST(E911Notify, TheMessageBodyIsExactlyTheNotificationText)
 	cfg.callback = "2025550123";
 	cfg.location = "Front office";
 	const std::string expected = pbx::formatE911Notification(
-		/*isTest=*/false, "101", "911", /*hadTrunkPrefix=*/false, /*routed=*/false, cfg);
+		/*isTest=*/false, "101", "911", /*hadTrunkPrefix=*/false, /*routed=*/false, cfg,
+		"the 3CX anchor could not place the call; no trunk is configured");
 
 	EXPECT_EQ(body, expected)
 		<< "the SIP body and the syslog record must be the same text";

@@ -1755,8 +1755,11 @@ private:
 	// Issue #166 part 2: fire the Kari's Law notification. Called ONLY after
 	// the emergency call leg (or its 503) has already been enqueued, so a
 	// notification can never delay or displace the call. Caller holds _mutex.
+	// `notRoutedReason` names the route that failed when `routed` is false
+	// (desmo, #878).
 	void notifyEmergency(const pbx::EmergencyDial& emergency,
-		const std::string& fromExt, const std::string& dialed, bool routed);
+		const std::string& fromExt, const std::string& dialed, bool routed,
+		std::string_view notRoutedReason = {});
 
 	void routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller,
