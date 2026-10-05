@@ -1292,8 +1292,8 @@ TEST(E911Notify, A911TheAnchorRefusesForBusyBridgesFallsBackToTheTrunk)
 // ─────────────────────────────────────────────────────────────────────────────
 // #878 review S-C2: a final from the carrier after its own 2xx (a stateless
 // forking hop or a broken SBC; RFC 3261 §16.7 forbids it) refuses no 911 still
-// ringing: the PSAP answered it. ROUTED stands and no NOT ROUTED follows. The
-// teardown of the live call that final still causes is #890, not changed here.
+// ringing: the PSAP answered it. ROUTED stands and no NOT ROUTED follows. Nor
+// does that final end the call (#890, the test after this one).
 // ─────────────────────────────────────────────────────────────────────────────
 
 TEST(E911Notify, ACarrierFinalAfterItsTwoHundredIsNeverReportedNotRouted)
@@ -1327,6 +1327,72 @@ TEST(E911Notify, ACarrierFinalAfterItsTwoHundredIsNeverReportedNotRouted)
 		b.handler->handle(carrierResponse(b, "SIP/2.0 486 Busy Here"));
 		EXPECT_EQ(countStarting(b, "SIP/2.0 486"), 1) << b.dump();
 		expectNotRoutedAfterRouted(b, "the trunk refused it (486)", "SIP/2.0 486");
+	}
+}
+
+// #890: the final used to run the failure path: the PSAP's dialog was freed
+// with no BYE and the caller's session ended with none either, so a connected
+// 911 lost its audio. Now nothing goes on the wire, the call and its relay stay
+// up, and a BYE from either side still ends it, with no NOT ROUTED at any
+// point. The negative, a 486 before the 2xx, is the second half of the test above.
+TEST(E911Notify, ACarrierFinalAfterItsTwoHundredLeavesThe911Up)
+{
+	auto header = [](const std::string& m, const std::string& name) {
+		const size_t p = m.find("\r\n" + name);
+		return p == std::string::npos ? std::string() : m.substr(p + 2, m.find("\r\n", p + 2) - p - 2);
+	};
+	for (const bool psapHangsUp : { true, false })
+	{
+		SCOPED_TRACE(psapHangsUp ? "then the PSAP hangs up" : "then the caller hangs up");
+		NBench b;
+		b.handler->setE911Config("200", "", "");
+		b.handler->setAnchorPlacesRealCallsForTest(false);
+		b.handler->setTrunkConfig(dottedQuadTrunk());
+		b.wire.clear();
+		b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-890"));
+		ASSERT_EQ(countStarting(b, "INVITE sip:911@203.0.113.5"), 1) << b.dump();
+		b.handler->handle(carrierResponse(b, "SIP/2.0 200 OK", /*withSdp=*/true));
+		ASSERT_EQ(countStarting(b, "SIP/2.0 200 OK"), 1) << "precondition: the PSAP answered:\n" << b.dump();
+		std::string invite, answer;
+		for (const auto& w : b.wire)
+		{
+			if (invite.empty() && w.rfind("INVITE sip:911@203.0.113.5", 0) == 0) invite = w;
+			if (answer.empty() && w.rfind("SIP/2.0 200 OK", 0) == 0) answer = w;
+		}
+		const size_t before = b.wire.size();
+
+		b.handler->handle(carrierResponse(b, "SIP/2.0 486 Busy Here"));
+		b.handler->handle(carrierResponse(b, "SIP/2.0 486 Busy Here"));   // its retransmission
+
+		EXPECT_EQ(b.wire.size(), before) << "nothing to the caller or the PSAP:\n" << b.dump();
+		const auto s = b.handler->getSession("Call-ID: en-890");
+		EXPECT_TRUE(s.has_value() && s.value()->getState() == Session::State::Connected) << b.dump();
+		EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 1u);
+
+		if (psapHangsUp)
+		{
+			// RFC 3261 §12.2.1.1: the PSAP's From is the INVITE's To, with its tag.
+			const std::string bye = "BYE sip:trunkuser@192.168.78.1:5060 SIP/2.0\r\n"
+				"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKpsap890\r\n"
+				"From: " + header(invite, "To: ").substr(4) + ";tag=carrier879\r\n"
+				"To: " + header(invite, "From: ").substr(6) + "\r\n" + header(invite, "Call-ID: ") + "\r\n"
+				"CSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n";
+			b.handler->handle(RequestsHandler::getMessageFromPool(bye, enAddr("203.0.113.5")));
+			EXPECT_EQ(countStarting(b, "BYE sip:101@"), 1) << "the caller is told:\n" << b.dump();
+		}
+		else
+		{
+			const std::string bye = "BYE sip:911@server SIP/2.0\r\n"
+				"Via: SIP/2.0/UDP 192.168.78.11:5060;branch=z9hG4bKb890\r\n"
+				+ header(answer, "From: ") + "\r\n" + header(answer, "To: ") + "\r\n"
+				"Call-ID: en-890\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n";
+			b.handler->handle(RequestsHandler::getMessageFromPool(bye, enAddr("192.168.78.11")));
+			EXPECT_EQ(countStarting(b, "BYE sip:911@203.0.113.9"), 1) << "the PSAP is told:\n" << b.dump();
+		}
+		EXPECT_FALSE(b.handler->getSession("Call-ID: en-890").has_value()) << b.dump();
+		EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 0u);
+		EXPECT_EQ(b.countOf("ROUTED TO TRUNK"), 1) << b.dump();
+		EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << "the PSAP answered this 911:\n" << b.dump();
 	}
 }
 

@@ -1521,6 +1521,47 @@ TEST(SipTrunkAuth, APoolRefusalOnTheRetryAcksTheChallengeOnceFromTheUntouchedTra
 	EXPECT_EQ(trunk.activeDialogs(), 0u) << "unanswerable for now: an ordinary failure";
 }
 
+// #890: the 2xx ended the INVITE's transaction, so a final after it is neither
+// a challenge to answer nor the call's failure. Answering a 401/407 sent a
+// second, credentialed INVITE for a call that was up (on a 911, a second PSAP
+// call), set the dialog back to Trying and dropped the answer's tag. A 486 ran
+// the failure path: an ACK, the dialog freed with no BYE, and the listener told
+// the call failed.
+TEST(SipTrunkAuth, AFinalAfterTheAnswerIsNeitherAnsweredNorAFailure)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	RecordingListener lis;
+	trunk.setConfig(workingConfig());
+	trunk.setListener(&lis);
+	ASSERT_TRUE(trunk.setCredentials("s3cret-890"));
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	ASSERT_TRUE(trunk.handleResponse(responseFor(okFor(*d))));
+	ASSERT_EQ(env.sent.size(), 2u) << "precondition: the INVITE and the 2xx's ACK";
+	lis.events.clear();
+
+	EXPECT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 407, "Proxy-Authenticate"))));
+	EXPECT_TRUE(trunk.handleResponse(responseFor(challengeFor(*d, 401, "WWW-Authenticate"))));
+	EXPECT_TRUE(trunk.handleResponse(responseFor(withStatus(okFor(*d), "SIP/2.0 486 Busy Here"))));
+
+	std::string sentAfter;
+	for (std::size_t i = 2; i < env.sent.size(); ++i) sentAfter += firstLine(env.sentRaw(i)) + "\n";
+	EXPECT_EQ(env.sent.size(), 2u) << "no ACK and no second INVITE; sent:\n" << sentAfter;
+	EXPECT_TRUE(lis.events.empty()) << "and no failure reported: " << (lis.events.empty() ? 0 : lis.events[0].status);
+	ASSERT_NE(trunk.findByCallID("handset-1"), nullptr) << "the call is still up";
+	EXPECT_EQ(trunk.findByCallID("handset-1")->state, SipTrunk::State::Confirmed);
+	EXPECT_FALSE(anySentOrLoggedContains(env, "s3cret-890"));
+
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+	ASSERT_EQ(env.sent.size(), 3u);
+	const std::string bye = env.sentRaw(2);
+	EXPECT_EQ(firstLine(bye), "BYE sip:+15551234567@203.0.113.99:5060 SIP/2.0");
+	EXPECT_NE(bye.find(";tag=carrier-tag"), std::string::npos) << "on the answer's dialog:\n" << bye;
+	EXPECT_NE(bye.find("CSeq: 2 BYE"), std::string::npos) << "the INVITE's CSeq is still 1:\n" << bye;
+}
+
 // ── #399: REGISTER with the carrier, digest-signed ──────────────────────────
 //
 // Engage's SBC never answered .244's INVITEs because the trunk never
