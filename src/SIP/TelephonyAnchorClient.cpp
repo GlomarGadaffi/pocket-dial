@@ -422,11 +422,12 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	int status = 0;
 	std::string respBody;
 	bool requestSent = false;   // #349: did the POST body actually reach 3CX?
-	uint64_t postSeq = 0;       // #379: a Remove received after this may be this makecall's leg
-	{
+	// #379: a Remove received after the POST whose response names the leg may be that leg's.
+	auto readPostSeq = [this] {
 		std::lock_guard<std::mutex> lock(_mutex);
-		postSeq = _wsSeq;
-	}
+		return _wsSeq;
+	};
+	uint64_t postSeq = readPostSeq();
 	bool success = httpPostBody(makeCallUrl, "application/json", postData, respBody, &status, &requestSent);
 
 	// A device-path 404 means the cached device_id went stale (registration flap). Re-resolve once
@@ -447,12 +448,14 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		if (!freshId.empty())
 		{
 			status = 0; respBody.clear(); requestSent = false;
+			postSeq = readPostSeq();
 			success = httpPostBody(deviceUrl(freshId), "application/json", postData, respBody, &status, &requestSent);
 		}
 		if (!success)
 		{
 			ESP_LOGW(TAG, "makeCall: falling back to legacy makecall endpoint");
 			status = 0; respBody.clear(); requestSent = false;
+			postSeq = readPostSeq();
 			success = httpPostBody(legacyUrl, "application/json", postData, respBody, &status, &requestSent);
 		}
 	}

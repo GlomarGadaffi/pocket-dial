@@ -57,10 +57,15 @@ class AnchorOwnLegNotInboundTest(unittest.TestCase):
         self.assertLess(named, keyed, "noted before the slot is keyed, so no window is uncovered")
         self.assertIn("telephony::ownLegMayBeHeld(ownLegSource)", self.make[:named],
                       "only a leg 3CX named as ours is held, never the list fallback's guess")
-        took = self.make.find("postSeq = _wsSeq;")
-        self.assertNotEqual(took, -1, "makeCall must take the WS event number before its makecall goes out")
-        self.assertLess(took, self.make.find("httpPostBody("),
-                        "a Remove received after the makecall went out may be this leg's own")
+        self.assertRegex(self.make, r"std::lock_guard<std::mutex> lock\(_mutex\);\s*return _wsSeq;",
+                         "the WS event number is read under _mutex: a 64-bit read can tear on the S3")
+        posts = [m.start() for m in re.finditer(r"httpPostBody\(", self.make)]
+        self.assertEqual(len(posts), 3, "positive control: the makecall POST and its two retries")
+        prev = 0
+        for at in posts:
+            self.assertIn("postSeq = readPostSeq();", self.make[prev:at],
+                          "the number is read just before each makecall POST: a Remove after it may be this leg's")
+            prev = at
 
     def test_a_freed_outbound_slot_hands_its_leg_to_the_table(self):
         cleared = self.free.find("slot.participantId.clear()")
