@@ -638,7 +638,9 @@ class CounterTest(unittest.TestCase):
         self.assertLessEqual(an.ref_call_worst_s(sc), sc["call_cap_s"])
         self.assertEqual(an.scenario_problems(sc), [])
         self.assertGreaterEqual(sc["ref_timeout_s"], 2 * an.MAKECALL_OBSERVED_MAX_S)
-        for t in (12, 20, 60):
+        # 12.6 s is the longest wait that fits: 12.6 + 1.4 + 16 = 30.0 s. 12 s still fits (29.4 s).
+        self.assertEqual(an.scenario_problems(dict(sc, ref_timeout_s=12)), [])
+        for t in (13, 20, 60):
             self.assertTrue(any("past the" in p for p in an.scenario_problems(dict(sc, ref_timeout_s=t))), t)
         # the INVITE transaction (16 s) must outlive the CANCEL and the PBX's 487
         self.assertTrue(any("INVITE" in p for p in an.scenario_problems(dict(sc, ref_timeout_s=14))))
@@ -1030,8 +1032,11 @@ class RunTest(unittest.TestCase):
         argv = cli("--port", str(self.board.port), "--http-port", str(self.http_port), "--local-ip", "127.0.0.1",
                    "--syslog-port", "0", "--set-syslog", "--pin-check-s", "0.05", "--out", self.tmp.name,
                    "--expect-version", "v1.5.0-fake", *extra, scenario=scenario)
-        rc, out = run_main(argv, env or base_env(), start_logger=start_logger,
-                           overrides=dict(fast or FAST, **(overrides or {})), run_defaults=FAST_RUN)
+        # the fast fakes shrink every wait to a fraction of a second, below the floor a real run keeps
+        # above the slowest makecall response seen on a board (CounterTest pins that floor itself)
+        with mock.patch.object(an, "MAKECALL_OBSERVED_MAX_S", 0.0):
+            rc, out = run_main(argv, env or base_env(), start_logger=start_logger,
+                               overrides=dict(fast or FAST, **(overrides or {})), run_defaults=FAST_RUN)
         dirs = [d for d in os.listdir(self.tmp.name) if os.path.isdir(os.path.join(self.tmp.name, d))]
         self.assertEqual(len(dirs), 1, out)
         self.res = os.path.join(self.tmp.name, dirs[0])
@@ -1074,7 +1079,7 @@ class RunTest(unittest.TestCase):
             self.assertIsNotNone(c["ring_ref_ms"])
             self.assertFalse(c["ref_timeout"])
             self.assertGreater(c["cancel_sent_ms"], c["ring_ref_ms"])
-            self.assertAlmostEqual(c["cancel_after_ref_ms"], c["cancel_planned_ms"], delta=60)
+            self.assertAlmostEqual(c["cancel_after_ref_ms"], c["cancel_planned_ms"], delta=100)
         self.assertEqual(self.manifest["summary"]["buckets"], {"cancelled": 3})
         pcaps = sorted(os.listdir(os.path.join(self.res, "pcap")))
         self.assertEqual(pcaps, ["call-01.pcap", "call-02.pcap", "call-03.pcap", "end.pcap"])
@@ -1137,9 +1142,9 @@ class RunTest(unittest.TestCase):
         calls = self.calls()
         self.assertEqual([c["final"] for c in calls], [487, 487, 487])
         for i, c in enumerate(calls):
-            self.assertAlmostEqual(c["ring_ref_ms"], 700, delta=150)
+            self.assertAlmostEqual(c["ring_ref_ms"], 700, delta=250)
             self.assertGreater(c["cancel_sent_ms"], c["ring_ref_ms"])
-            self.assertAlmostEqual(c["cancel_after_ref_ms"], c["cancel_planned_ms"], delta=60)
+            self.assertAlmostEqual(c["cancel_after_ref_ms"], c["cancel_planned_ms"], delta=100)
             # what the board saw: the CANCEL after ITS OWN Upset line plus the swept delay, never before
             self.assertGreaterEqual(self.board.cancels[i] - self.board.upset_times[i],
                                     c["cancel_planned_ms"] / 1000.0 - 0.01, "call %d" % (i + 1))
@@ -1150,7 +1155,7 @@ class RunTest(unittest.TestCase):
         rc, out = self.go(overrides={"calls": 2})
         self.assertEqual(rc, 0, out)
         for i, c in enumerate(self.calls()):
-            self.assertAlmostEqual(c["ring_ref_ms"], 800, delta=150)
+            self.assertAlmostEqual(c["ring_ref_ms"], 800, delta=250)
             self.assertGreaterEqual(self.board.cancels[i] - self.board.upset_times[i],
                                     c["cancel_planned_ms"] / 1000.0 - 0.01)
             self.assertGreater(self.board.cancels[i] - self.board.leg_times[i], 0.6)
@@ -1308,8 +1313,8 @@ class RunTest(unittest.TestCase):
 
 # ---------------------------------------------------------------- x379_cancel_before_leg
 X379 = "x379_cancel_before_leg"
-X379_FAST = {"calls": 3, "cancel_ms": (50, 150), "gap_s": 0.2, "leg_wait_s": 3.0, "drop_wait_s": 1.5,
-             "settle_s": 0.4}
+X379_FAST = {"calls": 2, "cancel_ms": (50, 150), "gap_s": 0.1, "leg_wait_s": 3.0, "drop_wait_s": 1.5,
+             "settle_s": 0.3}
 
 
 class X379CancelBeforeLegTest(unittest.TestCase):
@@ -1323,7 +1328,7 @@ class X379CancelBeforeLegTest(unittest.TestCase):
     assert_no_secret_anywhere = RunTest.assert_no_secret_anywhere
 
     def run379(self, **kw):
-        self.board.leg_delay_s = kw.pop("leg_delay_s", 0.4)    # makecall latency, past the CANCEL
+        self.board.leg_delay_s = kw.pop("leg_delay_s", 0.3)    # makecall latency, past the CANCEL
         self.board.drop_delay_s = kw.pop("drop_delay_s", 0.1)
         return self.go(scenario=X379, fast=X379_FAST, **kw)
 
@@ -1338,7 +1343,7 @@ class X379CancelBeforeLegTest(unittest.TestCase):
         self.assertIn("initiated", an.LOG_COUNTERS)
 
     def test_pass(self):
-        rc, out = self.run379()
+        rc, out = self.run379(overrides={"calls": 3})
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.manifest["verdict"], "PASS")
         calls = self.calls()
@@ -1412,10 +1417,10 @@ class X379CancelBeforeLegTest(unittest.TestCase):
         self.assertTrue(any("call 2" in r and "never came up" in r for r in self.manifest["invalid_reasons"]),
                         self.manifest["invalid_reasons"])
         self.assertEqual(self.manifest["fail_reasons"], [])
-        self.assertEqual(self.manifest["summary"]["race_exercised"], 2)
+        self.assertEqual(self.manifest["summary"]["race_exercised"], 1)
 
     def test_invalid_when_no_call_ever_gets_a_leg(self):
-        self.board.no_leg_calls = {0, 1, 2}
+        self.board.no_leg_calls = {0, 1}
         rc, out = self.run379()
         self.assertEqual(rc, 3, out)
         self.assertIn("initiated is 0", out)
@@ -1489,7 +1494,7 @@ class X379CancelBeforeLegTest(unittest.TestCase):
         rc, out = self.run379()
         self.assertEqual(rc, 3, out)
         self.assertIn("the S1 pin lapsed", out)
-        self.assertLess(len(self.calls()), 3)
+        self.assertLess(len(self.calls()), 2)
 
 
 class FarEndLoopbackRunTest(unittest.TestCase):

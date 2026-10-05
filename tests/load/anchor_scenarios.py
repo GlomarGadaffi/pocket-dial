@@ -32,6 +32,18 @@ Safety, checked against the board before the first call and through the run
     the register beep (From user "pbx") is a phantom inbound: FAIL.
   * the far end must not be registered on the board (it would ring locally).
 
+x4_cancel_ringing times each CANCEL from a ringing reference, not from the INVITE. The PBX's 180
+is local ringback, sent at INVITE time (RequestsHandler.cpp originateAnchorCall) before the 3CX call
+is even requested, and no 183 or early RTP follows, so no SIP message says the far leg rings. The
+witness is the syslog line "Upset <leg> -> control leg <leg> status '<not Connected>'": 3CX's
+participant list shows our leg and it is not yet Connected, the state the firmware itself treats as
+ringing (#667). x379_cancel_before_leg is the other race: its CANCEL goes 0.3-0.8 s after the INVITE,
+before the makecall response, so before any 3CX leg exists.
+
+The far end must not route back into this board. The board exposes its route DN and its DID rows
+but not the tenant's own numbers, so a far end equal to the route DN or to a DID row is INVALID
+before the first packet, and any phantom verdict says it holds only if the far end cannot route back.
+
 Probe scenarios (x349_unread_makecall, x379_never_opened, x518_403_clean_giveup,
 x279_degraded_bye) drive the bench probe image (docs/BENCH_PROBE.md, #384 H1):
 they need --expect-version with a -probe stamp, read /api/bench/fault's counters
@@ -61,6 +73,7 @@ import argparse
 import collections
 import datetime
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -111,6 +124,20 @@ USER_ENV = "PD_BOARD_ADMIN_USER"
 SECRET_ENVS = (PIN_ENV, "PD_ANCHOR_TENANT", "PD_ANCHOR_CLIENT_ID", "PD_ANCHOR_CLIENT_SECRET",
                "PD_OTA_USER", "PD_OTA_PASS")
 LOGGER = os.path.join(REPO, "tools", "soak", "status_logger.sh")
+# What the scenarios' timing rests on. The agent's own transaction bounds come from sip_agent, so a
+# change there re-opens the per-call arithmetic below.
+_AGENT_DEFAULTS = inspect.signature(sip_agent.Agent.__init__).parameters
+AGENT_TXN_TIMEOUT_S = float(_AGENT_DEFAULTS["timeout"].default)            # a CANCEL or a BYE transaction
+AGENT_INVITE_TIMEOUT_S = float(_AGENT_DEFAULTS["invite_timeout"].default)  # the INVITE transaction
+CANCEL_FINAL_S = 2.0          # the PBX answers a CANCEL's INVITE with its 487 within this
+# 3CX's makecall response took 1.8-3.2 s on a real tenant (#379, Stray's correction comment). A
+# CANCEL 0.6-1.4 s after the INVITE therefore always lands before the 3CX leg exists.
+MAKECALL_OBSERVED_MIN_S = 1.8
+MAKECALL_OBSERVED_MAX_S = 3.2
+MAX_NO_REF = 2                # calls in a row with no ringing reference before x4 stops ringing the far end
+LOOPBACK_CAVEAT = ("this is a firmware finding only if the far end cannot route back to this board's route DN; "
+                   "the harness refuses a far end equal to the route DN or to a DID row but cannot see the "
+                   "tenant's own numbers, so confirm the far end before posting it")
 RING_REQUIRED = ("RING-REQUIRED: the far end is not confirmed automated (#384 approval, 2026-10-03), "
                  "so a run against real 3CX needs desmo's OK for that run")
 
@@ -123,6 +150,12 @@ LOG_COUNTERS = {
     "rx554_dropped_leg": r"startRxIfNeeded: (\S+) was dropped -- not re-priming \(#554\)",
     "rx_started": r"Rx stream task started for participant (\S+)",
     "initiated": r"Successfully initiated call to \S+ \(own leg (\S+)\)",
+    # The upsert worker's status line for one of OUR outbound legs that is not yet fully up: 3CX's
+    # participant list shows it (group 1 = the control leg) in a state that is not Connected. A
+    # non-empty status is the firmware's own "ringing, not a #100 wedge" (#667); '' is "no evidence".
+    "leg_listed": r"Upset \S+ -> control leg (\S+) status '(?!Connected')[^']+'",
+    # The same worker's inbound branch: the leg was announced as an inbound call on the route DN.
+    "inbound_call": r"Inbound call on DN .*?: participant (\S+) caller",
     "dropped": r"Successfully dropped participant (\S+)",
     "drop_failed": r"dropCall request failed for participant (\S+)",
     "drop_reconciled": r"dropCall: reconciled live participant (\S+)",
@@ -267,6 +300,41 @@ def far_end_problems(far, owner):
     return problems
 
 
+_NUMERIC = re.compile(r"\+?[0-9 ()./-]+")
+
+
+def same_number(a, b):
+    """True if a and b are one number as a route would see it: equal digits or, when both are
+    full national numbers (10+ digits), the same last ten, so +1 555 010 4242 and 5550104242
+    match (DidMapping::sameDid's E.164 equivalence). A name such as the route DN "rcv2" matches
+    only itself, never by the digit in it."""
+    a, b = str(a if a is not None else "").strip(), str(b if b is not None else "").strip()
+    if not a or not b:
+        return False
+    if not (_NUMERIC.fullmatch(a) and _NUMERIC.fullmatch(b)):
+        return a == b
+    da, db = re.sub(r"[^0-9]", "", a), re.sub(r"[^0-9]", "", b)
+    return da == db or (len(da) >= 10 and len(db) >= 10 and da[-10:] == db[-10:])
+
+
+def far_end_loopback_problems(far, route_dn, rows):
+    """Why `far` may route straight back into this board's own route point, or []. A call to such
+    a far end arrives on the route DN as an inbound call and is offered to the DID row. The board
+    exposes the route DN (/api/telephony-config) and its DID rows (/api/did-mapping), not the
+    tenant's own inbound numbers, so only those can be checked; never echoes a number."""
+    problems = []
+    if same_number(far, route_dn):
+        problems.append("the far end is this anchor slot's route DN: a call to it arrives back on the route "
+                        "point as an inbound call")
+    rows = [r for r in rows or [] if isinstance(r, dict)]
+    if any(same_number(far, r.get("did")) for r in rows):
+        problems.append("the far end is the number of a DID row (/api/did-mapping): a call to it routes back "
+                        "into this board as an inbound call")
+    if any(same_number(far, r.get("extension")) for r in rows):
+        problems.append("the far end is the extension a DID row maps to: it never reaches the anchor")
+    return problems
+
+
 def load_far_end(env, stat_fn=os.stat, posix=None):
     """-> (far end, where it came from). Raises Refused, never echoing the value."""
     posix = (os.name == "posix") if posix is None else posix
@@ -385,6 +453,64 @@ def probe_problems(sc):
 SCENARIOS = {}
 
 
+def sweep_problems(sc):
+    ms = sc.get("cancel_ms")
+    if isinstance(ms, (tuple, list)) and len(ms) == 2 and 0 <= ms[0] <= ms[1]:
+        return []
+    return ["%s: cancel_ms must be (low, high) in ms, 0 <= low <= high" % sc.get("name", "<unnamed>")]
+
+
+def ref_call_worst_s(sc):
+    """The longest an x4 call can take: the CANCEL leaves by ref_timeout_s + the sweep's high end,
+    its own transaction may take AGENT_TXN_TIMEOUT_S, and so may a BYE after a 2xx that crossed it."""
+    return sc["ref_timeout_s"] + sc["cancel_ms"][1] / 1000.0 + 2 * AGENT_TXN_TIMEOUT_S
+
+
+def ref_timing_problems(sc):
+    n = sc.get("name", "<unnamed>")
+    problems = sweep_problems(sc)
+    if problems:
+        return problems
+    t, hi = sc["ref_timeout_s"], sc["cancel_ms"][1] / 1000.0
+    if t < 2 * MAKECALL_OBSERVED_MAX_S:
+        problems.append("%s: ref_timeout_s %g is shorter than twice the slowest makecall response seen on a "
+                        "board (%g s): a slow tenant would end calls INVALID" % (n, t, MAKECALL_OBSERVED_MAX_S))
+    if t + hi + CANCEL_FINAL_S > AGENT_INVITE_TIMEOUT_S:
+        problems.append("%s: the agent gives up on the INVITE after %g s, before a CANCEL due by %.1f s can be "
+                        "answered with its 487" % (n, AGENT_INVITE_TIMEOUT_S, t + hi))
+    if ref_call_worst_s(sc) > sc.get("call_cap_s", 0):
+        problems.append("%s: a call can take up to %.1f s (reference wait %g + sweep %.1f + a CANCEL and a BYE "
+                        "transaction of %g s each), past the %d s call cap"
+                        % (n, ref_call_worst_s(sc), t, hi, AGENT_TXN_TIMEOUT_S, sc.get("call_cap_s", 0)))
+    return problems
+
+
+def x379_call_worst_s(sc):
+    """The longest an x379 call can take: the agent part (the sweep, its CANCEL and a BYE) or the
+    wait for the leg, whichever is longer, then the wait for the drop and the settle."""
+    return max(sc["cancel_ms"][1] / 1000.0 + 2 * AGENT_TXN_TIMEOUT_S, sc["leg_wait_s"]) \
+        + sc["drop_wait_s"] + sc["settle_s"]
+
+
+def leg_wait_problems(sc):
+    n = sc.get("name", "<unnamed>")
+    problems = sweep_problems(sc)
+    if problems:
+        return problems
+    hi = sc["cancel_ms"][1] / 1000.0
+    if sc["leg_wait_s"] < 2 * MAKECALL_OBSERVED_MAX_S:
+        problems.append("%s: leg_wait_s %g is shorter than twice the slowest makecall response seen on a "
+                        "board (%g s)" % (n, sc["leg_wait_s"], MAKECALL_OBSERVED_MAX_S))
+    if hi >= MAKECALL_OBSERVED_MIN_S:
+        problems.append("%s: the CANCEL sweep reaches %.1f s, not before the fastest makecall response seen "
+                        "on a board (%g s): the leg could exist first, which is not this race"
+                        % (n, hi, MAKECALL_OBSERVED_MIN_S))
+    if x379_call_worst_s(sc) > sc.get("call_cap_s", 0):
+        problems.append("%s: a call can take up to %.1f s (leg wait, drop wait and settle after the agent's "
+                        "own bound), past the %d s call cap" % (n, x379_call_worst_s(sc), sc.get("call_cap_s", 0)))
+    return problems
+
+
 def scenario_problems(sc):
     problems = []
     n = sc.get("name", "<unnamed>")
@@ -399,14 +525,21 @@ def scenario_problems(sc):
         problems.append("%s: the phantom detector must be %s, the S1 pin's target" % (n, PIN_UA))
     if len(set(uas.values())) != len(uas):
         problems.append("%s: one UA in two roles" % n)
-    if not 1 <= sc.get("calls", 0) <= MAX_CALLS:
-        problems.append("%s: calls must be 1-%d (the #384 approval)" % (n, MAX_CALLS))
+    cap = min(MAX_CALLS, sc.get("max_calls", MAX_CALLS))
+    if not 1 <= sc.get("calls", 0) <= cap:
+        problems.append("%s: calls must be 1-%d (%s)" % (
+            n, cap, "the #384 approval" if cap == MAX_CALLS
+            else "this scenario's own cap; the #384 approval allows %d" % MAX_CALLS))
     if not 0 < sc.get("call_cap_s", 0) <= MAX_CALL_S:
         problems.append("%s: call_cap_s must be 1-%d (each call <= ~30 s)" % (n, MAX_CALL_S))
     if not callable(sc.get("run")) or not callable(sc.get("judge")):
         problems.append("%s: needs a run and a judge" % n)
     if sc.get("probe"):
         problems += probe_problems(sc)
+    if "ref_timeout_s" in sc:
+        problems += ref_timing_problems(sc)
+    if "leg_wait_s" in sc:
+        problems += leg_wait_problems(sc)
     return problems
 
 
@@ -834,6 +967,7 @@ class AnchorRun:
         self.calls, self.fails, self.invalid, self.log_lines = [], [], [], []
         self.syslog = self.logger = self.watch = None
         self.route_dn = None
+        self.did_rows = None             # the last /api/did-mapping read, for the far-end check
         self.syslog_restore = None
         self.baseline = {}
         self.last_reg = 0.0
@@ -905,6 +1039,10 @@ class AnchorRun:
             self.route_dn = str(active[0]["routeDn"])
             if len(re.sub(r"[^0-9]", "", self.route_dn)) >= 7:
                 self.red.add(self.route_dn)  # a DID-shaped route DN is never posted
+            if self.read_did_rows() is None:
+                problems.append("GET /api/did-mapping failed: the far end cannot be checked against the DID rows")
+            else:
+                problems += self.far_end_loopback()
         if problems:
             raise run_soak.Abort("INVALID", "preflight: " + "; ".join(problems))
 
@@ -926,10 +1064,20 @@ class AnchorRun:
             raise run_soak.Abort("INVALID", "POST /api/syslog was refused")
         self.say("the board now logs to %s:%d (restored after the run)" % want)
 
+    def read_did_rows(self):
+        """GET /api/did-mapping -> its rows (kept for the far-end check), or None."""
+        rows = (self.http.get_json("/api/did-mapping") or {}).get("mappings")
+        self.did_rows = rows if isinstance(rows, list) else None
+        return self.did_rows
+
+    def far_end_loopback(self):
+        """Why the far end may route back into this board, from the route DN and the last DID rows read."""
+        return far_end_loopback_problems(self.far_end, self.route_dn, self.did_rows)
+
     def pin_problem(self):
         """Why the S1 pin does not hold right now, or None."""
-        rows = (self.http.get_json("/api/did-mapping") or {}).get("mappings")
-        if not isinstance(rows, list):
+        rows = self.read_did_rows()
+        if rows is None:
             return "GET /api/did-mapping failed"
         # DidMapping::sameDid(): exact first, then E.164 equivalence for a numeric DN.
         numeric = re.fullmatch(r"\+?[0-9 ()-]+", self.route_dn) is not None
@@ -968,6 +1116,9 @@ class AnchorRun:
         why = self.pin_problem()
         if why:
             raise run_soak.Abort("INVALID", "the S1 pin lapsed: " + why)
+        loop = self.far_end_loopback()           # the DID rows pin_problem just read
+        if loop:
+            raise run_soak.Abort("INVALID", "the far end now routes back into this board: " + "; ".join(loop))
         if self.phantoms():
             raise run_soak.Abort("FAIL", "a phantom inbound reached a test UA: no more calls")
         self.watch_board()
@@ -1244,7 +1395,8 @@ class AnchorRun:
         self.manifest["syslog_lines"] = len(lines)
         fails, invalid = list(self.fails), list(self.invalid)
         for role, ext, who in self.phantoms():
-            fails.append("an INVITE from %r reached test UA %s (%s): a phantom inbound (S1)" % (who, ext, role))
+            fails.append("an INVITE from %r reached test UA %s (%s): a phantom inbound (S1); %s"
+                         % (who, ext, role, LOOPBACK_CAVEAT))
         fails += self.coredump_problems(end_status)
         if end_status and self.baseline.get("version") and end_status.get("version") != self.baseline["version"]:
             fails.append("the version changed during the run: %r -> %r"
@@ -1326,7 +1478,16 @@ def call_record(i, cancel_ms, dlg, t_start):
 
 
 def x4_classify(c):
-    """-> (bucket, problem or None) for one call (RFC 3261 s9.1, #548)."""
+    """-> (bucket, problem or None) for one call (RFC 3261 s9.1, #548). A call whose CANCEL went at
+    the reference timeout, not after a ringing signal, is counted apart: it keeps any real fault
+    (a 503, no final) but is not a CANCEL while ringing."""
+    bucket, problem = _x4_bucket(c)
+    if c.get("ref_timeout") and bucket == "cancelled":
+        bucket = "no_ringing_ref"
+    return bucket, problem
+
+
+def _x4_bucket(c):
     st = c["final"]
     if st == 487:
         if c["cancel_status"] != 200:
@@ -1346,20 +1507,66 @@ def x4_classify(c):
     return "refused", "final %d instead of 487 (%s 180 before it; #681)" % (st, "a" if rang else "no")
 
 
+def calls_text(numbers):
+    return ("call %s" if len(numbers) == 1 else "calls %s") % ", ".join(str(n) for n in numbers)
+
+
+def x4_when(run, delay_ms, st):
+    """cancel_when for one x4 call: the CANCEL is due delay_ms after the first syslog line that shows
+    3CX listing a leg THIS INVITE started (an "own leg" line since the INVITE) as not yet Connected.
+    Records what it saw in `st`. A phantom INVITE at a test UA makes the CANCEL due at once, so the
+    call is torn down and the next checkpoint stops the run."""
+    def when(since):
+        if run.phantoms():
+            st["phantom"] = True
+            return time.monotonic()
+        ents = run.syslog.entries(since)
+        legs = {}
+        for t, m in matches(ents, "initiated"):
+            legs.setdefault(m.group(1), t)
+        if legs and st.get("leg_t") is None:
+            st["leg_t"] = min(legs.values())
+        for t, m in matches(ents, "leg_listed"):
+            if m.group(1) in legs:
+                st["ref_t"], st["leg"] = t, m.group(1)
+                return t + delay_ms / 1000.0
+        return None
+    return when
+
+
+def ref_stage(st, dlg):
+    """Why a call that waited out its reference timeout had none."""
+    if dlg.cancel_when_error:
+        return "the reference function failed: %s" % dlg.cancel_when_error
+    if st.get("leg_t") is None:
+        return "no own-leg line: the makecall response never came"
+    return "the leg was never listed as ringing"
+
+
 def x4_run(run, sc):
     caller = run.agents["caller"]
     lo, hi = sc["cancel_ms"]
     n = sc["calls"]
-    run.say("%d calls %s -> far end, CANCEL swept %d..%d ms after the INVITE, gap %.0f s"
-            % (n, caller.ext, lo, hi, sc["gap_s"]))
+    run.say("%d calls %s -> far end, CANCEL swept %d..%d ms after 3CX lists the far leg as ringing (the "
+            "'Upset ... status' syslog line; not the INVITE), reference wait <= %g s, gap %.0f s"
+            % (n, caller.ext, lo, hi, sc["ref_timeout_s"], sc["gap_s"]))
+    misses = 0
     for i in range(n):
         if run.stopped():
             break
         run.checkpoint()
         cancel_ms = lo + (hi - lo) * i / (n - 1) if n > 1 else lo
         t_start = time.monotonic()
-        dlg = caller.invite(run.far_end, cancel_after_ms=cancel_ms)
+        st = {}
+        dlg = caller.invite(run.far_end, cancel_when=x4_when(run, cancel_ms, st),
+                            cancel_when_timeout_s=sc["ref_timeout_s"])
         rec = call_record(i, cancel_ms, dlg, t_start)
+        rec["ring_ref_ms"] = ms_since(dlg.invite_sent_at, st.get("ref_t"))
+        rec["ref_timeout"] = bool(dlg.cancel_when_expired) and st.get("ref_t") is None
+        rec["ref_stage"] = ref_stage(st, dlg) if rec["ref_timeout"] else None
+        rec["ref_leg"] = st.get("leg")
+        rec["cancel_after_ref_ms"] = None if None in (rec["cancel_sent_ms"], rec["ring_ref_ms"]) \
+            else rec["cancel_sent_ms"] - rec["ring_ref_ms"]
         try:
             if dlg.ok:
                 rec["bye"] = dlg.bye()
@@ -1368,11 +1575,19 @@ def x4_run(run, sc):
         rec["duration_s"] = round(time.monotonic() - t_start, 3)
         rec["bucket"], rec["problem"] = x4_classify(rec)
         run.calls.append(rec)
-        run.say("call %2d/%d: CANCEL planned +%d ms, sent %s, final %s (%s)%s"
-                % (i + 1, n, rec["cancel_planned_ms"],
+        run.say("call %2d/%d: ringing reference %s, CANCEL planned +%d ms after it, sent %s, final %s (%s)%s%s"
+                % (i + 1, n, "+%d ms" % rec["ring_ref_ms"] if rec["ring_ref_ms"] is not None
+                   else "NONE within %g s (%s)" % (sc["ref_timeout_s"], rec["ref_stage"] or "a final came first"),
+                   rec["cancel_planned_ms"],
                    "+%d ms" % rec["cancel_sent_ms"] if rec["cancel_sent_ms"] is not None else "never",
-                   rec["final"], rec["bucket"], ": " + rec["problem"] if rec["problem"] else ""))
+                   rec["final"], rec["bucket"], ": " + rec["problem"] if rec["problem"] else "",
+                   " [a phantom ended the wait]" if st.get("phantom") else ""))
         run.pull_pcap("call-%02d" % (i + 1))
+        misses = misses + 1 if rec["ref_timeout"] else 0
+        if misses >= MAX_NO_REF:
+            raise run_soak.Abort("INVALID", "%d calls in a row had no ringing reference within %g s (%s): the "
+                                 "run stops rather than ring the far end for nothing"
+                                 % (misses, sc["ref_timeout_s"], rec["ref_stage"]))
         if i + 1 < n:
             run.idle(sc["gap_s"])
 
@@ -1387,6 +1602,15 @@ def x4_judge(run, sc, lines):
             fails.append("call %d took %.1f s (cap %d s)" % (c["call"], c["duration_s"], sc["call_cap_s"]))
     if len(run.calls) < sc["calls"]:
         invalid.append("only %d of %d calls ran" % (len(run.calls), sc["calls"]))
+    missed = [c for c in run.calls if c.get("ref_timeout")]
+    if missed:
+        stages = collections.Counter(c["ref_stage"] for c in missed)
+        invalid.append("%d of %d calls had no ringing reference within %g s (%s; %s): each was CANCELled at the "
+                       "timeout, not %d-%d ms after 3CX listed the far leg as ringing, so it does not count "
+                       "toward the path (INVALID, never PASS)"
+                       % (len(missed), len(run.calls), sc["ref_timeout_s"], calls_text([c["call"] for c in missed]),
+                          "; ".join("%d x %s" % (k, why) for why, k in sorted(stages.items())),
+                          sc["cancel_ms"][0], sc["cancel_ms"][1]))
     if run.calls and not buckets["cancelled"]:
         invalid.append("no call was CANCELled while ringing: the path was not exercised")
     fails += drop_problems(lines)
@@ -1400,9 +1624,10 @@ def x4_judge(run, sc, lines):
 
 
 scenario(name="x4_cancel_ringing", issues=("#370", "#681", "#379"),
-         about="row X4: test UA 6101 -> the designated far end through the anchor, CANCELled "
-               "0.6-1.4 s after the INVITE; 6104 holds the S1 pin and detects phantoms",
-         uas={"caller": "6101", "detector": PIN_UA}, calls=30, cancel_ms=(600, 1400),
+         about="row X4: test UA 6101 -> the designated far end through the anchor, CANCELled 0.6-1.4 s "
+               "after 3CX lists the far leg as ringing (the 'Upset ... status' syslog line, not the INVITE: "
+               "makecall takes seconds); 6104 holds the S1 pin and detects phantoms",
+         uas={"caller": "6101", "detector": PIN_UA}, calls=30, cancel_ms=(600, 1400), ref_timeout_s=8.0,
          call_cap_s=30, gap_s=12.0, path_counter="rx554_window", ring_required=True,
          judge=x4_judge)(x4_run)
 
@@ -1473,6 +1698,137 @@ def pcap_bye_problems(c, who):
         return ["/api/pcap shows %d BYE transactions sent to %s for the call, the UA counted %s (second "
                 "witness)" % (c["pcap_byes"], who, c.get("pbx_byes"))]
     return []
+
+
+# -- x379_cancel_before_leg ------------------------------------------------------
+def x379_run(run, sc):
+    caller = run.agents["caller"]
+    lo, hi = sc["cancel_ms"]
+    n = sc["calls"]
+    run.say("%d calls %s -> far end, CANCEL swept %d..%d ms after the INVITE (before the makecall response, so "
+            "before the 3CX leg exists), then up to %g s for the own-leg line, %g s for its drop, gap %.0f s"
+            % (n, caller.ext, lo, hi, sc["leg_wait_s"], sc["drop_wait_s"], sc["gap_s"]))
+    for i in range(n):
+        if run.stopped():
+            break
+        run.checkpoint()
+        cancel_ms = lo + (hi - lo) * i / (n - 1) if n > 1 else lo
+        t_start = time.monotonic()
+        dlg = caller.invite(run.far_end, cancel_after_ms=cancel_ms)
+        rec = call_record(i, cancel_ms, dlg, t_start)
+        rec.update(leg=None, leg_ms=None, drop_ms=None, cancel_before_leg=False)
+        run.calls.append(rec)                  # first: a phantom abort below keeps the record
+        try:
+            if dlg.ok:
+                rec["bye"] = dlg.bye()
+        finally:
+            dlg.close()
+        rec["bucket"], rec["problem"] = x4_classify(rec)
+        # The call is over; the makecall response is still on the wire. Watch for the leg it creates,
+        # for its drop, and for anything that follows, with the phantom detector on throughout.
+        known = {r["leg"] for r in run.calls[:-1] if r.get("leg")}
+        found = []
+
+        def leg_seen():
+            found[:] = [(t, m.group(1)) for t, m in matches(run.syslog.entries(t_start), "initiated")
+                        if m.group(1) not in known][:1]
+            return bool(found)
+        run.watch_call(t_start + sc["leg_wait_s"], stop_when=leg_seen)
+        if found:
+            t_leg, leg = found[0]
+            rec.update(leg=leg, leg_ms=ms_since(t_start, t_leg), _leg_t=t_leg,
+                       cancel_before_leg=dlg.cancel_sent_at is not None and dlg.cancel_sent_at < t_leg)
+            t_drop = []
+
+            def dropped():
+                t_drop[:] = [t for t, _ in matches(run.syslog.entries(t_leg), "dropped", leg)][:1]
+                return bool(t_drop)
+            if run.watch_call(time.monotonic() + sc["drop_wait_s"], stop_when=dropped):
+                rec["drop_ms"] = ms_since(t_leg, t_drop[0])
+            run.watch_call(time.monotonic() + sc["settle_s"])     # a second drop, an inbound line, a phantom
+        rec["duration_s"] = round(time.monotonic() - t_start, 3)
+        run.say("call %2d/%d: CANCEL planned +%d ms, sent %s, final %s (%s); leg %s, own-leg line %s, drop %s%s"
+                % (i + 1, n, rec["cancel_planned_ms"],
+                   "+%d ms" % rec["cancel_sent_ms"] if rec["cancel_sent_ms"] is not None else "never",
+                   rec["final"], rec["bucket"], rec["leg"] or "NONE",
+                   "+%d ms" % rec["leg_ms"] if rec["leg_ms"] is not None else "never",
+                   "+%d ms after it" % rec["drop_ms"] if rec["drop_ms"] is not None else "never",
+                   ": " + rec["problem"] if rec["problem"] else ""))
+        run.pull_pcap("call-%02d" % (i + 1))
+        if i + 1 < n:
+            run.idle(sc["gap_s"])
+
+
+def x379_judge(run, sc, lines):
+    fails, invalid = [], []
+    if count_lines(lines)["panic"]:
+        fails.append("a panic line reached the syslog")
+    calls = run.calls
+    buckets = collections.Counter(c.get("bucket") for c in calls)
+    no_leg, early, many, race = [], [], [], 0
+    for i, c in enumerate(calls):
+        n = c["call"]
+        nxt = calls[i + 1]["t_start"] if i + 1 < len(calls) else None
+        ents = run.syslog.entries(c["t_start"], nxt) if run.syslog else []
+        c["log"] = {k: v for k, v in count_lines([ln for _, ln in ents]).items() if v}
+        if c.get("problem"):
+            fails.append("call %d: %s" % (n, c["problem"]))
+        elif c.get("bucket") != "cancelled":
+            fails.append("call %d ended %s, not 487: PASS needs the CANCEL to end the call" % (n, c.get("final")))
+        if c.get("duration_s") is not None and c["duration_s"] > sc["call_cap_s"]:
+            fails.append("call %d took %.1f s (cap %d s)" % (n, c["duration_s"], sc["call_cap_s"]))
+        leg = c.get("leg")
+        if not leg:
+            no_leg.append(n)
+            continue
+        if len(matches(ents, "initiated")) > 1:
+            many.append(n)
+        if c.get("cancel_before_leg"):
+            race += 1
+        else:
+            early.append(n)
+        drops = matches(ents, "dropped", leg)
+        if not drops:
+            fails.append("call %d: leg %s was never dropped within %g s of its creation (syslog is the only "
+                         "witness, S2): a live billable leg on 3CX?" % (n, leg, sc["drop_wait_s"]))
+        elif len(drops) > 1:
+            fails.append("call %d: leg %s was dropped %d times" % (n, leg, len(drops)))
+        elif drops[0][0] < c["_leg_t"]:
+            fails.append("call %d: the drop of leg %s was logged before its own-leg line" % (n, leg))
+        failed = matches(ents, "drop_failed", leg)
+        if failed:
+            fails.append("call %d: the drop of leg %s failed %d time(s)" % (n, leg, len(failed)))
+        if matches(ents, "inbound_call", leg):
+            fails.append("call %d: 'Inbound call on DN' was logged for leg %s, the leg this call initiated and "
+                         "had dropped: a dropped leg announced as an inbound call would ring the DID row's "
+                         "phones; %s" % (n, leg, LOOPBACK_CAVEAT))
+    if no_leg:
+        invalid.append("no own-leg line within %g s of the INVITE for %s: the leg never came up, so the "
+                       "CANCEL-before-the-leg race was not exercised (INVALID, never PASS)"
+                       % (sc["leg_wait_s"], calls_text(no_leg)))
+    if early:
+        invalid.append("the makecall response (the own-leg line) came before the CANCEL for %s: the CANCEL did "
+                       "not beat the leg, so the race was not exercised (INVALID, never PASS)" % calls_text(early))
+    if many:
+        invalid.append("more than one own-leg line during %s: one INVITE should start one leg" % calls_text(many))
+    if len(calls) < sc["calls"]:
+        invalid.append("only %d of %d calls ran" % (len(calls), sc["calls"]))
+    phantom_pcap = sum(run.pcap_count("INVITE", ua, phantom=True) for ua in run.agents.values())
+    if phantom_pcap:
+        fails.append("/api/pcap shows %d INVITE(s) sent to a test UA that were not the register beep: a phantom "
+                     "inbound (second witness); %s" % (phantom_pcap, LOOPBACK_CAVEAT))
+    return fails, invalid, {"buckets": dict(buckets), "calls": len(calls), "race_exercised": race,
+                            "pcap_phantom_invites": phantom_pcap,
+                            "drop_witness": "syslog only (S2): the 3CX participant list is not readable here"}
+
+
+scenario(name="x379_cancel_before_leg", issues=("#379", "#681"),
+         about="test UA 6101 -> the designated far end through the anchor, CANCELled 0.3-0.8 s after the INVITE, "
+               "before the makecall response so before the 3CX leg exists: 487, the leg dropped exactly once "
+               "when it does, no inbound-call line for it, nothing at 6104",
+         uas={"caller": "6101", "detector": PIN_UA}, calls=10, max_calls=10, cancel_ms=(300, 800),
+         call_cap_s=30, gap_s=12.0, leg_wait_s=10.0, drop_wait_s=5.0, settle_s=2.0,
+         path_counter="initiated", ring_required=True, judge=x379_judge)(x379_run)
 
 
 # -- x349_unread_makecall ------------------------------------------------------
