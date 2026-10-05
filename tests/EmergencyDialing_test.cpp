@@ -1003,3 +1003,33 @@ TEST(EmergencyDialing, ALiteralNineOneOneRuleAfterAYieldedWildcardStillRoutesToN
 	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.wire.dump();
 	EXPECT_FALSE(b.wire.saw("INVITE sip:102@")) << b.wire.dump();
 }
+
+// docs/API.md, "Emergency aliases: write them as literals" (pinned by
+// tests/tools/test_dialplan_emergency_alias_doc.py): a wildcard alias such as
+// 11X -> 911 lets a device that registers as 112 capture 112; a literal alias
+// 112 -> 911 does not yield to it.
+TEST(EmergencyDialing, AWildcardEmergencyAliasLetsARegistrationCaptureItAndALiteralOneDoesNot)
+{
+	{
+		SCOPED_TRACE("11X -> 911, with a device registered as 112: 112 rings the device");
+		Bench b;
+		b.handler->handle(emRegister("112", "192.168.77.13", "em-reg-112"));
+		ASSERT_TRUE(b.wire.saw("SIP/2.0 200 OK")) << "precondition: 112 registered:\n" << b.wire.dump();
+		b.handler->setDialRule("11X", "trunk", "911", 3);
+		b.wire.clear();
+		b.handler->handle(emInvite("101", "112", "192.168.77.11", "em-doc-wild"));
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "") << b.wire.dump();
+		EXPECT_TRUE(b.wire.saw("INVITE sip:112@")) << b.wire.dump();
+	}
+	{
+		SCOPED_TRACE("112 -> 911, with a device registered as 112: the call goes to 911");
+		Bench b;
+		b.handler->handle(emRegister("112", "192.168.77.13", "em-reg-112"));
+		ASSERT_TRUE(b.wire.saw("SIP/2.0 200 OK")) << "precondition: 112 registered:\n" << b.wire.dump();
+		b.handler->setDialRule("112", "trunk", "911", 3);
+		b.wire.clear();
+		b.handler->handle(emInvite("101", "112", "192.168.77.11", "em-doc-literal"));
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.wire.dump();
+		EXPECT_FALSE(b.wire.saw("INVITE sip:112@")) << b.wire.dump();
+	}
+}
