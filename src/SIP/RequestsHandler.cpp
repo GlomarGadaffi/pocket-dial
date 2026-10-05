@@ -4495,7 +4495,11 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// transform such as "0" -> "911").
 	auto markEmergency = [&] {
 		auto s = _sessions.find(data->getCallID());   // std::less<> map: no copy on the 911 path
-		if (s != _sessions.end() && s->second) s->second->setEmergency(true);
+		if (s != _sessions.end() && s->second)
+		{
+			s->second->setEmergency(true);
+			s->second->setEmergencyNumber(emergency.number);   // #879
+		}
 		// #659: opens this extension's PSAP callback window.
 		_emergencyCallbacks.note(caller->getNumber(), std::chrono::steady_clock::now());
 	};
@@ -12847,12 +12851,37 @@ void RequestsHandler::onTrunkFailed(const SipTrunk::TrunkEvent& ev, int status)
 		: (inv ? std::string(inv->getFromNumber()) : std::string());
 	const std::string to   = inv ? std::string(inv->getToNumber()) : std::string();
 
+	// #879: read before endCall() releases the session.
+	const std::string_view emergencyNumber = sit->second->getEmergencyNumber();
+
 	// Answer the still-ringing handset BEFORE tearing down: endCall() sends no
 	// final response, so skipping this leaves the phone ringing at a call that
 	// is already gone.
 	refuseRingingTrunk(handsetCallID, status);
 	endCall(handsetCallID, from, to,
 		"trunk call failed (" + std::to_string(status) + ")");
+
+	// #879 (#878 review B-BLK-1): a 911/933 the trunk took was notified ROUTED
+	// when it was placed, so its failure is told too, once: this fires once per
+	// dialog, and a handset that hung up first has no session here. A ringing
+	// 911 is never timed out (#712), so a 408 is a carrier that never answered
+	// the INVITE at all, or its own 408. With a real anchor configured, the
+	// trunk only ever carries a 911 the anchor could not place.
+	if (!emergencyNumber.empty())
+	{
+		pbx::EmergencyDial em = pbx::classifyEmergencyDial(to);
+		std::string dialed = to;
+		if (!em.isEmergency)   // a dial-plan rule produced it
+		{
+			em = pbx::classifyEmergencyDial(emergencyNumber);
+			dialed = std::string(emergencyNumber);
+		}
+		std::string note = emergencyRouteLocked() == EmergencyRoute::Anchor
+			? std::string(kAnchorNotPlaced) + "; " : std::string();
+		note += status == 408 ? std::string("the trunk timed out (408)")
+			: "the trunk refused it (" + std::to_string(status) + ")";
+		notifyEmergency(em, from, dialed, /*routed=*/false, note);
+	}
 }
 
 void RequestsHandler::onTrunkRemoteBye(const SipTrunk::TrunkEvent& ev)
