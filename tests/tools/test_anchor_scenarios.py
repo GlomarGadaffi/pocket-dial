@@ -1497,6 +1497,58 @@ class X379CancelBeforeLegTest(unittest.TestCase):
         self.assertLess(len(self.calls()), 2)
 
 
+class X379JudgeUnitTest(unittest.TestCase):
+    """x379_judge on hand-made records and log entries: what no fake board flow reaches."""
+
+    SC = an.SCENARIOS[X379]
+
+    @staticmethod
+    def run_of(calls, entries, pcap_phantoms=0):
+        return mock.Mock(calls=calls, agents={"detector": object()}, pcap_count=lambda *a, **k: pcap_phantoms,
+                         syslog=mock.Mock(entries=lambda since=None, until=None: list(entries)))
+
+    def judge(self, calls, entries=(), pcap_phantoms=0):
+        return an.x379_judge(self.run_of(calls, entries, pcap_phantoms), self.SC, [ln for _, ln in entries])
+
+    @staticmethod
+    def rec(**kw):
+        c = {"call": 1, "t_start": 0.0, "final": 487, "bucket": "cancelled", "problem": None, "leg": "7",
+             "cancel_before_leg": True, "duration_s": 3.0, "_leg_t": 5.0}
+        c.update(kw)
+        return c
+
+    LEG = (5.0, "I TelephonyAnchor: Successfully initiated call to x (own leg 7)")
+    DROP = (6.0, "I TelephonyAnchor: Successfully dropped participant 7")
+
+    def test_a_clean_call_passes(self):
+        fails, invalid, summary = self.judge([self.rec()], [self.LEG, self.DROP])
+        self.assertEqual(fails, [])
+        self.assertEqual(invalid, ["only 1 of 10 calls ran"], "the only thing missing is the other calls")
+        self.assertEqual(summary["race_exercised"], 1)
+
+    def test_a_call_that_was_answered_is_a_fail_even_with_no_problem_recorded(self):
+        fails, _, _ = self.judge([self.rec(final=200, bucket="answered_before_cancel")], [self.LEG, self.DROP])
+        self.assertTrue(any("call 1 ended 200, not 487" in f for f in fails), fails)
+
+    def test_a_call_over_the_cap_is_a_fail(self):
+        fails, _, _ = self.judge([self.rec(duration_s=31.0)], [self.LEG, self.DROP])
+        self.assertTrue(any("call 1 took 31.0 s (cap 30 s)" in f for f in fails), fails)
+
+    def test_a_drop_logged_before_its_own_leg_line_is_a_fail(self):
+        fails, _, _ = self.judge([self.rec()], [(4.0, self.DROP[1]), self.LEG])
+        self.assertTrue(any("before its own-leg line" in f for f in fails), fails)
+
+    def test_a_phantom_invite_in_the_pcap_is_a_fail_with_the_caveat(self):
+        fails, _, summary = self.judge([self.rec()], [self.LEG, self.DROP], pcap_phantoms=2)
+        self.assertTrue(any("/api/pcap shows 2 INVITE(s)" in f and an.LOOPBACK_CAVEAT in f for f in fails), fails)
+        self.assertEqual(summary["pcap_phantom_invites"], 2)
+
+    def test_a_second_own_leg_line_in_one_call_is_invalid(self):
+        two = (5.5, "I TelephonyAnchor: Successfully initiated call to x (own leg 8)")
+        _, invalid, _ = self.judge([self.rec()], [self.LEG, two, self.DROP])
+        self.assertTrue(any("more than one own-leg line during call 1" in r for r in invalid), invalid)
+
+
 class FarEndLoopbackRunTest(unittest.TestCase):
     """The far end is checked against what the board exposes before the first INVITE, and
     again between calls: its route DN and its DID rows."""

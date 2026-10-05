@@ -314,7 +314,7 @@ def same_number(a, b):
     if not (_NUMERIC.fullmatch(a) and _NUMERIC.fullmatch(b)):
         return a == b
     da, db = re.sub(r"[^0-9]", "", a), re.sub(r"[^0-9]", "", b)
-    return da == db or (len(da) >= 10 and len(db) >= 10 and da[-10:] == db[-10:])
+    return da[-10:] == db[-10:]     # equal digits; or two long numbers that share their last ten
 
 
 def far_end_loopback_problems(far, route_dn, rows):
