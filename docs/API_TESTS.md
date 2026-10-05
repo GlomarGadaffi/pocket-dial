@@ -427,11 +427,12 @@ Secures or forgets one adopted device. Cookie **and** `X-CSRF`.
 | Param | Values | Effect |
 |---|---|---|
 | `action` | `secure` \| `forget` | Required. |
-| `target` | 12-hex MAC, or an extension | Required. An extension resolves to the device currently bound to it. |
+| `target` | 12-hex MAC, or an extension | Required. An extension resolves to the one device that holds it. |
 
 `secure` promotes a `learned` device to `secured`. `forget` drops the adoption record, 
 in `learn` mode the phone is re-adopted on its next registration, which is how you re-home
-an extension to different hardware. `404` if no adopted device matches. Responds with the
+an extension to different hardware. `404` if no adopted device matches; `409` and no change
+if more than one device holds the extension given (#820: send the MAC). Responds with the
 same body as the `GET`.
 
 > The MAC lock is **not** a cryptographic boundary, it is learned from the ARP table, and

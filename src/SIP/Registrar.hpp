@@ -61,7 +61,7 @@ public:
 	struct AdoptedDevice
 	{
 		std::string mac;         // 12 lowercase hex chars
-		std::string extension;   // the AOR it last registered as
+		std::string extension;   // the AOR it was adopted as (#820: a REGISTER never moves it)
 		DeviceState state = DeviceState::Learned;
 		bool online = false;     // currently has a live registration binding
 		bool locked = false;     // #440: Learn has bound its extension to this MAC
@@ -119,7 +119,8 @@ public:
 	//     sent, the caller ARPs it); else a 503 + Retry-After is enqueued here
 	//     and RetryLater ("response already sent") is returned. Never a lockout;
 	//   - an UNLOCKED MAC that registers a second extension is marked shared
-	//     (the signature of phones behind one NAT router) and never locks;
+	//     (the signature of phones behind one NAT router) and never locks; its
+	//     record keeps the extension it holds (#820), locked or not;
 	//   - a first-packet ARP miss for an unlocked extension still Accepts;
 	//   - #507: a Secured extension or device is always digest-checked
 	//     (admitSecure), on an ARP miss too, and its record never moves.
@@ -150,6 +151,10 @@ public:
 
 	// ── Adopted-device registry ───────────────────────────────────────────────
 	void loadDevices();   // boot-time NVS reload; runs single-threaded pre-dispatch
+	// The seq a row loaded from NVS gets (#820: loadDevices() is ESP-only, this is
+	// not). `saved` is the row's seq field, nullptr for a pre-#440 row; `nextSeq`
+	// is advanced past the result.
+	static uint32_t loadedSeq(const char* saved, uint32_t& nextSeq);
 	// Mark a device online/offline after a (de)registration. Online state is
 	// volatile registration state — never persisted. No-op if the MAC isn't
 	// adopted (e.g. a Learn REGISTER whose ARP lookup missed never records).

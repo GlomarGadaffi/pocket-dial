@@ -257,13 +257,40 @@ MAC is then refused (`403 Extension Locked To Another Device`). Only REGISTERs w
 resolves in the box's ARP table count, the locking one must come at least 30 s after the
 phone's first (#515: a burst of two REGISTERs per MAC never locks), and the lock goes to
 the extension's **first claim**: while an earlier-adopted device's row still holds the extension, a later device
-stays plain TOFU however often it registers. Its exposure is every extension **not yet
-locked**: one whose phone has not yet registered again 30 s after its first, one whose phone is on
-another subnet (no ARP entry, so never locked), one whose phone shares a NAT router's MAC
-with other phones (an unlocked MAC that registers a second extension is marked shared and
-never locks), and one whose first claim came from a device that has gone (forget its row
-to let the replacement lock). Any device that REGISTERs such an extension is adopted
-**without verification**. So:
+stays plain TOFU however often it registers. An unlocked MAC that registers a second
+extension is marked **shared** and never locks; its row keeps the extension it registered
+first, and the second extension gets no row (#820).
+
+Its exposure is every extension **not yet locked**. Any device that REGISTERs one is
+admitted **without verification** and takes its binding. What happens after that depends
+on whether the phone's own row is the extension's first claim:
+
+- **Fails open: no other device can lock it.** The first claim is a row that has not locked yet
+  or never will: its phone has not yet registered again 30 s after its first, its device
+  has gone, or it is a shared row (a NAT router's first extension, or the old extension of
+  a phone re-provisioned while unlocked). Anyone can still register the extension as TOFU,
+  but nobody can lock its phone out. Forget a gone or shared row to let the right phone
+  lock, and forget any other row on that extension you do not recognise, because the
+  oldest remaining row becomes the first claim. This holds only while the row stays in the
+  device table: a full table (`POCKETDIAL_MAX_CLIENTS`, 32 by default) evicts the oldest
+  unlocked row, offline first, to adopt a new MAC, and a row that never locks is one of
+  those. Once it is evicted, the extension falls into the next list.
+- **Does not fail open: another device can lock the phone out.** The phone holds no row
+  on the extension, so nothing claims it, and any other on-link device that registers it
+  twice, at least 30 s apart, locks it. The lock is saved, so it survives a reboot.
+  - A phone on another subnet (an ARP miss never adopts it): once the locker holds the
+    binding, the phone gets `503` with `Retry-After` on every REGISTER (§8).
+  - The second and later phones behind a NAT router (the router's row holds only its first
+    extension): `403 Extension Locked To Another Device`.
+  - **A phone moved to another extension while its row was unlocked**: the row stays on
+    the old extension, so the phone holds no claim on the new one and gets `403` there
+    once another device locks it. Before #820 the row followed the phone; it no longer
+    does, so that an unauthenticated REGISTER cannot move it. desmo accepted this residual
+    on 2026-10-04 (#852). **Forget the phone's row when you move it** (§6).
+
+The protection for every case above is Secure (digest), but no current build can set the
+per-extension secret it needs (§3, Step 4). Until then, watch the roster and forget rows
+deliberately. So:
 
 - **Adopt what you own, promptly.** Let every phone register once on a trusted link, check
   the roster, and **forget** anything you don't recognise. The first device to claim an
@@ -292,6 +319,17 @@ ARP-derived, strong against accidental collisions and casual spoofing on a trust
 remains the link (WPA2 / trusted LAN). Learn mode buys you a low-friction cutover; it does
 not buy you cryptographic device identity.
 
+One more residual (#820): **one forged packet keeps an extension from ever locking.** A
+REGISTER for any other extension, sent with an unlocked phone's source IP (so ARP returns
+the phone's MAC), marks the phone's row shared. The mark is saved, and only forgetting the
+row clears it. The phone keeps its extension and is not locked out, because its row is
+still the first claim, but that extension never locks, so any device on the link can keep
+taking its binding as TOFU. A locked or Secured row is not affected. Before #820 the same
+packet moved the row and let the sender lock the phone out. The answer is Secure. Until it
+can be deployed, the cure is to forget the phone's row (and any row on that extension you
+do not recognise) and let the phone register again; the roster does not show `locked` or
+`shared` yet (#882), so you cannot see which rows this has hit.
+
 ## 6. Edge cases, rollback, and forget
 
 ### A phone whose MAC changes
@@ -307,10 +345,33 @@ some phones randomize, or a dock/adapter changes the L2 address), a secured or l
 A MAC change is indistinguishable, at the registrar, from a different device claiming the
 extension, so re-adoption is a deliberate admin action, by design.
 
+### A phone moved to another extension
+A phone's row keeps the extension it was adopted as; re-provisioning the phone does not
+move it (#820). While that row exists the phone holds no claim on its new extension, so
+any other on-link device that registers the new extension twice, at least 30 s apart,
+locks it, and the phone is then refused there with `403` (§5). Its old extension stays
+unlocked for everyone, and `GET /config/<mac>.cfg` keeps serving the old extension
+([PROVISIONING.md](PROVISIONING.md) §3). desmo accepted this on 2026-10-04 (#852). So when
+you move a phone, do these together:
+
+1. Change the extension on the phone.
+2. **Forget its row, by MAC.** Use the **Forget** button on that row of the dashboard
+   roster (it sends the MAC), or `POST /api/registrar/device` with
+   `action=forget&target=<MAC>`. By extension the route answers `409` while two rows hold
+   it. The row to forget has the phone's MAC and still shows the old extension.
+3. Reboot the phone, or make it re-register. It is adopted afresh on the new extension,
+   and its next REGISTER at least 30 s later locks it, if no other row holds that
+   extension first. If another MAC already holds the new extension in the roster, find out
+   what it is and forget that row too, or it stays the first claim.
+
+The roster does not show `locked` or `shared` yet (#882), so go by MAC and extension.
+
 ### Rollback / forget
 - Forget one device: removes its `{MAC, ext}` entry from the device registry
-  (`Registrar::forget()`, `Registrar.cpp:275-288`). The extension is then unclaimed and can
-  be re-adopted (in Learn) or left unregistered. **It does not remove the HA1.** The digest
+  (`Registrar::forget()` in `Registrar.cpp`). The extension is then unclaimed and can
+  be re-adopted (in Learn) or left unregistered. `POST /api/registrar/device` accepts an
+  extension only while one row holds it; with two it answers `409` and changes nothing, so
+  forget by MAC, as the dashboard does (#820). **It does not remove the HA1.** The digest
   credential lives in a separate NVS namespace (`sipauth`, `SipSecretStore.cpp:25`) and
   survives a forget, so "forget" is not a credential revocation.
 - ~~Rotate instead of forget~~: **not available.** There is no rotate path, for the

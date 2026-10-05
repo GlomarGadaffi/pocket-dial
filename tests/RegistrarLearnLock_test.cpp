@@ -640,3 +640,162 @@ TEST_F(LearnLockTest, AnUnauthenticatedRegisterCannotMoveASecuredDevicesExtensio
 	ArpLookup::setMockMac(addrFor("192.168.60.66"), macOf(0x66));
 	EXPECT_EQ(registerFrom("201", "192.168.60.66").substr(0, 11), "SIP/2.0 403");
 }
+
+// #820 item 1: while P's row was still UNLOCKED, one REGISTER for another
+// extension with P's source IP forged (so ARP returns P's MAC) moved P's row to
+// that extension. No earlier row then held 201, so a device N that registered
+// 201 twice locked P out of its own extension. A row now keeps its extension,
+// locked or not: the MAC is marked shared (it vouched for two extensions) and
+// its row still holds 201's first claim.
+TEST_F(LearnLockTest, AForgedRegisterNeverMovesAnUnlockedRowOrLetsAnotherDeviceLockIt)
+{
+	ArpLookup::setMockMac(addrFor("192.168.60.21"), macOf(0x21));
+	ArpLookup::setMockMac(addrFor("192.168.60.66"), macOf(0x66));
+	ASSERT_EQ(registerFrom("201", "192.168.60.21").substr(0, 11), "SIP/2.0 200");   // P claims 201
+	ASSERT_TRUE(device(hexOf(0x21)) && !device(hexOf(0x21))->locked);
+
+	EXPECT_EQ(registerFrom("202", "192.168.60.21").substr(0, 11), "SIP/2.0 200")
+		<< "the forged 202 is admitted as TOFU";
+	const auto* p = device(hexOf(0x21));
+	ASSERT_NE(p, nullptr);
+	EXPECT_EQ(p->extension, "201") << "an unauthenticated REGISTER moved P's unlocked row";
+	EXPECT_TRUE(p->shared) << "a MAC seen with two extensions never locks";
+	EXPECT_FALSE(p->locked);
+
+	EXPECT_EQ(registerFrom("201", "192.168.60.66").substr(0, 11), "SIP/2.0 200");   // N, TOFU
+	EXPECT_EQ(registerFrom("201", "192.168.60.66").substr(0, 11), "SIP/2.0 200");
+	ASSERT_NE(device(hexOf(0x66)), nullptr);
+	EXPECT_FALSE(device(hexOf(0x66))->locked) << "P's row still holds 201: N must not lock it";
+	EXPECT_EQ(registerFrom("201", "192.168.60.21").substr(0, 11), "SIP/2.0 200") << "P is locked out of 201";
+}
+
+// #820/#852: the moved-phone residual, accepted by desmo on 2026-10-04 ("852 is
+// a", the #852 review's B1). A phone re-provisioned to another extension while
+// its row was still unlocked keeps that row on its old extension, marked shared,
+// and holds no claim on the new one. So another device, with its own MAC and
+// nothing forged, that registers the new extension twice 30 s apart locks it,
+// and the moved phone is refused there (onRegister answers this Reject with a
+// 403; the lock is saved, so it survives a reboot). Before #820 the row followed
+// the phone, and this took one forged packet first. Secure is the protection;
+// the operator's step is to forget the phone's row when moving it (LEARN_MODE.md
+// §6). This pins today's behaviour on both extensions: if it fails, the residual
+// has changed, and so must the docs that describe it.
+TEST(LearnLockResidual, TheMovedPhoneResidualDesmoAccepted)
+{
+	struct ClearMocks { ~ClearMocks() { ArpLookup::clearMockMacs(); } } clearMocks;   // also on a failed ASSERT
+	using std::chrono::seconds;
+	using Decision = Registrar::AuthDecision;
+	FakePbxEnv env;
+	Registrar reg(env, Registrar::Mode::Learn);
+	const std::chrono::steady_clock::time_point t0{};
+	const auto macOfDevice = [](uint8_t n) { return ArpLookup::Mac{0x02, 0x00, 0x00, 0x00, 0x20, n}; };
+	std::string reason;
+	int cseq = 0;
+	// Device n: source 10.51.20.n, MAC 02:00:00:00:20:n. The LearnLockTest fixture
+	// cannot wait 30 s (real clock), so this drives admitLearn with time points.
+	const auto admit = [&](uint8_t n, const std::string& ext, seconds at) {
+		const std::string ip = "10.51.20." + std::to_string(n);
+		const sockaddr_in src = FakePbxEnv::addr(ip.c_str(), 5060);
+		ArpLookup::setMockMac(src, macOfDevice(n));
+		reason.clear();
+		return reg.admitLearn(std::make_shared<SipMessage>(registerRaw(ext, ip, 5060, 3600, ++cseq), src),
+			ext, reason, t0 + at);
+	};
+	std::vector<Registrar::AdoptedDevice> rows;
+	const auto row = [&](uint8_t n) -> const Registrar::AdoptedDevice* {
+		rows = reg.adoptedDevices();
+		for (const auto& d : rows)
+			if (d.mac == ArpLookup::toHex12(macOfDevice(n))) return &d;
+		return nullptr;
+	};
+	constexpr uint8_t P = 1, X = 2, N = 3;
+
+	// P is adopted on 201, then moved to 202 before it locked 201.
+	ASSERT_EQ(admit(P, "201", seconds(0)), Decision::Accept);
+	ASSERT_EQ(admit(P, "202", seconds(10)), Decision::Accept) << "P's new extension is admitted (TOFU)";
+	const auto* p = row(P);
+	ASSERT_NE(p, nullptr);
+	EXPECT_EQ(p->extension, "201") << "P's row stays on its old extension";
+	EXPECT_TRUE(p->shared);
+	EXPECT_FALSE(p->locked);
+
+	// 201 fails open: P's shared row is its first claim and never locks.
+	EXPECT_EQ(admit(P, "201", seconds(60)), Decision::Accept);
+	ASSERT_NE(row(P), nullptr);
+	EXPECT_FALSE(row(P)->locked) << "a shared row never locks";
+	ASSERT_EQ(admit(X, "201", seconds(61)), Decision::Accept);
+	EXPECT_EQ(admit(X, "201", seconds(100)), Decision::Accept);
+	ASSERT_NE(row(X), nullptr);
+	EXPECT_FALSE(row(X)->locked) << "P's row holds 201's first claim: no device can lock 201";
+
+	// 202 has no claim: N registers it twice, 31 s apart, and locks it.
+	ASSERT_EQ(admit(N, "202", seconds(110)), Decision::Accept);
+	ASSERT_EQ(admit(N, "202", seconds(141)), Decision::Accept);
+	ASSERT_NE(row(N), nullptr);
+	EXPECT_TRUE(row(N)->locked) << "N locked P's new extension: the accepted residual";
+
+	EXPECT_EQ(admit(P, "202", seconds(150)), Decision::Reject) << "P can no longer register its new extension";
+	EXPECT_EQ(reason, "Extension Locked To Another Device") << "the 403's reason phrase";
+	EXPECT_EQ(admit(P, "201", seconds(151)), Decision::Accept) << "P is not locked out of its old extension";
+}
+
+// #820 item 4: the registered address vouches for an ARP miss only while its
+// binding is live. A lease that has lapsed but is not swept yet is no longer the
+// owner's binding, so this miss, from an off-link source (the test sets no
+// on-link mock), is asked to retry like anyone else's.
+TEST_F(LearnLockTest, AnExpiredBindingDoesNotVouchForAnArpMiss)
+{
+	ASSERT_NO_FATAL_FAILURE(lockOwner());
+	ArpLookup::clearMockMacs();
+	_handler->expireLeaseUnsweptForTest("201");
+
+	EXPECT_EQ(registerFrom("201", "192.168.60.21").substr(0, 11), "SIP/2.0 503")
+		<< "a lapsed binding at the same IP:port stood in for the ARP lookup";
+	ASSERT_TRUE(device(hexOf(0x21)) && device(hexOf(0x21))->locked) << "the lock is untouched";
+}
+
+// #820 item 4: the owner's own de-REGISTER on an ARP miss, from its registered
+// address, is admitted like its refresh. It unbinds the owner; the lock stays.
+TEST_F(LearnLockTest, TheOwnersDeregisterOnAnArpMissUnbindsAndKeepsTheLock)
+{
+	ASSERT_NO_FATAL_FAILURE(lockOwner());
+	ArpLookup::clearMockMacs();
+
+	EXPECT_EQ(registerFrom("201", "192.168.60.21", 0).substr(0, 11), "SIP/2.0 200");
+	EXPECT_EQ(boundAddress("201"), "") << "the owner's expires=0 did not unregister it";
+	const auto* d = device(hexOf(0x21));
+	ASSERT_NE(d, nullptr);
+	EXPECT_TRUE(d->locked) << "unregistering released the lock";
+	EXPECT_EQ(d->extension, "201");
+	EXPECT_FALSE(d->shared);
+
+	EXPECT_EQ(registerFrom("201", "192.168.60.21").substr(0, 11), "SIP/2.0 503")
+		<< "with no binding left, an off-link miss from that address is no longer the owner's";
+	ArpLookup::setMockMac(addrFor("192.168.60.66"), macOf(0x66));
+	EXPECT_EQ(registerFrom("201", "192.168.60.66").substr(0, 11), "SIP/2.0 403") << "the lock still holds";
+}
+
+// #820 item 4: loadDevices()'s saved-sequence rule (it is ESP-only; the rule is
+// Registrar::loadedSeq). A saved UINT32_MAX used to be able to wrap the next
+// sequence to 0, after which every new adoption sorted as the oldest: evicted
+// first, and taken for an extension's first claim. The values clamp the same
+// with a 32-bit unsigned long (xtensa) and a 64-bit one (host).
+TEST(LearnLockSavedSeq, AnOutOfRangeSavedSequenceTakesTheLoadOrderAndNeverWraps)
+{
+	uint32_t next = 1;
+	EXPECT_EQ(Registrar::loadedSeq("4294967295", next), 1u) << "UINT32_MAX is out of range";
+	EXPECT_EQ(next, 2u) << "the next sequence wrapped";
+	EXPECT_EQ(Registrar::loadedSeq("2147483648", next), 2u) << "2^31 is out of range";
+	EXPECT_EQ(Registrar::loadedSeq("-1", next), 3u);
+	EXPECT_EQ(Registrar::loadedSeq("junk", next), 4u);
+	EXPECT_EQ(Registrar::loadedSeq("0", next), 5u);
+	EXPECT_EQ(Registrar::loadedSeq(nullptr, next), 6u) << "a pre-#440 row has no seq field";
+	EXPECT_EQ(next, 7u);
+
+	EXPECT_EQ(Registrar::loadedSeq("40", next), 40u) << "an in-range seq is kept";
+	EXPECT_EQ(next, 41u);
+	EXPECT_EQ(Registrar::loadedSeq("9", next), 9u) << "including one below the next sequence";
+	EXPECT_EQ(next, 41u) << "which never moves the next sequence back";
+	EXPECT_EQ(Registrar::loadedSeq("2147483647", next), 2147483647u) << "the largest kept value";
+	EXPECT_EQ(next, 2147483648u);
+}

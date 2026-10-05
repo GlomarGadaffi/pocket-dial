@@ -12,19 +12,12 @@
 // sits directly beside in onRegister().
 //
 // Scope note on the issue's second named call site (the device-registry
-// "rename" path, findProvisioningInfo()'s d.extension recheck): it cannot be
-// exercised end to end from a host test. findProvisioningInfo() only ever
-// sees a device that Learn-mode admission adopted, and that adoption path is
-// gated on ArpLookup::pdLookupMac() resolving a source IP to a MAC —
-// unconditionally std::nullopt on host builds (see ArpLookup.cpp's host
-// stub), with no seam to inject a fake resolution anywhere in the codebase.
-// That makes admitLearn()'s "known MAC" branch — and everything downstream
-// of it, including findProvisioningInfo() ever seeing a non-empty registry —
-// dead code in every host test that exists today, not something this change
-// made newly untestable. The onRegister() guard below is what actually gates
-// this in practice (it runs before admitLearn() is ever reached), and its
-// logic is the same pbx::isReservedOrPstnAor() already covered in
-// Pbx_test.cpp.
+// "rename" path, findProvisioningInfo()'s d.extension recheck): since #820 a
+// REGISTER never renames an adopted device's row, so that path is gone; the
+// recheck in findProvisioningInfo() stays as defence in depth. The onRegister()
+// guard below is what gates this in practice (it runs before admitLearn() is
+// ever reached), and its logic is the same pbx::isReservedOrPstnAor() already
+// covered in Pbx_test.cpp.
 
 #include <gtest/gtest.h>
 

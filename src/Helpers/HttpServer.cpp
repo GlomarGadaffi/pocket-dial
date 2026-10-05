@@ -4769,21 +4769,32 @@ void HttpServer::sendApiRegistrarDevice(int sock, const std::string& body)
 		return;
 	}
 
-	bool ok = false;
-	if (action == "secure")
-	{
-		ok = handler->secureDevice(target);
-	}
-	else if (action == "forget")
-	{
-		ok = handler->forgetDevice(target);
-	}
-	else
+	if (action != "secure" && action != "forget")
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
 		             "{\"error\":\"action must be one of: secure, forget\"}");
 		return;
 	}
+
+	// #820: two rows can hold one extension (a lock holder beside a later claim,
+	// or a stale row). By extension, act only when exactly one does; otherwise
+	// ask for the MAC, which is what the dashboard sends.
+	{
+		size_t holders = 0;
+		for (const auto& d : handler->getAdoptedDevices())
+		{
+			if (d.mac == target) { holders = 0; break; }
+			if (d.extension == target) ++holders;
+		}
+		if (holders > 1)
+		{
+			sendResponse(sock, 409, "Conflict", "application/json",
+			             "{\"error\":\"more than one device holds that extension; send its MAC\"}");
+			return;
+		}
+	}
+
+	const bool ok = (action == "secure") ? handler->secureDevice(target) : handler->forgetDevice(target);
 
 	if (!ok && action == "secure")
 	{

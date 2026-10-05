@@ -150,12 +150,11 @@ TEST_F(LearnLockMinAge, ARowLoadedFromNvsLocksAtItsFirstSightingAfterBoot)
 	EXPECT_EQ(admit(2, "5301", t0 + seconds(1)), Decision::Reject);
 }
 
-TEST_F(LearnLockMinAge, AReExtensionedRecordDoesNotLockItsNewExtensionEarly)
+TEST_F(LearnLockMinAge, AMacsOldAgeNeverLocksItsSecondExtension)
 {
-	// Guard. A record whose extension changes restarts its age, so its old age
-	// cannot lock the new extension. Today the shared-MAC rule also keeps it
-	// unlocked (one MAC, two extensions), so this passes either way; it fails if
-	// the shared rule ever lets such a record lock without the age restarting.
+	// Guard. Since #820 a record never takes a second extension (it keeps its
+	// first and is marked shared), and a shared MAC never locks. This fails if
+	// either rule ever lets the MAC's old age lock the new extension.
 	ASSERT_EQ(admit(1, "5301", t0), Decision::Accept);
 	ASSERT_EQ(admit(1, "5302", t0 + seconds(40)), Decision::Accept);
 	EXPECT_EQ(admit(1, "5302", t0 + seconds(41)), Decision::Accept);

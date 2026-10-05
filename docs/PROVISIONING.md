@@ -38,7 +38,7 @@ never built, clearly marked as such, because the analysis in them is still sound
 
 A desk phone fetches `http://<board-ip>/config/<mac>.cfg` and gets a Yealink config that
 sets its SIP account, server, transport and codec list. pocket-dial generates the file on the
-fly from the extension that MAC last registered as.
+fly from the extension that MAC was adopted as (#820: a later REGISTER for another AOR never changes it).
 
 * One route: `GET /config/<mac>.cfg`. Not session-gated, because a booting phone has no session
   cookie to present (`HttpServer.cpp:439-441`).
@@ -274,7 +274,7 @@ block in the file; see §2.4.
 | :--- | :--- | :--- |
 | SIP server / proxy | active board IP : `5060` | The registrar address. Port is not configurable. |
 | Transport | UDP (`transport_type = 0`) | The engine only speaks UDP. |
-| Extension (label / display / auth / user name) | the AOR this MAC last registered as | Comes straight from the adopted-device record. |
+| Extension (label / display / auth / user name) | the AOR this MAC was adopted as | Comes straight from the adopted-device record, which a later REGISTER for another AOR never changes (#820). |
 | Auth password | **blank** | The server has no plaintext secret to hand out (§4). |
 | Codec | PCMU (priority 1), PCMA (priority 2) | Two codecs are enabled and prioritized; the file does not disable others. |
 | NAT | `nat.udp_update_enable = 0` | Media on ordinary calls is peer-to-peer on one L2 segment. |
@@ -384,16 +384,18 @@ None of the four has been tested against a real handset of any vendor.
 
 ## 3. Extension assignment
 
-There is one mode, and it is not configurable: **the extension is whatever that MAC last
-successfully registered as.** `admitLearn()` adopts `{mac, ext, Learned}` on first sight and
-keeps the extension in sync if the phone later re-registers under a different AOR
-(`Registrar.cpp:188-194`).
+There is one mode, and it is not configurable: **the extension is the one that MAC was
+adopted as.** `admitLearn()` adopts `{mac, ext, Learned}` on first sight, and a later
+REGISTER under a different AOR never changes it (#820; see the re-sync bullet below).
 
 Consequences:
 
 * **There is no way to pre-assign an extension to a MAC.** No admin endpoint accepts a
-  MAC→extension pair (§0). To move a phone to a different extension you change it on the
-  phone and let it re-register; the registry follows.
+  MAC→extension pair (§0). To move a phone to a different extension, change it on the
+  phone, **forget its row** by MAC (the **Forget** button on its row of the dashboard
+  roster, or `POST /api/registrar/device` with `action=forget&target=<MAC>`), then let it
+  re-register: it is adopted afresh on the new extension. The registry does not follow on
+  its own; see the re-sync bullet below and [LEARN_MODE.md](LEARN_MODE.md) §6.
 * The registry is bounded by `POCKETDIAL_MAX_CLIENTS` (32 by default): `admitLearn()`
   refuses a new MAC with "Device Table Full" past that, so a flood of distinct MACs cannot
   grow the heap without limit (`Registrar.cpp:171-178`). Because the registry is bounded by
@@ -410,13 +412,16 @@ Consequences:
   (`700`-`709`) and page-zone (`980`-`989`) *ranges* are a separate mechanism (dial-plan
   routing intercepts those, per the original note) and are unaffected by this guard.
   Do not assign any of the above.
-* **Not yet guarded: `admitLearn()`'s own re-sync branch.** If a MAC already adopted under one
-  extension re-REGISTERs under a different AOR, `admitLearn()` updates the stored extension to
-  match (`Registrar.cpp:188-194`), but `onRegister()`'s identity guard runs *before*
-  `admitLearn()` is ever reached, so in practice a resync can never carry a reserved/emergency/
-  PSTN-shaped AOR either. There is no independent check inside `admitLearn()` itself; it relies
-  entirely on the caller's gate. Tracked as a possible defense-in-depth follow-up, not a known
-  bypass.
+* **No re-sync branch any more (#820).** A MAC already adopted under one extension that
+  REGISTERs under a different AOR keeps its stored extension: the other AOR is admitted as
+  TOFU, and an unlocked MAC is marked shared. Before #820 `admitLearn()` rewrote the stored
+  extension, so one REGISTER with a phone's source IP forged also changed the extension this
+  endpoint served to that phone. Now a phone moved to another extension by hand, without its
+  row being forgotten, gets its old extension back from its `.cfg`, and it holds no claim on
+  the new one: another device that registers the new extension twice, at least 30 s apart,
+  locks it, and the phone then gets `403` there. desmo accepted this residual on 2026-10-04
+  (#852). **Forget the phone's row when you move it** (above). The roster does not show
+  `locked` or `shared` yet (#882).
 * **`forget` re-arms adoption.** `POST /api/registrar/device` with `action=forget` removes the
   record; a later REGISTER in Learn mode re-learns it (`Registrar.hpp:83-85`).
 

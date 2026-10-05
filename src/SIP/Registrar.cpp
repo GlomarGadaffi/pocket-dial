@@ -360,8 +360,15 @@ Registrar::AuthDecision Registrar::admitLearn(
 	//                            A younger one is accepted, unlocked.
 	//   KNOWN mac, other ext   -> mark shared (phones behind one NAT router all
 	//                            resolve to the router's MAC); a shared MAC never
-	//                            locks. A re-provisioned phone looks the same and
-	//                            is also left unlocked -- fail open, not locked out.
+	//                            locks. The record keeps its extension, locked or
+	//                            not (#820); the other extension is plain TOFU,
+	//                            with no row. So a phone re-provisioned while
+	//                            unlocked keeps its old row (shared) and holds no
+	//                            claim on its new extension: another device that
+	//                            registers that one twice, 30 s apart, locks it,
+	//                            and the phone then gets 403. Accepted (desmo,
+	//                            2026-10-04, #852); Secure is the protection, and
+	//                            the operator forgets the old row on a move.
 	//   KNOWN + Secured mac    -> enforce digest (same path as secure mode), and
 	//                            never touch its record first (#507).
 	//   ARP miss, ext Secured  -> enforce digest; never accept on a miss (#507).
@@ -536,20 +543,20 @@ Registrar::AuthDecision Registrar::admitLearn(
 	{
 		// One MAC, a second extension, while still UNLOCKED: phones behind a NAT
 		// router, or a phone re-provisioned to a new AOR. Either way this MAC can no
-		// longer vouch for one extension, so it stops locking. Keep the extension in
-		// sync as before.
+		// longer vouch for one extension, so it stops locking. #820: and, like a
+		// locked record above, it keeps its extension. Moving it left that extension
+		// with no earlier claim, so after one REGISTER with the phone's source IP
+		// forged, a device that registered the phone's extension twice locked the
+		// phone out. The other extension is admitted as TOFU.
 		if (!rec.shared)
 		{
 			rec.shared = true;
 			_env.log("Learn: device " + mac + " registered ext " + ext + " after ext " +
 				rec.extension + " -- shared MAC (NAT?), its extensions stay unlocked", true);
+			persistDevices();
+			noteChange(Change::Structural);
 		}
-		rec.locked = false;
-		rec.extension = ext;
-		rec.firstSeen = now;
-		rec.firstSeenKnown = true;
-		persistDevices();
-		noteChange(Change::Structural);
+		return AuthDecision::Accept;
 	}
 
 	// (A Secured record returned above, before the record could be touched.)
@@ -737,6 +744,16 @@ void Registrar::copyOnlineFlagsInto(std::vector<AdoptedDevice>& rows) const
 	}
 }
 
+uint32_t Registrar::loadedSeq(const char* saved, uint32_t& nextSeq)
+{
+	// 0 (missing or unparseable) and anything from 2^31 up take the load order.
+	const unsigned long v = (saved != nullptr) ? strtoul(saved, nullptr, 10) : 0UL;
+	uint32_t seq = (v < 0x80000000UL) ? static_cast<uint32_t>(v) : 0;
+	if (seq == 0) seq = nextSeq;
+	if (seq >= nextSeq) nextSeq = seq + 1;
+	return seq;
+}
+
 void Registrar::loadDevices()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
@@ -766,6 +783,7 @@ void Registrar::loadDevices()
 				int si = atoi(rec[2].c_str());
 				r.state = (si == static_cast<int>(DeviceState::Secured))
 					? DeviceState::Secured : DeviceState::Learned;
+				const char* savedSeq = nullptr;
 				if (rec.size() >= 5)
 				{
 					const int flags = atoi(rec[3].c_str());
@@ -773,11 +791,9 @@ void Registrar::loadDevices()
 					r.shared = (flags & 2) != 0;
 					// Clamped: a saved UINT32_MAX would wrap _nextSeq to 0 below, and
 					// every later adoption would then sort as the oldest (evicted first).
-					const unsigned long saved = strtoul(rec[4].c_str(), nullptr, 10);
-					r.seq = (saved < 0x80000000UL) ? static_cast<uint32_t>(saved) : 0;
+					savedSeq = rec[4].c_str();
 				}
-				if (r.seq == 0) r.seq = _nextSeq;   // pre-#440 (or out-of-range) row: order as loaded
-				if (r.seq >= _nextSeq) _nextSeq = r.seq + 1;
+				r.seq = loadedSeq(savedSeq, _nextSeq);
 				_devices[rec[0]] = std::move(r);
 			}
 		}
