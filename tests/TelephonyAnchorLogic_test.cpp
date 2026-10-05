@@ -571,4 +571,62 @@ TEST(OwnLegs, ALegAdoptedAfterAnUnreadResponseIsHeld)
 	EXPECT_FALSE(ownLegMayBeHeld(OwnLegSource::FirstControllable));
 }
 
+// ── #349 review (#903): which list entries the adopt reads may pick, and the counts ──
+// resolveOutboundLeg() classifies each participant of the live list with these.
+
+TEST(ListLeg, OnlyAControllableUnclaimedLegWithAnIdIsACandidate)
+{
+	using D = DirectControlField;
+	EXPECT_EQ(classifyListLeg(D::True, true, false, false), ListLegVerdict::Candidate);
+	EXPECT_EQ(classifyListLeg(D::False, true, false, false), ListLegVerdict::NotControllable);
+	EXPECT_EQ(classifyListLeg(D::Absent, true, false, false), ListLegVerdict::NotControllable)
+		<< "audit #76: a missing direct_control is not controllable";
+	EXPECT_EQ(classifyListLeg(D::NotBool, true, false, false), ListLegVerdict::NotControllable);
+	EXPECT_EQ(classifyListLeg(D::True, false, false, false), ListLegVerdict::NoId);
+	EXPECT_EQ(classifyListLeg(D::True, true, true, false), ListLegVerdict::Claimed)
+		<< "#100: another call's slot holds it";
+}
+
+TEST(ListLeg, AnEarlierCallsLegIsNeverAdopted)
+{
+	// A leg the PBX dropped, or one #883 still holds after its slot was freed, is
+	// still listed until 3CX's Remove. It is unslotted and controllable, so the
+	// adopt reads would take it for the new call's leg.
+	EXPECT_EQ(classifyListLeg(DirectControlField::True, true, false, /*oursAlready=*/true),
+	          ListLegVerdict::OursAlready)
+		<< "the previous call's freed leg was adopted for the new call";
+}
+
+TEST(ListLeg, TheCountsTellTheFilterFromASlotClaim)
+{
+	// The rerun's question: did direct_control reject the leg, or was it claimed?
+	ListLegCounts claimed;
+	claimed.add(DirectControlField::True, ListLegVerdict::Claimed);
+	EXPECT_EQ(claimed.listed, 1);
+	EXPECT_EQ(claimed.controllable, 1);
+	EXPECT_EQ(claimed.claimed, 1);
+	EXPECT_EQ(claimed.candidates, 0);
+	EXPECT_EQ(claimed.dcAbsent + claimed.dcFalse + claimed.dcNotBool, 0) << "a claimed leg is not a filter reject";
+
+	ListLegCounts filtered;
+	filtered.add(DirectControlField::Absent, ListLegVerdict::NotControllable);
+	filtered.add(DirectControlField::False, ListLegVerdict::NotControllable);
+	filtered.add(DirectControlField::NotBool, ListLegVerdict::NotControllable);
+	EXPECT_EQ(filtered.listed, 3);
+	EXPECT_EQ(filtered.controllable, 0);
+	EXPECT_EQ(filtered.dcAbsent, 1);
+	EXPECT_EQ(filtered.dcFalse, 1);
+	EXPECT_EQ(filtered.dcNotBool, 1);
+
+	ListLegCounts mixed;
+	mixed.add(DirectControlField::True, ListLegVerdict::OursAlready);
+	mixed.add(DirectControlField::True, ListLegVerdict::NoId);
+	mixed.add(DirectControlField::True, ListLegVerdict::Candidate);
+	EXPECT_EQ(mixed.listed, 3);
+	EXPECT_EQ(mixed.controllable, 3);
+	EXPECT_EQ(mixed.oursAlready, 1);
+	EXPECT_EQ(mixed.noId, 1);
+	EXPECT_EQ(mixed.candidates, 1);
+}
+
 }  // namespace
