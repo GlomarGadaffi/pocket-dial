@@ -1065,9 +1065,8 @@ TEST(E911Notify, AnOrdinaryCallTheAnchorRefusesBeforeDispatchIsNotRetriedOnTheTr
 // it was placed. When the carrier then refuses it, or the trunk times it out,
 // onTrunkFailed() answers the handset as before, and the notify list now hears
 // exactly one NOT ROUTED after that ROUTED, naming the carrier's status. A 911
-// that drew a 180 or 183 is never timed out by the PBX (#712; desmo confirmed
-// "YES, exempt"); one that drew no provisional, or only a 100, 181 or 182
-// (#889), still is.
+// that drew any provisional is never timed out by the PBX (#712; desmo
+// confirmed "YES, exempt"; #889); one that drew no provisional at all still is.
 // ─────────────────────────────────────────────────────────────────────────────
 
 namespace
@@ -1191,6 +1190,55 @@ TEST(E911Notify, AnOrdinaryTrunkCallTheCarrierRefusesIsNotNotified)
 	b.handler->handle(carrierResponse(b, "SIP/2.0 403 Forbidden"));
 	EXPECT_EQ(countStarting(b, "SIP/2.0 502"), 1) << b.dump();
 	EXPECT_EQ(countStarting(b, "MESSAGE sip:200@"), 0) << b.dump();
+}
+
+// #889: a 100, 181, 182 or 199 is a provisional too (desmo, 2026-10-05: only a
+// 911 with no provisional at all is not exempt). Each used to miss SipTrunk,
+// so the dialog stayed Trying and the 60 s sweep refused the 911 and reported
+// it NOT ROUTED. Both timers are aged here; a retransmitted provisional is
+// sent too. The control, no provisional at all, still ends at the timeout with
+// one 503 and one NOT ROUTED.
+TEST(E911Notify, ATrunk911ThatDrewAnyProvisionalIsNeverTimedOut)
+{
+	const char* const provisionals[] = { "SIP/2.0 100 Trying", "SIP/2.0 181 Call Is Being Forwarded",
+		"SIP/2.0 182 Queued", "SIP/2.0 199 Early Dialog Terminated", "" };
+	for (const std::string number : { "911", "933" })
+	{
+		for (const std::string provisional : provisionals)
+		{
+			SCOPED_TRACE(number + ", the carrier's only answer: " + (provisional.empty() ? "none" : provisional));
+			NBench b;
+			b.handler->setE911Config("200", "", "");
+			b.handler->setAnchorPlacesRealCallsForTest(false);
+			b.handler->setTrunkConfig(dottedQuadTrunk());
+			b.wire.clear();
+			const std::string callId = "en-889-" + number + "-" + (provisional.empty() ? "none" : provisional.substr(8, 3));
+			b.handler->handle(enInvite("101", number, "192.168.78.11", callId));
+			ASSERT_EQ(countStarting(b, "INVITE sip:" + number + "@203.0.113.5"), 1) << b.dump();
+			if (!provisional.empty())
+			{
+				b.handler->handle(carrierResponse(b, provisional));
+				b.handler->handle(carrierResponse(b, provisional));
+			}
+			b.handler->expireTransactionTimersForTest();
+			b.handler->expireTrunkDeadlinesForTest();
+			b.handler->forceNextTickForTest();
+			b.handler->tick();
+			EXPECT_EQ(b.countOf("ROUTED TO TRUNK"), 1) << b.dump();
+			if (provisional.empty())
+			{
+				EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 1) << b.dump();
+				expectNotRoutedAfterRouted(b, "the trunk timed out (408)", "SIP/2.0 503");
+				EXPECT_FALSE(b.handler->getSession("Call-ID: " + callId).has_value()) << b.dump();
+				continue;
+			}
+			EXPECT_TRUE(b.handler->getSession("Call-ID: " + callId).has_value())
+				<< "the carrier is working on this call; the PBX may not end it:\n" << b.dump();
+			EXPECT_EQ(countStarting(b, "SIP/2.0 503"), 0) << b.dump();
+			EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << b.dump();
+			EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 1u) << "the relay stays up for the answer";
+		}
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

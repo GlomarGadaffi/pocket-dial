@@ -582,6 +582,41 @@ TEST(SipTrunkListener, RingingReportsEarlyMediaOnlyForOneEightyThree)
 	EXPECT_TRUE(lis.events[1].earlyMedia) << "183 is the carrier already sending audio";
 }
 
+// #889: the engine now hands SipTrunk the carrier's 100, 181, 182 and 199 as
+// well. None of their tags may become the dialog's: a 100 forms no dialog
+// (RFC 3261 §12.1), a 199 names one already gone (RFC 6228), and a 181 or 182
+// may be a hop's. The ACK for the 2xx and the BYE carry the 2xx's tag.
+TEST(SipTrunkDialog, AProvisionalsToTagNeverReplacesTheAnswers)
+{
+	for (const char* provisional : { "SIP/2.0 100 Trying", "SIP/2.0 181 Call Is Being Forwarded",
+		"SIP/2.0 182 Queued", "SIP/2.0 199 Early Dialog Terminated" })
+	{
+		SCOPED_TRACE(provisional);
+		FakePbxEnv env;
+		SipTrunk trunk(env);
+		trunk.setConfig(workingConfig());
+		ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+		const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+		ASSERT_NE(d, nullptr);
+		const std::string ok = okFor(*d);
+		std::string early = withStatus(ok, provisional);
+		early.replace(early.find("tag=carrier-tag"), 15, "tag=hop-tag-1xx");
+
+		ASSERT_TRUE(trunk.handleResponse(responseFor(early)));
+		EXPECT_EQ(trunk.findByCallID("handset-1")->state, SipTrunk::State::Proceeding) << "a provisional";
+		ASSERT_TRUE(trunk.handleResponse(responseFor(ok)));
+		ASSERT_TRUE(trunk.hangup("handset-1"));
+
+		ASSERT_EQ(env.sent.size(), 3u) << "INVITE, the 2xx's ACK, the BYE";
+		for (size_t i : { size_t{1}, size_t{2} })
+		{
+			const std::string m = env.sentRaw(i);
+			EXPECT_NE(m.find(";tag=carrier-tag"), std::string::npos) << m;
+			EXPECT_EQ(m.find("hop-tag-1xx"), std::string::npos) << m;
+		}
+	}
+}
+
 TEST(SipTrunkListener, AnsweredFiresAfterTheAckIsOnTheWire)
 {
 	FakePbxEnv env;
