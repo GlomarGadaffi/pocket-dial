@@ -287,26 +287,29 @@ inline bool httpResponseParsed(int status)
 // the leg's call slot, then stalled reconnecting, and an upsert for the leg that
 // matched no slot was announced as a new inbound call (#379 issuecomment-5985911668).
 //
-// Only an id 3CX named as ours is noted (ownLegMayBeHeld below), when the makecall
-// response names it and when its outbound slot is freed; never a leg the PBX merely
-// dropped: dropCall() also drops refused inbound legs, and a PSAP callback refused
-// while a bridge is busy must be announced again on 3CX's next upsert if its drop
-// fails. A genuine inbound call, a PSAP callback among them, is a new participant id.
+// Only an id the makecall response named is noted (ownLegMayBeHeld below), when it is
+// named and when its outbound slot is freed; never a leg the PBX merely dropped:
+// dropCall() also drops refused inbound legs, and a PSAP callback refused while a
+// bridge is busy must be announced again on 3CX's next upsert if its drop fails. A
+// genuine inbound call, a PSAP callback among them, is a new participant id.
 //
 // Until 3CX's Remove the id names a live participant of ours, so no other call can
 // carry it. The Remove releases it at once: an upsert received after the Remove may be
 // a new call reusing the id, and is announced as before. Only work received before the
-// Remove stays ours, told apart by the WS event number it was queued with. A held-back
-// new call could be lost, not merely delayed: a route point's first upsert is already
-// Connected, and the client's model is that 3CX does not repeat a Connected upsert.
+// Remove stays ours, told apart by the WS event number it was queued with. A Remove
+// received after our makecall went out but before its response named the leg is that
+// leg's own, and releases it too. A held-back new call could be lost, not merely
+// delayed: a route point's first upsert is already Connected, and the client's model is
+// that 3CX does not repeat a Connected upsert.
 //
-// Without a Remove the hold lapses kOwnLegGraceUs after the last event noted, never
-// extended by the upserts it suppresses. It spans the slot being freed to 3CX's Remove
-// across a stalled drop: performCtrl() makes two attempts with socket operations of up
-// to 2 s each (timeout_ms bounds each operation, not the request) and one cold TLS
-// handshake, about 5-7 s; the trace took 1.1 s. Fixed size: a full table overwrites its
-// least recently seen entry, and an id that does not fit is not recorded; both forget
-// a leg, which errs toward announcing. Not synchronised.
+// Without a Remove (a WS outage lost it, or 3CX removed only the far leg, or more than
+// N Removes came between a makecall and its response) the hold lapses kOwnLegGraceUs
+// after the last event noted, never extended by the upserts it suppresses. It spans the
+// slot being freed to 3CX's Remove across a stalled drop: performCtrl() makes two
+// attempts with socket operations of up to 2 s each (timeout_ms bounds each operation,
+// not the request) and one cold TLS handshake, about 5-7 s; the trace took 1.1 s. Fixed
+// size: a full table overwrites its least recently seen entry, and an id that does not
+// fit is not recorded; both forget a leg, which errs toward announcing. Not synchronised.
 inline constexpr int64_t kOwnLegGraceUs = 10'000'000;
 
 template <std::size_t N, std::size_t Len>
@@ -314,11 +317,16 @@ class OwnLegs
 {
 public:
 	// The makecall response named this leg: ours, even if 3CX removed an earlier
-	// participant with the same id.
-	// RED (#883 re-review): postSeq is not used yet.
-	void noteNamed(std::string_view id, int64_t nowUs, uint64_t /*postSeq*/ = 0)
+	// participant with the same id before the makecall went out (postSeq is the WS event
+	// number then). A Remove of the id since then was this leg's own.
+	void noteNamed(std::string_view id, int64_t nowUs, uint64_t postSeq)
 	{
-		if (Entry* e = put(id, nowUs)) e->removedSeq = 0;
+		uint64_t removedSeq = 0;
+		for (const Removed& r : _removed)
+		{
+			if (id == r.id && r.seq > removedSeq) removedSeq = r.seq;
+		}
+		if (Entry* e = put(id, nowUs)) e->removedSeq = removedSeq > postSeq ? removedSeq : 0;
 	}
 
 	// Held from nowUs (our outbound slot was freed); a Remove already seen stands.
@@ -333,11 +341,21 @@ public:
 		return true;
 	}
 
-	// 3CX removed the participant; wsSeq is that event's number.
+	// 3CX removed the participant; wsSeq is that event's number. Also remembered for a
+	// leg not named yet; the oldest of the last N Removes is overwritten.
 	void release(std::string_view id, uint64_t wsSeq)
 	{
 		const std::size_t i = indexOf(id);
 		if (i != N && _e[i].removedSeq == 0) _e[i].removedSeq = wsSeq;
+		if (id.empty() || id.size() >= Len) return;
+		Removed* oldest = &_removed[0];
+		for (Removed& r : _removed)
+		{
+			if (r.seq < oldest->seq) oldest = &r;
+		}
+		std::memcpy(oldest->id, id.data(), id.size());
+		oldest->id[id.size()] = '\0';
+		oldest->seq = wsSeq;
 	}
 
 	// Is an upset received as WS event wsSeq still ours?
@@ -354,6 +372,11 @@ private:
 		char     id[Len]    = {};
 		int64_t  seenUs     = 0;
 		uint64_t removedSeq = 0;   // the WS event of 3CX's Remove; 0 = none seen
+	};
+	struct Removed
+	{
+		char     id[Len] = {};
+		uint64_t seq     = 0;
 	};
 
 	std::size_t indexOf(std::string_view id) const   // N when absent
@@ -386,7 +409,8 @@ private:
 	}
 
 	static int64_t age(const Entry& e) { return e.id[0] != '\0' ? e.seenUs : std::numeric_limits<int64_t>::min(); }
-	Entry _e[N] = {};
+	Entry   _e[N]       = {};
+	Removed _removed[N] = {};
 };
 
 using AnchorOwnLegs = OwnLegs<8, 32>;
@@ -405,13 +429,14 @@ inline bool inboundAnnounceAllowed(const OwnLegs<N, Len>& own, std::string_view 
 enum class OwnLegSource : uint8_t
 {
 	MakecallResult,      // result.id in the makecall response
-	OwnPartyDn,          // the controllable leg whose party_dn is our source DN
-	FirstControllable,   // the first controllable leg with no slot: a guess
+	OwnPartyDn,          // the list fallback: the controllable leg whose party_dn is our source DN
+	FirstControllable,   // the list fallback: the first controllable leg with no slot
 };
 
-// Only an id 3CX named as ours is held. The guess can be a genuine inbound leg that
-// rang while the makecall was pending, since such a leg gets no slot then.
-inline bool ownLegMayBeHeld(OwnLegSource s) { return s != OwnLegSource::FirstControllable; }
+// Only the makecall response's own id is held. A list-fallback pick can be a genuine
+// inbound leg that rang while the makecall was pending (it gets no slot then), and
+// nothing here defines party_dn, so such a leg is treated as on main.
+inline bool ownLegMayBeHeld(OwnLegSource s) { return s == OwnLegSource::MakecallResult; }
 
 }  // namespace telephony
 

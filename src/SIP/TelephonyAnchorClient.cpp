@@ -422,6 +422,11 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	int status = 0;
 	std::string respBody;
 	bool requestSent = false;   // #349: did the POST body actually reach 3CX?
+	uint64_t postSeq = 0;       // #379: a Remove received after this may be this makecall's leg
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		postSeq = _wsSeq;
+	}
 	bool success = httpPostBody(makeCallUrl, "application/json", postData, respBody, &status, &requestSent);
 
 	// A device-path 404 means the cached device_id went stale (registration flap). Re-resolve once
@@ -554,7 +559,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			if (ownLegHeld)
 			{
 				std::lock_guard<std::mutex> lock(_mutex);
-				_ownLegs.noteNamed(ownLeg, esp_timer_get_time());
+				_ownLegs.noteNamed(ownLeg, esp_timer_get_time(), postSeq);
 			}
 			// Alloc THIS call's slot (startRxIfNeeded find-or-claims it for ownLeg) + prime the GET
 			// loop, then mark the slot outbound-in-flight so the WS upsets for ownLeg classify as
