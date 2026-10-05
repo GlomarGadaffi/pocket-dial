@@ -789,8 +789,8 @@ void Registrar::loadDevices()
 					const int flags = atoi(rec[3].c_str());
 					r.locked = (flags & 1) != 0;
 					r.shared = (flags & 2) != 0;
-					// loadedSeq() clamps it: a saved UINT32_MAX would wrap _nextSeq to 0,
-					// and every later adoption would then sort as the oldest (evicted first).
+					// Clamped: a saved UINT32_MAX would wrap _nextSeq to 0 below, and
+					// every later adoption would then sort as the oldest (evicted first).
 					savedSeq = rec[4].c_str();
 				}
 				r.seq = loadedSeq(savedSeq, _nextSeq);
