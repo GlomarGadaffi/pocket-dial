@@ -604,6 +604,64 @@ TEST(TrunkWiring, A183AfterTheAnswerDoesNotMoveTheAudio)
 	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9"));
 }
 
+// #890: a final after the carrier's 2xx (a broken SBC, or a stray fork with a
+// tag of its own) answers nothing: the call is up and only a BYE ends it (RFC
+// 3261 §15). It used to run the failure path, which freed the carrier dialog
+// with no BYE and ended the handset's session with none either, so both ends
+// kept a call whose relay was gone: for a 911, a connected PSAP call cut. The
+// same holds for an ordinary call. A BYE from either side still ends it.
+TEST(TrunkWiring, ACarrierFinalAfterTheAnswerLeavesTheCallUp)
+{
+	struct Case { const char* what; const char* dialed; const char* status; const char* tag; bool carrierByes; };
+	const Case cases[] = {
+		{ "911: a 486 on the answer's dialog, then the PSAP hangs up", "911", "SIP/2.0 486 Busy Here", "carrier-tag", true },
+		{ "911: a 503 from another fork, then the caller hangs up", "911", "SIP/2.0 503 Service Unavailable", "other-fork", false },
+		{ "ordinary: a 486, then the far end hangs up", "92025550123", "SIP/2.0 486 Busy Here", "carrier-tag", true },
+		{ "ordinary: a 404, then the handset hangs up", "92025550123", "SIP/2.0 404 Not Found", "carrier-tag", false },
+	};
+	for (const Case& c : cases)
+	{
+		SCOPED_TRACE(c.what);
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", c.dialed, "call-890"));
+		const auto carrier = CarrierView::from(b.firstWithTo("INVITE sip:", kSbcIp));
+		ASSERT_FALSE(carrier.callID.empty()) << "precondition: the call went to the trunk";
+		b.handler.handle(RequestsHandler::getMessageFromPool(carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+		const std::string ok = b.firstWithTo("200 OK", kHandsetIp);
+		ASSERT_FALSE(ok.empty()) << "precondition: the call is up";
+		ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+		b.sent.clear();
+
+		auto stray = carrier;
+		stray.toTag = c.tag;
+		for (int i = 0; i < 2; ++i)   // and its retransmission
+		{
+			b.handler.handle(RequestsHandler::getMessageFromPool(stray.response(c.status, false), addrFor(kSbcIp)));
+		}
+
+		EXPECT_EQ(b.countWithTo("", kHandsetIp), 0u) << "nothing to the handset";
+		EXPECT_EQ(b.countWithTo("", kSbcIp), 0u) << "no ACK, BYE or INVITE to the carrier";
+		const auto s = b.handler.getSession("Call-ID: call-890");
+		EXPECT_TRUE(s.has_value() && s.value()->getState() == Session::State::Connected) << "the call stays up";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "with its relay";
+
+		if (c.carrierByes)
+		{
+			b.handler.handle(RequestsHandler::getMessageFromPool(carrier.bye(), addrFor(kSbcIp)));
+			EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u) << "the handset is told";
+		}
+		else
+		{
+			b.handler.handle(makeHandsetBye("1001", c.dialed, "call-890", CarrierView::between(ok, ";tag=", "\r\n")));
+			const std::string bye = b.firstWithTo("BYE", kSbcIp);
+			EXPECT_NE(bye.find(";tag=carrier-tag"), std::string::npos) << "the carrier is told, on the answer's dialog:\n" << bye;
+		}
+		EXPECT_FALSE(b.handler.getSession("Call-ID: call-890").has_value());
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	}
+}
+
 // #861 (desmo, 2026-10-03): a 911/933 follows the address in every carrier
 // answer, unchecked, as before: early media, the answer, and a later 2xx.
 TEST(TrunkWiring, AnEmergencyCallFollowsEveryCarrierAnswerUnchecked)
