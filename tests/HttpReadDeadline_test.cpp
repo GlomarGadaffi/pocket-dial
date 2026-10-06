@@ -311,6 +311,114 @@ TEST(HttpReadDeadline, ARefusalWhoseSendTimeoutCannotBeSetClosesUnanswered)
 	waitIdle(server);
 }
 
+namespace
+{
+	// #871: holds each handler thread after its socket is closed and before its
+	// slot is freed, until a ticket lets one go (or 3 s pass).
+	struct ClosedHold
+	{
+		std::atomic<int> parked{0};
+		std::atomic<int> tickets{0};
+		std::atomic<bool> open{false};
+		void hold()
+		{
+			++parked;
+			const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+			while (!open.load() && std::chrono::steady_clock::now() < end)
+			{
+				int t = tickets.load();
+				if (t > 0 && tickets.compare_exchange_weak(t, t - 1)) break;
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+			--parked;
+		}
+		void waitParked(int n)
+		{
+			for (int i = 0; i < 300 && parked.load() < n; ++i)
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+	};
+
+	std::string getStatus(int port)
+	{
+		Sock s = connectFrom("127.0.0.1", port);
+		if (!valid(s)) return {};
+		sendAll(s, "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+		std::string resp = recvAll(s);   // to EOF, as TelephonyConfigHttp_test's client reads
+		closeSock(s);
+		return resp;
+	}
+}
+
+// #871: the flake. A client that sends one request after another, each read to
+// EOF, was refused 503 "too many connections from this address" when three of
+// its own finished connections' threads had not yet returned: the source slot
+// was released only after handleClient(), which had already closed the socket.
+// The hold makes that window deterministic.
+TEST(HttpReadDeadline, AClientsNextRequestIsNeverRefusedByItsOwnClosedConnections)
+{
+	RequestsHandler handler("192.168.52.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18255, nullptr);
+	server.attachHandler(&handler);
+	ClosedHold hold;
+	server.setAfterCloseHookForTest([&hold]() { hold.hold(); });
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	for (int i = 0; i < HttpServer::kMaxConnectionsPerSource; ++i)
+	{
+		EXPECT_EQ(statusOf(getStatus(18255)), 200) << "request " << i;
+	}
+	hold.waitParked(HttpServer::kMaxConnectionsPerSource);
+	ASSERT_EQ(hold.parked.load(), HttpServer::kMaxConnectionsPerSource);
+
+	const std::string next = getStatus(18255);
+	EXPECT_EQ(statusOf(next), 200) << next;
+	EXPECT_EQ(server.perSourceRefusals(), 0u);
+
+	hold.open = true;
+	waitIdle(server);
+}
+
+// The global cap still bounds the threads (#368). A full house of closed but not
+// yet returned handlers is waited for, briefly: one that returns inside the wait
+// lets the next request in; none returning still gets the 503.
+TEST(HttpReadDeadline, TheGlobalCapWaitsBrieflyForAClosedHandlerAndNoLonger)
+{
+	RequestsHandler handler("192.168.52.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18256, nullptr);
+	server.attachHandler(&handler);
+	ClosedHold hold;
+	server.setAfterCloseHookForTest([&hold]() { hold.hold(); });
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	for (int i = 0; i < HttpServer::kMaxConcurrentConnections; ++i)
+	{
+		ASSERT_EQ(statusOf(getStatus(18256)), 200) << "request " << i;
+	}
+	hold.waitParked(HttpServer::kMaxConcurrentConnections);
+	ASSERT_EQ(server.activeConnectionsForTest(), HttpServer::kMaxConcurrentConnections);
+
+	const std::string refused = getStatus(18256);
+	EXPECT_EQ(statusOf(refused), 503) << "no thread returned: the bound holds";
+	EXPECT_NE(refused.find("too many concurrent connections"), std::string::npos) << refused;
+
+	server.setClosingWaitMsForTest(2000);   // the 10 ms below is far inside it, loaded host or not
+	std::thread letOneGo([&hold]() {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		++hold.tickets;
+	});
+	const std::string served = getStatus(18256);
+	letOneGo.join();
+	EXPECT_EQ(statusOf(served), 200) << served;
+
+	hold.open = true;
+	waitIdle(server);
+}
+
 TEST(HttpReadDeadline, DestroyingTheServerWaitsForItsConnectionThreads)
 {
 	// #540: connection threads are detached and touch the server after

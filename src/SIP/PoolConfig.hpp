@@ -211,6 +211,14 @@
 #define POCKETDIAL_CONFERENCE 1
 #endif
 
+// Issue #800: 1 builds multicast paging (dial 997): one boot-time RTP receive slot
+// (RtpTaskSlots.hpp kRxSlots), the re-sender, its config and /api/multicast-paging.
+// 0 (SIP_CONSTRAINED) compiles all of it out; 997 then answers 403. The feature is
+// still off at runtime until an admin enables it.
+#ifndef POCKETDIAL_MULTICAST_PAGING
+#define POCKETDIAL_MULTICAST_PAGING 1
+#endif
+
 // Issue #479 (option D): rtp_media_tx stacks (3 KB, internal DMA) form ONE pool
 // shared by every RtpSender, sized to the concurrent outbound media streams. A
 // start() that finds it full is refused and counted (/api/status

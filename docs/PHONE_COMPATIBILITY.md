@@ -84,6 +84,7 @@ peer-to-peer or terminated on the board:
 | `440` | Server tone stream (server-sourced RTP) |
 | `555` | Anchored-media bridge (`kAnchorCallExt`, `RequestsHandler.cpp:72`) |
 | `888` | Meet-me conference (`ConferenceRoom::EXT`) |
+| `997` | Multicast paging (§3, off by default) |
 | `700`–`709` | Call-park orbits (`ParkOrbit.hpp:18`) |
 | `980`–`989` | Paging zones |
 | `*8`, `**<ext>` | Group pickup / directed pickup |
@@ -158,6 +159,26 @@ phone that has never registered. It re-provisions phones you already brought up 
 - Configure the SIP registrar address `192.168.4.1:5060`, transport **UDPOnly**, line
   address/auth user `1001`.
 - Codec preferences: enable **G711_Mu** and **G711_A**.
+
+### Multicast paging (`997`, issue #800)
+
+With paging enabled (`PUT /api/multicast-paging`, `docs/API.md`), dialing `997` is answered
+by the PBX itself (`a=recvonly`, PCMU), and the caller's audio is re-sent as G.711 µ-law
+RTP to the multicast group, default **`239.0.1.75:50000`**, TTL 1 (it never leaves the
+LAN). Phones that listen on that group play the page with no SIP call of their own, so a
+phone that is offline to SIP or already on a call can still hear it. One page at a time:
+a second `997` caller gets `486 Busy Here`. A page ends on the caller's BYE, or after
+5 s with no RTP from the caller.
+
+Listening settings (no firmware work on the phone side):
+
+* **Yealink (T32G):** Features → Multicast Listening: address `239.0.1.75:50000`, priority as wanted.
+* **Snom (370):** multicast paging, "Multicast listening address" `239.0.1.75:50000`.
+
+> [!WARNING]
+> No board has sent a page yet. On the Ethernet builds the other media paths transmit
+> through the L2 bypass, but this one goes through an lwIP UDP socket, and that path has
+> not been checked with a packet capture or a real phone (#800).
 
 ## 4. Behavior to expect after registration
 

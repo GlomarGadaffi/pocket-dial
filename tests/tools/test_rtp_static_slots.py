@@ -96,6 +96,8 @@ class RtpStaticSlots(unittest.TestCase):
         block = block[:block.index("endif()")]
         caps = dict(re.findall(r"(POCKETDIAL_(?:MAX_ANCHOR_CALLS|MAX_VOICEMAIL_LEGS|MAX_TRUNK_CALLS|CONFERENCE|RTP_TX_POOL))=(\d+)", block))
         self.assertEqual(caps.get("POCKETDIAL_CONFERENCE"), "0", "constrained must build no conference room")
+        # #800: nor the multicast pager's rx slot, which the sum below leaves out.
+        self.assertIn("POCKETDIAL_MULTICAST_PAGING=0", block, "constrained must build no multicast paging")
         a, v, t, p = (int(caps[k]) for k in ("POCKETDIAL_MAX_ANCHOR_CALLS", "POCKETDIAL_MAX_VOICEMAIL_LEGS",
                                             "POCKETDIAL_MAX_TRUNK_CALLS", "POCKETDIAL_RTP_TX_POOL"))
         rx = a + v + 2 * t

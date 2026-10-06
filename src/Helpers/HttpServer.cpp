@@ -320,7 +320,11 @@ void HttpServer::acceptLoop()
 	// block it: bound the send, and if even that cannot be set, close unanswered
 	// (#534 review). A dropped connection costs the refused client a retry; a
 	// send() that blocks forever costs every client the whole server.
-	const auto refuseBusy = [this](int sock, const char* body) {
+	const auto refuseBusy = [this](int sock, const char* body, const char* cap) {
+		// #871: which cap fired, at 1, 2, 4, 8, ... refusals (a flood logs a handful).
+		const uint32_t n = _busyRefusals.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((n & (n - 1)) == 0)
+			std::cerr << "[HttpServer] 503 busy: " << cap << " (" << n << " refused so far)\n";
 		if (setSocketTimeoutMs(sock, SO_SNDTIMEO, 1000))
 		{
 			sendResponse(sock, 503, "Service Unavailable", "application/json", body);
@@ -436,6 +440,16 @@ void HttpServer::acceptLoop()
 		// Refusing early and cheaply is strictly better than letting the spawn fail
 		// deeper in: the caller gets a 503 it can retry instead of a dropped socket,
 		// and the memory is never committed in the first place.
+		// #871: a slot held only by a handler that has closed its socket (its
+		// client already read the whole response) frees as soon as that thread
+		// returns. Wait for it, bounded, rather than refuse that client's next
+		// request; a slot held by a live request is never waited on.
+		for (int waited = 0; waited < _closingWaitMs.load(std::memory_order_relaxed) &&
+			_activeConnections.load(std::memory_order_acquire) >= kMaxConcurrentConnections &&
+			_closingConnections.load(std::memory_order_acquire) > 0; ++waited)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
 		if (_activeConnections.load(std::memory_order_acquire) >= kMaxConcurrentConnections)
 		{
 			// This refusal is written from the ACCEPT THREAD, not a handler, so it
@@ -445,7 +459,8 @@ void HttpServer::acceptLoop()
 			// the exhaustion this cap exists to prevent. handleClient()'s 5 s
 			// SO_RCVTIMEO (#23) is set on the handler path we are deliberately
 			// skipping here, so this socket needs its own bound (refuseBusy).
-			refuseBusy(clientSock, "{\"error\":\"busy\",\"message\":\"too many concurrent connections\"}");
+			refuseBusy(clientSock, "{\"error\":\"busy\",\"message\":\"too many concurrent connections\"}",
+				"global cap");
 			continue;
 		}
 
@@ -455,7 +470,16 @@ void HttpServer::acceptLoop()
 		if (!claimSource(sourceAddr))
 		{
 			_perSourceRefusals.fetch_add(1, std::memory_order_relaxed);
-			refuseBusy(clientSock, "{\"error\":\"busy\",\"message\":\"too many connections from this address\"}");
+			refuseBusy(clientSock, "{\"error\":\"busy\",\"message\":\"too many connections from this address\"}",
+				"per-source cap");
+			continue;
+		}
+		const int connIdx = claimConnSlot(clientSock, sourceAddr);
+		if (connIdx < 0)
+		{
+			releaseSource(sourceAddr);
+			refuseBusy(clientSock, "{\"error\":\"busy\",\"message\":\"too many concurrent connections\"}",
+				"no connection slot");
 			continue;
 		}
 
@@ -467,19 +491,22 @@ void HttpServer::acceptLoop()
 
 		try
 		{
-			std::thread([this, clientSock, sourceAddr]() {
+			std::thread([this, clientSock, connIdx]() {
 				// #405: which route this thread served, for the stack minimum.
 				char route[kRouteLabelBytes] = "unparsed";
 				handleClient(clientSock, route);
 				recordConnStackHwm(route);
-				releaseSource(sourceAddr);
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+				if (_afterCloseHookForTest) _afterCloseHookForTest();
+#endif
+				finishConnSlot(connIdx);
 				_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			}).detach();
 		}
 		catch (const std::exception& e)
 		{
 			// No thread was created, so nothing will ever decrement for this one.
-			releaseSource(sourceAddr);
+			finishConnSlot(connIdx);
 			_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			std::cerr << "[HttpServer] connection thread spawn failed: " << e.what()
 				<< " — dropping connection\n";
@@ -519,6 +546,40 @@ bool HttpServer::claimSource(uint32_t addr)
 void HttpServer::releaseSource(uint32_t addr)
 {
 	std::lock_guard<std::mutex> lock(_sourcesMutex);
+	releaseSourceLocked(addr);
+}
+
+int HttpServer::claimConnSlot(int sock, uint32_t addr)
+{
+	std::lock_guard<std::mutex> lock(_sourcesMutex);
+	for (int i = 0; i < kMaxConcurrentConnections; ++i)
+	{
+		if (_conns[i].sock < 0)
+		{
+			_conns[i] = ConnSlot{sock, addr, false};
+			return i;
+		}
+	}
+	return -1;
+}
+
+void HttpServer::finishConnSlot(int idx)
+{
+	std::lock_guard<std::mutex> lock(_sourcesMutex);
+	ConnSlot& c = _conns[idx];
+	if (c.closing)
+	{
+		_closingConnections.fetch_sub(1, std::memory_order_acq_rel);
+	}
+	else
+	{
+		releaseSourceLocked(c.addr);   // a path that never reached closeSocket()
+	}
+	c = ConnSlot{};
+}
+
+void HttpServer::releaseSourceLocked(uint32_t addr)
+{
 	for (SourceSlot& s : _sources)
 	{
 		if (s.count > 0 && s.addr == addr)
@@ -1193,6 +1254,24 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 			sendApiSbcModeSet(clientSock, req.body);
 		}
 	}
+#if POCKETDIAL_MULTICAST_PAGING
+	else if (req.method == "GET" && req.path == "/api/multicast-paging")
+	{
+		// Read gate matches the other config surfaces: nothing here is secret.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiMulticastPagingGet(clientSock);
+		}
+	}
+	else if (req.method == "PUT" && req.path == "/api/multicast-paging")
+	{
+		// Mutating, same gate as /api/sbc-mode (#800).
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiMulticastPagingSet(clientSock, req.body);
+		}
+	}
+#endif
 	else if (req.method == "GET" && req.path == "/api/did-mapping")
 	{
 		// Same read gate as /api/telephony-config above.
@@ -3910,6 +3989,87 @@ void HttpServer::sendApiSbcModeSet(int sock, const std::string& body)
 	sendApiSbcModeGet(sock);
 }
 
+#if POCKETDIAL_MULTICAST_PAGING
+void HttpServer::sendApiMulticastPagingGet(int sock)
+{
+	pbx::MulticastPagingConfig cfg;
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		cfg = handler->getMulticastPaging();
+	}
+	char group[16];
+	pbx::formatIpv4(cfg.group, group);
+
+	// #410: no heap. At most 60 bytes.
+	char buf[96];
+	JsonOut json{buf, sizeof(buf)};
+	json.s("{\"enabled\":").b(cfg.enabled)
+	    .s(",\"group\":\"").s(group).s("\"")
+	    .s(",\"port\":").n(cfg.port)
+	    .s("}");
+	if (json.full)
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"error\":\"multicast-paging response too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, json.len));
+}
+
+void HttpServer::sendApiMulticastPagingSet(int sock, const std::string& body)
+{
+	// Issue #800. Params, each optional (absent keeps the current value):
+	// enabled ("1"/"true"/"on"), group (dotted quad), port (1-65535).
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	pbx::MulticastPagingConfig cfg;
+	if (handler) cfg = handler->getMulticastPaging();
+
+	const std::string enabledParam = getFormParam(body, "enabled");
+	if (!enabledParam.empty())
+	{
+		cfg.enabled = (enabledParam == "1" || enabledParam == "true" || enabledParam == "on");
+	}
+	const std::string groupParam = getFormParam(body, "group");
+	if (!groupParam.empty())
+	{
+		uint32_t net = 0;
+		if (!TrunkResolver::parseDottedQuad(groupParam, net))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"group must be a dotted-quad IPv4 address\"}");
+			return;
+		}
+		cfg.group = ntohl(net);
+	}
+	const std::string portParam = getFormParam(body, "port");
+	if (!portParam.empty())
+	{
+		char* endp = nullptr;
+		const unsigned long port = (portParam[0] >= '0' && portParam[0] <= '9')
+			? std::strtoul(portParam.c_str(), &endp, 10) : 0;
+		if (endp == nullptr || *endp != '\0' || port == 0 || port > 65535)
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"port must be 1-65535\"}");
+			return;
+		}
+		cfg.port = static_cast<uint16_t>(port);
+	}
+
+	if (handler)
+	{
+		const std::string err = handler->setMulticastPaging(cfg);
+		if (!err.empty())
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"" + jsonEscape(err) + "\"}");
+			return;
+		}
+	}
+	sendApiMulticastPagingGet(sock);
+}
+#endif
+
 void HttpServer::sendApiDidMappingList(int sock)
 {
 	std::vector<DidMapping::Entry> mappings;
@@ -4193,6 +4353,21 @@ void HttpServer::send404(int sock)
 
 void HttpServer::closeSocket(int sock)
 {
+	{
+		// #871: a connection's source share is released before its client can
+		// read EOF; the thread is counted closing until it exits (finishConnSlot).
+		std::lock_guard<std::mutex> lock(_sourcesMutex);
+		for (ConnSlot& c : _conns)
+		{
+			if (c.sock == sock && !c.closing)
+			{
+				c.closing = true;
+				releaseSourceLocked(c.addr);
+				_closingConnections.fetch_add(1, std::memory_order_acq_rel);
+				break;
+			}
+		}
+	}
 #if defined(__linux__) || defined(ESP_PLATFORM)
 	close(sock);
 #elif defined _WIN32 || defined _WIN64

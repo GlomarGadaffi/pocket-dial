@@ -212,6 +212,13 @@ public:
 	// before the route table. The gate counts route (dispatch + response)
 	// allocations from there; request reading is done-when 2's business.
 	void handleClientForTest(int sock) { handleClient(sock); }
+	// #871: runs on each handler thread after its socket is closed and before
+	// its slot is freed, so a test can hold threads in that window. Set before start().
+	void setAfterCloseHookForTest(std::function<void()> f) { _afterCloseHookForTest = std::move(f); }
+	std::function<void()> _afterCloseHookForTest;
+	// #871: widen the accept loop's wait for a closed handler, so a test that
+	// frees one on a timer is not at the mercy of a loaded host's scheduler.
+	void setClosingWaitMsForTest(int ms) { _closingWaitMs.store(ms, std::memory_order_relaxed); }
 	static void setDispatchMarkForTest(void (*mark)());
 	void sendResponseForTest(int sock, int statusCode, std::string_view statusText,
 	                   std::string_view contentType, std::string_view body,
@@ -441,6 +448,9 @@ private:
 	void sendApiE911Set(int sock, const std::string& body);
 	void sendApiSbcModeGet(int sock);
 	void sendApiSbcModeSet(int sock, const std::string& body);
+	// Issue #800: multicast paging (997). Defined only when POCKETDIAL_MULTICAST_PAGING.
+	void sendApiMulticastPagingGet(int sock);
+	void sendApiMulticastPagingSet(int sock, const std::string& body);
 	void sendApiDidMappingSet(int sock, const std::string& body);
 	void sendApiDidMappingDelete(int sock, const std::string& body);
 	void sendApiWifiScan(int sock);
@@ -595,6 +605,21 @@ private:
 	std::mutex _sourcesMutex;
 	bool claimSource(uint32_t addr);     // false: that source is at its cap
 	void releaseSource(uint32_t addr);
+	void releaseSourceLocked(uint32_t addr);   // _sourcesMutex held
+	// #871: the connection each handler thread serves. closeSocket() on it
+	// releases the source's share BEFORE the client can read EOF, and marks
+	// the thread closing. The global slot stays held until the thread exits
+	// (#368's thread bound, #540's destructor wait); the accept loop waits up
+	// to kClosingWaitMs for a closing thread instead of refusing the same
+	// client's next request with 503.
+	struct ConnSlot { int sock = -1; uint32_t addr = 0; bool closing = false; };
+	ConnSlot _conns[kMaxConcurrentConnections]{};
+	std::atomic<int> _closingConnections{0};
+	static constexpr int kClosingWaitMs = 50;
+	std::atomic<int> _closingWaitMs{kClosingWaitMs};   // host tests may widen it (below)
+	int  claimConnSlot(int sock, uint32_t addr);   // -1: none free (not reached under the cap)
+	void finishConnSlot(int idx);                  // releases the source if no close did
+	std::atomic<uint32_t> _busyRefusals{0};
 	std::atomic<uint32_t> _readDeadlineDrops{0};
 	std::atomic<uint32_t> _perSourceRefusals{0};
 	// #410: /api/status output buffers, one per connection slot (see kStatusBufBytes).
