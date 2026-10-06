@@ -529,4 +529,104 @@ TEST(OwnLegs, AnIdThatDoesNotFitIsNeverHeld)
 	EXPECT_TRUE(inboundAnnounceAllowed(own, "", kNamed + 1, kSeqUpsert));
 }
 
+// ── #349: the makecall POST reached 3CX and its response was never read ──────
+// The x349_unread_makecall run on .244 (main 61132ada, #349 issuecomment-6004433436):
+// 3CX had already named the leg (the probe threw result.id away), the list read
+// found no leg, makeCall() gave up, and 3CX's leg 509 rang the far end, was
+// answered, and came back as a phantom inbound call.
+
+TEST(UnreadMakecall, ALegTheListShowsIsAdopted)
+{
+	EXPECT_EQ(unreadMakecallStep(/*legListed=*/true, 0), UnreadMakecallStep::Adopt);
+	EXPECT_EQ(unreadMakecallStep(true, kUnreadAdoptWindowUs), UnreadMakecallStep::Adopt)
+		<< "a leg on the last read is still ours";
+}
+
+TEST(UnreadMakecall, AListWithNoLegYetIsReadAgain)
+{
+	// One read that shows no leg is not "no call": 3CX had placed it on .244.
+	EXPECT_EQ(unreadMakecallStep(false, 0), UnreadMakecallStep::ReadAgain)
+		<< "the first list read with no leg ended the reconcile: the .244 orphan";
+	EXPECT_EQ(unreadMakecallStep(false, 2'000'000), UnreadMakecallStep::ReadAgain);
+}
+
+TEST(UnreadMakecall, TheReadsStopWithinTheWindow)
+{
+	// While makeCall() reads, an unmatched upsert is ignored (#888), so the window is bounded.
+	static_assert(kUnreadAdoptWindowUs <= 5'000'000, "#888: a longer window hides an inbound upsert longer");
+	const int64_t lastRead = kUnreadAdoptWindowUs - int64_t{kUnreadAdoptPollMs} * 1000;
+	EXPECT_EQ(unreadMakecallStep(false, lastRead - 1), UnreadMakecallStep::ReadAgain);
+	EXPECT_EQ(unreadMakecallStep(false, lastRead), UnreadMakecallStep::GiveUp)
+		<< "a read after the window closes";
+	EXPECT_EQ(unreadMakecallStep(false, kUnreadAdoptWindowUs * 10), UnreadMakecallStep::GiveUp);
+}
+
+TEST(OwnLegs, ALegAdoptedAfterAnUnreadResponseIsHeld)
+{
+	// Once adopted the leg is ours: freed at hangup, its upserts before 3CX's
+	// Remove must not ring the route DN. The list fallback alone stays unheld.
+	EXPECT_TRUE(ownLegMayBeHeld(OwnLegSource::AdoptedAfterUnreadResponse))
+		<< "an adopted leg's late upsert can still be announced as inbound";
+	EXPECT_FALSE(ownLegMayBeHeld(OwnLegSource::OwnPartyDn));
+	EXPECT_FALSE(ownLegMayBeHeld(OwnLegSource::FirstControllable));
+}
+
+// ── #349 review (#903): which list entries the adopt reads may pick, and the counts ──
+// resolveOutboundLeg() classifies each participant of the live list with these.
+
+TEST(ListLeg, OnlyAControllableUnclaimedLegWithAnIdIsACandidate)
+{
+	using D = DirectControlField;
+	EXPECT_EQ(classifyListLeg(D::True, true, false, false), ListLegVerdict::Candidate);
+	EXPECT_EQ(classifyListLeg(D::False, true, false, false), ListLegVerdict::NotControllable);
+	EXPECT_EQ(classifyListLeg(D::Absent, true, false, false), ListLegVerdict::NotControllable)
+		<< "audit #76: a missing direct_control is not controllable";
+	EXPECT_EQ(classifyListLeg(D::NotBool, true, false, false), ListLegVerdict::NotControllable);
+	EXPECT_EQ(classifyListLeg(D::True, false, false, false), ListLegVerdict::NoId);
+	EXPECT_EQ(classifyListLeg(D::True, true, true, false), ListLegVerdict::Claimed)
+		<< "#100: another call's slot holds it";
+}
+
+TEST(ListLeg, AnEarlierCallsLegIsNeverAdopted)
+{
+	// A leg the PBX dropped, or one #883 still holds after its slot was freed, is
+	// still listed until 3CX's Remove. It is unslotted and controllable, so the
+	// adopt reads would take it for the new call's leg.
+	EXPECT_EQ(classifyListLeg(DirectControlField::True, true, false, /*oursAlready=*/true),
+	          ListLegVerdict::OursAlready)
+		<< "the previous call's freed leg was adopted for the new call";
+}
+
+TEST(ListLeg, TheCountsTellTheFilterFromASlotClaim)
+{
+	// The rerun's question: did direct_control reject the leg, or was it claimed?
+	ListLegCounts claimed;
+	claimed.add(DirectControlField::True, ListLegVerdict::Claimed);
+	EXPECT_EQ(claimed.listed, 1);
+	EXPECT_EQ(claimed.controllable, 1);
+	EXPECT_EQ(claimed.claimed, 1);
+	EXPECT_EQ(claimed.candidates, 0);
+	EXPECT_EQ(claimed.dcAbsent + claimed.dcFalse + claimed.dcNotBool, 0) << "a claimed leg is not a filter reject";
+
+	ListLegCounts filtered;
+	filtered.add(DirectControlField::Absent, ListLegVerdict::NotControllable);
+	filtered.add(DirectControlField::False, ListLegVerdict::NotControllable);
+	filtered.add(DirectControlField::NotBool, ListLegVerdict::NotControllable);
+	EXPECT_EQ(filtered.listed, 3);
+	EXPECT_EQ(filtered.controllable, 0);
+	EXPECT_EQ(filtered.dcAbsent, 1);
+	EXPECT_EQ(filtered.dcFalse, 1);
+	EXPECT_EQ(filtered.dcNotBool, 1);
+
+	ListLegCounts mixed;
+	mixed.add(DirectControlField::True, ListLegVerdict::OursAlready);
+	mixed.add(DirectControlField::True, ListLegVerdict::NoId);
+	mixed.add(DirectControlField::True, ListLegVerdict::Candidate);
+	EXPECT_EQ(mixed.listed, 3);
+	EXPECT_EQ(mixed.controllable, 3);
+	EXPECT_EQ(mixed.oursAlready, 1);
+	EXPECT_EQ(mixed.noId, 1);
+	EXPECT_EQ(mixed.candidates, 1);
+}
+
 }  // namespace

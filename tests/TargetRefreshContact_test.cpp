@@ -131,6 +131,31 @@ namespace
 		return {};
 	}
 
+	// The request line: everything up to the first CRLF.
+	std::string requestLine(const std::string& raw)
+	{
+		return raw.substr(0, raw.find("\r\n"));
+	}
+
+	// A bodiless in-dialog request (ACK or BYE) addressed to the PBX, as a phone
+	// sends it: the Request-URI is the Contact the PBX presented (#425).
+	std::shared_ptr<SipMessage> bodilessInDialog(const std::string& method, const std::string& ruriUser,
+	                                             const std::string& fromHdr, const std::string& toHdr,
+	                                             const std::string& callId, int cseq,
+	                                             const std::string& branch, const char* srcIp)
+	{
+		std::string raw =
+			method + " sip:" + ruriUser + "@" + kPbxIp + ":5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(srcIp) + ":5060;branch=" + branch + "\r\n" +
+			fromHdr + "\r\n" +
+			toHdr + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(cseq) + " " + method + "\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
+	}
+
 	// A caller-side in-dialog request (re-INVITE or UPDATE) carrying the caller's
 	// REAL Contact, exactly as a phone sends it.
 	std::shared_ptr<SipMessage> callerInDialog(const std::string& method, const std::string& ruriUser,
@@ -306,6 +331,71 @@ TEST(TargetRefreshContact, SdpUpdateOnARelayCallReachesTheCalleeWithThePbxContac
 	ASSERT_FALSE(atCallee.empty()) << "an SDP UPDATE must be relayed to 106";
 	EXPECT_NE(atCallee.find("a=sendonly"), std::string::npos) << "the SDP must arrive intact";
 	EXPECT_EQ(headerLine(atCallee, "Contact:"), pbxContactFor("100"));
+}
+
+// ── #754: the Request-URI of a relayed in-dialog request names the far phone ──
+// The sender addresses the PBX (the Contact the PBX presented). Relayed as it
+// came, the far phone got a request naming the PBX -- a UA that applies RFC 3261
+// §8.2.2.1 answers 404 and stays off-hook. Each test's own precondition is that
+// the sender DID address the PBX (bodilessInDialog/callerInDialog use kPbxIp), so
+// a pass is the rewrite, not an accident of the fixture.
+
+TEST(TargetRefreshContact, RelayedHoldReinviteRequestUriNamesTheCalleeNotThePbx)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const std::string callId = "trc-ruri-reinv";
+	const std::string dialogTo = connectOrdinaryCall(handler, sent, callId);
+
+	handler.handle(callerInDialog("INVITE", "106", callId, dialogTo, 2, "z9hG4bKruriinv", "sendonly"));
+
+	std::string atCallee = findSentTo(sent, addrFor(kCalleeIp), "CSeq: 2 INVITE");
+	ASSERT_FALSE(atCallee.empty()) << "the hold re-INVITE must be relayed to 106";
+	EXPECT_EQ(requestLine(atCallee), "INVITE sip:106@" + std::string(kCalleeIp) + ":5060 SIP/2.0")
+		<< "#754: the Request-URI must be the callee's own address, not the PBX's";
+}
+
+TEST(TargetRefreshContact, RelayedUpdateRequestUriNamesTheCalleeNotThePbx)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const std::string callId = "trc-ruri-upd";
+	const std::string dialogTo = connectOrdinaryCall(handler, sent, callId);
+
+	handler.handle(callerInDialog("UPDATE", "106", callId, dialogTo, 2, "z9hG4bKruriupd", nullptr));
+
+	std::string atCallee = findSentTo(sent, addrFor(kCalleeIp), "CSeq: 2 UPDATE");
+	ASSERT_FALSE(atCallee.empty()) << "the UPDATE must be relayed to 106";
+	EXPECT_EQ(requestLine(atCallee), "UPDATE sip:106@" + std::string(kCalleeIp) + ":5060 SIP/2.0")
+		<< "#754: the Request-URI must be the callee's own address, not the PBX's";
+}
+
+TEST(TargetRefreshContact, RelayedAckAndByeRequestUrisNameTheFarPhoneInBothDirections)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const std::string callId = "trc-ruri-ackbye";
+	const std::string dialogTo = connectOrdinaryCall(handler, sent, callId);
+	const std::string callerFrom = "From: <sip:100@server>;tag=ft" + callId;
+
+	// The caller's ACK for the 2xx is relayed to the callee.
+	handler.handle(bodilessInDialog("ACK", "106", callerFrom, dialogTo, callId, 1, "z9hG4bKruriack", kCallerIp));
+	std::string ackAtCallee = findSentTo(sent, addrFor(kCalleeIp), "CSeq: 1 ACK");
+	ASSERT_FALSE(ackAtCallee.empty()) << "the caller's 2xx ACK must be relayed to 106";
+	EXPECT_EQ(requestLine(ackAtCallee), "ACK sip:106@" + std::string(kCalleeIp) + ":5060 SIP/2.0")
+		<< "#754: the ACK's Request-URI must be the callee's own address, not the PBX's";
+
+	// The callee hangs up: the PBX answers its BYE and sends the caller its own
+	// (#808), with the PBX's CSeq, not the callee's.
+	handler.handle(bodilessInDialog("BYE", "100", "From: <sip:106@server>;tag=ans106",
+		"To: <sip:100@server>;tag=ft" + callId, callId, 1, "z9hG4bKruribye", kCalleeIp));
+	std::string byeAtCaller = findSentTo(sent, addrFor(kCallerIp), "BYE sip:");
+	ASSERT_FALSE(byeAtCaller.empty()) << "the callee's hang-up must reach the caller";
+	EXPECT_EQ(requestLine(byeAtCaller), "BYE sip:100@" + std::string(kCallerIp) + ":5060 SIP/2.0")
+		<< "#754: the BYE's Request-URI must be the caller's own address, not the PBX's";
 }
 
 // ── #198: refresh on an INBOUND anchored call (PSTN -> handset) ──────────────

@@ -28,6 +28,7 @@ import check_app_version as gate  # noqa: E402
 
 MAX_LEN = gate.read_max_len()  # the shared definition, not a copy of the number
 LONG_TAG = "v1.5.0-beta.2-an-extremely-long-release-tag"
+ABBREV = f"--abbrev={gate.ABBREV}"  # #872: the stamp's pinned abbreviation
 
 
 def run(repo, *args):
@@ -134,7 +135,7 @@ class GateTest(unittest.TestCase):
     def test_over_length_describe_expects_the_hash_fallback(self):
         run(self.repo, "tag", LONG_TAG)
         self.commit("two")
-        full = run(self.repo, "describe", "--tags", "--always", "--dirty")
+        full = run(self.repo, "describe", "--tags", "--always", "--dirty", ABBREV)
         self.assertGreater(len(full), MAX_LEN, "precondition: describe really is over-length")
         s = self.stamp()
         self.assertRegex(s, r"^[0-9a-f]{7,}$")
@@ -157,7 +158,7 @@ class GateTest(unittest.TestCase):
         run(self.repo, "tag", LONG_TAG)
         self.commit("two")
         self.dirty()
-        full = run(self.repo, "describe", "--tags", "--always", "--dirty")
+        full = run(self.repo, "describe", "--tags", "--always", "--dirty", ABBREV)
         self.assertTrue(full.endswith("-dirty"))
         truncated = full[:MAX_LEN]
         self.assertFalse(truncated.endswith("-dirty"), "precondition: truncation drops the flag")
@@ -166,12 +167,12 @@ class GateTest(unittest.TestCase):
     def test_a_short_describe_padded_past_the_limit_by_dirty_uses_the_fallback(self):
         # Clean describe fits, but "-dirty" pushes it over: the rule must switch
         # to the fallback in exactly that case, as CMake does.
-        tag = "v" + "1" * (MAX_LEN - len("-1-g1234567") - 2)
+        tag = "v" + "1" * (MAX_LEN - len("-1-g") - gate.ABBREV - 2)
         run(self.repo, "tag", tag)
         self.commit("two")
-        clean = run(self.repo, "describe", "--tags", "--always")
+        clean = run(self.repo, "describe", "--tags", "--always", ABBREV)
         self.dirty()
-        dirty_full = run(self.repo, "describe", "--tags", "--always", "--dirty")
+        dirty_full = run(self.repo, "describe", "--tags", "--always", "--dirty", ABBREV)
         if len(clean) > MAX_LEN or len(dirty_full) <= MAX_LEN:
             self.skipTest(f"could not construct the boundary case ({len(clean)}, {len(dirty_full)})")
         s = self.stamp()
@@ -182,13 +183,13 @@ class GateTest(unittest.TestCase):
     # ── the exact boundary (an off-by-one here is silent) ───────────────────
 
     def _tag_giving_describe_length(self, n):
-        # describe one commit past a tag = <tag> + "-1-g" + <7 hex> = tag + 11.
-        return "v" + "x" * (n - 11 - 1)
+        # describe one commit past a tag = <tag> + "-1-g" + <ABBREV hex>.
+        return "v" + "x" * (n - len("-1-g") - gate.ABBREV - 1)
 
     def test_a_describe_of_exactly_the_limit_is_kept_whole(self):
         run(self.repo, "tag", self._tag_giving_describe_length(MAX_LEN))
         self.commit("two")
-        full = run(self.repo, "describe", "--tags", "--always", "--dirty")
+        full = run(self.repo, "describe", "--tags", "--always", "--dirty", ABBREV)
         self.assertEqual(len(full), MAX_LEN, "precondition: exactly at the limit")
         self.assertEqual(self.stamp(), full)
         self.assertGatePasses(full)
@@ -196,7 +197,7 @@ class GateTest(unittest.TestCase):
     def test_a_describe_one_past_the_limit_falls_back(self):
         run(self.repo, "tag", self._tag_giving_describe_length(MAX_LEN + 1))
         self.commit("two")
-        full = run(self.repo, "describe", "--tags", "--always", "--dirty")
+        full = run(self.repo, "describe", "--tags", "--always", "--dirty", ABBREV)
         self.assertEqual(len(full), MAX_LEN + 1, "precondition: one past the limit")
         s = self.stamp()
         self.assertRegex(s, r"^[0-9a-f]{7,}$")
@@ -214,6 +215,40 @@ class GateTest(unittest.TestCase):
         self.dirty()
         self.assertEqual(self.stamp(), clean + "-dirty", "precondition")
         self.assertGateFails(clean, "stamps as")
+
+    # ── #872: the abbreviation length is not part of the stamp's identity ───
+
+    def test_the_expected_stamp_pins_twelve_hex_whatever_core_abbrev_says(self):
+        run(self.repo, "config", "core.abbrev", "8")
+        run(self.repo, "tag", "v1.5.0")
+        self.commit("two")
+        self.assertRegex(self.stamp(), r"^v1\.5\.0-1-g[0-9a-f]{12}$")
+
+    def test_a_stamp_taken_at_another_abbreviation_of_this_commit_passes(self):
+        # The #872 gate failure: the build stamped g388ea80 (8), the check
+        # computed g388ea80a (9) for the same commit.
+        run(self.repo, "tag", "v1.5.0")
+        self.commit("two")
+        for n in (7, 8, 9, 11):
+            with self.subTest(abbrev=n):
+                self.assertGatePasses(run(self.repo, "describe", "--tags", "--always", f"--abbrev={n}"))
+
+    def test_another_commits_hash_at_another_abbreviation_still_fails(self):
+        run(self.repo, "tag", "v1.5.0")
+        self.commit("two")
+        old = run(self.repo, "describe", "--tags", "--always", "--abbrev=9")
+        self.commit("three")
+        self.assertGateFails(old.replace("-1-g", "-2-g"), "stamps as")
+
+    def test_a_clean_stamp_at_another_abbreviation_from_a_dirty_checkout_fails(self):
+        run(self.repo, "tag", "v1.5.0")
+        self.commit("two")
+        clean9 = run(self.repo, "describe", "--tags", "--always", "--abbrev=9")
+        self.dirty()
+        self.assertGateFails(clean9, "stamps as")
+
+    def test_the_longest_expected_describe_with_dirty_fits_the_descriptor(self):
+        self.assertLessEqual(len("v1.5.1-123-g" + "f" * gate.ABBREV + "-dirty"), MAX_LEN)
 
     # ── release builds ───────────────────────────────────────────────────────
 

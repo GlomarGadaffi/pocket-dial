@@ -162,6 +162,10 @@ public:
 	// The user part of the Request-URI ("600" in "INVITE sip:600@host SIP/2.0");
 	// empty for a response, or a Request-URI with no sip: user part.
 	std::string_view getRequestUriUser() const { return extractNumber(_startLine); }
+	// Replace the Request-URI of a request in place, keeping its method and SIP
+	// version (#754). False, and nothing changed, on a response or a start line
+	// that is not "<METHOD> <uri> SIP/2.0".
+	bool setRequestUri(std::string_view uri);
 	// Pins the SDP payload list to "0 8 101".
 	//
 	// DEPRECATED, and as of ISSUES.md #139 called from NO production path -- only
@@ -319,6 +323,13 @@ public:
 	// application/sdp, ignoring case and parameters. Unlike hasSdp(), which
 	// scans the raw datagram, an Accept line or a body part does not count.
 	bool hasSdpContentType() const;
+	// #838, #845: leaves exactly one Content-Type, naming SDP (RFC 3261 §20.15),
+	// on a copied request that is about to carry an SDP. The first
+	// Content-Type (or c:) line is kept if its media type is application/sdp
+	// (any case, any parameters) and rewritten in place if not; any later one
+	// is dropped; with none, one is added. Only these lines count, as in
+	// hasSdpContentType().
+	void setSdpContentType();
 	// Full `Authorization:` request-header line (or empty if absent). The value
 	// is fed to SipDigest::parseAuthorization, which tolerates the header name.
 	std::string_view getAuthorization() const;

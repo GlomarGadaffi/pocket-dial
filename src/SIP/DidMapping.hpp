@@ -65,6 +65,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 class DidMapping
@@ -122,6 +123,17 @@ public:
 	// (also "" for an empty `did`). See the BOUNDARY comment at the top of
 	// this file for who calls this and when.
 	std::string extensionForDid(const std::string& did) const;
+
+	// Issue #826: true if any DID maps to `extension` (zero-touch must not hand
+	// a new phone someone's inbound number). Linear over _count; no heap.
+	bool isTarget(std::string_view extension) const
+	{
+		for (size_t i = 0; i < _count; ++i)
+		{
+			if (_entries[i].extension == extension) return true;
+		}
+		return false;
+	}
 
 	size_t size() const { return _count; }
 	static constexpr size_t capacity() { return kMaxMappings; }

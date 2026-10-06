@@ -230,6 +230,69 @@ fork, no firmware-stack changes. Combined with §0.1, the installer is typing th
 phone they have *already* configured by hand, so the marginal effort saved is real but
 modest: it is the codec/NAT/expiry/line block that gets standardized, not the bootstrap.
 
+### 1.4 SIP Plug-and-Play (Issue #826): discovery shipped, answering limited to adopted phones
+
+A factory-fresh phone with PnP on multicasts a `SUBSCRIBE` to `224.0.1.75:5060` with
+`Event: ua-profile;profile-type="device";vendor=…;model=…;version=…` and its MAC in the
+From user (`MAC%3a0004132E08B4`). A server answers `200 OK`, then a `NOTIFY` with
+`Content-Type: application/url` whose body is the URL the phone stores and fetches. Unlike
+Option 66 (§1.1), this needs no DHCP server change: only a socket.
+
+**What ships:**
+
+* `PnpProfile` (`src/SIP/PnpProfile.{hpp,cpp}`) parses the request and writes the 200 and
+  the NOTIFY. Pure; host-tested (`tests/PnpProfile_test.cpp`).
+* `PnpResponder` (`src/SIP/PnpResponder.{hpp,cpp}`) holds the policy and a 16-slot table
+  of phones heard. `SipServer::pollPnp()` feeds it from the board's 1 s SIP loop: a
+  non-blocking socket bound to the **group address** (never `0.0.0.0`, which could take
+  the main SIP socket's unicast traffic in lwIP) and joined with `IP_ADD_MEMBERSHIP`.
+  Replies go out through the main SIP socket. No task of its own; no allocation per
+  datagram (`PnpResponder.DatagramPathAllocatesNothing`).
+* **Mode**, persisted as NVS `pbxcfg`/`pnp_mode`, set with `POST /api/pnp`:
+
+| Mode | Socket | Records phones | Answers |
+| :--- | :--- | :--- | :--- |
+| `off` (default) | closed | no | no |
+| `discover` | open | yes | no |
+| `provision` | open | yes | only a **snom or Yealink** whose MAC is **adopted** (§0.1) with an extension that passes the same AOR/identity gates as `findProvisioningInfo()`, or (zero-touch window open, §3.1) one that would be assigned an extension right now |
+
+  Off by default because the first answer wins: an always-on responder would capture any
+  PnP phone on a LAN shared with another PBX. A phone this board cannot serve gets
+  silence, so another server can still answer it: a phone handed a URL that 404s stores
+  it anyway and stops looking.
+* Only sources on the board's own subnet are recorded or answered; the NOTIFY goes to the
+  datagram's source address only; replies are token-bucketed (4, one back every 2 s); a
+  phone gets at most one NOTIFY per 30 s, though a retransmitted SUBSCRIBE still gets its
+  200 (same To tag, derived from the Call-ID).
+* **URL handed out:** snom: `http://<ip>/config/snom<mac>.xml` (snom fetches it as given);
+  Yealink: `http://<ip>/config/` (the phone appends its own `<mac>.cfg`). The MAC is
+  lowercased, so it passes §0.2's shape check. Other vendors are listed but not answered.
+
+**Not yet:** zero-touch assignment of an extension to a phone that has never registered
+(Issue #826 part B). Until then `provision` re-provisions known phones (factory-reset
+recovery), and `discover` shows what is on the network.
+
+**Bench, 2026-10-02 on `.195` (Waveshare W5500), snom370 8.7.5.48 at `.155`:**
+
+* **Board receive: works.** `/api/pnp` showed the group socket open (`listening`, no errno,
+  netmask `255.255.255.0`), and datagrams sent to `224.0.1.75:5060` from another LAN host
+  were counted. The W5500 blocks IPv4 multicast by default (`W5500_SMR_MAC_BLOCK_MCAST`),
+  but lwIP's IGMP join reaches it through esp-netif's MAC-filter callback and unblocks it.
+* **Answer path: works.** A replay of the snom's real SUBSCRIBE was parsed, listed and
+  answered (200 + NOTIFY), and `/config/snom<mac>.xml` served the 1001 config.
+* **The snom accepts the file.** Pointed at that URL, it logged `code: 200`, "found xml
+  style settings" and "last prov successful:1"; line 1 stayed registered. It also asks for
+  `<url-stem>-<MAC>.xml` (snom's per-MAC companion file) and a firmware page under the
+  same directory; both 404 here, harmlessly.
+* **What a snom actually sends** (its own SIP trace): source port **1053**, not 5060; a Via
+  with `rport` and no `branch`; Request-URI host `lan`. Five SUBSCRIBEs 0.5 s apart, then
+  it gives up and moves to its next setting server, so an answer must come within ~2.5 s.
+  The 1 s poll fits, but not by much. `tests/PnpProfile_test.cpp` carries the capture.
+* **Not yet seen end to end:** the snom's own multicast never reached the board on this
+  LAN, though another host's did. Something on the path between the phone and the board
+  (a switch with IGMP snooping, or a bridge) drops it. Check the network before blaming
+  the board: `/api/pnp`'s `rx.datagrams` stays 0 when nothing arrives.
+
 ## 2. The endpoint
 
 ### 2.1 URL scheme
@@ -241,6 +304,7 @@ GET /config/{mac}-phone.cfg      # Polycom per-phone XML
 GET /config/000000000000.cfg     # Polycom master/generic XML
 GET /config/spa{mac}.cfg         # Cisco SPA macro-expanded flat-profile XML ($MA)
 GET /config/spa{model}.cfg       # Cisco SPA model-keyed (Profile_Rule bootstrap)
+GET /config/snom{mac}.xml        # snom XML (Issue #826); {mac} may be upper or lower case
 ```
 
 `{mac}` is 12 **lowercase** hex digits, no separators (§0.2).
@@ -424,6 +488,55 @@ Consequences:
   and `GET /api/registrar` show that row as `shared` (it was unlocked) or `locked` (#882).
 * **`forget` re-arms adoption.** `POST /api/registrar/device` with `action=forget` removes the
   record; a later REGISTER in Learn mode re-learns it (`Registrar.hpp:83-85`).
+
+### 3.1 Zero-touch assignment (Issue #826 part B)
+
+An admin opens a window with `POST /api/zero-touch` (`open=1&lo=2001&hi=2099&minutes=30`).
+While it is open, a config fetch for an **unknown** MAC is handed the next free extension in
+the range, and the phone registers as it. Everything else on this page is unchanged: a known
+MAC still gets the extension it last registered as.
+
+**Who gets one.** A fetch on any MAC-keyed path (`<mac>.cfg`, `cfg<mac>.xml`,
+`<mac>-phone.cfg`, `spa<mac>.cfg`, `snom<mac>.xml`) assigns only when **all** of these hold:
+
+* the window is open (it closes itself after `minutes`, 1-120; a reboot closes it too, since
+  it is never persisted);
+* the registrar is in **Learn** mode (Secure needs a password the board cannot provision, §4.1);
+* the TCP peer's **ARP entry is the requested MAC**, so a fetch can only claim the fetching
+  host's own MAC (an ARP miss refuses);
+* the #515 adoption token bucket has a token (4, one back every 15 s, shared with Learn);
+* fewer than **4 unclaimed** rows exist, and the table has room or an evictable row;
+* a free extension exists in `lo`-`hi`.
+
+Every refusal is the same `404` as an unknown MAC (§4.3). `GET /api/zero-touch` says why
+instead: `free` (extensions assignable right now; a dial-plan pattern that swallows the range
+shows as 0), `lastRefusal` and `refusals`. PnP's `provision` mode (§1.4)
+answers an unknown MAC only when the same checks pass at that moment, so a phone is never
+pointed at a URL that 404s.
+
+**Which extension.** The lowest number in the range that no device row holds, nothing is
+registered as, and nothing routes elsewhere: reserved, emergency and PSTN-shaped numbers, page
+zones (980-989), park orbits (700-709), ring-group pilots, and anything the dial plan matches
+(`RequestsHandler::isRoutedElsewhere()`); and nothing that already **belongs to someone**:
+voicemail or DND on, a forward set, a DID mapped to it, or a stored SIP secret
+(`hasExtensionState()`). `lo` and `hi` are 3-6 digits, no leading zero,
+`lo <= hi`, fewer than 500 apart.
+
+**The row.** An assignment is an ordinary Learned row, created **locked**, so another MAC
+registering that extension is refused (`Extension Locked To Another Device`), and
+**assigned** (unclaimed) until its MAC first registers. An unclaimed row is evicted before
+any other row, so unauthenticated fetches can never fill the table with rows nothing may
+evict. The cap counts only rows from the **current** window, and opening a new window drops
+every row an earlier one left unclaimed: phones that fetched and never registered cannot hold
+zero-touch shut. (A late one is not lost: its extension is free again, so its REGISTER is
+adopted by ordinary Learn.) A row is claimed only when its phone registers **that**
+extension. The same MAC always gets the same extension. `/api/registrar` shows
+`"assigned": true` until the phone registers. "Forget learned" clears unclaimed rows too.
+The flag is bit 2 of the persisted row flags; firmware older than #826 reads it as a plain
+locked row.
+
+**Not allocation-free.** An assignment adds a map node and rewrites the NVS device blob, like
+any Learn adoption. It happens once per phone, on the HTTP task.
 
 ## 4. Security: what the config actually exposes
 

@@ -56,11 +56,12 @@ class AnchorEmergencySlotWaitTest(unittest.TestCase):
         # While the wait runs, _outboundPending > 0 makes handleWsEvent() ignore an
         # upsert for this unkeyed leg, and Telephony does not repeat a Connected
         # one: without a re-check, a 911 answered during the wait never fires
-        # Answered. Only a prime that waited queues it (an ordinary call is as before).
+        # Answered. Only a prime that waited queues it (an ordinary call is as before),
+        # or one #349 adopted after the list reads, which hid its upserts the same way.
         tail = self.make_call[self.make_call.index("while (pd::emergencySlotRetryContinues("):]
-        self.assertRegex(tail, r"if \(primed && waitedUs > 0\)",
+        self.assertRegex(tail, r"if \(primed && \(waitedUs > 0 \|\| adopted\)\)",
                          "the re-check must be gated on a prime that actually waited")
-        recheck = tail[tail.index("if (primed && waitedUs > 0)"):]
+        recheck = tail[tail.index("if (primed && (waitedUs > 0 || adopted))"):]
         self.assertIn("upsetInFlight.exchange(true", recheck,
                       "it must take the same single-flight claim handleWsEvent() takes")
         self.assertIn("item->kind       = WsWork::Upset;", recheck)
@@ -75,7 +76,7 @@ class AnchorEmergencySlotWaitTest(unittest.TestCase):
         # ROUTED was sent. makeCall() drops the leg while _outboundPending still hides
         # its upserts, and fails: the engine answers 503 and reports NOT ROUTED.
         tail = self.make_call[self.make_call.index("all %d call slots busy"):]
-        branch = tail[:tail.index("if (primed && waitedUs > 0)")]
+        branch = tail[:tail.index("if (primed && (waitedUs > 0 || adopted))")]
         self.assertRegex(branch, r"if \(emergency\)\s*\{", "an unprimed 911/933 must take a branch of its own")
         self.assertIn("dropCall(ownLeg);", branch,
                       "the 3CX leg must be dropped, or it reaches the PSAP with nobody on it")

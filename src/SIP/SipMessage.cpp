@@ -353,6 +353,17 @@ void SipMessage::setHeader(std::string value)
 	_startLine = std::move(value);
 }
 
+bool SipMessage::setRequestUri(std::string_view uri)
+{
+	const size_t sp1 = _startLine.find(' ');
+	if (sp1 == std::string::npos) return false;
+	if (std::string_view(_startLine).substr(0, sp1) == "SIP/2.0") return false;   // a response
+	const size_t sp2 = _startLine.find(' ', sp1 + 1);
+	if (sp2 == std::string::npos) return false;
+	_startLine.replace(sp1 + 1, sp2 - sp1 - 1, uri.data(), uri.size());
+	return true;
+}
+
 size_t SipMessage::findHeaderIndex(std::string_view fullName, std::string_view compactName) const
 {
 	for (size_t i = 0; i < _headerLines.size(); ++i)
@@ -1001,6 +1012,36 @@ bool SipMessage::hasSdpContentType() const
 		if ((iequal(name, "content-type") || iequal(name, "c")) && isSdpMediaType(headerValueOf(line))) return true;
 	}
 	return false;
+}
+
+void SipMessage::setSdpContentType()
+{
+	size_t first = std::string::npos;
+	for (size_t i = 0; i < _headerLines.size();)
+	{
+		const std::string_view name = headerNameOf(_headerLines[i]);
+		if (!iequal(name, "content-type") && !iequal(name, "c"))
+		{
+			++i;
+		}
+		else if (first == std::string::npos)
+		{
+			first = i++;
+		}
+		else
+		{
+			if (_spareHeaderLines.size() < SipLimits::kMaxHeaderLines) _spareHeaderLines.push_back(std::move(_headerLines[i]));
+			_headerLines.erase(_headerLines.begin() + static_cast<long>(i));
+		}
+	}
+	if (first == std::string::npos)
+	{
+		addHeader("Content-Type", "application/sdp");
+	}
+	else if (!isSdpMediaType(headerValueOf(_headerLines[first])))
+	{
+		composeHeaderLine(_headerLines[first], "Content-Type", "application/sdp");
+	}
 }
 
 const char* SipMessage::headerVerdictText(HeaderVerdict v)

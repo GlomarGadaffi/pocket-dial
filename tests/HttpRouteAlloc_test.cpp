@@ -94,6 +94,8 @@ namespace
 		{"GET /api/config/export",      "GET", "/api/config/export", "", true},
 		{"GET /api/ap-security",        "GET", "/api/ap-security", "", true},
 		{"GET /api/registrar",          "GET", "/api/registrar", "", true},
+		{"GET /api/pnp",                "GET", "/api/pnp", "", true},   // #826
+		{"GET /api/zero-touch",         "GET", "/api/zero-touch", "", true},   // #826 part B
 		{"GET /api/admin/status",       "GET", "/api/admin/status", "", true},
 		{"GET /api/ota/status",         "GET", "/api/ota/status", "", true},
 		{"POST /api/dnd",               "POST", "/api/dnd", "ext=101&enabled=1", true},
@@ -120,6 +122,12 @@ namespace
 		{"GET /api/syslog", 4}, {"GET /api/trunk", 4}, {"GET /api/moh", 4},
 		{"GET /api/coredump/info", 4}, {"GET /api/e911-config", 4},
 		{"GET /api/registrar", 4},
+		// #826: both allocations happen before sendApiPnp() runs (measured with
+		// its body stubbed to a fixed reply: still 2), i.e. in requireAdmin(),
+		// which copies the session token into a std::string. The handler itself
+		// writes into a leased fixed buffer.
+		{"GET /api/pnp", 2},
+		{"GET /api/zero-touch", 2},   // #826 part B: same two, requireAdmin(); the body is a fixed buffer
 		{"GET /api/email", 5}, {"GET /api/admin/status", 5},
 		{"GET /api/ap-security", 6}, {"POST /api/dialplan", 9}, {"GET /api/config/export", 10},
 		{"GET /api/telephony-config", 14},

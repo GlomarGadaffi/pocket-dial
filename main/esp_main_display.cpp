@@ -452,6 +452,7 @@ static void sip_server_task(void *pvParameters) {
 
     while (1) {
         srv->getHandler().tick();
+        srv->pollPnp();   // Issue #826: SIP PnP (no-op while PnP is off)
         // Fed once per 30 ms loop, far inside the 5 s default TWDT timeout.
         // Harmless no-op if the subscription above failed.
         if (wdtErr == ESP_OK) {

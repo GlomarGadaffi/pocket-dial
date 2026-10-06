@@ -55,7 +55,8 @@ namespace
 	}
 
 	std::shared_ptr<SipMessage> makeRegister(const std::string& ext, const std::string& srcIp,
-	                                         const std::string& callId)
+	                                         const std::string& callId,
+	                                         const std::string& contactParams = "")
 	{
 		const std::string port = std::to_string(kPhonePort);
 		std::string raw =
@@ -65,7 +66,7 @@ namespace
 			"To: <sip:" + ext + "@server>\r\n"
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 1 REGISTER\r\n"
-			"Contact: <sip:" + ext + "@" + srcIp + ":" + port + ">;expires=3600\r\n"
+			"Contact: <sip:" + ext + "@" + srcIp + ":" + port + contactParams + ">;expires=3600\r\n"
 			"Content-Length: 0\r\n\r\n";
 		return RequestsHandler::getMessageFromPool(raw, addrFor(srcIp));
 	}
@@ -267,4 +268,23 @@ TEST(RegisterBeepRouting, TheBeepNeverGoesOutInTheRegistersOwnPass)
 	// Once its delay has passed (forced here), it does go out.
 	handler.fireRegisterBeepsForTest();
 	EXPECT_FALSE(firstMatching(sent, "INVITE sip:460@").empty()) << "the beep was lost, not deferred";
+}
+
+// Issue #856: the beep goes to the Contact the phone registered, parameters and
+// all (RFC 3261 §10.2.1). A Snom answers 404/481 without its ;line=.
+TEST(RegisterBeepRouting, TheBeepInviteCarriesTheRegisteredContactUriParams)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	handler.handle(makeRegister("461", "192.168.9.47", "reg-461", ";transport=udp;line=pd856x;x-pd=a1"));
+	handler.fireRegisterBeepsForTest();
+
+	const std::string beep = firstMatching(sent, "INVITE sip:461@");
+	ASSERT_FALSE(beep.empty()) << "no register-beep INVITE was sent";
+	EXPECT_EQ(beep.substr(0, beep.find("\r\n")),
+		"INVITE sip:461@192.168.9.47:5062;transport=udp;line=pd856x;x-pd=a1 SIP/2.0");
 }

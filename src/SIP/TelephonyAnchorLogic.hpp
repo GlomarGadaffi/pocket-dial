@@ -440,12 +440,94 @@ enum class OwnLegSource : uint8_t
 	MakecallResult,      // result.id in the makecall response
 	OwnPartyDn,          // the list fallback: the controllable leg whose party_dn is our source DN
 	FirstControllable,   // the list fallback: the first controllable leg with no slot
+	AdoptedAfterUnreadResponse,   // #349: a list pick after the makecall response went unread
 };
 
 // Only the makecall response's own id is held. A list-fallback pick can be a genuine
 // inbound leg that rang while the makecall was pending (it gets no slot then), and
 // nothing here defines party_dn, so such a leg is treated as on main.
-inline bool ownLegMayBeHeld(OwnLegSource s) { return s == OwnLegSource::MakecallResult; }
+//
+// #349's adopted leg is held: it is bound to the outbound call, so once its slot is
+// freed 3CX's upserts before the Remove would ring the route DN (the .244 phantom).
+// If the pick was in fact an inbound leg, that call was already taken as ours.
+inline bool ownLegMayBeHeld(OwnLegSource s)
+{
+	return s == OwnLegSource::MakecallResult || s == OwnLegSource::AdoptedAfterUnreadResponse;
+}
+
+// #349: makeCall()'s POST reached 3CX and no response was read, so 3CX may have placed
+// the call. On .244 it had (it named the leg in the response the probe threw away), and
+// one list read showing no leg was taken as "no call": a 503, while 3CX's leg rang the
+// far end, was answered and came back as a phantom inbound. So the list is read every
+// kUnreadAdoptPollMs until it shows a leg, whatever an earlier read answered, and no
+// read starts kUnreadAdoptWindowUs or later after the first. The window is bounded
+// because while it is open an unmatched upsert is ignored (#888). sinceFirstReadUs is
+// the time from the start of the first read to the end of the latest.
+// A 911/933 gets the same decision: adopted at the first read that shows its leg.
+inline constexpr int64_t kUnreadAdoptWindowUs = 4'000'000;
+inline constexpr int     kUnreadAdoptPollMs   = 400;
+
+enum class UnreadMakecallStep : uint8_t { Adopt, ReadAgain, GiveUp };
+
+inline UnreadMakecallStep unreadMakecallStep(bool legListed, int64_t sinceFirstReadUs)
+{
+	if (legListed) return UnreadMakecallStep::Adopt;
+	if (sinceFirstReadUs + int64_t{kUnreadAdoptPollMs} * 1000 < kUnreadAdoptWindowUs) return UnreadMakecallStep::ReadAgain;
+	return UnreadMakecallStep::GiveUp;
+}
+
+// #349 (#903 review): resolveOutboundLeg()'s verdict on one entry of the live list.
+// The pick rule is unchanged (direct_control true, an id, no slot: audit #76, #100).
+// The adopt reads also pass oursAlready for a leg the PBX dropped or still holds
+// from an earlier call (_droppedLegs, _ownLegs): 3CX lists it until its Remove, and
+// it is never the new call's leg. An unrelated inbound leg that appears in the window
+// still qualifies; nothing in the list tells it apart.
+enum class DirectControlField : uint8_t { True, False, Absent, NotBool };
+enum class ListLegVerdict : uint8_t { NotControllable, NoId, Claimed, OursAlready, Candidate };
+
+inline ListLegVerdict classifyListLeg(DirectControlField dc, bool hasId, bool slotClaimed, bool oursAlready)
+{
+	if (dc != DirectControlField::True) return ListLegVerdict::NotControllable;
+	if (!hasId) return ListLegVerdict::NoId;
+	if (slotClaimed) return ListLegVerdict::Claimed;
+	if (oursAlready) return ListLegVerdict::OursAlready;
+	return ListLegVerdict::Candidate;
+}
+
+// What one list read held, for the no-leg and adopt log lines: a direct_control
+// reject (by how the field looked) is told apart from a slot claim or an old leg.
+struct ListLegCounts
+{
+	int listed = 0;         // participant objects
+	int controllable = 0;   // direct_control true
+	int noId = 0;
+	int claimed = 0;
+	int oursAlready = 0;
+	int candidates = 0;
+	int dcFalse = 0;
+	int dcAbsent = 0;
+	int dcNotBool = 0;
+
+	void add(DirectControlField dc, ListLegVerdict v)
+	{
+		++listed;
+		switch (dc)
+		{
+			case DirectControlField::True:    ++controllable; break;
+			case DirectControlField::False:   ++dcFalse; break;
+			case DirectControlField::Absent:  ++dcAbsent; break;
+			case DirectControlField::NotBool: ++dcNotBool; break;
+		}
+		switch (v)
+		{
+			case ListLegVerdict::NoId:            ++noId; break;
+			case ListLegVerdict::Claimed:         ++claimed; break;
+			case ListLegVerdict::OursAlready:     ++oursAlready; break;
+			case ListLegVerdict::Candidate:       ++candidates; break;
+			case ListLegVerdict::NotControllable: break;
+		}
+	}
+};
 
 }  // namespace telephony
 

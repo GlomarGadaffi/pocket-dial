@@ -17,6 +17,9 @@ stamp this checkout should produce:
      too, so the two cannot disagree about when the fallback applies.
      Equality rather than "contains": this job restores a cached build/, and
      a plausible stamp from a stale build would pass a looser test.
+     #872: both sides pin --abbrev=12 (ABBREV), and a stamp whose -g<hash>
+     (or bare hash) has a different length is still the same stamp when
+     everything else is equal and its hash is a prefix of HEAD's full hash.
   4. A build sitting exactly on a release tag must not be -dirty. A release
      image that says "v1.6.0-dirty" is not v1.6.0.
 
@@ -27,6 +30,7 @@ offset 32, magic 0xABCD5432, with version as char[32] at +16.
 
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -36,6 +40,10 @@ APP_DESC_OFFSET = 32
 APP_DESC_MAGIC = 0xABCD5432
 APP_DESC_VERSION_FIELD = 32          # esp_app_desc_t.version is char[32]
 FALLBACKS = {"", "1", "unknown"}
+# #872: the same pin as cmake/FirmwareVersion.cmake's describe.
+ABBREV = 12
+# <describe up to and including "-g"><hash>[-dirty], or <hash>[-dirty].
+_STAMP_HASH = re.compile(r"^(?P<pre>.*-g|)(?P<hash>[0-9a-f]{7,40})(?P<dirty>-dirty)?$")
 
 MAX_LEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "..", "..", "cmake", "FirmwareVersionMaxLen.txt")
@@ -97,7 +105,7 @@ def git(repo, *args):
 
 def expected_version(repo, max_len):
     """The stamp cmake/FirmwareVersion.cmake produces for this checkout -- same rule."""
-    full = git(repo, "describe", "--tags", "--always", "--dirty")
+    full = git(repo, "describe", "--tags", "--always", "--dirty", f"--abbrev={ABBREV}")
     if full.returncode != 0 or not full.stdout.strip():
         fail(f"cannot describe this checkout to compare against: {full.stderr.strip()}")
     full = full.stdout.strip()
@@ -107,6 +115,17 @@ def expected_version(repo, max_len):
     if short.returncode != 0 or not short.stdout.strip():
         fail(f"cannot describe this checkout (hash form): {short.stderr.strip()}")
     return short.stdout.strip()
+
+
+def same_stamp(image, want, head):
+    """#872: equal, or equal but for the length of a hash that prefixes HEAD."""
+    if image == want:
+        return True
+    a, b = _STAMP_HASH.match(image), _STAMP_HASH.match(want)
+    if not a or not b or not head:
+        return False
+    return (a["pre"] == b["pre"] and a["dirty"] == b["dirty"]
+            and head.startswith(a["hash"]) and head.startswith(b["hash"]))
 
 
 def exact_release_tag(repo):
@@ -138,7 +157,8 @@ def check(bin_path, chosen_path=None, repo=None, max_len_path=MAX_LEN_FILE):
 
     if repo:
         want = expected_version(repo, max_len)
-        if v != want:
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+        if not same_stamp(v, want, head):
             fail(f"the image says '{v}' but this checkout stamps as '{want}' "
                  f"(limit {max_len} chars): a stale build directory, a build of a different "
                  f"commit, or a build that modified a tracked file")

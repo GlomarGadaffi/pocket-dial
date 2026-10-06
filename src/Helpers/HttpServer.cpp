@@ -1346,6 +1346,34 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 			sendApiRegistrarDevice(clientSock, req.body);
 		}
 	}
+	else if (req.method == "GET" && req.path == "/api/pnp")
+	{
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiPnp(clientSock);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/pnp")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiPnpSet(clientSock, req.body);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/api/zero-touch")
+	{
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiZeroTouch(clientSock);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/zero-touch")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiZeroTouchSet(clientSock, req.body);
+		}
+	}
 	else if (req.method == "POST" && req.path == "/api/registrar/forget-learned")
 	{
 		// #515: one action to clear a flood of Learned adoptions; Secured
@@ -3057,6 +3085,19 @@ HttpServer::ProvisioningPathType HttpServer::parseProvisioningPath(
 		if (is12LowerHex(mac)) { outKey = mac; return ProvisioningPathType::CiscoSpaMac; }
 	}
 
+	// 4a. snom: snom<12 hex>.xml (20 chars, Issue #826). The PnP NOTIFY hands a
+	// snom this URL with the MAC already lowercased, but a snom's own {mac}
+	// template expands to UPPERCASE, so an admin-typed setting_server URL arrives
+	// that way: accept either case here and key the lookup on the lowercase form.
+	if (filename.size() == 20 && filename.compare(0, 4, "snom") == 0 &&
+	    filename.compare(16, 4, ".xml") == 0)
+	{
+		std::string mac = filename.substr(4, 12);
+		std::transform(mac.begin(), mac.end(), mac.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (is12LowerHex(mac)) { outKey = mac; return ProvisioningPathType::Snom; }
+	}
+
 	// 5. Cisco SPA model-keyed: spa<model>.cfg (e.g. spa504g.cfg)
 	if (filename.size() > 7 && filename.compare(0, 3, "spa") == 0 &&
 	    filename.compare(filename.size() - 4, 4, ".cfg") == 0)
@@ -3151,8 +3192,29 @@ void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
 		return;
 	}
 
-	// 3. MAC-keyed provisioning paths (Yealink, Grandstream, PolycomPhone, CiscoSpaMac)
+	// 3. MAC-keyed provisioning paths (Yealink, Grandstream, PolycomPhone, CiscoSpaMac, Snom)
 	auto info = handler ? handler->findProvisioningInfo(key) : std::nullopt;
+	if (!info && handler != nullptr)
+	{
+		// Issue #826 part B: zero-touch. An unknown MAC may be assigned the next
+		// free extension, but only for the host that IS that MAC: the TCP peer's
+		// ARP entry must name it, so a fetch can never claim someone else's.
+		// Every refusal (no window, wrong MAC, ARP miss, no token, no room, no
+		// free extension) is the same 404 as an unknown MAC (THREAT_MODEL 4.3).
+		bool verified = false;
+		sockaddr_in peer{};
+		peer.sin_family = AF_INET;
+		if (!req.clientIp.empty() && inet_pton(AF_INET, req.clientIp.c_str(), &peer.sin_addr) == 1)
+		{
+			const auto peerMac = ArpLookup::pdLookupMac(peer);
+			verified = peerMac.has_value() && ArpLookup::toHex12(*peerMac) == key;
+		}
+		std::string assigned;
+		if (handler->autoAssign(key, verified, assigned))
+		{
+			info = handler->findProvisioningInfo(key);
+		}
+	}
 	if (!info)
 	{
 		send404(sock);
@@ -3173,6 +3235,10 @@ void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
 	else if (type == ProvisioningPathType::CiscoSpaMac)
 	{
 		cfg = provisioning::ciscoSpaConfigFor(info->extension, activeIp, 5060, info->authRequired);
+	}
+	else if (type == ProvisioningPathType::Snom)
+	{
+		cfg = provisioning::snomConfigFor(info->extension, activeIp, 5060, info->authRequired);
 	}
 	else // ProvisioningPathType::Yealink (/config/<mac>.cfg)
 	{
@@ -4696,6 +4762,7 @@ void HttpServer::sendApiRegistrar(int sock)
 		     << "\",\"online\":" << (d.online ? "true" : "false")
 		     << ",\"locked\":" << (d.locked ? "true" : "false")
 		     << ",\"shared\":" << (d.shared ? "true" : "false")
+		     << ",\"assigned\":" << (d.assigned ? "true" : "false")   // #826: zero-touch, unclaimed
 		     << "}";
 	}
 	json << "]}";
@@ -4749,6 +4816,165 @@ void HttpServer::sendApiRegistrarSet(int sock, const std::string& body)
 
 	handler->setRegistrarMode(mode);
 	sendApiRegistrar(sock);
+}
+
+// Issue #826. Written into a leased /api/status buffer with JsonOut: no heap,
+// and the device table is visited in place rather than copied to this stack.
+void HttpServer::sendApiPnp(int sock)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 200, "OK", "application/json",
+		             "{\"attached\":false,\"mode\":\"unknown\",\"devices\":[]}");
+		return;
+	}
+	std::atomic<bool>* busy = nullptr;
+	char* buf = leaseStatusBuf(busy);
+	if (buf == nullptr)
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 503, "Service Unavailable", "application/json", "{\"error\":\"busy\"}");
+		return;
+	}
+	struct Release
+	{
+		std::atomic<bool>* f;
+		~Release() { f->store(false, std::memory_order_release); }
+	} release{busy};
+	JsonOut out{buf, (std::min)(_statusCap, kStatusBufBytes)};
+	PnpResponder& pnp = handler->pnp();
+	out.s("{\"attached\":true,\"mode\":\"").s(PnpResponder::modeName(pnp.mode())).s("\"");
+	{
+		const PnpResponder::Counters c = pnp.counters();
+		std::array<char, 16> mask{};
+		in_addr m{};
+		m.s_addr = pnp.netmask();
+		if (inet_ntop(AF_INET, &m, mask.data(), mask.size()) == nullptr) mask[0] = '\0';
+		out.s(",\"listening\":").b(pnp.listening()).s(",\"socketErrno\":").n(pnp.socketErrno());
+		out.s(",\"netmask\":\"").s(mask.data()).s("\",\"rx\":{\"datagrams\":").n(c.datagrams);
+		out.s(",\"offSubnet\":").n(c.offSubnet).s(",\"notPnp\":").n(c.notPnp);
+		out.s(",\"answered\":").n(c.answered).s("}");
+	}
+	out.s(",\"devices\":[");
+	bool first = true;
+	auto field = [](const std::array<char, pnp::kFieldCap>& a) {
+		return std::string_view(a.data(), ::strnlen(a.data(), a.size()));
+	};
+	pnp.forEachDevice([&](const PnpResponder::Device& d) {
+		std::array<char, 16> ip{};
+		in_addr a{};
+		a.s_addr = d.ip;
+		if (inet_ntop(AF_INET, &a, ip.data(), ip.size()) == nullptr) ip[0] = '\0';
+		out.s(first ? "{" : ",{");
+		first = false;
+		out.s("\"mac\":\"").s(std::string_view(d.id.mac.data(), pnp::kMacCap - 1));
+		out.s("\",\"vendor\":\"").e(field(d.id.vendor)).s("\",\"model\":\"").e(field(d.id.model));
+		out.s("\",\"version\":\"").e(field(d.id.version)).s("\",\"ip\":\"").s(ip.data());
+		out.s("\",\"seen\":").n(d.seen).s(",\"lastSeen\":").n(d.lastSeen);
+		out.s(",\"notified\":").b(d.notified).s("}");
+	});
+	out.s("]}");
+	if (out.full)
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json", "{\"error\":\"too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, out.len));
+}
+
+void HttpServer::sendApiPnpSet(int sock, const std::string& body)
+{
+	PnpResponder::Mode mode = PnpResponder::Mode::Off;
+	if (!PnpResponder::parseMode(getFormParam(body, "mode"), mode))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"mode must be one of: off, discover, provision\"}");
+		return;
+	}
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+		             "{\"error\":\"SIP engine not attached yet\"}");
+		return;
+	}
+	handler->pnp().setMode(mode);
+	sendApiPnp(sock);
+}
+
+bool HttpServer::parseExtensionNumber(const std::string& s, uint32_t& out)
+{
+	if (s.size() < 3 || s.size() >= static_cast<size_t>(POCKETDIAL_MIN_PSTN_AOR_DIGITS)) return false;
+	uint32_t n = 0;
+	for (char c : s)
+	{
+		if (c < '0' || c > '9') return false;
+		n = n * 10U + static_cast<uint32_t>(c - '0');
+	}
+	if (s[0] == '0') return false;   // "0123" would assign "123": refuse the ambiguity
+	out = n;
+	return true;
+}
+
+// Issue #826 part B. A small fixed body: no heap.
+void HttpServer::sendApiZeroTouch(int sock)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 200, "OK", "application/json", "{\"attached\":false,\"open\":false}");
+		return;
+	}
+	const RequestsHandler::AutoAssignState s = handler->autoAssignState();
+	std::array<char, 256> buf{};
+	const int n = std::snprintf(buf.data(), buf.size(),
+		"{\"attached\":true,\"open\":%s,\"lo\":%u,\"hi\":%u,\"secondsLeft\":%u,\"unclaimed\":%u,"
+		"\"free\":%u,\"lastRefusal\":\"%s\",\"refusals\":%u,\"learnOnly\":true}",
+		s.open ? "true" : "false", static_cast<unsigned>(s.lo), static_cast<unsigned>(s.hi),
+		static_cast<unsigned>(s.secondsLeft), static_cast<unsigned>(s.unclaimed),
+		static_cast<unsigned>(s.free), RequestsHandler::zeroTouchRefusalName(s.lastRefusal),
+		static_cast<unsigned>(s.refusals));
+	if (n <= 0 || static_cast<size_t>(n) >= buf.size())
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json", "{\"error\":\"too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf.data(), static_cast<size_t>(n)));
+}
+
+void HttpServer::sendApiZeroTouchSet(int sock, const std::string& body)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (handler == nullptr)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+		             "{\"error\":\"SIP engine not attached yet\"}");
+		return;
+	}
+	const std::string open = getFormParam(body, "open");
+	if (open == "0")
+	{
+		handler->closeAutoAssign();
+		sendApiZeroTouch(sock);
+		return;
+	}
+	uint32_t lo = 0;
+	uint32_t hi = 0;
+	uint32_t minutes = 0;
+	const std::string minutesText = getFormParam(body, "minutes");
+	bool ok = open == "1" && parseExtensionNumber(getFormParam(body, "lo"), lo) &&
+		parseExtensionNumber(getFormParam(body, "hi"), hi) && !minutesText.empty() && minutesText.size() <= 3;
+	for (char c : minutesText) ok = ok && c >= '0' && c <= '9';
+	if (ok) minutes = static_cast<uint32_t>(std::strtoul(minutesText.c_str(), nullptr, 10));
+	if (!ok || !handler->openAutoAssign(lo, hi, minutes))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"open=1 needs lo and hi (3-6 digits, lo <= hi, fewer than 500 apart) "
+		             "and minutes (1-120); open=0 closes\"}");
+		return;
+	}
+	sendApiZeroTouch(sock);
 }
 
 void HttpServer::sendApiRegistrarDevice(int sock, const std::string& body)

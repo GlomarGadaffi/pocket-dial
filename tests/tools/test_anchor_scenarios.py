@@ -38,6 +38,7 @@ from fake_pbx import FakePbx  # noqa: E402
 from sip_agent import SipMsg, rand_hex, tag_of, uri_of, user_of  # noqa: E402
 
 FAR = "15550104242"            # a fictional far end; never in any output or result
+FAR2 = "15550107373"           # #893: a second line on the same fictional phone
 PIN = "Pin-Secret-7731"
 TENANT = "acme-test.3cx.us"
 CLIENT_ID = "client-XYZ123"
@@ -503,6 +504,49 @@ class RefusalTest(unittest.TestCase):
                 os.chmod(path, 0o600)
                 self.assertEqual(an.load_far_end(env), (FAR, "file"))
 
+    def test_the_far_end_file_may_hold_two_lines_never_more_never_the_same_twice(self):
+        # #893: desmo's second line on the same phone; x4 alternates them
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "far")
+            env = {"PD_ANCHOR_FAR_END_FILE": path}
+            ok = lambda p: os.stat_result((0o100600, 0, 0, 1, getattr(os, "getuid", lambda: 0)(), 0, 0, 0, 0, 0))
+            for body, want in (("%s\n%s\n" % (FAR, FAR2), (FAR, FAR2)), ("# one\n%s\n" % FAR, (FAR,))):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(body)
+                self.assertEqual(an.load_far_ends(env, stat_fn=ok, posix=True), (want, "file"))
+            self.assertEqual(an.load_far_end(env, stat_fn=ok, posix=True), (FAR, "file"))
+            for body, needle in (("%s\n%s\n15550109999\n" % (FAR, FAR2), "two on separate lines"),
+                                 ("%s\n+%s\n" % (FAR, FAR), "the same number twice")):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(body)
+                with self.assertRaises(an.Refused) as cm:
+                    an.load_far_ends(env, stat_fn=ok, posix=True)
+                self.assertIn(needle, str(cm.exception))
+                for s in (FAR, FAR2):
+                    self.assertNotIn(s, str(cm.exception))
+
+    def test_the_second_far_end_is_refused_like_the_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "far")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("%s\n911\n" % FAR)
+            os.chmod(path, 0o600)
+            out = self.refused(cli(), base_env(PD_ANCHOR_FAR_END=None, PD_ANCHOR_FAR_END_FILE=path),
+                               "emergency or never-dial")
+            self.assertNotIn(FAR, out)
+
+    def test_the_cdr_guard_accepts_either_far_end_and_never_echoes_a_number(self):
+        rows = [{"callee": FAR}, {"callee": "+" + FAR2}, {"callee": "517"}, {"callee": ""}]
+        problems = an.cdr_callee_problems(rows, (FAR, FAR2))
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("CDR row 3", problems[0])
+        self.assertIn("participant id", problems[0])
+        self.assertIn("CDR row 4", problems[1])
+        for p in problems:
+            for s in (FAR, FAR2, "517"):
+                self.assertNotIn(s, p)
+        self.assertEqual(len(an.cdr_callee_problems(rows[:2], (FAR,))), 1, "one far end: the other line is not it")
+
     def test_a_real_run_needs_an_expected_version(self):
         self.refused(cli(), base_env(), "no --expect-version")
         rc, out = run_main(cli("--dry-run"), base_env(), http=NoNetwork())
@@ -753,7 +797,9 @@ class FakeBoard(FakePbx):
         self.upset_delay_s = 0.0          # the Upset line comes this long after the own-leg line
         self.no_upset_calls = set()       # call indexes that never log an Upset line
         self.no_leg_calls = set()         # call indexes whose makecall response never comes (no own-leg line)
+        self.diverted_calls = set()       # #893: call indexes whose far end's audio opens with no Upset line
         self.drop_delay_s = 0.0           # a CANCEL that beat the leg: its drop follows the leg by this long
+        self.cancel_drop_delay_s = 0.0    # #892: a CANCEL of a live leg: its drop follows the CANCEL by this long
         self.drop_counts = {}             # call index -> number of drop lines (default 1)
         self.drop_failed_calls = set()    # call indexes whose drop also logs a failure line
         self.inbound_calls = set()        # call indexes whose leg is announced "Inbound call on DN" after its drop
@@ -785,9 +831,9 @@ class FakeBoard(FakePbx):
                 on_response=lambda r: None)
 
     def _on_invite(self, req, addr):
-        if user_of(req.ruri) != FAR or tag_of(req.get("to")):
+        if user_of(req.ruri) not in (FAR, FAR2) or tag_of(req.get("to")):
             return super()._on_invite(req, addr)
-        self.invite_users.append(FAR)
+        self.invite_users.append(user_of(req.ruri))
         i, self.n_calls = self.n_calls, self.n_calls + 1
         self.leg += 1
         leg, tag = str(self.leg), rand_hex(6)
@@ -833,6 +879,11 @@ class FakeBoard(FakePbx):
             self.log("TelephonyAnchor: startRxIfNeeded: rx task for %s still exiting -- not restarting "
                      "yet (#554)" % leg)
         c["leg_up"] = True
+        if i in self.diverted_calls:              # #893: voicemail answers; no Upset line ever comes
+            self.log("TelephonyAnchor: GET (Telephony->device) audio stream OPEN: https://%s/callcontrol/%s/"
+                     "participants/%s/stream" % (TENANT, self.route_dn, leg))
+            self.log("TelephonyAnchor: GET read: first chunk 512 bytes <- Telephony (%s)" % leg)
+            return
         if self.upset_status is not None and i not in self.no_upset_calls:
             if self.upset_delay_s > 0:
                 threading.Timer(self.upset_delay_s, self._upset_later, (c,)).start()
@@ -878,7 +929,10 @@ class FakeBoard(FakePbx):
         c["cancelled"] = True
         self._send(self._resp(c["req"], 487, "Request Terminated", to_tag=c["tag"]), c["addr"])
         if c.get("leg_up"):
-            self._drop(c)
+            if self.cancel_drop_delay_s > 0:
+                threading.Timer(self.cancel_drop_delay_s, self._drop_later, (c,)).start()
+            else:
+                self._drop(c)
         if self.reboot_after_call == c["i"]:
             self.uptime_base = -10**6
 
@@ -1208,6 +1262,74 @@ class RunTest(unittest.TestCase):
         self.assertEqual(len(self.calls()), 2, "the third call is never placed")
         self.assertEqual(len(self.board.invite_users), 2)
         self.assertIn("2 calls in a row had no ringing reference", out)
+
+    def test_x4_two_far_ends_alternate_per_call_and_neither_is_printed(self):
+        path = os.path.join(self.tmp.name, "far-ends")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("%s\n%s\n" % (FAR, FAR2))
+        os.chmod(path, 0o600)
+        rc, out = self.go(env=base_env(PD_ANCHOR_FAR_END=None, PD_ANCHOR_FAR_END_FILE=path))
+        os.remove(path)                  # the evidence scan below walks this directory
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.board.invite_users, [FAR, FAR2, FAR])
+        self.assertIn("two numbers, x4 alternates them per call", out)
+        self.assertNotIn(FAR2, out)
+        self.assert_no_secret_anywhere(out)
+        for d, _, files in os.walk(self.tmp.name):
+            for n in files:
+                if not n.endswith(".tar.gz"):
+                    with open(os.path.join(d, n), "rb") as fh:
+                        self.assertNotIn(FAR2.encode(), fh.read(), n)
+
+    def test_x4_a_diverted_call_has_its_own_bucket_and_verdict(self):
+        # #893: the audio stream opened (512 B first chunk) and no 'Dialing' Upset line came
+        self.board.diverted_calls = {1}
+        rc, out = self.go(overrides={"ref_timeout_s": 0.6})
+        self.assertEqual(rc, 3, out)
+        calls = self.calls()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.manifest["summary"]["buckets"], {"cancelled": 2, "diverted": 1})
+        self.assertTrue(calls[1]["audio_opened"])
+        self.assertEqual(calls[1]["ref_stage"], an.DIVERTED)
+        reasons = self.manifest["invalid_reasons"]
+        self.assertTrue(any("1 of 3 calls were diverted" in r and "call 2" in r for r in reasons), reasons)
+        self.assertFalse(any("had no ringing reference" in r for r in reasons), reasons)
+        self.assertEqual(self.manifest["fail_reasons"], [])
+
+    def test_x4_two_diverted_calls_in_a_row_stop_the_run_naming_the_diversion(self):
+        self.board.diverted_calls = {0, 1}
+        rc, out = self.go(overrides={"ref_timeout_s": 0.5, "calls": 3})
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(len(self.calls()), 2)
+        self.assertIn("2 calls in a row were diverted", out)
+        self.assertNotIn("calls in a row had no ringing reference", out)
+
+    def test_x4_a_call_with_a_ringing_reference_and_audio_is_unchanged(self):
+        # the negative: an opened stream does not reclassify a call that had its reference
+        base = {"final": 487, "cancel_status": 200, "cancel_sent_ms": 900, "cancel_answered_ms": 950,
+                "final_ms": 960, "provisional": [[180, 5]], "bye": None}
+        self.assertEqual(an.x4_classify(dict(base, audio_opened=True)), ("cancelled", None))
+        self.assertEqual(an.x4_classify(dict(base, ref_timeout=True)), ("no_ringing_ref", None))
+        self.assertEqual(an.x4_classify(dict(base, ref_timeout=True, audio_opened=True)), ("diverted", None))
+
+    def test_x4_the_no_reference_stop_waits_for_the_last_legs_late_drop(self):
+        # #892: the stop fell on the last call and its drop line came ~0.3 s later
+        self.board.upset_status = None
+        self.board.cancel_drop_delay_s = 0.3
+        rc, out = self.go(overrides={"ref_timeout_s": 0.5, "calls": 3, "drop_wait_s": 2.0})
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(len(self.calls()), 2)
+        self.assertNotIn("never dropped", out)
+        self.assertEqual(self.manifest["fail_reasons"], [])
+        self.assertEqual(self.manifest["log_counters"]["dropped"], 2)
+
+    def test_x4_the_no_reference_stop_still_fails_a_leg_never_dropped(self):
+        self.board.upset_status = None
+        self.board.cancel_drop_delay_s = 0.3
+        self.board.undropped_calls = {1}
+        rc, out = self.go(overrides={"ref_timeout_s": 0.5, "calls": 3, "drop_wait_s": 1.0})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("leg 42 was initiated but never dropped", out)
 
     def test_x4_a_miss_between_hits_does_not_stop_the_run(self):
         self.board.no_upset_calls = {0, 2}
@@ -2157,13 +2279,15 @@ class ProbeRefusalTest(unittest.TestCase):
                      "past the", overrides={"get_max_attempts": 40})
 
     def test_the_harness_never_arms_for_an_emergency_far_end(self):
-        for far in ("911", "933", "9911", "112", "113", "15559110000", "+19335550100"):
-            run = mock.Mock(sc={"name": "x", "faults": ("makecall_read_fail",)}, far_end=far, probe=NoNetwork())
+        for ends in (("911",), ("933",), ("9911",), ("112",), ("113",), ("15559110000",), ("+19335550100",),
+                     (FAR, "911")):    # #893: the second line is checked too
+            run = mock.Mock(sc={"name": "x", "faults": ("makecall_read_fail",)}, far_end=ends[0], far_ends=ends,
+                            probe=NoNetwork())
             with self.assertRaises(an.run_soak.Abort) as cm:
                 an.AnchorRun.arm(run, "makecall_read_fail")
             self.assertEqual(cm.exception.verdict, "INVALID")
             self.assertIn("rule 5", cm.exception.reason)
-        run = mock.Mock(sc={"name": "x", "faults": ("get_status",)}, far_end=FAR, probe=NoNetwork())
+        run = mock.Mock(sc={"name": "x", "faults": ("get_status",)}, far_end=FAR, far_ends=(FAR,), probe=NoNetwork())
         with self.assertRaises(an.run_soak.Abort) as cm:
             an.AnchorRun.arm(run, "post_stream_fail")
         self.assertIn("did not pre-register", cm.exception.reason)

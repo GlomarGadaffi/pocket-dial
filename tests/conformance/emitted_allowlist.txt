@@ -13,5 +13,3 @@
 to-tag  *  400/INVITE->*,400/REGISTER->*,403/INVITE->*,404/INVITE->*,422/INVITE->*,480/INVITE->*,488/INVITE->*,489/SUBSCRIBE->*,503/INVITE->*  #702  item 11: stateless replies cloned from the request, no To tag
 cancel  ring_group  CANCEL->pc  #702  item 9: the broadcast-answer CANCEL keeps the INVITE's body and From/To
 dialog-orientation  park_pickup  ACK->pc  #453  pickup relays the caller's 2xx ACK to the cancelled target
-route  park_pickup  ACK->pc  #453  the same misrouted ACK
-route  attended_transfer,basic_call,blf,blind_transfer,callee_bye,early_media,glare,hold_update  ACK->pb,ACK->pc,re-INVITE->pb,UPDATE->pb  #754  relayed in-dialog requests keep the PBX's Request-URI

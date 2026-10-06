@@ -320,6 +320,10 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
 | [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster, each row with its `locked` and `shared` flags. |
 | [`/api/registrar`](#post-apiregistrar) | `POST` | High | Gated (+ `X-CSRF`) | Sets the admission mode (`learn`/`secure`; `open` is retired, #500). |
+| [`/api/pnp`](#get-apipnp) | `GET` | Low | Gated | SIP PnP mode and the phones heard on 224.0.1.75 (#826). |
+| [`/api/pnp`](#post-apipnp) | `POST` | Medium | Gated (+ `X-CSRF`) | Sets the PnP mode: `off`/`discover`/`provision` (#826). |
+| [`/api/zero-touch`](#get-apizero-touch) | `GET` | Low | Gated | The zero-touch extension assignment window (#826). |
+| [`/api/zero-touch`](#post-apizero-touch) | `POST` | High | Gated (+ `X-CSRF`) | Opens or closes the zero-touch window (#826). |
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/registrar/forget-learned`](#post-apiregistrarforget-learned) | `POST` | High | Gated (+ `X-CSRF`) | Forgets every `learned` device at once; `secured` ones stay (#515). |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
@@ -1362,6 +1366,65 @@ curl -s -X POST "http://$DEV/api/registrar" \
      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
      -d "mode=secure"
 ```
+
+### `GET /api/pnp`
+
+SIP Plug-and-Play (Issue #826, [PROVISIONING.md §1.4](PROVISIONING.md)): the mode and the
+phones heard on `224.0.1.75:5060` since boot (16 at most; the least recently seen is
+dropped first). Volatile: the list is not persisted.
+
+```json
+{
+  "attached": true,
+  "mode": "discover",
+  "listening": true, "socketErrno": 0, "netmask": "255.255.255.0",
+  "rx": { "datagrams": 4, "offSubnet": 0, "notPnp": 3, "answered": 1 },
+  "devices": [
+    { "mac": "0004132e08b4", "vendor": "snom", "model": "snom370", "version": "8.7.5.48",
+      "ip": "192.168.12.155", "seen": 3, "lastSeen": 5120, "notified": false }
+  ]
+}
+```
+
+* `lastSeen`: seconds since boot. `notified`: this board has sent it a NOTIFY.
+* `listening` / `socketErrno`: the group socket is open; else the errno of its last failed
+  open or join. `netmask`: what the same-subnet rule compares against.
+* `rx`: datagrams the group socket delivered, and why each was not answered (`offSubnet`,
+  `notPnp`) or that it was (`answered`). `datagrams` at 0 while phones boot means nothing
+  reaches the board: look at the network path (IGMP snooping), not the board.
+* `vendor`, `model`, `version` are what the phone claimed, with anything outside
+  `[A-Za-z0-9 ._+/-]` removed.
+
+### `POST /api/pnp`
+
+Sets the mode: `mode=off` (default; the group socket is closed), `mode=discover` (listen
+and record, never answer) or `mode=provision` (also answer phones this board can serve).
+Persisted. Returns the same body as `GET`.
+
+```bash
+curl -b cookies.txt -H "X-CSRF: $CSRF" -X POST http://192.168.4.1/api/pnp -d "mode=discover"
+```
+
+### `GET /api/zero-touch`
+
+The zero-touch assignment window (#826 part B, [PROVISIONING.md §3.1](PROVISIONING.md)).
+
+```json
+{ "attached": true, "open": true, "lo": 2001, "hi": 2099, "secondsLeft": 1740, "unclaimed": 1,
+  "free": 97, "lastRefusal": "unverified", "refusals": 2, "learnOnly": true }
+```
+
+`unclaimed`: rows assigned in this window to a MAC that has not registered yet (at most 4).
+`free`: extensions in the range assignable right now. `lastRefusal`/`refusals`: why the last
+fetch got a 404 while a window was open, and how many have (`unverified`: the fetching host's
+ARP MAC is not the MAC in the URL; `notLearn`, `noWindow`, `unclaimedCap`, `noFreeExtension`,
+`tableFull`, `rateLimited`).
+
+### `POST /api/zero-touch`
+
+`open=1&lo=2001&hi=2099&minutes=30` opens (or reopens) the window. `lo`/`hi` are 3-6 digits
+with no leading zero, `lo <= hi`, fewer than 500 apart. `minutes` is 1-120. `open=0`
+closes it. The window is never persisted. Returns the `GET` body, or `400` for invalid input.
 
 ### `POST /api/registrar/device`
 

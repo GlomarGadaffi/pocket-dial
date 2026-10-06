@@ -270,3 +270,29 @@ TEST(SipMessage, PreservesUnknownAndRepeatedHeadersOnMutation) {
     ASSERT_EQ(std::string(m.getCallID()), "Call-ID: guard-id");
     ASSERT_EQ(std::string(m.getContact()), "Contact: <sip:100@127.0.0.1:5060>");
 }
+
+// #754: setRequestUri() rewrites a request's Request-URI and nothing else. A
+// response, or a start line with no Request-URI, is left as it is. A URI longer
+// than the one it replaces is kept whole: the start line is a std::string.
+TEST(SipMessage, SetRequestUriRewritesOnlyARequestsUri)
+{
+	const std::string base = validBaseline();
+	const std::string rest = base.substr(base.find("\r\n"));
+	const std::string uri = "sip:100@192.168.31.10:1037;line=" + std::string(96, 'x');   // 128 B, SipClient's cap
+
+	SipMessage req(base, localhost());
+	EXPECT_TRUE(req.setRequestUri(uri));
+	EXPECT_EQ(std::string(req.getHeader()), "INVITE " + uri + " SIP/2.0");
+	const std::string out = req.toString();
+	EXPECT_EQ(out.substr(out.find("\r\n")), rest) << "headers and body untouched";
+	EXPECT_TRUE(req.setRequestUri("sip:1@h"));
+	EXPECT_EQ(std::string(req.getHeader()), "INVITE sip:1@h SIP/2.0");
+
+	for (const char* line : {"SIP/2.0 200 OK", "INVITE", "INVITE sip:100@server"})
+	{
+		SCOPED_TRACE(line);
+		SipMessage m(line + rest, localhost());
+		EXPECT_FALSE(m.setRequestUri("sip:1@h"));
+		EXPECT_EQ(std::string(m.getHeader()), line);
+	}
+}

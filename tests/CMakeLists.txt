@@ -87,6 +87,8 @@ add_executable(sip_parser_tests
     PerCallHeap_test.cpp
     # #838: a hostile many-line or long-line datagram must not grow a pool slot.
     HeaderLinePinning_test.cpp
+    # #845: an SDP answer built from a copy of the INVITE has one Content-Type.
+    SingleContentType_test.cpp
     # Issue #101(A)/(E): message-pool backpressure (refuse when spent; no heap
     # fallback since #409) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.
@@ -550,6 +552,10 @@ add_executable(sip_parser_tests
     # Zero-touch phone auto-provisioning (Issue #35): the pure Yealink config
     # builder + the HttpServer path-shape check + RequestsHandler wiring.
     ProvisioningConfig_test.cpp
+    # Issue #826: SIP PnP discovery (ua-profile SUBSCRIBE -> 200 + NOTIFY).
+    PnpProfile_test.cpp
+    # Issue #826 part B: zero-touch extension assignment.
+    ZeroTouchAssign_test.cpp
     # Part of #199: every message the PBX sends, recorded for tests/conformance.
     EmittedConformance_test.cpp
     # SIP digest-auth primitives + per-extension HA1 secret store. Both are
@@ -727,6 +733,9 @@ add_executable(sip_parser_tests
     ../src/SIP/SipMessageFactory.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp
+    # Issue #826: SIP PnP wire format + responder policy (pure, host-tested).
+    ../src/SIP/PnpProfile.cpp
+    ../src/SIP/PnpResponder.cpp
     ../src/SIP/RegisterBeeper.cpp
     ../src/SIP/SipTrunk.cpp
     ../src/SIP/TrunkResolver.cpp

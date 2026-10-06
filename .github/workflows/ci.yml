@@ -64,6 +64,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
 
+# Least privilege (CodeQL actions/missing-workflow-permissions): every job here
+# only checks out, caches, and up/downloads artifacts, none of which need more
+# than contents: read. No job comments, pushes, or writes releases.
+permissions:
+  contents: read
+
 jobs:
   # Job 1: Build and simulate the host desktop application, run static analysis and unit/smoke tests.
   # This serves as our simulation-based test suite, validating SIP and HTTP server logic on host runners.
