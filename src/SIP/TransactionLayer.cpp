@@ -583,10 +583,23 @@ void TransactionLayer::sweepOne(SipTransaction& tx, std::chrono::steady_clock::t
 		switch (tx.type)
 		{
 			case SipTransaction::Type::InviteClient:
-				// Exact wording preserved: hardware logs and the #148 regression
-				// test both key on this string.
-				_env.log(std::string("[tx] Timer B expired — INVITE for ") + tx.callId
-					+ " timed out (no provisional response)", true);
+				if (tx.state == SipTransaction::State::Calling)
+				{
+					// Exact wording preserved: hardware logs and the #148
+					// regression test both key on this string.
+					_env.log(std::string("[tx] Timer B expired — INVITE for ") + tx.callId
+						+ " timed out (no provisional response)", true);
+				}
+				else
+				{
+					// Proceeding (#898): a provisional WAS received, so this is
+					// not Timer B and not a silent far end. Say what happened so
+					// an incident log does not read as "the carrier never
+					// answered" for a call that rang. The call is not ended here.
+					_env.log(std::string("[tx] INVITE for ") + tx.callId
+						+ " released: a provisional response arrived but no final"
+						" response came in time (call not ended by this layer)", true);
+				}
 				break;
 			case SipTransaction::Type::NonInviteClient:
 				_env.log(std::string("[tx] Timer F expired — ") + tx.cseqMethod

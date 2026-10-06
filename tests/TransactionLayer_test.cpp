@@ -229,3 +229,62 @@ TEST(TransactionLayer, AProvisionalTakesTimerBOffTheTable)
 	EXPECT_TRUE(env.transactionTimeouts.empty())
 		<< "a provisional stops Timer B; the TU keeps its own no-answer bound";
 }
+
+namespace
+{
+	// First log line the layer wrote about an INVITE that hit the 32 s bound.
+	std::string firstLogContaining(const FakePbxEnv& env, const std::string& needle)
+	{
+		for (const auto& l : env.logs)
+		{
+			if (l.find(needle) != std::string::npos) return l;
+		}
+		return {};
+	}
+}
+
+TEST(TransactionLayer, TimerLogNamesCallingAsNoProvisional)
+{
+	// #898: an INVITE that never drew a 1xx is in Calling; the log says so.
+	FakePbxEnv env;
+	TransactionLayer tx(env);
+	const sockaddr_in phone = FakePbxEnv::addr("192.168.1.50", 5060);
+	tx.maybeTrack(phone, beepInvite(phone));
+
+	tx.sweep(std::chrono::steady_clock::now() + std::chrono::seconds(40));
+
+	const std::string line = firstLogContaining(env, "beep-call-id@192.168.1.10");
+	ASSERT_FALSE(line.empty()) << "the give-up must be logged";
+	EXPECT_NE(line.find("Timer B expired"), std::string::npos);
+	EXPECT_NE(line.find("no provisional response"), std::string::npos);
+}
+
+TEST(TransactionLayer, TimerLogDoesNotClaimNoProvisionalForProceeding)
+{
+	// #898: a 1xx WAS received, so the transaction is in Proceeding. The old
+	// line said "no provisional response" there, which reads as "the carrier
+	// never answered" -- the opposite of what happened (#712).
+	FakePbxEnv env;
+	TransactionLayer tx(env);
+	const sockaddr_in phone = FakePbxEnv::addr("192.168.1.50", 5060);
+	tx.maybeTrack(phone, beepInvite(phone));
+	const std::string ringing =
+		"SIP/2.0 180 Ringing\r\n"
+		"Via: SIP/2.0/UDP 192.168.1.10:5060;branch=" + std::string(kBranch) + "\r\n"
+		"From: \"PocketDial\" <sip:pbx@192.168.1.10:5060>;tag=servertag\r\n"
+		"To: <sip:101@192.168.1.10>;tag=far\r\n"
+		"Call-ID: beep-call-id@192.168.1.10\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	ASSERT_TRUE(tx.matchAndAdvance(std::make_shared<SipMessage>(ringing, phone)));
+
+	tx.sweep(std::chrono::steady_clock::now() + std::chrono::seconds(40));
+
+	const std::string line = firstLogContaining(env, "beep-call-id@192.168.1.10");
+	ASSERT_FALSE(line.empty()) << "the release must still be logged";
+	EXPECT_EQ(line.find("no provisional response"), std::string::npos) << line;
+	EXPECT_NE(line.find("provisional"), std::string::npos)
+		<< "it must say a provisional came: " << line;
+	EXPECT_NE(line.find("no final response"), std::string::npos) << line;
+	EXPECT_TRUE(env.transactionTimeouts.empty()) << "the TU is still not told (#726)";
+}
