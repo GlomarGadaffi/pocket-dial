@@ -102,6 +102,7 @@ bool MulticastPager::start(std::string_view callId, uint32_t groupHost, uint16_t
 	_seq = seq0;
 	_ts = ts0;
 	_first = true;
+	_held.store(false, std::memory_order_relaxed);
 	_active.store(true, std::memory_order_release);
 	return true;
 }
@@ -122,6 +123,7 @@ bool MulticastPager::holds(std::string_view callId) const
 void MulticastPager::onRtp(const RtpReceiver::RtpPacket& pkt)
 {
 	if (!_active.load(std::memory_order_acquire)) return;
+	if (_held.load(std::memory_order_acquire)) return;
 	_rxPackets.fetch_add(1, std::memory_order_relaxed);
 	if (pkt.payloadType != RtpReceiver::PAYLOAD_TYPE_PCMU || pkt.payloadLen == 0) return;
 

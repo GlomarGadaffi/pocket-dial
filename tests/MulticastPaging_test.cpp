@@ -4,7 +4,7 @@
 // Two layers:
 //   MulticastPager   the re-sender alone: RTP header, our own SSRC/sequence/
 //                    timestamp, TTL 1, PCMU only, no heap per frame (#284).
-//   MulticastPaging  RequestsHandler: the 997 answer (recvonly), off by default,
+//   MulticastPaging  RequestsHandler: the 997 answer (sendrecv), off by default,
 //                    one page at a time (486), teardown on BYE and on silence, the
 //                    reserved-number refusals, 911 untouched, pool refusal, and
 //                    the /api/multicast-paging config route.

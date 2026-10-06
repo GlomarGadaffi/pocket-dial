@@ -87,6 +87,13 @@ public:
 	bool isActive() const { return _active.load(std::memory_order_acquire); }
 	const std::string& callId() const { return _callId; }
 
+	// SIP thread (#909). A caller that holds the page (sendonly/inactive re-INVITE)
+	// is paused: nothing it still sends, such as hold music, goes to the group, and it
+	// does not count as liveness, so a hold longer than the silence window ends the
+	// page as before. start() clears it.
+	void setHeld(bool held) { _held.store(held, std::memory_order_release); }
+	bool isHeld() const { return _held.load(std::memory_order_acquire); }
+
 	// RTP task. Every well-formed packet counts as liveness; only PCMU is sent.
 	void onRtp(const RtpReceiver::RtpPacket& pkt);
 	// RtpReceiver::RawSink shape; ctx is the MulticastPager.
@@ -99,6 +106,7 @@ public:
 private:
 	McastTx* _tx;
 	std::atomic<bool> _active{false};
+	std::atomic<bool> _held{false};
 	std::string _callId;   // SIP thread only
 
 	// Written by start() before _active is published, then owned by onRtp().

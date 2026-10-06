@@ -3270,9 +3270,13 @@ void RequestsHandler::onMulticastPageInvite(std::shared_ptr<SipMessage> data,
 	}
 
 	const std::string toTag = IDGen::GenerateID(9);
+	// sendrecv, though the board never sends RTP on this leg: a recvonly answer makes
+	// the phone's side sendonly, which a Yealink shows and plays as a hold (#909).
 	const std::string sdpBody = buildMediaSdp(_localIp, _mcastRx.localPort(),
-		/*sendrecv=*/false, /*dtmfPt=*/-1, /*recvonly=*/true);
-	auto ok = buildOkWithSdp(data, _localIp, toTag, sdpBody, /*grantSessionTimer=*/false);   // #198: re-INVITE gets 488
+		/*sendrecv=*/true, /*dtmfPt=*/-1);
+	// No session timer (#198): the page has no refresh to answer, and the silence
+	// timer owns its lifetime.
+	auto ok = buildOkWithSdp(data, _localIp, toTag, sdpBody, /*grantSessionTimer=*/false);
 	if (!ok)
 	{
 		unwind();
@@ -11114,36 +11118,15 @@ static std::string stripHeaderName(std::string_view h)
 	return siphdr::stripHeaderName(h);
 }
 
-// ── Anchored-leg (555) re-INVITE/UPDATE — issue #218 ─────────────────────────
-// See the declaration's doc comment (RequestsHandler.hpp) for the full "why":
-// the board is the UAS on this leg, so a re-INVITE/UPDATE here is answered,
-// not relayed. Shared by onReinvite() and onUpdate(), whose SDP-bearing path
-// hits the identical case.
-bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& data,
-	const std::shared_ptr<Session>& session, const std::shared_ptr<SipClient>& src)
+// ── 200 OK with SDP to a re-INVITE/UPDATE on a leg this PBX terminates ───────
+// Shared by answerAnchorReinvite() (555) and answerPageReinvite() (997, #909), so
+// the Contact (#445), content-type (#838, #845) and direction-mirror (#751) fixes
+// live in one place.
+bool RequestsHandler::sendLocalMediaAnswer(const std::shared_ptr<SipMessage>& data,
+	int rtpPort, int dtmfPt, bool grantSessionTimer)
 {
-	const std::string callIdStr(data->getCallID());
-	MediaBridge* bridge = nullptr;
-	for (auto& b : _mediaBridges)
-	{
-		if (b.isForCallId(callIdStr)) { bridge = &b; break; }
-	}
-	if (!bridge)
-	{
-		// Bridge already torn down (a race with teardown) -- nothing to answer
-		// with. 481 is the honest response: the dialog this request names does
-		// not have a media leg behind it any more.
-		auto response = getMessageFromPool(*data);
-		if (!response) return false;   // pool exhausted: drop, peer retransmits (#101A)
-		response->setHeader("SIP/2.0 481 Call/Transaction Does Not Exist");
-		response->clearBody();
-		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-		_outbox.emplace_back(data->getSource(), std::move(response));
-		return false;
-	}
-
 	auto ok = getMessageFromPool(*data);
-	if (!ok) return true;   // pool exhausted: drop, peer retransmits (#101A) -- bridge was found, so this counts as handled
+	if (!ok) return false;   // pool exhausted: drop, peer retransmits (#101A)
 	ok->setHeader(SipMessageTypes::OK);
 	ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	// To: is left exactly as `data` carried it -- this is an in-dialog request,
@@ -11160,9 +11143,8 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 	// see buildInboundInviteFork()).
 	ok->setContact(buildContact(data->getToNumber()));
 	addCapabilityHeaders(*ok);
-	pbx::answerSessionTimer(*ok, *data, /*grant=*/true);   // #198: this IS the re-INVITE's 200
-	std::string sdpBody = buildMediaSdp(_localIp, bridge->receiverPort(),
-		/*sendrecv=*/true, data->getTelephoneEventPayloadType());
+	pbx::answerSessionTimer(*ok, *data, grantSessionTimer);   // #198
+	std::string sdpBody = buildMediaSdp(_localIp, rtpPort, /*sendrecv=*/true, dtmfPt);
 	// Issue #751: RFC 3264 s6.1 -- the answer's direction mirrors the offer's
 	// (sendonly -> recvonly, recvonly -> sendonly, inactive -> inactive). A
 	// sendrecv answer to a hold offer is one a strict phone rejects or plays
@@ -11194,6 +11176,42 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 	}
 	ok->syncContentLength();
 	_outbox.emplace_back(data->getSource(), std::move(ok));
+	return true;
+}
+
+// ── Anchored-leg (555) re-INVITE/UPDATE — issue #218 ─────────────────────────
+// See the declaration's doc comment (RequestsHandler.hpp) for the full "why":
+// the board is the UAS on this leg, so a re-INVITE/UPDATE here is answered,
+// not relayed. Shared by onReinvite() and onUpdate(), whose SDP-bearing path
+// hits the identical case.
+bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<Session>& session, const std::shared_ptr<SipClient>& src)
+{
+	const std::string callIdStr(data->getCallID());
+	MediaBridge* bridge = nullptr;
+	for (auto& b : _mediaBridges)
+	{
+		if (b.isForCallId(callIdStr)) { bridge = &b; break; }
+	}
+	if (!bridge)
+	{
+		// Bridge already torn down (a race with teardown) -- nothing to answer
+		// with. 481 is the honest response: the dialog this request names does
+		// not have a media leg behind it any more.
+		auto response = getMessageFromPool(*data);
+		if (!response) return false;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 481 Call/Transaction Does Not Exist");
+		response->clearBody();
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		return false;
+	}
+
+	if (!sendLocalMediaAnswer(data, bridge->receiverPort(), data->getTelephoneEventPayloadType(),
+		/*grantSessionTimer=*/true))
+	{
+		return true;   // pool exhausted: drop, peer retransmits (#101A) -- bridge was found, so this counts as handled
+	}
 
 	// Issue #263: sdp::isHold() is model-aware and section-explicit, and
 	// catches the legacy RFC 2543 c=0.0.0.0 hold signal getSdpDirection()
@@ -11218,6 +11236,56 @@ bool RequestsHandler::answerAnchorReinvite(const std::shared_ptr<SipMessage>& da
 	queueLog(std::string(holding ? "Hold (anchor): " : "Resume (anchor): ") +
 		std::string(src->getNumber()) + " call " + callIdStr, false);
 	return true;
+}
+
+// ── 997 page re-INVITE/UPDATE — issue #909 ───────────────────────────────────
+// A Yealink holds a page it was answered recvonly, and every Resume drew a 488, so
+// it re-held within half a second and the silence timer then ended the page. The
+// board is the UAS on this dialog (RFC 3261 §12.2.2): answer, never relay.
+void RequestsHandler::answerPageReinvite(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<Session>& session)
+{
+#if POCKETDIAL_MULTICAST_PAGING
+	// The page is re-sent as PCMU only (#304), so a re-offer without it is refused,
+	// as the INVITE's was (RFC 3264 §6).
+	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
+	{
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 488 Not Acceptable Here");
+		response->clearBody();
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		return;
+	}
+
+	// The answer is drawn before any state changes: a pool refusal leaves the page
+	// as it was and the phone retransmits. No session timer, as on the first answer.
+	if (!sendLocalMediaAnswer(data, _mcastRx.localPort(), /*dtmfPt=*/-1, /*grantSessionTimer=*/false))
+	{
+		return;
+	}
+
+	// Hold and resume as at the other sites (#263): recvonly counts as a hold here too.
+	SipSdpMessage* sdpMsg = data->hasSdp() ? static_cast<SipSdpMessage*>(data.get()) : nullptr;
+	const bool holding = (sdpMsg && sdpMsg->isHoldOffer()) ||
+		data->getSdpDirection() == SipMessage::SdpDirection::RecvOnly;
+	if (!holding && _mcastPager.isHeld())
+	{
+		// Packets sent while held were not counted, so the clock still shows the last
+		// talkspurt from before the hold. Without this, a hold of a few seconds
+		// followed by a Resume is ended by the silence sweep before the caller can speak.
+		_mcastRxSeen = _mcastPager.rxPackets();
+		_mcastRxSeenAt = std::chrono::steady_clock::now();
+	}
+	_mcastPager.setHeld(holding);
+	session->setState(holding ? Session::State::Held : Session::State::Connected);
+	queueLog(std::string(holding ? "Hold (page): " : "Resume (page): ") +
+		std::string(data->getFromNumber()) + " call " + std::string(data->getCallID()), false);
+#else
+	(void)data;
+	(void)session;
+#endif
 }
 
 // ── Mid-dialog re-INVITE (RFC 3261 §12.2 hold/resume) ────────────────────────
@@ -11255,6 +11323,14 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// #909: a 997 page is terminated here like 555, so it is answered, not refused.
+	// Keyed on the page's own dialog, never on the To number.
+	if (isMulticastPageCall(data->getCallID()))
+	{
+		answerPageReinvite(data, session);
+		return;
+	}
+
 	// Virtual-extension legs (777 echo, 888 conference, 440 tone, a park orbit
 	// 700-709) have no real peer to relay the offer to — their "dest" is a
 	// stand-in SipClient carrying the CALLER's own address, so relaying would
@@ -11262,11 +11338,11 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	// holding phone keeps the call on the original SDP.
 	// #453: a retrieved park keeps its orbit number as destNum but now has a real peer
 	// (a splice): relayIntoPeerDialog() below owns it. Only a leg with no peer is a
-	// park-orbit or 440 stand-in to answer locally. #800: a 997 page likewise.
+	// park-orbit or 440 stand-in to answer locally.
 	const bool splicedLeg = session && !session->getPeerCallID().empty();
 	if (destNum == "777" || destNum == ConferenceRoom::EXT ||
 	    (!splicedLeg && (destNum == "440" || pbx::isParkOrbitExt(destNum))) ||
-	    (session && session->isTrunk()) || isMulticastPageCall(data->getCallID()) || !src || !dest)
+	    (session && session->isTrunk()) || !src || !dest)
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -11445,13 +11521,22 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// #909: an SDP UPDATE on a 997 page is answered as onReinvite() answers its
+	// re-INVITE. A bodiless one is a refresh and falls to the guard below.
+	if (isMulticastPageCall(data->getCallID()) && data->hasSdp())
+	{
+		answerPageReinvite(data, session);
+		return;
+	}
+
 	// Same virtual-leg guard as onReinvite() above: 777/888, the 440 tone leg and a
 	// park orbit (700-709, #709) have no peer leg, and a trunk leg is terminated
 	// here too. A refresh is answered; an SDP change is declined so the phone
 	// keeps the original SDP.
 	// #453: a retrieved park keeps its orbit number as destNum but now has a real peer
 	// (a splice): relayIntoPeerDialog() below owns it. Only a leg with no peer is a
-	// park-orbit or 440 stand-in to answer locally. #800: a 997 page likewise.
+	// park-orbit or 440 stand-in to answer locally. #800: a 997 page's bodiless
+	// refresh is answered here likewise.
 	const bool splicedLeg = session && !session->getPeerCallID().empty();
 	if (destNum == "777" || destNum == ConferenceRoom::EXT ||
 	    (!splicedLeg && (destNum == "440" || pbx::isParkOrbitExt(destNum))) ||
@@ -11697,7 +11782,8 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 		// matches the isTrunk() guard added to onReinvite()/onUpdate(). A relay
 		// leg has no local UA to answer a refresh, so without this the sweep
 		// BYEs a perfectly healthy PSTN call partway through.
-		// #800: a 997 page is in onReinvite()/onUpdate()'s 488 set, so it is here.
+		// #800: a 997 page is here too. #909: its re-INVITE is now answered 200, but
+		// its answers grant no timer (expiry 0, skipped above), so it is never reaped.
 		if (!sweepSrc || !sweepDest || session->isTrunk() ||
 			sweepDestNum == "777" || sweepDestNum == ConferenceRoom::EXT ||
 			sweepDestNum == kAnchorCallExt || isMulticastPageCall(callID))

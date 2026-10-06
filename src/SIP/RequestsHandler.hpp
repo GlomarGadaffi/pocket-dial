@@ -132,8 +132,8 @@ public:
 	// `dtmfPt` echoes the caller's RFC 4733 telephone-event payload type (from
 	// SipMessage::getTelephoneEventPayloadType()) so DTMF can reach a
 	// server-terminated leg at all; -1 keeps the answer PCMU-only as before.
-	// `recvonly` (#800, the 997 multicast page) overrides `sendrecv`: the server only
-	// listens on that leg.
+	// `recvonly` overrides `sendrecv`. Nothing passes it now: the 997 page answers
+	// sendrecv (#909), because a recvonly answer makes a Yealink hold the call.
 	static std::string buildMediaSdp(const std::string& serverIp, int rtpPort,
 		bool sendrecv = false, int dtmfPt = -1, bool recvonly = false);
 
@@ -1091,6 +1091,20 @@ private:
 	bool answerAnchorReinvite(const std::shared_ptr<SipMessage>& data,
 		const std::shared_ptr<Session>& session, const std::shared_ptr<SipClient>& src);
 
+	// The 200 OK with SDP that answerAnchorReinvite() and answerPageReinvite() send to
+	// a re-INVITE or an SDP UPDATE on a leg this PBX terminates: the request's own
+	// To and Via, the board's Contact (#445), the direction mirrored (#751), the
+	// session timer granted or stripped. False if the message pool refused the draw,
+	// in which case nothing was queued.
+	bool sendLocalMediaAnswer(const std::shared_ptr<SipMessage>& data, int rtpPort,
+		int dtmfPt, bool grantSessionTimer);
+	// A re-INVITE or SDP UPDATE on the live 997 page (#909). The server is the UAS, so
+	// it answers 200 on the page's receiver, never 488 and never a relay. A hold
+	// (sendonly/inactive) pauses the page, a resume un-pauses it and restarts the
+	// silence clock. Caller holds _mutex and has checked isMulticastPageCall().
+	void answerPageReinvite(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<Session>& session);
+
 	// SDP admission failure (T-7). Requests that take a final response get a
 	// 488 Not Acceptable Here whose Warning header names the reason; ACK and
 	// responses, which take none, are dropped. Either way the body never reaches
@@ -1528,8 +1542,8 @@ private:
 	void onConferenceInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
 
 	// ── Multicast paging: virtual extension 997 (Issue #800) ─────────────────────
-	// The server answers recvonly (PCMU) and re-sends the caller's audio to the
-	// configured multicast group. One page at a time: a second caller gets 486.
+	// The server answers sendrecv (PCMU; it never sends RTP toward the caller) and
+	// re-sends the caller's audio to the configured multicast group. One page at a time: a second caller gets 486.
 	// 403 when the feature is off or not built. Caller holds _mutex.
 	void onMulticastPageInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
 	// True when `callID` is the live page's dialog. False on a build without the
