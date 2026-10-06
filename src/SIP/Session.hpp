@@ -222,6 +222,8 @@ public:
 	// no-bridge fallback skips a released leg, so every leg is dropped once.
 	bool isAnchorLegReleased() const { return _anchorLegReleased; }
 	void setAnchorLegReleased() { _anchorLegReleased = true; }
+	// #906: the degraded-audio sweep reports a kept 911/933 once per call: true the first time.
+	bool markDegradedReported() { const bool first = !_degradedReported; _degradedReported = true; return first; }
 
 	const std::vector<std::shared_ptr<SipClient>>& getPendingTargets() const { return _pendingTargets; }
 	void setPendingTargets(std::vector<std::shared_ptr<SipClient>> targets) { _pendingTargets = std::move(targets); }
@@ -419,6 +421,7 @@ private:
 	std::string _uacBranch;            // our INVITE Via branch (inbound anchor leg)
 	std::string _anchorParticipantId;  // upstream participant id (either anchor direction)
 	bool _anchorLegReleased = false;   // far leg already dropped (#379)
+	bool _degradedReported = false;    // #906: a kept degraded 911/933 was reported to the notify list
 	std::vector<std::shared_ptr<SipClient>> _pendingTargets;
 	std::shared_ptr<SipMessage> _inviteMessage;
 

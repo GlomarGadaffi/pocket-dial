@@ -1,0 +1,2 @@
+# TrunkWiring_test.cpp: 4 (#897: one crafted answer per checkSdp verdict; a trunk 911's answer is ACKed and connects on each; an ordinary call's is still dropped; a 911-dialog answer from another address is still gated)
+4

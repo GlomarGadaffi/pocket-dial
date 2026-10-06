@@ -89,6 +89,7 @@ private:
 	// rather than a new inbound — so an early upset can't false-ring the extensions. This is the
 	// per-slot successor to the old single pre-POST _outboundActive flag.
 	std::atomic<int>  _outboundPending{0};
+	std::atomic<int64_t> _outboundPendingSinceUs{0};   // #888: when the oldest pending makeCall began (witness only)
 
 	// #100: outbound/inbound disambiguation, the answer-once one-shot, the makecall-wedge timestamp
 	// and the inbound announce-once id all moved ONTO the per-call CallSlot (see the struct below),
@@ -209,6 +210,10 @@ private:
 		int                      getFd = -1;              // guarded by getMutex
 		bool                     rxDetached = false;      // #608: counted in _leakedGetClients; guarded by _mutex
 		bool                     ownLegHeld = false;      // #379: 3CX named this outbound leg as ours (or #349 adopted it); guarded by _mutex
+		// #902: makeCall's own leg for a non-emergency call: a 403 on its GET stream after
+		// the answer gives up early (telephony::getForbiddenGivesUp). False for a 911/933
+		// and for every inbound leg, which keep the whole budget.
+		std::atomic<bool>        getFailFast{false};
 		mutable std::mutex       postMutex;              // guards postClient (writeAudio/stop)
 		std::mutex               getMutex;                // guards getClient (runRxLoop/stop)
 	};

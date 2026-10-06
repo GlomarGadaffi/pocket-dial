@@ -282,6 +282,27 @@ inline bool httpResponseParsed(int status)
 	return status > 0;
 }
 
+// Issue #902: a 403 on the media GET stream is an authorisation answer, not a
+// readiness one (404/424), once the far end has answered; before the answer it
+// may still mean "this participant is not connected yet". So only 403s after
+// the answer count, consecutively, and any other answer resets the count. An
+// ordinary outbound leg (makeCall's own, not a 911/933) gives up after
+// kGetForbiddenMaxAfterAnswer of them: at the 500 ms backoff cap that is about
+// 3 s plus a round trip each, time for the stream to follow the Connected
+// upsert, instead of the whole 240-attempt (~2 min) budget. A 911/933 and an
+// inbound leg (a PSAP callback among them) keep the whole budget, as before.
+constexpr int kGetForbiddenMaxAfterAnswer = 6;
+
+inline int nextGetForbiddenCount(int count, int status, bool answered)
+{
+	return (status == 403 && answered) ? count + 1 : 0;
+}
+
+inline bool getForbiddenGivesUp(int count, bool failFastLeg)
+{
+	return failFastLeg && count >= kGetForbiddenMaxAfterAnswer;
+}
+
 // Issues #379/#681: the participant ids this PBX itself created. On .244 a handset
 // CANCELled before 3CX's makecall response named the PBX's own leg; the drop freed
 // the leg's call slot, then stalled reconnecting, and an upsert for the leg that

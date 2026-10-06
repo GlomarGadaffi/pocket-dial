@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "RequestsHandler.hpp"
+#include "Witness.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -287,4 +288,21 @@ TEST(RegisterBeepRouting, TheBeepInviteCarriesTheRegisteredContactUriParams)
 	ASSERT_FALSE(beep.empty()) << "no register-beep INVITE was sent";
 	EXPECT_EQ(beep.substr(0, beep.find("\r\n")),
 		"INVITE sip:461@192.168.9.47:5062;transport=udp;line=pd856x;x-pd=a1 SIP/2.0");
+}
+
+// #856 witness: one line per beep says which Request-URI form it took.
+TEST(RegisterBeepRouting, TheBeepWitnessesTheRequestUriFormItUsed)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler(kServerIp, 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	pdwitness::clear();
+	handler.handle(makeRegister("462", "192.168.9.48", "reg-462", ";line=pd856w"));   // the slot is claimed here
+
+	handler.fireRegisterBeepsForTest();
+
+	EXPECT_EQ(pdwitness::count("register beep Request-URI: registered Contact"), 1u);
+	EXPECT_EQ(pdwitness::count("register beep Request-URI: bare"), 0u);
 }

@@ -197,6 +197,7 @@ public:
 		std::string fromTag;
 		std::string toTag;
 		uint32_t    cseq = 1;
+		bool        exemptWitnessed = false;   // #889: the 911/933 no-answer exemption was witnessed (once)
 
 		// Where the request-URI and Via point.
 		// The identity stamped into From and Contact. Captured per dialog rather

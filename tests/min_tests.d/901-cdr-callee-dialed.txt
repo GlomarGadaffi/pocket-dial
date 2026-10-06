@@ -1,0 +1,2 @@
+# AnchorRouting_test.cpp: 3 (#901: the degraded teardown and the ACK-deadline reap record the dialed number as the CDR callee, 555 and 911; Participant Remove and handset BYE pinned)
+3

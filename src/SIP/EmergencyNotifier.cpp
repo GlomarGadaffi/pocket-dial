@@ -8,13 +8,14 @@
 #include "SipMessage.hpp"
 #include "SipWireUtil.hpp"
 #include "Syslog.hpp"
+#include "Witness.hpp"
 
 namespace pbx
 {
 
 std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	std::string_view dialed, bool hadTrunkPrefix, bool routed,
-	const E911Config& cfg, std::string_view note)
+	const E911Config& cfg, std::string_view note, bool callUp)
 {
 	std::string out;
 	out.reserve(200);
@@ -39,7 +40,19 @@ std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	// desmo, #878: say what failed. NOT ROUTED names the route; a call the
 	// trunk took after the anchor failed says that too. The caller knows which;
 	// "no trunk available" is only the fallback wording.
-	if (routed)
+	if (callUp)
+	{
+		// #906: connected, and the audio to the anchor keeps failing. Neither of
+		// the two wordings below: the call was not hung up and was not refused.
+		out += " - CALL STILL UP, AUDIO DEGRADED";
+		if (!note.empty())
+		{
+			out += " (";
+			out += note;
+			out += ")";
+		}
+	}
+	else if (routed)
 	{
 		out += " - ROUTED TO TRUNK";
 		if (!note.empty())
@@ -99,7 +112,6 @@ std::shared_ptr<SipMessage> EmergencyNotifier::buildNotifyMessage(const std::str
 	}
 
 	addrOut = client->getAddress();
-	const std::string destIpPort = sipwire::addrToIpPort(addrOut);
 	const std::string activeIp   = _env.localIp();
 	const std::string srcIpPort  = activeIp + ":" + std::to_string(_env.serverPort());
 
@@ -108,7 +120,11 @@ std::shared_ptr<SipMessage> EmergencyNotifier::buildNotifyMessage(const std::str
 	const std::string fromTag = IDGen::GenerateID(9);
 
 	std::ostringstream ss;
-	ss << "MESSAGE sip:" << ext << "@" << destIpPort << " SIP/2.0\r\n"
+	// The registered Contact URI with its parameters: a Snom answers 404 to the
+	// bare form without its ;line= (#904 review). Bare only when none is stored.
+	PD_WITNESS_I("e911", "notify MESSAGE Request-URI: %s",
+		client->getContactUri().empty() ? "bare (no Contact stored)" : "registered Contact");
+	ss << "MESSAGE " << sipwire::memberRequestUri(*client) << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
 	   << "From: \"Emergency\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
 	   << "To: <sip:" << ext << "@" << activeIp << ">\r\n"
@@ -134,10 +150,10 @@ std::shared_ptr<SipMessage> EmergencyNotifier::buildNotifyMessage(const std::str
 
 std::size_t EmergencyNotifier::notify(const pbx::E911Config& cfg, bool isTest,
 	std::string_view fromExt, std::string_view dialed,
-	bool hadTrunkPrefix, bool routed, std::string_view note)
+	bool hadTrunkPrefix, bool routed, std::string_view note, bool callUp)
 {
 	const std::string text =
-		pbx::formatE911Notification(isTest, fromExt, dialed, hadTrunkPrefix, routed, cfg, note);
+		pbx::formatE911Notification(isTest, fromExt, dialed, hadTrunkPrefix, routed, cfg, note, callUp);
 
 	// 1. The record. Unconditional and unconfigurable: an operator can leave
 	//    notifyExts empty, but they cannot turn off the fact that a 911 dial is

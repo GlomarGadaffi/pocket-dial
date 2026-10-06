@@ -907,6 +907,13 @@ public:
 		return bindOutboundParticipant(callId, ownLeg);
 	}
 
+	// Test-only: sendMessageTo() is private and has no production caller; this is
+	// its only way in, so its Request-URI is pinned (#904 review sibling).
+	bool sendMessageToForTest(const std::string& ext, const std::string& text)
+	{
+		return sendMessageTo(ext, text);
+	}
+
 	// Test-only (issue #379): what the anchor event callback does on
 	// CallEvent::MediaNeverOpened. The callback is wired only for a real anchor,
 	// never the host suite's Loopback. Not compiled into device firmware.
@@ -914,6 +921,12 @@ public:
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		anchorMediaNeverOpenedLocked(participantId);
+	}
+	// Test-only (#880): what the anchor event callback does on CallEvent::Dropped.
+	void anchorDroppedForTest(const std::string& participantId)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		anchorDroppedLocked(participantId);
 	}
 
 	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
@@ -1902,7 +1915,7 @@ private:
 	// false, or the anchor a trunk call stood in for.
 	void notifyEmergency(const pbx::EmergencyDial& emergency,
 		const std::string& fromExt, const std::string& dialed, bool routed,
-		std::string_view note = {});
+		std::string_view note = {}, bool callUp = false);
 
 	void routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller,
@@ -1926,6 +1939,10 @@ private:
 	// callback by #659's window (#818) or a 911 a dial-plan rule produces (#834).
 	// Caller holds _mutex.
 	bool isEmergencyTraffic(const SipMessage& m);
+	// #897: a response to OUR trunk INVITE for a live emergency session (keyed
+	// on our trunk dialog's Call-ID and its carrier's address, never on To).
+	// The SDP gate yields every verdict for it. Caller holds _mutex.
+	bool isTrunkAnswerToOurEmergencyInvite(const SipMessage& m);
 	// #818: an INVITE's callee is inside #659's callback window: the To user,
 	// or for a carrier INVITE the extension its DID maps to. Caller holds _mutex.
 	bool isPsapCallbackTo(const SipMessage& m);
@@ -2084,6 +2101,18 @@ private:
 	void asyncAnswerCall(const std::string& participantId);
 	// Issue #379: CallEvent::MediaNeverOpened. Caller holds _mutex.
 	void anchorMediaNeverOpenedLocked(const std::string& participantId);
+	// CallEvent::Dropped (drawbridge's #100: only THIS participant's session).
+	// #880: an outbound leg dropped before it connected is refused, never BYEd.
+	// Caller holds _mutex; runs off the SIP thread, so it sends on _asyncOutbox.
+	void anchorDroppedLocked(const std::string& participantId);
+	// #879, #880: one NOT ROUTED for a 911/933 told ROUTED whose route failed
+	// before it connected, naming `failure`. No-op off an emergency session
+	// (empty emergencyNumber). Caller holds _mutex; enqueues on _outbox.
+	void notifyEmergencyNotRouted(std::string_view emergencyNumber, const std::string& from,
+		const std::string& to, const std::string& failure);
+	// The trunk's NOT ROUTED text: with a real anchor configured, the trunk
+	// only ever carries a 911 the anchor could not place, and says so (#878).
+	std::string trunkEmergencyFailure(std::string_view failure);
 
 	// Bind an outbound call's own leg (from asyncMakeCall's successful makeCall())
 	// to its session, so the CallEvent::Answered/Dropped callback can match this

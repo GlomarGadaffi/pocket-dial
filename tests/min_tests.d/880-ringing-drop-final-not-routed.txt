@@ -1,0 +1,2 @@
+# EmergencyNotify_test.cpp: 6 (#880: a ringing anchored 911 3CX drops gets 503 + one NOT ROUTED, no BYE; an ordinary one 503 and no notification; a connected one is still BYEd; a trunk 911 answer with no audio and an early carrier BYE each give the handset a final and one NOT ROUTED; an ordinary early carrier BYE notifies nobody)
+6

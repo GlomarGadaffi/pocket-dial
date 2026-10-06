@@ -175,6 +175,8 @@ LOG_COUNTERS = {
     # makeCall() (#349): the unread response reconciled to our own leg, or not.
     "adopted_349": r"but 3CX has our leg (\S+) .*adopting the call instead of failing it \(#349\)",
     "orphaned_349": r"a call may be ORPHANED on 3CX \(#349/#328\)",
+    # #903: each adopt re-read that found no leg yet, with what the list held (group 1 = the read).
+    "adopt_reread_349": r"makeCall: no leg listed yet \(list status=-?\d+, read (\d+):",
     # runRxLoop()'s GET stream (#379, #518). A spent budget is attempt N/N.
     "get_refused": r"GET stream refused \(HTTP (\d+)\) for ",
     "get_refused_403": r"GET stream refused \(HTTP 403\) for \S*/participants/([^/\s]+)/stream",
@@ -183,10 +185,39 @@ LOG_COUNTERS = {
     "get_transport_giveup": r"GET stream: \d+ consecutive transport failures",
     "get_rebuild_giveup": r"GET stream: could not rebuild client after transport failure",
     "get_never_opened": r"GET \(Telephony->device\) stream never opened",
+    # #902: a 403 after the answer on an ordinary outbound leg gave up early; group 1 = the 403 count,
+    # group 2 = the leg, group 3 = the budget it did not spend.
+    "get_403_failfast_902": r"GET stream: HTTP 403 on (\d+) consecutive attempts after the answer for "
+                            r"/callcontrol/<dn>/participants/([^/\s]+)/stream -- giving up now, not at attempt "
+                            r"(\d+) \(#902\)",
     # #893: the far end's audio reached us (runRxLoop). With no ringing reference: a diversion.
     "get_open": r"GET \(Telephony->device\) audio stream OPEN: \S*/participants/([^/\s]+)/stream",
     "first_chunk": r"GET read: first chunk \d+ bytes <- Telephony \((\S+)\)",
     "post_open": r"POST \(device->Telephony\) audio stream OPEN: \S*/participants/([^/\s]+)/stream",
+    # #904 review: the 911 notify MESSAGE's Request-URI source, once per notified phone.
+    "e911_notify_uri": r"e911: notify MESSAGE Request-URI: (registered Contact|bare \(no Contact stored\))",
+    # #896: a trunk INVITE's final response replaced an early (180/183) To-tag; group 1 = the status.
+    "trunk_final_tag_896": r"trunk: final (\d+) To-tag differs from the early dialog's: the final's defines it \(#896\)",
+    # #897: the SDP gate let a trunk answer to our own 911/933 INVITE through; group 1 = the verdict.
+    "sdp_gate_yield_897": r"SDP gate yielded '([^']+)' for a trunk answer to our emergency INVITE \(#897\)",
+    # #880: 3CX dropped an outbound anchored leg before it connected: a final response, no BYE (group 1: a 911).
+    "anchor_drop_ringing_880": r"anchor dropped a ringing outbound leg: final 503 to the caller, no BYE(, NOT ROUTED sent)? \(#880\)",
+    # #879/#880: a 911/933 told ROUTED whose route then failed before it connected; group 1 = the failure.
+    "e911_not_routed": r"e911: NOT ROUTED correction: (.+)",
+    # #901: an outbound anchored call torn down by the reap or the degraded sweep records the dialed number.
+    "cdr_callee_dialed_901": r"CDR callee is the dialed number \((anchor reap|anchor audio write failure)\) \(#901\)",
+    # #889/#712: a trunk 911/933 that drew a provisional is held past its no-answer bound (once per dialog).
+    "trunk_911_exempt_889": r"trunk: 911/933 dialog held past its no-answer bound: a provisional came, "
+                            r"no PBX-side timeout \(#712, #889\)",
+    # #890: a carrier final after the call was answered, ignored; group 1 = the status.
+    "stray_final_890": r"trunk: final (\d+) after the call was answered ignored \(#890\)",
+    # #856: the register beep's Request-URI source, once per beep.
+    "beep_uri_856": r"beep: register beep Request-URI: (registered Contact|bare \(no Contact stored\))",
+    # #888: an upsert ignored while a makeCall was pending (group 1 = pending makeCalls, 2 = the oldest's age in ms).
+    "upset_ignored_pending_888": r"Upset ignored while (\d+) makeCall\(s\) pending \(oldest (-?\d+) ms old\): "
+                                 r"3CX does not repeat a Connected one \(#888\)",
+    # #906: the degraded-audio sweep kept a connected 911/933 up instead of hanging it up.
+    "e911_degraded_kept_906": r"e911: audio to the anchor keeps failing on a connected 911/933: kept up, not hung up \(#906\)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (\S+) reason=",
     "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",
@@ -430,6 +461,7 @@ PROBE_FAULTS = ("makecall_read_fail", "get_status", "get_max_attempts", "post_st
 BENCH_PATH = "/api/bench/fault"
 PROBE_IMAGE = "anchor-bench-probe"
 GET_MAX_ATTEMPTS = 240               # BenchProbeLogic.hpp kGetMaxAttempts; get_max_attempts only shrinks it
+GET_FORBIDDEN_FAILFAST = 6           # TelephonyAnchorLogic.hpp kGetForbiddenMaxAfterAnswer (#902)
 # runRxLoop()'s backoff after each attempt: 50 ms, doubling, capped at 500 ms.
 GET_BACKOFF_MS = (50, 100, 200, 400)
 GET_BACKOFF_CAP_MS = 500
@@ -2019,11 +2051,13 @@ def never_opened_judge(run, sc, lines):
     leg = legs[0]
     attempts = [(int(m.group(1)), int(m.group(2))) for _, line in ents for m in [_ATTEMPT.search(line)] if m]
     spent = matches(ents, "get_budget_spent")
+    failfast = matches(ents, "get_403_failfast_902")
     transport, rebuild = matches(ents, "get_transport_giveup"), matches(ents, "get_rebuild_giveup")
     drops, drop_failed = matches(ents, "dropped", leg), matches(ents, "drop_failed", leg)
     ends = endcalls(ents, c.get("_call_id"))
-    branch = "transport" if transport else "rebuild" if rebuild else "budget" if spent else "none"
-    t_hang, t_spent = c.get("_t_hangup"), (spent[0][0] if spent else None)
+    branch = ("transport" if transport else "rebuild" if rebuild else "failfast" if failfast
+              else "budget" if spent else "none")
+    t_hang, t_spent = c.get("_t_hangup"), (failfast[0][0] if failfast else spent[0][0] if spent else None)
     # MediaNeverOpened's witness on syslog (its own "no rx audio, dropping leg" line is
     # queueLog, stdout only): after the spent budget the board stops this call's bridge
     # (logged synchronously, before its drop is queued) or drops leg L, before any endCall
@@ -2040,7 +2074,8 @@ def never_opened_judge(run, sc, lines):
               refused_403_this_leg=len(matches(ents, "get_refused_403", leg)), branch=branch,
               never_opened_lines=len(matches(ents, "get_never_opened")), drops=len(drops),
               drop_failed=len(drop_failed), endcall_reasons=[r for _, r in ends],
-              dropped_by_the_board_on_its_own=on_its_own and branch == "budget",
+              dropped_by_the_board_on_its_own=on_its_own and branch in ("budget", "failfast"),
+              failfast_lines=len(failfast),
               rh_never_opened_line=len(matches(ents, "rh_never_opened_drop", leg)),
               harness_hung_up=t_hang is not None, pcap_byes=c.get("pcap_byes"),
               drop_witness="syslog only (S2): 3CX is HTTPS and its participant list is not readable here")
@@ -2049,6 +2084,17 @@ def never_opened_judge(run, sc, lines):
                        % ("/".join(str(b) for b in ev["budgets"]), n))
     if sc.get("require_refused") and not ev["refused_403_this_leg"]:
         invalid.append("no 'GET stream refused (HTTP 403)' line for leg %s reached the syslog (#518)" % leg)
+    if failfast and not sc.get("expect_failfast"):
+        fails.append("the 403 fail-fast fired on a run that forces a %d, which keeps the whole budget (#902)"
+                     % sc["get_status"])
+    if sc.get("expect_failfast"):
+        if branch != "failfast":
+            invalid.append("no 403 fail-fast line (branch %s): the budget was spent before the answer, or this "
+                           "image has no #902 (get_403_failfast_902 is 0)" % branch)
+            return fails, invalid, ev
+        if int(failfast[0][1].group(1)) != GET_FORBIDDEN_FAILFAST or int(failfast[0][1].group(3)) != n:
+            fails.append("the fail-fast line says %s consecutive 403s of budget %s, want %d of %d"
+                         % (failfast[0][1].group(1), failfast[0][1].group(3), GET_FORBIDDEN_FAILFAST, n))
     # S6: exactly one drop in every branch.
     if not drops:
         fails.append("leg %s was never dropped (syslog is the only witness, S2): a live billable leg on 3CX?"
@@ -2086,15 +2132,20 @@ NEVER_OPENED = dict(probe=True, faults=("get_status", "get_max_attempts"), get_s
                     agent_opts={"caller": {"contact_params": ";line=pd6101"}}, calls=1,
                     call_cap_s=30, dup_wait_s=3.0, settle_s=5.0, ring_required=True,
                     judge=never_opened_judge)
+# #902: a 403 after the answer on an ordinary leg gives up after GET_FORBIDDEN_FAILFAST of them, so the
+# whole-budget path is exercised with a 404 ("not ready yet", which keeps the whole budget) and the
+# fail-fast with a 403.
 scenario(name="x379_never_opened", issues=("#379",),
          about="test UA 6101 (Contact ;line=pd6101) -> the designated far end; every GET stream answer reads "
-               "403 and the budget is 12: the board must drop the leg once on its own (MediaNeverOpened) and "
+               "404 and the budget is 12: the board must drop the leg once on its own (MediaNeverOpened) and "
                "BYE 6101 once, at its registered Contact",
-         path_counter="get_budget_spent", **NEVER_OPENED)(probe_run(never_opened_run))
-scenario(name="x518_403_clean_giveup", issues=("#518", "#379"), require_refused=True,
-         about="x379_never_opened plus the 'GET stream refused (HTTP 403)' line (#519): a 403 for the "
-               "whole budget gives up cleanly; one run serves both issues",
-         path_counter="get_refused_403", **NEVER_OPENED)(probe_run(never_opened_run))
+         path_counter="get_budget_spent", **dict(NEVER_OPENED, get_status=404))(probe_run(never_opened_run))
+scenario(name="x518_403_clean_giveup", issues=("#518", "#379", "#902"), require_refused=True,
+         expect_failfast=True,
+         about="x379_never_opened with every answer a 403 plus the 'GET stream refused (HTTP 403)' line (#519): "
+               "after the answer, %d consecutive 403s give up cleanly by the #902 fail-fast (not the 12-attempt "
+               "budget): one drop, one BYE" % GET_FORBIDDEN_FAILFAST,
+         path_counter="get_403_failfast_902", **NEVER_OPENED)(probe_run(never_opened_run))
 
 
 # -- x279_degraded_bye (Connected; the Held variant is not registered) ----------------

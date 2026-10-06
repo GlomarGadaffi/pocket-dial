@@ -363,7 +363,8 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	// leg is keyed onto a slot below (RAII clears it on every return path). The WS classifier reads
 	// this to treat an early unmatched upset as our far leg, not a new inbound (the per-slot
 	// successor to the old pre-POST _outboundActive flag, which guarded the same window).
-	_outboundPending.fetch_add(1, std::memory_order_acq_rel);
+	if (_outboundPending.fetch_add(1, std::memory_order_acq_rel) == 0)
+		_outboundPendingSinceUs.store(esp_timer_get_time(), std::memory_order_relaxed);   // #888
 	struct PendingDec {
 		std::atomic<int>& c;
 		~PendingDec() { c.fetch_sub(1, std::memory_order_acq_rel); }
@@ -597,6 +598,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 					slot->ringing.store(false, std::memory_order_release);
 					slot->outboundActiveSetUs = esp_timer_get_time();
 					slot->ownLegHeld = ownLegHeld;
+					slot->getFailFast.store(!emergency, std::memory_order_release);   // #902: never for a 911/933
 				}
 			}
 			else
@@ -952,6 +954,7 @@ void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 	slot.outboundActiveSetUs = 0;
 	slot.upsetInFlight.store(false, std::memory_order_release);
 	slot.upsetPending.store(false, std::memory_order_release);
+	slot.getFailFast.store(false, std::memory_order_release);   // #902
 }
 
 // ── Private Helper Functions ───────────────────────────────────────────────
@@ -2902,6 +2905,8 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 									std::string controlLegs[POCKETDIAL_MAX_ANCHOR_CALLS];
 									int nLegs = 0;
 									bool ownLeg = false;
+									int ignoredPending = 0;        // #888 witness: an upsert ignored while a makeCall was pending
+									int64_t ignoredAgeMs = 0;
 									uint64_t seq = 0;
 									{
 										std::lock_guard<std::mutex> lock(_mutex);
@@ -2934,6 +2939,11 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 												// No resolved outbound leg. If a makecall is mid-resolve, this
 												// is its (far) leg — ignore; otherwise it's a new inbound call.
 												if (pending == 0) controlLegs[nLegs++] = partId;
+												else
+												{
+													ignoredPending = pending;
+													ignoredAgeMs = (esp_timer_get_time() - _outboundPendingSinceUs.load(std::memory_order_relaxed)) / 1000;
+												}
 											}
 											else if (nin == 1 && pending == 0)
 											{
@@ -2949,6 +2959,11 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 										}
 									}
 									if (ownLeg) ESP_LOGI(TAG, "Upset for own leg %s, no outbound slot: not an inbound call (#379)", partId.c_str());
+									// #888: 3CX does not repeat a Connected upsert, so one ignored here (a route-point
+									// inbound or a PSAP callback) may be lost. Witness only; nothing is held or replayed.
+									if (ignoredPending > 0)
+										ESP_LOGW(TAG, "Upset ignored while %d makeCall(s) pending (oldest %lld ms old): "
+											"3CX does not repeat a Connected one (#888)", ignoredPending, (long long)ignoredAgeMs);
 									if (nLegs == 0) break;   // ignored (pending far leg / all-busy)
 
 									// Best-effort caller id (cheap, JSON-only) for an inbound ring's From display.
@@ -3496,6 +3511,7 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	TickType_t           delay        = pdMS_TO_TICKS(50);   // Start fast at 50ms
 	bool opened = false;
 	int  transportFailures = 0;
+	int  forbiddenAfterAnswer = 0;   // #902: consecutive 403s since the far end answered
 	// #518: one diagnostic line per DISTINCT refusal status per stream, not per
 	// retry and not just the first -- a 404 while the far end is still ringing
 	// must not use up the line the 403 needs. At most 4 lines per stream.
@@ -3616,6 +3632,19 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					while (firstChunk > 0 &&
 						esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
 					transportFailures = 0;
+					forbiddenAfterAnswer = telephony::nextGetForbiddenCount(forbiddenAfterAnswer, status,
+						slot->outboundAnswered.load(std::memory_order_acquire));
+					if (telephony::getForbiddenGivesUp(forbiddenAfterAnswer,
+						slot->getFailFast.load(std::memory_order_acquire)))
+					{
+						// #902: the path's shape only; the host and the route DN (it can be a
+						// DID) stay out. The first 403's body and URL are in #518's line above.
+						ESP_LOGW(TAG, "GET stream: HTTP 403 on %d consecutive attempts after the answer for "
+							"/callcontrol/<dn>/participants/%s/stream -- giving up now, not at attempt %d (#902)",
+							forbiddenAfterAnswer, activePartId.c_str(), kMaxAttempts);
+						attempt = kMaxAttempts;   // the spent-budget give-up below (MediaNeverOpened), as before
+						break;
+					}
 				}
 				else
 				{
