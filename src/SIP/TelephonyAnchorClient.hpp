@@ -242,11 +242,14 @@ private:
 	// clears rxTaskHandle on Reap. Caller holds _mutex.
 	pd::ReapDecision reapParkedRxLocked(CallSlot& slot);
 
-	// Persistent control-plane HTTPS connection (makecall / participant drop).
-	// Kept open across requests so each command is one RTT instead of a fresh
-	// mbedTLS handshake — mirrors the keep-alive agents in the Telephony reference
-	// examples. Guarded by _ctrlMutex; never touched under _mutex.
+	// Control-plane HTTPS handle (participant drop / answer; makeCall uses a fresh client).
+	// performCtrl closes the connection after each success but keeps the handle, so the next
+	// request reconnects with the cached TLS session ticket (#884) instead of riding a socket
+	// 3CX may have reaped. Guarded by _ctrlMutex; never touched under _mutex.
 	esp_http_client_handle_t      _ctrlClient = nullptr;
+	// Set by the handle's HTTP_EVENT_ON_CONNECTED hook when perform() had to connect (a request
+	// that never sets it reused an open socket). Written inside perform(), so under _ctrlMutex.
+	bool                          _ctrlConnected = false;
 	std::mutex                    _ctrlMutex;
 
 	// Persistent GET connection for the read-body status calls (getLegStatus, reconcileParticipantId,
@@ -364,10 +367,12 @@ private:
 	// Returns true if the task is running (newly spawned or already up).
 	bool startRxIfNeeded(const std::string& participantId);
 
-	esp_http_client_handle_t makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token = "");
+	// onEvent/eventUser: optional esp_http_client event hook (performCtrl's connect witness, #884).
+	esp_http_client_handle_t makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token = "",
+	                                          http_event_handle_cb onEvent = nullptr, void* eventUser = nullptr);
 	bool performAuthedRequest(esp_http_client_handle_t client, int* statusCodeOut = nullptr);
-	// One-shot POST on the persistent control connection (creates/repairs the
-	// handle as needed; retries once on a stale connection). contentType may be
+	// One-shot POST on the control handle (closes the connection after each success; creates or
+	// rebuilds the handle as needed, retries once after a failure). contentType may be
 	// nullptr for an empty-body POST.
 	bool performCtrl(const std::string& url, const char* contentType, const std::string& body, int* statusCodeOut = nullptr);
 	void warmCtrlConnection();   // pre-establish the control TLS session (boot/reconnect)

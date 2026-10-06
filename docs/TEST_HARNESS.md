@@ -398,6 +398,7 @@ the firmware formats.
 | `e911_degraded_kept_906` | `e911: audio to the anchor keeps failing on a connected 911/933: kept up, not hung up \(#906\)` | #906: the degraded-audio sweep kept a connected 911/933 up and told the notify list (once per call) |
 | `get_403_failfast_902` | `GET stream: HTTP 403 on (\d+) consecutive attempts after the answer for /callcontrol/<dn>/participants/([^/\s]+)/stream -- giving up now, not at attempt (\d+) \(#902\)` | #902: 6 consecutive 403s after the answer gave up an ordinary outbound leg early (MediaNeverOpened follows). ESP-only |
 | `cdr_callee_dialed_901` | `CDR callee is the dialed number \((anchor reap\|anchor audio write failure)\) \(#901\)` | #901: the degraded (audio write failure) and reaped anchor teardowns write the dialed number as the CDR callee |
+| `ctrl_request_884` | `ctrl request: attempt (\d+) (reused\|resumed\|cold) in (\d+) ms \(#884\)` | #884: one line per successful control request (drop or answer) saying whether it rode an open socket (`reused`, no connect event), reconnected on the kept handle in 400 ms or less (`resumed`) or paid a full handshake (`cold`: a fresh handle, or a connect above 400 ms, which is the repo's cut and a timing heuristic, not proof of resumption). Group 3 is the elapsed ms. After #884 a `reused` is a bug. A failed attempt logs `Control request failed ... on attempt N` instead. ESP-only |
 
 **Safety preconditions.** Each one is refused before anything is sent (exit 2), except
 the S1 pin and the far-end check, which are made against the board:

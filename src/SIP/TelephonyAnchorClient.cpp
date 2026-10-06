@@ -263,8 +263,8 @@ bool TelephonyAnchorClient::start()
 	// status-check / media-start and keep the WS task answering PINGs.
 	startWsWorkers();
 
-	// 3. Pre-establish the control-plane TLS session so the first makecall
-	// doesn't pay the handshake during post-dial delay.
+	// 3. Prime the control handle's TLS session ticket so the first dropCall/answerCall after
+	// boot reconnects by resumption instead of a cold handshake (makeCall uses its own fresh client).
 	warmCtrlConnection();
 	// 3b. Same idea for the status-GET connection (getLegStatus/reconcile/caller-lookup/device
 	// resolve) — without this the FIRST post-boot status check still cold-handshakes even though
@@ -419,7 +419,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 
 	// Capture the makecall RESPONSE BODY (not just the status) so we can read result.id — the
 	// initiator's OWN leg on our DN, which is the leg Telephony authorizes us to stream/drop. (httpPostBody
-	// uses a fresh client; performCtrl's persistent handle does not expose the body.)
+	// uses a fresh client; performCtrl's handle does not expose the body.)
 	int status = 0;
 	std::string respBody;
 	bool requestSent = false;   // #349: did the POST body actually reach 3CX?
@@ -714,7 +714,8 @@ bool TelephonyAnchorClient::dropCall(const std::string& participantId)
 	stopMediaStreams(partId);
 
 	// Trigger drop via HTTP POST /callcontrol/{sourceDn}/participants/{participantId}/drop
-	// on the persistent control connection — fast teardown, no fresh handshake.
+	// through performCtrl: it reconnects by TLS session resumption (expected ~100-150 ms, see the
+	// witness line) rather than riding an open connection or paying a cold handshake.
 	std::string dropUrl = baseUrl + "/callcontrol/" + sourceDn + "/participants/" + partId + "/drop";
 
 	int status = 0;
@@ -753,7 +754,7 @@ bool TelephonyAnchorClient::answerCall(const std::string& participantId)
 	}
 
 	// Answer the inbound participant the route point is offering us: POST
-	// /callcontrol/{dn}/participants/{id}/answer on the persistent control connection.
+	// /callcontrol/{dn}/participants/{id}/answer through performCtrl (reconnects by session resumption, see dropCall).
 	// Telephony then connects the PSTN leg, flips the participant to Connected, and the
 	// existing Upset→Connected path opens the PCM streams (startMediaStreams).
 	//
@@ -1317,7 +1318,7 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 }
 
 // POST with a body and return the response body (and HTTP status). Mirrors httpGetBody but for the
-// makecall, whose result.id we need to read. Uses a fresh client (the persistent _ctrlClient that
+// makecall, whose result.id we need to read. Uses a fresh client (the _ctrlClient handle that
 // performCtrl drives via esp_http_client_perform does not surface the body). close()+cleanup() on
 // every path; *statusOut carries the HTTP status (or -1).
 bool TelephonyAnchorClient::httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut, bool* requestSentOut)
@@ -2173,10 +2174,13 @@ void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 	self->_restartInFlight.store(false, std::memory_order_release);
 }
 
-esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token)
+esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token,
+                                                              http_event_handle_cb onEvent, void* eventUser)
 {
 	esp_http_client_config_t config = {};
 	config.url = url.c_str();
+	config.event_handler = onEvent;
+	config.user_data = eventUser;
 	config.method = method;
 	config.crt_bundle_attach = esp_crt_bundle_attach;
 	config.buffer_size = 4096;
@@ -2187,9 +2191,9 @@ esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const std::stri
 	// is software-bound (~0.5-1 s) and cannot be sped up in hardware. The only lever is to
 	// AVOID the full handshake: keep_alive_enable holds the TCP+TLS connection open for
 	// reuse, and save_client_session caches the TLS session ticket so a reconnect resumes
-	// (abbreviated handshake, ~1 RTT) instead of re-doing the ECDHE. Paired with
-	// warmCtrlConnection() (which establishes the persistent _ctrlClient at init), the
-	// first dial reuses/resumes the already-warmed control session rather than cold-handshaking.
+	// (abbreviated handshake, ~1 RTT) instead of re-doing the ECDHE. The control handle
+	// closes its connection after each request but keeps the ticket (#884), so the first
+	// dropCall/answerCall after warmCtrlConnection() resumes; makeCall uses a fresh client and does not.
 	// Requires CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS + CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS.
 	config.keep_alive_enable  = true;
 	config.save_client_session = true;
@@ -2233,6 +2237,18 @@ bool TelephonyAnchorClient::performAuthedRequest(esp_http_client_handle_t client
 	}
 }
 
+// #884 witness: esp_http_client dispatches HTTP_EVENT_ON_CONNECTED once perform() has opened the
+// socket and finished the TLS handshake, so a request that never gets it rode an open socket.
+// No allocation, no lock: it runs inside perform(), under performCtrl's _ctrlMutex.
+static esp_err_t ctrlConnectedHook(esp_http_client_event_t* evt)
+{
+	if (evt->event_id == HTTP_EVENT_ON_CONNECTED && evt->user_data)
+	{
+		*static_cast<bool*>(evt->user_data) = true;
+	}
+	return ESP_OK;
+}
+
 bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* contentType, const std::string& body, int* statusCodeOut)
 {
 	std::string token;
@@ -2243,14 +2259,16 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 
 	std::lock_guard<std::mutex> ctrlLock(_ctrlMutex);
 
-	// Two attempts: the first may ride a connection the server idled out, in
-	// which case perform() fails; the second goes out on a fresh handle, which
-	// is exactly what every request paid before this connection was persistent.
+	// Two attempts: attempt 0 reopens the cleanly closed kept handle with TLS session ticket
+	// resumption (expected ~100-150 ms, unmeasured: the witness line below records it); if an
+	// unexpected transport failure occurs, attempt 1 cleans up and rebuilds fresh (cold handshake).
 	for (int attempt = 0; attempt < 2; ++attempt)
 	{
+		bool freshHandle = false;
 		if (!_ctrlClient)
 		{
-			_ctrlClient = makeAuthedClient(url, HTTP_METHOD_POST, 1024, token);
+			freshHandle = true;
+			_ctrlClient = makeAuthedClient(url, HTTP_METHOD_POST, 1024, token, ctrlConnectedHook, &_ctrlConnected);
 			if (!_ctrlClient)
 			{
 				return false;
@@ -2271,7 +2289,14 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 		}
 		esp_http_client_set_post_field(_ctrlClient, body.c_str(), body.length());
 
+		_ctrlConnected = false;
+		const int64_t t0 = esp_timer_get_time();
 		esp_err_t err = esp_http_client_perform(_ctrlClient);
+		const int64_t ms = (esp_timer_get_time() - t0) / 1000;
+		// reused: no connect event (rode an open socket). Otherwise a connect: a fresh handle holds
+		// no ticket, so it is cold; a kept handle is "resumed" when it connected in <= 400 ms (the
+		// repo's resumed-vs-full cut, as in rewarmPostSession) and "cold" above it (ticket refused).
+		const char* how = !_ctrlConnected ? "reused" : (freshHandle || ms > 400) ? "cold" : "resumed";
 		if (err == ESP_OK)
 		{
 			int status = esp_http_client_get_status_code(_ctrlClient);
@@ -2279,11 +2304,18 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 			{
 				*statusCodeOut = status;
 			}
+			// One witness line per control request, esp_log so syslog carries it (#884).
+			ESP_LOGI(TAG, "ctrl request: attempt %d %s in %lld ms (#884)", attempt, how, (long long)ms);
+			// #884: close (not cleanup) the transport connection so an idle period does not
+			// leave a dead TCP socket that fails the next perform() on WRITE_DATA and discards
+			// the cached TLS session ticket. The handle and session ticket stay warm for resumption.
+			esp_http_client_close(_ctrlClient);
 			return (status >= 200 && status < 300);
 		}
 
-		ESP_LOGW(TAG, "Control request failed (%s)%s", esp_err_to_name(err),
-		         attempt == 0 ? " — reconnecting" : "");
+		ESP_LOGW(TAG, "Control request failed (%s) on attempt %d after %lld ms, %s%s", esp_err_to_name(err),
+		         attempt, (long long)ms, _ctrlConnected ? "after connecting" : "before any connect (reused socket or connect failed)",
+		         attempt == 0 ? " — rebuilding the handle" : "");
 		esp_http_client_cleanup(_ctrlClient);
 		_ctrlClient = nullptr;
 	}
@@ -2297,10 +2329,10 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 
 void TelephonyAnchorClient::warmCtrlConnection()
 {
-	// Establish the control-plane TLS session ahead of the first command so a
-	// makecall right after dialing doesn't pay the handshake. A POST to the DN
-	// root is a no-op command-wise (Telephony answers 4xx) but completes the TLS+TCP
-	// setup that perform() will then reuse.
+	// Establish the control-plane TLS session ahead of the first command (dropCall or
+	// answerCall) so it doesn't pay a cold handshake mid-call. A POST to the DN
+	// root is a no-op command-wise (Telephony answers 4xx) but completes the TLS setup
+	// and primes the session ticket for resumption.
 	std::string url;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);

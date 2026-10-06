@@ -218,6 +218,9 @@ LOG_COUNTERS = {
                                  r"3CX does not repeat a Connected one \(#888\)",
     # #906: the degraded-audio sweep kept a connected 911/933 up instead of hanging it up.
     "e911_degraded_kept_906": r"e911: audio to the anchor keeps failing on a connected 911/933: kept up, not hung up \(#906\)",
+    # #884: one line per successful control request (drop/answer): group 1 = the attempt, 2 = reused (no connect),
+    # resumed (connected <= 400 ms on a kept handle) or cold, 3 = elapsed ms.
+    "ctrl_request_884": r"ctrl request: attempt (\d+) (reused|resumed|cold) in (\d+) ms \(#884\)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (\S+) reason=",
     "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",
