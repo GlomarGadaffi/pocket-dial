@@ -189,6 +189,8 @@ LOG_COUNTERS = {
     "get_open": r"GET \(Telephony->device\) audio stream OPEN: \S*/participants/([^/\s]+)/stream",
     "first_chunk": r"GET read: first chunk \d+ bytes <- Telephony \((\S+)\)",
     "post_open": r"POST \(device->Telephony\) audio stream OPEN: \S*/participants/([^/\s]+)/stream",
+    # #904 review: the 911 notify MESSAGE's Request-URI source, once per notified phone.
+    "e911_notify_uri": r"e911: notify MESSAGE Request-URI: (registered Contact|bare \(no Contact stored\))",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (\S+) reason=",
     "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",

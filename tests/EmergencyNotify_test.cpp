@@ -27,6 +27,8 @@
 
 #include "EmergencyCall.hpp"
 #include "EmergencyNotifier.hpp"
+#include "FakePbxEnv.hpp"
+#include "Witness.hpp"
 #include "LoopbackAnchorClient.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
@@ -1584,4 +1586,57 @@ TEST(E911Notify, AHandsetCancelBeforeTheCarriersFinalIsNeverReportedNotRouted)
 		EXPECT_EQ(b.countOf("ROUTED TO TRUNK"), 1) << b.dump();
 		EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << "the caller hung up; nothing was refused:\n" << b.dump();
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The notify MESSAGE is addressed at the phone's registered Contact URI
+// (#904 review). A Snom answers 404 to the bare sip:<ext>@<ip:port> form, which
+// drops its ;line= (RFC 3261 §8.1.1.1, §10.2.1): a 911 notification that never
+// reaches the front desk. Same send path, one string changed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+	std::string enRequestLine(const std::string& raw)
+	{
+		return raw.substr(0, raw.find("\r\n"));
+	}
+}
+
+TEST(E911Notify, TheNotifyMessageGoesToTheRegisteredContactUriWithItsParams)
+{
+	pdwitness::clear();
+	FakePbxEnv env;
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.78.20", 5062);
+	auto phone = std::make_shared<SipClient>("200", phoneAddr);
+	phone->setContactUri("sip:200@192.168.78.20:5062;transport=udp;line=pd911n");
+	env.registered["200"] = phone;
+	EmergencyNotifier notifier(env);
+	pbx::E911Config cfg;
+	cfg.notifyExts = {"200"};
+
+	EXPECT_EQ(notifier.notify(cfg, false, "101", "911", false, true), 1u);
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(enRequestLine(env.sentRaw(0)),
+		"MESSAGE sip:200@192.168.78.20:5062;transport=udp;line=pd911n SIP/2.0");
+	EXPECT_EQ(ntohs(env.sent[0].to.sin_port), 5062) << "still sent to the registered address";
+	EXPECT_NE(env.sentRaw(0).find("EMERGENCY: 911"), std::string::npos) << env.sentRaw(0);
+	EXPECT_EQ(pdwitness::count("e911: notify MESSAGE Request-URI: registered Contact"), 1u);
+}
+
+TEST(E911Notify, TheNotifyMessageToAPhoneWithNoStoredContactKeepsTheBareForm)
+{
+	pdwitness::clear();
+	FakePbxEnv env;
+	env.registered["200"] = std::make_shared<SipClient>("200", FakePbxEnv::addr("192.168.78.20", 5062));
+	EmergencyNotifier notifier(env);
+	pbx::E911Config cfg;
+	cfg.notifyExts = {"200"};
+
+	EXPECT_EQ(notifier.notify(cfg, true, "101", "933", false, false), 1u);
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(enRequestLine(env.sentRaw(0)), "MESSAGE sip:200@192.168.78.20:5062 SIP/2.0");
+	EXPECT_EQ(pdwitness::count("e911: notify MESSAGE Request-URI: bare (no Contact stored)"), 1u);
 }

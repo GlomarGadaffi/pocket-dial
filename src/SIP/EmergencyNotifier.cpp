@@ -8,6 +8,7 @@
 #include "SipMessage.hpp"
 #include "SipWireUtil.hpp"
 #include "Syslog.hpp"
+#include "Witness.hpp"
 
 namespace pbx
 {
@@ -99,7 +100,6 @@ std::shared_ptr<SipMessage> EmergencyNotifier::buildNotifyMessage(const std::str
 	}
 
 	addrOut = client->getAddress();
-	const std::string destIpPort = sipwire::addrToIpPort(addrOut);
 	const std::string activeIp   = _env.localIp();
 	const std::string srcIpPort  = activeIp + ":" + std::to_string(_env.serverPort());
 
@@ -108,7 +108,11 @@ std::shared_ptr<SipMessage> EmergencyNotifier::buildNotifyMessage(const std::str
 	const std::string fromTag = IDGen::GenerateID(9);
 
 	std::ostringstream ss;
-	ss << "MESSAGE sip:" << ext << "@" << destIpPort << " SIP/2.0\r\n"
+	// The registered Contact URI with its parameters: a Snom answers 404 to the
+	// bare form without its ;line= (#904 review). Bare only when none is stored.
+	PD_WITNESS_I("e911", "notify MESSAGE Request-URI: %s",
+		client->getContactUri().empty() ? "bare (no Contact stored)" : "registered Contact");
+	ss << "MESSAGE " << sipwire::memberRequestUri(*client) << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
 	   << "From: \"Emergency\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
 	   << "To: <sip:" << ext << "@" << activeIp << ">\r\n"

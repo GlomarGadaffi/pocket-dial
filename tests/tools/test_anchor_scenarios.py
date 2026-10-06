@@ -619,6 +619,7 @@ class WitnessSampleTest(unittest.TestCase):
         "adopt_reread_349": "W (51234) TelephonyAnchor: makeCall: no leg listed yet (list status=200, read 1: 0 "
                             "listed, 0 direct_control, 0 slot-claimed, 0 an earlier call's; direct_control false 0, "
                             "absent 0, not a bool 0) — reading again (#349)",
+        "e911_notify_uri": "I (88123) e911: notify MESSAGE Request-URI: registered Contact",
     }
 
     def test_each_witness_regex_matches_the_line_the_firmware_formats(self):

@@ -386,6 +386,7 @@ the firmware formats.
 | `adopted_349` | `but 3CX has our leg (\S+) .*adopting the call instead of failing it \(#349\)` | #903: an unread makecall response reconciled to our own leg |
 | `orphaned_349` | `a call may be ORPHANED on 3CX \(#349/#328\)` | #903: no response and no reconcilable leg after every re-read |
 | `adopt_reread_349` | `makeCall: no leg listed yet \(list status=-?\d+, read (\d+):` | #903: one adopt re-read that found no leg yet, with what the list held |
+| `e911_notify_uri` | `e911: notify MESSAGE Request-URI: (registered Contact\|bare \(no Contact stored\))` | #904 review: a 911/933 notify MESSAGE addressed at the phone's registered Contact (or the bare form when none is stored) |
 
 **Safety preconditions.** Each one is refused before anything is sent (exit 2), except
 the S1 pin and the far-end check, which are made against the board:
