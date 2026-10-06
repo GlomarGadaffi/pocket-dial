@@ -183,6 +183,9 @@ LOG_COUNTERS = {
     "get_transport_giveup": r"GET stream: \d+ consecutive transport failures",
     "get_rebuild_giveup": r"GET stream: could not rebuild client after transport failure",
     "get_never_opened": r"GET \(Telephony->device\) stream never opened",
+    # #893: the far end's audio reached us (runRxLoop). With no ringing reference: a diversion.
+    "get_open": r"GET \(Telephony->device\) audio stream OPEN: \S*/participants/([^/\s]+)/stream",
+    "first_chunk": r"GET read: first chunk \d+ bytes <- Telephony \((\S+)\)",
     "post_open": r"POST \(device->Telephony\) audio stream OPEN: \S*/participants/([^/\s]+)/stream",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (\S+) reason=",
@@ -1489,7 +1492,9 @@ def x4_classify(c):
     (a 503, no final) but is not a CANCEL while ringing."""
     bucket, problem = _x4_bucket(c)
     if c.get("ref_timeout") and bucket == "cancelled":
-        bucket = "no_ringing_ref"
+        # #893: the far end's audio opened with no ringing reference: voicemail or another
+        # answering service took the call, so the far leg never rang.
+        bucket = "diverted" if c.get("audio_opened") else "no_ringing_ref"
     return bucket, problem
 
 
@@ -1532,6 +1537,7 @@ def x4_when(run, delay_ms, st):
             legs.setdefault(m.group(1), t)
         if legs and st.get("leg_t") is None:
             st["leg_t"] = min(legs.values())
+            st["own_leg"] = min(legs, key=legs.get)
         for t, m in matches(ents, "leg_listed"):
             if m.group(1) in legs:
                 st["ref_t"], st["leg"] = t, m.group(1)
@@ -1546,7 +1552,21 @@ def ref_stage(st, dlg):
         return "the reference function failed: %s" % dlg.cancel_when_error
     if st.get("leg_t") is None:
         return "no own-leg line: the makecall response never came"
+    if st.get("audio_opened"):
+        return DIVERTED
     return "the leg was never listed as ringing"
+
+
+DIVERTED = ("diverted: the far end's audio stream opened with no ringing reference (voicemail or another "
+            "answering service; a person's phone as the far end does this on repeat calls, #893)")
+
+
+def audio_opened(run, since, leg):
+    """True if the board logged the GET stream opening, or its first chunk, for `leg` since `since`."""
+    if leg is None:
+        return False
+    ents = run.syslog.entries(since)
+    return bool(matches(ents, "get_open", leg) or matches(ents, "first_chunk", leg))
 
 
 def x4_run(run, sc):
@@ -1556,7 +1576,7 @@ def x4_run(run, sc):
     run.say("%d calls %s -> far end, CANCEL swept %d..%d ms after 3CX lists the far leg as ringing (the "
             "'Upset ... status' syslog line; not the INVITE), reference wait <= %g s, gap %.0f s"
             % (n, caller.ext, lo, hi, sc["ref_timeout_s"], sc["gap_s"]))
-    misses = 0
+    misses = diverted = 0
     for i in range(n):
         if run.stopped():
             break
@@ -1569,6 +1589,9 @@ def x4_run(run, sc):
         rec = call_record(i, cancel_ms, dlg, t_start)
         rec["ring_ref_ms"] = ms_since(dlg.invite_sent_at, st.get("ref_t"))
         rec["ref_timeout"] = bool(dlg.cancel_when_expired) and st.get("ref_t") is None
+        if rec["ref_timeout"]:
+            st["audio_opened"] = audio_opened(run, dlg.invite_sent_at, st.get("own_leg"))
+        rec["audio_opened"] = bool(st.get("audio_opened"))
         rec["ref_stage"] = ref_stage(st, dlg) if rec["ref_timeout"] else None
         rec["ref_leg"] = st.get("leg")
         rec["cancel_after_ref_ms"] = None if None in (rec["cancel_sent_ms"], rec["ring_ref_ms"]) \
@@ -1590,11 +1613,15 @@ def x4_run(run, sc):
                    " [a phantom ended the wait]" if st.get("phantom") else ""))
         run.pull_pcap("call-%02d" % (i + 1))
         misses = misses + 1 if rec["ref_timeout"] else 0
+        diverted = diverted + 1 if rec["bucket"] == "diverted" else 0
         if misses >= MAX_NO_REF:
             # #892: the last leg's drop line follows its stream stop by ~0.2-0.5 s; the abort closes
             # the syslog capture, so wait the drop window first. A leg still undropped then FAILs.
             run.watch_call(time.monotonic() + sc["drop_wait_s"],
                            stop_when=lambda: not undropped_legs(run.syslog.lines()))
+            if diverted >= misses:
+                raise run_soak.Abort("INVALID", "%d calls in a row were %s: the run stops rather than ring the "
+                                     "far end for nothing" % (misses, DIVERTED))
             raise run_soak.Abort("INVALID", "%d calls in a row had no ringing reference within %g s (%s): the "
                                  "run stops rather than ring the far end for nothing"
                                  % (misses, sc["ref_timeout_s"], rec["ref_stage"]))
@@ -1612,7 +1639,12 @@ def x4_judge(run, sc, lines):
             fails.append("call %d took %.1f s (cap %d s)" % (c["call"], c["duration_s"], sc["call_cap_s"]))
     if len(run.calls) < sc["calls"]:
         invalid.append("only %d of %d calls ran" % (len(run.calls), sc["calls"]))
-    missed = [c for c in run.calls if c.get("ref_timeout")]
+    diverted = [c for c in run.calls if c["bucket"] == "diverted"]
+    if diverted:
+        invalid.append("%d of %d calls were %s (%s): the far leg never rang, so they do not count toward the "
+                       "path (INVALID, never PASS)"
+                       % (len(diverted), len(run.calls), DIVERTED, calls_text([c["call"] for c in diverted])))
+    missed = [c for c in run.calls if c.get("ref_timeout") and c["bucket"] != "diverted"]
     if missed:
         stages = collections.Counter(c["ref_stage"] for c in missed)
         invalid.append("%d of %d calls had no ringing reference within %g s (%s; %s): each was CANCELled at the "

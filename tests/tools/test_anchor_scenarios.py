@@ -753,6 +753,7 @@ class FakeBoard(FakePbx):
         self.upset_delay_s = 0.0          # the Upset line comes this long after the own-leg line
         self.no_upset_calls = set()       # call indexes that never log an Upset line
         self.no_leg_calls = set()         # call indexes whose makecall response never comes (no own-leg line)
+        self.diverted_calls = set()       # #893: call indexes whose far end's audio opens with no Upset line
         self.drop_delay_s = 0.0           # a CANCEL that beat the leg: its drop follows the leg by this long
         self.cancel_drop_delay_s = 0.0    # #892: a CANCEL of a live leg: its drop follows the CANCEL by this long
         self.drop_counts = {}             # call index -> number of drop lines (default 1)
@@ -834,6 +835,11 @@ class FakeBoard(FakePbx):
             self.log("TelephonyAnchor: startRxIfNeeded: rx task for %s still exiting -- not restarting "
                      "yet (#554)" % leg)
         c["leg_up"] = True
+        if i in self.diverted_calls:              # #893: voicemail answers; no Upset line ever comes
+            self.log("TelephonyAnchor: GET (Telephony->device) audio stream OPEN: https://%s/callcontrol/%s/"
+                     "participants/%s/stream" % (TENANT, self.route_dn, leg))
+            self.log("TelephonyAnchor: GET read: first chunk 512 bytes <- Telephony (%s)" % leg)
+            return
         if self.upset_status is not None and i not in self.no_upset_calls:
             if self.upset_delay_s > 0:
                 threading.Timer(self.upset_delay_s, self._upset_later, (c,)).start()
@@ -1212,6 +1218,37 @@ class RunTest(unittest.TestCase):
         self.assertEqual(len(self.calls()), 2, "the third call is never placed")
         self.assertEqual(len(self.board.invite_users), 2)
         self.assertIn("2 calls in a row had no ringing reference", out)
+
+    def test_x4_a_diverted_call_has_its_own_bucket_and_verdict(self):
+        # #893: the audio stream opened (512 B first chunk) and no 'Dialing' Upset line came
+        self.board.diverted_calls = {1}
+        rc, out = self.go(overrides={"ref_timeout_s": 0.6})
+        self.assertEqual(rc, 3, out)
+        calls = self.calls()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.manifest["summary"]["buckets"], {"cancelled": 2, "diverted": 1})
+        self.assertTrue(calls[1]["audio_opened"])
+        self.assertEqual(calls[1]["ref_stage"], an.DIVERTED)
+        reasons = self.manifest["invalid_reasons"]
+        self.assertTrue(any("1 of 3 calls were diverted" in r and "call 2" in r for r in reasons), reasons)
+        self.assertFalse(any("had no ringing reference" in r for r in reasons), reasons)
+        self.assertEqual(self.manifest["fail_reasons"], [])
+
+    def test_x4_two_diverted_calls_in_a_row_stop_the_run_naming_the_diversion(self):
+        self.board.diverted_calls = {0, 1}
+        rc, out = self.go(overrides={"ref_timeout_s": 0.5, "calls": 3})
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(len(self.calls()), 2)
+        self.assertIn("2 calls in a row were diverted", out)
+        self.assertNotIn("calls in a row had no ringing reference", out)
+
+    def test_x4_a_call_with_a_ringing_reference_and_audio_is_unchanged(self):
+        # the negative: an opened stream does not reclassify a call that had its reference
+        base = {"final": 487, "cancel_status": 200, "cancel_sent_ms": 900, "cancel_answered_ms": 950,
+                "final_ms": 960, "provisional": [[180, 5]], "bye": None}
+        self.assertEqual(an.x4_classify(dict(base, audio_opened=True)), ("cancelled", None))
+        self.assertEqual(an.x4_classify(dict(base, ref_timeout=True)), ("no_ringing_ref", None))
+        self.assertEqual(an.x4_classify(dict(base, ref_timeout=True, audio_opened=True)), ("diverted", None))
 
     def test_x4_the_no_reference_stop_waits_for_the_last_legs_late_drop(self):
         # #892: the stop fell on the last call and its drop line came ~0.3 s later
