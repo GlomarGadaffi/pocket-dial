@@ -4871,7 +4871,10 @@ bool RequestsHandler::isTrunkAnswerToOurEmergencyInvite(const SipMessage& m)
 {
 	if (!m.getStatusInfo().has_value() || m.getCSeqMethod() != "INVITE") return false;
 	const SipTrunk::Dialog* d = _sipTrunk.findByCallID(m.getCallID());
-	if (!d || d->role != SipTrunk::Role::Outbound) return false;
+	if (!d) return false;
+#if POCKETDIAL_TRUNK_INBOUND
+	if (d->role != SipTrunk::Role::Outbound) return false;   // Dialog::role exists only with inbound trunking
+#endif   // without it every trunk dialog is ours, outbound
 	const uint32_t from = m.getSource().sin_addr.s_addr;
 	if (from != d->peer.sin_addr.s_addr && from != d->nextHop.sin_addr.s_addr) return false;
 	const auto s = getSession(d->handsetCallID);
