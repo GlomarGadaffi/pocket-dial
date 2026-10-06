@@ -375,6 +375,18 @@ then 500 ms per attempt, plus a TLS reconnect of up to 1.3 s per attempt once th
 a real 200, so it fits the 30 s call cap. The Held variant of `x279` and `x350`/`x336` are not
 registered.
 
+**Path witnesses.** One `esp_log` line per fixed path (`src/SIP/Witness.hpp`: `ESP_LOGx` on the board,
+a list a host test reads on the host), each registered in `LOG_COUNTERS` so a scenario can pre-register
+it as its path counter. No witness carries a number, a URI user or a credential.
+`tests/tools/test_anchor_scenarios.py` (`WitnessSampleTest`) checks every regex below against the line
+the firmware formats.
+
+| Counter | Line (regex) | Path |
+|---|---|---|
+| `adopted_349` | `but 3CX has our leg (\S+) .*adopting the call instead of failing it \(#349\)` | #903: an unread makecall response reconciled to our own leg |
+| `orphaned_349` | `a call may be ORPHANED on 3CX \(#349/#328\)` | #903: no response and no reconcilable leg after every re-read |
+| `adopt_reread_349` | `makeCall: no leg listed yet \(list status=-?\d+, read (\d+):` | #903: one adopt re-read that found no leg yet, with what the list held |
+
 **Safety preconditions.** Each one is refused before anything is sent (exit 2), except
 the S1 pin and the far-end check, which are made against the board:
 

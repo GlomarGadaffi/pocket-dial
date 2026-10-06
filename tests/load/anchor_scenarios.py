@@ -175,6 +175,8 @@ LOG_COUNTERS = {
     # makeCall() (#349): the unread response reconciled to our own leg, or not.
     "adopted_349": r"but 3CX has our leg (\S+) .*adopting the call instead of failing it \(#349\)",
     "orphaned_349": r"a call may be ORPHANED on 3CX \(#349/#328\)",
+    # #903: each adopt re-read that found no leg yet, with what the list held (group 1 = the read).
+    "adopt_reread_349": r"makeCall: no leg listed yet \(list status=-?\d+, read (\d+):",
     # runRxLoop()'s GET stream (#379, #518). A spent budget is attempt N/N.
     "get_refused": r"GET stream refused \(HTTP (\d+)\) for ",
     "get_refused_403": r"GET stream refused \(HTTP 403\) for \S*/participants/([^/\s]+)/stream",

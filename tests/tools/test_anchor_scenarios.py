@@ -605,6 +605,33 @@ class RefusalTest(unittest.TestCase):
         self.assertIn("x4_cancel_ringing", buf.getvalue())
 
 
+class WitnessSampleTest(unittest.TestCase):
+    """Each path witness's LOG_COUNTERS regex against the line the firmware formats (its ESP_LOGx
+    or PD_WITNESS format with sample values, behind the esp_log prefix syslog carries)."""
+
+    SAMPLES = {
+        "adopted_349": "W (51234) TelephonyAnchor: makeCall: no response read (status=-1) but 3CX has our leg "
+                       "517 — adopting the call instead of failing it (#349); 1 candidate leg(s) on read 2",
+        "orphaned_349": "E (51234) TelephonyAnchor: makeCall: request reached 3CX but no response and no "
+                        "reconcilable leg after 6 attempts (last list status=200: 2 listed, 0 direct_control, 0 "
+                        "slot-claimed, 1 an earlier call's; direct_control false 0, absent 2, not a bool 0) — "
+                        "a call may be ORPHANED on 3CX (#349/#328)",
+        "adopt_reread_349": "W (51234) TelephonyAnchor: makeCall: no leg listed yet (list status=200, read 1: 0 "
+                            "listed, 0 direct_control, 0 slot-claimed, 0 an earlier call's; direct_control false 0, "
+                            "absent 0, not a bool 0) — reading again (#349)",
+    }
+
+    def test_each_witness_regex_matches_the_line_the_firmware_formats(self):
+        for name, line in sorted(self.SAMPLES.items()):
+            with self.subTest(counter=name):
+                self.assertIn(name, an.LOG_COUNTERS)
+                self.assertEqual(an.count_lines([line])[name], 1, line)
+
+    def test_no_witness_sample_carries_a_number_beyond_a_leg_or_a_count(self):
+        for name, line in self.SAMPLES.items():
+            self.assertNotRegex(line, r"\d{7,}", name)
+
+
 class CounterTest(unittest.TestCase):
     LINES = [
         "I (1) TelephonyAnchor: Successfully initiated call to <x> (own leg 19)",
