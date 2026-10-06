@@ -4607,6 +4607,21 @@ namespace
 {
 	// desmo, #878: what a NOT ROUTED notification says failed.
 	constexpr std::string_view kAnchorNotPlaced = "the 3CX anchor could not place the call";
+
+	// #901: the number an outbound call dialed: its kept INVITE's To user, or,
+	// where none was kept (the synchronous anchor branch), the user of the
+	// dialog To it recorded at answer. Never a 3CX participant id.
+	std::string dialedNumberOf(const Session& s)
+	{
+		if (const auto inv = s.getInviteMessage()) return std::string(inv->getToNumber());
+		std::string_view to = s.getDialogTo();
+		if (const size_t lt = to.find('<'); lt != std::string_view::npos) to.remove_prefix(lt + 1);
+		const size_t colon = to.find(':');
+		if (colon == std::string_view::npos) return {};
+		to.remove_prefix(colon + 1);
+		const size_t end = to.find_first_of("@;>");
+		return end == std::string_view::npos ? std::string() : std::string(to.substr(0, end));
+	}
 	constexpr std::string_view kAnchorThenTrunkRefused =
 		"the 3CX anchor could not place the call; the trunk refused it";
 	constexpr std::string_view kAnchorNoTrunk =
@@ -5436,10 +5451,18 @@ void RequestsHandler::anchorDroppedLocked(const std::string& participantId)
 			                          fromHeader, std::string(inviteMsg->getFrom()));
 			if (bye) _asyncOutbox.emplace_back(caller->getAddress(), std::move(bye));
 		}
+		else if (caller && !session->getDialogFrom().empty() && !session->getDialogTo().empty())
+		{
+			// The synchronous branch keeps no INVITE, only the dialog headers it
+			// answered with: the same BYE the degraded-audio sweep sends.
+			auto bye = buildServerBye(caller->getNumber(), caller->getAddress(), callId,
+			                          session->getDialogTo(), session->getDialogFrom());
+			if (bye) _asyncOutbox.emplace_back(caller->getAddress(), std::move(bye));
+		}
 
 		std::string localCallId = callId;
 		endCall(localCallId, session->getSrc() ? session->getSrc()->getNumber() : "",
-		        inviteMsg ? inviteMsg->getToNumber() : "", "anchor hangup");
+		        dialedNumberOf(*session), "anchor hangup");
 		break;
 	}
 }
@@ -10330,7 +10353,10 @@ void RequestsHandler::tick()
 				}
 				queueLog(std::string("[Telephony] anchor call reaped (no ") + (stillRinging ? "answer" : "ACK") +
 				         ") — dropped leg " + part);
-				endCall(callID, session->getSrc() ? session->getSrc()->getNumber() : "", part, "anchor reap");
+				// #901: the CDR callee is the number dialed, never the 3CX participant id.
+				PD_WITNESS_I("pbx", "CDR callee is the dialed number (anchor reap) (#901)");
+				endCall(callID, session->getSrc() ? session->getSrc()->getNumber() : "",
+					dialedNumberOf(*session), "anchor reap");
 				continue;
 			}
 
@@ -10553,9 +10579,10 @@ void RequestsHandler::tick()
 
 			// CDR src/dest convention differs by direction (same as the no-answer
 			// reap above splits it): outbound treats the local extension as src
-			// and the anchor leg as dest; inbound treats the anchor participant
-			// as src and the (already-answered, since this call is Connected/
-			// Held) local extension as dest.
+			// and the number it dialed as dest (#901: not the anchor leg's id);
+			// inbound treats the anchor participant as src and the
+			// (already-answered, since this call is Connected/Held) local
+			// extension as dest.
 			if (session->isAnchorInbound())
 			{
 				auto handset = session->getDest();
@@ -10577,7 +10604,9 @@ void RequestsHandler::tick()
 						callID, dTo, dFrom);
 					if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
 				}
-				endCall(callID, handset ? handset->getNumber() : "", part,
+				// #901: the CDR callee is the number dialed, never the 3CX participant id.
+				PD_WITNESS_I("pbx", "CDR callee is the dialed number (anchor audio write failure) (#901)");
+				endCall(callID, handset ? handset->getNumber() : "", dialedNumberOf(*session),
 					"anchor audio write failure");
 			}
 		}

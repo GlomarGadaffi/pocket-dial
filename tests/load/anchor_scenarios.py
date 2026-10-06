@@ -199,6 +199,8 @@ LOG_COUNTERS = {
     "anchor_drop_ringing_880": r"anchor dropped a ringing outbound leg: final 503 to the caller, no BYE(, NOT ROUTED sent)? \(#880\)",
     # #879/#880: a 911/933 told ROUTED whose route then failed before it connected; group 1 = the failure.
     "e911_not_routed": r"e911: NOT ROUTED correction: (.+)",
+    # #901: an outbound anchored call torn down by the reap or the degraded sweep records the dialed number.
+    "cdr_callee_dialed_901": r"CDR callee is the dialed number \((anchor reap|anchor audio write failure)\) \(#901\)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (\S+) reason=",
     "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",

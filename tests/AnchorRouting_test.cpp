@@ -994,6 +994,99 @@ TEST(AnchorRouting, TickTearsDownAnAnchorCallAfterRepeatedWriteAudioFailures)
 		<< "the BYE must carry the SAME Call-ID as the torn-down session";
 }
 
+// #901: on .244 the degraded teardown's CDR row read callee "517", the 3CX
+// participant id, for a call to a real number. The callee is the number the
+// handset dialed, on every teardown of an outbound anchored call; for a 911
+// too (Rule 5: its CDR must not misreport the dialed 911).
+namespace
+{
+	struct CdrRig
+	{
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+		RequestsHandler handler{"192.168.9.1", 5060,
+			[this](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+				sent.emplace_back(addr, std::move(msg));
+			}};
+
+		explicit CdrRig(const std::string& dialed, const std::string& callId)
+		{
+			handler.setAnchorPlacesRealCallsForTest(true);   // the loopback otherwise refuses 911 (#521)
+			handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+			handler.handle(makeInvite("501", dialed, "192.168.9.51", callId));
+		}
+
+		std::string leg(const std::string& callId)
+		{
+			const auto s = handler.getSession("Call-ID: " + callId);
+			return s.has_value() && s.value() ? s.value()->getAnchorParticipantId() : std::string();
+		}
+
+		void expectOneCdr(const std::string& callee)
+		{
+			const auto cdr = handler.cdrSnapshotForTest();
+			ASSERT_EQ(cdr.size(), 1u);
+			EXPECT_EQ(cdr[0].caller, "501");
+			EXPECT_EQ(cdr[0].callee, callee) << "the dialed number, never the 3CX participant id";
+		}
+	};
+}
+
+TEST(AnchorRouting, ADegradedTeardownWritesTheDialedNumberAsTheCdrCallee)
+{
+	for (const std::string dialed : { "555", "911" })
+	{
+		SCOPED_TRACE(dialed);
+		CdrRig rig(dialed, "anchor-901-" + dialed);
+		MediaBridge* bridge = rig.handler.anchorBridgeForCallIdForTest("Call-ID: anchor-901-" + dialed);
+		ASSERT_NE(bridge, nullptr);
+		ASSERT_FALSE(rig.leg("anchor-901-" + dialed).empty());
+		const std::vector<uint8_t> frame(160, 0xFF);
+		bridge->onHandsetRtp(frame.data(), frame.size());
+		rig.handler.anchorClientForTest()->stop();
+		for (int i = 0; i < 30; ++i) bridge->onHandsetRtp(frame.data(), frame.size());
+		ASSERT_TRUE(bridge->isAudioDegraded());
+
+		rig.handler.tick();
+
+		ASSERT_FALSE(rig.handler.getSession("Call-ID: anchor-901-" + dialed).has_value());
+		rig.expectOneCdr(dialed);
+	}
+}
+
+TEST(AnchorRouting, AnAckDeadlineReapWritesTheDialedNumberAsTheCdrCallee)
+{
+	CdrRig rig("555", "anchor-901-reap");
+	auto session = rig.handler.getSession("Call-ID: anchor-901-reap");
+	ASSERT_TRUE(session.has_value());
+	session.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	rig.handler.forceNextTickForTest();
+	rig.handler.tick();
+	ASSERT_FALSE(rig.handler.getSession("Call-ID: anchor-901-reap").has_value());
+	rig.expectOneCdr("555");
+}
+
+TEST(AnchorRouting, AParticipantRemoveAndAHandsetByeAlreadyWriteTheDialedNumber)
+{
+	for (const std::string dialed : { "555", "911" })
+	{
+		SCOPED_TRACE(dialed);
+		{
+			CdrRig rig(dialed, "anchor-901-rm");
+			const std::string leg = rig.leg("anchor-901-rm");
+			ASSERT_FALSE(leg.empty());
+			rig.handler.anchorDroppedForTest(leg);   // 3CX's Participant Remove on a connected call
+			ASSERT_FALSE(rig.handler.getSession("Call-ID: anchor-901-rm").has_value());
+			rig.expectOneCdr(dialed);
+		}
+		{
+			CdrRig rig(dialed, "anchor-901-bye");
+			rig.handler.handle(makeBye("501", dialed, "192.168.9.51", "anchor-901-bye"));
+			ASSERT_FALSE(rig.handler.getSession("Call-ID: anchor-901-bye").has_value());
+			rig.expectOneCdr(dialed);
+		}
+	}
+}
+
 TEST(AnchorRouting, ForceDisconnectByesTheHandsetOnASynchronousAnchorCall)
 {
 	// Advisor's ask while reviewing #279: the missing setDialogHeaders() on

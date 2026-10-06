@@ -624,6 +624,7 @@ class WitnessSampleTest(unittest.TestCase):
         "sdp_gate_yield_897": "W (77012) pbx: SDP gate yielded 'malformed line' for a trunk answer to our emergency INVITE (#897)",
         "anchor_drop_ringing_880": "W (61002) pbx: anchor dropped a ringing outbound leg: final 503 to the caller, no BYE, NOT ROUTED sent (#880)",
         "e911_not_routed": "W (61003) e911: NOT ROUTED correction: the carrier hung up before answering",
+        "cdr_callee_dialed_901": "I (99001) pbx: CDR callee is the dialed number (anchor audio write failure) (#901)",
     }
 
     def test_each_witness_regex_matches_the_line_the_firmware_formats(self):

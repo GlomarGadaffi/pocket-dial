@@ -391,6 +391,7 @@ the firmware formats.
 | `sdp_gate_yield_897` | `SDP gate yielded '([^']+)' for a trunk answer to our emergency INVITE \(#897\)` | #897: a PSAP's 1xx/200 that trips any checkSdp() verdict is ACKed and connects instead of being dropped |
 | `anchor_drop_ringing_880` | `anchor dropped a ringing outbound leg: final 503 to the caller, no BYE(, NOT ROUTED sent)? \(#880\)` | #880: CallEvent::Dropped on a ringing outbound anchored call (a 911 also gets one NOT ROUTED) |
 | `e911_not_routed` | `e911: NOT ROUTED correction: (.+)` | #879/#880: every NOT ROUTED correction (trunk refusal or timeout, anchor drop, trunk answer exits, early carrier BYE) |
+| `cdr_callee_dialed_901` | `CDR callee is the dialed number \((anchor reap\|anchor audio write failure)\) \(#901\)` | #901: the degraded (audio write failure) and reaped anchor teardowns write the dialed number as the CDR callee |
 
 **Safety preconditions.** Each one is refused before anything is sent (exit 2), except
 the S1 pin and the far-end check, which are made against the board:
