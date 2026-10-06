@@ -9956,7 +9956,6 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 		}
 
 		const sockaddr_in& addr = client.value()->getAddress();
-		std::string destIpPort = sipwire::addrToIpPort(addr);
 
 		std::string activeIp = _localIp;
 		std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
@@ -9970,7 +9969,8 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 		std::string body = text.size() > 512 ? text.substr(0, 512) : text;
 
 		std::ostringstream ss;
-		ss << "MESSAGE sip:" << ext << "@" << destIpPort << " SIP/2.0\r\n"
+		// The registered Contact with its parameters (a Snom answers 404 without its ;line=).
+		ss << "MESSAGE " << memberRequestUri(*client.value()) << " SIP/2.0\r\n"
 		   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
 		   << "From: \"PocketDial\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
 		   << "To: <sip:" << ext << "@" << activeIp << ">\r\n"
