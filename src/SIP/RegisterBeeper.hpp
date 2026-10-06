@@ -127,6 +127,7 @@ private:
 		std::string branch;        // Via branch (reused for INVITE/CANCEL)
 		std::string fromTag;       // our (server) From tag
 		std::string ext;           // target extension (phone number)
+		std::string requestUri;    // the phone's registered Contact URI (#856); INVITE/ACK/CANCEL go to it
 		sockaddr_in addr{};        // phone's contact address
 		std::chrono::steady_clock::time_point deadline{};
 		// Issue #104: counts consecutive buildCancel() failures (message-pool

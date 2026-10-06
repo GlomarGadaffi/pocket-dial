@@ -8,7 +8,7 @@
 #include "ServiceExtensions.hpp"
 #include "SipWireUtil.hpp"
 
-using sipwire::addrToIpPort;
+using sipwire::memberRequestUri;
 
 RegisterBeeper::BeepDialog* RegisterBeeper::findByCallID(std::string_view callID)
 {
@@ -52,6 +52,7 @@ void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone, std::chro
 	slot->callID.clear();
 	slot->ext  = phone->getNumber();
 	slot->addr = phone->getAddress();
+	slot->requestUri = memberRequestUri(*phone);
 	const auto now = std::chrono::steady_clock::now();
 	if (delay.count() > 0)
 	{
@@ -70,8 +71,6 @@ void RegisterBeeper::fire(BeepDialog& bd, std::chrono::steady_clock::time_point 
 	BeepDialog* slot = &bd;
 	const std::string clientNum = slot->ext;
 	const sockaddr_in addr = slot->addr;
-	std::string destIpPort = addrToIpPort(addr);
-
 	std::string activeIp = _env.localIp();
 	std::string srcIpPort = activeIp + ":" + std::to_string(_env.serverPort());
 
@@ -93,7 +92,7 @@ void RegisterBeeper::fire(BeepDialog& bd, std::chrono::steady_clock::time_point 
 	const std::string body = sipwire::makeInactiveHoldSdp(activeIp);
 
 	std::ostringstream ss;
-	ss << "INVITE sip:" << clientNum << "@" << destIpPort << " SIP/2.0\r\n"
+	ss << "INVITE " << slot->requestUri << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
 	   << "From: \"PocketDial\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
 	   << "To: <sip:" << clientNum << "@" << activeIp << ">\r\n"
@@ -328,11 +327,20 @@ std::shared_ptr<SipMessage> RegisterBeeper::buildAck(const BeepDialog& bd,
 	// and needs a fresh one (#752), or a strict phone drops it as an INVITE
 	// retransmission and keeps re-sending its 200.
 	const std::string branch = for2xx ? "z9hG4bK" + IDGen::GenerateID(12) : bd.branch;
-	const std::string destIpPort = addrToIpPort(bd.addr);
 	const std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
 
+	// The ACK for a 2xx goes to the remote target, the Contact of that 200 (RFC 3261
+	// §12.2.1.1, §13.2.2.4); the registered one is the fallback. A non-2xx ACK is
+	// part of the INVITE transaction and repeats the INVITE's Request-URI (§17.1.1.3).
+	std::string_view target = bd.requestUri;
+	if (for2xx)
+	{
+		const std::string_view c = siphdr::contactUriView(ok->getContact());
+		if (!c.empty()) target = c;
+	}
+
 	std::ostringstream ss;
-	ss << "ACK sip:" << bd.ext << "@" << destIpPort << " SIP/2.0\r\n"
+	ss << "ACK " << target << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
 	   << "From: \"PocketDial\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
 	   << "To: " << siphdr::stripHeaderName(ok->getTo()) << "\r\n"
@@ -369,12 +377,11 @@ std::shared_ptr<SipMessage> RegisterBeeper::buildCancel(std::size_t slot)
 	}
 	BeepDialog& bd = _dialogs[slot];
 
-	std::string destIpPort = addrToIpPort(bd.addr);
 	std::string activeIp = _env.localIp();
 	std::string srcIpPort = activeIp + ":" + std::to_string(_env.serverPort());
 
 	std::ostringstream ss;
-	ss << "CANCEL sip:" << bd.ext << "@" << destIpPort << " SIP/2.0\r\n"
+	ss << "CANCEL " << bd.requestUri << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd.branch << "\r\n"
 	   << "From: \"PocketDial\" <sip:" << pbx::kServicePbx << "@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
 	   << "To: <sip:" << bd.ext << "@" << activeIp << ">\r\n"

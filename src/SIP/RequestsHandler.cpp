@@ -79,14 +79,7 @@ static bool isBroadcastCallerRequest(const std::shared_ptr<Session>& s, const Si
 	return s->isBroadcast() && src && m.getFromNumber() == src->getNumber();
 }
 
-// Request-URI toward a phone: its registered Contact with URI parameters intact
-// (a Snom answers 404/481 without its ;line=), the bare form only as a fallback.
-static std::string memberRequestUri(const SipClient& c)
-{
-	return c.getContactUri().empty()
-		? "sip:" + c.getNumber() + "@" + sipwire::addrToIpPort(c.getAddress())
-		: c.getContactUri();
-}
+using sipwire::memberRequestUri;
 
 static std::string stripHeaderName(std::string_view fullLine);
 
