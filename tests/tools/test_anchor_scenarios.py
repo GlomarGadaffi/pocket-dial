@@ -627,6 +627,14 @@ class WitnessSampleTest(unittest.TestCase):
         "get_403_failfast_902": "W (50211) TelephonyAnchor: GET stream: HTTP 403 on 6 consecutive attempts after "
                                 "the answer for /callcontrol/<dn>/participants/517/stream -- giving up now, not "
                                 "at attempt 240 (#902)",
+        "trunk_911_exempt_889": "W (40300) trunk: 911/933 dialog held past its no-answer bound: a provisional came, "
+                                "no PBX-side timeout (#712, #889)",
+        "stray_final_890": "W (40301) trunk: final 486 after the call was answered ignored (#890)",
+        "beep_uri_856": "I (30100) beep: register beep Request-URI: bare (no Contact stored)",
+        "upset_ignored_pending_888": "W (50300) TelephonyAnchor: Upset ignored while 1 makeCall(s) pending (oldest "
+                                     "1840 ms old): 3CX does not repeat a Connected one (#888)",
+        "e911_degraded_kept_906": "W (61100) e911: audio to the anchor keeps failing on a connected 911/933: kept up, "
+                                  "not hung up (#906)",
         "cdr_callee_dialed_901": "I (99001) pbx: CDR callee is the dialed number (anchor audio write failure) (#901)",
     }
 

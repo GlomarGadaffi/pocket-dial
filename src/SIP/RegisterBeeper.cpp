@@ -7,6 +7,7 @@
 #include "SipMessageTypes.h"
 #include "ServiceExtensions.hpp"
 #include "SipWireUtil.hpp"
+#include "Witness.hpp"
 
 using sipwire::memberRequestUri;
 
@@ -53,6 +54,8 @@ void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone, std::chro
 	slot->ext  = phone->getNumber();
 	slot->addr = phone->getAddress();
 	slot->requestUri = memberRequestUri(*phone);
+	PD_WITNESS_I("beep", "register beep Request-URI: %s",
+		phone->getContactUri().empty() ? "bare (no Contact stored)" : "registered Contact");
 	const auto now = std::chrono::steady_clock::now();
 	if (delay.count() > 0)
 	{

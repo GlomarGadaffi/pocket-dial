@@ -391,6 +391,12 @@ the firmware formats.
 | `sdp_gate_yield_897` | `SDP gate yielded '([^']+)' for a trunk answer to our emergency INVITE \(#897\)` | #897: a PSAP's 1xx/200 that trips any checkSdp() verdict is ACKed and connects instead of being dropped |
 | `anchor_drop_ringing_880` | `anchor dropped a ringing outbound leg: final 503 to the caller, no BYE(, NOT ROUTED sent)? \(#880\)` | #880: CallEvent::Dropped on a ringing outbound anchored call (a 911 also gets one NOT ROUTED) |
 | `e911_not_routed` | `e911: NOT ROUTED correction: (.+)` | #879/#880: every NOT ROUTED correction (trunk refusal or timeout, anchor drop, trunk answer exits, early carrier BYE) |
+| `trunk_911_exempt_889` | `trunk: 911/933 dialog held past its no-answer bound: a provisional came, no PBX-side timeout \(#712, #889\)` | #712/#889: a trunk 911/933 that drew a provisional is not timed out; once per dialog |
+| `stray_final_890` | `trunk: final (\d+) after the call was answered ignored \(#890\)` | #890: a carrier final after the 2xx is ignored, the call stays up |
+| `beep_uri_856` | `beep: register beep Request-URI: (registered Contact\|bare \(no Contact stored\))` | #856: which form the register beep's Request-URI took |
+| `upset_ignored_pending_888` | `Upset ignored while (\d+) makeCall\(s\) pending \(oldest (-?\d+) ms old\): 3CX does not repeat a Connected one \(#888\)` | #888: an upsert ignored while a makeCall was pending (a Connected one is not repeated by 3CX, so a route-point inbound or a PSAP callback may be lost); the pending age shows the window. ESP-only |
+| `e911_degraded_kept_906` | `e911: audio to the anchor keeps failing on a connected 911/933: kept up, not hung up \(#906\)` | #906: the degraded-audio sweep kept a connected 911/933 up and told the notify list (once per call) |
+| `get_403_failfast_902` | `GET stream: HTTP 403 on (\d+) consecutive attempts after the answer for /callcontrol/<dn>/participants/([^/\s]+)/stream -- giving up now, not at attempt (\d+) \(#902\)` | #902: 6 consecutive 403s after the answer gave up an ordinary outbound leg early (MediaNeverOpened follows). ESP-only |
 | `cdr_callee_dialed_901` | `CDR callee is the dialed number \((anchor reap\|anchor audio write failure)\) \(#901\)` | #901: the degraded (audio write failure) and reaped anchor teardowns write the dialed number as the CDR callee |
 
 **Safety preconditions.** Each one is refused before anything is sent (exit 2), except

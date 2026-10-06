@@ -33,6 +33,7 @@
 #include "LoopbackAnchorClient.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
+#include "Witness.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -1125,10 +1126,12 @@ TEST(AnchorRouting, ADegradedConnected911Or933IsKeptUpAndReportedOnce)
 		ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
 		ASSERT_TRUE(rig.degrade());
 		rig.sent.clear();
+		pdwitness::clear();
 
 		rig.handler.forceNextTickForTest();
 		rig.handler.tick();
 
+		EXPECT_EQ(pdwitness::count("audio to the anchor keeps failing on a connected 911/933: kept up"), 1u);
 		EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value())
 			<< "the degraded-audio sweep hung up a connected " << dialed;
 		EXPECT_TRUE(rig.bridge->isActive()) << "its bridge was stopped";

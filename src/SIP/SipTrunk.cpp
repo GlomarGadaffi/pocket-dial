@@ -1111,6 +1111,7 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	if (d->state == State::Confirmed)
 	{
 		_env.log("Trunk: " + std::to_string(status) + " after the call was answered ignored", true);
+		PD_WITNESS_W("trunk", "final %d after the call was answered ignored (#890)", status);
 		return true;
 	}
 
@@ -1389,6 +1390,12 @@ void SipTrunk::sweep(std::chrono::steady_clock::time_point now)
 		if (d.state == State::Proceeding &&
 		    (d.destE164 == pbx::kEmergencyNumber || d.destE164 == pbx::kEmergencyTestNumber))
 		{
+			if (!d.exemptWitnessed)
+			{
+				d.exemptWitnessed = true;
+				PD_WITNESS_W("trunk", "911/933 dialog held past its no-answer bound: a provisional came, "
+					"no PBX-side timeout (#712, #889)");
+			}
 			continue;
 		}
 

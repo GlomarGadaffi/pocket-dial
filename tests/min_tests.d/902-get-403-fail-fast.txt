@@ -1,3 +1,2 @@
 # TelephonyAnchorLogic_test.cpp: 5 (#902: 6 consecutive 403s after the answer give up an ordinary leg; before the answer never; any other status resets; 404/424 keep the budget; 911/inbound never early)
 5
-# tests/tools/test_anchor_get_403_fail_fast.py (unittest, not gtest): not counted here

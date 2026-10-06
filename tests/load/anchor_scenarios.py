@@ -206,6 +206,18 @@ LOG_COUNTERS = {
     "e911_not_routed": r"e911: NOT ROUTED correction: (.+)",
     # #901: an outbound anchored call torn down by the reap or the degraded sweep records the dialed number.
     "cdr_callee_dialed_901": r"CDR callee is the dialed number \((anchor reap|anchor audio write failure)\) \(#901\)",
+    # #889/#712: a trunk 911/933 that drew a provisional is held past its no-answer bound (once per dialog).
+    "trunk_911_exempt_889": r"trunk: 911/933 dialog held past its no-answer bound: a provisional came, "
+                            r"no PBX-side timeout \(#712, #889\)",
+    # #890: a carrier final after the call was answered, ignored; group 1 = the status.
+    "stray_final_890": r"trunk: final (\d+) after the call was answered ignored \(#890\)",
+    # #856: the register beep's Request-URI source, once per beep.
+    "beep_uri_856": r"beep: register beep Request-URI: (registered Contact|bare \(no Contact stored\))",
+    # #888: an upsert ignored while a makeCall was pending (group 1 = pending makeCalls, 2 = the oldest's age in ms).
+    "upset_ignored_pending_888": r"Upset ignored while (\d+) makeCall\(s\) pending \(oldest (-?\d+) ms old\): "
+                                 r"3CX does not repeat a Connected one \(#888\)",
+    # #906: the degraded-audio sweep kept a connected 911/933 up instead of hanging it up.
+    "e911_degraded_kept_906": r"e911: audio to the anchor keeps failing on a connected 911/933: kept up, not hung up \(#906\)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (\S+) reason=",
     "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",

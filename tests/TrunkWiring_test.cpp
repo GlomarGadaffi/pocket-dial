@@ -1069,6 +1069,45 @@ TEST(TrunkWiring, ARingingEmergencyCallIsNeverTimedOutButASilentOneStillIs)
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "only the silent leg's relay is released";
 }
 
+// #889 witness: the 911/933 exemption is logged once per dialog, however many sweeps pass.
+TEST(TrunkWiring, ARingingEmergencyCallsExemptionIsWitnessedOncePerDialog)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-889-witness"));
+	const auto ringing = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(ringing.callID.empty());
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		ringing.response("SIP/2.0 180 Ringing", false), addrFor(kSbcIp)));
+	pdwitness::clear();
+
+	for (int i = 0; i < 3; ++i)
+	{
+		b.handler.expireTrunkDeadlinesForTest();
+		b.handler.forceNextTickForTest();
+		b.handler.tick();
+	}
+
+	EXPECT_EQ(pdwitness::count("911/933 dialog held past its no-answer bound"), 1u);
+	EXPECT_TRUE(b.handler.getSession("Call-ID: call-889-witness").has_value());
+}
+
+// #890 witness: a carrier final after the answer is logged each time it is ignored.
+TEST(TrunkWiring, AStrayFinalAfterTheAnswerIsWitnessed)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-890-witness"));
+	const auto carrier = CarrierView::from(b.firstWithTo("INVITE sip:", kSbcIp));
+	ASSERT_FALSE(carrier.callID.empty());
+	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+	pdwitness::clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(carrier.response("SIP/2.0 486 Busy Here", false), addrFor(kSbcIp)));
+
+	EXPECT_EQ(pdwitness::count("final 486 after the call was answered ignored (#890)"), 1u);
+}
+
 // #889: a carrier 100, 182 (or 181, 199) now reaches SipTrunk, so it moves an
 // ORDINARY trunk call's dialog to Proceeding too. The #712 exemption is for
 // 911/933 only, so the 60 s no-answer bound ends that call exactly as it ends

@@ -363,7 +363,8 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	// leg is keyed onto a slot below (RAII clears it on every return path). The WS classifier reads
 	// this to treat an early unmatched upset as our far leg, not a new inbound (the per-slot
 	// successor to the old pre-POST _outboundActive flag, which guarded the same window).
-	_outboundPending.fetch_add(1, std::memory_order_acq_rel);
+	if (_outboundPending.fetch_add(1, std::memory_order_acq_rel) == 0)
+		_outboundPendingSinceUs.store(esp_timer_get_time(), std::memory_order_relaxed);   // #888
 	struct PendingDec {
 		std::atomic<int>& c;
 		~PendingDec() { c.fetch_sub(1, std::memory_order_acq_rel); }
@@ -2904,6 +2905,8 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 									std::string controlLegs[POCKETDIAL_MAX_ANCHOR_CALLS];
 									int nLegs = 0;
 									bool ownLeg = false;
+									int ignoredPending = 0;        // #888 witness: an upsert ignored while a makeCall was pending
+									int64_t ignoredAgeMs = 0;
 									uint64_t seq = 0;
 									{
 										std::lock_guard<std::mutex> lock(_mutex);
@@ -2936,6 +2939,11 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 												// No resolved outbound leg. If a makecall is mid-resolve, this
 												// is its (far) leg — ignore; otherwise it's a new inbound call.
 												if (pending == 0) controlLegs[nLegs++] = partId;
+												else
+												{
+													ignoredPending = pending;
+													ignoredAgeMs = (esp_timer_get_time() - _outboundPendingSinceUs.load(std::memory_order_relaxed)) / 1000;
+												}
 											}
 											else if (nin == 1 && pending == 0)
 											{
@@ -2951,6 +2959,11 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 										}
 									}
 									if (ownLeg) ESP_LOGI(TAG, "Upset for own leg %s, no outbound slot: not an inbound call (#379)", partId.c_str());
+									// #888: 3CX does not repeat a Connected upsert, so one ignored here (a route-point
+									// inbound or a PSAP callback) may be lost. Witness only; nothing is held or replayed.
+									if (ignoredPending > 0)
+										ESP_LOGW(TAG, "Upset ignored while %d makeCall(s) pending (oldest %lld ms old): "
+											"3CX does not repeat a Connected one (#888)", ignoredPending, (long long)ignoredAgeMs);
 									if (nLegs == 0) break;   // ignored (pending far leg / all-busy)
 
 									// Best-effort caller id (cheap, JSON-only) for an inbound ring's From display.
