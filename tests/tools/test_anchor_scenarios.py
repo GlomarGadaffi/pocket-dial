@@ -622,6 +622,8 @@ class WitnessSampleTest(unittest.TestCase):
         "e911_notify_uri": "I (88123) e911: notify MESSAGE Request-URI: registered Contact",
         "trunk_final_tag_896": "W (40211) trunk: final 200 To-tag differs from the early dialog's: the final's defines it (#896)",
         "sdp_gate_yield_897": "W (77012) pbx: SDP gate yielded 'malformed line' for a trunk answer to our emergency INVITE (#897)",
+        "anchor_drop_ringing_880": "W (61002) pbx: anchor dropped a ringing outbound leg: final 503 to the caller, no BYE, NOT ROUTED sent (#880)",
+        "e911_not_routed": "W (61003) e911: NOT ROUTED correction: the carrier hung up before answering",
     }
 
     def test_each_witness_regex_matches_the_line_the_firmware_formats(self):

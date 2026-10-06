@@ -195,6 +195,10 @@ LOG_COUNTERS = {
     "trunk_final_tag_896": r"trunk: final (\d+) To-tag differs from the early dialog's: the final's defines it \(#896\)",
     # #897: the SDP gate let a trunk answer to our own 911/933 INVITE through; group 1 = the verdict.
     "sdp_gate_yield_897": r"SDP gate yielded '([^']+)' for a trunk answer to our emergency INVITE \(#897\)",
+    # #880: 3CX dropped an outbound anchored leg before it connected: a final response, no BYE (group 1: a 911).
+    "anchor_drop_ringing_880": r"anchor dropped a ringing outbound leg: final 503 to the caller, no BYE(, NOT ROUTED sent)? \(#880\)",
+    # #879/#880: a 911/933 told ROUTED whose route then failed before it connected; group 1 = the failure.
+    "e911_not_routed": r"e911: NOT ROUTED correction: (.+)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (\S+) reason=",
     "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",

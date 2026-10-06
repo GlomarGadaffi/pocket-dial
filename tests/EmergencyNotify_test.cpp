@@ -1640,3 +1640,198 @@ TEST(E911Notify, TheNotifyMessageToAPhoneWithNoStoredContactKeepsTheBareForm)
 	EXPECT_EQ(enRequestLine(env.sentRaw(0)), "MESSAGE sip:200@192.168.78.20:5062 SIP/2.0");
 	EXPECT_EQ(pdwitness::count("e911: notify MESSAGE Request-URI: bare (no Contact stored)"), 1u);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #880: 3CX dropping an anchored call before it connected (CallEvent::Dropped
+// while the session is Invited) means 3CX could not place it. The handset's
+// INVITE is still open: it gets a final response, never a BYE on its early
+// dialog, and a 911 told ROUTED gets exactly one NOT ROUTED. Dropped after the
+// call connected keeps the BYE. The worker is parked so the test binds the leg.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+	void dialAnchoredAndBindLeg(NBench& b, const std::string& to, const std::string& callId,
+		const std::string& leg)
+	{
+		b.handler->failTelCtlLaneForTest(RequestsHandler::kLaneSos);
+		b.handler->forceAsyncAnchorForTest(true);
+		b.handler->holdTelCtlForTest(true);
+		b.handler->handle(enInvite("101", to, "192.168.78.11", callId));
+		ASSERT_NE(b.indexOf("SIP/2.0 180"), -1) << "precondition: dispatched:\n" << b.dump();
+		ASSERT_TRUE(waitUntil([&] { return b.handler->telCtlParkedForTest() == 1; }));
+		ASSERT_TRUE(b.handler->bindOutboundParticipantForTest("Call-ID: " + callId, leg));
+	}
+
+	int countStartingAt(const NBench& b, const std::string& prefix)
+	{
+		int n = 0;
+		for (const auto& s : b.wire) if (s.rfind(prefix, 0) == 0) ++n;
+		return n;
+	}
+}
+
+TEST(E911Notify, ARinging911ThatTheAnchorDropsGetsAFinalResponseAndOneNotRoutedNoBye)
+{
+	pdwitness::clear();
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+	ASSERT_NO_FATAL_FAILURE(dialAnchoredAndBindLeg(b, "911", "en-880-ring", "leg-880"));
+	ASSERT_NE(b.indexOf("ROUTED TO TRUNK"), -1) << "precondition: ROUTED at dispatch:\n" << b.dump();
+
+	b.handler->anchorDroppedForTest("leg-880");
+	flushAsyncOutbox(b);
+
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << "the open INVITE gets its final response:\n" << b.dump();
+	EXPECT_EQ(countStartingAt(b, "BYE "), 0) << "no BYE on an early dialog:\n" << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
+	EXPECT_NE(b.indexOf("NOT ROUTED (the 3CX anchor dropped the call before it connected)"), -1) << b.dump();
+	EXPECT_GT(b.indexOf("NOT ROUTED"), b.indexOf("SIP/2.0 503")) << "the caller's 503 first";
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-880-ring").has_value());
+	EXPECT_EQ(pdwitness::count("anchor dropped a ringing outbound leg: final 503 to the caller, no BYE, NOT ROUTED sent"), 1u);
+	b.handler->holdTelCtlForTest(false);
+}
+
+TEST(E911Notify, ARingingOrdinaryAnchoredCallTheAnchorDropsGetsAFinalResponseAndNoNotification)
+{
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+	ASSERT_NO_FATAL_FAILURE(dialAnchoredAndBindLeg(b, "555", "en-880-555", "leg-880b"));
+
+	b.handler->anchorDroppedForTest("leg-880b");
+	flushAsyncOutbox(b);
+
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(countStartingAt(b, "BYE "), 0) << b.dump();
+	EXPECT_EQ(b.indexOf("MESSAGE sip:200@"), -1) << "a 555 dial is not an emergency:\n" << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-880-555").has_value());
+	b.handler->holdTelCtlForTest(false);
+}
+
+TEST(E911Notify, AConnectedAnchoredCallTheAnchorDropsIsStillByed)
+{
+	// The synchronous loopback answers the call: Connected, its leg bound.
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+	b.handler->handle(enInvite("101", "555", "192.168.78.11", "en-880-conn"));
+	ASSERT_NE(countStartingAt(b, "SIP/2.0 200"), 0) << "precondition: answered:\n" << b.dump();
+	const auto s = b.handler->getSession("Call-ID: en-880-conn");
+	ASSERT_TRUE(s.has_value() && s.value());
+	const std::string leg(s.value()->getAnchorParticipantId());
+	ASSERT_FALSE(leg.empty());
+	b.wire.clear();
+
+	b.handler->anchorDroppedForTest(leg);
+	flushAsyncOutbox(b);
+
+	EXPECT_EQ(countStartingAt(b, "BYE sip:101@"), 1) << b.dump();
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 0) << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << b.dump();
+}
+
+// #880 addendum: the trunk's own exits after ROUTED.
+namespace
+{
+	std::string trunkInviteOnWire(const NBench& b)
+	{
+		for (const auto& s : b.wire)
+		{
+			if (s.rfind("INVITE sip:", 0) == 0 && s.find("@203.0.113.5") < s.find("\r\n")) return s;
+		}
+		return {};
+	}
+
+	// The value of header `name` ("To: ") in `m`, without the name.
+	std::string headerValue(const std::string& m, const std::string& name)
+	{
+		const size_t p = m.find("\r\n" + name);
+		if (p == std::string::npos) return {};
+		const size_t v = p + 2 + name.size();
+		return m.substr(v, m.find("\r\n", v) - v);
+	}
+
+	std::shared_ptr<SipMessage> carrierAnswerWithSdp(const NBench& b, const std::string& sdp)
+	{
+		const std::string inv = trunkInviteOnWire(b);
+		const std::string raw = "SIP/2.0 200 OK\r\n"
+			"Via: " + headerValue(inv, "Via: ") + "\r\n"
+			"From: " + headerValue(inv, "From: ") + "\r\n"
+			"To: " + headerValue(inv, "To: ") + ";tag=carrier879\r\n"
+			"Call-ID: " + headerValue(inv, "Call-ID: ") + "\r\n"
+			"CSeq: " + headerValue(inv, "CSeq: ") + "\r\n"
+			"Contact: <sip:911@203.0.113.9:5060>\r\nContent-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+		return RequestsHandler::getMessageFromPool(raw, enAddr("203.0.113.5"));
+	}
+
+	// The carrier's BYE on the early dialog its 180 opened: its tag in From.
+	std::shared_ptr<SipMessage> carrierEarlyBye(const NBench& b)
+	{
+		const std::string inv = trunkInviteOnWire(b);
+		const std::string raw =
+			"BYE sip:trunkuser@192.168.78.1:5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 203.0.113.5:5060;branch=z9hG4bKearlybye880\r\n"
+			"From: " + headerValue(inv, "To: ") + ";tag=carrier879\r\n"
+			"To: " + headerValue(inv, "From: ") + "\r\n"
+			"Call-ID: " + headerValue(inv, "Call-ID: ") + "\r\n"
+			"CSeq: 2 BYE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, enAddr("203.0.113.5"));
+	}
+}
+
+TEST(E911Notify, ATrunk911WhoseAnswerHasNoUsableAudioIsRefusedAndReportedNotRoutedOnce)
+{
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.handler->setAnchorPlacesRealCallsForTest(false);
+	b.handler->setTrunkConfig(dottedQuadTrunk());
+	b.wire.clear();
+	b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-880-502"));
+	ASSERT_EQ(countStartingAt(b, "INVITE sip:911@203.0.113.5"), 1) << b.dump();
+
+	// #873 item 2: no m=audio is still refused 502 and the PSAP BYEd (unchanged).
+	b.handler->handle(carrierAnswerWithSdp(b, "v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n"));
+
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 502"), 1) << b.dump();
+	expectNotRoutedAfterRouted(b, "the carrier's answer had no usable audio address (502)", "SIP/2.0 502");
+}
+
+TEST(E911Notify, ATrunk911TheCarrierByesBeforeAnsweringGetsAFinalResponseAndOneNotRouted)
+{
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.handler->setAnchorPlacesRealCallsForTest(false);
+	b.handler->setTrunkConfig(dottedQuadTrunk());
+	b.wire.clear();
+	b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-880-ebye"));
+	ASSERT_EQ(countStartingAt(b, "INVITE sip:911@203.0.113.5"), 1) << b.dump();
+	b.handler->handle(carrierResponse(b, "SIP/2.0 180 Ringing"));
+
+	b.handler->handle(carrierEarlyBye(b));
+
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << "the open INVITE is answered:\n" << b.dump();
+	EXPECT_EQ(countStartingAt(b, "BYE sip:101@"), 0) << b.dump();
+	expectNotRoutedAfterRouted(b, "the carrier hung up before answering", "SIP/2.0 503");
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-880-ebye").has_value());
+}
+
+TEST(E911Notify, AnOrdinaryTrunkCallTheCarrierByesBeforeAnsweringIsAnsweredAndNotNotified)
+{
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.handler->setTrunkConfig(dottedQuadTrunk());
+	b.handler->setDialRule("45X", "trunk", "", 0);
+	b.wire.clear();
+	b.handler->handle(enInvite("101", "455", "192.168.78.11", "en-880-pstn"));
+	ASSERT_EQ(countStartingAt(b, "INVITE sip:+455@203.0.113.5"), 1) << b.dump();
+	b.handler->handle(carrierResponse(b, "SIP/2.0 180 Ringing"));
+
+	b.handler->handle(carrierEarlyBye(b));
+
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(countStartingAt(b, "MESSAGE sip:200@"), 0) << b.dump();
+}

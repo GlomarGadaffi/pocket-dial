@@ -915,6 +915,12 @@ public:
 		std::lock_guard<std::mutex> lock(_mutex);
 		anchorMediaNeverOpenedLocked(participantId);
 	}
+	// Test-only (#880): what the anchor event callback does on CallEvent::Dropped.
+	void anchorDroppedForTest(const std::string& participantId)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		anchorDroppedLocked(participantId);
+	}
 
 	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
 	// anchor's CallEvent::Incoming does, and return the new session's Call-ID
@@ -2088,6 +2094,18 @@ private:
 	void asyncAnswerCall(const std::string& participantId);
 	// Issue #379: CallEvent::MediaNeverOpened. Caller holds _mutex.
 	void anchorMediaNeverOpenedLocked(const std::string& participantId);
+	// CallEvent::Dropped (drawbridge's #100: only THIS participant's session).
+	// #880: an outbound leg dropped before it connected is refused, never BYEd.
+	// Caller holds _mutex; runs off the SIP thread, so it sends on _asyncOutbox.
+	void anchorDroppedLocked(const std::string& participantId);
+	// #879, #880: one NOT ROUTED for a 911/933 told ROUTED whose route failed
+	// before it connected, naming `failure`. No-op off an emergency session
+	// (empty emergencyNumber). Caller holds _mutex; enqueues on _outbox.
+	void notifyEmergencyNotRouted(std::string_view emergencyNumber, const std::string& from,
+		const std::string& to, const std::string& failure);
+	// The trunk's NOT ROUTED text: with a real anchor configured, the trunk
+	// only ever carries a 911 the anchor could not place, and says so (#878).
+	std::string trunkEmergencyFailure(std::string_view failure);
 
 	// Bind an outbound call's own leg (from asyncMakeCall's successful makeCall())
 	// to its session, so the CallEvent::Answered/Dropped callback can match this
