@@ -636,6 +636,7 @@ class WitnessSampleTest(unittest.TestCase):
         "e911_degraded_kept_906": "W (61100) e911: audio to the anchor keeps failing on a connected 911/933: kept up, "
                                   "not hung up (#906)",
         "cdr_callee_dialed_901": "I (99001) pbx: CDR callee is the dialed number (anchor audio write failure) (#901)",
+        "ctrl_request_884": "I (52010) TelephonyAnchor: ctrl request: attempt 0 resumed in 131 ms (#884)",
     }
 
     def test_each_witness_regex_matches_the_line_the_firmware_formats(self):
