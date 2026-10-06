@@ -16,6 +16,7 @@
 #include "esp_log.h"   // #533 diag: queueLog() prints to stdout, which syslog never sees
 #endif
 #include "IDGen.hpp"
+#include "Witness.hpp"        // one-line path witnesses (train/everything)
 #include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include <cstdio>             // #463: snprintf for the OPTIONS ping and snapshot ip:port
 #include "IPHelper.hpp"
@@ -1051,11 +1052,24 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			const auto verdict = request->checkSdp();
 			// #199: a second active audio stream is policy, not safety -- the
 			// decoders use the first m=audio -- so it yields for 911 like a header.
+			// #897: a trunk's answer to our own 911/933 INVITE yields on EVERY
+			// verdict, or a PSAP's 1xx/200 is dropped before it is ACKed. Its SDP
+			// is read only by parseCallerRtp() through SipSdpMessage's flat,
+			// fixed-table lookups (T-7 (2)) and never relayed: the handset gets
+			// the PBX's own SDP.
 			if (verdict != SipMessage::SdpVerdict::Ok &&
 				!(verdict == SipMessage::SdpVerdict::TooManyAudioStreams && isEmergencyTraffic(*request)))
 			{
-				rejectSdp(request, verdict);
-				sdpRefused = true;
+				if (isTrunkAnswerToOurEmergencyInvite(*request))
+				{
+					PD_WITNESS_W("pbx", "SDP gate yielded '%s' for a trunk answer to our emergency INVITE (#897)",
+						SipMessage::sdpVerdictText(verdict));
+				}
+				else
+				{
+					rejectSdp(request, verdict);
+					sdpRefused = true;
+				}
 			}
 		}
 
@@ -4903,6 +4917,17 @@ bool RequestsHandler::isEmergencyTraffic(const SipMessage& m)
 		return false;
 	}
 	return isPsapCallbackTo(m) || dialRuleMakesEmergency(std::string(m.getToNumber()));
+}
+
+bool RequestsHandler::isTrunkAnswerToOurEmergencyInvite(const SipMessage& m)
+{
+	if (!m.getStatusInfo().has_value() || m.getCSeqMethod() != "INVITE") return false;
+	const SipTrunk::Dialog* d = _sipTrunk.findByCallID(m.getCallID());
+	if (!d || d->role != SipTrunk::Role::Outbound) return false;
+	const uint32_t from = m.getSource().sin_addr.s_addr;
+	if (from != d->peer.sin_addr.s_addr && from != d->nextHop.sin_addr.s_addr) return false;
+	const auto s = getSession(d->handsetCallID);
+	return s.has_value() && s.value() && s.value()->isEmergency();
 }
 
 bool RequestsHandler::isPsapCallbackTo(const SipMessage& m)

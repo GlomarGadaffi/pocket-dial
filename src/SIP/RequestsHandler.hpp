@@ -1926,6 +1926,10 @@ private:
 	// callback by #659's window (#818) or a 911 a dial-plan rule produces (#834).
 	// Caller holds _mutex.
 	bool isEmergencyTraffic(const SipMessage& m);
+	// #897: a response to OUR trunk INVITE for a live emergency session (keyed
+	// on our trunk dialog's Call-ID and its carrier's address, never on To).
+	// The SDP gate yields every verdict for it. Caller holds _mutex.
+	bool isTrunkAnswerToOurEmergencyInvite(const SipMessage& m);
 	// #818: an INVITE's callee is inside #659's callback window: the To user,
 	// or for a carrier INVITE the extension its DID maps to. Caller holds _mutex.
 	bool isPsapCallbackTo(const SipMessage& m);

@@ -193,6 +193,8 @@ LOG_COUNTERS = {
     "e911_notify_uri": r"e911: notify MESSAGE Request-URI: (registered Contact|bare \(no Contact stored\))",
     # #896: a trunk INVITE's final response replaced an early (180/183) To-tag; group 1 = the status.
     "trunk_final_tag_896": r"trunk: final (\d+) To-tag differs from the early dialog's: the final's defines it \(#896\)",
+    # #897: the SDP gate let a trunk answer to our own 911/933 INVITE through; group 1 = the verdict.
+    "sdp_gate_yield_897": r"SDP gate yielded '([^']+)' for a trunk answer to our emergency INVITE \(#897\)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (\S+) reason=",
     "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",

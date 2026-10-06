@@ -38,6 +38,7 @@
 
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
+#include "Witness.hpp"
 
 namespace
 {
@@ -176,6 +177,20 @@ namespace
 			if (withSdp) r += "Content-Type: application/sdp\r\n";
 			r += "Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
 			return r;
+		}
+
+		// #897: the same response with a caller-chosen SDP body.
+		std::string responseWithSdp(const std::string& statusLine, const std::string& sdp) const
+		{
+			return statusLine + "\r\n"
+				"Via: SIP/2.0/UDP 192.168.50.1:5060;branch=" + branch + "\r\n"
+				"From: <sip:15551230000@" + kSbcIp + ":5060>;tag=" + fromTag + "\r\n"
+				"To: <sip:+12025550123@" + kSbcIp + ":5060>;tag=" + toTag + "\r\n"
+				"Call-ID: " + callID + "\r\n"
+				"CSeq: 1 INVITE\r\n"
+				"Contact: <sip:+12025550123@203.0.113.9:5060>\r\n"
+				"Content-Type: application/sdp\r\n"
+				"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
 		}
 
 		// The carrier hanging up first.
@@ -693,6 +708,157 @@ TEST(TrunkWiring, AnEmergencyCallFollowsEveryCarrierAnswerUnchecked)
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
 	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-861-911b", peer));
 	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("224.0.0.1")) << "a later answer is followed, as before #861";
+}
+
+// ── #897: the SDP admission gate and a PSAP's answer ───────────────────────
+
+namespace
+{
+	// A usable carrier answer (c= and one m=audio) plus one thing that trips
+	// exactly the named checkSdp() verdict.
+	struct SdpCase { SipMessage::SdpVerdict verdict; std::string sdp; };
+
+	std::vector<SdpCase> sdpVerdictCases()
+	{
+		const std::string head = "v=0\r\no=- 0 0 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n";
+		const std::string audio = "m=audio 41000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n";
+		std::vector<SdpCase> v;
+		{
+			std::string s = head;
+			for (int i = 0; i < 10; ++i) s += "a=x-pad" + std::to_string(i) + ":" + std::string(450, 'p') + "\r\n";
+			v.push_back({SipMessage::SdpVerdict::BodyTooLarge, s + audio});
+		}
+		{
+			// Fits a 2048-byte datagram; m=audio first, inside SipSdpMessage's 128 lines.
+			std::string s = head + audio;
+			for (int i = 0; i < 260; ++i) s += "b=X\r\n";
+			v.push_back({SipMessage::SdpVerdict::TooManyLines, s});
+		}
+		v.push_back({SipMessage::SdpVerdict::LineTooLong, head + "a=x-long:" + std::string(600, 'l') + "\r\n" + audio});
+		v.push_back({SipMessage::SdpVerdict::MalformedLine, head + "this-is-not-an-sdp-line\r\n" + audio});
+		{
+			std::string toks;
+			for (int i = 0; i < 45; ++i) toks += " t" + std::to_string(i);
+			v.push_back({SipMessage::SdpVerdict::TooManyTokens, head + "a=x-tokens:0" + toks + "\r\n" + audio});
+		}
+		{
+			std::string fmts;
+			for (int i = 96; i < 96 + 33; ++i) fmts += " " + std::to_string(i);
+			v.push_back({SipMessage::SdpVerdict::TooManyMediaFormats,
+				head + "m=audio 41000 RTP/AVP 0" + fmts + "\r\na=rtpmap:0 PCMU/8000\r\n"});
+		}
+		v.push_back({SipMessage::SdpVerdict::BadAttributeName, head + "a=" + std::string(40, 'n') + ":1\r\n" + audio});
+		v.push_back({SipMessage::SdpVerdict::CapabilityNegotiation, head + audio + "a=acap:1 rtpmap:0 PCMU/8000\r\n"});
+		{
+			std::string s = head + audio;
+			for (int i = 0; i < 4; ++i) s += "m=video 0 RTP/AVP 31\r\n";
+			v.push_back({SipMessage::SdpVerdict::TooManyMediaSections, s});
+		}
+		{
+			std::string s = head;
+			for (int i = 0; i < 17; ++i) s += "a=x-s" + std::to_string(i) + ":1\r\n";
+			v.push_back({SipMessage::SdpVerdict::TooManyAttributes, s + audio});
+		}
+		v.push_back({SipMessage::SdpVerdict::TooManyAudioStreams,
+			head + audio + "m=audio 41002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"});
+		return v;
+	}
+}
+
+TEST(TrunkWiring, EveryCheckSdpVerdictHasACaseBelow)
+{
+	// Each crafted answer trips exactly the verdict it is named for, so the two
+	// tests below cover every refusal checkSdp() can return.
+	const auto cases = sdpVerdictCases();
+	ASSERT_EQ(cases.size(), 11u) << "one per SdpVerdict other than Ok";
+	for (const auto& c : cases)
+	{
+		SCOPED_TRACE(SipMessage::sdpVerdictText(c.verdict));
+		CarrierView v;
+		v.callID = "x"; v.branch = "z9hG4bKx"; v.fromTag = "f";
+		auto m = RequestsHandler::getMessageFromPool(v.responseWithSdp("SIP/2.0 200 OK", c.sdp), addrFor(kSbcIp));
+		ASSERT_NE(m, nullptr);
+		EXPECT_EQ(m->checkSdp(), c.verdict);
+	}
+}
+
+TEST(TrunkWiring, APsapAnswerIsAckedAndConnectsWhateverSdpVerdictItTrips)
+{
+	for (const auto& c : sdpVerdictCases())
+	{
+		SCOPED_TRACE(SipMessage::sdpVerdictText(c.verdict));
+		pdwitness::clear();
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "911", "call-897-911"));
+		const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+		ASSERT_FALSE(e911.callID.empty()) << "precondition: 911 went to the trunk";
+		b.sent.clear();
+
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			e911.responseWithSdp("SIP/2.0 200 OK", c.sdp), addrFor(kSbcIp)));
+
+		EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 1u) << "the PSAP's 200 is ACKed";
+		EXPECT_EQ(b.handler.getSdpRejected(), 0u);
+		// The SDP model (sdp::parse) has its own line-length and attribute caps
+		// and fails closed, so parseCallerRtp() finds no audio in these two and
+		// onTrunkAnswered()'s existing refusal runs: 502 to the caller, the PSAP
+		// BYEd. That is #873 item 2 (desmo's decision), pinned here, not changed.
+		const bool modelRefuses = c.verdict == SipMessage::SdpVerdict::LineTooLong ||
+			c.verdict == SipMessage::SdpVerdict::TooManyAttributes;
+		if (modelRefuses)
+		{
+			EXPECT_FALSE(b.firstWithTo("502", kHandsetIp).empty());
+			EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u);
+		}
+		else
+		{
+			EXPECT_FALSE(b.firstWithTo("200 OK", kHandsetIp).empty()) << "the 911 caller is connected";
+			EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u);
+		}
+		const bool yielded = pdwitness::count("SDP gate yielded") == 1u;
+		EXPECT_EQ(yielded, c.verdict != SipMessage::SdpVerdict::TooManyAudioStreams)
+			<< "the #897 witness, except for the verdict #199 already yields";
+	}
+}
+
+TEST(TrunkWiring, AnOrdinaryTrunkAnswerIsStillRefusedByTheSdpGate)
+{
+	for (const auto& c : sdpVerdictCases())
+	{
+		SCOPED_TRACE(SipMessage::sdpVerdictText(c.verdict));
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-897-pstn"));
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		ASSERT_FALSE(carrier.callID.empty());
+		b.sent.clear();
+
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.responseWithSdp("SIP/2.0 200 OK", c.sdp), addrFor(kSbcIp)));
+
+		EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 0u) << "dropped by the gate, never ACKed";
+		EXPECT_TRUE(b.firstWithTo("200 OK", kHandsetIp).empty());
+		EXPECT_EQ(b.handler.getSdpRejected(), 1u);
+	}
+}
+
+TEST(TrunkWiring, A911AnswerFromAnotherAddressIsStillGated)
+{
+	// The yield keys on our trunk dialog AND its carrier's address: a response
+	// with the dialog's Call-ID from anywhere else is not the PSAP's.
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "911", "call-897-forged"));
+	const auto e911 = CarrierView::from(b.firstWith("INVITE sip:911"));
+	ASSERT_FALSE(e911.callID.empty());
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		e911.responseWithSdp("SIP/2.0 200 OK", sdpVerdictCases()[3].sdp), addrFor("192.168.50.77")));
+
+	EXPECT_EQ(b.countWithTo("ACK", kSbcIp), 0u);
+	EXPECT_EQ(b.handler.getSdpRejected(), 1u);
 }
 
 // ── Failure ─────────────────────────────────────────────────────────────────

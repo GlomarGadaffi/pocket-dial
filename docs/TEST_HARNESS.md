@@ -388,6 +388,7 @@ the firmware formats.
 | `adopt_reread_349` | `makeCall: no leg listed yet \(list status=-?\d+, read (\d+):` | #903: one adopt re-read that found no leg yet, with what the list held |
 | `e911_notify_uri` | `e911: notify MESSAGE Request-URI: (registered Contact\|bare \(no Contact stored\))` | #904 review: a 911/933 notify MESSAGE addressed at the phone's registered Contact (or the bare form when none is stored) |
 | `trunk_final_tag_896` | `trunk: final (\d+) To-tag differs from the early dialog's: the final's defines it \(#896\)` | #896: a forking carrier's final (the PSAP's 200 for a 911) defines the dialog its ACK and BYE use |
+| `sdp_gate_yield_897` | `SDP gate yielded '([^']+)' for a trunk answer to our emergency INVITE \(#897\)` | #897: a PSAP's 1xx/200 that trips any checkSdp() verdict is ACKed and connects instead of being dropped |
 
 **Safety preconditions.** Each one is refused before anything is sent (exit 2), except
 the S1 pin and the far-end check, which are made against the board:
