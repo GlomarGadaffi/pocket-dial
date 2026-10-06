@@ -163,12 +163,16 @@ phone that has never registered. It re-provisions phones you already brought up 
 ### Multicast paging (`997`, issue #800)
 
 With paging enabled (`PUT /api/multicast-paging`, `docs/API.md`), dialing `997` is answered
-by the PBX itself (`a=recvonly`, PCMU), and the caller's audio is re-sent as G.711 µ-law
+by the PBX itself (`a=sendrecv`, PCMU; it never sends RTP back, and a `recvonly` answer
+made a Yealink hold the page, #909), and the caller's audio is re-sent as G.711 µ-law
 RTP to the multicast group, default **`239.0.1.75:50000`**, TTL 1 (it never leaves the
 LAN). Phones that listen on that group play the page with no SIP call of their own, so a
 phone that is offline to SIP or already on a call can still hear it. One page at a time:
 a second `997` caller gets `486 Busy Here`. A page ends on the caller's BYE, or after
-5 s with no RTP from the caller.
+5 s with no RTP from the caller. A re-INVITE or SDP UPDATE on the page is answered `200`
+with SDP; a hold (`sendonly`/`inactive`) pauses the page (nothing the held phone still
+sends reaches the group, and it does not count as liveness, so a hold longer than 5 s
+ends the page), and a resume un-pauses it. Not yet proven on a phone.
 
 Listening settings (no firmware work on the phone side):
 
