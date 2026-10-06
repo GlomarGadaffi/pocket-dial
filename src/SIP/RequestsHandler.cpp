@@ -4812,12 +4812,12 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 // response before reaching here, and nothing below can fail back into the call.
 void RequestsHandler::notifyEmergency(const pbx::EmergencyDial& emergency,
 	const std::string& fromExt, const std::string& dialed, bool routed,
-	std::string_view notRoutedReason)
+	std::string_view notRoutedReason, bool callUp)
 {
 	const pbx::E911Config& cfg = _cfg.e911Config();
 
 	_e911Notifier.notify(cfg, emergency.isTest, fromExt, dialed,
-		emergency.hadTrunkPrefix, routed, notRoutedReason);
+		emergency.hadTrunkPrefix, routed, notRoutedReason, callUp);
 
 	// Make the notified phones audibly alert, on top of the MESSAGE text. The
 	// beep is the existing register-beep INVITE (auto-answer headers, no RTP),
@@ -10506,6 +10506,7 @@ void RequestsHandler::tick()
 		// erases from _sessions, so acting while iterating it would invalidate
 		// the iterator.
 		std::vector<std::string> degradedAnchorCallIds;
+		std::vector<std::string> degradedEmergencyCallIds;   // #906: kept up, reported
 		for (const auto& [callID, session] : _sessions)
 		{
 			if (!session->isAnchor()) continue;
@@ -10521,7 +10522,28 @@ void RequestsHandler::tick()
 			}
 			if (b && b->isAudioDegraded())
 			{
-				degradedAnchorCallIds.push_back(callID);
+				// #906 (Rule 5; the same exemption as the RTP-inactivity reap below,
+				// #604/#712): no automated teardown hangs up a connected 911/933. The
+				// caller can still hear the PSAP, or be heard on the RTP leg, and
+				// the call is the only line out. Reported once, below.
+				if (session->isEmergency()) degradedEmergencyCallIds.push_back(callID);
+				else degradedAnchorCallIds.push_back(callID);
+			}
+		}
+		for (const auto& callID : degradedEmergencyCallIds)
+		{
+			auto sit = _sessions.find(callID);
+			if (sit == _sessions.end() || !sit->second->markDegradedReported()) continue;
+			const auto& session = sit->second;
+			PD_WITNESS_W("e911", "audio to the anchor keeps failing on a connected 911/933: kept up, not hung up (#906)");
+			queueLog("[Telephony] audio write repeatedly failed on a connected emergency call -- kept up, notify list told", true);
+			// A dialed 911/933 names its number; a PSAP callback (no dial) is logged only.
+			const std::string_view number = session->getEmergencyNumber();
+			if (!number.empty() && session->getSrc())
+			{
+				notifyEmergency(pbx::classifyEmergencyDial(number), std::string(session->getSrc()->getNumber()),
+					std::string(number), /*routed=*/true,
+					"the audio to the anchor keeps failing; the call was not hung up", /*callUp=*/true);
 			}
 		}
 		for (const auto& callID : degradedAnchorCallIds)

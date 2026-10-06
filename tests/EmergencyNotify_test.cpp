@@ -948,6 +948,20 @@ TEST(E911Notify, ANotRoutedNotificationNamesTheRouteThatFailed)
 	}
 }
 
+TEST(E911Format, ADegradedConnectedCallSaysItIsStillUpAndIsNeitherRoutedNorNotRouted)
+{
+	// #906: the call was kept up; the text must not read as a refusal or a fresh routing.
+	pbx::E911Config cfg;
+	const std::string s = pbx::formatE911Notification(false, "101", "911", false, /*routed=*/true, cfg,
+		"the audio to the anchor keeps failing; the call was not hung up", /*callUp=*/true);
+	EXPECT_NE(s.find("EMERGENCY: 911 dialed by ext 101 - CALL STILL UP, AUDIO DEGRADED (the audio to the anchor "
+		"keeps failing; the call was not hung up)"), std::string::npos) << s;
+	EXPECT_EQ(s.find("NOT ROUTED"), std::string::npos) << s;
+	EXPECT_EQ(s.find("ROUTED TO TRUNK"), std::string::npos) << s;
+	EXPECT_NE(pbx::formatE911Notification(true, "101", "933", false, true, cfg, "n", true).find("TEST: 933"),
+		std::string::npos) << "a 933 stays marked TEST";
+}
+
 TEST(E911Format, TruncationLandsOnAUtf8BoundaryNotMidCodepoint)
 {
 	// `location` is operator free text and may be non-ASCII. Cutting at byte 512

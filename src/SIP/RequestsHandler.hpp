@@ -1915,7 +1915,7 @@ private:
 	// false, or the anchor a trunk call stood in for.
 	void notifyEmergency(const pbx::EmergencyDial& emergency,
 		const std::string& fromExt, const std::string& dialed, bool routed,
-		std::string_view note = {});
+		std::string_view note = {}, bool callUp = false);
 
 	void routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller,
