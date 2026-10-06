@@ -4,8 +4,10 @@
 // One-line path witnesses for hardware runs. On the board they are esp_log
 // lines, the only lines syslog carries (queueLog() goes to stdout, #533/#603),
 // so tests/load/anchor_scenarios.py can pre-register one as a path counter
-// (LOG_COUNTERS). On the host the same formatted text goes to a bounded list
-// a test can read, so the format string is compiled and checked here too.
+// (LOG_COUNTERS). On the host the same formatted text goes to a fixed ring a
+// test can read, so the format string is compiled and checked here too. The
+// ring is static storage: a witness never allocates, so a per-call heap
+// baseline (PerCallHeap_test) is not moved by one.
 // Never put a number, a URI user or a credential in a witness.
 
 #if defined(ESP_PLATFORM)
@@ -19,17 +21,21 @@
 #include <cstdarg>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace pdwitness
 {
+	constexpr std::size_t kRingLines = 512;
+	constexpr std::size_t kLineBytes = 320;
+
 	struct Sink
 	{
-		std::mutex               m;
-		std::vector<std::string> lines;
+		std::mutex  m;
+		char        ring[kRingLines][kLineBytes];
+		std::size_t total = 0;   // lines ever recorded; the newest kRingLines are kept
 	};
 
 	inline Sink& sink()
@@ -43,37 +49,43 @@ namespace pdwitness
 #endif
 	inline void record(const char* tag, const char* fmt, ...)
 	{
-		char buf[320];
+		char body[kLineBytes];
 		va_list ap;
 		va_start(ap, fmt);
-		std::vsnprintf(buf, sizeof buf, fmt, ap);
+		(void)std::vsnprintf(body, sizeof body, fmt, ap);
 		va_end(ap);
 		Sink& s = sink();
 		std::lock_guard<std::mutex> g(s.m);
-		if (s.lines.size() >= 4096) s.lines.erase(s.lines.begin());
-		s.lines.push_back(std::string(tag) + ": " + buf);
+		(void)std::snprintf(s.ring[s.total % kRingLines], kLineBytes, "%s: %s", tag, body);
+		++s.total;
 	}
 
 	inline void clear()
 	{
 		Sink& s = sink();
 		std::lock_guard<std::mutex> g(s.m);
-		s.lines.clear();
+		s.total = 0;
 	}
 
 	inline std::vector<std::string> lines()
 	{
 		Sink& s = sink();
 		std::lock_guard<std::mutex> g(s.m);
-		return s.lines;
+		std::vector<std::string> out;
+		const std::size_t kept = s.total < kRingLines ? s.total : kRingLines;
+		for (std::size_t i = s.total - kept; i < s.total; ++i) out.emplace_back(s.ring[i % kRingLines]);
+		return out;
 	}
 
 	// Lines holding `needle`.
 	inline std::size_t count(const std::string& needle)
 	{
+		Sink& s = sink();
+		std::lock_guard<std::mutex> g(s.m);
 		std::size_t n = 0;
-		for (const std::string& l : lines())
-			if (l.find(needle) != std::string::npos) ++n;
+		const std::size_t kept = s.total < kRingLines ? s.total : kRingLines;
+		for (std::size_t i = s.total - kept; i < s.total; ++i)
+			if (std::strstr(s.ring[i % kRingLines], needle.c_str()) != nullptr) ++n;
 		return n;
 	}
 }
