@@ -624,6 +624,9 @@ class WitnessSampleTest(unittest.TestCase):
         "sdp_gate_yield_897": "W (77012) pbx: SDP gate yielded 'malformed line' for a trunk answer to our emergency INVITE (#897)",
         "anchor_drop_ringing_880": "W (61002) pbx: anchor dropped a ringing outbound leg: final 503 to the caller, no BYE, NOT ROUTED sent (#880)",
         "e911_not_routed": "W (61003) e911: NOT ROUTED correction: the carrier hung up before answering",
+        "get_403_failfast_902": "W (50211) TelephonyAnchor: GET stream: HTTP 403 on 6 consecutive attempts after "
+                                "the answer for /callcontrol/<dn>/participants/517/stream -- giving up now, not "
+                                "at attempt 240 (#902)",
         "cdr_callee_dialed_901": "I (99001) pbx: CDR callee is the dialed number (anchor audio write failure) (#901)",
     }
 
@@ -2119,9 +2122,16 @@ class FakeProbeBoard(FakeBoard):
             self.log("TelephonyAnchor: GET stream refused (HTTP %d) for %s: {\"message\":\"forbidden %s\"}"
                      % (code, self.url(leg), FAR))
             branch = k.get("branch", "budget")
-            last = 3 if branch != "budget" or n == 240 else n
+            # #902: after the answer, 6 consecutive 403s give up; any other status keeps the budget.
+            failfast = (branch == "budget" and n != 240 and not k.get("failfast_off")
+                        and (code == 403 or k.get("failfast_always")))
+            last = 3 if branch != "budget" or n == 240 else (an.GET_FORBIDDEN_FAILFAST if failfast else n)
             for a in range(1, last + 1):
                 self.log("TelephonyAnchor: GET stream not ready (HTTP %d), attempt %d/%d" % (code, a, n))
+            if failfast:
+                self.log("TelephonyAnchor: GET stream: HTTP 403 on %d consecutive attempts after the answer for "
+                         "/callcontrol/<dn>/participants/%s/stream -- giving up now, not at attempt %d (#902)"
+                         % (last, leg, n))
             if branch == "transport":
                 for a in range(last + 1, last + 4):
                     self.log("TelephonyAnchor: GET stream transport failure (no HTTP response, status=-1), "
@@ -2250,7 +2260,7 @@ class ProbeRefusalTest(unittest.TestCase):
     def test_the_probe_scenarios_are_registered_with_their_counters_and_faults(self):
         want = {"x349_unread_makecall": ("bench_makecall_read_fail", ("makecall_read_fail",)),
                 "x379_never_opened": ("get_budget_spent", ("get_status", "get_max_attempts")),
-                "x518_403_clean_giveup": ("get_refused_403", ("get_status", "get_max_attempts")),
+                "x518_403_clean_giveup": ("get_403_failfast_902", ("get_status", "get_max_attempts")),
                 "x279_degraded_bye": ("degraded_endcall", ("post_stream_fail",))}
         for name, (counter, faults) in want.items():
             sc = an.SCENARIOS[name]
@@ -2258,7 +2268,9 @@ class ProbeRefusalTest(unittest.TestCase):
             self.assertEqual(sc["uas"], {"caller": "6101", "detector": "6104"}, name)
             self.assertEqual(an.scenario_problems(sc), [], name)
         self.assertEqual((an.SCENARIOS["x379_never_opened"]["get_status"],
-                          an.SCENARIOS["x379_never_opened"]["get_max_attempts"]), (403, 12))
+                          an.SCENARIOS["x379_never_opened"]["get_max_attempts"]), (404, 12))
+        self.assertEqual((an.SCENARIOS["x518_403_clean_giveup"]["get_status"],
+                          an.SCENARIOS["x518_403_clean_giveup"]["get_max_attempts"]), (403, 12))
         self.assertNotIn("x350_get_pressure", an.SCENARIOS)
         self.assertNotIn("x336_ws_reauth", an.SCENARIOS)
 
@@ -2466,17 +2478,34 @@ class NeverOpenedTest(ProbeRunCase):
         self.assertEqual((ev["drops"], ev["endcall_reasons"]), (1, ["anchor hangup"]))
         self.assertTrue(ev["dropped_by_the_board_on_its_own"])
 
-    def test_x518_pass_needs_the_403_line(self):
+    def test_x518_pass_needs_the_403_line_and_gives_up_by_the_fail_fast(self):
         rc, out = self.go(scenario="x518_403_clean_giveup")
         self.assertEqual(rc, 0, out)
-        self.assertEqual(self.calls[0]["log"]["refused_403_this_leg"], 1)
+        ev = self.calls[0]["log"]
+        self.assertEqual(ev["refused_403_this_leg"], 1)
+        self.assertEqual((ev["branch"], ev["max_attempt"], ev["failfast_lines"], ev["drops"]),
+                         ("failfast", an.GET_FORBIDDEN_FAILFAST, 1, 1))
+        self.assertTrue(ev["dropped_by_the_board_on_its_own"])
         self.assert_clean_probe(out)
+
+    def test_x518_invalid_when_the_budget_was_spent_instead_of_the_fail_fast(self):
+        self.board.knobs["refused_status"] = 403
+        self.board.knobs["failfast_off"] = True
+        rc, out = self.go(scenario="x518_403_clean_giveup")
+        self.assertEqual(rc, 3, out)
+        self.assertIn("no 403 fail-fast line", out)
+
+    def test_x379_fails_if_a_404_run_gives_up_early(self):
+        self.board.knobs["failfast_always"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the 403 fail-fast fired on a run that forces a 404", out)
 
     def test_x518_invalid_without_the_403_line(self):
         self.board.knobs["refused_status"] = 404
         rc, out = self.go(scenario="x518_403_clean_giveup")
         self.assertEqual(rc, 3, out)
-        self.assertIn("get_refused_403 is 0", out)
+        self.assertIn("get_403_failfast_902 is 0", out)
         self.assertIn("no 'GET stream refused (HTTP 403)' line", out)
 
     def test_fail_when_no_bye_reaches_the_handset(self):

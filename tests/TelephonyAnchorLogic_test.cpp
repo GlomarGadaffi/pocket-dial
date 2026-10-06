@@ -629,4 +629,69 @@ TEST(ListLeg, TheCountsTellTheFilterFromASlotClaim)
 	EXPECT_EQ(mixed.candidates, 1);
 }
 
+// #902: a 403 on the media GET stream, once the far end has answered, is an
+// authorisation answer, not a readiness one; an ordinary outbound leg gives up
+// after kGetForbiddenMaxAfterAnswer of them in a row instead of 240 attempts.
+// A 404/424, a 403 before the answer, a 911/933 and an inbound leg keep the budget.
+TEST(GetForbidden, SixConsecutive403sAfterTheAnswerGiveUpAnOrdinaryLeg)
+{
+	int n = 0;
+	for (int i = 1; i < kGetForbiddenMaxAfterAnswer; ++i)
+	{
+		n = nextGetForbiddenCount(n, 403, /*answered=*/true);
+		EXPECT_FALSE(getForbiddenGivesUp(n, /*failFastLeg=*/true)) << "attempt " << i << " is still within the bound";
+	}
+	n = nextGetForbiddenCount(n, 403, true);
+	EXPECT_EQ(n, kGetForbiddenMaxAfterAnswer);
+	EXPECT_TRUE(getForbiddenGivesUp(n, true));
+	EXPECT_EQ(kGetForbiddenMaxAfterAnswer, 6) << "the chosen bound (#902): about 3 s of backoff at the 500 ms cap";
+}
+
+TEST(GetForbidden, A403BeforeTheAnswerIsNeverCounted)
+{
+	// Before the answer the participant may simply not be connected yet: the same
+	// "not ready" the 404 loop waits out.
+	int n = 0;
+	for (int i = 0; i < 100; ++i) n = nextGetForbiddenCount(n, 403, /*answered=*/false);
+	EXPECT_EQ(n, 0);
+	EXPECT_FALSE(getForbiddenGivesUp(n, true));
+}
+
+TEST(GetForbidden, AnyOtherAnswerResetsTheCount)
+{
+	int n = 0;
+	for (int i = 0; i < 5; ++i) n = nextGetForbiddenCount(n, 403, true);
+	ASSERT_EQ(n, 5);
+	for (const int status : { 404, 424, 500, 200, -1, 0 })
+	{
+		EXPECT_EQ(nextGetForbiddenCount(n, status, true), 0) << status;
+	}
+	n = nextGetForbiddenCount(n, 404, true);
+	for (int i = 0; i < 5; ++i) n = nextGetForbiddenCount(n, 403, true);
+	EXPECT_FALSE(getForbiddenGivesUp(n, true)) << "5 + 404 + 5 is not 6 in a row";
+}
+
+TEST(GetForbidden, A404Or424KeepsTheWholeBudget)
+{
+	int n = 0;
+	for (int i = 0; i < 240; ++i)
+	{
+		n = nextGetForbiddenCount(n, (i % 2) ? 404 : 424, true);
+		ASSERT_FALSE(getForbiddenGivesUp(n, true)) << "attempt " << i;
+	}
+}
+
+TEST(GetForbidden, AnEmergencyOrInboundLegNeverGivesUpEarly)
+{
+	// failFastLeg is false for a 911/933 (Rule 5: nothing may delay or refuse an
+	// emergency call, and a connected PSAP may still hear the caller) and for every
+	// inbound leg, a PSAP callback among them.
+	int n = 0;
+	for (int i = 0; i < 240; ++i)
+	{
+		n = nextGetForbiddenCount(n, 403, true);
+		ASSERT_FALSE(getForbiddenGivesUp(n, /*failFastLeg=*/false)) << "403 #" << (i + 1);
+	}
+}
+
 }  // namespace

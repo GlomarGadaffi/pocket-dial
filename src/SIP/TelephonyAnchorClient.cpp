@@ -597,6 +597,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 					slot->ringing.store(false, std::memory_order_release);
 					slot->outboundActiveSetUs = esp_timer_get_time();
 					slot->ownLegHeld = ownLegHeld;
+					slot->getFailFast.store(!emergency, std::memory_order_release);   // #902: never for a 911/933
 				}
 			}
 			else
@@ -952,6 +953,7 @@ void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 	slot.outboundActiveSetUs = 0;
 	slot.upsetInFlight.store(false, std::memory_order_release);
 	slot.upsetPending.store(false, std::memory_order_release);
+	slot.getFailFast.store(false, std::memory_order_release);   // #902
 }
 
 // ── Private Helper Functions ───────────────────────────────────────────────
@@ -3496,6 +3498,7 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 	TickType_t           delay        = pdMS_TO_TICKS(50);   // Start fast at 50ms
 	bool opened = false;
 	int  transportFailures = 0;
+	int  forbiddenAfterAnswer = 0;   // #902: consecutive 403s since the far end answered
 	// #518: one diagnostic line per DISTINCT refusal status per stream, not per
 	// retry and not just the first -- a 404 while the far end is still ringing
 	// must not use up the line the 403 needs. At most 4 lines per stream.
@@ -3616,6 +3619,19 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					while (firstChunk > 0 &&
 						esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
 					transportFailures = 0;
+					forbiddenAfterAnswer = telephony::nextGetForbiddenCount(forbiddenAfterAnswer, status,
+						slot->outboundAnswered.load(std::memory_order_acquire));
+					if (telephony::getForbiddenGivesUp(forbiddenAfterAnswer,
+						slot->getFailFast.load(std::memory_order_acquire)))
+					{
+						// #902: the path's shape only; the host and the route DN (it can be a
+						// DID) stay out. The first 403's body and URL are in #518's line above.
+						ESP_LOGW(TAG, "GET stream: HTTP 403 on %d consecutive attempts after the answer for "
+							"/callcontrol/<dn>/participants/%s/stream -- giving up now, not at attempt %d (#902)",
+							forbiddenAfterAnswer, activePartId.c_str(), kMaxAttempts);
+						attempt = kMaxAttempts;   // the spent-budget give-up below (MediaNeverOpened), as before
+						break;
+					}
 				}
 				else
 				{
