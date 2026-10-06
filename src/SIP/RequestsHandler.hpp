@@ -907,6 +907,13 @@ public:
 		return bindOutboundParticipant(callId, ownLeg);
 	}
 
+	// Test-only: sendMessageTo() is private and has no production caller; this is
+	// its only way in, so its Request-URI is pinned (#904 review sibling).
+	bool sendMessageToForTest(const std::string& ext, const std::string& text)
+	{
+		return sendMessageTo(ext, text);
+	}
+
 	// Test-only (issue #379): what the anchor event callback does on
 	// CallEvent::MediaNeverOpened. The callback is wired only for a real anchor,
 	// never the host suite's Loopback. Not compiled into device firmware.

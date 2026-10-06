@@ -1033,7 +1033,9 @@ namespace
 
 TEST(AnchorRouting, ADegradedTeardownWritesTheDialedNumberAsTheCdrCallee)
 {
-	for (const std::string dialed : { "555", "911" })
+	// #906: a connected 911/933 is no longer torn down by the degraded sweep (its
+	// CDR is covered by the Participant Remove case below).
+	for (const std::string dialed : { "555" })
 	{
 		SCOPED_TRACE(dialed);
 		CdrRig rig(dialed, "anchor-901-" + dialed);
@@ -1051,6 +1053,118 @@ TEST(AnchorRouting, ADegradedTeardownWritesTheDialedNumberAsTheCdrCallee)
 		ASSERT_FALSE(rig.handler.getSession("Call-ID: anchor-901-" + dialed).has_value());
 		rig.expectOneCdr(dialed);
 	}
+}
+
+// #906 (Rule 5, desmo's default): the degraded-audio sweep must not hang up a
+// connected 911/933, as the RTP-inactivity reap does not (#604, #712). The failure
+// is reported once to the notify list ("CALL STILL UP, AUDIO DEGRADED") and
+// witnessed; an ordinary call is torn down exactly as before.
+namespace
+{
+	struct DegradedRig
+	{
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+		RequestsHandler handler{"192.168.9.1", 5060,
+			[this](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+				sent.emplace_back(addr, std::move(msg));
+			}};
+		MediaBridge* bridge = nullptr;
+
+		DegradedRig(const std::string& dialed, const std::string& callId)
+		{
+			handler.setAnchorPlacesRealCallsForTest(true);
+			handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+			handler.handle(makeRegister("200", "192.168.9.20", "reg-200"));
+			handler.setE911Config("200", "", "");
+			handler.handle(makeInvite("501", dialed, "192.168.9.51", callId));
+			bridge = handler.anchorBridgeForCallIdForTest("Call-ID: " + callId);
+		}
+
+		// Breaks the anchor connection and feeds handset RTP until the bridge reads degraded.
+		bool degrade()
+		{
+			if (!bridge) return false;
+			const std::vector<uint8_t> frame(160, 0xFF);
+			bridge->onHandsetRtp(frame.data(), frame.size());
+			handler.anchorClientForTest()->stop();
+			for (int i = 0; i < 30; ++i) bridge->onHandsetRtp(frame.data(), frame.size());
+			return bridge->isAudioDegraded();
+		}
+
+		int countTo(const char* ip, const std::string& prefix) const
+		{
+			int n = 0;
+			for (const auto& [addr, msg] : sent)
+			{
+				if (!msg || addr.sin_addr.s_addr != addrFor(ip).sin_addr.s_addr) continue;
+				if (msg->toString().rfind(prefix, 0) == 0) ++n;
+			}
+			return n;
+		}
+		int countContaining(const char* ip, const std::string& needle) const
+		{
+			int n = 0;
+			for (const auto& [addr, msg] : sent)
+			{
+				if (!msg || addr.sin_addr.s_addr != addrFor(ip).sin_addr.s_addr) continue;
+				if (msg->toString().find(needle) != std::string::npos) ++n;
+			}
+			return n;
+		}
+	};
+}
+
+TEST(AnchorRouting, ADegradedConnected911Or933IsKeptUpAndReportedOnce)
+{
+	for (const std::string dialed : { "911", "933" })
+	{
+		SCOPED_TRACE(dialed);
+		const std::string callId = "anchor-906-" + dialed;
+		DegradedRig rig(dialed, callId);
+		ASSERT_NE(rig.bridge, nullptr);
+		ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
+		ASSERT_TRUE(rig.degrade());
+		rig.sent.clear();
+
+		rig.handler.forceNextTickForTest();
+		rig.handler.tick();
+
+		EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value())
+			<< "the degraded-audio sweep hung up a connected " << dialed;
+		EXPECT_TRUE(rig.bridge->isActive()) << "its bridge was stopped";
+		EXPECT_EQ(rig.countTo("192.168.9.51", "BYE "), 0) << "no BYE to the caller";
+		EXPECT_EQ(rig.countContaining("192.168.9.20", "AUDIO DEGRADED"), 1)
+			<< "the notify list is told once that the call is up with degraded audio";
+		EXPECT_EQ(rig.countContaining("192.168.9.20", "NOT ROUTED"), 0) << "it is not a routing failure";
+		EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty()) << "the call is still up: no CDR row";
+
+		rig.sent.clear();
+		rig.handler.forceNextTickForTest();
+		rig.handler.tick();
+		EXPECT_EQ(rig.countContaining("192.168.9.20", "AUDIO DEGRADED"), 0)
+			<< "reported once per call, not on every sweep";
+		EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
+
+		// The caller's own hangup still ends it.
+		rig.handler.handle(makeBye("501", dialed, "192.168.9.51", callId));
+		EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	}
+}
+
+TEST(AnchorRouting, ADegradedOrdinaryCallIsStillHungUpAndNotReported)
+{
+	DegradedRig rig("555", "anchor-906-555");
+	ASSERT_NE(rig.bridge, nullptr);
+	ASSERT_TRUE(rig.degrade());
+	rig.sent.clear();
+
+	rig.handler.forceNextTickForTest();
+	rig.handler.tick();
+
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: anchor-906-555").has_value());
+	EXPECT_EQ(rig.countTo("192.168.9.51", "BYE "), 1) << "the ordinary teardown is unchanged: one BYE";
+	EXPECT_EQ(rig.countContaining("192.168.9.20", "AUDIO DEGRADED"), 0) << "nobody is notified of a 555";
+	EXPECT_EQ(rig.handler.cdrSnapshotForTest().size(), 1u);
 }
 
 TEST(AnchorRouting, AnAckDeadlineReapWritesTheDialedNumberAsTheCdrCallee)

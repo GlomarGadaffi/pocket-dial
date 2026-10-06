@@ -433,6 +433,27 @@ TEST(E911Notify, TheEmittedMessageIsAWellFormedSipRequest)
 	EXPECT_FALSE(body.empty()) << "a notification with no body notifies nobody";
 }
 
+// #904 review sibling: the admin MESSAGE (sendMessageTo) builds the same Request-URI
+// and had the same bare form; a Snom answers 404 to it without its ;line=.
+TEST(E911Notify, SendMessageToIsAddressedAtTheRegisteredContactUri)
+{
+	NBench b;
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.78.20:5060;branch=z9hG4bKrline\r\n"
+		"From: <sip:200@server>;tag=rtline\r\n"
+		"To: <sip:200@server>\r\n"
+		"Call-ID: en-r-200-line\r\n"
+		"CSeq: 2 REGISTER\r\n"
+		"Contact: <sip:200@192.168.78.20:5060;line=3>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n", enAddr("192.168.78.20")));
+	b.wire.clear();
+
+	ASSERT_TRUE(b.handler->sendMessageToForTest("200", "hello"));
+
+	EXPECT_GE(b.indexOf("MESSAGE sip:200@192.168.78.20:5060;line=3 SIP/2.0\r\n"), 0) << b.dump();
+}
+
 TEST(E911Notify, TheMessageContentLengthMatchesTheActualBody)
 {
 	// The single most consequential field to get wrong: a Content-Length that

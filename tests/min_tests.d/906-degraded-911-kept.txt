@@ -1,0 +1,2 @@
+# AnchorRouting_test.cpp: 2 (#906: a connected 911/933 survives the degraded-audio sweep, reported once; an ordinary call is still hung up)
+2
