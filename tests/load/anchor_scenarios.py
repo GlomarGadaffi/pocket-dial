@@ -338,8 +338,24 @@ def far_end_loopback_problems(far, route_dn, rows):
     return problems
 
 
+def cdr_callee_problems(rows, far_ends):
+    """A CDR guard (#893, #901): every row's callee must be one of the far ends (same_number, so
+    either of two lines matches). Never echoes a number: rows are named by their position."""
+    return ["CDR row %d: the callee is not the far end (%s)" % (n, "missing" if not r.get("callee") else
+                                                                 "another number or a participant id")
+            for n, r in enumerate(rows or [], 1) if isinstance(r, dict)
+            and not any(same_number(r.get("callee"), end) for end in far_ends)]
+
+
 def load_far_end(env, stat_fn=os.stat, posix=None):
-    """-> (far end, where it came from). Raises Refused, never echoing the value."""
+    """-> (the first far end, where it came from). Raises Refused, never echoing the value."""
+    ends, src = load_far_ends(env, stat_fn, posix)
+    return ends[0], src
+
+
+def load_far_ends(env, stat_fn=os.stat, posix=None):
+    """-> (one or two far ends, where they came from). The file may hold two lines (#893: two lines
+    on one phone; x4 alternates them per call). Raises Refused, never echoing a value."""
     posix = (os.name == "posix") if posix is None else posix
     path, value = env.get(FAR_END_FILE_ENV), env.get(FAR_END_ENV)
     if path and value:
@@ -358,11 +374,13 @@ def load_far_end(env, stat_fn=os.stat, posix=None):
                 lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
         except OSError as e:
             raise Refused("%s cannot be read (%s)" % (FAR_END_FILE_ENV, e.strerror))
-        if len(lines) != 1:
-            raise Refused("%s must hold exactly one number" % FAR_END_FILE_ENV)
-        return lines[0], "file"
+        if len(lines) not in (1, 2):
+            raise Refused("%s must hold one number, or two on separate lines" % FAR_END_FILE_ENV)
+        if len(lines) == 2 and same_number(lines[0], lines[1]):
+            raise Refused("%s holds the same number twice" % FAR_END_FILE_ENV)
+        return tuple(lines), "file"
     if value:
-        return value.strip(), "env"
+        return (value.strip(),), "env"
     raise Refused("no far end: set %s (a 0600 file) or %s; it never goes on the command line"
                   % (FAR_END_FILE_ENV, FAR_END_ENV))
 
@@ -967,7 +985,9 @@ def moh_problems(http):
 # ---------------------------------------------------------------- the run
 class AnchorRun:
     def __init__(self, args, sc, far_end, redactor, http, agent_factory, start_logger, out):
-        self.a, self.sc, self.far_end, self.red = args, sc, far_end, redactor
+        self.a, self.sc, self.red = args, sc, redactor
+        self.far_ends = tuple(far_end) if isinstance(far_end, (list, tuple)) else (far_end,)
+        self.far_end = self.far_ends[0]
         self.http, self.agent_factory, self.start_logger, self.out = http, agent_factory, start_logger, out
         self.stop = threading.Event()
         self.ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1081,7 +1101,7 @@ class AnchorRun:
 
     def far_end_loopback(self):
         """Why the far end may route back into this board, from the route DN and the last DID rows read."""
-        return far_end_loopback_problems(self.far_end, self.route_dn, self.did_rows)
+        return [p for far in self.far_ends for p in far_end_loopback_problems(far, self.route_dn, self.did_rows)]
 
     def pin_problem(self):
         """Why the S1 pin does not hold right now, or None."""
@@ -1103,9 +1123,9 @@ class AnchorRun:
         clients = [c for c in st.get("clients") or [] if isinstance(c, dict)]
         if not any(c.get("number") == PIN_UA and c.get("address") == mine for c in clients):
             return "%s is not registered at this run's address %s" % (PIN_UA, mine)
-        far = self.far_end.lstrip("+")
-        if any(str(c.get("number")) in (self.far_end, far) for c in clients):
-            return "the far end is registered on this board: it would ring a local phone"
+        for end in self.far_ends:
+            if any(str(c.get("number")) in (end, end.lstrip("+")) for c in clients):
+                return "the far end is registered on this board: it would ring a local phone"
         return None
 
     def register_all(self, expires):
@@ -1211,7 +1231,7 @@ class AnchorRun:
         probe would refuse to fire anyway, rule 5)."""
         if name not in self.sc.get("faults", ()):
             raise run_soak.Abort("INVALID", "%s arms %s, which it did not pre-register" % (self.sc["name"], name))
-        if is_never_dial(self.far_end):
+        if any(is_never_dial(end) for end in self.far_ends):
             raise run_soak.Abort("INVALID", "refusing to arm %s: the far end is an emergency or never-dial "
                                  "number (rule 5)" % name)
         self.probe.arm(name, value)
@@ -1584,7 +1604,8 @@ def x4_run(run, sc):
         cancel_ms = lo + (hi - lo) * i / (n - 1) if n > 1 else lo
         t_start = time.monotonic()
         st = {}
-        dlg = caller.invite(run.far_end, cancel_when=x4_when(run, cancel_ms, st),
+        far = run.far_ends[i % len(run.far_ends)]     # #893: two lines on one phone alternate per call
+        dlg = caller.invite(far, cancel_when=x4_when(run, cancel_ms, st),
                             cancel_when_timeout_s=sc["ref_timeout_s"])
         rec = call_record(i, cancel_ms, dlg, t_start)
         rec["ring_ref_ms"] = ms_since(dlg.invite_sent_at, st.get("ref_t"))
@@ -2239,8 +2260,9 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
     problems = []
     far = src = None
     try:
-        far, src = load_far_end(env)
-        red.add(far)
+        far, src = load_far_ends(env)
+        for end in far:
+            red.add(end)
     except Refused as e:
         problems.append(str(e))
     bad_argv = argv_problems(argv, red)
@@ -2259,7 +2281,8 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
     owner = owner_set(args.owner_ext, env.get("PD_OWNER_EXTS"))
     problems += scenario_problems(sc) + host_problems(args.host) + approval_problems(args.approval_url)
     if far is not None:
-        problems += far_end_problems(far, owner)
+        for end in far:
+            problems += far_end_problems(end, owner)
     if not args.dry_run and not args.expect_version:
         problems.append("no --expect-version: the closure rule needs a provenance-checked image "
                         "(the release stamp, or that commit's -probe stamp)")
@@ -2278,8 +2301,10 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
     emit("  board     %s  SIP :%d  HTTP :%d" % (args.host, args.port, args.http_port))
     emit("  test UAs  %s; the S1 pin is <route DN> -> %s" % (
         ", ".join("%s %s" % kv for kv in sorted(sc["uas"].items())), PIN_UA))
-    emit("  far end   %s (never printed)" % ("from " + {"file": FAR_END_FILE_ENV, "env": FAR_END_ENV}[src]
-                                             if src else "<not set>"))
+    emit("  far end   %s (never printed)%s" % ("from " + {"file": FAR_END_FILE_ENV, "env": FAR_END_ENV}[src]
+                                               if src else "<not set>",
+                                               "; two numbers, x4 alternates them per call" if far and len(far) == 2
+                                               else ""))
     emit("  calls     %d, each <= %d s; counter %s (INVALID if 0)" % (sc["calls"], sc["call_cap_s"],
                                                                      sc["path_counter"]))
     emit("  approval  %s" % (args.approval_url or "<none>"))
