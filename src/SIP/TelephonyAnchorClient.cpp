@@ -2243,9 +2243,9 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 
 	std::lock_guard<std::mutex> ctrlLock(_ctrlMutex);
 
-	// Two attempts: the first may ride a connection the server idled out, in
-	// which case perform() fails; the second goes out on a fresh handle, which
-	// is exactly what every request paid before this connection was persistent.
+	// Two attempts: attempt 0 reopens the cleanly closed persistent handle with TLS session
+	// ticket resumption (~100-150 ms); if an unexpected transport failure occurs, attempt 1
+	// cleans up and rebuilds fresh (cold handshake fallback).
 	for (int attempt = 0; attempt < 2; ++attempt)
 	{
 		if (!_ctrlClient)
@@ -2279,6 +2279,10 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 			{
 				*statusCodeOut = status;
 			}
+			// #884: close (not cleanup) the transport connection so an idle period does not
+			// leave a dead TCP socket that fails the next perform() on WRITE_DATA and discards
+			// the cached TLS session ticket. The handle and session ticket stay warm for resumption.
+			esp_http_client_close(_ctrlClient);
 			return (status >= 200 && status < 300);
 		}
 
@@ -2297,10 +2301,10 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 
 void TelephonyAnchorClient::warmCtrlConnection()
 {
-	// Establish the control-plane TLS session ahead of the first command so a
-	// makecall right after dialing doesn't pay the handshake. A POST to the DN
-	// root is a no-op command-wise (Telephony answers 4xx) but completes the TLS+TCP
-	// setup that perform() will then reuse.
+	// Establish the control-plane TLS session ahead of the first command (dropCall or
+	// answerCall) so it doesn't pay a cold handshake mid-call. A POST to the DN
+	// root is a no-op command-wise (Telephony answers 4xx) but completes the TLS setup
+	// and primes the session ticket for resumption.
 	std::string url;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
