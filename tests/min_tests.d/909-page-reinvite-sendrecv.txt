@@ -1,0 +1,2 @@
+# MulticastPaging_test.cpp: 12 new tests (hold/resume/inactive/UPDATE/no-PCMU/timer/pool/911/silence/BYE) replace 1 (the 488 test), net +11
+11

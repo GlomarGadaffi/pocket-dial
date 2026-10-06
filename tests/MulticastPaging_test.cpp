@@ -17,9 +17,11 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -146,6 +148,61 @@ namespace
 			"Contact: <sip:" + from + "@" + ip + ":5060>\r\n"
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	}
+
+	// An in-dialog INVITE or UPDATE on the page's dialog, with its own branch and CSeq so
+	// the transaction layer never takes it for a retransmit. `dir` is the a= direction
+	// line ("" for none), `pt` the one payload type offered.
+	std::string midDialog(const char* method, const std::string& ip, const std::string& callId,
+		unsigned cseq, const std::string& dir, const std::string& extraHdrs = "",
+		const std::string& pt = "0", bool withSdp = true)
+	{
+		const std::string body = !withSdp ? std::string() :
+			"v=0\r\n"
+			"o=- 0 1 IN IP4 " + ip + "\r\n"
+			"s=-\r\n"
+			"c=IN IP4 " + ip + "\r\n"
+			"t=0 0\r\n"
+			"m=audio 10000 RTP/AVP " + pt + "\r\n"
+			"a=rtpmap:" + pt + (pt == "8" ? " PCMA/8000\r\n" : " PCMU/8000\r\n") +
+			(dir.empty() ? std::string() : "a=" + dir + "\r\n");
+		return std::string(method) + " sip:997@192.168.80.1:5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKm" + callId + std::to_string(cseq) + "\r\n"
+			"From: <sip:501@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:997@server>;tag=srvtag\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(cseq) + " " + method + "\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:501@" + ip + ":5060>\r\n" + extraHdrs +
+			(withSdp ? "Content-Type: application/sdp\r\n" : "") +
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	}
+
+	std::string reinvite(const std::string& callId, unsigned cseq, const std::string& dir,
+		const std::string& extraHdrs = "", const std::string& pt = "0")
+	{
+		return midDialog("INVITE", "192.168.80.51", callId, cseq, dir, extraHdrs, pt);
+	}
+
+	std::string bodyOf(const std::string& raw)
+	{
+		const size_t sep = raw.find("\r\n\r\n");
+		return sep == std::string::npos ? std::string() : raw.substr(sep + 4);
+	}
+
+	std::string headerLine(const std::string& raw, const std::string& name)
+	{
+		const size_t at = raw.find("\r\n" + name + ":");
+		if (at == std::string::npos) return std::string();
+		const size_t end = raw.find("\r\n", at + 2);
+		return raw.substr(at + 2, end - at - 2);
+	}
+
+	// The m=audio port of an SDP answer, 0 if there is none.
+	int audioPortOf(const std::string& raw)
+	{
+		const size_t at = raw.find("m=audio ");
+		return at == std::string::npos ? 0 : std::atoi(raw.c_str() + at + 8);
 	}
 
 	std::string bye(const std::string& from, const std::string& to, const std::string& ip,
@@ -347,15 +404,17 @@ TEST(MulticastPager, OnePageAtATimeAndAStoppedPageSendsNothing)
 
 // ── The 997 dial ──────────────────────────────────────────────────────────────
 
-TEST(MulticastPaging, DialingTheExtensionAnswersRecvonlyAndRelaysTheCallersAudio)
+TEST(MulticastPaging, DialingTheExtensionAnswersSendrecvAndRelaysTheCallersAudio)
 {
 	Bench b;
 	b.send(invite("501", "997", "192.168.80.51", "pg-ok"), "192.168.80.51");
 
 	const std::string ok = b.first();
 	ASSERT_NE(ok.find("SIP/2.0 200 OK"), std::string::npos) << ok;
-	EXPECT_NE(ok.find("a=recvonly"), std::string::npos) << "we only listen on this leg:\n" << ok;
-	EXPECT_EQ(ok.find("a=sendrecv"), std::string::npos) << ok;
+	// #909: a recvonly answer made a Yealink hold the page itself (RFC 3264 §8.4).
+	EXPECT_NE(ok.find("a=sendrecv"), std::string::npos) << "the phone must not see a hold:\n" << ok;
+	EXPECT_EQ(ok.find("a=recvonly"), std::string::npos) << ok;
+	EXPECT_EQ(ok.find("a=sendonly"), std::string::npos) << ok;
 	EXPECT_NE(ok.find("RTP/AVP 0\r\n"), std::string::npos) << "PCMU only:\n" << ok;
 	EXPECT_NE(ok.find("Contact: <sip:997@"), std::string::npos) << ok;
 	EXPECT_TRUE(b.hasSession("pg-ok"));
@@ -456,15 +515,246 @@ TEST(MulticastPaging, TheExtensionIsReservedEverywhere)
 	for (const auto& f : b.handler->getForwards()) EXPECT_NE(std::get<0>(f), "997");
 }
 
-TEST(MulticastPaging, AHoldReinviteIsDeclinedAndThePageSurvives)
+// ── #909: the page's re-INVITEs and UPDATEs are answered, not refused ────────
+// A Yealink answered recvonly held the page itself and re-held after every Resume,
+// because each one drew a 488. The server is the UAS on this dialog (RFC 3261 §12.2.2),
+// so it answers with 200 and SDP, as it does for 555.
+
+namespace
+{
+	// 200 OK with an SDP body on the page's own port, To-tag untouched, the board's
+	// Contact, and no session timer (the page's own answer granted none).
+	void expectPageAnswer(const std::string& r, int pagePort, const char* dir)
+	{
+		ASSERT_EQ(r.rfind("SIP/2.0 200 OK", 0), 0u) << r;
+		EXPECT_EQ(r.find("488"), std::string::npos) << r;
+		EXPECT_EQ(audioPortOf(r), pagePort) << "same receiver as the first answer:\n" << r;
+		EXPECT_NE(r.find("RTP/AVP 0\r\n"), std::string::npos) << r;
+		EXPECT_NE(r.find(std::string("a=") + dir + "\r\n"), std::string::npos) << r;
+		EXPECT_NE(headerLine(r, "Content-Type").find("application/sdp"), std::string::npos) << r;
+		EXPECT_EQ(headerLine(r, "Content-Length"), "Content-Length: " + std::to_string(bodyOf(r).size())) << r;
+		EXPECT_NE(headerLine(r, "Contact").find("sip:997@192.168.80.1"), std::string::npos) << r;
+		const std::string to = headerLine(r, "To");
+		EXPECT_EQ(to.find("tag="), to.rfind("tag=")) << "one To-tag only: " << to;
+		EXPECT_NE(to.find("tag=srvtag"), std::string::npos) << to;
+		EXPECT_EQ(r.find("Session-Expires"), std::string::npos) << r;
+		EXPECT_EQ(r.find("Require:"), std::string::npos) << r;
+	}
+}
+
+TEST(MulticastPaging, AHoldReinviteIsAnsweredWith200AndSdpNot488AndThePageSurvives)
 {
 	Bench b;
-	b.page("pg-h");
-	b.send(invite("501", "997", "192.168.80.51", "pg-h", "srvtag"), "192.168.80.51");
+	b.send(invite("501", "997", "192.168.80.51", "pg-h"), "192.168.80.51");
+	const int pagePort = audioPortOf(b.first());
+	ASSERT_GT(pagePort, 0) << b.first();
+	b.sent.clear();
 
-	EXPECT_TRUE(b.saw("488 Not Acceptable Here")) << b.first();
+	b.send(reinvite("pg-h", 2, "sendonly"), "192.168.80.51");
+
+	ASSERT_EQ(b.sent.size(), 1u) << "one final answer";
+	expectPageAnswer(b.first(), pagePort, "recvonly");   // RFC 3264 §6.1: sendonly -> recvonly
 	for (const auto& s : b.sent) EXPECT_NE(s.second.rfind("INVITE ", 0), 0u) << "nothing relayed back";
+	EXPECT_EQ(b.byesTo("192.168.80.51"), 0u);
+	EXPECT_TRUE(b.hasSession("pg-h"));
 	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
+}
+
+TEST(MulticastPaging, ResumeAfterHoldIsAnsweredSendrecvAndTheT29HoldLoopIsBroken)
+{
+	Bench b;
+	b.send(invite("501", "997", "192.168.80.51", "pg-r"), "192.168.80.51");
+	const int pagePort = audioPortOf(b.first());
+	ASSERT_GT(pagePort, 0);
+
+	unsigned cseq = 2;
+	for (int round = 0; round < 2; ++round)   // the capture: hold, Resume, re-hold, Resume
+	{
+		SCOPED_TRACE(round);
+		b.sent.clear();
+		b.send(reinvite("pg-r", cseq++, "sendonly"), "192.168.80.51");
+		expectPageAnswer(b.first(), pagePort, "recvonly");
+		b.sent.clear();
+		b.send(reinvite("pg-r", cseq++, "sendrecv"), "192.168.80.51");
+		ASSERT_EQ(b.sent.size(), 1u);
+		expectPageAnswer(b.first(), pagePort, "sendrecv");
+	}
+	EXPECT_EQ(b.byesTo("192.168.80.51"), 0u);
+	EXPECT_TRUE(b.hasSession("pg-r"));
+	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
+}
+
+TEST(MulticastPaging, AnInactiveReinviteIsAnsweredInactive)
+{
+	Bench b;
+	b.page("pg-i");
+	b.send(reinvite("pg-i", 2, "inactive"), "192.168.80.51");
+	ASSERT_EQ(b.sent.size(), 1u);
+	expectPageAnswer(b.first(), audioPortOf(b.first()), "inactive");
+	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
+}
+
+TEST(MulticastPaging, AHeldPageForwardsNothingAndResumeForwardsAgain)
+{
+	Bench b;
+	b.page("pg-f");
+	b.handler->multicastRtpForTest(callerPkt(160));
+	ASSERT_EQ(b.tx.sends, 1u);
+
+	b.send(reinvite("pg-f", 2, "sendonly"), "192.168.80.51");
+	ASSERT_NE(b.first().find("SIP/2.0 200 OK"), std::string::npos) << b.first();
+	b.handler->multicastRtpForTest(callerPkt(160));   // the phone's own hold audio
+	b.handler->multicastRtpForTest(callerPkt(160));
+	EXPECT_EQ(b.tx.sends, 1u) << "hold music or noise from a held caller never reaches the group";
+
+	b.sent.clear();
+	b.send(reinvite("pg-f", 3, "sendrecv"), "192.168.80.51");
+	ASSERT_NE(b.first().find("SIP/2.0 200 OK"), std::string::npos) << b.first();
+	b.handler->multicastRtpForTest(callerPkt(160));
+	EXPECT_EQ(b.tx.sends, 2u) << "resumed: the page is on the air again";
+}
+
+TEST(MulticastPaging, AHeldPageStillEndsBySilenceAndASecondCallerStillGets486)
+{
+	Bench b;
+	b.page("pg-hs");
+	const auto t0 = std::chrono::steady_clock::now();
+	b.send(reinvite("pg-hs", 2, "sendonly"), "192.168.80.51");
+	ASSERT_NE(b.first().find("SIP/2.0 200 OK"), std::string::npos) << b.first();
+	b.sent.clear();
+
+	b.send(invite("502", "997", "192.168.80.52", "pg-other"), "192.168.80.52");
+	EXPECT_NE(b.first().find("486 Busy Here"), std::string::npos) << "a held page is still the page:\n" << b.first();
+	EXPECT_FALSE(b.hasSession("pg-other"));
+	b.sent.clear();
+
+	b.handler->sweepMulticastPageForTest(t0 + pbx::kMulticastPageSilence - std::chrono::seconds(1));
+	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
+	EXPECT_EQ(b.byesTo("192.168.80.51"), 0u);
+	b.handler->sweepMulticastPageForTest(t0 + pbx::kMulticastPageSilence + std::chrono::seconds(1));
+	EXPECT_EQ(b.byesTo("192.168.80.51"), 1u) << "a re-INVITE is not RTP: the silence timer is unchanged";
+	EXPECT_FALSE(b.hasSession("pg-hs"));
+	EXPECT_FALSE(b.handler->multicastPageActiveForTest());
+}
+
+TEST(MulticastPaging, ResumeRestartsTheSilenceClockSoAHoldDoesNotEatTheNextTalkspurt)
+{
+	Bench b;
+	b.page("pg-rc");
+	const auto t0 = std::chrono::steady_clock::now();
+	b.send(reinvite("pg-rc", 2, "sendonly"), "192.168.80.51");
+	std::this_thread::sleep_for(std::chrono::milliseconds(30));
+	b.send(reinvite("pg-rc", 3, "sendrecv"), "192.168.80.51");
+	b.sent.clear();
+
+	// At t0 + silence + 15 ms the page's own start is stale, but the Resume was at
+	// least 30 ms after t0, so it is not.
+	b.handler->sweepMulticastPageForTest(t0 + pbx::kMulticastPageSilence + std::chrono::milliseconds(15));
+	EXPECT_EQ(b.byesTo("192.168.80.51"), 0u) << "the caller has had no time to talk since Resume";
+	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
+}
+
+TEST(MulticastPaging, ByeAfterAHoldEndsThePageAndTheNextPageIsNotHeld)
+{
+	Bench b;
+	b.page("pg-b1");
+	b.send(reinvite("pg-b1", 2, "sendonly"), "192.168.80.51");
+	ASSERT_NE(b.first().find("SIP/2.0 200 OK"), std::string::npos) << b.first();
+	b.sent.clear();
+
+	b.send(bye("501", "997", "192.168.80.51", "pg-b1"), "192.168.80.51");
+	EXPECT_NE(b.first().find("SIP/2.0 200 OK"), std::string::npos) << b.first();
+	EXPECT_FALSE(b.hasSession("pg-b1"));
+	EXPECT_FALSE(b.handler->multicastPageActiveForTest());
+	EXPECT_FALSE(b.handler->multicastRtpForTest(callerPkt(160))) << "receiver stopped";
+
+	b.page("pg-b2");
+	b.handler->multicastRtpForTest(callerPkt(160));
+	EXPECT_EQ(b.tx.sends, 1u) << "a hold never carries over into the next page";
+}
+
+TEST(MulticastPaging, AnUpdateWithSdpIsAnsweredAndABodilessOneIsStillAnsweredLocally)
+{
+	Bench b;
+	b.page("pg-u");
+
+	b.send(midDialog("UPDATE", "192.168.80.51", "pg-u", 2, "sendonly"), "192.168.80.51");
+	ASSERT_EQ(b.sent.size(), 1u);
+	expectPageAnswer(b.first(), audioPortOf(b.first()), "recvonly");
+	b.sent.clear();
+
+	b.send(midDialog("UPDATE", "192.168.80.51", "pg-u", 3, "", "", "0", /*withSdp=*/false), "192.168.80.51");
+	ASSERT_EQ(b.sent.size(), 1u);
+	EXPECT_EQ(b.first().rfind("SIP/2.0 200 OK", 0), 0u) << b.first();
+	EXPECT_TRUE(bodyOf(b.first()).empty());
+	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
+}
+
+TEST(MulticastPaging, AReinviteThatOffersNoPcmuIsRefusedAndThePageSurvivesUnheld)
+{
+	Bench b;
+	b.page("pg-np");
+	b.send(reinvite("pg-np", 2, "sendonly", "", "8"), "192.168.80.51");
+
+	EXPECT_NE(b.first().find("488 Not Acceptable Here"), std::string::npos) << b.first();
+	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
+	b.handler->multicastRtpForTest(callerPkt(160));
+	EXPECT_EQ(b.tx.sends, 1u) << "a refused offer changes nothing: not held";
+}
+
+TEST(MulticastPaging, ASessionTimerOnTheReinviteIsNotGrantedAndNothingEndsThePage)
+{
+	Bench b;
+	b.page("pg-st");
+	b.send(reinvite("pg-st", 2, "sendrecv",
+		"Supported: timer\r\nSession-Expires: 1800;refresher=uac\r\nMin-SE: 90\r\n"), "192.168.80.51");
+
+	const std::string r = b.first();
+	ASSERT_EQ(r.rfind("SIP/2.0 200 OK", 0), 0u) << r;
+	EXPECT_EQ(r.find("Session-Expires"), std::string::npos) << "the page grants no timer, as its first answer:\n" << r;
+	EXPECT_EQ(r.find("Require:"), std::string::npos) << r;
+	b.sent.clear();
+	b.handler->tick();
+	EXPECT_EQ(b.byesTo("192.168.80.51"), 0u);
+	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
+}
+
+TEST(MulticastPaging, PoolRefusalOnTheReinviteDropsItAndLeavesThePageUnheld)
+{
+	Bench b;
+	b.page("pg-rp");
+	auto re = RequestsHandler::getMessageFromPool(reinvite("pg-rp", 2, "sendonly"), addrFor("192.168.80.51"));
+	ASSERT_NE(re, nullptr);
+	{
+		std::vector<std::shared_ptr<SipMessage>> held;
+		const std::string filler = reg("599", "192.168.80.59", "hold");
+		for (size_t i = 0; i < 4 * POCKETDIAL_MSG_POOL; ++i)
+		{
+			auto m = RequestsHandler::getMessageFromPool(filler, addrFor("192.168.80.59"));
+			if (!m) break;
+			held.push_back(std::move(m));
+		}
+		b.handler->handle(re);
+		EXPECT_TRUE(b.sent.empty()) << "no answer drawn, none sent: the phone retransmits";
+	}
+	re.reset();
+	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
+	b.handler->multicastRtpForTest(callerPkt(160));
+	EXPECT_EQ(b.tx.sends, 1u) << "no 200 went out, so the page did not enter hold";
+}
+
+TEST(MulticastPaging, AnEmergencyCallStillRoutesWhileThePageIsHeld)
+{
+	Bench b;
+	b.handler->setAnchorPlacesRealCallsForTest(true);
+	b.page("pg-e");
+	b.send(reinvite("pg-e", 2, "sendonly"), "192.168.80.51");
+	auto* loopback = dynamic_cast<LoopbackAnchorClient*>(b.handler->anchorClientForTest());
+	ASSERT_NE(loopback, nullptr);
+
+	b.send(invite("502", "911", "192.168.80.52", "em-911h"), "192.168.80.52");
+	EXPECT_EQ(loopback->lastMakeCallDestination(), "911") << "a held page never gates or pre-empts 911";
+	EXPECT_FALSE(b.saw("486 Busy Here"));
 }
 
 TEST(MulticastPaging, AnAdminKillByesTheCallerOnceAndEndsThePage)
