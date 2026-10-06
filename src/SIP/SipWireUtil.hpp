@@ -20,6 +20,8 @@
 #include <string>
 #include <string_view>
 
+#include "SipClient.hpp"
+
 namespace sipwire
 {
 	// "a.b.c.d:port" for a v4 peer — the authority the machines stamp into a
@@ -29,6 +31,15 @@ namespace sipwire
 		char ipBuf[INET_ADDRSTRLEN]{};
 		inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
 		return std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
+	}
+
+	// Request-URI toward a phone: its registered Contact with URI parameters intact
+	// (a Snom answers 404/481 without its ;line=), the bare form only as a fallback.
+	inline std::string memberRequestUri(const SipClient& c)
+	{
+		return c.getContactUri().empty()
+			? "sip:" + c.getNumber() + "@" + addrToIpPort(c.getAddress())
+			: c.getContactUri();
 	}
 
 	// The top Via of a response, stamped per RFC 3261 §18.2.1 and RFC 3581 §4:
