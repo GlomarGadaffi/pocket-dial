@@ -34,7 +34,7 @@ namespace pdwitness
 	struct Sink
 	{
 		std::mutex  m;
-		char        ring[kRingLines][kLineBytes];
+		char        ring[kRingLines][kLineBytes] = {};
 		std::size_t total = 0;   // lines ever recorded; the newest kRingLines are kept
 	};
 
