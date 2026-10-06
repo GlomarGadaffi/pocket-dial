@@ -2173,10 +2173,13 @@ void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 	self->_restartInFlight.store(false, std::memory_order_release);
 }
 
-esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token)
+esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token,
+                                                              http_event_handle_cb onEvent, void* eventUser)
 {
 	esp_http_client_config_t config = {};
 	config.url = url.c_str();
+	config.event_handler = onEvent;
+	config.user_data = eventUser;
 	config.method = method;
 	config.crt_bundle_attach = esp_crt_bundle_attach;
 	config.buffer_size = 4096;
@@ -2233,6 +2236,18 @@ bool TelephonyAnchorClient::performAuthedRequest(esp_http_client_handle_t client
 	}
 }
 
+// #884 witness: esp_http_client dispatches HTTP_EVENT_ON_CONNECTED once perform() has opened the
+// socket and finished the TLS handshake, so a request that never gets it rode an open socket.
+// No allocation, no lock: it runs inside perform(), under performCtrl's _ctrlMutex.
+static esp_err_t ctrlConnectedHook(esp_http_client_event_t* evt)
+{
+	if (evt->event_id == HTTP_EVENT_ON_CONNECTED && evt->user_data)
+	{
+		*static_cast<bool*>(evt->user_data) = true;
+	}
+	return ESP_OK;
+}
+
 bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* contentType, const std::string& body, int* statusCodeOut)
 {
 	std::string token;
@@ -2248,9 +2263,11 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 	// cleans up and rebuilds fresh (cold handshake fallback).
 	for (int attempt = 0; attempt < 2; ++attempt)
 	{
+		bool freshHandle = false;
 		if (!_ctrlClient)
 		{
-			_ctrlClient = makeAuthedClient(url, HTTP_METHOD_POST, 1024, token);
+			freshHandle = true;
+			_ctrlClient = makeAuthedClient(url, HTTP_METHOD_POST, 1024, token, ctrlConnectedHook, &_ctrlConnected);
 			if (!_ctrlClient)
 			{
 				return false;
@@ -2271,7 +2288,14 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 		}
 		esp_http_client_set_post_field(_ctrlClient, body.c_str(), body.length());
 
+		_ctrlConnected = false;
+		const int64_t t0 = esp_timer_get_time();
 		esp_err_t err = esp_http_client_perform(_ctrlClient);
+		const int64_t ms = (esp_timer_get_time() - t0) / 1000;
+		// reused: no connect event (rode an open socket). Otherwise a connect: a fresh handle holds
+		// no ticket, so it is cold; a kept handle is "resumed" when it connected in <= 400 ms (the
+		// repo's resumed-vs-full cut, as in rewarmPostSession) and "cold" above it (ticket refused).
+		const char* how = !_ctrlConnected ? "reused" : (freshHandle || ms > 400) ? "cold" : "resumed";
 		if (err == ESP_OK)
 		{
 			int status = esp_http_client_get_status_code(_ctrlClient);
@@ -2279,6 +2303,8 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 			{
 				*statusCodeOut = status;
 			}
+			// One witness line per control request, esp_log so syslog carries it (#884).
+			ESP_LOGI(TAG, "ctrl request: attempt %d %s in %lld ms (#884)", attempt, how, (long long)ms);
 			// #884: close (not cleanup) the transport connection so an idle period does not
 			// leave a dead TCP socket that fails the next perform() on WRITE_DATA and discards
 			// the cached TLS session ticket. The handle and session ticket stay warm for resumption.
@@ -2286,8 +2312,9 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 			return (status >= 200 && status < 300);
 		}
 
-		ESP_LOGW(TAG, "Control request failed (%s)%s", esp_err_to_name(err),
-		         attempt == 0 ? " — reconnecting" : "");
+		ESP_LOGW(TAG, "Control request failed (%s) on attempt %d after %lld ms, %s%s", esp_err_to_name(err),
+		         attempt, (long long)ms, _ctrlConnected ? "after connecting" : "before any connect (reused socket or connect failed)",
+		         attempt == 0 ? " — rebuilding the handle" : "");
 		esp_http_client_cleanup(_ctrlClient);
 		_ctrlClient = nullptr;
 	}

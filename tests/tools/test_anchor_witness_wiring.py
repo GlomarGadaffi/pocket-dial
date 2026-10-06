@@ -32,6 +32,14 @@ class EspWitnessWiringTest(unittest.TestCase):
         self.assertIn('"/callcontrol/<dn>/participants/%s/stream -- giving up now, not at attempt %d (#902)"', self.src)
         self.assertNotIn("getUrl.c_str(),\n\t\t\t\t\t\t\tforbiddenAfterAnswer", self.src)
 
+    def test_884_ctrl_request_witness_is_one_esp_log_line_fed_by_the_connect_event(self):
+        self.assertIn('ESP_LOGI(TAG, "ctrl request: attempt %d %s in %lld ms (#884)"', self.src)
+        sample = "I (1) TelephonyAnchor: ctrl request: attempt 1 cold in 1130 ms (#884)"
+        self.assertEqual(an.count_lines([sample])["ctrl_request_884"], 1)
+        self.assertEqual(self.src.count("ctrl request: attempt"), 1, "one witness line, not queueLog")
+        self.assertIn("HTTP_EVENT_ON_CONNECTED", self.src)
+        self.assertIn("makeAuthedClient(url, HTTP_METHOD_POST, 1024, token, ctrlConnectedHook, &_ctrlConnected)", self.src)
+
     def test_888_witness_is_not_taken_under_the_mutex(self):
         at = self.src.index('ESP_LOGW(TAG, "Upset ignored while')
         before = self.src[max(0, at - 700):at]
