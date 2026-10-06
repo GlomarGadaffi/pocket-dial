@@ -69,7 +69,7 @@ Cross-references:
 | Attended transfer (REFER + Replaces, RFC 3891) | Splices B and C, BYEs A out of both, relays a later BYE across the bridge. The hardcoded `CSeq: 100` of #257 was removed by its own fix (#308, per-dialog floors), and #402 replaced those floors with `nextServerCSeq()` (`RequestsHandler.cpp:6149`). Only REFER `?Replaces=` is handled; an INVITE carrying `Replaces` (BLF pickup) is not. | `onRefer`, `handleTransferOk` |
 | Hold / resume | Re-INVITE relayed with its **SDP** untouched, so the SDP survives; `Contact` is rewritten on every relayed re-INVITE (#425, `RequestsHandler.cpp:9079-9090`) | `onReinvite`, `onOk` |
 | RFC 3311 `UPDATE` | | `onUpdate` |
-| RFC 4028 session timers | Passive: the PBX honours a timer a phone requests, but never requests one itself. An initial INVITE with too small a `Session-Expires` gets `422` + `Min-SE` (#591). | `armSessionTimer` |
+| RFC 4028 session timers | Advertises `Supported: timer` (#198). An initial INVITE with too small a `Session-Expires` gets `422` + `Min-SE` (#591), and PBX-authored 2xx answers name `refresher=uac` (#724). | `armSessionTimer`, `answerSessionTimer` |
 | Ring / hunt groups | ring-all or sequential hunt | `CallForker` |
 | Call park + retrieve | orbits `700`–`709` (`POCKETDIAL_PARK_SLOTS` = 10) | `ParkOrbit.*` |
 | Call pickup | group `*8`, directed `**<ext>`; pickup groups reuse ring-group membership | `CallPickup.*` |

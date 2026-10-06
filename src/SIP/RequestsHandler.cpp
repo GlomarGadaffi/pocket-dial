@@ -1612,16 +1612,17 @@ namespace
 	// handled, because nothing in src/ reads that header. Kept per #229's
 	// scope call rather than withdrawn, since the REFER usage is real.
 	//
-	// NOT "timer" (#198). The 2xx this PBX writes itself now names the phone as
-	// refresher (pbx::answerSessionTimer), and a too-small interval draws 422 +
-	// Min-SE (#591), but a UAS that advertises timer must still do what this one
-	// cannot: be the refresher when the phone asks it to (refresher=uas, or no
-	// Supported: timer), since nothing here ever sends a refresh; accept a
-	// re-INVITE refresh on 777/888/trunk legs (answered 488 below); and answer an
-	// UPDATE refresh on park and 440 legs (relayed back to the caller, #709).
+	// "timer" (RFC 4028, issue #198): the active half of session timers is
+	// implemented. onInvite() inspects Session-Expires / Min-SE and answers
+	// too-small intervals (< 90 s) with 422 Session Interval Too Small + Min-SE
+	// (#591); pbx::answerSessionTimer() handles PBX-authored 2xx responses by
+	// designating refresher=uac (and Require: timer) when the phone supports it,
+	// or omitting Session-Expires when refresher=uas or unsupported (#724); and
+	// in-dialog bodiless UPDATE refreshes are handled locally or relayed (#439, #782).
+	//
 	// NOT "100rel" (RFC 3262 needs PRACK), "norefersub", "path", "gruu" or
 	// "outbound" — none of them have any implementation in this codebase.
-	constexpr const char* kSupportedOptionTags = "replaces";
+	constexpr const char* kSupportedOptionTags = "replaces, timer";
 
 	// Body types this PBX actually parses: SDP on INVITE/re-INVITE/UPDATE/ACK,
 	// and the DTMF relay body handle() looks for on INFO. onMessage() does not
