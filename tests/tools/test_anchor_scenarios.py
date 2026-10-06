@@ -620,6 +620,7 @@ class WitnessSampleTest(unittest.TestCase):
                             "listed, 0 direct_control, 0 slot-claimed, 0 an earlier call's; direct_control false 0, "
                             "absent 0, not a bool 0) — reading again (#349)",
         "e911_notify_uri": "I (88123) e911: notify MESSAGE Request-URI: registered Contact",
+        "trunk_final_tag_896": "W (40211) trunk: final 200 To-tag differs from the early dialog's: the final's defines it (#896)",
     }
 
     def test_each_witness_regex_matches_the_line_the_firmware_formats(self):

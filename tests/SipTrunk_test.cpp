@@ -34,6 +34,7 @@
 
 #include "FakePbxEnv.hpp"
 #include "SipTrunk.hpp"
+#include "Witness.hpp"
 
 namespace
 {
@@ -615,6 +616,92 @@ TEST(SipTrunkDialog, AProvisionalsToTagNeverReplacesTheAnswers)
 			EXPECT_EQ(m.find("hop-tag-1xx"), std::string::npos) << m;
 		}
 	}
+}
+
+// #896: a forking carrier. A 180 from fork A carries tag A; the answer (the
+// PSAP's, for a 911) comes from fork B with tag B. The 2xx defines the dialog
+// (RFC 3261 §12.1.2, §13.2.2.4): its ACK and the later BYE carry B. The CANCEL
+// stays tagless (§9.1), and a later 2xx from another fork never moves it.
+TEST(SipTrunkDialog, TheFirstTwoXxsTagDefinesTheDialogNotAnEarlierProvisionals)
+{
+	for (const char* dest : { "911", "+15551234567" })
+	{
+		SCOPED_TRACE(dest);
+		pdwitness::clear();
+		FakePbxEnv env;
+		SipTrunk trunk(env);
+		trunk.setConfig(workingConfig());
+		ASSERT_TRUE(trunk.placeCall(dest, "handset-1", sbcAddr(), 40000));
+		const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+		ASSERT_NE(d, nullptr);
+		const std::string ok = okFor(*d);
+		std::string ringA = withStatus(ok, "SIP/2.0 180 Ringing");
+		ringA.replace(ringA.find("tag=carrier-tag"), 15, "tag=fork-A-tag1");
+
+		ASSERT_TRUE(trunk.handleResponse(responseFor(ringA)));
+		ASSERT_TRUE(trunk.handleResponse(responseFor(ok)));
+		std::string okC = ok;
+		okC.replace(okC.find("tag=carrier-tag"), 15, "tag=fork-C-tag1");
+		ASSERT_TRUE(trunk.handleResponse(responseFor(okC)));
+		ASSERT_TRUE(trunk.hangup("handset-1"));
+
+		// The second fork's 2xx is ACKed (index 2); answering it on its own dialog
+		// and BYEing that fork (§13.2.2.4) is not done today and is not pinned here.
+		ASSERT_EQ(env.sent.size(), 4u) << "INVITE, the 2xx's ACK, the second 2xx's ACK, the BYE";
+		for (size_t i : { size_t{1}, size_t{3} })
+		{
+			const std::string m = env.sentRaw(i);
+			EXPECT_NE(m.find("To: <"), std::string::npos) << m;
+			EXPECT_NE(m.find(";tag=carrier-tag"), std::string::npos) << m;
+			EXPECT_EQ(m.find("fork-A-tag1"), std::string::npos) << m;
+			EXPECT_EQ(m.find("fork-C-tag1"), std::string::npos) << m;
+		}
+		EXPECT_EQ(pdwitness::count("To-tag differs from the early dialog's"), 1u);
+	}
+}
+
+// §17.1.1.3: the ACK of a non-2xx final carries that response's To, tag included.
+TEST(SipTrunkDialog, AFailuresAckCarriesTheFailuresTagNotAnEarlierProvisionals)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("911", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	const std::string ok = okFor(*d);
+	std::string ringA = withStatus(ok, "SIP/2.0 183 Session Progress");
+	ringA.replace(ringA.find("tag=carrier-tag"), 15, "tag=fork-A-tag1");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(ringA)));
+	ASSERT_TRUE(trunk.handleResponse(responseFor(withStatus(ok, "SIP/2.0 486 Busy Here"))));
+
+	ASSERT_EQ(env.sent.size(), 2u) << "INVITE, the 486's ACK";
+	EXPECT_EQ(env.sentRaw(1).rfind("ACK ", 0), 0u) << env.sentRaw(1);
+	EXPECT_NE(env.sentRaw(1).find(";tag=carrier-tag"), std::string::npos) << env.sentRaw(1);
+	EXPECT_EQ(env.sentRaw(1).find("fork-A-tag1"), std::string::npos) << env.sentRaw(1);
+}
+
+// The CANCEL of a ringing call names the INVITE, so it has no To-tag (§9.1),
+// whatever tag a 180 latched.
+TEST(SipTrunkDialog, TheCancelOfARingingCallStaysTagless)
+{
+	FakePbxEnv env;
+	SipTrunk trunk(env);
+	trunk.setConfig(workingConfig());
+	ASSERT_TRUE(trunk.placeCall("+15551234567", "handset-1", sbcAddr(), 40000));
+	const SipTrunk::Dialog* d = trunk.findByCallID("handset-1");
+	ASSERT_NE(d, nullptr);
+	std::string ringA = withStatus(okFor(*d), "SIP/2.0 180 Ringing");
+	ringA.replace(ringA.find("tag=carrier-tag"), 15, "tag=fork-A-tag1");
+	ASSERT_TRUE(trunk.handleResponse(responseFor(ringA)));
+	ASSERT_TRUE(trunk.hangup("handset-1"));
+
+	ASSERT_EQ(env.sent.size(), 2u);
+	const std::string cancel = env.sentRaw(1);
+	ASSERT_EQ(cancel.rfind("CANCEL ", 0), 0u) << cancel;
+	const size_t to = cancel.find("\r\nTo: ");
+	ASSERT_NE(to, std::string::npos);
+	EXPECT_EQ(cancel.substr(to, cancel.find("\r\n", to + 2) - to).find("tag="), std::string::npos) << cancel;
 }
 
 TEST(SipTrunkListener, AnsweredFiresAfterTheAckIsOnTheWire)

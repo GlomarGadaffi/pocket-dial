@@ -1,0 +1,2 @@
+# SipTrunk_test.cpp: 3 (#896: the first 2xx's To-tag defines the dialog over a 180 from another fork, 911 and ordinary; a failure's ACK carries its own tag; the CANCEL stays tagless)
+3

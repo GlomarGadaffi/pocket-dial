@@ -14,6 +14,7 @@
 #include "SipMessageTypes.h"
 #include "SipWireUtil.hpp"
 #include "TrunkResolver.hpp"
+#include "Witness.hpp"
 
 using sipwire::addrToIpPort;
 
@@ -907,6 +908,16 @@ bool SipTrunk::handleResponse(const std::shared_ptr<SipMessage>& data)
 	const std::string toTag = siphdr::tagOf(data->getTo());
 	const bool dialogTag = status == 180 || status == 183 || status >= 200;
 	if (!toTag.empty() && d->toTag.empty() && dialogTag) d->toTag = toTag;
+	// #896: a final response to the INVITE names the dialog its ACK and BYE
+	// belong to (RFC 3261 §12.1.2, §13.2.2.4, §17.1.1.3), not a 180/183 from
+	// another fork. Once Confirmed, a later 2xx never moves it.
+	if (!toTag.empty() && status >= 200 && toTag != d->toTag && data->getCSeqMethod() == "INVITE"
+		&& d->state != State::Confirmed && d->state != State::Terminating)
+	{
+		PD_WITNESS_W("trunk", "final %d To-tag differs from the early dialog's: the final's defines it (#896)",
+			status);
+		d->toTag = toTag;
+	}
 
 	// #794: hangup() ran before any provisional response, when §9.1 forbade a
 	// CANCEL. This is the first one, so the CANCEL goes out now -- hangup() on

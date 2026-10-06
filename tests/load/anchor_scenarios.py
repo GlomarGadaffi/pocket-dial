@@ -191,6 +191,8 @@ LOG_COUNTERS = {
     "post_open": r"POST \(device->Telephony\) audio stream OPEN: \S*/participants/([^/\s]+)/stream",
     # #904 review: the 911 notify MESSAGE's Request-URI source, once per notified phone.
     "e911_notify_uri": r"e911: notify MESSAGE Request-URI: (registered Contact|bare \(no Contact stored\))",
+    # #896: a trunk INVITE's final response replaced an early (180/183) To-tag; group 1 = the status.
+    "trunk_final_tag_896": r"trunk: final (\d+) To-tag differs from the early dialog's: the final's defines it \(#896\)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (\S+) reason=",
     "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",
