@@ -362,6 +362,120 @@ TEST(RegisterBeeper, TheAckForA2xxCarriesAFreshViaBranch)
 	EXPECT_EQ(ackBranch.rfind("z9hG4bK", 0), 0u) << "RFC 3261 magic cookie: " << ack;
 }
 
+// Issue #856: the beep's Request-URI is the phone's registered Contact URI with
+// its parameters (RFC 3261 §10.2.1, §8.1.1.1). A Snom answers 404/481 to the
+// bare sip:<ext>@<ip>:<port> form, which lacks its ;line=.
+namespace
+{
+	constexpr const char* kLineContact = "sip:101@192.168.1.50:5060;transport=udp;line=pd856x;x-pd=a1";
+
+	std::shared_ptr<SipClient> phoneWithContact(const sockaddr_in& addr)
+	{
+		auto phone = std::make_shared<SipClient>("101", addr);
+		phone->setContactUri(kLineContact);
+		return phone;
+	}
+
+	std::string requestLine(const std::string& raw)
+	{
+		return raw.substr(0, raw.find("\r\n"));
+	}
+}
+
+TEST(RegisterBeeper, BeepInviteUsesTheRegisteredContactUriWithItsParams)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	beeper.sendBeep(phoneWithContact(phoneAddr));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(requestLine(env.sentRaw(0)), std::string("INVITE ") + kLineContact + " SIP/2.0");
+}
+
+TEST(RegisterBeeper, BeepInviteWithoutAStoredContactKeepsTheBareForm)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr));
+
+	ASSERT_EQ(env.sent.size(), 1u);
+	EXPECT_EQ(requestLine(env.sentRaw(0)), "INVITE sip:101@192.168.1.50:5060 SIP/2.0");
+}
+
+// The CANCEL carries the INVITE's Request-URI (§9.1) and an ACK to a non-2xx is
+// part of the INVITE transaction (§17.1.1.3), so both follow the INVITE.
+TEST(RegisterBeeper, CancelAndNon2xxAckReuseTheInvitesRequestUri)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+	const auto t0 = std::chrono::steady_clock::now();
+
+	beeper.sendBeep(phoneWithContact(phoneAddr));
+	beeper.sweep(t0 + std::chrono::seconds(6));
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_EQ(requestLine(env.sentRaw(1)), std::string("CANCEL ") + kLineContact + " SIP/2.0");
+
+	FakePbxEnv env2;
+	RegisterBeeper beeper2(env2);
+	beeper2.sendBeep(phoneWithContact(phoneAddr));
+	const std::string busy =
+		"SIP/2.0 486 Busy Here\r\n"
+		"Via: SIP/2.0/UDP 192.168.1.10:5060;branch=" + branchOf(env2.sentRaw(0)) + "\r\n"
+		"From: \"PocketDial\" <sip:pbx@192.168.1.10:5060>;tag=servertag\r\n"
+		"To: <sip:101@192.168.1.10>;tag=phonetag\r\n"
+		"Call-ID: " + callIdOf(env2.sentRaw(0)) + "\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	ASSERT_TRUE(beeper2.handleInviteFailure(std::make_shared<SipMessage>(busy, phoneAddr)));
+	ASSERT_EQ(env2.sent.size(), 2u);
+	EXPECT_EQ(requestLine(env2.sentRaw(1)), std::string("ACK ") + kLineContact + " SIP/2.0");
+}
+
+// The ACK for the 200 is an in-dialog request to the remote target: the Contact
+// of that 200 (RFC 3261 §12.2.1.1, §13.2.2.4). A 200 without a Contact falls back
+// to the registered one. The BYE is built by PbxEnv::serverBye, which already
+// looks the registered Contact up (#798).
+TEST(RegisterBeeper, AckForAnAnsweredBeepGoesToTheContactOfThe200)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	beeper.sendBeep(phoneWithContact(phoneAddr));
+	const std::string callId = callIdOf(env.sentRaw(0));
+	const std::string ok =
+		"SIP/2.0 200 OK\r\n"
+		"Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bKbeep\r\n"
+		"From: \"PocketDial\" <sip:pbx@192.168.1.10:5060>;tag=servertag\r\n"
+		"To: <sip:101@192.168.1.10>;tag=phonetag\r\n"
+		"Call-ID: " + callId + "\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Contact: <sip:101@192.168.1.50:5060;line=pd856y>\r\n"
+		"Content-Length: 0\r\n\r\n";
+	ASSERT_TRUE(beeper.handleOk(std::make_shared<SipMessage>(ok, phoneAddr)));
+
+	ASSERT_GE(env.sent.size(), 2u);
+	EXPECT_EQ(requestLine(env.sentRaw(1)), "ACK sip:101@192.168.1.50:5060;line=pd856y SIP/2.0");
+}
+
+TEST(RegisterBeeper, AckForAnAnsweredBeepWithoutAContactUsesTheRegisteredOne)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	beeper.sendBeep(phoneWithContact(phoneAddr));
+	ASSERT_TRUE(beeper.handleOk(okFor(callIdOf(env.sentRaw(0)), phoneAddr)));
+
+	ASSERT_GE(env.sent.size(), 2u);
+	EXPECT_EQ(requestLine(env.sentRaw(1)), std::string("ACK ") + kLineContact + " SIP/2.0");
+}
+
 // Control: an ACK for a non-2xx belongs to the INVITE's own transaction and keeps
 // its branch (§17.1.1.3), so the #752 change must not touch this one.
 TEST(RegisterBeeper, TheAckForANon2xxKeepsTheInvitesViaBranch)
