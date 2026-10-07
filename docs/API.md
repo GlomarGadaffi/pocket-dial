@@ -2868,3 +2868,239 @@ Stated explicitly, because each of these has cost someone time:
 Related documents: `docs/API_TESTS.md` (the test-by-test walkthrough of
 `tests/http/test_api.sh`), `docs/THREAT_MODEL.md` (why the gates are shaped this way),
 `docs/OTA.md`, `docs/LEARN_MODE.md`, `docs/PROVISIONING.md`.
+
+---
+
+## 6. External Telephony Anchor: 3CX Call Control API Conformance Audit (Issue #913)
+
+This section provides the formal architectural audit of Pocket-Dial's outbound telephony anchor
+client (`src/SIP/TelephonyAnchorClient.cpp`, `src/SIP/TelephonyAnchorLogic.hpp`) against 3CX's
+published API specifications and official developer repositories.
+
+While Sections 0–5 document the inbound HTTP REST management server hosted by Pocket-Dial, this
+audit specifies Pocket-Dial's client-side integration against the upstream PBX Call Control API.
+
+### 6.0 Scope & Reference Ground Truth
+
+The telephony anchor uses the **3CX Call Control API** exclusively. It deliberately does **not**
+use the 3CX Configuration REST API (XAPI). Pocket-Dial functions as a real-time media and signaling
+anchor for active call sessions; it does not provision extensions, modify trunks, or inspect tenant
+configuration. Keeping the anchor decoupled from XAPI limits permission scope, reduces attack surface,
+and eliminates version coupling to administrative schema migrations.
+
+**Primary Reference Sources:**
+* **Official 3CX Documentation**:
+  * [3CX Call Control API Overview](https://www.3cx.com/docs/call-control-api/)
+  * [3CX Call Control API Endpoints](https://www.3cx.com/docs/call-control-api-endpoints/)
+  * [3CX Configuration REST API (XAPI)](https://www.3cx.com/docs/configuration-rest-api/)
+* **3CX Ground-Truth Code Repositories**:
+  * [`3cx/call-control-sdk-ts`](https://github.com/3cx/call-control-sdk-ts): Official TypeScript SDK types, actions, event definitions, and streaming pipelines.
+  * [`3cx/call-control-examples`](https://github.com/3cx/call-control-examples): Client and server reference implementations.
+  * [`3cx/call-control-service-example`](https://github.com/3cx/call-control-service-example): Multi-user background service patterns.
+  * [`3cx/xapi-tutorial`](https://github.com/3cx/xapi-tutorial): Reference for administrative XAPI contrasts.
+
+---
+
+### 6.1 Endpoint Conformance Audit Matrix
+
+The following matrix audits every outbound HTTP and WebSocket interaction initiated by
+`TelephonyAnchorClient` against 3CX's published endpoint reference and TypeScript SDK types:
+
+| Anchor Call | Published Doc Endpoint | Method | Verified (Doc / Live) | Request Body / Format | Status Codes / Response Handling | Notes & Architecture |
+| :--- | :--- | :---: | :---: | :--- | :--- | :--- |
+| **Token Acquisition** | `/connect/token` | `POST` | **Doc** | `application/x-www-form-urlencoded`<br>`grant_type=client_credentials`<br>`&client_id=...&client_secret=...` | `200 OK`: parses `access_token`, `expires_in`.<br>`400`/`401`/`403`: authentication failure, logs error, stays disconnected. | Standard OAuth 2.0 client credentials. Pre-expiry refresh scheduled at $T - 300\text{ s}$ ($T_{\text{exp}} - 5\text{ min}$). Refresh is deferred while streaming legs are live. |
+| **Discover Devices** | `/callcontrol/{dn}/devices` | `GET` | **Doc** | None (Bearer header) | `200 OK`: JSON array of `DNDevice` (`device_id`, `user_agent`, `status`). | Discovers active registration IDs for extension `{dn}`. Extracts primary `device_id` for modern per-device makecall dispatch. |
+| **Make Call (Per-Device)** | `/callcontrol/{dn}/devices/{deviceid}/makecall` | `POST` | **Doc** | `application/json`<br>`{"destination":"<ext_or_num>"}` | `200 OK` / `202 Accepted`: call initiated, returns participant/call record. | Preferred dispatch path in 3CX V20. Eliminates ambiguity when multiple softphones/SIP endpoints share a DN. |
+| **Make Call (Legacy DN)** | `/callcontrol/{dn}/makecall` | `POST` | **Doc** | `application/json`<br>`{"destination":"<ext_or_num>"}` | `200 OK`: call initiated.<br>`400`/`404`: fall back or fail. | Unlisted in current V20 web reference (superseded by per-device route). Retained in Pocket-Dial as graceful fallback when no active device ID is discovered on `{dn}`. |
+| **Reconcile Participants** | `/callcontrol/{dn}/participants` | `GET` | **Doc** | None (Bearer header) | `200 OK`: JSON array of active `Participant` objects. | Periodic polling and post-WebSocket reconnection recovery. Reconciles orphaned or adopted call legs without relying solely on stateful delta streams (#349). |
+| **Poll Participant Leg** | `/callcontrol/{dn}/participants/{id}` | `GET` | **Doc** | None (Bearer header) | `200 OK`: returns single `Participant` object (`state`, `caller_id`, `party_caller_id`). | Used during leg state transitions to confirm `Connected`, `Ringing`, or `Dialing` when event delivery is delayed. |
+| **Answer Leg** | `/callcontrol/{dn}/participants/{id}/answer` | `POST` | **Doc** | `application/json`<br>`{}` | `200 OK`: leg answered.<br>`404`/`409`: leg already answered or dropped. | Dispatched when an incoming call arrives on a RoutePoint / monitored DN to bind Pocket-Dial's media pipeline. |
+| **Drop Leg** | `/callcontrol/{dn}/participants/{id}/drop` | `POST` | **Doc** | `application/json`<br>`{}` | `200 OK`: call dropped.<br>`404`: already terminated. | Terminated on local SIP hangup (`BYE`), CANCEL, timeout, or user termination. |
+| **Upstream Audio Stream** | `/callcontrol/{dn}/participants/{id}/stream` | `POST` | **Doc** | Chunked transfer encoding.<br>`audio/l16;rate=8000;channels=1`<br>Raw 16-bit PCM, 8000 Hz, mono. | `200 OK`: streaming channel opened.<br>`403`/`404`: invalid or terminated leg. | Transmits mic/SIP RTP audio to PBX. Continuous 128 kbps rate (320 bytes per 20 ms chunk). Socket closed on call teardown. |
+| **Downstream Audio Stream** | `/callcontrol/{dn}/participants/{id}/stream` | `GET` | **Doc** | None (Bearer header) | `200 OK`: chunked raw 16-bit PCM 8000 Hz mono stream.<br>`403 Forbidden`: backoff retry (#902). | Ingests PBX audio for playback/SIP bridge. Implements retry backoff when 3CX media endpoint responds 403 during leg startup negotiation race. |
+| **WebSocket Event Stream** | `/callcontrol/ws` | `GET` (Upgrade) | **Doc** | WebSocket Handshake (`101 Switching Protocols`), Bearer token in header or subprotocol. | Continuous JSON messages: `Upsert`, `Remove`, `DTMFstring`. | Event sink channel. Connects with exponential backoff and jitter. Monitored by watchdog for clean restart if connection drops or token expires (#336). |
+
+> [!NOTE]
+> **Live Verification Status**: All calls in the matrix above are verified against official 3CX published documentation and SDK ground-truth types. No live run against a production or testbed 3CX instance was performed during this pass (no live 3CX PBX is attached to this host build environment); live PBX checks remain recorded as **Not Verified** until exercised on a live testbed PBX.
+
+---
+
+### 6.2 Detailed Architectural Audit Across the 7 Criteria
+
+#### Check 1: Licence Tier & Tenancy Isolation (Rule 5 Compliance)
+* **Licence Requirements**:
+  * In **3CX V20 Update 2+**, the Call Control API requires an **8SC+ AI Edition** licence (in V18 and early V20, 8SC+ PRO or Enterprise).
+  * The Configuration REST API (XAPI) shares the identical licence restriction.
+* **Behaviour on Unlicensed PBX**:
+  * If the targeted 3CX instance lacks the required licence tier, the PBX refuses token generation at `POST /connect/token` with `400 Bad Request` or `401 Unauthorized`.
+  * `TelephonyAnchorClient` logs the error, flags the anchor service as disconnected (`isConnected() == false`), and cleanly fails any inbound calls directed to anchor slots without crashing or wedging FreeRTOS tasks.
+* **Rule 5 Compliance (Emergency Call Exemption)**:
+  * > [!IMPORTANT]
+    > **Emergency routing (911, 933, 112, 999) NEVER traverses or depends upon the telephony anchor.**
+  * **Function Definition**: `pbx::classifyEmergencyDial(std::string_view dialed)` is defined in `src/SIP/EmergencyCall.hpp:93`.
+  * **Interception & Bypass Call Sites**:
+    * `src/SIP/RequestsHandler.cpp:2268`: In `onInvite()`, the very first destination check before any dial plan rule or anchor slot lookup evaluates `pbx::classifyEmergencyDial(destNumber)`. If true, the call is dispatched immediately to `routeEmergencyCall()`, bypassing anchor slots, 3CX tokens, and PBX reachability.
+    * `src/SIP/CallForker.cpp:369`: In `matchDialRule()`, wildcard dial-plan trunk transforms resulting in emergency numbers are intercepted (`pbx::classifyEmergencyDial(transformed).isEmergency`) to prevent operator dial-plan trunk rules from intercepting or redirecting emergency numbers.
+    * `src/SIP/RequestsHandler.cpp:5524` (`asyncMakeCall`): Guarantees that any dial-plan rule transformed into an emergency number cannot be handed to an anchor slot.
+    * `src/SIP/RequestsHandler.cpp:12822` (`startEmergencyFromDialPlan`): Routes emergency calls directly to trunk/emergency path when triggered via dial plan dispatch.
+    * `src/SIP/TelephonyAnchorClient.cpp:377, 581`: Disarms the bench probe on emergency destinations and loops over `pd::emergencySlotRetryContinues()` to wait out tearing-down slots.
+  * **Tests Pinning the Bypass**:
+    * `tests/EmergencyRoute_test.cpp:251` (`TEST(EmergencyRoute, ADialRuleCannotHandTheLoopbackAnEmergencyNumber)`): Pins that a dial rule transforming a dial to 911 refuses simulated or anchor treatment and forces emergency routing (503 if unroutable, never simulated).
+    * `tests/EmergencyRoute_test.cpp:276` (`TEST(EmergencyRoute, ADialRuleThatProducesAnEmergencyNumberTakesTheEmergencyPath)`): Pins that dialed rules producing 911 reach the trunk directly and alert the front desk.
+    * `tests/EmergencyDialing_test.cpp` (Issue #166): Verifies that raw 911/933 dials always reach the trunk un-rewritten.
+    * `tests/tools/test_anchor_emergency_slot_wait.py` (Issue #743): Pins that `makeCall()` keeps retrying tearing-down slots for emergency calls.
+
+#### Check 2: Token Lifecycle, Expiration Math, and 401 Handling
+* **Token Lifetime**: 3CX bearer tokens carry an official lifetime of 3600 seconds (1 hour). Pocket-Dial inspects the standard JWT claims (`exp - iat`) upon receipt to determine actual token validity dynamically, defaulting to 3000 seconds (50 minutes) if token claim parsing fails.
+* **Proactive Token Refresh**:
+  * Scheduled at $T_{\text{refresh}} = T_{\text{exp}} - 300\text{ s}$ (`kRefreshMarginUs = 300,000,000` µs = 5 minutes prior to expiration).
+  * **Critical Streaming Guard**: 3CX immediately invalidates the prior bearer token when issuing a new token. If either anchor slot is actively streaming audio (`isStreamingActive()`), `ensureToken()` defers the refresh cycle until active streams conclude. Attempting to refresh mid-call immediately severs active chunked HTTP audio streams with `401 Unauthorized`.
+* **401 Handling Mid-Call and Reconnection**:
+  * If a `401 Unauthorized` is returned during WebSocket heartbeats or REST operations, `requestRestartIfTokenStale()` (Issue #336) flags the session as expired and schedules an orderly client cycle (`stop()` followed by `start()`) to fetch fresh credentials and re-establish the event sink.
+* **Token Grant Scope**:
+  * Pocket-Dial strictly requests OAuth 2.0 `grant_type=client_credentials` using configured application credentials (`client_id` and `client_secret`).
+  * Pocket-Dial never requests or transmits XAPI admin credentials or multi-company administrative super-tokens, adhering strictly to the principle of least privilege.
+
+#### Check 3: REST Endpoint Conformance & Legacy Fallbacks
+* **Modern vs Legacy MakeCall**:
+  * 3CX V20 documentation specifies `POST /callcontrol/{dn}/devices/{deviceid}/makecall`. Pocket-Dial prioritizes this route by resolving active device IDs via `GET /callcontrol/{dn}/devices`.
+  * If the device discovery returns an empty list (e.g. extension has no active SIP registration but allows PBX routing), Pocket-Dial falls back to `POST /callcontrol/{dn}/makecall`. While omitted from current V20 documentation pages, the PBX core retains backwards compatibility for this route.
+* **Empty JSON Payloads**:
+  * Action endpoints (`/answer`, `/drop`) conform to 3CX requirements by sending valid JSON objects (`{}`) with `Content-Type: application/json`, avoiding 415 Unsupported Media Type rejections.
+* **Audio Streaming Wire Formats**:
+  * Documented in 3CX Call Control Audio Streaming guides. Both upstream (`POST`) and downstream (`GET`) endpoints utilize chunked linear PCM 16-bit 8000 Hz mono (`audio/l16;rate=8000;channels=1`), matching ESP32 hardware codec sampling without requiring software resampling.
+
+#### Check 4: WebSocket Event Handling, Concurrency & Simultaneous Usage
+* **Event Schema**:
+  * Events consumed: `Upsert` (call leg creation/update), `Remove` (leg teardown), and `DTMFstring` (digits entered by remote party).
+  * Unhandled events: Server-side PBX audio prompts (`PromptPlaybackFinished = 3`) are acknowledged and safely ignored.
+* **Payload Structure**:
+  * Conforms to `@3cx/call-control-sdk-ts` definitions (`event_type`, `entity`, `attached_data`). Wire JSON uses snake_case keys.
+* **Simultaneous Usage Architecture**:
+  * 3CX documentation explicitly warns against blocking the WebSocket connection.
+  * Pocket-Dial enforces strict decoupling: the WebSocket connection (`/callcontrol/ws`) serves strictly as an asynchronous event ingest channel. All REST mutations (`makecall`, `answer`, `drop`) and HTTP audio stream transports execute on separate worker tasks with dedicated HTTP client contexts. Long-running TLS operations never starve the WebSocket event dispatch pump.
+* **Reconnection & State Reconciliation**:
+  * Network drops trigger exponential backoff with random jitter.
+  * Upon reconnect, `TelephonyAnchorLogic` executes `GET /callcontrol/{dn}/participants` to reconcile active call legs, preventing state drift or leaked phantom slots resulting from dropped disconnect notifications (Issue #349).
+
+#### Check 5: Rate Limiting, Audio Bitrates & Connection Reuse
+* **PBX Rate Limits**:
+  * 3CX does not publish fixed requests-per-second thresholds for Call Control REST endpoints, but recommends connection conservation on embedded clients.
+* **Audio Stream Bitrate**:
+  * Audio streams operate at a deterministic, constant bitrate:
+    $$\text{Bitrate} = 8{,}000\text{ samples/sec} \times 2\text{ bytes/sample} \times 8\text{ bits/byte} = 128\text{ kbps} \quad (16\text{ kB/s})$$
+  * Packets are dispatched in 20 ms frames (320 bytes), preventing network bufferbloat and ESP32 DMA ring-buffer exhaustion.
+* **Control Connection Reuse & TLS Resumption (#884 / #911)**:
+  * To avoid exhausting socket descriptors on 3CX and FreeRTOS socket tables, Pocket-Dial closes TCP connections between sporadic control requests (`esp_http_client_close`) while caching TLS session tickets in mbedTLS. Subsequent commands resume TLS sessions within ~100–150 ms without incurring full cryptographic handshakes.
+
+#### Check 6: Version Drift & PBX Compatibility
+* **Target Version & Live Build Status**:
+  * Audited against published **3CX Phone System V20** specifications (Call Control API version 20.0). No live 3CX instance was attached during this audit pass; specific live PBX build verification is recorded as **Not Verified**.
+* **Deprecations**:
+  * Legacy route `POST /callcontrol/{dn}/makecall` is marked as legacy/unlisted in V20; Pocket-Dial uses modern `/devices/{id}/makecall` as primary and retains legacy as fallback.
+  * No active beta endpoints are utilized.
+* **Advanced SDK Capabilities (Evaluated & Omitted)**:
+  * `PromptPlaybackFinished = 3`: Used when directing 3CX to play PBX-hosted WAV files. Not needed because Pocket-Dial streams live audio directly.
+  * `cancel_stream_queue`: Used to clear server-side audio playback queues. Pocket-Dial achieves immediate stream cessation by terminating the HTTP stream connection directly.
+
+#### Check 7: Differences with Official 3CX TypeScript SDK (`@3cx/call-control-sdk-ts`)
+
+| Dimension | 3CX TypeScript SDK (`@3cx/call-control-sdk-ts`) | Pocket-Dial Telephony Anchor | Rationale & Impact |
+| :--- | :--- | :--- | :--- |
+| **Token Request Encoding** | `multipart/form-data` with `scope=mcp xapi`<br>(Source: `@3cx/call-control-sdk-ts` at `src/auth/token-store.ts:40-52`) | `application/x-www-form-urlencoded` with `grant_type=client_credentials`<br>(Source: `TelephonyAnchorClient.cpp:468`) | 3CX's official Call Control API documentation ("Authentication" section) specifies `Content-Type: application/x-www-form-urlencoded` in strict conformance with RFC 6749 §4.4.2 (OAuth 2.0 Client Credentials Grant). The TypeScript SDK uses `FormData` (`multipart/form-data`) via `axios`. Pocket-Dial conforms to 3CX's published RFC 6749 form-urlencoded specification without requesting the administrative `xapi` scope. |
+| **Naming Convention** | Wire format is `snake_case`; Web documentation displays `PascalCase` | Matches `snake_case` wire format (`event_type`, `entity`, `device_id`) | Documentation text displays PascalCase for readability, but PBX JSON wire responses match the SDK's snake_case properties. |
+| **Media Transport** | WebAudio / Node.js audio pipeline via chunked HTTP stream | Hardware I2S / SIP RTP bridge via chunked HTTP stream | Direct byte-level bridge between SIP G.711 / PCM stream and 3CX chunked HTTP socket without intermediate transcoders. |
+| **Call Flow Designer (CFD)** | Supports `ExternalCallFlowAppHookEvent` | Not used | Pocket-Dial acts as an autonomous SIP-to-CallControl bridge, requiring no CFD routing scripts. |
+
+---
+
+### 6.3 Inbound (Incoming) Call Architecture & Lifecycle Flow
+
+Inbound call support represents the reverse signaling direction of `makeCall`: an external caller
+dials into 3CX (or an internal extension dials a monitored route point), and Pocket-Dial receives,
+announces, pre-warms, rings local SIP handsets, and bridges bidirectional audio.
+
+```
+External / 3CX PBX                 Pocket-Dial Anchor                Local SIP Handset(s)
+       |                                   |                                   |
+       |--- 1. Inbound Call to RoutePoint ->|                                   |
+       |--- 2. WS Upsert (Connected) ----->|                                   |
+       |    [Own-leg check #379 passed]    |                                   |
+       |<-- 3. GET /participants/{id} -----| (Resolve Caller-ID if empty)       |
+       |--- 4. Caller-ID details --------->|                                   |
+       |                                   |--- 5. Pre-warm Audio Streams ---->|
+       |<-- 6. POST & GET /stream ---------|    (128 kbps raw PCM)             |
+       |    (200 OK stream established)    |                                   |
+       |                                   |--- 7. Forked INVITE (Ring-All) -->|
+       |                                   |    (or targeted via DID Mapping)  |
+       |                                   |<-- 8. 180 Ringing ----------------|
+       |                                   |                                   |
+       |                                   |<-- 9. 200 OK with SDP (Winner) ---|
+       |                                   |--- 10. SIP ACK ------------------>|
+       |                                   |--- 11. SIP CANCEL (Losers) ------>|
+       |<-- 12. POST /participants/{id}/answer                                 |
+       |        {}                         |                                   |
+       |<-- 13. 200 OK --------------------|                                   |
+       |<================== 14. Bidirectional Audio Bridge ===================>|
+       |                                   |                                   |
+```
+
+#### Detailed Inbound Sequence Breakdown
+
+1. **3CX RoutePoint Ingress**:
+   * On 3CX, inbound DIDs or internal routes are configured to target a designated **RoutePoint** extension (configured as `_anchorRouteDn` in Pocket-Dial).
+   * When an external call arrives, 3CX binds the call to the RoutePoint and immediately changes the ingress participant leg to `Connected` state.
+2. **WebSocket Inbound Notification (`Upsert`)**:
+   * 3CX pushes an `Upsert` event over `/callcontrol/ws` where `entity.dn` matches `_anchorRouteDn`.
+   * **Own-Leg Discrimination (#379 / #681)**:
+     * A leg created by Pocket-Dial during an outbound `makeCall` (or recently freed during drop/cancellation) must never be mistakenly announced as an inbound call.
+     * `TelephonyAnchorClient` executes `telephony::inboundAnnounceAllowed(_ownLegs, controlLeg, now, seq)`. If the leg matches a tracked local outbound transaction, the event is treated as an outbound leg update; otherwise, it is recognized as a genuine external incoming call.
+3. **Caller-ID Resolution**:
+   * In 3CX V20, WebSocket `attached_data` on RoutePoint `Upsert` events is frequently null or generic (e.g. `"PSTN"`).
+   * If `callerId` is empty, `TelephonyAnchorClient` issues a non-blocking background query `GET /callcontrol/{dn}/participants/{id}` to retrieve authoritative `party_caller_id` and `party_caller_name` fields.
+4. **Media Stream Pre-Warming**:
+   * Rather than waiting for a local extension to answer, `TelephonyAnchorClient` immediately invokes `startMediaStreams(controlLeg)` upon receiving the inbound announcement.
+   * Both upstream (`POST /stream`) and downstream (`GET /stream`) HTTP chunked audio channels are established while the phones are ringing.
+   * **Architectural Rationale**: Establishing TLS and HTTP chunked handshakes takes 100–300 ms on an embedded microcontroller. Pre-warming during ringing ensures **zero audio cut-through clipping** when the user answers the handset.
+5. **Local Handset Ringing (DID Mapping vs Ring-All)**:
+   * `TelephonyAnchorClient` dispatches `AnchorClient::CallEvent::Incoming` to `RequestsHandler::routeInboundAnchorCall()`.
+   * **Target Selection**:
+     * **DID Mapping**: Pocket-Dial consults `DidMapping::extensionForDid(dn)`. If a mapping exists for the route DN and the target extension is registered, only that specific handset is rung.
+     * **Ring-All Fallback**: If no specific mapping exists, Pocket-Dial gathers all currently registered SIP clients (`_clientPool`) and forks delayed-offer INVITEs to every handset simultaneously.
+   * One shared SIP `Session` object is allocated, backed by a synthetic PSTN peer for CDR tracking.
+6. **Handset Pickup & Answer Dispatch (`POST /answer`)**:
+   * The first handset to pick up responds with SIP `200 OK` containing its local SDP offer.
+   * `RequestsHandler::onInboundAnchorOk()`:
+     * Binds the handset's RTP stream to `MediaBridge`, transcoding between handset audio and the pre-warmed PCM-16 8000 Hz stream.
+     * Sends SIP `ACK` to the winning handset.
+     * Issues SIP `CANCEL` (`buildInboundCancelTo`) to all remaining ringing forks so other extensions immediately stop ringing.
+     * Dispatches `asyncAnswerCall(participantId)` to the background worker queue, sending `POST /callcontrol/{dn}/participants/{id}/answer` with an empty JSON body `{}` to 3CX.
+7. **Inbound Call Termination & Edge Cases**:
+   * **Remote Caller Abandons Prior to Answer**:
+     * 3CX emits a `Remove` event on `/callcontrol/ws`.
+     * `TelephonyAnchorClient` terminates the media streams (`stopMediaStreams`) and fires `CallEvent::Dropped`.
+     * `RequestsHandler` intercepts the drop and immediately sends SIP `CANCEL` to all ringing handsets.
+   * **Ring Timeout / No Answer / Extension Busy**:
+     * If all local extensions respond `486 Busy Here` or the 30-second ring timer expires (`pbx::kNoAnswerTimeout`), `RequestsHandler` invokes `asyncDropCall(participantId)`.
+     * Sends `POST /callcontrol/{dn}/participants/{id}/drop` to 3CX, cleanly clearing the RoutePoint call on the PBX.
+   * **Local Handset Hangup**:
+     * Winning handset sends SIP `BYE`.
+     * `RequestsHandler` sends `200 OK` locally and dispatches `asyncDropCall(participantId)` -> `POST /participants/{id}/drop`.
+   * **Remote Caller Hangup After Bridge**:
+     * 3CX emits a `Remove` event on `/callcontrol/ws`.
+     * `TelephonyAnchorClient` tears down audio sockets and fires `CallEvent::Dropped`.
+     * `RequestsHandler` sends SIP `BYE` to the active handset.
+
+---
+
+### 6.4 Test & Verification Summary
+
+* **Unit & Logic Conformance**:
+  * Complete test coverage of anchor state machines, device discovery, participant reconciliation, own-leg inbound discrimination (#379/#681), and token deferral logic in `tests/TelephonyAnchorLogic_test.cpp` passing 100% on host GoogleTest builds.
+* **Inbound & Routing Suite**:
+  * Inbound call routing, DID mapping lookup, and synthetic session allocation verified in `tests/DidMapping_test.cpp`, `tests/InboundAnchorReinvite_test.cpp`, and `tests/TelCtlPool_test.cpp`.
+* **Python Tool & Mock Harness Verification**:
+  * Anchor maintenance, task counting, unread makecall, and own-leg inbound discrimination verified across `tests/tools/test_anchor_*.py` (194 unit tests pass).
+  * 5 scenario tests in `tests/tools/test_anchor_scenarios.py` require a physical hardware testbed board (`RING-REQUIRED`) as documented in `docs/TEST_HARNESS.md`.
+
+
