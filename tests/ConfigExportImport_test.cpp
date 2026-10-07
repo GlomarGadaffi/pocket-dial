@@ -551,6 +551,19 @@ TEST_F(ConfigExportImportTest, Import_RetiredOpenMode_AppliesLearnAndSaysSo)
 	EXPECT_EQ(_handler->getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
 }
 
+TEST_F(ConfigExportImportTest, Import_ExceedingMaxDepth_RejectedWith400)
+{
+	// #860: kMaxDepth is 5 to bound parser recursion on http_conn's 4 KB stack.
+	// A blob nesting deeper than kMaxDepth (depth 6+) must be rejected with 400,
+	// not crash the server or overflow the stack.
+	std::string deepBlob = R"({"exportVer":1,"plaintext":{"nested":{"a":{"b":{"c":1}}}}})";
+	std::string resp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(deepBlob) + "&confirm=REPLACE",
+		"pd_session=" + _sysop.cookie, _sysop.csrf);
+	EXPECT_EQ(statusOf(resp), 400) << resp;
+	EXPECT_NE(bodyOf(resp).find("malformed export blob"), std::string::npos) << bodyOf(resp);
+}
+
 // ── The admin credential hash must never appear in an export ───────────────
 
 TEST_F(ConfigExportImportTest, AdminHashNeverAppearsInExport_PlaintextOrGated)

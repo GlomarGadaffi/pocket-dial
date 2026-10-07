@@ -29,10 +29,10 @@
 namespace JsonReader
 {
 	// Depth cap: a config-export blob nests at most
-	// object -> {plaintext|secretsEnc} -> array -> object -> (no further
-	// nesting) — 4 deep in practice. 8 leaves comfortable headroom without
-	// admitting a pathological "((((((((...".
-	constexpr int kMaxDepth = 8;
+	// object -> {plaintext|secretsEnc} -> array -> object -> (leaf property)
+	// — 5 deep in practice. 5 leaves enough headroom for real export blobs
+	// while bounding the recursion on http_conn's 4 KB stack (#860).
+	constexpr int kMaxDepth = 5;
 	// Matches HttpServer's existing MAX_BODY_BYTES (16 KB) for the buffered
 	// POST path every import request arrives through — see handleClient().
 	// Enforced here too so this reader is safe to reuse against an
