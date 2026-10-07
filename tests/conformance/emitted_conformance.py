@@ -36,7 +36,7 @@ from collections import Counter, defaultdict
 
 # Ceiling on allowlist lines. Lowering it is how a fix PR proves it shrank the
 # list; raising it needs a reviewer to accept a new known violation.
-MAX_ALLOWLIST = 3
+MAX_ALLOWLIST = 2
 
 # What this PBX implements, independent of what it claims: the request
 # dispatch table (RequestsHandler.cpp, `_handlers.emplace`) plus INFO, which

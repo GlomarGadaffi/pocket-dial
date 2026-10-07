@@ -104,6 +104,21 @@ namespace
 		return RequestsHandler::getMessageFromPool(raw, addrFor(calleeIp));
 	}
 
+	std::shared_ptr<SipMessage> makeAck(const std::string& fromExt, const std::string& toExt,
+		const std::string& fromIp, const std::string& callId, const std::string& branch, int cseq = 1)
+	{
+		std::string raw =
+			"ACK sip:" + toExt + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + fromIp + ":5060;branch=z9hG4bK" + branch + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=from" + callId + "\r\n"
+			"To: <sip:" + toExt + "@server>;tag=to" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(cseq) + " ACK\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(fromIp));
+	}
+
 	std::shared_ptr<SipMessage> makeBye(const std::string& fromExt, const std::string& toExt,
 		const std::string& fromIp, const std::string& callId)
 	{
@@ -239,6 +254,14 @@ TEST(CallPickup, DirectedPickupCancelsTargetAndBridgesCallerToPicker)
 	EXPECT_EQ(pickerSession.value()->getState(), Session::State::Connected);
 	ASSERT_NE(pickerSession.value()->getDest(), nullptr);
 	EXPECT_EQ(pickerSession.value()->getDest()->getNumber(), "200");
+
+	// Issue #453: the caller's and picker's ACKs complete the PBX's own 200 OK
+	// transactions. Neither ACK is relayed to the cancelled target (100) or
+	// answered with a stray 404.
+	sent.clear();
+	handler.handle(makeAck("200", "100", "192.168.9.10", "call-1", "ack-caller"));
+	handler.handle(makeAck("102", "**100", "192.168.9.30", "pickup-1", "ack-picker"));
+	EXPECT_TRUE(sent.empty()) << "neither pickup ACK may be relayed or draw a response";
 }
 
 // Issue #749 / RFC 3261 §9.1: the CANCEL to the picked-up target carries the
