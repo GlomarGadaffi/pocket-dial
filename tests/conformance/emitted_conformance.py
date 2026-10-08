@@ -44,9 +44,9 @@ MAX_ALLOWLIST = 2
 # more (a narrower Allow, like the trunk leg's, is an honest under-claim).
 IMPLEMENTED_METHODS = {"INVITE", "ACK", "CANCEL", "BYE", "OPTIONS", "REGISTER",
                        "INFO", "MESSAGE", "REFER", "SUBSCRIBE", "UPDATE"}
-# Option tags with an implementation behind them (RFC 3891 Replaces). "timer"
-# is deliberately absent until #198 lands; "100rel" until #172.
-IMPLEMENTED_OPTION_TAGS = {"replaces"}
+# Option tags with an implementation behind them (RFC 3891 Replaces, RFC 4028
+# Session Timers #198). "100rel" until #172.
+IMPLEMENTED_OPTION_TAGS = {"replaces", "timer"}
 
 # Every message type the brief requires the scenarios to make the PBX emit.
 # A type that stops being emitted fails the run, so coverage can't rot.

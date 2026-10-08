@@ -343,11 +343,10 @@ TEST(SessionTimer, OptionsAdvertisesTheMethodsAndOptionTagsThisPbxReallyHandles)
 	EXPECT_NE(supported.find("replaces"), std::string::npos)
 		<< "Supported omits \"replaces\" (RFC 3891 §4): " << supported;
 
-	// Over-claiming here is the #199 failure mode itself. "timer" needs Min-SE
-	// processing and a 422 response (RFC 4028 §5/§6) that this PBX does not
-	// implement — getMinSESecs() has no caller — and "100rel" needs PRACK.
-	EXPECT_EQ(supported.find("timer"), std::string::npos)
-		<< "Supported claims \"timer\" but no 422/Min-SE handling exists: " << supported;
+	// RFC 4028 §3: "timer" is advertised now that Min-SE / 422 processing
+	// (#591) and PBX 2xx refresher=uac negotiation (#724) exist (#198).
+	EXPECT_NE(supported.find("timer"), std::string::npos)
+		<< "Supported omits \"timer\" (RFC 4028 §3): " << supported;
 	EXPECT_EQ(supported.find("100rel"), std::string::npos)
 		<< "Supported claims \"100rel\" but there is no PRACK handler: " << supported;
 

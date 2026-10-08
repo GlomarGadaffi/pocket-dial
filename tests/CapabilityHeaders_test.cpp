@@ -210,15 +210,11 @@ TEST(CapabilityHeaders, RegisterOkAdvertisesWhatThisPbxActuallyHandles)
 	EXPECT_EQ(headerValue(ok, "Allow-Events"), "dialog, message-summary");   // RFC 3842 MWI
 }
 
-TEST(CapabilityHeaders, TimerIsStillNotClaimedOnTheRegistrarPath)
+TEST(CapabilityHeaders, TimerIsClaimedOnTheRegistrarPath)
 {
-	// A guard, not a feature. #200 deliberately left `timer` out because RFC 4028
-	// §9 makes Min-SE processing and the 422 response mandatory for an entity
-	// that advertises the extension, and neither exists (getMinSESecs() still has
-	// no caller). The PBX only ever reaps an expiry, never refreshes — so
-	// claiming the tag would promise a session nobody is responsible for keeping
-	// alive. Advertising it on the registrar path would be the same lie in a new
-	// place. See the checklist on #198 for what would have to land first.
+	// RFC 4028 §3: now that Min-SE / 422 processing (#591) and PBX 2xx
+	// refresher=uac negotiation (#724) exist, "timer" is advertised in Supported
+	// on the registrar 200 OK as well as OPTIONS (#198).
 	Outbox sent;
 	RequestsHandler handler(kServerIp, 5060,
 		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) {
@@ -230,9 +226,10 @@ TEST(CapabilityHeaders, TimerIsStillNotClaimedOnTheRegistrarPath)
 	ASSERT_FALSE(ok.empty());
 
 	const std::string supported = headerValue(ok, "Supported");
-	EXPECT_EQ(supported.find("timer"), std::string::npos)
-		<< "Supported: " << supported << " — RFC 4028 support here is passive "
-		   "(no Min-SE, no 422, no refresh), so the tag would be an over-claim";
+	EXPECT_NE(supported.find("timer"), std::string::npos)
+		<< "Supported omits \"timer\": " << supported;
+	EXPECT_NE(supported.find("replaces"), std::string::npos)
+		<< "Supported omits \"replaces\": " << supported;
 	EXPECT_EQ(supported.find("100rel"), std::string::npos)
 		<< "100rel needs PRACK, which has no handler";
 	// Under-claiming is the safe direction, so the method list must not grow
@@ -272,8 +269,11 @@ TEST(CapabilityHeaders, APhonesOwnAllowDoesNotSurviveIntoOurAnswer)
 	// And it must be OUR list that survived, not the phone's.
 	EXPECT_EQ(headerValue(ok, "Allow").find("PRACK"), std::string::npos)
 		<< "the phone's PRACK claim was echoed back as though it were ours";
-	EXPECT_EQ(headerValue(ok, "Supported").find("timer"), std::string::npos)
-		<< "the phone's timer claim was echoed back as though it were ours";
+	EXPECT_EQ(headerValue(ok, "Supported").find("100rel"), std::string::npos)
+		<< "the phone's 100rel claim was echoed back as though it were ours";
+	EXPECT_EQ(headerValue(ok, "Supported").find("gruu"), std::string::npos)
+		<< "the phone's gruu claim was echoed back as though it were ours";
+	EXPECT_EQ(headerValue(ok, "Supported"), "replaces, timer");
 	EXPECT_NE(headerValue(ok, "Allow").find("UPDATE"), std::string::npos);
 }
 
@@ -303,6 +303,7 @@ TEST(CapabilityHeaders, AnAuthoredInviteAnswerCarriesAllowSoUpdateIsReachable)
 	EXPECT_NE(headerValue(ok, "Allow").find("UPDATE"), std::string::npos)
 		<< "an authored 2xx must advertise UPDATE, or onUpdate stays dead code";
 	EXPECT_NE(headerValue(ok, "Supported").find("replaces"), std::string::npos);
+	EXPECT_NE(headerValue(ok, "Supported").find("timer"), std::string::npos);
 	EXPECT_EQ(headerCount(ok, "Allow"), 1);
 
 	// The body must still be intact: addCapabilityHeaders() runs inside

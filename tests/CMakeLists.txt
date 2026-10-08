@@ -213,9 +213,7 @@ add_executable(sip_parser_tests
     # Issue #198: RFC 4028 session timers. Pins the arming DECISION (a 2xx with
     # Session-Expires but no refresher parameter obliges nobody, so arming a
     # reaper could only ever produce a spurious BYE) and the OPTIONS capability
-    # advertisement. The negative assertions are the load-bearing ones: Supported
-    # must NOT claim "timer" while Min-SE/422 handling is absent, which is the
-    # over-claiming failure class issue #199 exists to document.
+    # advertisement (Supported advertises "replaces, timer").
     SessionTimer_test.cpp
     # Issue #191: /api/kill used to hand-roll its form parse, swallowing every
     # parameter after "extension=" and never URL-decoding. Pins the shared
@@ -515,10 +513,10 @@ add_executable(sip_parser_tests
     # built addCapabilityHeaders() but wired it only into the OPTIONS 200 OK,
     # which is not what gates UPDATE or Replaces on a conformant phone — it reads
     # Allow off the dialog's own messages. Pins the advertisement on the
-    # registrar 200 and on 2xx the PBX authors as the real UAS, the absence of
-    # `timer` (RFC 4028 support here is passive — see #198), that a RELAYED
-    # answer keeps the callee's own capabilities, and that a phone's own Allow
-    # never survives into ours as a second header line.
+    # registrar 200 and on 2xx the PBX authors as the real UAS, advertising
+    # `timer` and `replaces` (#198), that a RELAYED answer keeps the callee's
+    # own capabilities, and that a phone's own Allow never survives into ours
+    # as a second header line.
     CapabilityHeaders_test.cpp
     # Issue #523: a de-REGISTER (Expires: 0) is answered 200 at its source, not
     # 404 through endHandle()'s by-number lookup of the client it just released.
