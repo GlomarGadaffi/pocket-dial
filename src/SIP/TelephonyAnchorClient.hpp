@@ -83,6 +83,8 @@ private:
 	std::atomic<bool> _running{false};
 	std::atomic<bool> _connected{false};
 	std::string       _accessToken;
+	// #465: cached "Bearer " + _accessToken once per token fetch, avoiding per-request heap allocation; guarded by _mutex.
+	std::string       _bearerHeader;
 	// #100: count of outbound makeCall()s in flight whose own leg is NOT yet resolved (the window
 	// between the makecall POST and resolveOutboundLeg keying the slot). While > 0, the WS
 	// classifier treats an UNmatched upset as a probable far-leg of an in-flight outbound call

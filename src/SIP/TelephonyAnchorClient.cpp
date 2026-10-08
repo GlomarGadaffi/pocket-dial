@@ -1010,6 +1010,7 @@ bool TelephonyAnchorClient::fetchToken()
 					// require it. Do not read that as redundant and drop the atomics.
 					std::lock_guard<std::mutex> lock(_mutex);
 					_accessToken = tokenStr;
+					_bearerHeader = "Bearer " + _accessToken;
 					_tokenObtainedUs = esp_timer_get_time();
 					_tokenLifetimeUs = decodeJwtLifetimeUs(_accessToken);
 					if (_wsClient)
@@ -1026,7 +1027,7 @@ bool TelephonyAnchorClient::fetchToken()
 						// requestRestartIfTokenStale()/WEBSOCKET_EVENT_DISCONNECTED below is what
 						// actually handles the disconnected case, via a full stop()/start() that
 						// rebuilds wsCfg.headers fresh at init time rather than patching this handle.
-						std::string wsHeaders = "Authorization: Bearer " + _accessToken + "\r\n";
+						std::string wsHeaders = "Authorization: " + _bearerHeader + "\r\n";
 						esp_websocket_client_set_headers(_wsClient, wsHeaders.c_str());
 					}
 					ESP_LOGI(TAG, "Retrieved access token (len=%d, lifetime=%llds)",
@@ -1140,11 +1141,11 @@ bool TelephonyAnchorClient::connectWs()
 {
 	// Convert base https:// URL to wss:// for call control websocket
 	std::string wsUrl;
-	std::string token;
+	std::string bearerHeader;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		wsUrl = _baseUrl;
-		token = _accessToken;
+		bearerHeader = _bearerHeader;
 	}
 
 	if (wsUrl.rfind("https://", 0) == 0)
@@ -1166,7 +1167,8 @@ bool TelephonyAnchorClient::connectWs()
 	// client is already CONNECTED, so calling it before start() silently set no
 	// header and Telephony rejected the unauthenticated upgrade with HTTP 401. Each header
 	// line must be CRLF-terminated. init() strdup's this string, so the local is safe.
-	std::string authHeader = "Authorization: Bearer " + token + "\r\n";
+	// #465: uses cached bearerHeader ("Bearer <token>").
+	std::string authHeader = "Authorization: " + bearerHeader + "\r\n";
 
 	esp_websocket_client_config_t wsCfg = {};
 	wsCfg.uri = wsUrl.c_str();
@@ -1241,10 +1243,10 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 	if (statusOut) *statusOut = -1;
 	bodyOut.clear();
 
-	std::string token;
+	std::string bearerHeader;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		token = _accessToken;
+		bearerHeader = _bearerHeader;
 	}
 
 	std::lock_guard<std::mutex> statusLock(_statusMutex);
@@ -1254,7 +1256,7 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 	{
 		if (!_statusClient)
 		{
-			_statusClient = makeAuthedClient(url, HTTP_METHOD_GET, 1024, token);
+			_statusClient = makeAuthedClient(url, HTTP_METHOD_GET, 1024, bearerHeader);
 			if (!_statusClient)
 			{
 				ESP_LOGE(TAG, "httpGetBody: failed to init HTTP client");
@@ -1266,10 +1268,9 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 			esp_http_client_set_url(_statusClient, url.c_str());
 			esp_http_client_set_method(_statusClient, HTTP_METHOD_GET);
 			// Token may have rotated since the handle was created.
-			if (!token.empty())
+			if (!bearerHeader.empty())
 			{
-				std::string authHeader = "Bearer " + token;
-				esp_http_client_set_header(_statusClient, "Authorization", authHeader.c_str());
+				esp_http_client_set_header(_statusClient, "Authorization", bearerHeader.c_str());
 			}
 		}
 
@@ -1327,13 +1328,13 @@ bool TelephonyAnchorClient::httpPostBody(const std::string& url, const char* con
 	if (requestSentOut) *requestSentOut = false;
 	respBody.clear();
 
-	std::string token;
+	std::string bearerHeader;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		token = _accessToken;
+		bearerHeader = _bearerHeader;
 	}
 
-	esp_http_client_handle_t client = makeAuthedClient(url, HTTP_METHOD_POST, 1024, token);
+	esp_http_client_handle_t client = makeAuthedClient(url, HTTP_METHOD_POST, 1024, bearerHeader);
 	if (!client)
 	{
 		ESP_LOGE(TAG, "httpPostBody: failed to init HTTP client");
@@ -1973,12 +1974,12 @@ void TelephonyAnchorClient::rewarmTaskTrampoline(void* arg)
 
 void TelephonyAnchorClient::rewarmPostSession()
 {
-	std::string baseUrl, sourceDn, token;
+	std::string baseUrl, sourceDn, bearerHeader;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		baseUrl  = _baseUrl;
-		sourceDn = _sourceDn;
-		token    = _accessToken;
+		baseUrl      = _baseUrl;
+		sourceDn     = _sourceDn;
+		bearerHeader = _bearerHeader;
 	}
 	if (baseUrl.empty())
 	{
@@ -2007,7 +2008,7 @@ void TelephonyAnchorClient::rewarmPostSession()
 		{
 			// No handle yet (no call since boot): this open is a COLD handshake, but it primes the
 			// session so the first real call resumes.
-			slot.postClient = makeAuthedClient(url, HTTP_METHOD_POST, 1024, token);
+			slot.postClient = makeAuthedClient(url, HTTP_METHOD_POST, 1024, bearerHeader);
 			if (!slot.postClient)
 			{
 				ESP_LOGW(TAG, "rewarm: failed to create POST client (slot %d)", (int)i);
@@ -2017,10 +2018,9 @@ void TelephonyAnchorClient::rewarmPostSession()
 		else
 		{
 			esp_http_client_set_url(slot.postClient, url.c_str());
-			if (!token.empty())
+			if (!bearerHeader.empty())
 			{
-				const std::string authHeader = "Bearer " + token;
-				esp_http_client_set_header(slot.postClient, "Authorization", authHeader.c_str());
+				esp_http_client_set_header(slot.postClient, "Authorization", bearerHeader.c_str());
 			}
 		}
 
@@ -2064,12 +2064,12 @@ void TelephonyAnchorClient::prewarmTaskTrampoline(void* arg)
 
 void TelephonyAnchorClient::prewarmAllSlots()
 {
-	std::string baseUrl, sourceDn, token;
+	std::string baseUrl, sourceDn, bearerHeader;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		baseUrl  = _baseUrl;
-		sourceDn = _sourceDn;
-		token    = _accessToken;
+		baseUrl      = _baseUrl;
+		sourceDn     = _sourceDn;
+		bearerHeader = _bearerHeader;
 	}
 	if (baseUrl.empty()) return;   // unprovisioned / loopback
 	// Benign same-host target: only the handshake matters (GET → participant list 200; POST → 405).
@@ -2077,7 +2077,7 @@ void TelephonyAnchorClient::prewarmAllSlots()
 
 	auto warmHandle = [&](esp_http_client_handle_t& h, esp_http_client_method_t method) -> bool {
 		if (!_running.load(std::memory_order_acquire)) return false;
-		if (!h) h = makeAuthedClient(url, method, 1024, token);
+		if (!h) h = makeAuthedClient(url, method, 1024, bearerHeader);
 		if (!h) return false;
 		const int64_t t0 = esp_timer_get_time();
 		if (esp_http_client_open(h, 0) != ESP_OK)
@@ -2206,8 +2206,16 @@ esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const std::stri
 
 	if (!token.empty())
 	{
-		std::string authHeader = "Bearer " + token;
-		esp_http_client_set_header(client, "Authorization", authHeader.c_str());
+		// #465: if token is already pre-formatted as "Bearer ...", pass directly; otherwise format
+		if (token.rfind("Bearer ", 0) == 0)
+		{
+			esp_http_client_set_header(client, "Authorization", token.c_str());
+		}
+		else
+		{
+			std::string authHeader = "Bearer " + token;
+			esp_http_client_set_header(client, "Authorization", authHeader.c_str());
+		}
 	}
 
 	return client;
@@ -2254,7 +2262,7 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 	std::string token;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		token = _accessToken;
+		token = _bearerHeader;
 	}
 
 	std::lock_guard<std::mutex> ctrlLock(_ctrlMutex);
@@ -2279,8 +2287,10 @@ bool TelephonyAnchorClient::performCtrl(const std::string& url, const char* cont
 			esp_http_client_set_url(_ctrlClient, url.c_str());
 			esp_http_client_set_method(_ctrlClient, HTTP_METHOD_POST);
 			// Token may have rotated since the handle was created.
-			std::string authHeader = "Bearer " + token;
-			esp_http_client_set_header(_ctrlClient, "Authorization", authHeader.c_str());
+			if (!token.empty())
+			{
+				esp_http_client_set_header(_ctrlClient, "Authorization", token.c_str());
+			}
 		}
 
 		if (contentType)
@@ -3238,14 +3248,14 @@ bool TelephonyAnchorClient::startMediaStreams(const std::string& participantId)
 		return false;
 	}
 
-	std::string baseUrl, sourceDn, token;
+	std::string baseUrl, sourceDn, bearerHeader;
 	CallSlot* slot = nullptr;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		slot = slotForLocked(participantId);
 		baseUrl = _baseUrl;
 		sourceDn = _sourceDn;
-		token = _accessToken;
+		bearerHeader = _bearerHeader;
 	}
 	if (!slot)
 	{
@@ -3266,7 +3276,7 @@ bool TelephonyAnchorClient::startMediaStreams(const std::string& participantId)
 		{
 			// First open on this slot (boot/teardown): a cold handshake. The handle is then KEPT
 			// WARM across calls on this slot so subsequent opens RESUME its TLS session.
-			slot->postClient = makeAuthedClient(postUrl, HTTP_METHOD_POST, 4096, token);
+			slot->postClient = makeAuthedClient(postUrl, HTTP_METHOD_POST, 4096, bearerHeader);
 			if (!slot->postClient)
 			{
 				ESP_LOGE(TAG, "Failed to init POST HTTP client");
@@ -3277,10 +3287,9 @@ bool TelephonyAnchorClient::startMediaStreams(const std::string& participantId)
 		{
 			// Reuse the warm handle: re-point at THIS call's participant + refresh the bearer.
 			esp_http_client_set_url(slot->postClient, postUrl.c_str());
-			if (!token.empty())
+			if (!bearerHeader.empty())
 			{
-				std::string authHeader = "Bearer " + token;
-				esp_http_client_set_header(slot->postClient, "Authorization", authHeader.c_str());
+				esp_http_client_set_header(slot->postClient, "Authorization", bearerHeader.c_str());
 			}
 		}
 
@@ -3297,7 +3306,7 @@ bool TelephonyAnchorClient::startMediaStreams(const std::string& participantId)
 			// handshake rather than a failed call).
 			ESP_LOGW(TAG, "POST open failed (%s) — rebuilding handle and retrying", esp_err_to_name(err));
 			esp_http_client_cleanup(slot->postClient);
-			slot->postClient = makeAuthedClient(postUrl, HTTP_METHOD_POST, 4096, token);
+			slot->postClient = makeAuthedClient(postUrl, HTTP_METHOD_POST, 4096, bearerHeader);
 			err = ESP_FAIL;
 			if (slot->postClient)
 			{
@@ -3484,13 +3493,13 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 
 	std::string activePartId;
 	std::string baseUrl, sourceDn;
-	std::string token;
+	std::string bearerHeader;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		activePartId = _activeParticipantId;
-		baseUrl = _baseUrl;
-		sourceDn = _sourceDn;
-		token = _accessToken;
+		baseUrl      = _baseUrl;
+		sourceDn     = _sourceDn;
+		bearerHeader = _bearerHeader;
 	}
 
 	std::string getUrl = baseUrl + "/callcontrol/" + sourceDn + "/participants/" + activePartId + "/stream";
@@ -3554,7 +3563,7 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 		std::lock_guard<std::mutex> lock(_getMutex);
 		if (keepRunning())
 		{
-			_getClient = makeAuthedClient(getUrl, HTTP_METHOD_GET, 1024, token);
+			_getClient = makeAuthedClient(getUrl, HTTP_METHOD_GET, 1024, bearerHeader);
 		}
 	}
 
@@ -3578,7 +3587,7 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 			_getClient = nullptr;
 		}
 		if (!keepRunning()) return false;
-		_getClient = makeAuthedClient(getUrl, HTTP_METHOD_GET, 1024, token);
+		_getClient = makeAuthedClient(getUrl, HTTP_METHOD_GET, 1024, bearerHeader);
 		return _getClient != nullptr;
 	};
 
