@@ -586,6 +586,83 @@ TEST(BlindTransfer, TargetAnswerIsAckedAndSwappedIntoTheTransfereesOwnDialog)
 	EXPECT_EQ(cLeg.value()->getPeerCallID(), "Call-ID: " + callId);
 }
 
+// The swap re-INVITE is the PBX's own request, so the transferee can refuse it
+// (488: it cannot take the target's codec). The PBX ACKs the refusal and ends the
+// bridge, and both phones must hear about it: the target, whose call will never
+// happen, and the transferee, who keeps the dialog it just refused the re-INVITE in
+// (RFC 3261 §14.1) while the PBX forgets it. BYEd as the departed transferor.
+TEST(BlindTransfer, TransfereeRefusingTheSwapIsAckedAndByedWithTheTarget)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.36.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in transferorAddr = addrFor("192.168.36.10"); // A: 100
+	const sockaddr_in transfereeAddr = addrFor("192.168.36.20"); // B: 106
+	const sockaddr_in targetAddr     = addrFor("192.168.36.30"); // C: 107
+
+	handler.handle(makeRegister("100", "192.168.36.10", "reg-100g"));
+	handler.handle(makeRegister("106", "192.168.36.20", "reg-106g"));
+	handler.handle(makeRegister("107", "192.168.36.30", "reg-107g"));
+
+	const std::string callId = "blindxfer-swap-refused";
+	connectCall(handler, sent, callId,
+		"100", transferorAddr, "atag", sdpBodyFor("10.1.1.1", 10001),
+		"106", transfereeAddr, "btag", sdpBodyFor("10.2.2.2", 20002));
+	handler.handle(makeRefer(callId, "100", transferorAddr, "atag", "106", "btag", "107"));
+
+	const std::string inviteToC = findSentTo(sent, targetAddr, "INVITE sip:107@");
+	ASSERT_FALSE(inviteToC.empty());
+	const std::string legCallId = extractHeaderLine(inviteToC, "Call-ID:");
+	{
+		std::string body = sdpBodyFor("10.3.3.3", 30003);
+		std::string raw =
+			"SIP/2.0 200 OK\r\n" +
+			extractHeaderLine(inviteToC, "Via:") + "\r\n" +
+			extractHeaderLine(inviteToC, "From:") + "\r\n"
+			"To: <sip:107@192.168.36.1:5060>;tag=ctag\r\n" +
+			legCallId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Contact: <sip:107@192.168.36.30:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		handler.handle(RequestsHandler::getMessageFromPool(raw, targetAddr));
+	}
+	const std::string reinviteToB = findSentTo(sent, transfereeAddr, "INVITE sip:106@");
+	ASSERT_FALSE(reinviteToB.empty()) << "the transferee must be re-INVITEd with the target's SDP";
+
+	sent.clear();
+	{
+		std::string raw =
+			"SIP/2.0 488 Not Acceptable Here\r\n" +
+			extractHeaderLine(reinviteToB, "Via:") + "\r\n" +
+			extractHeaderLine(reinviteToB, "From:") + "\r\n" +
+			extractHeaderLine(reinviteToB, "To:") + "\r\n"
+			"Call-ID: " + callId + "\r\n" +
+			extractHeaderLine(reinviteToB, "CSeq:") + "\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, transfereeAddr));
+	}
+
+	EXPECT_FALSE(findSentTo(sent, transfereeAddr, "ACK sip:").empty())
+		<< "the transferee's refusal must be ACKed or it retransmits until Timer H";
+	EXPECT_FALSE(findSentTo(sent, targetAddr, "BYE sip:").empty())
+		<< "the target is released";
+	const std::string byeToB = findSentTo(sent, transfereeAddr, "BYE sip:");
+	ASSERT_FALSE(byeToB.empty()) << "the transferee refused the re-INVITE but is still in its dialog: it must be BYEd";
+	EXPECT_NE(byeToB.find("Call-ID: " + callId), std::string::npos) << byeToB;
+	EXPECT_NE(extractHeaderLine(byeToB, "From:").find("tag=atag"), std::string::npos)
+		<< "the server speaks as the departed transferor:\n" << byeToB;
+	EXPECT_NE(extractHeaderLine(byeToB, "To:").find("tag=btag"), std::string::npos) << byeToB;
+	for (const auto& [addr, msg] : sent)
+	{
+		EXPECT_NE(addr.sin_addr.s_addr, transferorAddr.sin_addr.s_addr)
+			<< "the transferor left at REFER time and must receive nothing: " << msg->toString();
+	}
+}
+
 // A phone's Transfer softkey holds the call before it REFERs, so the last SDP
 // the PBX captured for the transferee is routinely a HOLD answer (a=recvonly /
 // a=inactive / a=sendonly). Relaying that direction into the new leg completes

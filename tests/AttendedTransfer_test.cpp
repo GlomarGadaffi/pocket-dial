@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -653,6 +654,276 @@ TEST(AttendedTransfer, SpliceReinviteFailureIsAckedAndTearsDownBridge)
 	// Nothing sent to A (already dropped)
 	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u)
 		<< "nothing should be sent to dropped party A";
+}
+
+// ── Splice refusal, second pass (#719, review of #927) ───────────────────────
+// A non-2xx to a re-INVITE leaves the dialog it answered as it was (RFC 3261
+// §14.1), so the phone that refused is still in a call with the PBX. And a final
+// that arrives after the teardown (the sibling leg's own answer, or a retransmit
+// of the refusal because our ACK was lost) is still an INVITE final the PBX owes
+// an ACK, whoever the call belongs to by then.
+namespace
+{
+	// A phone's response to a request the server sent it: the request's Via, From,
+	// To, Call-ID and CSeq echoed back, which is how a UA builds one.
+	std::string answerTo(const std::string& req, const std::string& status)
+	{
+		return "SIP/2.0 " + status + "\r\n" +
+			extractHeaderLine(req, "Via:") + "\r\n" +
+			extractHeaderLine(req, "From:") + "\r\n" +
+			extractHeaderLine(req, "To:") + "\r\n" +
+			extractHeaderLine(req, "Call-ID:") + "\r\n" +
+			extractHeaderLine(req, "CSeq:") + "\r\n"
+			"Content-Length: 0\r\n\r\n";
+	}
+
+	void deliver(Rig& rig, const std::string& raw, const sockaddr_in& from)
+	{
+		rig.handler->handle(RequestsHandler::getMessageFromPool(raw, from));
+	}
+
+	long cseqNumOf(const std::string& raw)
+	{
+		const auto at = raw.find("CSeq: ");
+		return at == std::string::npos ? -1 : std::stol(raw.substr(at + 6));
+	}
+
+	// The re-INVITEs onRefer() sent: B's rides the REFER's dialog at its CSeq + 1,
+	// C's the consult dialog at its setup CSeq + 1 (see the first test above).
+	struct SpliceInvites { std::string toB, toC; };
+	SpliceInvites spliceInvites(const Rig& rig)
+	{
+		return { findSentTo(rig.sent, rig.bAddr, "CSeq: 3 INVITE"),
+		         findSentTo(rig.sent, rig.cAddr, "CSeq: 2 INVITE") };
+	}
+}
+
+// The PBX has just forgotten the call, so the phone that refused has to be told:
+// BYEd as the dropped transferor, like its peer. Left alone it sits in a "connected"
+// call with dead audio until its user hangs up and draws a 481.
+TEST(AttendedTransfer, SpliceRefusalByesTheRefusingLegAsWellAsItsPeer)
+{
+	Rig rig;
+	setUpSplicedCalls(rig);
+	sendAttendedRefer(rig);
+	const auto inv = spliceInvites(rig);
+	ASSERT_FALSE(inv.toB.empty());
+
+	rig.sent.clear();
+	deliver(rig, answerTo(inv.toB, "488 Not Acceptable Here"), rig.bAddr);
+
+	const std::string byeToB = findSentToBoth(rig.sent, rig.bAddr, "BYE sip:", "Call-ID: " + rig.abCallId);
+	ASSERT_FALSE(byeToB.empty()) << "B refused the re-INVITE but is still in its dialog: it must be BYEd";
+	EXPECT_EQ(byeToB.rfind("BYE sip:106@", 0), 0u) << byeToB;
+	// The server speaks as A (A's tag in From), to B's own tag.
+	EXPECT_NE(extractHeaderLine(byeToB, "From:").find("tag=abtag"), std::string::npos) << byeToB;
+	EXPECT_NE(extractHeaderLine(byeToB, "To:").find("tag=btag"), std::string::npos) << byeToB;
+	EXPECT_GT(cseqNumOf(byeToB), 3) << "above the splice re-INVITE it follows:\n" << byeToB;
+
+	const std::string byeToC = findSentToBoth(rig.sent, rig.cAddr, "BYE sip:", "Call-ID: " + rig.acCallId);
+	ASSERT_FALSE(byeToC.empty()) << "the sibling leg must still be BYEd";
+	EXPECT_NE(extractHeaderLine(byeToC, "From:").find("tag=actag"), std::string::npos) << byeToC;
+	EXPECT_NE(extractHeaderLine(byeToC, "To:").find("tag=ctag"), std::string::npos) << byeToC;
+
+	EXPECT_EQ(countContaining(rig.sent, rig.bAddr, "BYE sip:"), 1u);
+	EXPECT_EQ(countContaining(rig.sent, rig.cAddr, "BYE sip:"), 1u);
+	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u) << "A is already dropped";
+}
+
+// Same, with A the CALLEE of the A-B dialog: the tags flip, the rule does not.
+TEST(AttendedTransfer, SpliceRefusalByesTheRefusingLegWhenAIsTheCallee)
+{
+	Rig rig;
+	setUpSplicedCallsReceptionist(rig);
+	sendAttendedReferReceptionist(rig);
+	const auto inv = spliceInvites(rig);
+	ASSERT_FALSE(inv.toB.empty());
+
+	rig.sent.clear();
+	deliver(rig, answerTo(inv.toB, "488 Not Acceptable Here"), rig.bAddr);
+
+	// A answered B's call: A's tag is the To-tag (raatag), B's the From-tag (rbatag).
+	const std::string byeToB = findSentToBoth(rig.sent, rig.bAddr, "BYE sip:", "Call-ID: " + rig.abCallId);
+	ASSERT_FALSE(byeToB.empty()) << "B refused the re-INVITE but is still in its dialog: it must be BYEd";
+	EXPECT_NE(extractHeaderLine(byeToB, "From:").find("tag=raatag"), std::string::npos) << byeToB;
+	EXPECT_NE(extractHeaderLine(byeToB, "To:").find("tag=rbatag"), std::string::npos) << byeToB;
+
+	const std::string byeToC = findSentToBoth(rig.sent, rig.cAddr, "BYE sip:", "Call-ID: " + rig.acCallId);
+	ASSERT_FALSE(byeToC.empty()) << "the sibling leg must still be BYEd";
+	EXPECT_NE(extractHeaderLine(byeToC, "From:").find("tag=ractag"), std::string::npos) << byeToC;
+	EXPECT_NE(extractHeaderLine(byeToC, "To:").find("tag=rctag"), std::string::npos) << byeToC;
+
+	EXPECT_EQ(countContaining(rig.sent, rig.bAddr, "BYE sip:"), 1u);
+	EXPECT_EQ(countContaining(rig.sent, rig.cAddr, "BYE sip:"), 1u);
+	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u) << "A is already dropped";
+}
+
+// The consult leg refuses first: the mirror image, with B as the sibling.
+TEST(AttendedTransfer, SpliceRefusalFromTheConsultLegByesBothLegs)
+{
+	Rig rig;
+	setUpSplicedCalls(rig);
+	sendAttendedRefer(rig);
+	const auto inv = spliceInvites(rig);
+	ASSERT_FALSE(inv.toC.empty());
+
+	rig.sent.clear();
+	deliver(rig, answerTo(inv.toC, "488 Not Acceptable Here"), rig.cAddr);
+
+	const std::string ackToC = findSentTo(rig.sent, rig.cAddr, "ACK sip:");
+	ASSERT_FALSE(ackToC.empty()) << "C's refusal must be ACKed";
+	EXPECT_NE(ackToC.find("CSeq: 2 ACK"), std::string::npos) << ackToC;
+
+	const std::string byeToC = findSentToBoth(rig.sent, rig.cAddr, "BYE sip:", "Call-ID: " + rig.acCallId);
+	ASSERT_FALSE(byeToC.empty()) << "C refused the re-INVITE but is still in its dialog: it must be BYEd";
+	EXPECT_NE(extractHeaderLine(byeToC, "From:").find("tag=actag"), std::string::npos) << byeToC;
+	EXPECT_NE(extractHeaderLine(byeToC, "To:").find("tag=ctag"), std::string::npos) << byeToC;
+	EXPECT_GT(cseqNumOf(byeToC), 2) << "above the splice re-INVITE it follows:\n" << byeToC;
+
+	const std::string byeToB = findSentToBoth(rig.sent, rig.bAddr, "BYE sip:", "Call-ID: " + rig.abCallId);
+	ASSERT_FALSE(byeToB.empty()) << "the sibling leg must still be BYEd";
+	EXPECT_NE(extractHeaderLine(byeToB, "From:").find("tag=abtag"), std::string::npos) << byeToB;
+	EXPECT_NE(extractHeaderLine(byeToB, "To:").find("tag=btag"), std::string::npos) << byeToB;
+
+	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u) << "A is already dropped";
+}
+
+// The refusing phone retransmits its final until it sees our ACK, so a lost ACK is
+// repaired by ACKing again; the teardown has already happened and must not repeat.
+TEST(AttendedTransfer, RetransmittedSpliceRefusalIsReAckedWithoutASecondTeardown)
+{
+	Rig rig;
+	setUpSplicedCalls(rig);
+	sendAttendedRefer(rig);
+	const auto inv = spliceInvites(rig);
+	ASSERT_FALSE(inv.toB.empty());
+
+	const std::string raw488 = answerTo(inv.toB, "488 Not Acceptable Here");
+	deliver(rig, raw488, rig.bAddr);
+
+	rig.sent.clear();
+	deliver(rig, raw488, rig.bAddr);
+
+	const std::string ack = findSentTo(rig.sent, rig.bAddr, "ACK sip:");
+	ASSERT_FALSE(ack.empty()) << "B's retransmitted 488 must be ACKed again";
+	EXPECT_NE(ack.find("CSeq: 3 ACK"), std::string::npos) << ack;
+	EXPECT_EQ(extractHeaderLine(ack, "Via:"), extractHeaderLine(inv.toB, "Via:"))
+		<< "a non-2xx ACK reuses the INVITE's branch (RFC 3261 §17.1.1.3)";
+	EXPECT_EQ(countContaining(rig.sent, rig.bAddr, "BYE sip:"), 0u) << "B was already BYEd";
+	EXPECT_EQ(countContaining(rig.sent, rig.cAddr, ""), 0u) << "C was already BYEd";
+	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u) << "A is already dropped";
+}
+
+// B's refusal tears the bridge down while C's re-INVITE is still pending, so C
+// answers afterwards: 487 once it sees the server's BYE (RFC 3261 §15.1.2), or its
+// own refusal if both reject. Each lands in a different handler (onReqTerminated,
+// onFinalFailure, onBusy, onUnavailable) and all of them must ACK it and swallow it,
+// not relay it into A's dropped dialog or leave it unclaimed.
+TEST(AttendedTransfer, SiblingFinalAfterTeardownIsAckedAndNotRelayedToA)
+{
+	for (const char* status : {"487 Request Terminated", "488 Not Acceptable Here",
+	                           "486 Busy Here", "480 Temporarily Unavailable"})
+	{
+		SCOPED_TRACE(status);
+		Rig rig;
+		setUpSplicedCalls(rig);
+		sendAttendedRefer(rig);
+		const auto inv = spliceInvites(rig);
+		ASSERT_FALSE(inv.toB.empty());
+		ASSERT_FALSE(inv.toC.empty());
+		deliver(rig, answerTo(inv.toB, "488 Not Acceptable Here"), rig.bAddr);   // tears the bridge down
+
+		rig.sent.clear();
+		deliver(rig, answerTo(inv.toC, status), rig.cAddr);
+
+		const std::string ack = findSentTo(rig.sent, rig.cAddr, "ACK sip:");
+		ASSERT_FALSE(ack.empty()) << "C's final must be ACKed or C retransmits it until Timer H";
+		EXPECT_NE(ack.find("CSeq: 2 ACK"), std::string::npos) << ack;
+		EXPECT_EQ(extractHeaderLine(ack, "Via:"), extractHeaderLine(inv.toC, "Via:"))
+			<< "a non-2xx ACK reuses the INVITE's branch (RFC 3261 §17.1.1.3)";
+		EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u)
+			<< "the final must not be relayed to the dropped transferor";
+		EXPECT_EQ(countContaining(rig.sent, rig.bAddr, ""), 0u) << "B was already BYEd";
+		EXPECT_EQ(countContaining(rig.sent, rig.cAddr, "BYE sip:"), 0u) << "C was already BYEd";
+	}
+}
+
+// B's refusal and C's 200 OK cross on the wire. C answered, so it expects an ACK
+// (RFC 3261 §13.2.2.4) and retransmits the 200 until it gets one.
+TEST(AttendedTransfer, SiblingLate200OkAfterTeardownIsAckedAndNotRelayedToA)
+{
+	Rig rig;
+	setUpSplicedCalls(rig);
+	sendAttendedRefer(rig);
+	const auto inv = spliceInvites(rig);
+	ASSERT_FALSE(inv.toB.empty());
+	ASSERT_FALSE(inv.toC.empty());
+	deliver(rig, answerTo(inv.toB, "488 Not Acceptable Here"), rig.bAddr);   // tears the bridge down
+
+	rig.sent.clear();
+	const std::string body = sdpBody("192.168.40.30", 30001);
+	deliver(rig,
+		"SIP/2.0 200 OK\r\n" + extractHeaderLine(inv.toC, "Via:") + "\r\n" +
+		extractHeaderLine(inv.toC, "From:") + "\r\n" + extractHeaderLine(inv.toC, "To:") + "\r\n" +
+		"Call-ID: " + rig.acCallId + "\r\n"
+		"CSeq: 2 INVITE\r\n"
+		"Contact: <sip:107@192.168.40.30:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body,
+		rig.cAddr);
+
+	const std::string ack = findSentTo(rig.sent, rig.cAddr, "ACK sip:");
+	ASSERT_FALSE(ack.empty()) << "C's 200 OK must be ACKed";
+	EXPECT_NE(ack.find("CSeq: 2 ACK"), std::string::npos) << ack;
+	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u)
+		<< "the 200 OK must not be relayed to the dropped transferor";
+	EXPECT_EQ(countContaining(rig.sent, rig.cAddr, "BYE sip:"), 0u) << "C was already BYEd";
+}
+
+// 481 and 408 are no exception: RFC 3261 §12.2.1.2 has the UAC terminate the dialog
+// on either, and "for INVITE initiated dialogs, terminating the dialog consists of
+// sending a BYE". The phone may answer that BYE with a 481 of its own; that is fine.
+TEST(AttendedTransfer, SpliceRefusalThatEndsTheDialogIsByedToo)
+{
+	for (const char* status : {"481 Call/Transaction Does Not Exist", "408 Request Timeout"})
+	{
+		SCOPED_TRACE(status);
+		Rig rig;
+		setUpSplicedCalls(rig);
+		sendAttendedRefer(rig);
+		const auto inv = spliceInvites(rig);
+		ASSERT_FALSE(inv.toB.empty());
+
+		rig.sent.clear();
+		deliver(rig, answerTo(inv.toB, status), rig.bAddr);
+
+		EXPECT_FALSE(findSentTo(rig.sent, rig.bAddr, "ACK sip:").empty()) << "the final is still ACKed";
+		EXPECT_FALSE(findSentToBoth(rig.sent, rig.bAddr, "BYE sip:", "Call-ID: " + rig.abCallId).empty())
+			<< "B is BYEd after a " << status << " as after any other refusal";
+		EXPECT_EQ(countContaining(rig.sent, rig.bAddr, "BYE sip:"), 1u);
+		EXPECT_EQ(countContaining(rig.sent, rig.cAddr, "BYE sip:"), 1u) << "C is still in its dialog";
+		EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u) << "A is already dropped";
+	}
+}
+
+// What the PBX remembers about a torn-down splice is bounded: past 64*T1 (RFC 3261
+// Timer B/F) the far phone has given up retransmitting, and the entry goes.
+TEST(AttendedTransfer, SpliceRefusalMemoryLapsesAfter64T1)
+{
+	Rig rig;
+	setUpSplicedCalls(rig);
+	sendAttendedRefer(rig);
+	const auto inv = spliceInvites(rig);
+	ASSERT_FALSE(inv.toB.empty());
+
+	const std::string raw488 = answerTo(inv.toB, "488 Not Acceptable Here");
+	deliver(rig, raw488, rig.bAddr);
+	rig.handler->ageSpliceTxnsForTest(std::chrono::seconds(40));
+
+	rig.sent.clear();
+	deliver(rig, raw488, rig.bAddr);
+	EXPECT_TRUE(findSentTo(rig.sent, rig.bAddr, "ACK sip:").empty())
+		<< "a final this late is no longer the PBX's to ACK";
 }
 
 // (c) B hangs up -> C gets a correctly-tagged BYE; A gets nothing (A is gone).

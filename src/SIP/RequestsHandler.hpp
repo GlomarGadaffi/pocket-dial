@@ -623,10 +623,12 @@ public:
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
 	// #589 review: age the in-flight splice transactions so a test can reach the 64*T1 sweep.
+	// #719: and the torn-down attended-transfer splices the PBX still remembers.
 	void ageSpliceTxnsForTest(std::chrono::steady_clock::duration d)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		for (auto& t : _spliceTxns) t.since -= d;
+		for (auto& t : _spliceTombs) t.since -= d;
 	}
 	// #808: run the transaction layer's timers as of `now`, so a test can carry a
 	// BYE past Timer F (32 s) without waiting for it.
@@ -1495,12 +1497,28 @@ private:
 
 	// Attended transfer (RFC 3891 Replaces), issue #131: onRefer() splices two live
 	// P2P sessions (A-B and A-C) into one B-C call via cross re-INVITEs carrying
-	// swapped SDP, then drops A. handleTransferOk() (called from onOk() before the
-	// normal session lookup, same pattern as _beeper.handleOk()/_park.handleOk())
-	// intercepts the 200 OK to each splice re-INVITE (CSeq 100, tracked by Call-ID
-	// in _transferPendingAcks) and ACKs it directly — it must never reach the
-	// generic relay below, which would forward it toward A, who is already gone.
-	// Caller holds _mutex.
+	// swapped SDP, then drops A. Every response to those re-INVITEs is the PBX's own
+	// transaction, tracked by Call-ID in _transferPendingAcks, and these two claim
+	// it ahead of the normal session lookup (same pattern as _beeper.handleOk()/
+	// _park.handleOk()): it must never reach the generic relays, which would forward
+	// it toward A, who is already gone.
+	//
+	//   handleTransferOk      — the 200 OK: ACK it, with the CSeq it echoes. A
+	//                           retransmit of it, or one that arrives after the
+	//                           splice was torn down, is ACKed again, nothing more.
+	//   handleTransferFailure — a non-2xx final (#719): ACK it, BYE both phones in
+	//                           A's name and end both sessions. The refusing phone
+	//                           is BYEd too, whatever the status: a refused re-INVITE
+	//                           leaves its dialog standing (RFC 3261 §14.1), and
+	//                           after a 481/408 the UAC ends it with a BYE as well
+	//                           (§12.2.1.2).
+	//                           The Call-IDs are then remembered for 64*T1
+	//                           (_spliceTombs), so a later final on either — the
+	//                           sibling's own answer, a retransmit of the refusal —
+	//                           is ACKed and absorbed rather than relayed to A.
+	//
+	// Both return false for anything that is not a splice response. Caller holds
+	// _mutex.
 	bool handleTransferOk(const std::shared_ptr<SipMessage>& data);
 	bool handleTransferFailure(const std::shared_ptr<SipMessage>& data);
 
@@ -2340,6 +2358,11 @@ private:
 	// The peer dialog of a spliced session: who to send to and as whom. BYE's
 	// two bridge branches and the in-dialog relay all resolve it the same way.
 	bool resolvePeerDialog(const std::shared_ptr<Session>& s, PeerDialog& out);
+	// One transfer-bridge leg on its own: the phone on its dialog and the headers to
+	// speak to it in the dropped transferor's name. resolvePeerDialog() is this for
+	// the leg's peer; handleTransferFailure() uses it for both legs, so a leg whose
+	// peer is already gone can still be BYEd.
+	bool resolveBridgeLeg(const std::shared_ptr<Session>& leg, PeerDialog& out);
 	// The phone that owns a spliced session's dialog (its src, or on a
 	// transfer bridge whichever side the dropped transferor was not).
 	std::shared_ptr<SipClient> ownPartyOf(const std::shared_ptr<Session>& s) const;
@@ -2388,6 +2411,24 @@ private:
 	// answers 500 + Retry-After rather than ever relaying untranslated.
 	static constexpr size_t kSpliceTxns = 8;
 	std::array<SpliceTxn, kSpliceTxns> _spliceTxns{};
+
+	// #719: Call-IDs of attended-transfer splice re-INVITEs that handleTransferFailure()
+	// has torn down. For 64*T1 after that, an INVITE final on one is still the PBX's
+	// to ACK: the sibling leg answers its own re-INVITE after the bridge is gone (487
+	// once it sees our BYE, a 200 that crossed the refusal, or its own refusal), and a
+	// refusing phone retransmits its final until an ACK arrives. A ring of fixed
+	// buffers like SpliceTxn's: the oldest entry is overwritten, one past 64*T1 is
+	// ignored, so nothing needs a tick(). A Call-ID too long for the buffer is not kept.
+	struct SpliceTomb
+	{
+		char callId[128] = {};   // the full "Call-ID: ..." line, as getCallID() returns it; empty = free
+		std::chrono::steady_clock::time_point since{};
+	};
+	static constexpr size_t kSpliceTombs = 4;   // two per failed transfer
+	std::array<SpliceTomb, kSpliceTombs> _spliceTombs{};
+	size_t _spliceTombNext = 0;
+	void noteSpliceDone(std::string_view callID);
+	bool spliceDone(std::string_view callID) const;
 
 	// nullptr when the pool or the builder refuses. `refused` is set for the
 	// builder's refusal (#744: a field it will not send), which, unlike a pool
