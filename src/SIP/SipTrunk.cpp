@@ -1,5 +1,7 @@
 #include "SipTrunk.hpp"
 
+#if POCKETDIAL_HAS_TRUNK
+
 #include <algorithm>
 #include <cstdio>
 #include <cctype>
@@ -1693,3 +1695,5 @@ bool SipTrunk::handleRegisterResponse(const std::shared_ptr<SipMessage>& data)
 	sendRegisterIfDue(nowMs);   // a 401/407/423 retry goes out now, not a tick later
 	return true;
 }
+
+#endif // POCKETDIAL_HAS_TRUNK
