@@ -98,19 +98,14 @@ Cross-references:
 | `enforceG711()` | **Deprecated, zero production callers** (tests only). It pinned `m=` to a literal `0 8 101`, inventing PT 101 with no `a=rtpmap`, which pjsip rejects outright. Any "this PBX is G.711-only" statement is stale. | `SipMessage.cpp:266` |
 | SDP admission gate | every SDP-bearing message structurally checked before any decoder sees it; capability-negotiation attributes refused (T-7 / the UNISOC T612 RCE class) | `SipMessage::checkSdp` |
 
-### 1.3 Outbound trunking
+### 1.3 Outbound PSTN Interconnect & Media Anchors
 
-Outbound calls leave by one of two paths, chosen in `RequestsHandler::routeTrunkCall()`:
-the **SIP trunk** whenever its configuration is valid, otherwise an **`AnchorClient`**
-(`RequestsHandler.cpp:9954-9963`).
+**Strategic Architecture (October 2026):** All traditional carrier-facing ITSP SIP trunks (`SipTrunk` over UDP) have been **shelved behind Milestone 11** due to NAT/CGNAT/SIP ALG traversal drop modes (#618, #919) and heavy embedded task stack/memory consumption. Outside-line PSTN interconnect is now standardized exclusively on **Cloud Media Anchors and Programmable Telephony** (Milestone 6, Epic #381, [ADR-002](ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md)).
 
-- **SIP trunk (#164).** `SipTrunk` sends `INVITE`/`ACK`/`BYE` over UDP straight to the
-  carrier's SBC and relays RTP raw between the handset and the carrier. Configured at
-  `/setup/trunk` and `GET`/`POST /api/trunk` (`HttpServer.cpp:688-709`), applied at boot by
-  `applyStoredTrunkConfig()` in every `main/esp_main*.cpp`. Cap
-  `POCKETDIAL_MAX_TRUNK_CALLS` = **2** (`PoolConfig.hpp:262`).
-- **Anchor client.** HTTP/OAuth2, a call-control WebSocket, and media as chunked-HTTPS
-  PCM16. The shipping real client speaks the **3CX Call Control API**.
+Outside-line calls leave through the **Programmable Media Anchor Interface**:
+- **3CX Call Control Anchor:** HTTP/OAuth2 REST call control, WebSocket events, and chunked-HTTPS PCM16 audio (`TelephonyAnchorClient`).
+- **Apidaze CPAAS Anchor (#920):** REST call control (`POST /calls`, `DELETE /calls/{uuid}`) and bidirectional 8 kHz PCM16 audio streaming over the standard **AudioSocket** binary framing protocol (Type `0x10`, 320-byte frames).
+- **Compile-out (#731):** Constrained firmware compiles out legacy `SipTrunk` (`POCKETDIAL_HAS_TRUNK=0`, `POCKETDIAL_MAX_TRUNK_CALLS=0`), reclaiming ~12 KB internal RAM and ~35 KB flash image space. Host tests and unconstrained builds support `POCKETDIAL_HAS_ANCHOR=1`.
 
 What surprises people:
 
