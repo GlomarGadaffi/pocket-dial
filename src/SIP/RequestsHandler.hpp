@@ -1502,6 +1502,7 @@ private:
 	// generic relay below, which would forward it toward A, who is already gone.
 	// Caller holds _mutex.
 	bool handleTransferOk(const std::shared_ptr<SipMessage>& data);
+	bool handleTransferFailure(const std::shared_ptr<SipMessage>& data);
 
 	// Blind transfer (RFC 3515 §2 / RFC 5359 §2.4), issue #197: onRefer() moves the
 	// TRANSFEREE — the party that is not the transferor — to the target, and drops

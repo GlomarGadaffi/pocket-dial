@@ -389,6 +389,12 @@ public:
 		return hi + 1 < kCSeqLimit ? hi + 1 : kCSeqLimit - 1;
 	}
 
+	// Issue #719: CSeq of the last 200 OK to a transfer splice re-INVITE we ACKed,
+	// so a retransmitted 200 OK is recognized and re-ACKed rather than relayed toward
+	// the dropped transferor.
+	uint32_t lastSpliceAckCSeq() const { return _lastSpliceAckCSeq; }
+	void setLastSpliceAckCSeq(uint32_t c) { _lastSpliceAckCSeq = c; }
+
 	void release();
 
 private:
@@ -457,6 +463,7 @@ private:
 	uint32_t _transferorCseqAtRefer = 0; // issue #257, see the accessor's comment
 	uint32_t _lastServerCSeq = 0;        // issue #389, see the accessor's comment
 	uint32_t _maxObservedCSeq = 0;       // issue #402, see the accessor's comment
+	uint32_t _lastSpliceAckCSeq = 0;     // issue #719, see the accessor's comment
 };
 
 #endif

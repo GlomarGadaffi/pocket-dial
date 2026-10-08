@@ -49,6 +49,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_blindXferLeg = false;
 	_lastServerCSeq = 0;
 	_maxObservedCSeq = 0;
+	_lastSpliceAckCSeq = 0;
 	_isEmergency = false;     // #604
 	_emergencyNumber = {};    // #879
 	_rtpWatchArmed = false;   // #604
@@ -177,6 +178,7 @@ void Session::release()
 	_blindXferLeg = false;
 	_lastServerCSeq = 0;
 	_maxObservedCSeq = 0;
+	_lastSpliceAckCSeq = 0;
 
 	// Deliberately does NOT clear the voicemail/trunk state that reset() does.
 	// endCall() calls release() on the pool slot and only AFTERWARDS reads
