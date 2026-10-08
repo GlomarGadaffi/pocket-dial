@@ -8210,9 +8210,14 @@ bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
 	auto spliced = getSession(callID);
 
 	const uint32_t ackCseq = siphdr::cseqNumber(data->getCSeq());
+	// A 200 OK that is no longer pending is still owed an ACK when it is a phone
+	// repeating itself: the live bridge's own last answer (the ACK was lost), or the
+	// answer of a splice handleTransferFailure() tore down while it was on the wire
+	// (#719). Either way it is ACKed and goes no further.
 	const bool isRetransmit = (it == _transferPendingAcks.end()) &&
-		spliced.has_value() && spliced.value()->isTransferBridge() &&
-		(ackCseq != 0 && ackCseq == spliced.value()->lastSpliceAckCSeq());
+		((spliced.has_value() && spliced.value()->isTransferBridge() &&
+		  (ackCseq != 0 && ackCseq == spliced.value()->lastSpliceAckCSeq())) ||
+		 spliceDone(callID));
 
 	if (it == _transferPendingAcks.end() && !isRetransmit) return false;
 
@@ -8241,6 +8246,12 @@ bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
 		if (spliced.has_value())
 		{
 			spliced.value()->setLastSpliceAckCSeq(ackCseq);
+			// This 200 OK answers a re-INVITE that re-pointed a phone's media at its
+			// new peer, so whatever hold that dialog was in has just ended. A
+			// transferor's Transfer softkey holds the call before it REFERs (and a
+			// consult does the same), so the session is routinely still Held here —
+			// leaving it that way would have the dashboard, the session-timer sweep
+			// and any later resume all reasoning about a call that is in fact talking.
 			if (spliced.value()->getState() == Session::State::Held)
 			{
 				spliced.value()->setState(Session::State::Connected);
@@ -8490,8 +8501,21 @@ bool RequestsHandler::handleTransferFailure(const std::shared_ptr<SipMessage>& d
 	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string::npos) return false;
 	const std::string callID(data->getCallID());
 	auto it = std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(), callID);
-	if (it == _transferPendingAcks.end()) return false;
+	if (it == _transferPendingAcks.end())
+	{
+		// Not pending: not ours, or a splice this function already tore down. The
+		// second still owes an ACK and must not reach the relays below, which would
+		// pass it to A or leave it unclaimed: it is the sibling leg answering its own
+		// re-INVITE after the bridge is gone (487 once it sees our BYE, or its own
+		// refusal), or the refusing phone repeating its final because our ACK was lost.
+		if (!spliceDone(callID)) return false;
+		ackForwardedFinal(data);
+		queueLog("REFER: final on a torn-down splice (" + std::string(data->getHeader()) +
+			") — ACKed and absorbed");
+		return true;
+	}
 	_transferPendingAcks.erase(it);
+	noteSpliceDone(callID);
 
 	ackForwardedFinal(data);
 
@@ -8499,29 +8523,39 @@ bool RequestsHandler::handleTransferFailure(const std::shared_ptr<SipMessage>& d
 	if (!sessionOpt.has_value()) return true;
 	auto session = sessionOpt.value();
 
+	// Both phones are still in their dialogs with the PBX and the call is about to be
+	// forgotten, so BYE each in the dropped transferor's name, THEN end both (the #128
+	// rule: endCall() alone tells no phone anything). The refusing phone is one of
+	// them: a refused re-INVITE leaves its dialog as it was (RFC 3261 §14.1). 481 and
+	// 408 are the exceptions, they mean it has dropped the dialog itself (§12.2.1.2).
+	// Resolved here, before endCall() erases the sessions the dialog headers come from.
 	const std::string peerId = session->getPeerCallID();
+	std::shared_ptr<Session> peerSess;
 	if (!peerId.empty())
 	{
-		if (auto peerOpt = getSession(peerId); peerOpt.has_value())
-		{
-			auto peerSess = peerOpt.value();
-			const bool peerAIsSrc = peerSess->wasTransferorSrc();
-			auto survivor = peerAIsSrc ? peerSess->getDest() : peerSess->getSrc();
-			if (survivor && !peerSess->getDialogFrom().empty() && !peerSess->getDialogTo().empty())
-			{
-				const std::string& peerAHdr     = peerAIsSrc ? peerSess->getDialogFrom() : peerSess->getDialogTo();
-				const std::string& peerOtherHdr = peerAIsSrc ? peerSess->getDialogTo()   : peerSess->getDialogFrom();
-				const uint32_t byeCSeq = peerSess->nextServerCSeq();
-				auto bye = buildServerBye(survivor->getNumber(), survivor->getAddress(),
-					peerId, peerAHdr, peerOtherHdr, byeCSeq);
-				if (bye) _outbox.emplace_back(survivor->getAddress(), std::move(bye));
-				peerSess->noteServerCSeq(byeCSeq);
-			}
-			endCall(peerId,
-				peerSess->getSrc() ? peerSess->getSrc()->getNumber() : std::string(),
-				peerSess->getDest() ? peerSess->getDest()->getNumber() : std::string(),
-				"transfer splice peer refused");
-		}
+		noteSpliceDone(peerId);
+		if (auto peerOpt = getSession(peerId); peerOpt.has_value()) peerSess = peerOpt.value();
+	}
+	const auto status = data->getStatusInfo();
+	const bool dialogGone = status.has_value() && (status->code == 481 || status->code == 408);
+	const auto byeLeg = [this](const std::shared_ptr<Session>& leg, const std::string& legId) {
+		PeerDialog pd;
+		if (!resolveBridgeLeg(leg, pd)) return;   // #72: no dialog headers yet, no BYE
+		const uint32_t byeCSeq = leg->nextServerCSeq();
+		auto bye = buildServerBye(pd.target->getNumber(), pd.target->getAddress(), legId,
+			*pd.fromHdr, *pd.toHdr, byeCSeq);
+		if (bye) _outbox.emplace_back(pd.target->getAddress(), std::move(bye));
+		leg->noteServerCSeq(byeCSeq);
+	};
+	if (peerSess) byeLeg(peerSess, peerId);
+	if (!dialogGone) byeLeg(session, callID);
+
+	if (peerSess)
+	{
+		endCall(peerId,
+			peerSess->getSrc() ? peerSess->getSrc()->getNumber() : std::string(),
+			peerSess->getDest() ? peerSess->getDest()->getNumber() : std::string(),
+			"transfer splice peer refused");
 	}
 	endCall(callID,
 		session->getSrc() ? session->getSrc()->getNumber() : std::string(),
@@ -12260,31 +12294,34 @@ std::shared_ptr<SipClient> RequestsHandler::ownPartyOf(const std::shared_ptr<Ses
 	return s->getSrc();
 }
 
+bool RequestsHandler::resolveBridgeLeg(const std::shared_ptr<Session>& leg, PeerDialog& out)
+{
+	if (!leg || leg->getDialogFrom().empty() || leg->getDialogTo().empty()) return false;
+	out.peer = leg;
+	// The PBX impersonates the dropped transferor (A) in this dialog: A's own
+	// From/To tags are what the phone on it expects. wasTransferorSrc() says which
+	// side of the dialog A was, so the phone is the other one.
+	const bool aIsSrc = leg->wasTransferorSrc();
+	out.target  = aIsSrc ? leg->getDest() : leg->getSrc();
+	out.fromHdr = aIsSrc ? &leg->getDialogFrom() : &leg->getDialogTo();
+	out.toHdr   = aIsSrc ? &leg->getDialogTo()   : &leg->getDialogFrom();
+	return out.target != nullptr;
+}
+
 bool RequestsHandler::resolvePeerDialog(const std::shared_ptr<Session>& s, PeerDialog& out)
 {
 	if (!s || s->getPeerCallID().empty()) return false;
 	auto peerOpt = getSession(s->getPeerCallID());
 	if (!peerOpt.has_value()) return false;
 	auto peer = peerOpt.value();
+	if (s->isTransferBridge()) return resolveBridgeLeg(peer, out);
 	if (peer->getDialogFrom().empty() || peer->getDialogTo().empty()) return false;
 	out.peer = peer;
-	if (s->isTransferBridge())
-	{
-		// The PBX impersonates the dropped transferor (A) in the peer dialog: A's
-		// own From/To tags are what the surviving phone's dialog expects.
-		const bool peerAIsSrc = peer->wasTransferorSrc();
-		out.target  = peerAIsSrc ? peer->getDest() : peer->getSrc();
-		out.fromHdr = peerAIsSrc ? &peer->getDialogFrom() : &peer->getDialogTo();
-		out.toHdr   = peerAIsSrc ? &peer->getDialogTo()   : &peer->getDialogFrom();
-	}
-	else
-	{
-		// Pickup / park: the peer session's src is its phone, and its dialog
-		// headers were captured from that phone's side (From = the phone).
-		out.target  = peer->getSrc();
-		out.fromHdr = &peer->getDialogTo();
-		out.toHdr   = &peer->getDialogFrom();
-	}
+	// Pickup / park: the peer session's src is its phone, and its dialog
+	// headers were captured from that phone's side (From = the phone).
+	out.target  = peer->getSrc();
+	out.fromHdr = &peer->getDialogTo();
+	out.toHdr   = &peer->getDialogFrom();
 	return out.target != nullptr;
 }
 
@@ -12311,6 +12348,30 @@ static void copyInto(char (&dst)[N], std::string_view src)
 	const size_t n = src.size() < N - 1 ? src.size() : N - 1;
 	std::memcpy(dst, src.data(), n);
 	dst[n] = 0;
+}
+
+// #719: how long a torn-down splice is remembered. 64*T1 (RFC 3261 Timer B/F),
+// as sweepSpliceTxns() uses: past it the phone has stopped retransmitting.
+static constexpr auto kSpliceTombLife = std::chrono::seconds(32);
+
+void RequestsHandler::noteSpliceDone(std::string_view callID)
+{
+	SpliceTomb& t = _spliceTombs[_spliceTombNext];
+	if (!fitsIn(t.callId, callID)) return;   // not kept; only a repeat of the final goes unanswered
+	copyInto(t.callId, callID);
+	t.since = std::chrono::steady_clock::now();
+	_spliceTombNext = (_spliceTombNext + 1) % kSpliceTombs;
+}
+
+bool RequestsHandler::spliceDone(std::string_view callID) const
+{
+	const auto now = std::chrono::steady_clock::now();
+	for (const auto& t : _spliceTombs)
+	{
+		if (t.callId[0] != 0 && now - t.since < kSpliceTombLife && callID == std::string_view(t.callId))
+			return true;
+	}
+	return false;
 }
 
 void RequestsHandler::relayIntoPeerDialog(const std::shared_ptr<SipMessage>& data,
