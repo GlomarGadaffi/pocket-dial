@@ -30,7 +30,7 @@ That design is what makes a small embedded board practical for a PBX.
 - hold, resume, call park, paging, and ring groups
 - call forwarding and DND per extension
 - dial-plan based routing
-- SIP trunk / call-control outside line support
+- cloud media anchors and programmable telephony for outside lines (3CX, Apidaze)
 - web dashboard for setup, monitoring, and diagnostics
 - desktop build for local simulation and testing
 
