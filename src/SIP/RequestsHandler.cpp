@@ -8526,8 +8526,9 @@ bool RequestsHandler::handleTransferFailure(const std::shared_ptr<SipMessage>& d
 	// Both phones are still in their dialogs with the PBX and the call is about to be
 	// forgotten, so BYE each in the dropped transferor's name, THEN end both (the #128
 	// rule: endCall() alone tells no phone anything). The refusing phone is one of
-	// them: a refused re-INVITE leaves its dialog as it was (RFC 3261 §14.1). 481 and
-	// 408 are the exceptions, they mean it has dropped the dialog itself (§12.2.1.2).
+	// them: a refused re-INVITE leaves its dialog as it was (RFC 3261 §14.1). Even a
+	// 481 or 408 is no exception: the UAC then terminates the dialog, and for an INVITE
+	// dialog that consists of sending a BYE (§12.2.1.2).
 	// Resolved here, before endCall() erases the sessions the dialog headers come from.
 	const std::string peerId = session->getPeerCallID();
 	std::shared_ptr<Session> peerSess;
@@ -8536,8 +8537,6 @@ bool RequestsHandler::handleTransferFailure(const std::shared_ptr<SipMessage>& d
 		noteSpliceDone(peerId);
 		if (auto peerOpt = getSession(peerId); peerOpt.has_value()) peerSess = peerOpt.value();
 	}
-	const auto status = data->getStatusInfo();
-	const bool dialogGone = status.has_value() && (status->code == 481 || status->code == 408);
 	const auto byeLeg = [this](const std::shared_ptr<Session>& leg, const std::string& legId) {
 		PeerDialog pd;
 		if (!resolveBridgeLeg(leg, pd)) return;   // #72: no dialog headers yet, no BYE
@@ -8548,7 +8547,7 @@ bool RequestsHandler::handleTransferFailure(const std::shared_ptr<SipMessage>& d
 		leg->noteServerCSeq(byeCSeq);
 	};
 	if (peerSess) byeLeg(peerSess, peerId);
-	if (!dialogGone) byeLeg(session, callID);
+	byeLeg(session, callID);
 
 	if (peerSess)
 	{

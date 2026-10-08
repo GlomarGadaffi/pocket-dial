@@ -1508,9 +1508,10 @@ private:
 	//                           splice was torn down, is ACKed again, nothing more.
 	//   handleTransferFailure — a non-2xx final (#719): ACK it, BYE both phones in
 	//                           A's name and end both sessions. The refusing phone
-	//                           is BYEd too: a refused re-INVITE leaves its dialog
-	//                           standing (RFC 3261 §14.1), except after 481/408,
-	//                           which mean the dialog is already gone (§12.2.1.2).
+	//                           is BYEd too, whatever the status: a refused re-INVITE
+	//                           leaves its dialog standing (RFC 3261 §14.1), and
+	//                           after a 481/408 the UAC ends it with a BYE as well
+	//                           (§12.2.1.2).
 	//                           The Call-IDs are then remembered for 64*T1
 	//                           (_spliceTombs), so a later final on either — the
 	//                           sibling's own answer, a retransmit of the refusal —

@@ -880,9 +880,10 @@ TEST(AttendedTransfer, SiblingLate200OkAfterTeardownIsAckedAndNotRelayedToA)
 	EXPECT_EQ(countContaining(rig.sent, rig.cAddr, "BYE sip:"), 0u) << "C was already BYEd";
 }
 
-// 481 and 408 mean the phone no longer has the dialog (RFC 3261 §12.2.1.2), so
-// there is nothing to BYE on its side; its peer, still in a live dialog, is BYEd.
-TEST(AttendedTransfer, SpliceRefusalThatEndsTheDialogIsNotByedAgain)
+// 481 and 408 are no exception: RFC 3261 §12.2.1.2 has the UAC terminate the dialog
+// on either, and "for INVITE initiated dialogs, terminating the dialog consists of
+// sending a BYE". The phone may answer that BYE with a 481 of its own; that is fine.
+TEST(AttendedTransfer, SpliceRefusalThatEndsTheDialogIsByedToo)
 {
 	for (const char* status : {"481 Call/Transaction Does Not Exist", "408 Request Timeout"})
 	{
@@ -897,8 +898,9 @@ TEST(AttendedTransfer, SpliceRefusalThatEndsTheDialogIsNotByedAgain)
 		deliver(rig, answerTo(inv.toB, status), rig.bAddr);
 
 		EXPECT_FALSE(findSentTo(rig.sent, rig.bAddr, "ACK sip:").empty()) << "the final is still ACKed";
-		EXPECT_EQ(countContaining(rig.sent, rig.bAddr, "BYE sip:"), 0u)
-			<< "B already considers the dialog gone";
+		EXPECT_FALSE(findSentToBoth(rig.sent, rig.bAddr, "BYE sip:", "Call-ID: " + rig.abCallId).empty())
+			<< "B is BYEd after a " << status << " as after any other refusal";
+		EXPECT_EQ(countContaining(rig.sent, rig.bAddr, "BYE sip:"), 1u);
 		EXPECT_EQ(countContaining(rig.sent, rig.cAddr, "BYE sip:"), 1u) << "C is still in its dialog";
 		EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u) << "A is already dropped";
 	}
