@@ -305,6 +305,12 @@
 static_assert(POCKETDIAL_HAS_ANCHOR || POCKETDIAL_HAS_TRUNK,
               "a build needs at least one outside-line path (#731)");
 
+// When SipTrunk is compiled out (#731), zero trunk slots are allocated.
+#if !POCKETDIAL_HAS_TRUNK
+#undef POCKETDIAL_MAX_TRUNK_CALLS
+#define POCKETDIAL_MAX_TRUNK_CALLS 0
+#endif
+
 // Issue #398: calls the carrier sends in over the SIP trunk. 0 (SIP_CONSTRAINED,
 // whose 4 MB app slot has ~1.5 KB left after #689) keeps onInvite as it was: an
 // INVITE from the SBC is refused 403 like any other unregistered caller.

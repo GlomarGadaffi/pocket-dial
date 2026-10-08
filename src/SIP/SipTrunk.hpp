@@ -79,6 +79,7 @@
 //
 // Locking: every method assumes the caller holds the engine's _mutex, matching
 // the convention of the sibling machine classes.
+#if POCKETDIAL_HAS_TRUNK
 class SipTrunk
 {
 public:
@@ -632,5 +633,151 @@ private:
 	Listener* _listener = nullptr;
 	std::array<Dialog, POCKETDIAL_MAX_TRUNK_CALLS> _dialogs{};
 };
+#else
+// Issue #731: compile-out stub when SipTrunk is compiled out
+class SipTrunk
+{
+public:
+	explicit SipTrunk(PbxEnv&) {}
+
+	struct Config
+	{
+		char     host[64]      = {};
+		uint16_t port          = 5060;
+		char     proxyHost[64] = {};
+		uint16_t proxyPort     = 5060;
+		char     fromUser[40]  = {};
+		char     callerId[24]  = {};
+		char     authUser[64]  = {};
+		bool     enabled       = false;
+
+		bool valid() const { return false; }
+		const char* transportHost() const { return ""; }
+		uint16_t    transportPort() const { return 0; }
+	};
+
+	void setConfig(const Config&) {}
+	const Config& config() const { static const Config c{}; return c; }
+
+	static constexpr size_t kMaxSecret = 64;
+	bool setCredentials(std::string_view) { return false; }
+	bool hasCredentials() const { return false; }
+	void clearCredentials() {}
+
+	enum class State : uint8_t { Free, Trying, Proceeding, Confirmed, Terminating, Cancelling };
+#if POCKETDIAL_TRUNK_INBOUND
+	enum class Role : uint8_t { Outbound, Inbound };
+#endif
+
+	struct Dialog
+	{
+		State       state = State::Free;
+		std::string callID;
+		std::string branch;
+		std::string fromTag;
+		std::string toTag;
+		uint32_t    cseq = 1;
+		bool        exemptWitnessed = false;
+		std::string fromUser;
+		std::string domain;
+		std::string sbcIpPort;
+		std::string localIpPort;
+		std::string destE164;
+		std::string remoteTarget;
+		std::string routeSet;
+		sockaddr_in nextHop{};
+		std::string handsetCallID;
+		uint16_t    localRtpPort = 0;
+		bool        sawSessionProgress = false;
+		std::string offerSdp;
+		bool        authAttempted = false;
+		std::string challengedBranch;
+		std::string challengedToTag;
+		uint32_t    challengedCseq = 0;
+		bool        byeAuthAttempted = false;
+		bool        cancelPending = false;
+		sockaddr_in peer{};
+		std::chrono::steady_clock::time_point deadline{};
+#if POCKETDIAL_TRUNK_INBOUND
+		Role        role = Role::Outbound;
+		uint32_t    remoteCseq = 0;
+		std::string inviteFrom, inviteTo;
+		std::string inviteVias;
+		std::string inviteRecordRoute;
+		bool        ackSeen = false;
+		bool        byeAfterAck = false;
+#endif
+	};
+
+	struct TrunkEvent
+	{
+		std::string_view trunkCallID;
+		std::string_view handsetCallID;
+		uint16_t         localRtpPort = 0;
+	};
+
+	struct Listener
+	{
+		virtual ~Listener() = default;
+		virtual void onTrunkRinging(const TrunkEvent&, bool,
+			const std::shared_ptr<SipMessage>&) {}
+		virtual void onTrunkAnswered(const TrunkEvent&,
+			const std::shared_ptr<SipMessage>&) {}
+		virtual void onTrunkFailed(const TrunkEvent&, int) {}
+		virtual void onTrunkRemoteBye(const TrunkEvent&) {}
+	};
+
+	void setListener(Listener*) {}
+
+	bool placeCall(std::string_view, std::string_view,
+		const sockaddr_in&, uint16_t) { return false; }
+	bool ownsCallID(std::string_view) const { return false; }
+	bool handleResponse(const std::shared_ptr<SipMessage>&) { return false; }
+	bool handleBye(const std::shared_ptr<SipMessage>&) { return false; }
+	bool hangup(std::string_view) { return false; }
+
+#if POCKETDIAL_TRUNK_INBOUND
+	int acceptCall(const SipMessage&, std::string_view, uint16_t) { return 503; }
+	bool respond(std::string_view, int, std::string_view = {}) { return false; }
+	bool handleAck(const SipMessage&) { return false; }
+	bool handleCancel(const std::shared_ptr<SipMessage>&) { return false; }
+	static const char* reasonPhrase(int status)
+	{
+		switch (status)
+		{
+		case 100: return "Trying";
+		case 180: return "Ringing";
+		case 183: return "Session Progress";
+		case 200: return "OK";
+		case 400: return "Bad Request";
+		case 401: return "Unauthorized";
+		case 403: return "Forbidden";
+		case 404: return "Not Found";
+		case 407: return "Proxy Authentication Required";
+		case 408: return "Request Timeout";
+		case 480: return "Temporarily Unavailable";
+		case 481: return "Call/Transaction Does Not Exist";
+		case 486: return "Busy Here";
+		case 487: return "Request Terminated";
+		case 488: return "Not Acceptable Here";
+		case 500: return "Server Internal Error";
+		case 503: return "Service Unavailable";
+		default:  return "Unknown";
+		}
+	}
+#endif
+
+	bool handleInviteTimeout(std::string_view) { return false; }
+	void sweep(std::chrono::steady_clock::time_point) {}
+	void tickRegistration(uint64_t, const sockaddr_in&) {}
+	uint32_t forgedRegisterResponses() const { return 0; }
+	uint32_t forgedDialogResponses() const { return 0; }
+	uint32_t refusedDialogByes() const { return 0; }
+	uint32_t refusedByeRetries() const { return 0; }
+	size_t activeDialogs() const { return 0; }
+	void expireDeadlinesForTest() {}
+	const Dialog* findByCallID(std::string_view) const { return nullptr; }
+};
+#endif // POCKETDIAL_HAS_TRUNK
 
 #endif // SIP_TRUNK_HPP

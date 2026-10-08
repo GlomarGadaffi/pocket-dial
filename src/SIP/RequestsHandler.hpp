@@ -2478,8 +2478,8 @@ private:
 	// index (setTrunkRelaySlot), because a receiver carries no Call-ID.
 	TrunkResolver _trunkResolver;
 	SipTrunk      _sipTrunk{*this};
-	RtpReceiver   _trunkRx[POCKETDIAL_MAX_TRUNK_CALLS];
-	RtpReceiver   _handsetRx[POCKETDIAL_MAX_TRUNK_CALLS];
+	RtpReceiver   _trunkRx[POCKETDIAL_MAX_TRUNK_CALLS ? POCKETDIAL_MAX_TRUNK_CALLS : 1];
+	RtpReceiver   _handsetRx[POCKETDIAL_MAX_TRUNK_CALLS ? POCKETDIAL_MAX_TRUNK_CALLS : 1];
 
 	// Recording/staging buffer pool (see PoolConfig.hpp's
 	// POCKETDIAL_VOICEMAIL_MAX_MESSAGE_BYTES budget comment and
