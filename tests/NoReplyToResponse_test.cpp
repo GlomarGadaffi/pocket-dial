@@ -274,7 +274,10 @@ TEST(NoReplyToResponse, ParkRetrieveAckIsNeverAnsweredAndTheCallStaysUp)
 
 	EXPECT_EQ(repliesTo(sent, retriever, "Call-ID: retrieve-424", "CSeq: 1 ACK"), 0u)
 		<< "#424(b): the PBX answered an ACK";
-	EXPECT_EQ(handler.getRepliesRefused(), refusedBefore + 1) << "the guard, not luck, dropped it";
+	// #453 / PR #916: on a bridged session (such as park retrieve), the PBX as UAS
+	// absorbs the ACK directly in onAck() without attempting to reply or relay it,
+	// so the #424 fallback guard does not need to intervene.
+	EXPECT_EQ(handler.getRepliesRefused(), refusedBefore);
 
 	session = handler.getSession("Call-ID: retrieve-424");
 	ASSERT_TRUE(session.has_value()) << "the ACK must not tear the retrieved call down";
