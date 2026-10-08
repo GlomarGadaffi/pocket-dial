@@ -1910,6 +1910,10 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 	{
 		return;
 	}
+	if (handleTransferFailure(data))
+	{
+		return;
+	}
 
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
@@ -2020,6 +2024,10 @@ void RequestsHandler::onFinalFailure(std::shared_ptr<SipMessage> data)
 	// busy party; fixed to data->getToNumber() by #256. This intercept still
 	// stands regardless, for the ACK-ownership reason above.
 	if (handleBlindXferFailure(data))
+	{
+		return;
+	}
+	if (handleTransferFailure(data))
 	{
 		return;
 	}
@@ -6336,6 +6344,10 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 	{
 		return;
 	}
+	if (handleTransferFailure(data))
+	{
+		return;
+	}
 
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
@@ -6485,6 +6497,10 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 	// busy party; fixed to data->getToNumber() by #256. This intercept still
 	// stands regardless, for the ACK-ownership reason above.
 	if (handleBlindXferFailure(data))
+	{
+		return;
+	}
+	if (handleTransferFailure(data))
 	{
 		return;
 	}
@@ -8191,8 +8207,14 @@ bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
 	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string::npos) return false;
 	const std::string callID(data->getCallID());
 	auto it = std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(), callID);
-	if (it == _transferPendingAcks.end()) return false;
+	auto spliced = getSession(callID);
+
 	const uint32_t ackCseq = siphdr::cseqNumber(data->getCSeq());
+	const bool isRetransmit = (it == _transferPendingAcks.end()) &&
+		spliced.has_value() && spliced.value()->isTransferBridge() &&
+		(ackCseq != 0 && ackCseq == spliced.value()->lastSpliceAckCSeq());
+
+	if (it == _transferPendingAcks.end() && !isRetransmit) return false;
 
 	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
@@ -8212,18 +8234,18 @@ bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
 	                          // entry stays so the retransmit still lands here, not the
 	                          // generic relay below (which would forward it toward A).
 	_outbox.emplace_back(data->getSource(), std::move(ack));
-	_transferPendingAcks.erase(it);
 
-	// This 200 OK answers a re-INVITE that re-pointed a phone's media at its new
-	// peer, so whatever hold that dialog was in has just ended. A transferor's
-	// Transfer softkey holds the call before it REFERs (and a consult does the
-	// same), so the session is routinely still Held here — leaving it that way
-	// would have the dashboard, the session-timer sweep and any later resume all
-	// reasoning about a call that is in fact talking.
-	if (auto spliced = getSession(callID);
-		spliced.has_value() && spliced.value()->getState() == Session::State::Held)
+	if (!isRetransmit)
 	{
-		spliced.value()->setState(Session::State::Connected);
+		_transferPendingAcks.erase(it);
+		if (spliced.has_value())
+		{
+			spliced.value()->setLastSpliceAckCSeq(ackCseq);
+			if (spliced.value()->getState() == Session::State::Held)
+			{
+				spliced.value()->setState(Session::State::Connected);
+			}
+		}
 	}
 	return true;
 }
@@ -8454,6 +8476,60 @@ bool RequestsHandler::handleBlindXferFailure(const std::shared_ptr<SipMessage>& 
 	queueLog("REFER: blind transfer target " +
 		(leg->getDest() ? leg->getDest()->getNumber() : std::string("?")) +
 		" refused the call (" + std::string(data->getHeader()) + ") — transferee released", true);
+	return true;
+}
+
+bool RequestsHandler::handleTransferFailure(const std::shared_ptr<SipMessage>& data)
+{
+	// Non-2xx final response to a splice re-INVITE (issue #719). Claimed ahead of
+	// the normal session failure paths because the server generated the splice
+	// re-INVITE and owes the ACK (RFC 3261 §17.1.1.3). Without this, the callee's
+	// rejection (e.g. 488, 486) goes unACKed and retransmits until Timer H.
+	// Furthermore, the transferor is already gone, so tear down the bridge leg(s)
+	// cleanly so the surviving peer is not stranded.
+	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string::npos) return false;
+	const std::string callID(data->getCallID());
+	auto it = std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(), callID);
+	if (it == _transferPendingAcks.end()) return false;
+	_transferPendingAcks.erase(it);
+
+	ackForwardedFinal(data);
+
+	auto sessionOpt = getSession(callID);
+	if (!sessionOpt.has_value()) return true;
+	auto session = sessionOpt.value();
+
+	const std::string peerId = session->getPeerCallID();
+	if (!peerId.empty())
+	{
+		if (auto peerOpt = getSession(peerId); peerOpt.has_value())
+		{
+			auto peerSess = peerOpt.value();
+			const bool peerAIsSrc = peerSess->wasTransferorSrc();
+			auto survivor = peerAIsSrc ? peerSess->getDest() : peerSess->getSrc();
+			if (survivor && !peerSess->getDialogFrom().empty() && !peerSess->getDialogTo().empty())
+			{
+				const std::string& peerAHdr     = peerAIsSrc ? peerSess->getDialogFrom() : peerSess->getDialogTo();
+				const std::string& peerOtherHdr = peerAIsSrc ? peerSess->getDialogTo()   : peerSess->getDialogFrom();
+				const uint32_t byeCSeq = peerSess->nextServerCSeq();
+				auto bye = buildServerBye(survivor->getNumber(), survivor->getAddress(),
+					peerId, peerAHdr, peerOtherHdr, byeCSeq);
+				if (bye) _outbox.emplace_back(survivor->getAddress(), std::move(bye));
+				peerSess->noteServerCSeq(byeCSeq);
+			}
+			endCall(peerId,
+				peerSess->getSrc() ? peerSess->getSrc()->getNumber() : std::string(),
+				peerSess->getDest() ? peerSess->getDest()->getNumber() : std::string(),
+				"transfer splice peer refused");
+		}
+	}
+	endCall(callID,
+		session->getSrc() ? session->getSrc()->getNumber() : std::string(),
+		session->getDest() ? session->getDest()->getNumber() : std::string(),
+		"transfer splice re-INVITE refused");
+
+	queueLog("REFER: splice re-INVITE refused (" + std::string(data->getHeader()) +
+		") — bridge torn down", true);
 	return true;
 }
 

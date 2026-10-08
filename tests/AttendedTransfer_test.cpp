@@ -575,6 +575,86 @@ TEST(AttendedTransfer, SpliceReinviteOkIsAckedNotRelayedToA)
 		<< "nothing should be sent to A once the splice has completed";
 }
 
+// Retransmitted 200 OK to the splice re-INVITE (issue #719):
+// B sends 200 OK, receives ACK. B retransmits the same 200 OK.
+// The retransmitted 200 OK must be re-ACKed directly to B and must NOT be
+// forwarded to A (who is already dropped and sent BYE).
+TEST(AttendedTransfer, RetransmittedSplice200OkIsReAckedAndNotRelayedToA)
+{
+	Rig rig;
+	setUpSplicedCalls(rig);
+	sendAttendedRefer(rig);
+
+	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 3 INVITE");
+	ASSERT_FALSE(invToB.empty());
+	std::string fromLine = extractHeaderLine(invToB, "From:");
+	std::string toLine = extractHeaderLine(invToB, "To:");
+	std::string via = extractHeaderLine(invToB, "Via:");
+
+	rig.sent.clear();
+	std::string body = sdpBody("192.168.40.20", 20001);
+	std::string raw200 =
+		"SIP/2.0 200 OK\r\n" + via + "\r\n" + fromLine + "\r\n" + toLine + "\r\n"
+		"Call-ID: " + rig.abCallId + "\r\n"
+		"CSeq: 3 INVITE\r\n"
+		"Contact: <sip:106@192.168.40.20:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+
+	// First 200 OK
+	rig.handler->handle(RequestsHandler::getMessageFromPool(raw200, rig.bAddr));
+	EXPECT_FALSE(findSentTo(rig.sent, rig.bAddr, "ACK sip:").empty())
+		<< "B's first splice-reinvite 200 OK must be ACKed";
+	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u)
+		<< "nothing should be sent to A on initial 200 OK";
+
+	// Retransmitted 200 OK
+	rig.sent.clear();
+	rig.handler->handle(RequestsHandler::getMessageFromPool(raw200, rig.bAddr));
+	EXPECT_FALSE(findSentTo(rig.sent, rig.bAddr, "ACK sip:").empty())
+		<< "B's retransmitted splice-reinvite 200 OK must be re-ACKed";
+	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u)
+		<< "retransmitted 200 OK must not be relayed toward dropped party A";
+}
+
+// Splice re-INVITE non-2xx failure (issue #719):
+// If B rejects the splice re-INVITE with 488 Not Acceptable Here (or 486 Busy),
+// the server must ACK the 488 (RFC 3261 §17.1.1.3), tear down the bridge,
+// and send a BYE to the peer leg (C) so C is not stranded with nobody on the call.
+TEST(AttendedTransfer, SpliceReinviteFailureIsAckedAndTearsDownBridge)
+{
+	Rig rig;
+	setUpSplicedCalls(rig);
+	sendAttendedRefer(rig);
+
+	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 3 INVITE");
+	ASSERT_FALSE(invToB.empty());
+	std::string fromLine = extractHeaderLine(invToB, "From:");
+	std::string toLine = extractHeaderLine(invToB, "To:");
+	std::string via = extractHeaderLine(invToB, "Via:");
+
+	rig.sent.clear();
+	std::string raw488 =
+		"SIP/2.0 488 Not Acceptable Here\r\n" + via + "\r\n" + fromLine + "\r\n" + toLine + "\r\n"
+		"Call-ID: " + rig.abCallId + "\r\n"
+		"CSeq: 3 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+
+	rig.handler->handle(RequestsHandler::getMessageFromPool(raw488, rig.bAddr));
+
+	// B's 488 must be ACKed directly
+	EXPECT_FALSE(findSentTo(rig.sent, rig.bAddr, "ACK sip:").empty())
+		<< "B's 488 failure must be ACKed so B does not retransmit until Timer H";
+
+	// C must receive a BYE because B rejected the splice
+	EXPECT_FALSE(findSentTo(rig.sent, rig.cAddr, "BYE sip:").empty())
+		<< "peer leg C must receive a BYE when splice re-INVITE to B fails";
+
+	// Nothing sent to A (already dropped)
+	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u)
+		<< "nothing should be sent to dropped party A";
+}
+
 // (c) B hangs up -> C gets a correctly-tagged BYE; A gets nothing (A is gone).
 TEST(AttendedTransfer, PostSpliceByeFromOneLegRelaysToTheOtherNotToA)
 {
