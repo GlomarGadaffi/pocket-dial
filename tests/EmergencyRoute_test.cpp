@@ -210,30 +210,27 @@ TEST(EmergencyRoute, TheRefusalSaysThatNoRouteIsConfigured)
 		<< "a 911 refusal must never tell the handset to back off";
 }
 
-TEST(EmergencyRoute, WithATrunkConfiguredTheCallGoesToTheCarrierAndNotTheLoopback)
+TEST(EmergencyRoute, WithATrunkConfiguredA911StillNeverGoesToTheCarrier)
 {
+	// desmo, 2026-10-08: no 911/933 over a real SIP trunk, ever. A configured trunk
+	// is not a route: the caller is refused, and no relay pair is held for it.
 	Bench b;
 	b.handler->setTrunkConfig(trunkConfig());
 
 	b.handler->handle(makeInvite("911", "er-trunk-911"));
 
-	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
-		<< "the carrier must be sent exactly one INVITE for the bare 911:\n" << b.dump();
-	EXPECT_EQ(b.count("INVITE sip:+911"), 0u)
-		<< "\"+911\" is country code 91, not an emergency number";
-	EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u)
-		<< "the caller is told the call is progressing:\n" << b.dump();
-	EXPECT_EQ(b.count("SIP/2.0 503"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:", kSbcIp), 0u)
+		<< "the carrier must never be sent a 911:\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
 	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "")
-		<< "the simulator must not see the call even when a trunk carries it";
-	EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 1u)
-		<< "the relay pair that will carry the caller's audio is held";
+		<< "the simulator must not see the call either";
+	EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 0u)
+		<< "no relay pair is held for a 911 the trunk never carries";
 }
 
-TEST(EmergencyRoute, TheTrunkIsHandedTheBareNumberWhateverWasDialed)
+TEST(EmergencyRoute, NoEmergencyNumberIsEverHandedToTheTrunkWhateverWasDialed)
 {
-	for (const auto& [dialed, bare] : std::vector<std::pair<std::string, std::string>>{
-		{"9911", "911"}, {"933", "933"}, {"9933", "933"}})
+	for (const auto& dialed : std::vector<std::string>{"9911", "933", "9933"})
 	{
 		SCOPED_TRACE(dialed);
 		Bench b;
@@ -241,10 +238,8 @@ TEST(EmergencyRoute, TheTrunkIsHandedTheBareNumberWhateverWasDialed)
 
 		b.handler->handle(makeInvite(dialed, "er-trunk-" + dialed));
 
-		EXPECT_EQ(b.count("INVITE sip:" + bare + "@" + std::string(kSbcIp), kSbcIp), 1u)
-			<< b.dump();
-		EXPECT_EQ(b.count("INVITE sip:" + dialed + "@"), dialed == bare ? 1u : 0u)
-			<< "the prefixed form must never reach the carrier";
+		EXPECT_EQ(b.count("INVITE sip:", kSbcIp), 0u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
 	}
 }
 
@@ -275,10 +270,9 @@ TEST(EmergencyRoute, ADialRuleCannotHandTheLoopbackAnEmergencyNumber)
 
 TEST(EmergencyRoute, ADialRuleThatProducesAnEmergencyNumberTakesTheEmergencyPath)
 {
-	// #538 review M2: pstnUri() sends 911 bare, so on a trunk board a rule
-	// rewriting 0 to 911 places a REAL 911. It must be the emergency path's 911:
-	// logged, and the front desk notified. Before the fix it was a plain trunk
-	// call with no notification at all.
+	// #538 review M2: pstnUri() sends 911 bare, so a rule rewriting 0 to 911 must
+	// take the emergency path (logged, front desk notified), never a plain trunk
+	// call. desmo, 2026-10-08: and never the trunk at all, so it is refused.
 	Bench b;
 	b.handler->handle(makeRegister("200", "192.168.79.20"));   // front desk
 	b.handler->setE911Config("200", "", "");
@@ -288,10 +282,11 @@ TEST(EmergencyRoute, ADialRuleThatProducesAnEmergencyNumberTakesTheEmergencyPath
 
 	b.handler->handle(makeInvite("0", "er-rule-trunk-911"));
 
-	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:", kSbcIp), 0u) << b.dump();
 	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u)
 		<< "the front desk must hear about a 911 however it was dialed:\n" << b.dump();
-	EXPECT_TRUE(b.saw("ROUTED TO TRUNK")) << b.dump();
+	EXPECT_TRUE(b.saw("NOT ROUTED")) << b.dump();
+	EXPECT_FALSE(b.saw("ROUTED TO TRUNK")) << b.dump();
 	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "");
 }
 
@@ -336,8 +331,10 @@ TEST(EmergencyRoute, ARuleProducedEmergencyCallGetsTheHeaderGateYieldAndAnOrdina
 			b.handler->setTrunkConfig(trunkConfig());
 			b.handler->setDialRule("0", "trunk", "911", 1);
 			b.handler->handle(makeGatedInvite("0", "er-834-911", s.extra, s.secondAudio));
-			EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
-				<< "a rule-produced 911 must reach the carrier:\n" << b.dump();
+			EXPECT_EQ(b.count("INVITE sip:", kSbcIp), 0u)
+				<< "a rule-produced 911 never reaches the trunk:\n" << b.dump();
+			EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u)
+				<< "it takes the emergency path, which refuses with no anchor:\n" << b.dump();
 			EXPECT_EQ(b.count(s.refusal), 0u) << b.dump();
 		}
 		{
@@ -367,30 +364,27 @@ TEST(EmergencyRoute, ARuleProducedEmergencyCallGetsTheHeaderGateYieldAndAnOrdina
 // B. What #521 added.
 // ═════════════════════════════════════════════════════════════════════════════
 
-TEST(EmergencyRoute, TheReportedRouteIsNoneUntilARealProviderOrATrunkExists)
+TEST(EmergencyRoute, TheReportedRouteIsNoneUntilARealProviderExists)
 {
 	Bench b;
 	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::None)
 		<< "the loopback simulator is not a route";
 
 	b.handler->setTrunkConfig(trunkConfig());
-	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::TrunkUnverified)
-		<< "#546: configured, but no call has proved it yet";
+	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::None)
+		<< "desmo, 2026-10-08: a configured SIP trunk is never a 911 route";
 
 	b.handler->setAnchorPlacesRealCallsForTest(true);
 	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::Anchor)
-		<< "a real anchor is tried first; the trunk is its fallback";
+		<< "the real anchor is the only route";
 
 	b.handler->setAnchorPlacesRealCallsForTest(false);
 	b.handler->setTrunkConfig(SipTrunk::Config{});
 	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::None)
-		<< "clearing the trunk takes the route away again";
+		<< "dropping the anchor leaves no route";
 
 	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::None), "none");
 	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::Anchor), "anchor");
-	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::Trunk), "trunk");
-	EXPECT_STREQ(RequestsHandler::emergencyRouteName(RequestsHandler::EmergencyRoute::TrunkUnverified),
-		"trunk-unverified");
 }
 
 TEST(EmergencyRoute, OnlyTheTelephonyApiProviderPlacesRealCalls)
@@ -416,8 +410,10 @@ TEST(EmergencyRoute, ARealAnchorTakesTheCallAheadOfTheTrunk)
 		<< "and the carrier is not ALSO sent the call:\n" << b.dump();
 }
 
-TEST(EmergencyRoute, ARealAnchorThatIsDownFallsBackToTheTrunk)
+TEST(EmergencyRoute, ARealAnchorThatIsDownNeverFallsBackToTheTrunk)
 {
+	// desmo, 2026-10-08: a down anchor refuses the 911 with 503. It is not handed
+	// to a configured trunk, even a working one.
 	Bench b;
 	b.handler->setTrunkConfig(trunkConfig());
 	b.handler->setAnchorPlacesRealCallsForTest(true);
@@ -426,13 +422,12 @@ TEST(EmergencyRoute, ARealAnchorThatIsDownFallsBackToTheTrunk)
 
 	b.handler->handle(makeInvite("911", "er-fallback"));
 
-	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
-		<< "a down anchor must not strand a 911 call a working trunk could carry:\n"
-		<< b.dump();
-	EXPECT_EQ(b.count("SIP/2.0 503"), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:", kSbcIp), 0u)
+		<< "a 911 never goes out over the trunk:\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
 }
 
-TEST(EmergencyRoute, ARealAnchorThatIsDownWithNoTrunkSaysSo)
+TEST(EmergencyRoute, ARealAnchorThatIsDownSaysSo)
 {
 	Bench b;
 	b.handler->setAnchorPlacesRealCallsForTest(true);
@@ -441,7 +436,7 @@ TEST(EmergencyRoute, ARealAnchorThatIsDownWithNoTrunkSaysSo)
 	b.handler->handle(makeInvite("911", "er-down"));
 
 	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
-	EXPECT_TRUE(b.saw("no outbound trunk connected"))
+	EXPECT_TRUE(b.saw("the 3CX anchor could not place the call"))
 		<< "a configured provider that is down is not \"no route configured\"";
 	EXPECT_FALSE(b.saw("no emergency route configured")) << b.dump();
 }
@@ -461,28 +456,27 @@ TEST(EmergencyRoute, ACodecRejectedOfferIsNotRetriedOnTheTrunk)
 	EXPECT_EQ(b.count("INVITE sip:"), 0u) << b.dump();
 }
 
-TEST(EmergencyRoute, ATrunkOnlyBoardRefusesAnOfferItCannotRelay)
+TEST(EmergencyRoute, ATrunkOnlyBoardRefusesA911WithTheNoRouteReason)
 {
-	// #538 review M1: the anchor's codec gate never runs on a trunk-only board,
-	// and onTrunkAnswered answers PCMU whatever was offered. Without a gate of its
-	// own the trunk connected a PCMA-only 911 with dead audio.
+	// desmo, 2026-10-08: a trunk-only board has no 911 route. The codec gate that
+	// the trunk branch used to carry went with it: the refusal says there is no
+	// route, and nothing is handed to the carrier.
 	Bench b;
 	b.handler->setTrunkConfig(trunkConfig());
 
 	b.handler->handle(makeInvite("911", "er-trunk-pcma", /*payloadType=*/8));
 
 	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
-	EXPECT_TRUE(b.saw("no G.711 codec offered")) << b.dump();
-	EXPECT_EQ(b.count("INVITE sip:"), 0u)
-		<< "the carrier must not be sent a call the handset cannot hear:\n" << b.dump();
+	EXPECT_TRUE(b.saw("no emergency route configured")) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:", kSbcIp), 0u)
+		<< "the carrier must not be sent a 911:\n" << b.dump();
 	EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 0u);
 }
 
-TEST(EmergencyRoute, TheFrontDeskIsToldTheTrunkTookTheCall)
+TEST(EmergencyRoute, TheFrontDeskIsToldATrunkNeverTakesA911)
 {
-	// Kari's Law notification (#166) reports whether the call was ROUTED. On
-	// the trunk path that is placeSipTrunkCall()'s placedOut, which only the
-	// path that hands the call to the carrier sets.
+	// Kari's Law notification (#166) reports whether the call was ROUTED. With no
+	// anchor there is no route, so the front desk is told NOT ROUTED.
 	Bench b;
 	b.handler->handle(makeRegister("200", "192.168.79.20"));   // front desk
 	b.handler->setE911Config("200", "", "");
@@ -492,8 +486,8 @@ TEST(EmergencyRoute, TheFrontDeskIsToldTheTrunkTookTheCall)
 	b.handler->handle(makeInvite("911", "er-notify-trunk"));
 
 	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
-	EXPECT_TRUE(b.saw("ROUTED TO TRUNK")) << b.dump();
-	EXPECT_FALSE(b.saw("NOT ROUTED")) << b.dump();
+	EXPECT_TRUE(b.saw("NOT ROUTED")) << b.dump();
+	EXPECT_FALSE(b.saw("ROUTED TO TRUNK")) << b.dump();
 }
 
 TEST(EmergencyRoute, TheFrontDeskIsToldALoopbackOnlyBoardDidNotRouteIt)
@@ -527,8 +521,10 @@ TEST(EmergencyRoute, BootingWithNoRouteLogsAWarning)
 	TrunkConfigStore::resetForTest();
 }
 
-TEST(EmergencyRoute, BootingWithAStoredTrunkLogsNoWarning)
+TEST(EmergencyRoute, BootingWithAStoredTrunkStillWarnsBecauseItIsNoRoute)
 {
+	// desmo, 2026-10-08: a stored trunk is not a 911 route, so the board with only
+	// a trunk is unconfigured for emergencies and must say so at boot.
 	TrunkConfigStore::resetForTest();
 	TrunkConfigStore::Config stored;
 	stored.host = kSbcIp;
@@ -542,10 +538,9 @@ TEST(EmergencyRoute, BootingWithAStoredTrunkLogsNoWarning)
 	b.handler->tick();
 	const std::string log = testing::internal::GetCapturedStderr();
 
-	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::TrunkUnverified)
-		<< "#546: a stored trunk is configured, not yet proved";
-	EXPECT_EQ(log.find("EMERGENCY CALLING IS NOT CONFIGURED"), std::string::npos)
-		<< "a board that can reach 911 must not cry wolf:\n" << log;
+	EXPECT_EQ(b.handler->emergencyRoute(), RequestsHandler::EmergencyRoute::None);
+	EXPECT_NE(log.find("WARN: EMERGENCY CALLING IS NOT CONFIGURED"), std::string::npos)
+		<< "the trunk is not a route, so the boot log must say 911 is refused:\n" << log;
 	TrunkConfigStore::resetForTest();
 }
 
@@ -597,8 +592,8 @@ TEST(EmergencyRoute, StatusReportsTheRouteWithoutASession)
 		<< "the dashboard banner keys on this, and it must not need a login";
 
 	b.handler->setTrunkConfig(trunkConfig());
-	EXPECT_NE(httpGet(kPort, "/api/status").find("\"emergencyRoute\":\"trunk-unverified\""), std::string::npos)
-		<< "#546: no carrier 2xx yet";
+	EXPECT_NE(httpGet(kPort, "/api/status").find("\"emergencyRoute\":\"none\""), std::string::npos)
+		<< "desmo, 2026-10-08: a configured trunk is still no 911 route";
 
 	b.handler->setAnchorPlacesRealCallsForTest(true);
 	EXPECT_NE(httpGet(kPort, "/api/status").find("\"emergencyRoute\":\"anchor\""), std::string::npos);
@@ -627,23 +622,19 @@ TEST(EmergencyRoute, TheDashboardShowsTheBannerWhileTheRouteIsNone)
 	EXPECT_NE(page.find("d.emergencyRoute===\"none\""), std::string::npos);
 }
 
-TEST(EmergencyRoute, TheDashboardWarnsWhileTheTrunkRouteIsUnverified)
+TEST(EmergencyRoute, TheDashboardHasNoTrunkRouteBannerAnymore)
 {
-	// #546: the unverified banner exists, starts hidden, and the status poll's
-	// applyEmergencyRoute() shows it for exactly "trunk-unverified".
+	// desmo, 2026-10-08: a trunk is never a 911 route, so there is no "trunk
+	// unverified" state for the dashboard to warn about.
 	std::string page;
 	for (const auto& part : CGA_INDEX_HTML_PARTS) page.append(part.data, part.size);
 
-	const size_t banner = page.find("id=\"e911-unverified-banner\"");
-	ASSERT_NE(banner, std::string::npos) << "no unverified-route banner on the dashboard";
-	const size_t tagEnd = page.find('>', banner);
-	EXPECT_NE(page.substr(banner, tagEnd - banner).find("display:none"), std::string::npos);
-
+	EXPECT_EQ(page.find("id=\"e911-unverified-banner\""), std::string::npos)
+		<< "the unverified-trunk banner must be gone";
 	const size_t fn = page.find("function applyEmergencyRoute(d){");
 	ASSERT_NE(fn, std::string::npos);
 	const std::string body = page.substr(fn, page.find("\n}\n", fn) - fn);
-	EXPECT_NE(body.find("e911-unverified-banner"), std::string::npos) << body;
-	EXPECT_NE(body.find("d.emergencyRoute===\"trunk-unverified\""), std::string::npos) << body;
+	EXPECT_EQ(body.find("trunk-unverified"), std::string::npos) << body;
 }
 
 TEST(EmergencyRoute, TheE911BannerDefersToTheRouteBannerWhileTheRouteIsNone)
@@ -1149,7 +1140,7 @@ TEST(EmergencyRoute, AMultipartEmergencyInviteCarryingLocationIsRoutedNotRefused
 	{
 		SCOPED_TRACE(dialed);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		const std::string number(dialed);
 		b.handler->handle(makeShapedInvite("sip:" + number + "@server", "sip:" + number + "@server",
 			"multipart/mixed; boundary=pdloc1",
@@ -1159,9 +1150,9 @@ TEST(EmergencyRoute, AMultipartEmergencyInviteCarryingLocationIsRoutedNotRefused
 		EXPECT_EQ(b.count("SIP/2.0 488"), 0u) << "the emergency offer was refused:\n" << b.dump();
 		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
 		EXPECT_EQ(b.count("SIP/2.0 5"), 0u) << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:" + number + "@" + kSbcIp, kSbcIp), 1u)
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), number)
 			<< "the carrier gets exactly one INVITE for the bare number:\n" << b.dump();
-		EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << b.dump();
 		EXPECT_FALSE(b.saw("pdloc1")) << "the MIME boundary must not reach the carrier's offer";
 	}
 
@@ -1173,12 +1164,12 @@ TEST(EmergencyRoute, AMultipartEmergencyInviteCarryingLocationIsRoutedNotRefused
 	{
 		SCOPED_TRACE(s.callId);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		b.handler->handle(makeShapedInvite("sip:911@server", "sip:911@server", s.contentType, "", s.body, s.callId));
 
 		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
 		EXPECT_EQ(b.count("SIP/2.0 5"), 0u) << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
 		EXPECT_FALSE(b.saw(s.boundary)) << "the MIME boundary must not reach the carrier's offer";
 	}
 }
@@ -1256,14 +1247,14 @@ TEST(EmergencyRoute, ATelUriOrTestServiceUrnEmergencyInviteIsRoutedNotRefused)
 	{
 		SCOPED_TRACE(s.uri);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		b.handler->handle(makeShapedInvite(s.uri, s.uri, "application/sdp", "", kSdpOffer,
 			std::string("er-uri-") + s.bare + std::to_string(std::string(s.uri).size())));
 
 		EXPECT_EQ(b.count("SIP/2.0 400"), 0u) << "the emergency URI was refused:\n" << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:" + std::string(s.bare) + "@" + kSbcIp, kSbcIp), 1u)
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), std::string(s.bare))
 			<< "the carrier gets exactly one INVITE for the bare number:\n" << b.dump();
-		EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << b.dump();
 	}
 }
 
@@ -1271,13 +1262,13 @@ TEST(EmergencyRoute, ATelUriEmergencyCallIsStillEndedByItsCancel)
 {
 	// tel:911 now reads as 911 for every request on the dialog. The handset's
 	// CANCEL (same Request-URI and To as its INVITE, RFC 3261 s9.1) still ends
-	// the call exactly once: 200 to the CANCEL, 487 to the INVITE, a CANCEL to
-	// the carrier, and no session left.
+	// the call: 200 to the CANCEL and no session left. The anchor answered the
+	// INVITE synchronously, so there is no carrier leg to cancel or 487.
 	Bench b;
-	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->setAnchorPlacesRealCallsForTest(true);
 	b.handler->handle(makeShapedInvite("tel:911", "tel:911", "application/sdp", "", kSdpOffer,
 		"er-tel-cancel"));
-	ASSERT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+	ASSERT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
 	b.handler->handle(carrierRinging(b, "911"));
 	b.sent.clear();
 
@@ -1292,9 +1283,6 @@ TEST(EmergencyRoute, ATelUriEmergencyCallIsStillEndedByItsCancel)
 		"Content-Length: 0\r\n\r\n", addrFor(kHandsetIp)));
 
 	EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << "the CANCEL itself:\n" << b.dump();
-	EXPECT_EQ(b.count("SIP/2.0 487", kHandsetIp), 1u) << "the handset's INVITE:\n" << b.dump();
-	EXPECT_EQ(b.count("CANCEL sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
-		<< "the carrier leg is cancelled:\n" << b.dump();
 	EXPECT_FALSE(b.handler->getSession("Call-ID: er-tel-cancel").has_value());
 }
 
@@ -1367,7 +1355,7 @@ TEST(EmergencyRoute, ATelUriInADisplayNameOrAParameterIsNotAnEmergency)
 	{
 		SCOPED_TRACE(to);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		auto invite = makeInviteWithToValue("tel:+15551230100", to, "application/sdp", "", kSdpOffer, "er-dn");
 		EXPECT_EQ(invite->getToNumber(), "");
 		b.handler->handle(invite);
@@ -1383,13 +1371,13 @@ TEST(EmergencyRoute, ATelUriInADisplayNameOrAParameterIsNotAnEmergency)
 	{
 		SCOPED_TRACE(to);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		auto invite = makeInviteWithToValue("tel:911", to, "application/sdp", "", kSdpOffer, "er-dn-911");
 		EXPECT_EQ(invite->getToNumber(), "911");
 		b.handler->handle(invite);
 
 		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
 	}
 
 	// The Request-URI goes through the same reader, from a start line.
@@ -1408,16 +1396,16 @@ TEST(EmergencyRoute, ATrunkPrefixedTelUriIsAnEmergencyAsItsSipUriIs)
 	{
 		SCOPED_TRACE(s.uri);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		auto invite = makeShapedInvite(s.uri, s.uri, "application/sdp", "", kSdpOffer, "er-tel-prefixed");
 		EXPECT_EQ(invite->getToNumber(), std::string(s.uri).substr(4));
 		EXPECT_EQ(invite->getRequestUriUser(), std::string(s.uri).substr(4));
 		b.handler->handle(invite);
 
 		EXPECT_EQ(b.count("SIP/2.0 400"), 0u) << "the emergency URI was refused:\n" << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:" + std::string(s.bare) + "@" + kSbcIp, kSbcIp), 1u)
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), std::string(s.bare))
 			<< "the carrier gets exactly one INVITE for the bare number:\n" << b.dump();
-		EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << b.dump();
 	}
 
 	// Control: one trunk digit only, and only before 911 or 933.
@@ -1425,7 +1413,7 @@ TEST(EmergencyRoute, ATrunkPrefixedTelUriIsAnEmergencyAsItsSipUriIs)
 	{
 		SCOPED_TRACE(uri);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		b.handler->handle(makeShapedInvite(uri, uri, "application/sdp", "", kSdpOffer, "er-tel-notem"));
 		EXPECT_EQ(b.count("SIP/2.0 400", kHandsetIp), 1u) << b.dump();
 		EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
@@ -1487,12 +1475,12 @@ namespace
 		EXPECT_EQ(u.wire.find("ns:pidf"), std::string::npos) << "the location part is dropped";
 
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		b.handler->handle(makeShapedInvite("sip:911@server", "sip:911@server", contentType, "", body, callId));
 		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
 		EXPECT_EQ(b.count("SIP/2.0 5"), 0u) << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
-		EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u) << b.dump();
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 200", kHandsetIp), 1u) << "the anchor answered:\n" << b.dump();
 		EXPECT_FALSE(b.saw(boundary)) << "the MIME boundary must not reach the carrier";
 		EXPECT_FALSE(b.saw("ns:pidf")) << "nor the location part";
 	}
@@ -1689,13 +1677,13 @@ TEST(EmergencyRoute, AnEmergencyUriIsRoutedWhateverItsDisplayNameSays)
 	{
 		SCOPED_TRACE(s.to);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		auto invite = makeInviteWithToValue(s.ruri, s.to, "application/sdp", "", kSdpOffer, "er-824-real");
 		EXPECT_EQ(invite->getToNumber(), s.user);
 		b.handler->handle(invite);
 
 		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << "the emergency call was refused:\n" << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:" + std::string(s.bare) + "@" + kSbcIp, kSbcIp), 1u)
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), std::string(s.bare))
 			<< "the carrier gets exactly one INVITE for the bare number:\n" << b.dump();
 	}
 }
@@ -1712,7 +1700,7 @@ TEST(EmergencyRoute, AnSosUrnInADisplayNameOrAParameterIsNotAnEmergency)
 	{
 		SCOPED_TRACE(to);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		auto invite = makeInviteWithToValue("tel:+15551230100", to, "application/sdp", "", kSdpOffer, "er-824-urn");
 		EXPECT_EQ(invite->getToNumber(), "");
 		b.handler->handle(invite);
@@ -1727,14 +1715,14 @@ TEST(EmergencyRoute, AnSosUrnInADisplayNameOrAParameterIsNotAnEmergency)
 	{
 		SCOPED_TRACE(to);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		auto invite = makeInviteWithToValue("urn:service:sos", to, "application/sdp", "", kSdpOffer, "er-824-sos");
 		EXPECT_EQ(invite->getToNumber(), "911");
 		EXPECT_EQ(invite->getRequestUriUser(), "911");
 		b.handler->handle(invite);
 
 		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
 	}
 }
 
@@ -1756,7 +1744,7 @@ TEST(EmergencyRoute, A911RequestUriOverAnExtensionToGetsNoEmergencyYield)
 	{
 		SCOPED_TRACE(s.what);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		b.handler->handle(makeRegister("102", "192.168.79.12"));
 		b.sent.clear();
 
@@ -1774,13 +1762,13 @@ TEST(EmergencyRoute, A911RequestUriOverAnExtensionToGetsNoEmergencyYield)
 	// Control: a To of 911 is the call onInvite routes to the PSAP, so it keeps
 	// the yield whatever the Request-URI says.
 	Bench b;
-	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->setAnchorPlacesRealCallsForTest(true);
 	auto invite = makeShapedInvite("sip:102@server", "sip:911@server", "application/sdp", "Require: 100rel\r\n",
 		kSdpOffer, "er-824-to911");
 	EXPECT_TRUE(invite->isEmergencyRequest());
 	b.handler->handle(invite);
 	EXPECT_EQ(b.count("SIP/2.0 420"), 0u) << b.dump();
-	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
 }
 
 TEST(EmergencyRoute, AnUnbalancedQuoteInTheCallersDisplayNameStillIdentifiesTheCaller)
@@ -1808,7 +1796,7 @@ TEST(EmergencyRoute, AnUnbalancedQuoteInTheCallersDisplayNameStillIdentifiesTheC
 	};
 
 	Bench b;
-	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->setAnchorPlacesRealCallsForTest(true);
 	b.handler->handle(makeRegister("200", "192.168.79.20"));   // front desk
 	b.handler->setE911Config("200", "", "");
 	b.sent.clear();
@@ -1835,7 +1823,7 @@ TEST(EmergencyRoute, AnUnbalancedQuoteInTheCallersDisplayNameStillIdentifiesTheC
 
 	b.handler->handle(oddInvite("911", "er-odd-911"));
 	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
 		<< "the 911 reaches the carrier:\n" << b.dump();
 	EXPECT_EQ(b.count("MESSAGE sip:200@"), 1u) << "Kari's Law: the front desk is told:\n" << b.dump();
 }
@@ -1849,13 +1837,13 @@ TEST(EmergencyRoute, AnUnbalancedQuoteInTheToDisplayNameFallsBackToTheLastUri)
 	{
 		SCOPED_TRACE(to);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		auto invite = makeInviteWithToValue("sip:911@x", to, "application/sdp", "", kSdpOffer, "er-odd-to");
 		EXPECT_EQ(invite->getToNumber(), "911");
 		b.handler->handle(invite);
 
 		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
 	}
 }
 
@@ -1870,21 +1858,21 @@ TEST(EmergencyRoute, AnUppercaseOrSipsSchemeIsReadAsSip)
 	{
 		SCOPED_TRACE(s.uri);
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		auto invite = makeShapedInvite(s.uri, s.uri, "application/sdp", "", kSdpOffer, "er-scheme");
 		EXPECT_EQ(invite->getToNumber(), s.user);
 		EXPECT_EQ(invite->getRequestUriUser(), s.user);
 		b.handler->handle(invite);
 
 		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:" + std::string(s.user) + "@" + kSbcIp, kSbcIp), 1u) << b.dump();
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), std::string(s.user)) << b.dump();
 	}
 
 	// Control: an extension so written is still that extension. Since #754
 	// (#773) the relayed INVITE is addressed at 102's registered Contact, so it
 	// is matched on that, sip:102@<its address>, sent to 102's address.
 	Bench b;
-	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->setAnchorPlacesRealCallsForTest(true);
 	b.handler->handle(makeRegister("102", "192.168.79.12"));
 	b.sent.clear();
 	b.handler->handle(makeShapedInvite("SIP:102@server", "SIP:102@server", "application/sdp", "", kSdpOffer,
@@ -1904,7 +1892,7 @@ TEST(EmergencyRoute, AStrayQuoteBeforeASecondBracketStillIdentifiesTheCaller)
 	const std::string ip105 = "192.168.79.15";
 	const std::string from = "From: \"Lobby 55\" <A> TV\" <sip:105@server>;tag=odd105b\r\n";
 	Bench b;
-	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->setAnchorPlacesRealCallsForTest(true);
 	b.sent.clear();
 
 	auto reg = RequestsHandler::getMessageFromPool(
@@ -1934,7 +1922,7 @@ TEST(EmergencyRoute, AStrayQuoteBeforeASecondBracketStillIdentifiesTheCaller)
 		"Content-Type: application/sdp\r\n"
 		"Content-Length: " + std::to_string(kSdpOffer.size()) + "\r\n\r\n" + kSdpOffer, addrFor(ip105)));
 	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
 		<< "the 911 reaches the carrier:\n" << b.dump();
 }
 
@@ -1960,13 +1948,13 @@ TEST(EmergencyRoute, AStrayQuoteAfterTheUriKeepsTheFirstUri)
 	// #835 control: the open quote is in a parameter after the URI. The first
 	// <...>, followed only by parameters, stays the URI: this 911 routes.
 	Bench b;
-	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->setAnchorPlacesRealCallsForTest(true);
 	auto invite = makeInviteWithToValue("sip:911@server", "<sip:911@server>;x=\"<sip:102@h>",
 		"application/sdp", "", kSdpOffer, "er-835-after");
 	EXPECT_EQ(invite->getToNumber(), "911");
 	b.handler->handle(invite);
 	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
 
 	// And an open quote with no <...> at all names no URI, as before.
 	EXPECT_EQ(makeInviteWithToValue("sip:911@server", "\"sip:911@lobby", "application/sdp", "", kSdpOffer,
@@ -1994,7 +1982,7 @@ TEST(EmergencyRoute, AStrayQuoteAfterTheToUriKeepsTheEmergencyNumber)
 		{
 			SCOPED_TRACE(std::string(to) + " / " + v.what);
 			Bench b;
-			b.handler->setTrunkConfig(trunkConfig());
+			b.handler->setAnchorPlacesRealCallsForTest(true);
 			b.handler->handle(makeRegister("102", "192.168.79.12"));
 			b.sent.clear();
 
@@ -2005,7 +1993,7 @@ TEST(EmergencyRoute, AStrayQuoteAfterTheToUriKeepsTheEmergencyNumber)
 
 			EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
 			EXPECT_EQ(b.count("SIP/2.0 5"), 0u) << b.dump();
-			EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+			EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
 				<< "the 911 reaches the carrier:\n" << b.dump();
 			EXPECT_EQ(b.count("INVITE sip:15551234567@"), 0u) << b.dump();
 			EXPECT_EQ(b.count("INVITE", "192.168.79.12"), 0u) << "102 must not be rung:\n" << b.dump();
@@ -2021,7 +2009,7 @@ TEST(EmergencyRoute, AStrayQuoteAfterTheFromUriStillIdentifiesTheCaller)
 	const std::string ip105 = "192.168.79.15";
 	const std::string from = "From: <sip:105@server> x\"<y>;tag=s1from\r\n";
 	Bench b;
-	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->setAnchorPlacesRealCallsForTest(true);
 	b.sent.clear();
 
 	auto reg = RequestsHandler::getMessageFromPool(
@@ -2051,7 +2039,7 @@ TEST(EmergencyRoute, AStrayQuoteAfterTheFromUriStillIdentifiesTheCaller)
 		"Content-Type: application/sdp\r\n"
 		"Content-Length: " + std::to_string(kSdpOffer.size()) + "\r\n\r\n" + kSdpOffer, addrFor(ip105)));
 	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u)
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911")
 		<< "the 911 reaches the carrier:\n" << b.dump();
 }
 
@@ -2061,13 +2049,13 @@ TEST(EmergencyRoute, AnOpenQuoteAfterAQuotedNameFallsBackToTheLastUri)
 	// right finds every '<' inside quotes, so the last '<' on the line is the
 	// URI (#832's rule). Without that step this 911 reads no user: a 400.
 	Bench b;
-	b.handler->setTrunkConfig(trunkConfig());
+	b.handler->setAnchorPlacesRealCallsForTest(true);
 	auto invite = makeInviteWithToValue("sip:911@server", "\"Lobby\" <sip:911@server> \"x", "application/sdp", "",
 		kSdpOffer, "er-835-step3");
 	EXPECT_EQ(invite->getToNumber(), "911");
 	b.handler->handle(invite);
 	EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-	EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+	EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
 }
 
 TEST(EmergencyRoute, AnEscapedQuoteIsNotAQuoteInTheScanFromTheRight)
@@ -2078,7 +2066,7 @@ TEST(EmergencyRoute, AnEscapedQuoteIsNotAQuoteInTheScanFromTheRight)
 	// to 102, goes to the PSAP. Main reads both as below.
 	{
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		b.handler->handle(makeRegister("102", "192.168.79.12"));
 		b.sent.clear();
 		auto invite = makeInviteWithToValue("sip:911@server", "\"Desk <sip:102@h> \\\"B <sip:911@server> \\\"B",
@@ -2086,12 +2074,12 @@ TEST(EmergencyRoute, AnEscapedQuoteIsNotAQuoteInTheScanFromTheRight)
 		EXPECT_EQ(invite->getToNumber(), "911");
 		b.handler->handle(invite);
 		EXPECT_EQ(b.count("SIP/2.0 4"), 0u) << b.dump();
-		EXPECT_EQ(b.count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp), 1u) << b.dump();
+		EXPECT_EQ(b.loopback()->lastMakeCallDestination(), "911") << b.dump();
 		EXPECT_EQ(b.count("INVITE", "192.168.79.12"), 0u) << "102 must not be rung:\n" << b.dump();
 	}
 	{
 		Bench b;
-		b.handler->setTrunkConfig(trunkConfig());
+		b.handler->setAnchorPlacesRealCallsForTest(true);
 		b.handler->handle(makeRegister("102", "192.168.79.12"));
 		b.sent.clear();
 		auto invite = makeInviteWithToValue("sip:102@server", "\"Desk <sip:911@h> \\\"B <sip:102@server> \\\"B",

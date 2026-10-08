@@ -1,0 +1,4 @@
+# no 911/933 over a SIP trunk, ever (desmo, 2026-10-08). Removes the 30 tests that
+# only proved the trunk-carried 911 path: TrunkWiring 16, E911Notify 11, HeaderLinePinning 1,
+# EmittedConformance 1, SingleContentType 1. The sink tests that still check a 911 moved to the anchor seam.
+-30
