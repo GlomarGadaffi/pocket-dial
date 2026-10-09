@@ -68,6 +68,7 @@ namespace SdpLimits
 namespace SipLimits
 {
 	constexpr size_t   kMaxCallIdLine   = 127;  // TransactionLayer/VmSdJob callId[128]; stores the whole line (corpus 41)
+	constexpr size_t   kMaxDialogLineBytes = 200;  // #870: a From/To line a dialog stores; a BYE built from it fits sipb::kMaxByeBytes (820 B worst case)
 	constexpr size_t   kMaxBranch       = 71;   // TransactionLayer viaBranch[72] (corpus 41)
 	constexpr size_t   kMaxCSeqMethod   = 11;   // TransactionLayer cseqMethod[12] (corpus 8)
 	constexpr size_t   kMaxCSeqDigits   = 10;   // RFC 3261 §8.1.1.5: < 2^31 (corpus 5)

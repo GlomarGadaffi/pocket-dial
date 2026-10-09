@@ -73,6 +73,7 @@ namespace
 	{
 		std::string ruri        = "sip:600@server";
 		std::string to          = "<sip:600@server>";
+		std::string from        = "<sip:500@server>";
 		std::string callId      = "sg-call";
 		std::string branch;                       // default: z9hG4bK + callId
 		std::string cseq        = "1 INVITE";
@@ -90,7 +91,7 @@ namespace
 				method + " " + ruri + " SIP/2.0\r\n"
 				"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=" + br + "\r\n" +
 				vias +
-				"From: <sip:500@server>;tag=f-" + callId + "\r\n"
+				"From: " + from + ";tag=f-" + callId + "\r\n"
 				"To: " + to + "\r\n"
 				"Call-ID: " + callId + "\r\n"
 				"CSeq: " + cseq + "\r\n"
@@ -450,4 +451,46 @@ TEST(SipGrammar, APsapCallbackIsNeverRefusedForAnOptionTag)
 		EXPECT_TRUE(b.forkedTo600()) << b.dump();
 		EXPECT_EQ(b.count("SIP/2.0 420", kCallerIp), 0u) << b.dump();
 	}
+}
+
+// #870: a dialog stores this INVITE's From and To lines, and the BYE the PBX builds
+// from them has a fixed size. A line past the bound is refused with 400 at ingress.
+TEST(SipGrammar, ADialogLineOverTheBoundIsRefusedAtIngress)
+{
+	const std::string pad(220, 'x');   // a display name: the AOR stays valid, the line grows
+	for (const bool fromSide : {true, false})
+	{
+		SCOPED_TRACE(fromSide ? "From" : "To");
+		Bench b;
+		Invite i;
+		if (fromSide) i.from = "\"" + pad + "\" <sip:500@server>";
+		else i.to = "\"" + pad + "\" <sip:600@server>";
+		b.send(i);
+		EXPECT_EQ(b.count("SIP/2.0 400 From/To Line Too Long", kCallerIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("INVITE", kCalleeIp), 0u) << "an oversize dialog line is never routed:\n" << b.dump();
+	}
+}
+
+TEST(SipGrammar, AnOrdinaryDialogLineWithinTheBoundIsStillRouted)
+{
+	Bench b;
+	Invite i;
+	i.from = "\"" + std::string(100, 'x') + "\" <sip:500@server>";
+	b.send(i);
+	EXPECT_EQ(b.count("SIP/2.0 400", kCallerIp), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE", kCalleeIp), 1u) << b.dump();
+}
+
+TEST(SipGrammar, AnEmergencyWithAnOversizeDialogLineIsNotRefusedForIt)
+{
+	// Rule 5: a 911 is never refused for its header length. It takes the emergency
+	// path, which (no anchor, no trunk) answers 503 as it does for any 911 today.
+	Bench b;
+	Invite i;
+	i.ruri = "sip:911@server";
+	i.to = "<sip:911@server>";
+	i.from = "\"" + std::string(220, 'x') + "\" <sip:500@server>";
+	b.send(i);
+	EXPECT_EQ(b.count("SIP/2.0 400", kCallerIp), 0u) << b.dump();
+	EXPECT_TRUE(b.routedTo911()) << b.dump();
 }
