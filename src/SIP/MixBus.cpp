@@ -4,6 +4,7 @@
 
 // #170: three independent pins of the same frame size must agree.
 static_assert(MixBus::FRAME == MIX_FRAME, "MixBus::FRAME must equal mix_kernels' MIX_FRAME");
+static_assert(Repacketizer::FRAME == static_cast<size_t>(MixBus::FRAME), "the repacketizer emits the bus's frame");
 
 // ── Lifecycle (cold path) ───────────────────────────────────────────────────
 // Invariant maintained by the tick: a Free slot ALWAYS has empty rings (the tick
@@ -39,8 +40,30 @@ void MixBus::detach(int port)
 bool MixBus::inputFrame(int port, const int16_t* pcm, size_t n)
 {
     if (port < 0 || port >= MAX_PORTS || pcm == nullptr) return false;
-    if (_ports[port].state.load(std::memory_order_acquire) != State::Active) return false;
-    return _ports[port].in.write(pcm, n) > 0;
+    Port& p = _ports[port];
+    if (p.state.load(std::memory_order_acquire) != State::Active) return false;
+
+    // #170: a 20 ms leg (every frame exactly FRAME, nothing carried) takes the ring as it always has.
+    Repack rs = p.repackState.load(std::memory_order_acquire);
+    if (n == static_cast<size_t>(FRAME) && rs == Repack::Idle)
+        return p.in.write(pcm, n) > 0;
+
+    // Anything else is reframed to whole FRAMEs first. A FRAME-sized input also lands here while a
+    // remainder is carried, so it queues behind it rather than overtaking it.
+    if (rs == Repack::ResetRequested)
+        p.repack.reset();                    // the port was reused: drop the last leg's remainder
+    if (p.repack.push(pcm, n) == 0) return false;
+    while (const int16_t* f = p.repack.front())     // straight from the buffer: no stack copy
+    {
+        p.in.write(f, Repacketizer::FRAME);
+        p.repack.pop();
+    }
+    p.repackDrops.store(p.repack.dropped(), std::memory_order_relaxed);
+    // CAS, not store: if the tick asked for a reset meanwhile, that request must survive.
+    p.repackState.compare_exchange_strong(
+        rs, p.repack.empty() ? Repack::Idle : Repack::Holding,
+        std::memory_order_acq_rel, std::memory_order_relaxed);
+    return true;
 }
 
 bool MixBus::outputFrame(int port, int16_t* pcm, size_t n)
@@ -66,6 +89,13 @@ void MixBus::tick()
         {
             _ports[p].in.clear();
             _ports[p].out.clear();
+            // #170: the repacketizer belongs to the rx task, so the tick only asks. A remainder
+            // carried from this leg is dropped by the next inputFrame on this port, before the
+            // new leg's first sample goes in; Idle means nothing is carried, so nothing to ask.
+            Repack carried = Repack::Holding;
+            _ports[p].repackState.compare_exchange_strong(
+                carried, Repack::ResetRequested,
+                std::memory_order_acq_rel, std::memory_order_relaxed);
             _ports[p].state.store(State::Free, std::memory_order_release); // clean + free
             present[p] = 0;
             continue;
@@ -92,6 +122,12 @@ void MixBus::tick()
         mix_minus_self(_out, _mix, _frame[p], FRAME);
         _ports[p].out.write(_out, FRAME);
     }
+}
+
+uint32_t MixBus::repackDropped(int port) const
+{
+    if (port < 0 || port >= MAX_PORTS) return 0;
+    return _ports[port].repackDrops.load(std::memory_order_relaxed);
 }
 
 int MixBus::activePorts() const

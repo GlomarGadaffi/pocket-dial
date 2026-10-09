@@ -396,6 +396,9 @@ add_executable(sip_parser_tests
     JsonEscape_test.cpp
     TelephonyAnchorLogic_test.cpp
     MixBus_test.cpp
+    # Issue #170: a leg that is not at 20 ms is reframed to the mixer's 160-sample
+    # frame by a pure fixed-buffer Repacketizer ahead of its port's input ring.
+    Repacketizer_test.cpp
     # Issue #75: MixBus wired into MediaBridge (BUS mode) and made dialable as the
     # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real
     # µ-law rim, a leg leaving mid-conference, and the RequestsHandler 888 intercept.

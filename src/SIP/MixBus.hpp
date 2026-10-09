@@ -4,6 +4,7 @@
 #include <cstdint>
 #include "PoolConfig.hpp"     // POCKETDIAL_CONF_LEGS (#479)
 #include "PlayoutBuffer.hpp"  // pocket-dial's existing ring (src/SIP/PlayoutBuffer.hpp)
+#include "Repacketizer.hpp"   // reframes a non-20 ms leg to FRAME before its ring (#170)
 
 // ── Conference mix bus ───────────────────────────────────────────────────────
 // The summing junction. Sits between the decode edge (RtpReceiver / anchor rx)
@@ -20,7 +21,7 @@ class MixBus
 {
 public:
     static constexpr int FRAME     = 160;  // samples/tick = the ptime WE send (20 ms @ 8 kHz); a leg
-                                           // may send another ptime, its in-ring absorbs it (#170)
+                                           // at another ptime is reframed to it before its in-ring (#170)
     // #479: one port per conference leg. Every port carries two rings, fixed with the
     // room at boot, so unused ports were pure internal DRAM on a no-PSRAM build.
     static constexpr int MAX_PORTS = POCKETDIAL_CONF_LEGS;
@@ -32,7 +33,10 @@ public:
     void detach(int port);         // non-blocking; tick reclaims at next boundary
 
     // Hot path (decode / encode tasks). Per-port jitter-absorbing rings.
-    bool inputFrame (int port, const int16_t* pcm, size_t n);  // leg -> bus
+    // leg -> bus. Exactly FRAME samples with nothing carried (a 20 ms leg) go straight to the ring;
+    // any other size, or any frame while a remainder is carried, is reframed first (Repacketizer),
+    // so n <= Repacketizer::MAX_IN is lossless. ONE producer per port (the leg's rx task).
+    bool inputFrame (int port, const int16_t* pcm, size_t n);
     bool outputFrame(int port,       int16_t* pcm, size_t n);  // bus -> leg
 
     // Master clock. Call from exactly ONE periodic driver, every FRAME samples.
@@ -40,14 +44,29 @@ public:
 
     int activePorts() const;
 
+    // Samples this port's repacketizer discarded to overrun (n > MAX_IN, oldest first) since the
+    // leg attached. 0 for a 20 ms leg and for a port out of range.
+    uint32_t repackDropped(int port) const;
+
 private:
     enum class State : uint8_t { Free = 0, Active = 1, Draining = 2 };
+
+    // Idle: nothing carried (so a FRAME-sized input may take the ring directly). Holding: a remainder
+    // is carried, so every input queues behind it. ResetRequested: the tick reclaimed the port while
+    // it was Holding; the next inputFrame discards that remainder before it pushes (#170).
+    enum class Repack : uint8_t { Idle = 0, Holding = 1, ResetRequested = 2 };
 
     struct Port
     {
         std::atomic<State> state{State::Free};
         PlayoutBuffer      in;     // leg -> bus  (the input direction a 1:1 MediaBridge doesn't need)
         PlayoutBuffer      out;    // bus -> leg  (same role as MediaBridge's playout buffer)
+
+        // #170. `repack` has ONE writer, the port's rx task inside inputFrame(); the tick never
+        // touches it (it only moves repackState Holding -> ResetRequested), so it needs no lock.
+        Repacketizer           repack;
+        std::atomic<Repack>    repackState{Repack::Idle};
+        std::atomic<uint32_t>  repackDrops{0};   // mirror of repack.dropped() for repackDropped()
     };
 
     Port    _ports[MAX_PORTS];

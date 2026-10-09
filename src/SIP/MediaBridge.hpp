@@ -208,6 +208,10 @@ private:
 	// twice the 20 ms RTP frame). Both directions are bounded by this so neither ever
 	// touches the heap on the media path.
 	static constexpr size_t MAX_FRAME_SAMPLES = 320;
+	// #170: BUS mode hands the receive task's decode straight to MixBus::inputFrame(), whose
+	// repacketizer is loss-free up to this many samples per call.
+	static_assert(MAX_FRAME_SAMPLES <= Repacketizer::MAX_IN,
+		"a decoded RTP frame must fit the MixBus repacketizer's loss-free input bound");
 
 	// Issue #218: fixed capacity for feedMohTick()'s on-stack participant-id
 	// snapshot (see the .cpp). 3CX Call Control API participant ids are short

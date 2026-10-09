@@ -355,7 +355,13 @@ suite step the clock instead of running the driver.
    reads the wrong window silently. (§6.)
 5. **Frame cadence.** Bus `FRAME` must equal the RTP ptime. Mixed ptimes (G.723.1 = 30 ms,
    G.729 = 10 ms, Opus 2.5–60 ms) need per-port repacketization before the bus, a
-   correctness/jitter problem, not a compute one.
+   correctness/jitter problem, not a compute one. `MixBus::inputFrame()` does it (#170): a frame of
+   exactly `FRAME` samples with nothing carried goes straight to the ring (a 20 ms leg never
+   leaves that path); anything else is reframed by the port's `Repacketizer` (`Repacketizer.hpp`,
+   loss-free to 320 samples per call, 479 samples / 958 B per port). The signal is the decoded
+   length: no negotiated ptime is consumed anywhere yet (`AttrKind::Ptime` has no reader), and a
+   ptime of 50 ms or more is still truncated to 320 samples upstream (`MediaBridge::onHandsetRtp`).
+   Added latency is the carried remainder, under one frame (20 ms).
 6. **Headroom vs. feel.** Naive clip is fine in practice (one or two talkers at once). Add VAD
    gating when you want conference-grade quiet. (§6c.)
 7. **Vectorise last.** Scalar ships and is a rounding error at ≤8 narrowband legs. The PIE
