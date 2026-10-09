@@ -40,23 +40,28 @@ class SosTokenWiringTest(unittest.TestCase):
         self.free = body_of(tac, "void TelephonyAnchorClient::freeSlotLocked(")
         self.fetch = body_of(tac, "bool TelephonyAnchorClient::fetchToken(")
 
-    def test_ruling_1_the_401_step_asks_whether_another_911_is_pending_or_up(self):
+    def test_ruling_1_the_401_step_only_counts_a_911_with_live_streams_and_never_skips(self):
         at = self.make.index("telephony::sosRetryOn401(")
-        step = self.make[at:at + 700]
-        self.assertIn("sosScope.id()", step, "the witness names the call that lost")
-        self.assertIn("sosScope.anotherPending()", step, "a makeCall() of another 911/933 pending")
-        self.assertIn("for (const CallSlot& s : _calls)", step, "a call whose streams are up")
+        step = self.make[at:at + 1100]
+        self.assertIn("sosScope.id()", step, "the witness names the fetching call")
+        self.assertIn("for (CallSlot& s : _calls)", step, "the live call is found in a call slot")
         self.assertIn("s.emergency.load(std::memory_order_acquire)", step)
+        self.assertIn("s.postLive.load(std::memory_order_acquire)", step, "only a slot with media up counts")
+        self.assertIn("std::try_to_lock", step, "the count never waits on a lock a 911/933 could be held by")
+        self.assertNotIn("anotherPending", self.make, "a makeCall() that is merely pending does not count")
+        self.assertNotIn("skip", step.lower(), "the fetch is not held back: the skip is gone (revised ruling 1)")
+        fetch = step.index("fetchToken(telephony::TokenLane::Emergency, false, sosScope.id())")
+        self.assertGreater(fetch, step.index("return 0;"), "the count comes first and only counts")
 
     def test_ruling_1_a_911_slot_is_marked_before_makecall_returns_and_cleared_when_freed(self):
         keyed = self.make.index("startRxIfNeeded(ownLeg)")
-        marked = self.make.index("slot->emergency.store(emergency, std::memory_order_release)")
+        marked = self.make.index("slot->emergency.store(emergency ? sosScope.id() : 0, std::memory_order_release)")
         self.assertLess(keyed, marked, "positive control: the mark follows the slot being keyed")
         self.assertIn("slot->getFailFast.store(", self.make[marked - 200:marked],
                       "set in the block that already sets the slot's other per-call flags, under _mutex")
         self.assertLess(marked, self.make.index("return success;"),
-                        "before makeCall() returns, so it overlaps the pending scope with no gap")
-        self.assertIn("slot.emergency.store(false, std::memory_order_release)", self.free,
+                        "before makeCall() returns, so the call is never unmarked while it can have streams")
+        self.assertIn("slot.emergency.store(0, std::memory_order_release)", self.free,
                       "the one place a slot goes back to free")
 
     def test_ruling_4_every_911_fetch_names_its_call_to_the_arena_claim(self):

@@ -226,12 +226,14 @@ private:
 		// gives up early (telephony::getForbiddenGivesUp). False for a 911/933
 		// and for every inbound leg, which keep the whole budget.
 		std::atomic<bool>        getFailFast{false};
-		// #862 (ruling 1 on #945): this is makeCall's own leg for a 911/933, from the moment its slot is
-		// keyed until the slot is freed. A 911/933 whose POST is answered 401 fetches no token while any
-		// slot has this set (telephony::sosRetryOn401): the fetch would revoke the token that call's
-		// streams hold. The inbound legs, a PSAP callback among them, are not marked: the client cannot
-		// tell them from any other inbound leg, so this sees only the 911/933s the anchor placed.
-		std::atomic<bool>        emergency{false};
+		// #862 (ruling 1 on #945): non-zero when this is makeCall's own leg for a 911/933, from the moment
+		// its slot is keyed until the slot is freed; the value is that call's number (EmergencyScope::id()).
+		// A 911/933 whose POST is answered 401 fetches regardless; when it does and this slot's media is up
+		// (postLive, or an open GET handle) it leaves token_sos_live_fetch_862 naming both calls, for #952's
+		// bench to count (telephony::sosRetryOn401). The inbound legs, a PSAP callback among them, are not
+		// marked: the client cannot tell them from any other inbound leg, so this sees only the 911/933s
+		// the anchor placed.
+		std::atomic<std::uint32_t> emergency{0};
 		mutable std::mutex       postMutex;              // guards postClient (writeAudio/stop)
 		std::mutex               getMutex;                // guards getClient (runRxLoop/stop)
 	};

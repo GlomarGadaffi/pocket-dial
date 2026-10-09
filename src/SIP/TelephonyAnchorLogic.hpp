@@ -893,12 +893,6 @@ public:
 		// through AnchorClient::makeCall() would touch every implementation.
 		std::uint32_t id() const { return _id; }
 
-		// Is another 911/933 makeCall() pending beside this one? The scope counts itself.
-		bool anotherPending() const
-		{
-			return _lanes && _lanes->_emergenciesPending.load(std::memory_order_acquire) > 1;
-		}
-
 	private:
 		TokenLanes*   _lanes;
 		std::uint32_t _id = 0;
@@ -989,26 +983,26 @@ struct PostResult
 // failed makecall does, which the caller handles (#880): not a refusal made here, not a second
 // fetch, not a second retry. Any answer other than a 401 is returned untouched.
 //
-// Not while another 911/933 is live (interim operator ruling on #945; #952's hardware reproduction
-// settles whether a fetch really tears a live call down). Never do anything that can tear down a
-// live 911; then never refuse or delay a new one; where they conflict under uncertainty the live
-// call wins. A fetch grants a new token and Telephony drops the old one at that instant, so
-// anotherSosLive() says whether another 911/933 is pending in makeCall() or has its streams up
-// (the ESP arm: a pending-count read and one atomic load per call slot, no lock). It is asked after
-// a 401 only, so a POST that was not answered 401 never pays for it. When one is, this call fetches nothing,
-// retries nothing and returns the 401: it fails like any failed makecall, to #880 (NOT ROUTED). One
-// witness line names the call that lost (callId, EmergencyScope::id()) and why. Where two 911/933s
-// are pending at once each sees the other as live, so neither fetches: the ruling as given.
-template <class OtherLive, class Fetch, class Retry>
-PostResult sosRetryOn401(PostResult first, std::uint32_t callId, OtherLive&& anotherSosLive, Fetch&& fetch, Retry&& retry)
+// The fetch runs whether or not another 911/933 is pending or up (revised operator ruling 1 on
+// #945: an earlier interim skip is gone). The one addition is a count for #952's bench, which settles
+// whether a fetch really tears down a live call: liveSosCall() (asked after a 401 only, so a POST that
+// was not answered 401 never pays for it) is the number of a 911/933 whose streams are up, 0 for none,
+// and a non-zero answer leaves token_sos_live_fetch_862 naming both calls (callId, EmergencyScope::id()).
+// The line is emitted for every occurrence, never sampled, and its answer never gates the fetch. A 911/933
+// that is only pending in makeCall() has no streams and does not count. On the ESP arm liveSosCall()
+// is one atomic load per call slot, plus the slot's getMutex for an open GET handle as ensureToken()
+// does it. The line is left as the fetch is about to start, before its arena claim: a fetch turned
+// away at the claim also leaves token_sos_claim_lost_862 for the same call (claimWaiting), which a
+// count of fetches that really ran subtracts.
+template <class LiveSos, class Fetch, class Retry>
+PostResult sosRetryOn401(PostResult first, std::uint32_t callId, LiveSos&& liveSosCall, Fetch&& fetch, Retry&& retry)
 {
 	if (first.ok || first.status != 401) return first;
-	if (anotherSosLive())
+	if (const std::uint32_t live = liveSosCall())
 	{
-		PD_WITNESS_W("e911", "token_sos_401_skip_862: 911/933 call %u lost its 401 recovery: another 911/933 is live and a "
-		                     "new token would revoke the one it holds, so no fetch and no retry; this call fails to NOT ROUTED "
-		                     "(#880) (#862)", static_cast<unsigned>(callId));
-		return first;
+		PD_WITNESS_W("e911", "token_sos_live_fetch_862: 911/933 call %u fetches a token while 911/933 call %u has live streams; "
+		                     "the fetch is not held back, this only counts it for #952 (#862)",
+		             static_cast<unsigned>(callId), static_cast<unsigned>(live));
 	}
 	PD_WITNESS_W("e911", "token_sos_401_fetch_862: a 911/933 POST was answered 401, fetching one token on its own arena (#862)");
 	if (!fetch()) return first;

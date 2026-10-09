@@ -1124,54 +1124,71 @@ TEST(Sos401, ACachedTokenNeverMeansAFetchBeforeThePostAndNoTokenMeansExactlyOne)
 	}
 }
 
-// ── no fetch while another 911/933 is live (#862, operator ruling 1 on #945, interim) ─────
-// Never do anything that can tear down a live 911/933: a fetch grants a new token and Telephony
-// drops the old one at that instant, taking down the streams of a call that holds it. Where that
-// conflicts with recovering a new 911/933, the live call wins: the 401 step fetches nothing and
-// the new call fails like any failed makecall, which RequestsHandler::runTelCtl turns into the
-// #880 path (refuseRingingAnchor, then notifyEmergency routed=false, kAnchorNotPlaced). Interim:
-// #952's hardware reproduction settles whether a fetch really tears a live call down.
+// ── a 911/933 answered 401 fetches whether or not another 911/933 is live (#862, ruling 1 on #945, revised) ──
+// The interim skip is gone: a 911/933 that draws a 401 does ONE bounded fetch and ONE retry on the
+// 911/933 arena, whether or not another 911/933 is pending or up. What is left is a count for #952's
+// bench: when the fetch starts while another 911/933 has live streams (a call slot marked 911/933 with
+// its media up; a makeCall() that is only pending does not count), token_sos_live_fetch_862 names both
+// calls. It is never sampled and never decides whether the fetch runs.
 
-TEST(Sos401, AnotherPending911SkipsTheFetchAndTheLosingCallGoesToNotRouted)
+TEST(Sos401, AnotherPending911WithNoLiveStreamsStillFetchesAndRetriesAndLeavesNoLiveFetchLine)
 {
 	Lanes lanes;
-	Lanes::EmergencyScope first(lanes, true);    // already in makeCall()
+	Lanes::EmergencyScope first(lanes, true);    // still in makeCall(): pending, no slot with media up yet
 	Lanes::EmergencyScope second(lanes, true);   // its POST was answered 401
 	ASSERT_EQ(first.id(), 1u);
 	ASSERT_EQ(second.id(), 2u);
 	Net net;
 	pdwitness::clear();
-	const telephony::PostResult r = sosDial(net, true, second.id(), [&] { return second.anotherPending(); });
-	EXPECT_FALSE(r.ok);
-	EXPECT_EQ(r.status, 401) << "the failed makecall comes back unchanged, which is what #880 handles";
-	const std::vector<std::string> want = {"post:old"};
-	EXPECT_EQ(net.events, want) << "no fetch and no retry";
-	EXPECT_EQ(pdwitness::count("token_sos_401_skip_862"), 1u) << "one line for the one decision";
-	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 0u);
-	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 0u);
-	const std::vector<std::string> lines = pdwitness::lines();
-	ASSERT_EQ(lines.size(), 1u);
-	EXPECT_NE(lines[0].find("call 2 "), std::string::npos) << "names the 911/933 that lost: " << lines[0];
-	EXPECT_EQ(lines[0].find("call 1 "), std::string::npos) << "and not the one that kept its token: " << lines[0];
-	EXPECT_NE(lines[0].find("another 911/933 is live"), std::string::npos) << "and why: " << lines[0];
+	const telephony::PostResult r = sosDial(net, true, second.id(), [] { return 0u; });   // the slot scan finds none
+	EXPECT_TRUE(r.ok);
+	EXPECT_EQ(r.status, 200);
+	const std::vector<std::string> want = {"post:old", "fetch", "post:new"};
+	EXPECT_EQ(net.events, want) << "the one fetch and the one retry run";
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_live_fetch_862"), 0u) << "pending alone is not a live call";
+	EXPECT_EQ(pdwitness::count("token_sos_401_skip_862"), 0u) << "and there is no skip";
 }
 
-TEST(Sos401, A911WhoseStreamsAreUpSkipsTheFetchTooAfterItsMakeCallHasReturned)
+TEST(Sos401, A911401WhileAnother911HasLiveStreamsStillFetchesAndRetriesAndTheLineNamesBothCalls)
 {
 	Lanes lanes;
-	Lanes::EmergencyScope second(lanes, true);   // the only makeCall() pending
-	EXPECT_FALSE(second.anotherPending()) << "the earlier 911/933 has returned from makeCall(): its scope is gone";
-	const bool streamsUp = true;   // makeCall()'s slot scan: a call slot marked 911/933 and not yet freed
+	Lanes::EmergencyScope first(lanes, true);    // in the real client call 1 has returned from makeCall(): its slot has media up
+	Lanes::EmergencyScope second(lanes, true);   // its POST was answered 401
 	Net net;
 	pdwitness::clear();
-	const telephony::PostResult r =
-	    sosDial(net, true, second.id(), [&] { return second.anotherPending() || streamsUp; });
-	EXPECT_FALSE(r.ok);
-	EXPECT_EQ(r.status, 401);
-	const std::vector<std::string> want = {"post:old"};
-	EXPECT_EQ(net.events, want) << "its streams hold the token a fetch would revoke";
-	EXPECT_EQ(pdwitness::count("token_sos_401_skip_862"), 1u);
-	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 0u);
+	const telephony::PostResult r = sosDial(net, true, second.id(), [&] { return first.id(); });
+	EXPECT_TRUE(r.ok);
+	EXPECT_EQ(r.status, 200);
+	const std::vector<std::string> want = {"post:old", "fetch", "post:new"};
+	EXPECT_EQ(net.events, want) << "the live call does not hold the fetch back";
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_skip_862"), 0u);
+	ASSERT_EQ(pdwitness::count("token_sos_live_fetch_862"), 1u);
+	for (const std::string& l : pdwitness::lines())
+	{
+		if (l.find("token_sos_live_fetch_862") == std::string::npos) continue;
+		const std::size_t fetching = l.find("call 2 ");
+		const std::size_t live = l.find("call 1 ");
+		EXPECT_NE(fetching, std::string::npos) << "names the 911/933 that fetched: " << l;
+		EXPECT_NE(live, std::string::npos) << "and the one with live streams: " << l;
+		EXPECT_LT(fetching, live) << "the fetching call first: " << l;
+		EXPECT_NE(l.find("live streams"), std::string::npos) << l;
+	}
+}
+
+TEST(Sos401, TheLiveStreamsLineIsNeverSampledEveryOccurrenceIsEmitted)
+{
+	pdwitness::clear();
+	for (std::uint32_t i = 1; i <= 40; ++i)
+	{
+		Net net;
+		sosDial(net, true, 100 + i, [i] { return i; });
+	}
+	EXPECT_EQ(pdwitness::count("token_sos_live_fetch_862"), 40u) << "the bench counts them: none is dropped";
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 40u);
 }
 
 TEST(Sos401, WithNoOther911LiveTheOneFetchAndTheOneRetryAreAsTheyWere)
@@ -1181,19 +1198,21 @@ TEST(Sos401, WithNoOther911LiveTheOneFetchAndTheOneRetryAreAsTheyWere)
 	Lanes::EmergencyScope ordinaryCall(lanes, false);   // an ordinary call is not a live 911/933
 	Net net;
 	pdwitness::clear();
-	const telephony::PostResult r = sosDial(net, true, only.id(), [&] { return only.anotherPending(); });
+	const telephony::PostResult r = sosDial(net, true, only.id(), [] { return 0u; });
 	EXPECT_TRUE(r.ok);
 	EXPECT_EQ(r.status, 200);
 	const std::vector<std::string> want = {"post:old", "fetch", "post:new"};
 	EXPECT_EQ(net.events, want);
-	EXPECT_EQ(pdwitness::count("token_sos_401_skip_862"), 0u);
+	EXPECT_EQ(pdwitness::count("token_sos_live_fetch_862"), 0u);
 	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
 	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
 }
 
-// Ruling 4: not the skip of ruling 1 (that needs another 911/933 live when the question is asked),
-// but two fetches that both got past it, as two calls with no cached token do (FetchThenPost). The
-// fetch of the one that loses the claim fails, so its 401 step returns the 401 and #880 takes it.
+// ── ruling 4, revised: two 911/933s, the loser is refused the arena at once ───────────
+// Two calls both fetch and the second is turned away at the arena claim. It does not wait: it goes on
+// with the best token it has (none cached: its POST goes out with no usable bearer), and a failed POST
+// takes the existing failure path, the 401 step's one fetch and one retry and then #880. The line says
+// which 911/933 lost and why. This scenario is reachable on the 401 path again now that the skip is gone.
 TEST(Sos401, TheLoserOfTwoFetchesIsTurnedAwayAtTheArenaClaimAndFallsToNotRouted)
 {
 	Lanes lanes;
@@ -1207,7 +1226,7 @@ TEST(Sos401, TheLoserOfTwoFetchesIsTurnedAwayAtTheArenaClaimAndFallsToNotRouted)
 	pdwitness::clear();
 	const telephony::PostResult first = net.post();
 	const telephony::PostResult r = telephony::sosRetryOn401(
-	    first, loser.id(), [] { return false; },
+	    first, loser.id(), [] { return 0u; },
 	    [&] {
 		    Arena::Lease lease = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, loser.id());
 		    if (!lease) return false;   // fetchToken() returns false here, before any I/O
@@ -1218,38 +1237,39 @@ TEST(Sos401, TheLoserOfTwoFetchesIsTurnedAwayAtTheArenaClaimAndFallsToNotRouted)
 	EXPECT_FALSE(r.ok);
 	EXPECT_EQ(r.status, 401) << "the 401 comes back unchanged, which is what #880 handles";
 	EXPECT_EQ(fetchesRun, 0) << "no fetch ran for the loser";
+	EXPECT_EQ(sleeper.calls, 0) << "and it did not wait for the arena";
 	const std::vector<std::string> want = {"post:old"};
 	EXPECT_EQ(net.events, want) << "and no retry";
 	EXPECT_EQ(pdwitness::count("token_sos_claim_lost_862"), 1u);
 	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 0u);
-	const std::vector<std::string> lines = pdwitness::lines();
-	bool named = false;
-	for (const std::string& l : lines)
+	bool named = false, why = false;
+	for (const std::string& l : pdwitness::lines())
 	{
-		if (l.find("token_sos_claim_lost_862") != std::string::npos) named = l.find("call 2 ") != std::string::npos;
+		if (l.find("token_sos_claim_lost_862") == std::string::npos) continue;
+		named = l.find("call 2 ") != std::string::npos;
+		why = l.find("another 911/933 token fetch holds the arena") != std::string::npos;
 	}
 	EXPECT_TRUE(named) << "the loser is call 2";
+	EXPECT_TRUE(why) << "and the line says why";
 }
 
-TEST(TokenLanes, AnotherPendingNeedsAnotherActiveScopeAndEvery911ScopeGetsItsOwnNumber)
+TEST(TokenLanes, Every911ScopeGetsItsOwnNumberAndAnOrdinaryCallGetsNone)
 {
 	Lanes lanes;
 	Lanes::EmergencyScope ordinary(lanes, false);
 	EXPECT_EQ(ordinary.id(), 0u) << "an ordinary call has no 911/933 number";
-	EXPECT_FALSE(ordinary.anotherPending());
 	Lanes::EmergencyScope first(lanes, true);
 	EXPECT_EQ(first.id(), 1u);
-	EXPECT_FALSE(first.anotherPending()) << "a scope does not count itself";
 	{
 		Lanes::EmergencyScope second(lanes, true);
 		EXPECT_EQ(second.id(), 2u);
-		EXPECT_TRUE(first.anotherPending());
-		EXPECT_TRUE(second.anotherPending());
-		EXPECT_FALSE(ordinary.anotherPending());
 	}
-	EXPECT_FALSE(first.anotherPending()) << "once the other has returned it no longer counts";
 	Lanes::EmergencyScope third(lanes, true);
 	EXPECT_EQ(third.id(), 3u) << "numbers keep counting up, so a line names one call";
+	Lanes::EmergencyScope ordinaryAgain(lanes, false);
+	EXPECT_EQ(ordinaryAgain.id(), 0u);
+	Lanes::EmergencyScope fourth(lanes, true);
+	EXPECT_EQ(fourth.id(), 4u) << "an ordinary call does not use up a number";
 }
 
 // ── a token is installed only if it looks like a JWT (#862) ────────────────────────────

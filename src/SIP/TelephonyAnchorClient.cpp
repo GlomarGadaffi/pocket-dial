@@ -435,20 +435,25 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	// exactly one retry of the POST, which httpPostBody() sends with _bearerHeader read again.
 	// A fetch or a retry that fails leaves `success` false, and the call fails the way any failed
 	// makecall does (the #880 handling is the caller's): no second retry, no refusal made here.
-	// Not while another 911/933 is live (ruling 1 on #945, interim): a makeCall() of one pending beside
-	// this one, or a slot marked emergency and not yet freed, whose streams the fetch would revoke.
-	// The call then fails at once like any failed makecall, and the same #880 path takes it.
+	// The fetch runs whether or not another 911/933 is pending or up (revised ruling 1 on #945). The
+	// first lambda only counts, for #952's bench: the number of a 911/933 whose slot has media up, 0 for
+	// none (a makeCall() that is merely pending has no slot and does not count). It decides nothing.
+	// It never waits: an open GET handle is read under getMutex with try_lock, and a slot whose
+	// getMutex is busy (its GET client is being made or torn down) is counted as up.
 	if (sosDial)
 	{
 		const telephony::PostResult after = telephony::sosRetryOn401(
 		    telephony::PostResult{success, status}, sosScope.id(),
-		    [&] {
-			    if (sosScope.anotherPending()) return true;
-			    for (const CallSlot& s : _calls)
+		    [&]() -> std::uint32_t {
+			    for (CallSlot& s : _calls)
 			    {
-				    if (s.emergency.load(std::memory_order_acquire)) return true;
+				    const std::uint32_t call = s.emergency.load(std::memory_order_acquire);
+				    if (call == 0) continue;
+				    if (s.postLive.load(std::memory_order_acquire)) return call;
+				    std::unique_lock<std::mutex> getLock(s.getMutex, std::try_to_lock);
+				    if (!getLock.owns_lock() || s.getClient != nullptr) return call;
 			    }
-			    return false;
+			    return 0;
 		    },
 		    [&] { return fetchToken(telephony::TokenLane::Emergency, false, sosScope.id()); },
 		    [&] {
@@ -599,7 +604,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 					slot->outboundActiveSetUs = esp_timer_get_time();
 					slot->ownLegHeld = ownLegHeld;
 					slot->getFailFast.store(!emergency, std::memory_order_release);   // #902: never for a 911/933
-					slot->emergency.store(emergency, std::memory_order_release);     // #862: set before makeCall() returns, so it overlaps the pending scope
+					slot->emergency.store(emergency ? sosScope.id() : 0, std::memory_order_release);   // #862: this 911/933's number
 				}
 			}
 			else
@@ -957,7 +962,7 @@ void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 	slot.upsetInFlight.store(false, std::memory_order_release);
 	slot.upsetPending.store(false, std::memory_order_release);
 	slot.getFailFast.store(false, std::memory_order_release);   // #902
-	slot.emergency.store(false, std::memory_order_release);     // #862: the call is over, a fetch no longer risks it
+	slot.emergency.store(0, std::memory_order_release);         // #862: the call is over, no longer a live 911/933
 }
 
 // ── Private Helper Functions ───────────────────────────────────────────────
