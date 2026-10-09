@@ -286,9 +286,10 @@ inline bool httpResponseParsed(int status)
 // readiness one (404/424). Every 403 counts, before the far end answers or after
 // it (desmo, 2026-10-09: fail fast before the answer too), consecutively; any other
 // answer resets the count. An ordinary outbound leg (makeCall's own, not a 911/933)
-// gives up after kGetForbiddenMaxAfterAnswer of them: at the 500 ms backoff cap that
-// is about 3 s plus a round trip each, instead of the whole 240-attempt (~2 min)
-// budget. A 911/933 and an inbound leg (a PSAP callback among them) keep the whole
+// gives up after kGetForbiddenMaxAfterAnswer of them. The GET loop backs off 50, 100,
+// 200, 400 ms before the sixth attempt, so the give-up lands about 1.3 s of backoff
+// after the first 403, plus six round trips. That is the whole budget for such a leg,
+// instead of 240 attempts (~2 min). A 911/933 and an inbound leg (a PSAP callback among them) keep the whole
 // budget, as before.
 constexpr int kGetForbiddenMaxAfterAnswer = 6;
 
