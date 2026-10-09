@@ -45,7 +45,7 @@ but not the tenant's own numbers, so a far end equal to the route DN or to a DID
 before the first packet, and any phantom verdict says it holds only if the far end cannot route back.
 
 Probe scenarios (x349_unread_makecall, x379_never_opened, x518_403_clean_giveup,
-x279_degraded_bye) drive the bench probe image (docs/BENCH_PROBE.md, #384 H1):
+x279_degraded_bye, x888_ws_upsert) drive the bench probe image (docs/BENCH_PROBE.md, #384 H1):
 they need --expect-version with a -probe stamp, read /api/bench/fault's counters
 before and after, arm only their pre-registered faults (never for an emergency far
 end, never while the probe reports an emergency), and always disarm every fault and
@@ -171,6 +171,7 @@ LOG_COUNTERS = {
     # The bench probe (BenchProbe.cpp): one line per firing, and the rule-5 stops.
     "bench_fired": r"BENCHFAULT (\S+) fired",
     "bench_makecall_read_fail": r"BENCHFAULT makecall_read_fail fired",
+    "bench_ws_upsert": r"BENCHFAULT ws_upsert fired",
     "bench_emergency": r"BENCHFAULT (?:every fault disarmed: emergency call|ballast released \(emergency\))",
     # makeCall() (#349): the unread response reconciled to our own leg, or not.
     "adopted_349": r"but 3CX has our leg (\S+) .*adopting the call instead of failing it \(#349\)",
@@ -473,7 +474,8 @@ def host_problems(host):
 
 
 # ---------------------------------------------------------------- the bench probe's numbers
-PROBE_FAULTS = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age")
+PROBE_FAULTS = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age",
+                "ws_upsert")
 BENCH_PATH = "/api/bench/fault"
 PROBE_IMAGE = "anchor-bench-probe"
 GET_MAX_ATTEMPTS = 240               # BenchProbeLogic.hpp kGetMaxAttempts; get_max_attempts only shrinks it
@@ -515,6 +517,8 @@ def probe_problems(sc):
                             "case), past the %.0f s the call cap leaves" % (n, m, get_giveup_worst_s(m), cap))
     if sc.get("hold_s", 0) > sc.get("call_cap_s", 0) - HANGUP_MARGIN_S:
         problems.append("%s: hold_s leaves no room for the hangup inside the call cap" % n)
+    if "call_fire_wait_s" in sc:
+        problems += x888_timing_problems(sc)
     return problems
 
 
@@ -2290,6 +2294,208 @@ scenario(name="x279_degraded_bye", issues=("#279",), probe=True, faults=("post_s
          calls=1, call_cap_s=30, post_open_wait_s=8.0, write_settle_s=1.5, bye_wait_s=3.0, dup_wait_s=1.5,
          settle_s=5.0, path_counter="degraded_endcall", ring_required=True,
          judge=x279_judge)(probe_run(x279_run))
+
+
+# -- x888_ws_upsert -----------------------------------------------------------------
+# The three #888 witness branches of TelephonyAnchorClient::handleWsEvent, one synthetic upsert each.
+# The probe's ws_upsert fault (docs/BENCH_PROBE.md) feeds that function a frame shaped like 3CX's, with a
+# participant id of its own, pdb-u<case>-<n>; the scenario counts the witness line each one makes.
+# (case, branch, the exact text the firmware logs): test_anchor_x888_ws_upsert.py greps the source for it.
+X888_BRANCHES = ((1, "unqueued", "Upset dropped, work item not queued"),
+                 (2, "absorbed", "Upset absorbed while an outbound is in flight"),
+                 (3, "own-leg", "Upset dropped as own leg with no outbound slot"))
+X888_ID_PREFIX = "pdb-u"                          # BenchProbeLogic.hpp kWsProbeIdPrefix
+X888_NEVER_DIAL = ("911", "933", "113", "1001")   # this scenario's own list, on top of is_never_dial()
+
+
+def x888_destination_problems(far):
+    """Why x888 may not dial `far`, or []: its own never-dial list, then any emergency or never-dial
+    number in any form. Never echoes the number."""
+    out = []
+    if (far or "").lstrip("+") in X888_NEVER_DIAL:
+        out.append("the far end is on the x888 never-dial list")
+    if is_never_dial(far):
+        out.append("the far end is an emergency or never-dial number (rule 5)")
+    return out
+
+
+def x888_timing_problems(sc):
+    n = sc.get("name", "<unnamed>")
+    worst = sc["call_fire_wait_s"] + sc["cancel_after_fire_s"] + 2 * AGENT_TXN_TIMEOUT_S
+    if worst > sc.get("call_cap_s", 0):
+        return ["%s: the call can take up to %.1f s (wait for the fire %g + the CANCEL delay %g + a CANCEL and a "
+                "BYE transaction of %g s each), past the %d s call cap"
+                % (n, worst, sc["call_fire_wait_s"], sc["cancel_after_fire_s"], AGENT_TXN_TIMEOUT_S,
+                   sc.get("call_cap_s", 0))]
+    return []
+
+
+def x888_counts(lines, case):
+    """{branch: lines} for the synthetic upsert of `case`: the branch's witness text and that case's part id
+    (so a real participant's line is not this run's). The three texts are not substrings of one another, so
+    a line counts for one branch only."""
+    part = "part=%s%d-" % (X888_ID_PREFIX, case)
+    return {name: sum(1 for ln in lines if text in ln and part in ln) for _, name, text in X888_BRANCHES}
+
+
+def x888_verdict(case, counts, fired):
+    """-> (verdict, why). PASS: the probe fired and the case's own branch logged exactly one line for its
+    upsert, no other branch one. No line is INVALID, never PASS (the branch was not shown to run); a second
+    line, or a line in another branch for the same upsert, is a FAIL."""
+    _, name, text = X888_BRANCHES[case - 1]
+    own = counts[name]
+    others = [k for k, n in counts.items() if k != name and n]
+    if not fired:
+        return "INVALID", "ws_upsert did not fire for case %d: its precondition never held" % case
+    if own == 0:
+        return "INVALID", "0 lines of '%s' for case %d: the branch was not shown to run" % (text, case)
+    if own > 1:
+        return "FAIL", "%d lines of '%s' for one upsert" % (own, text)
+    if others:
+        return "FAIL", "the upsert also logged %s" % ", ".join(others)
+    return "PASS", ""
+
+
+def x888_case_line(case, verdict, counts):
+    _, name, text = X888_BRANCHES[case - 1]
+    n = counts[name]
+    others = ", ".join("%s=%d" % (k, c) for k, c in counts.items() if k != name and c)
+    return "case %d %s: %s (%d line%s: %s%s)" % (case, name, verdict, n, "" if n == 1 else "s", text,
+                                                 "; other branches: " + others if others else "")
+
+
+def x888_summary(results):
+    """results: [(case, verdict, counts)]. One line: each branch's own count, the tally, the overall verdict."""
+    tally = collections.Counter(v for _, v, _ in results)
+    overall = "FAIL" if tally["FAIL"] else "INVALID" if tally["INVALID"] else "PASS"
+    own = ["%s=%d" % (X888_BRANCHES[c - 1][1], k[X888_BRANCHES[c - 1][1]]) for c, _, k in results]
+    return "x888 summary: %s: %d PASS, %d FAIL, %d INVALID -> %s" % (
+        " ".join(own), tally["PASS"], tally["FAIL"], tally["INVALID"], overall)
+
+
+def x888_fired(run):
+    """The probe's own ws_upsert count, over HTTP (the syslog is UDP and may lose the line)."""
+    return run.probe.counters()["faults"]["ws_upsert"]["fired"]
+
+
+def x888_idle_case(run, sc, case):
+    """Cases 1 and 3 need no call: arm, and wait for the board's next tick to inject."""
+    run.checkpoint()
+    before = x888_fired(run)
+    run.arm("ws_upsert", case)
+    fired = run.watch_call(time.monotonic() + sc["fire_wait_s"], stop_when=lambda: x888_fired(run) > before,
+                           step=0.25)
+    run.x888[case] = fired
+    run.say("case %d: ws_upsert %s" % (case, "fired" if fired else
+                                      "did NOT fire within %g s (its precondition did not hold)" % sc["fire_wait_s"]))
+    run.watch_call(time.monotonic() + sc["settle_s"])          # the witness line follows the fire
+
+
+def x888_cancel_when(run, delay_s):
+    """CANCEL delay_s after the board logs ws_upsert fired for this INVITE: the injected upsert is handled
+    while the far leg rings, and the CANCEL ends the ring at once after it (one short ring)."""
+    def when(since):
+        if run.phantoms():
+            return time.monotonic()
+        fired = matches(run.syslog.entries(since), "bench_ws_upsert")
+        return fired[0][0] + delay_s if fired else None
+    return when
+
+
+def x888_call_case(run, sc, caller, base):
+    """Case 2: armed before the INVITE, the fault waits for an unanswered outbound leg (the board's tick
+    sees it once the makecall response has named the leg). The call is then CANCELled while it rings."""
+    run.checkpoint()
+    before = x888_fired(run)
+    run.arm("ws_upsert", 2)
+    rec = {"call": 1, "t_start": time.monotonic(), "final": None}
+    run.calls.append(rec)                    # first: an abort keeps the record
+    dlg = caller.invite(run.far_end, cancel_when=x888_cancel_when(run, sc["cancel_after_fire_s"]),
+                        cancel_when_timeout_s=sc["call_fire_wait_s"])
+    try:
+        rec.update(_call_id=dlg.call_id, final=dlg.final_status, cancel_status=dlg.cancel_status,
+                   cancel_when_expired=bool(dlg.cancel_when_expired),
+                   provisional=[s for _, s in dlg.responses if s < 200])
+    finally:
+        finish_call(caller, dlg, rec)
+    run.x888[2] = x888_fired(run) > before
+    after_call(run, sc, caller, rec, base)
+    run.watch_call(time.monotonic() + sc["drop_wait_s"], stop_when=lambda: not undropped_legs(run.syslog.lines()))
+    run.say("case 2: ws_upsert %s; call 1: final %s, CANCEL answered %s%s"
+            % ("fired" if run.x888[2] else "did NOT fire", rec["final"], rec.get("cancel_status"),
+               ", hung up by the harness (BYE %s)" % rec.get("hangup_bye") if "hangup_ms" in rec else ""))
+
+
+def x888_run(run, sc):
+    caller = run.agents["caller"]
+    bad = sorted({p for end in run.far_ends for p in x888_destination_problems(end)})
+    if bad:
+        raise run_soak.Abort("INVALID", "refusing before any call: " + "; ".join(bad))
+    run.x888 = {}
+    run.say("3 synthetic upserts through handleWsEvent: case 1 an unknown participant, no call (not queued); "
+            "case 2 an unknown participant while 1 call %s -> far end rings (absorbed), CANCELled %g s after "
+            "the fire; case 3 our own leg, no call. The branch's witness line counts each one"
+            % (caller.ext, sc["cancel_after_fire_s"]))
+    run.checkpoint()
+    base = run.session_count()
+    x888_idle_case(run, sc, 1)
+    x888_call_case(run, sc, caller, base)
+    x888_idle_case(run, sc, 3)
+
+
+def x888_judge(run, sc, lines):
+    fails, invalid = common_problems(run, lines)
+    if not run.calls:
+        return fails, invalid, {}
+    fired = getattr(run, "x888", {})
+    results = []
+    for case, name, _ in X888_BRANCHES:
+        counts = x888_counts(lines, case)
+        verdict, why = x888_verdict(case, counts, fired.get(case))
+        results.append((case, verdict, counts))
+        if verdict != "PASS":
+            (fails if verdict == "FAIL" else invalid).append("case %d %s: %s" % (case, name, why))
+        run.say(x888_case_line(case, verdict, counts))
+    summary_line = x888_summary(results)
+    run.say(summary_line)
+    summary = {"summary": summary_line, "cases": {X888_BRANCHES[c - 1][1]: v for c, v, _ in results},
+               "lines": {X888_BRANCHES[c - 1][1]: k[X888_BRANCHES[c - 1][1]] for c, _, k in results}}
+    n = ((run.manifest.get("probe") or {}).get("fired") or {}).get("ws_upsert")
+    if n is not None and n != len(X888_BRANCHES):
+        invalid.append("ws_upsert fired %d times, not %d: a stray arm or a lost one" % (n, len(X888_BRANCHES)))
+    # a synthetic participant announced as an inbound call would ring the DID row's phones: never, not even once
+    synthetic = sorted(leg for leg in per_leg(lines, "inbound_call") if leg.startswith(X888_ID_PREFIX))
+    if synthetic:
+        fails.append("'Inbound call on DN' was logged for %d synthetic participant(s) (%s): a probe upsert was "
+                     "announced as an inbound call" % (len(synthetic), ", ".join(synthetic)))
+    c, caller = run.calls[0], run.agents["caller"]
+    if c.get("final") == 487:
+        if c.get("cancel_status") != 200:
+            fails.append("the CANCEL was answered %s, not 200" % c.get("cancel_status"))
+    elif answered(c):                        # the far end picked up before the CANCEL: the harness BYE ends it
+        if c.get("hangup_bye") != 200:
+            fails.append("the harness's BYE got %s, not 200" % c.get("hangup_bye"))
+        fails += bye_problems(c, caller.ext, count=False)
+    else:
+        invalid.append("the call did not ring (final %s): case 2 had no unanswered outbound leg to land on"
+                       % c.get("final"))
+    fails += drop_problems(lines)
+    phantom_pcap = sum(run.pcap_count("INVITE", ua, phantom=True) for ua in run.agents.values())
+    if phantom_pcap:
+        fails.append("/api/pcap shows %d INVITE(s) sent to a test UA that were not the register beep: a phantom "
+                     "inbound (second witness)" % phantom_pcap)
+    sf, si = session_problems(c, caller.ext)
+    return fails + sf, invalid + si, summary
+
+
+scenario(name="x888_ws_upsert", issues=("#888",), probe=True, faults=("ws_upsert",),
+         about="the three #888 witness branches on the real device: one synthetic upsert each through "
+               "handleWsEvent (an unknown participant with no call: not queued; the same while test UA 6101's "
+               "call to the designated far end rings: absorbed; our own leg: dropped), one short ring, CANCELled; "
+               "a branch with no witness line is INVALID",
+         uas={"caller": "6101", "detector": PIN_UA}, calls=1, max_calls=1, call_cap_s=30, fire_wait_s=6.0,
+         call_fire_wait_s=10.0, cancel_after_fire_s=0.5, settle_s=3.0, drop_wait_s=5.0,
+         path_counter="bench_ws_upsert", ring_required=True, judge=x888_judge)(probe_run(x888_run))
 
 
 # ---------------------------------------------------------------- CLI

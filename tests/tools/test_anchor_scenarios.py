@@ -587,7 +587,8 @@ class RefusalTest(unittest.TestCase):
         # x379_cancel_before_leg joined the registry with this change (the CANCEL-before-the-leg race)
         self.assertEqual(sorted(an.SCENARIOS), ["x279_degraded_bye", "x349_unread_makecall",
                                                 "x379_cancel_before_leg", "x379_never_opened",
-                                                "x4_cancel_ringing", "x518_403_clean_giveup"])
+                                                "x4_cancel_ringing", "x518_403_clean_giveup",
+                                                "x888_ws_upsert"])
 
     def test_dry_run_prints_the_plan_and_the_ring_required_banner(self):
         rc, out = run_main(cli("--dry-run"), base_env(), http=NoNetwork())
@@ -1862,7 +1863,8 @@ class X379RefusalTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- the probe scenarios (#384 H1)
-PROBE_SCENARIOS = ("x349_unread_makecall", "x379_never_opened", "x518_403_clean_giveup", "x279_degraded_bye")
+PROBE_SCENARIOS = ("x349_unread_makecall", "x379_never_opened", "x518_403_clean_giveup", "x279_degraded_bye",
+                   "x888_ws_upsert")
 PROBE_VERSION = "v1.5.0-fake-probe"
 EM_DASH = "—"
 
@@ -1873,12 +1875,15 @@ class FakeProbeBoard(FakeBoard):
     from what it really sent, a media port that counts RTP, and one anchor call flow per
     mode, each logging the esp_log lines the real board would. Knobs change one thing."""
 
-    NAMES = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age")
+    NAMES = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age", "ws_upsert")
 
     def __init__(self, mode):
         super().__init__()
         self.mode = mode
         self.knobs = {}
+        self.ws_n = 0                     # ws_upsert: the n of the synthetic id, like the board's own counter
+        self.ws_fired_at = []             # (case, monotonic time) of each synthetic upsert
+        self._ws_stop = threading.Event()
         self.faults = {n: {"armed": False, "value": 0, "fired": 0, "emergencySkips": 0} for n in self.NAMES}
         self.ballast = {"held": False, "bytes": 0, "blocks": 0, "target": 0, "deadmanS": 0,
                         "released": {"api": 0, "deadman": 0, "emergency": 0}, "refusedEmergency": 0}
@@ -1895,10 +1900,42 @@ class FakeProbeBoard(FakeBoard):
         self.media.settimeout(0.1)
         self.media_port = self.media.getsockname()[1]
         threading.Thread(target=self._media_loop, daemon=True).start()
+        if mode == "x888":
+            threading.Thread(target=self._ws_loop, daemon=True).start()
 
     def stop(self):
+        self._ws_stop.set()
         super().stop()
         self.media.close()
+
+    # #888 ws_upsert: the SIP task's 1 Hz tick on the board, 20 Hz here. A case waits armed until it
+    # can happen (1 and 3 with no call, 2 with an unanswered outbound leg in flight), as on the board.
+    def _ws_loop(self):
+        while not self._ws_stop.wait(0.05):
+            with self.lock:
+                f = self.faults["ws_upsert"]
+                if not f["armed"] or self.knobs.get("ws_never"):
+                    continue
+                case = f["value"]
+                live = [c for c in self.calls.values() if c.get("leg_up") and not c.get("done")]
+                if bool(live) != (case == 2) or self.fire("ws_upsert") is None:
+                    continue
+                self.ws_n += 1
+                self.ws_fired_at.append((case, time.monotonic()))
+                self._ws_witness(case, "pdb-u%d-%d" % (case, self.ws_n), live[0]["leg"] if live else "")
+
+    WS_LINES = {1: "Upset dropped, work item not queued: nin=0 pending=0 active=0 part=%s seen=1 (#888)",
+                2: "Upset absorbed while an outbound is in flight: nin=1 pending=0 active=1 part=%s own=%s seen=1 (#888)",
+                3: "Upset dropped as own leg with no outbound slot: nin=0 pending=0 active=0 part=%s seen=1 (#888)"}
+
+    def _ws_witness(self, case, part, leg):
+        k = self.knobs
+        shown = k.get("ws_wrong_branch", {}).get(case, case)       # a case that takes another branch
+        n = 0 if case in k.get("ws_no_line", ()) else 2 if case in k.get("ws_double_line", ()) else 1
+        for _ in range(n):
+            self.log("TelephonyAnchor: " + self.WS_LINES[shown] % ((part, leg) if shown == 2 else (part,)))
+        if k.get("ws_inbound_synth"):
+            self.log("TelephonyAnchor: Inbound call on DN %s: participant %s caller ''" % (self.route_dn, part))
 
     def _media_loop(self):
         while True:
@@ -1960,7 +1997,8 @@ class FakeProbeBoard(FakeBoard):
             ok = fault in self.faults and (
                 (fault == "get_status" and value.isdigit() and 400 <= int(value) <= 599) or
                 (fault == "get_max_attempts" and value.isdigit() and 1 <= int(value) <= 240) or
-                (fault not in ("get_status", "get_max_attempts") and not value))
+                (fault == "ws_upsert" and value in ("1", "2", "3")) or
+                (fault not in ("get_status", "get_max_attempts", "ws_upsert") and not value))
             if not ok:
                 return (400, {"error": "bad request"})
             if self.emergency_live or self.knobs.get("emergency_on_arm"):
@@ -2023,6 +2061,8 @@ class FakeProbeBoard(FakeBoard):
         return "https://%s/callcontrol/%s/participants/%s/stream" % (TENANT, self.route_dn, leg)
 
     def _on_invite(self, req, addr):
+        if self.mode == "x888":                          # the plain ringing anchor call: CANCEL -> 487, one drop
+            return FakeBoard._on_invite(self, req, addr)
         c = self.calls.get(req.call_id())
         if tag_of(req.get("to")):
             if c is None:
@@ -2326,7 +2366,7 @@ class ProbeRefusalTest(unittest.TestCase):
                              overrides={"uas": {"caller": "1001", "detector": "6104"}})
                 self.refused(cli(*ver, scenario=name), base_env(), "must be 6104",
                              overrides={"uas": {"caller": "6101", "detector": "6103"}})
-                self.refused(cli(*ver, scenario=name), base_env(), "calls must be 1-30", overrides={"calls": 31})
+                self.refused(cli(*ver, scenario=name), base_env(), "calls must be 1-", overrides={"calls": 31})
 
     def test_a_probe_scenario_needs_a_probe_stamp(self):
         for name in PROBE_SCENARIOS:
@@ -2680,6 +2720,108 @@ class X279Test(ProbeRunCase):
         rc, out = self.go()
         self.assertEqual(rc, 3, out)
         self.assertIn("degraded_endcall is 0", out)
+
+
+class X888Test(ProbeRunCase):
+    """x888_ws_upsert against a fake board whose ws_upsert fires the way the probe does: one
+    synthetic upsert per arm, a witness line for the branch it reaches (#888)."""
+    MODE = "x888"
+    SCENARIO = "x888_ws_upsert"
+    FAST = {"fire_wait_s": 1.5, "call_fire_wait_s": 2.5, "cancel_after_fire_s": 0.2, "settle_s": 0.4,
+            "drop_wait_s": 1.0}
+
+    def test_pass_runs_the_three_cases_in_order_with_one_call(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["verdict"], "PASS")
+        self.assertEqual([(p["fault"], p["value"]) for p in self.board.bench_posts
+                          if p.get("fault") not in (None, "disarm")],
+                         [("ws_upsert", "1"), ("ws_upsert", "2"), ("ws_upsert", "3")])
+        self.assertEqual(self.manifest["probe"]["fired"], {"ws_upsert": 3})
+        for line in ("case 1 unqueued: PASS (1 line: Upset dropped, work item not queued)",
+                     "case 2 absorbed: PASS (1 line: Upset absorbed while an outbound is in flight)",
+                     "case 3 own-leg: PASS (1 line: Upset dropped as own leg with no outbound slot)",
+                     "x888 summary: unqueued=1 absorbed=1 own-leg=1: 3 PASS, 0 FAIL, 0 INVALID -> PASS"):
+            self.assertEqual(sum(1 for ln in out.splitlines() if ln.endswith(line)), 1, line + "\n" + out)
+        self.assertEqual(len(self.calls), 1, "only case 2 places a call")
+        c = self.calls[0]
+        self.assertEqual((c["final"], c["cancel_status"], self.board.invite_users), (487, 200, [FAR]))
+        self.assertEqual(len(self.board.cancels), 1)
+        self.assertEqual(self.manifest["log_counters"]["dropped"], 1)
+        self.assertEqual(self.manifest["log_counters"]["bench_ws_upsert"], 3)
+        self.assertEqual(self.manifest["summary"]["cases"], {"unqueued": "PASS", "absorbed": "PASS", "own-leg": "PASS"})
+        self.assertNotIn("_call_id", c)
+        self.assert_clean_probe(out)
+
+    def test_the_case_2_call_is_cancelled_after_the_fire_not_before_it(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        at = dict(self.board.ws_fired_at)
+        self.assertEqual(sorted(at), [1, 2, 3])
+        self.assertGreaterEqual(self.board.cancels[0] - at[2], self.FAST["cancel_after_fire_s"],
+                                "the CANCEL waits for the injected upsert to be handled")
+        self.assertGreater(at[3], self.board.cancels[0], "case 3 runs after the call is over")
+
+    def test_invalid_when_a_branch_never_logs_its_line(self):
+        self.board.knobs["ws_no_line"] = {2}
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("case 2 absorbed: INVALID (0 lines: Upset absorbed while an outbound is in flight)", out)
+        self.assertIn("case 1 unqueued: PASS", out)
+        self.assertIn("-> INVALID", out)
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_the_fault_never_fires(self):
+        self.board.fire_enabled = False
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the fault ws_upsert fired 0 times", out)
+        self.assertIn("case 1 unqueued: INVALID (0 lines", out)
+        self.assertIn("x888 summary: unqueued=0 absorbed=0 own-leg=0: 0 PASS, 0 FAIL, 3 INVALID -> INVALID", out)
+        self.assertEqual(self.calls[0]["final"], 487, "the call is still CANCELled at its wait, not left ringing")
+        self.assert_clean_probe(out)
+
+    def test_fail_on_a_second_witness_line_for_one_upsert(self):
+        self.board.knobs["ws_double_line"] = {1}
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("case 1 unqueued: FAIL (2 lines", out)
+
+    def test_a_case_that_took_another_branch_is_not_a_pass(self):
+        self.board.knobs["ws_wrong_branch"] = {2: 1}          # the in-flight upsert logged "not queued"
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("case 2 absorbed: INVALID (0 lines: Upset absorbed while an outbound is in flight; "
+                      "other branches: unqueued=1)", out)
+
+    def test_fail_when_a_synthetic_participant_is_announced_as_an_inbound_call(self):
+        self.board.knobs["ws_inbound_synth"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("announced as an inbound call", out)
+
+    def test_invalid_when_the_call_never_rings(self):
+        self.board.refuse_calls = {0}                         # 180, then a 503 before any leg exists
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the call did not ring (final 503)", out)
+        self.assertIn("case 2 absorbed: INVALID (0 lines", out)
+
+    def test_a_409_at_arm_time_stops_before_the_first_upsert(self):
+        self.board.knobs["emergency_on_arm"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("arming ws_upsert: 409", out)
+        self.assertEqual(self.board.invite_users, [])
+        self.assertIn("emergency call touched the probe", out)
+        self.assert_clean_probe(out)
+
+    def test_an_unmet_precondition_waits_armed_and_is_disarmed_at_the_end(self):
+        self.board.knobs["ws_never"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(self.board.armed(), [])
+        self.assertIn("did NOT fire within", out)
 
 
 class ProbeSafetyTest(ProbeRunCase):

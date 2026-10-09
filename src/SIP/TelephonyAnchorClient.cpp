@@ -1755,6 +1755,8 @@ void TelephonyAnchorClient::tick()
 		_tokenObtainedUs.store(aged);
 		pd::benchprobe::noteTokenAged(&_tokenObtainedUs, aged, real);
 	}
+	// #888 ws_upsert: inject one synthetic upsert through handleWsEvent() once its case can happen.
+	if (pd::benchprobe::armedHint(pd::benchprobe::Fault::WsUpsert)) benchWsUpsert();
 #endif
 
 	// Issue #65 (L-1): too many leaked GET sockets — spawn a one-shot worker to do a full
@@ -2548,6 +2550,15 @@ void TelephonyAnchorClient::stopWsWorkers()
 bool TelephonyAnchorClient::enqueueWsWork(WsWorkItem* item)
 {
 	if (!item) return false;
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #888 ws_upsert: a synthetic participant is never queued as an inbound call (the worker would announce
+	// it); refusing it here is also how case 1 reaches handleWsEvent()'s "work item not queued" branch.
+	if (pd::benchprobe::wsProbeRefusesEnqueue(item->partId, item->controlLeg))
+	{
+		delete item;
+		return false;
+	}
+#endif
 	if (!_wsWorkQueue || xQueueSend(_wsWorkQueue, &item, 0) != pdTRUE)
 	{
 		// Queue not ready or full — drop it (Telephony repeats the upset every ~750 ms). No leak.
@@ -3245,6 +3256,59 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 			break;
 	}
 }
+
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+// The bench probe's ws_upsert fault (docs/BENCH_PROBE.md, #888): one synthetic upsert, through the same
+// handleWsEvent() a 3CX frame takes, so a witness branch runs on purpose. The case (1 an unknown participant,
+// no call; 2 an unknown participant while an outbound leg is in flight; 3 our own leg, no call) waits armed
+// until it can happen and is never forced. Runs on the SIP task from tick(), where the token_age fault runs.
+// fire() refuses while any emergency is live and then disarms every fault (rule 5).
+void TelephonyAnchorClient::benchWsUpsert()
+{
+	namespace bp = pd::benchprobe;
+	if (!_running.load(std::memory_order_acquire)) return;
+	const int which = bp::g_faults.value(bp::Fault::WsUpsert);
+	char dn[48];
+	int nin = 0, active = 0, pending = 0;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		nin = countOutboundLocked(nullptr, 0, active, pending);
+		std::snprintf(dn, sizeof(dn), "%s", _sourceDn.c_str());
+	}
+	if (!bp::wsUpsertReady(which, nin, active, pending) || !bp::fire(bp::Fault::WsUpsert)) return;
+
+	static uint32_t s_seq = 0;   // only tick() calls this, one thread
+	char id[24];
+	char frame[192];
+	size_t len = 0;
+	if (bp::formatWsUpsertId(id, sizeof(id), which, ++s_seq) != 0)
+		len = bp::formatWsUpsertFrame(frame, sizeof(frame), TEL_EV_UPSET, dn, id);
+	if (len == 0)
+	{
+		ESP_LOGW(TAG, "BENCHFAULT ws_upsert not injected: no frame fits (DN '%s')", dn);
+		return;
+	}
+	if (which == 3)
+	{
+		// #379: register the synthetic id as our own leg, as makeCall does for a leg 3CX named.
+		std::lock_guard<std::mutex> lock(_mutex);
+		_ownLegs.note(id, esp_timer_get_time());
+	}
+	esp_websocket_event_data_t ev = {};
+	ev.data_ptr = frame;
+	ev.data_len = static_cast<int>(len);
+	ev.op_code = 0x01;
+	ev.payload_len = ev.data_len;
+	ESP_LOGW(TAG, "BENCHFAULT ws_upsert case %d: injecting part=%s", which, id);
+	handleWsEvent(WEBSOCKET_EVENT_DATA, &ev);
+	if (which == 3)
+	{
+		// What 3CX's Remove does: the id is no longer ours from the next WS event on.
+		std::lock_guard<std::mutex> lock(_mutex);
+		_ownLegs.release(id, ++_wsSeq);
+	}
+}
+#endif
 
 bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 {

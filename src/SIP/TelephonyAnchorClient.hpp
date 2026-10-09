@@ -323,6 +323,9 @@ private:
 
 	static void wsEventTrampoline(void* handlerArgs, esp_event_base_t base, int32_t eventId, void* eventData);
 	void handleWsEvent(int32_t eventId, void* eventData);
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	void benchWsUpsert();   // the bench probe's ws_upsert fault (docs/BENCH_PROBE.md): tick() calls it while armed
+#endif
 
 	// ── #43: WS event queue + worker pool ────────────────────────────────────────
 	// The esp_websocket_client event task MUST stay responsive to keep answering PINGs
