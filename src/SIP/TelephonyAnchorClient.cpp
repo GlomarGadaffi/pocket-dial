@@ -2447,15 +2447,17 @@ bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client,
 	// response is well inside telephony::kJsonBodyFixedBytes, so the usual read allocates
 	// nothing. A bigger body spills to the heap and still parses whole. This is never a
 	// refusal. The buffer is static, not on the stack: the anchor's tasks have 6 KB stacks
-	// (tel_maint) and TLS runs below this frame. One lock serialises every fetchToken()
-	// caller: start() creates tel_maint before its own fetchToken(), so the two can overlap.
-	// The lock is held across the network read. fetchToken is the only caller and runs
-	// about once an hour.
+	// (tel_maint) and TLS runs below this frame. fetchToken() callers can overlap (start()
+	// creates tel_maint before its own fetchToken()), so s_body is owned through a try-lock:
+	// the winner reads into it, and a loser spills to the heap without waiting. The lock is
+	// held through cJSON_Parse, because the parsed text points into s_body.
 	static std::mutex s_bodyMutex;
 	static char s_body[telephony::kJsonBodyFixedBytes + 1];
-	std::lock_guard<std::mutex> bodyLock(s_bodyMutex);
+	std::unique_lock<std::mutex> bodyLock(s_bodyMutex, std::try_to_lock);
+	char spillOnly[1];   // 1 byte, not nullptr: BodyCollector writes _fixed[0] when nothing spilled
 
-	telephony::BodyCollector body(s_body, telephony::kJsonBodyFixedBytes);
+	telephony::BodyCollector body(bodyLock.owns_lock() ? s_body : spillOnly,
+	                              bodyLock.owns_lock() ? telephony::kJsonBodyFixedBytes : 0);
 	char tempBuf[512];
 	int readBytes = 0;
 	while ((readBytes = esp_http_client_read(client, tempBuf, sizeof(tempBuf))) > 0)

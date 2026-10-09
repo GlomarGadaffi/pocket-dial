@@ -365,3 +365,39 @@ TEST(AllocBaseline, Issue862TokenBodyThatSpillsIsKeptWholeAndFreed)
 	EXPECT_EQ(blocks1, blocks0) << "the spilled copy must be freed with the collector";
 	EXPECT_EQ(bytes1, bytes0);
 }
+
+// 700-byte reads: the third read (649 bytes) arrives with 648 bytes of room left in the fixed
+// buffer, so it straddles the edge (0 < now < n). The 512-byte reads above always land on the
+// edge exactly, so this is the only test that copies part of a read into the buffer and spills
+// the rest.
+TEST(AllocBaseline, Issue862TokenBodyThatStraddlesTheFixedEdgeIsKeptWhole)
+{
+	if (!heapLiveTracked()) GTEST_SKIP() << "this C library cannot report block sizes";
+	std::string body;
+	for (std::size_t i = 0; i < 2049; ++i) body.push_back(static_cast<char>('a' + i % 26));
+
+	std::size_t n = 0;
+	bool spilled = false;
+	bool same = false;
+	const std::size_t blocks0 = heapLiveBlocks();
+	const std::size_t bytes0 = heapLiveBytes();
+	{
+		char fixed[telephony::kJsonBodyFixedBytes + 1];
+		std::string joined;
+		telephony::BodyCollector c(fixed, telephony::kJsonBodyFixedBytes);
+		for (std::size_t off = 0; off < body.size(); off += 700)
+		{
+			c.append(body.data() + off, std::min<std::size_t>(700, body.size() - off));
+		}
+		spilled = c.spilled();
+		n = c.size();
+		same = std::string_view(c.terminated(joined)) == std::string_view(body);
+	}
+	const std::size_t blocks1 = heapLiveBlocks();
+	const std::size_t bytes1 = heapLiveBytes();
+	EXPECT_TRUE(spilled);
+	EXPECT_EQ(n, body.size());
+	EXPECT_TRUE(same) << "the byte that spilled must follow the 2048 bytes in the buffer, in order";
+	EXPECT_EQ(blocks1, blocks0);
+	EXPECT_EQ(bytes1, bytes0);
+}

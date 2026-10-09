@@ -136,7 +136,7 @@ TEST(Syslog, TimestampDefaultsToNilValueWhenTheCallerSuppliesNone)
 // The point of the parameter. Every frame this board emitted before timesync was
 // wired in carried a NILVALUE, so the collector had to stamp on receipt — which
 // loses queueing delay and is simply wrong for anything logged during a network
-// stall. send() now supplies timesync::rfc3339Now().
+// stall. send() now supplies timesync::rfc3339NowInto().
 TEST(Syslog, TimestampLandsInTheTimestampFieldWithoutShiftingAnything)
 {
 	const std::string when  = "2026-09-14T07:05:37Z";
@@ -165,7 +165,7 @@ TEST(Syslog, TimestampLandsInTheTimestampFieldWithoutShiftingAnything)
 	EXPECT_EQ(frame, "<134>1 " + when + " - pbx-call - - - " + msg);
 }
 
-// timesync::rfc3339Now() returns "-" while the clock is unsynced, which is
+// timesync::rfc3339NowInto() writes "-" while the clock is unsynced, which is
 // already the NILVALUE — so an early-boot frame stays conformant rather than
 // carrying a fabricated 1970 stamp. Passing it straight through must not
 // double-handle it into something else.
