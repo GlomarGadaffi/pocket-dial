@@ -222,8 +222,8 @@ LOG_COUNTERS = {
     # resumed (connected <= 400 ms on a kept handle) or cold, 3 = elapsed ms.
     "ctrl_request_884": r"ctrl request: attempt (\d+) (reused|resumed|cold) in (\d+) ms \(#884\)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
-    "endcall": r"endCall (\S+) reason=",
-    "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",
+    "endcall": r"endCall (?:Call-ID:\s*)?(\S+) reason=",
+    "degraded_endcall": r"endCall (?:Call-ID:\s*)?(\S+) reason=anchor audio write failure",
     "stop_bridge": r"stopBridge call=(\S*) part=",
     # queueLog() lines: stdout only, so seen only if a console capture is merged in.
     "rh_never_opened_drop": r"no rx audio, dropping leg (\S+)",
@@ -232,7 +232,9 @@ LOG_COUNTERS = {
 _RX = {k: re.compile(v) for k, v in LOG_COUNTERS.items()}
 _ATTEMPT = re.compile(r"GET stream (?:not ready \(HTTP -?\d+\)|transport failure \(no HTTP response, "
                       r"status=-?\d+\)|open failed \([^)]*\)), attempt (\d+)/(\d+)")
-_ENDCALL = re.compile(r"endCall (\S+) reason=(.*?)\s*$")
+# RequestsHandler::endCall logs the session key, which is the stored header line, so a real board writes
+# "endCall Call-ID: <id> reason=..."; the bare id is accepted too.
+_ENDCALL = re.compile(r"endCall (?:Call-ID:\s*)?(\S+) reason=(.*?)\s*$")
 
 
 class Refused(Exception):

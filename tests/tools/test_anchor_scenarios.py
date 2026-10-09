@@ -2048,7 +2048,7 @@ class FakeProbeBoard(FakeBoard):
             self.log("TelephonyAnchor: Successfully dropped participant %s" % c["leg"])
 
     def endcall(self, c, reason):
-        self.log("pbx: endCall %s reason=%s" % (c["req"].call_id(), reason))
+        self.log("pbx: endCall Call-ID: %s reason=%s" % (c["req"].call_id(), reason))   # the real board logs the header line
 
     def bye_handset(self, c):
         b = self.bindings.get("6101")
@@ -2093,7 +2093,7 @@ class FakeProbeBoard(FakeBoard):
         fired = self.fire("makecall_read_fail") is not None
         if fired and k.get("bug"):                      # the old code: an unread response is a failure
             self.log("TelephonyAnchor: makeCall request failed (status=-1)")
-            self.log("pbx: endCall %s reason=anchor call fail" % cid)
+            self.log("pbx: endCall Call-ID: %s reason=anchor call fail" % cid)
             self.refuse(c, 503)
             if k.get("phantom"):
                 threading.Timer(0.2, self.phantom).start()
