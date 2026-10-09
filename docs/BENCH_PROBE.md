@@ -69,6 +69,7 @@ scenario's "path exercised" counter: a run whose fault shows `fired: 0` is INVAL
 | `get_max_attempts` | 1-240 | the same GET stream | its attempt budget becomes `<value>`, so a refusal give-up and MediaNeverOpened fit a short call | #518, #379 |
 | `post_stream_fail` | none | the next `writeAudio()` on any live POST stream | `shutdown()` of that stream's socket: that write and every later one fails until the bridge gives up | #279 |
 | `token_age` | none | the anchor's next tick, if it holds a token | the token's obtained-at stamp moves back one lifetime, so `tokenExpiringSoon()` is true | #336 |
+| `ws_upsert` | 1-3, the case | the anchor's next tick at which the case can happen ([below](#ws_upsert-888)) | one synthetic WS upsert goes through `handleWsEvent()`, the function a 3CX frame takes, to reach one #888 witness branch on purpose | #888 |
 
 Notes:
 
@@ -90,6 +91,55 @@ Notes:
 
 **Validity:** app-level faults are **not** evidence for #350. That bug lives in
 mbedTLS's failed-read state, and only ballast or a real network fault reaches it.
+
+### `ws_upsert` (#888)
+
+`POST fault=ws_upsert&value=<case>` arms one injection. On the anchor's next 1 Hz tick at which the case
+can happen (`TelephonyAnchorClient::benchWsUpsert()`, on the SIP task, where `token_age` runs), the probe
+builds the frame `{"event":{"event_type":0,"entity":"/callcontrol/<dn>/participants/<id>","attached_data":{}}}`
+with `<dn>` the anchor's source DN, and hands it to `handleWsEvent()` as a text frame. The JSON parse, the DN
+check, `parseParticipantEntity()` and the classification are the real ones, not a copy. The participant id is
+the probe's own, `pdb-u<case>-<n>` (`n` counts injections since boot), so a witness line says which upsert made
+it (`part=pdb-u2-3`) and is the first sighting of its id, which is the one that logs.
+
+| Case | Waits for | The upsert | Branch it reaches | Witness line it makes |
+|---|---|---|---|---|
+| 1 | no outbound slot, no makeCall pending | an unknown participant, no call | the work item is **not queued** | `Upset dropped, work item not queued: nin=0 pending=0 active=0 part=pdb-u1-<n> seen=1 (#888)` |
+| 2 | an unanswered outbound leg in flight (`nin >= 1`): the makecall response has named the leg | an unknown participant while that leg rings | **absorbed**: mapped to the in-flight leg | `Upset absorbed while an outbound is in flight: nin=1 pending=0 active=1 part=pdb-u2-<n> own=<leg> seen=1 (#888)` |
+| 3 | no outbound slot, no makeCall pending | a participant registered as our own leg | the **own-leg** drop (#379) | `Upset dropped as own leg with no outbound slot: nin=0 pending=0 active=0 part=pdb-u3-<n> seen=1 (#888)` |
+
+- **A case that cannot happen yet waits, still armed.** It is never forced: a case 2 armed with no call in
+  flight fires when a call is, and a case 1 or 3 armed during an outbound call fires after it. `fired` counts
+  injections, so a case that never became possible shows `fired` unchanged and the scenario calls it INVALID.
+- **Case 1 and the enqueue.** The work queue has no failure a probe can drive without also starving the
+  workers (they drain it at once). So `enqueueWsWork()` refuses a work item whose participant is a `pdb-u` id
+  and whose control leg is that participant itself, which is what an unknown participant with no call maps
+  to, and answers false after freeing the item: the same `delete item; return false` a full queue takes. The
+  `xQueueSend` failure itself is not exercised. The same rule means a synthetic participant is never queued as
+  an inbound call, the one thing that would ring the route DN's phones, even if the call in case 2 ends between
+  the tick's check and the classification (the upsert then reads "not queued" and the case is INVALID, not a
+  ring). Case 2's item is queued, mapped to the in-flight leg: the worker runs its status check on that leg
+  (one extra participant-list GET on the real call), as it does for any upsert.
+- **Case 3 and the own-leg table.** The id is noted in `_ownLegs` (#379) before the injection and released
+  after it, with the next WS event number, as 3CX's Remove does. It occupies one of the table's 8 entries
+  for those microseconds and may displace the oldest real one, so it waits for an idle anchor.
+- **Counters.** `faults.ws_upsert.fired` (injections), `.emergencySkips`, and the top-level `refusedArms` and
+  `emergencyDisarms`, as for every fault. Logs: `BENCHFAULT ws_upsert armed (value <case>)`, then on the tick
+  `BENCHFAULT ws_upsert fired` and `BENCHFAULT ws_upsert case <case>: injecting part=<id>`, then the witness
+  line. If the 256-line per-boot witness cap was already reached there is no witness line (`witness cap
+  reached`), and the case reads INVALID.
+- **Refusal (rule 5, the same policy as every fault).** Arming while an emergency is live is answered `409`,
+  counted in `refusedArms` and logged `BENCHFAULT ws_upsert arm refused: emergency call live`. A fire site
+  reached while an emergency is live, or for an emergency destination, injects nothing, disarms every fault,
+  counts `emergencySkips` and logs `BENCHFAULT ws_upsert refused: emergency call, every fault disarmed`.
+  An emergency that begins while it is armed disarms it at once (`every fault disarmed: emergency call`).
+  The harness also refuses 911, 933, 113 and 1001 as the far end, and any emergency number in any form,
+  before it arms or dials.
+- **One ring (case 2).** The scenario `x888_ws_upsert` places **one** call to the designated far end, arms
+  before the INVITE, and CANCELs 0.5 s after the `BENCHFAULT ws_upsert fired` line (or at 10 s if it never
+  comes), so the far end rings once and briefly. Its call cap is 1. Cases 1 and 3 place no call. It counts
+  the witness line of each case by the exact text above and the case's part id; a case with 0 lines is
+  INVALID, never PASS. Far end only: no owner extension, no test UA, no service number.
 
 ## Ballast
 
@@ -145,3 +195,9 @@ The counters live in RAM and reset at boot.
 Written and host-tested without a board: no rig, no 3CX, no phone. The ESP glue
 (`src/SIP/BenchProbe.cpp` and the `#if` blocks) has only been compiled. Every
 scenario's first run is also the first run of the probe on hardware.
+
+`ws_upsert` and `x888_ws_upsert` (#888) are newer still: the probe arm (`benchWsUpsert()`, the `enqueueWsWork()`
+refusal, the `tick()` call) was syntax-checked with the release build's compile flags plus
+`-DPOCKETDIAL_ANCHOR_BENCH_PROBE=1`, never linked into a probe image, and its stack use on the SIP task is
+unmeasured. The scenario has run only against the fake board in `tests/tools/test_anchor_scenarios.py`
+(`X888Test`), whose `ws_upsert` is a model of this section, not the firmware.

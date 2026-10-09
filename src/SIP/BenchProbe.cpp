@@ -86,8 +86,15 @@ void undoTokenAge()
 
 bool fire(Fault f, bool destinationEmergency, int32_t* valueOut)
 {
-	if (!g_faults.fire(f, destinationEmergency, s_gate.live(), valueOut)) return false;
+	const bool wasArmed = g_faults.armedHint(f);
 	const std::string_view n = faultName(f);
+	if (!g_faults.fire(f, destinationEmergency, s_gate.live(), valueOut))
+	{
+		// Rule 5 refused an armed fault: say so, not a silent no-op (it disarmed every fault).
+		if (wasArmed && (destinationEmergency || s_gate.live()))
+			ESP_LOGW(TAG, "BENCHFAULT %.*s refused: emergency call, every fault disarmed", static_cast<int>(n.size()), n.data());
+		return false;
+	}
 	ESP_LOGW(TAG, "BENCHFAULT %.*s fired", static_cast<int>(n.size()), n.data());
 	return true;
 }
@@ -165,6 +172,8 @@ Verdict armFault(std::string_view name, std::string_view value, bool emergencySe
 	const Verdict v = g_faults.arm(r, s_gate.live());
 	if (v == Verdict::Ok)
 		ESP_LOGW(TAG, "BENCHFAULT %.*s armed (value %ld)", static_cast<int>(name.size()), name.data(), r.value);
+	else if (v == Verdict::EmergencyLive)
+		ESP_LOGW(TAG, "BENCHFAULT %.*s arm refused: emergency call live", static_cast<int>(name.size()), name.data());
 	return v;
 }
 

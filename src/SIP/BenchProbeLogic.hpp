@@ -13,19 +13,20 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string_view>
 
 namespace pd::benchprobe {
 
-enum class Fault : uint8_t { MakecallReadFail, GetStatus, GetMaxAttempts, PostStreamFail, TokenAge, Count };
+enum class Fault : uint8_t { MakecallReadFail, GetStatus, GetMaxAttempts, PostStreamFail, TokenAge, WsUpsert, Count };
 inline constexpr size_t kFaultCount = static_cast<size_t>(Fault::Count);
 // The names POST /api/bench/fault takes and the counters body reports. There is
 // no ws_drop: esp_websocket_client has no documented call that drops the
 // transport and keeps its own reconnect (stop() and close() end the client).
 inline constexpr std::string_view kFaultNames[kFaultCount] = {
-	"makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age"};
+	"makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age", "ws_upsert"};
 
 inline std::string_view faultName(Fault f)
 {
@@ -68,7 +69,11 @@ struct FaultRequest
 	long value = 0;
 };
 
-// get_status takes a refusal (400-599), get_max_attempts a budget (1-240); the
+// ws_upsert (#888): the cases TelephonyAnchorClient::benchWsUpsert() knows, 1 an unknown participant with
+// no call, 2 an unknown participant while an outbound leg is in flight, 3 our own leg.
+inline constexpr int kWsUpsertCases = 3;
+
+// get_status takes a refusal (400-599), get_max_attempts a budget (1-240), ws_upsert a case (1-3); the
 // others take no value.
 inline Verdict parseFaultRequest(std::string_view name, std::string_view value, FaultRequest& out)
 {
@@ -83,6 +88,9 @@ inline Verdict parseFaultRequest(std::string_view name, std::string_view value, 
 			break;
 		case Fault::GetMaxAttempts:
 			if (!r.hasValue || r.value < 1 || r.value > kGetMaxAttempts) return Verdict::BadRequest;
+			break;
+		case Fault::WsUpsert:
+			if (!r.hasValue || r.value < 1 || r.value > kWsUpsertCases) return Verdict::BadRequest;
 			break;
 		default:
 			if (r.hasValue) return Verdict::BadRequest;
@@ -230,6 +238,76 @@ inline int64_t agedTokenObtainedUs(int64_t nowUs, int64_t lifetimeUs)
 {
 	const int64_t aged = nowUs - lifetimeUs;
 	return aged == 0 ? -1 : aged;   // 0 means "no token" to tokenIsExpiringSoon()
+}
+
+// ── ws_upsert (#888) ──────────────────────────────────────────────────────────────
+// One synthetic upsert, through TelephonyAnchorClient::handleWsEvent(), to reach a #888 witness branch on
+// purpose. Its participant id is the probe's own, "pdb-u<case>-<n>": a witness line's part= names the
+// injection that made it, and it cannot be taken for a real 3CX participant (those are numbers).
+inline constexpr std::string_view kWsProbeIdPrefix = "pdb-u";
+
+inline bool isWsProbeId(std::string_view id)
+{
+	return id.substr(0, kWsProbeIdPrefix.size()) == kWsProbeIdPrefix;
+}
+
+// Can case `which` happen now? A case that cannot waits armed and is never forced. nin = unanswered
+// in-flight outbound legs, active = outbound slots, pending = makeCalls mid-resolve (the three numbers
+// TelephonyAnchorClient::countOutboundLocked() gives). Cases 1 and 3 need no outbound call at all, so a
+// synthetic upsert never shares a call's state; case 2 needs an unanswered outbound leg (nin >= 1), the
+// condition of the "absorbed" branch.
+inline bool wsUpsertReady(int which, int nin, int active, int pending)
+{
+	switch (which)
+	{
+		case 1:
+		case 3: return active == 0 && pending == 0;
+		case 2: return nin >= 1;
+		default: return false;
+	}
+}
+
+// "pdb-u<case>-<n>", NUL-terminated: its length, or 0 when the case is not 1-3 or it does not fit.
+inline size_t formatWsUpsertId(char* buf, size_t cap, int which, uint32_t n)
+{
+	if (which < 1 || which > kWsUpsertCases) return 0;
+	const int r = std::snprintf(buf, cap, "pdb-u%d-%u", which, static_cast<unsigned>(n));
+	return r > 0 && static_cast<size_t>(r) < cap ? static_cast<size_t>(r) : 0;
+}
+
+// A DN or participant id that cannot break out of the frame's JSON string or its entity path.
+inline bool wsProbeToken(std::string_view s)
+{
+	if (s.empty()) return false;
+	for (char c : s)
+	{
+		const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		                c == '-' || c == '_' || c == '.';
+		if (!ok) return false;
+	}
+	return true;
+}
+
+// {"event":{"event_type":<evType>,"entity":"/callcontrol/<dn>/participants/<id>","attached_data":{}}}:
+// the shape handleWsEvent() reads (event_type a number, entity the path parseParticipantEntity() splits,
+// attached_data an optional object). NUL-terminated: its length, or 0 when it does not fit or dn or id
+// could break the JSON or the path.
+inline size_t formatWsUpsertFrame(char* buf, size_t cap, int evType, std::string_view dn, std::string_view id)
+{
+	if (!wsProbeToken(dn) || !wsProbeToken(id)) return 0;
+	const int r = std::snprintf(buf, cap,
+		"{\"event\":{\"event_type\":%d,\"entity\":\"/callcontrol/%.*s/participants/%.*s\",\"attached_data\":{}}}",
+		evType, static_cast<int>(dn.size()), dn.data(), static_cast<int>(id.size()), id.data());
+	return r > 0 && static_cast<size_t>(r) < cap ? static_cast<size_t>(r) : 0;
+}
+
+// handleWsEvent() maps an unknown participant with no outbound leg in flight to itself (controlLeg ==
+// partId): the worker would announce it as an inbound call and ring the route DN's phones. A synthetic
+// participant is never queued like that, in any case. It is also how case 1 reaches the branch where the
+// work item is not queued. Case 2's item is mapped to the in-flight leg (controlLeg != partId): queued.
+inline bool wsProbeRefusesEnqueue(std::string_view partId, std::string_view controlLeg)
+{
+	return isWsProbeId(partId) && controlLeg == partId;
 }
 
 // Is an emergency (911/933, or a PSAP callback) live? The level comes from the

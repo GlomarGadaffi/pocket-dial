@@ -229,6 +229,12 @@ private:
 	// Issue #379: the number of the last Upset/Remove the WS task took, in arrival order;
 	// queued work carries its own, so a Remove releases only later upserts. Guarded by _mutex.
 	uint64_t _wsSeq = 0;
+	// #888 witness only, never a decision; guarded by _mutex. Sightings per partId of the unmatched
+	// upserts, the witness lines logged so far (rate limit), and whether the cap line was handed out.
+	struct WitnessSeen { char id[24]; uint16_t seen; };
+	WitnessSeen _witnessSeen[8] = {};   // ponytail: 8 partIds, least-seen evicted; a bigger table if a capture needs more
+	uint16_t    _witnessLines = 0;
+	bool        _witnessCapNoted = false;
 	// Slot lookup/alloc (caller holds _mutex). slotForLocked returns the slot whose
 	// participantId matches (nullptr if none); allocSlotLocked claims a free slot for a new
 	// participant (nullptr if all busy). freeSlotLocked clears a slot back to free.
@@ -240,6 +246,18 @@ private:
 	CallSlot* slotForLocked(std::string_view participantId);
 	CallSlot* allocSlotLocked(const std::string& participantId);
 	void      freeSlotLocked(CallSlot& slot);
+	// #888 witness only (caller holds _mutex; the caller logs after releasing it, never inside).
+	// witnessSightingLocked: Sampled (seen = this sighting's index) for a partId's first sighting and
+	// every 16th, Skipped otherwise, and CapReached once per boot when the line cap is first hit.
+	// noteWitnessCap logs the one cap line for a CapReached tick; call it outside _mutex.
+	// countOutboundLocked returns the unanswered in-flight outbound count (filling inflight[0..cap)
+	// when given, and never counting past cap then), and sets active (outbound slots with an active
+	// call, answered or not) and pending.
+	enum class WitnessStatus : uint8_t { Skipped, Sampled, CapReached };
+	struct WitnessTick { WitnessStatus status = WitnessStatus::Skipped; uint16_t seen = 0; };
+	WitnessTick witnessSightingLocked(const std::string& partId);
+	static void noteWitnessCap(const WitnessTick& tick);
+	int         countOutboundLocked(std::string* inflight, size_t inflightCap, int& active, int& pending) const;
 	// Issue #553: delete a slot's rx task only once it has parked (pd::reapDecision);
 	// clears rxTaskHandle on Reap. Caller holds _mutex.
 	pd::ReapDecision reapParkedRxLocked(CallSlot& slot);
@@ -305,6 +323,9 @@ private:
 
 	static void wsEventTrampoline(void* handlerArgs, esp_event_base_t base, int32_t eventId, void* eventData);
 	void handleWsEvent(int32_t eventId, void* eventData);
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	void benchWsUpsert();   // the bench probe's ws_upsert fault (docs/BENCH_PROBE.md): tick() calls it while armed
+#endif
 
 	// ── #43: WS event queue + worker pool ────────────────────────────────────────
 	// The esp_websocket_client event task MUST stay responsive to keep answering PINGs
