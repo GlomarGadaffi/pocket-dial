@@ -11,8 +11,8 @@
 #
 # Transport-agnostic: works with lan8720 / wifi / eth. NOT for the display build
 # (that targets the 16MB S3). Pair with SIP_CONSTRAINED=1 to shrink the SIP pools.
-# SIP_CONSTRAINED=1 also requires SIP_OUTSIDE_LINE=anchor|trunk (#731): one outside
-# line per constrained build, the 3CX anchor OR the SIP trunk.
+# SIP_CONSTRAINED=1 also requires SIP_OUTSIDE_LINE=anchor (#731): the constrained build's
+# one outside line is the 3CX anchor. The SIP trunk is shelved (docs/ADR-002).
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── No PSRAM ────────────────────────────────────────────────────────────────

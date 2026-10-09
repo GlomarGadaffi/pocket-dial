@@ -318,9 +318,10 @@ if(SIP_CONSTRAINED)
     message(STATUS "SipServer profile: RESOURCE-CONSTRAINED (clients=8 sessions=4 msgpool=8 clipcap=16384 conference=off mcastpage=off mwi=off rtpslots=3x3KBtx+4x6KBrx+1x6KBanchor=39KB-internal pcap=${POCKETDIAL_PCAP_RING_SIZE})")
 endif()
 
-# Issue #731: the constrained build carries exactly ONE outside-line path, chosen at
-# configure time -- the 3CX telephony anchor OR the SIP trunk, never both:
-#   -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=anchor|trunk
+# Issue #731: the constrained build carries exactly ONE outside-line path, and that is
+# the 3CX telephony anchor (ADR-002). The SIP trunk is shelved, and no 911 or 933 may
+# go over it, so a trunk-only constrained build could not meet Rule 5: it is refused.
+#   -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=anchor
 # It is required with SIP_CONSTRAINED and refused without it, so the knob can never
 # silently do nothing (the failure the pcap plumbing below was written to avoid).
 # Every other build keeps both paths. The result reaches the source as two 0/1
@@ -330,14 +331,13 @@ set(_pd_has_anchor 1)
 set(_pd_has_trunk 1)
 if(SIP_CONSTRAINED)
     if(NOT SIP_OUTSIDE_LINE)
-        message(FATAL_ERROR "SIP_CONSTRAINED=1 needs -D SIP_OUTSIDE_LINE=anchor or trunk: "
-                            "the constrained build carries exactly one outside-line path (#731)")
+        message(FATAL_ERROR "SIP_CONSTRAINED=1 needs -D SIP_OUTSIDE_LINE=anchor: "
+                            "the constrained build carries exactly one outside-line path, the anchor (#731)")
     elseif(SIP_OUTSIDE_LINE STREQUAL "anchor")
         set(_pd_has_trunk 0)
-    elseif(SIP_OUTSIDE_LINE STREQUAL "trunk")
-        set(_pd_has_anchor 0)
     else()
-        message(FATAL_ERROR "SIP_OUTSIDE_LINE must be 'anchor' or 'trunk', got '${SIP_OUTSIDE_LINE}' (#731)")
+        message(FATAL_ERROR "SIP_OUTSIDE_LINE must be 'anchor' on a constrained build, got "
+                            "'${SIP_OUTSIDE_LINE}': the SIP trunk is shelved and cannot carry 911 or 933 (#731)")
     endif()
 elseif(SIP_OUTSIDE_LINE)
     message(FATAL_ERROR "SIP_OUTSIDE_LINE=${SIP_OUTSIDE_LINE} only applies with SIP_CONSTRAINED=1; "
