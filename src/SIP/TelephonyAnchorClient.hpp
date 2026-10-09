@@ -229,6 +229,11 @@ private:
 	// Issue #379: the number of the last Upset/Remove the WS task took, in arrival order;
 	// queued work carries its own, so a Remove releases only later upserts. Guarded by _mutex.
 	uint64_t _wsSeq = 0;
+	// #888 witness only, never a decision; guarded by _mutex. Sightings per partId of the unmatched
+	// upserts, the last state each showed, and the witness lines logged so far (rate limit).
+	struct WitnessSeen { char id[24]; char state[12]; uint16_t seen; };
+	WitnessSeen _witnessSeen[8] = {};   // ponytail: 8 partIds, least-seen evicted; a bigger table if a capture needs more
+	uint16_t    _witnessLines = 0;
 	// Slot lookup/alloc (caller holds _mutex). slotForLocked returns the slot whose
 	// participantId matches (nullptr if none); allocSlotLocked claims a free slot for a new
 	// participant (nullptr if all busy). freeSlotLocked clears a slot back to free.
@@ -240,6 +245,12 @@ private:
 	CallSlot* slotForLocked(std::string_view participantId);
 	CallSlot* allocSlotLocked(const std::string& participantId);
 	void      freeSlotLocked(CallSlot& slot);
+	// #888 witness only (caller holds _mutex). witnessSightingLocked returns this sighting's index when
+	// its line is logged (the first, a state change, every 16th; none past the per-boot cap), else 0.
+	// countOutboundLocked returns the unanswered in-flight outbound count (filling inflight[] when
+	// given), and sets active (outbound slots with an active call, answered or not) and pending.
+	uint16_t witnessSightingLocked(const std::string& partId, const char* state);
+	int      countOutboundLocked(std::string* inflight, int& active, int& pending) const;
 	// Issue #553: delete a slot's rx task only once it has parked (pd::reapDecision);
 	// clears rxTaskHandle on Reap. Caller holds _mutex.
 	pd::ReapDecision reapParkedRxLocked(CallSlot& slot);

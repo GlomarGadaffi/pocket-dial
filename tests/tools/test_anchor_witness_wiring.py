@@ -22,7 +22,7 @@ class EspWitnessWiringTest(unittest.TestCase):
         self.assertIn('"Upset ignored while %d makeCall(s) pending (oldest %lld ms old): "', self.src)
         self.assertIn('"3CX does not repeat a Connected one (#888)"', self.src)
         sample = ("W (1) TelephonyAnchor: Upset ignored while 2 makeCall(s) pending (oldest 1840 ms old): "
-                  "3CX does not repeat a Connected one (#888)")
+                  "nin=0 active=0 part=517 state=Dialing: 3CX does not repeat a Connected one (#888)")
         self.assertEqual(an.count_lines([sample])["upset_ignored_pending_888"], 1)
         # the age is taken where the first pending makeCall begins
         self.assertRegex(self.src, r"_outboundPending\.fetch_add\(1,[^)]*\) == 0\)\s*\n\s*_outboundPendingSinceUs\.store")

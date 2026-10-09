@@ -632,7 +632,13 @@ class WitnessSampleTest(unittest.TestCase):
         "stray_final_890": "W (40301) trunk: final 486 after the call was answered ignored (#890)",
         "beep_uri_856": "I (30100) beep: register beep Request-URI: bare (no Contact stored)",
         "upset_ignored_pending_888": "W (50300) TelephonyAnchor: Upset ignored while 1 makeCall(s) pending (oldest "
-                                     "1840 ms old): 3CX does not repeat a Connected one (#888)",
+                                     "1840 ms old): nin=0 active=0 part=517 state=Dialing: 3CX does not repeat a Connected one (#888)",
+        "upset_absorbed_inflight_888": "W (50310) TelephonyAnchor: Upset absorbed while an outbound is in flight: nin=1 "
+                                     "pending=0 active=1 part=518 own=517 state=Dialing seen=16 (#888)",
+        "upset_dropped_own_leg_888": "W (50320) TelephonyAnchor: Upset dropped as own leg with no outbound slot: nin=0 "
+                                     "pending=0 active=0 part=519 state=Connected seen=1 (#888)",
+        "upset_dropped_unqueued_888": "W (50330) TelephonyAnchor: Upset dropped, work item not queued: nin=0 pending=0 "
+                                     "active=0 part=520 state=- seen=1 (#888)",
         "e911_degraded_kept_906": "W (61100) e911: audio to the anchor keeps failing on a connected 911/933: kept up, "
                                   "not hung up (#906)",
         "cdr_callee_dialed_901": "I (99001) pbx: CDR callee is the dialed number (anchor audio write failure) (#901)",

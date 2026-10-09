@@ -215,7 +215,16 @@ LOG_COUNTERS = {
     "beep_uri_856": r"beep: register beep Request-URI: (registered Contact|bare \(no Contact stored\))",
     # #888: an upsert ignored while a makeCall was pending (group 1 = pending makeCalls, 2 = the oldest's age in ms).
     "upset_ignored_pending_888": r"Upset ignored while (\d+) makeCall\(s\) pending \(oldest (-?\d+) ms old\): "
-                                 r"3CX does not repeat a Connected one \(#888\)",
+                                 r"nin=\d+ active=\d+ part=\S+ state=\S+: 3CX does not repeat a Connected one \(#888\)",
+    # #888: an unmatched upsert mapped to an in-flight outbound leg (nin >= 1): groups = nin, pending, active, part, own, state, sighting.
+    "upset_absorbed_inflight_888": r"Upset absorbed while an outbound is in flight: nin=(\d+) pending=(\d+) active=(\d+) "
+                                 r"part=(\S+) own=(\S+) state=(\S+) seen=(\d+) \(#888\)",
+    # #888: an unmatched upsert dropped as an own leg with no outbound slot (classification, or the worker re-check).
+    "upset_dropped_own_leg_888": r"Upset dropped as own leg (?:with no outbound slot|at the worker re-check): nin=(\d+) "
+                                 r"pending=(\d+) active=(\d+) part=(\S+) state=(\S+) seen=(\d+) \(#888\)",
+    # #888: an unmatched upsert whose work item was not queued (queue full or no allocation): the upsert is lost.
+    "upset_dropped_unqueued_888": r"Upset dropped, work item not queued: nin=(\d+) pending=(\d+) active=(\d+) "
+                                 r"part=(\S+) state=(\S+) seen=(\d+) \(#888\)",
     # #906: the degraded-audio sweep kept a connected 911/933 up instead of hanging it up.
     "e911_degraded_kept_906": r"e911: audio to the anchor keeps failing on a connected 911/933: kept up, not hung up \(#906\)",
     # #884: one line per successful control request (drop/answer): group 1 = the attempt, 2 = reused (no connect),

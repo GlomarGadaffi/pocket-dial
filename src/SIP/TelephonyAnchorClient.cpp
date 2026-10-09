@@ -2692,6 +2692,10 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 			// local handset answers, so there is exactly one inbound media starter and no race here.
 			bool announce = false;
 			bool ownLeg = false;
+			uint16_t ownSeen = 0;
+			int ownNin = 0;
+			int ownPending = 0;
+			int ownActive = 0;
 			{
 				std::lock_guard<std::mutex> lock(_mutex);
 				// #379: a leg this PBX created that no outbound slot holds (freed by its drop, or
@@ -2700,6 +2704,11 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 				// Find-or-claim the inbound slot so the announce-once flag lives on it (keyed by the
 				// surfaced leg). All slots busy => no slot => no announce (graceful at capacity).
 				CallSlot* s = ownLeg ? nullptr : allocSlotLocked(controlLeg);
+				if (ownLeg)
+				{
+					ownNin = countOutboundLocked(nullptr, ownActive, ownPending);
+					ownSeen = witnessSightingLocked(w.partId, "n/a");
+				}
 				if (s)
 				{
 					announce = (s->inboundSignaledPartId != controlLeg);
@@ -2724,6 +2733,9 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 			if (ownLeg)
 			{
 				ESP_LOGI(TAG, "Upset for own leg %s, no outbound slot: not an inbound call (#379)", controlLeg.c_str());
+				if (ownSeen)
+					ESP_LOGW(TAG, "Upset dropped as own leg at the worker re-check: nin=%d pending=%d active=%d "
+						"part=%.24s state=n/a seen=%u (#888)", ownNin, ownPending, ownActive, w.partId.c_str(), (unsigned)ownSeen);
 			}
 			else
 			{
@@ -2842,6 +2854,57 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 	}
 }
 
+// #888 witness: the state an upsert event carries, "-" when it carries none (the key is unverified).
+static const char* upsetStateOf(const cJSON* event)
+{
+	cJSON* st = cJSON_GetObjectItem(event, "state");
+	return cJSON_IsString(st) && st->valuestring ? st->valuestring : "-";
+}
+
+int TelephonyAnchorClient::countOutboundLocked(std::string* inflight, int& active, int& pending) const
+{
+	int nin = 0;
+	active = 0;
+	for (const auto& c : _calls)
+	{
+		if (c.participantId.empty() || !c.outboundActive.load(std::memory_order_acquire)) continue;
+		++active;
+		if (c.outboundAnswered.load(std::memory_order_acquire)) continue;
+		if (inflight) inflight[nin] = c.participantId;
+		++nin;
+	}
+	pending = _outboundPending.load(std::memory_order_acquire);
+	return nin;
+}
+
+uint16_t TelephonyAnchorClient::witnessSightingLocked(const std::string& partId, const char* state)
+{
+	static constexpr uint16_t kWitnessLineCap = 256;   // per boot, all #888 witness lines but the pending one
+	if (_witnessLines >= kWitnessLineCap) return 0;
+	WitnessSeen* w = nullptr;
+	for (auto& e : _witnessSeen)
+	{
+		if (e.seen != 0 && std::strncmp(e.id, partId.c_str(), sizeof(e.id) - 1) == 0) { w = &e; break; }
+	}
+	if (!w)
+	{
+		w = &_witnessSeen[0];
+		for (auto& e : _witnessSeen)
+		{
+			if (e.seen < w->seen) w = &e;
+		}
+		std::snprintf(w->id, sizeof(w->id), "%s", partId.c_str());
+		w->state[0] = '\0';
+		w->seen = 0;
+	}
+	const bool stateChanged = std::strncmp(w->state, state, sizeof(w->state) - 1) != 0;
+	std::snprintf(w->state, sizeof(w->state), "%s", state);
+	if (w->seen < 0xFFFFu) ++w->seen;
+	if (w->seen != 1 && !stateChanged && w->seen % 16 != 0) return 0;
+	++_witnessLines;
+	return w->seen;
+}
+
 void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 {
 	auto* data = static_cast<esp_websocket_event_data_t*>(eventData);
@@ -2949,11 +3012,19 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 									bool ownLeg = false;
 									int ignoredPending = 0;        // #888 witness: an upsert ignored while a makeCall was pending
 									int64_t ignoredAgeMs = 0;
+									int witnessKind = 0;           // #888 witness: 1 absorbed by an in-flight outbound, 2 dropped as an own leg
+									int witnessNin = 0;
+									int witnessPending = 0;
+									int witnessActive = 0;
+									char witnessOwn[24] = {};      // #888 witness: the in-flight leg an absorbed upsert was mapped to
+									uint16_t witnessSeen = 0;      // #888 witness: this sighting's index when its line is logged, else 0
+									bool unmatched = false;        // #888 witness: no slot holds this upsert's partId
 									uint64_t seq = 0;
 									{
 										std::lock_guard<std::mutex> lock(_mutex);
 										seq = ++_wsSeq;   // #379: received after any Remove already taken
 										CallSlot* s = slotForLocked(partId);
+										unmatched = !s;
 										if (s)
 										{
 											controlLegs[nLegs++] = partId;
@@ -2963,19 +3034,22 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 											// #379: our own leg with no outbound slot: neither a new inbound
 											// call nor the far leg of another call.
 											ownLeg = true;
+											witnessNin = countOutboundLocked(nullptr, witnessActive, witnessPending);
+											witnessKind = 2;
+											witnessSeen = witnessSightingLocked(partId, upsetStateOf(eventObj));
 										}
 										else
 										{
 											std::string inflight[POCKETDIAL_MAX_ANCHOR_CALLS];
-											int nin = 0;
-											for (auto& c : _calls)
+											const int nin = countOutboundLocked(inflight, witnessActive, witnessPending);
+											const int pending = witnessPending;
+											witnessNin = nin;
+											if (nin > 0)
 											{
-												if (!c.participantId.empty() &&
-												    c.outboundActive.load(std::memory_order_acquire) &&
-												    !c.outboundAnswered.load(std::memory_order_acquire))
-													inflight[nin++] = c.participantId;
+												witnessKind = 1;
+												std::snprintf(witnessOwn, sizeof(witnessOwn), "%s", inflight[0].c_str());
+												witnessSeen = witnessSightingLocked(partId, upsetStateOf(eventObj));
 											}
-											const int pending = _outboundPending.load(std::memory_order_acquire);
 											if (nin == 0)
 											{
 												// No resolved outbound leg. If a makecall is mid-resolve, this
@@ -3005,7 +3079,17 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 									// inbound or a PSAP callback) may be lost. Witness only; nothing is held or replayed.
 									if (ignoredPending > 0)
 										ESP_LOGW(TAG, "Upset ignored while %d makeCall(s) pending (oldest %lld ms old): "
-											"3CX does not repeat a Connected one (#888)", ignoredPending, (long long)ignoredAgeMs);
+											"nin=%d active=%d part=%.24s state=%.12s: "
+											"3CX does not repeat a Connected one (#888)", ignoredPending, (long long)ignoredAgeMs,
+											witnessNin, witnessActive, partId.c_str(), upsetStateOf(eventObj));
+									if (witnessSeen && witnessKind == 1)
+										ESP_LOGW(TAG, "Upset absorbed while an outbound is in flight: nin=%d pending=%d active=%d "
+											"part=%.24s own=%.24s state=%.12s seen=%u (#888)", witnessNin, witnessPending, witnessActive,
+											partId.c_str(), witnessOwn, upsetStateOf(eventObj), (unsigned)witnessSeen);
+									if (witnessSeen && witnessKind == 2)
+										ESP_LOGW(TAG, "Upset dropped as own leg with no outbound slot: nin=%d pending=%d active=%d "
+											"part=%.24s state=%.12s seen=%u (#888)", witnessNin, witnessPending, witnessActive,
+											partId.c_str(), upsetStateOf(eventObj), (unsigned)witnessSeen);
 									if (nLegs == 0) break;   // ignored (pending far leg / all-busy)
 
 									// Best-effort caller id (cheap, JSON-only) for an inbound ring's From display.
@@ -3083,6 +3167,22 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 											{
 												s->upsetInFlight.store(false, std::memory_order_release);
 												s->upsetPending.store(false, std::memory_order_release);
+											}
+											if (unmatched)
+											{
+												int dropNin = 0;
+												int dropActive = 0;
+												int dropPending = 0;
+												uint16_t dropSeen = 0;
+												{
+													std::lock_guard<std::mutex> lock(_mutex);
+													dropNin = countOutboundLocked(nullptr, dropActive, dropPending);
+													dropSeen = witnessSightingLocked(partId, upsetStateOf(eventObj));
+												}
+												if (dropSeen)
+													ESP_LOGW(TAG, "Upset dropped, work item not queued: nin=%d pending=%d active=%d "
+														"part=%.24s state=%.12s seen=%u (#888)", dropNin, dropPending, dropActive,
+														partId.c_str(), upsetStateOf(eventObj), (unsigned)dropSeen);
 											}
 										}
 									}
