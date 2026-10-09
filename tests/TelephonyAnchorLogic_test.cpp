@@ -694,4 +694,123 @@ TEST(GetForbidden, AnEmergencyOrInboundLegNeverGivesUpEarly)
 	}
 }
 
+// ── #888: an unmatched upsert while an outbound call is pending or in flight ─────
+
+TEST(UnmatchedUpset, WithNothingPendingOrInFlightItIsInbound)
+{
+	EXPECT_EQ(classifyUnmatchedUpset(false, 0, 0), UnmatchedUpsetVerdict::Inbound);
+	EXPECT_FALSE(holdsUnmatchedUpset(UnmatchedUpsetVerdict::Inbound));
+}
+
+TEST(UnmatchedUpset, AnOwnLegIsNeverInboundWhateverIsInFlight)
+{
+	EXPECT_EQ(classifyUnmatchedUpset(true, 0, 0), UnmatchedUpsetVerdict::OwnLeg);
+	EXPECT_EQ(classifyUnmatchedUpset(true, 1, 1), UnmatchedUpsetVerdict::OwnLeg);
+	EXPECT_FALSE(holdsUnmatchedUpset(UnmatchedUpsetVerdict::OwnLeg));
+}
+
+TEST(UnmatchedUpset, AMakecallResolvingWithNoLegKeyedIsIgnoredAndHeld)
+{
+	EXPECT_EQ(classifyUnmatchedUpset(false, 0, 1), UnmatchedUpsetVerdict::PendingLeg);
+	EXPECT_TRUE(holdsUnmatchedUpset(UnmatchedUpsetVerdict::PendingLeg));
+}
+
+TEST(UnmatchedUpset, AnAbsorbedUpsetKeepsItsVerdictAndIsAlsoHeld)
+{
+	// The in-flight legs are still rechecked (that is what drives their Answered); the hold is extra.
+	EXPECT_EQ(classifyUnmatchedUpset(false, 1, 0), UnmatchedUpsetVerdict::InFlightLeg);
+	EXPECT_EQ(classifyUnmatchedUpset(false, 2, 0), UnmatchedUpsetVerdict::InFlightLeg);
+	EXPECT_EQ(classifyUnmatchedUpset(false, 1, 1), UnmatchedUpsetVerdict::InFlightLeg);
+	EXPECT_TRUE(holdsUnmatchedUpset(UnmatchedUpsetVerdict::InFlightLeg));
+}
+
+TEST(UnmatchedUpset, TheWindowStaysOpenWhileAnyOutboundIsPendingOrInFlight)
+{
+	EXPECT_TRUE(outboundWindowOpen(1, 0));
+	EXPECT_TRUE(outboundWindowOpen(0, 1));
+	EXPECT_FALSE(outboundWindowOpen(0, 0));
+}
+
+TEST(HeldUpsets, AHeldIdIsKeptUntilReplayTakesIt)
+{
+	AnchorHeldUpsets held;
+	EXPECT_EQ(held.hold("301", 7), AnchorHeldUpsets::Result::Held);
+	EXPECT_EQ(held.size(), 1u);
+	int visits = 0;
+	held.replay([&](std::string_view id, uint64_t seq) {
+		++visits;
+		EXPECT_EQ(id, std::string_view("301"));
+		EXPECT_EQ(seq, 7u);
+		return false;   // enqueue failed: keep it for the next tick
+	});
+	EXPECT_EQ(visits, 1);
+	EXPECT_EQ(held.size(), 1u) << "a take that returns false keeps the id";
+	held.replay([](std::string_view, uint64_t) { return true; });
+	EXPECT_EQ(held.size(), 0u);
+}
+
+TEST(HeldUpsets, OneIdHeldManyTimesTakesOneEntry)
+{
+	// A far leg repeats its upsert about every 750 ms for as long as the outbound rings.
+	AnchorHeldUpsets held;
+	EXPECT_EQ(held.hold("301", 1), AnchorHeldUpsets::Result::Held);
+	for (uint64_t s = 2; s < 200; ++s)
+		EXPECT_EQ(held.hold("301", s), AnchorHeldUpsets::Result::Refreshed) << "repeat " << s;
+	EXPECT_EQ(held.size(), 1u);
+	EXPECT_EQ(held.refused(), 0u);
+}
+
+TEST(HeldUpsets, TheNinthDistinctIdIsRefusedAndCounted)
+{
+	AnchorHeldUpsets held;
+	for (int i = 0; i < 8; ++i)
+		ASSERT_EQ(held.hold("30" + std::to_string(i), static_cast<uint64_t>(i)), AnchorHeldUpsets::Result::Held) << i;
+	EXPECT_EQ(held.hold("399", 9), AnchorHeldUpsets::Result::Refused);
+	EXPECT_EQ(held.refused(), 1u) << "refused and counted, not silently dropped: the caller logs this";
+	EXPECT_EQ(held.size(), 8u);
+	EXPECT_EQ(held.hold("301", 10), AnchorHeldUpsets::Result::Refreshed) << "a held id is still refreshed when full";
+	EXPECT_EQ(held.refused(), 1u);
+}
+
+TEST(HeldUpsets, AnEmptyOrOversizeIdIsRefusedAndCounted)
+{
+	AnchorHeldUpsets held;
+	EXPECT_EQ(held.hold("", 1), AnchorHeldUpsets::Result::Refused);
+	EXPECT_EQ(held.hold(std::string(32, '9'), 1), AnchorHeldUpsets::Result::Refused);
+	EXPECT_EQ(held.refused(), 2u);
+	EXPECT_EQ(held.size(), 0u);
+}
+
+TEST(HeldUpsets, ARemoveReleasesTheHeldId)
+{
+	// 3CX removed the participant: nothing is left to announce for it.
+	AnchorHeldUpsets held;
+	held.hold("301", 1);
+	held.hold("302", 2);
+	held.release("301");
+	EXPECT_EQ(held.size(), 1u);
+	held.replay([](std::string_view id, uint64_t) {
+		EXPECT_EQ(id, std::string_view("302"));
+		return true;
+	});
+	EXPECT_EQ(held.size(), 0u);
+}
+
+TEST(ReplayHeldUpset, AHeldInboundIsAnnouncedOnceNothingIsLeftInFlight)
+{
+	// A far leg whose farPartId was never recorded also comes out here: a known cost (#888).
+	EXPECT_EQ(replayHeldUpset(false, false), UnmatchedUpsetVerdict::Inbound);
+}
+
+TEST(ReplayHeldUpset, ALegOfAnOutboundCallIsNotAnnounced)
+{
+	// Matches a slot's own leg or its recorded far leg (farPartId): the call's own leg, not a new call.
+	EXPECT_EQ(replayHeldUpset(false, true), UnmatchedUpsetVerdict::OutboundLeg);
+}
+
+TEST(ReplayHeldUpset, AnOwnLegIsNotAnnounced)
+{
+	EXPECT_EQ(replayHeldUpset(true, false), UnmatchedUpsetVerdict::OwnLeg);
+}
+
 }  // namespace

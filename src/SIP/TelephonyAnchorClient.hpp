@@ -226,6 +226,11 @@ private:
 	// Issue #379: legs this PBX created. An upsert for one that no outbound slot holds is
 	// never announced as an inbound call (telephony::inboundAnnounceAllowed). Guarded by _mutex.
 	telephony::AnchorOwnLegs _ownLegs;
+		// Issue #888: upserts held while an outbound call is pending or in flight, replayed by tick()
+		// once none is (telephony::HeldUpsets). Guarded by _mutex. _upsetsHeld mirrors "not empty" so
+		// tick() reads it without the lock.
+		telephony::AnchorHeldUpsets _heldUpsets;
+		std::atomic<bool>           _upsetsHeld{false};
 	// Issue #379: the number of the last Upset/Remove the WS task took, in arrival order;
 	// queued work carries its own, so a Remove releases only later upserts. Guarded by _mutex.
 	uint64_t _wsSeq = 0;
@@ -343,6 +348,7 @@ private:
 	static void wsWorkerTrampoline(void* arg);
 	void runWsWorker();
 	void processWsWork(const WsWorkItem& w);       // the blocking body, off the WS task
+	void replayHeldUpsets();                        // #888: called by tick() while _upsetsHeld
 
 	bool fetchToken();
 	bool ensureToken();             // refresh iff expiring AND no media streams active

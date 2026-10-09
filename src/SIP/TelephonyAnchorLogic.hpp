@@ -550,6 +550,134 @@ struct ListLegCounts
 	}
 };
 
+// ── #888: an unmatched participant upsert while an outbound call is pending or in flight ──
+// handleWsEvent() routes an upsert whose id no slot holds with classifyUnmatchedUpset(). ownLeg:
+// inboundAnnounceAllowed() said no (#379). inflight: resolved outbound calls not yet answered.
+// pending: makeCalls still resolving. Only Inbound announces a new call.
+enum class UnmatchedUpsetVerdict : uint8_t
+{
+	OwnLeg,       // a leg this PBX created, with no outbound slot: never a new call
+	Inbound,      // nothing outbound is pending or in flight: a new call
+	PendingLeg,   // a makeCall is resolving and no leg is keyed yet: ignored
+	InFlightLeg,  // absorbed as the far leg of the in-flight call(s): their own legs are rechecked
+	OutboundLeg,  // replay only: the id is a leg of an outbound call (own or far): not a new call
+};
+
+inline UnmatchedUpsetVerdict classifyUnmatchedUpset(bool ownLeg, int inflight, int pending)
+{
+	if (ownLeg) return UnmatchedUpsetVerdict::OwnLeg;
+	if (inflight > 0) return UnmatchedUpsetVerdict::InFlightLeg;
+	return pending > 0 ? UnmatchedUpsetVerdict::PendingLeg : UnmatchedUpsetVerdict::Inbound;
+}
+
+// The window is open while a makeCall is resolving or an outbound call is in flight. Held
+// upserts are replayed when it closes.
+inline bool outboundWindowOpen(int inflight, int pending)
+{
+	return inflight > 0 || pending > 0;
+}
+
+// Option A (#888): an upsert the verdict does not announce is also held. This is in addition to
+// the verdict, never instead of it: an InFlightLeg still rechecks the in-flight legs, which is
+// what drives their Answered.
+inline bool holdsUnmatchedUpset(UnmatchedUpsetVerdict v)
+{
+	return v == UnmatchedUpsetVerdict::PendingLeg || v == UnmatchedUpsetVerdict::InFlightLeg;
+}
+
+// Replay of a held id once the window has closed: the same ladder with nothing in flight, except
+// that an id matching a leg of an outbound call (matchesOutboundLeg: a slot's participantId or
+// farPartId) is not a new call. A far leg whose farPartId was never recorded is announced: a
+// known cost (#888).
+inline UnmatchedUpsetVerdict replayHeldUpset(bool ownLeg, bool matchesOutboundLeg)
+{
+	const UnmatchedUpsetVerdict v = classifyUnmatchedUpset(ownLeg, 0, 0);
+	return (v == UnmatchedUpsetVerdict::Inbound && matchesOutboundLeg) ? UnmatchedUpsetVerdict::OutboundLeg : v;
+}
+
+// Upserts held while an outbound call is pending or in flight (#888). Fixed storage, modelled on
+// OwnLegs. One entry per id: a far leg repeats its upsert about every 750 ms for as long as it
+// rings, and takes one entry. A new id when all N are taken is refused and counted (refused()),
+// never dropped silently. The count includes each refused repeat, so it counts refusals.
+// release() drops an id 3CX has removed: nothing is left to announce for it.
+template <std::size_t N, std::size_t Len>
+class HeldUpsets
+{
+public:
+	enum class Result : uint8_t { Held, Refreshed, Refused };
+
+	Result hold(std::string_view id, uint64_t wsSeq)
+	{
+		if (id.empty() || id.size() >= Len)
+		{
+			++_refused;
+			return Result::Refused;
+		}
+		for (Entry& e : _e)
+		{
+			if (e.id[0] != '\0' && id == e.id)
+			{
+				e.seq = wsSeq;
+				return Result::Refreshed;
+			}
+		}
+		for (Entry& e : _e)
+		{
+			if (e.id[0] == '\0')
+			{
+				std::memcpy(e.id, id.data(), id.size());
+				e.id[id.size()] = '\0';
+				e.seq = wsSeq;
+				return Result::Held;
+			}
+		}
+		++_refused;
+		return Result::Refused;
+	}
+
+	void release(std::string_view id)
+	{
+		for (Entry& e : _e)
+		{
+			if (e.id[0] != '\0' && id == e.id) e = Entry{};
+		}
+	}
+
+	// take(id, seq) gets each held id with its latest upsert's WS event number. It returns true
+	// when the id leaves the hold (announced or dropped), false to keep it (the queue was full).
+	template <class Take>
+	void replay(Take&& take)
+	{
+		for (Entry& e : _e)
+		{
+			if (e.id[0] != '\0' && take(std::string_view(e.id), e.seq)) e = Entry{};
+		}
+	}
+
+	std::size_t size() const
+	{
+		std::size_t n = 0;
+		for (const Entry& e : _e)
+		{
+			if (e.id[0] != '\0') ++n;
+		}
+		return n;
+	}
+
+	std::size_t refused() const { return _refused; }
+
+private:
+	struct Entry
+	{
+		char     id[Len] = {};
+		uint64_t seq     = 0;
+	};
+	Entry       _e[N]    = {};
+	std::size_t _refused = 0;
+};
+
+using AnchorHeldUpsets = HeldUpsets<8, 32>;
+
 }  // namespace telephony
 
 #endif // TELEPHONY_ANCHOR_LOGIC_HPP

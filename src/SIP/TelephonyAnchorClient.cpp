@@ -1757,6 +1757,10 @@ void TelephonyAnchorClient::tick()
 	}
 #endif
 
+	// #888: upserts held while an outbound call was pending or in flight are replayed once
+	// none is (replayHeldUpsets). The atomic keeps this a no-op on the common path.
+	if (_upsetsHeld.load(std::memory_order_acquire)) replayHeldUpsets();
+
 	// Issue #65 (L-1): too many leaked GET sockets — spawn a one-shot worker to do a full
 	// stop()/start() reclaim OFF this task (stop()/start() block on TLS I/O). _restartInFlight
 	// is a one-shot gate so repeated ticks can't stack restart workers. Checked before the
@@ -2557,6 +2561,53 @@ bool TelephonyAnchorClient::enqueueWsWork(WsWorkItem* item)
 	return true;
 }
 
+// #888: a held upsert is replayed once no outbound is pending or in flight (the window
+// telephony::outboundWindowOpen describes). It takes the verdict of a fresh upsert: an
+// inbound is queued for processWsWork to announce, a leg of this PBX or of an outbound call
+// is dropped, and an id the queue refuses stays held for the next tick.
+void TelephonyAnchorClient::replayHeldUpsets()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	int inflight = 0;
+	for (const auto& c : _calls)
+	{
+		if (!c.participantId.empty() && c.outboundActive.load(std::memory_order_acquire) &&
+			!c.outboundAnswered.load(std::memory_order_acquire))
+			++inflight;
+	}
+	if (telephony::outboundWindowOpen(inflight, _outboundPending.load(std::memory_order_acquire)))
+		return;
+	const int64_t nowUs = esp_timer_get_time();
+	_heldUpsets.replay([this, nowUs](std::string_view id, uint64_t seq) {
+		bool outboundLeg = false;
+		for (const auto& c : _calls)
+		{
+			if (std::string_view(c.participantId) == id || std::string_view(c.farPartId) == id)
+			{
+				outboundLeg = true;
+				break;
+			}
+		}
+		const bool own = !telephony::inboundAnnounceAllowed(_ownLegs, id, nowUs, seq);
+		if (telephony::replayHeldUpset(own, outboundLeg) != telephony::UnmatchedUpsetVerdict::Inbound)
+		{
+			ESP_LOGI(TAG, "Held upset %.*s not announced: a leg of this PBX or of an outbound call (#888)",
+				static_cast<int>(id.size()), id.data());
+			return true;
+		}
+		auto* item = new (std::nothrow) WsWorkItem{};
+		if (!item) return false;
+		item->kind = WsWork::Upset;
+		item->controlLeg.assign(id.data(), id.size());
+		item->partId.assign(id.data(), id.size());
+		item->seq = seq;
+		if (!enqueueWsWork(item)) return false;   // queue full: the id stays held
+		ESP_LOGI(TAG, "Held upset %.*s replayed as inbound (#888)", static_cast<int>(id.size()), id.data());
+		return true;
+	});
+	_upsetsHeld.store(_heldUpsets.size() != 0, std::memory_order_release);
+}
+
 void TelephonyAnchorClient::wsWorkerTrampoline(void* arg)
 {
 	auto* self = static_cast<TelephonyAnchorClient*>(arg);
@@ -2944,12 +2995,15 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 									// While an outbound makecall is mid-resolve (_outboundPending>0) an
 									// unmatched upset is treated as a pending far leg and IGNORED — a repeat
 									// upset drives it once the slot is keyed, so an early upset can't false-ring.
+									// #888: such an upset is also held, and replayed from tick() once no outbound is
+									// pending or in flight. Holding is in addition to the verdict: the in-flight legs are
+									// still rechecked, which is what drives their Answered.
 									std::string controlLegs[POCKETDIAL_MAX_ANCHOR_CALLS];
 									int nLegs = 0;
-									bool ownLeg = false;
-									int ignoredPending = 0;        // #888 witness: an upsert ignored while a makeCall was pending
-									int64_t ignoredAgeMs = 0;
+									telephony::UnmatchedUpsetVerdict verdict = telephony::UnmatchedUpsetVerdict::Inbound;
 									uint64_t seq = 0;
+									bool heldNew = false;          // #888: this id was newly held
+									std::size_t heldRefused = 0;   // #888: the hold's refusal count, when this id was refused
 									{
 										std::lock_guard<std::mutex> lock(_mutex);
 										seq = ++_wsSeq;   // #379: received after any Remove already taken
@@ -2957,12 +3011,6 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 										if (s)
 										{
 											controlLegs[nLegs++] = partId;
-										}
-										else if (!telephony::inboundAnnounceAllowed(_ownLegs, partId, esp_timer_get_time(), seq))
-										{
-											// #379: our own leg with no outbound slot: neither a new inbound
-											// call nor the far leg of another call.
-											ownLeg = true;
 										}
 										else
 										{
@@ -2976,37 +3024,40 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 													inflight[nin++] = c.participantId;
 											}
 											const int pending = _outboundPending.load(std::memory_order_acquire);
-											if (nin == 0)
+											// #379: a leg this PBX created, with no outbound slot, is neither a new inbound call
+											// nor the far leg of another call.
+											verdict = telephony::classifyUnmatchedUpset(
+												!telephony::inboundAnnounceAllowed(_ownLegs, partId, esp_timer_get_time(), seq), nin, pending);
+											switch (verdict)
 											{
-												// No resolved outbound leg. If a makecall is mid-resolve, this
-												// is its (far) leg — ignore; otherwise it's a new inbound call.
-												if (pending == 0) controlLegs[nLegs++] = partId;
-												else
-												{
-													ignoredPending = pending;
-													ignoredAgeMs = (esp_timer_get_time() - _outboundPendingSinceUs.load(std::memory_order_relaxed)) / 1000;
-												}
-											}
-											else if (nin == 1 && pending == 0)
-											{
-												controlLegs[nLegs++] = inflight[0];
-											}
-											else
-											{
-												// Ambiguous: re-check every resolved in-flight leg (their own
-												// status GET is authoritative; a still-pending leg waits for a
-												// repeat upset once it's keyed).
+											case telephony::UnmatchedUpsetVerdict::Inbound:
+												controlLegs[nLegs++] = partId;
+												break;
+											case telephony::UnmatchedUpsetVerdict::InFlightLeg:
+												// Absorbed as the far leg of the in-flight call(s): each one's own leg is rechecked (its
+												// status GET is authoritative; a still-pending leg waits for a repeat upset once it's keyed).
 												for (int i = 0; i < nin; ++i) controlLegs[nLegs++] = inflight[i];
+												break;
+											default:   // OwnLeg (#379) and PendingLeg: nothing is rechecked
+												break;
+											}
+											if (telephony::holdsUnmatchedUpset(verdict))
+											{
+												const auto r = _heldUpsets.hold(partId, seq);
+												heldNew = r == telephony::AnchorHeldUpsets::Result::Held;
+												if (r == telephony::AnchorHeldUpsets::Result::Refused) heldRefused = _heldUpsets.refused();
+												_upsetsHeld.store(_heldUpsets.size() != 0, std::memory_order_release);
 											}
 										}
 									}
-									if (ownLeg) ESP_LOGI(TAG, "Upset for own leg %s, no outbound slot: not an inbound call (#379)", partId.c_str());
-									// #888: 3CX does not repeat a Connected upsert, so one ignored here (a route-point
-									// inbound or a PSAP callback) may be lost. Witness only; nothing is held or replayed.
-									if (ignoredPending > 0)
-										ESP_LOGW(TAG, "Upset ignored while %d makeCall(s) pending (oldest %lld ms old): "
-											"3CX does not repeat a Connected one (#888)", ignoredPending, (long long)ignoredAgeMs);
-									if (nLegs == 0) break;   // ignored (pending far leg / all-busy)
+									if (verdict == telephony::UnmatchedUpsetVerdict::OwnLeg)
+										ESP_LOGI(TAG, "Upset for own leg %s, no outbound slot: not an inbound call (#379)", partId.c_str());
+									if (heldNew)
+										ESP_LOGI(TAG, "Upset %s held while an outbound call is pending or in flight (#888)", partId.c_str());
+									if (heldRefused)
+										ESP_LOGW(TAG, "Held upsets full: upset %s refused, %u refused in all (#888)", partId.c_str(),
+											static_cast<unsigned>(heldRefused));
+									if (nLegs == 0) break;   // ignored and held (pending far leg), own leg, or all-busy
 
 									// Best-effort caller id (cheap, JSON-only) for an inbound ring's From display.
 									std::string callerId;
@@ -3098,6 +3149,9 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 										const CallSlot* s = slotForLocked(partId);
 										if (s && s->ownLegHeld) _ownLegs.note(partId, esp_timer_get_time());
 										_ownLegs.release(partId, ++_wsSeq);
+										// #888: 3CX removed the participant: a held upsert of its id is no longer announced.
+										_heldUpsets.release(partId);
+										_upsetsHeld.store(_heldUpsets.size() != 0, std::memory_order_release);
 									}
 									// #43: stopMediaStreams() has a <=2 s rx-join — off the WS task.
 									// placement new(nothrow) returns an initialized pointer; cppcheck misparses it.
