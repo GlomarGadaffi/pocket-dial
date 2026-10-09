@@ -221,6 +221,15 @@
 #define POCKETDIAL_CONF_VAD 0
 #endif
 
+// Guard on the shipped default (#169). The VAD gate stays OFF in every shipped build.
+// Enabling it needs a deliberate edit of THIS line, not a silent macro flip, and only
+// after the audit is done: every REFER/transfer route into 888, and every other path that
+// can bring an emergency leg onto the bus, must be checked, and MixBus::setEmergency must
+// be wired to flag those legs. Until then a 911/933 leg could be gated out of the mix.
+static_assert(POCKETDIAL_CONF_VAD == 0,
+    "POCKETDIAL_CONF_VAD must stay 0 in the shipped config: audit the REFER/transfer routes"
+    " into 888 and wire MixBus::setEmergency for every emergency leg first (#169, Rule 5)");
+
 // Issue #800: 1 builds multicast paging (dial 997): one boot-time RTP receive slot
 // (RtpTaskSlots.hpp kRxSlots), the re-sender, its config and /api/multicast-paging.
 // 0 (SIP_CONSTRAINED) compiles all of it out; 997 then answers 403. The feature is
