@@ -258,7 +258,7 @@ namespace
 		size_t byesTo(const std::string& ip) const
 		{
 			size_t n = 0;
-			const in_addr_t want = inet_addr(ip.c_str());
+			const auto want = inet_addr(ip.c_str());
 			for (const auto& s : sent)
 				if (s.first.sin_addr.s_addr == want && s.second.rfind("BYE ", 0) == 0) ++n;
 			return n;
