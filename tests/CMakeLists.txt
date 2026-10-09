@@ -351,6 +351,8 @@ add_executable(sip_parser_tests
     PsramPlacement_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp
+    # #946 option A: every ring is allocated once at init; a call only clears it.
+    RingPin_test.cpp
     # Wires the AnchorClient/MediaBridge/TelephonyProvider extension point into
     # RequestsHandler's own call routing (virtual extension 555, opt-in, docs/
     # FEATURE_ROADMAP.md's "Anchored media") — the boot-time provider selection +
