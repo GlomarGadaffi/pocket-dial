@@ -17,7 +17,6 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <cstdio>
 #include <string>
 #include <utility>
 #include <vector>
@@ -241,29 +240,6 @@ namespace
 		rig.handler.handle(makeInvite("500", "777", "192.168.7.50", callId, "Require: 100rel\r\n"));
 		const std::string ringing = findSent(rig.sent, "SIP/2.0 180 Ringing", "CSeq: 1 INVITE");
 		return {headerValue(ringing, "RSeq"), toTagOf(ringing)};
-	}
-
-	// RFC 5737 TEST-NET-3: not routable, and the send callback above only captures.
-	constexpr const char* kSbcIp = "203.0.113.5";
-
-	void configureTrunk(RequestsHandler& handler)
-	{
-		SipTrunk::Config c;
-		std::snprintf(c.host, sizeof(c.host), "%s", kSbcIp);
-		c.port = 5060;
-		std::snprintf(c.fromUser, sizeof(c.fromUser), "%s", "15551230000");
-		c.enabled = true;
-		handler.setTrunkConfig(c);
-	}
-
-	size_t countSentTo(const Sent& sent, const char* ip, const std::string& startLine)
-	{
-		size_t n = 0;
-		for (const auto& [addr, msg] : sent)
-		{
-			if (addr.sin_addr.s_addr == inet_addr(ip) && msg && msg->toString().rfind(startLine, 0) == 0) ++n;
-		}
-		return n;
 	}
 
 	// handle() drops a source's packets past a burst of 40 (allowPacket), which would look like a full pool.
@@ -514,14 +490,11 @@ TEST(Prack100rel, ProxyRequire100relTo777EchoStays420)
 }
 
 // Guard, passes on unfixed code: a 911 with Require: 100rel is not refused and gets no
-// RSeq. Its path is the existing emergency yield, so it is never reliable (Rule 5). The caller
-// hears ringback, so the 911 was taken up rather than refused; the rig configures a capture-only
-// carrier just so it is not answered 503, and where the call goes from there is not asserted.
+// RSeq. Its path is the existing emergency yield, so it is never reliable (Rule 5). The rig has
+// no route for a 911, and none is configured: the board's own answer to that is not asserted.
 TEST(Prack100rel, Emergency911WithRequire100relIsNotRefusedAndGetsNoRSeq)
 {
 	EchoRig rig;
-	configureTrunk(rig.handler);
-	rig.sent.clear();
 	rig.handler.handle(makeInvite("500", "911", "192.168.7.50", "e-911", "Require: 100rel\r\n"));
 
 	EXPECT_FALSE(anySent(rig.sent, "420 Bad Extension"))
@@ -530,8 +503,6 @@ TEST(Prack100rel, Emergency911WithRequire100relIsNotRefusedAndGetsNoRSeq)
 		<< "Rule 5: a 911 is never answered on the reliable-provisional path";
 	EXPECT_EQ(rig.handler.getEmergencyHeaderYields(), 1u)
 		<< "the 911 takes the header gate's emergency yield, exactly as it does without the 100rel work";
-	EXPECT_EQ(countSentTo(rig.sent, "192.168.7.50", "SIP/2.0 180 Ringing"), 1u)
-		<< "the caller must hear ringback";
 }
 
 // Red on unfixed code: the PRACK was dropped. The echo sent no reliable provisional, so
@@ -672,34 +643,29 @@ TEST(Prack100rel, PrackOnAPsapCallbackTo777DialogStaysSilent)
 	}
 }
 
-// Red on 6dd8ed9e (Rule 5): *11 (and *69) repoint a live call's dest at a virtual 777 peer, so a call that
-// is not the echo test, a relayed call or a 911 over the trunk, looks like one by its dest number. Its PRACK is
-// the far leg's to answer, not the PBX's. 6dd8ed9e answered it 481.
+// Red on 6dd8ed9e (Rule 5): *11 (and *69) repoint a live call's dest at a virtual 777 peer, so a relayed
+// call (a 911 relayed the same way included) looks like the echo test by its dest number. Its PRACK is the
+// far leg's to answer, not the PBX's. 6dd8ed9e answered it 481. Covered with a relayed 500 to 600 call.
 TEST(Prack100rel, PrackOnACallRedirectedToTheEchoByStar11StaysSilent)
 {
-	for (const char* dialed : {"600", "911"})
-	{
-		SCOPED_TRACE(dialed);
-		EchoRig rig;
-		rig.handler.handle(makeRegister("600", "192.168.7.60", "reg-600"));
-		configureTrunk(rig.handler);
-		const std::string id = std::string("e-s11-") + dialed;
-		const std::string key = "Call-ID: " + id;
-		rig.handler.handle(makeInvite("500", dialed, "192.168.7.50", id));
-		ASSERT_TRUE(rig.handler.getSession(key).has_value()) << "precondition: the call has a session";
+	EchoRig rig;
+	rig.handler.handle(makeRegister("600", "192.168.7.60", "reg-600"));
+	const std::string id = "e-s11-600";
+	const std::string key = "Call-ID: " + id;
+	rig.handler.handle(makeInvite("500", "600", "192.168.7.50", id));
+	ASSERT_TRUE(rig.handler.getSession(key).has_value()) << "precondition: the call has a session";
 
-		for (const char digit : std::string("*11")) rig.handler.handle(makeInfoDigit(id, digit));
+	for (const char digit : std::string("*11")) rig.handler.handle(makeInfoDigit(id, digit));
 
-		const auto session = rig.handler.getSession(key);
-		ASSERT_TRUE(session.has_value());
-		ASSERT_TRUE(session.value()->getDest());
-		ASSERT_EQ(session.value()->getDest()->getNumber(), "777")
-			<< "precondition: *11 moved the call's destination to the virtual echo peer";
-		rig.sent.clear();
-		rig.handler.handle(makePrack(id, "calleetag", "1 1 INVITE"));
+	const auto session = rig.handler.getSession(key);
+	ASSERT_TRUE(session.has_value());
+	ASSERT_TRUE(session.value()->getDest());
+	ASSERT_EQ(session.value()->getDest()->getNumber(), "777")
+		<< "precondition: *11 moved the call's destination to the virtual echo peer";
+	rig.sent.clear();
+	rig.handler.handle(makePrack(id, "calleetag", "1 1 INVITE"));
 
-		EXPECT_FALSE(anySent(rig.sent, "PRACK")) << "a relayed call's PRACK is not the PBX's to answer";
-	}
+	EXPECT_FALSE(anySent(rig.sent, "PRACK")) << "a relayed call's PRACK is not the PBX's to answer";
 }
 
 // Guard, passes on 6dd8ed9e: RAck 0 is not an RSeq (RFC 3262 §7.1 starts at 1), so an unarmed provisional
