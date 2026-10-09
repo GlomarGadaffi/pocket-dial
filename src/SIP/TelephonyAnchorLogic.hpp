@@ -77,7 +77,8 @@ inline bool base64UrlDecode(const std::string& in, std::vector<uint8_t>& out)
 // write it to `out`. Minimal, allocation-free: finds "\"key\"", skips ':' and
 // whitespace, parses an integer (optionally signed). Returns false if the key
 // is absent or the value is not numeric. Sufficient for JWT `exp`/`iat` claims,
-// which are integer seconds as Telephony issues them. A fraction is cut, not rounded.
+// which are integer seconds as Telephony issues them. A number it cannot read exactly (a
+// fraction, an exponent, 19 or more digits) is refused, not cut or wrapped.
 inline bool scanJsonNumber(const std::string& json, const std::string& key, int64_t& out)
 {
 	const std::string needle = "\"" + key + "\"";
@@ -103,11 +104,17 @@ inline bool scanJsonNumber(const std::string& json, const std::string& key, int6
 			return false;   // not a number (e.g. a quoted/boolean value)
 		}
 		int64_t v = 0;
+		int digits = 0;
 		while (i < json.size() && json[i] >= '0' && json[i] <= '9')
 		{
+			if (++digits > 18) return false;   // 19 digits can overflow an int64; no JWT time has them
 			v = v * 10 + (json[i] - '0');
 			++i;
 		}
+		// A fraction or an exponent is a number this scan cannot read exactly: "1.7e9" must not
+		// read as 1, and cutting exp and iat each to whole seconds can overstate the lifetime by up
+		// to a second, the unsafe direction. Refused, so decodeJwtLifetimeUs() takes its fallback.
+		if (i < json.size() && (json[i] == '.' || json[i] == 'e' || json[i] == 'E')) return false;
 		out = neg ? -v : v;
 		return true;
 	}

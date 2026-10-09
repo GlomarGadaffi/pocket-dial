@@ -133,9 +133,45 @@ TEST(TelephonyLogic, DecodeJwtLifetimeFromARealisticPayload)
 	    "{\"iss\":\"https://pbx.example.com\",\"aud\":[\"call_control\"],\"nbf\":1700000000,"
 	    "\"exp\": 1700003600,\"iat\":1700000000,\"client_id\":\"900\",\"scope\":\"exp iat\"}";
 	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt(payload)), 3600LL * 1000000);
-	// A fraction is cut, not rounded: 3600.9 s - 0.2 s is 3600 s here (cJSON gave 3600.7 s).
-	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt("{\"iat\":1700000000.2,\"exp\":1700003600.9}")),
-	          3600LL * 1000000);
+}
+
+TEST(TelephonyLogic, DecodeJwtLifetimeFallsBackOnAFractionOrAnExponent)
+{
+	// Supersedes the earlier "a fraction is cut, not rounded" (#862). Cutting exp and iat each to
+	// whole seconds can put the lifetime up to a second HIGH, the unsafe direction (exp 101.0 and
+	// iat 100.9 would read as 1 s for 0.1 s), and "1.7e9" used to read as 1. A number with a '.',
+	// 'e' or 'E' after its digits is not read at all, so the lifetime is the 50 minute fallback.
+	for (const char* payload : {
+	         "{\"iat\":1700000000.2,\"exp\":1700003600.9}", "{\"iat\":1700000000,\"exp\":1700003600.5}",
+	         "{\"iat\":1700000000.5,\"exp\":1700003600}", "{\"iat\":1.7e9,\"exp\":1.7000036e9}",
+	         "{\"iat\":1700000000,\"exp\":1700003600E0}", "{\"iat\":1700000000,\"exp\":17000036e2}"})
+	{
+		EXPECT_EQ(decodeJwtLifetimeUs(makeJwt(payload)), kTokenFallbackLifetimeUs) << payload;
+	}
+}
+
+TEST(TelephonyLogic, ScanJsonNumberRefusesWhatItCannotReadExactly)
+{
+	int64_t v = 777;
+	// "1.7e9" must not read as 1, and 19 or more digits must not overflow a signed 64-bit value.
+	for (const char* json : {"{\"exp\":1.7e9}", "{\"exp\":1700000000.5}", "{\"exp\":1700000000E0}", "{\"exp\":17e8}",
+	                         "{\"exp\":1234567890123456789}", "{\"exp\":9223372036854775808}",
+	                         "{\"exp\":99999999999999999999999}"})
+	{
+		EXPECT_FALSE(scanJsonNumber(json, "exp", v)) << json;
+	}
+	EXPECT_EQ(v, 777) << "a refusal leaves out alone";
+	// What it can read exactly still reads: 18 digits is the most it takes.
+	ASSERT_TRUE(scanJsonNumber("{\"exp\":123456789012345678}", "exp", v));
+	EXPECT_EQ(v, 123456789012345678);
+	ASSERT_TRUE(scanJsonNumber("{\"exp\":-5}", "exp", v));
+	EXPECT_EQ(v, -5);
+	for (const char* json : {"{\"exp\":42}", "{\"exp\":42,\"x\":1}", "{\"exp\":42 }", "{\"a\":[1],\"exp\":42}"})
+	{
+		v = 0;
+		ASSERT_TRUE(scanJsonNumber(json, "exp", v)) << json;
+		EXPECT_EQ(v, 42) << json;
+	}
 }
 
 TEST(TelephonyLogic, DecodeJwtLifetimeTakesThreeAllocationsAndNoJsonTree)

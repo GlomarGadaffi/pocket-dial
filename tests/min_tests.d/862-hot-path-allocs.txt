@@ -7,5 +7,6 @@
 #   refresh while a 911/933 is pending), Sos401.* (5: a 911/933 POST answered 401 gets one fetch and
 #   one retry), TokenCheck.* (3: an empty or non-JWT token is not installed) and JsonStringField.* (9:
 #   the bounded scanner), the #948 arena contract for the token body.
-#   TelephonyAnchorLogic_test.cpp (2): DecodeJwtLifetime* (realistic claims, three allocations and no JSON tree).
-60
+#   TelephonyAnchorLogic_test.cpp (4): DecodeJwtLifetime* (3: realistic claims, three allocations and no
+#   JSON tree, a fraction or exponent falls back) and ScanJsonNumberRefusesWhatItCannotReadExactly.
+62
