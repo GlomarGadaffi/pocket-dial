@@ -412,7 +412,7 @@ TEST(PcapCapture, RecordingAllocatesNothingAfterConstruction) {
 	const sockaddr_in peer = addr("10.0.0.9", 5060);
 	// Every payload is built BEFORE the guard: small, SSO-sized, a full slot, and
 	// one past the slot, so the truncating path is inside the counted block too.
-	const std::string small = "OPTIONS sip:x SIP/2.0\r\n\r\n";
+	const std::string smallPayload = "OPTIONS sip:x SIP/2.0\r\n\r\n";
 	const std::string invite(1500, 'i');
 	const std::string exact(PcapCapture::kSlotBytes, 'e');
 	const std::string oversize(PcapCapture::kSlotBytes + 300, 'o');
@@ -424,7 +424,7 @@ TEST(PcapCapture, RecordingAllocatesNothingAfterConstruction) {
 	// Three times round the ring, so filling, wrapping and overwriting are all counted.
 	for (std::size_t i = 0; i < PcapCapture::kRingSize * 3; ++i)
 	{
-		cap->record(false, peer, small);
+		cap->record(false, peer, smallPayload);
 		cap->record(true,  peer, invite);
 		cap->record(false, peer, exact);
 		cap->record(true,  peer, oversize);
@@ -450,12 +450,12 @@ TEST(PcapCapture, SerializeIntoAllocatesNothingAndMatchesToString) {
 
 	// Truncated: writes exactly `cap` bytes, still reports the full length, and
 	// leaves everything past `cap` untouched.
-	std::array<char, 40> small;
-	small.fill('#');
+	std::array<char, 40> smallPayload;
+	smallPayload.fill('#');
 	const std::size_t cap = 25;
-	EXPECT_EQ(msg.serializeInto(small.data(), cap), expected.size());
-	EXPECT_EQ(std::string(small.data(), cap), expected.substr(0, cap));
-	EXPECT_EQ(small[cap], '#');
+	EXPECT_EQ(msg.serializeInto(smallPayload.data(), cap), expected.size());
+	EXPECT_EQ(std::string(smallPayload.data(), cap), expected.substr(0, cap));
+	EXPECT_EQ(smallPayload[cap], '#');
 }
 
 TEST(PcapCapture, OversizeMessageIsTruncatedAndFlaggedNotReallocated) {
