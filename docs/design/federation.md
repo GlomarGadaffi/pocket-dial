@@ -146,13 +146,15 @@ Host-testable (names follow EDT):
 - Digit-keeping builder: To and Request-URI user equal the dialed digits.
 - Credentials (Option 2 only): GET omits it, backup omits it, factory reset wipes it. `SipRegistrationClient` is already host-tested; `PeerLink` adds fake-clock re-arm tests.
 
-Bench (hardware, operator allocates boards; no trunk or anchor configured on either unit for Rule 5 steps; 933 only, never 911):
+Bench (hardware, operator allocates boards). For Rule 5 steps: no trunk, no anchor and no emergency-notification recipients on either
+unit (an unrouted 933 still fires `notifyEmergencyNotRouted`, RH.cpp:13049-13061, TEST-tagged), 933 only and never 911, and desmo's go-ahead before any dial:
 1. Both directions: two-way audio, RFC 4733 DTMF, hold/resume, BYE from each side, a call past the session timer.
 2. Media: phone subnets routed (direct) versus tunnel-only (shows whether a relay is needed).
 3. Faults: 20 s link drop idle and mid-call; peer reboot; peer IP change. Record time to recover.
 4. Rule 5 on the wire: pcap both units while a phone on A dials 933 with `8*` configured. Expect 503 from A and zero packets to B's 5060.
 5. Load: 8 local calls plus a peer call; compare `msgPoolRefusals` and free heap/PSRAM before and after.
-6. Abuse: sipp from a third host spoofing the peer IP at B with To 555/999/888/933. Expect refusals, no session.
+6. Abuse: sipp from a third host spoofing the peer IP at B with To 555/999/888. Expect refusals, no session. A spoofed 933 follows poll 2's
+   answer (today it routes as an emergency call under a matching From, G1), so run it only after that answer.
 
 ## 7. Decision asked
 
