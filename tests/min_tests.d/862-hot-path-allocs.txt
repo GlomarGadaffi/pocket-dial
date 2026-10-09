@@ -1,0 +1,24 @@
+# #862 hot-path allocations. AllocBaseline_test.cpp (3): Issue862SyslogStampAndLineTakeNoHeap,
+#   Issue862TeardownSnapshotTakesNoHeapForIdsThatFit, Issue862TeardownSnapshotKeepsAnOverlongIdWholeAndFreesIt.
+#   TokenBodyArena_test.cpp (88): TokenBodyArena.* (21: capacity edge, arena full, read error, timeout,
+#   claim, the budget enforced per transport read as the device reads, the read answer mapping, the
+#   release wipe), TokenLanes.* (20: the 911/933 lane's own arena, its failure branches, no waiting,
+#   the fetch's overall deadline, a cached token is never fetched ahead of a 911/933, the witness, no
+#   ordinary refresh while a 911/933 is pending, the 911/933 call numbers, the claim-loss witness
+#   names the losing 911/933), Sos401.* (11: a 911/933 POST answered 401 gets one fetch and one retry,
+#   whether or not another 911/933 is pending or has live streams; the live-streams line names both
+#   calls and is never sampled; the loser of two fetches is refused the arena at once, with and
+#   without a cached token, and falls to #880), TokenInstall.* (6: a response is installed only if
+#   its request was issued after the installed token's, both finishing orders, and the sampled
+#   discard line; a background refresh issued before the installed token is discarded and one issued
+#   after replaces it), TokenCheck.* (3: an empty or non-JWT token is not installed),
+#   TokenMaint.* (17: the 10-minute background refresh: the decision, one test per reason plus the
+#   boundary, the precedence, a token that lives no longer than the margin, the 60 s retry floor; the
+#   maintenance lane's own arena that is claimed without waiting and never takes the 911/933 or the
+#   ordinary one; the lanes seeing each other's fetches and a pending 911/933 or live streams
+#   holding it back; the refresh line never sampled, the skip line sampled first then every 16th)
+#   and JsonStringField.* (10: the bounded scanner), the #948 arena contract for the token body.
+#   (TokenLanes.TheTwoArenasAreTheWholeCost became TheThreeArenasAreTheWholeCost: no count change.)
+#   TelephonyAnchorLogic_test.cpp (4): DecodeJwtLifetime* (3: realistic claims, three allocations and no
+#   JSON tree, a fraction or exponent falls back) and ScanJsonNumberRefusesWhatItCannotReadExactly.
+95

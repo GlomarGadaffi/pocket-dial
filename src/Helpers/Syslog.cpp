@@ -449,9 +449,13 @@ namespace Syslog
 		// to stamp on receipt, which loses queueing delay and is wrong outright for
 		// anything logged during a network stall. Returns "-" until SNTP lands, so
 		// early-boot frames stay conformant rather than carrying a fabricated 1970.
-		const std::string nowStr = timesync::rfc3339Now();
+		// A stack buffer, not timesync::rfc3339Now(): a synced stamp is 20 characters, over
+		// the std::string small-string buffer, so the old form heap-allocated on every line.
+		// 21 bytes is smaller than the std::string object it replaces (#862).
+		char nowBuf[timesync::kRfc3339Bytes];
+		const size_t nowLen = timesync::rfc3339NowInto(nowBuf, sizeof(nowBuf));
 		const size_t len = formatFrame(frame, sizeof(frame), severity, facility, appName, msg,
-		                               nowStr.c_str());
+		                               nowLen > 0 ? nowBuf : timesync::kNilValue);
 		if (len == 0)
 		{
 			return;
