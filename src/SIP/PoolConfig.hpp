@@ -293,9 +293,8 @@
 #endif
 
 // Issue #731: which outside-line paths this build carries. The constrained build
-// (main/CMakeLists.txt, -D SIP_OUTSIDE_LINE=anchor|trunk) sets exactly one of these
-// to 1; every other build, host tests included, keeps both. Nothing reads them yet:
-// compiling the unchosen path out is the rest of #731.
+// (main/CMakeLists.txt, -D SIP_OUTSIDE_LINE=anchor) sets HAS_TRUNK to 0, which compiles
+// SipTrunk out (below and SipTrunk.hpp); every other build, host tests included, keeps both.
 #ifndef POCKETDIAL_HAS_ANCHOR
 #define POCKETDIAL_HAS_ANCHOR 1
 #endif
