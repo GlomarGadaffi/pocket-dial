@@ -777,6 +777,10 @@ public:
 		{
 			if (!_a) return;
 			_a->_used = 0;
+			// Cleared on every release, so a token (or the start of a body that then failed) does
+			// not stay in the reserved arena until the next fetch overwrites it. Before _busy
+			// is released, so the next claimant starts on zeros.
+			std::memset(_a->_buf, 0, N + 1);
 			_a->_busy.store(false, std::memory_order_release);
 			_a = nullptr;
 		}

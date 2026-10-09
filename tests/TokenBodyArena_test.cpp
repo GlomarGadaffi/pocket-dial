@@ -468,6 +468,40 @@ TEST(TokenBodyArena, ALeaseReleasesTheArenaOnEveryExitAndTheNextClaimStartsEmpty
 	EXPECT_EQ(got, "tok");
 }
 
+TEST(TokenBodyArena, ReleasingTheArenaWipesItSoNeitherATokenNorAPartialBodyStaysInRam)
+{
+	// The arena is reserved for the life of the client. Whatever was read into it, a whole token
+	// or the first part of a body that then failed, stays there until the next fetch overwrites
+	// it unless the release clears it. (The token also lives in the client's own strings; this is
+	// the copy that is nobody's.)
+	auto nonZero = [](Arena::Lease& l) {
+		return static_cast<std::size_t>(std::count_if(l.data(), l.data() + kN + 1, [](char c) { return c != 0; }));
+	};
+	const std::string token = filler(1400);
+	for (const int how : {0, 1, 2})
+	{
+		Arena arena;
+		std::int64_t clock = kT0;
+		{
+			Arena::Lease lease = arena.tryClaim();
+			ASSERT_TRUE(lease);
+			Script script;
+			switch (how)
+			{
+				case 0: script.bytes(tokenBody(token)); break;                                  // a whole token
+				case 1: script.bytes(tokenBody(token).substr(0, 700)).code(-1); break;          // a read error mid-body
+				default: script.bytes(filler(kN + 1)); break;                                   // too big: the probe byte is written
+			}
+			const BodyStatus st = run(lease, script, clock);
+			EXPECT_EQ(st, how == 0 ? BodyStatus::Ok : (how == 1 ? BodyStatus::ReadError : BodyStatus::ArenaFull));
+			EXPECT_GT(nonZero(lease), 0u) << "something really is in the arena before the release, case " << how;
+		}
+		Arena::Lease again = arena.tryClaim();
+		ASSERT_TRUE(again);
+		EXPECT_EQ(nonZero(again), 0u) << "case " << how << ": the release must clear every byte, the probe byte included";
+	}
+}
+
 TEST(TokenBodyArena, AMovedLeaseKeepsTheClaimOnceAndReleasesItOnce)
 {
 	Arena arena;
