@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -247,6 +248,159 @@ TEST(TokenBodyArena, ABodyInsideTheBudgetIsNotTimedOut)
 	ASSERT_TRUE(lease);
 	EXPECT_EQ(run(lease, script, clock, 3000000), BodyStatus::Ok);
 	EXPECT_EQ(held(lease), body);
+}
+
+// ── the budget is enforced per transport read, as the device reads ───────────────────
+// The tests above hand collect() a read() that returns after one transport read. The board's
+// esp_http_client_read() (ESP-IDF v6.0.1) does not: it loops transport reads until `len` bytes
+// of body are stored or the body ends, so one read() with room for 4,097 bytes can hold the
+// socket for a whole dripped body. These model that, so the budget has to be checked often
+// enough for that to be bounded.
+
+namespace
+{
+	class IdfRead
+	{
+	public:
+		// Each transport read delivers the next byte `gapUs` of clock after the last. chunk > 0: a
+		// chunked response spends `framing` transport reads on size-line bytes that carry no body
+		// before every `chunk` bytes of body.
+		IdfRead(std::string body, std::int64_t gapUs, std::int64_t* clock, std::size_t chunk = 0, std::size_t framing = 0)
+		    : _body(std::move(body)), _gapUs(gapUs), _clock(clock), _chunk(chunk), _framing(framing) {}
+
+		int read(char* dst, std::size_t len)
+		{
+			++_calls;
+			_maxRoom = std::max(_maxRoom, len);
+			std::size_t stored = 0;
+			while (stored < len && _pos < _body.size())
+			{
+				if (_chunk != 0 && _left == 0)
+				{
+					for (std::size_t i = 0; i < _framing; ++i) tick();
+					_left = _chunk;
+				}
+				tick();
+				dst[stored++] = _body[_pos++];
+				if (_chunk != 0) --_left;
+			}
+			return static_cast<int>(stored);   // 0 once the body is over
+		}
+
+		std::size_t transportReads() const { return _transportReads; }
+		std::size_t calls() const { return _calls; }
+		std::size_t maxRoom() const { return _maxRoom; }
+
+	private:
+		void tick() { *_clock += _gapUs; ++_transportReads; }
+
+		std::string  _body;
+		std::int64_t _gapUs;
+		std::int64_t* _clock;
+		std::size_t  _chunk, _framing, _left = 0, _pos = 0, _transportReads = 0, _calls = 0, _maxRoom = 0;
+	};
+}
+
+TEST(TokenBodyArena, FailureTimeout_AServerDrippingBytesIsStoppedAtTheBudgetEvenWhenEachReadBlocksForItsWholeRoom)
+{
+	// 2,000 bytes, one a second, a 3 s budget. If collect() let one read() ask for the whole
+	// arena, that read would loop 2,000 transport reads, i.e. 2,000 s, before collect() could
+	// look at the clock. The room it asks for has to stay small enough to look every transport read.
+	Arena arena;
+	std::int64_t clock = kT0;
+	IdfRead dev(filler(2000), 1000000, &clock);
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	const BodyStatus st = lease.collect([&](char* d, std::size_t room) { return dev.read(d, room); },
+	                                    [&] { return clock; }, 3000000);
+	EXPECT_EQ(st, BodyStatus::Timeout);
+	EXPECT_EQ(lease.size(), 0u);
+	EXPECT_LE(clock - kT0, 3000000 + 1000000) << "stopped at the budget plus the one transport read already in progress";
+	EXPECT_LE(dev.transportReads(), 4u);
+}
+
+TEST(TokenBodyArena, FailureTimeout_ChunkFramingCanOverrunTheBudgetByOneReadsFramingAndNoMore)
+{
+	// A chunked body spends transport reads on the size line inside a read() that stores one
+	// body byte. That is the overrun left: the budget plus the framing reads of one chunk.
+	constexpr std::size_t kFraming = 7;
+	Arena arena;
+	std::int64_t clock = kT0;
+	IdfRead dev(filler(2000), 1000000, &clock, /*chunk=*/64, kFraming);
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	const BodyStatus st = lease.collect([&](char* d, std::size_t room) { return dev.read(d, room); },
+	                                    [&] { return clock; }, 3000000);
+	EXPECT_EQ(st, BodyStatus::Timeout);
+	EXPECT_LE(clock - kT0, 3000000 + static_cast<std::int64_t>(kFraming + 1) * 1000000);
+	EXPECT_LE(dev.transportReads(), 3u + kFraming + 1);
+}
+
+TEST(TokenBodyArena, NoReadIsAskedForMoreThanTheSliceSoTheClockIsLookedAtEveryTransportRead)
+{
+	Arena arena;
+	std::int64_t clock = kT0;
+	const std::string body = tokenBody(filler(1400));
+	IdfRead dev(body, 1000, &clock);   // 1 ms a byte: well inside the budget
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	ASSERT_EQ(lease.collect([&](char* d, std::size_t room) { return dev.read(d, room); },
+	                        [&] { return clock; }, telephony::kTokenBodyBudgetUs),
+	          BodyStatus::Ok);
+	EXPECT_EQ(held(lease), body) << "reading a byte at a time loses nothing";
+	EXPECT_LE(dev.maxRoom(), telephony::kTokenReadSliceBytes);
+	EXPECT_EQ(telephony::kTokenReadSliceBytes, 1u);
+}
+
+TEST(TokenBodyArena, TheHttpReadAnswerIsMappedTheWayCollectNeeds)
+{
+	using telephony::httpReadResult;
+	constexpr int kEspFail = -1;
+	EXPECT_EQ(httpReadResult(1, false), 1);
+	EXPECT_EQ(httpReadResult(512, true), 512) << "data is data, whatever the completeness says";
+	EXPECT_EQ(httpReadResult(0, true), 0) << "the end of a whole body";
+	EXPECT_EQ(httpReadResult(0, false), -1) << "a 0 from a body that is not whole is an error, never a shorter token";
+	EXPECT_EQ(httpReadResult(telephony::kHttpReadTimedOut, false), telephony::kHttpReadTimedOut) << "EAGAIN is a timeout";
+	EXPECT_EQ(httpReadResult(telephony::kHttpReadTimedOut, true), telephony::kHttpReadTimedOut);
+	EXPECT_EQ(httpReadResult(kEspFail, false), -1) << "ESP_FAIL";
+	EXPECT_EQ(httpReadResult(kEspFail, true), -1);
+	EXPECT_EQ(httpReadResult(-0x7002, false), -1) << "any other transport error";
+	EXPECT_EQ(httpReadResult(std::numeric_limits<int>::min(), true), -1);
+	// Through collect(): the three answers end in Ok, Timeout and ReadError.
+	for (const auto& c : {std::make_pair(telephony::kHttpReadTimedOut, BodyStatus::Timeout),
+	                      std::make_pair(kEspFail, BodyStatus::ReadError)})
+	{
+		Arena arena;
+		Arena::Lease lease = arena.tryClaim();
+		ASSERT_TRUE(lease);
+		EXPECT_EQ(lease.collect([&](char*, std::size_t) { return httpReadResult(c.first, false); },
+		                        [] { return kT0; }, telephony::kTokenBodyBudgetUs),
+		          c.second);
+	}
+}
+
+TEST(TokenBodyArena, AZeroFromABodyThatIsNotWholeIsAReadErrorAndAWholeOneEndsIt)
+{
+	// 700 bytes of a longer body, then the connection closes: the transport says 0, the response
+	// says it is not whole. That must not come back as a 700-byte token.
+	const std::string part = tokenBody(filler(900)).substr(0, 700);
+	for (const bool whole : {false, true})
+	{
+		Arena arena;
+		Arena::Lease lease = arena.tryClaim();
+		ASSERT_TRUE(lease);
+		std::size_t pos = 0;
+		const BodyStatus st = lease.collect(
+		    [&](char* d, std::size_t room) {
+			    const std::size_t n = std::min(room, part.size() - pos);
+			    std::memcpy(d, part.data() + pos, n);
+			    pos += n;
+			    return telephony::httpReadResult(static_cast<int>(n), whole);
+		    },
+		    [] { return kT0; }, telephony::kTokenBodyBudgetUs);
+		EXPECT_EQ(st, whole ? BodyStatus::Ok : BodyStatus::ReadError) << "whole=" << whole;
+		EXPECT_EQ(lease.size(), whole ? part.size() : 0u);
+	}
 }
 
 // ── the claim: nobody waits, nothing is held across the read ───────────────────────

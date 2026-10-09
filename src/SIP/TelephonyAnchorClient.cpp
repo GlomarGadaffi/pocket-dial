@@ -2518,10 +2518,9 @@ bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client,
 	    [client, deadlineUs](char* dst, std::size_t room) -> int {
 		    if (!armTokenOpTimeout(client, deadlineUs)) return telephony::kHttpReadTimedOut;
 		    const int n = esp_http_client_read(client, dst, static_cast<int>(room));
-		    // A 0 ends the body only if the response says it is whole. Cut short (connection
-		    // closed early), it is an error, never a shorter token.
-		    if (n == 0 && !esp_http_client_is_complete_data_received(client)) return -1;
-		    return n;
+		    // The answer is mapped in telephony::httpReadResult (host-tested): a 0 ends the body
+		    // only if the response says it is whole. Cut short, it is an error, never a shorter token.
+		    return telephony::httpReadResult(n, n != 0 || esp_http_client_is_complete_data_received(client));
 	    },
 	    [] { return static_cast<std::int64_t>(esp_timer_get_time()); },
 	    bodyBudgetUs);

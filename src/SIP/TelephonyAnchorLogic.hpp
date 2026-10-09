@@ -629,12 +629,34 @@ inline constexpr std::size_t kTokenBodyBytes = 4096;
 
 // The whole body must arrive inside this budget. Each socket read already has its own timeout
 // (2 s, makeAuthedClient), but a server that sends one byte per read never trips it; this
-// bounds the sum. The worst case is the budget plus the one read already in progress.
+// bounds the sum. The budget is looked at between read() calls, and a read() is one byte
+// (kTokenReadSliceBytes), so the worst case is the budget plus the one transport read in progress
+// (plus the framing reads of a chunked body's size line, which ride along inside the same call).
+// It covers the body only: the connect and the response headers come before it, and the 911/933
+// lane bounds them with kSosTokenBudgetUs.
 inline constexpr std::int64_t kTokenBodyBudgetUs = 3LL * 1000 * 1000;
+
+// The most bytes collect() asks one read() for. esp_http_client_read() (ESP-IDF v6.0.1) does not
+// return until it has stored that many or the body ends: it loops esp_transport_read(), each with
+// the client's timeout. Room for the whole arena would let a server that drips the body hold ONE
+// call as long as it likes, and the budget would never be looked at. One byte means one
+// transport read per call, so the clock is checked every time.
+inline constexpr std::size_t kTokenReadSliceBytes = 1;
 
 // What esp_http_client_read() returns when its read times out before any data arrived:
 // -ESP_ERR_HTTP_EAGAIN, -0x7007 in ESP-IDF v6.0.1 (esp_http_client.h). The ESP arm static_asserts it.
 inline constexpr int kHttpReadTimedOut = -0x7007;
+
+// What esp_http_client_read() answered, in collect()'s terms. n > 0: bytes stored. 0 ends the
+// body only if the response says it is whole (bodyComplete, esp_http_client_is_complete_data_received):
+// cut short, e.g. the connection closed early, it is an error, never a shorter token. The timeout
+// code passes through; every other negative (ESP_FAIL is -1, or a transport error) is an error.
+inline int httpReadResult(int n, bool bodyComplete)
+{
+	if (n > 0) return n;
+	if (n == 0) return bodyComplete ? 0 : -1;
+	return n == kHttpReadTimedOut ? kHttpReadTimedOut : -1;
+}
 
 enum class BodyStatus : std::uint8_t { Ok, ArenaFull, ReadError, Timeout };
 
@@ -692,7 +714,10 @@ public:
 			{
 				// One slot past N is how an oversize body is seen. It is never kept: asking for
 				// 0 bytes instead would read as "end of body" and hand back a truncated one.
-				const int n = read(a._buf + a._used, N + 1 - a._used);
+				// And never more than a slice (kTokenReadSliceBytes), so one read() cannot hold
+				// the socket past the budget.
+				const std::size_t room = N + 1 - a._used;
+				const int n = read(a._buf + a._used, room < kTokenReadSliceBytes ? room : kTokenReadSliceBytes);
 				if (n == 0) return BodyStatus::Ok;
 				if (n < 0) return fail(n == kHttpReadTimedOut ? BodyStatus::Timeout : BodyStatus::ReadError);
 				a._used += static_cast<std::size_t>(n);
