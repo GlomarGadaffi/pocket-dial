@@ -67,6 +67,26 @@ class SosTokenWiringTest(unittest.TestCase):
         self.assertRegex(self.fetch, r"(?s)claimWaiting\(.*?\},\s*sosCallId\);",
                          "the refused claim's witness is emitted by claimWaiting, which needs the number")
 
+    def test_ruling_2_a_response_is_installed_only_if_its_request_was_issued_after_the_installed_one(self):
+        claim = self.fetch.index("_tokenLanes.claimWaiting(")
+        issued = self.fetch.index("const int64_t issuedUs = esp_timer_get_time();")
+        opened = self.fetch.index("esp_http_client_open(")
+        self.assertLess(claim, issued, "stamped after the lane claim, which start() may have waited for")
+        self.assertLess(issued, opened, "and before the request is issued")
+        gate = self.fetch.index("installed = _tokenGate.installIfNewer(issuedUs);")
+        assign = self.fetch.index("_accessToken.assign(")
+        lock = self.fetch.rindex("std::lock_guard<std::mutex> lock(_mutex);", 0, gate)
+        self.assertLess(gate, assign, "the cache is assigned only after the gate says so")
+        self.assertIn("if (installed)", self.fetch[gate:assign])
+        discarded = self.fetch.index("if (!installed) _tokenGate.noteDiscarded(lane);")
+        between = self.fetch[lock:discarded]
+        self.assertEqual(between.count("{") - between.count("}"), -1,
+                         "the discard's witness is emitted after _mutex is released")
+        self.assertNotEqual(self.fetch.find("success = true;", discarded), -1,
+                            "a discard is a success: a token issued later is installed")
+        self.assertIn("if (installed)", self.fetch[discarded:self.fetch.index("Retrieved access token")],
+                      "only an installed token is reported as retrieved")
+
 
 if __name__ == "__main__":
     unittest.main()

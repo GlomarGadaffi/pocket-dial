@@ -1045,10 +1045,14 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 	std::string body = "grant_type=client_credentials&client_id=" + urlEncode(clientId) +
 	                   "&client_secret=" + urlEncode(clientSecret);
 
+	// issuedUs is when this request is issued, after the lane claim (start() may have waited for it) and
+	// before the connect: the response is installed only if no later-issued fetch has installed first
+	// (ruling 2 on #945, _tokenGate), whichever of the two lanes finishes last.
+	const int64_t issuedUs = esp_timer_get_time();
+
 	// A 911/933 fetch must be over inside kSosTokenBudgetUs, connect and headers included: each
 	// operation below is armed with what is left, and one that finds the budget spent is not started.
-	const int64_t deadlineUs =
-	    lane == telephony::TokenLane::Emergency ? esp_timer_get_time() + telephony::kSosTokenBudgetUs : 0;
+	const int64_t deadlineUs = lane == telephony::TokenLane::Emergency ? issuedUs + telephony::kSosTokenBudgetUs : 0;
 
 	bool success = false;
 	esp_err_t err = ESP_ERR_TIMEOUT;
@@ -1082,21 +1086,31 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 					esp_websocket_client_handle_t ws = nullptr;
 					int      tokenLen = 0;
 					int64_t  lifetimeUs = 0;
+					bool     installed = false;
 					{
 						std::lock_guard<std::mutex> lock(_mutex);
-						_accessToken.assign(tokenStr.data(), tokenStr.size());
-						_bearerHeader.assign("Bearer ");
-						_bearerHeader.append(tokenStr.data(), tokenStr.size());
-						_tokenObtainedUs = esp_timer_get_time();
-						lifetimeUs = telephony::decodeJwtLifetimeUs(_accessToken);
-						_tokenLifetimeUs = lifetimeUs;
-						tokenLen = static_cast<int>(_accessToken.length());
-						if (_wsClient)
+						// Decided under the same lock as the assignment, so two landings cannot interleave.
+						installed = _tokenGate.installIfNewer(issuedUs);
+						if (installed)
 						{
-							ws = _wsClient;
-							wsHeaders = "Authorization: " + _bearerHeader + "\r\n";
+							_accessToken.assign(tokenStr.data(), tokenStr.size());
+							_bearerHeader.assign("Bearer ");
+							_bearerHeader.append(tokenStr.data(), tokenStr.size());
+							_tokenObtainedUs = esp_timer_get_time();
+							lifetimeUs = telephony::decodeJwtLifetimeUs(_accessToken);
+							_tokenLifetimeUs = lifetimeUs;
+							tokenLen = static_cast<int>(_accessToken.length());
+							if (_wsClient)
+							{
+								ws = _wsClient;
+								wsHeaders = "Authorization: " + _bearerHeader + "\r\n";
+							}
 						}
 					}
+					// Older than the installed token: discarded, and the token that is installed stays.
+					// That is a success: a token issued later is in hand, which is what a 911/933's 401
+					// retry reads from _bearerHeader. The witness is sampled and takes no lock.
+					if (!installed) _tokenGate.noteDiscarded(lane);
 					if (ws)
 					{
 						// Issue #336 caveat, found reviewing this call while fixing that issue:
@@ -1120,8 +1134,11 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 						// lock, a race this block already had and does not widen.
 						esp_websocket_client_set_headers(ws, wsHeaders.c_str());
 					}
-					ESP_LOGI(TAG, "Retrieved access token (len=%d, lifetime=%llds)", tokenLen,
-					         static_cast<long long>(lifetimeUs / 1000000));
+					if (installed)
+					{
+						ESP_LOGI(TAG, "Retrieved access token (len=%d, lifetime=%llds)", tokenLen,
+						         static_cast<long long>(lifetimeUs / 1000000));
+					}
 					success = true;
 				}
 			}

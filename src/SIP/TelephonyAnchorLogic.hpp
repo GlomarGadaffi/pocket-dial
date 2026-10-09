@@ -810,11 +810,16 @@ private:
 // caller carries on at once with the token it has. Nothing here refuses a call.
 //
 // Both lanes can have a fetch in flight together. Telephony then grants two tokens and drops
-// the older one, and the cache keeps whichever fetch finishes last (open on #945).
+// the older one, and the cache keeps the token whose request was issued last (TokenInstallGate,
+// ruling 2 on #945), whichever fetch finishes last.
 //
 // Cost: two arenas, kTokenBodyBytes + 1 bytes of buffer each, reserved with the client: about
 // 8.2 KB on the 32-bit ESP32. That is the object size, not a heap measurement.
 enum class TokenLane : std::uint8_t { Ordinary, Emergency };
+
+// The sampled witnesses (token_sos_fallback_862, token_install_older_862) log the first of a boot
+// and then every this-many-th, so a run of them cannot flood the log.
+inline constexpr std::uint32_t kWitnessSampleEvery = 16;
 
 class TokenLanes
 {
@@ -851,11 +856,11 @@ public:
 	// A 911/933 is about to POST on the token it has. If that token is stale (near or past expiry,
 	// or none: tokenStale), no fresh one was in hand and the call goes out regardless; this only
 	// leaves a witness, sampled so a run of them cannot flood the log: the first of a boot, then
-	// every kSosFallbackLogEvery-th. It returns nothing, so nothing can refuse a call on it.
+	// every kWitnessSampleEvery-th. It returns nothing, so nothing can refuse a call on it.
 	void noteSosDial(bool tokenStale)
 	{
 		if (!tokenStale) return;
-		if (_sosFallbacks.fetch_add(1, std::memory_order_relaxed) % kSosFallbackLogEvery != 0) return;
+		if (_sosFallbacks.fetch_add(1, std::memory_order_relaxed) % kWitnessSampleEvery != 0) return;
 		PD_WITNESS_W("e911", "token_sos_fallback_862: a 911/933 goes out on the token it has, near or past expiry or none, "
 		                     "no fresh one (#862)");
 	}
@@ -907,8 +912,6 @@ public:
 	}
 
 private:
-	static constexpr std::uint32_t kSosFallbackLogEvery = 16;
-
 	Arena& arena(TokenLane lane) { return lane == TokenLane::Emergency ? _emergency : _ordinary; }
 
 	Arena                      _ordinary;
@@ -916,6 +919,45 @@ private:
 	std::atomic<std::uint32_t> _sosFallbacks{0};
 	std::atomic<int>           _emergenciesPending{0};
 	std::atomic<std::uint32_t> _sosCalls{0};
+};
+
+// ── The cache keeps the token whose request was issued last (#862, ruling 2 on #945) ───────
+// Both lanes can have a fetch in flight together, Telephony drops the older token the moment it
+// grants a newer one, and the two finish in either order. So a response is installed only if its
+// request was ISSUED later than the installed token's request, not by when it finished: an older
+// response is discarded and the token it would have replaced stays. The stamp is the time the
+// request was issued, kept with the installed token. fetchToken() calls installIfNewer() under
+// the lock that guards the cached token, noteDiscarded() after releasing it, and a discard returns
+// success: a token issued later is in hand, which is what its caller (a 911/933's 401 retry, say) needed.
+//
+// Residual, by the ruling's own definition: Telephony grants in the order it handles the requests,
+// which need not be the order they were issued in, so the token kept can be the one it dropped.
+class TokenInstallGate
+{
+public:
+	// True: the response's request was issued after the installed token's (or nothing is installed
+	// yet, so even boot time 0 installs), and this is now the installed one's stamp. False: it was
+	// issued before, or at the same instant; the caller keeps what it has. Not synchronised.
+	bool installIfNewer(std::int64_t issuedUs)
+	{
+		if (issuedUs <= _installedIssuedUs) return false;
+		_installedIssuedUs = issuedUs;
+		return true;
+	}
+
+	// A discard's witness, sampled: the first of a boot, then every kWitnessSampleEvery-th. It names
+	// the lane and carries no token.
+	void noteDiscarded(TokenLane lane)
+	{
+		if (_discards.fetch_add(1, std::memory_order_relaxed) % kWitnessSampleEvery != 0) return;
+		PD_WITNESS_W("e911", "token_install_older_862: a token response from the %s lane was discarded, its request was issued "
+		                     "before the installed token's; the newer token stays (#862)",
+		             lane == TokenLane::Emergency ? "911/933" : "ordinary");
+	}
+
+private:
+	std::int64_t               _installedIssuedUs = std::numeric_limits<std::int64_t>::min();
+	std::atomic<std::uint32_t> _discards{0};
 };
 
 // What a 911/933 does about its token before its POST (#862, operator ruling on #945). With any

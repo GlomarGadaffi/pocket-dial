@@ -1280,6 +1280,143 @@ TEST(TokenCheck, ATokenWithoutTwoDotsIsRejectedWithItsReason)
 	EXPECT_NE(std::string(telephony::tokenCheckName(telephony::TokenCheck::NotAJwt)).find("JWT"), std::string::npos);
 }
 
+// ── a response is installed only if its request was issued after the installed token's ─────
+// Operator ruling 2 on #945. Both lanes can have a fetch in flight, Telephony drops the older token
+// when it grants a newer one, and the lanes finish in either order. "Newer" is when the request was
+// ISSUED, not when it finished: the installed token is the one whose request was issued last, an
+// older response is discarded and logged (sampled), and the token it would have replaced stays.
+// fetchToken() (ESP arm) offers each response to a TokenInstallGate under _mutex; these tests drive
+// the gate with the lanes' real arenas and the same body, JSON and JWT checks.
+
+namespace
+{
+	struct Cache
+	{
+		telephony::TokenInstallGate gate;
+		std::string                 token;   // what fetchToken() installed: "" = none
+	};
+
+	// One fetch in flight on `lane`: its request was issued at issuedUs and its arena is claimed.
+	struct Flight
+	{
+		TokenLane      lane;
+		std::int64_t   issuedUs;
+		std::string    token;
+		Arena::Lease   lease;
+	};
+
+	Flight startFetch(Lanes& lanes, TokenLane lane, std::int64_t issuedUs, std::string token)
+	{
+		Flight f{lane, issuedUs, std::move(token), lanes.claim(lane)};
+		EXPECT_TRUE(f.lease) << "each lane has its own arena, so both fetches can be in flight together";
+		return f;
+	}
+
+	// The response lands: the body is read, the token scanned and checked, then offered to the gate,
+	// as fetchToken() does it. Returns what fetchToken() returns: a discard is a success, because a
+	// token issued later is installed.
+	bool land(Cache& c, Flight& f, std::int64_t& clock)
+	{
+		Script body;
+		body.bytes(tokenBody(f.token));
+		if (run(f.lease, body, clock) != BodyStatus::Ok) return false;
+		std::string_view tok;
+		if (!telephony::jsonStringField(f.lease.data(), f.lease.size(), "access_token", tok)) return false;
+		if (telephony::checkToken(tok) != telephony::TokenCheck::Ok) return false;
+		if (!c.gate.installIfNewer(f.issuedUs))
+		{
+			c.gate.noteDiscarded(f.lane);
+			return true;
+		}
+		c.token.assign(tok);
+		return true;
+	}
+
+	constexpr const char* kEarlierToken = "e30.earlier.sig";
+	constexpr const char* kLaterToken   = "e30.later.sig";
+}
+
+TEST(TokenInstall, TheLaterIssuedFetchFinishingFirstStaysInstalledWhenTheEarlierIssuedOneFinishesAfterIt)
+{
+	for (const bool emergencyIsLater : {true, false})
+	{
+		Lanes lanes;
+		Cache cache;
+		std::int64_t clock = kT0;
+		const TokenLane earlierLane = emergencyIsLater ? TokenLane::Ordinary : TokenLane::Emergency;
+		const TokenLane laterLane   = emergencyIsLater ? TokenLane::Emergency : TokenLane::Ordinary;
+		Flight earlier = startFetch(lanes, earlierLane, kT0 + 1000000, kEarlierToken);
+		Flight later   = startFetch(lanes, laterLane, kT0 + 2000000, kLaterToken);
+
+		pdwitness::clear();
+		EXPECT_TRUE(land(cache, later, clock));
+		EXPECT_EQ(cache.token, kLaterToken);
+		EXPECT_EQ(pdwitness::count("token_install_older_862"), 0u);
+
+		EXPECT_TRUE(land(cache, earlier, clock)) << "a discard is not a failed fetch: a token issued later is in hand";
+		EXPECT_EQ(cache.token, kLaterToken) << "the response issued earlier did not replace it, though it finished last"
+		                                    << (emergencyIsLater ? " (911/933 lane later)" : " (ordinary lane later)");
+		EXPECT_EQ(pdwitness::count("token_install_older_862"), 1u) << "and the discard is logged";
+	}
+}
+
+TEST(TokenInstall, TheLaterIssuedFetchFinishingSecondReplacesTheEarlierIssuedOneThatFinishedFirst)
+{
+	for (const bool emergencyIsLater : {true, false})
+	{
+		Lanes lanes;
+		Cache cache;
+		std::int64_t clock = kT0;
+		const TokenLane earlierLane = emergencyIsLater ? TokenLane::Ordinary : TokenLane::Emergency;
+		const TokenLane laterLane   = emergencyIsLater ? TokenLane::Emergency : TokenLane::Ordinary;
+		Flight earlier = startFetch(lanes, earlierLane, kT0 + 1000000, kEarlierToken);
+		Flight later   = startFetch(lanes, laterLane, kT0 + 2000000, kLaterToken);
+
+		pdwitness::clear();
+		EXPECT_TRUE(land(cache, earlier, clock));
+		EXPECT_EQ(cache.token, kEarlierToken);
+		EXPECT_TRUE(land(cache, later, clock));
+		EXPECT_EQ(cache.token, kLaterToken) << (emergencyIsLater ? "911/933 lane later" : "ordinary lane later");
+		EXPECT_EQ(pdwitness::count("token_install_older_862"), 0u) << "nothing was discarded";
+	}
+}
+
+TEST(TokenInstall, TheFirstTokenIsAlwaysInstalledAndAnEqualOrEarlierIssueTimeIsNot)
+{
+	telephony::TokenInstallGate gate;
+	EXPECT_TRUE(gate.installIfNewer(0)) << "nothing is installed yet: even a request issued at boot time 0 installs";
+	EXPECT_FALSE(gate.installIfNewer(0)) << "the same issue time is not later";
+	EXPECT_TRUE(gate.installIfNewer(1));
+	EXPECT_FALSE(gate.installIfNewer(0));
+	telephony::TokenInstallGate fresh;
+	EXPECT_TRUE(fresh.installIfNewer(5000000));
+	EXPECT_FALSE(fresh.installIfNewer(4999999));
+	EXPECT_FALSE(fresh.installIfNewer(5000000));
+	EXPECT_TRUE(fresh.installIfNewer(5000001));
+}
+
+TEST(TokenInstall, TheDiscardLogsFirstThenEverySixteenthAndNamesTheLaneButNoToken)
+{
+	telephony::TokenInstallGate gate;
+	ASSERT_TRUE(gate.installIfNewer(100));
+	pdwitness::clear();
+	for (int i = 1; i <= 40; ++i)
+	{
+		ASSERT_FALSE(gate.installIfNewer(50));
+		gate.noteDiscarded(i <= 16 ? TokenLane::Ordinary : TokenLane::Emergency);
+	}
+	EXPECT_EQ(pdwitness::count("token_install_older_862"), 3u) << "discards 1, 17 and 33 of 40";
+	const std::vector<std::string> lines = pdwitness::lines();
+	ASSERT_EQ(lines.size(), 3u);
+	EXPECT_NE(lines[0].find("ordinary lane"), std::string::npos) << "the first discard says which lane: " << lines[0];
+	EXPECT_NE(lines[1].find("911/933 lane"), std::string::npos) << "and the 17th, on the other lane: " << lines[1];
+	for (const std::string& l : lines)
+	{
+		EXPECT_EQ(l.find("e30"), std::string::npos) << "a witness never carries a token: " << l;
+		EXPECT_EQ(l.find("pset"), std::string::npos) << "nothing in it reads as the harness's upset counter: " << l;
+	}
+}
+
 // ── the bounded field scanner ──────────────────────────────────────────────────────
 
 namespace

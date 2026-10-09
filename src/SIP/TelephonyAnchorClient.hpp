@@ -159,6 +159,9 @@ private:
 	// held across the socket read; a second fetch on the same lane is turned away. The 911/933
 	// lane never waits for, and is never turned away by, an ordinary fetch.
 	telephony::TokenLanes _tokenLanes;
+	// #862 (ruling 2 on #945): a token response is installed only if its request was issued after the
+	// installed token's. installIfNewer() is called under _mutex, with the token's own assignment.
+	telephony::TokenInstallGate _tokenGate;
 
 	esp_websocket_client_handle_t _wsClient   = nullptr;
 	// ── #100: per-call media slot ────────────────────────────────────────────────
