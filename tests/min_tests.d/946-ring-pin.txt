@@ -1,0 +1,2 @@
+# RingPin_test.cpp: 10 (#946 option A, rings allocated once at init, a call only clears them)
+10
