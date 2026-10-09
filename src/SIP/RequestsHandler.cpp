@@ -2292,6 +2292,24 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// #870: a dialog stores this INVITE's From and To lines, and the BYE the PBX later
+	// builds from them must fit sipb::kMaxByeBytes. An oversize line is refused here, so
+	// nothing stored can be unbuildable. Emergency calls return above and never reach
+	// this line: a 911 is not refused for its header length (Rule 5).
+	static_assert(2 * SipLimits::kMaxDialogLineBytes + 420 <= sipb::kMaxByeBytes,
+		"a BYE with two dialog lines at the bound must fit sipb::kMaxByeBytes (#870)");
+	if (data->getFrom().size() > SipLimits::kMaxDialogLineBytes ||
+		data->getTo().size() > SipLimits::kMaxDialogLineBytes)
+	{
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 400 Bad Request");
+		response->clearBody();
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		return;
+	}
+
 	// Issue #497: the From header only NAMES the caller. Before this, any host on
 	// the link could place a call -- dial plan and trunk egress included -- as any
 	// registered extension just by writing its number in From, and in Learn mode
