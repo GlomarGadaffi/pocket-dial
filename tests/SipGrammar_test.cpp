@@ -500,5 +500,6 @@ TEST(SipGrammar, AnEmergencyWithAnOversizeDialogLineIsNotRefusedForIt)
 	i.from = "\"" + std::string(220, 'x') + "\" <sip:500@server>";
 	b.send(i);
 	EXPECT_EQ(b.count("SIP/2.0 400", kCallerIp), 0u) << b.dump();
-	EXPECT_TRUE(b.routedTo911()) << b.dump();
+	EXPECT_TRUE(b.reachedEmergencyRoute()) << b.dump();
+	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();   // never to a carrier (#930)
 }
