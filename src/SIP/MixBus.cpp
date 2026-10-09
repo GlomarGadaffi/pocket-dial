@@ -89,13 +89,18 @@ void MixBus::tick()
         {
             _ports[p].in.clear();
             _ports[p].out.clear();
-            // #170: the repacketizer belongs to the rx task, so the tick only asks. A remainder
-            // carried from this leg is dropped by the next inputFrame on this port, before the
-            // new leg's first sample goes in; Idle means nothing is carried, so nothing to ask.
-            Repack carried = Repack::Holding;
-            _ports[p].repackState.compare_exchange_strong(
-                carried, Repack::ResetRequested,
-                std::memory_order_acq_rel, std::memory_order_relaxed);
+            // #170: the repacketizer belongs to the rx task, so the tick only asks. The next
+            // inputFrame on this port drops this leg's remainder and overrun count before the new
+            // leg's first sample goes in. A port that carries nothing and never overran (a 20 ms
+            // leg) is left Idle, so its next leg stays on the ring path.
+            Repack rs = _ports[p].repackState.load(std::memory_order_acquire);
+            if (rs == Repack::Holding ||
+                (rs == Repack::Idle && _ports[p].repackDrops.load(std::memory_order_relaxed) != 0))
+            {
+                _ports[p].repackState.compare_exchange_strong(
+                    rs, Repack::ResetRequested,
+                    std::memory_order_acq_rel, std::memory_order_relaxed);
+            }
             _ports[p].state.store(State::Free, std::memory_order_release); // clean + free
             present[p] = 0;
             continue;

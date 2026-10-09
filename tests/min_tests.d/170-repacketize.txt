@@ -1,2 +1,2 @@
-# Repacketizer_test.cpp: 12 tests (#170: pure 10/20/30 ms reframing with golden frames, drop-oldest overrun count and no-heap, the 479-sample bound; MixBus wiring: sticky routing, port-reuse reset, per-port drop count, 20 ms leg unchanged)
-12
+# Repacketizer_test.cpp: 13 tests (#170: pure 10/20/30 ms reframing with golden frames, drop-oldest overrun count and no-heap, the 479-sample bound; MixBus wiring: sticky routing, port-reuse reset of the remainder and of the drop count, per-port drop count, 20 ms leg unchanged)
+13

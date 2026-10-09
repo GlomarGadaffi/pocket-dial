@@ -330,6 +330,26 @@ TEST(MixBusRepack, AnOverrunIsCountedPerPort)
 	EXPECT_EQ(rig.bus.repackDropped(MixBus::MAX_PORTS), 0u);
 }
 
+TEST(MixBusRepack, AReusedPortStartsItsDropCountAtZero)
+{
+	// 600 then 161 samples: 121 dropped, and the buffer drains back to empty (Idle), so
+	// the reclaim has no remainder to flush. The count must still not outlive the leg.
+	Rig rig;
+	const auto big = ramp(0, 600), rest = ramp(600, 161);
+	ASSERT_TRUE(rig.bus.inputFrame(rig.A, big.data(), big.size()));
+	ASSERT_TRUE(rig.bus.inputFrame(rig.A, rest.data(), rest.size()));
+	ASSERT_EQ(rig.bus.repackDropped(rig.A), 121u) << "positive control: the first leg overran";
+
+	rig.bus.detach(rig.A);
+	rig.bus.tick();
+	const int a2 = rig.bus.attach();
+	ASSERT_EQ(a2, rig.A) << "the freed port is the one reused";
+
+	const auto leg2 = ramp(0, FRAME, 5000);
+	ASSERT_TRUE(rig.bus.inputFrame(a2, leg2.data(), leg2.size()));
+	EXPECT_EQ(rig.bus.repackDropped(a2), 0u) << "the second leg never overran";
+}
+
 TEST(MixBusRepack, ATwentyMsLegIsUnchanged)
 {
 	// Every packet exactly FRAME and nothing carried: the ring path as it always was.

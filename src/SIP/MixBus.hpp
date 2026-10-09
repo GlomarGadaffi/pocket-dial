@@ -44,8 +44,9 @@ public:
 
     int activePorts() const;
 
-    // Samples this port's repacketizer discarded to overrun (n > MAX_IN, oldest first) since the
-    // leg attached. 0 for a 20 ms leg and for a port out of range.
+    // Samples this port's repacketizer discarded to overrun (n > MAX_IN, oldest first) by the
+    // current leg: restarts at 0 on the first frame after the port is reused. 0 for a 20 ms leg
+    // and for a port out of range.
     uint32_t repackDropped(int port) const;
 
 private:
@@ -63,7 +64,11 @@ private:
         PlayoutBuffer      out;    // bus -> leg  (same role as MediaBridge's playout buffer)
 
         // #170. `repack` has ONE writer, the port's rx task inside inputFrame(); the tick never
-        // touches it (it only moves repackState Holding -> ResetRequested), so it needs no lock.
+        // touches it (it only asks, via repackState), so it needs no lock. Known window: stopBridge()
+        // detaches before the receiver stops and stop() does not join, so the OLD leg's rx task can
+        // still be inside inputFrame() after the port is reclaimed and re-attached. The rings survive
+        // that through their mutexes; this one does not. It needs a stall longer than a tick plus a
+        // SIP re-join.
         Repacketizer           repack;
         std::atomic<Repack>    repackState{Repack::Idle};
         std::atomic<uint32_t>  repackDrops{0};   // mirror of repack.dropped() for repackDropped()
