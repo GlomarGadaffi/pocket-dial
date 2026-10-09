@@ -8,11 +8,16 @@
 // Nothing includes this header yet, so no call path can reach it. Depth 1:
 // one menu, no submenus.
 //
+// A future caller must place this after the 911/933 classifier
+// (classifyEmergencyDial) and must never let a menu intercept an emergency
+// call.
+//
 // A digit with no binding and a timeout are both failed attempts. The first
 // kMaxFailures-1 failures ask the caller to replay the prompt; the
 // kMaxFailures-th gives up and the caller applies its own fallback. Once the
-// menu has routed or given up, every event is a no-op until reset(), which
-// keeps the bound table. An empty table never routes.
+// menu has routed or given up, every event is a no-op until reset(). reset()
+// revives a menu that routed or gave up, and keeps the bound table. An empty
+// table never routes.
 
 #include <cstdint>
 

@@ -1,2 +1,2 @@
-# IvrMenu digit-menu state machine tests (#168, host-only slice)
+# IvrMenu_test.cpp: 9 (#168: host-only digit-menu state machine)
 9

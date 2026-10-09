@@ -10,12 +10,28 @@ TEST(IvrMenu, ValidDigitRoutesToItsBoundTarget)
 	IvrMenu menu;
 	ASSERT_TRUE(menu.bind('1', 2001));
 	ASSERT_TRUE(menu.bind('2', 3001));
+	ASSERT_TRUE(menu.bind('0', 0)) << "target 0 is a valid id; only a negative one is refused";
+	ASSERT_TRUE(menu.bind('9', 9001));
+	const IvrMenu table = menu;
 
 	auto r = menu.onDigit('2');
 	EXPECT_EQ(r.command, IvrMenu::Command::Route);
 	EXPECT_EQ(r.target, 3001);
 	EXPECT_TRUE(menu.isDone());
 	EXPECT_EQ(menu.onDigit('1').command, IvrMenu::Command::None) << "a routed menu is finished";
+
+	const struct
+	{
+		char digit;
+		int target;
+	} edges[] = {{'0', 0}, {'1', 2001}, {'9', 9001}};
+	for (const auto& e : edges)
+	{
+		IvrMenu fresh = table;
+		auto er = fresh.onDigit(e.digit);
+		EXPECT_EQ(er.command, IvrMenu::Command::Route) << "digit " << e.digit;
+		EXPECT_EQ(er.target, e.target) << "digit " << e.digit;
+	}
 }
 
 TEST(IvrMenu, UnknownDigitReplaysThePromptAndDoesNotRoute)
@@ -72,7 +88,7 @@ TEST(IvrMenu, RetryLimitGivesUpAndLaterEventsAreNoOps)
 	EXPECT_EQ(menu.onTimeout().command, IvrMenu::Command::None);
 }
 
-TEST(IvrMenu, ResetRevivesAMenuThatGaveUpAndKeepsTheTable)
+TEST(IvrMenu, ResetRevivesAMenuThatGaveUpOrRoutedAndKeepsTheTable)
 {
 	IvrMenu menu;
 	ASSERT_TRUE(menu.bind('1', 2001));
@@ -85,6 +101,12 @@ TEST(IvrMenu, ResetRevivesAMenuThatGaveUpAndKeepsTheTable)
 	menu.reset();
 	EXPECT_FALSE(menu.isDone());
 	auto r = menu.onDigit('1');
+	EXPECT_EQ(r.command, IvrMenu::Command::Route);
+	EXPECT_EQ(r.target, 2001);
+
+	menu.reset();
+	EXPECT_FALSE(menu.isDone()) << "reset revives a menu that routed";
+	r = menu.onDigit('1');
 	EXPECT_EQ(r.command, IvrMenu::Command::Route);
 	EXPECT_EQ(r.target, 2001);
 }
@@ -111,7 +133,7 @@ TEST(IvrMenu, EmptyTableNeverRoutes)
 	for (char digit = '0'; digit <= '9'; ++digit)
 	{
 		IvrMenu menu;
-		EXPECT_NE(menu.onDigit(digit).command, IvrMenu::Command::Route) << "digit " << digit;
+		EXPECT_EQ(menu.onDigit(digit).command, IvrMenu::Command::Replay) << "digit " << digit;
 	}
 
 	IvrMenu menu;
@@ -127,9 +149,14 @@ TEST(IvrMenu, EmptyTableNeverRoutes)
 TEST(IvrMenu, BindRefusesNonDigitsAndNegativeTargetsAndLeavesTheTableAlone)
 {
 	IvrMenu menu;
+	ASSERT_TRUE(menu.bind('1', 5));
 	EXPECT_FALSE(menu.bind('*', 1));
 	EXPECT_FALSE(menu.bind('#', 1));
 	EXPECT_FALSE(menu.bind('a', 1));
 	EXPECT_FALSE(menu.bind('1', -1));
-	EXPECT_EQ(menu.onDigit('1').command, IvrMenu::Command::Replay) << "a refused bind must not route";
+	EXPECT_FALSE(menu.bind('2', -1));
+	EXPECT_EQ(menu.onDigit('2').command, IvrMenu::Command::Replay) << "a refused bind must not route";
+	auto r = menu.onDigit('1');
+	EXPECT_EQ(r.command, IvrMenu::Command::Route) << "a refused rebind must not unbind the digit";
+	EXPECT_EQ(r.target, 5) << "a refused rebind must not change the target";
 }
