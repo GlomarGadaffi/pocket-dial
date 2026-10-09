@@ -779,6 +779,28 @@ private:
 	Arena _emergency;
 };
 
+// ── A 911/933 token fetch has an overall deadline (#862, Rule 5) ─────────────────
+// The HTTP client's timeouts are per operation (connect and handshake, the request, the response
+// headers, each body read), so a fetch of four or more operations at 2 s each can run for ten
+// seconds with every one of them inside its timeout. The 911/933 lane's fetch gets this budget for
+// the whole of it, and each operation is given the smaller of its own cap and what is left.
+// One operation can still overrun what it was given: fetch_headers, and a read of a chunked body,
+// make more than one transport read inside a single call, each with the same timeout, so a server
+// that drips bytes stretches the bound to the budget plus those reads.
+inline constexpr std::int64_t kSosTokenBudgetUs = 3LL * 1000 * 1000;
+
+// The timeout to give the next operation of a fetch that must be over by deadlineUs: its cap
+// (capMs), or what is left of the budget if that is less, rounded up to a whole millisecond. 0
+// means the budget is spent, and then the operation must NOT be started: a timeout of 0 is "poll
+// once" in the transport, not "no wait".
+inline int opTimeoutMs(std::int64_t nowUs, std::int64_t deadlineUs, int capMs)
+{
+	const std::int64_t leftUs = deadlineUs - nowUs;
+	if (leftUs <= 0) return 0;
+	const std::int64_t leftMs = (leftUs + 999) / 1000;
+	return leftMs < capMs ? static_cast<int>(leftMs) : capMs;
+}
+
 namespace detail
 {
 	inline constexpr std::size_t kNoPos = static_cast<std::size_t>(-1);

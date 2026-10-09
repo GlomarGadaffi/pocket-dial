@@ -911,6 +911,20 @@ void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 
 // ── Private Helper Functions ───────────────────────────────────────────────
 
+// #862 (Rule 5): sets the HTTP client's timeout for the next operation of a 911/933 token fetch to
+// the smaller of the client's usual 2 s (makeAuthedClient) and what is left of the fetch's budget.
+// False when the budget is spent, and then the operation is not started. deadlineUs == 0: no
+// deadline, the ordinary lane keeps the client's own per-operation timeout.
+static bool armTokenOpTimeout(esp_http_client_handle_t client, int64_t deadlineUs)
+{
+	if (deadlineUs == 0) return true;
+	constexpr int kOpCapMs = 2000;
+	const int ms = telephony::opTimeoutMs(esp_timer_get_time(), deadlineUs, kOpCapMs);
+	if (ms == 0) return false;
+	esp_http_client_set_timeout_ms(client, ms);
+	return true;
+}
+
 bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForArena)
 {
 	// #862: claim the lane's token arena before any I/O. A fetch on this lane already holds it,
@@ -958,21 +972,33 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 	std::string body = "grant_type=client_credentials&client_id=" + urlEncode(clientId) +
 	                   "&client_secret=" + urlEncode(clientSecret);
 
+	// A 911/933 fetch must be over inside kSosTokenBudgetUs, connect and headers included: each
+	// operation below is armed with what is left, and one that finds the budget spent is not started.
+	const int64_t deadlineUs =
+	    lane == telephony::TokenLane::Emergency ? esp_timer_get_time() + telephony::kSosTokenBudgetUs : 0;
+
 	bool success = false;
-	esp_err_t err = esp_http_client_open(client, body.length());
+	esp_err_t err = ESP_ERR_TIMEOUT;
+	if (armTokenOpTimeout(client, deadlineUs)) err = esp_http_client_open(client, body.length());
 	if (err == ESP_OK)
 	{
-		int writeBytes = esp_http_client_write(client, body.c_str(), body.length());
+		int writeBytes = -1;
+		if (armTokenOpTimeout(client, deadlineUs)) writeBytes = esp_http_client_write(client, body.c_str(), body.length());
 		if (writeBytes >= 0)
 		{
-			int fetch_res = esp_http_client_fetch_headers(client);
-			int status = esp_http_client_get_status_code(client);
-			ESP_LOGI(TAG, "Token request HTTP status: %d, fetch_res: %d, chunked: %d", 
+			int fetch_res = -1;
+			int status = -1;
+			if (armTokenOpTimeout(client, deadlineUs))
+			{
+				fetch_res = esp_http_client_fetch_headers(client);
+				status = esp_http_client_get_status_code(client);
+			}
+			ESP_LOGI(TAG, "Token request HTTP status: %d, fetch_res: %d, chunked: %d",
 			         status, fetch_res, esp_http_client_is_chunked_response(client));
 			if (status == 200)
 			{
 				std::string_view tokenStr;   // views the arena, which `lease` holds until this returns
-				if (readJsonStringField(client, lease, "access_token", tokenStr))
+				if (readJsonStringField(client, lease, "access_token", tokenStr, deadlineUs))
 				{
 					// This lock guards _accessToken (a std::string, genuinely needs it).
 					// _tokenObtainedUs/_tokenLifetimeUs are std::atomic (#344) and do not
@@ -2415,7 +2441,8 @@ void TelephonyAnchorClient::stopAllMediaStreams()
 
 bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client,
                                                 telephony::TokenLanes::Lease& lease,
-                                                std::string_view field, std::string_view& out)
+                                                std::string_view field, std::string_view& out,
+                                                int64_t deadlineUs)
 {
 	// The body goes straight into the claimed arena (#862): no vector, no spill, no lock held,
 	// and no 512-byte stack buffer to copy through. A body that does not fit, a failed read or
@@ -2423,8 +2450,22 @@ bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client,
 	// false and fetchToken() keeps the token it has. The scan below needs the whole body.
 	static_assert(-ESP_ERR_HTTP_EAGAIN == telephony::kHttpReadTimedOut,
 	              "esp_http_client_read()'s timeout code moved: update telephony::kHttpReadTimedOut");
+	// A 911/933 fetch shares what is left of its overall budget with the body: the body gets the
+	// smaller of its own budget and that, and each read is armed with what is left of it.
+	int64_t bodyBudgetUs = telephony::kTokenBodyBudgetUs;
+	if (deadlineUs != 0)
+	{
+		const int64_t leftUs = deadlineUs - esp_timer_get_time();
+		if (leftUs <= 0)
+		{
+			ESP_LOGE(TAG, "Token response not read: the 911/933 fetch's budget is spent");
+			return false;
+		}
+		if (leftUs < bodyBudgetUs) bodyBudgetUs = leftUs;
+	}
 	const telephony::BodyStatus st = lease.collect(
-	    [client](char* dst, std::size_t room) -> int {
+	    [client, deadlineUs](char* dst, std::size_t room) -> int {
+		    if (!armTokenOpTimeout(client, deadlineUs)) return telephony::kHttpReadTimedOut;
 		    const int n = esp_http_client_read(client, dst, static_cast<int>(room));
 		    // A 0 ends the body only if the response says it is whole. Cut short (connection
 		    // closed early), it is an error, never a shorter token.
@@ -2432,7 +2473,7 @@ bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client,
 		    return n;
 	    },
 	    [] { return static_cast<std::int64_t>(esp_timer_get_time()); },
-	    telephony::kTokenBodyBudgetUs);
+	    bodyBudgetUs);
 	if (st != telephony::BodyStatus::Ok)
 	{
 		ESP_LOGE(TAG, "Token response not read: %s (arena %u bytes)", telephony::bodyStatusName(st),

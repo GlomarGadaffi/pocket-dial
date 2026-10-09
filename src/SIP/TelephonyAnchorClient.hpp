@@ -398,8 +398,9 @@ private:
 	// Reads the token response into the claimed arena and views the string member `field` in `out`
 	// (a view into the arena: valid while `lease` is). False, with nothing in `out`, when the
 	// body does not fit, the read fails or times out, or the member is missing or not a string.
+	// deadlineUs != 0 (esp_timer): the fetch's overall deadline, which the body shares (a 911/933).
 	bool readJsonStringField(esp_http_client_handle_t client, telephony::TokenLanes::Lease& lease,
-	                         std::string_view field, std::string_view& out);
+	                         std::string_view field, std::string_view& out, int64_t deadlineUs);
 
 	// Live-state GET helpers (reconcile watchdog + drop-fallback + device resolve). Snapshot
 	// creds under _mutex then do blocking I/O lock-free.

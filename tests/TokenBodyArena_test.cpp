@@ -577,6 +577,55 @@ TEST(TokenLanes, TheTwoArenasAreTheWholeCost)
 	EXPECT_LE(sizeof(Lanes), 2 * sizeof(Arena) + 16) << "two arenas and nothing that grows";
 }
 
+// ── the 911/933 fetch's overall deadline (#862, Rule 5) ──────────────────────────────
+
+TEST(TokenLanes, AnOperationGetsItsOwnCapWhileTheBudgetHasRoomAndWhatIsLeftAfter)
+{
+	constexpr std::int64_t kNow = 7000000;
+	const std::int64_t deadline = kNow + telephony::kSosTokenBudgetUs;
+	EXPECT_EQ(telephony::kSosTokenBudgetUs, 3000000);
+	EXPECT_EQ(telephony::opTimeoutMs(kNow, deadline, 2000), 2000) << "3 s left, a 2 s cap";
+	EXPECT_EQ(telephony::opTimeoutMs(deadline - 2000000, deadline, 2000), 2000);
+	EXPECT_EQ(telephony::opTimeoutMs(deadline - 1500000, deadline, 2000), 1500) << "less is left than the cap";
+	EXPECT_EQ(telephony::opTimeoutMs(deadline - 1001, deadline, 2000), 2) << "rounded up, never down to a poll";
+	EXPECT_EQ(telephony::opTimeoutMs(deadline - 1, deadline, 2000), 1);
+}
+
+TEST(TokenLanes, ASpentBudgetGivesZeroSoTheOperationIsNotStarted)
+{
+	constexpr std::int64_t kNow = 7000000;
+	EXPECT_EQ(telephony::opTimeoutMs(kNow, kNow, 2000), 0);
+	EXPECT_EQ(telephony::opTimeoutMs(kNow + 1, kNow, 2000), 0);
+	EXPECT_EQ(telephony::opTimeoutMs(kNow + 100000000, kNow, 2000), 0) << "long overdue is still 0, never negative";
+}
+
+TEST(TokenLanes, AServerThatStallsEveryOperationCannotTakeMoreThanTheBudget)
+{
+	// Every operation lasts min(the timeout it was given, the server's gap). The fetch asks for the
+	// next operation's timeout until it is told 0. However small or large the gap, the operations
+	// together never outlast the budget, and none was given more than its cap or than was left.
+	for (const std::int64_t gapMs : {1, 3, 100, 700, 1999, 2000, 5000})
+	{
+		const std::int64_t startUs = 90000000;
+		const std::int64_t deadline = startUs + telephony::kSosTokenBudgetUs;
+		std::int64_t now = startUs;
+		int ops = 0;
+		for (;;)
+		{
+			const int ms = telephony::opTimeoutMs(now, deadline, 2000);
+			if (ms == 0) break;
+			ASSERT_GT(ms, 0);
+			ASSERT_LE(ms, 2000);
+			ASSERT_LE(now + static_cast<std::int64_t>(ms) * 1000, deadline + 999) << "never more than was left";
+			now += std::min<std::int64_t>(ms, gapMs) * 1000;
+			++ops;
+			ASSERT_LT(ops, 5000);
+		}
+		EXPECT_LE(now - startUs, telephony::kSosTokenBudgetUs) << "gap " << gapMs << " ms";
+		EXPECT_GE(now, deadline - 1000) << "and it ran until the budget was spent, gap " << gapMs << " ms";
+	}
+}
+
 // ── the bounded field scanner ──────────────────────────────────────────────────────
 
 namespace
