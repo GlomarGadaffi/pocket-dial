@@ -837,8 +837,9 @@ void RequestsHandler::initHandlers()
 
 namespace
 {
-	// Issue #172: the one route that honours Require: 100rel is the 777 echo, and only for an
-	// initial INVITE (no To tag). Only the header gate keys on this; onInvite's 777 branch keys on
+	// Issue #172: the 777 echo is the route that always honours Require: 100rel, and only for an
+	// initial INVITE (no To tag); with the default-off forward100rel flag on, forwardHonours100rel() adds a
+	// plain extension call. Only the header gate keys on this; onInvite's 777 branch keys on
 	// destNumber == "777", the same To user.
 	bool isEchoTestInvite(const SipMessage& m)
 	{
@@ -988,9 +989,12 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// 100rel. Only the 777 echo sends its 180 reliably, so only its INVITE is told 100rel is
 		// honoured; any other message is judged at its Require line as before #172. Emergency traffic
 		// is never the echo (a PSAP callback to 777 is answered by that branch), so it takes the
-		// yield below as it always has.
+		// yield below as it always has. Step 3: with the default-off flag on, a plain extension call
+		// is told the same. forwardHonours100rel() returns false first thing with the flag off, so
+		// then the gate is the one main has.
 		const bool echoInvite = isEchoTestInvite(*request) && !isEmergencyTraffic(*request);
-		const auto hv = request->checkHeaders(unsupportedTag, echoInvite);
+		const bool reliableRoute = echoInvite || forwardHonours100rel(*request);
+		const auto hv = request->checkHeaders(unsupportedTag, reliableRoute);
 		if (hv != SipMessage::HeaderVerdict::Ok)
 		{
 			if (isEmergencyTraffic(*request))
@@ -1640,7 +1644,8 @@ namespace
 	// UNAVAILABLE/OK/FINAL_FAILURE/REQUEST_TERMINATED) are RESPONSE keys, not
 	// methods, and have no business in Allow.
 	//
-	// Deliberately absent: PRACK (onPrack covers only the 777 echo, #172; 100rel is not claimed
+	// Deliberately absent: PRACK (onPrack covers only the 777 echo and, with the default-off
+	// forward100rel flag on, a relayed call whose caller required 100rel, #172; 100rel is not claimed
 	// either), NOTIFY (BlfSubscriptions SENDS them; nothing accepts one) and
 	// PUBLISH. A phone that saw those here would wait on replies we never send.
 	constexpr const char* kAllowedMethods =
@@ -1664,8 +1669,9 @@ namespace
 	// or omitting Session-Expires when refresher=uas or unsupported (#724); and
 	// in-dialog bodiless UPDATE refreshes are handled locally or relayed (#439, #782).
 	//
-	// NOT "100rel": it is honoured only in a Require on the 777 echo INVITE (#172), not as a general
-	// capability a phone could rely on. NOT "norefersub", "path", "gruu" or "outbound" — none of
+	// NOT "100rel": it is honoured only in a Require, on the 777 echo INVITE and, with the default-off
+	// forward100rel flag on, on a plain extension call (#172), not as a general capability a phone could
+	// rely on. NOT "norefersub", "path", "gruu" or "outbound" — none of
 	// them have any implementation in this codebase.
 	constexpr const char* kSupportedOptionTags = "replaces, timer";
 
@@ -2827,6 +2833,20 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Issue #172 step 3, RFC 3262 §3: the caller required 100rel and this plain call is one the PBX takes
+	// over (forwardHonours100rel: flag on, never emergency traffic). The leg to the callee loses the
+	// tag, and its offer too, or the callee could send a reliable 180 the PBX cannot PRACK (§3: a UAS
+	// must not unless Supported or Require names 100rel). `data` is edited, not only the relay below,
+	// because it is kept as the session's INVITE and every CANCEL, 487 ACK and CFB/CFNA redirect copies it
+	// (§4: no request but INVITE carries a Require of 100rel). The edit is not session state: a refused
+	// draw below drops `data` with it, and the retransmit arrives as a fresh INVITE.
+	const bool takeOver100rel = forwardHonours100rel(*data);
+	if (takeOver100rel)
+	{
+		data->removeOptionTag("Require", {}, "100rel");
+		data->removeOptionTag("Supported", "k", "100rel");
+	}
+
 	// Issue #715: draw the relay BEFORE publishing the session. Published first, a
 	// pool refusal left an Invited session with no ring timer (no CFNA/voicemail on
 	// the callee) and no relay on the wire, and the caller's INVITE retransmit is
@@ -2839,6 +2859,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 
 	_sessions.emplace(data->getCallID(), newSession);
 	newSession->setEmergency(isEmergencyCallback(called.value()->getNumber()));   // #659
+	if (takeOver100rel) newSession->openForwardedReliable(siphdr::cseqNumber(data->getCSeq()));   // #172 step 3
 
 	// Retain the original INVITE on every direct-call session — not only when
 	// the callee has a conditional forward (busy/no-answer) configured.
@@ -4967,6 +4988,44 @@ bool RequestsHandler::isEmergencyTraffic(const SipMessage& m)
 	return isPsapCallbackTo(m) || dialRuleMakesEmergency(std::string(m.getToNumber()));
 }
 
+bool RequestsHandler::forwardHonours100rel(const SipMessage& m)
+{
+	// Flag first: off, nothing below runs and the header gate is the one main has.
+	if (!_cfg.forward100rel() || m.getType() != SipMessageTypes::INVITE ||
+		std::string_view(m.getTo()).find("tag=") != std::string_view::npos || !m.requiresReliableProvisional())
+	{
+		return false;
+	}
+	// Rule 5: a PSAP callback is emergency traffic on any To and DOES reach onInvite's forward path (the
+	// 911/933 returns above it take only the dialed numbers), keeping its Require: 100rel as it always did.
+	if (isEmergencyTraffic(m)) return false;
+#if POCKETDIAL_TRUNK_INBOUND
+	if (isTrunkSbcSource(m.getSource())) return false;   // a carrier's call, or a phone behind its gateway
+#endif
+	// onInvite's #497 rule: the caller is registered, from the address it sent this from.
+	const auto caller = findClient(m.getFromNumber());
+	if (!caller.has_value() || caller.value()->getAddress().sin_addr.s_addr != m.getSource().sin_addr.s_addr)
+	{
+		return false;
+	}
+	// The callee is a registered phone that no earlier branch of onInvite claims: not a reserved or special
+	// extension, a configured page zone, a park orbit, a pickup code, a ring group or a dial rule (the list
+	// dialRuleMakesEmergency() uses), and with no call forward to redirect it.
+	const std::string dest(m.getToNumber());
+	if (!findClient(dest).has_value() || pbx::isReservedExtension(dest) ||
+		(pbx::isPageZoneExt(dest) && _cfg.findPageZone(dest)) || _park.orbitIndex(dest) >= 0 ||
+		pbx::isGroupPickupCode(dest) || !pbx::directedPickupTarget(dest).empty() || _cfg.findRingGroup(dest) ||
+		(!_cfg.dialPlan().empty() && _forker.matchDialRule(dest)))
+	{
+		return false;
+	}
+	for (const char* trigger : {"always", "busy", "noanswer"})
+	{
+		if (!_cfg.getForwardTarget(dest, trigger).empty()) return false;
+	}
+	return true;
+}
+
 bool RequestsHandler::isTrunkAnswerToOurEmergencyInvite(const SipMessage& m)
 {
 	if (!m.getStatusInfo().has_value() || m.getCSeqMethod() != "INVITE") return false;
@@ -6317,13 +6376,20 @@ void RequestsHandler::onSessionProgress(std::shared_ptr<SipMessage> data)
 
 // Issue #172, RFC 3262 §3 and §7.2. The PBX is the UAS of a PRACK only on the 777 echo test's own dialog
 // (Session::isEchoDialog, set by onInvite's 777 branch): a matching RAck gets 200 and every other PRACK
-// there gets 481, whether or not the 180 was reliable. A PRACK on any other session is a relayed dialog's,
-// not ours to answer, and stays silent as it always was; a 481 there would make its sender end an early
-// dialog (RFC 3261 §12.2.1.2). That includes a call whose dest *11 or *69 repointed at a virtual 777 peer
-// (a 911 included) and a PSAP callback to 777, so this is keyed on the session's state, not on dest.
+// there gets 481, whether or not the 180 was reliable. The same holds, with the default-off flag on, on a
+// relayed call whose caller required 100rel (Session::isForwardedReliable, answerForwardedPrack). A PRACK
+// on any other session is a relayed dialog's, not ours to answer, and stays silent as it always was; a 481
+// there would make its sender end an early dialog (RFC 3261 §12.2.1.2). That includes a call whose dest *11
+// or *69 repointed at a virtual 777 peer (a 911 included) and a PSAP callback to 777, so this is keyed on the
+// session's state, not on dest.
 void RequestsHandler::onPrack(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
+	if (session.has_value() && session.value()->isForwardedReliable())
+	{
+		answerForwardedPrack(data, session.value());   // #172 step 3
+		return;
+	}
 	if (!session.has_value() || !session.value()->isEchoDialog()) return;
 	if (!isDialogSourceAuthorized(session.value(), data->getSource())) return;
 	uint32_t rseq = 0;
@@ -6338,6 +6404,32 @@ void RequestsHandler::onPrack(std::shared_ptr<SipMessage> data)
 	response->removeHeaders("RAck");
 	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	if (matches) session.value()->acknowledgeReliableProvisional();
+	_outbox.emplace_back(data->getSource(), std::move(response));
+}
+
+// Issue #172 step 3, RFC 3262 §3 and §7.2: on a relayed call whose caller required 100rel the PBX sent the
+// reliable 180 itself (onRinging), so it is the PRACK's UAS and answers it here; the PRACK is not relayed,
+// the callee never offered 100rel. The echo test's onPrack above is the same answer for the PBX's own dialog.
+// Only the caller PRACKs. isDialogSourceAuthorized() cannot say so: it lets any address through while dest is
+// unset, which is the whole time the callee rings, so the caller's address is checked here and anything
+// else is dropped unanswered and consumes nothing.
+void RequestsHandler::answerForwardedPrack(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<Session>& session)
+{
+	const auto caller = session->getSrc();
+	if (!caller || data->getSource().sin_addr.s_addr != caller->getAddress().sin_addr.s_addr) return;
+	uint32_t rseq = 0;
+	uint32_t cseq = 0;
+	std::string_view method;
+	const bool matches = parseRAck(siphdr::stripHeaderNameView(data->getHeaderLine("RAck")), rseq, cseq, method) &&
+		method == SipMessageTypes::INVITE && session->matchesForwardedProvisional(rseq, cseq);
+	auto response = getMessageFromPool(*data);
+	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+	response->setHeader(matches ? SipMessageTypes::OK : SipMessageTypes::NO_TRANSACTION);
+	response->clearBody();
+	response->removeHeaders("RAck");
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	if (matches) session->acknowledgeForwardedProvisional();
 	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
@@ -6400,6 +6492,28 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 	if (session.has_value() && session.value()->isBlindXferLeg())
 	{
 		return;
+	}
+	// Issue #172 step 3, RFC 3262 §3: the caller required 100rel and the PBX took it over, so this 180 goes
+	// to it reliably. The callee never offered 100rel (onInvite stripped it), so the reliability is the
+	// PBX's own: its RSeq, and its Contact, so the PRACK comes here and onPrack answers it. Not
+	// before the answer: a provisional after the final is not sent (§3), and not while the previous one
+	// is unacknowledged (§3: no second reliable provisional until the first is). The body goes: a
+	// 180 with a session description would have to hold the 200 for the PRACK (§3), so there is
+	// no early media on such a call. Nothing is retransmitted (no 64*T1 timer): a lost 180 is lost ringback,
+	// and the 200 does not wait for it. The PBX sees this 180 only if the callee answers it, not
+	// the caller directly (RFC 3261 §18.2.2); a callee that answers the caller leaves it an unreliable 180.
+	if (session.has_value() && session.value()->isForwardedReliable())
+	{
+		if (session.value()->getState() != Session::State::Invited) return;
+		const uint32_t rseq = session.value()->nextForwardedRSeq();
+		if (rseq == 0) return;
+		char rseqText[11];
+		const auto conv = std::to_chars(rseqText, rseqText + sizeof(rseqText), rseq);
+		data->clearBody();
+		data->removeHeaders("Require");
+		data->addHeader("Require", "100rel");
+		data->setHeaderOnce("RSeq", std::string_view(rseqText, static_cast<size_t>(conv.ptr - rseqText)));
+		presentContact(*data, data->getToNumber());
 	}
 	endHandle(data->getFromNumber(), data);
 }
@@ -9204,6 +9318,20 @@ std::string RequestsHandler::buildContact(std::string_view number) const
 	return "Contact: <sip:" + std::string(number) + "@" + activeIp + ":" + std::to_string(_serverPort) + ";transport=UDP>";
 }
 
+void RequestsHandler::presentContact(SipMessage& msg, std::string_view number) const
+{
+	char uri[128];
+	const int n = std::snprintf(uri, sizeof(uri), "<sip:%.*s@%s:%d;transport=UDP>",
+		static_cast<int>(number.size()), number.data(), _localIp.c_str(), _serverPort);
+	if (n <= 0 || static_cast<size_t>(n) >= sizeof(uri))
+	{
+		msg.setContact(buildContact(number));
+		return;
+	}
+	msg.removeHeaders("m");   // a compact Contact would otherwise stay beside the new one
+	msg.setHeaderOnce("Contact", std::string_view(uri, static_cast<size_t>(n)));
+}
+
 // ── Dashboard query API ──────────────────────────────────────────────────────
 
 static const char* sessionStateToString(Session::State s)
@@ -10017,6 +10145,20 @@ std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
 
 	printLogs(localLogs);
 	return err;
+}
+
+// ── RFC 3262 100rel on a forwarded call (Issue #172, step 3) ──────────────────
+
+bool RequestsHandler::getForward100rel()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _cfg.forward100rel();
+}
+
+void RequestsHandler::setForward100rel(bool on)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	_cfg.setForward100rel(on);
 }
 
 // ── DID -> extension inbound routing (new) ────────────────────────────────────

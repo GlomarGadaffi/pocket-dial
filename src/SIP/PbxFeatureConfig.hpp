@@ -155,6 +155,17 @@ public:
 	bool sbcEnabled() const { return _sbcEnabled; }
 	size_t sbcRoute() const { return _sbcRoute; }
 
+	// ── RFC 3262 100rel on a forwarded call (Issue #172, step 3) ─────────────
+	// Off by default. When on, a plain extension-to-extension INVITE carrying
+	// Require: 100rel is accepted instead of answered 420: the PBX strips the tag from
+	// the leg to the callee and sends the caller a reliable 180 itself
+	// (RequestsHandler::forwardHonours100rel()). Not persisted and not on the admin
+	// API: it can be turned on only through RequestsHandler::setForward100rel(), so
+	// a shipped image has it off. A persisted toggle follows the sbcmode pattern
+	// (own NVS key plus an HTTP route) and is a separate change.
+	void setForward100rel(bool on) { _forward100rel = on; }
+	bool forward100rel() const { return _forward100rel; }
+
 #if POCKETDIAL_MULTICAST_PAGING
 	// ── Multicast paging (Issue #800) ────────────────────────────────────────
 	// Stores and persists. Validation is the caller's
@@ -239,6 +250,8 @@ private:
 	// meaningful once enabled -- see setSbcMode()'s doc comment above).
 	bool _sbcEnabled = false;
 	size_t _sbcRoute = 0;
+
+	bool _forward100rel = false;   // Issue #172 step 3: off by default, in memory only
 
 #if POCKETDIAL_MULTICAST_PAGING
 	pbx::MulticastPagingConfig _mcastPaging;   // Issue #800: off by default
