@@ -170,7 +170,7 @@ private:
 	int indexOfLocked(const std::string& callID) const;
 	void runDriver();
 
-	MixBus                    _bus;
+	MixBus                    _bus{POCKETDIAL_CONF_VAD != 0};   // #169
 	std::array<Leg, MAX_LEGS> _legs;
 	mutable std::mutex        _mutex;
 	bool                      _busAligned = false;   // set once by the constructor

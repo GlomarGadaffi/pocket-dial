@@ -35,6 +35,12 @@ void MixBus::detach(int port)
         std::memory_order_acq_rel, std::memory_order_relaxed);
 }
 
+void MixBus::setEmergency(int port, bool on)
+{
+    if (port < 0 || port >= MAX_PORTS) return;
+    _ports[port].emergency.store(on, std::memory_order_relaxed);
+}
+
 // ── Media I/O (hot path) ────────────────────────────────────────────────────
 bool MixBus::inputFrame(int port, const int16_t* pcm, size_t n)
 {
@@ -66,6 +72,8 @@ void MixBus::tick()
         {
             _ports[p].in.clear();
             _ports[p].out.clear();
+            _ports[p].hang = 0;
+            _ports[p].emergency.store(false, std::memory_order_relaxed);
             _ports[p].state.store(State::Free, std::memory_order_release); // clean + free
             present[p] = 0;
             continue;
@@ -80,6 +88,19 @@ void MixBus::tick()
         if (present[p] && (_ports[p].in.getLength() < static_cast<size_t>(FRAME) ||
                            !_ports[p].in.read(_frame[p], FRAME)))
             std::memset(_frame[p], 0, sizeof _frame[p]);   // late leg -> silence this tick
+
+        // #169: a gated-out port contributes a ZEROED frame, and stays present. Clearing
+        // present[] instead would make mix_minus_self subtract audio mix_accumulate never
+        // added, and would skip the out write so the leg underruns into comfort noise.
+        // Rule 5: the only exemption is the port's emergency flag, passed as `bypass`.
+        if (_vadGate && present[p])
+        {
+            const pd::vad::Verdict v = pd::vad::step(
+                _ports[p].hang, _frame[p], FRAME, pd::vad::kOpenEnergy, pd::vad::kHangoverFrames,
+                _ports[p].emergency.load(std::memory_order_relaxed));
+            _ports[p].hang = v.hang;
+            if (!v.participates) std::memset(_frame[p], 0, sizeof _frame[p]);
+        }
     }
 
     // (2) Full mix in int32 — NEVER saturate here.            [PIE kernel A]
