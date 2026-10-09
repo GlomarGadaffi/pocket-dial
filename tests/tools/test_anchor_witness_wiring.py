@@ -12,17 +12,64 @@ import anchor_scenarios as an  # noqa: E402
 
 SRC = os.path.join(HERE, "..", "..", "src", "SIP", "TelephonyAnchorClient.cpp")
 
+# Comments and string literals are blanked (length and newlines kept) before any brace is counted.
+_TOKEN = re.compile(r'//[^\n]*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'')
+_LOCK = re.compile(r"std::lock_guard<std::mutex> lock\(_mutex\)")
+_ESP_LOG = re.compile(r"ESP_LOG[WIE]\(")
+_HELPER_CALL = re.compile(r"(?<!::)(witnessSightingLocked|countOutboundLocked)\(")
+
+
+def _blank(src):
+    return _TOKEN.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), src)
+
+
+def _pairs(code):
+    """Map each '{' index to the index of its '}'."""
+    stack, pairs = [], {}
+    for i, ch in enumerate(code):
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            pairs[stack.pop()] = i
+    return pairs
+
+
+def _enclosing(pairs, at):
+    """(open, close) of the innermost brace block that contains index at, or None."""
+    best = None
+    for o, c in pairs.items():
+        if o < at < c and (best is None or o > best[0]):
+            best = (o, c)
+    return best
+
 
 class EspWitnessWiringTest(unittest.TestCase):
     def setUp(self):
         with open(SRC, encoding="utf-8") as f:
             self.src = f.read()
+        self.code = _blank(self.src)
+        self.pairs = _pairs(self.code)
+
+    def _line(self, at):
+        return self.src.count("\n", 0, at) + 1
+
+    def _locks(self):
+        return [m.start() for m in _LOCK.finditer(self.code)]
+
+    def _witness_logs(self):
+        """Start index of each ESP_LOG statement whose format names #888 (the cap line too)."""
+        out = []
+        for m in _ESP_LOG.finditer(self.code):
+            end = self.code.index(";", m.start())
+            if "#888" in self.src[m.start():end]:
+                out.append(m.start())
+        return out
 
     def test_888_upset_ignored_while_pending_is_logged_with_the_pending_age(self):
         self.assertIn('"Upset ignored while %d makeCall(s) pending (oldest %lld ms old): "', self.src)
         self.assertIn('"3CX does not repeat a Connected one (#888)"', self.src)
         sample = ("W (1) TelephonyAnchor: Upset ignored while 2 makeCall(s) pending (oldest 1840 ms old): "
-                  "nin=0 active=0 part=517 state=Dialing: 3CX does not repeat a Connected one (#888)")
+                  "nin=0 active=0 part=517: 3CX does not repeat a Connected one (#888)")
         self.assertEqual(an.count_lines([sample])["upset_ignored_pending_888"], 1)
         # the age is taken where the first pending makeCall begins
         self.assertRegex(self.src, r"_outboundPending\.fetch_add\(1,[^)]*\) == 0\)\s*\n\s*_outboundPendingSinceUs\.store")
@@ -44,6 +91,83 @@ class EspWitnessWiringTest(unittest.TestCase):
         at = self.src.index('ESP_LOGW(TAG, "Upset ignored while')
         before = self.src[max(0, at - 700):at]
         self.assertIn("if (ignoredPending > 0)", before, "logged after the _mutex block, like the own-leg line")
+
+    def test_888_no_witness_log_sits_inside_a_mutex_scope(self):
+        logs = self._witness_logs()
+        self.assertTrue(logs, "no #888 witness log found")
+        for p in self._locks():
+            _, close = _enclosing(self.pairs, p)
+            for at in logs:
+                self.assertFalse(p < at < close, "#888 log at line %d is inside the _mutex scope at line %d"
+                                 % (self._line(at), self._line(p)))
+
+    def test_888_no_second_mutex_lock_inside_an_open_one(self):
+        locks = self._locks()
+        for p in locks:
+            _, close = _enclosing(self.pairs, p)
+            for q in locks:
+                self.assertFalse(p < q < close, "_mutex locked again at line %d inside the scope at line %d"
+                                 % (self._line(q), self._line(p)))
+
+    def test_888_not_handed_off_branch_takes_the_mutex_once_and_logs_outside_it(self):
+        self.assertEqual(self.code.count("if (!handedOff)"), 1)
+        open_ = self.code.index("{", self.code.index("if (!handedOff)"))
+        close = self.pairs[open_]
+        self.assertEqual(len(_LOCK.findall(self.code[open_:close])), 1)
+        self.assertFalse(any(open_ < at < close for at in self._witness_logs()))
+
+    def test_888_witness_sighting_is_taken_once_per_upsert_outside_the_leg_loop(self):
+        at = self.code.index("for (int i = 0; i < nLegs; ++i)")
+        close = self.pairs[self.code.index("{", at)]
+        self.assertNotIn("witnessSightingLocked(", self.code[at:close])
+        self.assertNotIn("countOutboundLocked(", self.code[at:close])
+        sightings = [m.start() for m in _HELPER_CALL.finditer(self.code) if m.group(1) == "witnessSightingLocked"]
+        self.assertEqual(len(sightings), 3, "re-check, own-leg classification, and the one after the leg loop")
+        self.assertEqual(len([p for p in sightings if p > close]), 1, "one sample per upsert, after the loop")
+        self.assertIn("if (unmatched) unqueued = true;", self.src, "the loop only flags a lost work item")
+
+    def test_888_witness_helpers_are_only_called_with_the_mutex_held(self):
+        calls = [m.start() for m in _HELPER_CALL.finditer(self.code)]
+        self.assertTrue(calls)
+        spans = [(p, _enclosing(self.pairs, p)[1]) for p in self._locks()]
+        for at in calls:
+            self.assertTrue(any(p < at < close for p, close in spans),
+                            "witness helper called at line %d without _mutex held" % self._line(at))
+
+    def test_888_witness_helpers_do_not_log(self):
+        for name in ("witnessSightingLocked", "countOutboundLocked"):
+            start = re.search(r"TelephonyAnchorClient::%s\(" % name, self.code).start()
+            body = self.code[self.code.index("{", start):self.pairs[self.code.index("{", start)]]
+            self.assertNotIn("ESP_LOG", body, name)
+
+    def test_888_every_sighting_hands_its_cap_status_to_noteWitnessCap(self):
+        sightings = [m for m in _HELPER_CALL.finditer(self.code) if m.group(1) == "witnessSightingLocked"]
+        self.assertEqual(len(re.findall(r"noteWitnessCap\(\w+\);", self.code)), len(sightings))
+        self.assertIn("_witnessCapNoted = true;", self.src, "the cap line is handed out once per boot")
+
+    def test_888_inflight_array_size_is_passed_to_the_counter(self):
+        self.assertIn("countOutboundLocked(inflight, POCKETDIAL_MAX_ANCHOR_CALLS, witnessActive, witnessPending)", self.src)
+        self.assertIn("never past the caller's array", self.src)
+
+    def test_888_witness_format_literals_are_in_the_source(self):
+        for lit in (
+            '"Upset ignored while %d makeCall(s) pending (oldest %lld ms old): "',
+            '"nin=%d active=%d part=%.24s: "',
+            '"Upset absorbed while an outbound is in flight: nin=%d pending=%d active=%d "',
+            '"part=%.24s own=%.24s seen=%u (#888)"',
+            '"Upset dropped as own leg with no outbound slot: nin=%d pending=%d active=%d "',
+            '"Upset dropped as own leg at the worker re-check: nin=%d pending=%d active=%d "',
+            '"Upset dropped, work item not queued: nin=%d pending=%d active=%d "',
+            '"part=%.24s seen=%u (#888)"',
+            '"witness cap reached: no further #888 witness lines this boot"',
+        ):
+            with self.subTest(lit=lit):
+                self.assertIn(lit, self.src)
+
+    def test_888_no_witness_line_carries_a_state_key(self):
+        self.assertNotIn("upsetStateOf", self.src)
+        self.assertNotIn("state=%", self.src)
+        self.assertNotIn("state=n/a", self.src)
 
 
 if __name__ == "__main__":
