@@ -1,4 +1,4 @@
-"""#902: a 403 on the media GET stream after the answer gives up after
+"""#902: a run of 403s on the media GET stream gives up after
 telephony::kGetForbiddenMaxAfterAnswer attempts, not after the whole budget, for
 an ordinary outbound leg only. The decision is pinned by TelephonyAnchorLogic_test.cpp;
 this pins its wiring into the ESP-only TelephonyAnchorClient, which no host test

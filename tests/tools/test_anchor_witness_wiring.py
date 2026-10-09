@@ -28,7 +28,7 @@ class EspWitnessWiringTest(unittest.TestCase):
         self.assertRegex(self.src, r"_outboundPending\.fetch_add\(1,[^)]*\) == 0\)\s*\n\s*_outboundPendingSinceUs\.store")
 
     def test_902_failfast_line_is_the_one_the_harness_counts(self):
-        self.assertIn('"GET stream: HTTP 403 on %d consecutive attempts after the answer for "', self.src)
+        self.assertIn('"GET stream: HTTP 403 on %d consecutive attempts for "', self.src)
         self.assertIn('"/callcontrol/<dn>/participants/%s/stream -- giving up now, not at attempt %d (#902)"', self.src)
         self.assertNotIn("getUrl.c_str(),\n\t\t\t\t\t\t\tforbiddenAfterAnswer", self.src)
 
