@@ -967,8 +967,8 @@ void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 
 // ── Private Helper Functions ───────────────────────────────────────────────
 
-// #862 (Rule 5): sets the HTTP client's timeout for the next operation of a 911/933 token fetch to
-// the smaller of the client's usual 2 s (makeAuthedClient) and what is left of the fetch's budget.
+// #862 (Rule 5): sets the HTTP client's timeout for the next operation of a 911/933 or background token
+// fetch to the smaller of the client's usual 2 s (makeAuthedClient) and what is left of the fetch's budget.
 // False when the budget is spent, and then the operation is not started. deadlineUs == 0: no
 // deadline, the ordinary lane keeps the client's own per-operation timeout.
 static bool armTokenOpTimeout(esp_http_client_handle_t client, int64_t deadlineUs)
@@ -1002,7 +1002,9 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 	// connection, and carries on with the token it has. Only the ordinary lane waits, and only
 	// for start(), which is off the 911 lane and would otherwise leave the anchor down after a
 	// restart that raced a makeCall()'s refresh. A 911/933 has an arena of its own and never
-	// waits: an ordinary fetch can be in flight beside it, and it carries on regardless.
+	// waits: an ordinary fetch can be in flight beside it, and it carries on regardless. The
+	// background refresh (Maintenance) has one too and never waits either: a lost claim is a skipped
+	// tick, and claimWaiting() leaves the token_maint_skip_862 line for it.
 	// This covers the body read only (#945); the rest of fetchToken is #951.
 	constexpr int      kClaimWaitPolls  = 50;
 	constexpr uint32_t kClaimWaitPollMs = 100;
@@ -1011,17 +1013,21 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 	    [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }, sosCallId);
 	if (!lease)
 	{
-		ESP_LOGW(TAG, "Token fetch skipped: another %s fetch is running",
-		         lane == telephony::TokenLane::Emergency ? "911/933" : "ordinary");
+		ESP_LOGW(TAG, "Token fetch skipped: another %s fetch is running", telephony::laneName(lane));
 		return false;
 	}
-	// Rule 5: a refresh ahead of an ordinary call does not start while a 911/933 makeCall() is
-	// pending. Its new token would revoke the one the 911/933's POST is about to carry (or has just
-	// carried, for the 401 retry). Checked after the claim and before any I/O, so it also closes
-	// the gap between ensureToken()'s own check and the connect. start() is never held.
-	if (lane == telephony::TokenLane::Ordinary && !_tokenLanes.ordinaryRefreshMayStart(waitForArena))
+	// Rule 5: a refresh ahead of an ordinary call, or the background refresh, does not start while a
+	// 911/933 makeCall() is pending. Its new token would revoke the one the 911/933's POST is about to
+	// carry (or has just carried, for the 401 retry). Checked after the claim and before any I/O, so it
+	// also closes the gap between ensureToken()'s own check, or the background job's, and the connect.
+	// start() is never held.
+	if (lane != telephony::TokenLane::Emergency && !_tokenLanes.ordinaryRefreshMayStart(waitForArena))
 	{
 		ESP_LOGW(TAG, "Token refresh skipped: a 911/933 call is being placed, it keeps the token it has");
+		if (lane == telephony::TokenLane::Maintenance)
+		{
+			_tokenLanes.noteMaintSkip(telephony::MaintRefreshReason::EmergencyPending);
+		}
 		return false;
 	}
 
@@ -1052,12 +1058,21 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 
 	// issuedUs is when this request is issued, after the lane claim (start() may have waited for it) and
 	// before the connect: the response is installed only if no later-issued fetch has installed first
-	// (ruling 2 on #945, _tokenGate), whichever of the two lanes finishes last.
+	// (ruling 2 on #945, _tokenGate), whichever of the lanes finishes last.
 	const int64_t issuedUs = esp_timer_get_time();
 
-	// A 911/933 fetch must be over inside kSosTokenBudgetUs, connect and headers included: each
-	// operation below is armed with what is left, and one that finds the budget spent is not started.
-	const int64_t deadlineUs = lane == telephony::TokenLane::Emergency ? issuedUs + telephony::kSosTokenBudgetUs : 0;
+	// The background refresh is now issuing its request: the one token_maint_refresh_862 line, with the
+	// age of the token it replaces. Never before the claim and the 911/933 re-check above, so a line
+	// means a request went out.
+	if (lane == telephony::TokenLane::Maintenance)
+	{
+		_tokenLanes.noteMaintRefresh(issuedUs - _tokenObtainedUs.load(std::memory_order_acquire));
+	}
+
+	// A 911/933 fetch, and the background refresh, must be over inside kSosTokenBudgetUs, connect and
+	// headers included: each operation below is armed with what is left, and one that finds the budget
+	// spent is not started. The ordinary lane keeps the client's own per-operation timeouts.
+	const int64_t deadlineUs = lane != telephony::TokenLane::Ordinary ? issuedUs + telephony::kSosTokenBudgetUs : 0;
 
 	bool success = false;
 	esp_err_t err = ESP_ERR_TIMEOUT;
@@ -1183,6 +1198,34 @@ bool TelephonyAnchorClient::haveCachedToken() const
 	return !_bearerHeader.empty();
 }
 
+// #100: a CALL is up if ANY slot has a live POST stream (postLive) or an open GET handle.
+// Each handle is read under the per-slot mutex that actually guards its lifecycle (postMutex/
+// getMutex), never nested. The persistent warm postClient (postLive=false) is NOT a live call,
+// so test postLive, not handle!=null — else the warm handle would wedge token refresh forever.
+// One definition for ensureToken() and the background refresh (#862): a new grant revokes the old
+// token, and the live streams hold it. The lock is held for a pointer read only, never across I/O.
+bool TelephonyAnchorClient::mediaStreamsLive()
+{
+	for (auto& s : _calls)
+	{
+		if (s.postLive.load(std::memory_order_acquire)) return true;
+		std::lock_guard<std::mutex> getLock(s.getMutex);
+		if (s.getClient != nullptr) return true;
+	}
+	return false;
+}
+
+// #862: a CallSlot::emergency number is set from the moment makeCall() keys a 911/933's slot until
+// the slot is freed. Atomic loads only; the flag is read, never written, here.
+bool TelephonyAnchorClient::anySosSlot() const
+{
+	for (const auto& s : _calls)
+	{
+		if (s.emergency.load(std::memory_order_acquire) != 0) return true;
+	}
+	return false;
+}
+
 bool TelephonyAnchorClient::ensureToken()
 {
 	{
@@ -1194,18 +1237,7 @@ bool TelephonyAnchorClient::ensureToken()
 	// previous token the instant a new one is granted, which would tear down the
 	// chunked GET/POST streams holding the old token mid-call. Refresh only
 	// happens between calls (makeCall is invoked before any stream is opened).
-	// #100: a CALL is up if ANY slot has a live POST stream (postLive) or an open GET handle.
-	// Each handle is read under the per-slot mutex that actually guards its lifecycle (postMutex/
-	// getMutex), never nested. The persistent warm postClient (postLive=false) is NOT a live call,
-	// so test postLive, not handle!=null — else the warm handle would wedge token refresh forever.
-	bool streamsActive = false;
-	for (auto& s : _calls)
-	{
-		if (s.postLive.load(std::memory_order_acquire)) { streamsActive = true; break; }
-		std::lock_guard<std::mutex> getLock(s.getMutex);
-		if (s.getClient != nullptr) { streamsActive = true; break; }
-	}
-	if (streamsActive)
+	if (mediaStreamsLive())
 	{
 		ESP_LOGW(TAG, "Token near expiry but media streams active — deferring refresh");
 		return true;
@@ -1934,6 +1966,32 @@ void TelephonyAnchorClient::tick()
 		}
 	}
 
+	// ── #862 (#945): the background token refresh ────────────────────────────────
+	// Keeps the token at least kMaintRefreshMarginUs (10 min) from its expiry, so a call placed on an
+	// idle unit never meets a token that is about to lapse. This tick (SIP task, RequestsHandler's lock
+	// held) only asks the pure test whether the token is due and the 60 s floor has passed: atomic
+	// loads and one timer read, no lock, no I/O. The job on tel_maint then decides again with the facts
+	// it reads there (streams live, a 911/933 pending, another fetch) and fetches on its own lane.
+	// Placed before the reconcile gate below, whose early returns would skip it.
+	if (_running.load(std::memory_order_acquire) &&
+	    !_maintRefreshInFlight.load(std::memory_order_acquire))
+	{
+		const int64_t now = esp_timer_get_time();
+		if (telephony::maintRefreshWakeDue(now, _tokenObtainedUs.load(std::memory_order_acquire),
+		                                   _tokenLifetimeUs.load(std::memory_order_acquire),
+		                                   _lastMaintRefreshUs.load(std::memory_order_acquire)))
+		{
+			// Stamped BEFORE the wake: the floor counts from this try, however long the job takes.
+			_lastMaintRefreshUs.store(now, std::memory_order_release);
+			_maintRefreshInFlight.store(true, std::memory_order_release);
+			if (!wakeMaint(kMaintTokenRefresh))
+			{
+				ESP_LOGE(TAG, "tick: no maint task for the token refresh");
+				_maintRefreshInFlight.store(false, std::memory_order_release);
+			}
+		}
+	}
+
 	// #100: is ANY outbound slot wedged — flag set, no media, past the grace window? Such a slot's
 	// makecall was accepted but never produced a participant/media; the reconcile worker frees it so
 	// it stops occupying a concurrent-call slot. 15 s grace: a real outbound call yields its
@@ -2001,7 +2059,32 @@ void TelephonyAnchorClient::maintTaskTrampoline(void* arg)
 		if (jobs & kMaintRestart)   restartTaskTrampoline(arg);
 		if (jobs & kMaintRewarm)    rewarmTaskTrampoline(arg);
 		if (jobs & kMaintReconcile) reconcileTaskTrampoline(arg);
+		if (jobs & kMaintTokenRefresh) maintRefreshTaskTrampoline(arg);
 	}
+}
+
+// #862 (#945): the background token refresh. Decided here, on tel_maint, with every input read now
+// rather than at the tick that woke it: a restart may have run first on this task, and a stream or a
+// 911/933 may have started since. A skip leaves its token_maint_skip_862 line (sampled) inside
+// maintRefreshWanted(); a go fetches on the Maintenance lane, which claims its own arena without
+// waiting, re-checks the pending 911/933 before any I/O and gives the fetch kSosTokenBudgetUs overall.
+// No lock is held across it: mediaStreamsLive() holds a slot's getMutex for a pointer read, and
+// fetchToken() copies what it needs under _mutex, releases, and only then does its I/O. The install
+// goes through the same newer-issued gate as every other lane. Nothing here is on the 911/933 path:
+// the pending flags are read, not written.
+void TelephonyAnchorClient::maintRefreshTaskTrampoline(void* arg)
+{
+	auto* self = static_cast<TelephonyAnchorClient*>(arg);
+	if (self->_running.load(std::memory_order_acquire) &&
+	    self->_tokenLanes.maintRefreshWanted(esp_timer_get_time(),
+	                                         self->_tokenObtainedUs.load(std::memory_order_acquire),
+	                                         self->_tokenLifetimeUs.load(std::memory_order_acquire),
+	                                         self->mediaStreamsLive(), self->anySosSlot()))
+	{
+		self->fetchToken(telephony::TokenLane::Maintenance);
+	}
+	// Single exit: release the one-shot slot so tick() can re-arm.
+	self->_maintRefreshInFlight.store(false, std::memory_order_release);
 }
 
 // One-shot worker: if _outboundActive has been stuck past the grace window, ask Telephony what is
@@ -2569,15 +2652,16 @@ bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client,
 	// false and fetchToken() keeps the token it has. The scan below needs the whole body.
 	static_assert(-ESP_ERR_HTTP_EAGAIN == telephony::kHttpReadTimedOut,
 	              "esp_http_client_read()'s timeout code moved: update telephony::kHttpReadTimedOut");
-	// A 911/933 fetch shares what is left of its overall budget with the body: the body gets the
-	// smaller of its own budget and that, and each read is armed with what is left of it.
+	// A fetch with an overall budget (911/933, background refresh) shares what is left of it with the
+	// body: the body gets the smaller of its own budget and that, and each read is armed with what is
+	// left of it.
 	int64_t bodyBudgetUs = telephony::kTokenBodyBudgetUs;
 	if (deadlineUs != 0)
 	{
 		const int64_t leftUs = deadlineUs - esp_timer_get_time();
 		if (leftUs <= 0)
 		{
-			ESP_LOGE(TAG, "Token response not read: the 911/933 fetch's budget is spent");
+			ESP_LOGE(TAG, "Token response not read: the fetch's overall budget is spent");
 			return false;
 		}
 		if (leftUs < bodyBudgetUs) bodyBudgetUs = leftUs;

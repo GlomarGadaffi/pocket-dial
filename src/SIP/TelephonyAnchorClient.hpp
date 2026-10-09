@@ -153,11 +153,11 @@ private:
 	std::atomic<int64_t> _tokenLifetimeUs{0};
 
 #if defined(ESP_PLATFORM) || defined(ESP32)
-	// #862: the token response is read into one of these two arenas, which live as long as the
+	// #862: the token response is read into one of these three arenas, which live as long as the
 	// client, so the body read allocates no buffer (the rest of fetchToken is #951). One is for the
-	// ordinary lane, one for a 911/933. Each is claimed with an atomic flag (never a mutex) and
-	// held across the socket read; a second fetch on the same lane is turned away. The 911/933
-	// lane never waits for, and is never turned away by, an ordinary fetch.
+	// ordinary lane, one for a 911/933, one for the background refresh. Each is claimed with an
+	// atomic flag (never a mutex) and held across the socket read; a second fetch on the same lane is
+	// turned away. The 911/933 lane never waits for, and is never turned away by, an ordinary fetch.
 	telephony::TokenLanes _tokenLanes;
 	// #862 (ruling 2 on #945): a token response is installed only if its request was issued after the
 	// installed token's. installIfNewer() is called under _mutex, with the token's own assignment.
@@ -307,14 +307,22 @@ private:
 	static constexpr int kLeakRestartThreshold = 3;
 	// The full stop()/start() reclaim cycle; runs on tel_maint, off-SIP.
 	static void restartTaskTrampoline(void* arg);
-	// #658: one persistent tel_maint task runs restart, re-warm and reconcile. tick() sets the
+	// #658: one persistent tel_maint task runs restart, re-warm, reconcile and token refresh. tick() sets the
 	// job's in-flight gate and a notify bit; the task runs the body and clears the gate. Created
 	// once by the first start() and never deleted (restart runs stop()/start() on it).
 	static constexpr uint32_t kMaintRestart   = 1u << 0;
 	static constexpr uint32_t kMaintRewarm    = 1u << 1;
 	static constexpr uint32_t kMaintReconcile = 1u << 2;
+	// #862 (#945): the background token refresh. tick() wakes it when the token is within
+	// kMaintRefreshMarginUs of expiry (telephony::maintRefreshWakeDue) and sets _maintRefreshInFlight;
+	// the job decides again (telephony::TokenLanes::maintRefreshWanted), fetches on the Maintenance lane
+	// if it should, and clears the gate last. _lastMaintRefreshUs is the floor's stamp (0: never woken).
+	static constexpr uint32_t kMaintTokenRefresh = 1u << 3;
+	std::atomic<bool>    _maintRefreshInFlight{false};
+	std::atomic<int64_t> _lastMaintRefreshUs{0};
 	std::atomic<TaskHandle_t> _maintHandle{nullptr};
 	static void maintTaskTrampoline(void* arg);
+	static void maintRefreshTaskTrampoline(void* arg);
 	bool wakeMaint(uint32_t job);   // false: no tel_maint task; the caller releases its gate
 	// Issue #336: same _restartRequested mechanism as the leak-count path above,
 	// triggered instead by a disconnected/errored WS with an expiring/expired
@@ -365,11 +373,17 @@ private:
 	// Claims the lane's arena in _tokenLanes before any I/O; a fetch already running on that lane
 	// means this one returns false at once (the caller keeps its cached token). Only start() passes
 	// waitForArena, and only the Ordinary lane honours it: start() is off the 911 lane, and a
-	// restart that lost the claim would leave the anchor down. The Emergency lane never waits.
+	// restart that lost the claim would leave the anchor down. The Emergency lane never waits, nor
+	// does the Maintenance lane (the background refresh: a refused claim is a skipped tick).
 	// sosCallId (EmergencyScope::id()) names the 911/933 in the witness when its claim is refused.
 	bool fetchToken(telephony::TokenLane lane = telephony::TokenLane::Ordinary, bool waitForArena = false,
 	                std::uint32_t sosCallId = 0);
 	bool ensureToken();          // refresh iff expiring AND no media streams active (the ordinary lane)
+	// Any slot with a live POST stream (postLive) or an open GET handle: the definition ensureToken()
+	// and the background refresh share. Takes each slot's getMutex for a pointer read, never nested
+	// and never across I/O; the SIP task must not call it (tick() does not).
+	bool mediaStreamsLive();
+	bool anySosSlot() const;     // any slot holds a live 911/933 (CallSlot::emergency); atomic loads only
 	bool tokenExpiringSoon() const; // true when within the refresh margin of JWT exp
 	bool haveCachedToken() const;   // any token installed, even one past expiry (under _mutex)
 	bool connectWs();
