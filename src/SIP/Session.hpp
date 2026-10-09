@@ -150,6 +150,23 @@ public:
 #endif
 	}
 
+	// Issue #172, RFC 3262 §3: the 777 echo answered a Require: 100rel INVITE with a
+	// reliable 180. _prackRSeq is that provisional's RSeq while it awaits its PRACK
+	// (0 = none); _prackCSeq is the INVITE CSeq it was sent for. The dialog stays
+	// reliable after the PRACK, so a repeat PRACK gets 481 rather than silence.
+	bool isReliableDialog() const { return _reliableDialog; }
+	void openReliableProvisional(uint32_t rseq, uint32_t cseq)
+	{
+		_reliableDialog = true;
+		_prackRSeq = rseq;
+		_prackCSeq = cseq;
+	}
+	bool matchesReliableProvisional(uint32_t rseq, uint32_t cseq) const
+	{
+		return _prackRSeq != 0 && rseq == _prackRSeq && cseq == _prackCSeq;
+	}
+	void acknowledgeReliableProvisional() { _prackRSeq = 0; }
+
 	// Issue #604: RTP inactivity watch. `legA`/`legB` are the received-packet
 	// counters of the call's two relayed legs (pass one counter twice for a
 	// one-leg bridge). The clock restarts whenever EITHER leg has received
@@ -414,6 +431,9 @@ private:
 	bool _isTrunk = false;
 	int  _trunkRelaySlot = -1;
 	bool _isEmergency = false;                          // #604
+	bool _reliableDialog = false;   // #172
+	uint32_t _prackRSeq = 0;        // #172
+	uint32_t _prackCSeq = 0;        // #172
 	std::string_view _emergencyNumber;                  // #879
 	bool _rtpWatchArmed = false;                        // #604
 	uint32_t _rtpMarkA = 0;                             // #604

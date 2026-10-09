@@ -269,6 +269,9 @@ public:
 		UnsupportedMediaType,    // 415 + Accept:
 	};
 	HeaderVerdict checkHeaders(std::string_view& unsupported) const;
+	// RFC 3262 §3: a Require header naming 100rel. checkHeaders() accepts 100rel only
+	// on an INVITE; the header gate refuses it (420) on every route but the 777 echo (#172).
+	bool requiresReliableProvisional() const;
 	static const char* headerVerdictText(HeaderVerdict v);
 	// An INVITE whose To is 911/933 or urn:service:sos (the number onInvite
 	// routes on; a 911 Request-URI alone does not count, #824), or an RFC 7090
