@@ -9,6 +9,9 @@ pressure runs for #350/#370 on purpose instead of waiting for them.
 putting a release image back, and CHECK-IN (#428) verifies the board reports a
 release stamp again. That check is the operator's job.
 
+A second, unrelated bench option, `POCKETDIAL_HTTP_DRAM_ACCOUNT` (#410, #328), is described
+at the end: [HTTP DRAM accounting](#http-dram-accounting-pocketdial_http_dram_account).
+
 ## Building it
 
 ```
@@ -201,3 +204,116 @@ refusal, the `tick()` call) was syntax-checked with the release build's compile 
 `-DPOCKETDIAL_ANCHOR_BENCH_PROBE=1`, never linked into a probe image, and its stack use on the SIP task is
 unmeasured. The scenario has run only against the fake board in `tests/tools/test_anchor_scenarios.py`
 (`X888Test`), whose `ws_upsert` is a model of this section, not the firmware.
+
+## HTTP DRAM accounting (`POCKETDIAL_HTTP_DRAM_ACCOUNT`)
+
+Issues #410 and #328. A bench-only reading, not a fix. Under HTTP load alone `.244`'s
+`minFreeHeapInternal` fell from 31567 B to 475 B (#947), and nothing said which part of the
+HTTP path held the bytes. This build option adds one field to `GET /api/status`,
+`httpDramAccount`, that does. Release behaviour is unchanged: the option defaults to `0`
+(`src/SIP/PoolConfig.hpp`), every line it adds sits under `#if POCKETDIAL_HTTP_DRAM_ACCOUNT`
+in `src/Helpers/HttpServer.cpp`, and with it off the field is absent
+(`HttpStatusAlloc.TheStatusKeyListIsPinned...` pins the key list of the response).
+
+### Building it
+
+Take the board's usual release build line and add the option; use a separate build directory,
+because the cache keeps it:
+
+```
+idf.py -B build-acct -D SIP_TRANSPORT=<the board's transport> [-D PD_ETH_BOARD=<board>] \
+       -D POCKETDIAL_HTTP_DRAM_ACCOUNT=1 set-target <esp32s3 | esp32>
+idf.py -B build-acct -D SIP_TRANSPORT=<the board's transport> [-D PD_ETH_BOARD=<board>] \
+       -D POCKETDIAL_HTTP_DRAM_ACCOUNT=1 build
+```
+
+- Not tied to a transport or to `SIP_CONSTRAINED`, unlike the anchor probe above. Configure
+  prints a `CMake Warning` naming the image.
+- The version stamp is **not** changed, so `tools/ci/check_app_version.py` and the soak runner
+  would accept this image as a release candidate. The field is how you tell: a release image has
+  no `httpDramAccount`. Flash a release image back when the run is over.
+- The host equivalent is `-DCMAKE_CXX_FLAGS=-DPOCKETDIAL_HTTP_DRAM_ACCOUNT=1`.
+
+### What it reports
+
+`httpDramAccount` is the last key of the `/api/status` object. `now` is what is held at the
+moment of the read, `hwm` the most that consumer has held since boot, `atPeak` what it held at
+the moment the **total** last set a new high. Everything is bytes except `conns`.
+
+| Consumer | What is counted, and where |
+|---|---|
+| `taskStack` | `HttpServer::kHttpConnStackBytes` (4096) for every connection thread from just before `std::thread` is created until its lambda ends (`acceptLoop()`). |
+| `reqBuf` | The `std::vector<char>(4096)` read buffer of `handleClient()`, while that request is in flight. |
+| `reqRaw` | The `std::string raw` copy of the request, by capacity, after each `append` (a small string lives inside the object and counts 0). |
+| `reqParsed` | The heap capacity of the parsed `HttpRequest` strings. `body` is a second copy of the request body. |
+| `respBody` | A response body built on the heap, from the moment `sendResponseWithHeader()` has it until the send is done. Not counted: a body inside a leased buffer (`/api/status`, `/metrics`, the registrar roster: allocated once at boot), a flash literal, or a block in PSRAM. |
+| `total` | Every row above added up, as `now` and as `hwm`. **`total.hwm` is the most the HTTP path ever held at once.** The rows' own `hwm` values peak at different instants and do not add up to it. |
+| `respBodyMax` | The largest single body counted in `respBody`. |
+| `conns` | Connection threads: `now` and the most ever alive at once. The board does not report this anywhere else (#947). |
+| `spawnFailures` | `connection thread spawn failed` events (stderr only until now). Non-zero means the heap floor was reached. |
+
+Counts are blocks the code asked for, by capacity; allocator overhead per block is not in them.
+A body, string or buffer is counted only if it is in internal RAM at the moment of counting
+(`esp_ptr_internal()`); the thread stacks are assumed internal (the `esp_pthread` default) and
+the code does not check. The filter exists on the device only: on the host every body outside
+the leased buffers counts, flash literals included, so a host number says nothing about DRAM.
+On the device a body formatted into a stack buffer is internal and counts, and those bytes are
+also inside `taskStack`, so `total` can read a few hundred bytes high.
+
+`respBody` is taken where a finished body is handed to `sendResponseWithHeader()`, not where the
+roughly thirty `std::ostringstream` response builders allocate. It is a lower bound for what the
+builders held.
+
+### Reading it on `.244`
+
+`minFreeHeapInternal` and every `hwm` are since boot and only ever fall, so compare windows, not
+instants:
+
+1. Reboot, wait for the phones to register, and let the board go idle. Read `/api/status` once
+   and write down `freeHeapInternal` (`F0`), `minFreeHeapInternal` (`M0`) and `httpDramAccount`.
+   The request that reads it is itself in flight, so `reqBuf.now` is at least 4096 and `conns.now` at least 1.
+2. Run the #961/#947 harness (idle, then dashboard), or `for i in $(seq 4); do curl ... & done`.
+3. Read `/api/status` again: `minFreeHeapInternal` (`M1`) and `httpDramAccount`.
+4. If `M1 < M0` the run set a new low-water mark, and `F0 - M1` is how far internal DRAM fell
+   from where it stood. Set it against `total.hwm`:
+   - `total.hwm` close to `F0 - M1`: the counted consumers are the drop. `atPeak` says which of
+     them held it.
+   - `total.hwm` well short: the difference is in the list below, and `spawnFailures` says whether
+     the floor was hit.
+5. Per consumer: `taskStack.hwm / 4096` is the peak connection threads, and each live connection
+   costs at least `4096 + 4096` (stack and read buffer) before any request text. With
+   `kMaxConcurrentConnections` at 4 that is 32768 B, more than the 31567 B low-water mark at the
+   first read in #947. That is arithmetic from the code, a candidate to confirm or reject with
+   the reading, not a finding.
+
+### What it cannot see
+
+- The task control block, the `esp_pthread` entry and the `std::thread` state of every connection.
+- Stacks and TCBs of finished threads. A FreeRTOS task frees them when the idle task reaps it,
+  after `taskStack.now` has already dropped, so under load internal DRAM can stay low while the
+  counters read zero.
+- lwIP: the socket, netconn and PCB per connection and, above all, the TCP send and receive
+  pbufs (a send window of `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` per connection, 5760 B by default,
+  comes from the same internal heap while the peer has not ACKed).
+- The Ethernet driver's TX/RX buffers and the SPI DMA bounce buffer #328 is about.
+- Transients inside a request: `parseRequest()`'s per-header `line`/`hName`/`hVal`, `getFormParam()`
+  and `jsonEscape()` strings, the OTA/MoH branch's `otaReq`, and the `std::ostringstream` stream
+  buffer a route fills before it hands over the body (a route that ends in `json.str()` holds
+  that buffer and the `str()` copy at the same moment, so about twice its `respBody`).
+- The 4096 B `std::vector<uint8_t>` chunk `streamBody()` holds during an OTA or MoH upload. It
+  exists only while one is running, not on the dashboard path.
+- Per-block allocator overhead, including `CONFIG_HEAP_POISONING_LIGHT`'s.
+- The leased `/api/status` buffers: standing from boot, so already out of the numbers above. On
+  a no-PSRAM profile they are internal DRAM (2 x 16384); `memory.psramFallbacks` says if a PSRAM
+  board had to take them from internal.
+- Everything that is not HTTP (SIP, RTP, TLS, the display), which draws on the same heap.
+
+### Not verified
+
+Host-tested (`HttpDramAccount_test.cpp`, built with the option on and off), and
+`HttpServer.cpp` was compiled on its own with the ESP32-S3 toolchain (esp-15.2.0, flags of an
+existing `eth` build tree): with the option off the object is byte-identical to `origin/main`'s;
+with it on, code grows by 2653 B and `.bss` by 84 B, and `-fstack-usage` gives `handleClient()`
+448 -> 496 B and `sendResponseWithHeader()` 240 -> 256 B. Not done: a link or a full image
+(so no app-slot margin for the option-on image), the classic-ESP32 / `lan8720` and
+`SIP_CONSTRAINED` profiles, any run on a board, and the first reading on `.244`.
