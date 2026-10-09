@@ -36,8 +36,8 @@ namespace pd::vad
 
     struct Verdict
     {
-        bool    participates;
-        uint8_t hang;                          // carry into the next frame's step()
+        bool    participates = false;
+        uint8_t hang         = 0;              // carry into the next frame's step()
     };
 
     inline Verdict step(uint8_t hang, const int16_t* pcm, int n,

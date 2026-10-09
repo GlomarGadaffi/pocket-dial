@@ -211,6 +211,16 @@
 #define POCKETDIAL_CONFERENCE 1
 #endif
 
+// Issue #169: 1 turns on the VAD energy gate in the 888 mix (MixBus, VadGate.hpp): an
+// idle leg drops out of the mix, so a quiet room is digital silence. Default 0 = the
+// plain sum, as before. The gate's constants are unmeasured placeholders (VadGate.hpp).
+// Rule 5: a leg that could carry an emergency call must be flagged with
+// MixBus::setEmergency, which no path does today -- audit every way a leg reaches 888
+// (INVITE, REFER/transfer) before turning this on.
+#ifndef POCKETDIAL_CONF_VAD
+#define POCKETDIAL_CONF_VAD 0
+#endif
+
 // Issue #800: 1 builds multicast paging (dial 997): one boot-time RTP receive slot
 // (RtpTaskSlots.hpp kRxSlots), the re-sender, its config and /api/multicast-paging.
 // 0 (SIP_CONSTRAINED) compiles all of it out; 997 then answers 403. The feature is

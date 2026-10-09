@@ -34,9 +34,10 @@ public:
     int  attach();                 // -> portId in [0,MAX_PORTS), or -1 if full
     void detach(int port);         // non-blocking; tick reclaims at next boundary
 
-    // Rule 5 (e911): an emergency port is never VAD-gated. NO call path sets this today
-    // (888 never carries 911/933); it exists so one that does can opt out of the gate.
-    // Cleared when the slot is reclaimed.
+    // Rule 5 (e911): an emergency port is never VAD-gated. NO call path sets this today,
+    // so Rule 5 holds only because the gate is off in every build; a path that can bring an
+    // emergency leg onto the bus must call this right after attach(), before its RTP starts
+    // (a closed gate would drop the quiet frames that arrive first). Cleared at reclaim.
     void setEmergency(int port, bool on);
 
     // Hot path (decode / encode tasks). Per-port jitter-absorbing rings.
