@@ -81,7 +81,7 @@ by 4x between eras; the bench must measure the target. Release-soak floors: 16,3
 internal RAM before `DYNAMIC_BUFFER` + `EXTERNAL_MEM_ALLOC` (`SD:211-217`). Bytes are derived, not measured:
 - Record buffers: `IN_CONTENT_LEN` 16,384 + `OUT_CONTENT_LEN` 4,096 = 20,480 B. Source: a built S3 `sdkconfig`
   (`~/w/c699-build-heap-poisoning/sdkconfig`, 2026-09-28, an old worktree, not main HEAD); IDF defaults match
-  (`mbedtls/Kconfig:212-228`). Browsers do not negotiate smaller fragments, so IN stays 16 KB.
+  (`mbedtls/Kconfig:209-225`). Browsers do not negotiate smaller fragments, so IN stays 16 KB.
 - With `EXTERNAL_MEM_ALLOC`, every mbedTLS allocation is PSRAM-only (`mbedtls/port/esp_mem.c:18-19`).
 - Planning figure: **40 KB PSRAM per session** (2x the buffers, for context, handshake and cert chain). Unmeasured.
 - Internal cost per session: one TCB (`StaticTask_t` is always internal, `PsramTask.hpp:145`), one lwIP socket (pool of
@@ -103,7 +103,7 @@ Matching the plain cap of 4 is ~208 KB (2.5%) but allows 4 simultaneous software
 - What "static" does not mean: `CF:18` ("No Dynamic Allocation") is scoped to the `RequestsHandler` path and packet loops.
   `HttpServer` already allocates per request (section 2). This design keeps internal DRAM allocation-free after init
   (slots static, mbedTLS PSRAM-only), but PSRAM is still allocated per handshake and, with `DYNAMIC_BUFFER`
-  (`SD:220`; IDF `Kconfig:230-243`), per record. A literal zero needs `DYNAMIC_BUFFER` off, which is global to the SMTP and
+  (`SD:220`; IDF `Kconfig:227-242`), per record. A literal zero needs `DYNAMIC_BUFFER` off, which is global to the SMTP and
   anchor clients. Not proposed. If the vote wants the literal rule, say so.
 
 **Does it close?**
@@ -113,7 +113,7 @@ Matching the plain cap of 4 is ~208 KB (2.5%) but allows 4 simultaneous software
   ECC block, and past ~4 simultaneous handshakes both cores saturate and the task watchdog fires
   (`PoolConfig.hpp:283-291`); `TASK_WDT_PANIC=y` turns that into a reboot (`SD:310`).
 - **Classic ESP32 constrained profile: no.** `SPIRAM=n` (`sdkconfig.defaults.esp32_constrained:20-21`); `EXTERNAL_MEM_ALLOC`
-  depends on SPIRAM malloc support (IDF `Kconfig:161-163`), so the 20 KB+ buffers would be internal; the internal budget is already
+  depends on SPIRAM malloc support (IDF `Kconfig:158-160`), so the 20 KB+ buffers would be internal; the internal budget is already
   counted to the byte (`main/CMakeLists.txt:284-289`) and the 4 MB app slot is full (`:298-304`). HTTPS is compiled out there.
 - **Cert generation needs new Kconfig.** `MBEDTLS_X509_CREATE_C` is unset in the built S3 config (IDF `Kconfig:392-410`)
   and absent from `SD`; enabling it, plus `X509_CRT_WRITE_C`, adds flash. Use ECDSA P-256, not RSA.
@@ -134,15 +134,15 @@ already uses ~2752 B of the 4096). The only workable variant splits the roles, a
 | Trust story | Self-signed: click-through warning (TM objection 1, 3) | Same | Site CA: no warning. Objections 1 and 3 go away |
 
 Costs that apply to (b) and (c) alike:
-- **Client address.** Every proxied or looped-back connection arrives from one address. The per-source cap (3 of 4 slots,
-  `HS.cpp:467-476`) and the login brute-force bucket keyed on the peer (`:657-676`) collapse into one shared bucket: one
-  attacker's failed HTTPS logins lock out every HTTPS user. (b) can fix this with a peer header that `HttpServer` trusts only
-  from loopback; (c) cannot, and the proxy must rate-limit itself. Plain HTTP stays as the unaffected path.
+- **Client address.** Every proxied or looped-back connection reaches `HttpServer` from one address. The per-source cap (3 of 4
+  slots; keyed on the `accept()` peer before any byte is read, `HS.cpp:467-476`) and the login brute-force bucket (`:657-676`)
+  both collapse: one attacker's failed HTTPS logins lock out every HTTPS user. (b) can re-key only the login bucket, via a peer
+  header `HttpServer` trusts only from loopback; `TlsFront` enforces its own per-source limit at its accept (trivial with a
+  pool of 1), and `HttpServer` sees TLS as one source, which invariant 3 relies on. (c) can do neither; the proxy must rate-limit.
 - **Host and Origin.** `isSameOrigin` has a fixed host list (`HS.cpp:4195-4203`) and the captive check 302s any other
   `Host` to `http://192.168.4.1/` (`:896-904`). A proxy at `dash.example.com` breaks every mutating call until it rewrites
   both headers to a name the device accepts.
-- **Cleartext hop.** (c)'s proxy-to-board hop is plain HTTP; acceptable only on a protected segment. The board's own :80
-  stays reachable on the LAN unless firewalled.
+- **Cleartext hop.** (c)'s proxy-to-board hop is plain HTTP, acceptable only on a protected segment; :80 stays open unless firewalled.
 
 ## 5. Rule 5: dashboard TLS must not hurt an emergency call
 
@@ -203,8 +203,8 @@ Host-testable (CMake gtest, per `CF:283` onward; HTTP test ports from a new disj
 2. `formatFingerprint`: fixed 32 bytes -> exact 95-character string; all-zero and all-0xFF. `DeviceConfig`: `https_enabled`
    defaults false, round-trips, erased by factory reset (pattern `DeviceConfig_test.cpp:60-76`).
 3. Cookie builder: `Secure` iff the connection is TLS; `HttpOnly` and `SameSite=Strict` always.
-4. Trusted peer header: honored only from `127.0.0.1`, ignored from any other source; feeds the per-source and brute-force
-   keys (`HS.cpp:467-476`, `:657-676`).
+4. Trusted peer header: honored only from `127.0.0.1`, ignored from any other source; re-keys the login bucket
+   (`HS.cpp:657-676`) and nothing else.
 5. `isSameOrigin` with an `https://` origin and matching Host passes, wrong host fails (pins the scheme-blind behavior, `HS.cpp:4177-4181`).
 6. Invariant 1: flag on and pool refusing, `GET /` and `PUT /api/e911-config` on the plain port still succeed (extends
    `DashboardE911Form_test.cpp`). A static check that the key-persist path calls `PD_ASSERT_NOT_PSRAM_STACK`.
