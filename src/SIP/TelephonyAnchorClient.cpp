@@ -3673,14 +3673,13 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					while (firstChunk > 0 &&
 						esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
 					transportFailures = 0;
-					forbiddenAfterAnswer = telephony::nextGetForbiddenCount(forbiddenAfterAnswer, status,
-						slot->outboundAnswered.load(std::memory_order_acquire));
+					forbiddenAfterAnswer = telephony::nextGetForbiddenCount(forbiddenAfterAnswer, status);
 					if (telephony::getForbiddenGivesUp(forbiddenAfterAnswer,
 						slot->getFailFast.load(std::memory_order_acquire)))
 					{
 						// #902: the path's shape only; the host and the route DN (it can be a
 						// DID) stay out. The first 403's body and URL are in #518's line above.
-						ESP_LOGW(TAG, "GET stream: HTTP 403 on %d consecutive attempts after the answer for "
+						ESP_LOGW(TAG, "GET stream: HTTP 403 on %d consecutive attempts for "
 							"/callcontrol/<dn>/participants/%s/stream -- giving up now, not at attempt %d (#902)",
 							forbiddenAfterAnswer, activePartId.c_str(), kMaxAttempts);
 						attempt = kMaxAttempts;   // the spent-budget give-up below (MediaNeverOpened), as before

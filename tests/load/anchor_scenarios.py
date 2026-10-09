@@ -185,9 +185,9 @@ LOG_COUNTERS = {
     "get_transport_giveup": r"GET stream: \d+ consecutive transport failures",
     "get_rebuild_giveup": r"GET stream: could not rebuild client after transport failure",
     "get_never_opened": r"GET \(Telephony->device\) stream never opened",
-    # #902: a 403 after the answer on an ordinary outbound leg gave up early; group 1 = the 403 count,
+    # #902: a run of 403s on an ordinary outbound leg gave up early; group 1 = the 403 count,
     # group 2 = the leg, group 3 = the budget it did not spend.
-    "get_403_failfast_902": r"GET stream: HTTP 403 on (\d+) consecutive attempts after the answer for "
+    "get_403_failfast_902": r"GET stream: HTTP 403 on (\d+) consecutive attempts for "
                             r"/callcontrol/<dn>/participants/([^/\s]+)/stream -- giving up now, not at attempt "
                             r"(\d+) \(#902\)",
     # #893: the far end's audio reached us (runRxLoop). With no ringing reference: a diversion.
@@ -2135,7 +2135,7 @@ NEVER_OPENED = dict(probe=True, faults=("get_status", "get_max_attempts"), get_s
                     agent_opts={"caller": {"contact_params": ";line=pd6101"}}, calls=1,
                     call_cap_s=30, dup_wait_s=3.0, settle_s=5.0, ring_required=True,
                     judge=never_opened_judge)
-# #902: a 403 after the answer on an ordinary leg gives up after GET_FORBIDDEN_FAILFAST of them, so the
+# #902: a run of 403s on an ordinary leg gives up after GET_FORBIDDEN_FAILFAST of them, so the
 # whole-budget path is exercised with a 404 ("not ready yet", which keeps the whole budget) and the
 # fail-fast with a 403.
 scenario(name="x379_never_opened", issues=("#379",),
@@ -2146,7 +2146,7 @@ scenario(name="x379_never_opened", issues=("#379",),
 scenario(name="x518_403_clean_giveup", issues=("#518", "#379", "#902"), require_refused=True,
          expect_failfast=True,
          about="x379_never_opened with every answer a 403 plus the 'GET stream refused (HTTP 403)' line (#519): "
-               "after the answer, %d consecutive 403s give up cleanly by the #902 fail-fast (not the 12-attempt "
+               "%d consecutive 403s give up cleanly by the #902 fail-fast (not the 12-attempt "
                "budget): one drop, one BYE" % GET_FORBIDDEN_FAILFAST,
          path_counter="get_403_failfast_902", **NEVER_OPENED)(probe_run(never_opened_run))
 

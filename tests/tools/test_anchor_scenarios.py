@@ -624,8 +624,8 @@ class WitnessSampleTest(unittest.TestCase):
         "sdp_gate_yield_897": "W (77012) pbx: SDP gate yielded 'malformed line' for a trunk answer to our emergency INVITE (#897)",
         "anchor_drop_ringing_880": "W (61002) pbx: anchor dropped a ringing outbound leg: final 503 to the caller, no BYE, NOT ROUTED sent (#880)",
         "e911_not_routed": "W (61003) e911: NOT ROUTED correction: the carrier hung up before answering",
-        "get_403_failfast_902": "W (50211) TelephonyAnchor: GET stream: HTTP 403 on 6 consecutive attempts after "
-                                "the answer for /callcontrol/<dn>/participants/517/stream -- giving up now, not "
+        "get_403_failfast_902": "W (50211) TelephonyAnchor: GET stream: HTTP 403 on 6 consecutive attempts "
+                                "for /callcontrol/<dn>/participants/517/stream -- giving up now, not "
                                 "at attempt 240 (#902)",
         "trunk_911_exempt_889": "W (40300) trunk: 911/933 dialog held past its no-answer bound: a provisional came, "
                                 "no PBX-side timeout (#712, #889)",
@@ -2131,14 +2131,14 @@ class FakeProbeBoard(FakeBoard):
             self.log("TelephonyAnchor: GET stream refused (HTTP %d) for %s: {\"message\":\"forbidden %s\"}"
                      % (code, self.url(leg), FAR))
             branch = k.get("branch", "budget")
-            # #902: after the answer, 6 consecutive 403s give up; any other status keeps the budget.
+            # #902: 6 consecutive 403s give up, before or after the answer; any other status keeps the budget.
             failfast = (branch == "budget" and n != 240 and not k.get("failfast_off")
                         and (code == 403 or k.get("failfast_always")))
             last = 3 if branch != "budget" or n == 240 else (an.GET_FORBIDDEN_FAILFAST if failfast else n)
             for a in range(1, last + 1):
                 self.log("TelephonyAnchor: GET stream not ready (HTTP %d), attempt %d/%d" % (code, a, n))
             if failfast:
-                self.log("TelephonyAnchor: GET stream: HTTP 403 on %d consecutive attempts after the answer for "
+                self.log("TelephonyAnchor: GET stream: HTTP 403 on %d consecutive attempts for "
                          "/callcontrol/<dn>/participants/%s/stream -- giving up now, not at attempt %d (#902)"
                          % (last, leg, n))
             if branch == "transport":

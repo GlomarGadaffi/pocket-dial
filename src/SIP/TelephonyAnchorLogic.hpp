@@ -283,19 +283,19 @@ inline bool httpResponseParsed(int status)
 }
 
 // Issue #902: a 403 on the media GET stream is an authorisation answer, not a
-// readiness one (404/424), once the far end has answered; before the answer it
-// may still mean "this participant is not connected yet". So only 403s after
-// the answer count, consecutively, and any other answer resets the count. An
-// ordinary outbound leg (makeCall's own, not a 911/933) gives up after
-// kGetForbiddenMaxAfterAnswer of them: at the 500 ms backoff cap that is about
-// 3 s plus a round trip each, time for the stream to follow the Connected
-// upsert, instead of the whole 240-attempt (~2 min) budget. A 911/933 and an
-// inbound leg (a PSAP callback among them) keep the whole budget, as before.
+// readiness one (404/424). Every 403 counts, before the far end answers or after
+// it (desmo, 2026-10-09: fail fast before the answer too), consecutively; any other
+// answer resets the count. An ordinary outbound leg (makeCall's own, not a 911/933)
+// gives up after kGetForbiddenMaxAfterAnswer of them. The GET loop backs off 50, 100,
+// 200, 400 ms before the sixth attempt, so the give-up lands about 1.3 s of backoff
+// after the first 403, plus six round trips. That is the whole budget for such a leg,
+// instead of 240 attempts (~2 min). A 911/933 and an inbound leg (a PSAP callback among them) keep the whole
+// budget, as before.
 constexpr int kGetForbiddenMaxAfterAnswer = 6;
 
-inline int nextGetForbiddenCount(int count, int status, bool answered)
+inline int nextGetForbiddenCount(int count, int status)
 {
-	return (status == 403 && answered) ? count + 1 : 0;
+	return status == 403 ? count + 1 : 0;
 }
 
 inline bool getForbiddenGivesUp(int count, bool failFastLeg)

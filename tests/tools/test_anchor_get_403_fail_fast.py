@@ -1,4 +1,4 @@
-"""#902: a 403 on the media GET stream after the answer gives up after
+"""#902: a run of 403s on the media GET stream gives up after
 telephony::kGetForbiddenMaxAfterAnswer attempts, not after the whole budget, for
 an ordinary outbound leg only. The decision is pinned by TelephonyAnchorLogic_test.cpp;
 this pins its wiring into the ESP-only TelephonyAnchorClient, which no host test
@@ -45,7 +45,7 @@ class AnchorGet403FailFastTest(unittest.TestCase):
 
     def test_the_rx_loop_counts_403s_after_the_answer_and_gives_up_by_the_spent_budget_path(self):
         self.assertRegex(self.rx, r"forbiddenAfterAnswer\s*=\s*telephony::nextGetForbiddenCount\(\s*"
-                                  r"forbiddenAfterAnswer,\s*status,\s*slot->outboundAnswered\.load")
+                                  r"forbiddenAfterAnswer,\s*status\)")
         at = self.rx.find("telephony::getForbiddenGivesUp(")
         self.assertNotEqual(at, -1)
         self.assertIn("slot->getFailFast.load", self.rx[at:at + 200])
