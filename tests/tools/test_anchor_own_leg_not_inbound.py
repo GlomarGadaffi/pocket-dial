@@ -60,7 +60,8 @@ class AnchorOwnLegNotInboundTest(unittest.TestCase):
         self.assertRegex(self.make, r"std::lock_guard<std::mutex> lock\(_mutex\);\s*return _wsSeq;",
                          "the WS event number is read under _mutex: a 64-bit read can tear on the S3")
         posts = [m.start() for m in re.finditer(r"httpPostBody\(", self.make)]
-        self.assertEqual(len(posts), 3, "positive control: the makecall POST and its two retries")
+        self.assertEqual(len(posts), 4, "positive control: the makecall POST, its two device-404 retries "
+                         "and the 911/933 401 retry (#862)")
         prev = 0
         for at in posts:
             self.assertIn("postSeq = readPostSeq();", self.make[prev:at],
