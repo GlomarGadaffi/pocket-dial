@@ -794,13 +794,16 @@ public:
 		return _busy.exchange(true, std::memory_order_acquire) ? Lease() : Lease(this);
 	}
 
+	// Whether a lease is out. A read, not a claim: it can be stale by the time it is used.
+	bool busy() const { return _busy.load(std::memory_order_acquire); }
+
 private:
 	std::atomic<bool> _busy{false};
 	std::size_t       _used = 0;
 	char              _buf[N + 1] = {};
 };
 
-// ── The token's two lanes: a 911/933 has an arena of its own (#862, Rule 5) ──────
+// ── The token's three lanes: a 911/933 and the background refresh each have an arena of their own (#862, Rule 5) ──
 // Telephony drops the old token the moment a new one is granted, so two fetches on the same
 // lane must not run together: the second is turned away and keeps the token it has. The
 // emergency lane is a lane of its own for another reason. A 911/933 must not wait on an
@@ -809,17 +812,106 @@ private:
 // The emergency lane does not wait for its own arena either: if another 911/933 holds it, the
 // caller carries on at once with the token it has. Nothing here refuses a call.
 //
-// Both lanes can have a fetch in flight together. Telephony then grants two tokens and drops
-// the older one, and the cache keeps the token whose request was issued last (TokenInstallGate,
+// The maintenance lane is the background refresh (maintRefreshDecision, run on tel_maint). It has an
+// arena of its own so that it takes neither of the others: it can never hold up a 911/933 or an
+// ordinary fetch by holding their arena, and it never waits for its own, for it is gated to one
+// at a time and a claim it loses is a skipped tick.
+//
+// All three lanes can have a fetch in flight together. Telephony then grants the tokens and drops
+// the older ones, and the cache keeps the token whose request was issued last (TokenInstallGate,
 // ruling 2 on #945), whichever fetch finishes last.
 //
-// Cost: two arenas, kTokenBodyBytes + 1 bytes of buffer each, reserved with the client: about
-// 8.2 KB on the 32-bit ESP32. That is the object size, not a heap measurement.
-enum class TokenLane : std::uint8_t { Ordinary, Emergency };
+// Cost: three arenas, kTokenBodyBytes + 1 bytes of buffer each, reserved with the client: about
+// 12.3 KB on the 32-bit ESP32. That is the object size, not a heap measurement.
+enum class TokenLane : std::uint8_t { Ordinary, Emergency, Maintenance };
 
-// The sampled witnesses (token_sos_fallback_862, token_install_older_862) log the first of a boot
-// and then every this-many-th, so a run of them cannot flood the log.
+inline const char* laneName(TokenLane lane)
+{
+	switch (lane)
+	{
+		case TokenLane::Ordinary:    return "ordinary";
+		case TokenLane::Emergency:   return "911/933";
+		case TokenLane::Maintenance: return "maintenance";
+	}
+	return "?";
+}
+
+// The sampled witnesses (token_sos_fallback_862, token_install_older_862, token_maint_skip_862) log
+// the first of a boot and then every this-many-th, so a run of them cannot flood the log.
 inline constexpr std::uint32_t kWitnessSampleEvery = 16;
+
+// ── The background refresh keeps a token ten minutes from its expiry (#862, #945) ───────────
+// tick() wakes a job on tel_maint when the token is due (maintRefreshWakeDue, atomics only); the job
+// decides again with every input read at that moment (maintRefreshDecision) and only then fetches,
+// on the maintenance lane. Due means the token's age has reached its lifetime minus this margin.
+// The ordinary refresh ahead of a call keeps its own, smaller margin (5 minutes, tokenExpiringSoon).
+inline constexpr std::int64_t kMaintRefreshMarginUs = 10LL * 60 * 1000000;
+
+// The least time between two wakes of the job. A token that stays due because its fetch failed, or
+// because a call keeps it from being refreshed, would otherwise wake the job on every tick, and a
+// fetch is a TLS handshake the S3 does in software (about a second of CPU, at a time a 911/933 may
+// need it). The same floor as the reconcile watchdog's (#94), longer: this one is not urgent.
+inline constexpr std::int64_t kMaintRefreshRetryUs = 60LL * 1000000;
+
+enum class MaintRefreshReason : std::uint8_t { Due, NotDue, NoToken, EmergencyPending, StreamsLive, FetchInFlight };
+
+inline const char* maintRefreshReasonName(MaintRefreshReason r)
+{
+	switch (r)
+	{
+		case MaintRefreshReason::Due:              return "due";
+		case MaintRefreshReason::NotDue:           return "not due";
+		case MaintRefreshReason::NoToken:          return "no token";
+		case MaintRefreshReason::EmergencyPending: return "a 911/933 is pending";
+		case MaintRefreshReason::StreamsLive:      return "media streams are live";
+		case MaintRefreshReason::FetchInFlight:    return "a token fetch is in flight";
+	}
+	return "?";
+}
+
+struct MaintRefreshDecision
+{
+	bool               refresh;
+	MaintRefreshReason reason;   // Due iff refresh
+};
+
+// Age (nowUs - obtainedUs) has reached lifetimeUs - kMaintRefreshMarginUs. A token that lives no
+// longer than the margin is never due: the test would hold at every age, the refresh would run again
+// the moment it finished, and no refresh could keep such a token ten minutes from expiry anyway
+// (the ordinary refresh ahead of a call still renews it). obtainedUs == 0 is no token.
+inline bool maintTokenDue(std::int64_t nowUs, std::int64_t obtainedUs, std::int64_t lifetimeUs)
+{
+	if (obtainedUs == 0 || lifetimeUs <= kMaintRefreshMarginUs) return false;
+	return nowUs - obtainedUs >= lifetimeUs - kMaintRefreshMarginUs;
+}
+
+// tick()'s test, on the SIP task under RequestsHandler's lock: due, and not tried within the floor.
+// lastWakeUs == 0: never woken.
+inline bool maintRefreshWakeDue(std::int64_t nowUs, std::int64_t obtainedUs, std::int64_t lifetimeUs,
+                                std::int64_t lastWakeUs)
+{
+	if (!maintTokenDue(nowUs, obtainedUs, lifetimeUs)) return false;
+	return lastWakeUs == 0 || nowUs - lastWakeUs >= kMaintRefreshRetryUs;
+}
+
+// Whether to refresh now. Everything but the clock is a fact the caller read: the token's stamp
+// (obtainedUs == 0 or lifetimeUs == 0: none) and lifetime; streamsLive (a slot with postLive, or an
+// open GET handle: a new grant revokes the old token and the live streams hold it); emergencyPending
+// (a 911/933 makeCall() is pending, or a slot holds a live 911/933: Rule 5, it keeps the token it
+// has); fetchInFlight (any lane's arena is claimed). A token that is not due is not due whatever is
+// going on, so a long call leaves no skip line for a refresh nobody wanted. Past that the reason
+// is the first of: a 911/933, streams, another fetch.
+inline MaintRefreshDecision maintRefreshDecision(std::int64_t nowUs, std::int64_t obtainedUs, std::int64_t lifetimeUs,
+                                                 bool streamsLive, bool emergencyPending, bool fetchInFlight)
+{
+	using R = MaintRefreshReason;
+	if (obtainedUs == 0 || lifetimeUs == 0) return {false, R::NoToken};
+	if (!maintTokenDue(nowUs, obtainedUs, lifetimeUs)) return {false, R::NotDue};
+	if (emergencyPending) return {false, R::EmergencyPending};
+	if (streamsLive) return {false, R::StreamsLive};
+	if (fetchInFlight) return {false, R::FetchInFlight};
+	return {true, R::Due};
+}
 
 class TokenLanes
 {
@@ -835,7 +927,8 @@ public:
 	// Emergency lane makes the one try and never calls sleepMs. A refused Emergency claim is one
 	// witness line naming the 911/933 that lost (sosCallId, EmergencyScope::id()) and why: another
 	// 911/933's fetch holds the arena, so the loser is refused at once, waits for nothing and goes on
-	// with the best token it has (operator ruling 4 on #945, revised).
+	// with the best token it has (operator ruling 4 on #945, revised). The Maintenance lane never
+	// waits either: a refused claim is a skipped refresh, and one token_maint_skip_862 line says so.
 	template <class Sleep>
 	Lease claimWaiting(TokenLane lane, int polls, std::uint32_t pollMs, Sleep&& sleepMs, std::uint32_t sosCallId = 0)
 	{
@@ -852,6 +945,7 @@ public:
 			                     "(maybe none); a failed POST takes the 401 step, then NOT ROUTED (#880) (#862)",
 			             static_cast<unsigned>(sosCallId));
 		}
+		if (!lease && lane == TokenLane::Maintenance) noteMaintSkip(MaintRefreshReason::FetchInFlight);
 		return lease;
 	}
 
@@ -907,19 +1001,68 @@ public:
 		return startup || _emergenciesPending.load(std::memory_order_acquire) == 0;
 	}
 
+	// A fetch holds an arena on some lane. A read: it can be stale by the time it is used, which is why
+	// fetchToken() still claims and re-checks before any I/O.
+	bool fetchInFlight() const { return _ordinary.busy() || _emergency.busy() || _maintenance.busy(); }
+
+	// The background refresh asks this, on tel_maint, with the facts it has just read (see
+	// maintRefreshDecision). sosSlotUp: a call slot holds a live 911/933 (CallSlot::emergency). The
+	// 911/933 makeCall() in progress is read here, from the same count ordinaryRefreshMayStart() reads.
+	// True: fetch now, on the Maintenance lane. False: skip this tick, and leave one
+	// token_maint_skip_862 line (sampled) saying why. Reads only; it changes no state a 911/933 reads.
+	bool maintRefreshWanted(std::int64_t nowUs, std::int64_t obtainedUs, std::int64_t lifetimeUs, bool streamsLive,
+	                        bool sosSlotUp)
+	{
+		const bool emergencyPending = sosSlotUp || _emergenciesPending.load(std::memory_order_acquire) != 0;
+		const MaintRefreshDecision d =
+		    maintRefreshDecision(nowUs, obtainedUs, lifetimeUs, streamsLive, emergencyPending, fetchInFlight());
+		if (!d.refresh) noteMaintSkip(d.reason);
+		return d.refresh;
+	}
+
+	// A refresh whose request is about to be issued: one line per refresh, never sampled, with the
+	// age in seconds of the token it replaces. A duration, not an identifier: nothing in it names a
+	// token, a number or a credential.
+	void noteMaintRefresh(std::int64_t ageUs)
+	{
+		PD_WITNESS_W("anchor", "token_maint_refresh_862: the background refresh fetches a new token, the one it replaces is "
+		                       "%lld s old (#862)",
+		             static_cast<long long>(ageUs / 1000000));
+	}
+
+	// A refresh that did not start, and why. Sampled, so a call that outlasts the due time cannot
+	// flood the log: the first of a boot, then every kWitnessSampleEvery-th.
+	void noteMaintSkip(MaintRefreshReason why)
+	{
+		if (_maintSkips.fetch_add(1, std::memory_order_relaxed) % kWitnessSampleEvery != 0) return;
+		PD_WITNESS_W("anchor", "token_maint_skip_862: the background token refresh is skipped: %s (#862)",
+		             maintRefreshReasonName(why));
+	}
+
 private:
-	Arena& arena(TokenLane lane) { return lane == TokenLane::Emergency ? _emergency : _ordinary; }
+	Arena& arena(TokenLane lane)
+	{
+		switch (lane)
+		{
+			case TokenLane::Emergency:   return _emergency;
+			case TokenLane::Maintenance: return _maintenance;
+			case TokenLane::Ordinary:    break;
+		}
+		return _ordinary;
+	}
 
 	Arena                      _ordinary;
 	Arena                      _emergency;
+	Arena                      _maintenance;
 	std::atomic<std::uint32_t> _sosFallbacks{0};
 	std::atomic<int>           _emergenciesPending{0};
 	std::atomic<std::uint32_t> _sosCalls{0};
+	std::atomic<std::uint32_t> _maintSkips{0};
 };
 
 // ── The cache keeps the token whose request was issued last (#862, ruling 2 on #945) ───────
-// Both lanes can have a fetch in flight together, Telephony drops the older token the moment it
-// grants a newer one, and the two finish in either order. So a response is installed only if its
+// The lanes can have fetches in flight together, Telephony drops the older token the moment it
+// grants a newer one, and they finish in any order. So a response is installed only if its
 // request was ISSUED later than the installed token's request, not by when it finished: an older
 // response is discarded and the token it would have replaced stays. The stamp is the time the
 // request was issued, kept with the installed token. fetchToken() calls installIfNewer() under
@@ -948,7 +1091,7 @@ public:
 		if (_discards.fetch_add(1, std::memory_order_relaxed) % kWitnessSampleEvery != 0) return;
 		PD_WITNESS_W("e911", "token_install_older_862: a token response from the %s lane was discarded, its request was issued "
 		                     "before the installed token's; the newer token stays (#862)",
-		             lane == TokenLane::Emergency ? "911/933" : "ordinary");
+		             laneName(lane));
 	}
 
 private:
