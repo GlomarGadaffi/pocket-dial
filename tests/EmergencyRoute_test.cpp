@@ -965,6 +965,37 @@ TEST(EmergencyCallback, AnInternalCallbackWithinThirtyMinutesIsAnEmergencyCall)
 	EXPECT_TRUE(s.value()->isEmergency());
 }
 
+TEST(EmergencyCallback, ACallbackWithAnOversizeFromIsNotRefusedForItsLength)
+{
+	// #870 must not refuse an emergency callback for its header length (Rule 5).
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+
+	const std::string from = "\"" + std::string(220, 'x') + "\" <sip:102@server>;tag=cb870";
+	const std::string body =
+		"v=0\r\no=- 0 0 IN IP4 " + std::string(kOtherIp) + "\r\ns=-\r\n"
+		"c=IN IP4 " + std::string(kOtherIp) + "\r\nt=0 0\r\n"
+		"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	const std::string raw =
+		"INVITE sip:101@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kOtherIp) + ":5060;branch=z9hG4bKcb870\r\n"
+		"From: " + from + "\r\n"
+		"To: <sip:101@server>\r\n"
+		"Call-ID: er-870-cb\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:102@" + std::string(kOtherIp) + ":5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	b.handler->handle(RequestsHandler::getMessageFromPool(raw, addrFor(kOtherIp)));
+
+	EXPECT_EQ(b.count("SIP/2.0 400 From/To Line Too Long", kOtherIp), 0u) << b.dump();
+	const auto s = b.handler->getSession("Call-ID: er-870-cb");
+	ASSERT_TRUE(s.has_value()) << "the callback must be placed, not refused:\n" << b.dump();
+	EXPECT_TRUE(s.value()->isEmergency());
+}
+
 TEST(EmergencyCallback, ACallbackAfterThirtyMinutesIsNot)
 {
 	Bench b;

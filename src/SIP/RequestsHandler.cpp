@@ -2293,17 +2293,22 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	}
 
 	// #870: a dialog stores this INVITE's From and To lines, and the BYE the PBX later
-	// builds from them must fit sipb::kMaxByeBytes. An oversize line is refused here, so
-	// nothing stored can be unbuildable. Emergency calls return above and never reach
-	// this line: a 911 is not refused for its header length (Rule 5).
+	// builds from them must fit sipb::kMaxByeBytes. An oversize line on an initial INVITE is
+	// refused here. Emergency traffic is exempt, as isEmergencyTraffic() defines it (a 911,
+	// a PSAP callback, a request on a live 911 dialog): a 400 there would fail a real call
+	// (Rule 5). A To tag is a dialog's own request, not an initial INVITE, and is not refused.
+	// Not covered: the callee's 2xx can add a To tag that pushes the stored To past the bound.
+	// The 420 below is hand-derived: 820 B worst-case BYE minus 2 * 200 B of From/To values.
 	static_assert(2 * SipLimits::kMaxDialogLineBytes + 420 <= sipb::kMaxByeBytes,
 		"a BYE with two dialog lines at the bound must fit sipb::kMaxByeBytes (#870)");
-	if (data->getFrom().size() > SipLimits::kMaxDialogLineBytes ||
-		data->getTo().size() > SipLimits::kMaxDialogLineBytes)
+	if (!isEmergencyTraffic(*data) &&
+		std::string_view(data->getTo()).find("tag=") == std::string_view::npos &&
+		(data->getFrom().size() > SipLimits::kMaxDialogLineBytes ||
+		 data->getTo().size() > SipLimits::kMaxDialogLineBytes))
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
-		response->setHeader("SIP/2.0 400 Bad Request");
+		response->setHeader("SIP/2.0 400 From/To Line Too Long");
 		response->clearBody();
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));

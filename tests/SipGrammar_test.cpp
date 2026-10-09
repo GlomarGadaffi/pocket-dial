@@ -466,7 +466,7 @@ TEST(SipGrammar, ADialogLineOverTheBoundIsRefusedAtIngress)
 		if (fromSide) i.from = "\"" + pad + "\" <sip:500@server>";
 		else i.to = "\"" + pad + "\" <sip:600@server>";
 		b.send(i);
-		EXPECT_EQ(b.count("SIP/2.0 400", kCallerIp), 1u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 400 From/To Line Too Long", kCallerIp), 1u) << b.dump();
 		EXPECT_EQ(b.count("INVITE", kCalleeIp), 0u) << "an oversize dialog line is never routed:\n" << b.dump();
 	}
 }
