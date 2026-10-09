@@ -150,6 +150,13 @@ public:
 #endif
 	}
 
+	// Issue #172: this is the 777 echo test's own dialog, the one the PBX answers PRACK on (onPrack).
+	// Set by onInvite's 777 branch for non-emergency traffic only. Dest is not a stand-in for it: *11
+	// and *69 repoint a relayed (or 911) call's dest at a virtual 777 peer, and a PSAP callback to 777
+	// is answered by the same branch, and none of those is the PBX's dialog to PRACK.
+	void setEchoDialog(bool v) { _echoDialog = v; }
+	bool isEchoDialog() const { return _echoDialog; }
+
 	// Issue #172, RFC 3262 §3: the 777 echo answered a Require: 100rel INVITE with a
 	// reliable 180. _prackRSeq is that provisional's RSeq while it awaits its PRACK
 	// (0 = none); _prackCSeq is the INVITE CSeq it was sent for. Once the PRACK has
@@ -429,6 +436,7 @@ private:
 	bool _isTrunk = false;
 	int  _trunkRelaySlot = -1;
 	bool _isEmergency = false;                          // #604
+	bool _echoDialog = false;       // #172
 	uint32_t _prackRSeq = 0;        // #172
 	uint32_t _prackCSeq = 0;        // #172
 	std::string_view _emergencyNumber;                  // #879

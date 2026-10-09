@@ -2543,6 +2543,11 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 			return;
 		}
 		newSession->setDest(dummy777);
+		// #172, Rule 5: a PSAP callback to 777 is answered here as an echo (the emergency return above
+		// takes only 911/933 and a rule-made one) but is not the echo test's dialog, so the PBX is not its
+		// PRACK UAS and onPrack must not 481 it. isEmergencyTraffic() is that decision, taken once.
+		const bool emergency = isEmergencyTraffic(*data);
+		newSession->setEchoDialog(!emergency);
 		_sessions.emplace(data->getCallID(), newSession);
 		newSession->setState(Session::State::Connected);
 
@@ -2571,7 +2576,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		// once the final is sent (§3: SHOULD NOT continue to retransmit after a final response).
 		// Rule 5: emergency traffic (a PSAP callback is one on any To) keeps the plain 180.
 		ringing->removeHeaders("Require");
-		if (data->requiresReliableProvisional() && !isEmergencyTraffic(*data))
+		if (data->requiresReliableProvisional() && !emergency)
 		{
 			ringing->addHeader("Require", "100rel");
 			ringing->setHeaderOnce("RSeq", "1");
@@ -6312,16 +6317,16 @@ void RequestsHandler::onSessionProgress(std::shared_ptr<SipMessage> data)
 	(void)_sipTrunk.handleResponse(data);
 }
 
-// Issue #172, RFC 3262 §3 and §7.2. The PBX is the UAS of a PRACK only on the 777 echo (its session dest is
-// the virtual 777 peer): a matching RAck gets 200 and every other PRACK there gets 481, whether or not the
-// 180 was reliable. A PRACK on any other session is a relayed dialog's, not ours to answer, and stays
-// silent as it always was; a 481 there would make its sender end an early dialog (RFC 3261 §12.2.1.2).
+// Issue #172, RFC 3262 §3 and §7.2. The PBX is the UAS of a PRACK only on the 777 echo test's own dialog
+// (Session::isEchoDialog, set by onInvite's 777 branch): a matching RAck gets 200 and every other PRACK
+// there gets 481, whether or not the 180 was reliable. A PRACK on any other session is a relayed dialog's,
+// not ours to answer, and stays silent as it always was; a 481 there would make its sender end an early
+// dialog (RFC 3261 §12.2.1.2). That includes a call whose dest *11 or *69 repointed at a virtual 777 peer
+// (a 911 included) and a PSAP callback to 777, so this is keyed on the session's state, not on dest.
 void RequestsHandler::onPrack(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
-	if (!session.has_value()) return;
-	const auto dest = session.value()->getDest();
-	if (!dest || dest->getNumber() != "777") return;
+	if (!session.has_value() || !session.value()->isEchoDialog()) return;
 	if (!isDialogSourceAuthorized(session.value(), data->getSource())) return;
 	uint32_t rseq = 0;
 	uint32_t cseq = 0;

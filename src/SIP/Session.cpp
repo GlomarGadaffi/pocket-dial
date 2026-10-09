@@ -52,6 +52,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_lastSpliceAckCSeq = 0;
 	_isEmergency = false;     // #604
 	_emergencyNumber = {};    // #879
+	_echoDialog = false;      // #172
 	_prackRSeq = 0;           // #172
 	_prackCSeq = 0;           // #172
 	_rtpWatchArmed = false;   // #604
