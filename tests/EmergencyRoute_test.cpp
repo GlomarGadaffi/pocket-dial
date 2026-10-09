@@ -357,14 +357,19 @@ TEST(EmergencyRoute, ARuleProducedEmergencyCallGetsTheHeaderGateYieldAndAnOrdina
 			b.handler->setDialRule("7*", "trunk", "911", 3);
 			ASSERT_EQ(b.handler->getDialRules().size(), 1u) << "precondition: the rule is stored";
 			b.handler->handle(makeGatedInvite("777", "er-834-777", s.extra, s.secondAudio));
-			// #172: the echo honours Require: 100rel with a reliable 180 (RSeq); its 488 for two streams is unchanged.
-				if (s.secondAudio) EXPECT_EQ(b.count(s.refusal, kHandsetIp), 1u) << "777 is the echo test, not a 911:\n" << b.dump();
-				else
-				{
-					EXPECT_EQ(b.count("SIP/2.0 180 Ringing", kHandsetIp), 1u) << b.dump();
-					EXPECT_TRUE(b.saw("RSeq: 1")) << "the echo's 180 is reliable:\n" << b.dump();
-					EXPECT_EQ(b.count("SIP/2.0 420"), 0u) << b.dump();
-				}
+			// #172: the echo honours Require: 100rel with a reliable 180 (RSeq);
+			// its 488 for two streams is unchanged.
+			if (s.secondAudio)
+			{
+				EXPECT_EQ(b.count(s.refusal, kHandsetIp), 1u)
+					<< "777 is the echo test, not a 911:\n" << b.dump();
+			}
+			else
+			{
+				EXPECT_EQ(b.count("SIP/2.0 180 Ringing", kHandsetIp), 1u) << b.dump();
+				EXPECT_TRUE(b.saw("RSeq: 1")) << "the echo's 180 is reliable:\n" << b.dump();
+				EXPECT_EQ(b.count("SIP/2.0 420"), 0u) << b.dump();
+			}
 			EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();
 		}
 	}

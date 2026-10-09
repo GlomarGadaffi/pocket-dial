@@ -377,7 +377,7 @@ TEST_F(LearnLockTest, TheOwnerGetsThroughOnceAFloodWindowPasses)
 
 // #864 review (Stray): nothing on the REGISTER path remembers a request it did
 // not answer. REGISTER gets no server transaction (TransactionLayer::classify()
-// keeps them for INVITE, BYE, CANCEL, REFER and UPDATE only) and onRegister()
+// keeps them for INVITE, BYE, CANCEL, REFER, UPDATE and PRACK only) and onRegister()
 // keeps no branch or Call-ID+CSeq cache, so every copy is processed fresh.
 TEST_F(LearnLockTest, TheSameRegisterIsProcessedFreshOnceTheTableIsWarm)
 {

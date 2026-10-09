@@ -1074,7 +1074,7 @@ private:
 	void onMessage(std::shared_ptr<SipMessage> data); // inbound MESSAGE (RFC 3428): ack 200 OK
 	void onReinvite(std::shared_ptr<SipMessage> data);  // mid-dialog re-INVITE (hold/resume, RFC 3261 §14)
 	void onUpdate(std::shared_ptr<SipMessage> data);    // RFC 3311 mid-dialog UPDATE
-	void onPrack(std::shared_ptr<SipMessage> data);     // RFC 3262 PRACK: owned by the 777 echo's reliable 180 only (#172)
+	void onPrack(std::shared_ptr<SipMessage> data);     // RFC 3262 PRACK: answered on the 777 echo only (#172)
 
 	// Issue #218: onReinvite()/onUpdate() share this for the anchored-media
 	// (555) leg. The board built the ORIGINAL 200 OK for that leg itself

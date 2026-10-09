@@ -905,8 +905,8 @@ namespace
 	// Option tags this PBX honours in Require (RFC 3261 §8.2.2.3). "timer":
 	// RFC 4028 is honoured passively (pjsua sends Require: timer on every
 	// INVITE). "replaces": RFC 3891, see kSupportedOptionTags in
-	// RequestsHandler.cpp. 100rel is known only in Require on an INVITE (#172). Everything else -- path, gruu,
-	// outbound, sec-agree -- is a 420.
+	// RequestsHandler.cpp. 100rel is known only in Require on an INVITE (#172).
+	// Everything else -- path, gruu, outbound, sec-agree -- is a 420.
 	// A Content-Type value naming SDP. Media type only: parameters after ';' do
 	// not change what we parse.
 	bool isSdpMediaType(std::string_view contentTypeValue)
@@ -917,6 +917,20 @@ namespace
 	bool isKnownOptionTag(std::string_view tag)
 	{
 		return iequalLower(tag, "timer") || iequalLower(tag, "replaces");
+	}
+
+	// Calls f on each non-empty option tag of a comma-separated Require value until f returns true.
+	template <typename F>
+	bool anyOptionTag(std::string_view list, F f)
+	{
+		while (!list.empty())
+		{
+			const size_t comma = list.find(',');
+			const std::string_view tag = trimWs(list.substr(0, comma));
+			list = (comma == std::string_view::npos) ? std::string_view{} : list.substr(comma + 1);
+			if (!tag.empty() && f(tag)) return true;
+		}
+		return false;
 	}
 }
 
@@ -981,17 +995,14 @@ SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported
 		}
 		else if (checkRequire && (iequal(name, "require") || iequal(name, "proxy-require")))
 		{
-			std::string_view rest = value;
-			while (!rest.empty())
-			{
-				const size_t comma = rest.find(',');
-				const std::string_view tag = trimWs(rest.substr(0, comma));
-				rest = (comma == std::string_view::npos) ? std::string_view{} : rest.substr(comma + 1);
-				if (!tag.empty() && !isKnownOptionTag(tag) && !(method == SipMessageTypes::INVITE && iequal(name, "require") && iequalLower(tag, "100rel")))
-				{
+			const bool honours100rel = method == SipMessageTypes::INVITE && iequal(name, "require");   // #172
+			if (anyOptionTag(value, [&](std::string_view tag) {
+					if (isKnownOptionTag(tag) || (honours100rel && iequalLower(tag, "100rel"))) return false;
 					unsupported = tag;
-					return HeaderVerdict::UnsupportedOption;
-				}
+					return true;
+				}))
+			{
+				return HeaderVerdict::UnsupportedOption;
 			}
 		}
 		else if (iequal(name, "content-type") || iequal(name, "c"))
@@ -1008,14 +1019,10 @@ bool SipMessage::requiresReliableProvisional() const
 {
 	for (const std::string& line : _headerLines)
 	{
-		if (!iequal(headerNameOf(line), "require")) continue;
-		std::string_view rest = headerValueOf(line);
-		while (!rest.empty())
+		if (iequal(headerNameOf(line), "require") &&
+			anyOptionTag(headerValueOf(line), [](std::string_view tag) { return iequalLower(tag, "100rel"); }))
 		{
-			const size_t comma = rest.find(',');
-			const std::string_view tag = trimWs(rest.substr(0, comma));
-			rest = (comma == std::string_view::npos) ? std::string_view{} : rest.substr(comma + 1);
-			if (iequalLower(tag, "100rel")) return true;
+			return true;
 		}
 	}
 	return false;

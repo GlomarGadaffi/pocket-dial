@@ -838,7 +838,8 @@ void RequestsHandler::initHandlers()
 namespace
 {
 	// Issue #172: the one route that honours Require: 100rel is the 777 echo, and only for an
-	// initial INVITE (no To tag). The header gate and onInvite's 777 branch both key on this.
+	// initial INVITE (no To tag). Only the header gate keys on this; onInvite's 777 branch keys on
+	// destNumber == "777", the same To user.
 	bool isEchoTestInvite(const SipMessage& m)
 	{
 		return m.getToNumber() == "777" && m.getTo().find("tag=") == std::string_view::npos;
@@ -1665,8 +1666,9 @@ namespace
 	// or omitting Session-Expires when refresher=uas or unsupported (#724); and
 	// in-dialog bodiless UPDATE refreshes are handled locally or relayed (#439, #782).
 	//
-	// NOT "100rel" (RFC 3262 needs PRACK), "norefersub", "path", "gruu" or
-	// "outbound" — none of them have any implementation in this codebase.
+	// NOT "100rel": it is honoured only in a Require on the 777 echo INVITE (#172), not as a general
+	// capability a phone could rely on. NOT "norefersub", "path", "gruu" or "outbound" — none of
+	// them have any implementation in this codebase.
 	constexpr const char* kSupportedOptionTags = "replaces, timer";
 
 	// Body types this PBX actually parses: SDP on INVITE/re-INVITE/UPDATE/ACK,
@@ -12169,7 +12171,7 @@ void RequestsHandler::drainOutboxInto(
 	// otherwise send one-shot UDP messages that are simply lost on a dropped
 	// packet. classify() (TransactionLayer.cpp) tracks INVITE requests, every
 	// other request except ACK/OPTIONS/REGISTER (NOTIFY included), and our
-	// own responses to INVITE/BYE/CANCEL/REFER/UPDATE; everything else is
+	// own responses to INVITE/BYE/CANCEL/REFER/UPDATE/PRACK; everything else is
 	// left untracked.
 	//
 	// Ordering matters (#70): the scan must run after everything that appends to
