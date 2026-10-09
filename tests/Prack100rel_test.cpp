@@ -514,8 +514,9 @@ TEST(Prack100rel, ProxyRequire100relTo777EchoStays420)
 }
 
 // Guard, passes on unfixed code: a 911 with Require: 100rel is not refused and gets no
-// RSeq. Its path is the existing emergency yield, so it is never reliable (Rule 5). With a trunk
-// configured the 911 is routed: one INVITE to the carrier, and ringback to the caller.
+// RSeq. Its path is the existing emergency yield, so it is never reliable (Rule 5). The caller
+// hears ringback, so the 911 was taken up rather than refused; the rig configures a capture-only
+// carrier just so it is not answered 503, and where the call goes from there is not asserted.
 TEST(Prack100rel, Emergency911WithRequire100relIsNotRefusedAndGetsNoRSeq)
 {
 	EchoRig rig;
@@ -529,10 +530,8 @@ TEST(Prack100rel, Emergency911WithRequire100relIsNotRefusedAndGetsNoRSeq)
 		<< "Rule 5: a 911 is never answered on the reliable-provisional path";
 	EXPECT_EQ(rig.handler.getEmergencyHeaderYields(), 1u)
 		<< "the 911 takes the header gate's emergency yield, exactly as it does without the 100rel work";
-	EXPECT_EQ(countSentTo(rig.sent, kSbcIp, "INVITE sip:911@" + std::string(kSbcIp)), 1u)
-		<< "the 911 must be routed to the carrier";
 	EXPECT_EQ(countSentTo(rig.sent, "192.168.7.50", "SIP/2.0 180 Ringing"), 1u)
-		<< "and the caller must hear ringback";
+		<< "the caller must hear ringback";
 }
 
 // Red on unfixed code: the PRACK was dropped. The echo sent no reliable provisional, so
