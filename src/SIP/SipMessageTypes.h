@@ -21,6 +21,9 @@ public:
 	static constexpr auto SERVICE_UNAVAILABLE = "SIP/2.0 503 Service Unavailable";
 	static constexpr auto OK                 = "SIP/2.0 200 OK";
 	static constexpr auto ACK                = "ACK";
+	// RFC 3262 PRACK, and the 481 for a PRACK that matches no reliable provisional (#172).
+	static constexpr auto PRACK              = "PRACK";
+	static constexpr auto NO_TRANSACTION     = "SIP/2.0 481 Call/Transaction Does Not Exist";
 	// Dispatch key (never a wire start line): every non-2xx final response that
 	// has no more specific key above is routed here, so it reaches a handler at
 	// all instead of falling off the table unacknowledged. See

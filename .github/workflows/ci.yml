@@ -823,7 +823,7 @@ jobs:
   # matrix's lan8720 leg uses the 16 MB defaults -- and it is the one layout near
   # its limit, so it is built here and its app-slot margin checked. The recipe
   # is main/CMakeLists.txt's SIP_CONSTRAINED comment. Issue #731: the constrained build
-  # carries exactly one outside line, so it is built once per choice (anchor, trunk).
+  # is anchor-only (ADR-002), so there is one such build and no trunk variant.
   build-constrained:
     name: Build Firmware (esp32 / lan8720 / SIP_CONSTRAINED, 4 MB) + app-slot margin
     runs-on: ubuntu-latest
@@ -837,27 +837,6 @@ jobs:
         run: |
           . $IDF_PATH/export.sh
           idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=anchor \
-                 -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
-                 set-target esp32 build
-
-      - name: App slot margin (issue #489)
-        run: |
-          . $IDF_PATH/export.sh > /dev/null
-          python3 tools/ci/app_slot_margin.py build
-
-  build-constrained-trunk:
-    name: Build Firmware (esp32 / lan8720 / SIP_CONSTRAINED trunk, 4 MB) + app-slot margin
-    runs-on: ubuntu-latest
-    container:
-      image: espressif/idf:v6.0.1
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Build the constrained profile (SIP_OUTSIDE_LINE=trunk)
-        run: |
-          . $IDF_PATH/export.sh
-          idf.py -D SIP_TRANSPORT=lan8720 -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=trunk \
                  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
                  set-target esp32 build
 

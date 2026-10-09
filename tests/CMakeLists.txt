@@ -113,6 +113,11 @@ add_executable(sip_parser_tests
     # BEFORE building any 180/200, mirroring the ordinary call-to-call INVITE
     # path, so a full session pool gets a real 503 instead of a false 200.
     Invite777SessionPool_test.cpp
+    # Issue #172: RFC 3262 Require: 100rel is honoured on the 777 echo route only.
+    Prack100rel_test.cpp
+    # Issue #172 step 3: with the default-off flag, a plain extension call carrying
+    # Require: 100rel is forwarded without it and its 180 is made reliable here.
+    Forward100rel_test.cpp
     # Relay codec policy: filterAudioCodecs()/offersSupportedAudio() replaced the
     # blind enforceG711() "0 8 101" rewrite on peer-to-peer legs -- offer order
     # preserved, G.722 admitted, unsupported payloads (and their rtpmap/fmtp)
@@ -394,6 +399,8 @@ add_executable(sip_parser_tests
     JsonEscape_test.cpp
     TelephonyAnchorLogic_test.cpp
     MixBus_test.cpp
+    # Issue #169: VAD energy-gating of mix participation (default off).
+    VadGate_test.cpp
     # Issue #75: MixBus wired into MediaBridge (BUS mode) and made dialable as the
     # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real
     # µ-law rim, a leg leaving mid-conference, and the RequestsHandler 888 intercept.

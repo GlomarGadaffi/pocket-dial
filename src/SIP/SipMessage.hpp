@@ -68,6 +68,7 @@ namespace SdpLimits
 namespace SipLimits
 {
 	constexpr size_t   kMaxCallIdLine   = 127;  // TransactionLayer/VmSdJob callId[128]; stores the whole line (corpus 41)
+	constexpr size_t   kMaxDialogLineBytes = 200;  // #870: a From/To line a dialog stores; a BYE built from it fits sipb::kMaxByeBytes (820 B worst case)
 	constexpr size_t   kMaxBranch       = 71;   // TransactionLayer viaBranch[72] (corpus 41)
 	constexpr size_t   kMaxCSeqMethod   = 11;   // TransactionLayer cseqMethod[12] (corpus 8)
 	constexpr size_t   kMaxCSeqDigits   = 10;   // RFC 3261 §8.1.1.5: < 2^31 (corpus 5)
@@ -267,7 +268,18 @@ public:
 		UnsupportedOption,       // 420 + Unsupported:
 		UnsupportedMediaType,    // 415 + Accept:
 	};
-	HeaderVerdict checkHeaders(std::string_view& unsupported) const;
+	// `reliableRoute` is the caller's word that this INVITE is one the PBX sends reliable provisionals for
+	// (#172): the 777 echo's, or, behind the default-off flag, a plain extension call
+	// (RequestsHandler::forwardHonours100rel). Only then is 100rel in a Require header an option tag this
+	// gate honours. Everywhere else it is a 420 at the Require line, in header order, exactly as before #172.
+	HeaderVerdict checkHeaders(std::string_view& unsupported, bool reliableRoute = false) const;
+	// RFC 3262 §3: a Require header naming 100rel.
+	bool requiresReliableProvisional() const;
+	// Removes `tag` (compared ignoring case, `tag` in lower case) from every `name` header line, and from
+	// every `compact` one when given, keeping the other tags in order; a line left with no tag is dropped.
+	// In place and without allocating. Issue #172 step 3: 100rel leaves the Require and Supported of a
+	// forwarded leg and nothing else does.
+	void removeOptionTag(std::string_view name, std::string_view compact, std::string_view tag);
 	static const char* headerVerdictText(HeaderVerdict v);
 	// An INVITE whose To is 911/933 or urn:service:sos (the number onInvite
 	// routes on; a 911 Request-URI alone does not count, #824), or an RFC 7090

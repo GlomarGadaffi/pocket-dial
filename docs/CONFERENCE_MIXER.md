@@ -292,26 +292,32 @@ mix_sum4_s16:                       # out[i] = sat16(a+b+c+d); args a2=out a3..a
 This matches the scalar reference bit-for-bit, but the vector body needs **int32-lane and
 narrowing ops I have not personally confirmed assemble**:
 
-> ⚠️ **VERIFY against the S3 TRM extended-instruction chapter before relying on these:**
-> - widen 8×int16 → two regs of 4×int32 (sign-extend),
-> - `ee.vadds.s32` / `ee.vsubs.s32` (32-bit-lane add/subtract),
-> - saturating narrow int32 → int16 (`ee.srs.*`-family pack-with-saturation).
+> **Status, checked 2026-10-09 against the ESP32-S3 TRM v1.8 and a GNU as probe (issue #171):**
+> - CONFIRMED: `ee.vadds.s32` and `ee.vsubs.s32` exist, saturate, and assemble. `ee.vsubs.s32` computes qy - qx (operand order matters).
+> - NOT FOUND: widening int16 to int32 into QR registers. Widening exists only into QACC (`EE.LDQA.S16.128.IP`, `EE.MOV.S16.QACC`).
+> - NOT FOUND: a QR-to-QR saturating narrow from int32 to int16. `ee.srs.qacc` and `ee.srs.s16.qacc` do not assemble. The only saturating narrow to int16 is `EE.SRCMB.S16.QACC`, which reads QACC.
+> - CORRECTED: the QACC 20-bit segment is the 8-bit case. 16-bit data uses 40-bit segments (TRM section 1.3.3). The safe-leg bound is about 16.7M legs, not about 16. The real ceiling is int16 saturation on readback.
+> - NO int32 readback from QACC exists (TRM section 1.5.3). Readback is EE.SRCMB.S16.QACC (saturates to int16) or the QACC_L/QACC_H store forms (packed 40-bit segments).
+> - Assembles: `ee.zero.qacc`, `ee.vmulas.s16.qacc`, `ee.srcmb.s16.qacc`, `ee.vadds.s16`, `ee.vld.128.ip`, `ee.vst.128.ip`.
 >
-> A confirmed alternative for the **accumulate** is the QACC multiply-by-one trick: preload a
-> ones-vector, `ee.zero.qacc`, then `ee.vmulas.s16.qacc` per port accumulates int16 values into
-> QACC's 20-bit segments (TRM: "16-bit results accumulated into 16 × 20-bit segments"). 20-bit
-> segments give ±524287 of headroom → safe to ~16 narrowband legs. Reading QACC back into int32
-> memory for the minus-self step is the part to confirm.
->
-> **Until verified, keep the scalar `mix_accumulate`/`mix_minus_self` bodies.** They are correct
-> today; crib the vector envelope from esp-dsp (`dsps_add_s16_aes3.S`, `dsps_mulc_s16_ansi.c` /
-> `_aes3.S`) when you commit to it. Gate the swap behind `POCKETDIAL_MIXBUS_PIE`.
+> **Status: the vector kernel is NOT built and NOT linked.** `POCKETDIAL_MIXBUS_PIE` is defined nowhere, and `src/SIP/pie/*.S` is in no CMake list. Keep the scalar `mix_accumulate` and `mix_minus_self` bodies, which are correct today. The vector path needs its twin kernels, the CMake entries, and the macro before it can link. Open question before any build: the scalar stand-in clips once, while `mix_sum4_s16.S` saturates per add, so mixed-sign input can differ on-target. Test that before swapping.
 
 ### 6c. Next honest PIE target: VAD gating
 When you want it to *sound* like a conference (not just be correct), gate the mix to ports
 that are actually speaking. That drops the noise floor and the clip risk simultaneously, and
 the per-frame energy test is **sum-of-squares**, a clean vector MAC (`ee.vmulas.s16.accx`),
 which is the same kernel shape as a Goertzel/correlation detector.
+
+**Scalar gate shipped, default off (Issue #169).** `MixBus(bool vadGate = false)`; the 888 room
+passes `POCKETDIAL_CONF_VAD` (`PoolConfig.hpp`, default 0, no admin knob). On, `tick()`
+asks `pd::vad::step()` (`src/SIP/VadGate.hpp`, pure) per port per frame. Energy is sum-of-squares
+in int64; the gate opens on the first loud frame and holds for `kHangoverFrames` (10 = 200 ms)
+quiet frames. A gated port's frame is zeroed before the accumulate but the port stays present,
+so it still hears the others and minus-self stays exact. `kOpenEnergy` and the hangover are
+**unmeasured placeholders** pending the .244 idle-vs-speaking energy measurement; an all-quiet room
+becomes digital silence. `MixBus::setEmergency()` exempts a port (Rule 5); no call path sets it
+today, and the REFER/transfer routes into 888 have not been audited for an emergency leg, so
+audit them before enabling `POCKETDIAL_CONF_VAD`. No PIE energy kernel is built.
 
 ## 7. Integration with `MediaBridge` (the diff)
 

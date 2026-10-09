@@ -1755,6 +1755,8 @@ void TelephonyAnchorClient::tick()
 		_tokenObtainedUs.store(aged);
 		pd::benchprobe::noteTokenAged(&_tokenObtainedUs, aged, real);
 	}
+	// #888 ws_upsert: inject one synthetic upsert through handleWsEvent() once its case can happen.
+	if (pd::benchprobe::armedHint(pd::benchprobe::Fault::WsUpsert)) benchWsUpsert();
 #endif
 
 	// Issue #65 (L-1): too many leaked GET sockets — spawn a one-shot worker to do a full
@@ -2548,6 +2550,15 @@ void TelephonyAnchorClient::stopWsWorkers()
 bool TelephonyAnchorClient::enqueueWsWork(WsWorkItem* item)
 {
 	if (!item) return false;
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+	// #888 ws_upsert: a synthetic participant is never queued as an inbound call (the worker would announce
+	// it); refusing it here is also how case 1 reaches handleWsEvent()'s "work item not queued" branch.
+	if (pd::benchprobe::wsProbeRefusesEnqueue(item->partId, item->controlLeg))
+	{
+		delete item;
+		return false;
+	}
+#endif
 	if (!_wsWorkQueue || xQueueSend(_wsWorkQueue, &item, 0) != pdTRUE)
 	{
 		// Queue not ready or full — drop it (Telephony repeats the upset every ~750 ms). No leak.
@@ -2692,6 +2703,10 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 			// local handset answers, so there is exactly one inbound media starter and no race here.
 			bool announce = false;
 			bool ownLeg = false;
+			WitnessTick ownTick;
+			int ownNin = 0;
+			int ownPending = 0;
+			int ownActive = 0;
 			{
 				std::lock_guard<std::mutex> lock(_mutex);
 				// #379: a leg this PBX created that no outbound slot holds (freed by its drop, or
@@ -2700,6 +2715,11 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 				// Find-or-claim the inbound slot so the announce-once flag lives on it (keyed by the
 				// surfaced leg). All slots busy => no slot => no announce (graceful at capacity).
 				CallSlot* s = ownLeg ? nullptr : allocSlotLocked(controlLeg);
+				if (ownLeg)
+				{
+					ownNin = countOutboundLocked(nullptr, 0, ownActive, ownPending);
+					ownTick = witnessSightingLocked(w.partId);
+				}
 				if (s)
 				{
 					announce = (s->inboundSignaledPartId != controlLeg);
@@ -2724,6 +2744,10 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 			if (ownLeg)
 			{
 				ESP_LOGI(TAG, "Upset for own leg %s, no outbound slot: not an inbound call (#379)", controlLeg.c_str());
+				noteWitnessCap(ownTick);
+				if (ownTick.status == WitnessStatus::Sampled)
+					ESP_LOGW(TAG, "Upset dropped as own leg at the worker re-check: nin=%d pending=%d active=%d "
+						"part=%.24s seen=%u (#888)", ownNin, ownPending, ownActive, w.partId.c_str(), (unsigned)ownTick.seen);
 			}
 			else
 			{
@@ -2842,6 +2866,62 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 	}
 }
 
+int TelephonyAnchorClient::countOutboundLocked(std::string* inflight, size_t inflightCap, int& active, int& pending) const
+{
+	int nin = 0;
+	active = 0;
+	for (const auto& c : _calls)
+	{
+		if (c.participantId.empty() || !c.outboundActive.load(std::memory_order_acquire)) continue;
+		++active;
+		if (c.outboundAnswered.load(std::memory_order_acquire)) continue;
+		if (inflight)
+		{
+			if (static_cast<size_t>(nin) >= inflightCap) continue;   // never past the caller's array
+			inflight[nin] = c.participantId;
+		}
+		++nin;
+	}
+	pending = _outboundPending.load(std::memory_order_acquire);
+	return nin;
+}
+
+TelephonyAnchorClient::WitnessTick TelephonyAnchorClient::witnessSightingLocked(const std::string& partId)
+{
+	static constexpr uint16_t kWitnessLineCap = 256;   // per boot, all #888 witness lines but the pending one
+	if (_witnessLines >= kWitnessLineCap)
+	{
+		if (_witnessCapNoted) return {};
+		_witnessCapNoted = true;
+		return {WitnessStatus::CapReached, 0};
+	}
+	WitnessSeen* w = nullptr;
+	for (auto& e : _witnessSeen)
+	{
+		if (e.seen != 0 && std::strncmp(e.id, partId.c_str(), sizeof(e.id) - 1) == 0) { w = &e; break; }
+	}
+	if (!w)
+	{
+		w = &_witnessSeen[0];
+		for (auto& e : _witnessSeen)
+		{
+			if (e.seen < w->seen) w = &e;
+		}
+		std::snprintf(w->id, sizeof(w->id), "%s", partId.c_str());
+		w->seen = 0;
+	}
+	if (w->seen < 0xFFFFu) ++w->seen;
+	if (w->seen != 1 && w->seen % 16 != 0) return {};
+	++_witnessLines;
+	return {WitnessStatus::Sampled, w->seen};
+}
+
+void TelephonyAnchorClient::noteWitnessCap(const WitnessTick& tick)
+{
+	if (tick.status == WitnessStatus::CapReached)
+		ESP_LOGW(TAG, "witness cap reached: no further #888 witness lines this boot");
+}
+
 void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 {
 	auto* data = static_cast<esp_websocket_event_data_t*>(eventData);
@@ -2949,11 +3029,20 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 									bool ownLeg = false;
 									int ignoredPending = 0;        // #888 witness: an upsert ignored while a makeCall was pending
 									int64_t ignoredAgeMs = 0;
+									int witnessNin = 0;            // #888 witness: counts at classification, for every witness line
+									int witnessPending = 0;
+									int witnessActive = 0;
+									char witnessOwn[24] = {};      // #888 witness: the in-flight leg an absorbed upsert was mapped to
+									bool absorbed = false;         // #888 witness: unmatched and mapped to an in-flight outbound (nin >= 1)
+									bool unmatched = false;        // #888 witness: no slot holds this upsert's partId
+									bool unqueued = false;         // #888 witness: an unmatched upsert's work item was not queued
+									WitnessTick witnessTick;       // #888 witness: this upsert's one sighting; logged after _mutex is released
 									uint64_t seq = 0;
 									{
 										std::lock_guard<std::mutex> lock(_mutex);
 										seq = ++_wsSeq;   // #379: received after any Remove already taken
 										CallSlot* s = slotForLocked(partId);
+										unmatched = !s;
 										if (s)
 										{
 											controlLegs[nLegs++] = partId;
@@ -2963,19 +3052,20 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 											// #379: our own leg with no outbound slot: neither a new inbound
 											// call nor the far leg of another call.
 											ownLeg = true;
+											witnessNin = countOutboundLocked(nullptr, 0, witnessActive, witnessPending);
+											witnessTick = witnessSightingLocked(partId);   // no leg loop follows (nLegs == 0)
 										}
 										else
 										{
 											std::string inflight[POCKETDIAL_MAX_ANCHOR_CALLS];
-											int nin = 0;
-											for (auto& c : _calls)
+											const int nin = countOutboundLocked(inflight, POCKETDIAL_MAX_ANCHOR_CALLS, witnessActive, witnessPending);
+											const int pending = witnessPending;
+											witnessNin = nin;
+											if (nin > 0)
 											{
-												if (!c.participantId.empty() &&
-												    c.outboundActive.load(std::memory_order_acquire) &&
-												    !c.outboundAnswered.load(std::memory_order_acquire))
-													inflight[nin++] = c.participantId;
+												absorbed = true;
+												std::snprintf(witnessOwn, sizeof(witnessOwn), "%s", inflight[0].c_str());
 											}
-											const int pending = _outboundPending.load(std::memory_order_acquire);
 											if (nin == 0)
 											{
 												// No resolved outbound leg. If a makecall is mid-resolve, this
@@ -3005,7 +3095,17 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 									// inbound or a PSAP callback) may be lost. Witness only; nothing is held or replayed.
 									if (ignoredPending > 0)
 										ESP_LOGW(TAG, "Upset ignored while %d makeCall(s) pending (oldest %lld ms old): "
-											"3CX does not repeat a Connected one (#888)", ignoredPending, (long long)ignoredAgeMs);
+											"nin=%d active=%d part=%.24s: "
+											"3CX does not repeat a Connected one (#888)", ignoredPending, (long long)ignoredAgeMs,
+											witnessNin, witnessActive, partId.c_str());
+									if (ownLeg)
+									{
+										noteWitnessCap(witnessTick);
+										if (witnessTick.status == WitnessStatus::Sampled)
+											ESP_LOGW(TAG, "Upset dropped as own leg with no outbound slot: nin=%d pending=%d active=%d "
+												"part=%.24s seen=%u (#888)", witnessNin, witnessPending, witnessActive,
+												partId.c_str(), (unsigned)witnessTick.seen);
+									}
 									if (nLegs == 0) break;   // ignored (pending far leg / all-busy)
 
 									// Best-effort caller id (cheap, JSON-only) for an inbound ring's From display.
@@ -3077,6 +3177,7 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 											// it (alloc failed, or the queue — depth kWsQueueDepth=16 — was full).
 											// Without this release the coalescing dedup wedges the leg: every later
 											// repeat just sets upsetPending with nobody left in flight to notice.
+											if (unmatched) unqueued = true;   // #888 witness: sampled once, after the leg loop
 											std::lock_guard<std::mutex> lock(_mutex);
 											CallSlot* s = slotForLocked(controlLeg);
 											if (s)
@@ -3084,6 +3185,27 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 												s->upsetInFlight.store(false, std::memory_order_release);
 												s->upsetPending.store(false, std::memory_order_release);
 											}
+										}
+									}
+									// #888 witness: one sighting per upsert, for an unmatched one absorbed by an in-flight
+									// outbound or whose work item was not queued. Both on one upsert log once, as unqueued.
+									if (absorbed || unqueued)
+									{
+										{
+											std::lock_guard<std::mutex> lock(_mutex);
+											witnessTick = witnessSightingLocked(partId);
+										}
+										noteWitnessCap(witnessTick);
+										if (witnessTick.status == WitnessStatus::Sampled)
+										{
+											if (unqueued)
+												ESP_LOGW(TAG, "Upset dropped, work item not queued: nin=%d pending=%d active=%d "
+													"part=%.24s seen=%u (#888)", witnessNin, witnessPending, witnessActive,
+													partId.c_str(), (unsigned)witnessTick.seen);
+											else
+												ESP_LOGW(TAG, "Upset absorbed while an outbound is in flight: nin=%d pending=%d active=%d "
+													"part=%.24s own=%.24s seen=%u (#888)", witnessNin, witnessPending, witnessActive,
+													partId.c_str(), witnessOwn, (unsigned)witnessTick.seen);
 										}
 									}
 								}
@@ -3134,6 +3256,59 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 			break;
 	}
 }
+
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+// The bench probe's ws_upsert fault (docs/BENCH_PROBE.md, #888): one synthetic upsert, through the same
+// handleWsEvent() a 3CX frame takes, so a witness branch runs on purpose. The case (1 an unknown participant,
+// no call; 2 an unknown participant while an outbound leg is in flight; 3 our own leg, no call) waits armed
+// until it can happen and is never forced. Runs on the SIP task from tick(), where the token_age fault runs.
+// fire() refuses while any emergency is live and then disarms every fault (rule 5).
+void TelephonyAnchorClient::benchWsUpsert()
+{
+	namespace bp = pd::benchprobe;
+	if (!_running.load(std::memory_order_acquire)) return;
+	const int which = bp::g_faults.value(bp::Fault::WsUpsert);
+	char dn[48];
+	int nin = 0, active = 0, pending = 0;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		nin = countOutboundLocked(nullptr, 0, active, pending);
+		std::snprintf(dn, sizeof(dn), "%s", _sourceDn.c_str());
+	}
+	if (!bp::wsUpsertReady(which, nin, active, pending) || !bp::fire(bp::Fault::WsUpsert)) return;
+
+	static uint32_t s_seq = 0;   // only tick() calls this, one thread
+	char id[24];
+	char frame[192];
+	size_t len = 0;
+	if (bp::formatWsUpsertId(id, sizeof(id), which, ++s_seq) != 0)
+		len = bp::formatWsUpsertFrame(frame, sizeof(frame), TEL_EV_UPSET, dn, id);
+	if (len == 0)
+	{
+		ESP_LOGW(TAG, "BENCHFAULT ws_upsert not injected: no frame fits (DN '%s')", dn);
+		return;
+	}
+	if (which == 3)
+	{
+		// #379: register the synthetic id as our own leg, as makeCall does for a leg 3CX named.
+		std::lock_guard<std::mutex> lock(_mutex);
+		_ownLegs.note(id, esp_timer_get_time());
+	}
+	esp_websocket_event_data_t ev = {};
+	ev.data_ptr = frame;
+	ev.data_len = static_cast<int>(len);
+	ev.op_code = 0x01;
+	ev.payload_len = ev.data_len;
+	ESP_LOGW(TAG, "BENCHFAULT ws_upsert case %d: injecting part=%s", which, id);
+	handleWsEvent(WEBSOCKET_EVENT_DATA, &ev);
+	if (which == 3)
+	{
+		// What 3CX's Remove does: the id is no longer ours from the next WS event on.
+		std::lock_guard<std::mutex> lock(_mutex);
+		_ownLegs.release(id, ++_wsSeq);
+	}
+}
+#endif
 
 bool TelephonyAnchorClient::startRxIfNeeded(const std::string& participantId)
 {
@@ -3673,14 +3848,13 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					while (firstChunk > 0 &&
 						esp_http_client_read(_getClient, drainBuf, sizeof(drainBuf)) > 0) {}
 					transportFailures = 0;
-					forbiddenAfterAnswer = telephony::nextGetForbiddenCount(forbiddenAfterAnswer, status,
-						slot->outboundAnswered.load(std::memory_order_acquire));
+					forbiddenAfterAnswer = telephony::nextGetForbiddenCount(forbiddenAfterAnswer, status);
 					if (telephony::getForbiddenGivesUp(forbiddenAfterAnswer,
 						slot->getFailFast.load(std::memory_order_acquire)))
 					{
 						// #902: the path's shape only; the host and the route DN (it can be a
 						// DID) stay out. The first 403's body and URL are in #518's line above.
-						ESP_LOGW(TAG, "GET stream: HTTP 403 on %d consecutive attempts after the answer for "
+						ESP_LOGW(TAG, "GET stream: HTTP 403 on %d consecutive attempts for "
 							"/callcontrol/<dn>/participants/%s/stream -- giving up now, not at attempt %d (#902)",
 							forbiddenAfterAnswer, activePartId.c_str(), kMaxAttempts);
 						attempt = kMaxAttempts;   // the spent-budget give-up below (MediaNeverOpened), as before

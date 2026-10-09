@@ -150,6 +150,55 @@ public:
 #endif
 	}
 
+	// Issue #172: this is the 777 echo test's own dialog, the one the PBX answers PRACK on (onPrack).
+	// Set by onInvite's 777 branch for non-emergency traffic only. Dest is not a stand-in for it: *11
+	// and *69 repoint a relayed (or 911) call's dest at a virtual 777 peer, and a PSAP callback to 777
+	// is answered by the same branch, and none of those is the PBX's dialog to PRACK.
+	void setEchoDialog(bool v) { _echoDialog = v; }
+	bool isEchoDialog() const { return _echoDialog; }
+
+	// Issue #172, RFC 3262 §3: the 777 echo answered a Require: 100rel INVITE with a
+	// reliable 180. _prackRSeq is that provisional's RSeq while it awaits its PRACK
+	// (0 = none); _prackCSeq is the INVITE CSeq it was sent for. Once the PRACK has
+	// matched, _prackRSeq is back to 0, so a repeat PRACK on the echo gets 481.
+	void openReliableProvisional(uint32_t rseq, uint32_t cseq)
+	{
+		_prackRSeq = rseq;
+		_prackCSeq = cseq;
+	}
+	bool matchesReliableProvisional(uint32_t rseq, uint32_t cseq) const
+	{
+		return _prackRSeq != 0 && rseq == _prackRSeq && cseq == _prackCSeq;
+	}
+	void acknowledgeReliableProvisional() { _prackRSeq = 0; }
+
+	// Issue #172 step 3, RFC 3262 §3: a relayed call whose caller sent Require: 100rel. The PBX
+	// stripped the tag from the leg to the callee and is the UAS that owes the caller reliable
+	// provisionals. Separate from the echo state above: that dialog is the PBX's end to end, this one
+	// is a relay. _fwdCSeq is the caller's INVITE CSeq, _fwdRSeq the RSeq of the last reliable 180
+	// sent (0 = none yet) and _fwdPending is set while that 180 awaits its PRACK.
+	void openForwardedReliable(uint32_t cseq)
+	{
+		_fwdReliable = true;
+		_fwdCSeq = cseq;
+		_fwdRSeq = 0;
+		_fwdPending = false;
+	}
+	bool isForwardedReliable() const { return _fwdReliable; }
+	// RSeq for the next reliable provisional, or 0 when the previous one is still unacknowledged
+	// (§3: no second one until the first is). The first is 1, inside the §3 range 1..2**31-1.
+	uint32_t nextForwardedRSeq()
+	{
+		if (_fwdPending) return 0;
+		_fwdPending = true;
+		return ++_fwdRSeq;
+	}
+	bool matchesForwardedProvisional(uint32_t rseq, uint32_t cseq) const
+	{
+		return _fwdPending && rseq == _fwdRSeq && cseq == _fwdCSeq;
+	}
+	void acknowledgeForwardedProvisional() { _fwdPending = false; }
+
 	// Issue #604: RTP inactivity watch. `legA`/`legB` are the received-packet
 	// counters of the call's two relayed legs (pass one counter twice for a
 	// one-leg bridge). The clock restarts whenever EITHER leg has received
@@ -414,6 +463,13 @@ private:
 	bool _isTrunk = false;
 	int  _trunkRelaySlot = -1;
 	bool _isEmergency = false;                          // #604
+	bool _echoDialog = false;       // #172
+	uint32_t _prackRSeq = 0;        // #172
+	uint32_t _prackCSeq = 0;        // #172
+	bool _fwdReliable = false;      // #172 step 3
+	bool _fwdPending = false;       // #172 step 3
+	uint32_t _fwdCSeq = 0;          // #172 step 3
+	uint32_t _fwdRSeq = 0;          // #172 step 3
 	std::string_view _emergencyNumber;                  // #879
 	bool _rtpWatchArmed = false;                        // #604
 	uint32_t _rtpMarkA = 0;                             // #604

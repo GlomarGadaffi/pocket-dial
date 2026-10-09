@@ -45,7 +45,7 @@ but not the tenant's own numbers, so a far end equal to the route DN or to a DID
 before the first packet, and any phantom verdict says it holds only if the far end cannot route back.
 
 Probe scenarios (x349_unread_makecall, x379_never_opened, x518_403_clean_giveup,
-x279_degraded_bye) drive the bench probe image (docs/BENCH_PROBE.md, #384 H1):
+x279_degraded_bye, x888_ws_upsert) drive the bench probe image (docs/BENCH_PROBE.md, #384 H1):
 they need --expect-version with a -probe stamp, read /api/bench/fault's counters
 before and after, arm only their pre-registered faults (never for an emergency far
 end, never while the probe reports an emergency), and always disarm every fault and
@@ -171,6 +171,7 @@ LOG_COUNTERS = {
     # The bench probe (BenchProbe.cpp): one line per firing, and the rule-5 stops.
     "bench_fired": r"BENCHFAULT (\S+) fired",
     "bench_makecall_read_fail": r"BENCHFAULT makecall_read_fail fired",
+    "bench_ws_upsert": r"BENCHFAULT ws_upsert fired",
     "bench_emergency": r"BENCHFAULT (?:every fault disarmed: emergency call|ballast released \(emergency\))",
     # makeCall() (#349): the unread response reconciled to our own leg, or not.
     "adopted_349": r"but 3CX has our leg (\S+) .*adopting the call instead of failing it \(#349\)",
@@ -185,9 +186,9 @@ LOG_COUNTERS = {
     "get_transport_giveup": r"GET stream: \d+ consecutive transport failures",
     "get_rebuild_giveup": r"GET stream: could not rebuild client after transport failure",
     "get_never_opened": r"GET \(Telephony->device\) stream never opened",
-    # #902: a 403 after the answer on an ordinary outbound leg gave up early; group 1 = the 403 count,
+    # #902: a run of 403s on an ordinary outbound leg gave up early; group 1 = the 403 count,
     # group 2 = the leg, group 3 = the budget it did not spend.
-    "get_403_failfast_902": r"GET stream: HTTP 403 on (\d+) consecutive attempts after the answer for "
+    "get_403_failfast_902": r"GET stream: HTTP 403 on (\d+) consecutive attempts for "
                             r"/callcontrol/<dn>/participants/([^/\s]+)/stream -- giving up now, not at attempt "
                             r"(\d+) \(#902\)",
     # #893: the far end's audio reached us (runRxLoop). With no ringing reference: a diversion.
@@ -215,15 +216,26 @@ LOG_COUNTERS = {
     "beep_uri_856": r"beep: register beep Request-URI: (registered Contact|bare \(no Contact stored\))",
     # #888: an upsert ignored while a makeCall was pending (group 1 = pending makeCalls, 2 = the oldest's age in ms).
     "upset_ignored_pending_888": r"Upset ignored while (\d+) makeCall\(s\) pending \(oldest (-?\d+) ms old\): "
-                                 r"3CX does not repeat a Connected one \(#888\)",
+                                 r"nin=\d+ active=\d+ part=\S+: 3CX does not repeat a Connected one \(#888\)",
+    # #888: an unmatched upsert mapped to an in-flight outbound leg (nin >= 1): groups = nin, pending, active, part, own, sighting.
+    "upset_absorbed_inflight_888": r"Upset absorbed while an outbound is in flight: nin=(\d+) pending=(\d+) active=(\d+) "
+                                 r"part=(\S+) own=(\S+) seen=(\d+) \(#888\)",
+    # #888: an unmatched upsert dropped as an own leg with no outbound slot (classification, or the worker re-check).
+    "upset_dropped_own_leg_888": r"Upset dropped as own leg (?:with no outbound slot|at the worker re-check): nin=(\d+) "
+                                 r"pending=(\d+) active=(\d+) part=(\S+) seen=(\d+) \(#888\)",
+    # #888: an unmatched upsert whose work item was not queued (queue full or no allocation): the upsert is lost.
+    "upset_dropped_unqueued_888": r"Upset dropped, work item not queued: nin=(\d+) pending=(\d+) active=(\d+) "
+                                 r"part=(\S+) seen=(\d+) \(#888\)",
+    # #888: the 256-line per-boot cap on the three witnesses above was hit; logged once per boot, then no more of them.
+    "witness_cap_888": r"witness cap reached: no further #888 witness lines this boot",
     # #906: the degraded-audio sweep kept a connected 911/933 up instead of hanging it up.
     "e911_degraded_kept_906": r"e911: audio to the anchor keeps failing on a connected 911/933: kept up, not hung up \(#906\)",
     # #884: one line per successful control request (drop/answer): group 1 = the attempt, 2 = reused (no connect),
     # resumed (connected <= 400 ms on a kept handle) or cold, 3 = elapsed ms.
     "ctrl_request_884": r"ctrl request: attempt (\d+) (reused|resumed|cold) in (\d+) ms \(#884\)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
-    "endcall": r"endCall (\S+) reason=",
-    "degraded_endcall": r"endCall (\S+) reason=anchor audio write failure",
+    "endcall": r"endCall (?:Call-ID:\s*)?(\S+) reason=",
+    "degraded_endcall": r"endCall (?:Call-ID:\s*)?(\S+) reason=anchor audio write failure",
     "stop_bridge": r"stopBridge call=(\S*) part=",
     # queueLog() lines: stdout only, so seen only if a console capture is merged in.
     "rh_never_opened_drop": r"no rx audio, dropping leg (\S+)",
@@ -232,7 +244,9 @@ LOG_COUNTERS = {
 _RX = {k: re.compile(v) for k, v in LOG_COUNTERS.items()}
 _ATTEMPT = re.compile(r"GET stream (?:not ready \(HTTP -?\d+\)|transport failure \(no HTTP response, "
                       r"status=-?\d+\)|open failed \([^)]*\)), attempt (\d+)/(\d+)")
-_ENDCALL = re.compile(r"endCall (\S+) reason=(.*?)\s*$")
+# RequestsHandler::endCall logs the session key, which is the stored header line, so a real board writes
+# "endCall Call-ID: <id> reason=..."; the bare id is accepted too.
+_ENDCALL = re.compile(r"endCall (?:Call-ID:\s*)?(\S+) reason=(.*?)\s*$")
 
 
 class Refused(Exception):
@@ -460,7 +474,8 @@ def host_problems(host):
 
 
 # ---------------------------------------------------------------- the bench probe's numbers
-PROBE_FAULTS = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age")
+PROBE_FAULTS = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age",
+                "ws_upsert")
 BENCH_PATH = "/api/bench/fault"
 PROBE_IMAGE = "anchor-bench-probe"
 GET_MAX_ATTEMPTS = 240               # BenchProbeLogic.hpp kGetMaxAttempts; get_max_attempts only shrinks it
@@ -502,6 +517,8 @@ def probe_problems(sc):
                             "case), past the %.0f s the call cap leaves" % (n, m, get_giveup_worst_s(m), cap))
     if sc.get("hold_s", 0) > sc.get("call_cap_s", 0) - HANGUP_MARGIN_S:
         problems.append("%s: hold_s leaves no room for the hangup inside the call cap" % n)
+    if "call_fire_wait_s" in sc:
+        problems += x888_timing_problems(sc)
     return problems
 
 
@@ -2045,7 +2062,12 @@ def never_opened_judge(run, sc, lines):
     legs = started_legs(ents)
     ev = {"legs": len(legs)}
     c["log"] = ev
-    if not answered(c):
+    # #937: since #932 the 403 fail-fast also fires before the answer (about 3 s after dial, usually
+    # before the far end picks up). A ringing leg dropped that way has no dialog to BYE: the caller
+    # gets a final 503 (#880). Only the 403 scenario can take this branch, and only with that 503.
+    pre_answer = bool(sc.get("expect_failfast")) and not answered(c) and c.get("final") == 503
+    ev["pre_answer"] = pre_answer
+    if not answered(c) and not pre_answer:
         invalid.append("the far end did not answer (final %s): a give-up would have no dialog to BYE" % c["final"])
         return fails, invalid, ev
     if len(legs) != 1:
@@ -2092,7 +2114,7 @@ def never_opened_judge(run, sc, lines):
                      % sc["get_status"])
     if sc.get("expect_failfast"):
         if branch != "failfast":
-            invalid.append("no 403 fail-fast line (branch %s): the budget was spent before the answer, or this "
+            invalid.append("no 403 fail-fast line (branch %s): the budget was spent instead, or this "
                            "image has no #902 (get_403_failfast_902 is 0)" % branch)
             return fails, invalid, ev
         if int(failfast[0][1].group(1)) != GET_FORBIDDEN_FAILFAST or int(failfast[0][1].group(3)) != n:
@@ -2119,6 +2141,24 @@ def never_opened_judge(run, sc, lines):
     if drops and not on_its_own:
         fails.append("the GET budget was spent but leg %s was dropped only by a teardown or the harness's "
                       "hangup, not by the board on its own (MediaNeverOpened, #379)" % leg)
+    if pre_answer:
+        # #937/#880: a ringing outbound leg dropped before the answer: the caller's INVITE gets a
+        # final 503 and no BYE (there is no dialog), one endCall for "anchor dropped the leg before it
+        # connected", and the board's own ringing-leg drop line.
+        ringing_drop = matches(ents, "anchor_drop_ringing_880")
+        ev.update(anchor_drop_880_lines=len(ringing_drop))
+        if not ringing_drop:
+            fails.append("the give-up came before the answer but the board's ringing-leg drop line is missing "
+                         "(final 503, no BYE, #880)")
+        if not any("before it connected" in r for _, r in ends):
+            fails.append("no endCall with reason 'anchor dropped the leg before it connected' for this call "
+                         "(reasons: %s)" % (", ".join(r for _, r in ends) or "none"))
+        if c.get("pbx_byes"):
+            fails.append("%s got %s BYE(s) for a call that never connected" % (caller.ext, c["pbx_byes"]))
+        if c.get("pcap_byes"):
+            fails.append("/api/pcap shows %s BYE(s) for a call that never connected" % c["pcap_byes"])
+        sf, si = session_problems(c, caller.ext)
+        return fails + sf, invalid + si, ev
     if t_hang is not None:
         fails.append("no BYE reached %s within the %d s cap after the give-up: the harness hung up"
                      % (caller.ext, sc["call_cap_s"]))
@@ -2135,7 +2175,7 @@ NEVER_OPENED = dict(probe=True, faults=("get_status", "get_max_attempts"), get_s
                     agent_opts={"caller": {"contact_params": ";line=pd6101"}}, calls=1,
                     call_cap_s=30, dup_wait_s=3.0, settle_s=5.0, ring_required=True,
                     judge=never_opened_judge)
-# #902: a 403 after the answer on an ordinary leg gives up after GET_FORBIDDEN_FAILFAST of them, so the
+# #902: a run of 403s on an ordinary leg gives up after GET_FORBIDDEN_FAILFAST of them, so the
 # whole-budget path is exercised with a 404 ("not ready yet", which keeps the whole budget) and the
 # fail-fast with a 403.
 scenario(name="x379_never_opened", issues=("#379",),
@@ -2146,8 +2186,9 @@ scenario(name="x379_never_opened", issues=("#379",),
 scenario(name="x518_403_clean_giveup", issues=("#518", "#379", "#902"), require_refused=True,
          expect_failfast=True,
          about="x379_never_opened with every answer a 403 plus the 'GET stream refused (HTTP 403)' line (#519): "
-               "after the answer, %d consecutive 403s give up cleanly by the #902 fail-fast (not the 12-attempt "
-               "budget): one drop, one BYE" % GET_FORBIDDEN_FAILFAST,
+               "%d consecutive 403s give up cleanly by the #902 fail-fast (not the 12-attempt "
+               "budget): one drop, and either one BYE (answered first) or a final 503 and no BYE "
+               "(the usual case: the give-up comes before the answer, #937)" % GET_FORBIDDEN_FAILFAST,
          path_counter="get_403_failfast_902", **NEVER_OPENED)(probe_run(never_opened_run))
 
 
@@ -2253,6 +2294,208 @@ scenario(name="x279_degraded_bye", issues=("#279",), probe=True, faults=("post_s
          calls=1, call_cap_s=30, post_open_wait_s=8.0, write_settle_s=1.5, bye_wait_s=3.0, dup_wait_s=1.5,
          settle_s=5.0, path_counter="degraded_endcall", ring_required=True,
          judge=x279_judge)(probe_run(x279_run))
+
+
+# -- x888_ws_upsert -----------------------------------------------------------------
+# The three #888 witness branches of TelephonyAnchorClient::handleWsEvent, one synthetic upsert each.
+# The probe's ws_upsert fault (docs/BENCH_PROBE.md) feeds that function a frame shaped like 3CX's, with a
+# participant id of its own, pdb-u<case>-<n>; the scenario counts the witness line each one makes.
+# (case, branch, the exact text the firmware logs): test_anchor_x888_ws_upsert.py greps the source for it.
+X888_BRANCHES = ((1, "unqueued", "Upset dropped, work item not queued"),
+                 (2, "absorbed", "Upset absorbed while an outbound is in flight"),
+                 (3, "own-leg", "Upset dropped as own leg with no outbound slot"))
+X888_ID_PREFIX = "pdb-u"                          # BenchProbeLogic.hpp kWsProbeIdPrefix
+X888_NEVER_DIAL = ("911", "933", "113", "1001")   # this scenario's own list, on top of is_never_dial()
+
+
+def x888_destination_problems(far):
+    """Why x888 may not dial `far`, or []: its own never-dial list, then any emergency or never-dial
+    number in any form. Never echoes the number."""
+    out = []
+    if (far or "").lstrip("+") in X888_NEVER_DIAL:
+        out.append("the far end is on the x888 never-dial list")
+    if is_never_dial(far):
+        out.append("the far end is an emergency or never-dial number (rule 5)")
+    return out
+
+
+def x888_timing_problems(sc):
+    n = sc.get("name", "<unnamed>")
+    worst = sc["call_fire_wait_s"] + sc["cancel_after_fire_s"] + 2 * AGENT_TXN_TIMEOUT_S
+    if worst > sc.get("call_cap_s", 0):
+        return ["%s: the call can take up to %.1f s (wait for the fire %g + the CANCEL delay %g + a CANCEL and a "
+                "BYE transaction of %g s each), past the %d s call cap"
+                % (n, worst, sc["call_fire_wait_s"], sc["cancel_after_fire_s"], AGENT_TXN_TIMEOUT_S,
+                   sc.get("call_cap_s", 0))]
+    return []
+
+
+def x888_counts(lines, case):
+    """{branch: lines} for the synthetic upsert of `case`: the branch's witness text and that case's part id
+    (so a real participant's line is not this run's). The three texts are not substrings of one another, so
+    a line counts for one branch only."""
+    part = "part=%s%d-" % (X888_ID_PREFIX, case)
+    return {name: sum(1 for ln in lines if text in ln and part in ln) for _, name, text in X888_BRANCHES}
+
+
+def x888_verdict(case, counts, fired):
+    """-> (verdict, why). PASS: the probe fired and the case's own branch logged exactly one line for its
+    upsert, no other branch one. No line is INVALID, never PASS (the branch was not shown to run); a second
+    line, or a line in another branch for the same upsert, is a FAIL."""
+    _, name, text = X888_BRANCHES[case - 1]
+    own = counts[name]
+    others = [k for k, n in counts.items() if k != name and n]
+    if not fired:
+        return "INVALID", "ws_upsert did not fire for case %d: its precondition never held" % case
+    if own == 0:
+        return "INVALID", "0 lines of '%s' for case %d: the branch was not shown to run" % (text, case)
+    if own > 1:
+        return "FAIL", "%d lines of '%s' for one upsert" % (own, text)
+    if others:
+        return "FAIL", "the upsert also logged %s" % ", ".join(others)
+    return "PASS", ""
+
+
+def x888_case_line(case, verdict, counts):
+    _, name, text = X888_BRANCHES[case - 1]
+    n = counts[name]
+    others = ", ".join("%s=%d" % (k, c) for k, c in counts.items() if k != name and c)
+    return "case %d %s: %s (%d line%s: %s%s)" % (case, name, verdict, n, "" if n == 1 else "s", text,
+                                                 "; other branches: " + others if others else "")
+
+
+def x888_summary(results):
+    """results: [(case, verdict, counts)]. One line: each branch's own count, the tally, the overall verdict."""
+    tally = collections.Counter(v for _, v, _ in results)
+    overall = "FAIL" if tally["FAIL"] else "INVALID" if tally["INVALID"] else "PASS"
+    own = ["%s=%d" % (X888_BRANCHES[c - 1][1], k[X888_BRANCHES[c - 1][1]]) for c, _, k in results]
+    return "x888 summary: %s: %d PASS, %d FAIL, %d INVALID -> %s" % (
+        " ".join(own), tally["PASS"], tally["FAIL"], tally["INVALID"], overall)
+
+
+def x888_fired(run):
+    """The probe's own ws_upsert count, over HTTP (the syslog is UDP and may lose the line)."""
+    return run.probe.counters()["faults"]["ws_upsert"]["fired"]
+
+
+def x888_idle_case(run, sc, case):
+    """Cases 1 and 3 need no call: arm, and wait for the board's next tick to inject."""
+    run.checkpoint()
+    before = x888_fired(run)
+    run.arm("ws_upsert", case)
+    fired = run.watch_call(time.monotonic() + sc["fire_wait_s"], stop_when=lambda: x888_fired(run) > before,
+                           step=0.25)
+    run.x888[case] = fired
+    run.say("case %d: ws_upsert %s" % (case, "fired" if fired else
+                                      "did NOT fire within %g s (its precondition did not hold)" % sc["fire_wait_s"]))
+    run.watch_call(time.monotonic() + sc["settle_s"])          # the witness line follows the fire
+
+
+def x888_cancel_when(run, delay_s):
+    """CANCEL delay_s after the board logs ws_upsert fired for this INVITE: the injected upsert is handled
+    while the far leg rings, and the CANCEL ends the ring at once after it (one short ring)."""
+    def when(since):
+        if run.phantoms():
+            return time.monotonic()
+        fired = matches(run.syslog.entries(since), "bench_ws_upsert")
+        return fired[0][0] + delay_s if fired else None
+    return when
+
+
+def x888_call_case(run, sc, caller, base):
+    """Case 2: armed before the INVITE, the fault waits for an unanswered outbound leg (the board's tick
+    sees it once the makecall response has named the leg). The call is then CANCELled while it rings."""
+    run.checkpoint()
+    before = x888_fired(run)
+    run.arm("ws_upsert", 2)
+    rec = {"call": 1, "t_start": time.monotonic(), "final": None}
+    run.calls.append(rec)                    # first: an abort keeps the record
+    dlg = caller.invite(run.far_end, cancel_when=x888_cancel_when(run, sc["cancel_after_fire_s"]),
+                        cancel_when_timeout_s=sc["call_fire_wait_s"])
+    try:
+        rec.update(_call_id=dlg.call_id, final=dlg.final_status, cancel_status=dlg.cancel_status,
+                   cancel_when_expired=bool(dlg.cancel_when_expired),
+                   provisional=[s for _, s in dlg.responses if s < 200])
+    finally:
+        finish_call(caller, dlg, rec)
+    run.x888[2] = x888_fired(run) > before
+    after_call(run, sc, caller, rec, base)
+    run.watch_call(time.monotonic() + sc["drop_wait_s"], stop_when=lambda: not undropped_legs(run.syslog.lines()))
+    run.say("case 2: ws_upsert %s; call 1: final %s, CANCEL answered %s%s"
+            % ("fired" if run.x888[2] else "did NOT fire", rec["final"], rec.get("cancel_status"),
+               ", hung up by the harness (BYE %s)" % rec.get("hangup_bye") if "hangup_ms" in rec else ""))
+
+
+def x888_run(run, sc):
+    caller = run.agents["caller"]
+    bad = sorted({p for end in run.far_ends for p in x888_destination_problems(end)})
+    if bad:
+        raise run_soak.Abort("INVALID", "refusing before any call: " + "; ".join(bad))
+    run.x888 = {}
+    run.say("3 synthetic upserts through handleWsEvent: case 1 an unknown participant, no call (not queued); "
+            "case 2 an unknown participant while 1 call %s -> far end rings (absorbed), CANCELled %g s after "
+            "the fire; case 3 our own leg, no call. The branch's witness line counts each one"
+            % (caller.ext, sc["cancel_after_fire_s"]))
+    run.checkpoint()
+    base = run.session_count()
+    x888_idle_case(run, sc, 1)
+    x888_call_case(run, sc, caller, base)
+    x888_idle_case(run, sc, 3)
+
+
+def x888_judge(run, sc, lines):
+    fails, invalid = common_problems(run, lines)
+    if not run.calls:
+        return fails, invalid, {}
+    fired = getattr(run, "x888", {})
+    results = []
+    for case, name, _ in X888_BRANCHES:
+        counts = x888_counts(lines, case)
+        verdict, why = x888_verdict(case, counts, fired.get(case))
+        results.append((case, verdict, counts))
+        if verdict != "PASS":
+            (fails if verdict == "FAIL" else invalid).append("case %d %s: %s" % (case, name, why))
+        run.say(x888_case_line(case, verdict, counts))
+    summary_line = x888_summary(results)
+    run.say(summary_line)
+    summary = {"summary": summary_line, "cases": {X888_BRANCHES[c - 1][1]: v for c, v, _ in results},
+               "lines": {X888_BRANCHES[c - 1][1]: k[X888_BRANCHES[c - 1][1]] for c, _, k in results}}
+    n = ((run.manifest.get("probe") or {}).get("fired") or {}).get("ws_upsert")
+    if n is not None and n != len(X888_BRANCHES):
+        invalid.append("ws_upsert fired %d times, not %d: a stray arm or a lost one" % (n, len(X888_BRANCHES)))
+    # a synthetic participant announced as an inbound call would ring the DID row's phones: never, not even once
+    synthetic = sorted(leg for leg in per_leg(lines, "inbound_call") if leg.startswith(X888_ID_PREFIX))
+    if synthetic:
+        fails.append("'Inbound call on DN' was logged for %d synthetic participant(s) (%s): a probe upsert was "
+                     "announced as an inbound call" % (len(synthetic), ", ".join(synthetic)))
+    c, caller = run.calls[0], run.agents["caller"]
+    if c.get("final") == 487:
+        if c.get("cancel_status") != 200:
+            fails.append("the CANCEL was answered %s, not 200" % c.get("cancel_status"))
+    elif answered(c):                        # the far end picked up before the CANCEL: the harness BYE ends it
+        if c.get("hangup_bye") != 200:
+            fails.append("the harness's BYE got %s, not 200" % c.get("hangup_bye"))
+        fails += bye_problems(c, caller.ext, count=False)
+    else:
+        invalid.append("the call did not ring (final %s): case 2 had no unanswered outbound leg to land on"
+                       % c.get("final"))
+    fails += drop_problems(lines)
+    phantom_pcap = sum(run.pcap_count("INVITE", ua, phantom=True) for ua in run.agents.values())
+    if phantom_pcap:
+        fails.append("/api/pcap shows %d INVITE(s) sent to a test UA that were not the register beep: a phantom "
+                     "inbound (second witness)" % phantom_pcap)
+    sf, si = session_problems(c, caller.ext)
+    return fails + sf, invalid + si, summary
+
+
+scenario(name="x888_ws_upsert", issues=("#888",), probe=True, faults=("ws_upsert",),
+         about="the three #888 witness branches on the real device: one synthetic upsert each through "
+               "handleWsEvent (an unknown participant with no call: not queued; the same while test UA 6101's "
+               "call to the designated far end rings: absorbed; our own leg: dropped), one short ring, CANCELled; "
+               "a branch with no witness line is INVALID",
+         uas={"caller": "6101", "detector": PIN_UA}, calls=1, max_calls=1, call_cap_s=30, fire_wait_s=6.0,
+         call_fire_wait_s=10.0, cancel_after_fire_s=0.5, settle_s=3.0, drop_wait_s=5.0,
+         path_counter="bench_ws_upsert", ring_required=True, judge=x888_judge)(probe_run(x888_run))
 
 
 # ---------------------------------------------------------------- CLI
