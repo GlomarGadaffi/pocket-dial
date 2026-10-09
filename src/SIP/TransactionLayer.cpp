@@ -85,17 +85,29 @@ TransactionLayer::classify(const sockaddr_in& peer, const std::shared_ptr<SipMes
 		if (method == "INVITE") return Type::InviteServer;
 
 		// Non-INVITE server transactions cost a 32 s Timer J slot each and buy
-		// nothing for an idempotent method, so they are restricted to the five
+		// nothing for an idempotent method, so they are restricted to the four
 		// where re-running the handler on a duplicate does real damage: a doubled
 		// REFER is a double transfer, a doubled BYE/CANCEL answers 481 for a
-		// dialog we tore down cleanly, a doubled UPDATE re-relays an offer, and a
-		// doubled PRACK answers 481 for the provisional it already acknowledged
-		// (the 777 echo, #172). See PoolConfig.hpp for why INFO is excluded despite
-		// the same argument.
+		// dialog we tore down cleanly, and a doubled UPDATE re-relays an offer.
+		// See PoolConfig.hpp for why INFO is excluded despite the same argument.
 		if (method == "BYE" || method == "CANCEL" ||
-		    method == "REFER" || method == "UPDATE" || method == "PRACK")
+		    method == "REFER" || method == "UPDATE")
 		{
 			return Type::NonInviteServer;
+		}
+
+		// PRACK (#172) is tracked for its 2xx only. The 777 echo answers a matching PRACK
+		// once, so a retransmission re-run would draw a 481 for the provisional it already
+		// acknowledged, and the cached 200 stops that. A 481, or a 420 from the header
+		// gate, re-processes to the same answer and takes no slot, so a flood of refused
+		// PRACKs cannot fill the pool ahead of the 200. Only the first matching PRACK of
+		// an echo call is ever answered 2xx, so this is at most one slot per reliable echo
+		// call. With no free slot the 200 still goes out (maybeTrack is bookkeeping and
+		// never holds a message back), uncached, and a retransmission of it then draws 481.
+		if (method == "PRACK")
+		{
+			return msg->getStatusInfo()->klass == PocketDial::SipStatusClass::Success
+				? Type::NonInviteServer : Type::None;
 		}
 		return Type::None;
 	}

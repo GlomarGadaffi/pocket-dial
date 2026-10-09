@@ -12174,8 +12174,8 @@ void RequestsHandler::drainOutboxInto(
 	// otherwise send one-shot UDP messages that are simply lost on a dropped
 	// packet. classify() (TransactionLayer.cpp) tracks INVITE requests, every
 	// other request except ACK/OPTIONS/REGISTER (NOTIFY included), and our
-	// own responses to INVITE/BYE/CANCEL/REFER/UPDATE/PRACK; everything else is
-	// left untracked.
+	// own responses to INVITE/BYE/CANCEL/REFER/UPDATE and the 2xx of a PRACK;
+	// everything else is left untracked.
 	//
 	// Ordering matters (#70): the scan must run after everything that appends to
 	// _outbox during this pass (BLF NOTIFYs, tick()-originated forks — park
