@@ -908,6 +908,26 @@ public:
 		return sendMessageTo(ext, text);
 	}
 
+	// Test-only (#930): placeSipTrunkCall() is private and its one caller,
+	// routeTrunkCall(), classifies an emergency destination first, so this is the
+	// only way a test reaches the backstop inside it. Drains the way handle()
+	// does. Not compiled into device firmware.
+	bool placeSipTrunkCallForTest(const std::shared_ptr<SipMessage>& data,
+	                              const std::string& callerExt, const std::string& destination,
+	                              bool* placedOut)
+	{
+		bool handled = false;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			auto caller = findClient(callerExt);
+			if (!caller.has_value()) return false;
+			handled = placeSipTrunkCall(data, caller.value(), destination, placedOut);
+			drainPassLocked(_rxOutboxScratch, _rxLogScratch);
+		}
+		flushPass(_rxOutboxScratch, _rxLogScratch);
+		return handled;
+	}
+
 	// Test-only (issue #379): what the anchor event callback does on
 	// CallEvent::MediaNeverOpened. The callback is wired only for a real anchor,
 	// never the host suite's Loopback. Not compiled into device firmware.
@@ -1979,12 +1999,13 @@ private:
 	EmergencyRoute emergencyRouteLocked() const;
 
 	// The generic-SIP-trunk half of routeTrunkCall(): everything after its
-	// "is a trunk configured" check. Split out so routeEmergencyCall() can
-	// reach the trunk directly (Issue #521) and learn whether a carrier INVITE
-	// actually went out -- routeTrunkCall()'s bool, like originateAnchorCall()'s,
-	// means only "took ownership of the INVITE". `placedOut`, when non-null, is
-	// true only on the one path that hands the call to the carrier. Caller
-	// holds _mutex.
+	// "is a trunk configured" check. Split out so a caller can learn whether a
+	// carrier INVITE actually went out -- routeTrunkCall()'s bool, like
+	// originateAnchorCall()'s, means only "took ownership of the INVITE".
+	// `placedOut`, when non-null, is true only on the one path that hands the
+	// call to the carrier. A 911/933 (by `destination` or by isEmergencyTraffic())
+	// is never handed over (#930): it is answered 503, placedOut stays false, and
+	// the return is true. Caller holds _mutex.
 	bool placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
 		bool* placedOut);

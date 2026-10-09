@@ -1,0 +1,2 @@
+# EmergencyRoute_test.cpp: 3 (#930: placeSipTrunkCall refuses a 911/933 destination and an emergency-marked INVITE itself; the ordinary-destination control)
+3

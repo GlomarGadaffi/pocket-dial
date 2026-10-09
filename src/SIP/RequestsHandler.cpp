@@ -13263,6 +13263,25 @@ bool RequestsHandler::placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
 	// the call to the carrier, and only that one sets it.
 	if (placedOut) *placedOut = false;
 
+	// Backstop (#930, #873): a 911/933 never goes over a real trunk, whoever
+	// called. routeTrunkCall() classifies first and hands it to the anchor; this
+	// holds for a caller that does not, as originateAnchorCall() holds for the
+	// anchor. Before any state: nothing to unwind. Same 503 as routeEmergencyCall().
+	if (pbx::classifyEmergencyDial(destination).isEmergency || isEmergencyTraffic(*data))
+	{
+		if (auto msg = getMessageFromPool(*data))   // pool exhausted: drop, peer retransmits (#101A)
+		{
+			msg->setHeader("SIP/2.0 503 Emergency Call Not Routable");
+			msg->clearBody();
+			msg->addHeader("Warning", "399 " + _localIp +
+				" \"Emergency call could not be routed: a 911/933 never goes over a trunk\"");
+			msg->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			_outbox.emplace_back(data->getSource(), std::move(msg));
+		}
+		queueLog("trunk: a 911/933 never goes over a trunk", true);
+		return true;
+	}
+
 	const std::string callID(data->getCallID());
 
 	auto refuse = [&](const char* statusLine, const char* why) {

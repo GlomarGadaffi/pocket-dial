@@ -360,6 +360,90 @@ TEST(EmergencyRoute, ARuleProducedEmergencyCallGetsTheHeaderGateYieldAndAnOrdina
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #930: placeSipTrunkCall() refuses an emergency itself. Its one caller classifies
+// the destination first, so nothing reaches the backstop through handle() but the
+// message path (the last test); the destination path needs the test seam.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(EmergencyRoute, PlaceSipTrunkCallRefusesAnEmergencyDestinationWhateverTheCaller)
+{
+	// {what the caller dialed, the destination handed to the trunk}. The last two
+	// are a number a dial rule rewrote: nothing in the INVITE says emergency, so
+	// only the destination can.
+	struct Dial { const char* to; const char* destination; };
+	for (const Dial& d : {Dial{"911", "911"}, Dial{"933", "933"}, Dial{"9911", "9911"},
+	                      Dial{"9933", "9933"}, Dial{"0", "911"}, Dial{"0", "933"}})
+	{
+		const std::string dialed = d.destination;
+		SCOPED_TRACE(std::string(d.to) + " -> " + dialed);
+		Bench b;
+		b.handler->setTrunkConfig(trunkConfig());
+		bool placed = true;
+
+		testing::internal::CaptureStderr();
+		const bool handled = b.handler->placeSipTrunkCallForTest(
+			makeInvite(d.to, "er-930-" + std::string(d.to) + "-" + dialed), "101", dialed, &placed);
+		const std::string log = testing::internal::GetCapturedStderr();
+
+		EXPECT_TRUE(handled) << "the request is answered, so the caller must not answer it again";
+		EXPECT_FALSE(placed) << "answered, not placed";
+		EXPECT_EQ(b.count("INVITE", kSbcIp), 0u)
+			<< "an emergency number must never reach the carrier:\n" << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable", kHandsetIp), 1u)
+			<< "the caller is told, not left hanging:\n" << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 180"), 0u) << "and is not rung for a call that is not placed";
+		EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 0u) << "no relay pair is claimed";
+		EXPECT_EQ(b.handler->getSessionCount(), 0u) << "and no session is published";
+		EXPECT_NE(log.find("trunk: a 911/933 never goes over a trunk\n"), std::string::npos)
+			<< "the refusal is logged. Got:\n" << log;
+	}
+}
+
+TEST(EmergencyRoute, PlaceSipTrunkCallStillPlacesAnOrdinaryDestinationOverTheSameTrunk)
+{
+	// The control: the same bench and trunk place the call when it is not an
+	// emergency, so the refusal above is the guard and not a bench that cannot dial.
+	Bench b;
+	b.handler->setTrunkConfig(trunkConfig());
+	bool placed = false;
+
+	const bool handled = b.handler->placeSipTrunkCallForTest(
+		makeInvite("92025550123", "er-930-pstn"), "101", "12025550123", &placed);
+
+	EXPECT_TRUE(handled);
+	EXPECT_TRUE(placed) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:+12025550123@", kSbcIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 180", kHandsetIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 503"), 0u) << b.dump();
+	EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 1u);
+}
+
+TEST(EmergencyRoute, PlaceSipTrunkCallRefusesAnEmergencyMarkedInviteToAnOrdinaryNumber)
+{
+	// The message path: nothing in the destination says emergency, so only
+	// isEmergencyTraffic() can see it, and this one reaches the trunk through
+	// handle(). Priority: psap-callback (RFC 7090) is what marks it.
+	auto dial = [](Bench& bench, const char* extra, const char* callId) {
+		bench.handler->setTrunkConfig(trunkConfig());
+		bench.handler->setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
+		bench.handler->handle(makeGatedInvite("92025550123", callId, extra, /*secondAudio=*/false));
+	};
+
+	{
+		Bench control;
+		dial(control, "", "er-930-plain");
+		ASSERT_EQ(control.count("INVITE sip:+12025550123@", kSbcIp), 1u)
+			<< "control: without the mark the same dial reaches the carrier:\n" << control.dump();
+	}
+
+	Bench b;
+	dial(b, "Priority: psap-callback\r\n", "er-930-mark");
+	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << "nothing emergency-marked goes to the carrier:\n" << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable", kHandsetIp), 1u) << b.dump();
+	EXPECT_EQ(b.handler->trunkRelaysInUseForTest(), 0u);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // B. What #521 added.
 // ═════════════════════════════════════════════════════════════════════════════
