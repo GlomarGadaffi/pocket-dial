@@ -2162,6 +2162,13 @@ private:
 	void refuseRingingAnchor(const std::string& callId,
 		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox);
 	void asyncDropCall(const std::string& participantId);
+	// #379: the one place a teardown path marks a session's far leg released, so endCall()'s
+	// no-bridge fallback does not drop it a second time. `dropLeg` true (the default): post the
+	// session's drop first, then mark. False: mark only, for a leg 3CX already dropped, or whose
+	// drop the caller posts itself. The drop goes out even if the id is empty (the inbound paths
+	// have always done so); a caller that must skip an unbound leg passes !part.empty().
+	// Caller holds _mutex. Takes no lock and copies nothing.
+	void releaseFarLeg(Session& s, bool dropLeg = true);
 	void asyncAnswerCall(const std::string& participantId);
 	// Issue #379: CallEvent::MediaNeverOpened. Caller holds _mutex.
 	void anchorMediaNeverOpenedLocked(const std::string& participantId);
