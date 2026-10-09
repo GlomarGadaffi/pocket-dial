@@ -153,11 +153,12 @@ private:
 	std::atomic<int64_t> _tokenLifetimeUs{0};
 
 #if defined(ESP_PLATFORM) || defined(ESP32)
-	// #862: the token response is read into this arena, which lives as long as the client, so
-	// no fetch allocates a body buffer. Claimed with an atomic flag (never a mutex, never
-	// waited for) and held across the socket read; a second fetch is turned away.
-	using TokenArena = telephony::BodyArena<telephony::kTokenBodyBytes>;
-	TokenArena _tokenArena;
+	// #862: the token response is read into one of these two arenas, which live as long as the
+	// client, so the body read allocates no buffer (the rest of fetchToken is #951). One is for the
+	// ordinary lane, one for a 911/933. Each is claimed with an atomic flag (never a mutex) and
+	// held across the socket read; a second fetch on the same lane is turned away. The 911/933
+	// lane never waits for, and is never turned away by, an ordinary fetch.
+	telephony::TokenLanes _tokenLanes;
 
 	esp_websocket_client_handle_t _wsClient   = nullptr;
 	// ── #100: per-call media slot ────────────────────────────────────────────────
@@ -350,11 +351,12 @@ private:
 	void runWsWorker();
 	void processWsWork(const WsWorkItem& w);       // the blocking body, off the WS task
 
-	// Claims _tokenArena before any I/O; a fetch already running means this one returns false at
-	// once (the caller keeps its cached token). Only start() passes waitForArena: it is off the
-	// 911 lane, and a restart that lost the claim would leave the anchor down.
-	bool fetchToken(bool waitForArena = false);
-	bool ensureToken();          // refresh iff expiring AND no media streams active
+	// Claims the lane's arena in _tokenLanes before any I/O; a fetch already running on that lane
+	// means this one returns false at once (the caller keeps its cached token). Only start() passes
+	// waitForArena, and only the Ordinary lane honours it: start() is off the 911 lane, and a
+	// restart that lost the claim would leave the anchor down. The Emergency lane never waits.
+	bool fetchToken(telephony::TokenLane lane = telephony::TokenLane::Ordinary, bool waitForArena = false);
+	bool ensureToken(telephony::TokenLane lane = telephony::TokenLane::Ordinary);   // refresh iff expiring AND no media streams active
 	bool tokenExpiringSoon() const; // true when within the refresh margin of JWT exp
 	bool connectWs();
 	// getParticipantStatus() removed (chore #75): the specific-id GET 403s for a
@@ -396,7 +398,7 @@ private:
 	// Reads the token response into the claimed arena and views the string member `field` in `out`
 	// (a view into the arena: valid while `lease` is). False, with nothing in `out`, when the
 	// body does not fit, the read fails or times out, or the member is missing or not a string.
-	bool readJsonStringField(esp_http_client_handle_t client, TokenArena::Lease& lease,
+	bool readJsonStringField(esp_http_client_handle_t client, telephony::TokenLanes::Lease& lease,
 	                         std::string_view field, std::string_view& out);
 
 	// Live-state GET helpers (reconcile watchdog + drop-fallback + device resolve). Snapshot

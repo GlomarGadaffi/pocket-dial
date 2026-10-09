@@ -603,16 +603,17 @@ private:
 	std::size_t _n = 0;
 };
 
-// ── The token body: one arena and a bounded scanner (#862) ──────────────────────
-// The OAuth token response is read into ONE arena that is reserved with the client and never
-// grows: no std::vector per read and no spill to the heap. The contract is the one recorded
-// on #948 for the 911/933 lane:
+// ── The token body: bounded arenas and a bounded scanner (#862) ─────────────────
+// The OAuth token response is read into an arena that is reserved with the client and never
+// grows: no std::vector per read and no spill to the heap. That is the body read only (#945);
+// the rest of the token fetch (the request, the TLS client, the token copies) is not covered
+// here (#951). The contract is the one recorded on #948 for the 911/933 lane:
 //   * Fits or fails. A body that does not fit is an error (ArenaFull), never a prefix, and a
 //     failed read (an error, a timeout, a stream that stops short) is an error too. After any
 //     error the arena shows no bytes at all, and the caller keeps the token it already has.
-//   * Nobody waits. The arena is claimed with an atomic flag, not a mutex: a second caller is
-//     turned away at once with an empty lease, and the holder is never blocked or slowed by
-//     it. No lock is held across the socket read.
+//   * Nobody waits. An arena is claimed with an atomic flag, not a mutex: a second caller of
+//     the same arena is turned away at once with an empty lease, and the holder is never
+//     blocked or slowed by it. No lock is held across the socket read.
 //   * It is bounded in time as well as in size: the whole body must arrive inside a budget.
 
 // The arena holds a body of exactly this many bytes and refuses one byte more. The size is an
@@ -729,6 +730,53 @@ private:
 	std::atomic<bool> _busy{false};
 	std::size_t       _used = 0;
 	char              _buf[N + 1] = {};
+};
+
+// ── The token's two lanes: a 911/933 has an arena of its own (#862, Rule 5) ──────
+// Telephony drops the old token the moment a new one is granted, so two fetches on the same
+// lane must not run together: the second is turned away and keeps the token it has. The
+// emergency lane is a lane of its own for another reason. A 911/933 must not wait on an
+// ordinary fetch (a refresh ahead of a normal call, or start()) and must not be turned away
+// by one, so it has its own arena and its own claim, and an ordinary fetch is never handed it.
+// The emergency lane does not wait for its own arena either: if another 911/933 holds it, the
+// caller carries on at once with the token it has. Nothing here refuses a call.
+//
+// Both lanes can have a fetch in flight together. Telephony then grants two tokens and drops
+// the older one, and the cache keeps whichever fetch finishes last (open on #945).
+//
+// Cost: two arenas, kTokenBodyBytes + 1 bytes of buffer each, reserved with the client: about
+// 8.2 KB on the 32-bit ESP32. That is the object size, not a heap measurement.
+enum class TokenLane : std::uint8_t { Ordinary, Emergency };
+
+class TokenLanes
+{
+public:
+	using Arena = BodyArena<kTokenBodyBytes>;
+	using Lease = Arena::Lease;
+
+	// Never waits. An Ordinary caller cannot be handed the emergency arena.
+	Lease claim(TokenLane lane) { return arena(lane).tryClaim(); }
+
+	// claim(), then, for the Ordinary lane only, up to `polls` more tries `pollMs` apart (start():
+	// off the 911 lane, and a restart that lost the claim would leave the anchor down). The
+	// Emergency lane makes the one try and never calls sleepMs.
+	template <class Sleep>
+	Lease claimWaiting(TokenLane lane, int polls, std::uint32_t pollMs, Sleep&& sleepMs)
+	{
+		Lease lease = claim(lane);
+		for (int i = 0; lane == TokenLane::Ordinary && !lease && i < polls; ++i)
+		{
+			sleepMs(pollMs);
+			lease = claim(lane);
+		}
+		return lease;
+	}
+
+private:
+	Arena& arena(TokenLane lane) { return lane == TokenLane::Emergency ? _emergency : _ordinary; }
+
+	Arena _ordinary;
+	Arena _emergency;
 };
 
 namespace detail

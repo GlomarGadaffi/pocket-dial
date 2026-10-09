@@ -187,7 +187,7 @@ bool TelephonyAnchorClient::start()
 	}
 
 	// 1. Fetch OAuth token
-	if (!fetchToken(true))
+	if (!fetchToken(telephony::TokenLane::Ordinary, true))
 	{
 		ESP_LOGE(TAG, "Failed to retrieve OAuth token");
 		std::lock_guard<std::mutex> lock(_mutex);
@@ -325,7 +325,13 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 
 	// Refresh the OAuth token if it's near expiry. Safe here: no media streams are
 	// open at call-origination time, so a re-issue can't kill a live stream.
-	ensureToken();
+	// #862 (Rule 5): a 911/933 refreshes on its own token arena, so an ordinary fetch neither
+	// holds it up nor turns it away. The result is not used either way: a refresh that does not
+	// land never refuses the call, which goes out on the token already cached.
+	const telephony::TokenLane tokenLane = pbx::classifyEmergencyDial(destination).isEmergency
+	                                           ? telephony::TokenLane::Emergency
+	                                           : telephony::TokenLane::Ordinary;
+	ensureToken(tokenLane);
 
 	std::string baseUrl, sourceDn, deviceId;
 	{
@@ -905,25 +911,25 @@ void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 
 // ── Private Helper Functions ───────────────────────────────────────────────
 
-bool TelephonyAnchorClient::fetchToken(bool waitForArena)
+bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForArena)
 {
-	// #862: claim the token arena before any I/O. A fetch already holds it, and a second one
-	// would only invalidate the first one's token (Telephony drops the old token the moment a
-	// new one is granted), so the loser is turned away here, before it opens a connection, and
-	// carries on with the token it has. Nothing waits for the arena -- except start(), which is
-	// off the 911 lane and would otherwise leave the anchor down after a restart that raced a
-	// makeCall()'s refresh.
+	// #862: claim the lane's token arena before any I/O. A fetch on this lane already holds it,
+	// and a second one would only invalidate the first one's token (Telephony drops the old token
+	// the moment a new one is granted), so the loser is turned away here, before it opens a
+	// connection, and carries on with the token it has. Only the ordinary lane waits, and only
+	// for start(), which is off the 911 lane and would otherwise leave the anchor down after a
+	// restart that raced a makeCall()'s refresh. A 911/933 has an arena of its own and never
+	// waits: an ordinary fetch can be in flight beside it, and it carries on regardless.
+	// This covers the body read only (#945); the rest of fetchToken is #951.
 	constexpr int      kClaimWaitPolls  = 50;
 	constexpr uint32_t kClaimWaitPollMs = 100;
-	TokenArena::Lease lease = _tokenArena.tryClaim();
-	for (int i = 0; waitForArena && !lease && i < kClaimWaitPolls; ++i)
-	{
-		vTaskDelay(pdMS_TO_TICKS(kClaimWaitPollMs));
-		lease = _tokenArena.tryClaim();
-	}
+	telephony::TokenLanes::Lease lease = _tokenLanes.claimWaiting(
+	    lane, waitForArena ? kClaimWaitPolls : 0, kClaimWaitPollMs,
+	    [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
 	if (!lease)
 	{
-		ESP_LOGW(TAG, "Token fetch skipped: another fetch is running");
+		ESP_LOGW(TAG, "Token fetch skipped: another %s fetch is running",
+		         lane == telephony::TokenLane::Emergency ? "911/933" : "ordinary");
 		return false;
 	}
 
@@ -1032,7 +1038,7 @@ bool TelephonyAnchorClient::tokenExpiringSoon() const
 	                                       _tokenLifetimeUs, kRefreshMarginUs);
 }
 
-bool TelephonyAnchorClient::ensureToken()
+bool TelephonyAnchorClient::ensureToken(telephony::TokenLane lane)
 {
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
@@ -1061,7 +1067,7 @@ bool TelephonyAnchorClient::ensureToken()
 	}
 
 	ESP_LOGI(TAG, "Access token near expiry — refreshing");
-	return fetchToken();
+	return fetchToken(lane);
 }
 
 // Issue #336: connectWs() bakes _accessToken into wsCfg.headers once, at
@@ -2407,7 +2413,8 @@ void TelephonyAnchorClient::stopAllMediaStreams()
 	}
 }
 
-bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client, TokenArena::Lease& lease,
+bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client,
+                                                telephony::TokenLanes::Lease& lease,
                                                 std::string_view field, std::string_view& out)
 {
 	// The body goes straight into the claimed arena (#862): no vector, no spill, no lock held,
